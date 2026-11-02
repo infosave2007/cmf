@@ -303,6 +303,10 @@ const B_OUT: usize = 14;
 const B_ITEMS: usize = 15;
 const B_COS: usize = 16;
 const B_SIN: usize = 17;
+// `gemm_nt`'s own slots (the one-GEMM door for other towers)
+const B_GX: usize = 18;
+const B_GY: usize = 19;
+const B_GI: usize = 20;
 
 /// `CMF_EGEMMA2_GPU=0` turns the device paths off.
 pub fn enabled() -> bool {
@@ -1502,6 +1506,63 @@ impl VisionGpu {
         );
         Ok(())
     }
+}
+
+// ───────────────────────────── one GEMM ─────────────────────────────
+
+/// One f32 NT GEMM on the device, `y[n×m] = x[n×k] · wᵀ[m×k]`, with the
+/// encoders' `eg_mm_nt` (f32 operands and accumulation, Accelerate's sum
+/// order). `w` is wrapped in place when it starts on a page (a tower's
+/// weight vectors do), `x` and `y` go through shared scratch. `false` when
+/// the device or its kernels are unavailable, or under
+/// `CMF_EGEMMA2_GPU=0`.
+pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+    if !enabled() || x.len() < n * k || w.len() < m * k || y.len() < n * m || n == 0 || m == 0 {
+        return false;
+    }
+    let Some(c) = super::ctx() else { return false };
+    let Ok(p) = pipes(c) else { return false };
+    let mut sc = SCRATCH.lock().unwrap();
+    let bx = sc.get(c, B_GX, n * k * 4);
+    let by = sc.get(c, B_GY, n * m * 4);
+    let bi = sc.get(c, B_GI, std::mem::size_of::<EgMm>());
+    write(&bx, &x[..n * k]);
+    let bw = wrap(c, &w[..m * k]);
+    let item = EgMm {
+        n: n as u32,
+        m: m as u32,
+        k: k as u32,
+        ldx: k as u32,
+        ldw: k as u32,
+        ldy: m as u32,
+        alpha: 1.0,
+        wrows: m as u32,
+        ..Default::default()
+    };
+    write(&bi, std::slice::from_ref(&item));
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&p.mm_nt);
+    enc.set_buffer(0, Some(&bx), 0);
+    enc.set_buffer(1, Some(&bw), 0);
+    enc.set_buffer(2, Some(&bw), 0);
+    enc.set_buffer(3, Some(&bw), 0);
+    enc.set_buffer(4, Some(&by), 0);
+    enc.set_buffer(5, Some(&bi), 0);
+    enc.dispatch_thread_groups(
+        MTLSize::new((n as u64).div_ceil(64), (m as u64).div_ceil(64), 1),
+        MTLSize::new(128, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+    if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(by.contents() as *const f32, y.as_mut_ptr(), n * m);
+    }
+    true
 }
 
 // ───────────────────────────── kernel development ─────────────────────────────

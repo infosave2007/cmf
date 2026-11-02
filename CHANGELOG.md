@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.52] — 2026-11-01
+
+### Changed
+- Block-diffusion models decode causally by default (`CMF_CLOVER_MODE=ar`):
+  Clover-35B-A3B-Preview `q4tp-v2` on an RTX 5090 goes from 26 to 120 tok/s on
+  prose and from 80–95 to 121 on code, a 16 GB budget from 5.6–14 to 53, the
+  CPU from 0.7–1.3 to 11–14, with the release's response-only penalties, the
+  stop and `</think>` ramps and cross-turn KV reuse. On an Apple M4 (24 GB)
+  the prompt runs on the Metal executor (~170 tok/s against 57) and the rows
+  on the CPU: 13–18 tok/s against 3.2 on prose and 6.5–9 on code.
+  `CMF_CLOVER_MODE=denoise` keeps the release's LowConfidence generation.
+
+### Added
+- Self-speculative decoding for block-diffusion models on the wgpu graph
+  (`CMF_CLOVER_MODE=draft`, the vendor's `draft-self`): a preview proposes a
+  block, the causal path verifies it and the state rewinds to the accepted
+  prefix; `CMF_CLOVER_DRAFT`, `CMF_CLOVER_ACCEPT`, `CMF_CLOVER_ACCEPT_RATIO`,
+  `CMF_CLOVER_ACCEPT_DELTA`.
+
+## [0.8.51] — 2026-10-31
+
+### Added
+- SenseNova-Loop-9B-Preview (`sensenova_loop`, `sensenova.rs`): the loop plan
+  from the release config (layers 4–27 run twice, each pass with its own KV
+  and GDN state, 56 layer executions from 32 layers), mHC with two residual
+  streams inside the loop (sigmoid pre/post gates, a 20-step log-space
+  Sinkhorn mix, float32 routers), interleaved MRoPE for image positions and
+  the Qwen3-VL-style vision tower (`qwen3vis`, 5-D patch embedding). mHC runs
+  in the wgpu token and batch graphs (`gpu_wgpu/mhc.rs`) and in the Metal
+  token graph (`gpu_metal/mhc.rs`); MRoPE angle tables ride the wgpu batch
+  graph. Greedy text and an image description match Transformers float32
+  (q8_2f).
+- Mage-VL-Cowork (`llava_onevision2`, `onevision2.rs`): the OneVision vision
+  encoder (3-axis RoPE, LayerNorm with bias, exact GELU, the patch merger)
+  over Qwen2-VL-processed screenshots, on Qwen3-4B. The encoder runs resident
+  on wgpu (`gpu_wgpu/vit.rs`: LayerNorm, GEMMs, RoPE and attention in one
+  submission per image) and on Metal through `gpu::vision_gemm_nt`; tower rows
+  match Transformers float32 (cosine 1.000000 on the CPU). `cortiq run
+  --image` and `/v1/chat/completions` image parts for both models.
+- Primal VAE (`primal_vae.rs`, `cortiq vae --mode encode|decode|roundtrip`):
+  the conv U-Net from its tensor shapes, executed as one device plan on wgpu
+  and Metal (`gpu_wgpu/primal_vae.rs`, `gpu_metal/primal_vae.rs`) or on the
+  host; `cortiq convert` packs the checkpoint (`primalvaepack.rs`). PSNR equals
+  the PyTorch float32 reference; 1024×1024 encode / decode 0.40 / 0.29 s on an
+  NVIDIA A40, 1.27 / 1.23 s on an Apple M4.
+- Batched q8_2f GEMM in the wgpu batch graph (`q8_2f_mm_r2`) for mHC and
+  embedded-prompt prefills.
+
+### Fixed
+- `import-gguf` on Spark-X2.5/2.6 GGUFs (llama.cpp arch `spark2_5`): the
+  file imported and then failed to load with `self_attn.q_proj.weight not
+  found` (#73). The fused `attn_qkv` is split into q/k/v and `attn_gate`
+  becomes the head-wise `self_attn.g_proj` (kept f16). The header takes the
+  sliding/full layer schedule, the 512-token window, both RoPE profiles and
+  exact GELU from the GGUF, matching `cortiq convert`. The tokenizer keeps
+  Spark's pre-tokenizer chain (digit runs of 1–3, CJK, words) instead of
+  plain GPT-2 ByteLevel. A fused attention layout the importer does not know
+  now fails at import instead of writing a file that cannot load. Checked on
+  XHToken/Spark-X2.6-1.7B-GGUF Q8_0 → `--quant q4t`: correct answers in
+  English and Chinese, 72 tok/s decode on an Apple M4.
+
 ## [0.8.50] — 2026-10-31
 
 ### Added

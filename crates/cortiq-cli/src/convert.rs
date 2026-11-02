@@ -708,6 +708,28 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == "lfm3" {
         return lfm3_canon(raw);
     }
+    // SenseNova-Loop (`sensenova_loop`): the Qwen3.5 text model at the usual
+    // names (its mHC routers ride along under their layers), the Qwen3-VL
+    // style vision tower as `vis.*` for `qwen3vis`. The MTP head is dropped:
+    // the looped stack decodes without it.
+    if arch.arch_name == "sensenova_loop" {
+        if let Some(rest) = raw.strip_prefix("model.visual.") {
+            if let Some(rest) = rest.strip_prefix("patch_embed.proj.") {
+                return Some(format!("vis.patch_embed.{rest}"));
+            }
+            return Some(format!("vis.{rest}"));
+        }
+        if raw.starts_with("mtp.") || raw.starts_with("model.mtp.") {
+            return None;
+        }
+        return canon_name(raw);
+    }
+    // Mage-VL (`llava_onevision2`): a Qwen3 text model at the usual names
+    // plus the OneVision tower and merger, kept as `visual.*` for
+    // `onevision2`.
+    if arch.arch_name == "llava_onevision2" && raw.starts_with("visual.") {
+        return Some(raw.to_string());
+    }
     if arch.arch_name.eq_ignore_ascii_case("whisper")
         && (raw.starts_with("model.encoder.") || raw.starts_with("model.decoder."))
     {
@@ -881,6 +903,12 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
+        // SenseNova-Loop's mHC routers: the reference keeps them FP32 (a
+        // logit, a sigmoid and a 20-step Sinkhorn read every entry).
+        || name.ends_with(".mhc_attn.weight")
+        || name.ends_with(".mhc_attn.bias")
+        || name.ends_with(".mhc_ffn.weight")
+        || name.ends_with(".mhc_ffn.bias")
         // MiMo-V2's per-head softmax sink logits: tiny, and a logit.
         || name.ends_with(".self_attn.sinks")
         // MiMo audio tokenizer RVQ codebooks: nearest-neighbour tables,
@@ -917,7 +945,8 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
 /// cosine of 0.999995 (worst 0.99984), q8_2f 0.9977 on the CPU (worst
 /// 0.958) and 0.993 through the device GEMM (worst 0.61).
 fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
-    arch.arch_name == "lfm3"
+    (arch.arch_name == "llava_onevision2" && name.starts_with("visual."))
+        || arch.arch_name == "lfm3"
         && [
             "vision_tower.",
             "multi_modal_projector.",
@@ -9496,11 +9525,11 @@ pub fn run_convert_multi_excluding(
     let mut tensors: Vec<Vec<TensorSpec>> =
         outputs.iter().map(|_| Vec::with_capacity(total)).collect();
     let mut tower_stats = vec![crate::mimo_towers::TowerStats::default(); outputs.len()];
-    if arch.prism_hadamard.is_some() {
+    if arch.prism_hadamard.is_some() || arch.arch_name == "sensenova_loop" {
         let mut vision_cfg = config
             .get("vision_config")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Prism checkpoint has no vision_config"))?;
+            .ok_or_else(|| anyhow::anyhow!("this checkpoint has no vision_config"))?;
         // qwen3vis accepts this optional list; an empty list is the honest
         // value for this source (no deepstack merger tensors are present).
         if let Some(obj) = vision_cfg.as_object_mut() {
@@ -11028,6 +11057,41 @@ pub fn run_convert_multi_excluding(
             "lfm3_vl: processor_config.json is missing — the image preprocessing lives there"
         );
         p["lfm3_vl"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // SenseNova-Loop: the execution plan (layers [start, end) visited
+    // `eval_count` times, each visit its own cache), the mHC settings, the
+    // checkpoint config and the image processor (`sensenova::LoopConfig`).
+    let provenance = if arch.arch_name == "sensenova_loop" {
+        let mut p = provenance;
+        let processor: serde_json::Value = fs::read(dir.join("preprocessor_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        anyhow::ensure!(
+            config.get("loop_settings").is_some(),
+            "sensenova_loop: config.json has no loop_settings"
+        );
+        p["sensenova_loop"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // Mage-VL: the checkpoint and image processor configs the vision path
+    // reads (`onevision2::Ov2Config`).
+    let provenance = if arch.arch_name == "llava_onevision2" {
+        let mut p = provenance;
+        let processor: serde_json::Value = fs::read(dir.join("preprocessor_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        anyhow::ensure!(
+            !processor.is_null(),
+            "llava_onevision2: preprocessor_config.json is missing — the image preprocessing lives there"
+        );
+        p["onevision2"] = serde_json::json!({"config": config.clone(), "processor": processor});
         p
     } else {
         provenance

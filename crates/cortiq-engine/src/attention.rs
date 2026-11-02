@@ -81,6 +81,18 @@ fn rope_table(tab: &mut Vec<(f32, f32)>, position: usize, inv_freq: &[f32]) {
     tab.extend(inv_freq.iter().map(|&freq| (position as f32 * freq).sin_cos()));
 }
 
+/// `rope_table` of an MRoPE row: frequency `i` turns by the position of
+/// its interleaved axis.
+fn mrope_table(tab: &mut Vec<(f32, f32)>, pos: [i64; 3], sections: [usize; 3], inv_freq: &[f32]) {
+    tab.clear();
+    tab.extend(
+        inv_freq
+            .iter()
+            .enumerate()
+            .map(|(i, &freq)| (pos[crate::sensenova::mrope_axis(i, sections)] as f32 * freq).sin_cos()),
+    );
+}
+
 /// `rope_rotate_scaled` with the sin/cos precomputed (bit-identical).
 #[inline]
 fn rope_rotate_table(x: &mut [f32], tab: &[(f32, f32)], scale: f32) {
@@ -648,10 +660,22 @@ fn rmsnorm_head(x: &mut [f32], w: &[f32], eps: f64, style: cortiq_core::NormStyl
     }
 }
 
+/// Interleaved-MRoPE positions of a prompt's rows (SenseNova-Loop image
+/// prompts): row `position - base` rotates frequency `i` by its
+/// `sensenova::mrope_axis` position instead of the plain one.
+#[derive(Clone, Copy)]
+pub struct MropeView<'a> {
+    pub base: usize,
+    pub pos: &'a [[i64; 3]],
+    pub sections: [usize; 3],
+}
+
 /// Dense attention configuration (no head masks — masked execution uses
 /// the historical path).
 #[derive(Clone, Copy)]
 pub struct QwenAttnCfg<'a> {
+    /// MRoPE rows of the prompt being prefilled (None: plain RoPE).
+    pub mrope: Option<MropeView<'a>>,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -997,7 +1021,10 @@ pub(crate) fn qk_norm_and_rope(
     let rope = |q: &mut [f32], k: &mut [f32]| {
         ROPE_TAB.with(|t| {
             let mut t = t.borrow_mut();
-            rope_table(&mut t, position, &cfg.inv_freq[..rd / 2]);
+            match cfg.mrope.filter(|m| position >= m.base && position - m.base < m.pos.len()) {
+                Some(m) => mrope_table(&mut t, m.pos[position - m.base], m.sections, &cfg.inv_freq[..rd / 2]),
+                None => rope_table(&mut t, position, &cfg.inv_freq[..rd / 2]),
+            }
             for h in 0..nh {
                 rope_rotate_table(&mut q[h * hd..h * hd + rd], &t, cfg.rope_scale);
             }
@@ -2614,6 +2641,7 @@ mod tests {
         pool: Option<&'a crate::pool::Pool>,
     ) -> QwenAttnCfg<'a> {
         QwenAttnCfg {
+            mrope: None,
             num_heads: 4,
             num_kv_heads: nkv,
             head_dim: 8,
@@ -2649,6 +2677,7 @@ mod tests {
         let (nh, nkv, hd) = (2usize, 1usize, 8usize);
         let inv = rope_inv_freq(hd, 10_000.0);
         let cfg = QwenAttnCfg {
+            mrope: None,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -2962,6 +2991,7 @@ mod tests {
         let bv: Vec<f32> = (0..nkv * hd).map(|i| 0.05 * i as f32).collect();
         let inv = rope_inv_freq(hd, 10_000.0);
         let cfg = |position| QwenAttnCfg {
+            mrope: None,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -3014,6 +3044,7 @@ mod tests {
         let wo = synth(hs, nh * hd, 8);
         let inv = rope_inv_freq(hd, 10_000.0);
         let cfg = |position| QwenAttnCfg {
+            mrope: None,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -3072,6 +3103,7 @@ mod tests {
         let gate = QTensor::from_f32(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], nh, hs);
         let inv = rope_inv_freq(hd, 10_000.0);
         let cfg = QwenAttnCfg {
+            mrope: None,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -3292,6 +3324,7 @@ mod tests {
             })
             .collect();
         let cfg = |position: usize, pool: Option<&'static crate::pool::Pool>| QwenAttnCfg {
+            mrope: None,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -3434,6 +3467,7 @@ mod qk_norm_order_tests {
         hd: usize,
     ) -> QwenAttnCfg<'a> {
         QwenAttnCfg {
+            mrope: None,
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: hd,

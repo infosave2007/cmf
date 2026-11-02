@@ -534,6 +534,7 @@ impl Pipeline {
         let inv_freq_l = self.layer_inv_freq(li);
         let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
         let cfg = QwenAttnCfg {
+            mrope: None,
             num_heads: self.layer_num_heads(li),
             num_kv_heads: nkv_l,
             head_dim: hd_l,

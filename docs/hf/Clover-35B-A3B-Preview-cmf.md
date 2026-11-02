@@ -15,6 +15,8 @@ tags:
   - vulkan
 language:
   - en
+  - ru
+  - zh
 ---
 
 # Clover-35B-A3B-Preview — CMF
@@ -23,10 +25,12 @@ language:
 — a diffusion language model on the Qwen3.6-35B-A3B backbone (mixture of
 experts: 35B parameters, ~3B active per token, 256 experts top-8 plus a shared
 expert; 30 Gated DeltaNet and 10 gated full-attention layers; 128k context).
-It writes the answer in 32-token blocks: each block starts as mask tokens and
-is resolved by repeated denoising passes over the whole block, several tokens
-at once — packaged as single [CMF](https://github.com/infosave2007/cmf) files
-for `cortiq`, a Rust inference engine with no Python and no ML framework.
+It is built to write in 32-token blocks by repeated denoising passes, and its
+trunk also reads as an ordinary causal model — packaged as single
+[CMF](https://github.com/infosave2007/cmf) files for `cortiq`, a Rust inference
+engine with no Python and no ML framework. `cortiq` decodes causally by default,
+the fastest on every machine we measured; block denoising and self-speculation
+are one setting away.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文说明)
 
@@ -38,8 +42,7 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Write a Python function that merges two sorted lists." --no-think --max-tokens 512
 ```
 
-Use cortiq 0.8.41 or later (block diffusion, Metal); prebuilt binaries for Linux,
-macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases).
+Use cortiq 0.8.52 or later; prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases).
 Without `--no-think` the model reasons in a `<think>` block first, so give it
 `--max-tokens` in the thousands.
 
@@ -61,21 +64,30 @@ PyTorch implementation (bf16), three chat prompts × 32 rows (two for
 
 ## Performance
 
-A *pass* is one denoising forward over the 32-row block. LowConfidence fixes
-every row above the threshold after each pass (the release default 0.95), so
-predictable text resolves several tokens a pass and free prose about one.
-Tokens per second after the prompt, `q4tp-v2`, cortiq 0.8.41:
+Tokens per second after the prompt, `q4tp-v2`:
 
-| hardware | backend | pass | prose | code |
-|---|---|---:|---:|---:|
-| RTX 5090 (32 GB) | Vulkan | 34 ms | 26 tok/s | 80–95 tok/s |
-| Mac mini M4 (24 GB) | Metal | 0.3–0.5 s | 3.2 tok/s | 6.5–9 tok/s |
+| hardware | prose | code | a 2048-token prompt |
+|---|---:|---:|---:|
+| RTX 5090 (32 GB), Vulkan | 120 | 121 | 1143 tok/s |
+| 16 GB of VRAM, Vulkan + CPU | 54 | 53 | |
+| Mac mini M4 (24 GB), prompt on Metal, decode on CPU | 13–18 | 14–18 | ~170 tok/s |
+| CPU only, 15 Xeon cores | 13.8 | 10.9 | |
 
-On the RTX 5090 the whole model and its head run on the card (18.8 GB). A
-lower threshold trades care for speed: `CMF_CLOVER_THRESHOLD=0.8` measured
-prose 25–30 and code 124–150 tok/s on the 5090, 3.7 and 9.7 tok/s on the M4.
-`cortiq run` prints the passes, tokens per pass and the rate after every
-answer.
+The whole model and its head take 18.7 GB on the card. `q8_2f` does not fit
+32 GB whole and runs at 46–49 tok/s there.
+
+### Decoding modes
+
+`CMF_CLOVER_MODE` picks how a request uses the model. On the RTX 5090:
+
+| mode | what it does | prose | code |
+|---|---|---:|---:|
+| `ar` (default) | causal decode with the release's response penalties | 120 | 121 |
+| `draft` | self-speculation: a denoising pass proposes 16 tokens, the causal path verifies them | 42 | 104 |
+| `denoise` | LowConfidence block denoising, the release's `generate` | 18–26 | 63–95 |
+
+In `denoise` on an M4: 3.2 and 6.5–9 tok/s. `CMF_CLOVER_THRESHOLD` lowers the
+denoising threshold, `CMF_CLOVER_DRAFT` sets the rows of a self-speculative round.
 
 ## Usage
 
@@ -85,12 +97,9 @@ cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "..." --max-tokens 4096 #
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "..." --no-think        # direct answer
 ```
 
-Generation follows the release: greedy LowConfidence over 32-token blocks,
-the block's experts restricted to the set that carries 90% of its routing,
-and the release's response penalties (presence 0.9, repetition 1.05, a
-gradual push toward the stop token after 8192 answer tokens and toward
-`</think>` after 4096). Knobs: `CMF_CLOVER_THRESHOLD` (0–1),
-`CMF_CLOVER_BLOCK` (8, 16 or 32). `--temperature` samples instead of greedy.
+Every mode applies the release's response penalties (presence 0.9, repetition
+1.05, a gradual push toward the stop token after 8192 answer tokens and toward
+`</think>` after 4096). `--temperature` samples instead of greedy.
 
 ### OpenAI-compatible server
 
@@ -104,21 +113,20 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 `/v1/chat/completions` (streamed or not), `/v1/completions`, `/v1/models` and
-a web dashboard on the same port. Streaming delivers each block as it
-resolves.
+a web dashboard on the same port.
 
 ## Hardware
 
-**NVIDIA / AMD / Intel (Vulkan, DX12).** A card that holds the file runs every
-pass as one GPU submission; a smaller one runs the first layers on the card
-and the rest on the CPU (a 16 GB budget held 30 of 40 layers). `cortiq gpu`
+**NVIDIA / AMD / Intel (Vulkan, DX12).** A card that holds the file runs the
+whole model; a smaller one runs the first layers on the card and the rest on
+the CPU. `cortiq gpu`
 lists the adapters; on headless Linux install `libvulkan1 libglvnd0 libegl1
 libgl1 libglx0` and set `XDG_RUNTIME_DIR=/tmp`.
 
-**Apple silicon.** The passes, block commits and the prompt run on Metal; the
-weights stay in the file's mapping (the experts a block uses are bound as
-they are routed), so a 24 GB Mac runs the `q4tp` files. The prompt reads at
-~57 tok/s on an M4.
+**Apple silicon.** The prompt runs on Metal and the decode on the CPU, which
+is the faster of the two for this file on a 24 GB Mac: Metal cannot keep the
+19 GB of weights resident there. The weights stay in the file's mapping, so a
+24 GB Mac runs the `q4tp` files.
 
 **CPU only.** `CMF_GPU=0`.
 
@@ -143,9 +151,7 @@ cortiq quantize-moe clover-35b-a3b-preview-q4tp.cmf --hf Diffuspace/Clover-35B-A
 
 ## Scope
 
-LowConfidence block diffusion, the release's default decoding. The
-self-speculative mode of DiffuSpace's SGLang and llama.cpp backends is not
-part of this runtime. Weights derive from DiffuSpace's release (built on
+Causal decoding, LowConfidence block diffusion and self-speculation. Weights derive from DiffuSpace's release (built on
 Qwen3.6-35B-A3B) and remain under its Apache-2.0 terms; see the
 [upstream card](https://huggingface.co/Diffuspace/Clover-35B-A3B-Preview) and
 its attributions.
@@ -155,10 +161,11 @@ its attributions.
 ## Документация на русском
 
 Clover-35B-A3B-Preview от DiffuSpace — диффузионная языковая модель на основе
-Qwen3.6-35B-A3B (35 млрд параметров, ~3 млрд активных на токен). Ответ
-пишется блоками по 32 токена: блок стартует из масок и раскрывается
-повторными проходами денойзинга, по нескольку токенов за проход. Здесь она в
-виде отдельных файлов CMF для движка `cortiq` на Rust.
+Qwen3.6-35B-A3B (35 млрд параметров, ~3 млрд активных на токен). Она умеет
+писать блоками по 32 токена, раскрывая их проходами денойзинга, а её основа
+работает и как обычная каузальная модель. Здесь она в виде отдельных файлов CMF
+для движка `cortiq` на Rust; по умолчанию `cortiq` декодирует каузально: это
+быстрее всего на всех машинах, где мы мерили.
 
 ```bash
 cargo install cortiq-cli
@@ -166,23 +173,36 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как работает хеш-таблица." --no-think --max-tokens 512
 ```
 
-Нужен cortiq 0.8.41 или новее. Файл по умолчанию — `q4tp-v2` (эксперты 4 бита
+Нужен cortiq 0.8.52 или новее. Файл по умолчанию — `q4tp-v2` (эксперты 4 бита
 с GPTQ, 19.36 ГБ, wiki ppl 16.80); `q4tp` — простая конвертация (18.22),
-`q8_2f` — почти без потерь (35 ГБ, 15.86). На RTX 5090 проход по блоку
-занимает 34 мс, модель целиком на карте (18.8 ГБ): проза ~26 ток/с, код
-80–95 ток/с при пороге 0.95; `CMF_CLOVER_THRESHOLD=0.8` ускоряет до 25–30 и
-124–150 ток/с. На Mac mini M4 (24 ГБ) проходы, коммиты блоков и промпт идут
-на Metal: проза 3.2 ток/с, код 6.5–9 ток/с. `cortiq serve` даёт OpenAI-совместимый API с потоковой выдачей.
+`q8_2f` — почти без потерь (35 ГБ, 15.86).
+
+Токены в секунду после промпта, `q4tp-v2`: RTX 5090 (Vulkan) — 120 на прозе и
+121 на коде, промпт на 2048 токенов читается со скоростью 1143 ток/с; при 16 ГБ
+видеопамяти — 54 и 53; Mac mini M4 (24 ГБ, промпт на Metal ~170 ток/с, декод на
+CPU) — 13–18 и 14–18; только CPU, 15 ядер Xeon — 13.8 и 10.9.
+
+`CMF_CLOVER_MODE` выбирает режим: `ar` (по умолчанию) — каузальный декод со
+штрафами из релиза; `draft` — самоспекуляция, проход денойзинга предлагает
+16 токенов, каузальный путь их проверяет (RTX 5090: 42 и 104 ток/с); `denoise` —
+блочный денойзинг LowConfidence из релиза (RTX 5090: 18–26 и 63–95; M4: 3.2 и
+6.5–9). `cortiq serve` даёт OpenAI-совместимый API с потоковой выдачей.
 
 ## 中文说明
 
 Clover-35B-A3B-Preview 是 DiffuSpace 基于 Qwen3.6-35B-A3B 的扩散语言模型（35B
-参数，每个 token 约 3B 激活）。模型以 32 个 token 为一块生成：每块从掩码开始，
-经多次去噪一次确定多个 token。本仓库提供可由 Rust 推理引擎 `cortiq`（0.8.41 及以上）
-加载的 CMF 文件；默认文件为 `q4tp-v2`（专家 4 位 GPTQ，19.36 GB）。RTX 5090 上
-每次去噪 34 ms，整模型驻留显存（18.8 GB）：阈值 0.95 时文本约 26 token/s，
-代码 80–95 token/s。Mac mini M4（24 GB）走 Metal：文本 3.2 token/s，代码
-6.5–9 token/s。
+参数，每个 token 约 3B 激活）。它可以用 32 个 token 的块经多次去噪生成，其主干也可作
+普通因果模型运行。本仓库提供可由 Rust 推理引擎 `cortiq`（0.8.52 及以上）加载的 CMF
+文件；默认文件为 `q4tp-v2`（专家 4 位 GPTQ，19.36 GB）。`cortiq` 默认因果解码，这在
+我们测过的所有机器上都最快。
+
+每秒 token 数（提示之后，`q4tp-v2`）：RTX 5090（Vulkan）文本 120、代码 121，2048 个
+token 的提示 1143 token/s；16 GB 显存 54 和 53；Mac mini M4（24 GB，提示走 Metal 约
+170 token/s，解码走 CPU）13–18 和 14–18；仅 CPU（15 核 Xeon）13.8 和 10.9。
+
+`CMF_CLOVER_MODE` 选择模式：`ar`（默认）为因果解码；`draft` 为自推测，一次去噪提出
+16 个 token，由因果路径验证（RTX 5090：42 和 104）；`denoise` 为发布版的 LowConfidence
+块去噪（RTX 5090：18–26 和 63–95；M4：3.2 和 6.5–9）。
 
 ```bash
 hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.cmf --local-dir .

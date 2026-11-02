@@ -114,6 +114,35 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Clover-35B-A3B-Preview декодирует каузально (0.8.52)
+
+Блочная диффузионная модель теперь по умолчанию идёт обычным каузальным путём
+со штрафами из релиза: `q4tp-v2` даёт 120 ток/с на RTX 5090 и на прозе, и на
+коде, 53 при бюджете 16 ГБ, 13–18 на Mac mini M4 (24 ГБ; промпт на Metal,
+~170 ток/с, строки на CPU). `CMF_CLOVER_MODE=denoise` оставляет блочный денойзинг
+LowConfidence, а `CMF_CLOVER_MODE=draft` включает самоспекуляцию вендора; все три
+сравниваются в [docs/CLOVER.md](docs/CLOVER.md).
+
+## SenseNova-Loop, Mage-VL-Cowork и Primal VAE (0.8.51)
+
+[SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
+выполняет блок из 24 слоёв декодера дважды с общими весами, внутри петли — два
+остаточных потока mHC; [Mage-VL-Cowork](https://huggingface.co/infosave/Mage-VL-Cowork-cmf) —
+агент Microsoft на 4 млрд для работы с компьютером по скриншотам в исходном
+разрешении; [Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) —
+автоэнкодер изображений Ostris (1–2 канала, сжатие 2×):
+
+```sh
+cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "Опиши это изображение." --no-think
+cortiq run mage-vl-cowork-q8_2f.cmf --image screen.png --prompt "Task: open the Downloads folder."
+cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
+Жадный текст и строки энкодеров совпадают с Transformers float32. Обе
+визуальные башни считаются на GPU (Vulkan и Metal), петля и mHC — внутри
+токен-графов wgpu и Metal; VAE кодирует или декодирует 1024×1024 одной
+отправкой на GPU (0.40 / 0.29 с на NVIDIA A40).
+
 ## Речь LFM3, Omni и d1 (0.8.50)
 
 [LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) распознаёт и
@@ -201,10 +230,10 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как работает хеш-таблица." --no-think
 ```
 
-На Vulkan каждый проход денойзинга — одна отправка на GPU (34 мс на блок из
+С `CMF_CLOVER_MODE=denoise` на Vulkan каждый проход денойзинга — одна отправка на GPU (34 мс на блок из
 32 токенов на RTX 5090: ~26 ток/с на прозе, 80–95 на коде при пороге из
 релиза модели); на Apple silicon проходы идут на Metal (Mac mini M4, 24 ГБ:
-3.2 ток/с на прозе, 6.5–9 на коде, 0.8.41). Конвертация, параметры генерации и замеры —
+3.2 ток/с на прозе, 6.5–9 на коде). Конвертация, параметры генерации и замеры —
 [docs/CLOVER.md](docs/CLOVER.md). В этом же релизе графы всех MoE-моделей на
 Vulkan занимают меньше видеопамяти: стек 35B-A3B q4tp — 18.8 ГБ вместо 31.8 ГБ,
 а опубликованная Qwen3.6-35B-A3B декодирует 156 ток/с на карте 32 ГБ.

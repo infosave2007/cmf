@@ -32,6 +32,8 @@ pub mod qi21;
 // EmbeddingGemma 2 text encoder — child module, `gpu_metal/egemma2.rs`.
 #[doc(hidden)]
 pub mod egemma2;
+pub mod primal_vae;
+pub mod mhc;
 
 // q8_2f routed experts on the token graph and the MoE chunk prefill —
 // child module, `gpu_metal/moe_q8.rs`.
@@ -18680,6 +18682,8 @@ pub struct SconvGpuLayer<'a> {
 /// One GDN layer's worth of tensors/vectors for the whole-block GPU
 /// path. Matvec tensors are (directory idx, rows, cols) of q1 weights.
 pub struct GdnGpuLayer<'a> {
+    /// SenseNova-Loop mHC streams around this layer (None: plain residual).
+    pub mhc: Option<crate::gpu::GraphMhc<'a>>,
     pub attn_norm: &'a [f32],
     pub post_norm: &'a [f32],
     pub qkv: (usize, usize, usize),
@@ -18808,6 +18812,8 @@ pub struct GraphDims {
 /// cols) triples; the qk-norms / RoPE / KV / attend stay on the CPU
 /// between the graph's QKV prefix and O+FFN suffix.
 pub struct AttnGpuLayer<'a> {
+    /// SenseNova-Loop mHC streams around this layer (None: plain residual).
+    pub mhc: Option<crate::gpu::GraphMhc<'a>>,
     pub attn_norm: &'a [f32],
     pub post_norm: &'a [f32],
     pub wq: (usize, usize, usize),
@@ -20604,7 +20610,7 @@ impl TokenGraph {
         // Dense decode (`fuse_on`): h += O·ao in the projection's epilogue,
         // so the norm below runs without a delta — bit-exact, one pass less.
         // Not under a Gemma-4 sandwich norm: O·ao is normed before its add.
-        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp) && l.attn_out_norm.is_none();
+        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp) && l.attn_out_norm.is_none() && l.mhc.is_none();
         if decode_skip('o') {
         } else if o_fused {
             encode_q4tp_matvec_m_add(
@@ -20656,7 +20662,7 @@ impl TokenGraph {
             } => {
                 let tail = (l.ffn_out_norm.is_some() || l.layer_scale.is_some())
                     .then_some((l.ffn_out_norm, l.layer_scale.unwrap_or(1.0)));
-                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, delta, tail);
+                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, delta, tail, l.mhc.as_ref());
             }
             MetalFfn::Moe(m) => {
                 self.encode_post_moe_ffn(enc, l.post_norm, m, delta);
@@ -20827,6 +20833,21 @@ impl TokenGraph {
             cmd.new_compute_command_encoder()
         };
         self.in_conc.set(self.conc);
+        // SenseNova-Loop mHC: the attention reads the routed branch.
+        if let Some(m) = &l.mhc {
+            mhc::encode_route(
+                self.c,
+                enc,
+                &self.h_b,
+                &const_buf(self.c, m.attn_w),
+                &const_buf(self.c, m.attn_b),
+                self.dims.hidden,
+                m.enter,
+                m.iters,
+                m.pre_scale,
+            );
+            self.bar(enc);
+        }
         // 1. attn rmsnorm h → n
         if !decode_skip('n') {
             disp(
@@ -21273,6 +21294,9 @@ impl TokenGraph {
         // Gemma-4 layer tail: (ffn_out_norm, layer_scale) — h = (h +
         // norm(d))·sc in one `gemma4` pass instead of the plain h += d.
         tail: Option<(Option<&[f32]>, f32)>,
+        // SenseNova-Loop mHC: `delta` folds into the streams, the FFN reads
+        // the routed branch, its output folds in too.
+        mhc: Option<&crate::gpu::GraphMhc>,
     ) {
         let gelu = act == 1;
         // tanh-GELU (and the layer tail) come from the Gemma-4 library;
@@ -21299,6 +21323,24 @@ impl TokenGraph {
         let fg_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
         let fu_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
         let fa_b = io_buf(self.c, 35_000_000_221 + inter, inter * 4);
+        if let Some(m) = mhc {
+            let d = delta.expect("an mHC layer hands its mixer output over");
+            mhc::encode_merge(self.c, enc, &self.h_b, d, self.dims.hidden, false);
+            self.bar(enc);
+            mhc::encode_route(
+                self.c,
+                enc,
+                &self.h_b,
+                &const_buf(self.c, m.ffn_w),
+                &const_buf(self.c, m.ffn_b),
+                self.dims.hidden,
+                false,
+                m.iters,
+                m.pre_scale,
+            );
+            self.bar(enc);
+        }
+        let delta = if mhc.is_some() { None } else { delta };
         // Fused residual-add + RMSNorm: h += delta (when present),
         // n = rmsnorm(h, post_norm). Uses add_rmsnorm_rows which
         // already handles the `hasd` flag.
@@ -21418,7 +21460,7 @@ impl TokenGraph {
         }
         self.bar(enc);
         let ad = self.proj_abs(down).unwrap();
-        let down_fused = gu_fused && matches!(ad.1, ProjKind::Q4tp) && tail.is_none();
+        let down_fused = gu_fused && matches!(ad.1, ProjKind::Q4tp) && tail.is_none() && mhc.is_none();
         // Part two of the fusion stack (same CMF_METAL_DUAL=1 gate):
         // down consumes gate and up directly with SiLU inline — the
         // silu dispatch and its dependent-stage drain disappear.
@@ -21524,6 +21566,10 @@ impl TokenGraph {
                 sc,
                 1,
             );
+            return;
+        }
+        if let Some(m) = mhc {
+            mhc::encode_merge(self.c, enc, &self.h_b, &self.d_b, self.dims.hidden, m.leave);
             return;
         }
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
@@ -22197,6 +22243,20 @@ impl TokenGraph {
 
         for (l, (a8, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
             let s_off = (ring_len * 4) as u64;
+            // SenseNova-Loop mHC: the mixer reads the routed branch.
+            if let Some(m) = &l.mhc {
+                mhc::encode_route(
+                    c,
+                    enc,
+                    &h_b,
+                    &const_buf(c, m.attn_w),
+                    &const_buf(c, m.attn_b),
+                    cfg.hidden,
+                    m.enter,
+                    m.iters,
+                    m.pre_scale,
+                );
+            }
             // 1. attn rmsnorm h → n
             enc_one(
                 &c.rmsn,
@@ -22367,6 +22427,7 @@ impl TokenGraph {
                             *act,
                             Some(&d_b),
                             None,
+                            l.mhc.as_ref(),
                         );
                     }
                     MetalFfn::Moe(m) => {
@@ -22498,7 +22559,7 @@ impl TokenGraph {
                     act,
                 } => {
                     let tail = l.ffn_out_norm.map(|w| (Some(w), 1.0));
-                    self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, Some(&d_b), tail);
+                    self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, Some(&d_b), tail, None);
                 }
                 MetalFfn::Moe(m) => self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b)),
                 MetalFfn::FlintMoe(m) => {
