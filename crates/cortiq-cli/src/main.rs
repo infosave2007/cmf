@@ -9185,7 +9185,11 @@ async fn cmd_run(
     let ov2_media = cortiq_engine::onevision2::has_vision(&model) && !images.is_empty();
     // SenseNova-Loop: images through the Qwen3-VL tower, MRoPE rows.
     let sn_media = cortiq_engine::sensenova::has_vision(&model) && !images.is_empty();
-    let ov2_media_or_sn = ov2_media || sn_media;
+    // MiniCPM-OCR: images through the SigLIP tower.
+    let ocr_media = cortiq_engine::minicpm_ocr::has_vision(&model) && !images.is_empty();
+    // Unlimited-OCR: images and an optional instruction, no chat template.
+    let uocr_media = cortiq_engine::uocr::is_uocr(&model) && !images.is_empty();
+    let ov2_media_or_sn = ov2_media || sn_media || ocr_media || uocr_media;
     // A text answer from a speech model: no speech or mixed turn.
     if lfm3_audio {
         let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
@@ -9193,10 +9197,10 @@ async fn cmd_run(
     }
     anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
     anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || ov2_media_or_sn || images.is_empty(),
-        "--image requires DeepSeek-V4.1, MiMo, an LFM3-VL, Mage-VL or SenseNova-Loop file");
+        "--image requires DeepSeek-V4.1, MiMo, an LFM3-VL, Mage-VL, SenseNova-Loop, MiniCPM-OCR or Unlimited-OCR file");
     anyhow::ensure!(!ov2_media_or_sn || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
         && std::env::var_os("CMF_PROMPT_IDS").is_none()),
-        "Mage-VL images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
+        "these images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     anyhow::ensure!(is_mimo || ((audios.is_empty() || lfm3_audio) && media_options.companion.is_none()
         && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
             || lfm3_vl
@@ -9798,6 +9802,25 @@ async fn cmd_run(
                 media_options.image_max_pixels)
                 .map_err(anyhow::Error::msg)?)
         } else { None };
+        let uocr_inputs = if uocr_media {
+            let sources: Vec<serde_json::Value> = images.iter().map(|path| serde_json::json!({"url":path})).collect();
+            Some(cortiq_engine::uocr::prepare(&model, &pipeline, &sources, Some(p))
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
+        // MiniCPM-OCR: the images, then the text, as in the model card.
+        let ocr_inputs = if ocr_media {
+            let mut content: Vec<serde_json::Value> = images.iter()
+                .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
+                .collect();
+            content.push(serde_json::json!({"type":"text", "text":p}));
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
+            Some(cortiq_engine::minicpm_ocr::prepare(&model, &pipeline, &messages, None, thinking)
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
         let sn_inputs = if sn_media {
             let mut content: Vec<serde_json::Value> = images.iter()
                 .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
@@ -9819,6 +9842,8 @@ async fn cmd_run(
             .map(|inputs| inputs.token_ids.clone())
             .or_else(|| ov2_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .or_else(|| sn_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
+            .or_else(|| ocr_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
+            .or_else(|| uocr_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .or_else(|| mimo_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .or_else(|| lfm3_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
@@ -9858,7 +9883,9 @@ async fn cmd_run(
         let media_rows = mimo_inputs.as_ref().and_then(|p| p.rows.as_deref())
             .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()))
             .or_else(|| ov2_inputs.as_ref().and_then(|p| p.rows.as_deref()))
-            .or_else(|| sn_inputs.as_ref().and_then(|p| p.rows.as_deref()));
+            .or_else(|| sn_inputs.as_ref().and_then(|p| p.rows.as_deref()))
+            .or_else(|| ocr_inputs.as_ref().and_then(|p| p.rows.as_deref()))
+            .or_else(|| uocr_inputs.as_ref().map(|p| p.rows.as_slice()));
         // LFM3-Audio speech answer: the assistant turn opens with
         // <|audio_start|>, frames until the end-of-audio frame, the codec.
         if let Some((path, speech_mode)) = speech_out {

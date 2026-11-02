@@ -104,6 +104,18 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Unlimited-OCR-2 与 MiniCPM-OCR-1.0（0.8.53）
+
+两款 OCR 模型。[Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
+一次解析整份文档：无论文档多长，注意力每步最多读取 512 个 token，RTX PRO 4500 在 24 页上
+保持 320 token/s。[MiniCPM-OCR-1.0](https://huggingface.co/infosave/MiniCPM-OCR-1.0-cmf)
+识别整页或区域，速度为 254–267 token/s：
+
+```sh
+cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192
+cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
+```
+
 ## Clover-35B-A3B-Preview 默认因果解码（0.8.52）
 
 这款块扩散模型现在默认走普通因果路径，并使用发布版的响应惩罚：`q4tp-v2` 在

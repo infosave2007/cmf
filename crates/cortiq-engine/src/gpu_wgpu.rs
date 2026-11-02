@@ -59,6 +59,7 @@ pub(crate) mod dense_mv;
 pub(crate) mod gram;
 pub(crate) mod mhc;
 pub(crate) mod vit;
+pub(crate) mod uocr;
 pub(crate) mod primal_vae;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
@@ -26927,6 +26928,10 @@ pub fn forward_token_graph(
                 graph_decline(reason);
                 return token_graph_outcome(o1_started || state_started, false);
             }
+            if g.dash.as_ref().is_some_and(|d| !uocr::admits(d, hidden, nh, hd)) {
+                graph_decline("DASH geometry outside the kernels");
+                return token_graph_outcome(o1_started || state_started, false);
+            }
             if *output_gate {
                 graph_decline("per-layer attention geometry with an output gate");
                 return token_graph_outcome(o1_started || state_started, false);
@@ -27507,13 +27512,13 @@ pub fn forward_token_graph(
                             graph_decline("detached shared MoE expert resolve");
                             return token_graph_outcome(o1_started || state_started, false);
                         };
-                        // This path is intentionally narrow: it is the
-                        // proven Q4TP SwiGLU representation used by Flint.
+                        // This path is intentionally narrow: the q4tp SwiGLU
+                        // Flint proved and its q8_2f twin (Unlimited-OCR).
                         // Other layouts/gated shared experts stay with their
                         // established owner rather than taking a near-match.
-                        if gate.kind != 6
-                            || up.kind != 6
-                            || down.kind != 6
+                        if !(gate.kind == 6 || gate.kind == 7)
+                            || up.kind != gate.kind
+                            || down.kind != gate.kind
                             || gate.prism != crate::gpu::GraphPrismOp::None
                             || up.prism != crate::gpu::GraphPrismOp::None
                             || down.prism != crate::gpu::GraphPrismOp::None
@@ -27521,7 +27526,7 @@ pub fn forward_token_graph(
                             || up.affine
                             || down.affine
                         {
-                            graph_decline("detached shared MoE expert is not plain q4tp");
+                            graph_decline("detached shared MoE expert is not plain q4tp or q8_2f");
                             return token_graph_outcome(o1_started || state_started, false);
                         }
                         Some(LDetachedShared {
@@ -29482,12 +29487,14 @@ pub fn forward_token_graph(
                         .map(|k| stor(bytemuck::cast_slice(k)))
                         .unwrap_or_else(|| zeros(hd));
                     let gate_flag = if *output_gate { 1u32 } else { 0 };
+                    // DASH: `invf` holds this position's angles.
+                    let rope_pos = if geom.is_some_and(|g| g.dash.is_some()) { 1 } else { position };
                     let mut rope_words = rope_uniform_words(
                         nh,
                         lnkv,
                         hd,
                         lrd,
-                        position,
+                        rope_pos,
                         flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
                         eps,
                         0,
@@ -29877,7 +29884,7 @@ pub fn forward_token_graph(
                         }
                         // RoPE + append fused, for a layer without an output
                         // gate (the fused kernel does not split q||gate).
-                        let rkv = gx.rope_kv.as_ref().filter(|_| !*output_gate && hd <= 256);
+                        let rkv = gx.rope_kv.as_ref().filter(|_| !*output_gate && hd <= 256 && g.dash.is_none());
                         if let (Some((rp, rl)), false) = (rkv, skip_attn) {
                             let bg_rk = bind_pairs(
                                 c,
@@ -29919,7 +29926,30 @@ pub fn forward_token_graph(
                             pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         }
                         ts_point!(enc, 22); // rope + kv append
-                        if let (Some((dpp, dpl)), false) = (g4dec, skip_attn) {
+                        if let Some(d) = g.dash.as_ref() {
+                            let e = uocr::DashEnc {
+                                d,
+                                key: (kv_id, layer_base + li),
+                                n1: &n1,
+                                qout: &qout,
+                                kbuf,
+                                vbuf,
+                                invf: &invf_l,
+                                attn: &attn,
+                                cap: mcap,
+                                pos0: position,
+                                k: 1,
+                                nh,
+                                hd,
+                                hidden,
+                                scale: attn_scale,
+                                eps,
+                            };
+                            if !uocr::encode_layer(c, &mut enc, &e, None) {
+                                graph_refused("DASH kernels unavailable");
+                                return token_graph_outcome(o1_started || state_started, false);
+                            }
+                        } else if let (Some((dpp, dpl)), false) = (g4dec, skip_attn) {
                             let xacc = GraphScratch::ensure(
                                 &c.device,
                                 &mut gs.xacc,
@@ -33205,6 +33235,8 @@ pub fn forward_batch_graph_at(
             act: u32,
         },
         Moe {
+            /// A wider shared expert outside the bank: gate, up, down, width.
+            detached: Option<(GMat, GMat, GMat, usize)>,
             router: GMat,
             sgate: GMat,
             gate_all: wgpu::Buffer,
@@ -33506,6 +33538,7 @@ pub fn forward_batch_graph_at(
                 has_shared,
                 shared_gated,
                 route_scale,
+                detached_shared,
                 ..
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + usize::from(*has_shared)
@@ -33553,7 +33586,26 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("site:5990");
                     return batch_outcome(o1_started || state_started, false);
                 };
+                let detached = match detached_shared {
+                    Some(ds) => {
+                        let (Some(gate), Some(up), Some(down)) = (
+                            resolve(&ds.gate, ds.width, hidden),
+                            resolve(&ds.up, ds.width, hidden),
+                            resolve(&ds.down, hidden, ds.width),
+                        ) else {
+                            bgraph_refused("detached shared MoE expert resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        };
+                        if !(gemmable(&gate) && gemmable(&up) && gemmable(&down)) || ds.width > inter {
+                            bgraph_refused("detached shared MoE expert not gemmable");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                        Some((gate, up, down, ds.width))
+                    }
+                    None => None,
+                };
                 BFfn::Moe {
+                    detached,
                     router,
                     sgate,
                     gate_all,
@@ -34745,7 +34797,36 @@ pub fn forward_batch_graph_at(
                         && hd % 4 == 0
                         && pos_end <= cap
                 });
-                if let Some(p) = preview_bt {
+                if let Some(d) = geom.as_ref().and_then(|g| g.dash.as_ref()) {
+                    // Unlimited-OCR's prompt chunk.
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let qall = rwc(k * nh * hd);
+                    let invf_l = stor(bytemuck::cast_slice(geom.as_ref().map_or(invf, |g| g.invf)));
+                    let e = uocr::DashEnc {
+                        d,
+                        key: (kv_id, layer_base + li),
+                        n1: &n1,
+                        qout: &qall,
+                        kbuf,
+                        vbuf,
+                        invf: &invf_l,
+                        attn: &attn_bb,
+                        cap: xcaps[&li],
+                        pos0: positions[0],
+                        k,
+                        nh,
+                        hd,
+                        hidden,
+                        scale: attn_scale,
+                        eps,
+                    };
+                    state_started = true;
+                    let raw = uocr::DashRaw { q: &qraw_b, k: &kb_b, v: &vb_b };
+                    if !uocr::encode_layer(c, &mut enc, &e, Some(&raw)) {
+                        bgraph_refused("DASH kernels unavailable");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                } else if let Some(p) = preview_bt {
                     // Block preview through the token-axis kernels: RoPE and
                     // the mirror append of every row, then every row attends
                     // all pos_end rows (`n_all`) — the block is bidirectional.
@@ -36366,6 +36447,7 @@ pub fn forward_batch_graph_at(
                 has_shared,
                 shared_gated,
                 route_scale,
+                detached: _,
             } => {
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let mut continue_ffn = true;
@@ -36667,6 +36749,27 @@ pub fn forward_batch_graph_at(
             }
         }
         bts!(enc, 3);
+        // A shared expert outside the bank adds to the routed sum.
+        if let BFfn::Moe { detached: Some((gate, up, down, w)), .. } = &lw.ffn {
+            let w = *w;
+            ematb2(&mut enc, gate, up, &n1, &gbuf, &ubuf, w, w, hidden);
+            let su = unif(&[(k * w) as u32, 0, 0, 0]);
+            go(
+                &mut enc,
+                &c.silu,
+                &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &su]),
+                ((k * w) as u32).div_ceil(256),
+            );
+            let shared_out = rwc(k * hidden);
+            ematb(&mut enc, down, &abuf, &shared_out, hidden, w);
+            let ax = unif(&[1.0f32.to_bits(), (k * hidden) as u32, 0, 0]);
+            go(
+                &mut enc,
+                &c.axpy,
+                &bg(&c.layout_axpy, &[&shared_out, &ob, &ax]),
+                ((k * hidden) as u32).div_ceil(256),
+            );
+        }
         let sandwich_tail = l.ffn_out_norm.is_some() || l.layer_scale.is_some();
         if let (true, Some(gp), Some((_, ob2))) = (sandwich_tail, g4p, g4_bufs.as_ref()) {
             // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
@@ -42821,6 +42924,43 @@ fn dit_attention_inner(
     resident: bool,
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
+    dit_attention_core(qh, kh, vh, nh, nkv, n, hd, scale, out, resident, keep, None)
+}
+
+/// SAM's decomposed relative positions, added to each head's score plane.
+pub(crate) struct DitRelBias<'a> {
+    pub pipe: &'a wgpu::ComputePipeline,
+    pub rel: &'a wgpu::Buffer,
+    pub g: usize,
+}
+
+/// The resident attention with a relative bias before the softmax.
+pub(crate) fn dit_attention_rel(
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    keep: &mut Option<wgpu::Buffer>,
+    bias: &DitRelBias<'_>,
+) -> bool {
+    dit_attention_core(&[], &[], &[], nh, nh, n, hd, scale, &mut [], true, Some(keep), Some(bias))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dit_attention_core(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    nh: usize,
+    nkv: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+    resident: bool,
+    keep: Option<&mut Option<wgpu::Buffer>>,
+    rel: Option<&DitRelBias<'_>>,
+) -> bool {
     let Some(c) = ctx() else { return false };
     let _op = c.op_gate.enter();
     if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
@@ -43169,6 +43309,23 @@ fn dit_attention_inner(
             }
         }
         split_now(&mut enc, 0);
+        if let Some(r) = rel {
+            let raw = [n as u32, n as u32, r.g as u32, 0, h as u32, hd as u32, n as u32, 0];
+            let u = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&raw),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dit-rel-bg"),
+                layout: &r.pipe.get_bind_group_layout(0),
+                entries: &[bind_buf(11, &qb), bind_buf(12, r.rel), bind_buf(13, &scb), bind_buf(9, &u)],
+            });
+            let mut pass = begin_pass_with(&mut enc, Some("dit-rel"), None);
+            pass.set_pipeline(r.pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(16), 1, 1);
+        }
         {
             let mut pass = begin_pass_with(&mut enc, Some("dit-sm"), None);
             pass.set_pipeline(&c.dit_softmax);

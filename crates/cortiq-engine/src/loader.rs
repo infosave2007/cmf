@@ -2074,6 +2074,10 @@ impl Pipeline {
             max_seq_len,
             sampler_config,
         );
+        // Unlimited-OCR: the DASH router and its page state.
+        if arch.arch_name == crate::uocr::ARCH {
+            pipeline.dash = Some(Box::new(crate::uocr::Dash::from_model(model).map_err(CmfError::Parse)?));
+        }
         if let Some((_, mhc)) = sensenova {
             pipeline.layer_map = layer_map;
             if let Some(ms) = mhc {

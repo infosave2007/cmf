@@ -146,6 +146,10 @@ pub struct Pipeline {
     pub layer_map: Option<Vec<usize>>,
     /// SenseNova-Loop: the mHC routers (`sensenova::Mhc`).
     pub mhc: Option<Box<crate::sensenova::Mhc>>,
+    /// Unlimited-OCR: the DASH router and page state (`uocr::Dash`).
+    pub dash: Option<Box<crate::uocr::Dash>>,
+    /// Its prompt chunks ride the batch graph until that declines.
+    dash_batch_on: bool,
     /// The decode token's mHC streams, `[streams · hidden]`.
     mhc_r: Vec<f32>,
     /// Interleaved-MRoPE sections and the prompt rows' (t, h, w) positions
@@ -2154,10 +2158,10 @@ impl Pipeline {
         }
     }
 
-    /// Mage-VL (`llava_onevision2`) prompt ingest through the batched wgpu
+    /// Mage-VL (`llava_onevision2`) and MiniCPM-OCR prompt ingest through the batched wgpu
     /// graph (`CMF_GRAPH_PREFILL=0` keeps the chunked host prefill).
     fn onevision2_prefill(&self) -> bool {
-        self.model.as_ref().is_some_and(|m| m.header.arch.arch_name == "llava_onevision2")
+        self.model.as_ref().is_some_and(|m| matches!(m.header.arch.arch_name.as_str(), "llava_onevision2" | "minicpm_ocr"))
             && std::env::var("CMF_GRAPH_PREFILL").as_deref() != Ok("0")
     }
 
@@ -2477,6 +2481,10 @@ impl Pipeline {
         };
         const MOE_WORKING_SET_REASON: &str =
             "model weights exceed Metal working set for native MoE graph";
+        // Unlimited-OCR's router has no Metal kernels: the per-layer host path.
+        if self.dash.is_some() {
+            return start;
+        }
         // A prior admission check rejected this pipeline. Avoid rebuilding the
         // entire 40-layer graph plan at every individual host layer after the
         // fallback begins; the per-operation path below stays eligible.
@@ -3946,6 +3954,8 @@ impl Pipeline {
             physical_layers,
             loop_final_norm,
             layer_map: None,
+            dash: None,
+            dash_batch_on: true,
             mhc: None,
             mhc_r: Vec::new(),
             mrope_sections: None,
@@ -5028,6 +5038,16 @@ impl Pipeline {
         // narrowed file whose one segment is always on carries exactly
         // such a mask — drop it here rather than pay 5x for a no-op.
         let task_mask = self.drop_open_mask(task_mask);
+        // Unlimited-OCR: the page coordinates of this prompt.
+        if self.dash.is_some() {
+            if prompt_rows.is_none() {
+                return Err("Unlimited-OCR reads images: pass at least one".into());
+            }
+            let eos = self.tokenizer.eos_token_id.unwrap_or(1);
+            if let Some(d) = self.dash.as_mut() {
+                d.begin(input_ids, eos)?;
+            }
+        }
         // A block-diffusion model generates whole blocks by denoising
         // previews, unless the request asks for the causal decode.
         if self.clover.is_some() && !self.clover_causal_request() {
@@ -6429,6 +6449,9 @@ impl Pipeline {
                 }
             }
             self.clover_causal_logits(&mut logits, generated, &all_ids[penalty_from..]);
+            if let Some(g) = self.dash.as_mut().and_then(|d| d.guard.as_mut()) {
+                g.apply(&mut logits, &all_ids[input_ids.len()..]);
+            }
             let t_next = match forced.or_else(|| forced_ids_at(generated)) {
                 Some(c) => c,
                 None => {
@@ -7042,6 +7065,9 @@ impl Pipeline {
                         if let Some(m) = mtp.as_mut() {
                             let _ = self.mtp_step_metal(m, &hidden, t_fwd, next_pos - 1, false);
                         }
+                    }
+                    if let Some(d) = self.dash.as_mut() {
+                        d.at_decode(t_fwd, next_pos);
                     }
                     hidden = self.forward_layers(&self.embed_single(t_fwd), next_pos, task_mask);
                     next_pos += 1;
@@ -11681,6 +11707,12 @@ impl Pipeline {
         pos: usize,
         task_mask: Option<&TaskMask>,
     ) -> Result<Vec<f32>, String> {
+        if self.dash.is_some() {
+            let PrefillIn::Hidden(rows) = input else {
+                return Err("Unlimited-OCR prompts carry image rows".into());
+            };
+            return Ok(self.dash_prefill_rows(rows, pos));
+        }
         self.mimo_moe_prepare();
         let hs = self.hidden_size;
         let bk = match input {
@@ -11746,6 +11778,44 @@ impl Pipeline {
         } else {
             Ok(out)
         }
+    }
+
+    /// Unlimited-OCR's prompt rows, one position at a time: each query has its
+    /// own coordinates and page candidates.
+    fn dash_prefill_rows(&mut self, rows: &[f32], pos: usize) -> Vec<f32> {
+        let hs = self.hidden_size;
+        let n = rows.len() / hs;
+        let mut last = vec![0f32; hs];
+        let mut i = 0usize;
+        while i < n && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            #[cfg(not(target_os = "macos"))]
+            if self.dash_batch_on {
+                let k = (n - i).min(crate::gpu::DASH_CHUNK_MAX);
+                if let Some(d) = self.dash.as_mut() {
+                    d.at_prompt_chunk(pos + i, k);
+                }
+                let mut h = rows[i * hs..(i + k) * hs].to_vec();
+                let positions: Vec<usize> = (pos + i..pos + i + k).collect();
+                match self.try_batch_graph_wgpu_prefix(&mut h, &positions, k, None, None) {
+                    crate::gpu::BatchGraphOutcome::Completed => {
+                        last.copy_from_slice(&h[(k - 1) * hs..]);
+                        i += k;
+                        continue;
+                    }
+                    crate::gpu::BatchGraphOutcome::Failed => {
+                        self.graph_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return last;
+                    }
+                    crate::gpu::BatchGraphOutcome::Declined => self.dash_batch_on = false,
+                }
+            }
+            if let Some(d) = self.dash.as_mut() {
+                d.at_prompt(pos + i);
+            }
+            last = self.forward_layers(&rows[i * hs..(i + 1) * hs], pos + i, None);
+            i += 1;
+        }
+        last
     }
 
     /// The layer-major batched walk over a layer span [from..upto_excl):
@@ -13218,9 +13288,31 @@ impl Pipeline {
     /// heads, V width, rotary width and RoPE table, window and sinks of
     /// THIS layer, exactly what the CPU attention reads for it.
     fn graph_attn_geom(&self, li: usize) -> Option<crate::gpu::GraphAttnGeom<'_>> {
-        self.graph_attn_decline_reason()?;
+        if self.dash.is_none() {
+            self.graph_attn_decline_reason()?;
+        }
         let (nkv, hd, rd) = self.layer_geom(li);
-        let invf: &[f32] = if self.layer_is_local(li) {
+        let dash = self.dash.as_deref().map(|d| {
+            let l = &d.layers[li];
+            crate::gpu::GraphDash {
+                qk_proj: &l.qk_proj,
+                q_norm: &l.q_norm,
+                k_norm: &l.k_norm,
+                head_cls: &l.head_cls,
+                idx_scale: l.route.idx_scale,
+                floor: l.route.floor,
+                sigma: l.route.sigma,
+                k: l.route.k,
+                block: d.block,
+                local_blocks: d.local_blocks,
+                nblk: d.allow.len(),
+                cands: &d.cands,
+                coff: &d.coff,
+            }
+        });
+        let invf: &[f32] = if let Some(d) = self.dash.as_deref() {
+            &d.angles
+        } else if self.layer_is_local(li) {
             match &self.inv_freq_local {
                 Some(f) => f.as_slice(),
                 None => self.inv_freq.as_slice(),
@@ -13241,6 +13333,7 @@ impl Pipeline {
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
             v_norm: self.attn_v_norm,
+            dash,
         })
     }
 
@@ -14469,11 +14562,13 @@ impl Pipeline {
                         Some((se, None))
                             if se.gate_proj.rows() != inter || se.up_proj.rows() != inter =>
                         {
-                            if !matches!(se.act, Act::Silu)
-                                || se.gate_proj.mapped_q4tp().is_none()
-                                || se.up_proj.mapped_q4tp().is_none()
-                                || se.down_proj.mapped_q4tp().is_none()
-                            {
+                            let q4 = se.gate_proj.mapped_q4tp().is_some()
+                                && se.up_proj.mapped_q4tp().is_some()
+                                && se.down_proj.mapped_q4tp().is_some();
+                            let q8 = se.gate_proj.mapped_q8_2f().is_some()
+                                && se.up_proj.mapped_q8_2f().is_some()
+                                && se.down_proj.mapped_q8_2f().is_some();
+                            if !matches!(se.act, Act::Silu) || !(q4 || q8) {
                                 return None;
                             }
                             Some(crate::gpu::GraphMoeDetachedShared {
@@ -16551,7 +16646,24 @@ impl Pipeline {
                         // A shared expert rides as slot top_k (gated or
                         // not is a flag on the select kernel); without one
                         // (MiMo-V2, LFM2-MoE) the kernels run top_k slots.
-                        let shared = m.shared.as_ref();
+                        let inter0 = m.experts.first()?.gate_proj.rows();
+                        // A wider shared expert (Unlimited-OCR) stays out of
+                        // the packed bank, as on the token graph.
+                        let detached_shared = match m.shared.as_ref() {
+                            Some((se, None)) if se.gate_proj.rows() != inter0 || se.up_proj.rows() != inter0 => {
+                                if !matches!(se.act, Act::Silu) {
+                                    return None;
+                                }
+                                Some(crate::gpu::GraphMoeDetachedShared {
+                                    gate: gw(&se.gate_proj)?,
+                                    up: gw(&se.up_proj)?,
+                                    down: gw(&se.down_proj)?,
+                                    width: se.gate_proj.rows(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        let shared = m.shared.as_ref().filter(|_| detached_shared.is_none());
                         let has_shared = shared.is_some();
                         let shared_gated = matches!(shared, Some((_, Some(_))));
                         let sgate = match shared {
@@ -16680,7 +16792,7 @@ impl Pipeline {
                             sigmoid_denom_eps: m.sigmoid_denom_eps,
                             bias: m.expert_bias.as_deref(),
                             has_shared,
-                            detached_shared: None,
+                            detached_shared,
                             shared_gated,
                             route_scale: m.routed_scaling,
                         }
@@ -18787,6 +18899,29 @@ impl Pipeline {
                         &mut self.kv_cache.layers[li],
                         &cfg,
                     )
+                }
+                AttnKind::Full { wq, wk, wv, wo, .. } if self.dash.is_some() => {
+                    let (nh_l, hd_l) = (self.num_heads, self.head_dim);
+                    let mut ao = vec![0f32; nh_l * hd_l];
+                    let dash = self.dash.as_mut().expect("guarded");
+                    crate::uocr::attention_host(
+                        dash,
+                        li,
+                        &self.ws.n1,
+                        wq,
+                        wk,
+                        wv,
+                        &mut self.kv_cache.layers[li],
+                        position,
+                        nh_l,
+                        hd_l,
+                        self.rms_eps as f32,
+                        pool.as_deref(),
+                        &mut ao,
+                    );
+                    let mut out = vec![0f32; hs];
+                    wo.matvec(&ao, &mut out, pool.as_deref());
+                    out
                 }
                 AttnKind::Full {
                     wq,

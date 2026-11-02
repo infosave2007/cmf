@@ -114,6 +114,19 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Unlimited-OCR-2 и MiniCPM-OCR-1.0 (0.8.53)
+
+Две OCR-модели. [Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
+разбирает весь документ за один проход: её внимание читает не больше 512 токенов на
+шаг при любой длине документа, и RTX PRO 4500 декодирует 320 ток/с на всех 24 страницах.
+[MiniCPM-OCR-1.0](https://huggingface.co/infosave/MiniCPM-OCR-1.0-cmf) распознаёт
+страницу или область на 254–267 ток/с:
+
+```sh
+cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192
+cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
+```
+
 ## Clover-35B-A3B-Preview декодирует каузально (0.8.52)
 
 Блочная диффузионная модель теперь по умолчанию идёт обычным каузальным путём

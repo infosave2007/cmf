@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.53] — 2026-11-02
+
+### Added
+- Unlimited-OCR-2 (`unlimited-ocr`, `uocr.rs`): multi-page document parsing. The
+  DeepEncoder (SAM ViT-B feeding CLIP-L), the MoE decoder and its DASH attention:
+  a per-layer router scores 32-token blocks through a learned summary, restricts
+  them to the query's page, takes entmax-1.5 over the best 16 and reads the best
+  12 with a centered log-prior bias plus the last 128 tokens, at most 512 rows
+  per query. Two-axis `page2d` rotary, the page-count guard, Pillow's fixed-point
+  bicubic. On wgpu the router and attend ride the token graph and a 64-row batch
+  graph chunk (`gpu_wgpu/uocr.rs`), SAM and CLIP stay resident (`vit::sam_encode`).
+  An RTX PRO 4500 decodes at 320 tok/s against 20 in Transformers float32 and holds
+  it over 24 pages; a tiled page's encoder takes 0.84 s. `q8_2f` matches float32
+  on the first 300 greedy tokens of a page.
+- MiniCPM-OCR-1.0 (`minicpm_ocr`, `minicpm_ocr.rs`): the SigLIP tower with nearest
+  position buckets, the 2×2 merger, the slicing image processor and its prompt
+  layout, on the resident ViT kernels. 254–267 tok/s against 35 in Transformers
+  float32; `q8_2f` matches float32 on 300 greedy tokens of a page.
+- `cortiq run --image` and `/v1/chat/completions` image parts for both models.
+
+### Changed
+- A MoE shared expert wider than its routed bank rides the batch graph, and in
+  q8_2f the token graph too.
+
 ## [0.8.52] — 2026-11-01
 
 ### Changed

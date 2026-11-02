@@ -1779,6 +1779,34 @@ pub struct GraphAttnGeom<'a> {
     /// Gemma-4's scale-less V norm: every V head is RMS-normalized (no
     /// weight) before it is cached, as `attention::vnorm_head` does.
     pub v_norm: bool,
+    /// Unlimited-OCR's block-sparse attend. `invf` then holds this position's
+    /// rotary angles and the rotation runs at position 1.
+    pub dash: Option<GraphDash<'a>>,
+}
+
+/// Rows of an Unlimited-OCR prompt chunk on the batch graph: every remote block
+/// of its rows must be closed before it starts, so it spans fewer blocks than
+/// the local window (4 of 32).
+pub const DASH_CHUNK_MAX: usize = 64;
+
+/// One layer's DASH router for the token graph (`gpu_wgpu::uocr`).
+#[derive(Clone, Copy)]
+pub struct GraphDash<'a> {
+    /// `[2·index_dim, hidden]`, the q rows then the k rows.
+    pub qk_proj: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub head_cls: &'a [f32],
+    pub idx_scale: f32,
+    pub floor: f32,
+    pub sigma: f32,
+    pub k: usize,
+    pub block: usize,
+    pub local_blocks: usize,
+    pub nblk: usize,
+    /// Candidate blocks of the rows, `coff[row]..coff[row + 1]` per row.
+    pub cands: &'a [u32],
+    pub coff: &'a [u32],
 }
 
 /// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
@@ -3778,6 +3806,8 @@ pub struct VitArgs<'a> {
     pub inter: usize,
     pub eps: f64,
     pub gelu_tanh: bool,
+    /// CLIP's `x·σ(1.702·x)`; wins over `gelu_tanh`.
+    pub quick_gelu: bool,
     pub rope_halves: bool,
     pub cos: &'a [f32],
     pub sin: &'a [f32],
@@ -3795,6 +3825,66 @@ pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::encode(a, x),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// One SAM block for [`sam_encode`]. `rel` is `[2w−1, hd]` relative positions,
+/// h then w (window blocks; the global ones take `SamArgs::rel_global`).
+pub struct SamLayer<'a> {
+    pub ln1_w: &'a [f32],
+    pub ln1_b: &'a [f32],
+    pub qkv: &'a [f32],
+    pub qkv_b: &'a [f32],
+    pub proj: &'a [f32],
+    pub proj_b: &'a [f32],
+    pub rel: &'a [f32],
+    pub ln2_w: &'a [f32],
+    pub ln2_b: &'a [f32],
+    pub fc1: &'a [f32],
+    pub fc1_b: &'a [f32],
+    pub fc2: &'a [f32],
+    pub fc2_b: &'a [f32],
+    pub window: usize,
+}
+
+/// One conv of SAM's neck, weights `[co, k·k, ci]`.
+pub struct SamConv<'a> {
+    pub w: &'a [f32],
+    pub ci: usize,
+    pub co: usize,
+    pub k: usize,
+    pub stride: usize,
+    pub pad: usize,
+    /// A LayerNorm2d follows (its weight and bias in `SamArgs::norms`).
+    pub norm: bool,
+}
+
+pub struct SamArgs<'a> {
+    pub key: u64,
+    pub layers: Vec<SamLayer<'a>>,
+    pub convs: Vec<SamConv<'a>>,
+    pub norms: Vec<&'a [f32]>,
+    /// Per global block: `[2g−1, hd]` h then w, resized to this grid.
+    pub rel_global: Vec<Vec<f32>>,
+    pub g: usize,
+    pub d: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub inter: usize,
+    pub eps: f64,
+}
+
+/// SAM's blocks and neck on the device; `false` = refused.
+#[allow(unused_variables)]
+pub fn sam_encode(a: &SamArgs, x: &[f32], out: &mut Vec<f32>) -> bool {
+    if std::env::var("CMF_VIT_RESIDENT").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::vit::sam_encode(a, x, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
