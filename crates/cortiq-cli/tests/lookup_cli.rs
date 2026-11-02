@@ -644,3 +644,141 @@ fn key_first_answers_backbone_routed_plant_prompts_from_the_table() {
     assert_eq!((c["a_backbone_b_key_first"].as_u64(), c["g2_pass"].as_bool()), (Some(0), Some(true)), "{c}");
     let _ = std::fs::remove_dir_all(&fx.dir);
 }
+
+#[test]
+fn key_span_router_pools_over_the_key_and_runs_no_forward_without_one() {
+    let fx = fixture("keyspan");
+    let skill = fx.dir.join("ks-skill.jsonl");
+    let general = fx.dir.join("ks-general.jsonl");
+    let skill_rows: Vec<(&str, &str, &str)> = SKILL_TEXTS.iter().map(|t| (*t, "ru", "herbs")).collect();
+    write_jsonl(&skill, &skill_rows);
+    // the same keys inside general text: the hard negatives of this pool
+    let hard: Vec<String> = SKILL_TEXTS
+        .iter()
+        .zip(GENERAL_TEXTS)
+        .map(|(k, g)| format!("{g} {k} {g}"))
+        .collect();
+    let general_rows: Vec<(&str, &str, &str)> = hard.iter().map(|t| (t.as_str(), "en", "general")).collect();
+    write_jsonl(&general, &general_rows);
+    let r = json(&[
+        "route-fit",
+        s(&fx.f1),
+        "--id",
+        SKILL_ID,
+        "--skill-prompts",
+        s(&skill),
+        "--general-prompts",
+        s(&general),
+        "--phi-layer",
+        "0",
+        "--rank",
+        "2",
+        "--margin",
+        "0",
+        "--key-alpha",
+        "0.5",
+        "--followup-alpha",
+        "2",
+        "--followup-margin",
+        "0.1",
+    ]);
+    assert_eq!(r["phi"]["pool"], "key_span", "{r}");
+    let m = cortiq_core::CmfModel::open(&fx.f1).unwrap();
+    let phi = &m.header.router.as_ref().unwrap().phi;
+    assert_eq!((phi.key_alpha, phi.followup_alpha, phi.followup_margin), (Some(0.5), Some(2.0), Some(0.1)));
+    // no key in the message: the backbone, decided before any φ forward
+    let gate = fx.dir.join("ks-gate.json");
+    let (out, _) = ok(&[
+        "route-eval",
+        s(&fx.f1),
+        "--prompts-jsonl",
+        s(&fx.mixed),
+        "--expect",
+        "backbone",
+        "--include-quarantine",
+        "--json",
+    ]);
+    std::fs::write(&gate, out.as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let v = if v.is_array() { v[0].clone() } else { v };
+    let rows = v["rows"].as_array().unwrap();
+    let last = rows.last().unwrap();
+    assert_eq!(last["target"], "backbone", "{last}");
+    assert!(last["reason"].as_str().unwrap().contains("no table key"), "{last}");
+    assert!(rows.iter().any(|r| r["reason"].as_str().unwrap().contains("E_base")), "φ decisions present");
+}
+
+#[test]
+fn keyless_and_followup_decisions_run_on_their_own_topologies() {
+    let fx = fixture("keyless");
+    let entries = fx.dir.join("dk.jsonl");
+    let card = "этого нет в записях";
+    let row = serde_json::json!({
+        "keys": ["cortiq keyless record card"],
+        "en": {"card": "not in my records", "fields": {}},
+        "ru": {"card": card, "fields": {}},
+    });
+    std::fs::write(&entries, row.to_string() + "\n").unwrap();
+    let f2 = fx.dir.join("f2.cmf");
+    ok(&["lookup-build", s(&fx.f1), "--entries", s(&entries), "--id", "dontknow", "--out", s(&f2), "--keyless"]);
+    let (skill, general) = (fx.dir.join("kl-skill.jsonl"), fx.dir.join("kl-general.jsonl"));
+    let skill_rows: Vec<(&str, &str, &str)> = SKILL_TEXTS.iter().map(|t| (*t, "ru", "herbs")).collect();
+    write_jsonl(&skill, &skill_rows);
+    let hard: Vec<String> = SKILL_TEXTS.iter().zip(GENERAL_TEXTS).map(|(k, g)| format!("{g} {k} {g}")).collect();
+    let general_rows: Vec<(&str, &str, &str)> = hard.iter().map(|t| (t.as_str(), "en", "general")).collect();
+    write_jsonl(&general, &general_rows);
+    ok(&[
+        "route-fit", s(&f2), "--id", SKILL_ID, "--skill-prompts", s(&skill), "--general-prompts", s(&general),
+        "--phi-layer", "0", "--rank", "2", "--margin", "0", "--key-alpha", "0.5",
+    ]);
+    // Any rows will do: the sign of a large margin decides below
+    let h = cortiq_core::CmfModel::open(&f2).unwrap().header.arch.hidden_size;
+    let mut x = 1u32;
+    let mut rows = Vec::new();
+    for _ in 0..12 * h {
+        x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+        rows.extend_from_slice(&((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5).to_le_bytes());
+    }
+    let phi = fx.dir.join("kl.phi.f32");
+    std::fs::write(&phi, &rows).unwrap();
+    let prompts = fx.dir.join("kl-prompts.jsonl");
+    write_jsonl(&prompts, &[(SKILL_TEXTS[0], "ru", "herbs"), (NO_KEY_TEXT, "ru", "nokey")]);
+    let utility = |f2: &Path| -> serde_json::Value {
+        let v = json(&["probe-utility", s(f2), "--prompts-jsonl", s(&prompts), "--route", "auto", "--include-quarantine", "--lookup-mode", "answer", "--max-tokens", "1", "--json"]);
+        if v.is_array() { v[0].clone() } else { v }
+    };
+    let fit_keyless = |margin: &str| {
+        ok(&["route-fit-keyless", s(&f2), "--record", "dontknow", "--fact-phi", s(&phi), "--chat-phi", s(&phi), "--rank", "2", "--margin", margin]);
+    };
+    // A message with no key goes to the keyless record, whose card is the answer; a key still goes to its own table.
+    fit_keyless("-10");
+    let u = utility(&f2);
+    assert_eq!(u["per_prompt"][1]["route"]["target"], "dontknow", "{u}");
+    assert_eq!(u["per_prompt"][1]["answer"], card, "{u}");
+    assert_eq!(u["per_prompt"][0]["route"]["target"], SKILL_ID, "{u}");
+    // The other side of the margin: the backbone runs as before.
+    fit_keyless("10");
+    let u = utility(&f2);
+    assert_eq!(u["per_prompt"][1]["route"]["target"], "backbone", "{u}");
+    // The follow-up decision on its own topologies, by the sign of the margin.
+    let dialogs = fx.dir.join("kl-dialogs.jsonl");
+    let d = serde_json::json!({"src": "x", "turns": [SKILL_TEXTS[0], NO_KEY_TEXT]});
+    std::fs::write(&dialogs, d.to_string() + "\n").unwrap();
+    let fit_followup = |margin: &str| {
+        ok(&["route-fit-followup", s(&f2), "--skill-phi", &format!("{SKILL_ID}={}", s(&phi)), "--general-phi", s(&phi), "--rank", "2", "--alpha", "4", "--margin", margin]);
+    };
+    let second_turn = |f2: &Path| -> serde_json::Value {
+        let v = json(&["probe-dialog", s(f2), "--dialogs-jsonl", s(&dialogs), "--route", "auto", "--include-quarantine", "--lookup-mode", "answer", "--json"]);
+        v["per_dialog"][0]["turns"][1]["target"].clone()
+    };
+    fit_followup("-10");
+    assert_eq!(second_turn(&f2), SKILL_ID);
+    fit_followup("10");
+    assert_eq!(second_turn(&f2), "backbone");
+    // The header copies of all those updates go, and the file means the same.
+    let before = std::fs::metadata(&f2).unwrap().len();
+    ok(&["tail-trim", s(&f2)]);
+    assert!(std::fs::metadata(&f2).unwrap().len() < before);
+    assert_eq!(second_turn(&f2), "backbone");
+    assert_eq!(utility(&f2)["per_prompt"][0]["route"]["target"], SKILL_ID);
+}

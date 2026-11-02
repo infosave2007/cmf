@@ -894,6 +894,16 @@ impl QTensor {
 
     /// Dense f32 view — only for owned tensors. Masked/sparse execution
     /// paths require it; quantized weights don't support masks yet.
+    /// The parts of a `q8_2f` tensor: codes by row, row scales, column field.
+    pub fn q8_2f_codes(&self) -> Option<(&[u8], &[f32], &[f32])> {
+        match self {
+            Self::Mapped { dtype: TensorDtype::Q8_2f, row_scale, col_field, .. } => {
+                Some((self.quant_bytes(), row_scale, col_field))
+            }
+            _ => None,
+        }
+    }
+
     pub fn as_f32(&self) -> Option<&[f32]> {
         match self {
             Self::F32 { data, .. } => Some(data),
@@ -1359,7 +1369,7 @@ impl QTensor {
     /// `out = W · x` (row-major). F32 delegates to the historical
     /// bit-exact path; Mapped runs the fused int8 kernel.
     pub fn matvec(&self, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
-        if self.flint_exact_cpu_default() {
+        if self.exact_cpu_default() {
             return float_activations_scope(|| self.matvec(x, out, pool));
         }
         match self {
@@ -1843,7 +1853,7 @@ impl QTensor {
         o2: &mut [f32],
         pool: Option<&Pool>,
     ) {
-        if self.flint_exact_cpu_default() {
+        if self.exact_cpu_default() {
             return float_activations_scope(|| self.matvec2(x1, x2, o1, o2, pool));
         }
         match self {
@@ -2038,7 +2048,7 @@ impl QTensor {
     }
 
     pub fn matmat(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
-        if self.flint_exact_cpu_default() {
+        if self.exact_cpu_default() {
             return float_activations_scope(|| self.matmat(xs_all, b, out, pool));
         }
         let cols = self.cols();
@@ -2851,7 +2861,7 @@ impl QTensor {
         mut outs: [&mut [f32]; N],
         pool: Option<&Pool>,
     ) {
-        if Self::any_flint_exact_cpu_default(&ts) {
+        if Self::any_exact_cpu_default(&ts) {
             return float_activations_scope(|| Self::matvec_many(ts, x, outs, pool));
         }
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
@@ -3324,7 +3334,7 @@ impl QTensor {
         mut o2s: [&mut [f32]; N],
         pool: Option<&Pool>,
     ) {
-        if Self::any_flint_exact_cpu_default(&ts) {
+        if Self::any_exact_cpu_default(&ts) {
             return float_activations_scope(|| {
                 Self::matvec2_many(ts, x1, x2, o1s, o2s, pool)
             });
@@ -3602,7 +3612,7 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
-        if gate.flint_exact_cpu_default() || up.flint_exact_cpu_default() {
+        if gate.exact_cpu_default() || up.exact_cpu_default() {
             return float_activations_scope(|| {
                 Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
             });
@@ -3957,7 +3967,7 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
-        if Self::any_flint_exact_cpu_default_pairs(pairs) {
+        if Self::any_exact_cpu_default_pairs(pairs) {
             return float_activations_scope(|| {
                 Self::moe_gate_up_many_limited(pairs, x, outs, limit, pool)
             });
@@ -4081,7 +4091,7 @@ impl QTensor {
         out: &mut [f32],
         pool: Option<&Pool>,
     ) -> bool {
-        if Self::any_flint_exact_cpu_default(downs) {
+        if Self::any_exact_cpu_default(downs) {
             return float_activations_scope(|| {
                 Self::moe_down_many(downs, gs, weights, out, pool)
             });
@@ -4179,7 +4189,7 @@ impl QTensor {
         outs: &mut [Vec<f32>],
         pool: Option<&Pool>,
     ) -> bool {
-        if Self::any_flint_exact_cpu_default_pairs(pairs) {
+        if Self::any_exact_cpu_default_pairs(pairs) {
             return float_activations_scope(|| {
                 Self::moe_gate_up_rows(pairs, groups, xs, outs, pool)
             });
@@ -4290,7 +4300,7 @@ impl QTensor {
         outs: &mut [Vec<f32>],
         pool: Option<&Pool>,
     ) -> bool {
-        if Self::any_flint_exact_cpu_default(downs) {
+        if Self::any_exact_cpu_default(downs) {
             return float_activations_scope(|| {
                 Self::moe_down_rows(downs, group_lens, gs, outs, pool)
             });
@@ -11709,35 +11719,37 @@ thread_local! {
 /// Flint's released Q2/Q4 profiles are unusually sensitive to activation
 /// quantization in the host-side attention path. With the normal A8W8
 /// default, a short greedy decode can diverge after the first token even
-/// though the selected-expert Metal path itself is unchanged. Keep the
-/// reference float-activation contract for Flint unless the operator has
-/// explicitly selected an `CMF_SDOT` policy.
-fn flint_exact_cpu_default_enabled() -> bool {
+/// though the selected-expert Metal path itself is unchanged. An Embryo file
+/// carries a router fitted on the exact φ, which A8W8 moves by 4e-3, and its
+/// CPU decode costs the same without it. Keep the reference float-activation
+/// contract for both unless the operator has explicitly selected an
+/// `CMF_SDOT` policy.
+fn exact_cpu_default_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CMF_SDOT").is_none())
 }
 
 impl QTensor {
     #[inline]
-    fn flint_exact_cpu_default(&self) -> bool {
+    fn exact_cpu_default(&self) -> bool {
         !FLOAT_ACTIVATIONS.get()
-            && flint_exact_cpu_default_enabled()
+            && exact_cpu_default_enabled()
             && matches!(
                 self,
-                Self::Mapped { model, .. } if model.header.arch.arch_name == "flint"
+                Self::Mapped { model, .. } if matches!(model.header.arch.arch_name.as_str(), "flint" | "cortiq_embryo")
             )
     }
 
     #[inline]
-    fn any_flint_exact_cpu_default(ts: &[&QTensor]) -> bool {
-        ts.iter().any(|t| t.flint_exact_cpu_default())
+    fn any_exact_cpu_default(ts: &[&QTensor]) -> bool {
+        ts.iter().any(|t| t.exact_cpu_default())
     }
 
     #[inline]
-    fn any_flint_exact_cpu_default_pairs(pairs: &[(&QTensor, &QTensor)]) -> bool {
+    fn any_exact_cpu_default_pairs(pairs: &[(&QTensor, &QTensor)]) -> bool {
         pairs
             .iter()
-            .any(|(gate, up)| gate.flint_exact_cpu_default() || up.flint_exact_cpu_default())
+            .any(|(gate, up)| gate.exact_cpu_default() || up.exact_cpu_default())
     }
 }
 

@@ -146,11 +146,17 @@ pub struct SftSampler {
 
 impl SftSampler {
     pub fn new(b: usize, t: usize, seed: u64) -> SftSampler {
+        Self::with_replay_fifths(b, t, seed, 1)
+    }
+
+    /// `replay_fifths` of every batch are raw-LM windows, the rest SFT records.
+    pub fn with_replay_fifths(b: usize, t: usize, seed: u64, replay_fifths: usize) -> SftSampler {
         assert!(b >= 5 && b % 5 == 0, "SFT batch must be a multiple of 5");
+        assert!((1..5).contains(&replay_fifths), "--replay-fifths must be 1..=4");
         SftSampler {
             b,
             t,
-            sft_rows: b * 4 / 5,
+            sft_rows: b * (5 - replay_fifths) / 5,
             state: seed ^ 0x9E37_79B9_7F4A_7C15,
         }
     }

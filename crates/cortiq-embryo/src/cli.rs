@@ -503,6 +503,8 @@ pub struct BirthArgs {
     /// Hold the donated tensors still for the first N steps (progressive
     /// replacement: the fresh mixers learn to fit the frozen network first).
     pub freeze_donor: usize,
+    /// Train only the tensors with these name prefixes (empty = all).
+    pub train_only: Vec<String>,
     pub seed: u64,
     /// State carry-over across consecutive windows of one document stream
     /// (plan S6b): stream sampler + `carry_begin`/`carry_commit` per step.
@@ -522,6 +524,10 @@ pub struct BirthArgs {
     /// run (step − resume step over steps − resume step) instead of the
     /// absolute step (a recovery/continuation with its own schedule)
     pub lr_restart: bool,
+    /// with `lr_restart`: the step the schedule and the eval/save cadence
+    /// count from (default: the resume step) — resumes a stopped
+    /// `--lr-restart` run on its original schedule
+    pub schedule_from: Option<usize>,
     /// dropless expert routing (capacity = every row) instead of capacity 2
     pub dropless: bool,
     /// extra held-out shards reported at every eval: `name=path`
@@ -863,6 +869,22 @@ pub fn birth(a: BirthArgs) {
             a.freeze_donor
         );
     }
+    if !a.train_only.is_empty() {
+        let lay = crate::model::Layout::new(&cfg);
+        let (mut free, mut frozen) = (0usize, Vec::new());
+        for (name, off, len) in &lay.names {
+            if a.train_only.iter().any(|p| name.starts_with(p.as_str())) {
+                free += len;
+            } else {
+                frozen.push((*off, *len));
+            }
+        }
+        assert!(free > 0, "--train-only matches no tensor");
+        println!("train-only {:?}: {:.2} M params train, the rest of the arena is frozen", a.train_only, free as f64 / 1e6);
+        gpu.freeze = frozen;
+        gpu.desc_updates.set(false);
+    }
+    let heal_base: Vec<f32> = if a.train_only.is_empty() { Vec::new() } else { gpu.p.to_vec() };
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed.wrapping_add(step0 as u64));
     assert!(
         a.retrieval_rate == 0.0 || a.carry,
@@ -942,8 +964,13 @@ pub fn birth(a: BirthArgs) {
     let mut cov_ema: Vec<f32> = Vec::new();
     // the last 10% of the run trains on the served anchor window (relative
     // to the resume point with --lr-restart, like the schedule)
+    let origin = a.schedule_from.unwrap_or(step0 as usize);
+    assert!(
+        a.schedule_from.is_none() || (a.lr_restart && origin <= step0 as usize),
+        "--schedule-from needs --lr-restart and a step at or before the resume step {step0}"
+    );
     let served_from = if a.lr_restart {
-        a.steps - (a.steps - step0 as usize) / 10
+        a.steps - (a.steps - origin) / 10
     } else {
         a.steps - a.steps / 10
     };
@@ -970,7 +997,7 @@ pub fn birth(a: BirthArgs) {
             println!("freeze-donor: thawed at step {step}");
         }
         let lr = if a.lr_restart {
-            lr_at(step - step0 as usize, a.steps - step0 as usize, a.warmup, a.lr, a.lr * 0.1)
+            lr_at(step - origin, a.steps - origin, a.warmup, a.lr, a.lr * 0.1)
         } else {
             lr_at(step, a.steps, a.warmup, a.lr, a.lr * 0.1)
         };
@@ -995,6 +1022,14 @@ pub fn birth(a: BirthArgs) {
             }
             None => {
                 let (l, g, ms) = gpu.train_step(&tokens, &targets, lr, wd, a.clip);
+                if !a.train_only.is_empty() {
+                    // AdamW momentum and decay must not move the frozen part either
+                    #[allow(unused_unsafe)]
+                    let live = unsafe { gpu.p.buf.contents() } as *mut f32;
+                    for &(o, n) in &gpu.freeze {
+                        unsafe { std::ptr::copy_nonoverlapping(heal_base[o..].as_ptr(), live.add(o), n) };
+                    }
+                }
                 (l, 0.0, g, ms)
             }
         };
@@ -1013,7 +1048,8 @@ pub fn birth(a: BirthArgs) {
         } else {
             0.98 * ema + 0.02 * loss
         };
-        if a.pca_every > 0 && (step + 1) % a.pca_every == 0 {
+        // Frozen routing means frozen subspaces too: a refreshed desc.u reroutes every expert.
+        if a.pca_every > 0 && !a.freeze_desc && a.train_only.is_empty() && (step + 1) % a.pca_every == 0 {
             gpu.update_subspaces(&mut cov_ema, 0.9);
         }
         if step % log_every == 0 || step + 1 == a.steps {
@@ -1061,7 +1097,7 @@ pub fn birth(a: BirthArgs) {
         }
         // with --lr-restart the eval/save cadence counts from the resume point,
         // so "every 500" means 500/1000/… steps into THIS run
-        let tick = if a.lr_restart { step + 1 - step0 as usize } else { step + 1 };
+        let tick = if a.lr_restart { step + 1 - origin } else { step + 1 };
         if tick % a.eval_every == 0 || step + 1 == a.steps {
             let vl = eval(&gpu, &mut tokens, &mut targets);
             println!("  val loss {vl:.4}  ppl {:.2}{}", vl.exp(), eval_extra(&gpu, &mut tokens, &mut targets));
@@ -2212,6 +2248,7 @@ pub fn served_checkpoint(ck: &Checkpoint, base: &cortiq_core::format::CmfModel) 
     let dtype = match g.encoding.as_str() {
         "f32" => TensorDtype::F32,
         "f16" => TensorDtype::F16,
+        "q8_2f" => TensorDtype::Q8_2f,
         e => anyhow::bail!("genome '{}' is encoded as {e}; growth binds to an f32/f16 genome", g.id),
     };
     let vocab = base

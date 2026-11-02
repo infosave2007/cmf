@@ -481,6 +481,38 @@ impl CmfModel {
         })
     }
 
+    /// Drop the header copies that earlier header updates left behind: the
+    /// current header moves down to the end of the last live section and the
+    /// file is cut there. No payload or directory byte moves, so a genome stays
+    /// what it is. Returns the lengths before and after.
+    pub fn trim_header_tail(path: impl AsRef<Path>) -> Result<(u64, u64), CmfError> {
+        let path = path.as_ref();
+        let (mut file, model, file_len) = open_for_append(path)?;
+        let env = model.envelope;
+        let live_end = [env.dir, env.data, env.masks, env.vocab, env.index]
+            .iter()
+            .map(|(off, len)| off + len)
+            .max()
+            .unwrap_or(ENVELOPE_LEN as u64);
+        // The current header must stay whole until the envelope points away from it.
+        if live_end + env.header.1 > env.header.0 {
+            return Ok((file_len, file_len));
+        }
+        let json = model.primary_bytes()[env.header.0 as usize..][..env.header.1 as usize].to_vec();
+        let mut envelope = envelope_bytes(&model);
+        drop(model);
+        file.seek(SeekFrom::Start(live_end))?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        envelope[0x10..0x18].copy_from_slice(&live_end.to_le_bytes());
+        write_envelope(&mut file, &envelope)?;
+        let new_len = live_end + json.len() as u64;
+        file.set_len(new_len)?;
+        file.sync_all()?;
+        CmfModel::open(path)?;
+        Ok((file_len, new_len))
+    }
+
     /// Header-only update through the same tail mechanism (router
     /// recalibration, status/gate updates, lineage events): the new header
     /// JSON goes to the end of the file, the directory and every payload

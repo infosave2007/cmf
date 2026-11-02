@@ -262,6 +262,10 @@ pub fn select_field(question: &str) -> Option<&'static str> {
     }
     if prefix("противопоказ")
         || prefix("безопас")
+        || prefix("алкогол")
+        || prefix("беременн")
+        || prefix("кормящ")
+        || prefix("вредн")
         || prefix("побочн")
         || prefix("опасн")
         || prefix("ядовит")
@@ -271,6 +275,13 @@ pub fn select_field(question: &str) -> Option<&'static str> {
         || prefix("poison")
         || word("safety")
         || word("safe")
+        || word("alcohol")
+        || word("pregnant")
+        || word("pregnancy")
+        || word("breastfeeding")
+        || word("children")
+        || word("kids")
+        || word("dangerous")
         || word("risk")
         || word("risks")
         || bigram("side", "effect")
@@ -1492,6 +1503,145 @@ impl LookupTables {
     }
 }
 
+impl LookupTables {
+    /// The key of `message` over every lookup record: the longest name wins.
+    pub fn find_key_any(&self, message: &str) -> Option<KeyHit> {
+        let mut best: Option<KeyHit> = None;
+        for id in self.ids() {
+            if let Ok(Some(t)) = self.get(&id) {
+                if let Some(k) = t.find_key(message) {
+                    if best.as_ref().is_none_or(|b| (k.words, k.key.len()) > (b.words, b.key.len())) {
+                        best = Some(k);
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Longest key in tokens (a byte-level tokenizer spends one per byte).
+pub const KEY_WINDOW_MAX: usize = 96;
+
+/// The shortest token window of `q` whose decoded text holds the normalised
+/// `key` (at most [`KEY_WINDOW_MAX`] tokens).
+pub fn key_token_window(tok: &crate::tokenizer::Tokenizer, q: &[u32], key: &str) -> Option<(usize, usize)> {
+    let mut window: Option<(usize, usize)> = None;
+    for a in 0..q.len() {
+        for b in a + 1..=q.len().min(a + KEY_WINDOW_MAX) {
+            if normalize_key(&tok.decode(&q[a..b])).contains(key) {
+                if window.is_none_or(|(x, y)| b - a < y - x) {
+                    window = Some((a, b));
+                }
+                break;
+            }
+        }
+    }
+    window
+}
+
+fn tables_of(model: &Arc<CmfModel>) -> Arc<LookupTables> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, Arc<LookupTables>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(Arc::as_ptr(model) as usize)
+        .or_insert_with(|| Arc::new(LookupTables::new(model.clone())))
+        .clone()
+}
+
+/// φ of the `key_span` pool for one user message on the backbone; `None`
+/// when the message names no table key.
+pub fn key_span_phi(
+    model: &Arc<CmfModel>,
+    pipe: &mut crate::pipeline::Pipeline,
+    spec: &cortiq_core::knowledge::PhiSpec,
+    text: &str,
+) -> Option<Vec<f32>> {
+    let hit = tables_of(model).find_key_any(text)?;
+    let q = pipe.tokenizer.encode_plain(text);
+    let window = key_token_window(&pipe.tokenizer, &q, &hit.key)?;
+    let (ids, span) = crate::router::phi_span_ids(spec, &q);
+    let rows = pipe.probe_hidden_rows(&ids, spec.layer);
+    Some(crate::router::pool_key_span(&rows, pipe.hidden_size, span, window, spec.key_alpha.unwrap_or(0.0)))
+}
+
+/// The lookup records whose table holds a key of the message.
+pub fn key_holders(model: &Arc<CmfModel>, text: &str) -> Vec<String> {
+    let tables = tables_of(model);
+    tables
+        .ids()
+        .into_iter()
+        .filter(|id| {
+            let Ok(Some(t)) = tables.get(id) else { return false };
+            let Some(k) = t.find_key(text) else { return false };
+            let share = t.info.min_key_share.unwrap_or(0.0);
+            let words = normalize_key(text).split(' ').filter(|w| !w.is_empty()).count();
+            k.words as f32 >= share * words as f32
+        })
+        .collect()
+}
+
+/// Does the message name a key of any lookup record?
+pub fn message_names_key(model: &Arc<CmfModel>, text: &str) -> bool {
+    tables_of(model).find_key_any(text).is_some()
+}
+
+/// φ of a follow-up: the key tokens of the most recent earlier turn that
+/// names a key, and the whole current message (`earlier` = most recent first).
+pub fn followup_phi(
+    model: &Arc<CmfModel>,
+    pipe: &mut crate::pipeline::Pipeline,
+    spec: &cortiq_core::knowledge::PhiSpec,
+    last: &str,
+    earlier: &[&str],
+) -> Option<(Vec<f32>, Vec<String>)> {
+    let tables = tables_of(model);
+    let alpha = spec.followup_alpha?;
+    // A follow-up can only add something where the card has fields to pick
+    // from: a one-paragraph card has already been said in full.
+    let with_fields = |text: &str| -> Vec<String> {
+        key_holders(model, text)
+            .into_iter()
+            .filter(|id| {
+                matches!(tables.get(id), Ok(Some(t)) if t.find_key(text).is_some_and(|k| {
+                    matches!(t.card(k.entry, 0), Ok(c) if !c.fields.is_empty())
+                }))
+            })
+            .collect()
+    };
+    let unit = |p: &mut Vec<f32>| {
+        let n = p.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        p.iter_mut().for_each(|x| *x /= n);
+    };
+    let (text, hit) = earlier.iter().find_map(|t| tables.find_key_any(t).map(|h| (*t, h)))?;
+    let holders = with_fields(text);
+    if holders.is_empty() {
+        return None;
+    }
+    let q = pipe.tokenizer.encode_plain(text);
+    let w = key_token_window(&pipe.tokenizer, &q, &hit.key)?;
+    let (ids, span) = crate::router::phi_span_ids(spec, &q);
+    let h = pipe.hidden_size;
+    let rows = pipe.probe_hidden_rows(&ids, spec.layer);
+    let mut key = vec![0f32; h];
+    for r in span.start + w.0..span.start + w.1 {
+        key.iter_mut().zip(&rows[r * h..(r + 1) * h]).for_each(|(a, x)| *a += x);
+    }
+    unit(&mut key);
+    let q = pipe.tokenizer.encode_plain(last);
+    let (ids, span) = crate::router::phi_span_ids(spec, &q);
+    let rows = pipe.probe_hidden_rows(&ids, spec.layer);
+    let mut msg = vec![0f32; h];
+    for r in span {
+        msg.iter_mut().zip(&rows[r * h..(r + 1) * h]).for_each(|(a, x)| *a += x);
+    }
+    unit(&mut msg);
+    let mut phi: Vec<f32> = key.iter().zip(&msg).map(|(k, m)| k + alpha * m).collect();
+    unit(&mut phi);
+    Some((phi, holders))
+}
+
 // ───────────────────────── the routed outcome ─────────────────────────
 
 /// What a routed request does once its target is known.
@@ -1645,7 +1795,23 @@ pub fn resolve_lookup_turns(
         );
         return Ok((d, LookupOutcome::Off { id }));
     }
-    let answer = match table.find_answer_turns(turns)? {
+    let found = if table.info.keyless == Some(true) {
+        let key = KeyHit {
+            key: String::new(),
+            hash: 0,
+            entry: 0,
+            words: 0,
+            source: KeySource::Ngram,
+            via: MatchVia::Exact,
+            stem: None,
+            turn: 0,
+            strong: false,
+        };
+        table.answer_for_key(key, turns.first().copied().unwrap_or(""))?
+    } else {
+        table.find_answer_turns(turns)?
+    };
+    let answer = match found {
         Found::Answer(a) => a,
         Found::NoKey => {
             let d = to_backbone(
@@ -2402,6 +2568,9 @@ mod tests {
             langs: vec!["ru".into()],
             fields: Vec::new(),
             policy: None,
+            route_margin: None,
+            min_key_share: None,
+            keyless: None,
         };
         assert_eq!(LookupPolicy::of(&info), LookupPolicy::RouterAndKey);
         assert!(LookupPolicy::is_known(&info));

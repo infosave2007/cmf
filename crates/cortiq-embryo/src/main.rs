@@ -122,8 +122,8 @@ enum Sub {
         tokenizer: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// Storage profile: exact f32, or f16 matrices with exact routing metadata/norms.
-        #[arg(long, default_value = "f32", value_parser = ["f32", "f16"])]
+        /// Storage profile: exact f32, f16 matrices with exact routing metadata/norms, or the same with q8_2f projections.
+        #[arg(long, default_value = "f32", value_parser = ["f32", "f16", "q8_2f"])]
         dtype: String,
         /// Stamp the frozen genome (bit GENOME, format v2): `header.genome`
         /// {id, generation 0, status, encoding, trunk_hash, master_trunk_hash}
@@ -133,6 +133,15 @@ enum Sub {
         /// Genome status at birth (with --genome-id).
         #[arg(long, requires = "genome_id", value_parser = ["pre_chat", "candidate", "sealed"])]
         genome_status: Option<String>,
+        /// Sampling recommendation recorded in `provenance.sampling`, as
+        /// `KEY=VALUE,...` (temperature, top_p, top_k, min_p,
+        /// repetition_penalty, presence_penalty, max_tokens): what `cortiq
+        /// run` / `serve` use for this file when a request names none.
+        #[arg(long)]
+        sampling: Option<String>,
+        /// Carry the cmf-im-v1 chat template: `cortiq run` and `serve` chat with the file.
+        #[arg(long)]
+        chat: bool,
     },
     /// Grow the trunk without changing what it computes: a wider hidden
     /// size and FFN, optionally twice the layers (a zero-output copy of
@@ -733,6 +742,13 @@ enum Sub {
         /// correction is exact, and --steps / the stage caps count from 0.
         #[arg(long)]
         fresh_moments: bool,
+        /// Fifths of every batch that are raw-LM replay windows.
+        #[arg(long, default_value_t = 1)]
+        replay_fifths: usize,
+        /// Chained stages: the "before" numbers are the last stage's "after";
+        /// do not spend GPU time on them (printed as 0).
+        #[arg(long)]
+        skip_eval_before: bool,
     },
     /// Synthetic recall probe (MQAR/NIAH-lite) through the trainer forward:
     /// K key→value pairs, real-text filler, one key repeated at distance D.
@@ -790,6 +806,70 @@ enum Sub {
         seq: usize,
         #[arg(long, value_delimiter = ',', default_value = "1024,4096,16384,32768,65536")]
         report: Vec<usize>,
+    },
+    /// Router research: hidden rows of every position of the canonical φ input of every prompt, batched on the GPU.
+    PhiRows {
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// .cmf with the lookup record (tokenizer, keys)
+        #[arg(long)]
+        cmf: PathBuf,
+        #[arg(long, default_value = "herbs")]
+        id: String,
+        #[arg(long)]
+        prompts: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "1,3,5,7")]
+        layers: Vec<usize>,
+        /// output stem
+        #[arg(long)]
+        out: PathBuf,
+        /// tokens per GPU batch (rows = budget / window)
+        #[arg(long, default_value_t = 8192)]
+        budget: usize,
+        #[arg(long, default_value_t = 512)]
+        max_len: usize,
+        /// Keep only the prompts that name a table key (written to `<out>.keyed.jsonl`).
+        #[arg(long)]
+        only_keyed: bool,
+        /// Stop after the key table: `<out>.jsonl` without any GPU work.
+        #[arg(long)]
+        keys_only: bool,
+    },
+    /// `key_span` φ of the prompts naming a table key, batched on the GPU, for `cortiq route-fit --skill-phi/--general-phi`.
+    PhiPool {
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// .cmf with the lookup records (tokenizer, keys, encoding of the served trunk)
+        #[arg(long)]
+        cmf: PathBuf,
+        #[arg(long)]
+        prompts: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        layer: usize,
+        #[arg(long, default_value_t = 0.5)]
+        alpha: f32,
+        /// output stem
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 8192)]
+        budget: usize,
+        #[arg(long, default_value_t = 512)]
+        max_len: usize,
+        /// Pool over the whole message: the follow-up half of φ, no key needed
+        #[arg(long)]
+        whole_message: bool,
+    },
+    /// The checkpoint with the values a served export computes with, to measure a storage format.
+    ServedCkpt {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// f16 | q8_2f
+        #[arg(long)]
+        dtype: String,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
@@ -917,6 +997,11 @@ enum Sub {
         /// hold the donated tensors still for the first N steps
         #[arg(long, default_value_t = 0)]
         freeze_donor: usize,
+        /// Train only the tensors whose names start with these prefixes, e.g.
+        /// `layers.3.attn,layers.7.attn` (memory healing after chat SFT);
+        /// everything else stays byte-identical.
+        #[arg(long, value_delimiter = ',')]
+        train_only: Vec<String>,
         #[arg(long, default_value_t = 1)]
         seed: u64,
         /// carry the recurrent state / conv history / anchor keys across
@@ -943,6 +1028,11 @@ enum Sub {
         /// the resume step) instead of the absolute step
         #[arg(long)]
         lr_restart: bool,
+        /// with --lr-restart: count the schedule and the eval/save cadence
+        /// from this step instead of the resume step (continues a stopped
+        /// --lr-restart run on its original schedule)
+        #[arg(long)]
+        schedule_from: Option<usize>,
         /// dropless expert routing (capacity = every row)
         #[arg(long)]
         dropless: bool,
@@ -1082,7 +1172,13 @@ fn main() {
             dtype,
             genome_id,
             genome_status,
+            sampling,
+            chat,
         } => {
+            let sampling = sampling.map(|s| cortiq_embryo::export::parse_sampling(&s).unwrap_or_else(|e| {
+                eprintln!("export: {e:#}");
+                std::process::exit(2);
+            }));
             // a genome file is never rewritten (export_genome checks again)
             if let Err(e) = cortiq_embryo::export::refuse_genome_overwrite(&out) {
                 eprintln!("export: {e:#}");
@@ -1092,13 +1188,23 @@ fn main() {
             let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
             let storage = match dtype.as_str() {
                 "f16" => cortiq_core::types::TensorDtype::F16,
+                "q8_2f" => cortiq_core::types::TensorDtype::Q8_2f,
                 _ => cortiq_core::types::TensorDtype::F32,
             };
             let genome = genome_id.map(|id| cortiq_embryo::export::ExportGenome {
                 id,
                 status: genome_status.expect("clap: --genome-status required"),
+                chat_template: None,
             });
-            cortiq_embryo::export::export_genome(&ck, &tj, &out, storage, genome.as_ref())
+            cortiq_embryo::export::export_genome_sampling(
+                &ck,
+                &tj,
+                &out,
+                storage,
+                genome.as_ref(),
+                sampling.as_ref(),
+                chat.then_some(cortiq_embryo::export::CMF_IM_V1_TEMPLATE),
+            )
                 .expect("export");
             let (total, active) = ck.cfg.params();
             println!(
@@ -1876,6 +1982,40 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Sub::PhiRows { ckpt, cmf, id, prompts, layers, out, budget, max_len, only_keyed, keys_only } => {
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
+            cortiq_embryo::skill::phi_rows(&ckpt, &cmf, &id, &prompts, &layers, &out, budget, max_len, only_keyed, keys_only)
+                .expect("phi-rows");
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
+            {
+                let _ = (ckpt, cmf, id, prompts, layers, out, budget, max_len, only_keyed, keys_only);
+                eprintln!("phi-rows needs Metal (macOS) or the vulkan feature");
+                std::process::exit(1);
+            }
+        }
+        Sub::ServedCkpt { ckpt, tokenizer, dtype, out } => {
+            let mut ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+            let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
+            let d = match dtype.as_str() {
+                "f16" => cortiq_core::types::TensorDtype::F16,
+                "q8_2f" => cortiq_core::types::TensorDtype::Q8_2f,
+                other => panic!("served-ckpt: dtype {other}"),
+            };
+            let params = cortiq_embryo::export::served_params(&ck, &tj, d).expect("served params");
+            let extras: Vec<(&str, &[f32])> = ck.extras.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect();
+            cortiq_embryo::train::save_checkpoint(&out, &ck.cfg, ck.step, &params, None, None, &extras).expect("save checkpoint");
+        }
+        Sub::PhiPool { ckpt, cmf, prompts, layer, alpha, out, budget, max_len, whole_message } => {
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
+            cortiq_embryo::skill::phi_pool(&ckpt, &cmf, &prompts, layer, alpha, &out, budget, max_len, whole_message)
+                .expect("phi-pool");
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
+            {
+                let _ = (ckpt, cmf, prompts, layer, alpha, out, budget, max_len, whole_message);
+                eprintln!("phi-pool needs Metal (macOS) or the vulkan feature");
+                std::process::exit(1);
+            }
+        }
         Sub::PplStream {
             ckpt,
             text,
@@ -2238,6 +2378,8 @@ fn main() {
             sampler_skip,
             dropless,
             fresh_moments,
+            replay_fifths,
+            skip_eval_before,
         } => {
             use cortiq_embryo::model::EmbryoGpu;
             use cortiq_embryo::sft::{SftSampler, SftShard};
@@ -2345,13 +2487,13 @@ fn main() {
                     .sum::<f32>()
                     / raw_batches as f32
             };
-            let response_before = eval_sft(&gpu, &mut vt, &mut vg);
-            let raw_before = eval_raw(&gpu, &mut rt, &mut rg);
+            let response_before = if skip_eval_before { 0.0 } else { eval_sft(&gpu, &mut vt, &mut vg) };
+            let raw_before = if skip_eval_before { 0.0 } else { eval_raw(&gpu, &mut rt, &mut rg) };
             assert!(response_before.is_finite() && raw_before.is_finite());
             eprintln!(
-                "native Vulkan SFT adapter active; response_nll_before={response_before:.6} batches={sft_val_batches} raw_lm_before={raw_before:.6} batches={raw_batches} replay=20%"
+                "native Vulkan SFT adapter active; response_nll_before={response_before:.6} batches={sft_val_batches} raw_lm_before={raw_before:.6} batches={raw_batches} replay={}%", replay_fifths * 20
             );
-            let mut sampler = SftSampler::new(batch, seq, seed);
+            let mut sampler = SftSampler::with_replay_fifths(batch, seq, seed, replay_fifths);
             sampler.skip_batches(sampler_skip);
             eprintln!(
                 "sft_sampler seed={seed} skipped_batches={sampler_skip} continuation=explicit"
@@ -2481,6 +2623,7 @@ fn main() {
             distill_w,
             distill_batch,
             freeze_donor,
+            train_only,
             seed,
             carry,
             carry_reset_every,
@@ -2489,6 +2632,7 @@ fn main() {
             retrieval_dists,
             retrieval_pairs,
             lr_restart,
+            schedule_from,
             dropless,
             val_extra,
         } => {
@@ -2535,6 +2679,7 @@ fn main() {
                 distill_w,
                 distill_batch,
                 freeze_donor,
+                train_only,
                 seed,
                 carry,
                 carry_reset_every,
@@ -2546,6 +2691,7 @@ fn main() {
                 },
                 retrieval_pairs,
                 lr_restart,
+                schedule_from,
                 dropless,
                 val_extra,
             });
@@ -2590,6 +2736,7 @@ fn main() {
                     distill_w,
                     distill_batch,
                     freeze_donor,
+                    train_only,
                     carry,
                     carry_reset_every,
                     carry_eot,
@@ -2597,6 +2744,7 @@ fn main() {
                     retrieval_dists,
                     retrieval_pairs,
                     lr_restart,
+                    schedule_from,
                     dropless,
                     val_extra,
                     seed,

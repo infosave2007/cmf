@@ -19724,6 +19724,8 @@ struct EmbryoDeviceModel {
     clusters: wgpu::Buffer,
     final_norm: wgpu::Buffer,
     inv_freq: wgpu::Buffer,
+    /// The packed matrices of the wide token path (16 bytes otherwise).
+    mats: wgpu::Buffer,
 }
 
 struct EmbryoDeviceSequence {
@@ -19846,10 +19848,35 @@ fn embryo_scratch_words() -> usize {
     40_960 + c * 1024 * 10 + c * 2048 * 2 + c * 16_512 + c * 1032 + c * 8 + c + 8 * c + 8
 }
 
+/// The matrix stages of the token path on f16 weights (`gpu_wgpu/embryo_wide.wgsl`).
+struct EmbryoWidePipelines {
+    gdn_step: wgpu::ComputePipeline,
+    route_rows: wgpu::ComputePipeline,
+    route_final: wgpu::ComputePipeline,
+    norm: wgpu::ComputePipeline,
+    post_norm: wgpu::ComputePipeline,
+    final_norm: wgpu::ComputePipeline,
+    gdn_project: wgpu::ComputePipeline,
+    gdn_out: wgpu::ComputePipeline,
+    anchor_project: wgpu::ComputePipeline,
+    attend_score: wgpu::ComputePipeline,
+    attend_weights: wgpu::ComputePipeline,
+    attend_part: wgpu::ComputePipeline,
+    attend_sum: wgpu::ComputePipeline,
+    anchor_out: wgpu::ComputePipeline,
+    ffn_up: wgpu::ComputePipeline,
+    ffn_down: wgpu::ComputePipeline,
+    head: wgpu::ComputePipeline,
+}
+
 struct EmbryoRuntime {
     layout: wgpu::BindGroupLayout,
+    pl: wgpu::PipelineLayout,
+    legacy_ready: bool,
     parallel: Option<EmbryoParallelPipelines>,
     core: Option<EmbryoCorePipelines>,
+    wide_f16: Option<EmbryoWidePipelines>,
+    wide_q8: Option<EmbryoWidePipelines>,
     models: HashMap<u64, EmbryoDeviceModel>,
     sequences: HashMap<(u64, u64), EmbryoDeviceSequence>,
 }
@@ -37034,6 +37061,16 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
     true
 }
 
+fn embryo_buffer_bytes(c: &Ctx, data: &[u8], label: &str) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let word = [0u8; 16];
+    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: if data.is_empty() { &word } else { data },
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
 fn embryo_buffer_f32(
     c: &Ctx,
     data: &[f32],
@@ -37120,6 +37157,22 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
         ty: storage_rw,
         count: None,
     });
+    // The f16 matrices of the wide token path, where the device has the slot.
+    let wide_slot = limits.max_storage_buffers_per_shader_stage >= 13;
+    if wide_slot {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 12,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage_ro,
+            count: None,
+        });
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 13,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage_rw,
+            count: None,
+        });
+    }
     let layout = c
         .device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -37140,6 +37193,100 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
         std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
         Ok("parallel") | Ok("1")
     );
+    *guard = Some(EmbryoRuntime {
+        layout,
+        pl,
+        legacy_ready: false,
+        parallel: None,
+        core: None,
+        wide_f16: None,
+        wide_q8: None,
+        models: HashMap::new(),
+        sequences: HashMap::new(),
+    });
+    true
+}
+
+/// The pipelines of the wide token path for one storage of the matrices.
+fn embryo_wide_pipelines(c: &Ctx, pl: &wgpu::PipelineLayout, q8: bool) -> Option<EmbryoWidePipelines> {
+    if std::env::var("CMF_EMBRYO_RESIDENT").as_deref().is_ok_and(|v| v != "parallel" && v != "1")
+        || std::env::var_os("CMF_EMBRYO_RESIDENT").is_none()
+        || c.device.limits().max_storage_buffers_per_shader_stage < 13
+    {
+        return None;
+    }
+    {
+        let wide_scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        // Every index in the module is in range by the geometry the pack was checked for.
+        let module = unsafe {
+            c.device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("embryo-resident-wide"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        format!(
+                            "{}\n{}",
+                            include_str!("gpu_wgpu/embryo_wide.wgsl"),
+                            if q8 {
+                                include_str!("gpu_wgpu/embryo_wide_q8.wgsl")
+                            } else {
+                                include_str!("gpu_wgpu/embryo_wide_f16.wgsl")
+                            }
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
+        let make = |entry: &'static str| {
+            c.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    // Every lane writes its workgroup memory before anyone reads it.
+                    compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..pco() },
+                    cache: None,
+                })
+        };
+        let out = EmbryoWidePipelines {
+            gdn_step: make("w_gdn_step"),
+            route_rows: make("w_route_rows"),
+            route_final: make("w_route_final"),
+            norm: make("w_norm"),
+            post_norm: make("w_post_norm"),
+            final_norm: make("w_final_norm"),
+            gdn_project: make("w_gdn_project"),
+            gdn_out: make("w_gdn_out"),
+            anchor_project: make("w_anchor_project"),
+            attend_score: make("w_attend_score"),
+            attend_weights: make("w_attend_weights"),
+            attend_part: make("w_attend_part"),
+            attend_sum: make("w_attend_sum"),
+            anchor_out: make("w_anchor_out"),
+            ffn_up: make("w_ffn_up"),
+            ffn_down: make("w_ffn_down"),
+            head: make("w_head"),
+        };
+        if let Some(e) = pollster::block_on(wide_scope.pop()) {
+            tracing::warn!("embryo wide shader rejected: {e}");
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+/// The pipelines of the f32 path: its shaders compile only for a file that runs it.
+fn embryo_legacy_pipelines(
+    c: &Ctx,
+    pl: &wgpu::PipelineLayout,
+) -> (Option<EmbryoParallelPipelines>, Option<EmbryoCorePipelines>) {
+    let requested_parallel = matches!(
+        std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
+        Ok("parallel") | Ok("1")
+    );
     let parallel = if requested_parallel {
         let parallel_scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -37150,7 +37297,7 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
             c.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
-                    layout: Some(&pl),
+                    layout: Some(pl),
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: pco(),
@@ -37182,7 +37329,7 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
             c.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
-                    layout: Some(&pl),
+                    layout: Some(pl),
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: pco(),
@@ -37273,14 +37420,7 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
     } else {
         None
     };
-    *guard = Some(EmbryoRuntime {
-        layout,
-        parallel,
-        core,
-        models: HashMap::new(),
-        sequences: HashMap::new(),
-    });
-    true
+    (parallel, core)
 }
 
 fn embryo_core_pass(
@@ -37475,6 +37615,156 @@ pub fn forward_embryo_graph_chunk(
     forward_embryo_graph_rows(model, kv_id, rows, n, position, logits)
 }
 
+/// Is the wide token path there for a file on this device?
+pub fn embryo_wide_ready(q8: bool) -> bool {
+    let Some(c) = ctx() else {
+        return false;
+    };
+    let _op = c.op_gate.enter();
+    if !embryo_runtime_init(c) {
+        return false;
+    }
+    let slot = EMBRYO_RUNTIME.get().unwrap();
+    let mut guard = slot.lock().unwrap();
+    let Some(rt) = guard.as_mut() else {
+        return false;
+    };
+    let have = if q8 { rt.wide_q8.is_some() } else { rt.wide_f16.is_some() };
+    if !have {
+        let made = embryo_wide_pipelines(c, &rt.pl, q8);
+        if q8 {
+            rt.wide_q8 = made;
+        } else {
+            rt.wide_f16 = made;
+        }
+    }
+    if q8 { rt.wide_q8.is_some() } else { rt.wide_f16.is_some() }
+}
+
+/// `S_ROPE` of `embryo_wide.wgsl`: the angles of the current position, in f32 words.
+const EMBRYO_S_ROPE: u64 = 53248;
+
+/// One or more positions through the wide kernels. Each position is its own
+/// submit; only the last one runs the head and waits for the logits.
+#[allow(clippy::too_many_arguments)]
+fn embryo_wide_forward(
+    c: &Ctx,
+    wp: &EmbryoWidePipelines,
+    model: &Arc<crate::gpu::EmbryoGraphModel>,
+    seq: &mut EmbryoDeviceSequence,
+    rows: &[f32],
+    n: usize,
+    position: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    let t_token = std::time::Instant::now();
+    let flags = if model.norm_gemma { 1u32 } else { 0 };
+    let hidden = model.hidden;
+    let groups32 = |threads: usize| (threads.div_ceil(32) as u32).max(1);
+    let parts = |cols: usize| cols.div_ceil(128);
+    // Log probability of a head cluster below which its rows are not read
+    static GATE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let gate = *GATE.get_or_init(|| std::env::var("CMF_EMBRYO_HEAD_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(-9.21));
+    let gate_bits = gate.to_bits();
+    let mut rope = Vec::new();
+    for t in 0..n {
+        let pos = position + t;
+        if n > 1 {
+            c.queue.write_buffer(&seq.hidden, 0, bytemuck::cast_slice(&rows[t * hidden..(t + 1) * hidden]));
+        }
+        for (li, layer_param) in seq.layer_params.iter().enumerate() {
+            let lp = [
+                pos as u32,
+                model.max_seq as u32,
+                model.vocab as u32,
+                flags,
+                model.meta.get(19).copied().unwrap_or(0),
+                gate_bits,
+                li as u32,
+                1u32,
+            ];
+            c.queue.write_buffer(layer_param, 0, bytemuck::cast_slice(&lp));
+        }
+        if !model.rope_freq.is_empty() {
+            let half = model.rope_freq.len();
+            rope.resize(2 * half, 0.0);
+            for (i, &f) in model.rope_freq.iter().enumerate() {
+                let (sn, cs) = (pos as f64 * f as f64).sin_cos();
+                rope[i] = cs as f32;
+                rope[half + i] = sn as f32;
+            }
+            c.queue.write_buffer(&seq.scratch, EMBRYO_S_ROPE * 4, bytemuck::cast_slice(&rope));
+        }
+        let mut enc =
+            c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("embryo-wide-token") });
+        let _merge_guard = PassMergeGuard::new(&enc);
+        let hd = model.anchor_head_dim;
+        for li in 0..model.layers {
+            let r = crate::gpu::EMBRYO_META_HEADER + li * 64;
+            let kind = model.meta[r];
+            let b = &seq.layer_binds[li];
+            embryo_core_pass(&mut enc, &wp.norm, b, 1, "embryo-core-norm");
+            if kind == 4 {
+                let (nv, dv, cdim) = (model.gdn_heads, model.gdn_dv, model.gdn_c_dim());
+                let threads = cdim + nv * dv + nv;
+                embryo_core_pass(&mut enc, &wp.gdn_project, b, groups32(threads), "embryo-wide-gdn-project");
+                embryo_core_pass(&mut enc, &wp.gdn_step, b, nv as u32, "embryo-wide-gdn-step");
+                embryo_core_pass(&mut enc, &wp.gdn_out, b, groups32(hidden * parts(nv * dv)), "embryo-wide-gdn-out");
+            } else {
+                let (qrows, krows) = (model.anchor_q_heads * hd, model.anchor_kv_heads * hd);
+                let threads = qrows + 2 * krows;
+                let keys = model.anchor_sink + (pos + 1).min(model.anchor_window);
+                embryo_core_pass(&mut enc, &wp.anchor_project, b, groups32(threads), "embryo-wide-anchor-project");
+                embryo_core_pass(&mut enc, &wp.attend_score, b, groups32(model.anchor_q_heads * keys.div_ceil(4)), "embryo-wide-attend-score");
+                embryo_core_pass(&mut enc, &wp.attend_weights, b, model.anchor_q_heads as u32, "embryo-wide-attend-weights");
+                embryo_core_pass(&mut enc, &wp.attend_part, b, groups32(model.anchor_q_heads * keys.div_ceil(32) * (hd / 4).div_ceil(8)), "embryo-wide-attend-part");
+                embryo_core_pass(&mut enc, &wp.attend_sum, b, groups32(qrows / 4), "embryo-wide-attend-sum");
+                embryo_core_pass(&mut enc, &wp.anchor_out, b, groups32(hidden * parts(model.anchor_q_heads * hd)), "embryo-wide-anchor-out");
+            }
+            embryo_core_pass(&mut enc, &wp.post_norm, b, 1, "embryo-core-post-norm");
+            let moe = model.meta[r + 15] == 1;
+            if moe {
+                let (ne, rank) = (model.meta[r + 16], model.meta[r + 20]);
+                embryo_core_pass(&mut enc, &wp.route_rows, b, groups32((ne * (rank + 1)) as usize * parts(hidden)), "embryo-wide-route-rows");
+                embryo_core_pass(&mut enc, &wp.route_final, b, 1, "embryo-wide-route-final");
+            }
+            let up = model.intermediate * if moe { 2 } else { 1 };
+            embryo_core_pass(&mut enc, &wp.ffn_up, b, groups32(up), "embryo-wide-ffn-up");
+            embryo_core_pass(&mut enc, &wp.ffn_down, b, groups32(hidden * parts(model.intermediate)), "embryo-wide-ffn-down");
+        }
+        if t + 1 < n {
+            submit(c, finish_enc(enc));
+            continue;
+        }
+        let last = &seq.layer_binds[model.layers - 1];
+        embryo_core_pass(&mut enc, &wp.final_norm, last, 1, "embryo-core-final-norm");
+        embryo_core_pass(&mut enc, &wp.head, last, model.cluster_count as u32, "embryo-wide-head");
+        if !readback(c, enc, &seq.logits, &seq.stage, seq.stage_bytes, logits) {
+            seq.initialized = false;
+            seq.next_position = 0;
+            return false;
+        }
+        }
+    seq.initialized = true;
+    seq.next_position = position.saturating_add(n);
+    if std::env::var("CMF_EMBRYO_PROFILE").as_deref() == Ok("1") {
+        eprintln!("embryo-profile: wide n={n} total={:.3}ms", t_token.elapsed().as_secs_f64() * 1e3);
+    }
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "embryo resident graph: wide active adapter={} layers={} hidden={} vocab={} {} matrices {} MB",
+            c.adapter_info.name,
+            model.layers,
+            model.hidden,
+            model.vocab,
+            if model.wide_q8 { "q8_2f" } else { "f16" },
+            (model.mats.len() + model.lm_head_packed.len()) / 1_000_000,
+        );
+    }
+    true
+}
+
 fn forward_embryo_graph_rows(
     model: &Arc<crate::gpu::EmbryoGraphModel>,
     kv_id: u64,
@@ -37604,13 +37894,19 @@ fn forward_embryo_graph_rows(
     // Never silently downgrade an explicitly requested resident run if its
     // optional pipelines failed validation. The caller can retain the
     // ordinary host path only before a sequence has started.
-    if wants_parallel && rt.parallel.is_none() {
+    if !model.wide && !rt.legacy_ready {
+        let (parallel, core) = embryo_legacy_pipelines(c, &rt.pl);
+        rt.parallel = parallel;
+        rt.core = core;
+        rt.legacy_ready = true;
+    }
+    if wants_parallel && !model.wide && rt.parallel.is_none() {
         if dbg {
             eprintln!("embryo-dbg: parallel head pipelines rejected (see RUST_LOG=warn)");
         }
         return false;
     }
-    if wants_parallel && rt.core.is_none() {
+    if wants_parallel && !model.wide && rt.core.is_none() {
         if dbg {
             eprintln!("embryo-dbg: core shader rejected (see RUST_LOG=warn)");
         }
@@ -37648,12 +37944,12 @@ fn forward_embryo_graph_rows(
                 wgpu::BufferUsages::STORAGE,
             ),
             meta: embryo_buffer_u32(c, &model.meta, "embryo-meta", wgpu::BufferUsages::STORAGE),
-            lm_head: embryo_buffer_f32(
-                c,
-                &model.lm_head,
-                "embryo-lm-head",
-                wgpu::BufferUsages::STORAGE,
-            ),
+            lm_head: if model.wide {
+                embryo_buffer_bytes(c, &model.lm_head_packed, "embryo-lm-head-packed")
+            } else {
+                embryo_buffer_f32(c, &model.lm_head, "embryo-lm-head", wgpu::BufferUsages::STORAGE)
+            },
+            mats: embryo_buffer_bytes(c, &model.mats, "embryo-mats"),
             clusters: embryo_buffer_f32(
                 c,
                 &model.clusters,
@@ -37715,7 +38011,7 @@ fn forward_embryo_graph_rows(
             // sequence rather than a per-token scratch churn.  Scratch is
             // not sequence state: the telemetry reports `state` and `kv`.
             size: (embryo_scratch_words() * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let logits_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -37818,7 +38114,9 @@ fn forward_embryo_graph_rows(
                 bind_buf(9, &seq.logits),
                 bind_buf(10, &seq.params),
                 bind_buf(11, &seq.scratch),
-            ],
+                bind_buf(12, &dm.mats),
+                bind_buf(13, &seq.scratch),
+            ][..if c.device.limits().max_storage_buffers_per_shader_stage >= 13 { 14 } else { 12 }],
         }));
     }
     if use_parallel && seq.layer_binds.len() != model.layers {
@@ -37847,7 +38145,9 @@ fn forward_embryo_graph_rows(
                     bind_buf(9, &seq.logits),
                     bind_buf(10, &layer_param),
                     bind_buf(11, &seq.scratch),
-                ],
+                    bind_buf(12, &dm.mats),
+                    bind_buf(13, &seq.scratch),
+                ][..if c.device.limits().max_storage_buffers_per_shader_stage >= 13 { 14 } else { 12 }],
             });
             layer_params.push(layer_param);
             layer_binds.push(layer_bind);
@@ -37873,6 +38173,16 @@ fn forward_embryo_graph_rows(
             c.queue
                 .write_buffer(layer_param, 0, bytemuck::cast_slice(&lp));
         }
+    }
+    if model.wide {
+        let Some(wide) = (if model.wide_q8 { rt.wide_q8.as_ref() } else { rt.wide_f16.as_ref() }) else {
+            return false;
+        };
+        // The clears of a fresh sequence are all this encoder holds.
+        if fresh {
+            submit(c, finish_enc(enc));
+        }
+        return embryo_wide_forward(c, wide, model, seq, hidden, n, position, logits);
     }
     let bind = seq.bind.as_ref().unwrap();
     // The resident graph has several dependent passes; profile them without
@@ -38388,6 +38698,15 @@ fn forward_embryo_graph_rows(
         if let Some((body, phase, route, attn, rest, tail, phase_pairs, route_pairs, attn_pairs)) = parallel_stages {
             eprintln!(
                 "embryo-profile: setup={:.3}ms encode={:.3}ms submit+map+copy={:.3}ms total={:.3}ms gpu-core={body:.3}ms gpu-phase={phase:.3}ms gpu-route={route:.3}ms gpu-attn={attn:.3}ms gpu-rest={rest:.3}ms gpu-tail={tail:.3}ms phase-pairs={phase_pairs} route-pairs={route_pairs} attn-pairs={attn_pairs}",
+                t_encode.duration_since(t_token).as_secs_f64() * 1e3,
+                t_encoded.duration_since(t_encode).as_secs_f64() * 1e3,
+                t_done.duration_since(t_readback).as_secs_f64() * 1e3,
+                t_done.duration_since(t_token).as_secs_f64() * 1e3,
+            );
+        } else {
+            // A backend without timestamps inside an encoder (Metal): the host side only.
+            eprintln!(
+                "embryo-profile: setup={:.3}ms encode={:.3}ms submit+map+copy={:.3}ms total={:.3}ms",
                 t_encode.duration_since(t_token).as_secs_f64() * 1e3,
                 t_encoded.duration_since(t_encode).as_secs_f64() * 1e3,
                 t_done.duration_since(t_readback).as_secs_f64() * 1e3,

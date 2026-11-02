@@ -151,7 +151,16 @@ impl Lanes {
         frame: router::PromptFrame,
     ) -> anyhow::Result<(RouteDecision, LookupOutcome)> {
         let last = turns.first().copied().unwrap_or("");
-        let d = self.decide_framed(mode, last, frame)?;
+        let d = if *mode == RouteMode::Auto && turns.len() > 1 {
+            if self.probe.is_none() {
+                self.probe = Some(Pipeline::from_model(&self.model, SamplerConfig::default())?);
+            }
+            let probe = self.probe.as_mut().expect("probe pipeline");
+            let d = router::route_turns_keyed(&self.model, probe, turns, self.opts);
+            router::enforce_prompt_contract(&self.model.header, d, frame, false).0
+        } else {
+            self.decide_framed(mode, last, frame)?
+        };
         let gate = (*mode == RouteMode::Auto).then(|| lookup::KeyFirstGate::new(self.opts, frame));
         lookup::resolve_lookup_gated(&self.lookups, d, gate, turns, self.lookup_mode)
             .map_err(anyhow::Error::msg)
@@ -200,7 +209,7 @@ impl Lanes {
                     self.probe = Some(Pipeline::from_model(&self.model, SamplerConfig::default())?);
                 }
                 let probe = self.probe.as_mut().expect("probe pipeline");
-                let d = router::route_request_with(&self.model, probe, user_text, self.opts);
+                let d = router::route_request_keyed(&self.model, probe, user_text, self.opts);
                 // The tools render every prompt as one cmf-im-v1 turn
                 // (utility::chat_prefix) and pass that frame; probe-dialog
                 // passes the tokenizer's chat frame, as serve does. The
@@ -642,7 +651,7 @@ pub fn cmd_route_eval(a: RouteEvalArgs<'_>) -> anyhow::Result<()> {
     let mut decisions = Vec::with_capacity(rows.len());
     let mut decided_by = Vec::with_capacity(rows.len());
     for row in rows {
-        let d = router::route_request_with(&model, &mut probe, &row.prompt, opts);
+        let d = router::route_request_keyed(&model, &mut probe, &row.prompt, opts);
         let (d, by) = if key_first_step {
             let (dk, outcome) = lookup::resolve_lookup_gated(
                 &tables,

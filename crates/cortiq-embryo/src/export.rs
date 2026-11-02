@@ -24,6 +24,8 @@ pub struct ExportGenome {
     pub id: String,
     /// `pre_chat` | `candidate` | `sealed`.
     pub status: String,
+    /// The chat template the file carries (part of the trunk hash).
+    pub chat_template: Option<String>,
 }
 
 impl ExportGenome {
@@ -76,6 +78,15 @@ fn f16_bytes(x: &[f32]) -> Vec<u8> {
     v
 }
 
+/// The matrices a `q8_2f` export stores in eight bits: the projections of the
+/// mixers, anchors and FFNs, and the tied embedding. Conv kernels, anchor sinks,
+/// clusters and descriptors keep the f16 / f32 rule.
+fn is_q8_matrix(name: &str, shape: &[usize]) -> bool {
+    shape.len() == 2
+        && !name.contains(".desc.")
+        && (name == "model.embed_tokens.weight" || name.ends_with("_proj.weight") || name.contains("_proj_"))
+}
+
 pub(crate) fn spec(name: &str, shape: &[usize], data: &[f32], export_dtype: TensorDtype) -> TensorSpec {
     assert_eq!(
         shape.iter().product::<usize>(),
@@ -88,8 +99,11 @@ pub(crate) fn spec(name: &str, shape: &[usize], data: &[f32], export_dtype: Tens
     // exact.  Descriptor rounding can change the winning expert even when the
     // forward error itself is tiny, so it is deliberately not part of this
     // storage optimization.
-    let use_f16 = export_dtype == TensorDtype::F16 && shape.len() >= 2 && !name.contains(".desc.");
-    let (dtype, data) = if use_f16 {
+    let half = matches!(export_dtype, TensorDtype::F16 | TensorDtype::Q8_2f);
+    let use_f16 = half && shape.len() >= 2 && !name.contains(".desc.");
+    let (dtype, data) = if export_dtype == TensorDtype::Q8_2f && is_q8_matrix(name, shape) {
+        (TensorDtype::Q8_2f, cortiq_core::quant::encode_q8_2f(data, shape[0], shape[1]))
+    } else if use_f16 {
         (TensorDtype::F16, f16_bytes(data))
     } else {
         (TensorDtype::F32, f32_bytes(data))
@@ -287,10 +301,60 @@ pub fn export_genome(
     export_dtype: TensorDtype,
     genome: Option<&ExportGenome>,
 ) -> anyhow::Result<()> {
+    export_genome_sampling(ck, tokenizer_json, out, export_dtype, genome, None, None)
+}
+
+/// [`export_genome`] that also records a sampling recommendation in
+/// `header.provenance.sampling` (keys of
+/// `cortiq_engine::sampler::FILE_SAMPLING_KEYS`): the defaults `cortiq run`
+/// and `serve` apply to this file when a request names none.
+pub fn export_genome_sampling(
+    ck: &Checkpoint,
+    tokenizer_json: &[u8],
+    out: &Path,
+    export_dtype: TensorDtype,
+    genome: Option<&ExportGenome>,
+    sampling: Option<&serde_json::Value>,
+    chat_template: Option<&str>,
+) -> anyhow::Result<()> {
     refuse_genome_overwrite(out)?;
-    let (header, specs) = build_export(ck, tokenizer_json, export_dtype, genome)?;
+    let with_chat = genome.map(|g| ExportGenome { chat_template: chat_template.map(str::to_string), ..g.clone() });
+    let (mut header, specs) = build_export(ck, tokenizer_json, export_dtype, with_chat.as_ref())?;
+    if let (Some(s), Some(p)) = (sampling, header.provenance.as_mut()) {
+        p["sampling"] = s.clone();
+    }
     CmfModel::write(out, &header, &specs, None, Some(tokenizer_json))?;
     Ok(())
+}
+
+/// The cmf-im-v1 chat template (`router::render_cmf_im_v1` for one user turn).
+pub const CMF_IM_V1_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+/// `KEY=VALUE,...` → the `provenance.sampling` object; keys are checked
+/// against `cortiq_engine::sampler::FILE_SAMPLING_KEYS`.
+pub fn parse_sampling(spec: &str) -> anyhow::Result<serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--sampling '{part}': expected KEY=VALUE"))?;
+        let (k, v) = (k.trim(), v.trim());
+        anyhow::ensure!(
+            cortiq_engine::sampler::FILE_SAMPLING_KEYS.contains(&k),
+            "--sampling: unknown key '{k}' (known: {})",
+            cortiq_engine::sampler::FILE_SAMPLING_KEYS.join(", ")
+        );
+        let val = if k == "top_k" || k == "max_tokens" {
+            serde_json::json!(v.parse::<u32>().map_err(|e| anyhow::anyhow!("--sampling {k} '{v}': {e}"))?)
+        } else {
+            let x = v.parse::<f64>().map_err(|e| anyhow::anyhow!("--sampling {k} '{v}': {e}"))?;
+            anyhow::ensure!(x.is_finite() && x >= 0.0, "--sampling {k}: {x} must be finite and >= 0");
+            serde_json::json!(x)
+        };
+        m.insert(k.to_string(), val);
+    }
+    anyhow::ensure!(!m.is_empty(), "--sampling: nothing to record");
+    Ok(serde_json::Value::Object(m))
 }
 
 /// A genome file is NEVER rewritten (docs §9: records are appended to a
@@ -359,6 +423,8 @@ pub struct F16Source {
     pub name: String,
     pub arena_offset: Option<usize>,
     pub len: usize,
+    /// (rows, cols) of a tensor stored as `q8_2f`; `None` is half precision.
+    pub q8: Option<(usize, usize)>,
 }
 
 /// Offset of `s` inside `arena` in elements (pointer arithmetic only).
@@ -393,8 +459,14 @@ pub fn served_params(
                 s.name
             )
         })?;
-        for x in &mut p[off..off + s.len] {
-            *x = cortiq_core::quant::f16_to_f32(cortiq_core::quant::f32_to_f16(*x));
+        let range = &mut p[off..off + s.len];
+        if let Some((rows, cols)) = s.q8 {
+            let bytes = cortiq_core::quant::encode_q8_2f(range, rows, cols);
+            cortiq_core::quant::dequant_q8_2f(&bytes, rows, cols, range);
+        } else {
+            for x in range {
+                *x = cortiq_core::quant::f16_to_f32(cortiq_core::quant::f32_to_f16(*x));
+            }
         }
     }
     Ok(p)
@@ -436,6 +508,7 @@ pub fn import_cmf(path: &Path) -> anyhow::Result<(Checkpoint, Vec<u8>, usize)> {
     let step = prov["step"].as_u64().unwrap_or(0) as u32;
     let dtype = match prov["export_dtype"].as_str() {
         Some("f16") => TensorDtype::F16,
+        Some("q8_2f") => TensorDtype::Q8_2f,
         _ => TensorDtype::F32,
     };
     let tok = m
@@ -527,8 +600,8 @@ fn build_export_all(
     genome: Option<&ExportGenome>,
 ) -> anyhow::Result<(CmfHeader, Vec<TensorSpec>, Vec<F16Source>, Vec<F16Source>)> {
     anyhow::ensure!(
-        matches!(export_dtype, TensorDtype::F32 | TensorDtype::F16),
-        "Embryo export dtype must be f32 or f16"
+        matches!(export_dtype, TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Q8_2f),
+        "Embryo export dtype must be f32, f16 or q8_2f"
     );
     if let Some(g) = genome {
         g.check()?;
@@ -548,6 +621,7 @@ fn build_export_all(
         name: name.to_string(),
         arena_offset: arena_offset(p, data),
         len: data.len(),
+        q8: None,
     };
     let spec_f32 = |name: &str, shape: &[usize], data: &[f32]| {
         all_sources.borrow_mut().push(source(name, data));
@@ -559,6 +633,8 @@ fn build_export_all(
         all_sources.borrow_mut().push(source(name, data));
         if s.dtype == TensorDtype::F16 {
             f16_sources.borrow_mut().push(source(name, data));
+        } else if s.dtype == TensorDtype::Q8_2f {
+            f16_sources.borrow_mut().push(F16Source { q8: Some((shape[0], shape[1])), ..source(name, data) });
         }
         s
     };
@@ -894,11 +970,12 @@ fn build_export_all(
         arch,
         quant_type: match export_dtype {
             TensorDtype::F16 => cortiq_core::types::QuantType::F16,
+            TensorDtype::Q8_2f => cortiq_core::types::QuantType::Q8_2f,
             _ => cortiq_core::types::QuantType::F32,
         },
         provenance: Some(provenance),
         tokenizer_config: Some(TokenizerBundle {
-            chat_template: None,
+            chat_template: genome.and_then(|g| g.chat_template.clone()),
             eos_token_ids: eos.into_iter().collect(),
             bos_token_id: None,
             pad_token_id: None,

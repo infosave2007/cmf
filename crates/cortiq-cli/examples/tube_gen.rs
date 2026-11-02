@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed: Some(1),
         suppress_tokens: Vec::new(),
         penalty_window: 0,
+        loop_stop: false,
     };
     let mut p = Pipeline::from_model(&m, cfg)?;
     let text = std::fs::read_to_string(&prompts_p)?;

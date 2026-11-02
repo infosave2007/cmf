@@ -253,6 +253,7 @@ fn fixture(tag: &str) -> Option<Fixture> {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "pre_chat".into(),
+            chat_template: None,
         }),
     )
     .unwrap();
@@ -420,6 +421,7 @@ fn export_stamps_the_frozen_genome() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "candidate".into(),
+            chat_template: None,
         }),
     )
     .unwrap();
@@ -456,6 +458,7 @@ fn export_stamps_the_frozen_genome() {
             Some(&cortiq_embryo::export::ExportGenome {
                 id: "x".into(),
                 status: "rejected".into(),
+                chat_template: None,
             }),
         )
         .is_err()
@@ -1207,6 +1210,7 @@ fn f16_genome_is_probed_and_baked_on_the_served_trunk() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "candidate".into(),
+            chat_template: None,
         }),
     )
     .unwrap();

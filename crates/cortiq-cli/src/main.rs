@@ -2251,6 +2251,15 @@ enum Commands {
         /// need the router). Probe key_first with --general-prompts.
         #[arg(long)]
         policy: Option<String>,
+        /// lookup.route_margin: this record must beat the backbone by this much in unit error, when stricter than router.margin
+        #[arg(long)]
+        route_margin: Option<f32>,
+        /// lookup.min_key_share: under the key_span router the key must make up at least this share of the words of the message
+        #[arg(long)]
+        min_key_share: Option<f32>,
+        /// lookup.keyless: entry 0 answers whatever the router sends here (route-fit-keyless)
+        #[arg(long)]
+        keyless: bool,
     },
     /// Switch the routing policy of an existing `lookup` record (spec
     /// §9.5.2) by one header-only tail append with a lineage event — no
@@ -2288,6 +2297,48 @@ enum Commands {
     /// selection by ONE header-only tail append. Prints the calibration
     /// summary (JSON on stdout): in-scope recall on the skill held-out,
     /// false-accept on the general held-out, θ, T.
+    /// Drop the header copies that header updates left at the end of a file (in place)
+    TailTrim {
+        model: String,
+    },
+    /// Fit the keyless decision: a message with no key that asks for a fact goes to a keyless record
+    RouteFitKeyless {
+        /// .cmf file (updated in place, append-only)
+        model: String,
+        /// The keyless lookup record that answers
+        #[arg(long)]
+        record: String,
+        /// f32 rows of whole-message φ of questions for a specific fact
+        #[arg(long)]
+        fact_phi: String,
+        /// f32 rows of whole-message φ of ordinary chat
+        #[arg(long)]
+        chat_phi: String,
+        #[arg(long, default_value = "32")]
+        rank: usize,
+        /// `fact` must beat `chat` by this much in unit error
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        margin: f32,
+    },
+    /// Fit the isolated topologies of the follow-up decision (key_span router)
+    RouteFitFollowup {
+        /// .cmf file (updated in place, append-only)
+        model: String,
+        /// id=path: f32 rows of φ of follow-up questions about the record's keys (repeatable)
+        #[arg(long)]
+        skill_phi: Vec<String>,
+        /// f32 rows of φ of unrelated messages in the same form
+        #[arg(long)]
+        general_phi: String,
+        #[arg(long, default_value = "32")]
+        rank: usize,
+        /// φ = unit(unit(key tokens of the earlier turn) + alpha·unit(the message))
+        #[arg(long, default_value = "4")]
+        alpha: f32,
+        /// A record must beat the unrelated topology by this much in unit error
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        margin: f32,
+    },
     RouteFit {
         /// .cmf file with the skill record (updated in place, append-only)
         model: String,
@@ -2317,6 +2368,23 @@ enum Commands {
         /// Target in-scope false-positive rate of the novelty flag (θ)
         #[arg(long, default_value = "0.05")]
         target_fpr: f32,
+        /// φ pool `key_span` with this weight of the rest of the message
+        /// (default: `span_mean` over the whole message)
+        #[arg(long)]
+        key_alpha: Option<f32>,
+        /// Raw φ of --skill-prompts computed elsewhere (`cortiq-embryo phi-pool`
+        /// on the GPU): N × hidden little-endian f32, in prompt order
+        #[arg(long)]
+        skill_phi: Option<String>,
+        /// Raw φ of --general-prompts, same format
+        #[arg(long)]
+        general_phi: Option<String>,
+        /// key_span follow-ups: weight of the message without a key
+        #[arg(long)]
+        followup_alpha: Option<f32>,
+        /// key_span follow-ups: the decision margin
+        #[arg(long)]
+        followup_margin: Option<f32>,
     },
     /// Growth records (`expert_append`): every prompt rendered as cmf-im-v1
     /// (as dump-logits), prefill + --max-tokens greedy steps, the MoE
@@ -3847,6 +3915,7 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
+            prefer_resident_gpu(&model);
             cmd_serve(
                 &model,
                 host.as_deref(),
@@ -4759,6 +4828,7 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
+            prefer_resident_gpu(&model);
             cmd_run(
                 &model,
                 &task,
@@ -4992,7 +5062,13 @@ async fn main() -> anyhow::Result<()> {
             general_prompts,
             general_stop_out,
             policy,
+            route_margin,
+            min_key_share,
+            keyless,
         } => lookup::cmd_lookup_build(lookup::LookupBuildArgs {
+            route_margin,
+            min_key_share,
+            keyless,
             base: &base,
             entries: &entries,
             id: &id,
@@ -5023,6 +5099,11 @@ async fn main() -> anyhow::Result<()> {
             max,
             margin,
             target_fpr,
+            key_alpha,
+            skill_phi,
+            general_phi,
+            followup_alpha,
+            followup_margin,
         } => lookup::cmd_route_fit(lookup::RouteFitArgs {
             model: &model,
             id: &id,
@@ -5033,6 +5114,34 @@ async fn main() -> anyhow::Result<()> {
             max,
             margin,
             target_fpr,
+            key_alpha,
+            skill_phi: skill_phi.as_deref(),
+            general_phi: general_phi.as_deref(),
+            followup_alpha,
+            followup_margin,
+        }),
+        Commands::TailTrim { model } => {
+            let (before, after) = cortiq_core::CmfModel::trim_header_tail(&model)?;
+            println!("{model}: {before} -> {after} bytes");
+            Ok(())
+        }
+        Commands::RouteFitKeyless { model, record, fact_phi, chat_phi, rank, margin } => {
+            lookup::cmd_route_fit_keyless(&model, &record, &fact_phi, &chat_phi, rank, margin)
+        }
+        Commands::RouteFitFollowup {
+            model,
+            skill_phi,
+            general_phi,
+            rank,
+            alpha,
+            margin,
+        } => lookup::cmd_route_fit_followup(lookup::RouteFitFollowupArgs {
+            model: &model,
+            skill_phi: &skill_phi,
+            general_phi: &general_phi,
+            rank,
+            alpha,
+            margin,
         }),
         Commands::GrowthEval {
             model,
@@ -7587,6 +7696,7 @@ async fn cmd_serve(
                 lookup_mode.label()
             );
         }
+        r.warm_lookups();
         Some(Arc::new(r))
     };
 
@@ -7594,6 +7704,13 @@ async fn cmd_serve(
     let runtime = CortiqRuntime::new(model.clone());
     if runtime.masks().get(default_task).is_some() {
         let _ = runtime.switch_task(default_task).await;
+    }
+    // The first request should not pay for the tables and the shaders of a small chat model.
+    if model.header.arch.arch_name == "cortiq_embryo" {
+        let _ = cortiq_engine::lookup::key_holders(&model, "warm up");
+        for p in pipelines.iter_mut() {
+            let _ = p.generate("Hi", 1, None, None);
+        }
     }
     let tokenizer = pipelines[0].tokenizer.clone();
     let state = Arc::new(AppState {
@@ -8255,7 +8372,7 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
     if cortiq_engine::router::is_router_v2(&model) {
-        let d = cortiq_engine::router::route_request(&model, &mut pipeline, prompt);
+        let d = cortiq_engine::router::route_request_keyed(&model, &mut pipeline, prompt, Default::default());
         for s in &d.routing.scores {
             println!(
                 "  {:<20} E = {:.4}  err = {:.3e}  p = {:.3}",
@@ -8346,7 +8463,7 @@ fn cmd_explain(
                 format!("pinned: --skill {id}"),
             )
         }
-        None => cortiq_engine::router::route_request_with(
+        None => cortiq_engine::router::route_request_keyed(
             &model,
             &mut probe,
             prompt,
@@ -8871,6 +8988,20 @@ fn read_prompt_ids(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// An Embryo file runs on its resident GPU graph (recurrent state and anchor
+/// KV on the device), wgpu over Metal on a Mac, unless the caller chose a backend.
+fn prefer_resident_gpu(model_path: &str) {
+    if std::env::var_os("CMF_GPU").is_some() || std::env::var_os("CMF_EMBRYO_RESIDENT").is_some() {
+        return;
+    }
+    if CmfModel::open_sharded(model_path).is_ok_and(|m| m.header.arch.arch_name == "cortiq_embryo") {
+        unsafe {
+            std::env::set_var("CMF_GPU", "wgpu");
+            std::env::set_var("CMF_EMBRYO_RESIDENT", "1");
+        }
+    }
+}
+
 async fn cmd_run(
     model_path: &str,
     task: &str,
@@ -9007,7 +9138,7 @@ async fn cmd_run(
         key_first_gate = Some(
             cortiq_engine::lookup::KeyFirstGate::new(route_opts, frame).can_render(can_render),
         );
-        let d = cortiq_engine::router::route_request_with(
+        let d = cortiq_engine::router::route_request_keyed(
             &model,
             &mut probe,
             prompt.unwrap_or(""),
@@ -9686,9 +9817,11 @@ async fn cmd_run(
                 .tokenizer
                 .encode(&cortiq_engine::router::render_cmf_im_v1(text))
         } else if use_template && !text.is_empty() {
+            let from = cortiq_engine::sampler::file_history_turns(model.header.provenance.as_ref())
+                .map_or(0, |n| cortiq_engine::sampler::last_turns_start(history.iter().map(|m| m.0.as_str()).collect::<Vec<_>>().into_iter(), n));
             pipeline
                 .tokenizer
-                .apply_chat_template_opts(history, thinking)
+                .apply_chat_template_opts(&history[from..], thinking)
         } else {
             let mut ids = resume_prefix.clone();
             ids.extend(pipeline.tokenizer.encode(text));

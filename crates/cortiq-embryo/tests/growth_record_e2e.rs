@@ -622,6 +622,7 @@ fn growth_record_end_to_end_on_a_fam_a_genome() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "sealed".into(),
+            chat_template: None,
         }),
     )
     .unwrap();
@@ -832,6 +833,7 @@ fn novel_source_mode_grows_a_novel_expert_not_a_general_one() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "sealed".into(),
+            chat_template: None,
         }),
     )
     .unwrap();

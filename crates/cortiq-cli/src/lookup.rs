@@ -57,6 +57,12 @@ pub struct LookupBuildArgs<'a> {
     /// `router_and_key | key_first` ([`LookupPolicy`]): written to
     /// `lookup.policy`; `None` leaves the field out (= `router_and_key`).
     pub policy: Option<&'a str>,
+    /// `lookup.route_margin`: this record's own margin over the backbone.
+    pub route_margin: Option<f32>,
+    /// `lookup.min_key_share`: the key's minimal share of the message's words.
+    pub min_key_share: Option<f32>,
+    /// `lookup.keyless`: entry 0 answers whatever the router sends here.
+    pub keyless: bool,
     /// A large GENERAL prompt set the BUILT table is probed with through
     /// the runtime's strong-key extraction ([`general_probe`]): every
     /// strong key it hits is a general phrase `key_first` would answer
@@ -371,6 +377,9 @@ pub fn build_table(entries: &[Entry], opts: BuildOptions<'_>) -> anyhow::Result<
         langs,
         fields,
         policy: None,
+        route_margin: None,
+        min_key_share: None,
+        keyless: None,
     };
     Ok(Table {
         info,
@@ -621,6 +630,9 @@ pub fn cmd_lookup_build(a: LookupBuildArgs<'_>) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("lookup-build: {e}"))?;
     table.info.policy = policy.map(|p| p.label().to_string());
+    table.info.route_margin = a.route_margin;
+    table.info.min_key_share = a.min_key_share;
+    table.info.keyless = a.keyless.then_some(true);
     let slot_refs: Vec<&str> = table.slots.iter().map(String::as_str).collect();
     let tensors = lookup_tensors(a.id, &table.info, &table.keys, &slot_refs)
         .map_err(|e| anyhow::anyhow!("lookup-build: {e}"))?;
@@ -1108,6 +1120,15 @@ pub struct RouteFitArgs<'a> {
     pub margin: Option<f32>,
     /// Target in-scope false-positive rate of the novelty flag.
     pub target_fpr: f32,
+    /// φ pool `key_span` with this weight of the rest of the message.
+    pub key_alpha: Option<f32>,
+    /// Raw φ of the skill prompts computed elsewhere (N × hidden f32 LE).
+    pub skill_phi: Option<&'a str>,
+    /// Raw φ of the general prompts, same format.
+    pub general_phi: Option<&'a str>,
+    /// `key_span` follow-up: weight of the message and the decision margin.
+    pub followup_alpha: Option<f32>,
+    pub followup_margin: Option<f32>,
 }
 
 /// A prompt set: JSONL (`{"prompt"}` / `{"text"}` / a bare string per
@@ -1177,6 +1198,153 @@ fn phi_set(p: &mut Pipeline, spec: &PhiSpec, prompts: &[String], what: &str) -> 
     out
 }
 
+/// φ of a fit set: from a file (GPU tool), or by the runtime; under `key_span`
+/// the prompts without a table key leave the set.
+fn fit_phis(
+    model: &Arc<CmfModel>,
+    p: &mut Pipeline,
+    spec: &PhiSpec,
+    prompts: &mut Vec<String>,
+    file: Option<&str>,
+    what: &str,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if let Some(path) = file {
+        let bytes = std::fs::read(path).with_context(|| path.to_string())?;
+        let h = p.hidden_size;
+        anyhow::ensure!(
+            bytes.len() == prompts.len() * h * 4,
+            "route-fit: {path} holds {} bytes, {} prompts × {h} × 4 expected",
+            bytes.len(),
+            prompts.len()
+        );
+        return Ok(bytes
+            .chunks_exact(h * 4)
+            .map(|r| r.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+            .collect());
+    }
+    if spec.pool != cortiq_core::knowledge::phi_pool::KEY_SPAN {
+        return Ok(phi_set(p, spec, prompts, what));
+    }
+    let mut kept = Vec::new();
+    let mut out = Vec::new();
+    for text in prompts.drain(..) {
+        if let Some(phi) = cortiq_engine::lookup::key_span_phi(model, p, spec, &text) {
+            out.push(phi);
+            kept.push(text);
+        }
+    }
+    *prompts = kept;
+    eprintln!("route-fit: φ {what}: {} prompts name a key", out.len());
+    Ok(out)
+}
+
+/// Arguments of `cortiq route-fit-followup`.
+pub struct RouteFitFollowupArgs<'a> {
+    pub model: &'a str,
+    /// `id=path`: φ of follow-up questions about the record's keys.
+    pub skill_phi: &'a [String],
+    /// φ of unrelated messages with a key of the record in front of them.
+    pub general_phi: &'a str,
+    pub rank: usize,
+    pub alpha: f32,
+    pub margin: f32,
+}
+
+/// Fit the isolated topologies of the follow-up decision from φ rows in its
+/// own form (`unit(unit(key) + alpha·unit(message))`, computed by the caller).
+pub fn cmd_route_fit_followup(a: RouteFitFollowupArgs<'_>) -> anyhow::Result<()> {
+    let model = CmfModel::open(a.model).with_context(|| a.model.to_string())?;
+    let r = model.header.router.as_ref().ok_or_else(|| anyhow::anyhow!("route-fit-followup: {} has no router", a.model))?;
+    anyhow::ensure!(
+        r.phi.pool == cortiq_core::knowledge::phi_pool::KEY_SPAN,
+        "route-fit-followup: router.phi.pool is '{}', key_span expected",
+        r.phi.pool
+    );
+    let (layer, h) = (r.phi.layer, model.header.arch.hidden_size);
+    let fit = |path: &str| -> anyhow::Result<(SelectionDescriptor, usize)> {
+        let bytes = std::fs::read(path).with_context(|| path.to_string())?;
+        anyhow::ensure!(bytes.len() % (h * 4) == 0, "route-fit-followup: {path} is not rows of {h} f32");
+        let rows: Vec<Vec<f32>> = bytes
+            .chunks_exact(h * 4)
+            .map(|r| r.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+            .collect();
+        let mut d = router::fit_descriptor(&rows, layer, a.rank)
+            .ok_or_else(|| anyhow::anyhow!("route-fit-followup: {path} does not fit"))?;
+        // Nothing is calibrated on these rows: the margin is the operating point.
+        d.holdout = None;
+        d.holdout_n = None;
+        Ok((d, rows.len()))
+    };
+    let (base, n_base) = fit(a.general_phi)?;
+    let mut skills = std::collections::BTreeMap::new();
+    let mut counts = serde_json::Map::new();
+    for spec in a.skill_phi {
+        let (id, path) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--skill-phi {spec}: id=path expected"))?;
+        anyhow::ensure!(model.header.skills.iter().any(|s| s.id == id), "route-fit-followup: no record '{id}'");
+        let (d, n) = fit(path)?;
+        counts.insert(id.to_string(), serde_json::json!(n));
+        skills.insert(id.to_string(), d);
+    }
+    drop(model);
+    let (alpha, margin) = (a.alpha, a.margin);
+    CmfModel::update_header_append(a.model, move |h| {
+        if let Some(r) = h.router.as_mut() {
+            r.phi.followup_alpha = Some(alpha);
+            r.phi.followup_margin = Some(margin);
+            r.followup = Some(cortiq_core::knowledge::FollowupTopologies { base, skills });
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("route-fit-followup: {}: {e}", a.model))?;
+    println!(
+        "{}",
+        serde_json::json!({ "file": a.model, "rank": a.rank, "alpha": alpha, "margin": margin, "general_rows": n_base, "skill_rows": counts })
+    );
+    Ok(())
+}
+
+/// Fit the keyless decision from whole-message φ rows of the two classes.
+pub fn cmd_route_fit_keyless(
+    model_path: &str,
+    record: &str,
+    fact_phi: &str,
+    chat_phi: &str,
+    rank: usize,
+    margin: f32,
+) -> anyhow::Result<()> {
+    let model = CmfModel::open(model_path).with_context(|| model_path.to_string())?;
+    let r = model.header.router.as_ref().ok_or_else(|| anyhow::anyhow!("route-fit-keyless: {model_path} has no router"))?;
+    let rec = model.header.skills.iter().find(|s| s.id == record);
+    anyhow::ensure!(
+        rec.and_then(|s| s.lookup.as_ref()).and_then(|l| l.keyless) == Some(true),
+        "route-fit-keyless: '{record}' is not a keyless lookup record"
+    );
+    let (layer, h) = (r.phi.layer, model.header.arch.hidden_size);
+    let fit = |path: &str| -> anyhow::Result<(SelectionDescriptor, usize)> {
+        let bytes = std::fs::read(path).with_context(|| path.to_string())?;
+        anyhow::ensure!(bytes.len() % (h * 4) == 0, "route-fit-keyless: {path} is not rows of {h} f32");
+        let rows: Vec<Vec<f32>> = bytes
+            .chunks_exact(h * 4)
+            .map(|r| r.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+            .collect();
+        let mut d = router::fit_descriptor(&rows, layer, rank)
+            .ok_or_else(|| anyhow::anyhow!("route-fit-keyless: {path} does not fit"))?;
+        d.holdout = None;
+        d.holdout_n = None;
+        Ok((d, rows.len()))
+    };
+    let ((fact, n_fact), (chat, n_chat)) = (fit(fact_phi)?, fit(chat_phi)?);
+    drop(model);
+    let id = record.to_string();
+    CmfModel::update_header_append(model_path, move |h| {
+        if let Some(r) = h.router.as_mut() {
+            r.keyless = Some(cortiq_core::knowledge::KeylessPolicy { record: id, fact, chat, margin });
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("route-fit-keyless: {model_path}: {e}"))?;
+    println!("{}", serde_json::json!({ "file": model_path, "record": record, "rank": rank, "margin": margin, "fact_rows": n_fact, "chat_rows": n_chat }));
+    Ok(())
+}
+
 fn desc_json(d: &SelectionDescriptor, n: usize) -> serde_json::Value {
     serde_json::json!({
         "n": n,
@@ -1233,9 +1401,14 @@ fn runtime_parity_check(
     };
     let (mut worst_phi, mut worst_e, mut to_skill) = (0f32, 0f32, 0usize);
     for (k, (text, phi_fit)) in cases.iter().enumerate() {
-        let q = pipe.tokenizer.encode_plain(text);
-        let (ids, span) = router::phi_span_ids(&policy.phi, &q);
-        let phi_rt = pipe.probe_phi_span(&ids, policy.phi.layer, span);
+        let phi_rt = if policy.phi.pool == cortiq_core::knowledge::phi_pool::KEY_SPAN {
+            cortiq_engine::lookup::key_span_phi(model, &mut pipe, &policy.phi, text)
+                .ok_or_else(|| anyhow::anyhow!("runtime check: no key in holdout prompt #{k}"))?
+        } else {
+            let q = pipe.tokenizer.encode_plain(text);
+            let (ids, span) = router::phi_span_ids(&policy.phi, &q);
+            pipe.probe_phi_span(&ids, policy.phi.layer, span)
+        };
         let (u_rt, u_fit) = (unit(&phi_rt), unit(phi_fit));
         anyhow::ensure!(
             u_rt.len() == u_fit.len(),
@@ -1376,8 +1549,14 @@ pub fn cmd_route_fit(a: RouteFitArgs<'_>) -> anyhow::Result<()> {
 
     // φ by the runtime, on the backbone (no overlay), the cmf-im-v1 frame.
     let mut probe = Pipeline::from_model(&model, SamplerConfig::default())?;
-    let spec = router::cmf_im_v1_phi_spec(&probe.tokenizer, layer)
+    let mut spec = router::cmf_im_v1_phi_spec(&probe.tokenizer, layer)
         .map_err(|e| anyhow::anyhow!("route-fit: {e}"))?;
+    if let Some(alpha) = a.key_alpha {
+        spec.pool = cortiq_core::knowledge::phi_pool::KEY_SPAN.into();
+        spec.key_alpha = Some(alpha);
+        spec.followup_alpha = a.followup_alpha;
+        spec.followup_margin = a.followup_margin;
+    }
     if let Some(r) = &model.header.router {
         if r.phi != spec {
             let others: Vec<&str> = router::calibration_classes(&model.header)
@@ -1403,8 +1582,8 @@ pub fn cmd_route_fit(a: RouteFitArgs<'_>) -> anyhow::Result<()> {
             );
         }
     }
-    let skill_phi = phi_set(&mut probe, &spec, &skill_prompts, "skill");
-    let general_phi = phi_set(&mut probe, &spec, &general_prompts, "general");
+    let skill_phi = fit_phis(&model, &mut probe, &spec, &mut skill_prompts, a.skill_phi, "skill")?;
+    let general_phi = fit_phis(&model, &mut probe, &spec, &mut general_prompts, a.general_phi, "general")?;
     drop(probe);
 
     let skill_desc = router::fit_descriptor(&skill_phi, layer, a.rank)
@@ -1425,6 +1604,8 @@ pub fn cmd_route_fit(a: RouteFitArgs<'_>) -> anyhow::Result<()> {
         margin,
         skills_hash: "0000000000000000".into(),
         measured: None,
+        followup: model.header.router.as_ref().and_then(|r| r.followup.clone()),
+        keyless: model.header.router.as_ref().and_then(|r| r.keyless.clone()),
     });
     let (cal, mut measured) = router::calibrate_v2(&header, a.target_fpr)
         .map_err(|e| anyhow::anyhow!("route-fit: {e}"))?;

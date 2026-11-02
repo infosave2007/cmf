@@ -114,6 +114,25 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Embryo-56M, a small model in its own architecture (0.8.53)
+
+[Embryo-56M](https://huggingface.co/infosave/Embryo-56M-cmf) has 56 million
+parameters, born and trained from scratch on one laptop GPU with no foreign
+weights: gated delta mixers and two bounded anchors, 10.1 MB of state at any
+context length, a 91 MB q8_2f file. It answers facts verbatim from records chosen
+by the reconstruction router, follows up on them, and refuses a factual question
+it has no record for. Outside the records it is a very small model: grammatical,
+short, often empty.
+
+| tok/s | decode | after 2000 tokens | prefill |
+|---|---|---|---|
+| Apple M4 GPU | 650 | 535 | 820 |
+| Apple M4 CPU | 470 | 379 | 430 |
+| RTX 2000 Ada | 925 | 796 | 1230 |
+| EPYC 7443P | 612 | 405 | 233 |
+
+How it is assembled and what each gate measures: [docs/EMBRYO_CHAT.md](docs/EMBRYO_CHAT.md).
+
 ## Clover-35B-A3B-Preview decodes causally (0.8.52)
 
 The block-diffusion model now takes its ordinary causal path by default, with

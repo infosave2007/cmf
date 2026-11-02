@@ -71,6 +71,13 @@ impl SkillRouter {
 
     /// Does the file carry at least one lookup record? Then every routed
     /// request takes the lookup pre-pass ([`Self::decide_lookup`]).
+    /// Open every lookup table now instead of on the first question that needs it.
+    pub fn warm_lookups(&self) {
+        for id in self.lookups.ids() {
+            let _ = self.lookups.get(&id);
+        }
+    }
+
     pub fn has_lookups(&self) -> bool {
         self.lookups.any()
     }
@@ -112,8 +119,11 @@ impl SkillRouter {
         turns: &[&str],
         frame: router::PromptFrame,
     ) -> Result<(RouteDecision, LookupOutcome), String> {
-        let last = turns.first().copied().unwrap_or("");
-        let d = self.decide_framed(last, frame);
+        let d = {
+            let mut probe = self.probe.lock().unwrap_or_else(|e| e.into_inner());
+            router::route_turns_keyed(&self.model, &mut probe, turns, self.opts)
+        };
+        let d = router::enforce_prompt_contract(&self.model.header, d, frame, false).0;
         let gate = lookup::KeyFirstGate::new(self.opts, frame);
         lookup::resolve_lookup_gated(&self.lookups, d, Some(gate), turns, self.lookup_mode)
     }
@@ -126,7 +136,7 @@ impl SkillRouter {
     /// `router.phi.layer`). Concurrent requests serialize on the probe.
     pub fn decide(&self, user_text: &str) -> RouteDecision {
         let mut probe = self.probe.lock().unwrap_or_else(|e| e.into_inner());
-        router::route_request_with(&self.model, &mut probe, user_text, self.opts)
+        router::route_request_keyed(&self.model, &mut probe, user_text, self.opts)
     }
 
     /// The lane of a skill target (blocking on first use: loads one
