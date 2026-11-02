@@ -3727,28 +3727,38 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
 }
 
 /// Ctrl-C, or SIGTERM on Unix.
-pub async fn shutdown_signal() {
-    let ctrl_c = async {
+pub fn shutdown_signal() -> impl std::future::Future<Output = ()> + Send + 'static {
+    // The listeners go in now, not at the future's first poll: the server can
+    // answer a request before that, and a SIGTERM after it would still take the
+    // default action and skip the ledger flush. Needs a Tokio runtime.
+    #[cfg(unix)]
+    let (int, term) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (signal(SignalKind::interrupt()).ok(), signal(SignalKind::terminate()).ok())
+    };
+    async move {
+        #[cfg(unix)]
+        {
+            let wait = |l: Option<tokio::signal::unix::Signal>| async move {
+                match l {
+                    Some(mut s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let (int, term) = (wait(int), wait(term));
+            tokio::select! {
+                _ = int => {},
+                _ = term => {},
+            }
+        }
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;
         }
-    };
-    #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = term => {},
+        tracing::info!("decision server shutting down");
     }
-    tracing::info!("decision server shutting down");
 }
 
 /// `cortiq serve FILE` on a decision file: open (on the blocking pool), bind,
@@ -3758,9 +3768,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let server = tokio::task::spawn_blocking(move || DecisionServer::open(&opts))
         .await
         .context("open the decision server")??;
+    let shutdown = shutdown_signal();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(addr = %addr, "decision server listening");
-    server.run(listener, shutdown_signal()).await
+    server.run(listener, shutdown).await
 }
