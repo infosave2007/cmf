@@ -146,6 +146,10 @@ pub struct Pipeline {
     pub layer_map: Option<Vec<usize>>,
     /// SenseNova-Loop: the mHC routers (`sensenova::Mhc`).
     pub mhc: Option<Box<crate::sensenova::Mhc>>,
+    /// Unlimited-OCR: the DASH router and page state (`uocr::Dash`).
+    pub dash: Option<Box<crate::uocr::Dash>>,
+    /// Its prompt chunks ride the batch graph until that declines.
+    dash_batch_on: bool,
     /// The decode token's mHC streams, `[streams · hidden]`.
     mhc_r: Vec<f32>,
     /// Interleaved-MRoPE sections and the prompt rows' (t, h, w) positions
@@ -2156,10 +2160,10 @@ impl Pipeline {
         }
     }
 
-    /// Mage-VL (`llava_onevision2`) prompt ingest through the batched wgpu
+    /// Mage-VL (`llava_onevision2`) and MiniCPM-OCR prompt ingest through the batched wgpu
     /// graph (`CMF_GRAPH_PREFILL=0` keeps the chunked host prefill).
     fn onevision2_prefill(&self) -> bool {
-        self.model.as_ref().is_some_and(|m| m.header.arch.arch_name == "llava_onevision2")
+        self.model.as_ref().is_some_and(|m| matches!(m.header.arch.arch_name.as_str(), "llava_onevision2" | "minicpm_ocr"))
             && std::env::var("CMF_GRAPH_PREFILL").as_deref() != Ok("0")
     }
 
@@ -2859,8 +2863,9 @@ impl Pipeline {
                         && pv.1 == nkv_g * hd_g
                         && po.2 == self.num_heads * hd_g;
                     // An mHC layer needs the device attend (the CPU-attend
-                    // sandwich has no stream hand-off).
-                    if !full_gpu && self.mhc_layer(scan) {
+                    // sandwich has no stream hand-off), and so does a DASH
+                    // layer: its router state lives on the device.
+                    if !full_gpu && (self.mhc_layer(scan) || self.dash.is_some()) {
                         break;
                     }
                     plan.push(Item::Attn {
@@ -2906,6 +2911,13 @@ impl Pipeline {
                 }
                 return start;
             }
+        }
+        // Unlimited-OCR: all of it or none of it, the host's router state and
+        // the device's are not interchangeable (`CMF_GPU=wgpu` keeps the host's).
+        if self.dash.is_some()
+            && (start != 0 || scan != self.num_layers || crate::gpu::backend_name() != "metal")
+        {
+            return start;
         }
         let Some(model) = model_ref else {
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
@@ -3377,7 +3389,8 @@ impl Pipeline {
                 } => {
                     *full_gpu
                         && self.kv_cache.layers[*li].o1.is_none()
-                        && matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))
+                        && (matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))
+                            || self.dash.is_some())
                 }
                 Item::Gdn { .. } | Item::Sconv { .. } => false,
             });
@@ -3552,6 +3565,13 @@ impl Pipeline {
                         debug_assert!(
                             cache.base() == 0 || window_l.is_some_and(|w| cpu_stored + 1 >= w)
                         );
+                        let dash_l = self.graph_dash(*li);
+                        // A DASH row carries its own angles: position 1 over
+                        // them is the rotation (`uocr::rope_angles`).
+                        let (rope_at, rope_invf, rope_sc): (usize, &[f32], f32) = match self.dash.as_deref() {
+                            Some(d) => (1, &d.angles, 1.0),
+                            None => (position, &inv_freq_l, self.layer_rope_scale(*li)),
+                        };
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
                             layer: *li,
@@ -3559,7 +3579,7 @@ impl Pipeline {
                             nkv,
                             hd,
                             rd: rd_l,
-                            position,
+                            position: rope_at,
                             scale: self.attn_scale,
                             eps: eps as f32,
                             gemma,
@@ -3567,8 +3587,8 @@ impl Pipeline {
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
-                            inv_freq: &inv_freq_l,
-                            rope_scale: self.layer_rope_scale(*li),
+                            inv_freq: rope_invf,
+                            rope_scale: rope_sc,
                             cpu_k,
                             cpu_v,
                             cpu_stored,
@@ -3578,6 +3598,7 @@ impl Pipeline {
                             softmax_sink: cache.sinks.as_deref(),
                             head_gate: head_gate_w,
                             v_norm: self.attn_v_norm,
+                            dash: dash_l.as_ref(),
                         };
                         let o1_bad = o1_layer && p.o1.is_none();
                         if !o1_bad && graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p)
@@ -3747,6 +3768,7 @@ impl Pipeline {
                             softmax_sink: cache.sinks.as_deref(),
                             head_gate: None,
                             v_norm: self.attn_v_norm,
+                            dash: None,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
                             let md = |a: &[f32], b: &[f32]| {
@@ -3957,6 +3979,8 @@ impl Pipeline {
             physical_layers,
             loop_final_norm,
             layer_map: None,
+            dash: None,
+            dash_batch_on: true,
             mhc: None,
             mhc_r: Vec::new(),
             mrope_sections: None,
@@ -5040,6 +5064,16 @@ impl Pipeline {
         // narrowed file whose one segment is always on carries exactly
         // such a mask — drop it here rather than pay 5x for a no-op.
         let task_mask = self.drop_open_mask(task_mask);
+        // Unlimited-OCR: the page coordinates of this prompt.
+        if self.dash.is_some() {
+            if prompt_rows.is_none() {
+                return Err("Unlimited-OCR reads images: pass at least one".into());
+            }
+            let eos = self.tokenizer.eos_token_id.unwrap_or(1);
+            if let Some(d) = self.dash.as_mut() {
+                d.begin(input_ids, eos)?;
+            }
+        }
         // A block-diffusion model generates whole blocks by denoising
         // previews, unless the request asks for the causal decode.
         if self.clover.is_some() && !self.clover_causal_request() {
@@ -6448,6 +6482,9 @@ impl Pipeline {
                 }
             }
             self.clover_causal_logits(&mut logits, generated, &all_ids[penalty_from..]);
+            if let Some(g) = self.dash.as_mut().and_then(|d| d.guard.as_mut()) {
+                g.apply(&mut logits, &all_ids[input_ids.len()..]);
+            }
             let t_next = match forced.or_else(|| forced_ids_at(generated)) {
                 Some(c) => c,
                 None => {
@@ -7061,6 +7098,9 @@ impl Pipeline {
                         if let Some(m) = mtp.as_mut() {
                             let _ = self.mtp_step_metal(m, &hidden, t_fwd, next_pos - 1, false);
                         }
+                    }
+                    if let Some(d) = self.dash.as_mut() {
+                        d.at_decode(t_fwd, next_pos);
                     }
                     hidden = self.forward_layers(&self.embed_single(t_fwd), next_pos, task_mask);
                     next_pos += 1;
@@ -11723,12 +11763,40 @@ impl Pipeline {
         pos: usize,
         task_mask: Option<&TaskMask>,
     ) -> Result<Vec<f32>, String> {
+        if self.dash.is_some() {
+            let PrefillIn::Hidden(rows) = input else {
+                return Err("Unlimited-OCR prompts carry image rows".into());
+            };
+            return Ok(self.dash_prefill_rows(rows, pos));
+        }
         self.mimo_moe_prepare();
         let hs = self.hidden_size;
         let bk = match input {
             PrefillIn::Ids(ids) => ids.len(),
             PrefillIn::Hidden(rows) => rows.len() / hs,
         };
+        // MiniCPM-OCR's vision rows on native Metal: the rows graph, as an id
+        // prompt's chunks take it in the generation loop.
+        #[cfg(target_os = "macos")]
+        if let PrefillIn::Hidden(rows) = input
+            && task_mask.is_none()
+            && self.onevision2_prefill()
+            && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
+            && crate::gpu::enabled_here()
+            && self.gdn_cfg.is_some()
+            && !self.per_token_stack()
+            && bk > 8
+            && bk <= 512
+            && std::env::var("CMF_METAL_PREFILL").as_deref() != Ok("0")
+        {
+            match self.prefill_hiddens_metal(rows.to_vec(), pos, None) {
+                MetalPrefillOutcome::Completed(h) => return Ok(h),
+                MetalPrefillOutcome::Failed => {
+                    return Err("Metal prefill of the prompt rows failed after admission".into());
+                }
+                MetalPrefillOutcome::Declined => {}
+            }
+        }
         #[cfg(not(target_os = "macos"))]
         if task_mask.is_none()
             && !self.o1_active()
@@ -11788,6 +11856,58 @@ impl Pipeline {
         } else {
             Ok(out)
         }
+    }
+
+    /// Unlimited-OCR's prompt rows, one position at a time: each query has its
+    /// own coordinates and page candidates.
+    fn dash_prefill_rows(&mut self, rows: &[f32], pos: usize) -> Vec<f32> {
+        let hs = self.hidden_size;
+        let n = rows.len() / hs;
+        let mut last = vec![0f32; hs];
+        let mut i = 0usize;
+        while i < n && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            #[cfg(not(target_os = "macos"))]
+            if self.dash_batch_on {
+                let k = (n - i).min(crate::gpu::DASH_CHUNK_MAX);
+                if let Some(d) = self.dash.as_mut() {
+                    d.at_prompt_chunk(pos + i, k);
+                }
+                let mut h = rows[i * hs..(i + k) * hs].to_vec();
+                let positions: Vec<usize> = (pos + i..pos + i + k).collect();
+                match self.try_batch_graph_wgpu_prefix(&mut h, &positions, k, None, None) {
+                    crate::gpu::BatchGraphOutcome::Completed => {
+                        last.copy_from_slice(&h[(k - 1) * hs..]);
+                        i += k;
+                        continue;
+                    }
+                    crate::gpu::BatchGraphOutcome::Failed => {
+                        self.graph_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return last;
+                    }
+                    crate::gpu::BatchGraphOutcome::Declined => self.dash_batch_on = false,
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if self.dash_batch_on && n - i >= 8 && crate::gpu::backend_name() == "metal" {
+                let k = (n - i).min(crate::gpu::DASH_CHUNK_MAX);
+                if let Some(d) = self.dash.as_mut() {
+                    d.at_prompt_chunk(pos + i, k);
+                }
+                let mut h = rows[i * hs..(i + k) * hs].to_vec();
+                if self.chunk_run_gpu(0, &mut h, k, pos + i, None, self.num_layers) == self.num_layers {
+                    last.copy_from_slice(&h[(k - 1) * hs..]);
+                    i += k;
+                    continue;
+                }
+                self.dash_batch_on = false;
+            }
+            if let Some(d) = self.dash.as_mut() {
+                d.at_prompt(pos + i);
+            }
+            last = self.forward_layers(&rows[i * hs..(i + 1) * hs], pos + i, None);
+            i += 1;
+        }
+        last
     }
 
     /// The layer-major batched walk over a layer span [from..upto_excl):
@@ -12517,7 +12637,7 @@ impl Pipeline {
             || std::env::var("CMF_GPU_CHUNK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
-            || b < self.chunk_min_rows
+            || (b < self.chunk_min_rows && self.dash.is_none())
             // MRoPE rows rotate on the host (`attention::MropeView`).
             || self.prompt_mrope.is_some()
             // Sliding windows with per-layer RoPE ride the chunk graph
@@ -12626,6 +12746,12 @@ impl Pipeline {
                             let w = idx.iter().map(|&e| p[e] / wsum).collect();
                             (idx, w)
                         });
+                        let detached = m.shared.as_ref().map(|(s, _)| {
+                            let t = |x: &QTensor| {
+                                x.q8_2f_parts().map(|p| p.0).or_else(|| x.q4tp_parts().map(|p| p.0)).unwrap_or(usize::MAX)
+                            };
+                            ([t(&s.gate_proj), t(&s.up_proj), t(&s.down_proj)], s.gate_proj.rows())
+                        });
                         (
                             &e0.gate_proj,
                             &e0.up_proj,
@@ -12636,6 +12762,7 @@ impl Pipeline {
                                 experts,
                                 q8,
                                 route,
+                                detached,
                             }),
                         )
                     }
@@ -12670,6 +12797,7 @@ impl Pipeline {
             // own field (`ChunkGemma4`), so its dense q8_2f stack rides.
             if moe.is_none()
                 && !gemma4
+                && self.dash.is_none()
                 && ffn_act != Act::Gelu
                 && (col.iter().any(|c| !c.is_empty()) || ffn_col.iter().any(|c| !c.is_empty()))
             {
@@ -12756,9 +12884,14 @@ impl Pipeline {
                     [&[][..]; 3]
                 },
                 moe,
+                dash: self.graph_dash(li),
             });
         }
         if layers.is_empty() {
+            return li0;
+        }
+        // Unlimited-OCR: all of it or none of it (the router state).
+        if self.dash.is_some() && (li0 != 0 || layers.len() != self.num_layers) {
             return li0;
         }
         // KV row width per layer (uniform but for Gemma-4).
@@ -13259,10 +13392,38 @@ impl Pipeline {
     /// Some only for a model whose layers do not share one (MiMo-V2) — KV
     /// heads, V width, rotary width and RoPE table, window and sinks of
     /// THIS layer, exactly what the CPU attention reads for it.
+    /// Unlimited-OCR: layer `li`'s router for the device graphs.
+    fn graph_dash(&self, li: usize) -> Option<crate::gpu::GraphDash<'_>> {
+        self.dash.as_deref().map(|d| {
+            let l = &d.layers[li];
+            crate::gpu::GraphDash {
+                qk_proj: &l.qk_proj,
+                q_norm: &l.q_norm,
+                k_norm: &l.k_norm,
+                head_cls: &l.head_cls,
+                idx_scale: l.route.idx_scale,
+                floor: l.route.floor,
+                sigma: l.route.sigma,
+                k: l.route.k,
+                block: d.block,
+                local_blocks: d.local_blocks,
+                nblk: d.allow.len(),
+                cands: &d.cands,
+                coff: &d.coff,
+                angles: &d.angles,
+            }
+        })
+    }
+
     fn graph_attn_geom(&self, li: usize) -> Option<crate::gpu::GraphAttnGeom<'_>> {
-        self.graph_attn_decline_reason()?;
+        if self.dash.is_none() {
+            self.graph_attn_decline_reason()?;
+        }
         let (nkv, hd, rd) = self.layer_geom(li);
-        let invf: &[f32] = if self.layer_is_local(li) {
+        let dash = self.graph_dash(li);
+        let invf: &[f32] = if let Some(d) = self.dash.as_deref() {
+            &d.angles
+        } else if self.layer_is_local(li) {
             match &self.inv_freq_local {
                 Some(f) => f.as_slice(),
                 None => self.inv_freq.as_slice(),
@@ -13283,6 +13444,7 @@ impl Pipeline {
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
             v_norm: self.attn_v_norm,
+            dash,
         })
     }
 
@@ -14511,11 +14673,13 @@ impl Pipeline {
                         Some((se, None))
                             if se.gate_proj.rows() != inter || se.up_proj.rows() != inter =>
                         {
-                            if !matches!(se.act, Act::Silu)
-                                || se.gate_proj.mapped_q4tp().is_none()
-                                || se.up_proj.mapped_q4tp().is_none()
-                                || se.down_proj.mapped_q4tp().is_none()
-                            {
+                            let q4 = se.gate_proj.mapped_q4tp().is_some()
+                                && se.up_proj.mapped_q4tp().is_some()
+                                && se.down_proj.mapped_q4tp().is_some();
+                            let q8 = se.gate_proj.mapped_q8_2f().is_some()
+                                && se.up_proj.mapped_q8_2f().is_some()
+                                && se.down_proj.mapped_q8_2f().is_some();
+                            if !matches!(se.act, Act::Silu) || !(q4 || q8) {
                                 return None;
                             }
                             Some(crate::gpu::GraphMoeDetachedShared {
@@ -15203,6 +15367,7 @@ impl Pipeline {
                 softmax_sink: cache.sinks.as_deref(),
                 head_gate: None,
                 v_norm: false,
+                dash: None,
             },
             cpu_stored,
         )
@@ -15476,14 +15641,26 @@ impl Pipeline {
         if b == 0 || b > 512 {
             return MetalPrefillOutcome::Declined;
         }
-        METAL_PREFILL_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let with_head = spec.is_some();
         let hs = self.hidden_size;
         let mut hiddens = vec![0f32; b * hs];
         for (j, &id) in ids.iter().enumerate() {
             let e = self.embed_single(id);
             hiddens[j * hs..(j + 1) * hs].copy_from_slice(&e);
         }
+        self.prefill_hiddens_metal(hiddens, start_pos, spec)
+    }
+
+    /// Ready prompt rows (`b <= 512`) through the rows graph.
+    #[cfg(target_os = "macos")]
+    fn prefill_hiddens_metal(
+        &mut self,
+        mut hiddens: Vec<f32>,
+        start_pos: usize,
+        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+    ) -> MetalPrefillOutcome {
+        let b = hiddens.len() / self.hidden_size;
+        METAL_PREFILL_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let with_head = spec.is_some();
         let mut pending = match self.metal_rows_run(&mut hiddens, start_pos, b, true, spec, None) {
             MetalRowsRun::Declined => return MetalPrefillOutcome::Declined,
             MetalRowsRun::Failed => {
@@ -15839,6 +16016,7 @@ impl Pipeline {
                 softmax_sink: None,
                 head_gate: None,
                 v_norm: false,
+                dash: None,
             };
             if !graph.attn_ok(&l, &p) || !graph.encode_attn_b(&l, &p) {
                 return None;
@@ -16108,6 +16286,7 @@ impl Pipeline {
                 softmax_sink: None,
                 head_gate: None,
                 v_norm: false,
+                dash: None,
             };
             if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                 return None;
@@ -16388,6 +16567,7 @@ impl Pipeline {
                     softmax_sink: None,
                     head_gate: None,
                     v_norm: false,
+                    dash: None,
                 };
                 if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                     return Err(false);
@@ -16593,7 +16773,24 @@ impl Pipeline {
                         // A shared expert rides as slot top_k (gated or
                         // not is a flag on the select kernel); without one
                         // (MiMo-V2, LFM2-MoE) the kernels run top_k slots.
-                        let shared = m.shared.as_ref();
+                        let inter0 = m.experts.first()?.gate_proj.rows();
+                        // A wider shared expert (Unlimited-OCR) stays out of
+                        // the packed bank, as on the token graph.
+                        let detached_shared = match m.shared.as_ref() {
+                            Some((se, None)) if se.gate_proj.rows() != inter0 || se.up_proj.rows() != inter0 => {
+                                if !matches!(se.act, Act::Silu) {
+                                    return None;
+                                }
+                                Some(crate::gpu::GraphMoeDetachedShared {
+                                    gate: gw(&se.gate_proj)?,
+                                    up: gw(&se.up_proj)?,
+                                    down: gw(&se.down_proj)?,
+                                    width: se.gate_proj.rows(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        let shared = m.shared.as_ref().filter(|_| detached_shared.is_none());
                         let has_shared = shared.is_some();
                         let shared_gated = matches!(shared, Some((_, Some(_))));
                         let sgate = match shared {
@@ -16722,7 +16919,7 @@ impl Pipeline {
                             sigmoid_denom_eps: m.sigmoid_denom_eps,
                             bias: m.expert_bias.as_deref(),
                             has_shared,
-                            detached_shared: None,
+                            detached_shared,
                             shared_gated,
                             route_scale: m.routed_scaling,
                         }
@@ -18974,6 +19171,29 @@ impl Pipeline {
                         &mut self.kv_cache.layers[li],
                         &cfg,
                     )
+                }
+                AttnKind::Full { wq, wk, wv, wo, .. } if self.dash.is_some() => {
+                    let (nh_l, hd_l) = (self.num_heads, self.head_dim);
+                    let mut ao = vec![0f32; nh_l * hd_l];
+                    let dash = self.dash.as_mut().expect("guarded");
+                    crate::uocr::attention_host(
+                        dash,
+                        li,
+                        &self.ws.n1,
+                        wq,
+                        wk,
+                        wv,
+                        &mut self.kv_cache.layers[li],
+                        position,
+                        nh_l,
+                        hd_l,
+                        self.rms_eps as f32,
+                        pool.as_deref(),
+                        &mut ao,
+                    );
+                    let mut out = vec![0f32; hs];
+                    wo.matvec(&ao, &mut out, pool.as_deref());
+                    out
                 }
                 AttnKind::Full {
                     wq,
@@ -21670,8 +21890,16 @@ fn chunk_moe_parts(
     m: &MoeFfn,
     hidden: usize,
 ) -> Option<(&[f32], Vec<(usize, usize, usize)>, bool)> {
-    if m.shared.is_some()
-        || m.per_expert_scale.is_some()
+    // Only a shared expert of its own width, without a gate: it adds to the
+    // routed mix (`ChunkMoe::detached`).
+    if m.shared.as_ref().is_some_and(|(s, g)| {
+        g.is_some()
+            || m.experts.is_empty()
+            || s.gate_proj.rows() == m.experts[0].gate_proj.rows()
+            || !(s.gate_proj.q8_2f_parts().is_some() || s.gate_proj.q4tp_parts().is_some())
+            || !(s.up_proj.q8_2f_parts().is_some() || s.up_proj.q4tp_parts().is_some())
+            || !(s.down_proj.q8_2f_parts().is_some() || s.down_proj.q4tp_parts().is_some())
+    }) || m.per_expert_scale.is_some()
         || m.resonance.is_some()
         || m.route_tau.is_some()
         || m.router_input_norm
@@ -21835,14 +22063,19 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
     {
         return None;
     }
+    // An ungated shared expert of its own width stays out of the jobs ladder:
+    // it runs after the routed mix (`GpuMoe::detached`).
+    let detached = m.shared.as_ref().filter(|(s, g)| {
+        g.is_none() && !m.router_sigmoid && s.gate_proj.rows() != m.experts[0].gate_proj.rows()
+    });
     // Without a shared expert the select kernel fills the k routed jobs
     // only (flag 32). Measured on Mellum2.1's softmax router; the sigmoid /
     // biased routers without one (LFM2-MoE) keep the CPU path until they
     // are measured too.
     let (sh, sg) = match &m.shared {
-        Some((sh, sg)) => (Some(sh), sg.as_ref()),
-        None if !m.router_sigmoid && m.expert_bias.is_none() => (None, None),
-        None => return None,
+        Some((sh, sg)) if detached.is_none() => (Some(sh), sg.as_ref()),
+        _ if !m.router_sigmoid && m.expert_bias.is_none() => (None, None),
+        _ => return None,
     };
     let (rf, rr, rc) = m.router.f32_parts()?;
     if rr != m.experts.len() || rc != hidden {
@@ -21874,7 +22107,7 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
     // contract they were measured on) take the `moe_q8` kernels;
     // `CMF_METAL_MOE_Q8=0` keeps them off the graph (per-op path).
     let q8 = crate::gpu_metal::moe_q8::enabled()
-        && m.shared.is_none()
+        && (m.shared.is_none() || detached.is_some())
         && m.experts[0].gate_proj.q8_2f_parts().is_some();
     let trio = |e: &DenseFfn| -> Option<(usize, usize, usize)> {
         if e.act != Act::Silu
@@ -21909,6 +22142,14 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         Some(sh) => Some(trio(sh)?),
         None => None,
     };
+    let detached = match detached {
+        Some((s, _)) => Some([
+            s.gate_proj.metal_graph_parts()?,
+            s.up_proj.metal_graph_parts()?,
+            s.down_proj.metal_graph_parts()?,
+        ]),
+        None => None,
+    };
     Some(crate::gpu::GpuMoe {
         router: rf,
         sgate: sf,
@@ -21925,6 +22166,7 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         sigmoid_denom_eps: m.sigmoid_denom_eps,
         bias: m.expert_bias.as_deref(),
         shared_gated,
+        detached,
     })
 }
 

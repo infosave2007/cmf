@@ -244,6 +244,14 @@ impl Mat {
         Ok(Mat { w, rows, cols })
     }
 
+    pub(crate) fn from_vec(w: Vec<f32>, rows: usize, cols: usize) -> Self {
+        Mat { w, rows, cols }
+    }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        &self.w
+    }
+
     /// `y[n, rows] = x[n, cols] · Wᵀ (+ bias)`.
     pub(crate) fn matmat(&self, x: &[f32], n: usize, bias: Option<&[f32]>, y: &mut [f32], pool: Option<&Pool>) {
         let (k, m) = (self.cols, self.rows);
@@ -516,55 +524,7 @@ impl Ov2Tower {
         if device_gemm_on() && n >= 64 && crate::gpu::dit_attention(qh, kh, vh, nh, nh, n, hd, scale, out) {
             return;
         }
-        let pool = self.pool.as_deref();
-        let tile = n.min(1024);
-        let mut vt = vec![0f32; hd * n];
-        let mut qs = vec![0f32; tile * hd];
-        let mut sc = vec![0f32; tile * n];
-        let mut oh = vec![0f32; tile * hd];
-        for h in 0..nh {
-            let kp = &kh[h * n * hd..(h + 1) * n * hd];
-            for j in 0..n {
-                for e in 0..hd {
-                    vt[e * n + j] = vh[(h * n + j) * hd + e];
-                }
-            }
-            for t0 in (0..n).step_by(tile) {
-                let tq = tile.min(n - t0);
-                for i in 0..tq {
-                    for e in 0..hd {
-                        qs[i * hd + e] = qh[(h * n + t0 + i) * hd + e] * scale;
-                    }
-                }
-                crate::fcd_ops::gemm_nt_host(&qs[..tq * hd], kp, &mut sc[..tq * n], tq, hd, n, pool);
-                let sp = crate::pool::SendMut::new(sc.as_mut_ptr());
-                let f = |lo: usize, hi: usize| {
-                    for i in lo..hi {
-                        // SAFETY: disjoint score rows per worker.
-                        let row = unsafe { std::slice::from_raw_parts_mut(sp.at(i * n), n) };
-                        let mx = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
-                        let mut sum = 0f32;
-                        for x in row.iter_mut() {
-                            *x = (*x - mx).exp();
-                            sum += *x;
-                        }
-                        let inv = 1.0 / sum;
-                        for x in row.iter_mut() {
-                            *x *= inv;
-                        }
-                    }
-                };
-                match pool {
-                    Some(p) => p.run_rows(tq, &f),
-                    None => f(0, tq),
-                }
-                crate::fcd_ops::gemm_nt_host(&sc[..tq * n], &vt, &mut oh[..tq * hd], tq, n, hd, pool);
-                for i in 0..tq {
-                    let r = t0 + i;
-                    out[r * nh * hd + h * hd..r * nh * hd + (h + 1) * hd].copy_from_slice(&oh[i * hd..(i + 1) * hd]);
-                }
-            }
-        }
+        attend_host(qh, kh, vh, nh, hd, n, scale, out, self.pool.as_deref());
     }
 
     /// Patch rows `[n, 768]` in merge-block order → merged rows
@@ -631,6 +591,7 @@ impl Ov2Tower {
                 inter,
                 eps: c.eps,
                 gelu_tanh: false,
+                quick_gelu: false,
                 rope_halves: false,
                 cos: &cos,
                 sin: &sin,
@@ -682,6 +643,59 @@ impl Ov2Tower {
             );
         }
         Ok(out)
+    }
+}
+
+/// Bidirectional attention over head-major planes on the host.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attend_host(qh: &[f32], kh: &[f32], vh: &[f32], nh: usize, hd: usize, n: usize, scale: f32, out: &mut [f32], pool: Option<&Pool>) {
+    let tile = n.min(1024);
+    let mut vt = vec![0f32; hd * n];
+    let mut qs = vec![0f32; tile * hd];
+    let mut sc = vec![0f32; tile * n];
+    let mut oh = vec![0f32; tile * hd];
+    for h in 0..nh {
+        let kp = &kh[h * n * hd..(h + 1) * n * hd];
+        for j in 0..n {
+            for e in 0..hd {
+                vt[e * n + j] = vh[(h * n + j) * hd + e];
+            }
+        }
+        for t0 in (0..n).step_by(tile) {
+            let tq = tile.min(n - t0);
+            for i in 0..tq {
+                for e in 0..hd {
+                    qs[i * hd + e] = qh[(h * n + t0 + i) * hd + e] * scale;
+                }
+            }
+            crate::fcd_ops::gemm_nt_host(&qs[..tq * hd], kp, &mut sc[..tq * n], tq, hd, n, pool);
+            let sp = crate::pool::SendMut::new(sc.as_mut_ptr());
+            let f = |lo: usize, hi: usize| {
+                for i in lo..hi {
+                    // SAFETY: disjoint score rows per worker.
+                    let row = unsafe { std::slice::from_raw_parts_mut(sp.at(i * n), n) };
+                    let mx = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+                    let mut sum = 0f32;
+                    for x in row.iter_mut() {
+                        *x = (*x - mx).exp();
+                        sum += *x;
+                    }
+                    let inv = 1.0 / sum;
+                    for x in row.iter_mut() {
+                        *x *= inv;
+                    }
+                }
+            };
+            match pool {
+                Some(p) => p.run_rows(tq, &f),
+                None => f(0, tq),
+            }
+            crate::fcd_ops::gemm_nt_host(&sc[..tq * n], &vt, &mut oh[..tq * hd], tq, n, hd, pool);
+            for i in 0..tq {
+                let r = t0 + i;
+                out[r * nh * hd + h * hd..r * nh * hd + (h + 1) * hd].copy_from_slice(&oh[i * hd..(i + 1) * hd]);
+            }
+        }
     }
 }
 

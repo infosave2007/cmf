@@ -1344,6 +1344,20 @@ async fn chat_completions(
     } else {
         None
     };
+    // Unlimited-OCR: images and an instruction, always (no chat template).
+    let uocr_messages = cortiq_engine::uocr::is_uocr(state.runtime.model())
+        .then(|| req.messages.iter().map(message_to_json).collect::<Vec<_>>());
+    // A MiniCPM-OCR file with image parts in the request.
+    let ocr_messages = if cortiq_engine::minicpm_ocr::has_vision(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        match cortiq_engine::minicpm_ocr::has_media(&messages) {
+            Ok(true) => Some(messages),
+            Ok(false) => None,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
+    };
     // An LFM3-Audio file with audio parts (`input_audio`, `audio`).
     let lfm3_audio_messages = if cortiq_engine::lfm3_audio::has_audio(state.runtime.model()) {
         let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
@@ -1482,6 +1496,54 @@ async fn chat_completions(
             Err(e) => {
                 tracing::error!("Mage-VL image preparation failed: {e}");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Mage-VL image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        (prepared.token_ids, None)
+    } else if let Some(messages) = uocr_messages {
+        // Unlimited-OCR: the tower runs before the stream opens, so a bad image
+        // is an HTTP 400.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "Unlimited-OCR cannot use a network split or cortiq.class_tokens");
+        }
+        let (sources, text) = match cortiq_engine::uocr::request_parts(&messages) {
+            Ok(parts) => parts,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        };
+        let slot = state.slots.acquire().await;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::uocr::prepare_for_pipeline(&slot.pipe, &sources, text.as_deref())
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("Unlimited-OCR image preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Unlimited-OCR image preparation failed");
+            }
+        };
+        mimo_rows = Some(prepared.rows);
+        (prepared.token_ids, None)
+    } else if let Some(messages) = ocr_messages {
+        // MiniCPM-OCR with images: the tower runs before the stream opens, so
+        // a bad image is an HTTP 400. Text-only requests take the path below.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "MiniCPM-OCR images cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::minicpm_ocr::prepare_for_pipeline(&slot.pipe, &messages, tools.as_deref(), thinking)
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("MiniCPM-OCR image preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MiniCPM-OCR image preparation failed");
             }
         };
         mimo_rows = prepared.rows;

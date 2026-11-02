@@ -724,6 +724,49 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
         }
         return canon_name(raw);
     }
+    // Unlimited-OCR-2 (`unlimited-ocr`): the MoE decoder at the usual names
+    // with its DASH routers beside the attention, the DeepEncoder as `vis.*`
+    // for `uocr`. The checkpoint's `indexer.*` belongs to the training stage,
+    // and CLIP's patch embedding is unused: SAM's channels replace it.
+    if arch.arch_name == "unlimited-ocr" {
+        if raw.contains(".self_attn.indexer.")
+            || raw == "model.vision_model.embeddings.patch_embedding.weight"
+            || raw == "model.vision_model.embeddings.position_ids"
+        {
+            return None;
+        }
+        if raw.contains(".self_attn.dash_router.") {
+            return Some(raw.to_string());
+        }
+        if let Some(rest) = raw.strip_prefix("model.sam_model.") {
+            return Some(format!("vis.sam.{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix("model.vision_model.") {
+            return Some(format!("vis.clip.{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix("model.projector.") {
+            return Some(format!("vis.projector.{rest}"));
+        }
+        if raw == "model.image_newline" || raw == "model.view_seperator" {
+            return Some(format!("vis.{}", &raw["model.".len()..]));
+        }
+        return canon_name(raw);
+    }
+    // MiniCPM-OCR (`minicpm_ocr`): the Qwen3.5 text model at the usual names,
+    // the SigLIP tower and merger as `vis.*` for `minicpm_ocr`. The tower's
+    // `vit_merger` serves only downsample_mode 16x, which the engine refuses.
+    if arch.arch_name == "minicpm_ocr" {
+        if let Some(rest) = raw.strip_prefix("model.vision_tower.") {
+            if rest.starts_with("vit_merger.") {
+                return None;
+            }
+            return Some(format!("vis.{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix("model.merger.") {
+            return Some(format!("vis.merger.{rest}"));
+        }
+        return canon_name(raw);
+    }
     // Mage-VL (`llava_onevision2`): a Qwen3 text model at the usual names
     // plus the OneVision tower and merger, kept as `visual.*` for
     // `onevision2`.
@@ -979,7 +1022,8 @@ pub(crate) fn keeps_float(name: &str) -> bool {
 }
 
 fn force_f16(name: &str) -> bool {
-    name.ends_with("model.encoder.embed_positions.weight")
+    name.contains(".self_attn.dash_router.")
+        || name.ends_with("model.encoder.embed_positions.weight")
         || name.ends_with("model.decoder.embed_positions.weight")
         // MiMo speech embeddings: 20 gather tables summed per frame, not matmuls.
         || name.starts_with("speech_embeddings.")
@@ -1109,7 +1153,8 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     // Metal/WGPU graph; only a multi-step on-device re-embed burst needs a
     // q4tp embedding and is deliberately not claimed by this fidelity-first
     // compact profile.
-    let qwen35_dense_minicpmv47 = arch.arch_name.eq_ignore_ascii_case("minicpmv4_7")
+    let qwen35_dense_minicpmv47 = (arch.arch_name.eq_ignore_ascii_case("minicpmv4_7")
+        || arch.arch_name.eq_ignore_ascii_case("minicpm_ocr"))
         && arch.moe.is_none()
         && arch
             .linear_core
@@ -10604,8 +10649,10 @@ pub fn run_convert_multi_excluding(
             // Phi-3 family fuses QKV (`qkv_proj`) and gate/up
             // (`gate_up_proj`): split into the canonical tensors — a
             // pure row slice, no value changes.
-            if name.ends_with(".self_attn.qkv_proj.weight")
-                || name.ends_with(".mlp.gate_up_proj.weight")
+            if (name.ends_with(".self_attn.qkv_proj.weight")
+                || name.ends_with(".mlp.gate_up_proj.weight"))
+                // A vision tower keeps its own fused layout.
+                && !name.starts_with("vis.")
             {
                 anyhow::ensure!(m_shape.len() == 2, "fused '{name}': expected 2-D");
                 let w = &m_vals;
@@ -11075,6 +11122,32 @@ pub fn run_convert_multi_excluding(
             "sensenova_loop: config.json has no loop_settings"
         );
         p["sensenova_loop"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // Unlimited-OCR: the checkpoint config, its router settings above all
+    // (`uocr::Dash`).
+    let provenance = if arch.arch_name == "unlimited-ocr" {
+        let mut p = provenance;
+        p["uocr"] = serde_json::json!({"config": config.clone()});
+        p
+    } else {
+        provenance
+    };
+    // MiniCPM-OCR: the checkpoint and image processor configs the vision
+    // path reads (`minicpm_ocr::OcrConfig`).
+    let provenance = if arch.arch_name == "minicpm_ocr" {
+        let mut p = provenance;
+        let processor: serde_json::Value = fs::read(dir.join("preprocessor_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        anyhow::ensure!(
+            !processor.is_null(),
+            "minicpm_ocr: preprocessor_config.json is missing — the image preprocessing lives there"
+        );
+        p["minicpm_ocr"] = serde_json::json!({"config": config.clone(), "processor": processor});
         p
     } else {
         provenance
