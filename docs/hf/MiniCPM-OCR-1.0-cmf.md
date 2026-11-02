@@ -14,6 +14,7 @@ tags:
   - document-parsing
   - vision
   - vulkan
+  - metal
 language:
   - en
   - ru
@@ -70,16 +71,18 @@ at least 0.9999998.
 ## Performance
 
 Measured on one A4 page at 144 dpi (an overview and nine slices, 2470 image
-tokens), RTX PRO 4500 Blackwell (32 GB), Vulkan:
+tokens):
 
-| file | decode | image and prompt to the first token |
-|---|---:|---:|
-| `q8_2f` | 254 tok/s | 2.0 s |
-| `q4tp` | 267 tok/s | 1.9 s |
+| file | stand | decode | image and prompt to the first token |
+|---|---|---:|---:|
+| `q8_2f` | RTX PRO 4500 Blackwell, Vulkan | 254 tok/s | 2.0 s |
+| `q4tp` | RTX PRO 4500 Blackwell, Vulkan | 267 tok/s | 1.9 s |
+| `q8_2f` | M4, 10-core GPU, Metal | 73 tok/s | 8.1 s |
+| `q4tp` | M4, 10-core GPU, Metal | 102 tok/s | 7.7 s |
 
-The encoder takes 0.13 s per view of those 1.3 s; the first request also uploads
-the weights (4 s more). On a 10-core Xeon quota with `CMF_GPU=0` the language model
-decodes at 61 tok/s.
+The encoder takes 0.13 s per view on the card and 0.5 s on the M4; the first request
+on the card also uploads the weights (4 s more). On a 10-core Xeon quota with
+`CMF_GPU=0` the language model decodes at 61 tok/s.
 
 ## Server
 
@@ -98,7 +101,8 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 ## Hardware
 
 **NVIDIA / AMD / Intel (Vulkan, DX12).** The encoder and the language model run on
-the card; 4 GB of VRAM holds either file. **CPU only.** `CMF_GPU=0`.
+the card; 4 GB of VRAM holds either file. **Apple silicon (Metal).** Both run on the
+GPU; a page takes about 4 GB of memory. **CPU only.** `CMF_GPU=0`.
 
 ## Scope
 
@@ -130,7 +134,8 @@ cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition
 
 `q8_2f` на странице A4 выдаёт те же 300 токенов, что и оригинал в float32; `q4tp`
 меньше и даёт тот же текст на этой странице. Скорость на RTX PRO 4500: 254 и
-267 ток/с. Только CPU: `CMF_GPU=0`. Лицензия Apache-2.0.
+267 ток/с, на M4 с 10-ядерным GPU (Metal): 73 и 102 ток/с. Только CPU: `CMF_GPU=0`.
+Лицензия Apache-2.0.
 
 ---
 
@@ -152,5 +157,5 @@ cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition
 阅读顺序不包含在内，这些文件负责识别这一步。
 
 在一页 A4 上，`q8_2f` 的 300 个贪心 token 与 float32 原模型一致；`q4tp` 更小，这一页的文本
-相同。RTX PRO 4500 上的速度：254 和 267 tok/s。仅 CPU：`CMF_GPU=0`。许可证
-Apache-2.0。
+相同。RTX PRO 4500 上的速度：254 和 267 tok/s；10 核 GPU 的 M4（Metal）：73 和 102 tok/s。
+仅 CPU：`CMF_GPU=0`。许可证 Apache-2.0。

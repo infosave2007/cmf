@@ -51,14 +51,14 @@ const S_BUDGET: usize = 32 << 20;
 /// Query rows per attention item.
 const QB: usize = 512;
 
-struct Pipes {
-    mm_nt: ComputePipelineState,
-    mm_nn: ComputePipelineState,
+pub(super) struct Pipes {
+    pub(super) mm_nt: ComputePipelineState,
+    pub(super) mm_nn: ComputePipelineState,
     rms: ComputePipelineState,
     add_norm: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     qkv_prep: ComputePipelineState,
-    softmax: ComputePipelineState,
+    pub(super) softmax: ComputePipelineState,
     row_inv: ComputePipelineState,
     pool: ComputePipelineState,
     flash64: ComputePipelineState,
@@ -75,7 +75,7 @@ fn msl_source() -> Result<String, String> {
     }
 }
 
-fn pipes(c: &Ctx) -> Result<&'static Pipes, String> {
+pub(super) fn pipes(c: &Ctx) -> Result<&'static Pipes, String> {
     PIPES
         .get_or_init(|| {
             let opts = metal::CompileOptions::new();
@@ -138,19 +138,19 @@ fn pipes(c: &Ctx) -> Result<&'static Pipes, String> {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
-struct EgMm {
-    n: u32,
-    m: u32,
-    k: u32,
-    ldx: u32,
-    ldw: u32,
-    ldy: u32,
-    x_off: u32,
-    w_off: u32,
-    y_off: u32,
-    alpha: f32,
-    wrows: u32,
-    pad1: u32,
+pub(super) struct EgMm {
+    pub(super) n: u32,
+    pub(super) m: u32,
+    pub(super) k: u32,
+    pub(super) ldx: u32,
+    pub(super) ldw: u32,
+    pub(super) ldy: u32,
+    pub(super) x_off: u32,
+    pub(super) w_off: u32,
+    pub(super) y_off: u32,
+    pub(super) alpha: f32,
+    pub(super) wrows: u32,
+    pub(super) pad1: u32,
 }
 
 #[repr(C)]
@@ -206,18 +206,18 @@ struct EgFlash {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
-struct EgAtt {
-    s_off: u32,
-    nq: u32,
-    nk: u32,
-    lds: u32,
-    q0: u32,
-    k0: u32,
-    len: u32,
-    window: u32,
+pub(super) struct EgAtt {
+    pub(super) s_off: u32,
+    pub(super) nq: u32,
+    pub(super) nk: u32,
+    pub(super) lds: u32,
+    pub(super) q0: u32,
+    pub(super) k0: u32,
+    pub(super) len: u32,
+    pub(super) window: u32,
 }
 
-fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
+pub(super) fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
     enc.set_bytes(
         idx,
         std::mem::size_of::<T>() as u64,
@@ -230,7 +230,7 @@ fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
 /// A host f32 slice as a device buffer: wrapped in place when it starts on
 /// a page (macOS hands large allocations whole pages; the wrap's length is
 /// rounded up to the page, inside the same allocation), copied otherwise.
-fn wrap(c: &Ctx, v: &[f32]) -> Buffer {
+pub(super) fn wrap(c: &Ctx, v: &[f32]) -> Buffer {
     let page = super::page_size();
     let addr = v.as_ptr() as usize;
     let bytes = v.len() * 4;
@@ -249,7 +249,7 @@ fn wrap(c: &Ctx, v: &[f32]) -> Buffer {
     )
 }
 
-fn write<T: Copy>(b: &Buffer, v: &[T]) {
+pub(super) fn write<T: Copy>(b: &Buffer, v: &[T]) {
     unsafe {
         std::ptr::copy_nonoverlapping(v.as_ptr(), b.contents() as *mut T, v.len());
     }
@@ -257,14 +257,18 @@ fn write<T: Copy>(b: &Buffer, v: &[T]) {
 
 /// Scratch buffers, grown on demand and kept; one set for every forward
 /// (text and vision programs never overlap: the lock is held for one).
-struct Scratch {
+pub(super) struct Scratch {
     bufs: Vec<(Buffer, usize)>,
 }
 
 static SCRATCH: Mutex<Scratch> = Mutex::new(Scratch { bufs: Vec::new() });
 
 impl Scratch {
-    fn get(&mut self, c: &Ctx, slot: usize, bytes: usize) -> Buffer {
+    pub(super) const fn new() -> Self {
+        Scratch { bufs: Vec::new() }
+    }
+
+    pub(super) fn get(&mut self, c: &Ctx, slot: usize, bytes: usize) -> Buffer {
         while self.bufs.len() <= slot {
             self.bufs.push((
                 c._device
@@ -319,7 +323,7 @@ fn prof_on() -> bool {
 
 /// Command-buffer recorder: one encoder; under `CMF_EGEMMA2_GPU_PROF=1` a
 /// buffer per op class so each class's GPU time can be read.
-struct Rec<'a> {
+pub(super) struct Rec<'a> {
     c: &'a Ctx,
     prof: bool,
     done: Vec<(&'static str, CommandBuffer)>,
@@ -327,7 +331,7 @@ struct Rec<'a> {
 }
 
 impl<'a> Rec<'a> {
-    fn new(c: &'a Ctx) -> Self {
+    pub(super) fn new(c: &'a Ctx) -> Self {
         Rec {
             c,
             prof: prof_on(),
@@ -336,7 +340,7 @@ impl<'a> Rec<'a> {
         }
     }
 
-    fn close(&mut self) {
+    pub(super) fn close(&mut self) {
         if let Some((cmd, enc, label)) = self.cur.take() {
             enc.end_encoding();
             cmd.commit();
@@ -344,7 +348,7 @@ impl<'a> Rec<'a> {
         }
     }
 
-    fn enc(&mut self, label: &'static str) -> &ComputeCommandEncoderRef {
+    pub(super) fn enc(&mut self, label: &'static str) -> &ComputeCommandEncoderRef {
         if self.prof && self.cur.as_ref().is_some_and(|(_, _, l)| *l != label) {
             self.close();
         }
@@ -357,7 +361,7 @@ impl<'a> Rec<'a> {
     }
 
     /// Commit what is left and wait for all of it; the GPU ms per class.
-    fn finish(mut self) -> Result<Vec<(&'static str, f64)>, String> {
+    pub(super) fn finish(mut self) -> Result<Vec<(&'static str, f64)>, String> {
         self.close();
         let mut out: Vec<(&'static str, f64)> = Vec::new();
         for (label, cmd) in &self.done {
@@ -379,14 +383,14 @@ impl<'a> Rec<'a> {
 }
 
 /// Item tables of one forward, packed into one shared buffer.
-struct Arena {
-    buf: Buffer,
-    cap: usize,
-    off: usize,
+pub(super) struct Arena {
+    pub(super) buf: Buffer,
+    pub(super) cap: usize,
+    pub(super) off: usize,
 }
 
 impl Arena {
-    fn push<T: Copy>(&mut self, items: &[T]) -> Result<u64, String> {
+    pub(super) fn push<T: Copy>(&mut self, items: &[T]) -> Result<u64, String> {
         let bytes = std::mem::size_of_val(items);
         let at = self.off.div_ceil(256) * 256;
         if at + bytes > self.cap {
@@ -408,21 +412,21 @@ impl Arena {
 
 /// One attention item: a block of one sequence's queries of one head.
 #[derive(Clone, Copy)]
-struct AttItem {
-    s0: usize,
-    h: usize,
-    kvh: usize,
-    q0: usize,
-    nq: usize,
-    k0: usize,
-    nk: usize,
+pub(super) struct AttItem {
+    pub(super) s0: usize,
+    pub(super) h: usize,
+    pub(super) kvh: usize,
+    pub(super) q0: usize,
+    pub(super) nq: usize,
+    pub(super) k0: usize,
+    pub(super) nk: usize,
 }
 
-type Rounds = Vec<Vec<(EgAtt, AttItem)>>;
+pub(super) type Rounds = Vec<Vec<(EgAtt, AttItem)>>;
 
 /// The items of one layer layout over `segs` (start, len), grouped into
 /// rounds that fit the score buffer; and the floats the largest round needs.
-fn att_plan(
+pub(super) fn att_plan(
     segs: &[(usize, usize)],
     nq_heads: usize,
     nkv: usize,
@@ -503,14 +507,14 @@ fn arena_bytes(layers: &[&Rounds], gemms: usize) -> usize {
 // ───────────────────────────── the program builder ─────────────────────────────
 
 /// One device program (a forward) being encoded.
-struct Prog<'a> {
-    p: &'static Pipes,
-    rec: Rec<'a>,
-    arena: Arena,
-    eps: f32,
+pub(super) struct Prog<'a> {
+    pub(super) p: &'static Pipes,
+    pub(super) rec: Rec<'a>,
+    pub(super) arena: Arena,
+    pub(super) eps: f32,
 }
 
-fn proj(n: usize, m: usize, k: usize, ldx: usize, ldy: usize, y_off: usize) -> EgMm {
+pub(super) fn proj(n: usize, m: usize, k: usize, ldx: usize, ldy: usize, y_off: usize) -> EgMm {
     EgMm {
         n: n as u32,
         m: m as u32,
@@ -529,7 +533,7 @@ fn proj(n: usize, m: usize, k: usize, ldx: usize, ldy: usize, y_off: usize) -> E
 
 impl<'a> Prog<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn mm(
+    pub(super) fn mm(
         &mut self,
         nn: bool,
         x: &Buffer,
@@ -1514,10 +1518,18 @@ impl VisionGpu {
 /// encoders' `eg_mm_nt` (f32 operands and accumulation, Accelerate's sum
 /// order). `w` is wrapped in place when it starts on a page (a tower's
 /// weight vectors do), `x` and `y` go through shared scratch. `false` when
-/// the device or its kernels are unavailable, or under
-/// `CMF_EGEMMA2_GPU=0`.
+/// the device or its kernels are unavailable, under `CMF_EGEMMA2_GPU=0`, or
+/// when k is off the kernel's grid of 32 (SigLIP's 588-wide patches): the tile
+/// would read past the end of each row.
 pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if !enabled() || x.len() < n * k || w.len() < m * k || y.len() < n * m || n == 0 || m == 0 {
+    if !enabled()
+        || x.len() < n * k
+        || w.len() < m * k
+        || y.len() < n * m
+        || n == 0
+        || m == 0
+        || !k.is_multiple_of(32)
+    {
         return false;
     }
     let Some(c) = super::ctx() else { return false };

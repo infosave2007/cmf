@@ -26,10 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout, on the resident ViT kernels. 254–267 tok/s against 35 in Transformers
   float32; `q8_2f` matches float32 on 300 greedy tokens of a page.
 - `cortiq run --image` and `/v1/chat/completions` image parts for both models.
+- Native Metal for both models. `gpu_metal/vit.rs` keeps a vision tower resident
+  (SigLIP, CLIP-L, SAM's windows, global blocks and neck) on the encoders' GEMMs;
+  `gpu_metal/uocr.rs` is the DASH router and attend on the token graph and the
+  chunk prefill. On a 10-core M4, Unlimited-OCR decodes at 95–112 tok/s against 71
+  on its CPU, a tiled page's encoder takes 3.5 s against 20 s, its prompt 1.4 s
+  against 12.6 s; MiniCPM-OCR decodes at 73–102 tok/s with 0.5 s a view against 1.2 s.
 
 ### Changed
 - A MoE shared expert wider than its routed bank rides the batch graph, and in
-  q8_2f the token graph too.
+  q8_2f the token graph too; on Metal the token graph and the chunk prefill too.
+- Metal's rows graph takes a q8_2f prompt chunk through the f32-tile GEMM instead
+  of a matvec per position (MiniCPM-OCR q8_2f, 2511 rows: 19.4 s to 2.5 s).
+
+### Fixed
+- `vision_gemm_nt` on Metal refuses a k off the kernel's grid of 32. SigLIP's
+  588-wide patch embedding read past each row, last row into unwritten memory.
 
 ## [0.8.52] — 2026-11-01
 

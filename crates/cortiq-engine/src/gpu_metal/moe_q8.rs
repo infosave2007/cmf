@@ -439,6 +439,7 @@ pub fn chunk_block_for_test(
         experts: trios.to_vec(),
         q8: true,
         route,
+        detached: None,
     };
     let nb = shared_buf(c, &f32_bytes(xs));
     let db = shared_buf(c, &vec![0u8; b * hidden * 4]);

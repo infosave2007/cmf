@@ -32,6 +32,10 @@ pub mod qi21;
 // EmbeddingGemma 2 text encoder — child module, `gpu_metal/egemma2.rs`.
 #[doc(hidden)]
 pub mod egemma2;
+// The vision towers of the OCR models resident on the device.
+pub mod vit;
+// Unlimited-OCR's block-sparse attention on the graphs.
+pub mod uocr;
 pub mod primal_vae;
 pub mod mhc;
 
@@ -12386,6 +12390,8 @@ pub struct ChunkLayer<'a> {
     /// q8_2f input fields of q, k, v, o (empty = plain q8_row / q4):
     /// the GEMM reads x·col (`col_scale_rows`), as the CPU's `prescale`.
     pub col: [&'a [f32]; 4],
+    /// Unlimited-OCR: rotation by per-row angles, router and block-sparse attend.
+    pub dash: Option<crate::gpu::GraphDash<'a>>,
     /// q8_2f input fields of the dense gate, up and down (empty = none):
     /// gate and up read n·col staged like q/k/v, down's field scales the
     /// activation rows in place before its GEMM. Exact-GELU FFNs only.
@@ -12423,6 +12429,9 @@ pub struct ChunkMoe<'a> {
     pub q8: bool,
     #[allow(clippy::type_complexity)]
     pub route: Box<dyn Fn(&[f32]) -> (Vec<usize>, Vec<f32>) + 'a>,
+    /// An ungated shared expert of its own width: `(idx, inter)` of gate, up
+    /// and down, added to the routed mix (same codec as the routed trios).
+    pub detached: Option<([usize; 3], usize)>,
 }
 
 /// One q4tp GEMM of the MoE chunk stage on a row SLICE: `nb` packed rows
@@ -12676,6 +12685,58 @@ fn chunk_moe_ffn(
     true
 }
 
+/// A chunk's detached shared expert over every row, added to `db` (the routed
+/// mix): gate, up, the guarded activation, down, the add.
+#[allow(clippy::too_many_arguments)]
+fn chunk_detached_ffn(
+    c: &Ctx,
+    fbuf: &WeightArena,
+    cmd: &metal::CommandBufferRef,
+    q8: bool,
+    model: &Arc<CmfModel>,
+    (t, inter): ([usize; 3], usize),
+    n_b: &Buffer,
+    db: &Buffer,
+    b: usize,
+    hs: usize,
+) {
+    let g_b = io_buf_grow(c, 86_000_000_051, b * inter * 4);
+    let u_b = io_buf_grow(c, 87_000_000_053, b * inter * 4);
+    let a_b = io_buf_grow(c, 88_000_000_059, b * inter * 4);
+    let up_b = io_buf_grow(c, 89_000_000_061, b * 4);
+    let eo_b = io_buf_grow(c, 90_000_000_067, b * hs * 4);
+    let abs = |i: usize| model.entry_abs_offset(&model.tensors[t[i]]).expect("validated expert");
+    let p8 = if q8 { moe_q8::pipes(c) } else { None };
+    let enc = cmd.new_compute_command_encoder();
+    if let Some(p) = p8 {
+        moe_q8::enc_mm_rows(p, enc, fbuf, abs(0), n_b, 0, &g_b, 0, b, inter, hs, true);
+        moe_q8::enc_mm_rows(p, enc, fbuf, abs(1), n_b, 0, &u_b, 0, b, inter, hs, true);
+        moe_q8::enc_act_rows(p, enc, fbuf, abs(2), &g_b, &u_b, &a_b, &up_b, 0, b, inter, hs);
+        moe_q8::enc_mm_rows(p, enc, fbuf, abs(2), &a_b, 0, &eo_b, 0, b, hs, inter, false);
+    } else {
+        enc_q4tp_mm_rows(c, enc, fbuf, abs(0), n_b, 0, &g_b, 0, b, inter, hs);
+        enc_q4tp_mm_rows(c, enc, fbuf, abs(1), n_b, 0, &u_b, 0, b, inter, hs);
+        enc.set_compute_pipeline_state(&c.moeact);
+        enc.set_buffer(0, Some(&g_b), 0);
+        enc.set_buffer(1, Some(&u_b), 0);
+        enc.set_buffer(2, Some(&a_b), 0);
+        enc.set_buffer(3, Some(&up_b), 0);
+        let n_u = inter as u32;
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc_q4tp_mm_rows(c, enc, fbuf, abs(2), &a_b, 0, &eo_b, 0, b, hs, inter);
+    }
+    let p = uocr::pipes(c).expect("admitted");
+    enc.set_compute_pipeline_state(&p.add);
+    enc.set_buffer(0, Some(&eo_b), 0);
+    enc.set_buffer(1, Some(db), 0);
+    enc.set_buffer(2, Some(&up_b), 0);
+    let n_u = hs as u32;
+    enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_threads(MTLSize::new(hs as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+}
+
 /// Run a RUN of consecutive prefill layers for the whole chunk in a
 /// single submission: per layer — norm → QKV GEMMs → bias+qk-norm+RoPE
 /// with fused mirror append → causal chunk attend (+attention importance) →
@@ -12855,10 +12916,15 @@ pub fn chunk_run_gpu(
     // resident, shapes uniform, mirror ready).
     let mut preps: Vec<ChunkPrep> = Vec::with_capacity(layers.len());
     for (l, lio) in layers.iter().zip(io.iter()) {
-        if l.nh != nh || l.hs != hs || l.inter != inter {
+        if l.nh != nh || l.hs != hs || (l.inter != inter && l.dash.is_none()) {
             return false;
         }
         if g4p.is_none() && (l.nkv != nkv || l.hd != hd) {
+            return false;
+        }
+        // Unlimited-OCR's first layer is dense and wider than the routed ones.
+        let inter = l.inter;
+        if l.dash.as_ref().is_some_and(|d| !uocr::admits(c, d, hs, nh, l.hd) || b > uocr::CHUNK_MAX) {
             return false;
         }
         // This layer's own KV heads and head width (uniform but for Gemma-4).
@@ -12919,7 +12985,7 @@ pub fn chunk_run_gpu(
         // as wide as the input it scales.
         let ffn_in = [l.gate.2, l.up.2, l.down.2];
         if l.ffn_col.iter().any(|f| !f.is_empty())
-            && (l.act != 1
+            && ((l.act != 1 && l.dash.is_none())
                 || l.moe.is_some()
                 || l.g4.is_some()
                 || l.ffn_col
@@ -13170,8 +13236,9 @@ pub fn chunk_run_gpu(
     let attn = io_buf(c, 66_000_000_103 + b * qw, b * qw * 4);
     let apanel = io_buf(c, 73_000_000_117 + b * qw, b * qw * 4);
     let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
-    let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
-    let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
+    let inter_max = layers.iter().map(|l| l.inter).max().unwrap_or(inter);
+    let gb = io_buf(c, 68_000_000_169 + b * inter_max, b * inter_max * 4);
+    let ub = io_buf(c, 69_000_000_213 + b * inter_max, b * inter_max * 4);
     let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
     // q8_2f: x·col staged for the projection that reads it (serial
     // encoders order the reuse).
@@ -13261,6 +13328,7 @@ pub fn chunk_run_gpu(
     for (l, prep) in layers.iter().zip(&preps) {
         // This layer's geometry (Gemma-4's global layers: 512 wide, 1 KV head).
         let (nkv, hd) = (l.nkv, l.hd);
+        let inter = l.inter;
         let inorm = const_buf(c, l.input_norm);
         let pnorm = const_buf(c, l.post_norm);
         let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
@@ -13304,7 +13372,7 @@ pub fn chunk_run_gpu(
         // A q8_2f MoE layer (Mellum2.1 q8_2f) may run its q8_2f projections
         // through the blob-addressed f32-tile GEMM and its attention GEMMs
         // with f32 tiles (`moe_q8`); every other layer keeps its kernels.
-        let q8l = l.moe.as_ref().is_some_and(|m| m.q8);
+        let q8l = l.moe.as_ref().is_some_and(|m| m.q8) || (l.dash.is_some() && !l.col[0].is_empty());
         let q8proj = if q8l && moe_q8::proj_on() {
             moe_q8::pipes(c)
         } else {
@@ -13379,6 +13447,34 @@ pub fn chunk_run_gpu(
             gemma4::enc_vnorm(g4p.unwrap(), enc, &vraw, nkv, hd, b, l.eps);
             enc.end_encoding();
         }
+        // Unlimited-OCR: per-row angles, then router and block-sparse attend
+        // straight into `attn` (the O GEMM below reads it).
+        if let Some(d) = &l.dash {
+            let de = uocr::DashEnc {
+                d,
+                key: (l.kv_id, l.layer),
+                n1: &n_b,
+                q: &qrope,
+                kb: &prep.k_mb,
+                vb: &prep.v_mb,
+                attn: &attn,
+                cap: prep.cap,
+                pos0: prep.st0,
+                k: b,
+                nh,
+                hd,
+                hidden: hs,
+                scale: 1.0f32 / (hd as f32).sqrt(),
+                eps: l.eps,
+            };
+            let enc = cmd.new_compute_command_encoder();
+            let ok = uocr::encode_rope(c, enc, &de, &qraw, &kraw, &vraw)
+                && uocr::encode(c, enc, &de, &|_: &metal::ComputeCommandEncoderRef| {});
+            enc.end_encoding();
+            if !ok {
+                return false;
+            }
+        } else {
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(if hd > 256 {
@@ -13554,6 +13650,7 @@ pub fn chunk_run_gpu(
             }
         }
         cmd = prof.cut(c, cmd, "attend");
+        }
         {
             let enc = cmd.new_compute_command_encoder();
             let o_fits =
@@ -13627,6 +13724,9 @@ pub fn chunk_run_gpu(
                 inter,
             ) {
                 return false;
+            }
+            if let Some(dt) = m.detached {
+                chunk_detached_ffn(c, &fbuf, &cmd, m.q8, l.model, dt, &n_b, &db, b, hs);
             }
             cmd = prof.cut(c, cmd, "moe");
         } else if let Some(g4) = l.g4.as_ref() {
@@ -13732,11 +13832,12 @@ pub fn chunk_run_gpu(
                 enc.end_encoding();
             }
             cmd = prof.cut(c, cmd, "mm_gateup");
-            if l.act == 1 {
+            if l.act == 1 || !l.ffn_col[2].is_empty() {
                 // GELU: gelu(g)·u in place over the gate rows, then the plain
-                // down GEMM (the fused-activation GEMMs compute SiLU only).
+                // down GEMM (the fused-activation GEMMs compute SiLU only). A
+                // q8_2f SiLU down takes it too: the fused GEMM has no field.
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&c.gelu);
+                enc.set_compute_pipeline_state(if l.act == 1 { &c.gelu } else { &c.silu });
                 enc.set_buffer(0, Some(&gb), 0);
                 enc.set_buffer(1, Some(&ub), 0);
                 enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
@@ -18755,6 +18856,9 @@ pub struct GpuMoe<'a> {
     /// The shared expert carries a sigmoid gate (`sgate`). `false`: it
     /// enters with weight 1 and `sgate` is a stand-in the kernel ignores.
     pub shared_gated: bool,
+    /// An ungated shared expert of its own width (`(idx, rows, cols)` of gate,
+    /// up, down; DeepSeek-V2's 2× expert), added after the routed mix.
+    pub detached: Option<[(usize, usize, usize); 3]>,
 }
 
 /// Strict native-Metal Flint descriptor. The routed expert bank is
@@ -18976,6 +19080,10 @@ fn encode_gdn_state_b(
 /// pointer + length, fingerprint-checked: these slices point into the
 /// model's mmap, and a reloaded model maps where the dropped one was —
 /// trusting the address alone served one model's norms to another.
+fn set_bytes_t<T>(enc: &metal::ComputeCommandEncoderRef, idx: u64, v: &T) {
+    enc.set_bytes(idx, std::mem::size_of::<T>() as u64, v as *const T as *const std::ffi::c_void);
+}
+
 fn const_buf(c: &Ctx, data: &[f32]) -> Buffer {
     let key = (data.as_ptr() as usize, data.len() * 4);
     let fp = crate::gpu::fp_f32(data);
@@ -19790,11 +19898,12 @@ impl TokenGraph {
                         None => false,
                     }
                 };
-                m.experts.iter().chain(m.shared.as_ref()).all(|&(g, u, d)| {
-                    ok_at(g, m.inter, self.dims.hidden, m.gu_q2)
-                        && ok_at(u, m.inter, self.dims.hidden, m.gu_q2)
-                        && ok_at(d, self.dims.hidden, m.inter, false)
-                })
+                m.detached.is_none_or(|t| t.iter().all(|x| self.proj_abs(*x).is_some()))
+                    && m.experts.iter().chain(m.shared.as_ref()).all(|&(g, u, d)| {
+                        ok_at(g, m.inter, self.dims.hidden, m.gu_q2)
+                            && ok_at(u, m.inter, self.dims.hidden, m.gu_q2)
+                            && ok_at(d, self.dims.hidden, m.inter, false)
+                    })
             }
             MetalFfn::FlintMoe(m) => {
                 // This deliberately repeats the narrow builder contract:
@@ -20336,6 +20445,7 @@ impl TokenGraph {
             softmax_sink: p.softmax_sink,
             head_gate: p.head_gate,
             v_norm: p.v_norm,
+            dash: None,
         };
         // fresh mirror every time
         kv_mirror_drop(p2.kv_id);
@@ -20685,6 +20795,7 @@ impl TokenGraph {
                 && p.o1.is_none()
                 && gemma4::pipes(self.c).is_some());
         self.attn_ok(l)
+            && p.dash.is_none_or(|d| uocr::admits(self.c, d, self.dims.hidden, p.nh, p.hd))
             && p.hd % 4 == 0
             && wide_ok
             && (!p.v_norm || gemma4::pipes(self.c).is_some())
@@ -21115,6 +21226,39 @@ impl TokenGraph {
                     ((p.nkv * p.hd) as u64, 256),
                 );
                 self.bar(enc);
+            }
+            if let Some(d) = p.dash {
+                let de = uocr::DashEnc {
+                    d,
+                    key: (p.kv_id, p.layer),
+                    n1: &self.n_b,
+                    q: &qr_b,
+                    kb: &k_mb,
+                    vb: &v_mb,
+                    attn: &ao_b,
+                    cap,
+                    pos0: stored,
+                    k: 1,
+                    nh: p.nh,
+                    hd: p.hd,
+                    hidden: self.dims.hidden,
+                    scale: p.scale,
+                    eps: p.eps,
+                };
+                let in_conc = self.in_conc.get();
+                let barrier = move |e: &metal::ComputeCommandEncoderRef| {
+                    if in_conc {
+                        enc_barrier(e);
+                    }
+                };
+                if !uocr::encode(self.c, enc, &de, &barrier) {
+                    tracing::error!("DASH attend refused after the mirror advanced");
+                }
+                self.bar(enc);
+                self.encode_o_ffn(enc, l, &ao_b);
+                enc.end_encoding();
+                self.in_conc.set(false);
+                return true;
             }
             // 5. grouped attend (+ attention importance into the mirror's imp).
             //    Flash-decoding: one threadgroup per Q-head, its simdgroups
@@ -21580,6 +21724,46 @@ impl TokenGraph {
     /// base tables), so the layer never leaves the shared command
     /// buffer. Caller must have passed `ffn_ok` — offsets are trusted.
     fn encode_post_moe_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        post_norm: &[f32],
+        m: &GpuMoe,
+        delta: Option<&Buffer>,
+    ) {
+        self.encode_post_moe_routed(enc, post_norm, m, delta);
+        // A detached shared expert reads the same normed rows; they are still
+        // in n_b, the routed mix wrote to its own scratch and h.
+        if let Some([gate, up, down]) = m.detached {
+            self.bar(enc);
+            let inter = gate.1;
+            let g_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
+            let u_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
+            let a_b = io_buf(self.c, 35_000_000_221 + inter, inter * 4);
+            let (ag, au, ad) = (
+                self.proj_abs(gate).unwrap(),
+                self.proj_abs(up).unwrap(),
+                self.proj_abs(down).unwrap(),
+            );
+            encode_proj(self.c, enc, &self.fbuf, ag.0, &ag.1, &self.n_b, &g_b, gate.1, gate.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, au.0, &au.1, &self.n_b, &u_b, up.1, up.2 / GROUP_SIZE);
+            self.bar(enc);
+            enc.set_compute_pipeline_state(&self.c.silu);
+            enc.set_buffer(0, Some(&g_b), 0);
+            enc.set_buffer(1, Some(&u_b), 0);
+            enc.set_buffer(2, Some(&g_b), 0); // dummy col (has_col = 0)
+            enc.set_buffer(3, Some(&a_b), 0);
+            let (n_u, hc) = (inter as u32, 0u32);
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+            self.bar(enc);
+            encode_proj(self.c, enc, &self.fbuf, ad.0, &ad.1, &a_b, &self.d_b, down.1, down.2 / GROUP_SIZE);
+            self.bar(enc);
+            disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
+        }
+    }
+
+    fn encode_post_moe_routed(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         post_norm: &[f32],
@@ -22628,6 +22812,9 @@ pub struct AttnDeviceParams<'a> {
     /// Gemma-4: every V head is RMS-normalized (no weight) before it is
     /// cached (`gemma4::enc_vnorm`, the host's `vnorm_head`).
     pub v_norm: bool,
+    /// Unlimited-OCR: the router and the block-sparse attend replace the
+    /// grouped one (`gpu_metal::uocr`).
+    pub dash: Option<&'a crate::gpu::GraphDash<'a>>,
 }
 
 // `rd=0` does not read the RoPE table, but Metal still requires a valid
@@ -23441,6 +23628,32 @@ impl VerifyGraph {
                 row_scale,
                 col_field,
             } => {
+                // A q8_2f prompt chunk takes the f32-tile GEMM, which reads the
+                // weight's input field in place: the matvec form below walks a
+                // whole matrix per position, and only verify needs its bit-exact
+                // rows (MiniCPM-OCR q8_2f on the M4, 2511 rows: 19.4 s against
+                // the host walk's 7 s).
+                if col_field.is_some() && self.prefill && self.b >= 32 && t.2 % 32 == 0 {
+                    let fits = abs % 4 == 0
+                        && moe_q8::tensor_bytes(t.1, t.2).is_some_and(|n| self.tg.arena_contains(abs, n));
+                    if let Some(p) = moe_q8::pipes(self.tg.c).filter(|_| fits) {
+                        moe_q8::enc_mm_rows(
+                            p,
+                            enc,
+                            &self.tg.fbuf,
+                            abs,
+                            xs,
+                            0,
+                            y,
+                            0,
+                            self.b,
+                            t.1,
+                            t.2,
+                            true,
+                        );
+                        return;
+                    }
+                }
                 // f32 activations end to end: the half pre-scale `xsc`
                 // has nothing to guard here.
                 encode_q8_matmat(

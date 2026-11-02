@@ -15,6 +15,7 @@ tags:
   - moe
   - vision
   - vulkan
+  - metal
 language:
   - en
   - ru
@@ -70,20 +71,18 @@ bf16 build where it leaves float32.
 
 ## Performance
 
-Measured on an RTX PRO 4500 Blackwell (32 GB), Vulkan:
+| stage | RTX PRO 4500 Blackwell, Vulkan | M4, 10-core GPU, Metal |
+|---|---:|---:|
+| encoder, one 640×640 tile | 0.10 s | 0.35 s |
+| encoder, one 1024×1024 view | 0.24 s | 1.15 s |
+| prompt ingest | about 2600 tok/s | about 700 tok/s |
+| decode, `q8_2f` | 323 tok/s | 95 tok/s |
+| decode, `q4tp` | 319 tok/s | 112 tok/s |
 
-| stage | |
-|---|---:|
-| encoder, one 640×640 tile | 0.10 s |
-| encoder, one 1024×1024 view | 0.24 s |
-| prompt ingest | about 2600 tok/s |
-| decode, `q8_2f` | 323 tok/s |
-| decode, `q4tp` | 319 tok/s |
-
-Decode speed holds over a document: 316 tok/s at 24 pages. A tiled page reaches
-its first token in 1.2 s once the weights are on the card (the first request adds
-about 4 s). On a 10-core Xeon quota with `CMF_GPU=0` the decoder runs at 67 tok/s and the
-encoder takes 16 s for a 1024×1024 view.
+Decode speed holds over a document: 316 tok/s at 24 pages on the card, 137 tok/s
+on the M4 with `q4tp`. A tiled page reaches its first token in 1.2 s on the card once
+the weights are loaded (the first request adds about 4 s), in 4.9 s on the M4. On a 10-core Xeon quota with
+`CMF_GPU=0` the decoder runs at 67 tok/s and the encoder takes 16 s for a 1024×1024 view.
 
 ## Server
 
@@ -103,8 +102,9 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 ## Hardware
 
 **NVIDIA / AMD / Intel (Vulkan, DX12).** The encoder and the decoder run on the
-card; 8 GB of VRAM holds `q4tp`, 12 GB `q8_2f`. **CPU only.** `CMF_GPU=0`: a
-page takes tens of seconds in the encoder.
+card; 8 GB of VRAM holds `q4tp`, 12 GB `q8_2f`. **Apple silicon (Metal).** Both run on
+the GPU; a page takes 4.7 GB of memory with `q4tp`, 6.2 GB with `q8_2f`. **CPU only.**
+`CMF_GPU=0`: a page takes tens of seconds in the encoder.
 
 ## Scope
 
@@ -136,7 +136,9 @@ cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --promp
 ответе один `<PAGE>` на страницу и разметка блоков с координатами в сетке 0–999.
 
 Скорость на RTX PRO 4500: декодирование 323 ток/с (`q8_2f`) и 319 ток/с (`q4tp`), и на 24 страницах
-не падает; энкодер 0.10 с на тайл и 0.24 с на общий вид. Только CPU: `CMF_GPU=0`. Лицензия MIT.
+не падает; энкодер 0.10 с на тайл и 0.24 с на общий вид. На M4 с 10-ядерным GPU (Metal): 95 и 112 ток/с,
+энкодер 0.35 с и 1.15 с; страница занимает 4.7 ГБ памяти с `q4tp` и 6.2 ГБ с `q8_2f`. Только CPU:
+`CMF_GPU=0`. Лицензия MIT.
 
 ---
 
@@ -157,4 +159,5 @@ cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --promp
 1024×1024 的全局视图。输出每页一个 `<PAGE>`，并标注各区块，坐标范围 0–999。
 
 RTX PRO 4500 上的速度：解码 323 tok/s（`q8_2f`）和 319 tok/s（`q4tp`），编码器每块 0.10 秒、
-全局视图 0.24 秒。仅 CPU：`CMF_GPU=0`。许可证 MIT。
+全局视图 0.24 秒。10 核 GPU 的 M4（Metal）：解码 95 和 112 tok/s，编码器 0.35 秒和 1.15 秒；一页占用
+内存 4.7 GB（`q4tp`）或 6.2 GB（`q8_2f`）。仅 CPU：`CMF_GPU=0`。许可证 MIT。

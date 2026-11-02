@@ -118,9 +118,9 @@ cortiq verify model.cmf
 
 Две OCR-модели. [Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
 разбирает весь документ за один проход: её внимание читает не больше 512 токенов на
-шаг при любой длине документа, и RTX PRO 4500 декодирует 320 ток/с на всех 24 страницах.
-[MiniCPM-OCR-1.0](https://huggingface.co/infosave/MiniCPM-OCR-1.0-cmf) распознаёт
-страницу или область на 254–267 ток/с:
+шаг при любой длине документа. RTX PRO 4500 декодирует 320 ток/с на всех 24 страницах,
+10-ядерный M4 — 95–112. [MiniCPM-OCR-1.0](https://huggingface.co/infosave/MiniCPM-OCR-1.0-cmf)
+распознаёт страницу или область на 254–267 ток/с, на M4 на 73–102:
 
 ```sh
 cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192

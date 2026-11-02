@@ -1807,6 +1807,8 @@ pub struct GraphDash<'a> {
     /// Candidate blocks of the rows, `coff[row]..coff[row + 1]` per row.
     pub cands: &'a [u32],
     pub coff: &'a [u32],
+    /// The rows' rotation angles, `[rows][head_dim / 2]`.
+    pub angles: &'a [f32],
 }
 
 /// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
@@ -3816,13 +3818,15 @@ pub struct VitArgs<'a> {
 
 /// The encoder layers of a vision tower resident on the device, `x`
 /// (`[n, d]`) in place. `false` = refused; the caller runs its per-op
-/// path. wgpu only for now; `CMF_VIT_RESIDENT=0` declines.
+/// path. `CMF_VIT_RESIDENT=0` declines.
 #[allow(unused_variables)]
 pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
     if std::env::var("CMF_VIT_RESIDENT").as_deref() == Ok("0") {
         return false;
     }
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::vit::encode(a, x),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::encode(a, x),
         #[allow(unreachable_patterns)]
@@ -3883,6 +3887,8 @@ pub fn sam_encode(a: &SamArgs, x: &[f32], out: &mut Vec<f32>) -> bool {
         return false;
     }
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::vit::sam_encode(a, x, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::sam_encode(a, x, out),
         #[allow(unreachable_patterns)]
