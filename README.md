@@ -131,6 +131,10 @@ short, often empty.
 | RTX 2000 Ada | 925 | 796 | 1230 |
 | EPYC 7443P | 612 | 405 | 233 |
 
+This is the first experimental version of a model built entirely on the
+technologies of Oleg Kirichenko. Larger models for different tasks and the
+mechanisms for training models will follow.
+
 How it is assembled and what each gate measures: [docs/EMBRYO_CHAT.md](docs/EMBRYO_CHAT.md).
 
 ## Clover-35B-A3B-Preview decodes causally (0.8.52)
