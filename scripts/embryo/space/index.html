@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embryo-56M</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <div class="brand">
+      <h1>Embryo-56M</h1>
+      <p data-t="tagline"></p>
+    </div>
+    <div class="top-side">
+      <div class="seg" role="group" aria-label="Language">
+        <button data-lang="en">EN</button><button data-lang="ru">RU</button><button data-lang="zh">中文</button>
+      </div>
+      <a class="link" href="https://huggingface.co/infosave/Embryo-56M-cmf" target="_blank" rel="noopener" data-t="linkModel"></a>
+      <a class="link" href="https://github.com/infosave2007/cmf" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+  <div class="wrap"><p class="note" data-t="note"></p></div>
+  <div class="wrap">
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="tests" data-t="tabTests"></button>
+      <button role="tab" data-tab="chat" data-t="tabChat"></button>
+      <button role="tab" data-tab="how" data-t="tabHow"></button>
+      <button role="tab" data-tab="measured" data-t="tabMeasured"></button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="loading" class="banner" hidden><span class="spin"></span><span data-t="loading"></span></div>
+
+  <section id="tests" class="panel">
+    <div class="toolbar">
+      <button id="runAll" class="primary" data-t="runAll"></button>
+      <button id="stop" hidden data-t="stop"></button>
+      <div class="progress" id="progress" hidden><div id="progressBar"></div></div>
+      <span id="progressText" class="muted"></span>
+      <span class="grow"></span>
+      <button id="download" disabled data-t="download"></button>
+    </div>
+    <div id="sets" class="sets"></div>
+    <div id="stats" class="stats" hidden></div>
+    <div id="resultsHead" class="results-head" hidden>
+      <h2 id="resultsTitle"></h2>
+      <div class="seg" role="group">
+        <button data-filter="all" data-t="filterAll"></button><button data-filter="missed" data-t="filterMissed"></button>
+      </div>
+    </div>
+    <div id="results"></div>
+    <p class="muted foot" data-t="testsFoot"></p>
+  </section>
+
+  <section id="chat" class="panel" hidden>
+    <div class="examples" id="examples"></div>
+    <div id="log" class="log" aria-live="polite"></div>
+    <form id="form" class="ask">
+      <textarea id="input" rows="2" maxlength="1000" data-t-placeholder="placeholder"></textarea>
+      <div class="ask-side">
+        <button type="submit" class="primary" id="send" data-t="send"></button>
+        <button type="button" id="reset" data-t="reset"></button>
+      </div>
+    </form>
+    <p class="muted foot" data-t="chatFoot"></p>
+  </section>
+
+  <section id="how" class="panel" hidden>
+    <figure><img id="figRouting" alt=""><figcaption data-t="capRouting"></figcaption></figure>
+    <figure><img id="figArch" alt=""><figcaption data-t="capArch"></figcaption></figure>
+    <figure><img id="figAdv" alt=""><figcaption data-t="capAdv"></figcaption></figure>
+  </section>
+
+  <section id="measured" class="panel" hidden>
+    <h2 data-t="mSpeed"></h2>
+    <div class="scroll"><table class="data">
+      <thead><tr><th data-t="mDevice"></th><th class="num" data-t="mDecode"></th><th class="num" data-t="mDeep"></th><th class="num" data-t="mPrefill"></th></tr></thead>
+      <tbody>
+        <tr><td>Apple M4 GPU</td><td class="num">650</td><td class="num">535</td><td class="num">820</td></tr>
+        <tr><td>Apple M4 CPU</td><td class="num">470</td><td class="num">379</td><td class="num">430</td></tr>
+        <tr><td>NVIDIA RTX 2000 Ada</td><td class="num">925</td><td class="num">796</td><td class="num">1230</td></tr>
+        <tr><td>AMD EPYC 7443P</td><td class="num">612</td><td class="num">405</td><td class="num">233</td></tr>
+      </tbody>
+    </table></div>
+    <p class="muted" data-t="mSpeedNote"></p>
+
+    <h2 data-t="mQuality"></h2>
+    <div class="scroll"><table class="data">
+      <thead><tr><th data-t="mCheck"></th><th class="num" data-t="mResult"></th></tr></thead>
+      <tbody id="quality"></tbody>
+    </table></div>
+    <p class="muted" data-t="mQualityNote"></p>
+
+    <h2 data-t="mPatents"></h2>
+    <div class="scroll"><table class="data">
+      <thead><tr><th data-t="mMethod"></th><th data-t="mApp"></th><th data-t="mFiled"></th></tr></thead>
+      <tbody id="patents"></tbody>
+    </table></div>
+    <p class="muted" data-t="mLimits"></p>
+  </section>
+</main>
+
+<footer class="wrap muted foot" data-t="footer"></footer>
+<script src="app.js"></script>
+</body>
+</html>

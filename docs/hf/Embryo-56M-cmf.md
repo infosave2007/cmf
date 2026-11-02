@@ -10,6 +10,8 @@ A language model of 56 million parameters, in its own architecture and its own f
 
 > This is the first experimental version of a model built entirely on the technologies of Oleg Kirichenko: architecture, file format, router, runtime and trainer. Larger models for different tasks and the mechanisms for training models will follow.
 
+Try it without installing: tests and chat in the [Space](https://huggingface.co/spaces/infosave/embryo-56m).
+
 ## Quick start
 
 ```bash
@@ -86,6 +88,8 @@ Apache-2.0. U.S. patent applications filed with the USPTO: No. 19/452,440 (Janua
 
 > Это первый экспериментальный вариант модели, полностью основанной на технологиях Олега Кириченко: архитектура, формат файла, роутер, рантайм и обучение. В дальнейшем выйдут более крупные модели для различных задач и механизмы обучения моделей.
 
+Попробовать без установки: тесты и чат в [Space](https://huggingface.co/spaces/infosave/embryo-56m).
+
 ```bash
 cargo install cortiq-cli --features gpu
 hf download infosave/Embryo-56M-cmf embryo-56m.cmf --local-dir .
@@ -111,6 +115,8 @@ cortiq run embryo-56m.cmf -p "Для чего применяют валериа�
 一个 5600 万参数的语言模型，采用自有架构和自有格式，在一台笔记本的 GPU（Apple M4）上从零训练，没有使用他人权重。用英语和俄语简短回答，并从同一文件内的记录中逐字给出事实：4265 种药用植物，以及 663 张关于国家、化学元素、科学、计算机、历史、书籍和日常操作的卡片。网络本身很小，不掌握事实，因此对记录之外的事实问题会如实回答“不知道”，而不是猜测。闲聊和简单任务交给网络：简短、合乎语法，但能力很弱。
 
 > 这是第一个实验版本的模型，完全基于 Oleg Kirichenko 的技术：架构、文件格式、路由器、运行时和训练器。之后将发布面向不同任务的更大模型以及模型训练机制。
+
+无需安装即可试用：[Space](https://huggingface.co/spaces/infosave/embryo-56m) 中有测试和对话。
 
 ```bash
 cargo install cortiq-cli --features gpu

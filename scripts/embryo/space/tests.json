@@ -1,0 +1,876 @@
+{
+ "sets": [
+  {
+   "id": "plants",
+   "cases": [
+    {
+     "turns": [
+      "What can you tell me about thyme?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What are the health benefits of aloe?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Is valerian safe to take every day?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Does calendula have side effects?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What can you tell me about valerian?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What are the health benefits of thyme?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Is licorice safe to take every day?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Does aloe have side effects?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What can you tell me about fennel?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What are the health benefits of valerian?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What can you tell me about sage?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Is garlic safe to take every day?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Какие полезные свойства есть у растения Корица?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Душица: какие есть противопоказания?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Есть ли побочные эффекты у растения Корица?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Расскажи про расторопшу."
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Есть ли побочные эффекты у растения Чабрец?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Есть ли побочные эффекты у растения Крапива?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют чеснок?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют алоэ?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Что ты можешь сказать про чеснок?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют имбирь?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют валериану?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Какие полезные свойства есть у растения Базилик?"
+     ],
+     "expect": "record",
+     "record": "herbs"
+    }
+   ]
+  },
+  {
+   "id": "world",
+   "cases": [
+    {
+     "turns": [
+      "Какой автор написал «Илиада»?"
+     ],
+     "expect": "record",
+     "record": "books"
+    },
+    {
+     "turns": [
+      "Какой автор написал «Великий Гэтсби»?"
+     ],
+     "expect": "record",
+     "record": "books"
+    },
+    {
+     "turns": [
+      "Who created The Old Man and the Sea?"
+     ],
+     "expect": "record",
+     "record": "books"
+    },
+    {
+     "turns": [
+      "Кто создал «Одиссея»?"
+     ],
+     "expect": "record",
+     "record": "books"
+    },
+    {
+     "turns": [
+      "Какой автор написал «Одиссея»?"
+     ],
+     "expect": "record",
+     "record": "books"
+    },
+    {
+     "turns": [
+      "What do they speak in Vietnam?"
+     ],
+     "expect": "record",
+     "record": "countries"
+    },
+    {
+     "turns": [
+      "What do they speak in Ghana?"
+     ],
+     "expect": "record",
+     "record": "countries"
+    },
+    {
+     "turns": [
+      "What do they speak in Andorra?"
+     ],
+     "expect": "record",
+     "record": "countries"
+    },
+    {
+     "turns": [
+      "What do they speak in Egypt?"
+     ],
+     "expect": "record",
+     "record": "countries"
+    },
+    {
+     "turns": [
+      "Я еду в страну Восточный Тимор. Какие там деньги?"
+     ],
+     "expect": "record",
+     "record": "countries"
+    },
+    {
+     "turns": [
+      "Какой символ в таблице у Радий?"
+     ],
+     "expect": "record",
+     "record": "elements"
+    },
+    {
+     "turns": [
+      "Give me the symbol for Promethium."
+     ],
+     "expect": "record",
+     "record": "elements"
+    },
+    {
+     "turns": [
+      "What kind of substance is Iodine?"
+     ],
+     "expect": "record",
+     "record": "elements"
+    },
+    {
+     "turns": [
+      "Какой символ в таблице у Ванадий?"
+     ],
+     "expect": "record",
+     "record": "elements"
+    },
+    {
+     "turns": [
+      "What kind of substance is Actinium?"
+     ],
+     "expect": "record",
+     "record": "elements"
+    },
+    {
+     "turns": [
+      "What is the best way to save money?"
+     ],
+     "expect": "record",
+     "record": "howto"
+    },
+    {
+     "turns": [
+      "Хочу копить деньги. Что делать?"
+     ],
+     "expect": "record",
+     "record": "howto"
+    },
+    {
+     "turns": [
+      "I want to stop procrastinating. What should I do?"
+     ],
+     "expect": "record",
+     "record": "howto"
+    },
+    {
+     "turns": [
+      "I want to fall asleep faster. What should I do?"
+     ],
+     "expect": "record",
+     "record": "howto"
+    },
+    {
+     "turns": [
+      "Как лучше быстрее заснуть?"
+     ],
+     "expect": "record",
+     "record": "howto"
+    },
+    {
+     "turns": [
+      "Кто это: Юлий Цезарь?"
+     ],
+     "expect": "record",
+     "record": "people"
+    },
+    {
+     "turns": [
+      "Краткая биография: Михаил Ломоносов."
+     ],
+     "expect": "record",
+     "record": "people"
+    },
+    {
+     "turns": [
+      "Give me a short biography of Yuri Gagarin."
+     ],
+     "expect": "record",
+     "record": "people"
+    },
+    {
+     "turns": [
+      "Who is Abraham Lincoln?"
+     ],
+     "expect": "record",
+     "record": "people"
+    },
+    {
+     "turns": [
+      "Кто это: Пабло Пикассо?"
+     ],
+     "expect": "record",
+     "record": "people"
+    },
+    {
+     "turns": [
+      "Give me a short summary of Roman Empire."
+     ],
+     "expect": "record",
+     "record": "places"
+    },
+    {
+     "turns": [
+      "Can you describe Volga?"
+     ],
+     "expect": "record",
+     "record": "places"
+    },
+    {
+     "turns": [
+      "Где искать Волга?"
+     ],
+     "expect": "record",
+     "record": "places"
+    },
+    {
+     "turns": [
+      "Опиши Эверест."
+     ],
+     "expect": "record",
+     "record": "places"
+    },
+    {
+     "turns": [
+      "What happened in Roman Empire?"
+     ],
+     "expect": "record",
+     "record": "places"
+    },
+    {
+     "turns": [
+      "What should I know about vaccine?"
+     ],
+     "expect": "record",
+     "record": "science"
+    },
+    {
+     "turns": [
+      "What does Euler's number mean?"
+     ],
+     "expect": "record",
+     "record": "science"
+    },
+    {
+     "turns": [
+      "Подскажи, что такое акция?"
+     ],
+     "expect": "record",
+     "record": "science"
+    },
+    {
+     "turns": [
+      "Дай короткое определение: машинное обучение."
+     ],
+     "expect": "record",
+     "record": "science"
+    },
+    {
+     "turns": [
+      "Give me a short definition of object-oriented programming."
+     ],
+     "expect": "record",
+     "record": "science"
+    },
+    {
+     "turns": [
+      "Can you tell me do you have feelings?"
+     ],
+     "expect": "record",
+     "record": "self"
+    },
+    {
+     "turns": [
+      "Подскажи, у тебя есть сознание?"
+     ],
+     "expect": "record",
+     "record": "self"
+    },
+    {
+     "turns": [
+      "Подскажи, ты живой?"
+     ],
+     "expect": "record",
+     "record": "self"
+    },
+    {
+     "turns": [
+      "Подскажи, ты живая?"
+     ],
+     "expect": "record",
+     "record": "self"
+    },
+    {
+     "turns": [
+      "Can you tell me are you alive?"
+     ],
+     "expect": "record",
+     "record": "self"
+    },
+    {
+     "turns": [
+      "Подскажи, сколько лет земле?"
+     ],
+     "expect": "record",
+     "record": "trivia"
+    },
+    {
+     "turns": [
+      "Do you know the age of the earth?"
+     ],
+     "expect": "record",
+     "record": "trivia"
+    },
+    {
+     "turns": [
+      "Do you know the smallest planet?"
+     ],
+     "expect": "record",
+     "record": "trivia"
+    },
+    {
+     "turns": [
+      "Do you know the inventor of the light bulb?"
+     ],
+     "expect": "record",
+     "record": "trivia"
+    },
+    {
+     "turns": [
+      "Ты знаешь: самая маленькая страна?"
+     ],
+     "expect": "record",
+     "record": "trivia"
+    }
+   ]
+  },
+  {
+   "id": "followups",
+   "cases": [
+    {
+     "turns": [
+      "What is dandelion used for?",
+      "Does it grow in Europe?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют душицу?",
+      "Какие там вещества?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют куркуму?",
+      "Растёт ли в России?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют крапиву?",
+      "Растёт ли в России?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют крапиву?",
+      "Какую часть брать?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is St. John's wort used for?",
+      "Can I take it with alcohol?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют расторопшу?",
+      "Какое научное название?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют чабрец?",
+      "Есть какие-то предупреждения?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют лаванду?",
+      "Можно кормящим?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют корицу?",
+      "Это правда работает?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют одуванчик?",
+      "Можно с алкоголем?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют бузину?",
+      "Какое научное название?"
+     ],
+     "expect": "followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is calendula used for?",
+      "Thank you very much."
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is garlic used for?",
+      "Thank you very much."
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is black cohosh used for?",
+      "Write a Python function that adds two numbers."
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют солодку?",
+      "Как починить машину?"
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is lavender used for?",
+      "How do I fix my car?"
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "What is thyme used for?",
+      "How are you?"
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют гинкго?",
+      "Напиши функцию на Python."
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    },
+    {
+     "turns": [
+      "Для чего применяют боярышник?",
+      "Сегодня будет дождь?"
+     ],
+     "expect": "not_followup",
+     "record": "herbs"
+    }
+   ]
+  },
+  {
+   "id": "refusal",
+   "cases": [
+    {
+     "turns": [
+      "Кто снял фильм Титаник?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "How many people live in Berlin?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "What is 2+2?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "В каком году утонул Титаник?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Сколько струн у скрипки?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Сколько стран в Африке?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Какая столица Сибири?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "What is the tallest building in the world?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Можно ли пить ибупрофен на голодный желудок?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Какой ВВП у Бразилии?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Who is the current president of the United States?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Сколько будет 7 на 8?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Who directed the movie Titanic?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Кто самый богатый человек в мире?"
+     ],
+     "expect": "refusal"
+    },
+    {
+     "turns": [
+      "Ты любишь кошек?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "I am bored, what should I do?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Why are people afraid of the dark?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Suggest a name for my cat."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Дай совет, как экономить деньги."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Let's talk about books."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "How can I become more confident?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Мне скучно, чем заняться?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Tell me a story about a dragon."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Давай поговорим о книгах."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Помоги составить резюме."
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Что ты думаешь о музыке?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Can you be my friend?"
+     ],
+     "expect": "not_refusal"
+    },
+    {
+     "turns": [
+      "Напиши короткую мотивирующую речь."
+     ],
+     "expect": "not_refusal"
+    }
+   ]
+  },
+  {
+   "id": "network",
+   "cases": [
+    {
+     "turns": [
+      "Tell me a story about a dragon."
+     ],
+     "expect": "speed"
+    },
+    {
+     "turns": [
+      "Write a poem about the sea."
+     ],
+     "expect": "speed"
+    },
+    {
+     "turns": [
+      "Write a Python function that adds two numbers."
+     ],
+     "expect": "speed"
+    },
+    {
+     "turns": [
+      "Explain how a bicycle stays upright."
+     ],
+     "expect": "speed"
+    },
+    {
+     "turns": [
+      "Расскажи историю о старом маяке."
+     ],
+     "expect": "speed"
+    },
+    {
+     "turns": [
+      "Напиши стихотворение о море."
+     ],
+     "expect": "speed"
+    }
+   ]
+  }
+ ]
+}
