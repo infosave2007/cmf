@@ -115,6 +115,8 @@ cortiq verify model.cmf
 | RTX 2000 Ada | 925 | 796 | 1230 |
 | EPYC 7443P | 612 | 405 | 233 |
 
+这是第一个实验版本的模型，完全基于 Oleg Kirichenko 的技术。之后将发布面向不同任务的更大模型以及模型训练机制。
+
 组装方式和各项检查的含义见 [docs/EMBRYO_CHAT.zh.md](docs/EMBRYO_CHAT.zh.md)。
 
 ## Clover-35B-A3B-Preview 默认因果解码（0.8.52）
