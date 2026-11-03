@@ -8,7 +8,10 @@
 //!   decodes under bf16 autocast, so f16 is the closer of the two anyway;
 //! - GroupNorm is the two-pass reduction, over a whole tile as in the class;
 //! - the mid attention runs one query frame at a time over the keys of that
-//!   frame and the frames before it.
+//!   frame and the frames before it;
+//! - a tensor past the storage binding limit (2 GB here, and 4.4 M × 256 × 2 B
+//!   is 2.2 GB) runs in slabs of frames: every kernel is row-local or, for the
+//!   convs, reads two frames back, so the buffers only need windowed bindings.
 
 use super::Ctx;
 use super::zimage::{Epi, MmArgs, MmCall, MmCfg, VAE_SOFTMAX_SRC, bg, default_cfg, mm_call, mm_pipe, mm_uniform, pipeline, sbuf, sbuf_init, ubuf, zctx};
@@ -31,8 +34,8 @@ var<workgroup> sh: array<f32, 512>;
 // 4 = pass 2 (Σ (v − mean)²).
 @compute @workgroup_size(256)
 fn s2v_gn_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-  let chunk = wid.x;
-  let r0 = chunk * p.rows;
+  let chunk = wid.x + p._b;
+  let r0 = wid.x * p.rows;
   let r1 = min(r0 + p.rows, p.m);
   let n = (r1 - r0) * p.c;
   let base = r0 * p.c;
@@ -367,77 +370,189 @@ impl Rec<'_> {
         Some(())
     }
 
+
+    fn limit(&self) -> usize {
+        let l = self.c.device.limits();
+        (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size) as usize
+    }
+
+    /// `(first frame, frames)` slabs of a `[F·H·W][ch]` f16 tensor that each
+    /// fit one binding.
+    fn slabs(&self, f: usize, per: usize, ch: usize) -> Vec<(usize, usize)> {
+        let frame = per * ch * 2;
+        let room = (self.limit() / frame).max(1).min(f);
+        (0..f.div_ceil(room)).map(|i| (i * room, room.min(f - i * room))).collect()
+    }
+
+    fn kw(&mut self, key: &str, src: &str, entry: &str, bufs: &[(&wgpu::Buffer, u64, u64)], grid: (u32, u32, u32)) -> Option<()> {
+        let pipe = pipeline(self.c, key, src, entry)?;
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if b.2 == 0 {
+                    super::bind_buf(i as u32, b.0)
+                } else {
+                    super::bind_buf_off(i as u32, b.0, b.1, b.2)
+                }
+            })
+            .collect();
+        let bgr = self.c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(key),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        self.ops.push(Op::D(pipe, bgr, grid));
+        Some(())
+    }
+
+    /// GroupNorm of `x` `[F·H·W][ch]` → f16 `out`, optional bias on read and SiLU.
     #[allow(clippy::too_many_arguments)]
-    fn gn(&mut self, x: &wgpu::Buffer, bias: Option<&wgpu::Buffer>, n: &VN, m: usize, ch: usize, silu: bool, out: &wgpu::Buffer) -> Option<()> {
+    fn gn(&mut self, x: &wgpu::Buffer, bias: Option<&wgpu::Buffer>, n: &VN, f: usize, per: usize, ch: usize, silu: bool, out: &wgpu::Buffer) -> Option<()> {
         let g = 32usize;
         let cpg = ch / g;
-        let nchunk = m.div_ceil(GN_ROWS);
+        let m = f * per;
         let hb = bias.is_some() as u32;
         let d = self.dummy.clone();
         let bb = bias.unwrap_or(&d);
         let (stat, part) = (self.stat.clone(), self.part.clone());
+        let sl = self.slabs(f, per, ch);
+        let nchunk_all: usize = sl.iter().map(|s| (s.1 * per).div_ceil(GN_ROWS)).sum();
         for pass2 in [false, true] {
             let flags = hb | if pass2 { 4 } else { 0 };
-            let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk as u32, flags, g as u32, 0]);
-            self.k("s2v_gn_part", GN_PART_SRC, "s2v_gn_part", &[x, bb, &stat, &part, &u], (nchunk as u32, 1, 1))?;
-            let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk as u32, flags, g as u32, 1e-6f32.to_bits()]);
+            let mut c0 = 0usize;
+            for &(f0, nf) in &sl {
+                let rows = nf * per;
+                let nc = rows.div_ceil(GN_ROWS);
+                let u = ubuf(self.c, &[rows as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk_all as u32, flags, g as u32, c0 as u32]);
+                let off = (f0 * per * ch * 2) as u64;
+                let size = (rows * ch * 2) as u64;
+                self.kw("s2v_gn_part", GN_PART_SRC, "s2v_gn_part", &[(x, off, size), (bb, 0, 0), (&stat, 0, 0), (&part, 0, 0), (&u, 0, 0)], (nc as u32, 1, 1))?;
+                c0 += nc;
+            }
+            let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk_all as u32, flags, g as u32, 1e-6f32.to_bits()]);
             self.k("s2v_gn_fin", GN_FIN_SRC, "s2v_gn_fin", &[&part, &stat, &u], (g as u32, 1, 1))?;
         }
         let flags = hb | if silu { 2 } else { 0 };
-        let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, 0, 0, flags, g as u32, mp_of(m) as u32]);
-        self.k("s2v_gn_apply", GN_APPLY_SRC, "s2v_gn_apply", &[x, bb, &stat, &n.w, &n.b, out, &u], grid1(mp_of(m) * ch / 4))
+        for &(f0, nf) in &sl {
+            let rows = nf * per;
+            let u = ubuf(self.c, &[rows as u32, ch as u32, cpg as u32, 0, 0, flags, g as u32, rows as u32]);
+            let off = (f0 * per * ch * 2) as u64;
+            let size = (rows * ch * 2) as u64;
+            self.kw(
+                "s2v_gn_apply",
+                GN_APPLY_SRC,
+                "s2v_gn_apply",
+                &[(x, off, size), (bb, 0, 0), (&stat, 0, 0), (&n.w, 0, 0), (&n.b, 0, 0), (out, off, size), (&u, 0, 0)],
+                grid1(rows * ch / 4),
+            )?;
+        }
+        Some(())
     }
 
-    /// conv of the f16 volume `act` → raw f16 `[m][cout_p]` (no bias).
+    /// conv of the f16 volume `act` → raw f16 `[m][cout_p]` (no bias). `act`
+    /// holds the source frames (before the nearest upsample `up`).
     #[allow(clippy::too_many_arguments)]
     fn conv(&mut self, cv: &VC, act: &wgpu::Buffer, f: usize, h: usize, w: usize, up: (bool, bool), out: &wgpu::Buffer) -> Option<()> {
-        let m = f * h * w;
+        let per = h * w;
+        let (sh, sw) = if up.0 { (h / 2, w / 2) } else { (h, w) };
+        let src_f = |of: usize| if up.1 && of > 0 { (of - 1) / 2 + 1 } else { of };
+        let sper = sh * sw * cv.cin_p * 2;
         let taps = if cv.k3 { 27 } else { 1 };
         let g = MmCfg { conv: if cv.k3 { 3 } else { 0 }, ..default_cfg(Epi::F16) };
-        let flags = (u32::from(up.0) << 16) | (u32::from(up.1) << 17);
-        let a = MmArgs {
-            m: m as u32,
-            n: cv.cout_p as u32,
-            k: (taps * cv.cin_p) as u32,
-            ldo: cv.cout_p as u32,
-            ocol: 0,
-            arow: if cv.k3 { f as u32 | flags } else { 0 },
-            oscale: 1.0,
-            conv: [w as u32, h as u32, cv.cin_p as u32],
-        };
-        let mc = mm_call(self.c, g, &a, &cv.plane, act, out)?;
-        self.ops.push(Op::M(mc));
+        let sl = self.slabs(f, per, cv.cout_p.max(if up.0 { 0 } else { cv.cin_p }));
+        for (f0, nf) in sl {
+            let rows = nf * per;
+            let s0 = if cv.k3 { src_f(f0.saturating_sub(2)) } else { f0 };
+            let s1 = src_f(f0 + nf - 1) + 1;
+            let a = MmArgs {
+                m: rows as u32,
+                n: cv.cout_p as u32,
+                k: (taps * cv.cin_p) as u32,
+                ldo: cv.cout_p as u32,
+                ocol: 0,
+                arow: if cv.k3 {
+                    (f as u32) | ((f0 as u32) << 8) | ((s0 as u32) << 16) | (u32::from(up.0) << 24) | (u32::from(up.1) << 25)
+                } else {
+                    0
+                },
+                oscale: 1.0,
+                conv: [w as u32, h as u32, cv.cin_p as u32],
+            };
+            // The tile over-reads rows past the slab: keep them in the window.
+            let oo = (f0 * per * cv.cout_p * 2) as u64;
+            let cap = out.size() - oo;
+            let osize = ((rows.next_multiple_of(128) * cv.cout_p * 2) as u64).min(cap);
+            let ao = (s0 * sper) as u64;
+            let acap = act.size() - ao;
+            let asize = (((s1 - s0) * sper) as u64).next_multiple_of(16).min(acap).max(16);
+            let mc = mm_win(self.c, g, &a, &cv.plane, act, ao, asize, out, oo, osize)?;
+            self.ops.push(Op::M(mc));
+        }
         Some(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn combine(&mut self, x: &wgpu::Buffer, h: &wgpu::Buffer, hb: &wgpu::Buffer, s: Option<(&wgpu::Buffer, &wgpu::Buffer)>, mode: u32, m: usize, ch: usize) -> Option<()> {
-        let c4n = mp_of(m) * ch / 4;
-        let u = ubuf(self.c, &[c4n as u32, ch as u32, mode, 0]);
+    fn combine(&mut self, x: &wgpu::Buffer, h: &wgpu::Buffer, hb: &wgpu::Buffer, s: Option<(&wgpu::Buffer, &wgpu::Buffer)>, mode: u32, f: usize, per: usize, ch: usize) -> Option<()> {
         let d = self.dummy.clone();
         let (sb, sbb) = s.unwrap_or((&d, &d));
-        self.k("s2v_combine", COMBINE_SRC, "s2v_combine", &[x, h, hb, sb, sbb, &u], grid1(c4n))
+        for (f0, nf) in self.slabs(f, per, ch) {
+            let rows = nf * per;
+            let c4n = rows * ch / 4;
+            let u = ubuf(self.c, &[c4n as u32, ch as u32, mode, 0]);
+            let off = (f0 * per * ch * 2) as u64;
+            let size = (rows * ch * 2) as u64;
+            let sw = if s.is_some() { (sb, off, size) } else { (sb, 0, 0) };
+            self.kw(
+                "s2v_combine",
+                COMBINE_SRC,
+                "s2v_combine",
+                &[(x, off, size), (h, off, size), (hb, 0, 0), sw, (sbb, 0, 0), (&u, 0, 0)],
+                grid1(c4n),
+            )?;
+        }
+        Some(())
     }
 
     fn resnet(&mut self, r: &VR, f: usize, h: usize, w: usize, ic: usize) -> Option<usize> {
-        let m = f * h * w;
+        let per = h * w;
         let oc = r.c1.cout;
         let (x, hb, s, xn) = (self.x.clone(), self.h.clone(), self.s.clone(), self.xn.clone());
-        self.gn(&x, None, &r.n1, m, ic, true, &xn)?;
+        self.gn(&x, None, &r.n1, f, per, ic, true, &xn)?;
         self.conv(&r.c1, &xn, f, h, w, (false, false), &hb)?;
-        self.gn(&hb, Some(&r.c1.bias), &r.n2, m, oc, true, &xn)?;
+        self.gn(&hb, Some(&r.c1.bias), &r.n2, f, per, oc, true, &xn)?;
         self.conv(&r.c2, &xn, f, h, w, (false, false), &hb)?;
         match &r.sc {
             Some(sc) => {
                 self.conv(sc, &x, f, h, w, (false, false), &s)?;
-                self.combine(&x, &hb, &r.c2.bias, Some((&s, &sc.bias)), 1, m, oc)?;
+                self.combine(&x, &hb, &r.c2.bias, Some((&s, &sc.bias)), 1, f, per, oc)?;
             }
             None => {
-                self.combine(&x, &hb, &r.c2.bias, None, 0, m, oc)?;
+                self.combine(&x, &hb, &r.c2.bias, None, 0, f, per, oc)?;
             }
         }
         Some(oc)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mm_win(c: &Ctx, g: MmCfg, a: &MmArgs, plane: &wgpu::Buffer, act: &wgpu::Buffer, ao: u64, asize: u64, out: &wgpu::Buffer, oo: u64, osize: u64) -> Option<MmCall> {
+    if a.n % g.bn != 0 || a.k % g.bk != 0 {
+        return None;
+    }
+    let pipe = mm_pipe(c, g)?;
+    let u = mm_uniform(c, a);
+    let bgr = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("s2v_conv"),
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[
+            super::bind_buf(0, plane),
+            super::bind_buf_off(1, act, ao, asize),
+            super::bind_buf_off(2, out, oo, osize),
+            super::bind_buf(3, &u),
+        ],
+    });
+    Some(MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)), mnk: [a.m, a.n, a.k], bits: false })
 }
 
 fn mm_off(c: &Ctx, g: MmCfg, a: &MmArgs, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, off: u64, size: u64) -> Option<MmCall> {
@@ -474,11 +589,6 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
             elems = elems.max(mp_of(ff * hh * ww) * u.cin_p.max(u.cout_p));
         }
     }
-    let lim = c.device.limits();
-    if (elems * 2) as u64 > (lim.max_storage_buffer_binding_size as u64).min(lim.max_buffer_size) {
-        eprintln!("s2v vae: {} MB tensor is over the binding limit, decoding on the CPU", (elems * 2) >> 20);
-        return None;
-    }
     let nchunk_max = (elems / 128).div_ceil(GN_ROWS) + 1;
     let mut r = Rec {
         c,
@@ -486,19 +596,19 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         dummy: sbuf(c, 64, "s2v_d"),
         stat: sbuf(c, 1024 * 4, "s2v_stat"),
         part: sbuf(c, (32 * nchunk_max * 4) as u64, "s2v_part"),
-        x: sbuf(c, (elems * 2) as u64, "s2v_vx"),
-        h: sbuf(c, (elems * 2) as u64, "s2v_vh"),
-        s: sbuf(c, (elems * 2) as u64, "s2v_vs"),
-        xn: sbuf(c, (elems * 2) as u64, "s2v_vxn"),
+        x: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vx"),
+        h: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vh"),
+        s: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vs"),
+        xn: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vxn"),
     };
     let (x, hb, xn) = (r.x.clone(), r.h.clone(), r.xn.clone());
     let cin0 = d.conv_in.cin_p;
     let m0 = f0 * h0 * w0;
     let mp0 = mp_of(m0);
-    let z = sbuf(c, (mp0 * cin0 * 2) as u64, "s2v_vz");
+    let z = sbuf(c, ((mp0 + 128) * cin0 * 2) as u64, "s2v_vz");
     r.conv(&d.conv_in, &z, f0, h0, w0, (false, false), &hb)?;
     let mut ch = d.conv_in.cout_p;
-    r.combine(&x, &hb, &d.conv_in.bias, None, 2, m0, ch)?;
+    r.combine(&x, &hb, &d.conv_in.bias, None, 2, f0, h0 * w0, ch)?;
     ch = r.resnet(&d.mid.r0, f0, h0, w0, ch)?;
 
     // Mid attention, one query frame at a time.
@@ -509,7 +619,7 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         let m = m0;
         let mp = mp0;
         let pf = h0 * w0;
-        r.gn(&x, None, &at.gn, m, cc, false, &xn)?;
+        r.gn(&x, None, &at.gn, f0, pf, cc, false, &xn)?;
         let q16 = sbuf(c, (mp * cc * 2) as u64, "s2v_q");
         let k16 = sbuf(c, (mp * cc * 2) as u64, "s2v_k");
         let o32 = sbuf(c, (mp * cc * 4) as u64, "s2v_o");
@@ -547,7 +657,7 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         r.ops.push(Op::D(cast.clone(), b, grid1(mp * cc / 4)));
         let a = MmArgs { m: m as u32, n: cc as u32, k: cc as u32, ldo: cc as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
         r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F16), &a, &at.o.plane, &xn, &hb)?));
-        r.combine(&x, &hb, &at.o.bias, None, 0, m, cc)?;
+        r.combine(&x, &hb, &at.o.bias, None, 0, f0, pf, cc)?;
         keep.extend([q16, k16, o32, vt16, q32, sc, pr]);
     }
     ch = r.resnet(&d.mid.r1, f0, h0, w0, ch)?;
@@ -562,11 +672,11 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
             ww *= fac[2];
             r.conv(u, &x, ff, hh, ww, (fac[1] == 2, fac[0] == 2), &hb)?;
             ch = u.cout_p;
-            r.combine(&x, &hb, &u.bias, None, 2, ff * hh * ww, ch)?;
+            r.combine(&x, &hb, &u.bias, None, 2, ff, hh * ww, ch)?;
         }
     }
     let m = ff * hh * ww;
-    r.gn(&x, None, &d.norm, m, ch, true, &xn)?;
+    r.gn(&x, None, &d.norm, ff, hh * ww, ch, true, &xn)?;
     r.conv(&d.conv_out, &xn, ff, hh, ww, (false, false), &hb)?;
     let out = sbuf(c, (3 * m * 4) as u64, "s2v_vout");
     let u = ubuf(c, &[m as u32, d.conv_out.cout_p as u32, 0, 0]);

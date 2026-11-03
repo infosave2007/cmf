@@ -1086,17 +1086,21 @@ pub fn mm_src(g: MmCfg) -> String {
     if g.conv == 3 {
         // 3×3×3 causal conv over an `[F·H·W][C]` volume: `y` counts F·H rows,
         // replicate padding (two frames in front), and the nearest upsample
-        // of the source folded in (`arow`: frames | up-space << 16 | up-time << 17).
+        // of the source folded in. `arow` bits: 0-7 frames, 8-15 this dispatch's
+        // first output frame, 16-23 the first source frame bound, 24 up-space,
+        // 25 up-time.
         let _ = writeln!(
             s,
             "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
   let k0 = kt * {bk}u;
   let tap = k0 / p.cin;
   let ci = k0 - tap * p.cin + vc * 4u;
-  let cf = i32(p.arow & 0xFFFFu);
-  let us = (p.arow >> 16u) & 1u;
-  let ut = (p.arow >> 17u) & 1u;
-  let fr = y / i32(p.ch);
+  let cf = i32(p.arow & 0xFFu);
+  let f0 = i32((p.arow >> 8u) & 0xFFu);
+  let s0 = (p.arow >> 16u) & 0xFFu;
+  let us = (p.arow >> 24u) & 1u;
+  let ut = (p.arow >> 25u) & 1u;
+  let fr = y / i32(p.ch) + f0;
   let ro = y % i32(p.ch);
   let sf = clamp(fr + i32(tap / 9u) - 2, 0, cf - 1);
   let sy = clamp(ro + i32((tap / 3u) % 3u) - 1, 0, i32(p.ch) - 1);
@@ -1105,7 +1109,7 @@ pub fn mm_src(g: MmCfg) -> String {
   if (ut != 0u && tf > 0u) {{ tf = (tf - 1u) / 2u + 1u; }}
   let scw = p.cw >> us;
   let sch = p.ch >> us;
-  let src = (tf * sch + (u32(sy) >> us)) * scw + (u32(sx) >> us);
+  let src = ((tf - s0) * sch + (u32(sy) >> us)) * scw + (u32(sx) >> us);
   return act[(src * p.cin + ci) / 4u];
 }}",
             bk = g.bk
