@@ -11,8 +11,8 @@ sound, and `cortiq` writes your track into the output file.
 
 ```bash
 cargo install cortiq-cli
-hf download infosave/Kandinsky-S2V-1.0-Pro-distill-cmf s2v-q4tp.cmf --local-dir .
-cortiq s2v --model s2v-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
+hf download infosave/Kandinsky-S2V-1.0-Pro-distill-cmf kandinsky-s2v-pro-q4tp.cmf --local-dir .
+cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
 ```
 
 The output is MJPEG with PCM audio in an AVI, 25 fps, and needs nothing installed.
@@ -68,7 +68,7 @@ not fit one process on a 32 GB card) and `cortiq s2v-check` compares each stage:
 
 ```bash
 python scripts/s2v/oracle.py enc --image i.png --audio a.wav --chunks 1 --out enc.safetensors
-cortiq s2v-check --model s2v-q8.cmf --stage enc --oracle enc.safetensors
+cortiq s2v-check --model kandinsky-s2v-pro-q8.cmf --stage enc --oracle enc.safetensors
 ```
 
 The run log with every measurement is in `scripts/s2v/JOURNAL_S2V_2026-11-03.md`.

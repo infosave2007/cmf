@@ -1405,7 +1405,7 @@ pub fn mm_src(g: MmCfg) -> String {
                     let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0], 16u);");
                     let _ = writeln!(s, "  workgroupBarrier();");
                     let _ = writeln!(s, "  {{ var hv: array<f32, 8>;");
-                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let v = sc[eb + e]; let z = abs(v) * 0.70710678; let t = 1.0 / (1.0 + 0.3275911 * z); let ez = -z * z * 1.442695; let ec = max(ez, -24.0); let ei = floor(ec); let ef = ec - ei; let em = (1.0 + ef * (0.6931472 + ef * (0.2402265 + ef * (0.0558282 + ef * 0.0089892)))) * bitcast<f32>(u32(i32(ei) + 127) << 23u); let er2 = 1.0 - (((((1.0614054 * t - 1.4531521) * t) + 1.4214138) * t - 0.28449672) * t + 0.2548296) * t * em; hv[e] = 0.5 * v * (1.0 + select(er2, -er2, v < 0.0)) * p.oscale; }}");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let v = sc[eb + e]; let z = abs(v) * 0.70710678; let t = 1.0 / (1.0 + 0.3275911 * z); let er2 = 1.0 - (((((1.0614054 * t - 1.4531521) * t) + 1.4214138) * t - 0.28449672) * t + 0.2548296) * t * exp(-z * z); hv[e] = 0.5 * v * (1.0 + select(er2, -er2, v < 0.0)) * p.oscale; }}");
                     let _ = writeln!(s, "    outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(hv[0], hv[1])), pack2x16float(vec2<f32>(hv[2], hv[3])), pack2x16float(vec2<f32>(hv[4], hv[5])), pack2x16float(vec2<f32>(hv[6], hv[7]))); }}", i * 16, j * 16);
                     let _ = writeln!(s, "  workgroupBarrier();");
                 }
@@ -1684,7 +1684,7 @@ impl FlashCfg {
             flash_thr(),
             flash_vt(),
             flash_pad(),
-            format!("{}{}", std::env::var("CMF_ZI_FLASH_DBG").unwrap_or_default(), std::env::var("CMF_ZI_FLASH_FEXP").unwrap_or_default())
+            std::env::var("CMF_ZI_FLASH_DBG").unwrap_or_default()
         )
     }
 }
@@ -1768,12 +1768,6 @@ pub fn flash_src(f: FlashCfg) -> String {
     // previous array (inf/NaN). Every workgroup array in this file is a
     // multiple of 16 bytes.
     let _ = writeln!(s, "var<workgroup> sfl: array<u32, 4>;");
-    let fexp = std::env::var("CMF_ZI_FLASH_FEXP").as_deref() == Ok("1");
-    if fexp {
-        // 2^x on [-24, ∞) as a quartic: 4e-5 relative, under the f16 rounding of P.
-        let _ = writeln!(s, "fn fexp2(x0: f32) -> f32 {{ let x = max(x0, -24.0); let i = floor(x); let f = x - i; let m = 1.0 + f * (0.6931472 + f * (0.2402265 + f * (0.0558282 + f * 0.0089892))); return m * bitcast<f32>(u32(i32(i) + 127) << 23u); }}");
-    }
-    let exp2_fn = if fexp { "fexp2" } else { "exp2" };
     let _ = writeln!(s, "@compute @workgroup_size({nt})\nfn zi_flash(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) tid: u32, @builtin(subgroup_id) sg: u32) {{");
     let _ = writeln!(s, "  let h = wid.y;");
     let _ = writeln!(s, "  let q0 = wid.x * {}u + sg * 16u;", f.nw * 16);
@@ -1883,7 +1877,7 @@ pub fn flash_src(f: FlashCfg) -> String {
     // P = exp2(s*scl - mu) → f16, row sums
     let _ = writeln!(s, "    let pbase = sg * {}u + r * {ldp}u + hf * {half}u;", 16 * ldp);
     for e in 0..half {
-        let _ = writeln!(s, "    let pv{e} = {exp2_fn}(ss[sbase + {e}u] * p.scl - mu);");
+        let _ = writeln!(s, "    let pv{e} = exp2(ss[sbase + {e}u] * p.scl - mu);");
     }
     for e in 0..half {
         let _ = writeln!(s, "    ls = ls + pv{e}; sp[pbase + {e}u] = f16(pv{e});");

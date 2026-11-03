@@ -10,8 +10,8 @@
 
 ```bash
 cargo install cortiq-cli
-hf download infosave/Kandinsky-S2V-1.0-Pro-distill-cmf s2v-q4tp.cmf --local-dir .
-cortiq s2v --model s2v-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
+hf download infosave/Kandinsky-S2V-1.0-Pro-distill-cmf kandinsky-s2v-pro-q4tp.cmf --local-dir .
+cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
 ```
 
 输出为 AVI 封装的 MJPEG 和 PCM 音频，25 fps，无需安装其他软件。如需 mp4：
@@ -58,7 +58,7 @@ ffmpeg -i avatar.avi -c:v libx264 -crf 18 -c:a aac avatar.mp4
 
 ```bash
 python scripts/s2v/oracle.py enc --image i.png --audio a.wav --chunks 1 --out enc.safetensors
-cortiq s2v-check --model s2v-q8.cmf --stage enc --oracle enc.safetensors
+cortiq s2v-check --model kandinsky-s2v-pro-q8.cmf --stage enc --oracle enc.safetensors
 ```
 
 全部测量记录见 `scripts/s2v/JOURNAL_S2V_2026-11-03.md`。

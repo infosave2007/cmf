@@ -18,8 +18,13 @@
 //! the f16 prompt · norms · cross attention · O GEMM · row op`, optionally the
 //! speech adapter (affine LN over the noisy tail, frame-aligned attention,
 //! ungated residual) and the feed-forward (`w1` GEMM with a GELU epilogue, `w2`
-//! GEMM, row op). Short attentions (prompt, speech) use a plain kernel: at 186
-//! keys a block's cross-attention is 0.3 % of its multiply-adds.
+//! GEMM, row op). The prompt attention is `qi_flash` with the prompt as its keys;
+//! the speech attention's four keys a query run on a plain kernel.
+//!
+//! Measured on an L40S (46 GB) at 36736 rows, one block: flash 150 ms (73 TF),
+//! w1 50, w2 36, qkv 30-40, O 28, row ops 14, norms 5, prompt flash 3, speech 3,
+//! dequant 2. A polynomial exp2 in the flash softmax lost 8 %; the flash tiles
+//! 8×16, 4×32, 8×32 and 16×16 lost 0-25 % against 4×16.
 
 use super::Ctx;
 use super::zimage::{
