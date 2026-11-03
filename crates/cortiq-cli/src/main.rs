@@ -43,6 +43,8 @@ mod nvgbench;
 #[cfg(feature = "gpu")]
 mod nvg_gpu;
 mod qwen_imagepack;
+mod s2vcmd;
+mod s2vpack;
 mod recall;
 mod requant;
 mod sign;
@@ -3180,6 +3182,91 @@ enum Commands {
         vvae_heads: usize,
     },
     /// MiniMax-H3 text → video with synchronized stereo audio, from a
+    /// Pack a diffusers Kandinsky S2V directory into one .cmf
+    S2vPack {
+        /// Diffusers root directory
+        root: String,
+        /// DiT projection codec: q4tp (default), q8 (= q8_2f), f16, bf16
+        #[arg(long)]
+        quant: Option<String>,
+        /// Thinker text projection codec (default q8 = q8_2f)
+        #[arg(long)]
+        te_quant: Option<String>,
+        /// Audio tower projection codec (default q8 = q8_2f)
+        #[arg(long)]
+        audio_quant: Option<String>,
+        /// VAE weight codec (default f16)
+        #[arg(long)]
+        vae_quant: Option<String>,
+        /// DiT projections kept at q8_2f over --quant: `visual.N`, a family
+        /// (attn, cross, audio, ffn) or `all`
+        #[arg(long, value_delimiter = ',')]
+        dit_keep: Vec<String>,
+        /// Skip hashing source shards into provenance
+        #[arg(long, default_value_t = false)]
+        no_source_sha: bool,
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+    },
+    /// Kandinsky S2V: reference frame + speech track → avatar video. The
+    /// `.cmf` comes from `s2v-pack`. Writes an MJPEG+PCM AVI, nothing to install.
+    S2v {
+        /// The .cmf packed by `s2v-pack`
+        #[arg(long)]
+        model: String,
+        /// Reference frame (PNG/JPEG)
+        #[arg(long)]
+        image: String,
+        /// Speech track (WAV; resampled to 16 kHz for the model)
+        #[arg(long)]
+        audio: String,
+        /// Output .avi
+        #[arg(long, default_value = "avatar.avi")]
+        out: String,
+        /// Override the canned reference prompt
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        seed: Option<u64>,
+        /// pi-Flow segments per chunk (default 16)
+        #[arg(long)]
+        steps: Option<usize>,
+        /// Chunks of 5 s (default: as many as cover the track)
+        #[arg(long)]
+        chunks: Option<usize>,
+        /// Pixel height (default: the 512 bucket closest to the image)
+        #[arg(long)]
+        height: Option<usize>,
+        /// Pixel width
+        #[arg(long)]
+        width: Option<usize>,
+        /// JPEG quality of the output frames
+        #[arg(long, default_value_t = 92)]
+        quality: u32,
+        /// Dev: write the final latents to a safetensors
+        #[arg(long)]
+        out_latents: Option<String>,
+        /// Dev: read `ref_eps` and `noise.k` from an oracle file
+        #[arg(long)]
+        oracle_noise: Option<String>,
+        /// Dev: stop each chunk after this many segments
+        #[arg(long)]
+        max_steps: Option<usize>,
+    },
+    /// Dev: compare a Kandinsky S2V stage with reference dumps (scripts/s2v/oracle.py)
+    S2vCheck {
+        #[arg(long)]
+        model: String,
+        /// enc, dit, sched or vae
+        #[arg(long)]
+        stage: String,
+        #[arg(long)]
+        oracle: String,
+        /// enc: the reference image; vae: the run's latents
+        #[arg(long)]
+        extra: Option<String>,
+    },
     /// `.cmf` packed by `animate-pack`. Writes an MJPEG+PCM AVI (and a
     /// .wav beside it) — no ffmpeg, nothing to install
     Animate {
@@ -5776,6 +5863,61 @@ async fn main() -> anyhow::Result<()> {
             vae_quant: &vae_quant,
             min_q4tp,
         }),
+        Commands::S2vPack {
+            root,
+            quant,
+            te_quant,
+            audio_quant,
+            vae_quant,
+            dit_keep,
+            no_source_sha,
+            out,
+        } => s2vpack::pack(
+            std::path::Path::new(&root),
+            &out,
+            &s2vpack::opts(
+                quant.as_deref(),
+                te_quant.as_deref(),
+                audio_quant.as_deref(),
+                vae_quant.as_deref(),
+                dit_keep,
+                !no_source_sha,
+            )?,
+        ),
+        Commands::S2v {
+            model,
+            image,
+            audio,
+            out,
+            prompt,
+            seed,
+            steps,
+            chunks,
+            height,
+            width,
+            quality,
+            out_latents,
+            oracle_noise,
+            max_steps,
+        } => s2vcmd::cmd_s2v(s2vcmd::RunArgs {
+            model: &model,
+            image: &image,
+            audio: &audio,
+            out: &out,
+            prompt: prompt.as_deref(),
+            seed,
+            steps,
+            chunks,
+            height,
+            width,
+            quality,
+            out_latents: out_latents.as_deref(),
+            oracle_noise: oracle_noise.as_deref(),
+            max_steps,
+        }),
+        Commands::S2vCheck { model, stage, oracle, extra } => {
+            s2vcmd::cmd_s2v_check(&model, &stage, &oracle, extra.as_deref())
+        }
         Commands::AnimatePack {
             out,
             carry,

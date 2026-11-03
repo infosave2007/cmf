@@ -92,6 +92,10 @@ pub mod qwen_image_vision;
 pub mod qwen_imagegen;
 pub mod router;
 pub mod runtime;
+pub mod s2v;
+pub mod s2v_enc;
+pub mod s2v_vae;
+pub mod s2vgen;
 pub mod sam3;
 pub mod sam3vid;
 pub(crate) mod sam3vid_net;
@@ -218,3 +222,8 @@ pub fn gpu_q1_matvec_for_test(
 pub use sampler::SamplerConfig;
 /// Re-exported for offline tools (the NVG encoder's f64 GEMMs in the CLI).
 pub use matrixmultiply;
+
+/// Device forward of one S2V input for `cortiq s2v-check` (None without a device path).
+pub fn s2v_check_device(dit: &s2v::S2vDit, i: &s2v::S2vInput<'_>) -> Option<Vec<f32>> {
+    gpu::s2v_check_forward(dit, i)
+}
