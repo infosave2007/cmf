@@ -3,7 +3,10 @@
 //! Weights stay in the file mapping: q4tp tiles are dequantized to half as the
 //! GEMM stages them, q8 int8 is staged times the column field with the row scale
 //! in the epilogue (the `qi_mm_*` kernels of the Qwen-Image-2.1 library), so the
-//! 21 B parameters never become planes on a shared 24 GB. The block order is the
+//! 21 B parameters never become planes on a shared 24 GB. Each block gets its own
+//! transient view of the mapping: the driver accounts a working set by buffer
+//! lengths, and views of the whole file pass the limit of a 24 GB machine and
+//! rewire for seconds at every switch. The block order is the
 //! wgpu chain's (`gpu_wgpu/s2v.rs`); the short attentions are `qi_flash` with the
 //! prompt or the speech frame's keys as its prefix.
 //!
@@ -35,6 +38,7 @@ struct Pipes {
     mm_q4tp: ComputePipelineState,
     mm_q8: ComputePipelineState,
     flash: ComputePipelineState,
+    flash_self: ComputePipelineState,
     row: ComputePipelineState,
     norm: ComputePipelineState,
     gelu: ComputePipelineState,
@@ -72,6 +76,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             mm_q4tp: pso("qi_mm_q4tp")?,
             mm_q8: pso("qi_mm_q8")?,
             flash: pso("qi_flash")?,
+            flash_self: pso("s2v_flash")?,
             row: pso("s2v_row")?,
             norm: pso("s2v_norm")?,
             gelu: pso("s2v_gelu")?,
@@ -113,6 +118,8 @@ struct Tens {
     stride: usize,
     rs: usize,
     col: usize,
+    /// One past the tensor's last byte in the mapping.
+    end: usize,
 }
 
 fn f16s(b: &[u8]) -> impl Iterator<Item = f32> + '_ {
@@ -144,7 +151,7 @@ fn tens(model: &CmfModel, name: &str, rows: usize, cols: usize, aux: &mut Aux) -
     }
     let bytes = model.entry_bytes(e);
     let q = rows * cols;
-    let mut t = Tens { abs, rows, cols, ..Default::default() };
+    let mut t = Tens { abs, rows, cols, end: abs + e.nbytes as usize, ..Default::default() };
     match e.dtype {
         TensorDtype::Q4TiledP => {
             let (po, co, st) = cortiq_core::quant::q4tp_sections(rows, cols);
@@ -185,6 +192,17 @@ struct At {
     ob: usize,
 }
 
+impl At {
+    fn tensors(&self) -> [Tens; 4] {
+        [self.q, self.k, self.v, self.o]
+    }
+}
+
+/// The byte range of the mapping that holds `ts`.
+fn span_of(ts: impl IntoIterator<Item = Tens>) -> (usize, usize) {
+    ts.into_iter().fold((usize::MAX, 0), |(a, b), t| (a.min(t.abs), b.max(t.end)))
+}
+
 fn attn_of(model: &CmfModel, p: &str, a: &s2v::Attn, h: usize, aux: &mut Aux) -> Result<At, String> {
     let bias = |l: &s2v::Lin| l.b.clone().unwrap_or_else(|| vec![0.0; l.rows()]);
     Ok(At {
@@ -209,12 +227,25 @@ struct VisB {
     w2: Tens,
 }
 
+impl VisB {
+    fn span(&self) -> (usize, usize) {
+        let adapter = self.v2a.iter().flat_map(|(a, _, _)| a.tensors());
+        span_of(self.sa.tensors().into_iter().chain(self.ca.tensors()).chain(adapter).chain([self.w1, self.w2]))
+    }
+}
+
 struct ShortB {
     a: At,
     w1: Tens,
     w2: Tens,
     /// LayerNorm (w, b) of the speech blocks.
     aff: Option<[usize; 4]>,
+}
+
+impl ShortB {
+    fn span(&self) -> (usize, usize) {
+        span_of(self.a.tensors().into_iter().chain([self.w1, self.w2]))
+    }
 }
 
 struct Seq {
@@ -451,6 +482,39 @@ impl E<'_, '_> {
         }
     }
 
+    /// Self-attention over all `n` rows of `panel`: `s2v_flash`, which needs a row
+    /// count that is a multiple of 32; `qi_flash` otherwise.
+    fn flash_self(&mut self, panel: &Buffer, ldp: usize, att: &Buffer, n: usize) {
+        if n % 32 != 0 {
+            self.flash(panel, ldp, att, 0, n, None);
+            return;
+        }
+        let p = self.p;
+        let (h, nh) = (self.h, self.nh);
+        let mut head0 = 0;
+        while head0 < nh {
+            let nheads = FLASH_HEADS.min(nh - head0);
+            let pf = PFa {
+                nq: n as u32,
+                n_own: n as u32,
+                ldp: ldp as u32,
+                h: h as u32,
+                ldo: h as u32,
+                oscale: 1.0,
+                head0: head0 as u32,
+                ..Default::default()
+            };
+            let enc = self.rec.enc("flash");
+            enc.set_compute_pipeline_state(&p.flash_self);
+            enc.set_buffer(0, Some(panel), 0);
+            enc.set_buffer(1, Some(att), 0);
+            set_p(enc, 4, &pf);
+            enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, nheads as u64, 1), MTLSize::new(256, 1, 1));
+            head0 += nheads;
+            self.rec.cut();
+        }
+    }
+
     fn gelu(&mut self, hid: &Buffer, n4: usize) {
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -473,8 +537,7 @@ impl E<'_, '_> {
 pub struct S2vDev {
     c: &'static Ctx,
     p: &'static Pipes,
-    _model: Arc<CmfModel>,
-    arena: Arc<WeightArena>,
+    model: Arc<CmfModel>,
     aux: Buffer,
     mods: Buffer,
     visual: Vec<VisB>,
@@ -543,7 +606,6 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
         );
         return None;
     }
-    let (arena, _) = super::file_buffer(c, &model)?;
 
     // Modulations, as on wgpu.
     let t0 = Instant::now();
@@ -666,8 +728,7 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
     Some(S2vDev {
         c,
         p,
-        _model: model,
-        arena,
+        model,
         aux: buf_from(c, &aux.0),
         mods,
         visual,
@@ -711,15 +772,23 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
 }
 
 impl S2vDev {
-    fn e<'r, 'a>(&'r self, rec: &'r mut Rec<'a>) -> E<'r, 'a> {
-        E { rec, p: self.p, arena: &self.arena, aux: &self.aux, h: self.h, nh: self.nh }
+    fn e<'r, 'a>(&'r self, rec: &'r mut Rec<'a>, weights: &'r WeightArena) -> E<'r, 'a> {
+        E { rec, p: self.p, arena: weights, aux: &self.aux, h: self.h, nh: self.nh }
     }
 
-    fn short_block(&self, rec: &mut Rec<'_>, b: &ShortB, n: usize, mods_at: Option<usize>) {
+    /// A view of one block's weights; the command buffers keep it alive.
+    fn weights(&self, span: (usize, usize)) -> Result<Arc<WeightArena>, String> {
+        super::file_page_buffer(self.c, &self.model, span.0, span.1)
+            .map(|w| w.0)
+            .ok_or_else(|| "Metal refused a view of a block's weights".to_string())
+    }
+
+    fn short_block(&self, rec: &mut Rec<'_>, b: &ShortB, n: usize, mods_at: Option<usize>) -> Result<(), String> {
         let (h, ff) = (self.h, self.ff);
         let s = &self.s_small;
         let aux = &self.aux;
-        let mut e = self.e(rec);
+        let weights = self.weights(b.span())?;
+        let mut e = self.e(rec, &weights);
         let m = &self.mods;
         match (mods_at, b.aff) {
             (Some(o), _) => e.row(s, 0, 0, n, 8, (m, 0), (m, o), (m, o + h), 0, 1.0),
@@ -747,6 +816,7 @@ impl S2vDev {
             (Some(o), _) => e.row(s, 0, 0, n, 1 | 2, (m, o + 5 * h), (m, 0), (m, 0), zero, 1.0),
             _ => e.row(s, 0, 0, n, 1, (m, 0), (m, 0), (m, 0), zero, 1.0),
         }
+        Ok(())
     }
 
     fn run_audio(&mut self, chunk: usize) -> Result<(), String> {
@@ -761,12 +831,13 @@ impl S2vDev {
         write_f32(&self.s_small.sn, 0, &asn);
         let mut rec = Rec::new(self.c);
         for b in &self.audio {
-            self.short_block(&mut rec, b, n, None);
+            self.short_block(&mut rec, b, n, None)?;
             rec.cut();
         }
         // The last residual is in x: f16 for the speech adapters' k|v GEMMs.
         {
-            let mut e = self.e(&mut rec);
+            let weights = self.weights(self.audio[0].span())?;
+            let mut e = self.e(&mut rec, &weights);
             let m = &self.mods;
             e.row(&self.s_small, 0, 0, n, 32, (m, 0), (m, 0), (m, 0), 0, 1.0);
         }
@@ -811,11 +882,12 @@ impl S2vDev {
             write_f32(&self.s_small.sn, 0, &tsn);
             let mut rec = Rec::new(self.c);
             for (bi, b) in self.text.iter().enumerate() {
-                self.short_block(&mut rec, b, self.nt, Some(self.text_off + bi * 6 * h));
+                self.short_block(&mut rec, b, self.nt, Some(self.text_off + bi * 6 * h))?;
                 rec.cut();
             }
             {
-                let mut e = self.e(&mut rec);
+                let weights = self.weights(self.text[0].span())?;
+                let mut e = self.e(&mut rec, &weights);
                 let m = &self.mods;
                 e.row(&self.s_small, 0, 0, self.nt, 32, (m, 0), (m, 0), (m, 0), 0, 1.0);
             }
@@ -886,14 +958,15 @@ impl S2vDev {
         };
         let zero = self.mask0 + h;
         for (bi, b) in self.visual.iter().enumerate() {
-            let mut e = self.e(&mut rec);
+            let weights = self.weights(b.span())?;
+            let mut e = self.e(&mut rec, &weights);
             // self-attention
             pre(&mut e, bi, 0, 8, None, zero);
             e.gemm(&[b.sa.q, b.sa.k, b.sa.v], &s.xn, h, &s.panel, &[0, h, 2 * h], 3 * h, m, true, 1.0);
             e.norm(&s.panel, &s.cs, &s.sn, m, 3 * h, 0, 3, b.sa.qn, b.sa.qb, qmul);
             e.norm(&s.panel, &s.cs, &s.sn, m, 3 * h, h, 3, b.sa.kn, b.sa.kb, 1.0);
             e.norm(&s.panel, &s.cs, &s.sn, m, 3 * h, 2 * h, 0, b.sa.qn, b.sa.vb, 1.0);
-            e.flash(&s.panel, 3 * h, &s.att, 0, m, None);
+            e.flash_self(&s.panel, 3 * h, &s.att, m);
             e.gemm(&[b.sa.o], &s.att, h, &s.y, &[0], h, m, false, 1.0);
             // residual + the prompt attention's pre-norm
             pre(&mut e, bi, 3, 1 | 2 | 8, Some(2), b.sa.ob);

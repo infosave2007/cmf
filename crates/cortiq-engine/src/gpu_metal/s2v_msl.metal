@@ -365,3 +365,110 @@ kernel void s2v_rgb(
     if (i >= n) return;
     for (uint c = 0; c < 3u; ++c) out[(ulong)c * n + i] = y[(ulong)i * 64u + c];
 }
+
+// ───────────────── self-attention with f32 weights ─────────────────
+// `qi_flash` holds its weights in half, so it renormalises each query against its
+// running maximum on every key block. The branch alone costs a third of the kernel's
+// rate, and half of the rate goes with the rescaling behind it. A few keys stand far
+// above the rest and scores pass 100 in some blocks, so half cannot do without that.
+// With f32 weights one scale per query is enough: the largest score over 16 key blocks
+// spread across the keys, which leaves 100 bits above it. The f32 product is about as
+// fast as the half one, and the kernel runs 1.8 times as fast at the size of a video.
+// Every key is visible, because the row count is a multiple of 32, and a row's sum is
+// gathered across its lanes at the end.
+kernel void s2v_flash(
+    device const half* P [[buffer(0)]],
+    device half* O [[buffer(1)]],
+    constant QFa& p [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]])
+{
+    constexpr uint NT = 256u, TOT = 32u * 16u, SAMPLES = 16u;
+    threadgroup half sk[32 * 128];
+    threadgroup float sv[32 * 128];
+    const uint hq = (tg.y + p.head0) * 128u;
+    const uint ntot = p.n_own;
+    const uint q0 = tg.x * 64u + 8u * sg;
+    const uint qi = min(q0, p.nq - 8u);
+    simdgroup_half8x8 qf[16];
+    for (ushort d = 0; d < 16; ++d)
+        simdgroup_load(qf[d], P + (ulong)qi * p.ldp + hq + 8u * d, p.ldp);
+    simdgroup_float8x8 of[16];
+    for (ushort d = 0; d < 16; ++d) of[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float l = 0.0f, m = -INFINITY;
+    const short2 fc = qi_fc(lane);
+    const uint blocks = ntot / 32u;
+    for (uint i = 0; i < SAMPLES; ++i) {
+        const uint kb0 = (blocks * i / SAMPLES) * 32u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ch = tid; ch < TOT; ch += NT) {
+            const uint key = ch / 16u, part = (ch % 16u) * 8u;
+            device const half* kp = P + (ulong)(kb0 + key) * p.ldp + p.H + hq;
+            *(threadgroup uint4*)(sk + key * 128u + part) = *(device const uint4*)(kp + part);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (ushort c = 0; c < 4; ++c) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (ushort d = 0; d < 16; ++d) {
+                simdgroup_half8x8 kf;
+                simdgroup_load(kf, sk + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qf[d], kf, s);
+            }
+            m = max(m, max(s.thread_elements()[0], s.thread_elements()[1]));
+        }
+    }
+    m = max(m, simd_shuffle_xor(m, 1));
+    m = max(m, simd_shuffle_xor(m, 8));
+    for (uint kb0 = 0; kb0 < ntot; kb0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ch = tid; ch < TOT; ch += NT) {
+            const uint key = ch / 16u, part = (ch % 16u) * 8u;
+            device const half* kp = P + (ulong)(kb0 + key) * p.ldp + p.H + hq;
+            const uint off = key * 128u + part;
+            *(threadgroup uint4*)(sk + off) = *(device const uint4*)(kp + part);
+            device const half4* vq = (device const half4*)(kp + p.H + part);
+            *(threadgroup float4*)(sv + off) = (float4)vq[0];
+            *(threadgroup float4*)(sv + off + 4u) = (float4)vq[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 pf[4];
+        #pragma clang loop unroll(full)
+        for (ushort c = 0; c < 4; ++c) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (ushort d = 0; d < 16; ++d) {
+                simdgroup_half8x8 kf;
+                simdgroup_load(kf, sk + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qf[d], kf, s);
+            }
+            const float p0 = exp2(min(s.thread_elements()[0] - m, 100.0f));
+            const float p1 = exp2(min(s.thread_elements()[1] - m, 100.0f));
+            l += p0 + p1;
+            pf[c].thread_elements()[0] = p0;
+            pf[c].thread_elements()[1] = p1;
+        }
+        #pragma clang loop unroll(full)
+        for (ushort c = 0; c < 4; ++c) {
+            #pragma clang loop unroll(full)
+            for (ushort d = 0; d < 16; ++d) {
+                simdgroup_float8x8 vf;
+                simdgroup_load(vf, sv + 8u * c * 128u + 8u * d, 128);
+                simdgroup_multiply_accumulate(of[d], pf[c], vf, of[d]);
+            }
+        }
+    }
+    l += simd_shuffle_xor(l, 1);
+    l += simd_shuffle_xor(l, 8);
+    if (q0 >= p.nq) return;
+    const float inv = 1.0f / l;
+    const uint orow = qi + (uint)fc.x;
+    for (ushort d = 0; d < 16; ++d) {
+        const uint col = hq + 8u * d + (uint)fc.y;
+        const half2 v = half2(of[d].thread_elements()[0] * inv, of[d].thread_elements()[1] * inv);
+        *(device half2*)(O + (ulong)orow * p.ldo + col) = v;
+    }
+}
