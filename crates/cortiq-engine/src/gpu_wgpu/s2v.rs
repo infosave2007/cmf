@@ -303,6 +303,7 @@ fn s2v_dq8(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
 
 /// A dispatch that isn't a GEMM. Bind groups are prebuilt.
 struct Disp {
+    name: &'static str,
     pipe: Arc<wgpu::ComputePipeline>,
     bg: wgpu::BindGroup,
     grid: (u32, u32, u32),
@@ -315,6 +316,18 @@ enum Op {
 }
 
 impl Op {
+    /// A name for the per-class profile.
+    fn class(&self) -> String {
+        match self {
+            Op::D(d) => d.name.to_string(),
+            Op::M(m) => {
+                let [_, n, k] = m.mnk;
+                format!("gemm n{n} k{k}")
+            }
+            Op::F(_) => "flash".to_string(),
+        }
+    }
+
     fn record(&self, pass: &mut wgpu::ComputePass) {
         match self {
             Op::D(d) => {
@@ -485,7 +498,7 @@ impl Builder<'_> {
         );
         let b = bg(self.c, &self.row, &[&s.br, &s.x, &s.xn, &self.mods, &self.aux, &u]);
         let r = rows as u32;
-        Op::D(Disp { pipe: self.row.clone(), bg: b, grid: (r.min(65535), r.div_ceil(65535), 1) })
+        Op::D(Disp { name: "row", pipe: self.row.clone(), bg: b, grid: (r.min(65535), r.div_ceil(65535), 1) })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -500,7 +513,7 @@ impl Builder<'_> {
         );
         let b = bg(self.c, &self.norm, &[panel, &self.aux, &s.rc, &s.rs, &u]);
         let r = rows as u32;
-        Op::D(Disp { pipe: self.norm.clone(), bg: b, grid: (self.nh as u32, r.min(65535), r.div_ceil(65535)) })
+        Op::D(Disp { name: "norm", pipe: self.norm.clone(), bg: b, grid: (self.nh as u32, r.min(65535), r.div_ceil(65535)) })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -537,6 +550,7 @@ impl Builder<'_> {
         );
         let b = bg(self.c, &self.xattn, &[qp, kv, out, groups, &u]);
         Op::D(Disp {
+            name: "xattn",
             pipe: self.xattn.clone(),
             bg: b,
             grid: ((m as u32).div_ceil(32), self.nh as u32, 1),
@@ -658,7 +672,7 @@ fn raw_block(c: &Ctx, model: &Arc<CmfModel>, items: &[RawT], planes: &[&wgpu::Bu
             let u = ubuf(c, &[it.cols as u32, it.rows as u32, o as u32, dst_w]);
             let b = bg(c, &dq4, &[&raw, dst, &u]);
             let wgs = ((it.rows * it.cols / 2) as u32).div_ceil(256);
-            ops.push(Op::D(Disp { pipe: dq4.clone(), bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
+            ops.push(Op::D(Disp { name: "dequant", pipe: dq4.clone(), bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
         } else {
             let sw = (o / 4) as u32;
             let n = it.rows * it.cols;
@@ -667,7 +681,7 @@ fn raw_block(c: &Ctx, model: &Arc<CmfModel>, items: &[RawT], planes: &[&wgpu::Bu
             let u = ubuf(c, &[it.cols as u32, it.rows as u32, u32::from(e.dtype == T::Q8_2f), sw, rs_w, cs_w, dst_w, 0]);
             let b = bg(c, &dq8, &[&raw, dst, &u]);
             let wgs = ((n / 4) as u32).div_ceil(256);
-            ops.push(Op::D(Disp { pipe: dq8.clone(), bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
+            ops.push(Op::D(Disp { name: "dequant", pipe: dq8.clone(), bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
         }
     }
     Some((raw, ops))
@@ -1078,7 +1092,7 @@ pub fn prepare(
         let u = ubuf(c, &[h as u32, nclean as u32, emb_b, mask0]);
         let b = bg(c, &tail, &[&s_vis.br, &s_vis.x, &bld.aux, &u]);
         let wgs = ((nvis * h) as u32).div_ceil(256);
-        embed.push(Op::D(Disp { pipe: tail, bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
+        embed.push(Op::D(Disp { name: "tail", pipe: tail, bg: b, grid: (wgs.min(65535), wgs.div_ceil(65535), 1) }));
     }
     let head_plane = {
         let Proj::F32 { w, .. } = &dit.out_w.w else { return None };
@@ -1148,6 +1162,28 @@ pub fn prepare(
 }
 
 impl S2vDev {
+    /// `CMF_S2V_CLASS=1`: time every op of two visual blocks (one with the
+    /// speech adapter), one submission each, once.
+    fn class_profile(&self) {
+        let mut by: std::collections::BTreeMap<String, f64> = Default::default();
+        let idx = [0usize, 1usize];
+        for &b in &idx {
+            let (dq, ops) = &self.visual_prog[b];
+            for op in dq.iter().chain(ops.iter()) {
+                let t0 = Instant::now();
+                let cb = encode_ops(self.c, &[std::slice::from_ref(op)]);
+                self.c.queue.submit(Some(cb));
+                super::zimage::wait(self.c);
+                *by.entry(op.class()).or_default() += t0.elapsed().as_secs_f64();
+            }
+        }
+        let tot: f64 = by.values().sum();
+        for (k, v) in &by {
+            eprintln!("  {k:<22} {:>9.1} ms  {:>5.1} %", v * 1e3, v / tot * 100.0);
+        }
+        eprintln!("  two blocks: {:.1} ms", tot * 1e3);
+    }
+
     fn submit_blocks(&self, blocks: &[(Vec<Op>, Vec<Op>)]) {
         for (dq, ops) in blocks {
             let cb = encode_ops(self.c, &[dq, ops]);
@@ -1231,6 +1267,9 @@ impl S2vDev {
         self.copy(&self.x0, 0, &self.s_vis.x, 0, (g.clean() * h * 4) as u64);
         let cb = encode_ops(self.c, &[&self.embed]);
         self.c.queue.submit(Some(cb));
+        if std::env::var("CMF_S2V_CLASS").is_ok() && step == 0 {
+            self.class_profile();
+        }
         self.submit_blocks(&self.visual_prog);
         let cb = encode_ops(self.c, &[&self.fin]);
         let mut enc = self.c.device.create_command_encoder(&Default::default());
