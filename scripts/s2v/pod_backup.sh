@@ -1,8 +1,7 @@
 #!/bin/bash
 # Reference dumps, logs and scripts to the private experiments repo, and the
 # containers to the private model repo. The token comes on stdin, never to disk.
-read -r HF_TOKEN
-export HF_TOKEN
+[ -n "$HF_TOKEN" ] || { read -r HF_TOKEN; export HF_TOKEN; }
 cd /workspace/s2v
 . venv/bin/activate
 python - <<'PY'
