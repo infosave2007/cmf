@@ -237,32 +237,32 @@ the halved budget. So the allocation buys *almost twice the file* for about
 
 ### Does it transfer to 27B? (measured on the GPU box)
 
-Qwen3.8-27B, NVG `blr` at 0.55 bpw (the published `q27-nvg055.cmf`, WikiText-2
-12×512 = **148.705** — the environment reproduces the published 148.6). The
+Qwen3.8-27B, NVG `blr` at 0.55 bpw (the uniform `q27-nvg055.cmf`, WikiText-2
+12×512 = **148.705** — the environment reproduces the earlier 148.6). The
 allocation's cheapest useful move at that scale: the **first four layers to
 1.0 bpw**, the rest untouched.
 
 | model | file | wiki12 | c4 |
 |---|---|---|---|
-| NVG 0.55, no training (the published base) | 4.893 GB | 148.705 | — |
+| NVG 0.55, no training (the uniform base) | 4.893 GB | 148.705 | — |
 | **the first 4 layers at 1.0 bpw, no training** | 4.979 GB | **139.234** | 370.251 |
-| the base + metric training (published) | 4.893 GB | 48.31 | 89.70 |
+| the base + metric training (1 M tokens) | 4.893 GB | 48.31 | 89.70 |
 | the allocation + metric training (1 M tokens) | 4.979 GB | 59.772 | 147.213 |
-| the base + sign training (published, 3 M tokens) | 4.893 GB | 31.86 | 60.88 |
+| the base + metric + sign training (1 M tokens) | 4.893 GB | 31.86 | 60.88 |
 | **the allocation + metric + sign training (2 M tokens)** | 4.979 GB | **34.487** | **79.421** |
 
 Two readings, and they point in opposite directions:
 
 * **The allocation transfers to the no-training conversion**: −6.4 % wiki12 for
   +1.8 % of the file. The pole is the pole at 27B too.
-* **It does not survive the training**: after the training the published
-  uniform model is ahead (31.86 vs 34.49, and 60.88 vs 79.42 on c4 — partly
-  because it saw 3 M tokens against our 2 M). The training moves the model by
+* **It does not survive the training**: after the training the uniform model
+  is ahead (31.86 vs 34.49, and 60.88 vs 79.42 on c4), even though it saw 1 M
+  tokens against our 2 M. The training moves the model by
   ×4.3 (148.7 → 34.5) while the allocation moves it by ×1.07. **The two
   levers are not additive, and the training is the bigger one at scale** — the
   allocation is worth having exactly where the training is not available.
 * And the two metrics disagree again: the allocated model's held-out KL after
-  the sign training is **1.552** against the published **1.663** — better — while
+  the sign training is **1.552** against the uniform **1.663** — better — while
   its perplexity is worse. The KL and the ppl are not the same objective; the
   article's numbers are perplexities, and the KL is reported beside them, not
   instead of them.
@@ -492,7 +492,7 @@ nothing to switch to.
 ### How the training compares with the bits (measured on the same model)
 
 Three models, the same skeleton, the same teacher, the same encoder — only
-the payload and the training differ. The training numbers are the published
+the payload and the training differ. The training numbers are the
 A/B of the NVG campaign (1 M tokens, the same schedule):
 
 | model | how it was made | body bpw | wiki (16×512) | c4 |
@@ -566,7 +566,7 @@ not optional at these budgets — see the price list in §7.
 | the product | a script that reproduces the recipe | `--blr-plan` and `nvg-train --budget-plan`: the measured allocation is a file the tools read |
 
 **One correction the store forces — and one the campaign measures itself.**
-The published `nvg08s` (672.52 at 1.0 bpw) is the converter's own output:
+The `nvg08s` file (672.52 at 1.0 bpw) is the converter's own output:
 *sequential* calibration (each layer on the activations the layers below it
 actually produce) and the model's own weights as the encode target. This
 study used the *non-sequential* calibration (every layer's Grams captured from
@@ -581,7 +581,7 @@ calibration tokens, same byte count, only the protocol differs:
 | **sequential (the converter's protocol)** | 324 440 878 | **1257.555** |
 
 > The protocol is worth **8.6 ppl**, not the ~180 an uncontrolled comparison
-> against the published 1.0-bpw model suggested: that comparison mixed up the
+> against the earlier 1.0-bpw model suggested: that comparison mixed up the
 > protocol with the encode *target* and the calibration volume. The gap to
 > 672.52 is the *budget* and the target, not the protocol.
 
