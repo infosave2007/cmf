@@ -5586,6 +5586,8 @@ pub fn s2v_prepare(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::s2v::prepare(dit, g, cond, ts, sf).map(|d| Box::new(d) as Box<dyn S2vStepper>),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::prepare(dit, g, cond, ts, sf).map(|d| Box::new(d) as Box<dyn S2vStepper>),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -5595,6 +5597,8 @@ pub fn s2v_prepare(
 pub fn s2v_release() {
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::s2v_vae::release();
+    #[cfg(target_os = "macos")]
+    crate::gpu_metal::s2v::release();
 }
 
 /// The whole temporally tiled decoder on the device, or `None`.
@@ -5603,6 +5607,8 @@ pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> O
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::s2v_vae::decode(vae, z),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::decode(vae, z),
         #[allow(unreachable_patterns)]
         _ => None,
     }
