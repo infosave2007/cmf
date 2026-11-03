@@ -65,7 +65,7 @@ fn wsum(v: f32, lid: u32) -> f32 {
 
 // Modes: 1 x += g·(br + bias), 2 the gate comes from mods (else g = 1),
 // 8 xn = LN(x)·(1 + scale) + shift, 16 xn = LN(x)·w + b, 32 xn = x.
-// One workgroup per row; each of the 256 threads owns 16 columns.
+// One workgroup per row; each of the 256 threads owns 8 column pairs.
 @compute @workgroup_size(256)
 fn s2v_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let row = wid.x + wid.y * 65535u;
@@ -73,53 +73,48 @@ fn s2v_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
   let clean = xrow < rp.nclean;
   let base = xrow * rp.h;
   let bb = row * rp.h;
-  var xv: array<f32, 16>;
-  let n = rp.h / 256u;
+  let np = rp.h / 512u;
+  var xv: array<vec2<f32>, 8>;
   if ((rp.mode & 1u) != 0u) {
     let g = select(rp.g1, rp.g0, clean);
-    for (var j = 0u; j < n; j = j + 1u) {
-      let c = lid + j * 256u;
-      var gv = 1.0;
-      if ((rp.mode & 2u) != 0u) { gv = mods[g + c]; }
-      let o = x[base + c] + gv * (br[bb + c] + aux[rp.bias + c]);
-      x[base + c] = o;
+    for (var j = 0u; j < np; j = j + 1u) {
+      let c = 2u * (lid + j * 256u);
+      var gv = vec2<f32>(1.0, 1.0);
+      if ((rp.mode & 2u) != 0u) { gv = vec2<f32>(mods[g + c], mods[g + c + 1u]); }
+      let o = vec2<f32>(x[base + c], x[base + c + 1u])
+        + gv * (vec2<f32>(br[bb + c], br[bb + c + 1u]) + vec2<f32>(aux[rp.bias + c], aux[rp.bias + c + 1u]));
+      x[base + c] = o.x;
+      x[base + c + 1u] = o.y;
       xv[j] = o;
     }
   } else {
-    for (var j = 0u; j < n; j = j + 1u) { xv[j] = x[base + lid + j * 256u]; }
+    for (var j = 0u; j < np; j = j + 1u) {
+      let c = 2u * (lid + j * 256u);
+      xv[j] = vec2<f32>(x[base + c], x[base + c + 1u]);
+    }
   }
   if ((rp.mode & 56u) == 0u) { return; }
   var mean = 0.0;
   var inv = 1.0;
   if ((rp.mode & 24u) != 0u) {
     var s = 0.0;
-    for (var j = 0u; j < n; j = j + 1u) { s = s + xv[j]; }
+    for (var j = 0u; j < np; j = j + 1u) { s = s + xv[j].x + xv[j].y; }
     mean = wsum(s, lid) / f32(rp.h);
     var v = 0.0;
-    for (var j = 0u; j < n; j = j + 1u) { let d = xv[j] - mean; v = v + d * d; }
+    for (var j = 0u; j < np; j = j + 1u) { let d = xv[j] - vec2<f32>(mean); v = v + dot(d, d); }
     inv = inverseSqrt(wsum(v, lid) / f32(rp.h) + rp.eps);
   }
   let sh = select(rp.sh1, rp.sh0, clean);
   let sc = select(rp.sc1, rp.sc0, clean);
-  for (var j = 0u; j < n; j = j + 1u) {
-    let c = lid + j * 256u;
+  for (var j = 0u; j < np; j = j + 1u) {
+    let c = 2u * (lid + j * 256u);
     var y = xv[j];
     if ((rp.mode & 8u) != 0u) {
-      y = (xv[j] - mean) * inv * (mods[sc + c] + 1.0) + mods[sh + c];
+      y = (y - vec2<f32>(mean)) * inv * (vec2<f32>(mods[sc + c], mods[sc + c + 1u]) + vec2<f32>(1.0)) + vec2<f32>(mods[sh + c], mods[sh + c + 1u]);
     } else if ((rp.mode & 16u) != 0u) {
-      y = (xv[j] - mean) * inv * aux[rp.aw + c] + aux[rp.ab + c];
+      y = (y - vec2<f32>(mean)) * inv * vec2<f32>(aux[rp.aw + c], aux[rp.aw + c + 1u]) + vec2<f32>(aux[rp.ab + c], aux[rp.ab + c + 1u]);
     }
-    xv[j] = y * rp.oscale;
-  }
-  // Exchange: odd lanes hand their values to the even lane on their left.
-  for (var j = 0u; j < n; j = j + 1u) {
-    red[lid] = xv[j];
-    workgroupBarrier();
-    if ((lid & 1u) == 0u) {
-      let c = lid + j * 256u;
-      xn[(row * rp.h + c) / 2u] = pack2x16float(vec2<f32>(red[lid], red[lid + 1u]));
-    }
-    workgroupBarrier();
+    xn[(row * rp.h + c) / 2u] = pack2x16float(y * rp.oscale);
   }
 }
 "#;
