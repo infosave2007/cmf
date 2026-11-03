@@ -213,7 +213,7 @@ struct SVc {
     uint H;
     uint W;
     uint taps;     // 27 = causal 3×3×3, 1 = 1×1×1, 0 = plain rows
-    uint up_s;     // the source is half size in space
+    uint up_s;     // 1: the source is half size in space, 2: stride 2 (twice the size)
     uint up_t;     // first frame + 2× in time
     uint epi;      // 0 f32, 1 half, 2 half transposed
     uint ldy;
@@ -231,13 +231,15 @@ static inline uint4 s2v_gather(device const half* X, constant SVc& p, uint pos, 
     const uint per = p.H * p.W;
     const uint fr = pos / per, rest = pos % per;
     const int y = (int)(rest / p.W), x = (int)(rest % p.W);
+    const int sd = p.up_s == 2u ? 2 : 1;
     const int sf = clamp((int)fr + (int)(tap / 9u) - 2, 0, (int)p.F - 1);
-    const int sy = clamp(y + (int)((tap / 3u) % 3u) - 1, 0, (int)p.H - 1);
-    const int sx = clamp(x + (int)(tap % 3u) - 1, 0, (int)p.W - 1);
+    const int sy = clamp(y * sd + (int)((tap / 3u) % 3u) - 1, 0, (int)p.H * sd - 1);
+    const int sx = clamp(x * sd + (int)(tap % 3u) - 1, 0, (int)p.W * sd - 1);
     uint tf = (uint)sf;
     if (p.up_t != 0u && tf > 0u) tf = (tf - 1u) / 2u + 1u;
-    const uint us = p.up_s != 0u ? 1u : 0u;
-    const uint src = (tf * (p.H >> us) + ((uint)sy >> us)) * (p.W >> us) + ((uint)sx >> us);
+    const uint us = p.up_s == 1u ? 1u : 0u;
+    const uint sh = (p.H * (uint)sd) >> us, sw = (p.W * (uint)sd) >> us;
+    const uint src = (tf * sh + ((uint)sy >> us)) * sw + ((uint)sx >> us);
     return *(device const uint4*)(X + (ulong)src * p.ic + c);
 }
 

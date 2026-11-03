@@ -347,13 +347,13 @@ pub struct S2vVae {
 }
 
 pub struct S2vVaeEncoder {
-    quant: Conv,
-    conv_in: Conv,
-    downs: Vec<(Vec<Res>, Option<Conv>)>,
-    mid: Mid,
-    norm_out: GroupNorm,
-    conv_out: Conv,
-    pool: Option<Arc<Pool>>,
+    pub(crate) quant: Conv,
+    pub(crate) conv_in: Conv,
+    pub(crate) downs: Vec<(Vec<Res>, Option<Conv>)>,
+    pub(crate) mid: Mid,
+    pub(crate) norm_out: GroupNorm,
+    pub(crate) conv_out: Conv,
+    pub(crate) pool: Option<Arc<Pool>>,
 }
 
 impl S2vVae {
@@ -531,7 +531,12 @@ impl S2vVaeEncoder {
         self.norm_out.apply(&mut h, pool);
         silu_all(&mut h, pool);
         let h = self.conv_out.forward(&h, pool);
-        let h = self.quant.forward(&h, pool);
+        self.finish_host(&h)
+    }
+
+    /// The quant conv and the posterior's split, after `conv_out`.
+    pub(crate) fn finish_host(&self, h: &Vol) -> (Vol, Vol) {
+        let h = self.quant.forward(h, self.pool.as_deref());
         let n = h.positions();
         let mut mean = Vol::zeros(16, h.f, h.h, h.w);
         let mut lv = Vol::zeros(16, h.f, h.h, h.w);

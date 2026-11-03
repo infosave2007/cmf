@@ -714,6 +714,29 @@ impl S2vDit {
         Ok(l.apply(te_silu, n, self.pool()))
     }
 
+    /// `modulate` over many layers at once, a thread per layer: each read is a
+    /// bf16 widening and a small GEMM, so they scale and the pool would not help.
+    pub(crate) fn modulate_all(&self, names: &[String], te_silu: &[f32], n: usize) -> Result<Vec<Vec<f32>>, String> {
+        let threads = Pool::effective_threads().clamp(1, 16);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let out: Vec<std::sync::Mutex<Option<Result<Vec<f32>, String>>>> = names.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= names.len() {
+                            break;
+                        }
+                        let r = Lin::load(&self.model, &names[i]).map(|l| l.apply(te_silu, n, None));
+                        *out[i].lock().unwrap() = Some(r);
+                    }
+                });
+            }
+        });
+        out.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+    }
+
     /// `time_embeddings(t) + pooled_text_embeddings(pooled)`.
     pub fn time_embed(&self, t: f32, pooled_emb: &[f32]) -> Vec<f32> {
         let d = self.cfg.dim / 2;

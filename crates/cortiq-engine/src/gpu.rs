@@ -5614,6 +5614,19 @@ pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> O
     }
 }
 
+/// The reference frame through the encoder on the device, or `None`.
+#[allow(unused_variables)]
+pub fn s2v_vae_encode(enc: &crate::s2v_vae::S2vVaeEncoder, img: &crate::ltxvae::Vol) -> Option<(crate::ltxvae::Vol, crate::ltxvae::Vol)> {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v_vae::encode(enc, img),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::encode(enc, img),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
 /// One forward on the device for the parity gate.
 #[allow(unused_variables)]
 pub fn s2v_check_forward(dit: &crate::s2v::S2vDit, i: &crate::s2v::S2vInput<'_>) -> Option<Vec<f32>> {

@@ -15,7 +15,7 @@ use super::qi21::{Rec, buf_from, buf_zeroed, set_p, write_f32};
 use super::{Ctx, WeightArena};
 use crate::ltxvae::Vol;
 use crate::s2v::{self, S2vDit, S2vGeom, audio_groups};
-use crate::s2v_vae::{Conv, GroupNorm, Mid, Res, S2vVae};
+use crate::s2v_vae::{Conv, GroupNorm, Mid, Res, S2vVae, S2vVaeEncoder};
 use crate::s2vgen::S2vCond;
 use cortiq_core::{CmfModel, TensorDtype};
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions, MTLSize};
@@ -558,8 +558,8 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
     let fin_off = text_off + cfg.n_text * 6 * h;
     let mods = buf_zeroed(c, (fin_off + 2 * h) * 4);
     let mut vm: Vec<Vec<f32>> = vec![Vec::with_capacity(cfg.n_visual * 9 * h); n_t];
-    for b in 0..cfg.n_visual {
-        let y = dit.modulate(&format!("dit.visual_transformer_blocks.{b}.visual_modulation.out_layer"), &rows_all, n_t + 1).ok()?;
+    let vnames: Vec<String> = (0..cfg.n_visual).map(|b| format!("dit.visual_transformer_blocks.{b}.visual_modulation.out_layer")).collect();
+    for (b, y) in dit.modulate_all(&vnames, &rows_all, n_t + 1).ok()?.into_iter().enumerate() {
         write_f32(&mods, b * 2 * 9 * h, &y[..9 * h]);
         for (s, v) in vm.iter_mut().enumerate() {
             v.extend_from_slice(&y[(s + 1) * 9 * h..(s + 2) * 9 * h]);
@@ -1164,7 +1164,7 @@ impl VRec<'_> {
 
     /// `Y = conv(X)` (+bias) (+R); `up` = (space, time) nearest upsample of the source.
     #[allow(clippy::too_many_arguments)]
-    fn conv(&mut self, cv: &VC, x: &Buffer, y: &Buffer, res: Option<&Buffer>, fhw: (usize, usize, usize), up: (bool, bool), epi: u32, ldy: usize, plain: Option<(usize, usize)>) {
+    fn conv(&mut self, cv: &VC, x: &Buffer, y: &Buffer, res: Option<&Buffer>, fhw: (usize, usize, usize), up: (u32, bool), epi: u32, ldy: usize, plain: Option<(usize, usize)>) {
         let (n, ldx, k) = match plain {
             Some((n, ldx)) => (n, ldx, ldx),
             None => (fhw.0 * fhw.1 * fhw.2, cv.icp, cv.taps * cv.icp),
@@ -1178,7 +1178,7 @@ impl VRec<'_> {
             h: fhw.1 as u32,
             w: fhw.2 as u32,
             taps: cv.taps as u32,
-            up_s: up.0 as u32,
+            up_s: up.0,
             up_t: up.1 as u32,
             epi,
             ldy: ldy as u32,
@@ -1280,13 +1280,50 @@ struct Bufs {
 fn resnet(r: &mut VRec, b: &Bufs, rs: &VR, fhw: (usize, usize, usize)) {
     let n = fhw.0 * fhw.1 * fhw.2;
     r.gn(&rs.n1, &b.xa, &b.hh, n, rs.cin, true, true);
-    r.conv(&rs.c1, &b.hh, &b.t, None, fhw, (false, false), 0, rs.cout, None);
+    r.conv(&rs.c1, &b.hh, &b.t, None, fhw, (0, false), 0, rs.cout, None);
     if let Some(sc) = &rs.sc {
         r.cvt(&b.xa, &b.hh, n * rs.cin);
-        r.conv(sc, &b.hh, &b.xa, None, fhw, (false, false), 0, rs.cout, None);
+        r.conv(sc, &b.hh, &b.xa, None, fhw, (0, false), 0, rs.cout, None);
     }
     r.gn(&rs.n2, &b.t, &b.hh, n, rs.cout, true, true);
-    r.conv(&rs.c2, &b.hh, &b.xa, Some(&b.xa), fhw, (false, false), 0, rs.cout, None);
+    r.conv(&rs.c2, &b.hh, &b.xa, Some(&b.xa), fhw, (0, false), 0, rs.cout, None);
+}
+
+/// The VAE's mid attention: one query frame at a time.
+#[allow(clippy::too_many_arguments)]
+fn mid_attention(c: &Ctx, r: &mut VRec, b: &Bufs, gn: &VN, w: (&VC, &VC, &VC, &VC), ac: usize, f0: usize, pf: usize) -> Option<()> {
+    let n0 = f0 * pf;
+    let n0p = n0.div_ceil(64) * 64;
+    let (qb, kb, vt, ob) = (
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+    );
+    let sb = buf_zeroed(c, pf * n0p * 4);
+    let pb = buf_zeroed(c, pf * n0p * 2);
+    r.gn(gn, &b.xa, &b.hh, n0, ac, false, true);
+    r.conv(w.0, &b.hh, &qb, None, (0, 0, 0), (0, false), 1, ac, Some((n0, ac)));
+    r.conv(w.1, &b.hh, &kb, None, (0, 0, 0), (0, false), 1, ac, Some((n0, ac)));
+    r.conv(w.2, &b.hh, &vt, None, (0, 0, 0), (0, false), 2, n0p, Some((n0, ac)));
+    for fr in 0..f0 {
+        let live = (fr + 1) * pf;
+        r.gemm(&kb, live.div_ceil(64) * 64, ac, (&qb, (fr * pf * ac * 2) as u64), ac, (&sb, 0), n0p, pf, 0);
+        {
+            let pp = r.p;
+            let (nv, ld) = (live as u32, n0p as u32);
+            let enc = r.enc();
+            enc.set_compute_pipeline_state(&pp.softmax);
+            enc.set_buffer(0, Some(&sb), 0);
+            enc.set_buffer(1, Some(&pb), 0);
+            set_p(enc, 2, &nv);
+            set_p(enc, 3, &ld);
+            enc.dispatch_thread_groups(MTLSize::new(pf as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        r.gemm(&vt, ac, n0p, (&pb, 0), n0p, (&ob, (fr * pf * ac * 2) as u64), ac, pf, 1);
+    }
+    r.conv(w.3, &ob, &b.xa, Some(&b.xa), (0, 0, 0), (0, false), 0, ac, Some((n0, ac)));
+    Some(())
 }
 
 /// One temporal tile `[16, F, H, W]`, past the post-quant conv.
@@ -1326,40 +1363,11 @@ fn decode_tile(c: &Ctx, p: &'static Pipes, d: &VDev, z: &Vol) -> Option<Vol> {
         unsafe { std::ptr::copy_nonoverlapping(zh.as_ptr(), b.hh.contents() as *mut u16, zh.len()) };
     }
     let ac = d.ac;
-    let n0p = n0.div_ceil(64) * 64;
-    let (qb, kb, vt, ob) = (
-        buf_zeroed(c, n0p * ac * 2),
-        buf_zeroed(c, n0p * ac * 2),
-        buf_zeroed(c, n0p * ac * 2),
-        buf_zeroed(c, n0p * ac * 2),
-    );
-    let sb = buf_zeroed(c, pf * n0p * 4);
-    let pb = buf_zeroed(c, pf * n0p * 2);
     let mut r = VRec { c, p, done: Vec::new(), cur: None, part: buf_zeroed(c, 32 * 1024 * 4), stat: buf_zeroed(c, 32 * 2 * 4) };
     let fhw0 = (f0, h0, w0);
-    r.conv(&d.conv_in, &b.hh, &b.xa, None, fhw0, (false, false), 0, d.conv_in.ocp, None);
+    r.conv(&d.conv_in, &b.hh, &b.xa, None, fhw0, (0, false), 0, d.conv_in.ocp, None);
     resnet(&mut r, &b, &d.mid0, fhw0);
-    r.gn(&d.gn, &b.xa, &b.hh, n0, ac, false, true);
-    r.conv(&d.q, &b.hh, &qb, None, (0, 0, 0), (false, false), 1, ac, Some((n0, ac)));
-    r.conv(&d.k, &b.hh, &kb, None, (0, 0, 0), (false, false), 1, ac, Some((n0, ac)));
-    r.conv(&d.v, &b.hh, &vt, None, (0, 0, 0), (false, false), 2, n0p, Some((n0, ac)));
-    for fr in 0..f0 {
-        let live = (fr + 1) * pf;
-        r.gemm(&kb, live.div_ceil(64) * 64, ac, (&qb, (fr * pf * ac * 2) as u64), ac, (&sb, 0), n0p, pf, 0);
-        {
-            let pp = r.p;
-            let (nv, ld) = (live as u32, n0p as u32);
-            let enc = r.enc();
-            enc.set_compute_pipeline_state(&pp.softmax);
-            enc.set_buffer(0, Some(&sb), 0);
-            enc.set_buffer(1, Some(&pb), 0);
-            set_p(enc, 2, &nv);
-            set_p(enc, 3, &ld);
-            enc.dispatch_thread_groups(MTLSize::new(pf as u64, 1, 1), MTLSize::new(256, 1, 1));
-        }
-        r.gemm(&vt, ac, n0p, (&pb, 0), n0p, (&ob, (fr * pf * ac * 2) as u64), ac, pf, 1);
-    }
-    r.conv(&d.o, &ob, &b.xa, Some(&b.xa), (0, 0, 0), (false, false), 0, ac, Some((n0, ac)));
+    mid_attention(c, &mut r, &b, &d.gn, (&d.q, &d.k, &d.v, &d.o), ac, f0, pf)?;
     resnet(&mut r, &b, &d.mid1, fhw0);
     let (mut ff, mut hh, mut ww) = (f0, h0, w0);
     let mut ch = d.mid1.cout;
@@ -1375,14 +1383,14 @@ fn decode_tile(c: &Ctx, p: &'static Pipes, d: &VDev, z: &Vol) -> Option<Vol> {
             ff = if fac[0] == 2 { 1 + (ff - 1) * 2 } else { ff };
             hh *= fac[1];
             ww *= fac[2];
-            r.conv(u, &b.hh, &tt, None, (ff, hh, ww), (fac[1] == 2, fac[0] == 2), 0, u.ocp, None);
+            r.conv(u, &b.hh, &tt, None, (ff, hh, ww), (u32::from(fac[1] == 2), fac[0] == 2), 0, u.ocp, None);
             std::mem::swap(&mut xa, &mut tt);
             ch = u.ocp;
         }
     }
     let n = ff * hh * ww;
     r.gn(&d.norm, &xa, &b.hh, n, ch, true, true);
-    r.conv(&d.conv_out, &b.hh, &tt, None, (ff, hh, ww), (false, false), 0, 64, None);
+    r.conv(&d.conv_out, &b.hh, &tt, None, (ff, hh, ww), (0, false), 0, 64, None);
     let out = buf_zeroed(c, 3 * n * 4);
     {
         let pp = r.p;
@@ -1401,6 +1409,87 @@ fn decode_tile(c: &Ctx, p: &'static Pipes, d: &VDev, z: &Vol) -> Option<Vol> {
     let src = unsafe { std::slice::from_raw_parts(out.contents() as *const f32, 3 * n) };
     v.data.copy_from_slice(src);
     Some(v)
+}
+
+/// The reference frame through the encoder: `[3, 1, H, W]` → `(mean, logvar)`.
+pub(crate) fn encode(enc: &S2vVaeEncoder, img: &Vol) -> Option<(Vol, Vol)> {
+    if std::env::var("CMF_S2V_VAE_METAL").as_deref() == Ok("0") || img.f != 1 {
+        return None;
+    }
+    let c = super::ctx()?;
+    let p = pipes(c)?;
+    let (h0, w0) = (img.h, img.w);
+    let conv_in = vc(c, &enc.conv_in);
+    let downs: Vec<(Vec<VR>, Option<VC>)> = enc
+        .downs
+        .iter()
+        .map(|(res, d)| (res.iter().map(|r| vr(c, r)).collect(), d.as_ref().map(|cv| vc(c, cv))))
+        .collect();
+    let m: &Mid = &enc.mid;
+    let ac = m.q.1.len();
+    let (mr0, gn, q, k, v, o, mr1) = (
+        vr(c, &m.r0),
+        vn(c, &m.gn),
+        vl(c, &m.q, 1.0 / (ac as f32).sqrt()),
+        vl(c, &m.k, 1.0),
+        vl(c, &m.v, 1.0),
+        vl(c, &m.o, 1.0),
+        vr(c, &m.r1),
+    );
+    let norm = vn(c, &enc.norm_out);
+    let conv_out = vc(c, &enc.conv_out);
+    let n0 = h0 * w0;
+    let cmax = n0 * 512;
+    let b = Bufs { xa: buf_zeroed(c, cmax * 4), t: buf_zeroed(c, cmax * 4), hh: buf_zeroed(c, cmax * 2) };
+    {
+        let icp = conv_in.icp;
+        let mut zh = vec![0u16; n0 * icp];
+        for ch in 0..3 {
+            for px in 0..n0 {
+                zh[px * icp + ch] = cortiq_core::quant::f32_to_f16(img.data[ch * n0 + px]);
+            }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(zh.as_ptr(), b.hh.contents() as *mut u16, zh.len()) };
+    }
+    let mut r = VRec { c, p, done: Vec::new(), cur: None, part: buf_zeroed(c, 32 * 1024 * 4), stat: buf_zeroed(c, 32 * 2 * 4) };
+    r.conv(&conv_in, &b.hh, &b.xa, None, (1, h0, w0), (0, false), 0, conv_in.ocp, None);
+    let (mut hh, mut ww) = (h0, w0);
+    let mut ch = conv_in.ocp;
+    let (mut xa, mut tt) = (b.xa.clone(), b.t.clone());
+    for (res, dn) in &downs {
+        for rs in res {
+            let bb = Bufs { xa: xa.clone(), t: tt.clone(), hh: b.hh.clone() };
+            resnet(&mut r, &bb, rs, (1, hh, ww));
+            ch = rs.cout;
+        }
+        if let Some(d) = dn {
+            r.cvt(&xa, &b.hh, hh * ww * ch);
+            hh /= 2;
+            ww /= 2;
+            r.conv(d, &b.hh, &tt, None, (1, hh, ww), (2, false), 0, d.ocp, None);
+            std::mem::swap(&mut xa, &mut tt);
+            ch = d.ocp;
+        }
+    }
+    let bb = Bufs { xa: xa.clone(), t: tt.clone(), hh: b.hh.clone() };
+    resnet(&mut r, &bb, &mr0, (1, hh, ww));
+    mid_attention(c, &mut r, &bb, &gn, (&q, &k, &v, &o), ac, 1, hh * ww)?;
+    resnet(&mut r, &bb, &mr1, (1, hh, ww));
+    let n = hh * ww;
+    r.gn(&norm, &xa, &b.hh, n, ac, true, true);
+    r.conv(&conv_out, &b.hh, &tt, None, (1, hh, ww), (0, false), 0, conv_out.ocp, None);
+    if !r.finish() {
+        return None;
+    }
+    let cout = enc.conv_out.cout;
+    let raw = unsafe { std::slice::from_raw_parts(tt.contents() as *const f32, n * conv_out.ocp) };
+    let mut h = Vol::zeros(cout, 1, hh, ww);
+    for co in 0..cout {
+        for i in 0..n {
+            h.data[co * n + i] = raw[i * conv_out.ocp + co];
+        }
+    }
+    Some(enc.finish_host(&h))
 }
 
 pub(crate) fn decode(vae: &S2vVae, z: &Vol) -> Option<Vol> {

@@ -366,10 +366,9 @@ impl SplitMix {
     }
 }
 
-/// Read a mono wave at 16 kHz; other sample rates are resampled.
+/// Read a speech track as mono 16 kHz: WAV here, anything else through ffmpeg.
 pub fn load_speech(path: &Path) -> Result<Vec<f32>, String> {
-    let (mono, rate) = crate::whisper::read_wav_samples(path, true)?;
-    Ok(if rate == SAMPLE_RATE { mono } else { crate::whisper::resample_sinc(&mono, rate, SAMPLE_RATE) })
+    crate::egemma2_audio::read_audio(path)
 }
 
 /// `reference` latent `[H, W, C]` from the posterior: mean + std·ε, scaled.
@@ -398,6 +397,31 @@ pub fn to_vol(x: &[f32], t: usize, h: usize, w: usize, c: usize) -> Vol {
     v
 }
 
+/// Thinker hidden states of the user's text and CLIP's pooled embedding.
+pub fn encode_prompt(model: &Arc<CmfModel>, d: &S2vDefaults, prompt: &str) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let vocab = model.vocab.as_deref().ok_or("S2V .cmf has no embedded tokenizer")?;
+    let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
+    let (ids, start) = prompt_ids(&tok, &d.system_prompt, prompt);
+    let text = {
+        let te = OmniText::from_cmf(model)?;
+        let h = te.encode(&ids);
+        h[start * te.hidden..].to_vec()
+    };
+    let clip_vocab = model.tensor_bytes("clip.tokenizer_json").map_err(|e| e.to_string())?;
+    let clip_tok = Tokenizer::from_bytes(clip_vocab).map_err(|e| format!("clip tokenizer: {e}"))?;
+    let ct = ClipText::from_cmf(model)?;
+    let mut cids = clip_tok.encode(prompt);
+    const BOS: u32 = 49406;
+    const EOS: u32 = 49407;
+    if cids.first() != Some(&BOS) {
+        cids.insert(0, BOS);
+    }
+    cids.truncate(76);
+    cids.push(EOS);
+    cids.resize(77, EOS);
+    Ok((text, ct.pooled(&cids, EOS)))
+}
+
 /// Text, speech and reference latent. Each model loads and is dropped.
 pub fn encode_conditions(
     model: &Arc<CmfModel>,
@@ -418,10 +442,6 @@ pub fn encode_conditions(
     let (text, audio, pooled) = if let Some((t, a, po)) = &p.oracle_cond {
         (t.clone(), a.clone(), po.clone())
     } else {
-        let prompt = p.prompt.clone().unwrap_or_else(|| d.prompt.clone());
-        let vocab = model.vocab.as_deref().ok_or("S2V .cmf has no embedded tokenizer")?;
-        let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
-        let (ids, start) = prompt_ids(&tok, &d.system_prompt, &prompt);
         let t0 = Instant::now();
         progress("audio tower", 0, 1);
         let (mel, frames) = omni_mel(&speech);
@@ -431,30 +451,16 @@ pub fn encode_conditions(
         };
         prof("audio", t0);
         let t0 = Instant::now();
-        progress("text encoder", 0, 1);
-        let text = {
-            let te = OmniText::from_cmf(model)?;
-            let h = te.encode(&ids);
-            h[start * te.hidden..].to_vec()
+        // The canned prompt's conditions are in the file; the 7B Thinker is only
+        // opened for another prompt.
+        let canned = model.tensor("s2v.default_text").is_some() && p.prompt.as_ref().is_none_or(|q| *q == d.prompt);
+        let (text, pooled) = if canned {
+            (crate::dit::cmf_f32(model, "s2v.default_text")?, crate::dit::cmf_f32(model, "s2v.default_pooled")?)
+        } else {
+            progress("text encoder", 0, 1);
+            encode_prompt(model, d, p.prompt.as_deref().unwrap_or(&d.prompt))?
         };
-        prof("text", t0);
-        let t0 = Instant::now();
-        let clip_vocab = model.tensor_bytes("clip.tokenizer_json").map_err(|e| e.to_string())?;
-        let clip_tok = Tokenizer::from_bytes(clip_vocab).map_err(|e| format!("clip tokenizer: {e}"))?;
-        let pooled = {
-            let ct = ClipText::from_cmf(model)?;
-            let mut cids = clip_tok.encode(&prompt);
-            const BOS: u32 = 49406;
-            const EOS: u32 = 49407;
-            if cids.first() != Some(&BOS) {
-                cids.insert(0, BOS);
-            }
-            cids.truncate(76);
-            cids.push(EOS);
-            cids.resize(77, EOS);
-            ct.pooled(&cids, EOS)
-        };
-        prof("clip", t0);
+        prof("prompt", t0);
         (text, audio, pooled)
     };
     let tokens = audio.len() / 3584;
@@ -473,7 +479,7 @@ pub fn encode_conditions(
     let img = prepare_image(&image.data, image.width, image.height, height, width);
     let (mean, logvar) = {
         let enc = S2vVaeEncoder::from_cmf(model)?;
-        enc.encode(&img)
+        crate::gpu::s2v_vae_encode(&enc, &img).unwrap_or_else(|| enc.encode(&img))
     };
     prof("vae encode", t0);
     let eps = rng_eps(mean.data.len());

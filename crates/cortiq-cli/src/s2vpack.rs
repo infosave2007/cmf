@@ -106,12 +106,41 @@ fn keep16(t: &StTensor) -> Codec {
     }
 }
 
+/// The canned prompt's Thinker and CLIP outputs, from the source weights: a
+/// throwaway container of the text encoders at their source precision, read
+/// back through the engine. A render with the default prompt then opens neither.
+fn canned_conditions(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let tmp = format!("{out}.prompt.tmp");
+    write_container(root, &tmp, o, true, None)?;
+    let r = (|| -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        let m = std::sync::Arc::new(cortiq_core::CmfModel::open_sharded(&tmp)?);
+        let d = cortiq_engine::s2vgen::S2vDefaults::of(&m).map_err(|e| anyhow::anyhow!(e))?;
+        cortiq_engine::s2vgen::encode_prompt(&m, &d, &d.prompt).map_err(|e| anyhow::anyhow!(e))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(format!("{tmp}.sha256"));
+    r
+}
+
 pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     ensure!(
         is_s2v_root(root),
         "{}: not a diffusers Kandinsky S2V directory",
         root.display()
     );
+    let t = std::time::Instant::now();
+    let cond = canned_conditions(root, out, o)?;
+    eprintln!("s2v pack: canned prompt encoded in {:.0}s", t.elapsed().as_secs_f64());
+    write_container(root, out, o, false, Some(&cond))
+}
+
+fn write_container(
+    root: &Path,
+    out: &str,
+    o: &PackOpts,
+    prompt_only: bool,
+    cond: Option<&(Vec<f32>, Vec<f32>)>,
+) -> anyhow::Result<()> {
     let t_all = std::time::Instant::now();
     let read = |rel: &str| -> anyhow::Result<Vec<u8>> {
         std::fs::read(root.join(rel)).with_context(|| format!("{}/{rel}", root.display()))
@@ -154,7 +183,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     let vae_file = files_of("vae", "diffusion_pytorch_model.safetensors");
 
     let mut source_sha = serde_json::Map::new();
-    if o.source_sha {
+    if o.source_sha && !prompt_only {
         let list = [&dit_file, &te_file, &clip_file, &vae_file];
         let hashes: Vec<anyhow::Result<String>> = std::thread::scope(|s| {
             let hs: Vec<_> = list.iter().map(|f| s.spawn(|| sha256_file(f))).collect();
@@ -179,6 +208,9 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     let q8 = Codec::Q(convert::Quant::Q8_2f);
     let (ts, size) = st_header(&dit_file)?;
     for (ti, t) in ts.iter().enumerate() {
+        if prompt_only {
+            break;
+        }
         // The speech and prompt towers run a handful of tokens through blocks
         // shared by every frame: at q4tp the speech stream leaves its four
         // blocks 78 % away from the reference (measured), so they stay 8-bit.
@@ -204,7 +236,9 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     let (ts, size) = st_header(&te_file)?;
     for (ti, t) in ts.iter().enumerate() {
         let (out_name, codec) = if let Some(n) = t.name.strip_prefix("model.") {
-            let c = if n == "embed_tokens.weight" {
+            let c = if prompt_only {
+                Codec::Raw
+            } else if n == "embed_tokens.weight" {
                 match o.te {
                     Codec::Q(_) => Codec::Q(convert::Quant::Q8Row),
                     c => c,
@@ -216,7 +250,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
             };
             (format!("te.{n}"), c)
         } else if let Some(n) = t.name.strip_prefix("audio_tower.") {
-            if n == "audio_bos_eos_token.weight" {
+            if n == "audio_bos_eos_token.weight" || prompt_only {
                 continue;
             }
             let proj = t.shape.len() == 2
@@ -246,7 +280,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
             out: format!("clip.{n}"),
             file: 2,
             t: ti,
-            codec: Codec::F16,
+            codec: if prompt_only { Codec::F32 } else { Codec::F16 },
         });
     }
     files.push((clip_file.clone(), ts, size));
@@ -254,6 +288,9 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     // ── VAE ──
     let (ts, size) = st_header(&vae_file)?;
     for (ti, t) in ts.iter().enumerate() {
+        if prompt_only {
+            break;
+        }
         items.push(Item {
             out: format!("vae.{}", t.name),
             file: 3,
@@ -274,7 +311,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
         ("s2v.config_json", serde_json::to_vec_pretty(&defaults)?),
         ("s2v.scheduler_json", sched_raw.clone()),
     ];
-    let count = items.len() + extras.len();
+    let count = items.len() + extras.len() + 2;
     eprintln!(
         "s2v pack: {n_dit} dit ({}), {} other tensors, te {}, audio {}, vae {}",
         codec_name(o.dit),
@@ -296,6 +333,13 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
         let mut w = CmfStreamWriter::new(&temp, CmfStreamWriter::head_reserve_for(count, 64))?;
         for (n, b) in &extras {
             w.push(n, TensorDtype::U8, &[b.len()], b)?;
+        }
+        if let Some((text, pooled)) = cond {
+            let hidden = text_cfg["hidden_size"].as_u64().context("hidden")? as usize;
+            let tb: Vec<u8> = text.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let pb: Vec<u8> = pooled.iter().flat_map(|v| v.to_le_bytes()).collect();
+            w.push("s2v.default_text", TensorDtype::F32, &[text.len() / hidden, hidden], &tb)?;
+            w.push("s2v.default_pooled", TensorDtype::F32, &[1, pooled.len()], &pb)?;
         }
         let mut done = 0usize;
         let mut maps: Vec<Option<memmap2::Mmap>> = (0..files.len()).map(|_| None).collect();

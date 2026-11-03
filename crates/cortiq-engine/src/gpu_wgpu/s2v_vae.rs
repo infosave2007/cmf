@@ -16,7 +16,7 @@
 use super::Ctx;
 use super::zimage::{Epi, MmArgs, MmCall, MmCfg, VAE_SOFTMAX_SRC, bg, default_cfg, mm_call, mm_pipe, mm_uniform, pipeline, sbuf, sbuf_init, ubuf, zctx};
 use crate::ltxvae::Vol;
-use crate::s2v_vae::{Conv, GroupNorm, Mid, Res, S2vVae};
+use crate::s2v_vae::{Conv, GroupNorm, Mid, Res, S2vVae, S2vVaeEncoder};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -454,8 +454,24 @@ impl Rec<'_> {
     /// holds the source frames (before the nearest upsample `up`).
     #[allow(clippy::too_many_arguments)]
     fn conv(&mut self, cv: &VC, act: &wgpu::Buffer, f: usize, h: usize, w: usize, up: (bool, bool), out: &wgpu::Buffer) -> Option<()> {
+        self.conv_any(cv, act, f, h, w, up, false, out)
+    }
+
+    /// The stride-2 conv of the encoder's single frame: `h`, `w` are the output's.
+    fn conv_down(&mut self, cv: &VC, act: &wgpu::Buffer, h: usize, w: usize, out: &wgpu::Buffer) -> Option<()> {
+        self.conv_any(cv, act, 1, h, w, (false, false), true, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_any(&mut self, cv: &VC, act: &wgpu::Buffer, f: usize, h: usize, w: usize, up: (bool, bool), stride: bool, out: &wgpu::Buffer) -> Option<()> {
         let per = h * w;
-        let (sh, sw) = if up.0 { (h / 2, w / 2) } else { (h, w) };
+        let (sh, sw) = if up.0 {
+            (h / 2, w / 2)
+        } else if stride {
+            (h * 2, w * 2)
+        } else {
+            (h, w)
+        };
         let src_f = |of: usize| if up.1 && of > 0 { (of - 1) / 2 + 1 } else { of };
         let sper = sh * sw * cv.cin_p * 2;
         let taps = if cv.k3 { 27 } else { 1 };
@@ -472,7 +488,7 @@ impl Rec<'_> {
                 ldo: cv.cout_p as u32,
                 ocol: 0,
                 arow: if cv.k3 {
-                    (f as u32) | ((f0 as u32) << 8) | ((s0 as u32) << 16) | (u32::from(up.0) << 24) | (u32::from(up.1) << 25)
+                    (f as u32) | ((f0 as u32) << 8) | ((s0 as u32) << 16) | (u32::from(up.0) << 24) | (u32::from(up.1) << 25) | (u32::from(stride) << 26)
                 } else {
                     0
                 },
@@ -574,47 +590,13 @@ fn mm_off(c: &Ctx, g: MmCfg, a: &MmArgs, plane: &wgpu::Buffer, act: &wgpu::Buffe
     Some(MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)), mnk: [a.m, a.n, a.k], bits: false })
 }
 
-fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog> {
-    // Shapes walk: size every buffer for the largest.
-    let mut elems = mp_of(f0 * h0 * w0) * 512;
-    let (mut ff, mut hh, mut ww) = (f0, h0, w0);
-    for (res, up) in &d.ups {
-        for r in res {
-            elems = elems.max(mp_of(ff * hh * ww) * r.c1.cin_p.max(r.c1.cout_p));
-        }
-        if let Some((u, fac)) = up {
-            ff = if fac[0] == 2 { 1 + (ff - 1) * 2 } else { ff };
-            hh *= fac[1];
-            ww *= fac[2];
-            elems = elems.max(mp_of(ff * hh * ww) * u.cin_p.max(u.cout_p));
-        }
-    }
-    let nchunk_max = (elems / 128).div_ceil(GN_ROWS) + 1;
-    let mut r = Rec {
-        c,
-        ops: Vec::new(),
-        dummy: sbuf(c, 64, "s2v_d"),
-        stat: sbuf(c, 1024 * 4, "s2v_stat"),
-        part: sbuf(c, (32 * nchunk_max * 4) as u64, "s2v_part"),
-        x: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vx"),
-        h: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vh"),
-        s: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vs"),
-        xn: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vxn"),
-    };
-    let (x, hb, xn) = (r.x.clone(), r.h.clone(), r.xn.clone());
-    let cin0 = d.conv_in.cin_p;
+/// The mid attention, one query frame at a time over the keys of that frame and
+/// the frames before it.
+fn mid_attention(c: &Ctx, r: &mut Rec<'_>, at: &VMid, f0: usize, h0: usize, w0: usize, keep: &mut Vec<wgpu::Buffer>) -> Option<()> {
+    let (x,) = (r.x.clone(),);
     let m0 = f0 * h0 * w0;
     let mp0 = mp_of(m0);
-    let z = sbuf(c, ((mp0 + 128) * cin0 * 2) as u64, "s2v_vz");
-    r.conv(&d.conv_in, &z, f0, h0, w0, (false, false), &hb)?;
-    let mut ch = d.conv_in.cout_p;
-    r.combine(&x, &hb, &d.conv_in.bias, None, 2, f0, h0 * w0, ch)?;
-    ch = r.resnet(&d.mid.r0, f0, h0, w0, ch)?;
-
-    // Mid attention, one query frame at a time.
-    let mut keep = Vec::new();
     {
-        let at = &d.mid;
         let cc = at.c;
         let m = m0;
         let mp = mp0;
@@ -664,6 +646,48 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         r.combine(&x, &ha, &at.o.bias, None, 0, f0, pf, cc)?;
         keep.extend([q16, k16, o32, vt16, q32, sc, pr, xa, ha]);
     }
+    Some(())
+}
+
+fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog> {
+    // Shapes walk: size every buffer for the largest.
+    let mut elems = mp_of(f0 * h0 * w0) * 512;
+    let (mut ff, mut hh, mut ww) = (f0, h0, w0);
+    for (res, up) in &d.ups {
+        for r in res {
+            elems = elems.max(mp_of(ff * hh * ww) * r.c1.cin_p.max(r.c1.cout_p));
+        }
+        if let Some((u, fac)) = up {
+            ff = if fac[0] == 2 { 1 + (ff - 1) * 2 } else { ff };
+            hh *= fac[1];
+            ww *= fac[2];
+            elems = elems.max(mp_of(ff * hh * ww) * u.cin_p.max(u.cout_p));
+        }
+    }
+    let nchunk_max = (elems / 128).div_ceil(GN_ROWS) + 1;
+    let mut r = Rec {
+        c,
+        ops: Vec::new(),
+        dummy: sbuf(c, 64, "s2v_d"),
+        stat: sbuf(c, 1024 * 4, "s2v_stat"),
+        part: sbuf(c, (32 * nchunk_max * 4) as u64, "s2v_part"),
+        x: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vx"),
+        h: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vh"),
+        s: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vs"),
+        xn: sbuf(c, ((elems + 128 * 512) * 2) as u64, "s2v_vxn"),
+    };
+    let (x, hb, xn) = (r.x.clone(), r.h.clone(), r.xn.clone());
+    let cin0 = d.conv_in.cin_p;
+    let m0 = f0 * h0 * w0;
+    let mp0 = mp_of(m0);
+    let z = sbuf(c, ((mp0 + 128) * cin0 * 2) as u64, "s2v_vz");
+    r.conv(&d.conv_in, &z, f0, h0, w0, (false, false), &hb)?;
+    let mut ch = d.conv_in.cout_p;
+    r.combine(&x, &hb, &d.conv_in.bias, None, 2, f0, h0 * w0, ch)?;
+    ch = r.resnet(&d.mid.r0, f0, h0, w0, ch)?;
+
+    let mut keep = Vec::new();
+    mid_attention(c, &mut r, &d.mid, f0, h0, w0, &mut keep)?;
     ch = r.resnet(&d.mid.r1, f0, h0, w0, ch)?;
     let (mut ff, mut hh, mut ww) = (f0, h0, w0);
     for (res, up) in &d.ups {
@@ -789,4 +813,107 @@ pub(crate) fn decode(vae: &S2vVae, z: &Vol) -> Option<Vol> {
         return None;
     }
     Some(v)
+}
+
+
+/// The reference frame through the encoder on the device: `[3, 1, H, W]` →
+/// `(mean, logvar)`, or `None` to run on the CPU.
+pub(crate) fn encode(enc: &S2vVaeEncoder, img: &Vol) -> Option<(Vol, Vol)> {
+    if std::env::var("CMF_S2V_VAE_WGPU").as_deref() == Ok("0") || img.f != 1 {
+        return None;
+    }
+    let c = zctx()?;
+    let (h0, w0) = (img.h, img.w);
+    let conv_in = vc(c, &enc.conv_in);
+    let downs: Vec<(Vec<VR>, Option<VC>)> = enc
+        .downs
+        .iter()
+        .map(|(res, d)| (res.iter().map(|r| vr(c, r)).collect(), d.as_ref().map(|cv| vc(c, cv))))
+        .collect();
+    let mid = vmid(c, &enc.mid);
+    let norm = vn(c, &enc.norm_out);
+    let conv_out = vc(c, &enc.conv_out);
+    let elems = (mp_of(h0 * w0) + 128) * 512;
+    let nchunk_max = (elems / 128).div_ceil(GN_ROWS) + 1;
+    let mut r = Rec {
+        c,
+        ops: Vec::new(),
+        dummy: sbuf(c, 64, "s2v_d"),
+        stat: sbuf(c, 1024 * 4, "s2v_stat"),
+        part: sbuf(c, (32 * nchunk_max * 4) as u64, "s2v_part"),
+        x: sbuf(c, (elems * 2) as u64, "s2v_ex"),
+        h: sbuf(c, (elems * 2) as u64, "s2v_eh"),
+        s: sbuf(c, (elems * 2) as u64, "s2v_es"),
+        xn: sbuf(c, (elems * 2) as u64, "s2v_exn"),
+    };
+    let (x, hb, xn) = (r.x.clone(), r.h.clone(), r.xn.clone());
+    let cin0 = conv_in.cin_p;
+    let m0 = h0 * w0;
+    let mut zin = vec![0u16; (mp_of(m0) + 128) * cin0];
+    for ch in 0..3 {
+        for i in 0..m0 {
+            zin[i * cin0 + ch] = cortiq_core::quant::f32_to_f16(img.data[ch * m0 + i]);
+        }
+    }
+    let z = sbuf_init(c, bytemuck::cast_slice(&zin), "s2v_ez");
+    r.conv(&conv_in, &z, 1, h0, w0, (false, false), &hb)?;
+    let mut ch = conv_in.cout_p;
+    r.combine(&x, &hb, &conv_in.bias, None, 2, 1, m0, ch)?;
+    let (mut hh, mut ww) = (h0, w0);
+    for (res, dn) in &downs {
+        for rs in res {
+            ch = r.resnet(rs, 1, hh, ww, ch)?;
+        }
+        if let Some(d) = dn {
+            hh /= 2;
+            ww /= 2;
+            r.conv_down(d, &x, hh, ww, &hb)?;
+            ch = d.cout_p;
+            r.combine(&x, &hb, &d.bias, None, 2, 1, hh * ww, ch)?;
+        }
+    }
+    ch = r.resnet(&mid.r0, 1, hh, ww, ch)?;
+    let mut keep = Vec::new();
+    mid_attention(c, &mut r, &mid, 1, hh, ww, &mut keep)?;
+    ch = r.resnet(&mid.r1, 1, hh, ww, ch)?;
+    let n = hh * ww;
+    r.gn(&x, None, &norm, 1, n, ch, true, &xn)?;
+    r.conv(&conv_out, &xn, 1, hh, ww, (false, false), &hb)?;
+    let bytes = (n * conv_out.cout_p * 2) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("s2v_estage"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encd = c.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encd.begin_compute_pass(&Default::default());
+        for op in &r.ops {
+            match op {
+                Op::D(pipe, b, g) => {
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, b, &[]);
+                    pass.dispatch_workgroups(g.0, g.1, g.2);
+                }
+                Op::M(m) => m.record(&mut pass),
+            }
+        }
+    }
+    encd.copy_buffer_to_buffer(&hb, 0, &stage, 0, bytes);
+    c.queue.submit(Some(encd.finish()));
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let mapped = slice.get_mapped_range().ok()?;
+    let raw: &[u16] = bytemuck::cast_slice(&mapped);
+    // `[n][cout_p]` f16 + bias → `[32, 1, H, W]`.
+    let mut h = Vol::zeros(enc.conv_out.cout, 1, hh, ww);
+    for co in 0..enc.conv_out.cout {
+        for i in 0..n {
+            h.data[co * n + i] = cortiq_core::quant::f16_to_f32(raw[i * conv_out.cout_p + co]) + enc.conv_out.b[co];
+        }
+    }
+    drop(mapped);
+    Some(enc.finish_host(&h))
 }

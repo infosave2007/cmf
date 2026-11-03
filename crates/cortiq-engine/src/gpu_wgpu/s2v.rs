@@ -756,10 +756,8 @@ pub fn prepare(
     }
     let mut clean_mods = Vec::with_capacity(cfg.n_visual * 9 * h);
     let mut vm: Vec<Vec<f32>> = vec![Vec::with_capacity(cfg.n_visual * 9 * h); n_t];
-    for b in 0..cfg.n_visual {
-        let y = dit
-            .modulate(&format!("dit.visual_transformer_blocks.{b}.visual_modulation.out_layer"), &rows_all, n_t + 1)
-            .ok()?;
+    let vnames: Vec<String> = (0..cfg.n_visual).map(|b| format!("dit.visual_transformer_blocks.{b}.visual_modulation.out_layer")).collect();
+    for y in dit.modulate_all(&vnames, &rows_all, n_t + 1).ok()? {
         clean_mods.extend_from_slice(&y[..9 * h]);
         for (s, v) in vm.iter_mut().enumerate() {
             v.extend_from_slice(&y[(s + 1) * 9 * h..(s + 2) * 9 * h]);
