@@ -1,7 +1,7 @@
 # Hermes core: pod journal
 
-Pod: `ssh root@81.27.69.177 -p 28634`, RTX PRO 6000 Blackwell Server 97.9 GB, EPYC 9554 with a 27 CPU quota, 188 GB cgroup.
-Sources `/root/cmf` (origin/master d979ebfe + trainer patch), runs `/root/runs/hermes`, corpus `/root/corpus`, teacher `/root/models/qwen38-27b-q4tp.cmf` (sha256 eec6a359 as on HF).
+Pod, switched off after this pass: RTX PRO 6000 Blackwell Server 97.9 GB, EPYC 9554 with a 27 CPU quota, 188 GB cgroup.
+Sources `/root/cmf` (d979ebfe + trainer patch), runs `/root/runs/hermes`, corpus `/root/corpus`, teacher `/root/models/qwen38-27b-q4tp.cmf` (sha256 eec6a359 as on HF).
 
 ## 03.11 trainer
 

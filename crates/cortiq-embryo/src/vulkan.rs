@@ -263,8 +263,8 @@ fn init() -> Result<Ctx, String> {
     let profile_ops = std::env::var("CMF_VULKAN_PROFILE_OPS").ok().as_deref() == Some("1");
     // Profiling is intentionally opt-in: it splits the command pass and
     // performs a tiny mapped readback after each commit, so it must never be
-    // part of the resident training path.  2048 pairs cover the observed
-    // full Embryo graph (829 operations at B1T64).
+    // part of the resident training path.  32768 pairs cover a full step
+    // (about 6500 operations at B8 T1024).
     let ts = want_ts.then(|| {
         const MAX_PAIRS: u32 = 32768;
         let query_sets = (0..MAX_PAIRS / TS_SET_PAIRS as u32)
@@ -3859,6 +3859,7 @@ const OP_HK_PHI: u32 = 27;
 const OP_HK_KV: u32 = 28;
 const OP_HK_FWD: u32 = 29;
 const OP_HK_BWD: u32 = 30;
+#[cfg(test)]
 const OP_ROUTE: u32 = 31;
 const OP_ROUTE_GROUP: u32 = 32;
 const OP_MOE_GATHER: u32 = 33;

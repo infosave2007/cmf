@@ -1,6 +1,6 @@
 # Ядро Hermes: что выяснили на поде 03.11
 
-Материал для дальнейших размышлений. План с этапами лежит отдельно: [PLAN_HERMES_CORE_2026-11-03.ru.md](PLAN_HERMES_CORE_2026-11-03.ru.md).
+Материал для дальнейших размышлений. План с этапами лежит отдельно: [HERMES_CORE_PLAN.ru.md](HERMES_CORE_PLAN.ru.md).
 
 ## Главное
 
@@ -63,7 +63,7 @@ RTX PRO 6000 Blackwell, замер внутри процесса, другие �
 
 GEMM занимает 74 % при 13–17 TFLOPS реальной скорости. Понятного следующего рычага по GEMM у меня нет: три варианта ядра не победили. Остался запас около 10–15 %: кодирование команд 75 мс на шаг, `CONV_BWD` 41 мс, мелкие операции около 60 мс.
 
-Код: ветка `hermes-core` в origin, worktree `/Users/oleg/dev/cmf-hermes-core`, в master не влита. Тесты тренера на поде прошли: lib 12, anchor_batches 4, correctness 5, gdn_wy 3, gemm64 2, operator_contract 11, training 4. Тест `terminal_sft_final_holdout_eval` не запускался как следует: ему нужен чекпойнт из переменной окружения. На Metal и на других GPU патч не проверялся.
+Тесты тренера на поде прошли: lib 12, anchor_batches 4, correctness 5, gdn_wy 3, gemm64 2, operator_contract 11, training 4. Тест `terminal_sft_final_holdout_eval` не запускался как следует: ему нужен чекпойнт из переменной окружения. Не запускались на GPU: bounded_anchor, desc_tmp, forward_contract, head_table, hk_gemm, model_parity, scatter_chain, sumsq_contract. Других GPU, кроме этого пода, патч не видел; путь Metal он не меняет.
 
 ## Данные
 
@@ -89,7 +89,7 @@ GEMM занимает 74 % при 13–17 TFLOPS реальной скорост
 | git | 249 | 3 млн | GPL-2.0 |
 | Debian Handbook | 23 | 1 млн | GPL-2+ и CC-BY-SA |
 
-Итого около 2,1 млрд символов, примерно 0,5 млрд токенов. Для Stack Exchange взят один лучший ответ на вопрос. Лицензии по большинству источников записаны по памяти и документам проектов, сверена дословно только tldr: перед релизом их надо проверить. Таблица: [scripts/hermes-core/LICENSES.tsv](scripts/hermes-core/LICENSES.tsv).
+Итого около 2,1 млрд символов, примерно 0,5 млрд токенов. Для Stack Exchange взят один лучший ответ на вопрос. Лицензии по большинству источников записаны по памяти и документам проектов, сверена дословно только tldr: перед релизом их надо проверить. Таблица: [scripts/hermes-core/LICENSES.tsv](../scripts/hermes-core/LICENSES.tsv).
 
 Не вошло: tagged Stack Overflow (объём неизвестен, дамп 23 ГБ качается за полторы минуты в 16 соединений), macOS man (нужно снимать с Мака), Fedora (клон не прошёл).
 
@@ -138,11 +138,11 @@ GEMM занимает 74 % при 13–17 TFLOPS реальной скорост
 
 ## Как продолжить на новом поде
 
-Все скрипты лежат в [scripts/hermes-core/](scripts/hermes-core/).
+Все скрипты лежат в [scripts/hermes-core/](../scripts/hermes-core/).
 
 | Шаг | Как | Замечание |
 |---|---|---|
-| Тренер | Ветка `hermes-core`, `cargo build --release -p cortiq-embryo --features vulkan` | `XDG_RUNTIME_DIR=/tmp` для Vulkan |
+| Тренер | `cargo build --release -p cortiq-embryo --features vulkan` | `XDG_RUNTIME_DIR=/tmp` для Vulkan |
 | Учитель | `curl` файла `qwen38-27b-q4tp.cmf`, `cortiq serve` | sha256 `eec6a359…`, 14,27 ГБ |
 | Hermes | `uv venv --python 3.14`, `uv pip install -e .` | На Python 3.11 зависимости не встают |
 | Песочницы | Пользователи `scen0`–`scen3`, ключ `/root/.ssh/scen_ed25519` | `unshare` и `mount` на поде запрещены |
@@ -158,6 +158,7 @@ GEMM занимает 74 % при 13–17 TFLOPS реальной скорост
 
 | Что | Где |
 |---|---|
-| Этот документ, план, скрипты, журнал, лицензии | Ветка `hermes-core`; копии лежат в `cmfpublic` без коммита |
-| Результаты, трассы, логи с пода | `~/embryo-data/hermes-core/pod-2026-11-03/` на Маке |
-| Документы корпуса, man, JSONL Stack Exchange, архив результатов | Приватный HF: `infosave/cmf-experiments`, каталог `hermes-core/2026-11-03/` |
+| Этот документ, план | `docs/` |
+| Скрипты, журнал, лицензии | `scripts/hermes-core/` |
+| Результаты, трассы, логи с пода | Локальный архив экспериментов, каталог `hermes-core/pod-2026-11-03/` |
+| Документы корпуса, man, JSONL Stack Exchange, архив результатов | Приватный репозиторий экспериментов на HF, каталог `hermes-core/2026-11-03/` |
