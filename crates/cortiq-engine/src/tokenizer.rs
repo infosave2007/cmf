@@ -647,16 +647,25 @@ impl Tokenizer {
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         // Added tokens match on raw text (normalized: false), longest first.
-        let mut rest = text;
+        let mut at = 0;
+        // Next occurrence of each added token at or after `at`. A token is
+        // searched again only once `at` has passed it, so one that never
+        // occurs costs a single scan: rescanning the rest of the text per
+        // token and per match made long chat-format text quadratic.
+        let mut next: Vec<Option<usize>> =
+            self.added.iter().map(|(content, _)| text.find(content.as_str())).collect();
         // `prepend_scheme: "first"` marks only the section that starts at
         // offset 0 — HF drops the ▁ for everything after an added token,
         // which is why a chat prompt opening with <|im_start|> tokenizes
         // the same either way and only raw prompts were wrong.
         let mut head = true;
-        'outer: while !rest.is_empty() {
+        'outer: while at < text.len() {
             let mut best: Option<(usize, usize, u32)> = None; // (pos, len, id)
-            for (content, id) in &self.added {
-                if let Some(pos) = rest.find(content.as_str()) {
+            for (i, (content, id)) in self.added.iter().enumerate() {
+                if next[i].is_some_and(|p| p < at) {
+                    next[i] = text[at..].find(content.as_str()).map(|p| at + p);
+                }
+                if let Some(pos) = next[i] {
                     let better = match best {
                         None => true,
                         Some((bp, bl, _)) => pos < bp || (pos == bp && content.len() > bl),
@@ -664,20 +673,20 @@ impl Tokenizer {
                     if better {
                         best = Some((pos, content.len(), *id));
                     }
-                    if pos == 0 {
+                    if pos == at {
                         break; // earliest possible; added is longest-first
                     }
                 }
             }
             match best {
                 Some((pos, len, id)) => {
-                    self.encode_segment_at(&rest[..pos], head, &mut ids);
+                    self.encode_segment_at(&text[at..pos], head, &mut ids);
                     ids.push(id);
-                    rest = &rest[pos + len..];
+                    at = pos + len;
                     head = false;
                 }
                 None => {
-                    self.encode_segment_at(rest, head, &mut ids);
+                    self.encode_segment_at(&text[at..], head, &mut ids);
                     break 'outer;
                 }
             }
@@ -2069,6 +2078,55 @@ mod tests {
         let ids2 = tok.encode("he<|eot|>he");
         assert_eq!(ids2, vec![8, 10, 8]);
         assert_eq!(tok.decode(&ids2), "hehe");
+    }
+
+    /// `encode` keeps each added token's next position: the result must equal
+    /// a fresh search of the remaining text at every match.
+    #[test]
+    fn added_token_scan_matches_a_fresh_search() {
+        let mut tok = Tokenizer::from_json(&mini_json()).unwrap();
+        // overlapping contents, longest first; "absent!" never occurs
+        tok.added = vec![
+            ("<|eot|>".to_string(), 10),
+            ("absent!".to_string(), 11),
+            ("<|".to_string(), 12),
+            ("he".to_string(), 13),
+        ];
+        let fresh = |text: &str| {
+            let (mut ids, mut rest, mut head) = (Vec::new(), text, true);
+            while !rest.is_empty() {
+                let mut best: Option<(usize, usize, u32)> = None;
+                for (content, id) in &tok.added {
+                    if let Some(pos) = rest.find(content.as_str()) {
+                        if best.is_none_or(|(bp, bl, _)| pos < bp || (pos == bp && content.len() > bl)) {
+                            best = Some((pos, content.len(), *id));
+                        }
+                    }
+                }
+                let Some((pos, len, id)) = best else {
+                    tok.encode_segment_at(rest, head, &mut ids);
+                    break;
+                };
+                tok.encode_segment_at(&rest[..pos], head, &mut ids);
+                ids.push(id);
+                rest = &rest[pos + len..];
+                head = false;
+            }
+            ids
+        };
+        for text in [
+            "",
+            "he",
+            "world",
+            "<|",
+            "<|eot|>",
+            "<|eot|><|eot|>he<|",
+            "hello <|eot|> world <| he <|eot|>he",
+            "<|<|eot|<|eot|>hehe wor<|ld",
+            "world he<|eot|> hello he he <|",
+        ] {
+            assert_eq!(tok.encode(text), fresh(text), "{text:?}");
+        }
     }
 
     /// LFM2/LFM3 templates open with `{{- bos_token -}}` and their tokenizers

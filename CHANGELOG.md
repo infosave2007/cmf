@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- Embryo trainer on Vulkan: a 340M step at B8 T1024 goes from 1340 to 1003 ms on an RTX PRO 6000. Routing takes its residual from GEMM products instead of a long per-row reduction, the DLG dots run in their own pass, and the GEMM tile thresholds follow the chip. `CMF_VULKAN_OP_TS=1` now covers a whole step.
-
 ## [0.8.55] — 2026-11-03
 
 ### Added
@@ -29,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An L40S takes 19.7 s a step at 512² (36736 tokens) against 19.5 s for Diffusers bf16,
   5.6 minutes for 5 s of video at 16.2 GB of VRAM. The final latents of q4tp have a
   cosine of 0.9996 with the reference on the same noise.
+
+### Changed
+
+- Embryo trainer on Vulkan: a 340M step at B8 T1024 goes from 1340 to 1003 ms on an RTX PRO 6000. Routing takes its residual from GEMM products instead of a long per-row reduction, the DLG dots run in their own pass, and the GEMM tile thresholds follow the chip. `CMF_VULKAN_OP_TS=1` now covers a whole step.
+
+### Performance
+
+- Tokenizing long chat-format text no longer takes quadratic time. `encode` searched the rest of the text for every added token at every match, so a text with tens of thousands of special tokens spent almost all its time there: `nvg-train` took 31 minutes to prepare about 22 MB of mixed text on the Qwen3.8-27B tokenizer, and takes 10 seconds now. Each token's next position is kept, and a token that never occurs is searched once. The output is unchanged.
 
 ## [0.8.54] — 2026-11-02
 
