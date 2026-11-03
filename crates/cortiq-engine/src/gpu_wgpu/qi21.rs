@@ -251,12 +251,17 @@ fn flash_cfg() -> FlashCfg {
     FlashCfg { nw: 8, bc: 16 }
 }
 
-fn flash_key(f: FlashCfg) -> String {
+/// The tile of a short key set beside a long query set.
+pub(super) fn prompt_flash_cfg() -> FlashCfg {
+    FlashCfg { nw: 8, bc: 16 }
+}
+
+pub(super) fn flash_key(f: FlashCfg) -> String {
     format!("qi_flash_{}_{}_{}", f.nw, f.bc, zi::flash_thr())
 }
 
 /// Workgroup-shared bytes of `qi_flash`.
-fn flash_shared(f: FlashCfg) -> u32 {
+pub(super) fn flash_shared(f: FlashCfg) -> u32 {
     2 * f.bc * 136 * 2 + f.nw * 16 * f.bc * 4 + f.nw * 16 * (f.bc + 8) * 2 + f.nw * 32 * 4 + 16
 }
 
@@ -270,7 +275,7 @@ fn flash_shared(f: FlashCfg) -> u32 {
 /// registers, so the O rescale may reuse the S scratch; the output is
 /// multiplied by `oscale`. Bindings: 0 panel (f16), 1 panel (vec4<f16>),
 /// 2 prefix cache (vec4<f16>), 3 output (vec4<u32>), 4 vis, 5 `FP`.
-fn flash_src(f: FlashCfg) -> Option<String> {
+pub(super) fn flash_src(f: FlashCfg) -> Option<String> {
     use std::fmt::Write;
     let (nw, bc) = (f.nw, f.bc);
     if nw == 0 || bc == 0 || bc % 16 != 0 || nw * 32 > 1024 {

@@ -554,6 +554,42 @@ impl Builder<'_> {
         })
     }
 
+    /// Prompt cross-attention on the matrix units: `qi_flash` with the prompt's
+    /// K|V panel as its whole key set.
+    fn prompt_flash(&self, qp: &wgpu::Buffer, ldq: usize, kv: &wgpu::Buffer, nt: usize, out: &wgpu::Buffer, m: usize) -> Option<Op> {
+        let f = super::qi21::prompt_flash_cfg();
+        if super::qi21::flash_shared(f) > self.c.device.limits().max_compute_workgroup_storage_size {
+            return None;
+        }
+        let pipe = pipeline(self.c, &super::qi21::flash_key(f), &super::qi21::flash_src(f)?, "qi_flash")?;
+        let h = self.h;
+        let scl = std::f32::consts::LOG2_E / (128f32).sqrt();
+        let u = ubuf(
+            self.c,
+            &[
+                m as u32,
+                nt as u32,
+                0,
+                ldq as u32,
+                h as u32,
+                (2 * h) as u32,
+                h as u32,
+                scl.to_bits(),
+                0,
+                (2 * h) as u32,
+                h as u32,
+                1f32.to_bits(),
+            ],
+        );
+        let b = bg(self.c, &pipe, &[qp, qp, kv, out, &self.groups_all, &u]);
+        Some(Op::D(Disp {
+            name: "prompt flash",
+            pipe,
+            bg: b,
+            grid: ((m as u32).div_ceil(f.nw * 16), self.nh as u32, 1),
+        }))
+    }
+
     fn mm(&self, cfg: MmCfg, a: MmArgs, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer) -> Option<Op> {
         Some(Op::M(mm_call(self.c, cfg, &a, plane, act, out)?))
     }
@@ -1046,7 +1082,10 @@ pub fn prepare(
         v.push(mm16(args(nt, 2 * h, h, 2 * h, p2(-qkv_sh)), &planes.ckv, &tcond, &tkv)?);
         v.push(bld.norm_op(&tkv, &s_vis, nt, 2 * h, 0, 1, off[7], off[9]));
         v.push(bld.norm_op(&tkv, &s_vis, nt, 2 * h, h, 0, 0, off[10]));
-        v.push(bld.xattn_op(&s_vis.qkv, 3 * h, &tkv, 2 * h, 0, h, &s_vis.att, m, m, &bld.groups_all));
+        match bld.prompt_flash(&s_vis.qkv, 3 * h, &tkv, nt, &s_vis.att, m) {
+            Some(op) => v.push(op),
+            None => v.push(bld.xattn_op(&s_vis.qkv, 3 * h, &tkv, 2 * h, 0, h, &s_vis.att, m, m, &bld.groups_all)),
+        }
         v.push(mm32(args(m, h, h, h, p2(qkv_sh)), &planes.co, &s_vis.att, &s_vis.br)?);
         let has_a = dit.visual[bi].v2a.is_some();
         if has_a {
