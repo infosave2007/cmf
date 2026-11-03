@@ -484,6 +484,8 @@ pub struct S2vDev {
     s_small: Seq,
     tkv: Buffer,
     akv: Buffer,
+    tcond: Buffer,
+    acond: Buffer,
     tcache: Buffer,
     t0: Vec<f32>,
     x0: Buffer,
@@ -651,6 +653,8 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
     let lin_b = |l: &s2v::Lin| l.b.clone().unwrap_or_else(|| vec![0.0; l.rows()]);
     let emb_b = aux.push(&lin_b(&dit.emb1));
     let mask0 = aux.push(&dit.mask[..h]);
+    // A row of zeros right after the mask, for residuals with no bias.
+    aux.push(&vec![0f32; h]);
     let s_vis = Seq::new(c, m, h, ff);
     let s_small = Seq::new(c, small, h, ff);
     let (vc, vs) = s2v::rope_visual(&cfg, g, sf);
@@ -673,6 +677,8 @@ pub fn prepare(dit: &S2vDit, g: &S2vGeom, cond: &S2vCond, ts: &[f32], sf: [f32; 
         s_small,
         tkv: buf_zeroed(c, (nt.div_ceil(64) * 64 + 64) * 2 * h * 2),
         akv: buf_zeroed(c, (na.div_ceil(64) * 64 + 64) * 2 * h * 2),
+        tcond: buf_zeroed(c, (nt.div_ceil(64) * 64 + 64) * h * 2),
+        acond: buf_zeroed(c, (na.div_ceil(64) * 64 + 64) * h * 2),
         tcache: buf_zeroed(c, n_t * small * h * 2),
         t0: dit.embed_text(&cond.text),
         x0: buf_zeroed(c, g.clean().max(1) * h * 4),
@@ -735,8 +741,7 @@ impl S2vDev {
         e.gemm(&[b.w1], &s.xn, h, &s.hid, &[0], ff, n, true, 1.0);
         e.gelu(&s.hid, n * ff / 4);
         e.gemm(&[b.w2], &s.hid, ff, &s.y, &[0], h, n, false, 1.0);
-        // The feed-forward has no bias; the zero row of `aux` past the mask is
-        // not needed because `mask0` is only read through `s2v_addv`.
+        // The feed-forward has no bias: the zero row after the mask.
         let zero = self.mask0 + h;
         match (mods_at, b.aff) {
             (Some(o), _) => e.row(s, 0, 0, n, 1 | 2, (m, o + 5 * h), (m, 0), (m, 0), zero, 1.0),
@@ -768,11 +773,11 @@ impl S2vDev {
         if !rec.finish("audio") {
             return Err("a Metal command buffer failed".into());
         }
-        // Keep the speech stream for the whole chunk in its own panel input.
+        // The speech stream for the whole chunk, in the panel the GEMMs read.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.s_small.xn.contents() as *const u16,
-                self.s_small.att.contents() as *mut u16,
+                self.acond.contents() as *mut u16,
                 n * h,
             );
         }
@@ -789,7 +794,6 @@ impl S2vDev {
         }
         write_f32(&self.mods, self.text_off, &self.tm[step]);
         write_f32(&self.mods, self.fin_off, &self.fm[step]);
-        // Speech stream of this chunk, kept as f16 in a private buffer.
         let speech_changed = self.audio_for != Some(chunk);
         if speech_changed {
             self.run_audio(chunk)?;
@@ -798,9 +802,6 @@ impl S2vDev {
             let clean = dit.embed_clean(&self.reference, memory, &g);
             write_f32(&self.x0, 0, &clean);
         }
-        let speech: Vec<u16> = unsafe {
-            std::slice::from_raw_parts(self.s_small.att.contents() as *const u16, self.na * h).to_vec()
-        };
         // Prompt stream of this segment, computed once and cached across chunks.
         let per = self.nt * h * 2;
         if !self.text_done[step] {
@@ -830,21 +831,14 @@ impl S2vDev {
             }
             self.text_done[step] = true;
         }
-        // The two condition panels the GEMMs read as activations.
-        let tcond = self.c._device.new_buffer_with_data(
-            unsafe { (self.tcache.contents() as *const u8).add(step * per) } as *const c_void,
-            ((self.nt.div_ceil(64) * 64 + 64) * h * 2).max(per) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let acond = {
-            let mut v = speech;
-            v.resize((self.na.div_ceil(64) * 64 + 64) * h, 0);
-            self.c._device.new_buffer_with_data(
-                v.as_ptr() as *const c_void,
-                (v.len() * 2) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (self.tcache.contents() as *const u8).add(step * per),
+                self.tcond.contents() as *mut u8,
+                per,
+            );
+        }
+        let (tcond, acond) = (&self.tcond, &self.acond);
         // Stream start: clean rows, then the noisy rows' embedder.
         let s = &self.s_vis;
         unsafe {
@@ -905,7 +899,7 @@ impl S2vDev {
             pre(&mut e, bi, 3, 1 | 2 | 8, Some(2), b.sa.ob);
             e.gemm(&[b.ca.q], &s.xn, h, &s.panel, &[0], 3 * h, m, true, 1.0);
             e.norm(&s.panel, &s.cs, &s.sn, m, 3 * h, 0, 1, b.ca.qn, b.ca.qb, qmul);
-            e.gemm(&[b.ca.k, b.ca.v], &tcond, h, &self.tkv, &[0, h], 2 * h, self.nt, true, 1.0);
+            e.gemm(&[b.ca.k, b.ca.v], tcond, h, &self.tkv, &[0, h], 2 * h, self.nt, true, 1.0);
             e.norm(&self.tkv, &s.cs, &s.sn, self.nt, 2 * h, 0, 1, b.ca.kn, b.ca.kb, 1.0);
             e.norm(&self.tkv, &s.cs, &s.sn, self.nt, 2 * h, h, 0, b.ca.qn, b.ca.vb, 1.0);
             e.flash(&s.panel, 3 * h, &s.att, 0, m, Some((&self.tkv, 0, self.nt)));
@@ -915,7 +909,7 @@ impl S2vDev {
                 e.row(s, cl, 0, g.nvis, 16, (mods, 0), (aux, *nb), (aux, *nw), zero, 1.0);
                 e.gemm(&[a.q], &s.xn, h, &s.panel, &[0], 3 * h, g.nvis, true, 1.0);
                 e.norm(&s.panel, &s.cs, &s.sn, g.nvis, 3 * h, 0, 1, a.qn, a.qb, qmul);
-                e.gemm(&[a.k, a.v], &acond, h, &self.akv, &[0, h], 2 * h, self.na, true, 1.0);
+                e.gemm(&[a.k, a.v], acond, h, &self.akv, &[0, h], 2 * h, self.na, true, 1.0);
                 e.norm(&self.akv, &s.cs, &s.sn, self.na, 2 * h, 0, 1, a.kn, a.kb, 1.0);
                 e.norm(&self.akv, &s.cs, &s.sn, self.na, 2 * h, h, 0, a.qn, a.vb, 1.0);
                 let pf_rows = g.per_frame();
