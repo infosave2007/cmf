@@ -381,18 +381,17 @@ def stage_vae(a):
     with safe_open(a.latents, "pt") as f:
         lats = [f.get_tensor(k) for k in sorted((k for k in f.keys() if k.startswith("final.")), key=lambda s: int(s.split(".")[1]))]
     out = {}
-    for tag, dt, auto in (("f32", torch.float32, False), ("bf16", torch.float32, True)):
-        if tag == "bf16" and a.skip_bf16:
-            continue
-        vae = AutoencoderKLHunyuanVideo.from_pretrained(f"{a.root}/vae", torch_dtype=torch.float32).to(dev).eval()
-        frames = []
-        t0 = time.time()
-        for lat in lats:
-            z = (lat.to(dev) / 0.476986).permute(3, 0, 1, 2).unsqueeze(0)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=auto):
-                frames.append(vae.decode(z.to(vae.dtype)).sample.float().cpu())
-        print(f"vae decode {tag} {time.time() - t0:.1f}s", flush=True)
-        out[f"frames_{tag}"] = torch.cat(frames, dim=2)[0]
+    # As the pipeline loads it: bf16 weights, the decode under bf16 autocast. An
+    # f32 decode does not fit 32 GB with the causal attention mask of a tile.
+    vae = AutoencoderKLHunyuanVideo.from_pretrained(f"{a.root}/vae", torch_dtype=torch.bfloat16).to(dev).eval()
+    frames = []
+    t0 = time.time()
+    for lat in lats:
+        z = (lat.to(dev) / 0.476986).permute(3, 0, 1, 2).unsqueeze(0)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            frames.append(vae.decode(z.to(vae.dtype)).sample.float().cpu())
+        print(f"vae decode chunk {time.time() - t0:.1f}s", flush=True)
+    out["frames_f32"] = torch.cat(frames, dim=2)[0]
     save_file({k: v.contiguous() for k, v in out.items()}, a.out)
     print("vae ok", {k: list(v.shape) for k, v in out.items()}, flush=True)
 

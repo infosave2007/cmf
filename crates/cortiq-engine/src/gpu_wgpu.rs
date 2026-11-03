@@ -19,6 +19,7 @@ use wgpu::util::DeviceExt;
 
 // Z-Image-Turbo device path (plan WP2) — child module, `gpu_wgpu/zimage.rs`.
 #[doc(hidden)]
+pub mod s2v;
 pub mod zimage;
 // Qwen-Image-2.1 denoiser and resident VAE decoder — child modules,
 // `gpu_wgpu/qi21.rs` and `gpu_wgpu/qi21_vae.rs`.

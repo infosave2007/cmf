@@ -867,6 +867,9 @@ pub enum Epi {
     /// carried a power-of-two range guard the nonlinearity must not see
     /// (Qwen-Image-2.1's FFN input, `gpu_wgpu/qi21.rs`).
     SwiGluIn,
+    /// `out[m][ocol+n]` f16 of `gelu(acc)` (erf form) · `oscale`: the
+    /// Kandinsky S2V feed-forward's hidden state.
+    Gelu,
 }
 
 impl Epi {
@@ -1002,7 +1005,7 @@ impl MmCfg {
         let nw = self.wm * self.wn;
         let sc = match self.epi {
             Epi::F32 => 0,
-            Epi::F16 => nw * 256 * 4,
+            Epi::F16 | Epi::Gelu => nw * 256 * 4,
             Epi::SwiGlu | Epi::SwiGluIn => nw * 512 * 4,
         };
         stage + sc
@@ -1105,7 +1108,7 @@ pub fn mm_src(g: MmCfg) -> String {
     match g.epi {
         _ if g.acc16_probe => {}
         Epi::F32 => {}
-        Epi::F16 => {
+        Epi::F16 | Epi::Gelu => {
             let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 256);
         }
         Epi::SwiGlu | Epi::SwiGluIn => {
@@ -1355,6 +1358,23 @@ pub fn mm_src(g: MmCfg) -> String {
                     let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0], 16u);");
                     let _ = writeln!(s, "  workgroupBarrier();");
                     let _ = writeln!(s, "  outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(sc[eb], sc[eb + 1u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 2u], sc[eb + 3u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 4u], sc[eb + 5u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 6u], sc[eb + 7u]) * p.oscale));", i * 16, j * 16);
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                }
+            }
+        }
+        Epi::Gelu => {
+            // As F16, the erf-form GELU in the lanes before the pack.
+            let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
+            let _ = writeln!(s, "  let lane = tid - sg * 32u;");
+            let _ = writeln!(s, "  let sb0 = sg * 256u;");
+            let _ = writeln!(s, "  let er = lane / 2u; let ec = (lane % 2u) * 8u; let eb = sb0 + er * 16u + ec;");
+            for i in 0..fm {
+                for j in 0..fnn {
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0], 16u);");
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                    let _ = writeln!(s, "  {{ var hv: array<f32, 8>;");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let v = sc[eb + e]; let z = abs(v) * 0.70710678; let t = 1.0 / (1.0 + 0.3275911 * z); let er2 = 1.0 - (((((1.0614054 * t - 1.4531521) * t) + 1.4214138) * t - 0.28449672) * t + 0.2548296) * t * exp(-z * z); hv[e] = 0.5 * v * (1.0 + select(er2, -er2, v < 0.0)) * p.oscale; }}");
+                    let _ = writeln!(s, "    outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(hv[0], hv[1])), pack2x16float(vec2<f32>(hv[2], hv[3])), pack2x16float(vec2<f32>(hv[4], hv[5])), pack2x16float(vec2<f32>(hv[6], hv[7]))); }}", i * 16, j * 16);
                     let _ = writeln!(s, "  workgroupBarrier();");
                 }
             }
@@ -2535,7 +2555,7 @@ impl Call {
     }
 }
 
-fn flash_calls(
+pub(super) fn flash_calls(
     c: &Ctx,
     f: FlashCfg,
     nh: usize,

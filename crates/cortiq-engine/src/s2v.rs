@@ -787,7 +787,7 @@ impl S2vDit {
         let pool = self.pool();
         let part = |lin: &Lin, data: &[f32], pt: usize, ps: usize, mask: usize| -> Vec<f32> {
             let (hh, ww) = (g.lh - g.lh % ps, g.lw - g.lw % ps);
-            let tok = crop_patchify(data, c, pt, ps, g.lh, g.lw, hh, ww);
+            let tok = patchify(data, c, pt, ps, hh, ww);
             let n = tok.len() / lin.w.cols();
             let mut y = lin.apply(&tok, n, pool);
             for row in y.chunks_exact_mut(h) {
@@ -803,6 +803,30 @@ impl S2vDit {
         out.extend(part(&self.emb_p1, i.mem1, 1, 2, 2));
         out.extend(part(&self.emb1, i.reference, 1, 2, 1));
         out.extend(part(&self.emb1, i.x, 1, 2, 0));
+        out
+    }
+
+    /// The clean rows of the visual stream, `[memory | ref]` embedded.
+    pub fn embed_clean(&self, reference: &[f32], memory: &[Vec<f32>; 3], g: &S2vGeom) -> Vec<f32> {
+        let (c, h) = (self.cfg.in_visual, self.cfg.dim);
+        let pool = self.pool();
+        let part = |lin: &Lin, data: &[f32], pt: usize, ps: usize, mask: usize| -> Vec<f32> {
+            let (hh, ww) = (g.lh - g.lh % ps, g.lw - g.lw % ps);
+            let tok = patchify(data, c, pt, ps, hh, ww);
+            let n = tok.len() / lin.w.cols();
+            let mut y = lin.apply(&tok, n, pool);
+            for row in y.chunks_exact_mut(h) {
+                for (v, &m) in row.iter_mut().zip(&self.mask[mask * h..(mask + 1) * h]) {
+                    *v += m;
+                }
+            }
+            y
+        };
+        let mut out = Vec::with_capacity(g.clean() * h);
+        out.extend(part(&self.emb_p4, &memory[2], 4, 8, 2));
+        out.extend(part(&self.emb_p2, &memory[1], 2, 4, 2));
+        out.extend(part(&self.emb_p1, &memory[0], 1, 2, 2));
+        out.extend(part(&self.emb1, reference, 1, 2, 1));
         out
     }
 
@@ -896,30 +920,6 @@ impl S2vDit {
         let y = self.out_w.apply(&xn, g.nvis, pool);
         Ok(unpatchify_out(&y, g, self.cfg.out_visual))
     }
-}
-
-fn crop_patchify(
-    data: &[f32],
-    c: usize,
-    pt: usize,
-    ps: usize,
-    lh: usize,
-    lw: usize,
-    hh: usize,
-    ww: usize,
-) -> Vec<f32> {
-    if hh == lh && ww == lw {
-        return patchify(data, c, pt, ps, lh, lw);
-    }
-    let frames = data.len() / (lh * lw * c);
-    let mut crop = Vec::with_capacity(frames * hh * ww * c);
-    for t in 0..frames {
-        for r in 0..hh {
-            let o = ((t * lh + r) * lw) * c;
-            crop.extend_from_slice(&data[o..o + ww * c]);
-        }
-    }
-    patchify(&crop, c, pt, ps, hh, ww)
 }
 
 fn add_assign(x: &mut [f32], y: &[f32]) {

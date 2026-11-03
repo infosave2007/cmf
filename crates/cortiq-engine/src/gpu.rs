@@ -5583,7 +5583,12 @@ pub fn s2v_prepare(
     ts: &[f32],
     sf: [f32; 3],
 ) -> Option<Box<dyn S2vStepper>> {
-    None
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v::prepare(dit, g, cond, ts, sf).map(|d| Box::new(d) as Box<dyn S2vStepper>),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
 }
 
 /// Frees what `s2v_prepare` kept on the device.
@@ -5598,5 +5603,15 @@ pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> O
 /// One forward on the device for the parity gate.
 #[allow(unused_variables)]
 pub fn s2v_check_forward(dit: &crate::s2v::S2vDit, i: &crate::s2v::S2vInput<'_>) -> Option<Vec<f32>> {
-    None
+    let cond = crate::s2vgen::S2vCond {
+        text: i.text_feats.to_vec(),
+        pooled: i.pooled.to_vec(),
+        audio: vec![i.audio_feats.to_vec()],
+        reference: i.reference.to_vec(),
+        height: i.geom.lh * 8,
+        width: i.geom.lw * 8,
+    };
+    let mut dev = s2v_prepare(dit, &i.geom, &cond, &[i.t], i.scale_factor)?;
+    let memory = [i.mem1.to_vec(), i.mem2.to_vec(), i.mem4.to_vec()];
+    dev.step(0, 0, i.x, &memory).ok()
 }
