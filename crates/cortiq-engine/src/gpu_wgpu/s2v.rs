@@ -819,6 +819,7 @@ pub fn prepare(
         ]
     };
     let mut visual_p: Vec<BlockP> = Vec::with_capacity(cfg.n_visual);
+    let mut v2a_rest: Vec<[u32; 6]> = Vec::with_capacity(cfg.n_visual);
     for (bi, b) in dit.visual.iter().enumerate() {
         let p = format!("dit.visual_transformer_blocks.{bi}");
         let (q, k, v, o) = attn_names(&format!("{p}.self_attention"))?;
@@ -855,20 +856,10 @@ pub fn prepare(
         let mut off = [0u32; 16];
         off[..6].copy_from_slice(&s);
         off[6..12].copy_from_slice(&ca);
-        off[12] = av2[0];
         off[13] = nw;
         off[14] = nb;
-        off[15] = keep_raw.len() as u32 - 1;
+        v2a_rest.push(av2);
         visual_p.push(BlockP { dq, off });
-        // The remaining speech parameters go into a parallel list below.
-        let _ = av2;
-    }
-    let mut v2a_rest: Vec<[u32; 6]> = Vec::with_capacity(cfg.n_visual);
-    for b in dit.visual.iter() {
-        v2a_rest.push(match &b.v2a {
-            Some((_, a)) => push_attn(&mut aux, a),
-            None => [0; 6],
-        });
     }
     let mut text_p = Vec::with_capacity(cfg.n_text);
     for (bi, b) in dit.text.iter().enumerate() {
@@ -942,7 +933,8 @@ pub fn prepare(
         sbuf_init(c, bytemuck::cast_slice(&v), "s2v_groups")
     };
     let groups_all = sbuf_init(c, bytemuck::cast_slice(&[0u32, nt as u32]), "s2v_gall");
-    let groups_small = sbuf_init(c, bytemuck::cast_slice(&[0u32, small as u32]), "s2v_gsm");
+    let groups_t = groups_all.clone();
+    let groups_a = sbuf_init(c, bytemuck::cast_slice(&[0u32, na as u32]), "s2v_gsm");
 
     let bld = Builder {
         c,
@@ -965,7 +957,7 @@ pub fn prepare(
     let mm32 = |a: MmArgs, p: &wgpu::Buffer, act: &wgpu::Buffer, o: &wgpu::Buffer| bld.mm(bld.tiles.1, a, p, act, o);
 
     // ── the short streams: one block program over `Seq` rows ──
-    let short_block = |s: &Seq, nrows: usize, off: [u32; 6], pre: (u32, u32), pre_ffn: (u32, u32), bias_gate: (u32, u32), modul: bool| -> Option<Vec<Op>> {
+    let short_block = |s: &Seq, nrows: usize, off: [u32; 6], pre: (u32, u32), pre_ffn: (u32, u32), bias_gate: (u32, u32), modul: bool, gr: &wgpu::Buffer| -> Option<Vec<Op>> {
         // pre: (shift word, scale word) or an affine (w, b) when unmodulated.
         let (mode_pre, sh, sc, af): (u32, (u32, u32), (u32, u32), (u32, u32)) = if modul {
             (8, (pre.0, pre.0), (pre.1, pre.1), (0, 0))
@@ -979,7 +971,7 @@ pub fn prepare(
         v.push(bld.norm_op(&s.qkv, s, nrows, 3 * h, 0, 3, off[0], off[2]));
         v.push(bld.norm_op(&s.qkv, s, nrows, 3 * h, h, 3, off[1], off[3]));
         v.push(bld.norm_op(&s.qkv, s, nrows, 3 * h, 2 * h, 0, 0, off[4]));
-        v.push(bld.xattn_op(&s.qkv, 3 * h, &s.qkv, 3 * h, h, 2 * h, &s.att, nrows, nrows, &groups_small));
+        v.push(bld.xattn_op(&s.qkv, 3 * h, &s.qkv, 3 * h, h, 2 * h, &s.att, nrows, nrows, gr));
         v.push(mm32(args(nrows, h, h, h, p2(qkv_sh)), &planes.o, &s.att, &s.br)?);
         let (gm, gs): (u32, (u32, u32)) = if modul { (2, (bias_gate.0, bias_gate.0)) } else { (0, (0, 0)) };
         let (mode_ffn, sh2, sc2, af2): (u32, (u32, u32), (u32, u32), (u32, u32)) = if modul {
@@ -1007,12 +999,13 @@ pub fn prepare(
             (text_mods(bi, 3), text_mods(bi, 4)),
             (text_mods(bi, 2), text_mods(bi, 5)),
             true,
+            &groups_t,
         )?;
         text_prog.push((dq, ops));
     }
     let mut audio_prog = Vec::with_capacity(cfg.n_audio);
     for (dq, off, n1, n2) in audio_p {
-        let ops = short_block(&s_small, na, off, n1, n2, (0, 0), false)?;
+        let ops = short_block(&s_small, na, off, n1, n2, (0, 0), false, &groups_a)?;
         audio_prog.push((dq, ops));
     }
     // Stream → f16 conditioning panel, with a row-op copy.
