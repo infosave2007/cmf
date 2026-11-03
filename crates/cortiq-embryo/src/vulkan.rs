@@ -43,7 +43,8 @@ struct BufInner {
 }
 
 struct TsState {
-    query_set: wgpu::QuerySet,
+    // wgpu caps a query set at 4096 entries; a full step takes more pairs.
+    query_sets: Vec<wgpu::QuerySet>,
     resolve: wgpu::Buffer,
     stage: wgpu::Buffer,
     period_ns: f32,
@@ -69,6 +70,8 @@ struct CtxInner {
     /// outputs per lane; on by default for M, N % 128, K % 16
     /// (`CMF_VULKAN_GEMM128=0` falls back to `gemm64` / the tile path).
     pipeline128: Arc<wgpu::ComputePipeline>,
+    /// A GB202-class chip: about 2× the SMs of the 84-SM part the GEMM thresholds were tuned on.
+    big_gpu: bool,
     gemm128: bool,
     /// RMSNorm backward entries (ids 5 = per-row dx, 6 = per-column dW).
     pipeline_rms_dx: Arc<wgpu::ComputePipeline>,
@@ -224,6 +227,10 @@ fn init() -> Result<Ctx, String> {
     let pipeline_gdn_fwd = entry_pipeline("gdn_fwd");
     let pipeline_gdn_bwd = entry_pipeline("gdn_bwd");
     let pipeline128 = entry_pipeline("gemm128");
+    let big_gpu = {
+        let name = adapter.get_info().name;
+        name.contains("RTX PRO 6000") || name.contains("RTX 5090")
+    };
     let pipeline_rms_dx = entry_pipeline("rms_bwd_dx");
     let pipeline_rms_dw = entry_pipeline("rms_dw");
     let pipeline_wy_norm = entry_pipeline("wy_norm_rows");
@@ -256,15 +263,19 @@ fn init() -> Result<Ctx, String> {
     let profile_ops = std::env::var("CMF_VULKAN_PROFILE_OPS").ok().as_deref() == Some("1");
     // Profiling is intentionally opt-in: it splits the command pass and
     // performs a tiny mapped readback after each commit, so it must never be
-    // part of the resident training path.  2048 pairs cover the observed
-    // full Embryo graph (829 operations at B1T64).
+    // part of the resident training path.  32768 pairs cover a full step
+    // (about 6500 operations at B8 T1024).
     let ts = want_ts.then(|| {
-        const MAX_PAIRS: u32 = 2048;
-        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("embryo-op-timestamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: MAX_PAIRS * 2,
-        });
+        const MAX_PAIRS: u32 = 32768;
+        let query_sets = (0..MAX_PAIRS / TS_SET_PAIRS as u32)
+            .map(|_| {
+                device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("embryo-op-timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: TS_SET_PAIRS as u32 * 2,
+                })
+            })
+            .collect();
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("embryo-op-timestamp-resolve"),
             size: (MAX_PAIRS as u64) * 2 * 8,
@@ -278,7 +289,7 @@ fn init() -> Result<Ctx, String> {
             mapped_at_creation: false,
         });
         TsState {
-            query_set,
+            query_sets,
             resolve,
             stage,
             period_ns: queue.get_timestamp_period(),
@@ -293,6 +304,7 @@ fn init() -> Result<Ctx, String> {
             pipelines: Mutex::new(HashMap::new()),
             pipeline64: Arc::new(pipeline64),
             pipeline128: Arc::new(pipeline128),
+            big_gpu,
             gemm128,
             pipeline_rms_dx: Arc::new(pipeline_rms_dx),
             pipeline_rms_dw: Arc::new(pipeline_rms_dw),
@@ -924,7 +936,7 @@ impl<'a> Cmd<'a> {
         let ok128 = self.c.inner.gemm128 && m % 128 == 0 && n % 128 == 0 && k % 16 == 0 && k > 0 && table.is_none();
         let ok64 = self.c.inner.gemm64 && m % 64 == 0 && n % 64 == 0 && k % 32 == 0 && k > 0 && table.is_none();
         let tiles128 = (m / 128) * (n / 128) * batches;
-        if ok128 && (tiles128 >= GEMM128_MIN_TILES || !ok64 || band.is_some()) {
+        if ok128 && (tiles128 >= gemm128_min_tiles(self.c.inner.big_gpu) || !ok64 || band.is_some()) {
             if let Some(bd) = band {
                 p[38] = bd.mode as u32;
                 p[39] = bd.lo as u32;
@@ -949,8 +961,8 @@ impl<'a> Cmd<'a> {
             // only for A-transposed GEMMs (weight gradients: the reduction runs
             // over the tokens, the output has no batch rows), so a token
             // row's result never depends on the batch shape
-            let split = if ta == Op::T && batches == 1 && dynamic.indirect.is_none() && k >= 1024 && groups < GEMM_SPLIT_TILES {
-                let want = GEMM_SPLIT_TILES.div_ceil(groups).min(k / 256).max(1);
+            let split = if ta == Op::T && batches == 1 && dynamic.indirect.is_none() && k >= 1024 && groups < gemm_split_tiles(self.c.inner.big_gpu) {
+                let want = gemm_split_tiles(self.c.inner.big_gpu).div_ceil(groups).min(k / 256).max(1);
                 let kslice = k.div_ceil(want).div_ceil(32) * 32;
                 k.div_ceil(kslice).max(1)
             } else {
@@ -2612,6 +2624,43 @@ impl<'a> Cmd<'a> {
         assign: &GBuf,
         res: &GBuf,
     ) {
+        // The per-row reduction re-reads x, mu and U for every rank and is bound by the bus.
+        // The same residual from products: |x-mu|^2 - sum((x-mu)·u)^2 with x·U and x·mu by GEMM.
+        let ek = r.e * r.k;
+        let off_s = r.rows * ek;
+        let off_m = off_s + r.rows * r.e;
+        let s = self.splitk_scratch(off_m + ek + r.e);
+        self.gemm(Op::N, Op::T, r.rows, ek, r.h, 1.0, x, 0, r.h, u, uoff, r.h, 0.0, &s, 0, ek);
+        self.gemm(Op::N, Op::T, r.rows, r.e, r.h, 1.0, x, 0, r.h, mu, muoff, r.h, 0.0, &s, off_s, r.e);
+        let mut p = vec![0; PARAM_WORDS];
+        p[1] = r.rows as u32;
+        p[2] = r.h as u32;
+        p[3] = r.e as u32;
+        p[4] = r.k as u32;
+        p[5] = muoff as u32;
+        p[6] = uoff as u32;
+        p[7] = eoff as u32;
+        p[8] = off_s as u32;
+        p[9] = off_m as u32;
+        self.rec(OP_ROUTE_MU, &[(mu, 0), (u, 1), (&s, 2)], p.clone(), ek + r.e);
+        self.rec(OP_ROUTE_FIN, &[(x, 0), (&s, 1), (bias, 2), (assign, 3), (res, 4)], p, r.rows);
+    }
+    /// The per-row reduction, kept as the reference of the products in `route`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn route_rows(
+        &self,
+        r: &RouteDims,
+        x: &GBuf,
+        mu: &GBuf,
+        muoff: usize,
+        u: &GBuf,
+        uoff: usize,
+        bias: &GBuf,
+        eoff: usize,
+        assign: &GBuf,
+        res: &GBuf,
+    ) {
         let mut p = vec![0; PARAM_WORDS];
         p[1] = r.rows as u32;
         p[2] = r.h as u32;
@@ -2625,7 +2674,7 @@ impl<'a> Cmd<'a> {
             &[(x, 0), (mu, 1), (u, 2), (bias, 3), (assign, 4), (res, 5)],
             p,
             r.rows,
-        )
+        );
     }
     pub fn route_smooth_k4(
         &self,
@@ -3333,8 +3382,12 @@ impl<'a> Cmd<'a> {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_dlg(&self, d: &GdnScanDims, dqn: &GBuf, dkn: &GBuf, dqg: &GBuf, dkg: &GBuf, qn: &GBuf, kn: &GBuf, drho: &GBuf, dlgm: &GBuf, dgend: &GBuf, rho: &GBuf, gam: &GBuf, dla: &GBuf) {
+        let _ = (dqn, dkn);
         let pp = Self::wy_p(d);
-        self.rec(OP_WY_DLG, &[(dqn, 0), (dkn, 1), (dqg, 2), (dkg, 3), (qn, 4), (kn, 5), (drho, 6), (dlgm, 7), (dgend, 8), (rho, 9), (gam, 10), (dla, 11)], pp, d.b * d.nv * (d.t / 64))
+        // A thread per (row, head) for the long dots fills the GPU; the chunk scan is then short.
+        let dots = self.splitk_scratch(d.b * d.nv * d.t);
+        self.rec(OP_WY_DLG_DOT, &[(&dots, 0), (dqg, 2), (dkg, 3), (qn, 4), (kn, 5)], pp.clone(), d.b * d.t * d.nv);
+        self.rec(OP_WY_DLG, &[(&dots, 0), (drho, 6), (dlgm, 7), (dgend, 8), (rho, 9), (gam, 10), (dla, 11)], pp, d.b * d.nv * (d.t / 64))
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_dscal(&self, d: &GdnScanDims, dla: &GBuf, a_pre: &GBuf, p: &GBuf, alog_off: usize, dt_off: usize, dbet: &GBuf, bet: &GBuf, da: &GBuf, db: &GBuf, part: &GBuf, beta_one: bool) {
@@ -3412,7 +3465,7 @@ impl<'a> Cmd<'a> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("embryo-train-submit"),
             });
-        const TS_MAX_PAIRS: usize = 2048;
+        const TS_MAX_PAIRS: usize = 32768;
         // Timestamp staging/query resources are process-wide and native tests
         // may issue independent commands from multiple threads. Serialize
         // only this opt-in diagnostic path; normal training never touches it.
@@ -3444,9 +3497,9 @@ impl<'a> Cmd<'a> {
                 };
                 let timestamp_writes =
                     (i < TS_MAX_PAIRS).then_some(wgpu::ComputePassTimestampWrites {
-                        query_set: &ts.query_set,
-                        beginning_of_pass_write_index: Some((2 * i) as u32),
-                        end_of_pass_write_index: Some((2 * i + 1) as u32),
+                        query_set: &ts.query_sets[i / TS_SET_PAIRS],
+                        beginning_of_pass_write_index: Some((2 * (i % TS_SET_PAIRS)) as u32),
+                        end_of_pass_write_index: Some((2 * (i % TS_SET_PAIRS) + 1) as u32),
                     });
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("embryo-op-profile"),
@@ -3464,7 +3517,15 @@ impl<'a> Cmd<'a> {
             }
             let n = ops.len().min(TS_MAX_PAIRS);
             if n > 0 {
-                enc.resolve_query_set(&ts.query_set, 0..(2 * n) as u32, &ts.resolve, 0);
+                for k in 0..n.div_ceil(TS_SET_PAIRS) {
+                    let used = (n - k * TS_SET_PAIRS).min(TS_SET_PAIRS);
+                    enc.resolve_query_set(
+                        &ts.query_sets[k],
+                        0..(2 * used) as u32,
+                        &ts.resolve,
+                        (k * TS_SET_PAIRS * 2 * 8) as u64,
+                    );
+                }
                 enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.stage, 0, (2 * n * 8) as u64);
             }
         } else {
@@ -3534,6 +3595,8 @@ impl<'a> Cmd<'a> {
                         .get_mapped_range(..bytes)
                         .expect("timestamp readback");
                     let raw: &[u64] = bytemuck::cast_slice(&mapped);
+                    let span = raw[2 * n - 1].saturating_sub(raw[0]) as f64 * ts.period_ns as f64 / 1.0e6;
+                    eprintln!("vulkan commit-ts ops={} measured={n} span_ms={span:.3}", ops.len());
                     let mut totals = HashMap::<u32, (f64, usize)>::new();
                     // GEMMs also by (entry, transposes, M, N, K, batches)
                     let mut gemms = HashMap::<[u32; 7], (f64, usize)>::new();
@@ -3751,13 +3814,22 @@ pub struct RouteDims {
 }
 
 // Operation numbers shared with the WGSL switch.
+const TS_SET_PAIRS: usize = 2048;
 const OP_NOOP: u32 = 0;
 const OP_GEMM: u32 = 1;
 /// `gemm128` below this many output tiles (all batches) leaves the GPU's
 /// SMs idle; such GEMMs take the 64×64 entry instead.
-const GEMM128_MIN_TILES: usize = 160;
-/// Output tiles (64×64) a split-K GEMM aims for (~4 per SM on an 84-SM part).
-const GEMM_SPLIT_TILES: usize = 336;
+fn gemm128_min_tiles(big: bool) -> usize {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("CMF_VULKAN_GEMM128_MIN_TILES").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(if big { 400 } else { 160 })
+}
+/// Output tiles (64×64) a split-K GEMM aims for (~4 per SM).
+fn gemm_split_tiles(big: bool) -> usize {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("CMF_VULKAN_GEMM_SPLIT_TILES").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(if big { 752 } else { 336 })
+}
 const OP_AXPBY: u32 = 2;
 const OP_ADAMW: u32 = 3;
 const OP_SUMSQ: u32 = 4;
@@ -3787,6 +3859,7 @@ const OP_HK_PHI: u32 = 27;
 const OP_HK_KV: u32 = 28;
 const OP_HK_FWD: u32 = 29;
 const OP_HK_BWD: u32 = 30;
+#[cfg(test)]
 const OP_ROUTE: u32 = 31;
 const OP_ROUTE_GROUP: u32 = 32;
 const OP_MOE_GATHER: u32 = 33;
@@ -3842,6 +3915,9 @@ const OP_BLOCK_COPY: u32 = 79;
 const OP_WY_DGEND_FOLD: u32 = 80;
 const OP_SPLITK_FOLD: u32 = 81;
 const OP_SCATTER_UNIQUE: u32 = 82;
+const OP_ROUTE_MU: u32 = 83;
+const OP_ROUTE_FIN: u32 = 84;
+const OP_WY_DLG_DOT: u32 = 85;
 
 /// WGSL source.  Input/output storage buffers all use u32 words so a single
 /// bind layout can serve f32 and token/index operations without host copies.
@@ -4743,12 +4819,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
    a[z]=WF(select(0.0,AF(z)*G,ii>=jj));b[z]=WF(select(0.0,BF(z)*G*DF(tj),ii>jj));return;}
  // op 75: per-(b,h,chunk) decay gradient: dlg_i = γ_i(dQγ_i·q̂_i + dKγ_i·k̂_i) + dlgm_i − dρ_i ρ_i (+ Σ_j dρ_j ρ_j + γ_end dgend at i = 63); dla = reverse cumsum.
  //        a=dqn b=dkn c=dqg d=dkg e=qn f=kn g=drho h=dlgm i=dgend j=rho k=gam l=dla
- if(op==75u){let nch=U(8u);let T=U(2u);let nv=U(3u);let dk=U(4u);if(z>=U(1u)*nv*nch){return;}let bh=z/nch;let cc=z%nch;let bb=bh/nv;let hh=bh%nv;
+ // op 85: per-(row,head) dots of op 75: a[(b,h,t)] = dqg·qn + dkg·kn. c=dqg d=dkg e=qn f=kn
+ if(op==85u){let T=U(2u);let nv=U(3u);let dk=U(4u);if(z>=U(1u)*T*nv){return;}let row=z/nv;let hh=z%nv;let bb=row/T;let t=row%T;var gq=0.0;var gk=0.0;
+   for(var dd=0u;dd<dk;dd=dd+1u){let o=row*nv*dk+hh*dk+dd;gq=gq+CF(o)*EF(o);gk=gk+DF(o)*FF(o);}
+   a[(bb*nv+hh)*T+t]=WF(gq+gk);return;}
+ // op 83: mu·U of the same expert, then |mu|^2. a=mu b=u c=scratch
+ if(op==83u){let hh=U(2u);let ee=U(3u);let kk=U(4u);let om=U(9u);if(z>=ee*kk+ee){return;}
+   var acc=0.0;
+   if(z<ee*kk){let q=z/kk;let qi=z%kk;for(var col=0u;col<hh;col=col+1u){acc=acc+AF(U(5u)+q*hh+col)*BF(U(6u)+(q*kk+qi)*hh+col);}}
+   else{let q=z-ee*kk;for(var col=0u;col<hh;col=col+1u){let v=AF(U(5u)+q*hh+col);acc=acc+v*v;}}
+   c[om+z]=WF(acc);return;}
+ // op 84: best expert per row from the products. a=x b=scratch c=bias d=assign e=res
+ if(op==84u){if(z>=U(1u)){return;}let row=z;let hh=U(2u);let ee=U(3u);let kk=U(4u);let os=U(8u);let om=U(9u);
+   var n2=0.0;for(var col=0u;col<hh;col=col+1u){let v=AF(row*hh+col);n2=n2+v*v;}
+   var best=3.4e38;var best_raw=0.0;var bi=0u;
+   for(var q=0u;q<ee;q=q+1u){var proj=0.0;
+     for(var qi=0u;qi<kk;qi=qi+1u){let ix=q*kk+qi;let pp=BF(row*ee*kk+ix)-BF(om+ix);proj=proj+pp*pp;}
+     let raw=n2-2.0*BF(os+row*ee+q)+BF(om+ee*kk+q)-proj;let score=raw-CF(U(7u)+q);
+     if(score<best){best=score;best_raw=raw;bi=q;}}
+   d[row]=bi;e[row]=WF(best_raw);return;}
+ if(op==75u){let nch=U(8u);let T=U(2u);let nv=U(3u);if(z>=U(1u)*nv*nch){return;}let bh=z/nch;let cc=z%nch;
    var srho=0.0;for(var ii=0u;ii<64u;ii=ii+1u){let t=bh*T+cc*64u+ii;srho=srho+GF(t)*JF(t);}
    var acc=0.0;
-   for(var ir=64u;ir>0u;ir=ir-1u){let ii=ir-1u;let t=cc*64u+ii;let tt=bh*T+t;let row=bb*T+t;var gq=0.0;var gk=0.0;
-     for(var dd=0u;dd<dk;dd=dd+1u){let o=row*nv*dk+hh*dk+dd;gq=gq+CF(o)*EF(o);gk=gk+DF(o)*FF(o);}
-     var dlg=KF(tt)*(gq+gk)+HF(tt)-GF(tt)*JF(tt);if(ii==63u){dlg=dlg+srho+KF(tt)*IF(bh*nch+cc);}
+   for(var ir=64u;ir>0u;ir=ir-1u){let ii=ir-1u;let t=cc*64u+ii;let tt=bh*T+t;
+     var dlg=KF(tt)*AF(tt)+HF(tt)-GF(tt)*JF(tt);if(ii==63u){dlg=dlg+srho+KF(tt)*IF(bh*nch+cc);}
      acc=acc+dlg;l[tt]=WF(acc);}
    return;}
  // op 76: per-(b,h): da = dla·(−e^A σ(a+dt)), db = dβ·β(1−β), part = (Σ dla·(−e^A sp), Σ da). a=dla b=a_pre c=p d=dbet e=bet f=da g=db h=part; U11=β≡1
@@ -4883,6 +4977,48 @@ impl Ctx {
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
+
+    /// The residual from products picks the same expert as the per-row reduction.
+    #[test]
+    fn native_vulkan_route_products_match_rows() {
+        let c = ctx().expect("native Vulkan adapter is required for this test");
+        let (rows, h, e, k) = (256usize, 128usize, 4usize, 16usize);
+        // Xorshift: a fixed stream, the test needs no RNG dependency.
+        let mut st = 0x2545f491u32;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            (st as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let x: Vec<f32> = (0..rows * h).map(|_| rnd()).collect();
+        let mu: Vec<f32> = (0..e * h).map(|_| 0.2 * rnd()).collect();
+        let u: Vec<f32> = (0..e * k * h).map(|_| 0.09 * rnd()).collect();
+        let bias: Vec<f32> = (0..e).map(|_| 0.01 * rnd()).collect();
+        let (gx, gmu, gu, gb) = (
+            GBuf::from_slice(c, &x),
+            GBuf::from_slice(c, &mu),
+            GBuf::from_slice(c, &u),
+            GBuf::from_slice(c, &bias),
+        );
+        let r = RouteDims { rows, h, e, k, cap: rows };
+        let (a0, r0, a1, r1) = (
+            GBuf::zeros(c, rows),
+            GBuf::zeros(c, rows),
+            GBuf::zeros(c, rows),
+            GBuf::zeros(c, rows),
+        );
+        let cmd = Cmd::new(c);
+        cmd.route_rows(&r, &gx, &gmu, 0, &gu, 0, &gb, 0, &a0, &r0);
+        cmd.route(&r, &gx, &gmu, 0, &gu, 0, &gb, 0, &a1, &r1);
+        cmd.commit();
+        let (a0, r0, a1, r1) = (a0.to_vec(), r0.to_vec(), a1.to_vec(), r1.to_vec());
+        let flips = a0.iter().zip(&a1).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+        let worst = r0.iter().zip(&r1).map(|(p, q)| (p - q).abs() / p.abs().max(1e-3)).fold(0f32, f32::max);
+        eprintln!("route products: {flips} flips of {rows}, worst relative residual {worst:.2e}");
+        assert_eq!(flips, 0);
+        assert!(worst < 1e-3, "worst relative residual {worst}");
+    }
 
     #[test]
     fn native_vulkan_gemm_and_adamw_change_device_state() {

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Embryo trainer on Vulkan: a 340M step at B8 T1024 goes from 1340 to 1003 ms on an RTX PRO 6000. Routing takes its residual from GEMM products instead of a long per-row reduction, the DLG dots run in their own pass, and the GEMM tile thresholds follow the chip. `CMF_VULKAN_OP_TS=1` now covers a whole step.
+
 ## [0.8.54] — 2026-11-02
 
 ### Added
