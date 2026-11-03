@@ -179,7 +179,12 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     let q8 = Codec::Q(convert::Quant::Q8_2f);
     let (ts, size) = st_header(&dit_file)?;
     for (ti, t) in ts.iter().enumerate() {
+        // The speech and prompt towers run a handful of tokens through blocks
+        // shared by every frame: at q4tp the speech stream leaves its four
+        // blocks 78 % away from the reference (measured), so they stay 8-bit.
+        let tower = t.name.starts_with("text_transformer_blocks") || t.name.starts_with("audio_transformer_blocks");
         let codec = match dit_family(&t.name, &t.shape) {
+            Fam::Proj if tower && matches!(o.dit, Codec::Q(_)) => q8,
             Fam::Proj if dit_keep_match(&t.name, &o.dit_keep) => q8,
             Fam::Proj => o.dit,
             Fam::Keep16 => keep16(t),

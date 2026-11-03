@@ -237,16 +237,29 @@ pub fn cmd_s2v_check(model: &str, stage: &str, oracle: &str, extra: Option<&str>
                     }
                 }
             };
-            let out = dit.forward(&i, Some(&mut tap)).map_err(|e| anyhow!(e))?;
-            println!(
-                "forward ({:.1}s, {} tokens): out rel {:.3e}, worst block {worst:.3e}",
-                t0.elapsed().as_secs_f64(),
-                g.total(),
-                rel(&out, &get(&st, "out")?.data)
-            );
-            let dev = cortiq_engine::s2v_check_device(&dit, &i);
-            if let Some(devo) = dev {
-                println!("device out rel to oracle {:.3e}, to host {:.3e}", rel(&devo, &get(&st, "out")?.data), rel(&devo, &out));
+            let host = if std::env::var("CMF_S2V_NO_HOST").is_ok() {
+                None
+            } else {
+                let out = dit.forward(&i, Some(&mut tap)).map_err(|e| anyhow!(e))?;
+                println!(
+                    "forward ({:.1}s, {} tokens): out rel {:.3e}, worst block {worst:.3e}",
+                    t0.elapsed().as_secs_f64(),
+                    g.total(),
+                    rel(&out, &get(&st, "out")?.data)
+                );
+                Some(out)
+            };
+            let t0 = std::time::Instant::now();
+            match cortiq_engine::s2v_check_device(&dit, &i) {
+                Some(devo) => {
+                    println!(
+                        "device ({:.2}s): out rel to oracle {:.3e}, to host {:.3e}",
+                        t0.elapsed().as_secs_f64(),
+                        rel(&devo, &get(&st, "out")?.data),
+                        host.as_ref().map_or(f64::NAN, |h| rel(&devo, h))
+                    );
+                }
+                None => println!("no device path"),
             }
         }
         "sched" => {

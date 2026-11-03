@@ -712,7 +712,8 @@ pub fn prepare(
     let nt = cond.text.len() / cfg.in_text;
     let na = cond.audio[0].len() / cfg.in_audio;
     let small = nt.max(na);
-    if nt > 512 || m > 70000 {
+    if nt > 512 || m > 70000 || m % 16 != 0 {
+        eprintln!("s2v: no device path for {m} tokens and {nt} prompt tokens: running on the CPU");
         return None;
     }
     let mp = pad_rows(m);
