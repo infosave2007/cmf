@@ -619,7 +619,11 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         let m = m0;
         let mp = mp0;
         let pf = h0 * w0;
-        r.gn(&x, None, &at.gn, f0, pf, cc, false, &xn)?;
+        // Small buffers of their own: `xn` and `h` are sized for the last stages
+        // and can be past a binding as a whole.
+        let xa = sbuf(c, ((mp + 128) * cc * 2) as u64, "s2v_xa");
+        let ha = sbuf(c, ((mp + 128) * cc * 2) as u64, "s2v_ha");
+        r.gn(&x, None, &at.gn, f0, pf, cc, false, &xa)?;
         let q16 = sbuf(c, (mp * cc * 2) as u64, "s2v_q");
         let k16 = sbuf(c, (mp * cc * 2) as u64, "s2v_k");
         let o32 = sbuf(c, (mp * cc * 4) as u64, "s2v_o");
@@ -629,7 +633,7 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
         // q and k as plain GEMMs with their bias, f16.
         for (cv, dst) in [(&at.q, &q16), (&at.k, &k16)] {
             let a = MmArgs { m: m as u32, n: cc as u32, k: cc as u32, ldo: cc as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
-            r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F32), &a, &cv.plane, &xn, &q32)?));
+            r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F32), &a, &cv.plane, &xa, &q32)?));
             let u = ubuf(c, &[m as u32, cc as u32, 1, 0]);
             let b = bg(c, &cast, &[&q32, &cv.bias, dst, &u]);
             r.ops.push(Op::D(cast.clone(), b, grid1(m * cc / 4)));
@@ -647,18 +651,18 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
             r.ops.push(Op::D(pipe, b, ((pf as u32).min(65535), (pf as u32).div_ceil(65535), 1)));
             // Vᵀ of the live keys: Wv·xnᵀ.
             let a = MmArgs { m: cc as u32, n: live as u32, k: cc as u32, ldo: live as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
-            r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F16), &a, &xn, &at.vw, &vt16)?));
+            r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F16), &a, &xa, &at.vw, &vt16)?));
             let a = MmArgs { m: pf as u32, n: cc as u32, k: live as u32, ldo: cc as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
             let off = (fr * pf * cc * 4) as u64;
             r.ops.push(Op::M(mm_off(c, default_cfg(Epi::F32), &a, &vt16, &pr, &o32, off, (pf * cc * 4) as u64)?));
         }
         let u = ubuf(c, &[mp as u32, cc as u32, 1, 0]);
-        let b = bg(c, &cast, &[&o32, &at.vb, &xn, &u]);
+        let b = bg(c, &cast, &[&o32, &at.vb, &xa, &u]);
         r.ops.push(Op::D(cast.clone(), b, grid1(mp * cc / 4)));
         let a = MmArgs { m: m as u32, n: cc as u32, k: cc as u32, ldo: cc as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
-        r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F16), &a, &at.o.plane, &xn, &hb)?));
-        r.combine(&x, &hb, &at.o.bias, None, 0, f0, pf, cc)?;
-        keep.extend([q16, k16, o32, vt16, q32, sc, pr]);
+        r.ops.push(Op::M(mm_call(c, default_cfg(Epi::F16), &a, &at.o.plane, &xa, &ha)?));
+        r.combine(&x, &ha, &at.o.bias, None, 0, f0, pf, cc)?;
+        keep.extend([q16, k16, o32, vt16, q32, sc, pr, xa, ha]);
     }
     ch = r.resnet(&d.mid.r1, f0, h0, w0, ch)?;
     let (mut ff, mut hh, mut ww) = (f0, h0, w0);
@@ -680,7 +684,8 @@ fn build_prog(c: &Ctx, d: &VDev, f0: usize, h0: usize, w0: usize) -> Option<Prog
     r.conv(&d.conv_out, &xn, ff, hh, ww, (false, false), &hb)?;
     let out = sbuf(c, (3 * m * 4) as u64, "s2v_vout");
     let u = ubuf(c, &[m as u32, d.conv_out.cout_p as u32, 0, 0]);
-    r.k("s2v_vout", OUT_SRC, "s2v_vout", &[&hb, &d.conv_out.bias, &out, &u], grid1(m))?;
+    let hsize = (m * d.conv_out.cout_p * 2) as u64;
+    r.kw("s2v_vout", OUT_SRC, "s2v_vout", &[(&hb, 0, hsize), (&d.conv_out.bias, 0, 0), (&out, 0, 0), (&u, 0, 0)], grid1(m))?;
     let bytes = (3 * m * 4) as u64;
     let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("s2v_vstage"),
