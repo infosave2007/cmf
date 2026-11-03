@@ -784,7 +784,15 @@ pub fn prepare(
 
     // ── per-block parameters and resident raw weights ──
     let t0 = Instant::now();
-    let tiles = (default_cfg(Epi::F16), default_cfg(Epi::F32), default_cfg(Epi::Gelu));
+    let w1_tile = std::env::var("CMF_S2V_TILE_W1")
+        .ok()
+        .and_then(|s| {
+            let v: Vec<u32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            (v.len() == 5).then(|| MmCfg::new(v[0], v[1], v[2], v[3], v[4], Epi::Gelu))
+        })
+        .filter(|g| g.valid())
+        .unwrap_or_else(|| default_cfg(Epi::Gelu));
+    let tiles = (default_cfg(Epi::F16), default_cfg(Epi::F32), w1_tile);
     let flash = default_flash();
     let s_vis = Seq::new(c, m, h, ff, "s2v_v");
     let s_small = Seq::new(c, small, h, ff, "s2v_t");
@@ -1152,19 +1160,22 @@ pub fn prepare(
 }
 
 impl S2vDev {
-    /// `CMF_S2V_CLASS=1`: time every op of two visual blocks (one with the
-    /// speech adapter), one submission each, once.
+    /// `CMF_S2V_CLASS=1`: time every op of two visual blocks (one with the speech
+    /// adapter), one submission each, the second of two runs. `=exit` stops there.
     fn class_profile(&self) {
         let mut by: std::collections::BTreeMap<String, f64> = Default::default();
-        let idx = [0usize, 1usize];
-        for &b in &idx {
+        for b in [0usize, 1usize] {
             let (dq, ops) = &self.visual_prog[b];
             for op in dq.iter().chain(ops.iter()) {
-                let t0 = Instant::now();
-                let cb = encode_ops(self.c, &[std::slice::from_ref(op)]);
-                self.c.queue.submit(Some(cb));
-                super::zimage::wait(self.c);
-                *by.entry(op.class()).or_default() += t0.elapsed().as_secs_f64();
+                let mut t = 0.0;
+                for _ in 0..2 {
+                    let t0 = Instant::now();
+                    let cb = encode_ops(self.c, &[std::slice::from_ref(op)]);
+                    self.c.queue.submit(Some(cb));
+                    super::zimage::wait(self.c);
+                    t = t0.elapsed().as_secs_f64();
+                }
+                *by.entry(op.class()).or_default() += t;
             }
         }
         let tot: f64 = by.values().sum();
@@ -1172,6 +1183,9 @@ impl S2vDev {
             eprintln!("  {k:<22} {:>9.1} ms  {:>5.1} %", v * 1e3, v / tot * 100.0);
         }
         eprintln!("  two blocks: {:.1} ms", tot * 1e3);
+        if std::env::var("CMF_S2V_CLASS").as_deref() == Ok("exit") {
+            std::process::exit(0);
+        }
     }
 
     fn submit_blocks(&self, blocks: &[(Vec<Op>, Vec<Op>)]) {
