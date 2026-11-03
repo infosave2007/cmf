@@ -648,6 +648,10 @@ fn raw_block(c: &Ctx, model: &Arc<CmfModel>, items: &[RawT], planes: &[&wgpu::Bu
             c.queue.write_buffer(&raw, o as u64, &v);
         }
     }
+    // Flush the staged writes: left to the first real submit they pile up in
+    // host-visible memory, 22 GB of them before the first dispatch.
+    c.queue.submit(std::iter::empty());
+    super::zimage::wait(c);
     let dq4 = pipeline(c, "s2v_dq4", DQ4_SRC, "s2v_dq4")?;
     let dq8 = pipeline(c, "s2v_dq8", DQ8_SRC, "s2v_dq8")?;
     let mut ops = Vec::with_capacity(items.len());
@@ -907,6 +911,15 @@ pub fn prepare(
     let out_b = lin_bias(&dit.out_w);
     let aux_buf = sbuf_init(c, bytemuck::cast_slice(&aux.0), "s2v_aux");
     crate::s2vgen::prof("raw weights", t0);
+    if std::env::var("CMF_S2V_PROF").is_ok() {
+        let l = c.device.limits();
+        eprintln!(
+            "s2v device: binding limit {} MB, buffer limit {} MB, raw weights {:.1} GB",
+            l.max_storage_buffer_binding_size >> 20,
+            l.max_buffer_size >> 20,
+            raw_total as f64 / 1e9
+        );
+    }
 
     // ── conditioning streams ──
     let ntp = small;

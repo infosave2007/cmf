@@ -383,6 +383,11 @@ impl S2vVae {
         })
     }
 
+    /// The post-quant conv alone, on the host (16 channels into a 1×1 conv).
+    pub(crate) fn post_quant_host(&self, z: &Vol) -> Vol {
+        self.post_quant.forward(z, self.pool.as_deref())
+    }
+
     /// One temporal tile through the decoder (post-quant conv included).
     fn decode_tile(&self, z: &Vol) -> Vol {
         let pool = self.pool.as_deref();

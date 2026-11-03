@@ -1083,7 +1083,34 @@ pub fn mm_src(g: MmCfg) -> String {
         }
     }
     let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: MmP;");
-    if g.conv != 0 {
+    if g.conv == 3 {
+        // 3×3×3 causal conv over an `[F·H·W][C]` volume: `y` counts F·H rows,
+        // replicate padding (two frames in front), and the nearest upsample
+        // of the source folded in (`arow`: frames | up-space << 16 | up-time << 17).
+        let _ = writeln!(
+            s,
+            "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
+  let k0 = kt * {bk}u;
+  let tap = k0 / p.cin;
+  let ci = k0 - tap * p.cin + vc * 4u;
+  let cf = i32(p.arow & 0xFFFFu);
+  let us = (p.arow >> 16u) & 1u;
+  let ut = (p.arow >> 17u) & 1u;
+  let fr = y / i32(p.ch);
+  let ro = y % i32(p.ch);
+  let sf = clamp(fr + i32(tap / 9u) - 2, 0, cf - 1);
+  let sy = clamp(ro + i32((tap / 3u) % 3u) - 1, 0, i32(p.ch) - 1);
+  let sx = clamp(x + i32(tap % 3u) - 1, 0, i32(p.cw) - 1);
+  var tf = u32(sf);
+  if (ut != 0u && tf > 0u) {{ tf = (tf - 1u) / 2u + 1u; }}
+  let scw = p.cw >> us;
+  let sch = p.ch >> us;
+  let src = (tf * sch + (u32(sy) >> us)) * scw + (u32(sx) >> us);
+  return act[(src * p.cin + ci) / 4u];
+}}",
+            bk = g.bk
+        );
+    } else if g.conv != 0 {
         let up = if g.conv == 2 { 1 } else { 0 };
         let _ = writeln!(
             s,
@@ -1554,7 +1581,7 @@ pub struct MmArgs {
     pub conv: [u32; 3],
 }
 
-fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
+pub(super) fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
     let w: [u32; 12] =
         [a.m, a.n, a.k, a.ldo, a.ocol, a.arow, a.oscale.to_bits(), 0, a.conv[0], a.conv[1], a.conv[2], 0];
     c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

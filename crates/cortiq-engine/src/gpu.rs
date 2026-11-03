@@ -5591,13 +5591,21 @@ pub fn s2v_prepare(
     }
 }
 
-/// Frees what `s2v_prepare` kept on the device.
-pub fn s2v_release() {}
+/// Frees what the VAE decode kept on the device.
+pub fn s2v_release() {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::s2v_vae::release();
+}
 
 /// The whole temporally tiled decoder on the device, or `None`.
 #[allow(unused_variables)]
 pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> Option<crate::ltxvae::Vol> {
-    None
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v_vae::decode(vae, z),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
 }
 
 /// One forward on the device for the parity gate.
