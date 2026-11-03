@@ -13,8 +13,7 @@
 //! - adaLN: `LayerNorm(x)·(1 + scale) + shift`, residual `x + gate·out`;
 //! - attention: RMS-normalize q and k per head (ε 1e-5), rotate them when the
 //!   block has RoPE (never in cross-attention), 1/√128 softmax;
-//! - speech cross-attention: every 18th-ish block (`audio_inject_layers`),
-//!   noisy rows only, frame i attends only to its own audio tokens, residual
+//! - speech cross-attention: the blocks in `audio_inject_layers`, noisy rows only, frame i attends only to its own audio tokens, residual
 //!   ungated, LayerNorm with learned weight and bias;
 //! - GELU is the erf form, not the tanh approximation;
 //! - the time embedding and every modulation stay fp32 in the reference, so
@@ -774,22 +773,6 @@ impl S2vDit {
         self.audio_norm.apply(&y, n, self.pool())
     }
 
-    /// The four speech blocks: unmodulated, so once per chunk.
-    pub fn audio_blocks(&self, x: &mut Vec<f32>, frames: usize) {
-        let h = self.cfg.dim;
-        let n = x.len() / h;
-        let pool = self.pool();
-        let (cos, sin) = rope_1d(&audio_rope_pos(n, frames));
-        for b in &self.audio {
-            let xn = b.sa_norm.apply(x, n, pool);
-            let o = b.attn.forward(&xn, n, &xn, n, Some((&cos, &sin)), None, pool);
-            add_assign(x, &o);
-            let xn = b.ff_norm.apply(x, n, pool);
-            let o = b.ffn.forward(&xn, n, pool);
-            add_assign(x, &o);
-        }
-    }
-
     /// One text block at the modulation row `m` (`[6h]`).
     fn text_block(&self, b: &TextBlock, x: &mut [f32], m: &[f32], rope: (&[f32], &[f32])) {
         let h = self.cfg.dim;
@@ -939,7 +922,7 @@ impl S2vDit {
         let m = self.modulate("dit.out_layer.modulation.out_layer", &s, 1)?;
         let tail = &x[clean * h..];
         let sc: &[&[f32]] = &[&m[..2 * h]];
-        let xn = modulated_norm_out(tail, g.nvis, h, sc, pool);
+        let xn = modulated_norm(tail, g.nvis, h, sc, &|_| 0, pool);
         let y = self.out_w.apply(&xn, g.nvis, pool);
         Ok(unpatchify_out(&y, g, self.cfg.out_visual))
     }
@@ -977,11 +960,6 @@ fn modulated_norm(
     y
 }
 
-/// The out layer's chunk order is `[shift, scale]` too.
-fn modulated_norm_out(x: &[f32], n: usize, h: usize, chunks: &[&[f32]], pool: Option<&Pool>) -> Vec<f32> {
-    modulated_norm(x, n, h, chunks, &|_| 0, pool)
-}
-
 fn gated_add(
     x: &mut [f32],
     o: &[f32],
@@ -1002,9 +980,4 @@ fn gated_add(
             }
         }
     });
-}
-
-/// Rows that decide the size of a device program (exposed for the planners).
-pub fn tokens_for(cfg: &S2vConfig, lt: usize, lh: usize, lw: usize) -> usize {
-    S2vGeom::new(cfg, lt, lh, lw).total()
 }

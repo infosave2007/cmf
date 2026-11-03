@@ -24,7 +24,6 @@ pub use crate::s2v::ARCH_NAME;
 
 pub const SAMPLE_RATE: usize = 16000;
 pub const AUDIO_TOKENS_PER_SECOND: usize = 25;
-const AUDIO_START_TOKEN: &str = "<|audio_bos|>";
 
 /// The recipe stored in the container (`s2v.config_json`).
 #[derive(Clone, Debug)]

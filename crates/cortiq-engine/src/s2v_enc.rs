@@ -9,7 +9,7 @@
 //! touched at all when a prompt has to be encoded. On a text-only prefix the
 //! three MRoPE axes carry the same value, so the rotation is plain RoPE.
 
-use crate::dit::{Proj, cmf_f32};
+use crate::dit::cmf_f32;
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
 use crate::s2v::{Affine, Lin, Rows, gelu, pool_rows, silu};
@@ -499,6 +499,3 @@ impl ClipText {
         y[at * d..(at + 1) * d].to_vec()
     }
 }
-
-#[allow(dead_code)]
-fn _proj_is_used(_: &Proj) {}

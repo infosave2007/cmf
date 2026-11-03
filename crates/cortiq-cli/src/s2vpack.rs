@@ -146,7 +146,6 @@ fn write_container(
         std::fs::read(root.join(rel)).with_context(|| format!("{}/{rel}", root.display()))
     };
     let dit_cfg_raw = read("transformer/config.json")?;
-    let dit_cfg: serde_json::Value = serde_json::from_slice(&dit_cfg_raw)?;
     let te_cfg_raw = read("text_encoder/config.json")?;
     let te_cfg: serde_json::Value = serde_json::from_slice(&te_cfg_raw)?;
     let text_cfg = te_cfg["text_config"].clone();

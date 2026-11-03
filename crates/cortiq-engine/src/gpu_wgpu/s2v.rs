@@ -23,7 +23,7 @@
 
 use super::Ctx;
 use super::zimage::{
-    Epi, FlashCfg, MmArgs, MmCall, MmCfg, bg, default_cfg, default_flash, flash_calls, mm_call, pad_rows, pipeline, sbuf, sbuf_init,
+    Epi, MmArgs, MmCall, MmCfg, bg, default_cfg, default_flash, flash_calls, mm_call, pad_rows, pipeline, sbuf, sbuf_init,
     ubuf, zctx,
 };
 use crate::dit::Proj;
@@ -354,7 +354,6 @@ impl Aux {
 
 /// One stream's activations.
 struct Seq {
-    m: usize,
     x: wgpu::Buffer,
     xn: wgpu::Buffer,
     qkv: wgpu::Buffer,
@@ -370,7 +369,6 @@ impl Seq {
         let mp = pad_rows(m) as u64;
         let (h, ff) = (h as u64, ff as u64);
         Seq {
-            m,
             x: sbuf(c, mp * h * 4, &format!("{tag}_x")),
             xn: sbuf(c, mp * h * 2, &format!("{tag}_xn")),
             qkv: sbuf(c, mp * 3 * h * 2, &format!("{tag}_qkv")),
@@ -456,7 +454,6 @@ struct Builder<'a> {
     eps: f32,
     g: Guards,
     tiles: (MmCfg, MmCfg, MmCfg),
-    flash: FlashCfg,
 }
 
 impl Builder<'_> {
@@ -696,10 +693,6 @@ fn lin_bias(l: &s2v::Lin) -> Vec<f32> {
     l.b.clone().unwrap_or_else(|| vec![0.0; l.rows()])
 }
 
-fn cmf(m: &CmfModel, n: &str) -> Option<Vec<f32>> {
-    crate::dit::cmf_f32(m, n).ok()
-}
-
 /// The render's device program, or `None` to run on the host.
 pub fn prepare(
     dit: &S2vDit,
@@ -816,7 +809,7 @@ pub fn prepare(
         ))
     };
     let mut keep_raw = Vec::new();
-    let mut push_attn = |aux: &mut Aux, a: &s2v::Attn| -> [u32; 6] {
+    let push_attn = |aux: &mut Aux, a: &s2v::Attn| -> [u32; 6] {
         [
             aux.push(&a.qn),
             aux.push(&a.kn),
@@ -958,7 +951,6 @@ pub fn prepare(
         eps: 1e-5,
         g: hg,
         tiles,
-        flash,
     };
     let (attn_sc, qkv_sh, hid_sh) = (p2(-hg.attn), hg.qkv, hg.hid);
     let mm16 = |a: MmArgs, p: &wgpu::Buffer, act: &wgpu::Buffer, o: &wgpu::Buffer| bld.mm(bld.tiles.0, a, p, act, o);
