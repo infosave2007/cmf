@@ -614,3 +614,101 @@ pub fn generate(
     prof("vae decode", t0);
     Ok(S2vOutput { frames: out, fps: d.fps, latents, lt, lh, lw })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> S2vDefaults {
+        S2vDefaults {
+            steps: 16,
+            fps: 25,
+            latent_frames: 32,
+            seed: 5,
+            buckets: vec![(512, 512), (768, 512), (512, 768)],
+            scale_factor: [1.0, 2.0, 2.0],
+            prompt: String::new(),
+            system_prompt: String::new(),
+            shift: 10.0,
+            n_grid: 5,
+            eps: 1e-6,
+            final_scale: 0.5,
+            substeps: 128,
+        }
+    }
+
+    #[test]
+    fn piflow_schedule_matches_the_reference() {
+        let f = Piflow::new(&defaults(), 16);
+        let t = f.timesteps();
+        assert_eq!(t.len(), 16);
+        // `PiflowScheduler.set_timesteps(16)` of diffusers.
+        assert!((t[0] - 1000.0).abs() < 1e-3);
+        assert!((t[1] - 993.1507).abs() < 1e-2);
+        assert!((t[2] - 985.4014).abs() < 1e-2);
+        assert!((t[15] - 250.0).abs() < 2e-1);
+    }
+
+    #[test]
+    fn piflow_step_on_a_constant_grid_lands_on_the_constant() {
+        // Every grid point predicts x0 = 0, so u = x/σ and the rollout scales x by σ_dst/σ_src.
+        let d = defaults();
+        let f = Piflow::new(&d, 16);
+        let sigma = f.sigmas[0];
+        let mut x = vec![2.0f32; 16];
+        let pred = vec![2.0 / sigma; 16 * 5];
+        f.step(0, &pred, &mut x, 16, None);
+        let want = 2.0 * f.sigmas[1] / sigma;
+        assert!(x.iter().all(|v| (v - want).abs() < 1e-3), "{} vs {want}", x[0]);
+    }
+
+    #[test]
+    fn bucket_follows_the_aspect_ratio() {
+        let b = defaults().buckets;
+        assert_eq!(select_bucket(&b, 960, 960), (512, 512));
+        assert_eq!(select_bucket(&b, 960, 1431), (768, 512));
+        assert_eq!(select_bucket(&b, 1431, 960), (512, 768));
+    }
+
+    #[test]
+    fn pil_bilinear_keeps_a_flat_image() {
+        let src = vec![90u8; 8 * 6 * 3];
+        let out = pil_bilinear(&src, 8, 6, 4, 3);
+        assert_eq!(out.len(), 4 * 3 * 3);
+        assert!(out.iter().all(|&v| v == 90));
+    }
+
+    #[test]
+    fn memory_rolls_the_newest_frames_to_the_finest_scale() {
+        let v: serde_json::Value = serde_json::json!({
+            "in_visual_dim": 1, "out_visual_dim": 5, "in_text_dim": 8, "in_text_dim2": 8, "in_audio_dim": 8,
+            "time_dim": 8, "patch_size": [1, 2, 2], "frame_buckets": [2, 4, 24], "index_rope_ref_image": 40,
+            "model_dim": 128, "ff_dim": 256, "num_text_blocks": 1, "num_audio_blocks": 1, "num_visual_blocks": 1,
+            "axes_dims": [32, 48, 48], "audio_inject_layers": []
+        });
+        let cfg = S2vConfig::from_json(&v).unwrap();
+        let g = S2vGeom::new(&cfg, 32, 8, 8);
+        // One value per frame.
+        let mut x = vec![0f32; 32 * 8 * 8];
+        for f in 0..32 {
+            x[f * 64..(f + 1) * 64].fill(f as f32);
+        }
+        let m = roll_memory(&cfg, &g, &x);
+        assert_eq!(m[0].len(), 2 * 64);
+        assert_eq!(m[0][0], 30.0);
+        assert_eq!(m[1][0], 26.0);
+        assert_eq!(m[2][0], 2.0);
+        assert_eq!(g.total(), g.n4 + g.n2 + g.n1 + g.nref + g.nvis);
+        let (c, _) = crate::s2v::rope_visual(&cfg, &g, [1.0, 2.0, 2.0]);
+        assert_eq!(c.len(), g.total() * crate::s2v::ROPE_PAIRS);
+    }
+
+    #[test]
+    fn speech_groups_cover_the_tokens_once() {
+        let g = crate::s2v::audio_groups(125, 32);
+        assert_eq!(g.len(), 32);
+        assert_eq!(g[0], (0, 1));
+        assert_eq!(g.iter().map(|x| x.1).sum::<usize>(), 125);
+        assert_eq!(g[31].0 + g[31].1, 125);
+    }
+}
