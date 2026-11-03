@@ -828,7 +828,23 @@ pub fn prepare(
         })
         .filter(|g| g.valid())
         .unwrap_or_else(|| default_cfg(Epi::Gelu));
-    let tiles = (default_cfg(Epi::F16), default_cfg(Epi::F32), w1_tile);
+    // Measured on an L40S at 36736 rows: the 3h and FF output widths prefer the
+    // taller tile, the h-wide O GEMMs the square one.
+    let site = |env: &str, epi: Epi, d: (u32, u32, u32, u32, u32)| -> MmCfg {
+        let v: Vec<u32> = std::env::var(env)
+            .ok()
+            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let g = if v.len() == 5 {
+            MmCfg::new(v[0], v[1], v[2], v[3], v[4], epi)
+        } else {
+            MmCfg::new(d.0, d.1, d.2, d.3, d.4, epi)
+        };
+        if g.valid() { g } else { default_cfg(epi) }
+    };
+    let qkv_tile = site("CMF_S2V_TILE_QKV", Epi::F16, (256, 128, 32, 4, 2));
+    let w2_tile = site("CMF_S2V_TILE_W2", Epi::F32, (256, 128, 32, 4, 2));
+    let tiles = (qkv_tile, default_cfg(Epi::F32), w1_tile);
     let flash = default_flash();
     let s_vis = Seq::new(c, m, h, ff, "s2v_v");
     let s_small = Seq::new(c, small, h, ff, "s2v_t");
@@ -1107,7 +1123,7 @@ pub fn prepare(
         }
         // feed-forward
         v.push(bld.mm(bld.tiles.2, args(m, ff, h, ff, p2(-hid_sh)), &planes.w1, &s_vis.xn, &s_vis.hid)?);
-        v.push(mm32(args(m, h, ff, h, p2(hid_sh)), &planes.w2, &s_vis.hid, &s_vis.br)?);
+        v.push(bld.mm(w2_tile, args(m, h, ff, h, p2(hid_sh)), &planes.w2, &s_vis.hid, &s_vis.br)?);
         v.push(bld.row_op(&s_vis, m, 1 | 2, nclean, 0, two(bi, 8), (0, 0), (0, 0), zero_h, (0, 0), 1.0));
         visual_prog.push((bp.dq, v));
     }
