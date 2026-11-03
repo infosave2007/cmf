@@ -114,6 +114,19 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Kandinsky S2V 1.0 Pro-distill: из речи в видео (0.8.55)
+
+[Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)
+превращает опорный кадр и дорожку речи в видео с аватаром, где движется вся фигура. В одном
+файле на 24 ГБ лежат DiT на 21B, энкодеры речи и текста, CLIP и VAE. L40S рендерит 5 с видео
+512×512 за 5.6 минуты при 16.2 ГБ видеопамяти:
+
+```sh
+cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
+```
+
+Подробнее в [руководстве](docs/KANDINSKY_S2V.ru.md).
+
 ## Unlimited-OCR-2 и MiniCPM-OCR-1.0 (0.8.54)
 
 Две OCR-модели. [Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)

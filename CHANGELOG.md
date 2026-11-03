@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Embryo trainer on Vulkan: a 340M step at B8 T1024 goes from 1340 to 1003 ms on an RTX PRO 6000. Routing takes its residual from GEMM products instead of a long per-row reduction, the DLG dots run in their own pass, and the GEMM tile thresholds follow the chip. `CMF_VULKAN_OP_TS=1` now covers a whole step.
 
+## [0.8.55] — 2026-11-03
+
+### Added
+- Kandinsky S2V 1.0 Pro-distill (`kandinsky_s2v`): reference frame + speech track → avatar
+  video. `cortiq s2v-pack` writes one .cmf from the Diffusers layout; `cortiq s2v` runs it;
+  `cortiq s2v-check` compares each stage with reference dumps (`scripts/s2v/oracle.py`).
+  The 21B DiT with FramePack memory and frame-aligned speech attention (`s2v.rs`), the
+  Qwen2.5-Omni Thinker's text model and audio tower plus CLIP (`s2v_enc.rs`), the pi-Flow
+  sampler and the chunk loop (`s2vgen.rs`), the HunyuanVideo causal VAE with its temporal
+  tiling (`s2v_vae.rs`). The default prompt's conditions are stored in the file.
+- wgpu: the whole denoiser step on the card (`gpu_wgpu/s2v.rs`). The container's quantized
+  bytes stay resident and one block's f16 planes are expanded right before it runs, because
+  21B parameters as planes are 42 GB. `zi_mm` takes a GELU epilogue, and 3×3×3 causal
+  convs with the upsample or stride folded into the gather for the resident VAE
+  (`gpu_wgpu/s2v_vae.rs`), which runs tensors past a storage binding in slabs of frames.
+  An L40S takes 19.7 s a step at 512² (36736 tokens) against 19.5 s for Diffusers bf16,
+  5.6 minutes for 5 s of video at 16.2 GB of VRAM. The final latents of q4tp have a
+  cosine of 0.9996 with the reference on the same noise.
+
 ## [0.8.54] — 2026-11-02
 
 ### Added
