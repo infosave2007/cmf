@@ -16,7 +16,79 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use cortiq_core::CmfModel;
+use cortiq_engine::lookup::{self, LookupMode, LookupOutcome, LookupTables};
+use cortiq_engine::router::{self, RouteDecision, RouteOptions, RouteTarget};
 use cortiq_engine::{Pipeline, SamplerConfig};
+
+/// The routing step of a chat turn on a file with lookup records: the engine
+/// calls `SkillRouter::decide_lookup_turns` makes for `cortiq serve`, without
+/// the server. φ runs on a DEDICATED backbone pipeline: its prefill resets the
+/// sequence state, and on the generation pipeline that would throw away the
+/// conversation's KV prefix.
+struct LookupRouter {
+    probe: Mutex<Pipeline>,
+    tables: Arc<LookupTables>,
+}
+
+impl LookupRouter {
+    /// `None` for a file without router policy v2 or lookup records, and for
+    /// a V4.1 file, which never routes: those chats stay unchanged.
+    fn open(model: &Arc<CmfModel>) -> Result<Option<Self>, String> {
+        let tables = lookup::tables_of(model);
+        if !router::is_router_v2(model) || !tables.any() || model.arch().deepseek_v41.is_some() {
+            return Ok(None);
+        }
+        for id in tables.ids() {
+            tables.get(&id)?;
+        }
+        let probe = Pipeline::from_model(model, SamplerConfig::default())
+            .map_err(|e| format!("router probe: {e}"))?;
+        Ok(Some(Self {
+            probe: Mutex::new(probe),
+            tables,
+        }))
+    }
+
+    /// `turns` are the user messages, the last one first. There are no skill
+    /// lanes behind the C ABI: an ordinary skill's pick runs the backbone.
+    fn decide(
+        &self,
+        model: &Arc<CmfModel>,
+        turns: &[&str],
+    ) -> Result<(RouteDecision, LookupOutcome), String> {
+        let opts = RouteOptions::default();
+        let mut probe = self
+            .probe
+            .lock()
+            .map_err(|_| "router probe mutex poisoned")?;
+        let frame = router::chat_frame(&probe.tokenizer);
+        // φ stays on the host: the router is fitted on the exact φ, and on a
+        // phone the per-op GPU path spends minutes arbitrating its first walk.
+        let d = cortiq_engine::gpu::cpu_scope(|| {
+            router::route_turns_keyed(model, &mut probe, turns, opts)
+        });
+        drop(probe);
+        let d = router::enforce_prompt_contract(&model.header, d, frame, false).0;
+        let gate = lookup::KeyFirstGate::new(opts, frame);
+        let (d, outcome) =
+            lookup::resolve_lookup_gated(&self.tables, d, Some(gate), turns, LookupMode::Answer)?;
+        if outcome == LookupOutcome::NotLookup && d.skill().is_some() {
+            let reason = format!(
+                "no skill lanes in the C ABI: the backbone runs [decision was: {}]",
+                d.reason
+            );
+            return Ok((
+                RouteDecision {
+                    target: RouteTarget::Backbone,
+                    routing: d.routing,
+                    reason,
+                },
+                outcome,
+            ));
+        }
+        Ok((d, outcome))
+    }
+}
 
 struct Ctx {
     /// Kept so the network split can prove identity (`dir_hash`) and
@@ -31,6 +103,10 @@ struct Ctx {
     /// default; `Some(false)` makes the model answer directly instead of
     /// emitting a `<think>` block. Set through `cortiq_set_options`.
     enable_thinking: Mutex<Option<bool>>,
+    /// Set for a file with lookup records.
+    router: Option<LookupRouter>,
+    /// The decision of the last generate as JSON (`cortiq_last_route`).
+    last_route: Mutex<String>,
 }
 
 thread_local! {
@@ -97,10 +173,20 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
                 return std::ptr::null_mut();
             }
         };
-        let pipeline = match Pipeline::from_model(&model, SamplerConfig::default()) {
+        // The file's own sampling recommendation, as `cortiq run` and `serve`
+        // start from: Embryo's `loop_stop` lives there.
+        let sampler = SamplerConfig::from_provenance(model.header.provenance.as_ref());
+        let pipeline = match Pipeline::from_model(&model, sampler) {
             Ok(p) => p,
             Err(e) => {
                 set_error(&format!("pipeline: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let router = match LookupRouter::open(&model) {
+            Ok(r) => r,
+            Err(e) => {
+                set_error(&format!("lookup: {e}"));
                 return std::ptr::null_mut();
             }
         };
@@ -109,6 +195,8 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
             cancel: pipeline.cancel.clone(),
             pipeline: Mutex::new(pipeline),
             enable_thinking: Mutex::new(None),
+            router,
+            last_route: Mutex::new("{}".to_string()),
         })) as *mut c_void
     });
     result.unwrap_or_else(|_| {
@@ -208,7 +296,9 @@ pub extern "C" fn cortiq_free(handle: *mut c_void) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(unsafe { Box::from_raw(handle as *mut Ctx) });
+        let ctx = unsafe { Box::from_raw(handle as *mut Ctx) };
+        lookup::release_tables(&ctx.model);
+        drop(ctx);
     }));
 }
 
@@ -253,6 +343,63 @@ fn run_generate(
     run_generate_ids(handle, input, max_tokens, cb, user)
 }
 
+/// The routing step of a chat turn. `Some` is the record's text: the answer,
+/// nothing is generated. `None` lets the generation run on the same messages.
+/// A raw completion has no user turn to route on, and with a peer the layers
+/// are not here: `cortiq serve --peer` leaves routing off too.
+fn route_chat(ctx: &Ctx, input: &GenInput) -> Result<Option<String>, String> {
+    let turns: Vec<&str> = match input {
+        GenInput::Chat(prompt) => vec![prompt],
+        GenInput::Raw(_) => Vec::new(),
+        GenInput::History(history) => history
+            .iter()
+            .rev()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, text)| text.as_str())
+            .take(lookup::MEMORY_TURNS)
+            .collect(),
+    };
+    let decided = match &ctx.router {
+        Some(router) if !turns.is_empty() && !peer_configured() => {
+            Some(router.decide(&ctx.model, &turns)?)
+        }
+        _ => None,
+    };
+    let route = match &decided {
+        Some((d, outcome)) => {
+            let mut v = d.summary_json();
+            outcome.annotate(&mut v, LookupMode::Answer);
+            v.to_string()
+        }
+        None => "{}".to_string(),
+    };
+    if let Ok(mut g) = ctx.last_route.lock() {
+        *g = route;
+    }
+    Ok(match decided {
+        Some((_, LookupOutcome::Answer(a))) => Some(a.text),
+        _ => None,
+    })
+}
+
+/// The routing decision of the last generate on this handle, as JSON: the
+/// object `cortiq serve` returns as `x_cortiq_route`. `target` is the record
+/// id or `"backbone"`; when `lookup_hit` is true the answer came from that
+/// record word for word (`lookup_key`, `field`, `lookup_lang`, `lookup_turn`,
+/// `decided_by`, `reason`). `{}` when the generate was not routed. The string
+/// is valid until the next JSON getter on this thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_last_route(handle: *mut c_void) -> *const c_char {
+    if handle.is_null() {
+        return set_last_json("{}");
+    }
+    let ctx = unsafe { &*(handle as *const Ctx) };
+    match ctx.last_route.lock() {
+        Ok(g) => set_last_json(&g),
+        Err(_) => set_last_json("{}"),
+    }
+}
+
 fn run_generate_ids(
     handle: *mut c_void,
     input: GenInput,
@@ -261,6 +408,22 @@ fn run_generate_ids(
     user: *mut c_void,
 ) -> i32 {
     let ctx = unsafe { &*(handle as *const Ctx) };
+    match route_chat(ctx, &input) {
+        Ok(Some(answer)) => {
+            if let (Some(f), Ok(c)) = (cb, CString::new(answer.replace('\0', " "))) {
+                f(c.as_ptr(), user);
+            }
+            // Nothing ran to honour a cancel that came during the decision.
+            ctx.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            set_error(&format!("lookup: {e}"));
+            return -1;
+        }
+    }
     let mut pipeline = match ctx.pipeline.lock() {
         Ok(g) => g,
         Err(_) => {
@@ -302,9 +465,24 @@ fn run_generate_ids(
         GenInput::Raw(prompt) => pipeline
             .tokenizer
             .with_bos(pipeline.tokenizer.encode(&prompt)),
-        GenInput::History(history) => pipeline
-            .tokenizer
-            .apply_chat_template_opts(&history, thinking),
+        GenInput::History(mut history) => {
+            // `sampling.history_turns`: the network sees only the last turns,
+            // the router above has seen them all.
+            let provenance = ctx.model.header.provenance.as_ref();
+            if let Some(n) = cortiq_engine::sampler::file_history_turns(provenance) {
+                let roles: Vec<&str> = history.iter().map(|m| m.0.as_str()).collect();
+                let start = cortiq_engine::sampler::last_turns_start(roles.into_iter(), n);
+                let mut i = 0;
+                history.retain(|m| {
+                    let keep = i >= start || m.0 == "system";
+                    i += 1;
+                    keep
+                });
+            }
+            pipeline
+                .tokenizer
+                .apply_chat_template_opts(&history, thinking)
+        }
     };
     // A configured peer routes the whole generation through the layer
     // split. Same ids, same callback, same result shape — the caller

@@ -81,6 +81,18 @@ int32_t cortiq_chat_messages(void *handle, const char *messages_json,
                              uint32_t max_tokens, cortiq_token_cb cb,
                              void *user);
 
+/* A file with lookup records answers a chat turn the way `cortiq serve` does:
+ * its router decides on the last user message, and a hit is the record's text,
+ * delivered through cb as one piece, with nothing generated: cortiq_chat and
+ * cortiq_chat_messages return 0. Otherwise the model generates as usual.
+ *
+ * The decision of the last generate as JSON, the object `cortiq serve` returns
+ * as x_cortiq_route: target is the record id or "backbone"; when lookup_hit is
+ * true the answer came from that record word for word (lookup_key, field,
+ * lookup_lang, lookup_turn, decided_by, reason). "{}" when the generate was not
+ * routed. Valid until the next JSON getter on this thread. */
+const char *cortiq_last_route(void *handle);
+
 /* Partial sampler options as JSON — absent keys keep their current
  * values; applies to every later generate on this handle. Keys:
  * temperature, top_p, top_k, repetition_penalty, min_p, seed,

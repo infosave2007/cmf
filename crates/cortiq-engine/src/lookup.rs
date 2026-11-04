@@ -1540,14 +1540,27 @@ pub fn key_token_window(tok: &crate::tokenizer::Tokenizer, q: &[u32], key: &str)
     window
 }
 
-fn tables_of(model: &Arc<CmfModel>) -> Arc<LookupTables> {
-    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, Arc<LookupTables>>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
+static TABLES_OF: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, Arc<LookupTables>>>> =
+    std::sync::OnceLock::new();
+
+/// The file's tables, shared per open model: the router's key search reads
+/// them too, and a second set would cost its open again.
+pub fn tables_of(model: &Arc<CmfModel>) -> Arc<LookupTables> {
+    let cache = TABLES_OF.get_or_init(Default::default);
     let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
     m.entry(Arc::as_ptr(model) as usize)
         .or_insert_with(|| Arc::new(LookupTables::new(model.clone())))
         .clone()
+}
+
+/// Forget the tables of [`tables_of`]. The cache holds the model, so a
+/// long-lived embedder that unloads a file would otherwise keep its mapping and
+/// its tables until the process exits.
+pub fn release_tables(model: &Arc<CmfModel>) {
+    if let Some(cache) = TABLES_OF.get() {
+        let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+        m.remove(&(Arc::as_ptr(model) as usize));
+    }
 }
 
 /// φ of the `key_span` pool for one user message on the backbone; `None`

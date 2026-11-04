@@ -30,4 +30,6 @@
 
 `cortiq run` 和 `cortiq serve` 默认让 Embryo 文件运行在常驻 GPU 图上（`CMF_GPU=wgpu`、`CMF_EMBRYO_RESIDENT=1`，在 Mac 上是基于 Metal 的 wgpu），除非你指定了后端。`CMF_GPU=0` 走 CPU 路径，贪心输出文本相同。Embryo 文件在 CPU 上使用浮点激活值，因为它的路由器是按精确的 φ 拟合的，而其他 q8 模型所用的 8 位激活值会使 φ 偏移 4e-3（`CMF_SDOT=1` 可开启：预填充快 5 倍，文本不同）。两条路径与精确运算的差距都不超过 3e-5。
 
+C ABI（`crates/cortiq-ffi`，移动应用基于它构建）用同样的引擎调用路由每轮对话，`cortiq_last_route` 给出回答所用的记录。无论 `cortiq_set_gpu` 如何设置，φ 都在 CPU 上计算：在 Xiaomi 12 Lite 上，逐操作 GPU 路径的首次仲裁耗时 235 秒，而 CPU 每个问题约 100 毫秒。
+
 矩阵在设备上保持文件中的形式，即 f16 或 q8_2f（`gpu_wgpu/embryo_wide.wgsl` 配合 `embryo_wide_f16.wgsl` 或 `embryo_wide_q8.wgsl`）。一个 token 约需 80 次调度，两次调度之间的边界比大多数内核本身更耗时（M4 上 8 µs，RTX 2000 Ada 上 5 µs），而且 GPU 只有在大量短线程下才能满载。因此一个线程最多处理一行中的 128 个值，部分和由下一个归一化阶段相加；q8_2f 矩阵的列缩放在生成输入向量的阶段一次性乘入，权重码按整数解包；锚点按绝对位置旋转查询和键，所以环形缓冲中存放的是旋转后的键，打分就是普通点积；值按块累加，只取权重高于最大权重 e^-16 的键；delta 规则及其归一化在每个头共用一个工作组。输出头只读取对数概率高于 −9.21 的簇（`CMF_EMBRYO_HEAD_GATE`；`-1e30` 读取所有行，被跳过的簇的行返回 −1e30）。`CMF_EMBRYO_WIDE=0` 使用 f32 路径。
