@@ -108,7 +108,7 @@ cortiq verify model.cmf
 
 [Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)
 根据一张参考帧和一段语音生成整个人物都在动的数字人视频。一个 24 GB 文件包含 21B DiT、语音和文本编码器、CLIP 以及 VAE。
-L40S 用 5.6 分钟、16.2 GB 显存渲染 5 秒 512×512 视频：
+L40S 用 5.6 分钟、16.2 GB 显存渲染 5 秒 512×512 视频，MacBook Air M4 用 4.45 小时、14.6 GB 统一内存：
 
 ```sh
 cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi

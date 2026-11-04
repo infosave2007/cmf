@@ -78,6 +78,16 @@ RTX 5090 ran q8 at 16.8 s a step with 6.8 s of VAE per chunk.
 256×256 is outside the model's trained sizes: it keeps the speech and the motion and
 loses detail in the face and the hands.
 
+MacBook Air M4 (10-core GPU, 24 GB, no fan) with Metal and q4tp:
+
+| size | tokens | a step | VAE per chunk | 5 s of video | peak memory |
+|---|---:|---:|---:|---:|---:|
+| 512×512 | 36736 | 955–1047 s | 362 s | 4.45 h | 14.6 GB |
+| 256×256, draft | 9184 | 134–149 s | 98 s | about 39 min | 4.7 GB |
+
+The final latents at 512² have a cosine of 0.9995 with the original on the same noise.
+The 256² clip time is two measured steps times 16, plus the VAE.
+
 ## Options
 
 | option | default | meaning |
@@ -99,7 +109,8 @@ stops at 300 s.
 
 **NVIDIA with 24 GB or more (Vulkan).** q4tp at 512² peaks at 16.2 GB and needs the card's
 cooperative matrix support. **Apple silicon (Metal).** Everything runs on the GPU from
-the file mapping. **CPU only.** `CMF_GPU=0` works, at hours per step.
+the file mapping; q4tp peaks at 14.6 GB of unified memory at 512² and 4.7 GB at 256².
+**CPU only.** `CMF_GPU=0` works, at hours per step.
 
 ## Responsible use
 
@@ -141,6 +152,10 @@ cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio spee
 а 5 с видео — 10 мин. Оригинал на Diffusers на той же карте тратит 19.5 с на шаг. Черновик 256×256 готов за
 64 с, но этот размер вне обученных: речь и движение сохраняются, детали лица и рук теряются.
 
+На MacBook Air M4 (10 ядер GPU, 24 ГБ, без вентилятора, Metal, q4tp) шаг на 512×512 занимает 955–1047 с, VAE 362 с,
+а 5 с видео — 4.45 ч при пике 14.6 ГБ. На 256×256 шаг занимает 134–149 с, VAE 98 с, пик 4.7 ГБ. Косинус конечных
+латентов на Metal с оригиналом 0.9995.
+
 Косинус конечных латентов с оригиналом на том же шуме 0.9996, PSNR кадров первого чанка 40.9 дБ. Параметры:
 `--prompt`, `--seed`, `--steps`, `--chunks`, `--height`, `--width`, `--quality`. Подробнее в
 [руководстве](https://github.com/infosave2007/cmf/blob/master/docs/KANDINSKY_S2V.ru.md).
@@ -174,6 +189,9 @@ cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio spee
 
 在 L40S（Vulkan）上，512×512 每步 19.7 秒，5 秒视频需 5.6 分钟；768×512 每步 36.9 秒，5 秒视频需 10 分钟。
 Diffusers 原版在同一张卡上每步 19.5 秒。256×256 草稿只需 64 秒，但这不是训练尺寸：语音和动作保留，脸和手的细节会损失。
+
+在 MacBook Air M4（10 核 GPU、24 GB、无风扇，Metal，q4tp）上，512×512 每步 955–1047 秒，VAE 362 秒，5 秒视频需 4.45 小时，
+内存峰值 14.6 GB；256×256 每步 134–149 秒，VAE 98 秒，峰值 4.7 GB。Metal 上最终潜变量与原模型的余弦相似度为 0.9995。
 
 在相同噪声下，最终潜变量与原模型的余弦相似度为 0.9996，第一个分块的帧 PSNR 为 40.9 dB。选项：`--prompt`、`--seed`、
 `--steps`、`--chunks`、`--height`、`--width`、`--quality`。详见[使用指南](https://github.com/infosave2007/cmf/blob/master/docs/KANDINSKY_S2V.zh.md)。

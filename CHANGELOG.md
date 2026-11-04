@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.55] — 2026-11-03
+## [0.8.55] — 2026-11-04
 
 ### Added
 - Kandinsky S2V 1.0 Pro-distill (`kandinsky_s2v`): reference frame + speech track → avatar
@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An L40S takes 19.7 s a step at 512² (36736 tokens) against 19.5 s for Diffusers bf16,
   5.6 minutes for 5 s of video at 16.2 GB of VRAM. The final latents of q4tp have a
   cosine of 0.9996 with the reference on the same noise.
+- Metal: the whole step on Apple GPUs (`gpu_metal/s2v.rs`). Weights stay in the file
+  mapping with one transient view per block, because the driver counts a view's whole
+  length against its working-set limit and two windows over the 24 GB file rewired at
+  every switch. Visual self-attention has its own kernel (`s2v_flash`): f32 weights and
+  one scale per query sampled from 16 key blocks, 1.8× the rate of `qi_flash`. A MacBook
+  Air M4 takes 955–1047 s a step at 512², 4.45 hours for 5 s of video at 14.6 GB of
+  unified memory, with a cosine of 0.9995 against the reference.
 
 ### Changed
 

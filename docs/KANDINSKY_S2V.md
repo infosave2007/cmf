@@ -57,9 +57,14 @@ reference frame → VAE encoder ────────────┘
 The weights do not fit a 32 GB card as f16 planes (42 GB). The container's quantized
 bytes stay on the card as they are and one block's planes are expanded right before
 that block runs, so q4tp needs about 14 GB of VRAM for the DiT. On Metal the weights
-stay in the file mapping and are dequantized as a GEMM reads them. The VAE runs
-resident on both. `cortiq s2v` falls back to the CPU when the device declines, which
-at 36736 tokens is hours per segment.
+stay in the file mapping and are dequantized as a GEMM reads them, with one block
+viewed at a time, because the driver counts a view's whole length against its
+working-set limit. The VAE runs resident on both. `cortiq s2v` falls back to the CPU
+when the device declines, which at 36736 tokens is hours per segment.
+
+An L40S renders 5 s at 512² in 5.6 minutes. A MacBook Air M4 (10-core GPU, 24 GB, no
+fan) takes 955–1047 s a step and 4.45 hours for the same clip, at a peak of 14.6 GB of
+unified memory.
 
 ## Parity
 
