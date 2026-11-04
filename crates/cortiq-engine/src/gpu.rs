@@ -5562,3 +5562,83 @@ pub fn vae_decode_chain(
         _ => false,
     }
 }
+
+
+// ── Kandinsky S2V device contract ──────────────────────────────────────
+
+/// A prepared device program for one render's geometry and conditions.
+pub trait S2vStepper {
+    /// One DiT forward: `x` `[T, H, W, 16]`, memory in `[1x, 2x, 4x]` order,
+    /// returns `[T, H, W, 80]`. `step` indexes the render's timestep list and
+    /// `chunk` the speech chunk.
+    fn step(&mut self, step: usize, chunk: usize, x: &[f32], memory: &[Vec<f32>; 3]) -> Result<Vec<f32>, String>;
+}
+
+/// The device program, or `None` to run the host path.
+#[allow(unused_variables)]
+pub fn s2v_prepare(
+    dit: &crate::s2v::S2vDit,
+    g: &crate::s2v::S2vGeom,
+    cond: &crate::s2vgen::S2vCond,
+    ts: &[f32],
+    sf: [f32; 3],
+) -> Option<Box<dyn S2vStepper>> {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v::prepare(dit, g, cond, ts, sf).map(|d| Box::new(d) as Box<dyn S2vStepper>),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::prepare(dit, g, cond, ts, sf).map(|d| Box::new(d) as Box<dyn S2vStepper>),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Frees what the VAE decode kept on the device.
+pub fn s2v_release() {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::s2v_vae::release();
+    #[cfg(target_os = "macos")]
+    crate::gpu_metal::s2v::release();
+}
+
+/// The whole temporally tiled decoder on the device, or `None`.
+#[allow(unused_variables)]
+pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> Option<crate::ltxvae::Vol> {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v_vae::decode(vae, z),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::decode(vae, z),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// The reference frame through the encoder on the device, or `None`.
+#[allow(unused_variables)]
+pub fn s2v_vae_encode(enc: &crate::s2v_vae::S2vVaeEncoder, img: &crate::ltxvae::Vol) -> Option<(crate::ltxvae::Vol, crate::ltxvae::Vol)> {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::s2v_vae::encode(enc, img),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::s2v::encode(enc, img),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// One forward on the device for the parity gate.
+#[allow(unused_variables)]
+pub fn s2v_check_forward(dit: &crate::s2v::S2vDit, i: &crate::s2v::S2vInput<'_>) -> Option<Vec<f32>> {
+    let cond = crate::s2vgen::S2vCond {
+        text: i.text_feats.to_vec(),
+        pooled: i.pooled.to_vec(),
+        audio: vec![i.audio_feats.to_vec()],
+        reference: i.reference.to_vec(),
+        height: i.geom.lh * 8,
+        width: i.geom.lw * 8,
+    };
+    let mut dev = s2v_prepare(dit, &i.geom, &cond, &[i.t], i.scale_factor)?;
+    let memory = [i.mem1.to_vec(), i.mem2.to_vec(), i.mem4.to_vec()];
+    dev.step(0, 0, i.x, &memory).ok()
+}

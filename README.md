@@ -114,6 +114,20 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Kandinsky S2V 1.0 Pro-distill, speech to video (0.8.55)
+
+[Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)
+turns a reference frame and a speech track into an avatar video where the whole figure
+moves. One 24 GB file holds the 21B DiT, the speech and text encoders, CLIP and the VAE.
+An L40S renders 5 s of 512×512 video in 5.6 minutes at 16.2 GB of VRAM, a MacBook Air M4
+in 4.45 hours at 14.6 GB of unified memory:
+
+```sh
+cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi
+```
+
+See [the guide](docs/KANDINSKY_S2V.md).
+
 ## Unlimited-OCR-2 and MiniCPM-OCR-1.0 (0.8.54)
 
 Two OCR models. [Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
@@ -380,7 +394,7 @@ cortiq imagine qwen-image/transformer.cmf \
 For pinned sources and component packing, see [the Qwen Image guide](docs/QWEN_IMAGE.md).
 
 The CLI also exposes `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
-`moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` and
+`moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate`, `s2v` and
 `ltx-video`. Run `cortiq <command> --help` for flags and current limitations.
 
 ### Whisper transcription

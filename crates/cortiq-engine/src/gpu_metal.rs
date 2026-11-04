@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 // Z-Image-Turbo device path (plan WP3) — child module, `gpu_metal/zimage.rs`.
 #[doc(hidden)]
+pub mod s2v;
 pub mod zimage;
 
 // Qwen-Image-2.1 denoiser — child module, `gpu_metal/qi21.rs`.

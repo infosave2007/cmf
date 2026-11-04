@@ -19,6 +19,8 @@ use wgpu::util::DeviceExt;
 
 // Z-Image-Turbo device path (plan WP2) — child module, `gpu_wgpu/zimage.rs`.
 #[doc(hidden)]
+pub mod s2v;
+pub mod s2v_vae;
 pub mod zimage;
 // Qwen-Image-2.1 denoiser and resident VAE decoder — child modules,
 // `gpu_wgpu/qi21.rs` and `gpu_wgpu/qi21_vae.rs`.
@@ -47993,7 +47995,7 @@ fn bind_buf(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 /// single-token kernel one token's slice without changing the kernel. The
 /// offset must respect `min_storage_buffer_offset_alignment` (256 on every
 /// card this runs on), which every per-token stride here does.
-fn bind_buf_off(binding: u32, buf: &wgpu::Buffer, off: u64, size: u64) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn bind_buf_off(binding: u32, buf: &wgpu::Buffer, off: u64, size: u64) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {

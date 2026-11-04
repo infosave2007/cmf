@@ -309,7 +309,7 @@ fn build_block(c: &Ctx, model: &CmfModel, r: &Qi21BlockRef, g: &Qi21Geom) -> Res
     })
 }
 
-fn buf_from(c: &Ctx, v: &[f32]) -> Buffer {
+pub(super) fn buf_from(c: &Ctx, v: &[f32]) -> Buffer {
     c._device.new_buffer_with_data(
         v.as_ptr() as *const c_void,
         (v.len().max(1) * 4) as u64,
@@ -325,12 +325,12 @@ fn buf_u32(c: &Ctx, v: &[u32]) -> Buffer {
     )
 }
 
-fn buf_zeroed(c: &Ctx, bytes: usize) -> Buffer {
+pub(super) fn buf_zeroed(c: &Ctx, bytes: usize) -> Buffer {
     c._device
         .new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
 }
 
-fn write_f32(b: &Buffer, off_floats: usize, v: &[f32]) {
+pub(super) fn write_f32(b: &Buffer, off_floats: usize, v: &[f32]) {
     unsafe {
         std::ptr::copy_nonoverlapping(
             v.as_ptr(),
@@ -520,7 +520,7 @@ struct PKv {
     ldp: u32,
 }
 
-fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
+pub(super) fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
     enc.set_bytes(
         idx,
         std::mem::size_of::<T>() as u64,
@@ -538,7 +538,7 @@ fn amax_on() -> bool {
 
 /// Command-buffer recorder (the Z-Image one): a new buffer at every cut;
 /// under profiling every op class gets its own buffer.
-struct Rec<'a> {
+pub(super) struct Rec<'a> {
     c: &'a Ctx,
     prof: bool,
     done: Vec<(&'static str, CommandBuffer)>,
@@ -550,7 +550,7 @@ struct Rec<'a> {
 }
 
 impl<'a> Rec<'a> {
-    fn new(c: &'a Ctx) -> Rec<'a> {
+    pub(super) fn new(c: &'a Ctx) -> Rec<'a> {
         Rec {
             c,
             prof: prof_on(),
@@ -567,7 +567,7 @@ impl<'a> Rec<'a> {
             self.done.push((label, cmd));
         }
     }
-    fn enc(&mut self, label: &'static str) -> &ComputeCommandEncoderRef {
+    pub(super) fn enc(&mut self, label: &'static str) -> &ComputeCommandEncoderRef {
         if self.prof && self.cur.as_ref().is_some_and(|(_, _, l)| *l != label) {
             self.close();
         }
@@ -581,12 +581,12 @@ impl<'a> Rec<'a> {
         }
         cur.1.as_ref().unwrap()
     }
-    fn cut(&mut self) {
+    pub(super) fn cut(&mut self) {
         if !self.prof {
             self.close();
         }
     }
-    fn finish(&mut self, what: &str) -> bool {
+    pub(super) fn finish(&mut self, what: &str) -> bool {
         self.close();
         let mut ok = true;
         for (_, cmd) in &self.done {

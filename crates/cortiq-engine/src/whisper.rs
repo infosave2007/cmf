@@ -1074,9 +1074,9 @@ fn is_near_silence(samples: &[f32]) -> bool {
             <= samples.len() as f64 * 1e-10
 }
 
-fn log_mel(samples: &[f32], frames: usize) -> Vec<f32> {
+pub(crate) fn log_mel(samples: &[f32], frames: usize) -> Vec<f32> {
     let cfg = mel_config();
-    debug_assert!(frames > 0 && frames <= CHUNK / HOP);
+    debug_assert!(frames > 0);
     let mut mel = vec![0.0f32; MEL * frames];
     let mut spec = vec![0.0f64; 201];
     let mut fft_buf = vec![Complex::new(0.0, 0.0); FFT];

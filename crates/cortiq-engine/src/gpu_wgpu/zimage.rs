@@ -867,6 +867,9 @@ pub enum Epi {
     /// carried a power-of-two range guard the nonlinearity must not see
     /// (Qwen-Image-2.1's FFN input, `gpu_wgpu/qi21.rs`).
     SwiGluIn,
+    /// `out[m][ocol+n]` f16 of `gelu(acc)` (erf form) · `oscale`: the
+    /// Kandinsky S2V feed-forward's hidden state.
+    Gelu,
 }
 
 impl Epi {
@@ -1002,7 +1005,7 @@ impl MmCfg {
         let nw = self.wm * self.wn;
         let sc = match self.epi {
             Epi::F32 => 0,
-            Epi::F16 => nw * 256 * 4,
+            Epi::F16 | Epi::Gelu => nw * 256 * 4,
             Epi::SwiGlu | Epi::SwiGluIn => nw * 512 * 4,
         };
         stage + sc
@@ -1080,7 +1083,39 @@ pub fn mm_src(g: MmCfg) -> String {
         }
     }
     let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: MmP;");
-    if g.conv != 0 {
+    if g.conv == 3 {
+        // 3×3×3 causal conv over an `[F·H·W][C]` volume: `y` counts F·H rows,
+        // replicate padding (two frames in front), and the nearest upsample
+        // of the source folded in. `arow` bits: 0-7 frames, 8-15 this dispatch's
+        // first output frame, 16-23 the first source frame bound, 24 up-space,
+        // 25 up-time, 26 stride 2 in space (the encoder's downsamplers).
+        let _ = writeln!(
+            s,
+            "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
+  let k0 = kt * {bk}u;
+  let tap = k0 / p.cin;
+  let ci = k0 - tap * p.cin + vc * 4u;
+  let cf = i32(p.arow & 0xFFu);
+  let f0 = i32((p.arow >> 8u) & 0xFFu);
+  let s0 = (p.arow >> 16u) & 0xFFu;
+  let us = (p.arow >> 24u) & 1u;
+  let ut = (p.arow >> 25u) & 1u;
+  let sd = 1u + ((p.arow >> 26u) & 1u);
+  let fr = y / i32(p.ch) + f0;
+  let ro = y % i32(p.ch);
+  let sf = clamp(fr + i32(tap / 9u) - 2, 0, cf - 1);
+  let sy = clamp(ro * i32(sd) + i32((tap / 3u) % 3u) - 1, 0, i32(p.ch * sd) - 1);
+  let sx = clamp(x * i32(sd) + i32(tap % 3u) - 1, 0, i32(p.cw * sd) - 1);
+  var tf = u32(sf);
+  if (ut != 0u && tf > 0u) {{ tf = (tf - 1u) / 2u + 1u; }}
+  let scw = (p.cw * sd) >> us;
+  let sch = (p.ch * sd) >> us;
+  let src = ((tf - s0) * sch + (u32(sy) >> us)) * scw + (u32(sx) >> us);
+  return act[(src * p.cin + ci) / 4u];
+}}",
+            bk = g.bk
+        );
+    } else if g.conv != 0 {
         let up = if g.conv == 2 { 1 } else { 0 };
         let _ = writeln!(
             s,
@@ -1105,7 +1140,7 @@ pub fn mm_src(g: MmCfg) -> String {
     match g.epi {
         _ if g.acc16_probe => {}
         Epi::F32 => {}
-        Epi::F16 => {
+        Epi::F16 | Epi::Gelu => {
             let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 256);
         }
         Epi::SwiGlu | Epi::SwiGluIn => {
@@ -1359,6 +1394,23 @@ pub fn mm_src(g: MmCfg) -> String {
                 }
             }
         }
+        Epi::Gelu => {
+            // As F16, the erf-form GELU in the lanes before the pack.
+            let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
+            let _ = writeln!(s, "  let lane = tid - sg * 32u;");
+            let _ = writeln!(s, "  let sb0 = sg * 256u;");
+            let _ = writeln!(s, "  let er = lane / 2u; let ec = (lane % 2u) * 8u; let eb = sb0 + er * 16u + ec;");
+            for i in 0..fm {
+                for j in 0..fnn {
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0], 16u);");
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                    let _ = writeln!(s, "  {{ var hv: array<f32, 8>;");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let v = sc[eb + e]; let z = abs(v) * 0.70710678; let t = 1.0 / (1.0 + 0.3275911 * z); let er2 = 1.0 - (((((1.0614054 * t - 1.4531521) * t) + 1.4214138) * t - 0.28449672) * t + 0.2548296) * t * exp(-z * z); hv[e] = 0.5 * v * (1.0 + select(er2, -er2, v < 0.0)) * p.oscale; }}");
+                    let _ = writeln!(s, "    outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(hv[0], hv[1])), pack2x16float(vec2<f32>(hv[2], hv[3])), pack2x16float(vec2<f32>(hv[4], hv[5])), pack2x16float(vec2<f32>(hv[6], hv[7]))); }}", i * 16, j * 16);
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                }
+            }
+        }
         Epi::SwiGlu | Epi::SwiGluIn => {
             // Fragment pair (gate j=2q, up j=2q+1) → 16 output columns.
             // SwiGluIn: both accumulators times `pin` first (the input's
@@ -1534,7 +1586,7 @@ pub struct MmArgs {
     pub conv: [u32; 3],
 }
 
-fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
+pub(super) fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
     let w: [u32; 12] =
         [a.m, a.n, a.k, a.ldo, a.ocol, a.arow, a.oscale.to_bits(), 0, a.conv[0], a.conv[1], a.conv[2], 0];
     c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2535,7 +2587,7 @@ impl Call {
     }
 }
 
-fn flash_calls(
+pub(super) fn flash_calls(
     c: &Ctx,
     f: FlashCfg,
     nh: usize,

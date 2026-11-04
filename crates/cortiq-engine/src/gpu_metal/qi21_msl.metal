@@ -261,7 +261,7 @@ struct QFa {
     uint ldo;
     float oscale;
     uint use_vis;
-    uint pad0;
+    uint head0;   // first head of this dispatch (grid.y counts from it)
     uint pad1;
     uint pad2;
 };
@@ -292,7 +292,7 @@ kernel void qi_flash(
     constexpr uint NT = 32u * NSG, CH = 512u / NT;
     threadgroup half sk[32 * 128];
     threadgroup half sv[32 * 128];
-    const uint h = tg.y;
+    const uint h = tg.y + p.head0;
     const uint ntot = p.n_pre + p.n_own;
     const uint qbase = tg.x * (8u * NSG);
     const uint q0 = qbase + 8u * sg;
