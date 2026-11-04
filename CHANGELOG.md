@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.56] — 2026-11-04
+
+### Fixed
+- C ABI: a chat turn on a file with lookup records now goes through the file's own router,
+  the same engine calls as `cortiq serve`. `cortiq_chat` and `cortiq_chat_messages` went
+  straight to the pipeline, so on a phone Embryo-56M's small network answered a question its
+  `herbs` record holds, and made up the answer. A hit is the record's text word for word,
+  delivered through the callback as one piece with nothing generated (the call returns 0),
+  the `dontknow` topology refuses, and the earlier user turns of `cortiq_chat_messages` feed
+  the follow-up decision. φ runs on a separate backbone pipeline, so the chat's KV prefix
+  survives. Files without lookup records, `cortiq_complete` and generates over a peer are
+  unchanged.
+- C ABI: `cortiq_load` starts from the file's sampling recommendation, as `run` and `serve`
+  do, and `cortiq_chat_messages` honours `sampling.history_turns`. Embryo's free chat on a
+  phone ran without `loop_stop` and with the whole history in front of the network.
+
+### Added
+- `cortiq_last_route(handle)`: the decision of the last generate as JSON, the object
+  `cortiq serve` returns as `x_cortiq_route`. `target` names the record and `lookup_hit` says
+  the answer came from it.
+
 ## [0.8.55] — 2026-11-04
 
 ### Added

@@ -12,6 +12,7 @@ The surface — see [`include/cortiq.h`](include/cortiq.h):
 | `cortiq_chat(h, prompt, max, cb, user)` | one user turn through the chat template |
 | `cortiq_chat_messages(h, json, max, cb, user)` | multi-turn: `[{"role","content"},…]` through the template |
 | `cortiq_complete(h, prompt, max, cb, user)` | raw completion, no template |
+| `cortiq_last_route(h)` | the decision of the last generate as JSON: `target`, `lookup_hit`, `lookup_key`, `reason`… |
 | `cortiq_set_options(h, json)` | sampler options, partial JSON: `temperature`, `top_p`, `top_k`, `repetition_penalty`, `min_p`, `seed`, `greedy` |
 | `cortiq_free(h)` | release |
 | `cortiq_last_error()` / `cortiq_version()` | diagnostics |
@@ -24,10 +25,18 @@ cortiq_chat_messages(h,
     256, cb, user);
 ```
 
-Absent option keys keep their current values (defaults: 0.7 / 0.9 / 40 /
-1.1 / 0.05 / random seed); `"greedy": true` pins temperature to 0.
-History for `cortiq_chat_messages` is the caller's: pass the full
-conversation each call — the engine is stateless between calls.
+Absent option keys keep their current values (the file's own sampling
+recommendation, else 0.7 / 0.9 / 40 / 1.1 / 0.05 / random seed); `"greedy":
+true` pins temperature to 0. History for `cortiq_chat_messages` is the
+caller's: pass the full conversation each call — the engine is stateless
+between calls. A file with `sampling.history_turns` shows the network only that
+many of the last user turns.
+
+A file with lookup records (Embryo-56M) answers a chat turn the way `cortiq
+serve` does: its router decides on the last user message, and a hit is the
+record's text, delivered through the callback as one piece with nothing
+generated, so the call returns 0. `cortiq_last_route` names the record.
+Other files generate as before, and so does `cortiq_complete`.
 
 ## Android (JNI)
 
