@@ -104,6 +104,16 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo,显卡上的固定上限(0.8.58)
+
+[Turbo 文件](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf)让长提示下的显存保持不变,长提示的行一读完就进入内存或高速 SSD。任何长度的提示都能放进 16 GB 显卡。RTX 5090 上 64 000 个 token 时:15.7 GB 对 22.8 GB,首个 token 177 秒对 316 秒,解码 92 tok/s 对 51,文本中的密码和编码依然精确:
+
+```sh
+cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+```
+
+见[指南](docs/QWEN38_TURBO.zh.md)。
+
 ## Nemotron-Labs Dory 1.0 4B:循环 Transformer(0.8.57)
 
 [Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) 让 40 个子层组成的块在同一份权重上运行多次。

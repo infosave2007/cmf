@@ -114,6 +114,19 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo, a fixed ceiling on the card (0.8.58)
+
+[The turbo file](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) keeps device memory in place on long
+prompts, and a long prompt's rows go to RAM or to a fast SSD as they are read. It fits a 16 GB card at any
+prompt length. On an RTX 5090, at 64 000 tokens: 15.7 GB against 22.8 GB, first token 177 s against 316 s, decode
+92 tok/s against 51, with passwords and codes in the text still exact:
+
+```sh
+cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+```
+
+See [the guide](docs/QWEN38_TURBO.md).
+
 ## Nemotron-Labs Dory 1.0 4B, a looped transformer (0.8.57)
 
 [Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) runs a block of 40 sub-layers

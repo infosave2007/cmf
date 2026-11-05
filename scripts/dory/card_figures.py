@@ -4,8 +4,7 @@ card_figures.py SCORE.bin OUT_DIR   (SCORE.bin: `CMF_DORY_EXACT_LOG` of a prompt
 import json, math, os, subprocess, sys
 import numpy as np
 
-score_file, out = sys.argv[1:3]
-os.makedirs(out, exist_ok=True)
+out = "."
 SURF, INK, INK2, MUTE, LINE = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8983", "#dedcd5"
 BLUE, ORANGE, AQUA, GREY, TINT, TINT2 = "#2a78d6", "#eb6834", "#1baf7a", "#c9c7bf", "#eaf2fc", "#fdeee7"
 FONT = "Helvetica Neue, Arial, Hiragino Sans GB, Arial Unicode MS, sans-serif"
@@ -343,11 +342,14 @@ def compare_fig(lang):
     s.done(f"compare_{lang}")
 
 
-sc = np.fromfile(score_file, dtype=np.float32)
-frows = list(range(17421, 17427))
-for lang in T:
-    router_fig(lang)
-    far_fig(lang)
-    exact_fig(lang, sc, frows)
-    compare_fig(lang)
-print("ok")
+if __name__ == "__main__":
+    score_file, out = sys.argv[1:3]
+    os.makedirs(out, exist_ok=True)
+    sc = np.fromfile(score_file, dtype=np.float32)
+    frows = list(range(17421, 17427))
+    for lang in T:
+        router_fig(lang)
+        far_fig(lang)
+        exact_fig(lang, sc, frows)
+        compare_fig(lang)
+    print("ok")

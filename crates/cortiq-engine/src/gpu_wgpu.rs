@@ -50,6 +50,7 @@ pub(crate) mod moe_q82;
 pub(crate) mod dense_batch;
 /// Sealed O(1) layers on the batch graph: the whole prompt chunk at once.
 pub(crate) mod o1_batch;
+pub(crate) mod o1_stages;
 /// Gemma-4 on the batch graph (prompt ingest) and its q8_2f prompt GEMM.
 pub(crate) mod gemma_batch;
 /// d1's one-pass `set` forward over an LFM3 stack.
@@ -21249,7 +21250,17 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::ExperimentalFeatures::disabled()
         },
         memory_hints: if exact_alloc {
-            wgpu::MemoryHints::MemoryUsage
+            // "MemoryUsage" alone still grows its blocks to 64 MiB, and a 40 MiB tensor takes
+            // one of those whole: Qwen3.8-27B's 12.6 GiB of weights held 16.6 GiB of the card.
+            // At 16 MiB only the small buffers share blocks, at the same speed.
+            let mb = std::env::var("CMF_WGPU_BLOCK_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(16)
+                .clamp(4, 256);
+            wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: (mb << 20)..(mb << 20),
+            }
         } else {
             wgpu::MemoryHints::Performance
         },
@@ -29774,9 +29785,32 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.o1_push);
                         pass.set_bind_group(0, &bg_push, &[]);
                         pass.dispatch_workgroups(gg as u32, 1, 1);
-                        pass.set_pipeline(&c.o1_attend);
-                        pass.set_bind_group(0, &bg_att, &[]);
-                        pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                        if let Some(f) = o1_stages::pipes(c, hh_).filter(|_| hd % 4 == 0 && mm <= 32 && !rect_fm) {
+                            let st = {
+                                let map = c.o1m.lock().unwrap();
+                                map.get(&(kv_id, layer_base + li)).unwrap().stages.clone()
+                            };
+                            let site = |n: u32| 1000 + ((o1_epoch as u32) & 0xFFFF) * 8 + n;
+                            let (g32, nh32, e4) = (gg as u32, nh as u32, (hd / 4) as u32);
+                            let steps: [(&o1_stages::Pipe, wgpu::BindGroup, u32, u32); 7] = [
+                                (&f.score, bgc(site(0), li, &f.score.l, &[&st.u, &dmeta, &qout, &drk, &dsk, &st.sc]), ((ww + nns) as u32).div_ceil(32), g32),
+                                (&f.land, bgc(site(1), li, &f.land.l, &[&st.u, &qout, &dkt, &st.fs]), (mm as u32).div_ceil(32), g32),
+                                (&f.max, bgc(site(2), li, &f.max.l, &[&st.u, &dmeta, &st.sc, &st.nm]), nh32, 1),
+                                (&f.far, bgc(site(3), li, &f.far.l, &[&st.u, &dmeta, &st.fs, &st.nm, &dmu, &dmz, &st.hd, &st.gn]), nh32.div_ceil(8), 1),
+                                (&f.soft, bgc(site(4), li, &f.soft.l, &[&st.u, &dmeta, &st.sc, &st.hd, &st.inv]), nh32, 1),
+                                (&f.sum, bgc(site(5), li, &f.sum.l, &[&st.u, &dmeta, &st.sc, &drv, &dsv, &st.pz]), (g32 * 8 * e4).div_ceil(32), 1),
+                                (&f.add, bgc(site(6), li, &f.add.l, &[&st.u, &st.pz, &st.hd, &st.gn, &dth, &st.inv, &attn]), (nh32 * e4).div_ceil(32), 1),
+                            ];
+                            for (p, g, x, y) in &steps {
+                                pass.set_pipeline(&p.p);
+                                pass.set_bind_group(0, g, &[]);
+                                pass.dispatch_workgroups(*x, *y, 1);
+                            }
+                        } else {
+                            pass.set_pipeline(&c.o1_attend);
+                            pass.set_bind_group(0, &bg_att, &[]);
+                            pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                        }
                         drop(pass);
                         if std::env::var("CMF_O1_TRACE").is_ok() {
                             // Debug-only: stage this layer's o1 attention output
@@ -33007,6 +33041,8 @@ pub fn forward_batch_graph_at(
     // like the O(1) route; failures after that point must be terminal rather
     // than a stale CPU fallback.
     let mut state_started = false;
+    // A verify: sealed layers attend and their state waits for the accepted count.
+    let spec_run = spec.is_some();
     let Some(c) = ctx() else {
         bgraph_refused("no ctx");
         return batch_outcome(o1_started || state_started, false);
@@ -33796,7 +33832,7 @@ pub fn forward_batch_graph_at(
         return batch_outcome(o1_started || state_started, false);
     }
     if has_o1 {
-        if spec.is_some() {
+        if spec.is_some() && std::env::var("CMF_O1_SPEC").as_deref() == Ok("0") {
             bgraph_refused("o1 batch does not support speculative tail");
             return batch_outcome(o1_started || state_started, false);
         }
@@ -35208,8 +35244,18 @@ pub fn forward_batch_graph_at(
                             that: &dth,
                         };
                         o1_batch::encode(
-                            c, &mut enc, ob, &st, geom, &qall, &kb_b, &vb_b, &o1s, &attn_bb, k,
+                            c, &mut enc, ob, &st, geom, &qall, &kb_b, &vb_b, &o1s, &attn_bb, k, !spec_run,
                         );
+                        if spec_run {
+                            let stash = c.o1m.lock().unwrap().get(&(kv_id, layer_base + li)).map(|d| d.stages.clone());
+                            if let Some(t) = stash {
+                                flush_pass(&enc);
+                                let n = (k * nkv * hd * 4) as u64;
+                                enc.copy_buffer_to_buffer(&kb_b, 0, &t.spec_k, 0, n);
+                                enc.copy_buffer_to_buffer(&vb_b, 0, &t.spec_v, 0, n);
+                            }
+                        }
+                        o1_acap_copy(c, &mut enc, layer_base + li, &qall, &kb_b, &vb_b, k * nh * hd, k * nkv * hd);
                         if *output_gate {
                             let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
                             let mut pass = begin_pass(&mut enc);
@@ -37064,7 +37110,9 @@ pub fn forward_batch_graph_at(
         for (li, views) in o1.iter().enumerate() {
             if views.is_some() {
                 if let Some(d) = om.get_mut(&(kv_id, layer_base + li)) {
-                    d.next_pos = Some(next);
+                    if !spec_run {
+                        d.next_pos = Some(next);
+                    }
                 }
             }
         }
@@ -48463,6 +48511,8 @@ struct O1Dev {
     mu: wgpu::Buffer,
     mz: wgpu::Buffer,
     that: wgpu::Buffer,
+    stages: std::sync::Arc<o1_stages::Scratch>,
+    dk: usize,
     g: usize,
     h: usize,
     m: usize,
@@ -48519,11 +48569,124 @@ fn o1_qcap_buffer(c: &Ctx, layer: usize, floats: usize) -> Option<wgpu::Buffer> 
     })
 }
 
+/// The accepted rows of a verify: the sealed layers' state moves over them.
+pub fn o1_spec_commit(kv_id: u64, pos0: usize, rows: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(ob) = o1_batch::pipes(c) else { return false };
+    let _op = c.op_gate.enter();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("o1-spec-commit") });
+    {
+        let mut map = c.o1m.lock().unwrap();
+        for ((id, _), d) in map.iter_mut() {
+            if *id != kv_id {
+                continue;
+            }
+            let geom = o1_batch::Geom { g: d.g, hpg: d.h, m: d.m, w: d.w, ns: d.ns, rect_fm: false, d: d.dk, dv: d.dk, scale: d.scale };
+            let st = o1_batch::State {
+                meta: &d.meta,
+                ring_k: &d.ring_k,
+                ring_v: &d.ring_v,
+                sink_k: &d.sink_k,
+                sink_v: &d.sink_v,
+                k_tilde: &d.k_tilde,
+                qt: &d.qt,
+                mu: &d.mu,
+                mz: &d.mz,
+                that: &d.that,
+            };
+            o1_batch::commit_only(c, &mut enc, ob, &st, geom, &d.stages.spec_k, &d.stages.spec_v, &d.stages.spec_s, rows);
+            flush_pass(&enc);
+            d.next_pos = Some(pos0 + rows);
+        }
+    }
+    submit(c, finish_enc(enc));
+    true
+}
+
+/// A sealed prompt chunk's queries, keys and values on their way to host memory, for the
+/// far field's rebuild at the prompt's end. They never take room on the card.
+struct O1Acap {
+    /// (layer, q, k, v, q floats, k or v floats)
+    rows: Vec<(usize, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, usize, usize)>,
+}
+
+thread_local! {
+    static O1_ACAP: std::cell::RefCell<Option<O1Acap>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn o1_acap_begin() {
+    O1_ACAP.with(|a| *a.borrow_mut() = Some(O1Acap { rows: Vec::new() }));
+}
+
+pub fn o1_acap_end() {
+    O1_ACAP.with(|a| *a.borrow_mut() = None);
+}
+
+fn o1_acap_copy(c: &Ctx, enc: &mut wgpu::CommandEncoder, layer: usize, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, qf: usize, kf: usize) {
+    O1_ACAP.with(|a| {
+        let mut a = a.borrow_mut();
+        let Some(a) = a.as_mut() else { return };
+        flush_pass(&*enc);
+        let stage = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("o1-acap"),
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let (sq, sk, sv) = (stage(qf), stage(kf), stage(kf));
+        enc.copy_buffer_to_buffer(q, 0, &sq, 0, (qf * 4) as u64);
+        enc.copy_buffer_to_buffer(k, 0, &sk, 0, (kf * 4) as u64);
+        enc.copy_buffer_to_buffer(v, 0, &sv, 0, (kf * 4) as u64);
+        a.rows.push((layer, sq, sk, sv, qf, kf));
+    });
+}
+
+/// The rows captured since the last call: (layer, queries, keys, values).
+pub fn o1_acap_take() -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    let rows = O1_ACAP.with(|a| a.borrow_mut().as_mut().map(|a| std::mem::take(&mut a.rows)))?;
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let read = |b: &wgpu::Buffer, n: usize| -> Option<Vec<f32>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().ok()?.ok()?;
+        let mut out = vec![0f32; n];
+        out.copy_from_slice(bytemuck::cast_slice(&b.get_mapped_range(..).ok()?));
+        b.unmap();
+        Some(out)
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for (l, q, k, v, qf, kf) in &rows {
+        out.push((*l, read(q, *qf)?, read(k, *kf)?, read(v, *kf)?));
+    }
+    Some(out)
+}
+
 /// End the capture and read it back: per captured layer, every call's rows
 /// concatenated in order. None when no capture was armed or the readback
 /// failed; an armed capture is always cleared.
 pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
     let cap = O1_QCAP.with(|q| q.borrow_mut().take())?;
+    o1_qcap_read(cap)
+}
+
+/// What has been captured so far, off the card; the capture stays armed. A long prefix
+/// would otherwise hold every row's queries on the device.
+pub fn o1_qcap_drain() -> Option<Vec<(usize, Vec<f32>)>> {
+    let cap = O1_QCAP.with(|q| {
+        let mut q = q.borrow_mut();
+        let q = q.as_mut()?;
+        Some(O1QCap { layers: q.layers.clone(), bufs: std::mem::take(&mut q.bufs) })
+    })?;
+    o1_qcap_read(cap)
+}
+
+fn o1_qcap_read(cap: O1QCap) -> Option<Vec<(usize, Vec<f32>)>> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
     let total: usize = cap.bufs.iter().map(|(_, n, _)| n).sum();
@@ -48720,6 +48883,8 @@ fn o1_ensure_near(
         mu: stor_f(&mu, "o1-mu"),
         mz: stor_f(&mz, "o1-mz"),
         that: stor_f(&th, "o1-th"),
+        stages: std::sync::Arc::new(o1_stages::scratch(c, gcnt, hcnt, m, w, ns, d, g0.scale)),
+        dk: d,
         g: gcnt,
         h: hcnt,
         m,

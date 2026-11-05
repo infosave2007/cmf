@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.58] — 2026-11-05
+
+### Added
+- `cortiq far-turbo`: a file with the same weights that takes a far field on long prompts, with exact rows,
+  and stays exact on short ones. On Qwen3.8-27B, RTX 5090, at 64 000 tokens: device memory 22.8 → 15.7 GB, first
+  token 316 → 177 s, decode 51 → 92 tok/s, facts in 100 000 characters 12 of 12. It seals at 8192 rows, or at 4096
+  where the card's budget has no room: 15.0 GB with the budget of a 16 GB card. `CMF_O1_PREFIX_MAX`
+- A fixed ceiling for a long prompt: rows past the first seal leave the card as they are read, and the far field
+  is built from them one layer at a time. `--o1-spill DIR` (`CMF_O1_SPILL`) keeps them in files: at 64 000 tokens
+  3.0 GB of RAM and 18.7 GB of disk against 13.2 GB of RAM, at the same speed on a fast SSD.
+- Draft tokens over a far field: a verify attends without moving it, and `o1_spec_commit` moves it over the
+  accepted rows only. Greedy text is the same with drafts and without. `CMF_O1_SPEC=0`
+- The far field's attention in short threads on Vulkan, for a sealed token (`o1s_*`: 31.5 → 56 tok/s) and for a chunk
+  of rows (`o1c_*`: a verify of five rows 57 → 41 ms, a sealed prompt about 230 → 360 tok/s). `CMF_O1_STAGES=0`
+- The far field for a chunk of rows on Metal (`gpu_metal/o1c.rs`), near window up to 2052 keys: a token, a verify and a
+  prompt chunk take the same kernels, and the prompt's rows go the same way. MacBook Air M4 at 16 000 tokens: 6.3 GB beside
+  the mapped weights. An M4 decodes the 27B at about 5 tok/s at any length, so there the gain is memory.
+- `cortiq run --prompt-file`, for a prompt longer than a command line holds.
+
+### Changed
+- Vulkan: the allocator shares blocks of 16 MiB among small buffers, down from up to 64 MiB, where a 40 MiB tensor
+  took a block of its own. Qwen3.8-27B: 12.6 GB of weights held 16.6 GB of the card, now 13 GB, at the same speed.
+  `CMF_WGPU_BLOCK_MB`
+
 ## [0.8.57] — 2026-11-05
 
 ### Added

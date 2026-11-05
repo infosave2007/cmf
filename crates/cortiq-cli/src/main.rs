@@ -301,6 +301,11 @@ struct Cli {
     /// further back fades. `--o1` adds a far-field estimate of it.
     #[arg(long = "full-window", global = true, value_name = "N")]
     full_window: Option<usize>,
+
+    /// Keep a long prompt's rows in files in this directory instead of RAM, while the far
+    /// field is built (`--o1`, turbo files). About 300 KB a row on a 27B model.
+    #[arg(long, global = true, value_name = "DIR")]
+    o1_spill: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -1480,6 +1485,9 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
+        /// The prompt from a file, for one longer than a command line holds
+        #[arg(long = "prompt-file", value_name = "FILE", conflicts_with = "prompt")]
+        prompt_file: Option<std::path::PathBuf>,
         /// Image path, data URL, or HTTP(S) URL for a V4.1, MiMo or LFM3-VL
         /// prompt. Repeat the flag for several images (MiMo and V4.1 place
         /// them after the text, LFM3-VL before it).
@@ -1908,6 +1916,28 @@ enum Commands {
         /// How many rows those are
         #[arg(long, default_value_t = 512)]
         exact_rows: usize,
+    },
+    /// A turbo file for a model with full-attention layers: the same weights, and by
+    /// default long prompts in a far field of fixed size, with the rows it would lose
+    /// exact; shorter prompts stay as they are
+    FarTurbo {
+        /// Input .cmf
+        input: String,
+        /// Output .cmf
+        output: String,
+        /// Weights that choose the rows kept exact: `f32` count, then the weights
+        /// (scripts/dory/router/q27_feat.py)
+        #[arg(long)]
+        exact_weights: String,
+        /// How many rows those are
+        #[arg(long, default_value_t = 248)]
+        exact_rows: usize,
+        /// Far field: landmarks,window,sinks
+        #[arg(long, default_value = "32,1800,4")]
+        o1: String,
+        /// A prompt at least this long goes over to the far field
+        #[arg(long, default_value_t = 8192)]
+        seal: usize,
     },
     /// The frozen signal φ of one prompt per line: unit mean hidden state after a
     /// layer, as `f32` rows, for fitting topologies outside the engine
@@ -3975,6 +4005,9 @@ async fn main() -> anyhow::Result<()> {
         if let Some(m) = &cli.kv_cache {
             std::env::set_var("CMF_DORY_KV", m);
         }
+        if let Some(d) = &cli.o1_spill {
+            std::env::set_var("CMF_O1_SPILL", d);
+        }
         if let Some(n) = cli.full_window {
             std::env::set_var("CMF_DORY_FULL_WINDOW", n.to_string());
         }
@@ -4939,6 +4972,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             task,
             prompt,
+            prompt_file,
             images,
             videos,
             video_fps,
@@ -4982,6 +5016,10 @@ async fn main() -> anyhow::Result<()> {
             gpus,
             lookup_mode,
         } => {
+            let prompt = match prompt_file {
+                Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| anyhow::anyhow!("--prompt-file {}: {e}", f.display()))?),
+                None => prompt,
+            };
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -5102,6 +5140,7 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
         Commands::Phi { model, prompts, layer, out } => cmd_phi(&model, &prompts, layer, &out),
+        Commands::FarTurbo { input, output, exact_weights, exact_rows, o1, seal } => cmd_far_turbo(&input, &output, &exact_weights, exact_rows, &o1, seal),
         Commands::DoryTurbo { input, output, topologies, bias, o1, exact_weights, exact_rows } => {
             cmd_dory_turbo(&input, &output, &topologies, bias, &o1, exact_weights.as_deref(), exact_rows)
         }
@@ -8256,6 +8295,33 @@ fn cmd_fcd(
         )?);
         fcd_gen_check(&polished, &cfg, &va, "after")?;
     }
+    Ok(())
+}
+
+/// `cortiq far-turbo`: the same weights under a header that holds long prompts in a far
+/// field of fixed size.
+fn cmd_far_turbo(input: &str, output: &str, exact_weights: &str, exact_rows: usize, o1: &str, seal: usize) -> anyhow::Result<()> {
+    let model = CmfModel::open_sharded(input)?;
+    let mut header = model.header.clone();
+    let o: Vec<usize> = o1.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    anyhow::ensure!(o.len() == 3, "--o1 wants landmarks,window,sinks");
+    anyhow::ensure!(o[1] + o[2] + exact_rows <= 2052 && o[2] + exact_rows <= 255, "window, sinks and exact rows go over what the batch kernels hold");
+    let raw = std::fs::read(exact_weights)?;
+    let w: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    anyhow::ensure!(w.len() > 1 && w[0] as usize == w.len() - 1, "{exact_weights}: a count, then that many weights");
+    let mut prov = header.provenance.clone().unwrap_or_else(|| serde_json::json!({}));
+    prov["o1_turbo"] = serde_json::json!({ "layers": "all", "m": o[0], "w": o[1], "sink": o[2], "seal": seal, "exact_rows": exact_rows });
+    header.provenance = Some(prov);
+    let bytes: Vec<u8> = w[1..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut refs: Vec<cortiq_core::format::TensorSpecRef> = model
+        .tensors
+        .iter()
+        .filter(|e| e.name != "o1.exact.weights")
+        .map(|e| cortiq_core::format::TensorSpecRef { name: e.name.clone(), dtype: e.dtype, shape: e.shape.clone(), data: model.entry_bytes(e) })
+        .collect();
+    refs.push(cortiq_core::format::TensorSpecRef { name: "o1.exact.weights".to_string(), dtype: TensorDtype::F32, shape: vec![w.len() - 1], data: &bytes });
+    CmfModel::write_ref(output, &header, &refs, Some(&model.masks), model.vocab.as_deref())?;
+    println!("wrote {output}: {} tensors, far field {o1} from {seal} rows, {exact_rows} exact rows", refs.len());
     Ok(())
 }
 
@@ -12666,12 +12732,16 @@ async fn cmd_bench(
     // depth/TTFT and report the wrong path as `prefill_tok_s`.
     let o1_prefill_requested = std::env::var("CMF_O1_PREFILL")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok());
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| {
+            // Exact rows seal before the prompt's last rows: the bounded path too.
+            (std::env::var_os("CMF_O1_EXACT").is_some() || pipeline.is_far_turbo()).then(|| prompt_ids.len().saturating_sub(cortiq_engine::dory::EXACT_TAIL))
+        });
     // The pipeline's own route (env or the discrete-card default), so the
     // reported prefill is the one generation takes.
     let batch_k_requested = Some(pipeline.generation_batch_k()).filter(|k| *k > 0);
     let prefill_measurement = bench_generation_prefill_path(
-        pipeline.o1_active(),
+        pipeline.o1_active() || (pipeline.is_far_turbo() && prompt_ids.len() >= pipeline.far_turbo_seal()),
         mask.is_some(),
         prompt_ids.len(),
         o1_prefill_requested,

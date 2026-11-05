@@ -114,6 +114,19 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo, постоянный потолок на карте (0.8.58)
+
+[Турбо-файл](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) держит память карты на месте при длинных
+промптах, а строки длинного промпта по мере чтения уходят в RAM или на быстрый SSD. Файл помещается на карту 16 ГБ при
+любой длине промпта. На RTX 5090 на 64 000 токенов: 15,7 ГБ против 22,8 ГБ, первый токен 177 с против 316 с, декод 92
+ток/с против 51, а пароли и коды в тексте остаются точными:
+
+```sh
+cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+```
+
+Подробнее в [руководстве](docs/QWEN38_TURBO.ru.md).
+
 ## Nemotron-Labs Dory 1.0 4B, циклический трансформер (0.8.57)
 
 [Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) проходит блоком из 40 подслоёв

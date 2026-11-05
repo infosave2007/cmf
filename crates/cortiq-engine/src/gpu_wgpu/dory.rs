@@ -2025,7 +2025,8 @@ fn seal(c: &'static Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows
     // The chosen rows leave the far field: a copy of a fact there drowns the exact one.
     let keep = match (&m.exact, last) {
         (Some(x), true) => {
-            let layers: Vec<(&[f32], &[f32])> = got.iter().filter(|e| e.1 == 0).map(|e| (&e.2[..], &e.3[..])).collect();
+            let views: Vec<crate::dory::FlatRows> = got.iter().filter(|e| e.1 == 0).map(|e| crate::dory::FlatRows { k: &e.2, v: &e.3, nk, hd }).collect();
+            let layers: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
             crate::dory::pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
         }
         _ => Vec::new(),

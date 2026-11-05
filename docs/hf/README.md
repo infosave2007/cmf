@@ -16,6 +16,8 @@ hf upload infosave/Hy-MT2-cmf \
     docs/hf/Hy-MT2-cmf.md README.md
 hf upload infosave/Nemotron-Labs-Dory1.0-4B-cmf \
     docs/hf/Nemotron-Labs-Dory1.0-4B-cmf.md README.md
+hf upload infosave/Qwen3.8-27B-Turbo-cmf \
+    docs/hf/Qwen3.8-27B-Turbo-cmf.md README.md
 hf upload infosave/EmbeddingGemma-2-cmf \
     docs/hf/EmbeddingGemma-2-cmf.md README.md
 hf upload infosave/flint-cmf docs/hf/Flint-cmf.md README.md

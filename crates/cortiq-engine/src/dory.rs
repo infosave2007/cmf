@@ -156,10 +156,33 @@ fn rank_share(v: &[f32]) -> Vec<f32> {
     out
 }
 
+/// One layer's rows for the choice of exact ones, however its cache lays them out.
+pub trait LayerRows: Sync {
+    fn key(&self, kh: usize, r: usize) -> &[f32];
+    fn value(&self, kh: usize, r: usize) -> &[f32];
+}
+
+/// `[row][nk][hd]`, the layout of Dory's slots.
+pub struct FlatRows<'a> {
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub nk: usize,
+    pub hd: usize,
+}
+
+impl LayerRows for FlatRows<'_> {
+    fn key(&self, kh: usize, r: usize) -> &[f32] {
+        &self.k[(r * self.nk + kh) * self.hd..(r * self.nk + kh + 1) * self.hd]
+    }
+    fn value(&self, kh: usize, r: usize) -> &[f32] {
+        &self.v[(r * self.nk + kh) * self.hd..(r * self.nk + kh + 1) * self.hd]
+    }
+}
+
 /// Per row, how much of a head's key lies outside the span of `m` segment means.
-fn key_residuals(ks: &[f32], rows: usize, nk: usize, kh: usize, hd: usize, m: usize) -> Vec<f32> {
+fn key_residuals(l0: &dyn LayerRows, rows: usize, kh: usize, hd: usize, m: usize) -> Vec<f32> {
     const RIDGE: f64 = 1e-4;
-    let at = |r: usize| &ks[(r * nk + kh) * hd..(r * nk + kh + 1) * hd];
+    let at = |r: usize| l0.key(kh, r);
     let mut l = vec![0f32; m * hd];
     for a in 0..m {
         let (lo, hi) = (a * rows / m, ((a + 1) * rows / m).max(a * rows / m + 1).min(rows));
@@ -224,12 +247,15 @@ fn key_residuals(ks: &[f32], rows: usize, nk: usize, kh: usize, hd: usize, m: us
         .collect()
 }
 
-/// The rows to keep exact, ascending. `layers` are the full layers' keys and values,
-/// `[row][nk][hd]`; `lo..hi` the rows that can go, which leaves out the sinks and the
-/// window. A row goes with its neighbours until the budget is spent.
-pub fn pick_exact_rows(x: &ExactRows, layers: &[(&[f32], &[f32])], rows: usize, nk: usize, hd: usize, m: usize, lo: usize, hi: usize) -> Vec<usize> {
+/// The rows to keep exact, ascending. `lo..hi` are the rows that can go, which leaves
+/// out the sinks and the window. A row goes with its neighbours until the budget is spent.
+pub fn pick_exact_rows(x: &ExactRows, layers: &[&dyn LayerRows], rows: usize, nk: usize, hd: usize, m: usize, lo: usize, hi: usize) -> Vec<usize> {
     let hi = hi.min(rows);
-    if hi <= lo || x.weights.len() != layers.len() * 2 * nk || rows < 2 {
+    if hi <= lo || rows < 2 {
+        return Vec::new();
+    }
+    let dump = std::env::var("CMF_DORY_EXACT_FEATURES").ok();
+    if x.weights.len() != layers.len() * 2 * nk && dump.is_none() {
         return Vec::new();
     }
     let m = m.min(rows).max(1);
@@ -237,28 +263,44 @@ pub fn pick_exact_rows(x: &ExactRows, layers: &[(&[f32], &[f32])], rows: usize, 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16).min(tasks.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let total = std::sync::Mutex::new(vec![0f32; rows]);
+    let table = std::sync::Mutex::new(vec![0f32; if dump.is_some() { rows * tasks.len() * 2 } else { 0 }]);
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| loop {
                 let t = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&(l, kh)) = tasks.get(t) else { break };
-                let (ks, vs) = layers[l];
-                let res = rank_share(&key_residuals(ks, rows, nk, kh, hd, m));
+                let res = rank_share(&key_residuals(layers[l], rows, kh, hd, m));
                 let vn: Vec<f32> = (0..rows)
                     .map(|r| {
-                        let v = &vs[(r * nk + kh) * hd..(r * nk + kh + 1) * hd];
+                        let v = layers[l].value(kh, r);
                         crate::attention::dot_f32(v, v)
                     })
                     .collect();
                 let vn = rank_share(&vn);
-                let (wr, wv) = (x.weights[(l * 2) * nk + kh], x.weights[(l * 2 + 1) * nk + kh]);
-                let mut tot = total.lock().unwrap();
-                for r in 0..rows {
-                    tot[r] += wr * res[r] + wv * vn[r];
+                if dump.is_some() {
+                    let mut tb = table.lock().unwrap();
+                    let (f0, f1) = ((l * 2) * nk + kh, (l * 2 + 1) * nk + kh);
+                    let nf = tasks.len() * 2;
+                    for r in 0..rows {
+                        tb[r * nf + f0] = res[r];
+                        tb[r * nf + f1] = vn[r];
+                    }
+                }
+                if x.weights.len() == tasks.len() * 2 {
+                    let (wr, wv) = (x.weights[(l * 2) * nk + kh], x.weights[(l * 2 + 1) * nk + kh]);
+                    let mut tot = total.lock().unwrap();
+                    for r in 0..rows {
+                        tot[r] += wr * res[r] + wv * vn[r];
+                    }
                 }
             });
         }
     });
+    if let Some(f) = dump {
+        let tb = table.into_inner().unwrap();
+        let b: Vec<u8> = tb.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(f, b);
+    }
     let score = total.into_inner().unwrap();
     if let Ok(f) = std::env::var("CMF_DORY_EXACT_LOG") {
         let b: Vec<u8> = score.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1077,8 +1119,9 @@ fn seal_far(m: &Dory, st: &mut DoryState, o1: DoryO1, last: bool) {
         .collect();
     let keep = match (&m.exact, last) {
         (Some(x), true) => {
-            let layers: Vec<(&[f32], &[f32])> = full.iter().map(|&o| (&st.slots[o][0].k[..], &st.slots[o][0].v[..])).collect();
-            let rows = layers[0].0.len() / kv_row;
+            let views: Vec<FlatRows> = full.iter().map(|&o| FlatRows { k: &st.slots[o][0].k, v: &st.slots[o][0].v, nk, hd }).collect();
+            let layers: Vec<&dyn LayerRows> = views.iter().map(|v| v as &dyn LayerRows).collect();
+            let rows = views[0].k.len() / kv_row;
             pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
         }
         _ => Vec::new(),
@@ -1222,11 +1265,17 @@ impl Topologies {
 }
 
 fn exact_from_env() -> Option<ExactRows> {
-    let v = std::env::var("CMF_DORY_EXACT").ok()?;
+    exact_from_var("CMF_DORY_EXACT")
+}
+
+/// `FILE:rows` from a variable; a file that is not there gives no weights, which only
+/// dumps the features.
+pub fn exact_from_var(name: &str) -> Option<ExactRows> {
+    let v = std::env::var(name).ok()?;
     let (file, rows) = v.rsplit_once(':')?;
-    let b = std::fs::read(file).ok()?;
+    let b = std::fs::read(file).unwrap_or_default();
     let w: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    Some(ExactRows { weights: Arc::new(w.get(1..)?.to_vec()), budget: rows.parse().ok()? })
+    Some(ExactRows { weights: Arc::new(w.get(1..).unwrap_or(&[]).to_vec()), budget: rows.parse().ok()? })
 }
 
 fn gate_from_env() -> Option<Gate> {
@@ -1537,7 +1586,7 @@ mod tests {
         ks[200 * hd + 7] = 1.0;
         let vs = vec![1f32; rows * hd];
         let x = ExactRows { weights: Arc::new(vec![1.0, 0.0]), budget: 5 };
-        let keep = pick_exact_rows(&x, &[(&ks, &vs)], rows, nk, hd, 8, 4, 300);
+        let keep = pick_exact_rows(&x, &[&FlatRows { k: &ks, v: &vs, nk, hd }], rows, nk, hd, 8, 4, 300);
         assert_eq!(keep, vec![198, 199, 200, 201, 202]);
     }
 
