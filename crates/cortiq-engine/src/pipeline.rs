@@ -4658,7 +4658,7 @@ impl Pipeline {
         }
         #[cfg(target_os = "macos")]
         if self.o1_active() && self.o1_on_graph() && crate::gpu::q1_force() && crate::gpu::enabled_here() {
-            return 128;
+            return if crate::gpu_metal::ane::wanted() { 512 } else { 128 };
         }
         // The sealed O(1) suffix of a bounded prompt (`CMF_O1_PREFILL`) on
         // the device route rides the batch graph, whose O(1) kernels take
@@ -6306,7 +6306,8 @@ impl Pipeline {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&v| (16..=512).contains(&v))
-                .unwrap_or(256);
+                // The ANE's weights go once a chunk: a larger one pays them over more rows.
+                .unwrap_or(if crate::gpu_metal::ane::wanted() { 512 } else { 256 });
             let hs = self.hidden_size;
             let _tp = std::time::Instant::now();
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -16147,6 +16148,21 @@ impl Pipeline {
         }) else {
             return MetalRowsRun::Declined;
         };
+        if prefill {
+            let mut ffns = Vec::new();
+            let mut note = |f: &crate::gpu_metal::MetalFfn<'_>| {
+                if let crate::gpu_metal::MetalFfn::Dense { gate, up, down, act: 0 } = f {
+                    ffns.push((*gate, *up, *down));
+                }
+            };
+            for item in &plan {
+                match item {
+                    MetalRowsItem::Gdn { run, .. } => run.iter().for_each(|l| note(&l.ffn)),
+                    MetalRowsItem::Attn { l, .. } => note(&l.ffn),
+                }
+            }
+            graph.ane_attach(&ffns);
+        }
         let geom = (
             self.num_heads,
             self.num_kv_heads,

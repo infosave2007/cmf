@@ -39,6 +39,7 @@ pub mod vit;
 pub mod uocr;
 // Dory's looped stack.
 pub mod dory;
+pub mod ane;
 pub mod o1c;
 pub mod primal_vae;
 pub mod mhc;
@@ -23118,6 +23119,10 @@ pub struct VerifyGraph {
     /// output readback is allowed after it, and callers must not fall back to
     /// a serial path against partially mutated device state.
     failed: bool,
+    /// A prompt chunk's FFNs on the Neural Engine, and the one whose input the open encoder
+    /// is packing: the ANE's layer, gate, up and down.
+    ane: Option<Arc<ane::AneFfn>>,
+    ane_job: Option<(usize, (usize, usize, usize), (usize, usize, usize), (usize, usize, usize))>,
 }
 
 const VBUF_BASE: usize = 60_000_000_000;
@@ -23401,6 +23406,8 @@ impl VerifyGraph {
             prefill: false,
             pending_delta: false,
             failed: false,
+            ane: None,
+            ane_job: None,
         })
     }
 
@@ -23722,12 +23729,39 @@ impl VerifyGraph {
         };
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
+        // The Neural Engine takes this FFN: its input now, the rest once this encoder ends.
+        if let Some(a) = self.ane.clone() {
+            if let Some((abs, ProjKind::Q4tp)) = self.batch_abs(*gate) {
+                if let Some(li) = a.layer_of(abs).filter(|_| a.takes(self.b)) {
+                    a.encode_input(enc, &self.n_b, self.b);
+                    self.ane_job = Some((li, *gate, *up, *down));
+                    self.pending_delta = true;
+                    return;
+                }
+            }
+        }
+        let (gate, up, down) = (*gate, *up, *down);
+        self.ffn_gpu(enc, gate, up, down);
+        // the residual add rides in the next layer's norm
+        self.pending_delta = true;
+        let _ = c;
+    }
+
+    /// The FFN on the GPU: `n_b` into `d_b`.
+    fn ffn_gpu(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        gate: (usize, usize, usize),
+        up: (usize, usize, usize),
+        down: (usize, usize, usize),
+    ) {
+        let c = self.tg.c;
         let inter = gate.1;
         let fg = Self::vbuf(c, 7, 0, self.bc * inter * 4);
         let fu = Self::vbuf(c, 8, 0, self.bc * inter * 4);
         let fa = Self::vbuf(c, 9, 0, self.bc * inter * 4);
-        self.gemm(enc, *gate, &self.n_b, &fg, &self.ones);
-        self.gemm(enc, *up, &self.n_b, &fu, &self.ones);
+        self.gemm(enc, gate, &self.n_b, &fg, &self.ones);
+        self.gemm(enc, up, &self.n_b, &fu, &self.ones);
         // silu(g)·u and the row pre-scale in one pass
         disp(
             enc,
@@ -23737,9 +23771,104 @@ impl VerifyGraph {
             &[],
             ((self.b * 256) as u64, 256),
         );
-        self.gemm(enc, *down, &fa, &self.d_b, &self.xsc);
-        // the residual add rides in the next layer's norm
-        self.pending_delta = true;
+        self.gemm(enc, down, &fa, &self.d_b, &self.xsc);
+    }
+
+    /// A prompt chunk's FFNs go to the Neural Engine when it takes all of `ffns`' q4tp shapes.
+    pub fn ane_attach(&mut self, ffns: &[((usize, usize, usize), (usize, usize, usize), (usize, usize, usize))]) {
+        if !self.prefill || self.b < 64 || ffns.is_empty() {
+            return;
+        }
+        let mut layers = Vec::with_capacity(ffns.len());
+        for (g, u, d) in ffns {
+            let proj = |t: (usize, usize, usize)| match self.batch_abs(t) {
+                Some((abs, ProjKind::Q4tp)) => Some(ane::Proj { abs, rows: t.1, cols: t.2 }),
+                _ => None,
+            };
+            // A layer of another codec stays on the GPU.
+            if let (Some(a), Some(b), Some(c)) = (proj(*g), proj(*u), proj(*d)) {
+                layers.push([a, b, c]);
+            }
+        }
+        if layers.is_empty() {
+            return;
+        }
+        self.ane = ane::ffn_for(self.tg.c, &self.tg.fbuf, layers);
+    }
+
+    /// The Neural Engine's turn, after the encoder that packed its input: that command runs to
+    /// its end, the ANE takes the layer, and its output becomes `d_b`. A failure gives the
+    /// layer to the GPU, whose `n_b` is intact, and every later one.
+    fn ane_finish(&mut self) -> bool {
+        let Some((li, gate, up, down)) = self.ane_job.take() else {
+            return true;
+        };
+        let c = self.tg.c;
+        let a = self.ane.clone().unwrap();
+        let t_gpu = std::time::Instant::now();
+        if let Some(cmd) = self.cmd.take() {
+            cmd.commit();
+            cmd.wait_until_completed();
+            if cmd.status() == metal::MTLCommandBufferStatus::Error {
+                self.failed = true;
+                return false;
+            }
+        }
+        a.ms.lock().unwrap().2 += t_gpu.elapsed().as_secs_f64() * 1e3;
+        let mut ok = match a.run(c, &self.tg.fbuf, li, self.b) {
+            Ok(()) => true,
+            Err(e) => {
+                ane::retire(&e);
+                false
+            }
+        };
+        if ok {
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            a.encode_join(enc, &self.d_b, self.b);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            if a.not_finite() || cmd.status() == metal::MTLCommandBufferStatus::Error {
+                ane::retire("an output that is not finite");
+                ok = false;
+            }
+        }
+        let check = ok && std::env::var("CMF_ANE_CHECK").is_ok();
+        if !ok || check {
+            let n = self.b * self.tg.dims.hidden;
+            let ours: Vec<f32> = if check {
+                // SAFETY: a shared buffer of at least `n` floats, and no command is running.
+                unsafe { std::slice::from_raw_parts(self.d_b.contents() as *const f32, n).to_vec() }
+            } else {
+                Vec::new()
+            };
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            self.ffn_gpu(enc, gate, up, down);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            if cmd.status() == metal::MTLCommandBufferStatus::Error {
+                self.failed = true;
+                return false;
+            }
+            if check {
+                // SAFETY: as above; the GPU's FFN is done.
+                let gpu = unsafe { std::slice::from_raw_parts_mut(self.d_b.contents() as *mut f32, n) };
+                let (mut e, mut t) = (0f64, 0f64);
+                for (x, y) in ours.iter().zip(gpu.iter()) {
+                    e += ((x - y) as f64).powi(2);
+                    t += (*y as f64).powi(2);
+                }
+                eprintln!("ane-check layer {li} rows {}: relative rms {:.4}", self.b, (e / t.max(1e-30)).sqrt());
+                gpu.copy_from_slice(&ours);
+            }
+        }
+        if !ok {
+            self.ane = None;
+        }
+        true
     }
 
     /// A run of consecutive GDN layers over the b rows. `states` are the
@@ -23773,8 +23902,8 @@ impl VerifyGraph {
         let c = self.tg.c;
         let b = self.b;
         let vd = cfg.nv * cfg.dv;
-        let cmd = self.ensure_cmd();
         for (l, st) in layers.iter().zip(states) {
+            let cmd = self.ensure_cmd();
             let slot = self.gdn.len();
             let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {
                 Some(b) => (b, 0usize),
@@ -23891,6 +24020,9 @@ impl VerifyGraph {
             self.gemm(enc, l.out, &of_b, &self.d_b, &self.ones);
             self.post_ffn(enc, l.post_norm, &l.ffn);
             enc.end_encoding();
+            if !self.ane_finish() {
+                return false;
+            }
             self.gdn.push(VerifyGdnSlot {
                 st: s_b,
                 st_len,
@@ -24108,7 +24240,7 @@ impl VerifyGraph {
             self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
             self.post_ffn(enc, l.post_norm, &l.ffn);
             enc.end_encoding();
-            return true;
+            return self.ane_finish();
         }
         let (k_mb, v_mb, cap, stored) = mirror.unwrap();
         // append the b rows
@@ -24220,7 +24352,7 @@ impl VerifyGraph {
         self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
         self.post_ffn(enc, l.post_norm, &l.ffn);
         enc.end_encoding();
-        true
+        self.ane_finish()
     }
 
     /// Final norm + lm_head over the b rows; read with `read_logits`
