@@ -75,7 +75,7 @@ accepted ones only. Greedy text stays the same with and without drafts.
 
 RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length.
 
-| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak device memory, GB (standard) | peak device memory, GB (**turbo**) |
+| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak VRAM, GB (standard) | peak VRAM, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
 | 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
@@ -211,7 +211,7 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 
 RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промпта этой длины.
 
-| промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик памяти карты, ГБ (обычный) | пик памяти карты, ГБ (**турбо**) |
+| промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик VRAM, ГБ (обычный) | пик VRAM, ГБ (**турбо**) |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 000 | 2,2 | **2,2** | 105 | **105** | 14,5 | **14,4** |
 | 4 000 | 8,8 | **8,8** | 104 | **104** | 14,9 | **14,8** |
