@@ -114,6 +114,20 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Nemotron-Labs Dory 1.0 4B, циклический трансформер (0.8.57)
+
+[Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) проходит блоком из 40 подслоёв
+несколько раз по одним и тем же весам. Турбо-файл на 2,09 ГБ выбирает один проход или два для каждого
+токена резонансным роутером, держит длинный промпт в 0,5 ГБ памяти устройства и сохраняет пароли и коды
+точными, выбирая их по работе самих слоёв. NVIDIA L4 декодирует 61 ток/с на реальных запросах и 54 ток/с
+при контексте 64 000 токенов, MacBook Air M4 — 33 и 29 при 16 000:
+
+```sh
+cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, которая разворачивает список." --no-think
+```
+
+См. [руководство](docs/DORY.ru.md).
+
 ## Kandinsky S2V 1.0 Pro-distill: из речи в видео (0.8.55)
 
 [Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)

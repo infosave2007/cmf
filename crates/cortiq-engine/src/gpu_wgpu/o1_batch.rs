@@ -617,6 +617,95 @@ pub(crate) fn encode(
     }
 }
 
+/// One sub-chunk of [`encode`] as recorded dispatches, for a caller that replays
+/// them. Without `commit` the rows attend and the state stays where it was: a later
+/// pass over the same positions commits its own keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn steps(
+    c: &Ctx,
+    p: &Pipes,
+    st: &State<'_>,
+    geom: Geom,
+    q: &wgpu::Buffer,
+    kb: &wgpu::Buffer,
+    vb: &wgpu::Buffer,
+    scratch: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    rows: usize,
+    commit: bool,
+) -> Vec<(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)> {
+    let bind = |l: &wgpu::BindGroupLayout, e: &[(u32, &wgpu::Buffer)]| {
+        let entries: Vec<_> = e.iter().map(|(i, b)| bind_buf(*i, b)).collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: l, entries: &entries })
+    };
+    let ghm = (geom.g * geom.hpg * geom.m) as u32;
+    let u = uniform_rope(
+        c,
+        [
+            geom.hpg as u32,
+            geom.m as u32,
+            geom.w as u32,
+            (geom.ns as u32) | (u32::from(geom.rect_fm) << 8),
+            geom.d as u32,
+            geom.dv as u32,
+            geom.scale.to_bits(),
+            rows as u32,
+            (geom.g * geom.hpg) as u32,
+            geom.g as u32,
+            0,
+            0,
+        ],
+    );
+    let mut v = vec![
+        (
+            p.far_e.0.clone(),
+            bind(&p.far_e.1, &[(0, st.meta), (1, st.ring_k), (6, st.qt), (8, st.mz), (13, scratch), (15, &u)]),
+            ghm,
+            1,
+        ),
+        (
+            p.attend.0.clone(),
+            bind(
+                &p.attend.1,
+                &[
+                    (0, st.meta),
+                    (1, st.ring_k),
+                    (2, st.ring_v),
+                    (3, st.sink_k),
+                    (4, st.sink_v),
+                    (5, st.k_tilde),
+                    (7, st.mu),
+                    (9, st.that),
+                    (10, q),
+                    (11, kb),
+                    (12, vb),
+                    (13, scratch),
+                    (14, out),
+                    (15, &u),
+                ],
+            ),
+            (geom.g * geom.hpg) as u32,
+            rows as u32,
+        ),
+    ];
+    if commit {
+        v.push((
+            p.far_commit.0.clone(),
+            bind(&p.far_commit.1, &[(0, st.meta), (2, st.ring_v), (8, st.mz), (9, st.that), (13, scratch), (15, &u)]),
+            ghm,
+            1,
+        ));
+        v.push((
+            p.ring_commit.0.clone(),
+            bind(&p.ring_commit.1, &[(0, st.meta), (1, st.ring_k), (2, st.ring_v), (11, kb), (12, vb), (15, &u)]),
+            geom.g as u32,
+            rows as u32,
+        ));
+        v.push((p.meta.0.clone(), bind(&p.meta.1, &[(0, st.meta), (15, &u)]), 1, 1));
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

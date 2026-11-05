@@ -14,6 +14,8 @@ hf upload infosave/Granite-4.2-cmf \
     docs/hf/Granite-4.2-cmf.md README.md
 hf upload infosave/Hy-MT2-cmf \
     docs/hf/Hy-MT2-cmf.md README.md
+hf upload infosave/Nemotron-Labs-Dory1.0-4B-cmf \
+    docs/hf/Nemotron-Labs-Dory1.0-4B-cmf.md README.md
 hf upload infosave/EmbeddingGemma-2-cmf \
     docs/hf/EmbeddingGemma-2-cmf.md README.md
 hf upload infosave/flint-cmf docs/hf/Flint-cmf.md README.md

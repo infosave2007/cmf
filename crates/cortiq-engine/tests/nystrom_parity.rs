@@ -627,3 +627,36 @@ fn wide_window_group_is_exact_attention() {
         "nothing may leave a window that covers the stream"
     );
 }
+
+/// A later pass over a position replaces its row and leaves the far field alone: the
+/// same state as if only the later pass had ever run.
+#[test]
+fn restep_replaces_the_row_and_keeps_the_far_field() {
+    let (d, p, nh) = (8usize, 40usize, 2usize);
+    let mut seed = 7u32;
+    let mut rnd = move |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    };
+    let (q0, q1, k, v) = (rnd(p * d), rnd(p * d), rnd(p * d), rnd(p * d));
+    let start = || {
+        let mut s = NystromState::new_group(4, 6, 0, nh);
+        s.prefill_group(&[&q0[..], &q1[..]], &k, &v, p, d, d);
+        s
+    };
+    let (mut twice, mut once) = (start(), start());
+    let (mut a, mut b) = (vec![0f32; nh * d], vec![0f32; nh * d]);
+    for _ in 0..20 {
+        let (q, k1, v1, k2, v2) = (rnd(nh * d), rnd(d), rnd(d), rnd(d), rnd(d));
+        twice.step_group(&q, &k1, &v1, &mut a);
+        twice.restep_group(&q, &k2, &v2, &mut a);
+        once.step_group(&q, &k2, &v2, &mut b);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+        }
+    }
+}

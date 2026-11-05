@@ -1160,9 +1160,10 @@ impl Pipeline {
 
         // ── Top-level weights (never masked → always quantized) ──
         let embed_tokens = load_matrix(model, "model.embed_tokens.weight", false, ov)?;
-        let final_norm = if arch.qwen4_exp.is_some() {
+        let final_norm = if arch.qwen4_exp.is_some() || arch.dory.is_some() {
             // qwen4_exp folds its four streams through a learned global
-            // hyper mixer and has no conventional final RMSNorm.
+            // hyper mixer and has no conventional final RMSNorm; Dory's hidden
+            // state is on the unit sphere and goes straight to the head.
             vec![0.0; arch.hidden_size]
         } else {
             load_f32(model, "model.norm.weight", ov).map_err(err)?
@@ -1869,6 +1870,7 @@ impl Pipeline {
         let owns_its_layers = is_g3n
             || arch.arch_name == "deepseek_v4"
             || arch.arch_name == "deepseek_v41"
+            || arch.dory.is_some()
             || arch.qwen4_exp.is_some();
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
@@ -2546,6 +2548,11 @@ impl Pipeline {
                 window: arch.sliding_window.unwrap_or(512),
             };
             pipeline.g3n = Some(Box::new((globals, g3n_layers)));
+        }
+        // Dory: its own stack (`dory`), selected by the arch record.
+        if arch.dory.is_some() {
+            let m = crate::dory::Dory::from_model(model).map_err(CmfError::Parse)?;
+            pipeline.dory = Some(Box::new((m, crate::dory::DoryState::default())));
         }
         // DeepSeek-V4.1: its own stack, selected by the preserved source
         // configuration. The generic layer loop cannot represent shared

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.57] — 2026-11-05
+
+### Added
+- Nemotron-Labs Dory 1.0 4B (`dory`), NVIDIA's looped normalized transformer: conversion, the host
+  stack, a resident graph on Vulkan and on Metal, `q8_2f` and `q4tp` with GPTQ. `--loops N|auto`,
+  `--kv-cache per_loop|last_loop`, `--full-window`, tool calls and reasoning in `serve`. Greedy text on
+  the raw prompt is identical to the f32 reference, which matches vLLM on 64 of 64 tokens.
+- `cortiq dory-turbo`: the same weights under a header that switches on a last-loop cache, a resonance
+  router, a far field on the full layers, one pass over a prompt and exact rows. The router decides one
+  pass or two from the state after the first one, with two PCA subspaces and no read-out. NVIDIA L4:
+  49.6 → 60.7 tok/s on real prompts, 14.1 → 54.0 at 32 000 tokens of context, 53.0 at 64 000, device KV
+  4.3 → 0.5 GB. MacBook Air M4: 25.7 → 32.9 and 14.8 → 29.3 at 16 000.
+- Exact rows for a far field: the rows it would lose stay exact, chosen by a linear fit over ranks of
+  key residuals and value norms, with no word lists, and the far field is built anew without them
+  before a prompt's last rows. Facts in 100 000 characters: 8 of 8, against 1 of 8 without the order. `CMF_DORY_EXACT`, `CMF_DORY_EXACT_LOG`, `dory.exact.weights`.
+- The far field's attention in short threads on Vulkan and Metal (`dory_os` … `dory_ogate`): a sealed
+  token 25.0 → 35.7 tok/s on L4 at the same perplexity.
+- `cortiq phi`: the frozen signal of a prompt per line.
+
 ## [0.8.56] — 2026-11-04
 
 ### Fixed

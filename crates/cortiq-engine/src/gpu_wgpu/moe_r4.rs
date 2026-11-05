@@ -1059,12 +1059,28 @@ pub(crate) fn q82sg_encode(
     cols: usize,
     mats: &[(&wgpu::Buffer, &wgpu::Buffer, usize)],
 ) -> bool {
-    let Some(ps) = pipes(c) else { return false };
-    let Some((p, l)) = ps.q82sg.as_ref() else {
+    let Some((p, bind, groups)) = q82sg_prep(c, x, cols, mats) else {
         return false;
     };
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(&p);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(groups, 1, 1);
+    true
+}
+
+/// The pipeline, bind group and workgroups of `q82sg_encode`, for a caller
+/// that records its dispatches once.
+pub(crate) fn q82sg_prep(
+    c: &Ctx,
+    x: &wgpu::Buffer,
+    cols: usize,
+    mats: &[(&wgpu::Buffer, &wgpu::Buffer, usize)],
+) -> Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+    let ps = pipes(c)?;
+    let (p, l) = ps.q82sg.as_ref()?;
     if cols % 16 != 0 || cols > 4096 || mats.is_empty() || mats.len() > 3 {
-        return false;
+        return None;
     }
     let rows_max = mats.iter().map(|m| m.2).max().unwrap_or(0);
     // Rows per warp: enough workgroups to fill the card on the narrow
@@ -1095,13 +1111,9 @@ pub(crate) fn q82sg_encode(
     });
     let groups: usize = (0..3).map(|i| r(i).div_ceil(per)).sum();
     if groups as u32 > MAX_WG {
-        return false;
+        return None;
     }
-    let mut pass = begin_pass(enc);
-    pass.set_pipeline(p);
-    pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups(groups as u32, 1, 1);
-    true
+    Some((p.clone(), bind, groups as u32))
 }
 
 fn build_sg(c: &Ctx) -> Option<Sg> {

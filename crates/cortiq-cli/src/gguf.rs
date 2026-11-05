@@ -1269,6 +1269,7 @@ fn arch_from_md(
         moe,
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         anchor_core: None,
         linear_core: if is_q35 {
@@ -1729,6 +1730,7 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         moe: None,
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         anchor_core: None,
         linear_core: None,
