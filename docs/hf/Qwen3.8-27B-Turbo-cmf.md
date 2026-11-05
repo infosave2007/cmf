@@ -99,7 +99,7 @@ memory.
 
 **On a Mac.** MacBook Air M4, 24 GB, Metal: at 16 000 tokens the process stays at 6.3 GB beside the mapped
 weights, first token 545 s, decode 4 tok/s. A planted fact in 40 000 characters came back whole. An M4 decodes this
-model at about 5 tok/s at any length, bound by its matrix speed, so on a Mac the file saves memory and not time.
+model at about 5 tok/s at any length, bound by its matrix speed, so on a Mac the file saves memory and not time. Drafts do not pay there, 4.6 tok/s with them against 4.9 without, and stay off.
 
 **Host memory.** While a long prompt is read, its rows take RAM or a disk. The mapped weights are not
 counted here; the system can drop them from RAM.
@@ -237,7 +237,7 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 
 **На Маке.** MacBook Air M4, 24 ГБ, Metal: на 16 000 токенов процесс держится на 6,3 ГБ помимо отображённых весов,
 первый токен 545 с, декод 4 ток/с. Факт, вставленный в 40 000 символов, вернулся целым. M4 декодирует эту модель примерно
-на 5 ток/с при любой длине, упираясь в скорость умножения матриц, поэтому на Маке файл экономит память, а не время.
+на 5 ток/с при любой длине, упираясь в скорость умножения матриц, поэтому на Маке файл экономит память, а не время. Черновики там не окупаются, 4,6 ток/с против 4,9 без них, и остаются выключенными.
 
 **Память хоста.** Пока читается длинный промпт, его строки занимают RAM или диск. Отображённые в память
 веса здесь не считаются: система может выгрузить их из RAM.
@@ -354,7 +354,7 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 
 **在 16 GB 显卡上。** 在同一张 5090 上设置这种显卡的预算(`CMF_GPU_VRAM_MB=15000`),文件在 4096 行封存,保持在 15.0 GB。首个 token:16 000 时 43 秒,32 000 时 87 秒,64 000 时 176 秒,解码 92 tok/s。真正的 16 GB 显卡计算单元更少,因此相同显存下速度会更低。
 
-**在 Mac 上。** MacBook Air M4,24 GB,Metal:16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s。插入 40 000 字符中的事实完整返回。M4 在任何长度下解码这个模型约为 5 tok/s,受矩阵运算速度限制,所以在 Mac 上这个文件节省的是内存,而不是时间。
+**在 Mac 上。** MacBook Air M4,24 GB,Metal:16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s。插入 40 000 字符中的事实完整返回。M4 在任何长度下解码这个模型约为 5 tok/s,受矩阵运算速度限制,所以在 Mac 上这个文件节省的是内存,而不是时间。草稿在那里不划算(有草稿 4.6 tok/s,没有 4.9 tok/s),默认保持关闭。
 
 **主机内存。** 读取长提示时,它的行占用内存或磁盘。这里不计内存映射的权重,系统可以把它们移出内存。
 

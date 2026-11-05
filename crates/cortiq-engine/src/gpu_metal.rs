@@ -19259,7 +19259,11 @@ fn o1_ensure_metal(
         }
     }
     let g0 = views.first()?;
-    let (gcnt, hcnt, m, w, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.w, g0.sink_len);
+    // Groups may widen their own window: the ring stride is the widest one, each group's width
+    // rides in meta slot 3 (the chunk kernels read it, the old ones refuse below).
+    let w = views.iter().map(|v| v.w).max()?;
+    let mixed = views.iter().any(|v| v.w != w);
+    let (gcnt, hcnt, m, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.sink_len);
     // Same geometry gates as the wgpu port — and just as loud: a
     // silent refusal here costs the whole token its graph.
     if ns + w > max_near || m > 32 || g0.d > 256 || g0.dv > 256 {
@@ -19273,7 +19277,7 @@ fn o1_ensure_metal(
         return None;
     }
     for v in views {
-        if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
+        if v.m_eff != m || v.sink_len != ns || v.heads.len() != hcnt {
             tracing::warn!(
                 "o1-metal L{li}: group m_eff {} w {} sink {} heads {} vs first {m}/{w}/{ns}/{hcnt}",
                 v.m_eff,
@@ -19290,7 +19294,7 @@ fn o1_ensure_metal(
     let (mut rk, mut rv, mut sk, mut sv, mut kt) = (vec![], vec![], vec![], vec![], vec![]);
     let (mut qt, mut mu, mut mz, mut th) = (vec![], vec![], vec![], vec![]);
     for v in views {
-        meta.extend_from_slice(&[v.win_len as u32, v.win_head as u32, v.far_len as u32, 0]);
+        meta.extend_from_slice(&[v.win_len as u32, v.win_head as u32, v.far_len as u32, v.w as u32]);
         // Ring buffers are cap-sized already (cap = w in skeleton mode).
         rk.extend_from_slice(v.win_k);
         rk.resize(rk.len() + (w * d - v.win_k.len().min(w * d)), 0.0);
@@ -19349,6 +19353,10 @@ fn o1_ensure_metal(
         spec_k: c._device.new_buffer((o1c::OB_K * gcnt * d * 4) as u64, MTLResourceOptions::StorageModeShared),
         spec_v: c._device.new_buffer((o1c::OB_K * gcnt * dv * 4) as u64, MTLResourceOptions::StorageModeShared),
     };
+    if mixed && !o1c::admits(c, &dev) {
+        tracing::warn!("o1-metal L{li}: groups of different windows need the chunk kernels");
+        return None;
+    }
     let ret = dev.clone();
     c.o1m.lock().unwrap().insert((kv_id, li), dev);
     Some(ret)
