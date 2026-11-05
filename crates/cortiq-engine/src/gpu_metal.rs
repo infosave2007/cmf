@@ -23354,12 +23354,10 @@ impl VerifyGraph {
     }
 
     fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
-        // the key carries the size (io_buf caches by key alone)
-        io_buf(
-            c,
-            VBUF_BASE + kind * 1_000_000_000_000 + slot * 1_000_000_000 + nbytes / 16,
-            nbytes,
-        )
+        // One buffer per kind and slot, replaced only by a larger one. With the size in the
+        // key every chunk size left a set behind for each of the 48 GDN layers, and nothing
+        // frees them: Qwen3.8-27B at 10 000 tokens held 14.6 GB (`io_buf_grow`).
+        io_buf_grow(c, VBUF_BASE + kind * 1_000_000_000_000 + slot * 1_000_000_000, nbytes)
     }
 
     pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
@@ -23793,7 +23791,7 @@ impl VerifyGraph {
         if layers.is_empty() {
             return;
         }
-        self.ane = ane::ffn_for(self.tg.c, &self.tg.fbuf, layers);
+        self.ane = ane::ffn_for(self.tg.c, layers);
     }
 
     /// The Neural Engine's turn, after the encoder that packed its input: that command runs to
@@ -23815,7 +23813,7 @@ impl VerifyGraph {
             }
         }
         a.ms.lock().unwrap().2 += t_gpu.elapsed().as_secs_f64() * 1e3;
-        let mut ok = match a.run(c, &self.tg.fbuf, li, self.b) {
+        let mut ok = match a.run(&self.tg.fbuf, li, self.b) {
             Ok(()) => true,
             Err(e) => {
                 ane::retire(&e);
@@ -23910,13 +23908,16 @@ impl VerifyGraph {
                 None => (Self::vbuf(c, 10, slot, (ring_len + s_len) * 4), st.len()),
             };
             let bc = self.bc;
-            let qkv_b = Self::vbuf(c, 11, slot, bc * cfg.c_dim * 4);
-            let cq_b = Self::vbuf(c, 12, slot, bc * cfg.c_dim * 4);
-            let z_b = Self::vbuf(c, 13, slot, bc * vd * 4);
-            let g_b = Self::vbuf(c, 14, slot, bc * cfg.nv * 4);
-            let bt_b = Self::vbuf(c, 15, slot, bc * cfg.nv * 4);
-            let iq_b = Self::vbuf(c, 16, slot, bc * cfg.nk * 4);
-            let ik_b = Self::vbuf(c, 17, slot, bc * cfg.nk * 4);
+            // A verify replays each layer's rows at its commit. A prompt's rows are real and
+            // leave nothing to replay, so its layers share one set of these.
+            let scratch = if self.prefill { 0 } else { slot };
+            let qkv_b = Self::vbuf(c, 11, scratch, bc * cfg.c_dim * 4);
+            let cq_b = Self::vbuf(c, 12, scratch, bc * cfg.c_dim * 4);
+            let z_b = Self::vbuf(c, 13, scratch, bc * vd * 4);
+            let g_b = Self::vbuf(c, 14, scratch, bc * cfg.nv * 4);
+            let bt_b = Self::vbuf(c, 15, scratch, bc * cfg.nv * 4);
+            let iq_b = Self::vbuf(c, 16, scratch, bc * cfg.nk * 4);
+            let ik_b = Self::vbuf(c, 17, scratch, bc * cfg.nk * 4);
             let a_b = Self::vbuf(c, 18, 0, bc * cfg.nv * 4);
             let bb_b = Self::vbuf(c, 19, 0, bc * cfg.nv * 4);
             let of_b = Self::vbuf(c, 20, 0, bc * vd * 4);

@@ -1,12 +1,20 @@
-//! The Neural Engine through Apple's private client, the service behind Core ML. A MIL program
-//! over IOSurfaces the GPU shares, after Splash (Inco AI, Apache-2.0): see THIRD_PARTY_NOTICES.
-//! The interface may change with any macOS: everything here fails softly to the GPU.
+//! A prompt chunk's FFNs on the Neural Engine, through Apple's private client, the service behind
+//! Core ML: a MIL program over IOSurfaces the GPU shares, after Splash (Inco AI, Apache-2.0; see
+//! THIRD_PARTY_NOTICES.md). The interface may change with any macOS, so everything here falls back
+//! to the GPU. `CMF_ANE=1` asks for it.
+//!
+//! q4tp weights are four bits under a scale per tile, so eight bits under a scale per row hold them
+//! nearly whole: no rotation is needed to spread outliers, and the activations go as fp16. The CPU
+//! decodes them, a NEON table lookup per 16 weights, while the ANE runs the layer before and the
+//! GPU its mixer: three engines at once, with the file out of the GPU's working set for the FFNs.
 
+use super::*;
 use objc::rc::autoreleasepool;
 use objc::runtime::{BOOL, Class, NO, Object};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 type Id = *mut Object;
 
@@ -316,58 +324,42 @@ impl Drop for Program {
     }
 }
 
-/// The blob of one fp16 constant, which a program names at offset 64.
-pub(crate) fn constant_blob(values: &[half_bits::F16]) -> Vec<u8> {
-    let data = 128usize;
-    let n = std::mem::size_of_val(values);
-    let mut blob = vec![0u8; data + n];
+/// A program's blob: it names no constant, and the service wants the file.
+fn empty_blob() -> Vec<u8> {
+    let mut blob = vec![0u8; 132];
     blob[0..4].copy_from_slice(&1u32.to_le_bytes());
     blob[4..8].copy_from_slice(&2u32.to_le_bytes());
     blob[64..68].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
     blob[68..72].copy_from_slice(&1u32.to_le_bytes());
-    blob[72..80].copy_from_slice(&(n as u64).to_le_bytes());
-    blob[80..88].copy_from_slice(&(data as u64).to_le_bytes());
-    for (i, v) in values.iter().enumerate() {
-        blob[data + i * 2..data + i * 2 + 2].copy_from_slice(&v.0.to_le_bytes());
-    }
+    blob[72..80].copy_from_slice(&4u64.to_le_bytes());
+    blob[80..88].copy_from_slice(&128u64.to_le_bytes());
     blob
 }
 
-/// fp16 by hand: the stable toolchain has no f16.
-pub(crate) mod half_bits {
-    #[derive(Clone, Copy)]
-    pub(crate) struct F16(pub(crate) u16);
-    impl F16 {
-        pub(crate) fn from_f32(v: f32) -> F16 {
-            let b = v.to_bits();
-            let s = ((b >> 16) & 0x8000) as u16;
-            let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
-            let m = b & 0x7fffff;
-            if e <= 0 {
-                if e < -10 {
-                    return F16(s);
-                }
-                let m = (m | 0x800000) >> (1 - e);
-                return F16(s | ((m + 0x1000) >> 13) as u16);
-            }
-            if e >= 31 {
-                return F16(s | 0x7c00);
-            }
-            F16(s | ((e as u16) << 10) + (((m + 0x1000) >> 13) as u16))
+fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let s = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let m = b & 0x7fffff;
+    if e <= 0 {
+        if e < -10 {
+            return s;
         }
+        let m = (m | 0x800000) >> (1 - e);
+        return s | ((m + 0x1000) >> 13) as u16;
     }
+    if e >= 31 {
+        return s | 0x7c00;
+    }
+    s | (((e as u16) << 10) + ((m + 0x1000) >> 13) as u16)
 }
 
-/// How one layer's FFN runs on the ANE: `hidden` inputs, `channels` of its intermediate width,
-/// `rows` rows. Mirrors Splash's AneFfn::function: int8 weights and activations, a Hadamard
-/// rotation of the intermediate row, a per-token int8 scale.
+/// One segment of a matmul: its inputs a program takes in 2560 channels each.
 pub(crate) const SEGMENT: usize = 2560;
-pub(crate) const BLOCK: usize = 512;
 
 /// The surfaces a function's text takes its types from.
 pub(crate) struct FfnTypes<'a> {
     pub(crate) x: Vec<&'a Surface>,
-    pub(crate) tx: &'a Surface,
     pub(crate) wg: Vec<&'a Surface>,
     pub(crate) wu: Vec<&'a Surface>,
     pub(crate) wd: Vec<&'a Surface>,
@@ -375,46 +367,6 @@ pub(crate) struct FfnTypes<'a> {
     pub(crate) su: &'a Surface,
     pub(crate) sd: &'a Surface,
     pub(crate) out: &'a Surface,
-}
-
-pub(crate) struct FfnSurfaces {
-    pub(crate) x: Vec<Surface>,
-    pub(crate) tx: Surface,
-    pub(crate) wg: Vec<Surface>,
-    pub(crate) wu: Vec<Surface>,
-    pub(crate) wd: Vec<Surface>,
-    pub(crate) sg: Surface,
-    pub(crate) su: Surface,
-    pub(crate) sd: Surface,
-    pub(crate) out: Surface,
-}
-
-pub(crate) fn ffn_surfaces(hidden: usize, channels: usize, max_rows: usize) -> Result<FfnSurfaces, String> {
-    let segs = hidden / SEGMENT;
-    let down = channels.div_ceil(SEGMENT);
-    let mk = |r, w, i| Surface::new(r, w, i);
-    let mut x = Vec::new();
-    let (mut wg, mut wu, mut wd) = (Vec::new(), Vec::new(), Vec::new());
-    for _ in 0..segs {
-        x.push(mk(SEGMENT, max_rows, true)?);
-        wg.push(mk(channels, SEGMENT, true)?);
-        wu.push(mk(channels, SEGMENT, true)?);
-    }
-    for i in 0..down {
-        let w = SEGMENT.min(channels - i * SEGMENT);
-        wd.push(mk(hidden, w, true)?);
-    }
-    Ok(FfnSurfaces {
-        x,
-        tx: mk(1, max_rows, false)?,
-        wg,
-        wu,
-        wd,
-        sg: mk(channels, 1, false)?,
-        su: mk(channels, 1, false)?,
-        sd: mk(hidden, 1, false)?,
-        out: mk(hidden + 1, max_rows, false)?,
-    })
 }
 
 fn tensor(ty: &str, rows: usize, width: usize) -> String {
@@ -430,7 +382,8 @@ fn fp16(v: f64) -> String {
     format!("fp16({sign}0x1.{m:013x}p{e:+})")
 }
 
-/// The MIL of one function of `rows` rows, as Splash's AneFfn::function writes it.
+/// The MIL of one function of `rows` rows: int8 weights, fp16 activations. A token's intermediate
+/// row still comes down to one peak, against fp16 overflow in the down product.
 pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnTypes<'_>) -> String {
     let unit = fp16(1.0 / 128.0);
     let segs = hidden / SEGMENT;
@@ -449,7 +402,6 @@ pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnT
     for k in 0..segs {
         input(format!("x{k}"), s.x[k], SEGMENT, rows, &mut line);
     }
-    input("tx".into(), s.tx, 1, rows, &mut line);
     for k in 0..segs {
         input(format!("wg{k}"), s.wg[k], channels, SEGMENT, &mut line);
         input(format!("wu{k}"), s.wu[k], channels, SEGMENT, &mut line);
@@ -479,40 +431,24 @@ pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnT
         }
         total
     };
-    for k in 0..segs {
-        line2(f16(&format!("x{k}_d"), SEGMENT, rows, format!("dequantize(input = x{k}_t, scale = {unit})")));
-    }
     for p in ["g", "u"] {
         for k in 0..segs {
-            matmul(format!("{p}m{k}"), format!("w{p}{k}"), format!("x{k}_d"), channels, SEGMENT, &mut line2);
+            matmul(format!("{p}m{k}"), format!("w{p}{k}"), format!("x{k}_t"), channels, SEGMENT, &mut line2);
         }
         let total = sum(&format!("{p}m"), segs, channels, &mut line2);
         line2(f16(&format!("{p}s"), channels, rows, format!("mul(x = {total}, y = s{p}_t)")));
     }
-    line2(f16("gt", channels, rows, "mul(x = gs, y = tx_t)".into()));
-    line2(f16("gh", channels, rows, format!("mul(x = gt, y = {})", fp16(0.5))));
-    line2(f16("th", channels, rows, "tanh(x = gh)".into()));
-    line2(f16("tp", channels, rows, format!("add(x = th, y = {})", fp16(1.0))));
-    line2(f16("silu", channels, rows, "mul(x = gh, y = tp)".into()));
-    line2(f16("h", channels, rows, "mul(x = silu, y = us)".into()));
-    let (c, r, b) = (channels, rows, BLOCK);
-    line2(format!("tensor<fp16, [1, {c}, 1, {r}]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, {c}, 1, {r}]))"));
-    line2(format!(
-        "tensor<fp16, [{c}, {b}, 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [{c}, {b}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(64)))]"
-    ));
-    line2(format!(
-        "tensor<fp16, [1, {c}, 1, {r}]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32({}), pad = tensor<int32, [4]>([0, 0, 0, 0]), pad_type = string(\"valid\"), strides = tensor<int32, [2]>([1, 1]), weight = rotation, x = h4)",
-        c / b
-    ));
-    line2(f16("hr", c, r, format!("reshape(x = hr4, shape = tensor<int32, [4]>([1, 1, {c}, {r}]))")));
-    line2(f16("habs", c, r, "abs(x = hr)".into()));
+    let (c, r) = (channels, rows);
+    line2(f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5))));
+    line2(f16("th", c, r, "tanh(x = gh)".into()));
+    line2(f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0))));
+    line2(f16("silu", c, r, "mul(x = gh, y = tp)".into()));
+    line2(f16("h", c, r, "mul(x = silu, y = us)".into()));
+    line2(f16("habs", c, r, "abs(x = h)".into()));
     line2(f16("peak", 1, r, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))".into()));
     line2(f16("floor", 1, r, format!("maximum(x = peak, y = {})", fp16(1.0 / 512.0))));
-    line2(f16("inverse", 1, r, format!("real_div(x = {}, y = floor)", fp16(127.0))));
-    line2(f16("hs", c, r, "mul(x = hr, y = inverse)".into()));
-    line2(format!("{} hq = quantize(input = hs, scale = fp16(1), output_dtype = string(\"int8\"))", tensor("int8", c, r)));
-    line2(f16("hd", c, r, format!("dequantize(input = hq, scale = {unit})")));
-    line2(f16("hscale", 1, r, format!("mul(x = floor, y = {})", fp16(128.0 / 127.0))));
+    line2(f16("inverse", 1, r, format!("real_div(x = {}, y = floor)", fp16(1.0))));
+    line2(f16("hd", c, r, "mul(x = h, y = inverse)".into()));
     let mut begin = 0usize;
     for (i, &w) in down.iter().enumerate() {
         line2(f16(
@@ -526,7 +462,7 @@ pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnT
     }
     let total = sum("dm", down.len(), hidden, &mut line2);
     line2(f16("ds", hidden, r, format!("mul(x = {total}, y = sd_t)")));
-    line2(f16("yt", hidden + 1, r, "concat(axis = int32(2), interleave = bool(false), values = (ds, hscale))".into()));
+    line2(f16("yt", hidden + 1, r, "concat(axis = int32(2), interleave = bool(false), values = (ds, floor))".into()));
     line2(format!(
         "{} y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>({}))",
         s.out.buffer_type(hidden + 1, r),
@@ -534,37 +470,6 @@ pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnT
     ));
     format!("    func ffn{rows}<ios18>({}) {{\n{body}    }} -> (y);\n", params.join(", "))
 }
-
-/// The Hadamard rotation constant of the intermediate rows.
-pub(crate) fn rotation_blob(channels: usize) -> Vec<u8> {
-    let signs = rotation_signs();
-    let mut v = Vec::with_capacity(channels * BLOCK);
-    let norm = 1.0 / (BLOCK as f32).sqrt();
-    for ch in 0..channels {
-        let out = ch % BLOCK;
-        for i in 0..BLOCK {
-            let h = if ((out & i).count_ones() & 1) == 1 { -1.0 } else { 1.0 };
-            v.push(half_bits::F16::from_f32(signs[out] * h * norm));
-        }
-    }
-    constant_blob(&v)
-}
-
-pub(crate) fn rotation_signs() -> Vec<f32> {
-    let mut x: u64 = 20260930;
-    (0..BLOCK)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            if x & 1 == 1 { -1.0 } else { 1.0 }
-        })
-        .collect()
-}
-
-// ── A dense FFN of a prompt chunk on the ANE ─────────────────────────────────────────────────
-
-use super::*;
 
 const MSL: &str = include_str!("ane_msl.metal");
 
@@ -596,16 +501,6 @@ struct WeightSet {
     sd: Shared,
 }
 
-struct Pipes {
-    rotate: ComputePipelineState,
-    pack: ComputePipelineState,
-    w_in: ComputePipelineState,
-    w_int: ComputePipelineState,
-    s_in: ComputePipelineState,
-    s_int: ComputePipelineState,
-    join: ComputePipelineState,
-}
-
 /// One projection in the model's file: its absolute offset, rows and columns.
 #[derive(Clone, Copy)]
 pub(crate) struct Proj {
@@ -616,22 +511,21 @@ pub(crate) struct Proj {
 
 pub(crate) struct AneFfn {
     prog: Program,
-    p: Pipes,
+    pack: ComputePipelineState,
+    join: ComputePipelineState,
     hidden: usize,
     inter: usize,
     sets: [WeightSet; 2],
     x: Vec<Shared>,
     tx: Shared,
     out: Shared,
-    rotated: Buffer,
-    signs: Buffer,
     status: Buffer,
-    row_scales: Buffer,
     layers: Vec<[Proj; 3]>,
     /// What each set holds, once a staging is done.
     staged: Mutex<[Option<usize>; 2]>,
-    /// A staging on its way, for the set it writes.
-    staging: Mutex<Option<(metal::CommandBuffer, usize, usize)>>,
+    /// A staging on its way: the thread, the set it writes and the layer.
+    staging: Mutex<Option<(std::thread::JoinHandle<()>, usize, usize)>>,
+    /// Milliseconds: waiting for weights, the ANE, the GPU's part, and the evaluations.
     pub(crate) ms: Mutex<(f64, f64, f64, u64)>,
 }
 
@@ -643,10 +537,9 @@ fn seg_widths(channels: usize) -> Vec<usize> {
 }
 
 fn weight_set(c: &Ctx, hidden: usize, inter: usize) -> Result<WeightSet, String> {
-    let segs = hidden / SEGMENT;
     let mk = |r, w, i| shared_surface(c, r, w, i);
     let (mut wg, mut wu, mut wd) = (Vec::new(), Vec::new(), Vec::new());
-    for _ in 0..segs {
+    for _ in 0..hidden / SEGMENT {
         wg.push(mk(inter, SEGMENT, true)?);
         wu.push(mk(inter, SEGMENT, true)?);
     }
@@ -658,15 +551,15 @@ fn weight_set(c: &Ctx, hidden: usize, inter: usize) -> Result<WeightSet, String>
 
 impl AneFfn {
     /// `layers`: gate, up and down of each FFN, q4tp, of one shape.
-    pub(crate) fn new(c: &Ctx, fbuf: &WeightArena, layers: Vec<[Proj; 3]>) -> Result<AneFfn, String> {
+    pub(crate) fn new(c: &Ctx, layers: Vec<[Proj; 3]>) -> Result<AneFfn, String> {
         api()?;
         let first = layers.first().ok_or("no layers")?;
         let (hidden, inter) = (first[0].cols, first[0].rows);
-        if hidden % SEGMENT != 0 || hidden % 1024 != 0 || hidden / SEGMENT > 4 {
+        if hidden % SEGMENT != 0 || hidden / SEGMENT > 4 {
             return Err(format!("hidden {hidden} is not whole segments"));
         }
-        if inter % BLOCK != 0 || inter % WEIGHT_ROWS_U != 0 {
-            return Err(format!("intermediate {inter} is not whole blocks"));
+        if inter % 32 != 0 {
+            return Err(format!("intermediate {inter} is not whole tiles"));
         }
         if layers.iter().any(|l| {
             l[0].cols != hidden || l[0].rows != inter || l[1].cols != hidden || l[1].rows != inter || l[2].rows != hidden || l[2].cols != inter
@@ -680,129 +573,60 @@ impl AneFfn {
             let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
             c._device.new_compute_pipeline_state_with_function(&f).map_err(|e| format!("pipeline {name}: {e}"))
         };
-        let p = Pipes {
-            rotate: pso("ane_rotate")?,
-            pack: pso("ane_pack")?,
-            w_in: pso("ane_weights_inputs")?,
-            w_int: pso("ane_weights_intermediate")?,
-            s_in: pso("ane_row_scale_inputs")?,
-            s_int: pso("ane_row_scale_intermediate")?,
-            join: pso("ane_join")?,
-        };
+        let (pack, join) = (pso("ane_pack16")?, pso("ane_join")?);
         let sets = [weight_set(c, hidden, inter)?, weight_set(c, hidden, inter)?];
         let max_rows = *FUNCTIONS.last().unwrap();
         let x: Result<Vec<Shared>, String> =
-            (0..hidden / SEGMENT).map(|_| shared_surface(c, SEGMENT, max_rows, true)).collect();
+            (0..hidden / SEGMENT).map(|_| shared_surface(c, SEGMENT, max_rows, false)).collect();
         let x = x?;
         let tx = shared_surface(c, 1, max_rows, false)?;
+        // The join's input scale: there is nothing to bring back.
+        let p = tx.s.base() as *mut u16;
+        for i in 0..tx.s.bytes / 2 {
+            // SAFETY: inside the surface, which no command uses yet.
+            unsafe { *p.add(i) = f32_to_f16(1.0) };
+        }
         let out = shared_surface(c, hidden + 1, max_rows, false)?;
-        let shared = |bytes: usize| c._device.new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared);
-        let signs = shared(BLOCK * 4);
-        let sv = rotation_signs();
-        // SAFETY: fresh shared buffers of these sizes.
-        unsafe { std::ptr::copy_nonoverlapping(sv.as_ptr(), signs.contents() as *mut f32, BLOCK) };
-        let rotated = shared(max_rows * hidden * 2);
-        let status = shared(16);
-        let per = 2 * inter + hidden;
-        let row_scales = shared(layers.len() * per * 2);
-        // The program, with one surface set's types: both sets have one stride.
-        let view = FfnSurfacesRef { x: &x, wg: &sets[0].wg, wu: &sets[0].wu, wd: &sets[0].wd, tx: &tx, sg: &sets[0].sg, su: &sets[0].su, sd: &sets[0].sd, out: &out };
+        let status = c._device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+        let types = FfnTypes {
+            x: x.iter().map(|a| &a.s).collect(),
+            wg: sets[0].wg.iter().map(|a| &a.s).collect(),
+            wu: sets[0].wu.iter().map(|a| &a.s).collect(),
+            wd: sets[0].wd.iter().map(|a| &a.s).collect(),
+            sg: &sets[0].sg.s,
+            su: &sets[0].su.s,
+            sd: &sets[0].sd.s,
+            out: &out.s,
+        };
         let mut text = String::from("program(1.3)\n{\n");
         for rows in FUNCTIONS {
-            text.push_str(&ffn_function_ref(hidden, inter, rows, &view));
+            text.push_str(&ffn_function(hidden, inter, rows, &types));
         }
         text.push_str("}\n");
+        drop(types);
         let t0 = std::time::Instant::now();
-        let prog = Program::new(&text, &rotation_blob(inter))?;
-        let me = AneFfn {
+        let prog = Program::new(&text, &empty_blob())?;
+        tracing::info!(
+            "neural engine: FFN of {inter} channels over {} layers, program {:.1} s",
+            layers.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(AneFfn {
             prog,
-            p,
+            pack,
+            join,
             hidden,
             inter,
             sets,
             x,
             tx,
             out,
-            rotated,
-            signs,
             status,
-            row_scales,
             layers,
             staged: Mutex::new([None, None]),
             staging: Mutex::new(None),
             ms: Mutex::new((0.0, 0.0, 0.0, 0)),
-        };
-        let t1 = std::time::Instant::now();
-        me.row_scales_cached(c, fbuf)?;
-        tracing::info!(
-            "neural engine: FFN of {inter} channels over {} layers, program {:.1} s, row scales {:.1} s",
-            me.layers.len(),
-            (t1 - t0).as_secs_f64(),
-            t1.elapsed().as_secs_f64()
-        );
-        Ok(me)
-    }
-
-    fn scale_off(&self, layer: usize, matrix: usize) -> usize {
-        let per = 2 * self.inter + self.hidden;
-        (layer * per + matrix * self.inter) * 2
-    }
-
-    /// The row scales of a model seen before come from a small file: reading them takes every
-    /// layer's weights through the GPU once.
-    fn row_scales_cached(&self, c: &Ctx, fbuf: &WeightArena) -> Result<(), String> {
-        let n = self.layers.len() * (2 * self.inter + self.hidden) * 2;
-        let mut key = 0xcbf29ce484222325u64;
-        for l in &self.layers {
-            for pr in l {
-                key = fnv(&(pr.abs as u64).to_le_bytes(), key);
-                key = fnv(&(pr.rows as u64).to_le_bytes(), key);
-            }
-        }
-        let first = self.layers[0][0].abs;
-        // SAFETY: the first gate's params are inside the mapped file that `fbuf` covers.
-        let (buf, off) = fbuf.locate(first + self.inter * (self.hidden / 32) * 16);
-        let tag = unsafe { std::slice::from_raw_parts((buf.contents() as *const u8).add(off), 64) };
-        key = fnv(tag, key);
-        let file = cache_dir().join(format!("row-scales-{key:016x}.bin"));
-        if let Ok(data) = std::fs::read(&file) {
-            if data.len() == n {
-                // SAFETY: a shared buffer of `n` bytes that no command is using.
-                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.row_scales.contents() as *mut u8, n) };
-                return Ok(());
-            }
-        }
-        self.compute_row_scales(c, fbuf)?;
-        // SAFETY: as above; the command is done.
-        let data = unsafe { std::slice::from_raw_parts(self.row_scales.contents() as *const u8, n) };
-        let _ = std::fs::create_dir_all(cache_dir());
-        let _ = std::fs::write(&file, data);
-        Ok(())
-    }
-
-    fn compute_row_scales(&self, c: &Ctx, fbuf: &WeightArena) -> Result<(), String> {
-        for (li, l) in self.layers.iter().enumerate() {
-            let cmd = c.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            for m in 0..3 {
-                let pr = l[m];
-                let inputs = m < 2;
-                enc.set_compute_pipeline_state(if inputs { &self.p.s_in } else { &self.p.s_int });
-                fbuf.bind(enc, 0, pr.abs);
-                enc.set_buffer(1, Some(&self.row_scales), self.scale_off(li, m) as u64);
-                enc.set_buffer(2, Some(&self.signs), 0);
-                let params = [(pr.cols / 32) as u32, pr.rows as u32, 0, pr.cols as u32, 0, 0];
-                enc.set_bytes(3, 24, params.as_ptr() as *const c_void);
-                enc.dispatch_thread_groups(MTLSize::new((pr.rows / WEIGHT_ROWS_U) as u64, 1, 1), MTLSize::new(256, 1, 1));
-            }
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-            if cmd.status() == metal::MTLCommandBufferStatus::Error {
-                return Err("row scales: the command failed".into());
-            }
-        }
-        Ok(())
+        })
     }
 
     pub(crate) fn layer_of(&self, gate_abs: usize) -> Option<usize> {
@@ -810,61 +634,46 @@ impl AneFfn {
     }
 
     pub(crate) fn takes(&self, rows: usize) -> bool {
-        FUNCTIONS.iter().any(|&f| f == rows) || (rows >= 64 && rows <= *FUNCTIONS.last().unwrap())
+        (64..=*FUNCTIONS.last().unwrap()).contains(&rows)
     }
 
-    /// Layer `li`'s int8 weights into set `set`.
-    fn encode_weights(&self, enc: &metal::ComputeCommandEncoderRef, fbuf: &WeightArena, li: usize, set: usize) {
+    /// Layer `li`'s int8 weights into set `set` on the CPU.
+    fn stage(&self, li: usize, set: usize, file: &[usize; 3]) {
         let t = &self.sets[set];
-        let l = &self.layers[li];
-        let mut add = |m: usize, out: &Shared, scale: &Shared, input: usize, width: usize| {
-            let pr = l[m];
-            let inputs = m < 2;
-            enc.set_compute_pipeline_state(if inputs { &self.p.w_in } else { &self.p.w_int });
-            fbuf.bind(enc, 0, pr.abs);
-            enc.set_buffer(1, Some(&self.row_scales), self.scale_off(li, m) as u64);
-            enc.set_buffer(2, Some(&out.b), 0);
-            enc.set_buffer(3, Some(&scale.b), 0);
-            enc.set_buffer(4, Some(&self.signs), 0);
-            let params = [
-                (pr.cols / 32) as u32,
-                pr.rows as u32,
-                input as u32,
-                width as u32,
-                out.s.stride as u32,
-                (scale.s.stride / 2) as u32,
-            ];
-            enc.set_bytes(5, 24, params.as_ptr() as *const c_void);
-            let block = if inputs { 128 } else { BLOCK };
-            enc.dispatch_thread_groups(
-                MTLSize::new((pr.rows / WEIGHT_ROWS_U) as u64, (width / block) as u64, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        };
-        for k in 0..t.wg.len() {
-            add(0, &t.wg[k], &t.sg, k * SEGMENT, SEGMENT);
-            add(1, &t.wu[k], &t.su, k * SEGMENT, SEGMENT);
-        }
-        for (i, w) in seg_widths(self.inter).into_iter().enumerate() {
-            add(2, &t.wd[i], &t.sd, i * SEGMENT, w);
+        for m in 0..3 {
+            let pr = self.layers[li][m];
+            let q = file[m];
+            let (outs, scale): (&[Shared], &Shared) = match m {
+                0 => (&t.wg, &t.sg),
+                1 => (&t.wu, &t.su),
+                _ => (&t.wd, &t.sd),
+            };
+            let outs: Vec<(usize, usize)> = outs.iter().map(|o| (o.s.base() as usize, o.s.stride)).collect();
+            let (sbase, sstride) = (scale.s.base() as usize, scale.s.stride);
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+            let per = pr.rows.div_ceil(threads);
+            std::thread::scope(|sc| {
+                for th in 0..threads {
+                    let outs = &outs;
+                    sc.spawn(move || {
+                        let (r0, r1) = (th * per, ((th + 1) * per).min(pr.rows));
+                        // SAFETY: rows of the mapped tensor and of this set's surfaces, which no
+                        // engine reads until this staging is joined; threads own disjoint rows.
+                        unsafe { stage_rows(q, pr.rows, pr.cols, r0, r1, outs, sbase, sstride) };
+                    });
+                }
+            });
         }
     }
 
-    /// The chunk's normalized rows as the program's int8 input.
+    /// The chunk's normalized rows as the program's fp16 input, transposed.
     pub(crate) fn encode_input(&self, enc: &metal::ComputeCommandEncoderRef, n_b: &Buffer, rows: usize) {
         let hidden = self.hidden as u32;
-        enc.set_compute_pipeline_state(&self.p.rotate);
-        enc.set_buffer(0, Some(n_b), 0);
-        enc.set_buffer(1, Some(&self.signs), 0);
-        enc.set_buffer(2, Some(&self.rotated), 0);
-        enc.set_buffer(3, Some(&self.tx.b), 0);
-        enc.set_bytes(4, 4, &hidden as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
         for (k, x) in self.x.iter().enumerate() {
-            enc.set_compute_pipeline_state(&self.p.pack);
-            enc.set_buffer(0, Some(&self.rotated), 0);
+            enc.set_compute_pipeline_state(&self.pack);
+            enc.set_buffer(0, Some(n_b), 0);
             enc.set_buffer(1, Some(&x.b), 0);
-            let (ch, stride) = ((k * SEGMENT) as u32, x.s.stride as u32);
+            let (ch, stride) = ((k * SEGMENT) as u32, (x.s.stride / 2) as u32);
             enc.set_bytes(2, 4, &hidden as *const u32 as *const c_void);
             enc.set_bytes(3, 4, &ch as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &stride as *const u32 as *const c_void);
@@ -875,7 +684,7 @@ impl AneFfn {
         }
     }
 
-    fn inputs<'a>(&'a self, set: usize) -> Vec<(String, &'a Surface)> {
+    fn inputs(&self, set: usize) -> Vec<(String, &Surface)> {
         let t = &self.sets[set];
         let mut v: Vec<(String, &Surface)> = Vec::new();
         for (k, x) in self.x.iter().enumerate() {
@@ -886,61 +695,48 @@ impl AneFfn {
         for (i, w) in t.wd.iter().enumerate() {
             v.push((format!("wd{i}"), &w.s));
         }
-        v.push(("tx".into(), &self.tx.s));
         v.push(("sg".into(), &t.sg.s));
         v.push(("su".into(), &t.su.s));
         v.push(("sd".into(), &t.sd.s));
         v
     }
 
-    fn wait_staging(&self) -> Result<(), String> {
-        if let Some((cmd, set, li)) = self.staging.lock().unwrap().take() {
-            cmd.wait_until_completed();
-            if cmd.status() == metal::MTLCommandBufferStatus::Error {
-                return Err("weights staging failed".into());
-            }
-            self.staged.lock().unwrap()[set] = Some(li);
+    fn file_ptrs(&self, fbuf: &WeightArena, li: usize) -> [usize; 3] {
+        let mut p = [0usize; 3];
+        for m in 0..3 {
+            let (b, off) = fbuf.locate(self.layers[li][m].abs);
+            p[m] = b.contents() as usize + off;
         }
-        Ok(())
+        p
     }
 
-    /// Layer `li`'s FFN over the inputs `encode_input` wrote, whose command is done: staged here
-    /// if it is not ready, the next layer staged while the ANE runs.
-    pub(crate) fn run(&self, c: &Ctx, fbuf: &WeightArena, li: usize, rows: usize) -> Result<(), String> {
+    /// Layer `li`'s FFN over the input `encode_input` wrote, whose command is done. A thread
+    /// stages the next layer's weights while the ANE runs this one and the GPU goes on to the
+    /// next layer's mixer.
+    pub(crate) fn run(self: &Arc<Self>, fbuf: &WeightArena, li: usize, rows: usize) -> Result<(), String> {
         let t0 = std::time::Instant::now();
-        self.wait_staging()?;
-        let found = {
-            let s = self.staged.lock().unwrap();
-            s.iter().position(|v| *v == Some(li))
-        };
+        if let Some((h, set, l)) = self.staging.lock().unwrap().take() {
+            h.join().map_err(|_| "weights staging panicked".to_string())?;
+            self.staged.lock().unwrap()[set] = Some(l);
+        }
+        let found = self.staged.lock().unwrap().iter().position(|v| *v == Some(li));
         let set = match found {
             Some(s) => s,
             None => {
-                let cmd = c.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                self.encode_weights(enc, fbuf, li, 0);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-                if cmd.status() == metal::MTLCommandBufferStatus::Error {
-                    return Err("weights staging failed".into());
-                }
+                self.stage(li, 0, &self.file_ptrs(fbuf, li));
                 self.staged.lock().unwrap()[0] = Some(li);
                 0
             }
         };
         let t1 = std::time::Instant::now();
-        // The other set takes the next layer while this one runs.
         let next = (li + 1) % self.layers.len();
         let other = set ^ 1;
         if self.staged.lock().unwrap()[other] != Some(next) {
             self.staged.lock().unwrap()[other] = None;
-            let cmd = c.queue.new_command_buffer().to_owned();
-            let enc = cmd.new_compute_command_encoder();
-            self.encode_weights(enc, fbuf, next, other);
-            enc.end_encoding();
-            cmd.commit();
-            *self.staging.lock().unwrap() = Some((cmd, other, next));
+            let file = self.file_ptrs(fbuf, next);
+            let me = self.clone();
+            let h = std::thread::spawn(move || me.stage(next, other, &file));
+            *self.staging.lock().unwrap() = Some((h, other, next));
         }
         let func = FUNCTIONS.iter().copied().find(|&f| f >= rows).ok_or("too many rows")?;
         let names = self.inputs(set);
@@ -951,7 +747,13 @@ impl AneFfn {
         m.1 += t1.elapsed().as_secs_f64() * 1e3;
         m.3 += 1;
         if m.3 % 64 == 0 && std::env::var("CMF_ANE_PROF").is_ok() {
-            eprintln!("ane-prof: {} evaluations, each: the GPU's part {:.1} ms, waited for weights {:.1} ms, the ANE {:.1} ms", m.3, m.2 / m.3 as f64, m.0 / m.3 as f64, m.1 / m.3 as f64);
+            eprintln!(
+                "ane-prof: {} evaluations, each: the GPU's part {:.1} ms, waited for weights {:.1} ms, the ANE {:.1} ms",
+                m.3,
+                m.2 / m.3 as f64,
+                m.0 / m.3 as f64,
+                m.1 / m.3 as f64
+            );
         }
         Ok(())
     }
@@ -959,7 +761,7 @@ impl AneFfn {
     /// The output of `run` as the residual's delta.
     pub(crate) fn encode_join(&self, enc: &metal::ComputeCommandEncoderRef, d_b: &Buffer, rows: usize) {
         let (hidden, stride) = (self.hidden as u32, (self.out.s.stride / 2) as u32);
-        enc.set_compute_pipeline_state(&self.p.join);
+        enc.set_compute_pipeline_state(&self.join);
         enc.set_buffer(0, Some(d_b), 0);
         enc.set_buffer(1, Some(&self.out.b), 0);
         enc.set_buffer(2, Some(&self.tx.b), 0);
@@ -981,49 +783,93 @@ impl AneFfn {
     }
 }
 
-const WEIGHT_ROWS_U: usize = 8;
-
-struct FfnSurfacesRef<'a> {
-    x: &'a [Shared],
-    wg: &'a [Shared],
-    wu: &'a [Shared],
-    wd: &'a [Shared],
-    tx: &'a Shared,
-    sg: &'a Shared,
-    su: &'a Shared,
-    sd: &'a Shared,
-    out: &'a Shared,
+/// Rows [r0, r1) of a q4tp tensor as int8 under each row's scale. `outs`: per segment of 80 tiles,
+/// its surface's base and stride. The row's scale goes to its fp16 surface.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, outs: &[(usize, usize)], sbase: usize, sstride: usize) {
+    use std::arch::aarch64::*;
+    let q = q as *const u8;
+    let gpr = cols / 32;
+    let params = rows * gpr * 16;
+    let codes = params + rows * 4;
+    let stride = (gpr * 5).div_ceil(8);
+    let per_seg = SEGMENT / 32;
+    let mut code = vec![0u8; gpr];
+    for r in r0..r1 {
+        unsafe {
+            let ph = q.add(params + r * 4);
+            let lo = f16_to_f32(u16::from_le_bytes([*ph, *ph.add(1)]));
+            let step = f16_to_f32(u16::from_le_bytes([*ph.add(2), *ph.add(3)]));
+            let cp = q.add(codes + r * stride);
+            let mut top = 0u8;
+            for (g, c) in code.iter_mut().enumerate() {
+                let bit = g * 5;
+                let (at, shf) = (bit >> 3, bit & 7);
+                let v = *cp.add(at) as u32 | if shf > 3 { (*cp.add(at + 1) as u32) << 8 } else { 0 };
+                *c = ((v >> shf) & 31) as u8;
+                top = top.max(*c);
+            }
+            let peak = (8.0 * (lo + top as f32 * step).exp2()).max(1.0 / 16384.0);
+            let bits = f32_to_f16(peak / 127.0 * 128.0);
+            *((sbase + r * sstride) as *mut u16) = bits;
+            let inverse = 128.0 / f16_to_f32(bits);
+            let mut luts = [[0i8; 16]; 32];
+            let mut have = 0u32;
+            let n_lo = vdupq_n_u8(15);
+            for g in 0..gpr {
+                let c = code[g] as usize;
+                if have & (1 << c) == 0 {
+                    have |= 1 << c;
+                    let k = (lo + c as f32 * step).exp2() * inverse;
+                    for (n, slot) in luts[c].iter_mut().enumerate() {
+                        *slot = ((n as f32 - 8.0) * k).round().clamp(-127.0, 127.0) as i8;
+                    }
+                }
+                let lut = vld1q_s8(luts[c].as_ptr());
+                let tile = vld1q_u8(q.add((r * gpr + g) * 16));
+                let (l, h) = (vandq_u8(tile, n_lo), vshrq_n_u8(tile, 4));
+                let (seg, within) = (g / per_seg, g % per_seg);
+                let (base, st) = outs[seg];
+                let out = (base + r * st + within * 32) as *mut i8;
+                vst1q_s8(out, vqtbl1q_s8(lut, vzip1q_u8(l, h)));
+                vst1q_s8(out.add(16), vqtbl1q_s8(lut, vzip2q_u8(l, h)));
+            }
+        }
+    }
 }
 
-fn ffn_function_ref(hidden: usize, inter: usize, rows: usize, v: &FfnSurfacesRef<'_>) -> String {
-    // Types only, from surfaces of the same strides: the text names no memory.
-    let s = FfnTypes {
-        x: v.x.iter().map(|a| &a.s).collect(),
-        tx: &v.tx.s,
-        wg: v.wg.iter().map(|a| &a.s).collect(),
-        wu: v.wu.iter().map(|a| &a.s).collect(),
-        wd: v.wd.iter().map(|a| &a.s).collect(),
-        sg: &v.sg.s,
-        su: &v.su.s,
-        sd: &v.sd.s,
-        out: &v.out.s,
-    };
-    ffn_function(hidden, inter, rows, &s)
+/// Macs without NEON have no Neural Engine: `wanted` keeps them away from this.
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn stage_rows(_q: usize, _rows: usize, _cols: usize, _r0: usize, _r1: usize, _outs: &[(usize, usize)], _sbase: usize, _sstride: usize) {}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let s = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((bits >> 10) & 0x1f) as i32;
+    let m = (bits & 0x3ff) as f32;
+    if e == 0 {
+        s * m * 2f32.powi(-24)
+    } else {
+        s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    }
 }
+
 
 static ANE: Mutex<Option<Arc<AneFfn>>> = Mutex::new(None);
 static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a prompt asks for the Neural Engine, which takes larger chunks.
 pub(crate) fn wanted() -> bool {
-    std::env::var("CMF_ANE").as_deref() == Ok("1")
+    cfg!(target_arch = "aarch64")
+        && std::env::var("CMF_ANE").as_deref() == Ok("1")
         && !REFUSED.load(std::sync::atomic::Ordering::Relaxed)
         && api().is_ok()
 }
 
-/// The FFN for these layers, built once. `CMF_ANE=1` asks for it; any refusal keeps the GPU's.
-pub(crate) fn ffn_for(c: &Ctx, fbuf: &WeightArena, layers: Vec<[Proj; 3]>) -> Option<Arc<AneFfn>> {
-    if std::env::var("CMF_ANE").as_deref() != Ok("1") || REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+/// The FFN for these layers, built once; any refusal keeps the GPU's.
+pub(crate) fn ffn_for(c: &Ctx, layers: Vec<[Proj; 3]>) -> Option<Arc<AneFfn>> {
+    if !wanted() {
         return None;
     }
     let mut slot = ANE.lock().unwrap();
@@ -1032,7 +878,7 @@ pub(crate) fn ffn_for(c: &Ctx, fbuf: &WeightArena, layers: Vec<[Proj; 3]>) -> Op
             return Some(a.clone());
         }
     }
-    match AneFfn::new(c, fbuf, layers) {
+    match AneFfn::new(c, layers) {
         Ok(a) => {
             let a = Arc::new(a);
             *slot = Some(a.clone());
@@ -1056,153 +902,101 @@ pub(crate) fn retire(why: &str) {
 mod tests {
     use super::*;
 
-    /// How fast the ANE of this Mac runs one FFN of realistic size, on noise.
-    /// `cargo test -p cortiq-engine --release --lib ane_ffn_speed -- --ignored --nocapture`
+    /// One FFN of noise against the same arithmetic on the host, with the ANE's speed. It talks to
+    /// a private service, so it runs by hand:
+    /// `cargo test -p cortiq-engine --release --lib ane_ffn_matches_host -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn ane_ffn_speed() {
-        let hidden: usize = std::env::var("ANE_H").ok().and_then(|v| v.parse().ok()).unwrap_or(5120);
-        let list = std::env::var("ANE_C").unwrap_or("2560,5120,10240,15360".into());
-        let rows: usize = std::env::var("ANE_R").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-        for channels in list.split(',').map(|v| v.parse::<usize>().unwrap()) {
-            let s = ffn_surfaces(hidden, channels, rows).expect("surfaces");
-            let mut seed = 12345u64;
-            let mut fill = |surf: &Surface| {
-                let p = surf.base();
-                for i in 0..surf.bytes {
-                    seed = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
-                    unsafe { *p.add(i) = ((seed >> 56) as i8 / 4) as u8 };
-                }
-            };
-            for g in s.x.iter().chain(&s.wg).chain(&s.wu).chain(&s.wd) {
-                fill(g);
+    fn ane_ffn_matches_host() {
+        let (hidden, channels, rows) = (5120usize, 2560usize, 128usize);
+        let mk = |r, w, i| Surface::new(r, w, i).expect("surface");
+        let x: Vec<Surface> = (0..2).map(|_| mk(SEGMENT, rows, false)).collect();
+        let wg: Vec<Surface> = (0..2).map(|_| mk(channels, SEGMENT, true)).collect();
+        let wu: Vec<Surface> = (0..2).map(|_| mk(channels, SEGMENT, true)).collect();
+        let wd = vec![mk(hidden, channels, true)];
+        let (sg, su, sd) = (mk(channels, 1, false), mk(channels, 1, false), mk(hidden, 1, false));
+        let out = mk(hidden + 1, rows, false);
+        let mut seed = 12345u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            (seed >> 56) as i8
+        };
+        for g in wg.iter().chain(&wu).chain(&wd) {
+            for i in 0..g.bytes {
+                unsafe { *g.base().add(i) = (rnd() / 4) as u8 };
             }
-            let one = half_bits::F16::from_f32(0.1).0;
-            for surf in [&s.tx, &s.sg, &s.su, &s.sd] {
-                let p = surf.base() as *mut u16;
-                for i in 0..surf.bytes / 2 {
-                    unsafe { *p.add(i) = one };
-                }
-            }
-            let types = FfnTypes {
-                x: s.x.iter().collect(),
-                tx: &s.tx,
-                wg: s.wg.iter().collect(),
-                wu: s.wu.iter().collect(),
-                wd: s.wd.iter().collect(),
-                sg: &s.sg,
-                su: &s.su,
-                sd: &s.sd,
-                out: &s.out,
-            };
-            let mil = format!("program(1.3)\n{{\n{}}}\n", ffn_function(hidden, channels, rows, &types));
-            let t0 = std::time::Instant::now();
-            let prog = match Program::new(&mil, &rotation_blob(channels)) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("channels {channels}: program: {e}");
-                    continue;
-                }
-            };
-            let t_load = t0.elapsed().as_secs_f64();
-            let mut names: Vec<(String, &Surface)> = Vec::new();
-            for (k, x) in s.x.iter().enumerate() {
-                names.push((format!("x{k}"), x));
-                names.push((format!("wg{k}"), &s.wg[k]));
-                names.push((format!("wu{k}"), &s.wu[k]));
-            }
-            for (i, w) in s.wd.iter().enumerate() {
-                names.push((format!("wd{i}"), w));
-            }
-            names.push(("tx".into(), &s.tx));
-            names.push(("sg".into(), &s.sg));
-            names.push(("su".into(), &s.su));
-            names.push(("sd".into(), &s.sd));
-            let refs: Vec<(&str, &Surface)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
-            let mut ms = Vec::new();
-            for _ in 0..6 {
-                let t = std::time::Instant::now();
-                if let Err(e) = prog.eval(&format!("ffn{rows}"), &refs, &s.out) {
-                    eprintln!("channels {channels}: {e}");
-                    break;
-                }
-                ms.push(t.elapsed().as_secs_f64() * 1e3);
-            }
-            let finite = {
-                let p = s.out.base() as *const u16;
-                (0..s.out.bytes / 2).filter(|i| unsafe { *p.add(*i) } & 0x7c00 == 0x7c00).count()
-            };
-            // The same arithmetic on the host, for a few rows.
-            let i8_at = |surf: &Surface, r: usize, c: usize| unsafe { *surf.base().add(r * surf.stride + c) as i8 as f32 } / 128.0;
-            let f16_of = |bits: u16| -> f32 {
-                let s = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
-                let e = ((bits >> 10) & 0x1f) as i32;
-                let m = (bits & 0x3ff) as f32;
-                if e == 0 { s * m * 2f32.powi(-24) } else { s * (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
-            };
-            let signs = rotation_signs();
-            let norm = 1.0 / (BLOCK as f32).sqrt();
-            let mut worst = 0f32;
-            let mut rms = (0f64, 0f64);
-            for row in [0usize, 7, rows - 1] {
-                let segs = hidden / SEGMENT;
-                let x: Vec<f32> = (0..hidden).map(|c| i8_at(&s.x[c / SEGMENT], c % SEGMENT, row)).collect();
-                let mv = |w: &Vec<Surface>, ch: usize| -> f32 {
-                    let mut acc = 0f32;
-                    for k in 0..segs {
-                        for c in 0..SEGMENT {
-                            acc += i8_at(&w[k], ch, c) * x[k * SEGMENT + c];
-                        }
-                    }
-                    acc * 0.1
-                };
-                let h: Vec<f32> = (0..channels)
-                    .map(|ch| {
-                        let g = mv(&s.wg, ch) * 0.1 * 0.5;
-                        g * (g.tanh() + 1.0) * mv(&s.wu, ch)
-                    })
-                    .collect();
-                let mut hr = vec![0f32; channels];
-                for ch in 0..channels {
-                    let base = ch / BLOCK * BLOCK;
-                    let out = ch % BLOCK;
-                    let mut acc = 0f32;
-                    for i in 0..BLOCK {
-                        let sign = if ((out & i).count_ones() & 1) == 1 { -1.0 } else { 1.0 };
-                        acc += sign * h[base + i];
-                    }
-                    hr[ch] = acc * signs[out] * norm;
-                }
-                let peak = hr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1.0 / 512.0);
-                let hd: Vec<f32> = hr.iter().map(|v| (v * 127.0 / peak).round().clamp(-128.0, 127.0) / 128.0).collect();
-                let hscale = peak * 128.0 / 127.0;
-                let out_at = |r: usize| unsafe { *((s.out.base().add(r * s.out.stride) as *const u16).add(row)) };
-                let got_scale = f16_of(out_at(hidden));
-                for r in (0..hidden).step_by(97) {
-                    let mut acc = 0f32;
-                    for (i, w) in s.wd.iter().enumerate() {
-                        let width = SEGMENT.min(channels - i * SEGMENT);
-                        for c in 0..width {
-                            acc += i8_at(w, r, c) * hd[i * SEGMENT + c];
-                        }
-                    }
-                    let want = acc * 0.1 * hscale;
-                    let got = f16_of(out_at(r)) * got_scale;
-                    worst = worst.max((want - got).abs());
-                    rms.0 += ((want - got) as f64).powi(2);
-                    rms.1 += (want as f64).powi(2);
-                }
-                eprintln!("  row {row}: token scale host {hscale:.4} ane {got_scale:.4}");
-            }
-            eprintln!("  against the host: max|Δ| {worst:.3e}, relative rms {:.3e}", (rms.0 / rms.1.max(1e-30)).sqrt());
-            let macs = (3 * channels * hidden * rows) as f64;
-            let best = ms.iter().cloned().fold(f64::MAX, f64::min);
-            eprintln!(
-                "hidden {hidden} channels {channels} rows {rows}: load {t_load:.1} s, eval {:?} ms, {:.0} GMAC/s, non-finite {finite}",
-                ms.iter().map(|m| m.round() as i64).collect::<Vec<_>>(),
-                macs / best / 1e6
-            );
         }
+        for g in &x {
+            let p = g.base() as *mut u16;
+            for i in 0..g.bytes / 2 {
+                unsafe { *p.add(i) = f32_to_f16(rnd() as f32 / 128.0) };
+            }
+        }
+        for g in [&sg, &su, &sd] {
+            let p = g.base() as *mut u16;
+            for i in 0..g.bytes / 2 {
+                unsafe { *p.add(i) = f32_to_f16(0.1) };
+            }
+        }
+        let types = FfnTypes {
+            x: x.iter().collect(),
+            wg: wg.iter().collect(),
+            wu: wu.iter().collect(),
+            wd: wd.iter().collect(),
+            sg: &sg,
+            su: &su,
+            sd: &sd,
+            out: &out,
+        };
+        let mil = format!("program(1.3)\n{{\n{}}}\n", ffn_function(hidden, channels, rows, &types));
+        let Ok(prog) = Program::new(&mil, &empty_blob()) else {
+            eprintln!("no Neural Engine here");
+            return;
+        };
+        let mut names: Vec<(String, &Surface)> = Vec::new();
+        for k in 0..2 {
+            names.push((format!("x{k}"), &x[k]));
+            names.push((format!("wg{k}"), &wg[k]));
+            names.push((format!("wu{k}"), &wu[k]));
+        }
+        names.push(("wd0".into(), &wd[0]));
+        names.push(("sg".into(), &sg));
+        names.push(("su".into(), &su));
+        names.push(("sd".into(), &sd));
+        let refs: Vec<(&str, &Surface)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            prog.eval(&format!("ffn{rows}"), &refs, &out).expect("evaluation");
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let w = |s: &Surface, r: usize, c: usize| unsafe { *s.base().add(r * s.stride + c) as i8 as f32 } / 128.0;
+        let h16 = |s: &Surface, r: usize, c: usize| unsafe { f16_to_f32(*(s.base().add(r * s.stride) as *const u16).add(c)) };
+        let (mut e, mut t) = (0f64, 0f64);
+        for row in [0usize, 7, rows - 1] {
+            let xv: Vec<f32> = (0..hidden).map(|c| h16(&x[c / SEGMENT], c % SEGMENT, row)).collect();
+            let mv = |m: &[Surface], ch: usize| -> f32 {
+                let mut acc = 0f32;
+                for (c, v) in xv.iter().enumerate() {
+                    acc += w(&m[c / SEGMENT], ch, c % SEGMENT) * v;
+                }
+                acc * 0.1
+            };
+            let h: Vec<f32> = (0..channels)
+                .map(|ch| {
+                    let g = mv(&wg, ch) * 0.5;
+                    g * (g.tanh() + 1.0) * mv(&wu, ch)
+                })
+                .collect();
+            for r in (0..hidden).step_by(97) {
+                let want: f32 = h.iter().enumerate().map(|(c, v)| w(&wd[0], r, c) * v).sum::<f32>() * 0.1;
+                let got = h16(&out, r, row) * h16(&out, hidden, row);
+                e += ((want - got) as f64).powi(2);
+                t += (want as f64).powi(2);
+            }
+        }
+        let rel = (e / t.max(1e-30)).sqrt();
+        eprintln!("hidden {hidden} channels {channels} rows {rows}: {best:.1} ms, relative rms {rel:.4}");
+        assert!(rel < 0.15, "relative rms {rel}");
     }
 }
-
