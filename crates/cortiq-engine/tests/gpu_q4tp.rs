@@ -547,6 +547,54 @@ fn metal_q4tp_matvec_batch_matches_dequant_reference() {
     }
 }
 
+/// The two- and three-vector Metal matvec (a verify of one or two drafts)
+/// against the dequant reference, in the f32 kernels' 1e-4 band, on shapes
+/// with a tail simdgroup and a tail threadgroup.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_small_batch_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    let mut built = Vec::new();
+    for (rows, cols) in [(256usize, 512usize), (128, 4096), (201, 512), (3, 64), (37, 2048)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-mvs-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        for b in [2usize, 3] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_metal::q4tp_matvec_small_batch(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
+                "Metal refused the small-batch q4tp matvec ({rows}x{cols}, b={b})"
+            );
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: GPU {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The Metal narrow simdgroup-matrix GEMM (`q4tp_mul_mm_n8`, the verify's
 /// projection kernel: 64 rows × ≤8 batch, half-staged) against the
 /// dequant reference. Half staging bounds it at ~1e-3 relative per

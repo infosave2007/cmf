@@ -73,5 +73,5 @@ runs each stage as its own command. `CMF_ANE_CHECK=1` computes what the ANE did 
 - The next layer's `z` inside the FFN's call, with the norm in the program: one call a layer instead of two would bring
   a layer near 48 ms. The norm in fp16 needs a scale against overflow.
 - The CPU's matrix unit as a third engine.
-- Decode is the GPU's, 6 tok/s.
+- Decode is the GPU's: 6.4 tok/s, and 10 to 20 with drafts, see `JOURNAL_Q27_MAC_DECODE_2026-11-06.md`.
 - No Mac with a fan and no other chip: every number is one M4.

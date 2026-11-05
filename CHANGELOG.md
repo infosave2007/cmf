@@ -18,11 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a command prepares what it reads: a cold file's first token 35.3 → 33.6 s. `CMF_METAL_PREFETCH`, `CMF_METAL_WINDOWS`
 - `CMF_ANE_TRACE=1` prints every wait, ANE call and GPU command of a prompt on one clock, `CMF_VERIFY_CUT=1` runs each
   stage of the rows graph as its own command, `CMF_ANE_CHECK=1` prints how far the ANE's numbers are from the GPU's.
+- Native Metal, drafts over q4tp weights (`CMF_GRAPH_SPEC=1`): a verify of two or three rows runs on a batched matvec
+  (`q4tp_matvec_b2`, `_b3`) at 95.7 and 82.4 GB/s, where the narrow GEMM reads 60 to 67 at any batch, and its logits
+  equal the plain path's to four decimal places. `CMF_METAL_MVS=0` for the GEMM.
+- There the draft depth follows how often each draft of the chain holds, in place of a fixed seven, and where the
+  answer repeats a stretch of the prompt or of itself the tokens that followed it continue the chain up to seven
+  drafts. `CMF_GRAPH_SPEC_K=n` pins the depth, `CMF_SPEC_LOOKUP=0` turns the lookup off.
+- Qwen3.8-27B Turbo on a MacBook Air M4, greedy, 6.4 tok/s without drafts, the same text with them: an essay 10.1,
+  an explanation in Russian 10.7, a Rust function with tests 12.1, quotes from the prompt 15.0, an edit of the
+  prompt's code 20.5 tok/s; after a prompt of 3 600 tokens 6.0 → 8.3. Seven drafts gave the essay 6.2.
+- `CMF_METAL_CMD_TIMES=1` with `CMF_METAL_GPUPROF=1` prints a token-graph command's time in the kernel and on the GPU
+  and what Metal holds for the process; the `batch_kernel_lab` test times a batched q4tp matvec from an MSL file
+  against the engine's kernels on a model's own weights (`scripts/dory/q27_batch_lab.sh`).
 
 ### Changed
 - Metal: attention over a prompt chunk's rows is three GEMMs per KV group in place of a loop over rows, and a GDN
   mixer's a and b projections are one dispatch. Qwen3.8-27B on the M4's GPU alone, 3 600 tokens: 87.0 → 73.9 s.
   `CMF_ATTN_GEMM=0` for the loop.
+
+### Fixed
+- Metal: the draft chain's input stage, the embedding and the input projection, is a command of its own. Joined with
+  the draft block, which lies at the other end of a 13.6 GB weight buffer, the command waited 150 to 170 ms in the
+  driver for 9 ms of work in the first rounds of an answer: a round of two drafts on Qwen3.8-27B 362 → 204 ms.
+  `CMF_MTP_CHAIN_JOIN=1` joins them.
 
 ## [0.8.58] — 2026-11-05
 

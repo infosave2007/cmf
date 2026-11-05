@@ -5474,6 +5474,122 @@ kernel void q4tp_matvec_bk(
     }
 }
 
+// ── Two or three activation vectors against ONE weight stream at the
+// one-vector matvec's price: the verify of one or two drafts. Lanes, rows
+// and ladder as `q4tp_matvec`; a group of 32 columns goes in four steps of
+// 8, the step's activations in registers across the four rows, a row's word
+// unpacked once (masked nibbles, the 16^-k weights applied to the step's
+// sum) and multiplied into every vector. M4, the q4tp projections of the
+// 27B's first four layers, 791 MB a pass: `q4tp_mul_mm_n8` 11.7 ms at any
+// batch, this kernel 8.3 ms for two vectors and 9.6 for three, one vector
+// 8.6. Against the batched matvec 2.9e-7 relative rms, where the half-staged
+// GEMM stands at 3.6e-4.
+//
+// The step loop stays a loop. Unrolled, the compiler stages every step's
+// activations ahead and the registers a thread then holds cost the kernel
+// its occupancy: 17.4 ms a pass at three vectors, and 30.6 with a whole
+// group's activations held. Four vectors lose to the GEMM either way (12.7).
+template <int NB>
+inline void q4tp_mvs(device const uchar* q, device const float* x, device float* y, uint gpr, uint rows,
+                     uint sg, uint lane, uint tgpos, uint sgs, threadgroup float* lad)
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    uint cols = gpr * 32u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float acc[NB][4];
+    #pragma clang loop unroll(full)
+    for (int e = 0; e < NB; ++e) {
+        #pragma clang loop unroll(full)
+        for (int ri = 0; ri < 4; ++ri) acc[e][ri] = 0.0f;
+    }
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        // a tail simdgroup reads its last row again and writes nothing for it
+        float scale[4];
+        #pragma clang loop unroll(full)
+        for (int ri = 0; ri < 4; ++ri) {
+            uint r = min(r0 + (uint)ri, rows - 1u);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            scale[ri] = lad[(sg * 4u + min((uint)ri, nr - 1u)) * 32u + code];
+        }
+        #pragma clang loop unroll(disable)
+        for (uint s = 0u; s < 4u; ++s) {
+            float4 xf[NB][2];
+            float m8[NB];
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < NB; ++e) {
+                device const float4* xv = (device const float4*)(x + (ulong)e * cols + g * 32u + s * 8u);
+                float4 x0 = xv[0], x1 = xv[1];
+                float4 s4 = x0 + x1;
+                xf[e][0] = x0;
+                xf[e][1] = x1;
+                m8[e] = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+            }
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < 4; ++ri) {
+                uint r = min(r0 + (uint)ri, rows - 1u);
+                uint u = *((device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 16ul) + s);
+                float4 n0 = q4_nib4_scaled(u), n1 = q4_nib4_scaled(u >> 16);
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < NB; ++e) {
+                    float4 v = n0 * xf[e][0] + n1 * xf[e][1];
+                    acc[e][ri] += scale[ri] * (dot(v, sc) + m8[e]);
+                }
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int e = 0; e < NB; ++e) {
+        #pragma clang loop unroll(full)
+        for (int ri = 0; ri < 4; ++ri) {
+            float v = simd_sum(acc[e][ri]);
+            if (lane == 0u && (uint)ri < nr) y[(ulong)e * rows + r0 + (uint)ri] = v;
+        }
+    }
+}
+kernel void q4tp_matvec_b2(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    q4tp_mvs<2>(q, x, y, gpr, rows, sg, lane, tgpos, sgs, lad);
+}
+kernel void q4tp_matvec_b3(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    q4tp_mvs<3>(q, x, y, gpr, rows, sg, lane, tgpos, sgs, lad);
+}
+
 // Job-batched q4tp matvec: ONE dispatch covers every routed expert of a
 // MoE layer.
 //
@@ -8451,6 +8567,9 @@ struct Ctx {
     fwht_rows: ComputePipelineState,
     /// Batched (b ≤ 8) q4tp matvec — the speculative verify's kernel.
     q4tpbk: ComputePipelineState,
+    /// Two and three activation vectors against one weight stream (`q4tp_mvs`).
+    q4tpb2: ComputePipelineState,
+    q4tpb3: ComputePipelineState,
     /// q4tp matvec over a row prefix (draft-head shortlist).
     q4tppart: ComputePipelineState,
     /// Job-batched q4tp matvec + its two MoE companions: the whole
@@ -8765,6 +8884,8 @@ fn init() -> Result<Ctx, String> {
     let fwht = pso("prism_fwht")?;
     let fwht_rows = pso("prism_fwht_rows")?;
     let q4tpbk = pso("q4tp_matvec_bk")?;
+    let q4tpb2 = pso("q4tp_matvec_b2")?;
+    let q4tpb3 = pso("q4tp_matvec_b3")?;
     let q4tppart = pso("q4tp_matvec_part")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
     let q2tpjobs = pso("q2tp_matvec_jobs")?;
@@ -8901,6 +9022,8 @@ fn init() -> Result<Ctx, String> {
         fwht,
         fwht_rows,
         q4tpbk,
+        q4tpb2,
+        q4tpb3,
         q4tppart,
         q4tpjobs,
         q2tpjobs,
@@ -9098,6 +9221,14 @@ pub(crate) fn waitprof(dt: std::time::Duration) {
             NS.load(Ordering::Relaxed) as f64 / 1e6
         );
     }
+}
+
+/// `CMF_METAL_CMD_TIMES=1` with `CMF_METAL_GPUPROF=1`: every token graph
+/// command's time in the kernel, the gap before the GPU starts it and the
+/// GPU's own time.
+fn spec_gpu_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_CMD_TIMES").as_deref() == Ok("1"))
 }
 
 fn gpuprof_on() -> bool {
@@ -9374,6 +9505,43 @@ pub fn max_buffer_bytes() -> u64 {
     ctx()
         .map(|c| c._device.max_buffer_length() as u64)
         .unwrap_or(0)
+}
+
+/// What Metal holds for this process, for `CMF_METAL_CMD_TIMES=1`: the device's own count, the
+/// scratch cache, the weight windows built so far and the ceiling the driver recommends.
+pub fn working_set_report() -> String {
+    let Some(c) = ctx() else { return String::new() };
+    const MB: f64 = 1048576.0;
+    let (mut io, mut n_io, mut top) = (0u64, 0usize, Vec::new());
+    for ((_, key), b) in c.io_bufs.lock().unwrap().iter() {
+        io += b.length();
+        n_io += 1;
+        top.push((b.length(), *key));
+    }
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    let (mut win, mut n_win) = (0u64, 0usize);
+    for (arena, _) in c.file_bufs.lock().unwrap().values() {
+        for b in arena.bufs.iter().filter_map(|b| b.get()) {
+            win += b.length();
+            n_win += 1;
+        }
+    }
+    let mut mir = 0u64;
+    for m in c.kv_mirrors.lock().unwrap().values() {
+        mir += m.k.length() + m.v.length() + m.imp.length();
+    }
+    let wraps: u64 = c.st_wraps.lock().unwrap().values().map(|b| b.length()).sum();
+    let tops: Vec<String> = top.iter().take(8).map(|(l, k)| format!("{:.0}@{k}", *l as f64 / MB)).collect();
+    format!(
+        "device {:.0} MB | scratch {:.0} MB in {n_io} | windows {:.0} MB in {n_win} | mirrors {:.0} MB | state wraps {:.0} MB | recommended {:.0} MB | largest scratch {}",
+        c._device.current_allocated_size() as f64 / MB,
+        io as f64 / MB,
+        win as f64 / MB,
+        mir as f64 / MB,
+        wraps as f64 / MB,
+        c._device.recommended_max_working_set_size() as f64 / MB,
+        tops.join(" ")
+    )
 }
 
 /// What the device is willing to keep wired, in bytes (0 without Metal).
@@ -11059,6 +11227,93 @@ fn encode_q4tp_matvec_bk(
     );
 }
 
+/// Whether a verify of two or three rows takes `q4tp_matvec_b2` / `_b3`
+/// (`CMF_METAL_MVS=0`: the narrow GEMM, as for any other batch).
+pub fn small_batch_mv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_MVS").as_deref() != Ok("0"))
+}
+
+/// Two or three activation vectors against one weight stream: `xs` is
+/// `[nb][cols]` f32, `y` `[nb][rows]`, the batched matvec's bindings.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_matvec_bs(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+    nb: usize,
+) {
+    debug_assert!((2..=3).contains(&nb));
+    enc.set_compute_pipeline_state(if nb == 2 { &c.q4tpb2 } else { &c.q4tpb3 });
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// `q4tp_matvec_batch` through the two- and three-vector kernel (tests).
+pub fn q4tp_matvec_small_batch(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || !(2..=3).contains(&b) || pre.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let xs_buf = c._device.new_buffer_with_data(
+        pre.as_ptr() as *const std::ffi::c_void,
+        (b * cols * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let y_buf = c
+        ._device
+        .new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_matvec_bs(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b);
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    true
+}
+
 /// The narrow simdgroup-matrix GEMM: `xs` is `[nb][cols]` f32, `y`
 /// `[nb][rows]`, `xsc` `[nb]` power-of-two activation pre-scales (all
 /// ones when the caller knows the rows fit half). nb ≤ 8.
@@ -11669,6 +11924,116 @@ pub fn q4tp_kernel_bench(
     let t = std::time::Instant::now();
     submit_and_wait(c, cmd, &[&y_buf]);
     Some(t.elapsed().as_secs_f64() * 1e3 / reps as f64)
+}
+
+/// Batch-kernel lab (tests): every tensor of `idxs` against `b` activation
+/// vectors, `reps` passes in one command buffer, on the GPU's clock. `kernel`
+/// is `bk` (the batched matvec), `n8` (the narrow GEMM), `bs` (the two- and
+/// three-vector matvec; b must be 2 or 3) or, with `src`, an
+/// entry point of that MSL under the batched matvec's bindings (0 q, 1 x
+/// `[b][cols]`, 2 y `[b][rows]`, 3 groups a row, 4 rows, 5 b), dispatched as
+/// ceil(rows / tg_rows) threadgroups of `tg_threads`. Returns the GPU's ms a
+/// pass and the last tensor's output.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_batch_kernel_lab(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    b: usize,
+    kernel: &str,
+    src: Option<&str>,
+    tg_rows: usize,
+    tg_threads: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    if kernel == "bs" && !(2..=3).contains(&b) {
+        return None;
+    }
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let lab = match (kernel, src) {
+        ("bk", None) | ("n8", None) | ("bs", None) => None,
+        (name, Some(src)) => {
+            let lib = c
+                ._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?;
+            let f = lib.get_function(name, None).ok()?;
+            Some(c._device.new_compute_pipeline_state_with_function(&f).ok()?)
+        }
+        _ => return None,
+    };
+    let mut ts = Vec::new();
+    for &idx in idxs {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape[1] % 64 != 0 {
+            return None;
+        }
+        ts.push((model.entry_abs_offset(e)?, e.shape[0], e.shape[1]));
+    }
+    let max_cols = ts.iter().map(|t| t.2).max()?;
+    let max_rows = ts.iter().map(|t| t.1).max()?;
+    let shared = MTLResourceOptions::StorageModeShared;
+    let ones = [1.0f32; 8];
+    let sc = c
+        ._device
+        .new_buffer_with_data(ones.as_ptr() as *const std::ffi::c_void, 32, shared);
+    let y_buf = c._device.new_buffer((b * max_rows * 4) as u64, shared);
+    // x is `[b][cols]` of each tensor's own width: one buffer a width
+    let mut xbufs: std::collections::HashMap<usize, Buffer> = std::collections::HashMap::new();
+    for &(_, _, cols) in &ts {
+        xbufs.entry(cols).or_insert_with(|| {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| (((i * 7 + i / cols * 13) % 97) as f32 - 48.0) / 480.0)
+                .collect();
+            c._device.new_buffer_with_data(
+                xs.as_ptr() as *const std::ffi::c_void,
+                (xs.len() * 4) as u64,
+                shared,
+            )
+        });
+    }
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            for &(abs, rows, cols) in &ts {
+                let xs = &xbufs[&cols];
+                match (&lab, kernel) {
+                    (Some(pso), _) => {
+                        enc.set_compute_pipeline_state(pso);
+                        fbuf.bind(enc, 0, abs);
+                        enc.set_buffer(1, Some(xs), 0);
+                        enc.set_buffer(2, Some(&y_buf), 0);
+                        let w = [(cols / GROUP_SIZE) as u32, rows as u32, b as u32];
+                        for (i, v) in w.iter().enumerate() {
+                            enc.set_bytes(3 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                        }
+                        enc.set_buffer(6, Some(&sc), 0);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(rows.div_ceil(tg_rows) as u64, 1, 1),
+                            MTLSize::new(tg_threads as u64, 1, 1),
+                        );
+                    }
+                    (None, "bk") => {
+                        encode_q4tp_matvec_bk(c, enc, &fbuf, abs, xs, &y_buf, rows, cols / 32, b)
+                    }
+                    (None, "bs") => {
+                        encode_q4tp_matvec_bs(c, enc, &fbuf, abs, xs, &y_buf, rows, cols / 32, b)
+                    }
+                    _ => encode_q4tp_mm_n8(c, enc, &fbuf, abs, xs, &y_buf, &sc, rows, cols, b),
+                }
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let rows = ts.last()?.1;
+    let mut y = vec![0f32; b * rows];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), b * rows);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
 }
 
 /// Encode a projection `in_buf → out_buf` for a Q1 / Q1T / Q4-block weight.
@@ -20355,6 +20720,16 @@ impl TokenGraph {
                     cmd.as_ref() as *const _ as *mut metal::objc::runtime::Object;
                 let s: f64 = unsafe { msg_send![p, GPUStartTime] };
                 let e: f64 = unsafe { msg_send![p, GPUEndTime] };
+                let ks: f64 = unsafe { msg_send![p, kernelStartTime] };
+                let ke: f64 = unsafe { msg_send![p, kernelEndTime] };
+                if spec_gpu_trace_on() {
+                    eprintln!(
+                        "cmd-times: kernel {:.1} ms | kernel end to gpu start {:.1} ms | gpu {:.1} ms",
+                        (ke - ks) * 1e3,
+                        (s - ke) * 1e3,
+                        (e - s) * 1e3
+                    );
+                }
                 if e > s {
                     BUSY_US[kind as usize % 4].fetch_add(((e - s) * 1e6) as u64, Ordering::Relaxed);
                     busy += e - s;
@@ -24191,7 +24566,20 @@ impl VerifyGraph {
         note_weight_bytes(&kind, t.1, t.2 / GROUP_SIZE);
         match &kind {
             ProjKind::Q4tp => {
-                if self.b <= 8 {
+                if (2..=3).contains(&self.b) && small_batch_mv() {
+                    // f32 activations end to end: nothing for `xsc` to guard
+                    encode_q4tp_matvec_bs(
+                        self.tg.c,
+                        enc,
+                        &self.tg.fbuf,
+                        abs,
+                        xs,
+                        y,
+                        t.1,
+                        t.2 / GROUP_SIZE,
+                        self.b,
+                    );
+                } else if self.b <= 8 {
                     encode_q4tp_mm_n8(
                         self.tg.c,
                         enc,

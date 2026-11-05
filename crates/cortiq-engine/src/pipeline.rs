@@ -346,6 +346,14 @@ pub struct Pipeline {
     pub spec_k_adapt: Option<usize>,
     /// EWMA of the accepted fraction that drives `spec_k_adapt`.
     pub spec_acc_ewma: f32,
+    /// Native Metal over a q4tp trunk: how often draft `j` holds once the
+    /// one before it held, a running average (see `metal_spec_depth`).
+    pub spec_hold: [f32; 7],
+    /// Prompt lookup on native Metal: the drafts it added to a round that
+    /// held, a running average, and the rounds it sits out after that fell
+    /// under `LOOKUP_PAYS`.
+    pub spec_lookup_gain: f32,
+    pub spec_lookup_rest: u32,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
     /// Speculative SAMPLING state (graph_spec_step, temperature > 0): the
@@ -1331,6 +1339,98 @@ struct SpecMon {
     metal: bool,
 }
 
+/// What a speculative round of k drafts costs on native Metal over a q4tp
+/// trunk, in plain tokens. One and two drafts verify on the small-batch
+/// matvec (`q4tp_matvec_b2` / `_b3`), three and more on the narrow GEMM at
+/// one flat price. MacBook Air M4, Qwen3.8-27B: a plain token 160 ms, a
+/// round of one draft 176, of two 204, of three 246, of seven 281.
+const METAL_ROUND_COST: [f32; 7] = [1.10, 1.275, 1.54, 1.59, 1.65, 1.70, 1.76];
+/// How often a draft holds once the one before it held, before any round has
+/// shown it: the 27B's chain on code and on prose holds its first draft in
+/// four rounds of five, the second in three of four after that, the third in
+/// one of two.
+const SPEC_HOLD_PRIOR: [f32; 7] = [0.80, 0.75, 0.50, 0.67, 0.65, 0.69, 0.67];
+
+/// The draft depth that lands the most tokens in a unit of time: a round of
+/// k drafts gives its tip and every draft the chain held, for the cost of
+/// that depth's verify.
+fn metal_spec_depth(hold: &[f32; 7]) -> usize {
+    let mut best = (1usize, 0f32);
+    let (mut tokens, mut reach) = (1.0f32, 1.0f32);
+    for k in 1..=7 {
+        reach *= hold[k - 1];
+        tokens += reach;
+        let rate = tokens / METAL_ROUND_COST[k - 1];
+        // a longer chain has to win by more than the averages' noise
+        if rate > best.1 * 1.04 {
+            best = (k, rate);
+        }
+    }
+    best.0
+}
+
+/// A round of `k` drafts held its first `accepted`: move every depth the
+/// round put to the test. Depths past `k` keep their last value, except
+/// while the deepest one shown holds in nine rounds of ten: text that
+/// predictable is worth a longer chain now and then, so they drift towards
+/// it until a deeper round measures them.
+fn spec_hold_update(hold: &mut [f32; 7], k: usize, accepted: usize) {
+    let k = k.clamp(1, 7);
+    for j in 1..=k {
+        if accepted + 1 >= j {
+            let hit = if accepted >= j { 1.0 } else { 0.0 };
+            hold[j - 1] += 0.1 * (hit - hold[j - 1]);
+        }
+    }
+    if k < 7 && hold[k - 1] >= 0.9 {
+        for j in k + 1..=7 {
+            hold[j - 1] += 0.005 * (hold[k - 1] - hold[j - 1]);
+        }
+    }
+}
+
+/// Real tokens before the head's drafts that have to repeat with them for a
+/// lookup to continue the chain.
+const LOOKUP_MIN_REAL: usize = 3;
+/// Drafts a lookup has to add to a round on average to pay for the wider
+/// verify (a round of two drafts against one of seven on the M4: 204 and
+/// 281 ms).
+const LOOKUP_PAYS: f32 = 1.0;
+
+/// Prompt lookup: where the tail of `seq`, its last `min_len` tokens or
+/// more, repeats an earlier stretch, the tokens that followed that stretch
+/// there, at most `want` of them. The longest repeat wins, the latest of
+/// equal ones.
+fn lookup_continuation(seq: &[u32], min_len: usize, want: usize) -> &[u32] {
+    const CAP: usize = 32;
+    let n = seq.len();
+    if want == 0 || min_len == 0 || n <= min_len {
+        return &[];
+    }
+    let last = seq[n - 1];
+    let mut best = (0usize, 0usize);
+    for p in (0..n - 1).rev() {
+        if seq[p] != last {
+            continue;
+        }
+        let mut l = 1;
+        while l < CAP && l <= p && seq[p - l] == seq[n - 1 - l] {
+            l += 1;
+        }
+        if l > best.0 {
+            best = (l, p);
+            if l == CAP {
+                break;
+            }
+        }
+    }
+    if best.0 < min_len {
+        return &[];
+    }
+    let from = best.1 + 1;
+    &seq[from..(from + want).min(n)]
+}
+
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
@@ -1759,6 +1859,32 @@ impl Pipeline {
             ChunkHost::Other,
             self.chunk_stack_facts().dense_on_discrete(),
         )
+    }
+
+    /// Prompt lookup in a speculative round (`CMF_SPEC_LOOKUP=0` leaves the
+    /// chain to the draft head alone).
+    fn spec_lookup_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_SPEC_LOOKUP").as_deref() != Ok("0"))
+    }
+
+    /// Whether a verify of two or three rows runs on the small-batch matvec:
+    /// native Metal, a dense q4tp FFN in the trunk, the kernel not switched
+    /// off (`CMF_METAL_MVS=0`).
+    fn metal_small_batch_verify(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            crate::gpu::q1_force()
+                && crate::gpu_metal::small_batch_mv()
+                && self.weights.layers.first().is_some_and(|l| match &l.ffn {
+                    FfnKind::Dense(d) => d.gate_proj.mapped_q4tp().is_some(),
+                    _ => false,
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Architectures that run a dedicated per-token stack (gemma-3n's
@@ -4199,6 +4325,9 @@ impl Pipeline {
             draft_full_streak: 0,
             spec_k_adapt: None,
             spec_acc_ewma: 0.7,
+            spec_hold: SPEC_HOLD_PRIOR,
+            spec_lookup_gain: 2.0,
+            spec_lookup_rest: 0,
             rng,
             sampler_scratch: SamplerScratch::default(),
             spec_forced: None,
@@ -5854,7 +5983,14 @@ impl Pipeline {
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .filter(|&v| (1..=8).contains(&v))
-                        .unwrap_or(7);
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| {
+                            if self.metal_small_batch_verify() {
+                                "auto".to_string()
+                            } else {
+                                "7".to_string()
+                            }
+                        });
                     let arm = if self.sampler_config.temperature < 1e-6 {
                         "greedy"
                     } else {
@@ -8755,12 +8891,24 @@ impl Pipeline {
         // let the accepted fraction move it — predictable text climbs to
         // the old default within a few rounds, prose settles at 2-3 where
         // the shorter verify pays.
-        let (k_start, k_max) = if metal_native {
+        // Native Metal over a q4tp trunk: two rows verify at about a plain
+        // token's price and three at a quarter more, so the depth follows
+        // each depth's running acceptance instead of filling the GEMM tile.
+        let metal_small = metal_native && self.metal_small_batch_verify();
+        let (k_start, k_max) = if metal_small {
+            (metal_spec_depth(&self.spec_hold), 7)
+        } else if metal_native {
             (7, 7)
         } else {
             (3, k_default.max(5))
         };
-        let k_full: usize = k_env.unwrap_or_else(|| self.spec_k_adapt.unwrap_or(k_start));
+        let k_full: usize = k_env.unwrap_or_else(|| {
+            if metal_small {
+                k_start
+            } else {
+                self.spec_k_adapt.unwrap_or(k_start)
+            }
+        });
         let k_spec = k_full.min(room).max(1);
         // a tail round cut short by `room` says nothing about the text:
         // it must not move the adaptive depth the next request starts at
@@ -8940,6 +9088,32 @@ impl Pipeline {
             spec_stamp("d.pick");
         }
         all_ids.truncate(base_len);
+        // Prompt lookup, plain greedy on native Metal, where a verify of
+        // four to eight rows has one price: when the tip and the head's
+        // drafts repeat an earlier stretch of the sequence, the tokens that
+        // followed it there go on as drafts. The head's drafts are the
+        // test: a lookup continues only what they agree with.
+        let k_mtp = k_spec;
+        let k_room = room.min(7);
+        if metal_native
+            && !sampling
+            && !greedy_pen
+            && k_mtp < k_room
+            && drafts.len() == k_mtp
+            && Self::spec_lookup_on()
+        {
+            if self.spec_lookup_rest > 0 {
+                self.spec_lookup_rest -= 1;
+            } else {
+                all_ids.extend_from_slice(&drafts);
+                let more =
+                    lookup_continuation(all_ids, k_mtp + LOOKUP_MIN_REAL, k_room - k_mtp).to_vec();
+                all_ids.truncate(base_len);
+                drafts.extend(more);
+            }
+        }
+        let k_spec = drafts.len();
+        spec_stamp("d.look");
         *drafted += k_spec;
         let t_draft = t_round.elapsed();
         let sub_draft = subs();
@@ -9043,7 +9217,7 @@ impl Pipeline {
                 // The verifier refused before admission.  Its draft MTP
                 // rows are still device-resident, so rewind the separate
                 // mirror before the caller takes the exact one-token path.
-                m.kv.truncate_last(k_spec);
+                m.kv.truncate_last(k_mtp);
                 if !metal_native && !self.rewind_mtp_graph_mirror(next_pos) {
                     self.clear_sequence_state();
                     self.graph_failed
@@ -9111,7 +9285,7 @@ impl Pipeline {
                     hd = hd.max((hi[j] - hiddens[i * self.hidden_size + j]).abs());
                 }
                 eprintln!(
-                    "verify-check row {i} tok {t} pos {}: ref argmax {ra} verify argmax {va} {} | max|dlogit| {md:.3} rms {:.4} | max|dhidden| {hd:.4}",
+                    "verify-check row {i} tok {t} pos {}: ref argmax {ra} verify argmax {va} {} | max|dlogit| {md:.3e} rms {:.3e} | max|dhidden| {hd:.3e}",
                     next_pos + i,
                     if ra == va { "OK" } else { "MISMATCH" },
                     (rms / lm_rows as f64).sqrt()
@@ -9352,7 +9526,7 @@ impl Pipeline {
         let mut warm_pending: Option<MetalWarmPending> = None;
         #[cfg(target_os = "macos")]
         if metal_native {
-            m.kv.truncate_last(k_spec.saturating_sub(1));
+            m.kv.truncate_last(k_mtp.saturating_sub(1));
             if self.mtp_graph_mode == Some(true) {
                 // the mirror rows below the cut are the CPU rows: re-point,
                 // no re-upload
@@ -9495,7 +9669,7 @@ impl Pipeline {
         // warms are batched instead of assuming either way.
         if !metal_native {
             // (Metal cut its MTP cache before the trunk commit, above)
-            m.kv.truncate_last(k_spec.saturating_sub(1));
+            m.kv.truncate_last(k_mtp.saturating_sub(1));
         }
         spec_stamp("c.trunc");
         if !metal_native
@@ -9623,6 +9797,34 @@ impl Pipeline {
         // of one), so a shorter round only forfeits tokens — measured on
         // the M4: an essay round at k=2 still verified in 260 ms. The
         // adaptation is for cards whose verify grows with the rows.
+        if k_spec > k_mtp {
+            // a lookup's round: what it added over the head's own drafts
+            let extra = a.saturating_sub(k_mtp) as f32;
+            self.spec_lookup_gain += 0.2 * (extra - self.spec_lookup_gain);
+            if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                eprintln!(
+                    "spec-lookup: {} drafts from the context, {extra} held (average {:.2})",
+                    k_spec - k_mtp,
+                    self.spec_lookup_gain
+                );
+            }
+            if self.spec_lookup_gain < LOOKUP_PAYS {
+                self.spec_lookup_rest = 24;
+                self.spec_lookup_gain = 1.6;
+            }
+        }
+        if metal_small && !k_capped {
+            spec_hold_update(&mut self.spec_hold, k_mtp, a.min(k_mtp));
+            if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                let next = metal_spec_depth(&self.spec_hold);
+                if next != k_mtp && k_env.is_none() {
+                    eprintln!(
+                        "spec-k: {k_mtp} → {next} (a draft holds after the last {:.2?})",
+                        self.spec_hold
+                    );
+                }
+            }
+        }
         if k_env.is_none() && !metal_native && !k_capped {
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
@@ -17347,6 +17549,13 @@ impl Pipeline {
         // against 30.1 whole, and the whole chain's host encode measures
         // 0.3 ms against a 29.7 ms wait. Kept as a probe, off by default.
         let split = std::env::var("CMF_MTP_CHAIN_SPLIT").as_deref() == Ok("1");
+        // The input stage, the embedding and the block's input projection, goes as a command
+        // of its own. The weights are one buffer of 13.6 GB on a Mac, the embedding table lies
+        // 1.5 GB into it and the draft block 13.1 GB: in one command with the block the driver
+        // held the command 150 to 170 ms before the GPU ran its 9 ms, in every round until the
+        // first one without a warm-up. MacBook Air M4, Qwen3.8-27B, a round of two drafts:
+        // 362 → 204 ms. `CMF_MTP_CHAIN_JOIN=1` keeps one command.
+        let join = std::env::var("CMF_MTP_CHAIN_JOIN").as_deref() == Ok("1");
         let t_chain = std::time::Instant::now();
         graph.chain_ids_init(t_next, k);
         let cpu_stored;
@@ -17397,6 +17606,9 @@ impl Pipeline {
                     v_norm: false,
                     dash: None,
                 };
+                if !join {
+                    graph.commit();
+                }
                 if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                     return Err(false);
                 }
@@ -17428,6 +17640,9 @@ impl Pipeline {
                 (t_chain.elapsed() - t_enc).as_secs_f64() * 1e3,
                 if split { ", split" } else { "" }
             );
+            if std::env::var("CMF_METAL_CMD_TIMES").as_deref() == Ok("1") {
+                eprintln!("metal-set: {}", crate::gpu_metal::working_set_report());
+            }
         }
         let mut ids = vec![0u32; k];
         if !graph.chain_ids_read(&mut ids) {
@@ -24240,6 +24455,70 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn lookup_continues_a_repeated_stretch() {
+        // 1 2 3 4 5 6 7 | 9 9 | 2 3 4 → the stretch 2 3 4 was followed by 5 6 7
+        let seq = [1, 2, 3, 4, 5, 6, 7, 9, 9, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 3, 3), &[5, 6, 7]);
+        assert_eq!(lookup_continuation(&seq, 3, 2), &[5, 6]);
+        // a repeat shorter than asked gives nothing
+        assert!(lookup_continuation(&seq, 4, 3).is_empty());
+        // the longest repeat wins over a later, shorter one
+        let seq = [5, 2, 3, 4, 8, 0, 3, 4, 7, 0, 5, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 2, 1), &[8]);
+        // of equal ones the latest
+        let seq = [2, 3, 4, 8, 0, 2, 3, 4, 7, 0, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 2, 1), &[7]);
+        // a period continues through the tail itself
+        let seq = [1, 2, 1, 2, 1, 2];
+        assert_eq!(lookup_continuation(&seq, 3, 4), &[1, 2]);
+        assert!(lookup_continuation(&[1, 2, 3], 3, 2).is_empty());
+        assert!(lookup_continuation(&[], 1, 2).is_empty());
+    }
+
+    #[test]
+    fn metal_spec_depth_follows_what_the_chain_holds() {
+        // before any round: two drafts
+        assert_eq!(metal_spec_depth(&SPEC_HOLD_PRIOR), 2);
+        // a second draft that seldom holds is not worth its verify
+        assert_eq!(metal_spec_depth(&[0.6, 0.15, 0.5, 0.5, 0.5, 0.5, 0.5]), 1);
+        // predictable text fills the GEMM tile
+        assert_eq!(metal_spec_depth(&[0.97; 7]), 7);
+        // rounds of two drafts that both hold reach for a longer chain
+        let mut h = SPEC_HOLD_PRIOR;
+        let mut k = metal_spec_depth(&h);
+        let mut rounds = 0;
+        while k == 2 && rounds < 200 {
+            spec_hold_update(&mut h, k, 2);
+            k = metal_spec_depth(&h);
+            rounds += 1;
+        }
+        assert!(k > 2 && rounds < 60, "depth {k} after {rounds} rounds");
+        // ... and come back once the longer chain shows that a third never holds
+        let mut back = 0;
+        while k > 2 && back < 200 {
+            spec_hold_update(&mut h, k, 2);
+            k = metal_spec_depth(&h);
+            back += 1;
+        }
+        assert!(k == 2 && back < 10, "depth {k} after {back} rounds");
+        // most rounds of such text stay at two drafts
+        let mut deep = 0;
+        for _ in 0..400 {
+            let k = metal_spec_depth(&h);
+            deep += (k > 2) as usize;
+            spec_hold_update(&mut h, k, 2);
+        }
+        assert!(deep < 40, "{deep} of 400 rounds went deeper");
+        // a chain that holds one draft in two rounds of three, two in one of three: never deeper
+        let mut h = SPEC_HOLD_PRIOR;
+        for i in 0..300 {
+            let k = metal_spec_depth(&h);
+            assert!(k <= 2, "depth {k} at round {i}");
+            spec_hold_update(&mut h, k, (i % 3).min(k));
         }
     }
 
