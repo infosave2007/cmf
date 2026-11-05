@@ -14,7 +14,7 @@ use objc::runtime::{BOOL, Class, NO, Object};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 type Id = *mut Object;
 
@@ -33,6 +33,26 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut c_void;
+}
+
+/// vImage's view of a plane: `height` rows of `width` values, `row_bytes` apart.
+#[repr(C)]
+struct Plane {
+    data: *mut c_void,
+    height: usize,
+    width: usize,
+    row_bytes: usize,
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn vImageConvert_Planar16FtoPlanarF(src: *const Plane, dest: *const Plane, flags: u32) -> isize;
+    fn vImageConvert_PlanarFtoPlanar16F(src: *const Plane, dest: *const Plane, flags: u32) -> isize;
+    fn vDSP_mtrans(a: *const f32, ia: isize, c: *mut f32, ic: isize, m: usize, n: usize);
+    fn vDSP_svesq(a: *const f32, ia: isize, c: *mut f32, n: usize);
+    fn vDSP_vsmul(a: *const f32, ia: isize, b: *const f32, c: *mut f32, ic: isize, n: usize);
+    fn vDSP_vmul(a: *const f32, ia: isize, b: *const f32, ib: isize, c: *mut f32, ic: isize, n: usize);
+    fn cblas_saxpy(n: i32, alpha: f32, x: *const f32, incx: i32, y: *mut f32, incy: i32);
 }
 
 const QOS_DEFAULT: u32 = 0x15;
@@ -382,99 +402,156 @@ fn fp16(v: f64) -> String {
     format!("fp16({sign}0x1.{m:013x}p{e:+})")
 }
 
-/// The MIL of one function of `rows` rows: int8 weights, fp16 activations. A token's intermediate
-/// row still comes down to one peak, against fp16 overflow in the down product.
-pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnTypes<'_>) -> String {
-    let unit = fp16(1.0 / 128.0);
-    let segs = hidden / SEGMENT;
-    let mut params: Vec<String> = Vec::new();
-    let mut body = String::new();
-    let mut line = |t: String| {
-        body.push_str("        ");
-        body.push_str(&t);
-        body.push_str(";\n");
-    };
-    let mut input = |name: String, surf: &Surface, r: usize, w: usize, line: &mut dyn FnMut(String)| {
-        params.push(format!("{} {name}", surf.buffer_type(r, w)));
+/// The text of one MIL function, a line at a time.
+struct Mil {
+    params: Vec<String>,
+    body: String,
+}
+
+impl Mil {
+    fn new() -> Mil {
+        Mil { params: Vec::new(), body: String::new() }
+    }
+
+    fn line(&mut self, t: String) {
+        self.body.push_str("        ");
+        self.body.push_str(&t);
+        self.body.push_str(";\n");
+    }
+
+    fn f16(&mut self, name: &str, h: usize, w: usize, expr: String) {
+        self.line(format!("{} {name} = {expr}", tensor("fp16", h, w)));
+    }
+
+    /// A surface as the input `name`, and its tensor `name_t`.
+    fn input(&mut self, name: &str, surf: &Surface, r: usize, w: usize) -> String {
+        self.params.push(format!("{} {name}", surf.buffer_type(r, w)));
         let ty = if surf.int8 { "int8" } else { "fp16" };
-        line(format!("{} {name}_t = tensor_buffer_to_tensor<ios17>(input = {name})", tensor(ty, r, w)));
-    };
-    for k in 0..segs {
-        input(format!("x{k}"), s.x[k], SEGMENT, rows, &mut line);
+        self.line(format!("{} {name}_t = tensor_buffer_to_tensor<ios17>(input = {name})", tensor(ty, r, w)));
+        format!("{name}_t")
     }
-    for k in 0..segs {
-        input(format!("wg{k}"), s.wg[k], channels, SEGMENT, &mut line);
-        input(format!("wu{k}"), s.wu[k], channels, SEGMENT, &mut line);
+
+    /// Weights as an input, and the name of their fp16 tensor: int8 ones count in 1/128.
+    fn weights(&mut self, name: &str, surf: &Surface, r: usize, w: usize) -> String {
+        let t = self.input(name, surf, r, w);
+        if !surf.int8 {
+            return t;
+        }
+        self.f16(&format!("{name}_d"), r, w, format!("dequantize(input = {t}, scale = {})", fp16(1.0 / 128.0)));
+        format!("{name}_d")
     }
-    input("sg".into(), s.sg, channels, 1, &mut line);
-    input("su".into(), s.su, channels, 1, &mut line);
-    let down: Vec<usize> = (0..s.wd.len()).map(|i| SEGMENT.min(channels - i * SEGMENT)).collect();
-    for (i, &w) in down.iter().enumerate() {
-        input(format!("wd{i}"), s.wd[i], hidden, w, &mut line);
-    }
-    input("sd".into(), s.sd, hidden, 1, &mut line);
-    let f16 = |name: &str, h: usize, w: usize, expr: String| format!("{} {name} = {expr}", tensor("fp16", h, w));
-    let matmul = |name: String, weights: String, values: String, h: usize, w: usize, line: &mut dyn FnMut(String)| {
-        line(f16(&format!("{weights}_d"), h, w, format!("dequantize(input = {weights}_t, scale = {unit})")));
-        line(format!(
-            "{} {name} = matmul(transpose_x = bool(false), transpose_y = bool(false), x = {weights}_d, y = {values})",
-            tensor("fp16", h, rows)
-        ));
-    };
-    let mut line2 = |t: String| line(t);
-    let sum = |prefix: &str, terms: usize, h: usize, line: &mut dyn FnMut(String)| -> String {
-        let mut total = format!("{prefix}0");
-        for t in 1..terms {
-            let next = format!("{prefix}_sum{t}");
-            line(f16(&next, h, rows, format!("add(x = {total}, y = {prefix}{t})")));
+
+    /// The sum over the segments of `weights[k]` · `values[k]`: `h` × `rows`.
+    fn product(&mut self, out: &str, weights: &[String], values: &[String], h: usize, rows: usize) -> String {
+        for (k, (w, v)) in weights.iter().zip(values).enumerate() {
+            self.f16(
+                &format!("{out}{k}"),
+                h,
+                rows,
+                format!("matmul(transpose_x = bool(false), transpose_y = bool(false), x = {w}, y = {v})"),
+            );
+        }
+        let mut total = format!("{out}0");
+        for k in 1..weights.len() {
+            let next = format!("{out}_sum{k}");
+            self.f16(&next, h, rows, format!("add(x = {total}, y = {out}{k})"));
             total = next;
         }
         total
-    };
-    for p in ["g", "u"] {
-        for k in 0..segs {
-            matmul(format!("{p}m{k}"), format!("w{p}{k}"), format!("x{k}_t"), channels, SEGMENT, &mut line2);
-        }
-        let total = sum(&format!("{p}m"), segs, channels, &mut line2);
-        line2(f16(&format!("{p}s"), channels, rows, format!("mul(x = {total}, y = s{p}_t)")));
+    }
+
+    /// `value` (`h` × `rows`) as the function's output on `surf`.
+    fn finish(mut self, name: &str, value: &str, surf: &Surface, h: usize, rows: usize) -> String {
+        self.line(format!(
+            "{} y = tensor_to_tensor_buffer<ios17>(input = {value}, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>({}))",
+            surf.buffer_type(h, rows),
+            surf.strides(h)
+        ));
+        format!("    func {name}<ios18>({}) {{\n{}    }} -> (y);\n", self.params.join(", "), self.body)
+    }
+}
+
+/// The MIL of one FFN over `rows` rows: fp16 activations, weights of the surfaces' type. A
+/// token's intermediate row still comes down to one peak, against fp16 overflow in the down
+/// product.
+pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnTypes<'_>) -> String {
+    let segs = hidden / SEGMENT;
+    let mut m = Mil::new();
+    let xs: Vec<String> = (0..segs).map(|k| m.input(&format!("x{k}"), s.x[k], SEGMENT, rows)).collect();
+    let (mut wg, mut wu) = (Vec::new(), Vec::new());
+    for k in 0..segs {
+        wg.push(m.weights(&format!("wg{k}"), s.wg[k], channels, SEGMENT));
+        wu.push(m.weights(&format!("wu{k}"), s.wu[k], channels, SEGMENT));
+    }
+    m.input("sg", s.sg, channels, 1);
+    m.input("su", s.su, channels, 1);
+    let down = seg_widths(channels);
+    let wd: Vec<String> = down.iter().enumerate().map(|(i, &w)| m.weights(&format!("wd{i}"), s.wd[i], hidden, w)).collect();
+    m.input("sd", s.sd, hidden, 1);
+    for (p, w) in [("g", &wg), ("u", &wu)] {
+        let total = m.product(&format!("{p}m"), w, &xs, channels, rows);
+        m.f16(&format!("{p}s"), channels, rows, format!("mul(x = {total}, y = s{p}_t)"));
     }
     let (c, r) = (channels, rows);
-    line2(f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5))));
-    line2(f16("th", c, r, "tanh(x = gh)".into()));
-    line2(f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0))));
-    line2(f16("silu", c, r, "mul(x = gh, y = tp)".into()));
-    line2(f16("h", c, r, "mul(x = silu, y = us)".into()));
-    line2(f16("habs", c, r, "abs(x = h)".into()));
-    line2(f16("peak", 1, r, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))".into()));
-    line2(f16("floor", 1, r, format!("maximum(x = peak, y = {})", fp16(1.0 / 512.0))));
-    line2(f16("inverse", 1, r, format!("real_div(x = {}, y = floor)", fp16(1.0))));
-    line2(f16("hd", c, r, "mul(x = h, y = inverse)".into()));
+    m.f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5)));
+    m.f16("th", c, r, "tanh(x = gh)".into());
+    m.f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0)));
+    m.f16("silu", c, r, "mul(x = gh, y = tp)".into());
+    m.f16("h", c, r, "mul(x = silu, y = us)".into());
+    m.f16("habs", c, r, "abs(x = h)".into());
+    m.f16("peak", 1, r, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))".into());
+    m.f16("floor", 1, r, format!("maximum(x = peak, y = {})", fp16(1.0 / 512.0)));
+    m.f16("inverse", 1, r, format!("real_div(x = {}, y = floor)", fp16(1.0)));
+    m.f16("hd", c, r, "mul(x = h, y = inverse)".into());
+    let mut parts = Vec::new();
     let mut begin = 0usize;
     for (i, &w) in down.iter().enumerate() {
-        line2(f16(
+        m.f16(
             &format!("hd{i}"),
             w,
             r,
             format!("slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, {begin}, 0]), size = tensor<int32, [4]>([1, 1, {w}, {r}]))"),
-        ));
-        matmul(format!("dm{i}"), format!("wd{i}"), format!("hd{i}"), hidden, w, &mut line2);
+        );
+        parts.push(format!("hd{i}"));
         begin += w;
     }
-    let total = sum("dm", down.len(), hidden, &mut line2);
-    line2(f16("ds", hidden, r, format!("mul(x = {total}, y = sd_t)")));
-    line2(f16("yt", hidden + 1, r, "concat(axis = int32(2), interleave = bool(false), values = (ds, floor))".into()));
-    line2(format!(
-        "{} y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>({}))",
-        s.out.buffer_type(hidden + 1, r),
-        s.out.strides(hidden + 1)
-    ));
-    format!("    func ffn{rows}<ios18>({}) {{\n{body}    }} -> (y);\n", params.join(", "))
+    let total = m.product("dm", &wd, &parts, hidden, rows);
+    m.f16("ds", hidden, r, format!("mul(x = {total}, y = sd_t)"));
+    m.f16("yt", hidden + 1, r, "concat(axis = int32(2), interleave = bool(false), values = (ds, floor))".into());
+    m.finish(&format!("ffn{rows}"), "yt", s.out, hidden + 1, rows)
+}
+
+/// The MIL of a group of projections of one input over `rows` rows, their outputs one under
+/// another. `projs`: each one's weight segments, its row scales and its rows.
+pub(crate) fn lin_function(name: &str, rows: usize, x: &[&Surface], projs: &[(Vec<&Surface>, &Surface, usize)], out: &Surface) -> String {
+    let mut m = Mil::new();
+    let xs: Vec<String> = x.iter().enumerate().map(|(k, s)| m.input(&format!("x{k}"), s, SEGMENT, rows)).collect();
+    let mut parts = Vec::new();
+    let mut total_rows = 0usize;
+    for (j, (w, scale, h)) in projs.iter().enumerate() {
+        let ws: Vec<String> = w.iter().enumerate().map(|(k, surf)| m.weights(&format!("w{j}_{k}"), surf, *h, SEGMENT)).collect();
+        m.input(&format!("s{j}"), scale, *h, 1);
+        let total = m.product(&format!("p{j}m"), &ws, &xs, *h, rows);
+        m.f16(&format!("p{j}"), *h, rows, format!("mul(x = {total}, y = s{j}_t)"));
+        parts.push(format!("p{j}"));
+        total_rows += h;
+    }
+    let value = if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        m.f16("yt", total_rows, rows, format!("concat(axis = int32(2), interleave = bool(false), values = ({}))", parts.join(", ")));
+        "yt".into()
+    };
+    m.finish(name, &value, out, total_rows, rows)
 }
 
 const MSL: &str = include_str!("ane_msl.metal");
 
 /// The rows of the program's functions. A chunk runs on the smallest that holds it.
 const FUNCTIONS: [usize; 3] = [128, 256, 512];
+
+/// Halves of a chunk in flight at once.
+pub(crate) const LANES: usize = 2;
 
 struct Shared {
     s: Surface,
@@ -492,13 +569,15 @@ fn shared_surface(c: &Ctx, rows: usize, width: usize, int8: bool) -> Result<Shar
     Ok(Shared { s, b })
 }
 
-struct WeightSet {
-    wg: Vec<Shared>,
-    wu: Vec<Shared>,
-    wd: Vec<Shared>,
-    sg: Shared,
-    su: Shared,
-    sd: Shared,
+/// One projection as the ANE reads it: its weight segments and the scale of each row.
+struct Staged {
+    w: Vec<Shared>,
+    s: Shared,
+}
+
+fn staged(c: &Ctx, rows: usize, cols: usize, int8: bool) -> Result<Staged, String> {
+    let w: Result<Vec<Shared>, String> = seg_widths(cols).into_iter().map(|w| shared_surface(c, rows, w, int8)).collect();
+    Ok(Staged { w: w?, s: shared_surface(c, rows, 1, false)? })
 }
 
 /// One projection in the model's file: its absolute offset, rows and columns.
@@ -509,24 +588,95 @@ pub(crate) struct Proj {
     pub(crate) cols: usize,
 }
 
+/// What the ANE takes of one layer: its FFN's gate, up and down, and the projections of the
+/// mixer's input.
+#[derive(Clone, Default)]
+pub(crate) struct LayerProjs {
+    pub(crate) ffn: Option<[Proj; 3]>,
+    pub(crate) mix: Vec<Proj>,
+}
+
+/// The weights the ANE reads go in two groups, each with two sets that take turns. A third
+/// set of FFN weights lets the next layer be staged before the second half lets one go, and
+/// lost: Qwen3.8-27B on the M4, first token 27.8 and 27.7 s with two sets, 31.3 s with three
+/// for the FFNs, 28.6 s with three for both groups. With two the halves keep a layer apart.
+const FFN: usize = 0;
+const MIX: usize = 1;
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    layer: Option<usize>,
+    ready: bool,
+    /// Evaluations of its layer the halves of this chunk still owe.
+    uses: usize,
+    /// The chunk that counted `uses`.
+    chunk: u64,
+    /// The layer a thread is to stage here, or is staging.
+    pending: Option<usize>,
+}
+
+#[derive(Default)]
+struct Stock {
+    groups: [[Slot; 2]; 2],
+    lanes: usize,
+    chunk: u64,
+    dead: bool,
+    /// The lane that keeps the ANE from its FFN through the mixer call that follows.
+    hold: Option<usize>,
+}
+
+/// A lane's surfaces: the input segments, the FFN's output, and the mixer projections' output
+/// of each shape.
+struct LaneIo {
+    x: Vec<Shared>,
+    out: Shared,
+    mix: Vec<Shared>,
+    /// The host's planes for `host_norm`: channels by rows, and rows by channels.
+    host: Mutex<(Vec<f32>, Vec<f32>)>,
+}
+
+#[derive(Default)]
+struct Times {
+    /// Milliseconds by group: waiting for weights, the ANE, and the evaluations.
+    weights: [f64; 2],
+    ane: [f64; 2],
+    count: [u64; 2],
+    /// Waiting for the GPU's commands, and for the ANE while the other half had it.
+    gpu: f64,
+    queue: f64,
+    /// The CPU's milliseconds on weights, and the layers staged.
+    staged: [f64; 2],
+    layers: [u64; 2],
+    /// The CPU's milliseconds between an FFN and the next mixer.
+    host: f64,
+    /// The GPU's own milliseconds on commands of GDN and of attention layers, and their count.
+    cmd: [f64; 2],
+    cmds: [u64; 2],
+}
+
 pub(crate) struct AneFfn {
     prog: Program,
     pack: ComputePipelineState,
     join: ComputePipelineState,
+    unpack: ComputePipelineState,
     hidden: usize,
     inter: usize,
-    sets: [WeightSet; 2],
-    x: Vec<Shared>,
+    layers: Vec<LayerProjs>,
+    /// The shapes of mixer projections: the rows of each projection of a group.
+    shapes: Vec<Vec<usize>>,
+    /// Each layer's shape, when the ANE takes its mixer's input.
+    shape_of: Vec<Option<usize>>,
+    ffn_sets: [[Staged; 3]; 2],
+    /// By set, then shape, then projection.
+    mix_sets: [Vec<Vec<Staged>>; 2],
+    io: [LaneIo; LANES],
     tx: Shared,
-    out: Shared,
-    status: Buffer,
-    layers: Vec<[Proj; 3]>,
-    /// What each set holds, once a staging is done.
-    staged: Mutex<[Option<usize>; 2]>,
-    /// A staging on its way: the thread, the set it writes and the layer.
-    staging: Mutex<Option<(std::thread::JoinHandle<()>, usize, usize)>>,
-    /// Milliseconds: waiting for weights, the ANE, the GPU's part, and the evaluations.
-    pub(crate) ms: Mutex<(f64, f64, f64, u64)>,
+    stock: Mutex<Stock>,
+    turn: Condvar,
+    /// One evaluation at a time.
+    eval: Mutex<()>,
+    times: Mutex<Times>,
+    born: std::time::Instant,
 }
 
 unsafe impl Send for AneFfn {}
@@ -536,24 +686,72 @@ fn seg_widths(channels: usize) -> Vec<usize> {
     (0..channels.div_ceil(SEGMENT)).map(|i| SEGMENT.min(channels - i * SEGMENT)).collect()
 }
 
-fn weight_set(c: &Ctx, hidden: usize, inter: usize) -> Result<WeightSet, String> {
-    let mk = |r, w, i| shared_surface(c, r, w, i);
-    let (mut wg, mut wu, mut wd) = (Vec::new(), Vec::new(), Vec::new());
-    for _ in 0..hidden / SEGMENT {
-        wg.push(mk(inter, SEGMENT, true)?);
-        wu.push(mk(inter, SEGMENT, true)?);
+/// Whether the mixer's projections go as fp16, which holds q4tp weights whole; int8 holds them
+/// to 1.4 % and halves their memory (`CMF_ANE_MIX=int8`).
+fn mix_int8() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_ANE_MIX").is_ok_and(|v| v.split(',').any(|t| t == "int8")))
+}
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+}
+
+/// The clock Metal stamps its commands with, in milliseconds.
+pub(crate) fn clock_ms() -> f64 {
+    static BASE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let scale = *BASE.get_or_init(|| {
+        let mut info = [1u32, 1u32];
+        // SAFETY: a two-word struct the call fills.
+        unsafe { mach_timebase_info(&mut info) };
+        info[0] as f64 / info[1] as f64 / 1e6
+    });
+    // SAFETY: no arguments and no state.
+    unsafe { mach_absolute_time() as f64 * scale }
+}
+
+/// `CMF_ANE_TRACE=1` prints every stage of a chunk's halves with its start and its length, for
+/// reading the schedule: `ane-trace START lane LANE layer LAYER WHAT LENGTH`, in milliseconds.
+pub(crate) fn trace(lane: usize, layer: usize, what: &str, start: f64, end: f64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("CMF_ANE_TRACE").is_ok()) {
+        eprintln!("ane-trace {start:.2} lane {lane} layer {layer} {what} {:.2}", end - start);
     }
-    for w in seg_widths(inter) {
-        wd.push(mk(hidden, w, true)?);
-    }
-    Ok(WeightSet { wg, wu, wd, sg: mk(inter, 1, false)?, su: mk(inter, 1, false)?, sd: mk(hidden, 1, false)? })
+}
+
+/// What the ANE takes besides the FFNs (`CMF_ANE_MIX`): 0 nothing (`ffn`), 1 a GDN mixer's `z`
+/// (`z`), 2 that and an attention layer's `q` (the default), 3 every input projection (`all`);
+/// `,int8` stages them as int8. The default leaves the GPU and the ANE about equally busy in
+/// both kinds of layer. The half that ran an FFN keeps the ANE for the next layer's call, so
+/// the short call does not wait behind the other half's FFN. Qwen3.8-27B on the M4, 3 600
+/// tokens, first token: 32.2 and 33.0 s with the FFNs alone, 30.5 and 28.7 s with `z`.
+pub(crate) fn mix_level() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("CMF_ANE_MIX").unwrap_or_default();
+        let has = |t: &str| v.split(',').any(|x| x == t);
+        if has("ffn") || has("0") {
+            0
+        } else if has("all") {
+            3
+        } else if has("z") {
+            1
+        } else {
+            2
+        }
+    })
+}
+
+fn mix_on() -> bool {
+    mix_level() > 0
 }
 
 impl AneFfn {
-    /// `layers`: gate, up and down of each FFN, q4tp, of one shape.
-    pub(crate) fn new(c: &Ctx, layers: Vec<[Proj; 3]>) -> Result<AneFfn, String> {
+    /// `layers`: what the ANE may take of each layer, q4tp, the FFNs of one shape.
+    pub(crate) fn new(c: &Ctx, mut layers: Vec<LayerProjs>) -> Result<AneFfn, String> {
         api()?;
-        let first = layers.first().ok_or("no layers")?;
+        let first = layers.iter().find_map(|l| l.ffn).ok_or("no layers")?;
         let (hidden, inter) = (first[0].cols, first[0].rows);
         if hidden % SEGMENT != 0 || hidden / SEGMENT > 4 {
             return Err(format!("hidden {hidden} is not whole segments"));
@@ -561,10 +759,27 @@ impl AneFfn {
         if inter % 32 != 0 {
             return Err(format!("intermediate {inter} is not whole tiles"));
         }
-        if layers.iter().any(|l| {
+        if layers.iter().filter_map(|l| l.ffn).any(|l| {
             l[0].cols != hidden || l[0].rows != inter || l[1].cols != hidden || l[1].rows != inter || l[2].rows != hidden || l[2].cols != inter
         }) {
             return Err("layers differ in shape".into());
+        }
+        // A mixer's projections go when they read the same rows as the FFN and fit one output.
+        let mut shapes: Vec<Vec<usize>> = Vec::new();
+        let mut shape_of = Vec::with_capacity(layers.len());
+        for l in layers.iter_mut() {
+            let rows: Vec<usize> = l.mix.iter().map(|p| p.rows).collect();
+            let fits = mix_on() && !l.mix.is_empty() && l.mix.iter().all(|p| p.cols == hidden) && rows.iter().sum::<usize>() <= 16384;
+            if !fits {
+                l.mix.clear();
+                shape_of.push(None);
+                continue;
+            }
+            let at = shapes.iter().position(|s| *s == rows).unwrap_or_else(|| {
+                shapes.push(rows.clone());
+                shapes.len() - 1
+            });
+            shape_of.push(Some(at));
         }
         let opts = metal::CompileOptions::new();
         opts.set_language_version(metal::MTLLanguageVersion::V3_0);
@@ -573,12 +788,29 @@ impl AneFfn {
             let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
             c._device.new_compute_pipeline_state_with_function(&f).map_err(|e| format!("pipeline {name}: {e}"))
         };
-        let (pack, join) = (pso("ane_pack16")?, pso("ane_join")?);
-        let sets = [weight_set(c, hidden, inter)?, weight_set(c, hidden, inter)?];
+        let (pack, join, unpack) = (pso("ane_pack16")?, pso("ane_join")?, pso("ane_unpack")?);
+        let ffn_set = || -> Result<[Staged; 3], String> {
+            Ok([staged(c, inter, hidden, true)?, staged(c, inter, hidden, true)?, staged(c, hidden, inter, true)?])
+        };
+        let mix_set = || -> Result<Vec<Vec<Staged>>, String> {
+            shapes.iter().map(|s| s.iter().map(|&r| staged(c, r, hidden, mix_int8())).collect()).collect()
+        };
+        let ffn_sets = [ffn_set()?, ffn_set()?];
+        let mix_sets = [mix_set()?, mix_set()?];
         let max_rows = *FUNCTIONS.last().unwrap();
-        let x: Result<Vec<Shared>, String> =
-            (0..hidden / SEGMENT).map(|_| shared_surface(c, SEGMENT, max_rows, false)).collect();
-        let x = x?;
+        let lane = || -> Result<LaneIo, String> {
+            let x: Result<Vec<Shared>, String> =
+                (0..hidden / SEGMENT).map(|_| shared_surface(c, SEGMENT, max_rows, false)).collect();
+            let mix: Result<Vec<Shared>, String> =
+                shapes.iter().map(|s| shared_surface(c, s.iter().sum(), max_rows, false)).collect();
+            Ok(LaneIo {
+                x: x?,
+                out: shared_surface(c, hidden + 1, max_rows, false)?,
+                mix: mix?,
+                host: Mutex::new((Vec::new(), Vec::new())),
+            })
+        };
+        let io = [lane()?, lane()?];
         let tx = shared_surface(c, 1, max_rows, false)?;
         // The join's input scale: there is nothing to bring back.
         let p = tx.s.base() as *mut u16;
@@ -586,90 +818,221 @@ impl AneFfn {
             // SAFETY: inside the surface, which no command uses yet.
             unsafe { *p.add(i) = f32_to_f16(1.0) };
         }
-        let out = shared_surface(c, hidden + 1, max_rows, false)?;
-        let status = c._device.new_buffer(16, MTLResourceOptions::StorageModeShared);
-        let types = FfnTypes {
-            x: x.iter().map(|a| &a.s).collect(),
-            wg: sets[0].wg.iter().map(|a| &a.s).collect(),
-            wu: sets[0].wu.iter().map(|a| &a.s).collect(),
-            wd: sets[0].wd.iter().map(|a| &a.s).collect(),
-            sg: &sets[0].sg.s,
-            su: &sets[0].su.s,
-            sd: &sets[0].sd.s,
-            out: &out.s,
-        };
+        let x: Vec<&Surface> = io[0].x.iter().map(|a| &a.s).collect();
+        fn seg(t: &Staged) -> Vec<&Surface> {
+            t.w.iter().map(|a| &a.s).collect()
+        }
+        let f = &ffn_sets[0];
+        let types = FfnTypes { x: x.clone(), wg: seg(&f[0]), wu: seg(&f[1]), wd: seg(&f[2]), sg: &f[0].s.s, su: &f[1].s.s, sd: &f[2].s.s, out: &io[0].out.s };
         let mut text = String::from("program(1.3)\n{\n");
         for rows in FUNCTIONS {
             text.push_str(&ffn_function(hidden, inter, rows, &types));
+            for (k, shape) in shapes.iter().enumerate() {
+                let projs: Vec<(Vec<&Surface>, &Surface, usize)> =
+                    mix_sets[0][k].iter().zip(shape).map(|(t, &r)| (seg(t), &t.s.s, r)).collect();
+                text.push_str(&lin_function(&format!("mix{k}_{rows}"), rows, &x, &projs, &io[0].mix[k].s));
+            }
         }
         text.push_str("}\n");
         drop(types);
         let t0 = std::time::Instant::now();
         let prog = Program::new(&text, &empty_blob())?;
         tracing::info!(
-            "neural engine: FFN of {inter} channels over {} layers, program {:.1} s",
-            layers.len(),
+            "neural engine: FFN of {inter} channels over {} layers, mixer projections {:?} over {} ({}), program {:.1} s",
+            layers.iter().filter(|l| l.ffn.is_some()).count(),
+            shapes,
+            shape_of.iter().flatten().count(),
+            if mix_int8() { "int8" } else { "fp16" },
             t0.elapsed().as_secs_f64()
         );
         Ok(AneFfn {
             prog,
             pack,
             join,
+            unpack,
             hidden,
             inter,
-            sets,
-            x,
-            tx,
-            out,
-            status,
             layers,
-            staged: Mutex::new([None, None]),
-            staging: Mutex::new(None),
-            ms: Mutex::new((0.0, 0.0, 0.0, 0)),
+            shapes,
+            shape_of,
+            ffn_sets,
+            mix_sets,
+            io,
+            tx,
+            stock: Mutex::new(Stock { lanes: 1, ..Stock::default() }),
+            turn: Condvar::new(),
+            eval: Mutex::new(()),
+            times: Mutex::new(Times::default()),
+            born: std::time::Instant::now(),
         })
     }
 
+    /// The layer whose FFN has this gate.
     pub(crate) fn layer_of(&self, gate_abs: usize) -> Option<usize> {
-        self.layers.iter().position(|l| l[0].abs == gate_abs)
+        self.layers.iter().position(|l| l.ffn.is_some_and(|f| f[0].abs == gate_abs))
+    }
+
+    /// The layer whose mixer's first projection this is, when the ANE takes them.
+    pub(crate) fn mix_layer(&self, first_abs: usize) -> Option<usize> {
+        self.layers.iter().position(|l| l.mix.first().is_some_and(|p| p.abs == first_abs))
     }
 
     pub(crate) fn takes(&self, rows: usize) -> bool {
         (64..=*FUNCTIONS.last().unwrap()).contains(&rows)
     }
 
-    /// Layer `li`'s int8 weights into set `set` on the CPU.
-    fn stage(&self, li: usize, set: usize, file: &[usize; 3]) {
-        let t = &self.sets[set];
-        for m in 0..3 {
-            let pr = self.layers[li][m];
-            let q = file[m];
-            let (outs, scale): (&[Shared], &Shared) = match m {
-                0 => (&t.wg, &t.sg),
-                1 => (&t.wu, &t.su),
-                _ => (&t.wd, &t.sd),
-            };
-            let outs: Vec<(usize, usize)> = outs.iter().map(|o| (o.s.base() as usize, o.s.stride)).collect();
-            let (sbase, sstride) = (scale.s.base() as usize, scale.s.stride);
-            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    /// A chunk begins, in `lanes` halves: each owes every layer one evaluation of a group.
+    pub(crate) fn begin(&self, lanes: usize) {
+        let mut st = self.stock.lock().unwrap();
+        st.lanes = lanes.clamp(1, LANES);
+        st.chunk += 1;
+        st.hold = None;
+        // Whatever an abandoned chunk still owed is void.
+        for g in st.groups.iter_mut() {
+            for s in g.iter_mut() {
+                s.uses = 0;
+            }
+        }
+        self.turn.notify_all();
+    }
+
+    /// No evaluation is to come: every wait ends.
+    fn stop(&self) {
+        self.stock.lock().unwrap().dead = true;
+        self.turn.notify_all();
+    }
+
+    fn group_projs(&self, group: usize, li: usize) -> Vec<Proj> {
+        match group {
+            FFN => self.layers[li].ffn.map(|f| f.to_vec()).unwrap_or_default(),
+            _ => self.layers[li].mix.clone(),
+        }
+    }
+
+    fn group_set(&self, group: usize, li: usize, set: usize) -> &[Staged] {
+        match group {
+            FFN => &self.ffn_sets[set],
+            _ => &self.mix_sets[set][self.shape_of[li].unwrap()],
+        }
+    }
+
+    /// Layer `li`'s weights of a group into set `set` on the CPU: `file` holds each projection's
+    /// address.
+    fn stage(&self, group: usize, li: usize, set: usize, file: &[usize]) {
+        let t0 = std::time::Instant::now();
+        let projs = self.group_projs(group, li);
+        for ((pr, t), &q) in projs.iter().zip(self.group_set(group, li, set)).zip(file) {
+            let outs: Vec<(usize, usize)> = t.w.iter().map(|o| (o.s.base() as usize, o.s.stride)).collect();
+            let wide = !t.w[0].s.int8;
+            let (sbase, sstride) = (t.s.s.base() as usize, t.s.s.stride);
+            let threads = stage_threads();
             let per = pr.rows.div_ceil(threads);
+            let pr = *pr;
             std::thread::scope(|sc| {
                 for th in 0..threads {
                     let outs = &outs;
                     sc.spawn(move || {
                         let (r0, r1) = (th * per, ((th + 1) * per).min(pr.rows));
                         // SAFETY: rows of the mapped tensor and of this set's surfaces, which no
-                        // engine reads until this staging is joined; threads own disjoint rows.
-                        unsafe { stage_rows(q, pr.rows, pr.cols, r0, r1, outs, sbase, sstride) };
+                        // engine reads until the set is ready; threads own disjoint rows.
+                        unsafe { stage_rows(q, pr.rows, pr.cols, r0, r1, outs, sbase, sstride, wide) };
                     });
                 }
             });
         }
+        let mut m = self.times.lock().unwrap();
+        m.staged[group] += t0.elapsed().as_secs_f64() * 1e3;
+        m.layers[group] += 1;
+    }
+
+    /// A thread stages layer `li` of a group into `set` once no half needs what the set holds.
+    fn stage_later(self: &Arc<Self>, fbuf: &WeightArena, group: usize, li: usize, set: usize) {
+        let file: Vec<usize> = self
+            .group_projs(group, li)
+            .iter()
+            .map(|p| {
+                let (b, off) = fbuf.locate(p.abs);
+                b.contents() as usize + off
+            })
+            .collect();
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let mut st = me.stock.lock().unwrap();
+            while st.groups[group][set].uses > 0 && !st.dead {
+                st = me.turn.wait(st).unwrap();
+            }
+            if st.dead {
+                st.groups[group][set].pending = None;
+                me.turn.notify_all();
+                return;
+            }
+            st.groups[group][set] = Slot { layer: Some(li), ready: false, uses: 0, chunk: 0, pending: Some(li) };
+            drop(st);
+            me.stage(group, li, set, &file);
+            let mut st = me.stock.lock().unwrap();
+            st.groups[group][set].ready = true;
+            st.groups[group][set].pending = None;
+            me.turn.notify_all();
+        });
+    }
+
+    /// The set that holds layer `li`'s weights of a group, staged here if nobody did, with the
+    /// next layer's begun on the other set. `release` returns it.
+    fn acquire(self: &Arc<Self>, fbuf: &WeightArena, group: usize, li: usize, lane: usize) -> Result<usize, String> {
+        let mut st = self.stock.lock().unwrap();
+        let set = loop {
+            if st.dead {
+                return Err("the Neural Engine stopped".into());
+            }
+            let g = &mut st.groups[group];
+            if let Some(s) = g.iter().position(|s| s.layer == Some(li) && s.ready) {
+                break s;
+            }
+            if !g.iter().any(|s| s.pending == Some(li)) {
+                if let Some(s) = g.iter().position(|s| s.pending.is_none() && s.uses == 0) {
+                    g[s].pending = Some(li);
+                    self.stage_later(fbuf, group, li, s);
+                }
+            }
+            // A half that waits for weights lets the ANE go: the set it waits for may be one
+            // the other half has yet to read.
+            if st.hold == Some(lane) {
+                st.hold = None;
+                self.turn.notify_all();
+            }
+            st = self.turn.wait(st).unwrap();
+        };
+        let (chunk, lanes) = (st.chunk, st.lanes);
+        let slot = &mut st.groups[group][set];
+        if slot.chunk != chunk {
+            slot.chunk = chunk;
+            slot.uses = lanes;
+        }
+        // The layer after it, ahead of time. A chunk's last layer stages nothing: no thread
+        // outlives the chunk, whose model may go.
+        let next = li + 1;
+        if next < self.layers.len() && !self.group_projs(group, next).is_empty() {
+            let other = set ^ 1;
+            let g = &mut st.groups[group];
+            if g[other].layer != Some(next) && g[other].pending.is_none() {
+                g[other].pending = Some(next);
+                self.stage_later(fbuf, group, next, other);
+            }
+        }
+        Ok(set)
+    }
+
+    fn release(&self, group: usize, set: usize) {
+        let mut st = self.stock.lock().unwrap();
+        let s = &mut st.groups[group][set];
+        s.uses = s.uses.saturating_sub(1);
+        self.turn.notify_all();
     }
 
     /// The chunk's normalized rows as the program's fp16 input, transposed.
-    pub(crate) fn encode_input(&self, enc: &metal::ComputeCommandEncoderRef, n_b: &Buffer, rows: usize) {
+    pub(crate) fn encode_input(&self, enc: &metal::ComputeCommandEncoderRef, n_b: &Buffer, rows: usize, lane: usize) {
         let hidden = self.hidden as u32;
-        for (k, x) in self.x.iter().enumerate() {
+        for (k, x) in self.io[lane].x.iter().enumerate() {
             enc.set_compute_pipeline_state(&self.pack);
             enc.set_buffer(0, Some(n_b), 0);
             enc.set_buffer(1, Some(&x.b), 0);
@@ -677,6 +1040,8 @@ impl AneFfn {
             enc.set_bytes(2, 4, &hidden as *const u32 as *const c_void);
             enc.set_bytes(3, 4, &ch as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &stride as *const u32 as *const c_void);
+            let rows_u = rows as u32;
+            enc.set_bytes(5, 4, &rows_u as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new((rows as u64).div_ceil(32), (SEGMENT / 32) as u64, 1),
                 MTLSize::new(32, 8, 1),
@@ -684,110 +1049,247 @@ impl AneFfn {
         }
     }
 
-    fn inputs(&self, set: usize) -> Vec<(String, &Surface)> {
-        let t = &self.sets[set];
-        let mut v: Vec<(String, &Surface)> = Vec::new();
-        for (k, x) in self.x.iter().enumerate() {
-            v.push((format!("x{k}"), &x.s));
-            v.push((format!("wg{k}"), &t.wg[k].s));
-            v.push((format!("wu{k}"), &t.wu[k].s));
-        }
-        for (i, w) in t.wd.iter().enumerate() {
-            v.push((format!("wd{i}"), &w.s));
-        }
-        v.push(("sg".into(), &t.sg.s));
-        v.push(("su".into(), &t.su.s));
-        v.push(("sd".into(), &t.sd.s));
-        v
-    }
-
-    fn file_ptrs(&self, fbuf: &WeightArena, li: usize) -> [usize; 3] {
-        let mut p = [0usize; 3];
-        for m in 0..3 {
-            let (b, off) = fbuf.locate(self.layers[li][m].abs);
-            p[m] = b.contents() as usize + off;
-        }
-        p
-    }
-
-    /// Layer `li`'s FFN over the input `encode_input` wrote, whose command is done. A thread
-    /// stages the next layer's weights while the ANE runs this one and the GPU goes on to the
-    /// next layer's mixer.
-    pub(crate) fn run(self: &Arc<Self>, fbuf: &WeightArena, li: usize, rows: usize) -> Result<(), String> {
+    /// What stands between an FFN and the next layer's mixer, on the host, so that no command
+    /// waits behind the other half's on the GPU: with `add` the FFN's output joins the stream
+    /// `h` (`rows` × hidden), which is normed by `gain` into `n` and into this lane's input.
+    /// The arithmetic of `add_rmsnorm_rows`.
+    ///
+    /// # Safety
+    /// `h` and `n` hold `rows` × hidden floats that no command reads or writes now, and the
+    /// lane's last evaluation is over.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn host_norm(&self, lane: usize, rows: usize, h: *mut f32, n: *mut f32, gain: &[f32], gemma: bool, eps: f32, add: bool) {
         let t0 = std::time::Instant::now();
-        if let Some((h, set, l)) = self.staging.lock().unwrap().take() {
-            h.join().map_err(|_| "weights staging panicked".to_string())?;
-            self.staged.lock().unwrap()[set] = Some(l);
+        let hidden = self.hidden;
+        let io = &self.io[lane];
+        let mut planes = io.host.lock().unwrap();
+        let (by_channel, by_row) = &mut *planes;
+        by_channel.resize((hidden + 1) * rows, 0.0);
+        by_row.resize(rows * hidden, 0.0);
+        let gain: Vec<f32> = if gemma { gain.iter().map(|w| 1.0 + w).collect() } else { gain.to_vec() };
+        unsafe {
+            if add {
+                let src = Plane { data: io.out.s.base() as *mut c_void, height: hidden + 1, width: rows, row_bytes: io.out.s.stride };
+                let dst = Plane { data: by_channel.as_mut_ptr() as *mut c_void, height: hidden + 1, width: rows, row_bytes: rows * 4 };
+                vImageConvert_Planar16FtoPlanarF(&src, &dst, 0);
+                vDSP_mtrans(by_channel.as_ptr(), 1, by_row.as_mut_ptr(), 1, rows, hidden);
+            }
+            for t in 0..rows {
+                let (hr, nr) = (h.add(t * hidden), n.add(t * hidden));
+                if add {
+                    // The row under the channels is each token's scale.
+                    cblas_saxpy(hidden as i32, by_channel[hidden * rows + t], by_row.as_ptr().add(t * hidden), 1, hr, 1);
+                }
+                let mut squares = 0f32;
+                vDSP_svesq(hr, 1, &mut squares, hidden);
+                let inverse = 1.0 / (squares / hidden as f32 + eps).sqrt();
+                vDSP_vsmul(hr, 1, &inverse, nr, 1, hidden);
+                vDSP_vmul(nr, 1, gain.as_ptr(), 1, nr, 1, hidden);
+            }
+            vDSP_mtrans(n, 1, by_channel.as_mut_ptr(), 1, hidden, rows);
+            for (k, x) in io.x.iter().enumerate() {
+                let src = Plane { data: by_channel.as_mut_ptr().add(k * SEGMENT * rows) as *mut c_void, height: SEGMENT, width: rows, row_bytes: rows * 4 };
+                let dst = Plane { data: x.s.base() as *mut c_void, height: SEGMENT, width: rows, row_bytes: x.s.stride };
+                vImageConvert_PlanarFtoPlanar16F(&src, &dst, 0);
+            }
         }
-        let found = self.staged.lock().unwrap().iter().position(|v| *v == Some(li));
-        let set = match found {
-            Some(s) => s,
-            None => {
-                self.stage(li, 0, &self.file_ptrs(fbuf, li));
-                self.staged.lock().unwrap()[0] = Some(li);
-                0
+        self.times.lock().unwrap().host += t0.elapsed().as_secs_f64() * 1e3;
+    }
+
+    /// The GPU's time on a finished command of a GDN or an attention layer, for the profile.
+    pub(crate) fn note_gpu(&self, attention: bool, ms: f64) {
+        let mut m = self.times.lock().unwrap();
+        m.cmd[attention as usize] += ms;
+        m.cmds[attention as usize] += 1;
+    }
+
+    /// One evaluation of a group's function for layer `li` over the input `encode_input` wrote
+    /// for this lane, whose command is done. `waited`: the milliseconds the caller spent on it.
+    fn run(self: &Arc<Self>, fbuf: &WeightArena, group: usize, li: usize, rows: usize, lane: usize, waited: f64) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        let set = self.acquire(fbuf, group, li, lane)?;
+        let t1 = std::time::Instant::now();
+        let func = FUNCTIONS.iter().copied().find(|&f| f >= rows).ok_or("too many rows")?;
+        let io = &self.io[lane];
+        let mut v: Vec<(String, &Surface)> = io.x.iter().enumerate().map(|(k, x)| (format!("x{k}"), &x.s)).collect();
+        let (name, out, out_rows) = match group {
+            FFN => {
+                for (p, t) in ["g", "u", "d"].iter().zip(&self.ffn_sets[set]) {
+                    for (k, w) in t.w.iter().enumerate() {
+                        v.push((format!("w{p}{k}"), &w.s));
+                    }
+                    v.push((format!("s{p}"), &t.s.s));
+                }
+                (format!("ffn{func}"), &io.out, self.hidden + 1)
+            }
+            _ => {
+                let shape = self.shape_of[li].ok_or("no mixer projections")?;
+                for (j, t) in self.mix_sets[set][shape].iter().enumerate() {
+                    for (k, w) in t.w.iter().enumerate() {
+                        v.push((format!("w{j}_{k}"), &w.s));
+                    }
+                    v.push((format!("s{j}"), &t.s.s));
+                }
+                (format!("mix{shape}_{func}"), &io.mix[shape], self.shapes[shape].iter().sum())
             }
         };
-        let t1 = std::time::Instant::now();
-        let next = (li + 1) % self.layers.len();
-        let other = set ^ 1;
-        if self.staged.lock().unwrap()[other] != Some(next) {
-            self.staged.lock().unwrap()[other] = None;
-            let file = self.file_ptrs(fbuf, next);
-            let me = self.clone();
-            let h = std::thread::spawn(move || me.stage(next, other, &file));
-            *self.staging.lock().unwrap() = Some((h, other, next));
+        let refs: Vec<(&str, &Surface)> = v.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        // A half keeps the ANE from its FFN through the next layer's mixer call. That call is
+        // short, and behind the other half's FFN it waited 11 ms of a 60 ms layer with the GPU
+        // idle; this way the other half's FFN waits for it instead, 6 ms at most.
+        // The second half follows the first at every layer, so the first never waits for it
+        // without a bound: it gives the second 3 ms to get to its call and then goes ahead.
+        {
+            let mut st = self.stock.lock().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3);
+            while st.hold.is_some_and(|l| l != lane) && !st.dead {
+                if lane == 0 {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    st = self.turn.wait_timeout(st, left).unwrap().0;
+                } else {
+                    st = self.turn.wait(st).unwrap();
+                }
+            }
+            if group == FFN && st.lanes > 1 && self.layers.get(li + 1).is_some_and(|l| !l.mix.is_empty()) {
+                st.hold = Some(lane);
+            }
         }
-        let func = FUNCTIONS.iter().copied().find(|&f| f >= rows).ok_or("too many rows")?;
-        let names = self.inputs(set);
-        let refs: Vec<(&str, &Surface)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
-        self.prog.eval(&format!("ffn{func}"), &refs, &self.out.s)?;
-        let mut m = self.ms.lock().unwrap();
-        m.0 += (t1 - t0).as_secs_f64() * 1e3;
-        m.1 += t1.elapsed().as_secs_f64() * 1e3;
-        m.3 += 1;
-        if m.3 % 64 == 0 && std::env::var("CMF_ANE_PROF").is_ok() {
+        let (result, t2) = {
+            let _one = self.eval.lock().unwrap();
+            let t2 = std::time::Instant::now();
+            let c0 = clock_ms();
+            let r = self.prog.eval(&name, &refs, &out.s);
+            trace(lane, li, if group == FFN { "ane-ffn" } else { "ane-mix" }, c0, clock_ms());
+            (r, t2)
+        };
+        self.release(group, set);
+        if group == MIX || result.is_err() {
+            let mut st = self.stock.lock().unwrap();
+            if st.hold == Some(lane) {
+                st.hold = None;
+                self.turn.notify_all();
+            }
+        }
+        result?;
+        if !finite(&out.s, out_rows, rows) {
+            return Err("an output that is not finite".into());
+        }
+        let mut m = self.times.lock().unwrap();
+        m.weights[group] += (t1 - t0).as_secs_f64() * 1e3;
+        m.queue += (t2 - t1).as_secs_f64() * 1e3;
+        m.ane[group] += t2.elapsed().as_secs_f64() * 1e3;
+        m.gpu += waited;
+        m.count[group] += 1;
+        if group == FFN && m.count[FFN] % 128 == 0 && std::env::var("CMF_ANE_PROF").is_ok() {
+            let n = |g: usize| m.count[g].max(1) as f64;
+            let l = |g: usize| m.layers[g].max(1) as f64;
             eprintln!(
-                "ane-prof: {} evaluations, each: the GPU's part {:.1} ms, waited for weights {:.1} ms, the ANE {:.1} ms",
-                m.3,
-                m.2 / m.3 as f64,
-                m.0 / m.3 as f64,
-                m.1 / m.3 as f64
+                "ane-prof: {} FFNs {:.1} ms each, {} mixer inputs {:.1} ms each; the GPU's commands {:.1} ms a GDN layer, {:.1} ms an attention layer; a half waited {:.1} ms for the GPU, {:.1} ms for the ANE, {:.1} ms for weights, the host's norm took {:.1} ms; the CPU {:.1} + {:.1} ms a layer of weights; {:.1} ms of wall clock an FFN",
+                m.count[FFN],
+                m.ane[FFN] / n(FFN),
+                m.count[MIX],
+                m.ane[MIX] / n(MIX),
+                m.cmd[0] / m.cmds[0].max(1) as f64,
+                m.cmd[1] / m.cmds[1].max(1) as f64,
+                m.gpu / n(FFN),
+                m.queue / n(FFN),
+                (m.weights[FFN] + m.weights[MIX]) / n(FFN),
+                m.host / n(FFN),
+                m.staged[FFN] / l(FFN),
+                m.staged[MIX] / l(MIX),
+                self.born.elapsed().as_secs_f64() * 1e3 / n(FFN)
             );
+            super::cut_report();
         }
         Ok(())
     }
 
-    /// The output of `run` as the residual's delta.
-    pub(crate) fn encode_join(&self, enc: &metal::ComputeCommandEncoderRef, d_b: &Buffer, rows: usize) {
-        let (hidden, stride) = (self.hidden as u32, (self.out.s.stride / 2) as u32);
-        enc.set_compute_pipeline_state(&self.join);
-        enc.set_buffer(0, Some(d_b), 0);
-        enc.set_buffer(1, Some(&self.out.b), 0);
-        enc.set_buffer(2, Some(&self.tx.b), 0);
-        enc.set_buffer(3, Some(&self.status), 0);
-        enc.set_bytes(4, 4, &hidden as *const u32 as *const c_void);
-        enc.set_bytes(5, 4, &stride as *const u32 as *const c_void);
-        enc.dispatch_threads(MTLSize::new(self.hidden as u64, rows as u64, 1), MTLSize::new(32, 1, 1));
+    /// Layer `li`'s FFN: `encode_join` brings its output.
+    pub(crate) fn run_ffn(self: &Arc<Self>, fbuf: &WeightArena, li: usize, rows: usize, lane: usize, waited: f64) -> Result<(), String> {
+        self.run(fbuf, FFN, li, rows, lane, waited)
     }
 
-    /// Whether a value the ANE gave was not finite, since the last call.
-    pub(crate) fn not_finite(&self) -> bool {
-        let p = self.status.contents() as *mut u32;
-        // SAFETY: a shared buffer of 16 bytes, and no command writes it now.
-        unsafe {
-            let v = *p != 0;
-            *p = 0;
-            v
-        }
+    /// Layer `li`'s mixer projections: `encode_unpack` brings each one's output.
+    pub(crate) fn run_mix(self: &Arc<Self>, fbuf: &WeightArena, li: usize, rows: usize, lane: usize, waited: f64) -> Result<(), String> {
+        self.run(fbuf, MIX, li, rows, lane, waited)
+    }
+
+    /// The output of `run_ffn` as the residual's delta.
+    pub(crate) fn encode_join(&self, enc: &metal::ComputeCommandEncoderRef, d_b: &Buffer, rows: usize, lane: usize) {
+        let out = &self.io[lane].out;
+        let (hidden, stride) = (self.hidden as u32, (out.s.stride / 2) as u32);
+        enc.set_compute_pipeline_state(&self.join);
+        enc.set_buffer(0, Some(d_b), 0);
+        enc.set_buffer(1, Some(&out.b), 0);
+        enc.set_buffer(2, Some(&self.tx.b), 0);
+        enc.set_bytes(3, 4, &hidden as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &stride as *const u32 as *const c_void);
+        let rows_u = rows as u32;
+        enc.set_bytes(5, 4, &rows_u as *const u32 as *const c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(32), (self.hidden as u64).div_ceil(32), 1),
+            MTLSize::new(32, 8, 1),
+        );
+    }
+
+    /// Projection `j` of layer `li`'s mixer out of `run_mix`'s output: `rows` rows of its width.
+    pub(crate) fn encode_unpack(&self, enc: &metal::ComputeCommandEncoderRef, li: usize, j: usize, y: &Buffer, rows: usize, lane: usize) {
+        let Some(shape) = self.shape_of[li] else { return };
+        let out = &self.io[lane].mix[shape];
+        let first: usize = self.shapes[shape][..j].iter().sum();
+        let (width, stride, first) = (self.shapes[shape][j] as u32, (out.s.stride / 2) as u32, first as u32);
+        enc.set_compute_pipeline_state(&self.unpack);
+        enc.set_buffer(0, Some(y), 0);
+        enc.set_buffer(1, Some(&out.b), 0);
+        enc.set_bytes(2, 4, &width as *const u32 as *const c_void);
+        enc.set_bytes(3, 4, &stride as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &first as *const u32 as *const c_void);
+        let rows_u = rows as u32;
+        enc.set_bytes(5, 4, &rows_u as *const u32 as *const c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(32), (width as u64).div_ceil(32), 1),
+            MTLSize::new(32, 8, 1),
+        );
     }
 }
 
-/// Rows [r0, r1) of a q4tp tensor as int8 under each row's scale. `outs`: per segment of 80 tiles,
-/// its surface's base and stride. The row's scale goes to its fp16 surface.
+/// Threads a staging takes.
+fn stage_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_ANE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=32).contains(n))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(8))
+    })
+}
+
+/// Whether the leading `rows` × `width` fp16 values of a surface are all finite.
+fn finite(s: &Surface, rows: usize, width: usize) -> bool {
+    let base = s.base() as *const u16;
+    let mut bad = 0u16;
+    for r in 0..rows {
+        // SAFETY: inside the surface; the ANE's evaluation is over.
+        let row = unsafe { std::slice::from_raw_parts(base.add(r * s.stride / 2), width) };
+        let mut top = 0u16;
+        for v in row {
+            top |= ((*v & 0x7c00) == 0x7c00) as u16;
+        }
+        bad |= top;
+    }
+    bad == 0
+}
+
+/// Rows [r0, r1) of a q4tp tensor under each row's scale, which goes to its fp16 surface: int8
+/// in 1/128, or with `wide` fp16, which holds the four bits and a tile's scale whole. `outs`:
+/// per segment of 80 tiles, its surface's base and stride.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, outs: &[(usize, usize)], sbase: usize, sstride: usize) {
+unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, outs: &[(usize, usize)], sbase: usize, sstride: usize, wide: bool) {
     use std::arch::aarch64::*;
     let q = q as *const u8;
     let gpr = cols / 32;
@@ -811,10 +1313,11 @@ unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, o
                 top = top.max(*c);
             }
             let peak = (8.0 * (lo + top as f32 * step).exp2()).max(1.0 / 16384.0);
-            let bits = f32_to_f16(peak / 127.0 * 128.0);
+            let bits = f32_to_f16(if wide { peak } else { peak / 127.0 * 128.0 });
             *((sbase + r * sstride) as *mut u16) = bits;
-            let inverse = 128.0 / f16_to_f32(bits);
-            let mut luts = [[0i8; 16]; 32];
+            let inverse = if wide { 1.0 } else { 128.0 } / f16_to_f32(bits);
+            // By code: the sixteen values of a tile, as int8 or as the two bytes of fp16.
+            let mut luts = [[0u8; 32]; 32];
             let mut have = 0u32;
             let n_lo = vdupq_n_u8(15);
             for g in 0..gpr {
@@ -822,18 +1325,37 @@ unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, o
                 if have & (1 << c) == 0 {
                     have |= 1 << c;
                     let k = (lo + c as f32 * step).exp2() * inverse;
-                    for (n, slot) in luts[c].iter_mut().enumerate() {
-                        *slot = ((n as f32 - 8.0) * k).round().clamp(-127.0, 127.0) as i8;
+                    for n in 0..16 {
+                        let v = (n as f32 - 8.0) * k;
+                        if wide {
+                            let h = f32_to_f16(v).to_le_bytes();
+                            luts[c][n] = h[0];
+                            luts[c][16 + n] = h[1];
+                        } else {
+                            luts[c][n] = v.round().clamp(-127.0, 127.0) as i8 as u8;
+                        }
                     }
                 }
-                let lut = vld1q_s8(luts[c].as_ptr());
                 let tile = vld1q_u8(q.add((r * gpr + g) * 16));
                 let (l, h) = (vandq_u8(tile, n_lo), vshrq_n_u8(tile, 4));
+                let (i0, i1) = (vzip1q_u8(l, h), vzip2q_u8(l, h));
                 let (seg, within) = (g / per_seg, g % per_seg);
                 let (base, st) = outs[seg];
-                let out = (base + r * st + within * 32) as *mut i8;
-                vst1q_s8(out, vqtbl1q_s8(lut, vzip1q_u8(l, h)));
-                vst1q_s8(out.add(16), vqtbl1q_s8(lut, vzip2q_u8(l, h)));
+                let low = vld1q_u8(luts[c].as_ptr());
+                if wide {
+                    let high = vld1q_u8(luts[c].as_ptr().add(16));
+                    let out = (base + r * st + within * 64) as *mut u8;
+                    let (a0, b0) = (vqtbl1q_u8(low, i0), vqtbl1q_u8(high, i0));
+                    let (a1, b1) = (vqtbl1q_u8(low, i1), vqtbl1q_u8(high, i1));
+                    vst1q_u8(out, vzip1q_u8(a0, b0));
+                    vst1q_u8(out.add(16), vzip2q_u8(a0, b0));
+                    vst1q_u8(out.add(32), vzip1q_u8(a1, b1));
+                    vst1q_u8(out.add(48), vzip2q_u8(a1, b1));
+                } else {
+                    let out = (base + r * st + within * 32) as *mut u8;
+                    vst1q_u8(out, vqtbl1q_u8(low, i0));
+                    vst1q_u8(out.add(16), vqtbl1q_u8(low, i1));
+                }
             }
         }
     }
@@ -842,7 +1364,7 @@ unsafe fn stage_rows(q: usize, rows: usize, cols: usize, r0: usize, r1: usize, o
 /// Macs without NEON have no Neural Engine: `wanted` keeps them away from this.
 #[cfg(not(target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
-unsafe fn stage_rows(_q: usize, _rows: usize, _cols: usize, _r0: usize, _r1: usize, _outs: &[(usize, usize)], _sbase: usize, _sstride: usize) {}
+unsafe fn stage_rows(_q: usize, _rows: usize, _cols: usize, _r0: usize, _r1: usize, _outs: &[(usize, usize)], _sbase: usize, _sstride: usize, _wide: bool) {}
 
 fn f16_to_f32(bits: u16) -> f32 {
     let s = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
@@ -867,14 +1389,15 @@ pub(crate) fn wanted() -> bool {
         && api().is_ok()
 }
 
-/// The FFN for these layers, built once; any refusal keeps the GPU's.
-pub(crate) fn ffn_for(c: &Ctx, layers: Vec<[Proj; 3]>) -> Option<Arc<AneFfn>> {
+/// The ANE's side for these layers, built once; any refusal keeps the GPU's.
+pub(crate) fn ffn_for(c: &Ctx, layers: Vec<LayerProjs>) -> Option<Arc<AneFfn>> {
     if !wanted() {
         return None;
     }
     let mut slot = ANE.lock().unwrap();
+    let first = |l: &[LayerProjs]| l.iter().find_map(|l| l.ffn).map(|f| f[0].abs);
     if let Some(a) = slot.as_ref() {
-        if a.layers.len() == layers.len() && a.layers.first().map(|l| l[0].abs) == layers.first().map(|l| l[0].abs) {
+        if a.layers.len() == layers.len() && first(&a.layers) == first(&layers) {
             return Some(a.clone());
         }
     }
@@ -892,10 +1415,14 @@ pub(crate) fn ffn_for(c: &Ctx, layers: Vec<[Proj; 3]>) -> Option<Arc<AneFfn>> {
     }
 }
 
-/// The ANE stopped: the GPU's for the rest of the process.
+/// The ANE stopped: the GPU's for the rest of the process, and nobody waits for it.
 pub(crate) fn retire(why: &str) {
-    tracing::warn!("neural engine off: {why}");
-    REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("neural engine off: {why}");
+    }
+    if let Some(a) = ANE.lock().unwrap().as_ref() {
+        a.stop();
+    }
 }
 
 #[cfg(test)]

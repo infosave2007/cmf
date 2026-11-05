@@ -16141,28 +16141,66 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let Some(mut graph) = (if prefill {
-            VerifyGraph::new_prefill(&model, dims, hiddens, b)
-        } else {
-            VerifyGraph::new(&model, dims, hiddens, b)
-        }) else {
-            return MetalRowsRun::Declined;
-        };
-        if prefill {
-            let mut ffns = Vec::new();
-            let mut note = |f: &crate::gpu_metal::MetalFfn<'_>| {
-                if let crate::gpu_metal::MetalFfn::Dense { gate, up, down, act: 0 } = f {
-                    ffns.push((*gate, *up, *down));
-                }
+        // A prompt chunk for the Neural Engine goes as two halves, a thread each: one is on the
+        // ANE while the GPU has the other.
+        let hs = self.hidden_size;
+        let relay = prefill
+            && spec.is_none()
+            && b >= 128
+            && crate::gpu_metal::ane::wanted()
+            && std::env::var("CMF_ANE_RELAY").as_deref() != Ok("0");
+        let cuts: Vec<(usize, usize)> = if relay { vec![(0, b / 2), (b / 2, b - b / 2)] } else { vec![(0, b)] };
+        let gate = crate::gpu_metal::LaneGate::new();
+        let mut lanes: Vec<VerifyGraph> = Vec::with_capacity(cuts.len());
+        for (ln, &(r0, n)) in cuts.iter().enumerate() {
+            let h = &hiddens[r0 * hs..(r0 + n) * hs];
+            let g = if relay {
+                VerifyGraph::new_prefill_lane(&model, dims, h, n, ln, b - r0 - n, &gate)
+            } else if prefill {
+                VerifyGraph::new_prefill(&model, dims, h, n)
+            } else {
+                VerifyGraph::new(&model, dims, h, n)
             };
+            let Some(g) = g else {
+                return MetalRowsRun::Declined;
+            };
+            lanes.push(g);
+        }
+        if prefill {
+            use crate::gpu_metal::{AneWants, MetalFfn};
+            let ffn = |f: &MetalFfn<'_>| match f {
+                MetalFfn::Dense { gate, up, down, act: 0 } => Some([*gate, *up, *down]),
+                _ => None,
+            };
+            let mut wants = Vec::new();
             for item in &plan {
                 match item {
-                    MetalRowsItem::Gdn { run, .. } => run.iter().for_each(|l| note(&l.ffn)),
-                    MetalRowsItem::Attn { l, .. } => note(&l.ffn),
+                    MetalRowsItem::Gdn { run, .. } => {
+                        wants.extend(run.iter().map(|l| AneWants {
+                            ffn: ffn(&l.ffn),
+                            mix: if crate::gpu_metal::ane_takes_qkv() { vec![l.qkv, l.z] } else { vec![l.z] },
+                        }))
+                    }
+                    MetalRowsItem::Attn { l, .. } => wants.push(AneWants {
+                        ffn: ffn(&l.ffn),
+                        mix: if crate::gpu_metal::ane_takes_qkv() {
+                            vec![l.wk, l.wv, l.wq]
+                        } else if crate::gpu_metal::ane_takes_q() {
+                            vec![l.wq]
+                        } else {
+                            Vec::new()
+                        },
+                    }),
                 }
             }
-            graph.ane_attach(&ffns);
+            for g in lanes.iter_mut() {
+                g.ane_attach(&wants);
+            }
+            lanes[0].ane_begin(lanes.len());
         }
+        // With the Neural Engine a layer's command is committed as it ends, so a refusal past
+        // the first one leaves states half written.
+        let hard = relay || lanes[0].has_ane();
         let geom = (
             self.num_heads,
             self.num_kv_heads,
@@ -16177,7 +16215,7 @@ impl Pipeline {
             let ok = match item {
                 MetalRowsItem::Gdn { run, .. } => gcfg
                     .as_ref()
-                    .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
+                    .map(|gc| lanes.iter().all(|g| run.iter().all(|l| g.gdn_ok(l, gc))))
                     .unwrap_or(false),
                 MetalRowsItem::Attn {
                     l,
@@ -16203,7 +16241,7 @@ impl Pipeline {
                         self.qk_norm_after_rope,
                         self.o1_epoch,
                     );
-                    graph.attn_ok(l, &p)
+                    lanes.iter().all(|g| g.attn_ok(l, &p))
                 }
             };
             if !ok {
@@ -16217,24 +16255,28 @@ impl Pipeline {
         }
         let lm = match &spec {
             Some((lm, _, _)) => {
-                if !graph.lm_head_ok(*lm) {
+                if !lanes[0].lm_head_ok(*lm) {
                     return MetalRowsRun::Declined;
                 }
                 Some(*lm)
             }
             None => None,
         };
+        // What each half encodes, layer by layer: nothing here changes while they run.
+        enum Step<'a> {
+            Gdn(&'a crate::gpu_metal::GdnGpuLayer<'a>, &'a [f32]),
+            Attn(&'a crate::gpu_metal::AttnGpuLayer<'a>, crate::gpu_metal::AttnDeviceParams<'a>),
+        }
         let mut gdn_layers = Vec::new();
         let mut attn_layers = Vec::new();
+        let mut steps: Vec<Vec<Step<'_>>> = cuts.iter().map(|_| Vec::new()).collect();
         for item in &plan {
             match item {
                 MetalRowsItem::Gdn { run, first } => {
-                    let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
-                        .iter()
-                        .map(|l| l.linear_state.as_slice())
-                        .collect();
-                    if !graph.encode_gdn_run_b(run, &ro, gcfg.as_ref().unwrap()) {
-                        return MetalRowsRun::Declined;
+                    for (l, kv) in run.iter().zip(&self.kv_cache.layers[*first..*first + run.len()]) {
+                        for st in steps.iter_mut() {
+                            st.push(Step::Gdn(l, kv.linear_state.as_slice()));
+                        }
                     }
                     gdn_layers.extend(*first..*first + run.len());
                 }
@@ -16245,73 +16287,124 @@ impl Pipeline {
                     k_norm,
                     output_gate,
                 } => {
-                    let (p, cpu_stored) = Self::metal_attn_params(
-                        *li,
-                        &self.kv_cache.layers[*li],
-                        *q_norm,
-                        *k_norm,
-                        *output_gate,
-                        &inv_freq,
-                        self.layer_rope_scale(*li),
-                        geom,
-                        pos0,
-                        kv_id,
-                        self.attn_scale,
-                        eps,
-                        gemma,
-                        self.qk_norm_after_rope,
-                        self.o1_epoch,
-                    );
-                    if !graph.encode_attn_b(l, &p) {
-                        return MetalRowsRun::Declined;
-                    }
-                    // A sealed layer leaves no mirror row to pull.
-                    if p.o1.is_none() {
-                        attn_layers.push((*li, cpu_stored));
+                    for (ln, st) in steps.iter_mut().enumerate() {
+                        let (mut p, cpu_stored) = Self::metal_attn_params(
+                            *li,
+                            &self.kv_cache.layers[*li],
+                            *q_norm,
+                            *k_norm,
+                            *output_gate,
+                            &inv_freq,
+                            self.layer_rope_scale(*li),
+                            geom,
+                            pos0 + cuts[ln].0,
+                            kv_id,
+                            self.attn_scale,
+                            eps,
+                            gemma,
+                            self.qk_norm_after_rope,
+                            self.o1_epoch,
+                        );
+                        // The half before leaves its rows in the mirror, not yet in the host's.
+                        p.cpu_stored += cuts[ln].0;
+                        // A sealed layer leaves no mirror row to pull.
+                        if ln == 0 && p.o1.is_none() {
+                            attn_layers.push((*li, cpu_stored));
+                        }
+                        st.push(Step::Attn(l, p));
                     }
                 }
             }
         }
+        // One half's layers in order; `Err` tells whether a command was already committed.
+        let gc = gcfg.as_ref();
+        let walk = |g: &mut VerifyGraph, steps: &[Step<'_>]| -> Result<(), bool> {
+            for (i, step) in steps.iter().enumerate() {
+                let ok = match step {
+                    Step::Gdn(l, state) => match gc {
+                        Some(gc) => g.encode_gdn_run_b(std::slice::from_ref(*l), &[*state], gc),
+                        None => false,
+                    },
+                    Step::Attn(l, p) => g.encode_attn_b(l, p),
+                };
+                if !ok {
+                    return Err(i > 0);
+                }
+            }
+            Ok(())
+        };
+        let refused = |started: bool| if hard && started { MetalRowsRun::Failed } else { MetalRowsRun::Declined };
+        if relay {
+            let (first, second) = lanes.split_at_mut(1);
+            let (sa, sb) = (&steps[0], &steps[1]);
+            let (ra, rb) = std::thread::scope(|sc| {
+                let other = sc.spawn(|| {
+                    let r = walk(&mut second[0], sb);
+                    if r.is_err() {
+                        // The first half must not wait for this one's turn on the ANE.
+                        crate::gpu_metal::ane::retire("a half of the chunk stopped");
+                    }
+                    r
+                });
+                let r = walk(&mut first[0], sa);
+                if r.is_err() {
+                    gate.fail();
+                }
+                (r, other.join().unwrap_or(Err(true)))
+            });
+            if ra.is_err() || rb.is_err() {
+                return MetalRowsRun::Failed;
+            }
+        } else if let Err(started) = walk(&mut lanes[0], &steps[0]) {
+            return refused(started);
+        }
+        drop(steps);
         if let (Some(lm), Some((_, final_norm, _))) = (lm, spec.as_ref()) {
-            if !graph.encode_lm_head_b(final_norm, lm) {
-                return MetalRowsRun::Declined;
+            if !lanes[0].encode_lm_head_b(final_norm, lm) {
+                return refused(true);
             }
             // The device argmax is an OPTIMISATION, never a reason to
             // decline the round: if it will not encode, drop it and read
             // the logits plane back the old way (the head is encoded
             // either way, so the rows are there).
             if let Some((n, _)) = argmax_out.as_ref() {
-                if !graph.encode_argmax_b(*n) {
+                if !lanes[0].encode_argmax_b(*n) {
                     argmax_out = None;
                 }
             }
         }
         spec_stamp("v.enc");
-        if !graph.sync() {
-            return MetalRowsRun::Failed;
+        for g in lanes.iter_mut() {
+            if !g.sync() {
+                return MetalRowsRun::Failed;
+            }
         }
         spec_stamp("v.gpu");
         match (spec, argmax_out) {
             (Some(_), Some((_, ids))) => {
                 ids.resize(b, 0);
-                if !graph.read_argmax(ids) {
+                if !lanes[0].read_argmax(ids) {
                     return MetalRowsRun::Failed;
                 }
                 spec_stamp("v.am");
             }
             (Some((lm, _, logits)), None) => {
                 logits.resize(b * lm.1, 0.0);
-                if !graph.read_logits(logits) {
+                if !lanes[0].read_logits(logits) {
                     return MetalRowsRun::Failed;
                 }
                 spec_stamp("v.lg");
             }
             (None, _) => {}
         }
-        if !graph.read_hidden(hiddens) {
-            return MetalRowsRun::Failed;
+        for (g, &(r0, n)) in lanes.iter().zip(&cuts) {
+            if !g.read_hidden(&mut hiddens[r0 * hs..(r0 + n) * hs]) {
+                return MetalRowsRun::Failed;
+            }
         }
         spec_stamp("v.hid");
+        // The last half's graph: the layers' states are the chunk's.
+        let graph = lanes.pop().unwrap();
         MetalRowsRun::Completed(MetalVerifyPending {
             graph,
             gdn_layers,

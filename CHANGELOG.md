@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A Mac's Neural Engine for a prompt's chunks, off by default (`CMF_ANE=1`): it takes every layer's FFN, a GDN mixer's
+  `z` projection and an attention layer's `q`, the GPU takes the rest of the mixer, and the CPU decodes the next layer's
+  weights for it. A chunk of 512 rows goes in two halves a layer apart. Qwen3.8-27B Turbo on a MacBook Air M4, first
+  token at 3 600 tokens: 73.9 → 28.3 s, the same text; at 10 000 tokens with `--o1-spill` 217.6 → 113.5 s with a peak
+  footprint of 3.4 GB. Against the GPU's numbers `z` and `q` differ by 4e-4 and an FFN by 1.4 %. `CMF_ANE_MIX=ffn|z|all`
+  moves the split, `,int8` stages the mixer's weights as int8.
+- With it, the model file is read ahead in blocks while the first chunk runs, and the weight arena is cut at tensors,
+  so a command prepares what it reads: a cold file's first token 35.3 → 33.6 s. `CMF_METAL_PREFETCH`, `CMF_METAL_WINDOWS`
+- `CMF_ANE_TRACE=1` prints every wait, ANE call and GPU command of a prompt on one clock, `CMF_VERIFY_CUT=1` runs each
+  stage of the rows graph as its own command, `CMF_ANE_CHECK=1` prints how far the ANE's numbers are from the GPU's.
+
+### Changed
+- Metal: attention over a prompt chunk's rows is three GEMMs per KV group in place of a loop over rows, and a GDN
+  mixer's a and b projections are one dispatch. Qwen3.8-27B on the M4's GPU alone, 3 600 tokens: 87.0 → 73.9 s.
+  `CMF_ATTN_GEMM=0` for the loop.
+
 ## [0.8.58] — 2026-11-05
 
 ### Added

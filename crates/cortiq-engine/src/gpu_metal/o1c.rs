@@ -390,10 +390,21 @@ pub(crate) fn cap_take() -> Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> {
         unsafe { std::ptr::copy_nonoverlapping(b.contents() as *const f32, v.as_mut_ptr(), n) };
         v
     };
-    cap.rows
-        .drain(..)
-        .map(|(li, q, k, v, qn, kn)| (li, read(&q, qn), read(&k, kn), read(&v, kn)))
-        .collect()
+    let mut out: Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+    for (li, q, k, v, qn, kn) in cap.rows.drain(..) {
+        let (q, k, v) = (read(&q, qn), read(&k, kn), read(&v, kn));
+        match out.iter_mut().find(|e| e.0 == li) {
+            // The halves of one chunk, in the rows' order: the second half is behind the first
+            // at every layer, though the first may already be a layer further on.
+            Some(last) => {
+                last.1.extend(q);
+                last.2.extend(k);
+                last.3.extend(v);
+            }
+            _ => out.push((li, q, k, v)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

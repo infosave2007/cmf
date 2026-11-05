@@ -4119,6 +4119,58 @@ kernel void f32_matvec2_b(
     }
 }
 
+// `f32_matvec2_b` over a whole chunk in one dispatch: the grid's y is a group of 8 rows. The
+// same sums in the same order; a dispatch per group left the GPU almost idle (32 of them cost
+// 12 ms of a 256-row GDN layer on the M4 for 0.1 G multiply-adds).
+kernel void f32_matvec2_rows(
+    device const float*  w1   [[buffer(0)]],
+    device const float*  w2   [[buffer(1)]],
+    device const float*  xs   [[buffer(2)]],
+    device float*        y1   [[buffer(3)]],
+    device float*        y2   [[buffer(4)]],
+    constant uint&       cols [[buffer(5)]],
+    constant uint&       rows [[buffer(6)]],
+    constant uint&       nb   [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint idx = tgpos.x * sgs + sg;
+    uint c0 = tgpos.y * 8u;
+    if (idx >= 2u * rows || c0 >= nb) return;
+    uint n = min(nb - c0, 8u);
+    bool second = idx >= rows;
+    uint row = second ? idx - rows : idx;
+    device const float* wr = (second ? w2 : w1) + (ulong)row * cols;
+    device const float* x = xs + (ulong)c0 * cols;
+    device float* y = (second ? y2 : y1) + (ulong)c0 * rows;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint i = lane; i < cols; i += 32u) {
+        float wv = wr[i];
+        a0 += wv * x[i];
+        if (n > 1u) a1 += wv * x[(ulong)1u * cols + i];
+        if (n > 2u) a2 += wv * x[(ulong)2u * cols + i];
+        if (n > 3u) a3 += wv * x[(ulong)3u * cols + i];
+        if (n > 4u) a4 += wv * x[(ulong)4u * cols + i];
+        if (n > 5u) a5 += wv * x[(ulong)5u * cols + i];
+        if (n > 6u) a6 += wv * x[(ulong)6u * cols + i];
+        if (n > 7u) a7 += wv * x[(ulong)7u * cols + i];
+    }
+    a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2); a3 = simd_sum(a3);
+    a4 = simd_sum(a4); a5 = simd_sum(a5); a6 = simd_sum(a6); a7 = simd_sum(a7);
+    if (lane == 0u) {
+        y[row] = a0;
+        if (n > 1u) y[(ulong)1u * rows + row] = a1;
+        if (n > 2u) y[(ulong)2u * rows + row] = a2;
+        if (n > 3u) y[(ulong)3u * rows + row] = a3;
+        if (n > 4u) y[(ulong)4u * rows + row] = a4;
+        if (n > 5u) y[(ulong)5u * rows + row] = a5;
+        if (n > 6u) y[(ulong)6u * rows + row] = a6;
+        if (n > 7u) y[(ulong)7u * rows + row] = a7;
+    }
+}
+
 // SwiGLU activation over b rows WITH the row's power-of-two pre-scale for
 // the half-staged down GEMM in the same pass: act = silu(g)·u, xsc[row]
 // from max|act|. One threadgroup per row.
@@ -8521,6 +8573,8 @@ struct Ctx {
     gqacomb: ComputePipelineState,
     rowpow2: ComputePipelineState,
     f32mv2b: ComputePipelineState,
+    /// `f32_matvec2_rows`: both projections over a whole chunk in one dispatch.
+    f32mv2r: ComputePipelineState,
     silurows: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
@@ -8803,6 +8857,7 @@ fn init() -> Result<Ctx, String> {
     let gqacomb = pso("gqa_combine")?;
     let rowpow2 = pso("row_pow2_scale")?;
     let f32mv2b = pso("f32_matvec2_b")?;
+    let f32mv2r = pso("f32_matvec2_rows")?;
     let silurows = pso("silu_rows")?;
     let queue = device.new_command_queue();
     let replay_queue = device.new_command_queue();
@@ -8938,6 +8993,7 @@ fn init() -> Result<Ctx, String> {
         gqacomb,
         rowpow2,
         f32mv2b,
+        f32mv2r,
         silurows,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
@@ -9243,6 +9299,13 @@ pub(crate) struct WeightArena {
     /// every tensor binding / MoE jobs-table base into this range.
     base: usize,
     limit: usize,
+    /// Windows cut at tensor boundaries, each one's first byte in ascending order; empty for
+    /// windows every `stride` bytes. The driver prepares a whole window at its first command,
+    /// half a second a gigabyte on the M4 even with the file in the page cache, so one window
+    /// over a 14 GB file held the first chunk of a prompt for 7 s. With these a command
+    /// prepares the tensors it reads, and what the GPU never reads is never prepared: a dense
+    /// FFN's weights while the Neural Engine takes the FFNs.
+    cuts: Vec<usize>,
 }
 
 impl WeightArena {
@@ -9251,6 +9314,10 @@ impl WeightArena {
     }
     fn locate(&self, abs: usize) -> (&Buffer, usize) {
         debug_assert!(self.contains(abs, 1));
+        if !self.cuts.is_empty() {
+            let i = self.cuts.partition_point(|&start| start <= abs).saturating_sub(1);
+            return (self.window(i), abs - self.cuts[i]);
+        }
         if self.bufs.len() == 1 {
             return (self.window(0), abs - self.base);
         }
@@ -9274,7 +9341,7 @@ impl WeightArena {
     /// to four windows — past that (a 54 GB file on this M4) they refuse
     /// and the per-tensor fallback runs.
     pub(crate) fn jobs_ok(&self) -> bool {
-        self.bufs.len() <= 4
+        self.cuts.is_empty() && self.bufs.len() <= 4
     }
     /// Windows 1..3 at buffer slots 8-10 (window 0 stands in for the
     /// ones that do not exist) and the stride at slot 11 — 0 for a single
@@ -9673,6 +9740,100 @@ pub(crate) fn model_tensor_span(model: &Arc<CmfModel>, idx: usize) -> Option<(us
     Some((start, start.checked_add(entry.nbytes as usize)?))
 }
 
+/// A tensor of this size or more has a window of its own; smaller ones share one up to it.
+const WINDOW_MERGE: usize = 8 << 20;
+
+/// The model's mapping as windows cut at tensor boundaries, for `WeightArena::cuts`: each
+/// window's first byte and its end, page-rounded. Taken when the Neural Engine is wanted
+/// (`CMF_METAL_WINDOWS=0` keeps the wide windows, `=1` cuts them for any model); `None` keeps
+/// the wide windows.
+fn tensor_windows(model: &Arc<CmfModel>, len: usize, page: usize, max_len: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("CMF_METAL_WINDOWS").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    });
+    if !mode.unwrap_or_else(ane::wanted) {
+        return None;
+    }
+    let mut spans: Vec<(usize, usize)> = model
+        .tensors
+        .iter()
+        .filter_map(|e| {
+            let start = model.entry_abs_offset(e)?;
+            let end = start.checked_add(e.nbytes as usize)?;
+            (end <= len && end > start).then_some((start, end))
+        })
+        .collect();
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_unstable();
+    let (mut starts, mut ends): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (start, end) in spans {
+        let (first, past) = (start / page * page, end.div_ceil(page).saturating_mul(page).min(len));
+        let small = end - start < WINDOW_MERGE;
+        match (starts.last().copied(), ends.last_mut()) {
+            // The same first page, or a small tensor after small ones.
+            (Some(s), Some(e)) if first == s || (small && *e - s < WINDOW_MERGE && first <= *e) => *e = (*e).max(past),
+            _ => {
+                starts.push(first);
+                ends.push(past);
+            }
+        }
+    }
+    if starts.iter().zip(&ends).any(|(s, e)| e - s > max_len) {
+        return None;
+    }
+    Some((starts, ends))
+}
+
+/// Reads the model file ahead of its first readers, in file order, which is the layers' order,
+/// and maps what it read. A page fault on a cold file brings in 0.7 GB/s on one thread and
+/// 2 GB/s on eight; a read in blocks brings 3.3 GB/s, and a page it left in the cache maps in
+/// under a microsecond. Qwen3.8-27B on the M4, 3 600 tokens, a file out of the cache: first
+/// token 35.3 → 33.6 s. Having the driver prepare the windows behind the read gained nothing:
+/// a window of mapped pages is prepared in milliseconds. `CMF_METAL_PREFETCH`: `0` off, `1` on
+/// for any model, `wait` returns when the file is in.
+fn prefetch(model: &Arc<CmfModel>, len: usize, page: usize) {
+    use std::os::unix::fs::FileExt;
+    const BLOCK: usize = 8 << 20;
+    let mode = std::env::var("CMF_METAL_PREFETCH").unwrap_or_default();
+    if mode == "0" || (mode.is_empty() && !ane::wanted()) {
+        return;
+    }
+    let Ok(file) = std::fs::File::open(&model.path) else { return };
+    if file.metadata().map_or(true, |m| (m.len() as usize) < len) {
+        return;
+    }
+    let model = model.clone();
+    let t0 = std::time::Instant::now();
+    let hand = std::thread::spawn(move || {
+        let base = model.primary_bytes().as_ptr();
+        let mut block = vec![0u8; BLOCK];
+        let (mut at, mut sum) = (0usize, 0u8);
+        while at < len {
+            let n = BLOCK.min(len - at);
+            if file.read_exact_at(&mut block[..n], at as u64).is_err() {
+                break;
+            }
+            let mut o = at;
+            while o < at + n {
+                // SAFETY: inside the mapped file, which `model` keeps alive.
+                sum = sum.wrapping_add(unsafe { std::ptr::read_volatile(base.add(o)) });
+                o += page;
+            }
+            at += n;
+        }
+        std::hint::black_box(sum);
+        tracing::info!("model file read ahead in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    });
+    if mode == "wait" {
+        let _ = hand.join();
+    }
+}
+
 fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usize)> {
     // The paged graph deliberately uses `file_page_buffer`, never this
     // retained full-mmap arena.  Once that opt-in is active for a model over
@@ -9712,7 +9873,25 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
     let max_len = c._device.max_buffer_length() as usize / page * page;
     let base_ptr = bytes.as_ptr() as usize;
     let dev = c._device.clone();
-    let arena = if len <= max_len {
+    let arena = if let Some((starts, ends)) = tensor_windows(model, len, page, max_len) {
+        tracing::info!("model mmap {} MB in {} windows cut at tensors, built on first use", len / (1024 * 1024), starts.len());
+        let cuts = starts.clone();
+        WeightArena {
+            bufs: (0..starts.len()).map(|_| OnceLock::new()).collect(),
+            make: Box::new(move |i| unsafe {
+                dev.new_buffer_with_bytes_no_copy(
+                    (base_ptr + starts[i]) as *const std::ffi::c_void,
+                    (ends[i] - starts[i]) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            }),
+            stride: len.max(1),
+            base: 0,
+            limit: len,
+            cuts,
+        }
+    } else if len <= max_len {
         WeightArena {
             bufs: vec![OnceLock::new()],
             make: Box::new(move |_| unsafe {
@@ -9726,6 +9905,7 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
             stride: len.max(1),
             base: 0,
             limit: len,
+            cuts: Vec::new(),
         }
     } else {
         // The driver accounts the working set by BUFFER LENGTHS, not
@@ -9773,9 +9953,13 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
             stride,
             base: 0,
             limit: len,
+            cuts: Vec::new(),
         }
     };
     let arena = Arc::new(arena);
+    if !arena.cuts.is_empty() {
+        prefetch(model, len, page);
+    }
     cache.insert(key, (arena.clone(), Arc::clone(model)));
     Some((arena, len))
 }
@@ -9831,6 +10015,7 @@ fn file_page_buffer(
         stride: len,
         base,
         limit,
+        cuts: Vec::new(),
     };
     Some((Arc::new(arena), file_len))
 }
@@ -12794,6 +12979,18 @@ fn cmd_gpu_ms(cmd: &metal::CommandBufferRef) -> f64 {
         let s: f64 = msg_send![p, GPUStartTime];
         let e: f64 = msg_send![p, GPUEndTime];
         (e - s) * 1000.0
+    }
+}
+
+/// The GPU's start and end of a finished command on Metal's clock, in milliseconds.
+fn cmd_gpu_span_ms(cmd: &metal::CommandBufferRef) -> (f64, f64) {
+    use metal::foreign_types::ForeignTypeRef;
+    use metal::objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let p = cmd.as_ptr();
+        let s: f64 = msg_send![p, GPUStartTime];
+        let e: f64 = msg_send![p, GPUEndTime];
+        (s * 1000.0, e * 1000.0)
     }
 }
 
@@ -23123,6 +23320,65 @@ pub struct VerifyGraph {
     /// is packing: the ANE's layer, gate, up and down.
     ane: Option<Arc<ane::AneFfn>>,
     ane_job: Option<(usize, (usize, usize, usize), (usize, usize, usize), (usize, usize, usize))>,
+    /// Which half of a chunk this graph holds (`new_prefill_lane`): its rows and the ANE's
+    /// surfaces are its own, the layers' states and scratch are shared with the other half.
+    lane: usize,
+    /// A half of a chunk, on its own thread: every layer's command is committed as it ends, so
+    /// the GPU has it while this half is on the ANE and the other half encodes.
+    relay: bool,
+    /// The halves in step, and whether this one leads.
+    gate: Option<Arc<LaneGate>>,
+    /// Layers this graph began, and whether the one it is in is an attention layer.
+    began: usize,
+    in_attention: bool,
+    /// The ANE's output waits to become `d_b`, in the next encoder of this graph.
+    join_pending: bool,
+    /// The layers' states already hold the half before this one: nothing comes from the host.
+    state_follow: bool,
+    /// Rows of the chunk that come after this graph's, for which a mirror keeps room.
+    rows_after: usize,
+}
+
+/// The halves of a prompt chunk in step. A layer's state, mirror rows and far field take the
+/// first half's rows before the second's, so the second half begins a layer once the first
+/// one's command for it is committed.
+pub struct LaneGate {
+    at: std::sync::Mutex<(usize, bool)>,
+    turn: std::sync::Condvar,
+}
+
+impl LaneGate {
+    pub fn new() -> Arc<LaneGate> {
+        Arc::new(LaneGate { at: std::sync::Mutex::new((0, false)), turn: std::sync::Condvar::new() })
+    }
+
+    /// The first half committed one more layer.
+    fn pass(&self) {
+        self.at.lock().unwrap().0 += 1;
+        self.turn.notify_all();
+    }
+
+    /// Whether the first half committed layer `layer`; false once a half failed.
+    fn wait(&self, layer: usize) -> bool {
+        let mut at = self.at.lock().unwrap();
+        while at.0 <= layer && !at.1 {
+            at = self.turn.wait(at).unwrap();
+        }
+        !at.1
+    }
+
+    /// A half failed: the other one stops at its next layer.
+    pub fn fail(&self) {
+        self.at.lock().unwrap().1 = true;
+        self.turn.notify_all();
+    }
+}
+
+/// What the Neural Engine may take of one layer of a prompt chunk: the FFN's gate, up and down,
+/// and the projections of the mixer's input.
+pub struct AneWants {
+    pub ffn: Option<[(usize, usize, usize); 3]>,
+    pub mix: Vec<(usize, usize, usize)>,
 }
 
 const VBUF_BASE: usize = 60_000_000_000;
@@ -23151,6 +23407,38 @@ fn verify_skip(what: char) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("CMF_VERIFY_SKIP").unwrap_or_default())
         .contains(what)
+}
+
+/// Whether the Neural Engine takes every input projection of a mixer (`CMF_ANE_MIX=all`).
+/// Otherwise a GDN mixer's `qkv` and an attention layer's `k` and `v` stay on the GPU, which
+/// computes them while the ANE computes `z` or `q`.
+pub fn ane_takes_qkv() -> bool {
+    ane::mix_level() == 3
+}
+
+/// Whether the Neural Engine takes an attention layer's `q` projection.
+pub fn ane_takes_q() -> bool {
+    ane::mix_level() >= 2
+}
+
+/// Stage attribution of the rows graph (`CMF_VERIFY_CUT=1`): every stage of a layer is its own
+/// command, run to its end, so the GPU's time on each can be read. Wall time inflates and two
+/// halves of a chunk overwrite each other's scratch, so the output is not to be read.
+fn cut_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_VERIFY_CUT").as_deref() == Ok("1"))
+}
+
+static CUTS: Mutex<Vec<(&'static str, f64, u32)>> = Mutex::new(Vec::new());
+
+/// The stages' GPU time so far, per run of each.
+pub(crate) fn cut_report() {
+    let cuts = CUTS.lock().unwrap();
+    if cuts.is_empty() {
+        return;
+    }
+    let line: Vec<String> = cuts.iter().map(|(l, ms, n)| format!("{l} {:.2} ms x{n}", ms / *n as f64)).collect();
+    eprintln!("rows-prof: {}", line.join("; "));
 }
 
 /// Scan only the immutable Q2 payload planes for the legal affine ternary
@@ -23361,6 +23649,10 @@ impl VerifyGraph {
     }
 
     pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
+        Self::new_lane(model, dims, h, b, 0)
+    }
+
+    fn new_lane(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize, lane: usize) -> Option<VerifyGraph> {
         if !(1..=512).contains(&b) || h.len() != b * dims.hidden || dims.hidden % 128 != 0 {
             return None;
         }
@@ -23368,15 +23660,15 @@ impl VerifyGraph {
         let c = tg.c;
         let bc = Self::bcap(b);
         let hb = bc * dims.hidden * 4;
-        let h_b = Self::vbuf(c, 1, 0, hb);
-        let n_b = Self::vbuf(c, 2, 0, hb);
-        let d_b = Self::vbuf(c, 3, 0, hb);
+        let h_b = Self::vbuf(c, 1, lane, hb);
+        let n_b = Self::vbuf(c, 2, lane, hb);
+        let d_b = Self::vbuf(c, 3, lane, hb);
         unsafe {
             std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * dims.hidden);
         }
         // per-row scales: b entries (the pow2 pre-scale writes one a row)
-        let ones = Self::vbuf(c, 4, 0, bc * 4);
-        let xsc = Self::vbuf(c, 5, 0, bc * 4);
+        let ones = Self::vbuf(c, 4, lane, bc * 4);
+        let xsc = Self::vbuf(c, 5, lane, bc * 4);
         unsafe {
             let p = ones.contents() as *mut f32;
             for i in 0..bc {
@@ -23406,7 +23698,297 @@ impl VerifyGraph {
             failed: false,
             ane: None,
             ane_job: None,
+            lane,
+            relay: false,
+            gate: None,
+            began: 0,
+            in_attention: false,
+            join_pending: false,
+            state_follow: false,
+            rows_after: 0,
         })
+    }
+
+    /// One half of a prompt chunk whose halves take turns on the GPU and the Neural Engine, a
+    /// thread each: `lane` 0 holds the first rows and leads at every layer, `rows_after` are the
+    /// rows of the half behind it.
+    pub fn new_prefill_lane(
+        model: &Arc<CmfModel>,
+        dims: GraphDims,
+        h: &[f32],
+        b: usize,
+        lane: usize,
+        rows_after: usize,
+        gate: &Arc<LaneGate>,
+    ) -> Option<VerifyGraph> {
+        if lane >= ane::LANES {
+            return None;
+        }
+        let mut g = Self::new_lane(model, dims, h, b, lane)?;
+        g.prefill = true;
+        g.relay = true;
+        g.gate = Some(gate.clone());
+        g.state_follow = lane > 0;
+        g.rows_after = rows_after;
+        Some(g)
+    }
+
+    /// A layer begins. The second half of a chunk waits here for the first one's command.
+    /// Under `CMF_VERIFY_CUT` the stage encoded so far runs as its own command, and its GPU
+    /// time goes under `label`.
+    fn cut(&mut self, enc: metal::ComputeCommandEncoder, label: &'static str) -> metal::ComputeCommandEncoder {
+        if !cut_on() {
+            return enc;
+        }
+        enc.end_encoding();
+        let note = |label: &'static str, ms: f64| {
+            let mut cuts = CUTS.lock().unwrap();
+            match cuts.iter_mut().find(|c| c.0 == label) {
+                Some(c) => {
+                    c.1 += ms;
+                    c.2 += 1;
+                }
+                None => cuts.push((label, ms, 1)),
+            }
+        };
+        // What went ahead of the Neural Engine's answer.
+        for cmd in std::mem::take(&mut self.inflight) {
+            cmd.wait_until_completed();
+            note("early", cmd_gpu_ms(&cmd));
+        }
+        if let Some(cmd) = self.cmd.take() {
+            cmd.commit();
+            cmd.wait_until_completed();
+            note(label, cmd_gpu_ms(&cmd));
+        }
+        self.ensure_cmd().new_compute_command_encoder().to_owned()
+    }
+
+    fn begin_layer(&mut self, attention: bool) -> bool {
+        self.in_attention = attention;
+        let layer = self.began;
+        self.began += 1;
+        let t0 = ane::clock_ms();
+        let ok = match &self.gate {
+            Some(g) if self.lane > 0 => g.wait(layer),
+            _ => true,
+        };
+        ane::trace(self.lane, layer, "gate", t0, ane::clock_ms());
+        ok
+    }
+
+    /// The open command goes to the GPU, not waited.
+    fn commit_open(&mut self) {
+        if let Some(cmd) = self.cmd.take() {
+            METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cmd.commit();
+            self.inflight.push(cmd);
+            let t = ane::clock_ms();
+            ane::trace(self.lane, self.began.saturating_sub(1), "commit", t, t);
+        }
+    }
+
+    /// Every committed command is done; false on a command's error, which is terminal.
+    fn wait_committed(&mut self) -> bool {
+        let mut ms = 0.0;
+        let cmds = std::mem::take(&mut self.inflight);
+        let t0 = ane::clock_ms();
+        for cmd in &cmds {
+            if let Err(err) = wait_fast_checked(cmd) {
+                self.failed = true;
+                tracing::error!("Metal VerifyGraph command buffer failed: {err}");
+                return false;
+            }
+            ms += cmd_gpu_ms(cmd);
+            let (a, b) = cmd_gpu_span_ms(cmd);
+            ane::trace(self.lane, self.began.saturating_sub(1), "gpu", a, b);
+        }
+        if !cmds.is_empty() {
+            ane::trace(self.lane, self.began.saturating_sub(1), "wait-gpu", t0, ane::clock_ms());
+        }
+        if let (Some(a), false) = (&self.ane, cmds.is_empty()) {
+            a.note_gpu(self.in_attention, ms);
+        }
+        true
+    }
+
+    /// One command of its own, run to its end.
+    fn run_now(&mut self, encode: &dyn Fn(&VerifyGraph, &metal::ComputeCommandEncoderRef)) -> bool {
+        let cmd = self.tg.c.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode(self, enc);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        if cmd.status() == metal::MTLCommandBufferStatus::Error {
+            self.failed = true;
+            return false;
+        }
+        true
+    }
+
+    /// Whether the Neural Engine takes the mixer projections that begin with `first`, and its
+    /// layer.
+    fn mix_on_ane(&self, first: (usize, usize, usize)) -> Option<(Arc<ane::AneFfn>, usize)> {
+        let a = self.ane.clone().filter(|_| ane::wanted())?;
+        match self.batch_abs(first) {
+            Some((abs, ProjKind::Q4tp)) => a.mix_layer(abs).filter(|_| a.takes(self.b)).map(|li| (a, li)),
+            _ => None,
+        }
+    }
+
+    /// The Neural Engine's share of a mixer's input projections: its layer, and how many of the
+    /// leading ones stay on the GPU.
+    fn ane_split(&self, projs: &[(usize, usize, usize)]) -> Option<(Arc<ane::AneFfn>, usize, usize)> {
+        (0..projs.len()).find_map(|k| self.mix_on_ane(projs[k]).map(|(a, li)| (a, li, k)))
+    }
+
+    /// The layer's first norm on the host, when the Neural Engine is on both sides of it: the
+    /// FFN before, if any, joins the stream, and the normed rows go straight to the ANE's
+    /// input. No command of this graph is in flight then, and none has to wait behind the other
+    /// half's on the GPU. False leaves it to `rows_norm`.
+    fn host_norm(&mut self, w: &[f32], projs: &[(usize, usize, usize)]) -> bool {
+        if self.cmd.is_some() || !self.inflight.is_empty() || (self.pending_delta && !self.join_pending) {
+            return false;
+        }
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("CMF_ANE_HOST_NORM").as_deref() == Ok("0")) {
+            return false;
+        }
+        let Some((a, _, _)) = self.ane_split(projs) else {
+            return false;
+        };
+        let add = std::mem::take(&mut self.join_pending);
+        self.pending_delta = false;
+        let t_host = ane::clock_ms();
+        // SAFETY: shared buffers of b rows of the hidden size, this graph's alone, with no
+        // command in flight; the ANE's last evaluation for this lane is over.
+        unsafe {
+            a.host_norm(
+                self.lane,
+                self.b,
+                self.h_b.contents() as *mut f32,
+                self.n_b.contents() as *mut f32,
+                w,
+                self.tg.dims.gemma,
+                self.tg.dims.eps,
+                add,
+            );
+        }
+        ane::trace(self.lane, self.began.saturating_sub(1), "host-norm", t_host, ane::clock_ms());
+        true
+    }
+
+    /// The mixer's projections of `n_b`, each into its buffer, and `early`: what else of the
+    /// layer needs only `n_b` and the GPU's projections. The Neural Engine takes the trailing
+    /// projections it has for this layer: its input is packed (or `host_norm` left it there),
+    /// the GPU's projections and `early` go ahead as a command of their own, the ANE evaluates
+    /// meanwhile, and a new encoder begins with its outputs unpacked. Without the ANE all of it
+    /// is encoded in place. `None` is a terminal failure.
+    fn input_projections(
+        &mut self,
+        enc: metal::ComputeCommandEncoder,
+        projs: &[((usize, usize, usize), &Buffer)],
+        hosted: bool,
+        early: Option<&dyn Fn(&VerifyGraph, &metal::ComputeCommandEncoderRef)>,
+    ) -> Option<metal::ComputeCommandEncoder> {
+        let list: Vec<(usize, usize, usize)> = projs.iter().map(|p| p.0).collect();
+        let Some((a, li, k)) = self.ane_split(&list) else {
+            for (t, out) in projs {
+                self.gemm(&enc, *t, &self.n_b, out, &self.ones);
+            }
+            if let Some(early) = early {
+                early(self, &enc);
+            }
+            return Some(enc);
+        };
+        // `host_norm` already left the rows on the ANE's input.
+        let mut waited = 0.0;
+        let enc = if hosted {
+            enc
+        } else {
+            a.encode_input(&enc, &self.n_b, self.b, self.lane);
+            enc.end_encoding();
+            let t_gpu = std::time::Instant::now();
+            self.commit_open();
+            if !self.wait_committed() {
+                return None;
+            }
+            waited = t_gpu.elapsed().as_secs_f64() * 1e3;
+            self.ensure_cmd().new_compute_command_encoder().to_owned()
+        };
+        // The GPU's own share runs while the ANE evaluates. `early` reads the first projection,
+        // so it goes ahead only when that one is the GPU's.
+        let ahead = k > 0;
+        if ahead {
+            for (t, out) in &projs[..k] {
+                self.gemm(&enc, *t, &self.n_b, out, &self.ones);
+            }
+            if let Some(early) = early {
+                early(self, &enc);
+            }
+        }
+        enc.end_encoding();
+        if ahead {
+            self.commit_open();
+        }
+        let theirs = &projs[k..];
+        let ok = match a.run_mix(&self.tg.fbuf, li, self.b, self.lane, waited) {
+            Ok(()) => true,
+            Err(e) => {
+                ane::retire(&e);
+                self.ane = None;
+                false
+            }
+        };
+        if ok && std::env::var("CMF_ANE_CHECK").is_ok() {
+            // The same projections on the GPU, and how far the ANE's are from them.
+            if !self.wait_committed() {
+                return None;
+            }
+            let (b, lane) = (self.b, self.lane);
+            if !self.run_now(&|_, enc| {
+                for (j, (_, out)) in theirs.iter().enumerate() {
+                    a.encode_unpack(enc, li, j, out, b, lane);
+                }
+            }) {
+                return None;
+            }
+            let read = |out: &Buffer, n: usize| -> Vec<f32> {
+                // SAFETY: a shared buffer of at least `n` floats, and no command is running on it.
+                unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n).to_vec() }
+            };
+            let ours: Vec<Vec<f32>> = theirs.iter().map(|(t, out)| read(out, b * t.1)).collect();
+            if !self.run_now(&|g, enc| {
+                for (t, out) in theirs {
+                    g.gemm(enc, *t, &g.n_b, out, &g.ones);
+                }
+            }) {
+                return None;
+            }
+            for (j, ((t, out), ours)) in theirs.iter().zip(&ours).enumerate() {
+                let gpu = read(out, b * t.1);
+                let (mut e, mut tt) = (0f64, 0f64);
+                for (x, y) in ours.iter().zip(&gpu) {
+                    e += ((x - y) as f64).powi(2);
+                    tt += (*y as f64).powi(2);
+                }
+                eprintln!("ane-check layer {li} mixer projection {j} rows {b}: relative rms {:.5}", (e / tt.max(1e-30)).sqrt());
+            }
+        }
+        let cmd = self.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder().to_owned();
+        for (j, (t, out)) in theirs.iter().enumerate() {
+            if ok {
+                a.encode_unpack(&enc, li, j, out, self.b, self.lane);
+            } else {
+                self.gemm(&enc, *t, &self.n_b, out, &self.ones);
+            }
+        }
+        if let (Some(early), false) = (early, ahead) {
+            early(self, &enc);
+        }
+        Some(enc)
     }
 
     /// The prefill flavour: b prompt rows (≤ 512), states written in
@@ -23532,6 +24114,7 @@ impl VerifyGraph {
     /// n = rmsnorm(h, w) — folding a pending `h += d` in when there is one.
     fn rows_norm(&mut self, enc: &metal::ComputeCommandEncoderRef, w: &[f32]) {
         let c = self.tg.c;
+        self.join(enc);
         if self.pending_delta {
             self.pending_delta = false;
             self.add_norm(enc, w);
@@ -23545,6 +24128,15 @@ impl VerifyGraph {
             &[self.tg.dims.eps],
             ((self.b * 256) as u64, 256),
         );
+    }
+
+    /// The Neural Engine's output becomes `d_b`, ahead of whatever reads it.
+    fn join(&mut self, enc: &metal::ComputeCommandEncoderRef) {
+        if std::mem::take(&mut self.join_pending) {
+            if let Some(a) = &self.ane {
+                a.encode_join(enc, &self.d_b, self.b, self.lane);
+            }
+        }
     }
 
     /// h += d_b; n = rmsnorm(h, w) — one dispatch.
@@ -23570,6 +24162,7 @@ impl VerifyGraph {
 
     /// Flush a pending delta into h_b (before a readback or the head).
     fn flush_delta(&mut self, enc: &metal::ComputeCommandEncoderRef) {
+        self.join(enc);
         if self.pending_delta {
             self.pending_delta = false;
             disp_axpy(
@@ -23728,10 +24321,10 @@ impl VerifyGraph {
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
         // The Neural Engine takes this FFN: its input now, the rest once this encoder ends.
-        if let Some(a) = self.ane.clone() {
+        if let Some(a) = self.ane.clone().filter(|_| ane::wanted()) {
             if let Some((abs, ProjKind::Q4tp)) = self.batch_abs(*gate) {
                 if let Some(li) = a.layer_of(abs).filter(|_| a.takes(self.b)) {
-                    a.encode_input(enc, &self.n_b, self.b);
+                    a.encode_input(enc, &self.n_b, self.b, self.lane);
                     self.ane_job = Some((li, *gate, *up, *down));
                     self.pending_delta = true;
                     return;
@@ -23772,100 +24365,102 @@ impl VerifyGraph {
         self.gemm(enc, down, &fa, &self.d_b, &self.xsc);
     }
 
-    /// A prompt chunk's FFNs go to the Neural Engine when it takes all of `ffns`' q4tp shapes.
-    pub fn ane_attach(&mut self, ffns: &[((usize, usize, usize), (usize, usize, usize), (usize, usize, usize))]) {
-        if !self.prefill || self.b < 64 || ffns.is_empty() {
+    /// Whether the Neural Engine takes this graph's FFNs.
+    pub fn has_ane(&self) -> bool {
+        self.ane.is_some()
+    }
+
+    /// The Neural Engine takes what it can of a prompt chunk's layers: q4tp FFNs of one shape,
+    /// and the mixers' input projections.
+    pub fn ane_attach(&mut self, wants: &[AneWants]) {
+        if !self.prefill || self.b < 64 || wants.is_empty() {
             return;
         }
-        let mut layers = Vec::with_capacity(ffns.len());
-        for (g, u, d) in ffns {
-            let proj = |t: (usize, usize, usize)| match self.batch_abs(t) {
-                Some((abs, ProjKind::Q4tp)) => Some(ane::Proj { abs, rows: t.1, cols: t.2 }),
-                _ => None,
-            };
-            // A layer of another codec stays on the GPU.
-            if let (Some(a), Some(b), Some(c)) = (proj(*g), proj(*u), proj(*d)) {
-                layers.push([a, b, c]);
-            }
-        }
-        if layers.is_empty() {
+        let proj = |t: (usize, usize, usize)| match self.batch_abs(t) {
+            Some((abs, ProjKind::Q4tp)) => Some(ane::Proj { abs, rows: t.1, cols: t.2 }),
+            _ => None,
+        };
+        // A layer of another codec stays on the GPU.
+        let layers: Vec<ane::LayerProjs> = wants
+            .iter()
+            .map(|w| ane::LayerProjs {
+                ffn: w.ffn.and_then(|f| Some([proj(f[0])?, proj(f[1])?, proj(f[2])?])),
+                mix: w.mix.iter().map(|t| proj(*t)).collect::<Option<Vec<_>>>().unwrap_or_default(),
+            })
+            .collect();
+        if layers.iter().all(|l| l.ffn.is_none()) {
             return;
         }
         self.ane = ane::ffn_for(self.tg.c, layers);
     }
 
-    /// The Neural Engine's turn, after the encoder that packed its input: that command runs to
-    /// its end, the ANE takes the layer, and its output becomes `d_b`. A failure gives the
-    /// layer to the GPU, whose `n_b` is intact, and every later one.
+    /// A chunk begins on the Neural Engine, in `lanes` halves.
+    pub fn ane_begin(&self, lanes: usize) {
+        if let Some(a) = &self.ane {
+            a.begin(lanes);
+        }
+    }
+
+    /// The end of a layer's encoder. With an FFN for the Neural Engine the command runs to its
+    /// end and the ANE takes the layer; its output joins `d_b` in the graph's next encoder. A
+    /// failure gives the layer to the GPU, whose `n_b` is intact, and every later one. A half of
+    /// a chunk commits every layer's command, and the first half lets the second one begin.
     fn ane_finish(&mut self) -> bool {
+        if !self.relay && self.ane_job.is_none() {
+            return true;
+        }
+        let t_gpu = std::time::Instant::now();
+        self.commit_open();
+        if let (Some(g), 0) = (&self.gate, self.lane) {
+            g.pass();
+        }
         let Some((li, gate, up, down)) = self.ane_job.take() else {
             return true;
         };
-        let c = self.tg.c;
-        let a = self.ane.clone().unwrap();
-        let t_gpu = std::time::Instant::now();
-        if let Some(cmd) = self.cmd.take() {
-            cmd.commit();
-            cmd.wait_until_completed();
-            if cmd.status() == metal::MTLCommandBufferStatus::Error {
-                self.failed = true;
-                return false;
-            }
+        if !self.wait_committed() {
+            return false;
         }
-        a.ms.lock().unwrap().2 += t_gpu.elapsed().as_secs_f64() * 1e3;
-        let mut ok = match a.run(&self.tg.fbuf, li, self.b) {
+        let a = self.ane.clone().unwrap();
+        let waited = t_gpu.elapsed().as_secs_f64() * 1e3;
+        let ok = match a.run_ffn(&self.tg.fbuf, li, self.b, self.lane, waited) {
             Ok(()) => true,
             Err(e) => {
                 ane::retire(&e);
+                self.ane = None;
                 false
             }
         };
-        if ok {
-            let cmd = c.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            a.encode_join(enc, &self.d_b, self.b);
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-            if a.not_finite() || cmd.status() == metal::MTLCommandBufferStatus::Error {
-                ane::retire("an output that is not finite");
-                ok = false;
-            }
-        }
-        let check = ok && std::env::var("CMF_ANE_CHECK").is_ok();
-        if !ok || check {
-            let n = self.b * self.tg.dims.hidden;
-            let ours: Vec<f32> = if check {
-                // SAFETY: a shared buffer of at least `n` floats, and no command is running.
-                unsafe { std::slice::from_raw_parts(self.d_b.contents() as *const f32, n).to_vec() }
-            } else {
-                Vec::new()
-            };
-            let cmd = c.queue.new_command_buffer();
+        if !ok {
+            let cmd = self.ensure_cmd();
             let enc = cmd.new_compute_command_encoder();
             self.ffn_gpu(enc, gate, up, down);
             enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-            if cmd.status() == metal::MTLCommandBufferStatus::Error {
-                self.failed = true;
-                return false;
-            }
-            if check {
-                // SAFETY: as above; the GPU's FFN is done.
-                let gpu = unsafe { std::slice::from_raw_parts_mut(self.d_b.contents() as *mut f32, n) };
-                let (mut e, mut t) = (0f64, 0f64);
-                for (x, y) in ours.iter().zip(gpu.iter()) {
-                    e += ((x - y) as f64).powi(2);
-                    t += (*y as f64).powi(2);
-                }
-                eprintln!("ane-check layer {li} rows {}: relative rms {:.4}", self.b, (e / t.max(1e-30)).sqrt());
-                gpu.copy_from_slice(&ours);
-            }
+            return true;
         }
-        if !ok {
-            self.ane = None;
+        if std::env::var("CMF_ANE_CHECK").is_err() {
+            self.join_pending = true;
+            return true;
         }
+        // The same FFN on the GPU, and how far the ANE's is from it.
+        let (b, lane) = (self.b, self.lane);
+        if !self.run_now(&|g, enc| a.encode_join(enc, &g.d_b, b, lane)) {
+            return false;
+        }
+        let n = self.b * self.tg.dims.hidden;
+        // SAFETY: a shared buffer of at least `n` floats, and no command is running on it.
+        let ours: Vec<f32> = unsafe { std::slice::from_raw_parts(self.d_b.contents() as *const f32, n).to_vec() };
+        if !self.run_now(&|g, enc| g.ffn_gpu(enc, gate, up, down)) {
+            return false;
+        }
+        // SAFETY: as above; the GPU's FFN is done.
+        let gpu = unsafe { std::slice::from_raw_parts_mut(self.d_b.contents() as *mut f32, n) };
+        let (mut e, mut t) = (0f64, 0f64);
+        for (x, y) in ours.iter().zip(gpu.iter()) {
+            e += ((x - y) as f64).powi(2);
+            t += (*y as f64).powi(2);
+        }
+        eprintln!("ane-check layer {li} rows {}: relative rms {:.4}", self.b, (e / t.max(1e-30)).sqrt());
+        gpu.copy_from_slice(&ours);
         true
     }
 
@@ -23901,7 +24496,9 @@ impl VerifyGraph {
         let b = self.b;
         let vd = cfg.nv * cfg.dv;
         for (l, st) in layers.iter().zip(states) {
-            let cmd = self.ensure_cmd();
+            if !self.begin_layer(false) {
+                return false;
+            }
             let slot = self.gdn.len();
             let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {
                 Some(b) => (b, 0usize),
@@ -23910,7 +24507,14 @@ impl VerifyGraph {
             let bc = self.bc;
             // A verify replays each layer's rows at its commit. A prompt's rows are real and
             // leave nothing to replay, so its layers share one set of these.
-            let scratch = if self.prefill { 0 } else { slot };
+            // Two halves of a chunk each keep a set: a half's early command and its late one
+            // may have the other half's between them.
+            let scratch = match (self.prefill, self.lane) {
+                (false, _) => slot,
+                (true, 0) => 0,
+                (true, lane) => 900 + lane,
+            };
+            let lane_slot = if self.prefill && self.lane > 0 { 900 + self.lane } else { 0 };
             let qkv_b = Self::vbuf(c, 11, scratch, bc * cfg.c_dim * 4);
             let cq_b = Self::vbuf(c, 12, scratch, bc * cfg.c_dim * 4);
             let z_b = Self::vbuf(c, 13, scratch, bc * vd * 4);
@@ -23918,10 +24522,11 @@ impl VerifyGraph {
             let bt_b = Self::vbuf(c, 15, scratch, bc * cfg.nv * 4);
             let iq_b = Self::vbuf(c, 16, scratch, bc * cfg.nk * 4);
             let ik_b = Self::vbuf(c, 17, scratch, bc * cfg.nk * 4);
-            let a_b = Self::vbuf(c, 18, 0, bc * cfg.nv * 4);
-            let bb_b = Self::vbuf(c, 19, 0, bc * cfg.nv * 4);
-            let of_b = Self::vbuf(c, 20, 0, bc * vd * 4);
-            if st_len > 0 {
+            let a_b = Self::vbuf(c, 18, lane_slot, bc * cfg.nv * 4);
+            let bb_b = Self::vbuf(c, 19, lane_slot, bc * cfg.nv * 4);
+            let of_b = Self::vbuf(c, 20, lane_slot, bc * vd * 4);
+            // The half before this one left its state here, and its command may still run.
+            if st_len > 0 && !self.state_follow {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         st.as_ptr(),
@@ -23931,75 +24536,109 @@ impl VerifyGraph {
                 }
             }
             let gnorm_b = const_buf(c, l.gnorm);
-            let enc = cmd.new_compute_command_encoder();
             // 1. norm
-            self.rows_norm(enc, l.attn_norm);
-            // 2. mixer projections
-            self.gemm(enc, l.qkv, &self.n_b, &qkv_b, &self.ones);
-            self.gemm(enc, l.z, &self.n_b, &z_b, &self.ones);
-            {
-                // a and b projections in one dispatch (8 rows a pass)
+            let hosted = self.host_norm(l.attn_norm, &[l.qkv, l.z]);
+            let cmd = self.ensure_cmd();
+            let enc = cmd.new_compute_command_encoder().to_owned();
+            if !hosted {
+                self.rows_norm(&enc, l.attn_norm);
+            }
+            // 2. What needs the normed rows alone: the a and b projections, the conv over the
+            //    virtual sequence, the gates and the qk norms.
+            let s_ring = s_b.clone();
+            let early = |g: &VerifyGraph, enc: &metal::ComputeCommandEncoderRef| {
                 let (da, rows, cols) = l.a;
                 let (db, _, _) = l.b;
                 let (wa, wb2) = (const_buf(c, da), const_buf(c, db));
-                for c0 in (0..b).step_by(8) {
-                    let nb = (b - c0).min(8);
-                    disp(
+                match moe_q8::pipes(c).filter(|_| b > 8 && cols % 32 == 0) {
+                    // Two small GEMMs with f32 tiles: every row of `n_b` is read once, where a
+                    // simdgroup per output read all of them again (5.8 ms of a 256-row layer).
+                    Some(p) => {
+                        for (w, y) in [(&wa, &a_b), (&wb2, &bb_b)] {
+                            moe_q8::set_att_nt(p, enc);
+                            enc.set_buffer(0, Some(w), 0);
+                            enc.set_buffer(1, Some(&g.n_b), 0);
+                            enc.set_buffer(2, Some(y), 0);
+                            for (i, v) in [cols as u32, rows as u32, b as u32].iter().enumerate() {
+                                enc.set_bytes(3 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                            }
+                            let one = 1.0f32;
+                            enc.set_bytes(6, 4, &one as *const f32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+                                MTLSize::new(128, 1, 1),
+                            );
+                        }
+                    }
+                    None if b > 8 => {
+                        enc.set_compute_pipeline_state(&c.f32mv2r);
+                        for (i, buf) in [&wa, &wb2, &g.n_b, &a_b, &bb_b].iter().enumerate() {
+                            enc.set_buffer(i as u64, Some(buf), 0);
+                        }
+                        for (i, w) in [cols as u32, rows as u32, b as u32].iter().enumerate() {
+                            enc.set_bytes(5 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                        }
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(((2 * rows) as u64).div_ceil(8), (b as u64).div_ceil(8), 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    // a and b projections in one dispatch (8 rows a pass)
+                    None => disp(
                         enc,
                         &c.f32mv2b,
-                        &[
-                            (&wa, 0),
-                            (&wb2, 0),
-                            (&self.n_b, (c0 * cols * 4) as u64),
-                            (&a_b, (c0 * rows * 4) as u64),
-                            (&bb_b, (c0 * rows * 4) as u64),
-                        ],
-                        &[cols as u32, rows as u32, nb as u32],
+                        &[(&wa, 0), (&wb2, 0), (&g.n_b, 0), (&a_b, 0), (&bb_b, 0)],
+                        &[cols as u32, rows as u32, b as u32],
                         &[],
                         (((2 * rows) as u64).div_ceil(8) * 256, 256),
-                    );
+                    ),
                 }
-            }
-            // 3. conv over the virtual sequence
-            enc.set_compute_pipeline_state(&c.gdnconvb);
-            enc.set_buffer(0, Some(&qkv_b), 0);
-            enc.set_buffer(1, Some(&s_b), 0);
-            enc.set_buffer(2, Some(&const_buf(c, l.conv1d)), 0);
-            enc.set_buffer(3, Some(&cq_b), 0);
-            let (cd_u, kk_u, nb_u) = (cfg.c_dim as u32, cfg.kk as u32, b as u32);
-            enc.set_bytes(4, 4, &cd_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &kk_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(
-                MTLSize::new(cfg.c_dim as u64, b as u64, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            // 4. gates + qk norms
-            disp(
-                enc,
-                &c.gdngatesb,
-                &[
-                    (&a_b, 0),
-                    (&bb_b, 0),
-                    (&const_buf(c, l.a_log), 0),
-                    (&const_buf(c, l.dt_bias), 0),
-                    (&g_b, 0),
-                    (&bt_b, 0),
-                ],
-                &[cfg.nv as u32, (b * cfg.nv) as u32],
-                &[],
-                ((b * cfg.nv) as u64, 64),
-            );
-            disp(
-                enc,
-                &c.gdnqknb,
-                &[(&cq_b, 0), (&iq_b, 0), (&ik_b, 0)],
-                &[cfg.nk as u32, cfg.dk as u32, cfg.c_dim as u32, b as u32],
-                &[],
-                (((b * cfg.nk) as u64).div_ceil(8) * 256, 256),
-            );
+                // 3. conv over the virtual sequence
+                enc.set_compute_pipeline_state(&c.gdnconvb);
+                enc.set_buffer(0, Some(&qkv_b), 0);
+                enc.set_buffer(1, Some(&s_ring), 0);
+                enc.set_buffer(2, Some(&const_buf(c, l.conv1d)), 0);
+                enc.set_buffer(3, Some(&cq_b), 0);
+                let (cd_u, kk_u, nb_u) = (cfg.c_dim as u32, cfg.kk as u32, b as u32);
+                enc.set_bytes(4, 4, &cd_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &kk_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(
+                    MTLSize::new(cfg.c_dim as u64, b as u64, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                // 4. gates + qk norms
+                disp(
+                    enc,
+                    &c.gdngatesb,
+                    &[
+                        (&a_b, 0),
+                        (&bb_b, 0),
+                        (&const_buf(c, l.a_log), 0),
+                        (&const_buf(c, l.dt_bias), 0),
+                        (&g_b, 0),
+                        (&bt_b, 0),
+                    ],
+                    &[cfg.nv as u32, (b * cfg.nv) as u32],
+                    &[],
+                    ((b * cfg.nv) as u64, 64),
+                );
+                disp(
+                    enc,
+                    &c.gdnqknb,
+                    &[(&cq_b, 0), (&iq_b, 0), (&ik_b, 0)],
+                    &[cfg.nk as u32, cfg.dk as u32, cfg.c_dim as u32, b as u32],
+                    &[],
+                    (((b * cfg.nk) as u64).div_ceil(8) * 256, 256),
+                );
+            };
+            let Some(enc_o) = self.input_projections(enc, &[(l.qkv, &qkv_b), (l.z, &z_b)], hosted, Some(&early)) else {
+                return false;
+            };
             // 5. recurrence over the b positions (outputs; prefill also
             //    writes the state back and shifts the ring right here)
+            let enc_o = self.cut(enc_o, "gdn-in");
+            let enc: &metal::ComputeCommandEncoderRef = &enc_o;
             if !verify_skip('s') {
                 let mode = if self.prefill { 3 } else { 1 };
                 Self::state_dispatch(
@@ -24018,8 +24657,14 @@ impl VerifyGraph {
                 }
             }
             // 6. out_proj → d; 7. post-norm + FFN
+            let enc_o = self.cut(enc_o, "gdn-state");
+            let enc: &metal::ComputeCommandEncoderRef = &enc_o;
             self.gemm(enc, l.out, &of_b, &self.d_b, &self.ones);
+            let enc_o = self.cut(enc_o, "gdn-out");
+            let enc: &metal::ComputeCommandEncoderRef = &enc_o;
             self.post_ffn(enc, l.post_norm, &l.ffn);
+            let enc_o = self.cut(enc_o, "gdn-post");
+            let enc: &metal::ComputeCommandEncoderRef = &enc_o;
             enc.end_encoding();
             if !self.ane_finish() {
                 return false;
@@ -24091,6 +24736,9 @@ impl VerifyGraph {
         if !self.attn_ok(l, p) {
             return false;
         }
+        if !self.begin_layer(true) {
+            return false;
+        }
         let c = self.tg.c;
         let b = self.b;
         // A sealed layer's rows go through its device state, and no mirror exists.
@@ -24103,7 +24751,7 @@ impl VerifyGraph {
         };
         let mirror = if o1dev.is_some() { None } else { Some({
             let mut reg = c.kv_mirrors.lock().unwrap();
-            let need = p.cpu_stored + b;
+            let need = p.cpu_stored + b + self.rows_after;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
                 k: c._device
                     .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
@@ -24155,21 +24803,30 @@ impl VerifyGraph {
             entry.stored += b;
             out
         }) };
+        // `k` and `v` first: the GPU's share of the projections leads the ANE's.
+        let hosted = self.host_norm(l.attn_norm, &[l.wk, l.wv, l.wq]);
         let cmd = self.ensure_cmd();
-        let enc = cmd.new_compute_command_encoder();
-        self.rows_norm(enc, l.attn_norm);
+        let enc = cmd.new_compute_command_encoder().to_owned();
+        if !hosted {
+            self.rows_norm(&enc, l.attn_norm);
+        }
         let nhd = p.nh * p.hd;
         let kvd = p.nkv * p.hd;
         let bc = self.bc;
         let q_b = Self::vbuf(c, 21, 0, bc * l.wq.1 * 4);
-        let k_b = Self::vbuf(c, 22, 0, bc * kvd * 4);
-        let v_b = Self::vbuf(c, 23, 0, bc * kvd * 4);
+        // A half's own `k` and `v`: its command that computes them and the one that reads them
+        // may have the other half's between them.
+        let lane_slot = if self.prefill && self.lane > 0 { 900 + self.lane } else { 0 };
+        let k_b = Self::vbuf(c, 22, lane_slot, bc * kvd * 4);
+        let v_b = Self::vbuf(c, 23, lane_slot, bc * kvd * 4);
         let qr_b = Self::vbuf(c, 24, 0, bc * nhd * 4);
         let g_b = Self::vbuf(c, 25, 0, bc * nhd * 4);
         let ao_b = Self::vbuf(c, 26, 0, bc * nhd * 4);
-        self.gemm(enc, l.wq, &self.n_b, &q_b, &self.ones);
-        self.gemm(enc, l.wk, &self.n_b, &k_b, &self.ones);
-        self.gemm(enc, l.wv, &self.n_b, &v_b, &self.ones);
+        let Some(enc_o) = self.input_projections(enc, &[(l.wk, &k_b), (l.wv, &v_b), (l.wq, &q_b)], hosted, None) else {
+            return false;
+        };
+        let enc_o = self.cut(enc_o, "attn-in");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         let flags = (p.output_gate as u32)
             | ((p.q_norm.is_some() as u32) << 1)
             | ((p.k_norm.is_some() as u32) << 2)
@@ -24245,6 +24902,8 @@ impl VerifyGraph {
         }
         let (k_mb, v_mb, cap, stored) = mirror.unwrap();
         // append the b rows
+        let enc_o = self.cut(enc_o, "attn-rope");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         enc.set_compute_pipeline_state(&c.kvappb);
         enc.set_buffer(0, Some(&k_b), 0);
         enc.set_buffer(1, Some(&v_b), 0);
@@ -24264,8 +24923,16 @@ impl VerifyGraph {
             MTLSize::new(kvd as u64, b as u64, 1),
             MTLSize::new(256, 1, 1),
         );
+        let enc_o = self.cut(enc_o, "attn-append");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         let thr = gqa_blk_threshold();
-        let blk = b >= 2
+        let gemm = self.prefill
+            && !verify_skip('a')
+            && encode_attend_gemm(
+                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
+            );
+        let blk = !gemm
+            && b >= 2
             && thr > 0
             && stored + b > thr
             && !verify_skip('a')
@@ -24273,7 +24940,7 @@ impl VerifyGraph {
                 c, enc, &qr_b, &k_mb, &v_mb, 0, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
                 false,
             );
-        if b >= 2 && !blk {
+        if b >= 2 && !blk && !gemm {
             // the chunk attend: one simdgroup per (row, head), row e over
             // positions 0..=stored+e (one dispatch; the per-row flash split
             // below stays for the single row)
@@ -24340,6 +25007,8 @@ impl VerifyGraph {
                 ((sgs * p.hd + 2 * sgs) * 4) as u64,
             );
         }
+        let enc_o = self.cut(enc_o, "attn-loop");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         if p.output_gate {
             disp(
                 enc,
@@ -24351,7 +25020,11 @@ impl VerifyGraph {
             );
         }
         self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
+        let enc_o = self.cut(enc_o, "attn-out");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         self.post_ffn(enc, l.post_norm, &l.ffn);
+        let enc_o = self.cut(enc_o, "attn-post");
+        let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         enc.end_encoding();
         self.ane_finish()
     }
@@ -24677,6 +25350,132 @@ pub fn gdn_block(
 /// How many simdgroups may split one Q-head's positions in the decode
 /// attend (`CMF_GQA_SPLIT`, default 8). More splitting buys parallelism
 /// at depth and costs a wider threadgroup-memory combine.
+/// How a prompt chunk's rows attend (`CMF_ATTN_GEMM`): 1, the default, three GEMMs per KV group
+/// with fp16 operand tiles; 2 (`f32`) the same with f32 tiles; 0 (`0`) the streaming kernels.
+fn attn_gemm_mode() -> u8 {
+    static V: OnceLock<u8> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("CMF_ATTN_GEMM").as_deref() {
+        Ok("0") => 0,
+        Ok("f32") => 2,
+        _ => 1,
+    })
+}
+
+/// The bytes of scores one pass of the GEMM attend may hold (`CMF_ATTN_GEMM_MB`, default 64).
+fn attn_gemm_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CMF_ATTN_GEMM_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=4096).contains(v))
+            .unwrap_or(64)
+            << 20
+    })
+}
+
+/// A prompt chunk's attend as GEMMs, the chunk graph's form: per KV group the scores
+/// `Q·Kᵀ·scale` of its query heads' rows, a causal softmax over each, and `P·V`. `q` and `ao`
+/// are `[nb][nh][hd]`; row e attends positions 0..=stored+e of the mirror, which already holds
+/// the chunk's own rows. The streaming kernel walks K and V once per (row, head) and ran at a
+/// fifth of the GEMM's rate (Qwen3.8-27B, 256 rows at 3 600 tokens on the M4: 41-48 ms of a
+/// layer's 60). Rows go in passes that keep the scores under `attn_gemm_bytes`, and a pass
+/// computes only the positions its rows can see. False encodes nothing.
+#[allow(clippy::too_many_arguments)]
+fn encode_attend_gemm(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    q: &Buffer,
+    k_mb: &Buffer,
+    v_mb: &Buffer,
+    ao: &Buffer,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    stored: usize,
+    nb: usize,
+    scale: f32,
+) -> bool {
+    let mode = attn_gemm_mode();
+    if mode == 0 || nkv == 0 || nh % nkv != 0 || hd % 32 != 0 || hd > 256 || nb < 32 {
+        return false;
+    }
+    let exact = if mode == 2 {
+        match moe_q8::pipes(c) {
+            Some(p) => Some(p),
+            None => return false,
+        }
+    } else {
+        None
+    };
+    let hpk = nh / nkv;
+    let per_row = hpk * (stored + nb) * 4;
+    let pass = (attn_gemm_bytes() / per_row / 32 * 32).clamp(32, nb.max(32));
+    let qp = VerifyGraph::vbuf(c, 41, 0, nh * pass.min(nb) * hd * 4);
+    let ap = VerifyGraph::vbuf(c, 42, 0, nh * pass.min(nb) * hd * 4);
+    let scores = VerifyGraph::vbuf(c, 43, 0, hpk * pass.min(nb) * (stored + nb) * 4);
+    let words = |enc: &metal::ComputeCommandEncoderRef, at: u64, w: &[u32]| {
+        for (i, v) in w.iter().enumerate() {
+            enc.set_bytes(at + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+        }
+    };
+    for c0 in (0..nb).step_by(pass) {
+        let n = pass.min(nb - c0);
+        let ncur = stored + c0 + n;
+        let m_rows = hpk * n;
+        let row_off = (c0 * nh * hd * 4) as u64;
+        // [n][nh][hd] → [nh][n][hd]: a group's rows are then one panel.
+        enc.set_compute_pipeline_state(&c.packh);
+        enc.set_buffer(0, Some(q), row_off);
+        enc.set_buffer(1, Some(&qp), 0);
+        words(enc, 2, &[n as u32, nh as u32, hd as u32, n as u32]);
+        enc.dispatch_threads(MTLSize::new((n * nh * hd) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        for g in 0..nkv {
+            let koff = (g * cap * hd * 4) as u64;
+            let poff = (g * hpk * n * hd * 4) as u64;
+            match exact {
+                Some(p) => moe_q8::set_att_nt(p, enc),
+                None => enc.set_compute_pipeline_state(&mm_pipeline(c, 0, hd, 2)),
+            }
+            enc.set_buffer(0, Some(k_mb), koff);
+            enc.set_buffer(1, Some(&qp), poff);
+            enc.set_buffer(2, Some(&scores), 0);
+            words(enc, 3, &[hd as u32, ncur as u32, m_rows as u32]);
+            enc.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((m_rows as u64).div_ceil(32), (ncur as u64).div_ceil(64), 1),
+                MTLSize::new(128, 1, 1),
+            );
+            enc.set_compute_pipeline_state(&c.csmax);
+            enc.set_buffer(0, Some(&scores), 0);
+            words(enc, 1, &[ncur as u32, (stored + c0) as u32, n as u32, m_rows as u32]);
+            enc.dispatch_thread_groups(
+                MTLSize::new((m_rows as u64).div_ceil(8), 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            match exact {
+                Some(p) => moe_q8::set_att_nn(p, enc),
+                None => enc.set_compute_pipeline_state(&mm_pipeline(c, hd, 0, 3)),
+            }
+            enc.set_buffer(0, Some(v_mb), koff);
+            enc.set_buffer(1, Some(&scores), 0);
+            enc.set_buffer(2, Some(&ap), poff);
+            words(enc, 3, &[ncur as u32, hd as u32, m_rows as u32]);
+            enc.dispatch_thread_groups(
+                MTLSize::new((m_rows as u64).div_ceil(32), (hd as u64).div_ceil(64), 1),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+        enc.set_compute_pipeline_state(&c.unstack);
+        enc.set_buffer(0, Some(&ap), 0);
+        enc.set_buffer(1, Some(ao), row_off);
+        words(enc, 2, &[nh as u32, n as u32, hd as u32]);
+        enc.dispatch_threads(MTLSize::new((nh * n * hd) as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+    true
+}
+
 /// The GQA-shared split-K attend for `nb` rows: `q` [nb][nh][hd] rope'd,
 /// `ao` [nb][nh][hd] out; row e attends positions 0..=stored+e. Used past
 /// `gqa_blk_threshold()` positions (below it the per-head kernels are
