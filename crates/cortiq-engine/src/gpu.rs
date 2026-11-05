@@ -2430,7 +2430,65 @@ pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
     false
 }
 
-/// End the capture: per layer, the rows of every call since
+/// What the capture holds so far, off the card; it stays armed.
+pub fn o1_qcap_drain() -> Option<Vec<(usize, Vec<f32>)>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_qcap_drain();
+    }
+    None
+}
+
+/// The accepted rows of a verify: the sealed layers' state moves over them.
+pub fn o1_spec_commit(_kv_id: u64, _pos0: usize, _rows: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_spec_commit(_kv_id, _pos0, _rows);
+    }
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::o1c::spec_commit(_kv_id, _rows);
+    }
+    false
+}
+
+/// Copy sealed prompt chunks' rows to host memory until `o1_acap_end`.
+pub fn o1_acap_begin() {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::o1_acap_begin();
+    }
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::o1c::acap_begin();
+    }
+}
+
+pub fn o1_acap_end() {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::o1_acap_end();
+    }
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::o1c::cap_end();
+    }
+}
+
+/// The rows captured since the last call: (layer, queries, keys, values).
+pub fn o1_acap_take() -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_acap_take();
+    }
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return Some(crate::gpu_metal::o1c::cap_take());
+    }
+    None
+}
+
+/// End the capture and read what is left: per layer, rows of the calls since
 /// `o1_qcap_begin`, position-major `[rows × nh × hd]`.
 pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
     #[cfg(feature = "gpu")]

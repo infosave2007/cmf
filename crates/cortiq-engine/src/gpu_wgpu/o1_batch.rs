@@ -514,6 +514,7 @@ pub(crate) fn encode(
     scratch: &wgpu::Buffer,
     out: &wgpu::Buffer,
     rows: usize,
+    commit: bool,
 ) {
     let bind = |l: &wgpu::BindGroupLayout, e: &[(u32, &wgpu::Buffer)]| {
         let entries: Vec<_> = e.iter().map(|(i, b)| bind_buf(*i, b)).collect();
@@ -524,6 +525,8 @@ pub(crate) fn encode(
         })
     };
     let ghm = geom.g * geom.hpg * geom.m;
+    let stages = super::o1_stages::chunk_pipes(c, geom.hpg)
+        .filter(|_| geom.d == geom.dv && geom.d % 4 == 0 && geom.m <= 32 && !geom.rect_fm);
     let mut pass = begin_pass(enc);
     let mut r0 = 0;
     while r0 < rows {
@@ -601,9 +604,75 @@ pub(crate) fn encode(
         pass.set_pipeline(&p.far_e.0);
         pass.set_bind_group(0, &bg_far, &[]);
         pass.dispatch_workgroups(ghm as u32, 1, 1);
-        pass.set_pipeline(&p.attend.0);
-        pass.set_bind_group(0, &bg_att, &[]);
-        pass.dispatch_workgroups((geom.g * geom.hpg) as u32, kk as u32, 1);
+        match stages {
+            Some(sp) => super::o1_stages::encode_chunk(c, &mut pass, sp, st, geom, q, kb, vb, scratch, out, &u, kk),
+            None => {
+                pass.set_pipeline(&p.attend.0);
+                pass.set_bind_group(0, &bg_att, &[]);
+                pass.dispatch_workgroups((geom.g * geom.hpg) as u32, kk as u32, 1);
+            }
+        }
+        if commit {
+            pass.set_pipeline(&p.far_commit.0);
+            pass.set_bind_group(0, &bg_fc, &[]);
+            pass.dispatch_workgroups(ghm as u32, 1, 1);
+            pass.set_pipeline(&p.ring_commit.0);
+            pass.set_bind_group(0, &bg_rc, &[]);
+            pass.dispatch_workgroups(geom.g as u32, kk as u32, 1);
+            pass.set_pipeline(&p.meta.0);
+            pass.set_bind_group(0, &bg_meta, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        r0 += kk;
+    }
+}
+
+/// The state after `rows` rows whose attention has run: for speculation, where only the
+/// accepted part of a chunk stays. `kb` and `vb` hold the chunk's keys and values.
+pub(crate) fn commit_only(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    p: &Pipes,
+    st: &State<'_>,
+    geom: Geom,
+    kb: &wgpu::Buffer,
+    vb: &wgpu::Buffer,
+    scratch: &wgpu::Buffer,
+    rows: usize,
+) {
+    let bind = |l: &wgpu::BindGroupLayout, e: &[(u32, &wgpu::Buffer)]| {
+        let entries: Vec<_> = e.iter().map(|(i, b)| bind_buf(*i, b)).collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: l, entries: &entries })
+    };
+    let ghm = geom.g * geom.hpg * geom.m;
+    let mut pass = begin_pass(enc);
+    let mut r0 = 0;
+    while r0 < rows {
+        let kk = OB_K.min(rows - r0);
+        let u = uniform_rope(
+            c,
+            [
+                geom.hpg as u32,
+                geom.m as u32,
+                geom.w as u32,
+                (geom.ns as u32) | (u32::from(geom.rect_fm) << 8),
+                geom.d as u32,
+                geom.dv as u32,
+                geom.scale.to_bits(),
+                kk as u32,
+                (geom.g * geom.hpg) as u32,
+                geom.g as u32,
+                r0 as u32,
+                0,
+            ],
+        );
+        let bg_far = bind(&p.far_e.1, &[(0, st.meta), (1, st.ring_k), (6, st.qt), (8, st.mz), (13, scratch), (15, &u)]);
+        let bg_fc = bind(&p.far_commit.1, &[(0, st.meta), (2, st.ring_v), (8, st.mz), (9, st.that), (13, scratch), (15, &u)]);
+        let bg_rc = bind(&p.ring_commit.1, &[(0, st.meta), (1, st.ring_k), (2, st.ring_v), (11, kb), (12, vb), (15, &u)]);
+        let bg_meta = bind(&p.meta.1, &[(0, st.meta), (15, &u)]);
+        pass.set_pipeline(&p.far_e.0);
+        pass.set_bind_group(0, &bg_far, &[]);
+        pass.dispatch_workgroups(ghm as u32, 1, 1);
         pass.set_pipeline(&p.far_commit.0);
         pass.set_bind_group(0, &bg_fc, &[]);
         pass.dispatch_workgroups(ghm as u32, 1, 1);
@@ -842,7 +911,7 @@ mod tests {
                         mz: &dv.mz,
                         that: &dv.that,
                     };
-                    encode(c, &mut enc, p, &st, geom, &qb, &kb, &vb, &sb, &ob, rows);
+                    encode(c, &mut enc, p, &st, geom, &qb, &kb, &vb, &sb, &ob, rows, true);
                 }
                 let mut got = vec![0f32; rows * nh * d];
                 assert!(readback(

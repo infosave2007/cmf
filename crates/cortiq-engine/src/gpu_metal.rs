@@ -39,6 +39,7 @@ pub mod vit;
 pub mod uocr;
 // Dory's looped stack.
 pub mod dory;
+pub mod o1c;
 pub mod primal_vae;
 pub mod mhc;
 
@@ -19233,6 +19234,11 @@ pub(crate) struct O1MetalDev {
     dv: usize,
     nsrect: u32,
     scale: f32,
+    /// Sinks, past what `nsrect` holds for the old kernels.
+    ns: usize,
+    /// A verify's keys and values until its accepted part is known.
+    spec_k: Buffer,
+    spec_v: Buffer,
 }
 unsafe impl Send for O1MetalDev {}
 
@@ -19339,6 +19345,9 @@ fn o1_ensure_metal(
         dv,
         nsrect: (ns as u32) | (u32::from(rect_fm) << 8),
         scale: g0.scale,
+        ns,
+        spec_k: c._device.new_buffer((o1c::OB_K * gcnt * d * 4) as u64, MTLResourceOptions::StorageModeShared),
+        spec_v: c._device.new_buffer((o1c::OB_K * gcnt * dv * 4) as u64, MTLResourceOptions::StorageModeShared),
     };
     let ret = dev.clone();
     c.o1m.lock().unwrap().insert((kv_id, li), dev);
@@ -20837,10 +20846,13 @@ impl TokenGraph {
         // ── O(1) layer: ensure the device state FIRST (upload on seal
         // epoch change) — a refusal must leave nothing half-encoded.
         let o1dev = match &p.o1 {
-            Some(o) => match o1_ensure_metal(self.c, p.kv_id, p.layer, &o.views, o.epoch, 196) {
-                Some(d) => Some(d),
-                None => return false,
-            },
+            Some(o) => {
+                let cap = if o1c::pipes(self.c).is_some() { o1c::MAX_NEAR } else { 196 };
+                match o1_ensure_metal(self.c, p.kv_id, p.layer, &o.views, o.epoch, cap) {
+                    Some(d) => Some(d),
+                    None => return false,
+                }
+            }
             None => None,
         };
         // ── KV mirror prep (CPU side; previous token already synced).
@@ -21146,7 +21158,10 @@ impl TokenGraph {
         }
         self.bar(enc);
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
-        if let Some(od) = &o1dev {
+        if let Some(od) = o1dev.as_ref().filter(|od| o1c::admits(self.c, od)) {
+            // 4-5. O(1), a chunk of one row: the near window up to 2052 keys in short threads.
+            o1c::encode(self.c, enc, self.in_conc.get(), od, &qr_b, &k_b, &v_b, &ao_b, 1, true);
+        } else if let Some(od) = &o1dev {
             // 4-5. O(1): absorb the ring slot being evicted into the far
             // accumulators, push this token's K/V, then the whole
             // Nystrom step into ao_b. The serial encoder is the ordering
@@ -23477,7 +23492,7 @@ impl VerifyGraph {
     /// Pre-flight for a full-attention layer (F32 KV mirror, no o1).
     pub fn attn_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         self.tg.attn_device_ok(l, p)
-            && p.o1.is_none()
+            && (p.o1.is_none() || o1c::pipes(self.tg.c).is_some())
             // The batched twins attend full context, ungated.
             && p.window.is_none()
             // `chunk_attend` has no value-less softmax column.  A b=1
@@ -23937,7 +23952,15 @@ impl VerifyGraph {
         }
         let c = self.tg.c;
         let b = self.b;
-        let (k_mb, v_mb, cap, stored) = {
+        // A sealed layer's rows go through its device state, and no mirror exists.
+        let o1dev = match &p.o1 {
+            Some(o) => match o1_ensure_metal(c, p.kv_id, p.layer, &o.views, o.epoch, o1c::MAX_NEAR) {
+                Some(d) if o1c::admits(c, &d) => Some(d),
+                _ => return false,
+            },
+            None => None,
+        };
+        let mirror = if o1dev.is_some() { None } else { Some({
             let mut reg = c.kv_mirrors.lock().unwrap();
             let need = p.cpu_stored + b;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
@@ -23990,7 +24013,7 @@ impl VerifyGraph {
             let out = (entry.k.clone(), entry.v.clone(), entry.cap, entry.stored);
             entry.stored += b;
             out
-        };
+        }) };
         let cmd = self.ensure_cmd();
         let enc = cmd.new_compute_command_encoder();
         self.rows_norm(enc, l.attn_norm);
@@ -24060,6 +24083,26 @@ impl VerifyGraph {
                 MTLSize::new(256, 1, 1),
             );
         }
+        o1c::capture(c, enc, p.layer, o1dev.is_some(), &qr_b, &k_b, &v_b, b * nhd, b * kvd);
+        if let Some(od) = &o1dev {
+            // A prompt's rows are real. A verify's wait for the accepted part.
+            if !o1c::encode(c, enc, false, od, &qr_b, &k_b, &v_b, &ao_b, b, self.prefill) {
+                enc.end_encoding();
+                return false;
+            }
+            if !self.prefill {
+                o1c::copy(c, enc, false, &k_b, &od.spec_k, b * kvd * 4);
+                o1c::copy(c, enc, false, &v_b, &od.spec_v, b * kvd * 4);
+            }
+            if p.output_gate {
+                disp(enc, &c.sgate, &[(&ao_b, 0), (&g_b, 0)], &[(b * nhd) as u32], &[], ((b * nhd) as u64, 256));
+            }
+            self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
+            self.post_ffn(enc, l.post_norm, &l.ffn);
+            enc.end_encoding();
+            return true;
+        }
+        let (k_mb, v_mb, cap, stored) = mirror.unwrap();
         // append the b rows
         enc.set_compute_pipeline_state(&c.kvappb);
         enc.set_buffer(0, Some(&k_b), 0);

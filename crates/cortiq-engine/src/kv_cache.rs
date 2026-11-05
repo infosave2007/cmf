@@ -149,6 +149,12 @@ pub struct LayerKvCache {
     /// attention functions return only a hidden vector, so the pipeline
     /// consumes this side channel at its next forward boundary.
     o1_error: Option<String>,
+    /// Rows the next seal keeps exact, ascending.
+    pub(crate) o1_keep: Vec<usize>,
+    /// One row in this many is in the query trace.
+    o1_q_stride: usize,
+    /// The geometry of the last `o1_begin`.
+    o1_params: Option<(usize, usize, usize, crate::nystrom::O1Rect)>,
     /// Set when a collecting state actually becomes sealed. Pipeline owns
     /// the epoch bump and consumes this bit after a complete forward.
     o1_transitioned: bool,
@@ -212,7 +218,68 @@ pub const WIRE_MAGIC: &[u8; 4] = b"CMFS";
 /// Current wire version.
 pub const WIRE_VERSION: u32 = 2;
 
+/// A layer's exact rows, for the choice of those a seal keeps.
+pub(crate) struct GroupRows<'a> {
+    k: &'a [Vec<f32>],
+    v: &'a [Vec<f32>],
+    hd: usize,
+}
+
+impl crate::dory::LayerRows for GroupRows<'_> {
+    fn key(&self, kh: usize, r: usize) -> &[f32] {
+        &self.k[kh][r * self.hd..(r + 1) * self.hd]
+    }
+    fn value(&self, kh: usize, r: usize) -> &[f32] {
+        &self.v[kh][r * self.hd..(r + 1) * self.hd]
+    }
+}
+
 impl LayerKvCache {
+    pub(crate) fn o1_set_q_stride(&mut self, stride: usize) {
+        self.o1_q_stride = stride.max(1);
+    }
+
+    /// The whole query trace at once, `[rows / stride][num_heads][hd]`.
+    pub(crate) fn o1_set_q_trace(&mut self, q: Vec<f32>) {
+        if let Some(O1State::Collecting { q_buf, .. }) = &mut self.o1 {
+            *q_buf = q;
+        }
+    }
+
+    /// Back to collecting over rows kept in host memory, `[rows][nkv][hd]`: the next
+    /// seal builds this layer's far field anew from them.
+    pub(crate) fn o1_recollect(&mut self, k: &[f32], v: &[f32], q: Vec<f32>, stride: usize, rows: usize) -> bool {
+        let Some(O1State::Sealed { .. }) = &self.o1 else { return false };
+        let (hd, nk) = (self.head_dim, self.num_kv_heads);
+        if self.o1_params.is_none() {
+            return false;
+        }
+        let (m, w, sink, rect) = self.o1_params.unwrap();
+        for g in 0..nk {
+            let mut kg = Vec::with_capacity(rows * hd);
+            let mut vg = Vec::with_capacity(rows * hd);
+            for r in 0..rows {
+                kg.extend_from_slice(&k[(r * nk + g) * hd..(r * nk + g + 1) * hd]);
+                vg.extend_from_slice(&v[(r * nk + g) * hd..(r * nk + g + 1) * hd]);
+            }
+            self.k[g] = kg;
+            self.v[g] = vg;
+        }
+        self.seq_len = rows;
+        self.o1_q_stride = stride.max(1);
+        self.o1_keep.clear();
+        self.o1 = Some(O1State::Collecting { m, w, sink, rect, seal_at: Some(rows), q_buf: q });
+        true
+    }
+
+    pub(crate) fn o1_is_collecting(&self) -> bool {
+        matches!(self.o1, Some(O1State::Collecting { .. }))
+    }
+
+    pub(crate) fn group_rows(&self) -> GroupRows<'_> {
+        GroupRows { k: &self.k, v: &self.v, hd: self.head_dim }
+    }
+
     pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
         Self {
             sinks: None,
@@ -237,6 +304,9 @@ impl LayerKvCache {
             linear_wire_allowed: true,
             o1: None,
             o1_error: None,
+            o1_keep: Vec::new(),
+            o1_q_stride: 1,
+            o1_params: None,
             o1_transitioned: false,
             bounded: None,
             wire_kind: WireKind::Full,
@@ -529,6 +599,9 @@ impl LayerKvCache {
             seal_at,
             q_buf: Vec::new(),
         });
+        self.o1_keep.clear();
+        self.o1_q_stride = 1;
+        self.o1_params = Some((m, w, sink, rect));
         self.o1_error = None;
         self.o1_transitioned = false;
     }
@@ -702,8 +775,11 @@ impl LayerKvCache {
         let expected_k = t
             .checked_mul(hd)
             .ok_or_else(|| "o1 seal: KV row length overflow".to_string())?;
-        let expected_q = expected_k
-            .checked_mul(num_heads)
+        let stride = self.o1_q_stride;
+        let expected_q = t
+            .div_ceil(stride)
+            .checked_mul(hd)
+            .and_then(|v| v.checked_mul(num_heads))
             .ok_or_else(|| "o1 seal: query trace length overflow".to_string())?;
         if q_len != expected_q {
             return Err(format!(
@@ -738,7 +814,7 @@ impl LayerKvCache {
             for hh in 0..hpk {
                 let h = g * hpk + hh;
                 for p in 0..t {
-                    let src = (p * num_heads + h) * hd;
+                    let src = (p / stride * num_heads + h) * hd;
                     let dst = (hh * t + p) * hd;
                     qh[dst..dst + hd].copy_from_slice(&q_buf[src..src + hd]);
                 }
@@ -758,11 +834,26 @@ impl LayerKvCache {
             );
             let calib = crate::nystrom::O1Calib::load(self.wire_layer, g, hd, hpk);
             let wg = crate::nystrom::wide_window(self.wire_layer, g).unwrap_or(w);
-            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk)
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink + self.o1_keep.len(), hpk)
                 .with_window(wg)
                 .with_rect(rect)
                 .with_calib(calib);
-            st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
+            if self.o1_keep.is_empty() {
+                st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
+            } else {
+                // The kept rows go right behind the sinks, and leave the far field.
+                let order = crate::dory::seal_order(t, sink, &self.o1_keep);
+                let pick = |src: &[f32]| -> Vec<f32> {
+                    let mut out = Vec::with_capacity(t * hd);
+                    for &r in &order {
+                        out.extend_from_slice(&src[r as usize * hd..(r as usize + 1) * hd]);
+                    }
+                    out
+                };
+                let qo: Vec<Vec<f32>> = qs.iter().map(|q| pick(q)).collect();
+                let qr: Vec<&[f32]> = qo.iter().map(|q| &q[..]).collect();
+                st.prefill_group(&qr, &pick(&self.k[g]), &pick(&self.v[g]), t, hd, hd);
+            }
             groups.push(st);
         }
         // The states now carry everything decode needs — release the

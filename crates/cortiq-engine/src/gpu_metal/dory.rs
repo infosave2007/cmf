@@ -892,7 +892,11 @@ fn seal(c: &Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows: usize)
     let keep: Vec<usize> = match &m.exact {
         Some(x) => {
             let view = |b: &Buffer, n: usize| unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n) };
-            let layers: Vec<(&[f32], &[f32])> = full.iter().map(|&o| (view(&d.slots[o][0].k, rows * nk * hd), view(&d.slots[o][0].v, rows * nk * hd))).collect();
+            let views: Vec<crate::dory::FlatRows> = full
+                .iter()
+                .map(|&o| crate::dory::FlatRows { k: view(&d.slots[o][0].k, rows * nk * hd), v: view(&d.slots[o][0].v, rows * nk * hd), nk, hd })
+                .collect();
+            let layers: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
             crate::dory::pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
         }
         None => Vec::new(),

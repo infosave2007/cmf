@@ -2040,7 +2040,12 @@ impl Pipeline {
         let cap = std::env::var("CMF_MAX_SEQ")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(32_768);
+            // A turbo file's rows past the seal take no device memory.
+            .unwrap_or(if model.header.provenance.as_ref().is_some_and(|p| p.get("o1_turbo").is_some()) {
+                usize::MAX
+            } else {
+                32_768
+            });
         let max_seq_len = arch.max_position_embeddings.min(cap);
 
         // Looped Transformer: total virtual layers = physical × num_loops.
@@ -2863,7 +2868,23 @@ impl Pipeline {
                     .into(),
             ));
         }
-        let o1 = match crate::nystrom::o1_from_env() {
+        let o1_env = crate::nystrom::o1_from_env();
+        // A turbo file: the far field comes on for long prompts only, so nothing is set now.
+        if matches!(o1_env, crate::nystrom::O1Env::Unset) {
+            let hint = model.header.provenance.as_ref().and_then(|p| p.get("o1_turbo"));
+            if let Some(h) = hint {
+                let field = |k: &str| h.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+                let weights = load_f32(model, "o1.exact.weights", &Overlay::None).unwrap_or_default();
+                if let (Some(cfg), Some(seal), Some(rows)) = (crate::nystrom::O1Cfg::from_json(h), field("seal"), field("exact_rows")) {
+                    pipeline.o1_turbo = Some(crate::pipeline::O1Turbo {
+                        cfg,
+                        seal: crate::pipeline::o1_seal_for_card(seal, model.tensors.iter().map(|e| e.nbytes).sum()),
+                        exact: crate::dory::ExactRows { weights: std::sync::Arc::new(weights), budget: rows },
+                    });
+                }
+            }
+        }
+        let o1 = match o1_env {
             crate::nystrom::O1Env::Off => None,
             crate::nystrom::O1Env::On(cfg) => Some(cfg),
             crate::nystrom::O1Env::Unset => model

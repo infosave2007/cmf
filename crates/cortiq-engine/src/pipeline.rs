@@ -415,6 +415,10 @@ pub struct Pipeline {
     /// O(1) Nyström attention setting (CLI/env/header-hint resolved by
     /// the caller; None = plain cache attention everywhere).
     o1_cfg: Option<crate::nystrom::O1Cfg>,
+    /// A turbo file: the far field on long prompts only (`cortiq far-turbo`).
+    pub(crate) o1_turbo: Option<O1Turbo>,
+    /// Over a far field the draft head starts at this prompt row, and counts from it.
+    mtp_pos_base: usize,
     /// Bumped once per collecting→sealed transition — the GPU state mirror
     /// re-uploads when it sees a new epoch (each fresh sealed state).
     o1_epoch: u64,
@@ -1580,6 +1584,152 @@ enum PrefillIn<'a> {
 /// otherwise indexes an empty vector, which is a panic rather than a
 /// fallback. Every call site goes through here so the next such
 /// architecture is one line, not four.
+/// What a turbo file's header asks for.
+#[derive(Clone)]
+pub(crate) struct O1Turbo {
+    pub(crate) cfg: crate::nystrom::O1Cfg,
+    /// A prompt this long goes over to the far field; a shorter one stays exact.
+    pub(crate) seal: usize,
+    pub(crate) exact: crate::dory::ExactRows,
+}
+
+/// Rows of a prompt read exactly on the card before the first seal, at most. Past them
+/// the rows leave the card as they are read.
+const O1_PREFIX_MAX: usize = 8192;
+
+/// Where a turbo file seals on this card. Exact rows take about 190 KB each on Qwen3.8-27B,
+/// and the state, the scratch and the draft head about 1.8 GB beside the weights: a 16 GB card
+/// has no room for 8192 rows, and gives up a little prompt speed to keep the ceiling.
+/// `CMF_O1_PREFIX_MAX` chooses by hand.
+pub(crate) fn o1_seal_for_card(seal: usize, weight_bytes: u64) -> usize {
+    if let Some(s) = std::env::var("CMF_O1_PREFIX_MAX").ok().and_then(|v| v.parse().ok()) {
+        return s;
+    }
+    let mut budget = crate::gpu::vram_budget();
+    // Unified memory: what the system lets the GPU keep, and a row there lives twice, in the
+    // host's cache and in the mirror.
+    let mut row = 190u64 << 10;
+    #[cfg(target_os = "macos")]
+    if budget == u64::MAX {
+        budget = crate::gpu_metal::working_set_bytes();
+        row *= 2;
+    }
+    if budget == 0 || budget == u64::MAX {
+        return seal;
+    }
+    let room = budget.saturating_sub(weight_bytes + (1800 << 20));
+    seal.min(((room / row) as usize).max(O1_PREFIX_MAX / 2))
+}
+
+/// Rows of an archive as they come in: in RAM, or in a file (`CMF_O1_SPILL=DIR`) when
+/// RAM is short and a disk is not.
+enum ArchStore {
+    Ram(Vec<f32>),
+    Disk { path: std::path::PathBuf, file: std::io::BufWriter<std::fs::File> },
+}
+
+impl ArchStore {
+    fn new(dir: Option<&std::path::Path>, name: String) -> Result<Self, String> {
+        let Some(dir) = dir else { return Ok(Self::Ram(Vec::new())) };
+        std::fs::create_dir_all(dir).map_err(|e| format!("O(1) spill {}: {e}", dir.display()))?;
+        let path = dir.join(format!("cortiq-o1-{}-{name}.rows", std::process::id()));
+        let file = std::fs::File::create(&path).map_err(|e| format!("O(1) spill {}: {e}", path.display()))?;
+        Ok(Self::Disk { path, file: std::io::BufWriter::with_capacity(1 << 22, file) })
+    }
+
+    fn push(&mut self, rows: &[f32]) -> Result<(), String> {
+        match self {
+            Self::Ram(v) => {
+                v.extend_from_slice(rows);
+                Ok(())
+            }
+            Self::Disk { path, file } => {
+                use std::io::Write;
+                // SAFETY: an `f32` slice is valid as bytes of four times its length.
+                let bytes = unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4) };
+                file.write_all(bytes).map_err(|e| format!("O(1) spill {}: {e}", path.display()))
+            }
+        }
+    }
+
+    fn freeze(mut self) -> Result<ArchRows, String> {
+        match self {
+            Self::Ram(ref mut v) => Ok(ArchRows::Ram(std::mem::take(v))),
+            Self::Disk { ref mut path, ref mut file } => {
+                use std::io::Write;
+                file.flush().map_err(|e| format!("O(1) spill {}: {e}", path.display()))?;
+                let f = std::fs::File::open(&*path).map_err(|e| format!("O(1) spill {}: {e}", path.display()))?;
+                // SAFETY: the file is this process's own and no one writes it any more.
+                let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| format!("O(1) spill {}: {e}", path.display()))?;
+                Ok(ArchRows::Disk { map: Some(map), path: std::mem::take(path) })
+            }
+        }
+    }
+}
+
+impl Drop for ArchStore {
+    fn drop(&mut self) {
+        if let Self::Disk { path, .. } = self {
+            // A store that was frozen hands its file over; the file is gone only here if not.
+            if !path.as_os_str().is_empty() {
+                let _ = std::fs::remove_file(&*path);
+            }
+        }
+    }
+}
+
+enum ArchRows {
+    Ram(Vec<f32>),
+    Disk { map: Option<memmap2::Mmap>, path: std::path::PathBuf },
+}
+
+impl ArchRows {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Ram(v) => v,
+            Self::Disk { map, .. } => {
+                let b = map.as_ref().map_or(&[][..], |m| &m[..]);
+                // SAFETY: a page-aligned map of what `push` wrote, whole `f32`s.
+                unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<f32>(), b.len() / 4) }
+            }
+        }
+    }
+}
+
+impl Drop for ArchRows {
+    fn drop(&mut self) {
+        if let Self::Disk { map, path } = self {
+            *map = None;
+            let _ = std::fs::remove_file(&*path);
+        }
+    }
+}
+
+/// The rows of a prompt past its first seal, off the card until the far field is built
+/// anew over all of them.
+struct O1Archive {
+    dir: Option<std::path::PathBuf>,
+    layers: Vec<O1ArchLayer>,
+    rows: usize,
+    stride: usize,
+    nh: usize,
+    nk: usize,
+    hd: usize,
+}
+
+impl O1Archive {
+    fn new() -> Self {
+        Self { dir: std::env::var_os("CMF_O1_SPILL").map(Into::into), layers: Vec::new(), rows: 0, stride: 1, nh: 0, nk: 0, hd: 0 }
+    }
+}
+
+struct O1ArchLayer {
+    li: usize,
+    k: ArchStore,
+    v: ArchStore,
+    q: ArchStore,
+}
+
 impl Pipeline {
     pub(crate) fn can_prefill_batched(&self) -> bool {
         #[cfg(test)]
@@ -2816,7 +2966,8 @@ impl Pipeline {
                     // is on: full_gpu attends through the device state,
                     // and any refusal falls to the sandwich, whose CPU
                     // core routes sealed layers through the nystrom step.
-                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1"))
+                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1")
+                    || self.o1_on_graph())
                     // A projected output gate: Spark-X2.5's per-head
                     // sigmoid form only (Laguna's softplus gate is
                     // unmeasured on these paths and keeps the CPU walk).
@@ -2841,7 +2992,7 @@ impl Pipeline {
                     // sealed Nystrom state (opt-in while the port proves
                     // itself). Unsealed -> sandwich path = the CPU o1 step.
                     let o1_metal = cache.o1.is_some()
-                        && std::env::var("CMF_O1_METAL").as_deref() == Ok("1")
+                        && (std::env::var("CMF_O1_METAL").as_deref() == Ok("1") || self.o1_on_graph())
                         && cache.o1_views().is_some();
                     // The device attend takes the layer's window and RoPE
                     // table, and the per-head gate from f32 rows; a gate
@@ -4073,6 +4224,8 @@ impl Pipeline {
             dyn_phi_seen: 0,
             dyn_router: None,
             o1_cfg: None,
+            o1_turbo: None,
+            mtp_pos_base: 0,
             o1_epoch: 0,
             o1_flags: Vec::new(),
             trace: false,
@@ -4503,13 +4656,17 @@ impl Pipeline {
         if self.g4_batch_prefill() {
             return 128;
         }
+        #[cfg(target_os = "macos")]
+        if self.o1_active() && self.o1_on_graph() && crate::gpu::q1_force() && crate::gpu::enabled_here() {
+            return 128;
+        }
         // The sealed O(1) suffix of a bounded prompt (`CMF_O1_PREFILL`) on
         // the device route rides the batch graph, whose O(1) kernels take
         // the chunk in 64-row sub-chunks (`o1_batch`); 128 as the exact
         // prompt below. Without it the suffix went one position at a time.
         #[cfg(not(target_os = "macos"))]
         if self.o1_active()
-            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && self.o1_on_graph()
             && crate::gpu::enabled_here()
             && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
         {
@@ -4660,6 +4817,7 @@ impl Pipeline {
         if self.o1_cfg.is_none() {
             return Ok(false);
         }
+        self.o1_choose_exact_rows();
         let mut participating = false;
         for li in 0..self.num_layers {
             if !self.o1_flags.get(li).copied().unwrap_or(false) {
@@ -4689,6 +4847,270 @@ impl Pipeline {
                     || self.kv_cache.layers[li].seq_len == 0
                     || self.kv_cache.layers[li].o1_sealed()
             }))
+    }
+
+    /// A sealed chunk's rows join the archive.
+    fn o1_archive_chunk(&self, a: &mut O1Archive, pos: usize, bk: usize) -> Result<(), String> {
+        let got = crate::gpu::o1_acap_take().ok_or("O(1) archive: readback failed")?;
+        let qrow = a.nh * a.hd;
+        let stride = a.stride;
+        for (gl, q, k, v) in got {
+            let Some(l) = a.layers.iter_mut().find(|l| l.li == gl) else { continue };
+            l.k.push(&k)?;
+            l.v.push(&v)?;
+            for p in pos..pos + bk {
+                if p % stride == 0 {
+                    l.q.push(&q[(p - pos) * qrow..(p - pos + 1) * qrow])?;
+                }
+            }
+        }
+        a.rows = pos + bk;
+        Ok(())
+    }
+
+    /// The far field built anew over all the rows read so far, the chosen ones out of it.
+    /// One layer at a time, so RAM holds one layer's rows.
+    fn o1_seal_archive(&mut self, a: O1Archive) -> Result<bool, String> {
+        let t0 = std::time::Instant::now();
+        let (rows, stride, nk, hd) = (a.rows, a.stride, a.nk, a.hd);
+        let mut layers = Vec::with_capacity(a.layers.len());
+        for l in a.layers {
+            layers.push((l.li, l.k.freeze()?, l.v.freeze()?, l.q.freeze()?));
+        }
+        let keep = match (self.o1_exact_cfg().cloned(), self.o1_cfg.clone()) {
+            (Some(x), Some(c)) => {
+                let views: Vec<crate::dory::FlatRows> = layers.iter().map(|l| crate::dory::FlatRows { k: l.1.as_slice(), v: l.2.as_slice(), nk, hd }).collect();
+                let refs: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
+                crate::dory::pick_exact_rows(&x, &refs, rows, nk, hd, c.m, c.sink, rows.saturating_sub(c.w))
+            }
+            _ => Vec::new(),
+        };
+        let t_pick = t0.elapsed().as_secs_f64();
+        let mut all = !layers.is_empty();
+        for (li, k, v, q) in layers {
+            let num_heads = self.layer_num_heads(li);
+            let cache = &mut self.kv_cache.layers[li];
+            if !cache.o1_recollect(k.as_slice(), v.as_slice(), q.as_slice().to_vec(), stride, rows) {
+                return Err(format!("O(1) archive: layer {li} is not sealed"));
+            }
+            cache.o1_keep = keep.clone();
+            all &= cache.o1_seal_checked(num_heads)?;
+        }
+        self.o1_note_transition();
+        tracing::info!(
+            "o1: far field rebuilt over {rows} rows, {} kept exact, chosen in {t_pick:.2} s, {:.2} s in all",
+            keep.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(all)
+    }
+
+    /// A sealed prompt chunk on the device: wgpu's batch graph, or Metal's rows graph.
+    fn o1_prompt_chunk(&mut self, hiddens: &mut Vec<f32>, positions: &[usize], bk: usize) -> crate::gpu::BatchGraphOutcome {
+        #[cfg(target_os = "macos")]
+        if crate::gpu::q1_force() && self.o1_active() {
+            return match self.prefill_hiddens_metal(hiddens.clone(), positions[0], None) {
+                MetalPrefillOutcome::Completed(h) => {
+                    *hiddens = h;
+                    crate::gpu::BatchGraphOutcome::Completed
+                }
+                MetalPrefillOutcome::Declined => crate::gpu::BatchGraphOutcome::Declined,
+                MetalPrefillOutcome::Failed => crate::gpu::BatchGraphOutcome::Failed,
+            };
+        }
+        self.try_batch_graph_wgpu(hiddens, positions, bk, None)
+    }
+
+    /// `o1_prefix_on_graph` on Metal: the prompt's exact part on the rows graph, which leaves its
+    /// rows in the host cache and the mirror. Queries come from the graph, one row in `QT_STRIDE`.
+    #[cfg(target_os = "macos")]
+    fn o1_prefix_on_metal(
+        &mut self,
+        ids: &[u32],
+        chunk: usize,
+        mut arch: Option<&mut O1Archive>,
+    ) -> Result<Option<Vec<f32>>, String> {
+        const QT_STRIDE: usize = 8;
+        let o1_layers: Vec<usize> = (0..self.num_layers)
+            .filter(|&li| self.o1_flags.get(li).copied().unwrap_or(false))
+            .collect();
+        let Some(&first) = o1_layers.first() else {
+            return Ok(None);
+        };
+        let (nkv, hd) = {
+            let c = &self.kv_cache.layers[first];
+            (c.num_kv_heads, c.head_dim)
+        };
+        let nh = self.num_heads;
+        if chunk == 0
+            || o1_layers.iter().any(|&li| {
+                let c = &self.kv_cache.layers[li];
+                self.layer_num_heads(li) != nh
+                    || (c.num_kv_heads, c.head_dim) != (nkv, hd)
+                    || c.seq_len != 0
+                    || c.o1_pending_boundary().is_none()
+            })
+        {
+            return Ok(None);
+        }
+        let hs = self.hidden_size;
+        let n = ids.len();
+        let mut last = vec![0f32; hs];
+        let qrow = nh * hd;
+        let mut qs: Vec<Vec<f32>> = vec![Vec::new(); o1_layers.len()];
+        crate::gpu_metal::o1c::qcap_begin(&o1_layers);
+        for &li in &o1_layers {
+            self.kv_cache.layers[li].o1_set_q_stride(QT_STRIDE);
+        }
+        let mut pos = 0;
+        while pos < n {
+            let end = (pos + chunk).min(n);
+            let bk = end - pos;
+            let mut hiddens = vec![0f32; bk * hs];
+            for (j, &id) in ids[pos..end].iter().enumerate() {
+                hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            match self.prefill_hiddens_metal(hiddens, pos, None) {
+                MetalPrefillOutcome::Completed(h) => last.copy_from_slice(&h[(bk - 1) * hs..]),
+                MetalPrefillOutcome::Declined if pos == 0 => {
+                    crate::gpu_metal::o1c::cap_end();
+                    for &li in &o1_layers {
+                        self.kv_cache.layers[li].o1_set_q_stride(1);
+                    }
+                    return Ok(None);
+                }
+                _ => {
+                    crate::gpu_metal::o1c::cap_end();
+                    return Err("O(1) prefix: the Metal rows graph stopped after admission".into());
+                }
+            }
+            for (li, q, _, _) in crate::gpu_metal::o1c::cap_take() {
+                let Some(i) = o1_layers.iter().position(|&l| l == li) else { continue };
+                if q.len() != bk * qrow {
+                    crate::gpu_metal::o1c::cap_end();
+                    return Err(format!("O(1) prefix: {} query values, expected {}", q.len(), bk * qrow));
+                }
+                for p in pos..end {
+                    if p % QT_STRIDE == 0 {
+                        qs[i].extend_from_slice(&q[(p - pos) * qrow..(p - pos + 1) * qrow]);
+                    }
+                }
+            }
+            pos = end;
+        }
+        crate::gpu_metal::o1c::cap_end();
+        let row = nkv * hd;
+        for (&li, q) in o1_layers.iter().zip(qs) {
+            if q.len() != n.div_ceil(QT_STRIDE) * qrow {
+                return Err(format!("O(1) prefix: layer {li} kept {} query values", q.len()));
+            }
+            if let Some(a) = arch.as_deref_mut() {
+                let (mut k, mut v) = (vec![0f32; n * row], vec![0f32; n * row]);
+                if !crate::gpu_metal::kv_mirror_read_rows(self.graph_kv_id, li, nkv, hd, 0, n, &mut k, &mut v) {
+                    return Err("O(1) prefix: K/V readback failed".into());
+                }
+                let dir = a.dir.clone();
+                let mut layer = O1ArchLayer {
+                    li,
+                    k: ArchStore::new(dir.as_deref(), format!("{li}-k"))?,
+                    v: ArchStore::new(dir.as_deref(), format!("{li}-v"))?,
+                    q: ArchStore::new(dir.as_deref(), format!("{li}-q"))?,
+                };
+                layer.k.push(&k)?;
+                layer.v.push(&v)?;
+                layer.q.push(&q)?;
+                a.layers.push(layer);
+                a.rows = n;
+                a.stride = QT_STRIDE;
+                a.nh = nh;
+                a.nk = nkv;
+                a.hd = hd;
+            }
+            self.kv_cache.layers[li].o1_set_q_trace(q);
+        }
+        Ok(Some(last))
+    }
+
+    fn o1_exact_cfg(&self) -> Option<&crate::dory::ExactRows> {
+        static EXACT: std::sync::OnceLock<Option<crate::dory::ExactRows>> = std::sync::OnceLock::new();
+        EXACT
+            .get_or_init(|| crate::dory::exact_from_var("CMF_O1_EXACT"))
+            .as_ref()
+            .or(self.o1_turbo.as_ref().map(|t| &t.exact))
+    }
+
+    pub fn is_far_turbo(&self) -> bool {
+        self.o1_turbo.is_some() && self.o1_graph_backend()
+    }
+
+    /// A backend with the far field's prompt path and stages.
+    fn o1_graph_backend(&self) -> bool {
+        crate::gpu::wgpu_active() || crate::gpu::backend_name() == "metal"
+    }
+
+    pub fn far_turbo_seal(&self) -> usize {
+        self.o1_turbo.as_ref().map_or(usize::MAX, |t| t.seal)
+    }
+
+    /// The draft head on top of a far field: a verify's rows attend, and the state moves
+    /// over the accepted ones only. On the wgpu graph; `CMF_O1_SPEC=0` turns it off.
+    fn o1_spec(&self) -> bool {
+        self.o1_active()
+            && self.o1_on_graph()
+            && self.o1_graph_backend()
+            && (self.o1_turbo.is_some() || std::env::var("CMF_O1_SPEC").as_deref() == Ok("1"))
+            && std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
+    }
+
+    /// The far field rides the device graph: asked for, or a turbo file's way.
+    fn o1_on_graph(&self) -> bool {
+        self.o1_turbo.is_some() || std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+    }
+
+    /// A turbo file takes the far field for a long prompt and leaves it for a short one,
+    /// where exact attention and speculation are the faster way.
+    fn o1_turbo_gate(&mut self, prompt_rows: usize) {
+        // Off the wgpu and Metal graphs the far field would run on the host, so a turbo file
+        // runs as the plain file it holds.
+        if !self.is_far_turbo() {
+            return;
+        }
+        let Some(t) = self.o1_turbo.clone() else { return };
+        let want = prompt_rows >= t.seal;
+        if want != self.o1_active() {
+            self.clear_sequence_state();
+            if let Err(e) = self.try_set_o1(want.then(|| t.cfg.clone())) {
+                tracing::warn!("turbo file: the far field is off: {e}");
+                self.o1_turbo = None;
+            }
+        }
+    }
+
+    /// The rows this seal keeps exact (`CMF_O1_EXACT=FILE:rows`), the same in every layer.
+    fn o1_choose_exact_rows(&mut self) {
+        let Some(x) = self.o1_exact_cfg().cloned() else { return };
+        let Some(c) = self.o1_cfg.clone() else { return };
+        let layers: Vec<usize> = (0..self.num_layers)
+            .filter(|&li| self.o1_flags.get(li).copied().unwrap_or(false) && self.kv_cache.layers[li].seq_len > 0 && self.kv_cache.layers[li].o1_is_collecting())
+            .collect();
+        let Some(&first) = layers.first() else { return };
+        let rows = self.kv_cache.layers[first].seq_len;
+        let floor = crate::nystrom::o1_deferred_boundary(c.w, c.sink).unwrap_or(usize::MAX);
+        let target = self.kv_cache.layers[first].o1_pending_boundary().unwrap_or(floor).max(floor);
+        if rows < target || layers.iter().any(|&li| self.kv_cache.layers[li].seq_len != rows) {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let (nk, hd) = (self.kv_cache.layers[first].num_kv_heads, self.kv_cache.layers[first].head_dim);
+        let keep = {
+            let views: Vec<_> = layers.iter().map(|&li| self.kv_cache.layers[li].group_rows()).collect();
+            let refs: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
+            crate::dory::pick_exact_rows(&x, &refs, rows, nk, hd, c.m, c.sink, rows.saturating_sub(c.w))
+        };
+        tracing::info!("o1: {} exact rows of {rows} chosen in {:.2} s", keep.len(), t0.elapsed().as_secs_f64());
+        for &li in &layers {
+            self.kv_cache.layers[li].o1_keep = keep.clone();
+        }
     }
 
     /// Complete a deferred boundary after a full position/span forward.
@@ -4755,6 +5177,7 @@ impl Pipeline {
         &mut self,
         ids: &[u32],
         chunk: usize,
+        mut arch: Option<&mut O1Archive>,
     ) -> Result<Option<Vec<f32>>, String> {
         let o1_layers: Vec<usize> = (0..self.num_layers)
             .filter(|&li| self.o1_flags.get(li).copied().unwrap_or(false))
@@ -4783,6 +5206,11 @@ impl Pipeline {
         let n = ids.len();
         let mut last = vec![0f32; hs];
         let mut pos = 0;
+        // The seal's queries leave the card chunk by chunk, one row in `QT_STRIDE`: its
+        // landmarks are means over long segments.
+        const QT_STRIDE: usize = 8;
+        let qrow = nh * hd;
+        let mut qs: Vec<Vec<f32>> = vec![Vec::new(); o1_layers.len()];
         while pos < n {
             let end = (pos + chunk).min(n);
             let bk = end - pos;
@@ -4794,7 +5222,6 @@ impl Pipeline {
             match self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None) {
                 crate::gpu::BatchGraphOutcome::Completed => {
                     last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
-                    pos = end;
                 }
                 crate::gpu::BatchGraphOutcome::Declined if pos == 0 => {
                     let _ = crate::gpu::o1_qcap_take();
@@ -4805,29 +5232,64 @@ impl Pipeline {
                     return Err("O(1) prefix batch graph stopped after admission".into());
                 }
             }
+            let Some(drained) = crate::gpu::o1_qcap_drain() else {
+                let _ = crate::gpu::o1_qcap_take();
+                return Err("O(1) prefix: query readback failed".into());
+            };
+            for (i, (_, rows)) in drained.iter().enumerate() {
+                if rows.len() != bk * qrow {
+                    let _ = crate::gpu::o1_qcap_take();
+                    return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), bk * qrow));
+                }
+                for p in pos..end {
+                    if p % QT_STRIDE == 0 {
+                        qs[i].extend_from_slice(&rows[(p - pos) * qrow..(p - pos + 1) * qrow]);
+                    }
+                }
+            }
+            pos = end;
         }
-        let q = crate::gpu::o1_qcap_take().ok_or("O(1) prefix: query readback failed")?;
+        let _ = crate::gpu::o1_qcap_take();
         let pulls: Vec<(usize, usize, usize)> = o1_layers.iter().map(|&li| (li, 0, n)).collect();
         let kv = crate::gpu::graph_kv_read_rows(self.graph_kv_id, &pulls, nkv, hd)
             .ok_or("O(1) prefix: K/V readback failed")?;
-        let (row, qrow) = (nkv * hd, nh * hd);
-        for ((li, qs), (k, v)) in q.into_iter().zip(kv) {
-            if k.len() != n * row || v.len() != n * row || qs.len() != n * qrow {
+        let row = nkv * hd;
+        for ((&li, q), (k, v)) in o1_layers.iter().zip(qs).zip(kv) {
+            if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
                 return Err(format!(
                     "O(1) prefix: layer {li} read back {}/{}/{} values, expected {}/{}/{}",
                     k.len(),
                     v.len(),
-                    qs.len(),
+                    q.len(),
                     n * row,
                     n * row,
-                    n * qrow
+                    n.div_ceil(QT_STRIDE) * qrow
                 ));
             }
             let cache = &mut self.kv_cache.layers[li];
+            cache.o1_set_q_stride(QT_STRIDE);
             for p in 0..n {
                 cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
-                cache.o1_push_q(&qs[p * qrow..(p + 1) * qrow]);
             }
+            if let Some(a) = arch.as_deref_mut() {
+                let dir = a.dir.clone();
+                let mut layer = O1ArchLayer {
+                    li,
+                    k: ArchStore::new(dir.as_deref(), format!("{li}-k"))?,
+                    v: ArchStore::new(dir.as_deref(), format!("{li}-v"))?,
+                    q: ArchStore::new(dir.as_deref(), format!("{li}-q"))?,
+                };
+                layer.k.push(&k)?;
+                layer.v.push(&v)?;
+                layer.q.push(&q)?;
+                a.layers.push(layer);
+                a.rows = n;
+                a.stride = QT_STRIDE;
+                a.nh = nh;
+                a.nk = nkv;
+                a.hd = hd;
+            }
+            cache.o1_set_q_trace(q);
         }
         Ok(Some(last))
     }
@@ -5079,6 +5541,8 @@ impl Pipeline {
         // whole-token graph, all of which are gated on `is_none()`. A
         // narrowed file whose one segment is always on carries exactly
         // such a mask — drop it here rather than pay 5x for a no-op.
+        self.o1_turbo_gate(input_ids.len());
+        self.mtp_pos_base = 0;
         let task_mask = self.drop_open_mask(task_mask);
         // Unlimited-OCR: the page coordinates of this prompt.
         if self.dash.is_some() {
@@ -5180,11 +5644,28 @@ impl Pipeline {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&p| p > 0)
+                // Exact rows are chosen before the prompt's last rows, which then read them.
+                .or_else(|| {
+                    self.o1_exact_cfg()
+                        .map(|_| {
+                            let max = std::env::var("CMF_O1_PREFIX_MAX")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .or(self.o1_turbo.as_ref().map(|t| t.seal))
+                                .unwrap_or(O1_PREFIX_MAX);
+                            input_ids.len().saturating_sub(crate::dory::EXACT_TAIL).min(max)
+                        })
+                        .filter(|&p| p > 0)
+                })
         } else {
             None
         };
         if task_mask.is_none() {
             self.o1_begin_with_prefix(o1_prefill);
+        }
+        if let Ok(f) = std::env::var("CMF_O1_TOKENS_DUMP") {
+            let b: Vec<u8> = input_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(f, b);
         }
 
         // Speculative decode is off under o1: a rejected draft can't be
@@ -5343,7 +5824,7 @@ impl Pipeline {
             && (graph_on || metal_graph)
             && self.mtp.is_some()
             && task_mask.is_none()
-            && !self.o1_active()
+            && (!self.o1_active() || self.o1_spec())
             && spec_sampling_ok
             && spec_wanted;
         // The host fused pair is an optimization, not a verifier. On real
@@ -5443,7 +5924,7 @@ impl Pipeline {
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
-            && !self.o1_active()
+            && (!self.o1_active() || self.o1_spec())
             && ((!graph_on && pair_pays && self.sampler_config.temperature < 1e-6) || graph_spec);
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
@@ -5704,6 +6185,7 @@ impl Pipeline {
             .and_then(|requested| self.o1_effective_boundary(requested))
             .map(|boundary| boundary.min(input_ids.len()));
         let mut o1_sealed = false;
+        let mut o1_arch: Option<O1Archive> = None;
         if let Some(limit) = o1_prefill_limit {
             // On the device route the prefix takes the batch graph and its
             // sealed suffix the O(1) batches after it (`o1_prefix_on_graph`):
@@ -5715,14 +6197,28 @@ impl Pipeline {
                 && limit < input_ids.len()
                 && batch_k > 0
                 && task_mask.is_none()
-                && mtp.is_none()
+                && (mtp.is_none() || self.o1_spec())
                 && !dyn_prefill
-                && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+                && self.o1_on_graph()
                 && std::env::var("CMF_O1_PREFIX_GPU").as_deref() != Ok("0")
                 && (0..self.num_layers).all(|li| self.phys_layer(li) == li)
             {
                 let t_px = std::time::Instant::now();
-                match self.o1_prefix_on_graph(&input_ids[..limit], batch_k) {
+                // More of the prompt than the first seal covers: its rows stay in host
+                // memory, and the far field is built anew before the prompt's last rows.
+                let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
+                if limit < tail_from && self.o1_exact_cfg().is_some() {
+                    o1_arch = Some(O1Archive::new());
+                }
+                #[cfg(target_os = "macos")]
+                let prefix = if crate::gpu::q1_force() {
+                    self.o1_prefix_on_metal(&input_ids[..limit], batch_k, o1_arch.as_mut())
+                } else {
+                    self.o1_prefix_on_graph(&input_ids[..limit], batch_k, o1_arch.as_mut())
+                };
+                #[cfg(not(target_os = "macos"))]
+                let prefix = self.o1_prefix_on_graph(&input_ids[..limit], batch_k, o1_arch.as_mut());
+                match prefix {
                     Ok(Some(last)) => {
                         hidden.copy_from_slice(&last);
                         pos = limit;
@@ -5765,6 +6261,12 @@ impl Pipeline {
                         return Err(err);
                     }
                 };
+                // Sealed layers read no mirror again: their rows leave the memory they share
+                // with everything else on a Mac.
+                #[cfg(target_os = "macos")]
+                if o1_sealed && crate::gpu::q1_force() {
+                    crate::gpu_metal::kv_mirror_drop(self.graph_kv_id);
+                }
                 tracing::info!(
                     "o1 bounded prompt prefix: requested={} effective={} processed={} of {} token(s)",
                     o1_prefill.unwrap_or(0),
@@ -5791,6 +6293,7 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         if task_mask.is_none()
             && !dyn_prefill
+            && !o1_sealed
             && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
             && self.gdn_cfg.is_some()
@@ -6099,8 +6602,8 @@ impl Pipeline {
         // refusal behavior remain the ordinary controls/comparator.
         let o1_batch_ready = o1_sealed
             && o1_prefill.is_some()
-            && mtp.is_none()
-            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && (mtp.is_none() || self.o1_spec())
+            && self.o1_on_graph()
             && (0..self.num_layers).all(|li| {
                 let cache = &self.kv_cache.layers[self.phys_layer(li)];
                 cache.o1.is_none() || cache.o1_views().is_some()
@@ -6119,14 +6622,32 @@ impl Pipeline {
             && (graph_prefill || o1_batch_ready)
             && task_mask.is_none()
             && (!self.o1_active() || o1_batch_ready)
-            && (mtp.is_none() || mtp_batch_prefill)
+            && (mtp.is_none() || mtp_batch_prefill || o1_batch_ready)
             && !dyn_prefill
             && pos + 1 < input_ids.len()
         {
             let hs = self.hidden_size;
             let chunk = batch_k;
+            let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
+            if o1_arch.is_some() {
+                crate::gpu::o1_acap_begin();
+            }
+            if o1_batch_ready && mtp.is_some() {
+                self.mtp_pos_base = tail_from.max(pos);
+            }
             while pos < input_ids.len() {
-                let end = (pos + chunk).min(input_ids.len());
+                // The prompt's last rows read the rows chosen just before them.
+                if pos >= tail_from {
+                    if let Some(a) = o1_arch.take() {
+                        crate::gpu::o1_acap_end();
+                        if let Err(err) = self.o1_seal_archive(a) {
+                            self.finish_generation(&mut mtp, &mut router, true);
+                            return Err(err);
+                        }
+                    }
+                }
+                let stop = if o1_arch.is_some() { tail_from } else { input_ids.len() };
+                let end = (pos + chunk).min(stop);
                 let bk = end - pos;
                 let mut hiddens = vec![0f32; bk * hs];
                 for (j, &id) in input_ids[pos..end].iter().enumerate() {
@@ -6134,8 +6655,48 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let t_chunk = std::time::Instant::now();
-                let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+                let outcome = self.o1_prompt_chunk(&mut hiddens, &positions, bk);
+                if let (Some(a), crate::gpu::BatchGraphOutcome::Completed) = (o1_arch.as_mut(), outcome) {
+                    if let Err(err) = self.o1_archive_chunk(a, pos, bk) {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err(err);
+                    }
+                }
                 let ok_b = outcome == crate::gpu::BatchGraphOutcome::Completed;
+                // The draft head over a far field reads the prompt's tail only.
+                if ok_b && o1_batch_ready && end > self.mtp_pos_base && mtp.is_some() {
+                    let first = pos.max(self.mtp_pos_base);
+                    let n_pairs = mtp_prefill_pair_count(first, end, input_ids.len());
+                    if n_pairs > 0 {
+                        let rows: Vec<Vec<f32>> = (0..n_pairs).map(|j| hiddens[(first - pos + j) * hs..(first - pos + j + 1) * hs].to_vec()).collect();
+                        let pairs: Vec<(&[f32], u32)> = rows.iter().enumerate().map(|(j, row)| (row.as_slice(), input_ids[first + j + 1])).collect();
+                        #[cfg(target_os = "macos")]
+                        let warmed = crate::gpu::q1_force() && {
+                            if let Some(m) = mtp.as_mut() {
+                                if !self.mtp_warm_batch_metal(m, &pairs, first) {
+                                    for (j, (h, t)) in pairs.iter().enumerate() {
+                                        let h = h.to_vec();
+                                        let _ = self.mtp_step(m, &h, *t, first + j);
+                                    }
+                                }
+                            }
+                            true
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let warmed = false;
+                        let warm_error = if warmed {
+                            None
+                        } else if let Some(m) = mtp.as_mut() {
+                            self.mtp_warm_prefill_pairs(m, &pairs, first).err()
+                        } else {
+                            None
+                        };
+                        if let Some(err) = warm_error {
+                            self.finish_generation(&mut mtp, &mut router, true);
+                            return Err(err.to_string());
+                        }
+                    }
+                }
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
                     let ms = t_chunk.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
@@ -7273,6 +7834,7 @@ impl Pipeline {
         next_token: u32,
         position: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        let position = position.saturating_sub(self.mtp_pos_base);
         // The graph arm: the MTP block as a one-layer token graph with the
         // head fused — device attention over the block's own KV mirror,
         // one submit for block + head, hidden and logits back together.
@@ -7556,6 +8118,7 @@ impl Pipeline {
     /// speculative rows.
     #[cfg(feature = "gpu")]
     fn rewind_mtp_graph_mirror(&self, stored: usize) -> bool {
+        let stored = stored.saturating_sub(self.mtp_pos_base);
         self.mtp_graph_mode != Some(true)
             || crate::gpu::graph_kv_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, stored)
     }
@@ -7574,6 +8137,10 @@ impl Pipeline {
                 self.weights.layers[self.phys_layer(li)].attn,
                 AttnKind::Full { .. }
             ) {
+                // A sealed layer has no mirror: its state moved by `o1_spec_commit`.
+                if self.o1_flags.get(li).copied().unwrap_or(false) && self.kv_cache.layers[li].o1_sealed() {
+                    continue;
+                }
                 expected = true;
                 ok &= crate::gpu::graph_kv_set_stored(self.graph_kv_id, li, stored);
             }
@@ -7842,6 +8409,7 @@ impl Pipeline {
         pairs: &[(&[f32], u32)],
         first_pos: usize,
     ) -> crate::gpu::BatchGraphOutcome {
+        let first_pos = first_pos.saturating_sub(self.mtp_pos_base);
         if pairs.is_empty() {
             return crate::gpu::BatchGraphOutcome::Completed;
         }
@@ -7990,6 +8558,7 @@ impl Pipeline {
         pairs: &[(&[f32], u32)],
         first_pos: usize,
     ) -> bool {
+        let first_pos = first_pos.saturating_sub(self.mtp_pos_base);
         if pairs.is_empty() {
             return true;
         }
@@ -8083,6 +8652,7 @@ impl Pipeline {
     /// verify just proved, without paying the head. What keeps the draft's
     /// attention context warm between speculative rounds.
     fn mtp_warm(&mut self, m: &mut MtpModule, hidden: &[f32], next_token: u32, position: usize) {
+        let position = position.saturating_sub(self.mtp_pos_base);
         let e = self.embed_single(next_token);
         let mut cat = vec![0.0f32; 2 * self.hidden_size];
         let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
@@ -8888,6 +9458,15 @@ impl Pipeline {
                 tracing::error!("GDN speculative restore failed after verify");
                 return None;
             }
+        }
+        if self.o1_active() && !crate::gpu::o1_spec_commit(self.graph_kv_id, next_pos, a + 1) {
+            self.clear_sequence_state();
+            self.graph_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!("far field commit failed after verify");
+            return None;
         }
         if !metal_native && !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
             // The verify graph committed the full batch, but one of its
@@ -11507,7 +12086,7 @@ impl Pipeline {
         let batch_admitted = batch_k > 0
             && self.can_prefill_batched()
             && self.o1_active()
-            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && self.o1_on_graph()
             && (0..self.num_layers).all(|li| {
                 let cache = &self.kv_cache.layers[self.phys_layer(li)];
                 cache.o1.is_none() || cache.o1_views().is_some()
@@ -14628,7 +15207,7 @@ impl Pipeline {
         };
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
-        let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
+        let o1_gpu = self.o1_on_graph();
         if (self.o1_active() && !o1_gpu) || self.attn_softcap > 0.0 {
             // Softcapped scores have no graph kernel yet — CPU owns them.
             // o1 rides the graph only behind CMF_O1_GPU=1 while the port
@@ -15297,7 +15876,7 @@ impl Pipeline {
                 .map(|v| v == "0")
                 .unwrap_or(false)
             || self.attn_softcap > 0.0
-            || self.o1_active()
+            || (self.o1_active() && !self.o1_on_graph())
             || self.swa.is_some()
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
@@ -15404,7 +15983,7 @@ impl Pipeline {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let cache = &self.kv_cache.layers[li];
-                    if cache.mode != crate::kv_cache::KvMode::F32 || cache.o1.is_some() {
+                    if cache.mode != crate::kv_cache::KvMode::F32 || (cache.o1.is_some() && !self.o1_on_graph()) {
                         return None;
                     }
                     plan.push(MetalRowsItem::Attn {
@@ -15464,6 +16043,7 @@ impl Pipeline {
         eps: f32,
         gemma: bool,
         late_qk_norm: bool,
+        o1_epoch: u64,
     ) -> (crate::gpu_metal::AttnDeviceParams<'a>, usize) {
         let (nh, nkv, hd, rd) = geom;
         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
@@ -15491,7 +16071,8 @@ impl Pipeline {
                 cpu_v,
                 cpu_stored,
                 cpu_gen: cache.generation(),
-                o1: None,
+                // A layer still collecting has no views, and its rows go through the mirror.
+                o1: cache.o1_views().map(|views| crate::gpu_metal::O1AttnParams { views, epoch: o1_epoch }),
                 window: None,
                 softmax_sink: cache.sinks.as_deref(),
                 head_gate: None,
@@ -15604,6 +16185,7 @@ impl Pipeline {
                         eps,
                         gemma,
                         self.qk_norm_after_rope,
+                        self.o1_epoch,
                     );
                     graph.attn_ok(l, &p)
                 }
@@ -15662,11 +16244,15 @@ impl Pipeline {
                         eps,
                         gemma,
                         self.qk_norm_after_rope,
+                        self.o1_epoch,
                     );
                     if !graph.encode_attn_b(l, &p) {
                         return MetalRowsRun::Declined;
                     }
-                    attn_layers.push((*li, cpu_stored));
+                    // A sealed layer leaves no mirror row to pull.
+                    if p.o1.is_none() {
+                        attn_layers.push((*li, cpu_stored));
+                    }
                 }
             }
         }
@@ -16018,6 +16604,7 @@ impl Pipeline {
         first_pos: usize,
     ) -> Option<MetalWarmPending> {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, VerifyGraph};
+        let first_pos = first_pos.saturating_sub(self.mtp_pos_base);
         let b = pairs.len();
         if b == 0 || b > 512 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
             return None;
@@ -16276,6 +16863,7 @@ impl Pipeline {
         want_logits: bool,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        let position = position.saturating_sub(self.mtp_pos_base);
         if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
             || !crate::gpu::q1_force()
             || !crate::gpu::enabled_here()
@@ -16513,6 +17101,7 @@ impl Pipeline {
         k: usize,
     ) -> Result<Vec<u32>, bool> {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        let position = position.saturating_sub(self.mtp_pos_base);
         if k == 0
             || k > 64
             || !Self::mtp_chain_on()

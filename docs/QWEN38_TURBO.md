@@ -1,0 +1,125 @@
+# Qwen3.8-27B Turbo on cortiq
+
+*Languages: **English** · [Русский](QWEN38_TURBO.ru.md) · [中文](QWEN38_TURBO.zh.md)*
+
+[The turbo file](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) holds the 4-bit weights of
+Qwen3.8-27B under a header that keeps device memory in place on long prompts. Prompts under 8192 tokens
+run exact attention, as in the [standard file](https://huggingface.co/infosave/Qwen3.8-27B-cmf).
+
+## Run
+
+```bash
+cargo install cortiq-cli
+hf download infosave/Qwen3.8-27B-Turbo-cmf qwen38-27b-turbo.cmf --local-dir .
+cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+```
+
+| option | meaning |
+|---|---|
+| `--o1-spill DIR` | a long prompt's rows in files in `DIR`, also `CMF_O1_SPILL` |
+| `--prompt-file FILE` | a prompt longer than a command line holds |
+| `CMF_O1_PREFIX_MAX=N` | seal at `N` rows instead of the choice for the card |
+| `CMF_O1=off` | the plain model, with exact attention at any length |
+| `CMF_O1_SPEC=0` | no drafts over the far field |
+| `CMF_O1_STAGES=0` | the far field's attention in one long thread per head |
+| `CMF_WGPU_BLOCK_MB=N` | the block the Vulkan allocator shares among small buffers, 16 MiB by default |
+
+## What happens to a long prompt
+
+![A long prompt on a small card](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/ceiling_en.png)
+
+1. The first rows are read exactly on the batch graph: 8192 of them, 4096 where the card's budget has no
+   room for more (`o1_seal_for_card`).
+2. Later chunks read a far field built over the rows so far. Their queries, keys and values leave the card
+   through host-visible staging, for RAM or files (`O1Archive`).
+3. Before the last 512 rows the exact rows are chosen among all the stored rows, and the far field is
+   built anew from them, one layer at a time, so memory never holds two layers' rows.
+4. The last rows and every decoded token read the sinks, the exact rows, the window of 1800 and 32 landmarks
+   per head. The state has a fixed size.
+
+The order in step 3 matters: a question carries what it found in the text on to the answer, so it has to
+read the exact fact itself. Choosing after the question's rows finds the fact's rows and still answers 1
+time in 8.
+
+**Exact rows.** For each KV head of each full layer, two numbers per row: how far its key lies from the span
+of the landmarks, and its value's norm. Each becomes a rank within the prompt, and a linear fit over the 128
+ranks scores the row, with no word lists. Over planted facts, a fact's rows land in the top 0.22 % of a
+prompt on average, and in the top 0.96 % at worst, on prompts the fit did not see.
+
+**Short threads.** A workgroup stays on one SM of an NVIDIA card, so one 256-lane workgroup per head leaves
+the card idle. `o1_stages` takes the arithmetic apart: near scores with a thread per key, landmark scores,
+the largest score, the far part per head, the weights, the value sum in pieces, and the pieces added. A sealed
+token went from 31.5 to 56 tok/s, and a verify of five rows from 57 to 41 ms.
+
+**Drafts.** A verify chunk attends without moving the far field, and its keys and values wait on the card.
+`o1_spec_commit` then moves the state over the accepted rows only. The draft head warms on the prompt's last
+rows. Greedy text is identical with drafts and without.
+
+**Device memory.** Weights of 33 to 64 MiB used to take a 64 MiB block each, so 12.6 GB of weights held 16.6 GB
+of the card. Blocks of 16 MiB take this back for every model on Vulkan, at the same speed.
+
+## Numbers
+
+![Standard and turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/compare_en.png)
+
+RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length.
+
+| prompt, tokens | first token, s | | decode, tok/s | | peak device memory, GB | |
+|---:|---:|---:|---:|---:|---:|---:|
+| | standard | **turbo** | standard | **turbo** | standard | **turbo** |
+| 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
+| 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
+| 16 000 | 42 | **47** | 87 | **92** | 16.5 | **15.5** |
+| 32 000 | 107 | **92** | 71 | **91** | 18.5 | **15.7** |
+| 64 000 | 316 | **177** | 51 | **92** | 22.8 | **15.7** |
+
+A real answer, 400 tokens of a summary, after 100 000 characters of Wikipedia: first token 76.7 → 72.1 s,
+decode 50.9 → 60.4 tok/s. With the budget of a 16 GB card on the same 5090 (`CMF_GPU_VRAM_MB=15000`): 15.0 GB,
+first token 176 s at 64 000, decode 92 tok/s. A real 16 GB card has fewer shader cores.
+
+Host memory while the prompt is read, without the mapped weights:
+
+| prompt, tokens | RAM | with `--o1-spill`: RAM | with `--o1-spill`: disk |
+|---:|---:|---:|---:|
+| 16 000 | 4.4 GB | 2.2 GB | 4.7 GB |
+| 32 000 | 7.0 GB | 2.2 GB | 8.7 GB |
+| 64 000 | 13.2 GB | 3.0 GB | 18.7 GB |
+
+On a disk with 4.5 GB/s write and 5.2 GB/s read the speed is the same as in RAM.
+
+MacBook Air M4, 24 GB, Metal, at 16 000 tokens: 6.3 GB beside the mapped weights, first token 545 s, decode 4 tok/s. An M4
+decodes this model at about 5 tok/s at any length, so on a Mac the file saves memory and not time.
+
+Facts planted in 100 000 characters: 12 of 12, 8 of them with a 15 GB budget and an SSD; in 230 000 characters, about 53 000
+tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 6. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
+
+## Building a turbo file
+
+```bash
+python3 scripts/dory/router/q27_feat.py cortiq qwen38-27b-q4tp.cmf tokenizer.json wiki_test.txt keep27.bin
+cortiq far-turbo qwen38-27b-q4tp.cmf qwen38-27b-turbo.cmf --exact-weights keep27.bin
+```
+
+`scripts/dory/router/keep27.bin` holds the fit for Qwen3.8-27B. `--o1 m,w,sink`, `--seal` and `--exact-rows` set
+the field; the window, sinks and exact rows have to fit 2052 keys. Other models with full-attention layers take the
+same command with a fit of their own; only Qwen3.8-27B has been measured.
+
+`scripts/dory/q27_final.sh` and `q27_quality.sh` run the tables above, `q27_figures.py` draws the figures, and
+`JOURNAL_Q27_TURBO_2026-11-05.md` keeps the log of what was tried.
+
+## What stays out
+
+- The far field runs on Vulkan, DX12 and Metal (`gpu_metal/o1c.rs`). On the CPU the file runs as the standard one. It was
+  measured on an NVIDIA card and an M4.
+- Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact. The fit saw planted
+  facts, and other kinds of important text were not tested.
+- Rows that arrive after a prompt ends stay in the window or go to the far field. A turn that diverges from a sealed
+  conversation reads the whole prompt again.
+- On Vulkan, drafts need greedy decoding without penalties.
+- A generation that starts below the seal stays exact, and its memory grows with every token.
+
+## License
+
+Weights: [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). The far field is a subject of U.S. patent
+application No. 19/738,763; see [PATENTS.md](../PATENTS.md).
