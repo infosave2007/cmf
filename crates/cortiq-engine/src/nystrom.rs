@@ -736,6 +736,20 @@ impl NystromState {
         }
     }
 
+    /// A later pass over the position `step_group` just took: its row is replaced in
+    /// the window, and the far field keeps what the row's arrival evicted.
+    pub fn restep_group(&mut self, q_all: &[f32], k: &[f32], v: &[f32], out_all: &mut [f32]) {
+        let g = &mut self.group;
+        let (d, dv) = (g.d, g.dv);
+        assert!(g.win_len > 0, "step_group() must run before restep_group()");
+        let slot = if g.exact_only || g.win_len < g.w { g.win_len - 1 } else { (g.win_head + g.w - 1) % g.w };
+        g.win_k[slot * d..(slot + 1) * d].copy_from_slice(k);
+        g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(v);
+        for (h, head) in self.heads.iter_mut().enumerate() {
+            head.step(&self.group, &q_all[h * d..(h + 1) * d], &mut out_all[h * dv..(h + 1) * dv]);
+        }
+    }
+
     /// Rebuild the skeleton against the CURRENT stream (Patent 17):
     /// K-landmarks from the ring of recently evicted keys, Q-landmarks
     /// from each head's recent queries, M re-inverted, and the far

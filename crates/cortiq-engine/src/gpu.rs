@@ -2079,6 +2079,72 @@ pub fn forward_token_graph(
     }
 }
 
+/// Dory's forward on the selected device. `false` leaves the host to run it.
+#[allow(clippy::too_many_arguments)]
+pub fn dory_forward(
+    id: u64,
+    model: Option<&std::sync::Arc<cortiq_core::CmfModel>>,
+    m: &crate::dory::Dory,
+    ids: &[u32],
+    pos: usize,
+    loops: usize,
+    want: crate::dory::Want,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return model.is_some_and(|md| crate::gpu_metal::dory::forward(id, md, m, ids, pos, loops, want, logits));
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::dory::forward(id, m, ids, pos, loops, want, logits);
+    }
+    let _ = (id, model, m, ids, pos, loops, want, logits);
+    false
+}
+
+/// A new Dory sequence on the device.
+pub fn dory_reset(id: u64) {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::dory::reset(id);
+        return;
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::dory::reset(id);
+    }
+    let _ = id;
+}
+
+/// The KV bytes a Dory sequence holds on the device.
+/// Has this Dory sequence gone over to the far field on the device?
+pub fn dory_sealed(id: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::dory::sealed(id);
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::dory::sealed(id);
+    }
+    let _ = id;
+    false
+}
+
+pub fn dory_kv_bytes(id: u64) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::dory::kv_bytes(id);
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::dory::kv_bytes(id);
+    }
+    let _ = id;
+    None
+}
+
 /// Is the f16 token path of the resident graph there on this device?
 pub fn embryo_wide_ready(q8: bool) -> bool {
     #[cfg(feature = "gpu")]

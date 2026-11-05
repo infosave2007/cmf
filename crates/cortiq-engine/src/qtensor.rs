@@ -911,6 +911,14 @@ impl QTensor {
         }
     }
 
+    /// The tensor's bytes in the file, for a device that takes them as they are.
+    pub fn mapped_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Mapped { .. } => Some(self.quant_bytes()),
+            _ => None,
+        }
+    }
+
     fn quant_bytes(&self) -> &[u8] {
         match self {
             Self::Mapped { model, idx, .. } => model.entry_bytes(&model.tensors[*idx]),
@@ -11736,7 +11744,10 @@ impl QTensor {
             && exact_cpu_default_enabled()
             && matches!(
                 self,
-                Self::Mapped { model, .. } if matches!(model.header.arch.arch_name.as_str(), "flint" | "cortiq_embryo")
+                Self::Mapped { model, dtype, .. } if matches!(model.header.arch.arch_name.as_str(), "flint" | "cortiq_embryo")
+                    // Dory on q8 runs as fast on float activations and exact; on
+                    // q4tp int8 is 4.7× on an M4 for 0.1 % of perplexity.
+                    || (model.header.arch.arch_name == "dory" && *dtype == TensorDtype::Q8_2f)
             )
     }
 

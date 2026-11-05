@@ -10,6 +10,7 @@ pub mod d1;
 pub mod d1_parse;
 pub mod dit;
 pub mod dsv4;
+pub mod dory;
 pub mod dsv41;
 pub mod dsv41_encoding;
 pub mod dsv41_vision;

@@ -104,6 +104,19 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Nemotron-Labs Dory 1.0 4B:循环 Transformer(0.8.57)
+
+[Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) 让 40 个子层组成的块在同一份权重上运行多次。
+2.09 GB 的 Turbo 文件用共振路由器为每个 token 选择一次或两次循环,把长提示词保持在 0.5 GB 设备内存内,并让密码和代码
+保持精确,这些行靠各层自身的行为选出。NVIDIA L4 在真实提问上解码 61 tok/s,在 64 000 token 上下文时 54 tok/s;MacBook
+Air M4 为 33 tok/s,16 000 上下文时 29 tok/s:
+
+```sh
+cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --no-think
+```
+
+见[指南](docs/DORY.zh.md)。
+
 ## Kandinsky S2V 1.0 Pro-distill：语音生成视频（0.8.55）
 
 [Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)

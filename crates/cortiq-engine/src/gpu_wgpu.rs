@@ -61,6 +61,7 @@ pub(crate) mod dense_mv;
 pub(crate) mod gram;
 pub(crate) mod mhc;
 pub(crate) mod vit;
+pub(crate) mod dory;
 pub(crate) mod uocr;
 pub(crate) mod primal_vae;
 /// GPTQ fold operator and q4tp row sweep on the device.
@@ -48373,6 +48374,10 @@ fn batch_outcome(o1_started: bool, ok: bool) -> crate::gpu::BatchGraphOutcome {
 const O1_MAX_NEAR: usize = 2052;
 
 fn o1_view_valid(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd: usize) -> bool {
+    o1_view_valid_near(v, nh, nkv, hd, O1_MAX_NEAR)
+}
+
+fn o1_view_valid_near(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd: usize, max_near: usize) -> bool {
     let hpg = nh.checked_div(nkv).unwrap_or(0);
     let md = v.m_eff.checked_mul(v.d).unwrap_or(usize::MAX);
     let mdv = v.m_eff.checked_mul(v.dv).unwrap_or(usize::MAX);
@@ -48385,7 +48390,7 @@ fn o1_view_valid(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd
         && v.heads.len() == hpg
         && (4..=32).contains(&v.m_eff)
         && v.w > 0
-        && v.sink_len.saturating_add(v.w) <= O1_MAX_NEAR
+        && v.sink_len.saturating_add(v.w) <= max_near
         && v.d == hd
         && v.dv == hd
         && v.d <= 256
@@ -48414,12 +48419,22 @@ fn o1_views_valid(
     nkv: usize,
     hd: usize,
 ) -> bool {
+    o1_views_valid_near(views, nh, nkv, hd, O1_MAX_NEAR)
+}
+
+fn o1_views_valid_near(
+    views: &[crate::nystrom::O1DeviceView<'_>],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    max_near: usize,
+) -> bool {
     let Some(first) = views.first() else {
         return false;
     };
-    o1_view_valid(first, nh, nkv, hd)
+    o1_view_valid_near(first, nh, nkv, hd, max_near)
         && views.iter().all(|v| {
-            o1_view_valid(v, nh, nkv, hd)
+            o1_view_valid_near(v, nh, nkv, hd, max_near)
                 && v.m_eff == first.m_eff
                 && v.sink_len == first.sink_len
                 && v.d == first.d
@@ -48575,6 +48590,18 @@ fn o1_ensure(
     views: &[crate::nystrom::O1DeviceView<'_>],
     epoch: u64,
 ) -> Option<()> {
+    o1_ensure_near(c, kv_id, li, views, epoch, O1_MAX_NEAR)
+}
+
+/// The same for kernels that read a longer near field than `o1_attend`'s scratch holds.
+fn o1_ensure_near(
+    c: &Ctx,
+    kv_id: u64,
+    li: usize,
+    views: &[crate::nystrom::O1DeviceView<'_>],
+    epoch: u64,
+    max_near: usize,
+) -> Option<()> {
     {
         let m = c.o1m.lock().unwrap();
         if let Some(d) = m.get(&(kv_id, li)) {
@@ -48595,7 +48622,7 @@ fn o1_ensure(
     // against 49.2 tok/s on Qwen3.8 — so every branch says which limit
     // it is and with what numbers. Silent capability gates are how a
     // day was once spent reading one KV ceiling as three model bugs.
-    if ns.saturating_add(w) > O1_MAX_NEAR || m > 32 || g0.d > 256 || g0.dv > 256 {
+    if ns.saturating_add(w) > max_near || m > 32 || g0.d > 256 || g0.dv > 256 {
         graph_refused("o1 geometry over kernel limits");
         tracing::warn!(
             "o1_ensure L{li}: sink+window {}+{} (cap {O1_MAX_NEAR}), landmarks {m} (cap 32), \

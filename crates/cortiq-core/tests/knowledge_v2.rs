@@ -53,6 +53,7 @@ fn arch() -> ModelArch {
         moe: None,
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         anchor_core: None,
         linear_core: None,

@@ -1598,6 +1598,25 @@ pub(crate) fn encode_q82_mm(
     true
 }
 
+/// The pipeline, bind group and workgroup grid of `encode_q82_mm`.
+pub(crate) fn q82_mm_prep(
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+) -> Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)> {
+    let (pipe, l) = pipes(c)?.mm.as_ref()?;
+    if cols % 64 != 0 || rows == 0 || nb == 0 || rows.div_ceil(64) > MAX_WG as usize {
+        return None;
+    }
+    let u = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, nb as u32, cols as u32]);
+    let bgm = bind(c, l, &[(0, weight), (1, xs), (2, y), (3, &u)]);
+    Some((pipe.clone(), bgm, rows.div_ceil(64) as u32, nb.div_ceil(64) as u32))
+}
+
 #[cfg(test)]
 mod shader_tests {
     use super::*;

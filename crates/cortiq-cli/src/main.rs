@@ -287,6 +287,20 @@ impl PplWindows {
 #[command(about = "Sparse task-routed model inference engine")]
 #[command(version)]
 struct Cli {
+    /// Looped models (Dory): passes of the recurrent block per token, or `auto`:
+    /// one pass when its top token is confident, a second when it is not, on the
+    /// last-loop cache. More passes reason better and cost more; no retraining.
+    #[arg(long, global = true, value_name = "N|auto")]
+    loops: Option<String>,
+    /// Looped models (Dory): `per_loop` keeps a KV cache per pass, `last_loop`
+    /// one per recurrent layer, so its memory does not grow with `--loops`.
+    #[arg(long = "kv-cache", global = true, value_name = "MODE")]
+    kv_cache: Option<String>,
+    /// Looped models (Dory): the full-attention layers read and keep only the last
+    /// N positions: the same speed and memory at any context length, what lies
+    /// further back fades. `--o1` adds a far-field estimate of it.
+    #[arg(long = "full-window", global = true, value_name = "N")]
+    full_window: Option<usize>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -1869,6 +1883,46 @@ enum Commands {
         /// Prompt to route
         #[arg(short, long)]
         prompt: String,
+    },
+    /// A turbo Dory file: the same weights, and by default the last-loop cache, the
+    /// patent-1 exit router and the O(1) far field on the full layers
+    DoryTurbo {
+        /// Input .cmf
+        input: String,
+        /// Output .cmf
+        output: String,
+        /// The exit router: `f32` rank, dim, then mean and basis of the easy topology
+        /// and of the hard one (scripts/dory/router/make_bin.py)
+        #[arg(long)]
+        topologies: String,
+        /// A token whose state after one pass scores at least this leaves the loop
+        #[arg(long, allow_negative_numbers = true)]
+        bias: f32,
+        /// Far field: landmarks,window,sinks,seal position
+        #[arg(long, default_value = "32,1536,4,8192")]
+        o1: String,
+        /// Weights that choose the prompt rows kept exact past the seal: `f32` count, then
+        /// the weights (scripts/dory/router/illum_budget.py)
+        #[arg(long)]
+        exact_weights: Option<String>,
+        /// How many rows those are
+        #[arg(long, default_value_t = 512)]
+        exact_rows: usize,
+    },
+    /// The frozen signal φ of one prompt per line: unit mean hidden state after a
+    /// layer, as `f32` rows, for fitting topologies outside the engine
+    Phi {
+        /// Path to .cmf model file
+        model: String,
+        /// Text file, one prompt per line (`\n` in a line stands for a line break)
+        #[arg(long)]
+        prompts: String,
+        /// φ = hidden after this layer
+        #[arg(long)]
+        layer: usize,
+        /// Output: raw little-endian f32, prompts × hidden
+        #[arg(long)]
+        out: String,
     },
     /// Teacher-forced perplexity over a text file (quant gate)
     Ppl {
@@ -3905,6 +3959,26 @@ async fn main() -> anyhow::Result<()> {
     // `run` hands the screen to the model: the loader's INFO chatter is noise
     // in front of an answer. Every other command keeps the informative
     // default. RUST_LOG overrides either way.
+    // Read when a Dory file loads; both are checked there.
+    // SAFETY: no other thread runs this early.
+    unsafe {
+        match cli.loops.as_deref() {
+            None => {}
+            Some("auto") => {
+                std::env::set_var("CMF_DORY_KV", "last_loop");
+                if std::env::var_os("CMF_DORY_GATE").is_none() {
+                    std::env::set_var("CMF_DORY_GATE", "auto");
+                }
+            }
+            Some(n) => std::env::set_var("CMF_DORY_LOOPS", n),
+        }
+        if let Some(m) = &cli.kv_cache {
+            std::env::set_var("CMF_DORY_KV", m);
+        }
+        if let Some(n) = cli.full_window {
+            std::env::set_var("CMF_DORY_FULL_WINDOW", n.to_string());
+        }
+    }
     let default_level = match &cli.command {
         Commands::Run { .. } => "warn",
         // `decide` prints its answer (and its batch totals on stderr), and
@@ -5027,6 +5101,10 @@ async fn main() -> anyhow::Result<()> {
             skill,
         } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
+        Commands::Phi { model, prompts, layer, out } => cmd_phi(&model, &prompts, layer, &out),
+        Commands::DoryTurbo { input, output, topologies, bias, o1, exact_weights, exact_rows } => {
+            cmd_dory_turbo(&input, &output, &topologies, bias, &o1, exact_weights.as_deref(), exact_rows)
+        }
         Commands::ProbeUtility {
             models,
             prompts,
@@ -8181,6 +8259,88 @@ fn cmd_fcd(
     Ok(())
 }
 
+/// `cortiq dory-turbo`: the same weights under a header that runs fast by default.
+fn cmd_dory_turbo(input: &str, output: &str, topologies: &str, bias: f32, o1: &str, exact_weights: Option<&str>, exact_rows: usize) -> anyhow::Result<()> {
+    let model = CmfModel::open_sharded(input)?;
+    let mut header = model.header.clone();
+    let hidden = header.arch.hidden_size;
+    let o: Vec<usize> = o1.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    anyhow::ensure!(o.len() == 4, "--o1 wants landmarks,window,sinks,seal");
+    let rec = header.arch.dory.as_mut().ok_or_else(|| anyhow::anyhow!("{input} is not a Dory file"))?;
+    let exact: Option<Vec<f32>> = match exact_weights {
+        Some(f) => {
+            let raw = std::fs::read(f)?;
+            let w: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            anyhow::ensure!(w.len() > 1 && w[0] as usize == w.len() - 1, "{f}: a count, then that many weights");
+            Some(w[1..].to_vec())
+        }
+        None => None,
+    };
+    anyhow::ensure!(
+        exact.is_none() || o[1] + o[2] + exact_rows <= cortiq_engine::dory::MAX_NEAR,
+        "window, sinks and exact rows go over the near field's {}",
+        cortiq_engine::dory::MAX_NEAR
+    );
+    rec.turbo = Some(cortiq_core::DoryTurbo {
+        exit_bias: bias,
+        o1: [o[0], o[1], o[2], o[3]],
+        exact_rows: if exact.is_some() { exact_rows } else { 0 },
+    });
+    let raw = std::fs::read(topologies)?;
+    let w: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    anyhow::ensure!(w.len() > 2, "{topologies}: too short");
+    let (rank, dim) = (w[0] as usize, w[1] as usize);
+    anyhow::ensure!(dim == hidden && w.len() == 2 + 2 * (dim + rank * dim), "{topologies}: rank {rank}, dim {dim}, {} values", w.len());
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let mut parts = vec![
+        ("dory.router.easy.mean", vec![dim], bytes(&w[2..2 + dim])),
+        ("dory.router.easy.basis", vec![rank, dim], bytes(&w[2 + dim..2 + dim + rank * dim])),
+        ("dory.router.hard.mean", vec![dim], bytes(&w[2 + dim + rank * dim..2 + 2 * dim + rank * dim])),
+        ("dory.router.hard.basis", vec![rank, dim], bytes(&w[2 + 2 * dim + rank * dim..])),
+    ];
+    if let Some(e) = &exact {
+        parts.push(("dory.exact.weights", vec![e.len()], bytes(e)));
+    }
+    let mut refs: Vec<cortiq_core::format::TensorSpecRef> = model
+        .tensors
+        .iter()
+        .filter(|e| !e.name.starts_with("dory.router.") && !e.name.starts_with("dory.exact."))
+        .map(|e| cortiq_core::format::TensorSpecRef {
+            name: e.name.clone(),
+            dtype: e.dtype,
+            shape: e.shape.clone(),
+            data: model.entry_bytes(e),
+        })
+        .collect();
+    for (name, shape, data) in &parts {
+        refs.push(cortiq_core::format::TensorSpecRef { name: name.to_string(), dtype: TensorDtype::F32, shape: shape.clone(), data: data.as_slice() });
+    }
+    CmfModel::write_ref(output, &header, &refs, Some(&model.masks), model.vocab.as_deref())?;
+    println!("wrote {output}: {} tensors, exit bias {bias}, far field {o1}, exact rows {}", refs.len(), if exact.is_some() { exact_rows } else { 0 });
+    Ok(())
+}
+
+/// `cortiq phi`: one row per prompt, the unit mean hidden state after `layer`.
+fn cmd_phi(model_path: &str, prompts: &str, layer: usize, out: &str) -> anyhow::Result<()> {
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+    let text = std::fs::read_to_string(prompts)?;
+    let mut bytes = Vec::new();
+    let mut rows = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let ids = pipeline.tokenizer.encode(&line.replace("\\n", "\n"));
+        let n = ids.len();
+        let mut phi = pipeline.probe_phi_span(&ids, layer, 0..n);
+        let norm = phi.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        phi.iter_mut().for_each(|v| *v /= norm);
+        bytes.extend(phi.iter().flat_map(|v| v.to_le_bytes()));
+        rows += 1;
+    }
+    std::fs::write(out, &bytes)?;
+    println!("{rows} rows of {} into {out}", bytes.len() / rows.max(1) / 4);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_ppl(
     model_path: &str,
@@ -10789,6 +10949,19 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     let bounded = count(cortiq_core::LayerType::BoundedAttention);
     let linear = arch.num_layers - full - sliding - conv - bounded;
     println!("Model: {}", model_path);
+    if let Some(d) = &arch.dory {
+        let attn = d.layer_pattern.chars().filter(|c| *c != '-').count();
+        let full = d.layer_pattern.chars().filter(|c| *c == '*').count();
+        println!(
+            "  Looped:      {}+{}+{} sub-layers, {} loops by default, {attn} attention ({full} full, window {}), {} MLP",
+            d.n_input_layers,
+            d.n_recurrent_layers,
+            d.n_output_layers,
+            d.n_recurrent_loops,
+            d.sliding_window,
+            d.layer_pattern.len() - attn
+        );
+    }
     println!("  Format:      CMF v{}", model.header.version);
     println!("  Arch:        {}", arch.arch_name);
     let mut mix = format!("{full} full");
@@ -12886,6 +13059,9 @@ async fn cmd_bench(
             total_mem as f64 / 1e6,
             pipeline.kv_cache.seq_len()
         );
+    }
+    if let (true, Some((_, kv))) = (pipeline.dory.is_some(), device_state) {
+        println!("  Memory:  device KV {:.1} MB", kv as f64 / 1e6);
     }
     if result.mtp_drafted > 0 {
         println!(

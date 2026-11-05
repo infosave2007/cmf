@@ -708,6 +708,9 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == "lfm3" {
         return lfm3_canon(raw);
     }
+    if arch.dory.is_some() {
+        return Some(dory_canon(raw));
+    }
     // SenseNova-Loop (`sensenova_loop`): the Qwen3.5 text model at the usual
     // names (its mHC routers ride along under their layers), the Qwen3-VL
     // style vision tower as `vis.*` for `qwen3vis`. The MTP head is dropped:
@@ -799,6 +802,106 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
         return Some(format!("vis.{rest}"));
     }
     canon_name(raw)
+}
+
+fn dory_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    let num = |key: &str| cfg_usize(config, key).ok_or_else(|| anyhow::anyhow!("dory config: no {key}"));
+    let real = |key: &str| config.get(key).and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("dory config: no {key}"));
+    let types = config
+        .get("layer_types")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("dory config: no layer_types"))?;
+    let mut layer_pattern = String::with_capacity(types.len());
+    for t in types {
+        layer_pattern.push(match t.as_str() {
+            Some("sliding_attention") => 'S',
+            Some("full_attention") => '*',
+            Some("mlp") => '-',
+            other => anyhow::bail!("dory config: layer type {other:?}"),
+        });
+    }
+    let n = num("num_hidden_layers")?;
+    let (n_in, n_rec, n_out) = (num("n_input_layers")?, num("n_recurrent_layers")?, num("n_output_layers")?);
+    anyhow::ensure!(layer_pattern.len() == n && n_in + n_rec + n_out == n, "dory config: layer counts disagree");
+    let (nh, nk, hd) = (num("num_attention_heads")?, num("num_key_value_heads")?, num("head_dim")?);
+    anyhow::ensure!(nk > 0 && nh % nk == 0 && hd % 2 == 0, "dory config: attention geometry {nh}/{nk}/{hd}");
+    anyhow::ensure!(config.get("hidden_act").and_then(|v| v.as_str()) == Some("silu"), "dory config: hidden_act");
+    anyhow::ensure!(
+        config.get("tie_word_embeddings").and_then(|v| v.as_bool()) == Some(false),
+        "dory config: tied embeddings"
+    );
+    let rope = |kind: &str| -> anyhow::Result<f64> {
+        let r = config
+            .get("rope_parameters")
+            .and_then(|v| v.get(kind))
+            .ok_or_else(|| anyhow::anyhow!("dory config: no rope profile {kind}"))?;
+        anyhow::ensure!(
+            r.get("rope_type").and_then(|v| v.as_str()) == Some("default")
+                && r.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) == 1.0,
+            "dory config: rope profile {kind}"
+        );
+        r.get("rope_theta").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("dory config: no theta in {kind}"))
+    };
+    let hidden = num("hidden_size")?;
+    let record = cortiq_core::DoryConfig {
+        n_input_layers: n_in,
+        n_recurrent_layers: n_rec,
+        n_output_layers: n_out,
+        n_recurrent_loops: num("n_recurrent_loops")?,
+        recurrent_kv_cache_mode: config
+            .get("recurrent_kv_cache_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("per_loop")
+            .to_string(),
+        layer_pattern,
+        sliding_window: num("sliding_window")?,
+        rope_theta_full: rope("full_attention")?,
+        rope_theta_sliding: rope("sliding_attention")?,
+        initializer_range: real("initializer_range")?,
+        ngpt_alpha_init: real("ngpt_alpha_init")?,
+        // vLLM: a null init means sqrt(hidden_size).
+        gate_logit_scale_init: config
+            .get("attention_output_gate_logit_scale_init")
+            .and_then(|v| v.as_f64())
+            .unwrap_or((hidden as f64).sqrt()),
+        turbo: None,
+    };
+    let plain = serde_json::json!({
+        "model_type": "qwen3",
+        "vocab_size": num("vocab_size")?,
+        "hidden_size": hidden,
+        "num_hidden_layers": n,
+        "intermediate_size": num("intermediate_size")?,
+        "num_attention_heads": nh,
+        "num_key_value_heads": nk,
+        "head_dim": hd,
+        "max_position_embeddings": num("max_position_embeddings")?,
+        "tie_word_embeddings": false,
+        "hidden_act": "silu",
+        "rope_theta": record.rope_theta_full,
+    });
+    let mut arch = build_arch(&plain)?;
+    arch.arch_name = "dory".into();
+    arch.sliding_window = Some(record.sliding_window);
+    arch.layer_types = record
+        .layer_pattern
+        .chars()
+        .map(|c| if c == 'S' { LayerType::SlidingAttention } else { LayerType::FullAttention })
+        .collect();
+    arch.dory = Some(record);
+    Ok(arch)
+}
+
+/// Dory: the embedding and layers at the usual prefixes. A layer keeps its own
+/// spelling (`mixer.q_proj`, `attn_alpha`): the engine runs its own stack.
+fn dory_canon(raw: &str) -> String {
+    if raw == "backbone.embeddings.weight" {
+        return "model.embed_tokens.weight".into();
+    }
+    match raw.strip_prefix("backbone.layers.") {
+        Some(rest) => format!("model.layers.{rest}"),
+        None => raw.to_string(),
+    }
 }
 
 /// Spark-X2.5 (`spark2_5`) onto the canonical layout: the embedding is
@@ -1012,6 +1115,19 @@ fn force_arch_f32(arch: &ModelArch, name: &str) -> bool {
     force_f32(name)
         || (arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE
             && name.ends_with(".mlp.gate.weight"))
+        || (arch.dory.is_some() && dory_scale_vector(name))
+}
+
+/// Dory's learned scale vectors go through a square and into a sigmoid or a
+/// normalized blend: BF16 widens to f32 exactly, an f16 would round them.
+pub(crate) fn dory_scale_vector(name: &str) -> bool {
+    name == "lm_head.logit_scale"
+        || name.ends_with(".mixer.sqk")
+        || name.ends_with(".mixer.s_gate")
+        || name.ends_with(".mixer.suv_gate")
+        || name.ends_with(".mixer.suv_up")
+        || name.ends_with(".attn_alpha")
+        || name.ends_with(".mlp_alpha")
 }
 
 /// Name-level "never quantize this matrix" rule, for tools that re-encode a
@@ -6945,6 +7061,7 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
         }),
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         linear_core: None,
         anchor_core: None,
@@ -6968,6 +7085,11 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
 }
 
 fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    // Dory: a looped normalized GPT. The generic fields describe the plain
+    // geometry, the record carries everything the engine's own stack reads.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("dory") {
+        return dory_arch(config);
+    }
     // Clover (`clover_moe`): the Qwen3.6-35B-A3B trunk, decoded by block
     // diffusion. The trunk converts exactly as `qwen3_5_moe_text` — the same
     // tensors, plus each GDN layer's right convolution and softmax controls,
@@ -7784,6 +7906,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
         }),
         block_diffusion: None,
+        dory: None,
         // Keep the complete original HF object, including the text/vision
         // sub-configs and quantization policy. V4.1 runtime initialization
         // consumes this verbatim for multimodal and Engram geometry.
@@ -11982,6 +12105,60 @@ pub(crate) mod tests {
             "model.layers.7.self_attn.compressor.wkv.weight"
         );
         assert_eq!(m("layers.7.hc_attn_scale"), "model.layers.7.hc_attn_scale");
+    }
+
+    #[test]
+    fn dory_config_and_names_reach_the_record() {
+        let mut types = vec!["sliding_attention", "mlp", "full_attention", "mlp"];
+        types.extend_from_slice(&["sliding_attention", "mlp", "full_attention", "mlp"]);
+        let config = serde_json::json!({
+            "model_type": "dory",
+            "vocab_size": 64,
+            "hidden_size": 16,
+            "num_hidden_layers": 8,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false,
+            "ngpt_alpha_init": 0.05,
+            "attention_output_gate_logit_scale_init": null,
+            "n_input_layers": 2,
+            "n_recurrent_layers": 4,
+            "n_output_layers": 2,
+            "n_recurrent_loops": 2,
+            "recurrent_kv_cache_mode": "per_loop",
+            "hidden_act": "silu",
+            "initializer_range": 0.0177,
+            "sliding_window": 32,
+            "rope_parameters": {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 1.0},
+                "full_attention": {"rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 1.0}
+            },
+            "layer_types": types,
+        });
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "dory");
+        let rec = arch.dory.as_ref().unwrap();
+        assert_eq!(rec.layer_pattern, "S-*-S-*-");
+        assert_eq!((rec.n_input_layers, rec.n_recurrent_layers, rec.n_output_layers), (2, 4, 2));
+        assert_eq!(rec.rope_theta_full, 1e7);
+        assert!((rec.gate_logit_scale_init - 4.0).abs() < 1e-9, "null means sqrt(hidden)");
+        assert_eq!(
+            canon_name_for_arch(&arch, "backbone.embeddings.weight", MimoTowers::TextOnly).as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            canon_name_for_arch(&arch, "backbone.layers.3.mixer.up_proj.weight", MimoTowers::TextOnly).as_deref(),
+            Some("model.layers.3.mixer.up_proj.weight")
+        );
+        assert!(force_arch_f32(&arch, "model.layers.1.mlp_alpha"));
+        assert!(force_arch_f32(&arch, "lm_head.logit_scale"));
+        assert!(!force_arch_f32(&arch, "lm_head.weight"));
+        // A record with loops survives the file header's serde.
+        let back: ModelArch = serde_json::from_str(&serde_json::to_string(&arch).unwrap()).unwrap();
+        assert_eq!(back.dory.as_ref(), Some(rec));
     }
 
     #[test]

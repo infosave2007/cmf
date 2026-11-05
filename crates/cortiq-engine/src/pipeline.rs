@@ -248,6 +248,8 @@ pub struct Pipeline {
     /// DeepSeek-V4.1 owns the shared CED/CSA2 attention state, raw Engram
     /// lookup and four-stream mHC handoff. It cannot use the V4 cache
     /// layout, so it has a dedicated executor and state tuple.
+    /// Dory: a looped normalized GPT, its weights and KV state (`dory`).
+    pub dory: Option<Box<(crate::dory::Dory, crate::dory::DoryState)>>,
     pub dsv41: Option<
         Box<(
             crate::dsv41::Dsv41Globals,
@@ -1621,6 +1623,7 @@ impl Pipeline {
             && !self.per_token_stack()
             && self.dsv4.is_none()
             && self.dsv41.is_none()
+            && self.dory.is_none()
             && self.qwen4_exp.is_none()
             && self.weights.layers.iter().all(|lw| {
                 // LFM2/LFM3's short-conv mixer is two projection GEMMs and
@@ -1851,6 +1854,10 @@ impl Pipeline {
         if let Some(b) = &mut self.dsv41 {
             b.3.clear();
         }
+        if let Some(b) = &mut self.dory {
+            b.1.clear();
+            crate::gpu::dory_reset(self.graph_kv_id);
+        }
         crate::gpu::graph_kv_reset(self.graph_kv_id);
         // MTP is detached from `self` for the duration of generation, so its
         // device mirror is not covered by the trunk reset above.  Reset the
@@ -1866,7 +1873,7 @@ impl Pipeline {
     /// prefill runs through the token graph keeps its device state as the
     /// authority and is left untouched.
     fn prepare_kv_reuse(&mut self, reuse_from: usize) -> bool {
-        if self.graph_prefill_preferred() {
+        if self.dory.is_some() || self.graph_prefill_preferred() {
             return true;
         }
         let kv_id = self.graph_kv_id;
@@ -4005,6 +4012,7 @@ impl Pipeline {
             g3n: None,
             g4e: None,
             dsv4: None,
+            dory: None,
             dsv41: None,
             dsv41_vision: None,
             dsv41_prefill: None,
@@ -4134,6 +4142,9 @@ impl Pipeline {
     /// Bytes the resident device graph holds for this pipeline's sequence:
     /// `(recurrent state, anchor KV/ring)`; None on the host path.
     pub fn device_state_bytes(&self) -> Option<(u64, u64)> {
+        if self.dory.is_some() {
+            return crate::gpu::dory_kv_bytes(self.graph_kv_id).map(|b| (0, b));
+        }
         crate::gpu::embryo_device_state_bytes(self.graph_kv_id)
     }
 
@@ -4151,6 +4162,11 @@ impl Pipeline {
 
     /// `set_o1` that reports the refusal instead of logging it.
     pub fn try_set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) -> Result<(), String> {
+        // Dory runs its own stack: the far field goes on its full layers.
+        if let Some(b) = &mut self.dory {
+            b.0.o1 = cfg.map(|c| crate::dory::DoryO1 { m: c.m, w: c.w, sink: c.sink, seal: (c.w + c.sink + 16).max(8192) });
+            return Ok(());
+        }
         if let Some(c) = &cfg {
             if let Some(why) = self.o1_refusal() {
                 self.o1_flags = Vec::new();
@@ -5090,7 +5106,9 @@ impl Pipeline {
         // Extension-only (no rollback), so it is exact for every layer
         // kind including recurrent state; MTP/o1/task-mask runs keep
         // the fresh-sequence path. CMF_KV_REUSE=0 disables.
-        let mut reuse_from = {
+        let mut reuse_from = if self.dory.is_some() {
+            self.dory_cached_prefix(input_ids)
+        } else {
             let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
             if on
                 && prompt_rows.is_none()
@@ -5112,7 +5130,17 @@ impl Pipeline {
         }
         // A diverging turn (`rollback_prefix_len`): drop every row past the
         // common prefix, so the tail prefill appends at `reuse_from`.
-        if reuse_from > 0 && !self.bounded_native() && reuse_from < self.kv_history.len() {
+        if reuse_from > 0 && self.dory.is_some() && reuse_from < self.kv_history.len() {
+            // The device's rings are addressed by position, so going back there
+            // is only this: the next rows overwrite the rolled-back ones.
+            if let Some(b) = &mut self.dory {
+                let kv_row = b.0.cfg.nk * b.0.cfg.hd;
+                b.1.rollback(reuse_from, kv_row);
+            }
+            self.kv_history.truncate(reuse_from);
+            self.graph_logits = None;
+        }
+        if reuse_from > 0 && self.dory.is_none() && !self.bounded_native() && reuse_from < self.kv_history.len() {
             for l in &mut self.kv_cache.layers {
                 let d = l.pos_len() - reuse_from;
                 l.truncate_last(d);
@@ -5609,6 +5637,12 @@ impl Pipeline {
                 self.graph_logits = Some(lg);
             }
             pos = end;
+            hidden = vec![0.0; self.hidden_size];
+        }
+        if self.dory.is_some() && mtp.is_none() && pos < input_ids.len() {
+            let lg = self.dory_forward(&input_ids[pos..], pos, crate::dory::Want::Last);
+            self.graph_logits = Some(lg);
+            pos = input_ids.len();
             hidden = vec![0.0; self.hidden_size];
         }
         let dsv41_prefill = self.dsv41_prefill.take();
@@ -6539,7 +6573,7 @@ impl Pipeline {
             // Catch-all for decode paths that bypass the walks' own trim
             // (a graph step, a speculative round).
             self.swa_trim_tails();
-            if self.dsv41.is_none() && self.kv_cache.needs_eviction() {
+            if self.dsv41.is_none() && self.dory.is_none() && self.kv_cache.needs_eviction() {
                 // Say it ONCE, loudly: past this point the model keeps
                 // talking but has lost half its context, and on a GDN
                 // hybrid the graph's device state goes stale on top. The
@@ -9517,6 +9551,9 @@ impl Pipeline {
         }
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
+        if self.dory.is_some() {
+            return Ok(self.dory_forward(ids, 0, crate::dory::Want::Last));
+        }
         if let Some(b) = &mut self.dsv41 {
             let pool = self.pool.clone();
             let mut logits = Vec::new();
@@ -10940,12 +10977,101 @@ impl Pipeline {
         Ok(r)
     }
 
+    /// The positions of `input_ids` a Dory sequence already holds: the common
+    /// prefix, unless going back to it passes what a sliding ring still keeps.
+    fn dory_cached_prefix(&self, input_ids: &[u32]) -> usize {
+        if std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0") {
+            return 0;
+        }
+        let h = &self.kv_history;
+        let lcp = h.iter().zip(input_ids).take_while(|(a, b)| a == b).count();
+        let n = lcp.min(input_ids.len().saturating_sub(1));
+        if n == 0 || h.len() - n > crate::dory::REWIND {
+            return 0;
+        }
+        // Rows past the prefix have gone through the far field: a sealed sequence can
+        // only be extended, and a turn that goes back starts over.
+        let sealed = crate::gpu::dory_sealed(self.graph_kv_id)
+            || self.dory.as_ref().is_some_and(|b| b.1.slots.iter().flatten().any(|s| !s.far.is_empty()));
+        if n < h.len() && sealed {
+            return 0;
+        }
+        n
+    }
+
+    /// Dory's score: chunks through its own stack, logits of every row.
+    fn dory_nll(&mut self, ids: &[u32], start: usize) -> Result<(f64, usize), String> {
+        self.clear_sequence_state();
+        let chunk: usize = std::env::var("CMF_NLL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&c: &usize| c > 0)
+            .unwrap_or(128);
+        let vocab = self.vocab_size;
+        let n = ids.len().saturating_sub(1);
+        // `CMF_NLL_SKIP`: a prompt of so many rows goes in as a prompt does.
+        let skip: usize = std::env::var("CMF_NLL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let start = start.max(skip.min(n));
+        let (mut nll, mut cnt, mut pos) = (0f64, 0usize, 0usize);
+        while pos < n {
+            if pos < skip {
+                let end = (pos + 64).min(skip).min(n);
+                self.dory_forward(&ids[pos..end], pos, crate::dory::Want::None);
+                pos = end;
+                continue;
+            }
+            let end = (pos + chunk).min(n);
+            let lg = self.dory_forward(&ids[pos..end], pos, crate::dory::Want::All);
+            for (r, row) in lg.chunks_exact(vocab).enumerate() {
+                if pos + r < start {
+                    continue;
+                }
+                let target = ids[pos + r + 1] as usize;
+                let best = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+                let den: f64 = row.iter().map(|&x| ((x as f64) - best).exp()).sum();
+                nll += den.ln() - (row[target] as f64 - best);
+                cnt += 1;
+            }
+            pos = end;
+        }
+        Ok((nll, cnt))
+    }
+
+    /// Dory's forward over a chunk: the device path when it takes the file.
+    fn dory_forward(&mut self, ids: &[u32], pos: usize, want: crate::dory::Want) -> Vec<f32> {
+        let pool = self.pool.clone();
+        let id = self.graph_kv_id;
+        let b = self.dory.as_mut().expect("a Dory file");
+        let (m, st) = (&b.0, &mut b.1);
+        let mut logits = Vec::new();
+        let loops = m.cfg.loops;
+        // GPTQ's Hessian hook sees a matrix's input only on the host stack.
+        let host = crate::gptq_capture::capturing();
+        let file = m.file.clone();
+        if host || !crate::gpu::dory_forward(id, file.as_ref(), m, ids, pos, loops, want, &mut logits) {
+            logits.clear();
+            crate::dory::forward_host(m, st, ids, pos, loops, want, pool.as_deref(), None, &mut logits);
+        }
+        if m.o1.is_some() && std::env::var_os("CMF_DORY_KV_REPORT").is_some() {
+            let (e, f) = crate::dory::host_kv_bytes(st);
+            eprintln!("dory kv at {}: exact {:.1} MB, far {:.1} MB", pos + ids.len(), e as f64 / 1e6, f as f64 / 1e6);
+        }
+        if let Ok(dir) = std::env::var("CMF_DORY_DUMP") {
+            let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/{pos}.bin"), bytes);
+        }
+        logits
+    }
+
     fn nll_ids_inner(
         &mut self,
         ids: &[u32],
         start: usize,
         task_mask: Option<&TaskMask>,
     ) -> Result<(f64, usize), String> {
+        if self.dory.is_some() && task_mask.is_none() {
+            return self.dory_nll(ids, start);
+        }
         self.nll_begin()?;
         // Block diffusion on Apple silicon: the Metal executor's causal path.
         #[cfg(target_os = "macos")]
@@ -12593,7 +12719,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.dsv41.is_some() || self.qwen4_exp.is_some() {
+        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -13862,6 +13988,9 @@ impl Pipeline {
             return Err(
                 "network split: DeepSeek-V4 runs its own fused stack (not splittable yet)".into(),
             );
+        }
+        if self.dory.is_some() {
+            return Err("network split: Dory's looped stack is not splittable".into());
         }
         if self.dsv41.is_some() {
             return Err(
@@ -16397,6 +16526,7 @@ impl Pipeline {
             // the chain gathers embeddings itself: only the plain table
             || self.dsv4.is_some()
             || self.dsv41.is_some()
+            || self.dory.is_some()
             || self.qwen4_exp.is_some()
             || self.per_token_stack()
         {
@@ -17712,6 +17842,7 @@ impl Pipeline {
             || self.per_token_stack()
             || self.dsv4.is_some()
             || self.dsv41.is_some()
+            || self.dory.is_some()
             || self.qwen4_exp.is_some()
             // Dynamic routing swaps FFN weights mid-sequence under the
             // packed graph; a blend has no single overlay. A STATIC skill
@@ -18643,6 +18774,14 @@ impl Pipeline {
             self.dspark_probe(position, token_id);
             // The caller expects a hidden; the logits went out of band, as
             // with the fused lm_head path.
+            return vec![0.0; self.hidden_size];
+        }
+        // Dory owns its complete stack and emits logits out of band.
+        if self.dory.is_some() {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let lg = self.dory_forward(&[token_id], position, crate::dory::Want::Last);
+            self.graph_logits = Some(lg);
             return vec![0.0; self.hidden_size];
         }
         // DeepSeek-V4.1 owns its complete stack and emits logits out of band.

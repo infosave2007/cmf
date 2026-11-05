@@ -541,6 +541,46 @@ fn one_usize() -> usize {
     1
 }
 
+/// Geometry of a looped normalized GPT (`ModelArch::dory`). Each physical layer
+/// is one sub-layer: attention or a SwiGLU MLP, by `sliding`/`mlp` below.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoryConfig {
+    pub n_input_layers: usize,
+    pub n_recurrent_layers: usize,
+    pub n_output_layers: usize,
+    /// Default loop count; a request may override it, no retraining involved.
+    pub n_recurrent_loops: usize,
+    /// `per_loop` keeps a KV cache per loop, `last_loop` one per recurrent
+    /// attention layer, overwritten by each loop.
+    pub recurrent_kv_cache_mode: String,
+    /// One byte per physical layer: `S` sliding attention, `*` full attention, `-` MLP.
+    pub layer_pattern: String,
+    pub sliding_window: usize,
+    pub rope_theta_full: f64,
+    pub rope_theta_sliding: f64,
+    /// The learned scales are stored divided by these.
+    pub initializer_range: f64,
+    pub ngpt_alpha_init: f64,
+    pub gate_logit_scale_init: f64,
+    /// A file made to run fast by default (`cortiq dory-turbo`): the last-loop cache,
+    /// the patent-1 exit router in tensors `dory.router.*`, the far field. Explicit
+    /// flags win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turbo: Option<DoryTurbo>,
+}
+
+/// The defaults of a turbo Dory file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoryTurbo {
+    /// A token whose state after one pass scores at least this leaves the loop.
+    pub exit_bias: f32,
+    /// Far field on the full layers: landmarks, exact window, sinks, seal position.
+    pub o1: [usize; 4],
+    /// Rows of a sealed prompt kept exact, chosen by `dory.exact.weights`.
+    #[serde(default)]
+    pub exact_rows: usize,
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -675,6 +715,11 @@ pub struct ModelArch {
     /// run the model as a next-token predictor, which it is not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_diffusion: Option<BlockDiffusionConfig>,
+    /// A looped normalized GPT (NVIDIA Nemotron Labs Dory): input, recurrent
+    /// and output blocks, a shared block run several times per token. The
+    /// engine runs its own stack from this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dory: Option<DoryConfig>,
     /// DeepSeek-V4.1 source configuration, preserved verbatim for the
     /// multimodal/Engram runtime. The engine must read the nested
     /// `text_config`, `vision_config`, and `quantization_config` values from

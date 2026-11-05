@@ -37,6 +37,8 @@ pub mod egemma2;
 pub mod vit;
 // Unlimited-OCR's block-sparse attention on the graphs.
 pub mod uocr;
+// Dory's looped stack.
+pub mod dory;
 pub mod primal_vae;
 pub mod mhc;
 
@@ -19240,6 +19242,7 @@ fn o1_ensure_metal(
     li: usize,
     views: &[crate::nystrom::O1DeviceView<'_>],
     epoch: u64,
+    max_near: usize,
 ) -> Option<O1MetalDev> {
     {
         let reg = c.o1m.lock().unwrap();
@@ -19253,7 +19256,7 @@ fn o1_ensure_metal(
     let (gcnt, hcnt, m, w, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.w, g0.sink_len);
     // Same geometry gates as the wgpu port — and just as loud: a
     // silent refusal here costs the whole token its graph.
-    if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
+    if ns + w > max_near || m > 32 || g0.d > 256 || g0.dv > 256 {
         tracing::warn!(
             "o1-metal L{li}: sink+window {}+{} (cap 196), landmarks {m} (cap 32), d {} dv {} (cap 256)",
             ns,
@@ -20834,7 +20837,7 @@ impl TokenGraph {
         // ── O(1) layer: ensure the device state FIRST (upload on seal
         // epoch change) — a refusal must leave nothing half-encoded.
         let o1dev = match &p.o1 {
-            Some(o) => match o1_ensure_metal(self.c, p.kv_id, p.layer, &o.views, o.epoch) {
+            Some(o) => match o1_ensure_metal(self.c, p.kv_id, p.layer, &o.views, o.epoch, 196) {
                 Some(d) => Some(d),
                 None => return false,
             },
@@ -25336,6 +25339,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             block_diffusion: None,
+            dory: None,
             deepseek_v41: None,
             anchor_core: None,
             linear_core: None,
@@ -25478,6 +25482,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             block_diffusion: None,
+            dory: None,
             deepseek_v41: None,
             anchor_core: None,
             linear_core: None,
@@ -25657,6 +25662,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             block_diffusion: None,
+            dory: None,
             deepseek_v41: None,
             anchor_core: None,
             linear_core: None,

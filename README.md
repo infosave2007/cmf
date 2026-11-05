@@ -114,6 +114,20 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Nemotron-Labs Dory 1.0 4B, a looped transformer (0.8.57)
+
+[Dory](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) runs a block of 40 sub-layers
+several times over the same weights. The 2.09 GB turbo file picks one pass or two for each token with
+a resonance router, keeps a long prompt in 0.5 GB of device memory, and keeps passwords and codes
+exact, chosen by what the layers do with them. An NVIDIA L4 decodes at 61 tok/s on real prompts and at
+54 tok/s at 64 000 tokens of context, a MacBook Air M4 at 33 and at 29 at 16 000:
+
+```sh
+cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list." --no-think
+```
+
+See [the guide](docs/DORY.md).
+
 ## Kandinsky S2V 1.0 Pro-distill, speech to video (0.8.55)
 
 [Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)

@@ -574,6 +574,29 @@ pub(crate) fn encode_q4tp_mm_r(
     true
 }
 
+/// The pipeline, bind group and workgroup grid of `encode_q4tp_mm_r`.
+pub(crate) fn q4tp_mm_r_prep(
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+) -> Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)> {
+    let (p, l) = pipes(c).and_then(|p| p.mm_r.as_ref())?;
+    if cols % 64 != 0 || rows == 0 || nb == 0 || rows.div_ceil(64) > MAX_WG as usize {
+        return None;
+    }
+    let u = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, nb as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q4mm-r"),
+        layout: l,
+        entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &u)],
+    });
+    Some((p.clone(), bind, rows.div_ceil(64) as u32, nb.div_ceil(64) as u32))
+}
+
 pub(crate) fn pipes(c: &Ctx) -> Option<&Pipes> {
     c.dense_batch_pipes.get_or_init(|| build(c)).as_ref()
 }

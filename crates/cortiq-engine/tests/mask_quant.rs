@@ -108,6 +108,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         moe: None,
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         anchor_core: None,
         linear_core: None,

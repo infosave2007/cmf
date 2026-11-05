@@ -137,6 +137,7 @@ fn arch(g: Geom, bounded: bool) -> ModelArch {
         moe: None,
         qwen4_exp: None,
         block_diffusion: None,
+        dory: None,
         deepseek_v41: None,
         anchor_core: bounded.then(|| AnchorCoreConfig {
             kind: "swa_sink_v1".into(),
