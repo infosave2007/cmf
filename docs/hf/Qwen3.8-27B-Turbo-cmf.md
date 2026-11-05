@@ -75,9 +75,8 @@ accepted ones only. Greedy text stays the same with and without drafts.
 
 RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length.
 
-| prompt, tokens | first token, s | | decode, tok/s | | peak device memory, GB | |
+| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak device memory, GB (standard) | peak device memory, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| | standard | **turbo** | standard | **turbo** | standard | **turbo** |
 | 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
 | 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
 | 16 000 | 42 | **47** | 87 | **92** | 16.5 | **15.5** |
@@ -86,9 +85,8 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length
 
 A real answer, 400 tokens of a summary of Wikipedia articles, with about half of the drafts accepted:
 
-| prompt | first token, s | | decode, tok/s | |
+| prompt | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) |
 |---|---:|---:|---:|---:|
-| | standard | **turbo** | standard | **turbo** |
 | 30 000 characters | 19.2 | **18.6** | 76.4 | **76.3** |
 | 100 000 characters | 76.7 | **72.1** | 50.9 | **60.4** |
 
@@ -213,9 +211,8 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 
 RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промпта этой длины.
 
-| промпт, токенов | первый токен, с | | декод, ток/с | | пик памяти карты, ГБ | |
+| промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик памяти карты, ГБ (обычный) | пик памяти карты, ГБ (**турбо**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| | обычный | **турбо** | обычный | **турбо** | обычный | **турбо** |
 | 1 000 | 2,2 | **2,2** | 105 | **105** | 14,5 | **14,4** |
 | 4 000 | 8,8 | **8,8** | 104 | **104** | 14,9 | **14,8** |
 | 16 000 | 42 | **47** | 87 | **92** | 16,5 | **15,5** |
@@ -224,9 +221,8 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 
 Настоящий ответ: 400 токенов пересказа статей Википедии, принята примерно половина черновиков.
 
-| промпт | первый токен, с | | декод, ток/с | |
+| промпт | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) |
 |---|---:|---:|---:|---:|
-| | обычный | **турбо** | обычный | **турбо** |
 | 30 000 символов | 19,2 | **18,6** | 76,4 | **76,3** |
 | 100 000 символов | 76,7 | **72,1** | 50,9 | **60,4** |
 
@@ -335,9 +331,8 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 
 RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 token。
 
-| 提示,token 数 | 首个 token,秒 | | 解码,tok/s | | 显存峰值,GB | |
+| 提示,token 数 | 首个 token,秒(普通) | 首个 token,秒(**turbo**) | 解码,tok/s(普通) | 解码,tok/s(**turbo**) | 显存峰值,GB(普通) | 显存峰值,GB(**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| | 普通 | **turbo** | 普通 | **turbo** | 普通 | **turbo** |
 | 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
 | 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
 | 16 000 | 42 | **47** | 87 | **92** | 16.5 | **15.5** |
@@ -346,9 +341,8 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 
 真实回答:400 个 token 的维基百科文章摘要,约一半草稿被接受。
 
-| 提示 | 首个 token,秒 | | 解码,tok/s | |
+| 提示 | 首个 token,秒(普通) | 首个 token,秒(**turbo**) | 解码,tok/s(普通) | 解码,tok/s(**turbo**) |
 |---|---:|---:|---:|---:|
-| | 普通 | **turbo** | 普通 | **turbo** |
 | 30 000 字符 | 19.2 | **18.6** | 76.4 | **76.3** |
 | 100 000 字符 | 76.7 | **72.1** | 50.9 | **60.4** |
 

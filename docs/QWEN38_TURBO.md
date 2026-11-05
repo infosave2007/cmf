@@ -65,9 +65,8 @@ of the card. Blocks of 16 MiB take this back for every model on Vulkan, at the s
 
 RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length.
 
-| prompt, tokens | first token, s | | decode, tok/s | | peak device memory, GB | |
+| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak device memory, GB (standard) | peak device memory, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| | standard | **turbo** | standard | **turbo** | standard | **turbo** |
 | 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
 | 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
 | 16 000 | 42 | **47** | 87 | **92** | 16.5 | **15.5** |
