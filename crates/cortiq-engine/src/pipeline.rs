@@ -1623,13 +1623,13 @@ pub(crate) fn o1_seal_for_card(seal: usize, weight_bytes: u64) -> usize {
 
 /// Rows of an archive as they come in: in RAM, or in a file (`CMF_O1_SPILL=DIR`) when
 /// RAM is short and a disk is not.
-enum ArchStore {
+pub(crate) enum ArchStore {
     Ram(Vec<f32>),
     Disk { path: std::path::PathBuf, file: std::io::BufWriter<std::fs::File> },
 }
 
 impl ArchStore {
-    fn new(dir: Option<&std::path::Path>, name: String) -> Result<Self, String> {
+    pub(crate) fn new(dir: Option<&std::path::Path>, name: String) -> Result<Self, String> {
         let Some(dir) = dir else { return Ok(Self::Ram(Vec::new())) };
         std::fs::create_dir_all(dir).map_err(|e| format!("O(1) spill {}: {e}", dir.display()))?;
         let path = dir.join(format!("cortiq-o1-{}-{name}.rows", std::process::id()));
@@ -1637,7 +1637,7 @@ impl ArchStore {
         Ok(Self::Disk { path, file: std::io::BufWriter::with_capacity(1 << 22, file) })
     }
 
-    fn push(&mut self, rows: &[f32]) -> Result<(), String> {
+    pub(crate) fn push(&mut self, rows: &[f32]) -> Result<(), String> {
         match self {
             Self::Ram(v) => {
                 v.extend_from_slice(rows);
@@ -1652,7 +1652,7 @@ impl ArchStore {
         }
     }
 
-    fn freeze(mut self) -> Result<ArchRows, String> {
+    pub(crate) fn freeze(mut self) -> Result<ArchRows, String> {
         match self {
             Self::Ram(ref mut v) => Ok(ArchRows::Ram(std::mem::take(v))),
             Self::Disk { ref mut path, ref mut file } => {
@@ -1678,13 +1678,13 @@ impl Drop for ArchStore {
     }
 }
 
-enum ArchRows {
+pub(crate) enum ArchRows {
     Ram(Vec<f32>),
     Disk { map: Option<memmap2::Mmap>, path: std::path::PathBuf },
 }
 
 impl ArchRows {
-    fn as_slice(&self) -> &[f32] {
+    pub(crate) fn as_slice(&self) -> &[f32] {
         match self {
             Self::Ram(v) => v,
             Self::Disk { map, .. } => {

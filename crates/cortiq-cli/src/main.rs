@@ -303,7 +303,7 @@ struct Cli {
     full_window: Option<usize>,
 
     /// Keep a long prompt's rows in files in this directory instead of RAM, while the far
-    /// field is built (`--o1`, turbo files). About 300 KB a row on a 27B model.
+    /// field is built (`--o1`, turbo files). About 300 KB a row on a 27B model, 160 KB on Dory.
     #[arg(long, global = true, value_name = "DIR")]
     o1_spill: Option<String>,
     #[command(subcommand)]

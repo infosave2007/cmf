@@ -171,6 +171,22 @@ kernel void dory_gate(
     z[base + e] = acc * inv / (1.0f + float4(exp(x.x), exp(x.y), exp(x.z), exp(x.w)));
 }
 
+// The gate over the output of `o1c`, on a sealed prompt chunk.
+kernel void dory_gate1(
+    device const float4* zi  [[buffer(0)]],
+    device const float4* g_  [[buffer(1)]],
+    device const float4* sg  [[buffer(2)]],
+    device float4*       z   [[buffer(3)]],
+    constant P&          p   [[buffer(4)]],
+    uint2 id [[thread_position_in_grid]])
+{
+    uint n = p.nh * (p.hd / 4u);
+    if (id.x >= n) return;
+    uint at = id.y * n + id.x;
+    float4 x = -(g_[at] * sg[id.x]);
+    z[at] = zi[at] / (1.0f + float4(exp(x.x), exp(x.y), exp(x.z), exp(x.w)));
+}
+
 // The MLP activation, in place in the gate's output.
 kernel void dory_silu(
     device float4*       g_ [[buffer(0)]],

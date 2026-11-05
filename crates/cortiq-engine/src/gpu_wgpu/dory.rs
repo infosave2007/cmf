@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::dory::{Dory, ExitRate, Gate, KvMode, Layer, Want, top_prob};
+use crate::pipeline::ArchStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -371,6 +372,14 @@ fn dory_qcopy(@builtin(global_invocation_id) g: vec3<u32>) {
     qc_out[at / QT_STRIDE * n + e] = qc_in[g.y * n + e];
 }
 
+// A sealed prompt chunk's queries, on their way to the archive.
+@compute @workgroup_size(32)
+fn dory_qarch(@builtin(global_invocation_id) g: vec3<u32>) {
+    let n = p.nh * (p.hd / 4u);
+    if (g.x >= n) { return; }
+    qc_out[g.y * n + g.x] = qc_in[g.y * n + g.x];
+}
+
 @group(0) @binding(33) var<storage, read_write> ob_meta: array<u32>;
 @compute @workgroup_size(1)
 fn dory_o1_back(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -394,7 +403,7 @@ fn dory_gate1(@builtin(global_invocation_id) g: vec3<u32>) {
     nz[at] = g1_z[at] / (1.0 + exp(-(ag[at] * asg[e])));
 }
 
-// ── A sealed prompt chunk's keys and values, kept for the choice of exact rows.
+// ── A sealed prompt chunk's keys and values, on their way to the archive.
 @group(0) @binding(60) var<storage, read> ar_k: array<vec4<f32>>;
 @group(0) @binding(61) var<storage, read> ar_v: array<vec4<f32>>;
 @group(0) @binding(62) var<storage, read_write> ar_ko: array<vec4<f32>>;
@@ -686,12 +695,10 @@ fn rmax4(lid: u32, v: vec4<f32>) -> vec4<f32> {
 }
 "#;
 
-/// One row in this many keeps its queries for the seal: landmark queries are means
-/// over long segments, and a row's queries take 16 KB per full layer and loop.
-const QT_STRIDE: usize = 8;
+use crate::dory::QT_STRIDE;
 /// A prompt this long seals before it ends: 8 KB a row per full layer and loop.
 const SEAL_MAX: usize = 8192;
-/// Rows of a sealed prompt kept on the card for the choice of exact ones.
+/// Rows of a sealed prompt kept off the card for the choice of exact ones.
 const ARCH_MAX: usize = 65536;
 /// Rows of a prompt chunk.
 pub(crate) const CHUNK: usize = 64;
@@ -718,6 +725,7 @@ struct Pipes {
     slerp: Pipe,
     mix: [Pipe; 5],
     qcopy: Pipe,
+    qarch: Pipe,
     o1_back: Pipe,
     gate1: Pipe,
     arch: Pipe,
@@ -778,6 +786,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 slerp: mk("dory_slerp"),
                 mix: [mk("dory_mix0"), mk("dory_mix1"), mk("dory_mix2"), mk("dory_mix3"), mk("dory_mix4")],
                 qcopy: mk("dory_qcopy"),
+                qarch: mk("dory_qarch"),
                 o1_back: mk("dory_o1_back"),
                 gate1: mk("dory_gate1"),
                 arch: mk("dory_arch"),
@@ -964,12 +973,31 @@ pub(crate) struct Device {
     /// Key of the sequence's O(1) states in `Ctx::o1m`.
     id: u64,
     sealed: bool,
-    /// Rows of the sealed prompt still kept for the choice of exact ones; 0: none.
-    arch_rows: usize,
+    /// The sealed prompt's rows, off the card until the far field is built anew over them.
+    arch: Option<Archive>,
     seal_epoch: u64,
     o1_refused: bool,
-    /// The queries of a full slot up to the seal.
+    /// The queries of a full slot up to the seal; past it, of the chunk on its way out.
     qtrace: HashMap<(usize, usize), wgpu::Buffer>,
+}
+
+/// One slot's rows past the first seal.
+struct ArchSlot {
+    ord: usize,
+    sl: usize,
+    k: ArchStore,
+    v: ArchStore,
+    /// One row in `QT_STRIDE`.
+    q: ArchStore,
+}
+
+/// A long prompt's rows, in RAM or in files (`CMF_O1_SPILL`). On the card they would take
+/// more than the weights: a slot there holds one chunk, read back as it ends.
+struct Archive {
+    slots: Vec<ArchSlot>,
+    rows: usize,
+    /// One chunk of all the slots.
+    staging: wgpu::Buffer,
 }
 
 struct Parts {
@@ -1150,7 +1178,7 @@ fn build(c: &Ctx, m: &Dory) -> Option<Device> {
         t0.elapsed().as_secs_f64()
     );
     let slots = (0..m.attn_layers).map(|_| Vec::new()).collect();
-    Some(Device { layers, head, s, slots, plans: HashMap::new(), head_plan: HashMap::new(), parts: None, gate_tokens: 0, gate_one: 0, exits: ExitRate::default(), id: 0, sealed: false, arch_rows: 0, seal_epoch: 0, o1_refused: false, qtrace: HashMap::new() })
+    Some(Device { layers, head, s, slots, plans: HashMap::new(), head_plan: HashMap::new(), parts: None, gate_tokens: 0, gate_one: 0, exits: ExitRate::default(), id: 0, sealed: false, arch: None, seal_epoch: 0, o1_refused: false, qtrace: HashMap::new() })
 }
 
 /// Pieces of a value sum over `n` keys: short threads on every SM beat long ones
@@ -1294,19 +1322,20 @@ fn record(c: &'static Ctx, d: &Device, m: &Dory, loops: usize, k: usize) -> Opti
                         y: kx,
                         kind: Kind::Prep,
                     });
-                    if k > 1 && d.arch_rows > 0 {
+                    if k > 1 && d.arch.is_some() {
                         let slot = &d.slots[a.ordinal][sl];
                         out.push(Step {
                             pipe: p.arch.p.clone(),
-                            bg: bind_pairs(c, &p.arch.l, &[(0, &s.u[1]), (60, &s.kt), (61, &s.vt), (62, &slot.k), (63, &slot.v)]),
+                            // `s.u[2]`: the chunk's own rows, from row 0 of the slot.
+                            bg: bind_pairs(c, &p.arch.l, &[(0, &s.u[2]), (60, &s.kt), (61, &s.vt), (62, &slot.k), (63, &slot.v)]),
                             x: ((cf.nk * cf.hd / 4) as u32).div_ceil(32),
                             y: kx,
                             kind: Kind::Prep,
                         });
                         if let Some(tr) = d.qtrace.get(&(a.ordinal, sl)) {
                             out.push(Step {
-                                pipe: p.qcopy.p.clone(),
-                                bg: bind_pairs(c, &p.qcopy.l, &[(0, &s.u[1]), (34, &s.qo), (35, tr)]),
+                                pipe: p.qarch.p.clone(),
+                                bg: bind_pairs(c, &p.qarch.l, &[(0, &s.u[1]), (34, &s.qo), (35, tr)]),
                                 x: ((cf.nh * cf.hd / 4) as u32).div_ceil(32),
                                 y: kx,
                                 kind: Kind::Prep,
@@ -1575,14 +1604,14 @@ pub(crate) fn forward(
         let batch = !d.sealed
             || (o1_batch::pipes(c).is_some()
                 && m.o1.is_some_and(|o| {
-                    let extra = if d.arch_rows > 0 { 0 } else { m.exact.as_ref().map_or(0, |x| x.budget) };
+                    let extra = if d.arch.is_some() { 0 } else { m.exact.as_ref().map_or(0, |x| x.budget) };
                     o.w >= o1_batch::OB_K && o.sink + extra <= 255 && o.w + o.sink + extra <= 2052
                 }));
         let k = if k < 8 || !batch { 1 } else { k };
         // The prompt's last rows, rows that take the decode path, or rows that would pass
         // what is kept: the choice comes now.
         let tail_from = (pos0 + ids.len()).saturating_sub(crate::dory::EXACT_TAIL);
-        if d.arch_rows > 0 && (k == 1 || pos0 + at + k > ARCH_MAX || pos0 + at >= tail_from) {
+        if d.arch.is_some() && (k == 1 || pos0 + at + k > ARCH_MAX || pos0 + at >= tail_from) {
             if !m.o1.is_some_and(|o1| seal(c, d, m, o1, pos0 + at, true)) {
                 return false;
             }
@@ -1593,10 +1622,12 @@ pub(crate) fn forward(
         if !run(c, d, m, &ids[at..at + k], pos0 + at, m.chunk_loops(loops, w), w, kv_row, logits) {
             return false;
         }
-        at += k;
-        if d.arch_rows > 0 && k > 1 {
-            d.arch_rows = pos0 + at;
+        if d.arch.is_some() && k > 1 {
+            if let Err(e) = archive_chunk(c, d, cf, pos0 + at, k) {
+                give_up_rows(c, d, &e);
+            }
         }
+        at += k;
         if let (Some(o1), false, false) = (m.o1, d.sealed, d.o1_refused) {
             let rows = pos0 + at;
             // At a prompt's end: its rows go fastest exact, and a long one seals
@@ -1611,7 +1642,7 @@ pub(crate) fn forward(
             }
         }
     }
-    if d.arch_rows > 0 && !m.o1.is_some_and(|o1| seal(c, d, m, o1, pos0 + ids.len(), true)) {
+    if d.arch.is_some() && !m.o1.is_some_and(|o1| seal(c, d, m, o1, pos0 + ids.len(), true)) {
         return false;
     }
     true
@@ -1648,12 +1679,11 @@ fn run(
         let rec = li >= cf.n_in && li < cf.n_in + cf.n_rec;
         let n = if rec && per_loop { loops } else { 1 };
         for sl in 0..n {
-            if !sliding && d.sealed && !(d.arch_rows > 0 && k > 1) {
+            if !sliding && d.sealed {
                 continue;
             }
             if let (false, Some(o1), false, false, false) = (sliding, m.o1, d.sealed, d.o1_refused, d.qtrace.contains_key(&(ord, sl))) {
-                let top = if m.exact.is_some() { ARCH_MAX } else { SEAL_MAX };
-                let b = buf(c, "dory-qtrace", (top + CHUNK) / QT_STRIDE * cf.nh * cf.hd * 4, STORE);
+                let b = buf(c, "dory-qtrace", (SEAL_MAX.max(o1.seal) + CHUNK) / QT_STRIDE * cf.nh * cf.hd * 4, STORE);
                 d.qtrace.insert((ord, sl), b);
                 d.plans.clear();
                 d.parts = None;
@@ -1991,12 +2021,147 @@ fn cf_kv(m: &Dory) -> KvMode {
     m.cfg.kv
 }
 
-/// O(1) on the full layers from here on: read the slots back, freeze landmarks over
-/// them (`nystrom`), upload the states, free the exact rows.
-fn seal(c: &'static Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows: usize, last: bool) -> bool {
+/// A sealed chunk's rows leave the card; the next chunk overwrites them.
+fn archive_chunk(c: &'static Ctx, d: &mut Device, cf: &crate::dory::DoryCfg, pos: usize, k: usize) -> Result<(), String> {
+    let (qrow, kv_row) = (cf.nh * cf.hd, cf.nk * cf.hd);
+    let Some(a) = d.arch.as_mut() else { return Ok(()) };
+    let (kb, qb) = ((k * kv_row * 4) as u64, (k * qrow * 4) as u64);
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dory-arch") });
+    let mut off = 0u64;
+    for s in &a.slots {
+        let Some(tr) = d.qtrace.get(&(s.ord, s.sl)) else { return Err("a slot lost its queries".into()) };
+        let slot = &d.slots[s.ord][s.sl];
+        enc.copy_buffer_to_buffer(&slot.k, 0, &a.staging, off, kb);
+        enc.copy_buffer_to_buffer(&slot.v, 0, &a.staging, off + kb, kb);
+        enc.copy_buffer_to_buffer(tr, 0, &a.staging, off + 2 * kb, qb);
+        off += 2 * kb + qb;
+    }
+    submit(c, finish_enc(enc));
+    let (tx, rx) = std::sync::mpsc::channel();
+    a.staging.map_async(wgpu::MapMode::Read, 0..off, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    if !matches!(rx.recv(), Ok(Ok(()))) {
+        return Err("a chunk's rows did not come back from the card".into());
+    }
+    let mut failed = None;
+    {
+        let data = a.staging.get_mapped_range(0..off).map_err(|e| format!("a chunk's rows: {e}"))?;
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (kn, qn) = (k * kv_row, k * qrow);
+        for (i, s) in a.slots.iter_mut().enumerate() {
+            let at = i * (2 * kn + qn);
+            let mut step = || -> Result<(), String> {
+                s.k.push(&all[at..at + kn])?;
+                s.v.push(&all[at + kn..at + 2 * kn])?;
+                let q = &all[at + 2 * kn..at + 2 * kn + qn];
+                for p in pos..pos + k {
+                    if p % QT_STRIDE == 0 {
+                        s.q.push(&q[(p - pos) * qrow..(p - pos + 1) * qrow])?;
+                    }
+                }
+                Ok(())
+            };
+            if let Err(e) = step() {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    a.staging.unmap();
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    a.rows = pos + k;
+    Ok(())
+}
+
+/// The rows did not fit where they were going: the far field stays as first sealed, with
+/// no exact rows.
+fn give_up_rows(c: &Ctx, d: &mut Device, why: &str) {
+    tracing::warn!("dory: {why}: the prompt's rows are dropped, and none stays exact past the seal");
+    d.arch = None;
+    d.qtrace.clear();
+    d.plans.clear();
+    d.parts = None;
+    for row in d.slots.iter_mut() {
+        for s in row.iter_mut().filter(|s| s.cap == CHUNK) {
+            *s = Slot { k: buf(c, "dory-sealed", 16, STORE), v: buf(c, "dory-sealed", 16, STORE), cap: 1 };
+        }
+    }
+}
+
+/// The far field built anew over all the archived rows, the chosen ones out of it.
+fn seal_archive(c: &'static Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows: usize, a: Archive) -> bool {
     let cf = &m.cfg;
     let (nh, nk, hd) = (cf.nh, cf.nk, cf.hd);
-    let rep = nh / nk;
+    let t0 = std::time::Instant::now();
+    drop(a.staging);
+    if a.rows != rows {
+        give_up_rows(c, d, &format!("the archive holds {} rows of {rows}", a.rows));
+        return true;
+    }
+    let mut frozen = Vec::with_capacity(a.slots.len());
+    for s in a.slots {
+        let done = (|| Ok::<_, String>((s.k.freeze()?, s.v.freeze()?, s.q.freeze()?)))();
+        match done {
+            Ok((k, v, q)) => frozen.push((s.ord, s.sl, k, v, q)),
+            Err(e) => {
+                give_up_rows(c, d, &e);
+                return true;
+            }
+        }
+    }
+    // The chosen rows leave the far field: a copy of a fact there drowns the exact one.
+    let keep = match &m.exact {
+        Some(x) => {
+            let views: Vec<crate::dory::FlatRows> = frozen.iter().filter(|e| e.1 == 0).map(|e| crate::dory::FlatRows { k: e.2.as_slice(), v: e.3.as_slice(), nk, hd }).collect();
+            let layers: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
+            crate::dory::pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
+        }
+        None => Vec::new(),
+    };
+    let t_pick = t0.elapsed().as_secs_f64();
+    let order = crate::dory::seal_order(rows, o1.sink, &keep);
+    d.seal_epoch += 1;
+    // One slot at a time, so memory holds the far field of one layer on its way to the card.
+    for (o, sl, k, v, q) in frozen {
+        let (ks, vs, qs) = (k.as_slice(), v.as_slice(), q.as_slice());
+        if ks.len() != rows * nk * hd || vs.len() != ks.len() || qs.len() != rows.div_ceil(QT_STRIDE) * nh * hd {
+            tracing::error!("dory: archive of layer {o}: {} {} {} values for {rows} rows", ks.len(), vs.len(), qs.len());
+            return false;
+        }
+        let states = crate::dory::far_states(cf, o1, ks, vs, qs, QT_STRIDE, rows, &order, keep.len());
+        let views: Vec<_> = states.iter().map(|n| n.device_view()).collect();
+        if !o1_views_valid_near(&views, nh, nk, hd, crate::dory::MAX_NEAR)
+            || o1_ensure_near(c, d.id, o1_key(o, sl), &views, d.seal_epoch, crate::dory::MAX_NEAR).is_none()
+        {
+            tracing::error!("dory: the far state of layer {o} does not fit the kernels");
+            return false;
+        }
+        d.slots[o][sl] = Slot { k: buf(c, "dory-sealed", 16, STORE), v: buf(c, "dory-sealed", 16, STORE), cap: 1 };
+    }
+    d.qtrace.clear();
+    d.plans.clear();
+    d.parts = None;
+    tracing::info!("dory: far field rebuilt over {rows} rows, {} kept exact, chosen in {t_pick:.2} s, {:.2} s in all", keep.len(), t0.elapsed().as_secs_f64());
+    true
+}
+
+/// O(1) on the full layers from here on: read the slots back, freeze landmarks over
+/// them (`nystrom`), upload the states, free the exact rows. Before a prompt's end, with
+/// a choice of exact rows to make, the rows go on to an archive and the slots shrink to
+/// one chunk: the choice comes with a rebuild over all of them (`seal_archive`).
+fn seal(c: &'static Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows: usize, last: bool) -> bool {
+    // Plans hold the slots' buffers.
+    d.plans.clear();
+    d.parts = None;
+    if let Some(a) = d.arch.take() {
+        return seal_archive(c, d, m, o1, rows, a);
+    }
+    let cf = &m.cfg;
+    let (nh, nk, hd) = (cf.nh, cf.nk, cf.hd);
     let kv_row = nk * hd;
     let t0 = std::time::Instant::now();
     let full: Vec<usize> = d
@@ -2032,59 +2197,70 @@ fn seal(c: &'static Ctx, d: &mut Device, m: &Dory, o1: crate::dory::DoryO1, rows
         _ => Vec::new(),
     };
     let order = crate::dory::seal_order(rows, o1.sink, &keep);
+    let archive = m.exact.is_some() && !last;
+    // The slots' rows are on the host now. A slot leaves the card once the first layer's state
+    // has passed the kernels' limits, so the far field and the rows never sit there together.
+    let shrink = |c: &Ctx, d: &mut Device, o: usize, sl: usize| {
+        if archive {
+            d.slots[o][sl] = Slot { k: buf(c, "dory-arch-k", slot_bytes(CHUNK, kv_row), STORE), v: buf(c, "dory-arch-v", slot_bytes(CHUNK, kv_row), STORE), cap: CHUNK };
+            d.qtrace.insert((o, sl), buf(c, "dory-arch-q", CHUNK * nh * hd * 4, STORE));
+        } else {
+            d.slots[o][sl] = Slot { k: buf(c, "dory-sealed", 16, STORE), v: buf(c, "dory-sealed", 16, STORE), cap: 1 };
+            d.qtrace.remove(&(o, sl));
+        }
+    };
     d.seal_epoch += 1;
-    for (o, sl, ks, vs, qs) in &got {
-        let mut states = Vec::with_capacity(nk);
-        std::thread::scope(|sc| {
-            let mut hs = Vec::with_capacity(nk);
-            for kh in 0..nk {
-                let (ks, vs, qs, order, keep) = (ks, vs, qs, &order, &keep);
-                hs.push(sc.spawn(move || {
-                    let mut kg = vec![0f32; rows * hd];
-                    let mut vg = vec![0f32; rows * hd];
-                    let mut qg: Vec<Vec<f32>> = (0..rep).map(|_| vec![0f32; rows * hd]).collect();
-                    for (r, &from) in order.iter().enumerate() {
-                        let from = from as usize;
-                        let at = (from * nk + kh) * hd;
-                        kg[r * hd..(r + 1) * hd].copy_from_slice(&ks[at..at + hd]);
-                        vg[r * hd..(r + 1) * hd].copy_from_slice(&vs[at..at + hd]);
-                        for (h, q) in qg.iter_mut().enumerate() {
-                            let at = (from / QT_STRIDE * nh + kh * rep + h) * hd;
-                            q[r * hd..(r + 1) * hd].copy_from_slice(&qs[at..at + hd]);
-                        }
-                    }
-                    let mut n = crate::nystrom::NystromState::new_group(o1.m, o1.w, o1.sink + keep.len(), rep);
-                    let refs: Vec<&[f32]> = qg.iter().map(|q| &q[..]).collect();
-                    n.prefill_group(&refs, &kg, &vg, rows, hd, hd);
-                    n
-                }));
-            }
-            for h in hs {
-                states.push(h.join().expect("seal worker"));
-            }
-        });
+    for (i, (o, sl, ks, vs, qs)) in got.iter().enumerate() {
+        let states = crate::dory::far_states(cf, o1, ks, vs, qs, QT_STRIDE, rows, &order, keep.len());
         let views: Vec<_> = states.iter().map(|n| n.device_view()).collect();
         if !o1_views_valid_near(&views, nh, nk, hd, crate::dory::MAX_NEAR)
             || o1_ensure_near(c, d.id, o1_key(*o, *sl), &views, d.seal_epoch, crate::dory::MAX_NEAR).is_none()
         {
             tracing::warn!("dory: the far state does not fit the kernels, the layer stays exact");
+            // A later layer: the rows that left the card come back, in rings of one size.
+            let cap = d.slots[*o][*sl].cap;
+            for (o, sl, ks, vs, _) in got.iter().take(i) {
+                let slot = Slot { k: buf(c, "dory-k", slot_bytes(cap, kv_row), STORE), v: buf(c, "dory-v", slot_bytes(cap, kv_row), STORE), cap };
+                c.queue.write_buffer(&slot.k, 0, bytemuck::cast_slice(ks));
+                c.queue.write_buffer(&slot.v, 0, bytemuck::cast_slice(vs));
+                d.slots[*o][*sl] = slot;
+            }
             return false;
         }
-    }
-    if m.exact.is_some() && !last {
-        d.arch_rows = rows;
-    } else {
-        for (o, sl, _, _, _) in &got {
-            d.slots[*o][*sl].k = buf(c, "dory-sealed", 16, STORE);
-            d.slots[*o][*sl].v = buf(c, "dory-sealed", 16, STORE);
-            d.slots[*o][*sl].cap = 1;
-        }
-        d.arch_rows = 0;
-        d.qtrace.clear();
+        shrink(c, d, *o, *sl);
     }
     d.sealed = true;
-    d.plans.clear();
-    d.parts = None;
+    if archive {
+        let n_slots = got.len();
+        let mut slots = Vec::with_capacity(n_slots);
+        let stored = (|| -> Result<(), String> {
+            let dir = m.spill.as_deref();
+            // Each layer's copy goes as it is stored.
+            for (o, sl, ks, vs, qs) in got {
+                let name = |kind: &str| format!("dory{}-{o}-{sl}-{kind}", d.id);
+                let mut s = ArchSlot { ord: o, sl, k: ArchStore::new(dir, name("k"))?, v: ArchStore::new(dir, name("v"))?, q: ArchStore::new(dir, name("q"))? };
+                s.k.push(&ks)?;
+                s.v.push(&vs)?;
+                s.q.push(&qs)?;
+                slots.push(s);
+            }
+            Ok(())
+        })();
+        match stored {
+            Ok(()) => {
+                let staging = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dory-arch-stage"),
+                    size: (n_slots * CHUNK * (2 * kv_row + nh * hd) * 4) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                d.arch = Some(Archive { slots, rows, staging });
+            }
+            Err(e) => give_up_rows(c, d, &e),
+        }
+    } else {
+        d.qtrace.clear();
+    }
     tracing::info!("dory: O(1) sealed {rows} rows, {} kept exact, in {:.2} s", keep.len(), t0.elapsed().as_secs_f64());
     true
 }
@@ -2112,7 +2288,7 @@ pub(crate) fn reset(id: u64) {
                     c.o1m.lock().unwrap().retain(|(i, _), _| *i != id);
                 }
                 d.sealed = false;
-                d.arch_rows = 0;
+                d.arch = None;
                 d.qtrace.clear();
                 d.o1_refused = false;
                 d.slots.iter_mut().for_each(|r| r.clear());
