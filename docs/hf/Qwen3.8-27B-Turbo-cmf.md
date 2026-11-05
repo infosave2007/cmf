@@ -115,7 +115,7 @@ only until the far field is built.
 
 **Quality.** A planted fact in 100 000 characters, four kinds of them (a pass key, an access code, a
 password, a room number): 12 of 12, 8 of them with a 15 GB budget and an SSD; in 230 000 characters, about 53 000 tokens, 6 of 6 on the
-same path. A far field without exact rows finds 0 of 6. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
+same path. A far field without exact rows finds 0 of 4. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
 
 ## Options
 
@@ -252,7 +252,7 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 дальнего поля.
 
 **Качество.** Факт, вставленный в 100 000 символов, четырёх видов (ключ, код доступа, пароль, номер
-комнаты): 12 из 12, из них 8 с бюджетом 15 ГБ и SSD; в 230 000 символов, это около 53 000 токенов, 6 из 6 тем же путём. Дальнее поле без точных строк находит 0 из 6.
+комнаты): 12 из 12, из них 8 с бюджетом 15 ГБ и SSD; в 230 000 символов, это около 53 000 токенов, 6 из 6 тем же путём. Дальнее поле без точных строк находит 0 из 4.
 Перплексия на строках после места запечатывания, два окна по 16 384 токена Википедии: точное внимание 4,76, дальнее поле 4,97.
 
 ### Параметры
@@ -366,7 +366,7 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 
 在写入 4.5 GB/s、读取 5.2 GB/s 的磁盘上,速度与使用内存相同。这些行只在构建远场之前需要。
 
-**质量。** 在 100 000 字符中插入事实,共四类(密钥、访问码、密码、房间号):12/12,其中 8 次使用 15 GB 预算和 SSD;在 230 000 字符(约 53 000 token)中同样路径 6/6。没有精确行的远场为 0/6。封存点之后各行的困惑度,两个 16 384 token 的维基百科窗口:精确注意力 4.76,远场 4.97。
+**质量。** 在 100 000 字符中插入事实,共四类(密钥、访问码、密码、房间号):12/12,其中 8 次使用 15 GB 预算和 SSD;在 230 000 字符(约 53 000 token)中同样路径 6/6。没有精确行的远场为 0/4。封存点之后各行的困惑度,两个 16 384 token 的维基百科窗口:精确注意力 4.76,远场 4.97。
 
 ### 参数
 

@@ -92,7 +92,7 @@ MacBook Air M4, 24 GB, Metal, at 16 000 tokens: 6.3 GB beside the mapped weights
 decodes this model at about 5 tok/s at any length, so on a Mac the file saves memory and not time. Drafts do not pay there, 4.6 tok/s against 4.9 without, and stay off.
 
 Facts planted in 100 000 characters: 12 of 12, 8 of them with a 15 GB budget and an SSD; in 230 000 characters, about 53 000
-tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 6. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
+tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 4. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
 
 ## Building a turbo file
 

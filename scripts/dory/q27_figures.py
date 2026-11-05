@@ -40,7 +40,7 @@ T = {
         "x_1": "Per KV head of each full layer, two numbers per row: how far its key lies from the span of the landmarks, and its value’s norm.",
         "x_2": "Each becomes a rank within the prompt, and a linear fit over 128 ranks gives the score, stored in the file.",
         "x_3": "The choice comes before the prompt’s last 512 rows: a question reads the exact fact and carries it on to the answer.",
-        "x_res": "A planted fact in 100 000 characters: turbo 12 of 12, a far field without exact rows 0 of 6",
+        "x_res": "A planted fact in 100 000 characters: turbo 12 of 12, a far field without exact rows 0 of 4",
     },
     "ru": {
         "t": "Длинный промпт не занимает больше памяти карты",
@@ -64,7 +64,7 @@ T = {
         "x_1": "На каждую KV-голову каждого полного слоя два числа на строку: насколько ключ далёк от опорных точек и норма значения.",
         "x_2": "Каждое становится рангом внутри промпта, и линейная модель по 128 рангам даёт оценку. Веса лежат в файле.",
         "x_3": "Выбор идёт до последних 512 строк промпта: вопрос читает точный факт и несёт его к ответу.",
-        "x_res": "Факт в 100 000 символов: турбо 12 из 12, дальнее поле без точных строк 0 из 6",
+        "x_res": "Факт в 100 000 символов: турбо 12 из 12, дальнее поле без точных строк 0 из 4",
     },
     "zh": {
         "t": "提示再长,显存也不再增加",
@@ -88,7 +88,7 @@ T = {
         "x_1": "每个完整层的每个 KV 头,每行两个数:键与地标张成空间的距离,以及值的范数。",
         "x_2": "两者都转为提示内的排名,再由 128 个排名的线性拟合给出分数,权重存放在文件中。",
         "x_3": "选择发生在提示最后 512 行之前:问题读到精确的事实,并把它带到答案中。",
-        "x_res": "100 000 字符中插入一个事实:turbo 12/12,没有精确行的远场 0/6",
+        "x_res": "100 000 字符中插入一个事实:turbo 12/12,没有精确行的远场 0/4",
     },
 }
 

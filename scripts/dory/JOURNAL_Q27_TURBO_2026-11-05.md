@@ -7,7 +7,7 @@ Stand: RTX 5090, 32 GB, Vulkan, EPYC host, a disk with 4.5 GB/s write and 5.2 GB
 
 - Exact, drafts on: prefill 470/463/382/301 tok/s and decode 92/98/84/68 at 1000/4000/16000/32000. Memory 18.3 GB at
   4000, 23.8 GB at 32000. A far field looked needless on speed; the point is the memory of a small card.
-- A far field alone on 100 000 characters: facts 0 of 6, exact 4 of 4.
+- A far field alone on 100 000 characters: facts 0 of 4, exact 4 of 4.
 
 ## Far field on the batch graph
 
