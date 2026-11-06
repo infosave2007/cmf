@@ -75,7 +75,21 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length
 
 A real answer, 400 tokens of a summary, after 100 000 characters of Wikipedia: first token 76.7 → 72.1 s,
 decode 50.9 → 60.4 tok/s. With the budget of a 16 GB card on the same 5090 (`CMF_GPU_VRAM_MB=15000`): 15.0 GB,
-first token 176 s at 64 000, decode 92 tok/s. A real 16 GB card has fewer shader cores.
+first token 176 s at 64 000, decode 92 tok/s.
+
+A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt. `cortiq run --greedy --no-think`,
+220 tokens of an answer:
+
+| answer | without drafts, tok/s | with drafts, tok/s |
+|---|---:|---:|
+| an essay | 13.3 | **20.5** |
+| an explanation in Russian | 13.4 | **21.0** |
+| a Rust function with tests | 13.4 | **24.4** |
+| quotes from the prompt | 13.1 | **25.1** |
+| an edit of the prompt's code | 13.1 | **28.4** |
+
+In a chat the depth of the draft chain settles on the card's own round times: of five turns in one process the
+second to the fifth run at 29.8 tok/s.
 
 Host memory while the prompt is read, without the mapped weights:
 

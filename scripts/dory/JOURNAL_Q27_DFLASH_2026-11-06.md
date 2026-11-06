@@ -132,6 +132,74 @@ of prose, a repeat of the first answer, a Go function; 200 tokens each), old →
 Turns 2 to 5: 26.5 → 29.8 tok/s, +12.5 %. The old binary timed plain tokens in every turn, the new one in the
 first.
 
+## RTX 5090 32 GB, Vulkan
+
+A second pod, for statistics: the release (tag `v0.8.58`, `cortiq-old`) against the branch (`cortiq`) on one
+card, the two binaries in turn (`q27_mtp_pod/stat-base.sh`, `stat-run.sh 3`, `stat-more.sh 6`, `stat-dflash.sh`, `stat-long.sh`).
+The stand moves: a plain token is 17 to 29 ms by the trials' own timing (mean 21.4), one run of one binary
+spreads 4 to 6 tok/s, so only means over passes say anything.
+
+Without drafts, once: code 47.4, edit 52.4, quote 51.2, prose 53.6, Russian 57.1 tok/s.
+
+One answer a process, nine passes, the texts the same in both binaries:
+
+| prompt | release | branch | |
+|---|---:|---:|---:|
+| code | 63.3 | 64.4 | +1.7 % |
+| edit | 74.5 | 76.0 | +2.0 % |
+| quote | 64.3 | 69.4 | +8.1 % |
+| prose | 55.8 | 53.7 | −3.8 % |
+| Russian | 56.4 | 59.4 | +5.2 % |
+| mean | 62.8 | 64.6 | +2.7 % |
+
+Five turns in one process (`turns.txt`), six passes:
+
+| turn | release | branch | |
+|---|---:|---:|---:|
+| 1 | 64.3 | 63.2 | −1.7 % |
+| 2 | 69.8 | 77.6 | +11.2 % |
+| 3 | 54.2 | 56.2 | +3.7 % |
+| 4 | 80.6 | 82.2 | +2.0 % |
+| 5 | 68.4 | 75.2 | +9.9 % |
+
+Turns 2 to 5: 68.3 → 72.8 tok/s, +6.7 %. The same shape as on the 16 GB card, at half the size: here a plain
+token is cheap, so the trial's eight of them cost a turn less.
+
+A round of k drafts over all the session rounds, draft + verify + commit and the share of drafts kept: 2: 2.8 +
+30.7 + 2.1 = 35.5 ms, 82 %; 3: 44.5 ms, 72 %; 4: 50.7 ms, 67 %; 5: 55.3 ms, 63 %; a verify of eight rows 57 ms.
+A row past the first costs 4.4 ms, a fifth of a plain token: deeper rounds are dearer here than on the 16 GB
+card (a tenth to a sixth), and far dearer than on the M4.
+
+The release at a fixed depth (`CMF_GRAPH_SPEC_K`; it has no pin switch, its trial still runs), three passes, two
+drafts / three: code 70.7 / 63.1, edit 71.8 / 77.0, quote 74.1 / 75.5, prose 55.5 / 55.0, Russian 64.5 / 57.7;
+means 67.3 / 65.7 against the default rule's 62.8. Two drafts is this card's depth on most text, and a first
+answer under either rule gets there late.
+
+**The block, pinned** (`stat-dflash.sh`, `CMF_GRAPH_SPEC_PIN=1`), against the chain at 3 / 5 / 7 drafts:
+
+| prompt | chain, 3 | 5 | 7 | DFlash block |
+|---|---:|---:|---:|---:|
+| code | 63.2 | 56.0 | 51.0 | 26.8 |
+| edit | 78.2 | 90.2 | 83.8 | 44.7 |
+| prose | 54.5 | 45.9 | 36.7 | 16.7 |
+
+The block is 107 ms in 18 submissions (141 ms on the 16 GB card: the cost is the host's submissions, not the
+card), its verify 59 ms; it keeps more, 172 of 304 drafts on code against the chain's 142 of 230, 4.6 tokens a
+round against 2.9. Priced on the code prompt: the chain at three drafts 2.9 tokens in 45 ms, 63 tok/s; the block
+as it is 4.6 in 170 ms, 27; a block at 10 ms 4.6 in 70 ms, 65; a free block 4.6 in 60 ms, 76. So one graph for
+the block would bring about +3 % on code here and about +20 % on an edit (7.4 tokens a round in 66 ms against
+90 tok/s), and nothing on prose. VRAM peak with the sidecar 16 071 MiB. The verdict stands: on wgpu the chain
+keeps the rounds.
+
+**This pod against the page's stand.** `bench --core --tokens 60 --ignore-eos --ctx N`, whose text keeps every
+draft, release / branch: 1 000 tokens 62.9 / 77.2 tok/s, 4 000: 89.7 / 87.1, 16 000 (past the seal): 46.0 / 55.1
+with a first token at 81 / 75 s. The page's 5090 gave 105, 104 and 92 with a first token at 47 s: this pod's host
+is the slower one, so its absolute numbers stay in this journal and the page keeps its own.
+A 300-token summary after 30 000 characters of Wikipedia (`stat-long.sh`), three runs in turn, release / branch:
+53.8, 54.7 / 56.1, 60.9 tok/s where the drafts stayed on, and one run of three in each binary where the trial
+timed a slow round and stopped them (50.0 / 45.3, a 141-token answer in place of the 167-token one). The page's
+stand: 76.3.
+
 ## Traps
 
 - **wgpu's verify is not the token graph bit for bit.** The batched verify runs on int8 activations
@@ -161,14 +229,18 @@ first.
 `dflash_check.rs`, `dflash_route.rs`, `convert.rs`. Scripts: `q27_dflash_kit.py`, `q27_dflash_fit_prompts.py`,
 `q27_dflash_rows.sh`, `q27_dflash_ab.sh` (arms `plain`, `mtp`, `dflash`, `auto`, `k1`..`k7`),
 `q27_mtp_pod/dflash-check.sh`, `dflash-acc.sh`, `evalq-measure.sh`, `dflash-wgpu.sh`.
-Private HF `infosave/cmf-experiments/q27-dflash/`: `rows.tgz` (the 34 prompts' rounds) and
-`pod-rtx2000ada-logs.tgz`, sha256 checked. The sidecar is rebuilt from the published drafter and the rows.
+`q27_mtp_pod/stat-base.sh`, `stat-run.sh`, `stat-more.sh`, `stat-dflash.sh`, `stat-long.sh` (a release against a branch on a card).
+Private HF `infosave/cmf-experiments/q27-dflash/`: `rows.tgz` (the 34 prompts' rounds),
+`pod-rtx2000ada-logs.tgz` and `pod-rtx5090-logs.tgz`, sha256 checked. The sidecar is rebuilt from the published drafter and the rows.
 
 ## Open
 
-- No release loads the sidecar yet; the Turbo page on HF is as it was.
+- No release loads the sidecar yet. The Turbo page on HF got the real 16 GB card's table (the release's numbers);
+  the Mac's drafts and the chat numbers of this branch go there with the release.
 - A first answer on wgpu: the trial's eight plain tokens and the timing of depths cost it what a pinned depth of
   three does not (26.3 against 24.1 tok/s on the five prompts).
-- The block as one wgpu graph, measured on a 24 GB card.
-- The new depth rule is measured on one card. RTX PRO 4000, 3090 and 5090 have their own price lists; the rule
-  reads them, the runs were not made.
+- The block as one wgpu graph: priced above at about +3 % on code and +20 % on an edit on a 5090, not built.
+- The new depth rule is measured on two cards (RTX 2000 Ada, RTX 5090). RTX PRO 4000 and 3090 have their own
+  price lists; the rule reads them, the runs were not made.
+- On the 5090 a fixed depth of two beats both rules on a first answer (67.3 against 62.8 and 64.6 tok/s): the
+  rule starts at three and times depths before it settles.

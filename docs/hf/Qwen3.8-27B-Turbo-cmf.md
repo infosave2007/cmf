@@ -92,8 +92,18 @@ A real answer, 400 tokens of a summary of Wikipedia articles, with about half of
 
 **On a 16 GB card.** With the budget of such a card set on the same 5090 (`CMF_GPU_VRAM_MB=15000`), the
 file seals at 4096 rows and stays at 15.0 GB. First token 43 s at 16 000, 87 s at 32 000, 176 s at
-64 000, decode 92 tok/s. A real 16 GB card has fewer shader cores, so expect lower speed at the same
-memory.
+64 000, decode 92 tok/s.
+
+A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt. `cortiq run --greedy --no-think`,
+220 tokens of an answer:
+
+| answer | without drafts, tok/s | with drafts, tok/s |
+|---|---:|---:|
+| an essay | 13.3 | **20.5** |
+| an explanation in Russian | 13.4 | **21.0** |
+| a Rust function with tests | 13.4 | **24.4** |
+| quotes from the prompt | 13.1 | **25.1** |
+| an edit of the prompt's code | 13.1 | **28.4** |
 
 **On a Mac.** MacBook Air M4, 24 GB, Metal: at 16 000 tokens the process stays at 6.3 GB beside the mapped
 weights, first token 545 s, decode 4 tok/s. A planted fact in 40 000 characters came back whole. An M4 decodes this
@@ -228,8 +238,18 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 
 **На карте 16 ГБ.** С бюджетом такой карты на той же 5090 (`CMF_GPU_VRAM_MB=15000`) файл запечатывает на
 4096 строках и держится на 15,0 ГБ. Первый токен: 43 с на 16 000, 87 с на 32 000, 176 с на 64 000, декод
-92 ток/с. У настоящей карты на 16 ГБ меньше вычислительных блоков, поэтому при той же памяти скорость
-будет ниже.
+92 ток/с.
+
+Настоящая карта на 16 ГБ, RTX 2000 Ada, держит файл в 14,2 ГБ на коротком промпте. `cortiq run --greedy --no-think`,
+220 токенов ответа:
+
+| ответ | без черновиков, ток/с | с черновиками, ток/с |
+|---|---:|---:|
+| эссе | 13,3 | **20,5** |
+| объяснение на русском | 13,4 | **21,0** |
+| функция на Rust с тестами | 13,4 | **24,4** |
+| цитаты из промпта | 13,1 | **25,1** |
+| правка кода из промпта | 13,1 | **28,4** |
 
 **На Маке.** MacBook Air M4, 24 ГБ, Metal: на 16 000 токенов процесс держится на 6,3 ГБ помимо отображённых весов,
 первый токен 545 с, декод 4 ток/с. Факт, вставленный в 40 000 символов, вернулся целым. M4 декодирует эту модель примерно
@@ -346,7 +366,17 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 30 000 字符 | 19.2 | **18.6** | 76.4 | **76.3** |
 | 100 000 字符 | 76.7 | **72.1** | 50.9 | **60.4** |
 
-**在 16 GB 显卡上。** 在同一张 5090 上设置这种显卡的预算(`CMF_GPU_VRAM_MB=15000`),文件在 4096 行封存,保持在 15.0 GB。首个 token:16 000 时 43 秒,32 000 时 87 秒,64 000 时 176 秒,解码 92 tok/s。真正的 16 GB 显卡计算单元更少,因此相同显存下速度会更低。
+**在 16 GB 显卡上。** 在同一张 5090 上设置这种显卡的预算(`CMF_GPU_VRAM_MB=15000`),文件在 4096 行封存,保持在 15.0 GB。首个 token:16 000 时 43 秒,32 000 时 87 秒,64 000 时 176 秒,解码 92 tok/s。
+
+真正的 16 GB 显卡 RTX 2000 Ada 在短提示下占用 14.2 GB。`cortiq run --greedy --no-think`,回答 220 个 token:
+
+| 回答 | 不带草稿,tok/s | 带草稿,tok/s |
+|---|---:|---:|
+| 一篇文章 | 13.3 | **20.5** |
+| 俄语讲解 | 13.4 | **21.0** |
+| 带测试的 Rust 函数 | 13.4 | **24.4** |
+| 引用提示中的原文 | 13.1 | **25.1** |
+| 修改提示中的代码 | 13.1 | **28.4** |
 
 **在 Mac 上。** MacBook Air M4,24 GB,Metal:16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s。插入 40 000 字符中的事实完整返回。M4 在任何长度下解码这个模型约为 5 tok/s,受矩阵运算速度限制,所以在 Mac 上这个文件节省的是内存,而不是时间。草稿在那里不划算(有草稿 4.6 tok/s,没有 4.9 tok/s),默认保持关闭。
 
