@@ -105,9 +105,27 @@ A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt.
 | quotes from the prompt | 13.1 | **25.1** |
 | an edit of the prompt's code | 13.1 | **28.4** |
 
-**On a Mac.** MacBook Air M4, 24 GB, Metal: at 16 000 tokens the process stays at 6.3 GB beside the mapped
-weights, first token 545 s, decode 4 tok/s. A planted fact in 40 000 characters came back whole. An M4 decodes this
-model at about 5 tok/s at any length, bound by its matrix speed, so on a Mac the file saves memory and not time. Drafts do not pay there, 4.6 tok/s with them against 4.9 without, and stay off.
+**On a Mac.** The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the
+base M4's memory bus, 120 GB/s by Apple's figure and 92 to 95 GB/s as measured. A token reads 13.6 GB of weights,
+so the bus sets the speed: 6.4 tok/s without drafts. An M4 Pro's bus is rated at 273 GB/s and an M4 Max's at up to
+546 GB/s; those machines were not measured.
+
+At 16 000 tokens the process stays at 6.3 GB beside the mapped weights, first token 545 s, decode 4 tok/s, and a
+planted fact in 40 000 characters came back whole: past the seal the file saves memory on a Mac, not time.
+
+Two switches, both off by default, add speed. Drafts, `CMF_GRAPH_SPEC=1`, with `--greedy`, 220 tokens, the same
+text with drafts and without:
+
+| answer | without drafts, tok/s | with drafts, tok/s |
+|---|---:|---:|
+| an essay | 6.4 | **10.1** |
+| an explanation in Russian | 6.4 | **10.7** |
+| a Rust function with tests | 6.4 | **12.1** |
+| quotes from the prompt | 6.4 | **15.0** |
+| an edit of the prompt's code | 6.4 | **20.5** |
+
+The Neural Engine, `CMF_ANE=1`, reads a prompt beside the GPU: first token at 3 600 tokens 73.9 → 28.3 s, the same
+text. Both switches are in [pull request 88](https://github.com/infosave2007/cmf/pull/88) and arrive with the release after 0.8.58.
 
 **Host memory.** While a long prompt is read, its rows take RAM or a disk. The mapped weights are not
 counted here; the system can drop them from RAM.
@@ -251,9 +269,27 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 | цитаты из промпта | 13,1 | **25,1** |
 | правка кода из промпта | 13,1 | **28,4** |
 
-**На Маке.** MacBook Air M4, 24 ГБ, Metal: на 16 000 токенов процесс держится на 6,3 ГБ помимо отображённых весов,
-первый токен 545 с, декод 4 ток/с. Факт, вставленный в 40 000 символов, вернулся целым. M4 декодирует эту модель примерно
-на 5 ток/с при любой длине, упираясь в скорость умножения матриц, поэтому на Маке файл экономит память, а не время. Черновики там не окупаются, 4,6 ток/с против 4,9 без них, и остаются выключенными.
+**На Маке.** Машина — MacBook Air M4, 24 ГБ: без вентилятора, поэтому на долгих прогонах она греется и
+замедляется, и с шиной памяти базового M4 — 120 ГБ/с по данным Apple, 92–95 ГБ/с по замеру. Токен читает 13,6 ГБ
+весов, так что скорость задаёт шина: 6,4 ток/с без черновиков. У M4 Pro шина заявлена на 273 ГБ/с, у M4 Max — до
+546 ГБ/с; на этих машинах замеров не было.
+
+На 16 000 токенов процесс держится на 6,3 ГБ помимо отображённых весов, первый токен 545 с, декод 4 ток/с, а факт,
+вставленный в 40 000 символов, вернулся целым: за печатью файл на Маке экономит память, а не время.
+
+Скорость добавляют два переключателя, оба по умолчанию выключены. Черновики, `CMF_GRAPH_SPEC=1`, с `--greedy`,
+220 токенов, текст с черновиками и без них один и тот же:
+
+| ответ | без черновиков, ток/с | с черновиками, ток/с |
+|---|---:|---:|
+| эссе | 6,4 | **10,1** |
+| объяснение на русском | 6,4 | **10,7** |
+| функция на Rust с тестами | 6,4 | **12,1** |
+| цитаты из промпта | 6,4 | **15,0** |
+| правка кода из промпта | 6,4 | **20,5** |
+
+Neural Engine, `CMF_ANE=1`, читает промпт рядом с GPU: первый токен на 3 600 токенов 73,9 → 28,3 с, текст тот же.
+Оба переключателя находятся в [pull request 88](https://github.com/infosave2007/cmf/pull/88) и появятся в релизе после 0.8.58.
 
 **Память хоста.** Пока читается длинный промпт, его строки занимают RAM или диск. Отображённые в память
 веса здесь не считаются: система может выгрузить их из RAM.
@@ -378,7 +414,21 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 引用提示中的原文 | 13.1 | **25.1** |
 | 修改提示中的代码 | 13.1 | **28.4** |
 
-**在 Mac 上。** MacBook Air M4,24 GB,Metal:16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s。插入 40 000 字符中的事实完整返回。M4 在任何长度下解码这个模型约为 5 tok/s,受矩阵运算速度限制,所以在 Mac 上这个文件节省的是内存,而不是时间。草稿在那里不划算(有草稿 4.6 tok/s,没有 4.9 tok/s),默认保持关闭。
+**在 Mac 上。** 测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s,实测 92 到 95 GB/s。每个 token 要读取 13.6 GB 权重,所以速度由总线决定:不带草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。
+
+16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s,插入 40 000 字符中的事实完整返回:封存点之后,这个文件在 Mac 上节省的是内存,不是时间。
+
+两个开关可以提速,默认都关闭。草稿,`CMF_GRAPH_SPEC=1`,配合 `--greedy`,220 个 token,带草稿和不带草稿的文本相同:
+
+| 回答 | 不带草稿,tok/s | 带草稿,tok/s |
+|---|---:|---:|
+| 一篇文章 | 6.4 | **10.1** |
+| 俄语讲解 | 6.4 | **10.7** |
+| 带测试的 Rust 函数 | 6.4 | **12.1** |
+| 引用提示中的原文 | 6.4 | **15.0** |
+| 修改提示中的代码 | 6.4 | **20.5** |
+
+Neural Engine,`CMF_ANE=1`,与 GPU 一起读取提示:3 600 个 token 时首个 token 73.9 → 28.3 秒,文本相同。两个开关在 [pull request 88](https://github.com/infosave2007/cmf/pull/88) 中,将随 0.8.58 之后的版本发布。
 
 **主机内存。** 读取长提示时,它的行占用内存或磁盘。这里不计内存映射的权重,系统可以把它们移出内存。
 

@@ -109,8 +109,10 @@ tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 4. Perplex
 
 ## On a Mac
 
-An M4 reads the 13.6 GB of weights a token takes at 92 to 95 GB/s, the speed of its memory: 6.4 tok/s without drafts.
-Two switches, both off by default, move the rest.
+The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the base M4's memory
+bus, 120 GB/s by Apple's figure. It reads the 13.6 GB of weights a token takes at 92 to 95 GB/s, the speed of that
+bus: 6.4 tok/s without drafts. An M4 Pro's bus is rated at 273 GB/s and an M4 Max's at up to 546 GB/s; those
+machines were not measured. Two switches, both off by default, move the rest.
 
 **Drafts**, `CMF_GRAPH_SPEC=1`. The draft head proposes tokens and one pass over the weights checks them, so a pass
 gives more than one token. MacBook Air M4, greedy, 220 tokens, the same text with drafts and without:

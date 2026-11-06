@@ -235,8 +235,10 @@ Private HF `infosave/cmf-experiments/q27-dflash/`: `rows.tgz` (the 34 prompts' r
 
 ## Open
 
-- No release loads the sidecar yet. The Turbo page on HF got the real 16 GB card's table (the release's numbers);
-  the Mac's drafts and the chat numbers of this branch go there with the release.
+- No release loads the sidecar yet. The Turbo page on HF got the real 16 GB card's table (the release's numbers)
+  and, on the owner's word, the Mac section of this branch (the machine: a fanless Air on the base M4's bus;
+  drafts, the Neural Engine) with a link to the pull request; that link goes when a release carries the switches.
+  The chat numbers of this branch and the sidecar are not on the page.
 - A first answer on wgpu: the trial's eight plain tokens and the timing of depths cost it what a pinned depth of
   three does not (26.3 against 24.1 tok/s on the five prompts).
 - The block as one wgpu graph: priced above at about +3 % on code and +20 % on an edit on a 5090, not built.
