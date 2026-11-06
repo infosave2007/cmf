@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in place of the share of drafts kept alone, and a plain token's time from a speculation trial is kept for the
   process's next requests. Qwen3.8-27B Turbo on an RTX 2000 Ada 16 GB, five chat turns of 200 tokens in one
   process, turns two to five: 26.5 → 29.8 tok/s; a first answer +2 %. `CMF_GRAPH_SPEC_K=n` pins the depth as before.
+- Dory's turbo file keeps its ceiling while a long prompt is read. Past the first seal at 8192 rows a chunk's rows leave
+  the device as the chunk ends, on Vulkan and Metal, and the far field is built anew from them before the prompt's last rows.
+  `--o1-spill DIR` (`CMF_O1_SPILL`) keeps them in files, on the CPU too. RTX 5090 at 64 000 tokens: peak on the card 10.8 → 3.76 GB,
+  host RAM 1.7 GB and 9.6 GB of disk with files, at the same speed. Metal reads a sealed prompt in chunks with `o1c`, and its seal for a
+  file with exact rows moves from 32768 rows to 8192. On the CPU a sealed prompt keeps one row's queries in 8.
 
 ### Fixed
 - Metal: the draft chain's input stage, the embedding and the input projection, is a command of its own. Joined with

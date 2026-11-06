@@ -20,6 +20,7 @@
 //! hold their last loop's keys, so the loop count can change from token to token
 //! and the cache has no holes.
 
+use crate::pipeline::ArchStore;
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
 use cortiq_core::{CmfModel, DoryConfig, ModelArch};
@@ -121,6 +122,8 @@ pub struct Dory {
     pub prompt_loops: usize,
     /// Rows of a sealed prompt the far field would lose (`CMF_DORY_EXACT=FILE:rows`).
     pub exact: Option<ExactRows>,
+    /// A long prompt's rows go to files here, and to RAM without it (`CMF_O1_SPILL`).
+    pub spill: Option<std::path::PathBuf>,
 }
 
 /// Which rows of a prompt stay exact past the seal: passwords, codes and the like, found
@@ -143,6 +146,10 @@ pub const EXACT_TAIL: usize = 512;
 
 /// Neighbours kept on each side of a chosen row: a fact is several tokens.
 const EXACT_NEIGHBOURS: usize = 2;
+
+/// One row in this many of a sealed prompt keeps its queries for the far field's rebuild:
+/// landmark queries are means over long segments, and a row's take 8 KB per full layer.
+pub const QT_STRIDE: usize = 8;
 
 fn rank_share(v: &[f32]) -> Vec<f32> {
     let n = v.len();
@@ -337,6 +344,43 @@ pub fn seal_order(rows: usize, sink: usize, keep: &[usize]) -> Vec<u32> {
         .collect()
 }
 
+/// A slot's far field, one state per KV head, over its rows taken in `order`. `ks` and `vs` are
+/// `[row][nk][hd]`, `qs` `[row / stride][nh][hd]`; `kept` rows after the sinks stay exact.
+#[allow(clippy::too_many_arguments)]
+pub fn far_states(c: &DoryCfg, o1: DoryO1, ks: &[f32], vs: &[f32], qs: &[f32], stride: usize, rows: usize, order: &[u32], kept: usize) -> Vec<crate::nystrom::NystromState> {
+    let (nh, nk, hd) = (c.nh, c.nk, c.hd);
+    let rep = nh / nk;
+    let mut states = Vec::with_capacity(nk);
+    std::thread::scope(|sc| {
+        let mut hs = Vec::with_capacity(nk);
+        for kh in 0..nk {
+            hs.push(sc.spawn(move || {
+                let mut kg = vec![0f32; rows * hd];
+                let mut vg = vec![0f32; rows * hd];
+                let mut qg: Vec<Vec<f32>> = (0..rep).map(|_| vec![0f32; rows * hd]).collect();
+                for (r, &from) in order.iter().enumerate() {
+                    let from = from as usize;
+                    let at = (from * nk + kh) * hd;
+                    kg[r * hd..(r + 1) * hd].copy_from_slice(&ks[at..at + hd]);
+                    vg[r * hd..(r + 1) * hd].copy_from_slice(&vs[at..at + hd]);
+                    for (h, q) in qg.iter_mut().enumerate() {
+                        let at = (from / stride * nh + kh * rep + h) * hd;
+                        q[r * hd..(r + 1) * hd].copy_from_slice(&qs[at..at + hd]);
+                    }
+                }
+                let mut n = crate::nystrom::NystromState::new_group(o1.m, o1.w, o1.sink + kept, rep);
+                let refs: Vec<&[f32]> = qg.iter().map(|q| &q[..]).collect();
+                n.prefill_group(&refs, &kg, &vg, rows, hd, hd);
+                n
+            }));
+        }
+        for h in hs {
+            states.push(h.join().expect("seal worker"));
+        }
+    });
+    states
+}
+
 /// O(1) far field for the full-attention layers (`nystrom`): `CMF_DORY_O1=m,w,sink,seal`.
 /// A slot runs exact up to position `seal`, then an exact window of `w` keys plus a
 /// skeleton of `m` landmarks. Sliding layers are bounded already.
@@ -365,10 +409,43 @@ pub struct KvSlot {
     pub first: usize,
     /// Sealed, and its rows still kept for the choice of exact ones.
     pub arch: bool,
-    /// Every row's queries `[row][nh][hd]`, until the O(1) seal.
+    /// Every row's queries `[row][nh][hd]`, until the O(1) seal; past it, the chunk's.
     pub qt: Vec<f32>,
     /// One state per KV head after the seal.
     pub far: Vec<crate::nystrom::NystromState>,
+    /// The rows of a sealed prompt but for the chunk being read, in RAM or in files.
+    store: Option<SlotStore>,
+}
+
+struct SlotStore {
+    k: ArchStore,
+    v: ArchStore,
+    /// One row in `QT_STRIDE`.
+    q: ArchStore,
+    rows: usize,
+}
+
+impl SlotStore {
+    fn new(dir: Option<&std::path::Path>) -> Result<Self, String> {
+        // Two sequences of one process may seal at once.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let at = |kind: &str| ArchStore::new(dir, format!("dory-host-{n}-{kind}"));
+        Ok(Self { k: at("k")?, v: at("v")?, q: at("q")?, rows: 0 })
+    }
+
+    /// A chunk's rows, from position `pos`; its queries are `[row][nh][hd]`.
+    fn push(&mut self, k: &[f32], v: &[f32], q: &[f32], kv_row: usize, q_row: usize, pos: usize) -> Result<(), String> {
+        self.k.push(k)?;
+        self.v.push(v)?;
+        for (r, row) in q.chunks_exact(q_row).enumerate() {
+            if (pos + r) % QT_STRIDE == 0 {
+                self.q.push(row)?;
+            }
+        }
+        self.rows += k.len() / kv_row;
+        Ok(())
+    }
 }
 
 impl KvSlot {
@@ -397,6 +474,8 @@ impl DoryState {
                 s.k.clear();
                 s.v.clear();
                 s.first = 0;
+                s.arch = false;
+                s.store = None;
                 s.qt.clear();
                 s.far.clear();
             }
@@ -566,6 +645,7 @@ impl Dory {
             gate,
             prompt_loops,
             exact,
+            spill: std::env::var_os("CMF_O1_SPILL").map(Into::into),
         })
     }
 
@@ -1075,9 +1155,12 @@ fn stack(
         }
     }
     st.scratch = sc;
+    if st.slots.iter().flatten().any(|s| s.arch) {
+        store_chunk(c, st, pos0);
+    }
     if let Some(o1) = m.o1 {
         if pos0 + t >= o1.seal {
-            seal_far(m, st, o1, false);
+            seal_far(m, st, o1);
         }
     }
     // Sliding layers need only the window behind the next position. Trimming
@@ -1100,78 +1183,143 @@ fn stack(
     }
 }
 
-/// Freeze the full-attention slots' landmarks over what they hold, and go on from
-/// them row by row (`nystrom::NystromState::prefill_group`). Under a choice of exact rows
-/// a prompt's end does this again over all its rows, with the chosen ones out of the far
-/// field: a copy of a fact there drowns the exact one.
-fn seal_far(m: &Dory, st: &mut DoryState, o1: DoryO1, last: bool) {
+/// A sealed chunk's rows join the store; a later pass over the chunk has rewritten them by now.
+fn store_chunk(c: &DoryCfg, st: &mut DoryState, pos: usize) {
+    let (kv_row, q_row) = (c.nk * c.hd, c.nh * c.hd);
+    let mut failed = None;
+    for s in st.slots.iter_mut().flatten().filter(|s| s.arch) {
+        let Some(a) = s.store.as_mut() else { continue };
+        if let Err(e) = a.push(&s.k, &s.v, &s.qt, kv_row, q_row, pos) {
+            failed = Some(e);
+            break;
+        }
+        s.k.clear();
+        s.v.clear();
+        s.qt.clear();
+    }
+    if let Some(e) = failed {
+        give_up_rows(st, &e);
+    }
+}
+
+/// The rows did not fit where they were going: the far field stays as first sealed, with no
+/// exact rows.
+fn give_up_rows(st: &mut DoryState, why: &str) {
+    tracing::warn!("dory: {why}: the prompt's rows are dropped, and none stays exact past the seal");
+    for s in st.slots.iter_mut().flatten().filter(|s| s.arch) {
+        s.arch = false;
+        s.store = None;
+        s.k = Vec::new();
+        s.v = Vec::new();
+        s.qt = Vec::new();
+    }
+}
+
+/// Freeze the full-attention slots' landmarks over what they hold, and go on from them row by
+/// row (`nystrom::NystromState::prefill_group`). Before a prompt's end, with a choice of exact
+/// rows to make, the rows go on to a store.
+fn seal_far(m: &Dory, st: &mut DoryState, o1: DoryO1) {
     let c = &m.cfg;
-    let (nk, nh, hd) = (c.nk, c.nh, c.hd);
-    let rep = nh / nk;
+    let (nk, hd, q_row) = (c.nk, c.hd, c.nh * c.hd);
     let kv_row = nk * hd;
-    let full: Vec<usize> = m
-        .layers
+    let mut sealed = false;
+    for o in full_slots(m) {
+        for s in st.slots[o].iter_mut() {
+            if !s.far.is_empty() || s.k.is_empty() {
+                continue;
+            }
+            sealed = true;
+            let t = s.k.len() / kv_row;
+            let order = seal_order(t, o1.sink, &[]);
+            s.far = far_states(c, o1, &s.k, &s.v, &s.qt, 1, t, &order, 0);
+            if m.exact.is_some() {
+                let mut a = match SlotStore::new(m.spill.as_deref()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!("dory: {e}");
+                        s.qt = Vec::new();
+                        s.k = Vec::new();
+                        s.v = Vec::new();
+                        continue;
+                    }
+                };
+                match a.push(&s.k, &s.v, &s.qt, kv_row, q_row, 0) {
+                    Ok(()) => {
+                        s.arch = true;
+                        s.store = Some(a);
+                    }
+                    Err(e) => tracing::warn!("dory: {e}"),
+                }
+            }
+            s.qt = Vec::new();
+            s.k = Vec::new();
+            s.v = Vec::new();
+        }
+    }
+    // Every slot or none: the choice of rows reads all the layers.
+    if sealed && m.exact.is_some() && st.slots.iter().flatten().any(|s| !s.far.is_empty() && !s.arch) {
+        give_up_rows(st, "a store failed");
+    }
+}
+
+/// The full-attention layers' slots.
+fn full_slots(m: &Dory) -> Vec<usize> {
+    m.layers
         .iter()
         .filter_map(|l| match l {
             Layer::Attn(w) if !w.sliding => Some(w.ordinal),
             _ => None,
         })
-        .collect();
-    let keep = match (&m.exact, last) {
-        (Some(x), true) => {
-            let views: Vec<FlatRows> = full.iter().map(|&o| FlatRows { k: &st.slots[o][0].k, v: &st.slots[o][0].v, nk, hd }).collect();
-            let layers: Vec<&dyn LayerRows> = views.iter().map(|v| v as &dyn LayerRows).collect();
-            let rows = views[0].k.len() / kv_row;
-            pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
-        }
-        _ => Vec::new(),
-    };
-    for o in full {
-        for s in st.slots[o].iter_mut() {
-            if (!s.far.is_empty() && !last) || s.k.is_empty() {
-                continue;
-            }
-            let t = s.k.len() / kv_row;
-            let order = seal_order(t, o1.sink, &keep);
-            let mut far = Vec::with_capacity(nk);
-            for kh in 0..nk {
-                let mut ks = vec![0f32; t * hd];
-                let mut vs = vec![0f32; t * hd];
-                let mut qs: Vec<Vec<f32>> = (0..rep).map(|_| vec![0f32; t * hd]).collect();
-                for (r, &from) in order.iter().enumerate() {
-                    let from = from as usize;
-                    let at = (from * nk + kh) * hd;
-                    ks[r * hd..(r + 1) * hd].copy_from_slice(&s.k[at..at + hd]);
-                    vs[r * hd..(r + 1) * hd].copy_from_slice(&s.v[at..at + hd]);
-                    for (h, q) in qs.iter_mut().enumerate() {
-                        let at = (from * nh + kh * rep + h) * hd;
-                        q[r * hd..(r + 1) * hd].copy_from_slice(&s.qt[at..at + hd]);
-                    }
-                }
-                let mut n = crate::nystrom::NystromState::new_group(o1.m, o1.w, o1.sink + keep.len(), rep);
-                let refs: Vec<&[f32]> = qs.iter().map(|q| &q[..]).collect();
-                n.prefill_group(&refs, &ks, &vs, t, hd, hd);
-                far.push(n);
-            }
-            s.far = far;
-            if m.exact.is_some() && !last {
-                s.arch = true;
-            } else {
-                s.arch = false;
-                s.qt = Vec::new();
-                s.k = Vec::new();
-                s.v = Vec::new();
-            }
-        }
-    }
+        .collect()
 }
 
-/// A prompt's end on the host: the rows it should not lose leave the far field.
+/// A prompt's end on the host, before its last rows: the far field built anew over all the rows,
+/// the ones it should not lose out of it. A copy of a fact there drowns the exact one.
 fn finish_exact(m: &Dory, st: &mut DoryState) {
     let Some(o1) = m.o1 else { return };
-    if m.exact.is_some() && st.slots.iter().flatten().any(|s| s.arch) {
-        seal_far(m, st, o1, true);
+    let Some(x) = m.exact.as_ref() else { return };
+    if !st.slots.iter().flatten().any(|s| s.arch) {
+        return;
     }
+    let c = &m.cfg;
+    let (nh, nk, hd) = (c.nh, c.nk, c.hd);
+    let kv_row = nk * hd;
+    let t0 = std::time::Instant::now();
+    let full = full_slots(m);
+    let mut frozen = Vec::new();
+    let mut rows = 0;
+    let mut fail = None;
+    for &o in &full {
+        for sl in 0..st.slots[o].len() {
+            let s = &mut st.slots[o][sl];
+            let Some(a) = s.store.take() else { continue };
+            rows = a.rows;
+            match (a.k.freeze(), a.v.freeze(), a.q.freeze()) {
+                (Ok(k), Ok(v), Ok(q)) => frozen.push((o, sl, k, v, q)),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail = Some(e),
+            }
+        }
+    }
+    if let Some(e) = fail {
+        give_up_rows(st, &e);
+        return;
+    }
+    let keep = {
+        let views: Vec<FlatRows> = frozen.iter().filter(|e| e.1 == 0).map(|e| FlatRows { k: e.2.as_slice(), v: e.3.as_slice(), nk, hd }).collect();
+        let layers: Vec<&dyn LayerRows> = views.iter().map(|v| v as &dyn LayerRows).collect();
+        pick_exact_rows(x, &layers, rows, nk, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
+    };
+    let order = seal_order(rows, o1.sink, &keep);
+    // One slot at a time: memory holds the far field of one layer on top of the rows.
+    for (o, sl, k, v, q) in frozen {
+        let (ks, vs, qs) = (k.as_slice(), v.as_slice(), q.as_slice());
+        debug_assert_eq!(qs.len(), rows.div_ceil(QT_STRIDE) * nh * hd);
+        debug_assert_eq!(ks.len(), rows * kv_row);
+        let s = &mut st.slots[o][sl];
+        s.far = far_states(c, o1, ks, vs, qs, QT_STRIDE, rows, &order, keep.len());
+        s.arch = false;
+    }
+    tracing::info!("dory: far field rebuilt over {rows} rows, {} kept exact, in {:.2} s", keep.len(), t0.elapsed().as_secs_f64());
 }
 
 /// The host's KV bytes: `(exact rows, O(1) states)`.
@@ -1494,6 +1642,7 @@ mod tests {
             gate: None,
             prompt_loops: 0,
             exact: None,
+            spill: None,
         }
     }
 
@@ -1610,6 +1759,52 @@ mod tests {
         logits.clear();
         forward_host(&m, &mut st, &[3], 40, 2, Want::Last, None, None, &mut logits);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_prompt_past_the_seal_reads_the_same_from_ram_and_from_files() {
+        let build = |spill: Option<std::path::PathBuf>| {
+            let mut m = tiny(5, KvMode::LastLoop, 2);
+            m.o1 = Some(DoryO1 { m: 4, w: 6, sink: 1, seal: 24 });
+            let layers = m.layers.iter().filter(|l| matches!(l, Layer::Attn(w) if !w.sliding)).count();
+            m.exact = Some(ExactRows { weights: Arc::new(vec![1.0; layers * 2 * m.cfg.nk]), budget: 3 });
+            m.spill = spill;
+            m
+        };
+        let ids: Vec<u32> = (0..700).map(|i| (i * 5 % 11) as u32).collect();
+        let dir = std::env::temp_dir().join(format!("cortiq-dory-spill-test-{}", std::process::id()));
+        let mut got = Vec::new();
+        for spill in [None, Some(dir.clone())] {
+            let m = build(spill);
+            let mut st = DoryState::default();
+            let mut logits = Vec::new();
+            forward_host(&m, &mut st, &ids, 0, 2, Want::Last, None, None, &mut logits);
+            assert!(st.slots.iter().flatten().all(|s| !s.arch && s.store.is_none()));
+            got.push(logits);
+        }
+        assert!(got[0].iter().all(|v| v.is_finite()));
+        assert_eq!(got[0], got[1]);
+        // A store in files is gone with the rebuild.
+        assert_eq!(std::fs::read_dir(&dir).map_or(0, |d| d.count()), 0, "files left in {}", dir.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spill_directory_that_cannot_be_made_leaves_the_far_field_working() {
+        let mut m = tiny(5, KvMode::LastLoop, 2);
+        m.o1 = Some(DoryO1 { m: 4, w: 6, sink: 1, seal: 24 });
+        let layers = m.layers.iter().filter(|l| matches!(l, Layer::Attn(w) if !w.sliding)).count();
+        m.exact = Some(ExactRows { weights: Arc::new(vec![1.0; layers * 2 * m.cfg.nk]), budget: 3 });
+        let file = std::env::temp_dir().join(format!("cortiq-dory-spill-file-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        m.spill = Some(file.join("no"));
+        let mut st = DoryState::default();
+        let mut logits = Vec::new();
+        let ids: Vec<u32> = (0..100).map(|i| (i * 5 % 11) as u32).collect();
+        forward_host(&m, &mut st, &ids, 0, 2, Want::Last, None, None, &mut logits);
+        assert!(logits.iter().all(|v| v.is_finite()));
+        assert!(st.slots.iter().flatten().all(|s| !s.arch));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

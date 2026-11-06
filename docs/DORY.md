@@ -33,6 +33,7 @@ original scores 13.42 on the same windows.
 | `--kv-cache per_loop\|last_loop` | one cache per loop, or one for all of them |
 | `--o1 m,w,sink` | the far field on the full-attention layers, sealed at 8192 rows |
 | `--full-window N` | cut the full-attention layers to a window instead |
+| `--o1-spill DIR` | a long prompt's rows in files in `DIR`, also `CMF_O1_SPILL` |
 
 `CMF_DORY_O1=m,w,sink,seal` sets the seal position too, and `CMF_DORY_O1=off` turns a turbo
 file's far field off. `CMF_DORY_GATE=conf:0.7` or `recon:FILE:bias` chooses the gate.
@@ -55,7 +56,19 @@ no pass through the output block and the head. About 85 % of tokens take one pas
 
 **Far field.** Full-attention layers keep the first rows and the last 1536 rows exact, and everything
 else in 32 landmarks per head (`nystrom`). Sliding layers already have a window of 1024. Device memory
-stops growing, and so does the cost of a token.
+stops growing, and so does the cost of a token. That holds while a prompt is read: past 8192 rows each chunk's
+rows leave the card as the chunk ends, for RAM or for files, until the far field is built anew over them.
+
+| prompt, tokens | peak on the card | RAM | with `--o1-spill`: RAM | with `--o1-spill`: disk |
+|---:|---:|---:|---:|---:|
+| 1 000 | 3.08 GB | 0.2 GB | | |
+| 12 000 | 3.76 GB | 1.4 GB | 1.2 GB | 2.0 GB |
+| 32 000 | 3.76 GB | 3.6 GB | | |
+| 64 000 | 3.76 GB | 7.2 GB | 1.7 GB | 9.6 GB |
+
+RTX 5090, Vulkan, a disk with 4.2 GB/s write. The weights are 1.95 GB of it, the speed is the same in RAM
+and in files, and the files go when the far field is built. On a MacBook Air M4 at 23 000 tokens, peak
+footprint: 3.27 GB, 1.64 GB with `--o1-spill`.
 
 ![What a long prompt keeps on the card](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_en.png)
 

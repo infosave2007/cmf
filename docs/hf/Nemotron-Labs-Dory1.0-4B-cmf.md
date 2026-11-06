@@ -66,7 +66,9 @@ trained by gradient, and the decision needs no read-out. Patent application No. 
 ![One pass or two, token by token](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/router_en.png)
 
 **A far field.** Full-attention layers keep the first rows and the last 1536 rows exact, and all
-the others in 32 landmarks per head. Memory and the cost of a token stop growing with the text.
+the others in 32 landmarks per head. Memory and the cost of a token stop growing with the text, and this
+holds while a prompt is read: 3.76 GB on the card at 12 000, 32 000 and 64 000 tokens (RTX 5090). The rows wait
+in RAM, or in files with `--o1-spill DIR`. This comes in the release after cortiq 0.8.58; 0.8.58 does not have it.
 Patent application No. 19/738,763.
 
 ![What a long prompt keeps on the card](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_en.png)
@@ -177,7 +179,8 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 ![Один проход или два, для каждого токена](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/router_ru.png)
 
 **Дальнее поле.** Слои полного внимания держат точно первые строки и последние 1536, а все остальные
-сводят к 32 опорным точкам на голову. Память и цена токена перестают расти вместе с текстом. Заявка
+сводят к 32 опорным точкам на голову. Память и цена токена перестают расти вместе с текстом, и при чтении промпта
+тоже: 3,76 ГБ на карте при 12 000, 32 000 и 64 000 токенов (RTX 5090). Строки ждут в RAM или, с `--o1-spill DIR`, в файлах. Это войдёт в релиз после cortiq 0.8.58, в 0.8.58 этого ещё нет. Заявка
 на патент № 19/738,763.
 
 ![Что длинный промпт хранит на карте](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_ru.png)
@@ -276,7 +279,7 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 ![每个 token 一次或两次循环](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/router_zh.png)
 
 远场。全注意力层精确保留最前几行和最后 1536 行,其余全部压缩到每个头 32 个地标。内存和每个 token
-的代价不再随文本增长。专利申请号 19/738,763。
+的代价不再随文本增长,读取提示词时也是如此:12 000、32 000 和 64 000 token 时显卡上都是 3.76 GB(RTX 5090)。这些行留在内存中,使用 `--o1-spill DIR` 时留在文件中。此功能将在 cortiq 0.8.58 之后的版本中提供,0.8.58 尚不支持。专利申请号 19/738,763。
 
 ![长提示词在显卡上保留什么](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_zh.png)
 
