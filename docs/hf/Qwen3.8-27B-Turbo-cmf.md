@@ -45,7 +45,7 @@ Short on RAM as well, with a fast SSD:
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-Use cortiq 0.8.58 or later; prebuilt binaries are on the
+Use cortiq 0.8.59 or later; prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). `--greedy` turns on draft tokens, and
 `--no-think` asks for a direct answer.
 
@@ -105,6 +105,9 @@ A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt.
 | quotes from the prompt | 13.1 | **25.1** |
 | an edit of the prompt's code | 13.1 | **28.4** |
 
+In a chat the depth of the draft chain settles on the card's own round times: of five turns in one process the
+second to the fifth run at 29.8 tok/s.
+
 **On a Mac.** The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the
 base M4's memory bus, 120 GB/s by Apple's figure and 92 to 95 GB/s as measured. A token reads 13.6 GB of weights,
 so the bus sets the speed: 6.4 tok/s without drafts. An M4 Pro's bus is rated at 273 GB/s and an M4 Max's at up to
@@ -125,7 +128,7 @@ text with drafts and without:
 | an edit of the prompt's code | 6.4 | **20.5** |
 
 The Neural Engine, `CMF_ANE=1`, reads a prompt beside the GPU: first token at 3 600 tokens 73.9 → 28.3 s, the same
-text. Both switches are in [pull request 88](https://github.com/infosave2007/cmf/pull/88) and arrive with the release after 0.8.58.
+text. Both switches need cortiq 0.8.59 or later.
 
 **Host memory.** While a long prompt is read, its rows take RAM or a disk. The mapped weights are not
 counted here; the system can drop them from RAM.
@@ -209,7 +212,7 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-Нужен cortiq 0.8.58 или новее; готовые сборки лежат на
+Нужен cortiq 0.8.59 или новее; готовые сборки лежат на
 [странице релизов](https://github.com/infosave2007/cmf/releases). `--greedy` включает черновые токены,
 `--no-think` просит ответ без рассуждения.
 
@@ -269,6 +272,9 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 | цитаты из промпта | 13,1 | **25,1** |
 | правка кода из промпта | 13,1 | **28,4** |
 
+В чате глубина цепочки черновиков подстраивается под время раундов самой карты: из пяти ходов одного процесса
+ходы со второго по пятый идут на 29,8 ток/с.
+
 **На Маке.** Машина — MacBook Air M4, 24 ГБ: без вентилятора, поэтому на долгих прогонах она греется и
 замедляется, и с шиной памяти базового M4 — 120 ГБ/с по данным Apple, 92–95 ГБ/с по замеру. Токен читает 13,6 ГБ
 весов, так что скорость задаёт шина: 6,4 ток/с без черновиков. У M4 Pro шина заявлена на 273 ГБ/с, у M4 Max — до
@@ -289,7 +295,7 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 | правка кода из промпта | 6,4 | **20,5** |
 
 Neural Engine, `CMF_ANE=1`, читает промпт рядом с GPU: первый токен на 3 600 токенов 73,9 → 28,3 с, текст тот же.
-Оба переключателя находятся в [pull request 88](https://github.com/infosave2007/cmf/pull/88) и появятся в релизе после 0.8.58.
+Обоим переключателям нужен cortiq 0.8.59 или новее.
 
 **Память хоста.** Пока читается длинный промпт, его строки занимают RAM или диск. Отображённые в память
 веса здесь не считаются: система может выгрузить их из RAM.
@@ -367,7 +373,7 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-需要 cortiq 0.8.58 或更新版本;预编译版本在[发布页](https://github.com/infosave2007/cmf/releases)。`--greedy` 开启草稿 token,`--no-think` 要求直接回答。
+需要 cortiq 0.8.59 或更新版本;预编译版本在[发布页](https://github.com/infosave2007/cmf/releases)。`--greedy` 开启草稿 token,`--no-think` 要求直接回答。
 
 ### 这个文件做了什么
 
@@ -414,6 +420,8 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 引用提示中的原文 | 13.1 | **25.1** |
 | 修改提示中的代码 | 13.1 | **28.4** |
 
+在对话中,草稿链的深度按该显卡自身的轮次耗时调整:同一进程的五轮对话里,第二到第五轮为 29.8 tok/s。
+
 **在 Mac 上。** 测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s,实测 92 到 95 GB/s。每个 token 要读取 13.6 GB 权重,所以速度由总线决定:不带草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。
 
 16 000 个 token 时,进程除内存映射的权重外保持在 6.3 GB,首个 token 545 秒,解码 4 tok/s,插入 40 000 字符中的事实完整返回:封存点之后,这个文件在 Mac 上节省的是内存,不是时间。
@@ -428,7 +436,7 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 引用提示中的原文 | 6.4 | **15.0** |
 | 修改提示中的代码 | 6.4 | **20.5** |
 
-Neural Engine,`CMF_ANE=1`,与 GPU 一起读取提示:3 600 个 token 时首个 token 73.9 → 28.3 秒,文本相同。两个开关在 [pull request 88](https://github.com/infosave2007/cmf/pull/88) 中,将随 0.8.58 之后的版本发布。
+Neural Engine,`CMF_ANE=1`,与 GPU 一起读取提示:3 600 个 token 时首个 token 73.9 → 28.3 秒,文本相同。两个开关都需要 cortiq 0.8.59 或更新版本。
 
 **主机内存。** 读取长提示时,它的行占用内存或磁盘。这里不计内存映射的权重,系统可以把它们移出内存。
 

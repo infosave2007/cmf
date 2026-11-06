@@ -114,6 +114,20 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo, drafts on a Mac and in a chat (0.8.59)
+
+On a MacBook Air M4 (24 GB, no fan, the base M4's memory bus)
+[the turbo file](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) decodes at 6.4 tok/s; with drafts it is
+10 to 20, and the Neural Engine (`CMF_ANE=1`) reads a prompt of 3 600 tokens in 28 s against 74. Both switches are
+off by default:
+
+```sh
+CMF_GRAPH_SPEC=1 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+On Vulkan the depth of the draft chain follows what a round costs on the card: a chat on a 16 GB card runs at
+29.8 tok/s against 26.5. See [the guide](docs/QWEN38_TURBO.md).
+
 ## Qwen3.8-27B Turbo, a fixed ceiling on the card (0.8.58)
 
 [The turbo file](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) keeps device memory in place on long

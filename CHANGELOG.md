@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.59] — 2026-11-06
+
 ### Added
 - A Mac's Neural Engine for a prompt's chunks, off by default (`CMF_ANE=1`): it takes every layer's FFN, a GDN mixer's
   `z` projection and an attention layer's `q`, the GPU takes the rest of the mixer, and the CPU decodes the next layer's

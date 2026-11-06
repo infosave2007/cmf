@@ -104,6 +104,16 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo:Mac 上和对话中的草稿(0.8.59)
+
+在 MacBook Air M4(24 GB,无风扇,基础版 M4 的内存总线)上,[Turbo 文件](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf)解码 6.4 tok/s;开启草稿后为 10 到 20,Neural Engine(`CMF_ANE=1`)读取 3 600 个 token 的提示用 28 秒,原来是 74 秒。两个开关默认都关闭:
+
+```sh
+CMF_GRAPH_SPEC=1 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+在 Vulkan 上,草稿链的深度按一轮在该显卡上的实际耗时调整:16 GB 显卡上的对话为 29.8 tok/s,原来是 26.5。见[指南](docs/QWEN38_TURBO.zh.md)。
+
 ## Qwen3.8-27B Turbo,显卡上的固定上限(0.8.58)
 
 [Turbo 文件](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf)让长提示下的显存保持不变,长提示的行一读完就进入内存或高速 SSD。任何长度的提示都能放进 16 GB 显卡。RTX 5090 上 64 000 个 token 时:15.7 GB 对 22.8 GB,首个 token 177 秒对 316 秒,解码 92 tok/s 对 51,文本中的密码和编码依然精确:
