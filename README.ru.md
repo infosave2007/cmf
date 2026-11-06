@@ -114,6 +114,20 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Qwen3.8-27B Turbo, черновики на Маке и в чате (0.8.59)
+
+На MacBook Air M4 (24 ГБ, без вентилятора, шина памяти базового M4)
+[турбо-файл](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) декодирует 6,4 ток/с; с черновиками — от 10
+до 20, а Neural Engine (`CMF_ANE=1`) читает промпт в 3 600 токенов за 28 с вместо 74. Оба переключателя по умолчанию
+выключены:
+
+```sh
+CMF_GRAPH_SPEC=1 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+На Vulkan глубина цепочки черновиков следует тому, сколько стоит раунд на самой карте: чат на карте 16 ГБ идёт на
+29,8 ток/с вместо 26,5. Подробнее в [руководстве](docs/QWEN38_TURBO.ru.md).
+
 ## Qwen3.8-27B Turbo, постоянный потолок на карте (0.8.58)
 
 [Турбо-файл](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) держит память карты на месте при длинных

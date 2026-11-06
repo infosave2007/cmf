@@ -1281,6 +1281,17 @@ pub fn hidden_out(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>) 
     to::download(c, &w.ckpt[net.end], w.ntok * net.geom.hs)
 }
 
+/// The outputs of the listed layers (`[ntok][hs]` each, before any norm)
+/// from one forward of `ids`: the rows a draft model built elsewhere reads
+/// from its target.
+pub fn layer_outputs(c: Ctx, net: &Net, w: &Work, ids: &[u32], layers: &[usize]) -> Option<Vec<Vec<f32>>> {
+    if net.first != 0 || layers.iter().any(|&l| l >= net.end) {
+        return None;
+    }
+    forward_in(c, net, w, ids, None)?;
+    layers.iter().map(|&l| to::download(c, &w.ckpt[l + 1], w.ntok * net.geom.hs)).collect()
+}
+
 /// The output of a [`Net::load_prefix`] net for `ids` (`[ntok][hs]`).
 pub fn prefix_hidden(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<Vec<f32>> {
     forward_in(c, net, w, ids, None)?;
@@ -1382,7 +1393,13 @@ pub fn teacher_topk(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Optio
 /// norm) from the same forward: what a draft head trained on its trunk's
 /// own predictions reads and imitates.
 pub fn teacher_topk_hidden(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Option<(Vec<u32>, Vec<f32>, Vec<f32>)> {
-    forward(c, net, w, ids)?;
+    topk_hidden_in(c, net, w, ids, None, k)
+}
+
+/// [`teacher_topk_hidden`] of a net started from `h0`: a draft block's own
+/// top-k and its output rows, what the next step of its chain reads.
+pub fn topk_hidden_in(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, k: usize) -> Option<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+    forward_in(c, net, w, ids, h0)?;
     let h = to::download(c, &w.ckpt[net.end], w.ntok * net.geom.hs)?;
     let (i, p) = th::topk(c, &net.head, &w.head, w.get("n1"), w.ntok, k)?;
     Some((i, p, h))

@@ -4381,6 +4381,118 @@ pub fn q4tp_matmat(
     }
 }
 
+/// Ask the next whole-token or batch graph on this thread to keep the
+/// residual stream after each of `layers` (absolute indices): a DFlash
+/// drafter's context reads them. wgpu graphs only (the Metal graphs take
+/// `tap` calls); an empty list disarms.
+pub fn layer_taps_arm(layers: &[usize]) {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::layer_taps_arm(layers),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = layers;
+        }
+    }
+}
+
+/// What the armed graph kept, `[slot][row][hidden]`; disarms. False when it
+/// kept nothing (another backend, a span without every asked layer, a burst).
+pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::layer_taps_take(out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = out;
+            false
+        }
+    }
+}
+
+/// Several four-bit GEMMs over the same rows (at most eight), `(directory
+/// index, rows, cols, take)` each, in one submission on the narrow kernel:
+/// `outs[i]` is `[b][take]`, the plane's first `take` rows (a head's shortlist
+/// of the vocabulary; `take = rows` for all of it). Native Metal only: any
+/// other backend declines and the caller runs them one by one.
+pub fn q4tp_rows8_many(
+    model: &Arc<CmfModel>,
+    jobs: &[(usize, usize, usize, usize)],
+    xs: &[f32],
+    b: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => {
+            let takes: Vec<usize> = jobs.iter().map(|j| j.3).collect();
+            let jobs: Vec<crate::gpu_metal::MmJob> = jobs
+                .iter()
+                .map(|&(idx, rows, cols, _)| crate::gpu_metal::MmJob { idx, rows, cols })
+                .collect();
+            crate::gpu_metal::q4tp_n8_many(model, &jobs, Some(&takes), xs, b, outs)
+        }
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (model, jobs, xs, b, outs);
+            false
+        }
+    }
+}
+
+/// `q4tp_ffn` over at most eight rows on the narrow kernel. Native Metal only.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_rows8_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4tp_n8_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (model, w1, w3, w2, xs, b, hidden, inter, out);
+            false
+        }
+    }
+}
+
+/// Several four-bit GEMMs over the same rows, `(directory index, rows, cols)`
+/// each, in one submission (wgpu: narrow batches only). Where it declines the
+/// caller runs them one by one.
+pub fn q4tp_matmat_many(
+    model: &Arc<CmfModel>,
+    jobs: &[(usize, usize, usize)],
+    xs: &[f32],
+    b: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => {
+            let jobs: Vec<crate::gpu_metal::MmJob> = jobs
+                .iter()
+                .map(|&(idx, rows, cols)| crate::gpu_metal::MmJob { idx, rows, cols })
+                .collect();
+            crate::gpu_metal::q4tp_matmat_many(model, &jobs, xs, b, outs)
+        }
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_matmat_many(model, jobs, xs, b, outs),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (model, jobs, xs, b, outs);
+            false
+        }
+    }
+}
+
 /// The same over a two-bit weight plane. Native Metal uses the dedicated
 /// q2tp tile; unsupported shapes return false and preserve the host fallback.
 pub fn q2tp_matmat(

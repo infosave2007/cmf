@@ -75,7 +75,21 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length
 
 A real answer, 400 tokens of a summary, after 100 000 characters of Wikipedia: first token 76.7 → 72.1 s,
 decode 50.9 → 60.4 tok/s. With the budget of a 16 GB card on the same 5090 (`CMF_GPU_VRAM_MB=15000`): 15.0 GB,
-first token 176 s at 64 000, decode 92 tok/s. A real 16 GB card has fewer shader cores.
+first token 176 s at 64 000, decode 92 tok/s.
+
+A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt. `cortiq run --greedy --no-think`,
+220 tokens of an answer:
+
+| answer | without drafts, tok/s | with drafts, tok/s |
+|---|---:|---:|
+| an essay | 13.3 | **20.5** |
+| an explanation in Russian | 13.4 | **21.0** |
+| a Rust function with tests | 13.4 | **24.4** |
+| quotes from the prompt | 13.1 | **25.1** |
+| an edit of the prompt's code | 13.1 | **28.4** |
+
+In a chat the depth of the draft chain settles on the card's own round times: of five turns in one process the
+second to the fifth run at 29.8 tok/s.
 
 Host memory while the prompt is read, without the mapped weights:
 
@@ -87,11 +101,44 @@ Host memory while the prompt is read, without the mapped weights:
 
 On a disk with 4.5 GB/s write and 5.2 GB/s read the speed is the same as in RAM.
 
-MacBook Air M4, 24 GB, Metal, at 16 000 tokens: 6.3 GB beside the mapped weights, first token 545 s, decode 4 tok/s. An M4
-decodes this model at about 5 tok/s at any length, so on a Mac the file saves memory and not time. Drafts do not pay there, 4.6 tok/s against 4.9 without, and stay off.
+MacBook Air M4, 24 GB, Metal, at 16 000 tokens: 6.3 GB beside the mapped weights, first token 545 s, decode 4 tok/s.
+[On a Mac](#on-a-mac) has the rest.
 
 Facts planted in 100 000 characters: 12 of 12, 8 of them with a 15 GB budget and an SSD; in 230 000 characters, about 53 000
 tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 4. Perplexity on the rows past the seal, two windows of 16 384 tokens of Wikipedia: exact 4.76, far field 4.97.
+
+## On a Mac
+
+The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the base M4's memory
+bus, 120 GB/s by Apple's figure. It reads the 13.6 GB of weights a token takes at 92 to 95 GB/s, the speed of that
+bus: 6.4 tok/s without drafts. An M4 Pro's bus is rated at 273 GB/s and an M4 Max's at up to 546 GB/s; those
+machines were not measured. Two switches, both off by default, move the rest.
+
+**Drafts**, `CMF_GRAPH_SPEC=1`. The draft head proposes tokens and one pass over the weights checks them, so a pass
+gives more than one token. MacBook Air M4, greedy, 220 tokens, the same text with drafts and without:
+
+| answer | without drafts, tok/s | with drafts, tok/s |
+|---|---:|---:|
+| an essay | 6.4 | **10.1** |
+| an explanation in Russian | 6.4 | **10.7** |
+| a Rust function with tests | 6.4 | **12.1** |
+| quotes from the prompt | 6.4 | **15.0** |
+| an edit of the prompt's code | 6.4 | **20.5** |
+
+After a prompt of 3 600 tokens: 6.0 → 8.3 tok/s. Three things give it. A check of two or three rows runs on a batched
+matvec that reads the weights as fast as one row does, 95.7 and 82.4 GB/s against 60 to 67 for the GEMM, and its
+logits equal the plain path's to four decimal places. The chain's depth follows how often each of its drafts holds:
+two drafts on most text, where a fixed seven gave an essay nothing. Where an answer repeats a stretch of the prompt or
+of itself, the tokens that followed that stretch continue the chain up to seven drafts (`CMF_SPEC_LOOKUP=0` turns this
+off). Past the seal, at 16 000 tokens, drafts gave 4.6 tok/s against 4.9 before these changes and were not measured
+again.
+
+**The Neural Engine**, `CMF_ANE=1`. It reads a prompt's chunks beside the GPU: every layer's FFN, a GDN mixer's `z`
+and an attention layer's `q`. First token at 3 600 tokens 73.9 → 28.3 s, the same text; at 10 000 tokens with
+`--o1-spill` 217.6 → 113.5 s with a peak footprint of 3.4 GB. Decode stays on the GPU.
+
+`scripts/dory/q27_spec_decode.sh` runs the table; `JOURNAL_Q27_MAC_DECODE_2026-11-06.md` and
+`JOURNAL_Q27_ANE_2026-11-05.md` keep the logs.
 
 ## Building a turbo file
 

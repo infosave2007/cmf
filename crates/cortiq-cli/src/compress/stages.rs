@@ -1337,18 +1337,7 @@ fn s5_quant(run: &Run) -> Result<()> {
             let tmp = run.stage_dir(5).join("out-mtpheal.cmf");
             let init = path_of(&s0, "f16");
             run.log(&format!("S5: MTP draft trained on the finished trunk (3-step chain, {} epochs)", a.mtp_heal_epochs));
-            let cfg = super::mtp_heal::Cfg {
-                chain: 3,
-                refresh: 150,
-                tokens: 393216,
-                window: 2048,
-                epochs: a.mtp_heal_epochs,
-                lr: 2e-5,
-                topk: 64,
-                batch: 2,
-                eval_every: 25,
-                patience: 6,
-            };
+            let cfg = super::mtp_heal::Cfg::stage(a.mtp_heal_epochs);
             let r = super::mtp_heal::heal(&out, init.as_deref(), root, &cfg, &tmp, run.threads)?;
             std::fs::rename(&tmp, &out)?;
             run.log(&format!(

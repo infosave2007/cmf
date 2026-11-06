@@ -346,6 +346,43 @@ pub struct Pipeline {
     pub spec_k_adapt: Option<usize>,
     /// EWMA of the accepted fraction that drives `spec_k_adapt`.
     pub spec_acc_ewma: f32,
+    /// Native Metal over a q4tp trunk: how often draft `j` holds once the
+    /// one before it held, a running average (see `metal_spec_depth`).
+    pub spec_hold: [f32; 7],
+    /// wgpu: what a round of k drafts costs on this device, a running
+    /// average of its wall in ms (0 until a depth has run twice), the rounds
+    /// each depth has run, and the rounds the depth still stays where the
+    /// last change put it (`wgpu_spec_depth`).
+    spec_wall: [f32; 7],
+    spec_wall_n: [u8; 7],
+    spec_k_dwell: u8,
+    /// wgpu: a plain token's time as a speculation trial last measured it,
+    /// and the position it was measured at. A later request's trial decides
+    /// from it instead of decoding eight plain tokens again.
+    spec_plain_ms: (f64, usize),
+    /// The same for the DFlash drafter's rounds, and whether the last round
+    /// was one of them.
+    pub dflash_hold: [f32; 7],
+    dflash_last: bool,
+    /// Rounds the DFlash block still sits out, the wait its next lost turn
+    /// costs, and the rounds of its turn so far.
+    dflash_wait: u32,
+    dflash_back: u32,
+    dflash_turn: u32,
+    /// The tokens the turn's rounds landed and what they cost, in plain tokens.
+    dflash_turn_sum: (f32, f32),
+    /// The sidecar's router: how far the target's last rows lean to the
+    /// block's rounds (a running average of `Route::margin`).
+    dflash_lean: f32,
+    /// The depth of the block's rounds on a card whose verify grows with its
+    /// rows, and the running share of drafts they keep (`spec_k_adapt`'s twin).
+    dflash_k_adapt: Option<usize>,
+    dflash_acc_ewma: f32,
+    /// Prompt lookup on native Metal: the drafts it added to a round that
+    /// held, a running average, and the rounds it sits out after that fell
+    /// under `LOOKUP_PAYS`.
+    pub spec_lookup_gain: f32,
+    pub spec_lookup_rest: u32,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
     /// Speculative SAMPLING state (graph_spec_step, temperature > 0): the
@@ -368,6 +405,17 @@ pub struct Pipeline {
     /// KV in different places (device mirror vs the CPU cache) and a
     /// mid-run switch would read the wrong one.
     mtp_graph_mode: Option<bool>,
+    /// The DFlash block drafter of the model's sidecar (`CMF_DFLASH=1`): it
+    /// drafts a round in one block from the trunk's tapped layer outputs.
+    pub dflash: Option<Box<crate::dflash::Drafter>>,
+    /// The tapped rows of the verify in flight, joined a row at a time, and
+    /// their first position: the accepted ones become the drafter's context.
+    dflash_rows: Option<(usize, Vec<f32>)>,
+    /// Rows the wgpu graphs kept for the drafter, `(first position, rows as
+    /// [row][layer][hidden])` in the order the graphs ran: a prompt's and a
+    /// plain token's become context at the next round, a verify's are taken
+    /// by the round that ran it.
+    dflash_taps: std::sync::Mutex<Vec<(usize, Vec<f32>)>>,
     /// The Metal verify graph of the round in flight, between its sync
     /// (logits read) and the commit that replays the accepted prefix.
     #[cfg(target_os = "macos")]
@@ -1331,6 +1379,320 @@ struct SpecMon {
     metal: bool,
 }
 
+/// What a speculative round of k drafts costs on native Metal over a q4tp
+/// trunk, in plain tokens. One and two drafts verify on the small-batch
+/// matvec (`q4tp_matvec_b2` / `_b3`), three and more on the narrow GEMM at
+/// one flat price. MacBook Air M4, Qwen3.8-27B: a plain token 160 ms, a
+/// round of one draft 176, of two 204, of three 246, of seven 281.
+const METAL_ROUND_COST: [f32; 7] = [1.10, 1.275, 1.54, 1.59, 1.65, 1.70, 1.76];
+/// How often a draft holds once the one before it held, before any round has
+/// shown it: the 27B's chain on code and on prose holds its first draft in
+/// four rounds of five, the second in three of four after that, the third in
+/// one of two.
+const SPEC_HOLD_PRIOR: [f32; 7] = [0.80, 0.75, 0.50, 0.67, 0.65, 0.69, 0.67];
+
+/// The draft depth that lands the most tokens in a unit of time: a round of
+/// k drafts gives its tip and every draft the chain held, for the cost of
+/// that depth's verify.
+fn metal_spec_depth(hold: &[f32; 7]) -> usize {
+    metal_spec_plan(hold, 0.0).0
+}
+
+/// `metal_spec_depth` for a drafter whose drafts cost `draft` plain tokens a
+/// round whatever the depth (a DFlash block; an MTP chain's steps are small
+/// change beside the verify and count as nothing): the depth, and the tokens
+/// it lands in the time of a plain one.
+fn metal_spec_plan(hold: &[f32; 7], draft: f32) -> (usize, f32) {
+    spec_plan_at(&METAL_ROUND_COST, hold, draft, 0.0)
+}
+
+/// `metal_spec_plan` over any device's price list: `cost[k - 1]` plain tokens
+/// for a round of k drafts, `draft` a round and `step` a draft on top.
+fn spec_plan_at(cost: &[f32; 7], hold: &[f32; 7], draft: f32, step: f32) -> (usize, f32) {
+    let mut best = (1usize, 0f32);
+    let (mut tokens, mut reach) = (1.0f32, 1.0f32);
+    for k in 1..=7 {
+        reach *= hold[k - 1];
+        tokens += reach;
+        let rate = tokens / (cost[k - 1] + draft + step * k as f32);
+        // a longer chain has to win by more than the averages' noise
+        if rate > best.1 * 1.04 {
+            best = (k, rate);
+        }
+    }
+    best
+}
+
+/// The depth of the MTP chain's rounds on wgpu, from what a round costs on
+/// this device: `wall[k - 1]` is the measured wall of a round of k drafts in
+/// ms (0: not timed yet), and a depth between or past the timed ones is
+/// priced on the line through the two nearest. A verify's price climbs with
+/// its rows by a card's own slope (Qwen3.8-27B Turbo, a round of 3 / 4 / 5
+/// drafts: RTX 2000 Ada 111 / 126 / 145 ms against a plain token's 75), so
+/// the acceptance alone does not say where a deeper round stops paying.
+/// `None` until two depths are timed: the acceptance rule moves the depth
+/// until then. The depth in turn stays unless another lands 4 % more tokens
+/// in a unit of time.
+fn wgpu_spec_depth(hold: &[f32; 7], wall: &[f32; 7], k_now: usize, k_min: usize, k_max: usize) -> Option<usize> {
+    let mut timed = (1..=7usize).filter(|&k| wall[k - 1] > 0.0);
+    let (first, second) = (timed.next()?, timed.next()?);
+    let price = |k: usize| -> f32 {
+        if wall[k - 1] > 0.0 {
+            return wall[k - 1];
+        }
+        // the two timed depths nearest to k
+        let (mut a, mut b) = (first, second);
+        for j in (1..=7usize).filter(|&j| wall[j - 1] > 0.0 && j != first && j != second) {
+            let far = if a.abs_diff(k) >= b.abs_diff(k) { &mut a } else { &mut b };
+            if j.abs_diff(k) < far.abs_diff(k) {
+                *far = j;
+            }
+        }
+        let (a, b) = (a.min(b), a.max(b));
+        let slope = ((wall[b - 1] - wall[a - 1]) / (b - a) as f32).max(0.0);
+        (wall[a - 1] + slope * (k as f32 - a as f32)).max(wall[a - 1] * 0.5)
+    };
+    let (k_min, k_max) = (k_min.clamp(1, 7), k_max.clamp(1, 7));
+    let (mut tokens, mut reach) = (1.0f32, 1.0f32);
+    let mut rate = [0f32; 7];
+    for k in 1..=7 {
+        reach *= hold[k - 1];
+        tokens += reach;
+        rate[k - 1] = tokens / price(k);
+    }
+    let k_now = k_now.clamp(k_min, k_max);
+    let best = (k_min..=k_max).max_by(|&a, &b| rate[a - 1].total_cmp(&rate[b - 1]))?;
+    Some(if rate[best - 1] > rate[k_now - 1] * 1.04 { best } else { k_now })
+}
+
+/// A DFlash block with its head and selector on native Metal, in plain
+/// tokens: one price a round, every draft of the block at once. MacBook Air
+/// M4, the DFlash 2 drafter of Qwen3.8-27B as q4tp: 70 ms against a plain
+/// token's 160.
+const DFLASH_ROUND_DRAFT: f32 = 0.44;
+/// How often a DFlash draft holds once the one before it held, before any
+/// round has shown it: the 27B's drafter keeps 3.4 drafts of seven from every
+/// start of mixed text.
+const DFLASH_HOLD_PRIOR: [f32; 7] = [0.85, 0.82, 0.80, 0.80, 0.80, 0.80, 0.80];
+/// Rounds the DFlash block sits out after a turn that the MTP chain took
+/// back, and the most it ever sits out: a turn of fewer than `DFLASH_TURN`
+/// rounds doubles the wait, a longer one starts it over. A turn that landed
+/// more tokens over all its rounds than the chain was landing lost them to a
+/// hard stretch (the block holds a whole round or none of it, so a few empty
+/// rounds in a row say little): it sits out `DFLASH_WAIT_DIP` rounds only.
+const DFLASH_WAIT: u32 = 48;
+const DFLASH_WAIT_MOST: u32 = 768;
+/// The router's margin of a round enters the running average with this
+/// weight, and the drafter in turn keeps the rounds while the average is
+/// inside this band (the margin is a difference of squared errors of unit
+/// rows).
+pub const DFLASH_LEAN_STEP: f32 = 0.5;
+pub const DFLASH_LEAN_BAND: f32 = 0.0;
+/// A stretch being copied from the context is the chain's whatever the router
+/// says: this many of the last tokens repeating an earlier stretch (see
+/// `tail_repeat`). Its short round and the lookup after it draft such text
+/// for less than a block (edits and quotes: 8 keeps the code's rounds, where
+/// three or four tokens repeat all the time).
+pub const DFLASH_COPY_MIN: usize = 8;
+const DFLASH_WAIT_DIP: u32 = 8;
+const DFLASH_TURN: u32 = 16;
+
+/// One logged start of a sequence, for `dflash_round_values`.
+pub struct DflashStart<'a> {
+    /// The committed stream through the round's first token.
+    pub seq: &'a [u32],
+    /// What the trunk went on to say after it (seven tokens or more).
+    pub after: &'a [u32],
+    /// The block's seven drafts there.
+    pub block: &'a [u32],
+    /// The chain's seven.
+    pub chain: &'a [u32],
+}
+
+/// For `cortiq dflash-route-fit`: what a round at each of a sequence's logged
+/// starts lands and what it costs in plain tokens, `(tokens, cost)` under the
+/// block and under the chain, each at the depth its own rule picks from the
+/// starts before it, a prompt lookup going on after the drafts as it does in
+/// a round (`METAL_ROUND_COST`, `DFLASH_ROUND_DRAFT`: the price of a round on
+/// a MacBook Air M4).
+pub fn dflash_round_values(starts: &[DflashStart<'_>]) -> Vec<((f32, f32), (f32, f32))> {
+    dflash_round_values_at(starts, &METAL_ROUND_COST, DFLASH_ROUND_DRAFT, 0.0)
+}
+
+/// `dflash_round_values` at another device's prices: `cost[k - 1]` plain
+/// tokens for the verify and commit of a round of k drafts, `block_draft`
+/// for a block, `chain_step` for each draft of the chain.
+pub fn dflash_round_values_at(
+    starts: &[DflashStart<'_>],
+    cost: &[f32; 7],
+    block_draft: f32,
+    chain_step: f32,
+) -> Vec<((f32, f32), (f32, f32))> {
+    // a drafter's account of what holds, and what its lookups have paid
+    struct Side {
+        hold: [f32; 7],
+        gain: f32,
+        rest: u32,
+        draft: f32,
+        step: f32,
+    }
+    let mut seq: Vec<u32> = Vec::new();
+    let mut round = |side: &mut Side, s: &DflashStart<'_>, own: &[u32]| -> (f32, f32) {
+        let k = spec_plan_at(cost, &side.hold, side.draft, side.step).0.min(own.len()).max(1);
+        let mut drafts = own[..k.min(own.len())].to_vec();
+        if k < 7 && drafts.len() == k {
+            if side.rest > 0 {
+                side.rest -= 1;
+            } else {
+                seq.clear();
+                seq.extend_from_slice(s.seq);
+                seq.extend_from_slice(&drafts);
+                let more = lookup_continuation(&seq, k + LOOKUP_MIN_REAL, 7 - k).to_vec();
+                drafts.extend(more);
+            }
+        }
+        let kept = drafts.iter().zip(s.after).take_while(|(d, t)| d == t).count();
+        if drafts.len() > k {
+            side.gain += 0.2 * (kept.saturating_sub(k) as f32 - side.gain);
+            if side.gain < LOOKUP_PAYS {
+                (side.rest, side.gain) = (24, 1.6);
+            }
+        }
+        spec_hold_update(&mut side.hold, k, kept.min(k));
+        ((1 + kept) as f32, cost[drafts.len().clamp(1, 7) - 1] + side.draft + side.step * k as f32)
+    };
+    let mut block = Side { hold: DFLASH_HOLD_PRIOR, gain: 2.0, rest: 0, draft: block_draft, step: 0.0 };
+    let mut chain = Side { hold: SPEC_HOLD_PRIOR, gain: 2.0, rest: 0, draft: 0.0, step: chain_step };
+    starts.iter().map(|s| (round(&mut block, s, s.block), round(&mut chain, s, s.chain))).collect()
+}
+
+/// `CMF_DFLASH_ROWS=FILE`: every round of the DFlash block is written there
+/// for `cortiq dflash-route-fit`, and the MTP chain drafts the same round
+/// beside it, unverified. A record is 24 u32 and the target's row at the
+/// tip (hidden f32), little-endian: the position of the round's first
+/// token, that token, drafts verified, drafts accepted, the block's seven
+/// drafts, the chain's seven, the lookup's count and its five after the
+/// chain's first two (`u32::MAX` where there is none). `FILE.ids` holds the
+/// stream through the first logged round's first token (u32).
+fn dflash_rows_log() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let path = std::env::var("CMF_DFLASH_ROWS").ok()?;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => Some(std::sync::Mutex::new(f)),
+            Err(e) => {
+                tracing::warn!("CMF_DFLASH_ROWS: {path}: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Which drafter takes rounds when a DFlash sidecar sits beside the model's
+/// own MTP block: `CMF_DFLASH_PICK=dflash` / `mtp` pins one, anything else
+/// leaves it to what each of them holds.
+fn dflash_pick() -> Option<bool> {
+    static PICK: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *PICK.get_or_init(|| match std::env::var("CMF_DFLASH_PICK").as_deref() {
+        Ok("dflash") => Some(true),
+        Ok("mtp") => Some(false),
+        _ => None,
+    })
+}
+
+/// A round of `k` drafts held its first `accepted`: move every depth the
+/// round put to the test. Depths past `k` keep their last value, except
+/// while the deepest one shown holds in nine rounds of ten: text that
+/// predictable is worth a longer chain now and then, so they drift towards
+/// it until a deeper round measures them.
+fn spec_hold_update(hold: &mut [f32; 7], k: usize, accepted: usize) {
+    let k = k.clamp(1, 7);
+    for j in 1..=k {
+        if accepted + 1 >= j {
+            let hit = if accepted >= j { 1.0 } else { 0.0 };
+            hold[j - 1] += 0.1 * (hit - hold[j - 1]);
+        }
+    }
+    if k < 7 && hold[k - 1] >= 0.9 {
+        for j in k + 1..=7 {
+            hold[j - 1] += 0.005 * (hold[k - 1] - hold[j - 1]);
+        }
+    }
+}
+
+/// Real tokens before the head's drafts that have to repeat with them for a
+/// lookup to continue the chain.
+const LOOKUP_MIN_REAL: usize = 3;
+/// Drafts a lookup has to add to a round on average to pay for the wider
+/// verify (a round of two drafts against one of seven on the M4: 204 and
+/// 281 ms).
+const LOOKUP_PAYS: f32 = 1.0;
+
+/// Prompt lookup: where the tail of `seq`, its last `min_len` tokens or
+/// more, repeats an earlier stretch, the tokens that followed that stretch
+/// there, at most `want` of them. The longest repeat wins, the latest of
+/// equal ones.
+fn lookup_continuation(seq: &[u32], min_len: usize, want: usize) -> &[u32] {
+    const CAP: usize = 32;
+    let n = seq.len();
+    if want == 0 || min_len == 0 || n <= min_len {
+        return &[];
+    }
+    let last = seq[n - 1];
+    let mut best = (0usize, 0usize);
+    for p in (0..n - 1).rev() {
+        if seq[p] != last {
+            continue;
+        }
+        let mut l = 1;
+        while l < CAP && l <= p && seq[p - l] == seq[n - 1 - l] {
+            l += 1;
+        }
+        if l > best.0 {
+            best = (l, p);
+            if l == CAP {
+                break;
+            }
+        }
+    }
+    if best.0 < min_len {
+        return &[];
+    }
+    let from = best.1 + 1;
+    &seq[from..(from + want).min(n)]
+}
+
+/// How many of the last tokens of `seq` repeat an earlier stretch of it (the
+/// longest such repeat, 32 at most): text that is being copied from the
+/// context. A lookup drafts such a stretch for nothing after the chain's
+/// short round, so a round there is not worth a DFlash block.
+pub fn tail_repeat(seq: &[u32]) -> usize {
+    const CAP: usize = 32;
+    let n = seq.len();
+    if n < 2 {
+        return 0;
+    }
+    let last = seq[n - 1];
+    let mut best = 0usize;
+    for p in (0..n - 1).rev() {
+        if seq[p] != last {
+            continue;
+        }
+        let mut l = 1;
+        while l < CAP && l <= p && seq[p - l] == seq[n - 1 - l] {
+            l += 1;
+        }
+        if l > best {
+            best = l;
+            if l == CAP {
+                break;
+            }
+        }
+    }
+    best
+}
+
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
@@ -1761,6 +2123,32 @@ impl Pipeline {
         )
     }
 
+    /// Prompt lookup in a speculative round (`CMF_SPEC_LOOKUP=0` leaves the
+    /// chain to the draft head alone).
+    fn spec_lookup_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_SPEC_LOOKUP").as_deref() != Ok("0"))
+    }
+
+    /// Whether a verify of two or three rows runs on the small-batch matvec:
+    /// native Metal, a dense q4tp FFN in the trunk, the kernel not switched
+    /// off (`CMF_METAL_MVS=0`).
+    fn metal_small_batch_verify(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            crate::gpu::q1_force()
+                && crate::gpu_metal::small_batch_mv()
+                && self.weights.layers.first().is_some_and(|l| match &l.ffn {
+                    FfnKind::Dense(d) => d.gate_proj.mapped_q4tp().is_some(),
+                    _ => false,
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     /// Architectures that run a dedicated per-token stack (gemma-3n's
     /// AltUp flow, the gemma-4 E-series PLE/shared-KV body): batched
     /// prefill and the graphs stay off for them.
@@ -2001,6 +2389,16 @@ impl Pipeline {
         // `kv_prefix`) describe the state being dropped here.
         self.clear_history();
         self.graph_logits = None;
+        if let Some(d) = &mut self.dflash {
+            d.reset();
+        }
+        self.dflash_rows = None;
+        self.dflash_taps.lock().unwrap().clear();
+        // a new sequence owes the DFlash block nothing of the last one's turns
+        self.dflash_hold = DFLASH_HOLD_PRIOR;
+        (self.dflash_last, self.dflash_wait, self.dflash_back, self.dflash_turn) = (false, 0, DFLASH_WAIT, 0);
+        self.dflash_turn_sum = (0.0, 0.0);
+        self.dflash_lean = 0.0;
         if let Some(b) = &mut self.dsv41 {
             b.3.clear();
         }
@@ -2913,8 +3311,10 @@ impl Pipeline {
                         dt_bias: &w.dt_bias,
                         gnorm: &w.norm,
                     };
+                    // a run ends at a layer a DFlash drafter reads: its output is kept there
+                    let cut = scan > 0 && self.dflash.as_ref().is_some_and(|d| d.g.taps.contains(&(scan - 1)));
                     match plan.last_mut() {
-                        Some(Item::Gdn { run, .. }) => run.push(gl),
+                        Some(Item::Gdn { run, .. }) if !cut => run.push(gl),
                         _ => plan.push(Item::Gdn {
                             run: vec![gl],
                             first: scan,
@@ -3608,6 +4008,13 @@ impl Pipeline {
         // Device-attended layers: their K/V/imp are pulled from the
         // mirror after the final sync.
         let mut dev_attn: Vec<(usize, usize, usize)> = Vec::new();
+        // The layers a DFlash drafter reads, kept as the token passes them
+        // (a whole token in one graph only).
+        let taps: Vec<usize> = match &self.dflash {
+            Some(d) if start == 0 && end == self.num_layers => d.g.taps.clone(),
+            _ => Vec::new(),
+        };
+        let mut tapped = 0usize;
         for item in &plan {
             let _xt0 = std::time::Instant::now();
             let _xkind: u32 = match item {
@@ -3640,6 +4047,9 @@ impl Pipeline {
                         // Unreachable: the plan was validated above.
                         tracing::error!("q1 graph: GDN run refused after validation");
                         return start;
+                    }
+                    if let Some(slot) = taps.iter().position(|t| *t + 1 == *first + run.len()) {
+                        tapped += graph.tap(slot, taps.len()) as usize;
                     }
                     // Early commit: the GPU starts the run while the
                     // CPU encodes the next layer (nothing to wait on).
@@ -3764,6 +4174,9 @@ impl Pipeline {
                             // o1 layers leave no mirror row to pull.
                             if p.o1.is_none() {
                                 dev_attn.push((*li, nkv, hd));
+                            }
+                            if let Some(slot) = taps.iter().position(|t| t == li) {
+                                tapped += graph.tap(slot, taps.len()) as usize;
                             }
                             graph.commit_kind = 3;
                             graph.commit();
@@ -3963,6 +4376,9 @@ impl Pipeline {
                         attention::recycle_buf(&mut raw);
                     }
                     graph.encode_attn_suffix(l, &ao);
+                    if let Some(slot) = taps.iter().position(|t| t == li) {
+                        tapped += graph.tap(slot, taps.len()) as usize;
+                    }
                     // Early commit: the GPU starts O+FFN while the CPU
                     // encodes the following GDN run / attention prefix.
                     graph.commit();
@@ -4045,6 +4461,15 @@ impl Pipeline {
             self.graph_logits = Some(lg);
         }
         graph.read_h(h);
+        // the token's row of the drafter's context
+        if !taps.is_empty() && tapped == taps.len() {
+            let mut row = vec![0f32; taps.len() * self.hidden_size];
+            if graph.read_taps(&mut row) {
+                if let Some(d) = self.dflash.as_mut() {
+                    d.queue_context(position, &row, self.pool.as_deref());
+                }
+            }
+        }
         if self.graph_head_required && self.graph_logits.is_none() {
             METAL_GRAPH_HEAD_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.fail_metal_graph("fused graph head completed without logits readback");
@@ -4199,6 +4624,22 @@ impl Pipeline {
             draft_full_streak: 0,
             spec_k_adapt: None,
             spec_acc_ewma: 0.7,
+            spec_hold: SPEC_HOLD_PRIOR,
+            spec_wall: [0.0; 7],
+            spec_wall_n: [0; 7],
+            spec_k_dwell: 0,
+            spec_plain_ms: (0.0, 0),
+            dflash_hold: DFLASH_HOLD_PRIOR,
+            dflash_last: false,
+            dflash_wait: 0,
+            dflash_back: DFLASH_WAIT,
+            dflash_turn: 0,
+            dflash_turn_sum: (0.0, 0.0),
+            dflash_lean: 0.0,
+            dflash_k_adapt: None,
+            dflash_acc_ewma: 0.6,
+            spec_lookup_gain: 2.0,
+            spec_lookup_rest: 0,
             rng,
             sampler_scratch: SamplerScratch::default(),
             spec_forced: None,
@@ -4209,6 +4650,9 @@ impl Pipeline {
             spec_ps: Vec::new(),
             spec_ress: Vec::new(),
             mtp_graph_mode: None,
+            dflash: None,
+            dflash_rows: None,
+            dflash_taps: std::sync::Mutex::new(Vec::new()),
             #[cfg(target_os = "macos")]
             metal_verify: None,
             inv_freq,
@@ -4658,7 +5102,7 @@ impl Pipeline {
         }
         #[cfg(target_os = "macos")]
         if self.o1_active() && self.o1_on_graph() && crate::gpu::q1_force() && crate::gpu::enabled_here() {
-            return 128;
+            return if crate::gpu_metal::ane::wanted() { 512 } else { 128 };
         }
         // The sealed O(1) suffix of a bounded prompt (`CMF_O1_PREFILL`) on
         // the device route rides the batch graph, whose O(1) kernels take
@@ -5854,7 +6298,14 @@ impl Pipeline {
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .filter(|&v| (1..=8).contains(&v))
-                        .unwrap_or(7);
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| {
+                            if self.metal_small_batch_verify() {
+                                "auto".to_string()
+                            } else {
+                                "7".to_string()
+                            }
+                        });
                     let arm = if self.sampler_config.temperature < 1e-6 {
                         "greedy"
                     } else {
@@ -6306,7 +6757,8 @@ impl Pipeline {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&v| (16..=512).contains(&v))
-                .unwrap_or(256);
+                // The ANE's weights go once a chunk: a larger one pays them over more rows.
+                .unwrap_or(if crate::gpu_metal::ane::wanted() { 512 } else { 256 });
             let hs = self.hidden_size;
             let _tp = std::time::Instant::now();
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6960,6 +7412,12 @@ impl Pipeline {
             metal: graph_spec && crate::gpu::q1_force() && spec_cheap_round,
             ..SpecMon::default()
         };
+        // wgpu: a plain token an earlier request's trial timed stands while
+        // the context is of the same order (the trunk's weights are most of
+        // a token's time), and this trial decides after its rounds.
+        if !spec_mon.metal && self.spec_plain_ms.0 > 0.0 && input_ids.len() <= self.spec_plain_ms.1 * 2 + 1024 {
+            spec_mon.plain_ms = self.spec_plain_ms.0;
+        }
         let mut spec_watchdog_off = false;
         // CMF_GRAPH_SPEC_TIME: the round walls so far (round 1 excluded —
         // it pays the scratch), for the outlier test on each new one
@@ -7159,6 +7617,9 @@ impl Pipeline {
                     SpecTrial::Plain { t0, gen0 } if spec_mon.plain_done(t0, gen0, generated) => {
                         spec_mon.plain_ms =
                             t0.elapsed().as_secs_f64() * 1e3 / (generated - gen0) as f64;
+                        if !spec_mon.metal {
+                            self.spec_plain_ms = (spec_mon.plain_ms, next_pos);
+                        }
                         let keep = spec_mon.pays();
                         tracing::info!(
                             "speculation trial: {:.2} tok/round in {:.1} ms vs plain {:.1} ms/tok — {}",
@@ -7999,6 +8460,16 @@ impl Pipeline {
     /// a decided speculation keeps re-checking the rule every round and
     /// stops after four losing rounds in a row.
     fn spec_trial_round(trial: SpecTrial, mon: &mut SpecMon, generated: usize) -> SpecTrial {
+        // CMF_GRAPH_SPEC_PIN=1 keeps the rounds on whatever they cost: a
+        // count of how a draft head holds has to include the stretches a
+        // trial would decode plain.
+        static PIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PIN.get_or_init(|| std::env::var("CMF_GRAPH_SPEC_PIN").as_deref() == Ok("1")) {
+            return SpecTrial::Decided {
+                spec: true,
+                recheck_at: usize::MAX,
+            };
+        }
         match trial {
             SpecTrial::Spec { t0, gen0, rounds } => {
                 let rounds = rounds + 1;
@@ -8754,12 +9225,139 @@ impl Pipeline {
         // let the accepted fraction move it — predictable text climbs to
         // the old default within a few rounds, prose settles at 2-3 where
         // the shorter verify pays.
-        let (k_start, k_max) = if metal_native {
+        // Native Metal over a q4tp trunk: two rows verify at about a plain
+        // token's price and three at a quarter more, so the depth follows
+        // each depth's running acceptance instead of filling the GEMM tile.
+        let metal_small = metal_native && self.metal_small_batch_verify();
+        // Greedy without penalties verifies by argmax equality (bit-exact
+        // against the plain path). Anything else is speculative SAMPLING:
+        // each draft is a DRAW from the MTP head's post-chain distribution
+        // q_j, kept for the accept test; the verify's rows give p_j.
+        let cfg = self.sampler_config.clone();
+        let penalized = !(cfg.repetition_penalty == 1.0
+            && cfg.presence_penalty == 0.0
+            && cfg.suppress_tokens.is_empty());
+        // Three verify regimes: plain greedy (argmax of the raw rows),
+        // greedy WITH penalties (argmax of the penalized rows — a single
+        // pass each, no distributions), and sampling (draw / accept /
+        // correct on post-chain distributions).
+        let greedy_pen = cfg.temperature < 1e-6 && penalized;
+        let sampling = cfg.temperature >= 1e-6;
+        // A DFlash drafter beside the model drafts a round in one block
+        // (plain greedy on native Metal, where the verify hands it the
+        // trunk's rows). Its block costs the same at any depth, so its
+        // rounds go deep where its drafts hold; the MTP chain's are short
+        // and nearly free. Each keeps its own account of what it holds, and
+        // the round goes to the one that lands more tokens in a unit of time
+        // (the one in turn has to be beaten by more than the noise). The
+        // block was trained on Latin-script text: while the committed tokens
+        // come from the high table (`draft_full_streak`) the chain keeps the
+        // rounds. A turn the chain takes back makes the block sit out, longer
+        // each time it is a short one.
+        // The wgpu graphs keep the drafter's rows on their way (`layer_taps`):
+        // they become context here, and a round is the block's only while that
+        // context reaches the tip. There the block is for measuring, pinned
+        // with `CMF_DFLASH_PICK=dflash`, and the chain keeps the rounds
+        // otherwise: the block is a matrix a submission, and on a 16 GB card
+        // the Turbo trunk leaves its 1.3 GB no room among the resident weights
+        // (RTX 2000 Ada: 135 ms a block against 11 ms for the chain's drafts,
+        // and a verify of eight rows costs two plain tokens).
+        if !metal_native {
+            self.dflash_taps_absorb();
+        }
+        let dflash_ok = !sampling
+            && !greedy_pen
+            && match &self.dflash {
+                Some(d) => metal_native || (dflash_pick() == Some(true) && d.next_position() == next_pos),
+                None => false,
+            };
+        if !metal_native && self.dflash.is_some() && dflash_pick() != Some(true) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!(
+                    "DFlash drafter: on wgpu the MTP chain keeps the rounds (CMF_DFLASH_PICK=dflash pins the block)"
+                )
+            });
+        }
+        let (k_flash, rate_flash) = metal_spec_plan(&self.dflash_hold, DFLASH_ROUND_DRAFT);
+        let (_, rate_mtp) = metal_spec_plan(&self.spec_hold, 0.0);
+        // A sidecar that carries a router says which drafter the text at the
+        // tip is for, from the target's own row there: two subspaces of such
+        // rows, one of the rounds the block won and one of the chain's, and
+        // the row goes to the one that holds it better (`dflash::Route`).
+        // A few rounds are averaged, and the drafter in turn keeps a round
+        // the average does not clearly give away.
+        let routed = match (&self.dflash, dflash_ok) {
+            (Some(d), true) => d.route.as_ref().map(|r| r.margin(hidden)),
+            _ => None,
+        };
+        if let Some(m) = routed {
+            self.dflash_lean += DFLASH_LEAN_STEP * (m - self.dflash_lean);
+        }
+        let copying = routed.is_some() && dflash_pick().is_none() && tail_repeat(all_ids) >= DFLASH_COPY_MIN;
+        let dflash_round = dflash_ok
+            && match (dflash_pick(), routed) {
+                (Some(pin), _) => pin,
+                (None, Some(_)) if copying => false,
+                (None, Some(_)) if self.dflash_last => self.dflash_lean > -DFLASH_LEAN_BAND,
+                (None, Some(_)) => self.dflash_lean > DFLASH_LEAN_BAND,
+                (None, None) if !metal_small => true,
+                (None, None) if self.draft_full_streak > 0 => false,
+                (None, None) if self.dflash_last => rate_flash * 1.05 >= rate_mtp,
+                (None, None) if self.dflash_wait > 0 => {
+                    self.dflash_wait -= 1;
+                    false
+                }
+                (None, None) => rate_flash > rate_mtp * 1.05,
+            };
+        if dflash_ok && dflash_round != self.dflash_last {
+            if dflash_round {
+                (self.dflash_turn, self.dflash_turn_sum) = (0, (0.0, 0.0));
+            } else {
+                // the block's turn is over: it comes back to a fresh account
+                let (tokens, cost) = self.dflash_turn_sum;
+                if self.dflash_turn >= DFLASH_TURN && tokens >= rate_mtp * cost {
+                    self.dflash_wait = DFLASH_WAIT_DIP;
+                } else {
+                    self.dflash_back = if self.dflash_turn < DFLASH_TURN {
+                        (self.dflash_back * 2).min(DFLASH_WAIT_MOST)
+                    } else {
+                        DFLASH_WAIT
+                    };
+                    self.dflash_wait = self.dflash_back;
+                }
+                self.dflash_hold = DFLASH_HOLD_PRIOR;
+            }
+            if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                eprintln!(
+                    "spec-drafter: {} ({rate_flash:.2} against {rate_mtp:.2} tokens in a plain token's time)",
+                    if dflash_round { "the DFlash block" } else { "the MTP chain" }
+                );
+            }
+        }
+        self.dflash_turn += u32::from(dflash_round);
+        self.dflash_last = dflash_round;
+        // a pinned block never hands a round to the chain: its cache may lapse
+        let mtp_in_step = dflash_pick() != Some(true) || dflash_rows_log().is_some();
+        let (k_start, k_max) = if dflash_round && metal_small {
+            (k_flash, 7)
+        } else if metal_small {
+            (metal_spec_depth(&self.spec_hold), 7)
+        } else if metal_native || dflash_round {
+            // (a block costs the same at any depth: its rounds start at all seven)
             (7, 7)
         } else {
             (3, k_default.max(5))
         };
-        let k_full: usize = k_env.unwrap_or_else(|| self.spec_k_adapt.unwrap_or(k_start));
+        let k_full: usize = k_env.unwrap_or_else(|| {
+            if metal_small {
+                k_start
+            } else if dflash_round && !metal_native {
+                self.dflash_k_adapt.unwrap_or(k_start)
+            } else {
+                self.spec_k_adapt.unwrap_or(k_start)
+            }
+        });
         let k_spec = k_full.min(room).max(1);
         // a tail round cut short by `room` says nothing about the text:
         // it must not move the adaptive depth the next request starts at
@@ -8785,20 +9383,10 @@ impl Pipeline {
         // That is the largest measured item left on this path.
         let subs = || crate::gpu_wgpu::SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
         let sub0 = subs();
-        // Greedy without penalties verifies by argmax equality (bit-exact
-        // against the plain path). Anything else is speculative SAMPLING:
-        // each draft is a DRAW from the MTP head's post-chain distribution
-        // q_j, kept for the accept test; the verify's rows give p_j.
-        let cfg = self.sampler_config.clone();
-        let penalized = !(cfg.repetition_penalty == 1.0
-            && cfg.presence_penalty == 0.0
-            && cfg.suppress_tokens.is_empty());
-        // Three verify regimes: plain greedy (argmax of the raw rows),
-        // greedy WITH penalties (argmax of the penalized rows — a single
-        // pass each, no distributions), and sampling (draw / accept /
-        // correct on post-chain distributions).
-        let greedy_pen = cfg.temperature < 1e-6 && penalized;
-        let sampling = cfg.temperature >= 1e-6;
+        let k_spec = match &self.dflash {
+            Some(d) if dflash_round => k_spec.min(d.g.block - 1),
+            _ => k_spec,
+        };
         // Sampling with a top-k goes through the SPARSE chain: the dense
         // one builds nine 248k-float distributions a round (four drafts,
         // five verify rows) and measured 19-22 tok/s against a plain 40 —
@@ -8822,13 +9410,39 @@ impl Pipeline {
         // from the same inputs — are the arms the difference, or the inputs?
         let spec_dbg = std::env::var("CMF_SPEC_DBG").is_ok();
         spec_stamp("pro");
+        if dflash_round {
+            drafts = self.dflash_draft(t_next, next_pos, k_spec);
+            spec_stamp("d.flash");
+        }
+        // the chain's drafts of a round the block has, for the rows log: its
+        // cache is then cut and warmed as after a round of its own
+        let mut beside: Vec<u32> = Vec::new();
+        #[cfg(target_os = "macos")]
+        if dflash_round && dflash_rows_log().is_some() && self.mtp_graph_mode != Some(false) {
+            match self.mtp_draft_chain_metal(m, hidden, t_next, next_pos - 1, 7) {
+                Ok(ids) => {
+                    self.mtp_graph_mode = Some(true);
+                    beside = ids;
+                }
+                Err(true) => {
+                    tracing::error!("mtp Metal draft chain failed after commit");
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                Err(false) => {}
+            }
+        }
         // Plain greedy on native Metal: the whole chain as one command
         // buffer (device argmax + embedding gather between the steps).
         // A decline before commit hands the round to the per-step loop
         // below; a failure after commit is terminal, like any graph
         // failure after admission.
         #[cfg(target_os = "macos")]
-        if metal_native && !sampling && !greedy_pen && self.mtp_graph_mode != Some(false) {
+        if metal_native && !dflash_round && !sampling && !greedy_pen && self.mtp_graph_mode != Some(false) {
             match self.mtp_draft_chain_metal(m, hidden, t_next, next_pos - 1, k_spec) {
                 Ok(ids) => {
                     self.mtp_graph_mode = Some(true);
@@ -8939,6 +9553,35 @@ impl Pipeline {
             spec_stamp("d.pick");
         }
         all_ids.truncate(base_len);
+        // Prompt lookup, plain greedy on native Metal, where a verify of
+        // four to eight rows has one price: when the tip and the head's
+        // drafts repeat an earlier stretch of the sequence, the tokens that
+        // followed it there go on as drafts. The head's drafts are the
+        // test: a lookup continues only what they agree with.
+        let k_mtp = k_spec;
+        // steps the MTP block took this round: its own round's drafts, the
+        // chain run beside a DFlash block, or none
+        let mtp_steps = if dflash_round { beside.len() } else { k_mtp };
+        let k_room = room.min(7);
+        if metal_native
+            && !sampling
+            && !greedy_pen
+            && k_mtp < k_room
+            && drafts.len() == k_mtp
+            && Self::spec_lookup_on()
+        {
+            if self.spec_lookup_rest > 0 {
+                self.spec_lookup_rest -= 1;
+            } else {
+                all_ids.extend_from_slice(&drafts);
+                let more =
+                    lookup_continuation(all_ids, k_mtp + LOOKUP_MIN_REAL, k_room - k_mtp).to_vec();
+                all_ids.truncate(base_len);
+                drafts.extend(more);
+            }
+        }
+        let k_spec = drafts.len();
+        spec_stamp("d.look");
         *drafted += k_spec;
         let t_draft = t_round.elapsed();
         let sub_draft = subs();
@@ -9042,8 +9685,10 @@ impl Pipeline {
                 // The verifier refused before admission.  Its draft MTP
                 // rows are still device-resident, so rewind the separate
                 // mirror before the caller takes the exact one-token path.
-                m.kv.truncate_last(k_spec);
-                if !metal_native && !self.rewind_mtp_graph_mirror(next_pos) {
+                // (A DFlash round put no rows there.)
+                self.dflash_rows = None;
+                m.kv.truncate_last(mtp_steps);
+                if !metal_native && mtp_steps > 0 && !self.rewind_mtp_graph_mirror(next_pos) {
                     self.clear_sequence_state();
                     self.graph_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9063,6 +9708,7 @@ impl Pipeline {
                 self.cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!("MTP verify batch graph failed after admission");
+                self.dflash_rows = None;
                 return None;
             }
         }
@@ -9110,7 +9756,7 @@ impl Pipeline {
                     hd = hd.max((hi[j] - hiddens[i * self.hidden_size + j]).abs());
                 }
                 eprintln!(
-                    "verify-check row {i} tok {t} pos {}: ref argmax {ra} verify argmax {va} {} | max|dlogit| {md:.3} rms {:.4} | max|dhidden| {hd:.4}",
+                    "verify-check row {i} tok {t} pos {}: ref argmax {ra} verify argmax {va} {} | max|dlogit| {md:.3e} rms {:.3e} | max|dhidden| {hd:.3e}",
                     next_pos + i,
                     if ra == va { "OK" } else { "MISMATCH" },
                     (rms / lm_rows as f64).sqrt()
@@ -9269,6 +9915,46 @@ impl Pipeline {
             ids
         };
         spec_stamp("acc");
+        if dflash_round {
+            if let Some(log) = dflash_rows_log() {
+                let mut rec = [u32::MAX; 24];
+                (rec[0], rec[1], rec[2], rec[3]) = (next_pos as u32, t_next, k_spec as u32, a as u32);
+                for (o, &d) in rec[4..11].iter_mut().zip(&drafts) {
+                    *o = d;
+                }
+                for (o, &d) in rec[11..18].iter_mut().zip(&beside) {
+                    *o = d;
+                }
+                // what a round of the chain's own would have added from the context
+                let mut more: Vec<u32> = Vec::new();
+                if beside.len() >= 2 && Self::spec_lookup_on() {
+                    all_ids.extend_from_slice(&beside[..2]);
+                    more = lookup_continuation(all_ids, 2 + LOOKUP_MIN_REAL, 5).to_vec();
+                    all_ids.truncate(base_len);
+                }
+                rec[18] = more.len() as u32;
+                for (o, &d) in rec[19..24].iter_mut().zip(&more) {
+                    *o = d;
+                }
+                let mut bytes: Vec<u8> = rec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                bytes.extend(hidden.iter().flat_map(|v| v.to_le_bytes()));
+                use std::io::Write as _;
+                // the stream through the first logged round's first token, once:
+                // a lookup reads the prompt, and the fit has to as well
+                static IDS: std::sync::Once = std::sync::Once::new();
+                IDS.call_once(|| {
+                    if let Ok(path) = std::env::var("CMF_DFLASH_ROWS") {
+                        let ids: Vec<u8> = all_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        if let Err(e) = std::fs::write(format!("{path}.ids"), ids) {
+                            tracing::warn!("CMF_DFLASH_ROWS: {path}.ids: {e}");
+                        }
+                    }
+                });
+                if let Ok(mut f) = log.lock() {
+                    let _ = f.write_all(&bytes);
+                }
+            }
+        }
         if spec_dbg {
             eprintln!(
                 "spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}",
@@ -9349,9 +10035,27 @@ impl Pipeline {
         // round's return and the next draft chain.
         #[cfg(target_os = "macos")]
         let mut warm_pending: Option<MetalWarmPending> = None;
+        // The pairs the MTP cache has to hold of this round: the accepted
+        // ones and, before them, the tip's own when the block was DFlash's
+        // (an MTP chain's first step is that pair). The MTP block stays in
+        // step through DFlash rounds, so either drafter can take the next.
+        let hs_w = self.hidden_size;
+        let warm_first = usize::from(mtp_steps == 0);
+        let warm_n = if dflash_round && !mtp_in_step { 0 } else { a + warm_first };
+        let warm_pos = next_pos - warm_first;
+        let warm_pair = |j: usize| -> (&[f32], u32) {
+            if j < warm_first {
+                (hidden, t_next)
+            } else {
+                let j = j - warm_first;
+                (&hiddens[j * hs_w..(j + 1) * hs_w], ids[j])
+            }
+        };
         #[cfg(target_os = "macos")]
         if metal_native {
-            m.kv.truncate_last(k_spec.saturating_sub(1));
+            if mtp_steps > 0 {
+                m.kv.truncate_last(mtp_steps - 1);
+            }
             if self.mtp_graph_mode == Some(true) {
                 // the mirror rows below the cut are the CPU rows: re-point,
                 // no re-upload
@@ -9360,16 +10064,9 @@ impl Pipeline {
                     Self::MTP_LAYER_BASE,
                     m.kv.seq_len,
                 );
-                if !warm_off && a > 0 {
-                    let pairs: Vec<(&[f32], u32)> = (0..a)
-                        .map(|j| {
-                            (
-                                &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size],
-                                ids[j],
-                            )
-                        })
-                        .collect();
-                    warm_pending = self.mtp_warm_batch_submit(m, &pairs, next_pos);
+                if !warm_off && warm_n > 0 {
+                    let pairs: Vec<(&[f32], u32)> = (0..warm_n).map(&warm_pair).collect();
+                    warm_pending = self.mtp_warm_batch_submit(m, &pairs, warm_pos);
                 }
             }
             spec_stamp("c.wsub");
@@ -9387,6 +10084,12 @@ impl Pipeline {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!("Metal verify state/KV handoff failed after admission");
                 return None;
+            }
+            // the rows the round keeps are the drafter's next context
+            if let (Some((pos0, rows)), Some(d)) = (self.dflash_rows.take(), self.dflash.as_mut()) {
+                let tw = d.g.tap_width();
+                d.queue_context(pos0, &rows[..(a + 1) * tw], self.pool.as_deref());
+                spec_stamp("c.flash");
             }
             if let Some((plain_states, rows)) = commit_ref {
                 crate::gpu_metal::queue_fence();
@@ -9468,6 +10171,17 @@ impl Pipeline {
             tracing::error!("far field commit failed after verify");
             return None;
         }
+        // the rows a wgpu verify kept for the drafter: those the round keeps
+        // are its next context
+        if !metal_native {
+            let kept = self.dflash_taps.lock().unwrap().pop();
+            if let (Some((pos0, rows)), Some(d)) = (kept, self.dflash.as_mut()) {
+                let tw = d.g.tap_width();
+                if pos0 == next_pos && rows.len() >= (a + 1) * tw {
+                    d.queue_context(pos0, &rows[..(a + 1) * tw], self.pool.as_deref());
+                }
+            }
+        }
         if !metal_native && !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
             // The verify graph committed the full batch, but one of its
             // persistent Full-attention mirrors could not be re-pointed to
@@ -9492,14 +10206,17 @@ impl Pipeline {
         // (50.3 against 50.5) and backwards at k=4 (48.1 against 50.1).
         // The knob stays so the next person can re-price it after the
         // warms are batched instead of assuming either way.
-        if !metal_native {
+        if !metal_native && mtp_steps > 0 {
             // (Metal cut its MTP cache before the trunk commit, above)
-            m.kv.truncate_last(k_spec.saturating_sub(1));
+            m.kv.truncate_last(mtp_steps - 1);
         }
         spec_stamp("c.trunc");
+        // (the block's round put no row there: the mirror already ends where
+        // the warm-up starts)
         if !metal_native
             && self.mtp_graph_mode == Some(true)
-            && !self.rewind_mtp_graph_mirror(next_pos)
+            && (mtp_steps > 0 || warm_n > 0)
+            && !self.rewind_mtp_graph_mirror(warm_pos)
         {
             // The graph draft was admitted, so inability to move its cursor
             // back to the real anchor is a state failure, not a capability
@@ -9512,7 +10229,7 @@ impl Pipeline {
             tracing::error!("MTP graph mirror rewind failed after verify commit");
             return None;
         }
-        if !warm_off && a > 0 {
+        if !warm_off && warm_n > 0 {
             // Graph arm: all accepted pairs in ONE batched run over the
             // MTP block; the token graph one by one if the batch declines.
             let mut warmed = false;
@@ -9527,11 +10244,11 @@ impl Pipeline {
                 };
                 if !warmed {
                     warmed = true;
-                    for j in 0..a {
-                        let row =
-                            hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
+                    for j in 0..warm_n {
+                        let (row, tok) = warm_pair(j);
+                        let row = row.to_vec();
                         if self
-                            .mtp_step_metal(m, &row, ids[j], next_pos + j, false)
+                            .mtp_step_metal(m, &row, tok, warm_pos + j, false)
                             .is_none()
                         {
                             warmed = false;
@@ -9541,15 +10258,14 @@ impl Pipeline {
                 }
             }
             if !warmed && self.mtp_graph_mode != Some(false) && !metal_native {
-                let rows: Vec<Vec<f32>> = (0..a)
-                    .map(|j| hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec())
+                let rows: Vec<(Vec<f32>, u32)> = (0..warm_n)
+                    .map(|j| {
+                        let (row, tok) = warm_pair(j);
+                        (row.to_vec(), tok)
+                    })
                     .collect();
-                let pairs: Vec<(&[f32], u32)> = rows
-                    .iter()
-                    .zip(ids.iter())
-                    .map(|(r, &t)| (r.as_slice(), t))
-                    .collect();
-                match self.mtp_warm_prefill_pairs(m, &pairs, next_pos) {
+                let pairs: Vec<(&[f32], u32)> = rows.iter().map(|(r, t)| (r.as_slice(), *t)).collect();
+                match self.mtp_warm_prefill_pairs(m, &pairs, warm_pos) {
                     Ok(()) => warmed = true,
                     Err(err) => {
                         // A warm-up failure after graph admission cannot
@@ -9568,10 +10284,10 @@ impl Pipeline {
                 }
             }
             if !warmed {
-                for j in 0..a {
-                    let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
+                for j in 0..warm_n {
+                    let (row, tok) = warm_pair(j);
                     let row = row.to_vec();
-                    self.mtp_warm(m, &row, ids[j], next_pos + j);
+                    self.mtp_warm(m, &row, tok, warm_pos + j);
                 }
             }
         }
@@ -9622,28 +10338,148 @@ impl Pipeline {
         // of one), so a shorter round only forfeits tokens — measured on
         // the M4: an essay round at k=2 still verified in 260 ms. The
         // adaptation is for cards whose verify grows with the rows.
+        if k_spec > k_mtp {
+            // a lookup's round: what it added over the head's own drafts
+            let extra = a.saturating_sub(k_mtp) as f32;
+            self.spec_lookup_gain += 0.2 * (extra - self.spec_lookup_gain);
+            if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                eprintln!(
+                    "spec-lookup: {} drafts from the context, {extra} held (average {:.2})",
+                    k_spec - k_mtp,
+                    self.spec_lookup_gain
+                );
+            }
+            if self.spec_lookup_gain < LOOKUP_PAYS {
+                self.spec_lookup_rest = 24;
+                self.spec_lookup_gain = 1.6;
+            }
+        }
+        if metal_small && !k_capped {
+            // (the chain's account stands as its last rounds on this text
+            // left it while the block has the rounds: that is what the block
+            // has to beat)
+            if dflash_round {
+                self.dflash_turn_sum.0 += (a + 1) as f32;
+                self.dflash_turn_sum.1 += METAL_ROUND_COST[k_spec.clamp(1, 7) - 1] + DFLASH_ROUND_DRAFT;
+            }
+            let hold = if dflash_round { &mut self.dflash_hold } else { &mut self.spec_hold };
+            spec_hold_update(hold, k_mtp, a.min(k_mtp));
+            if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                let next = metal_spec_plan(hold, if dflash_round { DFLASH_ROUND_DRAFT } else { 0.0 }).0;
+                if next != k_mtp && k_env.is_none() {
+                    eprintln!("spec-k: {k_mtp} → {next} (a draft holds after the last {hold:.2?})");
+                }
+            }
+        }
+
         if k_env.is_none() && !metal_native && !k_capped {
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
-            // draft it just paid for.
+            // draft it just paid for. Each drafter has its own depth.
+            let (ewma, k_min) = if dflash_round { (&mut self.dflash_acc_ewma, 3) } else { (&mut self.spec_acc_ewma, 2) };
             let f = a as f32 / k_spec.max(1) as f32;
-            self.spec_acc_ewma += 0.2 * (f - self.spec_acc_ewma);
+            *ewma += 0.2 * (f - *ewma);
             let mut k_next = k_spec;
-            if self.spec_acc_ewma >= 0.75 && k_spec < k_max {
+            if *ewma >= 0.75 && k_spec < k_max {
                 k_next = k_spec + 1;
-            } else if self.spec_acc_ewma < 0.4 && k_spec > 2 {
+            } else if *ewma < 0.4 && k_spec > k_min {
                 k_next = k_spec - 1;
             }
-            if k_next != k_spec {
-                self.spec_acc_ewma = 0.6;
-                if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
-                    eprintln!("spec-k: {k_spec} → {k_next}");
+            // The chain's rounds are timed by depth, and once two depths
+            // are, the depth is the one that lands the most tokens in a unit
+            // of time at this device's prices (`wgpu_spec_depth`): the share
+            // of drafts kept climbs to five on text that holds whatever a
+            // fifth row costs. A depth's first round pays its scratch and
+            // is not counted; a change stands for six rounds.
+            let mut planned = false;
+            if !dflash_round {
+                spec_hold_update(&mut self.spec_hold, k_spec, a);
+                let d = k_spec.clamp(1, 7) - 1;
+                let w = t_round.elapsed().as_secs_f32() * 1e3;
+                match self.spec_wall_n[d] {
+                    0 => self.spec_wall_n[d] = 1,
+                    1 => (self.spec_wall[d], self.spec_wall_n[d]) = (w, 2),
+                    _ => self.spec_wall[d] += 0.2 * (w - self.spec_wall[d]),
+                }
+                if let Some(k_plan) = wgpu_spec_depth(&self.spec_hold, &self.spec_wall, k_spec, k_min, k_max) {
+                    planned = true;
+                    k_next = if self.spec_k_dwell > 0 {
+                        self.spec_k_dwell -= 1;
+                        k_spec
+                    } else {
+                        k_plan
+                    };
+                    if k_next != k_spec {
+                        self.spec_k_dwell = 6;
+                    }
                 }
             }
-            self.spec_k_adapt = Some(k_next);
+            if k_next != k_spec {
+                *ewma = 0.6;
+                if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                    if planned {
+                        eprintln!(
+                            "spec-k: {k_spec} → {k_next} (a round costs {:.0?} ms, a draft holds after the last {:.2?})",
+                            self.spec_wall, self.spec_hold
+                        );
+                    } else {
+                        eprintln!("spec-k: {k_spec} → {k_next}");
+                    }
+                }
+            }
+            if dflash_round {
+                self.dflash_k_adapt = Some(k_next);
+            } else {
+                self.spec_k_adapt = Some(k_next);
+            }
         }
         spec_stamp("end");
         Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
+    }
+
+    /// A round's drafts from the DFlash drafter: the block behind the anchor
+    /// `t_next` at `next_pos`, its first `k` tokens. The block reads the
+    /// context the trunk's rows before `next_pos` left; the tokens come from
+    /// the trunk's own head through the drafter's selector.
+    fn dflash_draft(&mut self, t_next: u32, next_pos: usize, k: usize) -> Vec<u32> {
+        let Some(mut d) = self.dflash.take() else {
+            return Vec::new();
+        };
+        let (hs, rows) = (self.hidden_size, d.g.block);
+        let mut h = vec![0f32; rows * hs];
+        h[..hs].copy_from_slice(&self.embed_single(t_next));
+        let mask = self.embed_single(d.g.mask_token);
+        for r in 1..rows {
+            h[r * hs..(r + 1) * hs].copy_from_slice(&mask);
+        }
+        let pool = self.pool.as_deref();
+        d.settle(pool);
+        spec_stamp("d.ctx");
+        let out = d.block(next_pos, h, pool);
+        spec_stamp("d.block");
+        // the head over the round's shortlist of the vocabulary, as the MTP
+        // draft has it (the full head while `draft_full_streak` runs)
+        let (n, head) = (rows - 1, &self.weights.lm_head);
+        let width = self.draft_head_rows(head.rows());
+        let mut logits = vec![0f32; n * width];
+        // the block's rows on the narrow kernel; any other head as a batch
+        let narrow = head.mapped_q4tp().is_some_and(|(m, idx)| {
+            crate::gpu::q4tp_rows8_many(m, &[(idx, head.rows(), head.cols(), width)], &out[hs..], n, &mut [&mut logits[..]])
+        });
+        if !narrow {
+            logits = vec![0f32; n * head.rows()];
+            if !head.device_matmat(&out[hs..], n, &mut logits) {
+                head.matmat(&out[hs..], n, &mut logits, pool);
+            }
+        }
+        spec_stamp("d.head");
+        let (mut ids, _) = d.select(&out[hs..], &logits, t_next);
+        ids.truncate(k);
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() && d.next_position() != next_pos {
+            eprintln!("dflash: the context ends at {} for a block at {next_pos}", d.next_position());
+        }
+        self.dflash = Some(d);
+        ids
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
@@ -15814,6 +16650,8 @@ impl Pipeline {
         // second readback only for that explicit probe instead of dumping
         // the input copy left in `h` by a folded-head graph.
         let dump_hidden = std::env::var_os("CMF_LOGIT_DUMP").is_some();
+        let taps = if steps == 1 { self.dflash_taps_wanted(from, upto_excl) } else { Vec::new() };
+        crate::gpu::layer_taps_arm(&taps);
         let outcome = crate::gpu::forward_token_graph(
             &model,
             self.graph_kv_id,
@@ -15844,6 +16682,7 @@ impl Pipeline {
             from,
             dump_hidden,
         );
+        self.dflash_taps_keep(&taps, position, 1, outcome == crate::gpu::TokenGraphOutcome::Completed);
         match outcome {
             crate::gpu::TokenGraphOutcome::Completed => Some(Ok(h)),
             crate::gpu::TokenGraphOutcome::Failed => Some(Err(())),
@@ -16140,13 +16979,66 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let Some(mut graph) = (if prefill {
-            VerifyGraph::new_prefill(&model, dims, hiddens, b)
-        } else {
-            VerifyGraph::new(&model, dims, hiddens, b)
-        }) else {
-            return MetalRowsRun::Declined;
-        };
+        // A prompt chunk for the Neural Engine goes as two halves, a thread each: one is on the
+        // ANE while the GPU has the other.
+        let hs = self.hidden_size;
+        let relay = prefill
+            && spec.is_none()
+            && b >= 128
+            && crate::gpu_metal::ane::wanted()
+            && std::env::var("CMF_ANE_RELAY").as_deref() != Ok("0");
+        let cuts: Vec<(usize, usize)> = if relay { vec![(0, b / 2), (b / 2, b - b / 2)] } else { vec![(0, b)] };
+        let gate = crate::gpu_metal::LaneGate::new();
+        let mut lanes: Vec<VerifyGraph> = Vec::with_capacity(cuts.len());
+        for (ln, &(r0, n)) in cuts.iter().enumerate() {
+            let h = &hiddens[r0 * hs..(r0 + n) * hs];
+            let g = if relay {
+                VerifyGraph::new_prefill_lane(&model, dims, h, n, ln, b - r0 - n, &gate)
+            } else if prefill {
+                VerifyGraph::new_prefill(&model, dims, h, n)
+            } else {
+                VerifyGraph::new(&model, dims, h, n)
+            };
+            let Some(g) = g else {
+                return MetalRowsRun::Declined;
+            };
+            lanes.push(g);
+        }
+        if prefill {
+            use crate::gpu_metal::{AneWants, MetalFfn};
+            let ffn = |f: &MetalFfn<'_>| match f {
+                MetalFfn::Dense { gate, up, down, act: 0 } => Some([*gate, *up, *down]),
+                _ => None,
+            };
+            let mut wants = Vec::new();
+            for item in &plan {
+                match item {
+                    MetalRowsItem::Gdn { run, .. } => {
+                        wants.extend(run.iter().map(|l| AneWants {
+                            ffn: ffn(&l.ffn),
+                            mix: if crate::gpu_metal::ane_takes_qkv() { vec![l.qkv, l.z] } else { vec![l.z] },
+                        }))
+                    }
+                    MetalRowsItem::Attn { l, .. } => wants.push(AneWants {
+                        ffn: ffn(&l.ffn),
+                        mix: if crate::gpu_metal::ane_takes_qkv() {
+                            vec![l.wk, l.wv, l.wq]
+                        } else if crate::gpu_metal::ane_takes_q() {
+                            vec![l.wq]
+                        } else {
+                            Vec::new()
+                        },
+                    }),
+                }
+            }
+            for g in lanes.iter_mut() {
+                g.ane_attach(&wants);
+            }
+            lanes[0].ane_begin(lanes.len());
+        }
+        // With the Neural Engine a layer's command is committed as it ends, so a refusal past
+        // the first one leaves states half written.
+        let hard = relay || lanes[0].has_ane();
         let geom = (
             self.num_heads,
             self.num_kv_heads,
@@ -16161,7 +17053,7 @@ impl Pipeline {
             let ok = match item {
                 MetalRowsItem::Gdn { run, .. } => gcfg
                     .as_ref()
-                    .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
+                    .map(|gc| lanes.iter().all(|g| run.iter().all(|l| g.gdn_ok(l, gc))))
                     .unwrap_or(false),
                 MetalRowsItem::Attn {
                     l,
@@ -16187,7 +17079,7 @@ impl Pipeline {
                         self.qk_norm_after_rope,
                         self.o1_epoch,
                     );
-                    graph.attn_ok(l, &p)
+                    lanes.iter().all(|g| g.attn_ok(l, &p))
                 }
             };
             if !ok {
@@ -16201,26 +17093,33 @@ impl Pipeline {
         }
         let lm = match &spec {
             Some((lm, _, _)) => {
-                if !graph.lm_head_ok(*lm) {
+                if !lanes[0].lm_head_ok(*lm) {
                     return MetalRowsRun::Declined;
                 }
                 Some(*lm)
             }
             None => None,
         };
+        // What each half encodes, layer by layer: nothing here changes while they run.
+        enum Step<'a> {
+            Gdn(&'a crate::gpu_metal::GdnGpuLayer<'a>, &'a [f32]),
+            Attn(&'a crate::gpu_metal::AttnGpuLayer<'a>, crate::gpu_metal::AttnDeviceParams<'a>),
+        }
         let mut gdn_layers = Vec::new();
         let mut attn_layers = Vec::new();
+        let mut steps: Vec<Vec<Step<'_>>> = cuts.iter().map(|_| Vec::new()).collect();
+        // the layer each step is, for the rows a DFlash drafter reads
+        let mut step_layer: Vec<usize> = Vec::new();
         for item in &plan {
             match item {
                 MetalRowsItem::Gdn { run, first } => {
-                    let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
-                        .iter()
-                        .map(|l| l.linear_state.as_slice())
-                        .collect();
-                    if !graph.encode_gdn_run_b(run, &ro, gcfg.as_ref().unwrap()) {
-                        return MetalRowsRun::Declined;
+                    for (l, kv) in run.iter().zip(&self.kv_cache.layers[*first..*first + run.len()]) {
+                        for st in steps.iter_mut() {
+                            st.push(Step::Gdn(l, kv.linear_state.as_slice()));
+                        }
                     }
                     gdn_layers.extend(*first..*first + run.len());
+                    step_layer.extend(*first..*first + run.len());
                 }
                 MetalRowsItem::Attn {
                     l,
@@ -16229,73 +17128,161 @@ impl Pipeline {
                     k_norm,
                     output_gate,
                 } => {
-                    let (p, cpu_stored) = Self::metal_attn_params(
-                        *li,
-                        &self.kv_cache.layers[*li],
-                        *q_norm,
-                        *k_norm,
-                        *output_gate,
-                        &inv_freq,
-                        self.layer_rope_scale(*li),
-                        geom,
-                        pos0,
-                        kv_id,
-                        self.attn_scale,
-                        eps,
-                        gemma,
-                        self.qk_norm_after_rope,
-                        self.o1_epoch,
-                    );
-                    if !graph.encode_attn_b(l, &p) {
-                        return MetalRowsRun::Declined;
+                    for (ln, st) in steps.iter_mut().enumerate() {
+                        let (mut p, cpu_stored) = Self::metal_attn_params(
+                            *li,
+                            &self.kv_cache.layers[*li],
+                            *q_norm,
+                            *k_norm,
+                            *output_gate,
+                            &inv_freq,
+                            self.layer_rope_scale(*li),
+                            geom,
+                            pos0 + cuts[ln].0,
+                            kv_id,
+                            self.attn_scale,
+                            eps,
+                            gemma,
+                            self.qk_norm_after_rope,
+                            self.o1_epoch,
+                        );
+                        // The half before leaves its rows in the mirror, not yet in the host's.
+                        p.cpu_stored += cuts[ln].0;
+                        // A sealed layer leaves no mirror row to pull.
+                        if ln == 0 && p.o1.is_none() {
+                            attn_layers.push((*li, cpu_stored));
+                        }
+                        st.push(Step::Attn(l, p));
                     }
-                    // A sealed layer leaves no mirror row to pull.
-                    if p.o1.is_none() {
-                        attn_layers.push((*li, cpu_stored));
-                    }
+                    step_layer.push(*li);
                 }
             }
         }
+        // The outputs of the layers a DFlash drafter reads are kept on the way
+        // (one graph only: a chunk in halves through the Neural Engine keeps none).
+        let taps: Vec<usize> = match &self.dflash {
+            Some(d) if !relay => d.g.taps.clone(),
+            _ => Vec::new(),
+        };
+        let tap_slot: Vec<Option<usize>> = step_layer.iter().map(|l| taps.iter().position(|t| t == l)).collect();
+        let tapped = std::sync::atomic::AtomicUsize::new(0);
+        // One half's layers in order; `Err` tells whether a command was already committed.
+        let gc = gcfg.as_ref();
+        let walk = |g: &mut VerifyGraph, steps: &[Step<'_>]| -> Result<(), bool> {
+            for (i, step) in steps.iter().enumerate() {
+                let ok = match step {
+                    Step::Gdn(l, state) => match gc {
+                        Some(gc) => g.encode_gdn_run_b(std::slice::from_ref(*l), &[*state], gc),
+                        None => false,
+                    },
+                    Step::Attn(l, p) => g.encode_attn_b(l, p),
+                };
+                if !ok {
+                    return Err(i > 0);
+                }
+                if let Some(slot) = tap_slot.get(i).copied().flatten() {
+                    if g.tap(slot, taps.len()) {
+                        tapped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            Ok(())
+        };
+        let refused = |started: bool| if hard && started { MetalRowsRun::Failed } else { MetalRowsRun::Declined };
+        if relay {
+            let (first, second) = lanes.split_at_mut(1);
+            let (sa, sb) = (&steps[0], &steps[1]);
+            let (ra, rb) = std::thread::scope(|sc| {
+                let other = sc.spawn(|| {
+                    let r = walk(&mut second[0], sb);
+                    if r.is_err() {
+                        // The first half must not wait for this one's turn on the ANE.
+                        crate::gpu_metal::ane::retire("a half of the chunk stopped");
+                    }
+                    r
+                });
+                let r = walk(&mut first[0], sa);
+                if r.is_err() {
+                    gate.fail();
+                }
+                (r, other.join().unwrap_or(Err(true)))
+            });
+            if ra.is_err() || rb.is_err() {
+                return MetalRowsRun::Failed;
+            }
+        } else if let Err(started) = walk(&mut lanes[0], &steps[0]) {
+            return refused(started);
+        }
+        drop(steps);
         if let (Some(lm), Some((_, final_norm, _))) = (lm, spec.as_ref()) {
-            if !graph.encode_lm_head_b(final_norm, lm) {
-                return MetalRowsRun::Declined;
+            if !lanes[0].encode_lm_head_b(final_norm, lm) {
+                return refused(true);
             }
             // The device argmax is an OPTIMISATION, never a reason to
             // decline the round: if it will not encode, drop it and read
             // the logits plane back the old way (the head is encoded
             // either way, so the rows are there).
             if let Some((n, _)) = argmax_out.as_ref() {
-                if !graph.encode_argmax_b(*n) {
+                if !lanes[0].encode_argmax_b(*n) {
                     argmax_out = None;
                 }
             }
         }
         spec_stamp("v.enc");
-        if !graph.sync() {
-            return MetalRowsRun::Failed;
+        for g in lanes.iter_mut() {
+            if !g.sync() {
+                return MetalRowsRun::Failed;
+            }
         }
         spec_stamp("v.gpu");
         match (spec, argmax_out) {
             (Some(_), Some((_, ids))) => {
                 ids.resize(b, 0);
-                if !graph.read_argmax(ids) {
+                if !lanes[0].read_argmax(ids) {
                     return MetalRowsRun::Failed;
                 }
                 spec_stamp("v.am");
             }
             (Some((lm, _, logits)), None) => {
                 logits.resize(b * lm.1, 0.0);
-                if !graph.read_logits(logits) {
+                if !lanes[0].read_logits(logits) {
                     return MetalRowsRun::Failed;
                 }
                 spec_stamp("v.lg");
             }
             (None, _) => {}
         }
-        if !graph.read_hidden(hiddens) {
-            return MetalRowsRun::Failed;
+        for (g, &(r0, n)) in lanes.iter().zip(&cuts) {
+            if !g.read_hidden(&mut hiddens[r0 * hs..(r0 + n) * hs]) {
+                return MetalRowsRun::Failed;
+            }
         }
         spec_stamp("v.hid");
+        // The tapped rows, a row's layers joined: a prompt's rows are context at
+        // once, a verify's wait for the round to say which of them it keeps.
+        self.dflash_rows = None;
+        if !taps.is_empty() && tapped.load(std::sync::atomic::Ordering::Relaxed) == taps.len() && lanes.len() == 1 {
+            let nt = taps.len();
+            let mut raw = vec![0f32; nt * b * hs];
+            if lanes[0].read_taps(&mut raw) {
+                let mut joined = vec![0f32; b * nt * hs];
+                for s in 0..nt {
+                    for r in 0..b {
+                        joined[(r * nt + s) * hs..][..hs].copy_from_slice(&raw[(s * b + r) * hs..][..hs]);
+                    }
+                }
+                if prefill {
+                    if let Some(d) = self.dflash.as_mut() {
+                        d.queue_context(pos0, &joined, self.pool.as_deref());
+                    }
+                } else {
+                    self.dflash_rows = Some((pos0, joined));
+                }
+                spec_stamp("v.taps");
+            }
+        }
+        // The last half's graph: the layers' states are the chunk's.
+        let graph = lanes.pop().unwrap();
         MetalRowsRun::Completed(MetalVerifyPending {
             graph,
             gdn_layers,
@@ -17238,6 +18225,13 @@ impl Pipeline {
         // against 30.1 whole, and the whole chain's host encode measures
         // 0.3 ms against a 29.7 ms wait. Kept as a probe, off by default.
         let split = std::env::var("CMF_MTP_CHAIN_SPLIT").as_deref() == Ok("1");
+        // The input stage, the embedding and the block's input projection, goes as a command
+        // of its own. The weights are one buffer of 13.6 GB on a Mac, the embedding table lies
+        // 1.5 GB into it and the draft block 13.1 GB: in one command with the block the driver
+        // held the command 150 to 170 ms before the GPU ran its 9 ms, in every round until the
+        // first one without a warm-up. MacBook Air M4, Qwen3.8-27B, a round of two drafts:
+        // 362 → 204 ms. `CMF_MTP_CHAIN_JOIN=1` keeps one command.
+        let join = std::env::var("CMF_MTP_CHAIN_JOIN").as_deref() == Ok("1");
         let t_chain = std::time::Instant::now();
         graph.chain_ids_init(t_next, k);
         let cpu_stored;
@@ -17288,6 +18282,9 @@ impl Pipeline {
                     v_norm: false,
                     dash: None,
                 };
+                if !join {
+                    graph.commit();
+                }
                 if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                     return Err(false);
                 }
@@ -17319,6 +18316,9 @@ impl Pipeline {
                 (t_chain.elapsed() - t_enc).as_secs_f64() * 1e3,
                 if split { ", split" } else { "" }
             );
+            if std::env::var("CMF_METAL_CMD_TIMES").as_deref() == Ok("1") {
+                eprintln!("metal-set: {}", crate::gpu_metal::working_set_report());
+            }
         }
         let mut ids = vec![0u32; k];
         if !graph.chain_ids_read(&mut ids) {
@@ -17781,7 +18781,9 @@ impl Pipeline {
             }
             Clear
         });
-        crate::gpu::forward_batch_graph(
+        let taps = self.dflash_taps_wanted(0, graph_end);
+        crate::gpu::layer_taps_arm(&taps);
+        let outcome = crate::gpu::forward_batch_graph(
             &model,
             self.graph_kv_id,
             &layers,
@@ -17805,7 +18807,48 @@ impl Pipeline {
             self.o1_epoch,
             spec,
             layers_run,
-        )
+        );
+        self.dflash_taps_keep(&taps, positions[0], k, outcome == crate::gpu::BatchGraphOutcome::Completed);
+        outcome
+    }
+
+    /// The layers a DFlash drafter reads, when a wgpu graph over layers
+    /// `from..upto_excl` is the whole stack (nothing otherwise).
+    fn dflash_taps_wanted(&self, from: usize, upto_excl: usize) -> Vec<usize> {
+        match &self.dflash {
+            Some(d) if dflash_pick() == Some(true) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Collect what the armed graph kept for `rows` rows from `pos0`
+    /// (`ok`: it completed) into `dflash_taps`, a row's layers joined.
+    fn dflash_taps_keep(&self, taps: &[usize], pos0: usize, rows: usize, ok: bool) {
+        if taps.is_empty() {
+            return;
+        }
+        let (nt, hs) = (taps.len(), self.hidden_size);
+        let mut raw = Vec::new();
+        if !crate::gpu::layer_taps_take(&mut raw) || !ok || raw.len() != nt * rows * hs {
+            return;
+        }
+        let mut joined = vec![0f32; rows * nt * hs];
+        for s in 0..nt {
+            for r in 0..rows {
+                joined[(r * nt + s) * hs..][..hs].copy_from_slice(&raw[(s * rows + r) * hs..][..hs]);
+            }
+        }
+        self.dflash_taps.lock().unwrap().push((pos0, joined));
+    }
+
+    /// Rows the wgpu graphs kept become the drafter's context, oldest first.
+    fn dflash_taps_absorb(&mut self) {
+        let kept = std::mem::take(&mut *self.dflash_taps.lock().unwrap());
+        if let Some(d) = self.dflash.as_mut() {
+            for (pos0, rows) in kept {
+                d.queue_context(pos0, &rows, self.pool.as_deref());
+            }
+        }
     }
 
     /// Same, stopping after layer `upto` inclusive (routing probe φ).
@@ -24131,6 +25174,123 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tail_repeat_counts_the_copied_stretch() {
+        assert_eq!(tail_repeat(&[]), 0);
+        assert_eq!(tail_repeat(&[5]), 0);
+        assert_eq!(tail_repeat(&[1, 2, 3, 4]), 0);
+        // the last three repeat the first three
+        assert_eq!(tail_repeat(&[1, 2, 3, 9, 1, 2, 3]), 3);
+        // the longest repeat wins over a later, shorter one
+        assert_eq!(tail_repeat(&[1, 2, 3, 4, 8, 3, 4, 7, 1, 2, 3, 4]), 4);
+        // a repeat reaching the start of the sequence
+        assert_eq!(tail_repeat(&[1, 2, 1, 2]), 2);
+        let long: Vec<u32> = (0..40).chain(0..40).collect();
+        assert_eq!(tail_repeat(&long), 32);
+    }
+
+    /// The chain's depth on wgpu follows the device's own round prices: a
+    /// card whose verify climbs with its rows comes back from five drafts
+    /// to three on the same acceptance that keeps a flat card at five.
+    #[test]
+    fn wgpu_spec_depth_follows_the_round_prices() {
+        // RTX 2000 Ada, Qwen3.8-27B Turbo: rounds of 2..5 drafts, ms
+        let steep = [0.0, 100.5, 111.3, 126.3, 144.6, 0.0, 0.0];
+        let hold = [0.90, 0.85, 0.80, 0.60, 0.60, 0.60, 0.60];
+        assert_eq!(wgpu_spec_depth(&hold, &steep, 5, 2, 5), Some(3));
+        // the depth in turn stays while no other is 4 % better
+        assert_eq!(wgpu_spec_depth(&hold, &steep, 4, 2, 5), Some(4));
+        let flat = [0.0, 0.0, 60.0, 62.0, 64.0, 0.0, 0.0];
+        assert_eq!(wgpu_spec_depth(&[0.9; 7], &flat, 3, 2, 5), Some(5));
+        // an untimed depth is priced on the line through the two nearest
+        let two = [0.0, 0.0, 111.3, 126.3, 0.0, 0.0, 0.0];
+        assert_eq!(wgpu_spec_depth(&[0.5; 7], &two, 4, 2, 5), Some(2));
+        // one timed depth says nothing of the slope
+        assert_eq!(wgpu_spec_depth(&hold, &[0.0, 0.0, 111.3, 0.0, 0.0, 0.0, 0.0], 3, 2, 5), None);
+    }
+
+    #[test]
+    fn dflash_round_values_price_a_round_of_each_drafter() {
+        // the block holds all seven of its drafts, the chain its first only
+        let after: Vec<u32> = (10..30).collect();
+        let seq: Vec<u32> = (100..140).collect();
+        let block: Vec<u32> = (10..17).collect();
+        let chain: Vec<u32> = vec![10, 99, 99, 99, 99, 99, 99];
+        let starts: Vec<DflashStart<'_>> =
+            (0..40).map(|_| DflashStart { seq: &seq, after: &after, block: &block, chain: &chain }).collect();
+        let v = dflash_round_values(&starts);
+        let (b, c) = v[39];
+        // a block seven deep: eight tokens for a round of seven drafts and the block's own price
+        assert_eq!(b, (8.0, METAL_ROUND_COST[6] + DFLASH_ROUND_DRAFT));
+        // the chain has settled at one draft, which holds
+        assert_eq!(c, (2.0, METAL_ROUND_COST[0]));
+        assert!(b.0 / b.1 > c.0 / c.1);
+    }
+
+    #[test]
+    fn lookup_continues_a_repeated_stretch() {
+        // 1 2 3 4 5 6 7 | 9 9 | 2 3 4 → the stretch 2 3 4 was followed by 5 6 7
+        let seq = [1, 2, 3, 4, 5, 6, 7, 9, 9, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 3, 3), &[5, 6, 7]);
+        assert_eq!(lookup_continuation(&seq, 3, 2), &[5, 6]);
+        // a repeat shorter than asked gives nothing
+        assert!(lookup_continuation(&seq, 4, 3).is_empty());
+        // the longest repeat wins over a later, shorter one
+        let seq = [5, 2, 3, 4, 8, 0, 3, 4, 7, 0, 5, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 2, 1), &[8]);
+        // of equal ones the latest
+        let seq = [2, 3, 4, 8, 0, 2, 3, 4, 7, 0, 2, 3, 4];
+        assert_eq!(lookup_continuation(&seq, 2, 1), &[7]);
+        // a period continues through the tail itself
+        let seq = [1, 2, 1, 2, 1, 2];
+        assert_eq!(lookup_continuation(&seq, 3, 4), &[1, 2]);
+        assert!(lookup_continuation(&[1, 2, 3], 3, 2).is_empty());
+        assert!(lookup_continuation(&[], 1, 2).is_empty());
+    }
+
+    #[test]
+    fn metal_spec_depth_follows_what_the_chain_holds() {
+        // before any round: two drafts
+        assert_eq!(metal_spec_depth(&SPEC_HOLD_PRIOR), 2);
+        // a second draft that seldom holds is not worth its verify
+        assert_eq!(metal_spec_depth(&[0.6, 0.15, 0.5, 0.5, 0.5, 0.5, 0.5]), 1);
+        // predictable text fills the GEMM tile
+        assert_eq!(metal_spec_depth(&[0.97; 7]), 7);
+        // rounds of two drafts that both hold reach for a longer chain
+        let mut h = SPEC_HOLD_PRIOR;
+        let mut k = metal_spec_depth(&h);
+        let mut rounds = 0;
+        while k == 2 && rounds < 200 {
+            spec_hold_update(&mut h, k, 2);
+            k = metal_spec_depth(&h);
+            rounds += 1;
+        }
+        assert!(k > 2 && rounds < 60, "depth {k} after {rounds} rounds");
+        // ... and come back once the longer chain shows that a third never holds
+        let mut back = 0;
+        while k > 2 && back < 200 {
+            spec_hold_update(&mut h, k, 2);
+            k = metal_spec_depth(&h);
+            back += 1;
+        }
+        assert!(k == 2 && back < 10, "depth {k} after {back} rounds");
+        // most rounds of such text stay at two drafts
+        let mut deep = 0;
+        for _ in 0..400 {
+            let k = metal_spec_depth(&h);
+            deep += (k > 2) as usize;
+            spec_hold_update(&mut h, k, 2);
+        }
+        assert!(deep < 40, "{deep} of 400 rounds went deeper");
+        // a chain that holds one draft in two rounds of three, two in one of three: never deeper
+        let mut h = SPEC_HOLD_PRIOR;
+        for i in 0..300 {
+            let k = metal_spec_depth(&h);
+            assert!(k <= 2, "depth {k} at round {i}");
+            spec_hold_update(&mut h, k, (i % 3).min(k));
         }
     }
 

@@ -72,6 +72,7 @@ required-features = ["gpu"]
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
+objc = "0.2"
 # pthread_set_qos_class_self_np: the pool's workers ask for the P-cores.
 libc = "0.2"
 
