@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CMF_METAL_CMD_TIMES=1` with `CMF_METAL_GPUPROF=1` prints a token-graph command's time in the kernel and on the GPU
   and what Metal holds for the process; the `batch_kernel_lab` test times a batched q4tp matvec from an MSL file
   against the engine's kernels on a model's own weights (`scripts/dory/q27_batch_lab.sh`).
+- `cortiq mtp-heal` measures and trains a draft as the rounds use it. `--data A.tdata@TOKENS,B.tdata` takes several
+  sets and packs their records into windows; `--trunk-cache DIR` keeps the trunk's pass on disk for the next run;
+  `--stride N` starts a chain every N rows and lays its steps out as a round reads them; `--hard F` puts F of a
+  target row's mass on the trunk's own token; `--codec` and `--also-output CODEC=PATH` write the trained block as
+  q4tp, q8_2f or f16 from one training; `--epochs 0` measures, and with a codec re-encodes, with no training.
+  It prints the share of held-out rows each chain step holds, per data set, the drafts a round keeps
+  (h1 + h1·h2 + …), and with a stride longer than the chain the same for rounds taken in order, each starting
+  after what the one before kept. The checkpoint written is the one that keeps the most drafts a round.
+- `mtp-heal --dump DIR` writes the chain's output rows and top-4 per step with the tensors a draft reads, and
+  `--taps DIR=L,L,…` the trunk's rows after the named layers, for draft models built outside the engine
+  (`scripts/dory/q27_ext_draft.py` runs DFlash 2 and DSpark on them, `q27_res_head.py`, `q27_res_train.py` and
+  `q27_res_gate.py` the resonance drafts).
+- `CMF_GRAPH_SPEC_PIN=1` keeps speculative rounds on whatever they cost, so a count of how a draft holds includes
+  the stretches the trial would decode plain (`scripts/dory/q27_spec_hold.sh`).
 
 ### Changed
 - Metal: attention over a prompt chunk's rows is three GEMMs per KV group in place of a loop over rows, and a GDN

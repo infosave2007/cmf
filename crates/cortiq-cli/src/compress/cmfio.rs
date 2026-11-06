@@ -26,6 +26,9 @@ pub enum Encoding {
     /// Copy every tensor that is not replaced; a replacement is encoded in
     /// its source tensor's codec (a one-tensor edit of a finished file).
     Keep,
+    /// Copy every tensor that is not replaced; a 2-D replacement is encoded
+    /// in this codec whatever its source tensor's was.
+    Replace(Quant),
 }
 
 pub fn tensor_f32(model: &CmfModel, e: &TensorEntry) -> Result<Vec<f32>> {
@@ -69,7 +72,7 @@ pub fn rewrite(
     let encode_one = |e: &TensorEntry| -> Result<Out> {
         let rep = replace(&e.name)?;
         let reencode = match enc {
-            Encoding::KeepF16 | Encoding::Keep => false,
+            Encoding::KeepF16 | Encoding::Keep | Encoding::Replace(_) => false,
             Encoding::Profile(_) => {
                 e.shape.len() == 2 && !keeps_float(&e.name) && (is_float(e.dtype) || rep.is_some())
             }
@@ -112,7 +115,15 @@ pub fn rewrite(
                 };
                 Ok(Out::Encoded(dt, shape, bytes))
             }
-            (None, Encoding::KeepF16 | Encoding::Keep) => Ok(Out::Copy),
+            (Some((shape, vals)), Encoding::Replace(q)) => {
+                let (dt, bytes) = match shape.len() {
+                    2 => quantize_2d(q, &vals, shape[0], shape[1]),
+                    _ if e.dtype == TensorDtype::F16 => quantize_2d(Quant::F16, &vals, 1, vals.len()),
+                    _ => (TensorDtype::F32, vals.iter().flat_map(|v| v.to_le_bytes()).collect()),
+                };
+                Ok(Out::Encoded(dt, shape, bytes))
+            }
+            (None, Encoding::KeepF16 | Encoding::Keep | Encoding::Replace(_)) => Ok(Out::Copy),
         }
     };
     // Encode a batch of tensors in parallel, push them in directory order.

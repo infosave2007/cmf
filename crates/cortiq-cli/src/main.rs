@@ -961,7 +961,7 @@ enum Commands {
     /// hidden rows and next-token top-k once on the trainer, then the
     /// draft's block (a one-layer model from its own input) learns the
     /// trunk's distribution one position ahead — the token its verify
-    /// accepts (KL, best held-out checkpoint)
+    /// accepts (KL; the checkpoint whose chain keeps the most drafts)
     MtpHeal {
         /// The compressed model whose draft is trained
         model: String,
@@ -969,17 +969,24 @@ enum Commands {
         /// before compress, e.g. its f16 copy); default: the model's own
         #[arg(long)]
         init: Option<String>,
-        /// Records to train on: a .tdata (its train split; every tenth
-        /// window is held out)
+        /// Records to train on: one or more .tdata, comma-separated, each
+        /// `PATH.tdata[@TOKENS]` (the train split, packed into windows;
+        /// every tenth window is held out)
         #[arg(long)]
         data: String,
         /// Chain steps trained: step 1 reads the trunk's hidden row, step j
-        /// the draft's own step j − 1 output (the runtime drafts 3–5 deep)
+        /// the draft's own step j − 1 output (the runtime drafts 2–7 deep)
         #[arg(long, default_value_t = 3)]
         chain: usize,
         /// Steps between rebuilds of the chain's inputs from the current weights
         #[arg(long, default_value_t = 150)]
         refresh: usize,
+        /// 0: every row starts a chain, and step j of a row reads step j
+        /// rows of the rows before it. N: a chain starts every N rows and
+        /// is laid out as a round sees it — the trunk's rows up to its
+        /// start, its own rows after
+        #[arg(long, default_value_t = 0)]
+        stride: usize,
         #[arg(long, default_value_t = 393216)]
         tokens: usize,
         #[arg(long, default_value_t = 2048)]
@@ -998,6 +1005,33 @@ enum Commands {
         /// Evaluations without a new best before training stops (0 = never)
         #[arg(long, default_value_t = 6)]
         patience: usize,
+        /// Share of a target's mass put on the trunk's own token: 0 = its
+        /// distribution as it is, 1 = its choice alone, what a greedy
+        /// verify accepts
+        #[arg(long, default_value_t = 0.0)]
+        hard: f64,
+        /// Directory that keeps the trunk's pass (its hidden rows and
+        /// top-k) per data set: a later run on the same trunk, data and
+        /// window reads it back instead of running the trunk
+        #[arg(long)]
+        trunk_cache: Option<String>,
+        /// Codec of the trained draft in the output: `keep` (the file's
+        /// own) or a codec's name (f16, q8_2f, q4tp)
+        #[arg(long, default_value = "keep")]
+        codec: String,
+        /// `CODEC=PATH`: the same result with the draft in another codec
+        /// (repeatable)
+        #[arg(long)]
+        also_output: Vec<String>,
+        /// Directory for the chain's rows per step (output hidden, top-4)
+        /// before and after training, and the tensors a draft reads
+        #[arg(long)]
+        dump: Option<String>,
+        /// `DIR=L,L,…`: the output rows of these trunk layers (0-based) for
+        /// the held-out windows, what a draft model built elsewhere reads
+        /// from its target
+        #[arg(long)]
+        taps: Option<String>,
         #[arg(long)]
         output: String,
     },
@@ -4709,8 +4743,18 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "gpu"))]
         Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
         #[cfg(feature = "gpu")]
-        Commands::MtpHeal { model, init, data, chain, refresh, tokens, window, epochs, lr, topk, batch, eval_every, patience, output } => {
-            let cfg = compress::mtp_heal::Cfg { chain, refresh, tokens, window, epochs, lr, topk, batch, eval_every, patience };
+        Commands::MtpHeal { model, init, data, chain, refresh, stride, tokens, window, epochs, lr, topk, batch, eval_every, patience, hard, trunk_cache, codec, also_output, dump, taps, output } => {
+            let also = also_output
+                .iter()
+                .map(|s| s.split_once('=').map(|(c, p)| (c.to_string(), std::path::PathBuf::from(p))).ok_or_else(|| anyhow::anyhow!("--also-output {s:?}: CODEC=PATH")))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let recoded = codec != "keep" || !also.is_empty();
+            let taps = match taps.as_deref().map(|s| s.split_once('=')) {
+                None => None,
+                Some(Some((d, l))) => Some((std::path::PathBuf::from(d), l.split(',').map(|x| x.trim().parse::<usize>()).collect::<Result<Vec<_>, _>>().map_err(|e| anyhow::anyhow!("--taps: layers: {e}"))?)),
+                Some(None) => anyhow::bail!("--taps expects DIR=L,L,…"),
+            };
+            let cfg = compress::mtp_heal::Cfg { chain, refresh, stride, tokens, window, epochs, lr, topk, batch, eval_every, patience, hard, trunk_cache: trunk_cache.map(Into::into), codec, also, dump: dump.map(Into::into), taps };
             let r = compress::mtp_heal::heal(
                 std::path::Path::new(&model),
                 init.as_deref().map(std::path::Path::new),
@@ -4719,10 +4763,21 @@ async fn main() -> anyhow::Result<()> {
                 std::path::Path::new(&output),
                 compress::stages::cpu_budget(),
             )?;
-            println!(
-                "mtp heal: held-out KL to the trunk {:.5} → {:.5} (best step {} of {}); wrote {output}",
-                r.loss_start, r.loss_best, r.best_step, r.steps
-            );
+            let hold = |v: &[f64]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(" / ");
+            if r.steps == 0 {
+                let wrote = if recoded { format!("the draft re-encoded, wrote {output}") } else { "nothing written".to_string() };
+                println!("mtp heal: no training: the chain holds {}; {wrote}", hold(&r.hold_start));
+            } else {
+                println!(
+                    "mtp heal: held-out KL to the trunk {:.5} → {:.5} (best step {} of {}), the chain holds {} → {}; wrote {output}",
+                    r.loss_start,
+                    r.loss_best,
+                    r.best_step,
+                    r.steps,
+                    hold(&r.hold_start),
+                    hold(&r.hold_best)
+                );
+            }
             Ok(())
         }
         #[cfg(not(feature = "gpu"))]

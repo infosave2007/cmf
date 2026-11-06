@@ -8136,6 +8136,16 @@ impl Pipeline {
     /// a decided speculation keeps re-checking the rule every round and
     /// stops after four losing rounds in a row.
     fn spec_trial_round(trial: SpecTrial, mon: &mut SpecMon, generated: usize) -> SpecTrial {
+        // CMF_GRAPH_SPEC_PIN=1 keeps the rounds on whatever they cost: a
+        // count of how a draft head holds has to include the stretches a
+        // trial would decode plain.
+        static PIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PIN.get_or_init(|| std::env::var("CMF_GRAPH_SPEC_PIN").as_deref() == Ok("1")) {
+            return SpecTrial::Decided {
+                spec: true,
+                recheck_at: usize::MAX,
+            };
+        }
         match trial {
             SpecTrial::Spec { t0, gen0, rounds } => {
                 let rounds = rounds + 1;
