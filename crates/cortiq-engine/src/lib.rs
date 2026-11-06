@@ -8,6 +8,7 @@ pub mod blr;
 pub mod bounded;
 pub mod d1;
 pub mod d1_parse;
+pub mod dflash;
 pub mod dit;
 pub mod dsv4;
 pub mod dory;

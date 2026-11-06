@@ -44,11 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `q27_res_gate.py` the resonance drafts).
 - `CMF_GRAPH_SPEC_PIN=1` keeps speculative rounds on whatever they cost, so a count of how a draft holds includes
   the stretches the trial would decode plain (`scripts/dory/q27_spec_hold.sh`).
+- A DFlash drafter beside a model, off by default (`CMF_DFLASH=1`): `cortiq convert --model DIR --output MODEL.cmf
+  --dflash-sidecar` writes a published drafter (Qwen3.8-27B-DFlash2: five layers over five of the trunk's rows) as
+  `MODEL.dflash.cmf`, and a plain greedy round on native Metal can take its seven drafts from one block in place of
+  the MTP chain. Which drafter a round goes to is read off the trunk's row at the tip by a router fitted from logged
+  rounds (`cortiq dflash-route-fit`, two rank-16 subspaces of such rows), and text copied from the prompt stays with
+  the chain and its lookup. Qwen3.8-27B Turbo on a MacBook Air M4, the same text: a Rust function with tests
+  11.7 → 13.3 tok/s, an essay 9.6 → 9.9, the others within the run's spread. `cortiq dflash-check` runs the block
+  against the published drafter's numbers; `CMF_DFLASH_PICK=dflash|mtp` pins a drafter. On wgpu the chain keeps the
+  rounds unless the block is pinned: RTX 2000 Ada, 141 ms a block against the chain's 11 ms of drafts.
 
 ### Changed
 - Metal: attention over a prompt chunk's rows is three GEMMs per KV group in place of a loop over rows, and a GDN
   mixer's a and b projections are one dispatch. Qwen3.8-27B on the M4's GPU alone, 3 600 tokens: 87.0 → 73.9 s.
   `CMF_ATTN_GEMM=0` for the loop.
+- wgpu: the MTP chain's draft depth follows what a round of each depth costs on the card, timed as the rounds run,
+  in place of the share of drafts kept alone, and a plain token's time from a speculation trial is kept for the
+  process's next requests. Qwen3.8-27B Turbo on an RTX 2000 Ada 16 GB, five chat turns of 200 tokens in one
+  process, turns two to five: 26.5 → 29.8 tok/s; a first answer +2 %. `CMF_GRAPH_SPEC_K=n` pins the depth as before.
 
 ### Fixed
 - Metal: the draft chain's input stage, the embedding and the input projection, is a command of its own. Joined with

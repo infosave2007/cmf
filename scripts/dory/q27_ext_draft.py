@@ -13,9 +13,20 @@ The forward is the drafter's published one (z-lab/dflash `model.py`, the
 round starts of one window. The count is `mtp-heal`'s round layout: a chain
 starts every STRIDE rows at offsets 0 and STRIDE/2 where the token after it is
 the trunk's own, and a draft counts at depth j while every draft before it held.
+
+REF=DIR with REF_WINDOWS=0,20,26 (indices into the taps' windows) writes what a
+port of the drafter is checked against: per window its taps, tokens, the round
+starts and the drafts of each, and for the first eight starts the block's rows
+after the last norm, the sixteen candidates a row and their scores.
+
+QUANT=q8|q4|q4all rounds the drafter's matrices first, a stand-in for a CMF codec:
+q8 is eight bits with a scale a row, q4 four bits with a scale a row and 32 columns
+on the layers' matrices (eight bits on the rest), q4all four bits on everything.
+SETS="code:3,en:3,ru:3" names the data sets by their windows, in order.
 """
 import json
 import math
+import os
 import struct
 import sys
 
@@ -28,6 +39,8 @@ stride = int(sys.argv[4]) if len(sys.argv) > 4 else 12
 depth = int(sys.argv[5]) if len(sys.argv) > 5 else 7
 dev = "cuda"
 torch.set_grad_enabled(False)
+REF = os.environ.get("REF")
+ONLY = [int(x) for x in os.environ["REF_WINDOWS"].split(",")] if REF else None
 
 
 def safetensors(path):
@@ -51,6 +64,27 @@ cfg = json.load(open(f"{draft_dir}/config.json"))
 kind = cfg["architectures"][0]
 dc = cfg.get("dflash_config", {})
 W = safetensors(f"{draft_dir}/model.safetensors")
+QUANT = os.environ.get("QUANT")
+
+
+def rounded(w, bits):
+    kind, w = w.dtype, w.float()
+    if bits == 8:
+        s = w.abs().amax(1, keepdim=True).clamp_min(1e-12) / 127
+        return (torch.round(w / s).clamp(-127, 127) * s).to(kind)
+    r, c = w.shape
+    x = F.pad(w, (0, (-c) % 32)).view(r, -1, 32)
+    s = x.abs().amax(2, keepdim=True).clamp_min(1e-12) / 7
+    return (torch.round(x / s).clamp(-7, 7) * s).view(r, -1)[:, :c].to(kind)
+
+
+if QUANT:
+    for name in list(W):
+        if W[name].dim() != 2 or "base_kernel" in name:
+            continue
+        body = name.startswith("layers.") and "kernel_projection" not in name
+        W[name] = rounded(W[name], 4 if QUANT == "q4all" or (QUANT == "q4" and body) else 8)
+    print(f"the drafter's matrices rounded as {QUANT}", flush=True)
 meta = json.load(open(f"{taps_dir}/meta.json"))
 t, hs, layers, held = meta["window"], meta["hidden"], meta["layers"], meta["windows"]
 want = dc.get("target_layer_ids", cfg.get("target_layer_ids"))
@@ -156,6 +190,7 @@ def context(win):
     x = torch.from_numpy(np.ascontiguousarray(taps[win])).to(dev)  # [nl][t][hs]
     x = torch.cat([x[i] for i in range(nl)], -1).to(dt)
     tgt = rms(lin(x, "fc.weight"), W["hidden_norm.weight"])
+    context.tgt = tgt
     pos = torch.arange(t, device=dev)
     out = []
     for i in range(nlay):
@@ -242,6 +277,8 @@ names = ["as published", "its rows' own top token", "rounds in order"]
 cnt = np.zeros((3, depth, 2), dtype=np.int64)
 group = {}
 for wi in range(nw):
+    if ONLY is not None and wi not in ONLY:
+        continue
     n_len = int(lens[wi])
     starts = [n for off in (0, stride // 2) for n in range(off, n_len - 1, stride) if ids[wi, n + 1] == own[wi, n]]
     if not starts:
@@ -258,6 +295,21 @@ for wi in range(nw):
         for v in range(2):
             got[v].append(out[v].cpu().numpy())
     got = [np.concatenate(g) for g in got]
+    if REF:
+        os.makedirs(REF, exist_ok=True)
+        st = torch.tensor(starts[:8], device=dev)
+        toks = torch.full((st.shape[0], rows), mask_id, device=dev, dtype=torch.long)
+        toks[:, 0] = wid[st + 1]
+        hid = draft(ctx, st + 1, toks)
+        unary, cand = torch.topk(F.linear(hid[:, first:], head).float(), 16, dim=-1)
+        np.savez(
+            f"{REF}/ref-{held[wi]}.npz",
+            ids=ids[wi], own=own[wi], length=n_len, starts=np.array(starts), drafts=got[0], plain=got[1],
+            hidden=hid.float().cpu().numpy(), unary=unary.cpu().numpy(), cand=cand.cpu().numpy(),
+            target=context.tgt[:64].float().cpu().numpy(),
+            key0=ctx[0][0][:, :64].float().cpu().numpy(), value0=ctx[0][1][:, :64].float().cpu().numpy(),
+        )
+        np.ascontiguousarray(taps[wi]).tofile(f"{REF}/taps-{held[wi]}.f16")
     local = np.zeros((3, depth, 2), dtype=np.int64)
     # rounds as a decode has them: the next one starts after what this one kept
     n = 0
@@ -292,8 +344,15 @@ for wi in range(nw):
                 if not hit:
                     break
     cnt += local
-    # the data sets in the order mtp-heal read them: code, own, own2
+    # the data sets in the order mtp-heal read them: code, own, own2, or SETS="name:windows,..."
     g = "code" if held[wi] < 196 else "prose"
+    if os.environ.get("SETS"):
+        edge = 0
+        for part in os.environ["SETS"].split(","):
+            g, n = part.split(":")
+            edge += int(n)
+            if held[wi] < edge:
+                break
     group[g] = group.get(g, 0) + local
     print(f"window {held[wi]:3d}: {len(starts)} rounds", flush=True)
 

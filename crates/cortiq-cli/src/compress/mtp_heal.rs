@@ -225,6 +225,14 @@ fn create(dir: &Path, name: &str) -> Result<BufWriter<std::fs::File>> {
     Ok(BufWriter::with_capacity(1 << 22, std::fs::File::create(&p).with_context(|| format!("creating {}", p.display()))?))
 }
 
+/// Every tenth window is held out of training and is what a measure counts.
+/// `CMF_MTP_HOLD_ALL=1` holds out all of them: a measure (`--epochs 0`) of text
+/// no training read, such as answers to fresh prompts.
+fn held_out(i: usize) -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| std::env::var("CMF_MTP_HOLD_ALL").as_deref() == Ok("1")) || i % 10 == 9
+}
+
 fn open(dir: &Path, name: &str) -> Result<BufReader<std::fs::File>> {
     let p = dir.join(name);
     Ok(BufReader::with_capacity(1 << 22, std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?))
@@ -316,7 +324,9 @@ pub fn heal(student_path: &Path, init_path: Option<&Path>, data_spec: &str, cfg:
     // windows per data set; every tenth of all of them is held out
     let sets: Vec<(String, Vec<Vec<u32>>)> = data_spec.split(',').filter(|s| !s.is_empty()).map(|item| packed_windows(item, cfg.tokens, t, 16 + chain)).collect::<Result<_>>()?;
     let n_all: usize = sets.iter().map(|s| s.1.len()).sum();
-    ensure!(n_all >= 10 * nb, "mtp heal: {n_all} windows in {data_spec}, need {} (every tenth is held out)", 10 * nb);
+    // window 0 is held out only when all of them are: a measure of a short text
+    let need = if held_out(0) { 1 } else { 10 * nb };
+    ensure!(n_all >= need, "mtp heal: {n_all} windows in {data_spec}, need {need} (every tenth is held out)");
     for (name, ws) in &sets {
         eprintln!("mtp heal: {name}: {} windows, {} tokens", ws.len(), ws.iter().map(Vec::len).sum::<usize>());
     }
@@ -425,7 +435,7 @@ pub fn heal(student_path: &Path, init_path: Option<&Path>, data_spec: &str, cfg:
                 eprintln!("  trunk on the trainer ({:.0}s)", t0.elapsed().as_secs_f64());
             }
             let (tnet, tw) = trunk.as_ref().unwrap();
-            let held: Vec<usize> = (0..wins.len()).filter(|i| i % 10 == 9).collect();
+            let held: Vec<usize> = (0..wins.len()).filter(|&i| held_out(i)).collect();
             let (mut ft, mut fl, mut fi, mut fti) = (create(d, "taps.f16")?, create(d, "len.u32")?, create(d, "ids.u32")?, create(d, "ti.u32")?);
             for &i in &held {
                 let w = &wins[i];
@@ -502,7 +512,7 @@ pub fn heal(student_path: &Path, init_path: Option<&Path>, data_spec: &str, cfg:
         }
         Ok(())
     };
-    let (val, train): (Vec<usize>, Vec<usize>) = (0..wins.len()).partition(|i| i % 10 == 9);
+    let (val, train): (Vec<usize>, Vec<usize>) = (0..wins.len()).partition(|&i| held_out(i));
     // The chain of `net` over the windows `idx`, each step from the one
     // before: per step, of the held-out rows where the steps before held
     // and every token the chain was fed is the trunk's own choice (what a
@@ -531,7 +541,7 @@ pub fn heal(student_path: &Path, init_path: Option<&Path>, data_spec: &str, cfg:
                         continue;
                     }
                     let hit = di[p * KK] == w.ti[(p + j) * k];
-                    if i % 10 == 9 {
+                    if held_out(i) {
                         cnt[j - 1].0 += 1;
                         cnt[j - 1].1 += hit as u64;
                     }

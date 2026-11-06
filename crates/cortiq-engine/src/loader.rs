@@ -2764,6 +2764,17 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
+        // A DFlash block drafter beside the file drafts the rounds when asked to.
+        if std::env::var("CMF_DFLASH").as_deref() == Ok("1") {
+            match crate::dflash::Drafter::for_target(model) {
+                Some(Ok(d)) => {
+                    tracing::info!("DFlash drafter: {} layers on the trunk's layers {:?}, blocks of {}", d.g.layers, d.g.taps, d.g.block);
+                    pipeline.dflash = Some(Box::new(d));
+                }
+                Some(Err(e)) => tracing::warn!("DFlash sidecar ignored: {e}"),
+                None => tracing::warn!("CMF_DFLASH=1, and {} is not there", crate::dflash::sidecar_path(&model.path).display()),
+            }
+        }
         if arch.arch_name == "mimo_v2" {
             pipeline.mimo_mtp = crate::pipeline::mimo_mtp::load_for(model, &arch)?;
         }

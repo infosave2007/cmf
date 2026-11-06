@@ -6797,6 +6797,269 @@ pub fn write_dspark_sidecar(
     Ok(out)
 }
 
+// ── DFlash 2 sidecar (`<stem>.dflash.cmf`) ───────────────────────────────
+//
+// DFlash 2 (`DFlash2DraftModel`) drafts a block of tokens in one pass: a few
+// Qwen3-shaped layers over the rows [anchor, MASK…], which attend to keys and
+// values projected from several of the target's layer outputs, with a grouped
+// causal convolution around attention and MLP and a candidate selector over
+// the target's own head. The sidecar carries the checkpoint under `dflash.`
+// beside one converted target; `cortiq_engine::dflash` runs it.
+
+const DFLASH2_SOURCE_ARCH: &str = "DFlash2DraftModel";
+
+/// How a DFlash 2 tensor is stored.
+#[derive(Clone, Copy, PartialEq)]
+enum DflashKind {
+    /// A layer's attention or MLP matrix: `--quant`.
+    Body,
+    /// A projection outside the layers' bodies: q8_2f.
+    Side,
+    /// A norm gain or a convolution's base kernel: f32.
+    Plain,
+    /// A selector codebook, read a row at a time: f16.
+    Table,
+}
+
+/// The fixed tensor set of a DFlash 2 checkpoint, by its config.
+fn dflash_tensor_specs(g: &cortiq_engine::dflash::Geometry) -> Vec<(String, Vec<usize>, DflashKind)> {
+    use DflashKind::*;
+    let (hs, ffn, qd, kd) = (g.hidden, g.intermediate, g.heads * g.head_dim, g.kv_heads * g.head_dim);
+    let conv = 2 * g.conv_kernel * (hs / g.conv_group);
+    let mut v = vec![("fc.weight".to_string(), vec![hs, hs * g.taps.len()], Side), ("hidden_norm.weight".into(), vec![hs], Plain)];
+    for i in 0..g.layers {
+        let p = format!("layers.{i}");
+        v.push((format!("{p}.input_layernorm.weight"), vec![hs], Plain));
+        v.push((format!("{p}.post_attention_layernorm.weight"), vec![hs], Plain));
+        for c in ["attention_conv", "mlp_conv"] {
+            v.push((format!("{p}.{c}.base_kernel"), vec![2, g.conv_kernel, hs], Plain));
+            v.push((format!("{p}.{c}.kernel_projection.weight"), vec![conv, hs], Side));
+        }
+        v.push((format!("{p}.self_attn.q_proj.weight"), vec![qd, hs], Body));
+        v.push((format!("{p}.self_attn.k_proj.weight"), vec![kd, hs], Body));
+        v.push((format!("{p}.self_attn.v_proj.weight"), vec![kd, hs], Body));
+        v.push((format!("{p}.self_attn.o_proj.weight"), vec![hs, qd], Body));
+        v.push((format!("{p}.self_attn.q_norm.weight"), vec![g.head_dim], Plain));
+        v.push((format!("{p}.self_attn.k_norm.weight"), vec![g.head_dim], Plain));
+        v.push((format!("{p}.mlp.gate_proj.weight"), vec![ffn, hs], Body));
+        v.push((format!("{p}.mlp.up_proj.weight"), vec![ffn, hs], Body));
+        v.push((format!("{p}.mlp.down_proj.weight"), vec![hs, ffn], Body));
+    }
+    v.push(("norm.weight".into(), vec![hs], Plain));
+    v.push(("candidate_selector.hidden_projection.weight".into(), vec![g.selector_rank, hs], Side));
+    v.push(("candidate_selector.predecessor_codebook".into(), vec![g.vocab, g.selector_rank], Table));
+    v.push(("candidate_selector.successor_codebook".into(), vec![g.vocab, g.selector_rank], Table));
+    v
+}
+
+/// The geometry a DFlash 2 `config.json` declares; anything this converter
+/// and the engine's drafter do not implement is refused here.
+fn dflash_geometry(config: &serde_json::Value) -> anyhow::Result<cortiq_engine::dflash::Geometry> {
+    let int = |v: &serde_json::Value, k: &str| -> anyhow::Result<usize> {
+        v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: config has no integer {k}"))
+    };
+    anyhow::ensure!(
+        config.get("architectures").and_then(|v| v.as_array()).is_some_and(|a| a.iter().any(|v| v.as_str() == Some(DFLASH2_SOURCE_ARCH))),
+        "DFlash sidecar: config.json does not declare {DFLASH2_SOURCE_ARCH}"
+    );
+    let d = config.get("dflash_config").ok_or_else(|| anyhow::anyhow!("DFlash sidecar: config has no dflash_config"))?;
+    let rope = config.get("rope_parameters").ok_or_else(|| anyhow::anyhow!("DFlash sidecar: config has no rope_parameters"))?;
+    anyhow::ensure!(
+        rope.get("rope_type").and_then(|v| v.as_str()).unwrap_or("default") == "default",
+        "DFlash sidecar: only the default rotary positions are implemented"
+    );
+    anyhow::ensure!(config.get("hidden_act").and_then(|v| v.as_str()) == Some("silu"), "DFlash sidecar: hidden_act must be silu");
+    anyhow::ensure!(config.get("is_causal").and_then(|v| v.as_bool()) == Some(false), "DFlash sidecar: the block must be non-causal");
+    anyhow::ensure!(config.get("attention_bias").and_then(|v| v.as_bool()) != Some(true), "DFlash sidecar: attention biases are not implemented");
+    let taps = d
+        .get("target_layer_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("DFlash sidecar: dflash_config has no target_layer_ids"))?
+        .iter()
+        .map(|v| v.as_u64().map(|v| v as usize).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: target_layer_ids must be integers")))
+        .collect::<anyhow::Result<Vec<usize>>>()?;
+    let g = cortiq_engine::dflash::Geometry {
+        hidden: int(config, "hidden_size")?,
+        intermediate: int(config, "intermediate_size")?,
+        layers: int(config, "num_hidden_layers")?,
+        heads: int(config, "num_attention_heads")?,
+        kv_heads: int(config, "num_key_value_heads")?,
+        head_dim: int(config, "head_dim")?,
+        vocab: int(config, "vocab_size")?,
+        block: int(d, "block_size")?,
+        mask_token: int(d, "mask_token_id")? as u32,
+        conv_group: int(d, "conv_group_size")?,
+        conv_kernel: int(d, "conv_kernel_size")?,
+        selector_rank: int(d, "selector_rank")?,
+        selector_top: int(d, "selector_top_k")?,
+        taps,
+        target_layers: int(config, "num_target_layers")?,
+        window: if config.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) { int(config, "sliding_window")? } else { 0 },
+        rope_theta: rope.get("rope_theta").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: rope_parameters.rope_theta missing"))?,
+        eps: config.get("rms_norm_eps").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: rms_norm_eps missing"))?,
+    };
+    anyhow::ensure!(
+        g.layers > 0
+            && g.block >= 2
+            && !g.taps.is_empty()
+            && g.taps.windows(2).all(|w| w[0] < w[1])
+            && g.taps.iter().all(|&l| l < g.target_layers)
+            && g.kv_heads > 0
+            && g.heads % g.kv_heads == 0
+            && g.head_dim % 2 == 0
+            && g.conv_group > 0
+            && g.hidden % g.conv_group == 0
+            && g.conv_kernel >= 1
+            && g.selector_top >= 1
+            && (g.mask_token as usize) < g.vocab,
+        "DFlash sidecar: unsupported geometry {g:?}"
+    );
+    Ok(g)
+}
+
+/// Convert a DFlash 2 checkpoint (`config.json` + `model.safetensors`) into
+/// `<stem>.dflash.cmf` beside the converted target it drafts for. The layers'
+/// attention and MLP matrices take `quant` (q4tp, q8_2f or f16); the other
+/// projections are q8_2f, norms and kernels f32, the selector's codebooks f16.
+pub fn write_dflash_sidecar(model_dir: &Path, base_output: &Path, quant: &str) -> anyhow::Result<PathBuf> {
+    let quant = parse_quant(quant)?;
+    anyhow::ensure!(matches!(quant, Quant::Q8_2f | Quant::Q4TiledP | Quant::F16), "DFlash sidecar: --quant must be q4tp, q8_2f, or f16");
+    let config_path = model_dir.join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).map_err(|e| anyhow::anyhow!("DFlash sidecar: {}: {e}", config_path.display()))?)?;
+    let g = dflash_geometry(&config)?;
+
+    // the target this draft was trained on: its depth, width and vocabulary,
+    // and the embedding and head the draft shares with it
+    let base = cortiq_core::CmfModel::open(base_output).map_err(|e| anyhow::anyhow!("DFlash sidecar: open base {}: {e}", base_output.display()))?;
+    let filename = base_output.file_name().and_then(|v| v.to_str()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: --output must be a UTF-8 base .cmf filename"))?;
+    anyhow::ensure!(
+        filename.ends_with(".cmf") && !filename.ends_with(".mtp.cmf") && !filename.ends_with(".dspark.cmf") && !filename.ends_with(".dflash.cmf"),
+        "DFlash sidecar: --output must name the existing base .cmf, not a sidecar"
+    );
+    let arch = base.arch();
+    anyhow::ensure!(
+        arch.num_layers == g.target_layers && arch.hidden_size == g.hidden && arch.vocab_size == g.vocab,
+        "DFlash sidecar: base (layers {}, hidden {}, vocab {}) is not the draft's target ({}, {}, {})",
+        arch.num_layers,
+        arch.hidden_size,
+        arch.vocab_size,
+        g.target_layers,
+        g.hidden,
+        g.vocab
+    );
+    for name in ["model.embed_tokens.weight", "lm_head.weight"] {
+        let t = base.tensor(name).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: base has no {name}"))?;
+        anyhow::ensure!(t.shape == [g.vocab, g.hidden], "DFlash sidecar: base {name} shape {:?}, expected {:?}", t.shape, [g.vocab, g.hidden]);
+    }
+    let out = cortiq_engine::dflash::sidecar_path(base_output);
+    anyhow::ensure!(!out.exists(), "DFlash sidecar: {} already exists; refusing to overwrite it", out.display());
+
+    let source = open_safetensors(&model_dir.join("model.safetensors"))?;
+    let specs = dflash_tensor_specs(&g);
+    anyhow::ensure!(
+        source.tensors.len() == specs.len(),
+        "DFlash sidecar: the checkpoint holds {} tensors, its config describes {}",
+        source.tensors.len(),
+        specs.len()
+    );
+    for (name, shape, _) in &specs {
+        let t = source.tensors.iter().find(|t| &t.name == name).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: the checkpoint has no {name}"))?;
+        anyhow::ensure!(&t.shape == shape, "DFlash sidecar: {name} shape {:?}, expected {shape:?}", t.shape);
+    }
+
+    let mut cfg = serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": g.hidden,
+        "intermediate_size": g.intermediate,
+        "num_hidden_layers": g.layers,
+        "num_attention_heads": g.heads,
+        "num_key_value_heads": g.kv_heads,
+        "head_dim": g.head_dim,
+        "vocab_size": g.vocab,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": g.eps,
+        "rope_theta": g.rope_theta,
+        "hidden_act": "silu",
+        "tie_word_embeddings": false,
+    });
+    if let Some(m) = config.get("max_position_embeddings") {
+        cfg["max_position_embeddings"] = m.clone();
+    }
+    let mut sidecar_arch = build_arch(&cfg)?;
+    sidecar_arch.arch_name = cortiq_engine::dflash::SIDECAR_ARCH.into();
+    sidecar_arch.mtp = None;
+    sidecar_arch.moe = None;
+    sidecar_arch.linear_core = None;
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch: sidecar_arch,
+        quant_type: dspark_quant_type(quant),
+        provenance: Some(serde_json::json!({
+            "kind": cortiq_engine::dflash::SIDECAR_ARCH,
+            "source": {
+                "directory": model_dir.display().to_string(),
+                "file": "model.safetensors",
+                "architectures": [DFLASH2_SOURCE_ARCH],
+                "tensor_count": specs.len(),
+            },
+            "base_binding": {
+                "filename": filename,
+                "arch_name": arch.arch_name,
+                "trunk_hash64": format!("{:016x}", base.trunk_hash()),
+                "shared_target_tensors": { "embedding": "model.embed_tokens.weight", "lm_head": "lm_head.weight" },
+            },
+            "dflash": serde_json::to_value(&g)?,
+            "tensor_namespace": cortiq_engine::dflash::NAMESPACE,
+            "weight_quant": quant_name(quant),
+            "matrix_policy": "attention and MLP matrices of the layers use weight_quant; fc, kernel projections and the selector's projection are q8_2f; norms and base kernels f32; codebooks f16",
+            "converter": format!("cortiq {}", env!("CARGO_PKG_VERSION")),
+        })),
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
+    };
+
+    let name = out.file_name().and_then(|v| v.to_str()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: output filename must be UTF-8"))?;
+    let partial = out.with_file_name(format!(".{name}.part-{}", std::process::id()));
+    let write = || -> anyhow::Result<()> {
+        let mut writer = cortiq_core::format::CmfStreamWriter::new(&partial, cortiq_core::format::CmfStreamWriter::head_reserve_for(specs.len(), 64))
+            .map_err(|e| anyhow::anyhow!("DFlash sidecar: create {}: {e}", partial.display()))?;
+        for (source_name, shape, kind) in &specs {
+            let t = source.tensors.iter().find(|t| &t.name == source_name).expect("checked above");
+            let vals = to_f32(&t.dtype, source.bytes(t))?;
+            anyhow::ensure!(vals.len() == shape.iter().product::<usize>() && vals.iter().all(|v| v.is_finite()), "DFlash sidecar: {source_name} holds an invalid payload");
+            let name = format!("{}{source_name}", cortiq_engine::dflash::NAMESPACE);
+            let (dtype, data) = match kind {
+                DflashKind::Body => quantize_2d(quant, &vals, shape[0], shape[1]),
+                DflashKind::Side => quantize_2d(Quant::Q8_2f, &vals, shape[0], shape[1]),
+                DflashKind::Table => (TensorDtype::F16, encode_f16(&vals)),
+                DflashKind::Plain => (TensorDtype::F32, vals.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            };
+            writer.push(&name, dtype, shape, &data).map_err(|e| anyhow::anyhow!("DFlash sidecar: write {name}: {e}"))?;
+        }
+        writer.finish(&header, None, None).map_err(|e| anyhow::anyhow!("DFlash sidecar: finalize {}: {e}", partial.display()))?;
+        // the file as the drafter will read it
+        let written = std::sync::Arc::new(cortiq_core::CmfModel::open(&partial).map_err(|e| anyhow::anyhow!("DFlash sidecar: reopen {}: {e}", partial.display()))?);
+        cortiq_engine::dflash::Geometry::of(&written).map_err(|e| anyhow::anyhow!("DFlash sidecar: {e}"))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&partial);
+        return Err(e);
+    }
+    fs::rename(&partial, &out).map_err(|e| anyhow::anyhow!("DFlash sidecar: publish {} -> {}: {e}", partial.display(), out.display()))?;
+    Ok(out)
+}
+
 /// Layer index of a `model.layers.N.*` name.
 fn layer_index_of(name: &str) -> Option<usize> {
     name.strip_prefix("model.layers.")?

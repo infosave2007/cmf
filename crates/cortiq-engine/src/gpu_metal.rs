@@ -11330,7 +11330,29 @@ fn encode_q4tp_mm_n8(
     cols: usize,
     nb: usize,
 ) {
+    encode_q4tp_mm_n8_take(c, enc, fbuf, abs, xs, y, xsc, rows, cols, nb, rows);
+}
+
+/// `encode_q4tp_mm_n8` over the plane's first `take` rows: `y` stays
+/// `[nb][rows]`, of which every row's first `take` entries are written. (A
+/// q4tp plane keeps its rows' scales after every row's nibbles, so its first
+/// rows are not a smaller plane: the kernel is told the whole height.)
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mm_n8_take(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    xsc: &Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+    take: usize,
+) {
     debug_assert!((1..=8).contains(&nb));
+    debug_assert!((1..=rows).contains(&take));
     enc.set_compute_pipeline_state(&c.q4tpmmn8);
     fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
@@ -11341,9 +11363,200 @@ fn encode_q4tp_mm_n8(
     enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
     enc.set_buffer(6, Some(xsc), 0);
     enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(64), 1, 1),
+        MTLSize::new((take as u64).div_ceil(64), 1, 1),
         MTLSize::new(128, 1, 1),
     );
+}
+
+/// Power-of-two pre-scales of `b` activation rows for the narrow GEMM, which
+/// stages them as `half`: 1.0 while a row fits, a scale down past that (the
+/// kernel undoes it on the output row).
+fn n8_row_scales(xs: &[f32], b: usize, cols: usize) -> [f32; 8] {
+    const SAFE: f32 = 32768.0;
+    let mut sc = [1.0f32; 8];
+    for (s, row) in sc.iter_mut().zip(xs.chunks_exact(cols).take(b)) {
+        let amax = row.iter().fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        if amax > SAFE {
+            *s = (-(amax / SAFE).log2().ceil()).exp2();
+        }
+    }
+    sc
+}
+
+/// Scratch for the narrow-GEMM entry points below: its own keys, so a call
+/// never takes a buffer another path left data in.
+const N8_KEY: usize = 91_000_000_000;
+
+fn n8_scales_buf(c: &Ctx, slot: usize, sc: &[f32; 8]) -> Buffer {
+    let buf = io_buf_grow(c, N8_KEY + 100 + slot, 32);
+    unsafe {
+        std::ptr::copy_nonoverlapping(sc.as_ptr(), buf.contents() as *mut f32, 8);
+    }
+    buf
+}
+
+/// Several narrow q4tp GEMMs over the same rows (at most eight) in ONE
+/// command buffer: `xs` is `[b][cols]`, `outs[i]` `[b][take_i]`, the first
+/// `take_i` rows of job i's plane (all of them when `takes` is `None`).
+///
+/// The wide GEMM tiles 32 batch columns and costs the same whatever the
+/// batch is; for the eight rows of a draft block this kernel sits near the
+/// weights' bandwidth instead. MacBook Air M4, the DFlash 2 drafter of
+/// Qwen3.8-27B (five layers of 5120 × 17408): a block 80 ms on the wide
+/// GEMM, a submission a matrix or not.
+pub fn q4tp_n8_many(
+    model: &Arc<CmfModel>,
+    jobs: &[MmJob],
+    takes: Option<&[usize]>,
+    xs: &[f32],
+    b: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if jobs.is_empty() || jobs.len() != outs.len() || !(1..=8).contains(&b) {
+        return false;
+    }
+    if takes.is_some_and(|t| t.len() != jobs.len()) {
+        return false;
+    }
+    let cols = jobs[0].cols;
+    if cols % 64 != 0 || xs.len() < b * cols {
+        return false;
+    }
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let take_of = |i: usize| takes.map_or(jobs[i].rows, |t| t[i]);
+    let mut abs_offsets = Vec::with_capacity(jobs.len());
+    for (i, (j, o)) in jobs.iter().zip(outs.iter()).enumerate() {
+        let take = take_of(i);
+        if j.cols != cols || take == 0 || take > j.rows || o.len() < b * take {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(&model.tensors[j.idx]) else {
+            return false;
+        };
+        let Some(need) = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[j.rows, j.cols],
+        ) else {
+            return false;
+        };
+        if abs + need > safe_len {
+            return false;
+        }
+        abs_offsets.push(abs);
+    }
+    let xs_buf = io_buf_grow(c, N8_KEY, b * cols * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, b * cols);
+    }
+    let sc_buf = n8_scales_buf(c, 0, &n8_row_scales(xs, b, cols));
+    let ys: Vec<Buffer> = jobs
+        .iter()
+        .enumerate()
+        .map(|(slot, j)| io_buf_grow(c, N8_KEY + 1 + slot, b * j.rows * 4))
+        .collect();
+    let cmd = c.queue.new_command_buffer();
+    for (i, (j, (abs, y))) in jobs.iter().zip(abs_offsets.iter().zip(ys.iter())).enumerate() {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_mm_n8_take(c, enc, &fbuf, *abs, &xs_buf, y, &sc_buf, j.rows, cols, b, take_of(i));
+        enc.end_encoding();
+    }
+    let refs: Vec<&Buffer> = ys.iter().collect();
+    submit_and_wait(c, cmd, &refs);
+    for (i, (j, (y, out))) in jobs.iter().zip(ys.iter().zip(outs.iter_mut())).enumerate() {
+        let take = take_of(i);
+        unsafe {
+            let src = y.contents() as *const f32;
+            for bi in 0..b {
+                std::ptr::copy_nonoverlapping(src.add(bi * j.rows), out.as_mut_ptr().add(bi * take), take);
+            }
+        }
+    }
+    true
+}
+
+/// A SwiGLU MLP over at most eight rows on the narrow GEMM, one command
+/// buffer: `y = W2 · (silu(W1 · x) ⊙ W3 · x)`, `xs` `[b][hidden]`, `out`
+/// `[b][hidden]`. The wide twin is `q4tp_ffn`.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_n8_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden % 64 != 0 || inter % 64 != 0 || !(1..=8).contains(&b) {
+        return false;
+    }
+    if xs.len() < b * hidden || out.len() < b * hidden {
+        return false;
+    }
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let abs_ok = |idx: usize, rows: usize, cols: usize| -> Option<usize> {
+        let abs = model.entry_abs_offset(&model.tensors[idx])?;
+        let need = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
+        (abs + need <= safe_len).then_some(abs)
+    };
+    let (Some(a1), Some(a3), Some(a2)) = (
+        abs_ok(w1, inter, hidden),
+        abs_ok(w3, inter, hidden),
+        abs_ok(w2, hidden, inter),
+    ) else {
+        return false;
+    };
+    let xs_buf = io_buf_grow(c, N8_KEY + 200, b * hidden * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, b * hidden);
+    }
+    let sc_buf = n8_scales_buf(c, 1, &n8_row_scales(xs, b, hidden));
+    // the down projection reads rows that never left the device, as they are
+    let ones_buf = n8_scales_buf(c, 2, &[1.0; 8]);
+    let g_buf = io_buf_grow(c, N8_KEY + 201, b * inter * 4);
+    let u_buf = io_buf_grow(c, N8_KEY + 202, b * inter * 4);
+    let y_buf = io_buf_grow(c, N8_KEY + 203, b * hidden * 4);
+    let cmd = c.queue.new_command_buffer();
+    for (abs, y) in [(a1, &g_buf), (a3, &u_buf)] {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_mm_n8(c, enc, &fbuf, abs, &xs_buf, y, &sc_buf, inter, hidden, b);
+        enc.end_encoding();
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.silu);
+        enc.set_buffer(0, Some(&g_buf), 0);
+        enc.set_buffer(1, Some(&u_buf), 0);
+        enc.set_buffer(2, Some(&u_buf), 0); // col slot: unused (has_col=0)
+        enc.set_buffer(3, Some(&g_buf), 0);
+        let n_u = (b * inter) as u32;
+        let has = 0u32;
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &has as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((b * inter) as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_mm_n8(c, enc, &fbuf, a2, &g_buf, &y_buf, &ones_buf, hidden, inter, b);
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * hidden);
+    }
+    true
 }
 
 /// The batched q4tp matvec as one submit (tests, microbench): `pre` is
@@ -19988,6 +20201,8 @@ pub struct TokenGraph {
     /// The plan's positions per split-K block (`set_attend_blk`); None =
     /// `gqa_blk_size()`.
     blk_size: Option<usize>,
+    /// The hidden kept on the way (`tap`): the buffer and how many it holds.
+    taps_b: Option<(Buffer, usize)>,
 }
 
 impl TokenGraph {
@@ -20082,6 +20297,7 @@ impl TokenGraph {
             conc: false,
             blk_from: None,
             blk_size: None,
+            taps_b: None,
             in_conc: std::cell::Cell::new(false),
         })
     }
@@ -20982,6 +21198,37 @@ impl TokenGraph {
             &[],
             (threads, threads),
         );
+        true
+    }
+
+    /// Keep the hidden as it stands after the layers encoded so far, as row `slot`
+    /// of `slots`, for `read_taps`: a layer's output. Not inside a concurrent encoder.
+    pub fn tap(&mut self, slot: usize, slots: usize) -> bool {
+        if self.failed || self.conc || slot >= slots {
+            return false;
+        }
+        let n = self.dims.hidden * 4;
+        let buf = io_buf_grow(self.c, 74_000_009_931, slots * n);
+        let cmd = self.ensure_cmd();
+        let blit = cmd.new_blit_command_encoder();
+        blit.copy_from_buffer(&self.h_b, 0, &buf, (slot * n) as u64, n as u64);
+        blit.end_encoding();
+        self.taps_b = Some((buf, slots));
+        true
+    }
+
+    /// The rows `tap` kept, `[slot][hidden]` (after `sync`).
+    pub fn read_taps(&self, out: &mut [f32]) -> bool {
+        let Some((buf, slots)) = self.taps_b.as_ref().filter(|_| !self.failed) else {
+            return false;
+        };
+        let n = slots * self.dims.hidden;
+        if out.len() != n {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.contents() as *const f32, out.as_mut_ptr(), n);
+        }
         true
     }
 
@@ -23687,6 +23934,8 @@ pub struct VerifyGraph {
     /// d_b holds a residual delta not yet added to h_b: the next norm
     /// folds `h += d` in (one dispatch instead of axpy + norm).
     pending_delta: bool,
+    /// Rows kept on the way (`tap`): a buffer of b rows per set.
+    taps_b: Vec<Option<Buffer>>,
     /// A command-buffer error is terminal for this graph.  No state, KV, or
     /// output readback is allowed after it, and callers must not fall back to
     /// a serial path against partially mutated device state.
@@ -24070,6 +24319,7 @@ impl VerifyGraph {
             logits_b: None,
             prefill: false,
             pending_delta: false,
+            taps_b: Vec::new(),
             failed: false,
             ane: None,
             ane_job: None,
@@ -24533,6 +24783,47 @@ impl VerifyGraph {
         );
         enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(MTLSize::new(self.b as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Keep the rows as they stand after the layers encoded so far, as set `slot` of
+    /// `slots`, for `read_taps`: a layer's output, `h` and the residual still pending
+    /// on it. The graph's own arithmetic is not touched: the residual stays pending
+    /// for the next norm. A chunk that goes through the Neural Engine keeps none.
+    pub fn tap(&mut self, slot: usize, slots: usize) -> bool {
+        if self.failed || self.relay || self.ane.is_some() || slot >= slots || slots > 16 {
+            return false;
+        }
+        let rows = self.b * self.tg.dims.hidden;
+        let buf = Self::vbuf(self.tg.c, 31 + slot, self.lane, rows * 4);
+        let cmd = self.ensure_cmd();
+        let blit = cmd.new_blit_command_encoder();
+        blit.copy_from_buffer(&self.h_b, 0, &buf, 0, (rows * 4) as u64);
+        blit.end_encoding();
+        if self.pending_delta {
+            let enc = cmd.new_compute_command_encoder();
+            disp_axpy(self.tg.c, enc, &self.d_b, &buf, 1.0, rows);
+            enc.end_encoding();
+        }
+        self.taps_b.resize(slots, None);
+        self.taps_b[slot] = Some(buf);
+        true
+    }
+
+    /// The rows `tap` kept, `[set][row][hidden]` (after `sync`).
+    pub fn read_taps(&self, out: &mut [f32]) -> bool {
+        let rows = self.b * self.tg.dims.hidden;
+        if self.failed || self.taps_b.is_empty() || out.len() != self.taps_b.len() * rows {
+            return false;
+        }
+        for (buf, dst) in self.taps_b.iter().zip(out.chunks_exact_mut(rows)) {
+            let Some(buf) = buf else {
+                return false;
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.contents() as *const f32, dst.as_mut_ptr(), rows);
+            }
+        }
+        true
     }
 
     /// Flush a pending delta into h_b (before a readback or the head).

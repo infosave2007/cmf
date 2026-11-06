@@ -27871,6 +27871,8 @@ pub fn forward_token_graph(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }));
+    // Layer outputs a caller asked to keep (`layer_taps_arm`): one token only.
+    let layer_taps = if steps == 1 { layer_taps_plan(c, layer_base, layers.len(), 1, hidden) } else { None };
     let n1 = GraphScratch::ensure(
         &c.device,
         &mut gs.n1,
@@ -32471,6 +32473,13 @@ pub fn forward_token_graph(
                     enc.copy_buffer_to_buffer(&h_buf, 0, tap, 0, (hidden * 4) as u64);
                 }
             }
+            if let Some((slots, stage)) = layer_taps.as_ref() {
+                if let Some(slot) = slots[li] {
+                    let n = (hidden * 4) as u64;
+                    flush_pass(&enc);
+                    enc.copy_buffer_to_buffer(&h_buf, 0, stage, slot as u64 * n, n);
+                }
+            }
         }
         // ── Multi-step tail: final norm + lm_head + on-device argmax; the
         // winner's embedding becomes the next step's h. All inside the SAME
@@ -33001,6 +33010,71 @@ pub fn set_batch_q82_mm(on: bool) {
 /// Arm (`Some`) or clear the MRoPE angles of the next batch graph call.
 pub fn set_batch_mrope(angles: Option<Vec<f32>>) {
     BATCH_MROPE.with(|m| *m.borrow_mut() = angles);
+}
+
+thread_local! {
+    /// Layers (absolute indices) whose outputs the next whole-token or batch
+    /// graph on this thread keeps: `layer_taps_arm`.
+    static LAYER_TAPS_WANT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What that graph kept: the stage `[slot][row][hidden]` and its floats.
+    static LAYER_TAPS_STAGE: std::cell::RefCell<Option<(wgpu::Buffer, usize)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Ask the next token or batch graph on this thread to keep the residual
+/// stream after each of `layers` (a DFlash drafter's context reads them).
+/// An empty list disarms. `layer_taps_take` collects.
+pub fn layer_taps_arm(layers: &[usize]) {
+    LAYER_TAPS_WANT.with(|w| *w.borrow_mut() = layers.to_vec());
+    LAYER_TAPS_STAGE.with(|s| *s.borrow_mut() = None);
+}
+
+/// For a graph over `n_layers` from `layer_base` and `rows` rows: the slot of
+/// each of its layers that is kept and the stage the copies go to. None when
+/// nothing is asked or the span does not hold every asked layer.
+fn layer_taps_plan(c: &Ctx, layer_base: usize, n_layers: usize, rows: usize, hidden: usize) -> Option<(Vec<Option<usize>>, wgpu::Buffer)> {
+    let want = LAYER_TAPS_WANT.with(|w| w.borrow().clone());
+    if want.is_empty() || rows == 0 || want.iter().any(|&t| t < layer_base || t >= layer_base + n_layers) {
+        return None;
+    }
+    let slots = (0..n_layers).map(|li| want.iter().position(|&t| t == layer_base + li)).collect();
+    let floats = want.len() * rows * hidden;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("layer-taps"),
+        size: (floats * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    LAYER_TAPS_STAGE.with(|s| *s.borrow_mut() = Some((stage.clone(), floats)));
+    Some((slots, stage))
+}
+
+/// The rows the last armed graph kept, `[slot][row][hidden]`; disarms. Call
+/// it after the graph completed (its readback has drained the queue).
+pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
+    LAYER_TAPS_WANT.with(|w| w.borrow_mut().clear());
+    let Some((stage, floats)) = LAYER_TAPS_STAGE.with(|s| s.borrow_mut().take()) else {
+        return false;
+    };
+    let Some(c) = ctx() else { return false };
+    let bytes = (floats * 4) as u64;
+    let (tx, rx) = std::sync::mpsc::channel();
+    stage.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    if !rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+        return false;
+    }
+    let ok = match stage.get_mapped_range(..bytes) {
+        Ok(raw) => {
+            out.clear();
+            out.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&raw));
+            true
+        }
+        Err(_) => false,
+    };
+    stage.unmap();
+    ok
 }
 
 pub fn forward_batch_graph_at(
@@ -33959,6 +34033,8 @@ pub fn forward_batch_graph_at(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }));
+    // Layer outputs a caller asked to keep (`layer_taps_arm`), every row's.
+    let layer_taps = layer_taps_plan(c, layer_base, layers.len(), k, hidden);
     let n1 = rwc(k * hidden);
     // The token graph's Prism transform is one 1024-block per activation
     // row.  Reuse that shader for the batched graph by carrying an explicit
@@ -36919,6 +36995,13 @@ pub fn forward_batch_graph_at(
             if let Some(tap) = tap_stage.as_ref() {
                 flush_pass(&enc);
                 enc.copy_buffer_to_buffer(&h_buf, 0, tap, 0, (k * hidden * 4) as u64);
+            }
+        }
+        if let Some((slots, stage)) = layer_taps.as_ref() {
+            if let Some(slot) = slots[li] {
+                let n = (k * hidden * 4) as u64;
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&h_buf, 0, stage, slot as u64 * n, n);
             }
         }
     }
@@ -41516,6 +41599,110 @@ pub fn q4tp_matmat(
     out: &mut [f32],
 ) -> bool {
     tp_matmat(model, idx, xs, b, rows, cols, out, false)
+}
+
+/// Several four-bit GEMMs over the same `b` rows, `(directory index, rows,
+/// cols)` each with one `cols`, in ONE submission and one readback: `outs[i]`
+/// is `[b][rows_i]`. A drafter's block asks q, k and v of the same rows, and
+/// a submission apiece is a round trip apiece. Narrow batches only (the
+/// in-kernel decode): from 64 rows on a caller's own GEMM unpacks the plane
+/// once, and this declines.
+pub fn q4tp_matmat_many(
+    model: &Arc<CmfModel>,
+    jobs: &[(usize, usize, usize)],
+    xs: &[f32],
+    b: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let _gate = c.mm_gate.lock().unwrap();
+    if jobs.is_empty() || jobs.len() != outs.len() || b == 0 || b >= 64 {
+        return false;
+    }
+    let cols = jobs[0].2;
+    if cols % 32 != 0 || xs.len() < b * cols || jobs.iter().any(|j| j.2 != cols || j.1 == 0) {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    let mut ws = Vec::with_capacity(jobs.len());
+    // every output starts on a 256-byte boundary of the shared buffer
+    let mut offs = Vec::with_capacity(jobs.len());
+    let mut total = 0u64;
+    for (&(idx, rows, _), o) in jobs.iter().zip(outs.iter()) {
+        let entry = &model.tensors[idx];
+        if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+            || entry.shape.first().copied().unwrap_or(0) < rows
+            || o.len() < b * rows
+        {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(entry) else {
+            return false;
+        };
+        let plen = entry.nbytes as usize;
+        let Some(need) = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols]) else {
+            return false;
+        };
+        if plen < need || abs + plen > bytes.len() {
+            return false;
+        }
+        let Some(w) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&entry.name)) else {
+            return false;
+        };
+        ws.push(w);
+        offs.push(total);
+        total += ((b * rows * 4) as u64).next_multiple_of(256);
+    }
+    let coop_arm = !MIMO_F32_GEMM.get() && c.q4tp_mm_coop.is_some();
+    let ascale: f32 = if coop_arm {
+        let mx = host_absmax(&xs[..b * cols]);
+        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+    } else {
+        0.0
+    };
+    let pipe = mm_pipeline(c, true, false);
+    let (xs_buf, y_buf, stage_buf) = {
+        let mut sc = c.scratch.lock().unwrap();
+        (
+            Scratch::ensure(&c.device, &mut sc.xs, (b * cols * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, "q4tpmm-xs"),
+            Scratch::ensure(&c.device, &mut sc.y, total, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "q4tpmm-y"),
+            Scratch::ensure(&c.device, &mut sc.stage, total, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "q4tpmm-stage"),
+        )
+    };
+    c.queue.write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q4tpmm-many") });
+    for ((&(_, rows, _), w), &off) in jobs.iter().zip(&ws).zip(&offs) {
+        let params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
+        let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q4tpmm-params"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("q4tpmm-many-bg"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, w),
+                bind_buf(1, &xs_buf),
+                bind_buf_off(2, &y_buf, off, (b * rows * 4) as u64),
+                bind_buf(3, &p_buf),
+            ],
+        });
+        let mut pass = begin_pass_with(&mut enc, Some("q4tpmm-many"), None);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), (b as u32).div_ceil(64), 1);
+    }
+    let mut flat = vec![0f32; (total / 4) as usize];
+    if !readback(c, enc, &y_buf, &stage_buf, total, &mut flat) {
+        return false;
+    }
+    for ((&(_, rows, _), o), &off) in jobs.iter().zip(outs.iter_mut()).zip(&offs) {
+        let at = (off / 4) as usize;
+        o[..b * rows].copy_from_slice(&flat[at..at + b * rows]);
+    }
+    true
 }
 
 /// The same, over a two-bit weight plane.

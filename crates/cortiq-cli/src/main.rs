@@ -6,6 +6,8 @@ mod awnp;
 mod choice;
 mod convert;
 mod decision;
+mod dflash_check;
+mod dflash_route;
 mod dialog;
 mod egemma2pack;
 mod nemotron_pack;
@@ -554,6 +556,12 @@ enum Commands {
         /// not enable a draft runtime by itself.
         #[arg(long, conflicts_with = "mtp_sidecar")]
         dspark_sidecar: bool,
+        /// Convert a DFlash 2 block drafter (`DFlash2DraftModel`: config.json
+        /// and model.safetensors) into `<stem>.dflash.cmf` beside the existing
+        /// base --output CMF it drafts for. The layers' matrices take --quant
+        /// (default q4tp; q8_2f or f16), the rest a fixed layout.
+        #[arg(long, conflicts_with_all = ["mtp_sidecar", "dspark_sidecar"])]
+        dflash_sidecar: bool,
         /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
         /// companion `<stem>.mm.cmf` (vision, audio encoder, speech
         /// embeddings, audio tokenizer encoder — no text tensors; `auto`
@@ -1034,6 +1042,55 @@ enum Commands {
         taps: Option<String>,
         #[arg(long)]
         output: String,
+    },
+    /// The DFlash drafter of MODEL's sidecar against a reference kit
+    /// (`scripts/dory/q27_dflash_kit.py`): context rows, block rows, tokens.
+    #[command(hide = true)]
+    DflashCheck {
+        /// Base .cmf with a `.dflash.cmf` beside it
+        model: String,
+        /// Directory of the kit's raw files
+        kit: String,
+        /// Keep every matrix on the host
+        #[arg(long)]
+        host: bool,
+        /// Anchors a window, 0 for all the kit has
+        #[arg(long, default_value = "0")]
+        starts: usize,
+        /// Score only the head's first N rows (a shortlist), 0 for all of it
+        #[arg(long, default_value = "0")]
+        head_rows: usize,
+    },
+    /// Fit the router of MODEL's DFlash sidecar from rounds logged with
+    /// `CMF_DFLASH_ROWS` (`scripts/dory/q27_dflash_rows.sh`): which drafter a
+    /// round goes to, read off the target's row at the tip.
+    #[command(hide = true)]
+    DflashRouteFit {
+        /// Base .cmf with a `.dflash.cmf` beside it
+        model: String,
+        /// Directory of `*.rows` files, one per sequence
+        rows: String,
+        /// Rank of each drafter's subspace
+        #[arg(long, default_value = "16")]
+        rank: usize,
+        /// A round is given to the drafter that does better over this many rounds on each side of it
+        #[arg(long, default_value = "4")]
+        window: usize,
+        /// The block has to do better there by this factor to be given the round
+        /// (the values are a model of a round's price, and a turn costs a little)
+        #[arg(long, default_value = "1.1")]
+        edge: f32,
+        /// Every N-th sequence is held out of a first fit and measured (0: none)
+        #[arg(long, default_value = "4")]
+        hold_every: usize,
+        /// Measure at another device's prices, in plain tokens: the verify and
+        /// commit of a round of one to seven drafts, a block's drafts, one
+        /// draft of the chain (nine numbers, with --dry-run)
+        #[arg(long)]
+        prices: Option<String>,
+        /// Only measure: do not write the router into the sidecar
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Calibrate and physically compact a dense MTP draft FFN without
     /// rewriting the trunk. Statistics are teacher-forced through the
@@ -4185,6 +4242,7 @@ async fn main() -> anyhow::Result<()> {
             o1_sink,
             mtp_sidecar,
             dspark_sidecar,
+            dflash_sidecar,
             mimo_towers,
             sampling,
             blr_bpw,
@@ -4302,6 +4360,20 @@ async fn main() -> anyhow::Result<()> {
                 exclude_tensors.is_empty() || !dspark_sidecar,
                 "--exclude-tensors cannot be combined with --dspark-sidecar (the sidecar is a fixed tensor set)"
             );
+            if dflash_sidecar {
+                anyhow::ensure!(
+                    also_output.is_empty() && exclude_tensors.is_empty() && tensor_quant.is_empty() && mimo_towers == "text",
+                    "--dflash-sidecar writes a fixed tensor set: --also-output, --exclude-tensors, --tensor-quant and --mimo-towers do not apply"
+                );
+                let q = match quant.as_deref() {
+                    None => "q4tp",
+                    Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q4tp",
+                    Some(q) => q,
+                };
+                let path = convert::write_dflash_sidecar(std::path::Path::new(&model), std::path::Path::new(&output), q)?;
+                println!("✓ wrote DFlash sidecar {}", path.display());
+                return Ok(());
+            }
             if dspark_sidecar {
                 let q = match quant.as_deref() {
                     None => "q8_2f",
@@ -4643,6 +4715,10 @@ async fn main() -> anyhow::Result<()> {
             plan,
             output,
         } => tube::cmd_tube_bake(&model, &plan, &output),
+        Commands::DflashCheck { model, kit, host, starts, head_rows } => dflash_check::run(&model, &kit, host, starts, head_rows),
+        Commands::DflashRouteFit { model, rows, rank, window, edge, hold_every, prices, dry_run } => {
+            dflash_route::run(&model, &rows, rank, window, edge, hold_every, prices.as_deref(), !dry_run)
+        }
         Commands::MtpCompact {
             model,
             data,
