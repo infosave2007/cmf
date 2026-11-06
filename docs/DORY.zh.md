@@ -31,6 +31,7 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 | `--kv-cache per_loop\|last_loop` | 每次循环一个缓存,或全部共用一个 |
 | `--o1 m,w,sink` | 全注意力层上的远场,在 8192 行处封存 |
 | `--full-window N` | 改为把全注意力层截断到窗口 |
+| `--o1-spill DIR` | 把长提示词的行放在 `DIR` 的文件中,也可用 `CMF_O1_SPILL` |
 
 `CMF_DORY_O1=m,w,sink,seal` 同时设置封存位置,`CMF_DORY_O1=off` 关闭 Turbo 文件的远场。`CMF_DORY_GATE=conf:0.7`
 或 `recon:FILE:bias` 选择门控。`CMF_DORY_PROMPT_LOOPS=N` 设置提示词的循环次数,`CMF_DORY_EXACT=FILE:rows` 设置精确
@@ -49,7 +50,16 @@ token 和没有改变的 token 上。误差较小的一方决定 token 是否离
 约 85% 的 token 只走一次循环。
 
 远场。全注意力层精确保留最前几行和最后 1536 行,其余全部压缩到每个头 32 个地标(`nystrom`()。滑动层本来就只有 1024
-行窗口。设备内存不再增长,每个 token 的代价也不再增长。
+行窗口。设备内存不再增长,每个 token 的代价也不再增长。读取提示词时同样如此:超过 8192 行后,每个块读完,它的行就离开显卡,进入内存或文件,直到远场在这些行上重建。
+
+| 提示词,token 数 | 显卡峰值 | 内存 | 使用 `--o1-spill`:内存 | 使用 `--o1-spill`:磁盘 |
+|---:|---:|---:|---:|---:|
+| 1 000 | 3.08 GB | 0.2 GB | | |
+| 12 000 | 3.76 GB | 1.4 GB | 1.2 GB | 2.0 GB |
+| 32 000 | 3.76 GB | 3.6 GB | | |
+| 64 000 | 3.76 GB | 7.2 GB | 1.7 GB | 9.6 GB |
+
+RTX 5090,Vulkan,磁盘写入 4.2 GB/s。其中权重占 1.95 GB,内存和文件两种方式速度相同,远场建好后文件即被删除。MacBook Air M4 上 23 000 token 时,峰值 footprint 为 3.27 GB,使用 `--o1-spill` 时为 1.64 GB。
 
 ![长提示词在显卡上保留什么](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_zh.png)
 
