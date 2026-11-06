@@ -48,9 +48,8 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 
 RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 token。
 
-| 提示,token 数 | 首个 token,秒 | | 解码,tok/s | | 显存峰值,GB | |
+| 提示,token 数 | 首个 token,秒(普通) | 首个 token,秒(**turbo**) | 解码,tok/s(普通) | 解码,tok/s(**turbo**) | 显存峰值,GB(普通) | 显存峰值,GB(**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| | 普通 | **turbo** | 普通 | **turbo** | 普通 | **turbo** |
 | 1 000 | 2.2 | **2.2** | 105 | **105** | 14.5 | **14.4** |
 | 4 000 | 8.8 | **8.8** | 104 | **104** | 14.9 | **14.8** |
 | 16 000 | 42 | **47** | 87 | **92** | 16.5 | **15.5** |
