@@ -1422,6 +1422,63 @@ fn qwen4_expert(source: &Source, src: &LayerSrc, li: usize, part: Part, e: usize
     }
 }
 
+/// A Flash-Next checkpoint read one layer of routed experts at a time
+/// (`cortiq hot-bake --experts`): a local directory, or a Hub repository whose
+/// shards are fetched into `scratch` and dropped once a later layer no longer
+/// needs them (`HF_TOKEN` in the environment for a gated repository).
+pub(crate) struct ExpertSource {
+    src: Source,
+    held: Vec<String>,
+}
+
+impl ExpertSource {
+    pub(crate) fn open(hf: &str, scratch: &str) -> anyhow::Result<Self> {
+        Ok(Self { src: Source::open(hf, scratch)?, held: Vec::new() })
+    }
+
+    /// Layer `li`'s routed experts `0..ne` as f32 (`g`, `u` `[inter, hidden]`,
+    /// `d` `[hidden, inter]`), each handed to `f` in turn.
+    pub(crate) fn routed_layer(&mut self, li: usize, ne: usize, hidden: usize, inter: usize, mut f: impl FnMut(usize, ExpertW) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let names: Vec<String> = QWEN4_ROUTED.iter().map(|p| qwen4_src_name(&self.src, li, p)).collect::<anyhow::Result<_>>()?;
+        let shards = self.src.shards_of(&names)?;
+        for sh in std::mem::take(&mut self.held) {
+            if !shards.contains(&sh) {
+                self.src.release(&sh);
+            }
+        }
+        let layer = self.src.open_layer(&shards)?;
+        self.held = shards;
+        for e in 0..ne {
+            f(e, qwen4_expert(&self.src, &layer, li, Part::Routed, e, hidden, inter, 0)?)?;
+        }
+        Ok(())
+    }
+}
+
+impl ExpertSource {
+    /// Layer `li`'s shared expert as f32 (`g`, `u` `[inter_s, hidden]`, `d` `[hidden, inter_s]`).
+    pub(crate) fn shared_layer(&mut self, li: usize, hidden: usize, inter_s: usize) -> anyhow::Result<ExpertW> {
+        let names: Vec<String> = QWEN4_SHARED.iter().map(|p| qwen4_src_name(&self.src, li, p)).collect::<anyhow::Result<_>>()?;
+        let shards = self.src.shards_of(&names)?;
+        for sh in std::mem::take(&mut self.held) {
+            if !shards.contains(&sh) {
+                self.src.release(&sh);
+            }
+        }
+        let layer = self.src.open_layer(&shards)?;
+        self.held = shards;
+        qwen4_expert(&self.src, &layer, li, Part::Shared, 0, hidden, 0, inter_s)
+    }
+}
+
+impl Drop for ExpertSource {
+    fn drop(&mut self) {
+        for sh in std::mem::take(&mut self.held) {
+            self.src.release(&sh);
+        }
+    }
+}
+
 /// Flash-Next capture rows `[hidden + ne]` (input, router logits) → input
 /// rows in f16 and the top-k of the f16-rounded logits.
 fn qwen4_layer_rows(r: &[f32], hidden: usize, ne: usize, top_k: usize, out: &mut LayerRows) {

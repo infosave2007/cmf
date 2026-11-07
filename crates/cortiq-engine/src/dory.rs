@@ -348,7 +348,14 @@ pub fn seal_order(rows: usize, sink: usize, keep: &[usize]) -> Vec<u32> {
 /// `[row][nk][hd]`, `qs` `[row / stride][nh][hd]`; `kept` rows after the sinks stay exact.
 #[allow(clippy::too_many_arguments)]
 pub fn far_states(c: &DoryCfg, o1: DoryO1, ks: &[f32], vs: &[f32], qs: &[f32], stride: usize, rows: usize, order: &[u32], kept: usize) -> Vec<crate::nystrom::NystromState> {
-    let (nh, nk, hd) = (c.nh, c.nk, c.hd);
+    far_states_geom(c.nh, c.nk, c.hd, o1, ks, vs, qs, stride, rows, order, kept)
+}
+
+/// [`far_states`] for any attention geometry: `nh` query heads over `nk` KV heads of
+/// `hd`, keys and values `[row][nk][hd]`, the query trace `[row / stride][nh][hd]`
+/// (the Flash-Next device path seals through this one).
+#[allow(clippy::too_many_arguments)]
+pub fn far_states_geom(nh: usize, nk: usize, hd: usize, o1: DoryO1, ks: &[f32], vs: &[f32], qs: &[f32], stride: usize, rows: usize, order: &[u32], kept: usize) -> Vec<crate::nystrom::NystromState> {
     let rep = nh / nk;
     let mut states = Vec::with_capacity(nk);
     std::thread::scope(|sc| {

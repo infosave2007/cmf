@@ -954,6 +954,11 @@ enum Commands {
         /// `--stat hits`: how many neurons a position counts
         #[arg(long, default_value_t = 2048)]
         topk: usize,
+        /// Probe a MoE model's routed experts instead (Qwen 3.5/3.8 MoE, on the
+        /// host): the width is experts x neurons, the statistic Σ(w·act)² with
+        /// w the routing weight
+        #[arg(long)]
+        experts: bool,
     },
     /// A 2-bit FFN with its busiest neurons at 8 bits: every q2tp layer of
     /// COLD cut into the ordinary triple (cold neurons, their 2-bit rows as
@@ -971,7 +976,8 @@ enum Commands {
         /// Share of a layer's neurons kept at 8 bits
         #[arg(long, default_value_t = 0.05)]
         frac: f64,
-        /// top (by the probe's score) or random (the control)
+        /// top (by the probe's score), random (the control) or, with `--experts`, err
+        /// (the score times the row's relative quantization error)
         #[arg(long, default_value = "top")]
         pick: String,
         /// Score a neuron by the probe's statistic alone, without the energy
@@ -986,6 +992,31 @@ enum Commands {
         /// no neuron is cut
         #[arg(long)]
         take: Vec<String>,
+        /// Bake a MoE model's routed experts instead: the hot neurons' gate
+        /// and up rows are zeroed in place in COLD's q2tp/q4tp experts and one
+        /// q8_2f tube per expert carries them from HOT, here the bf16
+        /// checkpoint (a local directory or a Hub repository, `HF_TOKEN` for a
+        /// gated one); STAT from `hot-probe --experts`
+        #[arg(long)]
+        experts: bool,
+        /// `--experts`: cut the tubes' down columns from the bf16 checkpoint instead of
+        /// the cold file's own down (a GPTQ-calibrated down loses its cross-column
+        /// compensation when a column leaves it)
+        #[arg(long)]
+        bf16_down: bool,
+        /// `--experts`: the shared expert, which every token runs, whole in q8_2f as a
+        /// tube beside its zeroed triple (the device runs it with the route's weight)
+        #[arg(long)]
+        shared_q8: bool,
+        /// `--experts`: instead of `--frac` of every expert's neurons, the N busiest
+        /// experts of every layer (by their summed statistic; `--pick random` for a
+        /// control) whole in q8_2f, each as one tube of all its neurons
+        #[arg(long, default_value_t = 0)]
+        whole_experts: usize,
+        /// `--experts` with a Hub source: where its shards are fetched (default
+        /// OUTPUT.src, removed at the end)
+        #[arg(long)]
+        scratch: Option<String>,
     },
     /// Bake a task's skill into a model before compressing it (DTG-MA,
     /// Patent 2): soft gates on the FFN neurons of the deep layers trained
@@ -2077,9 +2108,9 @@ enum Commands {
         /// Output .cmf
         output: String,
         /// Weights that choose the rows kept exact: `f32` count, then the weights
-        /// (scripts/dory/router/q27_feat.py)
+        /// (scripts/dory/router/q27_feat.py); without them no row is kept exact
         #[arg(long)]
-        exact_weights: String,
+        exact_weights: Option<String>,
         /// How many rows those are
         #[arg(long, default_value_t = 248)]
         exact_rows: usize,
@@ -4775,8 +4806,20 @@ async fn main() -> anyhow::Result<()> {
             plan,
             output,
         } => tube::cmd_tube_bake(&model, &plan, &output),
-        Commands::HotProbe { model, text, out, tokens, window, skip, stat, topk } => hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk),
-        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take } => hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take),
+        Commands::HotProbe { model, text, out, tokens, window, skip, stat, topk, experts } => {
+            if experts {
+                hotmix::cmd_hot_probe_experts(&model, &text, &out, tokens, window, skip)
+            } else {
+                hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk)
+            }
+        }
+        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, bf16_down, shared_q8, whole_experts, scratch } => {
+            if experts {
+                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, bf16_down, shared_q8, whole_experts, scratch.as_deref())
+            } else {
+                hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take)
+            }
+        }
         Commands::DflashCheck { model, kit, host, starts, head_rows } => dflash_check::run(&model, &kit, host, starts, head_rows),
         Commands::DflashRouteFit { model, rows, rank, window, edge, hold_every, prices, dry_run } => {
             dflash_route::run(&model, &rows, rank, window, edge, hold_every, prices.as_deref(), !dry_run)
@@ -5333,7 +5376,7 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
         Commands::Phi { model, prompts, layer, out } => cmd_phi(&model, &prompts, layer, &out),
-        Commands::FarTurbo { input, output, exact_weights, exact_rows, o1, seal } => cmd_far_turbo(&input, &output, &exact_weights, exact_rows, &o1, seal),
+        Commands::FarTurbo { input, output, exact_weights, exact_rows, o1, seal } => cmd_far_turbo(&input, &output, exact_weights.as_deref(), exact_rows, &o1, seal),
         Commands::DoryTurbo { input, output, topologies, bias, o1, exact_weights, exact_rows } => {
             cmd_dory_turbo(&input, &output, &topologies, bias, &o1, exact_weights.as_deref(), exact_rows)
         }
@@ -8493,26 +8536,36 @@ fn cmd_fcd(
 
 /// `cortiq far-turbo`: the same weights under a header that holds long prompts in a far
 /// field of fixed size.
-fn cmd_far_turbo(input: &str, output: &str, exact_weights: &str, exact_rows: usize, o1: &str, seal: usize) -> anyhow::Result<()> {
+fn cmd_far_turbo(input: &str, output: &str, exact_weights: Option<&str>, exact_rows: usize, o1: &str, seal: usize) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(input)?;
     let mut header = model.header.clone();
     let o: Vec<usize> = o1.split(',').filter_map(|v| v.trim().parse().ok()).collect();
     anyhow::ensure!(o.len() == 3, "--o1 wants landmarks,window,sinks");
+    // Without weights no row is kept exact: the far field holds the whole sealed prompt.
+    let exact_rows = if exact_weights.is_some() { exact_rows } else { 0 };
     anyhow::ensure!(o[1] + o[2] + exact_rows <= 2052 && o[2] + exact_rows <= 255, "window, sinks and exact rows go over what the batch kernels hold");
-    let raw = std::fs::read(exact_weights)?;
-    let w: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    anyhow::ensure!(w.len() > 1 && w[0] as usize == w.len() - 1, "{exact_weights}: a count, then that many weights");
+    let w: Vec<f32> = match exact_weights {
+        Some(path) => {
+            let raw = std::fs::read(path)?;
+            let w: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            anyhow::ensure!(w.len() > 1 && w[0] as usize == w.len() - 1, "{path}: a count, then that many weights");
+            w
+        }
+        None => Vec::new(),
+    };
     let mut prov = header.provenance.clone().unwrap_or_else(|| serde_json::json!({}));
     prov["o1_turbo"] = serde_json::json!({ "layers": "all", "m": o[0], "w": o[1], "sink": o[2], "seal": seal, "exact_rows": exact_rows });
     header.provenance = Some(prov);
-    let bytes: Vec<u8> = w[1..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let bytes: Vec<u8> = w.iter().skip(1).flat_map(|x| x.to_le_bytes()).collect();
     let mut refs: Vec<cortiq_core::format::TensorSpecRef> = model
         .tensors
         .iter()
         .filter(|e| e.name != "o1.exact.weights")
         .map(|e| cortiq_core::format::TensorSpecRef { name: e.name.clone(), dtype: e.dtype, shape: e.shape.clone(), data: model.entry_bytes(e) })
         .collect();
-    refs.push(cortiq_core::format::TensorSpecRef { name: "o1.exact.weights".to_string(), dtype: TensorDtype::F32, shape: vec![w.len() - 1], data: &bytes });
+    if w.len() > 1 {
+        refs.push(cortiq_core::format::TensorSpecRef { name: "o1.exact.weights".to_string(), dtype: TensorDtype::F32, shape: vec![w.len() - 1], data: &bytes });
+    }
     CmfModel::write_ref(output, &header, &refs, Some(&model.masks), model.vocab.as_deref())?;
     println!("wrote {output}: {} tensors, far field {o1} from {seal} rows, {exact_rows} exact rows", refs.len());
     Ok(())
