@@ -59,6 +59,8 @@ pub(crate) mod lfm_set;
 pub(crate) mod amd_mv;
 /// Flash-decoding split attend of the decode graph (subgroups, all lanes).
 pub(crate) mod attend_fd;
+/// A sealed (far-field) layer's decode attention in two dispatches.
+pub(crate) mod o1_fd;
 pub(crate) mod dense_mv;
 pub(crate) mod dense_split;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
@@ -19760,6 +19762,8 @@ pub struct Ctx {
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Flash-decoding split attend per (heads a KV group, head width) (`attend_fd`).
     attend_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<attend_fd::FdPipe>>>,
+    /// Two-dispatch sealed-layer attend per (heads a KV group, head width) (`o1_fd`).
+    o1_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<o1_fd::O1FdPipe>>>,
     dense_split_pipes: std::sync::OnceLock<Option<dense_split::SplitPipes>>,
     amd_mv_pipes: std::sync::OnceLock<Option<amd_mv::AmdMv>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
@@ -22868,6 +22872,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
         attend_fd_pipes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        o1_fd_pipes: std::sync::Mutex::new(std::collections::HashMap::new()),
         dense_split_pipes: std::sync::OnceLock::new(),
         amd_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
@@ -30340,7 +30345,53 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.o1_push);
                         pass.set_bind_group(0, &bg_push, &[]);
                         pass.dispatch_workgroups(gg as u32, 1, 1);
-                        if let Some(f) = o1_stages::pipes(c, hh_).filter(|_| hd % 4 == 0 && mm <= 32 && !rect_fm) {
+                        if let Some(fp) = o1_fd::pipe(c, hh_, hd, mm).filter(|_| hd % 4 == 0 && !rect_fm) {
+                            // Two dispatches in place of the seven stages: the near rows
+                            // (sinks, then the ring) through the flash-decoding pass, then
+                            // one merge a query head with the landmarks' far part.
+                            let ncap = nns + ww;
+                            let ck = attend_fd::FD_WARPS * attend_fd::per_warp(ncap, gg);
+                            let nc = ncap.div_ceil(ck);
+                            let pacc = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.apacc,
+                                (nh * nc * hd * 4) as u64,
+                                st,
+                                "g-apacc",
+                            );
+                            let pml = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.apml,
+                                (nh * nc * 8) as u64,
+                                st,
+                                "g-apml",
+                            );
+                            let ou = unif(&[
+                                hh_ as u32,
+                                mm as u32,
+                                ww as u32,
+                                nns as u32,
+                                hd as u32,
+                                gg as u32,
+                                sc.to_bits(),
+                                ncap as u32,
+                            ]);
+                            let fu = unif(&[ck as u32, nc as u32, 0, 0]);
+                            let bg_p = bg(
+                                &fp.part.1,
+                                &[&ou, &dmeta, &qout, &drk, &dsk, &drv, &dsv, &pacc, &pml, &fu],
+                            );
+                            let bg_m = bg(
+                                &fp.merge.1,
+                                &[&ou, &dmeta, &qout, &dkt, &dmu, &dmz, &dth, &pacc, &pml, &fu, &attn],
+                            );
+                            pass.set_pipeline(&fp.part.0);
+                            pass.set_bind_group(0, &bg_p, &[]);
+                            pass.dispatch_workgroups(gg as u32, nc as u32, 1);
+                            pass.set_pipeline(&fp.merge.0);
+                            pass.set_bind_group(0, &bg_m, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if let Some(f) = o1_stages::pipes(c, hh_).filter(|_| hd % 4 == 0 && mm <= 32 && !rect_fm) {
                             let st = {
                                 let map = c.o1m.lock().unwrap();
                                 map.get(&(kv_id, layer_base + li)).unwrap().stages.clone()

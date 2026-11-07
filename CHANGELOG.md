@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   92 → 117 at 8 192, 72 → 90 at 32 000; q8_2f 103 → 163, 102 → 142, 98 → 143, 91 → 110; chat answers 110 → 136–164
   (q4tp) and 101 → 135–150 (q8_2f) with the same greedy text. Needs 32-lane subgroups and heads of 64, 128 or 256;
   `CMF_ATTEND_FD=0` keeps the old kernels.
+- A sealed (far-field) layer decodes on Vulkan/DX12 in two dispatches instead of the seven `o1_stages`
+  (`gpu_wgpu/o1_fd.rs`): the near rows (sinks, then the ring of the window and the exact rows) through the same
+  flash-decoding pass, then one workgroup a query head scores its landmarks, builds the far part as `o1s_far` does and
+  writes (Σ near + Σ far) / (Σ near weights + far mass). CherryPit-1.2-2B Turbo on an RTX 5090, decode past the seal:
+  56 → 108 tok/s at 16 000 tokens, 67 → 153 at 32 000. `CMF_O1_FD=0` keeps the stages.
 
 ### Fixed
 - `cortiq serve` with `"enable_thinking": false` replaced a system prompt the chat template writes itself when the
