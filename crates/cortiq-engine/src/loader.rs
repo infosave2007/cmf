@@ -2906,7 +2906,9 @@ impl Pipeline {
         }
         let o1_env = crate::nystrom::o1_from_env();
         // A turbo file: the far field comes on for long prompts only, so nothing is set now.
-        if matches!(o1_env, crate::nystrom::O1Env::Unset) {
+        // The Flash-Next device path reads the header itself (`qwen4_o1`): the generic seal
+        // has no layers of its own there.
+        if matches!(o1_env, crate::nystrom::O1Env::Unset) && pipeline.qwen4_exp.is_none() {
             let hint = model.header.provenance.as_ref().and_then(|p| p.get("o1_turbo"));
             if let Some(h) = hint {
                 let field = |k: &str| h.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
