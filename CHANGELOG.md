@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and per attend. CherryPit-1.2-2B on an RTX 5090: 2 048 tokens in 1.2 s instead of 10.9 (q8_2f; q4tp 1.0 s
   instead of 10.5), 8 192 in 7.2 s instead of 49.6, and decode at that depth 68 → 91 tok/s; the same greedy text
   and WikiText-2 ppl. `CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked walk.
+- Decode attention on Vulkan/DX12 is a flash-decoding kernel (`gpu_wgpu/attend_fd.rs`) from 16 cached positions on: a
+  workgroup of eight 32-lane subgroups takes a chunk of the KV group, a subgroup reads each K and V row whole and
+  coalesced, scores every query head of the group with one `subgroupAdd` and keeps the online softmax in registers;
+  the subgroups meet in workgroup memory and `gqa_attend_merge` joins the chunks as before. The old split kernel gave
+  a model with two KV heads 32 workgroups at 4 096 positions and walked 256 V rows in a row. CherryPit-1.2-2B on an
+  RTX 5090, decode tok/s old → new: q4tp 110 → 182 at 512 positions, 113 → 164 at 2 048, 106 → 147 at 4 096,
+  92 → 117 at 8 192, 72 → 90 at 32 000; q8_2f 103 → 163, 102 → 142, 98 → 143, 91 → 110; chat answers 110 → 136–164
+  (q4tp) and 101 → 135–150 (q8_2f) with the same greedy text. Needs 32-lane subgroups and heads of 64, 128 or 256;
+  `CMF_ATTEND_FD=0` keeps the old kernels.
 
 ### Fixed
 - `cortiq serve` with `"enable_thinking": false` replaced a system prompt the chat template writes itself when the
