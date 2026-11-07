@@ -1309,6 +1309,23 @@ impl Tokenizer {
         }
     }
 
+    /// Whether the chat template writes a system prompt of its own when the
+    /// conversation has none (CherryPit's identity prompt, Qwen2.5's "You
+    /// are Qwen…"): a user turn alone renders LONGER than the same turn
+    /// behind an empty system message. A caller that would add a system
+    /// message of its own must not, or that prompt is lost. False when the
+    /// file has no template or it fails to render.
+    pub fn template_has_default_system(&self) -> bool {
+        let Some(tpl) = self.chat_template.as_ref() else {
+            return false;
+        };
+        let user = serde_json::json!({"role": "user", "content": "x"});
+        let system = serde_json::json!({"role": "system", "content": ""});
+        let alone = self.render_template_json(tpl, std::slice::from_ref(&user), None, None, None);
+        let behind = self.render_template_json(tpl, &[system, user], None, None, None);
+        matches!((alone, behind), (Ok(a), Ok(b)) if a.len() > b.len())
+    }
+
     fn render_template_json(
         &self,
         tpl: &str,
@@ -1936,6 +1953,28 @@ mod tests {
             .render_chat_json_with_reasoning_effort(&messages, None, None, None)
             .expect("render native default");
         assert_eq!(native_default, "<default-effort>||prior chain");
+    }
+
+    #[test]
+    fn template_default_system_is_detected() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(
+            "{% if messages[0].role != 'system' %}<|im_start|>system\nYou are CherryPit.<|im_end|>\n{% endif %}\
+             {% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+                .to_string(),
+        );
+        assert!(tok.template_has_default_system());
+
+        tok.chat_template = Some(
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+                .to_string(),
+        );
+        assert!(!tok.template_has_default_system());
+
+        tok.chat_template = Some("{% for message in messages %}".to_string());
+        assert!(!tok.template_has_default_system());
+        tok.chat_template = None;
+        assert!(!tok.template_has_default_system());
     }
 
     #[test]

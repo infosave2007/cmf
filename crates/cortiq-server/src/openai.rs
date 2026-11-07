@@ -1626,7 +1626,10 @@ async fn chat_completions(
             // Not with tools: "output ONLY the final answer" talks a model
             // out of calling them (Spark-X2.5 answered 4 of 6 tool requests
             // with invented results under it, and called the tool in all
-            // 6 without it).
+            // 6 without it). Nor in place of a system prompt the template
+            // writes itself when there is none: CherryPit-1.2's identity
+            // prompt went, and "Who are you?" came back as "a MiniCPM
+            // series model".
             eprintln!("[serve] thinking={:?}", req.thinking());
             if !minimax_m3 && req.thinking() == Some(false) && req.effective_tools().is_none() {
                 let has_system = msgs.iter().any(|m| m["role"] == "system");
@@ -1637,7 +1640,7 @@ async fn chat_completions(
                         let cur = m["content"].as_str().unwrap_or_default();
                         m["content"] = serde_json::json!(format!("{directive}\n\n{cur}"));
                     }
-                } else {
+                } else if !state.tokenizer.template_has_default_system() {
                     msgs.insert(
                         0,
                         serde_json::json!({"role": "system", "content": directive}),
