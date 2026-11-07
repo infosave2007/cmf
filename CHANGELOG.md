@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8 192-token prompt in 31 s instead of 58 s (q4tp; q8_2f 34 s instead of 55), 2 048 tokens in 4.5 s instead of
   6.0 (q8_2f 5.5 s instead of 9.2); WikiText-2 ppl through the graph equal to the host's to three decimals.
   `CMF_METAL_PREFILL=0` keeps the host walk.
+- On Vulkan/DX12 a fully resident pure-attention model reads its prompt through the batched graph, as MoE and GDN
+  models already did, instead of the chunked host walk that paid a submit, a wait and a readback per projection
+  and per attend. CherryPit-1.2-2B on an RTX 5090: 2 048 tokens in 1.2 s instead of 10.9 (q8_2f; q4tp 1.0 s
+  instead of 10.5), 8 192 in 7.2 s instead of 49.6, and decode at that depth 68 → 91 tok/s; the same greedy text
+  and WikiText-2 ppl. `CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked walk.
 
 ### Fixed
 - `cortiq serve` with `"enable_thinking": false` replaced a system prompt the chat template writes itself when the
