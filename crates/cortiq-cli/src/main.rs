@@ -1675,8 +1675,10 @@ enum Commands {
         /// patchification.
         #[arg(long)]
         image_max_pixels: Option<usize>,
-        /// V4.1 reasoning budget: 1..=100 or low/high/max.
-        #[arg(long, value_name = "1..100|low|high|max")]
+        /// Reasoning budget. DeepSeek-V4.1: 1..=100 or low/high/max; a model
+        /// whose chat template reads `reasoning_effort` gets the value as is
+        /// (Minico-M1: off, low, medium, high, max).
+        #[arg(long, value_name = "LEVEL")]
         reasoning_effort: Option<String>,
         /// Maximum number of tokens to generate
         #[arg(short = 'n', long, default_value = "256")]
@@ -9887,7 +9889,21 @@ async fn cmd_run(
         let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
         pipeline.sampler_config.suppress_tokens.extend(ids);
     }
-    anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
+    // Outside V4.1 (its own encoder) the effort goes to a chat template that
+    // reads `reasoning_effort` (Minico-M1's off..max dial), verbatim.
+    let template_effort = reasoning_effort
+        .filter(|_| !is_dsv41)
+        .map(str::to_string);
+    anyhow::ensure!(
+        is_dsv41
+            || reasoning_effort.is_none()
+            || pipeline
+                .tokenizer
+                .chat_template
+                .as_deref()
+                .is_some_and(cortiq_engine::tokenizer::template_reads_reasoning_effort),
+        "--reasoning-effort requires DeepSeek-V4.1 or a chat template that reads `reasoning_effort`"
+    );
     anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || ov2_media_or_sn || images.is_empty(),
         "--image requires DeepSeek-V4.1, MiMo, an LFM3-VL, Mage-VL, SenseNova-Loop, MiniCPM-OCR or Unlimited-OCR file");
     anyhow::ensure!(!ov2_media_or_sn || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
@@ -10384,9 +10400,21 @@ async fn cmd_run(
         } else if use_template && !text.is_empty() {
             let from = cortiq_engine::sampler::file_history_turns(model.header.provenance.as_ref())
                 .map_or(0, |n| cortiq_engine::sampler::last_turns_start(history.iter().map(|m| m.0.as_str()).collect::<Vec<_>>().into_iter(), n));
-            pipeline
-                .tokenizer
-                .apply_chat_template_opts(&history[from..], thinking)
+            match &template_effort {
+                Some(effort) => {
+                    let msgs: Vec<serde_json::Value> = history[from..]
+                        .iter()
+                        .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+                        .collect();
+                    pipeline.tokenizer.apply_chat_template_json_with_reasoning_effort(
+                        &msgs,
+                        None,
+                        thinking,
+                        Some(effort),
+                    )
+                }
+                None => pipeline.tokenizer.apply_chat_template_opts(&history[from..], thinking),
+            }
         } else {
             let mut ids = resume_prefix.clone();
             ids.extend(pipeline.tokenizer.encode(text));

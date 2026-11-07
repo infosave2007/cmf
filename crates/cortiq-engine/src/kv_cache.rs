@@ -151,6 +151,11 @@ pub struct LayerKvCache {
     o1_error: Option<String>,
     /// Rows the next seal keeps exact, ascending.
     pub(crate) o1_keep: Vec<usize>,
+    /// The pipeline chooses the exact rows over every far-field layer once all of
+    /// them hold the boundary's rows (`o1_choose_exact_rows`), and seals then: the
+    /// layer does not convert itself on reaching the boundary (only before a row
+    /// past it would be appended).
+    pub(crate) o1_await_keep: bool,
     /// One row in this many is in the query trace.
     o1_q_stride: usize,
     /// The geometry of the last `o1_begin`.
@@ -305,6 +310,7 @@ impl LayerKvCache {
             o1: None,
             o1_error: None,
             o1_keep: Vec::new(),
+            o1_await_keep: false,
             o1_q_stride: 1,
             o1_params: None,
             o1_transitioned: false,
@@ -600,6 +606,7 @@ impl LayerKvCache {
             q_buf: Vec::new(),
         });
         self.o1_keep.clear();
+        self.o1_await_keep = false;
         self.o1_q_stride = 1;
         self.o1_params = Some((m, w, sink, rect));
         self.o1_error = None;

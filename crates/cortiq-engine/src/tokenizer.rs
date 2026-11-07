@@ -295,6 +295,14 @@ pub(crate) fn strip_generation_tags(tpl: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Whether a chat template consumes a `reasoning_effort` variable (Minico-M1's
+/// off/low/medium/high/max dial, GLM-5, gpt-oss): only such templates are
+/// handed a caller's effort, verbatim, by `run --reasoning-effort` and the
+/// server's `reasoning_effort` field.
+pub fn template_reads_reasoning_effort(tpl: &str) -> bool {
+    tpl.contains("reasoning_effort")
+}
+
 /// Close a template's generation-time `<think>` marker for direct answers.
 ///
 /// GLM-5's template ends in `<|assistant|><think>` and controls the reasoning
@@ -1907,6 +1915,45 @@ mod tests {
             .render_chat_json_with_reasoning_effort(&messages, None, None, None)
             .expect("render native default");
         assert_eq!(native_default, "<default-effort>||prior chain");
+    }
+
+    /// Minico-M1-1105's five-step dial, its resolution block verbatim: the
+    /// lax `default`, case folding, aliases, the unknown-value fallback and
+    /// `enable_thinking=false` as the hard off switch must behave in
+    /// minijinja as they do in Transformers.
+    #[test]
+    fn minico_effort_dial_resolves_like_transformers() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(
+            r#"{%- set effort = (reasoning_effort | default("medium", true) | string | lower | trim) -%}
+{%- set effort_aliases = {"none": "off", "xhigh": "max", "med": "medium"} -%}
+{%- if effort in effort_aliases -%}
+    {%- set effort = effort_aliases[effort] -%}
+{%- endif -%}
+{%- if effort not in ["off", "low", "medium", "high", "max"] -%}
+    {%- set effort = "medium" -%}
+{%- endif -%}
+{%- if enable_thinking is defined and enable_thinking is not none and not enable_thinking -%}
+    {%- set effort = "off" -%}
+{%- endif -%}
+{{- "Reasoning effort: " + effort -}}
+{%- if effort == "off" -%}{{- "<think>\n\n</think>" -}}{%- endif -%}"#
+                .to_string(),
+        );
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let render = |thinking: Option<bool>, effort: Option<&str>| {
+            tok.render_chat_json_with_reasoning_effort(&msgs, None, thinking, effort)
+                .expect("render the effort dial")
+        };
+        assert_eq!(render(None, None), "Reasoning effort: medium");
+        assert_eq!(render(Some(true), None), "Reasoning effort: medium");
+        assert_eq!(render(None, Some("high")), "Reasoning effort: high");
+        assert_eq!(render(None, Some(" XHigh ")), "Reasoning effort: max");
+        assert_eq!(render(None, Some("bogus")), "Reasoning effort: medium");
+        assert_eq!(render(None, Some("off")), "Reasoning effort: off<think>\n\n</think>");
+        assert_eq!(render(Some(false), None), "Reasoning effort: off<think>\n\n</think>");
+        assert_eq!(render(Some(false), Some("max")), "Reasoning effort: off<think>\n\n</think>");
+        assert!(template_reads_reasoning_effort(tok.chat_template.as_deref().unwrap()));
     }
 
     #[test]
