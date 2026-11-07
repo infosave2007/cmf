@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.63] — 2026-11-07
+
 ### Added
 - CherryPit-1.2-2B (DRUPEs, a MiniCPM5-2B finetune) in CMF: `q8_2f`, a chat-calibrated GPTQ `q4tp` with the attention
   at eight bits, and a Turbo file with exact-row weights fitted for its 42 layers (`scripts/cherrypit/`). Cards
