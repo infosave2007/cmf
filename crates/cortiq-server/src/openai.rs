@@ -891,8 +891,10 @@ struct ChatCompletionsRequest {
     /// so the model answers directly). Absent = the template's default.
     #[serde(default)]
     enable_thinking: Option<bool>,
-    /// DeepSeek-V4.1 accepts an integer budget 1..=100 or low/high/max.
-    /// Keep JSON at the protocol edge so numeric values remain integers.
+    /// DeepSeek-V4.1 accepts an integer budget 1..=100 or low/high/max; a
+    /// chat template that reads `reasoning_effort` (MiniMax M3, Minico-M1)
+    /// gets a string verbatim. Keep JSON at the protocol edge so numeric
+    /// values remain integers.
     #[serde(default)]
     reasoning_effort: Option<serde_json::Value>,
     /// vLLM-style alternative: {"enable_thinking": false} — the explicit
@@ -1097,6 +1099,34 @@ fn minimax_m3_reasoning_effort(
     }
 }
 
+/// A chat template with its own effort dial (Minico-M1: off, low, medium,
+/// high, max) reads the OpenAI `reasoning_effort` field, or
+/// `chat_template_kwargs.reasoning_effort` as llama.cpp clients send it,
+/// verbatim. Other templates never see the field.
+fn template_reasoning_effort(
+    tokenizer: &cortiq_engine::tokenizer::Tokenizer,
+    req: &ChatCompletionsRequest,
+) -> Option<String> {
+    if !tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(cortiq_engine::tokenizer::template_reads_reasoning_effort)
+    {
+        return None;
+    }
+    req.reasoning_effort
+        .as_ref()
+        .or_else(|| {
+            req.chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.get("reasoning_effort"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Encode OpenAI messages with the pinned V4.1 harmony formatter and image
 /// processor. This is public so the CLI/server protocol layers share the same
 /// image-span normalization without duplicating it in the runtime.
@@ -1188,7 +1218,7 @@ async fn chat_completions(
     }
 
     let minimax_m3 = state.runtime.model().arch().arch_name == "minimax_m3_vl";
-    let minimax_m3_effort = if minimax_m3 {
+    let template_effort = if minimax_m3 {
         // Unlike an ordinary text model, M3's wire grammar and adaptive
         // thinking are defined by its bundled Jinja template.  Running its
         // text backbone in generic ChatML is a different protocol, not a
@@ -1206,7 +1236,7 @@ async fn chat_completions(
             Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
         }
     } else {
-        None
+        template_reasoning_effort(&state.tokenizer, &req)
     };
 
     // Resolve task selection into request-local state. Mutating the runtime's
@@ -1666,7 +1696,7 @@ async fn chat_completions(
                         &msgs,
                         Some(tools),
                         template_thinking,
-                        minimax_m3_effort.as_deref(),
+                        template_effort.as_deref(),
                     )
                 {
                     Ok(ids) => ids,
@@ -1690,7 +1720,7 @@ async fn chat_completions(
                         &msgs,
                         None,
                         template_thinking,
-                        minimax_m3_effort.as_deref(),
+                        template_effort.as_deref(),
                     )
                 {
                     Ok(ids) => ids,
@@ -1711,7 +1741,7 @@ async fn chat_completions(
                         &msgs,
                         None,
                         template_thinking,
-                        minimax_m3_effort.as_deref(),
+                        template_effort.as_deref(),
                     ),
             }
         };
@@ -2631,6 +2661,28 @@ mod tests {
         assert!(minimax_m3_reasoning_effort(Some(&numeric)).is_err());
         let blank = serde_json::json!("  ");
         assert!(minimax_m3_reasoning_effort(Some(&blank)).is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_only_templates_that_read_it() {
+        let req = |extra: serde_json::Value| -> ChatCompletionsRequest {
+            let mut body = serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let field = req(serde_json::json!({"reasoning_effort": "high"}));
+        let kwargs = req(serde_json::json!({"chat_template_kwargs": {"reasoning_effort": "low"}}));
+        let mut tok = cortiq_engine::tokenizer::Tokenizer::byte_level();
+        tok.chat_template = Some("{{ messages[0].content }}".to_string());
+        assert_eq!(template_reasoning_effort(&tok, &field), None);
+        tok.chat_template = Some("{{ reasoning_effort | default('medium', true) }}".to_string());
+        assert_eq!(template_reasoning_effort(&tok, &field).as_deref(), Some("high"));
+        assert_eq!(template_reasoning_effort(&tok, &kwargs).as_deref(), Some("low"));
+        assert_eq!(template_reasoning_effort(&tok, &req(serde_json::json!({}))), None);
     }
 
     #[test]

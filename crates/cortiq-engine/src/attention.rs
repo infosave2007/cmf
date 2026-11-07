@@ -1389,9 +1389,11 @@ pub fn qwen_attention_core(
     // row above is retained in the trace/KV, then conversion happens before
     // the next row can append. A malformed transition is terminal: clear
     // the layer and publish the error for Pipeline's existing failure path.
-    if cache
-        .o1_pending_boundary()
-        .is_some_and(|target| cache.seq_len >= target)
+    // A layer awaiting its exact rows is sealed by the pipeline instead.
+    if !cache.o1_await_keep
+        && cache
+            .o1_pending_boundary()
+            .is_some_and(|target| cache.seq_len >= target)
     {
         if let Err(err) = cache.o1_seal_checked(nh) {
             cache.o1_abort(err);
@@ -2225,10 +2227,12 @@ pub fn qwen_attention_batch(
     }
     // A chunk that ends exactly on the deferred barrier holds only exact
     // rows: it ran batched, and the layer converts here, as the row path
-    // does after its boundary row.
-    if cache
-        .o1_pending_boundary()
-        .is_some_and(|target| cache.seq_len >= target)
+    // does after its boundary row. A layer awaiting its exact rows is sealed
+    // by the pipeline once every far-field layer holds them.
+    if !cache.o1_await_keep
+        && cache
+            .o1_pending_boundary()
+            .is_some_and(|target| cache.seq_len >= target)
     {
         if let Err(err) = cache.o1_seal_checked(nh) {
             cache.o1_abort(err);
