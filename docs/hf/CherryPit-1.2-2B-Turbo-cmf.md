@@ -45,8 +45,7 @@ Short on RAM as well, with a fast SSD:
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-cortiq 0.8.61 or later runs the file; the decode speeds below need the release after 0.8.62, which decodes
-past the seal at about 67 tok/s. Prebuilt binaries are on the
+Use cortiq 0.8.63 or later; prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). `CMF_MAX_SEQ` lifts the default cap of
 32 768 tokens to the model's 131 072.
 
@@ -152,9 +151,8 @@ hf download infosave/CherryPit-1.2-2B-Turbo-cmf CherryPit-1.2-2B-turbo.cmf --loc
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-Если не хватает и оперативной памяти, но есть быстрый SSD, добавьте `--o1-spill /mnt/ssd/cortiq`. Файл
-запускает cortiq 0.8.61 или новее; скорость декода из таблицы — с релиза после 0.8.62 (в нём за печатью
-около 67 ток/с). `CMF_MAX_SEQ` поднимает предел по умолчанию в 32 768 токенов до 131 072 у модели.
+Если не хватает и оперативной памяти, но есть быстрый SSD, добавьте `--o1-spill /mnt/ssd/cortiq`. Нужен
+cortiq 0.8.63 или новее. `CMF_MAX_SEQ` поднимает предел по умолчанию в 32 768 токенов до 131 072 у модели.
 
 ### Что делает файл
 
@@ -234,8 +232,7 @@ hf download infosave/CherryPit-1.2-2B-Turbo-cmf CherryPit-1.2-2B-turbo.cmf --loc
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-内存也不足但有高速 SSD 时，加上 `--o1-spill /mnt/ssd/cortiq`。cortiq 0.8.61 或更新版本即可运行；
-表中的解码速度需要 0.8.62 之后的版本（0.8.62 在封存点之后约 67 tok/s）。`CMF_MAX_SEQ` 把默认的 32 768 token
+内存也不足但有高速 SSD 时，加上 `--o1-spill /mnt/ssd/cortiq`。需要 cortiq 0.8.63 或更新版本。`CMF_MAX_SEQ` 把默认的 32 768 token
 上限提高到模型的 131 072。
 
 ### 文件做了什么
