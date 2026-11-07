@@ -324,6 +324,22 @@ fn close_direct_think(rendered: String, enable_thinking: Option<bool>) -> String
         }
         return out;
     }
+    // ChatML templates that take no `enable_thinking` (Ripple) end in
+    // `<|im_start|>assistant\n`; the empty think block goes after that line.
+    if let Some(pos) = rendered.rfind("<|im_start|>assistant") {
+        let mut insert_at = pos + "<|im_start|>assistant".len();
+        if let Some(idx) = rendered[insert_at..].find('\n') {
+            insert_at += idx + 1;
+        }
+        let mut out = String::with_capacity(rendered.len() + 24);
+        out.push_str(&rendered[..insert_at]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("<think>\n\n</think>\n\n");
+        out.push_str(&rendered[insert_at..]);
+        return out;
+    }
     // Templates without the angle-bracket assistant marker use a
     // line-oriented role prefix.  Keep that marker intact and append the
     // empty think block after its newline.
@@ -1687,6 +1703,19 @@ impl SpMerges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_answer_closes_think_after_a_chatml_assistant_line() {
+        let r = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n".to_string();
+        assert_eq!(
+            close_direct_think(r.clone(), Some(false)),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(close_direct_think(r.clone(), None), r);
+        // A template that closed the block itself is left alone.
+        let done = format!("{r}<think>\n\n</think>\n\n");
+        assert_eq!(close_direct_think(done.clone(), Some(false)), done);
+    }
 
     #[test]
     fn byte_unicode_bijection() {
