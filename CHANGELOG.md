@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Qwen3.8-Flash-Next (`qwen4_exp`) on wgpu: an O(1) far field for the 12 attention layers, after the Dory pattern
+  (`crates/cortiq-engine/src/qwen4_o1.rs`). A sequence runs exact up to the seal; there the layers' keys, values
+  and a strided trace of their queries come to the host, `nystrom` builds a sink + window + landmark state per KV
+  head, the states go up as the layers' O(1) states and the exact caches leave the card. Later frames pack their
+  rows dense (`q4t_o1_pack`), run the engine's `o1_batch` kernels in place of the indexer and the sparse attention
+  and pass through the sigmoid output gate (`q4t_o1_gate`); a verify window attends without committing and the host
+  commits the accepted rows. The GDN layers and the experts do not change. Switched on by the far-turbo header
+  (`cortiq far-turbo`, whose `--exact-weights` are now optional: without them no row is kept exact) or by
+  `CMF_QWEN_O1=m,w,sink,seal`; `CMF_QWEN_O1=off` keeps a turbo file exact. RTX 5090, the q2tp-v2 file, a
+  6 045-token prompt sealed at 4 096 rows: first token 113 → 105 s, decode 26.5 → 29.3 tok/s with the MTP head;
+  WikiText-2 over 8 192 tokens: ppl 2.241 exact, {{WIKI_SEALED}} sealed at 4 096. {{BENCH_LINE}}
+  [Qwen3.8-Flash-Next Turbo](https://huggingface.co/infosave/Qwen3.8-Flash-Next-turbo-cmf) is the file.
+- Hot neurons in the routed experts of a MoE model. `cortiq hot-probe --experts MODEL TEXT STAT` records Σ(w·act)²
+  per layer, expert and neuron on the host path; `cortiq hot-bake --experts COLD HF_SRC STAT OUT --frac f` zeroes
+  the busiest neurons' gate and up rows in place in the q2tp/q4tp experts (rung 0, nibble 8) and writes one q8_2f
+  tube per expert (`mlp.experts.{e}.{gate,up,down}_proj.tube1.weight`) from the bf16 checkpoint, read one layer at
+  a time from a directory or the Hub; the shared expert, the experts' layout and the expert cache do not change.
+  The host MoE paths add the tubes after the triple; the device keeps them resident in three banks per layer and two
+  token-wide kernels (`q4t_tube_gu`, `q4t_tube_dn`) add every winner's tube to the frame's MoE output.
+  Flash-Next q2tp-v2, 5 % of every expert (32 of 640 neurons, {{PROBE_SHARE}} % of the energy over
+  {{PROBE_TOKENS}} tokens of code and text): code ppl 4.438 → {{HOT_PPL}} (q4tp 4.111), {{HOT_SIZE_LINE}}
+
+### Fixed
+- `--no-think` closes the think block after a ChatML `<|im_start|>assistant` line as well (Ripple-65B's template
+  takes no `enable_thinking`): the model answered after 14 000 tokens of thinking in 0.8.60.
+
 ## [0.8.61] — 2026-11-07
 
 ### Fixed
