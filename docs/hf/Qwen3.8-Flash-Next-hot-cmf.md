@@ -42,8 +42,24 @@ CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp-hot.cmf --p
 Use cortiq 0.8.62 or later ([prebuilt binaries](https://github.com/infosave2007/cmf/releases)): an older cortiq
 does not read the 8-bit tubes and runs the file with their rows at zero. `--no-think` asks for a direct answer;
 without it the model reasons first, so raise `--max-tokens`. The `.mtp.cmf` file next to the model turns on draft
-tokens. Each `cortiq run` loads the model again; for chat keep it loaded with `cortiq serve` (an OpenAI-compatible
-server, as on the standard page).
+tokens. Each `cortiq run` loads the model again; for chat keep it loaded with [`cortiq serve`](#openai-compatible-server).
+
+## OpenAI-compatible server
+
+```bash
+CMF_QWEN_PROFILE=flashnext.profile cortiq serve qwen38-flash-next-q2tp-hot.cmf --host 127.0.0.1 --port 8080
+
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "qwen38-flash-next-q2tp-hot", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "Write a Rust function that reverses a string, with a test."}]}'
+```
+
+The model loads once and stays in memory; the `.mtp.cmf` file next to it drafts tokens under `temperature: 0`.
+Endpoints: `/v1/chat/completions` (streaming, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
+`/healthz`, a web dashboard on `/`. Without `--host` the server listens on all interfaces (`0.0.0.0`).
+`CMF_GPU_VRAM_MB` is the card's budget for the expert cache and the 8-bit banks (29000 on the 32 GB card measured
+here); when the banks do not fit the budget the file runs on the host path. One stream was measured; concurrent
+requests share the card.
 
 ## Files
 
@@ -156,8 +172,24 @@ CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp-hot.cmf --p
 Нужен cortiq 0.8.62 или новее ([готовые сборки](https://github.com/infosave2007/cmf/releases)): более старый cortiq
 не читает 8-битные трубки и запускает файл с их обнулёнными строками. `--no-think` просит прямой ответ; без него
 модель сначала рассуждает — поднимите `--max-tokens`. Файл `.mtp.cmf` рядом с моделью включает черновые токены.
-Каждый `cortiq run` загружает модель заново; для чата держите её загруженной в `cortiq serve` (OpenAI-совместимый
-сервер, как на стандартной странице).
+Каждый `cortiq run` загружает модель заново; для чата держите её загруженной в [`cortiq serve`](#openai-совместимый-сервер).
+
+### OpenAI-совместимый сервер
+
+```bash
+CMF_QWEN_PROFILE=flashnext.profile cortiq serve qwen38-flash-next-q2tp-hot.cmf --host 127.0.0.1 --port 8080
+
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "qwen38-flash-next-q2tp-hot", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "Напиши функцию на Rust, которая переворачивает строку, с тестом."}]}'
+```
+
+Модель загружается один раз и остаётся в памяти; файл `.mtp.cmf` рядом с ней даёт черновые токены при
+`temperature: 0`. Эндпоинты: `/v1/chat/completions` (потоковая выдача, `tools`, `enable_thinking`),
+`/v1/completions`, `/v1/models`, `/healthz`, веб-панель на `/`. Без `--host` сервер слушает все интерфейсы
+(`0.0.0.0`). `CMF_GPU_VRAM_MB` — бюджет карты под кэш экспертов и 8-битные банки (29000 на измеренной здесь карте
+32 ГБ); если банки в бюджет не помещаются, файл идёт по хост-пути. Измерен один поток; параллельные запросы делят
+карту.
 
 ### Файлы
 
@@ -266,7 +298,22 @@ CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp-hot.cmf --p
 
 需要 cortiq 0.8.62 或更新版本（[预编译二进制](https://github.com/infosave2007/cmf/releases)）：更旧的 cortiq 不读取 8 位管，
 会以置零的行运行该文件。`--no-think` 要求直接回答；不加它模型会先推理，请提高 `--max-tokens`。放在模型旁边的 `.mtp.cmf`
-文件开启草稿 token。每次 `cortiq run` 都会重新加载模型；聊天请用 `cortiq serve` 常驻（OpenAI 兼容服务器，用法见标准页面）。
+文件开启草稿 token。每次 `cortiq run` 都会重新加载模型；聊天请用 [`cortiq serve`](#openai-兼容服务器) 常驻。
+
+### OpenAI 兼容服务器
+
+```bash
+CMF_QWEN_PROFILE=flashnext.profile cortiq serve qwen38-flash-next-q2tp-hot.cmf --host 127.0.0.1 --port 8080
+
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "qwen38-flash-next-q2tp-hot", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "写一个反转字符串的 Rust 函数，并附带测试。"}]}'
+```
+
+模型只加载一次并常驻内存；放在旁边的 `.mtp.cmf` 文件在 `temperature: 0` 下提供草稿 token。端点：`/v1/chat/completions`
+（流式、`tools`、`enable_thinking`）、`/v1/completions`、`/v1/models`、`/healthz`，以及 `/` 上的网页面板。不加 `--host`
+时服务器监听所有网卡（`0.0.0.0`）。`CMF_GPU_VRAM_MB` 是显卡用于专家缓存和 8 位库的预算（本文在 32 GB 显卡上为 29000）；
+当库放不进预算时，文件走主机路径。只测过单路请求；并发请求共用同一张显卡。
 
 ### 文件
 
