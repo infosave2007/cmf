@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`cortiq far-turbo`, whose `--exact-weights` are now optional: without them no row is kept exact) or by
   `CMF_QWEN_O1=m,w,sink,seal`; `CMF_QWEN_O1=off` keeps a turbo file exact. RTX 5090, the q2tp-v2 file, a
   6 045-token prompt sealed at 4 096 rows: first token 113 → 105 s, decode 26.5 → 29.3 tok/s with the MTP head;
-  WikiText-2 over 8 192 tokens: ppl 2.241 exact, {{WIKI_SEALED}} sealed at 4 096. {{BENCH_LINE}}
-  [Qwen3.8-Flash-Next Turbo](https://huggingface.co/infosave/Qwen3.8-Flash-Next-turbo-cmf) is the file.
+  WikiText-2 over 8 192 tokens: ppl 2.241 exact, 2.323 sealed at 4 096. On this model the far field is not a speed
+  device: its attention is 12 layers × 2 KV heads × 256, exact attention over 16 000 rows is cheap, and
+  `cortiq bench --core` exact against sealed at 8 192 reads 59.6 / 54.6 / 37.7 against 62.3 / 44.6 / 25.8 tok/s of
+  decode at 1 000 / 4 000 / 16 000 rows, the first token at 16 000 94 against 127 s. The published Flash-Next files
+  stay exact; the far field is there for the attention state that stops growing.
 - Hot neurons in the routed experts of a MoE model. `cortiq hot-probe --experts MODEL TEXT STAT` records Σ(w·act)²
   per layer, expert and neuron on the host path; `cortiq hot-bake --experts COLD HF_SRC STAT OUT --frac f` zeroes
   the busiest neurons' gate and up rows in place in the q2tp/q4tp experts (rung 0, nibble 8) and writes one q8_2f
@@ -27,10 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a time from a directory or the Hub; the shared expert, the experts' layout and the expert cache do not change.
   The host MoE paths add the tubes after the triple; the device keeps them resident in three banks per layer and two
   token-wide kernels (`q4t_tube_gu`, `q4t_tube_dn`) add every winner's tube to the frame's MoE output.
-  Flash-Next q2tp-v2, 5 % of every expert (32 of 640 neurons, {{PROBE_SHARE}} % of the energy over
-  {{PROBE_TOKENS}} tokens of code and text): code ppl 4.438 → {{HOT_PPL}} (q4tp 4.111), {{HOT_SIZE_LINE}}
+  `--pick top|err|random` ranks by the statistic, by the statistic times the row's two-bit error, or at random
+  (the control); the tube's down columns are the cold file's own (GPTQ-compensated) unless `--bf16-down`.
+  Measured on Flash-Next q2tp-v2 (GPTQ-calibrated): the busiest 5 % of every expert (32 of 640 neurons, 29–31 %
+  of the energy over 8 192 tokens of code and text) move the code ppl only 4.438 → 4.425 for +6.7 GB — on a
+  Hessian-calibrated two-bit file the hot rows are already the best-rendered ones.
+- The grain the model routes at, whole at eight bits. `hot-bake --shared-q8` writes the shared expert as one q8_2f
+  tube (`mlp.shared_expert.{gate,up,down}_proj.tube1.weight`) beside its own triple, whose gate and up rows go to
+  zero, so the device arena keeps the triple's shape in its pinned slot and runs the tube with the route's σ
+  (steps 722/723); `--whole-experts N` does the same for the N busiest experts of every layer (ranked by their
+  summed statistic; `--pick random` is the control), the other experts untouched — the device packs a layer's
+  tubes and a slot table sends the kernels to the right entry; the host paths add every tube after the triple.
+  Flash-Next q2tp-v2: the shared expert alone 4.438 → 4.241 (+0.3 GB); with the 28 busiest of 512 experts a layer
+  (43 % of the layers' Σ(w·act)²) 4.167 at 83.81 GB (+9 %), 83 % of the way to the 97 GB q4tp file (4.111); the 28
+  experts alone 4.327, 28 random experts 4.388; WikiText-2 12 × 512: 6.062 → 5.782. The tube banks stay resident
+  and are refused when the VRAM budget cannot hold them with 2 GB to spare; on the 32 GB card they come out of the
+  expert cache (23.4 → 17.1 GB), and the hot file decodes at 27.8 / 29.9 tok/s against the 2-bit file's 59.6 / 54.6
+  at 1 000 / 4 000 rows. [Qwen3.8-Flash-Next hot](https://huggingface.co/infosave/Qwen3.8-Flash-Next-hot-cmf) is
+  the file; an older cortiq runs it without the tubes.
 
 ### Fixed
+- The per-op GPU MoE block (`moe_ffn_gpu`, the path a model takes when its device graph is off) dropped the experts'
+  tubes (`hot-bake --experts`) silently; it adds them after the block now, as the CPU paths do.
 - `--no-think` closes the think block after a ChatML `<|im_start|>assistant` line as well (Ripple-65B's template
   takes no `enable_thinking`): the model answered after 14 000 tokens of thinking in 0.8.60.
 

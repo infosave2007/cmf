@@ -79,6 +79,7 @@ cannot hold and the model stays on the host path).
 | shared expert as a q8 tube | **4.241** | 23.824 / 23.758 | 77.17 GB (+225 MB resident) |
 | 28 busiest experts a layer whole + shared | **4.167** | | 83.81 GB (+6.5 GB resident; the expert pool 23.4 → 17.1 GB on the 32 GB card) |
 | 28 random experts a layer whole (control, 5.7 % of the statistic) | 4.388 | | 83.57 GB |
+| 28 busiest experts a layer whole, no shared tube | 4.327 | | 83.57 GB |
 
 The whole-expert grain pays: the 5 % neuron tubes bought 0.013 of ppl for 6.7 GB, the 28 whole experts 0.074 on top
 of the shared tube for the same bytes. Shared + 28 experts closes 83 % of the gap to the 97 GB q4tp file (4.111) at
@@ -93,3 +94,38 @@ step in `selected_tokens`, a check-mode host-cache bug independent of the tubes;
 Two WGSL traps on the way: `shared` is a reserved word even as a struct field (the module was rejected and the model
 fell to the host path — `cargo test -p cortiq-engine --features gpu --lib qwen4_shaders_validate` catches it without
 a card), and the tube banks were allocated past the VRAM budget.
+
+## Final pass (fnx/final2.sh, final3.sh)
+
+Hot file `qwen38-flash-next-q2tp-hot-turbo.cmf` (83 805 883 496 B, sha256 eabe117c…): code ppl 1536 4.167, WikiText-2
+12 × 512 5.782 (turbo 6.062). Device/host parity on the prompt row: turbo cos 0.9962, hot 0.9938. Greedy `--no-think`
+generation of the two files on "a Rust function that reverses a string, with a test": both a correct function and a
+test module (the hot file's test checks "hello" → "olleh", the turbo file's the empty string). cortiq 0.8.60 on the hot
+file: ppl 200.7 over 256 tokens — an engine that does not read the tubes sees zeroed rows, so the page stays private
+until the release that does.
+
+`cortiq bench --core --ctx N --tokens 60`, turbo file, `CMF_QWEN_O1=off` (exact) against the header's seal at 8 192:
+
+| rows | first token, s exact / sealed | decode, tok/s exact / sealed | peak MiB exact / sealed |
+|---:|---:|---:|---:|
+| 1 000 | 3.4 / 3.7 | 59.6 / 62.3 | 30 070 / 30 239 |
+| 4 000 | 19.8 / 21.9 | 54.6 / 44.6 | 29 902 / 30 935 |
+| 16 000 | 93.7 / 126.7 | 37.7 / 25.8 | 30 586 / 30 905 |
+
+Below the seal the two runs are the same code path and differ within the stand's noise (the host is shared, load
+average 65 on 120 cores). At 16 000 the sealed run is slower on both axes, as the 07:00 pair already hinted (exact
+41.3 / 24.5, sealed 40.0 / 23.5): Flash-Next's attention is 12 layers × 2 KV heads × 256, exact attention over 16 000
+rows is cheap, and the far field's extra dispatches a layer cost more than the rows they skip. On this model the far
+field bounds the attention state (the KV grows no further after the seal) and costs +3.7 % wiki ppl; it is not a speed
+device, and `CMF_QWEN_O1=off` is the setting while the prompt fits. The first final2 run was cut off in the 32 000 exact
+bench (no OOM: memory.events oom_kill 0; a stray kill); final3.sh reran hot 1k/4k; the 32k pair was stopped when the owner closed the pod work (11:20).
+
+## The hot file alone (11:20)
+
+The owner's verdict: the far field buys no speed here, so the page is not "turbo" — renamed to
+`infosave/Qwen3.8-Flash-Next-hot-cmf` (private), and the hot file is rebaked over the plain q2tp-v2 file (final4.sh),
+so its default is exact attention; the far field stays an option (`CMF_QWEN_O1=32,1800,4,8192`). The turbo files
+leave the page. Hot file on the 32 GB card, `bench --core`: 1 000 rows first token 9.0 s, decode 27.8 tok/s;
+4 000 rows 43.4 s, 29.9 tok/s — against the 2-bit file's 3.4 s / 59.6 and 19.8 s / 54.6: the resident banks take
+6.5 GB from the expert cache (23.4 → 17.1 GB) and every layer runs two more dispatches, so the file is about half the
+speed on a card this size.
