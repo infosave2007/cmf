@@ -410,15 +410,24 @@ pub(crate) fn zero_tiled_rows(dtype: TensorDtype, bytes: &mut [u8], rows_n: usiz
 }
 
 /// `cortiq hot-bake --experts`.
-pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: &str, frac: f64, readout: bool, scratch: Option<&str>) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: &str, frac: f64, pick_mode: &str, readout: bool, seed: u64, bf16_down: bool, shared_q8: bool, whole: usize, scratch: Option<&str>) -> anyhow::Result<()> {
     ensure!(!crate::tube::paths_collide(Path::new(output), Path::new(cold_path)), "hot-bake: the output must differ from the input");
+    ensure!(matches!(pick_mode, "top" | "err" | "random"), "--pick must be top, err or random");
     let cold = Arc::new(CmfModel::open_sharded(cold_path)?);
     let hidden = cold.arch().hidden_size;
     let (layers, ne, inter) = expert_layout(&cold)?;
     let (sl, sw, stat) = read_stat(stat_path)?;
     ensure!(sl == cold.arch().num_layers && sw == ne * inter, "{stat_path}: {sl} x {sw}, the model is {} x {ne}·{inter}", cold.arch().num_layers);
-    // The device tube kernels take the neurons four at a time.
-    let h = ((frac * inter as f64 / 4.0).round() as usize * 4).clamp(4, inter - 4);
+    // The device tube kernels take the neurons four at a time; `--frac 0` cuts no tube
+    // (`--shared-q8` alone). `--whole-experts N`: one tube width a layer, so the N experts
+    // go whole (h = inter) and the others get no tube.
+    // `--whole-experts` sets the layer's one tube width itself; `--frac` is then ignored.
+    let frac = if whole > 0 { 0.0 } else { frac };
+    ensure!(whole <= ne, "hot-bake: --whole-experts {whole} of {ne} experts");
+    ensure!(whole == 0 || matches!(pick_mode, "top" | "random"), "hot-bake: --whole-experts takes --pick top or random");
+    let h = if whole > 0 { inter } else if frac <= 0.0 { 0 } else { ((frac * inter as f64 / 4.0).round() as usize * 4).clamp(4, inter - 4) };
+    ensure!(h > 0 || shared_q8, "hot-bake: --frac 0 without --shared-q8 or --whole-experts changes nothing");
     let name = |li: usize, e: usize, part: &str, tube: bool| format!("model.layers.{li}.mlp.experts.{e}.{part}_proj{}.weight", if tube { ".tube1" } else { "" });
     for &li in &layers {
         for part in ["gate", "up"] {
@@ -431,7 +440,7 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
     let scratch_dir = scratch.map(str::to_string).unwrap_or_else(|| format!("{output}.src"));
     let mut source = crate::moegptq::ExpertSource::open(hf, &scratch_dir)?;
     let avg = cold.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cold.tensors.len().max(1);
-    let mut w = CmfStreamWriter::new(output, CmfStreamWriter::head_reserve_for(cold.tensors.len() + 3 * layers.len() * ne, avg + 12))?;
+    let mut w = CmfStreamWriter::new(output, CmfStreamWriter::head_reserve_for(cold.tensors.len() + 3 * layers.len() * (ne + 1), avg + 12))?;
     // `(layer, expert, part)` of a routed expert's gate or up matrix in a cut layer.
     let routed = |n: &str| -> Option<(usize, usize, &str)> {
         let rest = n.strip_prefix("model.layers.")?;
@@ -450,20 +459,140 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
     let t0 = std::time::Instant::now();
     let mut hot: std::collections::HashMap<(usize, usize), Vec<usize>> = std::collections::HashMap::new();
     let (mut covered, mut done) = (0f64, 0usize);
+    let shared = |n: &str| -> Option<(usize, &str)> {
+        let rest = n.strip_prefix("model.layers.")?;
+        let (li, rest) = rest.split_once('.')?;
+        let li: usize = li.parse().ok()?;
+        let part = match rest {
+            "mlp.shared_expert.gate_proj.weight" => "g",
+            "mlp.shared_expert.up_proj.weight" => "u",
+            "mlp.shared_expert.down_proj.weight" => "d",
+            _ => return None,
+        };
+        layers.contains(&li).then_some((li, part))
+    };
+    let mut shared_w: Option<(usize, crate::moegptq::ExpertW)> = None;
+    let mut shared_done = 0usize;
     for t in &cold.tensors {
-        let Some((li, e, part)) = routed(&t.name) else {
+        // `--shared-q8`: the shared expert, which every token runs, whole at eight bits —
+        // as a tube of all its neurons (`mlp.shared_expert.*_proj.tube1.weight`) beside its
+        // own triple, whose gate and up rows go to zero: the device keeps the triple's
+        // shape in its pinned slot and runs the tube like the winners'.
+        if shared_q8 && let Some((li, part)) = shared(&t.name) {
+            ensure!(t.shape.len() == 2, "hot-bake: {} is {:?}", t.name, t.shape);
+            let inter_s = if part == "d" { t.shape[1] } else { t.shape[0] };
+            if shared_w.as_ref().is_none_or(|(l, _)| *l != li) {
+                shared_w = Some((li, source.shared_layer(li, hidden, inter_s)?));
+                shared_done += 1;
+            }
+            let x = &shared_w.as_ref().unwrap().1;
+            let (vals, rows, cols, tube) = match part {
+                "g" => (x.g.clone(), inter_s, hidden, "gate"),
+                "u" => (x.u.clone(), inter_s, hidden, "up"),
+                _ => {
+                    let mut d = x.d.clone();
+                    if !bf16_down {
+                        // The cold file's own down (GPTQ-compensated), as the winners' tubes.
+                        match t.dtype {
+                            TensorDtype::Q4TiledP => cortiq_core::quant::dequant_q4tp(cold.tensor_bytes(&t.name)?, hidden, inter_s, &mut d),
+                            TensorDtype::Q2TiledP => cortiq_core::quant::dequant_q2tp(cold.tensor_bytes(&t.name)?, hidden, inter_s, &mut d),
+                            other => bail!("hot-bake: {} is {other:?}, expected q2tp or q4tp (or --bf16-down)", t.name),
+                        }
+                    }
+                    (d, hidden, inter_s, "down")
+                }
+            };
+            ensure!(t.shape.as_slice() == [rows, cols], "hot-bake: {} is {:?}, the checkpoint's [{rows}, {cols}]", t.name, t.shape);
+            ensure!(cold.tensor(&format!("model.layers.{li}.mlp.shared_expert.{tube}_proj.tube1.weight")).is_none(), "hot-bake: layer {li}'s shared expert already has a tube");
+            let mut bytes = cold.tensor_bytes(&t.name)?.to_vec();
+            if part != "d" {
+                let all: Vec<usize> = (0..inter_s).collect();
+                zero_tiled_rows(t.dtype, &mut bytes, inter_s, hidden, &all).with_context(|| t.name.clone())?;
+            }
+            w.push(&t.name, t.dtype, &t.shape, &bytes)?;
+            w.push(&format!("model.layers.{li}.mlp.shared_expert.{tube}_proj.tube1.weight"), TensorDtype::Q8_2f, &[rows, cols], &cortiq_core::quant::encode_q8_2f(&vals, rows, cols))?;
+            continue;
+        }
+        let Some((li, e, part)) = routed(&t.name).filter(|_| h > 0) else {
             w.push_bounded(&t.name, t.dtype, &t.shape, cold.entry_bytes(t), COPY_CHUNK)?;
             continue;
         };
         if e == 0 && part == "gate" {
             // The layer's first expert tensor: its bf16 experts in, the tubes out.
             let mut tubes = Vec::with_capacity(ne);
+            // `--whole-experts`: the layer's busiest experts by their summed statistic.
+            let chosen: Option<Vec<usize>> = (whole > 0).then(|| {
+                let en: Vec<f64> = (0..ne).map(|e| stat[li * sw + e * inter..li * sw + (e + 1) * inter].iter().map(|&v| v as f64).sum()).collect();
+                let idx = pick(&en, whole, (pick_mode == "random").then_some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(li as u64)));
+                let total: f64 = en.iter().sum();
+                covered += if total > 0.0 { idx.iter().map(|&e| en[e]).sum::<f64>() / total } else { 0.0 };
+                idx
+            });
             source.routed_layer(li, ne, hidden, inter, |e, x| {
+                if let Some(ch) = &chosen {
+                    if ch.binary_search(&e).is_err() {
+                        return Ok(());
+                    }
+                    // The whole expert: every row in the tube, the down from the cold file
+                    // (lossless in q8_2f) or bf16.
+                    let mut d = x.d.clone();
+                    if !bf16_down {
+                        let dn = entry(&cold, &name(li, e, "down", false))?;
+                        ensure!(dn.shape.as_slice() == [hidden, inter], "hot-bake: {} is {:?}", dn.name, dn.shape);
+                        match dn.dtype {
+                            TensorDtype::Q4TiledP => cortiq_core::quant::dequant_q4tp(cold.tensor_bytes(&dn.name)?, hidden, inter, &mut d),
+                            TensorDtype::Q2TiledP => cortiq_core::quant::dequant_q2tp(cold.tensor_bytes(&dn.name)?, hidden, inter, &mut d),
+                            other => bail!("hot-bake: {} is {other:?}, expected q2tp or q4tp (or --bf16-down)", dn.name),
+                        }
+                    }
+                    tubes.push((e, (0..inter).collect(), cortiq_core::quant::encode_q8_2f(&x.g, inter, hidden), cortiq_core::quant::encode_q8_2f(&x.u, inter, hidden), cortiq_core::quant::encode_q8_2f(&d, hidden, inter)));
+                    return Ok(());
+                }
                 let mut score: Vec<f64> = stat[li * sw + e * inter..li * sw + (e + 1) * inter].iter().map(|&v| v as f64).collect();
+                // The tube's down columns: the cold file's own (a GPTQ-calibrated down compensates
+                // each column's error in the later ones, and a column cut from bf16 breaks that
+                // for every token the neuron fires on), or bf16 on request.
+                let dn = entry(&cold, &name(li, e, "down", false))?;
+                let mut dcold = Vec::new();
+                let d_src: &[f32] = if bf16_down {
+                    &x.d
+                } else {
+                    ensure!(dn.shape.as_slice() == [hidden, inter], "hot-bake: {} is {:?}", dn.name, dn.shape);
+                    dcold.resize(hidden * inter, 0.0);
+                    match dn.dtype {
+                        TensorDtype::Q4TiledP => cortiq_core::quant::dequant_q4tp(cold.tensor_bytes(&dn.name)?, hidden, inter, &mut dcold),
+                        TensorDtype::Q2TiledP => cortiq_core::quant::dequant_q2tp(cold.tensor_bytes(&dn.name)?, hidden, inter, &mut dcold),
+                        other => bail!("hot-bake: {} is {other:?}, expected q2tp or q4tp (or --bf16-down)", dn.name),
+                    }
+                    &dcold
+                };
                 let mut col = vec![0f64; inter];
                 for r in 0..hidden {
                     for (c, &v) in col.iter_mut().zip(&x.d[r * inter..(r + 1) * inter]) {
                         *c += (v as f64) * (v as f64);
+                    }
+                }
+                if pick_mode == "err" {
+                    // The statistic times the row's relative quantization error: a neuron that
+                    // fires with a row the two bits render well is not the one to lift.
+                    let mut cg = vec![0f32; inter * hidden];
+                    let mut cu = vec![0f32; inter * hidden];
+                    for (part, buf) in [("gate", &mut cg), ("up", &mut cu)] {
+                        let t = entry(&cold, &name(li, e, part, false))?;
+                        match t.dtype {
+                            TensorDtype::Q2TiledP => cortiq_core::quant::dequant_q2tp(cold.tensor_bytes(&t.name)?, inter, hidden, buf),
+                            TensorDtype::Q4TiledP => cortiq_core::quant::dequant_q4tp(cold.tensor_bytes(&t.name)?, inter, hidden, buf),
+                            other => bail!("hot-bake: {} is {other:?}", t.name),
+                        }
+                    }
+                    for i in 0..inter {
+                        let (mut err, mut nrm) = (0f64, 0f64);
+                        for c in 0..hidden {
+                            let (g, u) = (x.g[i * hidden + c] as f64, x.u[i * hidden + c] as f64);
+                            err += (g - cg[i * hidden + c] as f64).powi(2) + (u - cu[i * hidden + c] as f64).powi(2);
+                            nrm += g * g + u * u;
+                        }
+                        score[i] *= if nrm > 0.0 { err / nrm } else { 0.0 };
                     }
                 }
                 let total: f64 = score.iter().sum();
@@ -474,7 +603,7 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
                         *s = if total > 0.0 { *s * c } else { *c };
                     }
                 }
-                let idx = pick(&score, h, None);
+                let idx = pick(&score, h, (pick_mode == "random").then_some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add((li * ne + e) as u64)));
                 let total: f64 = score.iter().sum();
                 covered += if total > 0.0 { idx.iter().map(|&j| score[j]).sum::<f64>() / total } else { 0.0 };
                 let mut g = Vec::with_capacity(h * hidden);
@@ -485,7 +614,7 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
                 }
                 let mut d = Vec::with_capacity(hidden * h);
                 for r in 0..hidden {
-                    d.extend(idx.iter().map(|&j| x.d[r * inter + j]));
+                    d.extend(idx.iter().map(|&j| d_src[r * inter + j]));
                 }
                 tubes.push((e, idx, cortiq_core::quant::encode_q8_2f(&g, h, hidden), cortiq_core::quant::encode_q8_2f(&u, h, hidden), cortiq_core::quant::encode_q8_2f(&d, hidden, h)));
                 Ok(())
@@ -499,7 +628,15 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
             done += 1;
             eprintln!("hot-bake: {done}/{} layers, {:.0} s", layers.len(), t0.elapsed().as_secs_f64());
         }
-        let idx = hot.get(&(li, e)).with_context(|| format!("{}: expert {e} comes before expert 0 in the file", t.name))?;
+        let idx = match hot.get(&(li, e)) {
+            Some(idx) => idx,
+            // `--whole-experts`: an expert without a tube keeps its triple as it is.
+            None if whole > 0 && done > 0 => {
+                w.push_bounded(&t.name, t.dtype, &t.shape, cold.entry_bytes(t), COPY_CHUNK)?;
+                continue;
+            }
+            None => bail!("{}: expert {e} comes before expert 0 in the file", t.name),
+        };
         let mut bytes = cold.tensor_bytes(&t.name)?.to_vec();
         zero_tiled_rows(t.dtype, &mut bytes, inter, hidden, idx).with_context(|| t.name.clone())?;
         w.push(&t.name, t.dtype, &t.shape, &bytes)?;
@@ -510,8 +647,12 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
         "width": h,
         "of": inter,
         "experts": ne,
+        "whole_experts": whole,
         "layers": layers,
         "readout": readout,
+        "pick": pick_mode,
+        "down": if bf16_down { "bf16" } else { "cold" },
+        "shared": if shared_q8 { "q8_2f tube" } else { "cold" },
         "stat": Path::new(stat_path).file_name().and_then(|s| s.to_str()),
         "codec": "q8_2f",
         "source": hf,
@@ -523,10 +664,14 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
         let _ = std::fs::remove_dir_all(&scratch_dir);
     }
     let gb = |p: &str| std::fs::metadata(p).map(|m| m.len() as f64 / 1e9).unwrap_or(0.0);
+    let what = if whole > 0 {
+        format!("{whole} of {ne} experts a layer whole in q8_2f ({pick_mode}), holding {:.1} % of the layers' statistic on average", covered / layers.len().max(1) as f64 * 100.0)
+    } else {
+        format!("{h} of {inter} neurons an expert in q8_2f ({pick_mode}), holding {:.1} % of the score on average", covered / (layers.len() * ne).max(1) as f64 * 100.0)
+    };
     println!(
-        "hot-bake: {} layers x {ne} experts, {h} of {inter} neurons an expert in q8_2f, holding {:.1} % of the score on average\n  {cold_path} {:.2} GB -> {output} {:.2} GB ({:+.1} %)",
+        "hot-bake: {} layers x {ne} experts, {what}; {shared_done} shared experts whole in a q8_2f tube\n  {cold_path} {:.2} GB -> {output} {:.2} GB ({:+.1} %)",
         layers.len(),
-        covered / (layers.len() * ne).max(1) as f64 * 100.0,
         gb(cold_path),
         gb(output),
         (gb(output) / gb(cold_path) - 1.0) * 100.0

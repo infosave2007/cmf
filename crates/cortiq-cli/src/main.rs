@@ -976,7 +976,8 @@ enum Commands {
         /// Share of a layer's neurons kept at 8 bits
         #[arg(long, default_value_t = 0.05)]
         frac: f64,
-        /// top (by the probe's score) or random (the control)
+        /// top (by the probe's score), random (the control) or, with `--experts`, err
+        /// (the score times the row's relative quantization error)
         #[arg(long, default_value = "top")]
         pick: String,
         /// Score a neuron by the probe's statistic alone, without the energy
@@ -998,6 +999,20 @@ enum Commands {
         /// gated one); STAT from `hot-probe --experts`
         #[arg(long)]
         experts: bool,
+        /// `--experts`: cut the tubes' down columns from the bf16 checkpoint instead of
+        /// the cold file's own down (a GPTQ-calibrated down loses its cross-column
+        /// compensation when a column leaves it)
+        #[arg(long)]
+        bf16_down: bool,
+        /// `--experts`: the shared expert, which every token runs, whole in q8_2f as a
+        /// tube beside its zeroed triple (the device runs it with the route's weight)
+        #[arg(long)]
+        shared_q8: bool,
+        /// `--experts`: instead of `--frac` of every expert's neurons, the N busiest
+        /// experts of every layer (by their summed statistic; `--pick random` for a
+        /// control) whole in q8_2f, each as one tube of all its neurons
+        #[arg(long, default_value_t = 0)]
+        whole_experts: usize,
         /// `--experts` with a Hub source: where its shards are fetched (default
         /// OUTPUT.src, removed at the end)
         #[arg(long)]
@@ -4798,9 +4813,9 @@ async fn main() -> anyhow::Result<()> {
                 hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk)
             }
         }
-        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, scratch } => {
+        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, bf16_down, shared_q8, whole_experts, scratch } => {
             if experts {
-                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, !no_readout, scratch.as_deref())
+                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, bf16_down, shared_q8, whole_experts, scratch.as_deref())
             } else {
                 hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take)
             }

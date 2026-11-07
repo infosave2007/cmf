@@ -1455,6 +1455,22 @@ impl ExpertSource {
     }
 }
 
+impl ExpertSource {
+    /// Layer `li`'s shared expert as f32 (`g`, `u` `[inter_s, hidden]`, `d` `[hidden, inter_s]`).
+    pub(crate) fn shared_layer(&mut self, li: usize, hidden: usize, inter_s: usize) -> anyhow::Result<ExpertW> {
+        let names: Vec<String> = QWEN4_SHARED.iter().map(|p| qwen4_src_name(&self.src, li, p)).collect::<anyhow::Result<_>>()?;
+        let shards = self.src.shards_of(&names)?;
+        for sh in std::mem::take(&mut self.held) {
+            if !shards.contains(&sh) {
+                self.src.release(&sh);
+            }
+        }
+        let layer = self.src.open_layer(&shards)?;
+        self.held = shards;
+        qwen4_expert(&self.src, &layer, li, Part::Shared, 0, hidden, 0, inter_s)
+    }
+}
+
 impl Drop for ExpertSource {
     fn drop(&mut self) {
         for sh in std::mem::take(&mut self.held) {
