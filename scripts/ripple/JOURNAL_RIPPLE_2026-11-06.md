@@ -113,6 +113,49 @@ tokens for a batch that reads the weights once. Both halves are orchestration, n
 be one device graph like the trunk's, and the verify the fused decode kernels for up to eight rows. Shipped as the
 exact sidecar it is, off unless `CMF_DFLASH=1`; the card says so.
 
+### The block on the device (07.11)
+
+`gpu_wgpu/dflash_dev.rs`: the whole DFlash2 block as one submission — per layer rms → q8 kernel projection →
+grouped conv → q k v (the eight-row int8 matvec, `q4tp_matvec4_bk8h`, in chunks of eight rows) → q/k norm and
+RoPE → attention over the context rows the drafter keeps on the card (`push_rows` as rows settle, `reserve` grows
+the per-layer K/V) → o → conv + residual → rms → projection → conv → gate, up → SiLU → down → conv + residual;
+then the final norm, the selector's hidden projection and the head over the draft rows only, logits and the
+selector input read back together. `CMF_DFLASH_DEV=0` keeps the host block; `CMF_DFLASH_DEV_CHECK=1` runs both
+and prints the logits' Δ and both drafts (the drafts agree in every round seen; the logits differ by rms 0.17–0.45
+of a max of 110–170, the int8 activations' share about half of that — the exact tile GEMM leaves 0.17).
+
+What it cost, by stage (`CMF_GPU_TS=1 CMF_DFLASH_DEV_TS=1`, 16 rows, five layers, the code prompt): 11.4 ms —
+gate-up + SiLU 4.25, down 1.59, attention 1.31, q k v 1.21, the two kernel projections 1.39, o 0.64, head 0.91.
+The int8 matvec is activation-load bound, so its time grows with the rows: 16 rows read every weight twice and
+cost 2.9× five rows. The cooperative f16 GEMM (`CMF_DFLASH_DEV_MM=coop`, 32.3 ms) and the exact 64×64 tile GEMM
+(`r`, 25.3 ms) both lose to it at 16 rows — the same lesson as `CMF_VERIFY_COOP` on the 27B.
+
+Two cuts: the attention kernel's indexed register arrays (`acc[h]`, `o[h]`) went to local memory; a lane per
+(key, head) with the head fastest, the softmax written back in place and one head at a time for the values, plus
+two head slices per (kv head, row) so the dispatch has 256 workgroups — 1.31 → 0.61 ms. And the block runs its
+first eight rows only (`CMF_DFLASH_DEV_ROWS`, 16 restores the trained block): the drafts and the rounds were the
+same to the token on code (56 of 80 kept either way) at 14.4 → 8.4 ms. The device build moved to the loader
+(the first round paid 480 ms for kernels and 2.3 GB of weights), and the sequence's first round, which also reads
+the prompt into the drafter's context on the host, is no longer a sample of the pay-off monitor — its 700 ms had
+sat in the EWMA and sent the drafter to rest on code.
+
+A round of four drafts now: draft 14 ms (context 5, block + head 8, selector 1) + verify 70 = 85 ms for 3.9 tokens
+on code. The verify is the wall: 786 µs a layer for five rows against 400 for a plain token and a 208 µs floor —
+`CMF_BATCH_TS=1` splits it into q k v 154 (three int8 dispatches of 640 / 128 / 128 workgroups plus three
+quantizations of the same x), attention 130, o 43, gate-up 297 (707 GB/s), down 108 (972 GB/s), the two norms 54.
+Dispatches with read-write outputs never overlap under wgpu's barriers, so the cure is fusion: one dispatch for q,
+k and v, the norm folded into the int8 quantizer, gate + up + SiLU in one — the batch twins of the decode graph's
+fused kernels. Not done here.
+
+| RTX PRO 6000, 160 tokens | plain | auto | k4 | k7 |
+|---|---:|---:|---:|---:|
+| code, tok/s | 30.2 | 43.1 | 46.6 | 36.4 |
+| prose, tok/s | 30.3 | 28.2 | 24.6 | 16.1 |
+
+The text is the plain run's in every run. `auto` picks seven drafts on code most rounds (5.7 tokens a round at
+123 ms) and rests on prose. Code pays 1.4–1.5×; prose costs 7 % under `auto` — the monitor's first rounds.
+
+
 ## Turbo
 
 As on the 27B page: 32 landmarks per head, a window of 1800 exact rows, 4 sinks, 248 chosen exact rows, on for

@@ -120,7 +120,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 cortiq run ripple-65b-q4tp.cmf --prompt-file report.txt --greedy
 ```
 
-旁边附有精确的 DFlash 2 草稿器(`CMF_DFLASH=1`);它的轮次目前还不划算。见[模型卡](docs/hf/Ripple-65B-Preview-cmf.md)。
+旁边附有 DFlash 2 草稿器(`CMF_DFLASH=1`),其草稿块作为一次显卡提交运行:在 RTX PRO 6000 上代码 30.2 → 46.6 tok/s,散文大致持平。见[模型卡](docs/hf/Ripple-65B-Preview-cmf.md)。
 
 ## Qwen3.8-27B Turbo:Mac 上和对话中的草稿(0.8.59)
 

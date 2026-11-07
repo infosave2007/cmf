@@ -17,9 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the K and V projections at eight bits in a two-bit file. [The three files](https://huggingface.co/infosave/Ripple-65B-Preview-cmf)
   on an NVIDIA A40 (46 GB), q4tp turbo, 4 000 to 64 000 tokens: 12.0 to 11.8 tok/s at 35.3 to 36.6 GB; perplexity
   against the BF16 checkpoint's 6.940: q8_2f 6.974, q4tp 7.089, q2tp 7.432.
-- A DFlash 2 sidecar for it (`cortiq convert --model DIR --output MODEL.cmf --dflash-sidecar --quant q4tp`), exact:
-  the ids with `CMF_DFLASH=1` equal the plain run's. Its rounds do not pay yet on any card (160 ms a round against a
-  32 ms token on an RTX PRO 6000: the block runs from the host, a matrix a submission), so it stays off by default.
+- A DFlash 2 sidecar for it (`cortiq convert --model DIR --output MODEL.cmf --dflash-sidecar --quant q4tp`), and the
+  drafter's block as one device submission on wgpu (`gpu_wgpu/dflash_dev.rs`: norms, kernel projections, grouped
+  convolutions, the int8 projections, a block attention over the context rows kept on the card, the head over the
+  draft rows). A round of four drafts costs 85 ms against 32 for a plain token on an RTX PRO 6000 (the block 8 ms,
+  the drafter's context 5, the verify of five rows 70; the host block took 87). Ripple-65B q4tp, 400 tokens of code:
+  30.2 → 46.6 tok/s with `CMF_DFLASH=1` (84 % of the drafts kept); prose keeps a third and the pay-off monitor rests,
+  30.5 → 28.8. The block runs its first eight rows (`CMF_DFLASH_DEV_ROWS=16` for the trained block: the same drafts
+  at twice the price); `CMF_DFLASH_DEV=0` keeps the host block, `CMF_DFLASH_DEV_CHECK=1` runs both and compares,
+  `CMF_DFLASH_DEV_TS=1` (with `CMF_GPU_TS=1`) prints the block's stages, `CMF_DFLASH_DEV_MM=coop|r` the GEMMs that
+  measured slower. The pay-off monitor no longer samples a sequence's first round (it reads the prompt into the
+  drafter), weighs a round at a tenth, and picks at most five drafts on its own (the verify of eight rows costs 108 ms
+  against 70 for five). The text was the plain run's in every run but one: the int8 verify resolved a near-tie the
+  other way at token 252 of a 384-token prose answer under a pinned depth of four; `CMF_VERIFY_I8=0` keeps the stream
+  bit-exact at 29 tok/s on code. Off unless `CMF_DFLASH=1`.
 - wgpu, q8_2f: a prompt chunk of 4 096 rows or more goes through the cooperative-matrix GEMM with an eight-bit tile
   loader (`q82_mm_coop_s`), f16 operands and f32 sums, the activation scale from the device. Ripple-65B q8_2f on an
   RTX PRO 6000, a 4 000-token prompt: 43 → 156 tok/s, perplexity 6.973 → 6.974. `CMF_Q82_COOP=0` keeps the scalar GEMM.

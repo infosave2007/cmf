@@ -1695,6 +1695,12 @@ struct SoloSpec {
     rounds: u32,
     /// The step in flight: its start, and the tokens it lands (0: a plain one).
     last: Option<(std::time::Instant, usize)>,
+    /// The sequence's first round is still to come: it pays the drafter's
+    /// read of the prompt (and, on a device block, the kernels' warm-up),
+    /// so like the first plain token it is not a sample. Before this the
+    /// 700 ms of that round sat in the EWMA for a dozen rounds and sent a
+    /// drafter that was winning 40 against 30 tok/s on code to rest.
+    first: bool,
 }
 
 /// The deepest round of a trunk without a draft block (the tip and seven
@@ -1704,6 +1710,12 @@ struct SoloSpec {
 /// stretch that lost.
 #[cfg(feature = "gpu")]
 const SOLO_K_MOST: usize = 7;
+/// The deepest round the pay-off monitor picks on its own. The verify's
+/// int8 batch kernels grow with the rows (eight rows 108 ms, five 70 on
+/// Ripple-65B / RTX PRO 6000), so seven drafts at 80 % kept gave 36 tok/s
+/// where four gave 47; `CMF_GRAPH_SPEC_K` still pins any depth to 7.
+#[cfg(feature = "gpu")]
+const SOLO_K_AUTO: usize = 5;
 #[cfg(feature = "gpu")]
 const SOLO_TRIAL: u32 = 6;
 #[cfg(feature = "gpu")]
@@ -6422,7 +6434,8 @@ impl Pipeline {
         let solo_pin: Option<usize> =
             std::env::var("CMF_GRAPH_SPEC_K").ok().and_then(|v| v.parse().ok()).filter(|k| (1..=SOLO_K_MOST).contains(k));
         #[cfg(feature = "gpu")]
-        let mut solo = SoloSpec { k: solo_pin.unwrap_or(6), rest: 3, back: SOLO_REST, plain_ms: 0.0, plain_n: 0, round_ms: 0.0, rounds: 0, last: None };
+        let mut solo =
+            SoloSpec { k: solo_pin.unwrap_or(4), rest: 3, back: SOLO_REST, plain_ms: 0.0, plain_n: 0, round_ms: 0.0, rounds: 0, last: None, first: true };
         // The host fused pair is an optimization, not a verifier. On real
         // q4tp Qwen3.5 a near-tied row produced a different greedy argmax
         // from two serial target forwards. That makes a seemingly accepted
@@ -7853,9 +7866,18 @@ impl Pipeline {
                             solo.plain_ms = if solo.plain_ms == 0.0 { ms } else { 0.7 * solo.plain_ms + 0.3 * ms };
                         }
                         solo.plain_n += 1;
+                    } else if solo.first {
+                        solo.first = false;
+                        if spec_time_level() > 0 {
+                            eprintln!("solo-round wall {ms:.1} ms → {tokens} tokens (the first round: not a sample)");
+                        }
                     } else {
                         let per = ms / tokens as f32;
-                        solo.round_ms = if solo.rounds == 0 { per } else { 0.8 * solo.round_ms + 0.2 * per };
+                        // a tenth a round: one round that kept nothing (85 ms for its
+                        // one token against 20 a token before it) must not send a
+                        // drafter keeping 80 % to rest — at a fifth it did, 36 against
+                        // 47 tok/s on code
+                        solo.round_ms = if solo.rounds == 0 { per } else { 0.9 * solo.round_ms + 0.1 * per };
                         solo.rounds += 1;
                         if spec_time_level() > 0 {
                             eprintln!(
@@ -7864,7 +7886,7 @@ impl Pipeline {
                             );
                         }
                         // rounds that land tokens no faster than plain steps sit out, longer each time
-                        if solo_pin.is_none() && solo.plain_ms > 0.0 && solo.rounds >= SOLO_TRIAL && solo.round_ms > 0.97 * solo.plain_ms {
+                        if solo_pin.is_none() && solo.plain_ms > 0.0 && solo.rounds >= SOLO_TRIAL && solo.round_ms > solo.plain_ms {
                             solo.rest = solo.back;
                             solo.back = (solo.back * 2).min(SOLO_REST_MOST);
                             solo.rounds = 0;
@@ -7879,7 +7901,7 @@ impl Pipeline {
                             accepted += r.accepted.len();
                             if solo_pin.is_none() {
                                 // two past what held: a round that held all of its drafts goes deeper
-                                solo.k = (r.accepted.len() + 2).clamp(2, SOLO_K_MOST);
+                                solo.k = (r.accepted.len() + 2).clamp(2, SOLO_K_AUTO);
                             }
                             solo.last = Some((now, r.accepted.len() + 1));
                             let mut stopped = false;
@@ -10715,6 +10737,52 @@ impl Pipeline {
         d.settle(pool);
         spec_stamp("d.ctx");
         let t_ctx = t0.elapsed();
+        // the block, the head and the selector's projection as one
+        // submission on wgpu; the host block below where it declines
+        #[cfg(feature = "gpu")]
+        if let Some((logits, hp)) = d.block_dev(next_pos, &h, k.min(rows - 1), &self.weights.lm_head) {
+            spec_stamp("d.block");
+            let t_block = t0.elapsed();
+            let n = k.min(rows - 1);
+            let (mut ids, _) = d.select_with(&hp, &logits, t_next, n);
+            ids.truncate(k);
+            // `CMF_DFLASH_DEV_CHECK=1`: the host block on the same rows, and
+            // how far the device's logits, selector rows and drafts are from it
+            if std::env::var_os("CMF_DFLASH_DEV_CHECK").is_some() {
+                let out = d.block(next_pos, h.clone(), pool);
+                let head = &self.weights.lm_head;
+                let mut hl = vec![0f32; n * head.rows()];
+                head.matmat(&out[hs..(n + 1) * hs], n, &mut hl, pool);
+                let (hids, _) = d.select(&out[hs..(n + 1) * hs], &hl, t_next);
+                let (mut dmax, mut ref_max, mut dsum, mut cnt) = (0f32, 0f32, 0f64, 0usize);
+                for (a, b) in logits.iter().zip(&hl) {
+                    dmax = dmax.max((a - b).abs());
+                    ref_max = ref_max.max(b.abs());
+                    dsum += ((a - b) * (a - b)) as f64;
+                    cnt += 1;
+                }
+                let arg = |v: &[f32]| (0..n).map(|j| sampler::argmax(&v[j * head.rows()..(j + 1) * head.rows()])).collect::<Vec<u32>>();
+                eprintln!(
+                    "dflash-dev-check: logits max|Δ| {dmax:.4} of max {ref_max:.2}, rms Δ {:.5} | argmax device {:?} host {:?} | drafts device {:?} host {:?}",
+                    (dsum / cnt.max(1) as f64).sqrt(),
+                    arg(&logits),
+                    arg(&hl),
+                    ids,
+                    &hids[..k.min(hids.len())]
+                );
+            }
+            if self.dflash_solo && spec_time_level() > 0 {
+                eprintln!(
+                    "solo-draft: context {:.1} ms | device block + head {:.1} ms | selector {:.1} ms",
+                    t_ctx.as_secs_f64() * 1e3,
+                    (t_block - t_ctx).as_secs_f64() * 1e3,
+                    (t0.elapsed() - t_block).as_secs_f64() * 1e3
+                );
+            }
+            spec_stamp("d.head");
+            self.dflash = Some(d);
+            return ids;
+        }
         let out = d.block(next_pos, h, pool);
         spec_stamp("d.block");
         let t_block = t0.elapsed();

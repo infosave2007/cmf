@@ -111,8 +111,8 @@ and the K and V projections at eight bits close most of the rest.
 
 **Drafts.** Ripple has no draft head of its own. The DFlash2 drafter, five layers over the trunk's rows
 after layers 1, 20, 39, 58 and 77, proposes up to seven tokens from one block; the card verifies them
-with the next token in one batch, and the far field moves over the accepted ones only. Greedy text
-stays the same with and without drafts; what a round costs is in the table below.
+with the next token in one batch, and the far field moves over the accepted ones only. The block runs
+on the card as one submission; what a round costs is in the table below.
 
 ## Performance
 
@@ -143,20 +143,21 @@ The q2tp file on the A40:
 | 4 000 | 77.8 | 11.8 | 30.3 |
 | 64 000 | 1459.2 | 11.5 | 31.6 |
 
-**With the drafter.** `cortiq run --greedy`, 160 tokens of an answer, the q4tp file:
+**With the drafter.** `cortiq run --greedy`, the q4tp file, RTX PRO 6000, 400 tokens of code and a 346-token
+prose answer:
 
 | answer | without drafts, tok/s | with drafts, tok/s | drafts kept a round |
 |---|---:|---:|---:|
-| code, A40 | 12.1 | 11.6 | 4.8 |
-| prose, A40 | 12.2 | 9.0 | 1.3 |
-| code, RTX PRO 6000 | 30.2 | 26.9 | 4.8 |
-| prose, RTX PRO 6000 | 30.6 | 21.6 | 1.2 |
+| code | 30.2 | 46.6 | 3.8 of 4.6 |
+| prose | 30.5 | 28.8 | 1.0 of 3.0 |
 
-The text is the plain run's token for token, and a round costs more than the tokens it keeps: on the
-RTX PRO 6000 a round takes 160 ms against 32 ms for a plain token, 75 ms of it the block itself, whose
-five layers go through fifteen device calls with the convolutions and the attention on the host between
-them. The rounds stay off unless `CMF_DFLASH=1` asks for them; a round of seven drafts
-(`CMF_GRAPH_SPEC_K=7`) keeps 4.6 of them on code.
+A round of four drafts costs 85 ms against 32 for a plain token: the block 8 ms, the drafter's context 5,
+the verify of five rows 70. On code the drafter keeps 84 % of its drafts and the answer comes 1.5× faster
+(47.2 tok/s with the depth pinned, `CMF_GRAPH_SPEC_K=4`); on prose it keeps a third and the pay-off
+monitor rests. The text was the plain run's in every run but one: the verify multiplies int8 activations,
+and at token 252 of the prose answer under a pinned depth of four it resolved a near-tie the other way;
+`CMF_VERIFY_I8=0` keeps the stream bit-exact at 29 tok/s on code. The rounds stay off unless
+`CMF_DFLASH=1` asks for them.
 
 **Host memory.** While a long prompt is read, its rows take RAM or a disk (`--o1-spill DIR`). The mapped
 weights are not counted; the system can drop them from RAM.
@@ -305,8 +306,8 @@ curl http://localhost:8080/v1/chat/completions \
 
 **Черновики.** У Ripple нет своей черновой головы. Черновик DFlash2 — пять слоёв над строками ствола
 после слоёв 1, 20, 39, 58 и 77 — предлагает до семи токенов из одного блока; карта проверяет их вместе
-со следующим токеном за один пакет, а дальнее поле сдвигается только по принятым. Жадный текст с
-черновиками и без них одинаков; сколько стоит раунд — в таблице ниже.
+со следующим токеном за один пакет, а дальнее поле сдвигается только по принятым. Блок идёт на карту
+одной отправкой; сколько стоит раунд — в таблице ниже.
 
 ### Скорость
 
@@ -337,20 +338,21 @@ NVIDIA A40 (46 ГБ), Vulkan, `cortiq bench --core`, 60 токенов посл�
 | 4 000 | 77,8 | 11,8 | 30,3 |
 | 64 000 | 1459,2 | 11,5 | 31,6 |
 
-**С черновиком.** `cortiq run --greedy`, 160 токенов ответа, файл q4tp:
+**С черновиком.** `cortiq run --greedy`, файл q4tp, RTX PRO 6000, 400 токенов кода и ответ прозой в 346
+токенов:
 
 | ответ | без черновиков, ток/с | с черновиками, ток/с | принято за раунд |
 |---|---:|---:|---:|
-| код, A40 | 12,1 | 11,6 | 4,8 |
-| проза, A40 | 12,2 | 9,0 | 1,3 |
-| код, RTX PRO 6000 | 30,2 | 26,9 | 4,8 |
-| проза, RTX PRO 6000 | 30,6 | 21,6 | 1,2 |
+| код | 30,2 | 46,6 | 3,8 из 4,6 |
+| проза | 30,5 | 28,8 | 1,0 из 3,0 |
 
-Текст — токен в токен текст обычного прогона, а раунд стоит дороже токенов, которые приносит: на
-RTX PRO 6000 раунд занимает 160 мс против 32 мс на обычный токен, 75 мс из них — сам блок, пять слоёв
-которого проходят через пятнадцать вызовов карты со свёртками и вниманием на хосте между ними. Раунды
-выключены, пока их не попросит `CMF_DFLASH=1`; раунд из семи черновиков (`CMF_GRAPH_SPEC_K=7`)
-принимает 4,6 из них на коде.
+Раунд из четырёх черновиков стоит 85 мс против 32 на обычный токен: блок 8 мс, контекст черновика 5,
+проверка пяти строк 70. На коде черновик удерживает 84 % предложенного, и ответ приходит в 1,5 раза
+быстрее (47,2 ток/с при закреплённой глубине, `CMF_GRAPH_SPEC_K=4`); на прозе — треть, и монитор
+окупаемости делает паузы. Текст совпал с обычным прогоном во всех прогонах, кроме одного: проверка
+умножает int8-активации, и на 252-м токене прозы при закреплённой глубине четыре почти равные логиты
+разрешились в другую сторону; `CMF_VERIFY_I8=0` делает поток точным до бита при 29 ток/с на коде.
+Раунды выключены, пока их не попросит `CMF_DFLASH=1`.
 
 **Память хоста.** Пока читается длинный промпт, его строки занимают RAM или диск (`--o1-spill DIR`).
 Отображённые веса не считаются: система может вытеснить их из RAM.
@@ -484,8 +486,8 @@ curl http://localhost:8080/v1/chat/completions \
 ![两比特权重,最活跃的神经元用八比特](https://huggingface.co/infosave/Ripple-65B-Preview-cmf/resolve/main/assets/hot_zh.png)
 
 **草稿。** Ripple 没有自己的草稿头。DFlash2 草稿模型是建立在主干第 1、20、39、58、77 层输出之上的五层网络,一个块最多
-提出七个 token;显卡把它们和下一个 token 一起在一个批次中验证,远场只沿被接受的 token 前移。贪心解码的文本有无草稿
-完全相同;一轮的开销见下表。
+提出七个 token;显卡把它们和下一个 token 一起在一个批次中验证,远场只沿被接受的 token 前移。草稿块作为一次提交在显卡上
+运行;一轮的开销见下表。
 
 ### 速度
 
@@ -516,18 +518,17 @@ A40 上的 q2tp 文件:
 | 4 000 | 77.8 | 11.8 | 30.3 |
 | 64 000 | 1459.2 | 11.5 | 31.6 |
 
-**使用草稿模型。** `cortiq run --greedy`,160 个 token 的回答,q4tp 文件:
+**使用草稿模型。** `cortiq run --greedy`,q4tp 文件,RTX PRO 6000,400 个 token 的代码和 346 个 token 的散文回答:
 
 | 回答 | 无草稿,tok/s | 有草稿,tok/s | 每轮接受的草稿数 |
 |---|---:|---:|---:|
-| 代码,A40 | 12.1 | 11.6 | 4.8 |
-| 散文,A40 | 12.2 | 9.0 | 1.3 |
-| 代码,RTX PRO 6000 | 30.2 | 26.9 | 4.8 |
-| 散文,RTX PRO 6000 | 30.6 | 21.6 | 1.2 |
+| 代码 | 30.2 | 46.6 | 4.6 个中的 3.8 |
+| 散文 | 30.5 | 28.8 | 3.0 个中的 1.0 |
 
-文本与普通运行逐 token 相同,但一轮的开销超过它换来的 token:在 RTX PRO 6000 上一轮耗时 160 毫秒,而普通一个 token 只需
-32 毫秒,其中 75 毫秒是草稿块本身——它的五层要经过十五次显卡调用,中间的卷积和注意力在主机上完成。除非 `CMF_DFLASH=1`
-要求,轮次保持关闭;固定七个草稿的一轮(`CMF_GRAPH_SPEC_K=7`)在代码上接受其中 4.6 个。
+四个草稿的一轮耗时 85 毫秒,普通一个 token 为 32 毫秒:草稿块 8 毫秒,草稿模型的上下文 5 毫秒,五行验证 70 毫秒。在代码上
+草稿模型保留 84 % 的草稿,回答快 1.5 倍(固定深度 `CMF_GRAPH_SPEC_K=4` 时 47.2 tok/s);在散文上只保留三分之一,收益监控会
+暂停轮次。除一次外,文本都与普通运行相同:验证使用 int8 激活相乘,在固定深度四的散文回答第 252 个 token 处,两个几乎相等的
+logit 被判向另一边;`CMF_VERIFY_I8=0` 让输出逐比特精确,代码上为 29 tok/s。除非 `CMF_DFLASH=1` 要求,轮次保持关闭。
 
 **主机内存。** 读取长提示时,它的行占用内存或磁盘(`--o1-spill DIR`)。映射的权重不计在内,系统可以把它们从内存中
 换出。

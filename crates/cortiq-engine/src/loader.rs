@@ -2791,6 +2791,8 @@ impl Pipeline {
             match crate::dflash::Drafter::for_target(model) {
                 Some(Ok(d)) => {
                     tracing::info!("DFlash drafter: {} layers on the trunk's layers {:?}, blocks of {}", d.g.layers, d.g.taps, d.g.block);
+                    #[cfg(feature = "gpu")]
+                    let _ = d.dev_ready();
                     pipeline.dflash = Some(Box::new(d));
                     pipeline.dflash_solo = pipeline.mtp.is_none();
                 }

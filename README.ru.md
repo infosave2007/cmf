@@ -134,8 +134,8 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 cortiq run ripple-65b-q4tp.cmf --prompt-file report.txt --greedy
 ```
 
-Рядом лежит точный драфтер DFlash 2 (`CMF_DFLASH=1`); его раунды пока не окупаются. См.
-[карточку](docs/hf/Ripple-65B-Preview-cmf.md).
+Рядом лежит драфтер DFlash 2 (`CMF_DFLASH=1`), его блок — одна отправка на карту: код 30,2 → 46,6 tok/s на
+RTX PRO 6000, проза примерно вровень. См. [карточку](docs/hf/Ripple-65B-Preview-cmf.md).
 
 ## Qwen3.8-27B Turbo, черновики на Маке и в чате (0.8.59)
 

@@ -238,6 +238,10 @@ pub struct Drafter {
     /// Matrices that read the same rows go to the device in one submission
     /// (`CMF_DFLASH_FUSED=0`: a submission each).
     fused: bool,
+    /// The block as one submission on wgpu (`gpu_wgpu::dflash_dev`), built
+    /// at the first block; `Err` once it declined.
+    #[cfg(feature = "gpu")]
+    dev: std::sync::Mutex<Option<Result<crate::gpu_wgpu::dflash_dev::Dev, ()>>>,
 }
 
 fn vector(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
@@ -436,10 +440,131 @@ impl Drafter {
             pending: Vec::new(),
             device: crate::gpu::enabled(),
             fused: std::env::var("CMF_DFLASH_FUSED").as_deref() != Ok("0"),
+            #[cfg(feature = "gpu")]
+            dev: std::sync::Mutex::new(None),
             layers,
             model,
             g,
         })
+    }
+
+    /// The device block, built on first use where wgpu runs the model and
+    /// `CMF_DFLASH_DEV` is not 0. The context held so far goes to the card
+    /// with it. The loader calls this once the drafter exists so the build
+    /// (kernels, 2.3 GB of sidecar weights) is paid at load, not in the
+    /// first round (measured 480 ms there).
+    #[cfg(feature = "gpu")]
+    pub fn dev_ready(&self) -> bool {
+        use crate::gpu_wgpu::dflash_dev::{Dev, LayerSpec, Spec};
+        let mut slot = self.dev.lock().unwrap();
+        if slot.is_none() {
+            // Not yet a wgpu context, or the device not wanted: nothing is
+            // decided, the next call asks again.
+            if !(self.device && crate::gpu_wgpu::selected() && crate::gpu_wgpu::enabled()) {
+                return false;
+            }
+            let built = if crate::gpu_wgpu::dflash_dev::wanted() {
+                let g = &self.g;
+                let idx = |name: &str| self.model.tensor_index(&format!("{NAMESPACE}{name}"));
+                let layers: Option<Vec<LayerSpec>> = self
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        let p = format!("layers.{i}");
+                        Some(LayerSpec {
+                            in_norm: l.in_norm.clone(),
+                            post_norm: l.post_norm.clone(),
+                            q_norm: l.q_norm.clone(),
+                            k_norm: l.k_norm.clone(),
+                            attn_base: l.attn_conv.base.clone(),
+                            mlp_base: l.mlp_conv.base.clone(),
+                            window: g.window_of(i),
+                            rotary: g.rotary(i),
+                            q: self.tiled(&l.q)?,
+                            k: self.tiled(&l.k)?,
+                            v: self.tiled(&l.v)?,
+                            o: self.tiled(&l.o)?,
+                            gate: self.tiled(&l.gate)?,
+                            up: self.tiled(&l.up)?,
+                            down: self.tiled(&l.down)?,
+                            attn_proj: idx(&format!("{p}.attention_conv.kernel_projection.weight"))?,
+                            mlp_proj: idx(&format!("{p}.mlp_conv.kernel_projection.weight"))?,
+                        })
+                    })
+                    .collect();
+                let spec = layers.and_then(|layers| {
+                    Some(Spec {
+                        hs: g.hidden,
+                        ffn: g.intermediate,
+                        hd: g.head_dim,
+                        nh: g.heads,
+                        kv: g.kv_heads,
+                        kn: g.conv_kernel,
+                        gs: g.conv_group,
+                        block: g.block,
+                        eps: g.eps as f32,
+                        layers,
+                        norm: self.norm.clone(),
+                        inv_freq: self.inv_freq.clone(),
+                        sel: idx("candidate_selector.hidden_projection.weight")?,
+                        sel_rank: g.selector_rank,
+                    })
+                });
+                match spec {
+                    Some(spec) => match Dev::new(self.model.clone(), spec) {
+                        Ok(mut dev) => {
+                            for li in 0..self.layers.len() {
+                                self.dev_refill(&mut dev, li);
+                            }
+                            tracing::info!("DFlash drafter: the block runs on the device as one submission");
+                            Ok(dev)
+                        }
+                        Err(e) => {
+                            tracing::info!("DFlash drafter: the block stays on the host ({e})");
+                            Err(())
+                        }
+                    },
+                    None => Err(()),
+                }
+            } else {
+                Err(())
+            };
+            *slot = Some(built);
+        }
+        matches!(slot.as_ref(), Some(Ok(_)))
+    }
+
+    /// Every context row of `layer` the host holds, to the device.
+    #[cfg(feature = "gpu")]
+    fn dev_refill(&self, dev: &mut crate::gpu_wgpu::dflash_dev::Dev, layer: usize) {
+        let hd = self.g.head_dim;
+        let c = &self.ctx[layer];
+        let rows = c.k.first().map(|h| h.len() / hd).unwrap_or(0);
+        // grown or not, the rows go up as they are
+        let _ = dev.reserve(layer, c.dropped + rows);
+        self.dev_refill_held(dev, layer);
+    }
+
+    /// The rows the host holds for `layer`, into a device buffer that has
+    /// room for them.
+    #[cfg(feature = "gpu")]
+    fn dev_refill_held(&self, dev: &mut crate::gpu_wgpu::dflash_dev::Dev, layer: usize) {
+        let (hd, kv) = (self.g.head_dim, self.g.kv_heads);
+        let c = &self.ctx[layer];
+        let rows = c.k.first().map(|h| h.len() / hd).unwrap_or(0);
+        if rows == 0 {
+            return;
+        }
+        let mut k = vec![0f32; rows * kv * hd];
+        let mut v = vec![0f32; rows * kv * hd];
+        for r in 0..rows {
+            for h in 0..kv {
+                k[(r * kv + h) * hd..][..hd].copy_from_slice(&c.k[h][r * hd..][..hd]);
+                v[(r * kv + h) * hd..][..hd].copy_from_slice(&c.v[h][r * hd..][..hd]);
+            }
+        }
+        dev.push_rows(layer, c.dropped, &k, &v);
     }
 
     /// Keep every matrix on the host (a parity check, a device that is busy).
@@ -626,6 +751,17 @@ impl Drafter {
                 if self.g.rotary(li) {
                     self.rotate(&mut k, kv, |r| at + r);
                 }
+                #[cfg(feature = "gpu")]
+                if let Some(Ok(dev)) = self.dev.lock().unwrap().as_mut() {
+                    let at = at - self.first;
+                    if dev.reserve(li, at + n) {
+                        dev.push_rows(li, at, &k, &v);
+                    } else {
+                        // the buffer grew and is empty: everything held so far, then these rows
+                        self.dev_refill_held(dev, li);
+                        dev.push_rows(li, at, &k, &v);
+                    }
+                }
                 let c = &mut self.ctx[li];
                 for r in 0..n {
                     for h in 0..kv {
@@ -782,6 +918,37 @@ impl Drafter {
         h
     }
 
+    /// The block on the device as one submission, the head and the selector's
+    /// projection in it: the logits of the `k` rows after the anchor under
+    /// `head` (its whole table) and the selector's rows of them. None where
+    /// the device declines; the host block runs then.
+    #[cfg(feature = "gpu")]
+    pub fn block_dev(&self, anchor_pos: usize, h: &[f32], k: usize, head: &QTensor) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::gpu_wgpu::dflash_dev::{CtxRange, kind_of};
+        if k == 0 || k >= self.g.block || !self.dev_ready() {
+            return None;
+        }
+        let (hmodel, hidx) = head.mapped_device_gemm()?;
+        let kind = kind_of(hmodel, hidx)?;
+        let g = &self.g;
+        let ranges: Vec<CtxRange> = (0..self.layers.len())
+            .map(|li| {
+                let (c, window) = (&self.ctx[li], g.window_of(li));
+                let base = self.first + c.dropped;
+                let hi = anchor_pos.min(self.first + self.len).max(base);
+                let lo = if window > 0 { (anchor_pos + 1).saturating_sub(window).clamp(base, hi) } else { base };
+                CtxRange { lo: lo - self.first, n: hi - lo }
+            })
+            .collect();
+        let mut slot = self.dev.lock().unwrap();
+        let Some(Ok(dev)) = slot.as_mut() else { return None };
+        let out = dev.block(anchor_pos, self.first, h, &ranges, (hmodel, hidx, head.rows(), head.cols(), kind), head.rows(), k)?;
+        if stage_timed() {
+            STAGE_US[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some((out.logits, out.hp))
+    }
+
     fn book_row(&self, book: usize, token: u32, dst: &mut [f32]) {
         let e = &self.model.tensors[self.books[book]];
         let rank = self.g.selector_rank;
@@ -798,11 +965,18 @@ impl Drafter {
     /// head's first rows (a shortlist of the vocabulary). Returns the chosen
     /// tokens and, for reference, every row's own top token.
     pub fn select(&self, hidden: &[f32], logits: &[f32], anchor: u32) -> (Vec<u32>, Vec<u32>) {
-        let (hs, rank, top, vocab) = (self.g.hidden, self.g.selector_rank, self.g.selector_top, self.g.vocab);
-        let n = hidden.len() / hs;
+        let n = hidden.len() / self.g.hidden;
+        let hp = self.sel.apply(hidden, n, None);
+        self.select_with(&hp, logits, anchor, n)
+    }
+
+    /// `select` with the selector's projection of the rows already made
+    /// (`hp`, `n` rows of `selector_rank`).
+    pub fn select_with(&self, hp: &[f32], logits: &[f32], anchor: u32, n: usize) -> (Vec<u32>, Vec<u32>) {
+        let (rank, top, vocab) = (self.g.selector_rank, self.g.selector_top, self.g.vocab);
         let width = logits.len() / n.max(1);
         assert!(logits.len() == n * width && (top..=vocab).contains(&width), "dflash: logits of {n} rows over the head's rows");
-        let hp = self.sel.apply(hidden, n, None);
+        assert!(hp.len() >= n * rank, "dflash: the selector's rows");
         let (mut prev, mut chosen, mut plain) = (anchor, Vec::with_capacity(n), Vec::with_capacity(n));
         let (mut pc, mut sc) = (vec![0f32; rank], vec![0f32; rank]);
         for j in 0..n {

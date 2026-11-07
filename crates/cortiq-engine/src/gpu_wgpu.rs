@@ -64,6 +64,7 @@ pub(crate) mod gram;
 pub(crate) mod mhc;
 /// Ripple's value residual: the V input blended with the embedding row.
 pub(crate) mod vres;
+pub mod dflash_dev;
 pub(crate) mod vit;
 pub(crate) mod dory;
 pub(crate) mod uocr;
@@ -35611,6 +35612,8 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("Prism transform unavailable for batched attention input");
                     return batch_outcome(o1_started || state_started, false);
                 };
+                // "qkv" = the input norm and the q, k and v projections.
+                bts!(enc, 4);
                 ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden);
                 if let (Some((blend, _)), Some((vp, e0b, vinb))) =
                     (geom.and_then(|g| g.vres), vres_bufs.as_ref())
@@ -35644,6 +35647,7 @@ pub fn forward_batch_graph_at(
                         hidden,
                     );
                 }
+                bts!(enc, 6);
                 let preview_bt = dense_batch::attn(c).filter(|_| {
                     preview.is_some()
                         && c.attend_gpart.is_some()
@@ -36821,6 +36825,9 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("Prism transform unavailable for batched output projection");
                     return batch_outcome(o1_started || state_started, false);
                 };
+                // "attn-core" = rope, the attention kernels and the gate;
+                // "attn" then = the output projection alone.
+                bts!(enc, 5);
                 ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * ldv);
                 bts!(enc, 1);
             }
@@ -37270,11 +37277,9 @@ pub fn forward_batch_graph_at(
                     &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &act_u]),
                     ((k * inter) as u32).div_ceil(256),
                 );
-                if g4p.is_some() {
-                    // "gdn-proj" = post-attention norms + gate/up GEMM + act;
-                    // "ffn" then = the down GEMM.
-                    bts!(enc, 7);
-                }
+                // "gate-up" = post-attention norms + gate/up GEMM + act;
+                // "ffn" then = the down GEMM.
+                bts!(enc, 7);
                 let Some(abuf_p) = prism_input_b(&mut enc, &[down], &abuf, inter) else {
                     bgraph_refused("Prism transform unavailable for batched FFN output");
                     return batch_outcome(o1_started || state_started, false);
@@ -38014,7 +38019,7 @@ pub fn forward_batch_graph_at(
                         e.1 += 1;
                     }
                     let names = [
-                        "start", "attn", "gdn-out", "ffn", "norm", "recur", "gdn-in", "gdn-proj",
+                        "start", "o-proj", "gdn-out", "down", "norm", "attn-core|recur", "qkv|gdn-in", "gate-up|gdn-proj",
                     ];
                     let line: Vec<String> = agg
                         .iter()

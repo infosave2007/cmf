@@ -134,8 +134,8 @@ tok/s (23.4 before this release), the eight-bit file reads a prompt at 156 tok/s
 cortiq run ripple-65b-q4tp.cmf --prompt-file report.txt --greedy
 ```
 
-An exact DFlash 2 drafter comes beside it (`CMF_DFLASH=1`); its rounds do not pay yet. See
-[the card](docs/hf/Ripple-65B-Preview-cmf.md).
+A DFlash 2 drafter comes beside it (`CMF_DFLASH=1`), its block one device submission: code 30.2 → 46.6 tok/s
+on the RTX PRO 6000, prose about even. See [the card](docs/hf/Ripple-65B-Preview-cmf.md).
 
 ## Qwen3.8-27B Turbo, drafts on a Mac and in a chat (0.8.59)
 
