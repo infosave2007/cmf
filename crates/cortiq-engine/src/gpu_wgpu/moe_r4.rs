@@ -662,6 +662,41 @@ fn m3_row_{M}(wb: u32, lid: u32) {
 }
 "#;
 
+/// `q82_mv3` with the value residual folded in: the third matrix (V)
+/// reads `lerp(e0, x, blend)` — `vres_lerp`'s form to the bit — straight
+/// from the normed row and the scaled embedding, so a Ripple layer's
+/// blend dispatch and the V projection's dispatch boundary both go. The
+/// first two matrices read `x` as `q82_mv3` does.
+fn mv3v_wgsl() -> String {
+    let mut body = String::new();
+    for m in ["a", "b"] {
+        body.push_str(&MV3_FN_T.replace("{M}", m));
+    }
+    // The third matrix's input reads go through the lerp.
+    let mut vfn = MV3_FN_T.replace("{M}", "c");
+    for idx in ["i", "i + 64u", "i + 128u", "i + 192u"] {
+        vfn = vfn.replace(&format!("m3_x[{idx}]"), &format!("m3_xv({idx})"));
+    }
+    body.push_str(&vfn);
+    MV3_WGSL_T
+        .replace(
+            "struct M3P { rows_a: u32, rows_b: u32, rows_c: u32, cols: u32 };",
+            MV3V_HEAD,
+        )
+        .replace("fn q82_mv3(", "fn q82_mv3v(")
+        .replace("{FNS}", &body)
+}
+
+const MV3V_HEAD: &str = r#"struct M3P { rows_a: u32, rows_b: u32, rows_c: u32, cols: u32, blend: f32, p1: u32, p2: u32, p3: u32 };
+@group(0) @binding(8) var<storage, read> m3_e : array<vec4<f32>>;
+// `vres_lerp`'s form, element by element: the same bits as the blend dispatch wrote.
+fn m3_xv(i: u32) -> vec4<f32> {
+    let e = m3_e[i];
+    let x = m3_x[i];
+    if (m3_p.blend < 0.5) { return e + m3_p.blend * (x - e); }
+    return x - (x - e) * (1.0 - m3_p.blend);
+}"#;
+
 const MV3_WGSL_T: &str = r#"
 struct M3P { rows_a: u32, rows_b: u32, rows_c: u32, cols: u32 };
 @group(0) @binding(0) var<storage, read>       m3_wa : array<u32>;
@@ -1311,6 +1346,9 @@ pub(crate) struct Pipes {
     /// `q82_mv3` (Q/K/V q8_2f in one dispatch); None on rejection or
     /// `CMF_MV3=0`.
     pub(crate) mv3: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// `q82_mv3v`: the same with the value residual's lerp on the third
+    /// matrix's input (Ripple); None on rejection or `CMF_MV3=0`.
+    pub(crate) mv3v: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     /// Subgroup folded-select pair (four rows a 128-lane workgroup).
     pub(crate) sg: Option<Sg>,
     /// Exact 32-lane subgroup tails for the ordinary four-row pair; None
@@ -1355,6 +1393,82 @@ fn build_mv3(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> 
 /// The fused Q/K/V q8_2f projection, when the module came up.
 pub(crate) fn mv3(c: &Ctx) -> Option<&(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
     pipes(c).and_then(|p| p.mv3.as_ref())
+}
+
+fn build_mv3v(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+    if std::env::var("CMF_MV3").as_deref() == Ok("0") || std::env::var("CMF_VRES_FUSE").as_deref() == Ok("0") {
+        return None;
+    }
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cmf-mv3v"),
+        source: wgpu::ShaderSource::Wgsl(mv3v_wgsl().into()),
+    });
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("q82_mv3v"),
+            layout: None,
+            module: &module,
+            entry_point: Some("q82_mv3v"),
+            compilation_options: crate::gpu_wgpu::pco(),
+            cache: c.pipeline_cache.as_ref(),
+        });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("cmf-mv3v module rejected ({e}): the value residual keeps its own dispatch");
+        return None;
+    }
+    let l = p.get_bind_group_layout(0);
+    Some((p, l))
+}
+
+/// Up to three q8_2f projections of one normed row `x` in ONE dispatch,
+/// the last of them (V) over `lerp(e0, x, blend)` computed in the kernel:
+/// `mats` = (weight, output, rows) for Q (or none: rows 0), K, V. False
+/// when the kernel is missing or a width is outside it; nothing encoded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mv3v_encode(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    e0: &wgpu::Buffer,
+    blend: f32,
+    cols: usize,
+    mats: [Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>; 3],
+) -> bool {
+    let Some(ps) = pipes(c) else { return false };
+    let Some((p, l)) = ps.mv3v.as_ref() else { return false };
+    if cols % 16 != 0 || mats[2].is_none() {
+        return false;
+    }
+    let r = |i: usize| mats[i].map_or(0, |m| m.2);
+    let w = |i: usize| mats[i].map_or(mats[2].unwrap().0, |m| m.0);
+    let y = |i: usize| mats[i].map_or(&ps.dummy_y, |m| m.1);
+    let u = uniform_u32x8(
+        c,
+        [r(0) as u32, r(1) as u32, r(2) as u32, cols as u32, blend.to_bits(), 0, 0, 0],
+    );
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q82-mv3v"),
+        layout: l,
+        entries: &[
+            bind_buf(0, w(0)),
+            bind_buf(1, w(1)),
+            bind_buf(2, w(2)),
+            bind_buf(3, x),
+            bind_buf(4, y(0)),
+            bind_buf(5, y(1)),
+            bind_buf(6, y(2)),
+            bind_buf(7, &u),
+            bind_buf(8, e0),
+        ],
+    });
+    let blocks: usize = (0..3).map(|i| r(i).div_ceil(4)).sum();
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(p);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((blocks as u32).min(MAX_WG), 1, 1);
+    true
 }
 
 fn build_prefill(c: &Ctx) -> Option<Prefill> {
@@ -1425,6 +1539,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
     let dn_f_l = dn_f.get_bind_group_layout(0);
     let prefill = build_prefill(c);
     let mv3 = build_mv3(c);
+    let mv3v = build_mv3v(c);
     let sg = build_sg(c);
     let exact_sg = build_exact_sg(c);
     let q82sg = build_q82sg(c);
@@ -1435,7 +1550,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
         mapped_at_creation: false,
     });
     Some(Pipes {
-        gu, gu_l, dn, dn_l, gu_f, gu_f_l, dn_f, dn_f_l, mv3, sg, exact_sg, q82sg, dummy_y, prefill,
+        gu, gu_l, dn, dn_l, gu_f, gu_f_l, dn_f, dn_f_l, mv3, mv3v, sg, exact_sg, q82sg, dummy_y, prefill,
     })
 }
 

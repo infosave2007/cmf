@@ -1210,6 +1210,12 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
         return Quant::Q8_2f;
     }
+    // Ripple's value residual hands the scaled embedding row to every layer's V
+    // projection, and its output table is untied: both edges at q8_2f cost 0.5 GB
+    // of a 34 GB q4tp file (wikitext-2 top-1 agreement with bf16 88.6 → 90.0 %).
+    if arch.arch_name.eq_ignore_ascii_case("ricursive") && vocabulary_edges {
+        return Quant::Q8_2f;
+    }
     // MiMo-V2 and Mellum are routed-MoE models whose expert banks dominate
     // the file, while every token always traverses the attention stack and
     // vocabulary edges.  Their q4tp profile therefore keeps the experts on
@@ -6878,10 +6884,34 @@ fn dflash_geometry(config: &serde_json::Value) -> anyhow::Result<cortiq_engine::
         .iter()
         .map(|v| v.as_u64().map(|v| v as usize).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: target_layer_ids must be integers")))
         .collect::<anyhow::Result<Vec<usize>>>()?;
+    let layers = int(config, "num_hidden_layers")?;
+    let window = if config.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) { int(config, "sliding_window")? } else { 0 };
+    // A layer of its own kind among the others: full attention among sliding ones.
+    let mut windows = Vec::new();
+    if let Some(types) = config.get("layer_types").and_then(|v| v.as_array()) {
+        anyhow::ensure!(types.len() == layers, "DFlash sidecar: layer_types names {} layers of {layers}", types.len());
+        for t in types {
+            windows.push(match t.as_str() {
+                Some("sliding_attention") => window,
+                Some("full_attention") => 0,
+                other => anyhow::bail!("DFlash sidecar: layer type {other:?} is not implemented"),
+            });
+        }
+        if windows.iter().all(|&w| w == window) {
+            windows.clear();
+        }
+    }
+    let no_rope = match config.get("no_rope_layers").and_then(|v| v.as_array()) {
+        Some(a) => a
+            .iter()
+            .map(|v| v.as_u64().map(|v| v as usize).filter(|&l| l < layers).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: no_rope_layers must name layers")))
+            .collect::<anyhow::Result<Vec<usize>>>()?,
+        None => Vec::new(),
+    };
     let g = cortiq_engine::dflash::Geometry {
         hidden: int(config, "hidden_size")?,
         intermediate: int(config, "intermediate_size")?,
-        layers: int(config, "num_hidden_layers")?,
+        layers,
         heads: int(config, "num_attention_heads")?,
         kv_heads: int(config, "num_key_value_heads")?,
         head_dim: int(config, "head_dim")?,
@@ -6894,7 +6924,9 @@ fn dflash_geometry(config: &serde_json::Value) -> anyhow::Result<cortiq_engine::
         selector_top: int(d, "selector_top_k")?,
         taps,
         target_layers: int(config, "num_target_layers")?,
-        window: if config.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) { int(config, "sliding_window")? } else { 0 },
+        window,
+        windows,
+        no_rope,
         rope_theta: rope.get("rope_theta").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: rope_parameters.rope_theta missing"))?,
         eps: config.get("rms_norm_eps").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: rms_norm_eps missing"))?,
     };
@@ -7307,6 +7339,7 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
         attention_sink: false,
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
+        ffn_clamp: None,
         attn_logit_softcapping: None,
         attn_v_norm: false,
         // The reference does Gemma-1p per-head Q/K norm before RoPE.
@@ -7758,6 +7791,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let mt = model_type.to_lowercase();
     let is_laguna = mt == "laguna";
     let is_granite = mt == "granite";
+    // Ripple (`ricursive`): PeriNorm blocks, sliding layers with RoPE and full layers with
+    // none, an element-wise sigmoid gate on the attention output, a value residual from the
+    // embeddings and a clamped SwiGLU.
+    let is_ricursive = mt == "ricursive";
     if is_laguna {
         anyhow::ensure!(
             !tc.get("swa_attention_sink_enabled")
@@ -7942,6 +7979,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else if is_minicpm3 {
         // MiniCPM: embeddings enter the stack ×scale_emb.
         tc.get("scale_emb").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32
+    } else if is_ricursive {
+        // Ripple: a non-folded checkpoint carries the scale (√hidden) in the config; a folded
+        // one has it in the embedding and leaves the key null.
+        tc.get("embed_scale").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32
     } else {
         1.0
     };
@@ -8049,6 +8090,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             None => {}
         }
     }
+    // Ripple: RoPE on the sliding layers only.
+    let ricursive_no_rope: Option<Vec<bool>> = is_ricursive.then(|| {
+        layer_types
+            .iter()
+            .map(|t| !matches!(t, LayerType::SlidingAttention))
+            .collect()
+    });
     let mut arch = ModelArch {
         // LFM3-VL's text model is plain LFM3; its vision tower rides along
         // under `vision_tower.*` with the checkpoint config in provenance.
@@ -8218,6 +8266,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 || is_gemma3n
                 // Recursive Flint: 35 sliding-window layers, 14 full.
                 || mt == "flint"
+                || is_ricursive
                 || tc.get("sliding_window_pattern").is_some()
                 || g4_pattern.is_some()
         }),
@@ -8243,19 +8292,28 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // Recursive Flint: the 14 full-attention layers carry no positional
         // encoding (RoPE only on the sliding-window layers), and every layer
         // carries a learned per-head attention sink (`softmax_offset`).
-        no_rope_layers: (model_type == "flint").then(|| {
-            let idx: Vec<usize> = tc
-                .get("no_rope_layer_indices")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
-                .unwrap_or_default();
-            (0..n_layers).map(|l| idx.contains(&l)).collect()
-        }),
+        no_rope_layers: if ricursive_no_rope.is_some() {
+            ricursive_no_rope
+        } else {
+            (model_type == "flint").then(|| {
+                let idx: Vec<usize> = tc
+                    .get("no_rope_layer_indices")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                    .unwrap_or_default();
+                (0..n_layers).map(|l| idx.contains(&l)).collect()
+            })
+        },
         attention_sink: model_type == "flint",
         activation_situ_beta: tc.get("activation_situ_beta").and_then(|v| v.as_f64()),
         activation_situ_linear_beta: tc
             .get("activation_situ_linear_beta")
             .and_then(|v| v.as_f64()),
+        ffn_clamp: tc
+            .get("ffn_clamp_threshold")
+            .and_then(|v| v.as_f64())
+            .filter(|&v| is_ricursive && v > 0.0)
+            .map(|v| v as f32),
         attn_v_norm: is_gemma4,
         qk_norm_after_rope: is_hunyuan_dense,
         rope_freq_factors,
@@ -10274,6 +10332,68 @@ pub fn run_convert_multi_excluding(
                 .iter()
                 .any(|s| m.name.ends_with(s))
             {
+                continue;
+            }
+            // Ripple: the element-wise output gate (`g_proj`, a sigmoid over the attention
+            // output before o_proj) rides in q_proj the way Qwen3.5 stores its gate: per head,
+            // the head's Q rows and then its gate rows. Every path that runs a gated Qwen3.5
+            // layer then runs this one.
+            if arch.arch_name == "ricursive" && name.ends_with(".self_attn.g_proj.weight") {
+                continue;
+            }
+            if arch.arch_name == "ricursive" && name.ends_with(".self_attn.q_proj.weight") {
+                let g_name = m.name.replace(".q_proj.", ".g_proj.");
+                let gate = files.iter().find_map(|source| {
+                    source
+                        .tensors
+                        .iter()
+                        .find(|t| t.name == g_name)
+                        .map(|t| (source, t))
+                });
+                if let Some((source, gm)) = gate {
+                    let (nh, hd) = (arch.num_attention_heads, arch.head_dim);
+                    anyhow::ensure!(
+                        m.shape.len() == 2 && m.shape == gm.shape && m.shape[0] == nh * hd,
+                        "{name}: q_proj {:?} and g_proj {:?} must both be [{}, hidden]",
+                        m.shape,
+                        gm.shape,
+                        nh * hd
+                    );
+                    let cols = m.shape[1];
+                    let q = to_f32(&m.dtype, file.bytes(m))?;
+                    let g = to_f32(&gm.dtype, source.bytes(gm))?;
+                    let mut fused = Vec::with_capacity(2 * q.len());
+                    for h in 0..nh {
+                        let span = h * hd * cols..(h + 1) * hd * cols;
+                        fused.extend_from_slice(&q[span.clone()]);
+                        fused.extend_from_slice(&g[span]);
+                    }
+                    emit_profiled_tensor(
+                        batches,
+                        profiles,
+                        active,
+                        &arch,
+                        &name,
+                        &[2 * nh * hd, cols],
+                        &fused,
+                        EmitMode::Auto,
+                    );
+                    continue;
+                }
+                anyhow::ensure!(
+                    !config
+                        .get("use_gated_attention")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    "{name}: its gate {g_name} is not among the open shards; convert from a local directory"
+                );
+            }
+            // Ripple's value residual: V reads `lerp(embedding, normed, sigmoid(lambda))`. The
+            // scalar stays as stored; the loader turns it into the blend.
+            if arch.arch_name == "ricursive" && name.ends_with(".self_attn.value_res_lambda") {
+                let lam = to_f32(&m.dtype, file.bytes(m))?;
+                anyhow::ensure!(lam.len() == 1, "{name}: one scalar expected, got {}", lam.len());
+                emit_profiled_tensor(batches, profiles, active, &arch, &name, &[1], &lam, EmitMode::F32);
                 continue;
             }
             // MiMo-V2 fused qkv: TP-chunked rows AND a TP-chunked scale grid.

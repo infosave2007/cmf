@@ -1180,6 +1180,8 @@ impl Music3Ar {
                         up: u,
                         down: d,
                         act: crate::gpu::GraphAct::Silu,
+                        limit: 0.0,
+                        hot: None,
                     },
                 });
             }

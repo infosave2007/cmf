@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.60] — 2026-11-07
+
+### Added
+- Ripple-65B Preview (ricursiveAI) runs on the engine: gated attention, a value residual from the first layer, sandwich
+  norms, a clamp on the SwiGLU (`ffn_clamp` in the arch), 16 full and 64 sliding layers over a vocabulary of 100 352.
+  `cortiq convert` reads the checkpoint; the turbo header (`cortiq far-turbo`) takes the file with 248 rows kept
+  exact (`scripts/ripple/keep_ripple.bin`), and `cortiq hotmix` keeps the busiest 5 % of each layer's FFN neurons and
+  the K and V projections at eight bits in a two-bit file. [The three files](https://huggingface.co/infosave/Ripple-65B-Preview-cmf)
+  on an NVIDIA A40 (46 GB), q4tp turbo, 4 000 to 64 000 tokens: 12.0 to 11.8 tok/s at 35.3 to 36.6 GB; perplexity
+  against the BF16 checkpoint's 6.940: q8_2f 6.974, q4tp 7.089, q2tp 7.432.
+- A DFlash 2 sidecar for it (`cortiq convert --model DIR --output MODEL.cmf --dflash-sidecar --quant q4tp`), and the
+  drafter's block as one device submission on wgpu (`gpu_wgpu/dflash_dev.rs`: norms, kernel projections, grouped
+  convolutions, the int8 projections, a block attention over the context rows kept on the card, the head over the
+  draft rows). A round of four drafts costs 85 ms against 32 for a plain token on an RTX PRO 6000 (the block 8 ms,
+  the drafter's context 5, the verify of five rows 70; the host block took 87). Ripple-65B q4tp, 400 tokens of code:
+  30.2 → 46.6 tok/s with `CMF_DFLASH=1` (84 % of the drafts kept); prose keeps a third and the pay-off monitor rests,
+  30.5 → 28.8. The block runs its first eight rows (`CMF_DFLASH_DEV_ROWS=16` for the trained block: the same drafts
+  at twice the price); `CMF_DFLASH_DEV=0` keeps the host block, `CMF_DFLASH_DEV_CHECK=1` runs both and compares,
+  `CMF_DFLASH_DEV_TS=1` (with `CMF_GPU_TS=1`) prints the block's stages, `CMF_DFLASH_DEV_MM=coop|r` the GEMMs that
+  measured slower. The pay-off monitor no longer samples a sequence's first round (it reads the prompt into the
+  drafter), weighs a round at a tenth, and picks at most five drafts on its own (the verify of eight rows costs 108 ms
+  against 70 for five). The text was the plain run's in every run but one: the int8 verify resolved a near-tie the
+  other way at token 252 of a 384-token prose answer under a pinned depth of four; `CMF_VERIFY_I8=0` keeps the stream
+  bit-exact at 29 tok/s on code. Off unless `CMF_DFLASH=1`.
+- wgpu, q8_2f: a prompt chunk of 4 096 rows or more goes through the cooperative-matrix GEMM with an eight-bit tile
+  loader (`q82_mm_coop_s`), f16 operands and f32 sums, the activation scale from the device. Ripple-65B q8_2f on an
+  RTX PRO 6000, a 4 000-token prompt: 43 → 156 tok/s, perplexity 6.973 → 6.974. `CMF_Q82_COOP=0` keeps the scalar GEMM.
+- wgpu, q8_2f decode: `q8_2f_matvec4k` splits a row block's columns across the workgroup's four sub-blocks and loads
+  the activations once for four rows (down 177 → 163 µs a layer on the 65B). `CMF_Q82_MV4K=0` keeps the old kernel,
+  `CMF_Q82_MV16=1` a sixteen-row one that measured worse.
+- The card's own timestamps on the token graph: `CMF_GRAPH_TS_ALL=1` stamps every stage of every layer
+  (`CMF_GPU_TS=2`), `CMF_GRAPH_DEVICE_SPAN=1` the whole token with two stamps, `CMF_GRAPH_PROF=1` the host's part.
+
+### Changed
+- wgpu decode on NVIDIA, all bit-exact against the previous build: the attention's key loop unrolled by eight and the
+  value loop by four (49 → 29 µs a layer), the output projection through the warp-per-row kernel (37 → 31), rope and
+  the K/V write fused on gated layers, the sandwich norms with shuffle trees and a second phase in waves of eight
+  (30 + 25 → 26 + 17), the narrow-matrix grid capped at four workgroups a multiprocessor (the count read from
+  `VK_NV_shader_sm_builtins`), the value-residual blend as one kernel, and a short first piece of the pipelined
+  submission (`CMF_GRAPH_FIRST`). Ripple-65B q4tp on an RTX PRO 6000 at 4 000 tokens: 23.4 → 29.8 tok/s; q8_2f
+  16.2 → 18.3; q2tp 27.8. Variants that measured worse stay as knobs with their numbers beside them: `CMF_MV_SPLIT`,
+  `CMF_MV_SG_W`, `CMF_MV_SG_THIN=1`, `CMF_MV_SG_KS=1`.
+
 ## [0.8.59] — 2026-11-06
 
 ### Added

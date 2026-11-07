@@ -1346,6 +1346,7 @@ fn arch_from_md(
         no_rope_layers: None,
         attention_sink: false,
         activation_situ_linear_beta: None,
+        ffn_clamp: None,
         // Gemma-4's v_norm is scale-less x̂ (with_scale=False).
         attn_v_norm: is_gemma4,
         qk_norm_after_rope: is_hunyuan_dense,
@@ -1724,6 +1725,7 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         no_rope_layers: None,
         attention_sink: false,
         activation_situ_linear_beta: None,
+        ffn_clamp: None,
         attn_v_norm: false,
         qk_norm_after_rope: false,
         mtp: None,

@@ -49,6 +49,27 @@ pub fn run(model: &str, kit: &str, host: bool, limit: usize, head_rows: usize) -
     let head = QTensor::from_model(&base, "lm_head.weight").map_err(|e| anyhow!(e))?;
     let pool = Pool::new(std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(1).max(1));
     let pool = Some(&pool);
+    // `DFLASH_HEAD_CHECK=1`: the head on the device against the host, a
+    // batch of rows at a time, before anything else
+    if std::env::var_os("DFLASH_HEAD_CHECK").is_some() {
+        let (hs, v) = (head.cols(), head.rows());
+        for b in [1usize, 2, 8, 15, 16] {
+            let xs: Vec<f32> = (0..b * hs).map(|i| ((i * 7919 + 13) % 1000) as f32 / 500.0 - 1.0).collect();
+            let (mut dev, mut host) = (vec![0f32; b * v], vec![0f32; b * v]);
+            let on = head.device_matmat(&xs, b, &mut dev);
+            head.matmat(&xs, b, &mut host, pool);
+            let mut line = format!("head batch {b}: device {}", if on { "ran" } else { "declined" });
+            for r in 0..b {
+                let (d, h) = (&dev[r * v..][..v], &host[r * v..][..v]);
+                let diff = d.iter().zip(h).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let am = |x: &[f32]| x.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |m, (i, &y)| if y > m.1 { (i, y) } else { m });
+                let (da, ha) = (am(d), am(h));
+                let zeros = d[v / 2..].iter().filter(|x| **x == 0.0).count();
+                line += &format!(" | row {r}: max diff {diff:.4}, argmax {} vs {}, zeros in the upper half {zeros}", da.0, ha.0);
+            }
+            println!("{line}");
+        }
+    }
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(kit.join("kit.json")).with_context(|| format!("reading {}/kit.json", kit.display()))?)?;
     let int = |k: &str| meta[k].as_u64().map(|v| v as usize).ok_or_else(|| anyhow!("kit.json has no {k}"));
     let g = d.g.clone();
@@ -124,6 +145,12 @@ pub fn run(model: &str, kit: &str, host: bool, limit: usize, head_rows: usize) -
                 }
             }
             let (chosen, plain) = d.select(&out[hs..], &logits, ids[a]);
+            let bad = |x: &[f32]| x.iter().filter(|v| !v.is_finite()).count();
+            if bad(&out) + bad(&logits) > 0 {
+                let rows_bad: Vec<usize> = (0..g.block).filter(|r| bad(&out[r * hs..][..hs]) > 0).collect();
+                let lrows_bad: Vec<usize> = (0..drafts).filter(|r| bad(&logits[r * logits.len() / drafts..][..logits.len() / drafts]) > 0).collect();
+                println!("  anchor {a:4}: {} non-finite values in the block's rows {rows_bad:?}, {} in the logits' rows {lrows_bad:?}", bad(&out), bad(&logits));
+            }
             // the first round of a window pays for loading
             if si > 0 {
                 block_ms += (t1 - t0).as_secs_f64() * 1e3;

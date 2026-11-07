@@ -58,9 +58,13 @@ pub(crate) mod lfm_set;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod amd_mv;
 pub(crate) mod dense_mv;
+pub(crate) mod dense_split;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
 pub(crate) mod gram;
 pub(crate) mod mhc;
+/// Ripple's value residual: the V input blended with the embedding row.
+pub(crate) mod vres;
+pub mod dflash_dev;
 pub(crate) mod vit;
 pub(crate) mod dory;
 pub(crate) mod uocr;
@@ -3652,6 +3656,254 @@ fn q8_2f_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
             var sc = rw.x;
             if ((row & 1u) == 1u) { sc = rw.y; }
             y82[row] = partial82x4[lid] * sc;
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+// q8_2f decode matvec, SIXTEEN rows a 256-thread workgroup: each 64-lane
+// sub-block owns four rows and loads a step's activations and column
+// scales ONCE for the four. `q8_2f_matvec4` loads them once per row —
+// for the 65B's FFN down (5120 x 40960) that is a 160 KB activation
+// vector streamed from L2 for every row, 205 MB of L2 traffic against
+// 210 MB of weights, and the kernel held 1190 GB/s where the 5120-wide
+// gate held 1420 on an RTX PRO 6000. Per row the lane layout, the add
+// order and the tree are `q8_2f_matvec4`'s (the partials are a vec4, one
+// row a component), so the output is the same to the bit. Word-aligned
+// rows only (cols % 16 == 0).
+var<workgroup> partial82x16: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn q8_2f_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let qbytes = p82.rows * p82.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + p82.rows;
+    let ngrp = p82.cols / 4u;
+    let rows = p82.rows;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let r0 = wb * 16u + sub * 4u;
+        let r1 = r0 + 1u;
+        let r2 = r0 + 2u;
+        let r3 = r0 + 3u;
+        let l1 = r1 < rows;
+        let l2 = r2 < rows;
+        let l3 = r3 < rows;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let w0b = r0 * ngrp;
+            let w1b = select(w0b, r1 * ngrp, l1);
+            let w2b = select(w0b, r2 * ngrp, l2);
+            let w3b = select(w0b, r3 * ngrp, l3);
+            var i = l;
+            loop {
+                if (i + 192u >= ngrp) { break; }
+                let x0 = xs82v[i];
+                let x1 = xs82v[i + 64u];
+                let x2 = xs82v[i + 128u];
+                let x3 = xs82v[i + 192u];
+                let s0 = f16x4(cs0h + i * 4u);
+                let s1 = f16x4(cs0h + (i + 64u) * 4u);
+                let s2 = f16x4(cs0h + (i + 128u) * 4u);
+                let s3 = f16x4(cs0h + (i + 192u) * 4u);
+                let a0 = q82[w0b + i];
+                let a1 = q82[w0b + i + 64u];
+                let a2 = q82[w0b + i + 128u];
+                let a3 = q82[w0b + i + 192u];
+                let b0 = q82[w1b + i];
+                let b1 = q82[w1b + i + 64u];
+                let b2 = q82[w1b + i + 128u];
+                let b3 = q82[w1b + i + 192u];
+                let c0 = q82[w2b + i];
+                let c1 = q82[w2b + i + 64u];
+                let c2 = q82[w2b + i + 128u];
+                let c3 = q82[w2b + i + 192u];
+                let d0 = q82[w3b + i];
+                let d1 = q82[w3b + i + 64u];
+                let d2 = q82[w3b + i + 128u];
+                let d3 = q82[w3b + i + 192u];
+                let xs0 = x0 * s0;
+                let xs1 = x1 * s1;
+                let xs2 = x2 * s2;
+                let xs3 = x3 * s3;
+                acc.x = acc.x + dot(i8x4(a0), xs0);
+                acc.x = acc.x + dot(i8x4(a1), xs1);
+                acc.x = acc.x + dot(i8x4(a2), xs2);
+                acc.x = acc.x + dot(i8x4(a3), xs3);
+                acc.y = acc.y + dot(i8x4(b0), xs0);
+                acc.y = acc.y + dot(i8x4(b1), xs1);
+                acc.y = acc.y + dot(i8x4(b2), xs2);
+                acc.y = acc.y + dot(i8x4(b3), xs3);
+                acc.z = acc.z + dot(i8x4(c0), xs0);
+                acc.z = acc.z + dot(i8x4(c1), xs1);
+                acc.z = acc.z + dot(i8x4(c2), xs2);
+                acc.z = acc.z + dot(i8x4(c3), xs3);
+                acc.w = acc.w + dot(i8x4(d0), xs0);
+                acc.w = acc.w + dot(i8x4(d1), xs1);
+                acc.w = acc.w + dot(i8x4(d2), xs2);
+                acc.w = acc.w + dot(i8x4(d3), xs3);
+                i = i + 256u;
+            }
+            loop {
+                if (i >= ngrp) { break; }
+                let xs0 = xs82v[i] * f16x4(cs0h + i * 4u);
+                acc.x = acc.x + dot(i8x4(q82[w0b + i]), xs0);
+                acc.y = acc.y + dot(i8x4(q82[w1b + i]), xs0);
+                acc.z = acc.z + dot(i8x4(q82[w2b + i]), xs0);
+                acc.w = acc.w + dot(i8x4(q82[w3b + i]), xs0);
+                i = i + 64u;
+            }
+        }
+        partial82x16[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) { partial82x16[lid] = partial82x16[lid] + partial82x16[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && r0 < rows) {
+            let t = partial82x16[lid];
+            let rw0 = unpack2x16float(q82[rs0 + (r0 >> 1u)]);
+            let rw2 = unpack2x16float(q82[rs0 + (r2 >> 1u)]);
+            // r0 is a multiple of 4: r0, r1 share a word, r2, r3 the next.
+            y82[r0] = t.x * rw0.x;
+            if (l1) { y82[r1] = t.y * rw0.y; }
+            if (l2) { y82[r2] = t.z * rw2.x; }
+            if (l3) { y82[r3] = t.w * rw2.y; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+// q8_2f decode matvec, four rows a workgroup and the COLUMNS split across
+// the four 64-lane sub-blocks: every lane holds four rows' sums for its
+// quarter of the row, so a step's activations and column scales are loaded
+// once for the four rows (`q8_2f_matvec4` loads them once per row, 20 load
+// instructions for 16 bytes of weights), and the grid stays rows / 4
+// workgroups — 1280 for the 65B's FFN down, 6.8 an SM on an RTX PRO 6000.
+// `q8_2f_matvec16` shared the loads by putting sixteen rows in a workgroup
+// instead: 320 workgroups, 2 on 132 SMs and 1 on 56, and the imbalance ate
+// the gain (down 177 -> 169 us, gate/up 148 -> 153). The four quarter sums
+// of a row are added in a fixed order, so the result is deterministic but
+// not the one-row kernel's bits. Word-aligned rows only (cols % 16 == 0).
+var<workgroup> partial82x4k: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn q8_2f_matvec4k(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let qbytes = p82.rows * p82.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + p82.rows;
+    let ngrp = p82.cols / 4u;
+    let rows = p82.rows;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let qlen = ngrp / 4u;
+    let kend = sub * qlen + qlen;
+    let blocks = (rows + 3u) / 4u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let r0 = wb * 4u;
+        let r1 = r0 + 1u;
+        let r2 = r0 + 2u;
+        let r3 = r0 + 3u;
+        let l1 = r1 < rows;
+        let l2 = r2 < rows;
+        let l3 = r3 < rows;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let w0b = r0 * ngrp;
+            let w1b = select(w0b, r1 * ngrp, l1);
+            let w2b = select(w0b, r2 * ngrp, l2);
+            let w3b = select(w0b, r3 * ngrp, l3);
+            var i = sub * qlen + l;
+            loop {
+                if (i + 192u >= kend) { break; }
+                let x0 = xs82v[i];
+                let x1 = xs82v[i + 64u];
+                let x2 = xs82v[i + 128u];
+                let x3 = xs82v[i + 192u];
+                let s0 = f16x4(cs0h + i * 4u);
+                let s1 = f16x4(cs0h + (i + 64u) * 4u);
+                let s2 = f16x4(cs0h + (i + 128u) * 4u);
+                let s3 = f16x4(cs0h + (i + 192u) * 4u);
+                let a0 = q82[w0b + i];
+                let a1 = q82[w0b + i + 64u];
+                let a2 = q82[w0b + i + 128u];
+                let a3 = q82[w0b + i + 192u];
+                let b0 = q82[w1b + i];
+                let b1 = q82[w1b + i + 64u];
+                let b2 = q82[w1b + i + 128u];
+                let b3 = q82[w1b + i + 192u];
+                let c0 = q82[w2b + i];
+                let c1 = q82[w2b + i + 64u];
+                let c2 = q82[w2b + i + 128u];
+                let c3 = q82[w2b + i + 192u];
+                let d0 = q82[w3b + i];
+                let d1 = q82[w3b + i + 64u];
+                let d2 = q82[w3b + i + 128u];
+                let d3 = q82[w3b + i + 192u];
+                let xs0 = x0 * s0;
+                let xs1 = x1 * s1;
+                let xs2 = x2 * s2;
+                let xs3 = x3 * s3;
+                acc.x = acc.x + dot(i8x4(a0), xs0);
+                acc.x = acc.x + dot(i8x4(a1), xs1);
+                acc.x = acc.x + dot(i8x4(a2), xs2);
+                acc.x = acc.x + dot(i8x4(a3), xs3);
+                acc.y = acc.y + dot(i8x4(b0), xs0);
+                acc.y = acc.y + dot(i8x4(b1), xs1);
+                acc.y = acc.y + dot(i8x4(b2), xs2);
+                acc.y = acc.y + dot(i8x4(b3), xs3);
+                acc.z = acc.z + dot(i8x4(c0), xs0);
+                acc.z = acc.z + dot(i8x4(c1), xs1);
+                acc.z = acc.z + dot(i8x4(c2), xs2);
+                acc.z = acc.z + dot(i8x4(c3), xs3);
+                acc.w = acc.w + dot(i8x4(d0), xs0);
+                acc.w = acc.w + dot(i8x4(d1), xs1);
+                acc.w = acc.w + dot(i8x4(d2), xs2);
+                acc.w = acc.w + dot(i8x4(d3), xs3);
+                i = i + 256u;
+            }
+            loop {
+                if (i >= kend) { break; }
+                let xs0 = xs82v[i] * f16x4(cs0h + i * 4u);
+                acc.x = acc.x + dot(i8x4(q82[w0b + i]), xs0);
+                acc.y = acc.y + dot(i8x4(q82[w1b + i]), xs0);
+                acc.z = acc.z + dot(i8x4(q82[w2b + i]), xs0);
+                acc.w = acc.w + dot(i8x4(q82[w3b + i]), xs0);
+                i = i + 64u;
+            }
+        }
+        partial82x4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) { partial82x4k[lid] = partial82x4k[lid] + partial82x4k[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u && r0 < rows) {
+            let t = ((partial82x4k[0u] + partial82x4k[64u]) + partial82x4k[128u]) + partial82x4k[192u];
+            let rw0 = unpack2x16float(q82[rs0 + (r0 >> 1u)]);
+            let rw2 = unpack2x16float(q82[rs0 + (r2 >> 1u)]);
+            y82[r0] = t.x * rw0.x;
+            if (l1) { y82[r1] = t.y * rw0.y; }
+            if (l2) { y82[r2] = t.z * rw2.x; }
+            if (l3) { y82[r3] = t.w * rw2.y; }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -18498,8 +18750,11 @@ fn rb_rope(head: u32, t: u32, lane: u32) {
     let hd = rb_p.hd;
     let isq = head < nh;
     let pos = rb_p.pos + t;
-    let src_base = select((head - nh) * hd, head * hd, isq);
-    let qoff = t * nh * hd;
+    // Flag 1: a gated Q (q||gate interleaved per head, as `attn_rope_qkn`
+    // reads it); the gate rows are copied out by the caller.
+    let gw = select(1u, 2u, (rb_p.flags & 1u) != 0u);
+    let src_base = select((head - nh) * hd, head * gw * hd, isq);
+    let qoff = t * nh * gw * hd;
     let koff = t * rb_p.nkv * hd;
     let nt = (hd + 31u) / 32u;
     var xv: array<f32, 8>;
@@ -18611,6 +18866,7 @@ fn rope_xb(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) 
 @group(0) @binding(17) var<storage, read_write> rk_kc : array<f32>;
 @group(0) @binding(18) var<storage, read_write> rk_vc : array<f32>;
 @group(0) @binding(19) var<storage, read>       rk_v  : array<f32>;
+@group(0) @binding(20) var<storage, read_write> rk_gout : array<f32>;
 @compute @workgroup_size(32)
 fn rope_kv_x(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let head = wid.x;
@@ -18631,6 +18887,7 @@ fn rope_kv_x(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
     }
     rb_rope(head, 0u, lane);
     let isq = head < nh;
+    let gate = (rb_p.flags & 1u) != 0u;
     let nt = (hd + 31u) / 32u;
     for (var i = 0u; i < nt; i = i + 1u) {
         let d = i * 32u + lane;
@@ -18640,6 +18897,14 @@ fn rope_kv_x(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
             } else {
                 rk_kc[((head - nh) * cap + slot) * hd + d] = rb_head[d];
             }
+        }
+    }
+    // The gate half of a gated head, as `attn_rope_qkn` passes it through.
+    if (isq && gate) {
+        let gbase = head * 2u * hd + hd;
+        for (var i = 0u; i < nt; i = i + 1u) {
+            let d = i * 32u + lane;
+            if (d < hd) { rk_gout[head * hd + d] = rb_qraw[gbase + d]; }
         }
     }
 }
@@ -19123,6 +19388,13 @@ pub struct Ctx {
     q8_2f_mv: wgpu::ComputePipeline,
     /// Four-row unrolled q8_2f decode matvec (`CMF_Q82_MV4=0` off).
     q8_2f_mv4: wgpu::ComputePipeline,
+    /// Four rows a workgroup, the columns split across the sub-blocks
+    /// (`q8_2f_matvec4k`); `CMF_Q82_MV4K=0` falls back to `q8_2f_matvec4`.
+    q8_2f_mv4k: wgpu::ComputePipeline,
+    use_q82_mv4k: bool,
+    /// Sixteen rows a workgroup (`q8_2f_matvec16`), opt-in: `CMF_Q82_MV16=1`.
+    q8_2f_mv16: wgpu::ComputePipeline,
+    use_q82_mv16: bool,
     use_q82_mv4: bool,
     matmat: wgpu::ComputePipeline,
     mul_mm: wgpu::ComputePipeline,
@@ -19242,6 +19514,11 @@ pub struct Ctx {
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     /// Same kernel, the scale read from a device buffer (binding 4).
     q4tp_mm_coop_s: Option<wgpu::ComputePipeline>,
+    /// The same tiled cooperative GEMM over q8_2f weights (`coop_q82_src`):
+    /// the eight-bit file's prompt chunks on the matrix units. The scalar
+    /// int8 GEMM held ~5 TFLOP/s on an RTX PRO 6000 (a 65B at 43 tok/s of
+    /// prompt, 92 s to the first token of 4000). `CMF_Q82_COOP=0` keeps it.
+    q82_mm_coop_s: Option<wgpu::ComputePipeline>,
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
     ffn_silu_packed: wgpu::ComputePipeline,
@@ -19387,6 +19664,9 @@ pub struct Ctx {
     q4tp_mv16nl_x2: wgpu::ComputePipeline,
     q4tp_mv16nl_gu: wgpu::ComputePipeline,
     use_mv_nl: bool,
+    /// Streaming multiprocessors of the card (NVIDIA Vulkan only, from
+    /// `VK_NV_shader_sm_builtins`); None where the driver does not say.
+    sm_count: Option<u32>,
     /// INT8-activation batched matvec (default; `CMF_VERIFY_I8=0`), one pipeline per
     /// batch 2..=8 (index = batch), and its quantizer.
     q4tp_mv4_bk8: Vec<wgpu::ComputePipeline>,
@@ -19476,6 +19756,7 @@ pub struct Ctx {
     g4_sandwich_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
+    dense_split_pipes: std::sync::OnceLock<Option<dense_split::SplitPipes>>,
     amd_mv_pipes: std::sync::OnceLock<Option<amd_mv::AmdMv>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
     q1g_sg_pipes: std::sync::OnceLock<Option<q1g_mv::Q1gSg>>,
@@ -20391,6 +20672,9 @@ struct GraphScratch {
     moe_shared_out: Option<(wgpu::Buffer, u64)>,
     /// The sandwich-normed token-mixer / FFN output (Gemma), before its add.
     ob2: Option<(wgpu::Buffer, u64)>,
+    /// Ripple's value residual: this token's embedding row and the V input.
+    e0: Option<(wgpu::Buffer, u64)>,
+    vin: Option<(wgpu::Buffer, u64)>,
     gbuf: Option<(wgpu::Buffer, u64)>,
     ubuf: Option<(wgpu::Buffer, u64)>,
     abuf: Option<(wgpu::Buffer, u64)>,
@@ -20959,6 +21243,36 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
+/// Streaming multiprocessors of an NVIDIA card on Vulkan, from
+/// `VK_NV_shader_sm_builtins` (`shaderSMCount`). None on other vendors,
+/// backends and platforms. The narrow-matvec grid cap scales with it.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+fn vulkan_sm_count(adapter: &wgpu::Adapter) -> Option<u32> {
+    use ash::vk;
+    if adapter.get_info().backend != wgpu::Backend::Vulkan {
+        return None;
+    }
+    unsafe {
+        let hal = adapter.as_hal::<wgpu::hal::api::Vulkan>()?;
+        let phd = hal.raw_physical_device();
+        let inst = hal.shared_instance().raw_instance();
+        let exts = inst.enumerate_device_extension_properties(phd).ok()?;
+        let want = vk::NV_SHADER_SM_BUILTINS_NAME;
+        if !exts.iter().any(|e| e.extension_name_as_c_str().ok() == Some(want)) {
+            return None;
+        }
+        let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
+        inst.get_physical_device_properties2(phd, &mut props);
+        (sm.shader_sm_count > 0).then_some(sm.shader_sm_count)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+fn vulkan_sm_count(_adapter: &wgpu::Adapter) -> Option<u32> {
+    None
+}
+
 /// Adapters in the engine's preference order — the order `cortiq gpu`
 /// lists, `CMF_GPU_ADAPTER=<n>` and the multi-GPU device index count in,
 /// and whose first entry a plain run takes. Real GPUs before software
@@ -21369,6 +21683,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q8_2f_mv = pipe("q8_2f_matvec");
     let q8_2f_mv4 = pipe("q8_2f_matvec4");
     let use_q82_mv4 = std::env::var("CMF_Q82_MV4").map(|v| v != "0").unwrap_or(true);
+    let q8_2f_mv4k = pipe("q8_2f_matvec4k");
+    let use_q82_mv4k = std::env::var("CMF_Q82_MV4K").as_deref() != Ok("0");
+    let q8_2f_mv16 = pipe("q8_2f_matvec16");
+    let use_q82_mv16 = std::env::var("CMF_Q82_MV16").as_deref() == Ok("1");
     let matmat = pipe("q8_matmat");
     let mul_mm = pipe("q8_mul_mm");
     let q1_mm = pipe("q1_mul_mm");
@@ -21608,6 +21926,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mm_coop_s = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_MM_SRC, "q4tp-coop-s", "q4tp_mm_coop_s"))
         .flatten();
+    let q82_mm_coop_s = (q4tp_mm_coop.is_some()
+        && std::env::var("CMF_Q82_COOP").as_deref() != Ok("0"))
+        .then(|| mk_coop(&coop_q82_src(), "q82-coop-s", "q82_mm_coop_s"))
+        .flatten();
 
     // The bake's f32 forward/backward GEMMs on the same units, guarded the
     // same way: a validation error must cost the pipeline, never the device.
@@ -21798,6 +22120,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv16nl_x2 = pipe("q4tp_matvec16nl_x2");
     let q4tp_mv16nl_gu = pipe("q4tp_matvec16nl_gu");
     let use_mv_nl = std::env::var("CMF_MV_NOLAD").map(|v| v != "0").unwrap_or(true);
+    let sm_count = vulkan_sm_count(&adapter);
     let q4tp_mv4_bk8: Vec<wgpu::ComputePipeline> = (0..=8u32)
         .map(|nb| {
             let cs = [("NB8", nb.clamp(2, 8) as f64)];
@@ -22302,6 +22625,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
         matvec_tiled,
         q8_2f_mv,
         q8_2f_mv4,
+        q8_2f_mv4k,
+        use_q82_mv4k,
+        q8_2f_mv16,
+        use_q82_mv16,
         use_q82_mv4,
         matmat,
         mul_mm,
@@ -22387,6 +22714,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q2tp_mm_coop,
         q4tp_mm_coop,
         q4tp_mm_coop_s,
+        q82_mm_coop_s,
         ffn_silu_packed,
         act_absmax,
         dit_gemm_coop,
@@ -22486,6 +22814,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv16nl_x2,
         q4tp_mv16nl_gu,
         use_mv_nl,
+        sm_count,
         q4tp_mv4_bk8,
         q4tp_mv4_bk8s,
         q4tp_mv4_bk8h,
@@ -22532,6 +22861,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_dec_pipe: std::sync::OnceLock::new(),
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
+        dense_split_pipes: std::sync::OnceLock::new(),
         amd_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
         mxfp4_pipes: std::sync::OnceLock::new(),
@@ -23842,6 +24172,12 @@ fn gu_pipe(c: &Ctx) -> &wgpu::ComputePipeline {
 /// kernel. Returns the pipeline and the rows each workgroup owns.
 fn q82_pipe(c: &Ctx, cols: usize) -> (&wgpu::ComputePipeline, u32) {
     if c.use_q82_mv4 && cols % 16 == 0 {
+        if c.use_q82_mv16 {
+            return (&c.q8_2f_mv16, 16);
+        }
+        if c.use_q82_mv4k {
+            return (&c.q8_2f_mv4k, 4);
+        }
         (&c.q8_2f_mv4, 4)
     } else {
         (&c.q8_2f_mv, 1)
@@ -24387,12 +24723,13 @@ fn mv_gu_bind(
     inter: usize,
     cols: usize,
     act_code: u32,
+    lim_bits: u32,
 ) -> (wgpu::BindGroup, u32) {
     let gpr = cols / 32;
-    // `_p0` carries the swiglu limit as f32 bits; the token graph's dense
-    // FFN has none (0.0), which is what silu_mul_pre gets there too.
+    // `_p0` carries the swiglu limit as f32 bits (0 = none; Ripple's dense
+    // FFN clamps at its `ffn_clamp`), which is what silu_mul_pre gets too.
     // `_p1` is the activation (`GraphAct::code`, 0 = SiLU).
-    let p_buf = uniform_u32x4(c, [gpr as u32, inter as u32, 0, act_code]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, inter as u32, lim_bits, act_code]);
     let layout = gu_pipe(c).get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-gu"),
@@ -24633,19 +24970,26 @@ fn verify_coop_on() -> bool {
 /// cap on the wide gate+up LOST 6.5% — so it applies only below
 /// `CMF_MV_NARROW_BLOCKS` (default 1024) row blocks. `CMF_MV_GRID`
 /// (a cap for every shape) still overrides both.
+///
+/// The 192 was four workgroups per SM of that 48-SM card. The same
+/// literal on a 188-SM RTX PRO 6000 is one workgroup per SM: the
+/// attention projections and the down of a 65B q4tp (Ripple, hidden
+/// 5120) measured 38.5 ms a token against 37.1 with the cap off. The
+/// default is therefore four per SM where the driver reports the count
+/// (`VK_NV_shader_sm_builtins`), and 192 where it does not.
 fn mv_grid_narrow() -> (u32, u32) {
-    static N: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let cap = std::env::var("CMF_MV_GRID_NARROW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(192);
+    static N: std::sync::OnceLock<(Option<u32>, u32)> = std::sync::OnceLock::new();
+    let (cap, blocks) = *N.get_or_init(|| {
+        let cap = std::env::var("CMF_MV_GRID_NARROW").ok().and_then(|v| v.parse().ok());
         let blocks = std::env::var("CMF_MV_NARROW_BLOCKS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024);
         (cap, blocks)
-    })
+    });
+    // Not cached: the context may not be up at the first call.
+    let per_sm = || ctx().and_then(|c| c.sm_count).map(|n| 4 * n).unwrap_or(192);
+    (cap.unwrap_or_else(per_sm), blocks)
 }
 
 fn mv_grid(blocks: u32) -> u32 {
@@ -24661,6 +25005,16 @@ fn mv_grid(blocks: u32) -> u32 {
         }
     };
     g.max(1).min(MAX_WG)
+}
+
+fn graph_first_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GRAPH_FIRST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
 }
 
 fn graph_split_n() -> usize {
@@ -26793,10 +27147,15 @@ fn graph_layer_payload_bytes(
     }
     match &layer.ffn {
         crate::gpu::GraphFfn::AttentionOnly => {}
-        crate::gpu::GraphFfn::Dense { gate, up, down, .. } => {
+        crate::gpu::GraphFfn::Dense { gate, up, down, hot, .. } => {
             add(gate)?;
             add(up)?;
             add(down)?;
+            if let Some(h) = hot {
+                add(&h.gate)?;
+                add(&h.up)?;
+                add(&h.down)?;
+            }
         }
         crate::gpu::GraphFfn::Moe {
             router,
@@ -26973,7 +27332,10 @@ pub fn forward_token_graph(
                 graph_decline("DASH geometry outside the kernels");
                 return token_graph_outcome(o1_started || state_started, false);
             }
-            if *output_gate {
+            // An element-wise output gate (Ripple) rides the split rope kernel
+            // and the gate multiply after the attend; the kernels that fold
+            // the rope into the append or the gate into the attend do not.
+            if *output_gate && (g.dv != g.hd || g.dash.is_some() || g.v_norm) {
                 graph_decline("per-layer attention geometry with an output gate");
                 return token_graph_outcome(o1_started || state_started, false);
             }
@@ -27038,7 +27400,11 @@ pub fn forward_token_graph(
         width: usize,
         /// Always SiLU: its public graph descriptor carries no activation
         /// contract, and construction admits only an explicit SiLU expert.
+        /// A dense layer's hot triple carries the layer's own.
         act: u32,
+        /// The clamp on the pre-activations (a dense layer's hot triple on
+        /// Ripple), 0 = none.
+        lim: f32,
     }
     enum LFfn {
         Dense {
@@ -27053,6 +27419,11 @@ pub fn forward_token_graph(
             width: usize,
             /// `GraphAct::code` of act(gate)·up.
             act: u32,
+            /// The clamp on the pre-activations (Ripple), 0 = none.
+            lim: f32,
+            /// The layer's hot neurons in their own codec: a second triple
+            /// whose output is added to the first one's (`cortiq hot-bake`).
+            hot: Option<LDetachedShared>,
         },
         Moe {
             router: GMat,
@@ -27459,7 +27830,39 @@ pub fn forward_token_graph(
                 up,
                 down,
                 act,
+                limit,
+                hot,
             } => {
+                let hot = match hot {
+                    Some(h) => {
+                        let (Some(hg), Some(hu), Some(hdn)) = (
+                            resolve(&h.gate, h.width, hidden),
+                            resolve(&h.up, h.width, hidden),
+                            resolve(&h.down, hidden, h.width),
+                        ) else {
+                            graph_decline("hot FFN triple resolve");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        };
+                        // The detached-triple path's contract: plain q4tp or q8_2f.
+                        if !(hg.kind == 6 || hg.kind == 7)
+                            || hu.kind != hg.kind
+                            || hdn.kind != hg.kind
+                            || [&hg, &hu, &hdn].iter().any(|m| m.prism != crate::gpu::GraphPrismOp::None || m.affine)
+                        {
+                            graph_decline("hot FFN triple is not plain q4tp or q8_2f");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        Some(LDetachedShared {
+                            gate: hg,
+                            up: hu,
+                            down: hdn,
+                            width: h.width,
+                            act: act.code(),
+                            lim: *limit,
+                        })
+                    }
+                    None => None,
+                };
                 // The tensor knows its own width; the config only knows
                 // the widest. Ask the weight.
                 let ffn_w = model
@@ -27483,6 +27886,8 @@ pub fn forward_token_graph(
                     down,
                     width: ffn_w,
                     act: act.code(),
+                    lim: *limit,
+                    hot,
                 }
             }
             crate::gpu::GraphFfn::Moe {
@@ -27576,6 +27981,7 @@ pub fn forward_token_graph(
                             down,
                             width: shared.width,
                             act: detached_shared_graph_act_code(act.code()),
+                            lim: 0.0,
                         })
                     }
                     None => None,
@@ -27802,13 +28208,21 @@ pub fn forward_token_graph(
         cb.insert(key, (b.clone(), 0));
         b
     };
+    // CMF_GRAPH_PROF: how much of the encode the uniform buffers cost.
+    let unif_ns = std::cell::Cell::new(0u64);
+    let unif_n = std::cell::Cell::new(0u32);
     let unif = |d: &[u32]| {
-        c.device
+        let t = std::time::Instant::now();
+        let b = c
+            .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(d),
                 usage: wgpu::BufferUsages::UNIFORM,
-            })
+            });
+        unif_ns.set(unif_ns.get() + t.elapsed().as_nanos() as u64);
+        unif_n.set(unif_n.get() + 1);
+        b
     };
     let mk_bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
         let e: Vec<_> = bufs
@@ -27944,6 +28358,35 @@ pub fn forward_token_graph(
         Some(GraphScratch::ensure(&c.device, &mut gs.ob2, (hidden * 4) as u64, st, "g-ob2"))
     } else {
         None
+    };
+    // Ripple's value residual: a layer's V reads its normed row blended with
+    // the token's embedding row, which the host hands over with the geometry.
+    let vres_row = layers.iter().find_map(|l| match &l.attn {
+        crate::gpu::GraphAttn::Full { geom: Some(g), .. } => g.vres.map(|v| v.1),
+        _ => None,
+    });
+    let vres_bufs = match vres_row {
+        Some(row) => {
+            let Some(vp) = vres::pipe(c) else {
+                graph_decline("value-residual kernel unavailable");
+                return token_graph_outcome(o1_started || state_started, false);
+            };
+            if steps != 1 || row.len() < hidden {
+                graph_decline("value residual in a multi-step frame");
+                return token_graph_outcome(o1_started || state_started, false);
+            }
+            let e0 = GraphScratch::ensure(
+                &c.device,
+                &mut gs.e0,
+                (hidden * 4) as u64,
+                st | wgpu::BufferUsages::COPY_DST,
+                "g-e0",
+            );
+            let vin = GraphScratch::ensure(&c.device, &mut gs.vin, (hidden * 4) as u64, st, "g-vin");
+            c.queue.write_buffer(&e0, 0, bytemuck::cast_slice(&row[..hidden]));
+            Some((vp, e0, vin))
+        }
+        None => None,
     };
     let gbuf = GraphScratch::ensure(&c.device, &mut gs.gbuf, (inter * 4) as u64, st, "g-gbuf");
     let ubuf = GraphScratch::ensure(&c.device, &mut gs.ubuf, (inter * 4) as u64, st, "g-ubuf");
@@ -28951,7 +29394,15 @@ pub fn forward_token_graph(
                     {
                         return Some(t);
                     }
-                    // Warp-per-row twin of 16nl (same rows to the bit).
+                    // Column-split twin of 16nl for the short narrow
+                    // projections (same rows to the bit), then the
+                    // warp-per-row twin.
+                    if c.use_mv_nl
+                        && c.q4tp_mv16w_probe.is_none()
+                        && let Some(t) = dense_split::prep(c, xs, cols, &m.buf, y, rows)
+                    {
+                        return Some(t);
+                    }
                     if c.use_mv_nl
                         && c.q4tp_mv16w_probe.is_none()
                         && let Some(t) = dense_mv::sg_prep(c, xs, cols, &[(&m.buf, y, rows)])
@@ -29452,11 +29903,26 @@ pub fn forward_token_graph(
         } else {
             usize::MAX
         };
+        // The FIRST piece is shorter (`CMF_GRAPH_FIRST`, default 2 layers;
+        // 0 = a whole chunk): the card idles until it is encoded and
+        // submitted, and that wait is paid every token. Ripple-65B on an
+        // RTX PRO 6000: a five-layer first piece was ~0.8 ms of a 35 ms token.
+        let first = if chunk == usize::MAX { usize::MAX } else { graph_first_chunk().min(chunk) };
+        let boundary = |li: usize| -> bool {
+            if li == 0 || chunk == usize::MAX {
+                return false;
+            }
+            if first == 0 || first >= chunk {
+                li % chunk == 0
+            } else {
+                li == first || (li > first && (li - first) % chunk == 0)
+            }
+        };
         for (li, l) in layers.iter().enumerate() {
             if li >= layer_cap {
                 break;
             }
-            if li > 0 && chunk != usize::MAX && li % chunk == 0 {
+            if boundary(li) {
                 flush_pass(&enc);
                 let full = std::mem::replace(
                     &mut enc,
@@ -29562,12 +30028,89 @@ pub fn forward_token_graph(
                             return token_graph_outcome(o1_started || state_started, false);
                         }
                     };
+                    // Ripple's value residual: V projects the normed row
+                    // pulled toward the embedding row, K and Q the normed row.
+                    // With q8_2f K and V the lerp rides inside the fused
+                    // projection kernel (`q82_mv3v`): no blend dispatch, and
+                    // K and V (and a q8_2f Q) in one dispatch. Measured on an
+                    // RTX PRO 6000: the four-dispatch stage was 90 µs a layer
+                    // for 37 MB of weights. `CMF_VRES_FUSE=0` is the bisect.
+                    let vres_fuse = match (geom.and_then(|g| g.vres), vres_bufs.as_ref()) {
+                        (Some((blend, _)), Some((_, e0b, _)))
+                            if group
+                                && wk.kind == 7
+                                && wv.kind == 7
+                                && wk.prism == crate::gpu::GraphPrismOp::None
+                                && wv.prism == crate::gpu::GraphPrismOp::None
+                                && hidden % 16 == 0
+                                && bias.is_none()
+                                && moe_r4::pipes(c).is_some_and(|p| p.mv3v.is_some()) =>
+                        {
+                            Some((blend, e0b.clone()))
+                        }
+                        _ => None,
+                    };
+                    let v_in = match (geom.and_then(|g| g.vres), vres_bufs.as_ref()) {
+                        _ if vres_fuse.is_some() => None,
+                        (Some((blend, _)), Some((vp, e0b, vinb))) => {
+                            let u = uniform_u32x4(c, vres::params(blend, hidden));
+                            go(
+                                &mut enc,
+                                vp,
+                                &bgc(110, li, &vp.get_bind_group_layout(0), &[&n1, e0b, vinb, &u]),
+                                vres::grid(hidden).0,
+                            );
+                            match prism_input(&mut enc, &[wv], vinb, hidden) {
+                                Some(x) => Some(x),
+                                None => {
+                                    graph_decline("Prism V transform unavailable");
+                                    return token_graph_outcome(o1_started || state_started, false);
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
                     // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
                     // kernel splits it, roping q and passing gate through to `gout`.
                     let qrows = nh * hd * (1 + *output_gate as usize);
+                    let fused_v = if let Some((blend, e0b)) = &vres_fuse {
+                        let q_in = (wq.kind == 7 && wq.prism == crate::gpu::GraphPrismOp::None)
+                            .then_some((&wq.buf, &qraw, qrows));
+                        ts_point!(enc, 28); // CMF_GRAPH_TS_ALL: the layer's prologue
+                        let ok = moe_r4::mv3v_encode(
+                            c,
+                            &mut enc,
+                            &qkv_in,
+                            e0b,
+                            *blend,
+                            hidden,
+                            [q_in, Some((&wk.buf, &kb, lnkv * hd)), Some((&wv.buf, &vb, lnkv * ldv))],
+                        );
+                        if !ok {
+                            graph_decline("fused value-residual projection unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        ts_point!(enc, 26); // CMF_GRAPH_TS_ALL: fused k+v(+q) projection
+                        if q_in.is_none() {
+                            // A four-bit Q on its own dispatch beside the pair.
+                            match prep(wq, &qkv_in, &qraw, qrows, hidden) {
+                                Some((pq, bq, wgq)) => {
+                                    let mut pass = begin_pass(&mut enc);
+                                    pass.set_pipeline(pq);
+                                    pass.set_bind_group(0, &bq, &[]);
+                                    pass.dispatch_workgroups(wgq, 1, 1);
+                                }
+                                None => group_mats_at(&mut enc, &[(wq, &qkv_in, &qraw, qrows, hidden)], 80, li),
+                            }
+                            ts_point!(enc, 27); // CMF_GRAPH_TS_ALL: the four-bit q projection
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     // k+v in ONE dispatch (the x2 kernel) next to q, when
                     // both are wide q4tp; otherwise the grouped pass.
-                    let pkv = if group {
+                    let pkv = if group && v_in.is_none() && !fused_v {
                         prep2(wk, wv, &qkv_in, &kb, &vb, lnkv * hd, lnkv * ldv, hidden)
                     } else {
                         None
@@ -29576,6 +30119,8 @@ pub fn forward_token_graph(
                     // to the three `q8_2f_matvec4` dispatches it replaces).
                     let mv3 = if group
                         && pkv.is_none()
+                        && v_in.is_none()
+                        && !fused_v
                         && wq.kind == 7
                         && wk.kind == 7
                         && wv.kind == 7
@@ -29598,8 +30143,9 @@ pub fn forward_token_graph(
                                 (&wv.buf, &vb, lnkv * ldv),
                             ],
                         );
-                    if sg3 {
-                        // encoded by the warp-per-row kernel
+                    if fused_v || sg3 {
+                        // encoded above (the fused value-residual kernel, or
+                        // the warp-per-row kernel)
                     } else if let Some((p3, l3)) = mv3 {
                         let (rk, rv) = (lnkv * hd, lnkv * ldv);
                         let u3 = uniform_u32x4(
@@ -29641,7 +30187,7 @@ pub fn forward_token_graph(
                             &[
                                 (wq, &qkv_in, &qraw, qrows, hidden),
                                 (wk, &qkv_in, &kb, lnkv * hd, hidden),
-                                (wv, &qkv_in, &vb, lnkv * ldv, hidden),
+                                (wv, v_in.as_ref().unwrap_or(&qkv_in), &vb, lnkv * ldv, hidden),
                             ],
                             80,
                             li,
@@ -29879,8 +30425,11 @@ pub fn forward_token_graph(
                         // merge. `CMF_G4_DEC=0`: the per-head split below.
                         // Past ATTEND_SPLIT_MIN only: at a short context its
                         // two workgroups a layer lose to one a head.
+                        // Ripple too: ten heads a KV group are past `xg`'s
+                        // eight, and its per-head kernels read a sliding
+                        // layer's 1024 rows once for each of 80 heads.
                         let g4dec = gemma_batch::dec_pipe(c).filter(|_| {
-                            g.v_norm
+                            (g.v_norm || nh / g.nkv.max(1) > 8)
                                 && hg.is_none()
                                 && xg.is_none()
                                 && n > ATTEND_SPLIT_MIN
@@ -29948,9 +30497,11 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &bg_vn, &[]);
                             pass.dispatch_workgroups(g.nkv as u32, 1, 1);
                         }
-                        // RoPE + append fused, for a layer without an output
-                        // gate (the fused kernel does not split q||gate).
-                        let rkv = gx.rope_kv.as_ref().filter(|_| !*output_gate && hd <= 256 && g.dash.is_none());
+                        // RoPE + append fused; a gated layer's q||gate is
+                        // split by the kernel (flag 1), the gate half to
+                        // `gout`. It was two dispatches on gated layers
+                        // (16 us a layer on an RTX PRO 6000, Ripple-65B).
+                        let rkv = gx.rope_kv.as_ref().filter(|_| hd <= 256 && g.dash.is_none());
                         if let (Some((rp, rl)), false) = (rkv, skip_attn) {
                             let bg_rk = bind_pairs(
                                 c,
@@ -29966,6 +30517,7 @@ pub fn forward_token_graph(
                                     (17, kbuf),
                                     (18, vbuf),
                                     (19, &vb),
+                                    (20, &gout),
                                 ],
                             );
                             let mut pass = begin_pass(&mut enc);
@@ -30465,6 +31017,16 @@ pub fn forward_token_graph(
                         {
                             if wo.kind == crate::gpu::GRAPH_KIND_BLR {
                                 blr_enc(&mut enc, &[(wo, &ob)], &wo_in, None, 84, li);
+                            } else if let Some((po, bo, wgo)) = prep(wo, &wo_in, &ob, hidden, nh * ldv) {
+                                // The decode kernel choice of the projections
+                                // above (column-split / warp-per-row), not the
+                                // generic 16-row kernel: on an RTX PRO 6000 the
+                                // 65B's o projection (5120 x 10240) streamed at
+                                // 850 GB/s against the FFN's 1400 that way.
+                                let mut pass = begin_pass(&mut enc);
+                                pass.set_pipeline(po);
+                                pass.set_bind_group(0, &bo, &[]);
+                                pass.dispatch_workgroups(wgo, 1, 1);
                             } else {
                                 emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
                             }
@@ -30907,7 +31469,7 @@ pub fn forward_token_graph(
                 LFfn::Moe {
                     detached_shared: Some(_),
                     ..
-                }
+                } | LFfn::Dense { hot: Some(_), .. }
             );
             let simple_tail = fuse_tail
                 && !loop_norm_at.contains(&li)
@@ -31172,15 +31734,25 @@ pub fn forward_token_graph(
                     down,
                     width,
                     act,
+                    lim,
+                    hot,
                 } => {
+                    // The hot triple reads the same normed input and adds to
+                    // `ob` before the residual tail (the block below the match).
+                    deferred_shared = hot.as_ref();
                     let inter = *width; // this layer's, not the model's
                     let act = *act;
+                    // Ripple's clamp rides the kernels' swiglu-limit word.
+                    let lim_bits = if *lim > 0.0 { lim.to_bits() } else { 0 };
+                    let lim_u = (lim_bits != 0)
+                        .then(|| uniform_u32x4(c, [inter as u32, 0, lim_bits, act]));
                     // act(gate)·up's uniform: SiLU's is the historical one.
-                    let act_u = match act {
-                        0 => &silu_u,
-                        2 => &gelu_tanh_u,
-                        3 => &swiglu_oai_m3_u,
-                        _ => &gelu_u,
+                    let act_u = match (&lim_u, act) {
+                        (Some(u), _) => u,
+                        (None, 0) => &silu_u,
+                        (None, 2) => &gelu_tanh_u,
+                        (None, 3) => &swiglu_oai_m3_u,
+                        (None, _) => &gelu_u,
                     };
                     let mut continue_ffn = false;
                     // DUAL (CMF_MV_DUAL=1): gate and up in ONE dispatch —
@@ -31190,6 +31762,7 @@ pub fn forward_token_graph(
                     // path whenever either side is not plain q4tp.
                     if c.use_mv_dual
                         && act == 0 // the dsilu-down epilogue is SiLU-only
+                        && lim_bits == 0 // and takes no clamp
                         && gate.kind == 2
                         && up.kind == 2
                         && gate.prism == crate::gpu::GraphPrismOp::None
@@ -31314,6 +31887,7 @@ pub fn forward_token_graph(
                                 .then(|| {
                                     dense_mv::sg_gu_prep(
                                         c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act,
+                                        lim_bits,
                                     )
                                 })
                                 .flatten()
@@ -31322,6 +31896,7 @@ pub fn forward_token_graph(
                                 None => {
                                     let (b, w) = mv_gu_bind(
                                         c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act,
+                                        lim_bits,
                                     );
                                     Some((gu_pipe(c), b, w))
                                 }
@@ -31460,6 +32035,7 @@ pub fn forward_token_graph(
                                 down_rode_along = true;
                             }
                         } else if act != 3
+                            && lim_bits == 0
                             && gate.kind == crate::gpu::GRAPH_KIND_BLR
                             && up.kind == crate::gpu::GRAPH_KIND_BLR
                         {
@@ -32230,6 +32806,7 @@ pub fn forward_token_graph(
                 // gate+up+SiLU projection rather than adding four launches
                 // to every one of the 47 MoE layers.  The generic pair and
                 // scalar fallback retain ownership of every other device.
+                let shared_lim = if shared.lim > 0.0 { shared.lim.to_bits() } else { 0 };
                 let gu_fused = c.use_mv_gu
                     && c.use_mv4
                     && shared.gate.kind == 6
@@ -32252,6 +32829,7 @@ pub fn forward_token_graph(
                                 shared.width,
                                 hidden,
                                 shared.act,
+                                shared_lim,
                             )
                         })
                         .flatten()
@@ -32265,6 +32843,7 @@ pub fn forward_token_graph(
                                 shared.width,
                                 hidden,
                                 shared.act,
+                                shared_lim,
                             );
                             Some((gu_pipe(c), b, w))
                         })
@@ -32295,7 +32874,7 @@ pub fn forward_token_graph(
                         );
                     }
                     let shared_silu_u =
-                        uniform_u32x4(c, [shared.width as u32, 0, 0, shared.act]);
+                        uniform_u32x4(c, [shared.width as u32, 0, shared_lim, shared.act]);
                     go(
                         &mut enc,
                         &c.silu,
@@ -32856,6 +33435,9 @@ pub fn forward_token_graph(
                     (14, _) => "|gdn:outp",
                     (15, _) => "|gdn:x2", // the wide qkv+z projection
                     (20, _) => "|attn:qkv",
+                    (26, _) => "|attn:kvp",
+                    (28, _) => "|attn:pro",
+                    (27, _) => "|attn:q",
                     (21, _) => "|attn:rope",
                     (22, _) => "|attn:kv",
                     (23, _) => "|attn:attend",
@@ -32967,7 +33549,9 @@ pub fn forward_token_graph(
     if prof {
         let setup = t_enc0.duration_since(t_start).as_secs_f64() * 1000.0;
         eprintln!(
-            "token-graph: setup {setup:.2} ms | encode {t_enc:.2} ms | tail+submit+readback {:.2} ms",
+            "token-graph: setup {setup:.2} ms | encode {t_enc:.2} ms (uniforms {} × {:.2} ms) | tail+submit+readback {:.2} ms",
+            unif_n.get(),
+            unif_ns.get() as f64 / 1e6,
             t_sub0.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -33227,10 +33811,10 @@ pub fn forward_batch_graph_at(
                 return batch_outcome(o1_started || state_started, false);
             }
         }
-        if !g4_model
-            && (l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some())
-        {
-            bgraph_refused("sandwich norms / layer scale outside Gemma-4");
+        // Sandwich norms outside Gemma-4 (Ripple) take the plain tails
+        // below; the layer scalar lives in Gemma-4's add-norm kernel only.
+        if !g4_model && l.layer_scale.is_some() {
+            bgraph_refused("layer scale outside Gemma-4");
             return batch_outcome(o1_started || state_started, false);
         }
         if let crate::gpu::GraphAttn::Full { geom: Some(g), .. } = &l.attn {
@@ -33251,7 +33835,9 @@ pub fn forward_batch_graph_at(
                 bgraph_refused(reason);
                 return batch_outcome(o1_started || state_started, false);
             }
-            if *output_gate {
+            // As the token graph: the gate rides the per-token loop's split
+            // rope kernel and a gate multiply after its attend.
+            if *output_gate && (g.dv != g.hd || g.dash.is_some() || g.v_norm) {
                 bgraph_refused("per-layer attention geometry with an output gate");
                 return batch_outcome(o1_started || state_started, false);
             }
@@ -33373,6 +33959,11 @@ pub fn forward_batch_graph_at(
             width: usize,
             /// `GraphAct::code` of act(gate)·up (0 SiLU; Gemma-4: 2).
             act: u32,
+            /// The clamp on the pre-activations (Ripple), 0 = none.
+            lim: f32,
+            /// The layer's hot neurons in their own codec: gate, up, down,
+            /// width; their output is added to the first triple's.
+            hot: Option<(GMat, GMat, GMat, usize)>,
         },
         Moe {
             /// A wider shared expert outside the bank: gate, up, down, width.
@@ -33631,7 +34222,27 @@ pub fn forward_batch_graph_at(
                 up: lu,
                 down: ld,
                 act: lact,
+                limit: llim,
+                hot: lhot,
             } => {
+                let hot = match lhot {
+                    Some(h) => {
+                        let (Some(hg), Some(hu), Some(hdn)) = (
+                            resolve(&h.gate, h.width, hidden),
+                            resolve(&h.up, h.width, hidden),
+                            resolve(&h.down, hidden, h.width),
+                        ) else {
+                            bgraph_refused("hot FFN triple resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        };
+                        if !(gemmable(&hg) && gemmable(&hu) && gemmable(&hdn)) || h.width > inter {
+                            bgraph_refused("hot FFN triple not gemmable");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                        Some((hg, hu, hdn, h.width))
+                    }
+                    None => None,
+                };
                 // Per-layer FFN width, from the weight rather than the
                 // header — a pruned model narrows it layer by layer.
                 let ffn_w = model
@@ -33659,6 +34270,8 @@ pub fn forward_batch_graph_at(
                     down,
                     width: ffn_w,
                     act: lact.code(),
+                    lim: *llim,
+                    hot,
                 }
             }
             crate::gpu::GraphFfn::Moe {
@@ -33888,8 +34501,15 @@ pub fn forward_batch_graph_at(
             let Some(li) = gl.checked_sub(layer_base).filter(|&li| li < layers.len()) else {
                 continue;
             };
-            let plain = matches!(&layers[li].attn, crate::gpu::GraphAttn::Full { geom: None, .. })
-                && o1.get(li).is_none_or(Option::is_none);
+            let plain = match &layers[li].attn {
+                crate::gpu::GraphAttn::Full { geom: None, .. } => true,
+                // Ripple's gated layers: the token-axis arm copies the same rows out.
+                crate::gpu::GraphAttn::Full { geom: Some(g), output_gate, .. } => {
+                    gated_geom_bt(c, g, nh, g.hd, *output_gate, k).is_some()
+                        && positions.windows(2).all(|w| w[1] == w[0] + 1)
+                }
+                _ => false,
+            } && o1.get(li).is_none_or(Option::is_none);
             if !plain || spec.is_some() || preview.is_some() {
                 bgraph_refused("o1 query capture needs the plain attention arm");
                 return batch_outcome(o1_started || state_started, false);
@@ -34036,6 +34656,28 @@ pub fn forward_batch_graph_at(
     // Layer outputs a caller asked to keep (`layer_taps_arm`), every row's.
     let layer_taps = layer_taps_plan(c, layer_base, layers.len(), k, hidden);
     let n1 = rwc(k * hidden);
+    // Ripple's value residual: the chunk's embedding rows (from the host with
+    // the geometry) and the blended V input of the layer being encoded.
+    let vres_rows = layers.iter().find_map(|l| match &l.attn {
+        crate::gpu::GraphAttn::Full { geom: Some(g), .. } => g.vres.map(|v| v.1),
+        _ => None,
+    });
+    let vres_bufs = match vres_rows {
+        Some(rows) => {
+            let Some(vp) = vres::pipe(c) else {
+                bgraph_refused("value-residual kernel unavailable");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            if rows.len() < k * hidden {
+                bgraph_refused("value residual: the chunk's embedding rows are missing");
+                return batch_outcome(o1_started || state_started, false);
+            }
+            let e0 = rwc(k * hidden);
+            c.queue.write_buffer(&e0, 0, bytemuck::cast_slice(&rows[..k * hidden]));
+            Some((vp, e0, rwc(k * hidden)))
+        }
+        None => None,
+    };
     // The token graph's Prism transform is one 1024-block per activation
     // row.  Reuse that shader for the batched graph by carrying an explicit
     // row count in FwhtP; the sign table remains one validated vector per
@@ -34163,10 +34805,19 @@ pub fn forward_batch_graph_at(
     // Gemma-4: normed + rotated Q rows of the run, and the sandwich-normed
     // mixer / FFN output before its residual add.
     let g4_bufs = g4p.map(|_| (rwc(k * nh * max_hd), rwc(k * hidden)));
+    // A sandwich-normed mixer / FFN output outside Gemma-4, before its add.
+    let sand_ob2 = (g4p.is_none()
+        && layers.iter().any(|l| l.attn_out_norm.is_some() || l.ffn_out_norm.is_some()))
+    .then(|| rwc(k * hidden));
     let qkv_b = rwc(k * gcdim);
     let z_b = rwc(k * gnv * gdv);
     let gdo_b = rwc(k * gnv * gdv);
     let ob = rwc(k * hidden);
+    // One more output for the layers with a hot triple.
+    let hot_ob = lws
+        .iter()
+        .any(|lw| matches!(&lw.ffn, BFfn::Dense { hot: Some(_), .. }))
+        .then(|| rwc(k * hidden));
     let gbuf = rwc(k * inter);
     let ubuf = rwc(k * inter);
     let abuf = rwc(k * inter);
@@ -34398,6 +35049,8 @@ pub fn forward_batch_graph_at(
         && BATCH_Q82_MM.with(|f| f.get())
         && std::env::var("CMF_Q82_MM").as_deref() != Ok("0");
     let q82mm_p = g4p.or_else(|| (preview.is_some() || q82_prompt).then(|| gemma_batch::pipes(c)).flatten());
+    // Prompt chunks only: no preview, no speculative verify.
+    let q82_coop_chunk = preview.is_none() && spec.is_none();
     let ematb = |enc: &mut wgpu::CommandEncoder,
                  m: &GMat,
                  xs: &wgpu::Buffer,
@@ -34416,6 +35069,47 @@ pub fn forward_batch_graph_at(
             // In a preview only wide matrices take it: one 64-row tile a
             // workgroup leaves a 2048-row projection 32 workgroups (the
             // GDN out_proj measured 3.4 → 7.5 ms a pass on an RTX 5090).
+            // The eight-bit prompt chunks on the matrix units: f16 operands
+            // (finer than the BF16 the weights came from), f32 sums, the
+            // activation scale from the device. The scalar int8 GEMM below
+            // kept a 65B at 43 tok/s of prompt on an RTX PRO 6000 against
+            // 209 for the four-bit file; `CMF_Q82_COOP=0` keeps it. Wide
+            // matrices only: a 1024-row K or V projection sits in L2 for
+            // the eight-row matvec, and the 64-row tiles plus the scale
+            // reduction cost the four-bit file's prompt 209 -> 196 tok/s.
+            7 if k > 16
+                && q82_coop_chunk
+                && rows >= 4096
+                && cols % 32 == 0
+                && c.q82_mm_coop_s.is_some()
+                && {
+                    let asc = {
+                        let mut sc = c.scratch.lock().unwrap();
+                        Scratch::ensure(
+                            &c.device,
+                            &mut sc.amax1,
+                            4,
+                            wgpu::BufferUsages::STORAGE,
+                            "batch-ascale",
+                        )
+                    };
+                    encode_act_absmax(c, enc, xs, k * cols, &asc) && {
+                        encode_q4_tile_mm_full(
+                            c,
+                            enc,
+                            c.q82_mm_coop_s.as_ref().unwrap(),
+                            &m.buf,
+                            xs,
+                            y,
+                            rows,
+                            cols,
+                            k,
+                            0.0,
+                            Some(&asc),
+                        );
+                        true
+                    }
+                } => {}
             7 if k > 16
                 && (g4p.is_some() || rows >= 8192 || q82_prompt)
                 && q82mm_p.is_some_and(|gp| {
@@ -34918,18 +35612,42 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("Prism transform unavailable for batched attention input");
                     return batch_outcome(o1_started || state_started, false);
                 };
+                // "qkv" = the input norm and the q, k and v projections.
+                bts!(enc, 4);
                 ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden);
-                ematb2(
-                    &mut enc,
-                    wk,
-                    wv,
-                    &n1_p,
-                    &kb_b,
-                    &vb_b,
-                    lnkv * hd,
-                    lnkv * ldv,
-                    hidden,
-                );
+                if let (Some((blend, _)), Some((vp, e0b, vinb))) =
+                    (geom.and_then(|g| g.vres), vres_bufs.as_ref())
+                {
+                    // Ripple: V projects the normed rows pulled toward the
+                    // chunk's embedding rows; K keeps the normed rows.
+                    let u = uniform_u32x4(c, vres::params(blend, k * hidden));
+                    let (gx, gy) = vres::grid(k * hidden);
+                    {
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(vp);
+                        pass.set_bind_group(0, &vres::bind(c, vp, [&n1, e0b, vinb, &u]), &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    let Some(vin_p) = prism_input_b(&mut enc, &[wv], vinb, hidden) else {
+                        bgraph_refused("Prism transform unavailable for the batched V input");
+                        return batch_outcome(o1_started || state_started, false);
+                    };
+                    ematb(&mut enc, wk, &n1_p, &kb_b, lnkv * hd, hidden);
+                    ematb(&mut enc, wv, &vin_p, &vb_b, lnkv * ldv, hidden);
+                } else {
+                    ematb2(
+                        &mut enc,
+                        wk,
+                        wv,
+                        &n1_p,
+                        &kb_b,
+                        &vb_b,
+                        lnkv * hd,
+                        lnkv * ldv,
+                        hidden,
+                    );
+                }
+                bts!(enc, 6);
                 let preview_bt = dense_batch::attn(c).filter(|_| {
                     preview.is_some()
                         && c.attend_gpart.is_some()
@@ -35246,6 +35964,11 @@ pub fn forward_batch_graph_at(
                         .first()
                         .and_then(|v| v.heads.first())
                         .is_some_and(|h| h.rect_fm);
+                    // A layer with its own geometry rotates by its own table
+                    // (Ripple's full-attention layers by none at all).
+                    let (rd, rope_scale) = geom.as_ref().map_or((rd, 1.0), |g| (g.rd, g.rope_scale));
+                    let invf_own = geom.as_ref().map(|g| stor(bytemuck::cast_slice(g.invf)));
+                    let invf_b = invf_own.as_ref().unwrap_or(&invf_b);
                     // The whole chunk at once (`o1_batch`): token-axis rope,
                     // then five dispatches per 64-row sub-chunk instead of
                     // six per row. The loop below is the fallback.
@@ -35285,7 +36008,7 @@ pub fn forward_batch_graph_at(
                                 | if *output_gate { 1 } else { 0 },
                             eps,
                             0,
-                            1.0,
+                            rope_scale,
                         ));
                         let bg_rope = bind_pairs(
                             c,
@@ -35297,7 +36020,7 @@ pub fn forward_batch_graph_at(
                                 (3, &gall),
                                 (4, &qnw),
                                 (5, &knw),
-                                (6, &invf_b),
+                                (6, invf_b),
                                 (7, &rope_u),
                             ],
                         );
@@ -35359,7 +36082,7 @@ pub fn forward_batch_graph_at(
                                         | if *output_gate { 1 } else { 0 },
                                     eps,
                                     i,
-                                    1.0,
+                                    rope_scale,
                                 ),
                             );
                             let o1_u = uniform_u32x8(
@@ -35378,7 +36101,7 @@ pub fn forward_batch_graph_at(
                             let bg_rope = bg(
                                 &c.layout_attn_rope,
                                 &[
-                                    &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                                    &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, invf_b, &rope_u,
                                 ],
                             );
                             let bg_far = bg(
@@ -35430,6 +36153,93 @@ pub fn forward_batch_graph_at(
                             );
                         }
                     }
+                } else if let Some((g, gp, rp)) = geom.as_ref().and_then(|g| {
+                    gated_geom_bt(c, g, nh, hd, *output_gate, k)
+                        .filter(|_| {
+                            g.nkv == lnkv
+                                && spec.is_none()
+                                && preview.is_none()
+                                && positions.windows(2).all(|w| w[1] == w[0] + 1)
+                        })
+                        .map(|(gp, rp)| (g, gp, rp))
+                }) {
+                    // Ripple, the whole run at once: the gate split, Q/K norm
+                    // and RoPE of every row, every row into the (ring) mirror,
+                    // the blocked causal attend, the output gate — five
+                    // dispatches a layer where the loop below issues five a row.
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let invf_l = stor(bytemuck::cast_slice(g.invf));
+                    let qall = rwc(k * nh * hd);
+                    let gall = rwc(k * nh * hd);
+                    let rope_u = unif(&rope_uniform_words(
+                        nh,
+                        g.nkv,
+                        hd,
+                        g.rd,
+                        positions[0],
+                        flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | 1,
+                        eps,
+                        0,
+                        g.rope_scale,
+                    ));
+                    let bg_rope = bind_pairs(
+                        c,
+                        &rp.rope_l,
+                        &[
+                            (0, &qraw_b),
+                            (1, &kb_b),
+                            (2, &qall),
+                            (3, &gall),
+                            (4, &qnw),
+                            (5, &knw),
+                            (6, &invf_l),
+                            (7, &rope_u),
+                        ],
+                    );
+                    {
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&rp.rope);
+                        pass.set_bind_group(0, &bg_rope, &[]);
+                        pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
+                    }
+                    // The O(1) seal's query trace: this layer's rotated rows.
+                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, k * nh * hd) {
+                        flush_pass(&enc);
+                        enc.copy_buffer_to_buffer(&qall, 0, &cb, 0, (k * nh * hd * 4) as u64);
+                    }
+                    state_started = true;
+                    gemma_batch::encode_kv_attend(
+                        c,
+                        &mut enc,
+                        gp,
+                        &gemma_batch::G4Attn {
+                            nh,
+                            nkv: g.nkv,
+                            hd,
+                            rd: g.rd,
+                            dv: g.dv,
+                            flags: 0,
+                            eps,
+                            rope_scale: g.rope_scale,
+                            v_norm: false,
+                            cap: xcaps[&li],
+                            pos0: positions[0],
+                            window: g.window,
+                            scale: attn_scale,
+                            k,
+                        },
+                        &kb_b,
+                        &vb_b,
+                        &qall,
+                        kbuf,
+                        vbuf,
+                        &attn_bb,
+                    );
+                    let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.gate_mul);
+                    pass.set_bind_group(0, &bg(&c.layout_gate_mul, &[&gall, &attn_bb, &gm_u]), &[]);
+                    pass.dispatch_workgroups(((k * nh * hd) as u32).div_ceil(256), 1, 1);
                 } else if let Some((g, xb)) = geom.and_then(|g| {
                     let hpk = nh / g.nkv.max(1);
                     c.graph_x
@@ -35601,7 +36411,8 @@ pub fn forward_batch_graph_at(
                             hd,
                             g.rd,
                             p,
-                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
+                                | u32::from(*output_gate),
                             eps,
                             i,
                             g.rope_scale,
@@ -35708,6 +36519,17 @@ pub fn forward_batch_graph_at(
                                 &[],
                             );
                             pass.dispatch_workgroups(nh as u32, 1, 1);
+                        }
+                        // attn_out *= sigmoid(gate), the rope kernel's `gout`.
+                        if *output_gate {
+                            let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(
+                                0,
+                                &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
                         }
                         encode_blit_p(
                             &mut pass,
@@ -36003,6 +36825,9 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("Prism transform unavailable for batched output projection");
                     return batch_outcome(o1_started || state_started, false);
                 };
+                // "attn-core" = rope, the attention kernels and the gate;
+                // "attn" then = the output projection alone.
+                bts!(enc, 5);
                 ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * ldv);
                 bts!(enc, 1);
             }
@@ -36385,8 +37210,8 @@ pub fn forward_batch_graph_at(
         }
         // Gemma sandwich: the mixer output is RMS-normed with its own
         // weights before the residual add reads it.
-        let mix_out = match (l.attn_out_norm, g4_bufs.as_ref()) {
-            (Some(w), Some((_, ob2))) => {
+        let mix_out = match (l.attn_out_norm, g4_bufs.as_ref().map(|b| &b.1).or(sand_ob2.as_ref())) {
+            (Some(w), Some(ob2)) => {
                 let won = stor(bytemuck::cast_slice(w));
                 go(
                     &mut enc,
@@ -36427,6 +37252,8 @@ pub fn forward_batch_graph_at(
                 down,
                 width,
                 act,
+                lim,
+                hot,
             } => {
                 let inter = *width; // this layer's, not the model's
                 let Some(n1_p) = prism_input_b(&mut enc, &[gate, up], &n1, hidden) else {
@@ -36436,7 +37263,10 @@ pub fn forward_batch_graph_at(
                 ematb2(&mut enc, gate, up, &n1_p, &gbuf, &ubuf, inter, inter, hidden);
                 // act(gate)·up: SiLU keeps the historical uniform; Gemma-4's
                 // tanh-GELU rides its `_c` word (admitted above only there).
-                let act_u = if *act == 0 {
+                // Ripple's clamp rides the kernel's swiglu-limit word.
+                let act_u = if *lim > 0.0 {
+                    unif(&[(k * inter) as u32, 0, lim.to_bits(), *act])
+                } else if *act == 0 {
                     silu_u.clone()
                 } else {
                     unif(&[(k * inter) as u32, 0, 0, *act])
@@ -36447,16 +37277,35 @@ pub fn forward_batch_graph_at(
                     &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &act_u]),
                     ((k * inter) as u32).div_ceil(256),
                 );
-                if g4p.is_some() {
-                    // "gdn-proj" = post-attention norms + gate/up GEMM + act;
-                    // "ffn" then = the down GEMM.
-                    bts!(enc, 7);
-                }
+                // "gate-up" = post-attention norms + gate/up GEMM + act;
+                // "ffn" then = the down GEMM.
+                bts!(enc, 7);
                 let Some(abuf_p) = prism_input_b(&mut enc, &[down], &abuf, inter) else {
                     bgraph_refused("Prism transform unavailable for batched FFN output");
                     return batch_outcome(o1_started || state_started, false);
                 };
                 ematb(&mut enc, down, &abuf_p, &ob, hidden, inter);
+                // The layer's hot neurons: the same input through their own
+                // triple, added to the first one's output.
+                if let (Some((hg, hu, hdn, w)), Some(hot_out)) = (hot, hot_ob.as_ref()) {
+                    let w = *w;
+                    ematb2(&mut enc, hg, hu, &n1, &gbuf, &ubuf, w, w, hidden);
+                    let su = unif(&[(k * w) as u32, 0, if *lim > 0.0 { lim.to_bits() } else { 0 }, *act]);
+                    go(
+                        &mut enc,
+                        &c.silu,
+                        &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &su]),
+                        ((k * w) as u32).div_ceil(256),
+                    );
+                    ematb(&mut enc, hdn, &abuf, hot_out, hidden, w);
+                    let ax = unif(&[1.0f32.to_bits(), (k * hidden) as u32, 0, 0]);
+                    go(
+                        &mut enc,
+                        &c.axpy,
+                        &bg(&c.layout_axpy, &[hot_out, &ob, &ax]),
+                        ((k * hidden) as u32).div_ceil(256),
+                    );
+                }
             }
             // q8_2f experts (`moe_q82`): every token's router row, the
             // batched select, then the expert-grouped pair — the selections
@@ -36923,6 +37772,21 @@ pub fn forward_batch_graph_at(
             );
         }
         let sandwich_tail = l.ffn_out_norm.is_some() || l.layer_scale.is_some();
+        // Outside Gemma-4 the FFN output is normed with its own weights and
+        // the plain residual tails below read that.
+        let ffn_out: &wgpu::Buffer = match (l.ffn_out_norm, sand_ob2.as_ref()) {
+            (Some(w), Some(ob2)) => {
+                let wfn = stor(bytemuck::cast_slice(w));
+                go(
+                    &mut enc,
+                    &c.rmsnorm_b,
+                    &bg(&c.layout_rmsnorm_b, &[&ob, &wfn, ob2, &rms_u]),
+                    k as u32,
+                );
+                ob2
+            }
+            _ => &ob,
+        };
         if let (true, Some(gp), Some((_, ob2))) = (sandwich_tail, g4p, g4_bufs.as_ref()) {
             // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
             // and n1 = rms(h)·next input norm in one per-row pass. The last
@@ -36977,7 +37841,7 @@ pub fn forward_batch_graph_at(
                 &c.add_rmsnorm_b,
                 &bg(
                     &c.layout_add_rmsnorm_b,
-                    &[&h_buf, &ob, &inw_next, &n1, &rms_u],
+                    &[&h_buf, ffn_out, &inw_next, &n1, &rms_u],
                 ),
                 k as u32,
             );
@@ -36986,7 +37850,7 @@ pub fn forward_batch_graph_at(
             go(
                 &mut enc,
                 &c.axpy,
-                &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]),
+                &bg(&c.layout_axpy, &[ffn_out, &h_buf, &ax_u]),
                 ((k * hidden) as u32).div_ceil(256),
             );
         }
@@ -37155,7 +38019,7 @@ pub fn forward_batch_graph_at(
                         e.1 += 1;
                     }
                     let names = [
-                        "start", "attn", "gdn-out", "ffn", "norm", "recur", "gdn-in", "gdn-proj",
+                        "start", "o-proj", "gdn-out", "down", "norm", "attn-core|recur", "qkv|gdn-in", "gate-up|gdn-proj",
                     ];
                     let line: Vec<String> = agg
                         .iter()
@@ -45722,30 +46586,38 @@ fn ffn_q4(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "q4tffn-stage",
     );
-    // Content-keyed uniforms: three shapes live in one submission, so
-    // one rewritable buffer cannot serve them.
-    let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
-    let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
     // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU,
     // 2 tanh-GELU, 3 MiniMax M3 SwiGLU-OAI).
     let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
     let mm = mm_pipeline(c, q4tp, false);
-    let mm_layout = mm.get_bind_group_layout(0);
-    let bind_mm = |q: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, p: &wgpu::Buffer| {
-        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("q4tffn-bg"),
-            layout: &mm_layout,
-            entries: &[
-                bind_buf(0, q),
-                bind_buf(1, x),
-                bind_buf(2, y),
-                bind_buf(3, p),
-            ],
-        })
+    // The cooperative kernel takes its operands as f16, which caps at
+    // 65 504: the host operand is scaled by its own max as every other
+    // caller scales it, and the intermediate, which never reaches the
+    // host, by a max taken on the card (the batched prefill's entry
+    // point). Unscaled, a wide SwiGLU row past the cap came back as NaN
+    // (Ripple's DFlash drafter, blocks of 16 rows).
+    let coop = q4tp && !MIMO_F32_GEMM.get() && c.q4tp_mm_coop.is_some();
+    let ascale: f32 = if coop {
+        let mx = host_absmax(&xs[..b * hidden]);
+        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+    } else {
+        0.0
     };
-    let bg1 = bind_mm(&q1, &xs_buf, &g_buf, &p13);
-    let bg3 = bind_mm(&q3, &xs_buf, &u_buf, &p13);
-    let bg2 = bind_mm(&q2, &g_buf, &y_buf, &p2);
+    let can_dev_scale = (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let dev_scale = coop && c.q4tp_mm_coop_s.is_some() && can_dev_scale;
+    let (asc_buf, amax_parts) = if dev_scale {
+        (
+            Some(c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q4tffn-ascale"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })),
+            Some(Scratch::ensure(&c.device, &mut sc.amaxp, 512 * 4, wgpu::BufferUsages::STORAGE, "q4tffn-amax-parts")),
+        )
+    } else {
+        (None, None)
+    };
     let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tffn-silu-bg"),
         layout: &c.ffn_silu.get_bind_group_layout(0),
@@ -45760,18 +46632,8 @@ fn ffn_q4(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("q4tffn"),
         });
-    let mm_pass = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup, rows: usize| {
-        let mut pass = begin_pass_with(enc, Some("q4tffn-mm"), None);
-        pass.set_pipeline(mm);
-        pass.set_bind_group(0, bg, &[]);
-        pass.dispatch_workgroups(
-            (rows as u32).div_ceil(64).min(MAX_WG),
-            (b as u32).div_ceil(64),
-            1,
-        );
-    };
-    mm_pass(&mut enc, &bg1, inter);
-    mm_pass(&mut enc, &bg3, inter);
+    encode_q4_tile_mm_full_offset(c, &mut enc, mm, &q1, &xs_buf, 0, &g_buf, inter, hidden, b, ascale, None);
+    encode_q4_tile_mm_full_offset(c, &mut enc, mm, &q3, &xs_buf, 0, &u_buf, inter, hidden, b, ascale, None);
     {
         let mut pass = begin_pass_with(&mut enc, Some("q4tffn-silu"), None);
         pass.set_pipeline(&c.ffn_silu);
@@ -45783,7 +46645,16 @@ fn ffn_q4(
         let wgs = ((b * inter) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
-    mm_pass(&mut enc, &bg2, hidden);
+    let scaled_down = match (&asc_buf, &amax_parts) {
+        (Some(asc), Some(parts)) if encode_act_absmax_with(c, &mut enc, &g_buf, b * inter, asc, Some(parts)) => {
+            encode_q4_tile_mm_full_offset(c, &mut enc, c.q4tp_mm_coop_s.as_ref().unwrap(), &q2, &g_buf, 0, &y_buf, hidden, inter, b, 0.0, Some(asc));
+            true
+        }
+        _ => false,
+    };
+    if !scaled_down {
+        encode_q4_tile_mm_full_offset(c, &mut enc, mm, &q2, &g_buf, 0, &y_buf, hidden, inter, b, if coop { 1.0 } else { 0.0 }, None);
+    }
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
 }
 
@@ -46743,6 +47614,44 @@ fn q4tp_mm_coop_s(@builtin(workgroup_id) wid: vec3<u32>,
     coop_body(wid, tid, sg, asc);
 }
 "#;
+
+/// `COOP_MM_SRC` with the weight tile read from a q8_2f buffer: the
+/// int8 word of four consecutive columns, the row's f16 scale, the four
+/// columns' f16 scales (both planes sit inside the buffer, as the decode
+/// matvecs read them). Tile shape, activation scale and the matrix-unit
+/// choreography are the four-bit kernel's, verbatim. Entry points
+/// `q82_mm_coop` / `q82_mm_coop_s`.
+fn coop_q82_src() -> String {
+    let start = "                let g = col0 >> 5u;\n";
+    let end = "                wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;\n";
+    let a = COOP_MM_SRC.find(start).expect("coop source: dequant block start");
+    let b = COOP_MM_SRC.find(end).expect("coop source: dequant block end") + end.len();
+    let q8 = "                let wrow = n0 + n;
+                let qbytes = pmm.rows * cols;
+                let word = qmm[(wrow * cols + col0) >> 2u];
+                let rw = unpack2x16float(qmm[(qbytes >> 2u) + (wrow >> 1u)]);
+                let rsc = select(rw.x, rw.y, (wrow & 1u) == 1u);
+                let h = (qbytes >> 1u) + pmm.rows + col0;
+                let hw = h >> 1u;
+                let ca = unpack2x16float(qmm[hw]);
+                let cb = unpack2x16float(qmm[hw + 1u]);
+                var cs = vec4<f32>(ca.x, ca.y, cb.x, cb.y);
+                if ((h & 1u) == 1u) {
+                    let cc = unpack2x16float(qmm[hw + 2u]);
+                    cs = vec4<f32>(ca.y, cb.x, cb.y, cc.x);
+                }
+                let sw = i32(word);
+                let q = vec4<f32>(f32((sw << 24u) >> 24u), f32((sw << 16u) >> 24u),
+                                  f32((sw << 8u) >> 24u), f32(sw >> 24u));
+                wv = q * cs * rsc;
+";
+    let mut src = String::with_capacity(COOP_MM_SRC.len() + 256);
+    src.push_str(&COOP_MM_SRC[..a]);
+    src.push_str(q8);
+    src.push_str(&COOP_MM_SRC[b..]);
+    src.replace("fn q4tp_mm_coop(", "fn q82_mm_coop(")
+        .replace("fn q4tp_mm_coop_s(", "fn q82_mm_coop_s(")
+}
 
 const COOP_Q2_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
@@ -49228,6 +50137,10 @@ fn encode_q4_tile_mm_full_offset(
         || c.q4tp_mm_coop_f16
             .as_ref()
             .map(|p| std::ptr::eq(p, pipeline))
+            .unwrap_or(false)
+        || c.q82_mm_coop_s
+            .as_ref()
+            .map(|p| std::ptr::eq(p, pipeline))
             .unwrap_or(false);
     // 0xFFFFFFFF is not a float the host would ever pass; the kernel
     // reads it as "take the scale from the buffer instead".
@@ -49573,6 +50486,34 @@ fn uniform_u32x8(c: &Ctx, v: [u32; 8]) -> wgpu::Buffer {
 /// Parameters for `attn_rope_qkn`. The final four words make the uniform
 /// 48 bytes and carry YaRN's *amplitude* factor without changing angles.
 #[inline]
+/// Can a gated layer with its own geometry (Ripple) take a chunk through the
+/// token-axis kernels: `attn_rope_qkn_bt` for the gate split, Q/K norm and RoPE,
+/// then Gemma-4's append and blocked causal attend? Every row of the run enters
+/// a sliding layer's ring before the first one attends, so the run and the
+/// window must fit the ring together. `CMF_GEOM_BT=0` keeps the per-row loop.
+fn gated_geom_bt<'c>(
+    c: &'c Ctx,
+    g: &crate::gpu::GraphAttnGeom,
+    nh: usize,
+    hd: usize,
+    output_gate: bool,
+    k: usize,
+) -> Option<(&'c gemma_batch::Pipes, &'c dense_batch::AttnBt)> {
+    if !output_gate
+        || g.window.is_some_and(|w| k + w > kv_ring_cap(w))
+        || g.v_norm
+        || g.dash.is_some()
+        || g.sink.is_some()
+        || g.dv != hd
+        || hd > 256
+        || !gemma_batch::attn_fits(nh, g.nkv, hd, g.dv, g.rd)
+        || std::env::var("CMF_GEOM_BT").as_deref() == Ok("0")
+    {
+        return None;
+    }
+    gemma_batch::pipes(c).zip(dense_batch::attn(c))
+}
+
 fn rope_uniform_words(
     nh: usize,
     nkv: usize,
@@ -56035,7 +56976,7 @@ fn main() {
             pass.set_bind_group(0, &bg_silu, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
         }
-        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols, act_code);
+        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols, act_code, 0);
         {
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(gu_pipe(c));
@@ -56171,7 +57112,7 @@ fn main() {
                     mapped_at_creation: false,
                 })
             };
-            let (y1, y4) = (out(), out());
+            let (y1, y4, y16, y4k) = (out(), out(), out(), out());
             let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
             let mut enc = c
                 .device
@@ -56179,6 +57120,8 @@ fn main() {
             for (pipe, y, g) in [
                 (&c.q8_2f_mv, &y1, rows as u32),
                 (&c.q8_2f_mv4, &y4, (rows as u32).div_ceil(4)),
+                (&c.q8_2f_mv16, &y16, (rows as u32).div_ceil(16)),
+                (&c.q8_2f_mv4k, &y4k, (rows as u32).div_ceil(4)),
             ] {
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -56197,7 +57140,7 @@ fn main() {
             }
             let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: (2 * rows * 4) as u64,
+                size: (4 * rows * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -56205,16 +57148,32 @@ fn main() {
             enc.copy_buffer_to_buffer(&y1, 0, &stage, 0, (rows * 4) as u64);
             flush_pass(&enc);
             enc.copy_buffer_to_buffer(&y4, 0, &stage, (rows * 4) as u64, (rows * 4) as u64);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&y16, 0, &stage, (2 * rows * 4) as u64, (rows * 4) as u64);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&y4k, 0, &stage, (3 * rows * 4) as u64, (rows * 4) as u64);
             submit(c, finish_enc(enc));
             let slice = stage.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             let all: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range().unwrap()).to_vec();
             stage.unmap();
-            let (a, b) = all.split_at(rows);
+            let (a, rest) = all.split_at(rows);
+            let (b, rest) = rest.split_at(rows);
+            let (d, k) = rest.split_at(rows);
             assert!(a.iter().filter(|v| **v != 0.0).count() > rows / 2, "harness: mostly zero");
             let bad = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
             assert_eq!(bad, 0, "{rows}x{cols}: {bad} rows differ from the one-row q8_2f kernel");
+            let bad16 = a.iter().zip(d).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            assert_eq!(bad16, 0, "{rows}x{cols}: {bad16} rows of the 16-row kernel differ from the one-row one");
+            // The column-split kernel adds the four quarter sums in its own
+            // order: the same value up to f32 rounding of a K-long sum.
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = a.iter().zip(k).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-5 * scale,
+                "{rows}x{cols}: column-split kernel off by {worst} (max |y| {scale})"
+            );
         }
     }
 
@@ -57152,6 +58111,113 @@ fn main() {
         // f16 operands carry ~11 bits of mantissa; anything past 1e-2 is
         // a broken layout or a lost activation scale, not rounding.
         assert!(r < 1e-2, "coop GEMM drifted from the scalar arm: {r:.3e}");
+    }
+
+    /// The q8_2f cooperative GEMM against an f64 host product: the tile
+    /// loader reads the int8 word, the row scale and the four column
+    /// scales from the same buffer the decode matvecs take, the activation
+    /// scale comes from the device reduction.
+    #[test]
+    fn wgpu_q82_mm_coop_matches_host() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let Some(pipe) = c.q82_mm_coop_s.as_ref() else {
+            assert!(
+                c.q4tp_mm_coop.is_none() || std::env::var("CMF_Q82_COOP").as_deref() == Ok("0"),
+                "cooperative matrices are up but the q8_2f GEMM pipeline is missing — \
+                 the shader was rejected (check the init warning)"
+            );
+            eprintln!("no cooperative-matrix hardware here — skipping");
+            return;
+        };
+        // Several 64-row tiles, several k-chunks, a batch that is not a
+        // multiple of the tile, and an odd row count so a row scale sits
+        // in the high half of its word and the column plane starts on an
+        // odd half.
+        for (rows, cols, n) in [(256usize, 128usize, 96usize), (203, 320, 70)] {
+            let mut wb: Vec<u8> = (0..rows * cols)
+                .map(|i| ((i * 37 + 11) % 251) as u8)
+                .collect();
+            let rs: Vec<f32> = (0..rows).map(|r| 0.01 + (r % 13) as f32 * 0.002).collect();
+            let cs: Vec<f32> = (0..cols).map(|k| 0.5 + (k % 7) as f32 * 0.125).collect();
+            for v in &rs {
+                wb.extend_from_slice(&cortiq_core::quant::f32_to_f16(*v).to_le_bytes());
+            }
+            for v in &cs {
+                wb.extend_from_slice(&cortiq_core::quant::f32_to_f16(*v).to_le_bytes());
+            }
+            while wb.len() % 4 != 0 {
+                wb.push(0);
+            }
+            // Activations spanning the range that would overflow f16
+            // without the scale.
+            let xs: Vec<f32> = (0..n * cols)
+                .map(|i| {
+                    let b = ((i % 97) as f32 - 48.0) / 48.0;
+                    if i % 11 == 0 { b * 3000.0 } else { b }
+                })
+                .collect();
+            let mk = |bytes: &[u8]| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let wbuf = mk(&wb);
+            let xbuf = mk(bytemuck::cast_slice(&xs));
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * rows * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            assert!(encode_act_absmax(c, &mut enc, &xbuf, n * cols, &asc));
+            encode_q4_tile_mm_full(
+                c, &mut enc, pipe, &wbuf, &xbuf, &ybuf, rows, cols, n, 0.0, Some(&asc),
+            );
+            let mut out = vec![0f32; n * rows];
+            assert!(readback(c, enc, &ybuf, &stage, (n * rows * 4) as u64, &mut out));
+            let (mut num, mut den) = (0f64, 0f64);
+            for b in 0..n {
+                for r in 0..rows {
+                    let mut acc = 0f64;
+                    for k in 0..cols {
+                        let w = wb[r * cols + k] as i8 as f64;
+                        acc += w * cs[k] as f64 * xs[b * cols + k] as f64;
+                    }
+                    let want = acc * rs[r] as f64;
+                    let got = out[b * rows + r] as f64;
+                    num += (got - want).powi(2);
+                    den += want.powi(2);
+                }
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            println!("q82 coop vs host: {rows}x{cols} n={n} relative rms {rel:.3e}");
+            // f16 operands: ~1e-3; anything past 1e-2 is a wrong plane
+            // offset or a lost activation scale, not rounding.
+            assert!(rel < 1e-2, "q8_2f coop GEMM drifted from the host product: {rel:.3e}");
+        }
     }
 
     #[test]

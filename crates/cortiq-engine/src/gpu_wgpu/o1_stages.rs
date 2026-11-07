@@ -11,6 +11,10 @@ use super::*;
 /// Pieces of the value sum.
 pub(crate) const CH: usize = 8;
 
+/// Query heads per KV head the generated kernels are built for: one accumulator a head
+/// (Qwen3.8-27B has 6, Ripple-65B 10).
+pub(crate) const MAX_HPG: usize = 16;
+
 fn source(hpg: usize) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..hpg).map(f).collect::<Vec<_>>().join("\n");
     let zero = each(&|h| format!("    var a{h} = vec4<f32>(0.0);"));
@@ -290,7 +294,7 @@ pub(crate) fn pipes(c: &Ctx, hpg: usize) -> Option<&'static Pipes> {
     }
     PIPES
         .get_or_init(|| {
-            if !(1..=8).contains(&hpg) {
+            if !(1..=MAX_HPG).contains(&hpg) {
                 return None;
             }
             let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -682,14 +686,14 @@ fn o1c_add(@builtin(global_invocation_id) id: vec3<u32>) {{
     )
 }
 
-static CHUNK_PIPES: [std::sync::OnceLock<Option<Pipes>>; 9] = [const { std::sync::OnceLock::new() }; 9];
+static CHUNK_PIPES: [std::sync::OnceLock<Option<Pipes>>; MAX_HPG + 1] = [const { std::sync::OnceLock::new() }; MAX_HPG + 1];
 
 /// The chunk stages for `hpg` query heads per KV head, on the terms of [`pipes`].
 pub(crate) fn chunk_pipes(c: &Ctx, hpg: usize) -> Option<&'static Pipes> {
     if std::env::var("CMF_O1_STAGES").as_deref() == Ok("0") {
         return None;
     }
-    if !(1..=8).contains(&hpg) {
+    if !(1..=MAX_HPG).contains(&hpg) {
         return None;
     }
     CHUNK_PIPES[hpg]

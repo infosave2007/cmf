@@ -595,7 +595,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 /// row scale, so selecting a neuron keeps exactly the same encoded values.
 /// `q8_2f` additionally has one unchanged column-scale plane because the
 /// input axis of gate/up is unchanged.
-fn compact_encoded_basic_rows(
+pub(crate) fn compact_encoded_basic_rows(
     dtype: TensorDtype,
     source: &[u8],
     source_rows: usize,
@@ -721,7 +721,7 @@ fn compact_encoded_basic_rows(
 /// the matching (possibly re-ordered) column scale.  This is especially
 /// important for a quality-focused q8_2f draft: re-fitting scales after a
 /// column subset would introduce avoidable error.
-fn compact_encoded_basic_columns(
+pub(crate) fn compact_encoded_basic_columns(
     dtype: TensorDtype,
     source: &[u8],
     rows: usize,
@@ -961,7 +961,7 @@ enum CompactMtpColumns {
 /// code planes is both exact relative to the source CMF and much cheaper than
 /// dequantizing/re-quantizing it. `down_proj` is deliberately excluded: its
 /// selected axis is columns, which changes groups and requires requantization.
-fn compact_encoded_tiled_rows(
+pub(crate) fn compact_encoded_tiled_rows(
     dtype: TensorDtype,
     source: &[u8],
     source_rows: usize,
@@ -2218,6 +2218,7 @@ mod mtp_plan_tests {
                 attention_sink: false,
                 activation_situ_beta: None,
                 activation_situ_linear_beta: None,
+                ffn_clamp: None,
                 attn_logit_softcapping: None,
                 attn_v_norm: false,
                 qk_norm_after_rope: false,

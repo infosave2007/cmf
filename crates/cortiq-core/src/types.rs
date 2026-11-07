@@ -688,6 +688,10 @@ pub struct ModelArch {
     pub activation_situ_beta: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_situ_linear_beta: Option<f64>,
+    /// SwiGLU with clamped pre-activations (Ripple, `ffn_clamp_threshold`): the gate is cut from
+    /// above and the up branch on both sides at this value, before `silu(gate)·up`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_clamp: Option<f32>,
     /// Gemma-2: attention scores pass tanh(s/c)·c before the causal
     /// softmax (attn_logit_softcapping). None = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]

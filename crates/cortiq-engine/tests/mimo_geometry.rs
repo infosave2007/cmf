@@ -73,6 +73,7 @@ fn arch(kv_heads_per_layer: Option<Vec<usize>>, v_head_dim: Option<usize>) -> Mo
         mla: None,
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
+        ffn_clamp: None,
         attn_v_norm: false,
         qk_norm_after_rope: false,
         num_loops: 1,

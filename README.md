@@ -114,6 +114,29 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+Serve it as an OpenAI-compatible API (chat and completions, streamed or not, a web dashboard on the same
+port; `--host 127.0.0.1` keeps it local):
+
+```sh
+cortiq serve model.cmf --port 8080
+curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+## Ripple-65B Preview, a dense 65B in three files (0.8.60)
+
+[Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) in four bits (34.6 GB), two bits
+(29.2 GB) and eight bits (64.8 GB), each file with the turbo header: on an NVIDIA A40 (46 GB) the four-bit file
+decodes at 12 tok/s from 4 000 to 64 000 tokens of prompt at 35 to 37 GB. On an RTX PRO 6000 it decodes at 29.8
+tok/s (23.4 before this release), the eight-bit file reads a prompt at 156 tok/s against 43:
+
+```sh
+cortiq run ripple-65b-q4tp.cmf --prompt-file report.txt --greedy
+```
+
+A DFlash 2 drafter comes beside it (`CMF_DFLASH=1`), its block one device submission: code 30.2 → 46.6 tok/s
+on the RTX PRO 6000, prose about even. See [the card](docs/hf/Ripple-65B-Preview-cmf.md).
+
 ## Qwen3.8-27B Turbo, drafts on a Mac and in a chat (0.8.59)
 
 On a MacBook Air M4 (24 GB, no fan, the base M4's memory bus)
