@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.62] — 2026-11-07
+
 ### Added
 - Qwen3.8-Flash-Next (`qwen4_exp`) on wgpu: an O(1) far field for the 12 attention layers, after the Dory pattern
   (`crates/cortiq-engine/src/qwen4_o1.rs`). A sequence runs exact up to the seal; there the layers' keys, values
