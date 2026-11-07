@@ -120,7 +120,7 @@ file. The standard column is the same file with the far field off (`CMF_O1=off`)
 | q2tp | 155 | 25.9 | 27.8 |
 | q8_2f | 156 | 25.7 | 18.3 |
 
-The q2tp file on the same card:
+The q2tp file on the A40:
 
 | prompt, tokens | first token, s | decode, tok/s | peak VRAM, GB |
 |---:|---:|---:|---:|
@@ -299,7 +299,7 @@ NVIDIA A40 (46 ГБ), Vulkan, `cortiq bench --core`, 60 токенов посл�
 | q2tp | 155 | 25,9 | 27,8 |
 | q8_2f | 156 | 25,7 | 18,3 |
 
-Файл q2tp на той же карте:
+Файл q2tp на A40:
 
 | промпт, токенов | первый токен, с | декод, ток/с | пик VRAM, ГБ |
 |---:|---:|---:|---:|
@@ -465,7 +465,7 @@ NVIDIA A40(46 GB),Vulkan,`cortiq bench --core`,在该长度的提示之后生成
 | q2tp | 155 | 25.9 | 27.8 |
 | q8_2f | 156 | 25.7 | 18.3 |
 
-同一显卡上的 q2tp 文件:
+A40 上的 q2tp 文件:
 
 | 提示,token 数 | 首个 token,秒 | 解码,tok/s | 显存峰值,GB |
 |---:|---:|---:|---:|

@@ -104,6 +104,16 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Ripple-65B Preview:三个文件中的稠密 65B(0.8.60)
+
+[Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) 的四比特(34.6 GB)、二比特(29.2 GB)和八比特(64.8 GB)文件,每个都带 turbo 头:在 NVIDIA A40(46 GB)上,四比特文件从 4 000 到 64 000 个 token 的提示均以 12 tok/s 解码,占 35 到 37 GB。在 RTX PRO 6000 上解码 29.8 tok/s(本版之前为 23.4),八比特文件读取提示 156 tok/s,原来是 43:
+
+```sh
+cortiq run ripple-65b-q4tp.cmf --prompt-file report.txt --greedy
+```
+
+旁边附有精确的 DFlash 2 草稿器(`CMF_DFLASH=1`);它的轮次目前还不划算。见[模型卡](docs/hf/Ripple-65B-Preview-cmf.md)。
+
 ## Qwen3.8-27B Turbo:Mac 上和对话中的草稿(0.8.59)
 
 在 MacBook Air M4(24 GB,无风扇,基础版 M4 的内存总线)上,[Turbo 文件](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf)解码 6.4 tok/s;开启草稿后为 10 到 20,Neural Engine(`CMF_ANE=1`)读取 3 600 个 token 的提示用 28 秒,原来是 74 秒。两个开关默认都关闭:
