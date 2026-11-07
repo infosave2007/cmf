@@ -92,7 +92,12 @@ rows, the 6 attention layers move to a far field: the first 4 rows and the last 
 lives in 32 landmarks per head, so the cost of a token stops growing with the text. The far field is a subject of
 U.S. patent application No. 19/738,763.
 
-![What a long prompt keeps](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_en.png)
+![How the turbo file reads a long prompt](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/how_en.png)
+
+**A fixed state.** After the fold a new token reads the same 2052 exact rows and the landmarks, whatever the length
+of the text, so decoding keeps its speed where the standard file slows down with every row.
+
+![What a new token reads](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_en.png)
 
 **Exact rows.** A far field alone loses a password. So each row is scored by what the layers do with it, with no
 word lists, and the 248 best stay exact; the question at the end of the prompt reads them before it is answered. On
@@ -100,6 +105,8 @@ prompts the scoring did not see, the rows of a planted fact land in the top 0.01
 the top 0.02 % at worst.
 
 ![How passwords stay exact](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/exact_rows_en.png)
+
+**Speed and memory.**
 
 ![Standard and turbo](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/compare_en.png)
 
@@ -253,7 +260,12 @@ MacBook Air M4, 24 ГБ (без вентилятора, базовая шина 
 внимания переходят на дальнее поле: первые 4 строки и последние 1800 остаются точными, остальное хранится в 32
 опорных точках на голову, и цена токена перестаёт расти с текстом. Патентная заявка США № 19/738,763.
 
-![Что хранится от длинного промпта](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_ru.png)
+![Как турбо-файл читает длинный промпт](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/how_ru.png)
+
+После свёртки новый токен читает те же 2052 точные строки и опорные точки при любой длине текста, поэтому генерация
+не замедляется там, где обычный файл теряет скорость с каждой строкой.
+
+![Что читает новый токен](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_ru.png)
 
 Одно дальнее поле теряет пароль. Поэтому каждая строка получает оценку по тому, что с ней делают слои, без списков
 слов, и 248 лучших остаются точными; вопрос в конце промпта читает их до ответа. На промптах, которых оценка не
@@ -327,7 +339,9 @@ turbo 文件使用相同的 `q8_2f` 权重：8192 token 以下的提示词保持
 6 个注意力层转入远场（前 4 行和最后 1800 行精确，其余每个头 32 个地标），并按各层自身的作用为每行打分，保留得分最高的
 248 行为精确行，使密码和编码不会丢失。美国专利申请号 19/738,763。
 
-![长提示词保存什么](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_zh.png)
+![turbo 文件如何读取长提示词](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/how_zh.png)
+
+![新 token 读取什么](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/far_field_zh.png)
 
 ![密码如何保持精确](https://huggingface.co/infosave/Minico-M1-1105-cmf/resolve/main/assets/exact_rows_zh.png)
 
