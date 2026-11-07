@@ -3448,9 +3448,22 @@ fn forward_tokens_device(
             .iter()
             .map(|l| (matches!(l.mixer, Mixer::Gdn(_)), l.ple.is_some()))
             .collect();
-        let Some(dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
+        let Some(mut dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
             return off(state, "device state allocation refused");
         };
+        // The attention layers' far field: the file's turbo header or `CMF_QWEN_O1`.
+        if let Some(o1) = crate::qwen4_o1::Qwen4O1::from_model(&model) {
+            match o1.check(g.head_dim) {
+                Ok(()) => {
+                    let (m, w, sink, seal) = (o1.o1.m, o1.o1.w, o1.o1.sink, o1.o1.seal);
+                    let exact = o1.exact.as_ref().map_or(0, |x| x.budget);
+                    if dev.set_o1(&g, o1) {
+                        tracing::info!("qwen4 O(1): {m} landmarks, window {w}, {sink} sinks, {exact} exact rows, seal at {seal}");
+                    }
+                }
+                Err(e) => tracing::warn!("{e}; the attention layers stay exact"),
+            }
+        }
         let t0 = std::time::Instant::now();
         let Some(bytes) = q4::prewarm(&model, &globals.skeleton_idxs) else {
             return off(state, "skeleton does not fit the VRAM budget");
@@ -3749,7 +3762,9 @@ fn forward_tokens_device(
     let mut pf = DevProf::default();
     let cold_on_device = std::env::var("CMF_QWEN_COLD_DEVICE").as_deref() != Ok("0");
     // Several tokens per frame rule the gated chain out (one frame per layer).
-    let chain_len = if ntok > 1 {
+    // Sealed O(1) layers dispatch directly: a chain's aborted frame would still
+    // run their state pushes, and a row pushed twice is a row evicted twice.
+    let chain_len = if ntok > 1 || dev.o1.is_some() {
         1
     } else {
         std::env::var("CMF_QWEN_CHAIN")
@@ -4265,6 +4280,11 @@ fn forward_tokens_device(
     }
     if let Some(d) = state.dev.as_mut() {
         d.pos = pos0 + ntok;
+        // A prompt past the seal goes over to the far field (a verify window
+        // waits for its accepted rows: `decode_spec_device` seals then).
+        if !check && !snapshot && d.o1_seal_at().is_some_and(|at| pos0 + ntok >= at) {
+            d.seal(&g, pos0 + ntok);
+        }
     }
     if let (Some(pr), Ok(path)) = (
         state.profile.as_mut(),
@@ -4916,6 +4936,13 @@ pub fn spec_round(
         a += 1;
     }
     let logits = std::mem::take(&mut state.window_logits).swap_remove(a);
+    // Sealed O(1) layers: the accepted rows' keys and values go from the spec
+    // stash into the ring and the far field; the rejected rows never happened.
+    if let Some(uid) = state.dev.as_ref().filter(|d| d.o1_sealed()).map(|d| d.uid()) {
+        if !crate::gpu_wgpu::o1_spec_commit(uid, next_pos, a + 1) {
+            return None;
+        }
+    }
     // ── roll back what the rejected drafts changed ──
     if a < k {
         let dev = state.dev.as_mut()?;
@@ -4930,6 +4957,11 @@ pub fn spec_round(
         if let Some(mut enc) = q4::new_encoder("qwen4-keep-r") {
             dev.keep_r(&mut enc, a);
             q4::submit_only(enc);
+        }
+    }
+    if let Some(d) = state.dev.as_mut() {
+        if d.o1_seal_at().is_some_and(|at| state.pos >= at) {
+            d.seal(&g, state.pos);
         }
     }
     if let Some(head) = state.mtp.as_mut() {
