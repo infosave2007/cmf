@@ -416,6 +416,9 @@ pub struct Pipeline {
     /// plain token's become context at the next round, a verify's are taken
     /// by the round that ran it.
     dflash_taps: std::sync::Mutex<Vec<(usize, Vec<f32>)>>,
+    /// The sidecar's block is the trunk's only drafter (the model has no MTP
+    /// block): the wgpu graphs keep its rows without being asked to.
+    pub(crate) dflash_solo: bool,
     /// The Metal verify graph of the round in flight, between its sync
     /// (logits read) and the commit that replays the accepted prefix.
     #[cfg(target_os = "macos")]
@@ -535,6 +538,13 @@ pub struct Pipeline {
     /// full-attention layers have none. The rotary dim of such a layer is 0,
     /// which is what the attention kernel reads.
     pub no_rope_layers: Option<Vec<bool>>,
+    /// Ripple's value residual: per layer, the blend `sigmoid(value_res_lambda)` of the lerp
+    /// that feeds V, `lerp(embedding, normed, blend)`. None = V reads the normed input.
+    pub value_blend: Option<Vec<f32>>,
+    /// The scaled embedding rows of the positions in flight (one, a pair's two, a chunk's).
+    vres_e0: Vec<f32>,
+    /// The rows V projects in the layer being run.
+    vres_in: Vec<f32>,
     /// Natively bounded anchor record (`arch.anchor_core`): the file's
     /// operator, installed once at load. `Some` = the model is
     /// bounded-native — `--o1`/`CMF_O1*` are refused, prefix reuse and
@@ -668,6 +678,12 @@ pub enum Act {
         alpha: f32,
         limit: f32,
     },
+    /// Ripple's clamped SwiGLU (`ModelArch::ffn_clamp`): the gate is cut from above and the up
+    /// branch on both sides at `limit`, then `silu(gate)·up`. The contract of the
+    /// `swiglu_limit` kernels.
+    SiluClamp {
+        limit: f32,
+    },
 }
 
 impl Act {
@@ -696,7 +712,30 @@ impl Act {
                 alpha: 1.702,
                 limit: 7.0,
             },
+            "silu" if arch.ffn_clamp.is_some_and(|l| l > 0.0) => Self::SiluClamp {
+                limit: arch.ffn_clamp.unwrap_or(0.0),
+            },
             other => Self::from_arch(other),
+        }
+    }
+
+    /// The clamp of a dense FFN's pre-activations (0 = none).
+    #[inline]
+    pub fn clamp_limit(self) -> f32 {
+        match self {
+            Self::SiluClamp { limit } => limit,
+            _ => 0.0,
+        }
+    }
+
+    /// The wgpu graphs' dense FFN: an arm and the clamp its kernels take beside it. Only the
+    /// builders that hand the clamp on may ask; every other door reads `graph_act`, which has
+    /// no arm for a clamped SiLU.
+    pub(crate) fn dense_graph_contract(self) -> Option<(crate::gpu::GraphAct, f32)> {
+        match self {
+            Self::SiluClamp { limit } => Some((crate::gpu::GraphAct::Silu, limit)),
+            // The M3 arm carries its frozen clamp inside its code.
+            _ => self.wgpu_graph_act().map(|a| (a, 0.0)),
         }
     }
 
@@ -720,6 +759,7 @@ impl Act {
                 let gate = x.min(limit);
                 gate * (1.0 / (1.0 + (-alpha * gate).exp()))
             }
+            Self::SiluClamp { limit } => inference::silu(x.min(limit)),
         }
     }
 
@@ -734,6 +774,7 @@ impl Act {
             Self::SwiGluOai { alpha, limit } => {
                 inference::swiglu_oai(g, u, alpha, 1.0, Some(limit))
             }
+            Self::SiluClamp { limit } => self.apply(g) * u.clamp(-limit, limit),
             _ => self.apply(g) * u,
         }
     }
@@ -746,7 +787,7 @@ impl Act {
             Self::Silu => Some(crate::gpu::GraphAct::Silu),
             Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
             Self::GeluTanh => Some(crate::gpu::GraphAct::GeluTanh),
-            Self::Situ { .. } | Self::SwiGluOai { .. } => None,
+            Self::Situ { .. } | Self::SwiGluOai { .. } | Self::SiluClamp { .. } => None,
         }
     }
 
@@ -756,6 +797,11 @@ impl Act {
     /// code; a future OAI-like architecture with different constants must add
     /// and test its own kernel contract.
     pub(crate) fn wgpu_graph_act(self) -> Option<crate::gpu::GraphAct> {
+        // A clamped SiLU is an arm AND a limit: a door that reads the arm alone would run it
+        // unclamped, so it gets none here (`dense_graph_contract` hands both on).
+        if matches!(self, Self::SiluClamp { .. }) {
+            return None;
+        }
         self.moe_job_graph_contract().map(|(act, _)| act)
     }
 
@@ -772,6 +818,8 @@ impl Act {
             {
                 Some((crate::gpu::GraphAct::SwiGluOaiM3, 7.0))
             }
+            // The `swiglu_limit` kernels' own contract: gate from above, up on both sides.
+            Self::SiluClamp { limit } => Some((crate::gpu::GraphAct::Silu, limit)),
             _ => self.graph_act().map(|act| (act, 0.0)),
         }
     }
@@ -1588,6 +1636,80 @@ fn dflash_rows_log() -> Option<&'static std::sync::Mutex<std::fs::File>> {
     })
     .as_ref()
 }
+
+/// Rows of the trunk's tapped layers that may wait for the drafter
+/// (`dflash_taps`): 100 KB a row on five layers of 5120.
+const DFLASH_TAPS_ROWS: usize = 16384;
+
+/// `CMF_SPEC_SCRIPT=FILE`: token ids (the whole sequence, prompt first) that a
+/// round of a trunk without a draft block takes its drafts from, in place of
+/// a drafter. For tests of the verify and the rewind: with the plain greedy
+/// sequence in the file every draft holds, and an id changed there is a
+/// draft that does not.
+#[cfg(feature = "gpu")]
+fn solo_script() -> Option<&'static [u32]> {
+    static IDS: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        let path = std::env::var("CMF_SPEC_SCRIPT").ok()?;
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s.split_whitespace().filter_map(|t| t.parse().ok()).collect()),
+            Err(e) => {
+                tracing::warn!("CMF_SPEC_SCRIPT: {path}: {e}");
+                None
+            }
+        }
+    })
+    .as_deref()
+}
+
+/// Little-endian bytes of f32 values (`Pipeline::dflash_dump`).
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// What a round of a trunk without a draft block leaves the decode loop
+/// (`Pipeline::solo_spec_round`): the drafts that held, the trunk's row and
+/// logits after the last of them.
+#[cfg(feature = "gpu")]
+struct SoloRound {
+    accepted: Vec<u32>,
+    drafted: usize,
+    hidden: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+/// The decode loop's account of those rounds: how deep the next one drafts,
+/// and whether rounds land tokens faster than plain steps do.
+#[cfg(feature = "gpu")]
+struct SoloSpec {
+    k: usize,
+    /// Plain tokens to go before the next round, and the wait a losing
+    /// stretch of rounds gets next time.
+    rest: u32,
+    back: u32,
+    /// A plain token's time and a round's time per token it lands, ms
+    /// (the first plain token of a sequence pays the warm-up: not a sample).
+    plain_ms: f32,
+    plain_n: u32,
+    round_ms: f32,
+    rounds: u32,
+    /// The step in flight: its start, and the tokens it lands (0: a plain one).
+    last: Option<(std::time::Instant, usize)>,
+}
+
+/// The deepest round of a trunk without a draft block (the tip and seven
+/// drafts: the batch graph's narrow kernels take eight rows, and a ninth
+/// row costs a plane-wide GEMM a layer — 660 ms a verify against 120 on
+/// the A40), the rounds a stretch is judged over, and the waits of a
+/// stretch that lost.
+#[cfg(feature = "gpu")]
+const SOLO_K_MOST: usize = 7;
+#[cfg(feature = "gpu")]
+const SOLO_TRIAL: u32 = 6;
+#[cfg(feature = "gpu")]
+const SOLO_REST: u32 = 32;
+#[cfg(feature = "gpu")]
+const SOLO_REST_MOST: u32 = 512;
 
 /// Which drafter takes rounds when a DFlash sidecar sits beside the model's
 /// own MTP block: `CMF_DFLASH_PICK=dflash` / `mtp` pins one, anything else
@@ -2858,7 +2980,9 @@ impl Pipeline {
             // per-token stack — it has no batch graph rows to ingest.
             !self.weights.layers.is_empty()
                 && !self.per_token_stack()
-                && (self.global_attn.is_some() || self.attn_v_norm)
+                // Gemma-4, and Ripple: a dense stack with per-layer geometry
+                // whose host walk attends 80 heads a row on the CPU.
+                && (self.global_attn.is_some() || self.attn_v_norm || self.value_blend.is_some())
                 && crate::gpu::g4_batch_on()
                 && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
                 && crate::gpu::enabled_here()
@@ -3060,6 +3184,8 @@ impl Pipeline {
         }
         let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
+            // V with rows of its own (Ripple's value residual): no Metal kernel blends them.
+            || self.value_blend.is_some()
             || !self.metal_rope_scale_ok()
             || !crate::gpu::enabled_here()
             || !graph_force
@@ -4247,6 +4373,7 @@ impl Pipeline {
                         norm_style,
                         pool: pool.as_deref(),
                         v_head_dim: hd,
+                        value_in: None,
                     };
                     // CMF_ATTN_ORACLE=1: diff the device attend against
                     // this CPU attend on identical inputs (bring-up).
@@ -4653,6 +4780,7 @@ impl Pipeline {
             dflash: None,
             dflash_rows: None,
             dflash_taps: std::sync::Mutex::new(Vec::new()),
+            dflash_solo: false,
             #[cfg(target_os = "macos")]
             metal_verify: None,
             inv_freq,
@@ -4683,6 +4811,9 @@ impl Pipeline {
             chunk_min_rows: 32,
             sliding_layers: None,
             no_rope_layers: None,
+            value_blend: None,
+            vres_e0: Vec::new(),
+            vres_in: Vec::new(),
             anchor_core: None,
             bounded_rope: None,
             kv_prefix: KvPrefix::default(),
@@ -5816,6 +5947,7 @@ impl Pipeline {
             norm_style: self.norm_style,
             pool: self.pool.as_deref(),
             v_head_dim: self.v_head_dim.unwrap_or(self.head_dim),
+            value_in: None,
         }
     }
 
@@ -6271,6 +6403,26 @@ impl Pipeline {
             && (!self.o1_active() || self.o1_spec())
             && spec_sampling_ok
             && spec_wanted;
+        // A trunk without a draft block of its own (Ripple): a DFlash sidecar
+        // drafts a round in one block and the batch graph verifies it, the
+        // rows of drafts that did not hold let go. Plain greedy only, so the
+        // text is the plain path's. `CMF_GRAPH_SPEC=0` keeps plain tokens.
+        #[cfg(feature = "gpu")]
+        let solo_spec = self.speculative
+            && graph_on
+            && !metal_wgpu
+            && self.mtp.is_none()
+            && task_mask.is_none()
+            && (!self.o1_active() || self.o1_spec())
+            && self.sampler_config.temperature < 1e-6
+            && !penalized
+            && spec_env.as_deref() != Some("0")
+            && (self.dflash.is_some() || solo_script().is_some());
+        #[cfg(feature = "gpu")]
+        let solo_pin: Option<usize> =
+            std::env::var("CMF_GRAPH_SPEC_K").ok().and_then(|v| v.parse().ok()).filter(|k| (1..=SOLO_K_MOST).contains(k));
+        #[cfg(feature = "gpu")]
+        let mut solo = SoloSpec { k: solo_pin.unwrap_or(6), rest: 3, back: SOLO_REST, plain_ms: 0.0, plain_n: 0, round_ms: 0.0, rounds: 0, last: None };
         // The host fused pair is an optimization, not a verifier. On real
         // q4tp Qwen3.5 a near-tied row produced a different greedy argmax
         // from two serial target forwards. That makes a seemingly accepted
@@ -7689,6 +7841,88 @@ impl Pipeline {
                     }
                 }
             }
+            // ── A trunk without a draft block: the sidecar's block drafts, the batch graph verifies ──
+            #[cfg(feature = "gpu")]
+            if solo_spec && next_pos > 0 {
+                let now = std::time::Instant::now();
+                // the step that just ended, on the account of its kind
+                if let Some((t, tokens)) = solo.last.take() {
+                    let ms = (now - t).as_secs_f32() * 1e3;
+                    if tokens == 0 {
+                        if solo.plain_n > 0 {
+                            solo.plain_ms = if solo.plain_ms == 0.0 { ms } else { 0.7 * solo.plain_ms + 0.3 * ms };
+                        }
+                        solo.plain_n += 1;
+                    } else {
+                        let per = ms / tokens as f32;
+                        solo.round_ms = if solo.rounds == 0 { per } else { 0.8 * solo.round_ms + 0.2 * per };
+                        solo.rounds += 1;
+                        if spec_time_level() > 0 {
+                            eprintln!(
+                                "solo-round wall {ms:.1} ms → {tokens} tokens ({:.1} ms a token, plain {:.1})",
+                                solo.round_ms, solo.plain_ms
+                            );
+                        }
+                        // rounds that land tokens no faster than plain steps sit out, longer each time
+                        if solo_pin.is_none() && solo.plain_ms > 0.0 && solo.rounds >= SOLO_TRIAL && solo.round_ms > 0.97 * solo.plain_ms {
+                            solo.rest = solo.back;
+                            solo.back = (solo.back * 2).min(SOLO_REST_MOST);
+                            solo.rounds = 0;
+                        }
+                    }
+                }
+                if solo.rest == 0 && generated + 1 < max_tokens {
+                    let k = solo.k.min(max_tokens - generated);
+                    match self.solo_spec_round(t_next, next_pos, &all_ids, k) {
+                        Some(r) => {
+                            drafted += r.drafted;
+                            accepted += r.accepted.len();
+                            if solo_pin.is_none() {
+                                // two past what held: a round that held all of its drafts goes deeper
+                                solo.k = (r.accepted.len() + 2).clamp(2, SOLO_K_MOST);
+                            }
+                            solo.last = Some((now, r.accepted.len() + 1));
+                            let mut stopped = false;
+                            for &id in &r.accepted {
+                                if self.confidence_on {
+                                    confidence.push(0.0);
+                                }
+                                if trace_on {
+                                    traces.push(TokenTrace {
+                                        t: generated,
+                                        token_id: id,
+                                        confidence: confidence.last().copied().unwrap_or(0.0),
+                                        active_skill: None,
+                                        recon: None,
+                                        switched: false,
+                                    });
+                                }
+                                if !commit!(id) {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            if stopped {
+                                break 'decode;
+                            }
+                            next_pos += r.accepted.len() + 1;
+                            hidden = r.hidden;
+                            self.graph_logits = Some(r.logits);
+                            continue 'decode;
+                        }
+                        None => {
+                            if self.graph_failed.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                self.finish_generation(&mut mtp, &mut router, true);
+                                return Err("GPU batch graph failed during a speculative round".to_string());
+                            }
+                            // no round here (the drafter's context is not at the tip, the batch graph declined)
+                            solo.rest = 8;
+                        }
+                    }
+                }
+                solo.rest = solo.rest.saturating_sub(1);
+                solo.last = Some((now, 0));
+            }
             // ── Qwen3.8-Flash-Next draft head: k greedy drafts from the MTP
             //    sidecar, one batched verify window on the device ──
             #[cfg(feature = "gpu")]
@@ -8198,6 +8432,19 @@ impl Pipeline {
         }
         self.finish_generation(&mut mtp, &mut router, cancelled);
 
+        if self.dflash_solo && spec_time_level() > 0 {
+            if let Some(line) = crate::dflash::stage_report() {
+                eprintln!("solo-draft: {line}");
+            }
+        }
+        // `CMF_GEN_IDS_OUT=FILE`: the sequence as ids, prompt first (what
+        // `CMF_SPEC_SCRIPT` reads back).
+        if let Ok(path) = std::env::var("CMF_GEN_IDS_OUT") {
+            let text = all_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
+            if let Err(e) = std::fs::write(&path, text) {
+                tracing::warn!("CMF_GEN_IDS_OUT: {path}: {e}");
+            }
+        }
         let output_ids = &all_ids[input_ids.len()..];
         // Forwarded = prompt + all generated but the LAST sampled token
         // (emitted without being fed back). Exact only without MTP —
@@ -8805,6 +9052,8 @@ impl Pipeline {
                 up: gw(&d.up_proj)?,
                 down: gw(&d.down_proj)?,
                 act: d.act.graph_act()?,
+                limit: 0.0,
+                hot: None,
             },
         };
         let nh = self.num_heads;
@@ -8983,6 +9232,8 @@ impl Pipeline {
                 up: gu,
                 down: gd,
                 act: gact,
+                limit: 0.0,
+                hot: None,
             },
         };
         let positions: Vec<usize> = (first_pos..first_pos + pairs.len()).collect();
@@ -10452,15 +10703,27 @@ impl Pipeline {
         for r in 1..rows {
             h[r * hs..(r + 1) * hs].copy_from_slice(&mask);
         }
+        // A trunk that scales its embeddings on the way in (Ripple): the
+        // block reads the table's rows as they are (`CMF_DFLASH_EMBED=scaled`
+        // hands it the trunk's input rows).
+        if self.embed_multiplier != 1.0 && std::env::var("CMF_DFLASH_EMBED").as_deref() != Ok("scaled") {
+            let inv = 1.0 / self.embed_multiplier;
+            h.iter_mut().for_each(|v| *v *= inv);
+        }
         let pool = self.pool.as_deref();
+        let t0 = std::time::Instant::now();
         d.settle(pool);
         spec_stamp("d.ctx");
+        let t_ctx = t0.elapsed();
         let out = d.block(next_pos, h, pool);
         spec_stamp("d.block");
+        let t_block = t0.elapsed();
         // the head over the round's shortlist of the vocabulary, as the MTP
-        // draft has it (the full head while `draft_full_streak` runs)
+        // draft has it (the full head while `draft_full_streak` runs). The
+        // shortlist is the low ids of Qwen's vocabulary: a trunk with another
+        // tokenizer (`dflash_solo`) scores the whole head.
         let (n, head) = (rows - 1, &self.weights.lm_head);
-        let width = self.draft_head_rows(head.rows());
+        let width = if self.dflash_solo { head.rows() } else { self.draft_head_rows(head.rows()) };
         let mut logits = vec![0f32; n * width];
         // the block's rows on the narrow kernel; any other head as a batch
         let narrow = head.mapped_q4tp().is_some_and(|(m, idx)| {
@@ -10473,13 +10736,129 @@ impl Pipeline {
             }
         }
         spec_stamp("d.head");
+        let t_head = t0.elapsed();
         let (mut ids, _) = d.select(&out[hs..], &logits, t_next);
         ids.truncate(k);
+        if self.dflash_solo && spec_time_level() > 0 {
+            eprintln!(
+                "solo-draft: context {:.1} ms | block {:.1} ms | head {:.1} ms | selector {:.1} ms",
+                t_ctx.as_secs_f64() * 1e3,
+                (t_block - t_ctx).as_secs_f64() * 1e3,
+                (t_head - t_block).as_secs_f64() * 1e3,
+                (t0.elapsed() - t_head).as_secs_f64() * 1e3
+            );
+        }
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() && d.next_position() != next_pos {
             eprintln!("dflash: the context ends at {} for a block at {next_pos}", d.next_position());
         }
         self.dflash = Some(d);
         ids
+    }
+
+    /// A speculative round of a trunk that has no draft block of its own.
+    /// The drafts are the DFlash sidecar's block behind the tip `t_next` (or
+    /// the next ids of `CMF_SPEC_SCRIPT`); the batch graph verifies them with
+    /// the tip in one submission, and the cache keeps the rows of the drafts
+    /// that held and of the tip. None: no round was made (plain greedy goes
+    /// on), or the graph failed after admission (`graph_failed` is set).
+    #[cfg(feature = "gpu")]
+    fn solo_spec_round(&mut self, t_next: u32, next_pos: usize, all_ids: &[u32], k: usize) -> Option<SoloRound> {
+        self.dflash_taps_absorb();
+        let t0 = std::time::Instant::now();
+        let drafts: Vec<u32> = match solo_script() {
+            Some(script) => script.iter().skip(all_ids.len()).take(k).copied().collect(),
+            None => {
+                if self.dflash.as_ref().is_none_or(|d| d.next_position() != next_pos) {
+                    return None;
+                }
+                self.dflash_draft(t_next, next_pos, k)
+            }
+        };
+        if drafts.is_empty() {
+            return None;
+        }
+        let t_draft = t0.elapsed();
+        let (b, hs) = (drafts.len() + 1, self.hidden_size);
+        let mut hiddens = vec![0f32; b * hs];
+        for (i, &t) in std::iter::once(&t_next).chain(drafts.iter()).enumerate() {
+            hiddens[i * hs..(i + 1) * hs].copy_from_slice(&self.embed_single(t));
+        }
+        let positions: Vec<usize> = (next_pos..next_pos + b).collect();
+        let (lm_gw, lm_rows) = {
+            let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
+            (
+                crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false },
+                self.weights.lm_head.rows(),
+            )
+        };
+        let mut logits = Vec::new();
+        let final_norm = self.weights.final_norm.clone();
+        let outcome = self.try_batch_graph_wgpu(
+            &mut hiddens,
+            &positions,
+            b,
+            Some(crate::gpu::SpecTail { lm: lm_gw, lm_rows, final_norm: &final_norm, logits_out: &mut logits, pick: None }),
+        );
+        let fail = |p: &mut Self, what: &str| {
+            p.clear_sequence_state();
+            p.graph_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!("{what}");
+        };
+        match outcome {
+            crate::gpu::BatchGraphOutcome::Completed if logits.len() >= b * lm_rows => {}
+            crate::gpu::BatchGraphOutcome::Declined => return None,
+            _ => {
+                fail(self, "the verify of a speculative round failed after admission");
+                return None;
+            }
+        }
+        let t_verify = t0.elapsed();
+        // row i's argmax is the trunk's token after input i
+        let ids: Vec<u32> = (0..b).map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows])).collect();
+        let mut a = 0usize;
+        while a < drafts.len() && ids[a] == drafts[a] {
+            a += 1;
+        }
+        if std::env::var_os("CMF_SPEC_DBG").is_some() {
+            eprintln!(
+                "solo-dbg: tip {t_next} at {next_pos} | context {:?} | drafts {drafts:?} | the trunk's {ids:?} | kept {a}",
+                self.dflash.as_ref().map(|d| d.span())
+            );
+        }
+        if self.o1_active() && !crate::gpu::o1_spec_commit(self.graph_kv_id, next_pos, a + 1) {
+            fail(self, "far field commit failed after a speculative round");
+            return None;
+        }
+        // the rows the round keeps are the drafter's next context
+        let kept = self.dflash_taps.lock().unwrap().pop();
+        if let (Some((pos0, rows)), Some(d)) = (kept, self.dflash.as_mut()) {
+            let tw = d.g.tap_width();
+            if pos0 == next_pos && rows.len() >= (a + 1) * tw {
+                d.queue_context(pos0, &rows[..(a + 1) * tw], self.pool.as_deref());
+            }
+        }
+        if !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
+            fail(self, "trunk graph KV rewind failed after a speculative round");
+            return None;
+        }
+        let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
+        row.resize(self.vocab_size, 0.0);
+        if let Some(c) = self.final_softcap {
+            for l in row.iter_mut() {
+                *l = c * (*l / c).tanh();
+            }
+        }
+        if spec_time_level() > 0 {
+            eprintln!(
+                "solo-round: draft {:.1} ms | verify {:.1} ms | commit {:.1} ms | kept {a} of {}",
+                t_draft.as_secs_f64() * 1e3,
+                (t_verify - t_draft).as_secs_f64() * 1e3,
+                (t0.elapsed() - t_verify).as_secs_f64() * 1e3,
+                drafts.len()
+            );
+        }
+        Some(SoloRound { accepted: drafts[..a].to_vec(), drafted: drafts.len(), hidden: hiddens[a * hs..(a + 1) * hs].to_vec(), logits: row })
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
@@ -10581,6 +10960,11 @@ impl Pipeline {
         self.mimo_moe_prepare();
         let mut h1 = emb1.to_vec();
         let mut h2 = emb2.to_vec();
+        if self.value_blend.is_some() {
+            self.vres_e0.clear();
+            self.vres_e0.extend_from_slice(emb1);
+            self.vres_e0.extend_from_slice(emb2);
+        }
         let (_nkv, _hd, hs, _rd, eps) = (
             self.num_kv_heads,
             self.head_dim,
@@ -10621,6 +11005,17 @@ impl Pipeline {
                 self.norm_style,
                 &mut self.ws.n2,
             );
+            // The two rows V projects, when the layer blends the embeddings into them.
+            let vres = match self.layer_value_blend(li) {
+                Some(blend) => {
+                    let mut second = Vec::new();
+                    vres_lerp(&self.vres_e0[..hs], &self.ws.n1, blend, &mut self.vres_in);
+                    vres_lerp(&self.vres_e0[hs..], &self.ws.n2, blend, &mut second);
+                    self.vres_in.extend_from_slice(&second);
+                    true
+                }
+                None => false,
+            };
 
             let (a1, a2) = match &lw.attn {
                 AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
@@ -10741,6 +11136,7 @@ impl Pipeline {
                         norm_style: self.norm_style,
                         pool: pool.as_deref(),
                         v_head_dim: self.layer_v_dim(li),
+                        value_in: vres.then(|| self.vres_in.as_slice()),
                     };
                     attention::qwen_attention_pair(
                         &self.ws.n1,
@@ -11622,6 +12018,18 @@ impl Pipeline {
                 Err(err)
             }
         }
+    }
+
+    /// The FFN probe over one window of the layer-major batched walk
+    /// (`calib_forward`): the statistic of `probe_ffn_mass`, the window's rows
+    /// in one context, every projection a GEMM on the device where one is up.
+    pub fn probe_ffn_mass_span(&mut self, ids: &[u32], chunk: usize) -> Result<Vec<Vec<f64>>, String> {
+        FFN_PROBE.with(|p| {
+            *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
+        });
+        let result = self.calib_forward(ids, self.num_layers, chunk);
+        let probe = FFN_PROBE.with(|p| p.borrow_mut().take()).unwrap_or_default();
+        result.map(|()| probe)
     }
 
     /// Teacher-forced PPL with a task mask active (sparse execution) —
@@ -13343,6 +13751,9 @@ impl Pipeline {
             && !self.o1_active()
             && bk > 1
             && (self.batch_prefix_prefill()
+                // Ripple: scoring reads its chunks through the batch graph
+                // too (the host walk attends 80 heads a row on the CPU).
+                || (self.value_blend.is_some() && self.g4_batch_prefill())
                 // An embedded prompt (vision rows) on the graph route takes
                 // the batched graph like an id prompt does.
                 || (matches!(input, PrefillIn::Hidden(_)) && self.generation_batch_k() > 0)
@@ -13483,6 +13894,22 @@ impl Pipeline {
             PrefillIn::Hidden(hb) => {
                 h = hb.to_vec();
                 h_ready = true;
+            }
+        }
+        // Ripple's value residual reads the chunk's embedding rows in every layer.
+        if self.value_blend.is_some() {
+            self.vres_e0.clear();
+            match input {
+                PrefillIn::Ids(ids) => {
+                    for &id in ids {
+                        let e = self.embed_single(id);
+                        self.vres_e0.extend_from_slice(&e);
+                    }
+                }
+                PrefillIn::Hidden(hb) => {
+                    assert!(from == 0, "value residual: a layer span past the first layer has no embedding rows");
+                    self.vres_e0.extend_from_slice(hb);
+                }
             }
         }
         let fill_h = |h: &mut Vec<f32>, me: &Self| {
@@ -13764,6 +14191,14 @@ impl Pipeline {
                             &mut normed[bi * hs..(bi + 1) * hs],
                         );
                     }
+                    // The rows V projects, when the layer blends the embeddings into them.
+                    let vres = match self.layer_value_blend(li) {
+                        Some(blend) => {
+                            vres_lerp(&self.vres_e0, &normed, blend, &mut self.vres_in);
+                            true
+                        }
+                        None => false,
+                    };
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
@@ -13795,6 +14230,7 @@ impl Pipeline {
                         norm_style,
                         pool: pool.as_deref(),
                         v_head_dim: self.layer_v_dim(li),
+                        value_in: vres.then(|| self.vres_in.as_slice()),
                     };
                     #[cfg(feature = "gpu")]
                     let _mirror = self
@@ -14181,6 +14617,8 @@ impl Pipeline {
             || (b < self.chunk_min_rows && self.dash.is_none())
             // MRoPE rows rotate on the host (`attention::MropeView`).
             || self.prompt_mrope.is_some()
+            // V with rows of its own (Ripple's value residual) stays on the host walk.
+            || self.value_blend.is_some()
             // Sliding windows with per-layer RoPE ride the chunk graph
             // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
             || (self.swa.is_some() && !self.metal_graph_swa() && !gemma4)
@@ -14524,6 +14962,13 @@ impl Pipeline {
         self.inv_freq.clone()
     }
 
+    /// Layer `li`'s value-residual blend (None = V reads the normed input).
+    fn layer_value_blend(&self, li: usize) -> Option<f32> {
+        self.value_blend
+            .as_ref()
+            .and_then(|v| v.get(self.phys_layer(li)).copied())
+    }
+
     /// The attend window for layer `li` (None = full context).
     fn layer_window(&self, li: usize) -> Option<usize> {
         self.swa
@@ -14843,6 +15288,9 @@ impl Pipeline {
     /// what that geometry does not express keeps the decline, by name.
     /// None for every model with one attention geometry.
     pub fn wgpu_graph_attn_decline(&self) -> Option<&'static str> {
+        if self.value_blend.is_some() && !crate::gpu::vres_graph_on() {
+            return Some("value residual");
+        }
         // Keep the ordinary (uniform) fast arms off YaRN until they carry a
         // scale field too. A non-uniform geometry gets a `GraphAttnGeom` and
         // is handled below by the generic graph kernels.
@@ -14921,10 +15369,18 @@ impl Pipeline {
         if self.attn_v_norm {
             return Some("V norm");
         }
-        if self.weights.layers.iter().any(|lw| {
-            lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
-        }) {
-            return Some("sandwich norms / layer scale");
+        // Sandwich norms alone ride the batch graph's plain tails (Ripple).
+        if self.weights.layers.iter().any(|lw| lw.layer_scale.is_some()) {
+            return Some("layer scale");
+        }
+        if self.value_blend.is_none()
+            && self
+                .weights
+                .layers
+                .iter()
+                .any(|lw| lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some())
+        {
+            return Some("sandwich norms");
         }
         None
     }
@@ -14986,7 +15442,16 @@ impl Pipeline {
             sink: self.kv_cache.layers[li].sinks.as_deref(),
             v_norm: self.attn_v_norm,
             dash,
+            vres: None,
         })
+    }
+
+    /// `graph_attn_geom` with Ripple's value residual: the layer's blend and
+    /// `e0`, the embedding rows of the graph call.
+    fn graph_attn_geom_vres<'a>(&'a self, li: usize, e0: &'a [f32]) -> Option<crate::gpu::GraphAttnGeom<'a>> {
+        let mut g = self.graph_attn_geom(li)?;
+        g.vres = self.layer_value_blend(li).map(|b| (b, e0));
+        Some(g)
     }
 
     /// The decode graph's device K/V mirror that layer `li`'s batched
@@ -15421,6 +15886,11 @@ impl Pipeline {
         if self.per_token_stack() {
             return Err(
                 "network split: the per-token stack (gemma-3n AltUp / gemma-4 E-series) is not splittable yet".into(),
+            );
+        }
+        if self.value_blend.is_some() {
+            return Err(
+                "network split: a value-residual stack (Ripple) reads the embedding row in every layer".into(),
             );
         }
         Ok(())
@@ -16103,6 +16573,9 @@ impl Pipeline {
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        // Ripple's value residual: the embedding row of this position. A
+        // span past the first layer reads the one `forward_layers_span` kept.
+        let vres_e0: &[f32] = if from == 0 { hidden } else { &self.vres_e0 };
         let mut layers = Vec::with_capacity(upto_excl - from);
         let mut model = None;
         let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
@@ -16167,14 +16640,15 @@ impl Pipeline {
             }
             let gffn = match &lw.ffn {
                 FfnKind::DenseMoe(_) => return None, // dual branch: CPU path
-                // A tube layer is several matrices, not one — the
-                // whole-layer graph has no shape for it yet.
-                FfnKind::Dense(d) if !d.segs.is_empty() => return None,
+                // A tube layer is several matrices, not one. The graph has
+                // a shape for the core with one more triple that is always
+                // on (a hot-neuron file); task tubes keep the segmented path.
+                FfnKind::Dense(d) if d.segs.len() > 1 => return None,
                 FfnKind::Dense(d) => {
                     // An activation the graph has no kernel arm for keeps
                     // the CPU/per-op owner, by name — the dense graph FFN
                     // used to compute SiLU for whatever the model asked.
-                    let Some(act) = d.act.wgpu_graph_act() else {
+                    let Some((act, limit)) = d.act.dense_graph_contract() else {
                         self.note_graph_decline(
                             "wgpu token graph",
                             "dense FFN activation without a graph kernel",
@@ -16186,6 +16660,16 @@ impl Pipeline {
                         up: gw(&d.up_proj)?,
                         down: gw(&d.down_proj)?,
                         act,
+                        limit,
+                        hot: match d.segs.first() {
+                            Some(seg) => Some(crate::gpu::GraphMoeDetachedShared {
+                                gate: gw(&seg.gate)?,
+                                up: gw(&seg.up)?,
+                                down: gw(&seg.down)?,
+                                width: seg.width,
+                            }),
+                            None => None,
+                        },
                     }
                 }
                 FfnKind::Moe(m) => {
@@ -16502,7 +16986,7 @@ impl Pipeline {
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
                         cpu_base: self.kv_cache.layers[li].base(),
-                        geom: self.graph_attn_geom(li),
+                        geom: self.graph_attn_geom_vres(li, vres_e0),
                         head_gate,
                     }
                 }
@@ -17308,6 +17792,7 @@ impl Pipeline {
         if positions.len() != b
             || self.mhc.is_some()
             || self.prompt_mrope.is_some()
+            || self.value_blend.is_some()
             || positions.windows(2).any(|w| w[1] != w[0] + 1)
             || hiddens.len() != b * self.hidden_size
         {
@@ -18441,6 +18926,13 @@ impl Pipeline {
                 affine: false,
             })
         }
+        // Ripple's value residual: the chunk's embedding rows, as they enter
+        // the first layer (the graph overwrites `hiddens`).
+        let vres_e0: Vec<f32> = if self.value_blend.is_some() {
+            hiddens[..k * self.hidden_size].to_vec()
+        } else {
+            Vec::new()
+        };
         let built: Option<(
             Vec<crate::gpu::GraphLayer<'_>>,
             std::sync::Arc<cortiq_core::CmfModel>,
@@ -18456,14 +18948,14 @@ impl Pipeline {
                 // 54 on decode, i.e. reading the prompt was slower than
                 // writing the answer.
                 let gffn = match &lw.ffn {
-                    FfnKind::Dense(d) if !d.segs.is_empty() => {
+                    FfnKind::Dense(d) if d.segs.len() > 1 => {
                         if batch_debug {
                             eprintln!("batch graph: dense segmented FFN at layer {li}");
                         }
                         return None;
                     }
                     FfnKind::Dense(d) => {
-                        let Some(act) = d.act.wgpu_graph_act() else {
+                        let Some((act, limit)) = d.act.dense_graph_contract() else {
                             if batch_debug {
                                 eprintln!(
                                     "batch graph: dense FFN activation {:?} without a graph kernel at layer {li}",
@@ -18477,6 +18969,17 @@ impl Pipeline {
                             up: gw(&d.up_proj)?,
                             down: gw(&d.down_proj)?,
                             act,
+                            limit,
+                            // The layer's one tube (hot neurons), always on.
+                            hot: match d.segs.first() {
+                                Some(seg) => Some(crate::gpu::GraphMoeDetachedShared {
+                                    gate: gw(&seg.gate)?,
+                                    up: gw(&seg.up)?,
+                                    down: gw(&seg.down)?,
+                                    width: seg.width,
+                                }),
+                                None => None,
+                            },
                         }
                     }
                     FfnKind::Moe(m) => {
@@ -18685,7 +19188,7 @@ impl Pipeline {
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
                             cpu_base: self.kv_cache.layers[li].base(),
-                            geom: self.graph_attn_geom(li),
+                            geom: self.graph_attn_geom_vres(li, &vres_e0),
                             // The batched graph has no head-gate arm; a
                             // gated layer is refused above.
                             head_gate: None,
@@ -18724,20 +19227,22 @@ impl Pipeline {
                     }
                     _ => return None,
                 };
-                // Gemma-4's sandwich norms and layer scalar (`gemma_batch`);
-                // every other model hands the graph none, as before.
+                // Gemma-4's sandwich norms and layer scalar (`gemma_batch`),
+                // Ripple's sandwich norms (the plain tails); every other
+                // model hands the graph none, as before.
                 let g4 = self.global_attn.is_some() || self.attn_v_norm;
+                let sandwich = g4 || self.value_blend.is_some();
                 layers.push(crate::gpu::GraphLayer {
                     mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li)),
                     input_norm: &lw.input_norm,
                     attn,
                     post_norm: &lw.post_norm,
-                    attn_out_norm: if g4 {
+                    attn_out_norm: if sandwich {
                         lw.attn_out_norm.as_deref()
                     } else {
                         None
                     },
-                    ffn_out_norm: if g4 { lw.ffn_out_norm.as_deref() } else { None },
+                    ffn_out_norm: if sandwich { lw.ffn_out_norm.as_deref() } else { None },
                     layer_scale: if g4 { lw.layer_scale } else { None },
                     ffn: gffn,
                 });
@@ -18816,7 +19321,7 @@ impl Pipeline {
     /// `from..upto_excl` is the whole stack (nothing otherwise).
     fn dflash_taps_wanted(&self, from: usize, upto_excl: usize) -> Vec<usize> {
         match &self.dflash {
-            Some(d) if dflash_pick() == Some(true) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
+            Some(d) if (self.dflash_solo || dflash_pick() == Some(true)) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
             _ => Vec::new(),
         }
     }
@@ -18838,7 +19343,64 @@ impl Pipeline {
                 joined[(r * nt + s) * hs..][..hs].copy_from_slice(&raw[(s * rows + r) * hs..][..hs]);
             }
         }
-        self.dflash_taps.lock().unwrap().push((pos0, joined));
+        if std::env::var_os("CMF_SPEC_DBG").is_some() {
+            let rms = (joined.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / joined.len().max(1) as f64).sqrt();
+            eprintln!("solo-dbg: {rows} rows of {nt} layers kept from position {pos0} (rms {rms:.3})");
+        }
+        if let Some(dir) = std::env::var_os("CMF_DFLASH_DUMP") {
+            self.dflash_dump(std::path::Path::new(&dir), pos0, rows, &joined);
+        }
+        let mut kept = self.dflash_taps.lock().unwrap();
+        kept.push((pos0, joined));
+        // a long prompt's rows wait here until the first round: past
+        // `DFLASH_TAPS_ROWS` the oldest chunks go, and the drafter's context
+        // starts at what is left
+        let mut rows: usize = kept.iter().map(|(_, r)| r.len()).sum::<usize>() / (nt * hs);
+        while rows > DFLASH_TAPS_ROWS && kept.len() > 1 {
+            rows -= kept.remove(0).1.len() / (nt * hs);
+        }
+    }
+
+    /// `CMF_DFLASH_DUMP=DIR`: what a reference run of the published drafter
+    /// reads (`scripts/ripple/ripple_dflash_ref.py`). `taps.bin` grows by a
+    /// record a kept chunk (position and row count as u64, then the rows'
+    /// f32, a row's layers joined); the embedding table and the head are
+    /// written once as f32, the table without the trunk's input scale.
+    fn dflash_dump(&self, dir: &std::path::Path, pos0: usize, rows: usize, joined: &[f32]) {
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(dir);
+        let table = |name: &str, t: &QTensor| {
+            let p = dir.join(name);
+            if p.exists() {
+                return;
+            }
+            let Ok(f) = std::fs::File::create(&p) else { return };
+            let mut w = std::io::BufWriter::new(f);
+            let mut row = vec![0f32; t.cols()];
+            for r in 0..t.rows() {
+                t.row_f32(r, &mut row);
+                let _ = w.write_all(&f32_bytes(&row));
+            }
+        };
+        table("embed.f32", &self.weights.embed_tokens);
+        table("head.f32", &self.weights.lm_head);
+        let meta = dir.join("meta.json");
+        if !meta.exists() {
+            let _ = std::fs::write(
+                &meta,
+                format!(
+                    "{{\"hidden\": {}, \"vocab\": {}, \"embed_multiplier\": {}}}\n",
+                    self.hidden_size,
+                    self.weights.lm_head.rows(),
+                    self.embed_multiplier
+                ),
+            );
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("taps.bin")) {
+            let _ = f.write_all(&(pos0 as u64).to_le_bytes());
+            let _ = f.write_all(&(rows as u64).to_le_bytes());
+            let _ = f.write_all(&f32_bytes(joined));
+        }
     }
 
     /// Rows the wgpu graphs kept become the drafter's context, oldest first.
@@ -20546,6 +21108,19 @@ impl Pipeline {
             }
         }
         let mut h = hidden.to_vec();
+        // Ripple's value residual reads this position's embedding row in every layer.
+        // A later span of the same position (a stack split across cards)
+        // keeps the row its first span stored.
+        if self.value_blend.is_some() {
+            if from == 0 {
+                self.vres_e0.clear();
+                self.vres_e0.extend_from_slice(hidden);
+            }
+            assert!(
+                self.vres_e0.len() == hidden.len(),
+                "value residual: a layer span past the first layer has no embedding row"
+            );
+        }
         // MiMo-V2 expert placement: decided before the graph or the per-op
         // arena can claim the budget the expert bank needs.
         self.mimo_moe_prepare();
@@ -20860,6 +21435,14 @@ impl Pipeline {
                 &mut self.ws.n1,
             );
             drop(prof);
+            // The row V projects, when the layer blends the embedding into it.
+            let vres = match self.layer_value_blend(li) {
+                Some(blend) => {
+                    vres_lerp(&self.vres_e0, &self.ws.n1, blend, &mut self.vres_in);
+                    true
+                }
+                None => false,
+            };
 
             let attn_out = match &lw.attn {
                 AttnKind::Mla(w) => {
@@ -21010,6 +21593,7 @@ impl Pipeline {
                         norm_style: self.norm_style,
                         pool: pool.as_deref(),
                         v_head_dim: self.layer_v_dim(li),
+                        value_in: vres.then(|| self.vres_in.as_slice()),
                     };
                     attention::qwen_attention_nystrom(
                         &self.ws.n1,
@@ -21158,6 +21742,7 @@ impl Pipeline {
                                 norm_style: self.norm_style,
                                 pool: pool.as_deref(),
                                 v_head_dim: self.layer_v_dim(li),
+                                value_in: vres.then(|| self.vres_in.as_slice()),
                             };
                             attention::qwen_attention(
                                 &self.ws.n1,
@@ -22262,9 +22847,27 @@ fn dense_ffn_batch(
             let Some(row) = acc.get_mut(li as usize) else {
                 return;
             };
-            let sq = probe_sq();
+            let (sq, topk) = (probe_sq(), probe_topk().min(inter));
+            let mut mag: Vec<f32> = Vec::new();
             for t in 0..b {
-                for (a, &v) in row.iter_mut().zip(&g[t * inter..(t + 1) * inter]) {
+                let gr = &g[t * inter..(t + 1) * inter];
+                if topk > 0 {
+                    // The hit count of the per-position probe: a position's
+                    // `topk` loudest neurons each get one.
+                    mag.clear();
+                    mag.extend(gr.iter().map(|v| v.abs()));
+                    let (_, kth, _) = mag.select_nth_unstable_by(topk - 1, |a, b| {
+                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let thr = *kth;
+                    for (a, &v) in row.iter_mut().zip(gr) {
+                        if v.abs() >= thr {
+                            *a += 1.0;
+                        }
+                    }
+                    continue;
+                }
+                for (a, &v) in row.iter_mut().zip(gr) {
                     *a += if sq {
                         (v as f64) * (v as f64)
                     } else {
@@ -22586,6 +23189,18 @@ fn moe_ffn_rows_exact(
 /// Gemma's final-logit soft-capping, `c·tanh(x/c)`, over a whole vocab row —
 /// element for element the serial expression, split across the pool: at a
 /// 262k vocab the serial `tanh` pass was ~5 ms of a 36 ms decode token.
+/// Ripple's value residual: the rows V projects, `torch.lerp(e0, normed, blend)` term for term
+/// (the two forms torch picks between at a weight of one half).
+pub(crate) fn vres_lerp(e0: &[f32], normed: &[f32], blend: f32, out: &mut Vec<f32>) {
+    debug_assert_eq!(e0.len(), normed.len());
+    out.clear();
+    if blend < 0.5 {
+        out.extend(e0.iter().zip(normed).map(|(&e, &n)| e + blend * (n - e)));
+    } else {
+        out.extend(e0.iter().zip(normed).map(|(&e, &n)| n - (n - e) * (1.0 - blend)));
+    }
+}
+
 pub(crate) fn softcap_in_place(v: &mut [f32], c: f32, pool: Option<&Pool>) {
     match pool {
         Some(p) if v.len() >= 1 << 15 => {
@@ -22705,6 +23320,11 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
         } {
             // g now holds silu(gate)·up directly.
+        } else if d.act.clamp_limit() > 0.0 && {
+            let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
+            QTensor::matvec_silu_mul_limited(&d.gate_proj, &d.up_proj, x, g, d.act.clamp_limit(), pool)
+        } {
+            // g holds silu(min(gate, limit))·clamp(up).
         } else {
             u.resize(inter, 0.0);
             // Multi-matrix job: gate+up under one pool dispatch.

@@ -1099,7 +1099,40 @@ fn g4_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
         let krow = ((hb0 + ha) / hpk * cap + sl) * hd4;
         var da = vec4<f32>(0.0);
         var db = vec4<f32>(0.0);
-        for (var d = 0u; d < hd4; d = d + 1u) {
+        // Eight K loads in flight a step (the same adds in the same
+        // order): one load a step was a 32-deep latency chain, and with
+        // one workgroup an SM nothing hid it — 49 us a layer at 512
+        // positions on an RTX PRO 6000 for 64 KB of K and V.
+        var d = 0u;
+        loop {
+            if (d + 8u > hd4) { break; }
+            let k0 = dk[krow + d];
+            let k1 = dk[krow + d + 1u];
+            let k2 = dk[krow + d + 2u];
+            let k3 = dk[krow + d + 3u];
+            let k4 = dk[krow + d + 4u];
+            let k5 = dk[krow + d + 5u];
+            let k6 = dk[krow + d + 6u];
+            let k7 = dk[krow + d + 7u];
+            da = da + dsq[ha * hd4 + d] * k0;
+            db = db + dsq[hbb * hd4 + d] * k0;
+            da = da + dsq[ha * hd4 + d + 1u] * k1;
+            db = db + dsq[hbb * hd4 + d + 1u] * k1;
+            da = da + dsq[ha * hd4 + d + 2u] * k2;
+            db = db + dsq[hbb * hd4 + d + 2u] * k2;
+            da = da + dsq[ha * hd4 + d + 3u] * k3;
+            db = db + dsq[hbb * hd4 + d + 3u] * k3;
+            da = da + dsq[ha * hd4 + d + 4u] * k4;
+            db = db + dsq[hbb * hd4 + d + 4u] * k4;
+            da = da + dsq[ha * hd4 + d + 5u] * k5;
+            db = db + dsq[hbb * hd4 + d + 5u] * k5;
+            da = da + dsq[ha * hd4 + d + 6u] * k6;
+            db = db + dsq[hbb * hd4 + d + 6u] * k6;
+            da = da + dsq[ha * hd4 + d + 7u] * k7;
+            db = db + dsq[hbb * hd4 + d + 7u] * k7;
+            d = d + 8u;
+        }
+        for (; d < hd4; d = d + 1u) {
             let kv = dk[krow + d];
             da = da + dsq[ha * hd4 + d] * kv;
             db = db + dsq[hbb * hd4 + d] * kv;
@@ -1154,7 +1187,61 @@ fn g4_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
         var a3 = vec4<f32>(0.0);
         let lo = q < dv4;
         let hi = q + 64u < dv4;
-        for (var pp = 0u; pp < cn; pp = pp + 1u) {
+        // Four V rows in flight a step, the adds in position order.
+        var pp = 0u;
+        loop {
+            if (pp + 4u > cn) { break; }
+            var sl0 = s0 + pp;
+            if (sl0 >= cap) { sl0 = sl0 - cap; }
+            var sl1 = s0 + pp + 1u;
+            if (sl1 >= cap) { sl1 = sl1 - cap; }
+            var sl2 = s0 + pp + 2u;
+            if (sl2 >= cap) { sl2 = sl2 - cap; }
+            var sl3 = s0 + pp + 3u;
+            if (sl3 >= cap) { sl3 = sl3 - cap; }
+            let row0 = vb4 + sl0 * dv4;
+            let row1 = vb4 + sl1 * dv4;
+            let row2 = vb4 + sl2 * dv4;
+            let row3 = vb4 + sl3 * dv4;
+            let wa0 = dsw[h0 * 64u + pp];
+            let wb0 = dsw[h1 * 64u + pp];
+            let wa1 = dsw[h0 * 64u + pp + 1u];
+            let wb1 = dsw[h1 * 64u + pp + 1u];
+            let wa2 = dsw[h0 * 64u + pp + 2u];
+            let wb2 = dsw[h1 * 64u + pp + 2u];
+            let wa3 = dsw[h0 * 64u + pp + 3u];
+            let wb3 = dsw[h1 * 64u + pp + 3u];
+            if (lo) {
+                let v0 = dvv[row0 + q];
+                let v1 = dvv[row1 + q];
+                let v2 = dvv[row2 + q];
+                let v3 = dvv[row3 + q];
+                a0 = a0 + wa0 * v0;
+                a1 = a1 + wb0 * v0;
+                a0 = a0 + wa1 * v1;
+                a1 = a1 + wb1 * v1;
+                a0 = a0 + wa2 * v2;
+                a1 = a1 + wb2 * v2;
+                a0 = a0 + wa3 * v3;
+                a1 = a1 + wb3 * v3;
+            }
+            if (hi) {
+                let u0 = dvv[row0 + q + 64u];
+                let u1 = dvv[row1 + q + 64u];
+                let u2 = dvv[row2 + q + 64u];
+                let u3 = dvv[row3 + q + 64u];
+                a2 = a2 + wa0 * u0;
+                a3 = a3 + wb0 * u0;
+                a2 = a2 + wa1 * u1;
+                a3 = a3 + wb1 * u1;
+                a2 = a2 + wa2 * u2;
+                a3 = a3 + wb2 * u2;
+                a2 = a2 + wa3 * u3;
+                a3 = a3 + wb3 * u3;
+            }
+            pp = pp + 4u;
+        }
+        for (; pp < cn; pp = pp + 1u) {
             var sl = s0 + pp;
             if (sl >= cap) { sl = sl - cap; }
             let row = vb4 + sl * dv4;
@@ -1298,6 +1385,199 @@ fn g4_sandwich(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 "#;
 
+/// `g4_sandwich` with every load of a phase issued before its first
+/// store: the same values in the same order (1024 lanes for the first
+/// norm, 256 for the add and the second, the trees as before), so the
+/// outputs do not move. The first form read, added, stored and summed
+/// one element a step, and a store to the hidden sits between loads of
+/// it — the compiler could hoist nothing, and a 5120-wide sandwich was
+/// 20-25 us a dispatch (two a layer) on an RTX PRO 6000. Hidden sizes
+/// up to 8192 (eight values a lane in the first phase, 32 in the
+/// second; past the register file the second phase spills, still
+/// correct).
+pub(crate) const G4_SANDWICH2_WGSL: &str = r#"
+struct SwP { n: u32, gemma: u32, eps: f32, scale: u32 };
+@group(0) @binding(0) var<storage, read>       sw_x  : array<f32>;
+@group(0) @binding(1) var<storage, read>       sw_w1 : array<f32>;
+@group(0) @binding(2) var<storage, read_write> sw_h  : array<f32>;
+@group(0) @binding(3) var<storage, read>       sw_w2 : array<f32>;
+@group(0) @binding(4) var<storage, read_write> sw_o  : array<f32>;
+@group(0) @binding(5) var<uniform>             sw_p  : SwP;
+var<workgroup> sw_part: array<f32, 1024>;
+var<workgroup> sw_mid: array<f32, 8192>;
+@compute @workgroup_size(1024)
+fn g4_sandwich(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = sw_p.n;
+    let gemma = sw_p.gemma == 1u;
+    // rmsnorm: x -> mid. Every x and w1 of the lane first.
+    var xv: array<f32, 8>;
+    var w1v: array<f32, 8>;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let i = tid + k * 1024u;
+        xv[k] = 0.0;
+        w1v[k] = 0.0;
+        if (i < n) {
+            xv[k] = sw_x[i];
+            w1v[k] = sw_w1[i];
+        }
+    }
+    var acc = 0.0;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        if (tid + k * 1024u < n) { acc = acc + xv[k] * xv[k]; }
+    }
+    sw_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let i = tid + k * 1024u;
+        if (i < n) {
+            var wv = w1v[k];
+            if (gemma) { wv = 1.0 + wv; }
+            sw_mid[i] = xv[k] * inv * wv;
+        }
+    }
+    workgroupBarrier();
+    // add_rmsnorm: h = (h + mid)*scale, o = rms(h)*w2 - its 256 lanes.
+    // The lane's h in waves of eight loads (a 1024-lane workgroup has 64
+    // registers a lane: thirty-two values each of h and w2 spilled), the
+    // adds in order.
+    var hv: array<f32, 8>;
+    var acc2 = 0.0;
+    if (tid < 256u) {
+        for (var c = 0u; c < 4u; c = c + 1u) {
+            let k0 = c * 8u;
+            if (tid + k0 * 256u < n) {
+                for (var k = 0u; k < 8u; k = k + 1u) {
+                    let i = tid + (k0 + k) * 256u;
+                    hv[k] = 0.0;
+                    if (i < n) { hv[k] = sw_h[i]; }
+                }
+                for (var k = 0u; k < 8u; k = k + 1u) {
+                    let i = tid + (k0 + k) * 256u;
+                    if (i < n) {
+                        var v = hv[k] + sw_mid[i];
+                        if (sw_p.scale != 0u) { v = v * bitcast<f32>(sw_p.scale); }
+                        sw_h[i] = v;
+                        acc2 = acc2 + v * v;
+                    }
+                }
+            }
+        }
+        sw_part[tid] = acc2;
+    }
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv2 = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+    if (tid < 256u) {
+        var w2v: array<f32, 8>;
+        for (var c = 0u; c < 4u; c = c + 1u) {
+            let k0 = c * 8u;
+            if (tid + k0 * 256u < n) {
+                for (var k = 0u; k < 8u; k = k + 1u) {
+                    let i = tid + (k0 + k) * 256u;
+                    hv[k] = 0.0;
+                    w2v[k] = 0.0;
+                    if (i < n) {
+                        hv[k] = sw_h[i];
+                        w2v[k] = sw_w2[i];
+                    }
+                }
+                for (var k = 0u; k < 8u; k = k + 1u) {
+                    let i = tid + (k0 + k) * 256u;
+                    if (i < n) {
+                        var wv = w2v[k];
+                        if (gemma) { wv = 1.0 + wv; }
+                        sw_o[i] = hv[k] * inv2 * wv;
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// The two reduction trees of `G4_SANDWICH2_WGSL` as written (shared
+/// memory and a barrier at every level) and as shuffles from stride 16
+/// down: lanes l and l+s of the last five levels sit in one warp, and
+/// `subgroupShuffleDown(v, s)` hands lane l exactly the partner the tree
+/// read — the same adds in the same order.
+const SW_TREE1: &str = r#"    sw_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+"#;
+const SW_TREE1_SG: &str = r#"    sw_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride < 32u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid < 32u) {
+        var v = sw_part[tid];
+        v = v + subgroupShuffleDown(v, 16u);
+        v = v + subgroupShuffleDown(v, 8u);
+        v = v + subgroupShuffleDown(v, 4u);
+        v = v + subgroupShuffleDown(v, 2u);
+        v = v + subgroupShuffleDown(v, 1u);
+        if (tid == 0u) { sw_part[0] = v; }
+    }
+    workgroupBarrier();
+    let inv = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+"#;
+const SW_TREE2: &str = r#"    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv2 = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+"#;
+const SW_TREE2_SG: &str = r#"    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride < 32u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid < 32u) {
+        var v2 = sw_part[tid];
+        v2 = v2 + subgroupShuffleDown(v2, 16u);
+        v2 = v2 + subgroupShuffleDown(v2, 8u);
+        v2 = v2 + subgroupShuffleDown(v2, 4u);
+        v2 = v2 + subgroupShuffleDown(v2, 2u);
+        v2 = v2 + subgroupShuffleDown(v2, 1u);
+        if (tid == 0u) { sw_part[0] = v2; }
+    }
+    workgroupBarrier();
+    let inv2 = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+"#;
+
 /// The fused sandwich pipeline, compiled on first use; None under
 /// `CMF_G4_FUSE=0`, when rejected, or for a hidden size past 8192.
 pub(crate) fn sandwich_pipe(c: &Ctx, hidden: usize) -> Option<&Pipe> {
@@ -1312,7 +1592,24 @@ pub(crate) fn sandwich_pipe(c: &Ctx, hidden: usize) -> Option<&Pipe> {
             {
                 return None;
             }
-            module_pipes(c, "cmf-g4-sandwich", G4_SANDWICH_WGSL, &["g4_sandwich"])
+            // `CMF_G4_SW2=0`: the first form (the same values; its loads
+            // wait on one another). With subgroups (`CMF_G4_SW_SG=0` off)
+            // the trees' last five levels run as shuffles inside warp 0:
+            // the same partner at every level, so the same bits, and ten
+            // workgroup barriers fewer a dispatch.
+            let sg = c.device.features().contains(wgpu::Features::SUBGROUP)
+                && c.adapter_info.subgroup_min_size >= 32
+                && std::env::var("CMF_G4_SW_SG").as_deref() != Ok("0");
+            let src = if std::env::var("CMF_G4_SW2").as_deref() == Ok("0") {
+                G4_SANDWICH_WGSL.to_string()
+            } else if sg {
+                G4_SANDWICH2_WGSL
+                    .replace(SW_TREE1, SW_TREE1_SG)
+                    .replace(SW_TREE2, SW_TREE2_SG)
+            } else {
+                G4_SANDWICH2_WGSL.to_string()
+            };
+            module_pipes(c, "cmf-g4-sandwich", &src, &["g4_sandwich"])
                 .and_then(|v| v.into_iter().next())
         })
         .as_ref()
@@ -1478,6 +1775,38 @@ pub(crate) fn encode_attn(
             0,
         ],
     );
+    let bg_rope = bind(
+        c,
+        &p.rope.1,
+        &[(0, qraw), (1, kb), (2, qall), (3, vb), (4, qnw), (5, knw), (6, invf), (7, &rope_u)],
+    );
+    let heads = g.nh + g.nkv + if g.v_norm { g.nkv } else { 0 };
+    {
+        let mut pass = begin_pass(enc);
+        pass.set_pipeline(&p.rope.0);
+        pass.set_bind_group(0, &bg_rope, &[]);
+        pass.dispatch_workgroups(heads as u32, g.k as u32, 1);
+    }
+    encode_kv_attend(c, enc, p, g, kb, vb, qall, kcache, vcache, out);
+}
+
+/// `encode_attn` past its rope stage: every row's K/V into the (ring) mirror and the
+/// blocked causal attend, over rows whose Q and K are already normed and rotated
+/// (`qall`, `kb`). Ripple's gated layers come here from the token-axis rope that
+/// splits the gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_kv_attend(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    p: &Pipes,
+    g: &G4Attn,
+    kb: &wgpu::Buffer,
+    vb: &wgpu::Buffer,
+    qall: &wgpu::Buffer,
+    kcache: &wgpu::Buffer,
+    vcache: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+) {
     let kv_u = fresh_uniform(
         c,
         &[g.nkv as u32, g.hd as u32, g.dv as u32, g.cap as u32, g.pos0 as u32, 0, 0, 0],
@@ -1499,19 +1828,10 @@ pub(crate) fn encode_attn(
             0,
         ],
     );
-    let bg_rope = bind(
-        c,
-        &p.rope.1,
-        &[(0, qraw), (1, kb), (2, qall), (3, vb), (4, qnw), (5, knw), (6, invf), (7, &rope_u)],
-    );
     let bg_kv = bind(c, &p.kv.1, &[(8, kb), (9, vb), (10, kcache), (11, vcache), (12, &kv_u)]);
     let at = if g.dv > 256 { &p.attend2 } else { &p.attend };
     let bg_at = bind(c, &at.1, &[(13, qall), (14, kcache), (15, vcache), (16, out), (17, &at_u)]);
-    let heads = g.nh + g.nkv + if g.v_norm { g.nkv } else { 0 };
     let mut pass = begin_pass(enc);
-    pass.set_pipeline(&p.rope.0);
-    pass.set_bind_group(0, &bg_rope, &[]);
-    pass.dispatch_workgroups(heads as u32, g.k as u32, 1);
     pass.set_pipeline(&p.kv.0);
     pass.set_bind_group(0, &bg_kv, &[]);
     pass.dispatch_workgroups(

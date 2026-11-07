@@ -725,6 +725,10 @@ pub struct QwenAttnCfg<'a> {
     /// pad dims come out exactly 0), and the attention output is
     /// compacted back to `num_heads·v_head_dim` before o_proj.
     pub v_head_dim: usize,
+    /// The rows V projects, when they are not the layer's normed input (Ripple's value
+    /// residual: `lerp(embedding, normed, blend)`), laid out as that input is: one position's
+    /// row, a pair's two, a chunk's `b`. None = V reads what Q and K read.
+    pub value_in: Option<&'a [f32]>,
 }
 
 /// `[n × vd]` heads → `[n × hd]`, each head zero-padded at its tail (a V
@@ -880,6 +884,17 @@ fn project_matvecs(
     let mut k = take_buf(nkv * hd);
     // V heads may be narrower than Q/K (MiMo-V2); padded before the cache.
     let mut v = take_buf(nkv * cfg.v_head_dim);
+    if let Some(vin) = cfg.value_in {
+        // V has a row of its own: Q and K as one job, V as another.
+        QTensor::matvec_many(
+            [wq, wk],
+            hidden,
+            [q_raw.as_mut_slice(), k.as_mut_slice()],
+            cfg.pool,
+        );
+        wv.matvec(&vin[..hidden.len()], &mut v, cfg.pool);
+        return (q_raw, k, v);
+    }
     // QKV in ONE device submission (этап 4): three matvecs, one poll —
     // gated by the same discrete-card threshold as every GPU op. Any
     // refusal (budget/dtype/shard) falls through to the CPU path.
@@ -1484,6 +1499,9 @@ pub fn qwen_attention_batch(
         for bi in 0..b {
             let mut row_cfg = *cfg;
             row_cfg.position = cfg.position + bi;
+            row_cfg.value_in = cfg
+                .value_in
+                .map(|v| &v[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size]);
             let row = qwen_attention(
                 &normed_all[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size],
                 wq,
@@ -1514,6 +1532,9 @@ pub fn qwen_attention_batch(
         && !crate::gpu::mm_killed()
         && b >= 32
         && !capturing
+        // The fused submissions project q|k|v from one chunk; V with rows of its own goes
+        // by the per-projection path.
+        && cfg.value_in.is_none()
         && match (wq.mapped_q4t(), wk.mapped_q4t(), wv.mapped_q4t()) {
             (Some((model, iq)), Some((_, ik)), Some((_, iv))) => {
                 let (rk, rv) = (wk.rows(), wv.rows());
@@ -1549,6 +1570,7 @@ pub fn qwen_attention_batch(
             && !crate::gpu::mm_killed()
             && b >= 32
             && !capturing
+            && cfg.value_in.is_none()
             && std::env::var("CMF_QKV_KEEP").as_deref() != Ok("0")
             && match (
                 wq.mapped_device_gemm(),
@@ -1590,7 +1612,7 @@ pub fn qwen_attention_batch(
     if !fused {
         wq.matmat(normed_all, b, &mut q_all, cfg.pool);
         wk.matmat(normed_all, b, &mut k_all, cfg.pool);
-        wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+        wv.matmat(cfg.value_in.unwrap_or(normed_all), b, &mut v_all, cfg.pool);
     }
     let t_gate = std::time::Instant::now();
     if projected_all.is_none() {
@@ -2238,6 +2260,7 @@ pub(crate) fn qwen_attention_preview(
     let qrows = wq.rows();
     assert_eq!(cfg.v_head_dim, hd, "block preview: V heads narrower than Q/K");
     assert!(cfg.softplus_gate.is_none() && cache.o1.is_none() && cache.sinks.is_none());
+    assert!(cfg.value_in.is_none(), "block preview: V with rows of its own");
     let mut q_all = take_buf(b * qrows);
     let mut k_all = take_buf(b * nkv * hd);
     let mut v_all = take_buf(b * nkv * hd);
@@ -2390,11 +2413,16 @@ pub fn qwen_attention_pair(
         || cache
             .o1_pending_boundary()
             .is_some_and(|target| cache.seq_len + 2 == target)
+        // V with rows of its own: the fused pair job projects q|k|v from one row.
+        || cfg.value_in.is_some()
     {
+        let hs = cfg.hidden_size;
         let mut cfg1 = *cfg;
         cfg1.position = cfg.position;
+        cfg1.value_in = cfg.value_in.map(|v| &v[..hs]);
         let mut cfg2 = *cfg;
         cfg2.position = cfg.position + 1;
+        cfg2.value_in = cfg.value_in.map(|v| &v[hs..2 * hs]);
         return (
             qwen_attention(h1, wq, wk, wv, wo, cache, &cfg1),
             qwen_attention(h2, wq, wk, wv, wo, cache, &cfg2),
@@ -2665,6 +2693,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool,
             v_head_dim: 4,
+            value_in: None,
         }
     }
 
@@ -2701,6 +2730,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
             v_head_dim: hd,
+            value_in: None,
         };
         let mut q: Vec<f32> = (0..nh * hd).map(|i| i as f32 - 7.5).collect();
         let mut k: Vec<f32> = (0..nkv * hd).map(|i| i as f32 * 0.25 - 1.0).collect();
@@ -3015,6 +3045,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
             v_head_dim: hd,
+            value_in: None,
         };
         let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.3).sin()).collect();
         let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.7).cos()).collect();
@@ -3068,6 +3099,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
             v_head_dim: hd,
+            value_in: None,
         };
         let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.4).sin()).collect();
         let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.9).cos()).collect();
@@ -3127,6 +3159,7 @@ mod tests {
             bias: None,
             pool: None,
             v_head_dim: hd,
+            value_in: None,
         };
         let hidden = vec![0.0, 1.0, 2.0, 3.0];
         let mut cache = LayerKvCache::new(nkv, hd);
@@ -3348,6 +3381,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool,
             v_head_dim: hd,
+            value_in: None,
         };
         let fresh = || {
             let mut c = LayerKvCache::new(nkv, hd);
@@ -3491,6 +3525,7 @@ mod qk_norm_order_tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
             v_head_dim: hd,
+            value_in: None,
         }
     }
 

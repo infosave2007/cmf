@@ -181,6 +181,7 @@ fn arch(g: Geom, bounded: bool) -> ModelArch {
         attention_sink: false,
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
+        ffn_clamp: None,
         attn_v_norm: false,
         num_loops: 1,
         kda_gate_lower_bound: None,

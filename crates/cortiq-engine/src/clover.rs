@@ -1027,6 +1027,7 @@ impl Pipeline {
                         norm_style: ns,
                         pool: pool.as_deref(),
                         v_head_dim: v_dim,
+                        value_in: None,
                     };
                     attention::qwen_attention_preview(&normed, b, wq, wk, wv, wo, &mut self.kv_cache.layers[li], &cfg)
                 }

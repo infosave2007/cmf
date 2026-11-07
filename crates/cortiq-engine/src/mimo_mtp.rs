@@ -558,6 +558,7 @@ impl Pipeline {
             norm_style: self.norm_style,
             pool: self.pool.as_deref(),
             v_head_dim: self.layer_v_dim(li),
+            value_in: None,
         };
         let attn = attention::qwen_attention_batch(&normed, n, wq, wk, wv, wo, kv, &cfg);
         for (a, b) in x.iter_mut().zip(&attn) {

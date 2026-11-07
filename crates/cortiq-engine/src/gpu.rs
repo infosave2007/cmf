@@ -1791,6 +1791,10 @@ pub struct GraphAttnGeom<'a> {
     /// Unlimited-OCR's block-sparse attend. `invf` then holds this position's
     /// rotary angles and the rotation runs at position 1.
     pub dash: Option<GraphDash<'a>>,
+    /// Ripple's value residual: this layer's blend and the embedding rows of
+    /// the call (one row for a token, a chunk's rows for a batch). V projects
+    /// `lerp(embedding, normed, blend)`; Q and K project the normed row.
+    pub vres: Option<(f32, &'a [f32])>,
 }
 
 /// Rows of an Unlimited-OCR prompt chunk on the batch graph: every remote block
@@ -1818,6 +1822,12 @@ pub struct GraphDash<'a> {
     pub coff: &'a [u32],
     /// The rows' rotation angles, `[rows][head_dim / 2]`.
     pub angles: &'a [f32],
+}
+
+/// The wgpu graphs carry Ripple's value residual (`CMF_VRES_GRAPH=0`: the host walk).
+pub fn vres_graph_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_VRES_GRAPH").as_deref() != Ok("0"))
 }
 
 /// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
@@ -1913,6 +1923,14 @@ pub enum GraphFfn<'a> {
         /// act(gate)·up. The builders refuse an activation with no arm here
         /// (before this field the graph computed SiLU for any dense FFN).
         act: GraphAct,
+        /// Ripple's clamped SwiGLU: the gate cut from above and the up branch
+        /// on both sides at this value before `silu(gate)·up`; 0 = none.
+        limit: f32,
+        /// A second triple of the same layer, added to the first one's
+        /// output: the layer's hot neurons in their own codec (`cortiq
+        /// hot-bake`, stored as the layer's one tube). Same activation and
+        /// clamp as the first.
+        hot: Option<GraphMoeDetachedShared<'a>>,
     },
     Moe {
         /// Router logits weight (f32, kind 4) `[n_exp, hidden]`.

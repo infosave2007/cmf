@@ -13,6 +13,7 @@ mod egemma2pack;
 mod nemotron_pack;
 mod embed;
 mod flint;
+mod hotmix;
 mod flint_hybrid;
 mod gguf;
 mod gptq;
@@ -926,6 +927,65 @@ enum Commands {
         /// Output .cmf
         #[arg(long)]
         output: String,
+    },
+    /// Which FFN neurons a text uses most (Patent 2's probe over a batched
+    /// pass): per layer and neuron, the energy of `act(gate)·up`, or how often
+    /// the neuron is among a position's loudest. Input of `hot-bake`
+    HotProbe {
+        /// Path to .cmf model file
+        model: String,
+        /// Text the model reads
+        text: String,
+        /// Output: `u32 layers, u32 width, f32[layers·width]`
+        out: String,
+        /// Tokens read
+        #[arg(long, default_value_t = 8192)]
+        tokens: usize,
+        /// Tokens in one context
+        #[arg(long, default_value_t = 2048)]
+        window: usize,
+        /// Tokens of the text skipped first
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// energy (sum of squares), hits (times among a position's top
+        /// `--topk`) or mass (sum of magnitudes)
+        #[arg(long, default_value = "energy")]
+        stat: String,
+        /// `--stat hits`: how many neurons a position counts
+        #[arg(long, default_value_t = 2048)]
+        topk: usize,
+    },
+    /// A 2-bit FFN with its busiest neurons at 8 bits: every q2tp layer of
+    /// COLD cut into the ordinary triple (cold neurons, their 2-bit rows as
+    /// they are) and one tube of hot neurons in q8_2f taken from HOT, an
+    /// 8-bit file of the same model
+    HotBake {
+        /// The low-bit .cmf (q2tp or q4tp gate/up)
+        cold: String,
+        /// The same model in q8_2f
+        hot: String,
+        /// The probe's file (`hot-probe`)
+        stat: String,
+        /// Output .cmf
+        output: String,
+        /// Share of a layer's neurons kept at 8 bits
+        #[arg(long, default_value_t = 0.05)]
+        frac: f64,
+        /// top (by the probe's score) or random (the control)
+        #[arg(long, default_value = "top")]
+        pick: String,
+        /// Score a neuron by the probe's statistic alone, without the energy
+        /// of its down column
+        #[arg(long)]
+        no_readout: bool,
+        /// `--pick random`: seed
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// Take whole from HOT every tensor whose name contains this (repeat
+        /// for more): `self_attn.k_proj`, `self_attn.v_proj`. With `--frac 0`
+        /// no neuron is cut
+        #[arg(long)]
+        take: Vec<String>,
     },
     /// Bake a task's skill into a model before compressing it (DTG-MA,
     /// Patent 2): soft gates on the FFN neurons of the deep layers trained
@@ -4715,6 +4775,8 @@ async fn main() -> anyhow::Result<()> {
             plan,
             output,
         } => tube::cmd_tube_bake(&model, &plan, &output),
+        Commands::HotProbe { model, text, out, tokens, window, skip, stat, topk } => hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk),
+        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take } => hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take),
         Commands::DflashCheck { model, kit, host, starts, head_rows } => dflash_check::run(&model, &kit, host, starts, head_rows),
         Commands::DflashRouteFit { model, rows, rank, window, edge, hold_every, prices, dry_run } => {
             dflash_route::run(&model, &rows, rank, window, edge, hold_every, prices.as_deref(), !dry_run)

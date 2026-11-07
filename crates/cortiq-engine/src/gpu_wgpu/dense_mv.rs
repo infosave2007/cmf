@@ -24,10 +24,19 @@ use super::*;
 pub(crate) struct MvSg {
     pub(crate) mv: wgpu::ComputePipeline,
     pub(crate) mv_l: wgpu::BindGroupLayout,
+    /// The column-split twin (`ks_src`) with its own auto layout (the
+    /// bindings are the same, the layouts are per pipeline); built only
+    /// for `CMF_MV_SG_KS=1` (measured worse, see `sg_prep`).
+    pub(crate) ks: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// The two-rows-a-subgroup kernel for the thin grids (`sg_prep`), built
+    /// for `CMF_MV_SG_THIN=1` only (measured worse).
+    pub(crate) thin: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) gu: wgpu::ComputePipeline,
     pub(crate) gu_l: wgpu::BindGroupLayout,
     /// Rows a subgroup owns.
     pub(crate) rpw: usize,
+    /// Subgroups (warps) a workgroup of the plain matvec holds.
+    pub(crate) wpg: usize,
     /// Rows a subgroup owns in the fused gate+up.
     pub(crate) grpw: usize,
     /// Never-written output for the unused matrix slots.
@@ -87,11 +96,64 @@ fn build(c: &Ctx) -> Option<MvSg> {
         2 => (MV_SG_R2U2, 2),
         _ => (MV_SG_R4U2, 4),
     };
+    // Warps a workgroup (`CMF_MV_SG_W`: 1, 2, 4 or 8; default 8). On a
+    // 188-SM RTX PRO 6000 a 5120-row matrix is 160 workgroups of eight
+    // warps — 28 SMs idle — and the obvious cure, two warps a workgroup
+    // (640 workgroups), MEASURED WORSE: the FFN down 87 → 100 us a layer,
+    // the o projection 31 → 35, q 48 → 52 (one and four warps the same).
+    // Eight warps of one workgroup share an SM's L1 for the activation
+    // vector; spread thin, every warp streams it from L2. Same rows,
+    // same bits whichever way: a warp's work does not depend on which
+    // workgroup holds it. Kept as the record and the knob.
+    let wpg: usize = match std::env::var("CMF_MV_SG_W").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("4") => 4,
+        _ => 8,
+    };
+    let with_wpg = |src: &str| {
+        src.replace(
+            "@compute @workgroup_size(256)\nfn q4tp_mv_sg(",
+            &format!("@compute @workgroup_size({})\nfn q4tp_mv_sg(", 32 * wpg),
+        )
+        .replace("let per = 8u * 4u;", &format!("let per = {wpg}u * 4u;"))
+        .replace("let per = 8u * 2u;", &format!("let per = {wpg}u * 2u;"))
+        .replace("(blk * 8u + warp)", &format!("(blk * {wpg}u + warp)"))
+    };
+    let src = with_wpg(src);
+    debug_assert!(src.contains(&format!("@workgroup_size({})", 32 * wpg)));
     let (gsrc, grpw) = match grpw {
         4 => (GU_SG_R4U2, 4),
         _ => (GU_SG_R2U2, 2),
     };
-    let mv = compile(c, "cmf-mv-sg", src, "q4tp_mv_sg")?;
+    let mv = compile(c, "cmf-mv-sg", &src, "q4tp_mv_sg")?;
+    // The column-split twin: the eight warps of a workgroup take the SAME
+    // four rows, each an eighth of the columns, and the eight partials of
+    // a row are added in a fixed order. Four rows a workgroup puts a
+    // 5120-row matrix on 1280 workgroups (6.8 an SM on the 188-SM RTX PRO
+    // 6000) where the row-split kernel has 160 and leaves 28 SMs idle.
+    // MEASURED WORSE on that card for every shape (`sg_prep`); a knob.
+    // Two rows a subgroup for the matrices whose four-row grid leaves SMs
+    // idle: a 5120-row projection is 160 workgroups of 32 rows on a
+    // 188-SM card, 320 of 16 rows this way. The same per-row arithmetic
+    // (two groups a lane a step, the same tree), so the same bits — and
+    // MEASURED WORSE on that card (RTX PRO 6000, 65B): the FFN down 87 ->
+    // 97 us a layer, the o projection 31 -> 35. Four rows a warp keep
+    // more loads in flight than the idle SMs cost. A knob: `CMF_MV_SG_THIN=1`.
+    let thin = (rpw == 4 && std::env::var("CMF_MV_SG_THIN").as_deref() == Ok("1"))
+        .then(|| compile(c, "cmf-mv-sg-thin", &with_wpg(MV_SG_R2U2), "q4tp_mv_sg"))
+        .flatten()
+        .map(|p| {
+            let l = p.get_bind_group_layout(0);
+            (p, l)
+        });
+    let ks = (rpw == 4 && std::env::var("CMF_MV_SG_KS").as_deref() == Ok("1"))
+        .then(|| compile(c, "cmf-mv-sg-ks", &ks_src(), "q4tp_mv_sg_ks"))
+        .flatten()
+        .map(|p| {
+            let l = p.get_bind_group_layout(0);
+            (p, l)
+        });
     let gu = compile(c, "cmf-gu-sg", gsrc, "q4tp_gu_sg")?;
     let dummy_y = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mv-sg-dummy"),
@@ -102,12 +164,57 @@ fn build(c: &Ctx) -> Option<MvSg> {
     Some(MvSg {
         mv_l: mv.get_bind_group_layout(0),
         mv,
+        ks,
+        thin,
         gu_l: gu.get_bind_group_layout(0),
         gu,
         rpw,
+        wpg,
         grpw,
         dummy_y,
     })
+}
+
+/// `MV_SG_R4U2` with the columns split across the eight warps: `run_*`
+/// get the row block from the workgroup alone, walk the warp's eighth of
+/// the groups, and hand their four warp sums to shared memory; the entry
+/// point adds the eight in warp order and writes the rows.
+fn ks_src() -> String {
+    let mut s = MV_SG_R4U2.to_string();
+    // The warp's slice of the groups.
+    assert_eq!(s.matches("    let base = (blk * 8u + warp) * 4u;\n").count(), 3);
+    s = s.replace(
+        "    let base = (blk * 8u + warp) * 4u;\n",
+        "    let base = blk * 4u;\n    let gq = (gpr + 7u) / 8u;\n    let gend = min(gpr, (warp + 1u) * gq);\n",
+    );
+    // A dead row block must still reach the barrier: no early return, an
+    // empty slice instead.
+    let old_loop = "    if (!l0) { return; }\n    var g = lane;\n    loop {\n        if (g >= gpr) { break; }\n";
+    assert_eq!(s.matches(old_loop).count(), 3);
+    s = s.replace(
+        old_loop,
+        "    var g = warp * gq + lane;\n    if (!l0) { g = gend; }\n    loop {\n        if (g >= gend) { break; }\n",
+    );
+    assert_eq!(s.matches("        if (g + 32u < gpr) {\n").count(), 3);
+    s = s.replace("        if (g + 32u < gpr) {\n", "        if (g + 32u < gend) {\n");
+    // The warp sums go to shared memory instead of the output.
+    for m in ["a", "b", "c"] {
+        let old = format!(
+            "    if (lane == 0u) {{\n        if (l0) {{ sg_y{m}[r0] = t0; }}\n        if (l1) {{ sg_y{m}[r1] = t1; }}\n        if (l2) {{ sg_y{m}[r2] = t2; }}\n        if (l3) {{ sg_y{m}[r3] = t3; }}\n    }}\n"
+        );
+        assert_eq!(s.matches(old.as_str()).count(), 1, "sum store of run_{m}");
+        s = s.replace(
+            old.as_str(),
+            "    if (lane == 0u) {\n        ks_part[warp * 4u + 0u] = t0;\n        ks_part[warp * 4u + 1u] = t1;\n        ks_part[warp * 4u + 2u] = t2;\n        ks_part[warp * 4u + 3u] = t3;\n    }\n",
+        );
+    }
+    s = s.replace("var<storage, read_write> sg_yc  : array<f32>;\n", "var<storage, read_write> sg_yc  : array<f32>;\nvar<workgroup> ks_part: array<f32, 32>;\n");
+    let old_entry = s.find("@compute @workgroup_size(256)\nfn q4tp_mv_sg(").expect("sg entry");
+    s.truncate(old_entry);
+    s.push_str(
+        "@compute @workgroup_size(256)\nfn q4tp_mv_sg_ks(@builtin(workgroup_id) wid: vec3<u32>,\n                 @builtin(local_invocation_index) lid: u32,\n                 @builtin(subgroup_invocation_id) lane: u32) {\n    let warp = lid >> 5u;\n    let ba = (sg_p.rows_a + 3u) / 4u;\n    let bb = (sg_p.rows_b + 3u) / 4u;\n    let wb = wid.x;\n    var m = 0u;\n    var blk = wb;\n    if (wb < ba) {\n        run_a(wb, warp, lane);\n    } else if (wb < ba + bb) {\n        m = 1u;\n        blk = wb - ba;\n        run_b(blk, warp, lane);\n    } else {\n        m = 2u;\n        blk = wb - ba - bb;\n        run_c(blk, warp, lane);\n    }\n    workgroupBarrier();\n    if (lid < 4u) {\n        var t = ks_part[lid];\n        for (var w = 1u; w < 8u; w = w + 1u) { t = t + ks_part[w * 4u + lid]; }\n        let r = blk * 4u + lid;\n        if (m == 0u) { if (r < sg_p.rows_a) { sg_ya[r] = t; } }\n        else if (m == 1u) { if (r < sg_p.rows_b) { sg_yb[r] = t; } }\n        else { if (r < sg_p.rows_c) { sg_yc[r] = t; } }\n    }\n}\n",
+    );
+    s
 }
 
 pub(crate) fn pipes(c: &Ctx) -> Option<&MvSg> {
@@ -127,8 +234,24 @@ pub(crate) fn sg_prep<'a>(
     if cols % 32 != 0 || mats.is_empty() || mats.len() > 3 {
         return None;
     }
-    let per = 8 * p.rpw;
     let r = |i: usize| mats.get(i).map_or(0, |m| m.2);
+    // Two knobs for the thin grids (fewer four-row workgroups than two an
+    // SM), both MEASURED WORSE on an RTX PRO 6000 and off by default: the
+    // two-row kernel (`CMF_MV_SG_THIN=1`, twice the workgroups, the same
+    // bits: down 87 -> 97 us a layer, o 31 -> 35) and the column-split one
+    // (`CMF_MV_SG_KS=1`: q 48 -> 72, o 31 -> 43, down 87 -> 97 — eight
+    // warps reading eight segments of the same four rows fragment the
+    // memory streams). Four rows a warp, eight warps a workgroup, keep the
+    // most bytes in flight; the 28 idle SMs cost less than either cure.
+    let per_rs = p.wpg * p.rpw;
+    let groups_rs: usize = (0..3).map(|i| r(i).div_ceil(per_rs)).sum();
+    let sm = c.sm_count.unwrap_or(48) as usize;
+    let thin_grid = groups_rs < 2 * sm;
+    let (pipe, layout, per) = match (p.ks.as_ref(), p.thin.as_ref()) {
+        (Some((ks, l)), _) if ks_forced() => (ks, l, 4),
+        (_, Some((t, l))) if thin_grid => (t, l, p.wpg * 2),
+        _ => (&p.mv, &p.mv_l, per_rs),
+    };
     let groups: usize = (0..3).map(|i| r(i).div_ceil(per)).sum();
     if groups == 0 || groups as u32 > MAX_WG {
         return None;
@@ -141,7 +264,7 @@ pub(crate) fn sg_prep<'a>(
     let y = |i: usize| mats.get(i).map_or(&p.dummy_y, |m| m.1);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-sg"),
-        layout: &p.mv_l,
+        layout,
         entries: &[
             bind_buf(0, w(0)),
             bind_buf(1, w(1)),
@@ -156,7 +279,13 @@ pub(crate) fn sg_prep<'a>(
             bind_buf(10, &u),
         ],
     });
-    Some((&p.mv, bind, groups as u32))
+    Some((pipe, bind, groups as u32))
+}
+
+/// `CMF_MV_SG_KS=1`: the column-split kernel for every shape (a measurement knob).
+fn ks_forced() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("CMF_MV_SG_KS").as_deref() == Ok("1"))
 }
 
 /// gate+up+activation of `q4tp_matvec16nl_gu` (act code 0 SiLU, 1 exact
@@ -171,6 +300,7 @@ pub(crate) fn sg_gu_prep<'a>(
     inter: usize,
     cols: usize,
     act_code: u32,
+    lim_bits: u32,
 ) -> Option<(&'a wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
     let p = pipes(c)?;
     if cols % 32 != 0 || inter == 0 {
@@ -182,7 +312,7 @@ pub(crate) fn sg_gu_prep<'a>(
     }
     let u = uniform_u32x8(
         c,
-        [inter as u32, inter as u32, 0, (cols / 32) as u32, 0, act_code, 0, 0],
+        [inter as u32, inter as u32, 0, (cols / 32) as u32, lim_bits, act_code, 0, 0],
     );
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("gu-sg"),

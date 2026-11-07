@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Row features of a generic model's far-field seal over prompts with a planted fact, read from
-the engine, and the fit. q27_feat.py CORTIQ MODEL TOKENIZER_JSON WIKI OUT_WEIGHTS [N] [CHARS]"""
+the engine, and the fit. q27_feat.py CORTIQ MODEL TOKENIZER_JSON WIKI OUT_WEIGHTS [N] [CHARS] [FEATURES]
+
+FEATURES is two per KV head of every far-field layer: 128 for Qwen3.8-27B (16 × 4 × 2), 256 for
+Ripple-65B (16 × 8 × 2). A model whose host prompt path is slow sets CMF_O1_PREFILL below the
+prompt's length in the caller's environment: the seal then scores that many leading rows."""
 import os, random, subprocess, sys
 import numpy as np
 from tokenizers import Tokenizer
@@ -8,6 +12,7 @@ from tokenizers import Tokenizer
 cortiq, model, tokj, wiki, out = sys.argv[1:6]
 n = int(sys.argv[6]) if len(sys.argv) > 6 else 20
 chars = int(sys.argv[7]) if len(sys.argv) > 7 else 20000
+nf = int(sys.argv[8]) if len(sys.argv) > 8 else 128
 tok = Tokenizer.from_file(tokj)
 text = open(wiki, encoding="utf-8").read().replace("\r", "")
 random.seed(31)
@@ -49,8 +54,11 @@ for s in range(n):
         print("fact not found", s, flush=True)
         continue
     rows = [j for j in range(len(pos)) if pos[j] < i0 + len(fact) and pos[j] + len(pieces[j]) > i0]
-    nrows = F.shape[0] // 128 if F.shape[0] % 128 == 0 else None
-    X = F.reshape(nrows, 128)
+    if F.shape[0] % nf:
+        print("feature table of", F.shape[0], "floats is not rows of", nf, flush=True)
+        continue
+    nrows = F.shape[0] // nf
+    X = F.reshape(nrows, nf)
     y = np.zeros(nrows, dtype=bool)
     y[[j for j in rows if j < nrows]] = True
     Xs.append(X)

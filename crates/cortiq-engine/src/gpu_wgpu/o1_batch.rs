@@ -815,6 +815,9 @@ mod tests {
             // Production head geometry (Qwen3.8: d 256, 6 heads a group, 32
             // landmarks) with a wide group whose prompt still fits its ring.
             (256, 32, 128, 4, 6, 300, 512, [64, 64]),
+            // Ripple-65B's heads: d 128, ten a group, past the eight the chunk
+            // stages were first built for.
+            (128, 32, 128, 4, 10, 300, 128, [64, 64]),
         ] {
             let jit = |a: usize, b: usize| ((a * 37 + b * 13 + 3) % 83) as f32 / 83.0 - 0.5;
             let mut states = Vec::new();

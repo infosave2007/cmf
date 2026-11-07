@@ -8,6 +8,7 @@
 //! ```text
 //! context   t = norm(FC · [target layer outputs of a row])
 //!           K_l = rot(norm(Wk_l · t)), V_l = Wv_l · t          kept per position
+//!           (a layer may be without rotation, and each has a window of its own)
 //! block     rows = [anchor, MASK, …, MASK] at positions a, a + 1, …
 //!           x = norm(h); x, d = conv_in(x)                     grouped causal conv over the rows
 //!           q, k, v = W · x; attention over K_l, V_l before a and the block's own rows (not causal)
@@ -72,6 +73,13 @@ pub struct Geometry {
     pub target_layers: usize,
     /// Positions a block row sees back; 0 is all of them.
     pub window: usize,
+    /// The same per layer where the layers differ (a full-attention layer
+    /// among sliding ones: 0). Empty: `window` for every layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<usize>,
+    /// Layers whose queries and keys carry no rotary position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_rope: Vec<usize>,
     pub rope_theta: f64,
     pub eps: f64,
 }
@@ -84,7 +92,17 @@ impl Geometry {
         }
         let v = model.header.provenance.as_ref().and_then(|p| p.get("dflash")).ok_or("the sidecar's header has no dflash record")?;
         let g: Self = serde_json::from_value(v.clone()).map_err(|e| format!("the sidecar's dflash record: {e}"))?;
-        if g.layers == 0 || g.block < 2 || g.taps.is_empty() || g.kv_heads == 0 || g.heads % g.kv_heads != 0 || g.head_dim % 2 != 0 || g.conv_group == 0 || g.hidden % g.conv_group != 0 {
+        if g.layers == 0
+            || g.block < 2
+            || g.taps.is_empty()
+            || g.kv_heads == 0
+            || g.heads % g.kv_heads != 0
+            || g.head_dim % 2 != 0
+            || g.conv_group == 0
+            || g.hidden % g.conv_group != 0
+            || !(g.windows.is_empty() || g.windows.len() == g.layers)
+            || g.no_rope.iter().any(|&l| l >= g.layers)
+        {
             return Err(format!("unsupported DFlash geometry {g:?}"));
         }
         Ok(g)
@@ -93,6 +111,16 @@ impl Geometry {
     /// Width of a context row as the target hands it over.
     pub fn tap_width(&self) -> usize {
         self.taps.len() * self.hidden
+    }
+
+    /// Positions a block row of `layer` sees back; 0 is all of them.
+    pub fn window_of(&self, layer: usize) -> usize {
+        self.windows.get(layer).copied().unwrap_or(self.window)
+    }
+
+    /// Whether `layer` rotates its queries and keys by position.
+    pub fn rotary(&self, layer: usize) -> bool {
+        !self.no_rope.contains(&layer)
     }
 }
 
@@ -121,10 +149,38 @@ impl Small {
         Self { w, rows, cols }
     }
 
-    /// `[b][rows]` from `x`, `[b][cols]`.
-    fn apply(&self, x: &[f32], b: usize) -> Vec<f32> {
-        let mut out = vec![0f32; b * self.rows];
-        sgemm_public(b, self.rows, self.cols, 1.0, x, self.cols, &self.w, self.cols, true, &mut out, self.rows);
+    /// `[b][rows]` from `x`, `[b][cols]`. The rows go across the pool's
+    /// threads: `sgemm_public` runs one thread on x86, and a block's ten
+    /// kernel projections took 260 ms of a 340 ms block that way.
+    fn apply(&self, x: &[f32], b: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let (rows, cols) = (self.rows, self.cols);
+        let mut out = vec![0f32; b * rows];
+        let Some(pool) = pool.filter(|_| b * rows * cols >= 1 << 20 && rows >= 64) else {
+            sgemm_public(b, rows, cols, 1.0, x, cols, &self.w, cols, true, &mut out, rows);
+            return out;
+        };
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            fn at(&self, i: usize) -> *mut f32 {
+                // SAFETY: callers index inside the buffer the pointer came from.
+                unsafe { self.0.add(i) }
+            }
+        }
+        let dst = SendPtr(out.as_mut_ptr());
+        pool.run_rows(rows, &|r0, r1| {
+            let n = r1 - r0;
+            let mut part = vec![0f32; b * n];
+            sgemm_public(b, n, cols, 1.0, x, cols, &self.w[r0 * cols..r1 * cols], cols, true, &mut part, n);
+            for bi in 0..b {
+                // SAFETY: the chunks' row ranges are disjoint, so no two
+                // workers write the same element; `out` outlives the run.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(part[bi * n..].as_ptr(), dst.at(bi * rows + r0), n);
+                }
+            }
+        });
         out
     }
 }
@@ -151,6 +207,9 @@ struct Layer {
 struct Ctx {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// Rows that fell out of the layer's window and were let go: the layer
+    /// holds positions `first + dropped .. first + len`.
+    dropped: usize,
 }
 
 pub struct Drafter {
@@ -167,7 +226,8 @@ pub struct Drafter {
     books: [usize; 2],
     inv_freq: Vec<f32>,
     ctx: Vec<Ctx>,
-    /// The context holds positions `first .. first + len`.
+    /// The context covers positions `first .. first + len`; a layer holds
+    /// the part of them its window still reaches (`Ctx::dropped`).
     first: usize,
     len: usize,
     /// Rows that wait to become context (`queue_context`): their layer
@@ -370,7 +430,7 @@ impl Drafter {
             sel: Small::of(matrix(&model, "candidate_selector.hidden_projection.weight", g.selector_rank, hs)?),
             books: [book("predecessor_codebook")?, book("successor_codebook")?],
             inv_freq: (0..half).map(|i| (g.rope_theta.powf(-(2.0 * i as f64) / g.head_dim as f64)) as f32).collect(),
-            ctx: (0..g.layers).map(|_| Ctx { k: vec![Vec::new(); g.kv_heads], v: vec![Vec::new(); g.kv_heads] }).collect(),
+            ctx: (0..g.layers).map(|_| Ctx { k: vec![Vec::new(); g.kv_heads], v: vec![Vec::new(); g.kv_heads], dropped: 0 }).collect(),
             first: 0,
             len: 0,
             pending: Vec::new(),
@@ -392,6 +452,12 @@ impl Drafter {
         self.first + self.len + self.pending.len() / self.g.tap_width()
     }
 
+    /// The positions the context covers: its first, and one past its last
+    /// (rows that wait to be settled included).
+    pub fn span(&self) -> (usize, usize) {
+        (self.first, self.next_position())
+    }
+
     pub fn reset(&mut self) {
         self.truncate(0);
         self.first = 0;
@@ -404,15 +470,17 @@ impl Drafter {
         let keep = pos.saturating_sub(self.first).min(self.len);
         let hd = self.g.head_dim;
         for c in &mut self.ctx {
+            let rows = keep.saturating_sub(c.dropped);
             for h in c.k.iter_mut().chain(c.v.iter_mut()) {
-                h.truncate(keep * hd);
+                h.truncate(rows * hd);
             }
+            c.dropped = c.dropped.min(keep);
         }
         self.len = keep;
     }
 
-    /// A layer's keys and values of the positions held, for one KV head: rows
-    /// of `head_dim` from position `next_position() − len` on.
+    /// A layer's keys and values of the positions it holds, for one KV head:
+    /// rows of `head_dim`, the last of them the last settled position's.
     pub fn context(&self, layer: usize, kv_head: usize) -> (&[f32], &[f32]) {
         (&self.ctx[layer].k[kv_head], &self.ctx[layer].v[kv_head])
     }
@@ -555,7 +623,9 @@ impl Drafter {
                 let l = &self.layers[li];
                 let (mut k, v) = (kvs.next().unwrap(), kvs.next().unwrap());
                 rms(&mut k, &l.k_norm, eps);
-                self.rotate(&mut k, kv, |r| at + r);
+                if self.g.rotary(li) {
+                    self.rotate(&mut k, kv, |r| at + r);
+                }
                 let c = &mut self.ctx[li];
                 for r in 0..n {
                     for h in 0..kv {
@@ -567,24 +637,23 @@ impl Drafter {
             }
             self.len += n;
         }
-        // nothing sees further back than the window: drop what fell out of it
-        let w = self.g.window;
-        if w > 0 && self.len > 2 * w {
-            let cut = self.len - w;
-            for c in &mut self.ctx {
+        // no row of a layer sees further back than its window: drop what fell out of it
+        for (li, c) in self.ctx.iter_mut().enumerate() {
+            let (w, held) = (self.g.window_of(li), self.len - c.dropped);
+            if w > 0 && held > 2 * w {
+                let cut = held - w;
                 for h in c.k.iter_mut().chain(c.v.iter_mut()) {
                     h.drain(..cut * hd);
                 }
+                c.dropped += cut;
             }
-            self.first += cut;
-            self.len = w;
         }
     }
 
     /// The first stage of a row convolution: the rows convolved, and the
     /// second stage's kernels (computed from the same rows).
-    fn conv_in(&self, c: &Conv, x: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
-        let d = stage(0, || c.proj.apply(x, rows));
+    fn conv_in(&self, c: &Conv, x: &[f32], rows: usize, pool: Option<&Pool>) -> (Vec<f32>, Vec<f32>) {
+        let d = stage(0, || c.proj.apply(x, rows, pool));
         (self.conv(c, 0, x, &d, rows), d)
     }
 
@@ -619,18 +688,22 @@ impl Drafter {
         assert_eq!(h.len(), rows * hs, "dflash: a block is {rows} rows");
         debug_assert!(self.pending.is_empty(), "dflash: rows wait to become context (settle)");
         let (rep, eps, scale) = (nh / kv, g.eps as f32, (hd as f32).powf(-0.5));
-        // context rows before the anchor, as far back as the first row sees
-        let hi = anchor_pos.min(self.first + self.len).max(self.first);
-        let lo = if g.window > 0 { (anchor_pos + 1).saturating_sub(g.window).clamp(self.first, hi) } else { self.first };
-        let n = hi - lo;
-        let (clo, chi) = ((lo - self.first) * hd, (hi - self.first) * hd);
         let m = rep * rows;
-        let (mut qg, mut sc, mut og) = (vec![0f32; m * hd], vec![0f32; m * (n + rows)], vec![0f32; m * hd]);
+        let (mut qg, mut sc, mut og) = (vec![0f32; m * hd], Vec::new(), vec![0f32; m * hd]);
         let (mut kb, mut vb) = (vec![0f32; rows * hd], vec![0f32; rows * hd]);
         for (li, l) in self.layers.iter().enumerate() {
+            // the layer's context rows before the anchor, as far back as its first row sees
+            let (c, window) = (&self.ctx[li], g.window_of(li));
+            let base = self.first + c.dropped;
+            let hi = anchor_pos.min(self.first + self.len).max(base);
+            let lo = if window > 0 { (anchor_pos + 1).saturating_sub(window).clamp(base, hi) } else { base };
+            let n = hi - lo;
+            let (clo, chi) = ((lo - base) * hd, (hi - base) * hd);
+            sc.clear();
+            sc.resize(m * (n + rows), 0f32);
             let mut x = h.clone();
             rms(&mut x, &l.in_norm, eps);
-            let (x, ad) = self.conv_in(&l.attn_conv, &x, rows);
+            let (x, ad) = self.conv_in(&l.attn_conv, &x, rows, pool);
             let mut qkv = stage(1, || self.many(&[&l.q, &l.k, &l.v], &x, rows, pool));
             let t_attn = stage_timed().then(std::time::Instant::now);
             let v = qkv.pop().unwrap();
@@ -638,10 +711,11 @@ impl Drafter {
             let mut q = qkv.pop().unwrap();
             rms(&mut q, &l.q_norm, eps);
             rms(&mut k, &l.k_norm, eps);
-            self.rotate(&mut q, nh, |r| anchor_pos + r);
-            self.rotate(&mut k, kv, |r| anchor_pos + r);
+            if g.rotary(li) {
+                self.rotate(&mut q, nh, |r| anchor_pos + r);
+                self.rotate(&mut k, kv, |r| anchor_pos + r);
+            }
             let mut y = vec![0f32; rows * nh * hd];
-            let c = &self.ctx[li];
             for gi in 0..kv {
                 for qi in 0..rep {
                     for r in 0..rows {
@@ -662,8 +736,8 @@ impl Drafter {
                 for i in 0..m {
                     let row = &mut sc[i * w..(i + 1) * w];
                     // a row further on sees less far back
-                    if g.window > 0 {
-                        let from = (anchor_pos + i % rows + 1).saturating_sub(g.window);
+                    if window > 0 {
+                        let from = (anchor_pos + i % rows + 1).saturating_sub(window);
                         row[..from.saturating_sub(lo).min(n)].fill(f32::NEG_INFINITY);
                     }
                     let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -696,7 +770,7 @@ impl Drafter {
 
             let mut x = h.clone();
             rms(&mut x, &l.post_norm, eps);
-            let (x, md) = self.conv_in(&l.mlp_conv, &x, rows);
+            let (x, md) = self.conv_in(&l.mlp_conv, &x, rows, pool);
             let d = stage(4, || self.mlp(l, &x, rows, pool));
             let d = self.conv(&l.mlp_conv, 1, &d, &md, rows);
             h.iter_mut().zip(&d).for_each(|(a, b)| *a += b);
@@ -728,7 +802,7 @@ impl Drafter {
         let n = hidden.len() / hs;
         let width = logits.len() / n.max(1);
         assert!(logits.len() == n * width && (top..=vocab).contains(&width), "dflash: logits of {n} rows over the head's rows");
-        let hp = self.sel.apply(hidden, n);
+        let hp = self.sel.apply(hidden, n, None);
         let (mut prev, mut chosen, mut plain) = (anchor, Vec::with_capacity(n), Vec::with_capacity(n));
         let (mut pc, mut sc) = (vec![0f32; rank], vec![0f32; rank]);
         for j in 0..n {

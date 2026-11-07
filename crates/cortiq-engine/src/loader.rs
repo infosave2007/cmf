@@ -2271,8 +2271,30 @@ impl Pipeline {
         // Flint serializes the no-RoPE schedule explicitly.  Do not infer it
         // from a layer class: a later variant may combine a full window with
         // RoPE, and changing it changes every attention score.
-        if arch.arch_name == "flint" {
+        if arch.arch_name == "flint" || arch.arch_name == "ricursive" {
             pipeline.no_rope_layers = arch.no_rope_layers.clone();
+        }
+        // Ripple's value residual, by tensor presence: one scalar a layer,
+        // `model.layers.N.self_attn.value_res_lambda`; V reads
+        // `lerp(embedding, normed, sigmoid(lambda))`. A layer without one reads the normed
+        // input (blend 1).
+        if !owns_its_layers {
+            let mut blend = vec![1.0f32; arch.num_layers];
+            let mut any = false;
+            for (li, b) in blend.iter_mut().enumerate() {
+                let name = format!("model.layers.{li}.self_attn.value_res_lambda");
+                if model.tensor(&name).is_some() {
+                    let lam = load_f32(model, &name, ov).map_err(err)?;
+                    if lam.len() != 1 {
+                        return Err(CmfError::Parse(format!("{name}: one scalar expected, got {}", lam.len())));
+                    }
+                    *b = 1.0 / (1.0 + (-lam[0]).exp());
+                    any = true;
+                }
+            }
+            if any {
+                pipeline.value_blend = Some(blend);
+            }
         }
         if pipeline.kv_heads_per_layer.is_some()
             || pipeline.v_head_dim.is_some()
@@ -2770,6 +2792,7 @@ impl Pipeline {
                 Some(Ok(d)) => {
                     tracing::info!("DFlash drafter: {} layers on the trunk's layers {:?}, blocks of {}", d.g.layers, d.g.taps, d.g.block);
                     pipeline.dflash = Some(Box::new(d));
+                    pipeline.dflash_solo = pipeline.mtp.is_none();
                 }
                 Some(Err(e)) => tracing::warn!("DFlash sidecar ignored: {e}"),
                 None => tracing::warn!("CMF_DFLASH=1, and {} is not there", crate::dflash::sidecar_path(&model.path).display()),

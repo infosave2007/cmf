@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Facts of four kinds at random places of a long text, asked at the end through `cortiq run`.
-passkey2.py CORTIQ MODEL WIKI CHARS TRIALS [ENV=VAL ...]"""
+passkey2.py CORTIQ MODEL WIKI CHARS TRIALS [ENV=VAL ...]
+
+PASSKEY_TOKENS in the caller's environment is the answer's length (24): a model that reasons
+before it answers, as Ripple-65B does, needs a few hundred."""
 import os, random, subprocess, sys
 
 cortiq, model, wiki, chars, trials = sys.argv[1:6]
@@ -24,7 +27,7 @@ for t in range(trials):
     fill = text[at:at + chars]
     cut = random.randrange(0, chars * 8 // 10)
     msg = f"{fill[:cut]}\n\n{note}\n\n{fill[cut:]}\n\n{q}"
-    r = subprocess.run([cortiq, "run", model, "--prompt", msg, "--greedy", "--no-think", "--max-tokens", "24"], capture_output=True, text=True, env=env, timeout=1500)
+    r = subprocess.run([cortiq, "run", model, "--prompt", msg, "--greedy", "--no-think", "--max-tokens", os.environ.get("PASSKEY_TOKENS", "24")], capture_output=True, text=True, env=env, timeout=1500)
     tail = r.stdout[-200:]
     hit = ans in tail
     ok[i] += hit
