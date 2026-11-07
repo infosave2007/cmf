@@ -954,6 +954,11 @@ enum Commands {
         /// `--stat hits`: how many neurons a position counts
         #[arg(long, default_value_t = 2048)]
         topk: usize,
+        /// Probe a MoE model's routed experts instead (Qwen 3.5/3.8 MoE, on the
+        /// host): the width is experts x neurons, the statistic Σ(w·act)² with
+        /// w the routing weight
+        #[arg(long)]
+        experts: bool,
     },
     /// A 2-bit FFN with its busiest neurons at 8 bits: every q2tp layer of
     /// COLD cut into the ordinary triple (cold neurons, their 2-bit rows as
@@ -986,6 +991,17 @@ enum Commands {
         /// no neuron is cut
         #[arg(long)]
         take: Vec<String>,
+        /// Bake a MoE model's routed experts instead: the hot neurons' gate
+        /// and up rows are zeroed in place in COLD's q2tp/q4tp experts and one
+        /// q8_2f tube per expert carries them from HOT, here the bf16
+        /// checkpoint (a local directory or a Hub repository, `HF_TOKEN` for a
+        /// gated one); STAT from `hot-probe --experts`
+        #[arg(long)]
+        experts: bool,
+        /// `--experts` with a Hub source: where its shards are fetched (default
+        /// OUTPUT.src, removed at the end)
+        #[arg(long)]
+        scratch: Option<String>,
     },
     /// Bake a task's skill into a model before compressing it (DTG-MA,
     /// Patent 2): soft gates on the FFN neurons of the deep layers trained
@@ -4775,8 +4791,20 @@ async fn main() -> anyhow::Result<()> {
             plan,
             output,
         } => tube::cmd_tube_bake(&model, &plan, &output),
-        Commands::HotProbe { model, text, out, tokens, window, skip, stat, topk } => hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk),
-        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take } => hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take),
+        Commands::HotProbe { model, text, out, tokens, window, skip, stat, topk, experts } => {
+            if experts {
+                hotmix::cmd_hot_probe_experts(&model, &text, &out, tokens, window, skip)
+            } else {
+                hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk)
+            }
+        }
+        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, scratch } => {
+            if experts {
+                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, !no_readout, scratch.as_deref())
+            } else {
+                hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take)
+            }
+        }
         Commands::DflashCheck { model, kit, host, starts, head_rows } => dflash_check::run(&model, &kit, host, starts, head_rows),
         Commands::DflashRouteFit { model, rows, rank, window, edge, hold_every, prices, dry_run } => {
             dflash_route::run(&model, &rows, rank, window, edge, hold_every, prices.as_deref(), !dry_run)

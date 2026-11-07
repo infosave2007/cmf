@@ -284,3 +284,293 @@ pub fn cmd_hot_bake(cold_path: &str, hot_path: &str, stat_path: &str, output: &s
     );
     Ok(())
 }
+
+// ---- MoE experts: `hot-probe --experts`, `hot-bake --experts` ----------------------------------
+//
+// A routed expert is a small FFN of its own, and the busiest few per cent of its neurons
+// carry most of what it adds. The experts' layout is what the device arena is built
+// around, so their matrices are not cut: the hot neurons' gate and up rows are set to an
+// exact zero in place (a q2tp group at rung 0, a q4tp nibble at 8), which silences them
+// in the cold expert, and one q8_2f tube per expert (`mlp.experts.{e}.*_proj.tube1.weight`)
+// carries them from the bf16 checkpoint. The shared expert is left as it is.
+
+/// The routed experts of a file: `(layers with experts, experts a layer, inter)`.
+fn expert_layout(m: &CmfModel) -> anyhow::Result<(Vec<usize>, usize, usize)> {
+    let nl = m.arch().num_layers;
+    let mut layers = Vec::new();
+    let (mut ne, mut inter) = (0usize, 0usize);
+    for li in 0..nl {
+        let Some(g0) = m.tensor(&format!("model.layers.{li}.mlp.experts.0.gate_proj.weight")) else {
+            continue;
+        };
+        let n = (1..).take_while(|e| m.tensor(&format!("model.layers.{li}.mlp.experts.{e}.gate_proj.weight")).is_some()).count() + 1;
+        ensure!(g0.shape.len() == 2, "{}: not a matrix", g0.name);
+        ensure!(layers.is_empty() || (n == ne && g0.shape[0] == inter), "layer {li}: {n} experts of {} neurons, layer {} has {ne} of {inter}", g0.shape[0], layers[0]);
+        (ne, inter) = (n, g0.shape[0]);
+        layers.push(li);
+    }
+    ensure!(!layers.is_empty(), "the file has no routed experts (model.layers.N.mlp.experts.E.*)");
+    Ok((layers, ne, inter))
+}
+
+/// `cortiq hot-probe --experts`: the statistic per layer is `[expert · inter + neuron]`.
+pub fn cmd_hot_probe_experts(model_path: &str, text: &str, out: &str, tokens: usize, window: usize, skip: usize) -> anyhow::Result<()> {
+    // SAFETY: set before the engine's backends initialise, on the only thread running.
+    // The probe reads the host path: the device frames and the fused expert kernels
+    // do not report activations.
+    unsafe {
+        std::env::set_var("CMF_GPU", "0");
+        std::env::set_var("CMF_QWEN_DEVICE", "0");
+    }
+    let m = Arc::new(CmfModel::open_sharded(model_path)?);
+    let (layers, ne, inter) = expert_layout(&m)?;
+    let nl = m.arch().num_layers;
+    let mut p = Pipeline::from_model(&m, SamplerConfig::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ids = p.tokenizer.encode(&std::fs::read_to_string(text).with_context(|| format!("reading {text}"))?);
+    ensure!(ids.len() > skip + 2, "{text}: {} tokens, --skip {skip} leaves none", ids.len());
+    let ids = &ids[skip..(skip + tokens).min(ids.len())];
+    let window = window.max(2);
+    let mut acc = vec![vec![0f64; ne * inter]; nl];
+    let t0 = std::time::Instant::now();
+    let mut done = 0usize;
+    for w in ids.chunks(window) {
+        if w.len() < 2 {
+            continue;
+        }
+        let rows = p.probe_moe_mass(w).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for (a, r) in acc.iter_mut().zip(rows) {
+            for (x, v) in a.iter_mut().zip(r) {
+                *x += v;
+            }
+        }
+        done += w.len();
+        eprintln!("hot-probe: {done}/{} tokens, {:.0} s", ids.len(), t0.elapsed().as_secs_f64());
+    }
+    write_stat(out, &acc)?;
+    // Per expert: the share of its energy in its top 5 % of neurons, over the experts
+    // the text reached.
+    let (mut share, mut reached) = (0f64, 0usize);
+    for &li in &layers {
+        for e in 0..ne {
+            let row = &acc[li][e * inter..(e + 1) * inter];
+            if row.iter().any(|&v| v > 0.0) {
+                share += top_share(row, 0.05);
+                reached += 1;
+            }
+        }
+    }
+    println!(
+        "hot-probe: Σ(w·act)² over {done} tokens, {} MoE layers x {ne} experts x {inter} neurons -> {out}\n  {reached} of {} experts reached; in a reached expert its top 5 % of neurons hold {:.1} % of the energy on average",
+        layers.len(),
+        layers.len() * ne,
+        share / reached.max(1) as f64 * 100.0
+    );
+    Ok(())
+}
+
+/// Set a 5-bit rung code (the encoder's `q4tp_put_code` assumes a zeroed field).
+fn set_code(codes: &mut [u8], g: usize, code: usize) {
+    let bit = g * 5;
+    let (b, sh) = (bit / 8, bit % 8);
+    codes[b] &= !((0x1Fu16 << sh) as u8);
+    if sh > 3 {
+        codes[b + 1] &= !((0x1Fu16 >> (8 - sh)) as u8);
+    }
+    cortiq_core::quant::q4tp_put_code(codes, g, code);
+}
+
+/// Zero `rows` of a `[rows_n, cols]` q2tp or q4tp matrix in place: q2tp groups go to
+/// rung 0 (the format's exact zero), q4tp nibbles to 8. Other rows are untouched.
+pub(crate) fn zero_tiled_rows(dtype: TensorDtype, bytes: &mut [u8], rows_n: usize, cols: usize, rows: &[usize]) -> anyhow::Result<()> {
+    use cortiq_core::quant::{GROUP_SIZE, Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_sections};
+    ensure!(cols % GROUP_SIZE == 0, "{cols} columns are not whole groups of {GROUP_SIZE}");
+    let gpr = cols / GROUP_SIZE;
+    match dtype {
+        TensorDtype::Q2TiledP => {
+            let (_, codes_off, stride) = q2tp_sections(rows_n, cols);
+            for &r in rows {
+                ensure!(r < rows_n, "row {r} of {rows_n}");
+                bytes[r * gpr * Q2TP_CHUNK..(r + 1) * gpr * Q2TP_CHUNK].fill(0);
+                let codes = &mut bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
+                for g in 0..gpr {
+                    set_code(codes, g, 0);
+                }
+            }
+        }
+        TensorDtype::Q4TiledP => {
+            let _ = q4tp_sections(rows_n, cols);
+            for &r in rows {
+                ensure!(r < rows_n, "row {r} of {rows_n}");
+                bytes[r * gpr * Q4TP_NIB..(r + 1) * gpr * Q4TP_NIB].fill(0x88);
+            }
+        }
+        other => bail!("{other:?}: only q2tp and q4tp rows can be zeroed in place"),
+    }
+    Ok(())
+}
+
+/// `cortiq hot-bake --experts`.
+pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: &str, frac: f64, readout: bool, scratch: Option<&str>) -> anyhow::Result<()> {
+    ensure!(!crate::tube::paths_collide(Path::new(output), Path::new(cold_path)), "hot-bake: the output must differ from the input");
+    let cold = Arc::new(CmfModel::open_sharded(cold_path)?);
+    let hidden = cold.arch().hidden_size;
+    let (layers, ne, inter) = expert_layout(&cold)?;
+    let (sl, sw, stat) = read_stat(stat_path)?;
+    ensure!(sl == cold.arch().num_layers && sw == ne * inter, "{stat_path}: {sl} x {sw}, the model is {} x {ne}·{inter}", cold.arch().num_layers);
+    // The device tube kernels take the neurons four at a time.
+    let h = ((frac * inter as f64 / 4.0).round() as usize * 4).clamp(4, inter - 4);
+    let name = |li: usize, e: usize, part: &str, tube: bool| format!("model.layers.{li}.mlp.experts.{e}.{part}_proj{}.weight", if tube { ".tube1" } else { "" });
+    for &li in &layers {
+        for part in ["gate", "up"] {
+            let t = entry(&cold, &name(li, 0, part, false))?;
+            ensure!(matches!(t.dtype, TensorDtype::Q2TiledP | TensorDtype::Q4TiledP), "hot-bake: {} is {:?}, expected q2tp or q4tp", t.name, t.dtype);
+            ensure!(t.shape.as_slice() == [inter, hidden], "hot-bake: {} is {:?}", t.name, t.shape);
+        }
+        ensure!(cold.tensor(&name(li, 0, "gate", true)).is_none(), "hot-bake: layer {li} already has expert tubes");
+    }
+    let scratch_dir = scratch.map(str::to_string).unwrap_or_else(|| format!("{output}.src"));
+    let mut source = crate::moegptq::ExpertSource::open(hf, &scratch_dir)?;
+    let avg = cold.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cold.tensors.len().max(1);
+    let mut w = CmfStreamWriter::new(output, CmfStreamWriter::head_reserve_for(cold.tensors.len() + 3 * layers.len() * ne, avg + 12))?;
+    // `(layer, expert, part)` of a routed expert's gate or up matrix in a cut layer.
+    let routed = |n: &str| -> Option<(usize, usize, &str)> {
+        let rest = n.strip_prefix("model.layers.")?;
+        let (li, rest) = rest.split_once('.')?;
+        let li: usize = li.parse().ok()?;
+        let rest = rest.strip_prefix("mlp.experts.")?;
+        let (e, rest) = rest.split_once('.')?;
+        let e: usize = e.parse().ok()?;
+        let part = match rest {
+            "gate_proj.weight" => "gate",
+            "up_proj.weight" => "up",
+            _ => return None,
+        };
+        layers.contains(&li).then_some((li, e, part))
+    };
+    let t0 = std::time::Instant::now();
+    let mut hot: std::collections::HashMap<(usize, usize), Vec<usize>> = std::collections::HashMap::new();
+    let (mut covered, mut done) = (0f64, 0usize);
+    for t in &cold.tensors {
+        let Some((li, e, part)) = routed(&t.name) else {
+            w.push_bounded(&t.name, t.dtype, &t.shape, cold.entry_bytes(t), COPY_CHUNK)?;
+            continue;
+        };
+        if e == 0 && part == "gate" {
+            // The layer's first expert tensor: its bf16 experts in, the tubes out.
+            let mut tubes = Vec::with_capacity(ne);
+            source.routed_layer(li, ne, hidden, inter, |e, x| {
+                let mut score: Vec<f64> = stat[li * sw + e * inter..li * sw + (e + 1) * inter].iter().map(|&v| v as f64).collect();
+                let mut col = vec![0f64; inter];
+                for r in 0..hidden {
+                    for (c, &v) in col.iter_mut().zip(&x.d[r * inter..(r + 1) * inter]) {
+                        *c += (v as f64) * (v as f64);
+                    }
+                }
+                let total: f64 = score.iter().sum();
+                if readout || total <= 0.0 {
+                    // The read-out weighs the statistic; an expert the probe never reached
+                    // is ranked by its read-out alone.
+                    for (s, c) in score.iter_mut().zip(&col) {
+                        *s = if total > 0.0 { *s * c } else { *c };
+                    }
+                }
+                let idx = pick(&score, h, None);
+                let total: f64 = score.iter().sum();
+                covered += if total > 0.0 { idx.iter().map(|&j| score[j]).sum::<f64>() / total } else { 0.0 };
+                let mut g = Vec::with_capacity(h * hidden);
+                let mut u = Vec::with_capacity(h * hidden);
+                for &j in &idx {
+                    g.extend_from_slice(&x.g[j * hidden..(j + 1) * hidden]);
+                    u.extend_from_slice(&x.u[j * hidden..(j + 1) * hidden]);
+                }
+                let mut d = Vec::with_capacity(hidden * h);
+                for r in 0..hidden {
+                    d.extend(idx.iter().map(|&j| x.d[r * inter + j]));
+                }
+                tubes.push((e, idx, cortiq_core::quant::encode_q8_2f(&g, h, hidden), cortiq_core::quant::encode_q8_2f(&u, h, hidden), cortiq_core::quant::encode_q8_2f(&d, hidden, h)));
+                Ok(())
+            })?;
+            for (e, idx, g, u, d) in tubes {
+                w.push(&name(li, e, "gate", true), TensorDtype::Q8_2f, &[h, hidden], &g)?;
+                w.push(&name(li, e, "up", true), TensorDtype::Q8_2f, &[h, hidden], &u)?;
+                w.push(&name(li, e, "down", true), TensorDtype::Q8_2f, &[hidden, h], &d)?;
+                hot.insert((li, e), idx);
+            }
+            done += 1;
+            eprintln!("hot-bake: {done}/{} layers, {:.0} s", layers.len(), t0.elapsed().as_secs_f64());
+        }
+        let idx = hot.get(&(li, e)).with_context(|| format!("{}: expert {e} comes before expert 0 in the file", t.name))?;
+        let mut bytes = cold.tensor_bytes(&t.name)?.to_vec();
+        zero_tiled_rows(t.dtype, &mut bytes, inter, hidden, idx).with_context(|| t.name.clone())?;
+        w.push(&t.name, t.dtype, &t.shape, &bytes)?;
+    }
+    let mut header = cold.header.clone();
+    let mut prov = header.provenance.take().filter(serde_json::Value::is_object).unwrap_or_else(|| json!({}));
+    prov["hot_experts"] = json!({
+        "width": h,
+        "of": inter,
+        "experts": ne,
+        "layers": layers,
+        "readout": readout,
+        "stat": Path::new(stat_path).file_name().and_then(|s| s.to_str()),
+        "codec": "q8_2f",
+        "source": hf,
+    });
+    header.provenance = Some(prov);
+    w.finish(&header, (!cold.masks.masks.is_empty()).then_some(&cold.masks), cold.vocab.as_deref())?;
+    drop(source);
+    if scratch.is_none() {
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+    }
+    let gb = |p: &str| std::fs::metadata(p).map(|m| m.len() as f64 / 1e9).unwrap_or(0.0);
+    println!(
+        "hot-bake: {} layers x {ne} experts, {h} of {inter} neurons an expert in q8_2f, holding {:.1} % of the score on average\n  {cold_path} {:.2} GB -> {output} {:.2} GB ({:+.1} %)",
+        layers.len(),
+        covered / (layers.len() * ne).max(1) as f64 * 100.0,
+        gb(cold_path),
+        gb(output),
+        (gb(output) / gb(cold_path) - 1.0) * 100.0
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod expert_tests {
+    use super::*;
+    use cortiq_core::quant::{dequant_q2tp, dequant_q4tp};
+
+    fn tiled(q: crate::convert::Quant, vals: &[f32], rows: usize, cols: usize) -> (TensorDtype, Vec<u8>) {
+        quantize_2d(q, vals, rows, cols)
+    }
+
+    #[test]
+    fn zeroed_rows_read_back_as_zero_and_the_others_are_untouched() {
+        let (rows, cols) = (6, 64);
+        let vals: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 0.3).collect();
+        for q in [crate::convert::Quant::Q2TiledP, crate::convert::Quant::Q4TiledP] {
+            let (dt, before) = tiled(q, &vals, rows, cols);
+            let mut after = before.clone();
+            zero_tiled_rows(dt, &mut after, rows, cols, &[1, 4]).unwrap();
+            let mut a = vec![0f32; rows * cols];
+            let mut b = vec![0f32; rows * cols];
+            match dt {
+                TensorDtype::Q2TiledP => {
+                    dequant_q2tp(&before, rows, cols, &mut a);
+                    dequant_q2tp(&after, rows, cols, &mut b);
+                }
+                _ => {
+                    dequant_q4tp(&before, rows, cols, &mut a);
+                    dequant_q4tp(&after, rows, cols, &mut b);
+                }
+            }
+            for r in 0..rows {
+                let (x, y) = (&a[r * cols..(r + 1) * cols], &b[r * cols..(r + 1) * cols]);
+                if r == 1 || r == 4 {
+                    assert!(y.iter().all(|&v| v == 0.0), "{dt:?} row {r} not zero: {:?}", &y[..4]);
+                } else {
+                    assert_eq!(x, y, "{dt:?} row {r} changed");
+                }
+            }
+        }
+    }
+}

@@ -95,6 +95,15 @@ pub struct Layer {
     idx: Option<LayerIdx>,
 }
 
+impl Layer {
+    /// (routed experts, intermediate width of one) — `(0, 0)` for a layer
+    /// without experts.
+    pub fn expert_geometry(&self) -> (usize, usize) {
+        let inter = self.moe.experts.first().map_or(0, |d| d.gate_proj.rows());
+        (self.moe.experts.len(), inter)
+    }
+}
+
 pub struct Globals {
     embed: QTensor,
     lm_head: QTensor,
@@ -441,7 +450,7 @@ impl State {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.hyper.clear();
         self.token_history.clear();
         self.pos = 0;
