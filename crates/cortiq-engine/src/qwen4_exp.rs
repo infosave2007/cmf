@@ -2720,9 +2720,13 @@ fn dynamic_moe_gpu(
         *o += c;
     }
     crate::attention::recycle_buf(&mut cold_cpu);
-    // The experts' hot neurons (`hot-bake --experts`), resident or cold alike.
+    // The experts' hot neurons (`hot-bake --experts`), resident or cold alike, and the
+    // shared expert's tube (`--shared-q8`).
     for &e in &picks {
         crate::pipeline::expert_tubes_add(&m.experts[e], x, mix_weights[e], &mut out, pool);
+    }
+    if let Some((se, _)) = &m.shared {
+        crate::pipeline::expert_tubes_add(se, x, shared_weight, &mut out, pool);
     }
     Some((out, picks))
 }
@@ -3496,11 +3500,16 @@ fn forward_tokens_device(
         if layers.iter().any(|l| l.moe.experts.iter().any(|e| e.segs.len() > 1)) {
             return off(state, "an expert with more than one tube");
         }
-        if tubes.iter().flatten().any(Option::is_some) {
-            if !dev.set_tubes(&model, &g, &tubes) {
-                return off(state, "expert tubes do not load");
-            }
-            tracing::info!("qwen4 tubes: {} MB of expert tubes resident", dev.tube_bytes() >> 20);
+        // The shared expert's tube (`hot-bake --shared-q8`: the whole expert at eight bits).
+        let shared: Vec<Option<(usize, usize, usize)>> = layers
+            .iter()
+            .map(|l| match l.moe.shared.as_ref().map(|(se, _)| se.segs.as_slice()) {
+                Some([s]) => Some((s.gate.model_idx()?, s.up.model_idx()?, s.down.model_idx()?)),
+                _ => None,
+            })
+            .collect();
+        if layers.iter().any(|l| l.moe.shared.as_ref().is_some_and(|(se, _)| se.segs.len() > 1)) {
+            return off(state, "a shared expert with more than one tube");
         }
         let t0 = std::time::Instant::now();
         let Some(bytes) = q4::prewarm(&model, &globals.skeleton_idxs) else {
@@ -3512,6 +3521,13 @@ fn forward_tokens_device(
             bytes >> 20,
             t0.elapsed().as_secs_f64()
         );
+        // The tubes after the skeleton, so the budget check sees what is up.
+        if tubes.iter().flatten().any(Option::is_some) || shared.iter().any(Option::is_some) {
+            if !dev.set_tubes(&model, &g, &tubes, &shared) {
+                return off(state, "expert tubes do not load or do not fit the VRAM budget");
+            }
+            tracing::info!("qwen4 tubes: {} MB of expert tubes resident", dev.tube_bytes() >> 20);
+        }
         if prof {
             eprintln!(
                 "qwen4-device: skeleton {} MB resident in {:.2}s",

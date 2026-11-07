@@ -22744,6 +22744,26 @@ pub(crate) fn expert_tubes_add(d: &DenseFfn, x: &[f32], weight: f32, out: &mut [
     });
 }
 
+/// The shared expert's weight on one token: σ of its gate, or 1 without one.
+pub(crate) fn shared_expert_weight(gate: Option<&QTensor>, x: &[f32], pool: Option<&Pool>) -> f32 {
+    gate.map_or(1.0, |gate| {
+        let mut gl = [0.0f32; 1];
+        gate.matvec(x, &mut gl, pool);
+        1.0 / (1.0 + (-gl[0]).exp())
+    })
+}
+
+/// The shared expert's tubes (`mlp.shared_expert.*_proj.tube1.weight`, `hot-bake
+/// --shared-q8`: the whole expert at eight bits) added to `out` with its weight.
+pub(crate) fn shared_tubes_add(m: &MoeFfn, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
+    if let Some((se, gate)) = &m.shared
+        && !se.segs.is_empty()
+    {
+        let g = shared_expert_weight(gate.as_ref(), x, pool);
+        expert_tubes_add(se, x, g, out, pool);
+    }
+}
+
 /// CMF_PREFILL_PROF: cumulative ns of the batched walk's attention and
 /// FFN halves (all layers, all chunks).
 static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] = [
@@ -25677,6 +25697,7 @@ fn moe_ffn_cpu(
             let w = p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
             expert_tubes_add(&m.experts[e], x, w, &mut out, pool);
         }
+        shared_tubes_add(m, x, &mut out, pool);
         return out;
     }
     let mut out = attention::take_buf(x.len());
@@ -25710,6 +25731,7 @@ fn moe_ffn_cpu(
             out[i] += g * so[i];
         }
         attention::recycle_buf(&mut so);
+        expert_tubes_add(se, x, g, &mut out, pool);
     }
     out
 }
@@ -25878,6 +25900,12 @@ fn moe_ffn_gpu(
     let hidden = jobs[0].down.1;
     let mut out = vec![0.0f32; hidden];
     if crate::gpu::moe_block(&model, &jobs, &mut out) {
+        // The block knows no tubes (`hot-bake --experts`): the winners' and the
+        // shared expert's come here, as the CPU paths add them.
+        for &e in idx {
+            expert_tubes_add(&m.experts[e], x, p[e] / wsum, &mut out, pool);
+        }
+        shared_tubes_add(m, x, &mut out, pool);
         Some(out)
     } else {
         moe_gpu_refused("gpu::moe_block");
