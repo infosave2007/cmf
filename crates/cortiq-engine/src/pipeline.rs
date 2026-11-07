@@ -6905,14 +6905,17 @@ impl Pipeline {
         // the chunk — instead of one token-graph submit per position (the
         // 27B: 8 tok/s → GEMM-bound). The MTP warm-up rows come out of one
         // batched run of the block per chunk. Any refusal leaves the rest
-        // of the prompt to the sequential paths below.
+        // of the prompt to the sequential paths below. Pure-attention
+        // models take it too (the plan admits their layers): CherryPit-1.2-2B
+        // read an 8 192-token prompt on the M4 in 31 s instead of the host
+        // walk's 58 s (q4tp; q8_2f 34 s against 55), at the same WikiText-2
+        // ppl. `CMF_METAL_PREFILL=0` keeps the host walk.
         #[cfg(target_os = "macos")]
         if task_mask.is_none()
             && !dyn_prefill
             && !o1_sealed
             && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
-            && self.gdn_cfg.is_some()
             && !self.per_token_stack()
             && input_ids.len() > 8
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()

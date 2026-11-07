@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- On native Metal a pure-attention model (Llama, MiniCPM5 and the like) reads its prompt through the batched rows
+  graph, as the GDN hybrids already did, instead of the host walk: CherryPit-1.2-2B on a MacBook Air M4, an
+  8 192-token prompt in 31 s instead of 58 s (q4tp; q8_2f 34 s instead of 55), 2 048 tokens in 4.5 s instead of
+  6.0 (q8_2f 5.5 s instead of 9.2); WikiText-2 ppl through the graph equal to the host's to three decimals.
+  `CMF_METAL_PREFILL=0` keeps the host walk.
+
+### Fixed
+- `cortiq serve` with `"enable_thinking": false` replaced a system prompt the chat template writes itself when the
+  conversation has none: the direct-answer directive went in as the system message, so CherryPit-1.2-2B lost its
+  identity prompt and answered "Who are you?" as "a MiniCPM series model". The directive is now left out for such
+  templates (`Tokenizer::template_has_default_system`); `cortiq run --no-think` was not affected.
+- The f32 GEMM on the CPU (f16/bf16 files, `force_f32` tensors) ran on one core whenever the chunk was shorter than 256
+  positions, which every prefill chunk on a Mac is: it now splits the output rows across the pool, bit-identical. The
+  f16 CherryPit-1.2-2B scores WikiText-2 (12 × 512 tokens) on an M4 at 785 % CPU instead of 100 %.
+
 ## [0.8.62] — 2026-11-07
 
 ### Added
