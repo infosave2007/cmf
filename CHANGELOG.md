@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CherryPit-1.2-2B (DRUPEs, a MiniCPM5-2B finetune) in CMF: `q8_2f`, a chat-calibrated GPTQ `q4tp` with the attention
+  at eight bits, and a Turbo file with exact-row weights fitted for its 42 layers (`scripts/cherrypit/`). Cards
+  `docs/hf/CherryPit-1.2-2B-cmf.md`, `docs/hf/CherryPit-1.2-2B-Turbo-cmf.md`.
+
 ### Changed
 - On native Metal a pure-attention model (Llama, MiniCPM5 and the like) reads its prompt through the batched rows
   graph, as the GDN hybrids already did, instead of the host walk: CherryPit-1.2-2B on a MacBook Air M4, an
