@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CherryPit-1.2-2B (DRUPEs, a MiniCPM5-2B finetune) in CMF: `q8_2f`, a chat-calibrated GPTQ `q4tp` with the attention
   at eight bits, and a Turbo file with exact-row weights fitted for its 42 layers (`scripts/cherrypit/`). Cards
   `docs/hf/CherryPit-1.2-2B-cmf.md`, `docs/hf/CherryPit-1.2-2B-Turbo-cmf.md`.
+- Minico-M1-1105 (Mincofficial, a fine-tune of LFM2.5-350M) in CMF:
+  [three files](https://huggingface.co/infosave/Minico-M1-1105-cmf), `q8_2f`, `q4tp` and a turbo file with 248 rows
+  kept exact (`scripts/minico/keep_minico.bin`, fitted with `scripts/dory/router/q27_feat.py`). MacBook Air M4,
+  Metal: `q8_2f` 158 tok/s, `q4tp` 276; the turbo file after a 64 000-token prompt 106 tok/s against 38.6.
+- `run --reasoning-effort LEVEL` and the server's `reasoning_effort` (or `chat_template_kwargs.reasoning_effort`)
+  reach any chat template that reads `reasoning_effort`, as given. Before, only DeepSeek-V4.1 and MiniMax M3 took
+  it. Minico-M1's dial is `off`, `low`, `medium`, `high`, `max`.
+- `cortiq serve` returns LFM2's pythonic tool calls, `<|tool_call_start|>[name(k='v')]<|tool_call_end|>`, as
+  `message.tool_calls`, streamed or not. Before, they came back as text.
 
 ### Changed
 - On native Metal a pure-attention model (Llama, MiniCPM5 and the like) reads its prompt through the batched rows
@@ -46,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The f32 GEMM on the CPU (f16/bf16 files, `force_f32` tensors) ran on one core whenever the chunk was shorter than 256
   positions, which every prefill chunk on a Mac is: it now splits the output rows across the pool, bit-identical. The
   f16 CherryPit-1.2-2B scores WikiText-2 (12 × 512 tokens) on an M4 at 785 % CPU instead of 100 %.
+- `cortiq convert` on LFM2 configs written by Transformers 5, which state the tied head as `tie_embedding`: the file
+  did not load ("Tensor not found: lm_head.weight").
+- A turbo file kept no row exact where the prompt is read on the host (LFM2 on Metal, whose short convolutions the
+  rows graph does not take). Each attention layer sealed itself at the end of the chunk that reached the boundary,
+  before the pipeline chose the rows. And the rows past the first seal went into the far field unchosen: without
+  the device route the host now keeps the prompt exact up to its last 512 rows and chooses among all of them, as the
+  archive does on a card. Facts planted in 100 000 characters, Minico turbo: 4 of 8, the standard file 3 of 8, the
+  far field without exact rows 0 of 8.
 
 ## [0.8.62] — 2026-11-07
 

@@ -5356,9 +5356,14 @@ impl Pipeline {
                         .expect("o1 config boundary validated in set_o1"),
                 )
             });
+            // Exact rows are chosen across every far-field layer at the boundary:
+            // a layer that reached it first must not seal without them.
+            let await_keep = boundary.is_some() && self.o1_exact_cfg().is_some();
             for (li, &f) in self.o1_flags.iter().enumerate() {
                 if f {
-                    self.kv_cache.layers[li].o1_begin_with_boundary(m, w, sink, rect, boundary);
+                    let cache = &mut self.kv_cache.layers[li];
+                    cache.o1_begin_with_boundary(m, w, sink, rect, boundary);
+                    cache.o1_await_keep = await_keep;
                 }
             }
         }
@@ -6859,6 +6864,23 @@ impl Pipeline {
                     }
                 }
             }
+            // Without the device route (LFM2's short convolutions on Metal) the rows
+            // past the first seal would stream into the far field unchosen. With exact
+            // rows wanted, the host keeps the prompt exact up to its last rows and
+            // chooses among all of them there, as the archive does on the device.
+            let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
+            let limit = if pos == 0 && limit < tail_from && self.o1_exact_cfg().is_some() {
+                o1_arch = None;
+                for li in 0..self.num_layers {
+                    if self.o1_flags.get(li).copied().unwrap_or(false) {
+                        self.kv_cache.layers[li].o1_set_boundary(tail_from);
+                    }
+                }
+                tracing::info!("o1: no device prefix; exact on the host up to row {tail_from}, then the seal");
+                tail_from
+            } else {
+                limit
+            };
             // Reuse the exact batched prefix machinery when available; it
             // records the same per-position Q trace as the full prefill.
             if pos < limit && self.can_prefill_batched() && limit > 2 {
@@ -28142,6 +28164,38 @@ mod tests {
         let next = p.embed_single(B as u32);
         let _ = p.forward_layers(&next, B, None);
         assert_eq!(p.o1_epoch, 1, "sealed handoff must not republish the epoch");
+    }
+
+    /// A turbo file's exact rows are chosen across every far-field layer at the
+    /// boundary. A batched chunk ending on it used to seal each layer as it
+    /// finished, before the pipeline could choose, so no row stayed exact on the
+    /// host path (LFM2 on Metal).
+    #[test]
+    fn o1_exact_rows_are_chosen_before_a_batched_boundary_seals() {
+        const B: usize = 19;
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        let cfg = crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        };
+        p.set_o1(Some(cfg.clone()));
+        p.o1_turbo = Some(O1Turbo {
+            cfg,
+            seal: B,
+            exact: crate::dory::ExactRows { weights: std::sync::Arc::new(vec![1.0; 2 * 2]), budget: 3 },
+        });
+        p.o1_begin_with_prefix(Some(B));
+        let ids: Vec<u32> = (0..B as u32).collect();
+        let _ = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+        // The span's own completion chooses the rows and seals every layer.
+        assert!(p.kv_cache.layers.iter().all(|l| l.o1_sealed()));
+        let keep = p.kv_cache.layers[0].o1_keep.clone();
+        assert_eq!(keep.len(), 3, "the budget of exact rows is spent");
+        assert_eq!(keep, p.kv_cache.layers[1].o1_keep, "the same rows in every layer");
+        assert!(keep.iter().all(|&r| (2..B - 8).contains(&r)), "never a sink or a window row");
     }
 
     #[test]

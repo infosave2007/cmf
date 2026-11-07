@@ -1,0 +1,28 @@
+# The commit-author check runs on every push and pull request, with no path
+# filter: ci.yml skips documentation-only changes, and an AI identity in a
+# docs commit must not reach master either.
+name: authors
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  commit-authors:
+    name: commit authors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # GitHub lists commit authors and Co-authored-by names as contributors;
+      # commits from AI agent identities must not reach master.
+      - run: scripts/check_commit_authors.sh "$BASE" "$HEAD"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+

@@ -7970,6 +7970,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         other => anyhow::bail!("unsupported hidden_act '{other}'"),
     };
     let is_minicpm3 = model_type == "minicpm3";
+    let is_lfm2_config = model_type.to_lowercase().starts_with("lfm2");
     let embed_multiplier = if is_granite {
         tc.get("embedding_multiplier")
             .and_then(|v| v.as_f64())
@@ -8137,9 +8138,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("tie_word_embeddings")
             // LFM3-Audio states it on the nested text model only.
             .or_else(|| tc.get("tie_word_embeddings").filter(|_| is_lfm3))
+            // LFM2 configs written by Transformers 5 spell it `tie_embedding`
+            // (Lfm2Config reads that alias, and defaults to tied).
+            .or_else(|| config.get("tie_embedding").filter(|_| is_lfm2_config))
             .and_then(|v| v.as_bool())
             // MiniCPM3 ships no lm_head tensor — the head is the embedding.
-            .unwrap_or(is_gemma || is_minicpm3),
+            .unwrap_or(is_gemma || is_minicpm3 || is_lfm2_config),
         // DeepSeek-V4 rotates only `qk_rope_head_dim` of each head's 512,
         // and its config states that directly rather than as a fraction.
         // Carrying it here is what lets a retuned checkpoint load without
@@ -14420,6 +14424,31 @@ pub(crate) mod tests {
         // whatever the state buffer happened to hold.
         assert_eq!(arch.linear_conv_kernel_dim, Some(3));
         assert!(arch.moe.is_none(), "the dense build has no experts");
+    }
+
+    /// LFM2 fine-tunes saved by Transformers 5 (Minico-M1-1105) state the
+    /// tied head as `tie_embedding` and ship no `lm_head.weight`; missing
+    /// that alias made the file refuse to load.
+    #[test]
+    fn lfm2_tie_embedding_alias_ties_the_head() {
+        let base = r#""model_type": "lfm2", "architectures": ["Lfm2ForCausalLM"],
+            "hidden_size": 1024, "num_hidden_layers": 2,
+            "num_attention_heads": 16, "num_key_value_heads": 8,
+            "intermediate_size": 6656, "vocab_size": 65536,
+            "norm_eps": 1e-5, "conv_L_cache": 3,
+            "layer_types": ["conv","full_attention"]"#;
+        let arch = |extra: &str| {
+            let cfg: serde_json::Value =
+                serde_json::from_str(&format!("{{{base}{extra}}}")).unwrap();
+            build_arch(&cfg).unwrap()
+        };
+        assert!(arch(r#", "tie_embedding": true"#).tie_word_embeddings);
+        assert!(arch("").tie_word_embeddings, "Lfm2Config defaults to tied");
+        assert!(!arch(r#", "tie_embedding": false"#).tie_word_embeddings);
+        assert!(
+            !arch(r#", "tie_word_embeddings": false, "tie_embedding": true"#).tie_word_embeddings,
+            "the canonical key wins"
+        );
     }
 
     /// LFM3: a third mixer (sliding attention), per-type RoPE with a

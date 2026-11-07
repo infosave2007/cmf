@@ -1,7 +1,9 @@
 //! Tool calls out of generated text — every grammar the embedded
 //! templates teach, normalised to the OpenAI `tool_calls` shape.
 //!
-//! Two families:
+//! Three families (the third, Liquid's LFM2 pythonic list
+//! `<|tool_call_start|>[name(k='v')]<|tool_call_end|>`, is described at
+//! [`extract_lfm`]):
 //!
 //! * **Hermes / Qwen**: `<tool_call>{"name": …, "arguments": {…}}</tool_call>`,
 //!   Nanbeige's XML body inside the same wrapper
@@ -691,6 +693,8 @@ pub fn extract_tool_calls(text: &str, tools: Option<&[Value]>) -> (String, Vec<V
     let (plain_mid, mut calls) = extract_hermes(&text[start..end], tools.unwrap_or(&[]));
     let (plain_mid, minicpm) = extract_minicpm5(&plain_mid, tools.unwrap_or(&[]));
     calls.extend(minicpm);
+    let (plain_mid, lfm) = extract_lfm(&plain_mid, tools.unwrap_or(&[]));
+    calls.extend(lfm);
     let mut plain = String::with_capacity(text.len());
     plain.push_str(&text[..start]);
     plain.push_str(&plain_mid);
@@ -895,6 +899,91 @@ fn extract_minicpm5(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
     }
     plain.push_str(rest);
     (plain, calls)
+}
+
+// ─── LFM2 / LFM2.5 (Liquid) ──────────────────────────────────────────
+
+const LFM_OPEN: &str = "<|tool_call_start|>";
+const LFM_CLOSE: &str = "<|tool_call_end|>";
+
+/// Liquid's pythonic calls, the grammar the LFM2/LFM2.5 templates render
+/// history in: `<|tool_call_start|>[name(k='v', n=3), other()]<|tool_call_end|>`.
+/// Values are Python literals (the template quotes strings with `'`, and
+/// writes lists and dicts as JSON). A block that does not parse, repeats a
+/// keyword, or names a tool the request did not declare stays text.
+fn extract_lfm(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
+    let mut plain = String::new();
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(LFM_OPEN) {
+        let body_at = i + LFM_OPEN.len();
+        let Some(j) = rest[body_at..].find(LFM_CLOSE) else {
+            break; // unterminated: the rest stays text
+        };
+        let block_end = body_at + j + LFM_CLOSE.len();
+        match parse_lfm_calls(&rest[body_at..body_at + j], tools) {
+            Some(found) => {
+                plain.push_str(&rest[..i]);
+                calls.extend(found);
+            }
+            None => plain.push_str(&rest[..block_end]),
+        }
+        rest = &rest[block_end..];
+    }
+    plain.push_str(rest);
+    (plain, calls)
+}
+
+/// `[f(a=1), g(b='x')]` (the brackets optional) → OpenAI calls.
+fn parse_lfm_calls(body: &str, tools: &[Value]) -> Option<Vec<Value>> {
+    let mut p = PyLit {
+        s: body.as_bytes(),
+        src: body,
+        i: 0,
+    };
+    let bracketed = p.eat(b'[');
+    let mut calls = Vec::new();
+    loop {
+        let name = p.ident(b".-");
+        if name.is_empty() || !p.eat(b'(') {
+            return None;
+        }
+        if !tools.is_empty() && !tools.iter().any(|t| t["function"]["name"].as_str() == Some(name.as_str())) {
+            return None;
+        }
+        let mut args = Map::new();
+        if !p.eat(b')') {
+            loop {
+                let key = p.ident(b"");
+                if key.is_empty() || !p.eat(b'=') {
+                    return None;
+                }
+                let value = p.value()?;
+                if args.insert(key, value).is_some() {
+                    return None;
+                }
+                if p.eat(b')') {
+                    break;
+                }
+                if !p.eat(b',') {
+                    return None;
+                }
+            }
+        }
+        calls.push(openai_call(&name, &Value::Object(args)));
+        let more = p.eat(b',');
+        if !more {
+            if bracketed && !p.eat(b']') {
+                return None;
+            }
+            break;
+        }
+        if bracketed && p.eat(b']') {
+            break;
+        }
+    }
+    p.ws();
+    (p.i == p.s.len()).then_some(calls)
 }
 
 /// Length of the `<function …>…</function>` block at the start of `s`.
@@ -1113,6 +1202,21 @@ impl PyLit<'_> {
         }
     }
 
+    /// An identifier (`[A-Za-z0-9_]` plus `extra`) after whitespace; empty
+    /// when there is none.
+    fn ident(&mut self, extra: &[u8]) -> String {
+        self.ws();
+        let start = self.i;
+        while self.i < self.s.len()
+            && (self.s[self.i].is_ascii_alphanumeric()
+                || self.s[self.i] == b'_'
+                || extra.contains(&self.s[self.i]))
+        {
+            self.i += 1;
+        }
+        self.src[start..self.i].to_string()
+    }
+
     fn eat(&mut self, c: u8) -> bool {
         self.ws();
         if self.s.get(self.i) == Some(&c) {
@@ -1203,9 +1307,11 @@ impl PyLit<'_> {
                     self.i += 1;
                 }
                 match &self.src[start..self.i] {
-                    "None" => Some(Value::Null),
-                    "True" => Some(Value::Bool(true)),
-                    "False" => Some(Value::Bool(false)),
+                    // JSON spellings too: templates write nested lists and
+                    // dicts through `tojson` (LFM2 call arguments).
+                    "None" | "null" => Some(Value::Null),
+                    "True" | "true" => Some(Value::Bool(true)),
+                    "False" | "false" => Some(Value::Bool(false)),
                     num => serde_json::from_str::<serde_json::Number>(num)
                         .ok()
                         .map(Value::Number),
@@ -1232,7 +1338,7 @@ pub struct ToolHoldback {
     in_think: bool,
 }
 
-const MARKERS: &[&str] = &["<tool_call>", "<function ", "<function\n", "<function\t"];
+const MARKERS: &[&str] = &["<tool_call>", "<function ", "<function\n", "<function\t", LFM_OPEN];
 
 impl ToolHoldback {
     pub fn new() -> Self {
@@ -1347,6 +1453,54 @@ mod tests {
         );
         assert!(calls.is_empty());
         assert!(plain.contains("<tool_call>"));
+    }
+
+    /// Liquid's pythonic list, as Minico-M1-1105 (LFM2.5) answers.
+    #[test]
+    fn lfm_pythonic_calls_become_openai_calls() {
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "set_volume",
+                "parameters": {"type": "object", "properties": {"level": {"type": "integer"}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}),
+        ];
+        let args = |c: &Value| -> Value {
+            serde_json::from_str(c["function"]["arguments"].as_str().unwrap()).unwrap()
+        };
+        let text = "<think>\n\nUse set_volume.\n</think>\n\n<|tool_call_start|>[set_volume(level=30)]<|tool_call_end|>";
+        let (plain, calls) = extract_tool_calls(text, Some(&tools));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "set_volume");
+        assert_eq!(args(&calls[0])["level"], 30);
+        assert!(!plain.contains("tool_call_start"), "{plain}");
+        // two calls, quoted strings with escapes, JSON containers, no-arg call
+        let (plain, calls) = extract_tool_calls(
+            "On it. <|tool_call_start|>[get_weather(city='Paris \\'Nord\\''), set_volume(level=5), get_weather(city=\"Oslo\", opts={\"metric\": true, \"days\": [1, 2]})]<|tool_call_end|>",
+            None,
+        );
+        assert_eq!(plain, "On it.");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(args(&calls[0])["city"], "Paris 'Nord'");
+        assert_eq!(args(&calls[1])["level"], 5);
+        assert_eq!(args(&calls[2])["opts"]["metric"], true);
+        assert_eq!(args(&calls[2])["opts"]["days"][1], 2);
+        // an undeclared tool, a repeated keyword, prose: all stay text
+        for bad in [
+            "<|tool_call_start|>[rm_rf(path='/')]<|tool_call_end|>",
+            "<|tool_call_start|>[set_volume(level=1, level=2)]<|tool_call_end|>",
+            "<|tool_call_start|>I would call set_volume<|tool_call_end|>",
+        ] {
+            let (plain, calls) = extract_tool_calls(bad, Some(&tools));
+            assert!(calls.is_empty(), "{bad}");
+            assert_eq!(plain, bad);
+        }
+        // streamed token by token
+        let (content, calls) = stream(
+            &["Sure. <|tool", "_call_start|>[set_vol", "ume(level=7)]<|tool_call_end|>"],
+            &tools,
+        );
+        assert_eq!(content, "Sure. ");
+        assert_eq!(calls.len(), 1);
     }
 
     use super::*;
