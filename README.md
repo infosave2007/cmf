@@ -114,6 +114,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+Serve it as an OpenAI-compatible API (chat and completions, streamed or not, a web dashboard on the same
+port; `--host 127.0.0.1` keeps it local):
+
+```sh
+cortiq serve model.cmf --port 8080
+curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
 ## Ripple-65B Preview, a dense 65B in three files (0.8.60)
 
 [Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) in four bits (34.6 GB), two bits

@@ -104,6 +104,14 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+作为 OpenAI 兼容 API 启动服务(聊天与 completions,流式或非流式,同一端口上有网页面板;`--host 127.0.0.1` 只在本机监听):
+
+```sh
+cortiq serve model.cmf --port 8080
+curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
+```
+
 ## Ripple-65B Preview:三个文件中的稠密 65B(0.8.60)
 
 [Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) 的四比特(34.6 GB)、二比特(29.2 GB)和八比特(64.8 GB)文件,每个都带 turbo 头:在 NVIDIA A40(46 GB)上,四比特文件从 4 000 到 64 000 个 token 的提示均以 12 tok/s 解码,占 35 到 37 GB。在 RTX PRO 6000 上解码 29.8 tok/s(本版之前为 23.4),八比特文件读取提示 156 tok/s,原来是 43:

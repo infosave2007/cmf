@@ -53,6 +53,22 @@ Use cortiq 0.8.60 or later; prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). The model reasons inside `<think>` before
 it answers. `--greedy` turns on the drafter's rounds.
 
+### OpenAI-compatible server
+
+```bash
+cortiq serve ripple-65b-q4tp.cmf --port 8080
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "ripple", "max_tokens": 4096,
+       "messages": [{"role": "user", "content": "Explain how a B-tree splits a full node."}]}'
+```
+
+Endpoints: `/v1/chat/completions` (streamed or not), `/v1/completions`, `/v1/models`, and a web dashboard
+on the same port. `--host 127.0.0.1` keeps the server local. A conversation keeps its rows on the card
+between turns, so a turn reads only what is new; the far field holds the ceiling the same way as in
+`cortiq run`.
+
 ## Files
 
 | file | GB | fits | perplexity, wikitext-2 test, first 2048 tokens (BF16 6.94) | top-1 as BF16 |
@@ -232,6 +248,21 @@ CMF_DFLASH=1 cortiq run ripple-65b-q4tp.cmf --prompt-file task.txt --greedy
 [странице релизов](https://github.com/infosave2007/cmf/releases). Модель рассуждает внутри `<think>`,
 прежде чем ответить. `--greedy` включает раунды черновика.
 
+#### OpenAI-совместимый сервер
+
+```bash
+cortiq serve ripple-65b-q4tp.cmf --port 8080
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "ripple", "max_tokens": 4096,
+       "messages": [{"role": "user", "content": "Объясни, как B-дерево расщепляет полный узел."}]}'
+```
+
+Эндпоинты: `/v1/chat/completions` (с потоком и без), `/v1/completions`, `/v1/models` и веб-панель на том
+же порту. `--host 127.0.0.1` оставляет сервер локальным. Разговор держит свои строки на карте между
+ходами, так что ход читает только новое; дальнее поле держит потолок так же, как в `cortiq run`.
+
 ### Файлы
 
 | файл | ГБ | помещается | перплексия, wikitext-2 test, первые 2048 токенов (BF16 6,94) | top-1 как BF16 |
@@ -406,6 +437,19 @@ CMF_DFLASH=1 cortiq run ripple-65b-q4tp.cmf --prompt-file task.txt --greedy
 
 需要 cortiq 0.8.60 或更新版本;预编译二进制在
 [发布页](https://github.com/infosave2007/cmf/releases)。模型先在 `<think>` 中推理再回答。`--greedy` 开启草稿轮次。
+
+#### OpenAI 兼容服务器
+
+```bash
+cortiq serve ripple-65b-q4tp.cmf --port 8080
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "ripple", "max_tokens": 4096,
+       "messages": [{"role": "user", "content": "解释 B 树如何分裂一个满节点。"}]}'
+```
+
+接口:`/v1/chat/completions`(流式或非流式)、`/v1/completions`、`/v1/models`,以及同一端口上的网页面板。`--host 127.0.0.1` 让服务器只在本机监听。对话在轮次之间把自己的行留在显卡上,每一轮只读取新内容;远场像 `cortiq run` 一样保持上限。
 
 ### 文件
 
