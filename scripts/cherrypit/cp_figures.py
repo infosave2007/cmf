@@ -15,8 +15,8 @@ os.makedirs(cf.out, exist_ok=True)
 CTX = [1000, 4000, 16000, 32000, 64000]
 LABELS = ["1 000", "4 000", "16 000", "32 000", "64 000"]
 # Memory: nvidia-smi's peak in MiB / 1024, the unit a card's label uses.
-STD = dict(dec=[108.0, 111.9, 90.5, 73.7, 42.9], first=[0.43, 2.31, 18.11, 61.67, 228.53], vram=[2.1, 2.4, 3.5, 4.8, 7.4])
-TUR = dict(dec=[109.4, 108.2, 66.9, 67.4, 67.0], first=[0.45, 2.29, 48.80, 86.41, 171.90], vram=[1.9, 2.4, 2.9, 2.7, 3.2])
+STD = dict(dec=[171.0, 152.2, 113.0, 88.8, 53.6], first=[0.43, 2.28, 18.12, 61.87, 228.78], vram=[1.9, 2.4, 3.5, 4.8, 7.4])
+TUR = dict(dec=[170.6, 153.0, 154.1, 148.7, 155.1], first=[0.44, 2.35, 48.00, 86.78, 170.45], vram=[1.9, 2.4, 2.9, 2.9, 2.9])
 FACTS = dict(en="A planted fact: 8 of 8 in 100 000 characters, {f300} in 300 000 characters (about 67 000 tokens)",
              ru="Факт в тексте: 8 из 8 в 100 000 символов, {f300} в 300 000 символов (около 67 000 токенов)",
              zh="插入的事实：100 000 字符中 8/8，300 000 字符（约 67 000 token）中 {f300}")
@@ -36,7 +36,7 @@ T = {
         "s2": "Build", "s2t": "The far field is built anew from the stored rows, one layer at a time: 32 landmarks per head.",
         "s3": "Keep exact", "s3t": "248 chosen rows, the first 4 and the last 1800 stay exact on the card.",
         "s4": "Decode", "s4t": "A token reads the exact rows and the far field, so its cost stops growing with the text.",
-        "res": "3.2 GB of device memory and 67 tok/s at 64 000 tokens; the standard file 7.4 GB and 43 tok/s",
+        "res": "2.9 GB of device memory and 155 tok/s at 64 000 tokens; the standard file 7.4 GB and 54 tok/s",
         "x_t": "Passwords and codes stay exact",
         "x_sub": "Each row is scored by what the layers do with it, with no word lists.",
         "x_y": "row’s score", "x_x": "prompt rows read before the choice", "x_fact": "“Remember this pass key.”",
@@ -59,7 +59,7 @@ T = {
         "s2": "Сборка", "s2t": "Дальнее поле строится заново из сохранённых строк, слой за слоем: 32 опорные точки на голову.",
         "s3": "Точные", "s3t": "248 выбранных строк, первые 4 и последние 1800 остаются на карте точными.",
         "s4": "Декод", "s4t": "Токен читает точные строки и дальнее поле, и его цена перестаёт расти вместе с текстом.",
-        "res": "3,2 ГБ памяти карты и 67 ток/с на 64 000 токенов; у обычного файла 7,4 ГБ и 43 ток/с",
+        "res": "2,9 ГБ памяти карты и 155 ток/с на 64 000 токенов; у обычного файла 7,4 ГБ и 54 ток/с",
         "x_t": "Пароли и коды остаются точными",
         "x_sub": "Строка получает оценку по тому, что с ней делают слои. Списков слов нет.",
         "x_y": "оценка строки", "x_x": "строки промпта, прочитанные до выбора", "x_fact": "«Запомни этот ключ.»",
@@ -82,7 +82,7 @@ T = {
         "s2": "构建", "s2t": "用保存的行逐层重建远场：每个头 32 个地标。",
         "s3": "保持精确", "s3t": "选出的 248 行、前 4 行和后 1800 行以精确形式留在显卡上。",
         "s4": "解码", "s4t": "每个 token 读取精确行和远场，成本不再随文本增长。",
-        "res": "64 000 token 时显存 3.2 GB、解码 67 tok/s；普通文件为 7.4 GB、43 tok/s",
+        "res": "64 000 token 时显存 2.9 GB、解码 155 tok/s；普通文件为 7.4 GB、54 tok/s",
         "x_t": "密码和编码保持精确",
         "x_sub": "根据各层对每一行的处理来打分，不用词表。",
         "x_y": "行的分数", "x_x": "选择之前读取的提示行", "x_fact": "“记住这个密钥。”",
@@ -135,7 +135,7 @@ def compare(lang):
         s.text(X(4), Y(b[4]) + ends[1], n1(b[4]) if ymax < 40 else f"{b[4]:.0f}", 22, INK, "700", "end")
         return X, Y
 
-    panel(50, 540, t["dec"], STD["dec"], TUR["dec"], 120, 20, (34, -16))
+    panel(50, 540, t["dec"], STD["dec"], TUR["dec"], 200, 50, (34, -16))
     panel(570, 1060, t["first"], STD["first"], TUR["first"], 250, 50, (-16, 34))
     X, Y = panel(1090, 1550, t["vram"], STD["vram"], TUR["vram"], 8, 2, (-16, 34))
     s.line(1134, Y(4), 1550, Y(4), INK2, 2, "8 6")

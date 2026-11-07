@@ -96,3 +96,22 @@ not reach the dense batch NLL path (both printed 12.032 exact).
 HF: infosave/CherryPit-1.2-2B-cmf (q8_2f, q4tp, README) and infosave/CherryPit-1.2-2B-Turbo-cmf (turbo, README,
 assets/*.png, keep_cherrypit.bin), all verified by the tree API; still PRIVATE (making them public was refused to the
 agent — the owner's action).
+
+## Decode attention rewrite (Vulkan, RTX 5090), after the owner's «почему не переписал»
+Trap first: after the rebase onto 0.8.62 only crates/ was synced to the pod, the build failed behind `tail -1`, and
+the first «fd» A/B ran the 13:39 binary — sync the whole tree and grep the binary for a new string before measuring.
+Finding: decode slowed from 165 (41 positions) to 110 tok/s by 300 positions; the GPU span rose 4.0 → 7.1 ms between
+41 and 512 positions and only to 7.7 at 4 096 — the one-workgroup-per-head kernel and the split path's latency, not
+the depth. `gpu_wgpu/attend_fd.rs`: 8 subgroups a workgroup, whole coalesced K/V rows, subgroupAdd scores for every
+query head, online softmax in registers, ~64 workgroups (max 32 positions a subgroup), from 16 positions on.
+Same binary, CMF_ATTEND_FD=0 → default, q4tp: 512 110 → 182, 2 048 113 → 164, 4 096 106 → 147, 8 192 92 → 117,
+16 384 79 → 93, 32 000 72 → 90; q8_2f 103 → 163, 102 → 142, 98 → 143, 91 → 110, 32 000 68 → 84. Greedy text 12/12
+identical; chat decode q4tp 110 → 136-164, q8_2f 101 → 135-150. Grid sweep: 64 wgs 189/150/92 at 512/4k/16k, 128
+168/141/103, 256 140/116/85.
+`gpu_wgpu/o1_fd.rs`: a sealed layer in 2 dispatches instead of 7 o1_stages. Turbo decode 56 → 108 at 16k,
+67 → 153 at 32k; 300-token summary after 100 000 chars identical text (66.7 → 135.5 tok/s); facts 8/8.
+Final tables (vbench): q8_2f decode 190, 2k 1.30 s / 151, 8k 7.37 s / 109, ppl 18.462; q4tp 187, 1.00 s / 156,
+6.31 s / 124, ppl 19.401. Standard vs turbo (q4tp): 1k 171/171, 4k 152/153, 16k 113/154 (first token 18.1/48.0 s),
+32k 89/149 (61.9/86.8), 64k 54/155 (228.8/170.5), VRAM 7.4 vs 2.9 GB; 4 GB budget 2.9 GB, 173 s, 148 tok/s.
+Next lever: the turbo prompt — its exact 8 192-row prefix takes 17 s against ~6 for the standard file (the rows'
+K/V/q trace go to the host while it is read), then ~30 s for 8k sealed rows.

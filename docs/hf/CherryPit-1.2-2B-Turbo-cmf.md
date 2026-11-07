@@ -22,8 +22,8 @@ language:
 # CherryPit-1.2-2B Turbo — CMF
 
 The 4-bit weights of [CherryPit-1.2-2B](https://huggingface.co/DRUPEs/CherryPit-1.2-2B) under a header
-that holds device memory and decode speed in place on long prompts. At 64 000 tokens it takes 3.2 GB of
-the card instead of 7.4, reads the prompt in 172 s instead of 229 and decodes at 67 tok/s instead of 43,
+that holds device memory and decode speed in place on long prompts. At 64 000 tokens it takes 2.9 GB of
+the card instead of 7.4, reads the prompt in 170 s instead of 229 and decodes at 155 tok/s instead of 54,
 with passwords and codes in the text still exact. Prompts under 8192 tokens run exact attention, as in the
 [standard file](https://huggingface.co/infosave/CherryPit-1.2-2B-cmf). It is one
 [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no Python and
@@ -45,7 +45,8 @@ Short on RAM as well, with a fast SSD:
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-Use cortiq 0.8.61 or later; prebuilt binaries are on the
+cortiq 0.8.61 or later runs the file; the decode speeds below need the release after 0.8.62, which decodes
+past the seal at about 67 tok/s. Prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). `CMF_MAX_SEQ` lifts the default cap of
 32 768 tokens to the model's 131 072.
 
@@ -74,17 +75,18 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length
 
 | prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak VRAM, GB (standard) | peak VRAM, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 000 | 0.43 | **0.45** | 108 | **109** | 2.1 | **1.9** |
-| 4 000 | 2.3 | **2.3** | 112 | **108** | 2.4 | **2.4** |
-| 16 000 | 18.1 | **48.8** | 90 | **67** | 3.5 | **2.9** |
-| 32 000 | 61.7 | **86.4** | 74 | **67** | 4.8 | **2.7** |
-| 64 000 | 228.5 | **171.9** | 43 | **67** | 7.4 | **3.2** |
+| 1 000 | 0.43 | **0.44** | 171 | **171** | 1.9 | **1.9** |
+| 4 000 | 2.3 | **2.4** | 152 | **153** | 2.4 | **2.4** |
+| 16 000 | 18.1 | **48.0** | 113 | **154** | 3.5 | **2.9** |
+| 32 000 | 61.9 | **86.8** | 89 | **149** | 4.8 | **2.9** |
+| 64 000 | 228.8 | **170.5** | 54 | **155** | 7.4 | **2.9** |
 
-At 16 000 and 32 000 tokens a card with room for the cache is faster with the standard file; from 64 000
-tokens on, and on a card the cache does not fit, the turbo file is the faster and the smaller one.
+Past the seal the turbo file decodes at about 150 tok/s at any length and keeps the card at 2.9 GB. Where its
+cache fits, the standard file reads a 16 000- or 32 000-token prompt faster; from 64 000 tokens on the turbo
+file is the faster on the prompt too.
 
 **On a 4 GB card.** With the budget of such a card set on the same 5090 (`CMF_GPU_VRAM_MB=3800`), the
-file stays at 2.6 GB at 64 000 tokens: first token 161 s, decode 66 tok/s.
+file stays at 2.9 GB at 64 000 tokens: first token 173 s, decode 148 tok/s.
 
 **Host memory.** While a long prompt is read, its rows take RAM or a disk; the mapped weights are not
 counted. At 64 000 tokens: 11.0 GB of RAM, or with `--o1-spill` 8.3 GB of RAM and 8.2 GB on disk, at the same speed. The rows are needed only until the far field is built.
@@ -137,7 +139,7 @@ U.S. patent application No. 19/738,763; see
 
 4-битные веса [CherryPit-1.2-2B](https://huggingface.co/DRUPEs/CherryPit-1.2-2B) с заголовком, который
 держит память карты и скорость декода на месте при длинных промптах. На 64 000 токенов файл занимает
-3,2 ГБ карты вместо 7,4, читает промпт за 172 с вместо 229 и декодирует 67 ток/с вместо 43, а пароли и
+2,9 ГБ карты вместо 7,4, читает промпт за 170 с вместо 229 и декодирует 155 ток/с вместо 54, а пароли и
 коды в тексте остаются точными. Промпты короче 8192 токенов идут с точным вниманием, как в
 [обычном файле](https://huggingface.co/infosave/CherryPit-1.2-2B-cmf). Это один
 [CMF](https://github.com/infosave2007/cmf)-файл для `cortiq`, движка на Rust без Python и ML-фреймворков.
@@ -150,8 +152,9 @@ hf download infosave/CherryPit-1.2-2B-Turbo-cmf CherryPit-1.2-2B-turbo.cmf --loc
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-Если не хватает и оперативной памяти, но есть быстрый SSD, добавьте `--o1-spill /mnt/ssd/cortiq`. Нужен
-cortiq 0.8.61 или новее; `CMF_MAX_SEQ` поднимает предел по умолчанию в 32 768 токенов до 131 072 у модели.
+Если не хватает и оперативной памяти, но есть быстрый SSD, добавьте `--o1-spill /mnt/ssd/cortiq`. Файл
+запускает cortiq 0.8.61 или новее; скорость декода из таблицы — с релиза после 0.8.62 (в нём за печатью
+около 67 ток/с). `CMF_MAX_SEQ` поднимает предел по умолчанию в 32 768 токенов до 131 072 у модели.
 
 ### Что делает файл
 
@@ -177,17 +180,18 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 
 | промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик VRAM, ГБ (обычный) | пик VRAM, ГБ (**турбо**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 000 | 0,43 | **0,45** | 108 | **109** | 2,1 | **1,9** |
-| 4 000 | 2,3 | **2,3** | 112 | **108** | 2,4 | **2,4** |
-| 16 000 | 18,1 | **48,8** | 90 | **67** | 3,5 | **2,9** |
-| 32 000 | 61,7 | **86,4** | 74 | **67** | 4,8 | **2,7** |
-| 64 000 | 228,5 | **171,9** | 43 | **67** | 7,4 | **3,2** |
+| 1 000 | 0,43 | **0,44** | 171 | **171** | 1,9 | **1,9** |
+| 4 000 | 2,3 | **2,4** | 152 | **153** | 2,4 | **2,4** |
+| 16 000 | 18,1 | **48,0** | 113 | **154** | 3,5 | **2,9** |
+| 32 000 | 61,9 | **86,8** | 89 | **149** | 4,8 | **2,9** |
+| 64 000 | 228,8 | **170,5** | 54 | **155** | 7,4 | **2,9** |
 
-На 16 000 и 32 000 токенов карта, где помещается кэш, быстрее с обычным файлом; с 64 000 токенов, а также
-на карте, где кэш не помещается, турбо-файл и быстрее, и меньше.
+За печатью турбо-файл декодирует около 150 ток/с на любой длине и держит карту на 2,9 ГБ. Там, где кэш
+помещается, обычный файл быстрее читает промпт в 16 000 или 32 000 токенов; с 64 000 токенов турбо-файл
+быстрее и на промпте.
 
 **На карте 4 ГБ.** С бюджетом такой карты на той же 5090 (`CMF_GPU_VRAM_MB=3800`) файл держится в
-2,6 ГБ на 64 000 токенов: первый токен 161 с, декод 66 ток/с.
+2,9 ГБ на 64 000 токенов: первый токен 173 с, декод 148 ток/с.
 
 **Память хоста.** Пока читается длинный промпт, его строки занимают RAM или диск; отображённые веса не
 считаются. На 64 000 токенов: 11,0 ГБ RAM, а с `--o1-spill` — 8,3 ГБ RAM и 8,2 ГБ на диске при той же скорости.
@@ -217,8 +221,8 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 ## 中文说明
 
 [CherryPit-1.2-2B](https://huggingface.co/DRUPEs/CherryPit-1.2-2B) 的 4 位权重，文件头让长提示下的显存和
-解码速度保持不变。64 000 个 token 时占用显存 3.2 GB（普通文件 7.4 GB），读取提示用时 172 秒（普通文件
-229 秒），解码 67 tok/s（普通文件 43 tok/s），文本中的密码和编码依然精确。短于 8192 个 token 的提示使用
+解码速度保持不变。64 000 个 token 时占用显存 2.9 GB（普通文件 7.4 GB），读取提示用时 170 秒（普通文件
+229 秒），解码 155 tok/s（普通文件 54 tok/s），文本中的密码和编码依然精确。短于 8192 个 token 的提示使用
 精确注意力，与[普通文件](https://huggingface.co/infosave/CherryPit-1.2-2B-cmf)相同。这是一个供 `cortiq`
 使用的 [CMF](https://github.com/infosave2007/cmf) 文件。
 
@@ -230,8 +234,9 @@ hf download infosave/CherryPit-1.2-2B-Turbo-cmf CherryPit-1.2-2B-turbo.cmf --loc
 CMF_MAX_SEQ=131072 cortiq run CherryPit-1.2-2B-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-内存也不足但有高速 SSD 时，加上 `--o1-spill /mnt/ssd/cortiq`。需要 cortiq 0.8.61 或更新版本；
-`CMF_MAX_SEQ` 把默认的 32 768 token 上限提高到模型的 131 072。
+内存也不足但有高速 SSD 时，加上 `--o1-spill /mnt/ssd/cortiq`。cortiq 0.8.61 或更新版本即可运行；
+表中的解码速度需要 0.8.62 之后的版本（0.8.62 在封存点之后约 67 tok/s）。`CMF_MAX_SEQ` 把默认的 32 768 token
+上限提高到模型的 131 072。
 
 ### 文件做了什么
 
@@ -254,17 +259,17 @@ RTX 5090，Vulkan，`cortiq bench --core`，在该长度的提示之后生成 60
 
 | 提示，token | 首 token，秒（普通） | 首 token，秒（**turbo**） | 解码，tok/s（普通） | 解码，tok/s（**turbo**） | 显存峰值，GB（普通） | 显存峰值，GB（**turbo**） |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 000 | 0.43 | **0.45** | 108 | **109** | 2.1 | **1.9** |
-| 4 000 | 2.3 | **2.3** | 112 | **108** | 2.4 | **2.4** |
-| 16 000 | 18.1 | **48.8** | 90 | **67** | 3.5 | **2.9** |
-| 32 000 | 61.7 | **86.4** | 74 | **67** | 4.8 | **2.7** |
-| 64 000 | 228.5 | **171.9** | 43 | **67** | 7.4 | **3.2** |
+| 1 000 | 0.43 | **0.44** | 171 | **171** | 1.9 | **1.9** |
+| 4 000 | 2.3 | **2.4** | 152 | **153** | 2.4 | **2.4** |
+| 16 000 | 18.1 | **48.0** | 113 | **154** | 3.5 | **2.9** |
+| 32 000 | 61.9 | **86.8** | 89 | **149** | 4.8 | **2.9** |
+| 64 000 | 228.8 | **170.5** | 54 | **155** | 7.4 | **2.9** |
 
-16 000 和 32 000 token 时，若显卡放得下缓存，普通文件更快；从 64 000 token 起，以及在放不下缓存的显卡上，
-turbo 文件既更快也更小。
+超过封存点后，turbo 文件在任何长度下解码约 150 tok/s，显存保持 2.9 GB。若显卡放得下缓存，普通文件读取
+16 000 或 32 000 token 的提示更快；从 64 000 token 起 turbo 文件读取提示也更快。
 
 **4 GB 显卡。** 在同一张 5090 上设置这种显卡的预算（`CMF_GPU_VRAM_MB=3800`），64 000 token 时文件占用
-2.6 GB：首 token 161 秒，解码 66 tok/s。
+2.9 GB：首 token 173 秒，解码 148 tok/s。
 
 **主机内存。** 读取长提示时，其各行占用内存或磁盘（不计映射的权重）。64 000 token 时：内存 11.0 GB；使用 `--o1-spill` 时内存 8.3 GB、磁盘 8.2 GB，速度不变。
 

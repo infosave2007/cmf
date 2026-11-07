@@ -38,9 +38,9 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 ```
 
 Prebuilt binaries for Linux, macOS and Windows are on the
-[releases page](https://github.com/infosave2007/cmf/releases). cortiq 0.8.61 runs both files; the prompt
-times below need the release after it, since 0.8.61 reads a prompt of this model on the host path (2 048
-tokens in about 11 s on an RTX 5090). `--no-think` asks for a direct answer.
+[releases page](https://github.com/infosave2007/cmf/releases). cortiq 0.8.61 runs both files; the speeds below
+need the release after 0.8.62, which reads a prompt of this model on the host path (2 048 tokens in about
+11 s on an RTX 5090) and decodes it about a third slower on Vulkan. `--no-think` asks for a direct answer.
 
 ## Files
 
@@ -63,8 +63,8 @@ speed after a prompt of that length.
 
 | hardware | backend | file | decode, tok/s | 2k prompt, first token | decode at 2k | 8k prompt, first token | decode at 8k | peak memory |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| RTX 5090 (32 GB) | Vulkan | `q8_2f` | 150 | 1.2 s | 102 | 7.2 s | 90 | 3.0–4.3 GB VRAM |
-| RTX 5090 (32 GB) | Vulkan | `q4tp` | 161 | 1.0 s | 108 | 6.2 s | 95 | 1.9–3.2 GB VRAM |
+| RTX 5090 (32 GB) | Vulkan | `q8_2f` | 190 | 1.3 s | 151 | 7.4 s | 109 | 3.0–4.3 GB VRAM |
+| RTX 5090 (32 GB) | Vulkan | `q4tp` | 187 | 1.0 s | 156 | 6.3 s | 124 | 1.9–3.2 GB VRAM |
 | MacBook Air M4 (24 GB) | Metal | `q8_2f` | 26.3 | 5.5 s | 24.0 | 33.7 s | 15.5 | 4.1–5.3 GB RAM |
 | MacBook Air M4 (24 GB) | Metal | `q4tp` | 42.8 | 4.5 s | 35.9 | 31.4 s | 20.9 | 2.5–3.9 GB RAM |
 | MacBook Air M4 (24 GB) | CPU, 10 cores | `q8_2f` | 25.2 | 9.5 s | 25.6 | — | — | 3.1 GB RAM |
@@ -163,8 +163,8 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 ```
 
 Готовые сборки — на [странице релизов](https://github.com/infosave2007/cmf/releases). cortiq 0.8.61
-запускает оба файла; время чтения промпта из таблицы — со следующего релиза: 0.8.61 читает промпт этой
-модели хостовым путём (2 048 токенов примерно за 11 с на RTX 5090). `--no-think` даёт прямой ответ.
+запускает оба файла; скорость из таблицы — с релиза после 0.8.62: в нём промпт этой модели читается
+хостовым путём (2 048 токенов примерно за 11 с на RTX 5090), а генерация на Vulkan примерно на треть медленнее. `--no-think` даёт прямой ответ.
 
 ### Файлы
 
@@ -187,8 +187,8 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 
 | железо | бэкенд | файл | генерация, ток/с | промпт 2k, первый токен | генерация на 2k | промпт 8k, первый токен | генерация на 8k | пик памяти |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| RTX 5090 (32 ГБ) | Vulkan | `q8_2f` | 150 | 1,2 с | 102 | 7,2 с | 90 | 3,0–4,3 ГБ VRAM |
-| RTX 5090 (32 ГБ) | Vulkan | `q4tp` | 161 | 1,0 с | 108 | 6,2 с | 95 | 1,9–3,2 ГБ VRAM |
+| RTX 5090 (32 ГБ) | Vulkan | `q8_2f` | 190 | 1,3 с | 151 | 7,4 с | 109 | 3,0–4,3 ГБ VRAM |
+| RTX 5090 (32 ГБ) | Vulkan | `q4tp` | 187 | 1,0 с | 156 | 6,3 с | 124 | 1,9–3,2 ГБ VRAM |
 | MacBook Air M4 (24 ГБ) | Metal | `q8_2f` | 26,3 | 5,5 с | 24,0 | 33,7 с | 15,5 | 4,1–5,3 ГБ RAM |
 | MacBook Air M4 (24 ГБ) | Metal | `q4tp` | 42,8 | 4,5 с | 35,9 | 31,4 с | 20,9 | 2,5–3,9 ГБ RAM |
 | MacBook Air M4 (24 ГБ) | CPU, 10 ядер | `q8_2f` | 25,2 | 9,5 с | 25,6 | — | — | 3,1 ГБ RAM |
@@ -255,8 +255,8 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 ```
 
 预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。cortiq 0.8.61 可以运行这两个文件；
-表中的提示词耗时需要 0.8.61 之后的版本：0.8.61 用主机路径读取该模型的提示词（RTX 5090 上 2 048 个 token
-约 11 秒）。`--no-think` 直接给出回答。
+表中的速度需要 0.8.62 之后的版本：0.8.62 用主机路径读取该模型的提示词（RTX 5090 上 2 048 个 token
+约 11 秒），Vulkan 上的生成也慢约三分之一。`--no-think` 直接给出回答。
 
 ### 文件
 
@@ -277,8 +277,8 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 
 | 硬件 | 后端 | 文件 | 生成，tok/s | 2k 提示词首 token | 2k 处生成 | 8k 提示词首 token | 8k 处生成 | 内存峰值 |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| RTX 5090（32 GB） | Vulkan | `q8_2f` | 150 | 1.2 s | 102 | 7.2 s | 90 | 3.0–4.3 GB 显存 |
-| RTX 5090（32 GB） | Vulkan | `q4tp` | 161 | 1.0 s | 108 | 6.2 s | 95 | 1.9–3.2 GB 显存 |
+| RTX 5090（32 GB） | Vulkan | `q8_2f` | 190 | 1.3 s | 151 | 7.4 s | 109 | 3.0–4.3 GB 显存 |
+| RTX 5090（32 GB） | Vulkan | `q4tp` | 187 | 1.0 s | 156 | 6.3 s | 124 | 1.9–3.2 GB 显存 |
 | MacBook Air M4（24 GB） | Metal | `q8_2f` | 26.3 | 5.5 s | 24.0 | 33.7 s | 15.5 | 4.1–5.3 GB 内存 |
 | MacBook Air M4（24 GB） | Metal | `q4tp` | 42.8 | 4.5 s | 35.9 | 31.4 s | 20.9 | 2.5–3.9 GB 内存 |
 | MacBook Air M4（24 GB） | CPU，10 核 | `q8_2f` | 25.2 | 9.5 s | 25.6 | — | — | 3.1 GB 内存 |
