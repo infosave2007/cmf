@@ -2679,8 +2679,9 @@ fn dynamic_moe_gpu(
     let mut cold = Vec::new();
     let mut cold_x = Vec::new();
     let (frame_ok, mut cold_cpu) = std::thread::scope(|scope| {
+        // The resident kernels know no tubes: every winner's come below.
         let cpu = (!cold_jobs.is_empty())
-            .then(|| scope.spawn(|| crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)));
+            .then(|| scope.spawn(|| crate::pipeline::moe_cold_experts_cpu_with(&cold_jobs, x, pool, false)));
         let ok = crate::gpu_wgpu::dsv4_moe_frame(
             &model,
             &weights,
@@ -2710,6 +2711,10 @@ fn dynamic_moe_gpu(
         *o += c;
     }
     crate::attention::recycle_buf(&mut cold_cpu);
+    // The experts' hot neurons (`hot-bake --experts`), resident or cold alike.
+    for &e in &picks {
+        crate::pipeline::expert_tubes_add(&m.experts[e], x, mix_weights[e], &mut out, pool);
+    }
     Some((out, picks))
 }
 
@@ -3464,6 +3469,30 @@ fn forward_tokens_device(
                 Err(e) => tracing::warn!("{e}; the attention layers stay exact"),
             }
         }
+        // The experts' hot neurons (`hot-bake --experts`): one q8_2f tube per routed
+        // expert, resident on the card beside the skeleton.
+        let tubes: Vec<Vec<Option<(usize, usize, usize)>>> = layers
+            .iter()
+            .map(|l| {
+                l.moe
+                    .experts
+                    .iter()
+                    .map(|e| match e.segs.as_slice() {
+                        [s] => Some((s.gate.model_idx()?, s.up.model_idx()?, s.down.model_idx()?)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        if layers.iter().any(|l| l.moe.experts.iter().any(|e| e.segs.len() > 1)) {
+            return off(state, "an expert with more than one tube");
+        }
+        if tubes.iter().flatten().any(Option::is_some) {
+            if !dev.set_tubes(&model, &g, &tubes) {
+                return off(state, "expert tubes do not load");
+            }
+            tracing::info!("qwen4 tubes: {} MB of expert tubes resident", dev.tube_bytes() >> 20);
+        }
         let t0 = std::time::Instant::now();
         let Some(bytes) = q4::prewarm(&model, &globals.skeleton_idxs) else {
             return off(state, "skeleton does not fit the VRAM budget");
@@ -4214,7 +4243,8 @@ fn forward_tokens_device(
                 pf.cold_dev += cold_slots[t].len();
                 if !jobs.is_empty() {
                     let tc = std::time::Instant::now();
-                    cold_vec[t] = Some(crate::pipeline::moe_cold_experts_cpu(&jobs, &x2, pool));
+                    // the card adds every winner's tube (`q4t_tube_*`)
+                    cold_vec[t] = Some(crate::pipeline::moe_cold_experts_cpu_with(&jobs, &x2, pool, false));
                     pf.cold_cpu += tc.elapsed();
                 }
                 if check

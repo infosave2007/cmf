@@ -2028,6 +2028,132 @@ fn q4t_o1_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = o1g_gate[t * o1g_p.gs + i];
     o1g_out[t * o1g_p.os + i] = o1g_in[t * o1g_p.n + i] * (1.0 / (1.0 + exp(-g)));
 }
+// ── The routed experts' hot neurons (`hot-bake --experts`): every expert carries a
+// tube of `h` neurons at eight bits (q8_2f: int8 rows, f16 row scales, f16 column
+// scales) whose rows are zero in its own triple. The banks hold the experts' tubes
+// one after another at a fixed segment, gate and up `[h, hidden]`, down `[hidden, h]`.
+// `q4t_tube_gu`: one workgroup per (winner j, token t), eight lanes a row:
+// act[t][j][i] = silu(gate_i·x)·(up_i·x). `q4t_tube_dn`: a lane per (t, d) adds
+// Σ_j w_j Σ_i act[t][j][i]·down[d][i] to the frame's MoE output.
+struct TtP { hidden: u32, h: u32, top_k: u32, experts: u32, xs: u32, cs: u32, gseg: u32, dseg: u32,
+             os: u32, _a: u32, _b: u32, _c: u32, _d: u32, _e: u32, _f: u32, _g: u32 };
+@group(0) @binding(0) var<storage, read>       tt_g   : array<u32>;
+@group(0) @binding(1) var<storage, read>       tt_u   : array<u32>;
+@group(0) @binding(2) var<storage, read>       tt_x   : array<f32>;
+@group(0) @binding(3) var<storage, read>       tt_win : array<u32>;
+@group(0) @binding(4) var<storage, read_write> tt_act : array<f32>;
+@group(0) @binding(5) var<uniform>             tt_p   : TtP;
+var<workgroup> tt_rg: array<f32, 256>;
+var<workgroup> tt_ru: array<f32, 256>;
+fn tt_i8x4(w: u32) -> vec4<f32> {
+    let s = i32(w);
+    return vec4<f32>(f32((s << 24u) >> 24u), f32((s << 16u) >> 24u), f32((s << 8u) >> 24u), f32(s >> 24u));
+}
+// f16 at half index `hi` of the gate bank / the up bank
+fn tt_gh(hi: u32) -> f32 {
+    let v = unpack2x16float(tt_g[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+fn tt_uh(hi: u32) -> f32 {
+    let v = unpack2x16float(tt_u[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+@compute @workgroup_size(256)
+fn q4t_tube_gu(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let t = wid.y;
+    let k = tt_p.top_k;
+    let h = tt_p.h;
+    let hid = tt_p.hidden;
+    let rec = t * tt_p.cs + 2u * k + 2u * j;
+    let e = tt_win[rec];
+    let abase = (t * k + j) * h;
+    let sub = lid & 7u;
+    if (e >= tt_p.experts) {
+        for (var i = lid; i < h; i = i + 256u) { tt_act[abase + i] = 0.0; }
+        return;
+    }
+    let qw = hid >> 2u;
+    let seg = e * tt_p.gseg;            // words
+    let rsh = seg * 2u + ((h * hid) >> 1u); // half index of the row scales
+    let csh = rsh + h;                   // half index of the column scales
+    for (var r0 = 0u; r0 < h; r0 = r0 + 32u) {
+        let row = r0 + (lid >> 3u);
+        var ag = 0.0;
+        var au = 0.0;
+        if (row < h) {
+            let rw = seg + row * qw;
+            var w = sub;
+            loop {
+                if (w >= qw) { break; }
+                let xo = t * tt_p.xs + 4u * w;
+                let xv = vec4<f32>(tt_x[xo], tt_x[xo + 1u], tt_x[xo + 2u], tt_x[xo + 3u]);
+                let cg = vec4<f32>(tt_gh(csh + 4u * w), tt_gh(csh + 4u * w + 1u), tt_gh(csh + 4u * w + 2u), tt_gh(csh + 4u * w + 3u));
+                let cu = vec4<f32>(tt_uh(csh + 4u * w), tt_uh(csh + 4u * w + 1u), tt_uh(csh + 4u * w + 2u), tt_uh(csh + 4u * w + 3u));
+                ag = ag + dot(tt_i8x4(tt_g[rw + w]), xv * cg);
+                au = au + dot(tt_i8x4(tt_u[rw + w]), xv * cu);
+                w = w + 8u;
+            }
+        }
+        tt_rg[lid] = ag;
+        tt_ru[lid] = au;
+        workgroupBarrier();
+        if (sub < 4u) { tt_rg[lid] = tt_rg[lid] + tt_rg[lid + 4u]; tt_ru[lid] = tt_ru[lid] + tt_ru[lid + 4u]; }
+        workgroupBarrier();
+        if (sub < 2u) { tt_rg[lid] = tt_rg[lid] + tt_rg[lid + 2u]; tt_ru[lid] = tt_ru[lid] + tt_ru[lid + 2u]; }
+        workgroupBarrier();
+        if (sub == 0u && row < h) {
+            let g = (tt_rg[lid] + tt_rg[lid + 1u]) * tt_gh(rsh + row);
+            let u = (tt_ru[lid] + tt_ru[lid + 1u]) * tt_uh(rsh + row);
+            tt_act[abase + row] = g / (1.0 + exp(-g)) * u;
+        }
+        workgroupBarrier();
+    }
+}
+
+@group(0) @binding(0) var<storage, read>       td_d   : array<u32>;
+@group(0) @binding(1) var<storage, read>       td_act : array<f32>;
+@group(0) @binding(2) var<storage, read>       td_win : array<u32>;
+@group(0) @binding(3) var<storage, read_write> td_y   : array<f32>;
+@group(0) @binding(4) var<uniform>             td_p   : TtP;
+fn td_h(hi: u32) -> f32 {
+    let v = unpack2x16float(td_d[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+@compute @workgroup_size(256)
+fn q4t_tube_dn(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let t = gid.y;
+    let hid = td_p.hidden;
+    if (d >= hid) { return; }
+    let k = td_p.top_k;
+    let h = td_p.h;
+    let hw = h >> 2u;
+    var acc = 0.0;
+    for (var j = 0u; j < k; j = j + 1u) {
+        let rec = t * td_p.cs + 2u * k + 2u * j;
+        let e = td_win[rec];
+        if (e >= td_p.experts) { continue; }
+        let wj = bitcast<f32>(td_win[rec + 1u]);
+        let seg = e * td_p.dseg;
+        let rsh = seg * 2u + ((hid * h) >> 1u);
+        let csh = rsh + hid;
+        let abase = (t * k + j) * h;
+        var sum = 0.0;
+        for (var w = 0u; w < hw; w = w + 1u) {
+            let q = tt_i8x4(td_d[seg + d * hw + w]);
+            let cs = vec4<f32>(td_h(csh + 4u * w), td_h(csh + 4u * w + 1u), td_h(csh + 4u * w + 2u), td_h(csh + 4u * w + 3u));
+            let a = vec4<f32>(td_act[abase + 4u * w], td_act[abase + 4u * w + 1u], td_act[abase + 4u * w + 2u], td_act[abase + 4u * w + 3u]);
+            sum = sum + dot(q * cs, a);
+        }
+        acc = acc + wj * sum * td_h(rsh + d);
+    }
+    let yo = t * td_p.os + d;
+    td_y[yo] = td_y[yo] + acc;
+}
 "#;
 
 /// Subgroup twins of qwen4 kernels (32-lane subgroups laid out over the
@@ -2724,6 +2850,8 @@ pub(crate) struct Pipes {
     t_attend: wgpu::ComputePipeline,
     t_o1_pack: wgpu::ComputePipeline,
     t_o1_gate: wgpu::ComputePipeline,
+    t_tube_gu: wgpu::ComputePipeline,
+    t_tube_dn: wgpu::ComputePipeline,
     /// HC v3 (`HC3_WGSL`), where the device takes it; None keeps every
     /// hyper-connection mix on the kernels above.
     hc3: Option<Hc3>,
@@ -3075,6 +3203,8 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_attend: pipe("q4t_attend"),
         t_o1_pack: pipe("q4t_o1_pack"),
         t_o1_gate: pipe("q4t_o1_gate"),
+        t_tube_gu: pipe("q4t_tube_gu"),
+        t_tube_dn: pipe("q4t_tube_dn"),
         hc3: build_hc3(c),
         gu4w: build_sg_l(c, &sgm, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
         dn4s: build_sg_l(c, &sgm, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
@@ -3340,6 +3470,20 @@ struct LayerDev {
 /// Tokens one frame can carry (prefill chunks, the verify window).
 pub(crate) const TMAX: usize = 8;
 
+/// One MoE layer's expert tubes on the card (`hot-bake --experts`): the experts' q8_2f
+/// tube tensors one after another at a fixed segment, gate and up `[h, hidden]`, down
+/// `[hidden, h]`; `q4t_tube_gu` / `q4t_tube_dn` read them for the frame's winners.
+pub(crate) struct TubeBank {
+    gate: wgpu::Buffer,
+    up: wgpu::Buffer,
+    down: wgpu::Buffer,
+    /// Neurons a tube holds.
+    h: usize,
+    /// Words per expert in the gate / up banks and in the down bank.
+    gseg: u32,
+    dseg: u32,
+}
+
 /// The attention layers' O(1) far field (`crate::qwen4_o1`): the exact prompt leaves a
 /// query trace, the seal builds a sealed state per layer in `Ctx::o1m`, and later frames
 /// attend through `o1_batch`.
@@ -3434,6 +3578,10 @@ pub(crate) struct Dev {
     pub gated: bool,
     /// The far field of the attention layers, when the file or `CMF_QWEN_O1` asks for one.
     pub(crate) o1: Option<O1Run>,
+    /// The experts' tube banks per layer (None: no tubes in that layer) and the frame's
+    /// tube activations `[TMAX][top_k][h]`.
+    tubes: Vec<Option<TubeBank>>,
+    tube_act: Option<wgpu::Buffer>,
 }
 
 /// Indirect-argument slots per layer row (16 bytes each).
@@ -3451,6 +3599,7 @@ fn step_slot(step: u16) -> usize {
         400..=408 => 40 + (step as usize - 400), // GDN
         500..=513 => 40 + (step as usize - 500), // QSA (never with GDN in one row)
         520..=523 => 70 + (step as usize - 520), // QSA O(1) pack / gate
+        720..=721 => 74 + (step as usize - 720), // the experts' tubes
         600 => 54,                               // attention inject
         700..=713 => 55 + (step as usize - 700), // MoE route / experts / miss
         714 => 58,                               // the route's other kernel
@@ -3524,6 +3673,86 @@ impl Dev {
             ob: storage_buf(c, "qwen4-o1-ob", (geom.scratch_len() * 4) as u64),
         });
         true
+    }
+
+    /// The experts' tubes of every MoE layer on the card: `segs[li][e]` names each expert's
+    /// (gate, up, down) tube tensors (directory indices, q8_2f, every expert of a layer
+    /// the same width). Bytes land resident; false when a layer's tubes disagree, a tensor
+    /// is not q8_2f or the upload fails — the device path then stays off (its kernels
+    /// would compute the zeroed rows and nothing else).
+    pub(crate) fn set_tubes(&mut self, model: &CmfModel, g: &Geom, segs: &[Vec<Option<(usize, usize, usize)>>]) -> bool {
+        let Some(c) = ctx() else { return false };
+        let hidden = g.hidden;
+        let mut banks = Vec::with_capacity(segs.len());
+        let mut hmax = 0usize;
+        let bytes_of = |idx: usize| -> Option<(&[u8], usize, usize)> {
+            let e = model.tensors.get(idx)?;
+            if e.dtype != TensorDtype::Q8_2f || e.shape.len() != 2 {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            let b = model.primary_bytes().get(abs..abs + e.nbytes as usize)?;
+            Some((b, e.shape[0] as usize, e.shape[1] as usize))
+        };
+        for (li, layer) in segs.iter().enumerate() {
+            if layer.is_empty() || layer.iter().all(Option::is_none) {
+                banks.push(None);
+                continue;
+            }
+            let Some((gi, _, di)) = layer[0] else {
+                tracing::warn!("qwen4 tubes: layer {li}: expert 0 has no tube while others do");
+                return false;
+            };
+            let (Some((_, h, cols)), Some((_, drows, dcols))) = (bytes_of(gi), bytes_of(di)) else {
+                tracing::warn!("qwen4 tubes: layer {li}: a tube tensor is not a 2-D q8_2f tensor");
+                return false;
+            };
+            if cols != hidden || drows != hidden || dcols != h || h % 4 != 0 || h == 0 || hidden % 4 != 0 {
+                tracing::warn!("qwen4 tubes: layer {li}: tube [{h}, {cols}] / down [{drows}, {dcols}] against hidden {hidden}");
+                return false;
+            }
+            let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap_or(0).div_ceil(16) * 16;
+            let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap_or(0).div_ceil(16) * 16;
+            let n = layer.len();
+            let (mut gb, mut ub, mut db) = (vec![0u8; n * seg_g], vec![0u8; n * seg_g], vec![0u8; n * seg_d]);
+            for (e, t) in layer.iter().enumerate() {
+                let Some((gi, ui, di)) = t else {
+                    tracing::warn!("qwen4 tubes: layer {li}: expert {e} has no tube");
+                    return false;
+                };
+                for (idx, dst, seg, rows, cols) in [(*gi, &mut gb, seg_g, h, hidden), (*ui, &mut ub, seg_g, h, hidden), (*di, &mut db, seg_d, hidden, h)] {
+                    let Some((b, r, cc)) = bytes_of(idx) else {
+                        tracing::warn!("qwen4 tubes: layer {li}: expert {e}'s tube tensor is not q8_2f");
+                        return false;
+                    };
+                    if r != rows || cc != cols || b.len() > seg {
+                        tracing::warn!("qwen4 tubes: layer {li}: expert {e}'s tube is [{r}, {cc}], the layer's [{rows}, {cols}]");
+                        return false;
+                    }
+                    dst[e * seg..e * seg + b.len()].copy_from_slice(b);
+                }
+            }
+            let up = |label: &str, data: &[u8]| -> wgpu::Buffer {
+                let b = storage_buf(c, label, data.len() as u64);
+                c.queue.write_buffer(&b, 0, data);
+                b
+            };
+            c.resident.fetch_add((gb.len() + ub.len() + db.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            banks.push(Some(TubeBank { gate: up("qwen4-tube-g", &gb), up: up("qwen4-tube-u", &ub), down: up("qwen4-tube-d", &db), h, gseg: (seg_g / 4) as u32, dseg: (seg_d / 4) as u32 }));
+            hmax = hmax.max(h);
+        }
+        if hmax == 0 {
+            return true;
+        }
+        self.tube_act = Some(storage_buf(c, "qwen4-tube-act", (TMAX * g.top_k * hmax * 4) as u64));
+        self.tubes = banks;
+        c.queue.submit(std::iter::empty());
+        true
+    }
+
+    /// Tube bytes resident on the card.
+    pub(crate) fn tube_bytes(&self) -> u64 {
+        self.tubes.iter().flatten().map(|b| b.gate.size() + b.up.size() + b.down.size()).sum()
     }
 
     /// The model's id, the key of its far states in `Ctx::o1m`.
@@ -3949,6 +4178,8 @@ impl Dev {
             r_last: storage_buf(c, "qwen4-r-last", (g.hc * g.hidden * 4) as u64),
             gated: false,
             o1: None,
+            tubes: Vec::new(),
+            tube_act: None,
         })
     }
 
@@ -7310,6 +7541,38 @@ pub(crate) fn encode_layer(
             bc.launch(&mut pass, 706, (hidden as u32, nt as u32, 1));
         }
     }
+    // the winners' hot neurons: their tubes against the MoE input, into the output
+    if let (Some(tb), Some(act)) = (d.tubes.get(li).and_then(Option::as_ref), d.tube_act.as_ref()) {
+        if !skip("experts") {
+            let (hidden32, h32, k32, e32) = (hidden as u32, tb.h as u32, g.top_k as u32, g.n_experts as u32);
+            let tu = uniform_u32x16(
+                c,
+                [hidden32, h32, k32, e32, hs, es(4 * g.top_k * 4), tb.gseg, tb.dseg, es(hidden * 4), 0, 0, 0, 0, 0, 0, 0],
+            );
+            let (tg, tup, tdn, act2, tu2) = (tb.gate.clone(), tb.up.clone(), tb.down.clone(), act.clone(), tu.clone());
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_gu,
+                bc,
+                720,
+                "qwen4t-tube-gu",
+                || vec![tg, tup, x2.clone(), cold.clone(), act2, tu],
+                (g.top_k as u32, nt as u32, 1),
+            );
+            let act3 = act.clone();
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_dn,
+                bc,
+                721,
+                "qwen4t-tube-dn",
+                || vec![tdn, act3, cold.clone(), mo.clone(), tu2],
+                ((hidden as u32).div_ceil(256), nt as u32, 1),
+            );
+        }
+    }
     // a cold winner here gates every later frame of the chain off
     if d.gated {
         let bind = bc.get(709, || {
@@ -8903,6 +9166,8 @@ mod shader_tests {
             "q4t_attend",
             "q4t_o1_pack",
             "q4t_o1_gate",
+            "q4t_tube_gu",
+            "q4t_tube_dn",
         ] {
             assert!(
                 module.entry_points.iter().any(|e| e.name == ep),
@@ -9139,6 +9404,113 @@ mod hc3_device_tests {
         let other: Vec<usize> = (0..qcap).filter(|rr| !(pos0..pos0 + nt).any(|pos| pos % stride == 0 && pos / stride == *rr)).collect();
         for rr in other {
             assert!(gqt[rr * nq..(rr + 1) * nq].iter().all(|&x| x == 0.0), "trace row {rr} written");
+        }
+    }
+
+    /// The experts' tube kernels against the host: random q8_2f tubes of six experts,
+    /// two tokens with four winners each (one rank empty), the MoE output accumulated.
+    #[test]
+    fn tube_kernels_match_host() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        let (hidden, h, k, ne, nt) = (256usize, 32usize, 4usize, 6usize, 2usize);
+        let mut r = Rnd(0x7B3E_0002);
+        let fill = |r: &mut Rnd, n: usize| -> Vec<f32> { (0..n).map(|_| r.n() * 0.2).collect() };
+        // the experts' tubes, float and encoded
+        let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap().div_ceil(16) * 16;
+        let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap().div_ceil(16) * 16;
+        let (mut gb, mut ub, mut db) = (vec![0u8; ne * seg_g], vec![0u8; ne * seg_g], vec![0u8; ne * seg_d]);
+        let (mut gf, mut uf, mut df) = (Vec::new(), Vec::new(), Vec::new());
+        for e in 0..ne {
+            for (dst, seg, rows, cols, keep) in [(&mut gb, seg_g, h, hidden, &mut gf), (&mut ub, seg_g, h, hidden, &mut uf), (&mut db, seg_d, hidden, h, &mut df)] {
+                let vals = fill(&mut r, rows * cols);
+                let enc = cortiq_core::quant::encode_q8_2f(&vals, rows, cols);
+                let mut deq = vec![0f32; rows * cols];
+                cortiq_core::quant::dequant_q8_2f(&enc, rows, cols, &mut deq);
+                dst[e * seg..e * seg + enc.len()].copy_from_slice(&enc);
+                keep.push(deq);
+            }
+        }
+        let xs = es(hidden * 4) as usize;
+        let cs = es(4 * k * 4) as usize;
+        let x = fill(&mut r, nt * xs);
+        let mo0 = fill(&mut r, nt * xs);
+        // winners: (expert, weight) pairs in the cold list's second block
+        let picks: [[(u32, f32); 4]; 2] = [[(3, 0.4), (0, 0.3), (5, 0.2), (1, 0.1)], [(2, 0.5), (4, 0.5), (u32::MAX, 0.0), (u32::MAX, 0.0)]];
+        let mut win = vec![0u32; nt * cs];
+        for t in 0..nt {
+            for j in 0..k {
+                let (e, w) = picks[t][j];
+                win[t * cs + 2 * k + 2 * j] = e;
+                win[t * cs + 2 * k + 2 * j + 1] = w.to_bits();
+            }
+        }
+        let up_f = |label: &str, data: &[f32]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, (data.len() * 4) as u64);
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+            b
+        };
+        let up_b = |label: &str, data: &[u8]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, data.len() as u64);
+            c.queue.write_buffer(&b, 0, data);
+            b
+        };
+        let (bg_, bu_, bd_) = (up_b("t-tg", &gb), up_b("t-tu", &ub), up_b("t-td", &db));
+        let xb = up_f("t-x", &x);
+        let mob = up_f("t-mo", &mo0);
+        let winb = up_b("t-win", bytemuck::cast_slice(&win));
+        let act = storage_buf(c, "t-act", (nt * k * h * 4) as u64);
+        let u = uniform_u32x16(c, [hidden as u32, h as u32, k as u32, ne as u32, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, 0, 0, 0, 0, 0, 0, 0]);
+        let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
+            let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
+        };
+        let bg1 = bind(&p.t_tube_gu, &[&bg_, &bu_, &xb, &winb, &act, &u]);
+        let bg2 = bind(&p.t_tube_dn, &[&bd_, &act, &winb, &mob, &u]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-tube") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&p.t_tube_gu);
+            pass.set_bind_group(0, &bg1, &[]);
+            pass.dispatch_workgroups(k as u32, nt as u32, 1);
+            pass.set_pipeline(&p.t_tube_dn);
+            pass.set_bind_group(0, &bg2, &[]);
+            pass.dispatch_workgroups((hidden as u32).div_ceil(256), nt as u32, 1);
+        }
+        submit(c, enc.finish());
+        let got_act = train_ops::download(c, &act, nt * k * h).unwrap();
+        let got_mo = train_ops::download(c, &mob, nt * xs).unwrap();
+        for t in 0..nt {
+            let xv = &x[t * xs..t * xs + hidden];
+            let mut want = mo0[t * xs..t * xs + hidden].to_vec();
+            for j in 0..k {
+                let (e, w) = picks[t][j];
+                if e == u32::MAX {
+                    assert!(got_act[(t * k + j) * h..(t * k + j + 1) * h].iter().all(|&a| a == 0.0), "empty rank {j} of token {t}");
+                    continue;
+                }
+                let e = e as usize;
+                for i in 0..h {
+                    let g: f32 = (0..hidden).map(|d| gf[e][i * hidden + d] * xv[d]).sum();
+                    let uu: f32 = (0..hidden).map(|d| uf[e][i * hidden + d] * xv[d]).sum();
+                    let a = g / (1.0 + (-g).exp()) * uu;
+                    let got = got_act[(t * k + j) * h + i];
+                    assert!((got - a).abs() <= 1e-4 * a.abs().max(1.0), "act t{t} j{j} i{i}: {got} vs {a}");
+                    for d in 0..hidden {
+                        want[d] += w * a * df[e][d * h + i];
+                    }
+                }
+            }
+            for d in 0..hidden {
+                let got = got_mo[t * xs + d];
+                assert!((got - want[d]).abs() <= 2e-4 * want[d].abs().max(1.0), "out t{t} d{d}: {got} vs {}", want[d]);
+            }
         }
     }
 

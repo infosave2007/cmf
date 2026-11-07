@@ -22676,6 +22676,36 @@ thread_local! {
         const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
 }
 
+/// An expert's tubes (`mlp.experts.{e}.*_proj.tube1.weight`: its hot neurons at eight
+/// bits, their rows zero in the expert's own triple) added to `out` with the expert's
+/// routing weight. The MoE paths compute the triple themselves; this is the rest.
+pub(crate) fn expert_tubes_add(d: &DenseFfn, x: &[f32], weight: f32, out: &mut [f32], pool: Option<&Pool>) {
+    if d.segs.is_empty() {
+        return;
+    }
+    TUBE_SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let [g, u, acc] = &mut *sc;
+        for seg in &d.segs {
+            let w = seg.width;
+            g.resize(w, 0.0);
+            if !(d.act == Act::Silu && QTensor::matvec_silu_mul(&seg.gate, &seg.up, x, g, pool)) {
+                u.resize(w, 0.0);
+                QTensor::matvec_many([&seg.gate, &seg.up], x, [g, u], pool);
+                for i in 0..w {
+                    g[i] = d.act.combine(g[i], u[i]);
+                }
+            }
+            acc.resize(out.len(), 0.0);
+            acc.fill(0.0);
+            seg.down.matvec(g, acc, pool);
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
+                *o += weight * *a;
+            }
+        }
+    });
+}
+
 /// CMF_PREFILL_PROF: cumulative ns of the batched walk's attention and
 /// FFN halves (all layers, all chunks).
 static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] = [
@@ -25430,6 +25460,17 @@ pub(crate) fn moe_cold_experts_cpu(
     x: &[f32],
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    moe_cold_experts_cpu_with(experts, x, pool, true)
+}
+
+/// [`moe_cold_experts_cpu`] with the experts' tubes (`expert_tubes_add`) optional: the
+/// Flash-Next device path computes every winner's tube on the card.
+pub(crate) fn moe_cold_experts_cpu_with(
+    experts: &[(&DenseFfn, f32)],
+    x: &[f32],
+    pool: Option<&Pool>,
+    tubes: bool,
+) -> Vec<f32> {
     let mut out = attention::take_buf(x.len());
     if experts.is_empty() {
         return out;
@@ -25456,10 +25497,18 @@ pub(crate) fn moe_cold_experts_cpu(
         && QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
         && QTensor::moe_down_many(&downs, &activations, &weights, &mut out, pool)
     {
+        if tubes {
+            for &(expert, weight) in experts {
+                expert_tubes_add(expert, x, weight, &mut out, pool);
+            }
+        }
         return out;
     }
     out.fill(0.0);
     for &(expert, weight) in experts {
+        if tubes {
+            expert_tubes_add(expert, x, weight, &mut out, pool);
+        }
         let mut one = dense_ffn(expert, x, pool);
         for (o, v) in out.iter_mut().zip(&one) {
             *o += weight * v;
@@ -25548,7 +25597,11 @@ fn moe_ffn_cpu(
     wsum: f32,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
-    if let Some(out) = moe_ffn_cpu_batched(m, x, idx, p, wsum, pool) {
+    if let Some(mut out) = moe_ffn_cpu_batched(m, x, idx, p, wsum, pool) {
+        for &e in idx {
+            let w = p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
+            expert_tubes_add(&m.experts[e], x, w, &mut out, pool);
+        }
         return out;
     }
     let mut out = attention::take_buf(x.len());
@@ -25559,6 +25612,7 @@ fn moe_ffn_cpu(
             out[i] += w * eo[i];
         }
         attention::recycle_buf(&mut eo);
+        expert_tubes_add(&m.experts[e], x, w, &mut out, pool);
     }
     if let Some((se, gate)) = &m.shared {
         let mut so = dense_ffn(se, x, pool);
