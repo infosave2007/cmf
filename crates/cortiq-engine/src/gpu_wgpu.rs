@@ -21246,7 +21246,9 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
 /// Streaming multiprocessors of an NVIDIA card on Vulkan, from
 /// `VK_NV_shader_sm_builtins` (`shaderSMCount`). None on other vendors,
 /// backends and platforms. The narrow-matvec grid cap scales with it.
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+/// Linux only: the query needs `ash`, which the engine builds there alone
+/// (Windows and Android keep the default grid cap).
+#[cfg(target_os = "linux")]
 fn vulkan_sm_count(adapter: &wgpu::Adapter) -> Option<u32> {
     use ash::vk;
     if adapter.get_info().backend != wgpu::Backend::Vulkan {
@@ -21268,7 +21270,7 @@ fn vulkan_sm_count(adapter: &wgpu::Adapter) -> Option<u32> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+#[cfg(not(target_os = "linux"))]
 fn vulkan_sm_count(_adapter: &wgpu::Adapter) -> Option<u32> {
     None
 }

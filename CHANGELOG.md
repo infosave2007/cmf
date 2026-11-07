@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.61] — 2026-11-07
+
+### Fixed
+- The 0.8.60 binaries for Windows and Android did not build: the Vulkan SM-count query added in 0.8.60 (the grid cap
+  of the NVIDIA decode kernels) imported `ash`, which the engine depends on under Linux alone. The query is now Linux
+  only; Windows and Android keep the default grid cap. The crates of 0.8.60 are unaffected.
+
 ## [0.8.60] — 2026-11-07
 
 ### Added
