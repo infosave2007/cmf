@@ -9541,30 +9541,42 @@ mod hc3_device_tests {
             eprintln!("qwen4 kernels unavailable on this adapter: skipped");
             return;
         };
-        let (hidden, h, k, ne, nt) = (256usize, 32usize, 4usize, 6usize, 2usize);
+        // Six experts, one of them (4) without a tube; h = 64 so the gate/up kernel runs
+        // two row blocks; a shared expert's tube with its own bank.
+        let (hidden, h, k, ne, nt) = (256usize, 64usize, 4usize, 6usize, 2usize);
+        let slots = k + 1;
+        let notube = 4usize;
         let mut r = Rnd(0x7B3E_0002);
         let fill = |r: &mut Rnd, n: usize| -> Vec<f32> { (0..n).map(|_| r.n() * 0.2).collect() };
-        // the experts' tubes, float and encoded
         let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap().div_ceil(16) * 16;
         let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap().div_ceil(16) * 16;
-        let (mut gb, mut ub, mut db) = (vec![0u8; ne * seg_g], vec![0u8; ne * seg_g], vec![0u8; ne * seg_d]);
-        let (mut gf, mut uf, mut df) = (Vec::new(), Vec::new(), Vec::new());
-        for e in 0..ne {
-            for (dst, seg, rows, cols, keep) in [(&mut gb, seg_g, h, hidden, &mut gf), (&mut ub, seg_g, h, hidden, &mut uf), (&mut db, seg_d, hidden, h, &mut df)] {
-                let vals = fill(&mut r, rows * cols);
-                let enc = cortiq_core::quant::encode_q8_2f(&vals, rows, cols);
-                let mut deq = vec![0f32; rows * cols];
-                cortiq_core::quant::dequant_q8_2f(&enc, rows, cols, &mut deq);
-                dst[e * seg..e * seg + enc.len()].copy_from_slice(&enc);
-                keep.push(deq);
+        // a bank of `n` tubes, float and encoded
+        let mut bank = |r: &mut Rnd, n: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            let (mut gb, mut ub, mut db) = (vec![0u8; n * seg_g], vec![0u8; n * seg_g], vec![0u8; n * seg_d]);
+            let (mut gf, mut uf, mut df) = (Vec::new(), Vec::new(), Vec::new());
+            for e in 0..n {
+                for (dst, seg, rows, cols, keep) in [(&mut gb, seg_g, h, hidden, &mut gf), (&mut ub, seg_g, h, hidden, &mut uf), (&mut db, seg_d, hidden, h, &mut df)] {
+                    let vals = fill(r, rows * cols);
+                    let enc = cortiq_core::quant::encode_q8_2f(&vals, rows, cols);
+                    let mut deq = vec![0f32; rows * cols];
+                    cortiq_core::quant::dequant_q8_2f(&enc, rows, cols, &mut deq);
+                    dst[e * seg..e * seg + enc.len()].copy_from_slice(&enc);
+                    keep.push(deq);
+                }
             }
-        }
+            (gb, ub, db, gf, uf, df)
+        };
+        let (gb, ub, db, gf, uf, df) = bank(&mut r, ne - 1);
+        let (sgb, sub, sdb, sgf, suf, sdf) = bank(&mut r, 1);
+        // expert e's entry in the packed bank
+        let slot: Vec<u32> = (0..ne).map(|e| if e == notube { u32::MAX } else if e < notube { e as u32 } else { e as u32 - 1 }).collect();
         let xs = es(hidden * 4) as usize;
         let cs = es(4 * k * 4) as usize;
         let x = fill(&mut r, nt * xs);
         let mo0 = fill(&mut r, nt * xs);
-        // winners: (expert, weight) pairs in the cold list's second block
-        let picks: [[(u32, f32); 4]; 2] = [[(3, 0.4), (0, 0.3), (5, 0.2), (1, 0.1)], [(2, 0.5), (4, 0.5), (u32::MAX, 0.0), (u32::MAX, 0.0)]];
+        // winners: (expert, weight) pairs in the cold list's second block; token 1 picks the
+        // expert without a tube
+        let picks: [[(u32, f32); 4]; 2] = [[(3, 0.4), (0, 0.3), (5, 0.2), (1, 0.1)], [(2, 0.5), (4, 0.3), (u32::MAX, 0.0), (u32::MAX, 0.0)]];
         let mut win = vec![0u32; nt * cs];
         for t in 0..nt {
             for j in 0..k {
@@ -9572,6 +9584,12 @@ mod hc3_device_tests {
                 win[t * cs + 2 * k + 2 * j] = e;
                 win[t * cs + 2 * k + 2 * j + 1] = w.to_bits();
             }
+        }
+        // the route's weight table: the shared expert's σ at column k
+        let sigma = [0.7f32, 0.35];
+        let mut mwt = vec![0f32; nt * slots];
+        for t in 0..nt {
+            mwt[t * slots + k] = sigma[t];
         }
         let up_f = |label: &str, data: &[f32]| -> wgpu::Buffer {
             let b = storage_buf(c, label, (data.len() * 4) as u64);
@@ -9584,49 +9602,76 @@ mod hc3_device_tests {
             b
         };
         let (bg_, bu_, bd_) = (up_b("t-tg", &gb), up_b("t-tu", &ub), up_b("t-td", &db));
+        let (sg_, su_, sd_) = (up_b("t-sg", &sgb), up_b("t-su", &sub), up_b("t-sd", &sdb));
+        let slotb = up_b("t-slot", bytemuck::cast_slice(&slot));
+        let sslotb = up_b("t-sslot", bytemuck::cast_slice(&[0u32]));
         let xb = up_f("t-x", &x);
         let mob = up_f("t-mo", &mo0);
+        let mwtb = up_f("t-mwt", &mwt);
         let winb = up_b("t-win", bytemuck::cast_slice(&win));
         let act = storage_buf(c, "t-act", (nt * k * h * 4) as u64);
-        let u = uniform_u32x16(c, [hidden as u32, h as u32, k as u32, ne as u32, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, 0, 0, 0, 0, 0, 0, 0]);
+        let sact = storage_buf(c, "t-sact", (nt * h * 4) as u64);
+        let (hid32, h32, k32) = (hidden as u32, h as u32, k as u32);
+        let u = uniform_u32x16(c, [hid32, h32, k32, ne as u32, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, k32, slots as u32, 0, 0, 0, 0, 0]);
+        let su = uniform_u32x16(c, [hid32, h32, 0, 1, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, 1, slots as u32, k32, 1, 0, 0, 0]);
         let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
             let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
             c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
         };
-        let bg1 = bind(&p.t_tube_gu, &[&bg_, &bu_, &xb, &winb, &act, &u]);
-        let bg2 = bind(&p.t_tube_dn, &[&bd_, &act, &winb, &mob, &u]);
+        let bg1 = bind(&p.t_tube_gu, &[&bg_, &bu_, &xb, &winb, &act, &u, &slotb]);
+        let bg2 = bind(&p.t_tube_dn, &[&bd_, &act, &winb, &mob, &u, &mwtb, &slotb]);
+        let bg3 = bind(&p.t_tube_gu, &[&sg_, &su_, &xb, &winb, &sact, &su, &sslotb]);
+        let bg4 = bind(&p.t_tube_dn, &[&sd_, &sact, &winb, &mob, &su, &mwtb, &sslotb]);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-tube") });
         {
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(&p.t_tube_gu);
             pass.set_bind_group(0, &bg1, &[]);
-            pass.dispatch_workgroups(k as u32, nt as u32, 1);
+            pass.dispatch_workgroups(k as u32, nt as u32, (h as u32).div_ceil(32));
             pass.set_pipeline(&p.t_tube_dn);
             pass.set_bind_group(0, &bg2, &[]);
+            pass.dispatch_workgroups((hidden as u32).div_ceil(256), nt as u32, 1);
+            pass.set_pipeline(&p.t_tube_gu);
+            pass.set_bind_group(0, &bg3, &[]);
+            pass.dispatch_workgroups(1, nt as u32, (h as u32).div_ceil(32));
+            pass.set_pipeline(&p.t_tube_dn);
+            pass.set_bind_group(0, &bg4, &[]);
             pass.dispatch_workgroups((hidden as u32).div_ceil(256), nt as u32, 1);
         }
         submit(c, enc.finish());
         let got_act = train_ops::download(c, &act, nt * k * h).unwrap();
+        let got_sact = train_ops::download(c, &sact, nt * h).unwrap();
         let got_mo = train_ops::download(c, &mob, nt * xs).unwrap();
+        let tube = |gf: &[f32], uf: &[f32], xv: &[f32], i: usize| -> f32 {
+            let g: f32 = (0..hidden).map(|d| gf[i * hidden + d] * xv[d]).sum();
+            let uu: f32 = (0..hidden).map(|d| uf[i * hidden + d] * xv[d]).sum();
+            g / (1.0 + (-g).exp()) * uu
+        };
         for t in 0..nt {
             let xv = &x[t * xs..t * xs + hidden];
             let mut want = mo0[t * xs..t * xs + hidden].to_vec();
             for j in 0..k {
                 let (e, w) = picks[t][j];
-                if e == u32::MAX {
-                    assert!(got_act[(t * k + j) * h..(t * k + j + 1) * h].iter().all(|&a| a == 0.0), "empty rank {j} of token {t}");
+                if e == u32::MAX || e as usize == notube {
+                    assert!(got_act[(t * k + j) * h..(t * k + j + 1) * h].iter().all(|&a| a == 0.0), "rank {j} of token {t} should be empty");
                     continue;
                 }
-                let e = e as usize;
+                let s = slot[e as usize] as usize;
                 for i in 0..h {
-                    let g: f32 = (0..hidden).map(|d| gf[e][i * hidden + d] * xv[d]).sum();
-                    let uu: f32 = (0..hidden).map(|d| uf[e][i * hidden + d] * xv[d]).sum();
-                    let a = g / (1.0 + (-g).exp()) * uu;
+                    let a = tube(&gf[s], &uf[s], xv, i);
                     let got = got_act[(t * k + j) * h + i];
                     assert!((got - a).abs() <= 1e-4 * a.abs().max(1.0), "act t{t} j{j} i{i}: {got} vs {a}");
                     for d in 0..hidden {
-                        want[d] += w * a * df[e][d * h + i];
+                        want[d] += w * a * df[s][d * h + i];
                     }
+                }
+            }
+            for i in 0..h {
+                let a = tube(&sgf[0], &suf[0], xv, i);
+                let got = got_sact[t * h + i];
+                assert!((got - a).abs() <= 1e-4 * a.abs().max(1.0), "shared act t{t} i{i}: {got} vs {a}");
+                for d in 0..hidden {
+                    want[d] += sigma[t] * a * sdf[0][d * h + i];
                 }
             }
             for d in 0..hidden {
