@@ -12122,6 +12122,44 @@ impl Pipeline {
         result.map(|()| probe)
     }
 
+    /// The hot-neuron statistic of a MoE model's routed experts over `ids`:
+    /// per layer `[expert · inter + neuron]` of Σ (w·act)², `w` the expert's
+    /// final routing weight (a layer without experts gives an empty row).
+    /// Qwen-3.5/3.8 MoE models only, on the host path: the caller runs with
+    /// `CMF_GPU=0`, since the device frames and the fused expert kernels do
+    /// not report activations.
+    pub fn probe_moe_mass(&mut self, ids: &[u32]) -> Result<Vec<Vec<f64>>, String> {
+        let Some(b) = self.qwen4_exp.as_mut() else {
+            return Err("hot-probe --experts: not a Qwen MoE model (the probe reads the qwen4 host path)".into());
+        };
+        let geom: Vec<(usize, usize)> = b.1.iter().map(crate::qwen4_exp::Layer::expert_geometry).collect();
+        let inter = geom.iter().map(|g| g.1).max().unwrap_or(0);
+        if inter == 0 || ids.is_empty() {
+            return Err("hot-probe --experts: the model has no routed experts".into());
+        }
+        MOE_PROBE.with(|p| {
+            *p.borrow_mut() = Some(MoeProbe {
+                acc: geom.iter().map(|&(ne, _)| vec![0f64; ne * inter]).collect(),
+                inter,
+                cur: None,
+            });
+        });
+        b.3.reset();
+        let mut pos = 0usize;
+        while pos < ids.len() {
+            let end = (pos + crate::qwen4_exp::prefill_chunk()).min(ids.len());
+            let mut lg = Vec::new();
+            crate::qwen4_exp::forward_tokens(&b.0, &b.1, &b.2, &mut b.3, &ids[pos..end], pos, &self.inv_freq, self.pool.as_deref(), &mut lg, false);
+            pos = end;
+        }
+        b.3.reset();
+        let probe = MOE_PROBE.with(|p| p.borrow_mut().take()).map_or_else(Vec::new, |p| p.acc);
+        if !probe.iter().any(|r| r.iter().any(|&v| v > 0.0)) {
+            return Err("hot-probe --experts: the statistic is all zero (a device path hid the experts from the probe; run with CMF_GPU=0)".into());
+        }
+        Ok(probe)
+    }
+
     /// Teacher-forced PPL with a task mask active (sparse execution) —
     /// the quality gate for a DTG-MA-masked skill. Sequential per
     /// position: the batched prefill path is dense-only.
@@ -22698,6 +22736,56 @@ thread_local! {
         const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
 }
 
+/// An expert's tubes (`mlp.experts.{e}.*_proj.tube1.weight`: its hot neurons at eight
+/// bits, their rows zero in the expert's own triple) added to `out` with the expert's
+/// routing weight. The MoE paths compute the triple themselves; this is the rest.
+pub(crate) fn expert_tubes_add(d: &DenseFfn, x: &[f32], weight: f32, out: &mut [f32], pool: Option<&Pool>) {
+    if d.segs.is_empty() {
+        return;
+    }
+    TUBE_SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let [g, u, acc] = &mut *sc;
+        for seg in &d.segs {
+            let w = seg.width;
+            g.resize(w, 0.0);
+            if !(d.act == Act::Silu && QTensor::matvec_silu_mul(&seg.gate, &seg.up, x, g, pool)) {
+                u.resize(w, 0.0);
+                QTensor::matvec_many([&seg.gate, &seg.up], x, [g, u], pool);
+                for i in 0..w {
+                    g[i] = d.act.combine(g[i], u[i]);
+                }
+            }
+            acc.resize(out.len(), 0.0);
+            acc.fill(0.0);
+            seg.down.matvec(g, acc, pool);
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
+                *o += weight * *a;
+            }
+        }
+    });
+}
+
+/// The shared expert's weight on one token: σ of its gate, or 1 without one.
+pub(crate) fn shared_expert_weight(gate: Option<&QTensor>, x: &[f32], pool: Option<&Pool>) -> f32 {
+    gate.map_or(1.0, |gate| {
+        let mut gl = [0.0f32; 1];
+        gate.matvec(x, &mut gl, pool);
+        1.0 / (1.0 + (-gl[0]).exp())
+    })
+}
+
+/// The shared expert's tubes (`mlp.shared_expert.*_proj.tube1.weight`, `hot-bake
+/// --shared-q8`: the whole expert at eight bits) added to `out` with its weight.
+pub(crate) fn shared_tubes_add(m: &MoeFfn, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
+    if let Some((se, gate)) = &m.shared
+        && !se.segs.is_empty()
+    {
+        let g = shared_expert_weight(gate.as_ref(), x, pool);
+        expert_tubes_add(se, x, g, out, pool);
+    }
+}
+
 /// CMF_PREFILL_PROF: cumulative ns of the batched walk's attention and
 /// FFN halves (all layers, all chunks).
 static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] = [
@@ -23472,6 +23560,22 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
                 }
             }
         });
+        MOE_PROBE.with(|pr| {
+            if let Some(pr) = pr.borrow_mut().as_mut()
+                && let Some((e, w)) = pr.cur
+            {
+                let li = crate::gpu::cur_layer();
+                if li >= 0
+                    && let Some(row) = pr.acc.get_mut(li as usize)
+                    && let Some(cell) = row.get_mut(e * pr.inter..(e + 1) * pr.inter)
+                {
+                    for (a, &v) in cell.iter_mut().zip(g.iter()) {
+                        let s = (w * v) as f64;
+                        *a += s * s;
+                    }
+                }
+            }
+        });
         if oracle_topk() > 0 {
             keep_top_k(g, oracle_topk());
         }
@@ -24040,6 +24144,27 @@ thread_local! {
     /// accumulator, alive only during `Pipeline::probe_ffn_mass`.
     static FFN_PROBE: std::cell::RefCell<Option<Vec<Vec<f64>>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Hot-neuron probe of a MoE layer's routed experts (`cortiq hot-probe --experts`):
+/// per layer, per expert and neuron, Σ (w·act)² over the tokens the router sent
+/// there, `w` the expert's final weight — what the neuron's down column sees.
+pub(crate) struct MoeProbe {
+    /// `[layer][expert · inter + neuron]`; a layer without experts keeps an empty row.
+    acc: Vec<Vec<f64>>,
+    inter: usize,
+    /// The routed expert `dense_ffn` is running for, and its weight; `None`
+    /// outside the routed loop (the shared expert is not probed).
+    cur: Option<(usize, f32)>,
+}
+
+thread_local! {
+    /// Alive only during `Pipeline::probe_moe_mass`.
+    static MOE_PROBE: std::cell::RefCell<Option<MoeProbe>> = const { std::cell::RefCell::new(None) };
+}
+
+fn moe_probe_active() -> bool {
+    MOE_PROBE.with(|p| p.borrow().is_some())
 }
 
 /// Per-token structured sparsity, paid for in bytes.
@@ -25390,7 +25515,7 @@ fn moe_ffn_cpu_batched(
     // The bake probe reads per-neuron activation mass out of the
     // single-expert path; batching would skip it. Rare and offline —
     // hand those runs to the serial loop.
-    if FFN_PROBE.with(|pr| pr.borrow().is_some()) {
+    if FFN_PROBE.with(|pr| pr.borrow().is_some()) || moe_probe_active() {
         return None;
     }
     let n = idx.len() + usize::from(m.shared.is_some());
@@ -25452,6 +25577,17 @@ pub(crate) fn moe_cold_experts_cpu(
     x: &[f32],
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    moe_cold_experts_cpu_with(experts, x, pool, true)
+}
+
+/// [`moe_cold_experts_cpu`] with the experts' tubes (`expert_tubes_add`) optional: the
+/// Flash-Next device path computes every winner's tube on the card.
+pub(crate) fn moe_cold_experts_cpu_with(
+    experts: &[(&DenseFfn, f32)],
+    x: &[f32],
+    pool: Option<&Pool>,
+    tubes: bool,
+) -> Vec<f32> {
     let mut out = attention::take_buf(x.len());
     if experts.is_empty() {
         return out;
@@ -25478,10 +25614,18 @@ pub(crate) fn moe_cold_experts_cpu(
         && QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
         && QTensor::moe_down_many(&downs, &activations, &weights, &mut out, pool)
     {
+        if tubes {
+            for &(expert, weight) in experts {
+                expert_tubes_add(expert, x, weight, &mut out, pool);
+            }
+        }
         return out;
     }
     out.fill(0.0);
     for &(expert, weight) in experts {
+        if tubes {
+            expert_tubes_add(expert, x, weight, &mut out, pool);
+        }
         let mut one = dense_ffn(expert, x, pool);
         for (o, v) in out.iter_mut().zip(&one) {
             *o += weight * v;
@@ -25570,17 +25714,33 @@ fn moe_ffn_cpu(
     wsum: f32,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
-    if let Some(out) = moe_ffn_cpu_batched(m, x, idx, p, wsum, pool) {
+    if let Some(mut out) = moe_ffn_cpu_batched(m, x, idx, p, wsum, pool) {
+        for &e in idx {
+            let w = p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
+            expert_tubes_add(&m.experts[e], x, w, &mut out, pool);
+        }
+        shared_tubes_add(m, x, &mut out, pool);
         return out;
     }
     let mut out = attention::take_buf(x.len());
     for &e in idx {
-        let mut eo = dense_ffn(&m.experts[e], x, pool);
         let w = p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
+        MOE_PROBE.with(|pr| {
+            if let Some(pr) = pr.borrow_mut().as_mut() {
+                pr.cur = Some((e, w));
+            }
+        });
+        let mut eo = dense_ffn(&m.experts[e], x, pool);
+        MOE_PROBE.with(|pr| {
+            if let Some(pr) = pr.borrow_mut().as_mut() {
+                pr.cur = None;
+            }
+        });
         for i in 0..out.len() {
             out[i] += w * eo[i];
         }
         attention::recycle_buf(&mut eo);
+        expert_tubes_add(&m.experts[e], x, w, &mut out, pool);
     }
     if let Some((se, gate)) = &m.shared {
         let mut so = dense_ffn(se, x, pool);
@@ -25593,6 +25753,7 @@ fn moe_ffn_cpu(
             out[i] += g * so[i];
         }
         attention::recycle_buf(&mut so);
+        expert_tubes_add(se, x, g, &mut out, pool);
     }
     out
 }
@@ -25761,6 +25922,12 @@ fn moe_ffn_gpu(
     let hidden = jobs[0].down.1;
     let mut out = vec![0.0f32; hidden];
     if crate::gpu::moe_block(&model, &jobs, &mut out) {
+        // The block knows no tubes (`hot-bake --experts`): the winners' and the
+        // shared expert's come here, as the CPU paths add them.
+        for &e in idx {
+            expert_tubes_add(&m.experts[e], x, p[e] / wsum, &mut out, pool);
+        }
+        shared_tubes_add(m, x, &mut out, pool);
         Some(out)
     } else {
         moe_gpu_refused("gpu::moe_block");

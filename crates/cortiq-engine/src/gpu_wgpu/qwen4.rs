@@ -1976,6 +1976,206 @@ fn q4_gu_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+// ── O(1) layers: the frame's rows packed for the engine's far-field kernels
+// (dense `[t][nh·hd]` and `[t][nkv·hd]`), and while the prompt runs exact the
+// query trace the seal reads: one row in `stride` at `pos / stride`.
+struct ToP { nh: u32, nkv: u32, hd: u32, qs: u32, ks: u32, vs: u32, trace: u32, stride: u32,
+             qcap: u32, _a: u32, _b: u32, _c: u32, _d: u32, _e: u32, _f: u32, _g: u32 };
+@group(0) @binding(0) var<storage, read>       o1p_q   : array<f32>;
+@group(0) @binding(1) var<storage, read>       o1p_k   : array<f32>;
+@group(0) @binding(2) var<storage, read>       o1p_v   : array<f32>;
+@group(0) @binding(3) var<storage, read_write> o1p_pq  : array<f32>;
+@group(0) @binding(4) var<storage, read_write> o1p_pk  : array<f32>;
+@group(0) @binding(5) var<storage, read_write> o1p_pv  : array<f32>;
+@group(0) @binding(6) var<storage, read_write> o1p_qt  : array<f32>;
+@group(0) @binding(7) var<storage, read>       o1p_tab : array<vec4<u32>>;
+@group(0) @binding(8) var<uniform>             o1p_p   : ToP;
+@compute @workgroup_size(256)
+fn q4t_o1_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    let nq = o1p_p.nh * o1p_p.hd;
+    let nk = o1p_p.nkv * o1p_p.hd;
+    if (i < nq) {
+        let q = o1p_q[t * o1p_p.qs + i];
+        o1p_pq[t * nq + i] = q;
+        if (o1p_p.trace != 0u) {
+            let pos = o1p_tab[t].x;
+            if (pos % o1p_p.stride == 0u) {
+                let r = pos / o1p_p.stride;
+                if (r < o1p_p.qcap) { o1p_qt[r * nq + i] = q; }
+            }
+        }
+    }
+    if (i < nk) {
+        o1p_pk[t * nk + i] = o1p_k[t * o1p_p.ks + i];
+        o1p_pv[t * nk + i] = o1p_v[t * o1p_p.vs + i];
+    }
+}
+
+// ── O(1) layers: the far-field rows through the sigmoid output gate (as
+// `q4t_attend` applies it), into the frame's strided attention output.
+struct TogP { n: u32, gs: u32, os: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read>       o1g_in   : array<f32>;
+@group(0) @binding(1) var<storage, read>       o1g_gate : array<f32>;
+@group(0) @binding(2) var<storage, read_write> o1g_out  : array<f32>;
+@group(0) @binding(3) var<uniform>             o1g_p    : TogP;
+@compute @workgroup_size(256)
+fn q4t_o1_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    if (i >= o1g_p.n) { return; }
+    let g = o1g_gate[t * o1g_p.gs + i];
+    o1g_out[t * o1g_p.os + i] = o1g_in[t * o1g_p.n + i] * (1.0 / (1.0 + exp(-g)));
+}
+// ── The routed experts' hot neurons (`hot-bake --experts`): every expert carries a
+// tube of `h` neurons at eight bits (q8_2f: int8 rows, f16 row scales, f16 column
+// scales) whose rows are zero in its own triple. The banks hold the experts' tubes
+// one after another at a fixed segment, gate and up `[h, hidden]`, down `[hidden, h]`.
+// `q4t_tube_gu`: one workgroup per (winner j, token t, block of 32 rows), eight lanes a row:
+// act[t][j][i] = silu(gate_i·x)·(up_i·x). `q4t_tube_dn`: a lane per (t, d) adds
+// Σ_j w_j Σ_i act[t][j][i]·down[d][i] to the frame's MoE output.
+// `cols` activation columns a token: the routed winners (`top_k`), or one for the shared
+// expert's tube (`sh` = 1: bank entry 0, weight `tt_w[t·is + wi]`, the route's σ).
+// `tt_slot[e]` is expert e's entry in the bank, 0xFFFFFFFF when it has no tube.
+struct TtP { hidden: u32, h: u32, top_k: u32, experts: u32, xs: u32, cs: u32, gseg: u32, dseg: u32,
+             os: u32, cols: u32, is: u32, wi: u32, sh: u32, _e: u32, _f: u32, _g: u32 };
+@group(0) @binding(0) var<storage, read>       tt_g   : array<u32>;
+@group(0) @binding(1) var<storage, read>       tt_u   : array<u32>;
+@group(0) @binding(2) var<storage, read>       tt_x   : array<f32>;
+@group(0) @binding(3) var<storage, read>       tt_win : array<u32>;
+@group(0) @binding(4) var<storage, read_write> tt_act : array<f32>;
+@group(0) @binding(5) var<uniform>             tt_p   : TtP;
+@group(0) @binding(6) var<storage, read>       tt_slot: array<u32>;
+var<workgroup> tt_rg: array<f32, 256>;
+var<workgroup> tt_ru: array<f32, 256>;
+fn tt_i8x4(w: u32) -> vec4<f32> {
+    let s = i32(w);
+    return vec4<f32>(f32((s << 24u) >> 24u), f32((s << 16u) >> 24u), f32((s << 8u) >> 24u), f32(s >> 24u));
+}
+// f16 at half index `hi` of the gate bank / the up bank
+fn tt_gh(hi: u32) -> f32 {
+    let v = unpack2x16float(tt_g[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+fn tt_uh(hi: u32) -> f32 {
+    let v = unpack2x16float(tt_u[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+@compute @workgroup_size(256)
+fn q4t_tube_gu(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let t = wid.y;
+    let k = tt_p.top_k;
+    let h = tt_p.h;
+    let hid = tt_p.hidden;
+    var e = 0u;
+    if (tt_p.sh == 0u) {
+        let rec = t * tt_p.cs + 2u * k + 2u * j;
+        e = tt_win[rec];
+    }
+    let abase = (t * tt_p.cols + j) * h;
+    let sub = lid & 7u;
+    // Workgroup z owns rows r0..r0+32 (a whole expert's 640 rows are 20 workgroups).
+    let r0 = wid.z * 32u;
+    var slot = 0xFFFFFFFFu;
+    if (e < tt_p.experts) { slot = tt_slot[e]; }
+    if (slot == 0xFFFFFFFFu) {
+        let i = r0 + lid;
+        if (lid < 32u && i < h) { tt_act[abase + i] = 0.0; }
+        return;
+    }
+    let qw = hid >> 2u;
+    let seg = slot * tt_p.gseg;         // words
+    let rsh = seg * 2u + ((h * hid) >> 1u); // half index of the row scales
+    let csh = rsh + h;                   // half index of the column scales
+    {
+        let row = r0 + (lid >> 3u);
+        var ag = 0.0;
+        var au = 0.0;
+        if (row < h) {
+            let rw = seg + row * qw;
+            var w = sub;
+            loop {
+                if (w >= qw) { break; }
+                let xo = t * tt_p.xs + 4u * w;
+                let xv = vec4<f32>(tt_x[xo], tt_x[xo + 1u], tt_x[xo + 2u], tt_x[xo + 3u]);
+                let cg = vec4<f32>(tt_gh(csh + 4u * w), tt_gh(csh + 4u * w + 1u), tt_gh(csh + 4u * w + 2u), tt_gh(csh + 4u * w + 3u));
+                let cu = vec4<f32>(tt_uh(csh + 4u * w), tt_uh(csh + 4u * w + 1u), tt_uh(csh + 4u * w + 2u), tt_uh(csh + 4u * w + 3u));
+                ag = ag + dot(tt_i8x4(tt_g[rw + w]), xv * cg);
+                au = au + dot(tt_i8x4(tt_u[rw + w]), xv * cu);
+                w = w + 8u;
+            }
+        }
+        tt_rg[lid] = ag;
+        tt_ru[lid] = au;
+        workgroupBarrier();
+        if (sub < 4u) { tt_rg[lid] = tt_rg[lid] + tt_rg[lid + 4u]; tt_ru[lid] = tt_ru[lid] + tt_ru[lid + 4u]; }
+        workgroupBarrier();
+        if (sub < 2u) { tt_rg[lid] = tt_rg[lid] + tt_rg[lid + 2u]; tt_ru[lid] = tt_ru[lid] + tt_ru[lid + 2u]; }
+        workgroupBarrier();
+        if (sub == 0u && row < h) {
+            let g = (tt_rg[lid] + tt_rg[lid + 1u]) * tt_gh(rsh + row);
+            let u = (tt_ru[lid] + tt_ru[lid + 1u]) * tt_uh(rsh + row);
+            tt_act[abase + row] = g / (1.0 + exp(-g)) * u;
+        }
+        workgroupBarrier();
+    }
+}
+
+@group(0) @binding(0) var<storage, read>       td_d   : array<u32>;
+@group(0) @binding(1) var<storage, read>       td_act : array<f32>;
+@group(0) @binding(2) var<storage, read>       td_win : array<u32>;
+@group(0) @binding(3) var<storage, read_write> td_y   : array<f32>;
+@group(0) @binding(4) var<uniform>             td_p   : TtP;
+@group(0) @binding(5) var<storage, read>       td_w   : array<f32>;
+@group(0) @binding(6) var<storage, read>       td_slot: array<u32>;
+fn td_h(hi: u32) -> f32 {
+    let v = unpack2x16float(td_d[hi >> 1u]);
+    if ((hi & 1u) == 0u) { return v.x; }
+    return v.y;
+}
+@compute @workgroup_size(256)
+fn q4t_tube_dn(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let t = gid.y;
+    let hid = td_p.hidden;
+    if (d >= hid) { return; }
+    let k = td_p.top_k;
+    let h = td_p.h;
+    let hw = h >> 2u;
+    var acc = 0.0;
+    for (var j = 0u; j < td_p.cols; j = j + 1u) {
+        var e = 0u;
+        var wj = 0.0;
+        if (td_p.sh == 0u) {
+            let rec = t * td_p.cs + 2u * k + 2u * j;
+            e = td_win[rec];
+            if (e >= td_p.experts) { continue; }
+            wj = bitcast<f32>(td_win[rec + 1u]);
+        } else {
+            wj = td_w[t * td_p.is + td_p.wi];
+        }
+        let slot = td_slot[e];
+        if (slot == 0xFFFFFFFFu) { continue; }
+        let seg = slot * td_p.dseg;
+        let rsh = seg * 2u + ((hid * h) >> 1u);
+        let csh = rsh + hid;
+        let abase = (t * td_p.cols + j) * h;
+        var sum = 0.0;
+        for (var w = 0u; w < hw; w = w + 1u) {
+            let q = tt_i8x4(td_d[seg + d * hw + w]);
+            let cs = vec4<f32>(td_h(csh + 4u * w), td_h(csh + 4u * w + 1u), td_h(csh + 4u * w + 2u), td_h(csh + 4u * w + 3u));
+            let a = vec4<f32>(td_act[abase + 4u * w], td_act[abase + 4u * w + 1u], td_act[abase + 4u * w + 2u], td_act[abase + 4u * w + 3u]);
+            sum = sum + dot(q * cs, a);
+        }
+        acc = acc + wj * sum * td_h(rsh + d);
+    }
+    let yo = t * td_p.os + d;
+    td_y[yo] = td_y[yo] + acc;
+}
 "#;
 
 /// Subgroup twins of qwen4 kernels (32-lane subgroups laid out over the
@@ -2670,6 +2870,10 @@ pub(crate) struct Pipes {
     t_topk: wgpu::ComputePipeline,
     t_idx_build: wgpu::ComputePipeline,
     t_attend: wgpu::ComputePipeline,
+    t_o1_pack: wgpu::ComputePipeline,
+    t_o1_gate: wgpu::ComputePipeline,
+    t_tube_gu: wgpu::ComputePipeline,
+    t_tube_dn: wgpu::ComputePipeline,
     /// HC v3 (`HC3_WGSL`), where the device takes it; None keeps every
     /// hyper-connection mix on the kernels above.
     hc3: Option<Hc3>,
@@ -3019,6 +3223,10 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_topk: pipe("q4t_topk"),
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
+        t_o1_pack: pipe("q4t_o1_pack"),
+        t_o1_gate: pipe("q4t_o1_gate"),
+        t_tube_gu: pipe("q4t_tube_gu"),
+        t_tube_dn: pipe("q4t_tube_dn"),
         hc3: build_hc3(c),
         gu4w: build_sg_l(c, &sgm, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
         dn4s: build_sg_l(c, &sgm, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
@@ -3254,6 +3462,20 @@ struct QsaDev {
     kcap: usize,
 }
 
+impl QsaDev {
+    /// Caches for `cap` positions.
+    fn new(c: &Ctx, g: &Geom, cap: usize) -> Self {
+        QsaDev {
+            k: storage_buf(c, "qwen4-k", (g.n_kv_heads * cap * g.head_dim * 4) as u64),
+            v: storage_buf(c, "qwen4-v", (g.n_kv_heads * cap * g.head_dim * 4) as u64),
+            cap,
+            rawk: storage_buf(c, "qwen4-rawk", (cap * g.index_dim * 4) as u64),
+            ckeys: storage_buf(c, "qwen4-ckeys", ((cap / g.compress_ratio.max(1)) * g.index_dim * 4) as u64),
+            kcap: cap,
+        }
+    }
+}
+
 struct PleDev {
     hist: wgpu::Buffer,
     cap: usize,
@@ -3269,6 +3491,48 @@ struct LayerDev {
 
 /// Tokens one frame can carry (prefill chunks, the verify window).
 pub(crate) const TMAX: usize = 8;
+
+/// One MoE layer's expert tubes on the card (`hot-bake --experts`): the q8_2f tube tensors
+/// of the experts that have one, packed one after another at a fixed segment (`slots`
+/// names each expert's entry), gate and up `[h, hidden]`, down `[hidden, h]`;
+/// `q4t_tube_gu` / `q4t_tube_dn` read them for the frame's winners.
+pub(crate) struct TubeBank {
+    gate: wgpu::Buffer,
+    up: wgpu::Buffer,
+    down: wgpu::Buffer,
+    /// Expert e's entry in the bank (`u32::MAX`: no tube), `[experts]`.
+    slots: wgpu::Buffer,
+    /// Neurons a tube holds.
+    h: usize,
+    /// Words per expert in the gate / up banks and in the down bank.
+    gseg: u32,
+    dseg: u32,
+}
+
+/// The attention layers' O(1) far field (`crate::qwen4_o1`): the exact prompt leaves a
+/// query trace, the seal builds a sealed state per layer in `Ctx::o1m`, and later frames
+/// attend through `o1_batch`.
+pub(crate) struct O1Run {
+    pub(crate) cfg: crate::qwen4_o1::Qwen4O1,
+    geom: Geom,
+    /// Past the seal: the attention layers read the far field.
+    pub(crate) sealed: bool,
+    /// The far field did not fit the kernels once; the layers stay exact.
+    pub(crate) refused: bool,
+    epoch: u64,
+    /// The exact prompt's rotated queries, one row in `QT_STRIDE`, per layer
+    /// (`[row / QT_STRIDE][nh·hd]`; None on a GDN layer).
+    qtrace: Vec<Option<wgpu::Buffer>>,
+    /// Rows the trace holds.
+    qcap: usize,
+    /// The frame's rows packed for the far-field kernels: Q `[TMAX][nh·hd]`, K and V
+    /// `[TMAX][nkv·hd]`, their attention `[TMAX][nh·hd]`, the batch kernels' scratch.
+    pq: wgpu::Buffer,
+    pk: wgpu::Buffer,
+    pv: wgpu::Buffer,
+    out: wgpu::Buffer,
+    ob: wgpu::Buffer,
+}
 
 pub(crate) struct Dev {
     uid: u64,
@@ -3337,6 +3601,16 @@ pub(crate) struct Dev {
     /// ~1200 indirect dispatches a token cost 6-8 ms on the NVIDIA Vulkan
     /// stack, and an aborted frame still pays every launch).
     pub gated: bool,
+    /// The far field of the attention layers, when the file or `CMF_QWEN_O1` asks for one.
+    pub(crate) o1: Option<O1Run>,
+    /// The experts' tube banks per layer (None: no tubes in that layer) and the frame's
+    /// tube activations `[TMAX][top_k][h]`.
+    tubes: Vec<Option<TubeBank>>,
+    tube_act: Option<wgpu::Buffer>,
+    /// The shared expert's tube per layer (`hot-bake --shared-q8`: the whole expert at
+    /// eight bits) and its activations `[TMAX][h]`.
+    tubes_shared: Vec<Option<TubeBank>>,
+    tube_act_s: Option<wgpu::Buffer>,
 }
 
 /// Indirect-argument slots per layer row (16 bytes each).
@@ -3353,6 +3627,8 @@ fn step_slot(step: u16) -> usize {
         300..=309 => 20 + (step as usize - 300), // head HC (its own row)
         400..=408 => 40 + (step as usize - 400), // GDN
         500..=513 => 40 + (step as usize - 500), // QSA (never with GDN in one row)
+        520..=523 => 70 + (step as usize - 520), // QSA O(1) pack / gate
+        720..=723 => 74 + (step as usize - 720), // the experts' tubes, the shared expert's
         600 => 54,                               // attention inject
         700..=713 => 55 + (step as usize - 700), // MoE route / experts / miss
         714 => 58,                               // the route's other kernel
@@ -3393,6 +3669,309 @@ impl Dev {
         let b = build();
         self.binds.borrow_mut().insert(key, b.clone());
         b
+    }
+
+    /// The attention layers' far field (`crate::qwen4_o1`) for this sequence: the trace
+    /// and packing buffers, the state itself at the seal.
+    pub(crate) fn set_o1(&mut self, g: &Geom, cfg: crate::qwen4_o1::Qwen4O1) -> bool {
+        let Some(c) = ctx() else { return false };
+        if o1_batch::pipes(c).is_none() {
+            tracing::warn!("qwen4 O(1): the batch kernels are unavailable, the layers stay exact");
+            return false;
+        }
+        let (nh, nkv, hd) = (g.n_heads, g.n_kv_heads, g.head_dim);
+        let qcap = (cfg.o1.seal + TMAX).div_ceil(crate::dory::QT_STRIDE);
+        let qtrace = self
+            .layers
+            .iter()
+            .map(|l| l.qsa.as_ref().map(|_| storage_buf(c, "qwen4-o1-qtrace", (qcap * nh * hd * 4) as u64)))
+            .collect();
+        let geom = o1_batch::Geom { g: nkv, hpg: nh / nkv, m: cfg.o1.m, w: cfg.o1.w, ns: cfg.near() - cfg.o1.w, rect_fm: false, d: hd, dv: hd, scale: 0.0 };
+        self.o1 = Some(O1Run {
+            cfg,
+            geom: *g,
+            sealed: false,
+            refused: false,
+            epoch: 0,
+            qtrace,
+            qcap,
+            pq: storage_buf(c, "qwen4-o1-pq", (TMAX * nh * hd * 4) as u64),
+            pk: storage_buf(c, "qwen4-o1-pk", (TMAX * nkv * hd * 4) as u64),
+            pv: storage_buf(c, "qwen4-o1-pv", (TMAX * nkv * hd * 4) as u64),
+            out: storage_buf(c, "qwen4-o1-out", (TMAX * nh * hd * 4) as u64),
+            ob: storage_buf(c, "qwen4-o1-ob", (geom.scratch_len() * 4) as u64),
+        });
+        true
+    }
+
+    /// The experts' tubes of every MoE layer on the card: `segs[li][e]` names each expert's
+    /// (gate, up, down) tube tensors (directory indices, q8_2f, every expert of a layer
+    /// the same width). Bytes land resident; false when a layer's tubes disagree, a tensor
+    /// is not q8_2f or the upload fails — the device path then stays off (its kernels
+    /// would compute the zeroed rows and nothing else).
+    pub(crate) fn set_tubes(&mut self, model: &CmfModel, g: &Geom, segs: &[Vec<Option<(usize, usize, usize)>>], shared: &[Option<(usize, usize, usize)>]) -> bool {
+        let Some(c) = ctx() else { return false };
+        // The banks stay resident beside the skeleton (already up): refuse what the budget
+        // cannot hold with a slice left for the experts and the caches — a wgpu allocation
+        // past the card's memory is fatal, and a device path without the tubes would run the
+        // experts' zeroed rows.
+        let bank_bytes = |layer: &[Option<(usize, usize, usize)>]| -> u64 {
+            let Some((gi, _, _)) = layer.iter().flatten().next() else { return 0 };
+            let Some(e) = model.tensors.get(*gi) else { return 0 };
+            let Some(&h) = e.shape.first() else { return 0 };
+            let (h, hidden) = (h as usize, g.hidden);
+            let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap_or(0).div_ceil(16) * 16;
+            let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap_or(0).div_ceil(16) * 16;
+            (layer.iter().flatten().count() * (2 * seg_g + seg_d)) as u64
+        };
+        let need: u64 = segs.iter().map(|l| bank_bytes(l)).sum::<u64>() + shared.iter().map(|t| bank_bytes(std::slice::from_ref(t))).sum::<u64>();
+        let resident = c.resident.load(std::sync::atomic::Ordering::Relaxed);
+        let headroom = 2u64 << 30;
+        if resident + need + headroom > c.vram_budget {
+            tracing::warn!(
+                "qwen4 tubes: {} MB of tubes do not fit the VRAM budget ({} MB, {} MB resident) with 2 GB left for the experts",
+                need >> 20,
+                c.vram_budget >> 20,
+                resident >> 20
+            );
+            return false;
+        }
+        let mut banks = Vec::with_capacity(segs.len());
+        let mut hmax = 0usize;
+        for (li, layer) in segs.iter().enumerate() {
+            match Self::tube_bank(c, model, g, li, layer) {
+                Ok(b) => {
+                    hmax = hmax.max(b.as_ref().map_or(0, |b| b.h));
+                    banks.push(b);
+                }
+                Err(()) => return false,
+            }
+        }
+        let mut sbanks = Vec::with_capacity(shared.len());
+        let mut hsmax = 0usize;
+        for (li, t) in shared.iter().enumerate() {
+            match Self::tube_bank(c, model, g, li, std::slice::from_ref(t)) {
+                Ok(b) => {
+                    hsmax = hsmax.max(b.as_ref().map_or(0, |b| b.h));
+                    sbanks.push(b);
+                }
+                Err(()) => return false,
+            }
+        }
+        if hmax > 0 {
+            self.tube_act = Some(storage_buf(c, "qwen4-tube-act", (TMAX * g.top_k * hmax * 4) as u64));
+            self.tubes = banks;
+        }
+        if hsmax > 0 {
+            self.tube_act_s = Some(storage_buf(c, "qwen4-tube-act-s", (TMAX * hsmax * 4) as u64));
+            self.tubes_shared = sbanks;
+        }
+        c.queue.submit(std::iter::empty());
+        true
+    }
+
+    /// One layer's tube bank from the tube tensors of its experts (None: no tubes there).
+    fn tube_bank(c: &Ctx, model: &CmfModel, g: &Geom, li: usize, layer: &[Option<(usize, usize, usize)>]) -> Result<Option<TubeBank>, ()> {
+        let hidden = g.hidden;
+        let bytes_of = |idx: usize| -> Option<(&[u8], usize, usize)> {
+            let e = model.tensors.get(idx)?;
+            if e.dtype != TensorDtype::Q8_2f || e.shape.len() != 2 {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            let b = model.primary_bytes().get(abs..abs + e.nbytes as usize)?;
+            Some((b, e.shape[0] as usize, e.shape[1] as usize))
+        };
+        {
+            if layer.is_empty() || layer.iter().all(Option::is_none) {
+                return Ok(None);
+            }
+            let Some((gi, _, di)) = layer.iter().flatten().next().copied() else {
+                return Ok(None);
+            };
+            let (Some((_, h, cols)), Some((_, drows, dcols))) = (bytes_of(gi), bytes_of(di)) else {
+                tracing::warn!("qwen4 tubes: layer {li}: a tube tensor is not a 2-D q8_2f tensor");
+                return Err(());
+            };
+            if cols != hidden || drows != hidden || dcols != h || h % 4 != 0 || h == 0 || hidden % 4 != 0 {
+                tracing::warn!("qwen4 tubes: layer {li}: tube [{h}, {cols}] / down [{drows}, {dcols}] against hidden {hidden}");
+                return Err(());
+            }
+            let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap_or(0).div_ceil(16) * 16;
+            let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap_or(0).div_ceil(16) * 16;
+            // The experts with a tube, packed: `slots[e]` names expert e's entry.
+            let n = layer.iter().flatten().count();
+            let mut slots = vec![u32::MAX; layer.len()];
+            let (mut gb, mut ub, mut db) = (vec![0u8; n * seg_g], vec![0u8; n * seg_g], vec![0u8; n * seg_d]);
+            let mut e = 0usize;
+            for (ex, t) in layer.iter().enumerate() {
+                let Some((gi, ui, di)) = t else {
+                    continue;
+                };
+                slots[ex] = e as u32;
+                for (idx, dst, seg, rows, cols) in [(*gi, &mut gb, seg_g, h, hidden), (*ui, &mut ub, seg_g, h, hidden), (*di, &mut db, seg_d, hidden, h)] {
+                    let Some((b, r, cc)) = bytes_of(idx) else {
+                        tracing::warn!("qwen4 tubes: layer {li}: expert {e}'s tube tensor is not q8_2f");
+                        return Err(());
+                    };
+                    if r != rows || cc != cols || b.len() > seg {
+                        tracing::warn!("qwen4 tubes: layer {li}: expert {e}'s tube is [{r}, {cc}], the layer's [{rows}, {cols}]");
+                        return Err(());
+                    }
+                    dst[e * seg..e * seg + b.len()].copy_from_slice(b);
+                }
+                e += 1;
+            }
+            let up = |label: &str, data: &[u8]| -> wgpu::Buffer {
+                let b = storage_buf(c, label, data.len() as u64);
+                c.queue.write_buffer(&b, 0, data);
+                b
+            };
+            c.resident.fetch_add((gb.len() + ub.len() + db.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            let sb: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let bank = TubeBank { gate: up("qwen4-tube-g", &gb), up: up("qwen4-tube-u", &ub), down: up("qwen4-tube-d", &db), slots: up("qwen4-tube-slots", &sb), h, gseg: (seg_g / 4) as u32, dseg: (seg_d / 4) as u32 };
+            // Flush this layer's writes: their staging memory is device memory too, and
+            // 6 GB of banks staged at once left the expert pool's allocation no room.
+            c.queue.submit(std::iter::empty());
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            Ok(Some(bank))
+        }
+    }
+
+    /// Tube bytes resident on the card.
+    pub(crate) fn tube_bytes(&self) -> u64 {
+        self.tubes.iter().chain(self.tubes_shared.iter()).flatten().map(|b| b.gate.size() + b.up.size() + b.down.size()).sum()
+    }
+
+    /// The model's id, the key of its far states in `Ctx::o1m`.
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Rows at which the sequence seals, when a far field is configured and not yet built.
+    pub(crate) fn o1_seal_at(&self) -> Option<usize> {
+        self.o1.as_ref().filter(|o| !o.sealed && !o.refused).map(|o| o.cfg.o1.seal)
+    }
+
+    /// Past the seal: the attention layers read the far field.
+    pub(crate) fn o1_sealed(&self) -> bool {
+        self.o1.as_ref().is_some_and(|o| o.sealed && !o.refused)
+    }
+
+    /// Seal the sequence's attention layers at `rows` positions: their keys, values and
+    /// query traces come to the host, `nystrom` builds a sink + window + landmark state
+    /// per KV head (the chosen rows exact among the sinks), the states go up as the
+    /// layers' O(1) states and the exact caches leave the card. False, and the layers
+    /// stay exact, when a state does not fit the kernels.
+    pub(crate) fn seal(&mut self, g: &Geom, rows: usize) -> bool {
+        let Some(c) = ctx() else { return false };
+        let Some(o) = self.o1.as_ref() else { return false };
+        if o.sealed || o.refused || rows == 0 {
+            return false;
+        }
+        let (nh, nkv, hd) = (g.n_heads, g.n_kv_heads, g.head_dim);
+        let o1 = o.cfg.o1;
+        let stride = crate::dory::QT_STRIDE;
+        let t0 = std::time::Instant::now();
+        let refuse = |this: &mut Self, why: &str| -> bool {
+            tracing::warn!("qwen4 O(1): {why}; the attention layers stay exact");
+            c.o1m.lock().unwrap().retain(|(id, _), _| *id != this.uid);
+            if let Some(o) = this.o1.as_mut() {
+                o.refused = true;
+            }
+            false
+        };
+        if rows.div_ceil(stride) > o.qcap {
+            return refuse(self, &format!("{rows} rows go past the query trace of {} rows", o.qcap * stride));
+        }
+        // the layers' rows, `[row][nkv][hd]`, and their query traces
+        let mut got: Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+        for (li, l) in self.layers.iter().enumerate() {
+            let (Some(q), Some(tr)) = (l.qsa.as_ref(), o.qtrace[li].as_ref()) else { continue };
+            if rows > q.cap {
+                return refuse(self, &format!("{rows} rows go past layer {li}'s cache of {}", q.cap));
+            }
+            let (Some(ks), Some(vs), Some(qs)) = (
+                train_ops::download(c, &q.k, nkv * q.cap * hd),
+                train_ops::download(c, &q.v, nkv * q.cap * hd),
+                train_ops::download(c, tr, rows.div_ceil(stride) * nh * hd),
+            ) else {
+                return refuse(self, "the caches could not be read back");
+            };
+            got.push((
+                li,
+                crate::qwen4_o1::rows_from_heads(&ks, nkv, q.cap, hd, rows),
+                crate::qwen4_o1::rows_from_heads(&vs, nkv, q.cap, hd, rows),
+                qs,
+            ));
+        }
+        if got.is_empty() {
+            return refuse(self, "no attention layer to seal");
+        }
+        // The chosen rows leave the far field: a copy of a fact there drowns the exact one.
+        let keep = match &o.cfg.exact {
+            Some(x) => {
+                let views: Vec<crate::dory::FlatRows> = got.iter().map(|e| crate::dory::FlatRows { k: &e.1, v: &e.2, nk: nkv, hd }).collect();
+                let layers: Vec<&dyn crate::dory::LayerRows> = views.iter().map(|v| v as &dyn crate::dory::LayerRows).collect();
+                crate::dory::pick_exact_rows(x, &layers, rows, nkv, hd, o1.m, o1.sink, rows.saturating_sub(o1.w))
+            }
+            None => Vec::new(),
+        };
+        let order = crate::dory::seal_order(rows, o1.sink, &keep);
+        let epoch = o.epoch + 1;
+        for (li, ks, vs, qs) in &got {
+            let states = crate::qwen4_o1::far_states(nh, nkv, hd, o1, ks, vs, qs, rows, &order, keep.len());
+            let views: Vec<_> = states.iter().map(|n| n.device_view()).collect();
+            if !o1_views_valid_near(&views, nh, nkv, hd, crate::dory::MAX_NEAR)
+                || o1_ensure_near(c, self.uid, *li, &views, epoch, crate::dory::MAX_NEAR).is_none()
+            {
+                return refuse(self, &format!("the far state of layer {li} does not fit the kernels"));
+            }
+        }
+        // The exact caches leave the card; the cached bind groups held them.
+        let cr = g.compress_ratio.max(1);
+        for (li, _, _, _) in &got {
+            if let Some(q) = self.layers[*li].qsa.as_mut() {
+                *q = QsaDev::new(c, g, cr);
+            }
+            self.forget_layer(*li);
+        }
+        if let Some(o) = self.o1.as_mut() {
+            o.sealed = true;
+            o.epoch = epoch;
+        }
+        tracing::info!(
+            "qwen4 O(1): sealed {rows} rows of {} attention layers, {} kept exact, in {:.2} s",
+            got.len(),
+            keep.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        true
+    }
+
+    /// A new sequence: the far states go, the exact caches come back.
+    pub(crate) fn o1_reset(&mut self) {
+        let Some(o) = self.o1.as_mut() else { return };
+        if !o.sealed && !o.refused {
+            return;
+        }
+        let g = &o.geom;
+        let was_sealed = o.sealed;
+        o.sealed = false;
+        o.refused = false;
+        if let Some(c) = ctx() {
+            c.o1m.lock().unwrap().retain(|(id, _), _| *id != self.uid);
+            if was_sealed {
+                for l in &mut self.layers {
+                    if let Some(q) = l.qsa.as_mut() {
+                        *q = QsaDev::new(c, g, 4096);
+                    }
+                }
+            }
+        }
+        for li in 0..self.layers.len() {
+            self.forget_layer(li);
+        }
     }
 
     fn forget_layer(&self, li: usize) {
@@ -3618,21 +4197,7 @@ impl Dev {
                     ),
                 )
             });
-            let qsa = (!is_gdn).then(|| {
-                let cap = 4096usize;
-                QsaDev {
-                    k: storage_buf(c, "qwen4-k", (g.n_kv_heads * cap * g.head_dim * 4) as u64),
-                    v: storage_buf(c, "qwen4-v", (g.n_kv_heads * cap * g.head_dim * 4) as u64),
-                    cap,
-                    rawk: storage_buf(c, "qwen4-rawk", (cap * g.index_dim * 4) as u64),
-                    ckeys: storage_buf(
-                        c,
-                        "qwen4-ckeys",
-                        ((cap / g.compress_ratio.max(1)) * g.index_dim * 4) as u64,
-                    ),
-                    kcap: cap,
-                }
-            });
+            let qsa = (!is_gdn).then(|| QsaDev::new(c, g, 4096));
             let ple = has_ple.then(|| {
                 let cap = ((g.ple_kernel - 1) * g.ple_dilation).max(1);
                 PleDev {
@@ -3700,6 +4265,11 @@ impl Dev {
             ple_snaps: vec![Vec::new(); kinds.len()],
             r_last: storage_buf(c, "qwen4-r-last", (g.hc * g.hidden * 4) as u64),
             gated: false,
+            o1: None,
+            tubes: Vec::new(),
+            tube_act: None,
+            tubes_shared: Vec::new(),
+            tube_act_s: None,
         })
     }
 
@@ -3707,6 +4277,7 @@ impl Dev {
     /// history, forget the caches' fill (they are overwritten in place).
     pub(crate) fn reset(&mut self) -> bool {
         let Some(c) = ctx() else { return false };
+        self.o1_reset();
         let mut enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5469,10 +6040,13 @@ pub(crate) fn encode_layer(
     // Caches that grow with the position are sized before the pass opens —
     // for the whole chunk: a growth encoded between two tokens of one frame
     // would leave the earlier tokens' dispatches on the replaced buffers.
-    let grew = dev.layers[li]
-        .qsa
-        .as_mut()
-        .is_some_and(|q| ensure_qsa(c, g, q, pos0 + TMAX));
+    // A sealed layer's caches left the card: nothing to grow.
+    let o1_sealed = dev.o1.as_ref().is_some_and(|o| o.sealed && !o.refused);
+    let grew = !o1_sealed
+        && dev.layers[li]
+            .qsa
+            .as_mut()
+            .is_some_and(|q| ensure_qsa(c, g, q, pos0 + TMAX));
     if grew {
         dev.forget_layer(li);
     }
@@ -6127,197 +6701,326 @@ pub(crate) fn encode_layer(
                         },
                         ((nh + nkv) as u32, nt as u32, 1),
                     );
-                    // K/V and the raw indexer keys into the caches at their positions
-                    dispatch(
-                        c,
-                        &mut pass,
-                        &p.t_kv_append,
-                        bc,
-                        506,
-                        "qwen4t-kv-append",
-                        || {
-                            vec![
-                                kb.clone(),
-                                vb.clone(),
-                                qd.k.clone(),
-                                qd.v.clone(),
-                                tabb.clone(),
-                                uniform_u32x8(
-                                    c,
-                                    [nkv as u32, hd as u32, qd.cap as u32, kvs, kvs, 0, 0, 0],
-                                ),
-                            ]
-                        },
-                        (((nkv * hd) as u32).div_ceil(256), nt as u32, 1),
-                    );
-                    dispatch(
-                        c,
-                        &mut pass,
-                        &p.t_rawk,
-                        bc,
-                        513,
-                        "qwen4t-rawk",
-                        || {
-                            vec![
-                                iqk.clone(),
-                                qd.rawk.clone(),
-                                tabb.clone(),
-                                uniform_u32x4(c, [idim as u32, (ih * idim) as u32, iqks, 0]),
-                            ]
-                        },
-                        ((idim as u32).div_ceil(256), nt as u32, 1),
-                    );
-                    // blocks completed within the frame: their compressed keys
-                    for t in 0..nt {
-                        let npos = pos0 + t + 1;
-                        if npos % cr != 0 {
-                            continue;
-                        }
-                        let complete = npos / cr;
-                        let bt = Bc {
-                            dev: d,
-                            li,
-                            tok: t,
-                            direct: false,
+                    // The attention layers' O(1) far field (`crate::qwen4_o1`): while the
+                    // prompt runs exact its rows leave a query trace; past the seal the
+                    // frame's rows go through the engine's far-field kernels in place of
+                    // the indexer and the sparse attention, a verify window's keys and
+                    // values waiting in the state's spec stash for the host's commit.
+                    let o1_on = d.o1.as_ref().is_some_and(|o| !o.refused);
+                    let (ngq, ngk) = (nh * hd, nkv * hd);
+                    if o1_on {
+                        let o = d.o1.as_ref()?;
+                        let spec = o1_sealed && snapshot;
+                        let (pk, pv, step) = if spec {
+                            let map = c.o1m.lock().unwrap();
+                            let d1 = map.get(&(uid, li))?;
+                            (d1.stages.spec_k.clone(), d1.stages.spec_v.clone(), 522u16)
+                        } else {
+                            (o.pk.clone(), o.pv.clone(), if o1_sealed { 521 } else { 520 })
                         };
-                        let pb = uni_slot8(
+                        let qt = o.qtrace[li].clone().unwrap_or_else(|| zero.clone());
+                        let (pq, qcap) = (o.pq.clone(), o.qcap as u32);
+                        let trace = u32::from(!o1_sealed);
+                        dispatch(
                             c,
-                            U_BK,
-                            uid,
-                            bt.key(),
-                            [
-                                cr as u32,
-                                idim as u32,
-                                (complete - 1) as u32,
-                                ird as u32,
-                                g.eps.to_bits(),
-                                0,
-                                0,
-                                0,
-                            ],
+                            &mut pass,
+                            &p.t_o1_pack,
+                            bc,
+                            step,
+                            "qwen4t-o1-pack",
+                            || {
+                                vec![
+                                    qb.clone(),
+                                    kb.clone(),
+                                    vb.clone(),
+                                    pq,
+                                    pk,
+                                    pv,
+                                    qt,
+                                    tabb.clone(),
+                                    uniform_u32x16(
+                                        c,
+                                        [
+                                            nh as u32,
+                                            nkv as u32,
+                                            hd as u32,
+                                            qbs,
+                                            kvs,
+                                            kvs,
+                                            trace,
+                                            crate::dory::QT_STRIDE as u32,
+                                            qcap,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                        ],
+                                    ),
+                                ]
+                            },
+                            ((ngq.max(ngk) as u32).div_ceil(256), nt as u32, 1),
+                        );
+                    }
+                    if o1_sealed {
+                        let o = d.o1.as_ref()?;
+                        let ob = o1_batch::pipes(c)?;
+                        let (meta, rk, rv, sk, sv, kt, qt2, mu, mz, th, spk, spv, geom) = {
+                            let map = c.o1m.lock().unwrap();
+                            let d1 = map.get(&(uid, li))?;
+                            (
+                                d1.meta.clone(),
+                                d1.ring_k.clone(),
+                                d1.ring_v.clone(),
+                                d1.sink_k.clone(),
+                                d1.sink_v.clone(),
+                                d1.k_tilde.clone(),
+                                d1.qt.clone(),
+                                d1.mu.clone(),
+                                d1.mz.clone(),
+                                d1.that.clone(),
+                                d1.stages.spec_k.clone(),
+                                d1.stages.spec_v.clone(),
+                                o1_batch::Geom {
+                                    g: d1.g,
+                                    hpg: d1.h,
+                                    m: d1.m,
+                                    w: d1.w,
+                                    ns: d1.ns,
+                                    rect_fm: false,
+                                    d: d1.dk,
+                                    dv: d1.dk,
+                                    scale: d1.scale,
+                                },
+                            )
+                        };
+                        if geom.g != nkv || geom.hpg * nkv != nh || geom.d != hd {
+                            return None;
+                        }
+                        let st = o1_batch::State {
+                            meta: &meta,
+                            ring_k: &rk,
+                            ring_v: &rv,
+                            sink_k: &sk,
+                            sink_v: &sv,
+                            k_tilde: &kt,
+                            qt: &qt2,
+                            mu: &mu,
+                            mz: &mz,
+                            that: &th,
+                        };
+                        let (kb2, vb2) = if snapshot { (&spk, &spv) } else { (&o.pk, &o.pv) };
+                        for (pipe, bg, x, y) in o1_batch::steps(c, ob, &st, geom, &o.pq, kb2, vb2, &o.ob, &o.out, nt, !snapshot) {
+                            pass.set_pipeline(&pipe);
+                            pass.set_bind_group(0, &bg, &[]);
+                            pass.dispatch_workgroups(x, y, 1);
+                        }
+                        let (out, ats) = (o.out.clone(), es(nh * hd * 4));
+                        dispatch(
+                            c,
+                            &mut pass,
+                            &p.t_o1_gate,
+                            bc,
+                            523,
+                            "qwen4t-o1-gate",
+                            || vec![out, gate.clone(), att.clone(), uniform_u32x8(c, [ngq as u32, gts, ats, 0, 0, 0, 0, 0])],
+                            ((ngq as u32).div_ceil(256), nt as u32, 1),
+                        );
+                    } else {
+                        // K/V and the raw indexer keys into the caches at their positions
+                        dispatch(
+                            c,
+                            &mut pass,
+                            &p.t_kv_append,
+                            bc,
+                            506,
+                            "qwen4t-kv-append",
+                            || {
+                                vec![
+                                    kb.clone(),
+                                    vb.clone(),
+                                    qd.k.clone(),
+                                    qd.v.clone(),
+                                    tabb.clone(),
+                                    uniform_u32x8(
+                                        c,
+                                        [nkv as u32, hd as u32, qd.cap as u32, kvs, kvs, 0, 0, 0],
+                                    ),
+                                ]
+                            },
+                            (((nkv * hd) as u32).div_ceil(256), nt as u32, 1),
                         );
                         dispatch(
                             c,
                             &mut pass,
-                            &p.block_key,
-                            bt,
-                            507,
-                            "qwen4-block-key",
+                            &p.t_rawk,
+                            bc,
+                            513,
+                            "qwen4t-rawk",
                             || {
                                 vec![
+                                    iqk.clone(),
                                     qd.rawk.clone(),
-                                    iknw.clone(),
-                                    freq.clone(),
-                                    qd.ckeys.clone(),
-                                    pb,
-                                ]
-                            },
-                            (1, 1, 1),
-                        );
-                    }
-                    let (scs, pks, cts, ids) = (
-                        es(MAX_INDEX_BLOCKS * 4),
-                        es(pick_len),
-                        es(16),
-                        es(MAX_ATTEND * 4),
-                    );
-                    if max_complete > 0 {
-                        dispatch(
-                            c,
-                            &mut pass,
-                            &p.t_ix_scores,
-                            bc,
-                            508,
-                            "qwen4t-ix-scores",
-                            || {
-                                vec![
-                                    iq.clone(),
-                                    qd.ckeys.clone(),
-                                    ixw.clone(),
-                                    scores.clone(),
                                     tabb.clone(),
-                                    uniform_u32x4(c, [ih as u32, idim as u32, iqs2, scs]),
+                                    uniform_u32x4(c, [idim as u32, (ih * idim) as u32, iqks, 0]),
                                 ]
                             },
-                            (max_complete as u32, nt as u32, 1),
+                            ((idim as u32).div_ceil(256), nt as u32, 1),
                         );
+                        // blocks completed within the frame: their compressed keys
+                        for t in 0..nt {
+                            let npos = pos0 + t + 1;
+                            if npos % cr != 0 {
+                                continue;
+                            }
+                            let complete = npos / cr;
+                            let bt = Bc {
+                                dev: d,
+                                li,
+                                tok: t,
+                                direct: false,
+                            };
+                            let pb = uni_slot8(
+                                c,
+                                U_BK,
+                                uid,
+                                bt.key(),
+                                [
+                                    cr as u32,
+                                    idim as u32,
+                                    (complete - 1) as u32,
+                                    ird as u32,
+                                    g.eps.to_bits(),
+                                    0,
+                                    0,
+                                    0,
+                                ],
+                            );
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.block_key,
+                                bt,
+                                507,
+                                "qwen4-block-key",
+                                || {
+                                    vec![
+                                        qd.rawk.clone(),
+                                        iknw.clone(),
+                                        freq.clone(),
+                                        qd.ckeys.clone(),
+                                        pb,
+                                    ]
+                                },
+                                (1, 1, 1),
+                            );
+                        }
+                        let (scs, pks, cts, ids) = (
+                            es(MAX_INDEX_BLOCKS * 4),
+                            es(pick_len),
+                            es(16),
+                            es(MAX_ATTEND * 4),
+                        );
+                        if max_complete > 0 {
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.t_ix_scores,
+                                bc,
+                                508,
+                                "qwen4t-ix-scores",
+                                || {
+                                    vec![
+                                        iq.clone(),
+                                        qd.ckeys.clone(),
+                                        ixw.clone(),
+                                        scores.clone(),
+                                        tabb.clone(),
+                                        uniform_u32x4(c, [ih as u32, idim as u32, iqs2, scs]),
+                                    ]
+                                },
+                                (max_complete as u32, nt as u32, 1),
+                            );
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.t_topk,
+                                bc,
+                                509,
+                                "qwen4t-topk",
+                                || {
+                                    vec![
+                                        scores.clone(),
+                                        pick.clone(),
+                                        cnt.clone(),
+                                        tabb.clone(),
+                                        uniform_u32x4(c, [scs, pks, cts, 0]),
+                                    ]
+                                },
+                                (nt as u32, 1, 1),
+                            );
+                        }
                         dispatch(
                             c,
                             &mut pass,
-                            &p.t_topk,
+                            &p.t_idx_build,
                             bc,
-                            509,
-                            "qwen4t-topk",
+                            510,
+                            "qwen4t-idx",
                             || {
                                 vec![
-                                    scores.clone(),
                                     pick.clone(),
-                                    cnt.clone(),
+                                    idx.clone(),
                                     tabb.clone(),
-                                    uniform_u32x4(c, [scs, pks, cts, 0]),
+                                    uniform_u32x4(c, [cr as u32, pks, ids, 0]),
                                 ]
                             },
-                            (nt as u32, 1, 1),
+                            ((max_m as u32).div_ceil(256).max(1), nt as u32, 1),
+                        );
+                        dispatch(
+                            c,
+                            &mut pass,
+                            &p.t_attend,
+                            bc,
+                            511,
+                            "qwen4t-attend",
+                            || {
+                                vec![
+                                    qb.clone(),
+                                    qd.k.clone(),
+                                    qd.v.clone(),
+                                    idx.clone(),
+                                    gate.clone(),
+                                    att.clone(),
+                                    tabb.clone(),
+                                    uniform_u32x16(
+                                        c,
+                                        [
+                                            nh as u32,
+                                            hd as u32,
+                                            (hd as f32).sqrt().recip().to_bits(),
+                                            (nh / nkv) as u32,
+                                            qd.cap as u32,
+                                            qbs,
+                                            ids,
+                                            gts,
+                                            es(nh * hd * 4),
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                        ],
+                                    ),
+                                ]
+                            },
+                            (nh as u32, nt as u32, 1),
                         );
                     }
-                    dispatch(
-                        c,
-                        &mut pass,
-                        &p.t_idx_build,
-                        bc,
-                        510,
-                        "qwen4t-idx",
-                        || {
-                            vec![
-                                pick.clone(),
-                                idx.clone(),
-                                tabb.clone(),
-                                uniform_u32x4(c, [cr as u32, pks, ids, 0]),
-                            ]
-                        },
-                        ((max_m as u32).div_ceil(256).max(1), nt as u32, 1),
-                    );
-                    dispatch(
-                        c,
-                        &mut pass,
-                        &p.t_attend,
-                        bc,
-                        511,
-                        "qwen4t-attend",
-                        || {
-                            vec![
-                                qb.clone(),
-                                qd.k.clone(),
-                                qd.v.clone(),
-                                idx.clone(),
-                                gate.clone(),
-                                att.clone(),
-                                tabb.clone(),
-                                uniform_u32x16(
-                                    c,
-                                    [
-                                        nh as u32,
-                                        hd as u32,
-                                        (hd as f32).sqrt().recip().to_bits(),
-                                        (nh / nkv) as u32,
-                                        qd.cap as u32,
-                                        qbs,
-                                        ids,
-                                        gts,
-                                        es(nh * hd * 4),
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ],
-                                ),
-                            ]
-                        },
-                        (nh as u32, nt as u32, 1),
-                    );
                     ts_pass(&mut pass, 10);
                 } else {
                     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rd / 2]));
@@ -6926,6 +7629,70 @@ pub(crate) fn encode_layer(
             pass.set_bind_group(0, &bg_dn, &[]);
             pass.set_bind_group(1, &bg_dn_p, &[]);
             bc.launch(&mut pass, 706, (hidden as u32, nt as u32, 1));
+        }
+    }
+    // the winners' hot neurons: their tubes against the MoE input, into the output
+    if let (Some(tb), Some(act)) = (d.tubes.get(li).and_then(Option::as_ref), d.tube_act.as_ref()) {
+        if !skip("experts") {
+            let (hidden32, h32, k32, e32) = (hidden as u32, tb.h as u32, g.top_k as u32, g.n_experts as u32);
+            let tu = uniform_u32x16(
+                c,
+                [hidden32, h32, k32, e32, hs, es(4 * g.top_k * 4), tb.gseg, tb.dseg, es(hidden * 4), k32, slots as u32, 0, 0, 0, 0, 0],
+            );
+            let (tg, tup, tdn, act2, tu2, sl) = (tb.gate.clone(), tb.up.clone(), tb.down.clone(), act.clone(), tu.clone(), tb.slots.clone());
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_gu,
+                bc,
+                720,
+                "qwen4t-tube-gu",
+                || vec![tg, tup, x2.clone(), cold.clone(), act2, tu, sl],
+                (g.top_k as u32, nt as u32, (tb.h as u32).div_ceil(32)),
+            );
+            let (act3, sl2) = (act.clone(), tb.slots.clone());
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_dn,
+                bc,
+                721,
+                "qwen4t-tube-dn",
+                || vec![tdn, act3, cold.clone(), mo.clone(), tu2, mwt.clone(), sl2],
+                ((hidden as u32).div_ceil(256), nt as u32, 1),
+            );
+        }
+    }
+    // the shared expert's tube (the whole expert at eight bits), with the route's σ
+    if let (Some(tb), Some(act)) = (d.tubes_shared.get(li).and_then(Option::as_ref), d.tube_act_s.as_ref()) {
+        if !skip("experts") {
+            let (hidden32, h32, k32) = (hidden as u32, tb.h as u32, g.top_k as u32);
+            let tu = uniform_u32x16(
+                c,
+                [hidden32, h32, 0, 1, hs, es(4 * g.top_k * 4), tb.gseg, tb.dseg, es(hidden * 4), 1, slots as u32, k32, 1, 0, 0, 0],
+            );
+            let (tg, tup, tdn, act2, tu2, sl) = (tb.gate.clone(), tb.up.clone(), tb.down.clone(), act.clone(), tu.clone(), tb.slots.clone());
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_gu,
+                bc,
+                722,
+                "qwen4t-tube-gu-s",
+                || vec![tg, tup, x2.clone(), cold.clone(), act2, tu, sl],
+                (1, nt as u32, (tb.h as u32).div_ceil(32)),
+            );
+            let (act3, sl2) = (act.clone(), tb.slots.clone());
+            dispatch(
+                c,
+                &mut pass,
+                &p.t_tube_dn,
+                bc,
+                723,
+                "qwen4t-tube-dn-s",
+                || vec![tdn, act3, cold.clone(), mo.clone(), tu2, mwt.clone(), sl2],
+                ((hidden as u32).div_ceil(256), nt as u32, 1),
+            );
         }
     }
     // a cold winner here gates every later frame of the chain off
@@ -8519,6 +9286,10 @@ mod shader_tests {
             "q4t_topk",
             "q4t_idx_build",
             "q4t_attend",
+            "q4t_o1_pack",
+            "q4t_o1_gate",
+            "q4t_tube_gu",
+            "q4t_tube_dn",
         ] {
             assert!(
                 module.entry_points.iter().any(|e| e.name == ep),
@@ -8669,6 +9440,245 @@ mod hc3_device_tests {
             }
         }
         d / m.max(1e-30)
+    }
+
+    /// The O(1) glue kernels: the frame's strided rows packed dense (and the query
+    /// trace at the rows' positions), the far-field rows through the sigmoid gate.
+    #[test]
+    fn o1_pack_and_gate_match_host() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        let (nh, nkv, hd, nt) = (16usize, 2usize, 256usize, 3usize);
+        let (nq, nk) = (nh * hd, nkv * hd);
+        let (qs, ks) = (es(nq * 4) as usize, es(nk * 4) as usize);
+        let stride = crate::dory::QT_STRIDE;
+        let qcap = 16usize;
+        let pos0 = 38usize; // rows 38, 39, 40: one of them a trace row
+        let mut r = Rnd(0x51A5_0001);
+        let fill = |r: &mut Rnd, n: usize| -> Vec<f32> { (0..n).map(|_| r.n()).collect() };
+        let (q, k, v, gate, far) = (fill(&mut r, nt * qs), fill(&mut r, nt * ks), fill(&mut r, nt * ks), fill(&mut r, nt * qs), fill(&mut r, nt * nq));
+        let up = |label: &str, data: &[f32]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, (data.len() * 4) as u64);
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+            b
+        };
+        let (qb, kb, vb, gb, fb) = (up("t-q", &q), up("t-k", &k), up("t-v", &v), up("t-gate", &gate), up("t-far", &far));
+        let (pq, pk, pv, qt, att) = (
+            storage_buf(c, "t-pq", (nt * nq * 4) as u64),
+            storage_buf(c, "t-pk", (nt * nk * 4) as u64),
+            storage_buf(c, "t-pv", (nt * nk * 4) as u64),
+            storage_buf(c, "t-qt", (qcap * nq * 4) as u64),
+            storage_buf(c, "t-att", (nt * qs * 4) as u64),
+        );
+        let mut tab = vec![0u32; TMAX * 4];
+        for t in 0..nt {
+            tab[t * 4] = (pos0 + t) as u32;
+        }
+        let tabb = up("t-tab", bytemuck::cast_slice::<u32, f32>(&tab));
+        let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
+            let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
+        };
+        let u_pack = uniform_u32x16(c, [nh as u32, nkv as u32, hd as u32, qs as u32, ks as u32, ks as u32, 1, stride as u32, qcap as u32, 0, 0, 0, 0, 0, 0, 0]);
+        let u_gate = uniform_u32x8(c, [nq as u32, qs as u32, qs as u32, 0, 0, 0, 0, 0]);
+        let bg_pack = bind(&p.t_o1_pack, &[&qb, &kb, &vb, &pq, &pk, &pv, &qt, &tabb, &u_pack]);
+        let bg_gate = bind(&p.t_o1_gate, &[&fb, &gb, &att, &u_gate]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-o1") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&p.t_o1_pack);
+            pass.set_bind_group(0, &bg_pack, &[]);
+            pass.dispatch_workgroups((nq.max(nk) as u32).div_ceil(256), nt as u32, 1);
+            pass.set_pipeline(&p.t_o1_gate);
+            pass.set_bind_group(0, &bg_gate, &[]);
+            pass.dispatch_workgroups((nq as u32).div_ceil(256), nt as u32, 1);
+        }
+        submit(c, enc.finish());
+        let (gpq, gpk, gpv, gqt, gatt) = (
+            train_ops::download(c, &pq, nt * nq).unwrap(),
+            train_ops::download(c, &pk, nt * nk).unwrap(),
+            train_ops::download(c, &pv, nt * nk).unwrap(),
+            train_ops::download(c, &qt, qcap * nq).unwrap(),
+            train_ops::download(c, &att, nt * qs).unwrap(),
+        );
+        for t in 0..nt {
+            assert_eq!(&gpq[t * nq..(t + 1) * nq], &q[t * qs..t * qs + nq], "packed q row {t}");
+            assert_eq!(&gpk[t * nk..(t + 1) * nk], &k[t * ks..t * ks + nk], "packed k row {t}");
+            assert_eq!(&gpv[t * nk..(t + 1) * nk], &v[t * ks..t * ks + nk], "packed v row {t}");
+            let pos = pos0 + t;
+            if pos % stride == 0 {
+                let rr = pos / stride;
+                assert_eq!(&gqt[rr * nq..(rr + 1) * nq], &q[t * qs..t * qs + nq], "trace row {rr}");
+            }
+            for i in 0..nq {
+                let want = far[t * nq + i] / (1.0 + (-gate[t * qs + i]).exp());
+                let got = gatt[t * qs + i];
+                assert!((got - want).abs() <= 1e-5 * want.abs().max(1.0), "gate row {t} lane {i}: {got} vs {want}");
+            }
+        }
+        // rows the table did not name stay untouched
+        let other: Vec<usize> = (0..qcap).filter(|rr| !(pos0..pos0 + nt).any(|pos| pos % stride == 0 && pos / stride == *rr)).collect();
+        for rr in other {
+            assert!(gqt[rr * nq..(rr + 1) * nq].iter().all(|&x| x == 0.0), "trace row {rr} written");
+        }
+    }
+
+    /// The experts' tube kernels against the host: random q8_2f tubes of six experts,
+    /// two tokens with four winners each (one rank empty), the MoE output accumulated.
+    #[test]
+    fn tube_kernels_match_host() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        // Six experts, one of them (4) without a tube; h = 64 so the gate/up kernel runs
+        // two row blocks; a shared expert's tube with its own bank.
+        let (hidden, h, k, ne, nt) = (256usize, 64usize, 4usize, 6usize, 2usize);
+        let slots = k + 1;
+        let notube = 4usize;
+        let mut r = Rnd(0x7B3E_0002);
+        let fill = |r: &mut Rnd, n: usize| -> Vec<f32> { (0..n).map(|_| r.n() * 0.2).collect() };
+        let seg_g = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[h, hidden]).unwrap().div_ceil(16) * 16;
+        let seg_d = cortiq_core::quant::expected_nbytes(TensorDtype::Q8_2f, &[hidden, h]).unwrap().div_ceil(16) * 16;
+        // a bank of `n` tubes, float and encoded
+        let mut bank = |r: &mut Rnd, n: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            let (mut gb, mut ub, mut db) = (vec![0u8; n * seg_g], vec![0u8; n * seg_g], vec![0u8; n * seg_d]);
+            let (mut gf, mut uf, mut df) = (Vec::new(), Vec::new(), Vec::new());
+            for e in 0..n {
+                for (dst, seg, rows, cols, keep) in [(&mut gb, seg_g, h, hidden, &mut gf), (&mut ub, seg_g, h, hidden, &mut uf), (&mut db, seg_d, hidden, h, &mut df)] {
+                    let vals = fill(r, rows * cols);
+                    let enc = cortiq_core::quant::encode_q8_2f(&vals, rows, cols);
+                    let mut deq = vec![0f32; rows * cols];
+                    cortiq_core::quant::dequant_q8_2f(&enc, rows, cols, &mut deq);
+                    dst[e * seg..e * seg + enc.len()].copy_from_slice(&enc);
+                    keep.push(deq);
+                }
+            }
+            (gb, ub, db, gf, uf, df)
+        };
+        let (gb, ub, db, gf, uf, df) = bank(&mut r, ne - 1);
+        let (sgb, sub, sdb, sgf, suf, sdf) = bank(&mut r, 1);
+        // expert e's entry in the packed bank
+        let slot: Vec<u32> = (0..ne).map(|e| if e == notube { u32::MAX } else if e < notube { e as u32 } else { e as u32 - 1 }).collect();
+        let xs = es(hidden * 4) as usize;
+        let cs = es(4 * k * 4) as usize;
+        let x = fill(&mut r, nt * xs);
+        let mo0 = fill(&mut r, nt * xs);
+        // winners: (expert, weight) pairs in the cold list's second block; token 1 picks the
+        // expert without a tube
+        let picks: [[(u32, f32); 4]; 2] = [[(3, 0.4), (0, 0.3), (5, 0.2), (1, 0.1)], [(2, 0.5), (4, 0.3), (u32::MAX, 0.0), (u32::MAX, 0.0)]];
+        let mut win = vec![0u32; nt * cs];
+        for t in 0..nt {
+            for j in 0..k {
+                let (e, w) = picks[t][j];
+                win[t * cs + 2 * k + 2 * j] = e;
+                win[t * cs + 2 * k + 2 * j + 1] = w.to_bits();
+            }
+        }
+        // the route's weight table: the shared expert's σ at column k
+        let sigma = [0.7f32, 0.35];
+        let mut mwt = vec![0f32; nt * slots];
+        for t in 0..nt {
+            mwt[t * slots + k] = sigma[t];
+        }
+        let up_f = |label: &str, data: &[f32]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, (data.len() * 4) as u64);
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+            b
+        };
+        let up_b = |label: &str, data: &[u8]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, data.len() as u64);
+            c.queue.write_buffer(&b, 0, data);
+            b
+        };
+        let (bg_, bu_, bd_) = (up_b("t-tg", &gb), up_b("t-tu", &ub), up_b("t-td", &db));
+        let (sg_, su_, sd_) = (up_b("t-sg", &sgb), up_b("t-su", &sub), up_b("t-sd", &sdb));
+        let slotb = up_b("t-slot", bytemuck::cast_slice(&slot));
+        let sslotb = up_b("t-sslot", bytemuck::cast_slice(&[0u32]));
+        let xb = up_f("t-x", &x);
+        let mob = up_f("t-mo", &mo0);
+        let mwtb = up_f("t-mwt", &mwt);
+        let winb = up_b("t-win", bytemuck::cast_slice(&win));
+        let act = storage_buf(c, "t-act", (nt * k * h * 4) as u64);
+        let sact = storage_buf(c, "t-sact", (nt * h * 4) as u64);
+        let (hid32, h32, k32) = (hidden as u32, h as u32, k as u32);
+        let u = uniform_u32x16(c, [hid32, h32, k32, ne as u32, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, k32, slots as u32, 0, 0, 0, 0, 0]);
+        let su = uniform_u32x16(c, [hid32, h32, 0, 1, xs as u32, cs as u32, (seg_g / 4) as u32, (seg_d / 4) as u32, xs as u32, 1, slots as u32, k32, 1, 0, 0, 0]);
+        let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
+            let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
+        };
+        let bg1 = bind(&p.t_tube_gu, &[&bg_, &bu_, &xb, &winb, &act, &u, &slotb]);
+        let bg2 = bind(&p.t_tube_dn, &[&bd_, &act, &winb, &mob, &u, &mwtb, &slotb]);
+        let bg3 = bind(&p.t_tube_gu, &[&sg_, &su_, &xb, &winb, &sact, &su, &sslotb]);
+        let bg4 = bind(&p.t_tube_dn, &[&sd_, &sact, &winb, &mob, &su, &mwtb, &sslotb]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-tube") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&p.t_tube_gu);
+            pass.set_bind_group(0, &bg1, &[]);
+            pass.dispatch_workgroups(k as u32, nt as u32, (h as u32).div_ceil(32));
+            pass.set_pipeline(&p.t_tube_dn);
+            pass.set_bind_group(0, &bg2, &[]);
+            pass.dispatch_workgroups((hidden as u32).div_ceil(256), nt as u32, 1);
+            pass.set_pipeline(&p.t_tube_gu);
+            pass.set_bind_group(0, &bg3, &[]);
+            pass.dispatch_workgroups(1, nt as u32, (h as u32).div_ceil(32));
+            pass.set_pipeline(&p.t_tube_dn);
+            pass.set_bind_group(0, &bg4, &[]);
+            pass.dispatch_workgroups((hidden as u32).div_ceil(256), nt as u32, 1);
+        }
+        submit(c, enc.finish());
+        let got_act = train_ops::download(c, &act, nt * k * h).unwrap();
+        let got_sact = train_ops::download(c, &sact, nt * h).unwrap();
+        let got_mo = train_ops::download(c, &mob, nt * xs).unwrap();
+        let tube = |gf: &[f32], uf: &[f32], xv: &[f32], i: usize| -> f32 {
+            let g: f32 = (0..hidden).map(|d| gf[i * hidden + d] * xv[d]).sum();
+            let uu: f32 = (0..hidden).map(|d| uf[i * hidden + d] * xv[d]).sum();
+            g / (1.0 + (-g).exp()) * uu
+        };
+        for t in 0..nt {
+            let xv = &x[t * xs..t * xs + hidden];
+            let mut want = mo0[t * xs..t * xs + hidden].to_vec();
+            for j in 0..k {
+                let (e, w) = picks[t][j];
+                if e == u32::MAX || e as usize == notube {
+                    assert!(got_act[(t * k + j) * h..(t * k + j + 1) * h].iter().all(|&a| a == 0.0), "rank {j} of token {t} should be empty");
+                    continue;
+                }
+                let s = slot[e as usize] as usize;
+                for i in 0..h {
+                    let a = tube(&gf[s], &uf[s], xv, i);
+                    let got = got_act[(t * k + j) * h + i];
+                    assert!((got - a).abs() <= 1e-4 * a.abs().max(1.0), "act t{t} j{j} i{i}: {got} vs {a}");
+                    for d in 0..hidden {
+                        want[d] += w * a * df[s][d * h + i];
+                    }
+                }
+            }
+            for i in 0..h {
+                let a = tube(&sgf[0], &suf[0], xv, i);
+                let got = got_sact[t * h + i];
+                assert!((got - a).abs() <= 1e-4 * a.abs().max(1.0), "shared act t{t} i{i}: {got} vs {a}");
+                for d in 0..hidden {
+                    want[d] += sigma[t] * a * sdf[0][d * h + i];
+                }
+            }
+            for d in 0..hidden {
+                let got = got_mo[t * xs + d];
+                assert!((got - want[d]).abs() <= 2e-4 * want[d].abs().max(1.0), "out t{t} d{d}: {got} vs {}", want[d]);
+            }
+        }
     }
 
     #[test]

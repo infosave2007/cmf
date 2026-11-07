@@ -83,6 +83,7 @@ pub mod qtensor;
 pub mod qwen3te;
 pub mod qwen3vis;
 pub mod qwen4_exp;
+pub mod qwen4_o1;
 pub mod qwen_image;
 pub mod qwen_image21;
 pub mod qwen_image21_vae;

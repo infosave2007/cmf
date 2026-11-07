@@ -95,6 +95,15 @@ pub struct Layer {
     idx: Option<LayerIdx>,
 }
 
+impl Layer {
+    /// (routed experts, intermediate width of one) — `(0, 0)` for a layer
+    /// without experts.
+    pub fn expert_geometry(&self) -> (usize, usize) {
+        let inter = self.moe.experts.first().map_or(0, |d| d.gate_proj.rows());
+        (self.moe.experts.len(), inter)
+    }
+}
+
 pub struct Globals {
     embed: QTensor,
     lm_head: QTensor,
@@ -441,7 +450,7 @@ impl State {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.hyper.clear();
         self.token_history.clear();
         self.pos = 0;
@@ -2679,8 +2688,9 @@ fn dynamic_moe_gpu(
     let mut cold = Vec::new();
     let mut cold_x = Vec::new();
     let (frame_ok, mut cold_cpu) = std::thread::scope(|scope| {
+        // The resident kernels know no tubes: every winner's come below.
         let cpu = (!cold_jobs.is_empty())
-            .then(|| scope.spawn(|| crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)));
+            .then(|| scope.spawn(|| crate::pipeline::moe_cold_experts_cpu_with(&cold_jobs, x, pool, false)));
         let ok = crate::gpu_wgpu::dsv4_moe_frame(
             &model,
             &weights,
@@ -2710,6 +2720,14 @@ fn dynamic_moe_gpu(
         *o += c;
     }
     crate::attention::recycle_buf(&mut cold_cpu);
+    // The experts' hot neurons (`hot-bake --experts`), resident or cold alike, and the
+    // shared expert's tube (`--shared-q8`).
+    for &e in &picks {
+        crate::pipeline::expert_tubes_add(&m.experts[e], x, mix_weights[e], &mut out, pool);
+    }
+    if let Some((se, _)) = &m.shared {
+        crate::pipeline::expert_tubes_add(se, x, shared_weight, &mut out, pool);
+    }
     Some((out, picks))
 }
 
@@ -3448,9 +3466,51 @@ fn forward_tokens_device(
             .iter()
             .map(|l| (matches!(l.mixer, Mixer::Gdn(_)), l.ple.is_some()))
             .collect();
-        let Some(dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
+        let Some(mut dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
             return off(state, "device state allocation refused");
         };
+        // The attention layers' far field: the file's turbo header or `CMF_QWEN_O1`.
+        if let Some(o1) = crate::qwen4_o1::Qwen4O1::from_model(&model) {
+            match o1.check(g.head_dim) {
+                Ok(()) => {
+                    let (m, w, sink, seal) = (o1.o1.m, o1.o1.w, o1.o1.sink, o1.o1.seal);
+                    let exact = o1.exact.as_ref().map_or(0, |x| x.budget);
+                    if dev.set_o1(&g, o1) {
+                        tracing::info!("qwen4 O(1): {m} landmarks, window {w}, {sink} sinks, {exact} exact rows, seal at {seal}");
+                    }
+                }
+                Err(e) => tracing::warn!("{e}; the attention layers stay exact"),
+            }
+        }
+        // The experts' hot neurons (`hot-bake --experts`): one q8_2f tube per routed
+        // expert, resident on the card beside the skeleton.
+        let tubes: Vec<Vec<Option<(usize, usize, usize)>>> = layers
+            .iter()
+            .map(|l| {
+                l.moe
+                    .experts
+                    .iter()
+                    .map(|e| match e.segs.as_slice() {
+                        [s] => Some((s.gate.model_idx()?, s.up.model_idx()?, s.down.model_idx()?)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        if layers.iter().any(|l| l.moe.experts.iter().any(|e| e.segs.len() > 1)) {
+            return off(state, "an expert with more than one tube");
+        }
+        // The shared expert's tube (`hot-bake --shared-q8`: the whole expert at eight bits).
+        let shared: Vec<Option<(usize, usize, usize)>> = layers
+            .iter()
+            .map(|l| match l.moe.shared.as_ref().map(|(se, _)| se.segs.as_slice()) {
+                Some([s]) => Some((s.gate.model_idx()?, s.up.model_idx()?, s.down.model_idx()?)),
+                _ => None,
+            })
+            .collect();
+        if layers.iter().any(|l| l.moe.shared.as_ref().is_some_and(|(se, _)| se.segs.len() > 1)) {
+            return off(state, "a shared expert with more than one tube");
+        }
         let t0 = std::time::Instant::now();
         let Some(bytes) = q4::prewarm(&model, &globals.skeleton_idxs) else {
             return off(state, "skeleton does not fit the VRAM budget");
@@ -3461,6 +3521,13 @@ fn forward_tokens_device(
             bytes >> 20,
             t0.elapsed().as_secs_f64()
         );
+        // The tubes after the skeleton, so the budget check sees what is up.
+        if tubes.iter().flatten().any(Option::is_some) || shared.iter().any(Option::is_some) {
+            if !dev.set_tubes(&model, &g, &tubes, &shared) {
+                return off(state, "expert tubes do not load or do not fit the VRAM budget");
+            }
+            tracing::info!("qwen4 tubes: {} MB of expert tubes resident", dev.tube_bytes() >> 20);
+        }
         if prof {
             eprintln!(
                 "qwen4-device: skeleton {} MB resident in {:.2}s",
@@ -3749,7 +3816,9 @@ fn forward_tokens_device(
     let mut pf = DevProf::default();
     let cold_on_device = std::env::var("CMF_QWEN_COLD_DEVICE").as_deref() != Ok("0");
     // Several tokens per frame rule the gated chain out (one frame per layer).
-    let chain_len = if ntok > 1 {
+    // Sealed O(1) layers dispatch directly: a chain's aborted frame would still
+    // run their state pushes, and a row pushed twice is a row evicted twice.
+    let chain_len = if ntok > 1 || dev.o1.is_some() {
         1
     } else {
         std::env::var("CMF_QWEN_CHAIN")
@@ -4199,7 +4268,8 @@ fn forward_tokens_device(
                 pf.cold_dev += cold_slots[t].len();
                 if !jobs.is_empty() {
                     let tc = std::time::Instant::now();
-                    cold_vec[t] = Some(crate::pipeline::moe_cold_experts_cpu(&jobs, &x2, pool));
+                    // the card adds every winner's tube (`q4t_tube_*`)
+                    cold_vec[t] = Some(crate::pipeline::moe_cold_experts_cpu_with(&jobs, &x2, pool, false));
                     pf.cold_cpu += tc.elapsed();
                 }
                 if check
@@ -4265,6 +4335,11 @@ fn forward_tokens_device(
     }
     if let Some(d) = state.dev.as_mut() {
         d.pos = pos0 + ntok;
+        // A prompt past the seal goes over to the far field (a verify window
+        // waits for its accepted rows: `decode_spec_device` seals then).
+        if !check && !snapshot && d.o1_seal_at().is_some_and(|at| pos0 + ntok >= at) {
+            d.seal(&g, pos0 + ntok);
+        }
     }
     if let (Some(pr), Ok(path)) = (
         state.profile.as_mut(),
@@ -4916,6 +4991,13 @@ pub fn spec_round(
         a += 1;
     }
     let logits = std::mem::take(&mut state.window_logits).swap_remove(a);
+    // Sealed O(1) layers: the accepted rows' keys and values go from the spec
+    // stash into the ring and the far field; the rejected rows never happened.
+    if let Some(uid) = state.dev.as_ref().filter(|d| d.o1_sealed()).map(|d| d.uid()) {
+        if !crate::gpu_wgpu::o1_spec_commit(uid, next_pos, a + 1) {
+            return None;
+        }
+    }
     // ── roll back what the rejected drafts changed ──
     if a < k {
         let dev = state.dev.as_mut()?;
@@ -4930,6 +5012,11 @@ pub fn spec_round(
         if let Some(mut enc) = q4::new_encoder("qwen4-keep-r") {
             dev.keep_r(&mut enc, a);
             q4::submit_only(enc);
+        }
+    }
+    if let Some(d) = state.dev.as_mut() {
+        if d.o1_seal_at().is_some_and(|at| state.pos >= at) {
+            d.seal(&g, state.pos);
         }
     }
     if let Some(head) = state.mtp.as_mut() {
