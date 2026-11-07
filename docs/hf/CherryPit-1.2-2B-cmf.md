@@ -37,10 +37,8 @@ hf download infosave/CherryPit-1.2-2B-cmf CherryPit-1.2-2B-q8_2f.cmf --local-dir
 cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a search box and a list that loads on open." --no-think --max-tokens 1024
 ```
 
-Prebuilt binaries for Linux, macOS and Windows are on the
-[releases page](https://github.com/infosave2007/cmf/releases). cortiq 0.8.61 runs both files; the speeds below
-need the release after 0.8.62, which reads a prompt of this model on the host path (2 048 tokens in about
-11 s on an RTX 5090) and decodes it about a third slower on Vulkan. `--no-think` asks for a direct answer.
+Use cortiq 0.8.63 or later; prebuilt binaries for Linux, macOS and Windows are on the
+[releases page](https://github.com/infosave2007/cmf/releases). `--no-think` asks for a direct answer.
 
 ## Files
 
@@ -162,9 +160,8 @@ hf download infosave/CherryPit-1.2-2B-cmf CherryPit-1.2-2B-q8_2f.cmf --local-dir
 cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a search box and a list that loads on open." --no-think --max-tokens 1024
 ```
 
-Готовые сборки — на [странице релизов](https://github.com/infosave2007/cmf/releases). cortiq 0.8.61
-запускает оба файла; скорость из таблицы — с релиза после 0.8.62: в нём промпт этой модели читается
-хостовым путём (2 048 токенов примерно за 11 с на RTX 5090), а генерация на Vulkan примерно на треть медленнее. `--no-think` даёт прямой ответ.
+Нужен cortiq 0.8.63 или новее; готовые сборки — на [странице релизов](https://github.com/infosave2007/cmf/releases).
+`--no-think` даёт прямой ответ.
 
 ### Файлы
 
@@ -254,9 +251,8 @@ hf download infosave/CherryPit-1.2-2B-cmf CherryPit-1.2-2B-q8_2f.cmf --local-dir
 cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a search box and a list that loads on open." --no-think --max-tokens 1024
 ```
 
-预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。cortiq 0.8.61 可以运行这两个文件；
-表中的速度需要 0.8.62 之后的版本：0.8.62 用主机路径读取该模型的提示词（RTX 5090 上 2 048 个 token
-约 11 秒），Vulkan 上的生成也慢约三分之一。`--no-think` 直接给出回答。
+需要 cortiq 0.8.63 或更新版本；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。
+`--no-think` 直接给出回答。
 
 ### 文件
 
