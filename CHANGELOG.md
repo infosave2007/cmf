@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.63] — 2026-11-07
+
 ### Added
+- CherryPit-1.2-2B (DRUPEs, a MiniCPM5-2B finetune) in CMF: `q8_2f`, a chat-calibrated GPTQ `q4tp` with the attention
+  at eight bits, and a Turbo file with exact-row weights fitted for its 42 layers (`scripts/cherrypit/`). Cards
+  `docs/hf/CherryPit-1.2-2B-cmf.md`, `docs/hf/CherryPit-1.2-2B-Turbo-cmf.md`.
 - Minico-M1-1105 (Mincofficial, a fine-tune of LFM2.5-350M) in CMF:
   [three files](https://huggingface.co/infosave/Minico-M1-1105-cmf), `q8_2f`, `q4tp` and a turbo file with 248 rows
   kept exact (`scripts/minico/keep_minico.bin`, fitted with `scripts/dory/router/q27_feat.py`). MacBook Air M4,
@@ -18,7 +23,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cortiq serve` returns LFM2's pythonic tool calls, `<|tool_call_start|>[name(k='v')]<|tool_call_end|>`, as
   `message.tool_calls`, streamed or not. Before, they came back as text.
 
+### Changed
+- On native Metal a pure-attention model (Llama, MiniCPM5 and the like) reads its prompt through the batched rows
+  graph, as the GDN hybrids already did, instead of the host walk: CherryPit-1.2-2B on a MacBook Air M4, an
+  8 192-token prompt in 31 s instead of 58 s (q4tp; q8_2f 34 s instead of 55), 2 048 tokens in 4.5 s instead of
+  6.0 (q8_2f 5.5 s instead of 9.2); WikiText-2 ppl through the graph equal to the host's to three decimals.
+  `CMF_METAL_PREFILL=0` keeps the host walk.
+- On Vulkan/DX12 a fully resident pure-attention model reads its prompt through the batched graph, as MoE and GDN
+  models already did, instead of the chunked host walk that paid a submit, a wait and a readback per projection
+  and per attend. CherryPit-1.2-2B on an RTX 5090: 2 048 tokens in 1.2 s instead of 10.9 (q8_2f; q4tp 1.0 s
+  instead of 10.5), 8 192 in 7.2 s instead of 49.6, and decode at that depth 68 → 91 tok/s; the same greedy text
+  and WikiText-2 ppl. `CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked walk.
+- Decode attention on Vulkan/DX12 is a flash-decoding kernel (`gpu_wgpu/attend_fd.rs`) from 16 cached positions on: a
+  workgroup of eight 32-lane subgroups takes a chunk of the KV group, a subgroup reads each K and V row whole and
+  coalesced, scores every query head of the group with one `subgroupAdd` and keeps the online softmax in registers;
+  the subgroups meet in workgroup memory and `gqa_attend_merge` joins the chunks as before. The old split kernel gave
+  a model with two KV heads 32 workgroups at 4 096 positions and walked 256 V rows in a row. CherryPit-1.2-2B on an
+  RTX 5090, decode tok/s old → new: q4tp 110 → 182 at 512 positions, 113 → 164 at 2 048, 106 → 147 at 4 096,
+  92 → 117 at 8 192, 72 → 90 at 32 000; q8_2f 103 → 163, 102 → 142, 98 → 143, 91 → 110; chat answers 110 → 136–164
+  (q4tp) and 101 → 135–150 (q8_2f) with the same greedy text. Needs 32-lane subgroups and heads of 64, 128 or 256;
+  `CMF_ATTEND_FD=0` keeps the old kernels.
+- A sealed (far-field) layer decodes on Vulkan/DX12 in two dispatches instead of the seven `o1_stages`
+  (`gpu_wgpu/o1_fd.rs`): the near rows (sinks, then the ring of the window and the exact rows) through the same
+  flash-decoding pass, then one workgroup a query head scores its landmarks, builds the far part as `o1s_far` does and
+  writes (Σ near + Σ far) / (Σ near weights + far mass). CherryPit-1.2-2B Turbo on an RTX 5090, decode past the seal:
+  56 → 108 tok/s at 16 000 tokens, 67 → 153 at 32 000. `CMF_O1_FD=0` keeps the stages.
+
 ### Fixed
+- `cortiq serve` with `"enable_thinking": false` replaced a system prompt the chat template writes itself when the
+  conversation has none: the direct-answer directive went in as the system message, so CherryPit-1.2-2B lost its
+  identity prompt and answered "Who are you?" as "a MiniCPM series model". The directive is now left out for such
+  templates (`Tokenizer::template_has_default_system`); `cortiq run --no-think` was not affected.
+- The f32 GEMM on the CPU (f16/bf16 files, `force_f32` tensors) ran on one core whenever the chunk was shorter than 256
+  positions, which every prefill chunk on a Mac is: it now splits the output rows across the pool, bit-identical. The
+  f16 CherryPit-1.2-2B scores WikiText-2 (12 × 512 tokens) on an M4 at 785 % CPU instead of 100 %.
 - `cortiq convert` on LFM2 configs written by Transformers 5, which state the tied head as `tie_embedding`: the file
   did not load ("Tensor not found: lm_head.weight").
 - A turbo file kept no row exact where the prompt is read on the host (LFM2 on Metal, whose short convolutions the

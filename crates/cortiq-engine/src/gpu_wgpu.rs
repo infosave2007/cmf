@@ -57,6 +57,10 @@ pub(crate) mod gemma_batch;
 pub(crate) mod lfm_set;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod amd_mv;
+/// Flash-decoding split attend of the decode graph (subgroups, all lanes).
+pub(crate) mod attend_fd;
+/// A sealed (far-field) layer's decode attention in two dispatches.
+pub(crate) mod o1_fd;
 pub(crate) mod dense_mv;
 pub(crate) mod dense_split;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
@@ -19756,6 +19760,10 @@ pub struct Ctx {
     g4_sandwich_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
+    /// Flash-decoding split attend per (heads a KV group, head width) (`attend_fd`).
+    attend_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<attend_fd::FdPipe>>>,
+    /// Two-dispatch sealed-layer attend per (heads a KV group, head width) (`o1_fd`).
+    o1_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<o1_fd::O1FdPipe>>>,
     dense_split_pipes: std::sync::OnceLock<Option<dense_split::SplitPipes>>,
     amd_mv_pipes: std::sync::OnceLock<Option<amd_mv::AmdMv>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
@@ -22863,6 +22871,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_dec_pipe: std::sync::OnceLock::new(),
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
+        attend_fd_pipes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        o1_fd_pipes: std::sync::Mutex::new(std::collections::HashMap::new()),
         dense_split_pipes: std::sync::OnceLock::new(),
         amd_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
@@ -30335,7 +30345,53 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.o1_push);
                         pass.set_bind_group(0, &bg_push, &[]);
                         pass.dispatch_workgroups(gg as u32, 1, 1);
-                        if let Some(f) = o1_stages::pipes(c, hh_).filter(|_| hd % 4 == 0 && mm <= 32 && !rect_fm) {
+                        if let Some(fp) = o1_fd::pipe(c, hh_, hd, mm).filter(|_| hd % 4 == 0 && !rect_fm) {
+                            // Two dispatches in place of the seven stages: the near rows
+                            // (sinks, then the ring) through the flash-decoding pass, then
+                            // one merge a query head with the landmarks' far part.
+                            let ncap = nns + ww;
+                            let ck = attend_fd::FD_WARPS * attend_fd::per_warp(ncap, gg);
+                            let nc = ncap.div_ceil(ck);
+                            let pacc = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.apacc,
+                                (nh * nc * hd * 4) as u64,
+                                st,
+                                "g-apacc",
+                            );
+                            let pml = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.apml,
+                                (nh * nc * 8) as u64,
+                                st,
+                                "g-apml",
+                            );
+                            let ou = unif(&[
+                                hh_ as u32,
+                                mm as u32,
+                                ww as u32,
+                                nns as u32,
+                                hd as u32,
+                                gg as u32,
+                                sc.to_bits(),
+                                ncap as u32,
+                            ]);
+                            let fu = unif(&[ck as u32, nc as u32, 0, 0]);
+                            let bg_p = bg(
+                                &fp.part.1,
+                                &[&ou, &dmeta, &qout, &drk, &dsk, &drv, &dsv, &pacc, &pml, &fu],
+                            );
+                            let bg_m = bg(
+                                &fp.merge.1,
+                                &[&ou, &dmeta, &qout, &dkt, &dmu, &dmz, &dth, &pacc, &pml, &fu, &attn],
+                            );
+                            pass.set_pipeline(&fp.part.0);
+                            pass.set_bind_group(0, &bg_p, &[]);
+                            pass.dispatch_workgroups(gg as u32, nc as u32, 1);
+                            pass.set_pipeline(&fp.merge.0);
+                            pass.set_bind_group(0, &bg_m, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if let Some(f) = o1_stages::pipes(c, hh_).filter(|_| hd % 4 == 0 && mm <= 32 && !rect_fm) {
                             let st = {
                                 let map = c.o1m.lock().unwrap();
                                 map.get(&(kv_id, layer_base + li)).unwrap().stages.clone()
@@ -30735,6 +30791,7 @@ pub fn forward_token_graph(
                         ts_point!(enc, 23); // attend
                     } else {
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                        ts_point!(enc, 20); // qkv projections
                         // rope + kv_append are independent (both read kb, neither
                         // writes it) — share ONE compute pass to avoid the inter-pass
                         // pipeline flush (~78 μs on NVIDIA Vulkan).
@@ -30742,7 +30799,17 @@ pub fn forward_token_graph(
                         // Short context (the decode regime): attend + output gate +
                         // O-projection ride the SAME pass as rope/kv when they prep —
                         // five passes become one, and dispatch order is unchanged.
-                        let short_ctx = !(n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend));
+                        // The flash-decoding split kernel (`attend_fd`) takes over
+                        // from `attend_fd::min_positions` on: the one-workgroup-per-head
+                        // attend below it slowed from 152 to 109 tok/s between 100 and
+                        // 250 positions on CherryPit-1.2-2B (RTX 5090).
+                        let fd = (nkv > 0 && nh % nkv == 0)
+                            .then(|| attend_fd::pipe(c, nh / nkv, hd))
+                            .flatten();
+                        let split_min =
+                            if fd.is_some() { attend_fd::min_positions() } else { ATTEND_SPLIT_MIN };
+                        let short_ctx =
+                            !(n_ctx > split_min && (hd <= 128 || c.big_attend || fd.is_some()));
                         if passfuse && short_ctx && !skip_attn && hg.is_none() {
                             attn_done = true;
                             let (mut ap, al) = attend_pipes(c, hd);
@@ -30873,22 +30940,34 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bg_kv, &[]);
                                 pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                             }
-                            if n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend) {
+                            ts_point!(enc, 22); // rope + kv append
+                            if !short_ctx {
                                 // Split-K attend: (nh × chunks) part workgroups + a
                                 // per-head merge, both in ONE pass (WebGPU orders
                                 // dispatches within a pass, so the merge sees the
                                 // partials without an inter-pass flush).
                                 // GQA-shared kernel: one workgroup per (kv head,
-                                // 256-position chunk) serves all its query heads.
+                                // 256-position chunk) serves all its query heads;
+                                // the flash-decoding one a chunk of 8 subgroups ×
+                                // `per_warp` positions, sized so the card holds
+                                // about 128 workgroups, its partials packed by the
+                                // chunks in use.
                                 let hpk = nh / nkv;
-                                let gqa = c.attend_gpart.is_some()
+                                let gqa = fd.is_none()
+                                    && c.attend_gpart.is_some()
                                     && hpk <= 8
                                     && hd <= 256
                                     && hd % 4 == 0
                                     && nh % nkv == 0;
-                                let ck = if gqa { ATTEND_GCK } else { ATTEND_CK };
-                                let nc = cap.div_ceil(ck);
+                                let ck = if fd.is_some() {
+                                    attend_fd::FD_WARPS * attend_fd::per_warp(n_ctx, nkv)
+                                } else if gqa {
+                                    ATTEND_GCK
+                                } else {
+                                    ATTEND_CK
+                                };
                                 let nc_used = n_ctx.div_ceil(ck);
+                                let nc = if fd.is_some() { nc_used } else { cap.div_ceil(ck) };
                                 let pacc = GraphScratch::ensure(
                                     &c.device,
                                     &mut gs.apacc,
@@ -30913,7 +30992,9 @@ pub fn forward_token_graph(
                                     nc as u32,
                                     attn_scale.to_bits(),
                                 ]);
-                                let (pp, pl) = if gqa {
+                                let (pp, pl) = if let Some(f) = fd.as_ref() {
+                                    (&f.0, &f.1)
+                                } else if gqa {
                                     (
                                         c.attend_gpart.as_ref().unwrap(),
                                         c.layout_attend_gpart.as_ref().unwrap(),
@@ -30921,7 +31002,7 @@ pub fn forward_token_graph(
                                 } else {
                                     attend_part_pipes(c, hd)
                                 };
-                                let part_x = if gqa { nkv as u32 } else { nh as u32 };
+                                let part_x = if gqa || fd.is_some() { nkv as u32 } else { nh as u32 };
                                 let bg_part = bg(pl, &[&qout, kbuf, vbuf, &pacc, &pml, &ap_u]);
                                 let bg_merge =
                                     c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -30973,6 +31054,7 @@ pub fn forward_token_graph(
                                     );
                                 }
                             }
+                            ts_point!(enc, 23); // attend
                         } // fused-vs-split attend arms
                           // attn_out *= sigmoid(gate) before the O projection.
                     }

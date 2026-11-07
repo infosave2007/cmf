@@ -3102,8 +3102,8 @@ impl Pipeline {
         // builds that state on the CPU only, leaving the GPU buffers zeroed at
         // decode → garbage. Route GDN-hybrid prefill through the graph one
         // position at a time so the resident state is seeded exactly as decode
-        // will read it. Pure-attention models keep the batched CPU prefill (its
-        // KV mirror re-syncs from the CPU cache, so no seeding gap).
+        // will read it. Fully resident pure-attention models take the batched
+        // graph as well (see the end of this function).
         let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill);
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
@@ -3162,10 +3162,17 @@ impl Pipeline {
         // every token on the host, and the chunked prefill (GEMMs on the
         // card, the expert loop batched on the host) is the faster ingest
         // (the 8 GB ladder point: 7 tok/s chunked against ~1 walked).
-        self.weights
+        // Dense stacks too: the chunked walk paid a submit, a wait and a
+        // readback per projection and per attend, so a resident 2B read its
+        // prompt at the host's pace (CherryPit-1.2-2B on an RTX 5090, 2048
+        // tokens: 10.6 s chunked, 1.2 s through the batched graph, the same
+        // greedy text). `CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked walk.
+        (self
+            .weights
             .layers
             .iter()
             .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
+            || std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() != Ok("0"))
             && self.automatic_gpu_prefix().is_none()
     }
 
@@ -6927,14 +6934,17 @@ impl Pipeline {
         // the chunk — instead of one token-graph submit per position (the
         // 27B: 8 tok/s → GEMM-bound). The MTP warm-up rows come out of one
         // batched run of the block per chunk. Any refusal leaves the rest
-        // of the prompt to the sequential paths below.
+        // of the prompt to the sequential paths below. Pure-attention
+        // models take it too (the plan admits their layers): CherryPit-1.2-2B
+        // read an 8 192-token prompt on the M4 in 31 s instead of the host
+        // walk's 58 s (q4tp; q8_2f 34 s against 55), at the same WikiText-2
+        // ppl. `CMF_METAL_PREFILL=0` keeps the host walk.
         #[cfg(target_os = "macos")]
         if task_mask.is_none()
             && !dyn_prefill
             && !o1_sealed
             && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
-            && self.gdn_cfg.is_some()
             && !self.per_token_stack()
             && input_ids.len() > 8
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()

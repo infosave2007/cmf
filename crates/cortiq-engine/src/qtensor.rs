@@ -2096,11 +2096,11 @@ impl QTensor {
                 // to `matvec_rows`). The batch is the wide axis of a prefill;
                 // the rows may be few (Spark-X2.5's 16-row g_proj spent
                 // 17 ms a layer here split over its rows).
-                let run = |start: usize, end: usize| {
+                let kernel = |start: usize, end: usize, r0: usize, r1: usize| {
                     let mut bi = start;
                     while bi < end {
                         let n = (end - bi).min(4);
-                        for o in 0..rows {
+                        for o in r0..r1 {
                             let row = &data[o * cols..(o + 1) * cols];
                             if n == 4 {
                                 let x = |k: usize| &xs_all[(bi + k) * cols..(bi + k + 1) * cols];
@@ -2130,7 +2130,17 @@ impl QTensor {
                         bi += n;
                     }
                 };
-                dispatch_rows(pool, b, &run);
+                match pool {
+                    // A chunk shorter than 256 positions (every prefill
+                    // chunk on a Mac) left the whole GEMM on one core: an
+                    // f16 CherryPit-1.2-2B scored 512 tokens in minutes.
+                    // Split the output rows instead; every element keeps
+                    // its own chain, so the result is bit-identical.
+                    Some(pool) if b < 256 && rows >= 256 => {
+                        pool.run_rows(rows, &|r0, r1| kernel(0, b, r0, r1))
+                    }
+                    _ => dispatch_rows(pool, b, &|s, e| kernel(s, e, 0, rows)),
+                }
             }
             Self::Mapped {
                 model,
@@ -13661,6 +13671,23 @@ mod tests {
                 assert_eq!(out[bi * rows + o].to_bits(), one[o].to_bits(), "bi {bi} row {o}");
             }
         }
+    }
+
+    /// A short batch on a pool splits the f32 GEMM over its output rows
+    /// (it used to run on one core); the sums must not change by a bit.
+    #[test]
+    fn f32_matmat_row_split_on_pool_is_bitwise() {
+        let (rows, cols, b) = (300usize, 37usize, 7usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 113) as f32 - 56.0) / 37.0).collect();
+        let xs: Vec<f32> = (0..b * cols).map(|i| ((i * 104_729 % 97) as f32 - 48.0) / 29.0).collect();
+        let t = QTensor::from_f32(w, rows, cols);
+        let mut alone = vec![0f32; b * rows];
+        t.matmat(&xs, b, &mut alone, None);
+        let pool = Pool::new(3);
+        let mut split = vec![0f32; b * rows];
+        t.matmat(&xs, b, &mut split, Some(&pool));
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&alone), bits(&split));
     }
 
     #[test]
