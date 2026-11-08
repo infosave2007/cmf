@@ -496,6 +496,7 @@ async fn lookup_answer_response(
                 }],
                 usage: None,
                 x_cortiq_route: None,
+                timings: None,
             })
             .await;
         let _ = tx
@@ -535,6 +536,7 @@ async fn lookup_answer_response(
             completion_tokens: 0,
             total_tokens: prompt_tokens,
         },
+        timings: None,
         cortiq: None,
         x_cortiq_route: route,
     })
@@ -561,8 +563,16 @@ async fn run_generation(
     on_token: Option<cortiq_engine::TokenCallback>,
     route_text: Option<(String, PromptFrame)>,
     pre_decision: Option<RouteDecision>,
-) -> Result<(GenerateResult, f64, Option<RouteDecision>), Response> {
+) -> Result<(GenerateResult, f64, Option<RouteDecision>, streaming::Timings), Response> {
     let started = std::time::Instant::now();
+    // The first new token closes the prompt's time, as llama-server counts it.
+    let first = std::sync::Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
+    let mut inner = on_token;
+    let first_cb = first.clone();
+    let on_token: Option<cortiq_engine::TokenCallback> = Some(Box::new(move |t: &str| {
+        let _ = first_cb.get_or_init(std::time::Instant::now);
+        inner.as_mut().map_or(true, |cb| cb(t))
+    }));
     // The organism's day side: idle marker + OOD buffer (CMF_OOD_DIR).
     crate::ood::touch_last_request();
     let ood_on = crate::ood::ood_dir().is_some();
@@ -613,7 +623,10 @@ async fn run_generation(
         // A pooled pipeline must not inherit sampling state or RNG position
         // from the request that previously occupied this slot.
         p.set_sampler_config(sampler_config);
-        match remote {
+        let read_from = std::time::Instant::now();
+        // A path that does not count its prompt rows reads them all.
+        p.last_prefill_tokens = usize::MAX;
+        let out = match remote {
             Some(rm) => {
                 if vl_inputs.is_some() || mimo_rows.is_some() {
                     return Err(
@@ -660,13 +673,26 @@ async fn run_generation(
                     None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
                 },
             },
-        }
+        };
+        let end = std::time::Instant::now();
+        out.map(|r| {
+            let read = p.last_prefill_tokens.min(r.prompt_tokens);
+            let first = first.get().copied().unwrap_or(end);
+            let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f64() * 1000.0;
+            let t = streaming::Timings::new(r.prompt_tokens - read, read, ms(read_from, first), r.tokens_generated, ms(first, end));
+            (r, t)
+        })
     })
     .await;
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match outcome {
-        Ok(Ok(result)) => Ok((result, elapsed_ms, decision)),
+        Ok(Ok((result, timings))) => {
+            for line in timings.lines() {
+                tracing::info!("{line}");
+            }
+            Ok((result, elapsed_ms, decision, timings))
+        }
         Ok(Err(e)) => Err(error_response(StatusCode::BAD_REQUEST, e)),
         Err(join_err) => {
             tracing::error!("generation task panicked: {join_err}");
@@ -1194,6 +1220,9 @@ struct ChatCompletionsResponse {
     model: String,
     choices: Vec<ChatChoice>,
     usage: Usage,
+    /// Prompt and decode speed (llama-server's `timings`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<streaming::Timings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cortiq: Option<CortiqResponseMeta>,
     /// Router-v2 decision (`{target, novelty, e_base, e_skill, reason}`);
@@ -1849,6 +1878,7 @@ async fn chat_completions(
                 completion_tokens: 0,
                 total_tokens: prompt_tokens,
             },
+            timings: None,
             cortiq: Some(CortiqResponseMeta {
                 task_used,
                 sparsity: task_mask.map(|mask| mask.sparsity).unwrap_or(0.0),
@@ -1898,6 +1928,7 @@ async fn chat_completions(
                     }],
                     usage: None,
                     x_cortiq_route: None,
+                    timings: None,
                 })
                 .await;
 
@@ -2006,7 +2037,7 @@ async fn chat_completions(
             .await;
 
             match outcome {
-                Ok((result, elapsed_ms, decision)) => {
+                Ok((result, elapsed_ms, decision, timings)) => {
                     if minimax_m3 {
                         state2
                             .runtime
@@ -2060,10 +2091,11 @@ async fn chat_completions(
                         );
                         usage.x_cortiq_route =
                             route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode);
+                        usage.timings = Some(timings);
                         let _ = tx.send(usage).await;
-                        let _ = tx
-                            .send(streaming::finish_chunk(&id, &model, &finish, created))
-                            .await;
+                        let mut fin = streaming::finish_chunk(&id, &model, &finish, created);
+                        fin.timings = Some(timings);
+                        let _ = tx.send(fin).await;
                         return;
                     }
                     // End-of-generation flush of the think filter, by the
@@ -2148,10 +2180,11 @@ async fn chat_completions(
                     );
                     usage.x_cortiq_route =
                         route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode);
+                    usage.timings = Some(timings);
                     let _ = tx.send(usage).await;
-                    let _ = tx
-                        .send(streaming::finish_chunk(&id, &model, &finish, created))
-                        .await;
+                    let mut fin = streaming::finish_chunk(&id, &model, &finish, created);
+                    fin.timings = Some(timings);
+                    let _ = tx.send(fin).await;
                 }
                 Err(_) => {
                     let _ = tx
@@ -2163,7 +2196,7 @@ async fn chat_completions(
 
         stream.into_sse().into_response()
     } else {
-        let (result, elapsed_ms, decision) = match run_generation(
+        let (result, elapsed_ms, decision, timings) = match run_generation(
             state.clone(),
             prompt_ids,
             vl_inputs,
@@ -2267,6 +2300,7 @@ async fn chat_completions(
                 completion_tokens: result.tokens_generated as u32,
                 total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
             },
+            timings: Some(timings),
             cortiq: cortiq_meta,
             x_cortiq_route: route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode),
         })
@@ -2422,6 +2456,8 @@ struct CompletionsResponse {
     choices: Vec<CompletionChoice>,
     usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<streaming::Timings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     x_cortiq_route: Option<serde_json::Value>,
 }
 
@@ -2498,6 +2534,7 @@ async fn completions(
                             completion_tokens: 0,
                             total_tokens: prompt_tokens,
                         },
+                        timings: None,
                         x_cortiq_route: route_json(Some(&d), Some(&outcome), lookup_mode),
                     })
                     .into_response();
@@ -2521,7 +2558,7 @@ async fn completions(
     // (the humanizer's raw-prompt rewrite drifted from the chat one).
     let prompt_ids = state.tokenizer.with_bos(state.tokenizer.encode(&prompt));
 
-    let (result, elapsed_ms, decision) = match run_generation(
+    let (result, elapsed_ms, decision, timings) = match run_generation(
         state.clone(),
         prompt_ids,
         None,
@@ -2564,6 +2601,7 @@ async fn completions(
             completion_tokens: result.tokens_generated as u32,
             total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
         },
+        timings: Some(timings),
         x_cortiq_route: route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode),
     })
     .into_response()
