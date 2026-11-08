@@ -15,7 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
   off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
   Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
-  OrcaCyber at 9.0–14.6 tok/s against 6.1–6.3.
+  OrcaCyber at 9.0–14.6 tok/s against 6.1–6.3. (The default's eligibility asked for the wgpu token graph, which
+  native Metal does not have; it now checks the block shape Metal's own draft step takes.)
+- On a Mac the Neural Engine's surfaces (`CMF_ANE=1`: a layer's FFN and mixer weights in fp16, two sets, about
+  1.5 GB on a 27B) go back once the prompt is read; decode never reads them, and beside a 14 GB weight map on a 24 GB
+  MacBook Air they pushed weight pages out. OrcaCyber-Nano-1.0 after 16 000 tokens read with the Neural Engine, drafts
+  on: decode 6.4 → 8.2 tok/s (page faults 3.6 M → 31 K, the same text); after 3 600 tokens 7.1–7.5 → 7.7.
+  `CMF_ANE_KEEP=1` keeps them for a process that reads prompt after prompt.
 - On Vulkan/DX12 with an NVIDIA card a q4tp prompt reads through the cooperative-matrix (tensor-core) GEMM by
   default (`CMF_BATCH_COOP=0` keeps the scalar tile; `=1` asks for it on other vendors), and a 128-row chunk takes
   the new `q4tp_mm_coop128_s` tile: eight subgroups over one weight tile, so each weight is unpacked once a chunk,

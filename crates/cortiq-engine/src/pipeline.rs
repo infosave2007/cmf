@@ -7534,6 +7534,10 @@ impl Pipeline {
                 _tpf.elapsed().as_secs_f64() * 1000.0
             );
         }
+        // The Neural Engine read the prompt; decode runs on the GPU, so its surfaces go back
+        // to the weight map (`ane::release_idle`).
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::ane::release_idle();
         if self
             .graph_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
