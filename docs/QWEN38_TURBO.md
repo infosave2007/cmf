@@ -131,8 +131,9 @@ matvec that reads the weights as fast as one row does, 95.7 and 82.4 GB/s agains
 logits equal the plain path's to four decimal places. The chain's depth follows how often each of its drafts holds:
 two drafts on most text, where a fixed seven gave an essay nothing. Where an answer repeats a stretch of the prompt or
 of itself, the tokens that followed that stretch continue the chain up to seven drafts (`CMF_SPEC_LOOKUP=0` turns this
-off). Past the seal, at 16 000 tokens, drafts gave 4.6 tok/s against 4.9 before these changes and were not measured
-again.
+off). Past the seal they pay too: OrcaCyber-Nano-1.0 (a Qwen3.8-27B derivative, the same shapes), 16 000 tokens read
+with the Neural Engine, decodes at 8.2 tok/s with drafts against a plain token's 5.8. That needs the Neural Engine's
+surfaces released once the prompt is read: kept, they pushed the weight map out of a 24 GB Mac and decode fell to 6.4.
 
 **The Neural Engine**, `CMF_ANE=1`. It reads a prompt's chunks beside the GPU: every layer's FFN, a GDN mixer's `z`
 and an attention layer's `q`. First token at 3 600 tokens 73.9 → 28.3 s, the same text; at 10 000 tokens with

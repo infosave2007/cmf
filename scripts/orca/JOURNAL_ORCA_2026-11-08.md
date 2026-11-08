@@ -198,3 +198,17 @@ staging walks the 14 GB mmap on the CPU (46.8 s user, 1.1 M page reclaims, 24 76
 footprint 4.0 vs 2.9 GB), so on a 24 GB Mac decode reads evicted weight pages back — ~0.5 s once on a 49-token answer,
 against ~40 s the ANE saves. Not acted on. No new Metal slow path needing code: the file takes the same graph as
 Qwen3.8-27B Turbo (F32 in_proj_a/b go through the f32 matvecs). HF card got the Mac section (EN/RU/ZH).
+
+## Metal drafts by default, and the ANE's memory (08.11, «Да, включить», then «замерж … и продолжи»)
+
+PR #99 squash-merged as 8c858add. The default in it never reached native Metal: `spec_default_ok` asked
+`mtp_graph_ok`, which needs the wgpu token graph ("spec off (drafts by default only over a q4tp trunk…)"). Fix
+`mtp_block_shape_ok` (branch metal-drafts, PR #100): code prompt default 14.7 tok/s, `CMF_GRAPH_SPEC=0` 6.4, same text.
+
+16 000 tokens past the seal first looked like a loss (3.7 with drafts against 5.7), then 8 s rounds in a trace — both
+runs under memory pressure (one beside a test compile, one with two models: my mistake). Clean, one run at a time:
+plain+ANE 5.8 (2.18 M page faults), drafts+ANE 6.4 (3.64 M, swap +1.1 GB, first round 2.8 s), drafts GPU-prompt 8.4
+(8.6 K faults). Cause: the ANE's surfaces (~1.5 GB, a layer's FFN/mixers fp16 ×2 sets) lived in a static for the whole
+process. `ane::release_idle()` after the prompt (`CMF_ANE_KEEP=1` keeps): drafts+ANE 16k 6.4 → 8.2 (31 K faults,
+first token 205 s, same text), 3 600 tokens 7.1–7.5 → 7.7 (4 K faults). Plain at 16k by the trial: 172.9 ms → drafts
++41 % past the seal. Guide QWEN38_TURBO (EN/RU/ZH), CHANGELOG, HF card (Mac section, link to #100) updated.

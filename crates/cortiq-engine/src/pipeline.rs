@@ -6393,10 +6393,18 @@ impl Pipeline {
         // tokens, 57 % accepted), and 2.5 ms per prompt position (a
         // 4096-token ingest 171 against 295 tok/s); the published
         // Qwen3.6-35B-A3B 79.7 against 86.6. `CMF_GRAPH_SPEC=1` opts in.
+        // Native Metal has no wgpu graph: its draft step is `mtp_step_metal`,
+        // which takes the same block shape.
         #[cfg(feature = "gpu")]
-        let mtp_on_graph = self.mtp.as_ref().is_none_or(|m| self.mtp_graph_ok(m));
+        let mtp_on_graph = self.mtp.as_ref().is_none_or(|m| {
+            if native_metal_backend {
+                self.mtp_block_shape_ok(m)
+            } else {
+                self.mtp_graph_ok(m)
+            }
+        });
         #[cfg(not(feature = "gpu"))]
-        let mtp_on_graph = true;
+        let mtp_on_graph = self.mtp.as_ref().is_none_or(|m| !native_metal_backend || self.mtp_block_shape_ok(m));
         let spec_default_ok = (dense_n == 0 || dense_q4tp * 10 >= dense_n * 9) && mtp_on_graph;
         // Penalties break the draft head's agreement with the trunk (a
         // 1.1 repetition penalty measured 2 of 16 accepted): not by
@@ -7526,6 +7534,10 @@ impl Pipeline {
                 _tpf.elapsed().as_secs_f64() * 1000.0
             );
         }
+        // The Neural Engine read the prompt; decode runs on the GPU, so its surfaces go back
+        // to the weight map (`ane::release_idle`).
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::ane::release_idle();
         if self
             .graph_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -8971,8 +8983,18 @@ impl Pipeline {
         if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0") {
             return false;
         }
-        if !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
-            || !crate::gpu::enabled_here()
+        if !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode) || !crate::gpu::enabled_here() {
+            return false;
+        }
+        self.mtp_block_shape_ok(m)
+    }
+
+    /// The shape a device MTP step takes (the wgpu token graph and native
+    /// Metal's `mtp_step_metal` alike): one dense block of full attention
+    /// without a softplus gate, V as wide as K, no softcap. A MoE draft block
+    /// drafts op by op on the host and costs more than it saves.
+    fn mtp_block_shape_ok(&self, m: &MtpModule) -> bool {
+        if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
             || self.attn_softcap > 0.0
             || self.attention_heads_per_layer.is_some()
             // The block graph caches V as wide as K and feeds o_proj
