@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""The figures of the OrcaCyber-Nano-1.0 Turbo page, from measured numbers (arete_figures.py with RTX 2000 Ada
+numbers). orca_figures.py OUT_DIR (rsvg-convert on PATH)"""
+import math, os, sys
+import numpy as np
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dory"))
+import card_figures as cf
+from card_figures import Svg, SURF, INK, INK2, MUTE, LINE, BLUE, ORANGE, AQUA, GREY, TINT, TINT2, head
+
+cf.out = sys.argv[1]
+os.makedirs(cf.out, exist_ok=True)
+
+# Measured on an RTX 2000 Ada 16 GB, Vulkan: `cortiq bench --core --tokens 60 --ignore-eos` (numbers_ada.py).
+from numbers_ada import CTX, LABELS, STD, TUR, TXT, SCALE
+
+T = {
+    "en": {
+        "t": "Longer prompts cost no more on the card",
+        "sub": "OrcaCyber-Nano-1.0 q4tp, NVIDIA RTX 2000 Ada 16 GB, Vulkan. On this card prompts below 4096 rows run exact in both files.",
+        "dec": "Decode, tok/s", "first": "First token, s", "vram": "Peak device memory, GB", "ctx": "prompt, tokens",
+        "std": "Standard", "tur": "Turbo", "card": "16 GB card",
+        "c_t": "A long prompt on a small card",
+        "c_sub": "Device memory stays where the first part of the prompt left it. The rest of the rows leave the card as they are read.",
+        "a": "first 4096 rows", "a2": "exact, on the card (8192 on a larger card)",
+        "b": "the rest of the prompt", "b2": "each chunk's keys and values go to RAM or a fast SSD",
+        "c": "last 512", "c2": "read against the rest",
+        "s1": "Choose", "s1t": "The rows that hold passwords, codes and names are found among all the stored rows.",
+        "s2": "Build", "s2t": "The far field is built anew from the stored rows, one layer at a time: 32 landmarks per head.",
+        "s3": "Keep exact", "s3t": "248 chosen rows, the first 4 and the last 1800 stay exact on the card.",
+        "s4": "Decode", "s4t": "A token reads the exact rows and the far field, so its cost stops growing with the text.",
+        "res": "15.7 GB of device memory at 32 000 and at 64 000 tokens, 15.0 GB on a 16 GB card; 22.8 GB on the standard file at 64 000",
+        "x_t": "Passwords and codes stay exact",
+        "x_sub": "Each row is scored by what the layers do with it, with no word lists.",
+        "x_y": "row’s score", "x_x": "prompt rows read before the choice", "x_fact": "“Remember this pass key.”",
+        "x_rank": "its rows: {} of {}", "x_line": "the rows kept lie above this line",
+        "x_1": "Per KV head of each full layer, two numbers per row: how far its key lies from the span of the landmarks, and its value’s norm.",
+        "x_2": "Each becomes a rank within the prompt, and a linear fit over 128 ranks gives the score, stored in the file.",
+        "x_3": "The choice comes before the prompt’s last 512 rows: a question reads the exact fact and carries it on to the answer.",
+        "x_res": "A planted fact in 100 000 characters: turbo 12 of 12, a far field without exact rows 0 of 4",
+    },
+    "ru": {
+        "t": "Длинный промпт не занимает больше памяти карты",
+        "sub": "OrcaCyber-Nano-1.0 q4tp, NVIDIA RTX 2000 Ada 16 ГБ, Vulkan. На этой карте промпты короче 4096 строк в обоих файлах идут точно.",
+        "dec": "Декод, ток/с", "first": "Первый токен, с", "vram": "Пик памяти карты, ГБ", "ctx": "промпт, токенов",
+        "std": "Обычный", "tur": "Турбо", "card": "карта 16 ГБ",
+        "c_t": "Длинный промпт на маленькой карте",
+        "c_sub": "Память карты остаётся там, где её оставила первая часть промпта. Остальные строки уходят с карты по мере чтения.",
+        "a": "первые 4096 строк", "a2": "точно, на карте (8192 на карте побольше)",
+        "b": "остальной промпт", "b2": "ключи и значения каждого куска уходят в RAM или на быстрый SSD",
+        "c": "последние 512", "c2": "читают всё остальное",
+        "s1": "Выбор", "s1t": "Среди всех сохранённых строк находятся те, где пароли, коды и имена.",
+        "s2": "Сборка", "s2t": "Дальнее поле строится заново из сохранённых строк, слой за слоем: 32 опорные точки на голову.",
+        "s3": "Точные", "s3t": "248 выбранных строк, первые 4 и последние 1800 остаются на карте точными.",
+        "s4": "Декод", "s4t": "Токен читает точные строки и дальнее поле, и его цена перестаёт расти вместе с текстом.",
+        "res": "15,7 ГБ памяти карты на 32 000 и на 64 000 токенов, 15,0 ГБ на карте 16 ГБ; у обычного файла 22,8 ГБ на 64 000",
+        "x_t": "Пароли и коды остаются точными",
+        "x_sub": "Строка получает оценку по тому, что с ней делают слои. Списков слов нет.",
+        "x_y": "оценка строки", "x_x": "строки промпта, прочитанные до выбора", "x_fact": "«Запомни этот ключ.»",
+        "x_rank": "его строки: {} из {}", "x_line": "оставленные строки лежат выше этой линии",
+        "x_1": "На каждую KV-голову каждого полного слоя два числа на строку: насколько ключ далёк от опорных точек и норма значения.",
+        "x_2": "Каждое становится рангом внутри промпта, и линейная модель по 128 рангам даёт оценку. Веса лежат в файле.",
+        "x_3": "Выбор идёт до последних 512 строк промпта: вопрос читает точный факт и несёт его к ответу.",
+        "x_res": "Факт в 100 000 символов: турбо 12 из 12, дальнее поле без точных строк 0 из 4",
+    },
+    "zh": {
+        "t": "提示再长,显存也不再增加",
+        "sub": "OrcaCyber-Nano-1.0 q4tp,NVIDIA RTX 2000 Ada 16 GB,Vulkan。在这块显卡上,短于 4096 行的提示在两个文件中都走精确模式。",
+        "dec": "解码,tok/s", "first": "首个 token,秒", "vram": "显存峰值,GB", "ctx": "提示,token 数",
+        "std": "普通", "tur": "Turbo", "card": "16 GB 显卡",
+        "c_t": "小显卡上的长提示",
+        "c_sub": "显存停留在提示前段占用的位置,其余的行一读完就离开显卡。",
+        "a": "前 4096 行", "a2": "精确,在显卡上(更大的显卡为 8192)",
+        "b": "提示的其余部分", "b2": "每块的键和值进入内存或高速 SSD",
+        "c": "最后 512 行", "c2": "读取前面所有内容",
+        "s1": "选择", "s1t": "在所有保存的行中找出含有密码、编码和名字的行。",
+        "s2": "构建", "s2t": "用保存的行逐层重建远场:每个头 32 个地标。",
+        "s3": "保持精确", "s3t": "选出的 248 行、前 4 行和后 1800 行以精确形式留在显卡上。",
+        "s4": "解码", "s4t": "每个 token 读取精确行和远场,成本不再随文本增长。",
+        "res": "32 000 和 64 000 token 时显存均为 15.7 GB,16 GB 显卡上为 15.0 GB;普通文件在 64 000 时为 22.8 GB",
+        "x_t": "密码和编码保持精确",
+        "x_sub": "根据各层对每一行的处理来打分,不用词表。",
+        "x_y": "行的分数", "x_x": "选择之前读取的提示行", "x_fact": "“记住这个密钥。”",
+        "x_rank": "它的行:{},共 {} 行", "x_line": "保留的行在这条线之上",
+        "x_1": "每个完整层的每个 KV 头,每行两个数:键与地标张成空间的距离,以及值的范数。",
+        "x_2": "两者都转为提示内的排名,再由 128 个排名的线性拟合给出分数,权重存放在文件中。",
+        "x_3": "选择发生在提示最后 512 行之前:问题读到精确的事实,并把它带到答案中。",
+        "x_res": "100 000 字符中插入一个事实:turbo 12/12,没有精确行的远场 0/4",
+    },
+}
+
+for _l in T:
+    T[_l].update(TXT[_l])
+
+
+def wrap(text, lang, n):
+    return cf.wrap(text, lang, n)
+
+
+def compare(lang):
+    t = T[lang]
+    s = Svg(1600, 680)
+    head(s, t, t["t"], t["sub"])
+    # A legend, and each line named at its end.
+    s.path("M 50 148 L 90 148", ORANGE, 3)
+    s.dot(70, 148, 8, ORANGE)
+    s.text(102, 156, t["std"], 22, INK)
+    s.path("M 250 148 L 290 148", BLUE, 3)
+    s.dot(270, 148, 8, BLUE)
+    s.text(302, 156, t["tur"], 22, INK)
+    n1 = (lambda v: f"{v:.1f}".replace(".", ",")) if lang == "ru" else (lambda v: f"{v:.1f}")
+
+    def panel(x0, x1, title, a, b, ymax, step, ends):
+        y0, y1 = 570, 240
+        s.text(x0, 215, title, 25, INK, "700")
+        Y = lambda v: y0 + (y1 - y0) * v / ymax
+        lg = [math.log2(c) for c in CTX]
+        X = lambda i: x0 + 56 + (x1 - x0 - 76) * (lg[i] - lg[0]) / (lg[-1] - lg[0])
+        v = 0
+        while v <= ymax + 1e-9:
+            s.line(x0 + 44, Y(v), x1, Y(v), LINE, 1.5)
+            s.text(x0 + 34, Y(v) + 7, f"{v:.0f}", 19, INK2, "400", "end")
+            v += step
+        for i, lb in enumerate(LABELS):
+            if i in (0, 2, 4):
+                s.text(X(i), y0 + 30, lb, 19, INK2, "400", "middle")
+        s.text((x0 + x1) / 2, y0 + 62, t["ctx"], 19, INK2, "400", "middle")
+        for ser, c in ((a, ORANGE), (b, BLUE)):
+            pts = [(X(i), Y(v)) for i, v in enumerate(ser) if v is not None]
+            s.path("M " + " L ".join(f"{p[0]:.1f} {p[1]:.1f}" for p in pts), c, 3)
+            for p in pts:
+                s.dot(p[0], p[1], 7, c)
+        # The standard line ends where the file stops fitting the card: its last point is labelled.
+        ia = max(i for i, v in enumerate(a) if v is not None)
+        s.text(X(ia), Y(a[ia]) + ends[0], n1(a[ia]) if ymax < 40 else f"{a[ia]:.0f}", 22, INK, "700", "middle")
+        s.text(X(4), Y(b[4]) + ends[1], n1(b[4]) if ymax < 40 else f"{b[4]:.0f}", 22, INK, "700", "end")
+        return X, Y
+
+    panel(50, 540, t["dec"], STD["dec"], TUR["dec"], *SCALE["dec"])
+    panel(570, 1060, t["first"], STD["first"], TUR["first"], *SCALE["first"])
+    X, Y = panel(1090, 1550, t["vram"], STD["vram"], TUR["vram"], *SCALE["vram"])
+    s.line(1134, Y(16), 1550, Y(16), INK2, 2, "8 6")
+    s.text(1140, Y(16) - 10, t["card"], 19, INK2)
+    s.text(800, 156, t["nofit"], 22, ORANGE, "600", "middle")
+    s.done(f"compare_{lang}")
+
+
+def ceiling(lang):
+    t = T[lang]
+    s = Svg(1600, 640)
+    head(s, t, t["c_t"], t["c_sub"])
+    y, h = 160, 96
+    x0, xa, xb, x1 = 50, 480, 1300, 1550
+    s.rect(x0, y, xa - x0 - 6, h, TINT, 10, BLUE)
+    s.rect(xa, y, xb - xa - 6, h, TINT2, 10, ORANGE)
+    s.rect(xb, y, x1 - xb, h, TINT, 10, BLUE)
+    for xl, xr, a, b in ((x0, xa - 6, t["a"], t["a2"]), (xa, xb - 6, t["b"], t["b2"]), (xb, x1, t["c"], t["c2"])):
+        s.text((xl + xr) / 2, y + 40, a, 25, INK, "700", "middle")
+        s.text((xl + xr) / 2, y + 72, b, 19, INK2, "400", "middle")
+    ww = 362
+    yy = 300
+    for i, k in enumerate(("s1", "s2", "s3", "s4")):
+        x = 50 + i * (ww + 17)
+        s.rect(x, yy, ww, 225, TINT if i != 3 else TINT2, 12)
+        s.dot(x + 32, yy + 36, 19, BLUE if i != 3 else ORANGE)
+        s.text(x + 32, yy + 44, str(i + 1), 22, "#ffffff", "700", "middle")
+        s.text(x + 62, yy + 45, t[k], 27, INK, "700")
+        for j, ln in enumerate(wrap(t[k + "t"], lang, 29 if lang != "zh" else 15)):
+            s.text(x + 22, yy + 92 + j * 30, ln, 21, INK)
+    s.rect(50, 548, 1500, 62, TINT, 10)
+    s.text(800, 588, t["res"], 24 if lang != "ru" else 23, INK, "700", "middle")
+    s.done(f"ceiling_{lang}")
+
+
+def exact(lang, sc, rows):
+    t = T[lang]
+    s = Svg(1600, 800)
+    head(s, t, t["x_t"], t["x_sub"])
+    px0, px1, py0, py1 = 110, 1550, 470, 150
+    n = len(sc)
+    lo, hi = float(np.percentile(sc, 50)), float(sc.max())
+    bins = int(px1 - px0) // 2
+    top = np.full(bins, -1e9)
+    for i, v in enumerate(sc):
+        b = min(bins - 1, i * bins // n)
+        top[b] = max(top[b], v)
+    Y = lambda v: py0 + (py1 - py0) * (v - lo) / (hi - lo)
+    fb = {min(bins - 1, r * bins // n) for r in rows}
+    for b in range(bins):
+        if b not in fb and top[b] > lo:
+            s.line(px0 + b * 2, py0, px0 + b * 2, Y(top[b]), "#b9c9dc", 1.6)
+    th = float(np.sort(sc)[-248])
+    s.line(px0, Y(th), px1, Y(th), INK2, 2, "8 6")
+    s.text(px0 + 10, Y(th) - 10, t["x_line"], 20, INK2)
+    for b in fb:
+        s.line(px0 + b * 2, py0, px0 + b * 2, Y(top[b]), ORANGE, 5)
+    order = np.argsort(-sc)
+    place = {int(r): int(i) for i, r in enumerate(order)}
+    ranks = sorted(place[r] for r in rows)
+    fx = px0 + min(fb) * 2
+    anchor = "end" if fx > 900 else "start"
+    dx = -16 if fx > 900 else 16
+    span = f"{ranks[0]}–{ranks[-1]}"
+    s.text(fx + dx, py1 + 26, t["x_fact"], 24, INK, "700", anchor)
+    s.text(fx + dx, py1 + 56, t["x_rank"].format(span, f"{n:,}".replace(",", " ")), 21, ORANGE, "600", anchor)
+    s.line(px0, py0, px1, py0, LINE, 2)
+    s.text(px0, py0 + 34, "0", 20, INK2)
+    s.text(px1, py0 + 34, f"{n:,}".replace(",", " "), 20, INK2, "400", "end")
+    s.text((px0 + px1) / 2, py0 + 34, t["x_x"], 21, INK2, "400", "middle")
+    s.o.append(f'<text transform="translate(66 {(py0 + py1) / 2}) rotate(-90)" font-size="21" fill="{INK2}" text-anchor="middle">{t["x_y"]}</text>')
+    yy = 545
+    ww = 494
+    for i, k in enumerate(("x_1", "x_2", "x_3")):
+        x = 50 + i * (ww + 9)
+        s.rect(x, yy, ww, 140, TINT if i != 2 else TINT2, 12)
+        for j, ln in enumerate(wrap(t[k], lang, 43 if lang != "zh" else 22)):
+            s.text(x + 22, yy + 44 + j * 30, ln, 21, INK)
+    s.rect(50, 708, 1500, 62, TINT, 10)
+    s.text(800, 748, t["x_res"], 24 if lang != "ru" else 23, INK, "700", "middle")
+    s.done(f"exact_rows_{lang}")
+
+
+for lang in T:
+    compare(lang)
+    ceiling(lang)
+print("ok", cf.out)

@@ -1,0 +1,1 @@
+Explain to a new team member, in two short paragraphs, why defense in depth matters for a small company's network.

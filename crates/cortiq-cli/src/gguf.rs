@@ -6,8 +6,8 @@
 //! passed directly (the matching `.gguf` is downloaded). IQ4_NL / IQ4_XS (the
 //! non-linear 4-bit codebook, used inside q2_k/q3_k mixes) are handled, and
 //! STQ1_0 (Tencent's sparse-ternary 1.25-bit) is carried over EXACTLY as
-//! `q1t`; the IQ1/IQ2/IQ3 grid-codebook types are the only ggml types not
-//! yet supported.
+//! `q1t`. Of the grid-codebook types IQ3_S (inside imatrix IQ4_XS mixes) is
+//! handled; IQ1/IQ2 and IQ3_XXS are the only ggml types not yet supported.
 //! Qwen Image diffusion-transformer GGUFs use a separate component branch
 //! which preserves source tensor names and stores the official image
 //! transformer config instead of interpreting the file as an LLM.
@@ -57,6 +57,8 @@ const GGML_Q5_K: u32 = 13;
 const GGML_Q6_K: u32 = 14;
 const GGML_Q8_K: u32 = 15;
 const GGML_IQ4_NL: u32 = 20;
+/// 3.4375 bpw grid codebook (`IQ3S_GRID`), used in imatrix mixes.
+const GGML_IQ3_S: u32 = 21;
 const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
 /// Sparse ternary, 1.3125 bpw (Tencent AngelSlim "1.25-bit"; llama.cpp
@@ -329,12 +331,13 @@ fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
         GGML_Q8_K => dequant_q8_k(raw, n),
         GGML_IQ4_NL => dequant_iq4_nl(raw, n),
         GGML_IQ4_XS => dequant_iq4_xs(raw, n),
+        GGML_IQ3_S => dequant_iq3_s(raw, n),
         GGML_STQ1_0_LEGACY => dequant_stq1_0(raw, n),
         GGML_Q1_0 => dequant_q1_0(raw, n),
         GGML_Q2_0 => dequant_q2_0(raw, n),
         other => anyhow::bail!(
             "ggml tensor type {other} not supported by the native importer (supported: F32, F16, BF16, \
-             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, Q1_0, Q2_0, STQ1_0; the IQ1/IQ2/IQ3 grid codebooks are not)"
+             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, IQ3_S, Q1_0, Q2_0, STQ1_0; the IQ1/IQ2 and IQ3_XXS grid codebooks are not)"
         ),
     })
 }
@@ -358,6 +361,7 @@ fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
         GGML_Q8_K => blk(256, 292),
         GGML_IQ4_NL => blk(32, 18),
         GGML_IQ4_XS => blk(256, 136),
+        GGML_IQ3_S => blk(256, 110),
         GGML_STQ1_0_LEGACY => blk(256, 42),
         GGML_Q1_0 => blk(128, 18),
         GGML_Q2_0 => blk(64, 18),
@@ -896,6 +900,127 @@ fn dequant_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+// block_iq3_s (110 bytes, 256 elems): d(f16), qs[64], qh[8], signs[32],
+// scales[4]. Pairs of 32-element sub-blocks share one scale byte (low and
+// high nibble: d·(1+2·s)); each 8 weights take two 9-bit grid indices (qs
+// plus one qh bit) into `IQ3S_GRID` and one sign byte. Faithful port of ggml
+// `dequantize_row_iq3_s`.
+fn dequant_iq3_s(raw: &[u8], n: usize) -> Vec<f32> {
+    const QK_K: usize = 256;
+    const BB: usize = 110;
+    let nb = n.div_ceil(QK_K);
+    let mut out = vec![0.0f32; nb * QK_K];
+    for i in 0..nb {
+        let base = i * BB;
+        let d = f16_to_f32(u16::from_le_bytes([raw[base], raw[base + 1]]));
+        let qs_all = &raw[base + 2..base + 66];
+        let qh_all = &raw[base + 66..base + 74];
+        let signs_all = &raw[base + 74..base + 106];
+        let scales = &raw[base + 106..base + 110];
+        let mut y = i * QK_K;
+        let (mut q, mut h, mut s) = (0usize, 0usize, 0usize);
+        for ib32 in (0..QK_K / 32).step_by(2) {
+            let sc = scales[ib32 / 2];
+            for (half, db) in [
+                d * (1 + 2 * (sc & 0xf) as i32) as f32,
+                d * (1 + 2 * (sc >> 4) as i32) as f32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let qh = qh_all[h + half] as u32;
+                for l in 0..4 {
+                    let g1 = IQ3S_GRID
+                        [(qs_all[q + 2 * l] as u32 | ((qh << (8 - 2 * l)) & 256)) as usize];
+                    let g2 = IQ3S_GRID
+                        [(qs_all[q + 2 * l + 1] as u32 | ((qh << (7 - 2 * l)) & 256)) as usize];
+                    let sg = signs_all[s + l];
+                    for j in 0..4 {
+                        let m1 = ((g1 >> (8 * j)) & 0xff) as f32;
+                        let m2 = ((g2 >> (8 * j)) & 0xff) as f32;
+                        out[y + j] = if sg & (1 << j) != 0 { -db * m1 } else { db * m1 };
+                        out[y + j + 4] = if sg & (1 << (j + 4)) != 0 { -db * m2 } else { db * m2 };
+                    }
+                    y += 8;
+                }
+                q += 8;
+                s += 4;
+            }
+            h += 2;
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// ggml `iq3s_grid`: 512 entries of four 8-bit grid magnitudes (byte j = lane j).
+const IQ3S_GRID: [u32; 512] = [
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+];
+
 /// Split a fused `self_attn.qkv_proj.weight` (`q + 2·kv` rows) into the
 /// canonical q/k/v projections — a pure row slice, no value changes.
 fn split_qkv(
@@ -928,8 +1053,34 @@ fn split_qkv(
     )
 }
 
+/// The MTP (nextn) block of a qwen35 GGUF. llama.cpp appends it after the
+/// trunk as `blk.{N}` (N = trunk layers, counted in `block_count`, with
+/// `{arch}.nextn_predict_layers` saying how many): the ordinary layer
+/// tensors plus `nextn.{eh_proj,enorm,hnorm,shared_head_norm}`. The engine
+/// reads the same block as `model.mtp.*` (`mtp.fc` / `pre_fc_norm_*` /
+/// `mtp.norm` of the HF checkpoint). The shared embedding and head copies,
+/// when a file carries them, are dropped: the loader shares the trunk's.
+fn map_mtp_name(trunk_layers: usize, idx: usize, suffix: &str) -> Option<String> {
+    let k = idx.checked_sub(trunk_layers)?;
+    if let Some(n) = suffix.strip_prefix("nextn.") {
+        if k != 0 {
+            return None;
+        }
+        let mapped = match n {
+            "eh_proj.weight" => "eh_proj.weight",
+            "enorm.weight" => "enorm.weight",
+            "hnorm.weight" => "hnorm.weight",
+            "shared_head_norm.weight" => "norm.weight",
+            _ => return None,
+        };
+        return Some(format!("model.mtp.{mapped}"));
+    }
+    Some(format!("model.mtp.layers.{k}.{}", map_suffix(suffix)?))
+}
+
 /// ggml tensor name → HF name (`None` = skip, e.g. rope freqs).
-fn map_name(arch: &str, g: &str) -> Option<String> {
+/// `mtp_from`: the first `blk.*` index that belongs to the MTP block (qwen35).
+fn map_name(arch: &str, g: &str, mtp_from: Option<usize>) -> Option<String> {
     // Gemma-4 (llama.cpp arch name == HF model_type) names its globals
     // differently and uses the four-norm sandwich; the generic mapping
     // below is the llama-family one.
@@ -956,6 +1107,11 @@ fn map_name(arch: &str, g: &str) -> Option<String> {
     }
     let rest = g.strip_prefix("blk.")?;
     let (idx, suffix) = rest.split_once('.')?;
+    if let (Some(base), Ok(i)) = (mtp_from, idx.parse::<usize>()) {
+        if i >= base {
+            return map_mtp_name(base, i, suffix);
+        }
+    }
     let mapped: &str = if is_g4 {
         // Gemma-4: pre-FFN norm is llama.cpp's `ffn_norm`, the post-FFN
         // norm is `post_ffw_norm`, and the PLE/output-scale tensors carry
@@ -1039,7 +1195,17 @@ fn arch_from_md(
     let g = |k: &str| md.get(&format!("{arch}.{k}"));
     let gu = |k: &str| g(k).and_then(|v| v.as_u64()).map(|x| x as usize);
     let gf = |k: &str| g(k).and_then(|v| v.as_f64());
-    let n_layers = gu("block_count").ok_or_else(|| anyhow::anyhow!("gguf: no block_count"))?;
+    let n_blocks = gu("block_count").ok_or_else(|| anyhow::anyhow!("gguf: no block_count"))?;
+    // qwen35 GGUFs with an MTP head count it in block_count (see
+    // `map_mtp_name`); the trunk is what precedes it.
+    let n_nextn = if arch.starts_with("qwen35") {
+        gu("nextn_predict_layers").unwrap_or(0)
+    } else {
+        0
+    };
+    let n_layers = n_blocks.checked_sub(n_nextn).filter(|&n| n > 0).ok_or_else(|| {
+        anyhow::anyhow!("gguf: nextn_predict_layers {n_nextn} >= block_count {n_blocks}")
+    })?;
     let hidden =
         gu("embedding_length").ok_or_else(|| anyhow::anyhow!("gguf: no embedding_length"))?;
     let n_heads =
@@ -1228,9 +1394,26 @@ fn arch_from_md(
     } else {
         None
     };
+    // The MTP head rides along when the file carries its projection; one
+    // block, sharing the trunk's embedding and output head (Qwen3.5/3.8).
+    let mtp = (is_q35
+        && n_nextn > 0
+        && tensors
+            .iter()
+            .any(|t| t.name == format!("blk.{n_layers}.nextn.eh_proj.weight")))
+    .then(|| cortiq_core::MtpConfig {
+        num_layers: n_nextn,
+        ffn_intermediate_sizes: None,
+        share_lm_head: true,
+        share_embed: true,
+    });
     Ok(ModelArch {
-        arch_name: if is_q35 {
+        // Dense qwen35 is the `qwen3_5` the safetensors converter writes;
+        // only the expert-bearing file is `qwen3_5_moe`.
+        arch_name: if is_q35 && moe.is_some() {
             "qwen3_5_moe".into()
+        } else if is_q35 {
+            "qwen3_5".into()
         } else if is_hunyuan_dense {
             "hunyuan_v1_dense".into()
         } else {
@@ -1265,7 +1448,7 @@ fn arch_from_md(
         },
         yarn: None,
         attention_heads_per_layer: None,
-        mtp: None,
+        mtp,
         moe,
         qwen4_exp: None,
         block_diffusion: None,
@@ -2154,7 +2337,11 @@ pub fn run_import_gguf(
 
     let arch = arch_from_md(&g, &g.md, &g.tensors)?;
     let is_llama = arch.arch_name == "llama";
-    let is_q35 = arch.arch_name == "qwen3_5_moe";
+    let is_q35 = arch.arch_name == "qwen3_5_moe" || arch.arch_name == "qwen3_5";
+    // qwen35: where the MTP block starts (the trunk's layer count), so its
+    // `blk.N.*` tensors land under `model.mtp.*`, not as a 65th layer.
+    let mtp_from = (is_q35 && arch.mtp.is_some()).then_some(arch.num_layers);
+    let mut unshifted_norms: Vec<String> = Vec::new();
 
     // Honest guard: the native GGUF importer maps standard transformer tensors
     // plus the qwen35moe GDN-hybrid layout. Any OTHER SSM family (Mamba,
@@ -2221,7 +2408,7 @@ pub fn run_import_gguf(
                 continue;
             }
         }
-        let Some(name) = map_name(&arch.arch_name, &t.name) else {
+        let Some(name) = map_name(&arch.arch_name, &t.name, mtp_from) else {
             continue;
         };
         // The generic table sends attn_qkv/attn_gate to the GDN names; on
@@ -2296,15 +2483,20 @@ pub fn run_import_gguf(
             // llama.cpp stores it raw, and its weights initialize at 1 —
             // the magnitude heuristic would mangle them (found the hard
             // way: it was the one broken tensor in the layer diff).
+            // The MTP block's norms (`model.mtp.{enorm,hnorm,norm}` and its
+            // layer's) get the same +1 from llama.cpp's `*norm.weight` rule.
             if name.ends_with("layernorm.weight")
                 || name.ends_with("_norm.weight")
                 || name == "model.norm.weight"
+                || (name.starts_with("model.mtp.") && name.ends_with("norm.weight"))
             {
                 let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
                 if mean > 0.5 {
                     for v in vals.iter_mut() {
                         *v -= 1.0;
                     }
+                } else {
+                    unshifted_norms.push(name.clone());
                 }
             }
             // llama.cpp stores GDN decay as -exp(A_log) (the Mamba
@@ -2404,6 +2596,32 @@ pub fn run_import_gguf(
         }
     }
 
+    if !unshifted_norms.is_empty() {
+        // llama.cpp always stores qwen35 norms as 1+w; a weight that does not
+        // look shifted is kept as stored, and said, never silently guessed.
+        eprintln!(
+            "  note: {} norm tensor(s) look unshifted (mean <= 0.5), kept as stored, e.g. '{}'",
+            unshifted_norms.len(),
+            unshifted_norms[0]
+        );
+    }
+    if let Some(m) = &arch.mtp {
+        let n = tensors
+            .iter()
+            .filter(|t| t.name.starts_with("model.mtp."))
+            .count();
+        anyhow::ensure!(
+            tensors.iter().any(|t| t.name == "model.mtp.layers.0.self_attn.q_proj.weight")
+                && tensors.iter().any(|t| t.name == "model.mtp.norm.weight"),
+            "GGUF '{}': nextn_predict_layers = {} but the MTP block is incomplete ({n} tensors)",
+            path.display(),
+            m.num_layers
+        );
+        eprintln!(
+            "  MTP head: {} block(s) from blk.{} ({n} tensors)",
+            m.num_layers, arch.num_layers
+        );
+    }
     let (vocab, bundle) = tokenizer(&g.md);
     // `--tokenizer-dir`: embed the vendor's HF tokenizer.json verbatim instead
     // of the byte-level BPE reconstructed from ggml metadata. Required when
@@ -2677,6 +2895,45 @@ mod dequant_tests {
         }
     }
 
+    #[test]
+    fn iq3s_matches_ggml_reference() {
+        // Real block 7 of blk.0.ffn_up from OrcaCyber-Nano-1.0 Mix-15.7G
+        // (an imatrix IQ4_XS mix); reference values from gguf-py's numpy
+        // `dequantize`, an implementation independent of this port.
+        let raw = unhex(
+            "260471d1f1e7ac45f22810918d800d3dc46ca476cd84470d3623f5af0c5b896ab7a75e76406349f0cc7577ef29424739d67bb379752a6f7a2e1cfbeabc3e6670623929c921b92192307544b909bf7c7111c7f68543ad12610cb0655c4d0ce0515769576e23be203278e08ccbcfae",
+        );
+        assert_eq!(raw.len(), 110);
+        assert_eq!(nbytes(GGML_IQ3_S, 256).unwrap(), 110);
+        let out = dequant_iq3_s(&raw, 256);
+        for &(i, e) in &[
+            (0usize, 0.001582503f32),
+            (1, 0.00474751),
+            (2, -0.007912517),
+            (3, 0.01424253),
+            (4, 0.007912517),
+            (7, 0.007912517),
+            (8, -0.01424253),
+            (31, -0.001582503),
+            (32, 0.003228307),
+            (63, -0.00968492),
+            (64, 0.004367709),
+            (100, -0.00474751),
+            (128, -0.001962304),
+            (200, 0.02753556),
+            (255, -0.001329303),
+        ] {
+            assert!(
+                (out[i] - e).abs() < 1e-7,
+                "iq3_s idx {i}: got {} want {}",
+                out[i],
+                e
+            );
+        }
+        let maxabs = out.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!((maxabs - 0.029434562).abs() < 1e-7, "max |w| {maxabs}");
+    }
+
     fn put_gstr(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u64).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
@@ -2897,6 +3154,160 @@ mod dequant_tests {
             // the source repeats the same 128-element block
             let expect = if (i % 128) % 5 == 0 { d } else { -d };
             assert_eq!(*v, expect, "weight {i} changed");
+        }
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// A dense qwen35 GGUF with llama.cpp's MTP block (`blk.N` after the
+    /// trunk, `nextn.*` projections): the trunk keeps N layers, the block
+    /// lands under `model.mtp.*` with its norms unshifted like the trunk's,
+    /// and the shared embedding copy is not carried.
+    #[test]
+    fn qwen35_gguf_mtp_block_maps_to_model_mtp() {
+        let h = 128usize;
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| cortiq_core::quant::f32_to_f16(*x).to_le_bytes())
+                .collect()
+        };
+        let mat = |o: usize, i: usize| -> Vec<f32> {
+            (0..o * i).map(|k| ((k % 17) as f32 - 8.0) * 0.01).collect()
+        };
+        // Stored norms are 1+w (llama.cpp's qwen35 rule); w = 0.25 here.
+        let norm = f32b(&vec![1.25f32; h]);
+        let hu = h as u64;
+        let mut defs: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+        let mut put = |n: String, dims: Vec<u64>, ty: u32, data: Vec<u8>| {
+            defs.push((n, dims, ty, data));
+        };
+        put("token_embd.weight".into(), vec![hu, 256], GGML_F16, f16(&mat(256, h)));
+        put("output_norm.weight".into(), vec![hu], GGML_F32, norm.clone());
+        put("output.weight".into(), vec![hu, 256], GGML_F16, f16(&mat(256, h)));
+        for b in 0..2 {
+            for (s, o) in [
+                ("attn_q", 2 * h),
+                ("attn_k", h),
+                ("attn_v", h),
+                ("ffn_gate", h),
+                ("ffn_up", h),
+            ] {
+                let w = f16(&mat(o, h));
+                put(format!("blk.{b}.{s}.weight"), vec![hu, o as u64], GGML_F16, w);
+            }
+            for s in ["attn_output", "ffn_down"] {
+                let w = f16(&mat(h, h));
+                put(format!("blk.{b}.{s}.weight"), vec![hu, hu], GGML_F16, w);
+            }
+            for s in ["attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm"] {
+                put(format!("blk.{b}.{s}.weight"), vec![hu], GGML_F32, norm.clone());
+            }
+        }
+        let eh = f16(&mat(h, 2 * h));
+        put("blk.1.nextn.eh_proj.weight".into(), vec![2 * hu, hu], GGML_F16, eh);
+        for s in ["enorm", "hnorm", "shared_head_norm"] {
+            put(format!("blk.1.nextn.{s}.weight"), vec![hu], GGML_F32, norm.clone());
+        }
+        let emb = f16(&mat(256, h));
+        put("blk.1.nextn.embed_tokens.weight".into(), vec![hu, 256], GGML_F16, emb);
+        let kv_u32 = [
+            ("qwen35.block_count", 2u32),
+            ("qwen35.embedding_length", h as u32),
+            ("qwen35.attention.head_count", 2),
+            ("qwen35.attention.head_count_kv", 1),
+            ("qwen35.attention.key_length", 64),
+            ("qwen35.feed_forward_length", h as u32),
+            ("qwen35.nextn_predict_layers", 1),
+        ];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(defs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(1 + kv_u32.len() as u64).to_le_bytes());
+        put_gstr(&mut out, "general.architecture");
+        out.extend_from_slice(&T_STR.to_le_bytes());
+        put_gstr(&mut out, "qwen35");
+        for (k, v) in kv_u32 {
+            put_gstr(&mut out, k);
+            out.extend_from_slice(&T_U32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut rel = 0usize;
+        let mut offsets = Vec::with_capacity(defs.len());
+        for (name, dims, ggml_type, data) in &defs {
+            rel = align_up(rel, 32);
+            offsets.push(rel);
+            put_gstr(&mut out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            out.extend_from_slice(&ggml_type.to_le_bytes());
+            out.extend_from_slice(&(rel as u64).to_le_bytes());
+            rel += data.len();
+        }
+        let data_start = align_up(out.len(), 32);
+        out.resize(data_start, 0);
+        for ((_, _, _, data), &offset) in defs.iter().zip(&offsets) {
+            let start = data_start + offset;
+            if out.len() < start {
+                out.resize(start, 0);
+            }
+            out.extend_from_slice(data);
+        }
+        let id = format!(
+            "cortiq-q35-mtp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let src = std::env::temp_dir().join(format!("{id}.gguf"));
+        let dst = std::env::temp_dir().join(format!("{id}.cmf"));
+        std::fs::write(&src, &out).unwrap();
+        let (s_path, d_path) = (src.to_str().unwrap(), dst.to_str().unwrap());
+        run_import_gguf(s_path, "q8", d_path, None, None, |_| {}).unwrap();
+        let model = cortiq_core::CmfModel::open(&dst).unwrap();
+        assert!(model.verify().is_empty());
+        let arch = &model.header.arch;
+        assert_eq!(arch.arch_name, "qwen3_5");
+        assert_eq!(arch.num_layers, 1, "the MTP block is not a trunk layer");
+        assert_eq!(arch.layer_types.len(), 1);
+        let mtp = arch.mtp.as_ref().expect("header declares the MTP head");
+        assert_eq!(mtp.num_layers, 1);
+        assert!(mtp.share_embed && mtp.share_lm_head);
+        let names: Vec<&str> = model.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert!(!names.iter().any(|n| n.starts_with("model.layers.1.")));
+        assert!(!names
+            .iter()
+            .any(|n| n.contains("embed_tokens") && n.starts_with("model.mtp.")));
+        for n in [
+            "model.mtp.eh_proj.weight",
+            "model.mtp.enorm.weight",
+            "model.mtp.hnorm.weight",
+            "model.mtp.norm.weight",
+            "model.mtp.layers.0.input_layernorm.weight",
+            "model.mtp.layers.0.post_attention_layernorm.weight",
+            "model.mtp.layers.0.self_attn.q_proj.weight",
+            "model.mtp.layers.0.self_attn.q_norm.weight",
+            "model.mtp.layers.0.mlp.down_proj.weight",
+        ] {
+            assert!(names.contains(&n), "missing {n}");
+        }
+        let eh = &model.tensors[model.tensor_index("model.mtp.eh_proj.weight").unwrap()];
+        assert_eq!(eh.shape, vec![h, 2 * h]);
+        // Every norm, trunk and MTP alike, is back to the raw w = 0.25.
+        for n in [
+            "model.mtp.enorm.weight",
+            "model.mtp.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+        ] {
+            let t = &model.tensors[model.tensor_index(n).unwrap()];
+            let b = model.entry_bytes(t);
+            let v = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+            assert!((v - 0.25).abs() < 1e-3, "{n}: {v}");
         }
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dst);

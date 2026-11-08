@@ -1316,15 +1316,15 @@ fn graph_spec_wanted_by_policy(
 ) -> bool {
     match spec_env {
         Some("0") => false,
-        // Keep the native path genuinely explicit.  In particular, a
-        // typo/nonzero value must not silently re-enable an unqualified
-        // verifier just because historical non-Metal parsing treated it as
-        // force-on.
         Some("1") => true,
-        Some(_) => !native_metal,
-        // The discrete/wgpu default stays as it was; only native Metal has
-        // a quality gate here.
-        None => spec_default_ok && !penalized && !metal_wgpu && !native_metal,
+        // Off native Metal any other value still forces the drafts on, as it
+        // always did; on native Metal it means the default below.
+        Some(_) if !native_metal => true,
+        // Native Metal shares the default since the batched verify passed the
+        // exact-ID gate over q4tp trunks (`spec_default_ok`): MacBook Air M4,
+        // Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0, five prompts each, the
+        // same token ids with drafts and without, 1.45-2.3x the plain decode.
+        _ => spec_default_ok && !penalized && !metal_wgpu,
     }
 }
 
@@ -1429,8 +1429,8 @@ struct SpecMon {
     fails: u32,
     /// Consecutive rounds that produced only their verifier-tip token (zero
     /// accepted MTP drafts). This is deliberately counted before the warm-up
-    /// round is excluded from timing: two real zero-acceptance rounds are
-    /// enough to stop charging an obviously losing speculative arm.
+    /// round is excluded from timing: `SPEC_ZERO_ROUNDS` real zero-acceptance
+    /// rounds stop charging an obviously losing speculative arm.
     zero_accept_rounds: u8,
     metal: bool,
 }
@@ -1835,6 +1835,19 @@ pub fn tail_repeat(seq: &[u32]) -> usize {
     best
 }
 
+/// Zero-acceptance rounds in a row that end a speculation trial early. Two
+/// was too few: a good head meets two empty rounds in a row now and then
+/// (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, 95 pinned rounds of code and a
+/// review: four such pairs, no triple), and at the start of a chat turn a
+/// pair sent the whole 200-token turn to plain decode, 13.4 tok/s against
+/// 25.9 with the drafts. A head that never holds costs one more round.
+const SPEC_ZERO_ROUNDS: u8 = 3;
+/// Tokens a plain decision taken on thin evidence (fewer than five timed
+/// rounds) stands before the rounds are tried again; one taken on a full
+/// trial stands for `SPEC_RECHECK_PLAIN`.
+const SPEC_RECHECK_THIN: usize = 32;
+const SPEC_RECHECK_PLAIN: usize = 128;
+
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
@@ -1865,7 +1878,12 @@ impl SpecMon {
         }
     }
     fn repeated_zero_acceptance(&self) -> bool {
-        self.zero_accept_rounds >= 2
+        self.zero_accept_rounds >= SPEC_ZERO_ROUNDS
+    }
+    /// When a plain decision is tried again: soon if the rounds behind it
+    /// were few (round 1 is not timed, so `n` counts one more).
+    fn recheck_plain_at(&self, generated: usize) -> usize {
+        generated + if self.n < 6 { SPEC_RECHECK_THIN } else { SPEC_RECHECK_PLAIN }
     }
     /// Has the plain phase timed enough tokens to decide?
     fn plain_done(&self, t0: std::time::Instant, gen0: usize, generated: usize) -> bool {
@@ -6549,9 +6567,8 @@ impl Pipeline {
         let host_pair_opt_in = std::env::var("CMF_MTP_PAIR").as_deref() == Ok("1");
         let pair_pays = host_pair_opt_in
             && (self.gdn_cfg.is_none() || std::env::var("CMF_MTP").as_deref() == Ok("1"));
-        // Native Metal: say the route ONCE (RUST_LOG=info), including the
-        // deliberate quality gate that keeps the unqualified batch verifier
-        // off unless the user explicitly requested the experiment.
+        // Native Metal: say the route ONCE (RUST_LOG=info), including why
+        // the drafts are off when they are (`graph_spec_wanted_by_policy`).
         #[cfg(target_os = "macos")]
         if metal_graph {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -6591,10 +6608,10 @@ impl Pipeline {
                             .to_string()
                     }
                 } else if !spec_wanted {
-                    if spec_env.is_none() {
-                        "spec off (native Metal batch verifier requires CMF_GRAPH_SPEC=1 after exact-ID validation)".to_string()
+                    if spec_env.as_deref() == Some("0") {
+                        "spec off (CMF_GRAPH_SPEC=0)".to_string()
                     } else {
-                        "spec off (native Metal accepts only exact CMF_GRAPH_SPEC=1)".to_string()
+                        "spec off (drafts by default only over a q4tp trunk; CMF_GRAPH_SPEC=1 asks for them)".to_string()
                     }
                 } else if task_mask.is_some() {
                     "spec off (task mask)".to_string()
@@ -7964,7 +7981,7 @@ impl Pipeline {
                         spec_mon.fails = 0;
                         spec_trial = SpecTrial::Decided {
                             spec: keep,
-                            recheck_at: if keep { usize::MAX } else { generated + 128 },
+                            recheck_at: if keep { usize::MAX } else { spec_mon.recheck_plain_at(generated) },
                         };
                     }
                     SpecTrial::Decided { recheck_at, .. } if generated >= recheck_at => {
@@ -8912,11 +8929,11 @@ impl Pipeline {
                 let rounds = rounds + 1;
                 // A round that accepts no draft still has to run the MTP
                 // chain and a K+1 verifier, but emits only its verifier tip.
-                // After two such real rounds the speculative arm cannot win
-                // on any backend; time plain immediately rather than spend
-                // the remaining exploratory rounds on the same one-token
-                // result. A later 128-token re-check still gives changing
-                // context a chance to re-admit it.
+                // After `SPEC_ZERO_ROUNDS` such real rounds the speculative
+                // arm cannot win on any backend; time plain immediately
+                // rather than spend the remaining exploratory rounds on the
+                // same one-token result. A re-check soon after (the evidence
+                // is a few rounds) gives the text a chance to re-admit it.
                 if mon.repeated_zero_acceptance() {
                     tracing::info!(
                         "speculation trial: no accepted drafts in two rounds — timing plain"
@@ -8939,7 +8956,7 @@ impl Pipeline {
                         );
                         SpecTrial::Decided {
                             spec: keep,
-                            recheck_at: if keep { usize::MAX } else { generated + 128 },
+                            recheck_at: if keep { usize::MAX } else { mon.recheck_plain_at(generated) },
                         }
                     } else if mon.pays() {
                         // Metal: the rounds land enough tokens each that no
@@ -8995,7 +9012,7 @@ impl Pipeline {
                         );
                         SpecTrial::Decided {
                             spec: false,
-                            recheck_at: generated + 128,
+                            recheck_at: generated + SPEC_RECHECK_PLAIN,
                         }
                     } else {
                         trial
@@ -26377,7 +26394,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_trial_fast_exits_after_two_zero_acceptance_rounds() {
+    fn speculative_trial_fast_exits_after_three_zero_acceptance_rounds() {
         use super::{Pipeline, SpecMon, SpecTrial};
 
         let mut mon = SpecMon::default();
@@ -26394,12 +26411,21 @@ mod tests {
         );
         assert!(matches!(first, SpecTrial::Spec { rounds: 1, .. }));
 
+        // Two empty rounds in a row happen to a good head: the trial goes on.
         mon.round(1.0, 1);
         let second = Pipeline::spec_trial_round(first, &mut mon, 2);
         assert!(
-            matches!(second, SpecTrial::Plain { gen0: 2, .. }),
-            "two verifier-tip-only rounds must stop the losing MTP trial"
+            matches!(second, SpecTrial::Spec { rounds: 2, .. }),
+            "two empty rounds are not evidence enough to leave the drafts"
         );
+        mon.round(1.0, 1);
+        let third = Pipeline::spec_trial_round(second, &mut mon, 3);
+        assert!(
+            matches!(third, SpecTrial::Plain { gen0: 3, .. }),
+            "three verifier-tip-only rounds must stop the losing MTP trial"
+        );
+        // A plain decision on three rounds is tried again soon.
+        assert_eq!(mon.recheck_plain_at(3), 3 + super::SPEC_RECHECK_THIN);
 
         // One successful draft resets the streak, so a viable head retains
         // the normal five-round measurement budget.
@@ -26439,16 +26465,24 @@ mod tests {
     }
 
     #[test]
-    fn native_metal_batch_spec_requires_exact_explicit_opt_in() {
+    fn native_metal_batch_spec_defaults_on_over_a_q4tp_trunk() {
         use super::graph_spec_wanted_by_policy;
 
-        // A capable, otherwise-default-eligible native Metal model stays on
-        // the serial path until the user deliberately asks for the
-        // experimental verifier.
-        assert!(!graph_spec_wanted_by_policy(None, true, false, false, true));
-        assert!(!graph_spec_wanted_by_policy(
+        // A default-eligible (q4tp trunk) native Metal model drafts unless
+        // told not to; any value other than 0/1 means the default there.
+        assert!(graph_spec_wanted_by_policy(None, true, false, false, true));
+        assert!(graph_spec_wanted_by_policy(
             Some("anything-but-1"),
             true,
+            false,
+            false,
+            true,
+        ));
+        // A trunk outside the default (not q4tp) stays plain until asked.
+        assert!(!graph_spec_wanted_by_policy(None, false, false, false, true));
+        assert!(!graph_spec_wanted_by_policy(
+            Some("anything-but-1"),
+            false,
             false,
             false,
             true,

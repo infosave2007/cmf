@@ -12,11 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the prompt tokens reused from the cached prefix) and returns llama-server's `timings` object: in a
   non-streamed response, and on the usage and finish chunks of a stream.
 - A Spark-X2.6-4B Turbo file (`far-turbo` with `scripts/spark26/keep_spark26.bin`, exact-row weights fitted for
-  its 9 full-attention layers). RTX 2000 Ada, Vulkan, 64 000 tokens: decode 56.6 tok/s against 18.9 and 3.7 GB
-  of the card against 8.0.
+  its 9 full-attention layers). RTX 2000 Ada, Vulkan, 64 000 tokens: decode 56.2 tok/s against 18.5 and 4.2 GB
+  of the card against 7.9.
 - `cortiq ppl --window-score-from K` scores a window's predictions from position `K` on, the earlier ones
   being context only: with `--window-len 512 --window-stride 512 --window-score-from 256` the walk is that of
   `llama-perplexity -c 512`, so the two numbers compare.
+- `cortiq import-gguf` reads IQ3_S (the 3.4-bit grid codebook inside imatrix IQ4_XS mixes), a port of ggml's
+  `dequantize_row_iq3_s`, checked against gguf-py on a real block.
 
 ### Changed
 - Spark-X2.6 on native Metal reads its prompt through the rows graph (exact GELU, the per-head `g_proj` gate,
@@ -44,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tile, 582 with the matrix-unit tile, the same greedy text after 9 000 and 60 000 characters. A cooperative
   kernel's workgroup scalars are 16-byte `vec4<u32>`: a `u32` beside the tile arrays shifted every cooperative
   load and store by one element on NVIDIA (`tests/gpu_coop_probe.rs` keeps the probe that shows it).
-- The batched prefill's wide q4tp GEMMs run on the matrix units, by default through `zi_mm`, the 128×128×32
-  tensor-core tile of the image models: the weight dequantized once into an f16 plane, the chunk's
+- Where the cooperative GEMM is on (NVIDIA by default), a chunk of 128 rows or more runs its wide q4tp GEMMs
+  through `zi_mm`, the 128×128×32 tensor-core tile of the image models: the weight dequantized once into an f16 plane, the chunk's
   activations cast to f16 under the device scale, the result scaled back at the store. 12.0 TFLOP/s on an RTX
   2000 Ada against 6.2 for the 64×64 in-kernel-dequant cooperative kernel (`CMF_BATCH_MM=coop`; `v2` its
   pipelined twin; `CMF_BATCH_COOP=0` the scalar tile GEMM at 3.1). Spark-X2.6-4B over Vulkan on that card: a
@@ -64,11 +66,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A turbo file's far field is rebuilt with one thread per KV group (it was one group after another): Spark-X2.6-4B
   Turbo at 16 000 tokens, 6.5 s → 3.5 s of the prompt, 489 → 539 tok/s, the same greedy text after 60 000
   characters.
+- On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
+  off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
+  Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
+  OrcaCyber at 9.0–14.6 tok/s against 6.1–6.3.
+- On Vulkan/DX12 with an NVIDIA card a q4tp prompt reads through the cooperative-matrix (tensor-core) GEMM by
+  default (`CMF_BATCH_COOP=0` keeps the scalar tile; `=1` asks for it on other vendors), and a 128-row chunk takes
+  the new `q4tp_mm_coop128_s` tile: eight subgroups over one weight tile, so each weight is unpacked once a chunk,
+  one lane a row and eight k, with the activations read four floats a load (`CMF_COOP128=0` keeps the 64-row tile).
+  OrcaCyber-Nano-1.0 q4tp (Qwen3.8-27B class) on an RTX 2000 Ada 16 GB, 2000-token prompt: 74.5 → 112 tok/s, the
+  same greedy text; the 128-row tile's sums equal the 64-row kernel's bit for bit (test).
 
 ### Fixed
 - On wgpu a dense model the batched graph declines read its prompt one position at a time (0.8.63): Spark-X2.6
   q4tp on an RTX 2000 Ada, 65 tok/s. It reads chunked on the host walk again (195 tok/s), as sliding-window
   stacks always do now.
+- The speculation trial left the drafts after two empty rounds in a row and kept plain decode for 128 tokens. A good
+  head meets such a pair now and then; at the start of a chat turn it sent the whole turn to plain decode
+  (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, the second of five turns: 13.3 tok/s against 23–26 with the drafts). The
+  trial now needs three empty rounds, and a plain decision taken on fewer than five timed rounds is tried again after
+  32 tokens. One-shot answers unchanged.
+- `cortiq import-gguf` on a dense qwen35 GGUF with an MTP head (Qwen3.8-27B and its fine-tunes, e.g.
+  OrcaCyber-Nano-1.0): llama.cpp counts the nextn block in `block_count`, and the importer made it a 65th trunk
+  layer under the MoE arch name. The trunk is now `block_count − nextn_predict_layers`, the block lands under
+  `model.mtp.*` with its 1+w norms undone like the trunk's, the header declares the head, and dense qwen35 is
+  `qwen3_5`, as `cortiq convert` writes it.
 
 ## [0.8.63] — 2026-11-07
 
