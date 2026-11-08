@@ -86,9 +86,9 @@ MacBook Air M4,24 GB,Metal,16 000 个 token 时:除内存映射的权重外 6.3 
 
 ## 在 Mac 上
 
-测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s。它读取每个 token 所需的 13.6 GB 权重,速度为 92 到 95 GB/s,这就是这条总线的速度:没有草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。其余来自两个开关,默认都关闭。
+测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s。它读取每个 token 所需的 13.6 GB 权重,速度为 92 到 95 GB/s,这就是这条总线的速度:没有草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。其余来自草稿和 Neural Engine：在 q4tp 文件上草稿默认开启（`CMF_GRAPH_SPEC=0` 关闭；cortiq 0.8.63 及更早版本需要 `CMF_GRAPH_SPEC=1`），Neural Engine 是一个默认关闭的开关。
 
-**草稿**,`CMF_GRAPH_SPEC=1`。草稿头提出 token,对权重的一次遍历检查它们,于是一次遍历给出不止一个 token。MacBook Air M4,贪心解码,220 个 token,有草稿和没有草稿的文本相同:
+**草稿**。草稿头提出 token,对权重的一次遍历检查它们,于是一次遍历给出不止一个 token。MacBook Air M4,贪心解码,220 个 token,有草稿和没有草稿的文本相同:
 
 | 回答 | 没有草稿,tok/s | 有草稿,tok/s |
 |---|---:|---:|

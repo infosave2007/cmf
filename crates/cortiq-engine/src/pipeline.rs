@@ -1308,15 +1308,15 @@ fn graph_spec_wanted_by_policy(
 ) -> bool {
     match spec_env {
         Some("0") => false,
-        // Keep the native path genuinely explicit.  In particular, a
-        // typo/nonzero value must not silently re-enable an unqualified
-        // verifier just because historical non-Metal parsing treated it as
-        // force-on.
         Some("1") => true,
-        Some(_) => !native_metal,
-        // The discrete/wgpu default stays as it was; only native Metal has
-        // a quality gate here.
-        None => spec_default_ok && !penalized && !metal_wgpu && !native_metal,
+        // Off native Metal any other value still forces the drafts on, as it
+        // always did; on native Metal it means the default below.
+        Some(_) if !native_metal => true,
+        // Native Metal shares the default since the batched verify passed the
+        // exact-ID gate over q4tp trunks (`spec_default_ok`): MacBook Air M4,
+        // Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0, five prompts each, the
+        // same token ids with drafts and without, 1.45-2.3x the plain decode.
+        _ => spec_default_ok && !penalized && !metal_wgpu,
     }
 }
 
@@ -6481,9 +6481,8 @@ impl Pipeline {
         let host_pair_opt_in = std::env::var("CMF_MTP_PAIR").as_deref() == Ok("1");
         let pair_pays = host_pair_opt_in
             && (self.gdn_cfg.is_none() || std::env::var("CMF_MTP").as_deref() == Ok("1"));
-        // Native Metal: say the route ONCE (RUST_LOG=info), including the
-        // deliberate quality gate that keeps the unqualified batch verifier
-        // off unless the user explicitly requested the experiment.
+        // Native Metal: say the route ONCE (RUST_LOG=info), including why
+        // the drafts are off when they are (`graph_spec_wanted_by_policy`).
         #[cfg(target_os = "macos")]
         if metal_graph {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -6523,10 +6522,10 @@ impl Pipeline {
                             .to_string()
                     }
                 } else if !spec_wanted {
-                    if spec_env.is_none() {
-                        "spec off (native Metal batch verifier requires CMF_GRAPH_SPEC=1 after exact-ID validation)".to_string()
+                    if spec_env.as_deref() == Some("0") {
+                        "spec off (CMF_GRAPH_SPEC=0)".to_string()
                     } else {
-                        "spec off (native Metal accepts only exact CMF_GRAPH_SPEC=1)".to_string()
+                        "spec off (drafts by default only over a q4tp trunk; CMF_GRAPH_SPEC=1 asks for them)".to_string()
                     }
                 } else if task_mask.is_some() {
                     "spec off (task mask)".to_string()
@@ -26290,16 +26289,24 @@ mod tests {
     }
 
     #[test]
-    fn native_metal_batch_spec_requires_exact_explicit_opt_in() {
+    fn native_metal_batch_spec_defaults_on_over_a_q4tp_trunk() {
         use super::graph_spec_wanted_by_policy;
 
-        // A capable, otherwise-default-eligible native Metal model stays on
-        // the serial path until the user deliberately asks for the
-        // experimental verifier.
-        assert!(!graph_spec_wanted_by_policy(None, true, false, false, true));
-        assert!(!graph_spec_wanted_by_policy(
+        // A default-eligible (q4tp trunk) native Metal model drafts unless
+        // told not to; any value other than 0/1 means the default there.
+        assert!(graph_spec_wanted_by_policy(None, true, false, false, true));
+        assert!(graph_spec_wanted_by_policy(
             Some("anything-but-1"),
             true,
+            false,
+            false,
+            true,
+        ));
+        // A trunk outside the default (not q4tp) stays plain until asked.
+        assert!(!graph_spec_wanted_by_policy(None, false, false, false, true));
+        assert!(!graph_spec_wanted_by_policy(
+            Some("anything-but-1"),
+            false,
             false,
             false,
             true,

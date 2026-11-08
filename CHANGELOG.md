@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dequantize_row_iq3_s`, checked against gguf-py on a real block.
 
 ### Changed
+- On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
+  off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
+  Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
+  OrcaCyber at 9.0–14.6 tok/s against 6.1–6.3.
 - On Vulkan/DX12 with an NVIDIA card a q4tp prompt reads through the cooperative-matrix (tensor-core) GEMM by
   default (`CMF_BATCH_COOP=0` keeps the scalar tile; `=1` asks for it on other vendors), and a 128-row chunk takes
   the new `q4tp_mm_coop128_s` tile: eight subgroups over one weight tile, so each weight is unpacked once a chunk,
