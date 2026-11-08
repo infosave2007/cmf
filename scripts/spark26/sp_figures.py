@@ -480,6 +480,7 @@ T4 = {
         "u_p": "Prompt, tok/s", "u_d": "Decode after it, tok/s", "u_n": "{} tokens",
         "u_cq": "cortiq q4tp", "u_tu": "cortiq Turbo", "u_l": "llama.cpp Q4_K_M",
         "u_1": "Peak resident memory at 16 000 tokens: cortiq q4tp {cq} GB, Turbo {tu} GB, llama.cpp {ll} GB. Below 8192 tokens the turbo file reads exactly, as the standard one.",
+        "u_2": "Peak resident memory at 16 000 tokens: cortiq q4tp {cq} GB, llama.cpp {ll} GB. On the CPU the turbo file runs as the standard one.",
     },
     "ru": {
         "u_t": "Spark-X2.6-4B на CPU-сервере",
@@ -487,6 +488,7 @@ T4 = {
         "u_p": "Промпт, ток/с", "u_d": "Декод после него, ток/с", "u_n": "{} токенов",
         "u_cq": "cortiq q4tp", "u_tu": "cortiq Турбо", "u_l": "llama.cpp Q4_K_M",
         "u_1": "Пик резидентной памяти на 16 000 токенов: cortiq q4tp {cq} ГБ, Турбо {tu} ГБ, llama.cpp {ll} ГБ. До 8192 токенов турбо-файл читает точно, как обычный.",
+        "u_2": "Пик резидентной памяти на 16 000 токенов: cortiq q4tp {cq} ГБ, llama.cpp {ll} ГБ. На CPU турбо-файл работает как обычный.",
     },
     "zh": {
         "u_t": "Spark-X2.6-4B 在 CPU 服务器上",
@@ -494,6 +496,7 @@ T4 = {
         "u_p": "提示，tok/s", "u_d": "随后解码，tok/s", "u_n": "{} 词元",
         "u_cq": "cortiq q4tp", "u_tu": "cortiq Turbo", "u_l": "llama.cpp Q4_K_M",
         "u_1": "16 000 词元时的常驻内存峰值：cortiq q4tp {cq} GB，Turbo {tu} GB，llama.cpp {ll} GB。8192 词元以内 turbo 文件与标准文件一样精确读取。",
+        "u_2": "16 000 词元时的常驻内存峰值：cortiq q4tp {cq} GB，llama.cpp {ll} GB。在 CPU 上 turbo 文件按标准文件运行。",
     },
 }
 for _l in T:
@@ -507,6 +510,7 @@ def cpu(lang):
     s = Svg(1600, 900)
     head(s, t, t["u_t"], t["u_sub"])
     keys = [("cortiq", t["u_cq"], BLUE, True), ("turbo", t["u_tu"], AQUA, True), ("llama", t["u_l"], GREY, False)]
+    keys = [k for k in keys if k[0] in d]
     for pi, (metric, title, x0, w) in enumerate((("prefill", t["u_p"], 50, 760), ("dec", t["u_d"], 820, 730))):
         s.text(x0, 185, title, 26, BLUE, "700")
         umax = max(v for k, _, _, _ in keys for v in d[k][metric] if v is not None)
@@ -515,7 +519,8 @@ def cpu(lang):
             bars(s, lang, x0, 235 + ci * 185, w, t["u_n"].format(f"{c:,}".replace(",", " ")), rows, umax)
     i16 = d["ctx"].index(16000)
     s.rect(50, 800, 1500, 80, TINT, 10)
-    note = t["u_1"].format(cq=num(lang, d["cortiq"]["ram"][i16]), tu=num(lang, d["turbo"]["ram"][i16]), ll=num(lang, d["llama"]["ram"][i16]))
+    note = t["u_1" if "turbo" in d else "u_2"].format(
+        cq=num(lang, d["cortiq"]["ram"][i16]), tu=num(lang, d["turbo"]["ram"][i16]) if "turbo" in d else "", ll=num(lang, d["llama"]["ram"][i16]))
     for j, ln in enumerate(cf.wrap(note, lang, 140 if lang != "zh" else 66)[:2]):
         s.text(70, 835 + j * 30, ln, 21, INK)
     s.done(f"cpu_{lang}")

@@ -174,10 +174,11 @@ text, eight trials a length, the question at the end, Vulkan:
 |---|---:|---:|
 | 60 000 characters (about 14 000 tokens) | 8 of 8 | **6 of 8** |
 | 120 000 characters (about 28 000 tokens) | 8 of 8 | **6 of 8** |
-| 240 000 characters (about 56 000 tokens) | §S240 | **§F240** |
+| 240 000 characters (about 56 000 tokens) | 4 of 8 | **6 of 8** |
 
 The misses at 60 000 and 120 000 characters were all the password kind (`qX…vT`, a token the model had not seen as
-a word): the turbo file answered with text instead. §SUMMARY
+a word): the turbo file answered with text instead. At 240 000 characters the turbo file again missed only the
+password, twice, while the standard file lost one fact of each kind.
 
 ## Options
 
@@ -363,10 +364,11 @@ CUDA) и на 64 000: 56,2 tok/s против 35,6 (Vulkan) и 28,3 (CUDA) пр�
 |---|---:|---:|
 | 60 000 символов (около 14 000 токенов) | 8 из 8 | **6 из 8** |
 | 120 000 символов (около 28 000 токенов) | 8 из 8 | **6 из 8** |
-| 240 000 символов (около 56 000 токенов) | §S240 | **§F240** |
+| 240 000 символов (около 56 000 токенов) | 4 из 8 | **6 из 8** |
 
 Все промахи на 60 000 и 120 000 символах — пароли (`qX…vT`, токен, которого модель не видела словом): турбо-файл отвечал
-текстом вместо него. §RU_SUMMARY
+текстом вместо него. На 240 000 символах турбо-файл снова промахнулся только на пароле, дважды, а стандартный
+потерял по одному факту каждого вида.
 
 ### Параметры
 
@@ -538,9 +540,10 @@ CUDA 的 49.4），在 64 000 词元处同样领先：56.2 tok/s 对 35.6（Vulk
 |---|---:|---:|
 | 60 000 字符（约 14 000 词元） | 8 / 8 | **6 / 8** |
 | 120 000 字符（约 28 000 词元） | 8 / 8 | **6 / 8** |
-| 240 000 字符（约 56 000 词元） | §S240 | **§F240** |
+| 240 000 字符（约 56 000 词元） | 4 / 8 | **6 / 8** |
 
-60 000 和 120 000 字符上的失误都是密码类（`qX…vT`，模型没见过的词元）：turbo 文件用文字作答而没有给出它。§ZH_SUMMARY
+60 000 和 120 000 字符上的失误都是密码类（`qX…vT`，模型没见过的词元）：turbo 文件用文字作答而没有给出它。在 240 000 字符上，turbo 文件同样只在密码上失误两次，而标准文件
+每类事实各丢一个。
 
 ### 选项
 

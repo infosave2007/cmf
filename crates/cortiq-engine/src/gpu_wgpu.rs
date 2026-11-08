@@ -49722,7 +49722,12 @@ fn coop128_src() -> String {
     for (old, new) in [
         ("var<workgroup> cm_a: array<f16, 64 * 32>;", "var<workgroup> cm_a: array<f16, 128 * 32>;"),
         ("var<workgroup> cm_c: array<f32, 64 * 64>;", "var<workgroup> cm_c: array<f32, 128 * 64>;"),
-        ("let m0 = wid.y * 64u;", "let m0 = wid.y * 128u;"),
+        // The grouped tile walk (`mm_tile`) counts batch tiles of 128.
+        ("let mt = (pmm.nb + 63u) / 64u;", "let mt = (pmm.nb + 127u) / 128u;"),
+        (
+            "return vec2<u32>(m_tile * 64u, n_tile * 64u);",
+            "return vec2<u32>(m_tile * 128u, n_tile * 64u);",
+        ),
         // The activation panel read four floats a load (cols and every
         // tile column are multiples of 4, so the vec4 index is exact).
         (
@@ -49794,10 +49799,11 @@ fn coop128_src() -> String {
     src.push_str(
         "@compute @workgroup_size(256)
 fn q4tp_mm_coop128_s(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>,
                      @builtin(local_invocation_index) tid: u32,
                      @builtin(subgroup_id) sg: u32) {
     let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
-    coop_body(wid, tid, sg, asc);
+    coop_body(wid, nwg, tid, sg, asc);
 }
 ",
     );
@@ -60287,6 +60293,16 @@ fn main() {
         // f16 operands carry ~11 bits of mantissa; anything past 1e-2 is
         // a broken layout or a lost activation scale, not rounding.
         assert!(r < 1e-2, "coop GEMM drifted from the scalar arm: {r:.3e}");
+    }
+
+    /// The 128-row tile's source is a set of string patches on
+    /// `COOP_MM_SRC`: each must apply exactly once, or the device init
+    /// panics on every NVIDIA card. Checked without a device.
+    #[test]
+    fn coop128_source_patches_apply() {
+        let src = coop128_src();
+        assert!(src.contains("fn q4tp_mm_coop128_s("));
+        assert!(src.contains("let mt = (pmm.nb + 127u) / 128u;"));
     }
 
     /// The 128-row tile of the cooperative GEMM gives the 64-row kernel's
