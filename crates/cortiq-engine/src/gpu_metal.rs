@@ -2757,6 +2757,123 @@ kernel void gqa_attend_blk(
     if (lane == 0) { out[hd] = m; out[hd + 1u] = l; }
 }
 
+// `gqa_attend_blk`'s job with a thread per key (Spark-X2.6 decode at depth): a 128-key block of
+// one KV group, all its query heads. Each thread dots its key's row against the group's queries
+// (from threadgroup memory: the row is read once for every head, and no cross-lane sum per key),
+// the block's softmax goes through threadgroup memory, then P·V walks the block's V rows with
+// the threads across the head's dims. Same partials as `gqa_attend_blk` for `gqa_combine`.
+// hd <= 256, hpk <= 8; 128 threads.
+kernel void gqa_attend_kb(
+    device const float* q    [[buffer(0)]],   // [nb][nh][hd] rope'd
+    device const float* kbuf [[buffer(1)]],
+    device const float* vbuf [[buffer(2)]],
+    device float*       part [[buffer(3)]],
+    constant uint& nh   [[buffer(4)]],
+    constant uint& hpk  [[buffer(5)]],
+    constant uint& hd   [[buffer(6)]],
+    constant uint& cap  [[buffer(7)]],
+    constant uint& s0   [[buffer(8)]],
+    constant uint& nb   [[buffer(9)]],
+    constant uint& nblk [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    constant uint& bsz  [[buffer(12)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float qs[8u * 256u];
+    threadgroup float ws[8u * 128u];
+    threadgroup float red[8u * 4u];
+    threadgroup float bm[8u];
+    threadgroup float bl[8u];
+    uint kh = tg.x, j = tg.y, e = tg.z;
+    if (e >= nb || j >= nblk) return;
+    uint n = s0 + e + 1u;
+    uint p0 = j * 128u;
+    uint h0 = kh * hpk;
+    if (p0 >= n) {
+        for (uint h = 0u; h < hpk; ++h) {
+            device float* out = part + (((ulong)e * nh + h0 + h) * nblk + j) * (hd + 2u);
+            for (uint d = tid; d < hd; d += 128u) out[d] = 0.0f;
+            if (tid == 0u) { out[hd] = -INFINITY; out[hd + 1u] = 0.0f; }
+        }
+        return;
+    }
+    for (uint i = tid; i < hpk * hd; i += 128u) qs[i] = q[((ulong)e * nh + h0) * hd + i] * scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint p = p0 + tid;
+    bool live = p < n;
+    float a[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    uint hd4 = hd / 4u;
+    threadgroup const float4* qs4 = (threadgroup const float4*)qs;
+    if (live) {
+        // A row in vectors: a fourth of the load instructions of a scalar walk.
+        device const packed_float4* kr4 = (device const packed_float4*)(kbuf + ((ulong)kh * cap + p) * hd);
+        #pragma clang loop unroll(disable)
+        for (uint d = 0u; d < hd4; d += 4u) {
+            float4 k0 = float4(kr4[d]), k1 = float4(kr4[d + 1u]), k2 = float4(kr4[d + 2u]), k3 = float4(kr4[d + 3u]);
+            for (uint h = 0u; h < hpk; ++h) {
+                threadgroup const float4* qq = qs4 + h * hd4 + d;
+                a[h] += (dot(k0, qq[0]) + dot(k1, qq[1])) + (dot(k2, qq[2]) + dot(k3, qq[3]));
+            }
+        }
+    }
+    for (uint h = 0u; h < hpk; ++h) {
+        float m = simd_max(live ? a[h] : -INFINITY);
+        if (lane == 0u) red[h * 4u + sg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < hpk) bm[tid] = max(max(red[tid * 4u], red[tid * 4u + 1u]), max(red[tid * 4u + 2u], red[tid * 4u + 3u]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 0u; h < hpk; ++h) {
+        float w = live ? exp(a[h] - bm[h]) : 0.0f;
+        ws[h * 128u + tid] = w;
+        float sum = simd_sum(w);
+        if (lane == 0u) red[h * 4u + sg] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < hpk) bl[tid] = (red[tid * 4u] + red[tid * 4u + 1u]) + (red[tid * 4u + 2u] + red[tid * 4u + 3u]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint cnt = min(128u, n - p0);
+    float c0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float c1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Two adjacent dims a thread: a key's V row is one sweep of the threadgroup.
+    uint d0 = 2u * tid;
+    bool dl = d0 < hd;
+    device const packed_float2* vh2 = (device const packed_float2*)(vbuf + ((ulong)kh * cap + p0) * hd);
+    uint hd2 = hd / 2u;
+    // Eight keys' rows in flight a step: the walk one row at a time waited out a load
+    // per key (930 us of a 14 000-position layer on the M4, f16 or f32 alike).
+    uint t = 0u;
+    #pragma clang loop unroll(disable)
+    for (; t + 8u <= cnt; t += 8u) {
+        float2 vv[8];
+        for (uint u = 0u; u < 8u; ++u) vv[u] = dl ? float2(vh2[(ulong)(t + u) * hd2 + tid]) : float2(0.0f);
+        for (uint h = 0u; h < hpk; ++h) {
+            threadgroup const float* wr = ws + h * 128u + t;
+            for (uint u = 0u; u < 8u; ++u) {
+                c0[h] += wr[u] * vv[u].x;
+                c1[h] += wr[u] * vv[u].y;
+            }
+        }
+    }
+    #pragma clang loop unroll(disable)
+    for (; t < cnt; ++t) {
+        float2 vv = dl ? float2(vh2[(ulong)t * hd2 + tid]) : float2(0.0f);
+        for (uint h = 0u; h < hpk; ++h) {
+            float w = ws[h * 128u + t];
+            c0[h] += w * vv.x;
+            c1[h] += w * vv.y;
+        }
+    }
+    for (uint h = 0u; h < hpk; ++h) {
+        device float* out = part + (((ulong)e * nh + h0 + h) * nblk + j) * (hd + 2u);
+        if (dl) { out[d0] = c0[h]; out[d0 + 1u] = c1[h]; }
+        if (tid == 0u) { out[hd] = bm[h]; out[hd + 1u] = bl[h]; }
+    }
+}
+
 // Fold the block partials of `gqa_attend_blk` per (row, head):
 // out = Σ_j acc_j·exp(m_j − M) / Σ_j l_j·exp(m_j − M). One threadgroup
 // per (head, row), a thread per dim (hd ≤ 1024).
@@ -8348,6 +8465,138 @@ kernel void prism_fwht_rows(
 /// loudly. Checked on an Apple M4 outside cargo by
 /// `tools/metal_q1g_parity.swift`, which compiles this source and `MSL`
 /// straight from this file and compares the kernels bit for bit.
+/// The kernels with a KV mirror operand, and their f16 twins (`<name>_h`), cut from `MSL` at
+/// start-up: the mirror's rows in f16 half the bytes a token's attention reads at depth and the
+/// mirror's memory (Spark-X2.6-4B at 14 000 tokens on the M4: 1.03 GB a token in f32).
+const KV_HALF_KERNELS: [&str; 9] = [
+    "gqa_attend_kb",
+    "kv_append",
+    "kv_append_b",
+    "chunk_rope_kv",
+    "gqa_attend",
+    "gqa_attend_blk",
+    "chunk_attend",
+    "mul_mm_f32nt",
+    "mul_mm_f32nn",
+];
+
+/// `kernel void name(` … its closing `}` at the start of a line, out of `src`.
+fn msl_kernel<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let head = format!("kernel void {name}(");
+    let at = src.find(&head)?;
+    let end = src[at..].find("\n}\n")? + at + 3;
+    Some(&src[at..end])
+}
+
+/// Every `ty` + spaces + `name` of a declaration, retyped to `to`.
+fn msl_retype(text: &str, ty: &str, names: &[&str], to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(ty) {
+        let after = &rest[i + ty.len()..];
+        let name_at = after.len() - after.trim_start_matches(' ').len();
+        let tail = &after[name_at..];
+        let hit = names.iter().find(|n| {
+            tail.starts_with(**n) && !tail[n.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        });
+        out.push_str(&rest[..i]);
+        out.push_str(if hit.is_some() { to } else { ty });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The f16 twins of `KV_HALF_KERNELS`.
+fn kv_half_source(src: &str) -> Option<String> {
+    let mirror = ["kbuf", "vbuf", "xw", "vw", "kh0", "vh0", "kr", "vr", "vh0", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "r0", "r1", "r2", "r3", "wrow"];
+    let mut out = String::new();
+    for name in KV_HALF_KERNELS {
+        let k = msl_kernel(src, name)?;
+        let mut t = k.replacen(&format!("kernel void {name}("), &format!("kernel void {name}_h("), 1);
+        t = msl_retype(&t, "device const float*", &mirror, "device const half*");
+        t = msl_retype(&t, "device float*", &["kbuf", "vbuf"], "device half*");
+        t = t.replace(
+            "device const packed_float4* v4 = (device const packed_float4*)vr;",
+            "device const packed_half4* v4 = (device const packed_half4*)vr;",
+        );
+        t = t.replace("device const packed_float4* kr4 = (device const packed_float4*)(kbuf", "device const packed_half4* kr4 = (device const packed_half4*)(kbuf");
+        t = t.replace("device const packed_float2* vh2 = (device const packed_float2*)(vbuf", "device const packed_half2* vh2 = (device const packed_half2*)(vbuf");
+        if name == "chunk_rope_kv" {
+            let old = "    device float* dst = isq\n        ? qout + ((ulong)head * nb + bi) * hd\n        : (isv ? vbuf : kbuf) + ((ulong)kvh * cap + st0 + bi) * hd;\n    for (uint t = 0; t < nt; ++t) {\n        uint d = t * 32u + lane;\n        if (d < hd) dst[d] = xv[t];\n    }\n";
+            if !t.contains(old) {
+                return None;
+            }
+            t = t.replace(
+                old,
+                "    if (isq) {\n        device float* dst = qout + ((ulong)head * nb + bi) * hd;\n        for (uint t = 0; t < nt; ++t) {\n            uint d = t * 32u + lane;\n            if (d < hd) dst[d] = xv[t];\n        }\n    } else {\n        device half* dst = (isv ? vbuf : kbuf) + ((ulong)kvh * cap + st0 + bi) * hd;\n        for (uint t = 0; t < nt; ++t) {\n            uint d = t * 32u + lane;\n            if (d < hd) dst[d] = (half)xv[t];\n        }\n    }\n",
+            );
+        }
+        out.push_str(&t);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// KV mirrors in f16: `CMF_METAL_KV_F16=1` / `=0`, else the loader's choice for the file
+/// (`set_kv_f16_default`, Spark-X2.6). Fixed at the first mirror: every one in the process
+/// has one element type.
+static KV_F16_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KV_F16: OnceLock<bool> = OnceLock::new();
+
+/// The loader's choice of f16 mirrors, before the first one is made.
+pub fn set_kv_f16_default(on: bool) {
+    KV_F16_DEFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn kv_f16() -> bool {
+    *KV_F16.get_or_init(|| {
+        let want = match std::env::var("CMF_METAL_KV_F16").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => KV_F16_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+        };
+        let on = want
+            && ctx().is_some_and(|c| {
+                [&c.kvapp_h, &c.kvappb_h, &c.cropekv_h, &c.gqat_h, &c.gqablk_h, &c.cattend_h, &c.gqakb_h].iter().all(|p| p.is_some())
+            });
+        tracing::info!("Metal KV mirrors: {}", if on { "f16" } else { "f32" });
+        on
+    })
+}
+
+/// Bytes of one mirror element.
+fn kv_elem() -> usize {
+    if kv_f16() { 2 } else { 4 }
+}
+
+/// `src` rows into a mirror buffer at element `at`, in its element type.
+///
+/// # Safety
+/// `buf` holds at least `at + src.len()` elements and no command is using that range.
+unsafe fn mirror_put(buf: &Buffer, at: usize, src: &[f32]) {
+    if kv_f16() {
+        f32_to_f16_into(src, unsafe { (buf.contents() as *mut u16).add(at) });
+    } else {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (buf.contents() as *mut f32).add(at), src.len()) };
+    }
+}
+
+/// Mirror elements from `at` into `dst`, as f32.
+///
+/// # Safety
+/// `buf` holds at least `at + dst.len()` elements, and the command writing them is done.
+unsafe fn mirror_get(buf: &Buffer, at: usize, dst: &mut [f32]) {
+    if kv_f16() {
+        let p = unsafe { (buf.contents() as *const u16).add(at) };
+        for (i, d) in dst.iter_mut().enumerate() {
+            *d = cortiq_core::quant::f16_to_f32(unsafe { *p.add(i) });
+        }
+    } else {
+        unsafe { std::ptr::copy_nonoverlapping((buf.contents() as *const f32).add(at), dst.as_mut_ptr(), dst.len()) };
+    }
+}
+
 const MSL_Q1G: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -8686,6 +8935,16 @@ struct Ctx {
     /// attn_rope_qkn over a batch of positions.
     rqknb: ComputePipelineState,
     kvapp: ComputePipelineState,
+    /// f16-mirror twins (`kv_f16`): None when they did not compile.
+    kvapp_h: Option<ComputePipelineState>,
+    kvappb_h: Option<ComputePipelineState>,
+    cropekv_h: Option<ComputePipelineState>,
+    gqat_h: Option<ComputePipelineState>,
+    gqablk_h: Option<ComputePipelineState>,
+    cattend_h: Option<ComputePipelineState>,
+    /// `gqa_attend_kb` (a thread per key) and its f16 twin.
+    gqakb: ComputePipelineState,
+    gqakb_h: Option<ComputePipelineState>,
     gqat: ComputePipelineState,
     o1far: ComputePipelineState,
     o1push: ComputePipelineState,
@@ -8843,9 +9102,16 @@ fn init() -> Result<Ctx, String> {
     // atomic_float (attention-importance accumulation in gqa_attend) needs
     // MSL 3.0 — macOS 13+, a subset of what the UMA gate already implies.
     opts.set_language_version(metal::MTLLanguageVersion::V3_0);
-    let lib = device
-        .new_library_with_source(MSL, &opts)
-        .map_err(|e| format!("MSL compile: {e}"))?;
+    // With the KV mirrors' f16 twins appended; a twin that does not compile leaves them in f32.
+    let (lib, kv_half) = match kv_half_source(MSL).map(|h| device.new_library_with_source(&format!("{MSL}\n{h}"), &opts)) {
+        Some(Ok(l)) => (l, true),
+        other => {
+            if let Some(Err(e)) = other {
+                tracing::warn!("Metal f16 KV kernels: {e}");
+            }
+            (device.new_library_with_source(MSL, &opts).map_err(|e| format!("MSL compile: {e}"))?, false)
+        }
+    };
     let pso = |name: &str| -> Result<ComputePipelineState, String> {
         let f = lib
             .get_function(name, None)
@@ -8854,6 +9120,11 @@ fn init() -> Result<Ctx, String> {
             .new_compute_pipeline_state_with_function(&f)
             .map_err(|e| format!("pipeline {name}: {e}"))
     };
+    let half = |name: &str| kv_half.then(|| pso(name).ok()).flatten();
+    let (kvapp_h, kvappb_h, cropekv_h) = (half("kv_append_h"), half("kv_append_b_h"), half("chunk_rope_kv_h"));
+    let (gqat_h, gqablk_h, cattend_h) = (half("gqa_attend_h"), half("gqa_attend_blk_h"), half("chunk_attend_h"));
+    let gqakb_h = half("gqa_attend_kb_h");
+    let gqakb = pso("gqa_attend_kb")?;
     let q8 = pso("q8_matvec")?;
     let q8f = pso("q8f_matvec")?;
     let q8f_r4 = pso("q8f_matvec_r4")?;
@@ -9115,6 +9386,14 @@ fn init() -> Result<Ctx, String> {
         rqkn,
         rqknb,
         kvapp,
+        kvapp_h,
+        kvappb_h,
+        cropekv_h,
+        gqat_h,
+        gqablk_h,
+        cattend_h,
+        gqakb,
+        gqakb_h,
         gqat,
         o1far,
         o1push,
@@ -11924,8 +12203,17 @@ pub fn attend_kernel_bench(
             .new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (len * 4) as u64, shared)
     };
     let q = fill(nh * hd, 1);
-    let k = fill(nkv * cap * hd, 2);
-    let v = fill(nkv * cap * hd, 3);
+    // 3: the per-key kernel over f16 K/V (`gqa_attend_kb_h`).
+    let fill_h = |len: usize, seed: u32| -> Buffer {
+        let v: Vec<u16> = (0..len)
+            .map(|i| cortiq_core::quant::f32_to_f16((((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 8) % 2001) as f32 / 1000.0 - 1.0))
+            .collect();
+        c._device.new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (len * 2) as u64, shared)
+    };
+    let (k, v) = if which == 3 { (fill_h(nkv * cap * hd, 2), fill_h(nkv * cap * hd, 3)) } else { (fill(nkv * cap * hd, 2), fill(nkv * cap * hd, 3)) };
+    if which == 3 && c.gqakb_h.is_none() {
+        return None;
+    }
     let ao = c._device.new_buffer((nh * hd * 4) as u64, shared);
     let imp = c._device.new_buffer((cap * 4) as u64, shared);
     let sink = const_buf(c, &NO_ATTN_SINK);
@@ -11952,7 +12240,12 @@ pub fn attend_kernel_bench(
                 encode_gqa_attend_blk_with(
                     c,
                     enc,
-                    &c.gqablk,
+                    // 2: the thread-per-key `gqa_attend_kb`; 3: its f16 twin.
+                    match which {
+                        2 => &c.gqakb,
+                        3 => c.gqakb_h.as_ref().unwrap(),
+                        _ => &c.gqablk,
+                    },
                     gqa_blk_size(),
                     &q,
                     &k,
@@ -13026,6 +13319,20 @@ fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
     }
 }
 
+/// A KV-mirror kernel in the mirrors' element type (`kv_f16`).
+fn kvk<'a>(f32p: &'a ComputePipelineState, h: &'a Option<ComputePipelineState>) -> &'a ComputePipelineState {
+    match h {
+        Some(h) if kv_f16() => h,
+        _ => f32p,
+    }
+}
+
+/// The attention GEMMs over the mirror: `Q·Kᵀ` (2) or `P·V` (3), with the f16 operand (4, 5)
+/// when the mirrors hold f16.
+fn kv_mm(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineState {
+    mm_pipeline(c, rows, cols, if kv_f16() { kind + 2 } else { kind })
+}
+
 /// Shape-specialized mul_mm pipeline (cols/rows as function constants —
 /// fully unrolled K loop, strength-reduced addressing). Falls back to
 /// the generic pipeline if specialization fails.
@@ -13040,14 +13347,14 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
             let rows_u = rows as u32;
             // f32nt specializes cols only (rows = context, varies);
             // f32nn specializes rows only (kdim varies).
-            if kind != 3 {
+            if kind != 3 && kind != 5 {
                 fcv.set_constant_value_at_index(
                     &cols_u as *const u32 as *const std::ffi::c_void,
                     metal::MTLDataType::UInt,
                     0,
                 );
             }
-            if kind != 2 {
+            if kind != 2 && kind != 4 {
                 fcv.set_constant_value_at_index(
                     &rows_u as *const u32 as *const std::ffi::c_void,
                     metal::MTLDataType::UInt,
@@ -13058,12 +13365,19 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
                 1 => ("q8_mul_mm_silu", &c.q8mmsilu),
                 2 => ("mul_mm_f32nt", &c.mmf32nt),
                 3 => ("mul_mm_f32nn", &c.mmf32nn),
+                // f16 mirror operands (`kv_f16`): the twins, or their unspecialized form.
+                4 => ("mul_mm_f32nt_h", &c.mmf32nt),
+                5 => ("mul_mm_f32nn_h", &c.mmf32nn),
                 _ => ("q8_mul_mm", &c.q8mmm),
             };
-            c.lib
-                .get_function(name, Some(fcv))
-                .ok()
-                .and_then(|f| c._device.new_compute_pipeline_state_with_function(&f).ok())
+            let pso = |f: Option<&metal::FunctionConstantValues>| {
+                c.lib
+                    .get_function(name, f.cloned())
+                    .ok()
+                    .and_then(|f| c._device.new_compute_pipeline_state_with_function(&f).ok())
+            };
+            pso(Some(&fcv))
+                .or_else(|| if kind >= 4 { pso(None) } else { None })
                 .unwrap_or_else(|| generic.clone())
         })
         .clone()
@@ -13691,6 +14005,10 @@ pub fn chunk_run_gpu(
     if layers.len() != io.len() {
         return false;
     }
+    // Gemma-4's wide kernels and Unlimited-OCR's attend read f32 mirrors only.
+    if kv_f16() && layers.iter().any(|l| l.g4.is_some() || l.dash.is_some()) {
+        return false;
+    }
     let (nh, nkv, hd, hs, inter) = (first.nh, first.nkv, first.hd, first.hs, first.inter);
     // Gemma-4 runs carry their own kernels and may vary KV heads / head
     // width per layer (the buffers below are sized for the widest).
@@ -13964,7 +14282,7 @@ pub fn chunk_run_gpu(
             });
             if entry.cap < need {
                 let cap = mirror_cap(need, l.window.is_some());
-                let nb = (nkv * cap * hd * 4) as u64;
+                let nb = (nkv * cap * hd * kv_elem()) as u64;
                 entry.k = c
                     ._device
                     .new_buffer(nb, MTLResourceOptions::StorageModeShared);
@@ -13988,18 +14306,8 @@ pub fn chunk_run_gpu(
                         return false;
                     }
                     unsafe {
-                        let kd = (entry.k.contents() as *mut f32).add(hh * entry.cap * hd);
-                        std::ptr::copy_nonoverlapping(
-                            lio.cpu_k[hh].as_ptr(),
-                            kd,
-                            lio.cpu_k[hh].len(),
-                        );
-                        let vd = (entry.v.contents() as *mut f32).add(hh * entry.cap * hd);
-                        std::ptr::copy_nonoverlapping(
-                            lio.cpu_v[hh].as_ptr(),
-                            vd,
-                            lio.cpu_v[hh].len(),
-                        );
+                        mirror_put(&entry.k, hh * entry.cap * hd, lio.cpu_k[hh]);
+                        mirror_put(&entry.v, hh * entry.cap * hd, lio.cpu_v[hh]);
                     }
                 }
                 entry.stored = lio.cpu_stored;
@@ -14192,7 +14500,7 @@ pub fn chunk_run_gpu(
         } else {
             None
         };
-        let q8att = if q8l && moe_q8::att_on() {
+        let q8att = if q8l && moe_q8::att_on() && !kv_f16() {
             moe_q8::pipes(c)
         } else {
             None
@@ -14294,7 +14602,7 @@ pub fn chunk_run_gpu(
             enc.set_compute_pipeline_state(if hd > 256 {
                 &g4p.unwrap().cropekv16
             } else {
-                &c.cropekv
+                kvk(&c.cropekv, &c.cropekv_h)
             });
             for (i, buf) in [
                 &qraw, &kraw, &vraw, &qrope, &prep.k_mb, &prep.v_mb, &bqb, &bkb, &bvb, &qn_b,
@@ -14366,10 +14674,10 @@ pub fn chunk_run_gpu(
                 let enc = cmd.new_compute_command_encoder();
                 match q8att {
                     Some(p) => moe_q8::set_att_nt(p, enc),
-                    None => enc.set_compute_pipeline_state(&mm_pipeline(c, 0, hd, 2)),
+                    None => enc.set_compute_pipeline_state(&kv_mm(c, 0, hd, 2)),
                 }
                 for g in 0..nkv {
-                    let koff = (g * prep.cap * hd * 4) as u64;
+                    let koff = (g * prep.cap * hd * kv_elem()) as u64;
                     let qoff = (g * hpk * b * hd * 4) as u64;
                     enc.set_buffer(0, Some(&prep.k_mb), koff);
                     enc.set_buffer(1, Some(&qrope), qoff);
@@ -14428,9 +14736,9 @@ pub fn chunk_run_gpu(
                     enc.dispatch_threads(MTLSize::new(ncur as u64, 32, 1), MTLSize::new(64, 4, 1));
                     match q8att {
                         Some(p) => moe_q8::set_att_nn(p, enc),
-                        None => enc.set_compute_pipeline_state(&mm_pipeline(c, hd, 0, 3)),
+                        None => enc.set_compute_pipeline_state(&kv_mm(c, hd, 0, 3)),
                     }
-                    let koff = (g * prep.cap * hd * 4) as u64;
+                    let koff = (g * prep.cap * hd * kv_elem()) as u64;
                     let qoff = (g * hpk * b * hd * 4) as u64;
                     enc.set_buffer(0, Some(&prep.v_mb), koff);
                     enc.set_buffer(1, Some(&scores), g as u64 * g_stride);
@@ -14776,15 +15084,12 @@ pub fn chunk_run_gpu(
     for ((prep, lio), l) in preps.iter().zip(io.iter_mut()).zip(layers) {
         let (nkv, hd) = (l.nkv, l.hd);
         unsafe {
-            let kc = prep.k_mb.contents() as *const f32;
-            let vc = prep.v_mb.contents() as *const f32;
             for hh in 0..nkv {
                 for bi in 0..b {
-                    let srck = kc.add((hh * prep.cap + prep.st0 + bi) * hd);
-                    let srcv = vc.add((hh * prep.cap + prep.st0 + bi) * hd);
+                    let at = (hh * prep.cap + prep.st0 + bi) * hd;
                     let dst = (bi * nkv + hh) * hd;
-                    std::ptr::copy_nonoverlapping(srck, lio.out_k.as_mut_ptr().add(dst), hd);
-                    std::ptr::copy_nonoverlapping(srcv, lio.out_v.as_mut_ptr().add(dst), hd);
+                    mirror_get(&prep.k_mb, at, &mut lio.out_k[dst..dst + hd]);
+                    mirror_get(&prep.v_mb, at, &mut lio.out_v[dst..dst + hd]);
                 }
             }
             std::ptr::copy_nonoverlapping(
@@ -21711,6 +22016,10 @@ impl TokenGraph {
     /// encoding anything if the mirror could not be prepared.
     pub fn encode_attn_device(&mut self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         WCAT.store(3, std::sync::atomic::Ordering::Relaxed);
+        // Gemma-4's wide heads and Unlimited-OCR's attend read f32 mirrors only.
+        if kv_f16() && (p.hd > 256 || p.dash.is_some()) {
+            return false;
+        }
         // ── O(1) layer: ensure the device state FIRST (upload on seal
         // epoch change) — a refusal must leave nothing half-encoded.
         let o1dev = match &p.o1 {
@@ -21747,7 +22056,7 @@ impl TokenGraph {
                 });
                 if entry.cap < need {
                     let cap = mirror_cap(need, p.window.is_some());
-                    let bytes = (p.nkv * cap * p.hd * 4) as u64;
+                    let bytes = (p.nkv * cap * p.hd * kv_elem()) as u64;
                     entry.k = self
                         .c
                         ._device
@@ -21782,18 +22091,8 @@ impl TokenGraph {
                             return false;
                         }
                         unsafe {
-                            let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
-                            std::ptr::copy_nonoverlapping(
-                                p.cpu_k[h].as_ptr(),
-                                kd,
-                                p.cpu_k[h].len(),
-                            );
-                            let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
-                            std::ptr::copy_nonoverlapping(
-                                p.cpu_v[h].as_ptr(),
-                                vd,
-                                p.cpu_v[h].len(),
-                            );
+                            mirror_put(&entry.k, h * entry.cap * p.hd, p.cpu_k[h]);
+                            mirror_put(&entry.v, h * entry.cap * p.hd, p.cpu_v[h]);
                         }
                     }
                     entry.stored = p.cpu_stored;
@@ -21958,7 +22257,7 @@ impl TokenGraph {
             enc.set_compute_pipeline_state(if wide {
                 &g4.unwrap().cropekv16
             } else {
-                &self.c.cropekv
+                kvk(&self.c.cropekv, &self.c.cropekv_h)
             });
             // No bias (flag 16 clear): slots 6..8 are never read.
             for (i, buf) in [
@@ -22106,7 +22405,7 @@ impl TokenGraph {
             if !rope_app {
                 disp(
                     enc,
-                    &self.c.kvapp,
+                    kvk(&self.c.kvapp, &self.c.kvapp_h),
                     &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
                     &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
                     &[],
@@ -22160,13 +22459,20 @@ impl TokenGraph {
             let first = p.window.map_or(0, |w| n_all.saturating_sub(w));
             let skip_a = decode_skip('a');
             let n_pos = n_all - first;
-            let (kv_off, imp_off) = ((first * p.hd * 4) as u64, (first * 4) as u64);
+            let (kv_off, imp_off) = ((first * p.hd * kv_elem()) as u64, (first * 4) as u64);
             let att_small = moe_bit(ATT_SMALL);
             let thr = match self.blk_from {
                 _ if att_small => 1,
                 Some(n) if std::env::var("CMF_GQA_BLK").is_err() => n,
                 _ if moe_bit(ATT_BLK) && std::env::var("CMF_GQA_BLK").is_err() => 64,
                 _ => gqa_blk_threshold(),
+            };
+            // The per-key kernel pays from a few dozen positions on (Spark-X2.6 on the M4:
+            // 50 against 250 us at 512 positions, f16), sliding windows included.
+            let thr = if gqa_kb_on() && !wide && p.hd % 16 == 0 && p.hd <= 256 && std::env::var("CMF_GQA_BLK").is_err() {
+                thr.min(gqa_kb_min())
+            } else {
+                thr
             };
             // (`encode_gqa_attend_blk`'s hpk <= 8 for the main kernel; the
             // wide twin runs Gemma-4's 16 heads per KV head.)
@@ -22183,8 +22489,10 @@ impl TokenGraph {
                         enc,
                         if wide {
                             &g4.unwrap().gqablk16
+                        } else if gqa_kb_on() && p.hd % 4 == 0 {
+                            kvk(&self.c.gqakb, &self.c.gqakb_h)
                         } else {
-                            &self.c.gqablk
+                            kvk(&self.c.gqablk, &self.c.gqablk_h)
                         },
                         match self.blk_size {
                             _ if std::env::var("CMF_GQA_BLKSZ").is_ok() => gqa_blk_size(),
@@ -22209,7 +22517,7 @@ impl TokenGraph {
             let att_pso = if wide {
                 &g4.unwrap().gqat16
             } else {
-                &self.c.gqat
+                kvk(&self.c.gqat, &self.c.gqat_h)
             };
             let cap_sgs = (att_pso.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
@@ -22248,7 +22556,7 @@ impl TokenGraph {
                     let has_sink = p.softmax_sink.is_some() as u32;
                     disp_tg(
                         enc,
-                        &self.c.gqat,
+                        kvk(&self.c.gqat, &self.c.gqat_h),
                         &[
                             (&qr_b, 0),
                             (&k_mb, kv_off),
@@ -23733,12 +24041,10 @@ pub fn kv_mirror_read_last(
     }
     let row = m.stored - 1;
     unsafe {
-        let ks = m.k.contents() as *const f32;
-        let vs = m.v.contents() as *const f32;
         for h in 0..nkv {
             let off = (h * m.cap + row) * hd;
-            std::ptr::copy_nonoverlapping(ks.add(off), k_out[h * hd..].as_mut_ptr(), hd);
-            std::ptr::copy_nonoverlapping(vs.add(off), v_out[h * hd..].as_mut_ptr(), hd);
+            mirror_get(&m.k, off, &mut k_out[h * hd..(h + 1) * hd]);
+            mirror_get(&m.v, off, &mut v_out[h * hd..(h + 1) * hd]);
         }
     }
     true
@@ -23889,14 +24195,12 @@ pub fn kv_mirror_read_rows(
         return false;
     }
     unsafe {
-        let ks = m.k.contents() as *const f32;
-        let vs = m.v.contents() as *const f32;
         for r in 0..n {
             for h in 0..nkv {
                 let off = (h * m.cap + from + r) * hd;
                 let dst = (r * nkv + h) * hd;
-                std::ptr::copy_nonoverlapping(ks.add(off), k_out[dst..].as_mut_ptr(), hd);
-                std::ptr::copy_nonoverlapping(vs.add(off), v_out[dst..].as_mut_ptr(), hd);
+                mirror_get(&m.k, off, &mut k_out[dst..dst + hd]);
+                mirror_get(&m.v, off, &mut v_out[dst..dst + hd]);
             }
         }
     }
@@ -25492,7 +25796,7 @@ impl VerifyGraph {
             });
             if entry.cap < need {
                 let cap = mirror_cap(need, p.window.is_some());
-                let bytes = (p.nkv * cap * p.hd * 4) as u64;
+                let bytes = (p.nkv * cap * p.hd * kv_elem()) as u64;
                 entry.k = c
                     ._device
                     .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
@@ -25516,10 +25820,8 @@ impl VerifyGraph {
                         return false;
                     }
                     unsafe {
-                        let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
-                        std::ptr::copy_nonoverlapping(p.cpu_k[h].as_ptr(), kd, p.cpu_k[h].len());
-                        let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
-                        std::ptr::copy_nonoverlapping(p.cpu_v[h].as_ptr(), vd, p.cpu_v[h].len());
+                        mirror_put(&entry.k, h * entry.cap * p.hd, p.cpu_k[h]);
+                        mirror_put(&entry.v, h * entry.cap * p.hd, p.cpu_v[h]);
                     }
                 }
                 entry.stored = p.cpu_stored;
@@ -25633,7 +25935,7 @@ impl VerifyGraph {
         // append the b rows
         let enc_o = self.cut(enc_o, "attn-rope");
         let enc: &metal::ComputeCommandEncoderRef = &enc_o;
-        enc.set_compute_pipeline_state(&c.kvappb);
+        enc.set_compute_pipeline_state(kvk(&c.kvappb, &c.kvappb_h));
         enc.set_buffer(0, Some(&k_b), 0);
         enc.set_buffer(1, Some(&v_b), 0);
         enc.set_buffer(2, Some(&k_mb), 0);
@@ -25676,7 +25978,7 @@ impl VerifyGraph {
             // positions 0..=stored+e (one dispatch; the per-row flash split
             // below stays for the single row)
             if !verify_skip('a') {
-                enc.set_compute_pipeline_state(&c.cattend);
+                enc.set_compute_pipeline_state(kvk(&c.cattend, &c.cattend_h));
                 enc.set_buffer(0, Some(&qr_b), 0);
                 enc.set_buffer(1, Some(&k_mb), 0);
                 enc.set_buffer(2, Some(&v_mb), 0);
@@ -25715,14 +26017,14 @@ impl VerifyGraph {
             let n_all = stored + e + 1;
             let first = win.map_or(0, |w| n_all.saturating_sub(w));
             let n_pos = n_all - first;
-            let kv_off = (first * p.hd * 4) as u64;
+            let kv_off = (first * p.hd * kv_elem()) as u64;
             let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
             disp_tg(
                 enc,
-                &c.gqat,
+                kvk(&c.gqat, &c.gqat_h),
                 &[
                     (&qr_b, (e * nhd * 4) as u64),
                     (&k_mb, kv_off),
@@ -26143,7 +26445,7 @@ fn encode_attend_gemm(
     if mode == 0 || nkv == 0 || nh % nkv != 0 || hd % 32 != 0 || hd > 256 || nb < 32 {
         return false;
     }
-    let exact = if mode == 2 {
+    let exact = if mode == 2 && !kv_f16() {
         match moe_q8::pipes(c) {
             Some(p) => Some(p),
             None => return false,
@@ -26174,11 +26476,11 @@ fn encode_attend_gemm(
         words(enc, 2, &[n as u32, nh as u32, hd as u32, n as u32]);
         enc.dispatch_threads(MTLSize::new((n * nh * hd) as u64, 1, 1), MTLSize::new(256, 1, 1));
         for g in 0..nkv {
-            let koff = (g * cap * hd * 4) as u64;
+            let koff = (g * cap * hd * kv_elem()) as u64;
             let poff = (g * hpk * n * hd * 4) as u64;
             match exact {
                 Some(p) => moe_q8::set_att_nt(p, enc),
-                None => enc.set_compute_pipeline_state(&mm_pipeline(c, 0, hd, 2)),
+                None => enc.set_compute_pipeline_state(&kv_mm(c, 0, hd, 2)),
             }
             enc.set_buffer(0, Some(k_mb), koff);
             enc.set_buffer(1, Some(&qp), poff);
@@ -26201,7 +26503,7 @@ fn encode_attend_gemm(
             );
             match exact {
                 Some(p) => moe_q8::set_att_nn(p, enc),
-                None => enc.set_compute_pipeline_state(&mm_pipeline(c, hd, 0, 3)),
+                None => enc.set_compute_pipeline_state(&kv_mm(c, hd, 0, 3)),
             }
             enc.set_buffer(0, Some(v_mb), koff);
             enc.set_buffer(1, Some(&scores), 0);
@@ -26252,7 +26554,7 @@ fn encode_gqa_attend_blk(
     encode_gqa_attend_blk_with(
         c,
         enc,
-        &c.gqablk,
+        if gqa_kb_on() && hd <= 256 && hd % 4 == 0 { kvk(&c.gqakb, &c.gqakb_h) } else { kvk(&c.gqablk, &c.gqablk_h) },
         gqa_blk_size(),
         q,
         k_mb,
@@ -26299,7 +26601,11 @@ fn encode_gqa_attend_blk_with(
         return false;
     }
     let n_max = stored + nb;
-    let bs = if std::ptr::eq(pso, &c.gqablk) { bs } else { 128 };
+    let kb = std::ptr::eq(pso, &c.gqakb) || c.gqakb_h.as_ref().is_some_and(|h| std::ptr::eq(pso, h));
+    if kb && (hpk > 8 || hd > 256 || hd % 16 != 0) {
+        return false;
+    }
+    let bs = if !kb && (std::ptr::eq(pso, &c.gqablk) || c.gqablk_h.as_ref().is_some_and(|h| std::ptr::eq(pso, h))) { bs } else { 128 };
     let nblk = n_max.div_ceil(bs);
     let part = io_buf(
         c,
@@ -26328,7 +26634,7 @@ fn encode_gqa_attend_blk_with(
     enc.set_bytes(12, 4, &bs_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(nkv as u64, nblk as u64, nb as u64),
-        MTLSize::new((hpk * 32) as u64, 1, 1),
+        MTLSize::new(if kb { 128 } else { (hpk * 32) as u64 }, 1, 1),
     );
     if conc {
         enc_barrier(enc);
@@ -26385,6 +26691,19 @@ fn mirror_cap(need: usize, windowed: bool) -> usize {
     } else {
         (need + need / 4).div_ceil(1024).max(1) * 1024
     }
+}
+
+/// The split-K attend with a thread per key (`gqa_attend_kb`) where it fits (`CMF_GQA_KB=0`:
+/// the lane-sliced `gqa_attend_blk`).
+fn gqa_kb_on() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_GQA_KB").as_deref() != Ok("0"))
+}
+
+/// Positions past which a token's attend takes `gqa_attend_kb` (`CMF_GQA_KB_MIN`, default 64).
+fn gqa_kb_min() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_GQA_KB_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
 /// Positions per block of the split-K attend (`CMF_GQA_BLKSZ`, default

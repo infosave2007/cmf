@@ -398,3 +398,145 @@ kernel void o1c_copy(
 {
     dst[i] = src[i];
 }
+
+// ── The near window as GEMMs (a chunk of 16 rows or more) ─────────────────────────────────
+// Per group the window's keys and values are laid out as one panel: the sinks, the ring from
+// its oldest row, then the chunk's rows; `ncap` columns, the unused ones zero. The scores
+// `Q·Kᵀ` and the sum `P·V` then run on the engine's tiled GEMMs, and row i of the chunk reads
+// the columns its own window covers. Scores are [gh][k][ncap], the near sum [gh][k][d].
+
+// A thread per (vec4 of the head, column, group).
+kernel void o1c_gather(
+    device const uint*   meta [[buffer(0)]],
+    device const float4* rk   [[buffer(1)]],
+    device const float4* rv   [[buffer(2)]],
+    device const float4* sk   [[buffer(3)]],
+    device const float4* sv   [[buffer(4)]],
+    device const float4* kb   [[buffer(5)]],
+    device const float4* vb   [[buffer(6)]],
+    device float4*       kp   [[buffer(7)]],
+    device float4*       vp   [[buffer(8)]],
+    constant OC&         u    [[buffer(9)]],
+    uint3 id [[thread_position_in_grid]])
+{
+    uint e4 = u.d / 4u;
+    uint e = id.x, j = id.y, g = id.z;
+    uint ncap = u.ns + u.w + u.k;
+    if (e >= e4 || j >= ncap || g >= u.ng) return;
+    uint len0 = meta[g * 4u];
+    uint head0 = meta[g * 4u + 1u];
+    uint wg = wgf(meta[g * 4u + 3u], u);
+    float4 kv = 0.0f, vv = 0.0f;
+    if (j < u.ns) {
+        kv = sk[(g * u.ns + j) * e4 + e];
+        vv = sv[(g * u.ns + j) * e4 + e];
+    } else if (j < u.ns + len0) {
+        uint x = j - u.ns;
+        uint at = (g * u.w + (head0 + x) % wg) * e4 + e;
+        kv = rk[at];
+        vv = rv[at];
+    } else if (j < u.ns + len0 + u.k) {
+        uint at = ((u.r0 + j - u.ns - len0) * u.ng + g) * e4 + e;
+        kv = kb[at];
+        vv = vb[at];
+    }
+    uint o = (g * ncap + j) * e4 + e;
+    kp[o] = kv;
+    vp[o] = vv;
+}
+
+// The columns row i of a group may read: the sinks, then its window over the ring and the
+// chunk's rows up to its own.
+static inline void o1c_cols(device const uint* meta, constant OC& u, uint g, uint i, thread uint& lo, thread uint& hi) {
+    uint len0 = meta[g * 4u];
+    uint wg = wgf(meta[g * 4u + 3u], u);
+    uint win = min(wg, len0 + i + 1u);
+    lo = u.ns + len0 + i + 1u - win;
+    hi = u.ns + len0 + i + 1u;
+}
+
+// The largest near score of a (row, query head): one simdgroup each.
+kernel void o1c_gmax(
+    device const uint*  meta [[buffer(0)]],
+    device const float* sc   [[buffer(1)]],
+    device float*       nm   [[buffer(2)]],
+    constant OC&        u    [[buffer(3)]],
+    uint3 tg   [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_threadgroup]])
+{
+    uint gh = tg.x, i = tg.y;
+    uint g = gh / u.hpg;
+    uint ncap = u.ns + u.w + u.k;
+    uint lo, hi;
+    o1c_cols(meta, u, g, i, lo, hi);
+    device const float* r = sc + ((ulong)gh * u.k + i) * ncap;
+    float m = -1.0e30f;
+    for (uint j = lane; j < u.ns; j += 32u) m = max(m, r[j]);
+    for (uint j = lo + lane; j < hi; j += 32u) m = max(m, r[j]);
+    float mx = simd_max(m);
+    if (lane == 0u) nm[i * u.nh + gh] = mx;
+}
+
+// The near weights in place (zero outside the row's columns) and 1/Σ with the far mass.
+kernel void o1c_gsoft(
+    device const uint*   meta [[buffer(0)]],
+    device float*        sc   [[buffer(1)]],
+    device const float4* hd   [[buffer(2)]],
+    device float*        inv  [[buffer(3)]],
+    constant OC&         u    [[buffer(4)]],
+    uint3 tg   [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_threadgroup]])
+{
+    uint gh = tg.x, i = tg.y;
+    uint g = gh / u.hpg;
+    uint ncap = u.ns + u.w + u.k;
+    uint lo, hi;
+    o1c_cols(meta, u, g, i, lo, hi);
+    device float* r = sc + ((ulong)gh * u.k + i) * ncap;
+    float4 hh = hd[i * u.nh + gh];
+    float den = 0.0f;
+    for (uint j = lane; j < ncap; j += 32u) {
+        bool live = j < u.ns || (j >= lo && j < hi);
+        float e = live ? exp(r[j] - hh.x) : 0.0f;
+        r[j] = e;
+        den += e;
+    }
+    float total = simd_sum(den) + hh.y;
+    if (lane == 0u) inv[i * u.nh + gh] = 1.0f / max(total, 1.0e-30f);
+}
+
+// `o1c_add` with the near sum from the GEMM.
+kernel void o1c_gadd(
+    device const uint*   meta [[buffer(0)]],
+    device const float4* no   [[buffer(1)]],
+    device const float4* hd   [[buffer(2)]],
+    device const float*  gn   [[buffer(3)]],
+    device const float4* th   [[buffer(4)]],
+    device const float*  inv  [[buffer(5)]],
+    device const float*  cf   [[buffer(6)]],
+    device const float4* rv   [[buffer(7)]],
+    device float4*       out  [[buffer(8)]],
+    constant OC&         u    [[buffer(9)]],
+    uint2 id [[thread_position_in_grid]])
+{
+    uint e = id.x, i = id.y;
+    uint e4 = u.d / 4u;
+    if (e >= u.nh * e4) return;
+    uint d = e % e4;
+    uint gh = e / e4;
+    uint g = gh / u.hpg;
+    uint at0 = i * u.nh + gh;
+    float4 acc = no[((ulong)gh * u.k + i) * e4 + d];
+    if (hd[at0].z > 0.5f) {
+        for (uint b = 0u; b < u.m; ++b) acc += gn[at0 * u.m + b] * th[(gh * u.m + b) * e4 + d];
+        uint wg = wgf(meta[g * 4u + 3u], u);
+        uint j0 = wg - meta[g * 4u];
+        if (i >= j0) {
+            uint head0 = meta[g * 4u + 1u];
+            for (uint j = j0; j <= i; ++j) {
+                acc += cf[at0 * OB_K + j] * rv[(g * u.w + (head0 + j - j0) % wg) * e4 + d];
+            }
+        }
+    }
+    out[((u.r0 + i) * u.nh + gh) * e4 + d] = acc * inv[at0];
+}

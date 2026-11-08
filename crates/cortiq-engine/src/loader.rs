@@ -2820,6 +2820,12 @@ impl Pipeline {
             && std::env::var_os("CMF_ATTN_DUMP").is_none()
             && std::env::var("CMF_SWA_TRIM").as_deref() != Ok("0"))
             .then_some((64, 64));
+        // Spark-X2.6's KV mirrors in f16 on Metal: at 14 000 tokens a token read 1.03 GB of f32
+        // rows on the M4 (`CMF_METAL_KV_F16=0` keeps f32).
+        #[cfg(target_os = "macos")]
+        if arch.arch_name == "spark2_5" {
+            crate::gpu_metal::set_kv_f16_default(true);
+        }
         // Spark-X2.6-4B q8_2f on the M4: an 8..31-token prompt prefills in
         // ~105 ms on the chunk graph against 0.5-1.2 s on the host layer walk
         // (shorter prompts keep their faster per-position path).
