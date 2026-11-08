@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cortiq import-gguf` reads IQ3_S (the 3.4-bit grid codebook inside imatrix IQ4_XS mixes), a port of ggml's
   `dequantize_row_iq3_s`, checked against gguf-py on a real block.
 
+### Changed
+- On Vulkan/DX12 with an NVIDIA card a q4tp prompt reads through the cooperative-matrix (tensor-core) GEMM by
+  default (`CMF_BATCH_COOP=0` keeps the scalar tile; `=1` asks for it on other vendors), and a 128-row chunk takes
+  the new `q4tp_mm_coop128_s` tile: eight subgroups over one weight tile, so each weight is unpacked once a chunk,
+  one lane a row and eight k, with the activations read four floats a load (`CMF_COOP128=0` keeps the 64-row tile).
+  OrcaCyber-Nano-1.0 q4tp (Qwen3.8-27B class) on an RTX 2000 Ada 16 GB, 2000-token prompt: 74.5 → 112 tok/s, the
+  same greedy text; the 128-row tile's sums equal the 64-row kernel's bit for bit (test).
+
 ### Fixed
 - `cortiq import-gguf` on a dense qwen35 GGUF with an MTP head (Qwen3.8-27B and its fine-tunes, e.g.
   OrcaCyber-Nano-1.0): llama.cpp counts the nextn block in `block_count`, and the importer made it a 65th trunk

@@ -19523,6 +19523,16 @@ pub struct Ctx {
     /// int8 GEMM held ~5 TFLOP/s on an RTX PRO 6000 (a 65B at 43 tok/s of
     /// prompt, 92 s to the first token of 4000). `CMF_Q82_COOP=0` keeps it.
     q82_mm_coop_s: Option<wgpu::ComputePipeline>,
+    /// `COOP_MM_SRC` with a 128-row M tile (`coop128_src`): eight 32-lane
+    /// subgroups, so every weight tile of a 128-row prefill chunk is
+    /// unpacked once instead of once per 64-row half. NVIDIA only (the
+    /// kernel counts subgroups of 32), 44 KB of workgroup memory.
+    /// `CMF_COOP128=0` keeps the 64-row tile.
+    q4tp_mm_coop128_s: Option<wgpu::ComputePipeline>,
+    /// The batched prefill's wide q4tp GEMMs take the cooperative kernel
+    /// unless `CMF_BATCH_COOP=0`: on by default on NVIDIA (measured on two
+    /// cards), opt-in elsewhere.
+    batch_coop_default: bool,
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
     ffn_silu_packed: wgpu::ComputePipeline,
@@ -21940,6 +21950,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
         && std::env::var("CMF_Q82_COOP").as_deref() != Ok("0"))
         .then(|| mk_coop(&coop_q82_src(), "q82-coop-s", "q82_mm_coop_s"))
         .flatten();
+    let nvidia = adapter_info.vendor == 0x10de;
+    let q4tp_mm_coop128_s = (q4tp_mm_coop.is_some()
+        && nvidia
+        && wg_storage >= 45_056
+        && std::env::var("CMF_COOP128").as_deref() != Ok("0"))
+    .then(|| mk_coop(&coop128_src(), "q4tp-coop128-s", "q4tp_mm_coop128_s"))
+    .flatten();
+    let batch_coop_default = nvidia;
 
     // The bake's f32 forward/backward GEMMs on the same units, guarded the
     // same way: a validation error must cost the pipeline, never the device.
@@ -22725,6 +22743,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop,
         q4tp_mm_coop_s,
         q82_mm_coop_s,
+        q4tp_mm_coop128_s,
+        batch_coop_default,
         ffn_silu_packed,
         act_absmax,
         dit_gemm_coop,
@@ -24949,12 +24969,22 @@ fn mv_fuse_gpr_ok(gpr: usize) -> bool {
     gpr > 64 || (narrow && gpr == 64)
 }
 
-/// `CMF_BATCH_COOP=1`: the batched prefill's wide GEMMs (k > 16) on the
-/// cooperative-matrix kernel with a device-computed activation scale.
-/// Opt-in until measured on more than one card.
-fn batch_coop_on() -> bool {
-    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_BATCH_COOP").as_deref() == Ok("1"))
+/// The batched prefill's wide GEMMs (k > 16) on the cooperative-matrix
+/// kernel with a device-computed activation scale. On by default on NVIDIA:
+/// k=32 chunks on an RTX PRO 4000 89.8 against 53 tok/s (Qwen3.8-27B q4tp),
+/// and on an RTX 2000 Ada (70 W, OrcaCyber-Nano-1.0 q4tp, 2000-token prompt)
+/// 74.3 against 85.8 tok/s with the same greedy text. `CMF_BATCH_COOP=0`
+/// keeps the scalar tile GEMM, `=1` asks for the kernel on other vendors.
+fn batch_coop_on(c: &Ctx) -> bool {
+    static N: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match *N.get_or_init(|| match std::env::var("CMF_BATCH_COOP").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }) {
+        Some(v) => v,
+        None => c.batch_coop_default,
+    }
 }
 
 /// `CMF_VERIFY_COOP=1`: the speculative verify's b ≤ 16 rows on the
@@ -35309,7 +35339,7 @@ pub fn forward_batch_graph_at(
                     && !(verify_coop_on() && c.q4tp_mm_coop_s.is_some() && cols % 32 == 0)
                 {
                     let _ = encode_q4tp_mv4_b_with(c, enc, &m.buf, xs, y, rows, cols, k, i8_rows);
-                } else if (batch_coop_on() || (k <= 16 && verify_coop_on()))
+                } else if (batch_coop_on(c) || (k <= 16 && verify_coop_on()))
                     && c.q4tp_mm_coop_s.is_some()
                     && cols % 32 == 0
                 {
@@ -35329,10 +35359,17 @@ pub fn forward_batch_graph_at(
                         )
                     };
                     if encode_act_absmax(c, enc, xs, k * cols, &asc) {
+                        // A chunk past one 64-row tile takes the 128-row
+                        // tile where the device has it: each weight tile is
+                        // unpacked once for the whole chunk.
+                        let pipe = match c.q4tp_mm_coop128_s.as_ref() {
+                            Some(p) if k > 64 => p,
+                            _ => c.q4tp_mm_coop_s.as_ref().unwrap(),
+                        };
                         encode_q4_tile_mm_full(
                             c,
                             enc,
-                            c.q4tp_mm_coop_s.as_ref().unwrap(),
+                            pipe,
                             &m.buf,
                             xs,
                             y,
@@ -47737,6 +47774,103 @@ fn coop_q82_src() -> String {
         .replace("fn q4tp_mm_coop_s(", "fn q82_mm_coop_s(")
 }
 
+/// `COOP_MM_SRC` with a 128-row M tile: 256 lanes in eight subgroups, each
+/// subgroup its 16 batch rows against the same 64-row weight tile, so a
+/// 128-row prefill chunk unpacks every q4tp weight once (the 64-row tile
+/// unpacked it once per half: the staging, not the matrix units, held the
+/// kernel near 10 TFLOP/s on an RTX 2000 Ada). Per output element the k
+/// order and the operands are the 64-row kernel's: the sums match it bit
+/// for bit. Entry point `q4tp_mm_coop128_s`.
+fn coop128_src() -> String {
+    let body_end = COOP_MM_SRC
+        .find("@compute @workgroup_size(128)\nfn q4tp_mm_coop(")
+        .expect("coop source: entry points");
+    let mut src = COOP_MM_SRC[..body_end].to_string();
+    for (old, new) in [
+        ("var<workgroup> cm_a: array<f16, 64 * 32>;", "var<workgroup> cm_a: array<f16, 128 * 32>;"),
+        ("var<workgroup> cm_c: array<f32, 64 * 64>;", "var<workgroup> cm_c: array<f32, 128 * 64>;"),
+        ("let m0 = wid.y * 64u;", "let m0 = wid.y * 128u;"),
+        // The activation panel read four floats a load (cols and every
+        // tile column are multiples of 4, so the vec4 index is exact).
+        (
+            "@group(0) @binding(1) var<storage, read> xmm: array<f32>;",
+            "@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;",
+        ),
+        (
+            "v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);",
+            "v = xmm[base >> 2u];",
+        ),
+        (
+            "for (var t = tid; t < 64u * 8u; t = t + 128u) {\n            let m = t / 8u;",
+            "for (var t = tid; t < 128u * 8u; t = t + 256u) {\n            let m = t / 8u;",
+        ),
+        (
+            "for (var t = tid; t < 64u * 8u; t = t + 128u) {\n            let n = t / 8u;",
+            "for (var t = tid; t < 64u * 8u; t = t + 256u) {\n            let n = t / 8u;",
+        ),
+        (
+            "for (var t = tid; t < 64u * 64u; t = t + 128u) {",
+            "for (var t = tid; t < 128u * 64u; t = t + 256u) {",
+        ),
+    ] {
+        assert_eq!(src.matches(old).count(), 1, "coop128 source: {old}");
+        src = src.replace(old, new);
+    }
+    // The weight tile with 256 lanes is exactly one lane a row and eight k:
+    // one aligned word of nibbles and one group scale a lane, where the
+    // 64-row body reads two bytes and evaluates the scale for every four
+    // weights. Same values into the same tile slots.
+    let b_head = "        for (var t = tid; t < 64u * 8u; t = t + 256u) {\n            let n = t / 8u;";
+    let b_start = src.find(b_head).expect("coop128 source: weight staging");
+    let b_end = b_start
+        + src[b_start..]
+            .find("        workgroupBarrier();\n")
+            .expect("coop128 source: staging barrier");
+    src.replace_range(
+        b_start..b_end,
+        "        {
+            let n = tid / 4u;
+            let k8 = (tid % 4u) * 8u;
+            let col0 = k0 + k8;
+            var w0 = vec4<f32>(0.0);
+            var w1 = vec4<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = cm_byte(cb);
+                if (sh > 3u) { cv = cv | (cm_byte(cb + 1u) << 8u); }
+                let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
+                let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+                let word = qmm[(((wrow * gpr + g) * 16u) + (col0 - g * 32u) / 2u) >> 2u];
+                w0 = (vec4<f32>(f32(word & 0xFu), f32((word >> 4u) & 0xFu),
+                                f32((word >> 8u) & 0xFu), f32((word >> 12u) & 0xFu)) - 8.0) * scale;
+                w1 = (vec4<f32>(f32((word >> 16u) & 0xFu), f32((word >> 20u) & 0xFu),
+                                f32((word >> 24u) & 0xFu), f32(word >> 28u)) - 8.0) * scale;
+            }
+            let bd = n * KS + k8;
+            cm_b[bd] = f16(w0.x); cm_b[bd + 1u] = f16(w0.y);
+            cm_b[bd + 2u] = f16(w0.z); cm_b[bd + 3u] = f16(w0.w);
+            cm_b[bd + 4u] = f16(w1.x); cm_b[bd + 5u] = f16(w1.y);
+            cm_b[bd + 6u] = f16(w1.z); cm_b[bd + 7u] = f16(w1.w);
+        }
+",
+    );
+    src.push_str(
+        "@compute @workgroup_size(256)
+fn q4tp_mm_coop128_s(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_index) tid: u32,
+                     @builtin(subgroup_id) sg: u32) {
+    let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    coop_body(wid, tid, sg, asc);
+}
+",
+    );
+    src
+}
+
 const COOP_Q2_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -50226,6 +50360,13 @@ fn encode_q4_tile_mm_full_offset(
             .as_ref()
             .map(|p| std::ptr::eq(p, pipeline))
             .unwrap_or(false);
+    // The 128-row tile covers twice the batch rows per workgroup.
+    let m128 = c
+        .q4tp_mm_coop128_s
+        .as_ref()
+        .map(|p| std::ptr::eq(p, pipeline))
+        .unwrap_or(false);
+    let coop_kernel = coop_kernel || m128;
     // 0xFFFFFFFF is not a float the host would ever pass; the kernel
     // reads it as "take the scale from the buffer instead".
     let pad = if scale_buf.is_some() {
@@ -50282,7 +50423,7 @@ fn encode_q4_tile_mm_full_offset(
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(
         (rows as u32).div_ceil(64).min(MAX_WG),
-        (k as u32).div_ceil(64),
+        (k as u32).div_ceil(if m128 { 128 } else { 64 }),
         1,
     );
 }
@@ -58195,6 +58336,79 @@ fn main() {
         // f16 operands carry ~11 bits of mantissa; anything past 1e-2 is
         // a broken layout or a lost activation scale, not rounding.
         assert!(r < 1e-2, "coop GEMM drifted from the scalar arm: {r:.3e}");
+    }
+
+    /// The 128-row tile of the cooperative GEMM gives the 64-row kernel's
+    /// sums bit for bit (same operands, same k order per output), over a
+    /// batch that ends in a partial tile.
+    #[test]
+    fn wgpu_q4tp_mm_coop128_matches_coop64() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let (Some(p64), Some(p128)) = (c.q4tp_mm_coop_s.as_ref(), c.q4tp_mm_coop128_s.as_ref())
+        else {
+            eprintln!("no 128-row cooperative tile on this device — skipping");
+            return;
+        };
+        let (rows, cols, n) = (192usize, 160usize, 200usize);
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| (i * 53 % 241) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        let xs: Vec<f32> = (0..n * cols)
+            .map(|i| ((i % 89) as f32 - 44.0) / 11.0 * if i % 13 == 0 { 400.0 } else { 1.0 })
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let run = |pipe: &wgpu::ComputePipeline| -> Vec<f32> {
+            let bytes = (n * rows * 4) as u64;
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encode_q4_tile_mm_full(
+                c, &mut enc, pipe, &wbuf, &xbuf, &ybuf, rows, cols, n, 1.0 / 64.0, None,
+            );
+            let mut out = vec![0f32; n * rows];
+            assert!(readback(c, enc, &ybuf, &stage, bytes, &mut out));
+            out
+        };
+        let a = run(p64);
+        let b = run(p128);
+        let diff = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert!(a.iter().any(|v| *v != 0.0), "the 64-row kernel wrote nothing");
+        assert_eq!(diff, 0, "128-row tile differs from the 64-row one in {diff} of {}", a.len());
     }
 
     /// The q8_2f cooperative GEMM against an f64 host product: the tile
