@@ -116,6 +116,8 @@ from the start of the text, the second half of each chunk scored (16 320 predict
 `ppl --window-len 512 --window-stride 512 --window-score-from 256`, mlx-lm with the same chunks, all on
 the Mac.
 
+![Perplexity against file size](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/quality_en.png)
+
 | file | size, GB | perplexity |
 |---|---:|---:|
 | cortiq q4tp (this file and the standard one) | 2.16 | 32.95 |
@@ -145,8 +147,8 @@ RTX 2000 Ada (16 GB), Vulkan, `cortiq bench --core`, 60 tokens after a prompt of
 Past the seal the turbo file decodes at 56 tok/s at any length and keeps the card at 4.2 GB. Where its
 cache fits, the standard file reads a 16 000- or 32 000-token prompt faster; from 64 000 tokens on the
 turbo file is the faster on the prompt too. The far field is built on the host, so the process holds
-more RAM while a long prompt is read: 4.9 GB at 16 000 tokens, 7.2 at 32 000 and 11.9 at 64 000, against
-2.4 GB for the standard file at any length.
+more RAM while a long prompt is read: 4.7 GB at 16 000 tokens, 6.9 at 32 000 and 11.3 at 64 000, against
+2.3 GB for the standard file at any length.
 
 ![Spark-X2.6-4B in four engines](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/engines_en.png)
 
@@ -164,6 +166,26 @@ times over CUDA), and its decode after a short prompt is faster too (63.7 tok/s 
 tokens). On decode the turbo file is ahead of llama.cpp at 16 000 tokens (56.2 against 51.7 on Vulkan
 and 49.4 on CUDA) and at 64 000, where it holds 56.2 tok/s against 35.6 (Vulkan) and 28.3 (CUDA) at
 three quarters of the memory.
+
+## On a CPU server
+
+![Spark-X2.6-4B on a CPU server](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/cpu_en.png)
+
+AMD EPYC (Zen 1), 8 cores at 2.0 GHz, 23 GB of RAM, no GPU, 8 threads: `CMF_GPU=0 cortiq bench --core`, 60 tokens
+after the prompt, and llama.cpp b12202 `llama-bench -t 8` (`-p N`, then `-d N -n 60`), one after the other at
+each length.
+
+| prompt, tokens | prompt, tok/s (cortiq q4tp) | prompt, tok/s (llama.cpp Q4_K_M) | decode, tok/s (cortiq) | decode, tok/s (llama.cpp) | peak RAM, GB (cortiq) | peak RAM, GB (llama.cpp) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 18.5 | 31.9 | 3.6 | 5.4 | **2.5** | 5.0 |
+| 4 000 | 20.2 | 28.7 | 4.2 | 4.8 | **3.3** | 5.2 |
+| 16 000 | 17.6 | 20.9 | **1.7** | 0.8 | 6.6 | 6.1 |
+
+On this CPU llama.cpp reads a prompt faster, 1.7 times at 1 000 tokens and 1.2 times at 16 000, and decodes
+faster after a short prompt (5.4 against 3.6 tok/s). At 16 000 tokens cortiq decodes twice as fast (1.7 against
+0.84 tok/s): its attention reads each key once for a whole group of heads. Up to 4 000 tokens cortiq holds about
+half the memory; at 16 000 its f32 cache takes more. The server is a shared virtual machine whose speed moved by a
+third over one evening, so the two engines ran back to back at each length.
 
 ## Quality
 
@@ -308,6 +330,8 @@ Footprint — то, что Мониторинг системы показыва�
 текста, оценивается вторая половина каждого куска (16 320 предсказаний). cortiq
 `ppl --window-len 512 --window-stride 512 --window-score-from 256`, mlx-lm на тех же кусках, всё на Mac.
 
+![Перплексия и размер файла](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/quality_ru.png)
+
 | файл | размер, ГБ | перплексия |
 |---|---:|---:|
 | cortiq q4tp (этот файл и стандартный) | 2,16 | 32,95 |
@@ -337,7 +361,7 @@ RTX 2000 Ada (16 ГБ), Vulkan, `cortiq bench --core`, 60 токенов пос�
 После печати турбо-файл генерирует 56 tok/s на любой длине и держит карту на 4,2 ГБ. Пока кэш помещается,
 стандартный файл читает промпт в 16 000 и 32 000 токенов быстрее; с 64 000 токенов турбо-файл быстрее и на
 промпте. Дальнее поле строится на хосте, поэтому пока читается длинный промпт, процесс держит больше RAM:
-4,9 ГБ на 16 000 токенов, 7,2 на 32 000 и 11,9 на 64 000 против 2,4 ГБ у стандартного файла на любой длине.
+4,7 ГБ на 16 000 токенов, 6,9 на 32 000 и 11,3 на 64 000 против 2,3 ГБ у стандартного файла на любой длине.
 
 ![Spark-X2.6-4B в четырёх движках](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/engines_ru.png)
 
@@ -354,6 +378,25 @@ llama.cpp читает промпт в 16 000 токенов на этой ка�
 через CUDA), и после короткого промпта его генерация тоже быстрее (63,7 tok/s против 57,2 на 1 000 токенов).
 На генерации турбо-файл впереди llama.cpp уже на 16 000 токенов (56,2 против 51,7 на Vulkan и 49,4 на
 CUDA) и на 64 000: 56,2 tok/s против 35,6 (Vulkan) и 28,3 (CUDA) при трёх четвертях памяти.
+
+### На CPU-сервере
+
+![Spark-X2.6-4B на CPU-сервере](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/cpu_ru.png)
+
+AMD EPYC (Zen 1), 8 ядер по 2,0 ГГц, 23 ГБ RAM, без GPU, 8 потоков: `CMF_GPU=0 cortiq bench --core`, 60 токенов
+после промпта, и llama.cpp b12202 `llama-bench -t 8` (`-p N`, затем `-d N -n 60`), друг за другом на каждой длине.
+
+| промпт, токенов | промпт, tok/s (cortiq q4tp) | промпт, tok/s (llama.cpp Q4_K_M) | генерация, tok/s (cortiq) | генерация, tok/s (llama.cpp) | пик RAM, ГБ (cortiq) | пик RAM, ГБ (llama.cpp) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 18,5 | 31,9 | 3,6 | 5,4 | **2,5** | 5,0 |
+| 4 000 | 20,2 | 28,7 | 4,2 | 4,8 | **3,3** | 5,2 |
+| 16 000 | 17,6 | 20,9 | **1,7** | 0,8 | 6,6 | 6,1 |
+
+На этом CPU llama.cpp читает промпт быстрее, в 1,7 раза на 1 000 токенов и в 1,2 раза на 16 000, и после
+короткого промпта генерирует быстрее (5,4 против 3,6 tok/s). На 16 000 токенов cortiq генерирует вдвое быстрее
+(1,7 против 0,84 tok/s): его внимание читает каждый ключ один раз на всю группу голов. До 4 000 токенов cortiq
+держит примерно половину памяти; на 16 000 его кэш в f32 занимает больше. Сервер — общая виртуальная машина, чья
+скорость за один вечер менялась на треть, поэтому два движка шли друг за другом на каждой длине.
 
 ### Качество
 
@@ -488,6 +531,8 @@ footprint 是活动监视器显示为"内存"的数字：进程为自己持有�
 计分（16 320 次预测）。cortiq `ppl --window-len 512 --window-stride 512 --window-score-from 256`，mlx-lm 用相同的块，
 全部在 Mac 上。
 
+![困惑度与文件大小](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/quality_zh.png)
+
 | 文件 | 大小，GB | 困惑度 |
 |---|---:|---:|
 | cortiq q4tp（本文件与标准文件） | 2.16 | 32.95 |
@@ -515,7 +560,7 @@ RTX 2000 Ada（16 GB），Vulkan，`cortiq bench --core`，该长度的提示之
 
 封印之后，turbo 文件在任何长度上以 56 tok/s 生成，显存保持在 4.2 GB。只要缓存放得下，标准文件读 16 000 和 32 000
 词元的提示更快；从 64 000 词元起，turbo 文件连提示也更快。远场在主机上构建，因此读取长提示时进程占用更多内存：
-16 000 词元时 4.9 GB，32 000 时 7.2 GB，64 000 时 11.9 GB；标准文件在任何长度上都是 2.4 GB。
+16 000 词元时 4.7 GB，32 000 时 6.9 GB，64 000 时 11.3 GB；标准文件在任何长度上都是 2.3 GB。
 
 ![四个引擎中的 Spark-X2.6-4B](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/engines_zh.png)
 
@@ -531,6 +576,24 @@ RTX 2000 Ada（16 GB），Vulkan，`cortiq bench --core`，该长度的提示之
 在这张卡上，llama.cpp 经 Vulkan 读 16 000 词元的提示比 cortiq 快 1.8 倍（经 CUDA 快 3.0 倍），短提示之后的生成也更快
 （1 000 词元处 63.7 对 57.2 tok/s）。生成方面，turbo 文件在 16 000 词元处已领先 llama.cpp（56.2 对 Vulkan 的 51.7 和
 CUDA 的 49.4），在 64 000 词元处同样领先：56.2 tok/s 对 35.6（Vulkan）和 28.3（CUDA），显存为其四分之三。
+
+### 在 CPU 服务器上
+
+![Spark-X2.6-4B 在 CPU 服务器上](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf/resolve/main/assets/cpu_zh.png)
+
+AMD EPYC（Zen 1），8 核 2.0 GHz，23 GB 内存，无 GPU，8 线程：`CMF_GPU=0 cortiq bench --core`，提示之后生成 60 个词元；
+llama.cpp b12202 `llama-bench -t 8`（先 `-p N`，再 `-d N -n 60`），每个长度两个引擎紧接着运行。
+
+| 提示，词元 | 提示，tok/s（cortiq q4tp） | 提示，tok/s（llama.cpp Q4_K_M） | 生成，tok/s（cortiq） | 生成，tok/s（llama.cpp） | 内存峰值，GB（cortiq） | 内存峰值，GB（llama.cpp） |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 18.5 | 31.9 | 3.6 | 5.4 | **2.5** | 5.0 |
+| 4 000 | 20.2 | 28.7 | 4.2 | 4.8 | **3.3** | 5.2 |
+| 16 000 | 17.6 | 20.9 | **1.7** | 0.8 | 6.6 | 6.1 |
+
+在这台 CPU 上，llama.cpp 读提示更快（1 000 词元时快 1.7 倍，16 000 词元时快 1.2 倍），短提示之后的生成也更快（5.4 对
+3.6 tok/s）。在 16 000 词元处 cortiq 的生成快一倍（1.7 对 0.84 tok/s）：它的注意力对一组头只读取每个键一次。4 000 词元
+以内 cortiq 只占约一半内存；到 16 000 词元，它的 f32 缓存占用更多。这台服务器是共享虚拟机，一个晚上内速度变化达三分之一，
+所以两个引擎在每个长度上紧接着运行。
 
 ### 质量
 

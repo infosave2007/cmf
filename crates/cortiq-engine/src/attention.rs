@@ -2049,14 +2049,13 @@ pub fn qwen_attention_batch(
     // `CMF_CPU_ATTEND=0` keeps the per-position attend). `attend_chunk`
     // masks a sliding window itself and bounds its GEMM range to the
     // window, so a windowed layer takes it too, under the device arm's
-    // Spark-only rule (the window's parity was measured on Spark). Not
-    // while the O(1) collector runs on the layer: the bounded transition
-    // happens inside the per-position walk (as the device arm, which
-    // asks the same).
+    // Spark-only rule (the window's parity was measured on Spark). An O(1)
+    // layer still collecting its exact prefix takes it as on aarch64: the
+    // chunk that ends on the boundary must give the exact pipeline's rows
+    // (`o1_prefix_chunk_ending_on_boundary_matches_exact_prefill`).
     #[cfg(target_arch = "x86_64")]
     let cpu_attend = attend_core
         && (!window_masks || cfg.gate_sigmoid)
-        && cache.o1.is_none()
         && crate::qtensor::accel_gemm_enabled();
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let cpu_attend = false;

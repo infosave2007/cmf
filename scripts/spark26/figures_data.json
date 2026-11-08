@@ -1,5 +1,5 @@
 {
-  "_note": "Measured numbers behind sp_figures.py. RTX 2000 Ada (16 GB) over Vulkan: scripts/spark26/pod chainX.sh/chainS.sh (ctxbench.sh) on cortiq 0.8.63+spark26-turbo with the matrix-unit prefill (zi_mm GEMM route, plane-fed coop attend tile xc2, far field sealed with one thread per KV group; cortiq bench --core, 60 tokens after the prompt; first = seconds to the first token; ram = peak resident set of the process, GB). VRAM is from chainF.sh on an otherwise empty card: the later chains ran beside a paused recall job holding 5.4 GB, and after subtracting it every row agrees within 50 MiB. llama.cpp b12202 llama-bench. MacBook Air M4 24 GB: mac_suite3.sh (96 greedy tokens, fp_run.py, llama.cpp b12202 built for arm64 with Metal), one GPU job at a time with a minute of rest between runs. mlx first-token seconds = prompt tokens / mlx-lm's prompt tok/s.",
+  "_note": "Measured numbers behind sp_figures.py. RTX 2000 Ada (16 GB) over Vulkan: scripts/spark26/pod chainX.sh/chainS.sh (ctxbench.sh) on cortiq 0.8.63+spark26-turbo with the matrix-unit prefill (zi_mm GEMM route, plane-fed coop attend tile xc2, far field sealed with one thread per KV group; cortiq bench --core, 60 tokens after the prompt; first = seconds to the first token; ram = peak resident set of the process (VmHWM), GiB like the VRAM figures). VRAM is from chainF.sh on an otherwise empty card: the later chains ran beside a paused recall job holding 5.4 GB, and after subtracting it every row agrees within 50 MiB. llama.cpp b12202 llama-bench. MacBook Air M4 24 GB: mac_suite3.sh (96 greedy tokens, fp_run.py, llama.cpp b12202 built for arm64 with Metal), one GPU job at a time with a minute of rest between runs. mlx first-token seconds = prompt tokens / mlx-lm's prompt tok/s.",
   "ctx": [
     1000,
     16000,
@@ -32,10 +32,10 @@
       535.2
     ],
     "ram": [
-      2.4,
-      2.4,
-      2.4,
-      2.4
+      2.3,
+      2.3,
+      2.3,
+      2.3
     ]
   },
   "turbo": {
@@ -64,10 +64,10 @@
       550.2
     ],
     "ram": [
-      2.4,
-      4.9,
-      7.2,
-      11.9
+      2.3,
+      4.7,
+      6.9,
+      11.3
     ]
   },
   "facts": {
@@ -256,5 +256,47 @@
     "mlx8": 4.1,
     "llama_q4": 3.54,
     "llama_q8": 4.37
-  }
+  },
+  "cpu": {
+    "ctx": [
+      1000,
+      4000,
+      16000
+    ],
+    "cortiq": {
+      "prefill": [
+        18.5,
+        20.2,
+        17.6
+      ],
+      "dec": [
+        3.6,
+        4.2,
+        1.7
+      ],
+      "ram": [
+        2.5,
+        3.3,
+        6.6
+      ]
+    },
+    "llama": {
+      "prefill": [
+        31.85,
+        28.67,
+        20.93
+      ],
+      "dec": [
+        5.37,
+        4.75,
+        0.84
+      ],
+      "ram": [
+        5.0,
+        5.2,
+        6.1
+      ]
+    }
+  },
+  "_note_cpu": "CPU server (AMD EPYC Zen 1 VM, 8 vCPU at 2.0 GHz, 23 GB, no GPU): scripts/spark26/cpu/chain6.sh, cortiq bench --core with 60 tokens after the prompt and llama.cpp b12202 llama-bench -t 8 (-p N, then -d N -n 60), run back to back at each length because this shared VM drifted by a third over an evening; ram = peak resident set (VmHWM), GiB like the VRAM figures."
 }

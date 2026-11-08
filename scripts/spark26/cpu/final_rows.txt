@@ -1,0 +1,10 @@
+cortiq 1000 | rss_kb=2668404 |  Prompt: 1000 tokens | prefill 18.5 tok/s Decode: 60 tokens | 3.6 tok/s steady (TTFT 43.41s, 1.0 incl. prefill) 
+llama pp 1000 | rss_kb=5183180 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | pp1000 | 31.85 ± 0.00 |
+llama tg@1000 | rss_kb=5283632 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | tg60 @ d1000 | 5.37 ± 0.00 |
+cortiq 4000 | rss_kb=3418736 |  Prompt: 4000 tokens | prefill 20.2 tok/s Decode: 60 tokens | 4.2 tok/s steady (TTFT 195.63s, 0.3 incl. prefill) 
+llama pp 4000 | rss_kb=5300036 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | pp4000 | 28.67 ± 0.00 |
+llama tg@4000 | rss_kb=5499368 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | tg60 @ d4000 | 4.75 ± 0.00 |
+cortiq 16000 | rss_kb=6962224 |  Prompt: 16000 tokens | prefill 17.6 tok/s Decode: 60 tokens | 1.7 tok/s steady (TTFT 926.87s, 0.1 incl. prefill) 
+llama pp 16000 | rss_kb=5746700 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | pp16000 | 20.93 ± 0.00 |
+llama tg@16000 | rss_kb=6378136 | | spark2_5 ?B Q4_K - Medium | 3.30 GiB | 4.45 B | CPU | 8 | tg60 @ d16000 | 0.84 ± 0.00 |
+ROWS_DONE
