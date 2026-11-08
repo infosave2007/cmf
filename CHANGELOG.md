@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.64] — 2026-11-09
+
 ### Added
 - `cortiq serve` prints each request's speed as llama-server does (`prompt eval time`, `eval time`, `total time`,
   with the prompt tokens reused from the cached prefix) and returns llama-server's `timings` object: in a
@@ -66,6 +68,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A turbo file's far field is rebuilt with one thread per KV group (it was one group after another): Spark-X2.6-4B
   Turbo at 16 000 tokens, 6.5 s → 3.5 s of the prompt, 489 → 539 tok/s, the same greedy text after 60 000
   characters.
+- x86-64 CPU prompts: the batched chunk attend runs on x86 too (an AVX2 micro-GEMM, `x86_gemm_rm`, and an AVX2
+  softmax; a sliding window bounds the key range of the whole chunk; `CMF_CPU_ATTEND=0` keeps the per-position
+  attend); a q4tp batch takes two weight rows against four columns with FMA (`CMF_Q4TP_FMA=0` keeps the vertical
+  cell); the activation split and the FFN's activation combine (an exact GELU is one `erf` an element) run on the
+  pool instead of the main thread; the activation panel is sized to half the core's L2; a plain dense stack with no
+  GPU reads 128 rows a chunk instead of 48. Spark-X2.6-4B q4tp on 8 Zen 2 cores: a 1000-token prompt 16.7 → 31.6
+  tok/s, 4000 tokens 11.9 → 30.1.
+- x86-64 CPU decode: every vertical q4tp cell (the decode lanes, the fused gate/up lanes, the row-exact matmat
+  cells) accumulates with FMA and takes the `8·Σx` term once per row through one shared function, so the matvec
+  and the row-exact matmat still agree bit for bit; a grouped-query context of 512 rows or more attends split-K
+  (KV group × 256 keys a job, each K and V row read once for all the group's heads, an online-softmax merge;
+  `CMF_ATTEND_SPLITK=0` keeps one job a head).
 - On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
   off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
   Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
