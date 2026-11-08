@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cortiq import-gguf` reads IQ3_S (the 3.4-bit grid codebook inside imatrix IQ4_XS mixes), a port of ggml's
+  `dequantize_row_iq3_s`, checked against gguf-py on a real block.
+
+### Fixed
+- `cortiq import-gguf` on a dense qwen35 GGUF with an MTP head (Qwen3.8-27B and its fine-tunes, e.g.
+  OrcaCyber-Nano-1.0): llama.cpp counts the nextn block in `block_count`, and the importer made it a 65th trunk
+  layer under the MoE arch name. The trunk is now `block_count − nextn_predict_layers`, the block lands under
+  `model.mtp.*` with its 1+w norms undone like the trunk's, the header declares the head, and dense qwen35 is
+  `qwen3_5`, as `cortiq convert` writes it.
+
 ## [0.8.63] — 2026-11-07
 
 ### Added
