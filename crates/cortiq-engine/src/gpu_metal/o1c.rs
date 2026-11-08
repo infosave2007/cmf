@@ -347,6 +347,11 @@ pub(crate) fn cap_end() {
     *CAPTURE.lock().unwrap() = None;
 }
 
+/// Whether a first seal asks for this layer's queries.
+pub(crate) fn wants_q(li: usize) -> bool {
+    CAPTURE.lock().unwrap().as_ref().is_some_and(|c| !c.sealed && c.q_only.contains(&li))
+}
+
 /// A rows graph's copies for this layer, if it is asked for.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture(

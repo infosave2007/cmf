@@ -33871,25 +33871,14 @@ pub fn forward_batch_graph_at(
     // incorrect because the `GMat`s below retain evicted buffers until the
     // batch command finishes, producing a full-model transient allocation.
     for l in layers {
-        // No batched arm for the head-wise output gate or a non-SiLU dense
-        // FFN yet: refuse by name before any upload (the builders already
-        // do; this keeps a direct caller from running them as plain).
-        if matches!(
-            &l.attn,
-            crate::gpu::GraphAttn::Full {
-                head_gate: Some(_),
-                ..
-            }
-        ) {
-            bgraph_refused("head-wise output gate (no batched arm)");
-            return batch_outcome(o1_started || state_started, false);
-        }
+        // The head-wise output gate (Spark-X2.6) has its batched arm below:
+        // g = g_proj · n1 per row, then gate_mul per head before O.
         if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
-            // Gemma-4's tanh-GELU (and exact GELU) ride the act word of
-            // the batched act(gate)·up kernel; other models keep SiLU only.
+            // Exact GELU (Spark-X2.6) and Gemma-4's tanh-GELU ride the act
+            // word of the batched act(gate)·up kernel.
             if *act != crate::gpu::GraphAct::Silu
                 && *act != crate::gpu::GraphAct::SwiGluOaiM3
-                && !(g4_model && act.code() <= 2)
+                && act.code() > 2
             {
                 bgraph_refused("non-SiLU dense FFN (no batched arm)");
                 return batch_outcome(o1_started || state_started, false);
@@ -34008,6 +33997,8 @@ pub fn forward_batch_graph_at(
             /// Gemma-4 global layers (512 over 256).
             hd: usize,
             dv: usize,
+            /// Spark-X2.6 head-wise output gate `[nh, hidden]`.
+            hg: Option<GMat>,
         },
         Gdn {
             qkv: GMat,
@@ -34211,6 +34202,7 @@ pub fn forward_batch_graph_at(
                 output_gate,
                 bias,
                 geom,
+                head_gate,
                 ..
             } => {
                 if bias.is_some() {
@@ -34234,6 +34226,24 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("attention weights not gemmable");
                     return batch_outcome(o1_started || state_started, false);
                 }
+                // The gate reads the attention's normed input as is (no Prism plane).
+                let hg = match head_gate {
+                    None => None,
+                    Some(g) => match resolve(g, nh, hidden) {
+                        Some(m)
+                            if (gemmable(&m) || m.kind == 4)
+                                && m.prism == crate::gpu::GraphPrismOp::None
+                                && !m.affine
+                                && !*output_gate =>
+                        {
+                            Some(m)
+                        }
+                        _ => {
+                            bgraph_refused("head gate resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                    },
+                };
                 LAttn::Full {
                     wq,
                     wk,
@@ -34242,6 +34252,7 @@ pub fn forward_batch_graph_at(
                     nkv: lnkv,
                     hd: lhd,
                     dv: ldv,
+                    hg,
                 }
             }
             crate::gpu::GraphAttn::Gdn {
@@ -34587,9 +34598,12 @@ pub fn forward_batch_graph_at(
             };
             let plain = match &layers[li].attn {
                 crate::gpu::GraphAttn::Full { geom: None, .. } => true,
-                // Ripple's gated layers: the token-axis arm copies the same rows out.
+                // Per-layer geometry: Ripple's gated layers on the token-axis arm,
+                // the others on the whole-run or the per-token arm, which all copy
+                // the same rows out. MRoPE rows rotate elsewhere.
                 crate::gpu::GraphAttn::Full { geom: Some(g), output_gate, .. } => {
-                    gated_geom_bt(c, g, nh, g.hd, *output_gate, k).is_some()
+                    (gated_geom_bt(c, g, nh, g.hd, *output_gate, k).is_some() || !*output_gate)
+                        && g.dash.is_none()
                         && positions.windows(2).all(|w| w[1] == w[0] + 1)
                 }
                 _ => false,
@@ -35674,6 +35688,7 @@ pub fn forward_batch_graph_at(
                     nkv: lnkv,
                     hd: lhd,
                     dv: ldv,
+                    hg,
                 },
                 crate::gpu::GraphAttn::Full {
                     q_norm,
@@ -36410,6 +36425,10 @@ pub fn forward_batch_graph_at(
                     pass.set_bind_group(0, &bg_rope, &[]);
                     pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
                     state_started = true;
+                    // The O(1) seal's query trace: every row's rotated query at once.
+                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, k * nh * hd) {
+                        encode_blit_p(&mut pass, c, &qall, &cb, k * nh * hd, 0, 0, None);
+                    }
                     pass.set_pipeline(&xb.kv);
                     pass.set_bind_group(0, &bg_kv, &[]);
                     pass.dispatch_workgroups(
@@ -36479,6 +36498,9 @@ pub fn forward_batch_graph_at(
                         None => rwc(nh),
                     };
                     let split_any = g.window.is_none() && pos_end > ATTEND_SPLIT_MIN;
+                    // The O(1) seal's query trace (Spark-X2.6's 256-wide heads take
+                    // this arm): each token's rotated query as it is made.
+                    let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
                     let (xacc, xml) = if split_any {
                         (rwc(nh * nc * g.dv), rwc(nh * nc * 2))
                     } else {
@@ -36541,6 +36563,9 @@ pub fn forward_batch_graph_at(
                         );
                         pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
                         state_started = true;
+                        if let Some(cb) = &qcap {
+                            encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
+                        }
                         pass.set_pipeline(&gx.kv_append);
                         pass.set_bind_group(
                             0,
@@ -36904,6 +36929,29 @@ pub fn forward_batch_graph_at(
                             pass.dispatch_workgroups(((rows * nh * hd) as u32).div_ceil(256), 1, 1);
                         }
                     }
+                }
+                // Spark-X2.6's head-wise gate over the k rows: g = g_proj · n1
+                // ([k][nh]), then head h of row t *= sigmoid(g[t][h]).
+                if let Some(hgm) = hg {
+                    let gk = rwc(k * nh);
+                    if hgm.kind == 4 {
+                        // An f32 g_proj (the file keeps it unquantized): one
+                        // dispatch for every row, as GDN's a/b.
+                        let fb_u = uniform_u32x4(c, [hidden as u32, nh as u32, 0, 0]);
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&c.f32_matvec_b);
+                        pass.set_bind_group(0, &bg(&c.layout_f32b, &[&hgm.buf, &n1, &gk, &fb_u]), &[]);
+                        pass.dispatch_workgroups((nh as u32).min(MAX_WG), k as u32, 1);
+                    } else {
+                        ematb(&mut enc, hgm, &n1, &gk, nh, hidden);
+                    }
+                    let gm_u = unif(&[(k * nh * ldv) as u32, ldv as u32, 0, 0]);
+                    go(
+                        &mut enc,
+                        &c.gate_mul,
+                        &bg(&c.layout_gate_mul, &[&gk, &attn_bb, &gm_u]),
+                        ((k * nh * ldv) as u32).div_ceil(256),
+                    );
                 }
                 let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * ldv) else {
                     bgraph_refused("Prism transform unavailable for batched output projection");

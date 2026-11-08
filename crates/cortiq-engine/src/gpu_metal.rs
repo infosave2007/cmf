@@ -4204,6 +4204,37 @@ kernel void silu_rows(
     }
 }
 
+// `silu_rows` with the exact GELU (Spark-X2.6): act = gelu(g)·u and the
+// row's pre-scale, the same bindings.
+kernel void gelu_rows(
+    device const float* g   [[buffer(0)]],
+    device const float* u   [[buffer(1)]],
+    device float*       act [[buffer(2)]],
+    device float*       xsc [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    ulong base = (ulong)row * n;
+    float m = 0.0f;
+    for (uint i = tid; i < n; i += 256u) {
+        float a = gelu_erf(g[base + i]) * u[base + i];
+        act[base + i] = a;
+        m = max(m, fabs(a));
+    }
+    m = simd_max(m);
+    if (lane == 0) part[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint k = 0; k < 8u; ++k) tot = max(tot, part[k]);
+        xsc[row] = tot > 16384.0f ? exp2(-ceil(log2(tot / 16384.0f))) : 1.0f;
+    }
+}
+
 // Per-row power-of-two pre-scale for the half-staged GEMM: rows whose
 // max |x| would overflow half get scaled down (the GEMM undoes it).
 kernel void row_pow2_scale(
@@ -8695,6 +8726,7 @@ struct Ctx {
     /// `f32_matvec2_rows`: both projections over a whole chunk in one dispatch.
     f32mv2r: ComputePipelineState,
     silurows: ComputePipelineState,
+    gelurows: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
     lib: metal::Library,
@@ -8980,6 +9012,7 @@ fn init() -> Result<Ctx, String> {
     let f32mv2b = pso("f32_matvec2_b")?;
     let f32mv2r = pso("f32_matvec2_rows")?;
     let silurows = pso("silu_rows")?;
+    let gelurows = pso("gelu_rows")?;
     let queue = device.new_command_queue();
     let replay_queue = device.new_command_queue();
     let replay_event = device.new_shared_event();
@@ -9118,6 +9151,7 @@ fn init() -> Result<Ctx, String> {
         f32mv2b,
         f32mv2r,
         silurows,
+        gelurows,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
@@ -13929,7 +13963,7 @@ pub fn chunk_run_gpu(
                 generation: 0,
             });
             if entry.cap < need {
-                let cap = need.next_power_of_two().max(1024);
+                let cap = mirror_cap(need, l.window.is_some());
                 let nb = (nkv * cap * hd * 4) as u64;
                 entry.k = c
                     ._device
@@ -14305,6 +14339,12 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "rope_kv");
+        // A far field's exact prefix keeps this layer's rotated queries.
+        if o1c::wants_q(l.layer) {
+            let enc = cmd.new_compute_command_encoder();
+            o1c::capture(c, enc, l.layer, false, &qrope, &prep.k_mb, &prep.v_mb, b * nh * hd, 0);
+            enc.end_encoding();
+        }
         // GEMM attention (profiled: the streaming attend was 47% of the
         // chunk): scores = Qpanel·Kᵀ·scale per KV group, causal softmax
         // rows, attention column sums, attn = P·V. Groups get their own
@@ -21706,7 +21746,7 @@ impl TokenGraph {
                     generation: 0,
                 });
                 if entry.cap < need {
-                    let cap = need.next_power_of_two().max(1024);
+                    let cap = mirror_cap(need, p.window.is_some());
                     let bytes = (p.nkv * cap * p.hd * 4) as u64;
                     entry.k = self
                         .c
@@ -23906,6 +23946,8 @@ struct VerifyGdnSlot {
 pub struct VerifyGraph {
     tg: TokenGraph,
     b: usize,
+    /// The activation of the FFN `post_ffn` last took: 0 SiLU, 1 exact GELU.
+    ffn_act: u8,
     /// Rows the row-scaled scratch is SIZED for: 8 whenever b ≤ 8, so
     /// the verify (b = 8) and the round's warm-up (b = accepted, 1..7)
     /// share one set of cached buffers instead of allocating a fresh
@@ -24319,6 +24361,7 @@ impl VerifyGraph {
             logits_b: None,
             prefill: false,
             pending_delta: false,
+            ffn_act: 0,
             taps_b: Vec::new(),
             failed: false,
             ane: None,
@@ -24685,8 +24728,8 @@ impl VerifyGraph {
 
     fn ffn_n8_ok(&self, f: &MetalFfn) -> bool {
         match f {
-            // The batched twins compute SiLU only.
-            MetalFfn::Dense { act, .. } if *act != 0 => false,
+            // The batched twins compute SiLU and the exact GELU.
+            MetalFfn::Dense { act, .. } if *act > 1 => false,
             MetalFfn::Dense { gate, up, down, .. } => {
                 down.1 == self.tg.dims.hidden
                     && [gate, up, down]
@@ -24713,14 +24756,17 @@ impl VerifyGraph {
     pub fn attn_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         self.tg.attn_device_ok(l, p)
             && (p.o1.is_none() || o1c::pipes(self.tg.c).is_some())
-            // The batched twins attend full context, ungated.
-            && p.window.is_none()
+            // A sliding window (Spark-X2.6) attends through the windowed softmax
+            // or the per-row kernel; a far-field layer has none.
+            && (p.window.is_none() || p.o1.is_none())
+            && p.window != Some(0)
             // `chunk_attend` has no value-less softmax column.  A b=1
             // direct gqa call could represent it, but admitting it here
             // would make b>=2 verification silently compute a different
             // normalization.
             && p.softmax_sink.is_none()
-            && p.head_gate.is_none()
+            // The head-wise gate reads the normed input rows, `[nh × hidden]`.
+            && p.head_gate.is_none_or(|g| g.len() == p.nh * self.tg.dims.hidden)
             // ...and know nothing of Gemma-4.
             && !p.v_norm
             && l.attn_out_norm.is_none()
@@ -24991,16 +25037,17 @@ impl VerifyGraph {
             gate,
             up,
             down,
-            act: 0,
+            act,
         } = ffn
         else {
-            // GELU never reaches here: `ffn_n8_ok` refused it.
             return;
         };
+        // SiLU or the exact GELU (`ffn_n8_ok` refused the rest).
+        self.ffn_act = *act;
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
         // The Neural Engine takes this FFN: its input now, the rest once this encoder ends.
-        if let Some(a) = self.ane.clone().filter(|_| ane::wanted()) {
+        if let Some(a) = self.ane.clone().filter(|_| ane::wanted() && ane::takes_act(*act)) {
             if let Some((abs, ProjKind::Q4tp)) = self.batch_abs(*gate) {
                 if let Some(li) = a.layer_of(abs).filter(|_| a.takes(self.b)) {
                     a.encode_input(enc, &self.n_b, self.b, self.lane);
@@ -25032,10 +25079,10 @@ impl VerifyGraph {
         let fa = Self::vbuf(c, 9, 0, self.bc * inter * 4);
         self.gemm(enc, gate, &self.n_b, &fg, &self.ones);
         self.gemm(enc, up, &self.n_b, &fu, &self.ones);
-        // silu(g)·u and the row pre-scale in one pass
+        // act(g)·u and the row pre-scale in one pass
         disp(
             enc,
-            &c.silurows,
+            if self.ffn_act == 1 { &c.gelurows } else { &c.silurows },
             &[(&fg, 0), (&fu, 0), (&fa, 0), (&self.xsc, 0)],
             &[inter as u32],
             &[],
@@ -25444,7 +25491,7 @@ impl VerifyGraph {
                 generation: 0,
             });
             if entry.cap < need {
-                let cap = need.next_power_of_two().max(1024);
+                let cap = mirror_cap(need, p.window.is_some());
                 let bytes = (p.nkv * cap * p.hd * 4) as u64;
                 entry.k = c
                     ._device
@@ -25574,6 +25621,9 @@ impl VerifyGraph {
             if p.output_gate {
                 disp(enc, &c.sgate, &[(&ao_b, 0), (&g_b, 0)], &[(b * nhd) as u32], &[], ((b * nhd) as u64, 256));
             }
+            if let Some(gw) = p.head_gate {
+                encode_head_gate(c, enc, &ao_b, &const_buf(c, gw), &self.n_b, p.nh, p.hd, self.tg.dims.hidden, b);
+            }
             self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
             self.post_ffn(enc, l.post_norm, &l.ffn);
             enc.end_encoding();
@@ -25605,12 +25655,14 @@ impl VerifyGraph {
         let enc_o = self.cut(enc_o, "attn-append");
         let enc: &metal::ComputeCommandEncoderRef = &enc_o;
         let thr = gqa_blk_threshold();
+        let win = p.window;
         let gemm = self.prefill
             && !verify_skip('a')
             && encode_attend_gemm(
-                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
+                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale, win,
             );
         let blk = !gemm
+            && win.is_none()
             && b >= 2
             && thr > 0
             && stored + b > thr
@@ -25619,7 +25671,7 @@ impl VerifyGraph {
                 c, enc, &qr_b, &k_mb, &v_mb, 0, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
                 false,
             );
-        if b >= 2 && !blk && !gemm {
+        if b >= 2 && !blk && !gemm && win.is_none() {
             // the chunk attend: one simdgroup per (row, head), row e over
             // positions 0..=stored+e (one dispatch; the per-row flash split
             // below stays for the single row)
@@ -25652,12 +25704,18 @@ impl VerifyGraph {
         // ABI cannot represent a value-less sink column.  The ordinary
         // one-token graph uses the sink-aware `gqa_attend` dispatch below.
         let no_sink = const_buf(c, &NO_ATTN_SINK);
-        // attend row e over positions 0..=stored+e
+        // attend row e over positions 0..=stored+e — every row of a sliding
+        // layer the GEMM did not take, over its window: the walk starts `first`
+        // rows in, which shifts every head (rows sit at kh·cap + p).
+        let per_row = !verify_skip('a') && (b == 1 || (win.is_some() && !gemm));
         for e in 0..b {
-            if b >= 2 || verify_skip('a') {
+            if !per_row {
                 break;
             }
-            let n_pos = stored + e + 1;
+            let n_all = stored + e + 1;
+            let first = win.map_or(0, |w| n_all.saturating_sub(w));
+            let n_pos = n_all - first;
+            let kv_off = (first * p.hd * 4) as u64;
             let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
@@ -25667,10 +25725,10 @@ impl VerifyGraph {
                 &c.gqat,
                 &[
                     (&qr_b, (e * nhd * 4) as u64),
-                    (&k_mb, 0),
-                    (&v_mb, 0),
+                    (&k_mb, kv_off),
+                    (&v_mb, kv_off),
                     (&ao_b, (e * nhd * 4) as u64),
-                    (&self.imp_scratch, 0),
+                    (&self.imp_scratch, (first * 4) as u64),
                     (&no_sink, 0),
                 ],
                 &[
@@ -25697,6 +25755,9 @@ impl VerifyGraph {
                 &[],
                 ((b * nhd) as u64, 256),
             );
+        }
+        if let Some(gw) = p.head_gate {
+            encode_head_gate(c, enc, &ao_b, &const_buf(c, gw), &self.n_b, p.nh, p.hd, self.tg.dims.hidden, b);
         }
         self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
         let enc_o = self.cut(enc_o, "attn-out");
@@ -26075,6 +26136,8 @@ fn encode_attend_gemm(
     stored: usize,
     nb: usize,
     scale: f32,
+    // A sliding layer's window: row e keeps its last `w` positions.
+    win: Option<usize>,
 ) -> bool {
     let mode = attn_gemm_mode();
     if mode == 0 || nkv == 0 || nh % nkv != 0 || hd % 32 != 0 || hd > 256 || nb < 32 {
@@ -26126,9 +26189,12 @@ fn encode_attend_gemm(
                 MTLSize::new((m_rows as u64).div_ceil(32), (ncur as u64).div_ceil(64), 1),
                 MTLSize::new(128, 1, 1),
             );
-            enc.set_compute_pipeline_state(&c.csmax);
+            enc.set_compute_pipeline_state(if win.is_some() { &c.csmaxw } else { &c.csmax });
             enc.set_buffer(0, Some(&scores), 0);
             words(enc, 1, &[ncur as u32, (stored + c0) as u32, n as u32, m_rows as u32]);
+            if let Some(w) = win {
+                words(enc, 5, &[w as u32]);
+            }
             enc.dispatch_thread_groups(
                 MTLSize::new((m_rows as u64).div_ceil(8), 1, 1),
                 MTLSize::new(256, 1, 1),
@@ -26307,6 +26373,18 @@ fn encode_head_gate(
         MTLSize::new((nh as u64).div_ceil(sgs), rows as u64, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
+}
+
+/// Rows a KV mirror is made for when `need` no longer fits: a quarter more, on a
+/// 1024-row grid (a sliding layer's trimmed tail: 256 more, on a 256-row grid).
+/// Powers of two doubled a 16 400-token context's mirrors to 32 768 rows — 1.2 GB
+/// more on Spark-X2.6-4B; a grow re-uploads from the host cache, the owner of record.
+fn mirror_cap(need: usize, windowed: bool) -> usize {
+    if windowed {
+        (need + 256).div_ceil(256) * 256
+    } else {
+        (need + need / 4).div_ceil(1024).max(1) * 1024
+    }
 }
 
 /// Positions per block of the split-K attend (`CMF_GQA_BLKSZ`, default
