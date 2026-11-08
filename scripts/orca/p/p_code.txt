@@ -1,0 +1,1 @@
+Write a Rust function `fn parse_kv(line: &str) -> Option<(String, String)>` that parses a line of the form `key = value`, trims both sides, ignores lines starting with `#`, and returns None for malformed input. Include three unit tests.

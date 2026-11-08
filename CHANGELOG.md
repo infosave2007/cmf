@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cortiq import-gguf` reads IQ3_S (the 3.4-bit grid codebook inside imatrix IQ4_XS mixes), a port of ggml's
+  `dequantize_row_iq3_s`, checked against gguf-py on a real block.
+
+### Changed
+- On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
+  off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
+  Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
+  OrcaCyber at 9.0–14.6 tok/s against 6.1–6.3.
+- On Vulkan/DX12 with an NVIDIA card a q4tp prompt reads through the cooperative-matrix (tensor-core) GEMM by
+  default (`CMF_BATCH_COOP=0` keeps the scalar tile; `=1` asks for it on other vendors), and a 128-row chunk takes
+  the new `q4tp_mm_coop128_s` tile: eight subgroups over one weight tile, so each weight is unpacked once a chunk,
+  one lane a row and eight k, with the activations read four floats a load (`CMF_COOP128=0` keeps the 64-row tile).
+  OrcaCyber-Nano-1.0 q4tp (Qwen3.8-27B class) on an RTX 2000 Ada 16 GB, 2000-token prompt: 74.5 → 112 tok/s, the
+  same greedy text; the 128-row tile's sums equal the 64-row kernel's bit for bit (test).
+
+### Fixed
+- The speculation trial left the drafts after two empty rounds in a row and kept plain decode for 128 tokens. A good
+  head meets such a pair now and then; at the start of a chat turn it sent the whole turn to plain decode
+  (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, the second of five turns: 13.3 tok/s against 23–26 with the drafts). The
+  trial now needs three empty rounds, and a plain decision taken on fewer than five timed rounds is tried again after
+  32 tokens. One-shot answers unchanged.
+- `cortiq import-gguf` on a dense qwen35 GGUF with an MTP head (Qwen3.8-27B and its fine-tunes, e.g.
+  OrcaCyber-Nano-1.0): llama.cpp counts the nextn block in `block_count`, and the importer made it a 65th trunk
+  layer under the MoE arch name. The trunk is now `block_count − nextn_predict_layers`, the block lands under
+  `model.mtp.*` with its 1+w norms undone like the trunk's, the header declares the head, and dense qwen35 is
+  `qwen3_5`, as `cortiq convert` writes it.
+
 ## [0.8.63] — 2026-11-07
 
 ### Added

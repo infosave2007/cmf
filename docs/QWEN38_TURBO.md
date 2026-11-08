@@ -112,9 +112,10 @@ tokens, 6 of 6 on the same path. A far field without exact rows: 0 of 4. Perplex
 The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the base M4's memory
 bus, 120 GB/s by Apple's figure. It reads the 13.6 GB of weights a token takes at 92 to 95 GB/s, the speed of that
 bus: 6.4 tok/s without drafts. An M4 Pro's bus is rated at 273 GB/s and an M4 Max's at up to 546 GB/s; those
-machines were not measured. Two switches, both off by default, move the rest.
+machines were not measured. Drafts move the rest, on by default over a q4tp file (`CMF_GRAPH_SPEC=0` turns them off;
+cortiq 0.8.63 and earlier need `CMF_GRAPH_SPEC=1`), and the Neural Engine, a switch that is off by default.
 
-**Drafts**, `CMF_GRAPH_SPEC=1`. The draft head proposes tokens and one pass over the weights checks them, so a pass
+**Drafts.** The draft head proposes tokens and one pass over the weights checks them, so a pass
 gives more than one token. MacBook Air M4, greedy, 220 tokens, the same text with drafts and without:
 
 | answer | without drafts, tok/s | with drafts, tok/s |

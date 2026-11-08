@@ -1,0 +1,10 @@
+Triage these auth log lines. Which source IPs look malicious, what kind of attack is this, and what should be blocked first? Answer as a short list.
+
+Nov  8 03:12:01 web1 sshd[2211]: Failed password for root from 203.0.113.45 port 51122 ssh2
+Nov  8 03:12:02 web1 sshd[2213]: Failed password for root from 203.0.113.45 port 51130 ssh2
+Nov  8 03:12:02 web1 sshd[2215]: Failed password for invalid user admin from 203.0.113.45 port 51134 ssh2
+Nov  8 03:12:04 web1 sshd[2219]: Failed password for invalid user oracle from 198.51.100.7 port 40022 ssh2
+Nov  8 03:12:05 web1 sshd[2221]: Accepted publickey for deploy from 192.0.2.10 port 60011 ssh2
+Nov  8 03:12:06 web1 sshd[2223]: Failed password for invalid user test from 198.51.100.7 port 40030 ssh2
+Nov  8 03:12:07 web1 sshd[2225]: Failed password for root from 203.0.113.45 port 51141 ssh2
+Nov  8 03:12:09 web1 sshd[2227]: Failed password for invalid user ubuntu from 198.51.100.7 port 40041 ssh2
