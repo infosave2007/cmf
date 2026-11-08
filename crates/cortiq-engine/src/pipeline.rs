@@ -23196,9 +23196,7 @@ fn dense_ffn_batch(
             g[i] *= u[i];
         }
     } else {
-        for i in 0..b * inter {
-            g[i] = d.act.combine(g[i], u[i]);
-        }
+        combine_pooled(d.act, &mut g[..b * inter], &u[..b * inter], pool);
     }
     if let Some(row) = mask_row {
         zero_masked_cols(&mut g, b, inter, row);
@@ -23674,6 +23672,34 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     dense_ffn_cpu(d, x, pool)
 }
 
+/// `g[i] = act.combine(g[i], u[i])`, spread over the pool from 8192
+/// elements: elementwise, so the same bits as the serial loop. An exact
+/// GELU is one `erf` an element — 1.3 M a layer for a 128-row chunk of
+/// Spark-X2.6, 10 240 a decode step — and the main thread paid them alone
+/// while the workers waited for the down projection.
+fn combine_pooled(act: Act, g: &mut [f32], u: &[f32], pool: Option<&Pool>) {
+    debug_assert_eq!(g.len(), u.len());
+    match pool {
+        Some(p) if g.len() >= 8192 => {
+            let gp = crate::pool::SendMut::new(g.as_mut_ptr());
+            p.run_rows(g.len(), &|start, end| {
+                for i in start..end {
+                    // SAFETY: each worker owns elements [start, end).
+                    unsafe {
+                        let v = gp.at(i);
+                        *v = act.combine(*v, u[i]);
+                    }
+                }
+            });
+        }
+        _ => {
+            for (gv, &uv) in g.iter_mut().zip(u) {
+                *gv = act.combine(*gv, uv);
+            }
+        }
+    }
+}
+
 /// The pure-CPU dense-FFN body (also the fallback of every GPU refusal).
 fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let inter = d.gate_proj.rows();
@@ -23712,9 +23738,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
             QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
             let _c = crate::cpuprof::time(crate::cpuprof::Slot::FfnCombine);
-            for i in 0..inter {
-                g[i] = d.act.combine(g[i], u[i]);
-            }
+            combine_pooled(d.act, &mut g[..inter], &u[..inter], pool);
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
         // per-neuron activation mass while a probe pass is active.
