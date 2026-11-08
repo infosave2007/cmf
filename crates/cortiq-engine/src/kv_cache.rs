@@ -813,11 +813,19 @@ impl LayerKvCache {
         else {
             unreachable!("collecting state disappeared after validation");
         };
-        let mut groups = Vec::with_capacity(self.num_kv_heads);
-        // Query trace is position-major; the state wants each head's
-        // queries contiguous, so transpose one group at a time.
-        let mut qh = vec![0.0f32; hpk * t * hd];
-        for g in 0..self.num_kv_heads {
+        // One KV group's state depends on that group's rows alone, so the
+        // groups seal on their own threads: the replay of every prompt row
+        // into the far field is the host's share of a turbo prompt (7 s of
+        // 33 for 16 000 tokens on an RTX 2000 Ada before this), and it ran
+        // one group after another. Each thread transposes its own group of
+        // the position-major query trace (the state wants each head's
+        // queries contiguous).
+        let wire_layer = self.wire_layer;
+        let keep = &self.o1_keep;
+        let (ks, vs) = (&self.k, &self.v);
+        let q_buf = &q_buf;
+        let seal_group = move |g: usize| -> crate::nystrom::NystromState {
+            let mut qh = vec![0.0f32; hpk * t * hd];
             for hh in 0..hpk {
                 let h = g * hpk + hh;
                 for p in 0..t {
@@ -829,27 +837,18 @@ impl LayerKvCache {
             let qs: Vec<&[f32]> = (0..hpk)
                 .map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd])
                 .collect();
-            crate::nystrom::capture_seal(
-                self.wire_layer,
-                g,
-                t,
-                hd,
-                hpk,
-                &qh,
-                &self.k[g],
-                &self.v[g],
-            );
-            let calib = crate::nystrom::O1Calib::load(self.wire_layer, g, hd, hpk);
-            let wg = crate::nystrom::wide_window(self.wire_layer, g).unwrap_or(w);
-            let mut st = crate::nystrom::NystromState::new_group(m, w, sink + self.o1_keep.len(), hpk)
+            crate::nystrom::capture_seal(wire_layer, g, t, hd, hpk, &qh, &ks[g], &vs[g]);
+            let calib = crate::nystrom::O1Calib::load(wire_layer, g, hd, hpk);
+            let wg = crate::nystrom::wide_window(wire_layer, g).unwrap_or(w);
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink + keep.len(), hpk)
                 .with_window(wg)
                 .with_rect(rect)
                 .with_calib(calib);
-            if self.o1_keep.is_empty() {
-                st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
+            if keep.is_empty() {
+                st.prefill_group(&qs, &ks[g], &vs[g], t, hd, hd);
             } else {
                 // The kept rows go right behind the sinks, and leave the far field.
-                let order = crate::dory::seal_order(t, sink, &self.o1_keep);
+                let order = crate::dory::seal_order(t, sink, keep);
                 let pick = |src: &[f32]| -> Vec<f32> {
                     let mut out = Vec::with_capacity(t * hd);
                     for &r in &order {
@@ -859,10 +858,18 @@ impl LayerKvCache {
                 };
                 let qo: Vec<Vec<f32>> = qs.iter().map(|q| pick(q)).collect();
                 let qr: Vec<&[f32]> = qo.iter().map(|q| &q[..]).collect();
-                st.prefill_group(&qr, &pick(&self.k[g]), &pick(&self.v[g]), t, hd, hd);
+                st.prefill_group(&qr, &pick(&ks[g]), &pick(&vs[g]), t, hd, hd);
             }
-            groups.push(st);
-        }
+            st
+        };
+        let groups: Vec<crate::nystrom::NystromState> = if self.num_kv_heads > 1 {
+            std::thread::scope(|s| {
+                let hs: Vec<_> = (0..self.num_kv_heads).map(|g| s.spawn(move || seal_group(g))).collect();
+                hs.into_iter().map(|h| h.join().expect("o1 seal: a group's thread panicked")).collect()
+            })
+        } else {
+            vec![seal_group(0)]
+        };
         // The states now carry everything decode needs — release the
         // O(context) storage (this is the memory claim, not a cosmetic).
         for h in 0..self.num_kv_heads {
@@ -1389,14 +1396,17 @@ impl LayerKvCache {
         });
     }
 
-    /// Batched causal attend for a prefill chunk (macOS/AArch64): the
-    /// cache already holds every chunk row (`s0` old + `b` new). Per
-    /// Q-head the scores GEMM `Q·Kᵀ` rides the AMX, the causal softmax
-    /// zeroes the not-yet-visible tail so the `P·V` GEMM needs no
-    /// mask, and attention importance takes the masked column sums. Same
-    /// math as the per-position attend; summation order differs
-    /// (tolerance-class, like the projection GEMMs).
-    #[cfg(target_arch = "aarch64")]
+    /// Batched causal attend for a prefill chunk (macOS, AArch64, x86-64):
+    /// the cache already holds every chunk row (`s0` old + `b` new). Per
+    /// KV group the scores GEMM `Q·Kᵀ` rides Accelerate (AMX) or the
+    /// portable micro-GEMM (NEON, AVX2), the causal softmax zeroes the
+    /// not-yet-visible tail so the `P·V` GEMM needs no mask, and
+    /// attention importance takes the masked column sums. A sliding
+    /// window bounds the key range of the whole chunk, so a windowed
+    /// layer costs O(b·(b + w)) rather than O(b·n). Same math as the
+    /// per-position attend; summation order differs (tolerance-class,
+    /// like the projection GEMMs).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[allow(clippy::too_many_arguments)]
     pub fn attend_chunk(
         &mut self,
@@ -1412,6 +1422,13 @@ impl LayerKvCache {
         window: Option<usize>,
     ) {
         let n = s0 + b;
+        // A masking window: the earliest key any row of this chunk sees
+        // is `s0 + 1 - w`, so the GEMM pair runs over the keys [lo0, n)
+        // only — at 16 000 rows a 512-wide window is 32× less work than
+        // the full causal range, and the zeroed columns contributed
+        // nothing anyway.
+        let lo0 = window.map_or(0, |w| (s0 + 1).saturating_sub(w)).min(n);
+        let nk = n - lo0;
         struct SendPtr(*mut f32);
         unsafe impl Send for SendPtr {}
         unsafe impl Sync for SendPtr {}
@@ -1426,10 +1443,10 @@ impl LayerKvCache {
             static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
                 const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
         }
-        // The portable NEON GEMM pays dearly for the gathered Bᵀ loads
-        // of the scores multiply — pack Kᵀ once per (group, chunk) and
-        // hand it the sequential-B fast path instead. Accelerate keeps
-        // the no-copy transposed call.
+        // The portable micro-GEMM (NEON, AVX2) pays dearly for the
+        // gathered Bᵀ loads of the scores multiply — pack Kᵀ once per
+        // (group, chunk) and hand it the sequential-B fast path instead.
+        // Accelerate keeps the no-copy transposed call.
         let neon_gemm = cfg!(not(target_os = "macos"))
             || std::env::var("CMF_FORCE_NEON_GEMM")
                 .map(|v| v == "1")
@@ -1443,12 +1460,12 @@ impl LayerKvCache {
             // group instead of 2 per head — fat M keeps the AMX fed.
             let m = heads_per_kv * b;
             qpanel.resize(m * hd, 0.0);
-            scores.resize(m * n, 0.0);
+            scores.resize(m * nk, 0.0);
             aopanel.resize(m * hd, 0.0);
             for g in 0..self.num_kv_heads {
-                let kmat = &self.k[g];
-                let vmat = &self.v[g];
-                debug_assert_eq!(kmat.len(), n * hd);
+                debug_assert_eq!(self.k[g].len(), n * hd);
+                let kmat = &self.k[g][lo0 * hd..n * hd];
+                let vmat = &self.v[g][lo0 * hd..n * hd];
                 for hl in 0..heads_per_kv {
                     let hh = g * heads_per_kv + hl;
                     for bi in 0..b {
@@ -1457,14 +1474,26 @@ impl LayerKvCache {
                     }
                 }
                 if neon_gemm {
-                    ktpack.resize(hd * n, 0.0);
-                    for p in 0..n {
-                        let row = &kmat[p * hd..(p + 1) * hd];
-                        for (d, &v) in row.iter().enumerate() {
-                            ktpack[d * n + p] = v;
+                    ktpack.resize(hd * nk, 0.0);
+                    {
+                        // Each worker transposes its own key rows into
+                        // its own columns of Kᵀ.
+                        let sp_kt = SendPtr(ktpack.as_mut_ptr());
+                        let run = |start: usize, end: usize| {
+                            for p in start..end {
+                                let row = &kmat[p * hd..(p + 1) * hd];
+                                for (d, &v) in row.iter().enumerate() {
+                                    // SAFETY: column p belongs to this worker alone.
+                                    unsafe { *sp_kt.at(d * nk + p) = v };
+                                }
+                            }
+                        };
+                        match pool {
+                            Some(p) if nk >= 2048 => p.run_rows(nk, &run),
+                            _ => run(0, nk),
                         }
                     }
-                    // Accelerate threads its own GEMM; the NEON kernel
+                    // Accelerate threads its own GEMM; the micro-kernel
                     // splits the m rows across the pool instead.
                     let sp_q = SendPtr(qpanel.as_ptr() as *mut f32);
                     let sp_s = SendPtr(scores.as_mut_ptr());
@@ -1477,22 +1506,22 @@ impl LayerKvCache {
                             };
                             let c = unsafe {
                                 std::slice::from_raw_parts_mut(
-                                    sp_s.at(start * n),
-                                    (end - start) * n,
+                                    sp_s.at(start * nk),
+                                    (end - start) * nk,
                                 )
                             };
-                            crate::qtensor::neon_gemm_rm(
+                            crate::qtensor::micro_gemm_rm(
                                 end - start,
-                                n,
+                                nk,
                                 hd,
                                 scale,
                                 a,
                                 hd,
                                 kt,
-                                n,
+                                nk,
                                 false,
                                 c,
-                                n,
+                                nk,
                             );
                         }
                     };
@@ -1502,20 +1531,24 @@ impl LayerKvCache {
                     }
                 } else {
                     crate::qtensor::sgemm_rm(
-                        m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n,
+                        m, nk, hd, scale, qpanel, hd, kmat, hd, true, scores, nk,
                     );
                 }
                 // Causal softmax, row-parallel (rows are disjoint).
                 let sp = SendPtr(scores.as_mut_ptr());
                 let run = |start: usize, end: usize| {
                     for r in start..end {
-                        let allowed = s0 + (r % b) + 1;
+                        // Key indices relative to lo0, the first key of
+                        // the GEMM range.
+                        let allowed = s0 + (r % b) + 1 - lo0;
                         // Sliding-window layers see only the last W of
                         // the causal range; the zeroed head contributes
                         // nothing to P·V or attention importance.
-                        let lo = window.map(|w| allowed.saturating_sub(w)).unwrap_or(0);
+                        let lo = window
+                            .map(|w| (s0 + (r % b) + 1).saturating_sub(w) - lo0)
+                            .unwrap_or(0);
                         // SAFETY: workers cover disjoint row ranges.
-                        let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * n), n) };
+                        let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * nk), nk) };
                         crate::attention::softmax_row(&mut row[lo..allowed]);
                         row[..lo].fill(0.0);
                         row[allowed..].fill(0.0);
@@ -1531,8 +1564,13 @@ impl LayerKvCache {
                 let ni = self.imp.len().min(n);
                 for r in 0..m {
                     let al = (s0 + (r % b) + 1).min(ni);
-                    for (dst, &p) in self.imp[..al].iter_mut().zip(&scores[r * n..r * n + al]) {
-                        *dst += p;
+                    if al > lo0 {
+                        for (dst, &p) in self.imp[lo0..al]
+                            .iter_mut()
+                            .zip(&scores[r * nk..r * nk + (al - lo0)])
+                        {
+                            *dst += p;
+                        }
                     }
                 }
                 if neon_gemm {
@@ -1542,7 +1580,7 @@ impl LayerKvCache {
                         if end > start {
                             // SAFETY: workers write disjoint output rows.
                             let a = unsafe {
-                                std::slice::from_raw_parts(sp_s.at(start * n), (end - start) * n)
+                                std::slice::from_raw_parts(sp_s.at(start * nk), (end - start) * nk)
                             };
                             let c = unsafe {
                                 std::slice::from_raw_parts_mut(
@@ -1550,13 +1588,13 @@ impl LayerKvCache {
                                     (end - start) * hd,
                                 )
                             };
-                            crate::qtensor::neon_gemm_rm(
+                            crate::qtensor::micro_gemm_rm(
                                 end - start,
                                 hd,
-                                n,
+                                nk,
                                 1.0,
                                 a,
-                                n,
+                                nk,
                                 vmat,
                                 hd,
                                 false,
@@ -1571,7 +1609,7 @@ impl LayerKvCache {
                     }
                 } else {
                     crate::qtensor::sgemm_rm(
-                        m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd,
+                        m, hd, nk, 1.0, scores, nk, vmat, hd, false, aopanel, hd,
                     );
                 }
                 for hl in 0..heads_per_kv {
@@ -3409,5 +3447,90 @@ mod tests {
         r.install_bounded(8);
         let err = r.import_wire(&a.export_wire(false).unwrap()).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod chunk_attend_tests {
+    use super::*;
+
+    /// The batched chunk attend against a double-precision softmax
+    /// attention over the same cache rows: full causal, a window that
+    /// masks (the GEMM pair then runs over the window's key range only)
+    /// and a window wider than the context; attention importance too.
+    /// On macOS this is the Accelerate arm (the NEON arm with
+    /// CMF_FORCE_NEON_GEMM=1), elsewhere the NEON or AVX2 micro-GEMM.
+    #[test]
+    fn attend_chunk_matches_naive_attention() {
+        let (nkv, hd, hpk) = (2usize, 32usize, 3usize);
+        let nh = nkv * hpk;
+        let (s0, b) = (40usize, 48usize);
+        let n = s0 + b;
+        let scale = 1.0 / (hd as f32).sqrt();
+        for window in [None, Some(16usize), Some(200usize)] {
+            let mut c = LayerKvCache::new(nkv, hd);
+            c.mode = KvMode::F32;
+            for p in 0..n {
+                let k: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i * 31 + p * 17 + 3) % 97) as f32 / 97.0 - 0.5)
+                    .collect();
+                let v: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i * 13 + p * 29 + 7) % 89) as f32 / 89.0 - 0.5)
+                    .collect();
+                c.append(&k, &v, &[true; 2]);
+            }
+            let q: Vec<f32> = (0..b * nh * hd)
+                .map(|i| ((i * 11 + 5) % 83) as f32 / 83.0 - 0.5)
+                .collect();
+            let imp0 = c.imp.clone();
+            let mut out = vec![0f32; b * nh * hd];
+            c.attend_chunk(&q, b, s0, nh, hpk, hd, &mut out, None, scale, window);
+            let mut expect = vec![0f64; b * nh * hd];
+            let mut imp_ref: Vec<f64> = imp0.iter().map(|&x| x as f64).collect();
+            for bi in 0..b {
+                let lim = s0 + bi + 1;
+                let lo = window.map_or(0, |w| lim.saturating_sub(w));
+                for hh in 0..nh {
+                    let g = hh / hpk;
+                    let qv = &q[bi * nh * hd + hh * hd..][..hd];
+                    let mut sc: Vec<f64> = (lo..lim)
+                        .map(|p| {
+                            let kr = &c.k[g][p * hd..(p + 1) * hd];
+                            qv.iter().zip(kr).map(|(&x, &y)| x as f64 * y as f64).sum::<f64>()
+                                * scale as f64
+                        })
+                        .collect();
+                    let mx = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let mut z = 0f64;
+                    for s in sc.iter_mut() {
+                        *s = (*s - mx).exp();
+                        z += *s;
+                    }
+                    for (idx, p) in (lo..lim).enumerate() {
+                        let pr = sc[idx] / z;
+                        if p < imp_ref.len() {
+                            imp_ref[p] += pr;
+                        }
+                        let vr = &c.v[g][p * hd..(p + 1) * hd];
+                        for d in 0..hd {
+                            expect[bi * nh * hd + hh * hd + d] += pr * vr[d] as f64;
+                        }
+                    }
+                }
+            }
+            for (i, (&x, &y)) in out.iter().zip(&expect).enumerate() {
+                assert!(
+                    (x as f64 - y).abs() <= 1e-4,
+                    "window {window:?} out[{i}]: {x} vs {y}"
+                );
+            }
+            assert_eq!(c.imp.len(), imp0.len(), "window {window:?}: importance length changed");
+            for (p, (&x, &y)) in c.imp.iter().zip(&imp_ref).enumerate() {
+                assert!(
+                    (x as f64 - y).abs() <= 1e-3 * (1.0 + y.abs()),
+                    "window {window:?} imp[{p}]: {x} vs {y}"
+                );
+            }
+        }
     }
 }

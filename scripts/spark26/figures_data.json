@@ -1,0 +1,260 @@
+{
+  "_note": "Measured numbers behind sp_figures.py. RTX 2000 Ada (16 GB) over Vulkan: scripts/spark26/pod chainX.sh/chainS.sh (ctxbench.sh) on cortiq 0.8.63+spark26-turbo with the matrix-unit prefill (zi_mm GEMM route, plane-fed coop attend tile xc2, far field sealed with one thread per KV group; cortiq bench --core, 60 tokens after the prompt; first = seconds to the first token; ram = peak resident set of the process, GB). VRAM is from chainF.sh on an otherwise empty card: the later chains ran beside a paused recall job holding 5.4 GB, and after subtracting it every row agrees within 50 MiB. llama.cpp b12202 llama-bench. MacBook Air M4 24 GB: mac_suite3.sh (96 greedy tokens, fp_run.py, llama.cpp b12202 built for arm64 with Metal), one GPU job at a time with a minute of rest between runs. mlx first-token seconds = prompt tokens / mlx-lm's prompt tok/s.",
+  "ctx": [
+    1000,
+    16000,
+    32000,
+    64000
+  ],
+  "std": {
+    "dec": [
+      57.2,
+      37.9,
+      28.0,
+      18.5
+    ],
+    "first": [
+      1.4,
+      17.9,
+      43.3,
+      119.6
+    ],
+    "vram": [
+      3.5,
+      4.5,
+      5.6,
+      7.9
+    ],
+    "prefill": [
+      704.5,
+      894.9,
+      739.8,
+      535.2
+    ],
+    "ram": [
+      2.4,
+      2.4,
+      2.4,
+      2.4
+    ]
+  },
+  "turbo": {
+    "dec": [
+      56.2,
+      56.2,
+      56.0,
+      56.2
+    ],
+    "first": [
+      1.4,
+      29.4,
+      57.1,
+      116.3
+    ],
+    "vram": [
+      3.5,
+      4.2,
+      4.2,
+      4.2
+    ],
+    "prefill": [
+      740.0,
+      544.9,
+      560.6,
+      550.2
+    ],
+    "ram": [
+      2.4,
+      4.9,
+      7.2,
+      11.9
+    ]
+  },
+  "facts": {
+    "en": "TBD",
+    "ru": "TBD",
+    "zh": "TBD"
+  },
+  "engines": {
+    "mac": {
+      "ane": [
+        412.6,
+        31.0
+      ],
+      "cortiq": [
+        253.0,
+        31.0
+      ],
+      "mlx": [
+        261.1,
+        30.9
+      ],
+      "llama": [
+        264.0,
+        22.3
+      ]
+    },
+    "rtx": {
+      "cortiq": [
+        894.9,
+        37.9,
+        18.5
+      ],
+      "turbo": [
+        544.9,
+        56.2,
+        56.2
+      ],
+      "llama_vk": [
+        1576.3,
+        51.7,
+        35.6
+      ],
+      "llama_cuda": [
+        2711.1,
+        49.4,
+        28.3
+      ]
+    }
+  },
+  "mac_depth": {
+    "ctx": [
+      2000,
+      14000,
+      32000,
+      64000
+    ],
+    "cortiq": {
+      "dec": [
+        36.4,
+        31.0,
+        24.2,
+        24.5
+      ],
+      "first": [
+        6.6,
+        54.8,
+        157.9,
+        426.5
+      ]
+    },
+    "turbo": {
+      "dec": [
+        36.3,
+        33.0,
+        33.1,
+        33.5
+      ],
+      "first": [
+        6.5,
+        56.4,
+        131.2,
+        262.1
+      ]
+    },
+    "ane": {
+      "dec": [
+        35.1,
+        31.0,
+        24.4,
+        24.5
+      ],
+      "first": [
+        3.4,
+        33.6,
+        109.8,
+        334.7
+      ]
+    },
+    "mlx": {
+      "dec": [
+        36.4,
+        30.9,
+        20.8,
+        12.6
+      ],
+      "first": [
+        6.6,
+        53.1,
+        144.2,
+        351.5
+      ]
+    },
+    "llama": {
+      "dec": [
+        28.8,
+        22.3,
+        15.0,
+        8.8
+      ],
+      "first": [
+        6.2,
+        52.5,
+        170.1,
+        494.2
+      ]
+    }
+  },
+  "memory": {
+    "prompts": [
+      2000,
+      14000
+    ],
+    "cortiq": [
+      [
+        1.2,
+        3.06
+      ],
+      [
+        2.6,
+        4.37
+      ]
+    ],
+    "turbo": [
+      [
+        1.2,
+        3.05
+      ],
+      [
+        2.85,
+        4.7
+      ]
+    ],
+    "mlx": [
+      [
+        3.74,
+        2.4
+      ],
+      [
+        5.09,
+        2.43
+      ]
+    ],
+    "llama": [
+      [
+        0.33,
+        3.61
+      ],
+      [
+        0.83,
+        4.11
+      ]
+    ]
+  },
+  "ppl": {
+    "cortiq_q4tp": 32.95,
+    "cortiq_q8": 26.06,
+    "mlx4": 31.91,
+    "mlx8": 25.46,
+    "llama_q4": 26.75,
+    "llama_q8": 26.43
+  },
+  "ppl_size": {
+    "cortiq_q4tp": 2.16,
+    "cortiq_q8": 4.14,
+    "mlx4": 2.2,
+    "mlx8": 4.1,
+    "llama_q4": 3.54,
+    "llama_q8": 4.37
+  }
+}

@@ -5446,6 +5446,205 @@ kernel void q4tp_matvec_m_gu_gelu(
     }
 }
 
+// Dense decode (`qkv_fused`): the q, k and v projections, RoPE, the K/V append into the
+// mirror and the per-head output gate's dot products as ONE dispatch. Simdgroup s takes
+// four rows of Q (s < nq), K (s < nq+nk) or V (s < nq+nk+nv), or one head of the gate after
+// them (`ng` simdgroups; 0 without a gate). The rows of a head's rotary span pair up inside
+// a simdgroup: quad t holds rows (2t, 2t+1, 2t+hlf, 2t+1+hlf) of the head, so the rotation
+// is register arithmetic at the end (`chunk_rope_kv`'s pairs (d, d+hlf), angle pos·invf[d]);
+// the rows past `rd` come in plain quads. Q lands rotated in `qout` ([nh][hd]: the chunk
+// kernel's head-major row of one), K and V in the mirror row `st0` (f32 or half mirror).
+#define Q4TP_QKV_ROPE(NAME, KV)                                                                   \
+kernel void NAME(                                                                                 \
+    device const uchar* wq   [[buffer(0)]],                                                       \
+    device const uchar* wk   [[buffer(1)]],                                                       \
+    device const uchar* wv   [[buffer(2)]],                                                       \
+    device const float* x    [[buffer(3)]],                                                       \
+    device float*       qout [[buffer(4)]],                                                       \
+    device KV*          kbuf [[buffer(5)]],                                                       \
+    device KV*          vbuf [[buffer(6)]],                                                       \
+    device const float* invf [[buffer(7)]],                                                       \
+    device const float* gw   [[buffer(8)]],  /* [ng][gpr*32] gate rows */                         \
+    device float*       gain [[buffer(9)]],  /* [ng] sigmoid(gw[h]·x) */                          \
+    constant uint4&     dm   [[buffer(10)]], /* gpr, nh, nkv, hd */                               \
+    constant uint4&     rp   [[buffer(11)]], /* rd, pos, st0, cap */                              \
+    constant uint&      ng   [[buffer(12)]],                                                      \
+    constant float&     rsc  [[buffer(13)]],                                                      \
+    uint sg   [[simdgroup_index_in_threadgroup]],                                                 \
+    uint lane [[thread_index_in_simdgroup]],                                                      \
+    uint tgpos [[threadgroup_position_in_grid]],                                                  \
+    uint sgs  [[simdgroups_per_threadgroup]])                                                     \
+{                                                                                                 \
+    threadgroup float lad[8u * 4u * 32u];                                                         \
+    uint gpr = dm.x, nh = dm.y, nkv = dm.z, hd = dm.w;                                            \
+    uint rd = rp.x, pos = rp.y, st0 = rp.z, cap = rp.w;                                           \
+    uint qph = hd / 4u;                                                                           \
+    uint nq = nh * qph, nk = nkv * qph;                                                           \
+    uint total = nq + 2u * nk;                                                                    \
+    uint s = tgpos * sgs + sg;                                                                    \
+    if (s >= total) {                                                                             \
+        /* the gate simdgroups: one head's dot over the normed input */                           \
+        uint h = s - total;                                                                       \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        if (h < ng) {                                                                             \
+            device const float* row = gw + (ulong)h * gpr * 32u;                                  \
+            float acc = 0.0f;                                                                     \
+            for (uint i = lane; i < gpr * 32u; i += 32u) acc += row[i] * x[i];                    \
+            float g = simd_sum(acc);                                                              \
+            if (lane == 0u) gain[h] = 1.0f / (1.0f + exp(-g));                                    \
+        }                                                                                         \
+        return;                                                                                   \
+    }                                                                                             \
+    uint tensor = s < nq ? 0u : (s < nq + nk ? 1u : 2u);                                          \
+    uint lq = tensor == 0u ? s : (tensor == 1u ? s - nq : s - nq - nk);                           \
+    device const uchar* q = tensor == 0u ? wq : (tensor == 1u ? wk : wv);                         \
+    uint rows = tensor == 0u ? nh * hd : nkv * hd;                                                \
+    uint head = lq / qph, qi = lq % qph;                                                          \
+    uint hlf = rd / 2u;                                                                           \
+    uint npq = tensor == 2u ? 0u : hlf / 2u;                                                      \
+    bool rot = qi < npq;                                                                          \
+    uint base = head * hd;                                                                        \
+    uint r0, r1, r2, r3;                                                                          \
+    if (rot) {                                                                                    \
+        uint i = 2u * qi;                                                                         \
+        r0 = base + i; r1 = r0 + 1u; r2 = r0 + hlf; r3 = r2 + 1u;                                 \
+    } else {                                                                                      \
+        r0 = base + (tensor == 2u ? qi * 4u : rd + (qi - npq) * 4u);                              \
+        r1 = r0 + 1u; r2 = r0 + 2u; r3 = r0 + 3u;                                                 \
+    }                                                                                             \
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;                                           \
+    ulong codes_off  = params_off + (ulong)rows * 4ul;                                            \
+    uint  stride     = (gpr * 5u + 7u) / 8u;                                                      \
+    {                                                                                             \
+        uint rr[4] = {r0, r1, r2, r3};                                                            \
+        for (uint ri = 0u; ri < 4u; ++ri) {                                                       \
+            device const half* ph = (device const half*)(q + params_off + (ulong)rr[ri] * 4ul);   \
+            lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);   \
+        }                                                                                         \
+    }                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);                  \
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;                                     \
+    for (uint g = lane; g < gpr; g += 32u) {                                                      \
+        device const float4* xv = (device const float4*)(x + g * 32u);                            \
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];                                    \
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];                                    \
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;                                        \
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);                                           \
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;           \
+        uint bit = g * 5u;                                                                        \
+        uint cb  = bit >> 3u;                                                                     \
+        uint shf = bit & 7u;                                                                      \
+        uint rr[4] = {r0, r1, r2, r3};                                                            \
+        for (uint ri = 0u; ri < 4u; ++ri) {                                                       \
+            uint r = rr[ri];                                                                      \
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);             \
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;               \
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;    \
+            float scale = lad[(sg * 4u + ri) * 32u + code];                                       \
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)        \
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)        \
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)        \
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);       \
+            float contrib = scale * (gsum + m8);                                                  \
+            if (ri == 0u) acc0 += contrib;                                                        \
+            else if (ri == 1u) acc1 += contrib;                                                   \
+            else if (ri == 2u) acc2 += contrib;                                                   \
+            else acc3 += contrib;                                                                 \
+        }                                                                                         \
+    }                                                                                             \
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);   \
+    if (rot) {                                                                                    \
+        uint i = 2u * qi;                                                                         \
+        float a0 = (float)pos * invf[i], a1 = (float)pos * invf[i + 1u];                          \
+        float c0 = cos(a0), s0 = sin(a0), c1 = cos(a1), s1 = sin(a1);                             \
+        float o0 = acc0 * c0 - acc2 * s0, o2 = acc0 * s0 + acc2 * c0;                             \
+        float o1 = acc1 * c1 - acc3 * s1, o3 = acc1 * s1 + acc3 * c1;                             \
+        if (rsc != 1.0f) { o0 *= rsc; o1 *= rsc; o2 *= rsc; o3 *= rsc; }                          \
+        acc0 = o0; acc1 = o1; acc2 = o2; acc3 = o3;                                               \
+    }                                                                                             \
+    if (lane == 0u) {                                                                             \
+        if (tensor == 0u) {                                                                       \
+            qout[r0] = acc0; qout[r1] = acc1; qout[r2] = acc2; qout[r3] = acc3;                   \
+        } else {                                                                                  \
+            device KV* dst = (tensor == 1u ? kbuf : vbuf) + ((ulong)head * cap + st0) * hd;       \
+            dst[r0 - base] = (KV)acc0; dst[r1 - base] = (KV)acc1;                                 \
+            dst[r2 - base] = (KV)acc2; dst[r3 - base] = (KV)acc3;                                 \
+        }                                                                                         \
+    }                                                                                             \
+}
+
+Q4TP_QKV_ROPE(q4tp_qkv_rope, float)
+Q4TP_QKV_ROPE(q4tp_qkv_rope_h, half)
+
+// `q4tp_matvec_m` with y += W·(x ⊙ gain[head]): the O projection taking the per-head output
+// gate as it reads the attention output (`gph` groups of 32 per head), instead of a gate
+// pass over `ao` before it. Always the residual add (`addy` = 1 of the plain kernel).
+kernel void q4tp_matvec_m_add_gain(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const float* gain [[buffer(5)]],
+    constant uint&      gph  [[buffer(6)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float gn = gain[g / gph];
+        float4 x0 = xv[0] * gn, x1 = xv[1] * gn, x2 = xv[2] * gn, x3 = xv[3] * gn;
+        float4 x4 = xv[4] * gn, x5 = xv[5] * gn, x6 = xv[6] * gn, x7 = xv[7] * gn;
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = y[r0] + acc0;
+        if (nr > 1u) y[r0 + 1u] = y[r0 + 1u] + acc1;
+        if (nr > 2u) y[r0 + 2u] = y[r0 + 2u] + acc2;
+        if (nr > 3u) y[r0 + 3u] = y[r0 + 3u] + acc3;
+    }
+}
+
 // `q4tp_matvec` over the FIRST `rows_do` rows of a `rows`-row tensor: the
 // planes are laid out by the full row count, the dispatch stops early —
 // the draft head's vocabulary shortlist (CMF_DRAFT_VOCAB).
@@ -8835,6 +9034,12 @@ struct Ctx {
     q4tp_mgu_oai: ComputePipelineState,
     /// `q4tp_matvec_m_gu_gelu`: the same with the exact GELU.
     q4tp_mgu_gelu: ComputePipelineState,
+    /// `q4tp_qkv_rope` (f32 mirror) / `q4tp_qkv_rope_h` (half): q|k|v,
+    /// RoPE, the K/V append and the output gate's dots as one dispatch;
+    /// `q4tp_matvec_m_add_gain`: the O projection applying that gate.
+    q4tp_qkvr: ComputePipelineState,
+    q4tp_qkvr_h: ComputePipelineState,
+    q4tp_m_add_gain: ComputePipelineState,
     /// Standalone q2tp matvec with explicit ordinary/affine centre.
     q2tp: ComputePipelineState,
     /// Production affine Prism sign/zero-select matvec; legal tensors only.
@@ -9181,6 +9386,9 @@ fn init() -> Result<Ctx, String> {
     let q4tp_mgu = pso("q4tp_matvec_m_gu")?;
     let q4tp_mgu_oai = pso("q4tp_matvec_m_gu_oai")?;
     let q4tp_mgu_gelu = pso("q4tp_matvec_m_gu_gelu")?;
+    let q4tp_qkvr = pso("q4tp_qkv_rope")?;
+    let q4tp_qkvr_h = pso("q4tp_qkv_rope_h")?;
+    let q4tp_m_add_gain = pso("q4tp_matvec_m_add_gain")?;
     let q2tp = pso("q2tp_matvec")?;
     let q2tp_affine = pso("q2tp_affine_select_matvec")?;
     let q2tpmm = pso("q2tp_mul_mm")?;
@@ -9320,6 +9528,9 @@ fn init() -> Result<Ctx, String> {
         q4tp_mgu,
         q4tp_mgu_oai,
         q4tp_mgu_gelu,
+        q4tp_qkvr,
+        q4tp_qkvr_h,
+        q4tp_m_add_gain,
         q2tp,
         q2tp_affine,
         q2tpmm,
@@ -11145,6 +11356,15 @@ fn fuse_on() -> bool {
     MV_FAST.with(|f| f.get() & (DENSE_MV | DENSE_FUSE) == DENSE_MV | DENSE_FUSE)
 }
 
+/// The dense decode's q|k|v + RoPE + K/V append + output-gate dots as one
+/// dispatch (`q4tp_qkv_rope`), the gate applied inside the O projection
+/// (`q4tp_matvec_m_add_gain`): three dispatches and three barriers fewer per
+/// layer. Rides on `fuse_on`; `CMF_METAL_QKVFUSE=0` closes it.
+fn qkvfuse_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    fuse_on() && !*OFF.get_or_init(|| std::env::var("CMF_METAL_QKVFUSE").as_deref() == Ok("0"))
+}
+
 /// Scope in which the token graph's q4tp matvecs use `q4tp_matvec_m`
 /// (and, with `DENSE_FUSE`, its fused residual / gate|up|SiLU forms).
 ///
@@ -11411,6 +11631,87 @@ fn encode_q4tp_matvec_m_gu(
     enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     fbuf.bind(enc, 5, abs_u);
+    let sgs = 4u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// The fused q|k|v dispatch of the dense decode (`q4tp_qkv_rope`): rows
+/// `nh·hd` of Q and `nkv·hd` of K and V over `gpr` groups of the normed input
+/// `xs`; Q rotated into `qout` ([nh][hd]), K/V rotated/appended into the
+/// mirrors at row `st0` (f32 or half, `kv_f16`); `gate` = (rows `[ng][hidden]`,
+/// out `[ng]`) the output gate's sigmoid dots, or none.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_qkv_rope(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    (aq, ak, av): (usize, usize, usize),
+    xs: &Buffer,
+    qout: &Buffer,
+    kbuf: &Buffer,
+    vbuf: &Buffer,
+    invf: &Buffer,
+    gate: Option<(&Buffer, &Buffer, usize)>,
+    (gpr, nh, nkv, hd): (usize, usize, usize, usize),
+    (rd, pos, st0, cap): (usize, usize, usize, usize),
+    rsc: f32,
+) {
+    note_weight_bytes(&ProjKind::Q4tp, (nh + 2 * nkv) * hd, gpr);
+    enc.set_compute_pipeline_state(if kv_f16() { &c.q4tp_qkvr_h } else { &c.q4tp_qkvr });
+    fbuf.bind(enc, 0, aq);
+    fbuf.bind(enc, 1, ak);
+    fbuf.bind(enc, 2, av);
+    enc.set_buffer(3, Some(xs), 0);
+    enc.set_buffer(4, Some(qout), 0);
+    enc.set_buffer(5, Some(kbuf), 0);
+    enc.set_buffer(6, Some(vbuf), 0);
+    enc.set_buffer(7, Some(invf), 0);
+    let (gw, gout, ng) = match gate {
+        Some((w, o, n)) => (w, o, n),
+        // No gate: nothing reads the slots, but they must be bound.
+        None => (xs, qout, 0),
+    };
+    enc.set_buffer(8, Some(gw), 0);
+    enc.set_buffer(9, Some(gout), 0);
+    let dm = [gpr as u32, nh as u32, nkv as u32, hd as u32];
+    let rp = [rd as u32, pos as u32, st0 as u32, cap as u32];
+    let ng_u = ng as u32;
+    enc.set_bytes(10, 16, dm.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(11, 16, rp.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(12, 4, &ng_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(13, 4, &rsc as *const f32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    let quads = ((nh + 2 * nkv) * hd / 4 + ng) as u64;
+    enc.dispatch_thread_groups(MTLSize::new(quads.div_ceil(sgs), 1, 1), MTLSize::new(sgs * 32, 1, 1));
+}
+
+/// `q4tp_matvec_m_add_gain`: y += W·(x ⊙ gain[head]), `gph` groups of 32 per head.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_matvec_m_add_gain(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+    gain: &Buffer,
+    gph: usize,
+) {
+    note_weight_bytes(&ProjKind::Q4tp, rows, gpr);
+    enc.set_compute_pipeline_state(&c.q4tp_m_add_gain);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let (gpr_u, rows_u, gph_u) = (gpr as u32, rows as u32, gph as u32);
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(5, Some(gain), 0);
+    enc.set_bytes(6, 4, &gph_u as *const u32 as *const std::ffi::c_void);
     let sgs = 4u64;
     enc.dispatch_thread_groups(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
@@ -21895,19 +22196,50 @@ impl TokenGraph {
             std::ptr::copy_nonoverlapping(ao.as_ptr(), ao_b.contents() as *mut f32, ao.len());
         }
         let enc = cmd.new_compute_command_encoder();
-        self.encode_o_ffn(enc, l, &ao_b);
+        self.encode_o_ffn(enc, l, &ao_b, None);
         enc.end_encoding();
     }
 
     /// O-projection from a device-resident attention output + residual
     /// + post-norm + FFN + residual.
-    fn encode_o_ffn(&self, enc: &metal::ComputeCommandEncoderRef, l: &AttnGpuLayer, ao_b: &Buffer) {
+    /// Whether `encode_o_ffn` folds the residual add into the O projection
+    /// (and can take the output gate with it, `qkv_fused`).
+    fn o_fusable(&self, l: &AttnGpuLayer) -> bool {
+        fuse_on()
+            && matches!(self.proj_abs(l.wo).map(|a| a.1), Some(ProjKind::Q4tp))
+            && l.attn_out_norm.is_none()
+            && l.mhc.is_none()
+    }
+
+    /// `gain`: the per-head output gate (`[nh]` sigmoids, head width) the
+    /// fused q|k|v pass computed, applied as the O projection reads `ao`.
+    fn encode_o_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        l: &AttnGpuLayer,
+        ao_b: &Buffer,
+        gain: Option<(&Buffer, usize)>,
+    ) {
         let (abs, q1t) = self.proj_abs(l.wo).unwrap();
         // Dense decode (`fuse_on`): h += O·ao in the projection's epilogue,
         // so the norm below runs without a delta — bit-exact, one pass less.
         // Not under a Gemma-4 sandwich norm: O·ao is normed before its add.
-        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp) && l.attn_out_norm.is_none() && l.mhc.is_none();
+        let o_fused = self.o_fusable(l);
+        debug_assert!(gain.is_none() || o_fused, "a fused gate needs the fused O projection");
         if decode_skip('o') {
+        } else if let (true, Some((g, hd))) = (o_fused, gain) {
+            encode_q4tp_matvec_m_add_gain(
+                self.c,
+                enc,
+                &self.fbuf,
+                abs,
+                ao_b,
+                &self.h_b,
+                l.wo.1,
+                l.wo.2 / GROUP_SIZE,
+                g,
+                hd / GROUP_SIZE,
+            );
         } else if o_fused {
             encode_q4tp_matvec_m_add(
                 self.c,
@@ -22162,12 +22494,56 @@ impl TokenGraph {
         let q_b = io_buf(self.c, 40_000_000_003 + l.wq.1, l.wq.1 * 4);
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
         let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
-        if !decode_skip('q') {
-            let (aq, ak, av) = (
-                self.proj_abs(l.wq).unwrap(),
-                self.proj_abs(l.wk).unwrap(),
-                self.proj_abs(l.wv).unwrap(),
+        let (aq, ak, av) = (
+            self.proj_abs(l.wq).unwrap(),
+            self.proj_abs(l.wk).unwrap(),
+            self.proj_abs(l.wv).unwrap(),
+        );
+        let nhd = p.nh * p.hd;
+        let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
+        // Dense decode (`qkvfuse_on`): steps 2, 3, 4 and 6b as ONE dispatch —
+        // q|k|v, RoPE, the K/V append into the mirror, the output gate's
+        // dots — the gate applied inside the O projection. Plain RoPE heads
+        // (no qk-norm, no bias, no output-gate split, no V norm), the
+        // mirror present, `rd` a multiple of 4 (row pairs come in quads).
+        let qkv_fused = qkvfuse_on()
+            && l.mhc.is_none()
+            && mirror.is_some()
+            && p.dash.is_none()
+            && !p.output_gate
+            && !p.v_norm
+            && p.hd <= 256
+            && p.hd % 4 == 0
+            && p.rd % 4 == 0
+            && p.q_norm.is_none()
+            && p.k_norm.is_none()
+            && !p.late_qk_norm
+            && matches!(aq.1, ProjKind::Q4tp)
+            && matches!(ak.1, ProjKind::Q4tp)
+            && matches!(av.1, ProjKind::Q4tp)
+            && (p.head_gate.is_none() || self.o_fusable(l))
+            && !decode_skip('q')
+            && !decode_skip('p');
+        let gain_b = io_buf(self.c, 46_000_000_011 + p.nh, p.nh * 4);
+        if qkv_fused {
+            let (k_mb, v_mb, _, cap, stored) = mirror.as_ref().unwrap();
+            let inv_freq: &[f32] = if p.rd == 0 { &NO_ROPE_INV_FREQ } else { p.inv_freq };
+            encode_q4tp_qkv_rope(
+                self.c,
+                enc,
+                &self.fbuf,
+                (aq.0, ak.0, av.0),
+                &self.n_b,
+                &qr_b,
+                k_mb,
+                v_mb,
+                &const_buf(self.c, inv_freq),
+                p.head_gate.map(|gw| (const_buf(self.c, gw), gain_b.clone(), p.nh)).as_ref().map(|(w, o, n)| (w, o, *n)),
+                (l.wq.2 / GROUP_SIZE, p.nh, p.nkv, p.hd),
+                (p.rd, p.position, *stored, *cap),
+                p.rope_scale,
             );
+        } else if !decode_skip('q') {
             encode_proj(
                 self.c,
                 enc,
@@ -22217,8 +22593,6 @@ impl TokenGraph {
             self.bar(enc);
         }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
-        let nhd = p.nh * p.hd;
-        let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
         let g_b = io_buf(self.c, 45_000_000_039 + nhd, nhd * 4);
         let flags = (p.output_gate as u32)
             | ((p.q_norm.is_some() as u32) << 1)
@@ -22246,7 +22620,8 @@ impl TokenGraph {
         } else {
             p.inv_freq
         };
-        if decode_skip('p') {
+        if decode_skip('p') || qkv_fused {
+            // (the fused q|k|v pass rotated and appended already)
         } else if rope_app {
             let (k_mb, v_mb, _, cap, stored) = mirror.as_ref().unwrap();
             let flags_c = ((p.q_norm.is_some() as u32) << 1)
@@ -22323,7 +22698,9 @@ impl TokenGraph {
                 (((p.nh + p.nkv) * 32) as u64, 256),
             );
         }
-        self.bar(enc);
+        if !qkv_fused {
+            self.bar(enc);
+        }
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
         if let Some(od) = o1dev.as_ref().filter(|od| o1c::admits(self.c, od)) {
             // 4-5. O(1), a chunk of one row: the near window up to 2052 keys in short threads.
@@ -22402,7 +22779,7 @@ impl TokenGraph {
             let (k_mb, v_mb, imp_mb, cap, stored) = mirror.unwrap();
             // 4. append this position's K/V into the mirror (done above
             //    when the RoPE pass wrote the mirror itself)
-            if !rope_app {
+            if !rope_app && !qkv_fused {
                 disp(
                     enc,
                     kvk(&self.c.kvapp, &self.c.kvapp_h),
@@ -22441,7 +22818,7 @@ impl TokenGraph {
                     tracing::error!("DASH attend refused after the mirror advanced");
                 }
                 self.bar(enc);
-                self.encode_o_ffn(enc, l, &ao_b);
+                self.encode_o_ffn(enc, l, &ao_b, None);
                 enc.end_encoding();
                 self.in_conc.set(false);
                 return true;
@@ -22594,23 +22971,29 @@ impl TokenGraph {
             self.bar(enc);
         }
         // 6b. projected per-head gate off the normed input (n_b still
-        //     holds it: nothing since step 1 wrote n_b).
+        //     holds it: nothing since step 1 wrote n_b) — or, fused, its
+        //     sigmoids wait in gain_b for the O projection.
+        let mut gain = None;
         if let Some(gw) = p.head_gate {
-            encode_head_gate(
-                self.c,
-                enc,
-                &ao_b,
-                &const_buf(self.c, gw),
-                &self.n_b,
-                p.nh,
-                p.hd,
-                self.dims.hidden,
-                1,
-            );
-            self.bar(enc);
+            if qkv_fused {
+                gain = Some((&gain_b, p.hd));
+            } else {
+                encode_head_gate(
+                    self.c,
+                    enc,
+                    &ao_b,
+                    &const_buf(self.c, gw),
+                    &self.n_b,
+                    p.nh,
+                    p.hd,
+                    self.dims.hidden,
+                    1,
+                );
+                self.bar(enc);
+            }
         }
         // 7. O + residual + FFN + residual
-        self.encode_o_ffn(enc, l, &ao_b);
+        self.encode_o_ffn(enc, l, &ao_b, gain);
         enc.end_encoding();
         self.in_conc.set(false);
         true

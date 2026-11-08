@@ -8,6 +8,11 @@ const MSL: &str = include_str!("o1c_msl.metal");
 
 /// Rows per sub-chunk, as `o1_batch::OB_K`.
 pub(crate) const OB_K: usize = 64;
+/// The one-row path's near window split: threadgroups per group × simdgroups per threadgroup
+/// (`o1c_tok_near`), and the floats of a query head's far record (`o1c_tok_far`).
+const TOK_SPLIT: usize = 4;
+const TOK_SG: usize = 8;
+const TOK_FO: usize = 36;
 /// Sink and window together: the reach of the file's `nsrect`-free geometry.
 pub(crate) const MAX_NEAR: usize = 2052;
 
@@ -28,6 +33,11 @@ pub(crate) struct Pipes {
     gmax: ComputePipelineState,
     gsoft: ComputePipelineState,
     gadd: ComputePipelineState,
+    /// The one-row path (`encode_tok`).
+    tok_near: ComputePipelineState,
+    tok_far: ComputePipelineState,
+    tok_merge: ComputePipelineState,
+    tok_commit: ComputePipelineState,
 }
 
 unsafe impl Send for Pipes {}
@@ -71,6 +81,10 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 gmax: pso("o1c_gmax")?,
                 gsoft: pso("o1c_gsoft")?,
                 gadd: pso("o1c_gadd")?,
+                tok_near: pso("o1c_tok_near")?,
+                tok_far: pso("o1c_tok_far")?,
+                tok_merge: pso("o1c_tok_merge")?,
+                tok_commit: pso("o1c_tok_commit")?,
             })
         })
         .as_ref()
@@ -94,6 +108,10 @@ pub(crate) struct Scratch {
     gsc: Buffer,
     qp: Buffer,
     no: Buffer,
+    /// The one-row path's planes: near partials per (group, split, simdgroup, head) and the
+    /// far part per query head.
+    part: Buffer,
+    fo: Buffer,
 }
 
 unsafe impl Send for Scratch {}
@@ -131,6 +149,8 @@ fn scratch(c: &Ctx, od: &O1MetalDev) -> Arc<Scratch> {
         gsc: shared(c, nh * k * (ncap + k) * 4),
         qp: shared(c, nh * k * d * 4),
         no: shared(c, nh * k * d * 4),
+        part: shared(c, g * TOK_SPLIT * TOK_SG * hpg * (d + 4) * 4),
+        fo: shared(c, nh * TOK_FO * 4),
     });
     *slot = Some(s.clone());
     s
@@ -382,6 +402,67 @@ fn state_commit(
     run(enc, conc, &p.meta, &[&od.meta], u, (od.g as u64, 1, 1), 16, false);
 }
 
+/// Whether a one-row chunk takes the four-dispatch path (`o1c_tok_*`): up to 4 heads per
+/// group, a head width of 128 or 256, up to 32 landmarks; `CMF_O1C_TOK=0` keeps the stages.
+fn tok_ok(od: &O1MetalDev) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    od.h <= 4
+        && od.d % 128 == 0
+        && od.d <= 256
+        && od.m <= 32
+        && !*OFF.get_or_init(|| std::env::var("CMF_O1C_TOK").as_deref() == Ok("0"))
+}
+
+/// One row, attention and state commit, in four dispatches: near partials and the far part
+/// (independent), the merge into `out`, the commit.
+#[allow(clippy::too_many_arguments)]
+fn encode_tok(
+    enc: &metal::ComputeCommandEncoderRef,
+    conc: bool,
+    p: &Pipes,
+    od: &O1MetalDev,
+    s: &Scratch,
+    q: &Buffer,
+    kb: &Buffer,
+    vb: &Buffer,
+    out: &Buffer,
+) {
+    let u = uniform(od, 1, 0);
+    let (g, nh) = (od.g as u64, (od.g * od.h) as u64);
+    let e4 = (od.d / 4) as u64;
+    run(
+        enc,
+        false,
+        &p.tok_near,
+        &[&od.meta, q, &od.ring_k, &od.sink_k, kb, &od.ring_v, &od.sink_v, vb, &s.part],
+        &u,
+        (g, TOK_SPLIT as u64, 1),
+        (TOK_SG * 32) as u64,
+        true,
+    );
+    run(
+        enc,
+        conc,
+        &p.tok_far,
+        &[&od.meta, q, &od.k_tilde, &od.ring_k, &od.qt, &od.mz, &od.mu, &s.s, &s.fo],
+        &u,
+        (nh, 1, 1),
+        32,
+        true,
+    );
+    run(enc, conc, &p.tok_merge, &[&od.meta, &s.part, &s.fo, &od.that, &od.ring_v, out], &u, (nh * e4, 1, 1), 256, false);
+    run(
+        enc,
+        conc,
+        &p.tok_commit,
+        &[&od.meta, &od.ring_k, &od.ring_v, kb, vb, &od.mz, &od.that, &s.s],
+        &u,
+        (g, 1, 1),
+        256,
+        true,
+    );
+}
+
 /// The attention of `rows` rows of a sealed layer into `out`, and with `commit` the state after
 /// them. `q`: [rows][nh][d], `kb`, `vb`: [rows][g][d], `out`: [rows][nh][d].
 #[allow(clippy::too_many_arguments)]
@@ -399,6 +480,10 @@ pub(crate) fn encode(
 ) -> bool {
     let Some(p) = pipes(c) else { return false };
     let s = scratch(c, od);
+    if rows == 1 && commit && tok_ok(od) {
+        encode_tok(enc, conc, p, od, &s, q, kb, vb, out);
+        return true;
+    }
     let mut r0 = 0;
     while r0 < rows {
         let kk = OB_K.min(rows - r0);

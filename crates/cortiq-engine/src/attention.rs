@@ -333,6 +333,126 @@ pub(crate) fn softmax_row(row: &mut [f32]) {
     }
 }
 
+/// Numerically stable in-place softmax of one score row on x86-64:
+/// AVX2 max / exp / sum (the NEON twin's Cephes polynomial), scalar on a
+/// CPU without AVX2/FMA. The batched chunk attend's softmax.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn softmax_row(row: &mut [f32]) {
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both features were just detected on this CPU.
+        return unsafe { softmax_row_avx2(row) };
+    }
+    let maxs = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if maxs == f32::NEG_INFINITY {
+        return;
+    }
+    let mut sum = 0f32;
+    for v in row.iter_mut() {
+        *v = (*v - maxs).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for v in row.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+/// exp(x) for one AVX2 vector — the Cephes degree-6 polynomial of
+/// `vexpq_f32`, |rel err| < 2e-7 on the softmax range.
+///
+/// # Safety
+/// The caller has checked `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn exp_avx2(x: core::arch::x86_64::__m256) -> core::arch::x86_64::__m256 {
+    use core::arch::x86_64::*;
+    let x = _mm256_max_ps(x, _mm256_set1_ps(-87.0));
+    let x = _mm256_min_ps(x, _mm256_set1_ps(88.0));
+    let n = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(_mm256_mul_ps(
+        x,
+        _mm256_set1_ps(std::f32::consts::LOG2_E),
+    ));
+    // r = x − n·ln2, split hi/lo for accuracy (Cephes).
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693_359_4), x);
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.121_944_4e-4), r);
+    let mut p = _mm256_set1_ps(1.987_569_1e-4);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.398_2e-3));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.333_452e-3));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.166_579_6e-2));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.666_666_5e-1));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.000_000_3e-1));
+    let r2 = _mm256_mul_ps(r, r);
+    let e = _mm256_fmadd_ps(p, r2, _mm256_add_ps(_mm256_set1_ps(1.0), r));
+    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        _mm256_cvtps_epi32(n),
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(e, pow2)
+}
+
+/// The AVX2 body of the x86 `softmax_row`.
+///
+/// # Safety
+/// The caller has checked `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softmax_row_avx2(row: &mut [f32]) {
+    use core::arch::x86_64::*;
+    // SAFETY: every access is within row[..nn].
+    unsafe {
+        let nn = row.len();
+        let p = row.as_mut_ptr();
+        let mut j = 0usize;
+        let mut mv = _mm256_set1_ps(f32::NEG_INFINITY);
+        while j + 8 <= nn {
+            mv = _mm256_max_ps(mv, _mm256_loadu_ps(p.add(j)));
+            j += 8;
+        }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), mv);
+        let mut maxs = lanes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        while j < nn {
+            maxs = maxs.max(*p.add(j));
+            j += 1;
+        }
+        if maxs == f32::NEG_INFINITY {
+            return;
+        }
+        let mvv = _mm256_set1_ps(maxs);
+        let mut sumv = _mm256_setzero_ps();
+        j = 0;
+        while j + 8 <= nn {
+            let e = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(p.add(j)), mvv));
+            _mm256_storeu_ps(p.add(j), e);
+            sumv = _mm256_add_ps(sumv, e);
+            j += 8;
+        }
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sumv);
+        let mut sum: f32 = lanes.iter().sum();
+        while j < nn {
+            let e = (*p.add(j) - maxs).exp();
+            *p.add(j) = e;
+            sum += e;
+            j += 1;
+        }
+        if sum > 0.0 {
+            let inv = _mm256_set1_ps(1.0 / sum);
+            j = 0;
+            while j + 8 <= nn {
+                _mm256_storeu_ps(p.add(j), _mm256_mul_ps(_mm256_loadu_ps(p.add(j)), inv));
+                j += 8;
+            }
+            while j < nn {
+                *p.add(j) *= 1.0 / sum;
+                j += 1;
+            }
+        }
+    }
+}
+
 /// `acc += w · row` (f32 axpy) — NEON on aarch64, scalar elsewhere.
 #[inline]
 pub(crate) fn axpy_f32(acc: &mut [f32], row: &[f32], w: f32) {
@@ -1166,6 +1286,225 @@ fn attend_all_heads_upto(
 /// the pool's barrier costs more than the work.
 const ATTEND_PAR_MIN_CELLS: usize = 16 * 96;
 
+/// `row[i] = exp(row[i] − m)` in place, returning Σ row: the softmax's
+/// exponent pass without its normalization (the split-K decode attend
+/// normalizes after merging its chunks). AVX2 on x86-64 (the softmax
+/// row's Cephes polynomial), scalar libm elsewhere.
+pub(crate) fn exp_shift_sum(row: &mut [f32], m: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both features were just detected on this CPU.
+        return unsafe { exp_shift_sum_avx2(row, m) };
+    }
+    let mut s = 0f32;
+    for v in row.iter_mut() {
+        *v = (*v - m).exp();
+        s += *v;
+    }
+    s
+}
+
+/// The AVX2 body of `exp_shift_sum`.
+///
+/// # Safety
+/// The caller has checked `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_shift_sum_avx2(row: &mut [f32], m: f32) -> f32 {
+    use core::arch::x86_64::*;
+    // SAFETY: every access is within row[..n].
+    unsafe {
+        let n = row.len();
+        let p = row.as_mut_ptr();
+        let mv = _mm256_set1_ps(m);
+        let mut sv = _mm256_setzero_ps();
+        let mut j = 0usize;
+        while j + 8 <= n {
+            let e = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(p.add(j)), mv));
+            _mm256_storeu_ps(p.add(j), e);
+            sv = _mm256_add_ps(sv, e);
+            j += 8;
+        }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sv);
+        let mut s: f32 = lanes.iter().sum();
+        while j < n {
+            let e = (*p.add(j) - m).exp();
+            *p.add(j) = e;
+            s += e;
+            j += 1;
+        }
+        s
+    }
+}
+
+/// `CMF_ATTEND_SPLITK=0` keeps the per-head pooled decode attend (A/B).
+fn splitk_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_ATTEND_SPLITK").as_deref() != Ok("0"))
+}
+
+/// Keys per work unit of the split-K decode attend.
+const SPLITK_CHUNK: usize = 256;
+
+/// Split-K decode attend over a long grouped-query context (flash-decoding
+/// on the CPU pool). The per-head pooled attend gave each Q head its own
+/// job, so every head streamed its group's whole K and V: at 16 000 rows a
+/// full layer read 512 MB for 128 MB of cache, at ~4 GB/s on an 8-core
+/// EPYC — the decode step's largest cost past 4 000 tokens. Here a job is
+/// (KV group, a chunk of `SPLITK_CHUNK` keys): each K and V row is read
+/// once for all the group's heads, the chunk keeps its own max and sum
+/// (an online softmax), and the chunks merge per head afterwards. The
+/// importance row adds each head's final probabilities in the serial
+/// (group, head) order. The same scores and exponents as `attend_group`
+/// up to the vector exp; the sums run in another order (tolerance-class).
+/// F32 cache, no soft-cap, no learned sinks (the caller checks).
+#[allow(clippy::too_many_arguments)]
+fn attend_split_k(
+    q: &[f32],
+    cache: &LayerKvCache,
+    nh: usize,
+    heads_per_kv: usize,
+    hd: usize,
+    scale: f32,
+    window: Option<usize>,
+    pool: &crate::pool::Pool,
+    longest: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let hpk = heads_per_kv;
+    let nkv = nh / hpk;
+    let (kh, vh) = (cache.k_heads(), cache.v_heads());
+    // Per group: visible rows [first, stored), chunked.
+    let spans: Vec<(usize, usize)> = (0..nkv)
+        .map(|g| {
+            let stored = kh[g].len() / hd;
+            let first = window.map_or(0, |w| stored.saturating_sub(w)).min(stored);
+            (first, stored)
+        })
+        .collect();
+    let mut units: Vec<(usize, usize, usize)> = Vec::new(); // (group, r0, r1)
+    for (g, &(first, stored)) in spans.iter().enumerate() {
+        let mut r0 = first;
+        while r0 < stored {
+            let r1 = (r0 + SPLITK_CHUNK).min(stored);
+            units.push((g, r0, r1));
+            r0 = r1;
+        }
+    }
+    let nu = units.len();
+    // probs[h·longest + (p − first_g)]: the chunk's exponents, rescaled
+    // to probabilities after the merge. ml[u·hpk + h] = (max, sum);
+    // part[(u·hpk + h)·hd ..]: the chunk's un-normalized output.
+    let mut probs = take_buf(nh * longest);
+    let mut ml = vec![(f32::NEG_INFINITY, 0f32); nu * hpk];
+    let mut part = take_buf(nu * hpk * hd);
+    {
+        let (probs_p, ml_p, part_p) = (
+            crate::pool::SendMut::new(probs.as_mut_ptr()),
+            SendPair(ml.as_mut_ptr()),
+            crate::pool::SendMut::new(part.as_mut_ptr()),
+        );
+        let (units, spans) = (&units, &spans);
+        let run = |u0: usize, u1: usize| {
+            for u in u0..u1 {
+                let (g, r0, r1) = units[u];
+                let first = spans[g].0;
+                let (k, v) = (&kh[g], &vh[g]);
+                let len = r1 - r0;
+                // SAFETY: unit u owns probs columns [r0, r1) of its group's
+                // heads, ml[u·hpk..] and part[u·hpk·hd..].
+                let rows = |h: usize| unsafe {
+                    std::slice::from_raw_parts_mut(
+                        probs_p.at((g * hpk + h) * longest + (r0 - first)),
+                        len,
+                    )
+                };
+                for p in r0..r1 {
+                    let krow = &k[p * hd..(p + 1) * hd];
+                    for h in 0..hpk {
+                        let qh = &q[(g * hpk + h) * hd..(g * hpk + h + 1) * hd];
+                        rows(h)[p - r0] = dot_f32(qh, krow) * scale;
+                    }
+                }
+                let out = unsafe { std::slice::from_raw_parts_mut(part_p.at(u * hpk * hd), hpk * hd) };
+                out.fill(0.0);
+                for h in 0..hpk {
+                    let s = rows(h);
+                    let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let l = exp_shift_sum(s, m);
+                    unsafe { *ml_p.at(u * hpk + h) = (m, l) };
+                }
+                for p in r0..r1 {
+                    let vrow = &v[p * hd..(p + 1) * hd];
+                    for h in 0..hpk {
+                        let w = rows(h)[p - r0];
+                        axpy_f32(&mut out[h * hd..(h + 1) * hd], vrow, w);
+                    }
+                }
+            }
+        };
+        pool.run_rows(nu, &run);
+    }
+    // Merge per head: M = max over chunks, Z = Σ l·e^(m − M).
+    let mut attn_out = take_buf(nh * hd);
+    let mut imp = take_buf(cache.seq_len);
+    let mut fac = vec![0f32; nu * hpk];
+    for g in 0..nkv {
+        let us: Vec<usize> = (0..nu).filter(|&u| units[u].0 == g).collect();
+        for h in 0..hpk {
+            let mx = us.iter().map(|&u| ml[u * hpk + h].0).fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = us
+                .iter()
+                .map(|&u| {
+                    let (m, l) = ml[u * hpk + h];
+                    l * (m - mx).exp()
+                })
+                .sum();
+            let inv = if z > 0.0 { 1.0 / z } else { 0.0 };
+            let o = &mut attn_out[(g * hpk + h) * hd..(g * hpk + h + 1) * hd];
+            for &u in &us {
+                let f = (ml[u * hpk + h].0 - mx).exp() * inv;
+                fac[u * hpk + h] = f;
+                axpy_f32(o, &part[(u * hpk + h) * hd..(u * hpk + h + 1) * hd], f);
+            }
+        }
+        // Importance: each head's probabilities, (group, head) order.
+        let (first, stored) = spans[g];
+        let n = imp.len().min(stored);
+        for h in 0..hpk {
+            for &u in &us {
+                let (_, r0, r1) = units[u];
+                let r1 = r1.min(n);
+                if r1 <= r0 {
+                    continue;
+                }
+                let f = fac[u * hpk + h];
+                let row = &probs[(g * hpk + h) * longest + (r0 - first)..][..r1 - r0];
+                for (dst, &e) in imp[r0..r1].iter_mut().zip(row) {
+                    *dst += e * f;
+                }
+            }
+        }
+    }
+    recycle_buf(&mut probs);
+    recycle_buf(&mut part);
+    (attn_out, imp)
+}
+
+/// A raw `(max, sum)` pointer the split-K jobs share (disjoint slots).
+struct SendPair(*mut (f32, f32));
+// SAFETY: each job writes only its own unit's slots.
+unsafe impl Send for SendPair {}
+unsafe impl Sync for SendPair {}
+impl SendPair {
+    // A method, so the closure captures &SendPair rather than the raw
+    // field (2021 disjoint capture).
+    fn at(&self, i: usize) -> *mut (f32, f32) {
+        // SAFETY: callers index within the slot array.
+        unsafe { self.0.add(i) }
+    }
+}
+
 /// `attend_all_heads`, one pool job over the heads once the context is
 /// long enough. The serial kernel was the whole CPU attention of a decode
 /// step on one core: 16 heads × `stored` rows of dot + libm `exp` + axpy,
@@ -1189,6 +1528,21 @@ pub(crate) fn attend_all_heads_pool(
     check_sinks(cache, nh);
     let nkv = nh / heads_per_kv.max(1);
     let longest = (0..nkv).map(|g| cache.head_len(g)).max().unwrap_or(0);
+    // x86-64 (the architecture it was measured on): the split-K attend
+    // for a grouped context of 512 rows or more. `CMF_ATTEND_SPLITK=0`
+    // keeps the per-head jobs (bit-identical to the serial attend).
+    if let Some(pool) = pool
+        && cfg!(target_arch = "x86_64")
+        && heads_per_kv >= 2
+        && nh % heads_per_kv == 0
+        && longest >= 512
+        && cache.mode == crate::kv_cache::KvMode::F32
+        && softcap == 0.0
+        && cache.sinks.is_none()
+        && splitk_on()
+    {
+        return attend_split_k(q, cache, nh, heads_per_kv, hd, scale, window, pool, longest);
+    }
     if let Some(pool) = pool
         && nh >= 2
         && nh * longest >= ATTEND_PAR_MIN_CELLS
@@ -1657,11 +2011,11 @@ pub fn qwen_attention_batch(
     // (`chunk_attend_win`), and the portable fallback below honours it too.
     // Spark-X2.5 only, as above.
     let device_window = window_masks && cfg.gate_sigmoid && crate::gpu::chunk_attend_windowed();
-    let attend_ok = b >= 32
+    let attend_core = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
-        && (!window_masks || device_window)
         && cache.sinks.is_none();
+    let attend_ok = attend_core && (!window_masks || device_window);
     // The device can batch it on any architecture. That matters because
     // the CPU twin needs Accelerate or the NEON micro-GEMM, so x86 had
     // no batched attend at all and prefill fell back to a per-position
@@ -1691,10 +2045,24 @@ pub fn qwen_attention_batch(
             || std::env::var("CMF_FORCE_NEON_GEMM")
                 .map(|v| v == "1")
                 .unwrap_or(false));
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86-64: the AVX2 micro-GEMM twin (`qtensor::x86_gemm_rm`;
+    // `CMF_CPU_ATTEND=0` keeps the per-position attend). `attend_chunk`
+    // masks a sliding window itself and bounds its GEMM range to the
+    // window, so a windowed layer takes it too, under the device arm's
+    // Spark-only rule (the window's parity was measured on Spark). Not
+    // while the O(1) collector runs on the layer: the bounded transition
+    // happens inside the per-position walk (as the device arm, which
+    // asks the same).
+    #[cfg(target_arch = "x86_64")]
+    let cpu_attend = attend_core
+        && (!window_masks || cfg.gate_sigmoid)
+        && cache.o1.is_none()
+        && crate::qtensor::accel_gemm_enabled();
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let cpu_attend = false;
     let batched_attend = cpu_attend || gpu_attend;
-    // Without a batched attend (x86 has no CPU twin of the chunk kernel)
+    // Without a batched attend (no device, a CPU without a micro-GEMM, or
+    // a shape the chunk attends refuse)
     // every position used to attend right after its own append, serially
     // on the caller: a scalar-core loop of dot + libm exp + axpy that was
     // 30% of a 512-token and 46% of a 1024-token prefill on a 256-core
@@ -2094,7 +2462,7 @@ pub fn qwen_attention_batch(
                 );
             }
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if !done {
             cache.attend_chunk(
                 &q_rope_all,
@@ -2113,8 +2481,8 @@ pub fn qwen_attention_batch(
         if !done {
             // Portable fallback. It exists so a device refusal can never
             // leave `ao_all` untouched: this path is chosen BEFORE the
-            // per-position attend is skipped, and on x86 there is no
-            // other batched attend to fall back to.
+            // per-position attend is skipped, and a CPU without a
+            // micro-GEMM has no other batched attend to fall back to.
             let n = s0 + b;
             struct OutPtr(*mut f32);
             // SAFETY: workers own disjoint query ranges, so the writes
@@ -3594,6 +3962,48 @@ mod qk_norm_order_tests {
         qk_norm_and_rope(&cfg(&inv, &w, &w, false, hd), &mut qb, &mut kb, 2, 1, hd, 7);
         for (a, b) in qa.iter().zip(&qb).chain(ka.iter().zip(&kb)) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod splitk_tests {
+    use super::*;
+    use crate::kv_cache::{KvMode, LayerKvCache};
+
+    /// The pooled decode attend (split-K on x86-64, per-head jobs
+    /// elsewhere) against the serial grouped attend: full context and a
+    /// window, a context that is not a multiple of the chunk, output and
+    /// importance.
+    #[test]
+    fn pooled_decode_attend_matches_serial() {
+        let (nkv, hd, hpk) = (2usize, 64usize, 4usize);
+        let nh = nkv * hpk;
+        let pool = crate::pool::Pool::new(3);
+        for (n, window) in [(700usize, None), (1300, Some(512usize)), (600, Some(4000))] {
+            let mut c = LayerKvCache::new(nkv, hd);
+            c.mode = KvMode::F32;
+            for p in 0..n {
+                let k: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i * 31 + p * 17 + 3) % 97) as f32 / 48.5 - 1.0)
+                    .collect();
+                let v: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i * 13 + p * 29 + 7) % 89) as f32 / 89.0 - 0.5)
+                    .collect();
+                c.append(&k, &v, &[]);
+            }
+            let q: Vec<f32> = (0..nh * hd).map(|i| ((i * 11 + 5) % 83) as f32 / 41.5 - 1.0).collect();
+            let scale = 1.0 / (hd as f32).sqrt();
+            let (o1, i1) = attend_all_heads(&q, &c, nh, hpk, hd, scale, window, 0.0);
+            let (o2, i2) =
+                attend_all_heads_pool(&q, &c, nh, hpk, hd, scale, window, 0.0, Some(&pool));
+            for (i, (a, b)) in o1.iter().zip(&o2).enumerate() {
+                assert!((a - b).abs() <= 1e-5, "n{n} {window:?} out[{i}]: {a} vs {b}");
+            }
+            assert_eq!(i1.len(), i2.len());
+            for (i, (a, b)) in i1.iter().zip(&i2).enumerate() {
+                assert!((a - b).abs() <= 1e-5 * (1.0 + a.abs()), "n{n} {window:?} imp[{i}]: {a} vs {b}");
+            }
         }
     }
 }

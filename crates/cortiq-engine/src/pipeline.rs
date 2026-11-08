@@ -2258,11 +2258,11 @@ impl Pipeline {
         if env.is_some() || ChunkHost::here() != ChunkHost::Other {
             return prefill_chunk_rule(env, ChunkHost::here(), false);
         }
-        prefill_chunk_rule(
-            None,
-            ChunkHost::Other,
-            self.chunk_stack_facts().dense_on_discrete(),
-        )
+        let facts = self.chunk_stack_facts();
+        if facts.dense_on_cpu() {
+            return CPU_DENSE_PREFILL_CHUNK;
+        }
+        prefill_chunk_rule(None, ChunkHost::Other, facts.dense_on_discrete())
     }
 
     /// Prompt lookup in a speculative round (`CMF_SPEC_LOOKUP=0` leaves the
@@ -2376,6 +2376,12 @@ impl ChunkHost {
 /// prompt — see CHANGELOG 0.7.6 for the table.
 const DISCRETE_DENSE_PREFILL_CHUNK: usize = 512;
 
+/// Chunk for a plain dense stack with no GPU at all on x86-64: the AVX2
+/// q4tp batch kernel and the micro-GEMM chunk attend feed on wider
+/// panels. Spark-X2.6-4B q4tp, 1000-token prompt on 8 Zen 2 cores: 20.7
+/// tok/s at 48, 24.7 at 128, 25.0 at 256.
+const CPU_DENSE_PREFILL_CHUNK: usize = 128;
+
 /// The chunk-width rule. `dense_on_discrete` is true only for a plain
 /// dense transformer (full attention, dense FFN, no special stack) that
 /// is entirely resident on one discrete card — the one case measured
@@ -2415,6 +2421,16 @@ struct ChunkStackFacts {
 }
 
 impl ChunkStackFacts {
+    /// A plain dense stack on an x86-64 host with no GPU backend up
+    /// (O(1) stacks keep the width their trace was measured with).
+    fn dense_on_cpu(self) -> bool {
+        cfg!(target_arch = "x86_64")
+            && self.plain_dense
+            && !self.gpu_on
+            && !self.multi_gpu
+            && !self.o1
+    }
+
     fn dense_on_discrete(self) -> bool {
         self.plain_dense
             && self.discrete
@@ -3185,10 +3201,14 @@ impl Pipeline {
             .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
             || (std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() != Ok("0")
                 && !self.dense_batch_declined.load(std::sync::atomic::Ordering::Relaxed)
-                // Sliding-window stacks keep the walk: Spark-X2.6 q4tp on an RTX
-                // 2000 Ada read 8 000 tokens at 191 tok/s chunked, 130 batched.
-                && self.sliding_layers.is_none()
-                && self.swa.is_none()))
+                // Sliding-window stacks take the graph where its whole-run
+                // attend is tiled: Spark-X2.6 q4tp on an RTX 2000 Ada,
+                // 16 000 tokens, 182 tok/s chunked, 135 through the per-token
+                // batched arm, 390+ tiled. `CMF_DENSE_GRAPH_PREFILL=1` sends
+                // them through the graph regardless.
+                && ((self.sliding_layers.is_none() && self.swa.is_none())
+                    || crate::gpu::batched_attend_tiled()
+                    || std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() == Ok("1"))))
             && self.automatic_gpu_prefix().is_none()
     }
 
@@ -5256,6 +5276,15 @@ impl Pipeline {
     /// RTX 3090, 1000-token prompt: 51 tok/s at 32, 82 at 64, 95 at 128,
     /// 97 at 256; greedy output byte-identical to the 32-row chunks
     /// (every GEMM row and the k-looped recurrences are per position).
+    /// A dense sliding-window stack whose batched prefill attends with the
+    /// query-tiled kernels (the Spark-X2.6 class on a discrete wgpu card).
+    #[cfg(not(target_os = "macos"))]
+    fn tiled_sliding_batch(&self) -> bool {
+        (self.sliding_layers.is_some() || self.swa.is_some())
+            && !self.weights.layers.iter().any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
+            && crate::gpu::batched_attend_tiled()
+    }
+
     pub fn generation_batch_k(&self) -> usize {
         if let Some(k) = std::env::var("CMF_BATCH_K")
             .ok()
@@ -5282,10 +5311,18 @@ impl Pipeline {
             && crate::gpu::enabled_here()
             && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
         {
-            return 128;
+            return if self.tiled_sliding_batch() { 512 } else { 128 };
         }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
+            // A dense sliding-window stack on the tiled whole-run attend:
+            // 512 rows a submit (Spark-X2.6 q4tp on an RTX 2000 Ada, 4096
+            // tokens: 288 tok/s at 128, 317 at 512, the same greedy text;
+            // the tile holds 16 tokens, and a chunk is read against its K/V
+            // once per sub-run of whole tiles).
+            if self.tiled_sliding_batch() {
+                return 512;
+            }
             // 128 is measured on the dense hybrids; MoE stacks other than
             // the two expert codecs below keep the 32 their expert-grouped
             // prefill was measured at.
