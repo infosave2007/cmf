@@ -1,0 +1,7 @@
+Review this Python Flask handler for security problems and give a fixed version:
+
+@app.route("/user")
+def user():
+    uid = request.args.get("id")
+    row = db.execute("SELECT name, email FROM users WHERE id = " + uid).fetchone()
+    return "<h1>Hello " + row[0] + "</h1>"
