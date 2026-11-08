@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same greedy text; the 128-row tile's sums equal the 64-row kernel's bit for bit (test).
 
 ### Fixed
+- The speculation trial left the drafts after two empty rounds in a row and kept plain decode for 128 tokens. A good
+  head meets such a pair now and then; at the start of a chat turn it sent the whole turn to plain decode
+  (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, the second of five turns: 13.3 tok/s against 23–26 with the drafts). The
+  trial now needs three empty rounds, and a plain decision taken on fewer than five timed rounds is tried again after
+  32 tokens. One-shot answers unchanged.
 - `cortiq import-gguf` on a dense qwen35 GGUF with an MTP head (Qwen3.8-27B and its fine-tunes, e.g.
   OrcaCyber-Nano-1.0): llama.cpp counts the nextn block in `block_count`, and the importer made it a 65th trunk
   layer under the MoE arch name. The trunk is now `block_count − nextn_predict_layers`, the block lands under

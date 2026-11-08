@@ -1421,8 +1421,8 @@ struct SpecMon {
     fails: u32,
     /// Consecutive rounds that produced only their verifier-tip token (zero
     /// accepted MTP drafts). This is deliberately counted before the warm-up
-    /// round is excluded from timing: two real zero-acceptance rounds are
-    /// enough to stop charging an obviously losing speculative arm.
+    /// round is excluded from timing: `SPEC_ZERO_ROUNDS` real zero-acceptance
+    /// rounds stop charging an obviously losing speculative arm.
     zero_accept_rounds: u8,
     metal: bool,
 }
@@ -1827,6 +1827,19 @@ pub fn tail_repeat(seq: &[u32]) -> usize {
     best
 }
 
+/// Zero-acceptance rounds in a row that end a speculation trial early. Two
+/// was too few: a good head meets two empty rounds in a row now and then
+/// (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, 95 pinned rounds of code and a
+/// review: four such pairs, no triple), and at the start of a chat turn a
+/// pair sent the whole 200-token turn to plain decode, 13.4 tok/s against
+/// 25.9 with the drafts. A head that never holds costs one more round.
+const SPEC_ZERO_ROUNDS: u8 = 3;
+/// Tokens a plain decision taken on thin evidence (fewer than five timed
+/// rounds) stands before the rounds are tried again; one taken on a full
+/// trial stands for `SPEC_RECHECK_PLAIN`.
+const SPEC_RECHECK_THIN: usize = 32;
+const SPEC_RECHECK_PLAIN: usize = 128;
+
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
@@ -1857,7 +1870,12 @@ impl SpecMon {
         }
     }
     fn repeated_zero_acceptance(&self) -> bool {
-        self.zero_accept_rounds >= 2
+        self.zero_accept_rounds >= SPEC_ZERO_ROUNDS
+    }
+    /// When a plain decision is tried again: soon if the rounds behind it
+    /// were few (round 1 is not timed, so `n` counts one more).
+    fn recheck_plain_at(&self, generated: usize) -> usize {
+        generated + if self.n < 6 { SPEC_RECHECK_THIN } else { SPEC_RECHECK_PLAIN }
     }
     /// Has the plain phase timed enough tokens to decide?
     fn plain_done(&self, t0: std::time::Instant, gen0: usize, generated: usize) -> bool {
@@ -7828,7 +7846,7 @@ impl Pipeline {
                         spec_mon.fails = 0;
                         spec_trial = SpecTrial::Decided {
                             spec: keep,
-                            recheck_at: if keep { usize::MAX } else { generated + 128 },
+                            recheck_at: if keep { usize::MAX } else { spec_mon.recheck_plain_at(generated) },
                         };
                     }
                     SpecTrial::Decided { recheck_at, .. } if generated >= recheck_at => {
@@ -8776,11 +8794,11 @@ impl Pipeline {
                 let rounds = rounds + 1;
                 // A round that accepts no draft still has to run the MTP
                 // chain and a K+1 verifier, but emits only its verifier tip.
-                // After two such real rounds the speculative arm cannot win
-                // on any backend; time plain immediately rather than spend
-                // the remaining exploratory rounds on the same one-token
-                // result. A later 128-token re-check still gives changing
-                // context a chance to re-admit it.
+                // After `SPEC_ZERO_ROUNDS` such real rounds the speculative
+                // arm cannot win on any backend; time plain immediately
+                // rather than spend the remaining exploratory rounds on the
+                // same one-token result. A re-check soon after (the evidence
+                // is a few rounds) gives the text a chance to re-admit it.
                 if mon.repeated_zero_acceptance() {
                     tracing::info!(
                         "speculation trial: no accepted drafts in two rounds — timing plain"
@@ -8803,7 +8821,7 @@ impl Pipeline {
                         );
                         SpecTrial::Decided {
                             spec: keep,
-                            recheck_at: if keep { usize::MAX } else { generated + 128 },
+                            recheck_at: if keep { usize::MAX } else { mon.recheck_plain_at(generated) },
                         }
                     } else if mon.pays() {
                         // Metal: the rounds land enough tokens each that no
@@ -8859,7 +8877,7 @@ impl Pipeline {
                         );
                         SpecTrial::Decided {
                             spec: false,
-                            recheck_at: generated + 128,
+                            recheck_at: generated + SPEC_RECHECK_PLAIN,
                         }
                     } else {
                         trial
@@ -26201,7 +26219,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_trial_fast_exits_after_two_zero_acceptance_rounds() {
+    fn speculative_trial_fast_exits_after_three_zero_acceptance_rounds() {
         use super::{Pipeline, SpecMon, SpecTrial};
 
         let mut mon = SpecMon::default();
@@ -26218,12 +26236,21 @@ mod tests {
         );
         assert!(matches!(first, SpecTrial::Spec { rounds: 1, .. }));
 
+        // Two empty rounds in a row happen to a good head: the trial goes on.
         mon.round(1.0, 1);
         let second = Pipeline::spec_trial_round(first, &mut mon, 2);
         assert!(
-            matches!(second, SpecTrial::Plain { gen0: 2, .. }),
-            "two verifier-tip-only rounds must stop the losing MTP trial"
+            matches!(second, SpecTrial::Spec { rounds: 2, .. }),
+            "two empty rounds are not evidence enough to leave the drafts"
         );
+        mon.round(1.0, 1);
+        let third = Pipeline::spec_trial_round(second, &mut mon, 3);
+        assert!(
+            matches!(third, SpecTrial::Plain { gen0: 3, .. }),
+            "three verifier-tip-only rounds must stop the losing MTP trial"
+        );
+        // A plain decision on three rounds is tried again soon.
+        assert_eq!(mon.recheck_plain_at(3), 3 + super::SPEC_RECHECK_THIN);
 
         // One successful draft resets the streak, so a viable head retains
         // the normal five-round measurement budget.
