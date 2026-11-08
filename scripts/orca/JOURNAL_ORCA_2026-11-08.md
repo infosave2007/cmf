@@ -159,3 +159,17 @@ cache across processes would close most of it; `bench` spends ~20 s in a CPU `me
 
 HF: infosave/OrcaCyber-Nano-1.0-Turbo-cmf, orcacyber-nano-1.0-turbo.cmf 14 315 202 152 B, sha256
 6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7 (MATCH by get_paths_info from the pod).
+
+## Chat turns: the speculation trial (found after the final numbers)
+
+Five turns in one process (`run < turns.txt`, 200 tokens, greedy), default rule against a pinned depth 3, two passes:
+default 28.8 13.4 23.1 20.2 20.3 / 28.5 13.3 22.5 20.0 20.6; k3 29.9 25.9 22.7 20.3 20.0 / 29.6 25.6 22.6 20.4 19.9.
+Turn 2 (the review) decoded plain: trace "speculation trial: no accepted drafts in two rounds — timing plain" → "1.00
+tok/round in 107.7 ms vs plain 74.5 ms/tok — plain", kept for 128 tokens. Pinned rounds show such zero pairs inside
+good text (4 pairs in 95 rounds, no triple). Fix (pipeline.rs): `SPEC_ZERO_ROUNDS` 3, a plain decision on fewer
+than five timed rounds re-checked after 32 tokens (`SPEC_RECHECK_THIN`). Old → new, two passes: turn 2 13.3 → 26.2
+and 23.0; the other turns within noise; chat mean 21.0 → 22.7–23.7. One-shot five prompts: 28.9 26.3 23.5 20.2 19.5
+→ 28.8 26.9 23.5 19.8 19.6 (unchanged). Test `speculative_trial_fast_exits_after_three_zero_acceptance_rounds`.
+
+Still open: a one-shot answer with the default depth rule trails a pinned depth 3 by ~7 % on this card (the trial's
+plain tokens and the depth exploration; a per-device price cache across processes would close most of it).
