@@ -128,13 +128,36 @@ An answer of the file, `--greedy --no-think`:
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+## On a Mac
+
+MacBook Air M4 with 24 GB, native Metal: no fan, so long runs slow down as it heats, and the base M4's memory bus
+(120 GB/s by Apple's figure). Two switches, both off by default, make it faster: draft tokens and the Neural Engine
+for reading prompts.
+
+```bash
+CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
+```
+
+| answer | without drafts, tok/s | with drafts, tok/s | drafts kept |
+|---|---:|---:|---:|
+| a Rust function with tests | 6.3 | 14.6 | 67 % |
+| a security review of a Flask handler | 6.3 | 13.2 | 79 % |
+| triage of auth log lines | 6.2 | 11.9 | 59 % |
+| two paragraphs of prose | 6.1 | 10.0 | 68 % |
+| a Russian answer | 6.2 | 9.0 | 60 % |
+
+Greedy, 220 tokens, one answer a process; the same text with drafts and without in every pair.
+
+A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_ANE=1`, which reads the FFNs and part of the mixers on the Neural Engine beside the GPU (the same answer). 16 000 tokens, past the seal, with both switches: first token 211 s, decode 7.6 tok/s, a peak footprint of 5.8 GB beside the mapped weights, and a correct one-paragraph summary. An M4 Pro (273 GB/s) or M4 Max (up to 546 GB/s) was not measured.
+
 ## Options
 
 | option | meaning |
 |---|---|
 | `--o1-spill DIR` | a long prompt's rows in files in `DIR`, also `CMF_O1_SPILL` |
 | `--prompt-file FILE` | a prompt longer than a command line holds |
-| `CMF_GRAPH_SPEC=0` | no draft tokens |
+| `CMF_GRAPH_SPEC=1` / `=0` | draft tokens on / off (on by default on Vulkan and DX12, off on a Mac) |
+| `CMF_ANE=1` | on a Mac, read prompts on the Neural Engine beside the GPU |
 | `CMF_O1=off` | the plain model, with exact attention at any length |
 
 ## Limits
@@ -144,8 +167,8 @@ An answer of the file, `--greedy --no-think`:
 - OrcaCyber-Nano-1.0 is published only as GGUF. These weights are the Mix-15.7G file (an imatrix IQ4_XS/Q5_K/Q6_K
   mix) decoded and re-encoded as q4tp, so they carry both roundings.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact.
-- Measured on one card, an RTX 2000 Ada. The far field runs on Vulkan, DX12 and Metal; on the CPU the file runs
-  as the standard one.
+- Measured on one card, an RTX 2000 Ada, and on a MacBook Air M4. The far field runs on Vulkan, DX12 and Metal; on the
+  CPU the file runs as the standard one.
 
 ## How the file was made
 
@@ -268,13 +291,36 @@ NVIDIA RTX 2000 Ada (16 ГБ, 70 Вт), Vulkan, `cortiq bench --core`, 60 ток
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+### На Маке
+
+MacBook Air M4 с 24 ГБ, нативный Metal: без вентилятора, так что долгие прогоны замедляются по мере нагрева, и шина
+памяти базового M4 (120 ГБ/с по данным Apple). Два переключателя, оба выключены по умолчанию, ускоряют работу:
+черновые токены и Neural Engine для чтения промпта.
+
+```bash
+CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
+```
+
+| ответ | без черновиков, ток/с | с черновиками, ток/с | принято черновиков |
+|---|---:|---:|---:|
+| функция на Rust с тестами | 6,3 | 14,6 | 67 % |
+| ревью безопасности обработчика Flask | 6,3 | 13,2 | 79 % |
+| разбор строк auth-лога | 6,2 | 11,9 | 59 % |
+| два абзаца прозы | 6,1 | 10,0 | 68 % |
+| ответ на русском | 6,2 | 9,0 | 60 % |
+
+Жадно, 220 токенов, один ответ на процесс; текст с черновиками и без совпадает в каждой паре.
+
+Промпт в 3 600 токенов: первый токен через 68–71 с на GPU и через 28–29 с с `CMF_ANE=1`, который читает FFN и часть миксеров на Neural Engine рядом с GPU (ответ тот же). 16 000 токенов, после печати, с обоими переключателями: первый токен через 211 с, декод 7,6 ток/с, пиковый footprint 5,8 ГБ помимо отображённых весов и верное краткое содержание одним абзацем. M4 Pro (273 ГБ/с) и M4 Max (до 546 ГБ/с) не замерялись.
+
 ### Опции
 
 | опция | смысл |
 |---|---|
 | `--o1-spill DIR` | строки длинного промпта в файлах в `DIR`, также `CMF_O1_SPILL` |
 | `--prompt-file FILE` | промпт длиннее командной строки |
-| `CMF_GRAPH_SPEC=0` | без черновых токенов |
+| `CMF_GRAPH_SPEC=1` / `=0` | черновые токены вкл. / выкл. (по умолчанию включены на Vulkan и DX12, выключены на Маке) |
+| `CMF_ANE=1` | на Маке читать промпт на Neural Engine рядом с GPU |
 | `CMF_O1=off` | обычная модель с точным вниманием на любой длине |
 
 ### Ограничения
@@ -284,7 +330,8 @@ NVIDIA RTX 2000 Ada (16 ГБ, 70 Вт), Vulkan, `cortiq bench --core`, 60 ток
 - OrcaCyber-Nano-1.0 опубликована только в GGUF. Эти веса — файл Mix-15.7G (imatrix-смесь IQ4_XS/Q5_K/Q6_K),
   раскодированный и перекодированный в q4tp, так что в них оба округления.
 - После печати текст приблизителен: далёкое прошлое тускнеет, кроме строк, оставленных точными.
-- Замерено на одной карте, RTX 2000 Ada. Дальнее поле работает на Vulkan, DX12 и Metal; на CPU файл идёт как обычный.
+- Замерено на одной карте, RTX 2000 Ada, и на MacBook Air M4. Дальнее поле работает на Vulkan, DX12 и Metal; на CPU
+  файл идёт как обычный.
 
 ### Как сделан файл
 
@@ -399,13 +446,35 @@ NVIDIA RTX 2000 Ada（16 GB，70 W），Vulkan，`cortiq bench --core`，在该�
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+### 在 Mac 上
+
+MacBook Air M4，24 GB，原生 Metal：没有风扇，长时间运行会因发热变慢；基础款 M4 的内存总线为 120 GB/s（Apple 标称）。
+两个开关默认关闭，打开后更快：草稿 token，以及用 Neural Engine 读取提示。
+
+```bash
+CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
+```
+
+| 回答 | 无草稿 tok/s | 有草稿 tok/s | 草稿接受率 |
+|---|---:|---:|---:|
+| 带测试的 Rust 函数 | 6.3 | 14.6 | 67% |
+| Flask 处理函数的安全审查 | 6.3 | 13.2 | 79% |
+| 认证日志分诊 | 6.2 | 11.9 | 59% |
+| 两段散文 | 6.1 | 10.0 | 68% |
+| 俄语回答 | 6.2 | 9.0 | 60% |
+
+贪心解码，220 个 token，每个进程一个回答；每一对中有无草稿的文本完全相同。
+
+3 600 token 的提示：GPU 上首个 token 68–71 秒；开启 `CMF_ANE=1` 后为 28–29 秒，Neural Engine 在 GPU 旁读取 FFN 和部分混合层（回答相同）。16 000 token（超过封存点），两个开关都开：首个 token 211 秒，解码 7.6 tok/s，除映射的权重外峰值占用 5.8 GB，一段话的概括正确。M4 Pro（273 GB/s）和 M4 Max（最高 546 GB/s）未测量。
+
 ### 选项
 
 | 选项 | 含义 |
 |---|---|
 | `--o1-spill DIR` | 长提示的行存放在 `DIR` 的文件中，也可用 `CMF_O1_SPILL` |
 | `--prompt-file FILE` | 超过命令行长度的提示 |
-| `CMF_GRAPH_SPEC=0` | 不使用草稿 token |
+| `CMF_GRAPH_SPEC=1` / `=0` | 开启 / 关闭草稿 token（Vulkan 和 DX12 上默认开启，Mac 上默认关闭） |
+| `CMF_ANE=1` | 在 Mac 上用 GPU 旁的 Neural Engine 读取提示 |
 | `CMF_O1=off` | 普通模型，任何长度都用精确注意力 |
 
 ### 限制
@@ -413,7 +482,7 @@ NVIDIA RTX 2000 Ada（16 GB，70 W），Vulkan，`cortiq bench --core`，在该�
 - 只有文本：文件中不含 OrcaCyber 的视觉投影器（`mmproj`）和 DFlash2 草稿模型。在 16 GB 显卡上草稿模型没有空间与主干并存，而且那里 MTP 头更快。
 - OrcaCyber-Nano-1.0 只以 GGUF 形式发布。这些权重来自 Mix-15.7G 文件（imatrix 的 IQ4_XS/Q5_K/Q6_K 混合），解码后重新编码为 q4tp，因此带有两次舍入。
 - 超过封存点后文本是近似的：远处的内容会变淡，保留为精确的行除外。
-- 只在一块显卡 RTX 2000 Ada 上测量。远场可在 Vulkan、DX12 和 Metal 上运行；在 CPU 上该文件按普通文件运行。
+- 在一块显卡 RTX 2000 Ada 和一台 MacBook Air M4 上测量。远场可在 Vulkan、DX12 和 Metal 上运行；在 CPU 上该文件按普通文件运行。
 
 ### 文件是如何制作的
 

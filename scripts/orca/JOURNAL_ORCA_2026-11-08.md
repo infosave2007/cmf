@@ -173,3 +173,28 @@ and 23.0; the other turns within noise; chat mean 21.0 → 22.7–23.7. One-shot
 
 Still open: a one-shot answer with the default depth rule trails a pinned depth 3 by ~7 % on this card (the trial's
 plain tokens and the depth exploration; a per-device price cache across processes would close most of it).
+
+## MacBook Air M4 24 GB, native Metal (08.11, on the owner's «макбук свободен продолжай»)
+
+Download: `hf download` ran at 0.64 MB/s (one connection; Cloudflare 0.25 MB/s, GitHub 4 MB/s in parallel) →
+`scripts/orca/pdl.py`, 16 range connections, 7–15 MB/s, ~20 min, sha256 MATCH. Build of orca-nano 306 s.
+`mac_measure.sh`, one run at a time, 20 s pauses, greedy, 220 tokens:
+
+| prompt | plain | CMF_GRAPH_SPEC=1 | kept | text |
+|---|---:|---:|---:|---|
+| code | 6.3 | 14.6 | 67 % | same |
+| review | 6.3 | 13.2 | 79 % | same |
+| logs | 6.2 | 11.9 | 59 % | same |
+| prose | 6.1 | 10.0 | 68 % | same |
+| ru | 6.2 | 9.0 | 60 % | same |
+
+(Qwen3.8-27B Turbo on this Mac: plain 6.4, drafts 10.1–20.5.) 3 600 tokens: GPU first token 70.4 / 71.4 / 68.4 s, decode
+with drafts 8.1–8.2; `CMF_ANE=1` 34.0 (with the 4.7 s ANE program build) / 28.8 / 27.7 / 28.4 s, decode 6.5–7.5, same
+text. 16 000 tokens, ANE + drafts: first token 211.2 s, decode 7.6 tok/s, peak footprint 5.78 GB, correct summary
+(Ise-class battleship). Chat, five turns in one process, drafts: 13.4 10.6 10.4 9.1 8.7 — no turn fell to plain.
+
+Decode after an ANE prompt 7.1–7.5 against 8.2 after the GPU's, every pass, not heat (ANE run first, cold): the ANE
+staging walks the 14 GB mmap on the CPU (46.8 s user, 1.1 M page reclaims, 24 768 page faults ≈ 0.39 GB read back,
+footprint 4.0 vs 2.9 GB), so on a 24 GB Mac decode reads evicted weight pages back — ~0.5 s once on a 49-token answer,
+against ~40 s the ANE saves. Not acted on. No new Metal slow path needing code: the file takes the same graph as
+Qwen3.8-27B Turbo (F32 in_proj_a/b go through the f32 matvecs). HF card got the Mac section (EN/RU/ZH).
