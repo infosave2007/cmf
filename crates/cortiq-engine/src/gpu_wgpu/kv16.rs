@@ -281,6 +281,24 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e:?}"));
     }
 
+    /// The prefill GEMM with the q4tp loader and the device-scale store
+    /// parses and validates (naga, all capabilities), with no GPU.
+    #[test]
+    fn zi_mm_q4_validates() {
+        use super::super::zimage::{default_cfg, mm_src, Epi, MmCfg};
+        let g = MmCfg { q4: true, dscale: true, ..default_cfg(Epi::F32) };
+        assert!(g.valid());
+        let src = mm_src(g);
+        assert!(src.contains("fn qcode"));
+        let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{e}"));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
     #[test]
     fn half_src_rewrites_reads_and_stores() {
         let src = "@group(0) @binding(0) var<storage, read_write> kb : array<f32>;\n\

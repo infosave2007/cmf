@@ -60,6 +60,7 @@ pub(crate) mod amd_mv;
 /// Flash-decoding split attend of the decode graph (subgroups, all lanes).
 pub(crate) mod attend_fd;
 pub(crate) mod kv16;
+pub(crate) mod pf_flash;
 /// A sealed (far-field) layer's decode attention in two dispatches.
 pub(crate) mod o1_fd;
 pub(crate) mod dense_mv;
@@ -20025,6 +20026,8 @@ pub struct Ctx {
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
     q4tp_dq_f16: Option<wgpu::ComputePipeline>,
+    /// `q4tp_dq_f16` a thread per 32-column group (`q4tp_dq_f16_g`).
+    q4tp_dq_f16_g: Option<wgpu::ComputePipeline>,
     /// The int8 twin of `q4tp_dq_f16` — same plane, same GEMM after it.
     q8_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
@@ -22449,6 +22452,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
         .flatten();
+    let q4tp_dq_f16_g = (q4tp_dq_f16.is_some() && std::env::var("CMF_DQ_GROUP").as_deref() != Ok("0"))
+        .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq-g", "q4tp_dq_f16_g"))
+        .flatten();
     let q8_dq_f16 = q4tp_dq_f16
         .is_some()
         .then(|| mk_coop(COOP_DQ8_SRC, "q8-dq", "q8_dq_f16"))
@@ -23383,6 +23389,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
+        q4tp_dq_f16_g,
         q8_dq_f16,
         q4tp_mm_coop_f16,
         q4tp_mm_coop_f16_m128,
@@ -35672,7 +35679,12 @@ pub fn forward_batch_graph_at(
     let qdim = nh * max_hd * (1 + any_gate as usize);
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
     // batched GEMM outputs
-    let qraw_b = rwc(k * qdim);
+    // GEMM outputs hold whole 128-row tiles of a prompt chunk: the
+    // matrix-unit GEMM writes every row of its last tile, so a chunk whose
+    // length is not a multiple of 128 (a prompt's tail) could otherwise not
+    // take it (`encode_batch_zi_gemm` checks the size).
+    let kz = if k >= 128 { k.div_ceil(128) * 128 } else { k };
+    let qraw_b = rwc(kz * qdim);
     // Widest layer's K/V projection (per-layer KV heads and head width).
     let kv_rows = lws
         .iter()
@@ -35681,8 +35693,8 @@ pub fn forward_batch_graph_at(
             _ => None,
         })
         .fold(nkv * hd, usize::max);
-    let kb_b = rwc(k * kv_rows);
-    let vb_b = rwc(k * kv_rows);
+    let kb_b = rwc(kz * kv_rows);
+    let vb_b = rwc(kz * kv_rows);
     let attn_bb = rwc(k * nh * max_hd);
     // Gemma-4: normed + rotated Q rows of the run, and the sandwich-normed
     // mixer / FFN output before its residual add.
@@ -35691,17 +35703,17 @@ pub fn forward_batch_graph_at(
     let sand_ob2 = (g4p.is_none()
         && layers.iter().any(|l| l.attn_out_norm.is_some() || l.ffn_out_norm.is_some()))
     .then(|| rwc(k * hidden));
-    let qkv_b = rwc(k * gcdim);
-    let z_b = rwc(k * gnv * gdv);
+    let qkv_b = rwc(kz * gcdim);
+    let z_b = rwc(kz * gnv * gdv);
     let gdo_b = rwc(k * gnv * gdv);
-    let ob = rwc(k * hidden);
+    let ob = rwc(kz * hidden);
     // One more output for the layers with a hot triple.
     let hot_ob = lws
         .iter()
         .any(|lw| matches!(&lw.ffn, BFfn::Dense { hot: Some(_), .. }))
         .then(|| rwc(k * hidden));
-    let gbuf = rwc(k * inter);
-    let ubuf = rwc(k * inter);
+    let gbuf = rwc(kz * inter);
+    let ubuf = rwc(kz * inter);
     let abuf = rwc(k * inter);
     // per-position scratch
     let _n1_s = rwc(hidden);
@@ -36279,7 +36291,9 @@ pub fn forward_batch_graph_at(
             return;
         }
         ematb(enc, a, xs, ya, rows_a, cols);
+        zi_cast_reuse_next(true);
         ematb(enc, b, xs, yb, rows_b, cols);
+        zi_cast_reuse_next(false);
     };
     // SINGLE-row matvec for the per-token stretches inside the batch (the MoE
     // router/gate run once per token). `ematb` bakes nb=k into the GEMM: fed a
@@ -36612,6 +36626,8 @@ pub fn forward_batch_graph_at(
                     ematb(&mut enc, wk, &n1_p, &kb_b, lnkv * hd, hidden);
                     ematb(&mut enc, wv, &vin_p, &vb_b, lnkv * ldv, hidden);
                 } else {
+                    // k and v read the panel q's GEMM just cast.
+                    zi_cast_reuse_next(true);
                     ematb2(
                         &mut enc,
                         wk,
@@ -36623,6 +36639,7 @@ pub fn forward_batch_graph_at(
                         lnkv * ldv,
                         hidden,
                     );
+                    zi_cast_reuse_next(false);
                 }
                 bts!(enc, 6);
                 // An f16 mirror (`kv16`) has twins on the token-axis arm
@@ -38051,7 +38068,34 @@ pub fn forward_batch_graph_at(
                                     pass.dispatch_workgroups(nx as u32, ny as u32, 1);
                                 }
                             }
-                            let mut t0 = 0;
+                            // The causal flash kernel (`pf_flash`) over the planes:
+                            // the whole run in one dispatch, no partials.
+                            let pf = planes
+                                .as_ref()
+                                .and_then(|_| pf_flash::pipe(c))
+                                .filter(|_| hd == 256 && hpk <= 4 && 64 % hpk == 0);
+                            if let (Some((pfp, pfl)), Some((_, kpad, q16, k16, v16))) = (pf, planes.as_ref()) {
+                                let (kin, vin) = if half { (kbuf, vbuf) } else { (k16, v16) };
+                                let fu = unif(&[
+                                    nh as u32,
+                                    hpk as u32,
+                                    cap as u32,
+                                    p0 as u32,
+                                    k as u32,
+                                    *kpad as u32,
+                                    (attn_scale * std::f32::consts::LOG2_E).to_bits(),
+                                    nkv as u32,
+                                ]);
+                                let bgf = bind_pairs(
+                                    c,
+                                    pfl,
+                                    &[(0, q16), (1, kin), (2, vin), (3, &attn_bb), (4, &fu)],
+                                );
+                                pass.set_pipeline(pfp);
+                                pass.set_bind_group(0, &bgf, &[]);
+                                pass.dispatch_workgroups(k.div_ceil(tq) as u32, nkv as u32, 1);
+                            }
+                            let mut t0 = if pf.is_some() { k } else { 0 };
                             while t0 < k {
                                 let kk = sub_t.min(k - t0);
                                 let ab_u = unif(&[
@@ -38369,7 +38413,10 @@ pub fn forward_batch_graph_at(
                     let gpar = dense_mv::gdn(c)
                         .and_then(|g| g.par_k.as_ref())
                         .filter(|_| snap.is_none() && *kk <= 9);
-                    if let Some(gp) = gpar {
+                    // CMF_GDN_SKIP=conv,scan,norm — TIMING ONLY (garbage answer).
+                    let gskip = std::env::var("CMF_GDN_SKIP").unwrap_or_default();
+                    if gskip.contains("conv") {
+                    } else if let Some(gp) = gpar {
                         // conv reads the inputs, taps and ring and writes cq;
                         // ring_next reads the inputs and ring (auto layouts
                         // hold only what an entry point touches).
@@ -38505,6 +38552,46 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups(*nv as u32, 1, 1);
                         // gdn_step_k includes the gated RMS normalization.
                         needs_norm_k = false;
+                    } else if gskip.contains("scan") {
+                        needs_norm_k = true;
+                    } else if let Some((prep, scan2, cols)) = dense_mv::gdn(c)
+                        .and_then(|g| g.scan2.as_ref())
+                        .filter(|_| snap.is_none() && *dk == dense_mv::GDN_SCAN_DK && *nk * *dk * 2 + *nv * *dv == *cdim)
+                    {
+                        // The state-free part of every step for all rows at
+                        // once (`gdn_prep_k`), then the short-chain scan.
+                        let qk = rwc(k * *nk * 256);
+                        let kqb = rwc(k * *nk);
+                        let gbb = rwc(k * *nv * 2);
+                        let lp = prep.get_bind_group_layout(0);
+                        let bgp = bind_pairs(
+                            c,
+                            &lp,
+                            &[
+                                (0, &cq_s),
+                                (2, &a_bb),
+                                (3, &b_bb),
+                                (4, &alog),
+                                (5, &dtb),
+                                (9, &gd_pt),
+                                (10, &qk),
+                                (11, &kqb),
+                                (12, &gbb),
+                            ],
+                        );
+                        pass.set_pipeline(prep);
+                        pass.set_bind_group(0, &bgp, &[]);
+                        pass.dispatch_workgroups(*nk as u32, k as u32, 1);
+                        let ls2 = scan2.get_bind_group_layout(0);
+                        let bgs = bind_pairs(
+                            c,
+                            &ls2,
+                            &[(0, &cq_s), (7, s), (8, &gdo_b), (9, &gd_pt), (10, &qk), (11, &kqb), (12, &gbb)],
+                        );
+                        pass.set_pipeline(scan2);
+                        pass.set_bind_group(0, &bgs, &[]);
+                        pass.dispatch_workgroups(*nv as u32, (*dv).div_ceil(*cols) as u32, 1);
+                        needs_norm_k = true;
                     } else if let Some((scan, cols)) = dense_mv::gdn(c)
                         .and_then(|g| g.scan.as_ref())
                         .filter(|_| snap.is_none() && *dk == dense_mv::GDN_SCAN_DK)
@@ -38569,7 +38656,8 @@ pub fn forward_batch_graph_at(
                         // separate k-wide pass below.
                         needs_norm_k = true;
                     }
-                    if let Some(gp) = gpar.filter(|_| needs_norm_k && *dv <= 128) {
+                    if gskip.contains("norm") {
+                    } else if let Some(gp) = gpar.filter(|_| needs_norm_k && *dv <= 128) {
                         let l = gp.norm.get_bind_group_layout(0);
                         let bgn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: None,
@@ -38606,7 +38694,8 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups(*nv as u32, 1, 1);
                     }
                 }
-                bts!(enc, 5);
+                // "gdn-recur": conv, the recurrence and its norm (stamp 8).
+                bts!(enc, 8);
                 let Some(gdo_p) = prism_input_b(&mut enc, &[out], &gdo_b, nv * dv) else {
                     bgraph_refused("Prism transform unavailable for batched GDN output");
                     return batch_outcome(o1_started || state_started, false);
@@ -39439,7 +39528,7 @@ pub fn forward_batch_graph_at(
                 if let Ok(raw) = tstage.get_mapped_range(..bytes) {
                     let t: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&raw).to_vec();
                     drop(raw);
-                    let mut agg = [(0f64, 0u32); 8];
+                    let mut agg = [(0f64, 0u32); 9];
                     for i in 1..bts_lbl.len() {
                         let d = t[i].saturating_sub(t[i - 1]) as f64 * c.ts_period as f64 / 1e6;
                         let e = &mut agg[bts_lbl[i] as usize];
@@ -39448,6 +39537,7 @@ pub fn forward_batch_graph_at(
                     }
                     let names = [
                         "start", "o-proj", "gdn-out", "down", "norm", "attn-core|recur", "qkv|gdn-in", "gate-up|gdn-proj",
+                        "gdn-recur",
                     ];
                     let line: Vec<String> = agg
                         .iter()
@@ -42964,13 +43054,25 @@ fn zi_batch_pipes(
     Arc<wgpu::ComputePipeline>,
     zimage::MmCfg,
 )> {
-    let cfg = zimage::default_cfg(zimage::Epi::F32);
+    // The store applies the device activation scale itself (`dscale`):
+    // the separate `zi_post_scale` pass re-read and re-wrote every output,
+    // 6 of a 512-row Qwen3.5-4B chunk's 157 ms on an RTX A5000.
+    // `CMF_ZI_DSCALE=0` keeps the pass.
+    let cfg = zimage::MmCfg {
+        dscale: std::env::var("CMF_ZI_DSCALE").as_deref() != Ok("0"),
+        ..zimage::default_cfg(zimage::Epi::F32)
+    };
     if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;
     }
     let key = format!(
-        "zi_mm_{}x{}x{}_{}x{}_f32",
-        cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn
+        "zi_mm_{}x{}x{}_{}x{}_f32{}",
+        cfg.bm,
+        cfg.bn,
+        cfg.bk,
+        cfg.wm,
+        cfg.wn,
+        if cfg.dscale { "_ds" } else { "" }
     );
     let mm = prefill_pipe(c, &key, &zimage::mm_src(cfg), "zi_mm")?;
     let cvt = prefill_pipe(c, "zi_act_f16", ZI_ACT_SRC, "zi_act_f16")?;
@@ -42987,6 +43089,39 @@ fn zi_batch_pipes(
 /// multiples of the tile (the kernel runs unchecked and writes whole
 /// tiles), `cols` a multiple of 32, `y` holding all `k` rows.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// The next zi GEMM may reuse the activation panel and scale the one
+    /// before it left (`zi_cast_reuse_next`), when it read the same input.
+    static ZI_CAST_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ZI_CAST_LAST: std::cell::RefCell<Option<(wgpu::Buffer, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The zi_mm twin that reads the q4tp tensor itself (`MmCfg::q4`): the
+/// batched prefill dequantized every weight into an f16 plane per chunk
+/// first (26–36 of a 512-row Qwen3.5-4B chunk's 157 ms on an RTX A5000).
+/// `CMF_ZI_Q4=0` keeps the plane.
+fn zi_q4_pipe(c: &Ctx) -> Option<(Arc<wgpu::ComputePipeline>, zimage::MmCfg)> {
+    if std::env::var("CMF_ZI_Q4").as_deref() == Ok("0") {
+        return None;
+    }
+    let base = zi_batch_pipes(c)?.3;
+    let cfg = zimage::MmCfg { q4: true, ..base };
+    if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
+        return None;
+    }
+    let key = format!("zi_mm_{}x{}x{}_{}x{}_f32{}_q4", cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, if cfg.dscale { "_ds" } else { "" });
+    let mm = prefill_pipe(c, &key, &zimage::mm_src(cfg), "zi_mm")?;
+    Some((mm, cfg))
+}
+
+/// The next zi GEMM reads the input the previous one read (q, k and v of
+/// one norm; gate and up; GDN qkv and z): its absmax and f16 cast are
+/// skipped when the previous left that very panel.
+fn zi_cast_reuse_next(on: bool) {
+    ZI_CAST_REUSE.with(|f| f.set(on));
+}
+
 fn encode_batch_zi_gemm(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -42999,13 +43134,11 @@ fn encode_batch_zi_gemm(
 ) -> bool {
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
-    if k == 0
-        || k % 128 != 0
+    if k < 128
         || rows % 128 != 0
         || cols % 32 != 0
         || !can_dev_scale
         || c.q4tp_dq_f16.is_none()
-        || y.size() < (k * rows * 4) as u64
         || zimage::pad_rows(k) * cols.max(rows) >= (1usize << 31) / 4
     {
         return false;
@@ -43013,10 +43146,22 @@ fn encode_batch_zi_gemm(
     let Some((mm, cvt, post, cfg)) = zi_batch_pipes(c) else {
         return false;
     };
-    if k % cfg.bm as usize != 0 || rows % cfg.bn as usize != 0 || cols % cfg.bk as usize != 0 {
+    // Rows the tiles cover: a short last tile reads the cast panel's zero
+    // rows and writes into the output's spare rows, which must exist.
+    let km = k.div_ceil(cfg.bm as usize) * cfg.bm as usize;
+    if y.size() < (km * rows * 4) as u64 || rows % cfg.bn as usize != 0 || cols % cfg.bk as usize != 0 {
         return false;
     }
+    // The q4tp tensor straight into the tile (`MmCfg::q4`): no f16 plane.
+    let q4 = zi_q4_pipe(c).filter(|(_, g)| {
+        km % g.bm as usize == 0 && rows % g.bn as usize == 0 && cols % g.bk as usize == 0
+    });
+    let (mm, cfg) = match &q4 {
+        Some((p, g)) => (p.clone(), *g),
+        None => (mm, cfg),
+    };
     let mp = zimage::pad_rows(k);
+    let plane_bytes = (rows * cols * 2) as u64;
     let (asc, plane, bind_dq, act16) = {
         let mut sc = c.scratch.lock().unwrap();
         let asc = Scratch::ensure(
@@ -43026,8 +43171,13 @@ fn encode_batch_zi_gemm(
             wgpu::BufferUsages::STORAGE,
             "batch-ascale",
         );
-        let Some((plane, bind_dq)) = dq_f16_plane(c, &mut sc, weight, rows, cols) else {
-            return false;
+        let (plane, bind_dq) = if q4.is_some() {
+            (None, None)
+        } else {
+            let Some((plane, bind_dq)) = dq_f16_plane(c, &mut sc, weight, rows, cols) else {
+                return false;
+            };
+            (Some(plane), Some(bind_dq))
         };
         let act16 = Scratch::ensure(
             &c.device,
@@ -43038,14 +43188,47 @@ fn encode_batch_zi_gemm(
         );
         (asc, plane, bind_dq, act16)
     };
-    {
+    // The group-per-thread dequant's own group (its auto layout).
+    let dq_g_bind = match (plane.as_ref(), c.q4tp_dq_f16_g.as_ref()) {
+        (Some(plane), Some(pg)) => {
+            let u = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[cols as u32, rows as u32, 0u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pg.get_bind_group_layout(0),
+                entries: &[bind_buf(0, weight), bind_buf_off(1, plane, 0, plane_bytes), bind_buf(2, &u)],
+            }))
+        }
+        _ => None,
+    };
+    // CMF_ZI_SKIP=dq,amax,cast,post,mm — TIMING ONLY, the answer is
+    // garbage: drops that pass of every prompt GEMM to measure its share.
+    let skip = std::env::var("CMF_ZI_SKIP").unwrap_or_default();
+    if let Some(bind_dq) = bind_dq.as_ref().filter(|_| !skip.contains("dq")) {
         let mut pass = begin_pass_with(enc, Some("zi-dq"), None);
-        pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
-        pass.set_bind_group(0, &bind_dq, &[]);
-        let groups = ((rows * cols / 2) as u32).div_ceil(256);
-        pass.dispatch_workgroups(groups.min(MAX_WG), groups.div_ceil(MAX_WG), 1);
+        match (c.q4tp_dq_f16_g.as_ref(), dq_g_bind.as_ref()) {
+            (Some(pg), Some(bg)) => {
+                pass.set_pipeline(pg);
+                pass.set_bind_group(0, bg, &[]);
+                let groups = ((rows * cols / 32) as u32).div_ceil(256);
+                pass.dispatch_workgroups(groups.min(MAX_WG), groups.div_ceil(MAX_WG), 1);
+            }
+            _ => {
+                pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
+                pass.set_bind_group(0, bind_dq, &[]);
+                let groups = ((rows * cols / 2) as u32).div_ceil(256);
+                pass.dispatch_workgroups(groups.min(MAX_WG), groups.div_ceil(MAX_WG), 1);
+            }
+        }
     }
-    if !encode_act_absmax(c, enc, xs, k * cols, &asc) {
+    // The panel and scale the previous GEMM left, when it read this input.
+    let reuse = ZI_CAST_REUSE.with(|f| f.replace(false))
+        && ZI_CAST_LAST.with(|l| l.borrow().as_ref().is_some_and(|(b, kk, cc)| b == xs && *kk == k && *cc == cols));
+    ZI_CAST_LAST.with(|l| *l.borrow_mut() = Some((xs.clone(), k, cols)));
+    if !reuse && !skip.contains("amax") && !encode_act_absmax(c, enc, xs, k * cols, &asc) {
         return false;
     }
     let sent = 0xFFFF_FFFFu32;
@@ -43083,12 +43266,17 @@ fn encode_batch_zi_gemm(
     let bg_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zi-mm"),
         layout: &mm.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, &plane),
-            bind_buf(1, &act16),
-            bind_buf(2, y),
-            bind_buf(3, &mm_u),
-        ],
+        entries: &{
+            let w0 = match plane.as_ref() {
+                Some(pl) => bind_buf_off(0, pl, 0, plane_bytes),
+                None => bind_buf(0, weight),
+            };
+            if cfg.dscale {
+                vec![w0, bind_buf(1, &act16), bind_buf(2, y), bind_buf(3, &mm_u), bind_buf(4, &asc)]
+            } else {
+                vec![w0, bind_buf(1, &act16), bind_buf(2, y), bind_buf(3, &mm_u)]
+            }
+        },
     });
     let ps_u = uniform_u32x4(c, [(k * rows) as u32, sent, 0, 0]);
     let bg_ps = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -43096,20 +43284,20 @@ fn encode_batch_zi_gemm(
         layout: &post.get_bind_group_layout(0),
         entries: &[bind_buf(0, y), bind_buf(1, &ps_u), bind_buf(2, &asc)],
     });
-    {
+    if !reuse && !skip.contains("cast") {
         let mut pass = begin_pass_with(enc, Some("zi-act"), None);
         pass.set_pipeline(&cvt);
         pass.set_bind_group(0, &bg_cv, &[]);
         let wgs = ((mp * cols) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
-    {
+    if !skip.contains("mm") {
         let mut pass = begin_pass_with(enc, Some("zi-mm"), None);
         pass.set_pipeline(&mm);
         pass.set_bind_group(0, &bg_mm, &[]);
-        pass.dispatch_workgroups((rows / cfg.bn as usize) as u32, (k / cfg.bm as usize) as u32, 1);
+        pass.dispatch_workgroups((rows / cfg.bn as usize) as u32, (km / cfg.bm as usize) as u32, 1);
     }
-    {
+    if !cfg.dscale && !skip.contains("post") {
         let mut pass = begin_pass_with(enc, Some("zi-post"), None);
         pass.set_pipeline(&post);
         pass.set_bind_group(0, &bg_ps, &[]);
@@ -48759,6 +48947,52 @@ struct DqP { cols: u32, rows: u32, pad0: u32, pad1: u32 };
 
 fn dq_byte(off: u32) -> u32 {
     return (qsrc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+// One thread per 32-column group: its scale once, its 16 code bytes as one
+// vec4 load, its 32 halves as four vec4 stores. The pair kernel below ran a
+// thread per two weights — the group's code bits, the row's params and an
+// exp2 again for every pair: 31 of a 512-row Qwen3.5-4B prompt chunk's 157 ms
+// on an RTX A5000 for ~8.5 GB of traffic. Same arithmetic per weight.
+@group(0) @binding(0) var<storage, read> qsrc4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read_write> dst4: array<vec4<u32>>;
+// The pair kernel's `dq_byte` / params word, read through the vec4 view (one
+// entry point may bind slot 0 once).
+fn dq_word4(w: u32) -> u32 {
+    let v = qsrc4[w >> 2u];
+    let i = w & 3u;
+    return select(select(select(v.w, v.z, i == 2u), v.y, i == 1u), v.x, i == 0u);
+}
+fn dq_byte4(off: u32) -> u32 {
+    return (dq_word4(off >> 2u) >> ((off & 3u) * 8u)) & 0xFFu;
+}
+fn dq_pack(word: u32, sh: u32, scale: f32) -> u32 {
+    let b = (word >> sh) & 0xFFu;
+    return pack2x16float(vec2<f32>((f32(b & 0xFu) - 8.0) * scale, (f32(b >> 4u) - 8.0) * scale));
+}
+@compute @workgroup_size(256)
+fn q4tp_dq_f16_g(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let gi = gid.y * (65535u * 256u) + gid.x;
+    let gpr = dp.cols >> 5u;
+    if (gi >= dp.rows * gpr) { return; }
+    let row = gi / gpr;
+    let g = gi % gpr;
+    let params_b = dp.rows * gpr * 16u;
+    let codes_b = params_b + dp.rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let bit = g * 5u;
+    let cb = codes_b + row * cstride + (bit >> 3u);
+    let sh = bit & 7u;
+    var cv = dq_byte4(cb);
+    if (sh > 3u) { cv = cv | (dq_byte4(cb + 1u) << 8u); }
+    let pr = unpack2x16float(dq_word4((params_b >> 2u) + row));
+    let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+    let w = qsrc4[row * gpr + g];
+    let o = (row * dp.cols + g * 32u) >> 3u;
+    dst4[o] = vec4<u32>(dq_pack(w.x, 0u, scale), dq_pack(w.x, 8u, scale), dq_pack(w.x, 16u, scale), dq_pack(w.x, 24u, scale));
+    dst4[o + 1u] = vec4<u32>(dq_pack(w.y, 0u, scale), dq_pack(w.y, 8u, scale), dq_pack(w.y, 16u, scale), dq_pack(w.y, 24u, scale));
+    dst4[o + 2u] = vec4<u32>(dq_pack(w.z, 0u, scale), dq_pack(w.z, 8u, scale), dq_pack(w.z, 16u, scale), dq_pack(w.z, 24u, scale));
+    dst4[o + 3u] = vec4<u32>(dq_pack(w.w, 0u, scale), dq_pack(w.w, 8u, scale), dq_pack(w.w, 16u, scale), dq_pack(w.w, 24u, scale));
 }
 
 // One thread per PAIR of weights (a packed u32 of two f16).

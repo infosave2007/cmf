@@ -31,6 +31,10 @@ pub(crate) struct MvSg {
     /// The two-rows-a-subgroup kernel for the thin grids (`sg_prep`), built
     /// for `CMF_MV_SG_THIN=1` only (measured worse).
     pub(crate) thin: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// The plain matvec at two warps a workgroup, for the thin grids of a
+    /// card with at most 96 SMs (`sg_prep`; `CMF_MV_SG_SMALL=0` keeps the
+    /// eight-warp kernel for every shape).
+    pub(crate) small: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) gu: wgpu::ComputePipeline,
     pub(crate) gu_l: wgpu::BindGroupLayout,
     /// Rows a subgroup owns.
@@ -111,7 +115,7 @@ fn build(c: &Ctx) -> Option<MvSg> {
         Ok("4") => 4,
         _ => 8,
     };
-    let with_wpg = |src: &str| {
+    let at_wpg = |src: &str, wpg: usize| {
         src.replace(
             "@compute @workgroup_size(256)\nfn q4tp_mv_sg(",
             &format!("@compute @workgroup_size({})\nfn q4tp_mv_sg(", 32 * wpg),
@@ -120,6 +124,17 @@ fn build(c: &Ctx) -> Option<MvSg> {
         .replace("let per = 8u * 2u;", &format!("let per = {wpg}u * 2u;"))
         .replace("(blk * 8u + warp)", &format!("(blk * {wpg}u + warp)"))
     };
+    let with_wpg = |src: &str| at_wpg(src, wpg);
+    // Two warps a workgroup for the THIN grids on a smaller card: a
+    // 2560-row matrix is 80 eight-warp workgroups on a 64-SM RTX A5000,
+    // 320 this way (Qwen3.5-4B decode: FFN down 1449 -> 1117 us a token,
+    // GDN out 629 -> 512, o 226 -> 185; the wide matrices unchanged). The
+    // 188-SM PRO 6000 measured two warps worse (see `wpg` above), so only
+    // cards of at most 96 SMs take it.
+    let small_src = (wpg == 8
+        && c.sm_count.is_some_and(|n| n <= 96)
+        && std::env::var("CMF_MV_SG_SMALL").as_deref() != Ok("0"))
+        .then(|| at_wpg(src, 2));
     let src = with_wpg(src);
     debug_assert!(src.contains(&format!("@workgroup_size({})", 32 * wpg)));
     let (gsrc, grpw) = match grpw {
@@ -154,6 +169,12 @@ fn build(c: &Ctx) -> Option<MvSg> {
             let l = p.get_bind_group_layout(0);
             (p, l)
         });
+    let small = small_src
+        .and_then(|ss| compile(c, "cmf-mv-sg-w2", &ss, "q4tp_mv_sg"))
+        .map(|p| {
+            let l = p.get_bind_group_layout(0);
+            (p, l)
+        });
     let gu = compile(c, "cmf-gu-sg", gsrc, "q4tp_gu_sg")?;
     let dummy_y = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mv-sg-dummy"),
@@ -166,6 +187,7 @@ fn build(c: &Ctx) -> Option<MvSg> {
         mv,
         ks,
         thin,
+        small,
         gu_l: gu.get_bind_group_layout(0),
         gu,
         rpw,
@@ -247,9 +269,10 @@ pub(crate) fn sg_prep<'a>(
     let groups_rs: usize = (0..3).map(|i| r(i).div_ceil(per_rs)).sum();
     let sm = c.sm_count.unwrap_or(48) as usize;
     let thin_grid = groups_rs < 2 * sm;
-    let (pipe, layout, per) = match (p.ks.as_ref(), p.thin.as_ref()) {
-        (Some((ks, l)), _) if ks_forced() => (ks, l, 4),
-        (_, Some((t, l))) if thin_grid => (t, l, p.wpg * 2),
+    let (pipe, layout, per) = match (p.ks.as_ref(), p.thin.as_ref(), p.small.as_ref()) {
+        (Some((ks, l)), _, _) if ks_forced() => (ks, l, 4),
+        (_, Some((t, l)), _) if thin_grid => (t, l, p.wpg * 2),
+        (_, _, Some((sp, l))) if thin_grid => (sp, l, 2 * p.rpw),
         _ => (&p.mv, &p.mv_l, per_rs),
     };
     let groups: usize = (0..3).map(|i| r(i).div_ceil(per)).sum();
@@ -1839,6 +1862,10 @@ pub(crate) struct GdnSg {
     /// The register-resident prompt scan (`gdn_scan_k`, 128-wide keys):
     /// None under `CMF_GDN_SCAN=0` or on rejection.
     pub(crate) scan: Option<(wgpu::ComputePipeline, usize)>,
+    /// The short-chain scan (`gdn_scan2_k`) and its position-parallel
+    /// pre-pass (`gdn_prep_k`): None under `CMF_GDN_SCAN2=0` or on
+    /// rejection (the scan above then runs).
+    pub(crate) scan2: Option<(wgpu::ComputePipeline, wgpu::ComputePipeline, usize)>,
     /// Position-parallel twins of the chunk's conv and gated norm
     /// (`gdn_conv_par` + `gdn_ring_next`, `gdn_norm_rows`): None under
     /// `CMF_GDN_PAR=0` or on rejection.
@@ -2048,17 +2075,414 @@ fn gs_softplus(x: f32) -> f32 {
     s
 }
 
-/// Lanes a state column spans in `gdn_scan_k` (`CMF_GDN_SCAN_P`: 2, 4 or 8,
-/// default 8; `CMF_GDN_SCAN=0` turns the scan off).
+/// The pre-pass of `gdn_scan2_k`, a workgroup per (position, key head):
+/// the normalized q (times 1/sqrt(dk)) and k rows, their dot, and the
+/// decay g and gate beta of the key head's value heads — everything a scan
+/// step needs that does not depend on the state. Bindings: 0 the conv
+/// output, 2/3 a/b, 4/5 A_log/dt_bias, 9 the step uniform, 10 q|k rows
+/// `[pos][nk][2][128]`, 11 k·q `[pos][nk]`, 12 (g, beta) `[pos][nv]`.
+pub(crate) const GDN_PREP_WGSL: &str = r#"
+struct GsP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gp_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gp_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gp_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gp_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gp_dtb  : array<f32>;
+@group(0) @binding(9) var<uniform>             gp_p    : GsP;
+@group(0) @binding(10) var<storage, read_write> gp_qk  : array<f32>;
+@group(0) @binding(11) var<storage, read_write> gp_kq  : array<f32>;
+@group(0) @binding(12) var<storage, read_write> gp_gb  : array<vec2<f32>>;
+var<workgroup> gp_r: array<vec4<f32>, 4>;
+fn gp_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+@compute @workgroup_size(128)
+fn gdn_prep_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let ko = wid.x;
+    let i = wid.y;
+    let nk = gp_p.kd / 128u;
+    let base = i * gp_p.cdim + ko * 128u + t;
+    let q = gp_cq[base];
+    let k = gp_cq[base + gp_p.kd];
+    let s1 = subgroupAdd(q * q);
+    let s2 = subgroupAdd(k * k);
+    if ((t & 31u) == 0u) { gp_r[t >> 5u] = vec4<f32>(s1, s2, 0.0, 0.0); }
+    workgroupBarrier();
+    let tot = (gp_r[0] + gp_r[1]) + (gp_r[2] + gp_r[3]);
+    let invq = 1.0 / sqrt(tot.x + 1e-6) * (1.0 / sqrt(128.0));
+    let invk = 1.0 / sqrt(tot.y + 1e-6);
+    let qf = q * invq;
+    let kf = k * invk;
+    let ob = (i * nk + ko) * 256u + t;
+    gp_qk[ob] = qf;
+    gp_qk[ob + 128u] = kf;
+    let s3 = subgroupAdd(qf * kf);
+    workgroupBarrier();
+    if ((t & 31u) == 0u) { gp_r[t >> 5u].z = s3; }
+    workgroupBarrier();
+    if (t == 0u) { gp_kq[i * nk + ko] = (gp_r[0].z + gp_r[1].z) + (gp_r[2].z + gp_r[3].z); }
+    if (t < gp_p.rep) {
+        let h = ko * gp_p.rep + t;
+        let abo = i * gp_p.nv + h;
+        let g = exp(-exp(gp_alog[h]) * gp_softplus(gp_a[abo] + gp_dtb[h]));
+        let beta = 1.0 / (1.0 + exp(-gp_b[abo]));
+        gp_gb[abo] = vec2<f32>(g, beta);
+    }
+}
+"#;
+
+/// `gdn_scan_k` with the step reordered so its critical path is short:
+/// o_t = g·(S_{t-1}ᵀq) + (k·q)·δ, so both state dot products read the
+/// previous state at once, and the norms, g, beta and k·q come from
+/// `gdn_prep_k` instead of the chain. Per step on the chain: two
+/// independent partial dots, their `log2 P` shuffles side by side, δ, the
+/// state update. `gdn_scan_k` spent ~1.7 µs a position (21 of a 512-row
+/// Qwen3.5-4B chunk's GDN 24 ms on an RTX A5000) with the norms, a second
+/// reduction and the output dot behind every update.
+fn gdn_scan2_src(parts: usize) -> String {
+    let rows = GDN_SCAN_DK / parts;
+    let cols = 128 / parts;
+    let dk = GDN_SCAN_DK;
+    let mut s = String::new();
+    s.push_str(
+        r#"struct GsP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gs_cq   : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gs_S    : array<f32>;
+@group(0) @binding(8) var<storage, read_write> gs_o    : array<f32>;
+@group(0) @binding(9) var<uniform>             gs_p    : GsP;
+@group(0) @binding(10) var<storage, read>      gs_qk   : array<f32>;
+@group(0) @binding(11) var<storage, read>      gs_kq   : array<f32>;
+@group(0) @binding(12) var<storage, read>      gs_gb   : array<vec2<f32>>;
+"#,
+    );
+    let red2 = |a: &str, b: &str| {
+        let mut t = String::new();
+        let mut m = 1;
+        while m < parts {
+            t.push_str(&format!(
+                "        {a} = {a} + subgroupShuffleXor({a}, {m}u);
+        {b} = {b} + subgroupShuffleXor({b}, {m}u);
+"
+            ));
+            m *= 2;
+        }
+        t
+    };
+    let dot = |name: &str, a: &str, b: &str| {
+        let mut t = String::new();
+        for c in 0..4 {
+            let terms: Vec<String> = (c..rows).step_by(4).map(|u| format!("{a}{u} * {b}{u}")).collect();
+            t.push_str(&format!("        let {name}_{c} = {};
+", terms.join(" + ")));
+        }
+        t.push_str(&format!("        var {name} = ({name}_0 + {name}_1) + ({name}_2 + {name}_3);
+"));
+        t
+    };
+    let load = |at: &str, ind: &str| {
+        let mut t = String::new();
+        t.push_str(&format!("{ind}let qkb = (({at}) * nk + ko) * 256u + r * {rows}u;
+"));
+        for u in 0..rows {
+            t.push_str(&format!("{ind}nq{u} = gs_qk[qkb + {u}u];
+{ind}nk{u} = gs_qk[qkb + 128u + {u}u];
+"));
+        }
+        t.push_str(&format!(
+            "{ind}ngb = gs_gb[({at}) * gs_p.nv + h];
+{ind}nkq = gs_kq[({at}) * nk + ko];
+{ind}nvv = gs_cq[({at}) * gs_p.cdim + 2u * gs_p.kd + h * dv + j];
+"
+        ));
+        t
+    };
+    s.push_str(&format!(
+        "@compute @workgroup_size(128)
+fn gdn_scan2_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{
+    let r = lid % {parts}u;
+    let j0 = wid.y * {cols}u + lid / {parts}u;
+"
+    ));
+    s.push_str(
+        "    let dv = gs_p.dv;
+    let nk = gs_p.kd / 128u;
+    let live = wid.x < gs_p.nv && j0 < dv;
+    let h = select(0u, wid.x, live);
+    let j = select(0u, j0, live);
+    let ko = h / gs_p.rep;
+",
+    );
+    s.push_str(&format!("    let sb = h * {dk}u * dv + r * {rows}u * dv + j;
+"));
+    for u in 0..rows {
+        s.push_str(&format!("    var s{u} = gs_S[sb + {u}u * dv];
+"));
+    }
+    for u in 0..rows {
+        s.push_str(&format!("    var nq{u} = 0.0;
+    var nk{u} = 0.0;
+"));
+    }
+    s.push_str("    var ngb = vec2<f32>(0.0);
+    var nkq = 0.0;
+    var nvv = 0.0;
+    if (gs_p.kb > 0u) {
+");
+    s.push_str(&load("0u", "        "));
+    s.push_str("    }
+    for (var i = 0u; i < gs_p.kb; i = i + 1u) {
+");
+    for u in 0..rows {
+        s.push_str(&format!("        let q{u} = nq{u};
+        let k{u} = nk{u};
+"));
+    }
+    s.push_str("        let gb = ngb;
+        let kq = nkq;
+        let vt = nvv;
+        if (i + 1u < gs_p.kb) {
+");
+    s.push_str(&load("i + 1u", "            "));
+    s.push_str("        }
+");
+    s.push_str(&dot("kv", "s", "k"));
+    s.push_str(&dot("sq", "s", "q"));
+    s.push_str(&red2("kv", "sq"));
+    s.push_str("        let g = gb.x;
+        let dlt = (vt - g * kv) * gb.y;
+");
+    s.push_str("        if (live && r == 0u) { gs_o[i * gs_p.nv * dv + h * dv + j] = g * sq + kq * dlt; }
+");
+    for u in 0..rows {
+        s.push_str(&format!("        s{u} = g * s{u} + k{u} * dlt;
+"));
+    }
+    s.push_str("    }
+    if (live) {
+");
+    for u in 0..rows {
+        s.push_str(&format!("        gs_S[sb + {u}u * dv] = s{u};
+"));
+    }
+    s.push_str("    }
+}
+");
+    s
+}
+
+/// Positions a `gdn_scan3_k` block stages at once.
+const SCAN3_T: usize = 16;
+
+/// `gdn_scan2_k` with each block of 16 positions staged in workgroup
+/// memory: the workgroup loads the next block's q|k rows (from
+/// `gdn_prep_k`), its own v columns, g, beta and k·q with coalesced vec4
+/// loads while it runs the current block, and a step reads them back with
+/// ten vec4 shared loads. `gdn_scan2_k` fetched every step's 32 values a
+/// lane from device memory one step ahead — the prep rows of a 512-row
+/// chunk (8 MB) do not stay in a 6 MB L2, and the scan ran at ~1.6 µs a
+/// position whatever the work a lane did. q|k groups of 16 floats sit at a
+/// stride of 20, so the eight row parts of a warp's lanes hit distinct
+/// banks. Same arithmetic as `gdn_scan2_k`.
+fn gdn_scan3_src(parts: usize) -> String {
+    let rows = GDN_SCAN_DK / parts;
+    let cols = 128 / parts;
+    let dk = GDN_SCAN_DK;
+    let t_blk = SCAN3_T;
+    // Shared row of a position, in vec4: q|k 16 groups × 5, v cols/4, (g, beta, kq, 0).
+    let qk4 = 16 * 5;
+    let v4 = cols / 4;
+    let st4 = qk4 + v4 + 1;
+    let per = t_blk * (64 + v4); // vec4 loads of a block
+    let nld = per.div_ceil(128);
+    let mut s = String::new();
+    s.push_str(
+        r#"struct GsP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gs_cq   : array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> gs_S    : array<f32>;
+@group(0) @binding(8) var<storage, read_write> gs_o    : array<f32>;
+@group(0) @binding(9) var<uniform>             gs_p    : GsP;
+@group(0) @binding(10) var<storage, read>      gs_qk   : array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read>      gs_kq   : array<f32>;
+@group(0) @binding(12) var<storage, read>      gs_gb   : array<vec2<f32>>;
+"#,
+    );
+    s.push_str(&format!("var<workgroup> sh: array<vec4<f32>, {}>;
+", t_blk * st4));
+    let red2 = |a: &str, b: &str| {
+        let mut t = String::new();
+        let mut m = 1;
+        while m < parts {
+            t.push_str(&format!(
+                "            {a} = {a} + subgroupShuffleXor({a}, {m}u);
+            {b} = {b} + subgroupShuffleXor({b}, {m}u);
+"
+            ));
+            m *= 2;
+        }
+        t
+    };
+    // A block's loads into registers: vec4 index v → (position, slot).
+    let load = |blk: &str, s: &mut String| {
+        for l in 0..nld {
+            s.push_str(&format!(
+                "        {{ let vi = lid + {o}u; var x = vec4<f32>(0.0); let tp = vi / {w}u; let c = vi % {w}u; let pos = {blk} * {t_blk}u + tp; if (vi < {per}u && pos < gs_p.kb) {{ if (c < 64u) {{ x = gs_qk[(pos * nk + ko) * 64u + c]; }} else {{ x = gs_cq[(pos * gs_p.cdim + 2u * gs_p.kd + h * dv + col0) / 4u + c - 64u]; }} }} ld{l} = x; }}
+",
+                o = l * 128,
+                w = 64 + v4
+            ));
+        }
+        s.push_str(&format!(
+            "        {{ let pos = {blk} * {t_blk}u + lid; var e = vec4<f32>(0.0); if (lid < {t_blk}u && pos < gs_p.kb) {{ let gb = gs_gb[pos * gs_p.nv + h]; e = vec4<f32>(gb.x, gb.y, gs_kq[pos * nk + ko], 0.0); }} lde = e; }}
+"
+        ));
+    };
+    s.push_str(&format!(
+        "@compute @workgroup_size(128)
+fn gdn_scan3_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{
+    let r = lid % {parts}u;
+    let jl = lid / {parts}u;
+    let col0 = wid.y * {cols}u;
+    let j0 = col0 + jl;
+"
+    ));
+    s.push_str(
+        "    let dv = gs_p.dv;
+    let nk = gs_p.kd / 128u;
+    let live = wid.x < gs_p.nv && j0 < dv;
+    let h = min(wid.x, gs_p.nv - 1u);
+    let j = select(0u, j0, live);
+    let ko = h / gs_p.rep;
+",
+    );
+    s.push_str(&format!("    let sb = h * {dk}u * dv + r * {rows}u * dv + j;
+"));
+    for u in 0..rows {
+        s.push_str(&format!("    var s{u} = 0.0; if (live) {{ s{u} = gs_S[sb + {u}u * dv]; }}
+"));
+    }
+    for l in 0..nld {
+        s.push_str(&format!("    var ld{l} = vec4<f32>(0.0);
+"));
+    }
+    s.push_str("    var lde = vec4<f32>(0.0);
+");
+    s.push_str(&format!("    let nb = (gs_p.kb + {}u) / {t_blk}u;
+", t_blk - 1));
+    load("0u", &mut s);
+    s.push_str("    for (var b = 0u; b < nb; b = b + 1u) {
+        workgroupBarrier();
+");
+    // registers → shared (q|k groups at stride 5 vec4, then v, then e)
+    for l in 0..nld {
+        s.push_str(&format!(
+            "        {{ let vi = lid + {o}u; let tp = vi / {w}u; let c = vi % {w}u; if (vi < {per}u) {{ var d = tp * {st4}u + {qk4}u + (c - 64u); if (c < 64u) {{ d = tp * {st4}u + (c / 4u) * 5u + c % 4u; }} sh[d] = ld{l}; }} }}
+",
+            o = l * 128,
+            w = 64 + v4
+        ));
+    }
+    s.push_str(&format!("        if (lid < {t_blk}u) {{ sh[lid * {st4}u + {}u] = lde; }}
+", qk4 + v4));
+    s.push_str("        workgroupBarrier();
+        if (b + 1u < nb) {
+");
+    load("(b + 1u)", &mut s);
+    s.push_str("        }
+");
+    s.push_str(&format!("        let tn = min({t_blk}u, gs_p.kb - b * {t_blk}u);
+"));
+    s.push_str("        for (var t = 0u; t < tn; t = t + 1u) {
+");
+    s.push_str(&format!("            let ro = t * {st4}u;
+"));
+    let g4 = rows / 4;
+    for v in 0..g4 {
+        // part r's group of 16 rows: q group r, k group 8 + r (for 128/16 = 8 groups each)
+        let _ = v;
+    }
+    // q|k element e of part r: group (r*rows + e) / 16, offset % 16
+    for u4 in 0..g4 {
+        s.push_str(&format!(
+            "            let qv{u4} = sh[ro + ((r * {rows}u + {e}u) / 16u) * 5u + ((r * {rows}u + {e}u) % 16u) / 4u];
+            let kv{u4} = sh[ro + (8u + (r * {rows}u + {e}u) / 16u) * 5u + ((r * {rows}u + {e}u) % 16u) / 4u];
+",
+            e = u4 * 4
+        ));
+    }
+    s.push_str(&format!(
+        "            let vq = sh[ro + {qk4}u + jl / 4u];
+            let vt = select(select(select(vq.w, vq.z, (jl & 3u) == 2u), vq.y, (jl & 3u) == 1u), vq.x, (jl & 3u) == 0u);
+            let e = sh[ro + {}u];
+",
+        qk4 + v4
+    ));
+    // dots: kv = Σ s_u k_u, sq = Σ s_u q_u, four chains each
+    let comp = ["x", "y", "z", "w"];
+    let mut kv_terms = vec![Vec::new(); 4];
+    let mut sq_terms = vec![Vec::new(); 4];
+    for u in 0..rows {
+        kv_terms[u % 4].push(format!("s{u} * kv{}.{}", u / 4, comp[u % 4]));
+        sq_terms[u % 4].push(format!("s{u} * qv{}.{}", u / 4, comp[u % 4]));
+    }
+    for c in 0..4 {
+        s.push_str(&format!("            let kd_{c} = {};
+            let sd_{c} = {};
+", kv_terms[c].join(" + "), sq_terms[c].join(" + ")));
+    }
+    s.push_str("            var kvs = (kd_0 + kd_1) + (kd_2 + kd_3);
+            var sqs = (sd_0 + sd_1) + (sd_2 + sd_3);
+");
+    s.push_str(&red2("kvs", "sqs"));
+    s.push_str("            let g = e.x;
+            let dlt = (vt - g * kvs) * e.y;
+");
+    s.push_str(&format!(
+        "            if (live && r == 0u) {{ gs_o[(b * {t_blk}u + t) * gs_p.nv * dv + h * dv + j] = g * sqs + e.z * dlt; }}
+"
+    ));
+    for u in 0..rows {
+        s.push_str(&format!("            s{u} = g * s{u} + kv{}.{} * dlt;
+", u / 4, comp[u % 4]));
+    }
+    s.push_str("        }
+    }
+    if (live) {
+");
+    for u in 0..rows {
+        s.push_str(&format!("        gs_S[sb + {u}u * dv] = s{u};
+"));
+    }
+    s.push_str("    }
+}
+");
+    s
+}
+
+/// Lanes a state column spans in the prompt scans (`CMF_GDN_SCAN_P`: 2, 4
+/// or 8, default 4; `CMF_GDN_SCAN=0` turns the scans off).
 fn gdn_scan_parts() -> usize {
     match std::env::var("CMF_GDN_SCAN").as_deref() {
         Ok("0") => 0,
-        // RTX A5000, Qwen3.5-4B, 512-row chunks: 31 ms of the chunk's GDN
-        // stage at 8 lanes a column, 34 at 4, 38 at 2.
+        // RTX A5000, Qwen3.5-4B, 512-row chunks, the block-staged scan:
+        // 12.4 ms of the chunk's GDN stage at 4 lanes a column, 12.9 at 8
+        // (the one-step-prefetch scans: 21.4 / 22.0, 58 at 2).
         _ => match std::env::var("CMF_GDN_SCAN_P").as_deref() {
-            Ok("4") => 4,
+            Ok("8") => 8,
             Ok("2") => 2,
-            _ => 8,
+            _ => 4,
         },
     }
 }
@@ -2074,6 +2498,19 @@ fn build_gdn(c: &Ctx) -> Option<GdnSg> {
         .then(|| compile(c, "cmf-gdn-scan", &gdn_scan_src(parts), "gdn_scan_k"))
         .flatten()
         .map(|p| (p, 128 / parts));
+    let scan2 = (parts > 0 && std::env::var("CMF_GDN_SCAN2").as_deref() != Ok("0"))
+        .then(|| {
+            let prep = compile(c, "cmf-gdn-prep", GDN_PREP_WGSL, "gdn_prep_k")?;
+            // The block-staged scan by default; `CMF_GDN_SCAN3=0` keeps
+            // the one-step prefetch.
+            let sc = if std::env::var("CMF_GDN_SCAN3").as_deref() != Ok("0") {
+                compile(c, "cmf-gdn-scan3", &gdn_scan3_src(parts), "gdn_scan3_k")?
+            } else {
+                compile(c, "cmf-gdn-scan2", &gdn_scan2_src(parts), "gdn_scan2_k")?
+            };
+            Some((prep, sc, 128 / parts))
+        })
+        .flatten();
     let par_k = (std::env::var("CMF_GDN_PAR").as_deref() != Ok("0"))
         .then(|| {
             Some(GdnPar {
@@ -2089,6 +2526,7 @@ fn build_gdn(c: &Ctx) -> Option<GdnSg> {
         park_l: park.get_bind_group_layout(0),
         park,
         scan,
+        scan2,
         par_k,
     })
 }
@@ -2116,6 +2554,17 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("parts {parts}: {e:?}"));
             assert!(s.contains(&format!("var s{} = gs_S", GDN_SCAN_DK / parts - 1)));
+        }
+        for parts in [4, 8] {
+            for src in [gdn_scan2_src(parts), gdn_scan3_src(parts), GDN_PREP_WGSL.to_string()] {
+                let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{e}"));
+                wgpu::naga::valid::Validator::new(
+                    wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::all(),
+                )
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            }
         }
         let module = wgpu::naga::front::wgsl::parse_str(GDN_PAR_WGSL).expect("gdn par parses");
         wgpu::naga::valid::Validator::new(
