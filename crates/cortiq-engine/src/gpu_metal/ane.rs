@@ -1442,6 +1442,22 @@ pub(crate) fn ffn_for(c: &Ctx, layers: Vec<LayerProjs>) -> Option<Arc<AneFfn>> {
     }
 }
 
+/// The prompt is read: the ANE's surfaces go back. They are a layer's FFN and mixer weights in
+/// fp16, two sets of them (about 1.5 GB for a 27B), and decode never reads them; on a MacBook Air
+/// M4 with 24 GB they pushed the 14 GB weight map out of memory, so decode after a 16 000-token
+/// ANE prompt ran at 6.4 tok/s (3.6 M page faults) against 8.4 after the GPU's (8.6 K). The next
+/// prompt builds them again. Only when nothing else holds them (a staging thread in flight keeps
+/// them); `CMF_ANE_KEEP=1` keeps them for a process that reads prompt after prompt.
+pub(crate) fn release_idle() {
+    if std::env::var("CMF_ANE_KEEP").as_deref() == Ok("1") {
+        return;
+    }
+    let mut slot = ANE.lock().unwrap();
+    if slot.as_ref().is_some_and(|a| Arc::strong_count(a) == 1) {
+        *slot = None;
+    }
+}
+
 /// The ANE stopped: the GPU's for the rest of the process, and nobody waits for it.
 pub(crate) fn retire(why: &str) {
     if !REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {

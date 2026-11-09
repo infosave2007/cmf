@@ -131,8 +131,8 @@ An answer of the file, `--greedy --no-think`:
 ## On a Mac
 
 MacBook Air M4 with 24 GB, native Metal: no fan, so long runs slow down as it heats, and the base M4's memory bus
-(120 GB/s by Apple's figure). Two switches, both off by default, make it faster: draft tokens and the Neural Engine
-for reading prompts.
+(120 GB/s by Apple's figure). Two switches make it faster: draft tokens, which are on by default from
+[infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) on (in cortiq 0.8.63 set `CMF_GRAPH_SPEC=1`), and the Neural Engine for reading prompts.
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -148,7 +148,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 Greedy, 220 tokens, one answer a process; the same text with drafts and without in every pair.
 
-A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_ANE=1`, which reads the FFNs and part of the mixers on the Neural Engine beside the GPU (the same answer). 16 000 tokens, past the seal, with both switches: first token 211 s, decode 7.6 tok/s, a peak footprint of 5.8 GB beside the mapped weights, and a correct one-paragraph summary. An M4 Pro (273 GB/s) or M4 Max (up to 546 GB/s) was not measured.
+A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_ANE=1`, which reads the FFNs and part of the mixers on the Neural Engine beside the GPU (the same answer). 16 000 tokens, past the seal, with both switches: first token 205–211 s, decode 8.2 tok/s against 5.8 without drafts (#100 gives the Neural Engine's memory back once the prompt is read; before it, 6.4), a peak footprint of 5.8 GB beside the mapped weights, and a correct one-paragraph summary. An M4 Pro (273 GB/s) or M4 Max (up to 546 GB/s) was not measured.
 
 ## Options
 
@@ -294,8 +294,9 @@ NVIDIA RTX 2000 Ada (16 ГБ, 70 Вт), Vulkan, `cortiq bench --core`, 60 ток
 ### На Маке
 
 MacBook Air M4 с 24 ГБ, нативный Metal: без вентилятора, так что долгие прогоны замедляются по мере нагрева, и шина
-памяти базового M4 (120 ГБ/с по данным Apple). Два переключателя, оба выключены по умолчанию, ускоряют работу:
-черновые токены и Neural Engine для чтения промпта.
+памяти базового M4 (120 ГБ/с по данным Apple). Ускоряют работу два переключателя: черновые токены, включённые по
+умолчанию начиная с [infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) (в cortiq 0.8.63 задайте `CMF_GRAPH_SPEC=1`), и Neural Engine для
+чтения промпта.
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -311,7 +312,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 Жадно, 220 токенов, один ответ на процесс; текст с черновиками и без совпадает в каждой паре.
 
-Промпт в 3 600 токенов: первый токен через 68–71 с на GPU и через 28–29 с с `CMF_ANE=1`, который читает FFN и часть миксеров на Neural Engine рядом с GPU (ответ тот же). 16 000 токенов, после печати, с обоими переключателями: первый токен через 211 с, декод 7,6 ток/с, пиковый footprint 5,8 ГБ помимо отображённых весов и верное краткое содержание одним абзацем. M4 Pro (273 ГБ/с) и M4 Max (до 546 ГБ/с) не замерялись.
+Промпт в 3 600 токенов: первый токен через 68–71 с на GPU и через 28–29 с с `CMF_ANE=1`, который читает FFN и часть миксеров на Neural Engine рядом с GPU (ответ тот же). 16 000 токенов, после печати, с обоими переключателями: первый токен через 205–211 с, декод 8,2 ток/с против 5,8 без черновиков (#100 возвращает память Neural Engine, как только промпт прочитан; до него — 6,4), пиковый footprint 5,8 ГБ помимо отображённых весов и верное краткое содержание одним абзацем. M4 Pro (273 ГБ/с) и M4 Max (до 546 ГБ/с) не замерялись.
 
 ### Опции
 
@@ -449,7 +450,7 @@ NVIDIA RTX 2000 Ada（16 GB，70 W），Vulkan，`cortiq bench --core`，在该�
 ### 在 Mac 上
 
 MacBook Air M4，24 GB，原生 Metal：没有风扇，长时间运行会因发热变慢；基础款 M4 的内存总线为 120 GB/s（Apple 标称）。
-两个开关默认关闭，打开后更快：草稿 token，以及用 Neural Engine 读取提示。
+两个开关可以提速：草稿 token（从 [infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) 起默认开启；cortiq 0.8.63 中请设置 `CMF_GRAPH_SPEC=1`），以及用 Neural Engine 读取提示。
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -465,7 +466,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 贪心解码，220 个 token，每个进程一个回答；每一对中有无草稿的文本完全相同。
 
-3 600 token 的提示：GPU 上首个 token 68–71 秒；开启 `CMF_ANE=1` 后为 28–29 秒，Neural Engine 在 GPU 旁读取 FFN 和部分混合层（回答相同）。16 000 token（超过封存点），两个开关都开：首个 token 211 秒，解码 7.6 tok/s，除映射的权重外峰值占用 5.8 GB，一段话的概括正确。M4 Pro（273 GB/s）和 M4 Max（最高 546 GB/s）未测量。
+3 600 token 的提示：GPU 上首个 token 68–71 秒；开启 `CMF_ANE=1` 后为 28–29 秒，Neural Engine 在 GPU 旁读取 FFN 和部分混合层（回答相同）。16 000 token（超过封存点），两个开关都开：首个 token 205–211 秒，解码 8.2 tok/s，无草稿时 5.8（#100 在提示读完后归还 Neural Engine 的内存；此前为 6.4），除映射的权重外峰值占用 5.8 GB，一段话的概括正确。M4 Pro（273 GB/s）和 M4 Max（最高 546 GB/s）未测量。
 
 ### 选项
 
