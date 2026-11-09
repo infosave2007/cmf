@@ -50,6 +50,19 @@ fn pair() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_ATTEND_FD_PAIR").as_deref() == Ok("1"))
 }
 
+/// Cache rows a loop step of the blocked loop (`CMF_ATTEND_FD_BLK`: 1, 2,
+/// 4; default 4): the block's K and V rows all load before its first
+/// score, and the running max moves once a block (B + 1 exponentials a
+/// head instead of 2·B).
+fn blk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("CMF_ATTEND_FD_BLK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 4,
+    })
+}
+
 /// Positions from which the decode graph takes this kernel instead of the
 /// one-workgroup-per-head attend (`CMF_ATTEND_FD_MIN`, default 16: at 41
 /// positions it already decoded 196 tok/s against the old kernel's 163–188).
@@ -176,7 +189,36 @@ fn src(hpk: usize, hd: usize, half: bool) -> String {
             }
         }
     };
-    if pair() {
+    let nb = blk();
+    if !pair() && nb > 1 {
+        s.push_str(&format!("    var p = p0;\n    loop {{\n        if (p + {}u >= pend) {{ break; }}\n", nb - 1));
+        for b in 0..nb {
+            s.push_str(&format!("        let r{b} = kbase + (p + {b}u) * hd4;\n"));
+        }
+        for b in 0..nb {
+            load(&format!("b{b}_"), &format!("r{b}"), &mut s);
+        }
+        for h in 0..hpk {
+            for b in 0..nb {
+                let d: Vec<String> = (0..slots).map(|j| format!("dot(q{h}_{j}, kb{b}_{j})")).collect();
+                s.push_str(&format!("        let s{h}_{b} = subgroupAdd({}) * scale;\n", d.join(" + ")));
+            }
+            let mx = (0..nb).fold(format!("m{h}"), |acc, b| format!("max({acc}, s{h}_{b})"));
+            s.push_str(&format!("        let n{h} = {mx};\n        let f{h} = exp(m{h} - n{h});\n"));
+            for b in 0..nb {
+                s.push_str(&format!("        let w{h}_{b} = exp(s{h}_{b} - n{h});\n"));
+            }
+            let ws: Vec<String> = (0..nb).map(|b| format!("w{h}_{b}")).collect();
+            s.push_str(&format!("        l{h} = l{h} * f{h} + ({});\n        m{h} = n{h};\n", ws.join(" + ")));
+            for j in 0..slots {
+                let vs: Vec<String> = (0..nb).map(|b| format!("vb{b}_{j} * w{h}_{b}")).collect();
+                s.push_str(&format!("        a{h}_{j} = a{h}_{j} * f{h} + {};\n", vs.join(" + ")));
+            }
+        }
+        s.push_str(&format!("        p = p + {nb}u;\n    }}\n    for (; p < pend; p = p + 1u) {{\n"));
+        one(&mut s);
+        s.push_str("    }\n");
+    } else if pair() {
         s.push_str("    var p = p0;\n    loop {\n        if (p + 1u >= pend) { break; }\n        let ra = kbase + p * hd4;\n        let rb = ra + hd4;\n");
         load("a", "ra", &mut s);
         load("b", "rb", &mut s);
@@ -298,9 +340,9 @@ mod tests {
     /// subgroup capability on), with no GPU.
     #[test]
     fn sources_validate() {
-        for hpk in 1..=8 {
-            for hd in [64, 128, 256] {
-                let s = src(hpk, hd, false);
+        for (hpk, hd, half) in (1..=8).flat_map(|h| [64, 128, 256].into_iter().flat_map(move |d| [(h, d, false), (h, d, true)])) {
+            {
+                let s = src(hpk, hd, half);
                 let module = wgpu::naga::front::wgsl::parse_str(&s)
                     .unwrap_or_else(|e| panic!("hpk {hpk} hd {hd}: {e}"));
                 wgpu::naga::valid::Validator::new(

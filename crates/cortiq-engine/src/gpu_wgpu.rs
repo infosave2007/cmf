@@ -18188,7 +18188,35 @@ fn gqa_attend_merge_w(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invo
     if (!live) { return; }
     for (var d = t; d < hd; d = d + 256u) {
         var a = 0.0;
-        for (var ci = 0u; ci < nc; ci = ci + 1u) {
+        var ci = 0u;
+        // Eight chunks' rows load before the first of their adds, which
+        // stay in chunk order (the same sum to the bit): one load at a
+        // time held a lane to 125 serial loads at 32 000 positions, 57 us
+        // a layer on an RTX A5000.
+        if (fits) {
+            loop {
+                if (ci + 8u > nc) { break; }
+                let o = (hb + ci) * hd + d;
+                let x0 = ap_acc[o];
+                let x1 = ap_acc[o + hd];
+                let x2 = ap_acc[o + 2u * hd];
+                let x3 = ap_acc[o + 3u * hd];
+                let x4 = ap_acc[o + 4u * hd];
+                let x5 = ap_acc[o + 5u * hd];
+                let x6 = ap_acc[o + 6u * hd];
+                let x7 = ap_acc[o + 7u * hd];
+                a = a + x0 * mw_w[ci];
+                a = a + x1 * mw_w[ci + 1u];
+                a = a + x2 * mw_w[ci + 2u];
+                a = a + x3 * mw_w[ci + 3u];
+                a = a + x4 * mw_w[ci + 4u];
+                a = a + x5 * mw_w[ci + 5u];
+                a = a + x6 * mw_w[ci + 6u];
+                a = a + x7 * mw_w[ci + 7u];
+                ci = ci + 8u;
+            }
+        }
+        for (; ci < nc; ci = ci + 1u) {
             let idx = hb + ci;
             if (fits) {
                 a = a + ap_acc[idx * hd + d] * mw_w[ci];
@@ -31778,10 +31806,14 @@ pub fn forward_token_graph(
                                             bind_buf(6, &attn),
                                         ],
                                     });
+                                {
+                                    let mut pass = begin_pass(&mut enc);
+                                    pass.set_pipeline(pp);
+                                    pass.set_bind_group(0, &bg_part, &[]);
+                                    pass.dispatch_workgroups(part_x, nc_used as u32, 1);
+                                }
+                                ts_point!(enc, 29); // the split part, before its merge
                                 let mut pass = begin_pass(&mut enc);
-                                pass.set_pipeline(pp);
-                                pass.set_bind_group(0, &bg_part, &[]);
-                                pass.dispatch_workgroups(part_x, nc_used as u32, 1);
                                 pass.set_pipeline(&c.attend_merge);
                                 pass.set_bind_group(0, &bg_merge, &[]);
                                 pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -34292,6 +34324,7 @@ pub fn forward_token_graph(
                     (20, _) => "|attn:qkv",
                     (26, _) => "|attn:kvp",
                     (28, _) => "|attn:pro",
+                    (29, _) => "|attn:part",
                     (27, _) => "|attn:q",
                     (21, _) => "|attn:rope",
                     (22, _) => "|attn:kv",
@@ -55331,6 +55364,17 @@ mod tests {
         over.prefill_group(&qrefs, &ks, &vs, t, d, dv);
         let over_view = over.device_view();
         assert!(!o1_view_valid(&over_view, hpg * 2, 2, d));
+    }
+
+    #[test]
+    fn attend_split_source_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::ATTEND_SPLIT_SRC).unwrap_or_else(|e| panic!("{e}"));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}"));
     }
 
     #[test]
