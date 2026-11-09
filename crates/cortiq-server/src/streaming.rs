@@ -39,6 +39,91 @@ pub struct StreamChunk {
     /// e_skill, reason}`), carried by the usage chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_cortiq_route: Option<serde_json::Value>,
+    /// Prompt and decode speed of the request (llama-server's `timings`),
+    /// on the usage and finish chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
+}
+
+/// Prompt and decode speed of one request, in llama-server's `timings` shape:
+/// `cache_n` prompt tokens came from the reused prefix, `prompt_n` were read
+/// up to the first new token, `predicted_n` tokens came after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Timings {
+    pub cache_n: usize,
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+    /// Every new token, the first one included.
+    #[serde(skip)]
+    pub generated: usize,
+}
+
+impl Timings {
+    /// `generated` tokens in all: the first closes the prompt's `prompt_ms`,
+    /// the rest share `decode_ms`.
+    pub fn new(
+        cache_n: usize,
+        prompt_n: usize,
+        prompt_ms: f64,
+        generated: usize,
+        decode_ms: f64,
+    ) -> Self {
+        let predicted_n = generated.saturating_sub(1);
+        let per = |n: usize, ms: f64| {
+            if n > 0 && ms > 0.0 {
+                (ms / n as f64, n as f64 * 1000.0 / ms)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+        let (prompt_per_token_ms, prompt_per_second) = per(prompt_n, prompt_ms);
+        let (predicted_per_token_ms, predicted_per_second) = per(predicted_n, decode_ms);
+        Self {
+            cache_n,
+            prompt_n,
+            prompt_ms,
+            prompt_per_token_ms,
+            prompt_per_second,
+            predicted_n,
+            predicted_ms: if predicted_n > 0 { decode_ms } else { 0.0 },
+            predicted_per_token_ms,
+            predicted_per_second,
+            generated,
+        }
+    }
+
+    /// The three lines llama-server prints after a request.
+    pub fn lines(&self) -> [String; 3] {
+        let cached = if self.cache_n > 0 {
+            format!(", {} cached", self.cache_n)
+        } else {
+            String::new()
+        };
+        [
+            format!(
+                "prompt eval time = {:10.2} ms / {:5} tokens ({:8.2} ms per token, {:8.2} tokens per second){cached}",
+                self.prompt_ms, self.prompt_n, self.prompt_per_token_ms, self.prompt_per_second
+            ),
+            format!(
+                "       eval time = {:10.2} ms / {:5} tokens ({:8.2} ms per token, {:8.2} tokens per second)",
+                self.predicted_ms,
+                self.predicted_n,
+                self.predicted_per_token_ms,
+                self.predicted_per_second
+            ),
+            format!(
+                "      total time = {:10.2} ms / {:5} tokens",
+                self.prompt_ms + self.predicted_ms,
+                self.prompt_n + self.generated
+            ),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +236,7 @@ pub fn tool_calls_chunk(
         }],
         usage: None,
         x_cortiq_route: None,
+        timings: None,
     }
 }
 
@@ -172,6 +258,7 @@ pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamCh
         }],
         usage: None,
         x_cortiq_route: None,
+        timings: None,
     }
 }
 
@@ -196,6 +283,7 @@ pub fn usage_chunk(
             total_tokens: prompt_tokens + completion_tokens,
         }),
         x_cortiq_route: None,
+        timings: None,
     }
 }
 
@@ -217,5 +305,40 @@ pub fn finish_chunk(id: &str, model: &str, reason: &str, created: u64) -> Stream
         }],
         usage: None,
         x_cortiq_route: None,
+        timings: None,
+    }
+}
+
+#[cfg(test)]
+mod timings_tests {
+    use super::Timings;
+
+    #[test]
+    fn the_first_token_closes_the_prompt_time() {
+        let t = Timings::new(100, 400, 200.0, 51, 500.0);
+        assert_eq!((t.cache_n, t.prompt_n, t.predicted_n), (100, 400, 50));
+        assert!((t.prompt_per_second - 2000.0).abs() < 1e-9);
+        assert!((t.predicted_per_second - 100.0).abs() < 1e-9);
+        assert!((t.predicted_per_token_ms - 10.0).abs() < 1e-9);
+        let lines = t.lines();
+        assert!(
+            lines[0].starts_with("prompt eval time =") && lines[0].ends_with(", 100 cached"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[2].ends_with(" 451 tokens"), "{}", lines[2]);
+        let json = serde_json::to_value(t).unwrap();
+        assert_eq!(json["predicted_n"], 50);
+        assert!(json.get("generated").is_none(), "llama-server's shape only");
+    }
+
+    #[test]
+    fn no_new_token_leaves_the_decode_empty() {
+        let t = Timings::new(0, 10, 50.0, 0, 0.0);
+        assert_eq!(
+            (t.predicted_n, t.predicted_ms, t.predicted_per_second),
+            (0, 0.0, 0.0)
+        );
+        assert!(!t.lines()[0].contains("cached"));
     }
 }

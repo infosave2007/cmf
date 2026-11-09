@@ -336,7 +336,7 @@ fn metal_decode_attend_cost_by_depth() {
         .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
         .unwrap_or_else(|| vec![64, 150, 512, 1000, 3000]);
     for n in ns {
-        for (which, label) in [(0u32, "per-head"), (1, "split-K")] {
+        for (which, label) in [(0u32, "per-head"), (1, "split-K"), (2, "per-key"), (3, "per-key16")] {
             let _ = cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 4);
             if let Some(us) =
                 cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 64)

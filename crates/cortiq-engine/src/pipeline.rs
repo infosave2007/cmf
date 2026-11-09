@@ -530,6 +530,12 @@ pub struct Pipeline {
     /// chunk walks the layers on the host. 32 since the graph landed
     /// (measured on Qwen2.5-0.5B); Spark-X2.5/X2.6 take 8 (`loader`).
     pub chunk_min_rows: usize,
+    /// A far field's exact prefix rides the Metal chunk graph, which then also
+    /// keeps the collecting layers' queries (`o1_prefix_on_metal`).
+    o1_chunk_prefix: bool,
+    /// The batched wgpu graph declined this dense stack's prompt: later
+    /// prompts read chunked on the host walk (`graph_prefill_preferred`).
+    dense_batch_declined: std::sync::atomic::AtomicBool,
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
@@ -1208,6 +1214,8 @@ enum MetalRowsItem<'a> {
         q_norm: Option<&'a [f32]>,
         k_norm: Option<&'a [f32]>,
         output_gate: bool,
+        /// Spark-X2.6's per-head gate `[nh × hidden]`.
+        head_gate: Option<&'a [f32]>,
     },
 }
 
@@ -2268,11 +2276,11 @@ impl Pipeline {
         if env.is_some() || ChunkHost::here() != ChunkHost::Other {
             return prefill_chunk_rule(env, ChunkHost::here(), false);
         }
-        prefill_chunk_rule(
-            None,
-            ChunkHost::Other,
-            self.chunk_stack_facts().dense_on_discrete(),
-        )
+        let facts = self.chunk_stack_facts();
+        if facts.dense_on_cpu() {
+            return CPU_DENSE_PREFILL_CHUNK;
+        }
+        prefill_chunk_rule(None, ChunkHost::Other, facts.dense_on_discrete())
     }
 
     /// Prompt lookup in a speculative round (`CMF_SPEC_LOOKUP=0` leaves the
@@ -2386,6 +2394,12 @@ impl ChunkHost {
 /// prompt — see CHANGELOG 0.7.6 for the table.
 const DISCRETE_DENSE_PREFILL_CHUNK: usize = 512;
 
+/// Chunk for a plain dense stack with no GPU at all on x86-64: the AVX2
+/// q4tp batch kernel and the micro-GEMM chunk attend feed on wider
+/// panels. Spark-X2.6-4B q4tp, 1000-token prompt on 8 Zen 2 cores: 20.7
+/// tok/s at 48, 24.7 at 128, 25.0 at 256.
+const CPU_DENSE_PREFILL_CHUNK: usize = 128;
+
 /// The chunk-width rule. `dense_on_discrete` is true only for a plain
 /// dense transformer (full attention, dense FFN, no special stack) that
 /// is entirely resident on one discrete card — the one case measured
@@ -2425,6 +2439,16 @@ struct ChunkStackFacts {
 }
 
 impl ChunkStackFacts {
+    /// A plain dense stack on an x86-64 host with no GPU backend up
+    /// (O(1) stacks keep the width their trace was measured with).
+    fn dense_on_cpu(self) -> bool {
+        cfg!(target_arch = "x86_64")
+            && self.plain_dense
+            && !self.gpu_on
+            && !self.multi_gpu
+            && !self.o1
+    }
+
     fn dense_on_discrete(self) -> bool {
         self.plain_dense
             && self.discrete
@@ -3185,12 +3209,24 @@ impl Pipeline {
         // prompt at the host's pace (CherryPit-1.2-2B on an RTX 5090, 2048
         // tokens: 10.6 s chunked, 1.2 s through the batched graph, the same
         // greedy text). `CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked walk.
+        // A dense stack the batched graph declined once (Spark-X2.6) keeps the
+        // chunked walk: the per-position graph read its prompt at decode pace,
+        // 65 tok/s against 350 on an RTX 2000 Ada.
         (self
             .weights
             .layers
             .iter()
             .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
-            || std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() != Ok("0"))
+            || (std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() != Ok("0")
+                && !self.dense_batch_declined.load(std::sync::atomic::Ordering::Relaxed)
+                // Sliding-window stacks take the graph where its whole-run
+                // attend is tiled: Spark-X2.6 q4tp on an RTX 2000 Ada,
+                // 16 000 tokens, 182 tok/s chunked, 135 through the per-token
+                // batched arm, 390+ tiled. `CMF_DENSE_GRAPH_PREFILL=1` sends
+                // them through the graph regardless.
+                && ((self.sliding_layers.is_none() && self.swa.is_none())
+                    || crate::gpu::batched_attend_tiled()
+                    || std::env::var("CMF_DENSE_GRAPH_PREFILL").as_deref() == Ok("1"))))
             && self.automatic_gpu_prefix().is_none()
     }
 
@@ -4846,6 +4882,8 @@ impl Pipeline {
             swa_trim: None,
             swa_trim_anchor: usize::MAX,
             chunk_min_rows: 32,
+            o1_chunk_prefix: false,
+            dense_batch_declined: std::sync::atomic::AtomicBool::new(false),
             sliding_layers: None,
             no_rope_layers: None,
             value_blend: None,
@@ -5256,6 +5294,15 @@ impl Pipeline {
     /// RTX 3090, 1000-token prompt: 51 tok/s at 32, 82 at 64, 95 at 128,
     /// 97 at 256; greedy output byte-identical to the 32-row chunks
     /// (every GEMM row and the k-looped recurrences are per position).
+    /// A dense sliding-window stack whose batched prefill attends with the
+    /// query-tiled kernels (the Spark-X2.6 class on a discrete wgpu card).
+    #[cfg(not(target_os = "macos"))]
+    fn tiled_sliding_batch(&self) -> bool {
+        (self.sliding_layers.is_some() || self.swa.is_some())
+            && !self.weights.layers.iter().any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
+            && crate::gpu::batched_attend_tiled()
+    }
+
     pub fn generation_batch_k(&self) -> usize {
         if let Some(k) = std::env::var("CMF_BATCH_K")
             .ok()
@@ -5282,10 +5329,18 @@ impl Pipeline {
             && crate::gpu::enabled_here()
             && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
         {
-            return 128;
+            return if self.tiled_sliding_batch() { 512 } else { 128 };
         }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
+            // A dense sliding-window stack on the tiled whole-run attend:
+            // 512 rows a submit (Spark-X2.6 q4tp on an RTX 2000 Ada, 4096
+            // tokens: 288 tok/s at 128, 317 at 512, the same greedy text;
+            // the tile holds 16 tokens, and a chunk is read against its K/V
+            // once per sub-run of whole tiles).
+            if self.tiled_sliding_batch() {
+                return 512;
+            }
             // 128 is measured on the dense hybrids; MoE stacks other than
             // the two expert codecs below keep the 32 their expert-grouped
             // prefill was measured at.
@@ -5580,21 +5635,52 @@ impl Pipeline {
             self.kv_cache.layers[li].o1_set_q_stride(QT_STRIDE);
         }
         let mut pos = 0;
+        // Layers the rows graph does not hold (Spark-X2.6: GELU, per-head
+        // gates, sliding windows) read the prefix on the chunk graph, which
+        // keeps the collecting layers' queries too. Without it the prefix
+        // went to the host walk: 14 000 tokens in 155 s against 53 s exact.
+        let mut on_chunks = false;
+        let mut step = chunk;
         while pos < n {
-            let end = (pos + chunk).min(n);
+            let end = (pos + step).min(n);
             let bk = end - pos;
             let mut hiddens = vec![0f32; bk * hs];
             for (j, &id) in ids[pos..end].iter().enumerate() {
                 hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
             }
-            match self.prefill_hiddens_metal(hiddens, pos, None) {
+            let rows = if on_chunks {
+                MetalPrefillOutcome::Declined
+            } else {
+                self.prefill_hiddens_metal(hiddens.clone(), pos, None)
+            };
+            match rows {
                 MetalPrefillOutcome::Completed(h) => last.copy_from_slice(&h[(bk - 1) * hs..]),
-                MetalPrefillOutcome::Declined if pos == 0 => {
-                    crate::gpu_metal::o1c::cap_end();
-                    for &li in &o1_layers {
-                        self.kv_cache.layers[li].o1_set_q_stride(1);
+                MetalPrefillOutcome::Declined if pos == 0 || on_chunks => {
+                    if !on_chunks {
+                        on_chunks = true;
+                        // The chunk graph's own prompt chunk.
+                        let want = self.prefill_chunk().max(chunk);
+                        if want != step {
+                            step = want;
+                            continue;
+                        }
                     }
-                    return Ok(None);
+                    self.o1_chunk_prefix = true;
+                    let got = self.chunk_run_gpu(0, &mut hiddens, bk, pos, None, self.num_layers);
+                    self.o1_chunk_prefix = false;
+                    if got != self.num_layers {
+                        crate::gpu_metal::o1c::cap_end();
+                        if pos == 0 && got == 0 {
+                            for &li in &o1_layers {
+                                self.kv_cache.layers[li].o1_set_q_stride(1);
+                            }
+                            return Ok(None);
+                        }
+                        return Err("O(1) prefix: the Metal chunk graph stopped after admission".into());
+                    }
+                    // Every layer appended the chunk: sliding layers keep their tails only.
+                    self.swa_trim_tails();
+                    last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                 }
                 _ => {
                     crate::gpu_metal::o1c::cap_end();
@@ -6863,21 +6949,41 @@ impl Pipeline {
                 if limit < tail_from && self.o1_exact_cfg().is_some() {
                     o1_arch = Some(O1Archive::new());
                 }
+                // Without a Metal rows graph (Spark-X2.6: GELU, per-head gates, sliding
+                // windows) the sealed rows would go one position at a time: 14 000 tokens
+                // on the M4 took 219 s. The chunk graph reads the whole prompt exact
+                // instead, and the seal after it chooses among all of its rows, with the
+                // question's queries in the trace.
                 #[cfg(target_os = "macos")]
-                let prefix = if crate::gpu::q1_force() {
-                    self.o1_prefix_on_metal(&input_ids[..limit], batch_k, o1_arch.as_mut())
+                let px_len = if crate::gpu::q1_force() && o1_arch.is_some() && self.metal_rows_plan().is_none() {
+                    o1_arch = None;
+                    let n = input_ids.len();
+                    for li in 0..self.num_layers {
+                        if self.o1_flags.get(li).copied().unwrap_or(false) {
+                            self.kv_cache.layers[li].o1_set_boundary(n);
+                        }
+                    }
+                    n
                 } else {
-                    self.o1_prefix_on_graph(&input_ids[..limit], batch_k, o1_arch.as_mut())
+                    limit
                 };
                 #[cfg(not(target_os = "macos"))]
-                let prefix = self.o1_prefix_on_graph(&input_ids[..limit], batch_k, o1_arch.as_mut());
+                let px_len = limit;
+                #[cfg(target_os = "macos")]
+                let prefix = if crate::gpu::q1_force() {
+                    self.o1_prefix_on_metal(&input_ids[..px_len], batch_k, o1_arch.as_mut())
+                } else {
+                    self.o1_prefix_on_graph(&input_ids[..px_len], batch_k, o1_arch.as_mut())
+                };
+                #[cfg(not(target_os = "macos"))]
+                let prefix = self.o1_prefix_on_graph(&input_ids[..px_len], batch_k, o1_arch.as_mut());
                 match prefix {
                     Ok(Some(last)) => {
                         hidden.copy_from_slice(&last);
-                        pos = limit;
+                        pos = px_len;
                         if std::env::var("CMF_PREFILL_PROF").is_ok() {
                             eprintln!(
-                                "o1 prefix on the batch graph: {limit} rows in {:.1} ms",
+                                "o1 prefix on the batch graph: {px_len} rows in {:.1} ms",
                                 t_px.elapsed().as_secs_f64() * 1e3
                             );
                         }
@@ -7021,6 +7127,8 @@ impl Pipeline {
                     input_ids.len(),
                     _tp.elapsed().as_secs_f64() * 1e3
                 );
+                // Per-stage GPU time of the rows graph (`CMF_VERIFY_CUT=1`).
+                crate::gpu_metal::cut_report();
             }
         }
         // Gemma-4 on a discrete card: the prompt through the batched wgpu
@@ -7302,6 +7410,7 @@ impl Pipeline {
         {
             let hs = self.hidden_size;
             let chunk = batch_k;
+            let pos_start = pos;
             let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
             if o1_arch.is_some() {
                 crate::gpu::o1_acap_begin();
@@ -7463,6 +7572,33 @@ impl Pipeline {
                     });
                 } else {
                     break; // unsupported → per-position graph handles the rest
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                crate::gpu_metal::cut_report();
+            }
+            // A dense stack the batched graph does not take reads the prompt chunked
+            // on the host walk (its GEMMs on the card), as before the graph took dense
+            // prompts, instead of one position at a time.
+            if pos == pos_start
+                && graph_prefill
+                && !o1_batch_ready
+                && mtp.is_none()
+                && !mimo_spec
+                && self.can_prefill_batched()
+                && !self.per_token_stack()
+                && self.weights.layers.iter().all(|lw| {
+                    !matches!(&lw.attn, AttnKind::LinearGdn(_)) && !matches!(&lw.ffn, FfnKind::Moe(_))
+                })
+            {
+                self.dense_batch_declined.store(true, std::sync::atomic::Ordering::Relaxed);
+                let chunk = self.prefill_chunk();
+                while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let end = (pos + chunk).min(input_ids.len());
+                    let hb = self.prefill_batch(&input_ids[pos..end], pos);
+                    hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
+                    pos = end;
                 }
             }
         }
@@ -14791,7 +14927,7 @@ impl Pipeline {
             || std::env::var("CMF_GPU_CHUNK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
-            || (b < self.chunk_min_rows && self.dash.is_none())
+            || (b < self.chunk_min_rows && self.dash.is_none() && !self.o1_chunk_prefix)
             // MRoPE rows rotate on the host (`attention::MropeView`).
             || self.prompt_mrope.is_some()
             // V with rows of its own (Ripple's value residual) stays on the host walk.
@@ -14808,8 +14944,9 @@ impl Pipeline {
             // graph (the q1 sliding-native door checks the same geometry).
             || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa() && !gemma4)
             // Collection owns the exact Q trace and boundary conversion;
-            // this chunk graph appends dense KV without feeding that trace.
-            || self.o1_active()
+            // this chunk graph appends dense KV without feeding that trace,
+            // but for a far field's exact prefix, where it keeps the queries.
+            || (self.o1_active() && !self.o1_chunk_prefix)
             || (self.attn_v_norm && !gemma4)
             || !self.metal_rope_scale_ok()
             || ((self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9 && !gemma4)
@@ -14973,7 +15110,9 @@ impl Pipeline {
                 break;
             };
             let layer = &self.kv_cache.layers[li];
-            if layer.mode != crate::kv_cache::KvMode::F32 || layer.o1.is_some() {
+            if layer.mode != crate::kv_cache::KvMode::F32
+                || (layer.o1.is_some() && !(self.o1_chunk_prefix && layer.o1_is_collecting()))
+            {
                 break;
             }
             // A trimmed tail holds every row the chunk's first query reads.
@@ -17377,11 +17516,13 @@ impl Pipeline {
                 .unwrap_or(false)
             || self.attn_softcap > 0.0
             || (self.o1_active() && !self.o1_on_graph())
-            || self.swa.is_some()
+            // Sliding windows with per-layer RoPE (Spark-X2.6) ride the rows graph
+            // as they ride the chunk graph (`metal_graph_swa`).
+            || (self.swa.is_some() && !self.metal_graph_swa())
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || self.graph_attn_decline_reason().is_some()
+            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa())
             || self.attn_v_norm
             || self.loop_final_norm
             || !self.metal_rope_scale_ok()
@@ -17406,7 +17547,7 @@ impl Pipeline {
                 return None;
             }
             let ffn = match &lw.ffn {
-                FfnKind::Dense(d) if d.act == Act::Silu && d.segs.is_empty() => {
+                FfnKind::Dense(d) if matches!(d.act, Act::Silu | Act::Gelu) && d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) = (
                         d.gate_proj.metal_graph_parts(),
                         d.up_proj.metal_graph_parts(),
@@ -17418,7 +17559,8 @@ impl Pipeline {
                         gate: g,
                         up: u,
                         down: dn,
-                        act: 0, // SiLU only (the arm above)
+                        // SiLU, or the exact GELU of Spark-X2.6 (`gelu_rows`).
+                        act: if d.act == Act::Gelu { 1 } else { 0 },
                     }
                 }
                 _ => return None,
@@ -17468,9 +17610,18 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
-                    softplus_gate: None,
+                    softplus_gate,
                     bias: None,
                 } => {
+                    // Spark-X2.6's per-head sigmoid g_proj gate, from f32 rows.
+                    let head_gate = match softplus_gate {
+                        None => None,
+                        Some((g, true)) if self.proj_gate_sigmoid && !*output_gate => match g.f32_parts() {
+                            Some((d, r, c)) if r == self.num_heads && c == self.hidden_size => Some(d),
+                            _ => return None,
+                        },
+                        Some(_) => return None,
+                    };
                     let (Some(pq), Some(pk), Some(pv), Some(po)) = (
                         wq.metal_graph_parts(),
                         wk.metal_graph_parts(),
@@ -17504,6 +17655,7 @@ impl Pipeline {
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
+                        head_gate,
                     });
                 }
                 _ => return None,
@@ -17544,6 +17696,8 @@ impl Pipeline {
         gemma: bool,
         late_qk_norm: bool,
         o1_epoch: u64,
+        head_gate: Option<&'a [f32]>,
+        window: Option<usize>,
     ) -> (crate::gpu_metal::AttnDeviceParams<'a>, usize) {
         let (nh, nkv, hd, rd) = geom;
         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
@@ -17573,9 +17727,9 @@ impl Pipeline {
                 cpu_gen: cache.generation(),
                 // A layer still collecting has no views, and its rows go through the mirror.
                 o1: cache.o1_views().map(|views| crate::gpu_metal::O1AttnParams { views, epoch: o1_epoch }),
-                window: None,
+                window,
                 softmax_sink: cache.sinks.as_deref(),
-                head_gate: None,
+                head_gate,
                 v_norm: false,
                 dash: None,
             },
@@ -17667,8 +17821,13 @@ impl Pipeline {
         }
         if prefill {
             use crate::gpu_metal::{AneWants, MetalFfn};
-            let ffn = |f: &MetalFfn<'_>| match f {
-                MetalFfn::Dense { gate, up, down, act: 0 } => Some([*gate, *up, *down]),
+            // SiLU or the exact GELU (Spark-X2.6), one activation for the file's FFNs.
+            let mut ane_act = None;
+            let ffn = |f: &MetalFfn<'_>, ane_act: &mut Option<u8>| match f {
+                MetalFfn::Dense { gate, up, down, act } if *act <= 1 && ane_act.is_none_or(|a| a == *act) => {
+                    *ane_act = Some(*act);
+                    Some([*gate, *up, *down])
+                }
                 _ => None,
             };
             let mut wants = Vec::new();
@@ -17676,12 +17835,12 @@ impl Pipeline {
                 match item {
                     MetalRowsItem::Gdn { run, .. } => {
                         wants.extend(run.iter().map(|l| AneWants {
-                            ffn: ffn(&l.ffn),
+                            ffn: ffn(&l.ffn, &mut ane_act),
                             mix: if crate::gpu_metal::ane_takes_qkv() { vec![l.qkv, l.z] } else { vec![l.z] },
                         }))
                     }
                     MetalRowsItem::Attn { l, .. } => wants.push(AneWants {
-                        ffn: ffn(&l.ffn),
+                        ffn: ffn(&l.ffn, &mut ane_act),
                         mix: if crate::gpu_metal::ane_takes_qkv() {
                             vec![l.wk, l.wv, l.wq]
                         } else if crate::gpu_metal::ane_takes_q() {
@@ -17692,6 +17851,7 @@ impl Pipeline {
                     }),
                 }
             }
+            crate::gpu_metal::ane::set_act(ane_act.unwrap_or(0));
             for g in lanes.iter_mut() {
                 g.ane_attach(&wants);
             }
@@ -17709,7 +17869,9 @@ impl Pipeline {
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         let eps = self.rms_eps as f32;
         let kv_id = self.graph_kv_id;
-        let inv_freq = self.inv_freq.clone();
+        // Each layer's own RoPE table and width (Spark-X2.6: sliding and full layers differ).
+        let tables: Vec<std::sync::Arc<Vec<f32>>> = (0..self.num_layers).map(|li| self.layer_inv_freq(li)).collect();
+        let lgeom = |li: usize| (geom.0, geom.1, geom.2, self.layer_geom(li).2);
         for item in &plan {
             let ok = match item {
                 MetalRowsItem::Gdn { run, .. } => gcfg
@@ -17722,6 +17884,7 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    head_gate,
                 } => {
                     let (p, _) = Self::metal_attn_params(
                         *li,
@@ -17729,9 +17892,9 @@ impl Pipeline {
                         *q_norm,
                         *k_norm,
                         *output_gate,
-                        &inv_freq,
+                        &tables[*li],
                         self.layer_rope_scale(*li),
-                        geom,
+                        lgeom(*li),
                         pos0,
                         kv_id,
                         self.attn_scale,
@@ -17739,6 +17902,8 @@ impl Pipeline {
                         gemma,
                         self.qk_norm_after_rope,
                         self.o1_epoch,
+                        *head_gate,
+                        self.layer_window(*li),
                     );
                     lanes.iter().all(|g| g.attn_ok(l, &p))
                 }
@@ -17788,6 +17953,7 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    head_gate,
                 } => {
                     for (ln, st) in steps.iter_mut().enumerate() {
                         let (mut p, cpu_stored) = Self::metal_attn_params(
@@ -17796,9 +17962,9 @@ impl Pipeline {
                             *q_norm,
                             *k_norm,
                             *output_gate,
-                            &inv_freq,
+                            &tables[*li],
                             self.layer_rope_scale(*li),
-                            geom,
+                            lgeom(*li),
                             pos0 + cuts[ln].0,
                             kv_id,
                             self.attn_scale,
@@ -17806,6 +17972,8 @@ impl Pipeline {
                             gemma,
                             self.qk_norm_after_rope,
                             self.o1_epoch,
+                            *head_gate,
+                            self.layer_window(*li),
                         );
                         // The half before leaves its rows in the mirror, not yet in the host's.
                         p.cpu_stored += cuts[ln].0;
@@ -18085,6 +18253,8 @@ impl Pipeline {
         if with_head {
             METAL_PREFILL_HEAD_ROWS.fetch_add(b as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        // Every layer appended the chunk: sliding layers keep their tails only.
+        self.swa_trim_tails();
         MetalPrefillOutcome::Completed(hiddens)
     }
 
@@ -19337,13 +19507,21 @@ impl Pipeline {
                         softplus_gate,
                         bias,
                     } => {
-                        if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                        // Spark-X2.6's head-wise sigmoid gate rides the batch graph
+                        // (one g_proj row per Q head); Laguna's softplus gate does not.
+                        let head_gate = match softplus_gate {
+                            Some((g, true)) if self.proj_gate_sigmoid && !*output_gate => Some(gw(g)?),
+                            None => None,
+                            Some(_) => {
+                                if batch_debug {
+                                    eprintln!("batch graph: unsupported Full attention gate at layer {li}");
+                                }
+                                return None;
+                            }
+                        };
+                        if self.attention_heads_per_layer.is_some() {
                             if batch_debug {
-                                eprintln!(
-                                    "batch graph: unsupported Full attention gate at layer {li} softplus={} heads={}",
-                                    softplus_gate.is_some(),
-                                    self.attention_heads_per_layer.is_some()
-                                );
+                                eprintln!("batch graph: per-layer Q heads at layer {li}");
                             }
                             return None;
                         }
@@ -19366,9 +19544,7 @@ impl Pipeline {
                             cpu_v: self.kv_cache.layers[li].v_heads(),
                             cpu_base: self.kv_cache.layers[li].base(),
                             geom: self.graph_attn_geom_vres(li, &vres_e0),
-                            // The batched graph has no head-gate arm; a
-                            // gated layer is refused above.
-                            head_gate: None,
+                            head_gate,
                         }
                     }
                     AttnKind::LinearGdn(w) => {
@@ -23042,9 +23218,7 @@ fn dense_ffn_batch(
             g[i] *= u[i];
         }
     } else {
-        for i in 0..b * inter {
-            g[i] = d.act.combine(g[i], u[i]);
-        }
+        combine_pooled(d.act, &mut g[..b * inter], &u[..b * inter], pool);
     }
     if let Some(row) = mask_row {
         zero_masked_cols(&mut g, b, inter, row);
@@ -23520,6 +23694,34 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     dense_ffn_cpu(d, x, pool)
 }
 
+/// `g[i] = act.combine(g[i], u[i])`, spread over the pool from 8192
+/// elements: elementwise, so the same bits as the serial loop. An exact
+/// GELU is one `erf` an element — 1.3 M a layer for a 128-row chunk of
+/// Spark-X2.6, 10 240 a decode step — and the main thread paid them alone
+/// while the workers waited for the down projection.
+fn combine_pooled(act: Act, g: &mut [f32], u: &[f32], pool: Option<&Pool>) {
+    debug_assert_eq!(g.len(), u.len());
+    match pool {
+        Some(p) if g.len() >= 8192 => {
+            let gp = crate::pool::SendMut::new(g.as_mut_ptr());
+            p.run_rows(g.len(), &|start, end| {
+                for i in start..end {
+                    // SAFETY: each worker owns elements [start, end).
+                    unsafe {
+                        let v = gp.at(i);
+                        *v = act.combine(*v, u[i]);
+                    }
+                }
+            });
+        }
+        _ => {
+            for (gv, &uv) in g.iter_mut().zip(u) {
+                *gv = act.combine(*gv, uv);
+            }
+        }
+    }
+}
+
 /// The pure-CPU dense-FFN body (also the fallback of every GPU refusal).
 fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let inter = d.gate_proj.rows();
@@ -23558,9 +23760,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
             QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
             let _c = crate::cpuprof::time(crate::cpuprof::Slot::FfnCombine);
-            for i in 0..inter {
-                g[i] = d.act.combine(g[i], u[i]);
-            }
+            combine_pooled(d.act, &mut g[..inter], &u[..inter], pool);
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
         // per-neuron activation mass while a probe pass is active.

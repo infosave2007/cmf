@@ -7,11 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.64] — 2026-11-09
+
 ### Added
+- `cortiq serve` prints each request's speed as llama-server does (`prompt eval time`, `eval time`, `total time`,
+  with the prompt tokens reused from the cached prefix) and returns llama-server's `timings` object: in a
+  non-streamed response, and on the usage and finish chunks of a stream.
+- A Spark-X2.6-4B Turbo file (`far-turbo` with `scripts/spark26/keep_spark26.bin`, exact-row weights fitted for
+  its 9 full-attention layers). RTX 2000 Ada, Vulkan, 64 000 tokens: decode 56.2 tok/s against 18.5 and 4.2 GB
+  of the card against 7.9.
+- `cortiq ppl --window-score-from K` scores a window's predictions from position `K` on, the earlier ones
+  being context only: with `--window-len 512 --window-stride 512 --window-score-from 256` the walk is that of
+  `llama-perplexity -c 512`, so the two numbers compare.
 - `cortiq import-gguf` reads IQ3_S (the 3.4-bit grid codebook inside imatrix IQ4_XS mixes), a port of ggml's
   `dequantize_row_iq3_s`, checked against gguf-py on a real block.
 
 ### Changed
+- Spark-X2.6 on native Metal reads its prompt through the rows graph (exact GELU, the per-head `g_proj` gate,
+  sliding windows, each layer's own RoPE table), and with `CMF_ANE=1` its FFNs go to the Neural Engine: a
+  14 000-token prompt on a MacBook Air M4 in 34 s instead of 54.
+- Metal KV mirrors hold f16 for Spark-X2.6 (`CMF_METAL_KV_F16=0` keeps f32) and grow by a quarter instead of to
+  the next power of two; a token's attend takes a kernel with a thread per key from 64 positions (`CMF_GQA_KB=0`
+  keeps the split-K one): decode after a 14 000-token prompt 24.4 tok/s → 30.8, the same text.
+- A turbo file's prompt on Metal: the exact prefix on the chunk graph when the rows graph does not hold the
+  model, and a sealed layer's near window as GEMMs for a chunk of 16 rows or more.
+- A sealed layer's token on Metal runs four kernels instead of eleven (the near window and the far field in
+  one pass each, a merge, the commit; `CMF_O1C_TOK=0` keeps the stages): Spark-X2.6-4B Turbo after a
+  14 000-token prompt on an M4, 29.1 tok/s → 33.0, the same text.
+- A dense q4tp layer's q, k and v projections, RoPE, the K/V append and the per-head output-gate dots go in one
+  Metal dispatch, the gate applied inside the O projection (`CMF_METAL_QKVFUSE=0` keeps them apart).
+- The wgpu batch graph takes the per-head output gate and exact GELU and copies a far field's query trace out of
+  its per-layer-geometry arms, so a Spark-X2.6 turbo prompt rides it (16 000 tokens: 565 s → 117 s).
+- A dense sliding-window stack's prompt goes through the wgpu batch graph with 512-row submits where the graph's
+  whole-run attend is tiled (`CMF_DENSE_GRAPH_PREFILL=0` keeps the chunked host walk, `CMF_BATCH_K` the rows).
+  The whole-run attend admits heads of 256 (Spark-X2.6) and takes a tile of 16 tokens against each 64-key block
+  — a K/V row read once per tile instead of once per token (`gqa_attend_part_xt`, `CMF_ATTEND_XT=0` keeps the
+  per-token kernel) — and on a card with cooperative matrices the tile runs on the matrix units with a group of
+  blocks per workgroup and an online softmax (`gqa_attend_part_xc`, `CMF_ATTEND_XC=0` keeps the scalar tile).
+  Spark-X2.6-4B q4tp on an RTX 2000 Ada over Vulkan, 16 000 tokens: 182 tok/s walked, 390 tok/s with the scalar
+  tile, 582 with the matrix-unit tile, the same greedy text after 9 000 and 60 000 characters. A cooperative
+  kernel's workgroup scalars are 16-byte `vec4<u32>`: a `u32` beside the tile arrays shifted every cooperative
+  load and store by one element on NVIDIA (`tests/gpu_coop_probe.rs` keeps the probe that shows it).
+- Where the cooperative GEMM is on (NVIDIA by default), a chunk of 128 rows or more runs its wide q4tp GEMMs
+  through `zi_mm`, the 128×128×32 tensor-core tile of the image models: the weight dequantized once into an f16 plane, the chunk's
+  activations cast to f16 under the device scale, the result scaled back at the store. 12.0 TFLOP/s on an RTX
+  2000 Ada against 6.2 for the 64×64 in-kernel-dequant cooperative kernel (`CMF_BATCH_MM=coop`; `v2` its
+  pipelined twin; `CMF_BATCH_COOP=0` the scalar tile GEMM at 3.1). Spark-X2.6-4B over Vulkan on that card: a
+  4096-token prompt at 1020 tok/s (660 on the 64×64 kernel, 563 on the scalar tile), 16 000 tokens at 878
+  (575), the same greedy text. Dequantizing into the plane and running the 64×64 f16 kernel stays opt-in
+  (`CMF_BATCH_F16=1`; it lost to the in-kernel decoder). The 64×64 cooperative GEMMs walk their tiles in
+  groups of eight batch tiles so a weight tile leaves VRAM once per group instead of once per batch tile.
+  `tests/gpu_q4tp_mm_bench.rs` times every variant on the Spark shapes and holds each to the scalar GEMM's
+  answer. The whole-run attend's partial buffers are allocated once per call instead of once per layer (36 ×
+  65 MB in flight was an `Out of Memory` on a shared 16 GB card).
+- The whole-run attend of a full-attention layer with heads of 256 reads its matrix-unit operands straight from
+  f16 planes (`gqa_attend_part_xc2`): the chunk's queries and the cache's keys and values are cast once per
+  layer, and each tile loads from storage without the staging copies and barriers of `gqa_attend_part_xc`
+  (`CMF_ATTEND_XC2=0` keeps it). Spark-X2.6-4B q4tp over Vulkan on an RTX 2000 Ada: 4096 tokens 1012 → 1088
+  tok/s, 16 000 tokens 871 → 901, 64 000 tokens 486 → 535, the same greedy text after 9 000 characters.
+- A turbo file's far field is rebuilt with one thread per KV group (it was one group after another): Spark-X2.6-4B
+  Turbo at 16 000 tokens, 6.5 s → 3.5 s of the prompt, 489 → 539 tok/s, the same greedy text after 60 000
+  characters.
+- x86-64 CPU prompts: the batched chunk attend runs on x86 too (an AVX2 micro-GEMM, `x86_gemm_rm`, and an AVX2
+  softmax; a sliding window bounds the key range of the whole chunk; `CMF_CPU_ATTEND=0` keeps the per-position
+  attend); a q4tp batch takes two weight rows against four columns with FMA (`CMF_Q4TP_FMA=0` keeps the vertical
+  cell); the activation split and the FFN's activation combine (an exact GELU is one `erf` an element) run on the
+  pool instead of the main thread; the activation panel is sized to half the core's L2; a plain dense stack with no
+  GPU reads 128 rows a chunk instead of 48. Spark-X2.6-4B q4tp on 8 Zen 2 cores: a 1000-token prompt 16.7 → 31.6
+  tok/s, 4000 tokens 11.9 → 30.1.
+- x86-64 CPU decode: every vertical q4tp cell (the decode lanes, the fused gate/up lanes, the row-exact matmat
+  cells) accumulates with FMA and takes the `8·Σx` term once per row through one shared function, so the matvec
+  and the row-exact matmat still agree bit for bit; a grouped-query context of 512 rows or more attends split-K
+  (KV group × 256 keys a job, each K and V row read once for all the group's heads, an online-softmax merge;
+  `CMF_ATTEND_SPLITK=0` keeps one job a head).
 - On native Metal the MTP drafts are on by default over a q4tp trunk, as on Vulkan (`CMF_GRAPH_SPEC=0` turns them
   off, `=1` asks for them over other trunks). The batched verify passed the exact-ID gate there: on a MacBook Air M4,
   Qwen3.8-27B Turbo and OrcaCyber-Nano-1.0 gave the same token ids with drafts and without on five prompts each,
@@ -30,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same greedy text; the 128-row tile's sums equal the 64-row kernel's bit for bit (test).
 
 ### Fixed
+- On wgpu a dense model the batched graph declines read its prompt one position at a time (0.8.63): Spark-X2.6
+  q4tp on an RTX 2000 Ada, 65 tok/s. It reads chunked on the host walk again (195 tok/s), as sliding-window
+  stacks always do now.
 - The speculation trial left the drafts after two empty rounds in a row and kept plain decode for 128 tokens. A good
   head meets such a pair now and then; at the start of a chat turn it sent the whole turn to plain decode
   (OrcaCyber-Nano-1.0 on an RTX 2000 Ada, the second of five turns: 13.3 tok/s against 23–26 with the drafts). The

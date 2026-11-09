@@ -258,6 +258,10 @@ impl O1Flags {
 struct PplWindows {
     windows: Option<usize>,
     window_len: usize,
+    /// A fixed stride from the start of the corpus instead of the even spread.
+    stride: Option<usize>,
+    /// Score a window's positions from this one on (0 = every prediction).
+    score_from: usize,
 }
 
 impl PplWindows {
@@ -275,10 +279,13 @@ impl PplWindows {
             "corpus has {n} tokens < window_len+2 = {}",
             self.window_len + 2
         );
-        let stride = (n - self.window_len - 1) / w;
+        let stride = match self.stride {
+            Some(s) => s,
+            None => (n - self.window_len - 1) / w,
+        };
         anyhow::ensure!(
-            stride > 0,
-            "{w} windows of {} do not fit in {n} tokens",
+            stride > 0 && (w - 1) * stride + self.window_len <= n,
+            "{w} windows of {} at stride {stride} do not fit in {n} tokens",
             self.window_len
         );
         Ok(Some((0..w).map(|k| k * stride).collect()))
@@ -2167,6 +2174,18 @@ enum Commands {
         /// Token length of each --windows window
         #[arg(long, default_value = "512")]
         window_len: usize,
+        /// Place the --windows windows at this token stride from the start of
+        /// the corpus instead of spreading them evenly over it (511 with the
+        /// default length = consecutive windows sharing one token, the walk
+        /// of `llama-perplexity -c 512 --ppl-stride 511`)
+        #[arg(long)]
+        window_stride: Option<usize>,
+        /// Score each window's predictions from this position on, the
+        /// earlier ones being context only (256 with the default length and
+        /// --window-stride 512 = the second half of each chunk, the walk of
+        /// `llama-perplexity -c 512`). 0 scores every prediction
+        #[arg(long, default_value = "0")]
+        window_score_from: usize,
         /// Score the CONVERTED model: run the O(1) Nyström attention path
         /// (all | deepN | i,j,k | off) over the scored positions instead of
         /// exact attention. Each window's first --o1-prefill tokens run the
@@ -5638,6 +5657,8 @@ async fn main() -> anyhow::Result<()> {
             route_dynamic,
             windows,
             window_len,
+            window_stride,
+            window_score_from,
             o1,
             o1_m,
             o1_window,
@@ -5670,6 +5691,8 @@ async fn main() -> anyhow::Result<()> {
                 PplWindows {
                     windows,
                     window_len,
+                    stride: window_stride,
+                    score_from: window_score_from,
                 },
                 &O1Flags {
                     spec: o1,
@@ -8738,11 +8761,18 @@ fn cmd_ppl(
         return Ok(());
     }
     if let Some(offsets) = windowed {
+        anyhow::ensure!(
+            win.score_from + 1 < win.window_len,
+            "--window-score-from {} leaves no prediction in a window of {}",
+            win.score_from,
+            win.window_len
+        );
         return ppl_windows(
             &mut pipeline,
             &ids,
             &offsets,
             win.window_len,
+            win.score_from,
             o1,
             o1_prefill,
         );
@@ -8811,13 +8841,16 @@ fn ppl_windows(
     ids: &[u32],
     offsets: &[usize],
     wlen: usize,
+    score_from: usize,
     o1: &O1Flags,
     o1_prefill: Option<usize>,
 ) -> anyhow::Result<()> {
     let cfg = o1.cfg()?;
+    // Without --o1, `score_from` is the first scored position (the earlier
+    // ones are context only); with it, the seal point plays that part.
     let prefill = match &cfg {
         Some(_) => o1_prefill.unwrap_or(wlen / 2).min(wlen.saturating_sub(1)),
-        None => 0,
+        None => score_from,
     };
     let (mut nll_o1, mut nll_ex, mut cnt) = (0f64, 0f64, 0usize);
     let progress = std::env::var("CMF_PPL_PROGRESS").as_deref() == Ok("1");
@@ -8839,7 +8872,7 @@ fn ppl_windows(
             cnt += k;
         } else {
             let (n, k) = pipeline
-                .nll_ids_from(w, 0)
+                .nll_ids_from(w, prefill)
                 .map_err(|e| anyhow::anyhow!(e))?;
             nll_ex += n;
             cnt += k;
@@ -8861,10 +8894,15 @@ fn ppl_windows(
         }
     }
     println!(
-        "windows: {} x {wlen} tokens at stride {} ({} scored)",
+        "windows: {} x {wlen} tokens at stride {} ({} scored{})",
         offsets.len(),
         offsets.get(1).copied().unwrap_or(0),
-        cnt
+        cnt,
+        if cfg.is_none() && prefill > 0 {
+            format!(", from position {prefill}")
+        } else {
+            String::new()
+        }
     );
     match &cfg {
         Some(c) => {

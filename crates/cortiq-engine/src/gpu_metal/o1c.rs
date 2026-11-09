@@ -8,6 +8,11 @@ const MSL: &str = include_str!("o1c_msl.metal");
 
 /// Rows per sub-chunk, as `o1_batch::OB_K`.
 pub(crate) const OB_K: usize = 64;
+/// The one-row path's near window split: threadgroups per group × simdgroups per threadgroup
+/// (`o1c_tok_near`), and the floats of a query head's far record (`o1c_tok_far`).
+const TOK_SPLIT: usize = 4;
+const TOK_SG: usize = 8;
+const TOK_FO: usize = 36;
 /// Sink and window together: the reach of the file's `nsrect`-free geometry.
 pub(crate) const MAX_NEAR: usize = 2052;
 
@@ -24,6 +29,15 @@ pub(crate) struct Pipes {
     ring_commit: ComputePipelineState,
     meta: ComputePipelineState,
     copy: ComputePipelineState,
+    gather: ComputePipelineState,
+    gmax: ComputePipelineState,
+    gsoft: ComputePipelineState,
+    gadd: ComputePipelineState,
+    /// The one-row path (`encode_tok`).
+    tok_near: ComputePipelineState,
+    tok_far: ComputePipelineState,
+    tok_merge: ComputePipelineState,
+    tok_commit: ComputePipelineState,
 }
 
 unsafe impl Send for Pipes {}
@@ -63,6 +77,14 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 ring_commit: pso("o1c_ring_commit")?,
                 meta: pso("o1c_meta")?,
                 copy: pso("o1c_copy")?,
+                gather: pso("o1c_gather")?,
+                gmax: pso("o1c_gmax")?,
+                gsoft: pso("o1c_gsoft")?,
+                gadd: pso("o1c_gadd")?,
+                tok_near: pso("o1c_tok_near")?,
+                tok_far: pso("o1c_tok_far")?,
+                tok_merge: pso("o1c_tok_merge")?,
+                tok_commit: pso("o1c_tok_commit")?,
             })
         })
         .as_ref()
@@ -80,6 +102,16 @@ pub(crate) struct Scratch {
     cf: Buffer,
     inv: Buffer,
     pz: Buffer,
+    /// The GEMM path's planes: window keys and values per group, scores, query panel, near sum.
+    kp: Buffer,
+    vp: Buffer,
+    gsc: Buffer,
+    qp: Buffer,
+    no: Buffer,
+    /// The one-row path's planes: near partials per (group, split, simdgroup, head) and the
+    /// far part per query head.
+    part: Buffer,
+    fo: Buffer,
 }
 
 unsafe impl Send for Scratch {}
@@ -112,6 +144,13 @@ fn scratch(c: &Ctx, od: &O1MetalDev) -> Arc<Scratch> {
         cf: shared(c, k * nh * k * 4),
         inv: shared(c, k * nh * 4),
         pz: shared(c, k * nh * 8 * d * 4),
+        kp: shared(c, g * (ncap + k) * d * 4),
+        vp: shared(c, g * (ncap + k) * d * 4),
+        gsc: shared(c, nh * k * (ncap + k) * 4),
+        qp: shared(c, nh * k * d * 4),
+        no: shared(c, nh * k * d * 4),
+        part: shared(c, g * TOK_SPLIT * TOK_SG * hpg * (d + 4) * 4),
+        fo: shared(c, nh * TOK_FO * 4),
     });
     *slot = Some(s.clone());
     s
@@ -182,7 +221,23 @@ fn run(
     }
 }
 
-fn attend(
+/// Whether a chunk of `kk` rows takes the near window as GEMMs: 16 rows or more, heads the
+/// tiles cover, the GEMM attend not switched off (`CMF_ATTN_GEMM=0`, `CMF_O1C_GEMM=0`).
+fn gemm_near(od: &O1MetalDev, kk: usize) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    kk >= 16
+        && od.d % 32 == 0
+        && od.d <= 256
+        && attn_gemm_mode() != 0
+        && !*OFF.get_or_init(|| std::env::var("CMF_O1C_GEMM").as_deref() == Ok("0"))
+}
+
+/// The near window of a chunk as GEMMs (`o1c_gather` … `o1c_gadd`): the stepwise `o1c_score`
+/// read every row's queries again for every key, about 50 ms a layer for 128 rows of
+/// Spark-X2.6 on the M4.
+#[allow(clippy::too_many_arguments)]
+fn attend_gemm(
+    c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
     conc: bool,
     p: &Pipes,
@@ -195,6 +250,105 @@ fn attend(
     u: &OC,
     kk: usize,
 ) {
+    let (g, hpg, d, m) = (od.g, od.h, od.d, od.m as u64);
+    let nh = g * hpg;
+    let e4 = (d / 4) as u64;
+    let ncap = od.ns + od.w + kk;
+    let m_rows = hpg * kk;
+    let exact = if attn_gemm_mode() == 2 { moe_q8::pipes(c) } else { None };
+    let words = |enc: &metal::ComputeCommandEncoderRef, at: u64, w: &[u32]| {
+        for (i, v) in w.iter().enumerate() {
+            enc.set_bytes(at + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+        }
+    };
+    let bar = |enc: &metal::ComputeCommandEncoderRef| {
+        if conc {
+            enc_barrier(enc);
+        }
+    };
+    run(
+        enc,
+        conc,
+        &p.gather,
+        &[&od.meta, &od.ring_k, &od.ring_v, &od.sink_k, &od.sink_v, kb, vb, &s.kp, &s.vp],
+        u,
+        (e4, ncap as u64, g as u64),
+        64,
+        false,
+    );
+    // [row][nh][d] → [nh][row][d]: a group's query rows are one panel.
+    enc.set_compute_pipeline_state(&c.packh);
+    enc.set_buffer(0, Some(q), (u.r0 as usize * nh * d * 4) as u64);
+    enc.set_buffer(1, Some(&s.qp), 0);
+    words(enc, 2, &[kk as u32, nh as u32, d as u32, kk as u32]);
+    enc.dispatch_threads(MTLSize::new((kk * nh * d) as u64, 1, 1), MTLSize::new(256, 1, 1));
+    bar(enc);
+    for gi in 0..g {
+        match exact {
+            Some(x) => moe_q8::set_att_nt(x, enc),
+            None => enc.set_compute_pipeline_state(&mm_pipeline(c, 0, d, 2)),
+        }
+        enc.set_buffer(0, Some(&s.kp), (gi * ncap * d * 4) as u64);
+        enc.set_buffer(1, Some(&s.qp), (gi * m_rows * d * 4) as u64);
+        enc.set_buffer(2, Some(&s.gsc), (gi * m_rows * ncap * 4) as u64);
+        words(enc, 3, &[d as u32, ncap as u32, m_rows as u32]);
+        enc.set_bytes(6, 4, &od.scale as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((m_rows as u64).div_ceil(32), (ncap as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+    bar(enc);
+    let k = kk as u64;
+    run(enc, conc, &p.land, &[q, &od.k_tilde, &s.fs], u, (m, g as u64, k), 32, false);
+    run(enc, conc, &p.gmax, &[&od.meta, &s.gsc, &s.nm], u, (nh as u64, k, 1), 32, true);
+    run(enc, conc, &p.far, &[&od.meta, &s.fs, &s.nm, &od.mu, &s.s, &s.hd, &s.gn, &s.cf], u, (nh as u64, k, 1), 8, false);
+    run(enc, conc, &p.gsoft, &[&od.meta, &s.gsc, &s.hd, &s.inv], u, (nh as u64, k, 1), 32, true);
+    for gi in 0..g {
+        match exact {
+            Some(x) => moe_q8::set_att_nn(x, enc),
+            None => enc.set_compute_pipeline_state(&mm_pipeline(c, d, 0, 3)),
+        }
+        enc.set_buffer(0, Some(&s.vp), (gi * ncap * d * 4) as u64);
+        enc.set_buffer(1, Some(&s.gsc), (gi * m_rows * ncap * 4) as u64);
+        enc.set_buffer(2, Some(&s.no), (gi * m_rows * d * 4) as u64);
+        words(enc, 3, &[ncap as u32, d as u32, m_rows as u32]);
+        enc.dispatch_thread_groups(
+            MTLSize::new((m_rows as u64).div_ceil(32), (d as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+    bar(enc);
+    run(
+        enc,
+        conc,
+        &p.gadd,
+        &[&od.meta, &s.no, &s.hd, &s.gn, &od.that, &s.inv, &s.cf, &od.ring_v, out],
+        u,
+        (nh as u64 * e4, k, 1),
+        32,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attend(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    conc: bool,
+    p: &Pipes,
+    od: &O1MetalDev,
+    s: &Scratch,
+    q: &Buffer,
+    kb: &Buffer,
+    vb: &Buffer,
+    out: &Buffer,
+    u: &OC,
+    kk: usize,
+) {
+    if gemm_near(od, kk) {
+        return attend_gemm(c, enc, conc, p, od, s, q, kb, vb, out, u, kk);
+    }
     let (g, nh, ncap, m) = (od.g as u64, (od.g * od.h) as u64, (od.w + od.ns) as u64, od.m as u64);
     let e4 = (od.d / 4) as u64;
     let k = kk as u64;
@@ -248,6 +402,67 @@ fn state_commit(
     run(enc, conc, &p.meta, &[&od.meta], u, (od.g as u64, 1, 1), 16, false);
 }
 
+/// Whether a one-row chunk takes the four-dispatch path (`o1c_tok_*`): up to 4 heads per
+/// group, a head width of 128 or 256, up to 32 landmarks; `CMF_O1C_TOK=0` keeps the stages.
+fn tok_ok(od: &O1MetalDev) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    od.h <= 4
+        && od.d % 128 == 0
+        && od.d <= 256
+        && od.m <= 32
+        && !*OFF.get_or_init(|| std::env::var("CMF_O1C_TOK").as_deref() == Ok("0"))
+}
+
+/// One row, attention and state commit, in four dispatches: near partials and the far part
+/// (independent), the merge into `out`, the commit.
+#[allow(clippy::too_many_arguments)]
+fn encode_tok(
+    enc: &metal::ComputeCommandEncoderRef,
+    conc: bool,
+    p: &Pipes,
+    od: &O1MetalDev,
+    s: &Scratch,
+    q: &Buffer,
+    kb: &Buffer,
+    vb: &Buffer,
+    out: &Buffer,
+) {
+    let u = uniform(od, 1, 0);
+    let (g, nh) = (od.g as u64, (od.g * od.h) as u64);
+    let e4 = (od.d / 4) as u64;
+    run(
+        enc,
+        false,
+        &p.tok_near,
+        &[&od.meta, q, &od.ring_k, &od.sink_k, kb, &od.ring_v, &od.sink_v, vb, &s.part],
+        &u,
+        (g, TOK_SPLIT as u64, 1),
+        (TOK_SG * 32) as u64,
+        true,
+    );
+    run(
+        enc,
+        conc,
+        &p.tok_far,
+        &[&od.meta, q, &od.k_tilde, &od.ring_k, &od.qt, &od.mz, &od.mu, &s.s, &s.fo],
+        &u,
+        (nh, 1, 1),
+        32,
+        true,
+    );
+    run(enc, conc, &p.tok_merge, &[&od.meta, &s.part, &s.fo, &od.that, &od.ring_v, out], &u, (nh * e4, 1, 1), 256, false);
+    run(
+        enc,
+        conc,
+        &p.tok_commit,
+        &[&od.meta, &od.ring_k, &od.ring_v, kb, vb, &od.mz, &od.that, &s.s],
+        &u,
+        (g, 1, 1),
+        256,
+        true,
+    );
+}
+
 /// The attention of `rows` rows of a sealed layer into `out`, and with `commit` the state after
 /// them. `q`: [rows][nh][d], `kb`, `vb`: [rows][g][d], `out`: [rows][nh][d].
 #[allow(clippy::too_many_arguments)]
@@ -265,12 +480,16 @@ pub(crate) fn encode(
 ) -> bool {
     let Some(p) = pipes(c) else { return false };
     let s = scratch(c, od);
+    if rows == 1 && commit && tok_ok(od) {
+        encode_tok(enc, conc, p, od, &s, q, kb, vb, out);
+        return true;
+    }
     let mut r0 = 0;
     while r0 < rows {
         let kk = OB_K.min(rows - r0);
         let u = uniform(od, kk, r0);
         far_e(enc, conc, p, od, &s, &u);
-        attend(enc, conc, p, od, &s, q, kb, vb, out, &u, kk);
+        attend(c, enc, conc, p, od, &s, q, kb, vb, out, &u, kk);
         if commit {
             state_commit(enc, conc, p, od, &s, kb, vb, &u, kk);
         }
@@ -345,6 +564,11 @@ pub(crate) fn acap_begin() {
 
 pub(crate) fn cap_end() {
     *CAPTURE.lock().unwrap() = None;
+}
+
+/// Whether a first seal asks for this layer's queries.
+pub(crate) fn wants_q(li: usize) -> bool {
+    CAPTURE.lock().unwrap().as_ref().is_some_and(|c| !c.sealed && c.q_only.contains(&li))
 }
 
 /// A rows graph's copies for this layer, if it is asked for.

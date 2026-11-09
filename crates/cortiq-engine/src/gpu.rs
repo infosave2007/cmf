@@ -1455,6 +1455,19 @@ pub fn wgpu_graph_on(phase: GraphPhase) -> bool {
     }
 }
 
+/// The batched prefill's whole-run attend is tiled on this device (see
+/// `gpu_wgpu::batched_attend_tiled`); false without the wgpu feature.
+pub fn batched_attend_tiled() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::batched_attend_tiled()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
 pub fn wgpu_graph_default() -> bool {
     #[cfg(feature = "gpu")]
     {

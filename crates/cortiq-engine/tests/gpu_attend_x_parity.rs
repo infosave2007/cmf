@@ -183,7 +183,7 @@ fn attend_xg_matches_the_cpu_softmax_needs_cmf_gpu() {
         let mut got = vec![0f32; rows * nh * dv];
         assert!(
             cortiq_engine::gpu_wgpu::attend_xg_for_test(
-                &q, &k, &v, sink, window, nh, nkv, hd, dv, scale, run, &mut got
+                &q, &k, &v, sink, window, nh, nkv, hd, dv, scale, run, 0, &mut got
             ),
             "device or attend-xg kernels missing"
         );
@@ -213,4 +213,195 @@ fn attend_xg_matches_the_cpu_softmax_needs_cmf_gpu() {
         );
         assert!(worst < 1e-5, "device attend-xg diverged from the CPU: {worst:.3e}");
     }
+}
+
+/// The batch graph's query-tiled attends — the scalar tile
+/// (`gqa_attend_part_xt`) and the matrix-unit tile (`gqa_attend_part_xc`,
+/// f16 operands) — against the CPU softmax on Spark-X2.6 shapes (16 heads on
+/// 4, 256-wide, 512 window) and smaller ones: runs across the window edge,
+/// from position 0, with a partial last tile.
+#[cfg(feature = "gpu")]
+#[test]
+fn attend_tiles_match_the_cpu_softmax_needs_cmf_gpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
+            return;
+        }
+        Some(false) => panic!("wgpu selected but the context did not come up"),
+        Some(true) => {}
+    }
+    // (nh, nkv, hd, dv, npos, window, run)
+    let cases: &[(usize, usize, usize, usize, usize, Option<usize>, usize)] = &[
+        (16, 4, 256, 256, 2300, Some(512), 300),
+        (16, 4, 256, 256, 2300, None, 300),
+        (16, 4, 256, 256, 100, None, 100),
+        (16, 4, 256, 256, 700, Some(512), 700),
+        (32, 4, 128, 128, 1100, Some(1024), 64),
+        (8, 4, 64, 64, 200, None, 50),
+    ];
+    let mut failed = Vec::new();
+    for tile in [1u8, 2u8, 3u8] {
+        for &(nh, nkv, hd, dv, npos, window, run) in cases {
+            let rows = run;
+            let q: Vec<f32> = (0..rows * nh * hd).map(|i| val(i, 1) * 0.5).collect();
+            let k: Vec<f32> = (0..npos * nkv * hd).map(|i| val(i, 2)).collect();
+            let v: Vec<f32> = (0..npos * nkv * dv).map(|i| val(i, 3)).collect();
+            let scale = (hd as f32).powf(-0.5);
+            let mut got = vec![0f32; rows * nh * dv];
+            let ok = cortiq_engine::gpu_wgpu::attend_xg_for_test(
+                &q, &k, &v, None, window, nh, nkv, hd, dv, scale, run, tile, &mut got,
+            );
+            if !ok {
+                println!("tile {tile} nh {nh} hd {hd}: kernel missing, skipped");
+                continue;
+            }
+            // `CMF_TILE_DUMP=dir`: the device output of every case as raw f32
+            // (`tile<t>_nh<nh>_hd<hd>_npos<npos>_run<run>.bin`) for offline fits.
+            if let Ok(dir) = std::env::var("CMF_TILE_DUMP") {
+                let path = format!("{dir}/tile{tile}_nh{nh}_hd{hd}_npos{npos}_run{run}.bin");
+                let bytes: Vec<u8> = got.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::write(&path, bytes);
+            }
+            let mut worst = 0f64;
+            let mut worst_at = (0usize, 0usize);
+            for r in 0..rows {
+                let pos = npos - rows + r;
+                let want = cpu_attend(
+                    &q[r * nh * hd..(r + 1) * nh * hd],
+                    &k[..(pos + 1) * nkv * hd],
+                    &v[..(pos + 1) * nkv * dv],
+                    None,
+                    window,
+                    nh,
+                    nkv,
+                    hd,
+                    dv,
+                    scale,
+                );
+                for h in 0..nh {
+                    let g = &got[(r * nh + h) * dv..(r * nh + h + 1) * dv];
+                    let w = &want[h * dv..(h + 1) * dv];
+                    let num: f64 = g.iter().zip(w).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+                    let den: f64 = w.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-30);
+                    let rel = (num / den).sqrt();
+                    if rel > worst {
+                        worst = rel;
+                        worst_at = (r, h);
+                    }
+                }
+            }
+            let tol = if tile >= 2 { 2e-2 } else { 1e-5 };
+            println!(
+                "tile {tile} nh {nh} nkv {nkv} hd {hd} dv {dv} npos {npos} window {window:?} run {run}: worst rel {worst:.3e} at row {} head {}{}",
+                worst_at.0,
+                worst_at.1,
+                if worst < tol { "" } else { "  FAIL" }
+            );
+            if worst >= tol {
+                let (r, h) = worst_at;
+                let g = &got[(r * nh + h) * dv..(r * nh + h) * dv + 8];
+                println!("  got  {g:?}");
+                failed.push((tile, nh, hd, run, worst));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "tiled attends diverged from the CPU: {failed:?}");
+}
+
+/// The matrix-unit tile's debug switches (`CMF_ATTEND_XC_DBG`): 1 = P is the
+/// identity on key `row & 63` (so the output is one V row), 2 = the output's
+/// first 64 dims are the block's raw scores. One block, full attention from
+/// position 0, four tiles of 16 tokens. Run with the switch set; without it
+/// the test only prints.
+#[cfg(feature = "gpu")]
+#[test]
+fn attend_coop_tile_debug_needs_cmf_gpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
+            return;
+        }
+        Some(false) => panic!("wgpu selected but the context did not come up"),
+        Some(true) => {}
+    }
+    let dbg: u32 = std::env::var("CMF_ATTEND_XC_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if dbg == 0 {
+        println!("set CMF_ATTEND_XC_DBG=1 or 2");
+        return;
+    }
+    let hd: usize = std::env::var("CMF_ATTEND_XC_HD").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let (nh, nkv, dv, npos, run) = (16usize, 4usize, hd, 64usize, 64usize);
+    let hpk = nh / nkv;
+    let tq = 64 / hpk;
+    // `CMF_ATTEND_XC_FILL=keys|dims`: structured inputs that print the index
+    // each output element came from (V = key or dim; Q = 1, K = key at dim 0
+    // or K = dim, so the raw score is the key or the constant hd(hd-1)/2).
+    let fill = std::env::var("CMF_ATTEND_XC_FILL").unwrap_or_default();
+    let (q, k, v): (Vec<f32>, Vec<f32>, Vec<f32>) = match fill.as_str() {
+        "keys" => (
+            vec![1.0; run * nh * hd],
+            (0..npos * nkv * hd).map(|i| if i % hd == 0 { (i / (nkv * hd)) as f32 } else { 0.0 }).collect(),
+            (0..npos * nkv * dv).map(|i| (i / (nkv * dv)) as f32).collect(),
+        ),
+        "dims" => (
+            vec![1.0; run * nh * hd],
+            (0..npos * nkv * hd).map(|i| (i % hd) as f32).collect(),
+            (0..npos * nkv * dv).map(|i| (i % dv) as f32).collect(),
+        ),
+        _ => (
+            (0..run * nh * hd).map(|i| val(i, 1) * 0.5).collect(),
+            (0..npos * nkv * hd).map(|i| val(i, 2)).collect(),
+            (0..npos * nkv * dv).map(|i| val(i, 3)).collect(),
+        ),
+    };
+    let scale = (hd as f32).powf(-0.5);
+    let mut got = vec![0f32; run * nh * dv];
+    assert!(
+        cortiq_engine::gpu_wgpu::attend_xg_for_test(&q, &k, &v, None, None, nh, nkv, hd, dv, scale, run, 2, &mut got),
+        "coop tile missing"
+    );
+    if !fill.is_empty() {
+        for (r, h) in [(0, 0), (1, 0), (0, 1), (4, 0), (5, 2), (40, 7)] {
+            let o = &got[(r * nh + h) * dv..(r * nh + h + 1) * dv];
+            let tail = &o[dv - 8..];
+            println!("fill {fill} dbg {dbg} token {r} head {h} row {}: out[0..20] {:?} out[44..64] {:?} out[tail8] {tail:?}", (r % tq) * hpk + h % hpk, &o[..20], &o[44..64]);
+        }
+        return;
+    }
+    let mut bad = 0usize;
+    let mut shown = 0usize;
+    for r in 0..run {
+        for h in 0..nh {
+            let g = h / hpk;
+            let tile = r / tq;
+            let row = (r % tq) * hpk + (h % hpk);
+            let cn = tile * tq + tq; // keys visible to the tile's last token + 1
+            let o = &got[(r * nh + h) * dv..(r * nh + h + 1) * dv];
+            let mut want = vec![0f32; dv];
+            if dbg & 1 != 0 {
+                if row < cn {
+                    want.copy_from_slice(&v[(row * nkv + g) * dv..(row * nkv + g + 1) * dv]);
+                }
+            } else {
+                for d in 0..64.min(cn) {
+                    let kr = &k[(d * nkv + g) * hd..(d * nkv + g + 1) * hd];
+                    let qr = &q[(r * nh + h) * hd..(r * nh + h + 1) * hd];
+                    want[d] = qr.iter().zip(kr).map(|(a, b)| a * b).sum();
+                }
+            }
+            let num: f64 = o.iter().zip(&want).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+            let den: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-12);
+            let rel = (num / den).sqrt();
+            if rel > 2e-2 {
+                bad += 1;
+                if shown < 12 {
+                    shown += 1;
+                    println!("dbg {dbg} r {r} h {h} (tile {tile} row {row} cn {cn}): rel {rel:.3e} got {:?} want {:?}", &o[..6], &want[..6]);
+                }
+            }
+        }
+    }
+    println!("dbg {dbg}: {bad} of {} (row, head) outputs off", run * nh);
+    assert_eq!(bad, 0);
 }

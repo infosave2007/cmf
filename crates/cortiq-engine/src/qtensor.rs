@@ -4438,6 +4438,26 @@ pub(crate) fn accel_gemm_enabled() -> bool {
     true
 }
 
+/// On x86-64 the "accel" GEMM is the AVX2 micro-kernel below, so the
+/// batched attention opens there too; `CMF_CPU_ATTEND=0` keeps the
+/// per-position attend, and a CPU without AVX2/FMA never leaves it.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+pub(crate) fn accel_gemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::env::var("CMF_CPU_ATTEND").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// Any other architecture has no CPU micro-GEMM: the per-position attend.
+#[cfg(not(any(target_os = "macos", target_arch = "aarch64", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub(crate) fn accel_gemm_enabled() -> bool {
+    false
+}
+
 /// Portable NEON f32 GEMM (row-major, optional Bᵀ): a 4×8 fmla
 /// micro-kernel with A broadcast against B panels — the mobile stand-in
 /// for Accelerate in the batched causal attention (QKᵀ and P·V). Not a
@@ -4553,6 +4573,284 @@ pub(crate) fn sgemm_rm(
     ldc: usize,
 ) {
     neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
+/// The portable micro-GEMM of the batched causal attention: NEON on
+/// aarch64, AVX2 on x86-64. Same contract as `neon_gemm_rm`.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn micro_gemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
+/// The portable micro-GEMM of the batched causal attention (x86-64 arm).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn micro_gemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    x86_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
+/// Off-macOS x86-64: the batched attention rides the AVX2 micro-GEMM.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sgemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    x86_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
+/// Portable x86-64 f32 GEMM (row-major, optional Bᵀ): the x86 twin of
+/// `neon_gemm_rm` for the batched causal attention (Q·Kᵀ and P·V). An
+/// AVX2+FMA 4×16 micro-kernel with A broadcast against B panels, blocked
+/// so a 128-column × 256-row slab of B stays in L2 while the rows of A
+/// stream past it (the P·V multiply has k = context, so without the k
+/// blocking V would be re-read once per four rows). Same contract:
+/// C[m,n] = alpha·A[m,k] × B, B stored [k,n] — or [n,k] with
+/// `b_rows_are_n`, which packs Bᵀ first (the attention callers never
+/// take that arm: they pack Kᵀ themselves). Not a BLAS: the shapes are
+/// attention panels, and the goal is the end of the per-position
+/// quadratic wall on x86, not peak GEMM. Scalar on a CPU without
+/// AVX2/FMA.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn x86_gemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    debug_assert!(a.len() >= (m - 1) * lda + k);
+    debug_assert!(c.len() >= (m - 1) * ldc + n);
+    if b_rows_are_n {
+        debug_assert!(k == 0 || b_mat.len() >= (n - 1) * ldb + k);
+        let mut bt = vec![0f32; k * n];
+        for j in 0..n {
+            for (p, &v) in b_mat[j * ldb..j * ldb + k].iter().enumerate() {
+                bt[p * n + j] = v;
+            }
+        }
+        return x86_gemm_rm(m, n, k, alpha, a, lda, &bt, n, false, c, ldc);
+    }
+    if k == 0 {
+        for r in 0..m {
+            c[r * ldc..r * ldc + n].fill(0.0);
+        }
+        return;
+    }
+    debug_assert!(b_mat.len() >= (k - 1) * ldb + n);
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: the bounds hold (asserted above), and both features were
+        // just detected on this CPU.
+        unsafe { x86_gemm_avx2(m, n, k, alpha, a, lda, b_mat, ldb, c, ldc) }
+    } else {
+        for r in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += a[r * lda + p] * b_mat[p * ldb + j];
+                }
+                c[r * ldc + j] = acc * alpha;
+            }
+        }
+    }
+}
+
+/// The AVX2+FMA body of `x86_gemm_rm` (B stored [k,n]). Loop nest:
+/// column block (128) → k block (256) → four rows of A → 16-column
+/// panel; the first k block starts the accumulators at zero, later ones
+/// resume from C, the last one applies `alpha`.
+///
+/// # Safety
+/// The caller has checked `avx2` and `fma` and the slice bounds
+/// (`a` ≥ (m−1)·lda + k, `b` ≥ (k−1)·ldb + n, `c` ≥ (m−1)·ldc + n).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn x86_gemm_avx2(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    use core::arch::x86_64::*;
+    const NC: usize = 128;
+    const KC: usize = 256;
+    unsafe {
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let cp = c.as_mut_ptr();
+        let al = _mm256_set1_ps(alpha);
+        let mut jc = 0usize;
+        while jc < n {
+            let jend = (jc + NC).min(n);
+            let mut pc = 0usize;
+            while pc < k {
+                let pend = (pc + KC).min(k);
+                let (first, last) = (pc == 0, pend == k);
+                let mut i = 0usize;
+                while i < m {
+                    let mi = (m - i).min(4);
+                    let mut j = jc;
+                    while j < jend {
+                        let nj = (jend - j).min(16);
+                        if mi == 4 && nj == 16 {
+                            let a0 = ap.add(i * lda);
+                            let a1 = ap.add((i + 1) * lda);
+                            let a2 = ap.add((i + 2) * lda);
+                            let a3 = ap.add((i + 3) * lda);
+                            let c0 = cp.add(i * ldc + j);
+                            let c1 = cp.add((i + 1) * ldc + j);
+                            let c2 = cp.add((i + 2) * ldc + j);
+                            let c3 = cp.add((i + 3) * ldc + j);
+                            let (mut c00, mut c01, mut c10, mut c11, mut c20, mut c21, mut c30, mut c31) =
+                                if first {
+                                    let z = _mm256_setzero_ps();
+                                    (z, z, z, z, z, z, z, z)
+                                } else {
+                                    (
+                                        _mm256_loadu_ps(c0),
+                                        _mm256_loadu_ps(c0.add(8)),
+                                        _mm256_loadu_ps(c1),
+                                        _mm256_loadu_ps(c1.add(8)),
+                                        _mm256_loadu_ps(c2),
+                                        _mm256_loadu_ps(c2.add(8)),
+                                        _mm256_loadu_ps(c3),
+                                        _mm256_loadu_ps(c3.add(8)),
+                                    )
+                                };
+                            for p in pc..pend {
+                                let bb = bp.add(p * ldb + j);
+                                let b0 = _mm256_loadu_ps(bb);
+                                let b1 = _mm256_loadu_ps(bb.add(8));
+                                let x0 = _mm256_broadcast_ss(&*a0.add(p));
+                                c00 = _mm256_fmadd_ps(x0, b0, c00);
+                                c01 = _mm256_fmadd_ps(x0, b1, c01);
+                                let x1 = _mm256_broadcast_ss(&*a1.add(p));
+                                c10 = _mm256_fmadd_ps(x1, b0, c10);
+                                c11 = _mm256_fmadd_ps(x1, b1, c11);
+                                let x2 = _mm256_broadcast_ss(&*a2.add(p));
+                                c20 = _mm256_fmadd_ps(x2, b0, c20);
+                                c21 = _mm256_fmadd_ps(x2, b1, c21);
+                                let x3 = _mm256_broadcast_ss(&*a3.add(p));
+                                c30 = _mm256_fmadd_ps(x3, b0, c30);
+                                c31 = _mm256_fmadd_ps(x3, b1, c31);
+                            }
+                            if last {
+                                c00 = _mm256_mul_ps(c00, al);
+                                c01 = _mm256_mul_ps(c01, al);
+                                c10 = _mm256_mul_ps(c10, al);
+                                c11 = _mm256_mul_ps(c11, al);
+                                c20 = _mm256_mul_ps(c20, al);
+                                c21 = _mm256_mul_ps(c21, al);
+                                c30 = _mm256_mul_ps(c30, al);
+                                c31 = _mm256_mul_ps(c31, al);
+                            }
+                            _mm256_storeu_ps(c0, c00);
+                            _mm256_storeu_ps(c0.add(8), c01);
+                            _mm256_storeu_ps(c1, c10);
+                            _mm256_storeu_ps(c1.add(8), c11);
+                            _mm256_storeu_ps(c2, c20);
+                            _mm256_storeu_ps(c2.add(8), c21);
+                            _mm256_storeu_ps(c3, c30);
+                            _mm256_storeu_ps(c3.add(8), c31);
+                        } else {
+                            // Row-at-a-time tail: fewer than four rows left,
+                            // or a panel narrower than 16 columns.
+                            for r in 0..mi {
+                                let ar = ap.add((i + r) * lda);
+                                let cr = cp.add((i + r) * ldc + j);
+                                let mut q = 0usize;
+                                while q + 8 <= nj {
+                                    let mut acc = if first {
+                                        _mm256_setzero_ps()
+                                    } else {
+                                        _mm256_loadu_ps(cr.add(q))
+                                    };
+                                    for p in pc..pend {
+                                        acc = _mm256_fmadd_ps(
+                                            _mm256_broadcast_ss(&*ar.add(p)),
+                                            _mm256_loadu_ps(bp.add(p * ldb + j + q)),
+                                            acc,
+                                        );
+                                    }
+                                    if last {
+                                        acc = _mm256_mul_ps(acc, al);
+                                    }
+                                    _mm256_storeu_ps(cr.add(q), acc);
+                                    q += 8;
+                                }
+                                while q < nj {
+                                    let mut acc = if first { 0.0 } else { *cr.add(q) };
+                                    for p in pc..pend {
+                                        acc += *ar.add(p) * *bp.add(p * ldb + j + q);
+                                    }
+                                    if last {
+                                        acc *= alpha;
+                                    }
+                                    *cr.add(q) = acc;
+                                    q += 1;
+                                }
+                            }
+                        }
+                        j += nj;
+                    }
+                    i += mi;
+                }
+                pc = pend;
+            }
+            jc = jend;
+        }
+    }
 }
 
 /// Row-major f32 GEMM, exposed for offline tools (the AWNP pass builds a
@@ -6369,15 +6667,25 @@ unsafe fn q4tp_hsum256(acc: core::arch::x86_64::__m256) -> f32 {
     }
 }
 
+/// The `− 8·Σx` term of a q4tp a8w8 row: `8 · Σ_g Σx_g · scale_g`, an f32
+/// dot over the groups. Every vertical-cell path subtracts it after its
+/// horizontal sum through this one function, so their bits agree.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn q4tp_xg8_corr(xg8: &[f32], sc: &[f32]) -> f32 {
+    let n = sc.len().min(xg8.len());
+    8.0 * crate::attention::dot_f32(&xg8[..n], &sc[..n])
+}
+
 /// One (row, activation) cell computed the vertical way: per group,
-/// `(Σ(w+8)·x − 8·Σx) as f32 · scale` accumulated lane-wise in f32x8,
-/// one horizontal reduction at the end. Used by the lane drivers' tails
+/// `Σ(w+8)·x as f32 · scale` fused into lane-wise f32x8 accumulators, one
+/// horizontal reduction, then the `8·Σx` term (`q4tp_xg8_corr`). Used by the lane drivers' tails
 /// and by the row-exact matmat column loop so both land on identical bits.
 ///
 /// # Safety
 /// AVX2; `gpr` groups must be covered by `xq`/`sc`/`xg8`.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn q4tp_cell_dot_v(
     nib: *const u8,
@@ -6393,10 +6701,13 @@ unsafe fn q4tp_cell_dot_v(
         for gi in 0..gpr {
             let w = q4tp_unpack_w(nib.add((r * gpr + gi) * Q4TP_NIB));
             let d = q4tp_madd_wx(w, xp.add(gi * GROUP_SIZE));
-            let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), _mm256_set1_ps(*xg8.add(gi)));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(t, _mm256_set1_ps(*sc.add(gi))));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_set1_ps(*sc.add(gi)), acc);
         }
         q4tp_hsum256(acc)
+            - q4tp_xg8_corr(
+                std::slice::from_raw_parts(xg8, gpr),
+                std::slice::from_raw_parts(sc, gpr),
+            )
     }
 }
 
@@ -6413,7 +6724,7 @@ unsafe fn q4tp_cell_dot_v(
 /// AVX2 (caller gates on `a8w8_enabled()` + `xg8.len() == gpr`);
 /// `out` cells for this row are this worker's alone.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn q4tp_matmat_row_cols_v(
     v: &Q4tpView<'_>,
     r: usize,
@@ -6437,14 +6748,12 @@ unsafe fn q4tp_matmat_row_cols_v(
             for (k, act) in a.iter().enumerate() {
                 let xp = act.xq.as_ptr().add(gi * GROUP_SIZE);
                 let d = q4tp_madd_wx(w, xp);
-                let xgb = _mm256_set1_ps(*act.xg8.get_unchecked(gi));
-                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
-                accs[k] = _mm256_add_ps(accs[k], _mm256_mul_ps(t, sb));
+                accs[k] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sb, accs[k]);
             }
         }
         for k in 0..4 {
             let act = a[k];
-            let mut acc = q4tp_hsum256(accs[k]) * act.sx;
+            let mut acc = (q4tp_hsum256(accs[k]) - q4tp_xg8_corr(&act.xg8, sc)) * act.sx;
             for &(j, xv) in &act.outliers {
                 let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
                 acc += w * s * xv;
@@ -6475,6 +6784,142 @@ unsafe fn q4tp_matmat_row_cols_v(
     }
 }
 
+/// Columns per activation panel of the q4tp batch: `CMF_Q4TP_PANEL`, else
+/// 256 — and on x86-64 as many as fill half the core's L2 (`cols` int8
+/// bytes a column), a multiple of four from 8 to 256. A panel of 256
+/// columns of a 2560-wide row is 655 KB: on a 512 KB L2 (Zen 1/2) every
+/// weight row streamed the whole panel from L3 again.
+fn q4tp_panel_cols(cols: usize) -> usize {
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(v) = *ENV.get_or_init(|| {
+        std::env::var("CMF_Q4TP_PANEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+    }) {
+        return v;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        ((l2_bytes() / 2) / cols.max(1)).clamp(8, 256) & !3
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = cols;
+        256
+    }
+}
+
+/// The per-core L2 size (Linux sysfs; 1 MB when unknown).
+#[cfg(target_arch = "x86_64")]
+fn l2_bytes() -> usize {
+    static L2: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L2.get_or_init(|| {
+        let s = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index2/size").unwrap_or_default();
+        let s = s.trim();
+        let (num, mul) = match s.strip_suffix('K') {
+            Some(n) => (n, 1024),
+            None => match s.strip_suffix('M') {
+                Some(n) => (n, 1024 * 1024),
+                None => (s, 1),
+            },
+        };
+        num.parse::<usize>().ok().map(|n| n * mul).filter(|&b| b >= 64 * 1024).unwrap_or(1 << 20)
+    })
+}
+
+/// `CMF_Q4TP_FMA=0` keeps the row-exact vertical cell
+/// (`q4tp_matmat_row_cols_v`) for a batch on an AVX2 CPU (A/B only).
+#[cfg(target_arch = "x86_64")]
+fn q4tp_fma_x86() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::env::var("CMF_Q4TP_FMA").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// Two weight rows (`r`, `r + 1`) against a panel of activation columns,
+/// the tuned AVX2 shape for a batch that need not be row-exact: four
+/// columns at a time, so each group's tile is unpacked once for four
+/// columns and each column's 32 bytes are loaded once for two rows (eight
+/// lane accumulators, the register file's worth). Per group and cell the
+/// loop is `vpmaddubsw`, `vpmaddwd`, a convert and one FMA by the group
+/// scale — the vertical cell's `− 8·Σx` correction leaves the loop and is
+/// taken once per cell as `8 · Σ_g Σx_g · scale_g` (an f32 dot over the
+/// groups). The same products as the vertical cell, summed in another
+/// order: tolerance-class against the matvec, like the ARM tuned shape.
+/// Columns past the last group of four take the vertical cell, row by row.
+///
+/// # Safety
+/// AVX2 and FMA (`q4tp_fma_x86`); every column carries `xg8` of `gpr`
+/// groups; `out` cells (`(abase + k)·rows + r`, `r + 1`) disjoint per worker.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4tp_matmat_2rows_fma(
+    v: &Q4tpView<'_>,
+    r: usize,
+    gpr: usize,
+    acts: &[SplitAct],
+    sc0: &[f32],
+    sc1: &[f32],
+    abase: usize,
+    rows: usize,
+    out: SendMut,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(sc0.len() == gpr && sc1.len() == gpr);
+    let n = acts.len();
+    let nib = v.nib.as_ptr();
+    let ones = _mm256_set1_epi16(1);
+    let mut bi = 0usize;
+    unsafe {
+        while bi + 4 <= n {
+            let a: [&SplitAct; 4] = [&acts[bi], &acts[bi + 1], &acts[bi + 2], &acts[bi + 3]];
+            let xp: [*const i8; 4] = [
+                a[0].xq.as_ptr(),
+                a[1].xq.as_ptr(),
+                a[2].xq.as_ptr(),
+                a[3].xq.as_ptr(),
+            ];
+            let mut c0 = [_mm256_setzero_ps(); 4];
+            let mut c1 = [_mm256_setzero_ps(); 4];
+            for gi in 0..gpr {
+                let w0 = q4tp_unpack_w(nib.add((r * gpr + gi) * Q4TP_NIB));
+                let w1 = q4tp_unpack_w(nib.add(((r + 1) * gpr + gi) * Q4TP_NIB));
+                let s0 = _mm256_set1_ps(*sc0.get_unchecked(gi));
+                let s1 = _mm256_set1_ps(*sc1.get_unchecked(gi));
+                for k in 0..4 {
+                    let x = _mm256_loadu_si256(xp[k].add(gi * GROUP_SIZE) as *const __m256i);
+                    let d0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, x), ones);
+                    let d1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, x), ones);
+                    c0[k] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d0), s0, c0[k]);
+                    c1[k] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d1), s1, c1[k]);
+                }
+            }
+            for (row, cr, scr) in [(r, &c0, sc0), (r + 1, &c1, sc1)] {
+                for k in 0..4 {
+                    let act = a[k];
+                    let mut acc = (q4tp_hsum256(cr[k]) - q4tp_xg8_corr(&act.xg8, scr)) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
+                        acc += w * s * xv;
+                    }
+                    // SAFETY: disjoint (bi, r) cells per worker.
+                    *out.at((abase + bi + k) * rows + row) = acc;
+                }
+            }
+            bi += 4;
+        }
+        if bi < n {
+            q4tp_matmat_row_cols_v(v, r, gpr, &acts[bi..], sc0, abase + bi, rows, out);
+            q4tp_matmat_row_cols_v(v, r + 1, gpr, &acts[bi..], sc1, abase + bi, rows, out);
+        }
+    }
+}
+
 /// Rows `start..end` of a single-output q4tp a8w8 matvec, `L` independent
 /// accumulator chains wide. Per row: scales decoded once, groups stepped
 /// in ascending `gi` with `acc += d as f32 * scale` (the exact plain-row
@@ -6484,7 +6929,7 @@ unsafe fn q4tp_matmat_row_cols_v(
 /// # Safety
 /// AVX2 (callers gate on `a8w8_enabled()`); `out` disjoint per row.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn q4tp_matvec_lanes<const L: usize>(
     v: &Q4tpView<'_>,
     start: usize,
@@ -6514,13 +6959,11 @@ unsafe fn q4tp_matvec_lanes<const L: usize>(
         let mut accs = [_mm256_setzero_ps(); L];
         for gi in 0..gpr {
             let xp = xq.as_ptr().add(gi * GROUP_SIZE);
-            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
             for l in 0..L {
                 let w = q4tp_unpack_w(v.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
                 let d = q4tp_madd_wx(w, xp);
-                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
                 let sb = _mm256_set1_ps(*sc.get_unchecked(l * gpr + gi));
-                accs[l] = _mm256_add_ps(accs[l], _mm256_mul_ps(t, sb));
+                accs[l] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sb, accs[l]);
             }
         }
         drop(_t1);
@@ -6528,7 +6971,7 @@ unsafe fn q4tp_matvec_lanes<const L: usize>(
         for l in 0..L {
             let r = rows[l];
             let scl = &sc[l * gpr..(l + 1) * gpr];
-            let mut acc = q4tp_hsum256(accs[l]) * sx;
+            let mut acc = (q4tp_hsum256(accs[l]) - q4tp_xg8_corr(xg8, scl)) * sx;
             for &(j, xv) in outliers {
                 let (w, s) = q4tp_outlier(v.nib, r, gpr, j, scl);
                 acc += w * s * xv;
@@ -6565,7 +7008,7 @@ unsafe fn q4tp_matvec_lanes<const L: usize>(
 /// # Safety
 /// AVX2 (callers gate on `a8w8_enabled()`); `out` disjoint per row.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn q4tp_gateup_lanes<const L: usize>(
     gv: &Q4tpView<'_>,
     uv: &Q4tpView<'_>,
@@ -6603,20 +7046,17 @@ unsafe fn q4tp_gateup_lanes<const L: usize>(
         let mut au = [_mm256_setzero_ps(); L];
         for gi in 0..gpr {
             let xp = xq.as_ptr().add(gi * GROUP_SIZE);
-            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
             for l in 0..L {
                 let w = q4tp_unpack_w(gv.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
                 let d = q4tp_madd_wx(w, xp);
-                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
                 let sb = _mm256_set1_ps(*gsc.get_unchecked(l * gpr + gi));
-                ag[l] = _mm256_add_ps(ag[l], _mm256_mul_ps(t, sb));
+                ag[l] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sb, ag[l]);
             }
             for l in 0..L {
                 let w = q4tp_unpack_w(uv.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
                 let d = q4tp_madd_wx(w, xp);
-                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
                 let sb = _mm256_set1_ps(*usc.get_unchecked(l * gpr + gi));
-                au[l] = _mm256_add_ps(au[l], _mm256_mul_ps(t, sb));
+                au[l] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sb, au[l]);
             }
         }
         drop(_t1);
@@ -6625,8 +7065,8 @@ unsafe fn q4tp_gateup_lanes<const L: usize>(
             let r = rows[l];
             let gs = &gsc[l * gpr..(l + 1) * gpr];
             let us = &usc[l * gpr..(l + 1) * gpr];
-            let mut g = q4tp_hsum256(ag[l]) * sx;
-            let mut u = q4tp_hsum256(au[l]) * sx;
+            let mut g = (q4tp_hsum256(ag[l]) - q4tp_xg8_corr(xg8, gs)) * sx;
+            let mut u = (q4tp_hsum256(au[l]) - q4tp_xg8_corr(xg8, us)) * sx;
             for &(j, xv) in outliers {
                 let (w, s) = q4tp_outlier(gv.nib, r, gpr, j, gs);
                 g += w * s * xv;
@@ -6669,7 +7109,7 @@ unsafe fn q4tp_gateup_lanes<const L: usize>(
 /// # Safety
 /// AVX2 (callers gate on `a8w8_enabled()`); `outs` disjoint per row.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn q4tp_many_lanes<const L: usize>(
     views: &[Q4tpView<'_>],
     locate: &(dyn Fn(usize) -> (usize, usize)),
@@ -6703,15 +7143,13 @@ unsafe fn q4tp_many_lanes<const L: usize>(
         let mut accs = [_mm256_setzero_ps(); L];
         for gi in 0..gpr {
             let xp = xq.as_ptr().add(gi * GROUP_SIZE);
-            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
             for l in 0..L {
                 let w = q4tp_unpack_w(
                     views[tk[l]].nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB),
                 );
                 let d = q4tp_madd_wx(w, xp);
-                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
                 let sb = _mm256_set1_ps(*sc.get_unchecked(l * gpr + gi));
-                accs[l] = _mm256_add_ps(accs[l], _mm256_mul_ps(t, sb));
+                accs[l] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sb, accs[l]);
             }
         }
         drop(_t1);
@@ -6719,7 +7157,7 @@ unsafe fn q4tp_many_lanes<const L: usize>(
         for l in 0..L {
             let (t, r) = (tk[l], rows[l]);
             let scl = &sc[l * gpr..(l + 1) * gpr];
-            let mut acc = q4tp_hsum256(accs[l]) * sx;
+            let mut acc = (q4tp_hsum256(accs[l]) - q4tp_xg8_corr(xg8, scl)) * sx;
             for &(j, xv) in outliers {
                 let (w, s) = q4tp_outlier(views[t].nib, r, gpr, j, scl);
                 acc += w * s * xv;
@@ -7902,9 +8340,7 @@ fn q4tp_matmat_with(
 
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
-        let acts: Vec<SplitAct> = (0..b)
-            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
-            .collect();
+        let acts = split_acts_pooled(xs_all, b, cols, pool);
         let acts = &acts;
         // ARM stays blocked under `exact` too: the 1x4 kernel then runs in
         // its v1 shape, whose per-group `int dot as f32 * scale` and scalar
@@ -7936,11 +8372,7 @@ fn q4tp_matmat_with(
         // 256 columns is 590 KB beside 221 KB of this worker's weights:
         // both stay resident and the batch crosses L3 once instead of
         // once per row.
-        let panel_cols: usize = std::env::var("CMF_Q4TP_PANEL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(256);
+        let panel_cols = q4tp_panel_cols(cols);
         let run = |start: usize, end: usize| {
             for abase in (0..acts.len()).step_by(panel_cols) {
                 let alen = (acts.len() - abase).min(panel_cols);
@@ -8003,6 +8435,39 @@ fn q4tp_matmat_with(
                                 unsafe { *out_addr.at((abase + b2) * rows + row) = acc };
                             }
                         }
+                        r_lo += 2;
+                    }
+                }
+                // AVX2 without VNNI, a batch that need not be row-exact:
+                // two rows against four columns with FMA
+                // (`q4tp_matmat_2rows_fma`); an odd last row falls to the
+                // vertical cell below.
+                #[cfg(target_arch = "x86_64")]
+                if !blocked_ok
+                    && !exact
+                    && alen >= 4
+                    && q4tp_fma_x86()
+                    && acts[abase..abase + alen].iter().all(|a| a.xg8.len() == gpr)
+                {
+                    let mut sc1 = vec![0f32; gpr];
+                    while r_lo + 2 <= end {
+                        v.scales_into(r_lo, gpr, &mut sc);
+                        v.scales_into(r_lo + 1, gpr, &mut sc1);
+                        // SAFETY: AVX2+FMA checked; cells disjoint per
+                        // (worker, bi, r).
+                        unsafe {
+                            q4tp_matmat_2rows_fma(
+                                &v,
+                                r_lo,
+                                gpr,
+                                &acts[abase..abase + alen],
+                                &sc,
+                                &sc1,
+                                abase,
+                                rows,
+                                out_addr,
+                            )
+                        };
                         r_lo += 2;
                     }
                 }
@@ -12692,6 +13157,36 @@ fn silu_mul_limited(mut gate: f32, mut up: f32, limit: f32) -> f32 {
     gate / (1.0 + (-gate).exp()) * up
 }
 
+/// `split_act` of every column of a batch, the columns spread over the
+/// pool from 16 on. Each column's split is its own (the same bits as the
+/// serial loop); serially it was 25 µs a column, 6 ms of a Spark-4B
+/// prefill token on an 8-thread EPYC while the workers idled.
+fn split_acts_pooled(xs_all: &[f32], b: usize, cols: usize, pool: Option<&Pool>) -> Vec<SplitAct> {
+    match pool {
+        Some(p) if b >= 16 => {
+            let slots: Vec<std::sync::Mutex<Option<SplitAct>>> =
+                (0..b).map(|_| std::sync::Mutex::new(None)).collect();
+            p.run_rows(b, &|start, end| {
+                for bi in start..end {
+                    let a = split_act(&xs_all[bi * cols..(bi + 1) * cols]);
+                    *slots[bi].lock().unwrap_or_else(|e| e.into_inner()) = Some(a);
+                }
+            });
+            slots
+                .into_iter()
+                .map(|m| {
+                    m.into_inner()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .expect("every column split")
+                })
+                .collect()
+        }
+        _ => (0..b)
+            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
+            .collect(),
+    }
+}
+
 fn split_act(x: &[f32]) -> SplitAct {
     let _prof = crate::cpuprof::time(crate::cpuprof::Slot::SplitAct);
     let n = x.len();
@@ -16379,5 +16874,124 @@ mod gemm_bench {
             flops / best / 1e9,
             out.iter().take(64).sum::<f32>()
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_gemm_tests {
+    use super::x86_gemm_rm;
+
+    /// The AVX2 two-row FMA q4tp batch kernel against the row-exact
+    /// vertical cell (the matvec's bits): odd row counts (the last row
+    /// takes the vertical cell), columns past a group of four, a wide
+    /// row of 2560 columns (80 groups), outliers in the activations, and
+    /// the pool. Measured against the output's scale, as the blocked
+    /// kernel's test does.
+    #[test]
+    fn q4tp_fma_batch_matches_the_row_exact_cell() {
+        if !super::q4tp_fma_x86() || !super::a8w8_enabled() {
+            return;
+        }
+        let pool = crate::pool::Pool::from_env();
+        for &(rows, cols, b) in &[(33usize, 96usize, 7usize), (64, 256, 13), (257, 2560, 37)] {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut bytes: Vec<u8> = (0..total).map(|i| (i * 61 % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                bytes[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                bytes[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            let mut xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 37 % 89) as f32 - 44.0) / 44.0)
+                .collect();
+            for bi in (0..b).step_by(3) {
+                xs[bi * cols + (bi * 7) % cols] = 40.0; // an outlier column
+            }
+            let mut got = vec![0f32; b * rows];
+            let mut want = vec![0f32; b * rows];
+            super::q4tp_matmat_with(&bytes, &xs, b, rows, cols, &mut got, pool.as_deref(), false);
+            super::q4tp_matmat_with(&bytes, &xs, b, rows, cols, &mut want, pool.as_deref(), true);
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+            assert!(
+                worst <= 1e-5 * scale,
+                "{rows}x{cols} b={b}: FMA batch and row-exact cell disagree by {worst:.3e} (scale {scale:.3e})"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn naive(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &[f32],
+        lda: usize,
+        b: &[f32],
+        ldb: usize,
+        b_rows_are_n: bool,
+    ) -> Vec<f64> {
+        let mut c = vec![0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for p in 0..k {
+                    let bv = if b_rows_are_n { b[j * ldb + p] } else { b[p * ldb + j] };
+                    acc += a[i * lda + p] as f64 * bv as f64;
+                }
+                c[i * n + j] = acc * alpha as f64;
+            }
+        }
+        c
+    }
+
+    /// The AVX2 micro-GEMM against a double-precision triple loop: both
+    /// B layouts, padded leading dimensions, shapes that exercise the
+    /// 4×16 kernel, the row and column tails, and the k blocking (k >
+    /// 256 resumes the accumulators from C).
+    #[test]
+    fn x86_gemm_matches_naive_on_odd_shapes() {
+        for &(m, n, k) in &[
+            (1usize, 1usize, 1usize),
+            (4, 16, 256),
+            (7, 37, 19),
+            (9, 300, 257),
+            (64, 1000, 256),
+            (5, 256, 1001),
+            (13, 129, 512),
+            (8, 16, 0),
+        ] {
+            for &bt in &[false, true] {
+                let (lda, ldb, ldc) = (k + 3, if bt { k + 2 } else { n + 5 }, n + 1);
+                let a: Vec<f32> = (0..m * lda)
+                    .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+                    .collect();
+                let brows = if bt { n } else { k.max(1) };
+                let b: Vec<f32> = (0..brows * ldb)
+                    .map(|i| ((i * 104_729) % 997) as f32 / 498.5 - 1.0)
+                    .collect();
+                let mut c = vec![f32::NAN; m * ldc];
+                x86_gemm_rm(m, n, k, 0.37, &a, lda, &b, ldb, bt, &mut c, ldc);
+                let r = naive(m, n, k, 0.37, &a, lda, &b, ldb, bt);
+                for i in 0..m {
+                    for j in 0..n {
+                        let (x, y) = (c[i * ldc + j] as f64, r[i * n + j]);
+                        assert!(
+                            (x - y).abs() <= 1e-3 * (1.0 + y.abs()),
+                            "m{m} n{n} k{k} bt{bt} [{i},{j}]: {x} vs {y}"
+                        );
+                    }
+                    assert!(c[i * ldc + n].is_nan(), "m{m} n{n} k{k}: padding column written");
+                }
+            }
+        }
     }
 }

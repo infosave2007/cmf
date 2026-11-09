@@ -3323,6 +3323,50 @@ mod embryo_core_shader_tests {
 }
 
 #[cfg(test)]
+mod coop_gemm_shader_tests {
+    fn validate(src: &str, what: &str) {
+        let module = wgpu::naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("{what} WGSL must parse: {}", e.emit_to_string(src)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{what} WGSL must validate: {}", e.emit_to_string(src)));
+    }
+
+    /// The cooperative GEMMs (in-kernel dequant, the f16 plane, the q8_2f
+    /// twin) parse and validate without a device.
+    #[test]
+    fn coop_gemm_shaders_validate() {
+        validate(super::COOP_MM_SRC, "q4tp-mm-coop");
+        validate(super::COOP_MM_V2_SRC, "q4tp-mm-coop-v2");
+        validate(super::COOP_MM_F16_SRC, "q4tp-mm-f16");
+        validate(&super::coop_q82_src(), "q82-mm-coop");
+    }
+}
+
+#[cfg(test)]
+mod attend_coop_shader_tests {
+    /// The matrix-unit query tile (grouped blocks, lazy rescale) parses and
+    /// validates without a device: naga's uniformity analysis is what
+    /// rejected the first version (a return before a cooperative op), and
+    /// a Mac can run this check before the pod builds.
+    #[test]
+    fn attend_coop_shader_validates() {
+        let src = super::attend_coop_src();
+        let module = wgpu::naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("attend-coop WGSL must parse: {}", e.emit_to_string(&src)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("attend-coop WGSL must validate: {}", e.emit_to_string(&src)));
+    }
+}
+
+#[cfg(test)]
 mod global_moe_shader_tests {
     use super::{DSV4_GLOBAL_MOE_SRC, dsv4_global_moe_shader_source};
 
@@ -18532,8 +18576,9 @@ fn gqa_attend_merge_x(@builtin(workgroup_id) wid: vec3<u32>,
 // Ring-aware like the rest of this module (row (first + p) % cap); the
 // partials land in the [h*nc + ch] layout `gqa_attend_merge_x` reads,
 // with `_a` = 64 telling it the chunk length. hpk <= 8, hd <= 256,
-// dv <= 128. Lanes are (position, head) items for the scores, 16 lanes a
-// head for the chunk max/sum, and output dims for the value pass.
+// dv <= 256. Lanes are (position, head) items for the scores, 16 lanes a
+// head for the chunk max/sum, and output dims for the value pass (two a
+// lane past 128).
 var<workgroup> xg_q: array<vec4<f32>, 520>;   // [hq*(hd4+1) + d4] (padded: no bank conflicts)
 var<workgroup> xg_w: array<f32, 512>;         // [hq*64 + p]
 var<workgroup> xg_m: array<f32, 128>;
@@ -18561,7 +18606,11 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
     workgroupBarrier();
     let dv4 = dv / 4u;
     let vbase4 = g * cap * dv4;
-    for (var i = lid; i < cn * dv4; i = i + 128u) {
+    // V rows in flights of at most 2048 vec4: the chunk's 64 positions of a
+    // 128-wide V at once, 32 of a 256-wide one (Spark-X2.6), the second
+    // flight staged after the first is summed.
+    let pf = min(cn, 2048u / dv4);
+    for (var i = lid; i < pf * dv4; i = i + 128u) {
         let p = i / dv4;
         let sp = s0 + p;
         xg_vs[i] = ax_v4[vbase4 + select(sp, sp - cap, sp >= cap) * dv4 + (i - p * dv4)];
@@ -18606,23 +18655,62 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
         workgroupBarrier();
         st = st >> 1u;
     }
-    if (lid < dv) {
-        var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
-        var a4 = 0.0; var a5 = 0.0; var a6 = 0.0; var a7 = 0.0;
-        let lq = lid >> 2u;
-        let lc = lid & 3u;
-        for (var p = 0u; p < cn; p = p + 1u) {
-            let v = xg_vs[p * dv4 + lq][lc];
-            a0 = a0 + xg_w[p] * v;
-            a1 = a1 + xg_w[64u + p] * v;
-            a2 = a2 + xg_w[128u + p] * v;
-            a3 = a3 + xg_w[192u + p] * v;
-            a4 = a4 + xg_w[256u + p] * v;
-            a5 = a5 + xg_w[320u + p] * v;
-            a6 = a6 + xg_w[384u + p] * v;
-            a7 = a7 + xg_w[448u + p] * v;
+    // Value pass: lane `lid` owns output dim lid and, for a V wider than
+    // 128, dim lid + 128 as well (a0..a7 and b0..b7 per query head).
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    var a4 = 0.0; var a5 = 0.0; var a6 = 0.0; var a7 = 0.0;
+    var b0 = 0.0; var b1 = 0.0; var b2 = 0.0; var b3 = 0.0;
+    var b4 = 0.0; var b5 = 0.0; var b6 = 0.0; var b7 = 0.0;
+    let lq = lid >> 2u;
+    let lc = lid & 3u;
+    let lq2 = (lid + 128u) >> 2u;
+    let two = lid + 128u < dv;
+    var pb0 = 0u;
+    loop {
+        if (pb0 >= cn) { break; }
+        let pn = min(pf, cn - pb0);
+        if (pb0 > 0u) {
+            // The next flight of V rows, once every lane is done with the last.
+            workgroupBarrier();
+            for (var i = lid; i < pn * dv4; i = i + 128u) {
+                let p = i / dv4;
+                let sp = s0 + pb0 + p;
+                xg_vs[i] = ax_v4[vbase4 + select(sp, sp - cap, sp >= cap) * dv4 + (i - p * dv4)];
+            }
+            workgroupBarrier();
         }
-        let ib = pb * nc + ch;
+        if (lid < dv) {
+            for (var p = 0u; p < pn; p = p + 1u) {
+                let v = xg_vs[p * dv4 + lq][lc];
+                let w = pb0 + p;
+                a0 = a0 + xg_w[w] * v;
+                a1 = a1 + xg_w[64u + w] * v;
+                a2 = a2 + xg_w[128u + w] * v;
+                a3 = a3 + xg_w[192u + w] * v;
+                a4 = a4 + xg_w[256u + w] * v;
+                a5 = a5 + xg_w[320u + w] * v;
+                a6 = a6 + xg_w[384u + w] * v;
+                a7 = a7 + xg_w[448u + w] * v;
+            }
+        }
+        if (two) {
+            for (var p = 0u; p < pn; p = p + 1u) {
+                let v = xg_vs[p * dv4 + lq2][lc];
+                let w = pb0 + p;
+                b0 = b0 + xg_w[w] * v;
+                b1 = b1 + xg_w[64u + w] * v;
+                b2 = b2 + xg_w[128u + w] * v;
+                b3 = b3 + xg_w[192u + w] * v;
+                b4 = b4 + xg_w[256u + w] * v;
+                b5 = b5 + xg_w[320u + w] * v;
+                b6 = b6 + xg_w[384u + w] * v;
+                b7 = b7 + xg_w[448u + w] * v;
+            }
+        }
+        pb0 = pb0 + pf;
+    }
+    let ib = pb * nc + ch;
+    if (lid < dv) {
         ax_acc[ib * dv + lid] = a0;
         if (hpk > 1u) { ax_acc[(ib + nc) * dv + lid] = a1; }
         if (hpk > 2u) { ax_acc[(ib + 2u * nc) * dv + lid] = a2; }
@@ -18631,6 +18719,17 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
         if (hpk > 5u) { ax_acc[(ib + 5u * nc) * dv + lid] = a5; }
         if (hpk > 6u) { ax_acc[(ib + 6u * nc) * dv + lid] = a6; }
         if (hpk > 7u) { ax_acc[(ib + 7u * nc) * dv + lid] = a7; }
+    }
+    if (two) {
+        let d2 = lid + 128u;
+        ax_acc[ib * dv + d2] = b0;
+        if (hpk > 1u) { ax_acc[(ib + nc) * dv + d2] = b1; }
+        if (hpk > 2u) { ax_acc[(ib + 2u * nc) * dv + d2] = b2; }
+        if (hpk > 3u) { ax_acc[(ib + 3u * nc) * dv + d2] = b3; }
+        if (hpk > 4u) { ax_acc[(ib + 4u * nc) * dv + d2] = b4; }
+        if (hpk > 5u) { ax_acc[(ib + 5u * nc) * dv + d2] = b5; }
+        if (hpk > 6u) { ax_acc[(ib + 6u * nc) * dv + d2] = b6; }
+        if (hpk > 7u) { ax_acc[(ib + 7u * nc) * dv + d2] = b7; }
     }
     if (lid < hpk) {
         ax_ml[(pb + lid) * nc + ch] = vec2<f32>(xg_m[lid * 16u], xg_l[lid * 16u]);
@@ -18660,6 +18759,7 @@ struct AbP {
     nh: u32, hpk: u32, hd: u32, dv: u32,
     cap: u32, pos0: u32, win: u32, scale: f32,
     sink: u32, nc: u32, k: u32, t0: u32,
+    tq: u32, bpw: u32, lazy: f32, _p3: u32,
 };
 @group(0) @binding(9) var<uniform> ab_p: AbP;
 fn ab_n(t: u32) -> u32 {
@@ -18690,6 +18790,272 @@ fn gqa_attend_merge_xb(@builtin(workgroup_id) wid: vec3<u32>,
     let t = ab_p.t0 + tl;
     if (h >= ab_p.nh || tl >= ab_p.k) { return; }
     let used = (ab_n(t) + 63u) / 64u;
+    let base = (tl * ab_p.nh + h) * ab_p.nc;
+    var mg = -1.0e30;
+    if (ab_p.sink != 0u) { mg = ax_sink[h]; }
+    for (var ci = 0u; ci < used; ci = ci + 1u) { mg = max(mg, ax_ml[base + ci].x); }
+    var lg = 0.0;
+    if (ab_p.sink != 0u) { lg = exp(ax_sink[h] - mg); }
+    for (var ci = 0u; ci < used; ci = ci + 1u) {
+        let ml = ax_ml[base + ci];
+        lg = lg + ml.y * exp(ml.x - mg);
+    }
+    for (var d = lid; d < ab_p.dv; d = d + 128u) {
+        var a = 0.0;
+        for (var ci = 0u; ci < used; ci = ci + 1u) {
+            let idx = base + ci;
+            a = a + ax_acc[idx * ab_p.dv + d] * exp(ax_ml[idx].x - mg);
+        }
+        ax_o[(t * ab_p.nh + h) * ab_p.dv + d] = a / lg;
+    }
+}
+
+// Tiled twin of `gqa_attend_part_xgb` for the batched prefill: ONE workgroup
+// serves a tile of `tq` consecutive tokens (tq·hpk <= 64 query rows) against
+// one 64-position block, so a K/V row is read once per tile instead of once
+// per token (Spark-X2.6 on an RTX 2000 Ada, 16 000 tokens: the per-token
+// kernel re-read every visible row for each of 128 tokens a chunk, and the
+// batched graph fell behind the host walk, 125 against 182 tok/s). Blocks
+// are framed on the earliest position the tile's first token sees; a row
+// that sees no key of a block gets (m = -1e30, l = 0, acc = 0), and
+// `gqa_attend_merge_xt` counts a token's blocks the same way. Scores: lane =
+// (key, row half), the query rows in 64-dim segments through workgroup
+// memory, the K row in registers (hd % 64 == 0). Values: lane = output dim
+// (a second pass for dims past 128), V in flights of 16 rows, the 64 row
+// accumulators in registers.
+var<workgroup> xt_s: array<f32, 4160>;         // [row*65 + p]: scores, then weights
+var<workgroup> xt_buf: array<vec4<f32>, 1024>; // Q segment [row*16 + d]; then V rows [p*dv4 + d4]
+var<workgroup> xt_m: array<f32, 128>;
+var<workgroup> xt_l: array<f32, 128>;
+// One masked score to xt_s: key a = c0 + p is visible to the row's token t
+// when first(t) <= a <= pos0 + t, first(t) = pos0 + t + 1 - n(t).
+fn xt_put(row: u32, p: u32, nq: u32, live: bool, c0: u32, tf: u32, hpk: u32, v: f32) {
+    var s = -1.0e30;
+    if (row < nq && live) {
+        let t = tf + row / hpk;
+        let a = c0 + p;
+        if (a + ab_n(t) > ab_p.pos0 + t && a <= ab_p.pos0 + t) { s = v * ab_p.scale; }
+    }
+    xt_s[row * 65u + p] = s;
+}
+@compute @workgroup_size(128)
+fn gqa_attend_part_xt(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    // x = (tile, kv group), the fastest axis: the tiles of a block run back
+    // to back and the block's K/V rows come from L2 after the first.
+    let hpk = ab_p.hpk;
+    let ng = ab_p.nh / hpk;
+    let g = wid.x % ng;
+    let ch = wid.y;
+    let tq = ab_p.tq;
+    let tl0 = (wid.x / ng) * tq;
+    if (tl0 >= ab_p.k) { return; }
+    let ntok = min(tq, ab_p.k - tl0);
+    let nq = ntok * hpk;
+    let tf = ab_p.t0 + tl0;
+    // Absolute position of the tile's block 0 and of its last visible key.
+    let b0 = ab_p.pos0 + tf + 1u - ab_n(tf);
+    let c0 = b0 + ch * 64u;
+    let alast = ab_p.pos0 + tf + ntok - 1u;
+    if (c0 > alast) { return; }
+    let cn = min(64u, alast + 1u - c0);
+    let hd4 = ab_p.hd / 4u;
+    let dv = ab_p.dv;
+    let dv4 = dv / 4u;
+    let cap = ab_p.cap;
+    let s0 = c0 % cap;
+    // Scores: lane (p, half) = key p of the block against rows half*32 .. +32.
+    let p = lid & 63u;
+    let half = lid >> 6u;
+    let sp = s0 + p;
+    let krow = g * cap * hd4 + select(sp, sp - cap, sp >= cap) * hd4;
+    // 32 row accumulators in named registers (an indexed array spills to
+    // local memory); the half's rows start at vec4 half*512 of xt_buf.
+    let hb16 = half * 512u;
+    var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0); var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0);
+    var a4 = vec4<f32>(0.0); var a5 = vec4<f32>(0.0); var a6 = vec4<f32>(0.0); var a7 = vec4<f32>(0.0);
+    for (var seg = 0u; seg < hd4; seg = seg + 16u) {
+        workgroupBarrier();
+        for (var i = lid; i < nq * 16u; i = i + 128u) {
+            let r = i >> 4u;
+            let d = i & 15u;
+            let t = tf + r / hpk;
+            let h = g * hpk + (r % hpk);
+            xt_buf[i] = ax_q[(t * ab_p.nh + h) * hd4 + seg + d];
+        }
+        workgroupBarrier();
+        if (p < cn) {
+            for (var d = 0u; d < 16u; d = d + 1u) {
+                let kd = ax_k[krow + seg + d];
+                let qb = hb16 + d;
+                a0.x = a0.x + dot(xt_buf[qb], kd);
+                a0.y = a0.y + dot(xt_buf[qb + 16u], kd);
+                a0.z = a0.z + dot(xt_buf[qb + 32u], kd);
+                a0.w = a0.w + dot(xt_buf[qb + 48u], kd);
+                a1.x = a1.x + dot(xt_buf[qb + 64u], kd);
+                a1.y = a1.y + dot(xt_buf[qb + 80u], kd);
+                a1.z = a1.z + dot(xt_buf[qb + 96u], kd);
+                a1.w = a1.w + dot(xt_buf[qb + 112u], kd);
+                a2.x = a2.x + dot(xt_buf[qb + 128u], kd);
+                a2.y = a2.y + dot(xt_buf[qb + 144u], kd);
+                a2.z = a2.z + dot(xt_buf[qb + 160u], kd);
+                a2.w = a2.w + dot(xt_buf[qb + 176u], kd);
+                a3.x = a3.x + dot(xt_buf[qb + 192u], kd);
+                a3.y = a3.y + dot(xt_buf[qb + 208u], kd);
+                a3.z = a3.z + dot(xt_buf[qb + 224u], kd);
+                a3.w = a3.w + dot(xt_buf[qb + 240u], kd);
+                a4.x = a4.x + dot(xt_buf[qb + 256u], kd);
+                a4.y = a4.y + dot(xt_buf[qb + 272u], kd);
+                a4.z = a4.z + dot(xt_buf[qb + 288u], kd);
+                a4.w = a4.w + dot(xt_buf[qb + 304u], kd);
+                a5.x = a5.x + dot(xt_buf[qb + 320u], kd);
+                a5.y = a5.y + dot(xt_buf[qb + 336u], kd);
+                a5.z = a5.z + dot(xt_buf[qb + 352u], kd);
+                a5.w = a5.w + dot(xt_buf[qb + 368u], kd);
+                a6.x = a6.x + dot(xt_buf[qb + 384u], kd);
+                a6.y = a6.y + dot(xt_buf[qb + 400u], kd);
+                a6.z = a6.z + dot(xt_buf[qb + 416u], kd);
+                a6.w = a6.w + dot(xt_buf[qb + 432u], kd);
+                a7.x = a7.x + dot(xt_buf[qb + 448u], kd);
+                a7.y = a7.y + dot(xt_buf[qb + 464u], kd);
+                a7.z = a7.z + dot(xt_buf[qb + 480u], kd);
+                a7.w = a7.w + dot(xt_buf[qb + 496u], kd);
+            }
+        }
+    }
+    // Masked scores to workgroup memory.
+    let lp = p < cn;
+    let r0 = half * 32u;
+    xt_put(r0, p, nq, lp, c0, tf, hpk, a0.x);
+    xt_put(r0 + 1u, p, nq, lp, c0, tf, hpk, a0.y);
+    xt_put(r0 + 2u, p, nq, lp, c0, tf, hpk, a0.z);
+    xt_put(r0 + 3u, p, nq, lp, c0, tf, hpk, a0.w);
+    xt_put(r0 + 4u, p, nq, lp, c0, tf, hpk, a1.x);
+    xt_put(r0 + 5u, p, nq, lp, c0, tf, hpk, a1.y);
+    xt_put(r0 + 6u, p, nq, lp, c0, tf, hpk, a1.z);
+    xt_put(r0 + 7u, p, nq, lp, c0, tf, hpk, a1.w);
+    xt_put(r0 + 8u, p, nq, lp, c0, tf, hpk, a2.x);
+    xt_put(r0 + 9u, p, nq, lp, c0, tf, hpk, a2.y);
+    xt_put(r0 + 10u, p, nq, lp, c0, tf, hpk, a2.z);
+    xt_put(r0 + 11u, p, nq, lp, c0, tf, hpk, a2.w);
+    xt_put(r0 + 12u, p, nq, lp, c0, tf, hpk, a3.x);
+    xt_put(r0 + 13u, p, nq, lp, c0, tf, hpk, a3.y);
+    xt_put(r0 + 14u, p, nq, lp, c0, tf, hpk, a3.z);
+    xt_put(r0 + 15u, p, nq, lp, c0, tf, hpk, a3.w);
+    xt_put(r0 + 16u, p, nq, lp, c0, tf, hpk, a4.x);
+    xt_put(r0 + 17u, p, nq, lp, c0, tf, hpk, a4.y);
+    xt_put(r0 + 18u, p, nq, lp, c0, tf, hpk, a4.z);
+    xt_put(r0 + 19u, p, nq, lp, c0, tf, hpk, a4.w);
+    xt_put(r0 + 20u, p, nq, lp, c0, tf, hpk, a5.x);
+    xt_put(r0 + 21u, p, nq, lp, c0, tf, hpk, a5.y);
+    xt_put(r0 + 22u, p, nq, lp, c0, tf, hpk, a5.z);
+    xt_put(r0 + 23u, p, nq, lp, c0, tf, hpk, a5.w);
+    xt_put(r0 + 24u, p, nq, lp, c0, tf, hpk, a6.x);
+    xt_put(r0 + 25u, p, nq, lp, c0, tf, hpk, a6.y);
+    xt_put(r0 + 26u, p, nq, lp, c0, tf, hpk, a6.z);
+    xt_put(r0 + 27u, p, nq, lp, c0, tf, hpk, a6.w);
+    xt_put(r0 + 28u, p, nq, lp, c0, tf, hpk, a7.x);
+    xt_put(r0 + 29u, p, nq, lp, c0, tf, hpk, a7.y);
+    xt_put(r0 + 30u, p, nq, lp, c0, tf, hpk, a7.z);
+    xt_put(r0 + 31u, p, nq, lp, c0, tf, hpk, a7.w);
+    workgroupBarrier();
+    // Softmax of each row over the block: two lanes a row, 32 keys each.
+    let row = lid >> 1u;
+    let hb = row * 65u + (lid & 1u) * 32u;
+    var m = -1.0e30;
+    for (var j = 0u; j < 32u; j = j + 1u) { m = max(m, xt_s[hb + j]); }
+    xt_m[lid] = m;
+    workgroupBarrier();
+    m = max(xt_m[lid & ~1u], xt_m[lid | 1u]);
+    var l = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) {
+        let s = xt_s[hb + j];
+        let w = select(0.0, exp(s - m), s > -1.0e29);
+        xt_s[hb + j] = w;
+        l = l + w;
+    }
+    xt_l[lid] = l;
+    workgroupBarrier();
+    l = xt_l[lid & ~1u] + xt_l[lid | 1u];
+    if ((lid & 1u) == 0u && row < nq) {
+        let tl = tl0 + row / hpk;
+        let h = g * hpk + (row % hpk);
+        ax_ml[(tl * ab_p.nh + h) * ab_p.nc + ch] = vec2<f32>(m, l);
+    }
+    // Values: lane = (8 rows rg*8.., 4 dims dg*4..) of a 64-dim pass over
+    // dv, so one vec4 of V and eight weights feed 32 FMAs; V rows in
+    // flights of 16 through workgroup memory, staged once per pass.
+    let vbase4 = g * cap * dv4;
+    let rg = lid >> 4u;
+    let dg = lid & 15u;
+    for (var ps = 0u; ps * 16u < dv4; ps = ps + 1u) {
+        let d4 = ps * 16u + dg;
+        let live = d4 < dv4;
+        var o0 = vec4<f32>(0.0); var o1 = vec4<f32>(0.0);
+        var o2 = vec4<f32>(0.0); var o3 = vec4<f32>(0.0);
+        var o4 = vec4<f32>(0.0); var o5 = vec4<f32>(0.0);
+        var o6 = vec4<f32>(0.0); var o7 = vec4<f32>(0.0);
+        for (var pf0 = 0u; pf0 < cn; pf0 = pf0 + 16u) {
+            let pn = min(16u, cn - pf0);
+            workgroupBarrier();
+            for (var i = lid; i < pn * dv4; i = i + 128u) {
+                let pp = i / dv4;
+                let vp = s0 + pf0 + pp;
+                xt_buf[i] = ax_v4[vbase4 + select(vp, vp - cap, vp >= cap) * dv4 + (i - pp * dv4)];
+            }
+            workgroupBarrier();
+            if (live) {
+                let wb = rg * 8u * 65u + pf0;
+                for (var pp = 0u; pp < pn; pp = pp + 1u) {
+                    let v = xt_buf[pp * dv4 + d4];
+                    let w = wb + pp;
+                    o0 = o0 + xt_s[w] * v;
+                    o1 = o1 + xt_s[w + 65u] * v;
+                    o2 = o2 + xt_s[w + 130u] * v;
+                    o3 = o3 + xt_s[w + 195u] * v;
+                    o4 = o4 + xt_s[w + 260u] * v;
+                    o5 = o5 + xt_s[w + 325u] * v;
+                    o6 = o6 + xt_s[w + 390u] * v;
+                    o7 = o7 + xt_s[w + 455u] * v;
+                }
+            }
+        }
+        if (live) {
+            for (var r = 0u; r < 8u; r = r + 1u) {
+                let row = rg * 8u + r;
+                if (row < nq) {
+                    var ov = o0;
+                    if (r == 1u) { ov = o1; } else if (r == 2u) { ov = o2; } else if (r == 3u) { ov = o3; }
+                    else if (r == 4u) { ov = o4; } else if (r == 5u) { ov = o5; } else if (r == 6u) { ov = o6; }
+                    else if (r == 7u) { ov = o7; }
+                    let tl = tl0 + row / hpk;
+                    let h = g * hpk + (row % hpk);
+                    let ob = ((tl * ab_p.nh + h) * ab_p.nc + ch) * dv + d4 * 4u;
+                    ax_acc[ob] = ov.x;
+                    ax_acc[ob + 1u] = ov.y;
+                    ax_acc[ob + 2u] = ov.z;
+                    ax_acc[ob + 3u] = ov.w;
+                }
+            }
+        }
+    }
+}
+
+// `gqa_attend_merge_xb` for partials of `gqa_attend_part_xt`: a token's
+// blocks are counted from its tile's block 0.
+@compute @workgroup_size(128)
+fn gqa_attend_merge_xt(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let tl = wid.y;
+    let t = ab_p.t0 + tl;
+    if (h >= ab_p.nh || tl >= ab_p.k) { return; }
+    let tf = ab_p.t0 + (tl / ab_p.tq) * ab_p.tq;
+    let b0 = ab_p.pos0 + tf + 1u - ab_n(tf);
+    // Partials come per block (bpw = 1, `gqa_attend_part_xt`) or per group
+    // of bpw blocks (`gqa_attend_part_xc`).
+    let bpw = max(ab_p.bpw, 1u);
+    let used = ((ab_p.pos0 + t + 1u - b0 + 63u) / 64u + bpw - 1u) / bpw;
     let base = (tl * ab_p.nh + h) * ab_p.nc;
     var mg = -1.0e30;
     if (ab_p.sink != 0u) { mg = ax_sink[h]; }
@@ -19106,6 +19472,34 @@ struct XBatch {
     part_l: wgpu::BindGroupLayout,
     merge: wgpu::ComputePipeline,
     merge_l: wgpu::BindGroupLayout,
+    /// The query-tiled attend (`gqa_attend_part_xt` / `gqa_attend_merge_xt`):
+    /// None where the card's workgroup memory is too small for it or
+    /// `CMF_ATTEND_XT=0`.
+    tile: Option<XTile>,
+}
+
+struct XTile {
+    part: wgpu::ComputePipeline,
+    part_l: wgpu::BindGroupLayout,
+    merge: wgpu::ComputePipeline,
+    merge_l: wgpu::BindGroupLayout,
+    /// The same tile on the matrix units (`gqa_attend_part_xc`): None
+    /// without cooperative matrices or under `CMF_ATTEND_XC=0`.
+    coop: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// The tile fed from f16 planes (`gqa_attend_part_xc2`, no staging):
+    /// None without the first, or under `CMF_ATTEND_XC2=0`.
+    coop2: Option<Coop2>,
+}
+
+/// `gqa_attend_part_xc2` and the two plane makers it eats from
+/// (`q_f16_plane`, `kv_f16_plane` in `ATTEND_PLANES_SRC`).
+struct Coop2 {
+    part: wgpu::ComputePipeline,
+    part_l: wgpu::BindGroupLayout,
+    q_plane: wgpu::ComputePipeline,
+    q_plane_l: wgpu::BindGroupLayout,
+    kv_plane: wgpu::ComputePipeline,
+    kv_plane_l: wgpu::BindGroupLayout,
 }
 
 /// Bind group from explicit (binding, buffer) pairs — the ATTEND_X entry
@@ -19518,6 +19912,8 @@ pub struct Ctx {
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     /// Same kernel, the scale read from a device buffer (binding 4).
     q4tp_mm_coop_s: Option<wgpu::ComputePipeline>,
+    /// `COOP_MM_V2_SRC`: the pipelined twin (`CMF_BATCH_MM=v2`).
+    q4tp_mm_coop_v2_s: Option<wgpu::ComputePipeline>,
     /// The same tiled cooperative GEMM over q8_2f weights (`coop_q82_src`):
     /// the eight-bit file's prompt chunks on the matrix units. The scalar
     /// int8 GEMM held ~5 TFLOP/s on an RTX PRO 6000 (a 65B at 43 tok/s of
@@ -19560,6 +19956,8 @@ pub struct Ctx {
     /// The int8 twin of `q4tp_dq_f16` — same plane, same GEMM after it.
     q8_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
+    /// The f16-plane GEMM with a 128-row batch tile (`CMF_BATCH_MM_TILE=128`).
+    q4tp_mm_coop_f16_m128: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
     /// tensor-core devices, and `gemm_nt_f32` falls back to the scalar arm.
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
@@ -20879,6 +21277,18 @@ fn ctx() -> Option<&'static Ctx> {
     ctx_for(crate::gpu::current_device())
 }
 
+/// Whether the batched prefill attends a whole run with the query-tiled
+/// kernels (`gqa_attend_part_xt` / `_xc`): the pipeline sends a dense
+/// sliding-window stack's prompt through the batched graph only then.
+/// Measured on Spark-X2.6-4B (RTX 2000 Ada, 16 000 tokens): the chunked
+/// host walk 182 tok/s, the per-token batched arm 135, the tiled arm 390+.
+pub fn batched_attend_tiled() -> bool {
+    ctx()
+        .and_then(|c| c.graph_x.as_ref())
+        .and_then(|gx| gx.xb.as_ref())
+        .is_some_and(|xb| xb.tile.is_some())
+}
+
 /// The trainer's context (`train_ops::dev`): the runtime's when wgpu is
 /// selected; on macOS, where the runtime runs on native Metal, a wgpu
 /// Metal context of the trainer's own (the nvg-train / compress device
@@ -21941,10 +22351,16 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mm_coop_f16 = (q4tp_dq_f16.is_some())
         .then(|| mk_coop(COOP_MM_F16_SRC, "q4tp-mm-f16", "q4tp_mm_coop_f16"))
         .flatten();
+    let q4tp_mm_coop_f16_m128 = (q4tp_mm_coop_f16.is_some())
+        .then(|| mk_coop(COOP_MM_F16_SRC, "q4tp-mm-f16-m128", "q4tp_mm_coop_f16_m128"))
+        .flatten();
     // The device-scale entry point of the in-kernel coop module (the
     // batched prefill's operands never reach the host).
     let q4tp_mm_coop_s = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_MM_SRC, "q4tp-coop-s", "q4tp_mm_coop_s"))
+        .flatten();
+    let q4tp_mm_coop_v2_s = (q4tp_mm_coop_s.is_some())
+        .then(|| mk_coop(COOP_MM_V2_SRC, "q4tp-coop-v2-s", "q4tp_mm_coop_v2_s"))
         .flatten();
     let q82_mm_coop_s = (q4tp_mm_coop.is_some()
         && std::env::var("CMF_Q82_COOP").as_deref() != Ok("0"))
@@ -22497,6 +22913,55 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     );
                     None
                 } else {
+                    let tile = if std::env::var("CMF_ATTEND_XT").as_deref() == Ok("0") {
+                        None
+                    } else {
+                        let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                        let (tp, tm) = (px("gqa_attend_part_xt"), px("gqa_attend_merge_xt"));
+                        if let Some(e) = pollster::block_on(sg.pop()) {
+                            tracing::warn!(
+                                "tiled attend-x kernels rejected ({e}): the batch graph attends \
+                                 one token a workgroup"
+                            );
+                            None
+                        } else {
+                            let coop = if want_coop
+                                && std::env::var("CMF_ATTEND_XC").as_deref() != Ok("0")
+                            {
+                                mk_coop(&attend_coop_src(), "attend-coop", "gqa_attend_part_xc")
+                                    .map(|p| (p.get_bind_group_layout(0), p))
+                                    .map(|(l, p)| (p, l))
+                            } else {
+                                None
+                            };
+                            let coop2 = coop
+                                .as_ref()
+                                .filter(|_| std::env::var("CMF_ATTEND_XC2").as_deref() != Ok("0"))
+                                .and_then(|_| {
+                                    // Built for 256-wide heads (Spark-X2.6); the
+                                    // arm checks the shape before taking it.
+                                    let part = mk_coop(&attend_coop2_src(256, 256), "attend-coop2", "gqa_attend_part_xc2")?;
+                                    let q_plane = mk_coop(ATTEND_PLANES_SRC, "attend-planes", "q_f16_plane")?;
+                                    let kv_plane = mk_coop(ATTEND_PLANES_SRC, "attend-planes", "kv_f16_plane")?;
+                                    Some(Coop2 {
+                                        part_l: part.get_bind_group_layout(0),
+                                        part,
+                                        q_plane_l: q_plane.get_bind_group_layout(0),
+                                        q_plane,
+                                        kv_plane_l: kv_plane.get_bind_group_layout(0),
+                                        kv_plane,
+                                    })
+                                });
+                            Some(XTile {
+                                part_l: tp.get_bind_group_layout(0),
+                                merge_l: tm.get_bind_group_layout(0),
+                                part: tp,
+                                merge: tm,
+                                coop,
+                                coop2,
+                            })
+                        }
+                    };
                     Some(XBatch {
                         rope_l: rope.get_bind_group_layout(0),
                         kv_l: kv.get_bind_group_layout(0),
@@ -22506,6 +22971,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                         kv,
                         part,
                         merge,
+                        tile,
                     })
                 }
             };
@@ -22742,6 +23208,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q2tp_mm_coop,
         q4tp_mm_coop,
         q4tp_mm_coop_s,
+        q4tp_mm_coop_v2_s,
         q82_mm_coop_s,
         q4tp_mm_coop128_s,
         batch_coop_default,
@@ -22761,6 +23228,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_dq_f16,
         q8_dq_f16,
         q4tp_mm_coop_f16,
+        q4tp_mm_coop_f16_m128,
         gemm_nt_coop,
         gemm_nn_coop,
         bake_silu,
@@ -24985,6 +25453,40 @@ fn batch_coop_on(c: &Ctx) -> bool {
         Some(v) => v,
         None => c.batch_coop_default,
     }
+}
+
+/// `CMF_BATCH_MM=v2`: the batched prefill's in-kernel-dequant GEMM runs
+/// the pipelined kernel (`COOP_MM_V2_SRC`).
+fn batch_mm_v2_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_BATCH_MM").as_deref() == Ok("v2"))
+}
+
+/// The batched prefill's q4tp GEMMs through `zi_mm` (128x128x32 tiles,
+/// 2x2 subgroups, register prefetch): dequantize the weight to the f16
+/// plane, cast the chunk's activations to f16 with the device scale, run
+/// the tile kernel, scale the store back. The default; `CMF_BATCH_MM=coop`
+/// keeps the 64x64 in-kernel-dequant kernel, `v2` its pipelined twin.
+fn batch_mm_zi_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| matches!(std::env::var("CMF_BATCH_MM").as_deref(), Err(_) | Ok("") | Ok("zi")))
+}
+
+/// `CMF_BATCH_MM_TILE=128`: the f16-plane GEMM takes 128 batch rows a
+/// workgroup (two A tiles a subgroup) instead of 64.
+fn batch_mm_tile128_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_BATCH_MM_TILE").as_deref() == Ok("128"))
+}
+
+/// `CMF_BATCH_F16=1`: the batched prefill's q4tp GEMMs dequantize the
+/// weight once into an f16 plane and run the pure f16 kernel. Off by
+/// default: on an RTX 2000 Ada (Spark-X2.6, 512-row chunks) the plane
+/// pass plus the f16 GEMM took 421 ms a chunk for gate-up against 302 for
+/// the in-kernel decoder, 357 against 394 tok/s on a 16 000-token prompt.
+fn batch_f16_plane_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_BATCH_F16").as_deref() == Ok("1"))
 }
 
 /// `CMF_VERIFY_COOP=1`: the speculative verify's b ≤ 16 rows on the
@@ -33901,25 +34403,14 @@ pub fn forward_batch_graph_at(
     // incorrect because the `GMat`s below retain evicted buffers until the
     // batch command finishes, producing a full-model transient allocation.
     for l in layers {
-        // No batched arm for the head-wise output gate or a non-SiLU dense
-        // FFN yet: refuse by name before any upload (the builders already
-        // do; this keeps a direct caller from running them as plain).
-        if matches!(
-            &l.attn,
-            crate::gpu::GraphAttn::Full {
-                head_gate: Some(_),
-                ..
-            }
-        ) {
-            bgraph_refused("head-wise output gate (no batched arm)");
-            return batch_outcome(o1_started || state_started, false);
-        }
+        // The head-wise output gate (Spark-X2.6) has its batched arm below:
+        // g = g_proj · n1 per row, then gate_mul per head before O.
         if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
-            // Gemma-4's tanh-GELU (and exact GELU) ride the act word of
-            // the batched act(gate)·up kernel; other models keep SiLU only.
+            // Exact GELU (Spark-X2.6) and Gemma-4's tanh-GELU ride the act
+            // word of the batched act(gate)·up kernel.
             if *act != crate::gpu::GraphAct::Silu
                 && *act != crate::gpu::GraphAct::SwiGluOaiM3
-                && !(g4_model && act.code() <= 2)
+                && act.code() > 2
             {
                 bgraph_refused("non-SiLU dense FFN (no batched arm)");
                 return batch_outcome(o1_started || state_started, false);
@@ -34038,6 +34529,8 @@ pub fn forward_batch_graph_at(
             /// Gemma-4 global layers (512 over 256).
             hd: usize,
             dv: usize,
+            /// Spark-X2.6 head-wise output gate `[nh, hidden]`.
+            hg: Option<GMat>,
         },
         Gdn {
             qkv: GMat,
@@ -34241,6 +34734,7 @@ pub fn forward_batch_graph_at(
                 output_gate,
                 bias,
                 geom,
+                head_gate,
                 ..
             } => {
                 if bias.is_some() {
@@ -34264,6 +34758,24 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("attention weights not gemmable");
                     return batch_outcome(o1_started || state_started, false);
                 }
+                // The gate reads the attention's normed input as is (no Prism plane).
+                let hg = match head_gate {
+                    None => None,
+                    Some(g) => match resolve(g, nh, hidden) {
+                        Some(m)
+                            if (gemmable(&m) || m.kind == 4)
+                                && m.prism == crate::gpu::GraphPrismOp::None
+                                && !m.affine
+                                && !*output_gate =>
+                        {
+                            Some(m)
+                        }
+                        _ => {
+                            bgraph_refused("head gate resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                    },
+                };
                 LAttn::Full {
                     wq,
                     wk,
@@ -34272,6 +34784,7 @@ pub fn forward_batch_graph_at(
                     nkv: lnkv,
                     hd: lhd,
                     dv: ldv,
+                    hg,
                 }
             }
             crate::gpu::GraphAttn::Gdn {
@@ -34617,9 +35130,12 @@ pub fn forward_batch_graph_at(
             };
             let plain = match &layers[li].attn {
                 crate::gpu::GraphAttn::Full { geom: None, .. } => true,
-                // Ripple's gated layers: the token-axis arm copies the same rows out.
+                // Per-layer geometry: Ripple's gated layers on the token-axis arm,
+                // the others on the whole-run or the per-token arm, which all copy
+                // the same rows out. MRoPE rows rotate elsewhere.
                 crate::gpu::GraphAttn::Full { geom: Some(g), output_gate, .. } => {
-                    gated_geom_bt(c, g, nh, g.hd, *output_gate, k).is_some()
+                    (gated_geom_bt(c, g, nh, g.hd, *output_gate, k).is_some() || !*output_gate)
+                        && g.dash.is_none()
                         && positions.windows(2).all(|w| w[1] == w[0] + 1)
                 }
                 _ => false,
@@ -35339,6 +35855,82 @@ pub fn forward_batch_graph_at(
                     && !(verify_coop_on() && c.q4tp_mm_coop_s.is_some() && cols % 32 == 0)
                 {
                     let _ = encode_q4tp_mv4_b_with(c, enc, &m.buf, xs, y, rows, cols, k, i8_rows);
+                } else if k >= 128
+                    && batch_coop_on(c)
+                    && batch_mm_zi_on()
+                    && encode_batch_zi_gemm(c, enc, &m.buf, xs, y, rows, cols, k)
+                {
+                    // The chunk's GEMM went through `zi_mm` (encoded above):
+                    // the in-kernel-dequant 64x64 kernel below held the
+                    // matrix units at ~6 TFLOP/s, the 128x128 tile runs at
+                    // 13-21 on the same card.
+                } else if k >= 64
+                    && batch_coop_on(c)
+                    && batch_f16_plane_on()
+                    && c.q4tp_mm_coop_f16.is_some()
+                    && c.q4tp_dq_f16.is_some()
+                    && cols % 32 == 0
+                    && {
+                        // Dequantize once, then the pure f16 GEMM: the
+                        // in-kernel decoder re-runs its nibble and scale
+                        // arithmetic for every 64-row tile of a 512-row
+                        // chunk and held the matrix units at ~6.5 TFLOP/s
+                        // (Spark-X2.6 on an RTX 2000 Ada, 512 rows). The
+                        // plane is the shared scratch slot, so each GEMM
+                        // unpacks before it runs; passes execute in order.
+                        let (asc, plane) = {
+                            let mut sc = c.scratch.lock().unwrap();
+                            let asc = Scratch::ensure(
+                                &c.device,
+                                &mut sc.amax1,
+                                4,
+                                wgpu::BufferUsages::STORAGE,
+                                "batch-ascale",
+                            );
+                            let plane = dq_f16_plane(c, &mut sc, &m.buf, rows, cols);
+                            (asc, plane)
+                        };
+                        match plane {
+                            Some((plane, bind_dq)) => {
+                                {
+                                    let mut pass = begin_pass(enc);
+                                    pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
+                                    pass.set_bind_group(0, &bind_dq, &[]);
+                                    let groups = ((rows * cols / 2) as u32).div_ceil(256);
+                                    pass.dispatch_workgroups(
+                                        groups.min(MAX_WG),
+                                        groups.div_ceil(MAX_WG),
+                                        1,
+                                    );
+                                }
+                                if encode_act_absmax(c, enc, xs, k * cols, &asc) {
+                                    let m128 = k >= 128 && batch_mm_tile128_on();
+                                    encode_q4_tile_mm_full(
+                                        c,
+                                        enc,
+                                        c.q4tp_mm_coop_f16_m128
+                                            .as_ref()
+                                            .filter(|_| m128)
+                                            .unwrap_or_else(|| c.q4tp_mm_coop_f16.as_ref().unwrap()),
+                                        &plane,
+                                        xs,
+                                        y,
+                                        rows,
+                                        cols,
+                                        k,
+                                        0.0,
+                                        Some(&asc),
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            None => false,
+                        }
+                    }
+                {
+                    // Encoded above.
                 } else if (batch_coop_on(c) || (k <= 16 && verify_coop_on()))
                     && c.q4tp_mm_coop_s.is_some()
                     && cols % 32 == 0
@@ -35359,11 +35951,17 @@ pub fn forward_batch_graph_at(
                         )
                     };
                     if encode_act_absmax(c, enc, xs, k * cols, &asc) {
-                        // A chunk past one 64-row tile takes the 128-row
-                        // tile where the device has it: each weight tile is
+                        // `CMF_BATCH_MM=v2` takes the pipelined kernel; else a
+                        // chunk past one 64-row tile takes the 128-row tile
+                        // where the device has it: each weight tile is
                         // unpacked once for the whole chunk.
-                        let pipe = match c.q4tp_mm_coop128_s.as_ref() {
-                            Some(p) if k > 64 => p,
+                        let v2 = k >= 64 && batch_mm_v2_on();
+                        let pipe = match (
+                            c.q4tp_mm_coop_v2_s.as_ref().filter(|_| v2),
+                            c.q4tp_mm_coop128_s.as_ref(),
+                        ) {
+                            (Some(p), _) => p,
+                            (None, Some(p)) if k > 64 => p,
                             _ => c.q4tp_mm_coop_s.as_ref().unwrap(),
                         };
                         encode_q4_tile_mm_full(
@@ -35673,6 +36271,10 @@ pub fn forward_batch_graph_at(
     } else {
         usize::MAX
     };
+    // The whole-run attend's partial buffers, shared by every layer of the call.
+    let mut xb_part: Option<(wgpu::Buffer, wgpu::Buffer, usize, usize)> = None;
+    // The xc2 tile's f16 planes (Q, K, V), one set for the call as well.
+    let mut xb_plane: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, usize, usize, usize)> = None;
     for (li, l) in layers.iter().enumerate() {
         if li > 0 && bchunk != usize::MAX && li % bchunk == 0 {
             flush_pass(&enc);
@@ -35711,6 +36313,7 @@ pub fn forward_batch_graph_at(
                     nkv: lnkv,
                     hd: lhd,
                     dv: ldv,
+                    hg,
                 },
                 crate::gpu::GraphAttn::Full {
                     q_norm,
@@ -36372,7 +36975,7 @@ pub fn forward_batch_graph_at(
                                 && hpk <= 8
                                 && hd % 4 == 0
                                 && hd <= 256
-                                && g.dv <= 128
+                                && g.dv <= 256
                                 && g.window.is_none_or(|w| k <= w)
                                 && positions.windows(2).all(|w| w[1] == w[0] + 1)
                         })
@@ -36396,13 +36999,93 @@ pub fn forward_batch_graph_at(
                         let na = p0 + t + 1;
                         g.window.map_or(na, |w| na.min(w))
                     };
-                    let nc = n_of(k - 1).div_ceil(64);
-                    // Partials of a sub-run of tokens stay under ~64 MB.
+                    // The query-tiled attend frames a tile's blocks on the
+                    // earliest row its first token sees: up to tq - 1 more
+                    // positions than the token's own count (hd % 64 == 0 only).
+                    let tq = if xb.tile.is_some() && hd % 64 == 0 { 64 / hpk } else { 0 };
+                    // The matrix-unit tile wants 32-wide k steps, 64-wide dv
+                    // quarters (four at most) and a full 64-row tile.
+                    let xc = xb.tile.as_ref().and_then(|xt| xt.coop.as_ref()).filter(|_| {
+                        tq > 0 && hd % 32 == 0 && g.dv % 64 == 0 && g.dv <= 256 && 64 % hpk == 0
+                    });
+                    // The plane-fed tile (`gqa_attend_part_xc2`): a full
+                    // attention layer whose mirror holds every position in
+                    // slot order, the head widths it was built for.
+                    let xc2 = xb.tile.as_ref().and_then(|xt| xt.coop2.as_ref()).filter(|_| {
+                        xc.is_some()
+                            && g.window.is_none()
+                            && mcap % 64 == 0
+                            && p0 + k <= mcap
+                            && hd == 256
+                            && g.dv == 256
+                    });
+                    let blocks_all = (n_of(k - 1) + tq.saturating_sub(1)).div_ceil(64);
+                    // Blocks a workgroup walks: the matrix-unit tile takes a
+                    // group (at most 16 groups a row, at least 8 blocks each,
+                    // `CMF_ATTEND_BPW` overrides); the scalar tiles one block.
+                    let bpw = if xc.is_some() {
+                        std::env::var("CMF_ATTEND_BPW")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .filter(|&b| b >= 1)
+                            .unwrap_or_else(|| blocks_all.div_ceil(16).max(8))
+                    } else {
+                        1
+                    };
+                    let nc = blocks_all.div_ceil(bpw);
+                    // Partials of a sub-run of tokens stay under ~128 MB, but
+                    // a tiled sub-run is whole tiles (a short one leaves most
+                    // of the tile's rows idle and re-reads K/V per sub-run).
                     let per_tok = nh * nc * g.dv * 4;
-                    let sub = ((64usize << 20) / per_tok.max(1)).clamp(1, k);
+                    let mut sub = ((128usize << 20) / per_tok.max(1)).max(1);
+                    if tq > 0 {
+                        sub = (sub / tq * tq).max(tq);
+                    }
+                    let sub = sub.min(k);
                     let qall = rwc(k * nh * hd);
-                    let xacc = rwc(sub * nh * nc * g.dv);
-                    let xml = rwc(sub * nh * nc * 2);
+                    // One partial buffer pair for the whole call: the layers
+                    // run in order inside the pass, and a per-layer pair of
+                    // these sizes was the batch graph's Out of Memory on a
+                    // shared 16 GB card.
+                    let (xacc, xml) = {
+                        let na = sub * nh * nc * g.dv;
+                        let nm = sub * nh * nc * 2;
+                        match &xb_part {
+                            Some((a, m, ca, cm)) if *ca >= na && *cm >= nm => (a.clone(), m.clone()),
+                            _ => {
+                                let a = rwc(na);
+                                let m = rwc(nm);
+                                xb_part = Some((a.clone(), m.clone(), na, nm));
+                                (a, m)
+                            }
+                        }
+                    };
+                    // The xc2 tile's planes: Q over the run (rows padded to
+                    // whole tiles), K and V over the mirror; grown when a
+                    // layer needs more, as the partials above.
+                    let planes = xc2.map(|c2| {
+                        let kpad = k.div_ceil(tq) * tq;
+                        let nq16 = g.nkv * kpad * hpk * hd / 2;
+                        let nk16 = g.nkv * mcap * hd / 2;
+                        let nv16 = g.nkv * mcap * g.dv / 2;
+                        let (q16, k16, v16) = match &xb_plane {
+                            Some((q, kb, vb, cq, ck, cv)) if *cq >= nq16 && *ck >= nk16 && *cv >= nv16 => {
+                                (q.clone(), kb.clone(), vb.clone())
+                            }
+                            _ => {
+                                let q = rwc(nq16);
+                                let kb = rwc(nk16);
+                                let vb = rwc(nv16);
+                                xb_plane = Some((q.clone(), kb.clone(), vb.clone(), nq16, nk16, nv16));
+                                (q, kb, vb)
+                            }
+                        };
+                        (c2, kpad, q16, k16, v16)
+                    });
+                    let lazy = std::env::var("CMF_ATTEND_XC_LAZY")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .map_or(8.0f32, |v| v.clamp(0.0, 10.0));
                     let rope_u = unif(&rope_uniform_words(
                         nh,
                         g.nkv,
@@ -36447,6 +37130,10 @@ pub fn forward_batch_graph_at(
                     pass.set_bind_group(0, &bg_rope, &[]);
                     pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
                     state_started = true;
+                    // The O(1) seal's query trace: every row's rotated query at once.
+                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, k * nh * hd) {
+                        encode_blit_p(&mut pass, c, &qall, &cb, k * nh * hd, 0, 0, None);
+                    }
                     pass.set_pipeline(&xb.kv);
                     pass.set_bind_group(0, &bg_kv, &[]);
                     pass.dispatch_workgroups(
@@ -36454,6 +37141,37 @@ pub fn forward_batch_graph_at(
                         k as u32,
                         1,
                     );
+                    if let Some((c2, kpad, q16, k16, v16)) = &planes {
+                        let nconv = (p0 + k).div_ceil(64) * 64;
+                        let grid = |total: usize| {
+                            let groups = total.div_ceil(256);
+                            let nx = groups.min(32768);
+                            (nx, groups.div_ceil(nx))
+                        };
+                        let (nx, ny) = grid(*kpad * nh * (hd / 4));
+                        let qu = unif(&[k as u32, *kpad as u32, nh as u32, hpk as u32, (hd / 4) as u32, 0, nx as u32, 0]);
+                        let bg = bind_pairs(c, &c2.q_plane_l, &[(0, &qall), (1, q16), (2, &qu)]);
+                        pass.set_pipeline(&c2.q_plane);
+                        pass.set_bind_group(0, &bg, &[]);
+                        pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                        for (src, dst, w) in [(kbuf, k16, hd), (vbuf, v16, g.dv)] {
+                            let (nx, ny) = grid(g.nkv * nconv * (w / 4));
+                            let u = unif(&[
+                                g.nkv as u32,
+                                mcap as u32,
+                                (w / 4) as u32,
+                                nconv as u32,
+                                0,
+                                (p0 + k - 1) as u32,
+                                nx as u32,
+                                0,
+                            ]);
+                            let bg = bind_pairs(c, &c2.kv_plane_l, &[(0, src), (1, dst), (2, &u)]);
+                            pass.set_pipeline(&c2.kv_plane);
+                            pass.set_bind_group(0, &bg, &[]);
+                            pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                        }
+                    }
                     let mut t0 = 0;
                     while t0 < k {
                         let kk = sub.min(k - t0);
@@ -36470,32 +37188,60 @@ pub fn forward_batch_graph_at(
                             nc as u32,
                             kk as u32,
                             t0 as u32,
+                            tq as u32,
+                            bpw as u32,
+                            lazy.to_bits(),
+                            // The xc2 tile reads its Q plane's rows a group here.
+                            planes.as_ref().map_or(0, |p| p.1 as u32),
                         ]);
+                        // Tiled: a workgroup per ((tile of tq tokens, kv group),
+                        // block group); otherwise one per (kv group, block, token).
+                        let (part, part_l, merge, merge_l, x, blocks, z) =
+                            match xb.tile.as_ref().filter(|_| tq > 0) {
+                                Some(xt) => {
+                                    let (tp, tl) = match (planes.as_ref(), xc) {
+                                        (Some((c2, ..)), _) => (&c2.part, &c2.part_l),
+                                        (None, Some((p, l))) => (p, l),
+                                        (None, None) => (&xt.part, &xt.part_l),
+                                    };
+                                    (
+                                        tp,
+                                        tl,
+                                        &xt.merge,
+                                        &xt.merge_l,
+                                        g.nkv * kk.div_ceil(tq),
+                                        (n_of(t0 + kk - 1) + tq - 1).div_ceil(64).div_ceil(bpw),
+                                        1,
+                                    )
+                                }
+                                None => (
+                                    &xb.part,
+                                    &xb.part_l,
+                                    &xb.merge,
+                                    &xb.merge_l,
+                                    g.nkv,
+                                    n_of(t0 + kk - 1).div_ceil(64),
+                                    kk,
+                                ),
+                            };
+                        let (in0, in1, in2) = match &planes {
+                            Some((_, _, q16, k16, v16)) => (q16, k16, v16),
+                            None => (&qall, kbuf, vbuf),
+                        };
                         let bg_part = bind_pairs(
                             c,
-                            &xb.part_l,
-                            &[
-                                (0, &qall),
-                                (1, kbuf),
-                                (2, vbuf),
-                                (6, &xacc),
-                                (7, &xml),
-                                (9, &ab_u),
-                            ],
+                            part_l,
+                            &[(0, in0), (1, in1), (2, in2), (6, &xacc), (7, &xml), (9, &ab_u)],
                         );
                         let bg_merge = bind_pairs(
                             c,
-                            &xb.merge_l,
+                            merge_l,
                             &[(3, &attn_bb), (5, &sink_b), (6, &xacc), (7, &xml), (9, &ab_u)],
                         );
-                        pass.set_pipeline(&xb.part);
+                        pass.set_pipeline(part);
                         pass.set_bind_group(0, &bg_part, &[]);
-                        pass.dispatch_workgroups(
-                            g.nkv as u32,
-                            n_of(t0 + kk - 1).div_ceil(64) as u32,
-                            kk as u32,
-                        );
-                        pass.set_pipeline(&xb.merge);
+                        pass.dispatch_workgroups(x as u32, blocks as u32, z as u32);
+                        pass.set_pipeline(merge);
                         pass.set_bind_group(0, &bg_merge, &[]);
                         pass.dispatch_workgroups(nh as u32, kk as u32, 1);
                         t0 += kk;
@@ -36516,6 +37262,9 @@ pub fn forward_batch_graph_at(
                         None => rwc(nh),
                     };
                     let split_any = g.window.is_none() && pos_end > ATTEND_SPLIT_MIN;
+                    // The O(1) seal's query trace (Spark-X2.6's 256-wide heads take
+                    // this arm): each token's rotated query as it is made.
+                    let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
                     let (xacc, xml) = if split_any {
                         (rwc(nh * nc * g.dv), rwc(nh * nc * 2))
                     } else {
@@ -36578,6 +37327,9 @@ pub fn forward_batch_graph_at(
                         );
                         pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
                         state_started = true;
+                        if let Some(cb) = &qcap {
+                            encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
+                        }
                         pass.set_pipeline(&gx.kv_append);
                         pass.set_bind_group(
                             0,
@@ -36941,6 +37693,29 @@ pub fn forward_batch_graph_at(
                             pass.dispatch_workgroups(((rows * nh * hd) as u32).div_ceil(256), 1, 1);
                         }
                     }
+                }
+                // Spark-X2.6's head-wise gate over the k rows: g = g_proj · n1
+                // ([k][nh]), then head h of row t *= sigmoid(g[t][h]).
+                if let Some(hgm) = hg {
+                    let gk = rwc(k * nh);
+                    if hgm.kind == 4 {
+                        // An f32 g_proj (the file keeps it unquantized): one
+                        // dispatch for every row, as GDN's a/b.
+                        let fb_u = uniform_u32x4(c, [hidden as u32, nh as u32, 0, 0]);
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&c.f32_matvec_b);
+                        pass.set_bind_group(0, &bg(&c.layout_f32b, &[&hgm.buf, &n1, &gk, &fb_u]), &[]);
+                        pass.dispatch_workgroups((nh as u32).min(MAX_WG), k as u32, 1);
+                    } else {
+                        ematb(&mut enc, hgm, &n1, &gk, nh, hidden);
+                    }
+                    let gm_u = unif(&[(k * nh * ldv) as u32, ldv as u32, 0, 0]);
+                    go(
+                        &mut enc,
+                        &c.gate_mul,
+                        &bg(&c.layout_gate_mul, &[&gk, &attn_bb, &gm_u]),
+                        ((k * nh * ldv) as u32).div_ceil(256),
+                    );
                 }
                 let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * ldv) else {
                     bgraph_refused("Prism transform unavailable for batched output projection");
@@ -41633,6 +42408,173 @@ fn zi_gemm_route(
     let cvt = prefill_pipe(c, "zi_act_f16", ZI_ACT_SRC, "zi_act_f16")?;
     let post = prefill_pipe(c, "zi_post_scale", ZI_ACT_SRC, "zi_post_scale")?;
     Some((mm, cvt, post))
+}
+
+/// The `zi_mm` f32-epilogue GEMM for the batched prefill (the GEMM, the
+/// activation cast, the store-scale pass), tile from `zimage::default_cfg`
+/// (`CMF_ZI_TILE=bm,bn,bk,wm,wn` overrides it). None when the tile does not
+/// fit the device or a kernel is rejected.
+fn zi_batch_pipes(
+    c: &Ctx,
+) -> Option<(
+    Arc<wgpu::ComputePipeline>,
+    Arc<wgpu::ComputePipeline>,
+    Arc<wgpu::ComputePipeline>,
+    zimage::MmCfg,
+)> {
+    let cfg = zimage::default_cfg(zimage::Epi::F32);
+    if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
+        return None;
+    }
+    let key = format!(
+        "zi_mm_{}x{}x{}_{}x{}_f32",
+        cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn
+    );
+    let mm = prefill_pipe(c, &key, &zimage::mm_src(cfg), "zi_mm")?;
+    let cvt = prefill_pipe(c, "zi_act_f16", ZI_ACT_SRC, "zi_act_f16")?;
+    let post = prefill_pipe(c, "zi_post_scale", ZI_ACT_SRC, "zi_post_scale")?;
+    Some((mm, cvt, post, cfg))
+}
+
+/// One batched-prefill q4tp GEMM (`y[k][rows] = xs[k][cols] · Wᵀ`) through
+/// `zi_mm`: the weight dequantized into the shared f16 plane slot, the
+/// activations cast to an f16 panel padded to the tile (zeros past `k`),
+/// the 128x128x32 tile kernel, then `* aback` over the result. The device
+/// activation scale rides in the `amax1` slot as for the other coop arms.
+/// False — nothing encoded — when the shape does not fit: `k` and `rows`
+/// multiples of the tile (the kernel runs unchecked and writes whole
+/// tiles), `cols` a multiple of 32, `y` holding all `k` rows.
+#[allow(clippy::too_many_arguments)]
+fn encode_batch_zi_gemm(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+) -> bool {
+    let can_dev_scale =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    if k == 0
+        || k % 128 != 0
+        || rows % 128 != 0
+        || cols % 32 != 0
+        || !can_dev_scale
+        || c.q4tp_dq_f16.is_none()
+        || y.size() < (k * rows * 4) as u64
+        || zimage::pad_rows(k) * cols.max(rows) >= (1usize << 31) / 4
+    {
+        return false;
+    }
+    let Some((mm, cvt, post, cfg)) = zi_batch_pipes(c) else {
+        return false;
+    };
+    if k % cfg.bm as usize != 0 || rows % cfg.bn as usize != 0 || cols % cfg.bk as usize != 0 {
+        return false;
+    }
+    let mp = zimage::pad_rows(k);
+    let (asc, plane, bind_dq, act16) = {
+        let mut sc = c.scratch.lock().unwrap();
+        let asc = Scratch::ensure(
+            &c.device,
+            &mut sc.amax1,
+            4,
+            wgpu::BufferUsages::STORAGE,
+            "batch-ascale",
+        );
+        let Some((plane, bind_dq)) = dq_f16_plane(c, &mut sc, weight, rows, cols) else {
+            return false;
+        };
+        let act16 = Scratch::ensure(
+            &c.device,
+            &mut sc.zact,
+            (mp * cols * 2) as u64,
+            wgpu::BufferUsages::STORAGE,
+            "zi-act",
+        );
+        (asc, plane, bind_dq, act16)
+    };
+    {
+        let mut pass = begin_pass_with(enc, Some("zi-dq"), None);
+        pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
+        pass.set_bind_group(0, &bind_dq, &[]);
+        let groups = ((rows * cols / 2) as u32).div_ceil(256);
+        pass.dispatch_workgroups(groups.min(MAX_WG), groups.div_ceil(MAX_WG), 1);
+    }
+    if !encode_act_absmax(c, enc, xs, k * cols, &asc) {
+        return false;
+    }
+    let sent = 0xFFFF_FFFFu32;
+    let cv_u = uniform_u32x4(c, [(k * cols) as u32, (mp * cols) as u32, sent, 0]);
+    let bg_cv = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zi-act"),
+        layout: &cvt.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, xs),
+            bind_buf(1, &act16),
+            bind_buf(2, &cv_u),
+            bind_buf(3, &asc),
+        ],
+    });
+    let mm_u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("zi-mm-p"),
+            contents: bytemuck::cast_slice(&[
+                k as u32,
+                rows as u32,
+                cols as u32,
+                rows as u32,
+                0u32,
+                0u32,
+                1.0f32.to_bits(),
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bg_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zi-mm"),
+        layout: &mm.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &plane),
+            bind_buf(1, &act16),
+            bind_buf(2, y),
+            bind_buf(3, &mm_u),
+        ],
+    });
+    let ps_u = uniform_u32x4(c, [(k * rows) as u32, sent, 0, 0]);
+    let bg_ps = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zi-post"),
+        layout: &post.get_bind_group_layout(0),
+        entries: &[bind_buf(0, y), bind_buf(1, &ps_u), bind_buf(2, &asc)],
+    });
+    {
+        let mut pass = begin_pass_with(enc, Some("zi-act"), None);
+        pass.set_pipeline(&cvt);
+        pass.set_bind_group(0, &bg_cv, &[]);
+        let wgs = ((mp * cols) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    {
+        let mut pass = begin_pass_with(enc, Some("zi-mm"), None);
+        pass.set_pipeline(&mm);
+        pass.set_bind_group(0, &bg_mm, &[]);
+        pass.dispatch_workgroups((rows / cfg.bn as usize) as u32, (k / cfg.bm as usize) as u32, 1);
+    }
+    {
+        let mut pass = begin_pass_with(enc, Some("zi-post"), None);
+        pass.set_pipeline(&post);
+        pass.set_bind_group(0, &bg_ps, &[]);
+        let wgs = ((k * rows) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    true
 }
 
 /// Build (once per context) a prefill kernel into `Ctx::prefill_pipes`.
@@ -47377,13 +48319,36 @@ var<workgroup> cm_a: array<f16, 64 * 32>;
 var<workgroup> cm_b: array<f16, 64 * 32>;
 var<workgroup> cm_c: array<f32, 64 * 64>;
 
+
+// Tile origin of this workgroup. The dispatch is (weight tiles, batch
+// tiles), x fastest, so in launch order consecutive workgroups walked the
+// weight tiles against ONE batch tile and the whole weight left VRAM once
+// per batch tile (8 times for a 512-row chunk). Here consecutive workgroups
+// take the same weight tile against a group of up to 8 batch tiles, whose
+// activations stay in L2, so a weight tile leaves VRAM once per group.
+fn mm_tile(wid: vec3<u32>, nwg: vec3<u32>) -> vec2<u32> {
+    let nt = nwg.x;
+    let mt = (pmm.nb + 63u) / 64u;
+    let g = min(mt, 8u);
+    let lin = wid.y * nt + wid.x;
+    let ng = (mt + g - 1u) / g;
+    let mg = min(lin / (nt * g), ng - 1u);
+    let rem = lin - mg * nt * g;
+    let gs = min(g, mt - mg * g);
+    let n_tile = rem / gs;
+    let m_tile = mg * g + rem % gs;
+    return vec2<u32>(m_tile * 64u, n_tile * 64u);
+}
+
 @compute @workgroup_size(128)
 fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>,
                     @builtin(local_invocation_index) tid: u32,
                     @builtin(subgroup_id) sg: u32) {
     let cols = pmm.cols4 * 4u;
-    let m0 = wid.y * 64u;
-    let n0 = wid.x * 64u;
+    let mn = mm_tile(wid, nwg);
+    let m0 = mn.x;
+    let n0 = mn.y;
     var c0: coop_mat16x16<f32, C>;
     var c1: coop_mat16x16<f32, C>;
     var c2: coop_mat16x16<f32, C>;
@@ -47467,6 +48432,123 @@ fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
         let n = t % 64u;
         if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
             ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n] * aback;
+        }
+    }
+}
+
+// The same GEMM with a 128-row batch tile: a subgroup owns 32 rows (two A
+// tiles) against the 64 weight rows, so each staged weight tile feeds eight
+// multiply-adds instead of four, and the plane is staged half as often per
+// output. Dispatched (weight tiles, ceil(nb / 128)).
+var<workgroup> cm2_a: array<f16, 128 * 32>;
+var<workgroup> cm2_c: array<f32, 128 * 64>;
+
+fn mm_tile128(wid: vec3<u32>, nwg: vec3<u32>) -> vec2<u32> {
+    let nt = nwg.x;
+    let mt = (pmm.nb + 127u) / 128u;
+    let g = min(mt, 8u);
+    let lin = wid.y * nt + wid.x;
+    let ng = (mt + g - 1u) / g;
+    let mg = min(lin / (nt * g), ng - 1u);
+    let rem = lin - mg * nt * g;
+    let gs = min(g, mt - mg * g);
+    let n_tile = rem / gs;
+    let m_tile = mg * g + rem % gs;
+    return vec2<u32>(m_tile * 128u, n_tile * 64u);
+}
+
+@compute @workgroup_size(128)
+fn q4tp_mm_coop_f16_m128(@builtin(workgroup_id) wid: vec3<u32>,
+                         @builtin(num_workgroups) nwg: vec3<u32>,
+                         @builtin(local_invocation_index) tid: u32,
+                         @builtin(subgroup_id) sg: u32) {
+    let cols = pmm.cols4 * 4u;
+    let mn = mm_tile128(wid, nwg);
+    let m0 = mn.x;
+    let n0 = mn.y;
+    var c00: coop_mat16x16<f32, C>; var c01: coop_mat16x16<f32, C>;
+    var c02: coop_mat16x16<f32, C>; var c03: coop_mat16x16<f32, C>;
+    var c10: coop_mat16x16<f32, C>; var c11: coop_mat16x16<f32, C>;
+    var c12: coop_mat16x16<f32, C>; var c13: coop_mat16x16<f32, C>;
+    let asc_in = select(bitcast<f32>(pmm.pad), pmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc_in, asc_in > 0.0);
+    let ra = sg * 32u * KS;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 128u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
+            }
+            cm2_a[dst] = f16(v.x * ainv); cm2_a[dst + 1u] = f16(v.y * ainv);
+            cm2_a[dst + 2u] = f16(v.z * ainv); cm2_a[dst + 3u] = f16(v.w * ainv);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let bd = n * KS + k4;
+            var p0 = vec2<f32>(0.0);
+            var p1 = vec2<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let base = ((n0 + n) * cols + col0) >> 1u;
+                p0 = unpack2x16float(wmm[base]);
+                p1 = unpack2x16float(wmm[base + 1u]);
+            }
+            cm_b[bd] = f16(p0.x); cm_b[bd + 1u] = f16(p0.y);
+            cm_b[bd + 2u] = f16(p1.x); cm_b[bd + 3u] = f16(p1.y);
+        }
+        workgroupBarrier();
+        {
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&cm2_a[ra], 32u);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&cm2_a[ra + 16u * KS], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u], 32u);
+            c00 = coopMultiplyAdd(a0, b0, c00); c01 = coopMultiplyAdd(a0, b1, c01);
+            c02 = coopMultiplyAdd(a0, b2, c02); c03 = coopMultiplyAdd(a0, b3, c03);
+            c10 = coopMultiplyAdd(a1, b0, c10); c11 = coopMultiplyAdd(a1, b1, c11);
+            c12 = coopMultiplyAdd(a1, b2, c12); c13 = coopMultiplyAdd(a1, b3, c13);
+        }
+        {
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&cm2_a[ra + 16u], 32u);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&cm2_a[ra + 16u * KS + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c00 = coopMultiplyAdd(a0, b0, c00); c01 = coopMultiplyAdd(a0, b1, c01);
+            c02 = coopMultiplyAdd(a0, b2, c02); c03 = coopMultiplyAdd(a0, b3, c03);
+            c10 = coopMultiplyAdd(a1, b0, c10); c11 = coopMultiplyAdd(a1, b1, c11);
+            c12 = coopMultiplyAdd(a1, b2, c12); c13 = coopMultiplyAdd(a1, b3, c13);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    let rc = sg * 32u * 64u;
+    coopStoreT(c00, &cm2_c[rc], 64u);
+    coopStoreT(c01, &cm2_c[rc + 16u], 64u);
+    coopStoreT(c02, &cm2_c[rc + 32u], 64u);
+    coopStoreT(c03, &cm2_c[rc + 48u], 64u);
+    coopStoreT(c10, &cm2_c[rc + 16u * 64u], 64u);
+    coopStoreT(c11, &cm2_c[rc + 16u * 64u + 16u], 64u);
+    coopStoreT(c12, &cm2_c[rc + 16u * 64u + 32u], 64u);
+    coopStoreT(c13, &cm2_c[rc + 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    let aback = select(1.0, 1.0 / asc_in, asc_in > 0.0);
+    for (var t = tid; t < 128u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm2_c[m * 64u + n] * aback;
         }
     }
 }
@@ -47569,6 +48651,640 @@ fn act_absmax(@builtin(local_invocation_index) lid: u32) {
 }
 "#;
 
+/// The query-tiled batched attend on the matrix units: `gqa_attend_part_xt`'s
+/// framing (a tile of tq tokens = 64 query rows against a 64-key block,
+/// partials in the `gqa_attend_merge_xt` layout) with S = Q·Kᵀ and O = P·V
+/// as 16×16×16 f16 → f32 cooperative products. Q, K, P and V are f16 at the
+/// matrix units, the scores, softmax and output f32. Q and K arrive in
+/// 32-wide k steps (hd % 32 == 0); V in 64-wide dv quarters, transposed into
+/// workgroup memory (dv % 64 == 0). Same tile/subgroup choreography as
+/// `COOP_MM_SRC` (four 32-lane subgroups, each a 16-row strip).
+// The query tile on the matrix units: ONE workgroup serves a tile of tq
+// tokens (64 query rows) against a GROUP of `bpw` 64-key blocks, walking
+// the blocks with an online softmax, the 64 x dv output tile resident in
+// cooperative-matrix accumulators (16 C tiles a subgroup at dv = 256).
+// One partial (m, l, acc) per group goes out for `gqa_attend_merge_xt`.
+// Operands are f16 (what the matrix units take), scores and sums f32.
+// The running max is lazy: a row's max moves only when the block's max
+// exceeds it by more than `lazy` (nats; weights stay under e^lazy, well
+// inside f16), so the accumulator rescale — store, scale by row, reload —
+// is rare. No early return anywhere: naga requires uniform control flow
+// around every cooperative op, so the whole body sits under one
+// workgroup-uniform condition. Generated per dv quarter (`@Q@`), since
+// WGSL has no arrays of cooperative matrices.
+// The tail the matrix-unit attend tiles share (`gqa_attend_part_xc`,
+// `gqa_attend_part_xc2`): the accumulator rescale of one dv quarter, the
+// flag reset and the partial's write-out. `@Q@` is the quarter, `@J@` the
+// 16-wide C tile inside it.
+// Rescale of one dv quarter: the four C tiles of the subgroup through
+// xc_s, each row by its alpha, and back.
+const XC_RESCALE: &str = r#"
+                if (@Q@u * 64u < dv) {
+                    coopStoreT(o@Q@0, &xc_s[sg * 1024u], 64u);
+                    coopStoreT(o@Q@1, &xc_s[sg * 1024u + 16u], 64u);
+                    coopStoreT(o@Q@2, &xc_s[sg * 1024u + 32u], 64u);
+                    coopStoreT(o@Q@3, &xc_s[sg * 1024u + 48u], 64u);
+                    workgroupBarrier();
+                    for (var i = lid; i < 4096u; i = i + 128u) { xc_s[i] = xc_s[i] * xc_al[i >> 6u]; }
+                    workgroupBarrier();
+                    o@Q@0 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u], 64u);
+                    o@Q@1 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u + 16u], 64u);
+                    o@Q@2 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u + 32u], 64u);
+                    o@Q@3 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u + 48u], 64u);
+                    workgroupBarrier();
+                }
+"#;
+const XC_MID: &str = r#"
+                if (lid == 0u) { xc_flag = vec4<u32>(0u); }
+            }
+"#;
+const XC_TAIL_A: &str = r#"
+            workgroupBarrier();
+        }
+        // The group's partial: (m, l) of each live row, the accumulator
+        // tiles one at a time through xc_c.
+        if ((lid & 1u) == 0u && row < nq) {
+            let tl = tl0 + row / hpk;
+            let h = g * hpk + (row % hpk);
+            ax_ml[(tl * ab_p.nh + h) * ab_p.nc + gi] = vec2<f32>(xc_rm[row], xc_rl[row]);
+        }
+        let orow = sg * 16u + (sl >> 1u);
+        let ocol = (sl & 1u) * 8u;
+        let olive = orow < nq;
+        var obase = 0u;
+        if (olive) {
+            let tl = tl0 + orow / hpk;
+            let h = g * hpk + (orow % hpk);
+            obase = ((tl * ab_p.nh + h) * ab_p.nc + gi) * dv;
+        }
+        // Debug 4: the lane copy alone over a counting pattern in xc_c (the
+        // first 16 dims of every row should read sg*256 + m*16 + c).
+        if ((dbg & 4u) != 0u) {
+            workgroupBarrier();
+            for (var i = lid; i < 1024u; i = i + 128u) { xc_c[i] = f32(i); }
+            workgroupBarrier();
+            if (olive) {
+                let src = sg * 256u + (sl >> 1u) * 16u + ocol;
+                for (var j = 0u; j < 8u; j = j + 1u) { ax_acc[obase + ocol + j] = xc_c[src + j]; }
+            }
+            workgroupBarrier();
+        }
+        // Debug 8: a counting pattern in xc_s loaded as two C tiles into o00/o01
+        // and written out by the regular copy (dims 0..32 should read row*64 + c).
+        if ((dbg & 8u) != 0u) {
+            workgroupBarrier();
+            for (var i = lid; i < 4096u; i = i + 128u) { xc_s[i] = f32(i); }
+            workgroupBarrier();
+            o00 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u], 64u);
+            o01 = coopLoadT<coop_mat16x16<f32, C>>(&xc_s[sg * 1024u + 16u], 64u);
+            workgroupBarrier();
+        }
+        if ((dbg & 4u) == 0u) {
+"#;
+const XC_OUT: &str = r#"
+        if (@Q@u * 64u < dv) {
+            coopStoreT(o@Q@@J@, &xc_c[sg * 256u], 16u);
+            workgroupBarrier();
+            if (olive) {
+                let src = sg * 256u + (sl >> 1u) * 16u + ocol;
+                let dst = obase + @Q@u * 64u + @J@u * 16u + ocol;
+                for (var j = 0u; j < 8u; j = j + 1u) {
+                    var ov = xc_c[src + j];
+                    if ((dbg & 2u) != 0u) { ov = select(0.0, xc_s[orow * 64u + @J@u * 16u + ocol + j], @Q@u == 0u); }
+                    ax_acc[dst + j] = ov;
+                }
+            }
+            workgroupBarrier();
+        }
+"#;
+const XC_TAIL_B: &str = r#"
+        }
+    }
+}
+"#;
+
+fn attend_coop_src() -> String {
+    const HEAD: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct AbP {
+    nh: u32, hpk: u32, hd: u32, dv: u32,
+    cap: u32, pos0: u32, win: u32, scale: f32,
+    sink: u32, nc: u32, k: u32, t0: u32,
+    tq: u32, bpw: u32, lazy: f32, _p3: u32,
+};
+@group(0) @binding(0) var<storage, read>       ax_q   : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       ax_k   : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       ax_v4  : array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> ax_acc : array<f32>;
+@group(0) @binding(7) var<storage, read_write> ax_ml  : array<vec2<f32>>;
+@group(0) @binding(9) var<uniform>             ab_p   : AbP;
+
+const KS: u32 = 32u;
+var<workgroup> xc_a: array<f16, 64 * 32>;   // Q rows [m][k], one 32-wide k step
+var<workgroup> xc_b: array<f16, 64 * 32>;   // K rows [n][k], the same k step
+var<workgroup> xc_s: array<f32, 64 * 64>;   // S [row][key]; then the rescale staging
+var<workgroup> xc_p: array<f16, 64 * 64>;   // P [row][key]
+var<workgroup> xc_vt: array<f16, 64 * 64>;  // Vᵀ [dim of a 64-wide quarter][key]
+var<workgroup> xc_c: array<f32, 4 * 256>;   // one C tile a subgroup for the copy out
+var<workgroup> xc_m: array<f32, 128>;
+var<workgroup> xc_l: array<f32, 128>;
+var<workgroup> xc_rm: array<f32, 64>;       // running max of each row
+var<workgroup> xc_rl: array<f32, 64>;       // running sum of each row
+var<workgroup> xc_al: array<f32, 64>;       // this block's rescale of each row
+// 16-byte types on purpose: see the alignment note at `xc_wid` below.
+var<workgroup> xc_flag: vec4<u32>;
+var<workgroup> xc_wid: vec4<u32>;
+
+fn ab_n(t: u32) -> u32 {
+    let na = ab_p.pos0 + t + 1u;
+    return select(na, min(na, ab_p.win), ab_p.win != 0u);
+}
+
+@compute @workgroup_size(128)
+fn gqa_attend_part_xc(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32,
+                      @builtin(subgroup_id) sg: u32,
+                      @builtin(subgroup_invocation_id) sl: u32) {
+    // The workgroup id through a workgroup-uniform load: naga's analysis
+    // took the builtin itself for non-uniform and rejected every
+    // cooperative op under a condition derived from it.
+    if (lid == 0u) { xc_wid = vec4<u32>(wid.xy, 0u, 0u); }
+    let uw = workgroupUniformLoad(&xc_wid);
+    let hpk = ab_p.hpk;
+    let ng = ab_p.nh / hpk;
+    let g = uw.x % ng;
+    let gi = uw.y;
+    let tq = ab_p.tq;
+    let tl0 = (uw.x / ng) * tq;
+    let tlive = tl0 < ab_p.k;
+    let ntok = min(tq, ab_p.k - select(0u, tl0, tlive));
+    let nq = ntok * hpk;
+    let tf = ab_p.t0 + tl0;
+    // ab_n(tf) written out: naga rates every call result by the callee's
+    // own argument, i.e. non-uniform, and the tile condition below must
+    // stay uniform for the cooperative ops under it.
+    let naf = ab_p.pos0 + tf + 1u;
+    let nf = select(naf, min(naf, ab_p.win), ab_p.win != 0u);
+    let b0 = naf - nf;
+    let alast = ab_p.pos0 + tf + ntok - 1u;
+    let nblk = (alast + 1u - b0 + 63u) / 64u;
+    let bpw = max(ab_p.bpw, 1u);
+    let cb = gi * bpw;
+    let ce = min(nblk, cb + bpw);
+    // Debug switches (tests only): 1 = P is the identity on key row&63 with
+    // (m, l) = (0, 1); 2 = the output rows 0..63 are the last block's S.
+    let dbg = ab_p._p3;
+    // `&`, not `&&`: the short-circuit form lowers through a function-space
+    // temporary, which naga's uniformity analysis treats as non-uniform.
+    if (tlive & (cb < ce)) {
+        let hd4 = ab_p.hd / 4u;
+        let dv = ab_p.dv;
+        let dv4 = dv / 4u;
+        let cap = ab_p.cap;
+        let kbase = g * cap * hd4;
+        let vbase4 = g * cap * dv4;
+        // Softmax lanes: two a row, 32 keys each.
+        let row = lid >> 1u;
+        let kb = (lid & 1u) * 32u;
+        let tt = tf + row / hpk;
+        let tpos = ab_p.pos0 + tt;
+        let tlo = tpos + 1u - ab_n(tt);
+        if (lid < 64u) { xc_rm[lid] = -1.0e30; xc_rl[lid] = 0.0; }
+        if (lid == 0u) { xc_flag = vec4<u32>(0u); }
+        var o00: coop_mat16x16<f32, C>; var o01: coop_mat16x16<f32, C>;
+        var o02: coop_mat16x16<f32, C>; var o03: coop_mat16x16<f32, C>;
+        var o10: coop_mat16x16<f32, C>; var o11: coop_mat16x16<f32, C>;
+        var o12: coop_mat16x16<f32, C>; var o13: coop_mat16x16<f32, C>;
+        var o20: coop_mat16x16<f32, C>; var o21: coop_mat16x16<f32, C>;
+        var o22: coop_mat16x16<f32, C>; var o23: coop_mat16x16<f32, C>;
+        var o30: coop_mat16x16<f32, C>; var o31: coop_mat16x16<f32, C>;
+        var o32: coop_mat16x16<f32, C>; var o33: coop_mat16x16<f32, C>;
+        for (var ch = cb; ch < ce; ch = ch + 1u) {
+            let c0 = b0 + ch * 64u;
+            let cn = min(64u, alast + 1u - c0);
+            let s0 = c0 % cap;
+            // S = Q·Kᵀ over 32-wide k steps: subgroup sg owns rows sg*16 .. +16
+            // against all 64 keys (four C tiles).
+            var c0m: coop_mat16x16<f32, C>;
+            var c1m: coop_mat16x16<f32, C>;
+            var c2m: coop_mat16x16<f32, C>;
+            var c3m: coop_mat16x16<f32, C>;
+            for (var k0 = 0u; k0 < hd4; k0 = k0 + 8u) {
+                workgroupBarrier();
+                for (var t = lid; t < 64u * 8u; t = t + 128u) {
+                    let r = t >> 3u;
+                    let kq = t & 7u;
+                    var v = vec4<f32>(0.0);
+                    if (r < nq) {
+                        let tq_t = tf + r / hpk;
+                        let h = g * hpk + (r % hpk);
+                        v = ax_q[(tq_t * ab_p.nh + h) * hd4 + k0 + kq];
+                    }
+                    if ((dbg & 16u) != 0u) { v = vec4<f32>(1.0); }
+                    let dst = r * KS + kq * 4u;
+                    xc_a[dst] = f16(v.x); xc_a[dst + 1u] = f16(v.y);
+                    xc_a[dst + 2u] = f16(v.z); xc_a[dst + 3u] = f16(v.w);
+                    var w = vec4<f32>(0.0);
+                    if (r < cn) {
+                        let sp = s0 + r;
+                        w = ax_k[kbase + select(sp, sp - cap, sp >= cap) * hd4 + k0 + kq];
+                    }
+                    xc_b[dst] = f16(w.x); xc_b[dst + 1u] = f16(w.y);
+                    xc_b[dst + 2u] = f16(w.z); xc_b[dst + 3u] = f16(w.w);
+                }
+                workgroupBarrier();
+                {
+                    let a = coopLoadT<coop_mat16x16<f16, A>>(&xc_a[sg * 512u], 32u);
+                    let b0t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[0u], 32u);
+                    let b1t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[512u], 32u);
+                    let b2t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[1024u], 32u);
+                    let b3t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[1536u], 32u);
+                    c0m = coopMultiplyAdd(a, b0t, c0m);
+                    c1m = coopMultiplyAdd(a, b1t, c1m);
+                    c2m = coopMultiplyAdd(a, b2t, c2m);
+                    c3m = coopMultiplyAdd(a, b3t, c3m);
+                }
+                {
+                    let a = coopLoadT<coop_mat16x16<f16, A>>(&xc_a[sg * 512u + 16u], 32u);
+                    let b0t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[16u], 32u);
+                    let b1t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[512u + 16u], 32u);
+                    let b2t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[1024u + 16u], 32u);
+                    let b3t = coopLoad<coop_mat16x16<f16, B>>(&xc_b[1536u + 16u], 32u);
+                    c0m = coopMultiplyAdd(a, b0t, c0m);
+                    c1m = coopMultiplyAdd(a, b1t, c1m);
+                    c2m = coopMultiplyAdd(a, b2t, c2m);
+                    c3m = coopMultiplyAdd(a, b3t, c3m);
+                }
+            }
+            workgroupBarrier();
+            coopStoreT(c0m, &xc_s[sg * 1024u], 64u);
+            coopStoreT(c1m, &xc_s[sg * 1024u + 16u], 64u);
+            coopStoreT(c2m, &xc_s[sg * 1024u + 32u], 64u);
+            coopStoreT(c3m, &xc_s[sg * 1024u + 48u], 64u);
+            workgroupBarrier();
+            // Block max of the row (key a = c0 + p is visible to token t when
+            // first(t) <= a <= pos0 + t), then the lazy running max.
+            var mb = -1.0e30;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                let a = c0 + kb + j;
+                if (a >= tlo && a <= tpos && kb + j < cn) {
+                    mb = max(mb, xc_s[row * 64u + kb + j] * ab_p.scale);
+                }
+            }
+            xc_m[lid] = mb;
+            workgroupBarrier();
+            mb = max(xc_m[lid & ~1u], xc_m[lid | 1u]);
+            let mo = xc_rm[row];
+            var mn = mo;
+            if (mb > mo + ab_p.lazy) { mn = mb; }
+            var alpha = exp(mo - mn);
+            var l = 0.0;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                let a = c0 + kb + j;
+                var w = 0.0;
+                if (a >= tlo && a <= tpos && kb + j < cn) {
+                    w = exp(xc_s[row * 64u + kb + j] * ab_p.scale - mn);
+                }
+                if ((dbg & 1u) != 0u) { w = select(0.0, 1.0, kb + j == (row & 63u)); }
+                xc_p[row * 64u + kb + j] = f16(w);
+                l = l + w;
+            }
+            xc_l[lid] = l;
+            workgroupBarrier();
+            l = xc_l[lid & ~1u] + xc_l[lid | 1u];
+            if ((dbg & 3u) != 0u) { mn = 0.0; alpha = 1.0; l = 1.0; }
+            if ((lid & 1u) == 0u) {
+                xc_rm[row] = mn;
+                xc_rl[row] = xc_rl[row] * alpha + l;
+                xc_al[row] = alpha;
+                // The first block of the group scales a zero accumulator.
+                if (alpha != 1.0 && ch > cb) { xc_flag.x = 1u; }
+            }
+            let need = workgroupUniformLoad(&xc_flag).x;
+            if (need != 0u) {
+"#;
+    // O += P·V for one dv quarter: Vᵀ of the quarter into workgroup memory,
+    // four C tiles a subgroup.
+    const PV: &str = r#"
+            if (@Q@u * 64u < dv) {
+                workgroupBarrier();
+                for (var t = lid; t < 64u * 16u; t = t + 128u) {
+                    let p = t >> 4u;
+                    let d4 = t & 15u;
+                    var v = vec4<f32>(0.0);
+                    if (p < cn) {
+                        let sp = s0 + p;
+                        v = ax_v4[vbase4 + select(sp, sp - cap, sp >= cap) * dv4 + @Q@u * 16u + d4];
+                    }
+                    let dd = d4 * 4u;
+                    xc_vt[dd * 64u + p] = f16(v.x);
+                    xc_vt[(dd + 1u) * 64u + p] = f16(v.y);
+                    xc_vt[(dd + 2u) * 64u + p] = f16(v.z);
+                    xc_vt[(dd + 3u) * 64u + p] = f16(v.w);
+                }
+                workgroupBarrier();
+                for (var ks = 0u; ks < 64u; ks = ks + 16u) {
+                    let a = coopLoadT<coop_mat16x16<f16, A>>(&xc_p[sg * 1024u + ks], 64u);
+                    let v0 = coopLoad<coop_mat16x16<f16, B>>(&xc_vt[ks], 64u);
+                    let v1 = coopLoad<coop_mat16x16<f16, B>>(&xc_vt[1024u + ks], 64u);
+                    let v2 = coopLoad<coop_mat16x16<f16, B>>(&xc_vt[2048u + ks], 64u);
+                    let v3 = coopLoad<coop_mat16x16<f16, B>>(&xc_vt[3072u + ks], 64u);
+                    o@Q@0 = coopMultiplyAdd(a, v0, o@Q@0);
+                    o@Q@1 = coopMultiplyAdd(a, v1, o@Q@1);
+                    o@Q@2 = coopMultiplyAdd(a, v2, o@Q@2);
+                    o@Q@3 = coopMultiplyAdd(a, v3, o@Q@3);
+                }
+            }
+"#;
+    let mut s = String::with_capacity(16 << 10);
+    s.push_str(HEAD);
+    // Experiment switch: `CMF_ATTEND_XC_NORESCALE=1` compiles the tile without
+    // the accumulator rescale (its loads into the resident C tiles are the
+    // suspect behind the one-column shift; correct only while no row's max
+    // moves by more than the lazy margin).
+    // Experiment switch: `CMF_ATTEND_XC_QMAX=1|2` compiles only the first dv
+    // quarters (4 or 8 resident accumulators instead of 16; correct only for
+    // dv <= 64 * QMAX).
+    let qmax: usize = std::env::var("CMF_ATTEND_XC_QMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 4);
+    if std::env::var("CMF_ATTEND_XC_NORESCALE").is_err() {
+        for q in 0..qmax {
+            s.push_str(&XC_RESCALE.replace("@Q@", &q.to_string()));
+        }
+    }
+    s.push_str(XC_MID);
+    for q in 0..qmax {
+        s.push_str(&PV.replace("@Q@", &q.to_string()));
+    }
+    s.push_str(XC_TAIL_A);
+    for q in 0..qmax {
+        for j in 0..4 {
+            s.push_str(&XC_OUT.replace("@Q@", &q.to_string()).replace("@J@", &j.to_string()));
+        }
+    }
+    s.push_str(XC_TAIL_B);
+    s
+}
+
+/// The matrix-unit tile fed from f16 planes (`gqa_attend_part_xc2`): Q, K
+/// and V come as `[row][dim]` f16 planes (`ATTEND_PLANES_SRC`) and every
+/// operand tile is one cooperative load straight from storage, so the block
+/// loop stages nothing and its barriers serve the softmax alone (the `xc`
+/// tile above spent most of a 16 000-token chunk staging Q/K per 32-wide k
+/// step and Vᵀ per quarter). A cooperative load's stride is a constant
+/// here, so the head widths are baked into the source. Full-attention
+/// layers only: the mirror holds position p in slot p, so a 64-key block is
+/// 64 consecutive plane rows. `CMF_ATTEND_XC2_VLOAD=coopLoad` picks the
+/// other load for the V tiles (tests/gpu_coop_probe.rs says which one reads
+/// a `[key][dim]` plane as the B operand on a driver).
+fn attend_coop2_src(hd: usize, dv: usize) -> String {
+    const HEAD: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct AbP {
+    nh: u32, hpk: u32, hd: u32, dv: u32,
+    cap: u32, pos0: u32, win: u32, scale: f32,
+    sink: u32, nc: u32, k: u32, t0: u32,
+    tq: u32, bpw: u32, lazy: f32, _p3: u32,
+};
+@group(0) @binding(0) var<storage, read>       ax_q16 : array<f16>;   // [g][kpad][hpk][HD]
+@group(0) @binding(1) var<storage, read>       ax_k16 : array<f16>;   // [g][cap][HD]
+@group(0) @binding(2) var<storage, read>       ax_v16 : array<f16>;   // [g][cap][DV]
+@group(0) @binding(6) var<storage, read_write> ax_acc : array<f32>;
+@group(0) @binding(7) var<storage, read_write> ax_ml  : array<vec2<f32>>;
+@group(0) @binding(9) var<uniform>             ab_p   : AbP;
+
+const HD: u32 = @HD@u;
+const DV: u32 = @DV@u;
+var<workgroup> xc_s: array<f32, 64 * 64>;   // S [row][key]; then the rescale staging
+var<workgroup> xc_p: array<f16, 64 * 64>;   // P [row][key]
+var<workgroup> xc_c: array<f32, 4 * 256>;   // one C tile a subgroup for the copy out
+var<workgroup> xc_m: array<f32, 128>;
+var<workgroup> xc_l: array<f32, 128>;
+var<workgroup> xc_rm: array<f32, 64>;       // running max of each row
+var<workgroup> xc_rl: array<f32, 64>;       // running sum of each row
+var<workgroup> xc_al: array<f32, 64>;       // this block's rescale of each row
+// 16-byte types on purpose: a u32 beside the tile arrays shifted every
+// cooperative load and store by one element on NVIDIA (gpu_coop_probe.rs).
+var<workgroup> xc_flag: vec4<u32>;
+var<workgroup> xc_wid: vec4<u32>;
+
+fn ab_n(t: u32) -> u32 {
+    let na = ab_p.pos0 + t + 1u;
+    return select(na, min(na, ab_p.win), ab_p.win != 0u);
+}
+
+@compute @workgroup_size(128)
+fn gqa_attend_part_xc2(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32,
+                       @builtin(subgroup_id) sg: u32,
+                       @builtin(subgroup_invocation_id) sl: u32) {
+    if (lid == 0u) { xc_wid = vec4<u32>(wid.xy, 0u, 0u); }
+    let uw = workgroupUniformLoad(&xc_wid);
+    let hpk = ab_p.hpk;
+    let ng = ab_p.nh / hpk;
+    let g = uw.x % ng;
+    let gi = uw.y;
+    let tq = ab_p.tq;
+    // The Q plane's rows a group: the whole run padded to tiles, passed in
+    // `_p3` since `k` here is one sub-run of it.
+    let kpad = ab_p._p3;
+    let tl0 = (uw.x / ng) * tq;
+    let tlive = tl0 < ab_p.k;
+    let ntok = min(tq, ab_p.k - select(0u, tl0, tlive));
+    let nq = ntok * hpk;
+    let tf = ab_p.t0 + tl0;
+    let naf = ab_p.pos0 + tf + 1u;
+    let nf = select(naf, min(naf, ab_p.win), ab_p.win != 0u);
+    let b0 = naf - nf;
+    let alast = ab_p.pos0 + tf + ntok - 1u;
+    let nblk = (alast + 1u - b0 + 63u) / 64u;
+    let bpw = max(ab_p.bpw, 1u);
+    let cb = gi * bpw;
+    let ce = min(nblk, cb + bpw);
+    let dbg = 0u;
+    if (tlive & (cb < ce)) {
+        let dv = DV;
+        let cap = ab_p.cap;
+        // This subgroup's 16 query rows of the Q plane; the group's K and V rows.
+        let qg = (g * kpad * hpk + tf * hpk + sg * 16u) * HD;
+        let kg = g * cap * HD;
+        let vg = g * cap * DV;
+        // Softmax lanes: two a row, 32 keys each.
+        let row = lid >> 1u;
+        let kb = (lid & 1u) * 32u;
+        let tt = tf + row / hpk;
+        let tpos = ab_p.pos0 + tt;
+        let tlo = tpos + 1u - ab_n(tt);
+        if (lid < 64u) { xc_rm[lid] = -1.0e30; xc_rl[lid] = 0.0; }
+        if (lid == 0u) { xc_flag = vec4<u32>(0u); }
+        var o00: coop_mat16x16<f32, C>; var o01: coop_mat16x16<f32, C>;
+        var o02: coop_mat16x16<f32, C>; var o03: coop_mat16x16<f32, C>;
+        var o10: coop_mat16x16<f32, C>; var o11: coop_mat16x16<f32, C>;
+        var o12: coop_mat16x16<f32, C>; var o13: coop_mat16x16<f32, C>;
+        var o20: coop_mat16x16<f32, C>; var o21: coop_mat16x16<f32, C>;
+        var o22: coop_mat16x16<f32, C>; var o23: coop_mat16x16<f32, C>;
+        var o30: coop_mat16x16<f32, C>; var o31: coop_mat16x16<f32, C>;
+        var o32: coop_mat16x16<f32, C>; var o33: coop_mat16x16<f32, C>;
+        for (var ch = cb; ch < ce; ch = ch + 1u) {
+            let c0 = b0 + ch * 64u;
+            let cn = min(64u, alast + 1u - c0);
+            let s0 = c0 % cap;
+            let kr = kg + s0 * HD;
+            // S = Q·Kᵀ straight from the planes: subgroup sg owns rows
+            // sg*16 .. +16 against all 64 keys (four C tiles).
+            var c0m: coop_mat16x16<f32, C>;
+            var c1m: coop_mat16x16<f32, C>;
+            var c2m: coop_mat16x16<f32, C>;
+            var c3m: coop_mat16x16<f32, C>;
+            for (var kk = 0u; kk < HD; kk = kk + 16u) {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&ax_q16[qg + kk], HD);
+                let b0t = coopLoad<coop_mat16x16<f16, B>>(&ax_k16[kr + kk], HD);
+                let b1t = coopLoad<coop_mat16x16<f16, B>>(&ax_k16[kr + 16u * HD + kk], HD);
+                let b2t = coopLoad<coop_mat16x16<f16, B>>(&ax_k16[kr + 32u * HD + kk], HD);
+                let b3t = coopLoad<coop_mat16x16<f16, B>>(&ax_k16[kr + 48u * HD + kk], HD);
+                c0m = coopMultiplyAdd(a, b0t, c0m);
+                c1m = coopMultiplyAdd(a, b1t, c1m);
+                c2m = coopMultiplyAdd(a, b2t, c2m);
+                c3m = coopMultiplyAdd(a, b3t, c3m);
+            }
+            workgroupBarrier();
+            coopStoreT(c0m, &xc_s[sg * 1024u], 64u);
+            coopStoreT(c1m, &xc_s[sg * 1024u + 16u], 64u);
+            coopStoreT(c2m, &xc_s[sg * 1024u + 32u], 64u);
+            coopStoreT(c3m, &xc_s[sg * 1024u + 48u], 64u);
+            workgroupBarrier();
+            // Block max of the row (key a = c0 + p is visible to token t when
+            // first(t) <= a <= pos0 + t), then the lazy running max.
+            var mb = -1.0e30;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                let a = c0 + kb + j;
+                if (a >= tlo && a <= tpos && kb + j < cn) {
+                    mb = max(mb, xc_s[row * 64u + kb + j] * ab_p.scale);
+                }
+            }
+            xc_m[lid] = mb;
+            workgroupBarrier();
+            mb = max(xc_m[lid & ~1u], xc_m[lid | 1u]);
+            let mo = xc_rm[row];
+            var mn = mo;
+            if (mb > mo + ab_p.lazy) { mn = mb; }
+            var alpha = exp(mo - mn);
+            var l = 0.0;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                let a = c0 + kb + j;
+                var w = 0.0;
+                if (a >= tlo && a <= tpos && kb + j < cn) {
+                    w = exp(xc_s[row * 64u + kb + j] * ab_p.scale - mn);
+                }
+                if ((dbg & 1u) != 0u) { w = select(0.0, 1.0, kb + j == (row & 63u)); }
+                xc_p[row * 64u + kb + j] = f16(w);
+                l = l + w;
+            }
+            xc_l[lid] = l;
+            workgroupBarrier();
+            l = xc_l[lid & ~1u] + xc_l[lid | 1u];
+            if ((dbg & 3u) != 0u) { mn = 0.0; alpha = 1.0; l = 1.0; }
+            if ((lid & 1u) == 0u) {
+                xc_rm[row] = mn;
+                xc_rl[row] = xc_rl[row] * alpha + l;
+                xc_al[row] = alpha;
+                // The first block of the group scales a zero accumulator.
+                if (alpha != 1.0 && ch > cb) { xc_flag.x = 1u; }
+            }
+            let need = workgroupUniformLoad(&xc_flag).x;
+            if (need != 0u) {
+"#;
+    // O += P·V for one dv quarter, V straight from the plane: P is visible
+    // since the uniform load above, and the barrier that ends the block
+    // keeps the next softmax from overwriting it under these reads.
+    const PV: &str = r#"
+            if (@Q@u * 64u < DV) {
+                let vr = vg + s0 * DV + @Q@u * 64u;
+                for (var ks = 0u; ks < 64u; ks = ks + 16u) {
+                    let a = coopLoadT<coop_mat16x16<f16, A>>(&xc_p[sg * 1024u + ks], 64u);
+                    let v0 = @VLOAD@<coop_mat16x16<f16, B>>(&ax_v16[vr + ks * DV], DV);
+                    let v1 = @VLOAD@<coop_mat16x16<f16, B>>(&ax_v16[vr + ks * DV + 16u], DV);
+                    let v2 = @VLOAD@<coop_mat16x16<f16, B>>(&ax_v16[vr + ks * DV + 32u], DV);
+                    let v3 = @VLOAD@<coop_mat16x16<f16, B>>(&ax_v16[vr + ks * DV + 48u], DV);
+                    o@Q@0 = coopMultiplyAdd(a, v0, o@Q@0);
+                    o@Q@1 = coopMultiplyAdd(a, v1, o@Q@1);
+                    o@Q@2 = coopMultiplyAdd(a, v2, o@Q@2);
+                    o@Q@3 = coopMultiplyAdd(a, v3, o@Q@3);
+                }
+            }
+"#;
+    let vload = match std::env::var("CMF_ATTEND_XC2_VLOAD").as_deref() {
+        Ok("coopLoad") => "coopLoad",
+        _ => "coopLoadT",
+    };
+    let mut s = String::with_capacity(16 << 10);
+    s.push_str(&HEAD.replace("@HD@", &hd.to_string()).replace("@DV@", &dv.to_string()));
+    for q in 0..4 {
+        s.push_str(&XC_RESCALE.replace("@Q@", &q.to_string()));
+    }
+    s.push_str(XC_MID);
+    for q in 0..4 {
+        s.push_str(&PV.replace("@Q@", &q.to_string()).replace("@VLOAD@", vload));
+    }
+    s.push_str(XC_TAIL_A);
+    for q in 0..4 {
+        for j in 0..4 {
+            s.push_str(&XC_OUT.replace("@Q@", &q.to_string()).replace("@J@", &j.to_string()));
+        }
+    }
+    s.push_str(XC_TAIL_B);
+    s
+}
+
+/// The f16 planes `gqa_attend_part_xc2` reads, made on the device from the
+/// batch graph's f32 buffers: the run's rotated queries regrouped by KV
+/// group (rows past the run are zero so a partial tile loads real memory),
+/// and a K or V mirror as it lies, rows outside the attended range zeroed.
+const ATTEND_PLANES_SRC: &str = r#"
+struct PlP { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, nx: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       pl_src : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> pl_dst : array<vec2<u32>>;
+@group(0) @binding(2) var<uniform>             pl     : PlP;
+
+fn pl_pack(v: vec4<f32>) -> vec2<u32> {
+    return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}
+
+// Q [k][nh][hd] f32 -> [g][kpad][hpk][hd] f16; tokens >= k read as zero.
+// a = k, b = kpad, c = nh, d = hpk, e = hd / 4.
+@compute @workgroup_size(256)
+fn q_f16_plane(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let i = (wid.x + wid.y * pl.nx) * 256u + lid;
+    if (i >= pl.b * pl.c * pl.e) { return; }
+    let d4 = i % pl.e;
+    let r = i / pl.e;
+    let j = r % pl.d;
+    let t = (r / pl.d) % pl.b;
+    let g = r / (pl.d * pl.b);
+    var v = vec4<f32>(0.0);
+    if (t < pl.a) { v = pl_src[(t * pl.c + g * pl.d + j) * pl.e + d4]; }
+    pl_dst[i] = pl_pack(v);
+}
+
+// A K or V mirror [g][cap][w] f32 -> the same layout in f16 for rows < nconv;
+// slot r holds position r, rows outside [b0, alast] are zero.
+// a = nkv, b = cap, c = w / 4, d = nconv, e = b0, f = alast.
+@compute @workgroup_size(256)
+fn kv_f16_plane(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let i = (wid.x + wid.y * pl.nx) * 256u + lid;
+    if (i >= pl.a * pl.d * pl.c) { return; }
+    let d4 = i % pl.c;
+    let r = (i / pl.c) % pl.d;
+    let g = i / (pl.c * pl.d);
+    var v = vec4<f32>(0.0);
+    if (r >= pl.e && r <= pl.f) { v = pl_src[(g * pl.b + r) * pl.c + d4]; }
+    pl_dst[(g * pl.b + r) * pl.c + d4] = pl_pack(v);
+}
+"#;
+
 const COOP_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -47609,11 +49325,33 @@ fn cm_byte(off: u32) -> u32 {
 // pad is the sentinel — the batched prefill's operands never reach the
 // host). wgpu builds the auto layout PER entry point from the bindings
 // it touches, so the first keeps its four-slot layout.
-fn coop_body(wid: vec3<u32>, tid: u32, sg: u32, asc_in: f32) {
+
+// Tile origin of this workgroup. The dispatch is (weight tiles, batch
+// tiles), x fastest, so in launch order consecutive workgroups walked the
+// weight tiles against ONE batch tile and the whole weight left VRAM once
+// per batch tile (8 times for a 512-row chunk). Here consecutive workgroups
+// take the same weight tile against a group of up to 8 batch tiles, whose
+// activations stay in L2, so a weight tile leaves VRAM once per group.
+fn mm_tile(wid: vec3<u32>, nwg: vec3<u32>) -> vec2<u32> {
+    let nt = nwg.x;
+    let mt = (pmm.nb + 63u) / 64u;
+    let g = min(mt, 8u);
+    let lin = wid.y * nt + wid.x;
+    let ng = (mt + g - 1u) / g;
+    let mg = min(lin / (nt * g), ng - 1u);
+    let rem = lin - mg * nt * g;
+    let gs = min(g, mt - mg * g);
+    let n_tile = rem / gs;
+    let m_tile = mg * g + rem % gs;
+    return vec2<u32>(m_tile * 64u, n_tile * 64u);
+}
+
+fn coop_body(wid: vec3<u32>, nwg: vec3<u32>, tid: u32, sg: u32, asc_in: f32) {
     let cols = pmm.cols4 * 4u;
     let gpr = cols >> 5u;
-    let m0 = wid.y * 64u;
-    let n0 = wid.x * 64u;
+    let mn = mm_tile(wid, nwg);
+    let m0 = mn.x;
+    let n0 = mn.y;
     // Four subgroups, and which one this is comes from the builtin rather
     // than from `tid / 32`: nothing promises the driver hands out lanes to
     // subgroups in that order, and a cooperative matrix belongs to a
@@ -47722,17 +49460,212 @@ fn coop_body(wid: vec3<u32>, tid: u32, sg: u32, asc_in: f32) {
 
 @compute @workgroup_size(128)
 fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
                 @builtin(local_invocation_index) tid: u32,
                 @builtin(subgroup_id) sg: u32) {
-    coop_body(wid, tid, sg, bitcast<f32>(pmm.pad));
+    coop_body(wid, nwg, tid, sg, bitcast<f32>(pmm.pad));
 }
 
 @compute @workgroup_size(128)
 fn q4tp_mm_coop_s(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
                   @builtin(local_invocation_index) tid: u32,
                   @builtin(subgroup_id) sg: u32) {
     let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
-    coop_body(wid, tid, sg, asc);
+    coop_body(wid, nwg, tid, sg, asc);
+}
+"#;
+
+/// The in-kernel-dequant cooperative GEMM, pipelined. `COOP_MM_SRC` stages
+/// a 64 x 32 slab of each side, barriers, runs the matrix units, barriers
+/// again, and its staging is the cost: four scalar activation loads and a
+/// byte-gathered nibble decode (scale recomputed for every 4 columns) per
+/// slot, ~200 instructions a thread a K step against 8 matrix ops a
+/// subgroup, with the units idle meanwhile (measured ~6.7 TFLOP/s on an
+/// RTX 2000 Ada, 512 rows, Spark-X2.6). Here the stages are double
+/// buffered with ONE barrier a K step, the next step's global reads are
+/// issued before this step's matrix ops so their latency hides under
+/// them, a thread owns one row x 16 columns of a slab (one scale per
+/// thread per step, the sixteen nibbles from two aligned words), and the
+/// activations arrive as vec4. Same operands to the bit as `COOP_MM_SRC`
+/// (f16(x * ainv), f16((q - 8) * scale)), same tile walk, same f32
+/// accumulate, so its results match `q4tp_mm_coop_s` exactly. Device
+/// scale only (the batched prefill is its caller); `cols % 32 == 0`.
+const COOP_MM_V2_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> qmm: array<u32>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+@group(0) @binding(4) var<storage, read> qmm_s: array<f32>;
+
+const KS: u32 = 32u;
+const AST: u32 = 64u * 32u;
+var<workgroup> v2_a: array<f16, 2u * 64u * 32u>;
+var<workgroup> v2_b: array<f16, 2u * 64u * 32u>;
+var<workgroup> v2_c: array<f32, 64u * 64u>;
+
+fn cm_byte(off: u32) -> u32 {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+fn mm_tile(wid: vec3<u32>, nwg: vec3<u32>) -> vec2<u32> {
+    let nt = nwg.x;
+    let mt = (pmm.nb + 63u) / 64u;
+    let g = min(mt, 8u);
+    let lin = wid.y * nt + wid.x;
+    let ng = (mt + g - 1u) / g;
+    let mg = min(lin / (nt * g), ng - 1u);
+    let rem = lin - mg * nt * g;
+    let gs = min(g, mt - mg * g);
+    let n_tile = rem / gs;
+    let m_tile = mg * g + rem % gs;
+    return vec2<u32>(m_tile * 64u, n_tile * 64u);
+}
+
+// One thread's share of a K step: 16 activations of its row (four vec4)
+// and the 16 nibbles of its weight row (two words) with their scale.
+struct Stage { a0: vec4<f32>, a1: vec4<f32>, a2: vec4<f32>, a3: vec4<f32>, w0: u32, w1: u32, sc: f32 };
+
+fn fetch(k0: u32, abase4: u32, alive: bool, cbase: u32, tbase: u32, pr: vec2<f32>, wlive: bool, h: u32) -> Stage {
+    var s: Stage;
+    s.a0 = vec4<f32>(0.0); s.a1 = vec4<f32>(0.0); s.a2 = vec4<f32>(0.0); s.a3 = vec4<f32>(0.0);
+    s.w0 = 0u; s.w1 = 0u; s.sc = 0.0;
+    if (alive) {
+        let i = abase4 + ((k0 + h * 16u) >> 2u);
+        s.a0 = xmm[i]; s.a1 = xmm[i + 1u]; s.a2 = xmm[i + 2u]; s.a3 = xmm[i + 3u];
+    }
+    if (wlive) {
+        let g = k0 >> 5u;
+        let bit = g * 5u;
+        let cb = cbase + (bit >> 3u);
+        let sh = bit & 7u;
+        var cv = cm_byte(cb);
+        if (sh > 3u) { cv = cv | (cm_byte(cb + 1u) << 8u); }
+        s.sc = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+        let wi = (tbase + g) * 4u + h * 2u;
+        s.w0 = qmm[wi]; s.w1 = qmm[wi + 1u];
+    }
+    return s;
+}
+
+fn put(s: Stage, d: u32, ainv: f32) {
+    v2_a[d] = f16(s.a0.x * ainv); v2_a[d + 1u] = f16(s.a0.y * ainv);
+    v2_a[d + 2u] = f16(s.a0.z * ainv); v2_a[d + 3u] = f16(s.a0.w * ainv);
+    v2_a[d + 4u] = f16(s.a1.x * ainv); v2_a[d + 5u] = f16(s.a1.y * ainv);
+    v2_a[d + 6u] = f16(s.a1.z * ainv); v2_a[d + 7u] = f16(s.a1.w * ainv);
+    v2_a[d + 8u] = f16(s.a2.x * ainv); v2_a[d + 9u] = f16(s.a2.y * ainv);
+    v2_a[d + 10u] = f16(s.a2.z * ainv); v2_a[d + 11u] = f16(s.a2.w * ainv);
+    v2_a[d + 12u] = f16(s.a3.x * ainv); v2_a[d + 13u] = f16(s.a3.y * ainv);
+    v2_a[d + 14u] = f16(s.a3.z * ainv); v2_a[d + 15u] = f16(s.a3.w * ainv);
+    let sc = s.sc;
+    v2_b[d] = f16((f32(s.w0 & 0xFu) - 8.0) * sc);
+    v2_b[d + 1u] = f16((f32((s.w0 >> 4u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 2u] = f16((f32((s.w0 >> 8u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 3u] = f16((f32((s.w0 >> 12u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 4u] = f16((f32((s.w0 >> 16u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 5u] = f16((f32((s.w0 >> 20u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 6u] = f16((f32((s.w0 >> 24u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 7u] = f16((f32(s.w0 >> 28u) - 8.0) * sc);
+    v2_b[d + 8u] = f16((f32(s.w1 & 0xFu) - 8.0) * sc);
+    v2_b[d + 9u] = f16((f32((s.w1 >> 4u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 10u] = f16((f32((s.w1 >> 8u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 11u] = f16((f32((s.w1 >> 12u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 12u] = f16((f32((s.w1 >> 16u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 13u] = f16((f32((s.w1 >> 20u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 14u] = f16((f32((s.w1 >> 24u) & 0xFu) - 8.0) * sc);
+    v2_b[d + 15u] = f16((f32(s.w1 >> 28u) - 8.0) * sc);
+}
+
+@compute @workgroup_size(128)
+fn q4tp_mm_coop_v2_s(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>,
+                     @builtin(local_invocation_index) tid: u32,
+                     @builtin(subgroup_id) sg: u32) {
+    let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc, asc > 0.0);
+    let aback = select(1.0, 1.0 / asc, asc > 0.0);
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let mn = mm_tile(wid, nwg);
+    let m0 = mn.x;
+    let n0 = mn.y;
+    let params_b = pmm.rows * gpr * 16u;
+    let codes_b = params_b + pmm.rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+
+    let r = tid >> 1u;
+    let h = tid & 1u;
+    let arow = m0 + r;
+    let alive = arow < pmm.nb;
+    let abase4 = (arow * cols) >> 2u;
+    let wrow = n0 + r;
+    let wlive = wrow < pmm.rows;
+    let wr = min(wrow, pmm.rows - 1u);
+    let pr = unpack2x16float(qmm[(params_b >> 2u) + wr]);
+    let cbase = codes_b + wr * cstride;
+    let tbase = wr * gpr;
+    let soff = r * KS + h * 16u;
+
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    put(fetch(0u, abase4, alive, cbase, tbase, pr, wlive, h), soff, ainv);
+    workgroupBarrier();
+
+    var k0 = 0u;
+    var buf = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        let kn = k0 + KS;
+        let more = kn < cols;
+        var nx: Stage;
+        if (more) { nx = fetch(kn, abase4, alive, cbase, tbase, pr, wlive, h); }
+        let ab = buf * AST;
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&v2_a[ab + sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 512u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1024u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1536u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&v2_a[ab + sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        if (more) { put(nx, (buf ^ 1u) * AST + soff, ainv); }
+        workgroupBarrier();
+        k0 = kn;
+        buf = buf ^ 1u;
+    }
+    coopStoreT(c0, &v2_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &v2_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &v2_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &v2_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = v2_c[m * 64u + n] * aback;
+        }
+    }
 }
 "#;
 
@@ -47789,7 +49722,12 @@ fn coop128_src() -> String {
     for (old, new) in [
         ("var<workgroup> cm_a: array<f16, 64 * 32>;", "var<workgroup> cm_a: array<f16, 128 * 32>;"),
         ("var<workgroup> cm_c: array<f32, 64 * 64>;", "var<workgroup> cm_c: array<f32, 128 * 64>;"),
-        ("let m0 = wid.y * 64u;", "let m0 = wid.y * 128u;"),
+        // The grouped tile walk (`mm_tile`) counts batch tiles of 128.
+        ("let mt = (pmm.nb + 63u) / 64u;", "let mt = (pmm.nb + 127u) / 128u;"),
+        (
+            "return vec2<u32>(m_tile * 64u, n_tile * 64u);",
+            "return vec2<u32>(m_tile * 128u, n_tile * 64u);",
+        ),
         // The activation panel read four floats a load (cols and every
         // tile column are multiples of 4, so the vec4 index is exact).
         (
@@ -47861,10 +49799,11 @@ fn coop128_src() -> String {
     src.push_str(
         "@compute @workgroup_size(256)
 fn q4tp_mm_coop128_s(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>,
                      @builtin(local_invocation_index) tid: u32,
                      @builtin(subgroup_id) sg: u32) {
     let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
-    coop_body(wid, tid, sg, asc);
+    coop_body(wid, nwg, tid, sg, asc);
 }
 ",
     );
@@ -50356,6 +52295,14 @@ fn encode_q4_tile_mm_full_offset(
             .as_ref()
             .map(|p| std::ptr::eq(p, pipeline))
             .unwrap_or(false)
+        || c.q4tp_mm_coop_f16_m128
+            .as_ref()
+            .map(|p| std::ptr::eq(p, pipeline))
+            .unwrap_or(false)
+        || c.q4tp_mm_coop_v2_s
+            .as_ref()
+            .map(|p| std::ptr::eq(p, pipeline))
+            .unwrap_or(false)
         || c.q82_mm_coop_s
             .as_ref()
             .map(|p| std::ptr::eq(p, pipeline))
@@ -50391,10 +52338,16 @@ fn encode_q4_tile_mm_full_offset(
         }
     };
     let src_bytes = (k as u64).saturating_mul(cols as u64).saturating_mul(4);
-    let src_entry = if xs_offset == 0 {
+    // The pipelined kernel reads the activations as `array<vec4<f32>>`;
+    // its binding is cut to the panel so the size is a multiple of 16.
+    let v2 = c
+        .q4tp_mm_coop_v2_s
+        .as_ref()
+        .is_some_and(|p| std::ptr::eq(p, pipeline));
+    let src_entry = if xs_offset == 0 && !v2 {
         bind_buf(1, xs)
     } else {
-        bind_buf_off(1, xs, xs_offset, src_bytes)
+        bind_buf_off(1, xs, xs_offset, src_bytes.min(xs.size().saturating_sub(xs_offset)))
     };
     let mut entries = vec![bind_buf(0, weight), src_entry, bind_buf(2, y), bind_buf(3, &p_buf)];
     // Only the f16 twin declares binding 4. Deciding that by comparing
@@ -50418,6 +52371,10 @@ fn encode_q4_tile_mm_full_offset(
         layout: &layout,
         entries: &entries,
     });
+    let m128 = c
+        .q4tp_mm_coop_f16_m128
+        .as_ref()
+        .is_some_and(|p| std::ptr::eq(p, pipeline));
     let mut pass = begin_pass(enc);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind, &[]);
@@ -58336,6 +60293,16 @@ fn main() {
         // f16 operands carry ~11 bits of mantissa; anything past 1e-2 is
         // a broken layout or a lost activation scale, not rounding.
         assert!(r < 1e-2, "coop GEMM drifted from the scalar arm: {r:.3e}");
+    }
+
+    /// The 128-row tile's source is a set of string patches on
+    /// `COOP_MM_SRC`: each must apply exactly once, or the device init
+    /// panics on every NVIDIA card. Checked without a device.
+    #[test]
+    fn coop128_source_patches_apply() {
+        let src = coop128_src();
+        assert!(src.contains("fn q4tp_mm_coop128_s("));
+        assert!(src.contains("let mt = (pmm.nb + 127u) / 128u;"));
     }
 
     /// The 128-row tile of the cooperative GEMM gives the 64-row kernel's
@@ -76514,6 +78481,207 @@ pub fn attend_x_for_test(
     ok
 }
 
+/// Compile `src` (a cooperative-matrix probe with bindings 0 = A f32 in,
+/// 1 = B f32 in, 2 = f32 out) and run ONE workgroup of its `entry`,
+/// reading `out.len()` floats back. False when the device is missing or
+/// the module/pipeline is rejected. For layout probes in tests only.
+pub fn coop_probe_for_test(src: &str, entry: &str, a: &[f32], b: &[f32], out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("coop-probe"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        eprintln!("coop probe module rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return false;
+    }
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("coop-probe"),
+        layout: None,
+        module: &m,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        eprintln!("coop probe pipeline rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return false;
+    }
+    let ab = storage_bytes(c, bytemuck::cast_slice(a));
+    let bb = storage_bytes(c, bytemuck::cast_slice(b));
+    let ob = rw_f32(c, out.len(), true);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("coop-probe"),
+        layout: &p.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &ab), bind_buf(1, &bb), bind_buf(2, &ob)],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("coop-probe") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&p);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("coop-probe-stage"),
+        size: (out.len() * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &ob, &stage, (out.len() * 4) as u64, out)
+}
+
+/// The micro-benchmark's operands: a q4tp weight of `rows` x `cols` with
+/// random codes and unit scales (the per-row (base, step) f16 pairs zero),
+/// and `k` activation rows in [-1, 1).
+fn bench_q4tp_operands(rows: usize, cols: usize, k: usize) -> Option<(Vec<u8>, Vec<f32>)> {
+    if cols % 32 != 0 || rows == 0 || k == 0 {
+        return None;
+    }
+    let need = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
+    let gpr = cols / 32;
+    let params_b = rows * gpr * 16;
+    let mut seed = 0x5eed_2026u64;
+    let mut w = vec![0u8; need];
+    for (i, b) in w.iter_mut().enumerate() {
+        if (params_b..params_b + rows * 4).contains(&i) {
+            continue;
+        }
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (seed >> 56) as u8;
+    }
+    let xs: Vec<f32> = (0..k * cols)
+        .map(|i| (((i * 7919) % 1009) as f32 / 1009.0 - 0.5) * 2.0)
+        .collect();
+    Some((w, xs))
+}
+
+/// Relative rms of one batched-prefill GEMM variant ("coop", "v2", "zi")
+/// against the scalar tile GEMM on the micro-benchmark's operands. None
+/// when the device or the variant is missing, or the shape does not fit it.
+pub fn q4tp_mm_rel_for_test(rows: usize, cols: usize, k: usize, variant: &str) -> Option<f64> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let (w, xs) = bench_q4tp_operands(rows, cols, k)?;
+    let q_buf = storage_bytes(c, &w);
+    let xs_buf = storage_bytes(c, bytemuck::cast_slice(&xs));
+    let y_ref = rw_f32(c, k * rows, true);
+    let y_var = rw_f32(c, k * rows, true);
+    let asc = rw_f32(c, 4, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mm-rel") });
+    encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &q_buf, &xs_buf, &y_ref, rows, cols, k);
+    match variant {
+        "zi" => {
+            if !encode_batch_zi_gemm(c, &mut enc, &q_buf, &xs_buf, &y_var, rows, cols, k) {
+                return None;
+            }
+        }
+        "coop" | "v2" => {
+            let pipeline = if variant == "v2" {
+                c.q4tp_mm_coop_v2_s.as_ref()?
+            } else {
+                c.q4tp_mm_coop_s.as_ref()?
+            };
+            if !encode_act_absmax(c, &mut enc, &xs_buf, k * cols, &asc) {
+                return None;
+            }
+            encode_q4_tile_mm_full(c, &mut enc, pipeline, &q_buf, &xs_buf, &y_var, rows, cols, k, 0.0, Some(&asc));
+        }
+        _ => return None,
+    }
+    let bytes = (k * rows * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mm-rel-stage"),
+        size: 2 * bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&y_ref, 0, &stage, 0, bytes);
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&y_var, 0, &stage, bytes, bytes);
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range().ok()?;
+    let all: &[f32] = bytemuck::cast_slice(&data);
+    let (a, b) = all.split_at(k * rows);
+    let (mut num, mut den) = (0f64, 0f64);
+    for (x, y) in b.iter().zip(a) {
+        num += ((x - y) as f64).powi(2);
+        den += (*y as f64).powi(2);
+    }
+    let r = (num / den.max(1e-30)).sqrt();
+    drop(data);
+    stage.unmap();
+    Some(r)
+}
+
+/// Time one batched-prefill GEMM in isolation: a q4tp weight of `rows` x
+/// `cols` (random codes, unit scales), `k` activation rows, `variant` one of
+/// "coop" (`q4tp_mm_coop_s`), "v2" (`q4tp_mm_coop_v2_s`), "zi" (the
+/// `zi_mm` route with its plane dequant, cast and store scale), "scalar"
+/// (the tile GEMM). Returns the mean milliseconds of `reps` submits after one
+/// warm-up (each submit waited to completion), or None when the device or
+/// the variant is missing. The activation scale runs on the device as in
+/// the batch graph.
+pub fn q4tp_mm_bench_for_test(rows: usize, cols: usize, k: usize, variant: &str, reps: usize) -> Option<f64> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let (w, xs) = bench_q4tp_operands(rows, cols, k)?;
+    let q_buf = storage_bytes(c, &w);
+    let xs_buf = storage_bytes(c, bytemuck::cast_slice(&xs));
+    let y_buf = rw_f32(c, k * rows, false);
+    let asc = rw_f32(c, 4, false);
+    let pipeline = match variant {
+        "coop" => c.q4tp_mm_coop_s.as_ref()?,
+        "v2" => c.q4tp_mm_coop_v2_s.as_ref()?,
+        "scalar" | "zi" => &c.q4tp_mm,
+        _ => return None,
+    };
+    let run = || {
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mm-bench") });
+        if variant == "zi" {
+            // The plane dequant, the activation cast and the store scale
+            // are part of what the batch graph pays for this route.
+            if !encode_batch_zi_gemm(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols, k) {
+                return false;
+            }
+        } else if variant == "scalar" {
+            encode_q4_tile_mm(c, &mut enc, pipeline, &q_buf, &xs_buf, &y_buf, rows, cols, k);
+        } else {
+            if !encode_act_absmax(c, &mut enc, &xs_buf, k * cols, &asc) {
+                return false;
+            }
+            encode_q4_tile_mm_full(c, &mut enc, pipeline, &q_buf, &xs_buf, &y_buf, rows, cols, k, 0.0, Some(&asc));
+        }
+        flush_pass(&enc);
+        submit(c, finish_enc(enc));
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        true
+    };
+    if !run() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..reps.max(1) {
+        run();
+    }
+    Some(t.elapsed().as_secs_f64() * 1e3 / reps.max(1) as f64)
+}
+
 /// The GQA-shared 64-position split attend (`gqa_attend_part_xg` +
 /// `gqa_attend_merge_x`), or — with `run > 0` — the batch graph's run
 /// kernels (`kv_append_xb`, `gqa_attend_part_xgb`, `gqa_attend_merge_xb`)
@@ -76533,6 +78701,7 @@ pub fn attend_xg_for_test(
     dv: usize,
     scale: f32,
     run: usize,
+    tile: u8,
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -76543,6 +78712,25 @@ pub fn attend_xg_for_test(
     let Some((pg, pg_l)) = gx.part_g.as_ref() else {
         return false;
     };
+    // `tile`: 0 = the per-token run kernel (`gqa_attend_part_xgb`), 1 = the
+    // scalar query tile (`gqa_attend_part_xt`), 2 = the matrix-unit tile
+    // (`gqa_attend_part_xc`), 3 = the plane-fed matrix-unit tile
+    // (`gqa_attend_part_xc2`: full attention, 256-wide heads); the tiles
+    // need `run > 0`.
+    let hpk = nh / nkv.max(1);
+    let tq = if run > 0 && tile > 0 && hd % 64 == 0 && 64 % hpk.max(1) == 0 {
+        64 / hpk
+    } else {
+        0
+    };
+    if run > 0
+        && tile > 0
+        && (tq == 0
+            || (tile >= 2 && (dv % 64 != 0 || dv > 256))
+            || (tile == 3 && (window.is_some() || hd != 256 || dv != 256)))
+    {
+        return false;
+    }
     let npos = k_rows.len() / (nkv * hd).max(1);
     let rows = run.max(1);
     if npos == 0
@@ -76556,7 +78744,8 @@ pub fn attend_xg_for_test(
     }
     let cap = match window {
         Some(w) => kv_ring_cap(w),
-        None => npos.next_power_of_two(),
+        // Whole 64-row blocks for the plane-fed tile.
+        None => npos.next_power_of_two().max(64),
     };
     let pre = npos - run;
     let kb = storage_bytes(c, bytemuck::cast_slice(k_rows));
@@ -76570,7 +78759,26 @@ pub fn attend_xg_for_test(
     let vc = rw_f32(c, nkv * cap * dv, true);
     let ob = rw_f32(c, rows * nh * dv, true);
     let n_of = |p: usize| window.map_or(p + 1, |w| (p + 1).min(w));
-    let nc = if run == 0 { cap.div_ceil(64) } else { n_of(npos - 1).div_ceil(64) };
+    let blocks_all = if run == 0 {
+        cap.div_ceil(64)
+    } else {
+        (n_of(npos - 1) + tq.saturating_sub(1)).div_ceil(64)
+    };
+    // The engine's knobs apply here too (`CMF_ATTEND_BPW`, `CMF_ATTEND_XC_LAZY`).
+    let bpw = if tile == 2 {
+        std::env::var("CMF_ATTEND_BPW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&b| b >= 1)
+            .unwrap_or_else(|| blocks_all.div_ceil(16).max(8))
+    } else {
+        1
+    };
+    let lazy = std::env::var("CMF_ATTEND_XC_LAZY")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map_or(8.0f32, |v| v.clamp(0.0, 10.0));
+    let nc = blocks_all.div_ceil(bpw);
     let xacc = rw_f32(c, rows * nh * nc * dv, false);
     let xml = rw_f32(c, rows * nh * nc * 2, false);
     let mut enc = c
@@ -76656,22 +78864,92 @@ pub fn attend_xg_for_test(
                     nc as u32,
                     run as u32,
                     0,
+                    tq as u32,
+                    bpw as u32,
+                    lazy.to_bits(),
+                    if tile == 3 {
+                        (run.div_ceil(tq) * tq) as u32
+                    } else {
+                        std::env::var("CMF_ATTEND_XC_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32)
+                    },
                 ],
             );
+            let mut planes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> = None;
+            let (part, part_l, merge, merge_l, x, blocks, z) = if tq > 0 {
+                let Some(xt) = xb.tile.as_ref() else {
+                    return false;
+                };
+                let (tp, tl) = if tile == 3 {
+                    let Some(c2) = xt.coop2.as_ref() else {
+                        return false;
+                    };
+                    // The planes as the batch graph makes them: Q regrouped
+                    // over whole tiles, K and V over the mirror up to the
+                    // last position (whole 64-row blocks).
+                    let kpad = run.div_ceil(tq) * tq;
+                    let nconv = npos.div_ceil(64) * 64;
+                    let q16 = rw_f32(c, nkv * kpad * hpk * hd / 2, false);
+                    let k16 = rw_f32(c, nkv * cap * hd / 2, false);
+                    let v16 = rw_f32(c, nkv * cap * dv / 2, false);
+                    let grid = |total: usize| {
+                        let groups = total.div_ceil(256);
+                        let nx = groups.min(32768);
+                        (nx, groups.div_ceil(nx))
+                    };
+                    let (nx, ny) = grid(kpad * nh * (hd / 4));
+                    let qu = storage_uniform(
+                        c,
+                        &[run as u32, kpad as u32, nh as u32, hpk as u32, (hd / 4) as u32, 0, nx as u32, 0],
+                    );
+                    let bg = bind_pairs(c, &c2.q_plane_l, &[(0, &qb), (1, &q16), (2, &qu)]);
+                    pass.set_pipeline(&c2.q_plane);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                    keep.push(qu);
+                    for (src, dst, w) in [(&kc, &k16, hd), (&vc, &v16, dv)] {
+                        let (nx, ny) = grid(nkv * nconv * (w / 4));
+                        let u = storage_uniform(
+                            c,
+                            &[nkv as u32, cap as u32, (w / 4) as u32, nconv as u32, 0, (npos - 1) as u32, nx as u32, 0],
+                        );
+                        let bg = bind_pairs(c, &c2.kv_plane_l, &[(0, src), (1, dst), (2, &u)]);
+                        pass.set_pipeline(&c2.kv_plane);
+                        pass.set_bind_group(0, &bg, &[]);
+                        pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                        keep.push(u);
+                    }
+                    planes = Some((q16, k16, v16));
+                    (&c2.part, &c2.part_l)
+                } else if tile == 2 {
+                    let Some((p, l)) = xt.coop.as_ref() else {
+                        return false;
+                    };
+                    (p, l)
+                } else {
+                    (&xt.part, &xt.part_l)
+                };
+                (tp, tl, &xt.merge, &xt.merge_l, nkv * run.div_ceil(tq), nc, 1)
+            } else {
+                (&xb.part, &xb.part_l, &xb.merge, &xb.merge_l, nkv, nc, run)
+            };
+            let (in0, in1, in2) = match &planes {
+                Some((q16, k16, v16)) => (q16, k16, v16),
+                None => (&qb, &kc, &vc),
+            };
             let bgp = bind_pairs(
                 c,
-                &xb.part_l,
-                &[(0, &qb), (1, &kc), (2, &vc), (6, &xacc), (7, &xml), (9, &au)],
+                part_l,
+                &[(0, in0), (1, in1), (2, in2), (6, &xacc), (7, &xml), (9, &au)],
             );
             let bgm = bind_pairs(
                 c,
-                &xb.merge_l,
+                merge_l,
                 &[(3, &ob), (5, &sb), (6, &xacc), (7, &xml), (9, &au)],
             );
-            pass.set_pipeline(&xb.part);
+            pass.set_pipeline(part);
             pass.set_bind_group(0, &bgp, &[]);
-            pass.dispatch_workgroups(nkv as u32, nc as u32, run as u32);
-            pass.set_pipeline(&xb.merge);
+            pass.dispatch_workgroups(x as u32, blocks as u32, z as u32);
+            pass.set_pipeline(merge);
             pass.set_bind_group(0, &bgm, &[]);
             pass.dispatch_workgroups(nh as u32, run as u32, 1);
             keep.push(ku);

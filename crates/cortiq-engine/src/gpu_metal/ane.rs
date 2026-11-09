@@ -493,10 +493,24 @@ pub(crate) fn ffn_function(hidden: usize, channels: usize, rows: usize, s: &FfnT
         m.f16(&format!("{p}s"), channels, rows, format!("mul(x = {total}, y = s{p}_t)"));
     }
     let (c, r) = (channels, rows);
-    m.f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5)));
-    m.f16("th", c, r, "tanh(x = gh)".into());
-    m.f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0)));
-    m.f16("silu", c, r, "mul(x = gh, y = tp)".into());
+    if ACT.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        // GELU, tanh form: 0.5·g·(1 + tanh(√(2/π)·(g + 0.044715·g³))). The activations are
+        // fp16 here, where it stays within the exact (erf) form's rounding.
+        m.f16("g2", c, r, "mul(x = gs, y = gs)".into());
+        m.f16("g3", c, r, "mul(x = g2, y = gs)".into());
+        m.f16("g3c", c, r, format!("mul(x = g3, y = {})", fp16(0.044715)));
+        m.f16("gin", c, r, "add(x = gs, y = g3c)".into());
+        m.f16("gk", c, r, format!("mul(x = gin, y = {})", fp16(0.797_884_6)));
+        m.f16("th", c, r, "tanh(x = gk)".into());
+        m.f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0)));
+        m.f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5)));
+        m.f16("silu", c, r, "mul(x = gh, y = tp)".into());
+    } else {
+        m.f16("gh", c, r, format!("mul(x = gs, y = {})", fp16(0.5)));
+        m.f16("th", c, r, "tanh(x = gh)".into());
+        m.f16("tp", c, r, format!("add(x = th, y = {})", fp16(1.0)));
+        m.f16("silu", c, r, "mul(x = gh, y = tp)".into());
+    }
     m.f16("h", c, r, "mul(x = silu, y = us)".into());
     m.f16("habs", c, r, "abs(x = h)".into());
     m.f16("peak", 1, r, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))".into());
@@ -1382,6 +1396,19 @@ static ANE: Mutex<Option<Arc<AneFfn>>> = Mutex::new(None);
 static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a prompt asks for the Neural Engine, which takes larger chunks.
+/// The FFN activation the Neural Engine's program computes: 0 SiLU, 1 GELU (Spark-X2.6).
+static ACT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The file's FFN activation, before its program is built.
+pub(crate) fn set_act(act: u8) {
+    ACT.store(act, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the Neural Engine's FFN program computes this activation.
+pub(crate) fn takes_act(act: u8) -> bool {
+    act == ACT.load(std::sync::atomic::Ordering::Relaxed) && act <= 1
+}
+
 pub(crate) fn wanted() -> bool {
     cfg!(target_arch = "aarch64")
         && std::env::var("CMF_ANE").as_deref() == Ok("1")
