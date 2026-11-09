@@ -2575,6 +2575,15 @@ pub fn graph_kv_pull_host(
     None
 }
 
+/// Whether a sequence's wgpu K/V mirrors may be f16 (`gpu_wgpu::kv16`):
+/// the first note after a reset decides.
+pub fn graph_kv16_note(_kv_id: u64, _allowed: bool) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::kv16::note(_kv_id, _allowed);
+    }
+}
+
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.
 pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "gpu")]

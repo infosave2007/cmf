@@ -44,6 +44,12 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_ATTEND_FD").as_deref() != Ok("0"))
 }
 
+/// Two cache rows a loop step (`CMF_ATTEND_FD_PAIR=1`; default one).
+fn pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_ATTEND_FD_PAIR").as_deref() == Ok("1"))
+}
+
 /// Positions from which the decode graph takes this kernel instead of the
 /// one-workgroup-per-head attend (`CMF_ATTEND_FD_MIN`, default 16: at 41
 /// positions it already decoded 196 tok/s against the old kernel's 163–188).
@@ -72,22 +78,27 @@ pub(crate) fn per_warp(n: usize, nkv: usize) -> usize {
     n.div_ceil(chunks * FD_WARPS).clamp(1, 32)
 }
 
-fn src(hpk: usize, hd: usize) -> String {
+fn src(hpk: usize, hd: usize, half: bool) -> String {
     let hd4 = hd / 4;
     let slots = hd4.div_ceil(32);
     let guard = hd4 % 32 != 0;
     // No `enable subgroups;`: naga takes the builtins through the device
     // capability and rejects the directive itself.
+    // An f16 mirror (`kv16`): K and V rows load as f16, every sum in f32.
+    let kvt = if half { "vec4<f16>" } else { "vec4<f32>" };
     let mut s = String::new();
-    s.push_str(
-        "struct ApP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, ck: u32, nc: u32, scale: f32 };\n\
+    if half {
+        s.push_str("enable f16;\n");
+    }
+    s.push_str(&format!(
+        "struct ApP {{ nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, ck: u32, nc: u32, scale: f32 }};\n\
          @group(0) @binding(0) var<storage, read>       ap_q  : array<vec4<f32>>;\n\
-         @group(0) @binding(1) var<storage, read>       ap_k  : array<vec4<f32>>;\n\
-         @group(0) @binding(2) var<storage, read>       ap_v  : array<vec4<f32>>;\n\
+         @group(0) @binding(1) var<storage, read>       ap_k  : array<{kvt}>;\n\
+         @group(0) @binding(2) var<storage, read>       ap_v  : array<{kvt}>;\n\
          @group(0) @binding(3) var<storage, read_write> ap_acc: array<f32>;\n\
          @group(0) @binding(4) var<storage, read_write> ap_ml : array<vec2<f32>>;\n\
-         @group(0) @binding(5) var<uniform>             ap_p  : ApP;\n",
-    );
+         @group(0) @binding(5) var<uniform>             ap_p  : ApP;\n"
+    ));
     s.push_str(&format!(
         "var<workgroup> fd_m: array<f32, {}>;\nvar<workgroup> fd_l: array<f32, {}>;\nvar<workgroup> fd_acc: array<f32, {}>;\n",
         FD_WARPS * hpk,
@@ -131,31 +142,64 @@ fn src(hpk: usize, hd: usize) -> String {
         }
         s.push_str(&format!("    var m{h} = -1.0e30;\n    var l{h} = 0.0;\n"));
     }
-    s.push_str("    for (var p = p0; p < pend; p = p + 1u) {\n        let row = kbase + p * hd4;\n");
-    for j in 0..slots {
-        if guard {
-            s.push_str(&format!(
-                "        var k{j} = vec4<f32>(0.0);\n        var v{j} = vec4<f32>(0.0);\n        if (ok{j}) {{ k{j} = ap_k[row + lane + {o}u]; v{j} = ap_v[row + lane + {o}u]; }}\n",
-                o = 32 * j
-            ));
-        } else {
-            s.push_str(&format!(
-                "        let k{j} = ap_k[row + lane + {o}u];\n        let v{j} = ap_v[row + lane + {o}u];\n",
-                o = 32 * j
-            ));
-        }
-    }
-    for h in 0..hpk {
-        let dots: Vec<String> = (0..slots).map(|j| format!("dot(q{h}_{j}, k{j})")).collect();
-        s.push_str(&format!(
-            "        let s{h} = subgroupAdd({}) * scale;\n        let n{h} = max(m{h}, s{h});\n        let f{h} = exp(m{h} - n{h});\n        let w{h} = exp(s{h} - n{h});\n        l{h} = l{h} * f{h} + w{h};\n        m{h} = n{h};\n",
-            dots.join(" + ")
-        ));
+    // `CMF_ATTEND_FD_PAIR=1`: rows two at a time, both rows' loads in
+    // flight before either score is reduced. Measured no change (Qwen3.5-4B
+    // on an RTX A5000 at 32 000 positions, 75.2 against 75.1 tok/s: the
+    // merge was the wall, see `gqa_attend_merge_w`), so one row a step stays
+    // the default.
+    let load = |sfx: &str, rowv: &str, s: &mut String| {
         for j in 0..slots {
-            s.push_str(&format!("        a{h}_{j} = a{h}_{j} * f{h} + v{j} * w{h};\n"));
+            if guard {
+                s.push_str(&format!(
+                    "        var k{sfx}{j} = vec4<f32>(0.0);\n        var v{sfx}{j} = vec4<f32>(0.0);\n        if (ok{j}) {{ k{sfx}{j} = vec4<f32>(ap_k[{rowv} + lane + {o}u]); v{sfx}{j} = vec4<f32>(ap_v[{rowv} + lane + {o}u]); }}\n",
+                    o = 32 * j
+                ));
+            } else {
+                s.push_str(&format!(
+                    "        let k{sfx}{j} = vec4<f32>(ap_k[{rowv} + lane + {o}u]);\n        let v{sfx}{j} = vec4<f32>(ap_v[{rowv} + lane + {o}u]);\n",
+                    o = 32 * j
+                ));
+            }
         }
+    };
+    let one = |s: &mut String| {
+        s.push_str("        let row = kbase + p * hd4;\n");
+        load("", "row", s);
+        for h in 0..hpk {
+            let dots: Vec<String> = (0..slots).map(|j| format!("dot(q{h}_{j}, k{j})")).collect();
+            s.push_str(&format!(
+                "        let s{h} = subgroupAdd({}) * scale;\n        let n{h} = max(m{h}, s{h});\n        let f{h} = exp(m{h} - n{h});\n        let w{h} = exp(s{h} - n{h});\n        l{h} = l{h} * f{h} + w{h};\n        m{h} = n{h};\n",
+                dots.join(" + ")
+            ));
+            for j in 0..slots {
+                s.push_str(&format!("        a{h}_{j} = a{h}_{j} * f{h} + v{j} * w{h};\n"));
+            }
+        }
+    };
+    if pair() {
+        s.push_str("    var p = p0;\n    loop {\n        if (p + 1u >= pend) { break; }\n        let ra = kbase + p * hd4;\n        let rb = ra + hd4;\n");
+        load("a", "ra", &mut s);
+        load("b", "rb", &mut s);
+        for h in 0..hpk {
+            let da: Vec<String> = (0..slots).map(|j| format!("dot(q{h}_{j}, ka{j})")).collect();
+            let db: Vec<String> = (0..slots).map(|j| format!("dot(q{h}_{j}, kb{j})")).collect();
+            s.push_str(&format!(
+                "        let sa{h} = subgroupAdd({}) * scale;\n        let sb{h} = subgroupAdd({}) * scale;\n        let n{h} = max(m{h}, max(sa{h}, sb{h}));\n        let f{h} = exp(m{h} - n{h});\n        let wa{h} = exp(sa{h} - n{h});\n        let wb{h} = exp(sb{h} - n{h});\n        l{h} = l{h} * f{h} + wa{h} + wb{h};\n        m{h} = n{h};\n",
+                da.join(" + "),
+                db.join(" + ")
+            ));
+            for j in 0..slots {
+                s.push_str(&format!("        a{h}_{j} = a{h}_{j} * f{h} + va{j} * wa{h} + vb{j} * wb{h};\n"));
+            }
+        }
+        s.push_str("        p = p + 2u;\n    }\n    if (p < pend) {\n");
+        one(&mut s);
+        s.push_str("    }\n");
+    } else {
+        s.push_str("    for (var p = p0; p < pend; p = p + 1u) {\n");
+        one(&mut s);
+        s.push_str("    }\n");
     }
-    s.push_str("    }\n");
     // The eight subgroups meet per head; the chunk's partial goes out.
     for h in 0..hpk {
         s.push_str(&format!(
@@ -195,11 +239,17 @@ fn src(hpk: usize, hd: usize) -> String {
     s
 }
 
-fn compile(c: &Ctx, hpk: usize, hd: usize) -> Option<FdPipe> {
+/// The source, for the device-free tests of other modules.
+#[cfg(test)]
+pub(crate) fn src_for_test(hpk: usize, hd: usize, half: bool) -> String {
+    src(hpk, hd, half)
+}
+
+fn compile(c: &Ctx, hpk: usize, hd: usize, half: bool) -> Option<FdPipe> {
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cmf-attend-fd"),
-        source: wgpu::ShaderSource::Wgsl(src(hpk, hd).into()),
+        source: wgpu::ShaderSource::Wgsl(src(hpk, hd, half).into()),
     });
     let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("gqa_attend_fd"),
@@ -220,12 +270,13 @@ fn compile(c: &Ctx, hpk: usize, hd: usize) -> Option<FdPipe> {
 /// The kernel for a layer of `hpk` query heads per KV head of width `hd`;
 /// None where it does not apply (no 32-lane subgroups, hd not 64/128/256,
 /// more than 8 heads a group, or `CMF_ATTEND_FD=0`).
-pub(crate) fn pipe(c: &Ctx, hpk: usize, hd: usize) -> Option<FdPipe> {
+/// `half`: the twin over an f16 mirror (`kv16`).
+pub(crate) fn pipe(c: &Ctx, hpk: usize, hd: usize, half: bool) -> Option<FdPipe> {
     if !enabled() || hpk == 0 || hpk > 8 || !matches!(hd, 64 | 128 | 256) || !sg32(c) {
         return None;
     }
     let mut map = c.attend_fd_pipes.lock().ok()?;
-    map.entry((hpk, hd)).or_insert_with(|| compile(c, hpk, hd)).clone()
+    map.entry((hpk, hd, half)).or_insert_with(|| compile(c, hpk, hd, half)).clone()
 }
 
 #[cfg(test)]
@@ -249,7 +300,7 @@ mod tests {
     fn sources_validate() {
         for hpk in 1..=8 {
             for hd in [64, 128, 256] {
-                let s = src(hpk, hd);
+                let s = src(hpk, hd, false);
                 let module = wgpu::naga::front::wgsl::parse_str(&s)
                     .unwrap_or_else(|e| panic!("hpk {hpk} hd {hd}: {e}"));
                 wgpu::naga::valid::Validator::new(
@@ -264,12 +315,13 @@ mod tests {
 
     #[test]
     fn source_names_every_head() {
-        let s = src(8, 128);
+        let s = src(8, 128, false);
         assert!(s.contains("let s7 = subgroupAdd(dot(q7_0, k0)) * scale;"));
+        assert!(src(4, 256, true).contains("ap_k  : array<vec4<f16>>"));
         assert!(!s.contains("ok0"));
-        let s = src(2, 64);
+        let s = src(2, 64, false);
         assert!(s.contains("if (ok0)"));
-        let s = src(4, 256);
+        let s = src(4, 256, false);
         assert!(s.contains("dot(q3_0, k0) + dot(q3_1, k1)"));
     }
 }

@@ -59,6 +59,7 @@ pub(crate) mod lfm_set;
 pub(crate) mod amd_mv;
 /// Flash-decoding split attend of the decode graph (subgroups, all lanes).
 pub(crate) mod attend_fd;
+pub(crate) mod kv16;
 /// A sealed (far-field) layer's decode attention in two dispatches.
 pub(crate) mod o1_fd;
 pub(crate) mod dense_mv;
@@ -18111,6 +18112,77 @@ fn gqa_attend_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
     }
 }
 
+// `gqa_attend_merge` with a lane per output dimension (`CMF_ATTEND_MERGE_W=0`
+// keeps the 32-lane kernel above). That kernel walks every chunk eight
+// dimensions at a time and re-derives each chunk's weight per dimension:
+// ~1000 dependent loads a lane at 125 chunks (32 000 positions), about
+// 0.17 ms a layer on an RTX A5000. Here the chunk frames are loaded once
+// into workgroup memory, the max is a tree (max is exact in any order),
+// one lane sums the denominator in chunk order, and lane d sums its column
+// in chunk order: the 32-lane kernel's arithmetic to the bit. Past MW_MAX
+// chunks it walks the frames from device memory as before.
+const MW_MAX: u32 = 2048u;
+var<workgroup> mw_w: array<f32, 2048>;
+var<workgroup> mw_y: array<f32, 2048>;
+var<workgroup> mw_r: array<f32, 256>;
+var<workgroup> mw_s: vec4<f32>;
+@compute @workgroup_size(256)
+fn gqa_attend_merge_w(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let h = wid.x;
+    let hd = ap_p.hd;
+    let nc = (ap_p.n + ap_p.ck - 1u) / ap_p.ck;
+    let live = h < ap_p.nh;
+    let hb = select(0u, h, live) * ap_p.nc;
+    var mx = -1e30;
+    for (var ci = t; ci < nc; ci = ci + 256u) { mx = max(mx, ap_ml[hb + ci].x); }
+    mw_r[t] = mx;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (t < st) { mw_r[t] = max(mw_r[t], mw_r[t + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let mg = mw_r[0];
+    let fits = nc <= MW_MAX;
+    if (fits) {
+        for (var ci = t; ci < nc; ci = ci + 256u) {
+            let ml = ap_ml[hb + ci];
+            mw_w[ci] = exp(ml.x - mg);
+            mw_y[ci] = ml.y;
+        }
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        var lg = 0.0;
+        for (var ci = 0u; ci < nc; ci = ci + 1u) {
+            if (fits) {
+                lg = lg + mw_y[ci] * mw_w[ci];
+            } else {
+                let ml = ap_ml[hb + ci];
+                lg = lg + ml.y * exp(ml.x - mg);
+            }
+        }
+        mw_s.y = select(0.0, 1.0 / lg, lg > 0.0);
+    }
+    workgroupBarrier();
+    let invl = mw_s.y;
+    if (!live) { return; }
+    for (var d = t; d < hd; d = d + 256u) {
+        var a = 0.0;
+        for (var ci = 0u; ci < nc; ci = ci + 1u) {
+            let idx = hb + ci;
+            if (fits) {
+                a = a + ap_acc[idx * hd + d] * mw_w[ci];
+            } else {
+                a = a + ap_acc[idx * hd + d] * exp(ap_ml[idx].x - mg);
+            }
+        }
+        ap_o[h * hd + d] = a * invl;
+    }
+}
+
 // GQA-SHARED split-K decode attend: ONE workgroup per (kv head, chunk of
 // AG_CK positions) serves EVERY query head of that group, so a K/V row
 // is read once for all of them instead of once per query head. Qwen3.8
@@ -20169,7 +20241,7 @@ pub struct Ctx {
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Flash-decoding split attend per (heads a KV group, head width) (`attend_fd`).
-    attend_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<attend_fd::FdPipe>>>,
+    attend_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize, bool), Option<attend_fd::FdPipe>>>,
     /// Two-dispatch sealed-layer attend per (heads a KV group, head width) (`o1_fd`).
     o1_fd_pipes: std::sync::Mutex<std::collections::HashMap<(usize, usize), Option<o1_fd::O1FdPipe>>>,
     dense_split_pipes: std::sync::OnceLock<Option<dense_split::SplitPipes>>,
@@ -20629,9 +20701,17 @@ struct KvMirror {
     /// seed may skip the rows a window can no longer see). The resident
     /// rows are `[resident_from(), synced)`.
     lo: usize,
+    /// f16 rows (`kv16`): uniform mirrors of a sequence that asked for
+    /// them. Kept for the mirror's life; readers pick their twin by it.
+    half: bool,
 }
 
 impl KvMirror {
+    /// Bytes of one element.
+    fn es(&self) -> usize {
+        if self.half { 2 } else { 4 }
+    }
+
     /// Oldest position whose row is still in the mirror.
     fn resident_from(&self) -> usize {
         match self.ring {
@@ -20660,12 +20740,21 @@ struct GdnCursor {
 /// 131k: eagerly allocating `[64 layers, K+V, 8 heads, 131k, 128]` asks for
 /// about 64 GiB of KV before one token is decoded. Power-of-two growth keeps
 /// short prompts small and makes the occasional resize logarithmic.
+///
+/// The limit is rounded up to whole 64-row blocks: the query-tiled prompt
+/// attend walks the mirror in 64-row blocks and takes a layer only when its
+/// stride is a multiple of 64. A limit of `prompt + tokens` (4 005 for a
+/// 4 000-token bench) capped the mirror at 4 005 rows past position 2 048,
+/// and the rest of the prompt fell back to the scalar attend (Qwen3.5-4B on
+/// an RTX A5000: 118 against 42 ms a 512-row chunk). The extra rows are
+/// never written.
 fn kv_capacity(limit: usize, need: usize) -> usize {
     let floor = std::env::var("CMF_GPU_KV_MIN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(512)
         .max(1);
+    let limit = limit.max(1).div_ceil(64).saturating_mul(64);
     need.max(1)
         .checked_next_power_of_two()
         .unwrap_or(limit)
@@ -20676,6 +20765,8 @@ fn kv_capacity(limit: usize, need: usize) -> usize {
 /// Return a mirror with at least `want_cap` positions. Growth copies the
 /// already-device-resident history head by head into the new stride, so batch
 /// prefill and speculative verification do not need a CPU round trip.
+/// `half`: the dtype of a NEW mirror (`kv16::wanted`); an existing one
+/// keeps its own, growth included.
 fn kv_mirror_ensure<'a>(
     c: &Ctx,
     mirrors: &'a mut HashMap<(u64, usize), KvMirror>,
@@ -20683,6 +20774,7 @@ fn kv_mirror_ensure<'a>(
     nkv: usize,
     hd: usize,
     want_cap: usize,
+    half: bool,
 ) -> &'a mut KvMirror {
     // A mirror of another geometry (a per-layer-geometry mirror under the
     // same key) is not this one: start over from the host rows.
@@ -20699,7 +20791,15 @@ fn kv_mirror_ensure<'a>(
         // next frame rather than silently appending to the old stride.
         crate::gpu::probe_note_cold();
         let old = mirrors.remove(&key);
-        let sz = (nkv * want_cap * hd * 4) as u64;
+        let half = old.as_ref().map_or(half, |m| m.half);
+        if half && old.is_none() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!("wgpu graph: f16 K/V mirrors (CMF_GPU_KV16=0 keeps f32)")
+            });
+        }
+        let es = if half { 2 } else { 4 };
+        let sz = (nkv * want_cap * hd * es) as u64;
         let mk = || {
             c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("kv-mirror"),
@@ -20720,18 +20820,19 @@ fn kv_mirror_ensure<'a>(
             dv: hd,
             ring: None,
             lo: 0,
+            half,
         };
         if let Some(old) = old.filter(|m| m.synced > 0) {
             let copy_pos = old.synced.min(want_cap);
-            let nbytes = (copy_pos * hd * 4) as u64;
+            let nbytes = (copy_pos * hd * es) as u64;
             let mut enc = c
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("kv-grow"),
                 });
             for h in 0..nkv {
-                let src = (h * old.cap * hd * 4) as u64;
-                let dst = (h * want_cap * hd * 4) as u64;
+                let src = (h * old.cap * hd * es) as u64;
+                let dst = (h * want_cap * hd * es) as u64;
                 enc.copy_buffer_to_buffer(&old.k, src, &fresh.k, dst, nbytes);
                 enc.copy_buffer_to_buffer(&old.v, src, &fresh.v, dst, nbytes);
             }
@@ -20762,7 +20863,7 @@ fn kv_mirror_ensure_x<'a>(
 ) -> &'a mut KvMirror {
     if mirrors
         .get(&key)
-        .is_some_and(|m| m.ring != window || m.dv != dv || m.hd != hd || m.nkv != nkv)
+        .is_some_and(|m| m.half || m.ring != window || m.dv != dv || m.hd != hd || m.nkv != nkv)
     {
         mirrors.remove(&key);
     }
@@ -20797,6 +20898,7 @@ fn kv_mirror_ensure_x<'a>(
             dv,
             ring: window,
             lo: 0,
+            half: false,
         };
         // Only a full-context mirror grows (a ring's size is fixed), so the
         // history copies row for row at the new stride.
@@ -22825,7 +22927,59 @@ fn init(dev: usize) -> Result<Ctx, String> {
     } else {
         attend_part_s.clone()
     };
-    let attend_merge = pipe_split("gqa_attend_merge");
+    // The merge's bind-group layout is explicit, so the 32-lane kernel and
+    // its lane-per-dimension twin (`gqa_attend_merge_w`, the default) both
+    // take every group made from `layout_attend_merge`.
+    let attend_merge_bgl = {
+        let rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("attend-merge"),
+            entries: &[
+                rw(3),
+                rw(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                rw(6),
+            ],
+        })
+    };
+    let attend_merge = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("attend-merge"),
+            bind_group_layouts: &[Some(&attend_merge_bgl)],
+            immediate_size: 0,
+        });
+        let wide = std::env::var("CMF_ATTEND_MERGE_W").as_deref() != Ok("0")
+            && device.limits().max_compute_invocations_per_workgroup >= 256
+            && device.limits().max_compute_workgroup_storage_size >= 2 * 2048 * 4 + 256 * 4 + 16;
+        let ep = if wide { "gqa_attend_merge_w" } else { "gqa_attend_merge" };
+        trace_pipeline(ep);
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: Some(&pl),
+            module: &split_module,
+            entry_point: Some(ep),
+            compilation_options: pco(),
+            cache: pcache.as_ref(),
+        })
+    };
     let attend_gpart = (big_attend && std::env::var("CMF_ATTEND_GQA").as_deref() != Ok("0"))
         .then(|| pipe_split("gqa_attend_gpart"));
     let layout_attend_gpart = attend_gpart.as_ref().map(|p| p.get_bind_group_layout(0));
@@ -23061,7 +23215,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let layout_attend_part = attend_part.get_bind_group_layout(0);
     let layout_attend_part_s = attend_part_s.get_bind_group_layout(0);
-    let layout_attend_merge = attend_merge.get_bind_group_layout(0);
+    let layout_attend_merge = attend_merge_bgl;
     let layout_gdn = gdn_step.get_bind_group_layout(0);
     let layout_gdn_conv = gdn_conv.get_bind_group_layout(0);
     let layout_f32 = f32_matvec.get_bind_group_layout(0);
@@ -25462,6 +25616,14 @@ fn batch_mm_v2_on() -> bool {
     *N.get_or_init(|| std::env::var("CMF_BATCH_MM").as_deref() == Ok("v2"))
 }
 
+/// The batch graph's gated uniform-geometry attention (Qwen3.5 / Qwen3.8)
+/// through the matrix-unit query tile; `CMF_ATTN_BT_XC=0` keeps the scalar
+/// token-axis split.
+fn attn_bt_xc_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_ATTN_BT_XC").as_deref() != Ok("0"))
+}
+
 /// The batched prefill's q4tp GEMMs through `zi_mm` (128x128x32 tiles,
 /// 2x2 subgroups, register prefetch): dequantize the weight to the f16
 /// plane, cast the chunk's activations to f16 with the device scale, run
@@ -27468,9 +27630,13 @@ pub fn attn_dropin_gpu(
     if ro != hidden || co != nh * hd {
         return false;
     }
-    // Device K/V mirror (persist across tokens).
+    // Device K/V mirror (persist across tokens). An f16 mirror (`kv16`)
+    // belongs to the graphs: these kernels read f32 rows.
     let mut kvm = c.attn_kv.lock().unwrap();
-    let entry = kv_mirror_ensure(c, &mut kvm, (kv_id, layer), nkv, hd, cap);
+    if kvm.get(&(kv_id, layer)).is_some_and(|m| m.half) {
+        return false;
+    }
+    let entry = kv_mirror_ensure(c, &mut kvm, (kv_id, layer), nkv, hd, cap, false);
     // Sync prefill history 0..pos from the CPU cache (once).
     if entry.synced < pos {
         for h in 0..nkv {
@@ -29087,6 +29253,14 @@ pub fn forward_token_graph(
     // Sync each Full layer's device K/V mirror from the CPU cache (once);
     // GDN layers carry a persistent (ring, S) recurrent state instead.
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
+    // Each layer's mirror dtype (`kv16`), and whether a NEW uniform mirror
+    // of this call is made f16: the sequence asked, and every layer shares
+    // the call's geometry.
+    let mut kvhalf = vec![false; layers.len()];
+    let kv16_new = kv16::wanted(c, kv_id)
+        && layers
+            .iter()
+            .all(|l| !matches!(l.attn, crate::gpu::GraphAttn::Full { geom: Some(_), .. }));
     let mut gdnbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
     // Mirror rows of each per-layer-geometry layer (a ring's fixed size,
     // or a full-context mirror's current capacity) — the stride its
@@ -29153,7 +29327,7 @@ pub fn forward_token_graph(
                         graph_refused("host KV tail starts past position 0");
                         return token_graph_outcome(o1_started || state_started, false);
                     }
-                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap, kv16_new);
                     if e.synced > position {
                         graph_refused("KV mirror is ahead of token-graph position");
                         // A resident mirror proves that device state already
@@ -29165,21 +29339,14 @@ pub fn forward_token_graph(
                         for hh in 0..nkv {
                             let take = position.min(cpu_k[hh].len() / hd);
                             if take > e.synced {
-                                let off = ((hh * cap + e.synced) * hd * 4) as u64;
-                                c.queue.write_buffer(
-                                    &e.k,
-                                    off,
-                                    bytemuck::cast_slice(&cpu_k[hh][e.synced * hd..take * hd]),
-                                );
-                                c.queue.write_buffer(
-                                    &e.v,
-                                    off,
-                                    bytemuck::cast_slice(&cpu_v[hh][e.synced * hd..take * hd]),
-                                );
+                                let off = (hh * cap + e.synced) * hd;
+                                kv16::write_rows(c, &e.k, off, &cpu_k[hh][e.synced * hd..take * hd], e.half);
+                                kv16::write_rows(c, &e.v, off, &cpu_v[hh][e.synced * hd..take * hd], e.half);
                             }
                         }
                         e.synced = position;
                     }
+                    kvhalf[li] = e.half;
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
@@ -31335,18 +31502,37 @@ pub fn forward_token_graph(
                         // from `attend_fd::min_positions` on: the one-workgroup-per-head
                         // attend below it slowed from 152 to 109 tok/s between 100 and
                         // 250 positions on CherryPit-1.2-2B (RTX 5090).
+                        // An f16 mirror (`kv16`): the append, the decode attend
+                        // and the flash-decoding split have f16 twins; no other
+                        // arm may read it.
+                        let half = kvhalf[li];
                         let fd = (nkv > 0 && nh % nkv == 0)
-                            .then(|| attend_fd::pipe(c, nh / nkv, hd))
+                            .then(|| attend_fd::pipe(c, nh / nkv, hd, half))
                             .flatten();
                         let split_min =
                             if fd.is_some() { attend_fd::min_positions() } else { ATTEND_SPLIT_MIN };
                         let short_ctx =
                             !(n_ctx > split_min && (hd <= 128 || c.big_attend || fd.is_some()));
+                        let h16 = if half {
+                            let Some(hp) = kv16::pipes(c).filter(|_| {
+                                c.attend_dec && hd <= 256 && (short_ctx || fd.is_some())
+                            }) else {
+                                graph_refused("f16 K/V mirror on an attend arm without an f16 kernel");
+                                return token_graph_outcome(o1_started || state_started, false);
+                            };
+                            Some(hp)
+                        } else {
+                            None
+                        };
                         if passfuse && short_ctx && !skip_attn && hg.is_none() {
                             attn_done = true;
                             let (mut ap, al) = attend_pipes(c, hd);
                             let dec_l;
-                            let bg_att = if c.attend_dec && hd <= 256 {
+                            let bg_att = if let Some(hp) = h16 {
+                                ap = &hp.attend_dec;
+                                dec_l = hp.attend_dec.get_bind_group_layout(0);
+                                bg(&dec_l, &[&qout, kbuf, vbuf, &attn, &at_u])
+                            } else if c.attend_dec && hd <= 256 {
                                 ap = &c.gqa_attend_dec;
                                 // Auto layouts are pipeline-exclusive — the twin's
                                 // binding SET matches, its layout object does not.
@@ -31374,8 +31560,13 @@ pub fn forward_token_graph(
                                     &c.layout_attn_rope,
                                     &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
                                 );
-                                let bg_kv =
-                                    bgc(19, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                                let bg_kv = match h16 {
+                                    Some(hp) => bg(
+                                        &hp.kv_append.get_bind_group_layout(0),
+                                        &[&kb, &vb, kbuf, vbuf, &kv_u],
+                                    ),
+                                    None => bgc(19, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]),
+                                };
                                 let mut pass = begin_pass(&mut enc);
                                 let fine = ts_full || li < 4;
                                 tsp!(pass, fine, 20); // pass start (after qkv projections)
@@ -31388,7 +31579,7 @@ pub fn forward_token_graph(
                                                       // dispatch or readback fails, the CPU cache
                                                       // cannot safely resume this sequence.
                                 state_started = true;
-                                pass.set_pipeline(&c.kv_append);
+                                pass.set_pipeline(h16.map_or(&c.kv_append, |hp| &hp.kv_append));
                                 pass.set_bind_group(0, &bg_kv, &[]);
                                 pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                                 tsp!(pass, fine, 22); // kv append
@@ -31423,6 +31614,7 @@ pub fn forward_token_graph(
                                 emat(&mut enc, wo, &wo_in, &ob, hidden, nh * hd);
                             }
                         } else if c.attend_rkv
+                            && !half
                             && c.attend_dec
                             && short_ctx
                             && !skip_attn
@@ -31458,8 +31650,13 @@ pub fn forward_token_graph(
                                     &c.layout_attn_rope,
                                     &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
                                 );
-                                let bg_kv =
-                                    bgc(20, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                                let bg_kv = match h16 {
+                                    Some(hp) => bg(
+                                        &hp.kv_append.get_bind_group_layout(0),
+                                        &[&kb, &vb, kbuf, vbuf, &kv_u],
+                                    ),
+                                    None => bgc(20, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]),
+                                };
                                 let mut pass = begin_pass(&mut enc);
                                 pass.set_pipeline(&c.attn_rope);
                                 pass.set_bind_group(0, &bg_rope, &[]);
@@ -31468,7 +31665,7 @@ pub fn forward_token_graph(
                                 // kv_append is the Full-attention admission
                                 // boundary for the terminal outcome contract.
                                 state_started = true;
-                                pass.set_pipeline(&c.kv_append);
+                                pass.set_pipeline(h16.map_or(&c.kv_append, |hp| &hp.kv_append));
                                 pass.set_bind_group(0, &bg_kv, &[]);
                                 pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                             }
@@ -31560,7 +31757,15 @@ pub fn forward_token_graph(
                                 // 32-lane kernel cost 62 us per layer at ~50
                                 // positions on an RTX 3090 (MiniCPM5-2B, 42
                                 // layers: 2.6 of 7.2 ms of GPU per token).
-                                if c.attend_dec && hd <= 256 {
+                                if let Some(hp) = h16 {
+                                    let dec_l = hp.attend_dec.get_bind_group_layout(0);
+                                    go(
+                                        &mut enc,
+                                        &hp.attend_dec,
+                                        &bg(&dec_l, &[&qout, kbuf, vbuf, &attn, &at_u]),
+                                        nh as u32,
+                                    );
+                                } else if c.attend_dec && hd <= 256 {
                                     let dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
                                     go(
                                         &mut enc,
@@ -35482,6 +35687,14 @@ pub fn forward_batch_graph_at(
     let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
     // KV mirror + GDN state (fresh; batch appends positions pos0..pos0+k).
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
+    // Each layer's mirror dtype (`kv16`), and whether a NEW uniform mirror
+    // of this call is made f16: the sequence asked, and every layer shares
+    // the call's geometry.
+    let mut kvhalf = vec![false; layers.len()];
+    let kv16_new = kv16::wanted(c, kv_id)
+        && layers
+            .iter()
+            .all(|l| !matches!(l.attn, crate::gpu::GraphAttn::Full { geom: Some(_), .. }));
     let mut gdnbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
     // Mirror rows of each per-layer-geometry layer (ring or current cap).
     let mut xcaps: HashMap<usize, usize> = HashMap::new();
@@ -35541,7 +35754,7 @@ pub fn forward_batch_graph_at(
                         bgraph_refused("host KV tail starts past position 0");
                         return batch_outcome(o1_started || state_started, false);
                     }
-                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap, kv16_new);
                     if e.synced > pos0 {
                         bgraph_refused("KV mirror is ahead of batch position");
                         return batch_outcome(true, false);
@@ -35558,20 +35771,13 @@ pub fn forward_batch_graph_at(
                             return batch_outcome(o1_started || state_started, false);
                         }
                         for hh in 0..nkv {
-                            let off = ((hh * cap + e.synced) * hd * 4) as u64;
-                            c.queue.write_buffer(
-                                &e.k,
-                                off,
-                                bytemuck::cast_slice(&cpu_k[hh][e.synced * hd..pos0 * hd]),
-                            );
-                            c.queue.write_buffer(
-                                &e.v,
-                                off,
-                                bytemuck::cast_slice(&cpu_v[hh][e.synced * hd..pos0 * hd]),
-                            );
+                            let off = (hh * cap + e.synced) * hd;
+                            kv16::write_rows(c, &e.k, off, &cpu_k[hh][e.synced * hd..pos0 * hd], e.half);
+                            kv16::write_rows(c, &e.v, off, &cpu_v[hh][e.synced * hd..pos0 * hd], e.half);
                         }
                         e.synced = pos0;
                     }
+                    kvhalf[li] = e.half;
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
@@ -36372,6 +36578,12 @@ pub fn forward_batch_graph_at(
                     );
                 }
                 bts!(enc, 6);
+                // An f16 mirror (`kv16`) has twins on the token-axis arm
+                // below only; a block preview never asks for one.
+                if kvhalf[li] && preview.is_some() {
+                    bgraph_refused("f16 K/V mirror under a block preview");
+                    return batch_outcome(o1_started || state_started, false);
+                }
                 let preview_bt = dense_batch::attn(c).filter(|_| {
                     preview.is_some()
                         && c.attend_gpart.is_some()
@@ -36447,7 +36659,7 @@ pub fn forward_batch_graph_at(
                     dense_batch::encode_attn_bt(
                         c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
                         &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
-                        positions[0], 0, t_dec, k, *sub, *nc, attn_scale, pos_end,
+                        positions[0], 0, t_dec, k, *sub, *nc, attn_scale, pos_end, true,
                     );
                     if *output_gate {
                         let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
@@ -37425,7 +37637,8 @@ pub fn forward_batch_graph_at(
                     // The O(1) seal's query trace (`o1_qcap_begin`): this
                     // layer's rotated rows, copied out as attention reads them.
                     let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
-                    let bt = dense_batch::attn(c).filter(|_| {
+                    let half = kvhalf[li];
+                    let bt = dense_batch::attn_for(c, half).filter(|_| {
                         c.attend_gpart.is_some()
                             && nh % nkv == 0
                             && nh / nkv <= 8
@@ -37457,6 +37670,11 @@ pub fn forward_batch_graph_at(
                     } else {
                         t_split
                     };
+                    if half && (bt.is_none() || t_from > 0) {
+                        // The per-position loop's kernels read f32 rows.
+                        bgraph_refused("f16 K/V mirror on the per-position attend loop");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
                     // ONE compute pass for every position: the loop's four
                     // dispatches per token each carried their own pass, and
                     // pass boundaries — not the math — were 4.3 of this
@@ -37655,11 +37873,187 @@ pub fn forward_batch_graph_at(
                                 nc,
                             )
                         });
+                        // The query-tiled attend on the matrix units
+                        // (`gqa_attend_part_xc`; fed from f16 planes as `_xc2`
+                        // for 256-wide heads) takes the whole run: the scalar
+                        // token-axis split held ~2 TFLOP/s, 80 % of a 32 000-token
+                        // Qwen3.5-4B prompt on an RTX A5000. Rope, the mirror
+                        // append and the output gate stay this arm's.
+                        // `CMF_ATTN_BT_XC=0` keeps the split.
+                        let hpk = nh / nkv;
+                        let tile = c
+                            .graph_x
+                            .as_ref()
+                            .and_then(|gx| gx.xb.as_ref())
+                            .and_then(|xb| xb.tile.as_ref())
+                            .and_then(|xt| xt.coop.as_ref().map(|cp| (xt, cp)))
+                            .filter(|(xt, _)| {
+                                t_from == 0
+                                    && spec.is_none()
+                                    && preview.is_none()
+                                    && hpk > 0
+                                    && 64 % hpk == 0
+                                    && k >= 64 / hpk
+                                    && hd % 64 == 0
+                                    && cap % 64 == 0
+                                    && pos_end <= cap
+                                    && positions.windows(2).all(|w| w[1] == w[0] + 1)
+                                    && attn_bt_xc_on()
+                                    // f16 rows feed only the plane-fed tile.
+                                    && (!half || (hd == 256 && xt.coop2.is_some() && positions[0] + k <= cap))
+                            });
                         dense_batch::encode_attn_bt(
                             c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
                             &knw, mrope_tab.as_ref().unwrap_or(&invf_b), kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
-                            positions[0], t_from, t_split, k, *sub, *nc, attn_scale, 0,
+                            positions[0], t_from, t_split, k, *sub, *nc, attn_scale, 0, tile.is_none(),
                         );
+                        if let Some((xt, (xc_part, xc_part_l))) = tile {
+                            // The Spark-X2.6 arm's tile run, at this layer's
+                            // uniform geometry (dv = hd, no window, no sink).
+                            let p0 = positions[0];
+                            let tq = 64 / hpk;
+                            let n_of = |t: usize| p0 + t + 1;
+                            let xc2 = xt.coop2.as_ref().filter(|_| hd == 256 && p0 + k <= cap);
+                            // An f16 mirror is the plane `_xc2` reads (the same
+                            // [g][cap][hd] rows): no copy.
+                            let blocks_all = (n_of(k - 1) + tq - 1).div_ceil(64);
+                            let bpw = std::env::var("CMF_ATTEND_BPW")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .filter(|&b| b >= 1)
+                                .unwrap_or_else(|| blocks_all.div_ceil(16).max(8));
+                            let nc_t = blocks_all.div_ceil(bpw);
+                            let per_tok = nh * nc_t * hd * 4;
+                            let sub_t = ((((128usize << 20) / per_tok.max(1)).max(1) / tq) * tq)
+                                .max(tq)
+                                .min(k);
+                            let (xacc, xml) = {
+                                let na = sub_t * nh * nc_t * hd;
+                                let nm = sub_t * nh * nc_t * 2;
+                                match &xb_part {
+                                    Some((a, m, ca, cm)) if *ca >= na && *cm >= nm => (a.clone(), m.clone()),
+                                    _ => {
+                                        let a = rwc(na);
+                                        let m = rwc(nm);
+                                        xb_part = Some((a.clone(), m.clone(), na, nm));
+                                        (a, m)
+                                    }
+                                }
+                            };
+                            let planes = xc2.map(|c2| {
+                                let kpad = k.div_ceil(tq) * tq;
+                                let nq16 = nkv * kpad * hpk * hd / 2;
+                                let nk16 = if half { 1 } else { nkv * cap * hd / 2 };
+                                let (q16, k16, v16) = match &xb_plane {
+                                    Some((q, kb, vb, cq, ck, cv)) if *cq >= nq16 && *ck >= nk16 && *cv >= nk16 => {
+                                        (q.clone(), kb.clone(), vb.clone())
+                                    }
+                                    _ => {
+                                        let q = rwc(nq16);
+                                        let kb = rwc(nk16);
+                                        let vb = rwc(nk16);
+                                        xb_plane = Some((q.clone(), kb.clone(), vb.clone(), nq16, nk16, nk16));
+                                        (q, kb, vb)
+                                    }
+                                };
+                                (c2, kpad, q16, k16, v16)
+                            });
+                            let lazy = std::env::var("CMF_ATTEND_XC_LAZY")
+                                .ok()
+                                .and_then(|v| v.parse::<f32>().ok())
+                                .map_or(8.0f32, |v| v.clamp(0.0, 10.0));
+                            let sink_b = rwc(nh);
+                            let mut pass = begin_pass(&mut enc);
+                            if let Some((c2, kpad, q16, k16, v16)) = &planes {
+                                let nconv = (p0 + k).div_ceil(64) * 64;
+                                let grid = |total: usize| {
+                                    let groups = total.div_ceil(256);
+                                    let nx = groups.min(32768);
+                                    (nx, groups.div_ceil(nx))
+                                };
+                                let (nx, ny) = grid(*kpad * nh * (hd / 4));
+                                let qu = unif(&[
+                                    k as u32,
+                                    *kpad as u32,
+                                    nh as u32,
+                                    hpk as u32,
+                                    (hd / 4) as u32,
+                                    0,
+                                    nx as u32,
+                                    0,
+                                ]);
+                                let bgq = bind_pairs(c, &c2.q_plane_l, &[(0, &*qall), (1, q16), (2, &qu)]);
+                                pass.set_pipeline(&c2.q_plane);
+                                pass.set_bind_group(0, &bgq, &[]);
+                                pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                                for (src, dst) in [(kbuf, k16), (vbuf, v16)].into_iter().filter(|_| !half) {
+                                    let (nx, ny) = grid(nkv * nconv * (hd / 4));
+                                    let u = unif(&[
+                                        nkv as u32,
+                                        cap as u32,
+                                        (hd / 4) as u32,
+                                        nconv as u32,
+                                        0,
+                                        (p0 + k - 1) as u32,
+                                        nx as u32,
+                                        0,
+                                    ]);
+                                    let bgp = bind_pairs(c, &c2.kv_plane_l, &[(0, src), (1, dst), (2, &u)]);
+                                    pass.set_pipeline(&c2.kv_plane);
+                                    pass.set_bind_group(0, &bgp, &[]);
+                                    pass.dispatch_workgroups(nx as u32, ny as u32, 1);
+                                }
+                            }
+                            let mut t0 = 0;
+                            while t0 < k {
+                                let kk = sub_t.min(k - t0);
+                                let ab_u = unif(&[
+                                    nh as u32,
+                                    hpk as u32,
+                                    hd as u32,
+                                    hd as u32,
+                                    cap as u32,
+                                    p0 as u32,
+                                    0,
+                                    attn_scale.to_bits(),
+                                    0,
+                                    nc_t as u32,
+                                    kk as u32,
+                                    t0 as u32,
+                                    tq as u32,
+                                    bpw as u32,
+                                    lazy.to_bits(),
+                                    planes.as_ref().map_or(0, |p| p.1 as u32),
+                                ]);
+                                let (part, part_l) = match &planes {
+                                    Some((c2, ..)) => (&c2.part, &c2.part_l),
+                                    None => (xc_part, xc_part_l),
+                                };
+                                let (in0, in1, in2) = match &planes {
+                                    Some((_, _, q16, _, _)) if half => (q16, kbuf, vbuf),
+                                    Some((_, _, q16, k16, v16)) => (q16, k16, v16),
+                                    None => (&*qall, kbuf, vbuf),
+                                };
+                                let bg_part = bind_pairs(
+                                    c,
+                                    part_l,
+                                    &[(0, in0), (1, in1), (2, in2), (6, &xacc), (7, &xml), (9, &ab_u)],
+                                );
+                                let bg_merge = bind_pairs(
+                                    c,
+                                    &xt.merge_l,
+                                    &[(3, &attn_bb), (5, &sink_b), (6, &xacc), (7, &xml), (9, &ab_u)],
+                                );
+                                let blocks = (n_of(t0 + kk - 1) + tq - 1).div_ceil(64).div_ceil(bpw);
+                                pass.set_pipeline(part);
+                                pass.set_bind_group(0, &bg_part, &[]);
+                                pass.dispatch_workgroups((nkv * kk.div_ceil(tq)) as u32, blocks as u32, 1);
+                                pass.set_pipeline(&xt.merge);
+                                pass.set_bind_group(0, &bg_merge, &[]);
+                                pass.dispatch_workgroups(nh as u32, kk as u32, 1);
+                                t0 += kk;
+                            }
+                        }
                         if let Some(cb) = &qcap {
                             let off = (t_from * nh * hd * 4) as u64;
                             flush_pass(&enc);
@@ -37923,6 +38317,30 @@ pub fn forward_batch_graph_at(
                         0,
                     ]);
                     let mut pass = begin_pass(&mut enc);
+                    // Position-parallel conv + norm (`dense_mv::GDN_PAR_WGSL`)
+                    // outside spec rounds; `CMF_GDN_PAR=0` keeps the loops.
+                    let gpar = dense_mv::gdn(c)
+                        .and_then(|g| g.par_k.as_ref())
+                        .filter(|_| snap.is_none() && *kk <= 9);
+                    if let Some(gp) = gpar {
+                        // conv reads the inputs, taps and ring and writes cq;
+                        // ring_next reads the inputs and ring (auto layouts
+                        // hold only what an entry point touches).
+                        let conv_l = gp.conv.get_bind_group_layout(0);
+                        let bgc = bind_pairs(
+                            c,
+                            &conv_l,
+                            &[(0, &qkv_b), (1, &taps), (2, ring), (3, &cq_s), (4, &gc_pt)],
+                        );
+                        pass.set_pipeline(&gp.conv);
+                        pass.set_bind_group(0, &bgc, &[]);
+                        pass.dispatch_workgroups((*cdim as u32).div_ceil(256), k as u32, 1);
+                        let ring_l = gp.ring.get_bind_group_layout(0);
+                        let bgr = bind_pairs(c, &ring_l, &[(0, &qkv_b), (2, ring), (4, &gc_pt)]);
+                        pass.set_pipeline(&gp.ring);
+                        pass.set_bind_group(0, &bgr, &[]);
+                        pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                    } else {
                     pass.set_pipeline(&c.gdn_conv_k);
                     pass.set_bind_group(
                         0,
@@ -37944,6 +38362,7 @@ pub fn forward_batch_graph_at(
                         &[],
                     );
                     pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                    }
                     // Keep the proven scalar k-loop available as an explicit
                     // correctness arm.  The vec4 parallel kernel is useful
                     // only after its state layout has been independently
@@ -38039,6 +38458,37 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups(*nv as u32, 1, 1);
                         // gdn_step_k includes the gated RMS normalization.
                         needs_norm_k = false;
+                    } else if let Some((scan, cols)) = dense_mv::gdn(c)
+                        .and_then(|g| g.scan.as_ref())
+                        .filter(|_| snap.is_none() && *dk == dense_mv::GDN_SCAN_DK)
+                    {
+                        // The state in registers for the whole chunk
+                        // (`gdn_scan_k`); the norm pass below as for the
+                        // parallel step. Spec rounds (snapshots) keep it.
+                        pass.set_pipeline(scan);
+                        pass.set_bind_group(
+                            0,
+                            &{
+                                let l = scan.get_bind_group_layout(0);
+                                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &l,
+                                    entries: &[
+                                        bind_buf(0, &cq_s),
+                                        bind_buf(2, &a_bb),
+                                        bind_buf(3, &b_bb),
+                                        bind_buf(4, &alog),
+                                        bind_buf(5, &dtb),
+                                        bind_buf(7, s),
+                                        bind_buf(8, &gdo_b),
+                                        bind_buf(9, &gd_pt),
+                                    ],
+                                })
+                            },
+                            &[],
+                        );
+                        pass.dispatch_workgroups(*nv as u32, (*dv).div_ceil(*cols) as u32, 1);
+                        needs_norm_k = true;
                     } else {
                         let park_pipe =
                             dense_mv::gdn(c).map_or(&c.gdn_step_par_k, |g| &g.park);
@@ -38072,7 +38522,22 @@ pub fn forward_batch_graph_at(
                         // separate k-wide pass below.
                         needs_norm_k = true;
                     }
-                    if needs_norm_k {
+                    if let Some(gp) = gpar.filter(|_| needs_norm_k && *dv <= 128) {
+                        let l = gp.norm.get_bind_group_layout(0);
+                        let bgn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &l,
+                            entries: &[
+                                bind_buf(5, &z_b),
+                                bind_buf(6, &gnorm),
+                                bind_buf(7, &gdo_b),
+                                bind_buf(8, &gd_pt),
+                            ],
+                        });
+                        pass.set_pipeline(&gp.norm);
+                        pass.set_bind_group(0, &bgn, &[]);
+                        pass.dispatch_workgroups(*nv as u32, k as u32, 1);
+                    } else if needs_norm_k {
                         pass.set_pipeline(&c.gdn_step_norm_k);
                         pass.set_bind_group(
                             0,
@@ -40733,6 +41198,7 @@ pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
         let _op = c.op_gate.enter();
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
+        kv16::forget(kv_id);
         c.gdn_state
             .lock()
             .unwrap()
@@ -40854,7 +41320,8 @@ pub fn kv_mirror_read_rows(
 ) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let row_bytes = (hd * 4) as u64;
+    let mut row_bytes = (hd * 4) as u64;
+    let mut half = None;
     let mut srcs = Vec::with_capacity(reqs.len());
     {
         let mirrors = c.attn_kv.lock().unwrap();
@@ -40869,6 +41336,11 @@ pub fn kv_mirror_read_rows(
             if to < from || m.synced < to || m.cap < to {
                 return None;
             }
+            // One dtype a call (every layer of a sequence shares it).
+            if *half.get_or_insert(m.half) != m.half {
+                return None;
+            }
+            row_bytes = (hd * m.es()) as u64;
             let need = (nkv * m.cap) as u64 * row_bytes;
             if m.k.size() < need || m.v.size() < need {
                 return None;
@@ -40914,10 +41386,12 @@ pub fn kv_mirror_read_rows(
     slice.map_async(wgpu::MapMode::Read, |_| {});
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
     let data = slice.get_mapped_range().ok()?;
-    let all: &[f32] = bytemuck::cast_slice(&data);
+    let half = half.unwrap_or(false);
+    let all = kv16::from_mirror_bytes(&data, half);
+    let es = if half { 2 } else { 4 };
     let mut out = Vec::with_capacity(srcs.len());
     for (&(_, _, _, _, n), &off) in srcs.iter().zip(&offs) {
-        let base = (off / 4) as usize;
+        let base = (off / es) as usize;
         // [K | V] × [head][pos][hd] → [pos][head][hd]
         let mut k = vec![0.0f32; n * nkv * hd];
         let mut v = vec![0.0f32; n * nkv * hd];
@@ -40955,7 +41429,7 @@ pub fn kv_mirror_pull_host(
 ) -> Option<(Vec<f32>, Vec<f32>, usize)> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let (kb, vb, cap, dv, first_valid) = {
+    let (kb, vb, cap, dv, first_valid, es) = {
         let mirrors = c.attn_kv.lock().unwrap();
         let m = mirrors.get(&(kv_id, layer))?;
         if to < from || m.synced < to || m.nkv != nkv || m.hd != hd {
@@ -40970,6 +41444,7 @@ pub fn kv_mirror_pull_host(
             m.cap,
             m.dv,
             m.resident_from().max(from).min(to),
+            m.es(),
         )
     };
     let n = to - from;
@@ -40981,7 +41456,7 @@ pub fn kv_mirror_pull_host(
     }
     // Staging: per head [K rows live×hd][V rows live×dv], each copied in
     // at most two runs (a ring wraps once over `live <= cap` rows).
-    let per_head = (live * (hd + dv) * 4) as u64;
+    let per_head = (live * (hd + dv) * es) as u64;
     let total = per_head * nkv as u64;
     let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("kv-mirror-pull-x"),
@@ -41004,17 +41479,17 @@ pub fn kv_mirror_pull_host(
             let r0 = (p - first_valid) as u64;
             enc.copy_buffer_to_buffer(
                 &kb,
-                ((h * cap + slot) * hd * 4) as u64,
+                ((h * cap + slot) * hd * es) as u64,
                 &stage,
-                hbase + r0 * (hd * 4) as u64,
-                (run * hd * 4) as u64,
+                hbase + r0 * (hd * es) as u64,
+                (run * hd * es) as u64,
             );
             enc.copy_buffer_to_buffer(
                 &vb,
-                ((h * cap + slot) * dv * 4) as u64,
+                ((h * cap + slot) * dv * es) as u64,
                 &stage,
-                hbase + (live * hd * 4) as u64 + r0 * (dv * 4) as u64,
-                (run * dv * 4) as u64,
+                hbase + (live * hd * es) as u64 + r0 * (dv * es) as u64,
+                (run * dv * es) as u64,
             );
             p += run;
         }
@@ -41024,7 +41499,7 @@ pub fn kv_mirror_pull_host(
     slice.map_async(wgpu::MapMode::Read, |_| {});
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
     let data = slice.get_mapped_range().ok()?;
-    let all: &[f32] = bytemuck::cast_slice(&data);
+    let all = kv16::from_mirror_bytes(&data, es == 2);
     for h in 0..nkv {
         let hb = h * live * (hd + dv);
         for r in 0..live {
@@ -54469,7 +54944,11 @@ mod tests {
         assert_eq!(kv_capacity(131_072, 512), 512);
         assert_eq!(kv_capacity(131_072, 513), 1024);
         assert_eq!(kv_capacity(131_072, 65_537), 131_072);
-        assert_eq!(kv_capacity(1000, 999), 1000);
+        // A limit off the 64-row grid rounds up to it.
+        assert_eq!(kv_capacity(4_005, 2_049), 4_032);
+        assert_eq!(kv_capacity(4_005, 100), 512);
+        assert_eq!(kv_capacity(100, 100), 128);
+        assert_eq!(kv_capacity(1000, 999), 1024);
     }
 
     #[test]

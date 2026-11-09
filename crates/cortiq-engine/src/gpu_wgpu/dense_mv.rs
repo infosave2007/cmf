@@ -1836,6 +1836,231 @@ pub(crate) struct GdnSg {
     pub(crate) par_l: wgpu::BindGroupLayout,
     pub(crate) park: wgpu::ComputePipeline,
     pub(crate) park_l: wgpu::BindGroupLayout,
+    /// The register-resident prompt scan (`gdn_scan_k`, 128-wide keys):
+    /// None under `CMF_GDN_SCAN=0` or on rejection.
+    pub(crate) scan: Option<(wgpu::ComputePipeline, usize)>,
+    /// Position-parallel twins of the chunk's conv and gated norm
+    /// (`gdn_conv_par` + `gdn_ring_next`, `gdn_norm_rows`): None under
+    /// `CMF_GDN_PAR=0` or on rejection.
+    pub(crate) par_k: Option<GdnPar>,
+}
+
+pub(crate) struct GdnPar {
+    pub(crate) conv: wgpu::ComputePipeline,
+    pub(crate) ring: wgpu::ComputePipeline,
+    pub(crate) norm: wgpu::ComputePipeline,
+}
+
+/// `gdn_conv_k` and `gdn_step_norm_k` walk the chunk's positions one after
+/// another — the conv per column with its ring in device memory, the norm
+/// per head with a 256-lane tree per position: about 0.2 ms each of a
+/// 128-row chunk per layer on an RTX A5000, where neither carries state
+/// between positions. Here every (position, column) of the conv is its own
+/// lane, reading the chunk's inputs or the ring for the positions before
+/// it, in the k-looped kernel's order of sums (bit-identical); the ring
+/// takes the chunk's last inputs in a second dispatch. The norm is one
+/// workgroup per (head, position), a subgroup sum per 32 columns.
+pub(crate) const GDN_PAR_WGSL: &str = r#"
+struct GcKP { cdim: u32, kk: u32, kb: u32, snap: u32, stride: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read>       gp_qkv : array<f32>;
+@group(0) @binding(1) var<storage, read>       gp_taps: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gp_ring: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gp_cq  : array<f32>;
+@group(0) @binding(4) var<uniform>             gp_p   : GcKP;
+// Input row p of the chunk (p >= kk-1) or the ring row before it, for
+// relative position p - (kk-1).
+fn gp_x(p: u32, c: u32) -> f32 {
+    let kk = gp_p.kk;
+    if (p + 1u >= kk) { return gp_qkv[(p + 1u - kk) * gp_p.cdim + c]; }
+    return gp_ring[p * gp_p.cdim + c];
+}
+@compute @workgroup_size(256)
+fn gdn_conv_par(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let c = wid.x * 256u + lid;
+    let i = wid.y;
+    let cdim = gp_p.cdim;
+    if (c >= cdim || i >= gp_p.kb) { return; }
+    let kk = gp_p.kk;
+    let tb = c * kk;
+    var acc = gp_qkv[i * cdim + c] * gp_taps[tb + kk - 1u];
+    for (var j = 0u; j + 1u < kk; j = j + 1u) {
+        acc = acc + gp_x(i + j, c) * gp_taps[tb + j];
+    }
+    gp_cq[i * cdim + c] = acc / (1.0 + exp(-acc));
+}
+@compute @workgroup_size(256)
+fn gdn_ring_next(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let c = wid.x * 256u + lid;
+    if (c >= gp_p.cdim || gp_p.kk < 2u) { return; }
+    let kk = gp_p.kk;
+    // The new ring row j holds relative position kb - (kk-1) + j, read
+    // whole before any is written (a short chunk keeps old ring rows).
+    var nr: array<f32, 8>;
+    for (var j = 0u; j + 1u < kk && j < 8u; j = j + 1u) { nr[j] = gp_x(gp_p.kb + j, c); }
+    for (var j = 0u; j + 1u < kk && j < 8u; j = j + 1u) { gp_ring[j * gp_p.cdim + c] = nr[j]; }
+}
+
+struct GnP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(5) var<storage, read>       gn_z : array<f32>;
+@group(0) @binding(6) var<storage, read>       gn_w : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gn_o : array<f32>;
+@group(0) @binding(8) var<uniform>             gn_p : GnP;
+var<workgroup> gn_part: array<f32, 4>;
+@compute @workgroup_size(128)
+fn gdn_norm_rows(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let h = wid.x;
+    let i = wid.y;
+    let dv = gn_p.dv;
+    let idx = (i * gn_p.nv + h) * dv + t;
+    var x = 0.0;
+    if (t < dv) { x = gn_o[idx]; }
+    let ss = subgroupAdd(x * x);
+    if ((t & 31u) == 0u) { gn_part[t >> 5u] = ss; }
+    workgroupBarrier();
+    let tot = (gn_part[0] + gn_part[1]) + (gn_part[2] + gn_part[3]);
+    let inv = 1.0 / sqrt(tot / f32(dv) + gn_p.eps);
+    if (t < dv) {
+        let zz = gn_z[idx];
+        gn_o[idx] = x * inv * gn_w[t] * (zz / (1.0 + exp(-zz)));
+    }
+}
+"#;
+
+/// Key width the prompt scan is generated for (Qwen3.5 / 3.6 / 3.8).
+pub(crate) const GDN_SCAN_DK: usize = 128;
+
+/// The batch graph's GDN recurrence over a chunk with the state in
+/// registers. `gdn_step_par_k_sg` keeps the state in device memory and
+/// takes four 128-lane reductions per position (16 barriers): 1.7 ms of a
+/// 128-row chunk per layer on an RTX A5000, a third of a Qwen3.5-4B prompt.
+/// Here lane `l` of a workgroup owns column `l / P` of a head's state, rows
+/// `(l % P) · R .. + R` (R = dk / P) as named registers; the q/k norms and
+/// both state dot products are partial sums over a lane's rows, finished by
+/// `log2 P` subgroup shuffles among the column's P adjacent lanes. No
+/// barrier, no state traffic inside the position loop. Same recurrence as
+/// the step kernels; the sums run in another order (not bit-identical).
+fn gdn_scan_src(parts: usize) -> String {
+    let rows = GDN_SCAN_DK / parts;
+    let cols = 128 / parts;
+    let dk = GDN_SCAN_DK;
+    let mut s = String::new();
+    s.push_str(
+        r#"struct GsP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gs_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gs_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gs_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gs_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gs_dtb  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gs_S    : array<f32>;
+@group(0) @binding(8) var<storage, read_write> gs_o    : array<f32>;
+@group(0) @binding(9) var<uniform>             gs_p    : GsP;
+fn gs_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+"#,
+    );
+    let red = |v: &str| {
+        let mut t = String::new();
+        let mut m = 1;
+        while m < parts {
+            t.push_str(&format!("        {v} = {v} + subgroupShuffleXor({v}, {m}u);\n"));
+            m *= 2;
+        }
+        t
+    };
+    // Four partial chains per dot product (ILP), summed at the end.
+    let dot = |name: &str, a: &str, b: &str| {
+        let mut t = String::new();
+        for c in 0..4 {
+            let terms: Vec<String> = (c..rows).step_by(4).map(|u| format!("{a}{u} * {b}{u}")).collect();
+            t.push_str(&format!("        let {name}_{c} = {};\n", terms.join(" + ")));
+        }
+        t.push_str(&format!("        var {name} = ({name}_0 + {name}_1) + ({name}_2 + {name}_3);\n"));
+        t
+    };
+    // Position `at`'s inputs into the `n*` registers: loaded during the
+    // position before, so the loop's critical path does not wait on memory.
+    let load = |at: &str, ind: &str| {
+        let mut t = String::new();
+        t.push_str(&format!("{ind}let cqn = ({at}) * gs_p.cdim;\n"));
+        t.push_str(&format!("{ind}let qsn = cqn + ko * {dk}u + r * {rows}u;\n{ind}let ksn = qsn + gs_p.kd;\n"));
+        for u in 0..rows {
+            t.push_str(&format!("{ind}nq{u} = gs_cq[qsn + {u}u];\n{ind}nk{u} = gs_cq[ksn + {u}u];\n"));
+        }
+        t.push_str(&format!(
+            "{ind}na = gs_a[({at}) * gs_p.nv + h];\n{ind}nb = gs_b[({at}) * gs_p.nv + h];\n{ind}nvv = gs_cq[cqn + 2u * gs_p.kd + h * dv + j];\n"
+        ));
+        t
+    };
+    s.push_str(&format!(
+        "@compute @workgroup_size(128)\nfn gdn_scan_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{\n    let r = lid % {parts}u;\n    let j0 = wid.y * {cols}u + lid / {parts}u;\n"
+    ));
+    s.push_str(
+        "    let dv = gs_p.dv;\n    let live = wid.x < gs_p.nv && j0 < dv;\n    let h = select(0u, wid.x, live);\n    let j = select(0u, j0, live);\n    let ko = h / gs_p.rep;\n",
+    );
+    s.push_str(&format!("    let sb = h * {dk}u * dv + r * {rows}u * dv + j;\n"));
+    for u in 0..rows {
+        s.push_str(&format!("    var s{u} = gs_S[sb + {u}u * dv];\n"));
+    }
+    s.push_str("    let al = exp(gs_alog[h]);\n    let dtb = gs_dtb[h];\n");
+    s.push_str(&format!("    let qsc = 1.0 / sqrt(f32({dk}));\n"));
+    for u in 0..rows {
+        s.push_str(&format!("    var nq{u} = 0.0;\n    var nk{u} = 0.0;\n"));
+    }
+    s.push_str("    var na = 0.0;\n    var nb = 0.0;\n    var nvv = 0.0;\n    if (gs_p.kb > 0u) {\n");
+    s.push_str(&load("0u", "        "));
+    s.push_str("    }\n    for (var i = 0u; i < gs_p.kb; i = i + 1u) {\n");
+    for u in 0..rows {
+        s.push_str(&format!("        let q{u} = nq{u};\n        let k{u} = nk{u};\n"));
+    }
+    s.push_str("        let pa = na;\n        let pb = nb;\n        let vt = nvv;\n        if (i + 1u < gs_p.kb) {\n");
+    s.push_str(&load("i + 1u", "            "));
+    s.push_str("        }\n");
+    s.push_str(&dot("qq", "q", "q"));
+    s.push_str(&red("qq"));
+    s.push_str(&dot("kk", "k", "k"));
+    s.push_str(&red("kk"));
+    s.push_str(
+        "        let invq = 1.0 / sqrt(qq + 1e-6) * qsc;\n        let invk = 1.0 / sqrt(kk + 1e-6);\n        let g = exp(-al * gs_softplus(pa + dtb));\n        let beta = 1.0 / (1.0 + exp(-pb));\n",
+    );
+    s.push_str(&dot("kv", "s", "k"));
+    s.push_str(&red("kv"));
+    s.push_str("        let dlt = (vt - g * (kv * invk)) * beta * invk;\n");
+    for u in 0..rows {
+        s.push_str(&format!("        s{u} = g * s{u} + k{u} * dlt;\n"));
+    }
+    s.push_str(&dot("o", "q", "s"));
+    s.push_str(&red("o"));
+    s.push_str("        if (live && r == 0u) { gs_o[i * gs_p.nv * dv + h * dv + j] = o * invq; }\n    }\n    if (live) {\n");
+    for u in 0..rows {
+        s.push_str(&format!("        gs_S[sb + {u}u * dv] = s{u};\n"));
+    }
+    s.push_str("    }\n}\n");
+    s
+}
+
+/// Lanes a state column spans in `gdn_scan_k` (`CMF_GDN_SCAN_P`: 2, 4 or 8,
+/// default 8; `CMF_GDN_SCAN=0` turns the scan off).
+fn gdn_scan_parts() -> usize {
+    match std::env::var("CMF_GDN_SCAN").as_deref() {
+        Ok("0") => 0,
+        // RTX A5000, Qwen3.5-4B, 512-row chunks: 31 ms of the chunk's GDN
+        // stage at 8 lanes a column, 34 at 4, 38 at 2.
+        _ => match std::env::var("CMF_GDN_SCAN_P").as_deref() {
+            Ok("4") => 4,
+            Ok("2") => 2,
+            _ => 8,
+        },
+    }
 }
 
 fn build_gdn(c: &Ctx) -> Option<GdnSg> {
@@ -1844,14 +2069,60 @@ fn build_gdn(c: &Ctx) -> Option<GdnSg> {
     }
     let par = compile(c, "cmf-gdn-sg", GDN_SG_WGSL, "gdn_step_par_sg")?;
     let park = compile(c, "cmf-gdnk-sg", GDNK_SG_WGSL, "gdn_step_par_k_sg")?;
+    let parts = gdn_scan_parts();
+    let scan = (parts > 0)
+        .then(|| compile(c, "cmf-gdn-scan", &gdn_scan_src(parts), "gdn_scan_k"))
+        .flatten()
+        .map(|p| (p, 128 / parts));
+    let par_k = (std::env::var("CMF_GDN_PAR").as_deref() != Ok("0"))
+        .then(|| {
+            Some(GdnPar {
+                conv: compile(c, "cmf-gdn-par", GDN_PAR_WGSL, "gdn_conv_par")?,
+                ring: compile(c, "cmf-gdn-par", GDN_PAR_WGSL, "gdn_ring_next")?,
+                norm: compile(c, "cmf-gdn-par", GDN_PAR_WGSL, "gdn_norm_rows")?,
+            })
+        })
+        .flatten();
     Some(GdnSg {
         par_l: par.get_bind_group_layout(0),
         par,
         park_l: park.get_bind_group_layout(0),
         park,
+        scan,
+        par_k,
     })
 }
 
 pub(crate) fn gdn(c: &Ctx) -> Option<&GdnSg> {
     c.gdn_sg_pipes.get_or_init(|| build_gdn(c)).as_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prompt scan parses and validates for every lane split it may be
+    /// generated with (naga, subgroups on), with no GPU.
+    #[test]
+    fn gdn_scan_sources_validate() {
+        for parts in [2, 4, 8] {
+            let s = gdn_scan_src(parts);
+            let module = wgpu::naga::front::wgsl::parse_str(&s)
+                .unwrap_or_else(|e| panic!("parts {parts}: {e}"));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("parts {parts}: {e:?}"));
+            assert!(s.contains(&format!("var s{} = gs_S", GDN_SCAN_DK / parts - 1)));
+        }
+        let module = wgpu::naga::front::wgsl::parse_str(GDN_PAR_WGSL).expect("gdn par parses");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("gdn par validates");
+    }
 }

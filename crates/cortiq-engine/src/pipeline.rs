@@ -5349,6 +5349,14 @@ impl Pipeline {
                 .layers
                 .iter()
                 .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)));
+            // The dense GDN hybrids (Qwen3.5 / 3.6 / 3.8) on the tiled
+            // attend: 512 rows a submit, each weight unpacked to its f16
+            // plane once a chunk. Qwen3.5-4B q4tp on an RTX A5000, prompt
+            // tok/s at 4 000 / 16 000 / 32 000 tokens: 1223 / 1122 / 977
+            // at 128 rows, 1669 / 1550 / - at 256, 1833 / 1897 / 1539 at 512.
+            if !moe && self.graph_gdn_layer_count() > 0 && crate::gpu::batched_attend_tiled() {
+                return 512;
+            }
             // q8_2f experts (moe_q82's grouped prefill) read each expert
             // once per group of up to 16 of its entries, so the chunk that
             // fills those groups is the faster ingest: Mellum2.1 q8_2f on an
@@ -16789,6 +16797,17 @@ impl Pipeline {
         (ids.len() == k).then_some(ids)
     }
 
+    /// The sequence may keep f16 K/V mirrors on the wgpu graphs (`kv16`):
+    /// nothing it runs reads f32 mirror rows — no MTP head, no drafter, no
+    /// O(1) seal, no block preview.
+    fn kv16_allowed(&self) -> bool {
+        self.mtp.is_none()
+            && self.dflash.is_none()
+            && !self.o1_active()
+            && !self.is_block_diffusion()
+            && self.clover.is_none()
+    }
+
     /// Multi-step greedy: k whole frames in ONE submit, argmax and re-embed
     /// on the device. `ids_out` receives the k winner ids; the hidden/logits
     /// outputs are NOT produced in that mode.
@@ -16803,6 +16822,7 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
     ) -> Option<Result<Vec<f32>, ()>> {
+        crate::gpu::graph_kv16_note(self.graph_kv_id, self.kv16_allowed());
         // SenseNova-Loop: MRoPE prompt rows rotate on the host; the graph's
         // mHC kernels take two streams only, and a graph must not enter an
         // mHC range midway (its streams would be the host's).
@@ -19202,6 +19222,7 @@ impl Pipeline {
         spec: Option<crate::gpu::SpecTail<'_>>,
         layers_run: Option<&mut usize>,
     ) -> crate::gpu::BatchGraphOutcome {
+        crate::gpu::graph_kv16_note(self.graph_kv_id, self.kv16_allowed());
         // SenseNova-Loop: the mHC kernels take two streams (the
         // CMF_MHC_GRAPH=0 knob keeps the host); MRoPE prompt rows ride the
         // per-row attention loop with their own angle tables.
