@@ -34422,16 +34422,18 @@ thread_local! {
     /// hidden rows back (`set_batch_defer`), and the submission it leaves in
     /// flight; the call after waits for it before returning.
     static BATCH_DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static BATCH_INFLIGHT: std::cell::RefCell<Option<wgpu::SubmissionIndex>> = const { std::cell::RefCell::new(None) };
+    static BATCH_INFLIGHT: std::cell::RefCell<std::collections::VecDeque<wgpu::SubmissionIndex>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// A prompt chunk whose rows nobody reads (every chunk but the last): the
 /// batch graph submits and returns, so the host encodes the next chunk
 /// while the card runs this one. A 512-row chunk spent 50-150 ms in host
 /// encode against ~140 ms on the card (Qwen3.5-4B, RTX A5000), one after
-/// the other. At most one deferred chunk stays in flight: the next call
-/// waits for it after its own submit. `CMF_BATCH_DEFER=0` reads every
-/// chunk back.
+/// the other. One deferred chunk stays in flight: a call waits for the one
+/// before it after its own submit (two or three measured the same, within
+/// noise, on an RTX A5000). `CMF_BATCH_DEFER=0` reads every chunk back;
+/// `CMF_BATCH_DEFER_DEPTH` sets the depth (1–4).
 pub fn set_batch_defer(on: bool) {
     let on = on && std::env::var("CMF_BATCH_DEFER").as_deref() != Ok("0");
     BATCH_DEFER.with(|f| f.set(on));
@@ -34453,10 +34455,19 @@ pub fn set_batch_kv_hint(rows: usize) {
 
 /// Wait for a deferred chunk still in flight (a host read of device state
 /// may follow).
+#[allow(dead_code)]
 fn batch_inflight_wait(c: &Ctx) {
-    if let Some(idx) = BATCH_INFLIGHT.with(|f| f.borrow_mut().take()) {
+    let all: Vec<_> = BATCH_INFLIGHT.with(|f| f.borrow_mut().drain(..).collect());
+    if let Some(idx) = all.into_iter().last() {
         let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None });
     }
+}
+
+fn batch_defer_depth() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_BATCH_DEFER_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).clamp(1, 4)
+    })
 }
 
 /// Opt this thread's batch graph prompt chunks into the q8_2f GEMM.
@@ -39465,16 +39476,25 @@ pub fn forward_batch_graph_at(
             flush_pass(&enc);
             note_submit(c);
             let idx = c.queue.submit(Some(finish_enc(enc)));
-            if let Some(prev) = BATCH_INFLIGHT.with(|f| f.borrow_mut().replace(idx)) {
-                c.device
+            let old = BATCH_INFLIGHT.with(|f| {
+                let mut q = f.borrow_mut();
+                q.push_back(idx);
+                let mut old = None;
+                while q.len() > batch_defer_depth() {
+                    old = q.pop_front();
+                }
+                old
+            });
+            match old {
+                Some(prev) => c
+                    .device
                     .poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None })
-                    .is_ok()
-            } else {
-                true
+                    .is_ok(),
+                None => true,
             }
         } else {
             let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden]);
-            BATCH_INFLIGHT.with(|f| f.borrow_mut().take());
+            BATCH_INFLIGHT.with(|f| f.borrow_mut().clear());
             ok
         }
     };
@@ -43106,11 +43126,23 @@ fn zi_q4_pipe(c: &Ctx) -> Option<(Arc<wgpu::ComputePipeline>, zimage::MmCfg)> {
         return None;
     }
     let base = zi_batch_pipes(c)?.3;
-    let cfg = zimage::MmCfg { q4: true, ..base };
+    // The f32 activation panel read straight too (`MmCfg::a32`): the
+    // `zi_act_f16` pass was 7 of a chunk's ~104 ms. `CMF_ZI_A32=0` keeps it.
+    let a32 = base.dscale && std::env::var("CMF_ZI_A32").as_deref() != Ok("0");
+    let cfg = zimage::MmCfg { q4: true, a32, ..base };
     if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;
     }
-    let key = format!("zi_mm_{}x{}x{}_{}x{}_f32{}_q4", cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, if cfg.dscale { "_ds" } else { "" });
+    let key = format!(
+        "zi_mm_{}x{}x{}_{}x{}_f32{}_q4{}",
+        cfg.bm,
+        cfg.bn,
+        cfg.bk,
+        cfg.wm,
+        cfg.wn,
+        if cfg.dscale { "_ds" } else { "" },
+        if cfg.a32 { "_a32" } else { "" }
+    );
     let mm = prefill_pipe(c, &key, &zimage::mm_src(cfg), "zi_mm")?;
     Some((mm, cfg))
 }
@@ -43271,8 +43303,9 @@ fn encode_batch_zi_gemm(
                 Some(pl) => bind_buf_off(0, pl, 0, plane_bytes),
                 None => bind_buf(0, weight),
             };
+            let a1 = if cfg.a32 { bind_buf(1, xs) } else { bind_buf(1, &act16) };
             if cfg.dscale {
-                vec![w0, bind_buf(1, &act16), bind_buf(2, y), bind_buf(3, &mm_u), bind_buf(4, &asc)]
+                vec![w0, a1, bind_buf(2, y), bind_buf(3, &mm_u), bind_buf(4, &asc)]
             } else {
                 vec![w0, bind_buf(1, &act16), bind_buf(2, y), bind_buf(3, &mm_u)]
             }
@@ -43284,7 +43317,7 @@ fn encode_batch_zi_gemm(
         layout: &post.get_bind_group_layout(0),
         entries: &[bind_buf(0, y), bind_buf(1, &ps_u), bind_buf(2, &asc)],
     });
-    if !reuse && !skip.contains("cast") {
+    if !reuse && !cfg.a32 && !skip.contains("cast") {
         let mut pass = begin_pass_with(enc, Some("zi-act"), None);
         pass.set_pipeline(&cvt);
         pass.set_bind_group(0, &bg_cv, &[]);

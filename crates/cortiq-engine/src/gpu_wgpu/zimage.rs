@@ -932,14 +932,22 @@ pub struct MmCfg {
     /// plane in device memory. Needs `bk == 32` (one group a slice) and
     /// `bn` = the thread count (a row a thread).
     pub q4: bool,
+    /// The activation operand is the f32 panel itself (binding 1 as
+    /// `vec4<f32>`), scaled by the device activation scale and rounded to
+    /// f16 as the staging tile is filled — `zi_act_f16`'s arithmetic, with
+    /// no f16 panel pass. Rows past `m` read as zero. Needs `dscale`.
+    pub a32: bool,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16, dscale: false, q4: false }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16, dscale: false, q4: false, a32: false }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
+        if self.a32 && (!self.dscale || self.direct || self.conv != 0 || self.stages != 1 || self.acc16 != 0 || self.acc16_probe) {
+            return false;
+        }
         if self.q4
             && (self.bk != 32
                 || self.bn != nt
@@ -1022,6 +1030,7 @@ impl MmCfg {
         ) + if self.frag == 16 { "" } else { "_f8" }
             + if self.dscale { "_ds" } else { "" }
             + if self.q4 { "_q4" } else { "" }
+            + if self.a32 { "_a32" } else { "" }
     }
     /// Workgroup-shared bytes this variant declares.
     pub fn shared_bytes(&self) -> u32 {
@@ -1104,7 +1113,11 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
         } else {
             let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<f16>>;");
         }
-        let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
+        if g.a32 {
+            let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f32>>;");
+        } else {
+            let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
+        }
     }
     match g.epi {
         _ if g.acc16_probe => {
@@ -1249,6 +1262,17 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
                     o = t * nt
                 );
             }
+        } else if g.a32 {
+            // f32 rows, scaled and rounded as `zi_act_f16` does it.
+            let _ = writeln!(s, "  let a_sc = dsc[0];");
+            let _ = writeln!(s, "  let ainv = select(1.0, a_sc, a_sc > 0.0);");
+            for t in 0..la {
+                let _ = writeln!(
+                    s,
+                    "  var ra{t} = vec4<f32>(0.0); {{ let lr = m0 + (tid + {o}u) / {vpr}u; if (lr < p.m) {{ ra{t} = act[(p.arow + lr) * kq + (tid + {o}u) % {vpr}u]; }} }}",
+                    o = t * nt
+                );
+            }
         } else {
             for t in 0..la {
                 let _ = writeln!(
@@ -1295,6 +1319,14 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
             let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
             for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", if g.bits != 0 || g.q4 { 0 } else { lb })] {
                 for t in 0..cnt {
+                    if g.a32 && arr == "sa" {
+                        let _ = writeln!(
+                            s,
+                            "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; sa[d] = f16(ra{t}.x * ainv); sa[d + 1u] = f16(ra{t}.y * ainv); sa[d + 2u] = f16(ra{t}.z * ainv); sa[d + 3u] = f16(ra{t}.w * ainv); }}",
+                            o = t * nt
+                        );
+                        continue;
+                    }
                     let _ = writeln!(
                         s,
                         "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
@@ -1338,7 +1370,13 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
             let _ = writeln!(s, "    workgroupBarrier();");
             let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
             for t in 0..la {
-                if g.conv != 0 {
+                if g.a32 {
+                    let _ = writeln!(
+                        s,
+                        "      {{ let lr = m0 + (tid + {o}u) / {vpr}u; var x = vec4<f32>(0.0); if (lr < p.m) {{ x = act[(p.arow + lr) * kq + kb + (tid + {o}u) % {vpr}u]; }} ra{t} = x; }}",
+                        o = t * nt
+                    );
+                } else if g.conv != 0 {
                     let _ = writeln!(s, "      ra{t} = ldc(y{t}, x{t}, kt + 1u, vc);");
                 } else {
                     let _ = writeln!(

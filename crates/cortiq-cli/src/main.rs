@@ -13035,6 +13035,17 @@ async fn cmd_bench(
     let _ = pipeline
         .generate_from_ids(warm_ids, 8, mask.as_ref(), None)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // A prompt the batched graph reads in chunks warms its own kernels too
+    // (the matrix-unit GEMMs, the flash attend, the GDN scan): their first
+    // dispatches cost a 512-row chunk ~250 against ~110 ms on an RTX A5000,
+    // and llama-bench runs a full warmup prompt as well. Untimed, as above.
+    let chunk = pipeline.generation_batch_k();
+    if chunk >= 128 && prompt_ids.len() > chunk && !pipeline.o1_active() && !pipeline.is_far_turbo() {
+        let warm_n = (chunk + chunk / 4).min(prompt_ids.len());
+        let _ = pipeline
+            .generate_from_ids(&prompt_ids[..warm_n], 2, mask.as_ref(), None)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
 
     // Prefill benchmark.  Bounded O(1) generation deliberately calibrates
     // only the requested prefix and streams the suffix through its sealed
