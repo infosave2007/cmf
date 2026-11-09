@@ -1,0 +1,126 @@
+{
+ "names": {
+  "fastcode": {
+   "en": "Fast Code (cortiq)",
+   "ru": "Fast Code (cortiq)",
+   "zh": "Fast Code（cortiq）"
+  },
+  "strata": {
+   "en": "Strata Coder (Strata)",
+   "ru": "Strata Coder (Strata)",
+   "zh": "Strata Coder（Strata）"
+  },
+  "strata_cmf": {
+   "en": "Strata Coder weights (cortiq)",
+   "ru": "веса Strata Coder (cortiq)",
+   "zh": "Strata Coder 权重（cortiq）"
+  },
+  "q4tp": {
+   "en": "full 512-expert file (cortiq)",
+   "ru": "полный файл (cortiq)",
+   "zh": "完整文件（cortiq）"
+  }
+ },
+ "speed_series": [
+  "fastcode",
+  "strata",
+  "q4tp"
+ ],
+ "speed": [
+  {
+   "label": "4K",
+   "decode": {
+    "fastcode": 161.4,
+    "strata": 219.8,
+    "q4tp": 117.7
+   },
+   "prefill": {
+    "fastcode": 826.8,
+    "strata": 5492.1,
+    "q4tp": 207.6
+   }
+  },
+  {
+   "label": "16K",
+   "decode": {
+    "fastcode": 166.2,
+    "strata": 223.0,
+    "q4tp": 137.8
+   },
+   "prefill": {
+    "fastcode": 843.8,
+    "strata": 7228.5,
+    "q4tp": 206.3
+   }
+  },
+  {
+   "label": "32K",
+   "decode": {
+    "fastcode": 135.7,
+    "strata": 221.7,
+    "q4tp": 116.1
+   },
+   "prefill": {
+    "fastcode": 842.2,
+    "strata": 7659.4,
+    "q4tp": 209.7
+   }
+  }
+ ],
+ "humaneval": [
+  [
+   "fastcode",
+   93.29
+  ],
+  [
+   "q4tp",
+   94.51
+  ],
+  [
+   "strata",
+   94.51
+  ]
+ ],
+ "ppl": [
+  [
+   "fastcode",
+   3.337
+  ],
+  [
+   "q4tp",
+   3.366
+  ],
+  [
+   "strata_cmf",
+   3.436
+  ]
+ ],
+ "file_gb": [
+  [
+   "fastcode",
+   66.76
+  ],
+  [
+   "q4tp",
+   98.62
+  ],
+  [
+   "strata",
+   63.6
+  ]
+ ],
+ "vram_gb": [
+  [
+   "fastcode",
+   40.9
+  ],
+  [
+   "q4tp",
+   59.6
+  ],
+  [
+   "strata",
+   31.1
+  ]
+ ]
+}

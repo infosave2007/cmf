@@ -8,7 +8,7 @@
 //! is kept. Runtime semantics equal the `CMF_MOE_MASK` runtime mask
 //! (softmax renormalizes over the kept set) — gate on the same ppl A/B.
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use cortiq_core::{CmfModel, TensorDtype, TensorSpecRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -258,19 +258,158 @@ pub fn cmd_moe_defrag(
     cover: f64,
     output: &str,
 ) -> anyhow::Result<()> {
+    cmd_moe_defrag_with(model_path, stats_path, &DefragOpts { cover, keep: None, merge: None }, output)
+}
+
+/// How `moe-defrag` picks the kept experts and what else it writes.
+pub struct DefragOpts<'a> {
+    /// Per-layer routing-mass fraction to keep (ignored with `keep`).
+    pub cover: f64,
+    /// Keep exactly this many experts in every MoE layer, the most routed
+    /// first: one bank geometry for all layers (the Qwen3.8-Flash-Next
+    /// device path sizes every layer's expert table alike).
+    pub keep: Option<usize>,
+    /// Another CMF whose tensors the output also carries (the names the
+    /// source lacks), e.g. the `.mtp.cmf` draft head: one file instead of two.
+    pub merge: Option<&'a str>,
+}
+
+/// Magic of the qwen4 device path's routing profile (`CMF_QWEN_PROFILE_SAVE`):
+/// `[magic 8][layers u64][experts u64][tokens u64][counts u32 × layers·experts]`.
+const QWEN_PROFILE_MAGIC: &[u8; 8] = b"CMFQ4PF\0";
+
+/// A qwen4 routing profile as `{layer: counts}` JSON text, `None` when the
+/// bytes are not one. The token count rides along for the provenance.
+fn qwen_profile_as_stats(bytes: &[u8]) -> Option<(String, u64)> {
+    if bytes.len() < 32 || &bytes[..8] != QWEN_PROFILE_MAGIC {
+        return None;
+    }
+    let rd = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    let (nl, ne, tokens) = (rd(8) as usize, rd(16) as usize, rd(24));
+    if bytes.len() < 32 + nl * ne * 4 {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for l in 0..nl {
+        let counts: Vec<u64> = (0..ne)
+            .map(|e| {
+                let o = 32 + (l * ne + e) * 4;
+                u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as u64
+            })
+            .collect();
+        map.insert(l.to_string(), serde_json::json!(counts));
+    }
+    Some((serde_json::Value::Object(map).to_string(), tokens))
+}
+
+/// The kept experts of one layer, ascending (renumbering keeps relative
+/// order): the top `keep` by count, or the smallest top set reaching `cover`
+/// of the layer's routing mass. Ties go to the lower index.
+/// The checkpoint expert behind every slot of a `moe-defrag` cut, `{layer: [source expert
+/// of each slot]}`; `None` for a file that was never cut. Read from the cut's provenance
+/// (`kept_ids`), or, for a cut written before it recorded them, recomputed from the routing
+/// stats that made the cut from an uncut source (`stats_path`, checked against its hash).
+pub(crate) fn kept_ids_of(model: &CmfModel, stats_path: Option<&str>) -> anyhow::Result<Option<HashMap<usize, Vec<usize>>>> {
+    let Some(prov) = model.header.provenance.as_ref().and_then(|p| p.get("moe_defrag")) else {
+        return Ok(None);
+    };
+    let stats = match stats_path {
+        Some(p) => Some((p, std::fs::read(p).with_context(|| format!("reading {p}"))?)),
+        None => None,
+    };
+    kept_ids_from(prov, stats.as_ref().map(|(p, b)| (*p, b.as_slice()))).map(Some)
+}
+
+/// [`kept_ids_of`] over a cut's `moe_defrag` provenance and the bytes of the stats that made it.
+fn kept_ids_from(prov: &serde_json::Value, stats: Option<(&str, &[u8])>) -> anyhow::Result<HashMap<usize, Vec<usize>>> {
+    if let Some(ids) = prov.get("kept_ids").and_then(|v| v.as_object()) {
+        let mut out = HashMap::new();
+        for (k, v) in ids {
+            let li: usize = k.parse().with_context(|| format!("kept_ids: layer {k}"))?;
+            out.insert(li, serde_json::from_value(v.clone()).with_context(|| format!("kept_ids of layer {k}"))?);
+        }
+        return Ok(out);
+    }
+    let Some((p, bytes)) = stats else {
+        bail!("the file is a moe-defrag cut that does not record its source experts: pass the routing stats that made the cut (--defrag-stats)");
+    };
+    let text = match qwen_profile_as_stats(bytes) {
+        Some((text, _)) => text,
+        None => String::from_utf8(bytes.to_vec()).with_context(|| format!("{p}: not UTF-8 JSON"))?,
+    };
+    let want = prov.get("stats_hash64").and_then(|v| v.as_str()).unwrap_or("");
+    let got = format!("{:016x}", cortiq_core::hash64(text.as_bytes()));
+    ensure!(got == want, "{p}: stats hash {got}, the cut was made from {want}");
+    let cover = prov.get("cover").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let keep = prov.get("keep").and_then(|v| v.as_u64()).map(|k| k as usize);
+    let stats: HashMap<String, Vec<u64>> = serde_json::from_str(&text).with_context(|| format!("parsing {p}"))?;
+    let mut out = HashMap::new();
+    for (k, counts) in &stats {
+        let Ok(li) = k.parse::<usize>() else { continue };
+        if counts.iter().sum::<u64>() > 0 {
+            out.insert(li, pick_kept(counts, cover, keep));
+        }
+    }
+    Ok(out)
+}
+
+fn pick_kept(counts: &[u64], cover: f64, keep: Option<usize>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..counts.len()).collect();
+    order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+    let mut kept = match keep {
+        Some(k) => order[..k.min(order.len())].to_vec(),
+        None => {
+            let total: u64 = counts.iter().sum();
+            let mut acc = 0u64;
+            let mut kept = Vec::new();
+            for &e in &order {
+                kept.push(e);
+                acc += counts[e];
+                if (acc as f64) >= cover * (total as f64) {
+                    break;
+                }
+            }
+            kept
+        }
+    };
+    kept.sort_unstable();
+    kept
+}
+
+pub fn cmd_moe_defrag_with(
+    model_path: &str,
+    stats_path: Option<&str>,
+    opts: &DefragOpts<'_>,
+    output: &str,
+) -> anyhow::Result<()> {
+    let cover = opts.cover;
     if !(cover > 0.0 && cover <= 1.0) {
         bail!("--cover must be in (0, 1]");
     }
+    if opts.keep == Some(0) {
+        bail!("--keep must be at least 1");
+    }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     crate::knowledge::refuse_genome_rewrite(&model, "moe-defrag")?;
-    // Stats: an explicit CMF_MOE_STATS dump, or — for re-defragging an
-    // already-cut specialist tighter — the routing counts embedded in
-    // the source file's provenance by a previous moe-defrag.
+    // Stats: an explicit CMF_MOE_STATS dump (or a qwen4 device routing
+    // profile), or — for re-defragging an already-cut specialist tighter —
+    // the routing counts embedded in the source file's provenance by a
+    // previous moe-defrag.
+    let mut profile_tokens: Option<u64> = None;
     let (stats_text, stats_origin): (String, String) = match stats_path {
-        Some(p) => (
-            std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
-            p.to_string(),
-        ),
+        Some(p) => {
+            let bytes = std::fs::read(p).with_context(|| format!("reading {p}"))?;
+            match qwen_profile_as_stats(&bytes) {
+                Some((text, tokens)) => {
+                    profile_tokens = Some(tokens);
+                    (text, format!("{p} (qwen4 routing profile, {tokens} tokens)"))
+                }
+                None => (
+                    String::from_utf8(bytes).with_context(|| format!("{p}: not UTF-8 JSON"))?,
+                    p.to_string(),
+                ),
+            }
+        }
         None => {
             let counts = model
                 .header
@@ -302,18 +441,7 @@ pub fn cmd_moe_defrag(
         if total == 0 {
             continue;
         }
-        let mut order: Vec<usize> = (0..counts.len()).collect();
-        order.sort_unstable_by_key(|&e| std::cmp::Reverse(counts[e]));
-        let mut acc = 0u64;
-        let mut kept = Vec::new();
-        for &e in &order {
-            kept.push(e);
-            acc += counts[e];
-            if (acc as f64) >= cover * (total as f64) {
-                break;
-            }
-        }
-        kept.sort_unstable();
+        let kept = pick_kept(counts, cover, opts.keep);
         remap.insert(
             li,
             kept.iter()
@@ -365,6 +493,12 @@ pub fn cmd_moe_defrag(
         routers.insert(ti, (data, shape));
     }
 
+    // `--merge`: the other file's tensors the source lacks ride along (the
+    // qwen4 MTP draft head reads them from the main file when present).
+    let merged = match opts.merge {
+        Some(p) => Some(Arc::new(CmfModel::open(p).with_context(|| format!("opening --merge {p}"))?)),
+        None => None,
+    };
     // Pass 2: the spec list — dropped experts skipped, kept ones
     // renumbered, routers swapped for their sliced rows.
     let mut specs: Vec<TensorSpecRef> = Vec::new();
@@ -407,6 +541,25 @@ pub fn cmd_moe_defrag(
     if dropped == 0 {
         bail!("nothing to drop — check the stats file / --cover");
     }
+    let mut merged_n = 0usize;
+    if let Some(m) = merged.as_ref() {
+        let have: std::collections::HashSet<&str> = model.tensors.iter().map(|e| e.name.as_str()).collect();
+        for entry in &m.tensors {
+            if have.contains(entry.name.as_str()) {
+                continue;
+            }
+            merged_n += 1;
+            specs.push(TensorSpecRef {
+                name: entry.name.clone(),
+                dtype: entry.dtype,
+                shape: entry.shape.to_vec(),
+                data: m.entry_bytes(entry),
+            });
+        }
+        if merged_n == 0 {
+            bail!("--merge {}: every tensor already exists in the source", opts.merge.unwrap_or(""));
+        }
+    }
 
     // Honest provenance contract (spec §11.1, mirroring §11's defrag
     // block): what was cut, from what evidence, at what cover.
@@ -427,9 +580,32 @@ pub fn cmd_moe_defrag(
         }
         routing_counts.insert(k.clone(), serde_json::json!(remapped));
     }
-    let prov = serde_json::json!({
+    // The checkpoint expert behind every kept slot, so a later bake from the original
+    // checkpoint (`hot-bake --experts`) reads each slot's own weights. A cut of a cut
+    // composes with its source's list; a source cut that records none passes none on.
+    let src_ids = kept_ids_of(&model, None).ok().flatten();
+    let src_cut = model.header.provenance.as_ref().and_then(|p| p.get("moe_defrag")).is_some();
+    let mut kept_ids = serde_json::Map::new();
+    if !src_cut || src_ids.is_some() {
+        for (&li, m) in &remap {
+            let mut ids = vec![0usize; m.len()];
+            for (&old, &new) in m {
+                ids[new] = match &src_ids {
+                    Some(s) => match s.get(&li).and_then(|v| v.get(old)) {
+                        Some(&id) => id,
+                        None => bail!("layer {li}: the source cut lists no expert {old}"),
+                    },
+                    None => old,
+                };
+            }
+            kept_ids.insert(li.to_string(), serde_json::json!(ids));
+        }
+    }
+    let mut prov = serde_json::json!({
         "tool": format!("cortiq moe-defrag {}", env!("CARGO_PKG_VERSION")),
         "cover": cover,
+        "keep": opts.keep,
+        "profile_tokens": profile_tokens,
         "stats_hash64": format!("{:016x}", cortiq_core::hash64(stats_text.as_bytes())),
         "num_experts_pre": header
             .arch
@@ -441,8 +617,11 @@ pub fn cmd_moe_defrag(
             .iter()
             .map(|&(_, k)| k)
             .collect::<Vec<_>>(),
-        "routing_counts": serde_json::Value::Object(routing_counts),
+        "routing_counts": serde_json::Value::Object(routing_counts.clone()),
     });
+    if !kept_ids.is_empty() {
+        prov["kept_ids"] = serde_json::Value::Object(kept_ids);
+    }
     match header.provenance.as_mut() {
         Some(serde_json::Value::Object(map)) => {
             map.insert("moe_defrag".into(), prov);
@@ -459,14 +638,48 @@ pub fn cmd_moe_defrag(
         Some(&model.masks),
         model.vocab.as_deref(),
     )?;
+    // A qwen4 routing profile in, a profile in the new numbering out
+    // (`<output stem>.profile`): it warms the cut model's expert arena
+    // (`CMF_QWEN_PROFILE`) exactly as the source profile warmed the source.
+    let mut profile_out = None;
+    if let (Some(tokens), Some(k)) = (profile_tokens, opts.keep) {
+        let nl = remap.keys().max().map_or(0, |&l| l + 1);
+        if remap.len() == nl && remap.values().all(|m| m.len() == k) {
+            let mut out = Vec::with_capacity(32 + nl * k * 4);
+            out.extend_from_slice(QWEN_PROFILE_MAGIC);
+            out.extend_from_slice(&(nl as u64).to_le_bytes());
+            out.extend_from_slice(&(k as u64).to_le_bytes());
+            out.extend_from_slice(&tokens.to_le_bytes());
+            for li in 0..nl {
+                let counts = &routing_counts[&li.to_string()];
+                for e in 0..k {
+                    let c = counts[e].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+                    out.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+            let stem = output.strip_suffix(".cmf").unwrap_or(output);
+            let path = format!("{stem}.profile");
+            std::fs::write(&path, out).with_context(|| format!("writing {path}"))?;
+            profile_out = Some(path);
+        }
+    }
     let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
     let out_sz = std::fs::metadata(output)?.len() as f64 / 1e9;
+    let how = match opts.keep {
+        Some(k) => format!("top {k} a layer"),
+        None => format!("cover {:.0}%", cover * 100.0),
+    };
     println!(
-        "moe-defrag: kept {kept_experts} expert tensors, dropped {dropped} ({} MoE layers, cover {:.0}%)\n{model_path} {in_sz:.1} GB -> {output} {out_sz:.1} GB ({:+.0}%)",
+        "moe-defrag: kept {kept_experts} expert tensors, dropped {dropped} ({} MoE layers, {how})\n{model_path} {in_sz:.1} GB -> {output} {out_sz:.1} GB ({:+.0}%)",
         remap.len(),
-        cover * 100.0,
         (out_sz / in_sz - 1.0) * 100.0
     );
+    if merged_n > 0 {
+        println!("moe-defrag: {merged_n} tensors merged from {}", opts.merge.unwrap_or(""));
+    }
+    if let Some(p) = profile_out {
+        println!("moe-defrag: routing profile in the new numbering -> {p}");
+    }
     Ok(())
 }
 
@@ -481,6 +694,52 @@ mod tests {
             shape: Vec::new(),
             data: &[],
         }
+    }
+
+    #[test]
+    fn keep_takes_the_most_routed_and_ties_go_low() {
+        let counts = [5u64, 9, 0, 9, 1, 7];
+        assert_eq!(pick_kept(&counts, 0.95, Some(3)), vec![1, 3, 5]);
+        assert_eq!(pick_kept(&counts, 0.95, Some(4)), vec![0, 1, 3, 5]);
+        // cover: the smallest top set reaching the routing mass (31 of 31 at 1.0)
+        assert_eq!(pick_kept(&counts, 0.5, None), vec![1, 3]);
+        assert_eq!(pick_kept(&counts, 1.0, None), vec![0, 1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn qwen_profile_reads_as_layer_counts() {
+        let (nl, ne) = (2usize, 3usize);
+        let mut b = QWEN_PROFILE_MAGIC.to_vec();
+        for v in [nl as u64, ne as u64, 77] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for c in [4u32, 0, 2, 1, 1, 9] {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+        let (text, tokens) = qwen_profile_as_stats(&b).unwrap();
+        assert_eq!(tokens, 77);
+        let v: HashMap<String, Vec<u64>> = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["0"], vec![4, 0, 2]);
+        assert_eq!(v["1"], vec![1, 1, 9]);
+        assert!(qwen_profile_as_stats(b"{\"0\": [1]}").is_none());
+    }
+
+    #[test]
+    fn a_cut_names_its_source_experts() {
+        let stats = br#"{"0": [5, 9, 0, 9, 1, 7], "1": [0, 0, 3, 1, 2, 8]}"#;
+        let hash = format!("{:016x}", cortiq_core::hash64(stats));
+        // A cut that predates kept_ids: recomputed from the stats that made it.
+        let prov = serde_json::json!({"cover": 0.95, "keep": 3, "stats_hash64": hash});
+        let ids = kept_ids_from(&prov, Some(("s.json", stats))).unwrap();
+        assert_eq!(ids[&0], vec![1, 3, 5]);
+        assert_eq!(ids[&1], vec![2, 4, 5]);
+        assert!(kept_ids_from(&prov, None).is_err());
+        assert!(kept_ids_from(&prov, Some(("t.json", br#"{"0": [1, 2, 3, 4, 5, 6]}"#))).is_err());
+        // A cut that records them: read as written.
+        let prov = serde_json::json!({"kept_ids": {"0": [4, 0, 7], "3": [1]}});
+        let ids = kept_ids_from(&prov, None).unwrap();
+        assert_eq!(ids[&0], vec![4, 0, 7]);
+        assert_eq!(ids[&3], vec![1]);
     }
 
     #[test]

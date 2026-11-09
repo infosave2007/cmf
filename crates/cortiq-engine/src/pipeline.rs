@@ -5216,7 +5216,12 @@ impl Pipeline {
         let h = &self.kv_history;
         let lcp = h.iter().zip(input_ids).take_while(|(a, b)| a == b).count();
         let n = lcp.min(input_ids.len().saturating_sub(1));
-        if n == 0 || self.kv_cache.layers.len() < self.num_layers {
+        // Stacks that keep their own layers (qwen4, DSV4) leave the generic
+        // ones empty: nothing here can roll back, the prompt is read again.
+        if n == 0
+            || self.kv_cache.layers.len() < self.num_layers
+            || self.weights.layers.len() < self.num_layers
+        {
             return 0;
         }
         let kv_id = self.graph_kv_id;
@@ -9122,12 +9127,14 @@ impl Pipeline {
     /// Snapshot restore is all-or-nothing across that set; deriving the count
     /// from the model keeps the restore contract valid for looped models too.
     fn graph_gdn_layer_count(&self) -> usize {
+        // stacks that keep their own layers (qwen4, DSV4) leave the generic
+        // ones empty: no generic GDN layer, nothing to index
         (0..self.num_layers)
             .filter(|&li| {
-                matches!(
-                    &self.weights.layers[self.phys_layer(li)].attn,
-                    AttnKind::LinearGdn(_)
-                )
+                self.weights
+                    .layers
+                    .get(self.phys_layer(li))
+                    .is_some_and(|l| matches!(&l.attn, AttnKind::LinearGdn(_)))
             })
             .count()
     }

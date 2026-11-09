@@ -184,6 +184,18 @@ pub struct State {
     #[cfg(feature = "gpu")]
     mtp: Option<MtpHead>,
     mtp_tried: bool,
+    /// Every routed expert of every layer holds an arena slot (a model cut
+    /// to fit the card, `moe-defrag --keep`): no winner can be cold, so a
+    /// whole token, prompt chunks included, goes out as one chained
+    /// submission instead of one fenced frame per layer.
+    #[cfg(feature = "gpu")]
+    resident_all: bool,
+    /// A prompt chunk still running on the card (resident mode): its
+    /// readback is collected when the next chunk has been submitted, so the
+    /// card works while the host encodes. Drained before anything reads
+    /// device results.
+    #[cfg(feature = "gpu")]
+    inflight: Option<crate::gpu_wgpu::qwen4::Pending>,
 }
 
 /// Summed wall time and count of expert uploads (every thread), for the
@@ -447,10 +459,18 @@ impl State {
             #[cfg(feature = "gpu")]
             mtp: None,
             mtp_tried: false,
+            #[cfg(feature = "gpu")]
+            resident_all: false,
+            #[cfg(feature = "gpu")]
+            inflight: None,
         }
     }
 
     pub(crate) fn reset(&mut self) {
+        #[cfg(feature = "gpu")]
+        if let Some(p) = self.inflight.take() {
+            let _ = p.wait();
+        }
         self.hyper.clear();
         self.token_history.clear();
         self.pos = 0;
@@ -1970,7 +1990,7 @@ pub fn load(
         && std::env::var("CMF_QWEN_MTP_DEVICE_DRAFT").as_deref() == Ok("1")
     {
         let side = cortiq_core::mtp_sidecar_path(&model.path);
-        if side != model.path && side.exists() {
+        if mtp_embedded(model) || (side != model.path && side.exists()) {
             skeleton_idxs.extend(embed_idx);
         }
     }
@@ -3242,11 +3262,13 @@ impl DevProf {
 /// Tokens one device frame carries; the prompt is fed in chunks of this many.
 #[cfg(feature = "gpu")]
 pub fn prefill_chunk() -> usize {
+    // `forward_tokens` cuts a chunk into eight-token frames unless every expert
+    // is resident (then frames take up to TROWS tokens)
     std::env::var("CMF_QWEN_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(crate::gpu_wgpu::qwen4::TMAX)
-        .clamp(1, crate::gpu_wgpu::qwen4::TMAX)
+        .unwrap_or(crate::gpu_wgpu::qwen4::TROWS)
+        .clamp(1, crate::gpu_wgpu::qwen4::TROWS)
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -3258,6 +3280,19 @@ pub fn prefill_chunk() -> usize {
 /// when `want_logits`. The device path runs them in one frame per layer;
 /// otherwise each token takes the host path.
 #[allow(clippy::too_many_arguments)]
+/// Debug (`CMF_QWEN_TOPLOG=1`): the five largest logits of the last row
+/// after a chunked prompt, for comparing prompt-frame kernels.
+fn top_log(logits: &[f32], vocab: usize) {
+    if vocab == 0 || logits.len() < vocab {
+        return;
+    }
+    let row = &logits[logits.len() - vocab..];
+    let mut ix: Vec<usize> = (0..vocab).collect();
+    ix.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+    let top: Vec<String> = ix[..5].iter().map(|&i| format!("{i}:{:.4}", row[i])).collect();
+    eprintln!("[toplog] {}", top.join(" "));
+}
+
 pub fn forward_tokens(
     globals: &Globals,
     layers: &[Layer],
@@ -3270,9 +3305,55 @@ pub fn forward_tokens(
     logits: &mut Vec<f32>,
     want_logits: bool,
 ) {
+    // Frames take TMAX tokens, or TROWS on a resident cut model (no cold pass);
+    // a chunk asking for logits ends on a frame of at most TMAX tokens, so the
+    // head runs over a small frame.
+    #[cfg(feature = "gpu")]
+    {
+        use crate::gpu_wgpu::qwen4 as q4;
+        let big = state.resident_all && !state.device_off;
+        let cap = if big { q4::TROWS } else { q4::TMAX };
+        if ids.len() > q4::TMAX && (ids.len() > cap || want_logits) {
+            let mut at = 0usize;
+            while at < ids.len() {
+                let rem = ids.len() - at;
+                let big = state.resident_all && !state.device_off;
+                let n = if !big {
+                    rem.min(q4::TMAX)
+                } else if want_logits && rem > q4::TMAX {
+                    (rem - q4::TMAX).min(q4::TROWS)
+                } else {
+                    rem.min(if want_logits { q4::TMAX } else { q4::TROWS })
+                };
+                let last = at + n == ids.len();
+                let mut lg = Vec::new();
+                forward_tokens(
+                    globals,
+                    layers,
+                    cfg,
+                    state,
+                    &ids[at..at + n],
+                    pos0 + at,
+                    inv_freq,
+                    pool,
+                    &mut lg,
+                    want_logits && last,
+                );
+                if last {
+                    *logits = lg;
+                }
+                at += n;
+            }
+            if want_logits && std::env::var("CMF_QWEN_TOPLOG").as_deref() == Ok("1") {
+                top_log(logits, globals.lm_head.rows());
+            }
+            return;
+        }
+    }
     #[cfg(feature = "gpu")]
     if !ids.is_empty()
-        && ids.len() <= crate::gpu_wgpu::qwen4::TMAX
+        && (ids.len() <= crate::gpu_wgpu::qwen4::TMAX
+            || (state.resident_all && !want_logits && ids.len() <= crate::gpu_wgpu::qwen4::TROWS))
         && forward_tokens_device(
             globals,
             layers,
@@ -3407,7 +3488,8 @@ fn forward_tokens_device(
 ) -> bool {
     use crate::gpu_wgpu::qwen4 as q4;
     let ntok = ids.len();
-    if ntok == 0 || ntok > q4::TMAX {
+    let cap = if state.resident_all && !want_logits { q4::TROWS } else { q4::TMAX };
+    if ntok == 0 || ntok > cap {
         return false;
     }
     let position = pos0;
@@ -3545,7 +3627,7 @@ fn forward_tokens_device(
             state.mtp_tried = true;
             state.mtp = MtpHead::load(&model, model.arch());
             if let Some(head) = state.mtp.as_mut()
-                && let Err(why) = head.setup(&g, gu_q2)
+                && let Err(why) = head.setup(&device_geom(cfg, &head.layer.moe, gu_q2), gu_q2)
             {
                 tracing::warn!("qwen4 MTP off: {why}");
                 state.mtp = None;
@@ -3598,8 +3680,15 @@ fn forward_tokens_device(
             .saturating_sub(reserve_mb << 20)
             .saturating_sub(workspace)
             .saturating_sub(snap_extra);
-        let slots = (free / per as u64) as usize;
+        let mut slots = (free / per as u64) as usize;
         let n_layers = layers.len();
+        // A cut model the card holds whole takes exactly its experts (every
+        // routed one, the shared ones, a little slack), not the whole budget:
+        // the rest of the card stays free (a 40-48 GB card runs it whole).
+        let whole = n_layers * g.n_experts + n_layers + q4::TMAX * g.top_k + 64;
+        if std::env::var("CMF_QWEN_RESIDENT").as_deref() != Ok("0") && slots >= whole {
+            slots = whole;
+        }
         // staging for the cold passes: one slot per token slot and rank
         let staging = q4::TMAX * g.top_k;
         let Some(arena) = QwenGpuPool::create_explicit(
@@ -3691,6 +3780,38 @@ fn forward_tokens_device(
                     cap_staging
                 );
             }
+        }
+        // A cut model that fits the card whole: every routed expert gets its
+        // slot now (profiled ones first, then the rest), and the frames chain
+        // the whole token. `CMF_QWEN_RESIDENT=0` keeps the per-layer frames.
+        if std::env::var("CMF_QWEN_RESIDENT").as_deref() != Ok("0")
+            && cap_slots >= layers.len() * n_experts
+        {
+            let mut seen = vec![false; layers.len() * n_experts];
+            let mut all: Vec<(usize, usize)> = Vec::with_capacity(seen.len());
+            for &(l, e) in &warm_order {
+                if l < layers.len() && e < n_experts && !std::mem::replace(&mut seen[l * n_experts + e], true) {
+                    all.push((l, e));
+                }
+            }
+            for l in 0..layers.len() {
+                for e in 0..n_experts {
+                    if !seen[l * n_experts + e] {
+                        all.push((l, e));
+                    }
+                }
+            }
+            let t0 = std::time::Instant::now();
+            let arena = state.gpu_pool.as_mut().unwrap();
+            arena.prefill(&model, &all, &triples);
+            let held = arena.slot_for.iter().take(layers.len() * n_experts).filter(|&&s| s != u32::MAX).count();
+            state.resident_all = held == layers.len() * n_experts;
+            tracing::info!(
+                "qwen4 device: {held} of {} routed experts resident in {:.2}s{}",
+                layers.len() * n_experts,
+                t0.elapsed().as_secs_f64(),
+                if state.resident_all { " — whole-token chained frames" } else { "" }
+            );
         }
         // The host-heap tier behind the arena (Linux): admissions become DMA
         // copies (`HostTier`). Off unless asked: CMF_QWEN_HTIER_MB=auto sizes
@@ -3809,6 +3930,22 @@ fn forward_tokens_device(
             return off(state, "device reset failed");
         }
     }
+    let resident_all = state.resident_all;
+    // A prompt chunk nobody reads anything back from (resident mode: no cold
+    // winner to complete; no logits, no window, no profile) is left running
+    // while the next one is encoded. Anything else first drains it.
+    let defer_readback = resident_all
+        && !want_logits
+        && ntok > 1
+        && !state.verify_window
+        && state.profile.is_none()
+        && std::env::var("CMF_QWEN_PIPELINE").as_deref() != Ok("0")
+        && std::env::var_os("CMF_QWEN_DUMP_HYPER").is_none();
+    if !defer_readback && let Some(p) = state.inflight.take() {
+        if p.wait().is_none() {
+            return off(state, "readback");
+        }
+    }
     let dev = state.dev.as_mut().unwrap();
     let arena = state.gpu_pool.as_mut().unwrap();
 
@@ -3818,7 +3955,30 @@ fn forward_tokens_device(
     // Several tokens per frame rule the gated chain out (one frame per layer).
     // Sealed O(1) layers dispatch directly: a chain's aborted frame would still
     // run their state pushes, and a row pushed twice is a row evicted twice.
-    let chain_len = if ntok > 1 || dev.o1.is_some() {
+    // With every expert resident no winner is cold, so nothing gates: the
+    // whole token (or prompt chunk) and the head go out as one submission.
+    let chain_env = std::env::var("CMF_QWEN_CHAIN").ok().and_then(|v| v.parse::<usize>().ok());
+    // (A sealed far field dispatches its layers directly, which only an
+    // aborted chain frame could double; with every expert resident no frame
+    // aborts, so the far field chains too.)
+    let chain_len = if dev.o1.is_some() && !resident_all {
+        1
+    } else if resident_all {
+        // A token (or a verify window) goes out in a few chains, each encoded
+        // while the card runs the one before (`CMF_QWEN_CHAINS`, default 4):
+        // only the first chain's host encode is exposed (PRO 6000, 4K, plain
+        // decode: 1 chain 72.6 tok/s, 2–3 78.3, 4 79.7). A prompt chunk stays
+        // one chain (its chunks already overlap the host, `defer_readback`).
+        let chains = std::env::var("CMF_QWEN_CHAINS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        let split = want_logits && ntok <= crate::gpu_wgpu::qwen4::TMAX;
+        chain_env
+            .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { layers.len() + 1 })
+            .max(1)
+    } else if ntok > 1 {
         1
     } else {
         std::env::var("CMF_QWEN_CHAIN")
@@ -3834,7 +3994,15 @@ fn forward_tokens_device(
     let cs = q4::cold_stride(&g);
     let hidden_bytes = cfg.hidden * 4;
     let cold_part = (ntok * cs).div_ceil(16) * 16;
-    let frame_bytes = cold_part + (ntok * hidden_bytes).div_ceil(16) * 16;
+    // With every expert resident nothing in a layer frame's readback is acted
+    // on (no cold winner, no profile, no probe): the frames copy nothing out
+    // and only the head's logits come back.
+    let lean = resident_all
+        && state.profile.is_none()
+        && !check
+        && std::env::var_os("CMF_QWEN_DUMP_HYPER").is_none()
+        && std::env::var("CMF_QWEN_LEAN").as_deref() != Ok("0");
+    let frame_bytes = if lean { 0 } else { cold_part + (ntok * hidden_bytes).div_ceil(16) * 16 };
     let snapshot = state.verify_window;
     if snapshot {
         dev.ensure_snaps(&g, ntok);
@@ -3878,7 +4046,8 @@ fn forward_tokens_device(
     // cold expert in one of them leaves every later frame unexecuted, and
     // the chain resumes after the miss once the arena admitted it.
     let frames_total = if want_logits { n + 1 } else { n };
-    dev.gated = chain_len > 1;
+    // nothing can miss when every expert is resident: plain dispatches
+    dev.gated = chain_len > 1 && !resident_all;
     let mut fi = 0usize;
     let mut vocab_out = 0usize;
     // Single-frame chains are encoded one frame ahead, while the card runs
@@ -3987,6 +4156,9 @@ fn forward_tokens_device(
                     snapshot,
                 )
                 .ok_or("layer frame declined")?;
+                if lean {
+                    continue;
+                }
                 if !q4::copy_to_stage(&mut enc, dev, &out.cold, 0, stage_off, (ntok * cs) as u64)
                     || !q4::copy_to_stage(
                         &mut enc,
@@ -4048,16 +4220,32 @@ fn forward_tokens_device(
             break;
         };
         arena.rearm_uploads();
+        if defer_readback && hi >= frames_total {
+            // this chunk runs while the caller feeds the next; the previous
+            // one's stage is collected now (it holds nothing to act on)
+            if let Some(prev) = state.inflight.replace(pend)
+                && prev.wait().is_none()
+            {
+                failed = Some("readback");
+                break;
+            }
+            arena.uploads_done();
+            pf.chains += 1;
+            fi = hi;
+            continue;
+        }
         if let Some(tf) = t_fence.take() {
             pf.post += tf.elapsed();
         }
-        // one frame per chain: the next frame is encoded while this one runs
+        // one frame per chain (or every chain with all experts resident: no
+        // frame can miss, so the next chain always starts at `hi`): the next
+        // chain is encoded while this one runs
         arena.hold_layers = [None, None];
-        if chain_len == 1 && hi < frames_total {
+        if (chain_len == 1 || resident_all) && hi < frames_total {
             let te = std::time::Instant::now();
             match encode_chain(
                 hi,
-                hi + 1,
+                (hi + chain_len).min(frames_total),
                 dev,
                 arena,
                 &state.picks_prev,
@@ -4101,6 +4289,9 @@ fn forward_tokens_device(
             }
             let layer = &layers[f];
             dev.commit(f);
+            if lean {
+                continue 'frames;
+            }
             if let Some(dir) = dump_hyper.as_deref()
                 && let Some(rows) = q4::read_hyper(dev, ntok, cfg.hc * cfg.hidden)
             {
@@ -4549,24 +4740,45 @@ pub struct MtpHead {
     pub rounds: u64,
 }
 
+/// The main file carries the MTP draft head itself (`model.mtp.*`).
+fn mtp_embedded(model: &CmfModel) -> bool {
+    model.tensor("model.mtp.layers.0.self_attn.q_proj.weight").is_some()
+}
+
 #[cfg(feature = "gpu")]
 impl MtpHead {
-    /// Open the sidecar beside the main file, when there is one that fits.
+    /// Open the draft head: inside the main file, or the sidecar beside it.
     pub fn load(main: &Arc<CmfModel>, arch: &ModelArch) -> Option<Self> {
         if std::env::var("CMF_QWEN_MTP").as_deref() == Ok("0") {
             return None;
         }
-        let path = cortiq_core::mtp_sidecar_path(&main.path);
-        if path == main.path || !path.exists() {
-            return None;
-        }
-        let side = match CmfModel::open(&path) {
-            Ok(m) => Arc::new(m),
-            Err(e) => {
-                tracing::warn!("qwen4 MTP sidecar {}: {e}", path.display());
+        // The draft head rides inside the main file (`moe-defrag --merge`)
+        // or in the `<stem>.mtp.cmf` sidecar beside it.
+        let side = if mtp_embedded(main) {
+            // A second handle on the same file: its own uid keys the head's
+            // own expert bank and frame state apart from the backbone's
+            // (one uid would hand the backbone the head's 520-slot pool).
+            match CmfModel::open(&main.path) {
+                Ok(m) => Arc::new(m),
+                Err(e) => {
+                    tracing::warn!("qwen4 MTP head in {}: {e}", main.path.display());
+                    return None;
+                }
+            }
+        } else {
+            let path = cortiq_core::mtp_sidecar_path(&main.path);
+            if path == main.path || !path.exists() {
                 return None;
             }
+            match CmfModel::open(&path) {
+                Ok(m) => Arc::new(m),
+                Err(e) => {
+                    tracing::warn!("qwen4 MTP sidecar {}: {e}", path.display());
+                    return None;
+                }
+            }
         };
+        let path = side.path.clone();
         let sa = side.arch();
         if sa.arch_name != arch.arch_name
             || sa.hidden_size != arch.hidden_size
@@ -4750,6 +4962,10 @@ pub fn spec_round(
     // ── drafts ──
     let (k, drafts) = {
         let head = state.mtp.as_mut()?;
+        // The draft head routes over its own expert set: a backbone cut to
+        // K experts a layer (`moe-defrag --keep`) keeps the head's full 512,
+        // so its frames take the head's geometry, not the backbone's.
+        let g = device_geom(cfg, &head.layer.moe, gu_q2);
         if let Err(why) = head.setup(&g, gu_q2) {
             tracing::warn!("qwen4 MTP off: {why}");
             state.mtp = None;

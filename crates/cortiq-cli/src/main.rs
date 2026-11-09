@@ -16,6 +16,8 @@ mod flint;
 mod hotmix;
 mod flint_hybrid;
 mod gguf;
+mod gguf_iq;
+mod gguf_qwen4;
 mod gptq;
 #[cfg(feature = "gpu")]
 mod nvgtrain;
@@ -1024,6 +1026,11 @@ enum Commands {
         /// OUTPUT.src, removed at the end)
         #[arg(long)]
         scratch: Option<String>,
+        /// `--experts` on a `moe-defrag` cut written before cuts recorded their source
+        /// experts: the routing stats (profile or JSON) that made the cut, checked against
+        /// the cut's hash, so each slot reads its own expert from the checkpoint
+        #[arg(long)]
+        defrag_stats: Option<String>,
     },
     /// Bake a task's skill into a model before compressing it (DTG-MA,
     /// Patent 2): soft gates on the FFN neurons of the deep layers trained
@@ -1301,6 +1308,16 @@ enum Commands {
         /// Per-layer routing-mass fraction to keep (0–1]
         #[arg(long, default_value = "0.95")]
         cover: f64,
+        /// Keep exactly N experts in every MoE layer, the most routed first
+        /// (overrides --cover). `--stats` may then be a Qwen3.8-Flash-Next
+        /// routing profile (`CMF_QWEN_PROFILE_SAVE`); the cut file gets its
+        /// own `<output>.profile` in the new numbering
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Also carry this CMF's tensors that the source lacks, e.g. the
+        /// `.mtp.cmf` draft head (one file instead of two)
+        #[arg(long)]
+        merge: Option<String>,
         /// Output .cmf path
         #[arg(long)]
         output: String,
@@ -1333,6 +1350,20 @@ enum Commands {
         /// not plain byte-level BPE (HunYuan / Hy-MT2)
         #[arg(long)]
         tokenizer_dir: Option<String>,
+        /// Qwen3.8-Flash-Next (`qwen4exp`) GGUFs: a CMF of the same model
+        /// (any quantization) whose header, tokenizer and per-tensor codecs the
+        /// import follows; each tensor's layout is checked against it
+        #[arg(long)]
+        template: Option<String>,
+        /// With --template: the codec of the routed experts instead of the
+        /// template's (q4tp | q2tp | q8_2f | f16)
+        #[arg(long)]
+        experts_quant: Option<String>,
+        /// With --template: an RCO allocation listing of a pruned GGUF
+        /// (`blk.L.ffn_gate_exps.weight[E]: TYPE`): every kept expert is then
+        /// also compared with its original in the template
+        #[arg(long)]
+        alloc: Option<String>,
     },
     /// 1-bit PTQ via error-feedback transfer (GPTQ). Calibrates each
     /// linear's input Hessian on a corpus, then quantizes it to `q1s`:
@@ -4834,9 +4865,9 @@ async fn main() -> anyhow::Result<()> {
                 hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk)
             }
         }
-        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, bf16_down, shared_q8, whole_experts, scratch } => {
+        Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, bf16_down, shared_q8, whole_experts, scratch, defrag_stats } => {
             if experts {
-                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, bf16_down, shared_q8, whole_experts, scratch.as_deref())
+                hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, bf16_down, shared_q8, whole_experts, scratch.as_deref(), defrag_stats.as_deref())
             } else {
                 hotmix::cmd_hot_bake(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, &take)
             }
@@ -4903,14 +4934,44 @@ async fn main() -> anyhow::Result<()> {
             model,
             stats,
             cover,
+            keep,
+            merge,
             output,
-        } => moedefrag::cmd_moe_defrag(&model, stats.as_deref(), cover, &output),
+        } => moedefrag::cmd_moe_defrag_with(
+            &model,
+            stats.as_deref(),
+            &moedefrag::DefragOpts { cover, keep, merge: merge.as_deref() },
+            &output,
+        ),
+        Commands::ImportGguf {
+            gguf,
+            output,
+            quant: _,
+            hf_token,
+            tokenizer_dir: _,
+            template: Some(template),
+            experts_quant,
+            alloc,
+        } => {
+            gguf::run_import_gguf_template(
+                &gguf,
+                &output,
+                &template,
+                experts_quant.as_deref(),
+                alloc.as_deref(),
+                hf_token.as_deref(),
+            )?;
+            println!("✓ wrote {output}");
+            Ok(())
+        }
         Commands::ImportGguf {
             gguf,
             output,
             quant,
             hf_token,
             tokenizer_dir,
+            template: None,
+            ..
         } => {
             gguf::run_import_gguf(
                 &gguf,
