@@ -50,16 +50,18 @@ fn pair() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_ATTEND_FD_PAIR").as_deref() == Ok("1"))
 }
 
-/// Cache rows a loop step of the blocked loop (`CMF_ATTEND_FD_BLK`: 1, 2,
-/// 4; default 4): the block's K and V rows all load before its first
-/// score, and the running max moves once a block (B + 1 exponentials a
-/// head instead of 2·B).
+/// Cache rows a loop step of the blocked loop (`CMF_ATTEND_FD_BLK`: 2 or
+/// 4; default 1 = one row a step): the block's K and V rows all load
+/// before its first score, and the running max moves once a block (B + 1
+/// exponentials a head instead of 2·B). Measured no change (Qwen3.5-4B on
+/// an RTX A5000 at 32 000 positions: the part streams the cache at ~650
+/// GB/s either way), so the row loop stays the default.
 fn blk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| match std::env::var("CMF_ATTEND_FD_BLK").as_deref() {
-        Ok("1") => 1,
         Ok("2") => 2,
-        _ => 4,
+        Ok("4") => 4,
+        _ => 1,
     })
 }
 
