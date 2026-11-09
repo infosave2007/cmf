@@ -20755,6 +20755,9 @@ fn kv_capacity(limit: usize, need: usize) -> usize {
         .unwrap_or(512)
         .max(1);
     let limit = limit.max(1).div_ceil(64).saturating_mul(64);
+    // Every mirror of a prompt being read (`set_batch_kv_hint`) is sized for
+    // all of it, in every caller on this thread, so each sees one stride.
+    let need = need.max(BATCH_KV_HINT.with(|f| f.get()));
     need.max(1)
         .checked_next_power_of_two()
         .unwrap_or(limit)
@@ -34407,6 +34410,48 @@ thread_local! {
     static BATCH_Q82_MM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// The NEXT batch graph call on this thread submits without reading its
+    /// hidden rows back (`set_batch_defer`), and the submission it leaves in
+    /// flight; the call after waits for it before returning.
+    static BATCH_DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BATCH_INFLIGHT: std::cell::RefCell<Option<wgpu::SubmissionIndex>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A prompt chunk whose rows nobody reads (every chunk but the last): the
+/// batch graph submits and returns, so the host encodes the next chunk
+/// while the card runs this one. A 512-row chunk spent 50-150 ms in host
+/// encode against ~140 ms on the card (Qwen3.5-4B, RTX A5000), one after
+/// the other. At most one deferred chunk stays in flight: the next call
+/// waits for it after its own submit. `CMF_BATCH_DEFER=0` reads every
+/// chunk back.
+pub fn set_batch_defer(on: bool) {
+    let on = on && std::env::var("CMF_BATCH_DEFER").as_deref() != Ok("0");
+    BATCH_DEFER.with(|f| f.set(on));
+}
+
+thread_local! {
+    /// Rows the prompt being read on this thread will reach
+    /// (`set_batch_kv_hint`); 0 = unknown.
+    static BATCH_KV_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The prompt's length, so the K/V mirrors are sized for all of it at the
+/// first chunk (`kv_capacity` on this thread, every graph alike). Growing them by powers of two on the way
+/// (512 → 1024 → … → 16 384) copied every layer's mirror and waited for the
+/// card each time: a 411 ms chunk in a 16 000-token prompt. 0 clears it.
+pub fn set_batch_kv_hint(rows: usize) {
+    BATCH_KV_HINT.with(|f| f.set(rows));
+}
+
+/// Wait for a deferred chunk still in flight (a host read of device state
+/// may follow).
+fn batch_inflight_wait(c: &Ctx) {
+    if let Some(idx) = BATCH_INFLIGHT.with(|f| f.borrow_mut().take()) {
+        let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None });
+    }
+}
+
 /// Opt this thread's batch graph prompt chunks into the q8_2f GEMM.
 pub fn set_batch_q82_mm(on: bool) {
     BATCH_Q82_MM.with(|f| f.set(on));
@@ -34511,6 +34556,8 @@ pub fn forward_batch_graph_at(
     layers_run: Option<&mut usize>,
 ) -> crate::gpu::BatchGraphOutcome {
     let t_bfn = std::time::Instant::now();
+    // `set_batch_defer` arms this call only.
+    let defer_req = BATCH_DEFER.with(|f| f.replace(false));
     // Once sealed O(1) views have been admitted and uploaded, a failed batch
     // cannot safely fall through to the CPU path: the device state may have
     // advanced while the CPU copy is intentionally stale. All refusals before
@@ -39234,6 +39281,9 @@ pub fn forward_batch_graph_at(
     let stage = scratch_buffer(size,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "bg-stage");
     let t_enc_done = std::time::Instant::now();
+    // A deferred chunk returns no rows; diagnostics that read back keep
+    // the synchronous path.
+    let defer = defer_req && spec.is_none() && !bts_on && tap_layer.is_none() && preview.is_none();
     let ok = if let Some(sp) = spec.as_mut() {
         // Speculative tail: final-norm each row, one batched lm_head GEMM,
         // read every position's logits back beside the hiddens. The CPU
@@ -39320,7 +39370,24 @@ pub fn forward_batch_graph_at(
                 enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
             }
         }
-        readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden])
+        if defer {
+            // Rows nobody reads: submit, keep this chunk in flight, and wait
+            // for the one before it (one deferred chunk at a time).
+            flush_pass(&enc);
+            note_submit(c);
+            let idx = c.queue.submit(Some(finish_enc(enc)));
+            if let Some(prev) = BATCH_INFLIGHT.with(|f| f.borrow_mut().replace(idx)) {
+                c.device
+                    .poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None })
+                    .is_ok()
+            } else {
+                true
+            }
+        } else {
+            let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden]);
+            BATCH_INFLIGHT.with(|f| f.borrow_mut().take());
+            ok
+        }
     };
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
         let post = t_enc_done.elapsed().as_secs_f64() * 1e3;

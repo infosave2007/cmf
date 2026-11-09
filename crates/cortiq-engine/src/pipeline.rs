@@ -7408,6 +7408,9 @@ impl Pipeline {
             && !dyn_prefill
             && !self.o1_active()
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err();
+        // A hint a failed earlier prompt left behind must not size this one.
+        #[cfg(not(target_os = "macos"))]
+        crate::gpu::set_batch_kv_hint(0);
         if batch_k > 0
             && (graph_prefill || o1_batch_ready)
             && task_mask.is_none()
@@ -7420,6 +7423,13 @@ impl Pipeline {
             let chunk = batch_k;
             let pos_start = pos;
             let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
+            // The K/V mirrors take the whole prompt (and its first token) at
+            // the first chunk instead of growing on the way; cleared below.
+            // Not under O(1): its exact mirror must stay the tail it keeps.
+            #[cfg(not(target_os = "macos"))]
+            if !self.o1_active() && o1_arch.is_none() && !o1_batch_ready {
+                crate::gpu::set_batch_kv_hint(input_ids.len() + 1);
+            }
             if o1_arch.is_some() {
                 crate::gpu::o1_acap_begin();
             }
@@ -7446,7 +7456,20 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let t_chunk = std::time::Instant::now();
+                // A chunk before the last whose rows nothing reads: the
+                // graph submits it and returns, and this loop encodes the
+                // next chunk while the card runs it.
+                #[cfg(not(target_os = "macos"))]
+                crate::gpu::set_batch_defer(
+                    end < input_ids.len()
+                        && o1_arch.is_none()
+                        && !o1_batch_ready
+                        && !mimo_spec
+                        && !mtp_batch_prefill,
+                );
                 let outcome = self.o1_prompt_chunk(&mut hiddens, &positions, bk);
+                #[cfg(not(target_os = "macos"))]
+                crate::gpu::set_batch_defer(false);
                 if let (Some(a), crate::gpu::BatchGraphOutcome::Completed) = (o1_arch.as_mut(), outcome) {
                     if let Err(err) = self.o1_archive_chunk(a, pos, bk) {
                         self.finish_generation(&mut mtp, &mut router, true);
@@ -7671,6 +7694,8 @@ impl Pipeline {
             }
             pos += 1;
         }
+        #[cfg(not(target_os = "macos"))]
+        crate::gpu::set_batch_kv_hint(0);
         if std::env::var("CMF_PREFILL_PROF").is_ok() {
             eprintln!(
                 "prefill: {} tokens in {:.1} ms (batch_k={batch_k})",

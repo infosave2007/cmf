@@ -2575,6 +2575,24 @@ pub fn graph_kv_pull_host(
     None
 }
 
+/// The next batch graph call on this thread submits without reading its
+/// rows back (`gpu_wgpu::set_batch_defer`): a prompt chunk nobody reads.
+pub fn set_batch_defer(_on: bool) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::set_batch_defer(_on);
+    }
+}
+
+/// The prompt length the batch graph sizes its K/V mirrors for
+/// (`gpu_wgpu::set_batch_kv_hint`); 0 clears it.
+pub fn set_batch_kv_hint(_rows: usize) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::set_batch_kv_hint(_rows);
+    }
+}
+
 /// Whether a sequence's wgpu K/V mirrors may be f16 (`gpu_wgpu::kv16`):
 /// the first note after a reset decides.
 pub fn graph_kv16_note(_kv_id: u64, _allowed: bool) {
