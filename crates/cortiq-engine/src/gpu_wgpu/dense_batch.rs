@@ -443,24 +443,38 @@ pub(crate) struct AttnBt {
     pub(crate) dec_l: wgpu::BindGroupLayout,
 }
 
+/// The mirror bindings of `ATTN_BT_WGSL` an f16 mirror (`kv16`) retypes.
+pub(crate) const HALF_NAMES: &[&str] = &["kv_kb", "kv_vb", "ap_k", "ap_v"];
+
 pub(crate) struct Pipes {
     pub(crate) attn: Option<AttnBt>,
+    /// The same kernels over f16 mirror rows (`kv16::half_src`); None
+    /// without shader f16 or on rejection.
+    pub(crate) attn_h: Option<AttnBt>,
     /// `q4tp_mm_r2` (`q4tp_mm_r` under `CMF_Q4MM_R=1`); None on rejection,
     /// a small workgroup-storage limit or `CMF_Q4MM_R=0`.
     pub(crate) mm_r: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
 }
 
-fn build_attn(c: &Ctx) -> Option<AttnBt> {
+fn build_attn(c: &Ctx, half: bool) -> Option<AttnBt> {
     if std::env::var("CMF_ATTN_BT").as_deref() == Ok("0") {
         return None;
     }
     if c.device.limits().max_compute_workgroup_storage_size < 2 * 2048 * 4 + 512 * 16 {
         return None;
     }
+    if half && !super::kv16::device_ok(c) {
+        return None;
+    }
+    let src = if half {
+        super::kv16::half_src(ATTN_BT_WGSL, HALF_NAMES)
+    } else {
+        ATTN_BT_WGSL.to_string()
+    };
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cmf-attn-bt"),
-        source: wgpu::ShaderSource::Wgsl(ATTN_BT_WGSL.into()),
+        label: Some(if half { "cmf-attn-bt-h" } else { "cmf-attn-bt" }),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
     });
     let pipe = |ep: &str| {
         c.device
@@ -536,7 +550,8 @@ fn build_mm_r(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>
 
 fn build(c: &Ctx) -> Option<Pipes> {
     Some(Pipes {
-        attn: build_attn(c),
+        attn: build_attn(c, false),
+        attn_h: build_attn(c, true),
         mm_r: build_mm_r(c),
     })
 }
@@ -606,6 +621,11 @@ pub(crate) fn attn(c: &Ctx) -> Option<&AttnBt> {
     pipes(c).and_then(|p| p.attn.as_ref())
 }
 
+/// The kernels for a mirror of this dtype (`half`: an f16 mirror).
+pub(crate) fn attn_for(c: &Ctx, half: bool) -> Option<&AttnBt> {
+    pipes(c).and_then(|p| if half { p.attn_h.as_ref() } else { p.attn.as_ref() })
+}
+
 /// Positions per chunk of `gqa_attend_gpart_bt` (the token kernel's AG_CK).
 pub(crate) const BT_CK: usize = 256;
 
@@ -646,6 +666,9 @@ pub(crate) fn encode_attn_bt(
     scale: f32,
     // Rows every token attends (block preview); 0 = causal.
     n_all: usize,
+    // False: rope and the mirror append only — the caller attends the run
+    // itself (the matrix-unit tile).
+    attend: bool,
 ) {
     let run = k - t_from;
     if run == 0 {
@@ -703,6 +726,9 @@ pub(crate) fn encode_attn_bt(
     pass.set_pipeline(&p.kv);
     pass.set_bind_group(0, &bg_kv, &[]);
     pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), run as u32, 1);
+    if !attend {
+        return;
+    }
     if t_dec > t_from {
         // Tokens whose context is within ATTEND_SPLIT_MIN: the dec twin.
         let kk = t_dec - t_from;

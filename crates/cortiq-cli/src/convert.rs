@@ -4990,6 +4990,52 @@ fn safetensors_tensor_count(path: &Path) -> anyhow::Result<usize> {
         .unwrap_or(0))
 }
 
+/// Tensor names of a source checkpoint: the index's weight map for a sharded
+/// one, the header of `model.safetensors` otherwise. None when neither is on
+/// disk — the caller cannot judge the inventory then.
+fn source_tensor_names(dir: &Path) -> Option<Vec<String>> {
+    if let Some(map) = fs::read(dir.join("model.safetensors.index.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("weight_map").and_then(|m| m.as_object()).cloned())
+    {
+        return Some(map.keys().cloned().collect());
+    }
+    let mut file = fs::File::open(dir.join("model.safetensors")).ok()?;
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes).ok()?;
+    let mut header = vec![0u8; u64::from_le_bytes(len_bytes) as usize];
+    file.read_exact(&mut header).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    Some(
+        header
+            .as_object()?
+            .keys()
+            .filter(|name| name.as_str() != "__metadata__")
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Whether a source inventory can hold a multi-token-prediction head: a
+/// name spelled with `mtp` (Qwen3.5/3.6 `mtp.*`, DeepSeek-V4 `mtp.N.*`, MiMo),
+/// an `eh_proj` (the DeepSeek-V3/GLM block), or a decoder layer past the
+/// trunk (`layers.N` with N ≥ `num_layers`, where V3-lineage checkpoints keep
+/// their next-token layers). Errs toward yes: only an inventory with none of
+/// these drops the head a config announces.
+fn source_may_ship_mtp(names: &[String], num_layers: usize) -> bool {
+    names.iter().any(|n| {
+        let lower = n.to_ascii_lowercase();
+        lower.contains("mtp")
+            || lower.contains("eh_proj")
+            || lower
+                .split("layers.")
+                .skip(1)
+                .filter_map(|rest| rest.split('.').next()?.parse::<usize>().ok())
+                .any(|li| li >= num_layers)
+    })
+}
+
 /// Open only source shards absent from the supplied completed-mark set. A
 /// missing shard is therefore acceptable only when its basename is proven
 /// complete by every output manifest; an unmarked missing shard remains a
@@ -9632,6 +9678,16 @@ pub fn run_convert_multi_excluding(
          `hf download {model} --local-dir DIR`, then `cortiq convert --model DIR`"
     );
     let mut arch = build_arch(&config)?;
+    // A fine-tune keeps its base config's MTP count while shipping no MTP
+    // weights (ccore/Qwen3.5-4B-3D-Coder: `mtp_num_hidden_layers: 1`, no
+    // `mtp.*`). The header must not declare a head the file cannot carry:
+    // `cortiq info` would list it and every load would log its absence.
+    if arch.mtp.is_some()
+        && source_tensor_names(dir).is_some_and(|names| !source_may_ship_mtp(&names, arch.num_layers))
+    {
+        eprintln!("  config declares an MTP head but the checkpoint ships no MTP tensors: header without it");
+        arch.mtp = None;
+    }
     if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE && stream_repo.is_some() {
         anyhow::ensure!(
             stream_revision.is_some(),
@@ -11980,6 +12036,25 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    #[test]
+    fn mtp_inventory_check_keeps_every_known_spelling() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Qwen3.5 fine-tune without its base's MTP block.
+        let trunk = names(&[
+            "model.language_model.layers.31.mlp.down_proj.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.visual.blocks.0.attn.qkv.weight",
+        ]);
+        assert!(!source_may_ship_mtp(&trunk, 32));
+        // Qwen3.5 base, DeepSeek-V4, MiMo.
+        assert!(source_may_ship_mtp(&names(&["mtp.layers.0.mlp.up_proj.weight"]), 32));
+        assert!(source_may_ship_mtp(&names(&["mtp.0.main_proj.weight"]), 61));
+        assert!(source_may_ship_mtp(&names(&["model.mtp_layers.0.eh_proj.weight"]), 36));
+        // DeepSeek-V3 / GLM keep the next-token layer as `layers.N`, N past the trunk.
+        assert!(source_may_ship_mtp(&names(&["model.layers.61.enorm.weight"]), 61));
+        assert!(!source_may_ship_mtp(&names(&["model.layers.60.enorm.weight"]), 61));
+    }
 
     #[test]
     fn sampling_spec_parses_into_the_header_shape() {

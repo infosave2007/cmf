@@ -5349,6 +5349,14 @@ impl Pipeline {
                 .layers
                 .iter()
                 .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)));
+            // The dense GDN hybrids (Qwen3.5 / 3.6 / 3.8) on the tiled
+            // attend: 512 rows a submit, each weight unpacked to its f16
+            // plane once a chunk. Qwen3.5-4B q4tp on an RTX A5000, prompt
+            // tok/s at 4 000 / 16 000 / 32 000 tokens: 1223 / 1122 / 977
+            // at 128 rows, 1669 / 1550 / - at 256, 1833 / 1897 / 1539 at 512.
+            if !moe && self.graph_gdn_layer_count() > 0 && crate::gpu::batched_attend_tiled() {
+                return 512;
+            }
             // q8_2f experts (moe_q82's grouped prefill) read each expert
             // once per group of up to 16 of its entries, so the chunk that
             // fills those groups is the faster ingest: Mellum2.1 q8_2f on an
@@ -7400,6 +7408,9 @@ impl Pipeline {
             && !dyn_prefill
             && !self.o1_active()
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err();
+        // A hint a failed earlier prompt left behind must not size this one.
+        #[cfg(not(target_os = "macos"))]
+        crate::gpu::set_batch_kv_hint(0);
         if batch_k > 0
             && (graph_prefill || o1_batch_ready)
             && task_mask.is_none()
@@ -7412,6 +7423,13 @@ impl Pipeline {
             let chunk = batch_k;
             let pos_start = pos;
             let tail_from = input_ids.len().saturating_sub(crate::dory::EXACT_TAIL);
+            // The K/V mirrors take the whole prompt (and its first token) at
+            // the first chunk instead of growing on the way; cleared below.
+            // Not under O(1): its exact mirror must stay the tail it keeps.
+            #[cfg(not(target_os = "macos"))]
+            if !self.o1_active() && o1_arch.is_none() && !o1_batch_ready {
+                crate::gpu::set_batch_kv_hint(input_ids.len() + 1);
+            }
             if o1_arch.is_some() {
                 crate::gpu::o1_acap_begin();
             }
@@ -7438,7 +7456,20 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let t_chunk = std::time::Instant::now();
+                // A chunk before the last whose rows nothing reads: the
+                // graph submits it and returns, and this loop encodes the
+                // next chunk while the card runs it.
+                #[cfg(not(target_os = "macos"))]
+                crate::gpu::set_batch_defer(
+                    end < input_ids.len()
+                        && o1_arch.is_none()
+                        && !o1_batch_ready
+                        && !mimo_spec
+                        && !mtp_batch_prefill,
+                );
                 let outcome = self.o1_prompt_chunk(&mut hiddens, &positions, bk);
+                #[cfg(not(target_os = "macos"))]
+                crate::gpu::set_batch_defer(false);
                 if let (Some(a), crate::gpu::BatchGraphOutcome::Completed) = (o1_arch.as_mut(), outcome) {
                     if let Err(err) = self.o1_archive_chunk(a, pos, bk) {
                         self.finish_generation(&mut mtp, &mut router, true);
@@ -7663,6 +7694,8 @@ impl Pipeline {
             }
             pos += 1;
         }
+        #[cfg(not(target_os = "macos"))]
+        crate::gpu::set_batch_kv_hint(0);
         if std::env::var("CMF_PREFILL_PROF").is_ok() {
             eprintln!(
                 "prefill: {} tokens in {:.1} ms (batch_k={batch_k})",
@@ -16789,6 +16822,17 @@ impl Pipeline {
         (ids.len() == k).then_some(ids)
     }
 
+    /// The sequence may keep f16 K/V mirrors on the wgpu graphs (`kv16`):
+    /// nothing it runs reads f32 mirror rows — no MTP head, no drafter, no
+    /// O(1) seal, no block preview.
+    fn kv16_allowed(&self) -> bool {
+        self.mtp.is_none()
+            && self.dflash.is_none()
+            && !self.o1_active()
+            && !self.is_block_diffusion()
+            && self.clover.is_none()
+    }
+
     /// Multi-step greedy: k whole frames in ONE submit, argmax and re-embed
     /// on the device. `ids_out` receives the k winner ids; the hidden/logits
     /// outputs are NOT produced in that mode.
@@ -16803,6 +16847,7 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
     ) -> Option<Result<Vec<f32>, ()>> {
+        crate::gpu::graph_kv16_note(self.graph_kv_id, self.kv16_allowed());
         // SenseNova-Loop: MRoPE prompt rows rotate on the host; the graph's
         // mHC kernels take two streams only, and a graph must not enter an
         // mHC range midway (its streams would be the host's).
@@ -19202,6 +19247,7 @@ impl Pipeline {
         spec: Option<crate::gpu::SpecTail<'_>>,
         layers_run: Option<&mut usize>,
     ) -> crate::gpu::BatchGraphOutcome {
+        crate::gpu::graph_kv16_note(self.graph_kv_id, self.kv16_allowed());
         // SenseNova-Loop: the mHC kernels take two streams (the
         // CMF_MHC_GRAPH=0 knob keeps the host); MRoPE prompt rows ride the
         // per-row attention loop with their own angle tables.

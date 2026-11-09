@@ -922,14 +922,45 @@ pub struct MmCfg {
     /// the trainer's GEMM only: f32 epilogue, single-buffered staging,
     /// f16 or sign-bit planes.
     pub frag: u32,
+    /// F32 epilogue only: the store also multiplies by `1 / dsc[0]`
+    /// (binding 4, when `dsc[0] > 0`), the device activation scale the
+    /// batched prefill's separate `zi_post_scale` pass applied.
+    pub dscale: bool,
+    /// The weight operand is the q4tp tensor itself (binding 0 as
+    /// `vec4<u32>`): each thread expands its row's 32-column group into the
+    /// staging tile per K slice — the `q4tp_dq_f16` arithmetic, with no f16
+    /// plane in device memory. Needs `bk == 32` (one group a slice) and
+    /// `bn` = the thread count (a row a thread).
+    pub q4: bool,
+    /// The activation operand is the f32 panel itself (binding 1 as
+    /// `vec4<f32>`), scaled by the device activation scale and rounded to
+    /// f16 as the staging tile is filled — `zi_act_f16`'s arithmetic, with
+    /// no f16 panel pass. Rows past `m` read as zero. Needs `dscale`.
+    pub a32: bool,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16 }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16, dscale: false, q4: false, a32: false }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
+        if self.a32 && (!self.dscale || self.direct || self.conv != 0 || self.stages != 1 || self.acc16 != 0 || self.acc16_probe) {
+            return false;
+        }
+        if self.q4
+            && (self.bk != 32
+                || self.bn != nt
+                || self.direct
+                || self.bits != 0
+                || self.conv != 0
+                || self.stages != 1
+                || self.acc16 != 0
+                || self.acc16_probe
+                || self.frag != 16)
+        {
+            return false;
+        }
         let (tm, tn) = (self.bm / self.wm.max(1), self.bn / self.wn.max(1));
         let vpr = self.bk / 4;
         let f = self.frag;
@@ -997,6 +1028,9 @@ impl MmCfg {
                 String::new()
             }
         ) + if self.frag == 16 { "" } else { "_f8" }
+            + if self.dscale { "_ds" } else { "" }
+            + if self.q4 { "_q4" } else { "" }
+            + if self.a32 { "_a32" } else { "" }
     }
     /// Workgroup-shared bytes this variant declares.
     pub fn shared_bytes(&self) -> u32 {
@@ -1064,12 +1098,26 @@ pub fn mm_src(g: MmCfg) -> String {
         let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<f16>;");
         let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<f16>;");
     } else {
-        if g.bits != 0 {
+        if g.q4 {
+            let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<u32>>;");
+            // The q4tp tensor's words, bytes and 5-bit group scale codes
+            // (layout as `q4tp_dq_f16` reads it).
+            let _ = writeln!(
+                s,
+                "fn qwd(w: u32) -> u32 {{ let v = wt[w >> 2u]; let i = w & 3u; return select(select(select(v.w, v.z, i == 2u), v.y, i == 1u), v.x, i == 0u); }}
+fn qbyte(off: u32) -> u32 {{ return (qwd(off >> 2u) >> ((off & 3u) * 8u)) & 0xFFu; }}
+fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u); let sh = bit & 7u; var cv = qbyte(cb); if (sh > 3u) {{ cv = cv | (qbyte(cb + 1u) << 8u); }} return (cv >> sh) & 31u; }}"
+            );
+        } else if g.bits != 0 {
             let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<u32>;");
         } else {
             let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<f16>>;");
         }
-        let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
+        if g.a32 {
+            let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f32>>;");
+        } else {
+            let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
+        }
     }
     match g.epi {
         _ if g.acc16_probe => {
@@ -1077,6 +1125,9 @@ pub fn mm_src(g: MmCfg) -> String {
         }
         Epi::F32 => {
             let _ = writeln!(s, "@group(0) @binding(2) var<storage, read_write> outp: array<f32>;");
+            if g.dscale {
+                let _ = writeln!(s, "@group(0) @binding(4) var<storage, read> dsc: array<f32>;");
+            }
         }
         _ => {
             let _ = writeln!(s, "@group(0) @binding(2) var<storage, read_write> outp: array<vec4<u32>>;");
@@ -1211,6 +1262,17 @@ pub fn mm_src(g: MmCfg) -> String {
                     o = t * nt
                 );
             }
+        } else if g.a32 {
+            // f32 rows, scaled and rounded as `zi_act_f16` does it.
+            let _ = writeln!(s, "  let a_sc = dsc[0];");
+            let _ = writeln!(s, "  let ainv = select(1.0, a_sc, a_sc > 0.0);");
+            for t in 0..la {
+                let _ = writeln!(
+                    s,
+                    "  var ra{t} = vec4<f32>(0.0); {{ let lr = m0 + (tid + {o}u) / {vpr}u; if (lr < p.m) {{ ra{t} = act[(p.arow + lr) * kq + (tid + {o}u) % {vpr}u]; }} }}",
+                    o = t * nt
+                );
+            }
         } else {
             for t in 0..la {
                 let _ = writeln!(
@@ -1230,7 +1292,15 @@ pub fn mm_src(g: MmCfg) -> String {
                 format!("wt[({kt} * {bk}u + (tid + {o}u) / {wpn}u) * p.cw + n0 / 32u + (tid + {o}u) % {wpn}u]", bk = g.bk, wpn = g.bn / 32)
             }
         };
-        if g.bits != 0 {
+        if g.q4 {
+            let _ = writeln!(s, "  let qgpr = p.k / 32u;");
+            let _ = writeln!(s, "  let qrow = n0 + tid;");
+            let _ = writeln!(s, "  let qpb = p.n * qgpr * 16u;");
+            let _ = writeln!(s, "  let qcb = qpb + p.n * 4u + qrow * ((qgpr * 5u + 7u) / 8u);");
+            let _ = writeln!(s, "  let qpr = unpack2x16float(qwd((qpb >> 2u) + qrow));");
+            let _ = writeln!(s, "  var rq = wt[qrow * qgpr];");
+            let _ = writeln!(s, "  var rc = qcode(qcb, 0u);");
+        } else if g.bits != 0 {
             for t in 0..nbw {
                 let _ = writeln!(s, "  var rb{t} = {};", bw_load(t, "0u"));
             }
@@ -1247,14 +1317,38 @@ pub fn mm_src(g: MmCfg) -> String {
             mm_loop_2stage(&mut s, g, nt, tm, tn, fm, fnn, lds, vpr, la, lb);
         } else {
             let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
-            for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", if g.bits != 0 { 0 } else { lb })] {
+            for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", if g.bits != 0 || g.q4 { 0 } else { lb })] {
                 for t in 0..cnt {
+                    if g.a32 && arr == "sa" {
+                        let _ = writeln!(
+                            s,
+                            "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; sa[d] = f16(ra{t}.x * ainv); sa[d + 1u] = f16(ra{t}.y * ainv); sa[d + 2u] = f16(ra{t}.z * ainv); sa[d + 3u] = f16(ra{t}.w * ainv); }}",
+                            o = t * nt
+                        );
+                        continue;
+                    }
                     let _ = writeln!(
                         s,
                         "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
                         o = t * nt
                     );
                 }
+            }
+            // q4tp: this thread's row, the slice's 32 columns, one scale
+            if g.q4 {
+                let _ = writeln!(s, "    {{ let qs = exp2(qpr.x + f32(rc) * qpr.y); let d = tid * {lds}u;");
+                for (j, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+                    for m in 0..4 {
+                        let e = j * 8 + m * 2;
+                        let _ = writeln!(
+                            s,
+                            "      {{ let b = (rq.{comp} >> {sh}u) & 0xFFu; sb[d + {e}u] = f16((f32(b & 0xFu) - 8.0) * qs); sb[d + {e1}u] = f16((f32(b >> 4u) - 8.0) * qs); }}",
+                            sh = m * 8,
+                            e1 = e + 1
+                        );
+                    }
+                }
+                let _ = writeln!(s, "    }}");
             }
             // bits planes: each word expanded into 32 ±1 halves of sb
             for t in 0..if g.bits != 0 { nbw } else { 0 } {
@@ -1276,7 +1370,13 @@ pub fn mm_src(g: MmCfg) -> String {
             let _ = writeln!(s, "    workgroupBarrier();");
             let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
             for t in 0..la {
-                if g.conv != 0 {
+                if g.a32 {
+                    let _ = writeln!(
+                        s,
+                        "      {{ let lr = m0 + (tid + {o}u) / {vpr}u; var x = vec4<f32>(0.0); if (lr < p.m) {{ x = act[(p.arow + lr) * kq + kb + (tid + {o}u) % {vpr}u]; }} ra{t} = x; }}",
+                        o = t * nt
+                    );
+                } else if g.conv != 0 {
                     let _ = writeln!(s, "      ra{t} = ldc(y{t}, x{t}, kt + 1u, vc);");
                 } else {
                     let _ = writeln!(
@@ -1286,7 +1386,10 @@ pub fn mm_src(g: MmCfg) -> String {
                     );
                 }
             }
-            if g.bits != 0 {
+            if g.q4 {
+                let _ = writeln!(s, "      rq = wt[qrow * qgpr + kt + 1u];");
+                let _ = writeln!(s, "      rc = qcode(qcb, kt + 1u);");
+            } else if g.bits != 0 {
                 for t in 0..nbw {
                     let _ = writeln!(s, "      rb{t} = {};", bw_load(t, "(kt + 1u)"));
                 }
@@ -1350,7 +1453,12 @@ pub fn mm_src(g: MmCfg) -> String {
             // `oscale` undoes the producer's range guard (w2 reads the
             // SwiGLU hidden stored ×2⁻ᵏ): one scalar multiply per fragment.
             let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
-            let _ = writeln!(s, "  let osc = p.oscale;");
+            if g.dscale {
+                let _ = writeln!(s, "  let dsv = dsc[0];");
+                let _ = writeln!(s, "  let osc = p.oscale * select(1.0, 1.0 / dsv, dsv > 0.0);");
+            } else {
+                let _ = writeln!(s, "  let osc = p.oscale;");
+            }
             if fr == 16 {
                 for i in 0..fm {
                     for j in 0..fnn {

@@ -140,6 +140,39 @@ mod imp {
         }
     }
 
+    /// `qwen [cfg …]`: the batched-prefill GEMM shapes of Qwen3.5-4B
+    /// (hidden 2560, FFN 9216, GDN qkv 8192 + z 4096, out 4096) at 512- and
+    /// 1024-row prompt chunks, F32 epilogue; the per-chunk total weights each
+    /// shape by how often a 32-layer stack runs it.
+    fn cmd_qwen(args: &[String]) {
+        const SH: [(&str, usize, usize, usize); 6] = [
+            ("gate|up", 9216, 2560, 64),
+            ("down", 2560, 9216, 32),
+            ("gdn qkv|q", 8192, 2560, 32),
+            ("gdn z", 4096, 2560, 24),
+            ("out|o", 2560, 4096, 32),
+            ("k|v", 1024, 2560, 16),
+        ];
+        for cfg in parse_cfgs(args, Epi::F32) {
+            println!("{:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.stages));
+            for m in [512usize, 1024] {
+                let (mut fl, mut t) = (0f64, 0f64);
+                let mut line = format!("  M{m}");
+                for &(name, n, k, times) in &SH {
+                    match bench::mm_time(cfg, m, k, n) {
+                        Some(s) => {
+                            fl += 2.0 * (m * n * k) as f64 * times as f64;
+                            t += s * times as f64;
+                            line += &format!(" | {name} {:.3}ms {:.1}TF", s * 1e3, tflops(m, n, k, s));
+                        }
+                        None => line += &format!(" | {name} n/a"),
+                    }
+                }
+                println!("{line}\n    chunk total {:.1} ms {:.1} TF", t * 1e3, fl / t / 1e12);
+            }
+        }
+    }
+
     /// `mmt [cfg …]`: the nvg-train GEMM shapes of the 27B student
     /// (tokens 4096; blr forward/backward and the sign gradients), F32 epilogue.
     fn cmd_mmt(args: &[String]) {
@@ -1056,6 +1089,7 @@ mod imp {
             Some("existing") => cmd_existing(rest),
             Some("mm") => cmd_mm(rest),
             Some("mmt") => cmd_mmt(rest),
+            Some("qwen") => cmd_qwen(rest),
             Some("prec") => cmd_prec(rest),
             Some("flash") => cmd_flash(rest),
             Some("flashdbg") => cmd_flashdbg(rest),

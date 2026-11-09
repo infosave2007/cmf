@@ -53,7 +53,7 @@ mod imp {
     pub fn main() {
         let filter = std::env::args().nth(1).unwrap_or_default();
         let mut srcs: Vec<(&str, String, Vec<&str>)> = cortiq_engine::gpu_wgpu::gdn_train::debug_sources();
-        srcs.retain(|_| true);
+        srcs.extend(cortiq_engine::gpu_wgpu::debug_hot_sources());
         unsafe {
             let entry = ash::Entry::load().expect("libvulkan");
             let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
@@ -68,8 +68,12 @@ mod imp {
                 .unwrap() as u32;
             let prio = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
-            let exts = [ash::khr::pipeline_executable_properties::NAME.as_ptr()];
+            let exts = [
+                ash::khr::pipeline_executable_properties::NAME.as_ptr(),
+                ash::khr::cooperative_matrix::NAME.as_ptr(),
+            ];
             let mut pef = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
+            let mut cmf = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default().shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true);
@@ -77,6 +81,7 @@ mod imp {
                 .queue_create_infos(&qci)
                 .enabled_extension_names(&exts)
                 .push_next(&mut pef)
+                .push_next(&mut cmf)
                 .push_next(&mut f12)
                 .push_next(&mut f11)
                 .push_next(&mut f13);
