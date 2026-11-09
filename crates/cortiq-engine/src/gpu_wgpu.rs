@@ -20489,6 +20489,12 @@ pub struct Ctx {
     /// Bounded scratch for singleton dynamic-tail attention graphs. Held
     /// until readback completes, so independent pipelines cannot alias it.
     attn_batch_scratch: Mutex<Vec<(wgpu::BufferUsages, wgpu::Buffer)>>,
+    /// A prompt's chunk scratch (`forward_batch_graph_at`, k >= 128), call
+    /// by call: the next chunk reuses it; the prompt's last chunk drops it.
+    prompt_scratch: Mutex<Vec<(wgpu::BufferUsages, wgpu::Buffer)>>,
+    /// The batch graph's uniforms by content: immutable, so a chunk in
+    /// flight and the one being encoded share them.
+    unif_cache: Mutex<HashMap<Vec<u32>, wgpu::Buffer>>,
 }
 
 struct EmbryoDeviceModel {
@@ -23619,6 +23625,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_moe: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
         attn_batch_scratch: Mutex::new(Vec::new()),
+        prompt_scratch: Mutex::new(Vec::new()),
+        unif_cache: Mutex::new(HashMap::new()),
     })
 }
 
@@ -35488,13 +35496,23 @@ pub fn forward_batch_graph_at(
         cb.insert(key, (b.clone(), fp));
         b
     };
+    // By content (`unif_cache`): a 512-row chunk asked for ~200 of them,
+    // each a fresh device buffer, most the same words as the chunk before.
     let unif = |d: &[u32]| {
-        c.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(d),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
+        let mut m = c.unif_cache.lock().unwrap();
+        if let Some(b) = m.get(d) {
+            return b.clone();
+        }
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        let b = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(d),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        m.insert(d.to_vec(), b.clone());
+        b
     };
     let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
         let e: Vec<_> = bufs
@@ -35516,7 +35534,22 @@ pub fn forward_batch_graph_at(
         && matches!(layers[0].ffn, crate::gpu::GraphFfn::AttentionOnly)
         && crate::gpu::mimo_attention_scratch_enabled()
         && std::env::var("CMF_MIMO_ATTN_POOL").as_deref() != Ok("0");
-    let scratch = std::cell::RefCell::new(pooled.then(|| c.attn_batch_scratch.lock().unwrap()));
+    // A prompt chunk takes the previous chunk's scratch the same way, call
+    // by call (`prompt_scratch`): every chunk minted ~60 device buffers
+    // (~0.4 GB at 512 rows) and the host encode of a Qwen3.5-4B chunk ran
+    // 35-50 ms against ~85 on an RTX A5000. Each is written before it is
+    // read within a chunk (logits and greedy text identical with the pool
+    // off); no kernel sizes itself by `arrayLength`. Dropped at the
+    // prompt's last chunk (`defer` off). `CMF_BATCH_POOL=0` mints them.
+    let pooled_prompt =
+        !pooled && k >= 128 && std::env::var("CMF_BATCH_POOL").as_deref() != Ok("0");
+    let scratch = std::cell::RefCell::new(if pooled {
+        Some(c.attn_batch_scratch.lock().unwrap())
+    } else if pooled_prompt {
+        Some(c.prompt_scratch.lock().unwrap())
+    } else {
+        None
+    });
     let scratch_index = std::cell::Cell::new(0usize);
     let scratch_buffer = |size: u64, usage: wgpu::BufferUsages, label: &'static str| {
         let make = || c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -35752,6 +35785,8 @@ pub fn forward_batch_graph_at(
     // and gdn_step reads its token's row via GdnP.tok.
     let a_bb = rwc(k * gnv);
     let b_bb = rwc(k * gnv);
+    // `gdn_prep_k`'s rows (q|k, k·q, g|beta), made at the first GDN layer.
+    let mut gdn_prep_bufs: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> = None;
     let _gdo_s = rwc(gnv * gdv);
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
@@ -38420,7 +38455,7 @@ pub fn forward_batch_graph_at(
                     ]);
                     let mut pass = begin_pass(&mut enc);
                     // Position-parallel conv + norm (`dense_mv::GDN_PAR_WGSL`)
-                    // outside spec rounds; `CMF_GDN_PAR=0` keeps the loops.
+                    // outside spec rounds; `CMF_GDN_PAR_K=0` keeps the loops.
                     let gpar = dense_mv::gdn(c)
                         .and_then(|g| g.par_k.as_ref())
                         .filter(|_| snap.is_none() && *kk <= 9);
@@ -38571,9 +38606,10 @@ pub fn forward_batch_graph_at(
                     {
                         // The state-free part of every step for all rows at
                         // once (`gdn_prep_k`), then the short-chain scan.
-                        let qk = rwc(k * *nk * 256);
-                        let kqb = rwc(k * *nk);
-                        let gbb = rwc(k * *nv * 2);
+                        // One set for every GDN layer of the chunk.
+                        let (qk, kqb, gbb) = gdn_prep_bufs
+                            .get_or_insert_with(|| (rwc(k * *nk * 256), rwc(k * *nk), rwc(k * *nv * 2)))
+                            .clone();
                         let lp = prep.get_bind_group_layout(0);
                         let bgp = bind_pairs(
                             c,
@@ -39498,6 +39534,13 @@ pub fn forward_batch_graph_at(
             ok
         }
     };
+    // The prompt's last chunk: the pooled scratch goes with it.
+    if !defer && !pooled {
+        match scratch.borrow_mut().as_mut() {
+            Some(g) => g.clear(),
+            None => c.prompt_scratch.lock().unwrap().clear(),
+        }
+    }
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
         let post = t_enc_done.elapsed().as_secs_f64() * 1e3;
         eprintln!(
@@ -43126,9 +43169,11 @@ fn zi_q4_pipe(c: &Ctx) -> Option<(Arc<wgpu::ComputePipeline>, zimage::MmCfg)> {
         return None;
     }
     let base = zi_batch_pipes(c)?.3;
-    // The f32 activation panel read straight too (`MmCfg::a32`): the
-    // `zi_act_f16` pass was 7 of a chunk's ~104 ms. `CMF_ZI_A32=0` keeps it.
-    let a32 = base.dscale && std::env::var("CMF_ZI_A32").as_deref() != Ok("0");
+    // The f32 activation panel read straight (`MmCfg::a32`, `CMF_ZI_A32=1`):
+    // it saved the `zi_act_f16` pass while each GEMM cast its own panel;
+    // with q|k|v and gate|up sharing one cast the f16 panel is ~4 ms of a
+    // 512-row chunk faster (Qwen3.5-4B, RTX A5000), the default.
+    let a32 = base.dscale && std::env::var("CMF_ZI_A32").as_deref() == Ok("1");
     let cfg = zimage::MmCfg { q4: true, a32, ..base };
     if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;

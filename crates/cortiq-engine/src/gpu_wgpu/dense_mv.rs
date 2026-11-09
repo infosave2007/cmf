@@ -1868,7 +1868,7 @@ pub(crate) struct GdnSg {
     pub(crate) scan2: Option<(wgpu::ComputePipeline, wgpu::ComputePipeline, usize)>,
     /// Position-parallel twins of the chunk's conv and gated norm
     /// (`gdn_conv_par` + `gdn_ring_next`, `gdn_norm_rows`): None under
-    /// `CMF_GDN_PAR=0` or on rejection.
+    /// `CMF_GDN_PAR_K=0` or on rejection.
     pub(crate) par_k: Option<GdnPar>,
 }
 
@@ -2279,7 +2279,8 @@ fn gdn_scan2_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     s
 }
 
-/// Positions a `gdn_scan3_k` block stages at once.
+/// Positions a `gdn_scan3_k` block stages at once (8 and 32 measured
+/// the same on the A5000).
 const SCAN3_T: usize = 16;
 
 /// `gdn_scan2_k` with each block of 16 positions staged in workgroup
@@ -2511,7 +2512,7 @@ fn build_gdn(c: &Ctx) -> Option<GdnSg> {
             Some((prep, sc, 128 / parts))
         })
         .flatten();
-    let par_k = (std::env::var("CMF_GDN_PAR").as_deref() != Ok("0"))
+    let par_k = (std::env::var("CMF_GDN_PAR_K").as_deref() != Ok("0"))
         .then(|| {
             Some(GdnPar {
                 conv: compile(c, "cmf-gdn-par", GDN_PAR_WGSL, "gdn_conv_par")?,

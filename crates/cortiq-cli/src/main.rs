@@ -13035,17 +13035,6 @@ async fn cmd_bench(
     let _ = pipeline
         .generate_from_ids(warm_ids, 8, mask.as_ref(), None)
         .map_err(|e| anyhow::anyhow!(e))?;
-    // A prompt the batched graph reads in chunks warms its own kernels too
-    // (the matrix-unit GEMMs, the flash attend, the GDN scan): their first
-    // dispatches cost a 512-row chunk ~250 against ~110 ms on an RTX A5000,
-    // and llama-bench runs a full warmup prompt as well. Untimed, as above.
-    let chunk = pipeline.generation_batch_k();
-    if chunk >= 128 && prompt_ids.len() > chunk && !pipeline.o1_active() && !pipeline.is_far_turbo() {
-        let warm_n = (chunk + chunk / 4).min(prompt_ids.len());
-        let _ = pipeline
-            .generate_from_ids(&prompt_ids[..warm_n], 2, mask.as_ref(), None)
-            .map_err(|e| anyhow::anyhow!(e))?;
-    }
 
     // Prefill benchmark.  Bounded O(1) generation deliberately calibrates
     // only the requested prefix and streams the suffix through its sealed
@@ -13099,6 +13088,38 @@ async fn cmd_bench(
     } else {
         pipeline.measure_pair_fusion(8)
     };
+
+    // A prompt the batched graph reads in chunks warms its own kernels too
+    // (the matrix-unit GEMMs, the flash attend, the GDN scan): their first
+    // dispatches cost a 512-row chunk ~250 against ~110 ms on an RTX A5000.
+    // It also brings the card to its working clock: an RTX A5000 idles at
+    // 330 MHz and needs ~1 s of load to reach 1890, so a timed prompt right
+    // after a short warmup ran its first chunks ~3x slower. llama-bench
+    // warms with the same test before its timed repetitions. Untimed; up to
+    // 8192 tokens, repeated until ~1.5 s of load. Its text shares no first
+    // token with the timed prompt: the same ids left a reusable prefix, and
+    // the timed run then read only the rest. It runs right before the timed
+    // generation: after the pair micro-bench (per-op, token graph off) the
+    // first timed chunk spent ~350 against ~80 ms on the card.
+    let chunk = pipeline.generation_batch_k();
+    if chunk >= 128 && prompt_ids.len() > chunk && !pipeline.o1_active() && !pipeline.is_far_turbo() {
+        let warm_n = prompt_ids.len().min(8192);
+        let mut warm_long = pipeline
+            .tokenizer
+            .encode(&"Pack my box with five dozen liquor jugs. ".repeat(warm_n / 6 + 2));
+        warm_long.truncate(warm_n);
+        if warm_long.first() != prompt_ids.first() {
+            let t_warm = std::time::Instant::now();
+            for _ in 0..4 {
+                let _ = pipeline
+                    .generate_from_ids(&warm_long, 2, mask.as_ref(), None)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                if t_warm.elapsed().as_secs_f64() > 1.5 {
+                    break;
+                }
+            }
+        }
+    }
 
     // Decode benchmark. Steady-state decode speed comes from the
     // inter-token timestamps: generation's own prefill (fused pairs; +
