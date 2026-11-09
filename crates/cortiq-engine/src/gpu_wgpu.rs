@@ -82,6 +82,22 @@ pub(crate) mod blr;
 pub use blr::blr_matmat;
 /// GatedDeltaNet forward and BPTT backward on the device (training).
 pub mod gdn_train;
+
+/// The decode matvec, the prompt flash attention and the prompt GEMM as
+/// `shader_stats` builds them (driver registers and shared memory).
+pub fn debug_hot_sources() -> Vec<(&'static str, String, Vec<&'static str>)> {
+    let f32cfg = zimage::MmCfg { dscale: true, ..zimage::default_cfg(zimage::Epi::F32) };
+    let q4cfg = zimage::MmCfg { q4: true, ..f32cfg };
+    vec![
+        ("mv_sg_r4", dense_mv::MV_SG_R4U2.to_string(), vec!["q4tp_mv_sg"]),
+        ("mv_sg_r2", dense_mv::MV_SG_R2U2.to_string(), vec!["q4tp_mv_sg"]),
+        ("gu_sg_r2", dense_mv::GU_SG_R2U2.to_string(), vec!["q4tp_gu_sg"]),
+        ("pf_flash16", pf_flash::src(), vec!["pf_flash"]),
+        ("pf_flash32", pf_flash::src32(), vec!["pf_flash"]),
+        ("zi_mm_f16", zimage::mm_src(f32cfg), vec!["zi_mm"]),
+        ("zi_mm_q4", zimage::mm_src(q4cfg), vec!["zi_mm"]),
+    ]
+}
 /// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
 pub mod train_ops;
 /// Trainer attention on the matrix units (materialized causal scores).
