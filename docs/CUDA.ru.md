@@ -7,7 +7,7 @@ cortiq работает на GPU через wgpu (Vulkan, DX12, Metal) и чер
 feature сборки, а выбирает переменная окружения.
 
 ```bash
-cargo build --release -p cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda      # или в рабочей копии: cargo build --release -p cortiq-cli --features cuda
 CMF_GPU=cuda cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt "..." --greedy --no-think
 CMF_GPU=cuda cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 4000 --tokens 60 --core
 cortiq gpu        # скажет, на месте ли карта и библиотеки
@@ -188,7 +188,7 @@ Vulkan — cortiq 0.8.66 с `CMF_O1=off` (точное внимание, то, �
 
 Свободные жадные прогоны с точным вниманием на шести промптах от 20 до 20 255 токенов (`CMF_O1=off` для
 самого длинного), по 96 токенов: CUDA и Vulkan дают одни и те же 576 id на каждом файле. Чат из трёх реплик и два запроса к серверу с общим началом (строки K/V
-переиспользуются) дают один и тот же текст на обоих путях. Строки Vulkan — из этой ветки: первый токен
+переиспользуются) дают один и тот же текст на обоих путях. Строки Vulkan — версии 0.8.67: первый токен
 после промпта идёт через голову графа токена, а cortiq 0.8.66 считал его для файла q8_2f гибридной головой
 (0,29 на первом токене).
 

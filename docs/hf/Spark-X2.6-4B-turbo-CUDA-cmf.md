@@ -38,7 +38,7 @@ runs on Metal, Vulkan, DX12 and the CPU.
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch cuda-backend cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/Spark-X2.6-4B-turbo-CUDA-cmf spark-x2.6-4b-q4tp-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
@@ -55,7 +55,7 @@ CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 
 | card | NVIDIA, with its driver (`libcuda.so.1`) |
 | libraries | CUDA 12.x: `libnvrtc.so.12` and `libcublas.so.12` on the loader's path; the CUDA Toolkit installs them |
 | build | stable Rust; no CUDA toolkit at build time, nothing is linked |
-| engine | `cortiq` from the `cuda-backend` branch with the `cuda` feature; the prebuilt release binaries do not include the backend |
+| engine | `cortiq` 0.8.67 or later built with the `cuda` feature; the prebuilt release binaries do not include the backend |
 
 `CMF_MAX_SEQ` lifts the default cap of 32 768 tokens. `cortiq gpu` says whether the card and the libraries
 are there:
@@ -208,7 +208,7 @@ or `exact` (f32; 1788).
 and the far part of the token's attention joins the near rows under one shift. Its state is 18 MB a layer.
 
 The backend is described in
-[docs/CUDA.md](https://github.com/infosave2007/cmf/blob/cuda-backend/docs/CUDA.md), the far field on the
+[docs/CUDA.md](https://github.com/infosave2007/cmf/blob/master/docs/CUDA.md), the far field on the
 [Turbo page](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf).
 
 ## Options
@@ -266,7 +266,7 @@ Vulkan, DX12 и CPU.
 ### Быстрый старт
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch cuda-backend cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/Spark-X2.6-4B-turbo-CUDA-cmf spark-x2.6-4b-q4tp-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
@@ -283,7 +283,7 @@ CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 
 | карта | NVIDIA с драйвером (`libcuda.so.1`) |
 | библиотеки | CUDA 12.x: `libnvrtc.so.12` и `libcublas.so.12` на пути загрузчика; их ставит CUDA Toolkit |
 | сборка | стабильный Rust; toolkit CUDA при сборке не нужен, ничего не линкуется |
-| движок | `cortiq` из ветки `cuda-backend` с feature `cuda`; в готовых бинарниках релизов бэкенда нет |
+| движок | `cortiq` 0.8.67 или новее, собранный с feature `cuda`; в готовых бинарниках релизов бэкенда нет |
 
 `CMF_MAX_SEQ` снимает потолок по умолчанию в 32 768 токенов. `cortiq gpu` говорит, на месте ли карта и
 библиотеки:
@@ -436,7 +436,7 @@ f16 и умножается через cuBLAS на тензорных ядрах
 на слой.
 
 Бэкенд описан в
-[docs/CUDA.ru.md](https://github.com/infosave2007/cmf/blob/cuda-backend/docs/CUDA.ru.md), дальнее поле — на
+[docs/CUDA.ru.md](https://github.com/infosave2007/cmf/blob/master/docs/CUDA.ru.md), дальнее поле — на
 [странице Turbo](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf).
 
 ### Параметры
@@ -492,7 +492,7 @@ Vulkan 为 3789 和 80.2。埋在最长 240 000 字符文本中的密码和编�
 ### 快速开始
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch cuda-backend cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/Spark-X2.6-4B-turbo-CUDA-cmf spark-x2.6-4b-q4tp-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
@@ -509,7 +509,7 @@ CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 
 | 显卡 | NVIDIA 显卡及其驱动（`libcuda.so.1`） |
 | 库 | CUDA 12.x：`libnvrtc.so.12` 和 `libcublas.so.12` 在加载器路径上，由 CUDA Toolkit 安装 |
 | 构建 | 稳定版 Rust；构建时不需要 CUDA toolkit，不链接任何库 |
-| 引擎 | `cuda-backend` 分支的 `cortiq`，打开 `cuda` feature；发布页的预编译二进制不含该后端 |
+| 引擎 | `cortiq` 0.8.67 或更新版本，以 `cuda` feature 构建；发布页的预编译二进制不含该后端 |
 
 `CMF_MAX_SEQ` 解除默认 32 768 词元的上限。`cortiq gpu` 会说明显卡和库是否就位：
 
@@ -648,7 +648,7 @@ NVIDIA A40（46 GB），驱动 595.91，CUDA 12.8 库，Ubuntu 24.04。4 位文�
 偏移下相加。它的状态是每层 18 MB。
 
 后端的说明见
-[docs/CUDA.zh.md](https://github.com/infosave2007/cmf/blob/cuda-backend/docs/CUDA.zh.md)，远场见
+[docs/CUDA.zh.md](https://github.com/infosave2007/cmf/blob/master/docs/CUDA.zh.md)，远场见
 [Turbo 页面](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-cmf)。
 
 ### 选项

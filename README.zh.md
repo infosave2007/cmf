@@ -112,6 +112,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## 面向 NVIDIA 显卡的 CUDA 后端(0.8.67)
+
+在 wgpu 和 Metal 之外新增原生 CUDA 后端，属实验性质，默认关闭：用 `--features cuda` 构建，用 `CMF_GPU=cuda`
+选择。不链接任何库：内核用 CUDA C 编写，首次使用时编译，提示由 cuBLAS 计算。它覆盖 Spark-X2.x 一类的稠密
+注意力堆栈，包括 turbo 文件的远场。4 位的
+[Spark-X2.6-4B Turbo](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-CUDA-cmf) 在 NVIDIA A40 上以
+6096 tok/s 读入 4 000 词元的提示，以 111.5 tok/s 生成（Vulkan 为 3789 和 80.2）；读完 64 000 词元的提示后，
+42.3 秒给出首个词元，以 100.7 tok/s 生成，占显卡 3.9 GB（Vulkan 为 60.3 秒和 85.9 tok/s）：
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve spark-x2.6-4b-q4tp-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+
 ## Ripple-65B Preview:三个文件中的稠密 65B(0.8.60)
 
 [Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) 的四比特(34.6 GB)、二比特(29.2 GB)和八比特(64.8 GB)文件,每个都带 turbo 头:在 NVIDIA A40(46 GB)上,四比特文件从 4 000 到 64 000 个 token 的提示均以 12 tok/s 解码,占 35 到 37 GB。在 RTX PRO 6000 上解码 29.8 tok/s(本版之前为 23.4),八比特文件读取提示 156 tok/s,原来是 43:

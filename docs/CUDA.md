@@ -7,7 +7,7 @@ there is a third way, a native CUDA backend. It is experimental and off by defau
 it on and an environment variable selects it.
 
 ```bash
-cargo build --release -p cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda      # or, in a checkout: cargo build --release -p cortiq-cli --features cuda
 CMF_GPU=cuda cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt "..." --greedy --no-think
 CMF_GPU=cuda cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 4000 --tokens 60 --core
 cortiq gpu        # says whether the card and the libraries are there
@@ -189,7 +189,7 @@ each, every path forced along the same ids, the largest logit difference to the 
 
 Free greedy runs with exact attention on six prompts of 20 to 20 255 tokens (`CMF_O1=off` for the longest),
 96 tokens each: CUDA and Vulkan give the same 576 ids for each file. A chat of three turns and two server requests that share a prefix (its K/V rows reused)
-give the same text on both. The Vulkan rows are this branch's: its first token after a prompt takes the
+give the same text on both. The Vulkan rows are 0.8.67's: its first token after a prompt takes the
 token graph's head, where cortiq 0.8.66 used the hybrid head for a q8_2f file (0.29 at the first token).
 
 The far field has three checks. Its token kernels against `NystromState::step_group` on random states,

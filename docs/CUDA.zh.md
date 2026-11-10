@@ -6,7 +6,7 @@ cortiq 通过 wgpu（Vulkan、DX12、Metal）和自己的 Metal 路径在 GPU �
 原生 CUDA 后端。它是实验性的，默认关闭：由构建 feature 打开，由环境变量选择。
 
 ```bash
-cargo build --release -p cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda      # 或在源码目录中：cargo build --release -p cortiq-cli --features cuda
 CMF_GPU=cuda cortiq run spark-x2.6-4b-q4tp-turbo.cmf --prompt "..." --greedy --no-think
 CMF_GPU=cuda cortiq bench spark-x2.6-4b-q4tp-turbo.cmf --ctx 4000 --tokens 60 --core
 cortiq gpu        # 显卡和库是否就位
@@ -171,7 +171,7 @@ cortiq 0.8.66 加 `CMF_O1=off`（精确注意力，即 CUDA 路径所算的）�
 | q8_2f | Vulkan | 384/384 | 0.014 | 0.015 |
 
 精确注意力下的自由贪心运行，六个 20 到 20 255 词元的提示（最长的一个加 `CMF_O1=off`），各 96 个词元：每个
-文件在 CUDA 和 Vulkan 上给出相同的 576 个 id。三轮对话，以及两次共享前缀的服务器请求（其 K/V 行被复用），在两条路径上文本相同。Vulkan 各行来自本分支：
+文件在 CUDA 和 Vulkan 上给出相同的 576 个 id。三轮对话，以及两次共享前缀的服务器请求（其 K/V 行被复用），在两条路径上文本相同。Vulkan 各行是 0.8.67 的：
 提示之后的首词元走词元图的输出头，而 cortiq 0.8.66 对 q8_2f 文件用的是混合输出头（首词元相差 0.29）。
 
 远场有三项检验。它的词元内核与 `NystromState::step_group` 在随机状态上对比，144 行、环转过一整圈：数值最大
