@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A native CUDA backend for NVIDIA cards, experimental and off by default: build with `--features cuda`, select
+  with `CMF_GPU=cuda` ([docs/CUDA.md](docs/CUDA.md)). It runs dense stacks with full or sliding-window attention
+  (the Spark-X2.x class, q4tp / q8_2f / f32 weights): decode keeps the weights in their codec, the prompt expands
+  them to f16 planes for cuBLAS on the tensor cores. `cudarc` for the driver API, kernels in CUDA C compiled by
+  NVRTC on first use; nothing is linked, and a machine without the libraries falls back to the CPU. Spark-X2.6-4B
+  q4tp on an A40 against the Vulkan path: prompt of 1 000 / 4 000 / 16 000 tokens 6132 / 6096 / 4808 tok/s
+  (3177 / 3789 / 2949), decode 117 / 112 / 93 tok/s (83 / 80 / 54); logits within 0.02 of the host's with float
+  activations, the same greedy ids as Vulkan on six prompts for both files. A turbo file's
+  far field runs on it too: a prompt past the seal is read whole on the card and sealed once, and from there a
+  token reads the far-field state the card keeps (two more kernels a layer; the near rows go through the exact
+  attention's). A 64 000-token prompt: first token in 42.3 s, then 100.7 tok/s in 3.9 GB of the card, against
+  60.3 s and 85.9 tok/s over Vulkan; the kernels against the host's from one seal, logits within 0.0004; facts
+  planted in 240 000 characters found 8 times of 8. `CMF_O1_WHOLE=1` takes the wgpu path the same way. Other
+  architectures are not ported: under `CMF_GPU=cuda` they run on the CPU. `cortiq gpu` reports the card.
+
+### Changed
+- The far field's seal takes a few layers at a time, each on its groups' threads (`CMF_O1_SEAL_PAR=N`; one after
+  another on a Mac): 9 layers of 32 000 rows of Spark-X2.6-4B on 7.65 CPUs seal in 2.7 s instead of 4.1.
+
+### Fixed
+- wgpu: the first token after a prompt of a q8 / q8_2f file came from the hybrid head, whose CPU half works with
+  integer activations, so its logits sat up to 0.30 off the host's with float activations (0.015 at the later
+  tokens) and a near tie could go the other way. The first token now takes the token graph's head pass, as every
+  later token does: 0.014 on Spark-X2.6-4B q8_2f, the same greedy ids as the CUDA path on six prompts, prompt time
+  and memory unchanged. `CMF_HEAD_GRAPH=0` restores the old head.
+
 ## [0.8.66] — 2026-11-10
 
 ### Added
