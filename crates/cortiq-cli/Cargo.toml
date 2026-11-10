@@ -26,6 +26,9 @@ decision-vulkan = ["cortiq-decision/vulkan"]
 # (native Metal on macOS is target-gated in the engine and always in).
 default = ["gpu", "phonon"]
 gpu = ["cortiq-engine/gpu", "decision-vulkan"]
+# The native CUDA backend beside wgpu (NVIDIA; `CMF_GPU=cuda` at run time).
+# Off by default: a build without it is unchanged.
+cuda = ["gpu", "cortiq-engine/cuda"]
 # Self-contained CMF packaging and execution for Gradium Phonon TTS.
 phonon = ["cortiq-engine/phonon"]
 

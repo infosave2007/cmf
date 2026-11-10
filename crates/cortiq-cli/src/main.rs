@@ -6771,6 +6771,10 @@ async fn main() -> anyhow::Result<()> {
             // `gpu_wgpu` is behind the `gpu` feature, and this arm called
             // into it unconditionally — so the CPU-only build the manifest
             // documents (`--no-default-features`) did not compile at all.
+            #[cfg(feature = "cuda")]
+            for line in cortiq_engine::gpu_cuda::report() {
+                println!("  {line}");
+            }
             #[cfg(feature = "gpu")]
             {
                 for line in cortiq_engine::gpu_wgpu::adapter_report() {
@@ -13502,6 +13506,8 @@ async fn cmd_bench(
         cortiq_engine::linear_core::perf_report();
         #[cfg(feature = "gpu")]
         cortiq_engine::gpu_wgpu::perf_report();
+        #[cfg(feature = "cuda")]
+        cortiq_engine::gpu_cuda::perf_report();
         return Ok(());
     }
     println!(
@@ -13533,6 +13539,8 @@ async fn cmd_bench(
     cortiq_engine::linear_core::perf_report();
     #[cfg(feature = "gpu")]
     cortiq_engine::gpu_wgpu::perf_report();
+    #[cfg(feature = "cuda")]
+    cortiq_engine::gpu_cuda::perf_report();
     #[cfg(feature = "gpu")]
     cortiq_engine::dsv4::profile_report();
     cortiq_engine::dsv41::profile_report();

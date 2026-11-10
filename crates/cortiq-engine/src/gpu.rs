@@ -919,6 +919,8 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q8_resident_or_upload(model, idx, may_upload),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     };
     if !resident && may_upload {
         PROBE_UPLOADS.fetch_add(1, Ordering::Relaxed);
@@ -1077,6 +1079,8 @@ pub fn discrete() -> bool {
         #[cfg(target_os = "macos")]
         Backend::Metal => false, // UMA by the init() guard
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => true,
     }
 }
 
@@ -1150,6 +1154,9 @@ enum Backend {
     Metal,
     #[cfg(feature = "gpu")]
     Wgpu,
+    /// The native CUDA backend (`gpu_cuda`, `CMF_GPU=cuda`).
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
 /// The selected backend's name for reports: "metal", "wgpu" or "cpu".
@@ -1160,10 +1167,35 @@ pub fn backend_name() -> String {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => "wgpu".into(),
         Backend::None => "cpu".into(),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => "cuda".into(),
     }
 }
 
 fn backend() -> Backend {
+    // `CMF_GPU=cuda`: the native CUDA backend, or the CPU when it did not
+    // come up — never wgpu behind the user's back.
+    #[cfg(feature = "cuda")]
+    if crate::gpu_cuda::selected() {
+        return if crate::gpu_cuda::enabled() {
+            Backend::Cuda
+        } else {
+            Backend::None
+        };
+    }
+    // Asked for by name in a build that does not carry it: say so once (the
+    // run continues on whatever `CMF_GPU=<anything>` selects here).
+    #[cfg(not(feature = "cuda"))]
+    {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            if std::env::var("CMF_GPU").as_deref() == Ok("cuda") {
+                tracing::warn!(
+                    "CMF_GPU=cuda: this build has no CUDA backend (build with `--features cuda`)"
+                );
+            }
+        });
+    }
     #[cfg(feature = "gpu")]
     if crate::gpu_wgpu::selected() {
         return if crate::gpu_wgpu::enabled() {
@@ -1351,6 +1383,10 @@ pub fn device_count() -> usize {
 /// u64::MAX on unified memory (where the OS pages shared RAM and the
 /// question "does the model fit the card" has no separate answer).
 pub fn vram_budget() -> u64 {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::vram_budget();
+    }
     #[cfg(all(feature = "gpu", not(target_os = "macos")))]
     {
         return crate::gpu_wgpu::device_vram_budget();
@@ -1365,6 +1401,10 @@ pub fn vram_budget() -> u64 {
 /// adapter.  This is the logical device-local weight set; physical driver
 /// allocations are reported separately by the platform tools.
 pub fn resident_bytes() -> u64 {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::resident_bytes();
+    }
     #[cfg(feature = "gpu")]
     {
         if backend() == Backend::Wgpu {
@@ -1382,6 +1422,10 @@ pub fn o1_device_stats(kv_id: u64) -> (usize, u64) {
     {
         if backend() == Backend::Wgpu {
             return crate::gpu_wgpu::o1_device_stats(kv_id);
+        }
+        #[cfg(feature = "cuda")]
+        if backend() == Backend::Cuda {
+            return crate::gpu_cuda::o1_device_stats(kv_id);
         }
     }
     let _ = kv_id;
@@ -1458,6 +1502,11 @@ pub fn wgpu_graph_on(phase: GraphPhase) -> bool {
 /// The batched prefill's whole-run attend is tiled on this device (see
 /// `gpu_wgpu::batched_attend_tiled`); false without the wgpu feature.
 pub fn batched_attend_tiled() -> bool {
+    // The CUDA batch graph attends a whole chunk with two GEMMs a head.
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return true;
+    }
     #[cfg(feature = "gpu")]
     {
         crate::gpu_wgpu::batched_attend_tiled()
@@ -1468,7 +1517,34 @@ pub fn batched_attend_tiled() -> bool {
     }
 }
 
+/// Prompt rows per batched-graph chunk when the CUDA backend runs the
+/// graphs (`CMF_CUDA_BATCH`), None on every other backend.
+pub fn cuda_batch_rows() -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return Some(crate::gpu_cuda::batch_rows());
+    }
+    None
+}
+
+/// The CUDA backend is the one in use.
+pub fn cuda_active() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        backend() == Backend::Cuda
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 pub fn wgpu_graph_default() -> bool {
+    // The CUDA backend serves the same two graph contracts (token, batch).
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return true;
+    }
     #[cfg(feature = "gpu")]
     {
         // Discrete cards always; Apple-silicon UMA on macOS too — desktop
@@ -1508,6 +1584,8 @@ pub fn q8_matvec_range(
             crate::gpu_wgpu::q8_matvec_range(model, idx, row0, row_scale, xs, rows, cols, out)
         }
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -1575,6 +1653,8 @@ pub fn q8_matmat(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -1595,6 +1675,8 @@ pub fn q1_matvec(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -1616,6 +1698,8 @@ pub fn q1g_matvec(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1g_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -2093,6 +2177,34 @@ pub fn forward_token_graph(
             layer_base,
             hidden_too,
         ),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::forward_token_graph(
+            model,
+            kv_id,
+            layers,
+            o1,
+            o1_epoch,
+            invf,
+            h,
+            nh,
+            nkv,
+            hd,
+            attn_scale,
+            rd,
+            hidden,
+            position,
+            cap,
+            gemma,
+            eps,
+            lm_head,
+            final_norm,
+            logits,
+            loop_norm_at,
+            steps,
+            layers_run,
+            layer_base,
+            hidden_too,
+        ),
         #[allow(unused_variables)]
         _ => {
             let _ = (
@@ -2386,6 +2498,11 @@ pub fn forward_batch_graph_at(
             model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions,
             cap, gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run,
         ),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::forward_batch_graph_at(
+            model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap,
+            gemma, eps, attn_scale, k, o1, spec.is_some(), layers_run,
+        ),
         #[allow(unreachable_patterns)]
         _ => {
             let _ = (o1, o1_epoch, spec, layers_run);
@@ -2416,6 +2533,10 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
 /// is the wgpu twin of Metal's existing mirror cursor helper and keeps the
 /// MTP graph's speculative/device cache coherent with its real anchor.
 pub fn graph_kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::kv_set_stored(kv_id, layer, stored);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::kv_mirror_set_stored(kv_id, layer, stored);
@@ -2432,6 +2553,10 @@ pub fn graph_kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
 /// (None: no wgpu mirror). Metal keeps its owner cache current per token
 /// and reports None here.
 pub fn graph_kv_stored(_kv_id: u64, _layer: usize) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::kv_stored(_kv_id, _layer);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::kv_mirror_stored(_kv_id, _layer);
@@ -2458,6 +2583,21 @@ pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
         crate::gpu_wgpu::o1_qcap_begin(_layers);
         return true;
     }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_qcap_begin(_layers);
+    }
+    false
+}
+
+/// Ask the armed capture for one row in `stride` by position, the rows a
+/// seal's trace keeps. True: the drains hand back those rows alone; false:
+/// every row, as before.
+pub fn o1_qcap_stride(_stride: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_qcap_stride(_stride);
+    }
     false
 }
 
@@ -2466,6 +2606,10 @@ pub fn o1_qcap_drain() -> Option<Vec<(usize, Vec<f32>)>> {
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::o1_qcap_drain();
+    }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_qcap_drain();
     }
     None
 }
@@ -2526,6 +2670,10 @@ pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::o1_qcap_take();
     }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_qcap_take();
+    }
     None
 }
 
@@ -2548,6 +2696,10 @@ pub fn graph_kv_read_rows(
     _nkv: usize,
     _hd: usize,
 ) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::kv_read_rows(_kv_id, _reqs, _nkv, _hd);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::kv_mirror_read_rows(_kv_id, _reqs, _nkv, _hd);
@@ -2568,6 +2720,10 @@ pub fn graph_kv_pull_host(
     _nkv: usize,
     _hd: usize,
 ) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::kv_pull_host(_kv_id, _layer, _from, _to, _nkv, _hd);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::kv_mirror_pull_host(_kv_id, _layer, _from, _to, _nkv, _hd);
@@ -2578,6 +2734,10 @@ pub fn graph_kv_pull_host(
 /// The next batch graph call on this thread submits without reading its
 /// rows back (`gpu_wgpu::set_batch_defer`): a prompt chunk nobody reads.
 pub fn set_batch_defer(_on: bool) {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::set_batch_defer(_on);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::set_batch_defer(_on);
@@ -2587,6 +2747,10 @@ pub fn set_batch_defer(_on: bool) {
 /// The prompt length the batch graph sizes its K/V mirrors for
 /// (`gpu_wgpu::set_batch_kv_hint`); 0 clears it.
 pub fn set_batch_kv_hint(_rows: usize) {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::set_batch_kv_hint(_rows);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::set_batch_kv_hint(_rows);
@@ -2604,6 +2768,10 @@ pub fn graph_kv16_note(_kv_id: u64, _allowed: bool) {
 
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.
 pub fn graph_kv_reset(_kv_id: u64) {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::kv_reset(_kv_id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::kv_mirror_reset(_kv_id);
@@ -2634,6 +2802,8 @@ pub fn q1t_matvec(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1t_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -2654,6 +2824,8 @@ pub fn q4b_matvec(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q4b_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -2677,6 +2849,8 @@ pub fn q1t_matmat(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1t_matmat(model, idx, xs, b, rows, cols, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -4874,6 +5048,8 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::moe_block(model, jobs, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 
@@ -4886,6 +5062,8 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::matvec_batch(model, jobs, out),
         Backend::None => false,
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
     }
 }
 

@@ -1011,6 +1011,21 @@ impl LayerKvCache {
     /// Append K/V for one position. `k_new`/`v_new` are
     /// `[num_kv_heads × head_dim]`; heads with `alive[h] == false` are
     /// skipped (their slices stay empty).
+    /// Room for `rows` more rows of plain f32 storage, taken once: a prompt's
+    /// rows coming back from a device mirror otherwise grow each head's
+    /// vectors by doubling, a copy of everything stored so far each time.
+    pub(crate) fn reserve_rows(&mut self, rows: usize) {
+        if self.mode != KvMode::F32 {
+            return;
+        }
+        let n = rows * self.head_dim;
+        for h in 0..self.num_kv_heads {
+            self.k[h].reserve(n);
+            self.v[h].reserve(n);
+        }
+        self.imp.reserve(rows);
+    }
+
     pub fn append(&mut self, k_new: &[f32], v_new: &[f32], alive: &[bool]) {
         // A failed bounded transition is terminal until the sequence is
         // cleared. Do not let an ignored boolean/result resume plain KV

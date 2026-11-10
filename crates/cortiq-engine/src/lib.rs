@@ -31,6 +31,8 @@ pub mod gptq_capture;
 pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod gpu_metal;
+#[cfg(feature = "cuda")]
+pub mod gpu_cuda;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
 /// The wgpu crate the device types of `gpu_wgpu` come from (offline tools
