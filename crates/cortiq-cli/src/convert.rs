@@ -688,6 +688,31 @@ fn minimax_m3_canon(raw: &str) -> Option<String> {
     }
 }
 
+/// Is this source `lm_head.weight` the same dtype, shape and bytes as the
+/// embedding?  The loader serves a tied head from the embedding, so such a
+/// copy only adds dead bytes to the CMF.  An embedding in a shard whose
+/// mapping is already released reads as "not a copy" (the head is written).
+fn head_is_embedding_copy(
+    arch: &ModelArch,
+    head: &TensorMeta,
+    head_file: &SafeTensors,
+    files: &[SafeTensors],
+    towers: MimoTowers,
+) -> bool {
+    let Some(head_bytes) = head_file.try_bytes(head) else {
+        return false;
+    };
+    std::iter::once(head_file).chain(files.iter()).any(|f| {
+        f.tensors.iter().any(|e| {
+            e.dtype == head.dtype
+                && e.shape == head.shape
+                && canon_name_for_arch(arch, &e.name, towers).as_deref()
+                    == Some("model.embed_tokens.weight")
+                && f.try_bytes(e) == Some(head_bytes)
+        })
+    })
+}
+
 /// Prism/Bonsai uses the same text canonical layout as the ordinary Qwen
 /// reader, but its checkpoint wraps the language model one level deeper and
 /// carries a real vision tower.  Keep the generic `canon_name` multimodal
@@ -1049,6 +1074,9 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
+        // A pointer decision head (MNN-Pocket-0.3B-Dec) and its temperature:
+        // the reference keeps them float32.
+        || name.starts_with("decision.pointer.")
         // SenseNova-Loop's mHC routers: the reference keeps them FP32 (a
         // logit, a sigmoid and a 20-step Sinkhorn read every entry).
         || name.ends_with(".mhc_attn.weight")
@@ -4501,6 +4529,12 @@ impl SafeTensors {
         &mmap[self.data_start + m.start..self.data_start + m.end]
     }
 
+    /// `bytes`, or `None` once this shard's mapping has been released.
+    pub(crate) fn try_bytes(&self, m: &TensorMeta) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        mmap.get(self.data_start + m.start..self.data_start + m.end)
+    }
+
     /// Release the file mapping after this source shard's converted payloads
     /// and manifest checkpoint are durable. Metadata stays resident so the
     /// caller can retain the index for companion/name lookups.
@@ -6921,7 +6955,9 @@ fn dflash_geometry(config: &serde_json::Value) -> anyhow::Result<cortiq_engine::
         "DFlash sidecar: only the default rotary positions are implemented"
     );
     anyhow::ensure!(config.get("hidden_act").and_then(|v| v.as_str()) == Some("silu"), "DFlash sidecar: hidden_act must be silu");
-    anyhow::ensure!(config.get("is_causal").and_then(|v| v.as_bool()) == Some(false), "DFlash sidecar: the block must be non-causal");
+    // The block is non-causal by design; SpecForge-trained configs
+    // (MNN-Pocket-0.3B-DFlash2) leave the key out, so only `true` is refused.
+    anyhow::ensure!(config.get("is_causal").and_then(|v| v.as_bool()) != Some(true), "DFlash sidecar: the block must be non-causal");
     anyhow::ensure!(config.get("attention_bias").and_then(|v| v.as_bool()) != Some(true), "DFlash sidecar: attention biases are not implemented");
     let taps = d
         .get("target_layer_ids")
@@ -6962,7 +6998,8 @@ fn dflash_geometry(config: &serde_json::Value) -> anyhow::Result<cortiq_engine::
         kv_heads: int(config, "num_key_value_heads")?,
         head_dim: int(config, "head_dim")?,
         vocab: int(config, "vocab_size")?,
-        block: int(d, "block_size")?,
+        // SpecForge-trained configs state the block size at the top level.
+        block: int(d, "block_size").or_else(|_| int(config, "block_size"))?,
         mask_token: int(d, "mask_token_id")? as u32,
         conv_group: int(d, "conv_group_size")?,
         conv_kernel: int(d, "conv_kernel_size")?,
@@ -7027,6 +7064,10 @@ pub fn write_dflash_sidecar(model_dir: &Path, base_output: &Path, quant: &str) -
         g.vocab
     );
     for name in ["model.embed_tokens.weight", "lm_head.weight"] {
+        // A tied base serves its head from the embedding.
+        if name == "lm_head.weight" && base.tensor(name).is_none() && arch.tie_word_embeddings {
+            continue;
+        }
         let t = base.tensor(name).ok_or_else(|| anyhow::anyhow!("DFlash sidecar: base has no {name}"))?;
         anyhow::ensure!(t.shape == [g.vocab, g.hidden], "DFlash sidecar: base {name} shape {:?}, expected {:?}", t.shape, [g.vocab, g.hidden]);
     }
@@ -10239,6 +10280,15 @@ pub fn run_convert_multi_excluding(
                 && name == "lm_head.weight"
             {
                 tracing::info!("hunyuan_v1_dense: tied lm_head.weight not written (embedding serves)");
+                continue;
+            }
+            // Any other tied checkpoint whose `lm_head.weight` is a byte-for-byte
+            // copy of the embedding (MNN-Pocket) — same dead bytes.
+            if arch.tie_word_embeddings
+                && name == "lm_head.weight"
+                && head_is_embedding_copy(&arch, m, file, files, towers)
+            {
+                tracing::info!("tied lm_head.weight equals the embedding: not written (embedding serves)");
                 continue;
             }
             if arch.qwen4_exp.is_some()
@@ -15590,6 +15640,37 @@ pub(crate) mod tests {
         let model = CmfModel::open(&out).unwrap();
         assert_eq!(model.arch().vocab_size, 32);
         assert_eq!(model.arch().num_layers, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tied_lm_head_copy_of_the_embedding_is_not_written() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cortiq-tiedhead-{}", std::process::id()));
+        let emb: Vec<f32> = (0..32 * 64).map(|k| (k as f32 * 0.01).sin()).collect();
+        let mut other = emb.clone();
+        other[5] += 0.5;
+        for (head, written) in [(emb.clone(), false), (other, true)] {
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("config.json"),
+                r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":128,"vocab_size":32,"rms_norm_eps":0.000001,"tie_word_embeddings":true}"#,
+            )
+            .unwrap();
+            fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+            let st = tiny_safetensors(&[
+                ("model.embed_tokens.weight", vec![32, 64], emb.clone()),
+                ("lm_head.weight", vec![32, 64], head),
+                ("model.norm.weight", vec![64], vec![1.0f32; 64]),
+            ]);
+            fs::write(dir.join("model.safetensors"), &st).unwrap();
+            let out = dir.join("m.cmf");
+            run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, None, None, false, |_| {})
+                .unwrap();
+            let model = CmfModel::open(&out).unwrap();
+            assert_eq!(model.tensor("lm_head.weight").is_some(), written);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

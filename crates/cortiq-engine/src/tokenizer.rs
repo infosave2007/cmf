@@ -1088,6 +1088,42 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// Streaming decode of ONE token that never splits a character. A
+    /// byte-level (or `<0xNN>`) token may end inside a multi-byte UTF-8
+    /// sequence — a CJK character or a subscript digit spread over two
+    /// tokens of a small vocabulary — and decoding it alone gives U+FFFD.
+    /// The incomplete tail waits in `pending` (one per stream) and comes out
+    /// with the token that completes it; invalid bytes still decode lossily.
+    pub fn decode_token_stream(&self, id: u32, pending: &mut Vec<u8>) -> String {
+        if self.special_ids.contains(&id) {
+            return String::new();
+        }
+        if self.added_ids.contains(&id) {
+            pending.extend_from_slice(self.decode_token(id).as_bytes());
+        } else {
+            pending.extend_from_slice(&self.token_bytes(id));
+        }
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                let out = s.to_string();
+                pending.clear();
+                out
+            }
+            // Only an unfinished last character: emit what is complete.
+            Err(e) if e.error_len().is_none() => {
+                let valid = e.valid_up_to();
+                let out = std::str::from_utf8(&pending[..valid]).unwrap_or_default().to_string();
+                pending.drain(..valid);
+                out
+            }
+            Err(_) => {
+                let out = String::from_utf8_lossy(pending).into_owned();
+                pending.clear();
+                out
+            }
+        }
+    }
+
     /// The raw bytes token `id` stands for (an added token: its content), so
     /// a caller can map an encoded text's tokens back to its characters.
     pub fn token_bytes(&self, id: u32) -> Vec<u8> {
@@ -1858,6 +1894,38 @@ mod tests {
                 assert_eq!(fast, slow, "{piece:?}");
             }
         }
+    }
+
+    /// A small byte-level vocabulary splits a CJK character over two tokens
+    /// (MNN-Pocket's 65k vocab: "地" = E5 9C | B0). Streaming must print the
+    /// character once it is complete, never two U+FFFD.
+    #[test]
+    fn streaming_keeps_a_character_split_over_tokens() {
+        let (b2u, _) = bytes_to_unicode();
+        let piece = |bytes: &[u8]| bytes.iter().map(|&b| b2u[b as usize]).collect::<String>();
+        let vocab = serde_json::json!({
+            piece(" ".as_bytes()): 0,
+            piece(&[0xE5, 0x9C]): 1,
+            piece(&[0xB0]): 2,
+            piece("球".as_bytes()): 3,
+        });
+        let json = serde_json::json!({
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
+            "pre_tokenizer": {"type": "ByteLevel"},
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 4, "content": "<|im_end|>", "special": true}],
+        })
+        .to_string();
+        let t = Tokenizer::from_json(&json).unwrap();
+        let ids = [0u32, 1, 2, 3, 4];
+        assert_eq!(t.decode(&ids), " 地球");
+        let mut pending = Vec::new();
+        let pieces: Vec<String> = ids.iter().map(|&i| t.decode_token_stream(i, &mut pending)).collect();
+        assert_eq!(pieces, [" ", "", "地", "球", ""]);
+        assert!(pending.is_empty());
+        // Invalid bytes still come out (lossily) instead of waiting forever.
+        assert_eq!(t.decode_token_stream(2, &mut pending), "\u{FFFD}");
+        assert!(pending.is_empty());
     }
 
     /// MiniCPM5 marks its tool grammar special. Decoding must keep the

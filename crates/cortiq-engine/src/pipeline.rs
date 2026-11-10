@@ -7758,6 +7758,8 @@ impl Pipeline {
             }
         }
 
+        // Bytes of a character the last streamed token left unfinished.
+        let mut utf8_pending: Vec<u8> = Vec::new();
         // Commit one token: push, check EOS, stream. Returns false = stop.
         macro_rules! commit {
             ($id:expr) => {{
@@ -7768,7 +7770,7 @@ impl Pipeline {
                     finish_reason = "stop".to_string();
                     false
                 } else {
-                    let token_text = self.tokenizer.decode_token($id);
+                    let token_text = self.tokenizer.decode_token_stream($id, &mut utf8_pending);
                     let mut go = true;
                     if let Some(ref mut cb) = on_token {
                         if !cb(&token_text) {
