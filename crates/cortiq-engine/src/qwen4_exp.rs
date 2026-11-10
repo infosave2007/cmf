@@ -5297,7 +5297,6 @@ impl PackSet {
 }
 
 /// φ of a routing histogram: the first `layers` layers' winner distributions, unit-normed.
-#[cfg(feature = "gpu")]
 fn route_phi(hist: &[u32], ne: usize, layers: usize) -> Option<Vec<f32>> {
     if hist.len() < layers * ne || layers == 0 {
         return None;
