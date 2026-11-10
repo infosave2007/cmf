@@ -1701,6 +1701,10 @@ struct SoloSpec {
     plain_n: u32,
     round_ms: f32,
     rounds: u32,
+    /// The judging window: the rounds' summed wall and summed tokens (a
+    /// ratio of sums — a mean of per-round ratios misrates a drafter).
+    win_ms: f32,
+    win_tok: u32,
     /// The step in flight: its start, and the tokens it lands (0: a plain one).
     last: Option<(std::time::Instant, usize)>,
     /// The sequence's first round is still to come: it pays the drafter's
@@ -1726,6 +1730,9 @@ const SOLO_K_MOST: usize = 7;
 const SOLO_K_AUTO: usize = 5;
 #[cfg(feature = "gpu")]
 const SOLO_TRIAL: u32 = 6;
+/// The rounds a judging window holds before its first verdict.
+#[cfg(feature = "gpu")]
+const SOLO_JUDGE: u32 = 3;
 #[cfg(feature = "gpu")]
 const SOLO_REST: u32 = 32;
 #[cfg(feature = "gpu")]
@@ -4172,15 +4179,13 @@ impl Pipeline {
             }
             None => {
                 graph.set_dense_concurrent(dense_fast);
-                // Spark-X2.5 q8_2f: the four-row q8_2f matvec decodes the
-                // 1.7B at 40.5 tok/s on the M4 against 27.7 one-row.
-                let q8r4 = if swa_graph {
-                    crate::gpu_metal::DENSE_Q8R4
-                } else {
-                    0
-                };
+                // The four-row q8_2f matvec (same per-row sum order, text
+                // unchanged): in-process A/B on the M4, token time 0.81x on
+                // MiniCPM5-2B, 0.78x on Minico-M1, 0.85x on MNN-Pocket-0.3B;
+                // Spark-X2.5 1.7B 40.5 against 27.7 tok/s. `CMF_Q8_R4=0` closes it.
+                let _ = swa_graph;
                 crate::gpu_metal::MvFastGuard::set_bits(if dense_fast {
-                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE | q8r4
+                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE | crate::gpu_metal::DENSE_Q8R4
                 } else {
                     0
                 })
@@ -6572,7 +6577,7 @@ impl Pipeline {
             std::env::var("CMF_GRAPH_SPEC_K").ok().and_then(|v| v.parse().ok()).filter(|k| (1..=SOLO_K_MOST).contains(k));
         #[cfg(feature = "gpu")]
         let mut solo =
-            SoloSpec { k: solo_pin.unwrap_or(4), rest: 3, back: SOLO_REST, plain_ms: 0.0, plain_n: 0, round_ms: 0.0, rounds: 0, last: None, first: true };
+            SoloSpec { k: solo_pin.unwrap_or(4), rest: 3, back: SOLO_REST, plain_ms: 0.0, plain_n: 0, round_ms: 0.0, rounds: 0, win_ms: 0.0, win_tok: 0, last: None, first: true };
         // The host fused pair is an optimization, not a verifier. On real
         // q4tp Qwen3.5 a near-tied row produced a different greedy argmax
         // from two serial target forwards. That makes a seemingly accepted
@@ -7758,6 +7763,8 @@ impl Pipeline {
             }
         }
 
+        // Bytes of a character the last streamed token left unfinished.
+        let mut utf8_pending: Vec<u8> = Vec::new();
         // Commit one token: push, check EOS, stream. Returns false = stop.
         macro_rules! commit {
             ($id:expr) => {{
@@ -7768,7 +7775,7 @@ impl Pipeline {
                     finish_reason = "stop".to_string();
                     false
                 } else {
-                    let token_text = self.tokenizer.decode_token($id);
+                    let token_text = self.tokenizer.decode_token_stream($id, &mut utf8_pending);
                     let mut go = true;
                     if let Some(ref mut cb) = on_token {
                         if !cb(&token_text) {
@@ -8120,11 +8127,27 @@ impl Pipeline {
                                 solo.round_ms, solo.plain_ms
                             );
                         }
-                        // rounds that land tokens no faster than plain steps sit out, longer each time
-                        if solo_pin.is_none() && solo.plain_ms > 0.0 && solo.rounds >= SOLO_TRIAL && solo.round_ms > solo.plain_ms {
-                            solo.rest = solo.back;
-                            solo.back = (solo.back * 2).min(SOLO_REST_MOST);
-                            solo.rounds = 0;
+                        // Rounds that land tokens no faster than plain steps sit out, longer
+                        // each time. Judged on the window's summed wall over its summed
+                        // tokens from its SOLO_JUDGE-th round on: a short answer was over
+                        // before six rounds at a third kept had sent the drafter to rest
+                        // (MNN-Pocket-0.3B chat: 237 against 303 tok/s plain), and one
+                        // round that kept nothing weighs only its share of the sum.
+                        solo.win_ms += ms;
+                        solo.win_tok += tokens as u32;
+                        if solo_pin.is_none() && solo.plain_ms > 0.0 && solo.rounds >= SOLO_JUDGE {
+                            if solo.win_ms / solo.win_tok.max(1) as f32 > solo.plain_ms {
+                                solo.rest = solo.back;
+                                solo.back = (solo.back * 2).min(SOLO_REST_MOST);
+                                solo.rounds = 0;
+                                solo.win_ms = 0.0;
+                                solo.win_tok = 0;
+                            } else if solo.rounds >= SOLO_TRIAL {
+                                // a winning window starts over, so the verdict follows the text
+                                solo.rounds = 0;
+                                solo.win_ms = 0.0;
+                                solo.win_tok = 0;
+                            }
                         }
                     }
                 }

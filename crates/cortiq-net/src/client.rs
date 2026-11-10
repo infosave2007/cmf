@@ -475,6 +475,8 @@ pub fn generate_split(
     let mut next_pos = input_ids.len();
     // Run-ahead tokens already fetched and not yet committed.
     let mut pending: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    // Bytes of a character the last token left unfinished.
+    let mut utf8_pending: Vec<u8> = Vec::new();
 
     while token_ids.len() < max_tokens {
         // Commit `next` (mirrors generate_from_ids: EOS stops unemitted).
@@ -484,7 +486,7 @@ pub fn generate_split(
             finish_reason = "stop".to_string();
             break;
         }
-        let piece = p.tokenizer.decode_token(next);
+        let piece = p.tokenizer.decode_token_stream(next, &mut utf8_pending);
         text.push_str(&piece);
         if let Some(cb) = on_token.as_mut() {
             if !cb(&piece) {

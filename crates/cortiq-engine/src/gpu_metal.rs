@@ -11332,6 +11332,10 @@ pub const SKIP_AB: u16 = 256;
 /// Decode attend through the split-K kernel from the second position on,
 /// in 32-position blocks (`CMF_METAL_AB` letter k).
 pub const ATT_SMALL: u16 = 512;
+/// The decode attend without the short-context split-K rule
+/// (`short_split_bs`): the per-head / per-key kernels as before
+/// (`CMF_METAL_AB` letter l; `CMF_GQA_SHORT=0` outside the A/B).
+pub const ATT_SHORT_OFF: u16 = 1024;
 
 pub const MOE_PLAN_BITS: u16 = DENSE_Q8R4 | MOE_SEL | MOE_GU;
 
@@ -11453,6 +11457,7 @@ pub fn dense_ab_arm() -> Option<(u16, usize)> {
                     'b' => ATT_BLK,
                     'x' => SKIP_AB,
                     'k' => ATT_SMALL,
+                    'l' => ATT_SHORT_OFF,
                     _ => return None,
                 };
             }
@@ -13086,10 +13091,9 @@ fn encode_q8_matvec(
     gpr: usize,
 ) {
     static R4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Four-row reuse is an opt-in probe: on the fanless M4 it reduced x/col
-    // traffic but the register-pressure/occupancy trade was neutral to slower
-    // across alternating runs. Keep the one-row kernel as the measured default;
-    // a plan opens it per thread (`DENSE_Q8R4`) where it was measured faster.
+    // Four-row reuse: the plain dense plan opens it per thread (`DENSE_Q8R4`;
+    // in-process A/B on the M4, token time 0.78-0.85x from 0.3B to 2B); other
+    // plans keep the one-row kernel. `CMF_Q8_R4=1` forces it everywhere.
     let r4 = col_buf.is_some()
         && (*R4.get_or_init(|| std::env::var("CMF_Q8_R4").as_deref() == Ok("1")) || q8r4_on());
     enc.set_compute_pipeline_state(if r4 {
@@ -22856,7 +22860,46 @@ impl TokenGraph {
             // `gqa_attend_blk` folds only real KV rows.  A learned sink is
             // a value-less extra softmax column, so it must use the normal
             // kernel below, whose denominator includes that column exactly.
+            // Short contexts: the split-K kernel in small blocks spreads the
+            // positions over enough threadgroups to fill the GPU, where the
+            // per-head and per-key kernels run a few long ones (M4, heads
+            // 14/2/64: 6 against 24 us at 64 positions, 11 against 26 at 256,
+            // 17 against 26 at 512; `examples/metal_attend_bench`). Plans that
+            // tuned their own attend (Spark-X2.5's windows, the MoE plan) keep it.
+            let short = short_split_bs(n_pos).filter(|_| {
+                !wide
+                    && !att_small
+                    && self.blk_size.is_none()
+                    && self.blk_from.is_none()
+                    && !moe_bit(ATT_BLK)
+                    && !moe_bit(ATT_SHORT_OFF)
+                    && p.softmax_sink.is_none()
+                    && p.nh / p.nkv <= 8
+                    && std::env::var("CMF_GQA_BLK").is_err()
+                    && std::env::var("CMF_GQA_BLKSZ").is_err()
+            });
             let blk = skip_a
+                || short.is_some_and(|bs| {
+                    encode_gqa_attend_blk_with(
+                        self.c,
+                        enc,
+                        kvk(&self.c.gqablk, &self.c.gqablk_h),
+                        bs,
+                        &qr_b,
+                        &k_mb,
+                        &v_mb,
+                        kv_off,
+                        &ao_b,
+                        p.nh,
+                        p.nkv,
+                        p.hd,
+                        cap,
+                        stored - first,
+                        1,
+                        p.scale,
+                        self.in_conc.get(),
+                    )
+                })
                 || (p.softmax_sink.is_none()
                     && thr > 0
                     && n_pos > thr
@@ -27081,6 +27124,22 @@ fn mirror_cap(need: usize, windowed: bool) -> usize {
 fn gqa_kb_on() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("CMF_GQA_KB").as_deref() != Ok("0"))
+}
+
+/// Block of the decode's split-K attend for a short context: 16 positions up
+/// to 128, 32 up to 384, 64 up to 1 536; None from there on, or with
+/// `CMF_GQA_SHORT=0` (the per-head / per-key kernels as before).
+fn short_split_bs(n_pos: usize) -> Option<usize> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CMF_GQA_SHORT").as_deref() != Ok("0")) || n_pos < 2 {
+        return None;
+    }
+    match n_pos {
+        ..=128 => Some(16),
+        ..=384 => Some(32),
+        ..=1536 => Some(64),
+        _ => None,
+    }
 }
 
 /// Positions past which a token's attend takes `gqa_attend_kb` (`CMF_GQA_KB_MIN`, default 64).

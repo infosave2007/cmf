@@ -42,6 +42,7 @@ mod mossimagepack;
 mod npy;
 #[cfg(feature = "phonon")]
 mod phononpack;
+mod pointer_decision;
 mod nvg;
 mod nvg_linalg;
 mod nvgbench;
@@ -2160,6 +2161,19 @@ enum Commands {
         /// A prompt at least this long goes over to the far field
         #[arg(long, default_value_t = 8192)]
         seal: usize,
+    },
+    /// Typed decisions (choice / noul / score) with a pointer-head decision model
+    /// (MNN-Pocket-0.3B-Dec): a request {"state", "questions"} (or a list of them)
+    /// as JSON in, each question's candidate probabilities as JSON out
+    DecidePointer {
+        /// Path to the decision .cmf (carries `decision.pointer.*`)
+        model: String,
+        /// Request JSON file, or - for stdin
+        #[arg(long)]
+        input: String,
+        /// Softmax temperature instead of the file's calibrated one
+        #[arg(long)]
+        temperature: Option<f64>,
     },
     /// The frozen signal φ of one prompt per line: unit mean hidden state after a
     /// layer, as `f32` rows, for fitting topologies outside the engine
@@ -5474,6 +5488,7 @@ async fn main() -> anyhow::Result<()> {
             skill,
         } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
+        Commands::DecidePointer { model, input, temperature } => pointer_decision::run(&model, &input, temperature),
         Commands::Phi { model, prompts, layer, out } => cmd_phi(&model, &prompts, layer, &out),
         Commands::FarTurbo { input, output, exact_weights, exact_rows, o1, seal } => cmd_far_turbo(&input, &output, exact_weights.as_deref(), exact_rows, &o1, seal),
         Commands::DoryTurbo { input, output, topologies, bias, o1, exact_weights, exact_rows } => {
