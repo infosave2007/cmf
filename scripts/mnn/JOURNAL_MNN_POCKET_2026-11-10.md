@@ -54,3 +54,30 @@ Branch mask (state + own branch, positions continue the state) == a causal pass 
 196 pairs), head + temperature as decision.pointer.* f32. dec_ref.py = authors' inference.py (peft wheel
 in a scratch dir). Parity on 49 questions: f16 49/49, |dp| ≤ 0.001; q8_2f Metal 47/49 (near ties) ≤ 0.04,
 Vulkan 36/36 ≤ 0.05. Time per request of 3 questions: q8_2f 0.21 s M4, 0.31 s pod; f16 1.2 / 1.9 s.
+
+## Metal small-model decode (commit 6d2eeed7)
+Host waits 5.8 of 6.3 ms (CMF_GRAPH_HOSTPROF); GPU 0.2 ms a layer for 9 MB (CMF_METAL_GPUPROF + CMD_TIMES).
+In-process stage elimination (CMF_METAL_AB mcfr/mcfrx + CMF_METAL_SKIP): gate/up 33 %, attend 18 % (~30 us a
+layer at ~250 positions), head 13 % (at the bus), q 8.5 %, o 6.6 %. examples/metal_barrier_bench: a dependent
+dispatch ~3 us on the M4. examples/metal_attend_bench (warm GPU): split-K in blocks of 16/32/64 is 2-4x the
+per-head / per-key kernels up to ~1.5k positions on 14/2/64, 16/2/128, 32/8/128, 8/1/128.
+Levers: DENSE_Q8R4 for every dense plan (A/B 0.85x MNN q8_2f, 0.81x MiniCPM5-2B, 0.78x Minico-M1, 0.88x at 2k)
+and short_split_bs (A/B 0.91x / 0.89x, 0.98x MiniCPM5). Trap: separate runs on the fanless Air drift by
+thermal state (an "old" arm read 199.6 one run, 162 the next) — only CMF_METAL_AB pair medians count.
+Alternating runs on an idle Mac: q8_2f 162 -> 202 tok/s (CPU 154-161), q4tp 214 -> 252 (CPU 179-182).
+Text identical: 16/16 MNN q8_2f and q4tp, 6/6 MiniCPM5-2B, 6/6 Minico-M1.
+Tried and dropped: CMF_GQA_KB_MIN / KB=0 / BLKSZ (worse), ATT_SMALL (per-key, neutral).
+
+## DFlash2 on Vulkan (commit 48b9cb9f), RTX 2000 Ada pod 157.157.221.29:57821
+Round before: draft 7.7 ms on the host (block 3.7, head 2.6), verify 5.7 ms (2 rows) .. 10 ms (8 rows).
+1. dflash_dev: hs % 64, narrow q4 through encode_q4tp_mm_r -> device block; CMF_DFLASH_DEV_CHECK drafts equal host.
+2. batch-ts (CMF_GPU_TS=1 CMF_BATCH_TS=1) of a 6-row verify: gate-up 3.05, attn-core 3.08, down 1.31, qkv 0.95,
+   o 0.81, norm 0.42 ms. queue.submit 0.3 ms, readback wait 7.4 (new SPEC_SUBMIT/WAIT print) — GPU-bound.
+3. examples/q82_batch_bench: q8_2f_matvec_b is ~4x the decode kernel q8_2f_matvec4k even at ONE row (gate 55
+   vs 14 us); rows barely matter. A subgroup-shuffle tree variant was SLOWER (indexed acc array spilled) —
+   reverted; 32 KB-shared r4/b4k variants slower. Unrolled q8_2f_matvec_bu (decode kernel x nb, scalar vec4
+   accumulators, lane-major partials) bit-equal to q8_2f_matvec4k: 6 rows gate 33 / down 22 / q 14.5 us.
+4. Solo controller: summed window wall / tokens from round 3 (SOLO_JUDGE).
+Result q8_2f, plain -> DFlash: Python 318-320 -> 413-434, Chinese code 322-327 -> 318-370, arithmetic 322-326
+-> 299-315, chat 302-312 -> 235-256; text identical every run. q4tp still slower (int8 q4tp verify).
+Next levers: the q4tp batch verify kernels the same way; attn-core of the verify (2.6 ms for 6 rows).

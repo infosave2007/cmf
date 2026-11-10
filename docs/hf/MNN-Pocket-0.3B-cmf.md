@@ -93,18 +93,18 @@ speed after a prompt of that length. Memory: VRAM above idle, or peak RAM, for t
 |---|---|---|---:|---:|---:|---:|---:|---|
 | RTX 2000 Ada (16 GB) | Vulkan | `q8_2f` | 333 | 1.65 s | 292 | 10.5 s | 224 | 0.4–0.7 GB VRAM |
 | RTX 2000 Ada (16 GB) | Vulkan | `q4tp` | 401 | 0.76 s | 342 | 7.0 s | 256 | 0.4–0.6 GB VRAM |
-| MacBook Air M4 (24 GB) | Metal | `q8_2f` | 161 | 0.69 s | 144 | 5.9 s | 101 | 0.7–1.3 GB RAM |
-| MacBook Air M4 (24 GB) | Metal | `q4tp` | 216 | 0.67 s | 183 | 5.7 s | 122 | 0.5–1.2 GB RAM |
+| MacBook Air M4 (24 GB) | Metal | `q8_2f` | 202 | 0.69 s | 144 | 5.9 s | 101 | 0.7–1.3 GB RAM |
+| MacBook Air M4 (24 GB) | Metal | `q4tp` | 252 | 0.67 s | 183 | 5.7 s | 122 | 0.5–1.2 GB RAM |
 | MacBook Air M4 (24 GB) | CPU, 10 cores | `q8_2f` | 178 | 2.1 s | 104 | — | — | 0.6 GB RAM |
 | MacBook Air M4 (24 GB) | CPU, 10 cores | `q4tp` | 191 | 2.0 s | 110 | — | — | 0.5 GB RAM |
 
 `Base-q8_2f`, `SFT-q8_2f` and `Dec-q8_2f` have the layout of `q8_2f` and its speed. The MacBook Air has
 no fan and the base M4's memory bus; an M4 Pro or Max was not measured.
 
-DFlash2 drafts on the RTX 2000 Ada, greedy, four prompts (Python, arithmetic, chat, Chinese code): the
-assistant accepts 94 / 60 / 32 / 73 % of the drafted tokens with `q8_2f` and 81 / 68 / 37 / 73 % with
-`q4tp`, yet on a model this small a round costs more than it saves — 320 → 120–209 tok/s with `q8_2f`,
-383 → 139–243 with `q4tp`. Plain decoding is the faster one in cortiq today.
+DFlash2 drafts on the RTX 2000 Ada with `q8_2f`, greedy, plain → `CMF_DFLASH=1`: Python 320 → 415
+tok/s (88 % of the drafted tokens kept), Chinese code 325 → 318–347, arithmetic 324 → 306–315, chat
+307 → 235–256 (a third kept); the text is the plain decode's in every run. With `q4tp` the drafts do
+not pay yet (its verify runs the four-bit kernels): use them with `q8_2f` for code.
 
 ## Usage
 
@@ -138,8 +138,9 @@ Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus a web d
 CMF_DFLASH=1 cortiq run MNN-Pocket-0.3B-q8_2f.cmf --greedy --prompt "Write a Python function ..."
 ```
 
-The draft proposes a block of 8 tokens in one pass and the assistant checks them in one pass. It runs
-with greedy decoding on Vulkan/DX12; on Metal and the CPU, `CMF_DFLASH=1` has no effect.
+The draft proposes a block of 8 tokens in one pass and the assistant checks them in one pass; rounds
+that do not pay sit out on their own. It runs with greedy decoding on Vulkan/DX12; on Metal and the
+CPU, `CMF_DFLASH=1` has no effect.
 
 ### Decisions
 
@@ -246,18 +247,18 @@ WikiText-2, половина диалогов ассистента.
 |---|---|---|---:|---:|---:|---:|---:|---|
 | RTX 2000 Ada (16 ГБ) | Vulkan | `q8_2f` | 333 | 1,65 с | 292 | 10,5 с | 224 | 0,4–0,7 ГБ VRAM |
 | RTX 2000 Ada (16 ГБ) | Vulkan | `q4tp` | 401 | 0,76 с | 342 | 7,0 с | 256 | 0,4–0,6 ГБ VRAM |
-| MacBook Air M4 (24 ГБ) | Metal | `q8_2f` | 161 | 0,69 с | 144 | 5,9 с | 101 | 0,7–1,3 ГБ RAM |
-| MacBook Air M4 (24 ГБ) | Metal | `q4tp` | 216 | 0,67 с | 183 | 5,7 с | 122 | 0,5–1,2 ГБ RAM |
+| MacBook Air M4 (24 ГБ) | Metal | `q8_2f` | 202 | 0,69 с | 144 | 5,9 с | 101 | 0,7–1,3 ГБ RAM |
+| MacBook Air M4 (24 ГБ) | Metal | `q4tp` | 252 | 0,67 с | 183 | 5,7 с | 122 | 0,5–1,2 ГБ RAM |
 | MacBook Air M4 (24 ГБ) | CPU, 10 ядер | `q8_2f` | 178 | 2,1 с | 104 | — | — | 0,6 ГБ RAM |
 | MacBook Air M4 (24 ГБ) | CPU, 10 ядер | `q4tp` | 191 | 2,0 с | 110 | — | — | 0,5 ГБ RAM |
 
 `Base-q8_2f`, `SFT-q8_2f` и `Dec-q8_2f` устроены как `q8_2f` и работают с той же скоростью. У MacBook Air
 нет вентилятора и шина памяти базового M4; M4 Pro и Max не измерялись.
 
-Драфтер DFlash2 на RTX 2000 Ada, жадная генерация, четыре промпта (Python, арифметика, беседа, код
-по-китайски): ассистент принимает 94 / 60 / 32 / 73 % предложенных токенов с `q8_2f` и 81 / 68 / 37 / 73 % с
-`q4tp`, но на такой маленькой модели раунд стоит дороже, чем экономит: 320 → 120–209 ток/с с `q8_2f`,
-383 → 139–243 с `q4tp`. Сейчас в cortiq быстрее обычная генерация.
+Драфтер DFlash2 на RTX 2000 Ada с `q8_2f`, жадная генерация, обычная → `CMF_DFLASH=1`: Python 320 → 415
+ток/с (принято 88 % предложенных токенов), код по-китайски 325 → 318–347, арифметика 324 → 306–315,
+беседа 307 → 235–256 (принята треть); текст в каждом прогоне совпадает с обычной генерацией. С `q4tp`
+драфтер пока не окупается (его проверка идёт на 4-битных ядрах): включайте его с `q8_2f` для кода.
 
 ### Использование
 
@@ -291,8 +292,9 @@ curl http://localhost:8080/v1/chat/completions \
 CMF_DFLASH=1 cortiq run MNN-Pocket-0.3B-q8_2f.cmf --greedy --prompt "Write a Python function ..."
 ```
 
-Драфтер предлагает блок из 8 токенов за один проход, ассистент проверяет их тоже за один. Работает при
-жадной генерации на Vulkan/DX12; на Metal и CPU `CMF_DFLASH=1` ничего не меняет.
+Драфтер предлагает блок из 8 токенов за один проход, ассистент проверяет их тоже за один; раунды, которые
+не окупаются, сами уходят в паузу. Работает при жадной генерации на Vulkan/DX12; на Metal и CPU
+`CMF_DFLASH=1` ничего не меняет.
 
 #### Решения
 
@@ -375,14 +377,14 @@ cortiq run MNN-Pocket-0.3B-q8_2f.cmf --prompt "用三句话介绍一下杭州。
 |---|---|---|---:|---:|---:|---:|---:|---|
 | RTX 2000 Ada (16 GB) | Vulkan | `q8_2f` | 333 | 1.65 s | 292 | 10.5 s | 224 | 0.4–0.7 GB 显存 |
 | RTX 2000 Ada (16 GB) | Vulkan | `q4tp` | 401 | 0.76 s | 342 | 7.0 s | 256 | 0.4–0.6 GB 显存 |
-| MacBook Air M4 (24 GB) | Metal | `q8_2f` | 161 | 0.69 s | 144 | 5.9 s | 101 | 0.7–1.3 GB 内存 |
-| MacBook Air M4 (24 GB) | Metal | `q4tp` | 216 | 0.67 s | 183 | 5.7 s | 122 | 0.5–1.2 GB 内存 |
+| MacBook Air M4 (24 GB) | Metal | `q8_2f` | 202 | 0.69 s | 144 | 5.9 s | 101 | 0.7–1.3 GB 内存 |
+| MacBook Air M4 (24 GB) | Metal | `q4tp` | 252 | 0.67 s | 183 | 5.7 s | 122 | 0.5–1.2 GB 内存 |
 | MacBook Air M4 (24 GB) | CPU，10 核 | `q8_2f` | 178 | 2.1 s | 104 | — | — | 0.6 GB 内存 |
 | MacBook Air M4 (24 GB) | CPU，10 核 | `q4tp` | 191 | 2.0 s | 110 | — | — | 0.5 GB 内存 |
 
 `Base-q8_2f`、`SFT-q8_2f` 和 `Dec-q8_2f` 与 `q8_2f` 结构相同，速度一致。MacBook Air 无风扇，且为基础款 M4 的内存总线；未测试 M4 Pro 或 Max。
 
-DFlash2 草稿模型在 RTX 2000 Ada 上的表现（贪心解码，四个提示：Python、算术、闲聊、中文代码）：`q8_2f` 接受 94 / 60 / 32 / 73 % 的草稿 token，`q4tp` 接受 81 / 68 / 37 / 73 %；但在这样小的模型上，每轮的开销大于节省：`q8_2f` 从 320 降到 120–209 tok/s，`q4tp` 从 383 降到 139–243。目前在 cortiq 中普通解码更快。
+DFlash2 草稿模型在 RTX 2000 Ada 上配合 `q8_2f`，贪心解码，普通 → `CMF_DFLASH=1`：Python 320 → 415 tok/s（保留 88 % 的草稿 token），中文代码 325 → 318–347，算术 324 → 306–315，闲聊 307 → 235–256（保留约三分之一）；每次运行的文本都与普通解码一致。配合 `q4tp` 时草稿暂不划算（其验证走 4 位内核）：写代码时请与 `q8_2f` 一起使用。
 
 ### 使用
 
@@ -413,7 +415,7 @@ curl http://localhost:8080/v1/chat/completions \
 CMF_DFLASH=1 cortiq run MNN-Pocket-0.3B-q8_2f.cmf --greedy --prompt "Write a Python function ..."
 ```
 
-草稿模型一次前向提出 8 个 token 的块，助手一次前向完成验证。仅在 Vulkan/DX12 的贪心解码下生效；在 Metal 和 CPU 上 `CMF_DFLASH=1` 不起作用。
+草稿模型一次前向提出 8 个 token 的块，助手一次前向完成验证；不划算的轮次会自动暂停。仅在 Vulkan/DX12 的贪心解码下生效；在 Metal 和 CPU 上 `CMF_DFLASH=1` 不起作用。
 
 #### 决策
 
