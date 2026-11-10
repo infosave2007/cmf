@@ -19504,8 +19504,131 @@ fn q82_short_source(rows: usize) -> String {
     format!("{prefix}{body}")
 }
 
+impl GraphX {
+    /// The batched decode-kernel q8_2f matvec for `nb` rows of `cols`
+    /// columns, where it applies (the decode itself on `q8_2f_matvec4k`).
+    pub(crate) fn q82_unr(&self, use_mv4k: bool, cols: usize, nb: usize) -> Option<(&wgpu::ComputePipeline, &wgpu::BindGroupLayout)> {
+        (use_mv4k && cols % 16 == 0 && (1..=8).contains(&nb))
+            .then(|| self.q82_unr.get(nb - 1))
+            .flatten()
+            .map(|(p, l)| (p, l))
+    }
+}
+
+/// The token graph's q8_2f decode kernel (`q8_2f_matvec4k`: four weight rows
+/// a workgroup, the columns split across its four 64-lane sub-blocks) over
+/// exactly `nb` batch rows (1..=8), unrolled: every weight word is read once
+/// for all of them, one vec4 accumulator a batch row as its own variable (an
+/// indexed array of them left the registers), the partials lane-major
+/// (`j·256 + lane`, no bank conflicts). Per batch row the walk, the add order,
+/// the tree and the four-quarter sum are `q8_2f_matvec4k`'s, so a verify or a
+/// draft row is the decode's to the bit. RTX 2000 Ada, six rows of a 0.3B
+/// model: gate 2560 x 896 33 against `q8_2f_matvec_b`'s 53 us, down 22
+/// against 44, the 65 536-row head 0.87 against 1.37 ms
+/// (`examples/q82_batch_bench`). Word-aligned quarters only (cols % 16 == 0).
+fn q82_unr_source(nb: usize) -> String {
+    assert!((1..=8).contains(&nb));
+    let (mut decl, mut body, mut store, mut tree) = (String::new(), String::new(), String::new(), String::new());
+    for j in 0..nb {
+        decl += &format!("        var a{j} = vec4<f32>(0.0);\n");
+        body += &format!(
+            "                let x{j} = qb_x[{j}u * ngrp + i] * cs;\n                a{j} = a{j} + vec4<f32>(dot(wa, x{j}), dot(wb, x{j}), dot(wc, x{j}), dot(wd, x{j}));\n"
+        );
+        store += &format!("        qu_part[{j}u * 256u + lid] = a{j};\n");
+        tree += &format!(
+            "                qu_part[{j}u * 256u + lid] = qu_part[{j}u * 256u + lid] + qu_part[{j}u * 256u + lid + stride];\n"
+        );
+    }
+    let at = ATTEND_X_SRC.find("// y[b·rows + r]").unwrap();
+    let prefix = ATTEND_X_SRC[..at].replace(
+        "var<workgroup> qb_part: array<f32, 2048>;",
+        &format!("var<workgroup> qu_part: array<vec4<f32>, {}>;", 256 * nb),
+    );
+    let kernel = r#"
+@compute @workgroup_size(256)
+fn q8_2f_matvec_bu(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let rows = qb_p.rows;
+    let ngrp = qb_p.cols4;
+    let qbytes = rows * qb_p.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + rows;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let qlen = ngrp / 4u;
+    let kend = sub * qlen + qlen;
+    let blocks = (rows + 3u) / 4u;
+    var blk = wid.x;
+    loop {
+        if (blk >= blocks) { break; }
+        let r0 = blk * 4u;
+        let l1 = r0 + 1u < rows;
+        let l2 = r0 + 2u < rows;
+        let l3 = r0 + 3u < rows;
+DECL        if (r0 < rows) {
+            let w0b = r0 * ngrp;
+            let w1b = select(w0b, (r0 + 1u) * ngrp, l1);
+            let w2b = select(w0b, (r0 + 2u) * ngrp, l2);
+            let w3b = select(w0b, (r0 + 3u) * ngrp, l3);
+            var i = sub * qlen + l;
+            loop {
+                if (i >= kend) { break; }
+                let cs = qb_f16x4(cs0h + i * 4u);
+                let wa = qb_i8x4(qb_w[w0b + i]);
+                let wb = qb_i8x4(qb_w[w1b + i]);
+                let wc = qb_i8x4(qb_w[w2b + i]);
+                let wd = qb_i8x4(qb_w[w3b + i]);
+BODY                i = i + 64u;
+            }
+        }
+STORE        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+TREE            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid < NBu && r0 < rows) {
+            let j = lid;
+            let t = ((qu_part[j * 256u] + qu_part[j * 256u + 64u]) + qu_part[j * 256u + 128u]) + qu_part[j * 256u + 192u];
+            let rw0 = unpack2x16float(qb_w[rs0 + (r0 >> 1u)]);
+            let rw2 = unpack2x16float(qb_w[rs0 + ((r0 + 2u) >> 1u)]);
+            let o = j * rows + r0;
+            qb_y[o] = t.x * rw0.x;
+            if (l1) { qb_y[o + 1u] = t.y * rw0.y; }
+            if (l2) { qb_y[o + 2u] = t.z * rw2.x; }
+            if (l3) { qb_y[o + 3u] = t.w * rw2.y; }
+        }
+        workgroupBarrier();
+        blk = blk + nwg.x;
+    }
+}
+"#
+    .replace("DECL", &decl)
+    .replace("BODY", &body)
+    .replace("STORE", &store)
+    .replace("TREE", &tree)
+    .replace("NBu", &format!("{nb}u"));
+    format!("{prefix}{kernel}")
+}
+
 #[cfg(test)]
 mod attend_x_shader_tests {
+    #[test]
+    fn unrolled_q82_shaders_validate() {
+        for nb in 1..=8 {
+            let source = super::q82_unr_source(nb);
+            let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            ).validate(&module).unwrap();
+        }
+    }
+
     #[test]
     fn short_q82_shaders_validate() {
         for rows in 1..=4 {
@@ -19571,6 +19694,9 @@ struct GraphX {
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
     q82_short: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// `q8_2f_matvec_bu` for 1..=8 batch rows (`q82_unr_source`); empty with
+    /// `CMF_Q82_UNR=0`.
+    q82_unr: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     // Auto layouts (pipeline-exclusive; each lists only the bindings its
     // entry point reads).
     kv_l: wgpu::BindGroupLayout,
@@ -23216,7 +23342,25 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 let layout = pipe.get_bind_group_layout(0);
                 q82_short.push((pipe, layout));
             }
+            let mut q82_unr = Vec::new();
+            if std::env::var("CMF_Q82_UNR").as_deref() != Ok("0") {
+                for nb in 1..=8 {
+                    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("q82-unr"),
+                        source: wgpu::ShaderSource::Wgsl(q82_unr_source(nb).into()),
+                    });
+                    trace_pipeline("q82-unr");
+                    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("q82-unr"), layout: None, module: &module,
+                        entry_point: Some("q8_2f_matvec_bu"),
+                        compilation_options: pco(), cache: pcache.as_ref(),
+                    });
+                    let layout = pipe.get_bind_group_layout(0);
+                    q82_unr.push((pipe, layout));
+                }
+            }
             let gx = GraphX {
+                q82_unr,
                 q82_short,
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
@@ -36114,9 +36258,10 @@ pub fn forward_batch_graph_at(
                 let short = (k <= 4 && crate::gpu::mimo_q8_short_enabled()
                     && std::env::var("CMF_Q82_SHORT").as_deref() != Ok("0"))
                     .then(|| &gx.q82_short[k - 1]);
-                let (pipe, layout, width) = match short {
-                    Some((p, l)) => (p, l, k as u32),
-                    None => (&gx.q82_b, &gx.q82_l, 8),
+                let (pipe, layout, width) = match (short, gx.q82_unr(c.use_q82_mv4k, cols, k)) {
+                    (Some((p, l)), _) => (p, l, k as u32),
+                    (None, Some((p, l))) => (p, l, 8),
+                    (None, None) => (&gx.q82_b, &gx.q82_l, 8),
                 };
                 let bind = bind_pairs(c, layout, &[(0, &m.buf), (1, xs), (2, y), (3, &p_buf)]);
                 let mut pass = begin_pass(enc);
@@ -39593,11 +39738,13 @@ pub fn forward_batch_graph_at(
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
         let post = t_enc_done.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "batch-graph: encode {:.1} ms (weights resolve {:.1}, Gemma-4 kernels {:.1}) | gpu+readback {:.1} ms",
+            "batch-graph: encode {:.1} ms (weights resolve {:.1}, Gemma-4 kernels {:.1}) | gpu+readback {:.1} ms (in submit {:.1}, readback wait {:.1})",
             t_bfn.elapsed().as_secs_f64() * 1e3 - post,
             resolve_ms,
             g4p_ms,
             post,
+            SPEC_SUBMIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+            SPEC_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
         );
     }
     if ok {
@@ -48931,9 +49078,24 @@ fn note_submit(c: &Ctx) {
     }
 }
 
+/// `CMF_GRAPH_SPEC_TIME`: host time inside `queue.submit` and in the wait for
+/// a readback since the last batch-graph line (ns), printed by it.
+static SPEC_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPEC_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn spec_time_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GRAPH_SPEC_TIME").is_ok())
+}
+
 #[inline]
 fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
     note_submit(c);
+    if spec_time_on() {
+        let t = std::time::Instant::now();
+        c.queue.submit(Some(buf));
+        SPEC_SUBMIT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     if train_prof::on() {
         // trainer profiler: time the host spends inside queue.submit
         let t = std::time::Instant::now();
@@ -51966,6 +52128,7 @@ fn readback2(
     flush_pass(&enc);
     enc.copy_buffer_to_buffer(b_buf, 0, &stage, off, b_bytes);
     submit(c, finish_enc(enc));
+    let t_wait = std::time::Instant::now();
     let slice = stage.slice(..off + b_bytes);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -51991,6 +52154,9 @@ fn readback2(
     } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         stage.unmap();
         return false;
+    }
+    if spec_time_on() {
+        SPEC_WAIT_NS.fetch_add(t_wait.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     {
         let Ok(data) = slice.get_mapped_range() else {

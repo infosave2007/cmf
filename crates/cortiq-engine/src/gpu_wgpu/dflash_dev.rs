@@ -423,7 +423,7 @@ impl Dev {
     /// Build the block's device state for a sidecar, or say why not.
     pub fn new(model: Arc<CmfModel>, spec: Spec) -> Result<Self, String> {
         let c = super::ctx().ok_or("no wgpu context")?;
-        if spec.hd > 128 || spec.hd % 4 != 0 || spec.nh % spec.kv != 0 || spec.nh / spec.kv > 16 || spec.hs % 256 != 0 {
+        if spec.hd > 128 || spec.hd % 4 != 0 || spec.nh % spec.kv != 0 || spec.nh / spec.kv > 16 || spec.hs % 64 != 0 {
             return Err(format!("geometry (hd {}, heads {}/{}, hidden {}) outside the kernels' range", spec.hd, spec.nh, spec.kv, spec.hs));
         }
         if c.graph_x.is_none() {
@@ -606,7 +606,7 @@ impl Dev {
         let Some(w) = self.weight(c, model, idx) else { return false };
         let b = self.rows;
         let gpr = cols / 32;
-        if cols % 32 != 0 || gpr <= 64 {
+        if cols % 32 != 0 {
             return false;
         }
         // CMF_DFLASH_DEV_MM: `i8` (default) runs the eight-row int8 matvec
@@ -627,6 +627,11 @@ impl Dev {
                 }
             }
             _ => {}
+        }
+        // Narrow matrices (a 0.3B drafter's 896 columns) are below the int8
+        // kernel's split: the exact 64x64 tile GEMM, the weight read once.
+        if gpr <= 64 {
+            return super::dense_batch::encode_q4tp_mm_r(c, enc, &w, xs, y, rows, cols, b);
         }
         let mut done = 0;
         while done < b {
@@ -726,13 +731,15 @@ impl Dev {
         } else {
             bind_buf_off(1, xs, (x_off * 4) as u64, (nb * cols * 4) as u64)
         };
+        // the decode kernel batched where it applies (each row the decode's to the bit)
+        let (pipe, layout) = gx.q82_unr(c.use_q82_mv4k, cols, nb).unwrap_or((&gx.q82_b, &gx.q82_l));
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &gx.q82_l,
+            layout,
             entries: &[bind_buf(0, &w), xb, bind_buf(2, y), bind_buf(3, &p)],
         });
         let mut pass = begin_pass(enc);
-        pass.set_pipeline(&gx.q82_b);
+        pass.set_pipeline(pipe);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).div_ceil(4).min(MAX_WG), (nb as u32).div_ceil(8), 1);
         true
