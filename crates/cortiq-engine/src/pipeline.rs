@@ -4172,15 +4172,13 @@ impl Pipeline {
             }
             None => {
                 graph.set_dense_concurrent(dense_fast);
-                // Spark-X2.5 q8_2f: the four-row q8_2f matvec decodes the
-                // 1.7B at 40.5 tok/s on the M4 against 27.7 one-row.
-                let q8r4 = if swa_graph {
-                    crate::gpu_metal::DENSE_Q8R4
-                } else {
-                    0
-                };
+                // The four-row q8_2f matvec (same per-row sum order, text
+                // unchanged): in-process A/B on the M4, token time 0.81x on
+                // MiniCPM5-2B, 0.78x on Minico-M1, 0.85x on MNN-Pocket-0.3B;
+                // Spark-X2.5 1.7B 40.5 against 27.7 tok/s. `CMF_Q8_R4=0` closes it.
+                let _ = swa_graph;
                 crate::gpu_metal::MvFastGuard::set_bits(if dense_fast {
-                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE | q8r4
+                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE | crate::gpu_metal::DENSE_Q8R4
                 } else {
                     0
                 })
