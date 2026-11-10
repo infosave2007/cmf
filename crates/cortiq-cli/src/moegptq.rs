@@ -1438,7 +1438,9 @@ impl ExpertSource {
 
     /// Layer `li`'s routed experts `0..ne` as f32 (`g`, `u` `[inter, hidden]`,
     /// `d` `[hidden, inter]`), each handed to `f` in turn.
-    pub(crate) fn routed_layer(&mut self, li: usize, ne: usize, hidden: usize, inter: usize, mut f: impl FnMut(usize, ExpertW) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    /// Layer `li`'s routed experts `ids` (the checkpoint's numbering) as f32, each handed to
+    /// `f` with its slot in `ids` — a `moe-defrag` cut's slot `e` is checkpoint expert `ids[e]`.
+    pub(crate) fn routed_layer(&mut self, li: usize, ids: &[usize], hidden: usize, inter: usize, mut f: impl FnMut(usize, ExpertW) -> anyhow::Result<()>) -> anyhow::Result<()> {
         let names: Vec<String> = QWEN4_ROUTED.iter().map(|p| qwen4_src_name(&self.src, li, p)).collect::<anyhow::Result<_>>()?;
         let shards = self.src.shards_of(&names)?;
         for sh in std::mem::take(&mut self.held) {
@@ -1448,8 +1450,8 @@ impl ExpertSource {
         }
         let layer = self.src.open_layer(&shards)?;
         self.held = shards;
-        for e in 0..ne {
-            f(e, qwen4_expert(&self.src, &layer, li, Part::Routed, e, hidden, inter, 0)?)?;
+        for (e, &src) in ids.iter().enumerate() {
+            f(e, qwen4_expert(&self.src, &layer, li, Part::Routed, src, hidden, inter, 0)?)?;
         }
         Ok(())
     }

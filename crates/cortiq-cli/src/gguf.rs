@@ -7,7 +7,8 @@
 //! non-linear 4-bit codebook, used inside q2_k/q3_k mixes) are handled, and
 //! STQ1_0 (Tencent's sparse-ternary 1.25-bit) is carried over EXACTLY as
 //! `q1t`. Of the grid-codebook types IQ3_S (inside imatrix IQ4_XS mixes) is
-//! handled; IQ1/IQ2 and IQ3_XXS are the only ggml types not yet supported.
+//! handled; IQ3_XXS and IQ2_S (the
+//! Strata/GSQ expert banks) are handled too; IQ1 and IQ2_XXS/IQ2_XS are not.
 //! Qwen Image diffusion-transformer GGUFs use a separate component branch
 //! which preserves source tensor names and stores the official image
 //! transformer config instead of interpreting the file as an LLM.
@@ -56,9 +57,13 @@ const GGML_Q4_K: u32 = 12;
 const GGML_Q5_K: u32 = 13;
 const GGML_Q6_K: u32 = 14;
 const GGML_Q8_K: u32 = 15;
+/// 3.0625 bpw grid codebook (`IQ3XXS_GRID`, gguf_iq.rs).
+const GGML_IQ3_XXS: u32 = 18;
 const GGML_IQ4_NL: u32 = 20;
 /// 3.4375 bpw grid codebook (`IQ3S_GRID`), used in imatrix mixes.
 const GGML_IQ3_S: u32 = 21;
+/// 2.5625 bpw grid codebook (`IQ2S_GRID`, gguf_iq.rs).
+const GGML_IQ2_S: u32 = 22;
 const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
 /// Sparse ternary, 1.3125 bpw (Tencent AngelSlim "1.25-bit"; llama.cpp
@@ -94,7 +99,7 @@ const KVALUES_IQ4NL: [i8; 16] = [
 
 /// A parsed GGUF metadata value (only the parts we need are typed richly).
 #[derive(Clone)]
-enum Val {
+pub(crate) enum Val {
     U64(u64),
     I64(i64),
     F64(f64),
@@ -107,7 +112,7 @@ enum Val {
 }
 
 impl Val {
-    fn as_u64(&self) -> Option<u64> {
+    pub(crate) fn as_u64(&self) -> Option<u64> {
         match self {
             Val::U64(v) => Some(*v),
             Val::I64(v) => Some(*v as u64),
@@ -122,7 +127,7 @@ impl Val {
             _ => None,
         }
     }
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Val::Str(s) => Some(s),
             _ => None,
@@ -203,14 +208,14 @@ impl<'a> Cursor<'a> {
     }
 }
 
-struct GgufTensor {
-    name: String,
-    dims: Vec<u64>, // ggml order (ne[0] fastest)
-    ggml_type: u32,
-    offset: u64, // relative to data section
+pub(crate) struct GgufTensor {
+    pub(crate) name: String,
+    pub(crate) dims: Vec<u64>, // ggml order (ne[0] fastest)
+    pub(crate) ggml_type: u32,
+    pub(crate) offset: u64, // relative to data section
 }
 
-enum GgufBytes {
+pub(crate) enum GgufBytes {
     Mapped(memmap2::Mmap),
     Header(Vec<u8>),
 }
@@ -225,13 +230,13 @@ impl Deref for GgufBytes {
     }
 }
 
-struct Gguf {
-    md: BTreeMap<String, Val>,
-    tensors: Vec<GgufTensor>,
+pub(crate) struct Gguf {
+    pub(crate) md: BTreeMap<String, Val>,
+    pub(crate) tensors: Vec<GgufTensor>,
     /// The whole file, memory-mapped — a 20 GB+ MoE GGUF must not be
     /// slurped into RAM on a 24 GB machine.
-    bytes: GgufBytes,
-    data_start: usize,
+    pub(crate) bytes: GgufBytes,
+    pub(crate) data_start: usize,
     source_len: usize,
 }
 
@@ -239,7 +244,7 @@ fn align_up(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
 }
 
-fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
+pub(crate) fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
     let file = fs::File::open(path)?;
     // SAFETY: read-only map of a file we just opened.
     let bytes = unsafe { memmap2::Mmap::map(&file)? };
@@ -305,7 +310,7 @@ fn parse_bytes(bytes: GgufBytes, source_len: usize) -> anyhow::Result<Gguf> {
 /// Dequantize `n` elements of a ggml tensor into f32. Every codec below is a
 /// faithful port of ggml's `dequantize_row_*` (ggml-quants.c); output order and
 /// scale packing match byte-for-byte.
-fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
     Ok(match ggml_type {
         GGML_F32 => raw
             .chunks_exact(4)
@@ -332,18 +337,20 @@ fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
         GGML_IQ4_NL => dequant_iq4_nl(raw, n),
         GGML_IQ4_XS => dequant_iq4_xs(raw, n),
         GGML_IQ3_S => dequant_iq3_s(raw, n),
+        GGML_IQ3_XXS => crate::gguf_iq::dequant_iq3_xxs(raw, n),
+        GGML_IQ2_S => crate::gguf_iq::dequant_iq2_s(raw, n),
         GGML_STQ1_0_LEGACY => dequant_stq1_0(raw, n),
         GGML_Q1_0 => dequant_q1_0(raw, n),
         GGML_Q2_0 => dequant_q2_0(raw, n),
         other => anyhow::bail!(
             "ggml tensor type {other} not supported by the native importer (supported: F32, F16, BF16, \
-             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, IQ3_S, Q1_0, Q2_0, STQ1_0; the IQ1/IQ2 and IQ3_XXS grid codebooks are not)"
+             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, Q1_0, Q2_0, STQ1_0; the IQ1 and IQ2_XXS/IQ2_XS grid codebooks are not)"
         ),
     })
 }
 
 /// On-disk byte length of `n` elements for a given ggml type.
-fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
+pub(crate) fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
     let blk = |elems: usize, bytes: usize| n.div_ceil(elems) * bytes;
     Ok(match ggml_type {
         GGML_F32 => n * 4,
@@ -362,6 +369,8 @@ fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
         GGML_IQ4_NL => blk(32, 18),
         GGML_IQ4_XS => blk(256, 136),
         GGML_IQ3_S => blk(256, 110),
+        GGML_IQ3_XXS => blk(256, 98),
+        GGML_IQ2_S => blk(256, 82),
         GGML_STQ1_0_LEGACY => blk(256, 42),
         GGML_Q1_0 => blk(128, 18),
         GGML_Q2_0 => blk(64, 18),
@@ -438,7 +447,7 @@ fn type42_is_stq1_0(g: &Gguf) -> bool {
 
 /// The type as it must be decoded: 42 is either the open-PR sparse ternary or
 /// upstream's Q2_0, and the file's own data extent decides which.
-fn resolve_type(g: &Gguf, ty: u32) -> u32 {
+pub(crate) fn resolve_type(g: &Gguf, ty: u32) -> u32 {
     if ty == GGML_Q2_0 && type42_is_stq1_0(g) {
         GGML_STQ1_0_LEGACY
     } else {
@@ -2309,6 +2318,24 @@ fn run_import_qwen_image_url(
     })
 }
 
+/// A qwen4exp (Qwen3.8-Flash-Next) GGUF → `.cmf`, the header and every
+/// tensor's codec taken from `template` (see `gguf_qwen4`).
+pub fn run_import_gguf_template(
+    gguf: &str,
+    output: &str,
+    template: &str,
+    experts_quant: Option<&str>,
+    alloc: Option<&str>,
+    hf_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = resolve_gguf_source(gguf, hf_token)?;
+    let g = parse(&path)?;
+    let arch = g.md.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    anyhow::ensure!(arch == "qwen4exp", "--template imports qwen4exp GGUFs; '{}' is '{arch}'", path.display());
+    let xq = experts_quant.map(convert::parse_quant).transpose()?;
+    crate::gguf_qwen4::run(g, &path, template, xq, alloc, output)
+}
+
 pub fn run_import_gguf(
     gguf: &str,
     quant: &str,
@@ -2335,6 +2362,13 @@ pub fn run_import_gguf(
         return run_import_qwen_image(&g, &path, gguf, quant, output, progress);
     }
 
+    if g.md.get("general.architecture").and_then(|v| v.as_str()) == Some("qwen4exp") {
+        anyhow::bail!(
+            "'{}' is a qwen4exp (Qwen3.8-Flash-Next) GGUF: its import is template-driven — pass \
+             --template with a Qwen3.8-Flash-Next .cmf (any quantization)",
+            path.display()
+        );
+    }
     let arch = arch_from_md(&g, &g.md, &g.tensors)?;
     let is_llama = arch.arch_name == "llama";
     let is_q35 = arch.arch_name == "qwen3_5_moe" || arch.arch_name == "qwen3_5";
@@ -2703,7 +2737,7 @@ pub fn run_import_gguf(
 /// llama.cpp stores qwen35moe V-head-indexed blocks in "tiled" order
 /// (v-within-group major: block v·nk + g); the HF layout the engine
 /// runs is grouped by K head (block g·r + v). Pure block permutation.
-fn v_head_untile(vals: &mut [f32], nblk: usize, blk: usize, nk: usize) {
+pub(crate) fn v_head_untile(vals: &mut [f32], nblk: usize, blk: usize, nk: usize) {
     if nk == 0 || nblk % nk != 0 || vals.len() != nblk * blk {
         return;
     }
@@ -2720,7 +2754,7 @@ fn v_head_untile(vals: &mut [f32], nblk: usize, blk: usize, nk: usize) {
 
 /// The same untile applied to COLUMN blocks of every row (out_proj's
 /// input dimension is V-head-indexed).
-fn v_head_untile_cols(vals: &mut [f32], rows: usize, nblk: usize, blk: usize, nk: usize) {
+pub(crate) fn v_head_untile_cols(vals: &mut [f32], rows: usize, nblk: usize, blk: usize, nk: usize) {
     if nk == 0 || nblk % nk != 0 || vals.len() != rows * nblk * blk {
         return;
     }

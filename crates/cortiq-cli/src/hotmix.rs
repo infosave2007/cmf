@@ -411,7 +411,7 @@ pub(crate) fn zero_tiled_rows(dtype: TensorDtype, bytes: &mut [u8], rows_n: usiz
 
 /// `cortiq hot-bake --experts`.
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: &str, frac: f64, pick_mode: &str, readout: bool, seed: u64, bf16_down: bool, shared_q8: bool, whole: usize, scratch: Option<&str>) -> anyhow::Result<()> {
+pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: &str, frac: f64, pick_mode: &str, readout: bool, seed: u64, bf16_down: bool, shared_q8: bool, whole: usize, scratch: Option<&str>, defrag_stats: Option<&str>) -> anyhow::Result<()> {
     ensure!(!crate::tube::paths_collide(Path::new(output), Path::new(cold_path)), "hot-bake: the output must differ from the input");
     ensure!(matches!(pick_mode, "top" | "err" | "random"), "--pick must be top, err or random");
     let cold = Arc::new(CmfModel::open_sharded(cold_path)?);
@@ -436,6 +436,16 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
             ensure!(t.shape.as_slice() == [inter, hidden], "hot-bake: {} is {:?}", t.name, t.shape);
         }
         ensure!(cold.tensor(&name(li, 0, "gate", true)).is_none(), "hot-bake: layer {li} already has expert tubes");
+    }
+    // A `moe-defrag` cut numbers its experts afresh while the checkpoint keeps the original
+    // numbering: slot `e` of a cut layer is checkpoint expert `src_ids[li][e]`.
+    let src_ids = crate::moedefrag::kept_ids_of(&cold, defrag_stats).context("hot-bake")?;
+    if let Some(m) = &src_ids {
+        for &li in &layers {
+            let ids = m.get(&li).with_context(|| format!("hot-bake: the cut lists no source experts for layer {li}"))?;
+            ensure!(ids.len() == ne, "hot-bake: layer {li} lists {} source experts for {ne} slots", ids.len());
+        }
+        eprintln!("hot-bake: a moe-defrag cut; its {ne} experts a layer are read from the checkpoint by their source numbers");
     }
     let scratch_dir = scratch.map(str::to_string).unwrap_or_else(|| format!("{output}.src"));
     let mut source = crate::moegptq::ExpertSource::open(hf, &scratch_dir)?;
@@ -528,7 +538,8 @@ pub fn cmd_hot_bake_experts(cold_path: &str, hf: &str, stat_path: &str, output: 
                 covered += if total > 0.0 { idx.iter().map(|&e| en[e]).sum::<f64>() / total } else { 0.0 };
                 idx
             });
-            source.routed_layer(li, ne, hidden, inter, |e, x| {
+            let ids: Vec<usize> = src_ids.as_ref().map_or_else(|| (0..ne).collect(), |m| m[&li].clone());
+            source.routed_layer(li, &ids, hidden, inter, |e, x| {
                 if let Some(ch) = &chosen {
                     if ch.binary_search(&e).is_err() {
                         return Ok(());

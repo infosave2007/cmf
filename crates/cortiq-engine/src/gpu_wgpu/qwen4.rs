@@ -1552,6 +1552,159 @@ fn q4t_topk(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The indexer's block scores with a lane per block (`q4t_ix_scores` spends a
+// 256-lane workgroup per block on its four heads): the token's index queries in
+// workgroup memory, every lane one block's dots. nh·hd <= 1024.
+var<workgroup> ix3_q: array<f32, 1024>;
+@compute @workgroup_size(256)
+fn q4t_ix_scores_l(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let t = wid.y;
+    let hd = ix2_p.hd;
+    let nh = ix2_p.nh;
+    for (var i = lid; i < nh * hd; i = i + 256u) { ix3_q[i] = ix2_q[t * ix2_p.qs + i]; }
+    workgroupBarrier();
+    let blk = wid.x * 256u + lid;
+    if (blk >= ix2_tab[t].y) { return; }
+    let kb = blk * hd;
+    var acc = 0.0;
+    for (var h = 0u; h < nh; h = h + 1u) {
+        var d = 0.0;
+        let qb = h * hd;
+        for (var i = 0u; i < hd; i = i + 4u) {
+            let kv = vec4<f32>(ix2_kv[kb + i], ix2_kv[kb + i + 1u], ix2_kv[kb + i + 2u], ix2_kv[kb + i + 3u]);
+            let qv = vec4<f32>(ix3_q[qb + i], ix3_q[qb + i + 1u], ix3_q[qb + i + 2u], ix3_q[qb + i + 3u]);
+            d = d + dot(kv, qv);
+        }
+        acc = acc + max(d, 0.0) * ix2_w[h];
+    }
+    ix2_out[t * ix2_p.os + blk] = acc;
+}
+
+// Top-k of a token's block scores for any count (`q4t_topk` ranks every block
+// against every other and keeps a 4096-entry table): the k-th largest score by
+// a 32-step radix search on the (non-negative) score bits, ties to the lower
+// index, the kept blocks written in index order. Same set as `q4t_topk`.
+var<workgroup> tk3_acc: atomic<u32>;
+var<workgroup> tk3_tot: u32;
+var<workgroup> tk3_hdr: vec2<u32>;
+var<workgroup> tk3_sa: array<u32, 1024>;
+var<workgroup> tk3_sb: array<u32, 1024>;
+var<workgroup> tk3_h: array<atomic<u32>, 256>;
+var<workgroup> tk3_hs: array<u32, 256>;
+var<workgroup> tk3_sel: vec2<u32>;
+fn tk3_key(v: f32) -> u32 { return select(bitcast<u32>(v), 0u, v <= 0.0); }
+// workgroup-wide sum of `c`, uniform
+fn tk3_sum(c: u32, lid: u32) -> u32 {
+    if (lid == 0u) { atomicStore(&tk3_acc, 0u); }
+    workgroupBarrier();
+    atomicAdd(&tk3_acc, c);
+    workgroupBarrier();
+    if (lid == 0u) { tk3_tot = atomicLoad(&tk3_acc); }
+    return workgroupUniformLoad(&tk3_tot);
+}
+@compute @workgroup_size(1024)
+fn q4t_topk_r(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let t = wid.x;
+    if (lid == 0u) { tk3_hdr = vec2<u32>(tk2_tab[t].y, tk2_tab[t].z); }
+    let hdr = workgroupUniformLoad(&tk3_hdr);
+    let n = hdr.x;
+    let k = hdr.y;
+    let s0 = t * tk2_p.ss;
+    let p0 = t * tk2_p.ps;
+    let per = (n + 1023u) / 1024u;
+    let lo = min(n, lid * per);
+    let hi = min(n, lo + per);
+    // every block kept (k >= n, up to top_k·ratio positions): index order, as below
+    if (k >= n) {
+        for (var i = lo; i < hi; i = i + 1u) { tk2_idx[p0 + i] = i; }
+        if (lid == 0u) { tk2_cnt[t * tk2_p.cs] = n; }
+        return;
+    }
+    // the k-th largest key, eight bits a pass: a 256-bin histogram of the keys
+    // that match the digits found so far, then the digit whose suffix count
+    // first reaches what is still needed (the same value the bitwise search
+    // finds: the largest thr with count(key >= thr) >= k)
+    var thr = 0u;
+    var kk = k;
+    for (var d = 0u; d < 4u; d = d + 1u) {
+        let sh = 24u - 8u * d;
+        let hm = select(0xFFFFFFFFu << (sh + 8u), 0u, d == 0u);
+        if (lid < 256u) { atomicStore(&tk3_h[lid], 0u); }
+        workgroupBarrier();
+        for (var i = lo; i < hi; i = i + 1u) {
+            let key = tk3_key(tk2_s[s0 + i]);
+            if ((key & hm) == thr) { atomicAdd(&tk3_h[(key >> sh) & 255u], 1u); }
+        }
+        workgroupBarrier();
+        if (lid < 256u) { tk3_hs[lid] = atomicLoad(&tk3_h[lid]); }
+        workgroupBarrier();
+        for (var o = 1u; o < 256u; o = o << 1u) {
+            var v = 0u;
+            if (lid < 256u) {
+                v = tk3_hs[lid];
+                if (lid + o < 256u) { v = v + tk3_hs[lid + o]; }
+            }
+            workgroupBarrier();
+            if (lid < 256u) { tk3_hs[lid] = v; }
+            workgroupBarrier();
+        }
+        if (lid < 256u) {
+            var above = 0u;
+            if (lid < 255u) { above = tk3_hs[lid + 1u]; }
+            if (above < kk && kk <= tk3_hs[lid]) { tk3_sel = vec2<u32>(lid, kk - above); }
+        }
+        let sel = workgroupUniformLoad(&tk3_sel);
+        thr = thr | (sel.x << sh);
+        kk = sel.y;
+    }
+    // keep everything when k >= n
+    if (k >= n) { thr = 0u; }
+    var gt = 0u;
+    var eq = 0u;
+    for (var i = lo; i < hi; i = i + 1u) {
+        let key = tk3_key(tk2_s[s0 + i]);
+        if (key > thr) { gt = gt + 1u; } else if (key == thr) { eq = eq + 1u; }
+    }
+    if (k >= n) { gt = gt + eq; eq = 0u; }
+    let gt_all = tk3_sum(gt, lid);
+    let need = select(0u, k - gt_all, k > gt_all);
+    // exclusive prefix of the ties, then of what each lane keeps
+    tk3_sa[lid] = eq;
+    workgroupBarrier();
+    for (var o = 1u; o < 1024u; o = o << 1u) {
+        var v = tk3_sa[lid];
+        if (lid >= o) { v = v + tk3_sa[lid - o]; }
+        workgroupBarrier();
+        tk3_sa[lid] = v;
+        workgroupBarrier();
+    }
+    let eq_before = tk3_sa[lid] - eq;
+    let take = min(eq, select(0u, need - eq_before, need > eq_before));
+    tk3_sb[lid] = gt + take;
+    workgroupBarrier();
+    for (var o = 1u; o < 1024u; o = o << 1u) {
+        var v = tk3_sb[lid];
+        if (lid >= o) { v = v + tk3_sb[lid - o]; }
+        workgroupBarrier();
+        tk3_sb[lid] = v;
+        workgroupBarrier();
+    }
+    var out = tk3_sb[lid] - (gt + take);
+    var taken = 0u;
+    for (var i = lo; i < hi; i = i + 1u) {
+        let key = tk3_key(tk2_s[s0 + i]);
+        var keep = key > thr || k >= n;
+        if (!keep && key == thr && taken < take) { keep = true; taken = taken + 1u; }
+        if (keep) {
+            tk2_idx[p0 + out] = i;
+            out = out + 1u;
+        }
+    }
+    if (lid == 1023u) { tk2_cnt[t * tk2_p.cs] = tk3_sb[1023]; }
+}
+
 // Every token's attended-position list: kept blocks, then its open tail.
 struct TibP { cr: u32, ps: u32, is: u32, _a: u32 };
 @group(0) @binding(0) var<storage, read>       ib2_pick : array<u32>;
@@ -1655,6 +1808,374 @@ fn q4t_attend(@builtin(workgroup_id) wid: vec3<u32>,
         qa2_out[t * qa2_p.os + h * hd + k] = acc * inv * (1.0 / (1.0 + exp(-g)));
         k = k + 256u;
     }
+}
+
+// Split-key grouped attention (flash decoding): one workgroup per (KV head, chunk of
+// `ch` attended keys, token). The GQA group's `groups` query heads share every K/V row
+// the workgroup reads (the per-head kernel above reads each one `groups` times, one
+// workgroup a head walking all `m` keys alone). Each workgroup leaves its chunk's
+// running max, exp-sum and exp-weighted V rows; `q4t_attend_cmb` folds the chunks of a
+// head and applies the output gate. Limits: groups <= 16, ch <= 32, hd <= 256.
+struct TspP { nh: u32, hd: u32, scale: f32, groups: u32, cap: u32, qs: u32, is: u32, ch: u32,
+              nsp: u32, ps: u32, _a: u32, _b: u32, _c: u32, _d: u32, _e: u32, _f: u32 };
+@group(0) @binding(0) var<storage, read>       sp_q   : array<f32>;
+@group(0) @binding(1) var<storage, read>       sp_k   : array<f32>;
+@group(0) @binding(2) var<storage, read>       sp_v   : array<f32>;
+@group(0) @binding(3) var<storage, read>       sp_idx : array<u32>;
+@group(0) @binding(4) var<storage, read>       sp_tab : array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read_write> sp_o   : array<f32>;
+@group(0) @binding(6) var<storage, read_write> sp_ml  : array<vec2<f32>>;
+@group(0) @binding(7) var<uniform>             sp_p   : TspP;
+var<workgroup> sp_qs: array<f32, 4096>;   // [g][d] the group's queries
+var<workgroup> sp_sc: array<f32, 512>;    // [g][j] scores, then weights
+var<workgroup> sp_kp: array<u32, 32>;     // the chunk's key positions
+var<workgroup> sp_mx: array<f32, 16>;
+@compute @workgroup_size(256)
+fn q4t_attend_sp(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let kvh = wid.x;
+    let s = wid.y;
+    let t = wid.z;
+    let hd = sp_p.hd;
+    let gq = sp_p.groups;
+    let ch = sp_p.ch;
+    let m = sp_tab[t].w;
+    let j0 = s * ch;
+    let n = select(0u, min(ch, m - j0), j0 < m);
+    let h0 = kvh * gq;
+    // partial slot of (token, chunk, head)
+    let pbase = (t * sp_p.nsp + s) * sp_p.nh;
+    if (n == 0u) {
+        if (lid < gq) { sp_ml[pbase + h0 + lid] = vec2<f32>(-3.0e38, 0.0); }
+        return;
+    }
+    for (var i = lid; i < gq * hd; i = i + 256u) {
+        let g = i / hd;
+        let d = i - g * hd;
+        sp_qs[i] = sp_q[t * sp_p.qs + (h0 + g) * hd + d];
+    }
+    // every block kept (kept == complete): the list is 0..m, as q4t_idx_build
+    // would have written it from the radix top-k's index-ordered picks
+    let every = sp_tab[t].z == sp_tab[t].y;
+    if (lid < n) {
+        if (every) { sp_kp[lid] = j0 + lid; } else { sp_kp[lid] = sp_idx[t * sp_p.is + j0 + lid]; }
+    }
+    workgroupBarrier();
+    let kbase = kvh * sp_p.cap * hd;
+    // scores: lane -> (key j, heads g, g + 256/ch, ...)
+    let j = lid % ch;
+    let gl = lid / ch;
+    let gstep = 256u / ch;
+    if (j < n) {
+        let kb = kbase + sp_kp[j] * hd;
+        for (var g = gl; g < gq; g = g + gstep) {
+            var d0 = 0.0;
+            let qo = g * hd;
+            for (var d = 0u; d < hd; d = d + 4u) {
+                let kv = vec4<f32>(sp_k[kb + d], sp_k[kb + d + 1u], sp_k[kb + d + 2u], sp_k[kb + d + 3u]);
+                let qv = vec4<f32>(sp_qs[qo + d], sp_qs[qo + d + 1u], sp_qs[qo + d + 2u], sp_qs[qo + d + 3u]);
+                d0 = d0 + dot(kv, qv);
+            }
+            sp_sc[g * ch + j] = d0 * sp_p.scale;
+        }
+    }
+    workgroupBarrier();
+    // per head: the chunk's max, then weights and their sum
+    if (lid < gq) {
+        var mx = -3.0e38;
+        for (var i = 0u; i < n; i = i + 1u) { mx = max(mx, sp_sc[lid * ch + i]); }
+        var den = 0.0;
+        for (var i = 0u; i < n; i = i + 1u) {
+            let w = exp(sp_sc[lid * ch + i] - mx);
+            sp_sc[lid * ch + i] = w;
+            den = den + w;
+        }
+        sp_mx[lid] = mx;
+        sp_ml[pbase + h0 + lid] = vec2<f32>(mx, den);
+    }
+    workgroupBarrier();
+    // exp-weighted V rows: lane -> dimension d, head by head (the chunk's V rows,
+    // 32 x hd floats, stay in L1 across the group's heads; a runtime-indexed
+    // accumulator array would spill)
+    for (var d = lid; d < hd; d = d + 256u) {
+        for (var g = 0u; g < gq; g = g + 1u) {
+            var acc = 0.0;
+            for (var i = 0u; i < n; i = i + 1u) {
+                acc = acc + sp_sc[g * ch + i] * sp_v[kbase + sp_kp[i] * hd + d];
+            }
+            sp_o[(pbase + h0 + g) * sp_p.ps + d] = acc;
+        }
+    }
+}
+
+// `q4t_attend_sp` with coalesced reads: eight lanes a key read its K row as
+// vec4s interleaved over the row (lane sl: vec4s sl, sl+8, …), each against
+// all the group's queries from workgroup memory; the slices' partial dots
+// meet in workgroup memory. The V pass keeps every head's accumulator in
+// registers (a constant-bound loop, unrolled), so each V element is read once.
+// Same bindings, grid, outputs; needs ch == 32, hd % 32 == 0, hd <= 256,
+// groups <= 12 (the host checks).
+@group(0) @binding(1) var<storage, read> sp2_k4 : array<vec4<f32>>;
+var<workgroup> sp2_part: array<f32, 3072>;   // [g][j][slice], g < 12 (Apple's 32 KB)
+@compute @workgroup_size(256)
+fn q4t_attend_sp2(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let kvh = wid.x;
+    let s = wid.y;
+    let t = wid.z;
+    let hd = sp_p.hd;
+    let gq = sp_p.groups;
+    let ch = sp_p.ch;
+    let m = sp_tab[t].w;
+    let j0 = s * ch;
+    let n = select(0u, min(ch, m - j0), j0 < m);
+    let h0 = kvh * gq;
+    let pbase = (t * sp_p.nsp + s) * sp_p.nh;
+    if (n == 0u) {
+        if (lid < gq) { sp_ml[pbase + h0 + lid] = vec2<f32>(-3.0e38, 0.0); }
+        return;
+    }
+    for (var i = lid; i < gq * hd; i = i + 256u) {
+        let g = i / hd;
+        let d = i - g * hd;
+        sp_qs[i] = sp_q[t * sp_p.qs + (h0 + g) * hd + d];
+    }
+    let every = sp_tab[t].z == sp_tab[t].y;
+    if (lid < n) {
+        if (every) { sp_kp[lid] = j0 + lid; } else { sp_kp[lid] = sp_idx[t * sp_p.is + j0 + lid]; }
+    }
+    workgroupBarrier();
+    let kbase = kvh * sp_p.cap * hd;
+    let j = lid >> 3u;
+    let sl = lid & 7u;
+    let nv = hd >> 5u;   // vec4s of a lane's slice
+    if (j < n) {
+        let row4 = (kbase + sp_kp[j] * hd) >> 2u;
+        var kr: array<vec4<f32>, 8>;
+        for (var e = 0u; e < 8u; e = e + 1u) {
+            if (e < nv) { kr[e] = sp2_k4[row4 + sl + 8u * e]; }
+        }
+        for (var g = 0u; g < gq; g = g + 1u) {
+            var acc = 0.0;
+            for (var e = 0u; e < 8u; e = e + 1u) {
+                if (e < nv) {
+                    let qo = g * hd + 4u * (sl + 8u * e);
+                    acc = acc + dot(kr[e], vec4<f32>(sp_qs[qo], sp_qs[qo + 1u], sp_qs[qo + 2u], sp_qs[qo + 3u]));
+                }
+            }
+            sp2_part[(g * 32u + j) * 8u + sl] = acc;
+        }
+    }
+    workgroupBarrier();
+    for (var i = lid; i < gq * 32u; i = i + 256u) {
+        let g = i >> 5u;
+        let jj = i & 31u;
+        if (jj < n) {
+            let o = (g * 32u + jj) * 8u;
+            var v = 0.0;
+            for (var q = 0u; q < 8u; q = q + 1u) { v = v + sp2_part[o + q]; }
+            sp_sc[g * ch + jj] = v * sp_p.scale;
+        }
+    }
+    workgroupBarrier();
+    if (lid < gq) {
+        var mx = -3.0e38;
+        for (var i = 0u; i < n; i = i + 1u) { mx = max(mx, sp_sc[lid * ch + i]); }
+        var den = 0.0;
+        for (var i = 0u; i < n; i = i + 1u) {
+            let w = exp(sp_sc[lid * ch + i] - mx);
+            sp_sc[lid * ch + i] = w;
+            den = den + w;
+        }
+        sp_ml[pbase + h0 + lid] = vec2<f32>(mx, den);
+    }
+    workgroupBarrier();
+    let d = lid;
+    if (d < hd) {
+        var acc: array<f32, 16>;
+        for (var i = 0u; i < n; i = i + 1u) {
+            let v = sp_v[kbase + sp_kp[i] * hd + d];
+            for (var g = 0u; g < 16u; g = g + 1u) {
+                if (g < gq) { acc[g] = acc[g] + sp_sc[g * ch + i] * v; }
+            }
+        }
+        for (var g = 0u; g < 16u; g = g + 1u) {
+            if (g < gq) { sp_o[(pbase + h0 + g) * sp_p.ps + d] = acc[g]; }
+        }
+    }
+}
+
+// Fold the chunks of every (head, token): out = gate(σ) · Σ e^{m_s−M} o_s / Σ e^{m_s−M} l_s.
+struct TcbP { nh: u32, hd: u32, ch: u32, nsp: u32, ps: u32, gs: u32, os: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read>       cb_o    : array<f32>;
+@group(0) @binding(1) var<storage, read>       cb_ml   : array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read>       cb_gate : array<f32>;
+@group(0) @binding(3) var<storage, read>       cb_tab  : array<vec4<u32>>;
+@group(0) @binding(4) var<storage, read_write> cb_out  : array<f32>;
+@group(0) @binding(5) var<uniform>             cb_p    : TcbP;
+var<workgroup> cb_w: array<f32, 128>;
+@compute @workgroup_size(256)
+fn q4t_attend_cmb(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let t = wid.y;
+    if (h >= cb_p.nh) { return; }
+    let m = cb_tab[t].w;
+    let ns = min((m + cb_p.ch - 1u) / cb_p.ch, cb_p.nsp);
+    if (lid == 0u) {
+        var mx = -3.0e38;
+        for (var s = 0u; s < ns; s = s + 1u) { mx = max(mx, cb_ml[(t * cb_p.nsp + s) * cb_p.nh + h].x); }
+        var den = 0.0;
+        for (var s = 0u; s < ns; s = s + 1u) {
+            let ml = cb_ml[(t * cb_p.nsp + s) * cb_p.nh + h];
+            let w = exp(ml.x - mx);
+            cb_w[s] = w;
+            den = den + w * ml.y;
+        }
+        cb_w[127] = 1.0 / max(den, 1.17549435e-38);
+    }
+    workgroupBarrier();
+    let inv = cb_w[127];
+    for (var d = lid; d < cb_p.hd; d = d + 256u) {
+        var acc = 0.0;
+        for (var s = 0u; s < ns; s = s + 1u) {
+            acc = acc + cb_w[s] * cb_o[((t * cb_p.nsp + s) * cb_p.nh + h) * cb_p.ps + d];
+        }
+        let g = cb_gate[t * cb_p.gs + h * cb_p.hd + d];
+        cb_out[t * cb_p.os + h * cb_p.hd + d] = acc * inv * (1.0 / (1.0 + exp(-g)));
+    }
+}
+
+// Prompt frames past eight tokens (resident cut models): the f16 pair kernel as a
+// tiled GEMM. A workgroup holds 64 rows of [A; B] against 16 tokens, 64 columns a
+// step through workgroup memory; the epilogue is `q4t_f16_pair`'s (A rows to ya,
+// SiLU(v·inv) under act & 1; B rows to yb at yb_off, σ under act & 2).
+struct TmmP { cols: u32, rows_a: u32, rows_b: u32, act: u32, inv: f32, yb_off: u32, nt: u32, xs: u32,
+              yas: u32, ybs: u32, kc: u32, ks: u32, _c: u32, _d: u32, _e: u32, _f: u32 };
+@group(0) @binding(0) var<storage, read>       tmm_a  : array<u32>;
+@group(0) @binding(1) var<storage, read>       tmm_b  : array<u32>;
+@group(0) @binding(2) var<storage, read>       tmm_x  : array<f32>;
+@group(0) @binding(3) var<storage, read_write> tmm_ya : array<f32>;
+@group(0) @binding(4) var<storage, read_write> tmm_yb : array<f32>;
+@group(0) @binding(5) var<uniform>             tmm_p  : TmmP;
+// split-K partials [ks][nt][rows_a + rows_b] (wid.z = the column slice), when ks > 1
+@group(0) @binding(6) var<storage, read_write> tmm_part : array<f32>;
+var<workgroup> tmm_ws: array<f32, 4096>;  // [64 rows][64 cols]
+var<workgroup> tmm_xs: array<f32, 1024>;  // [16 tokens][64 cols]
+@compute @workgroup_size(256)
+fn q4t_f16_pair_mm(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let cols = tmm_p.cols;
+    let ra = tmm_p.rows_a;
+    let total = ra + tmm_p.rows_b;
+    let row0 = wid.x * 64u;
+    let t0 = wid.y * 16u;
+    let nt = tmm_p.nt;
+    let r = lid % 64u;
+    let tq = lid / 64u;
+    var acc = vec4<f32>(0.0);
+    let kbeg = wid.z * tmm_p.kc;
+    let kend = min(cols, kbeg + tmm_p.kc);
+    for (var k0 = kbeg; k0 < kend; k0 = k0 + 64u) {
+        // 64 x 64 weights: 2048 f16 pairs, eight a lane
+        for (var i = lid; i < 2048u; i = i + 256u) {
+            let rr = i / 32u;
+            let cc = (i % 32u) * 2u;
+            let row = row0 + rr;
+            let col = k0 + cc;
+            var w2 = vec2<f32>(0.0);
+            if (row < total && col < kend) {
+                if (row < ra) { w2 = unpack2x16float(tmm_a[(row * cols + col) >> 1u]); }
+                else { w2 = unpack2x16float(tmm_b[((row - ra) * cols + col) >> 1u]); }
+            }
+            tmm_ws[rr * 64u + cc] = w2.x;
+            tmm_ws[rr * 64u + cc + 1u] = w2.y;
+        }
+        // 16 tokens x 64 columns of the inputs
+        for (var i = lid; i < 1024u; i = i + 256u) {
+            let tt = i / 64u;
+            let cc = i % 64u;
+            let t = t0 + tt;
+            var xv = 0.0;
+            if (t < nt && k0 + cc < kend) { xv = tmm_x[t * tmm_p.xs + k0 + cc]; }
+            tmm_xs[i] = xv;
+        }
+        workgroupBarrier();
+        let wo = r * 64u;
+        let xo = tq * 4u * 64u;
+        for (var kk = 0u; kk < 64u; kk = kk + 1u) {
+            let w = tmm_ws[wo + kk];
+            acc = acc + w * vec4<f32>(tmm_xs[xo + kk], tmm_xs[xo + 64u + kk],
+                                      tmm_xs[xo + 128u + kk], tmm_xs[xo + 192u + kk]);
+        }
+        workgroupBarrier();
+    }
+    let row = row0 + r;
+    if (row >= total) { return; }
+    if (tmm_p.ks > 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let t = t0 + tq * 4u + j;
+            if (t >= nt) { break; }
+            tmm_part[(wid.z * nt + t) * total + row] = acc[j];
+        }
+        return;
+    }
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        let t = t0 + tq * 4u + j;
+        if (t >= nt) { break; }
+        var v = acc[j];
+        if (row >= ra) {
+            if ((tmm_p.act & 2u) != 0u) { v = 1.0 / (1.0 + exp(-v)); }
+            tmm_yb[t * tmm_p.ybs + tmm_p.yb_off + row - ra] = v;
+        } else {
+            if ((tmm_p.act & 1u) != 0u) { let z = v * tmm_p.inv; v = z / (1.0 + exp(-z)); }
+            tmm_ya[t * tmm_p.yas + row] = v;
+        }
+    }
+}
+
+// The split-K partials of `q4t_f16_pair_mm` summed in slice order, then its epilogue.
+@group(0) @binding(0) var<storage, read>       tps_part : array<f32>;
+@group(0) @binding(1) var<storage, read_write> tps_ya   : array<f32>;
+@group(0) @binding(2) var<storage, read_write> tps_yb   : array<f32>;
+@group(0) @binding(3) var<uniform>             tps_p    : TmmP;
+@compute @workgroup_size(256)
+fn q4t_pair_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let t = gid.y;
+    let ra = tps_p.rows_a;
+    let total = ra + tps_p.rows_b;
+    let nt = tps_p.nt;
+    if (row >= total || t >= nt) { return; }
+    var v = 0.0;
+    for (var z = 0u; z < tps_p.ks; z = z + 1u) { v = v + tps_part[(z * nt + t) * total + row]; }
+    if (row >= ra) {
+        if ((tps_p.act & 2u) != 0u) { v = 1.0 / (1.0 + exp(-v)); }
+        tps_yb[t * tps_p.ybs + tps_p.yb_off + row - ra] = v;
+    } else {
+        if ((tps_p.act & 1u) != 0u) { let z = v * tps_p.inv; v = z / (1.0 + exp(-z)); }
+        tps_ya[t * tps_p.yas + row] = v;
+    }
+}
+
+// The hyper-connection fold of `q4t_hc_upfold` once the up-projection is a GEMM:
+// x[t][d] = inv · Σ_s σ(y[t][s·hidden + d]) · normed[t][s·hidden + d].
+struct TfdP { hc: u32, hidden: u32, nt: u32, inv: f32, ys: u32, ns: u32, os: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read>       tfd_y  : array<f32>;
+@group(0) @binding(1) var<storage, read>       tfd_n  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> tfd_o  : array<f32>;
+@group(0) @binding(3) var<uniform>             tfd_p  : TfdP;
+@compute @workgroup_size(256)
+fn q4t_hc_fold_t(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let t = gid.y;
+    if (d >= tfd_p.hidden || t >= tfd_p.nt) { return; }
+    var a = 0.0;
+    for (var st = 0u; st < tfd_p.hc; st = st + 1u) {
+        let o = st * tfd_p.hidden + d;
+        a = a + (1.0 / (1.0 + exp(-tfd_y[t * tfd_p.ys + o]))) * tfd_n[t * tfd_p.ns + o] * tfd_p.inv;
+    }
+    tfd_o[t * tfd_p.os + d] = a;
 }
 
 // ── Resident experts, four rows a workgroup. The arena kernels put one
@@ -1780,6 +2301,42 @@ var<workgroup> gv_pt: array<vec4<f32>, 64>;
 fn gv_32(seg: u32, o: u32) -> u32 { return gv_w[seg].words[o]; }
 fn gv_16(seg: u32, o: u32) -> u32 { return (gv_32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu; }
 fn gv_8(seg: u32, o: u32) -> u32 { return (gv_32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu; }
+// The banks as 16-byte words (the same bindings 0/1): a 32-column group's
+// nibbles in one load. Declared for the kernels that never touch the u32 views.
+struct GqBank4 { w4: array<vec4<u32>> };
+@group(0) @binding(0) var<storage, read>       gq4_gw : binding_array<GqBank4, 8>;
+@group(0) @binding(1) var<storage, read>       gq4_uw : binding_array<GqBank4, 8>;
+@group(0) @binding(0) var<storage, read>       gv4_w  : binding_array<GqBank4, 8>;
+fn gq4_g32(seg: u32, o: u32) -> u32 { let v = gq4_gw[seg].w4[o >> 2u]; return v[o & 3u]; }
+fn gq4_u32(seg: u32, o: u32) -> u32 { let v = gq4_uw[seg].w4[o >> 2u]; return v[o & 3u]; }
+fn gq4_g8(seg: u32, o: u32) -> u32 { return (gq4_g32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu; }
+fn gq4_u8(seg: u32, o: u32) -> u32 { return (gq4_u32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu; }
+fn gq4_g16(seg: u32, o: u32) -> u32 { return (gq4_g32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn gq4_u16(seg: u32, o: u32) -> u32 { return (gq4_u32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn gq4_gc5(seg: u32, o: u32, shf: u32) -> u32 {
+    var c = gq4_g8(seg, o);
+    if (shf > 3u) { c = c | (gq4_g8(seg, o + 1u) << 8u); }
+    return (c >> shf) & 31u;
+}
+fn gq4_uc5(seg: u32, o: u32, shf: u32) -> u32 {
+    var c = gq4_u8(seg, o);
+    if (shf > 3u) { c = c | (gq4_u8(seg, o + 1u) << 8u); }
+    return (c >> shf) & 31u;
+}
+fn gq4_gpl(seg: u32, par16: u32) -> vec2<f32> {
+    return unpack2x16float(gq4_g16(seg, par16) | (gq4_g16(seg, par16 + 1u) << 16u));
+}
+fn gq4_upl(seg: u32, par16: u32) -> vec2<f32> {
+    return unpack2x16float(gq4_u16(seg, par16) | (gq4_u16(seg, par16 + 1u) << 16u));
+}
+// gq_gd32 of a group already loaded (the same sum order)
+fn gq4_dot(q: vec4<u32>, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>,
+           x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return gv_dot8(q.x, x0, x1) + gv_dot8(q.y, x2, x3) + gv_dot8(q.z, x4, x5) + gv_dot8(q.w, x6, x7);
+}
+fn gv4_32(seg: u32, o: u32) -> u32 { let v = gv4_w[seg].w4[o >> 2u]; return v[o & 3u]; }
+fn gv4_16(seg: u32, o: u32) -> u32 { return (gv4_32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn gv4_8(seg: u32, o: u32) -> u32 { return (gv4_32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu; }
 fn gv_n4(w: u32, sh: u32) -> vec4<f32> {
     return vec4<f32>(f32((w >> sh) & 0xFu), f32((w >> (sh + 4u)) & 0xFu), f32((w >> (sh + 8u)) & 0xFu), f32((w >> (sh + 12u)) & 0xFu))
         - vec4<f32>(8.0);
@@ -1976,6 +2533,371 @@ fn q4_gu_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+
+// q4_gu_q4tp4 with the nibble words read as vec4s (bank offsets 4-word aligned).
+@compute @workgroup_size(64)
+fn q4_gu_q4tp4v(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let slot = wid.y;
+    let batch = wid.z;
+    let bslot = batch * gq_p.slots + slot;
+    let flat = gq_sel[bslot];
+    let seg = flat / gq_p.segment_slots;
+    let local = flat - seg * gq_p.segment_slots;
+    let gpr = gq_p.gpr;
+    let rows = gq_p.inter;
+    let base16 = local * gq_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let par0 = base16 + rows * gpr * 8u + row0 * 2u;
+    let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row0 * cst;
+    let g0 = gq4_gpl(seg, par0);
+    let g1 = gq4_gpl(seg, par0 + 2u);
+    let g2 = gq4_gpl(seg, par0 + 4u);
+    let g3 = gq4_gpl(seg, par0 + 6u);
+    let u0 = gq4_upl(seg, par0);
+    let u1 = gq4_upl(seg, par0 + 2u);
+    let u2 = gq4_upl(seg, par0 + 4u);
+    let u3 = gq4_upl(seg, par0 + 6u);
+    let glo = vec4<f32>(g0.x, g1.x, g2.x, g3.x);
+    let gst = vec4<f32>(g0.y, g1.y, g2.y, g3.y);
+    let ulo = vec4<f32>(u0.x, u1.x, u2.x, u3.x);
+    let ust = vec4<f32>(u0.y, u1.y, u2.y, u3.y);
+    // nibble word of (row0, group 0); the next row is gpr·4 words on
+    let wr = gpr * 4u;
+    let w0 = (base16 >> 1u) + row0 * wr;
+    var ag = vec4<f32>(0.0);
+    var au = vec4<f32>(0.0);
+    let xb4 = batch * gpr * 8u;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = xb4 + g * 8u;
+        let x0 = gq_x[xo];
+        let x1 = gq_x[xo + 1u];
+        let x2 = gq_x[xo + 2u];
+        let x3 = gq_x[xo + 3u];
+        let x4 = gq_x[xo + 4u];
+        let x5 = gq_x[xo + 5u];
+        let x6 = gq_x[xo + 6u];
+        let x7 = gq_x[xo + 7u];
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cg = vec4<u32>(gq4_gc5(seg, cb, shf), gq4_gc5(seg, cb + cst, shf),
+                           gq4_gc5(seg, cb + 2u * cst, shf), gq4_gc5(seg, cb + 3u * cst, shf));
+        let cu = vec4<u32>(gq4_uc5(seg, cb, shf), gq4_uc5(seg, cb + cst, shf),
+                           gq4_uc5(seg, cb + 2u * cst, shf), gq4_uc5(seg, cb + 3u * cst, shf));
+        let sg = exp2(glo + vec4<f32>(cg) * gst);
+        let su = exp2(ulo + vec4<f32>(cu) * ust);
+        let w = w0 + g * 4u;
+        let dg = vec4<f32>(gq4_dot(gq4_gw[seg].w4[(w) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_gw[seg].w4[(w + wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_gw[seg].w4[(w + 2u * wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_gw[seg].w4[(w + 3u * wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7));
+        let du = vec4<f32>(gq4_dot(gq4_uw[seg].w4[(w) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_uw[seg].w4[(w + wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_uw[seg].w4[(w + 2u * wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq4_dot(gq4_uw[seg].w4[(w + 3u * wr) >> 2u], x0, x1, x2, x3, x4, x5, x6, x7));
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    gq_pg[lid] = ag;
+    gq_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            gq_pg[lid] = gq_pg[lid] + gq_pg[lid + stride];
+            gq_pu[lid] = gq_pu[lid] + gq_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid < 4u) {
+        let row = row0 + lid;
+        if (row < rows) {
+            let gate = gq_pg[0][lid];
+            let up = gq_pu[0][lid];
+            gq_act[bslot * gq_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+        }
+    }
+}
+
+
+// ── Prompt frames past eight tokens: the frame's (token, slot) winners sorted by
+// arena slot (`q4g_sort`), so the workgroups that read one expert's weights run
+// back to back and its rows come from L2 instead of DRAM once per token. ──
+@group(0) @binding(5) var<storage, read> gq_ord : array<u32>;
+@compute @workgroup_size(64)
+fn q4g_gu_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let bslot = gq_ord[wid.y];
+    let batch = bslot / gq_p.slots;
+    let flat = gq_sel[bslot];
+    if (flat == 0xFFFFFFFFu) { return; }
+    let seg = flat / gq_p.segment_slots;
+    let local = flat - seg * gq_p.segment_slots;
+    let gpr = gq_p.gpr;
+    let rows = gq_p.inter;
+    let base16 = local * gq_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let par0 = base16 + rows * gpr * 8u + row0 * 2u;
+    let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row0 * cst;
+    let g0 = gq_gpl(seg, par0);
+    let g1 = gq_gpl(seg, par0 + 2u);
+    let g2 = gq_gpl(seg, par0 + 4u);
+    let g3 = gq_gpl(seg, par0 + 6u);
+    let u0 = gq_upl(seg, par0);
+    let u1 = gq_upl(seg, par0 + 2u);
+    let u2 = gq_upl(seg, par0 + 4u);
+    let u3 = gq_upl(seg, par0 + 6u);
+    let glo = vec4<f32>(g0.x, g1.x, g2.x, g3.x);
+    let gst = vec4<f32>(g0.y, g1.y, g2.y, g3.y);
+    let ulo = vec4<f32>(u0.x, u1.x, u2.x, u3.x);
+    let ust = vec4<f32>(u0.y, u1.y, u2.y, u3.y);
+    // nibble word of (row0, group 0); the next row is gpr·4 words on
+    let wr = gpr * 4u;
+    let w0 = (base16 >> 1u) + row0 * wr;
+    var ag = vec4<f32>(0.0);
+    var au = vec4<f32>(0.0);
+    let xb4 = batch * gpr * 8u;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = xb4 + g * 8u;
+        let x0 = gq_x[xo];
+        let x1 = gq_x[xo + 1u];
+        let x2 = gq_x[xo + 2u];
+        let x3 = gq_x[xo + 3u];
+        let x4 = gq_x[xo + 4u];
+        let x5 = gq_x[xo + 5u];
+        let x6 = gq_x[xo + 6u];
+        let x7 = gq_x[xo + 7u];
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cg = vec4<u32>(gq_gc5(seg, cb, shf), gq_gc5(seg, cb + cst, shf),
+                           gq_gc5(seg, cb + 2u * cst, shf), gq_gc5(seg, cb + 3u * cst, shf));
+        let cu = vec4<u32>(gq_uc5(seg, cb, shf), gq_uc5(seg, cb + cst, shf),
+                           gq_uc5(seg, cb + 2u * cst, shf), gq_uc5(seg, cb + 3u * cst, shf));
+        let sg = exp2(glo + vec4<f32>(cg) * gst);
+        let su = exp2(ulo + vec4<f32>(cu) * ust);
+        let w = w0 + g * 4u;
+        let dg = vec4<f32>(gq_gd32(seg, w, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + 2u * wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + 3u * wr, x0, x1, x2, x3, x4, x5, x6, x7));
+        let du = vec4<f32>(gq_ud32(seg, w, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + 2u * wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + 3u * wr, x0, x1, x2, x3, x4, x5, x6, x7));
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    gq_pg[lid] = ag;
+    gq_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            gq_pg[lid] = gq_pg[lid] + gq_pg[lid + stride];
+            gq_pu[lid] = gq_pu[lid] + gq_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid < 4u) {
+        let row = row0 + lid;
+        if (row < rows) {
+            let gate = gq_pg[0][lid];
+            let up = gq_pu[0][lid];
+            gq_act[bslot * gq_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+        }
+    }
+}
+
+
+// The down projection per sorted winner: sixteen rows a workgroup, four lanes a
+// row over its 32-column groups; the weighted rows land per winner and
+// `q4g_sum` adds a token's winners.
+@group(0) @binding(5) var<storage, read> gv_ord : array<u32>;
+var<workgroup> gd_red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn q4g_dn_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 16u;
+    let bslot = gv_ord[wid.y];
+    let gpr = gv_p.gpr;
+    let rows = gv_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let flat = gv_sel[bslot];
+    let r = lid & 15u;
+    let gl = lid >> 4u;
+    let row = row0 + r;
+    var acc = 0.0;
+    if (flat != 0xFFFFFFFFu && row < rows) {
+        let seg = flat / gv_p.segment_slots;
+        let local = flat - seg * gv_p.segment_slots;
+        let base16 = local * gv_p.mat16;
+        let par0 = base16 + rows * gpr * 8u;
+        let cod0 = (par0 + rows * 2u) * 2u;
+        let par16 = par0 + row * 2u;
+        let pl = unpack2x16float(gv_16(seg, par16) | (gv_16(seg, par16 + 1u) << 16u));
+        let cod8 = cod0 + row * cst;
+        for (var g = gl; g < gpr; g = g + 4u) {
+            let xo = (bslot * gpr + g) * 8u;
+            let bit = g * 5u;
+            let cb = bit >> 3u;
+            let shf = bit & 7u;
+            var cv = gv_8(seg, cod8 + cb);
+            if (shf > 3u) { cv = cv | (gv_8(seg, cod8 + cb + 1u) << 8u); }
+            let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+            let t16 = base16 + (row * gpr + g) * 8u;
+            var d = 0.0;
+            d = d + gv_dot8(gv_16(seg, t16) | (gv_16(seg, t16 + 1u) << 16u), gv_act[xo], gv_act[xo + 1u]);
+            d = d + gv_dot8(gv_16(seg, t16 + 2u) | (gv_16(seg, t16 + 3u) << 16u), gv_act[xo + 2u], gv_act[xo + 3u]);
+            d = d + gv_dot8(gv_16(seg, t16 + 4u) | (gv_16(seg, t16 + 5u) << 16u), gv_act[xo + 4u], gv_act[xo + 5u]);
+            d = d + gv_dot8(gv_16(seg, t16 + 6u) | (gv_16(seg, t16 + 7u) << 16u), gv_act[xo + 6u], gv_act[xo + 7u]);
+            acc = acc + scale * d;
+        }
+    }
+    gd_red[lid] = acc;
+    workgroupBarrier();
+    if (lid < 16u && row0 + lid < rows && flat != 0xFFFFFFFFu) {
+        let v = gd_red[lid] + gd_red[lid + 16u] + gd_red[lid + 32u] + gd_red[lid + 48u];
+        gv_y[bslot * rows + row0 + lid] = gv_wt[bslot] * v;
+    }
+}
+
+// A token's MoE output: the sum of its winners' rows (empty ranks skipped).
+struct QsmP { hidden: u32, slots: u32, nt: u32, ys: u32 };
+@group(0) @binding(0) var<storage, read>       qsm_part : array<f32>;
+@group(0) @binding(1) var<storage, read>       qsm_sel  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> qsm_y    : array<f32>;
+@group(0) @binding(3) var<uniform>             qsm_p    : QsmP;
+@compute @workgroup_size(256)
+fn q4g_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let t = gid.y;
+    if (d >= qsm_p.hidden || t >= qsm_p.nt) { return; }
+    var v = 0.0;
+    for (var k = 0u; k < qsm_p.slots; k = k + 1u) {
+        let b = t * qsm_p.slots + k;
+        if (qsm_sel[b] != 0xFFFFFFFFu) { v = v + qsm_part[b * qsm_p.hidden + d]; }
+    }
+    qsm_y[t * qsm_p.ys + d] = v;
+}
+
+// The frame's winners ordered by (arena slot, winner index): one workgroup, a
+// bitonic sort of up to 2048 keys in workgroup memory.
+struct QsoP { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       qso_sel : array<u32>;
+@group(0) @binding(1) var<storage, read_write> qso_ord : array<u32>;
+@group(0) @binding(2) var<uniform>             qso_p   : QsoP;
+var<workgroup> qso_k: array<u32, 4096>;
+var<workgroup> qso_v: array<u32, 4096>;
+@compute @workgroup_size(1024)
+fn q4g_sort(@builtin(local_invocation_index) lid: u32) {
+    let n = qso_p.n;
+    for (var h = 0u; h < 4u; h = h + 1u) {
+        let i = lid + h * 1024u;
+        qso_k[i] = select(0xFFFFFFFFu, qso_sel[min(i, n - 1u)], i < n);
+        qso_v[i] = i;
+    }
+    workgroupBarrier();
+    for (var k = 2u; k <= 4096u; k = k << 1u) {
+        for (var j = k >> 1u; j > 0u; j = j >> 1u) {
+            for (var h = 0u; h < 4u; h = h + 1u) {
+                let i = lid + h * 1024u;
+                let l = i ^ j;
+                if (l > i) {
+                    let ki = qso_k[i];
+                    let kl = qso_k[l];
+                    let vi = qso_v[i];
+                    let vl = qso_v[l];
+                    let gt = ki > kl || (ki == kl && vi > vl);
+                    let up = (i & k) == 0u;
+                    if (gt == up) {
+                        qso_k[i] = kl;
+                        qso_k[l] = ki;
+                        qso_v[i] = vl;
+                        qso_v[l] = vi;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    for (var h = 0u; h < 4u; h = h + 1u) {
+        let i = lid + h * 1024u;
+        if (i < n) { qso_ord[i] = qso_v[i]; }
+    }
+}
+
+
+// The sorted winners' segments for the matrix-unit expert GEMMs: one per
+// arena slot, (slot, first sorted winner, count, 0), the count of segments at
+// [4096]; up to 4096 winners (`q4g_sort`'s order), four consecutive a lane.
+struct QsgP { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       qsg_sel : array<u32>;
+@group(0) @binding(1) var<storage, read>       qsg_ord : array<u32>;
+@group(0) @binding(2) var<storage, read_write> qsg_seg : array<vec4<u32>>;
+@group(0) @binding(3) var<uniform>             qsg_p   : QsgP;
+var<workgroup> qsg_sc: array<u32, 1024>;
+var<workgroup> qsg_nv: atomic<u32>;
+@compute @workgroup_size(1024)
+fn q4g_segs(@builtin(local_invocation_index) lid: u32) {
+    let n = qsg_p.n;
+    if (lid == 0u) { atomicStore(&qsg_nv, 0u); }
+    let i0 = lid * 4u;
+    var prev = 0xFFFFFFFFu;
+    if (i0 > 0u && i0 - 1u < n) { prev = qsg_sel[qsg_ord[i0 - 1u]]; }
+    var key = vec4<u32>(0xFFFFFFFFu);
+    var st = vec4<u32>(0u);
+    var nval = 0u;
+    for (var h = 0u; h < 4u; h = h + 1u) {
+        let i = i0 + h;
+        var k = 0xFFFFFFFFu;
+        if (i < n) { k = qsg_sel[qsg_ord[i]]; }
+        key[h] = k;
+        let valid = k != 0xFFFFFFFFu;
+        st[h] = u32(valid && (i == 0u || k != prev));
+        nval = nval + u32(valid);
+        prev = k;
+    }
+    let nst = st.x + st.y + st.z + st.w;
+    workgroupBarrier();
+    atomicAdd(&qsg_nv, nval);
+    qsg_sc[lid] = nst;
+    workgroupBarrier();
+    for (var o = 1u; o < 1024u; o = o << 1u) {
+        var v = qsg_sc[lid];
+        if (lid >= o) { v = v + qsg_sc[lid - o]; }
+        workgroupBarrier();
+        qsg_sc[lid] = v;
+        workgroupBarrier();
+    }
+    var at = qsg_sc[lid] - nst;
+    let nseg = qsg_sc[1023];
+    let nvalid = atomicLoad(&qsg_nv);
+    for (var h = 0u; h < 4u; h = h + 1u) {
+        if (st[h] == 1u) {
+            qsg_seg[at] = vec4<u32>(key[h], i0 + h, 0u, 0u);
+            at = at + 1u;
+        }
+    }
+    if (lid == 0u) { qsg_seg[4096] = vec4<u32>(nseg, 0u, 0u, 0u); }
+    storageBarrier();
+    workgroupBarrier();
+    for (var sid = lid; sid < nseg; sid = sid + 1024u) {
+        let e = qsg_seg[sid];
+        var en = nvalid;
+        if (sid + 1u < nseg) { en = qsg_seg[sid + 1u].y; }
+        qsg_seg[sid] = vec4<u32>(e.x, e.y, en - e.y, 0u);
+    }
+}
+
+
 // ── O(1) layers: the frame's rows packed for the engine's far-field kernels
 // (dense `[t][nh·hd]` and `[t][nkv·hd]`), and while the prompt runs exact the
 // query trace the seal reads: one row in `stride` at `pos / stride`.
@@ -2351,6 +3273,144 @@ fn q4_dn_q4tp4s(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q4_dn_q4tp4s with the nibble words read as vec4s.
+@compute @workgroup_size(64)
+fn q4_dn_q4tp4sv(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let batch = wid.y;
+    let gpr = gv_p.gpr;
+    let rows = gv_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = gv_p.slots * gpr;
+    var acc = vec4<f32>(0.0);
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i - slot * gpr;
+        let bslot = batch * gv_p.slots + slot;
+        let flat = gv_sel[bslot];
+        let seg = flat / gv_p.segment_slots;
+        let local = flat - seg * gv_p.segment_slots;
+        let base16 = local * gv_p.mat16;
+        let par0 = base16 + rows * gpr * 8u;
+        let cod0 = (par0 + rows * 2u) * 2u;
+        let xo = (bslot * gpr + g) * 8u;
+        let a0 = gv_act[xo];
+        let a1 = gv_act[xo + 1u];
+        let a2 = gv_act[xo + 2u];
+        let a3 = gv_act[xo + 3u];
+        let a4 = gv_act[xo + 4u];
+        let a5 = gv_act[xo + 5u];
+        let a6 = gv_act[xo + 6u];
+        let a7 = gv_act[xo + 7u];
+        let wt = gv_wt[bslot];
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let row = row0 + k;
+            let par16 = par0 + row * 2u;
+            let pl = unpack2x16float(gv4_16(seg, par16) | (gv4_16(seg, par16 + 1u) << 16u));
+            let cod8 = cod0 + row * cst;
+            var cv = gv4_8(seg, cod8 + cb);
+            if (shf > 3u) { cv = cv | (gv4_8(seg, cod8 + cb + 1u) << 8u); }
+            let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+            let t16 = base16 + (row * gpr + g) * 8u;
+            let q = gv4_w[seg].w4[t16 >> 3u];
+            var d = 0.0;
+            d = d + gv_dot8(q.x, a0, a1);
+            d = d + gv_dot8(q.y, a2, a3);
+            d = d + gv_dot8(q.z, a4, a5);
+            d = d + gv_dot8(q.w, a6, a7);
+            acc[k] = acc[k] + wt * scale * d;
+        }
+    }
+    if (lid >= 32u) {
+        g8_t[lid - 32u] = acc;
+    }
+    workgroupBarrier();
+    if (lid < 32u) {
+        let ta = g8_tail(acc + g8_t[lid]);
+        if (lid == 0u) {
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let row = row0 + k;
+                if (row < rows) {
+                    gv_y[batch * gv_p.hidden + row] = ta[k];
+                }
+            }
+        }
+    }
+}
+
+// q4_dn_q4tp4sv on 128 lanes (up to two (slot, group) items a lane for
+// eleven slots of twenty groups); four subgroup sums meet in workgroup memory.
+var<workgroup> d128_t: array<vec4<f32>, 4>;
+@compute @workgroup_size(128)
+fn q4_dn_q4tp4sv128(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32,
+                @builtin(subgroup_invocation_id) sgi: u32) {
+    let row0 = wid.x * 4u;
+    let batch = wid.y;
+    let gpr = gv_p.gpr;
+    let rows = gv_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = gv_p.slots * gpr;
+    var acc = vec4<f32>(0.0);
+    for (var i = lid; i < total; i = i + 128u) {
+        let slot = i / gpr;
+        let g = i - slot * gpr;
+        let bslot = batch * gv_p.slots + slot;
+        let flat = gv_sel[bslot];
+        let seg = flat / gv_p.segment_slots;
+        let local = flat - seg * gv_p.segment_slots;
+        let base16 = local * gv_p.mat16;
+        let par0 = base16 + rows * gpr * 8u;
+        let cod0 = (par0 + rows * 2u) * 2u;
+        let xo = (bslot * gpr + g) * 8u;
+        let a0 = gv_act[xo];
+        let a1 = gv_act[xo + 1u];
+        let a2 = gv_act[xo + 2u];
+        let a3 = gv_act[xo + 3u];
+        let a4 = gv_act[xo + 4u];
+        let a5 = gv_act[xo + 5u];
+        let a6 = gv_act[xo + 6u];
+        let a7 = gv_act[xo + 7u];
+        let wt = gv_wt[bslot];
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let row = row0 + k;
+            let par16 = par0 + row * 2u;
+            let pl = unpack2x16float(gv4_16(seg, par16) | (gv4_16(seg, par16 + 1u) << 16u));
+            let cod8 = cod0 + row * cst;
+            var cv = gv4_8(seg, cod8 + cb);
+            if (shf > 3u) { cv = cv | (gv4_8(seg, cod8 + cb + 1u) << 8u); }
+            let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+            let t16 = base16 + (row * gpr + g) * 8u;
+            let q = gv4_w[seg].w4[t16 >> 3u];
+            var d = 0.0;
+            d = d + gv_dot8(q.x, a0, a1);
+            d = d + gv_dot8(q.y, a2, a3);
+            d = d + gv_dot8(q.z, a4, a5);
+            d = d + gv_dot8(q.w, a6, a7);
+            acc[k] = acc[k] + wt * scale * d;
+        }
+    }
+    let r = g8_tail(acc);
+    if (sgi == 0u) { d128_t[lid >> 5u] = r; }
+    workgroupBarrier();
+    if (lid == 0u) {
+        let ta = d128_t[0] + d128_t[1] + d128_t[2] + d128_t[3];
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let row = row0 + k;
+            if (row < rows) {
+                gv_y[batch * gv_p.hidden + row] = ta[k];
+            }
+        }
+    }
+}
+
 // ── q4t_route with the ranking as k rounds of a workgroup argmax instead of
 // every expert counting its rank against all n (one SM walking n² compares),
 // and the softmax tail on workgroup memory instead of a single lane's chain
@@ -2558,6 +3618,59 @@ fn q4_q82_sg(@builtin(workgroup_id) wid: vec3<u32>,
         wb = wb + nwg.x;
     }
 }
+
+// q4_q82_sg for long rows (the out projections, cols >= 4096): one row a
+// 256-lane workgroup, so four times the lanes stream a row's words; the
+// eight subgroup sums meet in workgroup memory. Same bindings and uniform.
+var<workgroup> q8s1_t: array<f32, 8>;
+@compute @workgroup_size(256)
+fn q4_q82_sg1(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32,
+              @builtin(subgroup_invocation_id) sgi: u32) {
+    let rows = tq_p.rows;
+    let ngrp = tq_p.ngrp;
+    let qbytes = rows * tq_p.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + rows;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        let roww = row * ngrp;
+        var acc = 0.0;
+        var i = lid;
+        loop {
+            if (i + 256u >= ngrp) { break; }
+            let w0 = tq_w[roww + i];
+            let w1 = tq_w[roww + i + 256u];
+            let x0 = tq_x[i];
+            let x1 = tq_x[i + 256u];
+            let s0 = tq_f16x4(cs0h + i * 4u);
+            let s1 = tq_f16x4(cs0h + (i + 256u) * 4u);
+            acc = acc + dot(tq_i8x4(w0), x0 * s0);
+            acc = acc + dot(tq_i8x4(w1), x1 * s1);
+            i = i + 512u;
+        }
+        loop {
+            if (i >= ngrp) { break; }
+            acc = acc + dot(tq_i8x4(tq_w[roww + i]), tq_x[i] * tq_f16x4(cs0h + i * 4u));
+            i = i + 256u;
+        }
+        let r = subgroupAdd(acc);
+        if (sgi == 0u) { q8s1_t[lid >> 5u] = r; }
+        workgroupBarrier();
+        if (lid == 0u) {
+            var t = 0.0;
+            for (var k = 0u; k < 8u; k = k + 1u) { t = t + q8s1_t[k]; }
+            let rw = unpack2x16float(tq_w[rs0 + (row >> 1u)]);
+            var sc = rw.x;
+            if ((row & 1u) == 1u) { sc = rw.y; }
+            tq_y[row] = t * sc;
+        }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
 "#;
 
 /// HC v3: one hyper-connection mix in two subgroup kernels (`hc3_down`:
@@ -2734,6 +3847,196 @@ fn hc3_down(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// `hc3_down` in one pass over the hyper state (up to four tokens): every
+// lane keeps, per token, the four streams' sums of squares and the two rows'
+// per-stream dots of the (1 + w)-weighted state, and the stream inverses are
+// applied after the reduction (z = Σ_s inv_s · dot_s), so the state is read
+// once and the first pass with its barrier is gone. Same bindings, uniform,
+// grid and outputs.
+var<workgroup> h3e_red : array<vec4<f32>, 96>;  // [sg][t][ss, d0, d1]
+@compute @workgroup_size(256)
+fn hc3_down1(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32,
+             @builtin(subgroup_invocation_id) sgi: u32,
+             @builtin(subgroup_size) ssz: u32) {
+    let nch = h3d_p.cols >> 3u;
+    let hidden = h3d_p.hidden;
+    let nt = h3d_p.nt;
+    let nsg = 256u / ssz;
+    let sg = lid / ssz;
+    let total = h3d_p.rows_a + h3d_p.rows_b;
+    let g0 = wid.x * 2u;
+    let g1 = g0 + 1u;
+    let kd = select((nch + 255u) >> 8u, H3_KD, H3_KD != 0u);
+    if (lid < 4u * nt && (h3d_p.flags & 1u) != 0u) {
+        let t = lid >> 2u;
+        h3d_sc[32u + lid] = 2.0 / (1.0 + exp(-h3d_g[t * h3d_p.gs + (lid & 3u)] * h3d_p.inv_hc));
+    }
+    workgroupBarrier();
+    var a = array<vec4<f32>, 12>();
+    let ra = g0 < h3d_p.rows_a;
+    let rb = g1 < h3d_p.rows_a;
+    for (var k = 0u; k < kd; k = k + 1u) {
+        let q = lid + 256u * k;
+        if (q >= nch) { break; }
+        let s = (q * 8u) / hidden;
+        let bo = 2u * q - s * (hidden >> 2u);
+        let m = select(vec4<f32>(0.0), vec4<f32>(1.0), vec4<u32>(0u, 1u, 2u, 3u) == vec4<u32>(s));
+        var wa = vec4<u32>(0u);
+        var wb = vec4<u32>(0u);
+        if (ra) { wa = h3d_a[g0 * nch + q]; } else if (g0 < total) { wa = h3d_b[(g0 - h3d_p.rows_a) * nch + q]; }
+        if (rb) { wb = h3d_a[g1 * nch + q]; } else if (g1 < total) { wb = h3d_b[(g1 - h3d_p.rows_a) * nch + q]; }
+        let ga = vec4<f32>(1.0) + h3d_w[2u * q];
+        let gb = vec4<f32>(1.0) + h3d_w[2u * q + 1u];
+        for (var t = 0u; t < 4u; t = t + 1u) {
+            if (t >= nt) { break; }
+            let v = h3d_row(t, q, s, bo);
+            let e = dot(v[0], v[0]) + dot(v[1], v[1]);
+            let na = v[0] * ga;
+            let nb = v[1] * gb;
+            a[t * 3u] = a[t * 3u] + m * e;
+            a[t * 3u + 1u] = a[t * 3u + 1u] + m * h2_dot8(wa, na, nb);
+            a[t * 3u + 2u] = a[t * 3u + 2u] + m * h2_dot8(wb, na, nb);
+        }
+    }
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        let v = subgroupAdd(a[i]);
+        if (sgi == 0u) { h3e_red[sg * 12u + i] = v; }
+    }
+    workgroupBarrier();
+    if (lid < 2u * nt) {
+        let r = lid / nt;
+        let t = lid % nt;
+        var ss = vec4<f32>(0.0);
+        var dd = vec4<f32>(0.0);
+        for (var i = 0u; i < nsg; i = i + 1u) {
+            ss = ss + h3e_red[i * 12u + t * 3u];
+            dd = dd + h3e_red[i * 12u + t * 3u + 1u + r];
+        }
+        let inv = inverseSqrt(ss / f32(hidden) + vec4<f32>(h3d_p.eps));
+        if (wid.x == 0u && r == 0u) {
+            h3d_inv[t * 4u] = inv.x;
+            h3d_inv[t * 4u + 1u] = inv.y;
+            h3d_inv[t * 4u + 2u] = inv.z;
+            h3d_inv[t * 4u + 3u] = inv.w;
+        }
+        let v = dot(inv, dd);
+        let g = g0 + r;
+        if (g < h3d_p.rows_a) {
+            let z = v * h3d_p.inv_hc;
+            h3d_ya[t * h3d_p.yas + g] = z / (1.0 + exp(-z));
+        } else if (g < total) {
+            h3d_yb[t * h3d_p.ybs + g - h3d_p.rows_a] = v;
+        }
+    }
+}
+
+// `hc3_down` split by stream: workgroup (w, s) owns rows 2w, 2w+1 over stream
+// s's columns alone, with that stream's norm (an RMS of its own columns, so no
+// other workgroup is waited on), and writes the stream's share of the rows:
+// ya[t][s][g] = inv_s · Σ_c W·(1+w)·h (the A rows, before the SiLU) and the
+// injection rows' shares in yb[t][s][g − rows_a]. `hc3_upfold4` adds the four
+// shares (and applies the SiLU / writes the final injection logits). Four
+// times the workgroups of `hc3_down`, one pass over the state, up to 8 tokens.
+var<workgroup> h3s_red : array<vec4<f32>, 48>;  // [sg][ss lo, ss hi, d0 lo, d0 hi, d1 lo, d1 hi]
+@compute @workgroup_size(256)
+fn hc3_down4(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32,
+             @builtin(subgroup_invocation_id) sgi: u32,
+             @builtin(subgroup_size) ssz: u32) {
+    let hidden = h3d_p.hidden;
+    let nch = h3d_p.cols >> 3u;
+    let cps = hidden >> 3u;
+    let s = wid.y;
+    let nt = h3d_p.nt;
+    let nsg = 256u / ssz;
+    let sg = lid / ssz;
+    let total = h3d_p.rows_a + h3d_p.rows_b;
+    let g0 = wid.x * 2u;
+    let g1 = g0 + 1u;
+    if (lid < 4u * nt && (h3d_p.flags & 1u) != 0u) {
+        let t = lid >> 2u;
+        h3d_sc[32u + lid] = 2.0 / (1.0 + exp(-h3d_g[t * h3d_p.gs + (lid & 3u)] * h3d_p.inv_hc));
+    }
+    workgroupBarrier();
+    var ssl = vec4<f32>(0.0);
+    var ssh = vec4<f32>(0.0);
+    var d0l = vec4<f32>(0.0);
+    var d0h = vec4<f32>(0.0);
+    var d1l = vec4<f32>(0.0);
+    var d1h = vec4<f32>(0.0);
+    let ra = g0 < h3d_p.rows_a;
+    let rb = g1 < h3d_p.rows_a;
+    let kd = (cps + 255u) >> 8u;
+    for (var k = 0u; k < kd; k = k + 1u) {
+        let qs = lid + 256u * k;
+        if (qs >= cps) { break; }
+        let q = s * cps + qs;
+        let bo = 2u * qs;
+        var wa = vec4<u32>(0u);
+        var wb = vec4<u32>(0u);
+        if (ra) { wa = h3d_a[g0 * nch + q]; } else if (g0 < total) { wa = h3d_b[(g0 - h3d_p.rows_a) * nch + q]; }
+        if (rb) { wb = h3d_a[g1 * nch + q]; } else if (g1 < total) { wb = h3d_b[(g1 - h3d_p.rows_a) * nch + q]; }
+        let ga = vec4<f32>(1.0) + h3d_w[2u * q];
+        let gb = vec4<f32>(1.0) + h3d_w[2u * q + 1u];
+        for (var t = 0u; t < 8u; t = t + 1u) {
+            if (t >= nt) { break; }
+            let v = h3d_row(t, q, s, bo);
+            let e = dot(v[0], v[0]) + dot(v[1], v[1]);
+            let na = v[0] * ga;
+            let nb = v[1] * gb;
+            let x = h2_dot8(wa, na, nb);
+            let y = h2_dot8(wb, na, nb);
+            let m = select(vec4<f32>(0.0), vec4<f32>(1.0), vec4<u32>(0u, 1u, 2u, 3u) == vec4<u32>(t & 3u));
+            if (t < 4u) {
+                ssl = ssl + m * e;
+                d0l = d0l + m * x;
+                d1l = d1l + m * y;
+            } else {
+                ssh = ssh + m * e;
+                d0h = d0h + m * x;
+                d1h = d1h + m * y;
+            }
+        }
+    }
+    ssl = subgroupAdd(ssl);
+    d0l = subgroupAdd(d0l);
+    d1l = subgroupAdd(d1l);
+    if (nt > 4u) {
+        ssh = subgroupAdd(ssh);
+        d0h = subgroupAdd(d0h);
+        d1h = subgroupAdd(d1h);
+    }
+    if (sgi == 0u) {
+        h3s_red[sg * 6u] = ssl;
+        h3s_red[sg * 6u + 1u] = ssh;
+        h3s_red[sg * 6u + 2u] = d0l;
+        h3s_red[sg * 6u + 3u] = d0h;
+        h3s_red[sg * 6u + 4u] = d1l;
+        h3s_red[sg * 6u + 5u] = d1h;
+    }
+    workgroupBarrier();
+    if (lid < 2u * nt) {
+        let r = lid / nt;
+        let t = lid % nt;
+        let hi = t >> 2u;
+        var ss = 0.0;
+        var dd = 0.0;
+        for (var i = 0u; i < nsg; i = i + 1u) {
+            ss = ss + h3s_red[i * 6u + hi][t & 3u];
+            dd = dd + h3s_red[i * 6u + 2u + 2u * r + hi][t & 3u];
+        }
+        let inv = inverseSqrt(ss / f32(hidden) + h3d_p.eps);
+        if (wid.x == 0u && r == 0u) { h3d_inv[t * 4u + s] = inv; }
+        let g = g0 + r;
+        if (g < h3d_p.rows_a) {
+            h3d_ya[t * h3d_p.yas + s * h3d_p.rows_a + g] = inv * dd;
+        } else if (g < total) {
+            h3d_yb[t * h3d_p.ybs + s * h3d_p.rows_b + g - h3d_p.rows_a] = inv * dd;
+        }
+    }
+}
+
 struct H3uP { hidden: u32, low: u32, nt: u32, inv_hc: f32, ls4: u32, hs: u32, os: u32, flags: u32,
               bs: u32, gs: u32, _a: u32, _b: u32, _c: u32, _d: u32, _e: u32, _f: u32 };
 @group(0) @binding(0) var<storage, read>       h3u_w   : array<vec4<u32>>;
@@ -2837,6 +4140,784 @@ fn hc3_upfold(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+
+// hc3_upfold4's low row: the four streams' shares of chunk c added, the SiLU
+// of hc3_down applied (`ls4` is then the share array's token stride in vec4s)
+@group(0) @binding(9)  var<storage, read>       h3u_ybp : array<f32>;
+@group(0) @binding(10) var<storage, read_write> h3u_yb  : array<f32>;
+fn h3u_dot4(wq: vec4<u32>, t: u32, c: u32) -> f32 {
+    let lq = h3u_p.low >> 2u;
+    var a = vec4<f32>(0.0);
+    var b = vec4<f32>(0.0);
+    for (var s4 = 0u; s4 < 4u; s4 = s4 + 1u) {
+        let lb = t * h3u_p.ls4 + s4 * lq + 2u * c;
+        a = a + h3u_low[lb];
+        b = b + h3u_low[lb + 1u];
+    }
+    let za = a * h3u_p.inv_hc;
+    let zb = b * h3u_p.inv_hc;
+    return h2_dot8(wq, za / (vec4<f32>(1.0) + exp(-za)), zb / (vec4<f32>(1.0) + exp(-zb)));
+}
+
+@compute @workgroup_size(256)
+fn hc3_upfold4(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let hidden = h3u_p.hidden;
+    let nt = h3u_p.nt;
+    // the injection logits: the four streams' shares added (workgroup 0)
+    if (wid.x == 0u && lid < h3u_p._a * nt) {
+        let t = lid / h3u_p._a;
+        let r = lid % h3u_p._a;
+        var v = 0.0;
+        for (var s4 = 0u; s4 < 4u; s4 = s4 + 1u) { v = v + h3u_ybp[t * h3u_p._b + s4 * h3u_p._a + r]; }
+        h3u_yb[t * h3u_p._c + r] = v;
+    }
+    let lane = lid & 31u;
+    let s = lane >> 3u;
+    let j = lane & 7u;
+    let d = wid.x * 8u + (lid >> 5u);
+    let dd = min(d, hidden - 1u);
+    let lc = h3u_p.low >> 3u;
+    let o = s * hidden + dd;
+    let base = o * lc;
+    var lo = vec4<f32>(0.0);
+    var hi = vec4<f32>(0.0);
+    let ku = select((lc + 7u) >> 3u, H3_KU, H3_KU != 0u);
+    for (var k = 0u; k < ku; k = k + 1u) {
+        let c = j + 8u * k;
+        if (c >= lc) { break; }
+        let wq = h3u_w[base + c];
+        lo.x = lo.x + h3u_dot4(wq, 0u, c);
+        if (nt > 1u) { lo.y = lo.y + h3u_dot4(wq, 1u, c); }
+        if (nt > 2u) { lo.z = lo.z + h3u_dot4(wq, 2u, c); }
+        if (nt > 3u) { lo.w = lo.w + h3u_dot4(wq, 3u, c); }
+        if (nt > 4u) {
+            hi.x = hi.x + h3u_dot4(wq, 4u, c);
+            if (nt > 5u) { hi.y = hi.y + h3u_dot4(wq, 5u, c); }
+            if (nt > 6u) { hi.z = hi.z + h3u_dot4(wq, 6u, c); }
+            if (nt > 7u) { hi.w = hi.w + h3u_dot4(wq, 7u, c); }
+        }
+    }
+    lo = lo + subgroupShuffleXor(lo, 1u);
+    lo = lo + subgroupShuffleXor(lo, 2u);
+    lo = lo + subgroupShuffleXor(lo, 4u);
+    if (nt > 4u) {
+        hi = hi + subgroupShuffleXor(hi, 1u);
+        hi = hi + subgroupShuffleXor(hi, 2u);
+        hi = hi + subgroupShuffleXor(hi, 4u);
+    }
+    let nw1 = 1.0 + h3u_nw[o];
+    let wh = j == 0u && d < hidden;
+    // one lane per (stream, column) folds: it alone reads (and, with the
+    // fused inject, rewrites) h[t,s,d]; the other seven contribute zero
+    var vlo = vec4<f32>(0.0);
+    var vhi = vec4<f32>(0.0);
+    if (j == 0u) {
+        vlo.x = h3u_fold(0u, s, o, dd, lo.x, nw1, wh);
+        if (nt > 1u) { vlo.y = h3u_fold(1u, s, o, dd, lo.y, nw1, wh); }
+        if (nt > 2u) { vlo.z = h3u_fold(2u, s, o, dd, lo.z, nw1, wh); }
+        if (nt > 3u) { vlo.w = h3u_fold(3u, s, o, dd, lo.w, nw1, wh); }
+        if (nt > 4u) {
+            vhi.x = h3u_fold(4u, s, o, dd, hi.x, nw1, wh);
+            if (nt > 5u) { vhi.y = h3u_fold(5u, s, o, dd, hi.y, nw1, wh); }
+            if (nt > 6u) { vhi.z = h3u_fold(6u, s, o, dd, hi.z, nw1, wh); }
+            if (nt > 7u) { vhi.w = h3u_fold(7u, s, o, dd, hi.w, nw1, wh); }
+        }
+    }
+    vlo = vlo + subgroupShuffleXor(vlo, 8u);
+    vlo = vlo + subgroupShuffleXor(vlo, 16u);
+    if (nt > 4u) {
+        vhi = vhi + subgroupShuffleXor(vhi, 8u);
+        vhi = vhi + subgroupShuffleXor(vhi, 16u);
+    }
+    if (lane == 0u && d < hidden) {
+        for (var t = 0u; t < nt; t = t + 1u) {
+            var v = vlo[t & 3u];
+            if (t >= 4u) { v = vhi[t & 3u]; }
+            h3u_out[t * h3u_p.os + d] = v;
+        }
+    }
+}
+"#;
+
+/// Expert GEMMs of prompt frames on the matrix units (cooperative 16×16×16 f16
+/// → f32): per (64-row tile, expert segment of the sorted winners) a workgroup
+/// of four subgroups dequantizes its q4tp rows one 32-column group at a time
+/// into workgroup memory (each lane one row: four nibble words, one rung code,
+/// one exp2) and multiplies them into sixteen of the segment's tokens at once.
+/// Same bindings and segment table (`q4g_segs`: arena slot, first sorted
+/// winner, count; the count at [4096]) as the scalar tiles. Activations are
+/// rounded to f16 (the down input scaled by 2⁻⁴ against overflow, the scale
+/// undone in the f32 epilogue). Rules of naga's coop uniformity analysis kept:
+/// no early return, no `&&` and no call result on a path to a coop op, every
+/// workgroup variable a whole number of 16-byte units.
+pub(crate) const QWEN4_MM_WGSL: &str = r#"
+enable f16;
+enable wgpu_cooperative_matrix;
+enable wgpu_binding_array;
+diagnostic(off, derivative_uniformity);
+
+struct GqBank { words: array<u32> };
+struct GqP { gpr: u32, inter: u32, slots: u32, mat16: u32, lim: f32, segment_slots: u32, p0: u32, p1: u32 };
+struct GvP { gpr: u32, hidden: u32, slots: u32, mat16: u32, segment_slots: u32, p0: u32, p1: u32, p2: u32 };
+
+const MLD: u32 = 40u;
+
+// ── gate/up: the gu0t layout (banks, x, act, sorted order, segments) ──
+@group(0) @binding(0) var<storage, read>       mg_gw  : binding_array<GqBank, 8>;
+@group(0) @binding(1) var<storage, read>       mg_uw  : binding_array<GqBank, 8>;
+@group(0) @binding(2) var<storage, read>       mg_x   : array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> mg_act : array<f32>;
+@group(0) @binding(5) var<storage, read>       mg_ord : array<u32>;
+@group(0) @binding(6) var<storage, read>       mg_seg : array<vec4<u32>>;
+@group(1) @binding(0) var<uniform>             mg_p   : GqP;
+var<workgroup> mg_sa: array<f16, 640>;    // [16 tokens][40]
+var<workgroup> mg_sg: array<f16, 2560>;   // [64 rows][40] gate
+var<workgroup> mg_su: array<f16, 2560>;   // [64 rows][40] up
+var<workgroup> mg_c:  array<f32, 2048>;   // [subgroup][gate | up][16 tokens][16 rows]
+var<workgroup> mg_hdr: vec4<u32>;
+
+fn mg_gword(seg: u32, o: u32) -> u32 { return mg_gw[seg].words[o]; }
+fn mg_uword(seg: u32, o: u32) -> u32 { return mg_uw[seg].words[o]; }
+
+@compute @workgroup_size(128)
+fn q4g_mm_gu(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32,
+             @builtin(subgroup_id) sgid: u32) {
+    if (lid == 0u) {
+        var h = vec4<u32>(0u);
+        if (wid.y < mg_seg[4096].x) { h = mg_seg[wid.y]; }
+        mg_hdr = h;
+    }
+    let hdr = workgroupUniformLoad(&mg_hdr);
+    let cnt = hdr.z;
+    let flat = hdr.x;
+    let seg = flat / mg_p.segment_slots;
+    let local = flat - seg * mg_p.segment_slots;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = local * mg_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let row0 = wid.x * 64u;
+    // dequant role: lanes 0..63 a gate row, 64..127 the same up row
+    let isup = lid >= 64u;
+    let dr = lid & 63u;
+    let r = min(row0 + dr, rows - 1u);
+    let par16 = base16 + rows * gpr * 8u + r * 2u;
+    var plw = 0u;
+    if (isup) {
+        plw = (mg_uword(seg, par16 >> 1u));
+    } else {
+        plw = (mg_gword(seg, par16 >> 1u));
+    }
+    let pl = unpack2x16float(plw);
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + r * cst;
+    let w0 = (base16 >> 1u) + r * gpr * 4u;
+    // A role: token (lid / 8) of the tile, columns (lid % 8)·4 .. +3 of the group
+    let at = lid >> 3u;
+    let ak = (lid & 7u) * 4u;
+    var zc: coop_mat16x16<f32, C>;
+    var cg: coop_mat16x16<f32, C>;
+    var cu: coop_mat16x16<f32, C>;
+    for (var tb = 0u; tb < cnt; tb = tb + 16u) {
+        cg = zc;
+        cu = zc;
+        let jt = tb + at;
+        let live = jt < cnt;
+        var xrow = 0u;
+        if (live) { xrow = (mg_ord[hdr.y + jt] / mg_p.slots) * gpr * 8u; }
+        // registers of slice kt (loaded one slice ahead, under the MMAs)
+        var av = vec4<f32>(0.0);
+        var q = vec4<u32>(0u);
+        var cw = 0u;
+        if (live) { av = mg_x[xrow + (ak >> 2u)]; }
+        if (isup) {
+            q = vec4<u32>(mg_uword(seg, w0), mg_uword(seg, w0 + 1u), mg_uword(seg, w0 + 2u), mg_uword(seg, w0 + 3u));
+            cw = mg_uword(seg, cod8 >> 2u) >> ((cod8 & 3u) * 8u);
+        } else {
+            q = vec4<u32>(mg_gword(seg, w0), mg_gword(seg, w0 + 1u), mg_gword(seg, w0 + 2u), mg_gword(seg, w0 + 3u));
+            cw = mg_gword(seg, cod8 >> 2u) >> ((cod8 & 3u) * 8u);
+        }
+        for (var kt = 0u; kt < gpr; kt = kt + 1u) {
+            let da = at * MLD + ak;
+            mg_sa[da] = f16(av.x);
+            mg_sa[da + 1u] = f16(av.y);
+            mg_sa[da + 2u] = f16(av.z);
+            mg_sa[da + 3u] = f16(av.w);
+            // the rung code: five bits at bit kt·5 of the row's code bytes; `cw`
+            // holds the byte at kt·5/8 and the one after it from the prefetch
+            let shf = (kt * 5u) & 7u;
+            let sc = exp2(pl.x + f32((cw >> shf) & 31u) * pl.y);
+            let db = dr * MLD;
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let wj = q[j];
+                for (var b = 0u; b < 8u; b = b + 1u) {
+                    let v = f16((f32((wj >> (4u * b)) & 0xFu) - 8.0) * sc);
+                    if (isup) { mg_su[db + j * 8u + b] = v; } else { mg_sg[db + j * 8u + b] = v; }
+                }
+            }
+            workgroupBarrier();
+            // the next slice's registers while the matrix units run
+            let kn = min(kt + 1u, gpr - 1u);
+            av = vec4<f32>(0.0);
+            if (live) { av = mg_x[xrow + kn * 8u + (ak >> 2u)]; }
+            let wn = w0 + kn * 4u;
+            let cbn = cod8 + ((kn * 5u) >> 3u);
+            if (isup) {
+                q = vec4<u32>(mg_uword(seg, wn), mg_uword(seg, wn + 1u), mg_uword(seg, wn + 2u), mg_uword(seg, wn + 3u));
+                cw = (mg_uword(seg, cbn >> 2u) >> ((cbn & 3u) * 8u)) & 0xFFu;
+                if (((kn * 5u) & 7u) > 3u) { cw = cw | (((mg_uword(seg, (cbn + 1u) >> 2u) >> (((cbn + 1u) & 3u) * 8u)) & 0xFFu) << 8u); }
+            } else {
+                q = vec4<u32>(mg_gword(seg, wn), mg_gword(seg, wn + 1u), mg_gword(seg, wn + 2u), mg_gword(seg, wn + 3u));
+                cw = (mg_gword(seg, cbn >> 2u) >> ((cbn & 3u) * 8u)) & 0xFFu;
+                if (((kn * 5u) & 7u) > 3u) { cw = cw | (((mg_gword(seg, (cbn + 1u) >> 2u) >> (((cbn + 1u) & 3u) * 8u)) & 0xFFu) << 8u); }
+            }
+            for (var kk = 0u; kk < 2u; kk = kk + 1u) {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&mg_sa[kk * 16u], MLD);
+                let bg = coopLoad<coop_mat16x16<f16, B>>(&mg_sg[sgid * 16u * MLD + kk * 16u], MLD);
+                let bu = coopLoad<coop_mat16x16<f16, B>>(&mg_su[sgid * 16u * MLD + kk * 16u], MLD);
+                cg = coopMultiplyAdd(a, bg, cg);
+                cu = coopMultiplyAdd(a, bu, cu);
+            }
+            workgroupBarrier();
+        }
+        let og = sgid * 512u;
+        let ou = og + 256u;
+        coopStoreT(cg, &mg_c[og], 16u);
+        coopStoreT(cu, &mg_c[ou], 16u);
+        workgroupBarrier();
+        for (var e = lid; e < 1024u; e = e + 128u) {
+            let tt = e >> 6u;
+            let rr = e & 63u;
+            let o = (rr >> 4u) * 512u + tt * 16u + (rr & 15u);
+            let gv = mg_c[o];
+            let uv = mg_c[o + 256u];
+            let jj = tb + tt;
+            if (jj < cnt) {
+                if (row0 + rr < rows) {
+                    let bslot = mg_ord[hdr.y + jj];
+                    mg_act[bslot * rows + row0 + rr] = (gv / (1.0 + exp(-gv))) * uv;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+// ── q4g_mm_gu with 64-column K slices (two groups a lane a slice): half the
+// slices and barriers; needs an even group count (the host checks) ──
+const MLD2: u32 = 72u;
+var<workgroup> mg2_sa: array<f16, 1152>;   // [16 tokens][72]
+var<workgroup> mg2_sg: array<f16, 4608>;   // [64 rows][72]
+var<workgroup> mg2_su: array<f16, 4608>;
+fn mg_code(isup: bool, seg: u32, cod8: u32, g: u32) -> u32 {
+    let cb = cod8 + ((g * 5u) >> 3u);
+    let shf = (g * 5u) & 7u;
+    var cw = 0u;
+    if (isup) {
+        cw = (mg_uword(seg, cb >> 2u) >> ((cb & 3u) * 8u)) & 0xFFu;
+        if (shf > 3u) { cw = cw | (((mg_uword(seg, (cb + 1u) >> 2u) >> (((cb + 1u) & 3u) * 8u)) & 0xFFu) << 8u); }
+    } else {
+        cw = (mg_gword(seg, cb >> 2u) >> ((cb & 3u) * 8u)) & 0xFFu;
+        if (shf > 3u) { cw = cw | (((mg_gword(seg, (cb + 1u) >> 2u) >> (((cb + 1u) & 3u) * 8u)) & 0xFFu) << 8u); }
+    }
+    return (cw >> shf) & 31u;
+}
+fn mg_words(isup: bool, seg: u32, w: u32) -> vec4<u32> {
+    if (isup) {
+        return vec4<u32>(mg_uword(seg, w), mg_uword(seg, w + 1u), mg_uword(seg, w + 2u), mg_uword(seg, w + 3u));
+    }
+    return vec4<u32>(mg_gword(seg, w), mg_gword(seg, w + 1u), mg_gword(seg, w + 2u), mg_gword(seg, w + 3u));
+}
+@compute @workgroup_size(128)
+fn q4g_mm_gu64(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32,
+               @builtin(subgroup_id) sgid: u32) {
+    if (lid == 0u) {
+        var h = vec4<u32>(0u);
+        if (wid.y < mg_seg[4096].x) { h = mg_seg[wid.y]; }
+        mg_hdr = h;
+    }
+    let hdr = workgroupUniformLoad(&mg_hdr);
+    let cnt = hdr.z;
+    let flat = hdr.x;
+    let seg = flat / mg_p.segment_slots;
+    let local = flat - seg * mg_p.segment_slots;
+    let gpr = mg_p.gpr;
+    let npair = gpr >> 1u;
+    let rows = mg_p.inter;
+    let base16 = local * mg_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let row0 = wid.x * 64u;
+    let isup = lid >= 64u;
+    let dr = lid & 63u;
+    let r = min(row0 + dr, rows - 1u);
+    let par16 = base16 + rows * gpr * 8u + r * 2u;
+    var plw = 0u;
+    if (isup) { plw = mg_uword(seg, par16 >> 1u); } else { plw = mg_gword(seg, par16 >> 1u); }
+    let pl = unpack2x16float(plw);
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + r * cst;
+    let w0 = (base16 >> 1u) + r * gpr * 4u;
+    let at = lid >> 3u;
+    let ak = (lid & 7u) * 8u;
+    var zc: coop_mat16x16<f32, C>;
+    var cg: coop_mat16x16<f32, C>;
+    var cu: coop_mat16x16<f32, C>;
+    for (var tb = 0u; tb < cnt; tb = tb + 16u) {
+        cg = zc;
+        cu = zc;
+        let jt = tb + at;
+        let live = jt < cnt;
+        var xrow = 0u;
+        if (live) { xrow = (mg_ord[hdr.y + jt] / mg_p.slots) * gpr * 8u; }
+        var a0 = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0);
+        if (live) { a0 = mg_x[xrow + (ak >> 2u)]; a1 = mg_x[xrow + (ak >> 2u) + 1u]; }
+        var q0 = mg_words(isup, seg, w0);
+        var q1 = mg_words(isup, seg, w0 + 4u);
+        var c0 = mg_code(isup, seg, cod8, 0u);
+        var c1 = mg_code(isup, seg, cod8, 1u);
+        for (var kp = 0u; kp < npair; kp = kp + 1u) {
+            let da = at * MLD2 + ak;
+            mg2_sa[da] = f16(a0.x);
+            mg2_sa[da + 1u] = f16(a0.y);
+            mg2_sa[da + 2u] = f16(a0.z);
+            mg2_sa[da + 3u] = f16(a0.w);
+            mg2_sa[da + 4u] = f16(a1.x);
+            mg2_sa[da + 5u] = f16(a1.y);
+            mg2_sa[da + 6u] = f16(a1.z);
+            mg2_sa[da + 7u] = f16(a1.w);
+            let s0 = exp2(pl.x + f32(c0) * pl.y);
+            let s1 = exp2(pl.x + f32(c1) * pl.y);
+            let db = dr * MLD2;
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let wa = q0[j];
+                let wb = q1[j];
+                for (var b = 0u; b < 8u; b = b + 1u) {
+                    let va = f16((f32((wa >> (4u * b)) & 0xFu) - 8.0) * s0);
+                    let vb = f16((f32((wb >> (4u * b)) & 0xFu) - 8.0) * s1);
+                    if (isup) {
+                        mg2_su[db + j * 8u + b] = va;
+                        mg2_su[db + 32u + j * 8u + b] = vb;
+                    } else {
+                        mg2_sg[db + j * 8u + b] = va;
+                        mg2_sg[db + 32u + j * 8u + b] = vb;
+                    }
+                }
+            }
+            workgroupBarrier();
+            let kn = min(kp + 1u, npair - 1u);
+            a0 = vec4<f32>(0.0);
+            a1 = vec4<f32>(0.0);
+            if (live) { a0 = mg_x[xrow + kn * 16u + (ak >> 2u)]; a1 = mg_x[xrow + kn * 16u + (ak >> 2u) + 1u]; }
+            q0 = mg_words(isup, seg, w0 + kn * 8u);
+            q1 = mg_words(isup, seg, w0 + kn * 8u + 4u);
+            c0 = mg_code(isup, seg, cod8, 2u * kn);
+            c1 = mg_code(isup, seg, cod8, 2u * kn + 1u);
+            for (var kk = 0u; kk < 4u; kk = kk + 1u) {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&mg2_sa[kk * 16u], MLD2);
+                let bg = coopLoad<coop_mat16x16<f16, B>>(&mg2_sg[sgid * 16u * MLD2 + kk * 16u], MLD2);
+                let bu = coopLoad<coop_mat16x16<f16, B>>(&mg2_su[sgid * 16u * MLD2 + kk * 16u], MLD2);
+                cg = coopMultiplyAdd(a, bg, cg);
+                cu = coopMultiplyAdd(a, bu, cu);
+            }
+            workgroupBarrier();
+        }
+        let og = sgid * 512u;
+        let ou = og + 256u;
+        coopStoreT(cg, &mg_c[og], 16u);
+        coopStoreT(cu, &mg_c[ou], 16u);
+        workgroupBarrier();
+        for (var e = lid; e < 1024u; e = e + 128u) {
+            let tt = e >> 6u;
+            let rr = e & 63u;
+            let o = (rr >> 4u) * 512u + tt * 16u + (rr & 15u);
+            let gv = mg_c[o];
+            let uv = mg_c[o + 256u];
+            let jj = tb + tt;
+            if (jj < cnt) {
+                if (row0 + rr < rows) {
+                    let bslot = mg_ord[hdr.y + jj];
+                    mg_act[bslot * rows + row0 + rr] = (gv / (1.0 + exp(-gv))) * uv;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+// `q4g_mm_gu64` for q2tp gate/up banks (the q2tp-v2 and hot files): the 2-bit section
+// is half the size, a slice's two groups are four words, code 0 is a zero scale.
+@compute @workgroup_size(128)
+fn q4g_mm_gu64q2(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32,
+               @builtin(subgroup_id) sgid: u32) {
+    if (lid == 0u) {
+        var h = vec4<u32>(0u);
+        if (wid.y < mg_seg[4096].x) { h = mg_seg[wid.y]; }
+        mg_hdr = h;
+    }
+    let hdr = workgroupUniformLoad(&mg_hdr);
+    let cnt = hdr.z;
+    let flat = hdr.x;
+    let seg = flat / mg_p.segment_slots;
+    let local = flat - seg * mg_p.segment_slots;
+    let gpr = mg_p.gpr;
+    let npair = gpr >> 1u;
+    let rows = mg_p.inter;
+    let base16 = local * mg_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let row0 = wid.x * 64u;
+    let isup = lid >= 64u;
+    let dr = lid & 63u;
+    let r = min(row0 + dr, rows - 1u);
+    let par16 = base16 + rows * gpr * 4u + r * 2u;
+    var plw = 0u;
+    if (isup) { plw = mg_uword(seg, par16 >> 1u); } else { plw = mg_gword(seg, par16 >> 1u); }
+    let pl = unpack2x16float(plw);
+    let cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + r * cst;
+    let w0 = (base16 >> 1u) + r * gpr * 2u;
+    let at = lid >> 3u;
+    let ak = (lid & 7u) * 8u;
+    var zc: coop_mat16x16<f32, C>;
+    var cg: coop_mat16x16<f32, C>;
+    var cu: coop_mat16x16<f32, C>;
+    for (var tb = 0u; tb < cnt; tb = tb + 16u) {
+        cg = zc;
+        cu = zc;
+        let jt = tb + at;
+        let live = jt < cnt;
+        var xrow = 0u;
+        if (live) { xrow = (mg_ord[hdr.y + jt] / mg_p.slots) * gpr * 8u; }
+        var a0 = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0);
+        if (live) { a0 = mg_x[xrow + (ak >> 2u)]; a1 = mg_x[xrow + (ak >> 2u) + 1u]; }
+        var q0 = mg_words(isup, seg, w0);
+        var c0 = mg_code(isup, seg, cod8, 0u);
+        var c1 = mg_code(isup, seg, cod8, 1u);
+        for (var kp = 0u; kp < npair; kp = kp + 1u) {
+            let da = at * MLD2 + ak;
+            mg2_sa[da] = f16(a0.x);
+            mg2_sa[da + 1u] = f16(a0.y);
+            mg2_sa[da + 2u] = f16(a0.z);
+            mg2_sa[da + 3u] = f16(a0.w);
+            mg2_sa[da + 4u] = f16(a1.x);
+            mg2_sa[da + 5u] = f16(a1.y);
+            mg2_sa[da + 6u] = f16(a1.z);
+            mg2_sa[da + 7u] = f16(a1.w);
+            // q2tp rungs: code 0 is a zero scale, code c the rung c - 1
+            let s0 = select(exp2(pl.x + f32(max(c0, 1u) - 1u) * pl.y), 0.0, c0 == 0u);
+            let s1 = select(exp2(pl.x + f32(max(c1, 1u) - 1u) * pl.y), 0.0, c1 == 0u);
+            let db = dr * MLD2;
+            // two 2-bit words a group: column j at bit 2·(j % 16) of word j / 16, value − 1.5
+            for (var j = 0u; j < 2u; j = j + 1u) {
+                let wa = q0[j];
+                let wb = q0[2u + j];
+                for (var b = 0u; b < 16u; b = b + 1u) {
+                    let va = f16((f32((wa >> (2u * b)) & 3u) - 1.5) * s0);
+                    let vb = f16((f32((wb >> (2u * b)) & 3u) - 1.5) * s1);
+                    if (isup) {
+                        mg2_su[db + j * 16u + b] = va;
+                        mg2_su[db + 32u + j * 16u + b] = vb;
+                    } else {
+                        mg2_sg[db + j * 16u + b] = va;
+                        mg2_sg[db + 32u + j * 16u + b] = vb;
+                    }
+                }
+            }
+            workgroupBarrier();
+            let kn = min(kp + 1u, npair - 1u);
+            a0 = vec4<f32>(0.0);
+            a1 = vec4<f32>(0.0);
+            if (live) { a0 = mg_x[xrow + kn * 16u + (ak >> 2u)]; a1 = mg_x[xrow + kn * 16u + (ak >> 2u) + 1u]; }
+            q0 = mg_words(isup, seg, w0 + kn * 4u);
+            c0 = mg_code(isup, seg, cod8, 2u * kn);
+            c1 = mg_code(isup, seg, cod8, 2u * kn + 1u);
+            for (var kk = 0u; kk < 4u; kk = kk + 1u) {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&mg2_sa[kk * 16u], MLD2);
+                let bg = coopLoad<coop_mat16x16<f16, B>>(&mg2_sg[sgid * 16u * MLD2 + kk * 16u], MLD2);
+                let bu = coopLoad<coop_mat16x16<f16, B>>(&mg2_su[sgid * 16u * MLD2 + kk * 16u], MLD2);
+                cg = coopMultiplyAdd(a, bg, cg);
+                cu = coopMultiplyAdd(a, bu, cu);
+            }
+            workgroupBarrier();
+        }
+        let og = sgid * 512u;
+        let ou = og + 256u;
+        coopStoreT(cg, &mg_c[og], 16u);
+        coopStoreT(cu, &mg_c[ou], 16u);
+        workgroupBarrier();
+        for (var e = lid; e < 1024u; e = e + 128u) {
+            let tt = e >> 6u;
+            let rr = e & 63u;
+            let o = (rr >> 4u) * 512u + tt * 16u + (rr & 15u);
+            let gv = mg_c[o];
+            let uv = mg_c[o + 256u];
+            let jj = tb + tt;
+            if (jj < cnt) {
+                if (row0 + rr < rows) {
+                    let bslot = mg_ord[hdr.y + jj];
+                    mg_act[bslot * rows + row0 + rr] = (gv / (1.0 + exp(-gv))) * uv;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+// ── `q4t_f16_pair_mm` on the matrix units: the f16 pair (rows_a of A, then
+// rows_b of B) times every token's f32 inputs (rounded to f16), 64 rows × 64
+// tokens a workgroup (four subgroups of 16 rows, four 16-token accumulators
+// each), the same bindings, uniform, split-K partials and epilogue; grid
+// (row tiles, token tiles of 64, ks). ──
+struct TmmP { cols: u32, rows_a: u32, rows_b: u32, act: u32, inv: f32, yb_off: u32, nt: u32, xs: u32,
+              yas: u32, ybs: u32, kc: u32, ks: u32, _c: u32, _d: u32, _e: u32, _f: u32 };
+@group(0) @binding(0) var<storage, read>       pc_a  : array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       pc_b  : array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read>       pc_x  : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> pc_ya : array<f32>;
+@group(0) @binding(4) var<storage, read_write> pc_yb : array<f32>;
+@group(0) @binding(5) var<uniform>             pc_p  : TmmP;
+@group(0) @binding(6) var<storage, read_write> pc_part : array<f32>;
+var<workgroup> pc_sa: array<f16, 2560>;   // [64 tokens][40]
+var<workgroup> pc_sb: array<f16, 2560>;   // [64 rows][40]
+var<workgroup> pc_c:  array<f32, 4096>;   // [subgroup][token block][16 tokens][16 rows]
+@compute @workgroup_size(128)
+fn q4t_f16_pair_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_index) lid: u32,
+                     @builtin(subgroup_id) sgid: u32) {
+    let cols = pc_p.cols;
+    let ra = pc_p.rows_a;
+    let total = ra + pc_p.rows_b;
+    let row0 = wid.x * 64u;
+    let t0 = wid.y * 64u;
+    let nt = pc_p.nt;
+    let kbeg = wid.z * pc_p.kc;
+    let kend = min(cols, kbeg + pc_p.kc);
+    // B role: row lid / 2, sixteen columns (lid & 1) of the 32-column slice
+    let br = lid >> 1u;
+    let bh = (lid & 1u) * 16u;
+    let row_b = row0 + br;
+    // A role: token lid / 2, the same sixteen columns
+    let tok_a = t0 + br;
+    var zc: coop_mat16x16<f32, C>;
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    c0 = zc;
+    c1 = zc;
+    c2 = zc;
+    c3 = zc;
+    // this lane's sixteen columns of the slice, loaded one slice ahead: two
+    // 16-byte words of weights (8 f16 pairs), four 16-byte words of inputs
+    // (the host gives cols % 32 == 0 and an input row stride % 4 == 0)
+    let wbase = select((row_b - ra) * cols, row_b * cols, row_b < ra) >> 3u;
+    let live_b = row_b < total;
+    let live_a = tok_a < nt;
+    let xbase = (tok_a * pc_p.xs) >> 2u;
+    var wq0 = vec4<u32>(0u);
+    var wq1 = vec4<u32>(0u);
+    var xa0 = vec4<f32>(0.0);
+    var xa1 = vec4<f32>(0.0);
+    var xa2 = vec4<f32>(0.0);
+    var xa3 = vec4<f32>(0.0);
+    if (kbeg < kend) {
+        let o = (kbeg + bh) >> 3u;
+        if (live_b) {
+            if (row_b < ra) { wq0 = pc_a[wbase + o]; wq1 = pc_a[wbase + o + 1u]; }
+            else { wq0 = pc_b[wbase + o]; wq1 = pc_b[wbase + o + 1u]; }
+        }
+        if (live_a) {
+            let xo = xbase + ((kbeg + bh) >> 2u);
+            xa0 = pc_x[xo];
+            xa1 = pc_x[xo + 1u];
+            xa2 = pc_x[xo + 2u];
+            xa3 = pc_x[xo + 3u];
+        }
+    }
+    for (var k0 = kbeg; k0 < kend; k0 = k0 + 32u) {
+        let db = br * MLD + bh;
+        let wv = array<u32, 8>(wq0.x, wq0.y, wq0.z, wq0.w, wq1.x, wq1.y, wq1.z, wq1.w);
+        for (var j = 0u; j < 8u; j = j + 1u) {
+            let w2 = unpack2x16float(wv[j]);
+            pc_sb[db + 2u * j] = f16(w2.x);
+            pc_sb[db + 2u * j + 1u] = f16(w2.y);
+        }
+        let xv = array<vec4<f32>, 4>(xa0, xa1, xa2, xa3);
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            pc_sa[db + 4u * j] = f16(xv[j].x);
+            pc_sa[db + 4u * j + 1u] = f16(xv[j].y);
+            pc_sa[db + 4u * j + 2u] = f16(xv[j].z);
+            pc_sa[db + 4u * j + 3u] = f16(xv[j].w);
+        }
+        // the next slice (the last one reloads itself: in bounds, unused)
+        let kn = min(k0 + 32u, kend - 32u) + bh;
+        if (live_b) {
+            if (row_b < ra) { wq0 = pc_a[wbase + (kn >> 3u)]; wq1 = pc_a[wbase + (kn >> 3u) + 1u]; }
+            else { wq0 = pc_b[wbase + (kn >> 3u)]; wq1 = pc_b[wbase + (kn >> 3u) + 1u]; }
+        }
+        if (live_a) {
+            let xo = xbase + (kn >> 2u);
+            xa0 = pc_x[xo];
+            xa1 = pc_x[xo + 1u];
+            xa2 = pc_x[xo + 2u];
+            xa3 = pc_x[xo + 3u];
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 2u; kk = kk + 1u) {
+            let b = coopLoad<coop_mat16x16<f16, B>>(&pc_sb[sgid * 16u * MLD + kk * 16u], MLD);
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&pc_sa[kk * 16u], MLD);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&pc_sa[16u * MLD + kk * 16u], MLD);
+            let a2 = coopLoadT<coop_mat16x16<f16, A>>(&pc_sa[32u * MLD + kk * 16u], MLD);
+            let a3 = coopLoadT<coop_mat16x16<f16, A>>(&pc_sa[48u * MLD + kk * 16u], MLD);
+            c0 = coopMultiplyAdd(a0, b, c0);
+            c1 = coopMultiplyAdd(a1, b, c1);
+            c2 = coopMultiplyAdd(a2, b, c2);
+            c3 = coopMultiplyAdd(a3, b, c3);
+        }
+        workgroupBarrier();
+    }
+    let o0 = sgid * 1024u;
+    let o1 = o0 + 256u;
+    let o2 = o0 + 512u;
+    let o3 = o0 + 768u;
+    coopStoreT(c0, &pc_c[o0], 16u);
+    coopStoreT(c1, &pc_c[o1], 16u);
+    coopStoreT(c2, &pc_c[o2], 16u);
+    coopStoreT(c3, &pc_c[o3], 16u);
+    workgroupBarrier();
+    // 64 rows x 64 tokens, 32 a lane: lane -> row (lid & 63), tokens of half lid / 64
+    let rr = lid & 63u;
+    let row = row0 + rr;
+    let th = lid >> 6u;
+    if (row < total) {
+        for (var j = 0u; j < 32u; j = j + 1u) {
+            let tt = th * 32u + j;
+            let t = t0 + tt;
+            if (t < nt) {
+                var v = pc_c[(rr >> 4u) * 1024u + (tt >> 4u) * 256u + (tt & 15u) * 16u + (rr & 15u)];
+                if (pc_p.ks > 1u) {
+                    pc_part[(wid.z * nt + t) * total + row] = v;
+                } else if (row >= ra) {
+                    if ((pc_p.act & 2u) != 0u) { v = 1.0 / (1.0 + exp(-v)); }
+                    pc_yb[t * pc_p.ybs + pc_p.yb_off + row - ra] = v;
+                } else {
+                    if ((pc_p.act & 1u) != 0u) { let z = v * pc_p.inv; v = z / (1.0 + exp(-z)); }
+                    pc_ya[t * pc_p.yas + row] = v;
+                }
+            }
+        }
+    }
+}
+
+// ── down: the dn0t layout; partial[bslot][row] = weight · row ──
+@group(0) @binding(0) var<storage, read>       md_w   : binding_array<GqBank, 8>;
+@group(0) @binding(1) var<storage, read>       md_act : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read>       md_wt  : array<f32>;
+@group(0) @binding(4) var<storage, read_write> md_y   : array<f32>;
+@group(0) @binding(5) var<storage, read>       md_ord : array<u32>;
+@group(0) @binding(6) var<storage, read>       md_seg : array<vec4<u32>>;
+@group(1) @binding(0) var<uniform>             md_p   : GvP;
+var<workgroup> md_sa: array<f16, 640>;    // [16 tokens][40]
+var<workgroup> md_sb: array<f16, 2560>;   // [64 rows][40]
+var<workgroup> md_c:  array<f32, 1024>;   // [subgroup][16 tokens][16 rows]
+var<workgroup> md_hdr: vec4<u32>;
+
+fn md_word(seg: u32, o: u32) -> u32 { return md_w[seg].words[o]; }
+
+@compute @workgroup_size(128)
+fn q4g_mm_dn(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32,
+             @builtin(subgroup_id) sgid: u32) {
+    if (lid == 0u) {
+        var h = vec4<u32>(0u);
+        if (wid.y < md_seg[4096].x) { h = md_seg[wid.y]; }
+        md_hdr = h;
+    }
+    let hdr = workgroupUniformLoad(&md_hdr);
+    let cnt = hdr.z;
+    let flat = hdr.x;
+    let seg = flat / md_p.segment_slots;
+    let local = flat - seg * md_p.segment_slots;
+    let gpr = md_p.gpr;              // 32-column groups of the inter axis
+    let rows = md_p.hidden;
+    let base16 = local * md_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let row0 = wid.x * 64u;
+    // dequant role: two lanes a row, two nibble words each
+    let dr = lid >> 1u;
+    let hw = lid & 1u;
+    let r = min(row0 + dr, rows - 1u);
+    let par16 = base16 + rows * gpr * 8u + r * 2u;
+    let pl = unpack2x16float(md_word(seg, par16 >> 1u));
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + r * cst;
+    let w0 = (base16 >> 1u) + r * gpr * 4u + hw * 2u;
+    let at = lid >> 3u;
+    let ak = (lid & 7u) * 4u;
+    let cols4 = gpr * 8u;
+    var zc: coop_mat16x16<f32, C>;
+    var cc: coop_mat16x16<f32, C>;
+    for (var tb = 0u; tb < cnt; tb = tb + 16u) {
+        cc = zc;
+        let jt = tb + at;
+        let live = jt < cnt;
+        var arow = 0u;
+        if (live) { arow = md_ord[hdr.y + jt] * cols4; }
+        // registers of slice kt (loaded one slice ahead, under the MMAs)
+        var av = vec4<f32>(0.0);
+        if (live) { av = md_act[arow + (ak >> 2u)] * 0.0625; }
+        var cw = md_word(seg, cod8 >> 2u) >> ((cod8 & 3u) * 8u);
+        var q0 = md_word(seg, w0);
+        var q1 = md_word(seg, w0 + 1u);
+        for (var kt = 0u; kt < gpr; kt = kt + 1u) {
+            let da = at * MLD + ak;
+            md_sa[da] = f16(av.x);
+            md_sa[da + 1u] = f16(av.y);
+            md_sa[da + 2u] = f16(av.z);
+            md_sa[da + 3u] = f16(av.w);
+            let shf = (kt * 5u) & 7u;
+            let sc = exp2(pl.x + f32((cw >> shf) & 31u) * pl.y);
+            let db = dr * MLD + hw * 16u;
+            for (var b = 0u; b < 8u; b = b + 1u) {
+                md_sb[db + b] = f16((f32((q0 >> (4u * b)) & 0xFu) - 8.0) * sc);
+                md_sb[db + 8u + b] = f16((f32((q1 >> (4u * b)) & 0xFu) - 8.0) * sc);
+            }
+            workgroupBarrier();
+            let kn = min(kt + 1u, gpr - 1u);
+            av = vec4<f32>(0.0);
+            if (live) { av = md_act[arow + kn * 8u + (ak >> 2u)] * 0.0625; }
+            let cbn = cod8 + ((kn * 5u) >> 3u);
+            cw = (md_word(seg, cbn >> 2u) >> ((cbn & 3u) * 8u)) & 0xFFu;
+            if (((kn * 5u) & 7u) > 3u) { cw = cw | (((md_word(seg, (cbn + 1u) >> 2u) >> (((cbn + 1u) & 3u) * 8u)) & 0xFFu) << 8u); }
+            let wn = w0 + kn * 4u;
+            q0 = md_word(seg, wn);
+            q1 = md_word(seg, wn + 1u);
+            for (var kk = 0u; kk < 2u; kk = kk + 1u) {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&md_sa[kk * 16u], MLD);
+                let b = coopLoad<coop_mat16x16<f16, B>>(&md_sb[sgid * 16u * MLD + kk * 16u], MLD);
+                cc = coopMultiplyAdd(a, b, cc);
+            }
+            workgroupBarrier();
+        }
+        let oc = sgid * 256u;
+        coopStoreT(cc, &md_c[oc], 16u);
+        workgroupBarrier();
+        for (var e = lid; e < 1024u; e = e + 128u) {
+            let tt = e >> 6u;
+            let rr = e & 63u;
+            let v = md_c[(rr >> 4u) * 256u + tt * 16u + (rr & 15u)];
+            let jj = tb + tt;
+            if (jj < cnt) {
+                if (row0 + rr < rows) {
+                    let bslot = md_ord[hdr.y + jj];
+                    md_y[bslot * rows + row0 + rr] = md_wt[bslot] * v * 16.0;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
 "#;
 
 pub(crate) struct Pipes {
@@ -2860,6 +4941,7 @@ pub(crate) struct Pipes {
     embed_gather_q82: wgpu::ComputePipeline,
     gu_q2tp4: wgpu::ComputePipeline,
     gu_q4tp4: wgpu::ComputePipeline,
+    gu_q4tp4v: wgpu::ComputePipeline,
     dn_q4tp4: wgpu::ComputePipeline,
     t_hc_down: wgpu::ComputePipeline,
     t_hc_upfold2: wgpu::ComputePipeline,
@@ -2867,9 +4949,30 @@ pub(crate) struct Pipes {
     t_kv_append: wgpu::ComputePipeline,
     t_rawk: wgpu::ComputePipeline,
     t_ix_scores: wgpu::ComputePipeline,
+    t_ix_scores_l: wgpu::ComputePipeline,
+    t_topk_r: wgpu::ComputePipeline,
     t_topk: wgpu::ComputePipeline,
     t_idx_build: wgpu::ComputePipeline,
     t_attend: wgpu::ComputePipeline,
+    t_attend_sp: wgpu::ComputePipeline,
+    t_attend_cmb: wgpu::ComputePipeline,
+    t_f16_pair_mm: wgpu::ComputePipeline,
+    t_pair_sum: wgpu::ComputePipeline,
+    g_gu_q4tp4: wgpu::ComputePipeline,
+    g_dn_q4tp4: wgpu::ComputePipeline,
+    g_sum: wgpu::ComputePipeline,
+    g_sort: wgpu::ComputePipeline,
+    g_segs: wgpu::ComputePipeline,
+    /// `q4g_mm_gu` / `q4g_mm_dn` (`QWEN4_MM_WGSL`): the prompt frames'
+    /// expert GEMMs on the matrix units; None without cooperative matrices,
+    /// 32-lane subgroups, on rejection, or with `CMF_QWEN_MM=0`.
+    mm: Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)>,
+    /// `q4g_mm_gu64q2`: the gate/up GEMM for q2tp banks (same layout as `mm.0`).
+    mm_gu_q2: Option<wgpu::ComputePipeline>,
+    /// `q4t_f16_pair_coop` (`QWEN4_MM_WGSL`): the prompt frames' f16 pair GEMMs
+    /// (HC mixes, router, GDN gates) on the matrix units; `CMF_QWEN_PAIR_COOP=0` off.
+    pair_coop: Option<wgpu::ComputePipeline>,
+    t_hc_fold_t: wgpu::ComputePipeline,
     t_o1_pack: wgpu::ComputePipeline,
     t_o1_gate: wgpu::ComputePipeline,
     t_tube_gu: wgpu::ComputePipeline,
@@ -2883,6 +4986,8 @@ pub(crate) struct Pipes {
     /// 32-lane subgroups, on rejection, or with the switch at 0.
     gu4w: Option<wgpu::ComputePipeline>,
     dn4s: Option<wgpu::ComputePipeline>,
+    dn4sv: Option<wgpu::ComputePipeline>,
+    dn4sv128: Option<wgpu::ComputePipeline>,
     /// `q4t_route2` (`QWEN4_SG_WGSL`): the ranking as k argmax rounds;
     /// None without 32-lane subgroups or with `CMF_QWEN_ROUTE2=0`.
     route2: Option<wgpu::ComputePipeline>,
@@ -2892,6 +4997,8 @@ pub(crate) struct Pipes {
     /// `q4_q82_sg` (`QWEN4_SG_WGSL`): one-token q8_2f matvecs with the
     /// shuffle tail; None without the module or with `CMF_QWEN_Q82SG=0`.
     q82sg: Option<wgpu::ComputePipeline>,
+    /// `q4_q82_sg1`: the long-row twin (one row a workgroup); `CMF_QWEN_Q82SG1=0` off.
+    q82sg1: Option<wgpu::ComputePipeline>,
 }
 
 impl Pipes {
@@ -2904,11 +5011,20 @@ impl Pipes {
     /// The row-blocked (gate/up, down) pair: the subgroup twins where they
     /// came up.
     fn experts_blocked(&self, g: &Geom) -> (&wgpu::ComputePipeline, &wgpu::ComputePipeline) {
+        // vec4 nibble loads where every bank matrix starts on a 16-byte word
+        let v4 = v4load() && !g.gu_q2 && q4tp_words16(g.inter, g.hidden) && q4tp_words16(g.hidden, g.inter);
         let gu = match &self.gu4w {
             Some(p) if self.gu_rows(g) == 8 => p,
+            _ if v4 => &self.gu_q4tp4v,
             _ => self.gu4(g.gu_q2),
         };
-        (gu, self.dn4s.as_ref().unwrap_or(&self.dn_q4tp4))
+        let dn = match (&self.dn4sv128, &self.dn4sv, &self.dn4s) {
+            (Some(p), _, _) if v4 => p,
+            (_, Some(p), _) if v4 => p,
+            (_, _, Some(p)) => p,
+            _ => &self.dn_q4tp4,
+        };
+        (gu, dn)
     }
 
     /// The row-blocked gate/up kernel for the bank's gate/up dtype (q2tp or
@@ -2992,6 +5108,120 @@ fn hc3_subgroups_ok(c: &Ctx) -> bool {
 
 /// The HC v3 module, in isolation: a rejection here must leave the qwen4
 /// module and the older mixes untouched.
+/// The q2tp twin of the matrix-unit gate/up GEMM.
+fn build_mm_q2(c: &Ctx, gu: &wgpu::PipelineLayout) -> Option<wgpu::ComputePipeline> {
+    if std::env::var("CMF_QWEN_MM").as_deref() == Ok("0")
+        || !super::coop_matrix_active()
+        || !c.device.features().contains(wgpu::Features::SUBGROUP)
+        || c.adapter_info.subgroup_min_size != 32
+        || c.adapter_info.subgroup_max_size != 32
+    {
+        return None;
+    }
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = qwen_module(c, "qwen4-mm-q2", QWEN4_MM_WGSL);
+    let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("q4g_mm_gu64q2"),
+        layout: Some(gu),
+        module: &module,
+        entry_point: Some("q4g_mm_gu64q2"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &[],
+            zero_initialize_workgroup_memory: qwen_checked(),
+        },
+        cache: c.pipeline_cache.as_ref(),
+    });
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 matrix-unit q2tp gate/up GEMM rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    Some(p)
+}
+
+/// The matrix-unit f16 pair GEMM (auto layout: the pair's own bind groups).
+fn build_pair_coop(c: &Ctx) -> Option<wgpu::ComputePipeline> {
+    if std::env::var("CMF_QWEN_PAIR_COOP").as_deref() == Ok("0")
+        || !super::coop_matrix_active()
+        || !c.device.features().contains(wgpu::Features::SUBGROUP)
+        || c.adapter_info.subgroup_min_size != 32
+        || c.adapter_info.subgroup_max_size != 32
+    {
+        return None;
+    }
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = qwen_module(c, "qwen4-mm-pair", QWEN4_MM_WGSL);
+    let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("q4t_f16_pair_coop"),
+        layout: None,
+        module: &module,
+        entry_point: Some("q4t_f16_pair_coop"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &[],
+            zero_initialize_workgroup_memory: qwen_checked(),
+        },
+        cache: c.pipeline_cache.as_ref(),
+    });
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 matrix-unit pair GEMM rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    Some(p)
+}
+
+/// The matrix-unit expert GEMMs, in isolation like HC v3: a rejection keeps
+/// the scalar sorted kernels.
+fn build_mm(
+    c: &Ctx,
+    gu: &wgpu::PipelineLayout,
+    dn: &wgpu::PipelineLayout,
+) -> Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
+    if std::env::var("CMF_QWEN_MM").as_deref() == Ok("0")
+        || !super::coop_matrix_active()
+        || !c.device.features().contains(wgpu::Features::SUBGROUP)
+        || c.adapter_info.subgroup_min_size != 32
+        || c.adapter_info.subgroup_max_size != 32
+    {
+        return None;
+    }
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = qwen_module(c, "qwen4-mm", QWEN4_MM_WGSL);
+    let mk = |ep: &str, layout: &wgpu::PipelineLayout| {
+        c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(ep),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[],
+                zero_initialize_workgroup_memory: qwen_checked(),
+            },
+            cache: c.pipeline_cache.as_ref(),
+        })
+    };
+    // 64-column K slices for the gate/up GEMM (an even group count; 4K prompt
+    // 837 → 858 tok/s on the PRO 6000); `CMF_QWEN_MM64=0` the 32-column one
+    let pg = mk(if std::env::var("CMF_QWEN_MM64").as_deref() == Ok("0") { "q4g_mm_gu" } else { "q4g_mm_gu64" }, gu);
+    let pd = mk("q4g_mm_dn", dn);
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 matrix-unit expert GEMMs rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    tracing::info!("qwen4 prompt experts on the matrix units (q4g_mm_gu / q4g_mm_dn)");
+    Some((pg, pd))
+}
+
 fn build_hc3(c: &Ctx) -> Option<Hc3> {
     if !hc_v3_env() {
         return None;
@@ -3022,6 +5252,30 @@ fn build_hc3(c: &Ctx) -> Option<Hc3> {
     })
 }
 
+/// The one-pass `hc3_down1` for a frame of `nt` tokens: by default the
+/// two-to-four-token frames (the drafts' verify window: 40 → 36 µs a mix on
+/// the PRO 6000, one token equal); `CMF_QWEN_HC1=1` also one token, `=0` never.
+fn hc1(nt: usize) -> bool {
+    static S: OnceLock<u8> = OnceLock::new();
+    match S.get_or_init(|| match std::env::var("CMF_QWEN_HC1").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => 2,
+    }) {
+        0 => false,
+        1 => nt <= 4,
+        _ => (2..=4).contains(&nt),
+    }
+}
+
+/// The stream-split HC down (`hc3_down4` + `hc3_upfold4`): four times the
+/// workgroups of `hc3_down`, a mix 20.8 → 18.8 µs at one token on the PRO 6000;
+/// `CMF_QWEN_HC4=0` keeps the pair of `hc3_down` (or `hc3_down1`) and `hc3_upfold`.
+fn hc4() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_HC4").as_deref() != Ok("0"))
+}
+
 /// `hc3_down` (`down`) or `hc3_upfold` with its loop count fixed at `k`,
 /// built on first use; None (remembered) when the device rejects it.
 fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipeline> {
@@ -3029,10 +5283,14 @@ fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipelin
     if let Some(p) = m.get(&(down, k)) {
         return p.clone();
     }
+    // bit 15 of `k` asks for the one-pass down (`hc3_down1`), bit 14 for the
+    // stream-split pair (`hc3_down4` / `hc3_upfold4`)
+    let one = down && k & 0x8000 != 0;
+    let split = k & 0x4000 != 0;
     let (ep, knob) = if down {
-        ("hc3_down", "H3_KD")
+        (if split { "hc3_down4" } else if one { "hc3_down1" } else { "hc3_down" }, "H3_KD")
     } else {
-        ("hc3_upfold", "H3_KU")
+        (if split { "hc3_upfold4" } else { "hc3_upfold" }, "H3_KU")
     };
     // Validation and Internal both: a shader the translator or the driver
     // turns down (`CreateComputePipelineError::Internal`) is not a
@@ -3048,7 +5306,7 @@ fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipelin
             module: &h.module,
             entry_point: Some(ep),
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[(knob, f64::from(k))],
+                constants: &[(knob, f64::from(k & 0x3FFF))],
                 zero_initialize_workgroup_memory: qwen_checked(),
             },
             cache: c.pipeline_cache.as_ref(),
@@ -3150,6 +5408,60 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
                 storage(4, false, None),
             ],
         });
+    // the sorted twins read the frame's winner order at binding 5
+    let gu0s = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qwen4-gu4s-0"),
+            entries: &[
+                storage(0, true, segs),
+                storage(1, true, segs),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+                storage(5, true, None),
+            ],
+        });
+    let dn0s = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qwen4-dn4s-0"),
+            entries: &[
+                storage(0, true, segs),
+                storage(1, true, None),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+                storage(5, true, None),
+            ],
+        });
+    // the expert tiles: no winner table (they walk the sorted segments)
+    let gu0t = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qwen4-gut-0"),
+            entries: &[
+                storage(0, true, segs),
+                storage(1, true, segs),
+                storage(2, true, None),
+                storage(4, false, None),
+                storage(5, true, None),
+                storage(6, true, None),
+            ],
+        });
+    let dn0t = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qwen4-dnt-0"),
+            entries: &[
+                storage(0, true, segs),
+                storage(1, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+                storage(5, true, None),
+                storage(6, true, None),
+            ],
+        });
     let params = c
         .device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3177,6 +5489,34 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("qwen4-dn4-layout"),
             bind_group_layouts: &[Some(&dn0), Some(&params)],
+            immediate_size: 0,
+        });
+    let gu_layout_s = c
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qwen4-gu4s-layout"),
+            bind_group_layouts: &[Some(&gu0s), Some(&params)],
+            immediate_size: 0,
+        });
+    let dn_layout_s = c
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qwen4-dn4s-layout"),
+            bind_group_layouts: &[Some(&dn0s), Some(&params)],
+            immediate_size: 0,
+        });
+    let gu_layout_t = c
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qwen4-gut-layout"),
+            bind_group_layouts: &[Some(&gu0t), Some(&params)],
+            immediate_size: 0,
+        });
+    let dn_layout_t = c
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qwen4-dnt-layout"),
+            bind_group_layouts: &[Some(&dn0t), Some(&params)],
             immediate_size: 0,
         });
     let pipe_l = |ep: &str, layout: &wgpu::PipelineLayout| {
@@ -3213,6 +5553,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         embed_gather_q82: pipe("q4_embed_gather_q82"),
         gu_q2tp4: pipe_l("q4_gu_q2tp4", &gu_layout),
         gu_q4tp4: pipe_l("q4_gu_q4tp4", &gu_layout),
+        gu_q4tp4v: pipe_l("q4_gu_q4tp4v", &gu_layout),
         dn_q4tp4: pipe_l("q4_dn_q4tp4", &dn_layout),
         t_hc_down: pipe("q4t_hc_down"),
         t_hc_upfold2: pipe("q4t_hc_upfold2"),
@@ -3220,9 +5561,24 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_kv_append: pipe("q4t_kv_append"),
         t_rawk: pipe("q4t_rawk"),
         t_ix_scores: pipe("q4t_ix_scores"),
+        t_ix_scores_l: pipe("q4t_ix_scores_l"),
+        t_topk_r: pipe("q4t_topk_r"),
         t_topk: pipe("q4t_topk"),
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
+        t_attend_sp: pipe(if attn_sp2() { "q4t_attend_sp2" } else { "q4t_attend_sp" }),
+        t_attend_cmb: pipe("q4t_attend_cmb"),
+        t_f16_pair_mm: pipe("q4t_f16_pair_mm"),
+        t_pair_sum: pipe("q4t_pair_sum"),
+        g_gu_q4tp4: pipe_l("q4g_gu_q4tp4", &gu_layout_s),
+        g_dn_q4tp4: pipe_l("q4g_dn_q4tp4", &dn_layout_s),
+        g_sum: pipe("q4g_sum"),
+        g_sort: pipe("q4g_sort"),
+        g_segs: pipe("q4g_segs"),
+        mm: build_mm(c, &gu_layout_t, &dn_layout_t),
+        mm_gu_q2: build_mm_q2(c, &gu_layout_t),
+        pair_coop: build_pair_coop(c),
+        t_hc_fold_t: pipe("q4t_hc_fold_t"),
         t_o1_pack: pipe("q4t_o1_pack"),
         t_o1_gate: pipe("q4t_o1_gate"),
         t_tube_gu: pipe("q4t_tube_gu"),
@@ -3230,9 +5586,12 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         hc3: build_hc3(c),
         gu4w: build_sg_l(c, &sgm, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
         dn4s: build_sg_l(c, &sgm, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
+        dn4sv: build_sg_l(c, &sgm, "q4_dn_q4tp4sv", "CMF_QWEN_V4LOAD", true, &dn_layout, opts()),
+        dn4sv128: build_sg_l(c, &sgm, "q4_dn_q4tp4sv128", "CMF_QWEN_DN128", true, &dn_layout, opts()),
         route2: build_sg_auto(c, &sgm, "q4t_route2", "CMF_QWEN_ROUTE2", opts()),
         f16_matvec2: pipe("q4_f16_matvec2"),
         q82sg: build_sg_auto(c, &sgm, "q4_q82_sg", "CMF_QWEN_Q82SG", opts()),
+        q82sg1: build_sg_auto(c, &sgm, "q4_q82_sg1", "CMF_QWEN_Q82SG1", opts()),
     })
 }
 
@@ -3491,6 +5850,10 @@ struct LayerDev {
 
 /// Tokens one frame can carry (prefill chunks, the verify window).
 pub(crate) const TMAX: usize = 8;
+/// Rows of a prompt frame on a resident cut model (every expert on the card, so
+/// no cold pass): the frame buffers hold this many tokens; frames past `TMAX`
+/// take the GEMM kernels where the eight-token ones stop.
+pub(crate) const TROWS: usize = 256;
 
 /// One MoE layer's expert tubes on the card (`hot-bake --experts`): the q8_2f tube tensors
 /// of the experts that have one, packed one after another at a fixed segment (`slots`
@@ -3614,7 +5977,7 @@ pub(crate) struct Dev {
 }
 
 /// Indirect-argument slots per layer row (16 bytes each).
-const SLOTS: usize = 80;
+const SLOTS: usize = 88;
 
 /// A dispatch site's slot in its layer's argument row. Step ids are fixed
 /// per site; this folds them into a dense index.
@@ -3625,17 +5988,45 @@ fn step_slot(step: u16) -> usize {
         100..=109 => 20 + (step as usize - 100), // attention HC
         200..=209 => 30 + (step as usize - 200), // MoE HC
         300..=309 => 20 + (step as usize - 300), // head HC (its own row)
-        400..=408 => 40 + (step as usize - 400), // GDN
+        400..=409 => 40 + (step as usize - 400), // GDN (409: the prompt scan)
         500..=513 => 40 + (step as usize - 500), // QSA (never with GDN in one row)
         520..=523 => 70 + (step as usize - 520), // QSA O(1) pack / gate
+        524 => 51,                               // split attention (in the per-head attend's slot)
+        525 => 78,                               // its fold
         720..=723 => 74 + (step as usize - 720), // the experts' tubes, the shared expert's
         600 => 54,                               // attention inject
         700..=713 => 55 + (step as usize - 700), // MoE route / experts / miss
         714 => 58,                               // the route's other kernel
         800 => 69,                               // lm_head (head row)
+        110..=113 => 70 + (step as usize - 100), // HC stream-split pair (attention)
+        310..=313 => 70 + (step as usize - 300), // the head's (its own row)
+        210..=213 => 74 + (step as usize - 200), // the MoE's
         _ => 79,
     };
     s.min(SLOTS - 1)
+}
+
+/// Cost probe, not a release path: `CMF_Q4_SKIP_STEP=a,b,..` leaves the
+/// launches of those bind-cache steps out (the output goes wrong, the time
+/// of the rest stays), `CMF_Q4_STEP_LOG=1` prints every distinct (step,
+/// grid) once with its layer. True when the launch is to be left out.
+fn step_probe(step: u16, li: usize, groups: (u32, u32, u32)) -> bool {
+    static S: OnceLock<(Vec<u16>, bool)> = OnceLock::new();
+    let (skip, log) = S.get_or_init(|| {
+        let v = std::env::var("CMF_Q4_SKIP_STEP")
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        (v, std::env::var("CMF_Q4_STEP_LOG").as_deref() == Ok("1"))
+    });
+    if *log {
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u16, (u32, u32, u32))>>> = std::sync::Mutex::new(None);
+        if let Ok(mut g) = SEEN.lock() {
+            if g.get_or_insert_with(Default::default).insert((step, groups)) {
+                eprintln!("[step] {step} li {li} grid {groups:?}");
+            }
+        }
+    }
+    !skip.is_empty() && skip.contains(&step)
 }
 
 /// `CMF_Q4_SKIP=hc,gdn,qsa,route,experts,ple,head`: leave a stage out of the
@@ -3680,7 +6071,7 @@ impl Dev {
             return false;
         }
         let (nh, nkv, hd) = (g.n_heads, g.n_kv_heads, g.head_dim);
-        let qcap = (cfg.o1.seal + TMAX).div_ceil(crate::dory::QT_STRIDE);
+        let qcap = (cfg.o1.seal + TROWS).div_ceil(crate::dory::QT_STRIDE);
         let qtrace = self
             .layers
             .iter()
@@ -3695,10 +6086,10 @@ impl Dev {
             epoch: 0,
             qtrace,
             qcap,
-            pq: storage_buf(c, "qwen4-o1-pq", (TMAX * nh * hd * 4) as u64),
-            pk: storage_buf(c, "qwen4-o1-pk", (TMAX * nkv * hd * 4) as u64),
-            pv: storage_buf(c, "qwen4-o1-pv", (TMAX * nkv * hd * 4) as u64),
-            out: storage_buf(c, "qwen4-o1-out", (TMAX * nh * hd * 4) as u64),
+            pq: storage_buf(c, "qwen4-o1-pq", (TROWS * nh * hd * 4) as u64),
+            pk: storage_buf(c, "qwen4-o1-pk", (TROWS * nkv * hd * 4) as u64),
+            pv: storage_buf(c, "qwen4-o1-pv", (TROWS * nkv * hd * 4) as u64),
+            out: storage_buf(c, "qwen4-o1-out", (TROWS * nh * hd * 4) as u64),
             ob: storage_buf(c, "qwen4-o1-ob", (geom.scratch_len() * 4) as u64),
         });
         true
@@ -3759,7 +6150,7 @@ impl Dev {
             }
         }
         if hmax > 0 {
-            self.tube_act = Some(storage_buf(c, "qwen4-tube-act", (TMAX * g.top_k * hmax * 4) as u64));
+            self.tube_act = Some(storage_buf(c, "qwen4-tube-act", (TROWS * g.top_k * hmax * 4) as u64));
             self.tubes = banks;
         }
         if hsmax > 0 {
@@ -3982,6 +6373,9 @@ impl Dev {
 // frame_buf tags for this stack (the DSV4 frames use 0..175; 200+ is ours)
 const T_NORMED: u8 = 200;
 const T_LOW: u8 = 201;
+/// HC v3 stream-split shares: the A rows' `[t][s][row]`, the injection rows'.
+const T_LOW4: u8 = 185;
+const T_HCYB: u8 = 186;
 const T_INJ_ATTN: u8 = 202;
 const T_INJ_MLP: u8 = 203;
 const T_X: u8 = 205;
@@ -3992,6 +6386,10 @@ const T_A: u8 = 209;
 const T_B: u8 = 210;
 const T_CQ: u8 = 211;
 const T_GDO: u8 = 212;
+/// The staged GDN scan's prep rows of a prompt frame: q|k, k·q, (g, beta).
+const T_GQK: u8 = 227;
+const T_GKQ: u8 = 244;
+const T_GGB: u8 = 247;
 const T_BLK: u8 = 213;
 const T_IQK: u8 = 214;
 const T_QG: u8 = 215;
@@ -4032,6 +6430,18 @@ const T_ZERO: u8 = 252;
 const T_MIDS: u8 = 253;
 const T_HINV: u8 = 199;
 const T_QTAB: u8 = 198;
+/// Split-key attention partials (`q4t_attend_sp`): weighted V rows, and (max, sum).
+const T_ATSP_O: u8 = 192;
+const T_ATSP_ML: u8 = 193;
+/// The hyper-connection up-projection of a prompt frame past eight tokens.
+const T_HCUP: u8 = 194;
+/// Split-K partials of the f16 pair GEMM.
+const T_PAIRK: u8 = 195;
+/// A prompt frame's winners in arena-slot order, and their weighted down rows.
+const T_ORD: u8 = 196;
+const T_EPART: u8 = 197;
+/// The sorted winners' segments per expert (`q4g_segs`): 4096 + a header.
+const T_ESEG: u8 = 204;
 const T_AMPV: u8 = 254;
 const T_AMPI: u8 = 255;
 const T_MEMB: u8 = 180;
@@ -4055,12 +6465,67 @@ const U_BK: u8 = 208;
 /// The indexer's top-k runs in one workgroup over at most this many
 /// compressed blocks (the DSV4 kernel's table). With a compress ratio of 4
 /// that is 16k positions; longer contexts stay on the host path for now.
-pub(crate) const MAX_INDEX_BLOCKS: usize = 4096;
+/// Index blocks a token's scores row holds: 262 144 positions at a compression
+/// of 4, the model's trained context (`q4t_topk_r`); the per-head path and the
+/// old ranking kernel stop at `MAX_INDEX_BLOCKS_OLD`.
+pub(crate) const MAX_INDEX_BLOCKS: usize = 65536;
+pub(crate) const MAX_INDEX_BLOCKS_OLD: usize = 4096;
 /// The sparse attention kernel's score table.
 const MAX_ATTEND: usize = 2112;
 
 /// `CMF_QWEN_QSA_T=0`: QSA token by token (offset-bound single-token
 /// kernels) instead of the token-wide stages. The A/B arm.
+/// `CMF_QWEN_ATTN_SPLIT=0`: the per-head QSA attention kernel instead of the
+/// split-key GQA one (`q4t_attend_sp` + `q4t_attend_cmb`).
+fn attend_split() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_ATTN_SPLIT").as_deref() != Ok("0"))
+}
+
+/// `CMF_QWEN_SORTED=0`: prompt frames past eight tokens keep the per-token
+/// expert kernels instead of the arena-slot-sorted ones.
+fn sorted_experts() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_SORTED").as_deref() != Ok("0"))
+}
+
+/// `CMF_QWEN_TOPK_R=0`: the indexer's per-block scores and quadratic top-k
+/// instead of the lane-per-block scores and the radix top-k (whose block
+/// table reaches the trained 262 144 positions).
+/// `CMF_QWEN_QSA_ID=0`: rank and list the kept blocks even when every block
+/// is kept (the identity list the split attention otherwise takes directly).
+/// `CMF_QWEN_ATTN2=0`: the first split attention kernel (strided K reads).
+fn attn_sp2() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_ATTN2").as_deref() != Ok("0"))
+}
+
+/// `CMF_QWEN_V4LOAD=0`: the decode expert kernels read their nibbles as u32s.
+fn v4load() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_V4LOAD").as_deref() != Ok("0"))
+}
+
+/// Does a q4tp matrix take a whole number of 16-byte words (so bank slot i
+/// starts on one: the vec4 views index from the slot base)?
+fn q4tp_words16(rows: usize, cols: usize) -> bool {
+    cortiq_core::quant::expected_nbytes(TensorDtype::Q4TiledP, &[rows, cols]).is_some_and(|n| n % 16 == 0)
+}
+
+fn qsa_identity() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_QSA_ID").as_deref() != Ok("0"))
+}
+
+fn topk_r() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_TOPK_R").as_deref() != Ok("0"))
+}
+
+fn index_blocks_cap() -> usize {
+    if topk_r() { MAX_INDEX_BLOCKS } else { MAX_INDEX_BLOCKS_OLD }
+}
+
 fn qsa_tw() -> bool {
     static S: OnceLock<bool> = OnceLock::new();
     *S.get_or_init(|| std::env::var("CMF_QWEN_QSA_T").as_deref() != Ok("0"))
@@ -4182,7 +6647,7 @@ impl Dev {
             );
             return None;
         }
-        let hyper = storage_buf(c, "qwen4-hyper", (TMAX * hh * 4) as u64);
+        let hyper = storage_buf(c, "qwen4-hyper", (TROWS * hh * 4) as u64);
         let inj_flags = storage_buf(c, "qwen4-inj-flags", 16);
         let mut layers = Vec::with_capacity(kinds.len());
         for &(is_gdn, has_ple) in kinds {
@@ -4342,12 +6807,16 @@ impl Bc<'_> {
 
     /// The uniform-slot key of this section: layer and token slot.
     fn key(&self) -> usize {
-        self.li.wrapping_mul(TMAX) + self.tok
+        // token slots up to TW + TROWS + TMAX per layer
+        self.li.wrapping_mul(1024) + self.tok
     }
 
     /// Record the dispatch size in the layer's template row and dispatch
     /// indirectly from the live row the gate kernel fills.
     fn launch(&self, pass: &mut wgpu::ComputePass<'_>, step: u16, groups: (u32, u32, u32)) {
+        if step_probe(step, self.li, groups) {
+            return;
+        }
         if self.direct || !self.dev.gated {
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
             return;
@@ -4774,7 +7243,7 @@ fn dispatch<F>(
 
 /// Token index of the token-strided frame buffers in the frame pool (the
 /// per-token scratch of the PLE and MTP-input paths keeps 0..TMAX).
-const TROW: usize = 100;
+const TROW: usize = 1000;
 /// `Bc.tok` of a token-wide dispatch site: its bind group depends on the
 /// token count (through the uniform), never on a token slot.
 const TW: usize = 64;
@@ -4792,13 +7261,13 @@ fn es(len: usize) -> u32 {
 
 /// A frame buffer of TMAX token rows at `tstride(len)`.
 fn tbuf(c: &Ctx, tag: u8, len: usize, upload: bool) -> wgpu::Buffer {
-    frame_buf_t(c, tag, TROW, TMAX * tstride(len), upload)
+    frame_buf_t(c, tag, TROW, TROWS * tstride(len), upload)
 }
 
 /// A frame buffer of TMAX token rows packed at exactly `len`: buffers only
 /// token-wide kernels touch, whose row stride the kernel itself fixes.
 fn tbuf_exact(c: &Ctx, tag: u8, len: usize, upload: bool) -> wgpu::Buffer {
-    frame_buf_t(c, tag, TROW, TMAX * len, upload)
+    frame_buf_t(c, tag, TROW, TROWS * len, upload)
 }
 
 /// A buffer nothing ever writes (zeros), for bindings a flag turns off.
@@ -5008,6 +7477,69 @@ fn pair_w(
         return None;
     }
     let bbuf = b.map_or_else(|| a.buf.clone(), |b| b.buf.clone());
+    if nt > TMAX {
+        // a prompt frame past eight tokens: the tiled GEMM, same epilogue.
+        // Few rows over a long row (the hyper-connection's 324 x 10240) split
+        // the columns so the card gets enough workgroups; the slices' sums go
+        // through `q4t_pair_sum` in slice order.
+        let row_tiles = total.div_ceil(64);
+        // the matrix-unit twin takes 64-token tiles and 32-column slices
+        let coop = p.pair_coop.as_ref().filter(|_| a.cols % 32 == 0 && xs % 4 == 0);
+        let tok_tile = if coop.is_some() { 64 } else { 16 };
+        let ks = if row_tiles * nt.div_ceil(tok_tile) < 256 { a.cols.div_ceil(1024).clamp(1, 16) } else { 1 };
+        let kc = a.cols.div_ceil(ks).div_ceil(64) * 64;
+        let part = if ks > 1 {
+            frame_buf_t(c, T_PAIRK, 0, (ks * nt * total * 4).max(4), false)
+        } else {
+            zero_buf(c)
+        };
+        let u = uniform_u32x16(
+            c,
+            [
+                a.cols as u32,
+                a.rows as u32,
+                rows_b as u32,
+                act,
+                inv.to_bits(),
+                yb_off as u32,
+                nt as u32,
+                xs,
+                yas,
+                ybs,
+                kc as u32,
+                ks as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let u2 = u.clone();
+        let part2 = part.clone();
+        dispatch(
+            c,
+            pass,
+            coop.unwrap_or(&p.t_f16_pair_mm),
+            bc,
+            step,
+            "qwen4t-pair-mm",
+            || vec![a.buf.clone(), bbuf, x.clone(), ya.clone(), yb.clone(), u, part],
+            (row_tiles as u32, (nt as u32).div_ceil(tok_tile as u32), ks as u32),
+        );
+        if ks > 1 {
+            dispatch(
+                c,
+                pass,
+                &p.t_pair_sum,
+                bc,
+                step + 20,
+                "qwen4t-pair-sum",
+                || vec![part2, ya.clone(), yb.clone(), u2],
+                ((total as u32).div_ceil(256), nt as u32, 1),
+            );
+        }
+        return Some(());
+    }
     if nt == 1 && pair1_env() {
         // one token: the single-row pair kernel (row t = 0 of q4t_f16_pair
         // is its arithmetic bit for bit); the bind group is cached apart
@@ -5104,7 +7636,11 @@ fn q82_t(
     step: u16,
 ) -> bool {
     if nt == 1 {
-        if let Some(sg) = p.q82sg.as_ref()
+        // long rows: one row a workgroup
+        let long = w.cols >= 4096 && w.rows % 2 == 0;
+        let sg_pick = if long { p.q82sg1.as_ref().or(p.q82sg.as_ref()) } else { p.q82sg.as_ref() };
+        let one_row = long && p.q82sg1.is_some();
+        if let Some(sg) = sg_pick
             && w.dtype == TensorDtype::Q8_2f
             && w.cols % 16 == 0
             && c.use_q82_mv4
@@ -5138,7 +7674,7 @@ fn q82_t(
                         ),
                     ]
                 },
-                ((w.rows as u32).div_ceil(4).min(MAX_WG), 1, 1),
+                ((w.rows as u32).div_ceil(if one_row { 1 } else { 4 }).min(MAX_WG), 1, 1),
             );
             return true;
         }
@@ -5146,6 +7682,34 @@ fn q82_t(
     }
     if w.dtype != TensorDtype::Q8_2f || w.cols % 16 != 0 || xs % 4 != 0 {
         return false;
+    }
+    if nt > TMAX {
+        // a prompt frame past eight tokens: the batch graph's q8_2f GEMM
+        // (`q8_2f_mm_r2`, 64 x 64 tiles), rows packed at their width
+        let Some((mm, _)) = super::gemma_batch::pipes(c).and_then(|g| g.mm.as_ref()) else {
+            return false;
+        };
+        if xs as usize != w.cols || ys as usize != w.rows || w.cols % 64 != 0 {
+            return false;
+        }
+        dispatch(
+            c,
+            pass,
+            mm,
+            bc,
+            step,
+            "qwen4t-q82-mm",
+            || {
+                vec![
+                    w.buf.clone(),
+                    x.clone(),
+                    y.clone(),
+                    uniform_u32x4(c, [(w.cols / 4) as u32, w.rows as u32, nt as u32, w.cols as u32]),
+                ]
+            },
+            ((w.rows as u32).div_ceil(64), (nt as u32).div_ceil(64), 1),
+        );
+        return true;
     }
     dispatch(
         c,
@@ -5495,7 +8059,8 @@ fn encode_hc_v3(
         return None;
     }
     // loop counts: 8-column chunks per lane (256 lanes), low/8 words per octet lane
-    let pd = hc3_pipe(c, h3, true, (hh / 8).div_ceil(256) as u32)?;
+    let kd = (hh / 8).div_ceil(256) as u32;
+    let pd = hc3_pipe(c, h3, true, if hc1(nt) { kd | 0x8000 } else { kd })?;
     let pu = hc3_pipe(c, h3, false, (lr / 8).div_ceil(8) as u32)?;
     // the per-token stream inverses, [t·4 + s], from workgroup 0 of the down
     let hinv = tbuf_exact(c, T_HINV, g.hc * 4, false);
@@ -5516,6 +8081,105 @@ fn encode_hc_v3(
         (base + 1, base + 2)
     };
     let (ls, hs, os) = (es(lr * 4), es(hh * 4), es(g.hidden * 4));
+    if hc4() && rows_b <= 64 {
+        // stream-split: the four streams' shares of every row, added in the up-fold
+        let pd4 = hc3_pipe(c, h3, true, kd | 0x4000)?;
+        let pu4 = hc3_pipe(c, h3, false, (lr / 8).div_ceil(8) as u32 | 0x4000)?;
+        let (ls4s, ybs4) = (es(4 * lr * 4), es(4 * rows_b.max(1) * 4));
+        let low4 = tbuf(c, T_LOW4, 4 * lr * 4, false);
+        let ybp = tbuf(c, T_HCYB, 4 * rows_b.max(1) * 4, false);
+        let (blk2, gate2) = (blk.clone(), gate.clone());
+        // with and without the inject the bindings differ: their own cache slots
+        let (s4_down, s4_up) = if pre.is_some() { (base + 12, base + 13) } else { (base + 10, base + 11) };
+        dispatch(
+            c,
+            pass,
+            &pd4,
+            bc,
+            s4_down,
+            "qwen4t-hc3-down4",
+            || {
+                vec![
+                    down.buf.clone(),
+                    bbuf,
+                    hyper.clone(),
+                    nw.clone(),
+                    low4.clone(),
+                    ybp.clone(),
+                    hinv.clone(),
+                    uniform_u32x16(
+                        c,
+                        [
+                            hh as u32,
+                            lr as u32,
+                            rows_b as u32,
+                            g.hidden as u32,
+                            g.eps.to_bits(),
+                            inv,
+                            nt as u32,
+                            hs / 4,
+                            ls4s,
+                            ybs4,
+                            flags,
+                            bs / 4,
+                            gs,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    blk2,
+                    gate2,
+                ]
+            },
+            (groups as u32, 4, 1),
+        );
+        dispatch(
+            c,
+            pass,
+            &pu4,
+            bc,
+            s4_up,
+            "qwen4t-hc3-upfold4",
+            || {
+                vec![
+                    up.buf.clone(),
+                    low4.clone(),
+                    hyper.clone(),
+                    nw.clone(),
+                    hinv.clone(),
+                    x.clone(),
+                    uniform_u32x16(
+                        c,
+                        [
+                            g.hidden as u32,
+                            lr as u32,
+                            nt as u32,
+                            inv,
+                            ls4s / 4,
+                            hs,
+                            os,
+                            flags,
+                            bs,
+                            gs,
+                            rows_b as u32,
+                            ybs4,
+                            es(g.hc * 4),
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    blk,
+                    gate,
+                    ybp.clone(),
+                    injb.clone(),
+                ]
+            },
+            ((g.hidden / 8) as u32, 1, 1),
+        );
+        return Some(());
+    }
     dispatch(
         c,
         pass,
@@ -5751,6 +8415,44 @@ fn encode_hc_old(
         base + 6,
     )?;
     let inv = (1.0 / g.hc as f32).to_bits();
+    if nt > TMAX {
+        // up-projection as a GEMM into [nt][hh], then the σ-fold with the norms
+        let up_y = tbuf_exact(c, T_HCUP, hh * 4, false);
+        let zero = zero_buf(c);
+        pair_w(
+            c, p, pass, up, None, low, es(down.rows * 4), &up_y, hh as u32, &zero, 0, 0, 1.0, 0, nt, bc, base + 5,
+        )?;
+        dispatch(
+            c,
+            pass,
+            &p.t_hc_fold_t,
+            bc,
+            base + 4,
+            "qwen4t-hc-fold",
+            || {
+                vec![
+                    up_y.clone(),
+                    normed.clone(),
+                    x.clone(),
+                    uniform_u32x8(
+                        c,
+                        [
+                            g.hc as u32,
+                            g.hidden as u32,
+                            nt as u32,
+                            inv,
+                            hh as u32,
+                            es(hh * 4),
+                            es(g.hidden * 4),
+                            0,
+                        ],
+                    ),
+                ]
+            },
+            ((g.hidden as u32).div_ceil(256), nt as u32, 1),
+        );
+        return Some(());
+    }
     dispatch(
         c,
         pass,
@@ -6028,7 +8730,7 @@ pub(crate) fn encode_layer(
     let c = ctx()?;
     let p = pipes(c)?;
     let uid = dev.uid;
-    if nt == 0 || nt > TMAX {
+    if nt == 0 || nt > TROWS {
         return None;
     }
     let (hidden, hc) = (g.hidden, g.hc);
@@ -6046,7 +8748,7 @@ pub(crate) fn encode_layer(
         && dev.layers[li]
             .qsa
             .as_mut()
-            .is_some_and(|q| ensure_qsa(c, g, q, pos0 + TMAX));
+            .is_some_and(|q| ensure_qsa(c, g, q, pos0 + TROWS));
     if grew {
         dev.forget_layer(li);
     }
@@ -6429,32 +9131,114 @@ pub(crate) fn encode_layer(
                 bs.launch(&mut pass, 404, ((cdim as u32).div_ceil(256), 1, 1));
                 // the subgroup-tree twin where it came up (the same sums,
                 // `CMF_GDN_SG=0` keeps the loops)
-                let park = super::dense_mv::gdn(c).map_or(&c.gdn_step_par_k, |s| &s.park);
-                let bg_step = bs.get(405, || {
-                    // the auto layout keeps only what the entry point touches
-                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("qwen4-gdn-step-k"),
-                        layout: &park.get_bind_group_layout(0),
-                        entries: &[
+                // a prompt frame past eight tokens: the register-resident scan
+                // (`gdn_scan_k`) where it applies; window snapshots keep the step
+                let scan = (nt > TMAX && !snapping && gd.dk == super::dense_mv::GDN_SCAN_DK)
+                    .then(|| super::dense_mv::gdn(c).and_then(|g| g.scan.as_ref()))
+                    .flatten();
+                // `CMF_QWEN_SCAN3=1`: the staged scan (`gdn_prep_k` + `gdn_scan3_k`) of the
+                // Qwen3.5 hybrids instead of `gdn_scan_k`. Off: on Flash-Next's 48 v-heads over
+                // 16 k-heads it read a 4K prompt at 893 tok/s against 910 (PRO 6000), and its
+                // logits after a 9K prompt sit 0.2 off the register scan's
+                let scan3 = (nt > TMAX
+                    && !snapping
+                    && gd.dk == super::dense_mv::GDN_SCAN_DK
+                    && 2 * gd.nk * gd.dk + gd.nv * gd.dv == cdim
+                    && std::env::var("CMF_QWEN_SCAN3").as_deref() == Ok("1"))
+                .then(|| super::dense_mv::gdn(c).and_then(|g| g.scan2.as_ref()))
+                .flatten();
+                if let Some((prep, scan2, cols)) = scan3 {
+                    let qk = frame_buf_t(c, T_GQK, 0, TROWS * gd.nk * 256 * 4, false);
+                    let kq = frame_buf_t(c, T_GKQ, 0, TROWS * gd.nk * 4, false);
+                    let gb = frame_buf_t(c, T_GGB, 0, TROWS * gd.nv * 2 * 4, false);
+                    let bg_prep = bs.get(430, || {
+                        let ents = [
                             bind_buf(0, &cq),
                             bind_buf(2, &ab),
                             bind_buf(3, &bb),
                             bind_buf(4, &alog),
                             bind_buf(5, &dtb),
+                            bind_buf(9, &gd_p),
+                            bind_buf(10, &qk),
+                            bind_buf(11, &kq),
+                            bind_buf(12, &gb),
+                        ];
+                        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("qwen4-gdn-prep"),
+                            layout: &prep.get_bind_group_layout(0),
+                            entries: &ents,
+                        })
+                    });
+                    pass.set_pipeline(prep);
+                    pass.set_bind_group(0, &bg_prep, &[]);
+                    bs.launch(&mut pass, 430, (gd.nk as u32, nt as u32, 1));
+                    let bg_s3 = bs.get(431, || {
+                        let ents = [
+                            bind_buf(0, &cq),
                             bind_buf(7, st),
                             bind_buf(8, &gdo),
                             bind_buf(9, &gd_p),
-                            bind_buf(10, &snapb),
-                        ],
-                    })
-                });
-                pass.set_pipeline(park);
-                pass.set_bind_group(0, &bg_step, &[]);
-                bs.launch(
-                    &mut pass,
-                    405,
-                    (gd.nv as u32, (gd.dv as u32).div_ceil(4), 1),
-                );
+                            bind_buf(10, &qk),
+                            bind_buf(11, &kq),
+                            bind_buf(12, &gb),
+                        ];
+                        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("qwen4-gdn-scan3"),
+                            layout: &scan2.get_bind_group_layout(0),
+                            entries: &ents,
+                        })
+                    });
+                    pass.set_pipeline(scan2);
+                    pass.set_bind_group(0, &bg_s3, &[]);
+                    bs.launch(&mut pass, 431, (gd.nv as u32, (gd.dv as u32).div_ceil(*cols as u32), 1));
+                } else if let Some((scan, cols)) = scan {
+                    let bg_scan = bs.get(409, || {
+                        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("qwen4-gdn-scan"),
+                            layout: &scan.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(0, &cq),
+                                bind_buf(2, &ab),
+                                bind_buf(3, &bb),
+                                bind_buf(4, &alog),
+                                bind_buf(5, &dtb),
+                                bind_buf(7, st),
+                                bind_buf(8, &gdo),
+                                bind_buf(9, &gd_p),
+                            ],
+                        })
+                    });
+                    pass.set_pipeline(scan);
+                    pass.set_bind_group(0, &bg_scan, &[]);
+                    bs.launch(&mut pass, 409, (gd.nv as u32, (gd.dv as u32).div_ceil(*cols as u32), 1));
+                } else {
+                    let park = super::dense_mv::gdn(c).map_or(&c.gdn_step_par_k, |s| &s.park);
+                    let bg_step = bs.get(405, || {
+                        // the auto layout keeps only what the entry point touches
+                        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("qwen4-gdn-step-k"),
+                            layout: &park.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(0, &cq),
+                                bind_buf(2, &ab),
+                                bind_buf(3, &bb),
+                                bind_buf(4, &alog),
+                                bind_buf(5, &dtb),
+                                bind_buf(7, st),
+                                bind_buf(8, &gdo),
+                                bind_buf(9, &gd_p),
+                                bind_buf(10, &snapb),
+                            ],
+                        })
+                    });
+                    pass.set_pipeline(park);
+                    pass.set_bind_group(0, &bg_step, &[]);
+                    bs.launch(
+                        &mut pass,
+                        405,
+                        (gd.nv as u32, (gd.dv as u32).div_ceil(4), 1),
+                    );
+                }
                 dispatch(
                     c,
                     &mut pass,
@@ -6586,15 +9370,19 @@ pub(crate) fn encode_layer(
                     // read a stale table (the first multi-token frame after
                     // single-token ones left every later token attending at the
                     // wrong position).
-                    let mut tab: Vec<u32> = vec![0; TMAX * 4];
+                    let mut tab: Vec<u32> = vec![0; TROWS * 4];
                     let (mut max_complete, mut max_m) = (0usize, 0usize);
+                    let mut all_kept = true;
                     for t in 0..nt {
                         let pos = pos0 + t;
                         let npos = pos + 1;
                         let complete = npos / cr;
                         let keep = (g.index_budget / cr).min(complete);
+                        all_kept &= keep == complete;
                         let m = keep * cr + (npos - complete * cr);
-                        if complete > MAX_INDEX_BLOCKS || m > MAX_ATTEND {
+                        // the indexer's tables cap the exact path; a sealed layer
+                        // attends its far field and never reads them
+                        if !o1_sealed && (complete > index_blocks_cap() || m > MAX_ATTEND) {
                             return None;
                         }
                         max_complete = max_complete.max(complete);
@@ -6923,11 +9711,20 @@ pub(crate) fn encode_layer(
                             es(16),
                             es(MAX_ATTEND * 4),
                         );
-                        if max_complete > 0 {
+                        // every block of every token kept and the split attention
+                        // taking them: no scores, no ranking, no index list
+                        let groups = nh / nkv.max(1);
+                        let split = attend_split()
+                            && groups <= if attn_sp2() { 12 } else { 16 }
+                            && hd <= 256
+                            && hd % if attn_sp2() { 32 } else { 4 } == 0
+                            && nh % nkv.max(1) == 0;
+                        let identity = all_kept && split && topk_r() && qsa_identity();
+                        if max_complete > 0 && !identity {
                             dispatch(
                                 c,
                                 &mut pass,
-                                &p.t_ix_scores,
+                                if topk_r() { &p.t_ix_scores_l } else { &p.t_ix_scores },
                                 bc,
                                 508,
                                 "qwen4t-ix-scores",
@@ -6941,12 +9738,16 @@ pub(crate) fn encode_layer(
                                         uniform_u32x4(c, [ih as u32, idim as u32, iqs2, scs]),
                                     ]
                                 },
-                                (max_complete as u32, nt as u32, 1),
+                                if topk_r() {
+                                    ((max_complete as u32).div_ceil(256), nt as u32, 1)
+                                } else {
+                                    (max_complete as u32, nt as u32, 1)
+                                },
                             );
                             dispatch(
                                 c,
                                 &mut pass,
-                                &p.t_topk,
+                                if topk_r() { &p.t_topk_r } else { &p.t_topk },
                                 bc,
                                 509,
                                 "qwen4t-topk",
@@ -6962,64 +9763,149 @@ pub(crate) fn encode_layer(
                                 (nt as u32, 1, 1),
                             );
                         }
+                        if !identity {
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.t_idx_build,
+                                bc,
+                                510,
+                                "qwen4t-idx",
+                                || {
+                                    vec![
+                                        pick.clone(),
+                                        idx.clone(),
+                                        tabb.clone(),
+                                        uniform_u32x4(c, [cr as u32, pks, ids, 0]),
+                                    ]
+                                },
+                                ((max_m as u32).div_ceil(256).max(1), nt as u32, 1),
+                            );
+                        }
+                        if split {
+                            // split-key GQA attention: (KV head, chunk of 32 keys, token)
+                            // partials, then one fold per (head, token)
+                            const CH: usize = 32;
+                            let nsp = max_m.div_ceil(CH).max(1);
+                            let ps = hd;
+                            let po = frame_buf_t(c, T_ATSP_O, 0, TROWS * nsp.max(MAX_ATTEND.div_ceil(CH)) * nh * ps * 4, false);
+                            let pml = frame_buf_t(c, T_ATSP_ML, 0, TROWS * nsp.max(MAX_ATTEND.div_ceil(CH)) * nh * 8, false);
+                            let nsp_cap = nsp.max(MAX_ATTEND.div_ceil(CH));
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.t_attend_sp,
+                                bc,
+                                524,
+                                "qwen4t-attend-sp",
+                                || {
+                                    vec![
+                                        qb.clone(),
+                                        qd.k.clone(),
+                                        qd.v.clone(),
+                                        idx.clone(),
+                                        tabb.clone(),
+                                        po.clone(),
+                                        pml.clone(),
+                                        uniform_u32x16(
+                                            c,
+                                            [
+                                                nh as u32,
+                                                hd as u32,
+                                                (hd as f32).sqrt().recip().to_bits(),
+                                                groups as u32,
+                                                qd.cap as u32,
+                                                qbs,
+                                                ids,
+                                                CH as u32,
+                                                nsp_cap as u32,
+                                                ps as u32,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                            ],
+                                        ),
+                                    ]
+                                },
+                                (nkv as u32, nsp as u32, nt as u32),
+                            );
+                            dispatch(
+                                c,
+                                &mut pass,
+                                &p.t_attend_cmb,
+                                bc,
+                                525,
+                                "qwen4t-attend-cmb",
+                                || {
+                                    vec![
+                                        po.clone(),
+                                        pml.clone(),
+                                        gate.clone(),
+                                        tabb.clone(),
+                                        att.clone(),
+                                        uniform_u32x8(
+                                            c,
+                                            [
+                                                nh as u32,
+                                                hd as u32,
+                                                CH as u32,
+                                                nsp_cap as u32,
+                                                ps as u32,
+                                                gts,
+                                                es(nh * hd * 4),
+                                                0,
+                                            ],
+                                        ),
+                                    ]
+                                },
+                                (nh as u32, nt as u32, 1),
+                            );
+                        } else {
                         dispatch(
-                            c,
-                            &mut pass,
-                            &p.t_idx_build,
-                            bc,
-                            510,
-                            "qwen4t-idx",
-                            || {
-                                vec![
-                                    pick.clone(),
-                                    idx.clone(),
-                                    tabb.clone(),
-                                    uniform_u32x4(c, [cr as u32, pks, ids, 0]),
-                                ]
-                            },
-                            ((max_m as u32).div_ceil(256).max(1), nt as u32, 1),
-                        );
-                        dispatch(
-                            c,
-                            &mut pass,
-                            &p.t_attend,
-                            bc,
-                            511,
-                            "qwen4t-attend",
-                            || {
-                                vec![
-                                    qb.clone(),
-                                    qd.k.clone(),
-                                    qd.v.clone(),
-                                    idx.clone(),
-                                    gate.clone(),
-                                    att.clone(),
-                                    tabb.clone(),
-                                    uniform_u32x16(
-                                        c,
-                                        [
-                                            nh as u32,
-                                            hd as u32,
-                                            (hd as f32).sqrt().recip().to_bits(),
-                                            (nh / nkv) as u32,
-                                            qd.cap as u32,
-                                            qbs,
-                                            ids,
-                                            gts,
-                                            es(nh * hd * 4),
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                        ],
-                                    ),
-                                ]
-                            },
-                            (nh as u32, nt as u32, 1),
-                        );
+                                c,
+                                &mut pass,
+                                &p.t_attend,
+                                bc,
+                                511,
+                                "qwen4t-attend",
+                                || {
+                                    vec![
+                                        qb.clone(),
+                                        qd.k.clone(),
+                                        qd.v.clone(),
+                                        idx.clone(),
+                                        gate.clone(),
+                                        att.clone(),
+                                        tabb.clone(),
+                                        uniform_u32x16(
+                                            c,
+                                            [
+                                                nh as u32,
+                                                hd as u32,
+                                                (hd as f32).sqrt().recip().to_bits(),
+                                                (nh / nkv) as u32,
+                                                qd.cap as u32,
+                                                qbs,
+                                                ids,
+                                                gts,
+                                                es(nh * hd * 4),
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                            ],
+                                        ),
+                                    ]
+                                },
+                                (nh as u32, nt as u32, 1),
+                            );
+                        }
                     }
                     ts_pass(&mut pass, 10);
                 } else {
@@ -7036,7 +9922,9 @@ pub(crate) fn encode_layer(
                         let complete = npos / cr;
                         let keep = (g.index_budget / cr).min(complete);
                         let m = keep * cr + (npos - complete * cr);
-                        if complete > MAX_INDEX_BLOCKS || m > MAX_ATTEND {
+                        // the indexer's tables cap the exact path; a sealed layer
+                        // attends its far field and never reads them
+                        if !o1_sealed && (complete > MAX_INDEX_BLOCKS_OLD || m > MAX_ATTEND) {
                             return None;
                         }
                         let bt = Bc {
@@ -7474,7 +10362,185 @@ pub(crate) fn encode_layer(
                 0,
             ],
         );
-        if blocked_experts(g, global.segments) {
+        // q2tp gate/up banks take the sorted path only on the matrix units
+        let mm_ok = p.mm.is_some() && g.inter % 64 == 0 && hidden % 64 == 0 && (!g.gu_q2 || p.mm_gu_q2.is_some());
+        if blocked_experts(g, global.segments)
+            && nt > TMAX
+            && (!g.gu_q2 || mm_ok)
+            && sorted_experts()
+            && hidden % 16 == 0
+            && nt * slots <= 4096
+        {
+            // a prompt frame past eight tokens: the winners sorted by arena
+            // slot, so one expert's weights are read by back-to-back
+            // workgroups (L2) instead of once per token from DRAM
+            let nw = nt * slots;
+            let ord = tbuf_exact(c, T_ORD, slots * 4, false);
+            let part = frame_buf_t(c, T_EPART, 0, TROWS * slots * hidden * 4, false);
+            if let Some((mm_gu4, mm_dn)) = p.mm.as_ref().filter(|_| mm_ok) {
+                let mm_gu = if g.gu_q2 { p.mm_gu_q2.as_ref().unwrap_or(mm_gu4) } else { mm_gu4 };
+                // the matrix units: one workgroup per (64-row tile, expert segment)
+                let segb = frame_buf_t(c, T_ESEG, 0, 4097 * 16, false);
+                dispatch(
+                    c,
+                    &mut pass,
+                    &p.g_sort,
+                    bc,
+                    715,
+                    "qwen4g-sort",
+                    || vec![msel.clone(), ord.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
+                    (1, 1, 1),
+                );
+                dispatch(
+                    c,
+                    &mut pass,
+                    &p.g_segs,
+                    bc,
+                    734,
+                    "qwen4g-segs",
+                    || vec![msel.clone(), ord.clone(), segb.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
+                    (1, 1, 1),
+                );
+                let nseg = nw.min(g.n_experts.max(1)) as u32;
+                let bg_gu = bc.get(735, || {
+                    let gate_b: Vec<_> = global.gate.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                    let up_b: Vec<_> = global.up.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("qwen4g-mm-gu"),
+                        layout: &mm_gu.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::BufferArray(&gate_b) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::BufferArray(&up_b) },
+                            bind_buf(2, &x2),
+                            bind_buf(4, &mact),
+                            bind_buf(5, &ord),
+                            bind_buf(6, &segb),
+                        ],
+                    })
+                });
+                let bg_gu_p = bc.get(736, || {
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("qwen4g-mm-gu-p"),
+                        layout: &mm_gu.get_bind_group_layout(1),
+                        entries: &[bind_buf(0, &gu_u)],
+                    })
+                });
+                pass.set_pipeline(mm_gu);
+                pass.set_bind_group(0, &bg_gu, &[]);
+                pass.set_bind_group(1, &bg_gu_p, &[]);
+                pass.dispatch_workgroups((g.inter / 64) as u32, nseg, 1);
+                let bg_dn = bc.get(737, || {
+                    let down_b: Vec<_> = global.down.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("qwen4g-mm-dn"),
+                        layout: &mm_dn.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::BufferArray(&down_b) },
+                            bind_buf(1, &mact),
+                            bind_buf(3, &mwt),
+                            bind_buf(4, &part),
+                            bind_buf(5, &ord),
+                            bind_buf(6, &segb),
+                        ],
+                    })
+                });
+                let bg_dn_p = bc.get(738, || {
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("qwen4g-mm-dn-p"),
+                        layout: &mm_dn.get_bind_group_layout(1),
+                        entries: &[bind_buf(0, &dn_u)],
+                    })
+                });
+                pass.set_pipeline(mm_dn);
+                pass.set_bind_group(0, &bg_dn, &[]);
+                pass.set_bind_group(1, &bg_dn_p, &[]);
+                pass.dispatch_workgroups((hidden / 64) as u32, nseg, 1);
+                dispatch(
+                    c,
+                    &mut pass,
+                    &p.g_sum,
+                    bc,
+                    727,
+                    "qwen4g-sum",
+                    || vec![part.clone(), msel.clone(), mo.clone(), uniform_u32x4(c, [hidden as u32, slots as u32, nt as u32, es(hidden * 4)])],
+                    ((hidden as u32).div_ceil(256), nt as u32, 1),
+                );
+            } else {
+            dispatch(
+                c,
+                &mut pass,
+                &p.g_sort,
+                bc,
+                715,
+                "qwen4g-sort",
+                || vec![msel.clone(), ord.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
+                (1, 1, 1),
+            );
+            let bg_gu = bc.get(716, || {
+                let gate_b: Vec<_> = global.gate.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                let up_b: Vec<_> = global.up.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("qwen4g-gu"),
+                    layout: &p.g_gu_q4tp4.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::BufferArray(&gate_b) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::BufferArray(&up_b) },
+                        bind_buf(2, &x2),
+                        bind_buf(3, &msel),
+                        bind_buf(4, &mact),
+                        bind_buf(5, &ord),
+                    ],
+                })
+            });
+            let bg_gu_p = bc.get(717, || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("qwen4g-gu-p"),
+                    layout: &p.g_gu_q4tp4.get_bind_group_layout(1),
+                    entries: &[bind_buf(0, &gu_u)],
+                })
+            });
+            pass.set_pipeline(&p.g_gu_q4tp4);
+            pass.set_bind_group(0, &bg_gu, &[]);
+            pass.set_bind_group(1, &bg_gu_p, &[]);
+            pass.dispatch_workgroups((g.inter / 4) as u32, nw as u32, 1);
+            let bg_dn = bc.get(718, || {
+                let down_b: Vec<_> = global.down.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("qwen4g-dn"),
+                    layout: &p.g_dn_q4tp4.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::BufferArray(&down_b) },
+                        bind_buf(1, &mact),
+                        bind_buf(2, &msel),
+                        bind_buf(3, &mwt),
+                        bind_buf(4, &part),
+                        bind_buf(5, &ord),
+                    ],
+                })
+            });
+            let bg_dn_p = bc.get(719, || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("qwen4g-dn-p"),
+                    layout: &p.g_dn_q4tp4.get_bind_group_layout(1),
+                    entries: &[bind_buf(0, &dn_u)],
+                })
+            });
+            pass.set_pipeline(&p.g_dn_q4tp4);
+            pass.set_bind_group(0, &bg_dn, &[]);
+            pass.set_bind_group(1, &bg_dn_p, &[]);
+            pass.dispatch_workgroups((hidden as u32).div_ceil(16), nw as u32, 1);
+            dispatch(
+                c,
+                &mut pass,
+                &p.g_sum,
+                bc,
+                727,
+                "qwen4g-sum",
+                || vec![part.clone(), msel.clone(), mo.clone(), uniform_u32x4(c, [hidden as u32, slots as u32, nt as u32, es(hidden * 4)])],
+                ((hidden as u32).div_ceil(256), nt as u32, 1),
+            );
+            }
+        } else if blocked_experts(g, global.segments) {
             // four (eight) rows a workgroup: x read once per group for all
             let (gu4, dn4) = p.experts_blocked(g);
             let gr = p.gu_rows(g);
@@ -9245,6 +12311,36 @@ pub(crate) fn new_encoder(label: &'static str) -> Option<wgpu::CommandEncoder> {
 mod shader_tests {
     /// The module the device path compiles: both sources, every entry
     /// point the pipelines name.
+    /// The subgroup module as the device builds it (the qwen4 sources first).
+    #[test]
+    fn qwen4_sg_module_validates() {
+        let src = format!("{}{}{}", super::QWEN4_WGSL, super::QWEN4T_WGSL, super::QWEN4_SG_WGSL);
+        let module = wgpu::naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("qwen4 subgroup WGSL must parse: {}", e.emit_to_string(&src)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("qwen4 subgroup WGSL must validate: {}", e.emit_to_string(&src)));
+        for ep in ["q4_dn_q4tp4s", "q4_dn_q4tp4sv", "q4_dn_q4tp4sv128", "q4_q82_sg", "q4_q82_sg1", "q4t_route2"] {
+            assert!(module.entry_points.iter().any(|e| e.name == ep), "entry point {ep}");
+        }
+    }
+
+    #[test]
+    fn qwen4_mm_shader_validates() {
+        let src = super::QWEN4_MM_WGSL;
+        let module = wgpu::naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("qwen4 mm WGSL must parse: {}", e.emit_to_string(src)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("qwen4 mm WGSL must validate: {}", e.emit_to_string(src)));
+    }
+
     #[test]
     fn qwen4_shaders_validate() {
         let src = format!("{}{}", super::QWEN4_WGSL, super::QWEN4T_WGSL);
@@ -9276,6 +12372,7 @@ mod shader_tests {
             "q4_embed_gather_q82",
             "q4_gu_q2tp4",
             "q4_gu_q4tp4",
+            "q4_gu_q4tp4v",
             "q4_dn_q4tp4",
             "q4t_hc_down",
             "q4t_hc_upfold2",
@@ -9283,9 +12380,22 @@ mod shader_tests {
             "q4t_kv_append",
             "q4t_rawk",
             "q4t_ix_scores",
+            "q4t_ix_scores_l",
+            "q4t_topk_r",
             "q4t_topk",
             "q4t_idx_build",
             "q4t_attend",
+            "q4t_attend_sp",
+            "q4t_attend_sp2",
+            "q4t_attend_cmb",
+            "q4t_f16_pair_mm",
+            "q4t_pair_sum",
+            "q4g_gu_q4tp4",
+            "q4g_dn_q4tp4",
+            "q4g_sum",
+            "q4g_sort",
+            "q4g_segs",
+            "q4t_hc_fold_t",
             "q4t_o1_pack",
             "q4t_o1_gate",
             "q4t_tube_gu",
@@ -9310,7 +12420,7 @@ mod shader_tests {
         let info = naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
             .validate(&module)
             .expect("HC3 WGSL validates");
-        for ep in ["hc3_down", "hc3_upfold"] {
+        for ep in ["hc3_down", "hc3_down1", "hc3_down4", "hc3_upfold", "hc3_upfold4"] {
             assert!(
                 module.entry_points.iter().any(|e| e.name == ep),
                 "entry point {ep} missing"
@@ -9332,7 +12442,7 @@ mod shader_tests {
                 .is_err(),
             "HC3 must need the subgroup capability"
         );
-        for (ep, knob) in [("hc3_down", "H3_KD"), ("hc3_upfold", "H3_KU")] {
+        for (ep, knob) in [("hc3_down", "H3_KD"), ("hc3_down1", "H3_KD"), ("hc3_down4", "H3_KD"), ("hc3_upfold", "H3_KU"), ("hc3_upfold4", "H3_KU")] {
             for k in [0.0, 1.0, 5.0, 8.0] {
                 let mut pc = naga::back::PipelineConstants::default();
                 pc.insert(knob.to_string(), k);
@@ -9529,6 +12639,156 @@ mod hc3_device_tests {
         }
     }
 
+    /// The split-key GQA attention (`q4t_attend_sp` + `q4t_attend_cmb`) against the
+    /// per-head kernel it replaces: three tokens attending 70, 33 and 1 positions of a
+    /// two-KV-head cache, 24 query heads of 256, each through its sigmoid gate.
+    #[test]
+    fn split_attend_matches_per_head_kernel() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        let (nh, nkv, hd, cap, nt) = (24usize, 2usize, 256usize, 96usize, 3usize);
+        let ms = [70usize, 33, 1];
+        let is = 128usize;
+        let mut r = Rnd(0x5A11_7E2D);
+        let fill = |r: &mut Rnd, n: usize| -> Vec<f32> { (0..n).map(|_| r.n()).collect() };
+        let q = fill(&mut r, nt * nh * hd);
+        let k = fill(&mut r, nkv * cap * hd);
+        let v = fill(&mut r, nkv * cap * hd);
+        let gate = fill(&mut r, nt * nh * hd);
+        let mut idx = vec![0u32; nt * is];
+        let mut tab = vec![0u32; nt * 4];
+        for t in 0..nt {
+            for j in 0..ms[t] {
+                idx[t * is + j] = ((j * 7 + t * 3) % cap) as u32;
+            }
+            // one complete block, none kept: the kernels read the index list
+            // (kept == complete would take the identity list)
+            tab[t * 4 + 1] = 1;
+            tab[t * 4 + 3] = ms[t] as u32;
+        }
+        let up_f = |label: &str, data: &[f32]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, (data.len() * 4) as u64);
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+            b
+        };
+        let up_u = |label: &str, data: &[u32]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, (data.len() * 4) as u64);
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+            b
+        };
+        let (qb, kb, vb, gb) = (up_f("a-q", &q), up_f("a-k", &k), up_f("a-v", &v), up_f("a-g", &gate));
+        let (ib, tb) = (up_u("a-idx", &idx), up_u("a-tab", &tab));
+        let out_a = storage_buf(c, "a-out-a", (nt * nh * hd * 4) as u64);
+        let out_b = storage_buf(c, "a-out-b", (nt * nh * hd * 4) as u64);
+        const CH: usize = 32;
+        let nsp = ms.iter().max().unwrap().div_ceil(CH);
+        let po = storage_buf(c, "a-po", (nt * nsp * nh * hd * 4) as u64);
+        let pml = storage_buf(c, "a-pml", (nt * nsp * nh * 8) as u64);
+        let scale = (hd as f32).sqrt().recip().to_bits();
+        let (nh32, hd32, g32, cap32, qs, is32) = (nh as u32, hd as u32, (nh / nkv) as u32, cap as u32, (nh * hd) as u32, is as u32);
+        let ua = uniform_u32x16(c, [nh32, hd32, scale, g32, cap32, qs, is32, qs, qs, 0, 0, 0, 0, 0, 0, 0]);
+        let usp = uniform_u32x16(c, [nh32, hd32, scale, g32, cap32, qs, is32, CH as u32, nsp as u32, hd32, 0, 0, 0, 0, 0, 0]);
+        let ucb = uniform_u32x8(c, [nh32, hd32, CH as u32, nsp as u32, hd32, qs, qs, 0]);
+        let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
+            let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
+        };
+        let bga = bind(&p.t_attend, &[&qb, &kb, &vb, &ib, &gb, &out_a, &tb, &ua]);
+        let bgs = bind(&p.t_attend_sp, &[&qb, &kb, &vb, &ib, &tb, &po, &pml, &usp]);
+        let bgc = bind(&p.t_attend_cmb, &[&po, &pml, &gb, &tb, &out_b, &ucb]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-attend") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&p.t_attend);
+            pass.set_bind_group(0, &bga, &[]);
+            pass.dispatch_workgroups(nh as u32, nt as u32, 1);
+            pass.set_pipeline(&p.t_attend_sp);
+            pass.set_bind_group(0, &bgs, &[]);
+            pass.dispatch_workgroups(nkv as u32, nsp as u32, nt as u32);
+            pass.set_pipeline(&p.t_attend_cmb);
+            pass.set_bind_group(0, &bgc, &[]);
+            pass.dispatch_workgroups(nh as u32, nt as u32, 1);
+        }
+        submit(c, enc.finish());
+        let a = train_ops::download(c, &out_a, nt * nh * hd).unwrap();
+        let b = train_ops::download(c, &out_b, nt * nh * hd).unwrap();
+        let mut worst = 0f32;
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            let d = (x - y).abs();
+            assert!(d <= 2e-5 * x.abs().max(1.0), "element {i} (token {}, head {}): per-head {x} vs split {y}", i / (nh * hd), (i / hd) % nh);
+            worst = worst.max(d);
+        }
+        eprintln!("split attention vs per-head kernel: max |diff| {worst:.2e}");
+    }
+
+    /// The radix top-k (both its paths: everything kept, and the 8-bit digit
+    /// search) against a host sort: ties to the lower index, non-positive
+    /// scores all equal, the kept blocks in index order.
+    #[test]
+    fn radix_topk_matches_host() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        let cases = [(5000usize, 2048usize), (2048, 2048), (300, 2048), (3000, 1000), (4096, 1), (1500, 1499)];
+        let nt = cases.len();
+        let (ss, ps) = (8192usize, 4096usize);
+        let mut r = Rnd(0x7095_1D3A);
+        let mut sc = vec![0f32; nt * ss];
+        let mut tab = vec![0u32; nt * 4];
+        for (t, &(n, k)) in cases.iter().enumerate() {
+            for i in 0..n {
+                // a coarse ladder: many exact ties, some negative and zero scores
+                sc[t * ss + i] = ((r.n() * 6.0).round() / 4.0).max(-0.5) + if t % 2 == 0 { 0.0 } else { (r.n() * 1e-3).abs() };
+            }
+            tab[t * 4 + 1] = n as u32;
+            tab[t * 4 + 2] = k as u32;
+        }
+        let up = |label: &str, data: &[u8]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, data.len() as u64);
+            c.queue.write_buffer(&b, 0, data);
+            b
+        };
+        let sb = up("tk-s", bytemuck::cast_slice(&sc));
+        let tb = up("tk-tab", bytemuck::cast_slice(&tab));
+        let ib = storage_buf(c, "tk-idx", (nt * ps * 4) as u64);
+        let cb = storage_buf(c, "tk-cnt", (nt * 4 * 4) as u64);
+        let u = uniform_u32x4(c, [ss as u32, ps as u32, 4, 0]);
+        let ents: Vec<_> = [&sb, &ib, &cb, &tb, &u].iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+        let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.t_topk_r.get_bind_group_layout(0), entries: &ents });
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("t-topk") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&p.t_topk_r);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(nt as u32, 1, 1);
+        }
+        submit(c, enc.finish());
+        let idx: Vec<u32> = bytemuck::cast_slice(&train_ops::download(c, &ib, nt * ps).unwrap()).to_vec();
+        let cnt: Vec<u32> = bytemuck::cast_slice(&train_ops::download(c, &cb, nt * 4).unwrap()).to_vec();
+        for (t, &(n, k)) in cases.iter().enumerate() {
+            let key = |i: usize| -> u32 { let v = sc[t * ss + i]; if v <= 0.0 { 0 } else { v.to_bits() } };
+            let mut ord: Vec<usize> = (0..n).collect();
+            ord.sort_by(|&a, &b| key(b).cmp(&key(a)).then(a.cmp(&b)));
+            ord.truncate(k.min(n));
+            ord.sort();
+            let got: Vec<usize> = idx[t * ps..t * ps + cnt[t * 4] as usize].iter().map(|&v| v as usize).collect();
+            assert_eq!(got.len(), ord.len(), "case {t} (n {n}, k {k}): count");
+            assert_eq!(got, ord, "case {t} (n {n}, k {k}): kept blocks");
+        }
+        eprintln!("radix top-k matches the host sort on {nt} cases");
+    }
+
     /// The experts' tube kernels against the host: random q8_2f tubes of six experts,
     /// two tokens with four winners each (one rank empty), the MoE output accumulated.
     #[test]
@@ -9679,6 +12939,350 @@ mod hc3_device_tests {
                 assert!((got - want[d]).abs() <= 2e-4 * want[d].abs().max(1.0), "out t{t} d{d}: {got} vs {}", want[d]);
             }
         }
+    }
+
+    /// The matrix-unit f16 pair GEMM against the scalar one on random data: an
+    /// A/B pair of 300 + 4 rows over 1024 columns, 100 tokens, SiLU rows and
+    /// sigmoid gate rows, whole-K and split-K.
+    #[test]
+    fn pair_coop_matches_scalar() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable: skipped");
+            return;
+        };
+        let Some(pc) = p.pair_coop.as_ref() else {
+            eprintln!("no matrix-unit pair on {}: skipped", c.adapter_info.name);
+            return;
+        };
+        let (ra, rb, cols, nt) = (300usize, 4usize, 1024usize, 100usize);
+        let mut r = Rnd(0x9A1C_00F1);
+        let h16 = |v: f32| -> u16 { super::hc3_device_tests::f2h(v) };
+        let wa: Vec<u16> = (0..ra * cols).map(|_| h16(r.n() * 0.05)).collect();
+        let wb: Vec<u16> = (0..rb * cols).map(|_| h16(r.n() * 0.05)).collect();
+        let x: Vec<f32> = (0..nt * cols).map(|_| r.n()).collect();
+        let up = |label: &str, data: &[u8]| -> wgpu::Buffer {
+            let b = storage_buf(c, label, data.len() as u64);
+            c.queue.write_buffer(&b, 0, data);
+            b
+        };
+        let (ab, bb, xb) = (up("pc-a", bytemuck::cast_slice(&wa)), up("pc-b", bytemuck::cast_slice(&wb)), up("pc-x", bytemuck::cast_slice(&x)));
+        for ks in [1usize, 4] {
+            let kc = cols.div_ceil(ks).div_ceil(64) * 64;
+            let u = uniform_u32x16(c, [cols as u32, ra as u32, rb as u32, 3, 0.25f32.to_bits(), 0, nt as u32, cols as u32, ra as u32, rb as u32, kc as u32, ks as u32, 0, 0, 0, 0]);
+            let mut outs = Vec::new();
+            for (pipe, tile) in [(&p.t_f16_pair_mm, 16usize), (pc, 64usize)] {
+                let ya = storage_buf(c, "pc-ya", (nt * ra * 4) as u64);
+                let yb = storage_buf(c, "pc-yb", (nt * rb * 4) as u64);
+                let part = storage_buf(c, "pc-part", (ks * nt * (ra + rb) * 4).max(4) as u64);
+                let ents: Vec<_> = [&ab, &bb, &xb, &ya, &yb, &u, &part].iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+                let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents });
+                let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc") });
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups((ra + rb).div_ceil(64) as u32, nt.div_ceil(tile) as u32, ks as u32);
+                    if ks > 1 {
+                        let ents2: Vec<_> = [&part, &ya, &yb, &u].iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+                        let bg2 = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.t_pair_sum.get_bind_group_layout(0), entries: &ents2 });
+                        pass.set_pipeline(&p.t_pair_sum);
+                        pass.set_bind_group(0, &bg2, &[]);
+                        pass.dispatch_workgroups(((ra + rb) as u32).div_ceil(256), nt as u32, 1);
+                    }
+                }
+                submit(c, enc.finish());
+                let a: Vec<f32> = bytemuck::cast_slice(&train_ops::download(c, &ya, nt * ra).unwrap()).to_vec();
+                let b: Vec<f32> = bytemuck::cast_slice(&train_ops::download(c, &yb, nt * rb).unwrap()).to_vec();
+                outs.push((a, b));
+            }
+            let (mut wa_, mut wb_) = (0f32, 0f32);
+            for (x, y) in outs[0].0.iter().zip(&outs[1].0) {
+                wa_ = wa_.max((x - y).abs() / x.abs().max(0.05));
+            }
+            for (x, y) in outs[0].1.iter().zip(&outs[1].1) {
+                wb_ = wb_.max((x - y).abs());
+            }
+            eprintln!("pair coop vs scalar, ks {ks}: rows_a rel {wa_:.2e}, gate rows abs {wb_:.2e}");
+            assert!(wa_ < 3e-2 && wb_ < 1e-2, "coop pair departs: {wa_} {wb_}");
+        }
+    }
+
+    /// Kernel timing probe (`--ignored --nocapture` on the card): the cost of one
+    /// dependent dispatch (a chain of 1000 one-workgroup sums, each waiting on
+    /// the last) against the same dispatches with no hazard between them, and
+    /// the HC v3 pair at the decode shape (one token, pending inject, 13 MB of
+    /// f16 weights a call).
+    #[test]
+    #[ignore = "timing probe for the card"]
+    fn decode_kernel_bench() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable: skipped");
+            return;
+        };
+        let wait = || {
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        };
+        let time = |label: &str, n: usize, enc_fn: &dyn Fn(&mut wgpu::ComputePass<'_>, usize)| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("kbench") });
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..n {
+                        enc_fn(&mut pass, i);
+                    }
+                }
+                let cmd = enc.finish();
+                wait();
+                let t0 = std::time::Instant::now();
+                c.queue.submit([cmd]);
+                wait();
+                best = best.min(t0.elapsed().as_secs_f64() * 1e6 / n as f64);
+            }
+            eprintln!("[kbench] {label}: {best:.2} us a dispatch (best of 4, {n} in one pass)");
+            best
+        };
+        // 1. one-workgroup q4g_sum: dependent (one output) vs independent (16 outputs)
+        let part = upload(c, "kb-part", &vec![0u8; 64 * 10 * 4]);
+        let sel = upload(c, "kb-sel", bytemuck::cast_slice(&vec![0u32; 10]));
+        let outs: Vec<wgpu::Buffer> = (0..16).map(|_| upload(c, "kb-mo", &vec![0u8; 64 * 4])).collect();
+        let u = uniform_u32x4(c, [64, 10, 1, 64]);
+        let bgs: Vec<wgpu::BindGroup> = outs
+            .iter()
+            .map(|o| {
+                let ents: Vec<_> = [&part, &sel, o, &u].iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.g_sum.get_bind_group_layout(0), entries: &ents })
+            })
+            .collect();
+        time("q4g_sum 1 WG, dependent chain", 1000, &|pass, _| {
+            pass.set_pipeline(&p.g_sum);
+            pass.set_bind_group(0, &bgs[0], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        });
+        time("q4g_sum 1 WG, 16 independent outputs", 1000, &|pass, i| {
+            pass.set_pipeline(&p.g_sum);
+            pass.set_bind_group(0, &bgs[i % 16], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        });
+        // 2. HC v3 pair, decode shape
+        if p.hc3.is_none() {
+            eprintln!("HC v3 not admitted: HC timing skipped");
+            return;
+        }
+        let (hidden, hc, lr) = (2560usize, 4usize, 320usize);
+        let hh = hc * hidden;
+        let g = Geom {
+            hidden,
+            hc,
+            eps: 1e-6,
+            n_heads: 24,
+            n_kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            index_heads: 4,
+            index_dim: 128,
+            index_budget: 2048,
+            compress_ratio: 4,
+            gdn: GdnGeom { nv: 48, nk: 16, dk: 128, dv: 128, kk: 4 },
+            ple_kernel: 4,
+            ple_dilation: 1,
+            top_k: 10,
+            n_experts: 256,
+            inter: 640,
+            gu_q2: false,
+        };
+        let dev = Dev::new(0xC3C3_0B01, &g, &[]).expect("device state");
+        let mut r = Rnd(0x51ED_2701);
+        // a ring of weight sets, so the timing reads DRAM and not the 13 MB in L2
+        let sets: Vec<(WeightRef, WeightRef, WeightRef)> = (0..12)
+            .map(|_| (f16_weight(c, &mut r, lr, hh, 0.02), f16_weight(c, &mut r, hc, hh, 0.02), f16_weight(c, &mut r, hh, lr, 0.3)))
+            .collect();
+        let norm: Vec<f32> = (0..hh).map(|_| r.n() * 0.1).collect();
+        let nw = const_buf(c, bytemuck::cast_slice(&norm));
+        let os = es(hidden * 4) as usize;
+        let gsd = es(hc * 4) as usize;
+        let ls = es(lr * 4) as usize;
+        let hs = es(hh * 4) as usize;
+        let h0: Vec<f32> = (0..TMAX * hs).map(|_| r.n()).collect();
+        c.queue.write_buffer(&dev.hyper, 0, bytemuck::cast_slice(&h0));
+        let blk = upload(c, "kb-blk", bytemuck::cast_slice(&(0..TMAX * os).map(|_| r.n()).collect::<Vec<f32>>()));
+        let gate = upload(c, "kb-gate", bytemuck::cast_slice(&(0..TMAX * gsd).map(|_| r.n()).collect::<Vec<f32>>()));
+        let x = upload(c, "kb-x", &vec![0u8; TMAX * os * 4]);
+        let y = upload(c, "kb-y", &vec![0u8; TMAX * gsd * 4]);
+        let low = upload(c, "kb-low", &vec![0u8; TMAX * ls * 4]);
+        for nt in [1usize, 4] {
+            let us = time(&format!("HC v3 pair, nt {nt}, pending inject"), 240, &|pass, i| {
+                let (down, inj, up) = &sets[i % sets.len()];
+                let bc = Bc { dev: &dev, li: i % sets.len(), tok: TW + nt, direct: true };
+                let pre = PreInject { blk: &blk, bs: os as u32, gate: &gate, gs: gsd as u32, step: 2 };
+                encode_hc_v3(c, p, pass, &g, &nw, down, up, Some(inj), &dev.hyper, &x, &low, &y, Some(&pre), nt, bc, 100)
+                    .expect("HC v3 takes this shape");
+            });
+            let mb = (2 * lr * hh * 2 + hc * hh * 2) as f64 / 1e6;
+            eprintln!("[kbench]   = {:.0} GB/s over {mb:.1} MB of weights (two dispatches a call)", mb * 1e3 / us);
+        }
+        // 3. the router-shaped one-token f16 pair: 256 + 1 rows of 2560
+        let ra: Vec<WeightRef> = (0..12).map(|_| f16_weight(c, &mut r, 256, hidden, 0.02)).collect();
+        let rb: Vec<WeightRef> = (0..12).map(|_| f16_weight(c, &mut r, 1, hidden, 0.02)).collect();
+        let xr = upload(c, "kb-xr", bytemuck::cast_slice(&(0..hidden).map(|_| r.n()).collect::<Vec<f32>>()));
+        let ya = upload(c, "kb-ya", &vec![0u8; 512 * 4]);
+        let yb = upload(c, "kb-yb", &vec![0u8; 64 * 4]);
+        let ur = uniform_u32x8(c, [hidden as u32, 256, 1, 2, 1.0f32.to_bits(), 10, 0, 0]);
+        let bgr: Vec<wgpu::BindGroup> = (0..12)
+            .map(|i| {
+                let ents: Vec<_> = [&ra[i].buf, &rb[i].buf, &xr, &ya, &yb, &ur].iter().enumerate().map(|(k, b)| bind_buf(k as u32, b)).collect();
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.f16_matvec2.get_bind_group_layout(0), entries: &ents })
+            })
+            .collect();
+        time("router pair f16_matvec2 257 x 2560, one token", 480, &|pass, i| {
+            pass.set_pipeline(&p.f16_matvec2);
+            pass.set_bind_group(0, &bgr[i % 12], &[]);
+            pass.dispatch_workgroups(257, 1, 1);
+        });
+        // 4. split attention + fold at the decode shape: 24 heads, 2 KV heads of 256,
+        // 2051 keys (the 2048-position budget and the open tail)
+        let (nh, nkv, hd, cap, m) = (24usize, 2usize, 256usize, 4096usize, 2051usize);
+        let qv = upload(c, "kb-q", bytemuck::cast_slice(&(0..nh * hd).map(|_| r.n()).collect::<Vec<f32>>()));
+        let kc = upload(c, "kb-k", bytemuck::cast_slice(&(0..nkv * cap * hd).map(|_| r.n()).collect::<Vec<f32>>()));
+        let vc = upload(c, "kb-v", bytemuck::cast_slice(&(0..nkv * cap * hd).map(|_| r.n()).collect::<Vec<f32>>()));
+        let gt = upload(c, "kb-g", bytemuck::cast_slice(&(0..nh * hd).map(|_| r.n()).collect::<Vec<f32>>()));
+        let is = 4096usize;
+        let idxv: Vec<u32> = (0..is as u32).map(|j| (j * 7) % m as u32).collect();
+        let ib = upload(c, "kb-idx", bytemuck::cast_slice(&idxv));
+        let tb = upload(c, "kb-tab", bytemuck::cast_slice(&[3000u32, 750, 512, m as u32]));
+        const CH: usize = 32;
+        let nsp = m.div_ceil(CH);
+        let po = upload(c, "kb-po", &vec![0u8; nsp * nh * hd * 4]);
+        let pml = upload(c, "kb-pml", &vec![0u8; nsp * nh * 8]);
+        let att = upload(c, "kb-att", &vec![0u8; nh * hd * 4]);
+        let scale = (hd as f32).sqrt().recip().to_bits();
+        let (nh32, hd32, g32, cap32, qs, is32) = (nh as u32, hd as u32, (nh / nkv) as u32, cap as u32, (nh * hd) as u32, is as u32);
+        let usp = uniform_u32x16(c, [nh32, hd32, scale, g32, cap32, qs, is32, CH as u32, nsp as u32, hd32, 0, 0, 0, 0, 0, 0]);
+        let ucb = uniform_u32x8(c, [nh32, hd32, CH as u32, nsp as u32, hd32, qs, qs, 0]);
+        let bind = |pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]| {
+            let ents: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &ents })
+        };
+        let bgs = bind(&p.t_attend_sp, &[&qv, &kc, &vc, &ib, &tb, &po, &pml, &usp]);
+        let bgc = bind(&p.t_attend_cmb, &[&po, &pml, &gt, &tb, &att, &ucb]);
+        time("split attention partials, 2051 keys", 240, &|pass, _| {
+            pass.set_pipeline(&p.t_attend_sp);
+            pass.set_bind_group(0, &bgs, &[]);
+            pass.dispatch_workgroups(nkv as u32, nsp as u32, 1);
+        });
+        // 5. one-token q8_2f matvecs at the GDN shapes (qkv [10240, 2560], out [2560, 6144])
+        for (shape, (rows, cols)) in [(10240usize, 2560usize), (2560, 6144), (12288, 2560)].into_iter().enumerate() {
+            let ws: Vec<WeightRef> = (0..6)
+                .map(|_| {
+                    let vals: Vec<f32> = (0..rows * cols).map(|_| r.n() * 0.02).collect();
+                    let bytes = cortiq_core::quant::encode_q8_2f(&vals, rows, cols);
+                    WeightRef { buf: upload(c, "kb-q82", &bytes), dtype: TensorDtype::Q8_2f, rows, cols }
+                })
+                .collect();
+            let xq = upload(c, "kb-xq", bytemuck::cast_slice(&(0..cols).map(|_| r.n()).collect::<Vec<f32>>()));
+            let yq = upload(c, "kb-yq", &vec![0u8; rows * 4]);
+            let mb = (rows * cols) as f64 * 1.0625 / 1e6;
+            let us = time(&format!("q8_2f matvec [{rows}, {cols}], one token"), 240, &|pass, i| {
+                // a layer slot per (shape, weight set): the bind cache keys on it
+                let bc = Bc { dev: &dev, li: 20 + shape * 8 + i % ws.len(), tok: TW + 1, direct: true };
+                assert!(q82_t(c, p, pass, &ws[i % ws.len()], &xq, cols as u32, &yq, rows as u32, 1, bc, 400));
+            });
+            eprintln!("[kbench]   = {:.0} GB/s over {mb:.1} MB", mb * 1e3 / us);
+            // the output of the last weight set, to compare kernel variants across runs
+            let yv: Vec<f32> = bytemuck::cast_slice(&train_ops::download(c, &yq, rows).unwrap()).to_vec();
+            let sum: f64 = yv.iter().map(|v| f64::from(*v).abs()).sum();
+            eprintln!("[kbench]   y[0..3] {:.6} {:.6} {:.6}, sum|y| {sum:.4}", yv[0], yv[1], yv[2]);
+        }
+        // 6. decode experts (blocked gate/up + down, 11 slots: ten routed and the shared)
+        //    over an arena of 8 segments x 24 experts (~490 MB, past the L2)
+        {
+            const PS: usize = 24;
+            let (inter, gsl) = (640usize, 11usize);
+            let gu_len = cortiq_core::quant::expected_nbytes(TensorDtype::Q4TiledP, &[inter, hidden]).unwrap();
+            let d_len = cortiq_core::quant::expected_nbytes(TensorDtype::Q4TiledP, &[hidden, inter]).unwrap();
+            let rnd_bank = |r: &mut Rnd, len: usize| -> Vec<wgpu::Buffer> {
+                (0..8)
+                    .map(|_| {
+                        let v: Vec<u8> = (0..len * PS)
+                            .map(|_| ((r.bits() >> 40) as u8) & 0x77)
+                            .collect();
+                        upload(c, "kb-bank", &v)
+                    })
+                    .collect()
+            };
+            let (gb, ub, db) = (rnd_bank(&mut r, gu_len), rnd_bank(&mut r, gu_len), rnd_bank(&mut r, d_len));
+            fn arr4(v: &[wgpu::Buffer]) -> Vec<wgpu::BufferBinding<'_>> {
+                v.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect()
+            }
+            fn ent<'a>(b: u32, a: &'a [wgpu::BufferBinding<'a>]) -> wgpu::BindGroupEntry<'a> {
+                wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::BufferArray(a) }
+            }
+            let (ga, ua, da) = (arr4(&gb), arr4(&ub), arr4(&db));
+            let ge = Geom { inter, ..g };
+            let (gu4, dn4) = p.experts_blocked(&ge);
+            let xe = upload(c, "kb-xe", bytemuck::cast_slice(&(0..hidden).map(|_| r.n()).collect::<Vec<f32>>()));
+            let wte = upload(c, "kb-wte", bytemuck::cast_slice(&vec![0.1f32; gsl]));
+            let acte = upload(c, "kb-acte", &vec![0u8; gsl * inter * 4]);
+            let ye = upload(c, "kb-ye", &vec![0u8; hidden * 4]);
+            let gu_u = uniform_u32x8(c, [(hidden / 32) as u32, inter as u32, gsl as u32, (gu_len / 2) as u32, 0, PS as u32, 0, 0]);
+            let dn_u = uniform_u32x8(c, [(inter / 32) as u32, hidden as u32, gsl as u32, (d_len / 2) as u32, PS as u32, 0, 0, 0]);
+            let n_exp = 8 * PS;
+            let sels: Vec<wgpu::Buffer> = (0..16)
+                .map(|k| {
+                    let v: Vec<u32> = (0..gsl).map(|s| ((k * 11 + s * 17) % n_exp) as u32).collect();
+                    upload(c, "kb-sel", bytemuck::cast_slice(&v))
+                })
+                .collect();
+            let mk = |pipe: &wgpu::ComputePipeline, ents: &[wgpu::BindGroupEntry]| {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: ents })
+            };
+            let mkp = |pipe: &wgpu::ComputePipeline, u: &wgpu::Buffer| {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(1), entries: &[bind_buf(0, u)] })
+            };
+            let bgu: Vec<wgpu::BindGroup> = sels
+                .iter()
+                .map(|sl| mk(gu4, &[ent(0, &ga), ent(1, &ua), bind_buf(2, &xe), bind_buf(3, sl), bind_buf(4, &acte)]))
+                .collect();
+            let bdn: Vec<wgpu::BindGroup> = sels
+                .iter()
+                .map(|sl| mk(dn4, &[ent(0, &da), bind_buf(1, &acte), bind_buf(2, sl), bind_buf(3, &wte), bind_buf(4, &ye)]))
+                .collect();
+            let (pgu, pdn) = (mkp(gu4, &gu_u), mkp(dn4, &dn_u));
+            let gr = p.gu_rows(&ge) as u32;
+            let us_gu = time("decode experts gate/up (11 slots)", 480, &|pass, i| {
+                pass.set_pipeline(gu4);
+                pass.set_bind_group(0, &bgu[i % 16], &[]);
+                pass.set_bind_group(1, &pgu, &[]);
+                pass.dispatch_workgroups(inter as u32 / gr, gsl as u32, 1);
+            });
+            eprintln!("[kbench]   = {:.0} GB/s over {:.1} MB", (2 * gu_len * gsl) as f64 / 1e3 / us_gu, (2 * gu_len * gsl) as f64 / 1e6);
+            let us_dn = time("decode experts down (11 slots)", 480, &|pass, i| {
+                pass.set_pipeline(dn4);
+                pass.set_bind_group(0, &bdn[i % 16], &[]);
+                pass.set_bind_group(1, &pdn, &[]);
+                pass.dispatch_workgroups((hidden / 4) as u32, 1, 1);
+            });
+            eprintln!("[kbench]   = {:.0} GB/s over {:.1} MB", (d_len * gsl) as f64 / 1e3 / us_dn, (d_len * gsl) as f64 / 1e6);
+        }
+        time("split attention partials + fold", 240, &|pass, i| {
+            if i % 2 == 0 {
+                pass.set_pipeline(&p.t_attend_sp);
+                pass.set_bind_group(0, &bgs, &[]);
+                pass.dispatch_workgroups(nkv as u32, nsp as u32, 1);
+            } else {
+                pass.set_pipeline(&p.t_attend_cmb);
+                pass.set_bind_group(0, &bgc, &[]);
+                pass.dispatch_workgroups(nh as u32, 1, 1);
+            }
+        });
     }
 
     #[test]
@@ -9856,7 +13460,8 @@ mod hc3_device_tests {
                     let old = run(false);
                     let new = run(true);
                     let ex = rel(&new[0], &old[0], nt, os, hidden);
-                    let el = rel(&new[1], &old[1], nt, ls, lr);
+                    // the stream-split pair keeps its shares in its own buffer
+                    let el = if hc4() { 0.0 } else { rel(&new[1], &old[1], nt, ls, lr) };
                     let ei = if with_b {
                         rel(&new[2], &old[2], nt, gsd, hc)
                     } else {
@@ -10096,7 +13701,10 @@ mod expert4_tests {
                 0,
             ],
         );
-        let gu4 = p.gu4(false);
+        // the vec4-load twins where this shape takes them (CMF_QWEN_V4LOAD=0: the u32 ones)
+        let v4 = v4load() && q4tp_words16(INTER, HIDDEN) && q4tp_words16(HIDDEN, INTER);
+        let gu4 = if v4 { p.experts_blocked(&g).0 } else { p.gu4(false) };
+        eprintln!("blocked arm: {}", if v4 { "q4_gu_q4tp4v + the vec4 down" } else { "q4_gu_q4tp4 + q4_dn_q4tp4" });
         let bg = |pipe: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry]| {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("e4-test"),
@@ -10158,7 +13766,7 @@ mod expert4_tests {
             )
         };
         let dn_old = dn(p_dn, &act_old, &y_old);
-        let dn_new = dn(&p.dn_q4tp4, &act_new, &y_new);
+        let dn_new = dn(if v4 { p.dn4sv.as_ref().unwrap_or(&p.dn_q4tp4) } else { &p.dn_q4tp4 }, &act_new, &y_new);
         type Arm<'a> = (&'a wgpu::ComputePipeline, wgpu::BindGroup, wgpu::BindGroup);
         let launch = |pass: &mut PassHandle, a: &Arm, wg: (u32, u32, u32)| {
             pass.set_pipeline(a.0);
