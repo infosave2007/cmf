@@ -2621,6 +2621,23 @@ enum Commands {
     TailTrim {
         model: String,
     },
+    /// Fit the expert packs' router of a Qwen3.8-Flash-Next file (read at run time from
+    /// `CMF_QWEN_PACKS=DIR`): DIR holds per task `<task>.phi` (routing windows dumped with
+    /// `CMF_QWEN_PHI_DUMP`) and `<task>.profile` (`CMF_QWEN_PROFILE_SAVE`); each task gets
+    /// an isolated topology of its own windows, written to DIR/router.json
+    #[command(hide = true)]
+    QwenPacks {
+        dir: String,
+        /// Layers whose routing makes the signal φ
+        #[arg(long, default_value = "8")]
+        layers: usize,
+        /// Rank of each task's subspace
+        #[arg(long, default_value = "16")]
+        rank: usize,
+        /// Window sizes, in dumped windows, the topologies are fitted on
+        #[arg(long, default_value = "1,2,4")]
+        blocks: String,
+    },
     /// Fit the keyless decision: a message with no key that asks for a fact goes to a keyless record
     RouteFitKeyless {
         /// .cmf file (updated in place, append-only)
@@ -5645,6 +5662,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::TailTrim { model } => {
             let (before, after) = cortiq_core::CmfModel::trim_header_tail(&model)?;
             println!("{model}: {before} -> {after} bytes");
+            Ok(())
+        }
+        Commands::QwenPacks { dir, layers, rank, blocks } => {
+            let b: Vec<usize> = blocks.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let report = cortiq_engine::qwen4_exp::fit_packs(&dir, layers, rank, &b).map_err(anyhow::Error::msg)?;
+            print!("{report}");
             Ok(())
         }
         Commands::RouteFitKeyless { model, record, fact_phi, chat_phi, rank, margin } => {

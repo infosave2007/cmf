@@ -959,6 +959,8 @@ fn q4t_route(@builtin(workgroup_id) wid: vec3<u32>,
     let subset = (tr_p.flags & 16u) != 0u;
     let qwen = (tr_p.flags & 32u) != 0u;
     let shared_gated = (tr_p.flags & 64u) != 0u;
+    // flag 128 (with a remap): the ranking sees only the experts the arena holds
+    let masked = subset && (tr_p.flags & 128u) != 0u;
     if (lid < k) {
         tr_used[lid] = 0u;
         tr_idx[i0 + lid] = 0u;
@@ -988,6 +990,7 @@ fn q4t_route(@builtin(workgroup_id) wid: vec3<u32>,
             if (v <= 20.0) { sp = log(1.0 + exp(v)); }
             sc = sqrt(sp);
         }
+        if (masked && tr_map[i] == 0xFFFFFFFFu) { sc = bitcast<f32>(0xFF800000u); }
         tr_sc[i] = sc;
         i = i + 1024u;
     }
@@ -2897,6 +2900,87 @@ fn q4g_segs(@builtin(local_invocation_index) lid: u32) {
     }
 }
 
+// Frames past 4096 winners (`q4g_sort` holds 4096 keys in workgroup memory): a counting
+// sort by arena slot in global memory, into `q4g_segs`' layout — counts, one workgroup's
+// scan into each slot's first sorted position and the segment table, scatter. Winners of
+// one slot come out in any order: every winner's rows are computed on their own (the
+// GEMM rows are independent), so the results do not depend on it.
+struct QcsP { n: u32, nslots: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       qcs_sel : array<u32>;
+@group(0) @binding(1) var<storage, read_write> qcs_cnt : array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> qcs_ord : array<u32>;
+@group(0) @binding(3) var<storage, read_write> qcs_seg : array<vec4<u32>>;
+@group(0) @binding(4) var<uniform>             qcs_p   : QcsP;
+// every kernel names all five bindings (the auto layout keeps only the used ones, and
+// the four share one bind group); the branch never runs
+fn qcs_touch() {
+    if (qcs_p._a == 0xFFFFFFFFu) {
+        qcs_ord[0] = qcs_sel[0] + atomicLoad(&qcs_cnt[0]);
+        qcs_seg[0] = vec4<u32>(0u);
+    }
+}
+@compute @workgroup_size(256)
+fn q4g_cs_clear(@builtin(global_invocation_id) g: vec3<u32>) {
+    qcs_touch();
+    if (g.x < qcs_p.nslots) { atomicStore(&qcs_cnt[g.x], 0u); }
+}
+@compute @workgroup_size(256)
+fn q4g_cs_count(@builtin(global_invocation_id) g: vec3<u32>) {
+    qcs_touch();
+    if (g.x >= qcs_p.n) { return; }
+    let sl = qcs_sel[g.x];
+    if (sl < qcs_p.nslots) { atomicAdd(&qcs_cnt[sl], 1u); }
+}
+var<workgroup> qcs_sc: array<u32, 1024>;
+@compute @workgroup_size(1024)
+fn q4g_cs_scan(@builtin(local_invocation_index) lid: u32) {
+    qcs_touch();
+    let ns = qcs_p.nslots;
+    let per = (ns + 1023u) / 1024u;
+    let a = lid * per;
+    // this lane's bins: their winners (low 16 bits) and how many hold any (high 16)
+    var mine = 0u;
+    for (var j = 0u; j < per; j = j + 1u) {
+        let sl = a + j;
+        if (sl < ns) {
+            let c = atomicLoad(&qcs_cnt[sl]);
+            mine = mine + c + (select(0u, 1u, c > 0u) << 16u);
+        }
+    }
+    qcs_sc[lid] = mine;
+    workgroupBarrier();
+    for (var o = 1u; o < 1024u; o = o << 1u) {
+        var v = qcs_sc[lid];
+        if (lid >= o) { v = v + qcs_sc[lid - o]; }
+        workgroupBarrier();
+        qcs_sc[lid] = v;
+        workgroupBarrier();
+    }
+    let ex = qcs_sc[lid] - mine;
+    var st = ex & 0xFFFFu;
+    var sid = ex >> 16u;
+    for (var j = 0u; j < per; j = j + 1u) {
+        let sl = a + j;
+        if (sl < ns) {
+            let c = atomicLoad(&qcs_cnt[sl]);
+            if (c > 0u) {
+                qcs_seg[sid] = vec4<u32>(sl, st, c, 0u);
+                sid = sid + 1u;
+            }
+            atomicStore(&qcs_cnt[sl], st);
+            st = st + c;
+        }
+    }
+    if (lid == 1023u) { qcs_seg[4096] = vec4<u32>(qcs_sc[1023] >> 16u, 0u, 0u, 0u); }
+}
+@compute @workgroup_size(256)
+fn q4g_cs_scatter(@builtin(global_invocation_id) g: vec3<u32>) {
+    qcs_touch();
+    if (g.x >= qcs_p.n) { return; }
+    let sl = qcs_sel[g.x];
+    if (sl < qcs_p.nslots) { qcs_ord[atomicAdd(&qcs_cnt[sl], 1u)] = g.x; }
+}
+
 
 // ── O(1) layers: the frame's rows packed for the engine's far-field kernels
 // (dense `[t][nh·hd]` and `[t][nkv·hd]`), and while the prompt runs exact the
@@ -3443,6 +3527,7 @@ fn q4t_route2(@builtin(workgroup_id) wid: vec3<u32>,
     let subset = (tr_p.flags & 16u) != 0u;
     let qwen = (tr_p.flags & 32u) != 0u;
     let shared_gated = (tr_p.flags & 64u) != 0u;
+    let masked = subset && (tr_p.flags & 128u) != 0u;
     let shared_slot = tr_p.flags >> 8u;
     if (pin_shared && lid == 0u) {
         tr_idx[i0 + k] = shared_slot;
@@ -3454,6 +3539,7 @@ fn q4t_route2(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let neg_inf = bitcast<f32>(0xFF800000u);
     var alive = lid < n;
+    if (alive && masked) { alive = tr_map[lid] != 0xFFFFFFFFu; }
     var si = neg_inf;
     if (alive) {
         let v = tr_s[s0 + lid];
@@ -4963,6 +5049,8 @@ pub(crate) struct Pipes {
     g_sum: wgpu::ComputePipeline,
     g_sort: wgpu::ComputePipeline,
     g_segs: wgpu::ComputePipeline,
+    /// The counting sort of frames past 4096 winners: clear, count, scan, scatter.
+    g_cs: [wgpu::ComputePipeline; 4],
     /// `q4g_mm_gu` / `q4g_mm_dn` (`QWEN4_MM_WGSL`): the prompt frames'
     /// expert GEMMs on the matrix units; None without cooperative matrices,
     /// 32-lane subgroups, on rejection, or with `CMF_QWEN_MM=0`.
@@ -5575,6 +5663,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         g_sum: pipe("q4g_sum"),
         g_sort: pipe("q4g_sort"),
         g_segs: pipe("q4g_segs"),
+        g_cs: [pipe("q4g_cs_clear"), pipe("q4g_cs_count"), pipe("q4g_cs_scan"), pipe("q4g_cs_scatter")],
         mm: build_mm(c, &gu_layout_t, &dn_layout_t),
         mm_gu_q2: build_mm_q2(c, &gu_layout_t),
         pair_coop: build_pair_coop(c),
@@ -5974,6 +6063,16 @@ pub(crate) struct Dev {
     /// eight bits) and its activations `[TMAX][h]`.
     tubes_shared: Vec<Option<TubeBank>>,
     tube_act_s: Option<wgpu::Buffer>,
+    /// The streamed prompt (`forward_stream_device`): per frame of a chunk the state that
+    /// crosses a layer boundary — the hyper rows, the MoE output and its inject weights —
+    /// parked while the chunk's other frames run the same layer.
+    sbank: Vec<[wgpu::Buffer; 3]>,
+    /// The streamed prompt's routing: every (layer, frame)'s cold/pick rows copied out,
+    /// read once when the chunk is done (`route_cap_read`).
+    route_cap: Option<wgpu::Buffer>,
+    /// Routing kept to the experts the arena holds (`set_masked`): the narrow bundle of a
+    /// request decodes with no cold winner, as a resident model does.
+    pub(crate) masked: bool,
 }
 
 /// Indirect-argument slots per layer row (16 bytes each).
@@ -6410,6 +6509,17 @@ const T_MWT: u8 = 230;
 const T_MCNT: u8 = 231;
 const T_MACT: u8 = 232;
 const T_MO: u8 = 233;
+/// Counting sort bins of frames past 4096 winners (`q4g_cs_*`).
+const T_CSCNT: u8 = 21;
+/// The prompt frame's activation scale and its partial maxima (`q82_t` on the matrix units).
+const T_Q82ASC: u8 = 22;
+const T_Q82AMP: u8 = 23;
+
+/// `CMF_QWEN_Q82COOP=0`: prompt frames keep the scalar int8 GEMM for q8_2f projections.
+fn q82_coop_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_Q82COOP").as_deref() != Ok("0"))
+}
 const T_COLD: u8 = 234;
 const T_REMAP: u8 = 235;
 const T_COLDVEC: u8 = 236;
@@ -6735,6 +6845,9 @@ impl Dev {
             tube_act: None,
             tubes_shared: Vec::new(),
             tube_act_s: None,
+            sbank: Vec::new(),
+            route_cap: None,
+            masked: false,
         })
     }
 
@@ -6781,6 +6894,111 @@ impl Dev {
     /// Drop the deferred injection (a token nobody reads the logits of).
     pub(crate) fn clear_pending(&mut self) {
         self.pending_inject = false;
+    }
+
+    /// Room in the streamed prompt's bank for `frames` frames of TROWS rows.
+    pub(crate) fn stream_bank(&mut self, g: &Geom, frames: usize) -> bool {
+        let Some(c) = ctx() else { return false };
+        while self.sbank.len() < frames {
+            self.sbank.push([
+                storage_buf(c, "qwen4-sbank-hyper", (TROWS * self.hh * 4) as u64),
+                storage_buf(c, "qwen4-sbank-mo", (TROWS * tstride(g.hidden * 4)) as u64),
+                storage_buf(c, "qwen4-sbank-inj", (TROWS * tstride(g.hc * 4)) as u64),
+            ]);
+        }
+        true
+    }
+
+    /// Keep the routing to the arena's experts (or not). The route kernels take the flag in
+    /// a uniform their cached bind groups hold, so a change drops the bind cache.
+    pub(crate) fn set_masked(&mut self, on: bool) {
+        if self.masked != on {
+            self.masked = on;
+            self.binds.borrow_mut().clear();
+        }
+    }
+
+    /// A routing capture of at least `bytes` (grow-only).
+    pub(crate) fn route_cap_ensure(&mut self, bytes: u64) -> bool {
+        let Some(c) = ctx() else { return false };
+        if self.route_cap.as_ref().is_some_and(|b| b.size() >= bytes) {
+            return true;
+        }
+        self.route_cap = Some(c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen4-route-cap"),
+            size: bytes.max(16).div_ceil(16) * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }));
+        true
+    }
+
+    /// The frame's routing rows (`nt` tokens of `cold_stride` bytes: cold list, then
+    /// every winner and its weight) into the capture at byte `off`.
+    pub(crate) fn route_cap_copy(&self, enc: &mut wgpu::CommandEncoder, g: &Geom, off: u64, nt: usize) {
+        let (Some(c), Some(cap)) = (ctx(), self.route_cap.as_ref()) else { return };
+        let cold = tbuf(c, T_COLD, 4 * g.top_k * 4, false);
+        let bytes = (nt * cold_stride(g)) as u64;
+        if off + bytes <= cap.size() {
+            flush_pass(&*enc);
+            enc.copy_buffer_to_buffer(&cold, 0, cap, off, bytes);
+        }
+    }
+
+    /// The capture's first `bytes`, once the card has written them.
+    pub(crate) fn route_cap_read(&self, bytes: u64) -> Option<Vec<u8>> {
+        let c = ctx()?;
+        let cap = self.route_cap.as_ref()?;
+        let bytes = bytes.min(cap.size()).div_ceil(16) * 16;
+        let slice = cap.slice(..bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.is_ok());
+        });
+        c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        if !rx.recv().ok()? {
+            return None;
+        }
+        let out = slice.get_mapped_range().ok()?.to_vec();
+        cap.unmap();
+        Some(out)
+    }
+
+    /// Seed token `tok` of the streamed chunk's frame `k` with its embedding on every
+    /// stream (as `seed`, into the bank).
+    pub(crate) fn seed_bank(&self, k: usize, tok: usize, emb: &[f32], hc: usize) {
+        let (Some(c), Some(b)) = (ctx(), self.sbank.get(k)) else { return };
+        let mut all = Vec::with_capacity(emb.len() * hc);
+        for _ in 0..hc {
+            all.extend_from_slice(emb);
+        }
+        c.queue.write_buffer(&b[0], (tok * self.hh * 4) as u64, bytemuck::cast_slice(&all));
+    }
+
+    /// Frame `k` (`nt` rows) of a streamed chunk between the bank and the frame buffers:
+    /// `save` parks the live hyper rows (and, with `moe`, the MoE output and its inject
+    /// weights the next layer adds), else the parked state becomes live.
+    pub(crate) fn stream_swap(&self, enc: &mut wgpu::CommandEncoder, g: &Geom, k: usize, nt: usize, save: bool, moe: bool) -> bool {
+        let (Some(c), Some(b)) = (ctx(), self.sbank.get(k)) else { return false };
+        flush_pass(&*enc);
+        let mo = tbuf(c, T_MO, g.hidden * 4, true);
+        let inj = tbuf(c, T_INJ_MLP, g.hc * 4, true);
+        let parts = [
+            (&self.hyper, &b[0], nt * self.hh * 4),
+            (&mo, &b[1], nt * tstride(g.hidden * 4)),
+            (&inj, &b[2], nt * tstride(g.hc * 4)),
+        ];
+        for (i, (live, bank, bytes)) in parts.into_iter().enumerate() {
+            if i > 0 && !moe {
+                break;
+            }
+            if save {
+                enc.copy_buffer_to_buffer(live, 0, bank, 0, bytes as u64);
+            } else {
+                enc.copy_buffer_to_buffer(bank, 0, live, 0, bytes as u64);
+            }
+        }
+        true
     }
 }
 
@@ -7684,8 +7902,63 @@ fn q82_t(
         return false;
     }
     if nt > TMAX {
-        // a prompt frame past eight tokens: the batch graph's q8_2f GEMM
-        // (`q8_2f_mm_r2`, 64 x 64 tiles), rows packed at their width
+        // a prompt frame past eight tokens on the matrix units: the eight-bit prompt
+        // GEMM of the dense models (`q82_mm_coop_s`: f16 operands, f32 sums), the
+        // activations scaled by their absolute maximum (reduced on the card first).
+        // The scalar int8 GEMM below held ~18 TFLOP/s on an RTX 5090, the GDN and QSA
+        // projections half of a resident prompt frame. `CMF_QWEN_Q82COOP=0` keeps it.
+        if xs as usize == w.cols
+            && ys as usize == w.rows
+            && w.cols % 32 == 0
+            && w.rows >= 256
+            && q82_coop_on()
+            && let (Some(mm), Some(part), Some(fold)) = (c.q82_mm_coop_s.as_ref(), c.act_amax_part.as_ref(), c.act_amax_fold.as_ref())
+        {
+            let asc = frame_buf_t(c, T_Q82ASC, 0, 16, false);
+            let parts = frame_buf_t(c, T_Q82AMP, 0, 512 * 4, false);
+            let n = nt * w.cols;
+            dispatch(
+                c,
+                pass,
+                part,
+                bc,
+                step + 20000,
+                "qwen4t-amax-part",
+                || vec![x.clone(), parts.clone(), uniform_u32x4(c, [n as u32, 0, 0, 0])],
+                (512, 1, 1),
+            );
+            dispatch(
+                c,
+                pass,
+                fold,
+                bc,
+                step + 21000,
+                "qwen4t-amax-fold",
+                || vec![parts.clone(), asc.clone(), uniform_u32x4(c, [512, 0, 0, 0])],
+                (1, 1, 1),
+            );
+            dispatch(
+                c,
+                pass,
+                mm,
+                bc,
+                step + 22000,
+                "qwen4t-q82-coop",
+                || {
+                    vec![
+                        w.buf.clone(),
+                        x.clone(),
+                        y.clone(),
+                        uniform_u32x4(c, [(w.cols / 4) as u32, w.rows as u32, nt as u32, 0xFFFF_FFFF]),
+                        asc.clone(),
+                    ]
+                },
+                ((w.rows as u32).div_ceil(64).min(MAX_WG), (nt as u32).div_ceil(64), 1),
+            );
+            return true;
+        }
+        // the batch graph's scalar q8_2f GEMM (`q8_2f_mm_r2`, 64 x 64 tiles), rows
+        // packed at their width
         let Some((mm, _)) = super::gemma_batch::pipes(c).and_then(|g| g.mm.as_ref()) else {
             return false;
         };
@@ -8777,8 +9050,8 @@ pub(crate) fn encode_layer(
     };
     let hyper = &d.hyper;
     let zero = zero_buf(c);
-    let mo = tbuf(c, T_MO, hidden * 4, false);
-    let inj_mlp = tbuf(c, T_INJ_MLP, hc * 4, false);
+    let mo = tbuf(c, T_MO, hidden * 4, true);
+    let inj_mlp = tbuf(c, T_INJ_MLP, hc * 4, true);
     let x = tbuf(c, T_X, hidden * 4, false);
     let x2 = tbuf(c, T_X2, hidden * 4, false);
     let blk = tbuf(c, T_BLK, hidden * 4, false);
@@ -10283,8 +10556,12 @@ pub(crate) fn encode_layer(
         ts_pass(&mut pass, 11);
         // route on the card: Qwen ranking + softmax over the chosen ten, the
         // arena's remap turns winners into slots or hands them back cold
-        let rflags: u32 =
-            8 | 16 | 32 | (u32::from(w.shared_gate.is_some()) << 6) | (shared_slot << 8);
+        let rflags: u32 = 8
+            | 16
+            | 32
+            | (u32::from(w.shared_gate.is_some()) << 6)
+            | (u32::from(d.masked) << 7)
+            | (shared_slot << 8);
         let (route_pipe, route_step) = match &p.route2 {
             Some(r2) if g.n_experts <= 512 && g.top_k <= 64 => (r2, 714),
             _ => (&p.t_route, 703),
@@ -10369,7 +10646,7 @@ pub(crate) fn encode_layer(
             && (!g.gu_q2 || mm_ok)
             && sorted_experts()
             && hidden % 16 == 0
-            && nt * slots <= 4096
+            && (nt * slots <= 4096 || mm_ok)
         {
             // a prompt frame past eight tokens: the winners sorted by arena
             // slot, so one expert's weights are read by back-to-back
@@ -10381,27 +10658,51 @@ pub(crate) fn encode_layer(
                 let mm_gu = if g.gu_q2 { p.mm_gu_q2.as_ref().unwrap_or(mm_gu4) } else { mm_gu4 };
                 // the matrix units: one workgroup per (64-row tile, expert segment)
                 let segb = frame_buf_t(c, T_ESEG, 0, 4097 * 16, false);
-                dispatch(
-                    c,
-                    &mut pass,
-                    &p.g_sort,
-                    bc,
-                    715,
-                    "qwen4g-sort",
-                    || vec![msel.clone(), ord.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
-                    (1, 1, 1),
-                );
-                dispatch(
-                    c,
-                    &mut pass,
-                    &p.g_segs,
-                    bc,
-                    734,
-                    "qwen4g-segs",
-                    || vec![msel.clone(), ord.clone(), segb.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
-                    (1, 1, 1),
-                );
-                let nseg = nw.min(g.n_experts.max(1)) as u32;
+                if nw <= 4096 {
+                    dispatch(
+                        c,
+                        &mut pass,
+                        &p.g_sort,
+                        bc,
+                        715,
+                        "qwen4g-sort",
+                        || vec![msel.clone(), ord.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
+                        (1, 1, 1),
+                    );
+                    dispatch(
+                        c,
+                        &mut pass,
+                        &p.g_segs,
+                        bc,
+                        734,
+                        "qwen4g-segs",
+                        || vec![msel.clone(), ord.clone(), segb.clone(), uniform_u32x4(c, [nw as u32, 0, 0, 0])],
+                        (1, 1, 1),
+                    );
+                } else {
+                    // past 4096 winners: the counting sort by arena slot
+                    let nslots = global.capacity;
+                    let cnt = frame_buf_t(c, T_CSCNT, 0, nslots * 4, false);
+                    let u = || uniform_u32x4(c, [nw as u32, nslots as u32, 0, 0]);
+                    let groups = |n: usize| ((n as u32).div_ceil(256), 1, 1);
+                    for (i, (step, grid)) in [(739u16, groups(nslots)), (740, groups(nw)), (741, (1, 1, 1)), (742, groups(nw))]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        dispatch(
+                            c,
+                            &mut pass,
+                            &p.g_cs[i],
+                            bc,
+                            step,
+                            "qwen4g-cs",
+                            || vec![msel.clone(), cnt.clone(), ord.clone(), segb.clone(), u()],
+                            grid,
+                        );
+                    }
+                }
+                // a segment per expert of the layer and one for its shared expert
+                let nseg = nw.min(g.n_experts + 1) as u32;
                 let bg_gu = bc.get(735, || {
                     let gate_b: Vec<_> = global.gate.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
                     let up_b: Vec<_> = global.up.iter().map(wgpu::Buffer::as_entire_buffer_binding).collect();
@@ -10837,8 +11138,8 @@ pub(crate) fn encode_head_with(
     encode_gate(c, p, &mut pass, dev, dev.rows - 1);
     // the last layer's MoE output: inside the final mix's kernels (HC v3),
     // or by its own dispatch in front of it
-    let mo = tbuf(c, T_MO, g.hidden * 4, false);
-    let inj_mlp = tbuf(c, T_INJ_MLP, g.hc * 4, false);
+    let mo = tbuf(c, T_MO, g.hidden * 4, true);
+    let inj_mlp = tbuf(c, T_INJ_MLP, g.hc * 4, true);
     let mut pre = inject_prev.then_some(PreInject {
         blk: &mo,
         bs: es(g.hidden * 4),
@@ -10893,8 +11194,8 @@ pub(crate) fn encode_pending(
     let Some(c) = ctx() else { return false };
     let Some(p) = pipes(c) else { return false };
     let (hidden, k) = (g.hidden, g.top_k);
-    let mo = tbuf(c, T_MO, hidden * 4, false);
-    let inj = tbuf(c, T_INJ_MLP, g.hc * 4, false);
+    let mo = tbuf(c, T_MO, hidden * 4, true);
+    let inj = tbuf(c, T_INJ_MLP, g.hc * 4, true);
     let coldvec = tbuf(c, T_COLDVEC, hidden * 4, true);
     let csel = tbuf_exact(c, T_CSEL, k * 4, true);
     let cwt = tbuf_exact(c, T_CWT, k * 4, true);
@@ -11612,7 +11913,7 @@ pub(crate) fn tap_bufs(dev: &Dev, g: &Geom) -> [wgpu::Buffer; 5] {
         tbuf(c, T_X, g.hidden * 4, false),
         tbuf(c, T_BLK, g.hidden * 4, false),
         tbuf(c, T_X2, g.hidden * 4, false),
-        tbuf(c, T_MO, g.hidden * 4, false),
+        tbuf(c, T_MO, g.hidden * 4, true),
         dev.hyper.clone(),
     ]
 }
@@ -11620,6 +11921,26 @@ pub(crate) fn tap_bufs(dev: &Dev, g: &Geom) -> [wgpu::Buffer; 5] {
 /// A whole buffer as a bind group entry.
 pub(crate) fn whole(b: &wgpu::Buffer) -> Rng {
     Rng::all(b)
+}
+
+/// Submit `pre` (staged expert uploads) and `cb` in one queue submission; the index to
+/// wait on.
+pub(crate) fn submit_indexed(pre: Option<wgpu::CommandBuffer>, cb: wgpu::CommandBuffer) -> Option<wgpu::SubmissionIndex> {
+    let c = ctx()?;
+    note_submit(c);
+    Some(c.queue.submit(pre.into_iter().chain(std::iter::once(cb))))
+}
+
+/// Block until submission `idx` has run on the card.
+pub(crate) fn wait_submission(idx: wgpu::SubmissionIndex) -> bool {
+    let Some(c) = ctx() else { return false };
+    c.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).is_ok()
+}
+
+/// Whether a GPTQ calibration capture is recording layer rows (they must come in frame
+/// order, which a streamed prompt does not keep).
+pub(crate) fn capture_on() -> bool {
+    CAPTURE.lock().map(|g| g.is_some()).unwrap_or(true)
 }
 
 /// Submit one finished command buffer on its own.
@@ -12395,6 +12716,10 @@ mod shader_tests {
             "q4g_sum",
             "q4g_sort",
             "q4g_segs",
+            "q4g_cs_clear",
+            "q4g_cs_count",
+            "q4g_cs_scan",
+            "q4g_cs_scatter",
             "q4t_hc_fold_t",
             "q4t_o1_pack",
             "q4t_o1_gate",

@@ -196,6 +196,25 @@ pub struct State {
     /// device results.
     #[cfg(feature = "gpu")]
     inflight: Option<crate::gpu_wgpu::qwen4::Pending>,
+    /// This sequence's routing so far, `[layer][expert]` winner counts: the prompt's own
+    /// narrow bundle of experts, and the pack router's signal (`prompt_done`).
+    #[cfg(feature = "gpu")]
+    route_hist: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    route_tokens: usize,
+    /// `route_hist` when the φ dump last wrote a window (`CMF_QWEN_PHI_DUMP`).
+    #[cfg(feature = "gpu")]
+    phi_last: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    phi_last_tokens: usize,
+    /// The expert packs of `CMF_QWEN_PACKS`, read on first use (inner None: none).
+    #[cfg(feature = "gpu")]
+    packs: Option<Option<PackSet>>,
+    /// Decode keeps its routing to the arena's experts (`CMF_QWEN_MASK=1`, set after a
+    /// prompt by `prompt_done`): no cold winner, the whole token chained as on a resident
+    /// model. The next prompt is exact again.
+    #[cfg(feature = "gpu")]
+    masked: bool,
 }
 
 /// Summed wall time and count of expert uploads (every thread), for the
@@ -463,6 +482,18 @@ impl State {
             resident_all: false,
             #[cfg(feature = "gpu")]
             inflight: None,
+            #[cfg(feature = "gpu")]
+            route_hist: Vec::new(),
+            #[cfg(feature = "gpu")]
+            route_tokens: 0,
+            #[cfg(feature = "gpu")]
+            phi_last: Vec::new(),
+            #[cfg(feature = "gpu")]
+            phi_last_tokens: 0,
+            #[cfg(feature = "gpu")]
+            packs: None,
+            #[cfg(feature = "gpu")]
+            masked: false,
         }
     }
 
@@ -475,6 +506,13 @@ impl State {
         self.token_history.clear();
         self.pos = 0;
         self.host_pos = 0;
+        #[cfg(feature = "gpu")]
+        {
+            self.route_hist.iter_mut().for_each(|c| *c = 0);
+            self.route_tokens = 0;
+            self.phi_last.iter_mut().for_each(|c| *c = 0);
+            self.phi_last_tokens = 0;
+        }
         for st in &mut self.layers {
             *st = LayerState::default();
         }
@@ -1284,6 +1322,152 @@ impl QwenGpuPool {
 
     /// The live `(layer, expert) → slot` row and the layer's pinned shared
     /// slot, without admitting anything.
+    /// Every routed expert of `layer` resident at once (a streamed prompt chunk runs the
+    /// layer's whole bank): the missing ones get slots — never one of this layer's own,
+    /// a shared expert's or a held layer's — and are uploaded in one parallel batch.
+    /// The layer's remap and shared slot; None when the arena cannot hold them all.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn ensure_layer(
+        &mut self,
+        model: &Arc<CmfModel>,
+        layer: usize,
+        triples: &[(usize, usize, usize)],
+        shared: Option<(usize, usize, usize)>,
+    ) -> Option<(Vec<u32>, u32)> {
+        let ne = self.n_experts;
+        if triples.len() != ne || self.staging_base < ne + self.shared_slot.len() + 1 {
+            return None;
+        }
+        let (_, shared_slot) = self.ensure(model, layer, &[], triples, shared)?;
+        let all: Vec<usize> = (0..ne).collect();
+        self.clock = self.clock.saturating_add(1);
+        let now = self.clock;
+        let base = layer * ne;
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        for e in 0..ne {
+            let s = self.slot_for[base + e];
+            if s != u32::MAX {
+                self.last[s as usize] = now;
+                continue;
+            }
+            let Some(v) = self.victim(layer, &all) else {
+                // undo the slots taken so far: nothing was uploaded yet
+                for &(slot, e2) in &jobs {
+                    self.owner[slot] = None;
+                    self.slot_for[base + e2] = u32::MAX;
+                    self.occupancy[layer] = self.occupancy[layer].saturating_sub(1);
+                    self.free.push(slot);
+                }
+                return None;
+            };
+            if let Some(old) = self.owner[v] {
+                self.dropped(old);
+                if old.1 == usize::MAX {
+                    self.shared_slot[old.0] = u32::MAX;
+                } else {
+                    self.slot_for[old.0 * ne + old.1] = u32::MAX;
+                    self.occupancy[old.0] = self.occupancy[old.0].saturating_sub(1);
+                }
+            }
+            self.owner[v] = Some((layer, e));
+            self.slot_for[base + e] = v as u32;
+            self.occupancy[layer] += 1;
+            self.seen[base + e] = self.seen[base + e].max(1);
+            self.last[v] = now;
+            jobs.push((v, e));
+        }
+        let ok = self.run_fills(model, layer, &jobs, triples, true);
+        if ok.iter().any(|&x| !x) {
+            for (&(slot, e), &good) in jobs.iter().zip(&ok) {
+                if !good {
+                    self.owner[slot] = None;
+                    self.slot_for[base + e] = u32::MAX;
+                    self.occupancy[layer] = self.occupancy[layer].saturating_sub(1);
+                    self.free.push(slot);
+                }
+            }
+            return None;
+        }
+        Some((self.slot_for[base..base + ne].to_vec(), shared_slot))
+    }
+
+    /// Make the arena hold `ranked` (hottest first) as far as it fits: routed experts
+    /// outside the target give their slots up, then the target is admitted in order.
+    /// (evicted, admitted).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn repack(
+        &mut self,
+        model: &Arc<CmfModel>,
+        ranked: &[(usize, usize)],
+        triples: &[Vec<(usize, usize, usize)>],
+    ) -> (usize, usize) {
+        let ne = self.n_experts;
+        let pinned = self.shared_slot.iter().filter(|&&s| s != u32::MAX).count();
+        let room = self.staging_base.saturating_sub(pinned);
+        let target: Vec<(usize, usize)> = ranked
+            .iter()
+            .copied()
+            .filter(|&(l, e)| l < triples.len() && e < ne)
+            .take(room)
+            .collect();
+        let mut want = vec![false; self.slot_for.len()];
+        for &(l, e) in &target {
+            want[l * ne + e] = true;
+        }
+        let mut evicted = 0;
+        for slot in 0..self.staging_base {
+            if let Some((l, e)) = self.owner[slot]
+                && e != usize::MAX
+                && !want[l * ne + e]
+            {
+                self.dropped((l, e));
+                self.slot_for[l * ne + e] = u32::MAX;
+                self.occupancy[l] = self.occupancy[l].saturating_sub(1);
+                self.owner[slot] = None;
+                self.free.push(slot);
+                evicted += 1;
+            }
+        }
+        // the target's missing experts into the freed slots, layer by layer in one
+        // parallel batch each, through `fill_slot` (a DMA from the host tier when it
+        // holds the expert; `prefill` would write every one through the queue)
+        let now = self.clock.saturating_add(1);
+        self.clock = now;
+        let mut by_layer: Vec<Vec<(usize, usize)>> = vec![Vec::new(); triples.len()];
+        for &(l, e) in &target {
+            let key = l * ne + e;
+            if self.slot_for[key] != u32::MAX {
+                self.last[self.slot_for[key] as usize] = now;
+                continue;
+            }
+            let Some(slot) = self.free.pop() else { break };
+            self.owner[slot] = Some((l, e));
+            self.slot_for[key] = slot as u32;
+            self.occupancy[l] += 1;
+            self.seen[key] = self.seen[key].max(1);
+            self.last[slot] = now;
+            by_layer[l].push((slot, e));
+        }
+        let mut admitted = 0;
+        for (l, jobs) in by_layer.iter().enumerate() {
+            if jobs.is_empty() {
+                continue;
+            }
+            let ok = self.run_fills(model, l, jobs, &triples[l], true);
+            for (&(slot, e), &good) in jobs.iter().zip(&ok) {
+                if good {
+                    admitted += 1;
+                } else {
+                    self.owner[slot] = None;
+                    self.slot_for[l * ne + e] = u32::MAX;
+                    self.occupancy[l] = self.occupancy[l].saturating_sub(1);
+                    self.free.push(slot);
+                }
+            }
+        }
+        (evicted, admitted)
+    }
+
     pub(crate) fn remap_snapshot(&self, layer: usize) -> (Vec<u32>, u32) {
         let base = layer * self.n_experts;
         (
@@ -2480,12 +2664,24 @@ fn ple_frame_rows(
     ids: &[u32],
     pool: Option<&Pool>,
 ) -> Vec<Vec<Vec<f32>>> {
+    ple_rows_of(layers, cfg, history, ids, pool, None)
+}
+
+/// `ple_frame_rows`, for layer `only` alone when given (the others empty).
+fn ple_rows_of(
+    layers: &[Layer],
+    cfg: &Cfg,
+    history: &[u32],
+    ids: &[u32],
+    pool: Option<&Pool>,
+    only: Option<usize>,
+) -> Vec<Vec<Vec<f32>>> {
     let mut out: Vec<Vec<Vec<f32>>> = Vec::with_capacity(layers.len());
     // (layer, token, head, row id), and the destination of each row
     let mut jobs: Vec<(usize, usize, usize, i64)> = Vec::new();
     let mut hist: Vec<u32> = history.to_vec();
     for (li, l) in layers.iter().enumerate() {
-        let Some(pw) = l.ple.as_ref() else {
+        let Some(pw) = l.ple.as_ref().filter(|_| only.is_none_or(|o| o == li)) else {
             out.push(Vec::new());
             continue;
         };
@@ -3262,13 +3458,38 @@ impl DevProf {
 /// Tokens one device frame carries; the prompt is fed in chunks of this many.
 #[cfg(feature = "gpu")]
 pub fn prefill_chunk() -> usize {
-    // `forward_tokens` cuts a chunk into eight-token frames unless every expert
-    // is resident (then frames take up to TROWS tokens)
+    // `forward_tokens` cuts a chunk into TROWS-token frames when every expert is
+    // resident; otherwise it streams the chunk layer by layer (`forward_stream_device`,
+    // several frames), or cuts it into eight-token frames when that is off
+    let rows = crate::gpu_wgpu::qwen4::TROWS;
+    let dflt = if stream_on() { rows * stream_frames() } else { rows };
     std::env::var("CMF_QWEN_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(crate::gpu_wgpu::qwen4::TROWS)
-        .clamp(1, crate::gpu_wgpu::qwen4::TROWS)
+        .unwrap_or(dflt)
+        .clamp(1, rows * 64)
+}
+
+/// The layer-major prompt for a card that cannot hold every expert
+/// (`forward_stream_device`); `CMF_QWEN_STREAM=0` keeps the eight-token frames.
+#[cfg(feature = "gpu")]
+fn stream_on() -> bool {
+    std::env::var("CMF_QWEN_STREAM").as_deref() != Ok("0")
+}
+
+/// Frames (TROWS tokens each) of a streamed prompt chunk: `CMF_QWEN_STREAM_TOKENS` tokens,
+/// 4096, or 2048 under an 11 GiB budget (a 12 GB card; its bank takes ~52 KiB a token).
+#[cfg(feature = "gpu")]
+fn stream_frames() -> usize {
+    let rows = crate::gpu_wgpu::qwen4::TROWS;
+    std::env::var("CMF_QWEN_STREAM_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            if crate::gpu_wgpu::qwen4::vram_budget().is_some_and(|b| b < 11 << 30) { 2048 } else { 4096 }
+        })
+        .div_ceil(rows)
+        .clamp(1, 64)
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -3293,7 +3514,82 @@ fn top_log(logits: &[f32], vocab: usize) {
     eprintln!("[toplog] {}", top.join(" "));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn forward_tokens(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) {
+    #[cfg(feature = "gpu")]
+    if ids.len() > 1 && state.masked {
+        state.masked = false;
+        if let Some(d) = state.dev.as_mut() {
+            d.set_masked(false);
+        }
+    }
+    forward_tokens_stream(globals, layers, cfg, state, ids, pos0, inv_freq, pool, logits, want_logits);
+    // the prompt's last chunk: the arena gets the narrow bundle this request needs
+    #[cfg(feature = "gpu")]
+    if want_logits && ids.len() > 1 {
+        prompt_done(layers, state);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_tokens_stream(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) {
+    // A prompt chunk on a card that cannot hold every expert streams layer by layer:
+    // the sequence's first frame builds (or resets) the device state the usual way, the
+    // body streams, a last frame of at most TMAX tokens brings the logits.
+    #[cfg(feature = "gpu")]
+    {
+        use crate::gpu_wgpu::qwen4 as q4;
+        if stream_on() && !state.resident_all && !state.device_off && ids.len() > 3 * q4::TMAX {
+            let head = if state.dev.is_none() || pos0 == 0 || state.pos != pos0 { q4::TMAX } else { 0 };
+            if head > 0 {
+                let mut lg = Vec::new();
+                forward_tokens_split(globals, layers, cfg, state, &ids[..head], pos0, inv_freq, pool, &mut lg, false);
+            }
+            let tail = if want_logits { q4::TMAX } else { 0 };
+            let (a, b) = (head, ids.len() - tail);
+            if !state.resident_all
+                && !state.device_off
+                && b > a + q4::TMAX
+                && forward_stream_device(globals, layers, cfg, state, &ids[a..b], pos0 + a, inv_freq, pool)
+            {
+                if tail > 0 {
+                    forward_tokens_split(globals, layers, cfg, state, &ids[b..], pos0 + b, inv_freq, pool, logits, want_logits);
+                } else {
+                    logits.clear();
+                }
+                return;
+            }
+            forward_tokens_split(globals, layers, cfg, state, &ids[head..], pos0 + head, inv_freq, pool, logits, want_logits);
+            return;
+        }
+    }
+    forward_tokens_split(globals, layers, cfg, state, ids, pos0, inv_freq, pool, logits, want_logits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_tokens_split(
     globals: &Globals,
     layers: &[Layer],
     cfg: &Cfg,
@@ -3327,7 +3623,7 @@ pub fn forward_tokens(
                 };
                 let last = at + n == ids.len();
                 let mut lg = Vec::new();
-                forward_tokens(
+                forward_tokens_split(
                     globals,
                     layers,
                     cfg,
@@ -3814,13 +4110,14 @@ fn forward_tokens_device(
             );
         }
         // The host-heap tier behind the arena (Linux): admissions become DMA
-        // copies (`HostTier`). Off unless asked: CMF_QWEN_HTIER_MB=auto sizes
-        // it for every expert the arena cannot hold, =<MiB> to that size.
-        // Measured on the RTX 3090 (no resizable BAR, §8.7 of the device
-        // doc) against the admission pool alone it adds 2-5 % of steady
-        // decode and ingest, while pinning 28-37 GiB holds up the frames
-        // beside it (first token of a one-shot run +7-11 s) and squeezes
-        // the page cache: worth it only for a long-lived process. Whatever
+        // copies (`HostTier`). On by default when the arena cannot hold every
+        // expert (`CMF_QWEN_HTIER_MB=auto` sizes it for every expert the arena
+        // cannot hold, =<MiB> to that size, =0 off): the streamed prompt admits
+        // whole layer banks. Measured on the RTX 3090 (no resizable BAR, §8.7
+        // of the device doc) with eight-token frames it added only 2-5 % of
+        // steady decode and ingest, while pinning 28-37 GiB held up the frames
+        // beside it (first token of a one-shot run +7-11 s) and squeezed the
+        // page cache. Whatever
         // is asked, it never pins more than half of the memory this process
         // can still take (cgroup and MemAvailable) nor comes within 16 GiB
         // of it.
@@ -3829,7 +4126,12 @@ fn forward_tokens_device(
             let want_slots = n_keys.saturating_sub(cap_slots) + cap_slots / 8;
             let stride = (per as u64).div_ceil(256) * 256 + 1024;
             let want = want_slots as u64 * stride;
+            // Unset: on when the arena cannot hold every expert — a streamed prompt
+            // admits whole layer banks, which the queue's writes take at under 1 GB/s
+            // and DMA from the tier at PCIe speed (16 GB card: prompt 110 → 356 tok/s).
+            // `CMF_QWEN_HTIER_MB=0` keeps it off.
             let asked = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
+                None | Some("") if cap_slots < n_keys => want,
                 None | Some("") => 0,
                 Some("auto") => want,
                 Some(v) => v.parse::<u64>().map_or(0, |mb| mb << 20),
@@ -3902,7 +4204,11 @@ fn forward_tokens_device(
         if std::env::var_os("CMF_QWEN_PROFILE_SAVE").is_some() && profile.is_none() {
             profile = Some(ExpertProfile::new(layers.len(), n_experts));
         }
-        state.profile = profile;
+        // A loaded profile has done its work once it warmed the arena: it would only
+        // count this run's routing for nobody (nothing saves it), and a live profile
+        // keeps every layer frame copying its cold lists and MoE inputs back to the host
+        // and every prompt chunk waiting for that readback.
+        state.profile = if std::env::var_os("CMF_QWEN_PROFILE_SAVE").is_some() { profile } else { None };
         // Warm the RAM tier in the background: the profiled experts the
         // arena could not take, then every other expert (layer by layer
         // interleaved) while the tier has room for what VRAM lacks.
@@ -3930,7 +4236,8 @@ fn forward_tokens_device(
             return off(state, "device reset failed");
         }
     }
-    let resident_all = state.resident_all;
+    // a masked decode (`CMF_QWEN_MASK`) has no cold winner either
+    let resident_all = state.resident_all || (state.masked && ntok <= q4::TMAX);
     // A prompt chunk nobody reads anything back from (resident mode: no cold
     // winner to complete; no logits, no window, no profile) is left running
     // while the next one is encoded. Anything else first drains it.
@@ -4359,6 +4666,7 @@ fn forward_tokens_device(
                 if let Some(pr) = state.profile.as_mut() {
                     pr.note(f, &picks);
                 }
+                note_route(&mut state.route_hist, n, g.n_experts, f, &picks);
                 if check && ntok == 1 && tap_layer() == Some(f) && position < 3 && f + 1 == hi {
                     // the frame's scratch is still the layer's own: read it
                     let bufs = q4::tap_bufs(dev, &g);
@@ -4523,6 +4831,10 @@ fn forward_tokens_device(
     if !check {
         state.token_history.extend_from_slice(ids);
         state.pos = pos0 + ntok;
+        if !lean {
+            state.route_tokens += ntok;
+            phi_dump(&state.route_hist, state.route_tokens, &mut state.phi_last, &mut state.phi_last_tokens);
+        }
     }
     if let Some(d) = state.dev.as_mut() {
         d.pos = pos0 + ntok;
@@ -4669,6 +4981,527 @@ fn forward_tokens_device(
         *logits = dev_logits;
     }
     true
+}
+
+/// A prompt chunk of several TROWS-token frames, layer by layer, on a card that cannot
+/// hold every expert: each layer's whole bank is admitted once and runs every frame of the
+/// chunk, the frames' cross-layer state (hyper rows, MoE output, inject weights) parked in
+/// `Dev::stream_bank` between them. Nothing is read back and no winner is cold, so the
+/// frames run the resident model's kernels; the card keeps one layer queued while the host
+/// admits the next. False (nothing done) when the chunk does not qualify; a failure past
+/// the first admission turns the device path off.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn forward_stream_device(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+) -> bool {
+    use crate::gpu_wgpu::qwen4 as q4;
+    use std::time::{Duration, Instant};
+    let ntok = ids.len();
+    if ntok <= q4::TMAX
+        || state.device_off
+        || state.resident_all
+        || state.verify_window
+        || state.pos != pos0
+        || state.profile.is_some()
+        || state.dev.is_none()
+        || state.gpu_pool.is_none()
+        || q4::capture_on()
+        || std::env::var_os("CMF_QWEN_DUMP_HYPER").is_some()
+        || std::env::var("CMF_QWEN_DEVICE_CHECK").as_deref() == Ok("1")
+    {
+        return false;
+    }
+    let Some(first) = layers.first() else { return false };
+    let Some(e0) = first.moe.experts.first() else { return false };
+    let Some(model) = e0.gate_proj.model_arc() else { return false };
+    let gu_q2 = e0.gate_proj.model_dtype() == Some(TensorDtype::Q2TiledP);
+    let g = device_geom(cfg, &first.moe, gu_q2);
+    let n = layers.len();
+    let frames: Vec<(usize, usize)> =
+        (0..ntok).step_by(q4::TROWS).map(|a| (a, (ntok - a).min(q4::TROWS))).collect();
+    if state.gpu_pool.as_ref().is_some_and(|a| a.staging_base < g.n_experts + n + 1) {
+        return false;
+    }
+    let cs = q4::cold_stride(&g);
+    let cap_bytes = (n * frames.len() * q4::TROWS * cs) as u64;
+    {
+        let dev = state.dev.as_mut().unwrap();
+        if dev.o1.is_some() || !dev.stream_bank(&g, frames.len()) || !dev.route_cap_ensure(cap_bytes) {
+            return false;
+        }
+        dev.gated = false;
+    }
+    let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+    let t_all = Instant::now();
+    // a chunk the previous call left running
+    if let Some(p) = state.inflight.take()
+        && p.wait().is_none()
+    {
+        state.device_off = true;
+        return false;
+    }
+    {
+        let dev = state.dev.as_ref().unwrap();
+        let mut emb = vec![0.0f32; cfg.hidden];
+        for (k, &(a, nt)) in frames.iter().enumerate() {
+            for t in 0..nt {
+                emb.fill(0.0);
+                let id = ids[a + t] as usize;
+                if id < globals.embed.rows() {
+                    globals.embed.row_f32(id, &mut emb);
+                }
+                dev.seed_bank(k, t, &emb, cfg.hc);
+            }
+        }
+    }
+    let (mut t_admit, mut t_ple, mut t_enc, mut t_wait) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let fill_n0 = FILL_N.load(std::sync::atomic::Ordering::Relaxed);
+    let mut prev: Option<wgpu::SubmissionIndex> = None;
+    let mut failed: Option<&'static str> = None;
+    'layers: for f in 0..n {
+        let layer = &layers[f];
+        let Some(ix) = layer.idx.as_ref() else {
+            failed = Some("layer index");
+            break;
+        };
+        let Some(w) = device_layer_w(layer, ix) else {
+            failed = Some("layer weights");
+            break;
+        };
+        let arena = state.gpu_pool.as_mut().unwrap();
+        arena.hold_layers = [None, None];
+        let ta = Instant::now();
+        let Some((remap, shared_slot)) = arena.ensure_layer(&model, f, &layer.expert_ids, layer.shared_ids) else {
+            failed = Some("the arena cannot hold a layer's experts");
+            break;
+        };
+        let mut uploads = arena.take_uploads();
+        t_admit += ta.elapsed();
+        let tp = Instant::now();
+        let rows = if layer.ple.is_some() {
+            ple_rows_of(layers, cfg, &state.token_history, ids, pool, Some(f)).swap_remove(f)
+        } else {
+            Vec::new()
+        };
+        t_ple += tp.elapsed();
+        let dev = state.dev.as_mut().unwrap();
+        for (k, &(a, nt)) in frames.iter().enumerate() {
+            let te = Instant::now();
+            let Some(mut enc) = q4::new_encoder("qwen4-stream") else {
+                failed = Some("encoder");
+                break 'layers;
+            };
+            if !dev.stream_swap(&mut enc, &g, k, nt, false, f > 0) {
+                failed = Some("bank");
+                break 'layers;
+            }
+            let ple: &[Vec<f32>] = if rows.is_empty() { &[] } else { &rows[a..a + nt] };
+            if q4::encode_layer(&mut enc, dev, &model, &g, &w, f, pos0 + a, nt, inv_freq, &remap, shared_slot, ple, f > 0, false)
+                .is_none()
+            {
+                failed = Some("layer frame declined");
+                break 'layers;
+            }
+            // the next layer adds this MoE output itself (`inject_prev`)
+            dev.clear_pending();
+            dev.route_cap_copy(&mut enc, &g, ((f * frames.len() + k) * q4::TROWS * cs) as u64, nt);
+            dev.stream_swap(&mut enc, &g, k, nt, true, true);
+            let cb = q4::finish_frame(enc);
+            t_enc += te.elapsed();
+            let Some(idx) = q4::submit_indexed(uploads.take(), cb) else {
+                failed = Some("submit");
+                break 'layers;
+            };
+            dev.commit(f);
+            if k + 1 == frames.len()
+                && let Some(p) = prev.replace(idx)
+            {
+                // the card holds this layer while the host admits the next
+                let tw = Instant::now();
+                if !q4::wait_submission(p) {
+                    failed = Some("wait");
+                    break 'layers;
+                }
+                t_wait += tw.elapsed();
+            }
+        }
+        // (the host tier gets its slots back only once the card ran every copy: at the end)
+        state.gpu_pool.as_mut().unwrap().rearm_uploads();
+    }
+    if let Some(p) = prev.take() {
+        let tw = Instant::now();
+        if !q4::wait_submission(p) && failed.is_none() {
+            failed = Some("wait");
+        }
+        t_wait += tw.elapsed();
+    }
+    if let Some(a) = state.gpu_pool.as_mut() {
+        a.uploads_done();
+        a.flush_uploads();
+    }
+    if let Some(why) = failed {
+        tracing::warn!("qwen4 device path off: streamed prompt: {why}");
+        state.device_off = true;
+        return false;
+    }
+    let dev = state.dev.as_mut().unwrap();
+    dev.clear_pending();
+    dev.pos = pos0 + ntok;
+    // every frame's winners into the sequence's routing
+    let tr = Instant::now();
+    if let Some(bytes) = dev.route_cap_read(cap_bytes) {
+        let k_top = g.top_k;
+        for f in 0..n {
+            for (k, &(_, nt)) in frames.iter().enumerate() {
+                for t in 0..nt {
+                    let base = ((f * frames.len() + k) * q4::TROWS + t) * cs;
+                    let picks: Vec<usize> = (0..k_top)
+                        .filter_map(|j| {
+                            let o = base + 4 * (2 * k_top + 2 * j);
+                            let e = u32::from_le_bytes(bytes.get(o..o + 4)?.try_into().ok()?);
+                            (e != u32::MAX && (e as usize) < g.n_experts).then_some(e as usize)
+                        })
+                        .collect();
+                    note_route(&mut state.route_hist, n, g.n_experts, f, &picks);
+                }
+            }
+        }
+        state.route_tokens += ntok;
+        phi_dump(&state.route_hist, state.route_tokens, &mut state.phi_last, &mut state.phi_last_tokens);
+    }
+    let t_route = tr.elapsed();
+    state.token_history.extend_from_slice(ids);
+    state.pos = pos0 + ntok;
+    if prof {
+        eprintln!(
+            "qwen4-stream routing read in {:.1}ms",
+            t_route.as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "qwen4-stream pos={pos0} ntok={ntok} frames={} total={:.1}ms admit={:.1}ms ple={:.1}ms encode={:.1}ms wait={:.1}ms fills={}",
+            frames.len(),
+            t_all.elapsed().as_secs_f64() * 1e3,
+            t_admit.as_secs_f64() * 1e3,
+            t_ple.as_secs_f64() * 1e3,
+            t_enc.as_secs_f64() * 1e3,
+            t_wait.as_secs_f64() * 1e3,
+            FILL_N.load(std::sync::atomic::Ordering::Relaxed) - fill_n0,
+        );
+    }
+    true
+}
+
+/// Count one token's winners of layer `f` into `hist` (`[layers][experts]`, sized on
+/// first use).
+#[cfg(feature = "gpu")]
+fn note_route(hist: &mut Vec<u32>, n_layers: usize, ne: usize, f: usize, picks: &[usize]) {
+    if hist.len() != n_layers * ne {
+        *hist = vec![0; n_layers * ne];
+    }
+    for &e in picks {
+        if let Some(c) = hist.get_mut(f * ne + e) {
+            *c = c.saturating_add(1);
+        }
+    }
+}
+
+/// `CMF_QWEN_PHI_DUMP=<file>`: every `CMF_QWEN_PHI_WINDOW` tokens (default 128, at
+/// frame granularity) append the window's routing counts, `[layers][experts]` u32 LE —
+/// the rows `cortiq qwen-packs` fits a pack's topology on.
+#[cfg(feature = "gpu")]
+fn phi_dump(hist: &[u32], tokens: usize, last: &mut Vec<u32>, last_tokens: &mut usize) {
+    let Ok(path) = std::env::var("CMF_QWEN_PHI_DUMP") else { return };
+    let w = std::env::var("CMF_QWEN_PHI_WINDOW").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(128).max(1);
+    if tokens < *last_tokens + w || hist.is_empty() {
+        return;
+    }
+    if last.len() != hist.len() {
+        *last = vec![0; hist.len()];
+    }
+    let mut row = Vec::with_capacity(hist.len() * 4);
+    for (h, l) in hist.iter().zip(last.iter()) {
+        row.extend_from_slice(&h.saturating_sub(*l).to_le_bytes());
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(&row);
+    }
+    last.copy_from_slice(hist);
+    *last_tokens = tokens;
+}
+
+/// Expert packs (`CMF_QWEN_PACKS=<dir>`): narrow bundles of experts, one per task
+/// (rust, web, python, php, …), each a routing profile of its task's text, chosen per
+/// request by the patent-1 resonance router: every pack keeps an isolated topology (a
+/// mean and principal rows, `router::fit_descriptor`) of its own routing signature φ,
+/// and the prompt goes to the pack whose topology reconstructs its φ best (argmin
+/// reconstruction error). φ is the model's own routing of the prompt: the winner counts
+/// of the first `phi_layers` layers, each layer a distribution, the whole unit-normed.
+#[cfg(feature = "gpu")]
+struct PackSet {
+    phi_layers: usize,
+    names: Vec<String>,
+    subs: Vec<(Vec<f32>, Vec<f32>, usize)>,
+    profiles: Vec<ExpertProfile>,
+}
+
+#[cfg(feature = "gpu")]
+impl PackSet {
+    fn load(n_layers: usize, ne: usize) -> Option<Self> {
+        let dir = std::env::var("CMF_QWEN_PACKS").ok()?;
+        let path = std::path::Path::new(&dir).join("router.json");
+        let v: serde_json::Value = match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            Some(v) => v,
+            None => {
+                tracing::warn!("qwen4 packs: {} unreadable", path.display());
+                return None;
+            }
+        };
+        let phi_layers = v["phi_layers"].as_u64()? as usize;
+        let mut set = PackSet { phi_layers, names: Vec::new(), subs: Vec::new(), profiles: Vec::new() };
+        for p in v["packs"].as_array()? {
+            let name = p["name"].as_str()?.to_string();
+            let d = &p["descriptor"];
+            let rank = d["rank"].as_u64()? as usize;
+            let mean = crate::router::decode_f16(d["mean"].as_str()?)?;
+            let basis = crate::router::decode_f16(d["basis"].as_str()?)?;
+            let dim = phi_layers * ne;
+            let prof = ExpertProfile::load(&std::path::Path::new(&dir).join(format!("{name}.profile")).to_string_lossy(), n_layers, ne);
+            match prof {
+                Some(pr) if mean.len() == dim && basis.len() == rank * dim => {
+                    set.names.push(name);
+                    set.subs.push((mean, basis, rank));
+                    set.profiles.push(pr);
+                }
+                _ => tracing::warn!("qwen4 packs: pack {name} skipped (profile or topology does not fit this model)"),
+            }
+        }
+        (!set.names.is_empty()).then_some(set)
+    }
+
+    /// The pack whose topology reconstructs φ best, and every pack's error.
+    fn decide(&self, hist: &[u32], ne: usize) -> Option<(usize, Vec<f32>)> {
+        let phi = route_phi(hist, ne, self.phi_layers)?;
+        let errs: Vec<f32> = self.subs.iter().map(|(m, b, r)| crate::router::recon_error(&phi, m, b, *r)).collect();
+        let best = errs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1))?.0;
+        Some((best, errs))
+    }
+}
+
+/// φ of a routing histogram: the first `layers` layers' winner distributions, unit-normed.
+fn route_phi(hist: &[u32], ne: usize, layers: usize) -> Option<Vec<f32>> {
+    if hist.len() < layers * ne || layers == 0 {
+        return None;
+    }
+    let mut phi = Vec::with_capacity(layers * ne);
+    for l in 0..layers {
+        let row = &hist[l * ne..(l + 1) * ne];
+        let s = row.iter().map(|&c| c as f32).sum::<f32>().max(1.0);
+        phi.extend(row.iter().map(|&c| c as f32 / s));
+    }
+    let n = phi.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if n <= 0.0 {
+        return None;
+    }
+    phi.iter_mut().for_each(|v| *v /= n);
+    Some(phi)
+}
+
+/// The prompt has run: on a card that cannot hold every expert, the arena is refilled
+/// with the narrow bundle this request needs — the chosen pack's experts blended with
+/// the prompt's own routing (`CMF_QWEN_PACK_MIX`, the prompt's share, default 0.5; 1
+/// without packs; `CMF_QWEN_SELF_PACK=0` keeps the arena as the prompt left it when
+/// there are no packs). Each layer gets the same share of the arena, ranked by score.
+#[cfg(feature = "gpu")]
+fn prompt_done(layers: &[Layer], state: &mut State) {
+    if state.resident_all || state.device_off || state.gpu_pool.is_none() || state.route_tokens == 0 {
+        return;
+    }
+    let Some(model) = layers.first().and_then(|l| l.moe.experts.first()).and_then(|e| e.gate_proj.model_arc()) else {
+        return;
+    };
+    let n = layers.len();
+    let ne = state.gpu_pool.as_ref().unwrap().n_experts;
+    if state.route_hist.len() != n * ne {
+        return;
+    }
+    if state.packs.is_none() {
+        state.packs = Some(PackSet::load(n, ne));
+    }
+    let t0 = std::time::Instant::now();
+    let packs = state.packs.as_ref().unwrap().as_ref();
+    let choice = packs.and_then(|p| p.decide(&state.route_hist, ne));
+    if packs.is_none() && std::env::var("CMF_QWEN_SELF_PACK").as_deref() == Ok("0") {
+        return;
+    }
+    let mix: f32 = match choice {
+        None => 1.0,
+        Some(_) => std::env::var("CMF_QWEN_PACK_MIX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5f32).clamp(0.0, 1.0),
+    };
+    let pack_counts = choice.as_ref().map(|(i, _)| &packs.unwrap().profiles[*i].counts);
+    // per layer: experts by blended share, then round-robin over the layers by rank
+    let mut per_layer: Vec<Vec<(f32, usize)>> = Vec::with_capacity(n);
+    for l in 0..n {
+        let h = &state.route_hist[l * ne..(l + 1) * ne];
+        let hs = h.iter().map(|&c| c as f32).sum::<f32>().max(1.0);
+        let (pc, ps) = match pack_counts {
+            Some(pc) => {
+                let row = &pc[l * ne..(l + 1) * ne];
+                (Some(row), row.iter().map(|&c| c as f32).sum::<f32>().max(1.0))
+            }
+            None => (None, 1.0),
+        };
+        let mut v: Vec<(f32, usize)> = (0..ne)
+            .map(|e| {
+                let own = h[e] as f32 / hs;
+                let pk = pc.map_or(0.0, |r| r[e] as f32 / ps);
+                (mix * own + (1.0 - mix) * pk, e)
+            })
+            .filter(|&(sc, _)| sc > 0.0)
+            .collect();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        per_layer.push(v);
+    }
+    let mut ranked: Vec<(usize, usize)> = Vec::new();
+    for r in 0..ne {
+        for (l, v) in per_layer.iter().enumerate() {
+            if let Some(&(_, e)) = v.get(r) {
+                ranked.push((l, e));
+            }
+        }
+    }
+    let triples: Vec<Vec<(usize, usize, usize)>> = layers.iter().map(|l| l.expert_ids.clone()).collect();
+    let arena = state.gpu_pool.as_mut().unwrap();
+    let (evicted, admitted) = arena.repack(&model, &ranked, &triples);
+    arena.flush_uploads();
+    // every layer must hold its top_k for a masked ranking
+    let k_top = layers[0].moe.top_k;
+    let enough = (0..n).all(|l| arena.occupancy.get(l).copied().unwrap_or(0) > k_top);
+    if std::env::var("CMF_QWEN_MASK").as_deref() == Ok("1") && enough {
+        state.masked = true;
+        if let Some(d) = state.dev.as_mut() {
+            d.set_masked(true);
+        }
+    }
+    let name = choice.as_ref().map_or("prompt routing", |(i, _)| packs.unwrap().names[*i].as_str());
+    tracing::info!(
+        "qwen4 packs: {name} for this request ({} prompt tokens, prompt share {mix}), {evicted} experts out, {admitted} in, {:.0} ms",
+        state.route_tokens,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    if std::env::var_os("CMF_QWEN_PROF").is_some() || std::env::var_os("CMF_QWEN_PACK_LOG").is_some() {
+        let errs = choice.as_ref().map(|(_, e)| {
+            packs.unwrap().names.iter().zip(e).map(|(nm, x)| format!("{nm}={x:.4}")).collect::<Vec<_>>().join(" ")
+        });
+        eprintln!(
+            "qwen4-pack {name} tokens={} mix={mix} out={evicted} in={admitted} {:.0}ms errors: {}",
+            state.route_tokens,
+            t0.elapsed().as_secs_f64() * 1e3,
+            errs.unwrap_or_default()
+        );
+    }
+}
+
+/// Fit the packs' router (`cortiq qwen-packs`): `dir` holds per pack `<name>.phi` (the
+/// windows `CMF_QWEN_PHI_DUMP` wrote over that task's text) and `<name>.profile`. Each
+/// pack's topology is fitted on its own windows alone (summed `blocks` at a time, so short
+/// and long prompts are both seen), the last ones held out; `router.json` gets written
+/// and the report holds the held-out argmin accuracy per pack.
+pub fn fit_packs(dir: &str, phi_layers: usize, rank: usize, blocks: &[usize]) -> Result<String, String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{dir}: {e}"))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".phi")).map(str::to_string))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(format!("{dir}: no <name>.phi files"));
+    }
+    let mut report = String::new();
+    let mut packs = Vec::new();
+    let mut holds: Vec<(usize, Vec<Vec<f32>>)> = Vec::new();
+    for (pi, name) in names.iter().enumerate() {
+        let prof = std::fs::read(format!("{dir}/{name}.profile")).map_err(|e| format!("{name}.profile: {e}"))?;
+        if prof.len() < 32 || &prof[..8] != b"CMFQ4PF\0" {
+            return Err(format!("{name}.profile is not a routing profile"));
+        }
+        let rd = |o: usize| u64::from_le_bytes(prof[o..o + 8].try_into().unwrap()) as usize;
+        let (nl, ne) = (rd(8), rd(16));
+        let raw = std::fs::read(format!("{dir}/{name}.phi")).map_err(|e| format!("{name}.phi: {e}"))?;
+        let w = nl * ne * 4;
+        if raw.len() < w || raw.len() % w != 0 {
+            return Err(format!("{name}.phi: not whole {nl}x{ne} rows"));
+        }
+        let rows: Vec<Vec<u32>> = raw
+            .chunks_exact(w)
+            .map(|r| r.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+            .collect();
+        let mut phis: Vec<Vec<f32>> = Vec::new();
+        for &b in blocks {
+            for grp in rows.chunks(b.max(1)) {
+                if grp.len() < b.max(1) {
+                    continue;
+                }
+                let mut sum = vec![0u32; nl * ne];
+                for r in grp {
+                    for (s, &v) in sum.iter_mut().zip(r) {
+                        *s += v;
+                    }
+                }
+                if let Some(p) = route_phi(&sum, ne, phi_layers) {
+                    phis.push(p);
+                }
+            }
+        }
+        let d = crate::router::fit_descriptor(&phis, phi_layers, rank).ok_or(format!("{name}: too few windows ({})", phis.len()))?;
+        let hold = d.holdout.as_deref().and_then(crate::router::decode_f16).unwrap_or_default();
+        let dim = phi_layers * ne;
+        holds.push((pi, hold.chunks_exact(dim).map(|c| c.to_vec()).collect()));
+        report.push_str(&format!("{name}: {} windows ({} raw), rank {}\n", phis.len(), rows.len(), d.rank));
+        packs.push(serde_json::json!({ "name": name, "descriptor": d, "windows": phis.len() }));
+    }
+    // held-out argmin over every pack's topology, as decided at run time
+    let subs: Vec<(Vec<f32>, Vec<f32>, usize)> = packs
+        .iter()
+        .map(|p| {
+            let d = &p["descriptor"];
+            (
+                crate::router::decode_f16(d["mean"].as_str().unwrap_or("")).unwrap_or_default(),
+                crate::router::decode_f16(d["basis"].as_str().unwrap_or("")).unwrap_or_default(),
+                d["rank"].as_u64().unwrap_or(1) as usize,
+            )
+        })
+        .collect();
+    let (mut ok, mut tot) = (0usize, 0usize);
+    for (pi, hs) in &holds {
+        let mut right = 0;
+        let mut confused: std::collections::BTreeMap<&str, usize> = Default::default();
+        for h in hs {
+            let errs: Vec<f32> = subs.iter().map(|(m, b, r)| crate::router::recon_error(h, m, b, *r)).collect();
+            let best = errs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).map(|x| x.0).unwrap_or(0);
+            if best == *pi {
+                right += 1;
+            } else {
+                *confused.entry(names[best].as_str()).or_default() += 1;
+            }
+        }
+        ok += right;
+        tot += hs.len();
+        report.push_str(&format!("held-out {}: {right}/{} {:?}\n", names[*pi], hs.len(), confused));
+    }
+    report.push_str(&format!("held-out total: {ok}/{tot}\n"));
+    let out = serde_json::json!({ "phi_layers": phi_layers, "rank": rank, "blocks": blocks, "packs": packs });
+    std::fs::write(format!("{dir}/router.json"), serde_json::to_vec_pretty(&out).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("router.json: {e}"))?;
+    Ok(report)
 }
 
 #[cfg(feature = "gpu")]

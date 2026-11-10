@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.65] — 2026-11-10
+
+### Added
+- `cortiq moe-defrag --keep N` cuts a MoE to the N experts a layer that a routing profile (`CMF_QWEN_PROFILE_SAVE`)
+  routes to most, writes the profile in the new numbering, and `--merge` appends the MTP sidecar, so the cut is one
+  file. The cut records the checkpoint expert behind every kept slot (`provenance.moe_defrag.kept_ids`); `hot-bake
+  --experts` reads a cut's slots from the bf16 checkpoint by those numbers (`--defrag-stats` rebuilds the list for
+  older cuts). Qwen3.8-Flash-Next Fast Code (256 experts a layer by code and front-end routing): HumanEval 93.3 %,
+  prompt 827–844 tok/s and generation 136–166 tok/s on an RTX PRO 6000.
+- `cortiq import-gguf --template` maps a qwen4exp GGUF (Strata Coder) onto the tensors of an existing CMF, each
+  tensor's reading chosen by cosine against the template; IQ2_S and IQ3_XXS are dequantized as gguf-py does.
+- Expert packs for a Flash-Next-class MoE on a card that cannot hold every expert (`CMF_QWEN_PACKS=<dir>`): one
+  routing profile per task, chosen per request by a patent-1 resonance router over the model's own routing of the
+  prompt (`cortiq qwen-packs` fits it); after the prompt the arena is refilled with that task's experts in 10–40 ms.
+  `CMF_QWEN_MASK=1` keeps decode inside the arena (opt-in; it costs answer quality).
+- Qwen3.5 GDN hybrids on wgpu: f16 K/V mirrors (`CMF_GPU_KV16=0` keeps f32), q4tp prompt GEMMs and causal flash
+  attention on the matrix units, position-parallel GDN conv and norm, a staged GDN scan, deferred chunk readback,
+  flash-decoding with f16 twins. Qwen3.5-4B q4tp on an RTX A5000: prompt 800 → 2900–3260 tok/s at 1K and 607 → 3871
+  at 16K, decode 116 → 128 and 87 → 111, level with llama.cpp's Vulkan backend.
+
+### Changed
+- qwen4 (Flash-Next) on wgpu: 256-token prompt frames with the experts, HC mixes, router and GDN gates on the matrix
+  units; a decode token in four chains encoded while the card runs the previous one; radix top-k in the indexer and
+  index blocks to 65 536 (exact attention to 262 144 positions). RTX PRO 6000: prompt 551 → 887 tok/s at 4K, generation
+  with MTP 122 → 145.
+- On a card that cannot hold every qwen4 expert the prompt streams layer by layer (`CMF_QWEN_STREAM=0` restores
+  per-frame admission): each layer's experts are admitted once per 4096-token chunk (2048 below 11 GiB). The host tier
+  of pinned memory the arena copies from by DMA is on by default there. Fast Code (q4tp, 41 GB whole) now runs on
+  12–24 GB cards (it could not stream before); cards emulated on an RTX 5090, prompt at 4K / generation: 12 GB 240 /
+  30–33 tok/s, 16 GB 389 / 48, 24 GB 768 / 65–72.
+- A loaded routing profile (`CMF_QWEN_PROFILE`) no longer keeps every prompt frame reading its routing back; only
+  `CMF_QWEN_PROFILE_SAVE` does. Resident prompt ×1.7–2.4.
+- Prompt frames past 4096 expert winners sort them by counting; `CMF_QWEN_Q82COOP=1` runs the q8_2f prompt
+  projections on the matrix units.
+- `cortiq bench` warms the prompt with a different text of the same length right before the timed run (the old
+  warmup left a reusable prefix and ran before the pair micro-bench).
+
+### Fixed
+- The converter writes no MTP header when the config declares MTP but the checkpoint ships no MTP tensors.
+- f16 K/V mirror capacity rounds to 64: the 64-row tile was refused past 2048 positions.
+- The embedded MTP head of qwen4 opens its own model handle (it shared the backbone's arena uid);
+  `rollback_prefix_len` and `graph_gdn_layer_count` guard qwen4's empty generic layers (a panic in `run`/`serve`).
+- qwen4 prompt frames run `n_experts + 1` expert segments: a frame whose winners took every expert of a cut plus the
+  shared one would have skipped its last segment.
+
 ## [0.8.64] — 2026-11-09
 
 ### Added
