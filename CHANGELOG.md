@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.66] — 2026-11-10
+
+### Added
+- The MNN-Pocket-0.3B family (taobao-mnn): the assistant, its base and SFT checkpoints, the DFlash2 draft and the
+  decision model as CMF files (`infosave/MNN-Pocket-0.3B-cmf`). The q4tp file is rounded from the authors' INT4
+  (QAT) weights; the files carry the authors' sampling and a loop stop.
+- `cortiq decide-pointer MODEL --input request.json`: typed decisions (choice / noul / score) with a pointer-head
+  decision model (MNN-Pocket-0.3B-Dec): the authors' request serializer, one causal pass over the state and each
+  question's branch (the reference's branch mask), the float32 pointer head and calibrated temperature carried as
+  `decision.pointer.*`. Dec-f16 picks the reference's answer on 49/49 questions, probabilities within 0.001.
+- DFlash 2 sidecars from SpecForge configs (`is_causal` absent, `block_size` at the top level) and for tied bases.
+
+### Changed
+- Metal: the four-row q8_2f matvec decodes every plain dense plan (it was Spark-X2.5's alone; `CMF_Q8_R4=0` closes
+  it), and the decode attend runs the split-K kernel in blocks of 16 / 32 / 64 from 2 to 1 536 positions
+  (`CMF_GQA_SHORT=0` restores the per-head / per-key kernels). M4: MNN-Pocket-0.3B q8_2f 162 → 202 tok/s (the CPU
+  154–161), q4tp 214 → 252; token time 0.81x on MiniCPM5-2B, 0.78x on Minico-M1; text unchanged.
+- wgpu: the batch graph's q8_2f projections of 1–8 rows and the DFlash block's run the decode kernel batched
+  (`q8_2f_matvec_bu`; each row the decode's to the bit, `CMF_Q82_UNR=0` keeps the old kernel): six rows of a 0.3B
+  model's FFN 1.6–2x faster. The DFlash block runs on the device for hidden sizes that are multiples of 64 and
+  four-bit projections narrower than 2 048 columns. The solo drafter's pay-off is judged on summed round time over
+  summed tokens from its third round. MNN-Pocket-0.3B q8_2f + DFlash2 on an RTX 2000 Ada: Python 320 → 415 tok/s,
+  text identical to plain decoding.
+- The converter no longer writes a tied `lm_head.weight` that is a byte copy of the embedding (the embedding serves
+  the head): MNN-Pocket-0.3B q8_2f 375 → 316 MB.
+
+### Fixed
+- Streaming output (`run`, `serve` SSE, the network split path) no longer prints U+FFFD where a byte-level token ends
+  inside a character: the bytes wait for the token that completes it (44 of 192 MNN-Pocket answers, Chinese text
+  and subscripts).
+
 ## [0.8.65] — 2026-11-10
 
 ### Added
