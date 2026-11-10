@@ -27,7 +27,8 @@ fn main() {
     .expect("no adapter");
     println!("{}", adapter.get_info().name);
     let mut limits = adapter.limits();
-    limits.max_compute_workgroup_storage_size = limits.max_compute_workgroup_storage_size.max(32768);
+    limits.max_compute_workgroup_storage_size =
+        limits.max_compute_workgroup_storage_size.max(32768);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: None,
         required_limits: limits,
@@ -51,7 +52,11 @@ fn main() {
             cache: None,
         })
     };
-    let kernels = [("cur", pipe("cur"), 4u32), ("b4k", pipe("b4k"), 4u32), ("mv4k", pipe("mv4k"), 4u32)];
+    let kernels = [
+        ("cur", pipe("cur"), 4u32),
+        ("b4k", pipe("b4k"), 4u32),
+        ("mv4k", pipe("mv4k"), 4u32),
+    ];
     let mut seed = 0x9e37_79b9u32;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -60,7 +65,13 @@ fn main() {
         seed
     };
     use wgpu::util::DeviceExt;
-    for (rows, cols) in [(2560usize, 896usize), (896, 2560), (896, 896), (128, 896), (65536, 896)] {
+    for (rows, cols) in [
+        (2560usize, 896usize),
+        (896, 2560),
+        (896, 896),
+        (128, 896),
+        (65536, 896),
+    ] {
         // q8_2f payload: int8 codes, f16 row scales, f16 column scales
         let words = (rows * cols) / 4 + rows / 2 + cols / 2 + 4;
         let w: Vec<u32> = (0..words)
@@ -78,7 +89,9 @@ fn main() {
             usage: wgpu::BufferUsages::STORAGE,
         });
         for nb in [1usize, 4, 6, 8] {
-            let x: Vec<f32> = (0..nb * cols).map(|_| (rnd() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let x: Vec<f32> = (0..nb * cols)
+                .map(|_| (rnd() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
             let xbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&x),
@@ -127,10 +140,22 @@ fn main() {
                     label: None,
                     layout: &pl.get_bind_group_layout(0),
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wbuf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: xbuf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: ybuf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: pbuf.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wbuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: xbuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: ybuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pbuf.as_entire_binding(),
+                        },
                     ],
                 });
                 let wgs = (rows as u32).div_ceil(rows_per_wg).min(65535);
@@ -167,12 +192,20 @@ fn main() {
             }
             // b4k is the decode kernel (mv4k) batched: its row 0 equals mv4k's to the bit
             // b4k and unr batch the decode kernel (mv4k): their row 0 equals mv4k's to the bit
-            let eq = |o: &Vec<f32>| o[..rows].iter().zip(&outs[2][..rows]).all(|(a, b)| a.to_bits() == b.to_bits());
-            println!("{line}  row 0 = mv4k: b4k {} unr {}", eq(&outs[1]), eq(&outs[3]));
+            let eq = |o: &Vec<f32>| {
+                o[..rows]
+                    .iter()
+                    .zip(&outs[2][..rows])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            };
+            println!(
+                "{line}  row 0 = mv4k: b4k {} unr {}",
+                eq(&outs[1]),
+                eq(&outs[3])
+            );
         }
     }
 }
-
 
 /// `mv4k` over exactly `nb` batch rows, unrolled: one vec4 accumulator a
 /// batch row as its own variable, the partials lane-major (`j·256 + lane`),
@@ -189,7 +222,9 @@ fn unrolled_src(nb: usize) -> String {
             "                let x{j} = qb_x[{j}u * ngrp + i] * cs;\n                a{j} = a{j} + vec4<f32>(dot(wa, x{j}), dot(wb, x{j}), dot(wc, x{j}), dot(wd, x{j}));\n"
         );
         store += &format!("        u_part[{j}u * 256u + lid] = a{j};\n");
-        tree += &format!("                u_part[{j}u * 256u + lid] = u_part[{j}u * 256u + lid] + u_part[{j}u * 256u + lid + stride];\n");
+        tree += &format!(
+            "                u_part[{j}u * 256u + lid] = u_part[{j}u * 256u + lid] + u_part[{j}u * 256u + lid + stride];\n"
+        );
     }
     let core = r#"
 @compute @workgroup_size(256)

@@ -10,7 +10,10 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use metal::*;
-    let args: Vec<usize> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
+    let args: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse().ok())
+        .collect();
     let n = *args.first().unwrap_or(&300);
     let tgs = *args.get(1).unwrap_or(&14) as u64;
     let dev = Device::system_default().expect("no Metal device");
@@ -20,7 +23,9 @@ using namespace metal;
 kernel void step(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     x[i] = x[i] * 0.999f + 1.0f;
 }"#;
-    let lib = dev.new_library_with_source(src, &CompileOptions::new()).expect("compile");
+    let lib = dev
+        .new_library_with_source(src, &CompileOptions::new())
+        .expect("compile");
     let pso = dev
         .new_compute_pipeline_state_with_function(&lib.get_function("step", None).unwrap())
         .unwrap();
@@ -65,7 +70,9 @@ kernel void step(device float* x [[buffer(0)]], uint i [[thread_position_in_grid
         }
         best / n as f64
     };
-    println!("{n} dispatches of {tgs} threadgroups x 256 threads, GPU time per dispatch (best of 7):");
+    println!(
+        "{n} dispatches of {tgs} threadgroups x 256 threads, GPU time per dispatch (best of 7):"
+    );
     println!("  serial encoder (implicit hazards):  {:6.2} us", run(0));
     println!("  concurrent + barrier every pair:    {:6.2} us", run(1));
     println!("  concurrent, no barriers (floor):    {:6.2} us", run(2));
