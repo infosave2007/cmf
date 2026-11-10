@@ -21523,6 +21523,12 @@ static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<B
 /// init failure is a clean CPU fallback, so a box without a driver loses
 /// nothing. `CMF_GPU=0` forces the CPU.
 pub fn selected() -> bool {
+    // `CMF_GPU=cuda` hands the card to the native CUDA backend: no wgpu
+    // context is built beside it.
+    #[cfg(feature = "cuda")]
+    if crate::gpu_cuda::selected() {
+        return false;
+    }
     match std::env::var("CMF_GPU") {
         Ok(v) if v == "wgpu" => true,
         Ok(v) if v != "0" && v != "off" => !cfg!(target_os = "macos"),

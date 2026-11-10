@@ -5339,10 +5339,18 @@ impl Pipeline {
             && crate::gpu::enabled_here()
             && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
         {
+            if let Some(k) = crate::gpu::cuda_batch_rows() {
+                return k;
+            }
             return if self.tiled_sliding_batch() { 512 } else { 128 };
         }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
+            // The CUDA batch graph expands each weight once a chunk and
+            // multiplies with cuBLAS: its own, larger chunk (`CMF_CUDA_BATCH`).
+            if let Some(k) = crate::gpu::cuda_batch_rows() {
+                return k;
+            }
             // A dense sliding-window stack on the tiled whole-run attend:
             // 512 rows a submit (Spark-X2.6 q4tp on an RTX 2000 Ada, 4096
             // tokens: 288 tok/s at 128, 317 at 512, the same greedy text;
@@ -5508,7 +5516,8 @@ impl Pipeline {
             return Ok(false);
         }
         self.o1_choose_exact_rows();
-        let mut participating = false;
+        let (t_seal, mut sealed_now, epoch) = (std::time::Instant::now(), 0usize, self.o1_epoch);
+        let mut todo: Vec<(usize, usize)> = Vec::new();
         for li in 0..self.num_layers {
             if !self.o1_flags.get(li).copied().unwrap_or(false) {
                 continue;
@@ -5519,11 +5528,62 @@ impl Pipeline {
             if self.kv_cache.layers[li].seq_len == 0 {
                 continue;
             }
-            participating = true;
-            let num_heads = self.layer_num_heads(li);
-            self.kv_cache.layers[li].o1_seal_checked(num_heads)?;
+            todo.push((li, self.layer_num_heads(li)));
         }
+        let participating = !todo.is_empty();
+        // A layer's seal depends on that layer's rows alone, and its groups
+        // already seal on their own threads: a few layers go at a time, as
+        // many as the cores carry (`CMF_O1_SEAL_PAR=N` sets the number). Each
+        // holds its queries per group while it seals, so not all at once —
+        // and one after another on a Mac, where that memory is the model's
+        // too.
+        let par = std::env::var("CMF_O1_SEAL_PAR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    return 1;
+                }
+                let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+                let groups = todo.first().map_or(1, |&(li, _)| self.kv_cache.layers[li].num_kv_heads.max(1));
+                cores.div_ceil(groups).clamp(1, 3)
+            })
+            .max(1);
+        let mut slots: Vec<Option<&mut crate::kv_cache::LayerKvCache>> = self.kv_cache.layers.iter_mut().map(Some).collect();
+        let mut jobs: Vec<(&mut crate::kv_cache::LayerKvCache, usize)> =
+            todo.iter().filter_map(|&(li, nh)| slots[li].take().map(|c| (c, nh))).collect();
+        for run in jobs.chunks_mut(par) {
+            let done: Vec<Result<bool, String>> = if run.len() == 1 {
+                let (c, nh) = &mut run[0];
+                let was = c.o1_sealed();
+                vec![c.o1_seal_checked(*nh).map(|ok| ok && !was)]
+            } else {
+                std::thread::scope(|s| {
+                    let hs: Vec<_> = run
+                        .iter_mut()
+                        .map(|(c, nh)| {
+                            let nh = *nh;
+                            s.spawn(move || {
+                                let was = c.o1_sealed();
+                                c.o1_seal_checked(nh).map(|ok| ok && !was)
+                            })
+                        })
+                        .collect();
+                    hs.into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| Err("o1 seal: a layer's thread panicked".into())))
+                        .collect()
+                })
+            };
+            for r in done {
+                sealed_now += r? as usize;
+            }
+        }
+        drop(jobs);
+        drop(slots);
         self.o1_note_transition();
+        if self.o1_epoch != epoch && sealed_now > 0 {
+            tracing::info!("o1: {sealed_now} layer(s) sealed in {:.2} s", t_seal.elapsed().as_secs_f64());
+        }
         for li in 0..self.num_layers {
             if self.o1_flags.get(li).copied().unwrap_or(false) {
                 if let Some(err) = self.kv_cache.layers[li].take_o1_error() {
@@ -5766,7 +5826,17 @@ impl Pipeline {
 
     /// A backend with the far field's prompt path and stages.
     fn o1_graph_backend(&self) -> bool {
-        crate::gpu::wgpu_active() || crate::gpu::backend_name() == "metal"
+        crate::gpu::wgpu_active() || crate::gpu::cuda_active() || crate::gpu::backend_name() == "metal"
+    }
+
+    /// The whole prompt is read exact on the card, and one seal after it
+    /// chooses among all of its rows, with the question's queries in the
+    /// trace. The CUDA graph's way (it has the far field's token kernels and
+    /// no sealed-chunk ones); `CMF_O1_WHOLE=1` takes the wgpu graph the same
+    /// way, so the two can be compared row for row.
+    #[cfg(not(target_os = "macos"))]
+    fn o1_whole_prompt(&self) -> bool {
+        crate::gpu::cuda_active() || std::env::var("CMF_O1_WHOLE").as_deref() == Ok("1")
     }
 
     pub fn far_turbo_seal(&self) -> usize {
@@ -5927,10 +5997,16 @@ impl Pipeline {
         let n = ids.len();
         let mut last = vec![0f32; hs];
         let mut pos = 0;
+        // `CMF_PREFILL_PROF`: where the prefix's time goes (the chunks, the
+        // queries off the card, the K/V rows off the card, their way into the cache).
+        let prof = std::env::var("CMF_PREFILL_PROF").is_ok();
+        let (mut t_chunks, mut t_q) = (0f64, 0f64);
         // The seal's queries leave the card chunk by chunk, one row in `QT_STRIDE`: its
         // landmarks are means over long segments.
         const QT_STRIDE: usize = 8;
         let qrow = nh * hd;
+        // A backend may hand back the kept rows alone (CUDA gathers them on the card).
+        let strided = crate::gpu::o1_qcap_stride(QT_STRIDE);
         let mut qs: Vec<Vec<f32>> = vec![Vec::new(); o1_layers.len()];
         while pos < n {
             let end = (pos + chunk).min(n);
@@ -5940,7 +6016,11 @@ impl Pipeline {
                 hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
             }
             let positions: Vec<usize> = (pos..end).collect();
-            match self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None) {
+            let t_c = std::time::Instant::now();
+            let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+            t_chunks += t_c.elapsed().as_secs_f64();
+            let t_d = std::time::Instant::now();
+            match outcome {
                 crate::gpu::BatchGraphOutcome::Completed => {
                     last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                 }
@@ -5958,6 +6038,15 @@ impl Pipeline {
                 return Err("O(1) prefix: query readback failed".into());
             };
             for (i, (_, rows)) in drained.iter().enumerate() {
+                if strided {
+                    let kept = (pos..end).filter(|p| p % QT_STRIDE == 0).count();
+                    if rows.len() != kept * qrow {
+                        let _ = crate::gpu::o1_qcap_take();
+                        return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), kept * qrow));
+                    }
+                    qs[i].extend_from_slice(rows);
+                    continue;
+                }
                 if rows.len() != bk * qrow {
                     let _ = crate::gpu::o1_qcap_take();
                     return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), bk * qrow));
@@ -5968,12 +6057,15 @@ impl Pipeline {
                     }
                 }
             }
+            t_q += t_d.elapsed().as_secs_f64();
             pos = end;
         }
         let _ = crate::gpu::o1_qcap_take();
+        let t_kv = std::time::Instant::now();
         let pulls: Vec<(usize, usize, usize)> = o1_layers.iter().map(|&li| (li, 0, n)).collect();
         let kv = crate::gpu::graph_kv_read_rows(self.graph_kv_id, &pulls, nkv, hd)
             .ok_or("O(1) prefix: K/V readback failed")?;
+        let (t_kv, t_app) = (t_kv.elapsed().as_secs_f64(), std::time::Instant::now());
         let row = nkv * hd;
         for ((&li, q), (k, v)) in o1_layers.iter().zip(qs).zip(kv) {
             if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
@@ -5989,6 +6081,7 @@ impl Pipeline {
             }
             let cache = &mut self.kv_cache.layers[li];
             cache.o1_set_q_stride(QT_STRIDE);
+            cache.reserve_rows(n);
             for p in 0..n {
                 cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
             }
@@ -6011,6 +6104,12 @@ impl Pipeline {
                 a.hd = hd;
             }
             cache.o1_set_q_trace(q);
+        }
+        if prof {
+            eprintln!(
+                "o1 prefix: {n} rows, chunks {t_chunks:.2} s, queries off the card {t_q:.2} s, K/V off the card {t_kv:.2} s, into the cache {:.2} s",
+                t_app.elapsed().as_secs_f64()
+            );
         }
         Ok(Some(last))
     }
@@ -6986,7 +7085,18 @@ impl Pipeline {
                     limit
                 };
                 #[cfg(not(target_os = "macos"))]
-                let px_len = limit;
+                let px_len = if self.o1_whole_prompt() {
+                    o1_arch = None;
+                    let n = input_ids.len();
+                    for li in 0..self.num_layers {
+                        if self.o1_flags.get(li).copied().unwrap_or(false) {
+                            self.kv_cache.layers[li].o1_set_boundary(n);
+                        }
+                    }
+                    n
+                } else {
+                    limit
+                };
                 #[cfg(target_os = "macos")]
                 let prefix = if crate::gpu::q1_force() {
                     self.o1_prefix_on_metal(&input_ids[..px_len], batch_k, o1_arch.as_mut())
@@ -6994,7 +7104,18 @@ impl Pipeline {
                     self.o1_prefix_on_graph(&input_ids[..px_len], batch_k, o1_arch.as_mut())
                 };
                 #[cfg(not(target_os = "macos"))]
-                let prefix = self.o1_prefix_on_graph(&input_ids[..px_len], batch_k, o1_arch.as_mut());
+                let prefix = {
+                    // the CUDA mirrors take the whole prompt at the first chunk
+                    let hint = crate::gpu::cuda_active();
+                    if hint {
+                        crate::gpu::set_batch_kv_hint(px_len + 1);
+                    }
+                    let r = self.o1_prefix_on_graph(&input_ids[..px_len], batch_k, o1_arch.as_mut());
+                    if hint {
+                        crate::gpu::set_batch_kv_hint(0);
+                    }
+                    r
+                };
                 match prefix {
                     Ok(Some(last)) => {
                         hidden.copy_from_slice(&last);
@@ -16485,12 +16606,38 @@ impl Pipeline {
         )
     }
 
+    /// A device token graph (wgpu or CUDA) decodes this pipeline: the head
+    /// of a row the graph did not run — the first token after a prompt —
+    /// takes the graph's head pass as well (`CMF_HEAD_GRAPH=0`: the host
+    /// head, as before).
+    ///
+    /// The host head of a q8 file on a GPU run is a hybrid: half of the
+    /// vocabulary's rows on the card in f32, the other half on the CPU with
+    /// integer activations (`gpu_split_frac`). Every later token's logits
+    /// come from the graph's fused head, so that one row alone carried the
+    /// integer half. Spark-X2.6-4B q8_2f on an A40 over Vulkan, against the
+    /// host with float activations: first-token logits 0.29 off (and a
+    /// near-tie token flipped on one prompt in four), every other token
+    /// 0.015; through the graph's head the first token is 0.014 off too.
+    /// On wgpu only those two codecs take it (`m3_device_logits`): a q4tp
+    /// head measured the same either way.
+    #[cfg(feature = "gpu")]
+    fn graph_head_after_prompt(&self) -> bool {
+        (crate::gpu::wgpu_active() || crate::gpu::cuda_active())
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            && !self.graph_refused()
+            && std::env::var("CMF_HEAD_GRAPH").as_deref() != Ok("0")
+    }
+
     /// The pooled tail's device lm_head: final-norm + head as one
     /// layer-less graph pass, so decode stops paying the double-digit
     /// millisecond host matvec every token. `None` keeps the host head.
+    /// Also the head of the first token after a prompt wherever a device
+    /// graph decodes (`graph_head_after_prompt`).
     #[cfg(feature = "gpu")]
     fn m3_device_logits(&self, hidden: &[f32]) -> Option<Vec<f32>> {
-        if !crate::minicpm_tail::minimax_pool_on()
+        let pooled = crate::minicpm_tail::minimax_pool_on();
+        if !(pooled || self.graph_head_after_prompt())
             || !crate::gpu::enabled_here()
             || self.head_clusters.is_some()
             || self.graph_failed.load(std::sync::atomic::Ordering::Relaxed)
@@ -16503,6 +16650,11 @@ impl Pipeline {
             .lm_head
             .graph_weight()
             .or_else(|| self.weights.lm_head.graph_weight_descriptor())?;
+        // After a prompt on wgpu: the codecs whose host head is the hybrid
+        // (q8 by rows, q8_2f). CUDA has no host GPU head at all.
+        if !pooled && !crate::gpu::cuda_active() && !matches!(kind, 0 | 7) {
+            return None;
+        }
         let name = &model.tensors[i].name;
         let prism = if crate::prism::is_inverse_embedding(&model, name) {
             crate::gpu::GraphPrismOp::InverseEmbedding

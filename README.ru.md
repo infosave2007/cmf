@@ -123,6 +123,23 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Бэкенд CUDA для карт NVIDIA (0.8.67)
+
+Нативный бэкенд CUDA рядом с wgpu и Metal, экспериментальный и по умолчанию выключенный: сборка с
+`--features cuda`, выбор через `CMF_GPU=cuda`. Ничего не линкуется: ядра написаны на CUDA C и компилируются
+при первом запуске, промпт считает cuBLAS. Покрыты плотные стеки с вниманием класса Spark-X2.x, включая
+дальнее поле турбо-файла. [Spark-X2.6-4B Turbo](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-CUDA-cmf)
+в четырёх битах на NVIDIA A40 читает промпт в 4 000 токенов на 6096 tok/s и генерирует 111,5 tok/s (3789 и
+80,2 через Vulkan); после промпта в 64 000 токенов первый токен приходит через 42,3 с, генерация 100,7 tok/s
+в 3,9 ГБ карты (60,3 с и 85,9 tok/s через Vulkan):
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve spark-x2.6-4b-q4tp-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+См. [docs/CUDA.ru.md](docs/CUDA.ru.md).
+
 ## Ripple-65B Preview, плотная 65B в трёх файлах (0.8.60)
 
 [Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) в четырёх битах (34,6 ГБ), двух

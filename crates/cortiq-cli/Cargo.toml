@@ -26,6 +26,9 @@ decision-vulkan = ["cortiq-decision/vulkan"]
 # (native Metal on macOS is target-gated in the engine and always in).
 default = ["gpu", "phonon"]
 gpu = ["cortiq-engine/gpu", "decision-vulkan"]
+# The native CUDA backend beside wgpu (NVIDIA; `CMF_GPU=cuda` at run time).
+# Off by default: a build without it is unchanged.
+cuda = ["gpu", "cortiq-engine/cuda"]
 # Self-contained CMF packaging and execution for Gradium Phonon TTS.
 phonon = ["cortiq-engine/phonon"]
 
@@ -36,7 +39,7 @@ cortiq-core = { path = "../cortiq-core", version = "0.8.24" }
 # `phonon` is first introduced by this release.  Pin the published CLI to the
 # matching engine so `cargo install cortiq-cli` cannot resolve an older engine
 # which lacks that feature.
-cortiq-engine = { path = "../cortiq-engine", version = "=0.8.66" }
+cortiq-engine = { path = "../cortiq-engine", version = "=0.8.67" }
 cortiq-net = { path = "../cortiq-net", version = "0.8.24" }
 cortiq-server = { path = "../cortiq-server", version = "0.8.24" }
 # `cortiq decide` / `cortiq decision …` and the decision branch of serve.

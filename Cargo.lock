@@ -130,7 +130,7 @@ version = "0.38.0+1.3.281"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-cli"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "axum",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-core"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-decision"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-embryo"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -653,13 +653,14 @@ dependencies = [
 
 [[package]]
 name = "cortiq-engine"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "ash",
  "base64 0.22.1",
  "bytemuck",
  "cortiq-core",
+ "cudarc",
  "fancy-regex 0.14.0",
  "image",
  "libc",
@@ -686,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-ffi"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "cortiq-core",
  "cortiq-engine",
@@ -697,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-net"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "bincode",
  "cortiq-core",
@@ -709,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-server"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "axum",
@@ -734,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-spectra"
-version = "0.8.66"
+version = "0.8.67"
 dependencies = [
  "anyhow",
  "clap",
@@ -803,6 +804,15 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.19.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562"
+dependencies = [
+ "libloading 0.9.0",
 ]
 
 [[package]]
@@ -981,7 +991,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -1819,7 +1829,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
 dependencies = [
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "pkg-config",
 ]
 
@@ -1852,6 +1862,16 @@ name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -3928,7 +3948,7 @@ dependencies = [
  "js-sys",
  "khronos-egl",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "log",
  "naga",
  "naga-types",

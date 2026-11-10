@@ -123,6 +123,23 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## A CUDA backend for NVIDIA cards (0.8.67)
+
+A native CUDA backend beside wgpu and Metal, experimental and off by default: build with `--features cuda`,
+select with `CMF_GPU=cuda`. Nothing is linked: the kernels are CUDA C compiled at first use, the prompt runs
+on cuBLAS. It covers dense attention stacks of the Spark-X2.x class, a turbo file's far field included.
+[Spark-X2.6-4B Turbo](https://huggingface.co/infosave/Spark-X2.6-4B-turbo-CUDA-cmf) in four bits on an NVIDIA
+A40 reads a 4 000-token prompt at 6096 tok/s and decodes at 111.5 tok/s (3789 and 80.2 over Vulkan); after a
+64 000-token prompt it gives the first token in 42.3 s and decodes at 100.7 tok/s in 3.9 GB of the card (60.3 s
+and 85.9 tok/s over Vulkan):
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve spark-x2.6-4b-q4tp-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+See [docs/CUDA.md](docs/CUDA.md).
+
 ## Ripple-65B Preview, a dense 65B in three files (0.8.60)
 
 [Ripple-65B Preview](https://huggingface.co/infosave/Ripple-65B-Preview-cmf) in four bits (34.6 GB), two bits
