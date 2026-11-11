@@ -44,7 +44,7 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-On an NVIDIA card, through CUDA (cortiq 0.8.68 or later; see [NVIDIA via CUDA](#nvidia-via-cuda)):
+On an NVIDIA card, through CUDA (cortiq 0.8.69 or later; see [NVIDIA via CUDA](#nvidia-via-cuda)):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -151,7 +151,7 @@ The build links nothing; at run time the backend opens the driver's `libcuda` an
 `libnvrtc` and `libcublas`. The MTP head drafts by default. For code, the DFlash 2 drafter beside the file
 does a little better: download `orcacyber-nano-1.0-turbo.dflash.cmf` and add `CMF_DFLASH=1`.
 
-RTX 3090 (24 GB), cortiq 0.8.68, `--greedy --no-think`, tok/s:
+RTX 3090 (24 GB), cortiq 0.8.69, `--greedy --no-think`, tok/s:
 
 | answer | plain | **MTP drafts** | **DFlash 2** |
 |---|---:|---:|---:|
@@ -251,7 +251,7 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-На карте NVIDIA, через CUDA (cortiq 0.8.68 или новее; см. «NVIDIA через CUDA» ниже):
+На карте NVIDIA, через CUDA (cortiq 0.8.69 или новее; см. «NVIDIA через CUDA» ниже):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -354,7 +354,7 @@ CMF_GPU=cuda cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8
 `libnvrtc` и `libcublas`. По умолчанию черновики пишет MTP-голова. На коде драфтер DFlash 2 рядом с файлом
 немного лучше: скачайте `orcacyber-nano-1.0-turbo.dflash.cmf` и добавьте `CMF_DFLASH=1`.
 
-RTX 3090 (24 ГБ), cortiq 0.8.68, `--greedy --no-think`, ток/с:
+RTX 3090 (24 ГБ), cortiq 0.8.69, `--greedy --no-think`, ток/с:
 
 | ответ | обычный | **черновики MTP** | **DFlash 2** |
 |---|---:|---:|---:|
@@ -451,7 +451,7 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-在 NVIDIA 显卡上通过 CUDA 运行（cortiq 0.8.68 或更新版本；见下文「NVIDIA（CUDA）」）：
+在 NVIDIA 显卡上通过 CUDA 运行（cortiq 0.8.69 或更新版本；见下文「NVIDIA（CUDA）」）：
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -547,7 +547,7 @@ CMF_GPU=cuda cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8
 构建时不链接任何库；运行时后端打开驱动的 `libcuda` 和 CUDA 12.x 库 `libnvrtc`、`libcublas`。默认由 MTP 头起草。
 在代码上，文件旁的 DFlash 2 草稿模型略好一些：下载 `orcacyber-nano-1.0-turbo.dflash.cmf` 并加上 `CMF_DFLASH=1`。
 
-RTX 3090（24 GB），cortiq 0.8.68，`--greedy --no-think`，tok/s：
+RTX 3090（24 GB），cortiq 0.8.69，`--greedy --no-think`，tok/s：
 
 | 回答 | 普通 | **MTP 草稿** | **DFlash 2** |
 |---|---:|---:|---:|

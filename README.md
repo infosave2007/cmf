@@ -123,7 +123,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-## Qwen3.8-27B on CUDA: chat at 120–128 tok/s on an RTX 3090 (0.8.68)
+## Qwen3.8-27B on CUDA: chat at 120–128 tok/s on an RTX 3090 (0.8.69)
 
 The CUDA backend runs Qwen3.5-family hybrids (GDN mixers plus gated attention) with drafts and their verify on
 the card. On an RTX 3090 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) in four bits decodes

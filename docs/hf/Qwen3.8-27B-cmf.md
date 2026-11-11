@@ -40,7 +40,7 @@ The engine picks the GPU and its settings itself. `--no-think` asks for a
 direct answer; without it the model reasons first, so raise `--max-tokens`
 (default 256).
 
-On an NVIDIA card the CUDA backend is the fastest path (cortiq 0.8.68 or later):
+On an NVIDIA card the CUDA backend is the fastest path (cortiq 0.8.69 or later):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -78,7 +78,7 @@ Decode speed of `qwen38-27b-q4tp.cmf`, one stream, tok/s:
 
 The code prompt and bench columns use speculative decoding with `--greedy`;
 on the RTX 5090 the code prompt carries a 2.3k-token context. The CUDA row is
-cortiq 0.8.68 with the DFlash drafter on an LRU cache module, 512 tokens, and
+cortiq 0.8.69 with the DFlash drafter on an LRU cache module, 512 tokens, and
 the bench after a 4 000-token prompt. RTX 5090
 figures were measured on an earlier release. RTX 3090 figures were measured
 with cortiq 0.8.15 on Ubuntu 24.04: plain decode with `CMF_GRAPH_SPEC=0`, a
@@ -167,7 +167,7 @@ without them `CMF_GPU=cuda` falls back to the CPU and says why. The first run
 compiles the kernels and keeps them in `~/.cache/cortiq/cuda`. `q4tp` and its
 drafter fit a 24 GB card.
 
-RTX 3090 (24 GB), cortiq 0.8.68, `--greedy --no-think`, 512 tokens, tok/s:
+RTX 3090 (24 GB), cortiq 0.8.69, `--greedy --no-think`, 512 tokens, tok/s:
 
 | prompt | Vulkan | **CUDA** | **CUDA + DFlash** |
 |---|---:|---:|---:|
@@ -291,7 +291,7 @@ cortiq run qwen38-27b-q4tp.cmf --prompt "Объясни квиксорт в тр
 Движок сам выбирает GPU и настройки. `--no-think` даёт прямой ответ; без него
 модель сначала рассуждает, поэтому увеличьте `--max-tokens` (по умолчанию 256).
 
-На карте NVIDIA быстрее всего бэкенд CUDA (cortiq 0.8.68 или новее):
+На карте NVIDIA быстрее всего бэкенд CUDA (cortiq 0.8.69 или новее):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -329,7 +329,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq run qwen38-27b-q4tp.cmf --prompt "Объясн�
 
 Столбцы «промпт с кодом» и bench измерены со спекулятивным декодированием и
 `--greedy`; на RTX 5090 промпт с кодом идёт с контекстом 2.3k токенов. Строка
-CUDA — cortiq 0.8.68 с драфтером DFlash на модуле LRU-кэша, 512 токенов, а
+CUDA — cortiq 0.8.69 с драфтером DFlash на модуле LRU-кэша, 512 токенов, а
 bench — после промпта в 4 000 токенов. Данные для RTX 5090 получены на одном из прошлых релизов. Данные для RTX 3090 измерены
 на cortiq 0.8.15 под Ubuntu 24.04: обычное декодирование — с `CMF_GRAPH_SPEC=0`,
 ответ на промпт с кодом — 400 токенов, в bench принимается 91 % черновых токенов.
@@ -415,7 +415,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq serve qwen38-27b-q4tp.cmf --host 127.0.0.1 --po
 переходит на CPU и пишет почему. Первый запуск компилирует ядра и хранит их в
 `~/.cache/cortiq/cuda`. `q4tp` вместе с драфтером помещается на карту 24 ГБ.
 
-RTX 3090 (24 ГБ), cortiq 0.8.68, `--greedy --no-think`, 512 токенов, токенов/с:
+RTX 3090 (24 ГБ), cortiq 0.8.69, `--greedy --no-think`, 512 токенов, токенов/с:
 
 | промпт | Vulkan | **CUDA** | **CUDA + DFlash** |
 |---|---:|---:|---:|
@@ -518,7 +518,7 @@ cortiq run qwen38-27b-q4tp.cmf --prompt "用三句话解释快速排序。" --no
 设置。`--no-think` 直接给出回答；不加该参数时模型会先思考，请调高 `--max-tokens`
 （默认 256）。
 
-在 NVIDIA 显卡上，最快的路径是 CUDA 后端（cortiq 0.8.68 或更新版本）：
+在 NVIDIA 显卡上，最快的路径是 CUDA 后端（cortiq 0.8.69 或更新版本）：
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -554,7 +554,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq run qwen38-27b-q4tp.cmf --prompt "用三句话�
 | Mac mini M4（24 GB） | Metal | 6.8 | 17.3 | 20.0 |
 
 「代码类提示词」和 bench 两列使用推测解码和 `--greedy`；RTX 5090 的代码类提示词
-带 2.3k token 上下文。CUDA 一行为 cortiq 0.8.68 配合 DFlash 草稿模型，提示词是一个 LRU
+带 2.3k token 上下文。CUDA 一行为 cortiq 0.8.69 配合 DFlash 草稿模型，提示词是一个 LRU
 缓存模块，512 个 token；bench 在 4 000 token 提示词之后测得。RTX 5090 数据测于较早的版本。RTX 3090 数据使用 cortiq 0.8.15
 在 Ubuntu 24.04 上测得：普通解码设置 `CMF_GRAPH_SPEC=0`，代码类提示词生成 400 个
 token，bench 中 91% 的草稿 token 被接受。
@@ -631,7 +631,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq serve qwen38-27b-q4tp.cmf --host 127.0.0.1 --po
 `libnvrtc` 和 `libcublas`；缺少它们时 `CMF_GPU=cuda` 会退回 CPU 并说明原因。首次运行
 编译内核并缓存到 `~/.cache/cortiq/cuda`。`q4tp` 加上草稿模型可装入 24 GB 显卡。
 
-RTX 3090（24 GB），cortiq 0.8.68，`--greedy --no-think`，512 个 token，tok/s：
+RTX 3090（24 GB），cortiq 0.8.69，`--greedy --no-think`，512 个 token，tok/s：
 
 | 提示词 | Vulkan | **CUDA** | **CUDA + DFlash** |
 |---|---:|---:|---:|

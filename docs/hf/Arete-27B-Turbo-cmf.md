@@ -48,7 +48,7 @@ Short on RAM as well, with a fast SSD:
 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-On an NVIDIA card, through CUDA (cortiq 0.8.68 or later):
+On an NVIDIA card, through CUDA (cortiq 0.8.69 or later):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -56,7 +56,7 @@ hf download infosave/Arete-27B-Turbo-cmf arete-27b-turbo.cmf arete-27b-turbo.dfl
 CMF_GPU=cuda CMF_DFLASH=1 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-Measured with cortiq 0.8.63 (Vulkan) and 0.8.68 (CUDA). `--no-think` asks for a direct answer; without
+Measured with cortiq 0.8.63 (Vulkan) and 0.8.69 (CUDA). `--no-think` asks for a direct answer; without
 it the model reasons first, so raise `--max-tokens` (default 256).
 
 | file | quantization | size | sha256 |
@@ -140,7 +140,7 @@ libraries `libnvrtc` and `libcublas`. `arete-27b-turbo.dflash.cmf` is
 Arete has no draft head of its own, so the drafter is what makes it faster. `CMF_DFLASH=1` picks it up
 beside the file.
 
-RTX 3090 (24 GB), cortiq 0.8.68, `--greedy --no-think`:
+RTX 3090 (24 GB), cortiq 0.8.69, `--greedy --no-think`:
 
 | answer | plain, tok/s | **DFlash 2**, tok/s | drafts kept |
 |---|---:|---:|---:|
@@ -226,7 +226,7 @@ cortiq run arete-27b-turbo.cmf --prompt-file report.txt --no-think
 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-На карте NVIDIA, через CUDA (cortiq 0.8.68 или новее):
+На карте NVIDIA, через CUDA (cortiq 0.8.69 или новее):
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -234,7 +234,7 @@ hf download infosave/Arete-27B-Turbo-cmf arete-27b-turbo.cmf arete-27b-turbo.dfl
 CMF_GPU=cuda CMF_DFLASH=1 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-Замерено на cortiq 0.8.63 (Vulkan) и 0.8.68 (CUDA). `--no-think` просит прямой ответ; без него модель
+Замерено на cortiq 0.8.63 (Vulkan) и 0.8.69 (CUDA). `--no-think` просит прямой ответ; без него модель
 сначала рассуждает, так что поднимите `--max-tokens` (по умолчанию 256).
 
 | файл | квантизация | размер | sha256 |
@@ -305,7 +305,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq serve arete-27b-turbo.cmf --host 127.0.0.1 --po
 файл: своей головы черновиков у Arete нет, и ускоряет её именно драфтер. `CMF_DFLASH=1` подхватывает его
 рядом с файлом.
 
-RTX 3090 (24 ГБ), cortiq 0.8.68, `--greedy --no-think`:
+RTX 3090 (24 ГБ), cortiq 0.8.69, `--greedy --no-think`:
 
 | ответ | обычный, ток/с | **DFlash 2**, ток/с | принято черновиков |
 |---|---:|---:|---:|
@@ -382,7 +382,7 @@ cortiq run arete-27b-turbo.cmf --prompt-file report.txt --no-think
 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-在 NVIDIA 显卡上通过 CUDA 运行（cortiq 0.8.68 或更新版本）：
+在 NVIDIA 显卡上通过 CUDA 运行（cortiq 0.8.69 或更新版本）：
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -390,7 +390,7 @@ hf download infosave/Arete-27B-Turbo-cmf arete-27b-turbo.cmf arete-27b-turbo.dfl
 CMF_GPU=cuda CMF_DFLASH=1 cortiq run arete-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
-使用 cortiq 0.8.63（Vulkan）和 0.8.68（CUDA）测得。`--no-think` 要求直接回答；不加时模型会先推理，请调大
+使用 cortiq 0.8.63（Vulkan）和 0.8.69（CUDA）测得。`--no-think` 要求直接回答；不加时模型会先推理，请调大
 `--max-tokens`（默认 256）。
 
 | 文件 | 量化 | 大小 | sha256 |
@@ -454,7 +454,7 @@ CMF_GPU=cuda CMF_DFLASH=1 cortiq serve arete-27b-turbo.cmf --host 127.0.0.1 --po
 `arete-27b-turbo.dflash.cmf` 是为此文件转换的 [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)：
 Arete 没有自己的草稿头，提速靠的就是这个草稿模型。`CMF_DFLASH=1` 会加载文件旁边的它。
 
-RTX 3090（24 GB），cortiq 0.8.68，`--greedy --no-think`：
+RTX 3090（24 GB），cortiq 0.8.69，`--greedy --no-think`：
 
 | 回答 | 普通，tok/s | **DFlash 2**，tok/s | 草稿接受率 |
 |---|---:|---:|---:|
