@@ -426,8 +426,6 @@ pub struct Pipeline {
     /// read once the prompt is in (its layers' widest window back from the
     /// prompt's end): the prompt's chunks before it keep none.
     dflash_tap_from: usize,
-    /// Speculative rounds of this request so far.
-    spec_rounds_req: u32,
     /// The Metal verify graph of the round in flight, between its sync
     /// (logits read) and the commit that replays the accepted prefix.
     #[cfg(target_os = "macos")]
@@ -1584,10 +1582,6 @@ pub const DFLASH_COPY_MIN: usize = 8;
 /// CUDA round stays the chain's: an edit of 512 tokens lost 15 % to the
 /// block's rounds between its copies.
 const DFLASH_LOOKUP_KEEPS: f32 = 5.0;
-/// A request's first rounds that are the chain's on CUDA (a copy would show
-/// itself to the lookup first). Two cost the chats 2.7 % for 2.7 % on a copy:
-/// the block's first round pays for the prompt's context whenever it comes.
-const DFLASH_CHAIN_FIRST: u32 = 0;
 const DFLASH_WAIT_DIP: u32 = 8;
 const DFLASH_TURN: u32 = 16;
 
@@ -4905,7 +4899,6 @@ impl Pipeline {
             dflash_taps: std::sync::Mutex::new(Vec::new()),
             dflash_solo: false,
             dflash_tap_from: 0,
-            spec_rounds_req: 0,
             #[cfg(target_os = "macos")]
             metal_verify: None,
             inv_freq,
@@ -8111,7 +8104,6 @@ impl Pipeline {
             gen0: generated,
             rounds: 0,
         };
-        self.spec_rounds_req = 0;
         // The token-count proxy prices a round at ~1.9 plain tokens. That
         // holds for the Metal rounds whose cost was measured — greedy and
         // the sparse sampling chain — so an expensive round (the dense
@@ -10276,7 +10268,6 @@ impl Pipeline {
         // at about one price: the round goes to the drafter that lands more
         // tokens at that card's prices, as on Metal.
         let cuda_rate = !metal_native && crate::gpu::cuda_active();
-        self.spec_rounds_req += 1;
         let dflash_ok = !sampling
             && !greedy_pen
             && match &self.dflash {
@@ -10320,8 +10311,7 @@ impl Pipeline {
         // the lookup was eight rows) would give the block
         let copying = (routed.is_some() || cuda_rate)
             && dflash_pick().is_none()
-            && (tail_repeat(all_ids) >= DFLASH_COPY_MIN
-                || (cuda_rate && (self.spec_lookup_gain > DFLASH_LOOKUP_KEEPS || self.spec_rounds_req <= DFLASH_CHAIN_FIRST)));
+            && (tail_repeat(all_ids) >= DFLASH_COPY_MIN || (cuda_rate && self.spec_lookup_gain > DFLASH_LOOKUP_KEEPS));
         let dflash_round = dflash_ok
             && match (dflash_pick(), routed) {
                 (Some(pin), _) => pin,
@@ -11734,6 +11724,15 @@ impl Pipeline {
         if self.o1_active() && !crate::gpu::o1_spec_commit(self.graph_kv_id, next_pos, a + 1) {
             fail(self, "far field commit failed after a speculative round");
             return None;
+        }
+        // a hybrid trunk (Arete-27B, no draft block of its own): its GDN
+        // states back to the rows the round kept, as after a chain's round
+        if a + 1 < b {
+            let gdn = self.graph_gdn_layer_count();
+            if gdn > 0 && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, gdn) {
+                fail(self, "GDN restore failed after a speculative round");
+                return None;
+            }
         }
         // the rows the round keeps are the drafter's next context
         let kept = self.dflash_taps.lock().unwrap().pop();
