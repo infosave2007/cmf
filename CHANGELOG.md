@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.68] — 2026-11-11
+## [0.8.69] — 2026-11-11
+
+`cortiq-core` and `cortiq-engine` 0.8.68 reached crates.io from a publish stopped halfway; 0.8.69 is the release.
 
 ### Added
 - CUDA: Qwen3.5-family hybrids on the card (`qwen3_5`: GDN mixers, gated attention with Q/K norms, an MTP block;
@@ -54,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ring and the PLE history back exactly; drafts come from a copy cursor, copy frames and the file's MTP head. RTX
   5090, `fcaq256`: an edit that copies the prompt 497–548 tok/s (151 over Vulkan), a module written from scratch
   94–111, the same text with and without drafts (#107).
+
+- CUDA, Fast Code stack: a masked route (`CMF_QWEN_SELF_PACK=1 CMF_QWEN_MASK=1`) refills the arena from the
+  prompt's own routing and picks only among the experts it holds, so decoding uploads nothing: a module written
+  from scratch 94–111 → 135–160 tok/s on an RTX 5090, HumanEval-164 148/164 against 151–153 unmasked. Decode
+  steps and windows of a masked route build their expert units on the card (36.4 → 34.5 ms a verify window).
+  q2tp experts and 8-bit tubes (`Qwen3.8-Flash-Next-hot-cmf`) read on the card, exact against the host path.
+  The experts a refill chose are evicted last; a layer's n-gram rows are gathered when the pass reaches it.
+  `CMF_QWEN_ROUND_LOG=1` times every round, `CMF_QWEN_NCU=<n>` times every launch of round n (#108).
 
 ### Fixed
 - CUDA: DFlash on a trunk without an MTP head stopped after its first partial accept ("GDN state of layer 0 is at

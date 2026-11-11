@@ -112,7 +112,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-## CUDA 上的 Qwen3.8-27B：RTX 3090 上聊天 120–128 tok/s(0.8.68)
+## CUDA 上的 Qwen3.8-27B：RTX 3090 上聊天 120–128 tok/s(0.8.69)
 
 CUDA 后端在显卡上运行 Qwen3.5 系列混合模型（GDN 混合层加门控注意力），草稿及其验证也在显卡上完成。在 RTX 3090
 上，4 位的 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) 借助自带的 MTP 头以 120.2 tok/s 生成

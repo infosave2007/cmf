@@ -123,7 +123,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
-## Qwen3.8-27B на CUDA: чат 120–128 tok/s на RTX 3090 (0.8.68)
+## Qwen3.8-27B на CUDA: чат 120–128 tok/s на RTX 3090 (0.8.69)
 
 Бэкенд CUDA запускает гибриды семейства Qwen3.5 (миксеры GDN и внимание с гейтом) вместе с черновиками и их
 проверкой на карте. На RTX 3090 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) в четырёх битах
