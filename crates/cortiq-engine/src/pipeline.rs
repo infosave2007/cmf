@@ -9593,6 +9593,7 @@ impl Pipeline {
         // matvec each — the plan's own prologue).
         let mut hiddens = self.mtp_block_inputs(m, pairs);
         debug_assert_eq!(hiddens.len(), pairs.len() * hs);
+        spec_stamp("w.inp");
         let lw = &m.layer;
         let AttnKind::Full {
             wq,
@@ -9690,7 +9691,13 @@ impl Pipeline {
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
-        crate::gpu::forward_batch_graph(
+        // nothing reads the block's rows back: the warm-up is its K/V rows
+        // (CUDA: no readback, no wait)
+        let defer = crate::gpu::cuda_active();
+        if defer {
+            crate::gpu::set_batch_defer(true);
+        }
+        let out = crate::gpu::forward_batch_graph(
             &model,
             self.mtp_kv_id(),
             std::slice::from_ref(&layer),
@@ -9714,7 +9721,12 @@ impl Pipeline {
             0,
             None,
             None,
-        )
+        );
+        if defer {
+            crate::gpu::set_batch_defer(false);
+        }
+        spec_stamp("w.run");
+        out
     }
 
     /// Complete an MTP warm-up after the batched graph has refused.  A

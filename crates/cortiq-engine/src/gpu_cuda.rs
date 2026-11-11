@@ -614,10 +614,62 @@ pub(crate) mod qwen4;
 mod hyb;
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
-    let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("NVRTC: {e:?}"))?;
-    let text = CString::new(ptx.to_src()).map_err(|e| e.to_string())?;
+    // NVRTC takes seconds on a large module (the hybrid arm's: ~11 s on a
+    // 3090's host); its PTX is kept on disk by (source, defines, arch) and
+    // the driver's own cache keeps what it builds from that.
+    let cached = ptx_cache_path(src, &defs, arch);
+    let ptx = match cached.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(t) if t.contains(".entry") => t,
+        _ => {
+            let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("NVRTC: {e:?}"))?;
+            let t = ptx.to_src();
+            if let Some(p) = &cached {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let tmp = p.with_extension("tmp");
+                if std::fs::write(&tmp, &t).is_ok() {
+                    let _ = std::fs::rename(&tmp, p);
+                }
+            }
+            t
+        }
+    };
+    let text = CString::new(ptx).map_err(|e| e.to_string())?;
     unsafe { cu::module::load_data(text.as_ptr().cast()) }.map_err(derr)
+}
+
+/// Where a module's PTX is kept: `CMF_CUDA_CACHE` (a directory; `0` = no
+/// cache), else `$XDG_CACHE_HOME/cortiq/cuda` or `~/.cache/cortiq/cuda`.
+fn ptx_cache_path(src: &str, defs: &[String], arch: Option<&str>) -> Option<std::path::PathBuf> {
+    let dir = match std::env::var("CMF_CUDA_CACHE") {
+        Ok(v) if v == "0" => return None,
+        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+            base.join("cortiq").join("cuda")
+        }
+    };
+    // FNV-1a over everything the PTX depends on, and the crate version
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: &[u8]| {
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    eat(src.as_bytes());
+    for d in defs {
+        eat(d.as_bytes());
+    }
+    eat(arch.unwrap_or("").as_bytes());
+    eat(env!("CARGO_PKG_VERSION").as_bytes());
+    Some(dir.join(format!("{h:016x}.ptx")))
 }
 
 fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {

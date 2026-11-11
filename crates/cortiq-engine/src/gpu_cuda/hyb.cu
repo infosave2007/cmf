@@ -56,17 +56,7 @@ __device__ __forceinline__ void put3(u16* __restrict__ p0, u16* __restrict__ p1,
 }
 
 
-// ------------------------------------------------------------ small matvec
-//
-// y_j = (res_j +) W x_j for the rows j < N of x, several matrices a launch.
-// A warp owns R rows of a matrix, a lane one 32-weight group of the slab:
-// the input is staged into shared memory 1024 columns at a time (q4tp:
-// element-major with an odd stride, so the 32 lanes of a load hit 32 banks)
-// with each group's sum, and a lane takes the slab's x values into registers
-// once for all R rows. Per (matrix row, input row) the sums run as one row of
-// `mv_multi` runs them: the group's 32 products in order, minus 8 x the
-// group's input sum, times the group's rung, groups in order, then the warp.
-
+// Job record of the small-path matvec launches (`HyJob` in hyb.rs).
 struct HyJob {
     u64 w;     // weight body
     u64 aux0;  // q4tp: codes
@@ -78,173 +68,6 @@ struct HyJob {
     int blk0;  // first block of this job in the launch
     int ystride;
 };
-
-#define XSP 1056  // floats of one staged q4tp slab row: 32 x 33
-
-// Stage slab `c0` of the N input rows: xs[j][k * 33 + g] = x[j][c0 + 32 g + k],
-// every thread's float4 loads issued before any store.
-template <int N>
-__device__ __forceinline__ void stage_slab(float* __restrict__ xs, const float* __restrict__ x, int xstride, int c0,
-                                           int ncol)
-{
-    const int tid = threadIdx.x;
-    const int cc = (tid & 255) * 4;  // 256 threads x 4 columns = the slab
-    float4 v[N];
-#pragma unroll
-    for (int j = 0; j < N; j++)
-        v[j] = cc < ncol ? *(const float4*)(x + (size_t)j * xstride + c0 + cc) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const int k = cc & 31, g = cc >> 5;
-#pragma unroll
-    for (int j = 0; j < N; j++) {
-        float* d = xs + j * XSP + g;
-        d[k * 33] = v[j].x;
-        d[(k + 1) * 33] = v[j].y;
-        d[(k + 2) * 33] = v[j].z;
-        d[(k + 3) * 33] = v[j].w;
-    }
-}
-
-template <int N, int R>
-__device__ __forceinline__ void mvn_body(const HyJob* __restrict__ jobs, int njobs, const float* __restrict__ x,
-                                         int xstride, int cols)
-{
-    extern __shared__ float sh[];
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    int jx = 0;
-    while (jx + 1 < njobs && (int)blockIdx.x >= jobs[jx + 1].blk0) jx++;
-    const HyJob jb = jobs[jx];
-    const int kind = jb.kind & 0xffff;
-    // rows a warp owns for this matrix (<= R)
-    const int rpw = min(R, max(1, jb.kind >> 16));
-    float acc[R][N];
-#pragma unroll
-    for (int r = 0; r < R; r++)
-#pragma unroll
-        for (int j = 0; j < N; j++) acc[r][j] = 0.0f;
-    float* y = (float*)jb.y;
-    const float* res = (const float*)jb.res;
-    const int row0 = ((int)blockIdx.x - jb.blk0) * (8 * rpw) + warp * rpw;
-    float* xs = sh;  // [N][32 * 33]
-    if (kind == 6) {
-        const int gpr = cols >> 5;
-        float lad[R];
-        bool ok[R];
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const int rr = row0 + r;
-            ok[r] = r < rpw && rr < jb.rows;
-            lad[r] = ok[r] ? ((const float*)jb.aux1)[(size_t)rr * 32 + lane] : 0.0f;
-        }
-        const int iters = (gpr + 31) >> 5;
-        for (int it = 0; it < iters; it++) {
-            const int c0 = it << 10;
-            const int ncol = min(1024, cols - c0);
-            const int g = (it << 5) + lane;
-            const bool live = g < gpr;
-            // the slab's weights first: their loads fly while the input stages
-            uint4 w[R];
-            int code[R];
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if (live && ok[r]) {
-                    w[r] = ((const uint4*)jb.w)[(size_t)(row0 + r) * gpr + g];
-                    code[r] = ((const u8*)jb.aux0)[(size_t)(row0 + r) * gpr + g];
-                } else {
-                    w[r] = make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
-                    code[r] = 0;
-                }
-            }
-            __syncthreads();
-            stage_slab<N>(xs, x, xstride, c0, ncol);
-            __syncthreads();
-            float sc[R];
-#pragma unroll
-            for (int r = 0; r < R; r++) sc[r] = __shfl_sync(FULL, lad[r], code[r]);
-            const float* xp = xs + lane;
-#pragma unroll
-            for (int q = 0; q < 4; q++) {
-#pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    const int k = q * 8 + e;
-                    float xv[N];
-#pragma unroll
-                    for (int j = 0; j < N; j++) xv[j] = xp[j * XSP + k * 33];
-#pragma unroll
-                    for (int r = 0; r < R; r++) {
-                        const u32 wd = q == 0 ? w[r].x : q == 1 ? w[r].y : q == 2 ? w[r].z : w[r].w;
-                        // (nibble - 8) * rung: 2^23 + nib as a float's bits,
-                        // minus 2^23 + 8, exactly; then the row's scale
-                        const float wv = __fmul_rn(
-                            __fsub_rn(__uint_as_float(((wd >> (4 * e)) & 15u) | 0x4B000000u), 8388616.0f), sc[r]);
-#pragma unroll
-                        for (int j = 0; j < N; j++) acc[r][j] = fmaf(wv, xv[j], acc[r][j]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const int rr = row0 + r;
-#pragma unroll
-            for (int j = 0; j < N; j++) {
-                float v = acc[r][j];
-                for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(FULL, v, o));
-                if (lane == 0 && ok[r]) {
-                    const size_t at = (size_t)j * jb.ystride + rr;
-                    y[at] = res ? __fadd_rn(res[at], v) : v;
-                }
-            }
-        }
-    } else {
-        // f32 (a small matrix: GDN gates): a row a warp, the slab staged as
-        // the q4tp one (element k of group g at k * 33 + g)
-        const int rr = row0;
-        const int iters = (cols + 1023) >> 10;
-        for (int it = 0; it < iters; it++) {
-            const int c0 = it << 10;
-            const int ncol = min(1024, cols - c0);
-            __syncthreads();
-            stage_slab<N>(xs, x, xstride, c0, ncol);
-            __syncthreads();
-            if (rr < jb.rows) {
-                const float* W = (const float*)jb.w + (size_t)rr * cols + c0;
-                for (int c = lane; c < ncol; c += 32) {
-                    const float wv = W[c];
-                    const int off = (c & 31) * 33 + (c >> 5);
-#pragma unroll
-                    for (int j = 0; j < N; j++) acc[0][j] = fmaf(wv, xs[j * XSP + off], acc[0][j]);
-                }
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < N; j++) {
-            float v = acc[0][j];
-            for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(FULL, v, o));
-            if (lane == 0 && rr < jb.rows) {
-                const size_t at = (size_t)j * jb.ystride + rr;
-                y[at] = res ? __fadd_rn(res[at], v) : v;
-            }
-        }
-    }
-}
-
-#define MVN(NN, RR)                                                                                          \
-    extern "C" __global__ void __launch_bounds__(256) hy_mvn_##NN(const HyJob* __restrict__ jobs, int njobs, \
-                                                                 const float* __restrict__ x, int xstride,   \
-                                                                 int cols)                                   \
-    {                                                                                                        \
-        mvn_body<NN, RR>(jobs, njobs, x, xstride, cols);                                                     \
-    }
-MVN(1, 8)
-MVN(2, 8)
-MVN(3, 8)
-MVN(4, 8)
-MVN(5, 8)
-MVN(6, 8)
-MVN(7, 8)
-MVN(8, 8)
-MVN(12, 4)
-MVN(16, 4)
 
 // RMS norm of every row of x [B][n] into f32 or f16 (a block of 256 threads
 // a row): the very arithmetic `mv_multi` folds into its staging.
@@ -391,8 +214,23 @@ __device__ __forceinline__ float wsum(float v) {
 // column (value head h, value dim dj), a lane 4 of its cells. Per token:
 // kv = S . k, delta = (v - g kv) beta, S = g S + k delta, o = q . S.
 extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float* __restrict__ gb, float* S,
-                                       float* __restrict__ o, int n, int c_dim, int nv, int nk, int dk, int dv)
+                                       float* __restrict__ o, int n, int c_dim, int nv, int nk, int dk, int dv,
+                                       float* __restrict__ ring, const float* __restrict__ qkv, int qstride, int kk)
 {
+    // blocks past the state's columns move the conv ring (the front kernel
+    // that read it has finished): its last kk-1 rows of [ring, qkv rows]
+    const int sblocks = (nv * dv + (blockDim.x >> 5) - 1) / (blockDim.x >> 5);
+    if ((int)blockIdx.x >= sblocks) {
+        const int c = ((int)blockIdx.x - sblocks) * blockDim.x + threadIdx.x;
+        if (!ring || c >= c_dim || n <= 0) return;
+        float nr[8];
+        for (int j = 0; j < kk - 1 && j < 8; j++) {
+            const int src = n - (kk - 1) + j;
+            nr[j] = src >= 0 ? qkv[(u64)src * qstride + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
+        }
+        for (int j = 0; j < kk - 1 && j < 8; j++) ring[(u64)j * c_dim + c] = nr[j];
+        return;
+    }
     const int col = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (col >= nv * dv) return;
     const int lane = threadIdx.x & 31;
@@ -872,6 +710,28 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
 #pragma unroll
             for (int i = 0; i < 4; i++) part[warp][b][t][lane][i] = acc[b][t][i];
     __syncthreads();
+    if (jb.kind & 0x100) {
+        // a gate/up pair (rows of a tile: 8 of gate, then the same 8 of up):
+        // silu(gate) * up of output row (tile, gid) into the planes y, res
+        u16* q0 = (u16*)jb.y;
+        u16* q1 = (u16*)jb.res;
+        for (int o = tid; o < TB * NT * 32 * 2; o += blockDim.x) {
+            const int i = o & 1, ln = (o >> 1) & 31, t = (o >> 6) % NT, b = (o >> 6) / NT;
+            const int gd = ln >> 2, tg = ln & 3;
+            const int j = t * 8 + 2 * tg + i;
+            const int r = (tile0 + b) * 8 + gd;
+            if (j >= nrows || 2 * r >= rows) continue;
+            float g = part[0][b][t][ln][i], u = part[0][b][t][ln][i + 2];
+#pragma unroll
+            for (int k = 1; k < KS; k++) {
+                g = __fadd_rn(g, part[k][b][t][ln][i]);
+                u = __fadd_rn(u, part[k][b][t][ln][i + 2]);
+            }
+            const float v = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u);
+            put3(q0, q1, q1, (size_t)j * jb.ystride + r, v);
+        }
+        return;
+    }
     float* y = (float*)jb.y;
     const float* res = (const float*)jb.res;
     for (int o = tid; o < TB * NT * 32 * 4; o += blockDim.x) {
@@ -1190,4 +1050,155 @@ extern "C" __global__ void hy_gdn_gb32(const float* __restrict__ ab, const float
     const float sp = x > 20.0f ? x : log1pf(expf(x));
     gb[t * 2 * nv + h] = expf(-__fmul_rn(expf(a_log[h]), sp));
     gb[t * 2 * nv + nv + h] = 1.0f / (1.0f + expf(-ab[t * 2 * nv + nv + h]));
+}
+
+// ------------------------------------------- GDN restore, every layer at once
+//
+// After a verify window kept rows 0..keep-1: every GDN layer's state from
+// the copy the window started from, the kept rows replayed. tab[layer] =
+// {S saved, S, conv rows, gates, ring saved, ring, raw rows}; grid.y the
+// layer. The scan is `hy_gdn_scan`'s step, reading the saved state and
+// writing the current one; the ring is the last kk-1 rows of
+// [ring saved, raw rows 0..keep-1].
+extern "C" __global__ void hy_gdn_restore_scan(const u64* __restrict__ tab, int keep, int c_dim, int nv, int nk,
+                                               int dk, int dv)
+{
+    const u64* tb = tab + (size_t)blockIdx.y * 7;
+    const float* Sin = (const float*)tb[0];
+    float* Sout = (float*)tb[1];
+    const float* cq = (const float*)tb[2];
+    const float* gb = (const float*)tb[3];
+    const int col = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (col >= nv * dv) return;
+    const int lane = threadIdx.x & 31;
+    const int h = col / dv, dj = col - h * dv;
+    const int ko = h / (nv / nk);
+    const int kd = nk * dk;
+    const u64 qo = (u64)ko * dk + lane * 4, kofs = (u64)kd + qo, vo = (u64)2 * kd + (u64)h * dv + dj;
+    const u64 so = ((u64)h * dk + lane * 4) * dv + dj;
+    const float* sp = Sin + so;
+    float s0 = sp[0], s1 = sp[dv], s2 = sp[2 * dv], s3 = sp[3 * dv];
+    for (int t = 0; t < keep; t++) {
+        const float* row = cq + (u64)t * c_dim;
+        const float4 kf = *(const float4*)(row + kofs);
+        const float g = gb[(u64)t * 2 * nv + h], beta = gb[(u64)t * 2 * nv + nv + h];
+        const float kv = wsum(fmaf(s3, kf.w, fmaf(s2, kf.z, fmaf(s1, kf.y, __fmul_rn(s0, kf.x)))));
+        const float delta = __fmul_rn(__fsub_rn(row[vo], __fmul_rn(g, kv)), beta);
+        s0 = fmaf(kf.x, delta, __fmul_rn(g, s0));
+        s1 = fmaf(kf.y, delta, __fmul_rn(g, s1));
+        s2 = fmaf(kf.z, delta, __fmul_rn(g, s2));
+        s3 = fmaf(kf.w, delta, __fmul_rn(g, s3));
+    }
+    float* wp = Sout + so;
+    wp[0] = s0;
+    wp[dv] = s1;
+    wp[2 * dv] = s2;
+    wp[3 * dv] = s3;
+}
+
+extern "C" __global__ void hy_gdn_restore_ring(const u64* __restrict__ tab, int keep, int qstride, int c_dim, int kk)
+{
+    const u64* tb = tab + (size_t)blockIdx.y * 7;
+    const float* rs = (const float*)tb[4];
+    float* ring = (float*)tb[5];
+    const float* qkv = (const float*)tb[6];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= c_dim) return;
+    for (int j = 0; j < kk - 1; j++) {
+        const int src = keep - (kk - 1) + j;
+        ring[(u64)j * c_dim + c] = src >= 0 ? qkv[(u64)src * qstride + c] : rs[(u64)(kk - 1 + src) * c_dim + c];
+    }
+}
+
+
+// The prompt path's FFN middle from a gate/up pair GEMM: y [B][2 inter] in
+// the pair's row order (tile t: 8 gate rows, then the same 8 up rows) into
+// f16 xh [B][inter] = silu(gate) * up / 16.
+extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B)
+{
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)B * inter) return;
+    const u64 b = i / inter;
+    const int r = (int)(i - b * inter);
+    const float* yr = y + b * 2 * inter;
+    const int base = (r >> 3) * 16 + (r & 7);
+    const float g = yr[base], u = yr[base + 8];
+    xh[i] = f2h_sat(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u) * 0.0625f);
+}
+
+// ---------------------------------------------------------- repack on card
+//
+// A q4tp matrix (or a gate/up pair, `pair`) into the tensor-core layout: a
+// thread a (tile, group, lane). Logical row r is row r of A, or of a pair
+// row (r & 15) < 8 ? A : B at (r >> 4) * 8 + (r & 7). nib*: the payload's
+// nibble words [row][group][4]; codes*: its 5-bit code rows, `stride` bytes
+// each. Rows past `rows`: nibbles 8 (a zero weight), code 0.
+__device__ __forceinline__ void rp_src(int r, int pair, const u32* nA, const u8* cA, const u32* nB, const u8* cB,
+                                       const u32** n, const u8** cc, int* sr)
+{
+    if (pair && (r & 15) >= 8) {
+        *n = nB;
+        *cc = cB;
+    } else {
+        *n = nA;
+        *cc = cA;
+    }
+    *sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+}
+
+extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __restrict__ codesA,
+                                     const u32* __restrict__ nibB, const u8* __restrict__ codesB, int stride,
+                                     int pair, uint2* __restrict__ T, u8* __restrict__ Cc, int rows, int cols)
+{
+    const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)ntile * gpr * 32) return;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    u32 wa[4], wb[4];
+    for (int h = 0; h < 2; h++) {
+        const int r = tile * 16 + gid + 8 * h;
+        u32* w = h ? wb : wa;
+        if (r < rows) {
+            const u32* n;
+            const u8* cc;
+            int sr;
+            rp_src(r, pair, nibA, codesA, nibB, codesB, &n, &cc, &sr);
+            const u32* p = n + ((size_t)sr * gpr + g) * 4;
+            for (int q = 0; q < 4; q++) w[q] = p[q];
+        } else {
+            for (int q = 0; q < 4; q++) w[q] = 0x88888888u;
+        }
+    }
+    uint2 X;
+    for (int s = 0; s < 2; s++) {
+        u32 x = 0;
+        for (int m = 0; m < 4; m++) {
+            const u32 word = (m & 1) ? wb[2 * s + (m >> 1)] : wa[2 * s + (m >> 1)];
+            const u32 byte = (word >> (8 * tig)) & 0xFFu;
+            x |= (byte & 0xFu) << (4 * m);
+            x |= (byte >> 4) << (4 * m + 16);
+        }
+        if (s) X.y = x;
+        else X.x = x;
+    }
+    T[idx] = X;
+    if (lane < 16) {
+        const int r = tile * 16 + lane;
+        u8 code = 0;
+        if (r < rows) {
+            const u32* n;
+            const u8* cc;
+            int sr;
+            rp_src(r, pair, nibA, codesA, nibB, codesB, &n, &cc, &sr);
+            const u8* cr = cc + (size_t)sr * stride;
+            const int bit = g * 5, b = bit >> 3, sh = bit & 7;
+            u32 v = cr[b];
+            if (sh > 3) v |= (u32)cr[b + 1] << 8;
+            code = (u8)((v >> sh) & 31u);
+        }
+        Cc[tg * 16 + lane] = code;
+    }
 }
