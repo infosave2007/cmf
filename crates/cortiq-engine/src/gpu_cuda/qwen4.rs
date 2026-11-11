@@ -57,8 +57,15 @@ macro_rules! qfuncs {
         impl QFuncs {
             fn load(c: &Ctx) -> Res<Self> {
                 // CMF_QWEN_DEFS="-DQ4_GW=6 -DQ4_DW=8 ...": compile-time constants of the kernels (see the #ifndef blocks of qwen4.cu)
-                let defs: Vec<String> =
-                    std::env::var("CMF_QWEN_DEFS").map(|v| v.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
+                // in the fast precision (the default) the expert kernels quantize their inputs to int8 per group of 32
+                // and use __dp4a (EXP_DP4A); exact and tf32 keep the f32 dot
+                let mut defs: Vec<String> = Vec::new();
+                if prec().0 == Gemm::Half {
+                    defs.push("-DEXP_DP4A=1".to_string());
+                }
+                if let Ok(v) = std::env::var("CMF_QWEN_DEFS") {
+                    defs.extend(v.split_whitespace().map(str::to_string));
+                }
                 let module = compile(include_str!("qwen4.cu"), defs, c.arch)?;
                 Ok(Self { $($name: func(module, concat!("q4_", stringify!($name)))?,)* sm: QSmall::load(module)? })
             }
@@ -66,7 +73,7 @@ macro_rules! qfuncs {
     };
 }
 qfuncs!(
-    tile, grms, grms_inj, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_out, norm_rope, idx_reduce,
+    tile, grms, grms_inj, grms_inj4, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_scan_c, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
     scatter, shared_add, argmax, mtp_fuse, units,
 );
@@ -79,8 +86,12 @@ unsafe impl Sync for QFuncs {}
 struct QSmall {
     /// By the number of rows, 1..=SMALL_ROWS.
     mvb: [cs::CUfunction; SMALL_ROWS],
+    /// The same matvecs with int8-quantized inputs (`__dp4a`), the fast precision.
+    mvq: [cs::CUfunction; SMALL_ROWS],
     hc_di: [cs::CUfunction; SMALL_ROWS],
     hc_up: [cs::CUfunction; SMALL_ROWS],
+    /// The fold with four streams at once (`hc == 4`, rows of at most 48 words).
+    hc_up4: [cs::CUfunction; SMALL_ROWS],
     exp_gu: cs::CUfunction,
     /// The same for q2tp gate/up.
     exp_gu2: cs::CUfunction,
@@ -105,7 +116,7 @@ impl QSmall {
             }
             Ok(v)
         };
-        let (mvb, hc_di, hc_up) = (set("mvb")?, set("hc_di")?, set("hc_up")?);
+        let (mvb, mvq, hc_di, hc_up, hc_up4) = (set("mvb")?, set("mvq")?, set("hc_di")?, set("hc_up")?, set("hc_up4_")?);
         let (exp_gu, exp_gu2, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_gu2")?, func(module, "q4_exp_d")?);
         let (tube_gu, tube_d) = (func(module, "q4_tube_gu")?, func(module, "q4_tube_d")?);
         // a block stages every row of the round: ask for all a block may have
@@ -128,9 +139,9 @@ impl QSmall {
             }
             48 << 10
         };
-        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_gu2, exp_d, tube_gu, tube_d]));
-        let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice()].concat());
-        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_gu2, exp_d, tube_gu, tube_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
+        let (mvb_max, ex_max) = (family(&[mvb.as_slice(), mvq.as_slice()].concat()), family(&[exp_gu, exp_gu2, exp_d, tube_gu, tube_d]));
+        let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice(), hc_up4.as_slice()].concat());
+        Ok(Self { mvb, mvq, hc_di, hc_up, hc_up4, exp_gu, exp_gu2, exp_d, tube_gu, tube_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
     }
 }
 
@@ -222,10 +233,57 @@ macro_rules! go {
     };
 }
 
-/// `CMF_QWEN_DRAFT_VOCAB=<n>`: the draft chooses among the first n token ids (0 = all).
-fn draft_vocab() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("CMF_QWEN_DRAFT_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+/// `CMF_QWEN_MV_INT8=1`: the small path's q8_2f matvecs on int8-quantized inputs (`q4_mvq*`, fast precision
+/// only; the vocabulary head keeps the f32 dot). Off by default: unlike the expert kernels these matvecs are not
+/// bound by their arithmetic, and the window measured the same (12.9 vs 12.9 ms) with 3.13 instead of 3.18
+/// tokens a round.
+fn mv_int8() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| prec().0 == Gemm::Half && std::env::var("CMF_QWEN_MV_INT8").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn grms4() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("CMF_QWEN_GRMS4").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Shared memory a q4_mvb* block takes per input row: the side-by-side layout (MV_CONTIG, columns up to MV_CMAX)
+/// keeps 20 floats per 16 columns, the transposed one 16 per chunk plus an odd stride.
+fn mv_row_bytes(cols: usize) -> usize {
+    if cols <= 4096 { (cols >> 4) * 20 * 4 } else { 16 * ((cols >> 4) | 1) * 4 }
+}
+
+/// How many of the first token ids the draft chooses among. `CMF_QWEN_DRAFT_VOCAB=<n>` fixes it (0 = all). By
+/// default it adapts: the first 65 536 ids (the draft's vocabulary matvec reads a quarter of the head) while at
+/// most 10 % of the recent tokens lie beyond them (English prose and code: 3-5 %), all ids otherwise (text whose
+/// tokens sit high in the vocabulary, Cyrillic or CJK, would never be drafted right).
+fn draft_vocab(recent: &[u32], vocab: usize) -> usize {
+    const PREFIX: usize = 65536;
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    if let Some(n) = *V.get_or_init(|| std::env::var("CMF_QWEN_DRAFT_VOCAB").ok().and_then(|v| v.trim().parse().ok())) {
+        return n;
+    }
+    // the chat template's special tokens sit at the top of the vocabulary and are not text: they do not count
+    let top = vocab.saturating_sub(1024);
+    let out = recent.iter().filter(|&&t| (PREFIX..top).contains(&(t as usize))).count();
+    if recent.len() >= 16 && out * 10 <= recent.len() { PREFIX } else { 0 }
+}
+
+/// The gated delta rule over `n` tokens from state `st` into `st2`: a state column per thread when the key
+/// width is 128 (`q4_gdn_scan_c`; `CMF_QWEN_SCAN_C=0` keeps the lane-per-four-rows kernel).
+#[allow(clippy::too_many_arguments)]
+fn scan(c: &Ctx, q: &QFuncs, d: &Dims, mix: u64, gb: u64, st: u64, st2: u64, out: u64, n: usize) -> Res<()> {
+    static COL: OnceLock<bool> = OnceLock::new();
+    let col = *COL.get_or_init(|| !std::env::var("CMF_QWEN_SCAN_C").is_ok_and(|v| v.trim() == "0"));
+    let bt = d.dv.min(128);
+    if col && d.dk == 128 && d.dv.is_multiple_of(bt) && d.nk > 0 && d.nv.is_multiple_of(d.nk) {
+        go!(c, q.gdn_scan_c, (d.nv as u32, (d.dv / bt) as u32), bt;
+            mix, gb, st, st2, out, n as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
+    } else {
+        go!(c, q.gdn_scan, ((d.nv * d.dv).div_ceil(8) as u32, 1), 256;
+            mix, gb, st, st2, out, n as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
+    }
+    Ok(())
 }
 
 /// Blocks of 256 threads that cover `n` items.
@@ -2066,7 +2124,18 @@ impl Dev {
     /// `pos - 1 + j` (the main model's for the first, the previous cell's after)
     /// with the token it has just been given. `head` is the head's host layer
     /// (its experts' file bytes). Ok(false): no head, or its state is not at `pos`.
-    pub(crate) fn draft(&mut self, head: &Layer, embed: &dyn Fn(u32, &mut [f32]), tok0: u32, pos: usize, kmax: usize, out: &mut Vec<u32>) -> Res<bool> {
+    /// `recent`: the last accepted tokens, which pick the draft's vocabulary (see `draft_vocab`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draft(
+        &mut self,
+        head: &Layer,
+        embed: &dyn Fn(u32, &mut [f32]),
+        tok0: u32,
+        pos: usize,
+        kmax: usize,
+        recent: &[u32],
+        out: &mut Vec<u32>,
+    ) -> Res<bool> {
         let Self { k, arena, maskb, held, lm, mtp, pos: dpos, .. } = self;
         let k = &*k;
         let Some(m) = mtp.as_mut() else { return Ok(false) };
@@ -2102,7 +2171,7 @@ impl Dev {
             k.moe(&m.lw.moe, head, m.li, arena, 1, false)?;
             k.inject(1)?;
             let mut ids: Vec<u32> = Vec::new();
-            k.head_rows_v(&m.mixer, lm, 1, &mut ids, draft_vocab())?;
+            k.head_rows_v(&m.mixer, lm, 1, &mut ids, draft_vocab(recent, d.vocab), true)?;
             tok = ids.first().copied().unwrap_or(0);
             out.push(tok);
         }
@@ -2324,8 +2393,14 @@ impl Core {
     /// `W_j x`, `x [n]` rows `xstride` values apart and `cols` wide. Up to
     /// five jobs a launch; the rows are split by what a block can stage.
     fn mvb(&self, ops: &[SOp], x: u64, xstride: usize, cols: usize, n: usize) -> Res<()> {
+        self.mvb_x(ops, x, xstride, cols, n, false)
+    }
+
+    /// `mvb`; with `exact` (the vocabulary head) the f32 dot even in the fast precision.
+    fn mvb_x(&self, ops: &[SOp], x: u64, xstride: usize, cols: usize, n: usize, exact: bool) -> Res<()> {
         let sm = &self.q.sm;
-        let per = 16 * ((cols >> 4) | 1) * 4;
+        let fam = if !exact && mv_int8() { &sm.mvq } else { &sm.mvb };
+        let per = mv_row_bytes(cols);
         let cap = (sm.mvb_max / per).min(SMALL_ROWS);
         if cap == 0 || ops.is_empty() || ops.len() > 5 {
             return Err(format!("qwen4 cuda: a small matvec of {} jobs over {cols} columns", ops.len()));
@@ -2354,7 +2429,7 @@ impl Core {
             let xp = x + (t0 * xstride * 4) as u64;
             unsafe {
                 self.c.launch(
-                    sm.mvb[nb - 1],
+                    fam[nb - 1],
                     (blk, 1),
                     256,
                     nb * per,
@@ -2375,7 +2450,13 @@ impl Core {
     /// `hc_mix`, with the previous block's `inject` folded into its first launch when `inj` is set.
     fn hc_mix_inj(&self, hc: &Hc, hyper: u64, n: usize, inj: bool) -> Res<()> {
         let (d, s) = (&self.d, &self.s);
-        if inj {
+        // one float4 a thread: rows of up to 4096 values, aligned (CMF_QWEN_GRMS4=0 keeps the 256-thread kernels)
+        let t4 = d.h.div_ceil(4).next_multiple_of(32);
+        if d.h.is_multiple_of(4) && t4 <= 1024 && grms4() {
+            let blk = if inj { s.blk.ptr } else { 0u64 };
+            go!(self.c, self.q.grms_inj4, ((n * d.hc) as u32, 1), t4;
+                hyper, hc.norm.ptr, s.normed.ptr, s.normed_h.ptr, d.h as i32, d.hc as i32, d.eps, self.hi, blk, s.iw.ptr);
+        } else if inj {
             go!(self.c, self.q.grms_inj, ((n * d.hc) as u32, 1), 256;
                 hyper, hc.norm.ptr, s.normed.ptr, s.normed_h.ptr, d.h as i32, d.hc as i32, d.eps, self.hi, s.blk.ptr, s.iw.ptr);
         } else {
@@ -2408,6 +2489,29 @@ impl Core {
                         kargs!(hc.di.ptr, s.normed.ptr, s.hcp.ptr, hc.r as i32, d.w as i32, cw as i32, self.hi, s.low.ptr, s.iw.ptr, s.tick.ptr, hc.lr as i32, d.hc as i32),
                     )
                 }?;
+                let nl = hc.lr / per;
+                if d.hc == 4 && nl <= 48 && !std::env::var("CMF_QWEN_HC_UP4").is_ok_and(|v| v.trim() == "0") {
+                    unsafe {
+                        self.c.launch(
+                            sm.hc_up4[n - 1],
+                            (d.h.div_ceil(t.up_t / 32) as u32, 1),
+                            t.up_t as u32,
+                            ush,
+                            kargs!(
+                                hc.up.ptr,
+                                s.low.ptr,
+                                s.normed.ptr,
+                                s.folded.ptr,
+                                s.folded_h.ptr,
+                                d.h as i32,
+                                hc.lr as i32,
+                                hc.r as i32,
+                                self.hi
+                            ),
+                        )
+                    }?;
+                    return Ok(());
+                }
                 unsafe {
                     self.c.launch(
                         sm.hc_up[n - 1],
@@ -2479,8 +2583,7 @@ impl Core {
         go!(c, q.gdn_prep, ((n * 2 * d.nk) as u32, 1), 128; mix, d.c_dim as i32, d.nk as i32, d.dk as i32);
         go!(c, q.gdn_gb, (blocks(n * d.nv), 1), 256;
             s.ab.ptr, g.a_log.ptr, g.dt_bias.ptr, gb, n as i32, d.nv as i32);
-        go!(c, q.gdn_scan, (vd.div_ceil(8) as u32, 1), 256;
-            mix, gb, g.s.ptr, g.s2.ptr, s.qo.ptr, n as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
+        scan(c, q, d, mix, gb, g.s.ptr, g.s2.ptr, s.qo.ptr, n)?;
         if hold {
             g.dirty = true;
         } else {
@@ -3092,12 +3195,13 @@ impl Core {
     /// The most likely token of every row of the chunk, `n` of them: the
     /// logits of eight rows at a time go through `s.out` and a block-wide argmax.
     fn head_rows(&self, head: &Hc, lm: &DevMat, n: usize, ids: &mut Vec<u32>) -> Res<()> {
-        self.head_rows_v(head, lm, n, ids, 0)
+        self.head_rows_v(head, lm, n, ids, 0, false)
     }
 
     /// `head_rows`, choosing among the first `vp` tokens of the vocabulary when `vp` is set (a draft: the
     /// frequent ids carry nearly all of its picks, and the head's matvec is a tenth of the bytes).
-    fn head_rows_v(&self, head: &Hc, lm: &DevMat, n: usize, ids: &mut Vec<u32>, vp: usize) -> Res<()> {
+    /// A `draft` pass may use the int8 head too: what it picks is checked by the verify window.
+    fn head_rows_v(&self, head: &Hc, lm: &DevMat, n: usize, ids: &mut Vec<u32>, vp: usize, draft: bool) -> Res<()> {
         let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
         let vp = if vp > 0 && vp < d.vocab && lm.kind == 7 && self.small { vp } else { d.vocab };
         self.hc_mix(head, s.hyper.ptr, n)?;
@@ -3109,7 +3213,7 @@ impl Core {
             if lm.kind == 7 && self.small {
                 let mut op = SOp::q8(lm, s.out.ptr);
                 op.rows = vp;
-                self.mvb(&[op], x, d.h, d.h, rows)?;
+                self.mvb_x(&[op], x, d.h, d.h, rows, !draft)?;
             } else {
                 for r in 0..rows {
                     let (mut jobs, mut blk) = (Vec::new(), 0u32);
@@ -3391,8 +3495,7 @@ impl Dev {
                         go!(c, q.hist, (blocks(cap * d.c_dim), 1), 256;
                             g.ring.ptr, g.t_s1.ptr, g.ring2.ptr, cap as i32, d.c_dim as i32, m as i32);
                     }
-                    go!(c, q.gdn_scan, ((d.nv * d.dv).div_ceil(8) as u32, 1), 256;
-                        g.t_mix.ptr, g.t_gb.ptr, g.s.ptr, g.s2.ptr, s.qo.ptr, m as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
+                    scan(c, q, d, g.t_mix.ptr, g.t_gb.ptr, g.s.ptr, g.s2.ptr, s.qo.ptr, m)?;
                 }
                 std::mem::swap(&mut g.s, &mut g.s2);
                 if d.kk > 1 {

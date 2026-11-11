@@ -4127,7 +4127,7 @@ fn cuda_spec_round(
                 };
                 let kmax = head.k.min(budget).min(tape.saturating_sub(1)).min(7);
                 let mut out: Vec<u32> = Vec::new();
-                match dev.draft(&head.layer, &embed, all_ids[next_pos], next_pos, kmax, &mut out) {
+                match dev.draft(&head.layer, &embed, all_ids[next_pos], next_pos, kmax, &all_ids[all_ids.len().saturating_sub(256)..], &mut out) {
                     Ok(true) => drafts = out,
                     Ok(false) => {}
                     Err(e) => {
