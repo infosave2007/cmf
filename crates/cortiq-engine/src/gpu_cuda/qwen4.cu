@@ -472,7 +472,7 @@ extern "C" __global__ void q4_ple_conv(const float* __restrict__ normed, const f
 // picks in rank order. logits [n][R], R >= ne.
 extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __restrict__ picks,
                                     float* __restrict__ wts, int ne, int R, int topk, float tail,
-                                    const unsigned char* __restrict__ allow)
+                                    const unsigned long long* __restrict__ tbl)
 {
     __shared__ float pe[1024];
     __shared__ float red[256];
@@ -480,7 +480,7 @@ extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __res
     __shared__ float sw[32];
     const float* l = logits + (u64)blockIdx.x * R;
     float mx = -__int_as_float(0x7f800000);
-    for (int i = threadIdx.x; i < ne; i += blockDim.x) if (!allow || allow[i]) mx = fmaxf(mx, l[i]);
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) if (!tbl || tbl[i]) mx = fmaxf(mx, l[i]);
     red[threadIdx.x] = mx;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -488,7 +488,7 @@ extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __res
         __syncthreads();
     }
     mx = red[0];
-    for (int i = threadIdx.x; i < ne; i += blockDim.x) pe[i] = (!allow || allow[i]) ? expf(l[i] - mx) : 0.0f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) pe[i] = (!tbl || tbl[i]) ? expf(l[i] - mx) : 0.0f;
     __syncthreads();
     if (threadIdx.x == 0) {
         float s = 0.0f;
@@ -1169,4 +1169,72 @@ extern "C" __global__ void q4_mtp_fuse(const float* __restrict__ hs, const float
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hid * hc) return;
     hyper[i] = hs[i] + e[i % hid];
+}
+
+// The lean path's units, built on the card from the route's picks, packed: one block
+// counts the rows each expert in the table `tbl` (0: not in the arena, the pick is
+// dropped) was picked by, scans the counts into the first unit of each expert, and
+// writes the units (four rows to a unit, the expert's raw slot first) and, for every
+// (token, place), the row of the partial outputs it takes (`refs [n][K]`, -1 for none).
+// The shared expert's units (`nsh`, its slot `shared`) follow the experts'. The `umax`
+// units of the launch that are not used stay empty (slot 0): the kernels skip them.
+extern "C" __global__ void q4_units(const int* __restrict__ picks, const unsigned long long* __restrict__ tbl,
+                                    unsigned long long shared, u32* __restrict__ units, int* __restrict__ refs,
+                                    int n, int topk, int K, int ne, int umax, int nsh)
+{
+    __shared__ int sp[8 * 32];
+    __shared__ int cnt[512];
+    __shared__ int off[512];
+    __shared__ int scan[256];
+    const int np = n * topk, W = 2 + Q4_UR, T = blockDim.x, tid = threadIdx.x;
+    for (int i = tid; i < np; i += T) sp[i] = picks[i];
+    for (int i = tid; i < umax * W; i += T) units[i] = (i % W) >= 2 ? 0xffffffffu : 0u;
+    __syncthreads();
+    for (int e = tid; e < ne; e += T) {
+        int cn = 0;
+        if (tbl[e]) for (int i = 0; i < np; i++) cn += (sp[i] == e);
+        cnt[e] = cn;
+    }
+    __syncthreads();
+    const int e0 = 2 * tid, e1 = e0 + 1;
+    const int u0 = e0 < ne ? (cnt[e0] + Q4_UR - 1) / Q4_UR : 0;
+    const int u1 = e1 < ne ? (cnt[e1] + Q4_UR - 1) / Q4_UR : 0;
+    scan[tid] = u0 + u1;
+    __syncthreads();
+    for (int d = 1; d < T; d <<= 1) {
+        const int x = tid >= d ? scan[tid - d] : 0;
+        __syncthreads();
+        scan[tid] += x;
+        __syncthreads();
+    }
+    const int base = scan[tid] - (u0 + u1);
+    if (e0 < ne) off[e0] = base;
+    if (e1 < ne) off[e1] = base + u0;
+    const int total = scan[T - 1];
+    __syncthreads();
+    for (int e = tid; e < ne; e += T) {
+        if (!cnt[e]) continue;
+        const unsigned long long a = tbl[e];
+        int rank = 0;
+        for (int i = 0; i < np; i++) {
+            if (sp[i] != e) continue;
+            const int u = off[e] + rank / Q4_UR, j = rank % Q4_UR;
+            u32* w = units + (u64)u * W;
+            w[0] = (u32)a; w[1] = (u32)(a >> 32); w[2 + j] = (u32)(i / topk);
+            refs[(i / topk) * K + (i % topk)] = u * Q4_UR + j;
+            rank++;
+        }
+    }
+    for (int i = tid; i < np; i += T) {
+        const int e = sp[i];
+        if (e < 0 || e >= ne || !tbl[e]) refs[(i / topk) * K + (i % topk)] = -1;
+    }
+    for (int g = tid; g < nsh; g += T) {
+        u32* w = units + (u64)(total + g) * W;
+        w[0] = (u32)shared; w[1] = (u32)(shared >> 32);
+        for (int j = 0; j < Q4_UR; j++) {
+            const int t = g * Q4_UR + j;
+            if (t < n) { w[2 + j] = (u32)t; refs[t * K + topk] = (total + g) * Q4_UR + j; }
+        }
+    }
 }

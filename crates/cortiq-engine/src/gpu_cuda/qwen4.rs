@@ -65,7 +65,7 @@ macro_rules! qfuncs {
 qfuncs!(
     tile, grms, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
-    scatter, shared_add, argmax, mtp_fuse,
+    scatter, shared_add, argmax, mtp_fuse, units,
 );
 unsafe impl Send for QFuncs {}
 unsafe impl Sync for QFuncs {}
@@ -519,8 +519,6 @@ struct Scratch {
     out: Buf,
     /// Token ids of a window's rows.
     ids: Buf,
-    /// The experts of a layer a masked route may pick (a byte each).
-    allow: Buf,
 }
 
 /// Page-locked host memory the expert uploads are staged in: a copy from it
@@ -734,6 +732,8 @@ struct Arena {
     pins: Option<Pins>,
     /// Experts of the layers from this index on (the MTP head's) are never evicted.
     sticky_from: u32,
+    /// Slots whose expert a refill chose for the request: evicted only when nothing else can be.
+    prot: Vec<bool>,
     /// How often each (layer, expert) was picked since the sequence began, while `hist_on`
     /// (the prompt's routing: `Dev::retarget` refills the arena from it).
     hist: Vec<u32>,
@@ -741,6 +741,16 @@ struct Arena {
     hist_on: bool,
     /// Decoding routes among the experts the arena holds (`CMF_QWEN_MASK=1`, set by `retarget`).
     masked: bool,
+    /// The slot address of every (layer, expert) on the card, 0 for not in the arena
+    /// (`[row][tbl_stride]`, a row a layer, the MTP head's after them): what the masked
+    /// route and the lean path's units read. Rebuilt when `epoch` (a count of changes of
+    /// the arena's contents) is ahead of `tbl_epoch`.
+    tbl: Buf,
+    tbl_stride: usize,
+    tbl_ne: Vec<usize>,
+    tbl_held: Vec<usize>,
+    tbl_epoch: u64,
+    epoch: u64,
 }
 
 /// Copy the experts' file bytes `parts` into the slot-sized `dst` slices, on
@@ -781,19 +791,53 @@ fn copy_jobs(pool: Option<&CopyPool>, jobs: &mut [(&mut [u8], [&[u8]; 3])], sgu:
 }
 
 impl Arena {
-    /// The experts of layer `li` the arena holds, as bytes in `out` (`ne` of them), when the
-    /// route is masked and the layer holds more than `topk` of them; false: no mask.
-    fn mask_of(&self, li: usize, ne: usize, topk: usize, out: &mut [u8]) -> bool {
-        if !self.masked || li >= self.hist.len() / self.hist_ne.max(1) {
-            return false;
+    /// The table of slot addresses, rebuilt if the arena changed since.
+    fn refresh_table(&mut self, c: &Ctx) -> Res<()> {
+        if self.tbl_epoch == self.epoch {
+            return Ok(());
         }
-        let mut held = 0usize;
-        for e in 0..ne {
-            let on = self.map.contains_key(&(((li as u32) << 16) | e as u32));
-            out[e] = on as u8;
-            held += on as usize;
+        let mut host = vec![0u64; self.tbl_ne.len() * self.tbl_stride];
+        for (li, &ne) in self.tbl_ne.iter().enumerate() {
+            let mut held = 0usize;
+            for e in 0..ne {
+                if let Some(&s) = self.map.get(&(((li as u32) << 16) | e as u32)) {
+                    host[li * self.tbl_stride + e] = self.buf.ptr + (s as usize * self.slot) as u64;
+                    held += 1;
+                }
+            }
+            self.tbl_held[li] = held;
         }
-        held > topk
+        unsafe { cu::memcpy_htod_async(self.tbl.ptr, &host, c.stream) }.map_err(derr)?;
+        self.tbl_epoch = self.epoch;
+        if std::env::var_os("CMF_QWEN_PROF").is_some() && self.masked {
+            let main = &self.tbl_held[..self.main_layers().min(self.tbl_held.len())];
+            let (lo, hi) = (main.iter().min().copied().unwrap_or(0), main.iter().max().copied().unwrap_or(0));
+            eprintln!(
+                "qwen4 cuda: address table at epoch {}: experts held a layer {lo}..{hi} (layers with 10 or fewer: {})",
+                self.epoch,
+                main.iter().filter(|&&h| h <= 10).count()
+            );
+        }
+        Ok(())
+    }
+
+    /// The table row of layer `li` as a device address, when the route may use it: the
+    /// route is masked and the layer holds more than `topk` experts, or `force` (the MTP
+    /// head, whose experts all stay). 0: no.
+    fn tbl_ptr(&mut self, c: &Ctx, li: usize, topk: usize, force: bool) -> Res<u64> {
+        if li >= self.tbl_ne.len() || !(self.masked || force) {
+            return Ok(0);
+        }
+        self.refresh_table(c)?;
+        if !force && self.tbl_held[li] <= topk {
+            return Ok(0);
+        }
+        Ok(self.tbl.ptr + (li * self.tbl_stride * 8) as u64)
+    }
+
+    /// Layers of the backbone (the rows before the MTP head's).
+    fn main_layers(&self) -> usize {
+        self.hist.len() / self.hist_ne.max(1)
     }
 
     /// Count the picks of a layer's step.
@@ -827,6 +871,7 @@ impl Arena {
         if miss.is_empty() {
             return Ok(());
         }
+        self.epoch += 1;
         let mut slots: Vec<u32> = Vec::with_capacity(miss.len());
         while slots.len() < miss.len() && self.used < self.n {
             slots.push(self.used as u32);
@@ -847,19 +892,26 @@ impl Arena {
         if need > 0 {
             let (nl, lu) = (self.nl, li as u64);
             let mut cand: Vec<(u64, u32)> = Vec::with_capacity(self.n);
-            for s in 0..self.n {
-                let key = self.key[s];
-                if key == u32::MAX {
-                    continue;
+            // the experts a refill chose for the request (`prot`) go last
+            for allow_prot in [false, true] {
+                cand.clear();
+                for s in 0..self.n {
+                    let key = self.key[s];
+                    if key == u32::MAX || (self.prot[s] && !allow_prot) {
+                        continue;
+                    }
+                    let (j, lp) = ((key >> 16) as u64, self.last[s]);
+                    if (key >> 16) >= self.sticky_from || (j == lu && lp == pass) {
+                        continue;
+                    }
+                    // passes the expert went unused when its layer came up
+                    let age = if j <= lu { pass - lp } else { (pass - lp).saturating_sub(1) };
+                    let dist = if j > lu { j - lu } else { nl - lu + j };
+                    cand.push((age * nl + dist, s as u32));
                 }
-                let (j, lp) = ((key >> 16) as u64, self.last[s]);
-                if (key >> 16) >= self.sticky_from || (j == lu && lp == pass) {
-                    continue;
+                if cand.len() >= need {
+                    break;
                 }
-                // passes the expert went unused when its layer came up
-                let age = if j <= lu { pass - lp } else { (pass - lp).saturating_sub(1) };
-                let dist = if j > lu { j - lu } else { nl - lu + j };
-                cand.push((age * nl + dist, s as u32));
             }
             if cand.len() < need {
                 return Err("qwen4 cuda: the expert arena is smaller than one layer's experts".into());
@@ -950,6 +1002,7 @@ impl Arena {
             let key = ((li as u32) << 16) | e as u32;
             self.key[s as usize] = key;
             self.last[s as usize] = pass;
+            self.prot[s as usize] = false;
             self.map.insert(key, s);
             self.admitted += 1;
             slot_of[e] = self.buf.ptr + (s as usize * slot) as u64;
@@ -1390,6 +1443,11 @@ struct Core {
     xb: usize,
     sbuf: usize,
     ds: usize,
+    /// Decode steps and windows of a masked route (and the MTP head) build their expert units on
+    /// the card and never wait for the host between the layers (`CMF_QWEN_CUDA_LEAN_ROUTE=0` off).
+    /// 0: never, 1: always, 2: every other round (`CMF_QWEN_CUDA_LEAN_ROUTE=alt`: both ways in one process, for A/B timing).
+    lean_mode: u8,
+    lean_flip: std::sync::atomic::AtomicBool,
     /// A window of more than `SMALL_ROWS` rows runs its experts on the unit kernels too
     /// (`CMF_QWEN_CUDA_MID=0` gives it the batched GEMMs).
     mid: bool,
@@ -1411,6 +1469,8 @@ pub(crate) struct Dev {
     pub(crate) pos: usize,
     /// The window (position, rows) a `spec` pass left to settle.
     pending: Option<(usize, usize)>,
+    /// Host time (ms) the last pass took to queue its layers, before it waited for the card.
+    pub(crate) launch_ms: f64,
     /// The MTP draft head (`CMF_QWEN_MTP=0` leaves it out).
     mtp: Option<MtpW>,
     /// Keep the stage rows of each chunk's last token (check mode).
@@ -1556,6 +1616,9 @@ impl Dev {
             None => None,
         };
         let topk = topk.max(mtp_w.as_ref().map_or(1, |m| m.lw.moe.topk));
+        // the lean path's units: two of four rows for every expert of the widest layer, and the shared expert's
+        let head_ne = mtp_w.as_ref().map_or(0, |m| m.lw.moe.ne);
+        let lean_units = SMALL_ROWS * (topk + 1) + 2;
 
         // a card that cannot spare the prompt scratch: sub-batches, score buffers and chunks shrink
         // (`CMF_QWEN_CUDA_LEAN=1` forces, `=0` forbids)
@@ -1601,19 +1664,18 @@ impl Dev {
             wts: b.buf(n * topk * 4)?,
             rowtok: b.buf(xr * 4)?,
             tokrow: b.buf(n * topk * 4)?,
-            slots: b.buf((xb * 8).max(tape.max(SMALL_ROWS) * (topk + 1) * (UNIT_WORDS + 1) * 4))?,
+            slots: b.buf((xb * 8).max(tape.max(SMALL_ROWS) * (topk + 1) * (UNIT_WORDS + 1) * 4).max((lean_units * UNIT_WORDS + SMALL_ROWS * (topk + 1)) * 4))?,
             xg: b.buf(xr * d.h * es)?,
-            g: b.buf((xr * d.inter * es).max(n.max(tape.max(SMALL_ROWS) * (topk + 1) * UNIT_ROWS) * d.inter * 4))?,
+            g: b.buf((xr * d.inter * es).max(n.max(tape.max(SMALL_ROWS) * (topk + 1) * UNIT_ROWS).max(lean_units * UNIT_ROWS) * d.inter * 4))?,
             u: b.buf((xr * d.inter * es).max(n * d.inter * 4))?,
             ah: b.buf(xr.max(n) * d.inter * es)?,
-            d: b.buf((xr * d.h * es).max(n.max(tape.max(SMALL_ROWS) * (topk + 1) * UNIT_ROWS) * d.h * 4))?,
+            d: b.buf((xr * d.h * es).max(n.max(tape.max(SMALL_ROWS) * (topk + 1) * UNIT_ROWS).max(lean_units * UNIT_ROWS) * d.h * 4))?,
             wg: b.buf(xb * d.inter * d.h * es)?,
             wu: b.buf(xb * d.inter * d.h * es)?,
             wd: b.buf(xb * d.inter * d.h * es)?,
             wq: b.buf(b.wq_elems * es)?,
             out: b.buf(SMALL_ROWS * d.vocab * 4)?,
             ids: b.buf(n.max(SMALL_ROWS) * 4)?,
-            allow: b.buf(1024)?,
         };
         let maskb = b.buf(n * 64 * 4)?;
 
@@ -1633,6 +1695,13 @@ impl Dev {
         // one layer's experts of staging (`CMF_QWEN_CUDA_STAGE=0`: the driver's own)
         let stage_cap = ne.min(slots);
         let stage = if std::env::var("CMF_QWEN_CUDA_STAGE").is_ok_and(|v| v.trim() == "0") { None } else { Pinned::new(stage_cap * slot) };
+        let tbl_rows = layers.len() + usize::from(mtp_w.is_some());
+        let tbl_stride = ne.max(head_ne);
+        let mut tbl_ne = vec![ne; layers.len()];
+        if mtp_w.is_some() {
+            tbl_ne.push(head_ne);
+        }
+        let tbl = b.buf(tbl_rows * tbl_stride * 8)?;
         let arena = Arena {
             buf: b.buf(slots * slot)?,
             slot,
@@ -1655,10 +1724,17 @@ impl Dev {
             pairs: 0,
             pins: None,
             sticky_from: u32::MAX,
+            prot: vec![false; slots],
             hist: vec![0; layers.len() * ne],
             hist_ne: ne,
             hist_on: true,
             masked: false,
+            tbl,
+            tbl_stride,
+            tbl_ne,
+            tbl_held: vec![0; tbl_rows],
+            tbl_epoch: 0,
+            epoch: 1,
         };
         // the pinned expert pages (`Dev::prefill`) need the mapped model to outlive them
         let keep = layers.first().and_then(|l| l.moe.experts.first()).and_then(|f| f.gate_proj.model_arc());
@@ -1693,6 +1769,12 @@ impl Dev {
                 range,
                 small: std::env::var("CMF_QWEN_CUDA_SMALL").map(|v| v != "0").unwrap_or(true),
                 tune,
+                lean_mode: match std::env::var("CMF_QWEN_CUDA_LEAN_ROUTE").ok().as_deref().map(str::trim) {
+                    Some("0") => 0,
+                    Some("alt") => 2,
+                    _ => 1,
+                },
+                lean_flip: std::sync::atomic::AtomicBool::new(false),
                 xr,
                 xb,
                 sbuf: sbuf_b,
@@ -1710,6 +1792,7 @@ impl Dev {
             _keep: keep,
             pos: 0,
             pending: None,
+            launch_ms: 0.0,
             mtp: mtp_w,
             want_trace: false,
             trace: Vec::new(),
@@ -1729,6 +1812,29 @@ impl Dev {
     /// How often each (layer, expert) was picked since the sequence began (`[layer][expert]`).
     pub(crate) fn route_hist(&self) -> &[u32] {
         &self.arena.hist
+    }
+
+    /// Whether the lean path is on for the round that has just run (the other way next round with `alt`).
+    pub(crate) fn lean_was(&self) -> bool {
+        match self.k.lean_mode {
+            0 => false,
+            1 => true,
+            _ => !self.k.lean_flip.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// `CMF_QWEN_NCU=<round>`: the profiler's range around one speculation round (for
+    /// `ncu --profile-from-start off`).
+    pub(crate) fn profiler_range(&self, on: bool) {
+        let _ = self.k.c.sync();
+        // SAFETY: plain driver calls; they only mark a range for an attached profiler.
+        unsafe {
+            if on {
+                let _ = cs::cuProfilerStart();
+            } else {
+                let _ = cs::cuProfilerStop();
+            }
+        }
     }
 
     /// The MTP head is on the card.
@@ -1803,6 +1909,12 @@ impl Dev {
             arena.admit_layer(li, order, &layers[li].moe.experts, d, c, &mut slot_of)?;
             c.sync()?;
             arena.pending = false;
+        }
+        arena.prot.iter_mut().for_each(|p| *p = false);
+        for &(l, e) in &ranked {
+            if let Some(&s) = arena.map.get(&(((l as u32) << 16) | e as u32)) {
+                arena.prot[s as usize] = true;
+            }
         }
         // every layer must hold more than its top-k for a masked route
         if std::env::var("CMF_QWEN_MASK").as_deref() == Ok("1") {
@@ -1979,6 +2091,7 @@ impl Dev {
         self.arena.hist.iter_mut().for_each(|c| *c = 0);
         self.arena.hist_on = true;
         self.arena.masked = false;
+        self.arena.prot.iter_mut().for_each(|p| *p = false);
         if let Some(m) = &mut self.mtp {
             m.r_pos = None;
             if let Mix::Qsa(a) = &m.lw.mix {
@@ -2493,14 +2606,56 @@ impl Core {
                 } else {
                     self.gemm_w(lw.router.ptr, lw.r, d.h, s.folded.ptr, n, s.logits.ptr, Gemm::F32)?;
                 }
-                let mut allow = vec![0u8; lw.ne];
-                let allow_p = if arena.mask_of(li, lw.ne, topk, &mut allow) {
-                    unsafe { cu::memcpy_htod_async(s.allow.ptr, &allow, c.stream) }.map_err(derr)?;
-                    s.allow.ptr
-                } else {
-                    0u64
-                };
-                go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, lw.ne as i32, lw.r as i32, topk as i32, self.tail, allow_p);
+                let head = li >= arena.main_layers();
+                let tbl_p = arena.tbl_ptr(c, li, topk, head)?;
+                // the route is masked by the table in the backbone's layers; the head routes over all its experts
+                let mask_p = if head { 0u64 } else { tbl_p };
+                go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, lw.ne as i32, lw.r as i32, topk as i32, self.tail, mask_p);
+                let mut lean_saved: Option<Vec<f32>> = None;
+                if small && self.lean_on() && tbl_p != 0 && ur == UNIT_ROWS && lw.ne <= arena.tbl_stride {
+                    // every pick is in the arena: the units are built on the card and nothing waits for the host
+                    let nsh = if lw.shared.is_some() { n.div_ceil(UNIT_ROWS) } else { 0 };
+                    // at most one unit a pick, and the shared expert's
+                    let nu = n * topk + nsh;
+                    let refs_at = s.slots.ptr + (nu * UNIT_WORDS * 4) as u64;
+                    if refs_at + (n * kk * 4) as u64 <= s.slots.ptr + s.slots.bytes as u64
+                        && nu * UNIT_ROWS * d.inter * 4 <= s.g.bytes
+                        && nu * UNIT_ROWS * d.h * 4 <= s.d.bytes
+                    {
+                        let shared_at = lw.shared.as_ref().map_or(0u64, |b| b.ptr);
+                        go!(c, q.units, (1u32, 1), 256;
+                            s.picks.ptr, tbl_p, shared_at, s.slots.ptr, refs_at, n as i32, topk as i32, kk as i32, lw.ne as i32, nu as i32, nsh as i32);
+                        let gsh = (UNIT_ROWS * (32 * (gg | 1) + gg) + 2 * t.g_rb * 32) * 4;
+                        let dsh = (UNIT_ROWS * (32 * (gd | 1) + gd) + t.d_rb * 32) * 4;
+                        unsafe {
+                            c.launch(
+                                sm.exp_gu,
+                                (d.inter.div_ceil(t.g_rb) as u32, nu as u32),
+                                t.g_t as u32,
+                                gsh,
+                                kargs!(s.slots.ptr, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, t.g_rb as i32),
+                            )
+                        }?;
+                        unsafe {
+                            c.launch(
+                                sm.exp_d,
+                                (d.h.div_ceil(t.d_rb) as u32, nu as u32),
+                                t.d_t as u32,
+                                dsh,
+                                kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32),
+                            )
+                        }?;
+                        go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
+                            refs_at, s.d.ptr, s.wts.ptr, s.logits.ptr, s.blk.ptr,
+                            n as i32, kk as i32, topk as i32, d.h as i32, lw.r as i32, lw.gcol);
+                        if std::env::var_os("CMF_QWEN_LEAN_CHECK").is_none() {
+                            return self.lap(7);
+                        }
+                        // check mode: keep the lean result, the host path runs too and the two are compared
+                        c.sync()?;
+                        lean_saved = Some(self.grab(s.blk.ptr, n * d.h)?);
+                    }
+                }
                 let mut picks = vec![0i32; n * topk];
                 unsafe { cu::memcpy_dtoh_async(&mut picks, s.picks.ptr, c.stream) }.map_err(derr)?;
                 c.sync()?;
@@ -2585,6 +2740,20 @@ impl Core {
                 go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
                     refs_at, s.d.ptr, s.wts.ptr, s.logits.ptr, s.blk.ptr,
                     n as i32, kk as i32, topk as i32, d.h as i32, lw.r as i32, lw.gcol);
+                if let Some(a) = lean_saved {
+                    c.sync()?;
+                    let b = self.grab(s.blk.ptr, n * d.h)?;
+                    let (mut worst, mut at) = (0f32, 0usize);
+                    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                        if (x - y).abs() > worst {
+                            (worst, at) = ((x - y).abs(), i);
+                        }
+                    }
+                    let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    if worst > 1e-4 * scale.max(1e-6) {
+                        eprintln!("qwen4 cuda: lean check layer {li} rows {n}: max diff {worst:e} at {at} (lean {} host {}), scale {scale:e}", a[at], b[at]);
+                    }
+                }
                 return self.lap(7);
             }
         }
@@ -2592,13 +2761,7 @@ impl Core {
         // f16 activations: scaled down before the down projection, back up in it
         let (inv, alpha) = if half { (1.0f32 / 16.0, 16.0f32) } else { (1.0f32, 1.0f32) };
         self.gemm_w(lw.router.ptr, lw.r, d.h, s.folded.ptr, n, s.logits.ptr, Gemm::F32)?;
-        let mut allow = vec![0u8; lw.ne];
-        let allow_p = if hold && arena.mask_of(li, lw.ne, topk, &mut allow) {
-            unsafe { cu::memcpy_htod_async(s.allow.ptr, &allow, c.stream) }.map_err(derr)?;
-            s.allow.ptr
-        } else {
-            0u64
-        };
+        let allow_p = if hold && li < arena.main_layers() { arena.tbl_ptr(c, li, topk, false)? } else { 0u64 };
         go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, lw.ne as i32, lw.r as i32, topk as i32, 0.0f32, allow_p);
         let mut picks = vec![0i32; n * topk];
         unsafe { cu::memcpy_dtoh_async(&mut picks, s.picks.ptr, c.stream) }.map_err(derr)?;
@@ -2698,6 +2861,15 @@ impl Core {
             self.lap(8)?;
         }
         Ok(())
+    }
+
+    /// Whether the lean path is taken now.
+    fn lean_on(&self) -> bool {
+        match self.lean_mode {
+            0 => false,
+            1 => true,
+            _ => self.lean_flip.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Keep the final hyper state of row `row` for the MTP head, taken at `pos` tokens.
@@ -2800,6 +2972,16 @@ impl Dev {
         pos0: usize,
         logits: Option<&mut Vec<f32>>,
     ) -> Res<()> {
+        let eager = |li: usize| ple.get(li).cloned().unwrap_or_default();
+        self.run(layers, emb, &eager, pos0, match logits {
+            Some(l) => Out::Last(l),
+            None => Out::None,
+        })
+    }
+
+    /// `forward` with the n-gram rows of a layer asked for when the pass reaches it: the host
+    /// gathers them (page faults in the table) while the card works on the layers before.
+    pub(crate) fn forward_lazy(&mut self, layers: &[Layer], emb: &[f32], ple: &dyn Fn(usize) -> Vec<Vec<f32>>, pos0: usize, logits: Option<&mut Vec<f32>>) -> Res<()> {
         self.run(layers, emb, ple, pos0, match logits {
             Some(l) => Out::Last(l),
             None => Out::None,
@@ -2809,12 +2991,13 @@ impl Dev {
     /// A verify window: the chunk (at most `tape` rows) runs with the state
     /// left as it was; `ids` get every row's most likely token. `settle`
     /// then keeps the rows that stand.
-    pub(crate) fn spec(&mut self, layers: &[Layer], emb: &[f32], ple: &[Vec<Vec<f32>>], pos0: usize, ids: &mut Vec<u32>) -> Res<()> {
+    pub(crate) fn spec(&mut self, layers: &[Layer], emb: &[f32], ple: &dyn Fn(usize) -> Vec<Vec<f32>>, pos0: usize, ids: &mut Vec<u32>) -> Res<()> {
         self.run(layers, emb, ple, pos0, Out::Rows(ids))
     }
 
-    fn run(&mut self, layers: &[Layer], emb: &[f32], ple: &[Vec<Vec<f32>>], pos0: usize, out: Out) -> Res<()> {
-        let Self { k, layers: lws, head, lm, arena, maskb, held, pos, pending, want_trace, trace, mtp, .. } = self;
+    fn run(&mut self, layers: &[Layer], emb: &[f32], ple: &dyn Fn(usize) -> Vec<Vec<f32>>, pos0: usize, out: Out) -> Res<()> {
+        let Self { k, layers: lws, head, lm, arena, maskb, held, pos, pending, want_trace, trace, mtp, launch_ms, .. } = self;
+        let t_run = Instant::now();
         let k = &*k;
         let (d, s, c, q) = (&k.d, &k.s, k.c, k.q);
         let n = emb.len() / d.h;
@@ -2860,10 +3043,10 @@ impl Dev {
         k.lap(0)?;
         for (li, (lw, layer)) in lws.iter_mut().zip(layers).enumerate() {
             if let Some(p) = &mut lw.ple
-                && let Some(rows) = ple.get(li)
+                && let rows = ple(li)
                 && !rows.is_empty()
             {
-                k.ple(p, rows, n, hold)?;
+                k.ple(p, &rows, n, hold)?;
                 if tr {
                     trace.push(("post_ple", li, last(s.hyper.ptr, d.w)?));
                 }
@@ -2927,6 +3110,7 @@ impl Dev {
                 trace.push(("post_moe", li, last(s.hyper.ptr, d.w)?));
             }
         }
+        *launch_ms = t_run.elapsed().as_secs_f64() * 1e3;
         match out {
             Out::Last(lg) => {
                 k.head(head, lm, n, lg)?;
@@ -2946,6 +3130,7 @@ impl Dev {
             if let Some(m) = mtp.as_mut() {
                 k.keep_r(m, n - 1, pos0 + n)?;
             }
+            k.lean_flip.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(p) = &k.prof {
             let mut p = p.lock().unwrap();
@@ -3032,6 +3217,7 @@ impl Dev {
         if let Some(h) = mtp.as_mut() {
             k.keep_r(h, m - 1, pos0 + m)?;
         }
+        k.lean_flip.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 }
