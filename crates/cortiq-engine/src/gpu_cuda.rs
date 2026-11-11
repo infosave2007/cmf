@@ -673,8 +673,64 @@ fn ptx_cache_path(src: &str, defs: &[String], arch: Option<&str>) -> Option<std:
 }
 
 fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
-    unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
-        .map_err(|e| format!("kernel {name}: {e}"))
+    let f = unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
+        .map_err(|e| format!("kernel {name}: {e}"))?;
+    KT_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(f as usize, name.to_string());
+    if name.starts_with("q4_") {
+        PDL_FUNCS.lock().unwrap().get_or_insert_with(std::collections::HashSet::new).insert(f as usize);
+    }
+    Ok(f)
+}
+
+/// Programmatic dependent launch (`CMF_QWEN_PDL=1`): the kernels of the qwen4 module (each starts with
+/// `griddepcontrol.wait`) are launched so that one may begin to schedule while its predecessor drains.
+static PDL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PDL_FUNCS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(crate) fn pdl_set(on: bool) {
+    PDL_ON.store(on, Ordering::SeqCst);
+}
+
+/// Kernel timing (`CMF_QWEN_NCU=<round>` of the qwen4 path): while on, every launch is bracketed by two
+/// events and `kt_stop` prints the time per kernel. A profiler that cannot read the counters (a container)
+/// still gets the time of each kernel this way.
+static KT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KT_NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+// SAFETY: events are plain driver handles, used from the thread that owns the context lock.
+struct KtEvent(usize, cs::CUevent, cs::CUevent);
+unsafe impl Send for KtEvent {}
+static KT_EVENTS: Mutex<Vec<KtEvent>> = Mutex::new(Vec::new());
+
+pub(crate) fn kt_start() {
+    KT_EVENTS.lock().unwrap().clear();
+    KT_ON.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn kt_stop() {
+    KT_ON.store(false, Ordering::SeqCst);
+    let events = std::mem::take(&mut *KT_EVENTS.lock().unwrap());
+    let names = KT_NAMES.lock().unwrap();
+    let mut by: HashMap<String, (usize, f64)> = HashMap::new();
+    let (mut total, mut n) = (0f64, 0usize);
+    for KtEvent(f, a, b) in events {
+        let ms = unsafe { cu::event::elapsed(a, b) }.unwrap_or(0.0) as f64;
+        let name = names.as_ref().and_then(|m| m.get(&f)).cloned().unwrap_or_else(|| format!("{f:x}"));
+        let e = by.entry(name).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += ms;
+        total += ms;
+        n += 1;
+        unsafe {
+            let _ = cu::event::destroy(a);
+            let _ = cu::event::destroy(b);
+        }
+    }
+    let mut rows: Vec<(String, (usize, f64))> = by.into_iter().collect();
+    rows.sort_by(|x, y| y.1.1.total_cmp(&x.1.1));
+    eprintln!("qwen4 cuda: kernel times of one round: {n} launches, {total:.2} ms between their events");
+    for (name, (c, ms)) in rows.iter().take(40) {
+        eprintln!("qwen4 cuda: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
+    }
 }
 
 fn init() -> Res<Ctx> {
@@ -867,17 +923,54 @@ impl Ctx {
         shared: usize,
         params: &mut [*mut c_void],
     ) -> Res<()> {
-        unsafe {
-            cu::launch_kernel(
-                f,
-                (grid.0.max(1), grid.1.max(1), 1),
-                (block, 1, 1),
-                shared as u32,
-                self.stream,
-                params,
-            )
+        let timed = if KT_ON.load(Ordering::Relaxed) {
+            let a = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT).ok();
+            if let Some(a) = a {
+                let _ = unsafe { cu::event::record(a, self.stream) };
+            }
+            a
+        } else {
+            None
+        };
+        let pdl = PDL_ON.load(Ordering::Relaxed)
+            && PDL_FUNCS.lock().unwrap().as_ref().is_some_and(|set| set.contains(&(f as usize)));
+        let r = if pdl {
+            let mut attr: cs::CUlaunchAttribute = unsafe { std::mem::zeroed() };
+            attr.id = cs::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+            attr.value.programmaticStreamSerializationAllowed = 1;
+            let cfg = cs::CUlaunchConfig {
+                gridDimX: grid.0.max(1),
+                gridDimY: grid.1.max(1),
+                gridDimZ: 1,
+                blockDimX: block,
+                blockDimY: 1,
+                blockDimZ: 1,
+                sharedMemBytes: shared as u32,
+                hStream: self.stream,
+                attrs: &mut attr,
+                numAttrs: 1,
+            };
+            unsafe { cs::cuLaunchKernelEx(&cfg, f, params.as_mut_ptr(), std::ptr::null_mut()) }.result().map_err(derr)
+        } else {
+            unsafe {
+                cu::launch_kernel(
+                    f,
+                    (grid.0.max(1), grid.1.max(1), 1),
+                    (block, 1, 1),
+                    shared as u32,
+                    self.stream,
+                    params,
+                )
+            }
+            .map_err(derr)
+        };
+        if let Some(a) = timed {
+            if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
+                let _ = unsafe { cu::event::record(b, self.stream) };
+                KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
+            }
         }
-        .map_err(derr)
+        r
     }
 
     unsafe fn launch_3d(

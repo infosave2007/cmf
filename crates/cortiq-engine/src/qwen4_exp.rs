@@ -4143,12 +4143,20 @@ fn cuda_spec_round(
     if k == 0 {
         return None;
     }
+    // `CMF_QWEN_NCU=<n>`: round number n is the profiler's range
+    static ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let ncu_round = std::env::var("CMF_QWEN_NCU").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let this_round = ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ncu_on = ncu_round == Some(this_round);
     let ids: Vec<u32> = std::iter::once(all_ids[next_pos]).chain(drafts.iter().copied()).collect();
     let mut dev = state.cuda.take()?;
     let h = cfg.hidden;
     let no_ple = std::env::var_os("CMF_QWEN_NO_PLE").is_some();
     let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
     let t_round = std::time::Instant::now();
+    if ncu_on {
+        dev.profiler_range(true);
+    }
     let res = (|| -> Result<(usize, Vec<f32>), String> {
         let mut emb = vec![0.0f32; ids.len() * h];
         for (row, &id) in emb.chunks_mut(h).zip(&ids) {
@@ -4156,10 +4164,16 @@ fn cuda_spec_round(
                 globals.embed.row_f32(id as usize, row);
             }
         }
-        let ple = if no_ple { Vec::new() } else { ple_frame_rows(layers, cfg, &state.token_history, &ids, pool) };
         let t_host = t_round.elapsed();
         let mut row_ids: Vec<u32> = Vec::new();
-        dev.spec(layers, &emb, &ple, next_pos, &mut row_ids)?;
+        let t_spec = std::time::Instant::now();
+        let history = &state.token_history;
+        let rows_of = |li: usize| {
+            if no_ple { Vec::new() } else { ple_rows_of(layers, cfg, history, &ids, pool, Some(li)).into_iter().nth(li).unwrap_or_default() }
+        };
+        dev.spec(layers, &emb, &rows_of, next_pos, &mut row_ids)?;
+        let t_spec = t_spec.elapsed();
+        let t_settle = std::time::Instant::now();
         if row_ids.len() != ids.len() {
             return Err("qwen4 cuda: a window came back short".into());
         }
@@ -4168,9 +4182,11 @@ fn cuda_spec_round(
             a += 1;
         }
         let mut logits: Vec<f32> = Vec::new();
-        if !dev.settle(a + 1, &mut logits)? {
+        let settled = dev.settle(a + 1, &mut logits)?;
+        let t_settle = t_settle.elapsed();
+        if !settled {
             // too long a window to settle in part: the rows that stand run again
-            let part: Vec<Vec<Vec<f32>>> = ple.iter().map(|rows| rows.iter().take(a + 1).cloned().collect()).collect();
+            let part: Vec<Vec<Vec<f32>>> = if no_ple { Vec::new() } else { ple_frame_rows(layers, cfg, &state.token_history, &ids[..a + 1], pool) };
             dev.forward(layers, &emb[..(a + 1) * h], &part, next_pos, Some(&mut logits))?;
         }
         if prof {
@@ -4182,14 +4198,22 @@ fn cuda_spec_round(
         }
         if std::env::var_os("CMF_QWEN_ROUND_LOG").is_some() {
             eprintln!(
-                "qwen4 cuda: round {} k={k} a={a} draft {:.1} ms verify {:.1} ms",
+                "qwen4 cuda: round {} k={k} a={a} draft {:.1} ms verify {:.1} ms lean={} spec {:.1} ms (queued in {:.1}) settle {:.1} ms host {:.1} ms",
                 if copied { "copy" } else { "mtp" },
                 t_draft.as_secs_f64() * 1e3,
-                t_round.elapsed().as_secs_f64() * 1e3
+                t_round.elapsed().as_secs_f64() * 1e3,
+                u8::from(dev.lean_was()),
+                t_spec.as_secs_f64() * 1e3,
+                dev.launch_ms,
+                t_settle.as_secs_f64() * 1e3,
+                t_host.as_secs_f64() * 1e3
             );
         }
         Ok((a, logits))
     })();
+    if ncu_on {
+        dev.profiler_range(false);
+    }
     match res {
         Ok((a, logits)) => {
             state.token_history.extend_from_slice(&ids[..a + 1]);
@@ -4396,7 +4420,9 @@ fn cuda_run(
                 globals.embed.row_f32(id as usize, row);
             }
         }
-        let ple = if no_ple {
+        // a decode step or a window asks for a layer's rows when the pass gets there
+        let lazy = !no_ple && part.len() <= 8 && off == 0;
+        let ple = if no_ple || lazy {
             Vec::new()
         } else if off == 0 {
             ple_frame_rows(layers, cfg, history, part, pool)
@@ -4411,7 +4437,12 @@ fn cuda_run(
             eprintln!("qwen4 cuda: host rows of {} tokens {:.1} ms", part.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
         let lg = if end == ids.len() { logits.take() } else { None };
-        dev.forward(layers, &emb, &ple, pos0 + off, lg)?;
+        if lazy {
+            let rows_of = |li: usize| ple_rows_of(layers, cfg, history, part, pool, Some(li)).into_iter().nth(li).unwrap_or_default();
+            dev.forward_lazy(layers, &emb, &rows_of, pos0 + off, lg)?;
+        } else {
+            dev.forward(layers, &emb, &ple, pos0 + off, lg)?;
+        }
         off = end;
     }
     Ok(())
