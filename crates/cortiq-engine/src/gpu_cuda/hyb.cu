@@ -35,17 +35,24 @@ __device__ __forceinline__ u16 f2bf(float f) {
 }
 __device__ __forceinline__ float bf2f(u16 h) { return __uint_as_float((u32)h << 16); }
 
-// v as three bf16 parts at index i of planes p (p[0], p[1], p[2]).
+// Planes an input row of the tensor-core path is split into: 2 bf16 parts
+// carry ~17 significant bits a value (a dot product of 5120 lands within
+// ~1e-5 of its f32 sum, the f32 sum's own order error ~4e-6); 3 carry an
+// f32's 24.
+#ifndef NPL
+#define NPL 2
+#endif
+
+// v as NPL bf16 parts at index i of planes p0, p1 (, p2).
 __device__ __forceinline__ void put3(u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2, size_t i,
                                      float v)
 {
     const u16 a = f2bf(v);
     const float r1 = __fsub_rn(v, bf2f(a));
     const u16 b = f2bf(r1);
-    const float r2 = __fsub_rn(r1, bf2f(b));
     p0[i] = a;
     p1[i] = b;
-    p2[i] = f2bf(r2);
+    if (NPL > 2) p2[i] = f2bf(__fsub_rn(r1, bf2f(b)));
 }
 
 
@@ -750,9 +757,9 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ lg, int rows, int
 // k 16s + 2tig + 8; a3: row gid + 8). Codes [t][g][16 rows]; the ladder as
 // stored, [row][32].
 //
-// The input rows come as three bf16 planes (`put3`): x = p0 + p1 + p2, the
-// 24 bits of an f32's significand at an f32's range. A weight (nibble - 8)
-// is exact in bf16, a product exact in the f32 accumulator.
+// The input rows come as NPL bf16 planes (`put3`): x = p0 + p1 (+ p2). A
+// weight (nibble - 8) is exact in bf16, a product exact in the f32
+// accumulator.
 
 // A register a_m of a repacked word: (nibble - 8) as bf16x2. 128 + n is
 // 0x4300 | n; one fma takes 136 off both halves.
@@ -781,7 +788,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
                                          int nrows, int cols)
 {
-    __shared__ float lad_s[16 * TB][33];
+    __shared__ float2 par_s[16 * TB];
     __shared__ float part[KS][TB][NT][32][4];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int jx = 0;
@@ -790,9 +797,10 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
     const int rows = jb.rows;
     const int ntile = (rows + 15) >> 4;
-    for (int i = tid; i < 16 * TB * 32; i += blockDim.x) {
-        const int rr = tile0 * 16 + (i >> 5);
-        lad_s[i >> 5][i & 31] = rr < rows ? ((const float*)jb.aux1)[(size_t)rr * 32 + (i & 31)] : 0.0f;
+    // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
+    for (int i = tid; i < 16 * TB; i += blockDim.x) {
+        const int rr = tile0 * 16 + i;
+        par_s[i] = rr < rows ? ((const float2*)jb.aux1)[rr] : make_float2(0.0f, 0.0f);
     }
     __syncthreads();
     const int gid = lane >> 2, tig = lane & 3;
@@ -810,7 +818,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const u8* Cc = (const u8*)jb.aux0;
     for (int g = g0; g < g1; g++) {
         // B fragments: [n tile][plane][4 words]
-        u32 bx[NT][3][4];
+        u32 bx[NT][NPL][4];
         const int k0 = g * 32 + 2 * tig;
 #pragma unroll
         for (int t = 0; t < NT; t++) {
@@ -821,11 +829,11 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 for (int q = 0; q < 4; q++) {
                     bx[t][0][q] = *(const u32*)(x0 + xo + 8 * q);
                     bx[t][1][q] = *(const u32*)(x1 + xo + 8 * q);
-                    bx[t][2][q] = *(const u32*)(x2 + xo + 8 * q);
+                    if (NPL > 2) bx[t][NPL - 1][q] = *(const u32*)(x2 + xo + 8 * q);
                 }
             } else {
 #pragma unroll
-                for (int pl = 0; pl < 3; pl++)
+                for (int pl = 0; pl < NPL; pl++)
 #pragma unroll
                     for (int q = 0; q < 4; q++) bx[t][pl][q] = 0u;
             }
@@ -836,8 +844,9 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
             if (tile >= ntile) break;
             const size_t tg = (size_t)tile * gpr + g;
             const uint2 X = T[tg * 32 + lane];
-            const float sa = lad_s[b * 16 + gid][Cc[tg * 16 + gid]];
-            const float sb = lad_s[b * 16 + gid + 8][Cc[tg * 16 + gid + 8]];
+            const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+            const float sa = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
+            const float sb = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb.y, pb.x));
             const u32 a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
             const u32 a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
 #pragma unroll
@@ -845,7 +854,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 if (t * 8 >= nrows) break;
                 float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-                for (int pl = 0; pl < 3; pl++) {
+                for (int pl = 0; pl < NPL; pl++) {
                     mma16816(c, a00, a01, a02, a03, bx[t][pl][0], bx[t][pl][1]);
                     mma16816(c, a10, a11, a12, a13, bx[t][pl][2], bx[t][pl][3]);
                 }
@@ -920,8 +929,9 @@ extern "C" __global__ void hy_expand_p(const uint2* __restrict__ T, const u8* __
     const int gid = lane >> 2, tig = lane & 3;
     const uint2 X = T[idx];
     const int ra = tile * 16 + gid, rb = ra + 8;
-    const float sa = ra < rows ? lad[(size_t)ra * 32 + Cc[tg * 16 + gid]] : 0.0f;
-    const float sb = rb < rows ? lad[(size_t)rb * 32 + Cc[tg * 16 + gid + 8]] : 0.0f;
+    const float2* par = (const float2*)lad;
+    const float sa = ra < rows ? exp2f(fmaf((float)Cc[tg * 16 + gid], par[ra].y, par[ra].x)) : 0.0f;
+    const float sb = rb < rows ? exp2f(fmaf((float)Cc[tg * 16 + gid + 8], par[rb].y, par[rb].x)) : 0.0f;
 #pragma unroll
     for (int s = 0; s < 2; s++) {
         const u32 w = s ? X.y : X.x;
@@ -948,64 +958,79 @@ extern "C" __global__ void hy_expand_p(const uint2* __restrict__ T, const u8* __
 // gates of every row. The rows of a window run as the rows of one-row steps.
 extern "C" __global__ void hy_gdn_front(const float* __restrict__ qkv, int qstride, float* __restrict__ ring,
                                         const float* __restrict__ taps, float* __restrict__ cq, int n, int c_dim,
-                                        int kk, int nk, int dk, const float* __restrict__ ab, int abstride,
+                                        int kk, int nk, int dk, const float* __restrict__ xn, int hidden,
+                                        const float* __restrict__ wa, const float* __restrict__ wb,
                                         const float* __restrict__ a_log, const float* __restrict__ dt_bias,
                                         float* __restrict__ gb, int nv)
 {
-    __shared__ float red[32];
-    const int u = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    // a block a (unit, row): blockIdx.y is the row; the ring is read here and
+    // moved by `hy_gdn_ring` after this launch
+    __shared__ float red[2][32];
+    const int u = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int NW = blockDim.x >> 5;
     const int units = c_dim / dk;
-    if (u == units) {
-        // the gates: gb[t][h] = exp(-exp(a_log) softplus(a + dt_bias)), gb[t][nv + h] = sigmoid(b)
-        for (int i = tid; i < n * nv; i += blockDim.x) {
-            const int t = i / nv, h = i - t * nv;
-            const float x = __fadd_rn(ab[(size_t)t * abstride + h], dt_bias[h]);
-            const float sp = x > 20.0f ? x : log1pf(expf(x));
+    if (u >= units) {
+        // the gates of head h = u - units for row t: the a and b projections
+        // of the normed row (f32 weights), then
+        // gb[t][h] = exp(-exp(a_log) softplus(a + dt_bias)), gb[t][nv + h] = sigmoid(b)
+        const int h = u - units;
+        const float* ra = wa + (size_t)h * hidden;
+        const float* rb = wb + (size_t)h * hidden;
+        const float* x = xn + (size_t)t * hidden;
+        float sa = 0.0f, sb = 0.0f;
+        for (int c = tid; c < hidden; c += blockDim.x) {
+            const float xv = x[c];
+            sa = fmaf(ra[c], xv, sa);
+            sb = fmaf(rb[c], xv, sb);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            sa = __fadd_rn(sa, __shfl_xor_sync(FULL, sa, o));
+            sb = __fadd_rn(sb, __shfl_xor_sync(FULL, sb, o));
+        }
+        if (lane == 0) {
+            red[0][warp] = sa;
+            red[1][warp] = sb;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float a = 0.0f, b = 0.0f;
+            for (int w = 0; w < NW; w++) {
+                a = __fadd_rn(a, red[0][w]);
+                b = __fadd_rn(b, red[1][w]);
+            }
+            const float x2 = __fadd_rn(a, dt_bias[h]);
+            const float sp = x2 > 20.0f ? x2 : log1pf(expf(x2));
             gb[(size_t)t * 2 * nv + h] = expf(-__fmul_rn(expf(a_log[h]), sp));
-            gb[(size_t)t * 2 * nv + nv + h] = 1.0f / (1.0f + expf(-ab[(size_t)t * abstride + nv + h]));
+            gb[(size_t)t * 2 * nv + nv + h] = 1.0f / (1.0f + expf(-b));
         }
         return;
     }
     const int c = u * dk + tid;
     const bool live = tid < dk;
     const bool qk = u < 2 * nk;
-    const float* tp = taps + (size_t)c * kk;
-    float tap[8];
-    for (int j = 0; j < kk && j < 8; j++) tap[j] = live ? tp[j] : 0.0f;
-    for (int t = 0; t < n; t++) {
-        float v = 0.0f;
-        if (live) {
-            float acc = __fmul_rn(qkv[(size_t)t * qstride + c], tap[kk - 1]);
-            for (int j = 0; j < kk - 1; j++) {
-                const int src = t - (kk - 1 - j);
-                const float r = src >= 0 ? qkv[(size_t)src * qstride + c] : ring[(size_t)(kk - 1 + src) * c_dim + c];
-                acc = fmaf(r, tap[j], acc);
-            }
-            v = __fdiv_rn(acc, __fadd_rn(1.0f, expf(-acc)));
+    float v = 0.0f;
+    if (live) {
+        const float* tp = taps + (size_t)c * kk;
+        float acc = __fmul_rn(qkv[(size_t)t * qstride + c], tp[kk - 1]);
+        for (int j = 0; j < kk - 1; j++) {
+            const int src = t - (kk - 1 - j);
+            const float r = src >= 0 ? qkv[(size_t)src * qstride + c] : ring[(size_t)(kk - 1 + src) * c_dim + c];
+            acc = fmaf(r, tp[j], acc);
         }
-        if (qk) {
-            float s = v * v;
-            for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, o));
-            __syncthreads();
-            if (lane == 0) red[warp] = s;
-            __syncthreads();
-            float tot = 0.0f;
-            for (int w = 0; w < NW; w++) tot = __fadd_rn(tot, red[w]);
-            float inv = 1.0f / sqrtf(__fadd_rn(tot, 1e-6f));
-            if (u < nk) inv = __fdiv_rn(inv, sqrtf((float)dk));
-            v = __fmul_rn(v, inv);
-        }
-        if (live) cq[(size_t)t * c_dim + c] = v;
+        v = __fdiv_rn(acc, __fadd_rn(1.0f, expf(-acc)));
     }
-    // the ring after the n rows: the last kk - 1 raw rows of [ring, qkv]
-    if (live && kk > 1) {
-        float nr[8];
-        for (int j = 0; j < kk - 1 && j < 8; j++) {
-            const int src = n - (kk - 1) + j;
-            nr[j] = src >= 0 ? qkv[(size_t)src * qstride + c] : ring[(size_t)(kk - 1 + src) * c_dim + c];
-        }
-        for (int j = 0; j < kk - 1 && j < 8; j++) ring[(size_t)j * c_dim + c] = nr[j];
+    if (qk) {
+        float s = v * v;
+        for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, o));
+        if (lane == 0) red[0][warp] = s;
+        __syncthreads();
+        float tot = 0.0f;
+        for (int w = 0; w < NW; w++) tot = __fadd_rn(tot, red[0][w]);
+        float inv = 1.0f / sqrtf(__fadd_rn(tot, 1e-6f));
+        if (u < nk) inv = __fdiv_rn(inv, sqrtf((float)dk));
+        v = __fmul_rn(v, inv);
     }
+    if (live) cq[(size_t)t * c_dim + c] = v;
 }
 
 // of [n][nv][dv] = rms(o) * norm * silu(z) (sigmoid with `sigmoid`), f32, a

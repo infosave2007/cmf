@@ -46,8 +46,13 @@ const HSTAGES: [&str; 12] = [
     "norms", "gdn in", "gdn core", "gdn out", "attn in", "attn core", "attn out", "gate+up", "silu", "down",
     "head", "copies",
 ];
-static HSTAGE_NS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static HSTAGE_NS: [std::sync::atomic::AtomicU64; 12 * 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 12 * 17];
+static HCALLS_N: [std::sync::atomic::AtomicU64; 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 17];
 static HCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// The row count of the small-path call being timed (`hst`).
+    static HROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
 /// Small-path graphs recorded and replayed (`CMF_CUDA_DEBUG=1` reports them).
 static GRAPH_REC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GRAPH_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -68,7 +73,8 @@ fn bst(c: &Ctx, s: usize, t0: &std::cell::Cell<std::time::Instant>) -> Res<()> {
 fn hst(c: &Ctx, s: usize, t0: &mut std::time::Instant) -> Res<()> {
     if super::prof_on() {
         c.sync()?;
-        HSTAGE_NS[s].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = HROWS.with(|r| r.get()).min(16);
+        HSTAGE_NS[n * 12 + s].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         *t0 = std::time::Instant::now();
     }
     Ok(())
@@ -88,8 +94,18 @@ pub(super) fn report() {
         return;
     }
     eprintln!("cuda hybrid small path: {calls} calls");
-    for (name, ns) in HSTAGES.iter().zip(&HSTAGE_NS) {
-        eprintln!("  {name:>10}: {:8.3} ms a call", ns.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64);
+    for n in 1..=16 {
+        let k = HCALLS_N[n].load(Ordering::Relaxed);
+        if k == 0 {
+            continue;
+        }
+        let row: Vec<String> = HSTAGES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{name} {:.3}", HSTAGE_NS[n * 12 + i].load(Ordering::Relaxed) as f64 / 1e6 / k as f64))
+            .collect();
+        let tot: f64 = (0..12).map(|i| HSTAGE_NS[n * 12 + i].load(Ordering::Relaxed) as f64 / 1e6 / k as f64).sum();
+        eprintln!("  {n:>2} rows, {k} calls, {tot:.2} ms a call: {}", row.join(" | "));
     }
     let rows = BROWS.load(Ordering::Relaxed);
     if rows > 0 {
@@ -358,7 +374,7 @@ impl F32Set {
     }
 }
 
-/// The row planes a tensor-core launch reads: three bf16 parts of each f32
+/// The row planes a tensor-core launch reads: two bf16 parts of each f32
 /// (`put3` in hyb.cu), `stride` elements a row.
 #[derive(Clone, Copy)]
 struct Planes {
@@ -400,7 +416,7 @@ unsafe fn split(c: &Ctx, fx: &HFuncs, p: &Planes, x: u64, xstride: usize, cols: 
 /// [tile][group][lane] pairs of words, the codes [tile][group][16 rows], the
 /// ladder [row][32]. Rows are padded to a multiple of 16 with zero weights.
 fn repack_q4tp(bytes: &[u8], rows: usize, cols: usize) -> Res<(Vec<u32>, Vec<u8>, Vec<f32>)> {
-    use cortiq_core::quant::{GROUP_SIZE, q4tp_code, q4tp_ladder, q4tp_sections};
+    use cortiq_core::quant::{GROUP_SIZE, q4tp_code, q4tp_sections};
     if cols % GROUP_SIZE != 0 {
         return Err("q4tp width not a multiple of 32".into());
     }
@@ -412,10 +428,15 @@ fn repack_q4tp(bytes: &[u8], rows: usize, cols: usize) -> Res<(Vec<u32>, Vec<u8>
     let ntile = rows.div_ceil(16);
     let mut nib = vec![0u32; ntile * gpr * 64];
     let mut codes = vec![0u8; ntile * gpr * 16];
-    let mut lad = vec![0f32; rows * 32];
+    // a row's ladder is exp2(lo + code * step) (q4tp_ladder's rungs, up to
+    // rounding): the kernels take its two numbers
+    let mut lad = vec![0f32; rows * 2];
     let params = &bytes[params_off..params_off + rows * 4];
     for r in 0..rows {
-        lad[r * 32..r * 32 + 32].copy_from_slice(&q4tp_ladder(params, r));
+        let lo = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
+        let st = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
+        lad[r * 2] = lo;
+        lad[r * 2 + 1] = st;
     }
     let nb = &bytes[..params_off];
     // nibble k of row r's group g (8: a zero weight past the rows)
@@ -1269,6 +1290,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
     let hid_i = hidden as i32;
     let zero = 0i32;
     HCALLS.fetch_add(1, Ordering::Relaxed);
+    HCALLS_N[n.min(16)].fetch_add(1, Ordering::Relaxed);
+    HROWS.with(|r| r.set(n));
     let pl_ = Planes { p0: plan.pp[0].ptr, p1: plan.pp[1].ptr, p2: plan.pp[2].ptr, stride: plan.pstride };
     let planes = &pl_;
     let (pp0, pp1, pp2, ps_i) = (pl_.p0, pl_.p1, pl_.p2, plan.pstride as i32);
@@ -1301,7 +1324,6 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                 let r_bytes = (g.kk - 1) * g.cdim * 4;
                 unsafe {
                     g.ms_in.run(c, fx, planes, hidden, n)?;
-                    g.js_ab.run(c, fx, plan.xn.ptr, hidden, hidden, n)?;
                     hst(c, 1, &mut t0)?;
                     if tape {
                         cu::memcpy_dtod_async(s_save, gs_s, s_bytes, c.stream).map_err(derr)?;
@@ -1312,15 +1334,23 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                         // projection's own row stride
                         cu::memcpy_dtod_async(t_qkv, plan.qkv.ptr, n * plan.cdmax * 4, c.stream).map_err(derr)?;
                     }
-                    let abs_i = 2 * g.nv as i32;
                     let units = (g.cdim / g.dk) as u32;
                     c.launch(
                         fx.front,
-                        (units + 1, 1),
+                        (units + g.nv as u32, n as u32),
                         g.dk.max(64) as u32,
                         0,
-                        kargs!(plan.qkv.ptr, qs_i, gs_ring, g.taps.ptr, t_cq, n_i, cd_i, kk_i, nk_i, dk_i, plan.ab.ptr, abs_i, g.a_log.ptr, g.dt_bias.ptr, t_gb, nv_i),
+                        kargs!(plan.qkv.ptr, qs_i, gs_ring, g.taps.ptr, t_cq, n_i, cd_i, kk_i, nk_i, dk_i, plan.xn.ptr, hid_i, g.a.w.ptr, g.b.w.ptr, g.a_log.ptr, g.dt_bias.ptr, t_gb, nv_i),
                     )?;
+                    if g.kk > 1 {
+                        c.launch(
+                            fx.ring,
+                            ((g.cdim as u32).div_ceil(256), 1),
+                            256,
+                            0,
+                            kargs!(gs_ring, plan.qkv.ptr, qs_i, n_i, cd_i, kk_i),
+                        )?;
+                    }
                     let cols = g.nv * g.dv;
                     c.launch(
                         fx.scan,
