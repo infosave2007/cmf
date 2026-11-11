@@ -12,17 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Qwen3.8-27B), with drafts and their verify there too ([docs/CUDA.md](docs/CUDA.md#hybrids-the-qwen35-family)).
   - Decode and verify run through one tensor-core kernel (`mma.sync`, bf16 operands, f32 sums) over q4tp weights
     repacked on the card. Its arithmetic does not depend on the window, so the text with drafts is the text
-    without them.
+    without them. A verify picks its rows' argmax on the card.
   - A token or a verify window is one CUDA graph. Gate and up are one matrix with SiLU in the epilogue. A GDN
-    layer is two launches, and a partial accept goes back in two launches for all layers. K/V are f16.
-  - The MTP block drafts on the card. Prompt lookup runs on CUDA in windows of 8 and 16 rows.
+    layer is two launches; its delta rule gives a thread a column of the state (a coalesced 3 MB a layer), and a
+    partial accept goes back in two launches for all layers. K/V are f16.
+  - A round's MTP drafts are one CUDA graph, the token embeddings gathered and the argmax taken on the card.
+    Prompt lookup runs on CUDA in windows of 8 and 16 rows. Rounds that land two tokens speculate without timing
+    plain ones first.
   - Kernels are cached as PTX on disk (`CMF_CUDA_CACHE`), and the repack runs on the card: the 27B plan builds in
     under 4 s.
   - A turbo file's far field runs on the arm too, without drafts past the seal.
   - Qwen3.8-27B q4tp on an RTX 3090, greedy, 512 tokens, against the Vulkan path on the same card:
-    - chat with drafts 103.6 tok/s on average over eight prompts (57.7);
-    - without drafts 44.3 (40.8);
-    - a copy task 168.5 (74.8), an edit task 185.7 (71.6);
+    - chat with drafts 119.7 tok/s on average over eight prompts (57.7);
+    - without drafts 49.1 (40.8);
+    - a copy task 201.0 (74.8), an edit task 220.1 (71.6);
     - prompt 983 tok/s at 4 000 tokens (560).
 - CUDA hybrids: a chat's next turn goes back to a GDN snapshot the card took at the last prompt's assistant header
   (its last `<|im_start|>`), instead of reading the conversation again. A Qwen3.5 template drops the think block
@@ -34,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `cortiq serve` with `enable_thinking: false` decoded without drafts. The `<think>` token it suppresses counted
   as a penalty in the draft gate. On CUDA a suppress list alone now keeps the drafts, verified on the suppressed
-  rows: 44.8 → 82–151 tok/s for Qwen3.8-27B, the same text.
+  rows: 44.8 → 82–151 tok/s for Qwen3.8-27B at the time, the same text.
 
 ## [0.8.67] — 2026-11-10
 

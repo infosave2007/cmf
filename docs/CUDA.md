@@ -231,11 +231,20 @@ CMF_GPU=cuda cortiq serve qwen38-27b-q4tp.cmf --port 8080 --host 127.0.0.1
 **GDN and attention.**
 - A GDN layer is two launches: the conv, its ring, the L2 norms and the gates in one, the delta rule in
   the other.
+- In the delta rule a thread owns a column of the 3 MB state, so a warp reads 32 consecutive floats; the
+  verify's copy of the state for a step back is written by the same launch.
 - Attention reads f16 K/V mirrors.
 - A token or a verify window is one CUDA graph, replayed with a record of its positions.
+- A one-row call over a long matrix set takes one tile a block (gate/up 801 against 745 GB/s); the
+  arithmetic does not depend on it.
 
 **Drafts.**
-- The model's MTP block drafts on the card, its input projection included.
+- A round's MTP drafts are one CUDA graph: each step gathers its token's embedding row on the card (the
+  first 65 536 rows of the embedding, repacked), runs the block and the shortlist head and takes the
+  argmax there. One upload, one launch, the ids back.
+- The verify picks each row's argmax on the card with the host's tie rule, so the logits stay there.
+- A round that lands two tokens or more speculates without timing plain tokens first: a round costs
+  about 1.25 plain tokens on this arm.
 - Prompt lookup continues a draft that repeats an earlier stretch of the text. Its window is 8 rows, and
   16 after a lookup round whose drafts all held.
 - After a partial accept, every GDN state goes back to the window's start and replays the accepted rows:
@@ -275,24 +284,24 @@ rename in a 10 KB file).
 
 | prompt | Vulkan, drafts | **CUDA, drafts** |
 |---|---:|---:|
-| chat0: an LRU cache module | 53.6 | **101.2** |
-| chat1: an SSD's FTL | 53.4 | **90.7** |
-| chat2: an article in Danish | 40.8 | **67.1** |
-| chat3: a refactor | 62.9 | **118.4** |
-| chat4: trains | 65.5 | **118.5** |
-| chat5: a JSON schema | 73.9 | **143.4** |
-| chat6: a blog post | 48.0 | **84.4** |
-| chat7: a summary | 63.3 | **105.2** |
-| **chat, mean** | 57.7 | **103.6** |
-| copy0 | 74.8 | **168.5** |
-| edit0 | 71.6 | **185.7** |
+| chat0: an LRU cache module | 53.6 | **118.5** |
+| chat1: an SSD's FTL | 53.4 | **104.0** |
+| chat2: an article in Danish | 40.8 | **72.7** |
+| chat3: a refactor | 62.9 | **141.5** |
+| chat4: trains | 65.5 | **138.6** |
+| chat5: a JSON schema | 73.9 | **167.5** |
+| chat6: a blog post | 48.0 | **89.0** |
+| chat7: a summary | 63.3 | **125.9** |
+| **chat, mean** | 57.7 | **119.7** |
+| copy0 | 74.8 | **201.0** |
+| edit0 | 71.6 | **220.1** |
 
-- Without drafts (`CMF_GRAPH_SPEC=0`): 44.5 tok/s on CUDA, 40.8 on Vulkan.
+- Without drafts (`CMF_GRAPH_SPEC=0`): 49.1 tok/s on CUDA, 40.8 on Vulkan.
 - The text with drafts equals the text without them on every prompt checked (chat0, chat3, copy0, edit0).
   On Vulkan it differs on chat0, whose verify is int8.
 - Prompt: 983 tok/s at 4 000 tokens (Vulkan 560), 929 at 16 000, 819 at 32 000.
 - First token of chat0, the load included: 2.5 s.
-- Through `cortiq serve`, four greedy requests with and without thinking: 82–151 tok/s against 44.6–44.8
+- Through `cortiq serve`, four greedy requests with and without thinking: 86–173 tok/s against 48.9–49.1
   without drafts, the same texts (`scripts/q27cuda/serve_ab.sh`).
 - The turbo file: facts planted in 60 000 characters of Wikipedia text are answered 8 times of 8. The first
   token comes in 21–23 s, against 52–58 s over Vulkan; past the seal it decodes without drafts.

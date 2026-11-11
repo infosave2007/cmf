@@ -5,7 +5,7 @@
 tag=$1; shift
 cd /root/cuda
 d=out/serve_$tag; rm -rf $d; mkdir -p $d
-env "$@" CMF_GPU=cuda CMF_GPU_PROBE=0 setsid bin/cortiq-cuda-fast serve /root/models/qwen38-27b-q4tp.cmf \
+env "$@" CMF_GPU=cuda CMF_GPU_PROBE=0 setsid ${CORTIQ_BIN:-bin/cortiq-cuda-fast} serve /root/models/qwen38-27b-q4tp.cmf \
   --port 8090 --host 127.0.0.1 > $d/server.log 2>&1 < /dev/null &
 pid=$!
 for i in $(seq 1 90); do curl -s -m 2 127.0.0.1:8090/health >/dev/null 2>&1 && break; sleep 2; done
