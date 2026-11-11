@@ -201,7 +201,7 @@ extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float
 // row. kv and o are summed in a fixed order (two halves in the warp, then
 // the four warps), the same in the scan and in the restore: a restored state
 // is the bits the plain decode would hold. Rows `n` from `Sin` into `Sout`
-// (the same buffer for a scan); `ssave` (if given) gets the state before
+// (the same buffer for a scan; n <= 16); `ssave` (if given) gets the state before
 // the rows, `o` (if given) the outputs.
 __device__ __forceinline__ void gdn_scan4_body(const float* __restrict__ cq, const float* __restrict__ gb,
                                                const float* Sin, float* Sout, float* __restrict__ o, int n,
@@ -219,39 +219,54 @@ __device__ __forceinline__ void gdn_scan4_body(const float* __restrict__ cq, con
 #pragma unroll
         for (int i = 0; i < 32; i++) ssave[base + (size_t)i * dv] = s[i];
     }
-    __shared__ float ks[128], qs[128];
+    // every row's k and q heads, gates and this column's v first (n <= 16):
+    // the row loop then reads only shared memory and registers
+    __shared__ float ks[16][128], qs[16][128];
+    __shared__ float gbs[16][2];
     __shared__ float part[2][4][32];
-    for (int t = 0; t < n; t++) {
+    const int nn = min(n, 16);
+    for (int t = w; t < nn; t += 4) {
         const float* row = cq + (size_t)t * c_dim;
-        if (w == 0) *(float4*)(ks + lane * 4) = *(const float4*)(row + kd + (size_t)ko * 128 + lane * 4);
-        else if (w == 1) *(float4*)(qs + lane * 4) = *(const float4*)(row + (size_t)ko * 128 + lane * 4);
-        __syncthreads();
-        const float g = gb[(size_t)t * 2 * nv + h], beta = gb[(size_t)t * 2 * nv + nv + h];
+        *(float4*)(&ks[t][lane * 4]) = *(const float4*)(row + kd + (size_t)ko * 128 + lane * 4);
+        *(float4*)(&qs[t][lane * 4]) = *(const float4*)(row + (size_t)ko * 128 + lane * 4);
+        if (lane == 0) {
+            gbs[t][0] = gb[(size_t)t * 2 * nv + h];
+            gbs[t][1] = gb[(size_t)t * 2 * nv + nv + h];
+        }
+    }
+    float vv[16];
+#pragma unroll
+    for (int t = 0; t < 16; t++) vv[t] = t < nn ? cq[(size_t)t * c_dim + 2 * kd + (size_t)h * dv + j] : 0.0f;
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+        if (t >= nn) break;
+        const float g = gbs[t][0], beta = gbs[t][1];
         float a0 = 0.0f, a1 = 0.0f;
 #pragma unroll
         for (int i = 0; i < 32; i += 2) {
-            a0 = fmaf(s[i], ks[w * 32 + i], a0);
-            a1 = fmaf(s[i + 1], ks[w * 32 + i + 1], a1);
+            a0 = fmaf(s[i], ks[t][w * 32 + i], a0);
+            a1 = fmaf(s[i + 1], ks[t][w * 32 + i + 1], a1);
         }
         part[0][w][lane] = __fadd_rn(a0, a1);
         __syncthreads();
         const float kv = __fadd_rn(__fadd_rn(__fadd_rn(part[0][0][lane], part[0][1][lane]), part[0][2][lane]), part[0][3][lane]);
-        const float delta = __fmul_rn(__fsub_rn(row[2 * kd + (size_t)h * dv + j], __fmul_rn(g, kv)), beta);
+        const float delta = __fmul_rn(__fsub_rn(vv[t], __fmul_rn(g, kv)), beta);
         float b0 = 0.0f, b1 = 0.0f;
 #pragma unroll
         for (int i = 0; i < 32; i += 2) {
-            s[i] = fmaf(ks[w * 32 + i], delta, __fmul_rn(g, s[i]));
-            s[i + 1] = fmaf(ks[w * 32 + i + 1], delta, __fmul_rn(g, s[i + 1]));
-            b0 = fmaf(qs[w * 32 + i], s[i], b0);
-            b1 = fmaf(qs[w * 32 + i + 1], s[i + 1], b1);
+            s[i] = fmaf(ks[t][w * 32 + i], delta, __fmul_rn(g, s[i]));
+            s[i + 1] = fmaf(ks[t][w * 32 + i + 1], delta, __fmul_rn(g, s[i + 1]));
+            b0 = fmaf(qs[t][w * 32 + i], s[i], b0);
+            b1 = fmaf(qs[t][w * 32 + i + 1], s[i + 1], b1);
         }
         part[1][w][lane] = __fadd_rn(b0, b1);
+        // part[0] was read before this barrier, so the next row may write it
+        // after; part[1] is read by warp 0 before it reaches the next one
         __syncthreads();
         if (w == 0 && o)
             o[(size_t)t * nv * dv + (size_t)h * dv + j] =
                 __fadd_rn(__fadd_rn(__fadd_rn(part[1][0][lane], part[1][1][lane]), part[1][2][lane]), part[1][3][lane]);
-        // ks / qs / part are written again only past this barrier
-        __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < 32; i++) Sout[base + (size_t)i * dv] = s[i];

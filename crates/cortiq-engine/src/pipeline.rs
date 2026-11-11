@@ -1445,6 +1445,10 @@ struct SpecMon {
     /// rounds stop charging an obviously losing speculative arm.
     zero_accept_rounds: u8,
     metal: bool,
+    /// The CUDA hybrid arm: a round costs about 1.25 plain tokens (a verify
+    /// of five rows 1.1x a token, the drafts a tenth more), so rounds that
+    /// land `SPEC_PROXY_TOKENS_CUDA` pay without timing plain tokens.
+    cuda: bool,
 }
 
 /// What a speculative round of k drafts costs on native Metal over a q4tp
@@ -1870,6 +1874,9 @@ const SPEC_RECHECK_PLAIN: usize = 128;
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
+/// The CUDA hybrid arm's proxy (see `SpecMon::cuda`): RTX 3090, Qwen3.8-27B,
+/// a round 24.5-26.8 ms against a plain token's 20.4.
+const SPEC_PROXY_TOKENS_CUDA: f64 = 2.0;
 /// The Metal plain phase: at least two tokens, and more until this much
 /// wall time has been timed (up to the eight the other backends time).
 const SPEC_PLAIN_MIN_MS: f64 = 200.0;
@@ -1893,7 +1900,7 @@ impl SpecMon {
         if self.plain_ms > 0.0 {
             self.tokens * self.plain_ms > self.round_ms * 1.03
         } else {
-            self.metal && self.tokens >= SPEC_PROXY_TOKENS
+            (self.metal && self.tokens >= SPEC_PROXY_TOKENS) || (self.cuda && self.tokens >= SPEC_PROXY_TOKENS_CUDA)
         }
     }
     fn repeated_zero_acceptance(&self) -> bool {
@@ -8072,6 +8079,7 @@ impl Pipeline {
         // the plain path before it decides.
         let mut spec_mon = SpecMon {
             metal: graph_spec && crate::gpu::q1_force() && spec_cheap_round,
+            cuda: graph_spec && crate::gpu::cuda_active() && self.sampler_config.temperature < 1e-6,
             ..SpecMon::default()
         };
         // wgpu: a plain token an earlier request's trial timed stands while
