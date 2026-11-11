@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- CUDA: Qwen3.5-family hybrids on the card (`qwen3_5`: GDN mixers, gated attention with Q/K norms, an MTP block;
+  Qwen3.8-27B), with drafts and their verify there too ([docs/CUDA.md](docs/CUDA.md#hybrids-the-qwen35-family)).
+  - Decode and verify run through one tensor-core kernel (`mma.sync`, bf16 operands, f32 sums) over q4tp weights
+    repacked on the card. Its arithmetic does not depend on the window, so the text with drafts is the text
+    without them.
+  - A token or a verify window is one CUDA graph. Gate and up are one matrix with SiLU in the epilogue. A GDN
+    layer is two launches, and a partial accept goes back in two launches for all layers. K/V are f16.
+  - The MTP block drafts on the card. Prompt lookup runs on CUDA in windows of 8 and 16 rows.
+  - Kernels are cached as PTX on disk (`CMF_CUDA_CACHE`), and the repack runs on the card: the 27B plan builds in
+    under 4 s.
+  - A turbo file's far field runs on the arm too, without drafts past the seal.
+  - Qwen3.8-27B q4tp on an RTX 3090, greedy, 512 tokens, against the Vulkan path on the same card:
+    - chat with drafts 103.6 tok/s on average over eight prompts (57.7);
+    - without drafts 44.3 (40.8);
+    - a copy task 168.5 (74.8), an edit task 185.7 (71.6);
+    - prompt 983 tok/s at 4 000 tokens (560).
+- CUDA hybrids: a chat's next turn goes back to a GDN snapshot the card took at the last prompt's assistant header
+  (its last `<|im_start|>`), instead of reading the conversation again. A Qwen3.5 template drops the think block
+  from past answers, so a turn never extended the cached ids, and MTP models had prefix reuse off. The draft head
+  keeps its rows before that point too. Three turns over a 10 KB file: turn 2 read 338 new tokens in 0.50 s
+  instead of 4 048 in 4.13 s, turn 3 78 in 0.24 s instead of 4.29 s; the same texts. `CMF_KV_REUSE=0` reads every
+  turn from the start.
+
+### Fixed
+- `cortiq serve` with `enable_thinking: false` decoded without drafts. The `<think>` token it suppresses counted
+  as a penalty in the draft gate. On CUDA a suppress list alone now keeps the drafts, verified on the suppressed
+  rows: 44.8 → 82–151 tok/s for Qwen3.8-27B, the same text.
+
 ## [0.8.67] — 2026-11-10
 
 ### Added
