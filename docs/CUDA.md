@@ -306,6 +306,53 @@ rename in a 10 KB file).
 - The turbo file: facts planted in 60 000 characters of Wikipedia text are answered 8 times of 8. The first
   token comes in 21–23 s, against 52–58 s over Vulkan; past the seal it decodes without drafts.
 
+### DFlash 2 beside the file
+
+The published DFlash 2 drafter (`z-lab/Qwen3.8-27B-DFlash2`) drafts a round of seven tokens in one pass. It
+has five layers, and its context is the trunk's rows after layers 5, 19, 33, 47 and 61. On this arm the
+block runs on the card:
+- the four-bit matrices go through the same tensor-core matvec;
+- fc, the kernel projections and the selector run in f16 on cuBLAS;
+- the row convolutions, the head norms and the attention over the context have kernels of their own.
+
+The trunk's graphs copy the tapped rows out on their way, and the drafter's context is made from them on
+the card.
+
+```bash
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir dflash2
+cortiq convert --model dflash2 --output qwen38-27b-q4tp.cmf --dflash-sidecar --quant q4tp   # writes qwen38-27b-q4tp.dflash.cmf
+CMF_GPU=cuda CMF_DFLASH=1 cortiq run qwen38-27b-q4tp.cmf --prompt "..." --greedy --no-think
+```
+
+Each round goes to the drafter that lands more tokens at this card's prices. A block costs about 0.19 of a
+plain token, and a verify of eight rows 1.24.
+- A router in the sidecar's header reads the trunk's row at the tip. It is fitted on logged rounds at those
+  prices (`cortiq dflash-route-fit … --prices`).
+- Without a router, the drafters' measured holds decide.
+- A copy stays with the MTP chain: a tail that repeats eight tokens or more, or lookups that keep landing.
+  So does text from the high part of the vocabulary.
+
+The ten prompts on the RTX 3090, release build, tok/s:
+
+| prompt | MTP chain | **DFlash + router** |
+|---|---:|---:|
+| chat0 | 121.2 | **125.8** |
+| chat1 | 102.1 | **103.4** |
+| chat2 | 72.8 | **69.9** |
+| chat3 | 141.5 | **152.9** |
+| chat4 | 138.8 | **156.5** |
+| chat5 | 167.0 | **188.2** |
+| chat6 | 93.7 | **97.1** |
+| chat7 | 124.7 | **133.0** |
+| **chat, mean** | 120.2 | **128.4** |
+| copy0 | 198.9 | **183.5** |
+| edit0 | 220.3 | **197.6** |
+
+- The texts are the same as without drafts, and so are four server requests and a three-turn chat.
+- The block is built once the first prompt has been read (0.9 s), so the first token comes 0.5 s later.
+- A copy or an edit loses 8–10 %. The block's first round makes the prompt's context once: 100 ms on the
+  card, and more in host copies of the tapped rows.
+
 ## Options
 
 | variable | meaning |
@@ -320,6 +367,7 @@ rename in a 10 KB file).
 | `CMF_CUDA_CACHE=DIR` | where compiled PTX is kept, `~/.cache/cortiq/cuda` by default |
 | `CMF_GRAPH_SPEC=0` | a hybrid without drafts |
 | `CMF_KV_REUSE=0` | every chat turn read from the start |
+| `CMF_DFLASH=1` | the DFlash sidecar beside the file drafts the rounds it wins (`CMF_DFLASH_PICK=dflash\|mtp` pins one) |
 | `CMF_CUDA_DEBUG=1` | why a graph declined, and a decode / prompt summary at exit |
 
 ## Limits

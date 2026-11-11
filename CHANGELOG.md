@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of 4 048 in 4.13 s, turn 3 78 in 0.24 s instead of 4.29 s; the same texts. `CMF_KV_REUSE=0` reads every
   turn from the start.
 
+- CUDA hybrids: the DFlash 2 drafter (`z-lab/Qwen3.8-27B-DFlash2`, a `.dflash.cmf` sidecar, `CMF_DFLASH=1`) on
+  the card. Its block's four-bit matrices run on the arm's tensor-core matvec, and the rest in f16 on cuBLAS
+  and in kernels of its own. Its context is made on the card from the trunk's tapped rows, which the graphs
+  copy out on their way. Each round goes to the drafter that lands more at the card's prices, read off the
+  sidecar's router when it has one (`cortiq dflash-route-fit --prices` now writes one). Copies and text from
+  the high part of the vocabulary stay with the MTP chain. Qwen3.8-27B q4tp on an RTX 3090: chat 128.4 tok/s
+  against the chain's 120.2, the same texts; a copy and an edit 8-10 % slower, the first token 0.5 s later.
+
 ### Fixed
 - `cortiq serve` with `enable_thinking: false` decoded without drafts. The `<think>` token it suppresses counted
   as a penalty in the draft gate. On CUDA a suppress list alone now keeps the drafts, verified on the suppressed
