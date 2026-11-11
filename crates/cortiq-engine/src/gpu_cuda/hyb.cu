@@ -336,11 +336,14 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
                                      const int* __restrict__ ci)
 {
     __shared__ float sp[8][HD];
+    // `extra`: a far field's block after the near ones (ci[5])
+    int extra = 0;
     if (ci) {
         n0 = ci[0];
         rb = ci[2];
         ncap = ci[3];
         nbcap = ci[4];
+        extra = ci[5];
     }
     __shared__ float se[8][HPK];
     const int g = blockIdx.y, blk = blockIdx.x, b = blockIdx.z, nh = nkv * HPK;
@@ -353,7 +356,7 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
 #pragma unroll
     for (int j = 0; j < HPK; j++) {
         float m = -INF;
-        for (int q = lane; q < nblk; q += 32) m = fmaxf(m, Mx[((size_t)b * nh + g * HPK + j) * nbcap + q]);
+        for (int q = lane; q < nblk + extra; q += 32) m = fmaxf(m, Mx[((size_t)b * nh + g * HPK + j) * nbcap + q]);
         for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
         mx[j] = m;
     }
@@ -409,14 +412,16 @@ extern "C" __global__ void hy_finish(const float* __restrict__ P, const float* _
                                      u16* __restrict__ p2, int pstride, int n0, int rb, int nh, int nbcap,
                                      const int* __restrict__ ci)
 {
+    int extra = 0;
     if (ci) {
         n0 = ci[0];
         rb = ci[2];
         nbcap = ci[4];
+        extra = ci[5];
     }
     const int h = blockIdx.x, b = blockIdx.y;
     const int n = n0 + b + 1;
-    const int nblk = (n + rb - 1) / rb;
+    const int nblk = (n + rb - 1) / rb + extra;
     const float* Pb = P + (size_t)b * nbcap * nh * HD;
     const float* Eb = E + (size_t)b * nbcap * nh;
     float tot = 0.0f;
@@ -1067,5 +1072,117 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
         sum = 0.0f;
         for (int k = 0; k < NW; k++) sum += red[k];
         isum[(size_t)gk * istride + r] = sum > 0.0f ? 1.0f / sum : 1.0f;
+    }
+}
+
+
+// ------------------------------------------------- the far field of a turbo file
+//
+// A sealed layer (`nystrom.rs`) keeps its near rows (the sinks with the rows
+// kept exact, then the ring of the window) as an f16 mirror [row][kv head][HD]
+// that the decode attention reads, and each head's far accumulators: QT
+// [nh][m][HD] query landmarks, KT [nkv][m][HD] key landmarks, MU [nh][m][m]
+// the landmark inverse, MZ [nh][2m] the running maxima then the far mass at
+// that scale, TH [nh][m][HD] the far numerator at that scale (attn.cu's
+// kernels, reading the call record: ci[6] the ring row a new key replaces,
+// ci[7] whether the far field holds keys yet).
+
+// The ring row a new key is about to replace goes into each head's far
+// accumulators. A block a KV group, a thread per (head of the group, landmark).
+extern "C" __global__ void hy_far_insert(const u16* __restrict__ NK, const u16* __restrict__ NV,
+                                         const float* __restrict__ QT, float* __restrict__ MZ, float* __restrict__ TH,
+                                         const int* __restrict__ ci, int m, int nkv, float scale)
+{
+    const int g = blockIdx.x, tid = threadIdx.x;
+    const int j = tid / m, i = tid - j * m;
+    if (j >= HPK) return;
+    const int row = ci[6];
+    const int h = g * HPK + j;
+    const u16* k = NK + ((size_t)row * nkv + g) * HD;
+    const u16* v = NV + ((size_t)row * nkv + g) * HD;
+    const float* qt = QT + ((size_t)h * m + i) * HD;
+    float l = 0.0f;
+    for (int d = 0; d < HD; d++) l += qt[d] * h2f(k[d]);
+    l *= scale;
+    float* mz = MZ + (size_t)h * 2 * m;
+    float mm = mz[i], z = mz[m + i], rs = 1.0f;
+    if (l > mm) {
+        rs = expf(mm - l);
+        z *= rs;
+        mm = l;
+        mz[i] = l;
+    }
+    const float e = expf(l - mm);
+    mz[m + i] = z + e;
+    float* th = TH + ((size_t)h * m + i) * HD;
+    for (int d = 0; d < HD; d++) th[d] = th[d] * rs + e * h2f(v[d]);
+}
+
+// The far part of one row's attention, a block a query head: block `nblk`
+// (after the near rows' blocks) of P and E and maximum `nblk` of Mx
+// (`o1_far_prep` of attn.cu, over the call record's geometry).
+extern "C" __global__ void hy_far_prep(const float* __restrict__ q, const float* __restrict__ KT,
+                                       const float* __restrict__ MU, const float* __restrict__ MZ,
+                                       const float* __restrict__ TH, float* __restrict__ Mx,
+                                       float* __restrict__ P, float* __restrict__ E,
+                                       const int* __restrict__ ci, int m, int nh, float scale, int rect_fm)
+{
+    __shared__ float sf[64];
+    __shared__ float su[64];
+    __shared__ float sc[2];
+    const int keys = ci[0] + 1, rb = ci[2], nbcap = ci[4], far_on = ci[7];
+    const int nblk = (keys + rb - 1) / rb;
+    const int h = blockIdx.x, g = h / HPK, tid = threadIdx.x;
+    const float* mz = MZ + (size_t)h * 2 * m;
+    if (far_on && tid < m) {
+        const float* kt = KT + ((size_t)g * m + tid) * HD;
+        const float* qh = q + (size_t)h * HD;
+        float s = 0.0f;
+        for (int d = 0; d < HD; d++) s += qh[d] * kt[d];
+        sf[tid] = s * scale;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float c = -INF, f = -INF;
+        for (int b = 0; b < nblk; b++) c = fmaxf(c, Mx[(size_t)h * nbcap + b]);
+        if (far_on) {
+            for (int a = 0; a < m; a++) f = fmaxf(f, sf[a]);
+            for (int b = 0; b < m; b++) c = fmaxf(c, f + mz[b]);
+        }
+        sc[0] = f;
+        sc[1] = c;
+    }
+    __syncthreads();
+    const float f = sc[0], call = sc[1];
+    if (far_on && tid < m) sf[tid] = expf(sf[tid] - f);
+    __syncthreads();
+    if (far_on && tid < m) {
+        const float* mu = MU + (size_t)h * m * m;
+        float s = 0.0f;
+        for (int a = 0; a < m; a++) s += sf[a] * mu[a * m + tid];
+        if (rect_fm) s = fmaxf(s, 0.0f);
+        su[tid] = s * expf(f + mz[tid] - call);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float den = 0.0f;
+        if (far_on)
+            for (int b = 0; b < m; b++) den += su[b] * mz[m + b];
+        sc[0] = den;
+    }
+    __syncthreads();
+    const float den = sc[0];
+    const bool have = far_on && den >= 0.0f;
+    for (int d = tid; d < HD; d += blockDim.x) {
+        float s = 0.0f;
+        if (have) {
+            const float* th = TH + (size_t)h * m * HD + d;
+            for (int b = 0; b < m; b++) s += su[b] * th[(size_t)b * HD];
+        }
+        P[((size_t)nblk * nh + h) * HD + d] = s;
+    }
+    if (tid == 0) {
+        E[(size_t)nblk * nh + h] = have ? den : 0.0f;
+        Mx[(size_t)h * nbcap + nblk] = call;
     }
 }

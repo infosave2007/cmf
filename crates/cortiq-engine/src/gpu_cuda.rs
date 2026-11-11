@@ -1821,7 +1821,7 @@ pub fn forward_token_graph(
     let Some(c) = ctx() else { return TokenGraphOutcome::Declined };
     if hyb::wants(layers, nh, nkv, hd) {
         return hyb::token(
-            c, model, kv_id, layers, o1, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
+            c, model, kv_id, layers, o1, o1_epoch, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
             lm_head, final_norm, logits, loop_norm_at, steps, layers_run, layer_base, hidden_too,
         );
     }

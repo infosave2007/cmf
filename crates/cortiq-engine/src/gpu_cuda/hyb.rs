@@ -148,6 +148,8 @@ pub(super) struct HFuncs {
     finish: cs::CUfunction,
     attn_out: cs::CUfunction,
     softmax_h: cs::CUfunction,
+    far_insert: cs::CUfunction,
+    far_prep: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -189,6 +191,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         finish: func(module, "hy_finish")?,
         attn_out: func(module, "hy_attn_out")?,
         softmax_h: func(module, "hy_softmax_h")?,
+        far_insert: func(module, "hy_far_insert")?,
+        far_prep: func(module, "hy_far_prep")?,
     })
 }
 
@@ -731,6 +735,8 @@ pub(super) struct HState {
     mats: HashMap<(u64, usize), Arc<DevMat>>,
     /// Gate/up pairs (`hmat_pair`) by (model, gate, up).
     pairs: HashMap<(u64, usize, usize), Arc<DevMat>>,
+    /// The far fields of sealed layers (turbo files), by sequence and layer.
+    o1: HashMap<(u64, usize), HO1>,
     /// K/V mirrors this arm keeps in f16 (by sequence and layer): a mirror's
     /// `row` counts f32 slots, half its f16 values.
     pub(super) half: std::collections::HashSet<(u64, usize)>,
@@ -741,7 +747,7 @@ pub(super) struct HState {
     rtabs: HashMap<u64, (Buf, Vec<(u64, usize)>)>,
     /// Recorded small-path graphs by (plan, sequence, layer base, rows, tape,
     /// head).
-    graphs: HashMap<(u64, u64, usize, usize, bool, bool), GraphRec>,
+    graphs: HashMap<(u64, u64, usize, usize, bool, bool, u64), GraphRec>,
     plans: HashMap<(u64, usize, usize, bool), Arc<HPlan>>,
     gdn: HashMap<(u64, usize), GdnState>,
 }
@@ -1217,10 +1223,14 @@ fn admit(
     pos0: usize,
     n: usize,
     hint: usize,
+    sealed: &[bool],
 ) -> Result<(), (bool, String)> {
     let soft = |e: String| (false, e);
     for (li, (pl, l)) in plan.layers.iter().zip(layers).enumerate() {
         let key = (kv_id, layer_base + li);
+        if sealed.get(li).copied().unwrap_or(false) {
+            continue;
+        }
         match (&pl.mix, &l.attn) {
             (Mix::Attn(_), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
@@ -1321,6 +1331,136 @@ fn admit(
     Ok(())
 }
 
+/// A sealed layer's far field on the card (attn.cu's `O1Dev` with f16 near
+/// rows: the sinks and the rows kept exact, then the ring of the window, laid
+/// out as a K/V mirror; the landmarks and each head's far accumulators). It
+/// goes up once per seal epoch and moves with every row from there.
+struct HO1 {
+    epoch: u64,
+    /// The position of the next row that may move this state; None until the
+    /// first one has.
+    next_pos: Option<usize>,
+    bytes: u64,
+    nk: Buf,
+    nv: Buf,
+    kt: Buf,
+    qt: Buf,
+    mu: Buf,
+    mz: Buf,
+    th: Buf,
+    ns: usize,
+    w: usize,
+    m: usize,
+    win_len: usize,
+    win_head: usize,
+    far_len: usize,
+    scale: f32,
+    rect_fm: bool,
+}
+
+/// A sealed layer's far field up for this epoch (unless it is already).
+#[allow(clippy::too_many_arguments)]
+fn o1_ensure(c: &Ctx, st: &mut State, key: (u64, usize), views: &[crate::nystrom::O1DeviceView<'_>], epoch: u64, hpk: usize, nkv: usize, hd: usize) -> Res<()> {
+    if st.hyb.o1.get(&key).is_some_and(|d| d.epoch == epoch) {
+        return Ok(());
+    }
+    let g0 = views.first().ok_or("far field: a layer without groups")?;
+    let (m, ns, w) = (g0.m_eff, g0.sink_len, g0.w);
+    let rect_fm = g0.heads.first().is_some_and(|h| h.rect_fm);
+    if views.len() != nkv
+        || views.iter().any(|v| {
+            v.exact_only
+                || v.d != hd
+                || v.dv != hd
+                || v.m_eff != m
+                || v.sink_len != ns
+                || v.w != w
+                || v.heads.len() != hpk
+                || v.win_len != g0.win_len
+                || v.win_head != g0.win_head
+                || v.far_len != g0.far_len
+                || v.scale != g0.scale
+                || v.heads.iter().any(|h| h.rect_fm != rect_fm)
+        })
+    {
+        return Err("far field: the groups of a layer disagree, or one is exact-only".into());
+    }
+    if m == 0 || m > 64 || hpk * m > 1024 || w == 0 || g0.win_len > w {
+        return Err(format!("far field: {m} landmarks x {hpk} heads a group, window {w}: outside the kernels"));
+    }
+    let row = nkv * hd;
+    let h16 = cortiq_core::quant::f32_to_f16;
+    let mut nk = vec![0u16; (ns + w) * row];
+    let mut nv = vec![0u16; (ns + w) * row];
+    let (mut kt, mut qt, mut mu, mut mz, mut th) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (g, v) in views.iter().enumerate() {
+        let have = (v.win_k.len() / hd).min(v.win_v.len() / hd).min(w);
+        if v.sink_k.len() != ns * hd || v.sink_v.len() != ns * hd || v.k_tilde.len() != m * hd || have < v.win_len {
+            return Err("far field: sink, window or landmark rows of an unexpected length".into());
+        }
+        for r in 0..ns {
+            for d in 0..hd {
+                nk[(r * nkv + g) * hd + d] = h16(v.sink_k[r * hd + d]);
+                nv[(r * nkv + g) * hd + d] = h16(v.sink_v[r * hd + d]);
+            }
+        }
+        for r in 0..have {
+            for d in 0..hd {
+                nk[((ns + r) * nkv + g) * hd + d] = h16(v.win_k[r * hd + d]);
+                nv[((ns + r) * nkv + g) * hd + d] = h16(v.win_v[r * hd + d]);
+            }
+        }
+        kt.extend_from_slice(v.k_tilde);
+        for h in &v.heads {
+            if h.q_tilde.len() != m * hd || h.mu.len() != m * m || h.m_max.len() != m || h.z_hat.len() != m || h.t_hat.len() != m * hd {
+                return Err("far field: a head's skeleton of an unexpected length".into());
+            }
+            qt.extend_from_slice(h.q_tilde);
+            mu.extend_from_slice(h.mu);
+            mz.extend_from_slice(h.m_max);
+            mz.extend_from_slice(h.z_hat);
+            th.extend_from_slice(h.t_hat);
+        }
+    }
+    // queued work may still read the epoch being replaced
+    c.sync()?;
+    let bytes = ((nk.len() + nv.len()) * 2 + (kt.len() + qt.len() + mu.len() + mz.len() + th.len()) * 4) as u64;
+    let d = HO1 {
+        epoch,
+        next_pos: None,
+        bytes,
+        nk: Buf::from_slice(&nk)?,
+        nv: Buf::from_slice(&nv)?,
+        kt: Buf::from_slice(&kt)?,
+        qt: Buf::from_slice(&qt)?,
+        mu: Buf::from_slice(&mu)?,
+        mz: Buf::from_slice(&mz)?,
+        th: Buf::from_slice(&th)?,
+        ns,
+        w,
+        m,
+        win_len: g0.win_len,
+        win_head: g0.win_head,
+        far_len: g0.far_len,
+        scale: g0.scale,
+        rect_fm,
+    };
+    if debug() {
+        eprintln!(
+            "cuda hybrid: far field of layer {} on the card (epoch {epoch}): {ns} exact rows, window {} of {w}, {m} landmarks, {} keys far, {:.1} MB",
+            key.1,
+            d.win_len,
+            d.far_len,
+            bytes as f64 / 1e6
+        );
+    }
+    c.kv_bytes.fetch_add(bytes, Ordering::Relaxed);
+    if let Some(old) = st.hyb.o1.insert(key, d) {
+        c.kv_bytes.fetch_sub(old.bytes, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// One small-path call's launch inputs, made by `book`, which also moves
 /// the host-side cursors (mirror rows, GDN positions and tapes).
 struct Book {
@@ -1332,6 +1472,11 @@ struct Book {
     ci: Vec<i32>,
     /// The attention scratch (S, Mx, P, E).
     scratch: [u64; 4],
+    /// Per layer: 0 its exact mirror, 1 a far field, 2 a far field whose ring
+    /// row goes into the far sums first.
+    far: Vec<u8>,
+    /// Per layer: a far field's landmarks, scale and rectification.
+    farp: Vec<(usize, f32, bool)>,
 }
 
 /// Rows a key block of the decode attention takes for `keys` keys (64 up to
@@ -1354,19 +1499,53 @@ fn book(
     n: usize,
     tape: bool,
     kcap: usize,
+    sealed: &[bool],
 ) -> Res<Book> {
     let (nh, hd) = (plan.nh, plan.hd);
     let mut layers = Vec::with_capacity(plan.layers.len());
+    let mut far = Vec::with_capacity(plan.layers.len());
+    let mut farp = Vec::with_capacity(plan.layers.len());
     let mut ci = Vec::new();
     let mut keys_max = 0usize;
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        if !matches!(&pl.mix, Mix::Attn(_)) || !sealed.get(li).copied().unwrap_or(false) || !st.hyb.o1.contains_key(&key) {
+            far.push(0);
+            farp.push((0, 0.0, false));
+        }
         match &pl.mix {
             Mix::Gdn(_) => {
                 let gs = st.hyb.gdn.get_mut(&key).ok_or("GDN state missing")?;
                 layers.push([gs.s.ptr, gs.ring.ptr, gs.t_qkv.ptr, gs.t_cq.ptr, gs.t_gb.ptr, gs.s_save.ptr, gs.ring_save.ptr]);
                 gs.next_pos = pos0 + n;
                 gs.tape = if tape { Some((pos0, n)) } else { None };
+            }
+            Mix::Attn(_) if st.hyb.o1.contains_key(&key) && sealed.get(li).copied().unwrap_or(false) => {
+                // the far field (`nystrom.rs` advance): the ring row the new
+                // key replaces goes into the far sums first, once the ring is full
+                if n != 1 {
+                    return Err("a far field takes one row a call".into());
+                }
+                let d = st.hyb.o1.get_mut(&key).unwrap();
+                let full = d.win_len == d.w;
+                let row = d.ns + if full { d.win_head } else { d.win_len };
+                if full {
+                    d.far_len += 1;
+                    d.win_head = (d.win_head + 1) % d.w;
+                } else {
+                    d.win_len += 1;
+                }
+                d.next_pos = Some(pos0 + 1);
+                let keys = d.ns + d.win_len;
+                let rb = attn_rb(keys);
+                let ncap = keys.next_multiple_of(4096);
+                let nbcap = ncap.div_ceil(rb) + 1;
+                ci.extend([(keys - 1) as i32, row as i32, rb as i32, ncap as i32, nbcap as i32, 1, row as i32, (d.far_len > 0) as i32]);
+                layers.push([d.nk.ptr, d.nv.ptr, d.kt.ptr, d.qt.ptr, d.mu.ptr, d.mz.ptr, d.th.ptr]);
+                far.push(if full { 2 } else { 1 });
+                farp.push((d.m, d.scale, d.rect_fm));
+                keys_max = keys_max.max(keys);
+                continue;
             }
             Mix::Attn(_) => {
                 let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
@@ -1392,7 +1571,7 @@ fn book(
         st.scr(c, "hy_P", NMAX * nbc * nh * hd * 4)?,
         st.scr(c, "hy_E", NMAX * nbc * nh * 4)?,
     ];
-    Ok(Book { layers, ci, scratch })
+    Ok(Book { layers, ci, scratch, far, farp })
 }
 
 /// The small path's launches over the rows in `plan.h` (`n <= NMAX`), as
@@ -1486,6 +1665,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
             }
             Mix::Attn(a) => {
                 let (kp, vp) = (lb[0], lb[1]);
+                let far = bk.far[li];
+                let (fm, fscale, frect) = bk.farp[li];
                 let cip = plan.ci.ptr + (ai * 8 * 4) as u64;
                 let w = &bk.ci[ai * 8..ai * 8 + 8];
                 ai += 1;
@@ -1498,6 +1679,18 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
+                    if far == 2 {
+                        // the ring row this key replaces into the far sums,
+                        // before the key takes its place
+                        let (fm_i, nkv_i2) = (fm as i32, nkv as i32);
+                        c.launch(
+                            fx.far_insert,
+                            (nkv as u32, 1),
+                            (plan.hpk * fm) as u32,
+                            0,
+                            kargs!(kp, vp, lb[3], lb[5], lb[6], cip, fm_i, nkv_i2, fscale),
+                        )?;
+                    }
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, n as u32),
@@ -1517,6 +1710,17 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                         0,
                         kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, plan.scale, rb_i, ncap_i, nbcap_i, n_i, cip),
                     )?;
+                    if far != 0 {
+                        // the far part: one more block of P and E, and its maximum
+                        let (fm_i, frect_i) = (fm as i32, frect as i32);
+                        c.launch(
+                            fx.far_prep,
+                            (nh as u32, 1),
+                            64,
+                            0,
+                            kargs!(plan.qg.ptr, lb[2], lb[4], lb[5], lb[6], mx_p, p_p, e_p, cip, fm_i, nh_i, fscale, frect_i),
+                        )?;
+                    }
                     c.launch_3d(
                         fx.values,
                         (nblk, nkv as u32, n as u32),
@@ -1621,8 +1825,9 @@ unsafe fn run_small(
     tape: bool,
     head: bool,
     kcap: usize,
+    sealed: &[bool],
 ) -> Res<usize> {
-    let bk = book(c, st, plan, kv_id, layer_base, pos0, n, tape, kcap)?;
+    let bk = book(c, st, plan, kv_id, layer_base, pos0, n, tape, kcap, sealed)?;
     let rows = plan.lm.as_ref().map_or(0, |l| l.1);
     unsafe {
         if !bk.ci.is_empty() {
@@ -1635,9 +1840,15 @@ unsafe fn run_small(
             }
             return Ok(if head { rows } else { 0 });
         }
-        let key = (plan.id, kv_id, layer_base, n, tape, head);
+        let mut far_key = 0u64;
+        for (i, &f) in bk.far.iter().enumerate() {
+            far_key ^= (f as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(i as u32 % 64);
+        }
+        let key = (plan.id, kv_id, layer_base, n, tape, head, far_key);
         let mut sig: Vec<u64> = bk.layers.iter().flatten().copied().collect();
         sig.extend(bk.scratch);
+        sig.extend(bk.far.iter().map(|&f| f as u64));
+        sig.extend(bk.farp.iter().map(|&(m, sc, r)| (m as u64) << 33 | (sc.to_bits() as u64) << 1 | r as u64));
         let hit = st.hyb.graphs.get(&key).is_some_and(|g| g.sig == sig);
         GRAPH_RUN.fetch_add(1, Ordering::Relaxed);
         if !hit {
@@ -1694,6 +1905,7 @@ pub(super) fn token(
     kv_id: u64,
     layers: &[GraphLayer],
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     invf: &[f32],
     h: &mut [f32],
     nh: usize,
@@ -1715,10 +1927,11 @@ pub(super) fn token(
     layer_base: usize,
     hidden_too: bool,
 ) -> TokenGraphOutcome {
-    if steps != 1 || !loop_norm_at.is_empty() || o1.iter().any(Option::is_some) {
-        decline("hybrid token", "a multi-step burst, a mid-stack norm or a sealed far field");
+    if steps != 1 || !loop_norm_at.is_empty() || (!o1.is_empty() && o1.len() != layers.len()) {
+        decline("hybrid token", "a multi-step burst, a mid-stack norm or far-field views short of the layers");
         return TokenGraphOutcome::Declined;
     }
+    let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
     if position >= cap || h.len() != hidden {
         decline("hybrid token", "position past the context cap");
         return TokenGraphOutcome::Declined;
@@ -1734,9 +1947,30 @@ pub(super) fn token(
             return TokenGraphOutcome::Declined;
         }
     };
-    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, position, 1, 0) {
+    // the far fields first: a state the card has moved has no host copy to
+    // go back to, so from there a refusal is a failure
+    let moved = sealed.iter().enumerate().any(|(li, &s)| s && st.hyb.o1.get(&(kv_id, layer_base + li)).is_some_and(|d| d.next_pos.is_some()));
+    for (li, views) in o1.iter().enumerate() {
+        let Some(views) = views else { continue };
+        let key = (kv_id, layer_base + li);
+        let at = st.hyb.o1.get(&key).filter(|d| d.epoch == o1_epoch).and_then(|d| d.next_pos);
+        let res = match at {
+            Some(next) if next != position => Err(format!("far field: the card is at row {next}, the call at {position}")),
+            _ => o1_ensure(c, &mut st, key, views, o1_epoch, plan.hpk, nkv, hd),
+        };
+        if let Err(e) = res {
+            decline("hybrid token", &e);
+            return if moved { TokenGraphOutcome::Failed } else { TokenGraphOutcome::Declined };
+        }
+        // a sealed layer reads no mirror again
+        if let Some(m) = st.kv.remove(&key) {
+            let _ = c.sync();
+            c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
+        }
+    }
+    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, position, 1, 0, &sealed) {
         decline("hybrid token", &e);
-        return if hard { TokenGraphOutcome::Failed } else { TokenGraphOutcome::Declined };
+        return if hard || moved { TokenGraphOutcome::Failed } else { TokenGraphOutcome::Declined };
     }
     let t0 = std::time::Instant::now();
     let mut run = || -> Res<()> {
@@ -1746,7 +1980,7 @@ pub(super) fn token(
             if !tab.is_empty() {
                 cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
             }
-            let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap)?;
+            let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed)?;
             if rows > 0 {
                 logits.resize(rows, 0.0);
                 cu::memcpy_dtoh_async(logits.as_mut_slice(), plan.logits.ptr, c.stream).map_err(derr)?;
@@ -1839,7 +2073,7 @@ pub(super) fn batch(
         }
     };
     let hint = st.kv_hint;
-    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, pos0, b, hint) {
+    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, pos0, b, hint, &[]) {
         decline("hybrid batch", &e);
         return if hard { BatchGraphOutcome::Failed } else { BatchGraphOutcome::Declined };
     }
@@ -1852,7 +2086,7 @@ pub(super) fn batch(
                 if !tab.is_empty() {
                     cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                 }
-                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap)?;
+                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &[])?;
                 if let Some(sp) = spec.as_mut() {
                     sp.logits_out.resize(b * rows, 0.0);
                     cu::memcpy_dtoh_async(sp.logits_out.as_mut_slice(), plan.logits.ptr, c.stream).map_err(derr)?;
@@ -2030,6 +2264,28 @@ unsafe fn big(
                         kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, b_i, nul, qgh),
                     )?;
                 }
+                // a far-field layer of a prompt read for its seal: the rotated
+                // queries its trace keeps wait for `o1_qcap_drain`
+                let cap_stride = super::QCAP.with(|q| {
+                    q.borrow().as_ref().filter(|q| q.layers.contains(&(layer_base + li))).map(|q| q.stride.max(1))
+                });
+                if let Some(stride) = cap_stride {
+                    let first = (stride - pos0 % stride) % stride;
+                    let kept = if first < b { (b - first).div_ceil(stride) } else { 0 };
+                    if kept > 0 {
+                        let floats = kept * nh * hd;
+                        let buf = Buf::new(floats * 4)?;
+                        let (first_i, stride_i, hd_i) = (first as i32, stride as i32, hd as i32);
+                        unsafe {
+                            c.launch(c.f.q_rows_strided, (kept as u32, 1), 256, 0, kargs!(qg, buf.ptr, nh_i, nkv_i, hd_i, b_i, first_i, stride_i))?;
+                        }
+                        super::QCAP.with(|q| {
+                            if let Some(q) = q.borrow_mut().as_mut() {
+                                q.bufs.push((layer_base + li, floats, buf));
+                            }
+                        });
+                    }
+                }
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
@@ -2182,6 +2438,12 @@ pub(super) fn gdn_state_read(c: &Ctx, st: &State, kv_id: u64, layer: usize) -> O
 /// Drop a sequence's recurrent states.
 pub(super) fn reset(c: &Ctx, st: &mut State, kv_id: u64) {
     st.hyb.rtabs.remove(&kv_id);
+    st.hyb.o1.retain(|&(id, _), d| {
+        if id == kv_id {
+            c.kv_bytes.fetch_sub(d.bytes, Ordering::Relaxed);
+        }
+        id != kv_id
+    });
     st.hyb.gdn.retain(|&(id, _), g| {
         if id == kv_id {
             let (nv, nk, dk, dv, kk) = g.dims;
