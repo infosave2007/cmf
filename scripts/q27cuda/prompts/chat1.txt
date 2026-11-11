@@ -1,0 +1,1 @@
+Explain how a modern SSD's flash translation layer works: mapping tables, garbage collection, wear leveling, write amplification, and TRIM. Use headers and be thorough but precise.

@@ -1,0 +1,1 @@
+Produce a JSON document describing a fictional e-commerce order system schema: 6 tables with columns, types, constraints, indexes and relations, followed by SQL DDL for PostgreSQL and three example analytical queries with explanations.

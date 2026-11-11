@@ -79,8 +79,12 @@ backend serves the two graph contracts the wgpu backend serves:
   sealed once after it; from there a token reads the far-field state the card keeps, and its cost and the
   card's memory stop growing with the text. `CMF_O1=off` keeps exact attention at any length.
 
-Anything else (MoE, GDN mixers, sandwich norms, Q/K norms, output gates other than Spark's) is declined
-before any state changes, and the model runs on the CPU path; `CMF_CUDA_DEBUG=1` prints the reason.
+Hybrids of the Qwen3.5 family (`qwen3_5`: GDN mixers and gated full attention with Q/K norms, dense FFNs,
+an MTP block; Qwen3.8-27B) run on a second arm of the backend with drafts and their verify on the card,
+see [Hybrids](#hybrids-the-qwen35-family). The Fast Code stack (`qwen4_exp`) has its own path
+(`gpu_cuda/qwen4.rs`). Anything else (other MoE stacks, sandwich norms, output gates other than these) is
+declined before any state changes, and the model runs on the CPU path; `CMF_CUDA_DEBUG=1` prints the
+reason.
 
 ## How it works
 
@@ -203,6 +207,155 @@ one path: on that prompt the wgpu path's default and its f32 prompt differ by 0.
 attention does not. Facts planted in 60 000, 120 000 and 240 000 characters of Wikipedia text are answered
 8 times of 8 with the far field on CUDA (`scripts/cuda/pod/chain_cuda_passkey.sh`).
 
+## Hybrids: the Qwen3.5 family
+
+A stack of GDN mixers and gated full attention with Q/K norms (`qwen3_5`, Qwen3.8-27B among them) runs on
+its own arm, `gpu_cuda/hyb.rs` and `hyb.cu`, behind the same two graph contracts. The pipeline's draft
+rounds, prompt lookup and the server run on it unchanged.
+
+```bash
+CMF_GPU=cuda cortiq run qwen38-27b-q4tp.cmf --prompt "..." --greedy --no-think
+CMF_GPU=cuda cortiq serve qwen38-27b-q4tp.cmf --port 8080 --host 127.0.0.1
+```
+
+**Decode and verify** use one tensor-core kernel: `mma.sync` m16n8k16 with bf16 operands and f32 sums.
+- At load the card repacks each q4tp matrix, so a lane loads its eight bytes of a 16-row tile at once.
+- An input row reaches the kernel as two bf16 planes, about 17 significant bits, written by the kernel
+  that produced the row.
+- Up to sixteen rows cost about one: eight rows 1.05× a single row on a 3090, sixteen about 1.6×.
+- A row's arithmetic does not depend on how many rows share the launch. A verify window therefore gives
+  the plain token's bits, and the text with drafts is the text without them.
+- Gate and up are one matrix whose tiles hold eight rows of each. The kernel's epilogue writes
+  silu(gate) · up for the down projection.
+
+**GDN and attention.**
+- A GDN layer is two launches: the conv, its ring, the L2 norms and the gates in one, the delta rule in
+  the other.
+- In the delta rule a thread owns a column of the 3 MB state, so a warp reads 32 consecutive floats; the
+  verify's copy of the state for a step back is written by the same launch.
+- Attention reads f16 K/V mirrors.
+- A token or a verify window is one CUDA graph, replayed with a record of its positions.
+- A one-row call over a long matrix set takes one tile a block (gate/up 801 against 745 GB/s); the
+  arithmetic does not depend on it.
+
+**Drafts.**
+- A round's MTP drafts are one CUDA graph: each step gathers its token's embedding row on the card (the
+  first 65 536 rows of the embedding, repacked), runs the block and the shortlist head and takes the
+  argmax there. One upload, one launch, the ids back.
+- The verify picks each row's argmax on the card with the host's tie rule, so the logits stay there.
+- A round that lands two tokens or more speculates without timing plain tokens first: a round costs
+  about 1.25 plain tokens on this arm.
+- Prompt lookup continues a draft that repeats an earlier stretch of the text. Its window is 8 rows, and
+  16 after a lookup round whose drafts all held.
+- After a partial accept, every GDN state goes back to the window's start and replays the accepted rows:
+  two launches for all layers.
+
+**The prompt** expands the repacked weights to f16 for cuBLAS, in chunks of 1024 rows. Attention runs on
+the f16 K/V; the GDN glue runs in f32 kernels.
+
+**Load.** Each kernel's PTX is cached on disk (`~/.cache/cortiq/cuda`, `CMF_CUDA_CACHE`), and the repack
+runs on the card. The 27B file's plan builds in under 4 s.
+
+**A chat's next turn.** A Qwen3.5 template renders a past answer without its think block, so the next
+turn never extends the cached ids. The recurrent states cannot be rewound either. Instead, while it reads
+a prompt, the card copies the GDN states at the prompt's last `<|im_start|>` (the assistant header), about
+150 MB for the 27B file. A turn that starts with the ids before it goes back there and reads only what
+follows. The attention rows before that point are prompt rows no decode wrote, so the copy stays exact
+after any draft round. The draft head's rows before that point stay too. `CMF_KV_REUSE=0` reads every
+turn from the start.
+
+Three turns over a 10 KB file (`scripts/q27cuda/serve_chat.sh`), each turn carrying the model's own
+answers:
+
+| turn | prompt, tokens | read again | **from the snapshot** |
+|---:|---:|---:|---:|
+| 2 | 4 048 | 4 048 in 4.13 s | **338 in 0.50 s** |
+| 3 | 4 119 | 4 119 in 4.29 s | **78 in 0.24 s** |
+
+The texts of all three turns are the same both ways, and so is the decode rate (99 against 97 tok/s on
+turn 2).
+
+### Numbers on an RTX 3090
+
+Qwen3.8-27B q4tp on an RTX 3090 (24 GB), driver 595.91, CUDA 12.8 libraries, a container with 6.8 CPUs.
+`cortiq run --greedy --no-think`, 512 tokens; the Vulkan column is the wgpu path on the same card and
+build. Eight chat prompts, then a copy task (60 lines of a 14 KB document reproduced) and an edit task (a
+rename in a 10 KB file).
+
+| prompt | Vulkan, drafts | **CUDA, drafts** |
+|---|---:|---:|
+| chat0: an LRU cache module | 53.6 | **118.5** |
+| chat1: an SSD's FTL | 53.4 | **104.0** |
+| chat2: an article in Danish | 40.8 | **72.7** |
+| chat3: a refactor | 62.9 | **141.5** |
+| chat4: trains | 65.5 | **138.6** |
+| chat5: a JSON schema | 73.9 | **167.5** |
+| chat6: a blog post | 48.0 | **89.0** |
+| chat7: a summary | 63.3 | **125.9** |
+| **chat, mean** | 57.7 | **119.7** |
+| copy0 | 74.8 | **201.0** |
+| edit0 | 71.6 | **220.1** |
+
+- Without drafts (`CMF_GRAPH_SPEC=0`): 49.1 tok/s on CUDA, 40.8 on Vulkan.
+- The text with drafts equals the text without them on every prompt checked (chat0, chat3, copy0, edit0).
+  On Vulkan it differs on chat0, whose verify is int8.
+- Prompt: 983 tok/s at 4 000 tokens (Vulkan 560), 929 at 16 000, 819 at 32 000.
+- First token of chat0, the load included: 2.5 s.
+- Through `cortiq serve`, four greedy requests with and without thinking: 86–173 tok/s against 48.9–49.1
+  without drafts, the same texts (`scripts/q27cuda/serve_ab.sh`).
+- The turbo file: facts planted in 60 000 characters of Wikipedia text are answered 8 times of 8. The first
+  token comes in 21–23 s, against 52–58 s over Vulkan; past the seal it decodes without drafts.
+
+### DFlash 2 beside the file
+
+The published DFlash 2 drafter (`z-lab/Qwen3.8-27B-DFlash2`) drafts a round of seven tokens in one pass. It
+has five layers, and its context is the trunk's rows after layers 5, 19, 33, 47 and 61. On this arm the
+block runs on the card:
+- the four-bit matrices go through the same tensor-core matvec;
+- fc, the kernel projections and the selector run in f16 on cuBLAS;
+- the row convolutions, the head norms and the attention over the context have kernels of their own.
+
+The trunk's graphs copy the tapped rows out on their way, and the drafter's context is made from them on
+the card.
+
+```bash
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir dflash2
+cortiq convert --model dflash2 --output qwen38-27b-q4tp.cmf --dflash-sidecar --quant q4tp   # writes qwen38-27b-q4tp.dflash.cmf
+CMF_GPU=cuda CMF_DFLASH=1 cortiq run qwen38-27b-q4tp.cmf --prompt "..." --greedy --no-think
+```
+
+Each round goes to the drafter that lands more tokens at this card's prices. A block costs about 0.19 of a
+plain token, and a verify of eight rows 1.24.
+- A router in the sidecar's header reads the trunk's row at the tip. It is fitted on logged rounds at those
+  prices (`cortiq dflash-route-fit … --prices`).
+- Without a router, the drafters' measured holds decide.
+- A copy stays with the MTP chain: a tail that repeats eight tokens or more, or lookups that keep landing.
+  So does text from the high part of the vocabulary.
+
+The ten prompts on the RTX 3090, release build, tok/s:
+
+| prompt | MTP chain | **DFlash + router** |
+|---|---:|---:|
+| chat0 | 121.2 | **125.8** |
+| chat1 | 102.1 | **103.4** |
+| chat2 | 72.8 | **69.9** |
+| chat3 | 141.5 | **152.9** |
+| chat4 | 138.8 | **156.5** |
+| chat5 | 167.0 | **188.2** |
+| chat6 | 93.7 | **97.1** |
+| chat7 | 124.7 | **133.0** |
+| **chat, mean** | 120.2 | **128.4** |
+| copy0 | 198.9 | **183.5** |
+| edit0 | 220.3 | **197.6** |
+
+- The texts are the same as without drafts, and so are four server requests and a three-turn chat.
+- The block is built once the first prompt has been read (0.9 s), so the first token comes 0.5 s later.
+- A copy or an edit loses 8–10 %. The block's first round makes the prompt's context once: 100 ms on the
+  card, and more in host copies of the tapped rows.
+- A trunk without an MTP head ([Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf)) drafts
+  every round with the block: 49.2 → 102.1 tok/s on chat0, the same text. The sidecars of Qwen3.8-27B, Arete-27B
+  Turbo and OrcaCyber-Nano-1.0 Turbo, with routers at these prices, are on Hugging Face beside the files.
+
 ## Options
 
 | variable | meaning |
@@ -214,16 +367,22 @@ attention does not. Facts planted in 60 000, 120 000 and 240 000 characters of W
 | `CMF_GPU_VRAM_MB=N` | the weight budget instead of the card's memory less 2 GB |
 | `CMF_O1=off` | a turbo file with exact attention at any length |
 | `CMF_CUDA_PROF=1` | stage timers of the prompt and of a token, with a wait after each stage |
+| `CMF_CUDA_CACHE=DIR` | where compiled PTX is kept, `~/.cache/cortiq/cuda` by default |
+| `CMF_GRAPH_SPEC=0` | a hybrid without drafts |
+| `CMF_KV_REUSE=0` | every chat turn read from the start |
+| `CMF_DFLASH=1` | the DFlash sidecar beside the file drafts the rounds it wins (`CMF_DFLASH_PICK=dflash\|mtp` pins one) |
 | `CMF_CUDA_DEBUG=1` | why a graph declined, and a decode / prompt summary at exit |
 
 ## Limits
 
-- One architecture class is covered and one card was measured. MoE, GDN hybrids and Gemma-style stacks
-  run on the CPU under `CMF_GPU=cuda`, not on wgpu.
+- Three architecture classes are covered: dense Spark-class stacks (measured on an A40), Qwen3.5-family
+  hybrids (measured on an RTX 3090) and the Fast Code stack. Other MoE stacks and Gemma-style stacks run on
+  the CPU under `CMF_GPU=cuda`, not on wgpu.
 - The far field's prompt is read whole: its K/V rows are on the card until the seal (8.2 GB at
   64 000 tokens, 4.5 GB on the wgpu path), and its time grows faster than the text. A new turn of a
   sealed conversation reads the conversation again, as on the wgpu path.
-- No speculative decode and no multi-token burst on this backend.
+- Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm. Past a turbo file's seal
+  the hybrid decodes without them.
 - The toolkit libraries must be on the loader's path; the bindings are for CUDA 12.x.
 - Decode is bound by its own arithmetic, about 350 GB/s of weights on an A40 against 500 for a kernel
   that only loads them (`scripts/cuda/bench/mv_bench.cu`).

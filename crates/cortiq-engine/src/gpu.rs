@@ -2501,7 +2501,7 @@ pub fn forward_batch_graph_at(
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::forward_batch_graph_at(
             model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap,
-            gemma, eps, attn_scale, k, o1, spec.is_some(), layers_run,
+            gemma, eps, attn_scale, k, o1, spec, layers_run,
         ),
         #[allow(unreachable_patterns)]
         _ => {
@@ -2511,11 +2511,34 @@ pub fn forward_batch_graph_at(
     }
 }
 
+/// y [n][rows] = W x [n][cols] for a graph weight on the selected device;
+/// false leaves the caller to run it (CUDA's hybrid arm only).
+pub fn rows_matvec(
+    model: &Arc<CmfModel>,
+    gw: &GraphW,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    n: usize,
+    y: &mut [f32],
+) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::rows_matvec(model, gw, rows, cols, x, n, y);
+    }
+    let _ = (model, gw, rows, cols, x, n, y);
+    false
+}
+
 /// After a partial speculative acceptance: restore every GDN layer's device
 /// state to the snapshot after batch position `slot`. `base_pos` is the
 /// absolute position of the first verify row and `expected_layers` makes the
 /// restore all-or-nothing across the model's recurrent layers. wgpu only.
 pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_spec_restore(kv_id, slot, base_pos, expected_layers);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::gdn_spec_restore(kv_id, slot, base_pos, expected_layers);
@@ -2525,6 +2548,29 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
         let _ = (kv_id, slot, base_pos, expected_layers);
         false
     }
+}
+
+/// CUDA hybrid arm: copy every GDN state of the sequence, all at prompt
+/// position `pos`, to a snapshot on the card (a chat's next turn goes back
+/// there). False on any other backend or when a layer is elsewhere.
+pub fn gdn_snapshot(kv_id: u64, pos: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_snapshot(kv_id, pos);
+    }
+    let _ = (kv_id, pos);
+    false
+}
+
+/// CUDA hybrid arm: every GDN state of the sequence back to its snapshot at
+/// `pos`, all or nothing. False leaves the states untouched.
+pub fn gdn_snapshot_restore(kv_id: u64, pos: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_snapshot_restore(kv_id, pos);
+    }
+    let _ = (kv_id, pos);
+    false
 }
 
 /// Re-point one exact-attention device mirror after a speculative round has
@@ -2567,6 +2613,10 @@ pub fn graph_kv_stored(_kv_id: u64, _layer: usize) -> Option<usize> {
 /// Does the wgpu token graph hold a device-resident recurrent state for
 /// this layer (one the host `linear_state` has not seen)?
 pub fn graph_state_resident(_kv_id: u64, _layer: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::state_resident(_kv_id, _layer);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::graph_state_resident(_kv_id, _layer);
@@ -2680,6 +2730,10 @@ pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
 /// One GDN layer's recurrent state as the wgpu graph holds it, in the host
 /// `linear_state` layout ([conv ring | S]).
 pub fn graph_gdn_state_read(_kv_id: u64, _layer: usize) -> Option<Vec<f32>> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_state_read(_kv_id, _layer);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::graph_gdn_state_read(_kv_id, _layer);
@@ -4621,6 +4675,8 @@ pub fn layer_taps_arm(layers: &[usize]) {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::layer_taps_arm(layers),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::layer_taps_arm(layers),
         #[allow(unreachable_patterns)]
         _ => {
             let _ = layers;
@@ -4634,6 +4690,8 @@ pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::layer_taps_take(out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::layer_taps_take(out),
         #[allow(unreachable_patterns)]
         _ => {
             let _ = out;

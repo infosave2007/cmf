@@ -1,0 +1,1 @@
+A train leaves city A at 9:00 traveling at 80 km/h toward city B, 420 km away. A second train leaves B at 10:30 toward A at 100 km/h. When and where do they meet? Then generalize: give the formula for arbitrary speeds, distances and departure offsets, and check it against the numbers.

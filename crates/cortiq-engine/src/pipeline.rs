@@ -382,6 +382,9 @@ pub struct Pipeline {
     /// held, a running average, and the rounds it sits out after that fell
     /// under `LOOKUP_PAYS`.
     pub spec_lookup_gain: f32,
+    /// CUDA: the context lookup may fill a 16-row verify window (after a
+    /// lookup round whose drafts all held), else 8 rows (one price there).
+    pub spec_lookup_wide: bool,
     pub spec_lookup_rest: u32,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
@@ -419,6 +422,10 @@ pub struct Pipeline {
     /// The sidecar's block is the trunk's only drafter (the model has no MTP
     /// block): the wgpu graphs keep its rows without being asked to.
     pub(crate) dflash_solo: bool,
+    /// The first position whose tapped rows a DFlash drafter can still
+    /// read once the prompt is in (its layers' widest window back from the
+    /// prompt's end): the prompt's chunks before it keep none.
+    dflash_tap_from: usize,
     /// The Metal verify graph of the round in flight, between its sync
     /// (logits read) and the commit that replays the accepted prefix.
     #[cfg(target_os = "macos")]
@@ -470,6 +477,15 @@ pub struct Pipeline {
     pub(crate) o1_turbo: Option<O1Turbo>,
     /// Over a far field the draft head starts at this prompt row, and counts from it.
     mtp_pos_base: usize,
+    /// The CUDA hybrid arm's chat snapshot: the prompt ids before the last
+    /// turn's assistant header, whose GDN states the card keeps a copy of
+    /// (`gpu::gdn_snapshot`). The next turn that starts with them goes back
+    /// there and reads only what follows.
+    gdn_snap: Option<Vec<u32>>,
+    /// The draft head's base position when the last turn warmed it over
+    /// its whole prompt on the batched path (None otherwise): its rows from
+    /// there to that prompt's end are prompt rows a chat snapshot keeps.
+    mtp_warm_base: Option<usize>,
     /// Bumped once per collecting→sealed transition — the GPU state mirror
     /// re-uploads when it sees a new epoch (each fresh sealed state).
     o1_epoch: u64,
@@ -1433,6 +1449,10 @@ struct SpecMon {
     /// rounds stop charging an obviously losing speculative arm.
     zero_accept_rounds: u8,
     metal: bool,
+    /// The CUDA hybrid arm: a round costs about 1.25 plain tokens (a verify
+    /// of five rows 1.1x a token, the drafts a tenth more), so rounds that
+    /// land `SPEC_PROXY_TOKENS_CUDA` pay without timing plain tokens.
+    cuda: bool,
 }
 
 /// What a speculative round of k drafts costs on native Metal over a q4tp
@@ -1441,6 +1461,14 @@ struct SpecMon {
 /// one flat price. MacBook Air M4, Qwen3.8-27B: a plain token 160 ms, a
 /// round of one draft 176, of two 204, of three 246, of seven 281.
 const METAL_ROUND_COST: [f32; 7] = [1.10, 1.275, 1.54, 1.59, 1.65, 1.70, 1.76];
+/// The same on the CUDA hybrid arm, verify and commit of a round of k
+/// drafts: RTX 3090, Qwen3.8-27B q4tp, a plain token 20.4 ms, a round of
+/// four chain drafts 24.3 ms past its drafts, of seven block drafts 25.1.
+const CUDA_ROUND_COST: [f32; 7] = [1.12, 1.15, 1.17, 1.19, 1.21, 1.22, 1.24];
+/// A DFlash block on the CUDA arm with its context rows and head (3.9 ms),
+/// and a step of the MTP chain (0.62 ms), in plain tokens.
+const CUDA_BLOCK_DRAFT: f32 = 0.19;
+const CUDA_DRAFT_STEP: f32 = 0.03;
 /// How often a draft holds once the one before it held, before any round has
 /// shown it: the 27B's chain on code and on prose holds its first draft in
 /// four rounds of five, the second in three of four after that, the third in
@@ -1550,6 +1578,10 @@ pub const DFLASH_LEAN_BAND: f32 = 0.0;
 /// for less than a block (edits and quotes: 8 keeps the code's rounds, where
 /// three or four tokens repeat all the time).
 pub const DFLASH_COPY_MIN: usize = 8;
+/// The running gain of the chain's lookups (`spec_lookup_gain`) past which a
+/// CUDA round stays the chain's: an edit of 512 tokens lost 15 % to the
+/// block's rounds between its copies.
+const DFLASH_LOOKUP_KEEPS: f32 = 5.0;
 const DFLASH_WAIT_DIP: u32 = 8;
 const DFLASH_TURN: u32 = 16;
 
@@ -1858,6 +1890,9 @@ const SPEC_RECHECK_PLAIN: usize = 128;
 /// Tokens per round at or above which a Metal round pays without a plain
 /// measurement (see `SpecMon`).
 const SPEC_PROXY_TOKENS: f64 = 3.5;
+/// The CUDA hybrid arm's proxy (see `SpecMon::cuda`): RTX 3090, Qwen3.8-27B,
+/// a round 24.5-26.8 ms against a plain token's 20.4.
+const SPEC_PROXY_TOKENS_CUDA: f64 = 2.0;
 /// The Metal plain phase: at least two tokens, and more until this much
 /// wall time has been timed (up to the eight the other backends time).
 const SPEC_PLAIN_MIN_MS: f64 = 200.0;
@@ -1881,7 +1916,7 @@ impl SpecMon {
         if self.plain_ms > 0.0 {
             self.tokens * self.plain_ms > self.round_ms * 1.03
         } else {
-            self.metal && self.tokens >= SPEC_PROXY_TOKENS
+            (self.metal && self.tokens >= SPEC_PROXY_TOKENS) || (self.cuda && self.tokens >= SPEC_PROXY_TOKENS_CUDA)
         }
     }
     fn repeated_zero_acceptance(&self) -> bool {
@@ -2590,6 +2625,9 @@ impl Pipeline {
             crate::gpu::dory_reset(self.graph_kv_id);
         }
         crate::gpu::graph_kv_reset(self.graph_kv_id);
+        // the card's GDN snapshot went with the sequence's states
+        self.gdn_snap = None;
+        self.mtp_warm_base = None;
         // MTP is detached from `self` for the duration of generation, so its
         // device mirror is not covered by the trunk reset above.  Reset the
         // derived id as well: a failed/aborted warm-up must never leave a
@@ -4844,6 +4882,7 @@ impl Pipeline {
             dflash_k_adapt: None,
             dflash_acc_ewma: 0.6,
             spec_lookup_gain: 2.0,
+            spec_lookup_wide: false,
             spec_lookup_rest: 0,
             rng,
             sampler_scratch: SamplerScratch::default(),
@@ -4859,6 +4898,7 @@ impl Pipeline {
             dflash_rows: None,
             dflash_taps: std::sync::Mutex::new(Vec::new()),
             dflash_solo: false,
+            dflash_tap_from: 0,
             #[cfg(target_os = "macos")]
             metal_verify: None,
             inv_freq,
@@ -4876,6 +4916,8 @@ impl Pipeline {
             o1_cfg: None,
             o1_turbo: None,
             mtp_pos_base: 0,
+            gdn_snap: None,
+            mtp_warm_base: None,
             o1_epoch: 0,
             o1_flags: Vec::new(),
             trace: false,
@@ -5165,6 +5207,45 @@ impl Pipeline {
     pub(crate) fn invalidate_for_weight_change(&mut self) {
         self.clear_sequence_state();
         self.embryo_graph = None;
+    }
+
+    /// The CUDA hybrid arm keeps a chat snapshot (GDN states copied on the
+    /// card): a GDN stack with exact attention, no far field, reuse on.
+    fn gdn_snap_ok(&self) -> bool {
+        crate::gpu::cuda_active()
+            && self.gdn_cfg.is_some()
+            && self.o1_cfg.is_none()
+            && self.dory.is_none()
+            && self.dsv41.is_none()
+            && self.qwen4_exp.is_none()
+            && std::env::var("CMF_KV_REUSE").as_deref() != Ok("0")
+    }
+
+    /// Where this prompt's snapshot goes: its last `<|im_start|>`, the
+    /// assistant header the next turn renders differently (a previous
+    /// answer loses its think block there), past `from` and before the
+    /// prompt's last row.
+    fn gdn_snap_target(&self, input_ids: &[u32], from: usize) -> Option<usize> {
+        if !self.gdn_snap_ok() {
+            return None;
+        }
+        let id = self.tokenizer.token_to_id("<|im_start|>")?;
+        let s = input_ids.iter().rposition(|&t| t == id)?;
+        (s > from && s + 1 < input_ids.len()).then_some(s)
+    }
+
+    /// Positions a turn takes back from the chat snapshot (0: none). The
+    /// card's states go back to it here, all layers or none.
+    fn gdn_snap_reuse(&mut self, input_ids: &[u32]) -> usize {
+        let n = match &self.gdn_snap {
+            Some(s) if !s.is_empty() && s.len() < input_ids.len() && input_ids[..s.len()] == s[..] => s.len(),
+            _ => return 0,
+        };
+        if !self.gdn_snap_ok() || !crate::gpu::gdn_snapshot_restore(self.graph_kv_id, n) {
+            self.gdn_snap = None;
+            return 0;
+        }
+        n
     }
 
     /// Prompt positions the cache already holds when `input_ids`
@@ -5849,6 +5930,9 @@ impl Pipeline {
         self.o1_active()
             && self.o1_on_graph()
             && self.o1_graph_backend()
+            // the CUDA backend verifies no window over a far field: past
+            // the seal it decodes token by token
+            && !crate::gpu::cuda_active()
             && (self.o1_turbo.is_some() || std::env::var("CMF_O1_SPEC").as_deref() == Ok("1"))
             && std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
     }
@@ -6364,6 +6448,9 @@ impl Pipeline {
         // such a mask — drop it here rather than pay 5x for a no-op.
         self.o1_turbo_gate(input_ids.len());
         self.mtp_pos_base = 0;
+        let prev_mtp_warm = self.mtp_warm_base.take();
+        // the draft head's rows a chat snapshot keeps (counted from its base)
+        let mut mtp_keep: Option<usize> = None;
         let task_mask = self.drop_open_mask(task_mask);
         // Unlimited-OCR: the page coordinates of this prompt.
         if self.dash.is_some() {
@@ -6413,6 +6500,40 @@ impl Pipeline {
         if reuse_from > 0 && !self.prepare_kv_reuse(reuse_from) {
             reuse_from = 0;
         }
+        // The CUDA hybrid arm: a chat turn that starts with the ids before
+        // the last turn's assistant header goes back to the GDN snapshot the
+        // card took there; the attention mirrors rewind with it. The rows
+        // before it are prompt rows no decode wrote, so this is exact after
+        // any speculative round, and the draft head reads from there on.
+        if reuse_from == 0 && prompt_rows.is_none() && task_mask.is_none() {
+            let n = self.gdn_snap_reuse(input_ids);
+            if n > 0 {
+                reuse_from = n;
+                self.kv_history.truncate(n);
+                for l in &mut self.kv_cache.layers {
+                    let d = l.pos_len().saturating_sub(n);
+                    if d > 0 {
+                        l.truncate_last(d);
+                    }
+                }
+                self.graph_logits = None;
+                // The draft head's rows before `n` are the last prompt's
+                // rows when it was warmed over that whole prompt: they stay,
+                // and it reads the conversation, not just the new turn.
+                if self.mtp.is_some() {
+                    match prev_mtp_warm {
+                        Some(b) if b <= n => {
+                            self.mtp_pos_base = b;
+                            mtp_keep = Some(n - b);
+                        }
+                        _ => self.mtp_pos_base = n,
+                    }
+                }
+                if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                    eprintln!("kv-reuse: GDN snapshot at {n} of {} prompt positions", input_ids.len());
+                }
+            }
+        }
         // A diverging turn (`rollback_prefix_len`): drop every row past the
         // common prefix, so the tail prefill appends at `reuse_from`.
         if reuse_from > 0 && self.dory.is_some() && reuse_from < self.kv_history.len() {
@@ -6440,6 +6561,13 @@ impl Pipeline {
             self.graph_logits = None;
         }
         self.swa_trim_anchor = input_ids.len();
+        self.dflash_tap_from = match &self.dflash {
+            Some(d) if (0..d.g.layers).all(|l| d.g.window_of(l) > 0) => {
+                let w = (0..d.g.layers).map(|l| d.g.window_of(l)).max().unwrap_or(0);
+                input_ids.len().saturating_sub(w + crate::dflash::BLOCK_SLACK)
+            }
+            _ => 0,
+        };
         self.last_prefill_tokens = input_ids.len() - reuse_from;
         let bounded_native = self.bounded_native();
         if reuse_from == 0 {
@@ -6620,10 +6748,20 @@ impl Pipeline {
         // exactly (`greedy_pen`, the plain loop's arithmetic), so the
         // text is the plain path's and only the round's shape changes.
         // Measured on this M4 — see the report for the interleaved run.
+        //
+        // On the CUDA hybrid arm a suppress list alone (a no-think chat
+        // masks `<think>`) does not count: it reads no history, the draft
+        // and the verify rows mask the same ids, and the verify rows are
+        // the plain rows bit for bit, so the round (`greedy_pen`) keeps the
+        // plain text. Qwen3.8-27B q4tp, RTX 3090, a no-think chat over
+        // `cortiq serve`: 44.8 tok/s plain before this.
+        let suppress_only_ok = crate::gpu::cuda_active()
+            && self.sampler_config.repetition_penalty == 1.0
+            && self.sampler_config.presence_penalty == 0.0;
         let penalized = !metal_graph
             && (self.sampler_config.repetition_penalty != 1.0
                 || self.sampler_config.presence_penalty != 0.0
-                || !self.sampler_config.suppress_tokens.is_empty());
+                || (!self.sampler_config.suppress_tokens.is_empty() && !suppress_only_ok));
         // …and not on wgpu-over-Metal: the batched verify graph there
         // returned 0 accepted drafts and garbage text on a GDN hybrid
         // (16.08, Qwen3.5-0.8B) while Vulkan is bit-exact; the Mac's
@@ -6794,9 +6932,24 @@ impl Pipeline {
             );
         }
         if let Some(m) = &mut mtp {
-            m.kv.clear();
-            // The MTP block's own device mirror starts over with its cache.
-            crate::gpu::graph_kv_reset(self.mtp_kv_id());
+            let kept = mtp_keep.is_some_and(|rows| {
+                crate::gpu::graph_kv_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, rows)
+            });
+            if kept {
+                let rows = mtp_keep.unwrap_or(0);
+                let d = m.kv.pos_len().saturating_sub(rows);
+                if d > 0 {
+                    m.kv.truncate_last(d);
+                }
+            } else {
+                m.kv.clear();
+                // The MTP block's own device mirror starts over with its cache.
+                crate::gpu::graph_kv_reset(self.mtp_kv_id());
+                if mtp_keep.is_some() {
+                    // nothing kept: the head reads from the snapshot on
+                    self.mtp_pos_base = reuse_from;
+                }
+            }
             self.mtp_graph_mode = None;
         }
         // MiMo-V2's draft stack: greedy rounds (draft K with the chained
@@ -7567,6 +7720,9 @@ impl Pipeline {
             if o1_batch_ready && mtp.is_some() {
                 self.mtp_pos_base = tail_from.max(pos);
             }
+            // a chunk ends at the chat snapshot's row, the card copies the
+            // GDN states there before the next chunk runs
+            let snap_at = if o1_arch.is_none() && !o1_batch_ready { self.gdn_snap_target(input_ids, pos) } else { None };
             while pos < input_ids.len() {
                 // The prompt's last rows read the rows chosen just before them.
                 if pos >= tail_from {
@@ -7579,7 +7735,10 @@ impl Pipeline {
                     }
                 }
                 let stop = if o1_arch.is_some() { tail_from } else { input_ids.len() };
-                let end = (pos + chunk).min(stop);
+                let end = match snap_at {
+                    Some(s) if pos < s => (pos + chunk).min(stop).min(s),
+                    _ => (pos + chunk).min(stop),
+                };
                 let bk = end - pos;
                 let mut hiddens = vec![0f32; bk * hs];
                 for (j, &id) in input_ids[pos..end].iter().enumerate() {
@@ -7721,6 +7880,9 @@ impl Pipeline {
                     }
                     hidden.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                     pos = end;
+                    if snap_at == Some(end) {
+                        self.gdn_snap = crate::gpu::gdn_snapshot(self.graph_kv_id, end).then(|| input_ids[..end].to_vec());
+                    }
                 } else if outcome == crate::gpu::BatchGraphOutcome::Failed {
                     // A failed batch may have advanced a device recurrent
                     // state (ordinary GDN or sealed O(1)). A CPU fallback
@@ -7734,6 +7896,17 @@ impl Pipeline {
                     });
                 } else {
                     break; // unsupported → per-position graph handles the rest
+                }
+            }
+            if mtp_batch_prefill && mtp.is_some() && pos == input_ids.len() {
+                self.mtp_warm_base = Some(self.mtp_pos_base);
+            }
+            // the CUDA DFlash block is built once the trunk's kernels are, so
+            // its first round does not pay it
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() {
+                if let Some(d) = &self.dflash {
+                    let _ = d.dev_ready();
                 }
             }
             #[cfg(target_os = "macos")]
@@ -7938,6 +8111,7 @@ impl Pipeline {
         // the plain path before it decides.
         let mut spec_mon = SpecMon {
             metal: graph_spec && crate::gpu::q1_force() && spec_cheap_round,
+            cuda: graph_spec && crate::gpu::cuda_active() && self.sampler_config.temperature < 1e-6,
             ..SpecMon::default()
         };
         // wgpu: a plain token an earlier request's trial timed stands while
@@ -9290,14 +9464,45 @@ impl Pipeline {
     /// The block's input from (trunk hidden, token): eh_proj · [enorm(e);
     /// hnorm(h)] — the same arithmetic the per-op path starts with.
     fn mtp_block_input(&mut self, m: &MtpModule, hidden: &[f32], next_token: u32) -> Vec<f32> {
-        let e = self.embed_single(next_token);
-        let mut cat = vec![0.0f32; 2 * self.hidden_size];
-        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
-        inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
-        inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
-        let mut x = vec![0.0f32; self.hidden_size];
-        m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
-        x
+        self.mtp_block_inputs(m, &[(hidden, next_token)])
+    }
+
+    /// The block inputs of several (trunk hidden, token) pairs, `[n][hidden]`.
+    /// On the CUDA hybrid arm eh_proj runs on the card for all of them at
+    /// once (about 1 ms a pair on the host for Qwen3.8-27B's 27 MB matrix,
+    /// tens of microseconds there); everywhere else one host matvec a pair.
+    fn mtp_block_inputs(&mut self, m: &MtpModule, pairs: &[(&[f32], u32)]) -> Vec<f32> {
+        let hs = self.hidden_size;
+        let mut cats = vec![0.0f32; pairs.len() * 2 * hs];
+        for (i, (hidden, tok)) in pairs.iter().enumerate() {
+            let e = self.embed_single(*tok);
+            let cat = &mut cats[i * 2 * hs..(i + 1) * 2 * hs];
+            let (cat_e, cat_h) = cat.split_at_mut(hs);
+            inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+            inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
+        }
+        let mut xs = vec![0.0f32; pairs.len() * hs];
+        #[cfg(feature = "gpu")]
+        if crate::gpu::cuda_active() {
+            if let Some((model, idx, kind, rs)) = m.eh_proj.graph_weight() {
+                let gw = crate::gpu::GraphW {
+                    idx,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
+                };
+                let model = model.clone();
+                if crate::gpu::rows_matvec(&model, &gw, hs, 2 * hs, &cats, pairs.len(), &mut xs) {
+                    return xs;
+                }
+            }
+        }
+        for i in 0..pairs.len() {
+            m.eh_proj.matvec(&cats[i * 2 * hs..(i + 1) * 2 * hs], &mut xs[i * hs..(i + 1) * hs], self.pool.as_deref());
+        }
+        xs
     }
 
     /// Is the MTP block graphable at all (device up, full attention
@@ -9532,6 +9737,121 @@ impl Pipeline {
         Some((logits, x))
     }
 
+    /// The round's `k` greedy drafts on the CUDA hybrid arm as ONE graph
+    /// (`gpu_cuda::mtp_chain`): the block input, the block and the shortlist
+    /// head k times, each step's token embedding gathered on the card from
+    /// the argmax before it. Err(false): declined before any state changed
+    /// (the per-step loop takes the round); Err(true): failed after the
+    /// block's mirror moved.
+    #[cfg(feature = "cuda")]
+    fn mtp_draft_chain_cuda(&self, m: &MtpModule, hidden: &[f32], t_next: u32, position: usize, k: usize) -> Result<Vec<u32>, bool> {
+        let position = position.saturating_sub(self.mtp_pos_base);
+        if !crate::gpu::cuda_active()
+            || !Self::mtp_chain_on()
+            || std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
+            || self.draft_full_streak > 0
+            || !self.mtp_graph_ok(m)
+            || hidden.len() != self.hidden_size
+        {
+            return Err(false);
+        }
+        let lw = &m.layer;
+        let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias } = &lw.attn else {
+            return Err(false);
+        };
+        let FfnKind::Dense(d) = &lw.ffn else {
+            return Err(false);
+        };
+        if !d.segs.is_empty() {
+            return Err(false);
+        }
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            let (_, i, kind, rs) = t.graph_weight()?;
+            Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false })
+        }
+        let mk = || -> Option<_> {
+            let (model, _, _, _) = wq.graph_weight()?;
+            let (_, li, lkind, lrs) = self.weights.lm_head.graph_weight()?;
+            if lkind != 6 {
+                return None;
+            }
+            let rows = Self::draft_vocab_rows(self.weights.lm_head.rows());
+            let lm = crate::gpu::GraphW { idx: li, kind: lkind, row_scale: lrs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            let eh = gw(&m.eh_proj)?;
+            let layer = crate::gpu::GraphLayer {
+                mhc: None,
+                input_norm: &lw.input_norm,
+                attn: crate::gpu::GraphAttn::Full {
+                    wq: gw(wq)?,
+                    wk: gw(wk)?,
+                    wv: gw(wv)?,
+                    wo: gw(wo)?,
+                    q_norm: q_norm.as_deref(),
+                    k_norm: k_norm.as_deref(),
+                    late_qk_norm: self.qk_norm_after_rope,
+                    bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                    output_gate: *output_gate,
+                    cpu_k: m.kv.k_heads(),
+                    cpu_v: m.kv.v_heads(),
+                    cpu_base: m.kv.base(),
+                    geom: None,
+                    head_gate: None,
+                },
+                post_norm: &lw.post_norm,
+                attn_out_norm: None,
+                ffn_out_norm: None,
+                layer_scale: None,
+                ffn: crate::gpu::GraphFfn::Dense {
+                    gate: gw(&d.gate_proj)?,
+                    up: gw(&d.up_proj)?,
+                    down: gw(&d.down_proj)?,
+                    act: d.act.graph_act()?,
+                    limit: 0.0,
+                    hot: None,
+                },
+            };
+            // the embedding: q4tp in the same file (the chain gathers its rows)
+            let (emodel, ei, ekind, ers) = self.weights.embed_tokens.graph_weight()?;
+            if ekind != 6 || !std::sync::Arc::ptr_eq(emodel, model) || crate::prism::is_inverse_embedding(model, &model.tensors[ei].name) {
+                return None;
+            }
+            let emb = crate::gpu::GraphW { idx: ei, kind: ekind, row_scale: ers, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            Some((model.clone(), lm, rows, eh, layer, emb))
+        };
+        let Some((model, lm, rows, eh, layer, emb)) = mk() else {
+            return Err(false);
+        };
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let e0 = self.embed_single(t_next);
+        crate::gpu_cuda::mtp_chain(
+            &model,
+            self.mtp_kv_id(),
+            &layer,
+            &self.inv_freq,
+            hidden,
+            &e0,
+            t_next,
+            k,
+            self.num_heads,
+            nkv,
+            hd,
+            self.attn_scale,
+            rd,
+            self.hidden_size,
+            position,
+            self.kv_cache.max_seq_len,
+            self.norm_style == cortiq_core::NormStyle::Gemma,
+            self.rms_eps as f32,
+            (&lm, rows),
+            &m.final_norm,
+            &eh,
+            &m.enorm,
+            &m.hnorm,
+            &emb,
+            Self::MTP_LAYER_BASE,
+        )
+    }
+
     /// The warm-ups of one speculative round on the device: every accepted
     /// (hidden, token) pair as ONE batched graph run over the MTP block
     /// (no head) — its kv_append lands the pairs in the block's mirror.
@@ -9556,10 +9876,9 @@ impl Pipeline {
         let hs = self.hidden_size;
         // Block inputs for every pair (eh_proj on the per-op path, one
         // matvec each — the plan's own prologue).
-        let mut hiddens = Vec::with_capacity(pairs.len() * hs);
-        for (h, t) in pairs {
-            hiddens.extend_from_slice(&self.mtp_block_input(m, h, *t));
-        }
+        let mut hiddens = self.mtp_block_inputs(m, pairs);
+        debug_assert_eq!(hiddens.len(), pairs.len() * hs);
+        spec_stamp("w.inp");
         let lw = &m.layer;
         let AttnKind::Full {
             wq,
@@ -9657,7 +9976,13 @@ impl Pipeline {
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
-        crate::gpu::forward_batch_graph(
+        // nothing reads the block's rows back: the warm-up is its K/V rows
+        // (CUDA: no readback, no wait)
+        let defer = crate::gpu::cuda_active();
+        if defer {
+            crate::gpu::set_batch_defer(true);
+        }
+        let out = crate::gpu::forward_batch_graph(
             &model,
             self.mtp_kv_id(),
             std::slice::from_ref(&layer),
@@ -9681,7 +10006,12 @@ impl Pipeline {
             0,
             None,
             None,
-        )
+        );
+        if defer {
+            crate::gpu::set_batch_defer(false);
+        }
+        spec_stamp("w.run");
+        out
     }
 
     /// Complete an MTP warm-up after the batched graph has refused.  A
@@ -9933,13 +10263,18 @@ impl Pipeline {
         if !metal_native {
             self.dflash_taps_absorb();
         }
+        // The CUDA hybrid arm keeps the drafter's context at the tip every
+        // call (its graphs copy the tapped rows out) and verifies eight rows
+        // at about one price: the round goes to the drafter that lands more
+        // tokens at that card's prices, as on Metal.
+        let cuda_rate = !metal_native && crate::gpu::cuda_active();
         let dflash_ok = !sampling
             && !greedy_pen
             && match &self.dflash {
-                Some(d) => metal_native || (dflash_pick() == Some(true) && d.next_position() == next_pos),
+                Some(d) => metal_native || ((dflash_pick() == Some(true) || cuda_rate) && d.next_position() == next_pos),
                 None => false,
             };
-        if !metal_native && self.dflash.is_some() && dflash_pick() != Some(true) {
+        if !metal_native && !cuda_rate && self.dflash.is_some() && dflash_pick() != Some(true) {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
                 tracing::info!(
@@ -9947,8 +10282,16 @@ impl Pipeline {
                 )
             });
         }
-        let (k_flash, rate_flash) = metal_spec_plan(&self.dflash_hold, DFLASH_ROUND_DRAFT);
-        let (_, rate_mtp) = metal_spec_plan(&self.spec_hold, 0.0);
+        let (k_flash, rate_flash) = if cuda_rate {
+            spec_plan_at(&CUDA_ROUND_COST, &self.dflash_hold, CUDA_BLOCK_DRAFT, 0.0)
+        } else {
+            metal_spec_plan(&self.dflash_hold, DFLASH_ROUND_DRAFT)
+        };
+        let (_, rate_mtp) = if cuda_rate {
+            spec_plan_at(&CUDA_ROUND_COST, &self.spec_hold, 0.0, CUDA_DRAFT_STEP)
+        } else {
+            metal_spec_plan(&self.spec_hold, 0.0)
+        };
         // A sidecar that carries a router says which drafter the text at the
         // tip is for, from the target's own row there: two subspaces of such
         // rows, one of the rounds the block won and one of the chain's, and
@@ -9962,14 +10305,26 @@ impl Pipeline {
         if let Some(m) = routed {
             self.dflash_lean += DFLASH_LEAN_STEP * (m - self.dflash_lean);
         }
-        let copying = routed.is_some() && dflash_pick().is_none() && tail_repeat(all_ids) >= DFLASH_COPY_MIN;
+        // CUDA verifies a lookup of sixteen rows at about one price: while the
+        // lookups land (their running gain past `DFLASH_LOOKUP_KEEPS`), an
+        // edit or a quote stays the chain's, which the router (fitted where
+        // the lookup was eight rows) would give the block
+        let copying = (routed.is_some() || cuda_rate)
+            && dflash_pick().is_none()
+            && (tail_repeat(all_ids) >= DFLASH_COPY_MIN || (cuda_rate && self.spec_lookup_gain > DFLASH_LOOKUP_KEEPS));
         let dflash_round = dflash_ok
             && match (dflash_pick(), routed) {
                 (Some(pin), _) => pin,
                 (None, Some(_)) if copying => false,
+                // the block drafts over the head's shortlist: text from the
+                // high table is the chain's (CUDA, where the router alone
+                // sent a Danish article to the block: 55 against 73 tok/s)
+                (None, Some(_)) if cuda_rate && self.draft_full_streak > 0 => false,
                 (None, Some(_)) if self.dflash_last => self.dflash_lean > -DFLASH_LEAN_BAND,
                 (None, Some(_)) => self.dflash_lean > DFLASH_LEAN_BAND,
-                (None, None) if !metal_small => true,
+                // the chain's short round with the prompt lookup copies for less
+                (None, None) if copying => false,
+                (None, None) if !metal_small && !cuda_rate => true,
                 (None, None) if self.draft_full_streak > 0 => false,
                 (None, None) if self.dflash_last => rate_flash * 1.05 >= rate_mtp,
                 (None, None) if self.dflash_wait > 0 => {
@@ -10128,6 +10483,41 @@ impl Pipeline {
                 Err(false) => {}
             }
         }
+        // CUDA hybrid arm, greedy: the whole chain as one graph (device
+        // argmax and embedding gather between the steps). A suppress list
+        // whose ids all sit past the draft shortlist cannot change its
+        // argmax. A decline hands the round to the per-step loop below; a
+        // failure after admission is terminal, like any graph failure.
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active()
+            && !dflash_round
+            && !sampling
+            && !spec_dbg
+            && drafts.is_empty()
+            && self.mtp_graph_mode != Some(false)
+            && (!greedy_pen
+                || (cfg.repetition_penalty == 1.0
+                    && cfg.presence_penalty == 0.0
+                    && cfg.suppress_tokens.iter().all(|&t| (t as usize) >= Self::draft_vocab_rows(self.weights.lm_head.rows()))))
+        {
+            match self.mtp_draft_chain_cuda(m, &hx, t_next, next_pos - 1, k_spec) {
+                Ok(ids) => {
+                    self.mtp_graph_mode = Some(true);
+                    drafts = ids;
+                    spec_stamp("d.chain");
+                }
+                Err(true) => {
+                    tracing::error!("cuda draft chain failed after admission");
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                Err(false) => {}
+            }
+        }
         for j in drafts.len()..k_spec {
             let tok_in = if j == 0 { t_next } else { drafts[j - 1] };
             let mut dbg_ref: Option<(Vec<f32>, Vec<f32>)> = None;
@@ -10230,10 +10620,17 @@ impl Pipeline {
         // steps the MTP block took this round: its own round's drafts, the
         // chain run beside a DFlash block, or none
         let mtp_steps = if dflash_round { beside.len() } else { k_mtp };
-        let k_room = room.min(7);
-        if metal_native
+        // The CUDA hybrid arm verifies up to 16 rows on the tensor cores at
+        // about one price (8 rows 1.05x a plain token, 16 about 1.6x on a
+        // 3090): a copy may run 15 drafts deep there.
+        let cuda_window = crate::gpu::cuda_active();
+        let k_room = room.min(if cuda_window && self.spec_lookup_wide { 15 } else { 7 });
+        // A suppress list alone scores a continuation the same at any
+        // history, so the CUDA window takes lookups under it too.
+        let history_free = cfg.repetition_penalty == 1.0 && cfg.presence_penalty == 0.0;
+        if (metal_native || cuda_window)
             && !sampling
-            && !greedy_pen
+            && (!greedy_pen || (cuda_window && history_free))
             && k_mtp < k_room
             && drafts.len() == k_mtp
             && Self::spec_lookup_on()
@@ -10302,7 +10699,19 @@ impl Pipeline {
             && std::env::var_os("CMF_METAL_VERIFY_CHECK").is_none()
             && std::env::var_os("CMF_LOGIT_DUMP").is_none()
             && std::env::var("CMF_METAL_DEV_ARGMAX").as_deref() != Ok("0");
-        #[cfg(not(target_os = "macos"))]
+        // The CUDA hybrid arm the same way: each verify row's argmax on the
+        // card (the host's tie rule), 5 MB of logits not read back.
+        // `CMF_CUDA_DEV_ARGMAX=0` keeps the host path.
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        let greedy_dev = crate::gpu::cuda_active()
+            && !sampling
+            && !greedy_pen
+            && !self.confidence_on
+            && self.final_softcap.is_none()
+            && self.vocab_size == lm_rows
+            && std::env::var_os("CMF_LOGIT_DUMP").is_none()
+            && std::env::var("CMF_CUDA_DEV_ARGMAX").as_deref() != Ok("0");
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         let greedy_dev = false;
         let mut dev_ids: Vec<u32> = Vec::new();
         #[cfg(target_os = "macos")]
@@ -10334,6 +10743,8 @@ impl Pipeline {
                 }),
             )
         };
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        crate::gpu_cuda::verify_argmax_arm(greedy_dev);
         #[cfg(not(target_os = "macos"))]
         let verify_outcome = self.try_batch_graph_wgpu(
             &mut hiddens,
@@ -10347,6 +10758,12 @@ impl Pipeline {
                 pick: None,
             }),
         );
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        if greedy_dev {
+            if let Some(ids) = crate::gpu_cuda::verify_argmax_take() {
+                dev_ids = ids;
+            }
+        }
         match verify_outcome {
             crate::gpu::BatchGraphOutcome::Completed => {}
             crate::gpu::BatchGraphOutcome::Declined => {
@@ -11010,6 +11427,8 @@ impl Pipeline {
             // a lookup's round: what it added over the head's own drafts
             let extra = a.saturating_sub(k_mtp) as f32;
             self.spec_lookup_gain += 0.2 * (extra - self.spec_lookup_gain);
+            // a copy that holds whole earns the long window; a miss goes back
+            self.spec_lookup_wide = a == k_spec;
             if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
                 eprintln!(
                     "spec-lookup: {} drafts from the context, {extra} held (average {:.2})",
@@ -11041,9 +11460,19 @@ impl Pipeline {
         }
 
         if k_env.is_none() && !metal_native && !k_capped {
+            // The depth is the drafter's own: a round the context lookup
+            // lengthened (CUDA) adapts by the chain's drafts and what of them
+            // held, and its wall (a longer verify) is not a depth's price.
+            let lookup_round = k_spec > k_mtp;
+            let (k_spec, a) = (k_mtp, a.min(k_mtp));
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
             // draft it just paid for. Each drafter has its own depth.
+            if cuda_rate && dflash_round && !k_capped {
+                self.dflash_turn_sum.0 += (a + 1) as f32;
+                self.dflash_turn_sum.1 += CUDA_ROUND_COST[k_spec.clamp(1, 7) - 1] + CUDA_BLOCK_DRAFT;
+                spec_hold_update(&mut self.dflash_hold, k_spec, a.min(k_spec));
+            }
             let (ewma, k_min) = if dflash_round { (&mut self.dflash_acc_ewma, 3) } else { (&mut self.spec_acc_ewma, 2) };
             let f = a as f32 / k_spec.max(1) as f32;
             *ewma += 0.2 * (f - *ewma);
@@ -11060,7 +11489,7 @@ impl Pipeline {
             // fifth row costs. A depth's first round pays its scratch and
             // is not counted; a change stands for six rounds.
             let mut planned = false;
-            if !dflash_round {
+            if !dflash_round && !lookup_round {
                 spec_hold_update(&mut self.spec_hold, k_spec, a);
                 let d = k_spec.clamp(1, 7) - 1;
                 let w = t_round.elapsed().as_secs_f32() * 1e3;
@@ -11148,6 +11577,9 @@ impl Pipeline {
                 let head = &self.weights.lm_head;
                 let mut hl = vec![0f32; n * head.rows()];
                 head.matmat(&out[hs..(n + 1) * hs], n, &mut hl, pool);
+                // the device may score only the head's first rows (CUDA: the shortlist)
+                let width = logits.len() / n.max(1);
+                let hl: Vec<f32> = (0..n).flat_map(|j| hl[j * head.rows()..j * head.rows() + width].to_vec()).collect();
                 let (hids, _) = d.select(&out[hs..(n + 1) * hs], &hl, t_next);
                 let (mut dmax, mut ref_max, mut dsum, mut cnt) = (0f32, 0f32, 0f64, 0usize);
                 for (a, b) in logits.iter().zip(&hl) {
@@ -11156,7 +11588,7 @@ impl Pipeline {
                     dsum += ((a - b) * (a - b)) as f64;
                     cnt += 1;
                 }
-                let arg = |v: &[f32]| (0..n).map(|j| sampler::argmax(&v[j * head.rows()..(j + 1) * head.rows()])).collect::<Vec<u32>>();
+                let arg = |v: &[f32]| (0..n).map(|j| sampler::argmax(&v[j * width..(j + 1) * width])).collect::<Vec<u32>>();
                 eprintln!(
                     "dflash-dev-check: logits max|Δ| {dmax:.4} of max {ref_max:.2}, rms Δ {:.5} | argmax device {:?} host {:?} | drafts device {:?} host {:?}",
                     (dsum / cnt.max(1) as f64).sqrt(),
@@ -11292,6 +11724,15 @@ impl Pipeline {
         if self.o1_active() && !crate::gpu::o1_spec_commit(self.graph_kv_id, next_pos, a + 1) {
             fail(self, "far field commit failed after a speculative round");
             return None;
+        }
+        // a hybrid trunk (Arete-27B, no draft block of its own): its GDN
+        // states back to the rows the round kept, as after a chain's round
+        if a + 1 < b {
+            let gdn = self.graph_gdn_layer_count();
+            if gdn > 0 && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, gdn) {
+                fail(self, "GDN restore failed after a speculative round");
+                return None;
+            }
         }
         // the rows the round keeps are the drafter's next context
         let kept = self.dflash_taps.lock().unwrap().pop();
@@ -19871,7 +20312,8 @@ impl Pipeline {
             }
             Clear
         });
-        let taps = self.dflash_taps_wanted(0, graph_end);
+        // a prompt chunk wholly before what the drafter's windows reach keeps none
+        let taps = if positions.last().is_some_and(|&p| p < self.dflash_tap_from) { Vec::new() } else { self.dflash_taps_wanted(0, graph_end) };
         crate::gpu::layer_taps_arm(&taps);
         let outcome = crate::gpu::forward_batch_graph(
             &model,
@@ -19906,7 +20348,7 @@ impl Pipeline {
     /// `from..upto_excl` is the whole stack (nothing otherwise).
     fn dflash_taps_wanted(&self, from: usize, upto_excl: usize) -> Vec<usize> {
         match &self.dflash {
-            Some(d) if (self.dflash_solo || dflash_pick() == Some(true)) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
+            Some(d) if (self.dflash_solo || dflash_pick() == Some(true) || crate::gpu::cuda_active()) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
             _ => Vec::new(),
         }
     }
@@ -19941,7 +20383,13 @@ impl Pipeline {
         // `DFLASH_TAPS_ROWS` the oldest chunks go, and the drafter's context
         // starts at what is left
         let mut rows: usize = kept.iter().map(|(_, r)| r.len()).sum::<usize>() / (nt * hs);
-        while rows > DFLASH_TAPS_ROWS && kept.len() > 1 {
+        let cap = match &self.dflash {
+            Some(d) if (0..d.g.layers).all(|l| d.g.window_of(l) > 0) => {
+                DFLASH_TAPS_ROWS.min((0..d.g.layers).map(|l| d.g.window_of(l)).max().unwrap_or(0) + crate::dflash::BLOCK_SLACK)
+            }
+            _ => DFLASH_TAPS_ROWS,
+        };
+        while rows > cap && kept.len() > 1 {
             rows -= kept.remove(0).1.len() / (nt * hs);
         }
     }

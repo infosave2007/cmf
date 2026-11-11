@@ -5,6 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.8.68] — 2026-11-11
+
+### Added
+- CUDA: Qwen3.5-family hybrids on the card (`qwen3_5`: GDN mixers, gated attention with Q/K norms, an MTP block;
+  Qwen3.8-27B), with drafts and their verify there too ([docs/CUDA.md](docs/CUDA.md#hybrids-the-qwen35-family)).
+  - Decode and verify run through one tensor-core kernel (`mma.sync`, bf16 operands, f32 sums) over q4tp weights
+    repacked on the card. Its arithmetic does not depend on the window, so the text with drafts is the text
+    without them. A verify picks its rows' argmax on the card.
+  - A token or a verify window is one CUDA graph. Gate and up are one matrix with SiLU in the epilogue. A GDN
+    layer is two launches; its delta rule gives a thread a column of the state (a coalesced 3 MB a layer), and a
+    partial accept goes back in two launches for all layers. K/V are f16.
+  - A round's MTP drafts are one CUDA graph, the token embeddings gathered and the argmax taken on the card.
+    Prompt lookup runs on CUDA in windows of 8 and 16 rows. Rounds that land two tokens speculate without timing
+    plain ones first.
+  - Kernels are cached as PTX on disk (`CMF_CUDA_CACHE`), and the repack runs on the card: the 27B plan builds in
+    under 4 s.
+  - A turbo file's far field runs on the arm too, without drafts past the seal.
+  - Qwen3.8-27B q4tp on an RTX 3090, greedy, 512 tokens, against the Vulkan path on the same card:
+    - chat with drafts 119.7 tok/s on average over eight prompts (57.7);
+    - without drafts 49.1 (40.8);
+    - a copy task 201.0 (74.8), an edit task 220.1 (71.6);
+    - prompt 983 tok/s at 4 000 tokens (560).
+- CUDA hybrids: a chat's next turn goes back to a GDN snapshot the card took at the last prompt's assistant header
+  (its last `<|im_start|>`), instead of reading the conversation again. A Qwen3.5 template drops the think block
+  from past answers, so a turn never extended the cached ids, and MTP models had prefix reuse off. The draft head
+  keeps its rows before that point too. Three turns over a 10 KB file: turn 2 read 338 new tokens in 0.50 s
+  instead of 4 048 in 4.13 s, turn 3 78 in 0.24 s instead of 4.29 s; the same texts. `CMF_KV_REUSE=0` reads every
+  turn from the start.
+- CUDA hybrids: the DFlash 2 drafter (`z-lab/Qwen3.8-27B-DFlash2`, a `.dflash.cmf` sidecar, `CMF_DFLASH=1`) on
+  the card. Its block's four-bit matrices run on the arm's tensor-core matvec, and the rest in f16 on cuBLAS
+  and in kernels of its own. Its context is made on the card from the trunk's tapped rows, which the graphs
+  copy out on their way. Each round goes to the drafter that lands more at the card's prices, read off the
+  sidecar's router when it has one (`cortiq dflash-route-fit --prices` now writes one). Copies and text from
+  the high part of the vocabulary stay with the MTP chain. Qwen3.8-27B q4tp on an RTX 3090: chat 128.4 tok/s
+  against the chain's 120.2, the same texts; a copy and an edit 8-10 % slower, the first token 0.5 s later.
+- CUDA hybrids: DFlash 2 on a trunk without an MTP head (Arete-27B Turbo). Sidecars with a router fitted at an
+  RTX 3090's prices are on Hugging Face beside
+  [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf),
+  [Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf) and
+  [OrcaCyber-Nano-1.0 Turbo](https://huggingface.co/infosave/OrcaCyber-Nano-1.0-Turbo-cmf). Arete-27B Turbo on an
+  RTX 3090: 49.0 → 70.3 tok/s on a short answer, 49.2 → 102.1 on code; OrcaCyber: 116.8 tok/s on code with
+  DFlash, 111.4 with its MTP head; the same texts.
+- CUDA: the Fast Code stack (`qwen4_exp`, Qwen3.8-Flash-Next) on the card: hyper-connection mixes, GDN, QSA, PLE
+  and MoE, the experts read from an arena with a layer-order LRU. Speculation rounds roll the GDN state, the conv
+  ring and the PLE history back exactly; drafts come from a copy cursor, copy frames and the file's MTP head. RTX
+  5090, `fcaq256`: an edit that copies the prompt 497–548 tok/s (151 over Vulkan), a module written from scratch
+  94–111, the same text with and without drafts (#107).
+
+### Fixed
+- CUDA: DFlash on a trunk without an MTP head stopped after its first partial accept ("GDN state of layer 0 is at
+  row 46, the call at 43"). The round now takes the GDN states back to the accepted row.
+- `cortiq serve` no longer holds the first text of a reply until it has 100 characters (#107).
+- `cortiq serve` with `enable_thinking: false` decoded without drafts. The `<think>` token it suppresses counted
+  as a penalty in the draft gate. On CUDA a suppress list alone now keeps the drafts, verified on the suppressed
+  rows: 44.8 → 82–151 tok/s for Qwen3.8-27B at the time, the same text.
+
 ## [0.8.67] — 2026-11-10
 
 ### Added

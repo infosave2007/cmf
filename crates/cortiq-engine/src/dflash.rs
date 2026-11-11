@@ -34,6 +34,9 @@ pub const SIDECAR_ARCH: &str = "dflash2_sidecar";
 /// Where a sidecar's header keeps its router (`RouteFit`), under `provenance`.
 pub const ROUTE_KEY: &str = "dflash_route";
 pub const NAMESPACE: &str = "dflash.";
+/// Positions past a layer's window a drafter still keeps the context for:
+/// the rounds the next block is anchored further on by.
+pub const BLOCK_SLACK: usize = 256;
 /// Context rows projected per pass: bounds the joined-taps buffer.
 const CONTEXT_CHUNK: usize = 64;
 /// Context rows that may wait unsettled (`queue_context`): 100 KB a row on
@@ -242,6 +245,9 @@ pub struct Drafter {
     /// at the first block; `Err` once it declined.
     #[cfg(feature = "gpu")]
     dev: std::sync::Mutex<Option<Result<crate::gpu_wgpu::dflash_dev::Dev, ()>>>,
+    /// The same on CUDA (`gpu_cuda::DflashDev`), its context made on the card.
+    #[cfg(feature = "cuda")]
+    cdev: std::sync::Mutex<Option<Result<crate::gpu_cuda::DflashDev, ()>>>,
 }
 
 fn vector(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
@@ -442,6 +448,8 @@ impl Drafter {
             fused: std::env::var("CMF_DFLASH_FUSED").as_deref() != Ok("0"),
             #[cfg(feature = "gpu")]
             dev: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            cdev: std::sync::Mutex::new(None),
             layers,
             model,
             g,
@@ -455,6 +463,10 @@ impl Drafter {
     /// first round (measured 480 ms there).
     #[cfg(feature = "gpu")]
     pub fn dev_ready(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            return self.cuda_ready();
+        }
         use crate::gpu_wgpu::dflash_dev::{Dev, LayerSpec, Spec};
         let mut slot = self.dev.lock().unwrap();
         if slot.is_none() {
@@ -533,6 +545,127 @@ impl Drafter {
             *slot = Some(built);
         }
         matches!(slot.as_ref(), Some(Ok(_)))
+    }
+
+    /// The CUDA block (`gpu_cuda::DflashDev`), built once the hybrid arm's
+    /// kernels are: the sidecar's matrices on the card and the context held
+    /// so far with them. `CMF_DFLASH_DEV=0` keeps the block on the host.
+    #[cfg(feature = "cuda")]
+    fn cuda_ready(&self) -> bool {
+        let mut slot = self.cdev.lock().unwrap();
+        if slot.is_none() {
+            if !self.device || std::env::var("CMF_DFLASH_DEV").as_deref() == Ok("0") {
+                *slot = Some(Err(()));
+            } else if !crate::gpu_cuda::hybrid_kernels_ready() {
+                // the trunk's first call builds them: ask again then
+                return false;
+            } else {
+                let t0 = std::time::Instant::now();
+                let built = self.cuda_build();
+                match built {
+                    Ok(mut dev) => {
+                        let (hd, kv) = (self.g.head_dim, self.g.kv_heads);
+                        for (li, c) in self.ctx.iter().enumerate() {
+                            let rows = c.k.first().map(|h| h.len() / hd).unwrap_or(0);
+                            if rows == 0 {
+                                continue;
+                            }
+                            let (mut k, mut v) = (vec![0f32; rows * kv * hd], vec![0f32; rows * kv * hd]);
+                            for r in 0..rows {
+                                for h in 0..kv {
+                                    k[(r * kv + h) * hd..][..hd].copy_from_slice(&c.k[h][r * hd..][..hd]);
+                                    v[(r * kv + h) * hd..][..hd].copy_from_slice(&c.v[h][r * hd..][..hd]);
+                                }
+                            }
+                            let _ = dev.push_rows(li, c.dropped, &k, &v);
+                        }
+                        tracing::info!("DFlash drafter: the block runs on the CUDA card (built in {:.1} s)", t0.elapsed().as_secs_f64());
+                        *slot = Some(Ok(dev));
+                    }
+                    Err(e) => {
+                        tracing::info!("DFlash drafter: the block stays on the host ({e})");
+                        *slot = Some(Err(()));
+                    }
+                }
+            }
+        }
+        matches!(slot.as_ref(), Some(Ok(_)))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_build(&self) -> Result<crate::gpu_cuda::DflashDev, String> {
+        use crate::gpu::{GraphPrismOp, GraphW};
+        fn gw(t: &QTensor) -> Result<GraphW<'_>, String> {
+            let (_, idx, kind, rs) = t.graph_weight().ok_or("a matrix without a graph weight")?;
+            Ok(GraphW { idx, kind, row_scale: rs, data: &[], prism: GraphPrismOp::None, affine: false })
+        }
+        // a matrix to f32 rows, the rows across the host's threads
+        fn dense(t: &QTensor) -> Vec<f32> {
+            let (rows, cols) = (t.rows(), t.cols());
+            let mut w = vec![0f32; rows * cols];
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
+            let per = rows.div_ceil(threads);
+            std::thread::scope(|sc| {
+                for (ci, chunk) in w.chunks_mut(per * cols).enumerate() {
+                    sc.spawn(move || {
+                        for (r, row) in chunk.chunks_exact_mut(cols).enumerate() {
+                            t.row_f32(ci * per + r, row);
+                        }
+                    });
+                }
+            });
+            w
+        }
+        let g = &self.g;
+        let layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                Ok(crate::gpu_cuda::DflashLayerIn {
+                    in_norm: &l.in_norm,
+                    post_norm: &l.post_norm,
+                    q_norm: &l.q_norm,
+                    k_norm: &l.k_norm,
+                    attn_base: &l.attn_conv.base,
+                    mlp_base: &l.mlp_conv.base,
+                    attn_proj: &l.attn_conv.proj.w,
+                    mlp_proj: &l.mlp_conv.proj.w,
+                    window: g.window_of(i),
+                    rotary: g.rotary(i),
+                    q: gw(&l.q)?,
+                    k: gw(&l.k)?,
+                    v: gw(&l.v)?,
+                    o: gw(&l.o)?,
+                    gate: gw(&l.gate)?,
+                    up: gw(&l.up)?,
+                    down: gw(&l.down)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let t0 = std::time::Instant::now();
+        let fc = dense(&self.fc);
+        tracing::debug!("DFlash drafter: fc to f32 in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        let spec = crate::gpu_cuda::DflashSpecIn {
+            hs: g.hidden,
+            ffn: g.intermediate,
+            hd: g.head_dim,
+            nh: g.heads,
+            kv: g.kv_heads,
+            kn: g.conv_kernel,
+            gs: g.conv_group,
+            block: g.block,
+            eps: g.eps as f32,
+            sel_rank: g.selector_rank,
+            tw: g.tap_width(),
+            layers,
+            norm: &self.norm,
+            hidden_norm: &self.hidden_norm,
+            inv_freq: &self.inv_freq,
+            fc: &fc,
+            sel: &self.sel.w,
+        };
+        crate::gpu_cuda::DflashDev::new(&self.model, &spec)
     }
 
     /// Every context row of `layer` the host holds, to the device.
@@ -719,8 +852,19 @@ impl Drafter {
             self.truncate(pos);
         }
         self.pending.extend_from_slice(taps);
-        while self.pending.len() > PENDING_ROWS * tw {
-            let rows: Vec<f32> = self.pending.drain(..CONTEXT_CHUNK * tw).collect();
+        // past the limit the oldest rows go through at once (in chunks of
+        // `CONTEXT_CHUNK` inside): one move of what stays, not one a chunk
+        let held = self.pending.len() / tw;
+        // CUDA: as many as the widest window reads wait (a text the chain
+        // keeps never pays for them; the first block settles them at once)
+        let limit = if crate::gpu::cuda_active() && (0..self.g.layers).all(|l| self.g.window_of(l) > 0) {
+            PENDING_ROWS.max((0..self.g.layers).map(|l| self.g.window_of(l)).max().unwrap_or(0) + BLOCK_SLACK)
+        } else {
+            PENDING_ROWS
+        };
+        if held > limit {
+            let over = (held - limit).next_multiple_of(CONTEXT_CHUNK).min(held);
+            let rows: Vec<f32> = self.pending.drain(..over * tw).collect();
             self.settle_rows(self.first + self.len, &rows, pool);
         }
     }
@@ -735,10 +879,38 @@ impl Drafter {
     }
 
     fn settle_rows(&mut self, pos: usize, taps: &[f32], pool: Option<&Pool>) {
+        let t_settle = std::time::Instant::now();
         let (hs, tw, hd, kv) = (self.g.hidden, self.g.tap_width(), self.g.head_dim, self.g.kv_heads);
         let eps = self.g.eps as f32;
-        for (ci, chunk) in taps.chunks(CONTEXT_CHUNK * tw).enumerate() {
-            let (n, at) = (chunk.len() / tw, pos + ci * CONTEXT_CHUNK);
+        // the CUDA block's context takes rows a quarter of a thousand at a time
+        #[cfg(feature = "cuda")]
+        let per = if crate::gpu::cuda_active() { crate::gpu_cuda::DFLASH_SETTLE_MAX } else { CONTEXT_CHUNK };
+        #[cfg(not(feature = "cuda"))]
+        let per = CONTEXT_CHUNK;
+        for (ci, chunk) in taps.chunks(per * tw).enumerate() {
+            let (n, at) = (chunk.len() / tw, pos + ci * per);
+            // CUDA: the rows made on the card, the host keeping a copy
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() && self.cuda_ready() {
+                let rows = match self.cdev.lock().unwrap().as_mut() {
+                    Some(Ok(dev)) => dev.settle(at - self.first, at, chunk, n).map_err(|e| tracing::warn!("DFlash context on the card: {e}")).ok(),
+                    _ => None,
+                };
+                if let Some(rows) = rows {
+                    for (li, (k, v)) in rows.into_iter().enumerate() {
+                        let c = &mut self.ctx[li];
+                        for r in 0..n {
+                            for h in 0..kv {
+                                let o = (r * kv + h) * hd;
+                                c.k[h].extend_from_slice(&k[o..o + hd]);
+                                c.v[h].extend_from_slice(&v[o..o + hd]);
+                            }
+                        }
+                    }
+                    self.len += n;
+                    continue;
+                }
+            }
             let mut t = self.mm(&self.fc, chunk, n, pool);
             rms(&mut t, &self.hidden_norm, eps);
             debug_assert_eq!(t.len(), n * hs);
@@ -772,6 +944,9 @@ impl Drafter {
                 }
             }
             self.len += n;
+        }
+        if std::env::var_os("CMF_DFLASH_TIME").is_some() {
+            eprintln!("dflash context: {} rows in {:.1} ms", taps.len() / tw, t_settle.elapsed().as_secs_f64() * 1e3);
         }
         // no row of a layer sees further back than its window: drop what fell out of it
         for (li, c) in self.ctx.iter_mut().enumerate() {
@@ -927,6 +1102,38 @@ impl Drafter {
         use crate::gpu_wgpu::dflash_dev::{CtxRange, kind_of};
         if k == 0 || k >= self.g.block || !self.dev_ready() {
             return None;
+        }
+        // CUDA: the head over its first rows (the drafts' shortlist,
+        // `CMF_DFLASH_VOCAB`, 65536 by default)
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            let (hmodel, hidx, hkind, hrs) = head.graph_weight()?;
+            let hgw = crate::gpu::GraphW { idx: hidx, kind: hkind, row_scale: hrs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            let width = std::env::var("CMF_DFLASH_VOCAB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(65536).clamp(self.g.selector_top, head.rows());
+            let g = &self.g;
+            let ranges: Vec<(usize, usize, usize)> = (0..self.layers.len())
+                .map(|li| {
+                    let (c, window) = (&self.ctx[li], g.window_of(li));
+                    let base = self.first + c.dropped;
+                    let hi = anchor_pos.min(self.first + self.len).max(base);
+                    let lo = if window > 0 { (anchor_pos + 1).saturating_sub(window).clamp(base, hi) } else { base };
+                    (lo - self.first, hi - lo, lo)
+                })
+                .collect();
+            let mut slot = self.cdev.lock().unwrap();
+            let Some(Ok(dev)) = slot.as_mut() else { return None };
+            return match dev.block(anchor_pos, h, &ranges, hmodel, &hgw, head.rows(), width, k) {
+                Ok(out) => {
+                    if stage_timed() {
+                        STAGE_US[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Some(out)
+                }
+                Err(e) => {
+                    tracing::warn!("DFlash block on the card: {e}");
+                    None
+                }
+            };
         }
         let (hmodel, hidx) = head.mapped_device_gemm()?;
         let kind = kind_of(hmodel, hidx)?;

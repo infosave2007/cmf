@@ -573,6 +573,8 @@ struct State {
     scratch: HashMap<&'static str, Buf>,
     attn: HashMap<(usize, usize), AttnFuncs>,
     kv_hint: usize,
+    /// The Qwen3.5-family hybrid arm's plans and recurrent states.
+    hyb: hyb::HState,
 }
 
 struct Ctx {
@@ -607,11 +609,67 @@ macro_rules! kargs {
 /// as whole-chunk GEMMs; declared after `kargs!`, which it uses.
 pub(crate) mod qwen4;
 
+/// The Qwen3.5-family hybrid (GDN + gated full attention) behind the graph
+/// contracts; declared after `kargs!`, which it uses.
+mod hyb;
+
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
-    let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("NVRTC: {e:?}"))?;
-    let text = CString::new(ptx.to_src()).map_err(|e| e.to_string())?;
+    // NVRTC takes seconds on a large module (the hybrid arm's: ~11 s on a
+    // 3090's host); its PTX is kept on disk by (source, defines, arch) and
+    // the driver's own cache keeps what it builds from that.
+    let cached = ptx_cache_path(src, &defs, arch);
+    let ptx = match cached.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(t) if t.contains(".entry") => t,
+        _ => {
+            let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("NVRTC: {e:?}"))?;
+            let t = ptx.to_src();
+            if let Some(p) = &cached {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let tmp = p.with_extension("tmp");
+                if std::fs::write(&tmp, &t).is_ok() {
+                    let _ = std::fs::rename(&tmp, p);
+                }
+            }
+            t
+        }
+    };
+    let text = CString::new(ptx).map_err(|e| e.to_string())?;
     unsafe { cu::module::load_data(text.as_ptr().cast()) }.map_err(derr)
+}
+
+/// Where a module's PTX is kept: `CMF_CUDA_CACHE` (a directory; `0` = no
+/// cache), else `$XDG_CACHE_HOME/cortiq/cuda` or `~/.cache/cortiq/cuda`.
+fn ptx_cache_path(src: &str, defs: &[String], arch: Option<&str>) -> Option<std::path::PathBuf> {
+    let dir = match std::env::var("CMF_CUDA_CACHE") {
+        Ok(v) if v == "0" => return None,
+        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+            base.join("cortiq").join("cuda")
+        }
+    };
+    // FNV-1a over everything the PTX depends on, and the crate version
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: &[u8]| {
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    eat(src.as_bytes());
+    for d in defs {
+        eat(d.as_bytes());
+    }
+    eat(arch.unwrap_or("").as_bytes());
+    eat(env!("CARGO_PKG_VERSION").as_bytes());
+    Some(dir.join(format!("{h:016x}.ptx")))
 }
 
 fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
@@ -813,6 +871,27 @@ impl Ctx {
             cu::launch_kernel(
                 f,
                 (grid.0.max(1), grid.1.max(1), 1),
+                (block, 1, 1),
+                shared as u32,
+                self.stream,
+                params,
+            )
+        }
+        .map_err(derr)
+    }
+
+    unsafe fn launch_3d(
+        &self,
+        f: cs::CUfunction,
+        grid: (u32, u32, u32),
+        block: u32,
+        shared: usize,
+        params: &mut [*mut c_void],
+    ) -> Res<()> {
+        unsafe {
+            cu::launch_kernel(
+                f,
+                (grid.0.max(1), grid.1.max(1), grid.2.max(1)),
                 (block, 1, 1),
                 shared as u32,
                 self.stream,
@@ -1740,6 +1819,12 @@ pub fn forward_token_graph(
     hidden_too: bool,
 ) -> TokenGraphOutcome {
     let Some(c) = ctx() else { return TokenGraphOutcome::Declined };
+    if hyb::wants(layers, nh, nkv, hd) {
+        return hyb::token(
+            c, model, kv_id, layers, o1, o1_epoch, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
+            lm_head, final_norm, logits, loop_norm_at, steps, layers_run, layer_base, hidden_too,
+        );
+    }
     let mut st = c.st.lock().unwrap();
     // A far-field state the card has moved has no host copy to return to
     // (the host's is the seal's): from there a refusal is a failure, not a
@@ -2050,12 +2135,19 @@ pub fn forward_batch_graph_at(
     attn_scale: f32,
     k: usize,
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
-    spec: bool,
+    spec: Option<crate::gpu::SpecTail<'_>>,
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
     let Some(c) = ctx() else { return BatchGraphOutcome::Declined };
+    if hyb::wants(layers, nh, nkv, hd) {
+        let defer = BATCH_DEFER.with(|d| d.get());
+        return hyb::batch(
+            c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
+            attn_scale, k, o1, spec, layers_run, defer,
+        );
+    }
     let b = k;
-    if spec || o1.iter().any(|v| v.is_some()) {
+    if spec.is_some() || o1.iter().any(|v| v.is_some()) {
         decline("batch", "a speculative verify tail or a sealed far field");
         return BatchGraphOutcome::Declined;
     }
@@ -2367,6 +2459,8 @@ pub fn kv_reset(kv_id: u64) {
     if c.current().is_err() || c.sync().is_err() {
         return;
     }
+    hyb::reset(c, &mut st, kv_id);
+    st.hyb.half.retain(|k| k.0 != kv_id);
     st.kv.retain(|&(id, _), m| {
         if id == kv_id {
             c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
@@ -2446,6 +2540,151 @@ fn qcap_read(layers: Vec<usize>, bufs: Vec<(usize, usize, Buf)>) -> Option<Vec<(
 }
 
 /// Rows a layer's mirror holds (absolute), None without a mirror.
+/// y [n][rows] = W x [n][cols] on the card (a q4tp graph weight of the
+/// hybrid arm): false when the backend cannot take it.
+pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize, x: &[f32], n: usize, y: &mut [f32]) -> bool {
+    match hyb::rows_matvec(model, gw, rows, cols, x, n, y) {
+        Ok(()) => true,
+        Err(e) => {
+            decline("rows matvec", &e);
+            false
+        }
+    }
+}
+
+thread_local! {
+    /// A DFlash drafter's taps (`layer_taps_arm`): the layers asked for, and
+    /// what the next graph call of this thread kept, `[slot][row][hidden]`.
+    static LAYER_TAPS: std::cell::RefCell<(Vec<usize>, Option<Vec<f32>>)> = const { std::cell::RefCell::new((Vec::new(), None)) };
+}
+
+/// Ask the next graph call of this thread to keep the residual stream after
+/// each of `layers` (absolute indices); an empty list disarms.
+pub fn layer_taps_arm(layers: &[usize]) {
+    LAYER_TAPS.with(|t| *t.borrow_mut() = (layers.to_vec(), None));
+}
+
+/// What the armed call kept; disarms. False when it kept nothing.
+pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
+    let (_, got) = LAYER_TAPS.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    match got {
+        Some(v) => {
+            *out = v;
+            true
+        }
+        None => false,
+    }
+}
+
+fn taps_wanted() -> Vec<usize> {
+    LAYER_TAPS.with(|t| t.borrow().0.clone())
+}
+
+fn taps_put(v: Vec<f32>) {
+    LAYER_TAPS.with(|t| t.borrow_mut().1 = Some(v));
+}
+
+thread_local! {
+    /// A greedy verify's row ids from the card (`verify_argmax_arm`):
+    /// None unarmed, Some(empty) armed, Some(ids) after the verify.
+    static VERIFY_IDS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Arm (or disarm) the next verify window of this thread to pick each row's
+/// argmax on the card and hand back the ids instead of the logits.
+pub fn verify_argmax_arm(on: bool) {
+    VERIFY_IDS.with(|v| *v.borrow_mut() = if on { Some(Vec::new()) } else { None });
+}
+
+fn verify_argmax_armed() -> bool {
+    VERIFY_IDS.with(|v| v.borrow().is_some())
+}
+
+fn verify_argmax_put(ids: Vec<u32>) {
+    VERIFY_IDS.with(|v| *v.borrow_mut() = Some(ids));
+}
+
+/// The ids the armed verify picked (None when it picked none); disarms.
+pub fn verify_argmax_take() -> Option<Vec<u32>> {
+    VERIFY_IDS.with(|v| v.borrow_mut().take()).filter(|ids| !ids.is_empty())
+}
+
+pub use hyb::dflash::{Dev as DflashDev, LayerIn as DflashLayerIn, SETTLE_MAX as DFLASH_SETTLE_MAX, SpecIn as DflashSpecIn};
+
+/// The hybrid arm's kernels are built (a trunk plan ran): what the DFlash
+/// block borrows.
+pub fn hybrid_kernels_ready() -> bool {
+    ctx().is_some_and(|c| hyb::kernels_ready(&c.st.lock().unwrap()))
+}
+
+/// The hybrid arm's MTP draft chain: `k` greedy drafts in one graph
+/// (`hyb::mtp_chain`). Err(false) declined, Err(true) failed after admission.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_chain(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: &GraphLayer,
+    invf: &[f32],
+    h0: &[f32],
+    e0: &[f32],
+    t0: u32,
+    k: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    attn_scale: f32,
+    rd: usize,
+    hidden: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    lm_head: (&GraphW, usize),
+    final_norm: &[f32],
+    eh: &GraphW,
+    enorm: &[f32],
+    hnorm: &[f32],
+    embed: &GraphW,
+    layer_base: usize,
+) -> Result<Vec<u32>, bool> {
+    let Some(c) = ctx() else { return Err(false) };
+    hyb::mtp_chain(
+        c, model, kv_id, layer, invf, h0, e0, t0, k, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps, lm_head,
+        final_norm, eh, enorm, hnorm, embed, layer_base,
+    )
+}
+
+/// After a partial speculative acceptance: the sequence's GDN states back to
+/// the verify window's start, the accepted rows `..= slot` replayed.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
+    hyb::spec_restore(kv_id, slot, base_pos, expected_layers)
+}
+
+/// Snapshot every GDN state of the sequence at prompt position `pos`.
+pub fn gdn_snapshot(kv_id: u64, pos: usize) -> bool {
+    hyb::gdn_snapshot(kv_id, pos)
+}
+
+/// Every GDN state of the sequence back to its snapshot at `pos`.
+pub fn gdn_snapshot_restore(kv_id: u64, pos: usize) -> bool {
+    hyb::gdn_snapshot_restore(kv_id, pos)
+}
+
+/// A recurrent state of this sequence's layer lives on the card.
+pub fn state_resident(kv_id: u64, layer: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let st = c.st.lock().unwrap();
+    hyb::state_resident(&st, kv_id, layer)
+}
+
+/// A GDN layer's state back to the host (`[ring | S]`).
+pub fn gdn_state_read(kv_id: u64, layer: usize) -> Option<Vec<f32>> {
+    let c = ctx()?;
+    let st = c.st.lock().unwrap();
+    c.current().ok()?;
+    hyb::gdn_state_read(c, &st, kv_id, layer)
+}
+
 pub fn kv_stored(kv_id: u64, layer: usize) -> Option<usize> {
     let c = ctx()?;
     c.st.lock().unwrap().kv.get(&(kv_id, layer)).map(|m| m.stored)
@@ -2459,6 +2698,9 @@ pub fn kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
             m.stored = stored;
             true
         }
+        // fewer rows than asked (an MTP mirror behind plain tokens): nothing
+        // to step back from, and the next call zero-fills up to its row
+        Some(m) if stored > m.stored => true,
         _ => false,
     }
 }
@@ -2478,20 +2720,39 @@ pub fn kv_pull_host(
     c.current().ok()?;
     let m = st.kv.get(&(kv_id, layer))?;
     let row = nkv * hd;
-    if m.row != row || to > m.stored || from > to {
+    // the hybrid arm keeps f16 rows (its mirror's `row` counts f32 slots)
+    let half = st.hyb.half.contains(&(kv_id, layer));
+    if m.row != if half { row / 2 } else { row } || to > m.stored || from > to {
         return None;
     }
     let first = from.max(m.base);
     let mut kb = vec![0f32; (to - from) * row];
     let mut vb = vec![0f32; (to - from) * row];
     if first < to {
-        let off = ((first - m.base) * row * 4) as u64;
         let dst = (first - from) * row;
-        unsafe {
-            cu::memcpy_dtoh_async(&mut kb[dst..], m.kptr() + off, c.stream).ok()?;
-            cu::memcpy_dtoh_async(&mut vb[dst..], m.vptr() + off, c.stream).ok()?;
+        if half {
+            let off = ((first - m.base) * row * 2) as u64;
+            let mut kh = vec![0u16; (to - first) * row];
+            let mut vh = vec![0u16; (to - first) * row];
+            unsafe {
+                cu::memcpy_dtoh_async(&mut kh, m.kptr() + off, c.stream).ok()?;
+                cu::memcpy_dtoh_async(&mut vh, m.vptr() + off, c.stream).ok()?;
+            }
+            c.sync().ok()?;
+            for (d, h) in kb[dst..].iter_mut().zip(&kh) {
+                *d = cortiq_core::quant::f16_to_f32(*h);
+            }
+            for (d, h) in vb[dst..].iter_mut().zip(&vh) {
+                *d = cortiq_core::quant::f16_to_f32(*h);
+            }
+        } else {
+            let off = ((first - m.base) * row * 4) as u64;
+            unsafe {
+                cu::memcpy_dtoh_async(&mut kb[dst..], m.kptr() + off, c.stream).ok()?;
+                cu::memcpy_dtoh_async(&mut vb[dst..], m.vptr() + off, c.stream).ok()?;
+            }
+            c.sync().ok()?;
         }
-        c.sync().ok()?;
     }
     Some((kb, vb, first.min(to)))
 }
@@ -2545,6 +2806,7 @@ pub fn perf_report() {
     if !prof_on() && !debug() {
         return;
     }
+    hyb::report();
     let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
     let toks = TOKENS.load(Ordering::Relaxed).saturating_sub(16);
     if toks > 0 {
