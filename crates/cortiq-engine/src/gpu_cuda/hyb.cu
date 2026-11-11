@@ -96,30 +96,6 @@ extern "C" __global__ void hy_rmsnorm(const float* __restrict__ x, const float* 
     }
 }
 
-// silu(g) * u of the rows [n][ld] (the first `cols` of each) into the
-// planes [n][pstride].
-extern "C" __global__ void hy_silu_mul(const float* __restrict__ g, const float* __restrict__ u, int ld, int cols,
-                                       int n, u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2,
-                                       int pstride)
-{
-    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (u64)n * cols) return;
-    const int j = (int)(i / cols), c = (int)(i - (u64)j * cols);
-    const float a = g[(size_t)j * ld + c];
-    put3(p0, p1, p2, (size_t)j * pstride + c, __fmul_rn(__fdiv_rn(a, __fadd_rn(1.0f, expf(-a))), u[(size_t)j * ld + c]));
-}
-
-// The FFN middle as the f16 operand of the down GEMM: silu(g) * u / 16.
-extern "C" __global__ void hy_silu_half(const float* __restrict__ g, const float* __restrict__ u,
-                                        u16* __restrict__ xh, u64 n)
-{
-    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const float a = g[i];
-        xh[i] = f2h_sat(__fmul_rn(__fdiv_rn(a, __fadd_rn(1.0f, expf(-a))), u[i]) * 0.0625f);
-    }
-}
-
 // f32 -> f16 over n values (saturating).
 extern "C" __global__ void hy_to_half(const float* __restrict__ x, u16* __restrict__ xh, u64 n)
 {
@@ -131,26 +107,6 @@ extern "C" __global__ void hy_to_half(const float* __restrict__ x, u16* __restri
 //
 // Rows are [token][...]. qkv [n][c_dim] the raw projections, cq the conv
 // output, ab [n][2 nv] (a then b), gb the gates, o [n][nv dv].
-
-// Causal depthwise conv + SiLU: rows before the call come from the ring
-// [(kk-1)][c_dim] (oldest first).
-extern "C" __global__ void hy_gdn_conv(const float* __restrict__ qkv, int qstride, const float* __restrict__ ring,
-                                       const float* __restrict__ taps, float* __restrict__ cq, int n, int c_dim,
-                                       int kk)
-{
-    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (u64)n * c_dim) return;
-    const int t = (int)(i / c_dim);
-    const int c = (int)(i - (u64)t * c_dim);
-    const float* tp = taps + (u64)c * kk;
-    double acc = (double)qkv[(u64)t * qstride + c] * (double)tp[kk - 1];
-    for (int j = 0; j < kk - 1; j++) {
-        const int src = t - (kk - 1 - j);
-        const float v = src >= 0 ? qkv[(u64)src * qstride + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
-        acc += (double)v * (double)tp[j];
-    }
-    cq[i] = (float)(acc / (1.0 + exp(-acc)));
-}
 
 // The ring after the first `n` rows of the call: the last kk-1 raw rows of
 // [ring, qkv]. In place, a thread a channel walking the slots oldest first
@@ -165,44 +121,6 @@ extern "C" __global__ void hy_gdn_ring(float* __restrict__ ring, const float* __
         const float v = src >= 0 ? qkv[(u64)src * qstride + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
         ring[(u64)j * c_dim + c] = v;
     }
-}
-
-// L2 norm of the q and k heads in place, a block per (token, head of 2 nk);
-// q heads also divided by sqrt(dk).
-extern "C" __global__ void hy_gdn_prep(float* __restrict__ cq, int c_dim, int nk, int dk)
-{
-    __shared__ double red[256];
-    const u64 t = blockIdx.x / (2 * nk);
-    const int g = (int)(blockIdx.x - t * (2 * nk));
-    float* xr = cq + t * c_dim + (u64)g * dk;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        const double v = xr[i];
-        ss += v * v;
-    }
-    red[threadIdx.x] = ss;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    const double nrm = sqrt(red[0] + 1e-6);
-    const float inv = (float)(1.0 / (g < nk ? nrm * sqrt((double)dk) : nrm));
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) xr[i] = __fmul_rn(xr[i], inv);
-}
-
-// gb[t][h] = exp(-exp(a_log) softplus(a + dt_bias)), gb[t][nv + h] = sigmoid(b).
-extern "C" __global__ void hy_gdn_gb(const float* __restrict__ ab, const float* __restrict__ a_log,
-                                     const float* __restrict__ dt_bias, float* __restrict__ gb, int n, int nv)
-{
-    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (u64)n * nv) return;
-    const u64 t = i / nv;
-    const int h = (int)(i - t * nv);
-    const double x = (double)ab[t * 2 * nv + h] + (double)dt_bias[h];
-    const double sp = x > 20.0 ? x : log1p(exp(x));
-    gb[t * 2 * nv + h] = (float)exp(-exp((double)a_log[h]) * sp);
-    gb[t * 2 * nv + nv + h] = (float)(1.0 / (1.0 + exp(-(double)ab[t * 2 * nv + nv + h])));
 }
 
 __device__ __forceinline__ float wsum(float v) {
@@ -258,40 +176,6 @@ extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float
     sp[dv] = s1;
     sp[2 * dv] = s2;
     sp[3 * dv] = s3;
-}
-
-// of [n][nv][dv] = rms(o) * norm * gate(z), a block per (token, head), f64;
-// gate = SiLU (Qwen3.5) or sigmoid (`sigmoid` set). f32 or f16 out.
-extern "C" __global__ void hy_gdn_out(const float* __restrict__ o, const float* __restrict__ z, int zstride,
-                                      const float* __restrict__ norm, void* __restrict__ of, int nv, int dv,
-                                      double eps, int sigmoid, int half, u16* __restrict__ p0, u16* __restrict__ p1,
-                                      u16* __restrict__ p2, int pstride)
-{
-    __shared__ double red[256];
-    const u64 b = blockIdx.x;
-    const u64 t = b / nv;
-    const int hh = (int)(b - t * nv);
-    const float* xr = o + b * dv;
-    const float* zr = z + t * zstride + (u64)hh * dv;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dv; i += blockDim.x) {
-        const double v = xr[i];
-        ss += v * v;
-    }
-    red[threadIdx.x] = ss;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    const double inv = 1.0 / sqrt(red[0] / (double)dv + eps);
-    for (int i = threadIdx.x; i < dv; i += blockDim.x) {
-        const double zz = (double)zr[i];
-        const double gate = sigmoid ? 1.0 / (1.0 + exp(-zz)) : zz / (1.0 + exp(-zz));
-        const float v = (float)(((double)xr[i] * inv) * (double)norm[i] * gate);
-        if (p0) put3(p0, p1, p2, t * pstride + (u64)hh * dv + i, v);
-        else stf(of, b * dv + i, v, half);
-    }
 }
 
 // ------------------------------------------------------------- attention
@@ -544,45 +428,6 @@ extern "C" __global__ void hy_attn_out(const float* __restrict__ aog, const floa
     float v = aog[(((size_t)g * B + b) * HPK + j) * HD + d] * f;
     if (gate) v *= sigm(gate[i]);
     stf(ao, i, v, half);
-}
-
-// Greedy pick of every row of logits [B][rows]: the first maximum.
-extern "C" __global__ void hy_argmax(const float* __restrict__ lg, int rows, int* __restrict__ out)
-{
-    __shared__ float bv[32];
-    __shared__ int bi[32];
-    const float* r = lg + (size_t)blockIdx.x * rows;
-    float m = -INF;
-    int mi = 0x7fffffff;
-    for (int i = threadIdx.x; i < rows; i += blockDim.x) {
-        const float v = r[i];
-        if (v > m || (v == m && i < mi)) {
-            m = v;
-            mi = i;
-        }
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor_sync(FULL, m, o);
-        const int oi = __shfl_xor_sync(FULL, mi, o);
-        if (ov > m || (ov == m && oi < mi)) {
-            m = ov;
-            mi = oi;
-        }
-    }
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (lane == 0) {
-        bv[warp] = m;
-        bi[warp] = mi;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int w = 1; w < (int)(blockDim.x >> 5); w++)
-            if (bv[w] > m || (bv[w] == m && bi[w] < mi)) {
-                m = bv[w];
-                mi = bi[w];
-            }
-        out[blockIdx.x] = mi;
-    }
 }
 
 // ------------------------------------------------- tensor-core small path
@@ -955,45 +800,6 @@ extern "C" __global__ void hy_rmsnorm2(const float* __restrict__ x, const float*
         const float v = __fmul_rn(__fmul_rn(xr[i], inv), gemma ? 1.0f + w[i] : w[i]);
         if (out) out[(size_t)j * n + i] = v;
         if (p0) put3(p0, p1, p2, (size_t)j * pstride + i, v);
-    }
-}
-
-// f32 matrices of few rows (the GDN gates): a block a row of a job, its
-// threads over the columns, the window's rows j < nrows in registers, the
-// block's partial sums added in a fixed order. y_j[r] = W[r] . x_j.
-extern "C" __global__ void hy_mv32(const HyJob* __restrict__ jobs, int njobs, const float* __restrict__ x,
-                                   int xstride, int nrows, int cols)
-{
-    __shared__ float red[8][16];
-    int jx = 0;
-    while (jx + 1 < njobs && (int)blockIdx.x >= jobs[jx + 1].blk0) jx++;
-    const HyJob jb = jobs[jx];
-    const int r = (int)blockIdx.x - jb.blk0;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const float* W = (const float*)jb.w + (size_t)r * cols;
-    float acc[16];
-#pragma unroll
-    for (int j = 0; j < 16; j++) acc[j] = 0.0f;
-    for (int c = tid; c < cols; c += blockDim.x) {
-        const float wv = W[c];
-#pragma unroll
-        for (int j = 0; j < 16; j++)
-            if (j < nrows) acc[j] = fmaf(wv, x[(size_t)j * xstride + c], acc[j]);
-    }
-#pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (j >= nrows) break;
-        float v = acc[j];
-        for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(FULL, v, o));
-        if (lane == 0) red[warp][j] = v;
-    }
-    __syncthreads();
-    if (tid < nrows) {
-        float v = 0.0f;
-        for (int w = 0; w < (int)(blockDim.x >> 5); w++) v = __fadd_rn(v, red[w][tid]);
-        float* y = (float*)jb.y;
-        const size_t at = (size_t)tid * jb.ystride + r;
-        y[at] = jb.res ? __fadd_rn(((const float*)jb.res)[at], v) : v;
     }
 }
 

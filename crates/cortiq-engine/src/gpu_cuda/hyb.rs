@@ -129,19 +129,12 @@ pub(super) struct HFuncs {
     split: cs::CUfunction,
     expand_p: cs::CUfunction,
     rmsnorm: cs::CUfunction,
-    silu_mul: cs::CUfunction,
-    silu_half: cs::CUfunction,
     to_half: cs::CUfunction,
-    conv: cs::CUfunction,
     ring: cs::CUfunction,
-    prep: cs::CUfunction,
-    gb: cs::CUfunction,
     scan: cs::CUfunction,
-    out: cs::CUfunction,
     front: cs::CUfunction,
     out32: cs::CUfunction,
     rmsnorm2: cs::CUfunction,
-    mv32: cs::CUfunction,
     conv32: cs::CUfunction,
     prep32: cs::CUfunction,
     gb32: cs::CUfunction,
@@ -154,8 +147,6 @@ pub(super) struct HFuncs {
     values: cs::CUfunction,
     finish: cs::CUfunction,
     attn_out: cs::CUfunction,
-    #[allow(dead_code)]
-    argmax: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -178,19 +169,12 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         split: func(module, "hy_split")?,
         expand_p: func(module, "hy_expand_p")?,
         rmsnorm: func(module, "hy_rmsnorm")?,
-        silu_mul: func(module, "hy_silu_mul")?,
-        silu_half: func(module, "hy_silu_half")?,
         to_half: func(module, "hy_to_half")?,
-        conv: func(module, "hy_gdn_conv")?,
         ring: func(module, "hy_gdn_ring")?,
-        prep: func(module, "hy_gdn_prep")?,
-        gb: func(module, "hy_gdn_gb")?,
         scan: func(module, "hy_gdn_scan")?,
-        out: func(module, "hy_gdn_out")?,
         front: func(module, "hy_gdn_front")?,
         out32: func(module, "hy_gdn_out32")?,
         rmsnorm2: func(module, "hy_rmsnorm2")?,
-        mv32: func(module, "hy_mv32")?,
         conv32: func(module, "hy_gdn_conv32")?,
         prep32: func(module, "hy_gdn_prep32")?,
         gb32: func(module, "hy_gdn_gb32")?,
@@ -203,7 +187,6 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         values: func(module, "hy_values")?,
         finish: func(module, "hy_finish")?,
         attn_out: func(module, "hy_attn_out")?,
-        argmax: func(module, "hy_argmax")?,
     })
 }
 
@@ -275,33 +258,6 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 16384, tb1: max_rows <= 2048 })
 }
 
-/// f32 matrices of few rows for `hy_mv32`: a block a row.
-struct F32Set {
-    buf: Buf,
-    blocks: u32,
-    n: i32,
-}
-
-fn f32set(list: &[JobSpec]) -> Res<F32Set> {
-    let mut jobs = Vec::with_capacity(list.len());
-    let mut blk = 0u32;
-    for &(m, y, res, ystride, rows) in list {
-        if m.kind != 4 {
-            return Err("an f32 job over a quantized matrix".into());
-        }
-        jobs.push(HyJob { w: m.w.ptr, aux0: 0, aux1: 0, y, res, rows: rows as i32, kind: 4, blk0: blk as i32, ystride: ystride as i32 });
-        blk += rows as u32;
-    }
-    Ok(F32Set { buf: Buf::from_slice(&jobs)?, blocks: blk, n: list.len() as i32 })
-}
-
-impl F32Set {
-    unsafe fn run(&self, c: &Ctx, fx: &HFuncs, x: u64, xstride: usize, cols: usize, n: usize) -> Res<()> {
-        let (nj, xs_i, n_i, cols_i) = (self.n, xstride as i32, n as i32, cols as i32);
-        unsafe { c.launch(fx.mv32, (self.blocks, 1), 256, 0, kargs!(self.buf.ptr, nj, x, xs_i, n_i, cols_i)) }
-    }
-}
-
 /// The row planes a tensor-core launch reads: two bf16 parts of each f32
 /// (`put3` in hyb.cu), `stride` elements a row.
 #[derive(Clone, Copy)]
@@ -340,10 +296,12 @@ unsafe fn split(c: &Ctx, fx: &HFuncs, p: &Planes, x: u64, xstride: usize, cols: 
     unsafe { c.launch(fx.split, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x, xs_i, cols_i, p.p0, p.p1, p.p2, os_i, n_i)) }
 }
 
-/// A q4tp tensor in the tensor-core layout (see `hyb.cu`): the nibbles as
+/// A q4tp tensor in the tensor-core layout (see `hyb.cu`), on the host: the
+/// reference `hy_repack` is tested against. The nibbles as
 /// [tile][group][lane] pairs of words, the codes [tile][group][16 rows], each
 /// row's ladder as its two numbers (lo, step). Rows are padded to a multiple
 /// of 16 with zero weights.
+#[cfg(test)]
 fn repack_q4tp(bytes: &[u8], rows: usize, cols: usize) -> Res<(Vec<u32>, Vec<u8>, Vec<f32>)> {
     repack_rows(&[(bytes, rows)], rows, cols, &|r| (0, r))
 }
@@ -351,6 +309,7 @@ fn repack_q4tp(bytes: &[u8], rows: usize, cols: usize) -> Res<(Vec<u32>, Vec<u8>
 /// `repack_q4tp` over rows drawn from several q4tp payloads of one width:
 /// logical row r is row `map(r).1` of payload `srcs[map(r).0]` (a payload
 /// and its row count).
+#[cfg(test)]
 fn repack_rows(srcs: &[(&[u8], usize)], rows: usize, cols: usize, map: &(dyn Fn(usize) -> (usize, usize) + Sync)) -> Res<(Vec<u32>, Vec<u8>, Vec<f32>)> {
     use cortiq_core::quant::{GROUP_SIZE, f16_to_f32, q4tp_code, q4tp_sections};
     if cols % GROUP_SIZE != 0 {
@@ -601,9 +560,8 @@ struct GdnL {
     dv: usize,
     kk: usize,
     cdim: usize,
-    /// qkv and z (tensor cores), a and b (f32: a block a row).
+    /// qkv and z (tensor cores); a and b run in the front kernel.
     ms_in: MmaSet,
-    js_ab: F32Set,
     ms_out: MmaSet,
 }
 
@@ -668,11 +626,8 @@ pub(super) struct HPlan {
     gate: Buf,
     #[allow(dead_code)]
     ao: Buf,
-    gg: Buf,
-    uu: Buf,
     qkv: Buf,
     z: Buf,
-    ab: Buf,
     o: Buf,
     of: Buf,
     logits: Buf,
@@ -689,7 +644,6 @@ pub(super) struct HPlan {
     cdmax: usize,
     vdmax: usize,
     nvmax: usize,
-    intermax: usize,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -904,11 +858,8 @@ fn build(
     let qg = f4(NMAX * nh * hd)?;
     let gate = f4(NMAX * nh * hd)?;
     let ao = f4(NMAX * nh * hd)?;
-    let gg = f4(NMAX * intermax)?;
-    let uu = f4(NMAX * intermax)?;
     let qkv = f4(NMAX * cdmax)?;
     let z = f4(NMAX * vdmax)?;
-    let ab = f4(NMAX * 2 * nvmax)?;
     let o = f4(NMAX * vdmax)?;
     let of = f4(NMAX * vdmax)?;
     let tab = f4(NMAX * half * 2)?;
@@ -956,7 +907,6 @@ fn build(
                 let a_h = half_of(&am)?;
                 let b_h = half_of(&bm)?;
                 let ms_in = mmaset(&[(&qm, qkv.ptr, 0, cdmax, cdim), (&zm, z.ptr, 0, vdmax, nv * dv)])?;
-                let js_ab = f32set(&[(&am, ab.ptr, 0, 2 * nvmax, nv), (&bm, ab.ptr + (nv * 4) as u64, 0, 2 * nvmax, nv)])?;
                 let ms_out = mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?;
                 Mix::Gdn(GdnL {
                     qkv: qm,
@@ -977,7 +927,6 @@ fn build(
                     kk,
                     cdim,
                     ms_in,
-                    js_ab,
                     ms_out,
                 })
             }
@@ -1063,11 +1012,8 @@ fn build(
         qg,
         gate,
         ao,
-        gg,
-        uu,
         qkv,
         z,
-        ab,
         o,
         of,
         logits,
@@ -1080,7 +1026,6 @@ fn build(
         cdmax,
         vdmax,
         nvmax,
-        intermax,
     })
 }
 
@@ -1275,8 +1220,6 @@ struct Book {
     ci: Vec<i32>,
     /// The attention scratch (S, Mx, P, E).
     scratch: [u64; 4],
-    /// Largest key count of the call (the grid of the attention kernels).
-    keys: usize,
 }
 
 /// Rows a key block of the decode attention takes for `keys` keys (64 up to
@@ -1337,7 +1280,7 @@ fn book(
         st.scr(c, "hy_P", NMAX * nbc * nh * hd * 4)?,
         st.scr(c, "hy_E", NMAX * nbc * nh * 4)?,
     ];
-    Ok(Book { layers, ci, scratch, keys: keys_max })
+    Ok(Book { layers, ci, scratch })
 }
 
 /// The small path's launches over the rows in `plan.h` (`n <= NMAX`), as
@@ -2177,4 +2120,64 @@ pub(super) fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols:
         done += k;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// A q4tp payload of random nibbles, codes and row params.
+    fn payload(rows: usize, cols: usize, seed: &mut u64) -> Vec<u8> {
+        let (_, codes_off, stride) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut b: Vec<u8> = (0..codes_off + rows * stride).map(|_| lcg(seed) as u8).collect();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        for r in 0..rows {
+            // finite params: f16 lo in [-12, -4], step in [0, 0.25]
+            let lo = cortiq_core::quant::f32_to_f16(-12.0 + 8.0 * (lcg(seed) % 1000) as f32 / 1000.0);
+            let st = cortiq_core::quant::f32_to_f16(0.25 * (lcg(seed) % 1000) as f32 / 1000.0);
+            b[params_off + r * 4..params_off + r * 4 + 2].copy_from_slice(&lo.to_le_bytes());
+            b[params_off + r * 4 + 2..params_off + r * 4 + 4].copy_from_slice(&st.to_le_bytes());
+        }
+        b
+    }
+
+    fn down<T: Copy + Default>(c: &Ctx, b: &Buf, n: usize) -> Vec<T> {
+        let mut v = vec![T::default(); n];
+        unsafe { cu::memcpy_dtoh_sync(&mut v, b.ptr) }.unwrap();
+        let _ = c;
+        v
+    }
+
+    /// The card's repack (one matrix and a gate/up pair) is the host's,
+    /// word for word: the layout the tensor-core kernels read.
+    #[test]
+    fn card_repack_matches_the_host_repack() {
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 7u64;
+        for (rows, cols) in [(48usize, 96usize), (40, 64)] {
+            let a = payload(rows, cols, &mut seed);
+            let (hn, hc, hl) = repack_q4tp(&a, rows, cols).unwrap();
+            let (dn, dc, dl) = repack_on_card(c, &fx, &[&a], rows, rows, cols).unwrap();
+            assert_eq!(down::<u32>(c, &dn, hn.len()), hn, "nibbles {rows}x{cols}");
+            assert_eq!(down::<u8>(c, &dc, hc.len()), hc, "codes {rows}x{cols}");
+            assert_eq!(down::<f32>(c, &dl, hl.len()), hl, "params {rows}x{cols}");
+        }
+        let (inter, cols) = (24usize, 64usize);
+        let g = payload(inter, cols, &mut seed);
+        let u = payload(inter, cols, &mut seed);
+        let map = |r: usize| (((r & 15) >= 8) as usize, (r >> 4) * 8 + (r & 7));
+        let (hn, hc, hl) = repack_rows(&[(&g, inter), (&u, inter)], 2 * inter, cols, &map).unwrap();
+        let (dn, dc, dl) = repack_on_card(c, &fx, &[&g, &u], inter, 2 * inter, cols).unwrap();
+        assert_eq!(down::<u32>(c, &dn, hn.len()), hn, "pair nibbles");
+        assert_eq!(down::<u8>(c, &dc, hc.len()), hc, "pair codes");
+        assert_eq!(down::<f32>(c, &dl, hl.len()), hl, "pair params");
+    }
 }
