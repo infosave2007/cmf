@@ -1797,9 +1797,8 @@ async fn chat_completions(
     // generation prompt ends in `<think>`) leaves the reply holding only
     // the closing tag. The opener is put back, so the reply has the same
     // `<think>…</think>answer` shape as the other thinking models.
-    let think_opened = !dsv41
-        && req.thinking() != Some(false)
-        && prompt_ends_in_think(&state.tokenizer, &prompt_ids);
+    let think_prefilled = prompt_ends_in_think(&state.tokenizer, &prompt_ids);
+    let think_opened = !dsv41 && req.thinking() != Some(false) && think_prefilled;
 
     if let Some(class_tokens) = req
         .cortiq
@@ -2013,7 +2012,14 @@ async fn chat_completions(
                     }
                     return true;
                 }
-                if filter_buf.len() > 100 && !filter_buf.contains("<think>") {
+                // A reply that cannot be opening a reasoning block goes out
+                // with its first token: held for 100 characters it reached
+                // the client as one late chunk (28 tokens behind the model).
+                // A prompt that ends inside an opened block keeps the wait:
+                // its reply holds the reasoning without an opener.
+                if (filter_buf.len() > 100 && !filter_buf.contains("<think>"))
+                    || (!think_prefilled && !may_open_think(&filter_buf))
+                {
                     let b = std::mem::take(&mut *filter_buf);
                     filter_passthrough = true;
                     return emit(&b);
@@ -2411,6 +2417,13 @@ fn prompt_ends_in_think(tok: &cortiq_engine::tokenizer::Tokenizer, ids: &[u32]) 
     tok.decode_for_protocol(tail).trim_end().ends_with("<think>")
 }
 
+/// Whether the first text of a reply can still turn out to be an opening
+/// `<think>` tag: nothing but whitespace yet, a prefix of the tag, or the tag.
+fn may_open_think(buf: &str) -> bool {
+    let t = buf.trim_start();
+    t.is_empty() || "<think>".starts_with(t) || t.starts_with("<think>")
+}
+
 fn strip_think_block(s: &str) -> String {
     let mut rest = s;
     if let Some(pos) = rest.find("</think>") {
@@ -2627,6 +2640,16 @@ fn effective_max_tokens(state: &AppState, requested: Option<u32>) -> u32 {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn first_text_is_held_only_while_it_can_open_a_think_block() {
+        for held in ["", "\n", "<", "<thi", "\n<think>", "<think>\nplan"] {
+            assert!(may_open_think(held), "{held:?}");
+        }
+        for free in ["Here", "\n```python", "<tool_call>", "</think>"] {
+            assert!(!may_open_think(free), "{free:?}");
+        }
+    }
 
     #[test]
     fn minimax_m3_requires_a_native_template() {

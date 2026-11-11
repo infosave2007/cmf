@@ -3361,6 +3361,7 @@ mod coop_gemm_shader_tests {
         validate(super::COOP_MM_V2_SRC, "q4tp-mm-coop-v2");
         validate(super::COOP_MM_F16_SRC, "q4tp-mm-f16");
         validate(&super::coop_q82_src(), "q82-mm-coop");
+        validate(super::COOP_Q82_V2_SRC, "q82-mm-coop-v2");
     }
 }
 
@@ -20162,6 +20163,9 @@ pub struct Ctx {
     /// int8 GEMM held ~5 TFLOP/s on an RTX PRO 6000 (a 65B at 43 tok/s of
     /// prompt, 92 s to the first token of 4000). `CMF_Q82_COOP=0` keeps it.
     q82_mm_coop_s: Option<wgpu::ComputePipeline>,
+    /// `COOP_Q82_V2_SRC`: its pipelined twin (one barrier a K step, all of
+    /// a step's reads issued together), the frame GEMMs' kernel.
+    q82_mm_coop_v2_s: Option<wgpu::ComputePipeline>,
     /// `COOP_MM_SRC` with a 128-row M tile (`coop128_src`): eight 32-lane
     /// subgroups, so every weight tile of a 128-row prefill chunk is
     /// unpacked once instead of once per 64-row half. NVIDIA only (the
@@ -20429,6 +20433,8 @@ pub struct Ctx {
     fp8_act_pipe: std::sync::OnceLock<Option<fp8_act::Pipe>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
     gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
+    /// The verify window's snapshotting GDN scan (`dense_mv::gdn_scan_w`).
+    gdn_scan_w_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, usize)>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -22659,6 +22665,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
         && std::env::var("CMF_Q82_COOP").as_deref() != Ok("0"))
         .then(|| mk_coop(&coop_q82_src(), "q82-coop-s", "q82_mm_coop_s"))
         .flatten();
+    let q82_mm_coop_v2_s = (q82_mm_coop_s.is_some())
+        .then(|| mk_coop(COOP_Q82_V2_SRC, "q82-coop-v2-s", "q82_mm_coop_v2_s"))
+        .flatten();
     let nvidia = adapter_info.vendor == 0x10de;
     let q4tp_mm_coop128_s = (q4tp_mm_coop.is_some()
         && nvidia
@@ -23573,6 +23582,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop_s,
         q4tp_mm_coop_v2_s,
         q82_mm_coop_s,
+        q82_mm_coop_v2_s,
         q4tp_mm_coop128_s,
         batch_coop_default,
         ffn_silu_packed,
@@ -23733,6 +23743,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         mxfp4_global_s16: std::sync::OnceLock::new(),
         fp8_act_pipe: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
+        gdn_scan_w_pipe: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -50740,6 +50751,208 @@ fn q4tp_mm_coop_v2_s(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// `COOP_MM_V2_SRC` over a q8_2f weight: the pipelined, double-buffered
+/// tile GEMM with a thread owning one row x 16 columns of a K slab, its
+/// seventeen global reads of a step (four vec4 of activations, four int8
+/// words, the sixteen column scales in eight or nine words) issued
+/// together and before the previous step's matrix ops, the row scale read
+/// once per launch. `coop_q82_src` stages a slab in eight separate
+/// four-column slots a thread, each waiting on its own loads, between two
+/// barriers: a 256-token frame's launches took ~2.3 us a K step whatever
+/// their workgroup count, i.e. the K walk of ONE workgroup was the launch.
+/// Operands are that kernel's to the bit (f16(x * ainv),
+/// f16(q * cscale * rscale)), same tile walk, same f32 accumulate.
+/// `cols % 32 == 0`; device activation scale. Entry `q82_mm_coop_v2_s`.
+const COOP_Q82_V2_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> qmm: array<u32>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+@group(0) @binding(4) var<storage, read> qmm_s: array<f32>;
+
+const KS: u32 = 32u;
+const AST: u32 = 64u * 32u;
+var<workgroup> v2_a: array<f16, 2u * 64u * 32u>;
+var<workgroup> v2_b: array<f16, 2u * 64u * 32u>;
+var<workgroup> v2_c: array<f32, 64u * 64u>;
+
+fn mm_tile(wid: vec3<u32>, nwg: vec3<u32>) -> vec2<u32> {
+    let nt = nwg.x;
+    let mt = (pmm.nb + 63u) / 64u;
+    let g = min(mt, 8u);
+    let lin = wid.y * nt + wid.x;
+    let ng = (mt + g - 1u) / g;
+    let mg = min(lin / (nt * g), ng - 1u);
+    let rem = lin - mg * nt * g;
+    let gs = min(g, mt - mg * g);
+    let n_tile = rem / gs;
+    let m_tile = mg * g + rem % gs;
+    return vec2<u32>(m_tile * 64u, n_tile * 64u);
+}
+
+// One thread's share of a K step: 16 activations of its row (four vec4),
+// the 16 int8 weights of its weight row (four words) and the 16 column
+// scales (f16 pairs: eight words, nine when the plane starts on an odd
+// half).
+struct Stage {
+    a0: vec4<f32>, a1: vec4<f32>, a2: vec4<f32>, a3: vec4<f32>,
+    w0: u32, w1: u32, w2: u32, w3: u32,
+    s0: u32, s1: u32, s2: u32, s3: u32, s4: u32, s5: u32, s6: u32, s7: u32, s8: u32,
+};
+
+fn fetch(kk: u32, abase4: u32, alive: bool, wbase4: u32, cbase: u32, odd: bool, wlive: bool) -> Stage {
+    var s: Stage;
+    s.a0 = vec4<f32>(0.0); s.a1 = vec4<f32>(0.0); s.a2 = vec4<f32>(0.0); s.a3 = vec4<f32>(0.0);
+    s.w0 = 0u; s.w1 = 0u; s.w2 = 0u; s.w3 = 0u;
+    s.s0 = 0u; s.s1 = 0u; s.s2 = 0u; s.s3 = 0u; s.s4 = 0u; s.s5 = 0u; s.s6 = 0u; s.s7 = 0u; s.s8 = 0u;
+    if (alive) {
+        let i = abase4 + (kk >> 2u);
+        s.a0 = xmm[i]; s.a1 = xmm[i + 1u]; s.a2 = xmm[i + 2u]; s.a3 = xmm[i + 3u];
+    }
+    if (wlive) {
+        let wi = wbase4 + (kk >> 2u);
+        s.w0 = qmm[wi]; s.w1 = qmm[wi + 1u]; s.w2 = qmm[wi + 2u]; s.w3 = qmm[wi + 3u];
+        let ci = cbase + (kk >> 1u);
+        s.s0 = qmm[ci]; s.s1 = qmm[ci + 1u]; s.s2 = qmm[ci + 2u]; s.s3 = qmm[ci + 3u];
+        s.s4 = qmm[ci + 4u]; s.s5 = qmm[ci + 5u]; s.s6 = qmm[ci + 6u]; s.s7 = qmm[ci + 7u];
+        if (odd) { s.s8 = qmm[ci + 8u]; }
+    }
+    return s;
+}
+
+fn q8x4(w: u32) -> vec4<f32> {
+    let sw = i32(w);
+    return vec4<f32>(f32((sw << 24u) >> 24u), f32((sw << 16u) >> 24u),
+                     f32((sw << 8u) >> 24u), f32(sw >> 24u));
+}
+
+fn put(s: Stage, d: u32, ainv: f32, rsc: f32, odd: bool) {
+    v2_a[d] = f16(s.a0.x * ainv); v2_a[d + 1u] = f16(s.a0.y * ainv);
+    v2_a[d + 2u] = f16(s.a0.z * ainv); v2_a[d + 3u] = f16(s.a0.w * ainv);
+    v2_a[d + 4u] = f16(s.a1.x * ainv); v2_a[d + 5u] = f16(s.a1.y * ainv);
+    v2_a[d + 6u] = f16(s.a1.z * ainv); v2_a[d + 7u] = f16(s.a1.w * ainv);
+    v2_a[d + 8u] = f16(s.a2.x * ainv); v2_a[d + 9u] = f16(s.a2.y * ainv);
+    v2_a[d + 10u] = f16(s.a2.z * ainv); v2_a[d + 11u] = f16(s.a2.w * ainv);
+    v2_a[d + 12u] = f16(s.a3.x * ainv); v2_a[d + 13u] = f16(s.a3.y * ainv);
+    v2_a[d + 14u] = f16(s.a3.z * ainv); v2_a[d + 15u] = f16(s.a3.w * ainv);
+    let p0 = unpack2x16float(s.s0); let p1 = unpack2x16float(s.s1);
+    let p2 = unpack2x16float(s.s2); let p3 = unpack2x16float(s.s3);
+    let p4 = unpack2x16float(s.s4); let p5 = unpack2x16float(s.s5);
+    let p6 = unpack2x16float(s.s6); let p7 = unpack2x16float(s.s7);
+    var e0 = vec4<f32>(p0.x, p0.y, p1.x, p1.y);
+    var e1 = vec4<f32>(p2.x, p2.y, p3.x, p3.y);
+    var e2 = vec4<f32>(p4.x, p4.y, p5.x, p5.y);
+    var e3 = vec4<f32>(p6.x, p6.y, p7.x, p7.y);
+    if (odd) {
+        let p8 = unpack2x16float(s.s8);
+        e0 = vec4<f32>(p0.y, p1.x, p1.y, p2.x);
+        e1 = vec4<f32>(p2.y, p3.x, p3.y, p4.x);
+        e2 = vec4<f32>(p4.y, p5.x, p5.y, p6.x);
+        e3 = vec4<f32>(p6.y, p7.x, p7.y, p8.x);
+    }
+    let b0 = q8x4(s.w0) * e0 * rsc;
+    let b1 = q8x4(s.w1) * e1 * rsc;
+    let b2 = q8x4(s.w2) * e2 * rsc;
+    let b3 = q8x4(s.w3) * e3 * rsc;
+    v2_b[d] = f16(b0.x); v2_b[d + 1u] = f16(b0.y); v2_b[d + 2u] = f16(b0.z); v2_b[d + 3u] = f16(b0.w);
+    v2_b[d + 4u] = f16(b1.x); v2_b[d + 5u] = f16(b1.y); v2_b[d + 6u] = f16(b1.z); v2_b[d + 7u] = f16(b1.w);
+    v2_b[d + 8u] = f16(b2.x); v2_b[d + 9u] = f16(b2.y); v2_b[d + 10u] = f16(b2.z); v2_b[d + 11u] = f16(b2.w);
+    v2_b[d + 12u] = f16(b3.x); v2_b[d + 13u] = f16(b3.y); v2_b[d + 14u] = f16(b3.z); v2_b[d + 15u] = f16(b3.w);
+}
+
+@compute @workgroup_size(128)
+fn q82_mm_coop_v2_s(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>,
+                    @builtin(local_invocation_index) tid: u32,
+                    @builtin(subgroup_id) sg: u32) {
+    let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc, asc > 0.0);
+    let aback = select(1.0, 1.0 / asc, asc > 0.0);
+    let cols = pmm.cols4 * 4u;
+    let mn = mm_tile(wid, nwg);
+    let m0 = mn.x;
+    let n0 = mn.y;
+    let qbytes = pmm.rows * cols;
+    let hbase = (qbytes >> 1u) + pmm.rows;
+    let odd = (hbase & 1u) == 1u;
+    let cbase = hbase >> 1u;
+
+    let r = tid >> 1u;
+    let hk = (tid & 1u) * 16u;
+    let arow = m0 + r;
+    let alive = arow < pmm.nb;
+    let abase4 = (arow * cols) >> 2u;
+    let wrow = n0 + r;
+    let wlive = wrow < pmm.rows;
+    let wr = min(wrow, pmm.rows - 1u);
+    let rw = unpack2x16float(qmm[(qbytes >> 2u) + (wr >> 1u)]);
+    let rsc = select(rw.x, rw.y, (wr & 1u) == 1u);
+    let wbase4 = (wr * cols) >> 2u;
+    let soff = r * KS + hk;
+
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    put(fetch(hk, abase4, alive, wbase4, cbase, odd, wlive), soff, ainv, rsc, odd);
+    workgroupBarrier();
+
+    var k0 = 0u;
+    var buf = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        let kn = k0 + KS;
+        let more = kn < cols;
+        var nx: Stage;
+        if (more) { nx = fetch(kn + hk, abase4, alive, wbase4, cbase, odd, wlive); }
+        let ab = buf * AST;
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&v2_a[ab + sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 512u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1024u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1536u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&v2_a[ab + sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&v2_b[ab + 1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        if (more) { put(nx, (buf ^ 1u) * AST + soff, ainv, rsc, odd); }
+        workgroupBarrier();
+        k0 = kn;
+        buf = buf ^ 1u;
+    }
+    coopStoreT(c0, &v2_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &v2_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &v2_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &v2_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = v2_c[m * 64u + n] * aback;
+        }
+    }
+}
+"#;
+
 /// `COOP_MM_SRC` with the weight tile read from a q8_2f buffer: the
 /// int8 word of four consecutive columns, the row's f16 scale, the four
 /// columns' f16 scales (both planes sit inside the buffer, as the decode
@@ -53381,6 +53594,10 @@ fn encode_q4_tile_mm_full_offset(
         || c.q82_mm_coop_s
             .as_ref()
             .map(|p| std::ptr::eq(p, pipeline))
+            .unwrap_or(false)
+        || c.q82_mm_coop_v2_s
+            .as_ref()
+            .map(|p| std::ptr::eq(p, pipeline))
             .unwrap_or(false);
     // The 128-row tile covers twice the batch rows per workgroup.
     let m128 = c
@@ -53418,7 +53635,10 @@ fn encode_q4_tile_mm_full_offset(
     let v2 = c
         .q4tp_mm_coop_v2_s
         .as_ref()
-        .is_some_and(|p| std::ptr::eq(p, pipeline));
+        .is_some_and(|p| std::ptr::eq(p, pipeline))
+        || c.q82_mm_coop_v2_s
+            .as_ref()
+            .is_some_and(|p| std::ptr::eq(p, pipeline));
     let src_entry = if xs_offset == 0 && !v2 {
         bind_buf(1, xs)
     } else {
@@ -61489,6 +61709,11 @@ fn main() {
             eprintln!("no cooperative-matrix hardware here — skipping");
             return;
         };
+        let v2 = c
+            .q82_mm_coop_v2_s
+            .as_ref()
+            .expect("the q8_2f GEMM is up but its pipelined twin was rejected (check the init warning)");
+        for (name, pipe) in [("coop", pipe), ("coop-v2", v2)] {
         // Several 64-row tiles, several k-chunks, a batch that is not a
         // multiple of the tile, and an odd row count so a row scale sits
         // in the high half of its word and the column plane starts on an
@@ -61568,10 +61793,11 @@ fn main() {
                 }
             }
             let rel = (num / den.max(1e-30)).sqrt();
-            println!("q82 coop vs host: {rows}x{cols} n={n} relative rms {rel:.3e}");
+            println!("q82 {name} vs host: {rows}x{cols} n={n} relative rms {rel:.3e}");
             // f16 operands: ~1e-3; anything past 1e-2 is a wrong plane
             // offset or a lost activation scale, not rounding.
-            assert!(rel < 1e-2, "q8_2f coop GEMM drifted from the host product: {rel:.3e}");
+            assert!(rel < 1e-2, "q8_2f {name} GEMM drifted from the host product: {rel:.3e}");
+        }
         }
     }
 
@@ -79770,6 +79996,130 @@ pub fn q4tp_mm_bench_for_test(rows: usize, cols: usize, k: usize, variant: &str,
         run();
     }
     Some(t.elapsed().as_secs_f64() * 1e3 / reps.max(1) as f64)
+}
+
+/// The q8_2f micro-benchmark's operands: `rows` x `cols` int8 codes, f16
+/// row scales, f16 column scales (the layout the decode matvecs read), and
+/// `k` activation rows in [-1, 1).
+fn bench_q82_operands(rows: usize, cols: usize, k: usize) -> Option<(Vec<u8>, Vec<f32>)> {
+    if cols % 32 != 0 || rows == 0 || k == 0 {
+        return None;
+    }
+    let mut seed = 0x5eed_2082u64;
+    let mut w = Vec::with_capacity(rows * cols + 2 * (rows + cols) + 4);
+    for _ in 0..rows * cols {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        w.push((seed >> 56) as u8);
+    }
+    for r in 0..rows {
+        w.extend_from_slice(&cortiq_core::quant::f32_to_f16(0.01 + (r % 13) as f32 * 0.002).to_le_bytes());
+    }
+    for q in 0..cols {
+        w.extend_from_slice(&cortiq_core::quant::f32_to_f16(0.5 + (q % 7) as f32 * 0.125).to_le_bytes());
+    }
+    while w.len() % 4 != 0 {
+        w.push(0);
+    }
+    let xs: Vec<f32> = (0..k * cols)
+        .map(|i| (((i * 7919) % 1009) as f32 / 1009.0 - 0.5) * 2.0)
+        .collect();
+    Some((w, xs))
+}
+
+fn q82_bench_pipeline<'a>(c: &'a Ctx, variant: &str) -> Option<&'a wgpu::ComputePipeline> {
+    match variant {
+        "q82" => c.q82_mm_coop_s.as_ref(),
+        "q82v2" => c.q82_mm_coop_v2_s.as_ref(),
+        _ => None,
+    }
+}
+
+/// Time one q8_2f frame GEMM in isolation ("q82" = `q82_mm_coop_s`, "q82v2"
+/// = `q82_mm_coop_v2_s`), the activation scale reduced on the device as in
+/// a frame. Mean milliseconds of `reps` submits after a warm-up; None when
+/// the device or the kernel is missing.
+pub fn q82_mm_bench_for_test(rows: usize, cols: usize, k: usize, variant: &str, reps: usize) -> Option<f64> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let pipeline = q82_bench_pipeline(c, variant)?;
+    let (w, xs) = bench_q82_operands(rows, cols, k)?;
+    let q_buf = storage_bytes(c, &w);
+    let xs_buf = storage_bytes(c, bytemuck::cast_slice(&xs));
+    let y_buf = rw_f32(c, k * rows, false);
+    let asc = rw_f32(c, 4, false);
+    let run = || {
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q82-bench") });
+        if !encode_act_absmax(c, &mut enc, &xs_buf, k * cols, &asc) {
+            return false;
+        }
+        encode_q4_tile_mm_full(c, &mut enc, pipeline, &q_buf, &xs_buf, &y_buf, rows, cols, k, 0.0, Some(&asc));
+        flush_pass(&enc);
+        submit(c, finish_enc(enc));
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        true
+    };
+    if !run() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..reps.max(1) {
+        run();
+    }
+    Some(t.elapsed().as_secs_f64() * 1e3 / reps.max(1) as f64)
+}
+
+/// The two q8_2f frame GEMMs on the same operands: (cells that differ in
+/// their bits, cells, relative rms of "q82v2" against "q82"). The pipelined
+/// kernel stages the same f16 operands and adds them in the same order, so
+/// the first number is expected to be zero.
+pub fn q82_mm_v2_diff_for_test(rows: usize, cols: usize, k: usize) -> Option<(usize, usize, f64)> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let (old, new) = (q82_bench_pipeline(c, "q82")?, q82_bench_pipeline(c, "q82v2")?);
+    let (w, xs) = bench_q82_operands(rows, cols, k)?;
+    let q_buf = storage_bytes(c, &w);
+    let xs_buf = storage_bytes(c, bytemuck::cast_slice(&xs));
+    let y_ref = rw_f32(c, k * rows, true);
+    let y_var = rw_f32(c, k * rows, true);
+    let asc = rw_f32(c, 4, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q82-diff") });
+    if !encode_act_absmax(c, &mut enc, &xs_buf, k * cols, &asc) {
+        return None;
+    }
+    encode_q4_tile_mm_full(c, &mut enc, old, &q_buf, &xs_buf, &y_ref, rows, cols, k, 0.0, Some(&asc));
+    encode_q4_tile_mm_full(c, &mut enc, new, &q_buf, &xs_buf, &y_var, rows, cols, k, 0.0, Some(&asc));
+    let bytes = (k * rows * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q82-diff-stage"),
+        size: 2 * bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&y_ref, 0, &stage, 0, bytes);
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&y_var, 0, &stage, bytes, bytes);
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range().ok()?;
+    let all: &[f32] = bytemuck::cast_slice(&data);
+    let (a, b) = all.split_at(k * rows);
+    let (mut num, mut den, mut bits) = (0f64, 0f64, 0usize);
+    for (x, y) in b.iter().zip(a) {
+        bits += usize::from(x.to_bits() != y.to_bits());
+        num += ((x - y) as f64).powi(2);
+        den += (*y as f64).powi(2);
+    }
+    let r = (num / den.max(1e-30)).sqrt();
+    drop(data);
+    stage.unmap();
+    Some((bits, k * rows, r))
 }
 
 /// The GQA-shared 64-position split attend (`gqa_attend_part_xg` +

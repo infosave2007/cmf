@@ -20,10 +20,10 @@ const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
 const SPLITMIX_M2: u64 = 0x94D0_49BB_1331_11EB;
 
 pub struct GatedResidual {
-    norm: Vec<f32>,
-    down: QTensor,
-    up: QTensor,
-    inject: Option<QTensor>,
+    pub(crate) norm: Vec<f32>,
+    pub(crate) down: QTensor,
+    pub(crate) up: QTensor,
+    pub(crate) inject: Option<QTensor>,
     /// Directory indices of the same three matrices: the device frame binds
     /// the file bytes directly (f16/f32/q8_2f), the host path keeps the
     /// dequantized `QTensor` views above.
@@ -47,27 +47,27 @@ struct LayerIdx {
 }
 
 pub struct QsaWeights {
-    q_proj: QTensor,
-    k_proj: QTensor,
-    v_proj: QTensor,
-    o_proj: QTensor,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
-    index_qk: QTensor,
-    index_q_norm: Vec<f32>,
-    index_k_norm: Vec<f32>,
+    pub(crate) q_proj: QTensor,
+    pub(crate) k_proj: QTensor,
+    pub(crate) v_proj: QTensor,
+    pub(crate) o_proj: QTensor,
+    pub(crate) q_norm: Vec<f32>,
+    pub(crate) k_norm: Vec<f32>,
+    pub(crate) index_qk: QTensor,
+    pub(crate) index_q_norm: Vec<f32>,
+    pub(crate) index_k_norm: Vec<f32>,
 }
 
 pub struct PleWeights {
     shards: Vec<QTensor>,
     rows_per_shard: usize,
     row_dim: usize,
-    key_proj: QTensor,
-    value_proj: QTensor,
-    norm_key: Vec<f32>,
-    norm_query: Vec<f32>,
-    norm_conv: Vec<f32>,
-    conv: Vec<f32>,
+    pub(crate) key_proj: QTensor,
+    pub(crate) value_proj: QTensor,
+    pub(crate) norm_key: Vec<f32>,
+    pub(crate) norm_query: Vec<f32>,
+    pub(crate) norm_conv: Vec<f32>,
+    pub(crate) conv: Vec<f32>,
     multipliers: Vec<i64>,
     vocab_sizes: Vec<i64>,
     offsets: Vec<i64>,
@@ -79,11 +79,11 @@ pub enum Mixer {
 }
 
 pub struct Layer {
-    attn_hc: GatedResidual,
-    mlp_hc: GatedResidual,
-    mixer: Mixer,
-    moe: MoeFfn,
-    ple: Option<PleWeights>,
+    pub(crate) attn_hc: GatedResidual,
+    pub(crate) mlp_hc: GatedResidual,
+    pub(crate) mixer: Mixer,
+    pub(crate) moe: MoeFfn,
+    pub(crate) ple: Option<PleWeights>,
     /// Directory triples for the 512 routed experts.  The dynamic GPU cache
     /// binds by directory index; keeping the table beside the layer avoids
     /// rebuilding 24,576 triples on every token.
@@ -105,9 +105,9 @@ impl Layer {
 }
 
 pub struct Globals {
-    embed: QTensor,
-    lm_head: QTensor,
-    head_hc: GatedResidual,
+    pub(crate) embed: QTensor,
+    pub(crate) lm_head: QTensor,
+    pub(crate) head_hc: GatedResidual,
     lm_head_idx: Option<usize>,
     /// The embedding table, re-read on the card by the MTP draft chain.
     embed_idx: Option<usize>,
@@ -118,23 +118,23 @@ pub struct Globals {
 
 #[derive(Clone)]
 pub struct Cfg {
-    hidden: usize,
-    hc: usize,
-    eps: f64,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-    index_heads: usize,
-    index_kv_heads: usize,
-    index_dim: usize,
-    index_budget: usize,
-    compress_ratio: usize,
-    gdn: GdnCfg,
+    pub(crate) hidden: usize,
+    pub(crate) hc: usize,
+    pub(crate) eps: f64,
+    pub(crate) n_heads: usize,
+    pub(crate) n_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rotary_dim: usize,
+    pub(crate) index_heads: usize,
+    pub(crate) index_kv_heads: usize,
+    pub(crate) index_dim: usize,
+    pub(crate) index_budget: usize,
+    pub(crate) compress_ratio: usize,
+    pub(crate) gdn: GdnCfg,
     ngram_size: usize,
     heads_per_ngram: usize,
-    ple_kernel: usize,
-    ple_dilation: usize,
+    pub(crate) ple_kernel: usize,
+    pub(crate) ple_dilation: usize,
     eos: u32,
 }
 
@@ -175,12 +175,27 @@ pub struct State {
     /// so after it turns off mid-sequence this lags `pos` and the host path
     /// replays the history first.
     host_pos: usize,
+    /// The CUDA device path (`gpu_cuda::qwen4`): the whole stack on the card
+    /// through cuBLAS, taken instead of the wgpu one under `CMF_GPU=cuda`.
+    #[cfg(feature = "cuda")]
+    cuda: Option<crate::gpu_cuda::qwen4::Dev>,
+    /// The CUDA path refused (setup or mid-sequence); stay off it.
+    cuda_off: bool,
+    /// Check mode (`CMF_QWEN_CUDA_CHECK=1`): the host path's own state over
+    /// the same tokens, to compare every stage against.
+    #[cfg(feature = "cuda")]
+    cuda_ref: Option<Box<State>>,
+    /// The copy cursor of the CUDA path's speculation rounds.
+    #[cfg(feature = "cuda")]
+    cuda_copy: CopyCur,
     #[cfg(feature = "gpu")]
     profile: Option<ExpertProfile>,
     /// The next device forward is a verify window: snapshot the recurrent
-    /// state per token and return every token's logits in `window_logits`.
+    /// state per token and return every token's logits in `window_rows`.
     verify_window: bool,
-    window_logits: Vec<Vec<f32>>,
+    window_rows: Option<WindowRows>,
+    /// When the last speculative round ended (the host time between rounds, under the profiler).
+    round_end: Option<std::time::Instant>,
     #[cfg(feature = "gpu")]
     mtp: Option<MtpHead>,
     mtp_tried: bool,
@@ -207,6 +222,17 @@ pub struct State {
     phi_last: Vec<u32>,
     #[cfg(feature = "gpu")]
     phi_last_tokens: usize,
+    /// `route_hist` / `route_tokens` at the last request-phase boundary
+    /// (`CMF_QWEN_ROUTE_ROWS`); `row_gen`: the prompt is done, decode routing accrues.
+    #[cfg(feature = "gpu")]
+    row_snap: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    row_snap_tokens: usize,
+    #[cfg(feature = "gpu")]
+    row_gen: bool,
+    /// The expert core (`CMF_QWEN_CORE`) is pinned in the arena.
+    #[cfg(feature = "gpu")]
+    core_pinned: bool,
     /// The expert packs of `CMF_QWEN_PACKS`, read on first use (inner None: none).
     #[cfg(feature = "gpu")]
     packs: Option<Option<PackSet>>,
@@ -215,6 +241,23 @@ pub struct State {
     /// model. The next prompt is exact again.
     #[cfg(feature = "gpu")]
     masked: bool,
+    /// A copy round's frame (`CMF_QWEN_COPY_FRAME`): the next device forward may take more
+    /// than `TMAX` tokens under the mask, through the prompt-frame kernels.
+    #[cfg(feature = "gpu")]
+    copy_frame: bool,
+    /// That frame verifies drafts: checkpoint the recurrent state first and bring every
+    /// row's argmax back in `frame_ids` (megabytes of rows stay on the card).
+    #[cfg(feature = "gpu")]
+    frame_check: bool,
+    #[cfg(feature = "gpu")]
+    frame_ids: Option<Vec<u32>>,
+    /// Tokens the copy rounds in a row gave with every draft accepted: how far the copy has
+    /// held is how far the next round trusts it (a frame's size).
+    #[cfg(feature = "gpu")]
+    copy_run: usize,
+    /// Tokens the request still takes after the one in hand (`set_draft_budget`).
+    #[cfg(feature = "gpu")]
+    draft_budget: usize,
 }
 
 /// Summed wall time and count of expert uploads (every thread), for the
@@ -291,6 +334,14 @@ pub(crate) struct QwenGpuPool {
     occupancy: Vec<usize>,
     last: Vec<u64>,
     clock: u64,
+    /// `[layer][expert]`: experts no admission may evict (the shared core, `set_pins`).
+    pin: Vec<bool>,
+    /// Slots `ensure_layer` admitted (a streamed prompt's whole-bank sweep), oldest first:
+    /// the transient window the next layers of the sweep take their slots from, so the
+    /// resident working set of the layers ahead survives the sweep.
+    sweep_slots: Vec<usize>,
+    /// Per slot: `layer * n_experts + expert + 1` of the sweep admission that owns it, 0 = none.
+    sweep_of: Vec<u32>,
 }
 
 /// An admission whose serial bookkeeping is complete but whose reserved
@@ -471,10 +522,18 @@ impl State {
             picks_prev: vec![Vec::new(); n_layers],
             device_off: false,
             host_pos: 0,
+            #[cfg(feature = "cuda")]
+            cuda: None,
+            cuda_off: false,
+            #[cfg(feature = "cuda")]
+            cuda_ref: None,
+            #[cfg(feature = "cuda")]
+            cuda_copy: CopyCur::default(),
             #[cfg(feature = "gpu")]
             profile: None,
             verify_window: false,
-            window_logits: Vec::new(),
+            window_rows: None,
+            round_end: None,
             #[cfg(feature = "gpu")]
             mtp: None,
             mtp_tried: false,
@@ -491,10 +550,35 @@ impl State {
             #[cfg(feature = "gpu")]
             phi_last_tokens: 0,
             #[cfg(feature = "gpu")]
+            row_snap: Vec::new(),
+            #[cfg(feature = "gpu")]
+            row_snap_tokens: 0,
+            #[cfg(feature = "gpu")]
+            row_gen: false,
+            #[cfg(feature = "gpu")]
+            core_pinned: false,
+            #[cfg(feature = "gpu")]
             packs: None,
             #[cfg(feature = "gpu")]
             masked: false,
+            #[cfg(feature = "gpu")]
+            copy_frame: false,
+            #[cfg(feature = "gpu")]
+            frame_check: false,
+            #[cfg(feature = "gpu")]
+            frame_ids: None,
+            #[cfg(feature = "gpu")]
+            copy_run: 0,
+            #[cfg(feature = "gpu")]
+            draft_budget: usize::MAX,
         }
+    }
+
+    /// How many more tokens the request takes after the one in hand: a copy frame drafts
+    /// no further (a window's seven drafts overshoot by little, a frame's would not).
+    #[cfg(feature = "gpu")]
+    pub fn set_draft_budget(&mut self, n: usize) {
+        self.draft_budget = n;
     }
 
     pub(crate) fn reset(&mut self) {
@@ -506,12 +590,23 @@ impl State {
         self.token_history.clear();
         self.pos = 0;
         self.host_pos = 0;
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_copy = CopyCur::default();
+        }
         #[cfg(feature = "gpu")]
         {
+            if self.row_gen {
+                route_row("gen", &self.route_hist, self.route_tokens, &mut self.row_snap, &mut self.row_snap_tokens);
+                self.row_gen = false;
+            }
+            trace_flush();
             self.route_hist.iter_mut().for_each(|c| *c = 0);
             self.route_tokens = 0;
             self.phi_last.iter_mut().for_each(|c| *c = 0);
             self.phi_last_tokens = 0;
+            self.row_snap.iter_mut().for_each(|c| *c = 0);
+            self.row_snap_tokens = 0;
         }
         for st in &mut self.layers {
             *st = LayerState::default();
@@ -683,16 +778,66 @@ impl QwenGpuPool {
         2usize.checked_mul(gu)?.checked_add(dn)
     }
 
-    /// A free slot, else the least recently used slot of a layer above its
-    /// working-set floor, else one of this layer's own, never a shared slot
-    /// or one of `protect` (this layer's current winners).
+    /// A free slot, else a slot of the streamed prompt's sweep window (`sweep_victim`), else
+    /// the least recently used one (`lru_victim`); never a shared slot or one of `protect`
+    /// (this layer's current winners).
     fn victim(&mut self, layer: usize, protect: &[usize]) -> Option<usize> {
         if let Some(s) = self.free.pop() {
+            self.sweep_of[s] = 0;
             return Some(s);
         }
+        let s = self.sweep_victim(layer, protect).or_else(|| self.lru_victim(layer, protect))?;
+        self.sweep_of[s] = 0;
+        Some(s)
+    }
+
+    /// The newest slot of the sweep window another layer's whole-bank admission still owns:
+    /// a streamed prompt visits the layers 0..n in order, so the slots the previous layer
+    /// just took are the ones needed again last. Without the window the layer floor sits
+    /// above the average occupancy of a full arena and the plain LRU evicts the residents of
+    /// the layers the sweep reaches next, which then come back from the file every sweep.
+    fn sweep_victim(&mut self, layer: usize, protect: &[usize]) -> Option<usize> {
+        let ne = self.n_experts;
+        let mut i = self.sweep_slots.len();
+        while i > 0 {
+            i -= 1;
+            let slot = self.sweep_slots[i];
+            let live = match self.owner[slot] {
+                Some((l, e)) if e != usize::MAX && self.sweep_of[slot] as usize == l * ne + e + 1 => Some((l, e)),
+                _ => None,
+            };
+            let Some((l, e)) = live else {
+                self.sweep_slots.remove(i);
+                continue;
+            };
+            if self.pin.get(l * ne + e).copied().unwrap_or(false) {
+                self.sweep_of[slot] = 0;
+                self.sweep_slots.remove(i);
+                continue;
+            }
+            if (l == layer && protect.contains(&e)) || self.hold_layers.contains(&Some(l)) {
+                continue;
+            }
+            self.sweep_slots.remove(i);
+            return Some(slot);
+        }
+        None
+    }
+
+    /// The sweep window is over (the prompt is read): admissions go back to the plain LRU.
+    pub(crate) fn sweep_clear(&mut self) {
+        self.sweep_slots.clear();
+        self.sweep_of.fill(0);
+    }
+
+    /// The least recently used slot of a layer above its working-set floor, else one of
+    /// this layer's own, else any.
+    fn lru_victim(&self, layer: usize, protect: &[usize]) -> Option<usize> {
         let hold = self.hold_layers;
+        let (pin, ne) = (&self.pin, self.n_experts);
         let eligible = |owner: (usize, usize)| {
             owner.1 != usize::MAX
+                && !pin.get(owner.0 * ne + owner.1).copied().unwrap_or(false)
                 && (owner.0 != layer || !protect.contains(&owner.1))
                 // a frame already encoded against this layer's remap is in
                 // flight: its slots must stay what the remap says
@@ -1320,8 +1465,6 @@ impl QwenGpuPool {
         n
     }
 
-    /// The live `(layer, expert) → slot` row and the layer's pinned shared
-    /// slot, without admitting anything.
     /// Every routed expert of `layer` resident at once (a streamed prompt chunk runs the
     /// layer's whole bank): the missing ones get slots — never one of this layer's own,
     /// a shared expert's or a held layer's — and are uploaded in one parallel batch.
@@ -1343,6 +1486,20 @@ impl QwenGpuPool {
         self.clock = self.clock.saturating_add(1);
         let now = self.clock;
         let base = layer * ne;
+        if layer == 0 {
+            // a new sweep: drop the window's dead and repeated entries (a slot keeps its newest place)
+            let mut once = vec![false; self.owner.len()];
+            let mut live: Vec<usize> = Vec::with_capacity(self.sweep_slots.len());
+            for &slot in self.sweep_slots.iter().rev() {
+                let tagged = matches!(self.owner[slot], Some((l, e)) if e != usize::MAX && self.sweep_of[slot] as usize == l * ne + e + 1);
+                if tagged && !once[slot] {
+                    once[slot] = true;
+                    live.push(slot);
+                }
+            }
+            live.reverse();
+            self.sweep_slots = live;
+        }
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         for e in 0..ne {
             let s = self.slot_for[base + e];
@@ -1388,6 +1545,10 @@ impl QwenGpuPool {
             }
             return None;
         }
+        for &(slot, e) in &jobs {
+            self.sweep_of[slot] = (base + e + 1) as u32;
+            self.sweep_slots.push(slot);
+        }
         Some((self.slot_for[base..base + ne].to_vec(), shared_slot))
     }
 
@@ -1419,6 +1580,7 @@ impl QwenGpuPool {
             if let Some((l, e)) = self.owner[slot]
                 && e != usize::MAX
                 && !want[l * ne + e]
+                && !self.pin.get(l * ne + e).copied().unwrap_or(false)
             {
                 self.dropped((l, e));
                 self.slot_for[l * ne + e] = u32::MAX;
@@ -1468,6 +1630,8 @@ impl QwenGpuPool {
         (evicted, admitted)
     }
 
+    /// The live `(layer, expert) → slot` row and the layer's pinned shared
+    /// slot, without admitting anything.
     pub(crate) fn remap_snapshot(&self, layer: usize) -> (Vec<u32>, u32) {
         let base = layer * self.n_experts;
         (
@@ -1743,7 +1907,23 @@ impl QwenGpuPool {
             occupancy: vec![0; n_layers.max(1)],
             last: vec![0; capacity],
             clock: 0,
+            pin: Vec::new(),
+            sweep_slots: Vec::new(),
+            sweep_of: vec![0; capacity],
         })
+    }
+
+    /// Pin `core` (`[layer] -> experts`): no admission evicts a pinned expert.
+    pub(crate) fn set_pins(&mut self, core: &[Vec<usize>]) {
+        let ne = self.n_experts;
+        self.pin = vec![false; self.slot_for.len()];
+        for (l, row) in core.iter().enumerate() {
+            for &e in row {
+                if let Some(p) = self.pin.get_mut(l * ne + e) {
+                    *p = true;
+                }
+            }
+        }
     }
 
     /// Reserve slots for an admission without starting its potentially slow
@@ -1821,6 +2001,7 @@ impl QwenGpuPool {
             let slot = self.slot_for[key];
             if slot != u32::MAX {
                 self.last[slot as usize] = now;
+                self.sweep_of[slot as usize] = 0;
             }
         }
         let quota = std::env::var(self.fetch_max_env)
@@ -2403,7 +2584,20 @@ fn tap_layer() -> Option<usize> {
     std::env::var("CMF_QWEN_DEVICE_TAP").ok()?.parse().ok()
 }
 
+#[cfg(feature = "cuda")]
+thread_local! {
+    /// Check mode of the CUDA path: while armed, every stage the host path
+    /// observes on this thread is kept (label, layer, values).
+    static CUDA_TAP: std::cell::RefCell<Option<Vec<(String, usize, Vec<f32>)>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn observe(label: &str, li: usize, position: usize, values: &[f32]) {
+    #[cfg(feature = "cuda")]
+    CUDA_TAP.with(|t| {
+        if let Some(rows) = t.borrow_mut().as_mut() {
+            rows.push((label.to_string(), li, values.to_vec()));
+        }
+    });
     if tap_layer() == Some(li) && position < 3 {
         TAP.lock()
             .unwrap()
@@ -2651,6 +2845,120 @@ fn ple_row_ids(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<i6
     ids
 }
 
+/// Threads that ask the kernel for a prompt chunk's n-gram rows ahead of the
+/// gather (`CMF_QWEN_PLE_PREFETCH`, default 32; 0 turns the read-ahead off).
+#[cfg(feature = "gpu")]
+fn ple_prefetch_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_QWEN_PLE_PREFETCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .min(256)
+    })
+}
+
+/// Read-ahead for a prompt chunk's n-gram rows. A row of the table is ~90
+/// bytes on three pages of a ~26 GB mapping, so a host whose page cache does
+/// not hold the table takes three disk reads per row: 160 thousand faults
+/// for a 3.4K-token prompt, which the gather takes a few at a time, one per
+/// pool worker. The row ids depend on the tokens alone, so the pages are
+/// named before the first frame is built and handed to the kernel as
+/// `MADV_WILLNEED` from detached threads: the reads then run at the disk's
+/// queue depth while the first frame and layer 0 occupy the card, and the
+/// gather finds the rows in the page cache. Advice only; returns the number
+/// of rows asked for.
+#[cfg(feature = "gpu")]
+fn ple_prefetch(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32]) -> usize {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        let threads = ple_prefetch_threads();
+        if threads == 0 || ids.len() < 64 {
+            return 0;
+        }
+        let t0 = std::time::Instant::now();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut model = None;
+        let mut hist: Vec<u32> = history.to_vec();
+        for l in layers {
+            let Some(pw) = l.ple.as_ref() else { continue };
+            if model.is_none() {
+                model = pw.shards.first().and_then(|s| s.model_arc());
+            }
+            hist.truncate(history.len());
+            for &id in ids {
+                for r in ple_row_ids(pw, cfg, &hist, id) {
+                    let global = r as usize;
+                    if let Some(s) = pw.shards.get(global / pw.rows_per_shard) {
+                        s.row_spans(global % pw.rows_per_shard, &mut spans);
+                    }
+                }
+                hist.push(id);
+            }
+        }
+        let Some(model) = model else { return 0 };
+        if spans.is_empty() {
+            return 0;
+        }
+        let (rows, ntok) = (spans.len() / 3, ids.len());
+        let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+        // the page list, its sort and the advice itself stay off the request's thread
+        let _ = std::thread::Builder::new().name("ple-readahead".into()).spawn(move || {
+            // SAFETY: plain sysconf query.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+            let mut pages: Vec<usize> = Vec::with_capacity(spans.len() + spans.len() / 8);
+            for &(a, len) in &spans {
+                pages.extend(a / page..=(a + len - 1) / page);
+            }
+            pages.sort_unstable();
+            pages.dedup();
+            // adjacent pages go to the kernel as one range
+            let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+            for &p in &pages {
+                match runs.last_mut() {
+                    Some((s, n)) if *s + *n == p => *n += 1,
+                    _ => runs.push((p, 1)),
+                }
+            }
+            let threads = threads.min(runs.len().div_ceil(512)).max(1);
+            let runs = &runs;
+            std::thread::scope(|sc| {
+                for t in 0..threads {
+                    sc.spawn(move || {
+                        for &(p, n) in runs.iter().skip(t).step_by(threads) {
+                            // SAFETY: whole pages of our read-only mapping,
+                            // which `model` keeps alive; advice only.
+                            unsafe {
+                                libc::madvise(
+                                    (p * page) as *mut libc::c_void,
+                                    n * page,
+                                    libc::MADV_WILLNEED,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+            if prof {
+                eprintln!(
+                    "qwen4-ple: read-ahead of {} pages in {} ranges for {ntok} tokens on {threads} threads, issued in {:.1}ms",
+                    pages.len(),
+                    runs.len(),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            drop(model);
+        });
+        rows
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = (layers, cfg, history, ids);
+        0
+    }
+}
+
 /// The n-gram rows of every PLE layer for every token of a frame, each
 /// against its own history: `[layer][token]` → heads × `row_dim`. The rows
 /// are scattered over a ~25 GB table, so on a host whose page cache does
@@ -2794,6 +3102,11 @@ fn dynamic_moe_gpu(
     state: &mut State,
     pool: Option<&Pool>,
 ) -> Option<(Vec<f32>, Vec<usize>)> {
+    // the expert pool below is the wgpu one
+    #[cfg(feature = "cuda")]
+    if crate::gpu_cuda::selected() {
+        return None;
+    }
     let m = &layer.moe;
     if !crate::gpu::enabled_here()
         || m.router_sigmoid
@@ -2962,6 +3275,10 @@ pub fn forward_token(
     logits: &mut Vec<f32>,
     want_logits: bool,
 ) {
+    #[cfg(feature = "cuda")]
+    if cuda_forward(globals, layers, cfg, state, &[token_id], position, inv_freq, pool, logits, want_logits) {
+        return;
+    }
     #[cfg(feature = "gpu")]
     if forward_token_device(
         globals,
@@ -3377,6 +3694,518 @@ impl ExpertProfile {
     }
 }
 
+/// `CMF_QWEN_ROUTE_WSTAT=1` (with `CMF_QWEN_LEAN=0`, so the route is read back): how light the routed winners'
+/// tail is — the share of winners under 1/2/3/5/8/10 % of their token's routing and the routing they carry.
+#[cfg(feature = "gpu")]
+fn route_wstat() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_ROUTE_WSTAT").as_deref() == Ok("1"))
+}
+
+/// One token's routed (expert, weight bits) pairs into the tail statistics; a line every 9600 token-layers.
+#[cfg(feature = "gpu")]
+fn note_route_weights(pairs: &[u32]) {
+    const CUTS: [f32; 6] = [0.01, 0.02, 0.03, 0.05, 0.08, 0.10];
+    // token-layers, winners, winners under each cut, their routing
+    static ACC: std::sync::Mutex<(u64, u64, [u64; 6], [f64; 6])> = std::sync::Mutex::new((0, 0, [0; 6], [0.0; 6]));
+    let mut a = ACC.lock().unwrap();
+    a.0 += 1;
+    for pr in pairs.chunks_exact(2) {
+        if pr[0] == u32::MAX {
+            continue;
+        }
+        let w = f32::from_bits(pr[1]);
+        a.1 += 1;
+        for (i, &c) in CUTS.iter().enumerate() {
+            if w < c {
+                a.2[i] += 1;
+                a.3[i] += f64::from(w);
+            }
+        }
+    }
+    if a.0 % 9600 == 0 {
+        let share: Vec<String> = a.2.iter().map(|&n| format!("{:.1}", 100.0 * n as f64 / a.1.max(1) as f64)).collect();
+        let mass: Vec<String> = a.3.iter().map(|&m| format!("{:.2}", 100.0 * m / a.0 as f64)).collect();
+        eprintln!(
+            "route weights: {} token-layers, {:.2} winners each; under 1/2/3/5/8/10 %: {} % of the winners, {} % of the routing",
+            a.0,
+            a.1 as f64 / a.0 as f64,
+            share.join("/"),
+            mass.join("/")
+        );
+    }
+}
+
+/// Vocabulary rows the device draft chain's head projects
+/// (`CMF_QWEN_DRAFT_VOCAB`, 0 = the whole vocabulary).
+#[cfg(feature = "gpu")]
+fn draft_vocab_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CMF_QWEN_DRAFT_VOCAB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// The draft gate (`CMF_QWEN_DRAFT_MINP`, 0 = off): a draft joins the verify
+/// window while the chain's cumulative confidence (the product of the
+/// probabilities its head gave its own picks) stays at or above this. And
+/// whether the chain reports its confidences at all (the gate, or
+/// `CMF_QWEN_DRAFT_CONF=1` to print them with the gate off).
+#[cfg(feature = "gpu")]
+fn draft_gate() -> (f32, bool) {
+    static V: std::sync::OnceLock<(f32, bool)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let minp = std::env::var("CMF_QWEN_DRAFT_MINP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .map_or(0.0, |p| p.min(1.0));
+        let report = minp > 0.0 || std::env::var("CMF_QWEN_DRAFT_CONF").as_deref() == Ok("1");
+        (minp, report)
+    })
+}
+
+/// How many of a chain's drafts the gate keeps: the longest prefix whose
+/// cumulative confidence is at least `minp`, never fewer than one (the
+/// round's bonus token rides the same window either way).
+#[cfg(feature = "gpu")]
+fn draft_gate_keep(conf: &[f32], minp: f32) -> usize {
+    if minp <= 0.0 {
+        return conf.len();
+    }
+    let mut cum = 1.0f32;
+    let mut keep = 0;
+    for &p in conf {
+        cum *= p;
+        // a NaN confidence ends the prefix too
+        if cum.is_nan() || cum < minp {
+            break;
+        }
+        keep += 1;
+    }
+    keep.max(1).min(conf.len())
+}
+
+/// Suffix drafts (`CMF_QWEN_SUFFIX=EXT:STRONG:MAX`, off by default): drafts
+/// read off the context itself, at no card time. `strong`: a context tail
+/// of at least this many tokens that occurred before is continued from
+/// there with no draft chain at all; `ext`: the chain's drafts are extended
+/// the same way when the tail with them on it (this many tokens) occurred
+/// before; `max`: drafts a window carries at most. 0 turns a mode off.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SuffixCfg {
+    ext: usize,
+    strong: usize,
+    max: usize,
+}
+
+#[cfg(feature = "gpu")]
+fn suffix_parse(raw: &str) -> Option<SuffixCfg> {
+    let mut it = raw.split(':').map(|v| v.trim().parse::<usize>().ok());
+    let ext = it.next()??;
+    let strong = it.next().unwrap_or(Some(0))?;
+    let max = it.next().unwrap_or(Some(usize::MAX))?;
+    let max = max.clamp(1, crate::gpu_wgpu::qwen4::TMAX - 1);
+    (ext > 0 || strong > 0).then_some(SuffixCfg { ext, strong, max })
+}
+
+#[cfg(feature = "gpu")]
+fn suffix_cfg() -> Option<SuffixCfg> {
+    static V: std::sync::OnceLock<Option<SuffixCfg>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_SUFFIX").ok().and_then(|v| suffix_parse(&v)))
+}
+
+/// `CMF_QWEN_COPY_FRAME=N[:F]`: a copy round (`CMF_QWEN_SUFFIX`'s strong match) that has
+/// held for a while verifies up to N drafts as one frame of the prompt kernels (31, 63,
+/// 127 or 255 drafts: 32 to 256 tokens) instead of a window of `TMAX`. A frame carries no
+/// more drafts than F times the tokens the copy has given so far (default 2). Unset:
+/// windows.
+#[cfg(feature = "gpu")]
+fn copy_frame_cfg() -> Option<(usize, f32)> {
+    static V: std::sync::OnceLock<Option<(usize, f32)>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| copy_frame_parse(&std::env::var("CMF_QWEN_COPY_FRAME").ok()?))
+}
+
+/// `CMF_QWEN_FRAME_DEBUG=1`: a copy frame reads every row's logits back and prints the
+/// card's row ids beside the host's argmax of the same rows. A probe, not a release path.
+#[cfg(feature = "gpu")]
+fn copy_frame_debug() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_FRAME_DEBUG").as_deref() == Ok("1"))
+}
+
+#[cfg(feature = "gpu")]
+fn copy_frame_parse(raw: &str) -> Option<(usize, f32)> {
+    let mut it = raw.split(':');
+    let n = it.next()?.trim().parse::<usize>().ok()?;
+    let f = match it.next() {
+        Some(v) => v.trim().parse::<f32>().ok().filter(|f| f.is_finite() && *f > 0.0)?,
+        None => 2.0,
+    };
+    (n >= COPY_FRAMES[COPY_FRAMES.len() - 1]).then_some((n.min(crate::gpu_wgpu::qwen4::TROWS - 1), f))
+}
+
+/// The drafts a copy frame carries, largest first: a few fixed sizes, so that each builds
+/// its bind groups once. A frame's launches cost what they cost whatever it carries (RTX
+/// 5090: 84 ms for 32 tokens, 110 ms for 64, where a window of 8 takes 24 ms), so a frame
+/// of 16 tokens (70 ms) would lose to two windows.
+#[cfg(feature = "gpu")]
+const COPY_FRAMES: [usize; 4] = [255, 127, 63, 31];
+
+/// The drafts of the next copy frame: the largest size within the configured most, the
+/// copy's run so far times the factor, and what the request still takes. None: a window.
+#[cfg(feature = "gpu")]
+fn copy_frame_drafts(most: usize, factor: f32, run: usize, budget: usize) -> Option<usize> {
+    let lim = most.min(budget).min((run as f32 * factor) as usize);
+    COPY_FRAMES.into_iter().find(|&k| k <= lim)
+}
+
+/// The longest earlier occurrence of the context's tail (at least `min_m`
+/// tokens; the latest one on a tie): its length and the index of its last
+/// token. Length 0: the tail did not occur before.
+#[cfg(feature = "gpu")]
+fn suffix_find(ids: &[u32], min_m: usize) -> (usize, usize) {
+    // a match this long is as good as any longer one
+    const CAP: usize = 32;
+    let n = ids.len();
+    if min_m == 0 || n <= min_m {
+        return (0, 0);
+    }
+    let last = ids[n - 1];
+    let (mut best_m, mut best_j) = (0usize, 0usize);
+    for j in (min_m - 1..n - 1).rev() {
+        if ids[j] != last {
+            continue;
+        }
+        let mut m = 1;
+        while m < CAP && m <= j && ids[j - m] == ids[n - 1 - m] {
+            m += 1;
+        }
+        if m > best_m {
+            (best_m, best_j) = (m, j);
+            if m >= CAP {
+                break;
+            }
+        }
+    }
+    if best_m < min_m { (0, 0) } else { (best_m, best_j) }
+}
+
+/// The longest earlier occurrence of the context's tail (at least `min_m`
+/// tokens; the latest one on a tie) and the up to `max_out` tokens that
+/// followed it there. An occurrence that runs into the tail itself (a
+/// period shorter than the draft) continues through its own prediction.
+/// `(0, [])` when the tail did not occur before.
+#[cfg(feature = "gpu")]
+fn suffix_draft(ids: &[u32], min_m: usize, max_out: usize) -> (usize, Vec<u32>) {
+    let n = ids.len();
+    if min_m == 0 || max_out == 0 || n <= min_m {
+        return (0, Vec::new());
+    }
+    let (best_m, best_j) = suffix_find(ids, min_m);
+    if best_m < min_m {
+        return (0, Vec::new());
+    }
+    let mut out: Vec<u32> = Vec::with_capacity(max_out);
+    for i in 0..max_out {
+        let p = best_j + 1 + i;
+        out.push(if p < n { ids[p] } else { out[p - n] });
+    }
+    (best_m, out)
+}
+
+/// Tokens a copy may be interrupted by before the cursor lets go of its source.
+#[cfg(feature = "cuda")]
+const GAP_MAX: usize = 12;
+
+/// The copy rounds of the CUDA path. The model's answer often follows an
+/// earlier text of the context token by token, with insertions at the same
+/// places (an edit: the same comment line before every `def`). The cursor
+/// keeps the source position the next token should come from, and learns the
+/// insertions as rules `(token before, token after) -> inserted tokens`, so
+/// that a draft carries the insertion across, not only the copy.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct CopyCur {
+    /// Tokens of the context already accounted for.
+    seen: usize,
+    /// The index of the context token the next token should repeat.
+    at: Option<usize>,
+    /// Tokens that came as expected since the cursor was last disturbed.
+    run: usize,
+    /// Tokens inserted since the last copied one.
+    gap: Vec<u32>,
+    last_gap: Vec<u32>,
+    /// (token before, token after) -> (inserted tokens, times they came).
+    rules: std::collections::HashMap<(u32, u32), (Vec<u32>, u8)>,
+}
+
+#[cfg(feature = "cuda")]
+impl CopyCur {
+    fn key(ids: &[u32], at: usize) -> Option<(u32, u32)> {
+        (at >= 1 && at < ids.len()).then(|| (ids[at - 1], ids[at]))
+    }
+
+    fn start(&mut self, at: usize, run: usize) {
+        self.at = Some(at);
+        self.run = run;
+        self.gap.clear();
+    }
+
+    fn drop_cursor(&mut self) {
+        self.at = None;
+        self.run = 0;
+        self.gap.clear();
+    }
+
+    /// Account for the tokens of `ids` the cursor has not seen.
+    fn account(&mut self, ids: &[u32]) {
+        if self.seen > ids.len() {
+            *self = Self::default();
+        }
+        for j in self.seen..ids.len() {
+            let Some(at) = self.at else { break };
+            if at >= j {
+                self.drop_cursor();
+                break;
+            }
+            let key = Self::key(ids, at);
+            if ids[j] == ids[at] {
+                if !self.gap.is_empty() {
+                    let g = std::mem::take(&mut self.gap);
+                    if let Some(key) = key {
+                        match self.rules.get_mut(&key) {
+                            Some((rg, hits)) if *rg == g => *hits = hits.saturating_add(1),
+                            _ => {
+                                self.rules.insert(key, (g.clone(), 1));
+                            }
+                        }
+                    }
+                    self.last_gap = g;
+                } else if let Some(key) = key
+                    && let Some(r) = self.rules.get_mut(&key)
+                {
+                    // an insertion was expected here and did not come
+                    if r.1 <= 1 {
+                        self.rules.remove(&key);
+                    } else {
+                        r.1 -= 1;
+                    }
+                }
+                self.at = Some(at + 1);
+                self.run += 1;
+            } else {
+                self.gap.push(ids[j]);
+                let expected = key.and_then(|k| self.rules.get(&k)).is_some_and(|(rg, _)| rg.starts_with(&self.gap));
+                if !expected {
+                    self.run = 0;
+                }
+                if self.gap.len() > GAP_MAX {
+                    self.drop_cursor();
+                    break;
+                }
+            }
+        }
+        self.seen = ids.len();
+    }
+
+    /// Up to `most` tokens the answer should continue with: the rest of an
+    /// insertion in progress, then the copy with the insertions the rules know
+    /// (seen twice at least). Empty: the cursor cannot say what comes next.
+    fn draft(&self, ids: &[u32], most: usize) -> Vec<u32> {
+        let Some(at) = self.at else { return Vec::new() };
+        let mut out: Vec<u32> = Vec::with_capacity(most);
+        let mut skip = None;
+        if !self.gap.is_empty() {
+            let g = &self.gap;
+            let rule = Self::key(ids, at).and_then(|k| self.rules.get(&k)).map(|(rg, _)| rg.as_slice());
+            let rest: &[u32] = match rule {
+                Some(rg) if rg.len() >= g.len() && rg[..g.len()] == g[..] => &rg[g.len()..],
+                _ if self.last_gap.len() >= g.len() && self.last_gap[..g.len()] == g[..] => &self.last_gap[g.len()..],
+                _ => return Vec::new(),
+            };
+            out.extend_from_slice(&rest[..rest.len().min(most)]);
+            skip = Some(at);
+        }
+        let mut i = at;
+        while out.len() < most && i < ids.len() {
+            if i >= 1
+                && skip != Some(i)
+                && let Some((rg, hits)) = self.rules.get(&(ids[i - 1], ids[i]))
+                && *hits >= 2
+            {
+                for &t in rg {
+                    if out.len() < most {
+                        out.push(t);
+                    }
+                }
+                if out.len() >= most {
+                    break;
+                }
+            }
+            out.push(ids[i]);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// The copy rounds of the CUDA path are on unless `CMF_QWEN_SUFFIX=0` (or
+/// another value `suffix_parse` refuses); unset: a strong match of 8 tokens,
+/// windows of 7 drafts.
+#[cfg(feature = "cuda")]
+fn cuda_copy_cfg() -> Option<SuffixCfg> {
+    static V: std::sync::OnceLock<Option<SuffixCfg>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("CMF_QWEN_SUFFIX") {
+        Ok(v) => suffix_parse(&v),
+        Err(_) => Some(SuffixCfg { ext: 4, strong: 8, max: 7 }),
+    })
+}
+
+/// One speculation round on the CUDA card: the copy cursor drafts, the card
+/// verifies the window (or a frame of up to 255 drafts with
+/// `CMF_QWEN_COPY_FRAME`) in one pass and keeps the rows that stand.
+/// `None`: the caller decodes one token plainly.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_spec_round(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    next_pos: usize,
+    all_ids: &[u32],
+    pool: Option<&Pool>,
+) -> Option<SpecRound> {
+    if state.cuda_off || next_pos == 0 || all_ids.len() != next_pos + 1 || state.pos != next_pos || state.token_history.len() != next_pos {
+        return None;
+    }
+    let sc = cuda_copy_cfg();
+    let tape = match state.cuda.as_ref() {
+        Some(d) if d.pos == next_pos => d.tape(),
+        _ => return None,
+    };
+    let budget = state.draft_budget;
+    let mut drafts: Vec<u32> = Vec::new();
+    if let Some(sc) = sc {
+        state.cuda_copy.account(all_ids);
+        if state.cuda_copy.at.is_none() && sc.strong > 0 {
+            let (m, j) = suffix_find(all_ids, sc.strong);
+            if m >= sc.strong {
+                state.cuda_copy.start(j + 1, 1);
+            }
+        }
+        if state.cuda_copy.at.is_some() {
+            let run = state.cuda_copy.run;
+            let mut most = (1 + 2 * run).min(sc.max);
+            if let Some((fmax, factor)) = copy_frame_cfg() {
+                let lim = fmax.min(budget).min((run as f32 * factor) as usize).min(tape.saturating_sub(1));
+                if lim >= 63 {
+                    most = lim;
+                }
+            }
+            most = most.min(budget);
+            if most > 0 {
+                drafts = state.cuda_copy.draft(all_ids, most);
+            }
+        }
+    }
+    // no copy to follow: the MTP head drafts
+    let copied = !drafts.is_empty();
+    let t_draft0 = std::time::Instant::now();
+    if drafts.is_empty() && budget > 0 {
+        if let (Some(head), Some(dev)) = (state.mtp.as_ref(), state.cuda.as_mut()) {
+            if dev.has_mtp() {
+                let embed = |id: u32, row: &mut [f32]| {
+                    if (id as usize) < globals.embed.rows() {
+                        globals.embed.row_f32(id as usize, row);
+                    }
+                };
+                let kmax = head.k.min(budget).min(tape.saturating_sub(1)).min(7);
+                let mut out: Vec<u32> = Vec::new();
+                match dev.draft(&head.layer, &embed, all_ids[next_pos], next_pos, kmax, &mut out) {
+                    Ok(true) => drafts = out,
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("qwen4 cuda: the MTP head failed ({e}); it stays off");
+                        dev.mtp_off();
+                    }
+                }
+            }
+        }
+    }
+    let t_draft = t_draft0.elapsed();
+    let k = drafts.len();
+    if k == 0 {
+        return None;
+    }
+    let ids: Vec<u32> = std::iter::once(all_ids[next_pos]).chain(drafts.iter().copied()).collect();
+    let mut dev = state.cuda.take()?;
+    let h = cfg.hidden;
+    let no_ple = std::env::var_os("CMF_QWEN_NO_PLE").is_some();
+    let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+    let t_round = std::time::Instant::now();
+    let res = (|| -> Result<(usize, Vec<f32>), String> {
+        let mut emb = vec![0.0f32; ids.len() * h];
+        for (row, &id) in emb.chunks_mut(h).zip(&ids) {
+            if (id as usize) < globals.embed.rows() {
+                globals.embed.row_f32(id as usize, row);
+            }
+        }
+        let ple = if no_ple { Vec::new() } else { ple_frame_rows(layers, cfg, &state.token_history, &ids, pool) };
+        let t_host = t_round.elapsed();
+        let mut row_ids: Vec<u32> = Vec::new();
+        dev.spec(layers, &emb, &ple, next_pos, &mut row_ids)?;
+        if row_ids.len() != ids.len() {
+            return Err("qwen4 cuda: a window came back short".into());
+        }
+        let mut a = 0;
+        while a < k && row_ids[a] == drafts[a] {
+            a += 1;
+        }
+        let mut logits: Vec<f32> = Vec::new();
+        if !dev.settle(a + 1, &mut logits)? {
+            // too long a window to settle in part: the rows that stand run again
+            let part: Vec<Vec<Vec<f32>>> = ple.iter().map(|rows| rows.iter().take(a + 1).cloned().collect()).collect();
+            dev.forward(layers, &emb[..(a + 1) * h], &part, next_pos, Some(&mut logits))?;
+        }
+        if prof {
+            eprintln!(
+                "qwen4 cuda: round of {k} drafts, {a} accepted: host rows {:.1} ms, whole {:.1} ms",
+                t_host.as_secs_f64() * 1e3,
+                t_round.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if std::env::var_os("CMF_QWEN_ROUND_LOG").is_some() {
+            eprintln!(
+                "qwen4 cuda: round {} k={k} a={a} draft {:.1} ms verify {:.1} ms",
+                if copied { "copy" } else { "mtp" },
+                t_draft.as_secs_f64() * 1e3,
+                t_round.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok((a, logits))
+    })();
+    match res {
+        Ok((a, logits)) => {
+            state.token_history.extend_from_slice(&ids[..a + 1]);
+            state.pos = next_pos + a + 1;
+            state.cuda = Some(dev);
+            Some(SpecRound { accepted: drafts[..a].to_vec(), logits, drafted: k })
+        }
+        Err(e) => {
+            eprintln!("qwen4 cuda: {e}; the sequence continues on the host path");
+            drop(dev);
+            state.cuda_off = true;
+            None
+        }
+    }
+}
+
 /// `CMF_QWEN_ADMIT_BATCH=0`: a multi-token frame admits its cold winners
 /// token by token (the slots are the same either way; the batch only
 /// runs the uploads of the whole frame in parallel).
@@ -3458,6 +4287,15 @@ impl DevProf {
 /// Tokens one device frame carries; the prompt is fed in chunks of this many.
 #[cfg(feature = "gpu")]
 pub fn prefill_chunk() -> usize {
+    // CUDA runs a chunk as plain GEMMs over all of its tokens
+    #[cfg(feature = "cuda")]
+    if crate::gpu_cuda::selected() {
+        return std::env::var("CMF_QWEN_CUDA_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(if crate::gpu_cuda::qwen4::lean_card() { 1024 } else { 4096 })
+            .clamp(1, crate::gpu_cuda::qwen4::MAX_CHUNK);
+    }
     // `forward_tokens` cuts a chunk into TROWS-token frames when every expert is
     // resident; otherwise it streams the chunk layer by layer (`forward_stream_device`,
     // several frames), or cuts it into eight-token frames when that is off
@@ -3514,6 +4352,394 @@ fn top_log(logits: &[f32], vocab: usize) {
     eprintln!("[toplog] {}", top.join(" "));
 }
 
+/// `CMF_QWEN_CUDA_CHECK=1`: the host path runs the same tokens and every
+/// stage of the chunk's last token is compared (slow: a host token each).
+#[cfg(feature = "cuda")]
+fn cuda_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_CUDA_CHECK").as_deref() == Ok("1"))
+}
+
+/// `ids` at `pos0..` through the CUDA device, in chunks of its capacity;
+/// `history` are the tokens before them (the n-gram tables hash it).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_run(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    dev: &mut crate::gpu_cuda::qwen4::Dev,
+    history: &[u32],
+    ids: &[u32],
+    pos0: usize,
+    pool: Option<&Pool>,
+    mut logits: Option<&mut Vec<f32>>,
+) -> Result<(), String> {
+    let h = cfg.hidden;
+    let chunk = dev.chunk().max(1);
+    let no_ple = std::env::var_os("CMF_QWEN_NO_PLE").is_some();
+    let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+    // a prompt's n-gram rows leave the disk while the first chunk runs
+    if !no_ple && ids.len() >= 64 {
+        ple_prefetch(layers, cfg, history, ids);
+    }
+    // the history of a later chunk also holds the chunks before it
+    let mut grown: Vec<u32> = Vec::new();
+    let mut off = 0usize;
+    while off < ids.len() {
+        let end = (off + chunk).min(ids.len());
+        let part = &ids[off..end];
+        let t0 = std::time::Instant::now();
+        let mut emb = vec![0.0f32; part.len() * h];
+        for (row, &id) in emb.chunks_mut(h).zip(part) {
+            if (id as usize) < globals.embed.rows() {
+                globals.embed.row_f32(id as usize, row);
+            }
+        }
+        let ple = if no_ple {
+            Vec::new()
+        } else if off == 0 {
+            ple_frame_rows(layers, cfg, history, part, pool)
+        } else {
+            if grown.is_empty() {
+                grown.extend_from_slice(history);
+            }
+            grown.extend_from_slice(&ids[grown.len() - history.len()..off]);
+            ple_frame_rows(layers, cfg, &grown, part, pool)
+        };
+        if prof && part.len() > 1 {
+            eprintln!("qwen4 cuda: host rows of {} tokens {:.1} ms", part.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let lg = if end == ids.len() { logits.take() } else { None };
+        dev.forward(layers, &emb, &ple, pos0 + off, lg)?;
+        off = end;
+    }
+    Ok(())
+}
+
+/// The prompt has run on the CUDA card: the arena is refilled with what this request needs
+/// (see `prompt_done` of the wgpu path): the task's pack (`CMF_QWEN_PACKS`, named by
+/// `CMF_QWEN_TASK_HINT`) blended with the prompt's own routing (`CMF_QWEN_PACK_MIX`, the
+/// prompt's share, default 0.5; 1 without a pack); `CMF_QWEN_PACK_SWAP` bounds the experts
+/// brought in (default 4096). Off unless `CMF_QWEN_SELF_PACK=1`: on the CUDA card the refill
+/// from the prompt's own routing alone changed the decode speed by less than the run-to-run
+/// spread, and the python pack on a writing task made it slower.
+#[cfg(feature = "cuda")]
+fn cuda_prompt_done(layers: &[Layer], state: &mut State) {
+    if std::env::var("CMF_QWEN_SELF_PACK").as_deref() != Ok("1") {
+        return;
+    }
+    let (n, ne) = (layers.len(), layers.first().map_or(0, |l| l.moe.experts.len()));
+    if n == 0 || ne == 0 || state.cuda.is_none() {
+        return;
+    }
+    if state.packs.is_none() {
+        state.packs = Some(PackSet::load(n, ne));
+    }
+    let packs = state.packs.as_ref().and_then(|p| p.as_ref());
+    // the pack: named from outside, or the router's choice on the prompt's routing
+    let weighted: Vec<(usize, f32)> = match packs {
+        Some(p) => match p.hint_weights() {
+            Some(w) => w,
+            None => state
+                .cuda
+                .as_ref()
+                .and_then(|d| p.decide(d.route_hist(), ne))
+                .map(|(i, _)| vec![(i, 1.0)])
+                .unwrap_or_default(),
+        },
+        None => Vec::new(),
+    };
+    let pack: Option<Vec<f32>> = packs.filter(|_| !weighted.is_empty()).map(|p| {
+        let mut pk = vec![0f32; n * ne];
+        for &(i, w) in &weighted {
+            for l in 0..n {
+                let row = &p.profiles[i].counts[l * ne..(l + 1) * ne];
+                let ps = row.iter().map(|&c| c as f32).sum::<f32>().max(1.0);
+                for (o, &c) in pk[l * ne..(l + 1) * ne].iter_mut().zip(row) {
+                    *o += w * c as f32 / ps;
+                }
+            }
+        }
+        pk
+    });
+    let mix: f32 = if pack.is_some() { std::env::var("CMF_QWEN_PACK_MIX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5f32).clamp(0.0, 1.0) } else { 1.0 };
+    let max_swap = std::env::var("CMF_QWEN_PACK_SWAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096);
+    let t0 = std::time::Instant::now();
+    let name = weighted.first().and_then(|&(i, _)| packs.map(|p| p.names[i].clone())).unwrap_or_else(|| "prompt routing".into());
+    let Some(dev) = state.cuda.as_mut() else { return };
+    match dev.retarget(layers, pack.as_deref(), mix, max_swap) {
+        Ok((out, inn)) => {
+            if std::env::var_os("CMF_QWEN_PROF").is_some() || std::env::var_os("CMF_QWEN_PACK_LOG").is_some() {
+                eprintln!("qwen4 cuda: pack {name} (prompt share {mix}): {out} experts out, {inn} in, {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        Err(e) => eprintln!("qwen4 cuda: pack: {e}"),
+    }
+}
+
+/// The whole stack of `ids` at `position..` on the CUDA card
+/// (`gpu_cuda::qwen4`). Returns `false` when that path is not available or
+/// has refused: the caller then runs the tokens on the host path, which
+/// replays the history into its own caches first.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_forward(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    position: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) -> bool {
+    if state.cuda_off || ids.is_empty() || !crate::gpu_cuda::selected() {
+        return false;
+    }
+    // the wgpu device path never runs beside this one
+    state.device_off = true;
+    if !crate::gpu::enabled_here() || std::env::var("CMF_QWEN_DEVICE").as_deref() == Ok("0") {
+        return false;
+    }
+    if !crate::gpu_cuda::enabled() {
+        state.cuda_off = true;
+        return false;
+    }
+    if state.cuda.is_none() {
+        // the file's MTP draft head (`CMF_QWEN_MTP=0` leaves it out)
+        if state.mtp.is_none() && !state.mtp_tried {
+            state.mtp_tried = true;
+            if let Some(model) = layers.first().and_then(|l| l.moe.experts.first()).and_then(|f| f.gate_proj.model_arc()) {
+                state.mtp = MtpHead::load(&model, model.arch());
+            }
+        }
+        let fcs = state.mtp.as_ref().and_then(|h| {
+            Some((t(&h.side, "model.mtp.fc_embedding.weight").ok()?, t(&h.side, "model.mtp.fc_hidden.weight").ok()?))
+        });
+        let parts = state.mtp.as_ref().zip(fcs.as_ref()).map(|(h, (fe, fh))| crate::gpu_cuda::qwen4::MtpParts {
+            layer: &h.layer,
+            mixer: &h.mixer,
+            enorm: &h.enorm,
+            hnorm: &h.hnorm,
+            fc_e: fe,
+            fc_h: fh,
+        });
+        match crate::gpu_cuda::qwen4::Dev::new(globals, layers, cfg, inv_freq, prefill_chunk(), parts.as_ref()) {
+            Ok(mut d) => {
+                // the MTP head's experts stay in the arena
+                if let Some(head) = state.mtp.as_ref() {
+                    match d.warm_mtp(&head.layer) {
+                        Ok(n) if n > 0 => {
+                            if std::env::var_os("CMF_QWEN_PROF").is_some() {
+                                eprintln!("qwen4 cuda: {n} experts of the MTP head resident");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("qwen4 cuda: the MTP head's experts: {e}; it stays off");
+                            d.mtp_off();
+                        }
+                    }
+                }
+                // `CMF_QWEN_PROFILE`: the experts earlier runs used most go in first
+                let ne = layers.first().map_or(0, |l| l.moe.experts.len());
+                if let Some(pr) = std::env::var("CMF_QWEN_PROFILE").ok().and_then(|path| ExpertProfile::load(&path, layers.len(), ne)) {
+                    let t0 = std::time::Instant::now();
+                    match d.prefill(layers, &pr.ranked()) {
+                        Ok(n) => eprintln!(
+                            "qwen4 cuda: arena prefilled with {n} of {} profiled experts ({} tokens of history) in {:.2}s",
+                            pr.ranked().len(),
+                            pr.tokens,
+                            t0.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => eprintln!("qwen4 cuda: prefill: {e}"),
+                    }
+                }
+                state.cuda = Some(d)
+            }
+            Err(e) => {
+                eprintln!("qwen4 cuda: {e}; staying on the host path");
+                state.cuda_off = true;
+                return false;
+            }
+        }
+    }
+    let Some(mut dev) = state.cuda.take() else {
+        return false;
+    };
+    let check = cuda_check_on();
+    dev.want_trace = check;
+    let res = (|| -> Result<bool, String> {
+        if position == 0 || state.pos != position {
+            state.reset();
+            dev.reset()?;
+        }
+        if dev.pos != position {
+            // the host path ran these positions (or the sequence does not
+            // start at its beginning, which only the host path can serve)
+            if state.token_history.len() != position {
+                return Ok(false);
+            }
+            dev.reset()?;
+            cuda_run(globals, layers, cfg, &mut dev, &[], &state.token_history, 0, pool, None)?;
+        }
+        cuda_run(
+            globals,
+            layers,
+            cfg,
+            &mut dev,
+            &state.token_history,
+            ids,
+            position,
+            pool,
+            if want_logits { Some(&mut *logits) } else { None },
+        )?;
+        Ok(true)
+    })();
+    match res {
+        Ok(true) => {
+            if check {
+                cuda_check(globals, layers, cfg, state, &dev, ids, position, inv_freq, pool, want_logits);
+            }
+            state.token_history.extend_from_slice(ids);
+            state.pos = position + ids.len();
+            if !want_logits {
+                logits.clear();
+            }
+            state.cuda = Some(dev);
+            if want_logits && position == 0 && ids.len() >= 32 {
+                cuda_prompt_done(layers, state);
+            }
+            true
+        }
+        Ok(false) => {
+            state.cuda = Some(dev);
+            false
+        }
+        Err(e) => {
+            eprintln!("qwen4 cuda: {e}; the sequence continues on the host path");
+            drop(dev);
+            state.cuda_off = true;
+            false
+        }
+    }
+}
+
+/// Check mode: run `ids` through the host path on its own state and compare
+/// every stage of the last token with the device's trace.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_check(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    dev: &crate::gpu_cuda::qwen4::Dev,
+    ids: &[u32],
+    position: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    want_logits: bool,
+) {
+    if position == 0 || state.cuda_ref.is_none() {
+        let mut r = Box::new(State::new(layers.len()));
+        r.cuda_off = true;
+        r.device_off = true;
+        state.cuda_ref = Some(r);
+    }
+    let Some(host) = state.cuda_ref.as_mut() else {
+        return;
+    };
+    if host.pos != position {
+        eprintln!("qwen4 cuda check: the host reference is at {} and the chunk at {position}; not compared", host.pos);
+        return;
+    }
+    let mut host_logits = Vec::new();
+    let mut tap = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let last = i + 1 == ids.len();
+        if last {
+            CUDA_TAP.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        }
+        // exact float activations: the default int8-activation kernels differ
+        // from any f32 path by more than the device does
+        crate::qtensor::float_activations_scope(|| {
+            crate::gpu::cpu_scope(|| {
+                forward_token(
+                    globals,
+                    layers,
+                    cfg,
+                    host,
+                    id,
+                    position + i,
+                    inv_freq,
+                    pool,
+                    &mut host_logits,
+                    last && want_logits,
+                );
+            })
+        });
+        if last {
+            tap = CUDA_TAP.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        }
+    }
+    // relative error of a stage: the largest difference over the host's largest value
+    let rel = |a: &[f32], b: &[f32]| -> f32 {
+        if a.len() != b.len() {
+            return f32::INFINITY;
+        }
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let diff = a.iter().zip(b).fold(0f32, |m, (x, y)| if (x - y).is_nan() { f32::INFINITY } else { m.max((x - y).abs()) });
+        diff / scale
+    };
+    let at = position + ids.len() - 1;
+    let mut worst = (0f32, "", 0usize);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = usize::MAX;
+    for (label, li, dv) in &dev.trace {
+        let Some((_, _, hv)) = tap.iter().find(|(l, i, _)| l == label && i == li) else {
+            continue;
+        };
+        let r = rel(hv, dv);
+        if r > worst.0 || worst.1.is_empty() {
+            worst = (r, label, *li);
+        }
+        if *label == "logits" {
+            let arg = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0;
+            let (ha, da) = (arg(hv), arg(dv));
+            lines.push(format!(
+                "qwen4 cuda check pos {at} logits: rel {r:.2e}, argmax host {ha} cuda {da} ({})",
+                if ha == da { "same" } else { "DIFFERENT" }
+            ));
+            continue;
+        }
+        if *li != cur {
+            cur = *li;
+            lines.push(format!("qwen4 cuda check pos {at} L{li}:"));
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" {label} {r:.1e}"));
+        }
+    }
+    if ids.len() > 1 || std::env::var_os("CMF_QWEN_CUDA_CHECK_ALL").is_some() {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    } else if let Some(l) = lines.iter().rev().find(|l| l.contains(" logits: ")) {
+        eprintln!("{l}");
+    }
+    eprintln!(
+        "qwen4 cuda check pos {at}: {} stages compared, worst {} at layer {} rel {:.2e}",
+        dev.trace.len(),
+        worst.1,
+        worst.2,
+        worst.0
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn forward_tokens(
     globals: &Globals,
@@ -3527,12 +4753,26 @@ pub fn forward_tokens(
     logits: &mut Vec<f32>,
     want_logits: bool,
 ) {
+    #[cfg(feature = "cuda")]
+    if cuda_forward(globals, layers, cfg, state, ids, pos0, inv_freq, pool, logits, want_logits) {
+        return;
+    }
     #[cfg(feature = "gpu")]
     if ids.len() > 1 && state.masked {
         state.masked = false;
         if let Some(d) = state.dev.as_mut() {
             d.set_masked(false);
         }
+    }
+    // a new prompt after a decode: the decode's routing is one row (`CMF_QWEN_ROUTE_ROWS`)
+    #[cfg(feature = "gpu")]
+    if ids.len() > 1 && state.row_gen {
+        route_row("gen", &state.route_hist, state.route_tokens, &mut state.row_snap, &mut state.row_snap_tokens);
+        state.row_gen = false;
+        trace_mark(1);
+        trace_flush();
+    } else if ids.len() > 1 && pos0 == 0 {
+        trace_mark(1);
     }
     forward_tokens_stream(globals, layers, cfg, state, ids, pos0, inv_freq, pool, logits, want_logits);
     // the prompt's last chunk: the arena gets the narrow bundle this request needs
@@ -3562,6 +4802,9 @@ fn forward_tokens_stream(
     {
         use crate::gpu_wgpu::qwen4 as q4;
         if stream_on() && !state.resident_all && !state.device_off && ids.len() > 3 * q4::TMAX {
+            // the chunk's n-gram rows leave the disk while the first frame and layer 0 run
+            let seen = pos0.min(state.token_history.len());
+            ple_prefetch(layers, cfg, &state.token_history[..seen], ids);
             let head = if state.dev.is_none() || pos0 == 0 || state.pos != pos0 { q4::TMAX } else { 0 };
             if head > 0 {
                 let mut lg = Vec::new();
@@ -3784,7 +5027,12 @@ fn forward_tokens_device(
 ) -> bool {
     use crate::gpu_wgpu::qwen4 as q4;
     let ntok = ids.len();
-    let cap = if state.resident_all && !want_logits { q4::TROWS } else { q4::TMAX };
+    // a copy frame: a decode forward past TMAX tokens, with or without logits (no far
+    // field: its spec stash holds a window)
+    let frame_ok = state.copy_frame
+        && (state.resident_all || state.masked)
+        && state.dev.as_ref().is_some_and(|d| d.o1.is_none());
+    let cap = if (state.resident_all && !want_logits) || frame_ok { q4::TROWS } else { q4::TMAX };
     if ntok == 0 || ntok > cap {
         return false;
     }
@@ -4237,7 +5485,11 @@ fn forward_tokens_device(
         }
     }
     // a masked decode (`CMF_QWEN_MASK`) has no cold winner either
-    let resident_all = state.resident_all || (state.masked && ntok <= q4::TMAX);
+    let frame_mode = state.copy_frame && ntok > q4::TMAX;
+    let resident_all = state.resident_all || (state.masked && (ntok <= q4::TMAX || frame_mode));
+    // the frame verifies drafts: every row's argmax comes back with the last row
+    let frame_verify = frame_mode && want_logits && state.frame_check;
+    let frame_dbg = frame_verify && copy_frame_debug();
     // A prompt chunk nobody reads anything back from (resident mode: no cold
     // winner to complete; no logits, no window, no profile) is left running
     // while the next one is encoded. Anything else first drains it.
@@ -4281,7 +5533,7 @@ fn forward_tokens_device(
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4)
             .max(1);
-        let split = want_logits && ntok <= crate::gpu_wgpu::qwen4::TMAX;
+        let split = want_logits && (ntok <= crate::gpu_wgpu::qwen4::TMAX || frame_mode);
         chain_env
             .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { layers.len() + 1 })
             .max(1)
@@ -4325,7 +5577,9 @@ fn forward_tokens_device(
     // holds a window of four (MTP k = 3); five rows (k = 4) overran it.
     let logit_rows = match (want_logits, snapshot) {
         (false, _) => 0,
-        (true, false) => 1,
+        // (a copy frame's ids ride behind its one row)
+        (true, false) if frame_dbg => ntok + 1,
+        (true, false) => 1 + usize::from(frame_verify),
         (true, true) => ntok,
     };
     let stage_need = q4::chain_stage_bytes(
@@ -4336,6 +5590,10 @@ fn forward_tokens_device(
     );
     if !dev.ensure_stage(stage_need) {
         failed = Some("readback stage allocation");
+    }
+    // a copy frame keeps no per-token snapshot: the state before it, whole
+    if frame_verify && !dev.checkpoint(&g) {
+        failed = Some("copy frame checkpoint");
     }
     for (t, &id) in ids.iter().enumerate() {
         let mut emb = vec![0.0f32; cfg.hidden];
@@ -4357,6 +5615,11 @@ fn forward_tokens_device(
     dev.gated = chain_len > 1 && !resident_all;
     let mut fi = 0usize;
     let mut vocab_out = 0usize;
+    let free_run = lean
+        && resident_all
+        && !dev.gated
+        && !q4::ts_probe()
+        && std::env::var("CMF_QWEN_FREE_RUN").as_deref() != Ok("0");
     // Single-frame chains are encoded one frame ahead, while the card runs
     // the current one: with one frame per chain the next chain always
     // starts at the next frame, miss or not.
@@ -4383,6 +5646,8 @@ fn forward_tokens_device(
             &'static str,
         > {
             let mut enc = q4::new_encoder("qwen4-chain").ok_or("encoder")?;
+            // (the launch probe needs CMF_QWEN_CHAINS=1: the next chain's encode would clear this one's marks)
+            q4::dts_reset();
             let merge = q4::merge_guard(&enc);
             q4::ts_mark(&mut enc, 0);
             // chain head: the previous frame's MoE output with its cold winners
@@ -4405,7 +5670,7 @@ fn forward_tokens_device(
                     let hw = head_hc.as_ref().ok_or("head hyper-connection indices")?;
                     // logits of the chunk's last token; of every token in a
                     // verify window
-                    let first = if snapshot { 0 } else { ntok - 1 };
+                    let first = if snapshot || frame_dbg { 0 } else { ntok - 1 };
                     let (lb, vocab, ls) = q4::encode_head(
                         &mut enc,
                         dev,
@@ -4426,6 +5691,15 @@ fn forward_tokens_device(
                     *vocab_out = vocab;
                     lstride = ls;
                     stage_off += bytes.div_ceil(16) * 16;
+                    if frame_verify {
+                        // every row's argmax, behind the last row
+                        let idb = q4::encode_argmax_rows(&mut enc, dev, &lb, vocab, ls, ntok)
+                            .ok_or("copy frame argmax")?;
+                        if !q4::copy_to_stage(&mut enc, dev, &idb, 0, stage_off, (ntok * 4) as u64) {
+                            return Err("copy frame ids overrun the readback stage");
+                        }
+                        stage_off += ((ntok * 4) as u64).div_ceil(16) * 16;
+                    }
                     continue;
                 }
                 let layer = &layers[f];
@@ -4519,6 +5793,25 @@ fn forward_tokens_device(
             break;
         }
         let t0 = std::time::Instant::now();
+        // A layer chain of a lean frame with every expert resident brings nothing back (no frame can miss, nothing is
+        // copied out): it is left running and the next chain follows it into the queue as soon as it is encoded; only
+        // the chain with the head is waited on. A fence per chain cost the card an idle gap per chain — the next
+        // chain's queue submission ran after it (`CMF_QWEN_FREE_RUN=0`: the fence per chain).
+        if free_run && hi < frames_total && stage_off == 0 && arena.tier.is_none() {
+            let uploads = arena.take_uploads();
+            if q4::submit_indexed(uploads, cb).is_none() {
+                failed = Some("submit");
+                break;
+            }
+            arena.rearm_uploads();
+            for f in fi..hi.min(n) {
+                dev.commit(f);
+            }
+            pf.wait += t0.elapsed();
+            pf.chains += 1;
+            fi = hi;
+            continue;
+        }
         // staged admissions land before the frame that reads their slots:
         // their copies go first in the frame's own queue submission
         let uploads = arena.take_uploads();
@@ -4651,6 +5944,7 @@ fn forward_tokens_device(
                 }
                 pf.admit += ta.elapsed();
             }
+            let mut trace_row: Option<Vec<u16>> = (!check && trace_on()).then(|| Vec::with_capacity(ntok * top_k));
             for t in 0..ntok {
                 let w_off = frame_off + t * cs;
                 let words: Vec<u32> = bytes[w_off..w_off + 4 * top_k * 4]
@@ -4667,6 +5961,12 @@ fn forward_tokens_device(
                     pr.note(f, &picks);
                 }
                 note_route(&mut state.route_hist, n, g.n_experts, f, &picks);
+                if route_wstat() {
+                    note_route_weights(&words[2 * top_k..4 * top_k]);
+                }
+                if let Some(tr) = trace_row.as_mut() {
+                    tr.extend((0..top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)));
+                }
                 if check && ntok == 1 && tap_layer() == Some(f) && position < 3 && f + 1 == hi {
                     // the frame's scratch is still the layer's own: read it
                     let bufs = q4::tap_bufs(dev, &g);
@@ -4783,6 +6083,9 @@ fn forward_tokens_device(
                     }
                 }
             }
+            if let Some(tr) = trace_row {
+                trace_frame(pos0, f, ntok, top_k, &tr);
+            }
             if any_cold_in_frame {
                 pf.layers_with_cold += 1;
                 miss_at = Some(f);
@@ -4806,10 +6109,44 @@ fn forward_tokens_device(
                             .collect()
                     };
                     if snapshot {
-                        state.window_logits = (0..ntok).map(|t| read(lo + t * stride)).collect();
-                        *logits = state.window_logits.last().cloned().unwrap_or_default();
+                        // the rows stay as the card wrote them: the round reads their argmax in place and turns
+                        // only the row it samples from into floats
+                        state.window_rows =
+                            Some(WindowRows { bytes, lo, stride, vocab: vocab_out, rows: ntok });
                     } else {
-                        *logits = read(lo);
+                        let back = if frame_dbg { ntok } else { 1 };
+                        *logits = read(lo + (back - 1) * stride);
+                        if frame_verify {
+                            let io = lo + (back * stride).div_ceil(16) * 16;
+                            state.frame_ids = bytes.get(io..io + ntok * 4).map(|b| {
+                                b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+                            });
+                        }
+                        if frame_dbg {
+                            // the host's argmax of every row (highest index on a tie, as the card's)
+                            let host: Vec<(u32, f32, f32)> = (0..ntok)
+                                .map(|r| {
+                                    let row = read(lo + r * stride);
+                                    let (mut bi, mut bv, mut second) = (0usize, f32::MIN, f32::MIN);
+                                    for (i, &v) in row.iter().enumerate() {
+                                        if v >= bv {
+                                            second = bv;
+                                            bv = v;
+                                            bi = i;
+                                        } else if v > second {
+                                            second = v;
+                                        }
+                                    }
+                                    (bi as u32, bv, bv - second)
+                                })
+                                .collect();
+                            eprintln!(
+                                "qwen4-frame-debug nt={ntok} card={:?} host={:?} margin={:?}",
+                                state.frame_ids.as_deref().unwrap_or(&[]),
+                                host.iter().map(|h| h.0).collect::<Vec<_>>(),
+                                host.iter().map(|h| (h.2 * 100.0).round() / 100.0).collect::<Vec<_>>(),
+                            );
+                        }
                     }
                 }
                 fi = hi;
@@ -5063,6 +6400,14 @@ fn forward_stream_device(
         }
     }
     let (mut t_admit, mut t_ple, mut t_enc, mut t_wait) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut t_sub, mut waits, mut quick_waits) = (Duration::ZERO, 0usize, 0usize);
+    // probes: a host pause before each layer's wait (does the card run while the host works?)
+    // and the launch profile of every layer's first frame
+    let lag_ms = std::env::var("CMF_QWEN_STREAM_LAG_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let stream_dts = std::env::var("CMF_QWEN_STREAM_DTS").as_deref() == Ok("1") && q4::dts_on();
+    if stream_dts {
+        q4::dts_stream_line(None);
+    }
     let fill_n0 = FILL_N.load(std::sync::atomic::Ordering::Relaxed);
     let mut prev: Option<wgpu::SubmissionIndex> = None;
     let mut failed: Option<&'static str> = None;
@@ -5099,6 +6444,10 @@ fn forward_stream_device(
                 failed = Some("encoder");
                 break 'layers;
             };
+            let dts = stream_dts && k == 0;
+            if dts {
+                q4::dts_reset();
+            }
             if !dev.stream_swap(&mut enc, &g, k, nt, false, f > 0) {
                 failed = Some("bank");
                 break 'layers;
@@ -5114,23 +6463,42 @@ fn forward_stream_device(
             dev.clear_pending();
             dev.route_cap_copy(&mut enc, &g, ((f * frames.len() + k) * q4::TROWS * cs) as u64, nt);
             dev.stream_swap(&mut enc, &g, k, nt, true, true);
+            if dts {
+                q4::dts_flush(&mut enc);
+            }
             let cb = q4::finish_frame(enc);
             t_enc += te.elapsed();
+            let ts = Instant::now();
             let Some(idx) = q4::submit_indexed(uploads.take(), cb) else {
                 failed = Some("submit");
                 break 'layers;
             };
             dev.commit(f);
+            t_sub += ts.elapsed();
+            if dts {
+                // the marks are read before the next frame reuses the query set
+                if !q4::wait_submission(idx.clone()) {
+                    failed = Some("wait");
+                    break 'layers;
+                }
+                q4::dts_take();
+            }
             if k + 1 == frames.len()
                 && let Some(p) = prev.replace(idx)
             {
+                if lag_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(lag_ms));
+                }
                 // the card holds this layer while the host admits the next
                 let tw = Instant::now();
                 if !q4::wait_submission(p) {
                     failed = Some("wait");
                     break 'layers;
                 }
-                t_wait += tw.elapsed();
+                let w = tw.elapsed();
+                waits += 1;
+                quick_waits += usize::from(w < Duration::from_micros(300));
+                t_wait += w;
             }
         }
         // (the host tier gets its slots back only once the card ran every copy: at the end)
@@ -5146,6 +6514,9 @@ fn forward_stream_device(
     if let Some(a) = state.gpu_pool.as_mut() {
         a.uploads_done();
         a.flush_uploads();
+    }
+    if stream_dts {
+        q4::dts_stream_line(Some(&format!("qwen4-stream-dts pos={pos0} ntok={ntok}")));
     }
     if let Some(why) = failed {
         tracing::warn!("qwen4 device path off: streamed prompt: {why}");
@@ -5186,7 +6557,7 @@ fn forward_stream_device(
             t_route.as_secs_f64() * 1e3
         );
         eprintln!(
-            "qwen4-stream pos={pos0} ntok={ntok} frames={} total={:.1}ms admit={:.1}ms ple={:.1}ms encode={:.1}ms wait={:.1}ms fills={}",
+            "qwen4-stream pos={pos0} ntok={ntok} frames={} total={:.1}ms admit={:.1}ms ple={:.1}ms encode={:.1}ms wait={:.1}ms fills={} submit={:.1}ms quick_waits={quick_waits}/{waits}",
             frames.len(),
             t_all.elapsed().as_secs_f64() * 1e3,
             t_admit.as_secs_f64() * 1e3,
@@ -5194,6 +6565,7 @@ fn forward_stream_device(
             t_enc.as_secs_f64() * 1e3,
             t_wait.as_secs_f64() * 1e3,
             FILL_N.load(std::sync::atomic::Ordering::Relaxed) - fill_n0,
+            t_sub.as_secs_f64() * 1e3,
         );
     }
     true
@@ -5238,6 +6610,81 @@ fn phi_dump(hist: &[u32], tokens: usize, last: &mut Vec<u32>, last_tokens: &mut 
     *last_tokens = tokens;
 }
 
+/// `CMF_QWEN_ROUTE_ROWS=<prefix>`: one row per request phase, appended to `<prefix>.prompt`
+/// (at the prompt's end) or `<prefix>.gen` (at the next prompt or reset): the phase's
+/// token count, then its `[layers][experts]` winner counts, u32 LE.
+#[cfg(feature = "gpu")]
+fn route_row(kind: &str, hist: &[u32], tokens: usize, snap: &mut Vec<u32>, snap_tokens: &mut usize) {
+    let Ok(prefix) = std::env::var("CMF_QWEN_ROUTE_ROWS") else { return };
+    if hist.is_empty() {
+        return;
+    }
+    if snap.len() != hist.len() {
+        *snap = vec![0; hist.len()];
+    }
+    let mut row = Vec::with_capacity(hist.len() * 4 + 4);
+    row.extend_from_slice(&(tokens.saturating_sub(*snap_tokens) as u32).to_le_bytes());
+    for (h, s) in hist.iter().zip(snap.iter()) {
+        row.extend_from_slice(&h.saturating_sub(*s).to_le_bytes());
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{prefix}.{kind}")) {
+        let _ = f.write_all(&row);
+    }
+    snap.copy_from_slice(hist);
+    *snap_tokens = tokens;
+}
+
+/// `CMF_QWEN_ROUTE_TRACE=<file>`: every decode frame's winners (a frame = one layer of a
+/// window of at most TMAX tokens): pos0 u32, layer u16, ntok u16, then ntok × top_k
+/// expert ids u16 (u16::MAX: none), LE — what an arena policy is replayed on.
+#[cfg(feature = "gpu")]
+static ROUTE_TRACE: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "gpu")]
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CMF_QWEN_ROUTE_TRACE").is_some())
+}
+
+#[cfg(feature = "gpu")]
+fn trace_frame(pos0: usize, layer: usize, ntok: usize, top_k: usize, picks: &[u16]) {
+    use std::io::Write;
+    let mut g = ROUTE_TRACE.lock().unwrap();
+    if g.is_none() {
+        let Ok(path) = std::env::var("CMF_QWEN_ROUTE_TRACE") else { return };
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => *g = Some(std::io::BufWriter::with_capacity(1 << 20, f)),
+            Err(_) => return,
+        }
+    }
+    let w = g.as_mut().unwrap();
+    let mut rec = Vec::with_capacity(8 + ntok * top_k * 2);
+    rec.extend_from_slice(&(pos0 as u32).to_le_bytes());
+    rec.extend_from_slice(&(layer as u16).to_le_bytes());
+    rec.extend_from_slice(&(ntok as u16).to_le_bytes());
+    for &p in picks.iter().take(ntok * top_k) {
+        rec.extend_from_slice(&p.to_le_bytes());
+    }
+    let _ = w.write_all(&rec);
+}
+
+/// A request boundary in the trace: pos0 = u32::MAX, layer 1 = a prompt starts, 2 = its decode starts.
+#[cfg(feature = "gpu")]
+fn trace_mark(kind: u16) {
+    if trace_on() {
+        trace_frame(u32::MAX as usize, kind as usize, 0, 0, &[]);
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn trace_flush() {
+    use std::io::Write;
+    if let Some(w) = ROUTE_TRACE.lock().unwrap().as_mut() {
+        let _ = w.flush();
+    }
+}
+
 /// Expert packs (`CMF_QWEN_PACKS=<dir>`): narrow bundles of experts, one per task
 /// (rust, web, python, php, …), each a routing profile of its task's text, chosen per
 /// request by the patent-1 resonance router: every pack keeps an isolated topology (a
@@ -5261,8 +6708,24 @@ impl PackSet {
         let v: serde_json::Value = match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
             Some(v) => v,
             None => {
-                tracing::warn!("qwen4 packs: {} unreadable", path.display());
-                return None;
+                // no topologies: the packs are chosen by name only (`CMF_QWEN_TASK_HINT`)
+                let mut set = PackSet { phi_layers: 0, names: Vec::new(), subs: Vec::new(), profiles: Vec::new() };
+                let mut files: Vec<_> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).collect();
+                files.sort();
+                for p in files {
+                    let Some(name) = p.file_name().and_then(|s| s.to_str()).and_then(|s| s.strip_suffix(".profile")) else {
+                        continue;
+                    };
+                    if let Some(pr) = ExpertProfile::load(&p.to_string_lossy(), n_layers, ne) {
+                        set.names.push(name.to_string());
+                        set.profiles.push(pr);
+                    }
+                }
+                if set.names.is_empty() {
+                    tracing::warn!("qwen4 packs: {} unreadable and no profiles", path.display());
+                    return None;
+                }
+                return Some(set);
             }
         };
         let phi_layers = v["phi_layers"].as_u64()? as usize;
@@ -5287,8 +6750,43 @@ impl PackSet {
         (!set.names.is_empty()).then_some(set)
     }
 
+    /// `CMF_QWEN_TASK_HINT` as `label=weight,…` (two or more known labels): the packs and
+    /// their weights, summing to 1.
+    fn hint_weights(&self) -> Option<Vec<(usize, f32)>> {
+        let text = std::fs::read_to_string(std::env::var("CMF_QWEN_TASK_HINT").ok()?).ok()?;
+        let mut w: Vec<(usize, f32)> = text
+            .trim()
+            .split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let i = self.names.iter().position(|n| n == k.trim())?;
+                Some((i, v.trim().parse::<f32>().ok()?.max(0.0)))
+            })
+            .collect();
+        let s: f32 = w.iter().map(|x| x.1).sum();
+        if w.len() < 2 || s <= 0.0 {
+            return None;
+        }
+        w.iter_mut().for_each(|x| x.1 /= s);
+        Some(w)
+    }
+
     /// The pack whose topology reconstructs φ best, and every pack's error.
     fn decide(&self, hist: &[u32], ne: usize) -> Option<(usize, Vec<f32>)> {
+        // a task named from outside (a text router: `CMF_QWEN_TASK_HINT=<file>` holds the label)
+        if let Some(label) = std::env::var("CMF_QWEN_TASK_HINT").ok().and_then(|p| std::fs::read_to_string(p).ok())
+            && let Some(i) = self.names.iter().position(|n| n == label.trim())
+        {
+            return Some((i, Vec::new()));
+        }
+        if let Some(w) = self.hint_weights()
+            && let Some(&(i, _)) = w.iter().max_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((i, Vec::new()));
+        }
+        if self.subs.is_empty() {
+            return None;
+        }
         let phi = route_phi(hist, ne, self.phi_layers)?;
         let errs: Vec<f32> = self.subs.iter().map(|(m, b, r)| crate::router::recon_error(&phi, m, b, *r)).collect();
         let best = errs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1))?.0;
@@ -5315,6 +6813,25 @@ fn route_phi(hist: &[u32], ne: usize, layers: usize) -> Option<Vec<f32>> {
     Some(phi)
 }
 
+/// The expert core of `CMF_QWEN_CORE=<profile>` (`[layer] -> experts` with a nonzero
+/// count), read once.
+#[cfg(feature = "gpu")]
+fn core_set(n_layers: usize, ne: usize) -> Option<Vec<Vec<usize>>> {
+    static CORE: std::sync::OnceLock<Option<Vec<Vec<usize>>>> = std::sync::OnceLock::new();
+    CORE.get_or_init(|| {
+        let path = std::env::var("CMF_QWEN_CORE").ok()?;
+        let Some(p) = ExpertProfile::load(&path, n_layers, ne) else {
+            tracing::warn!("qwen4 core: {path} does not fit this model");
+            return None;
+        };
+        let core: Vec<Vec<usize>> =
+            (0..n_layers).map(|l| (0..ne).filter(|&e| p.counts[l * ne + e] > 0).collect()).collect();
+        eprintln!("qwen4-core: {} experts pinned ({} a layer on average)", core.iter().map(Vec::len).sum::<usize>(), core.iter().map(Vec::len).sum::<usize>() / n_layers.max(1));
+        Some(core)
+    })
+    .clone()
+}
+
 /// The prompt has run: on a card that cannot hold every expert, the arena is refilled
 /// with the narrow bundle this request needs — the chosen pack's experts blended with
 /// the prompt's own routing (`CMF_QWEN_PACK_MIX`, the prompt's share, default 0.5; 1
@@ -5322,6 +6839,12 @@ fn route_phi(hist: &[u32], ne: usize, layers: usize) -> Option<Vec<f32>> {
 /// there are no packs). Each layer gets the same share of the arena, ranked by score.
 #[cfg(feature = "gpu")]
 fn prompt_done(layers: &[Layer], state: &mut State) {
+    route_row("prompt", &state.route_hist, state.route_tokens, &mut state.row_snap, &mut state.row_snap_tokens);
+    state.row_gen = true;
+    trace_mark(2);
+    if let Some(a) = state.gpu_pool.as_mut() {
+        a.sweep_clear();
+    }
     if state.resident_all || state.device_off || state.gpu_pool.is_none() || state.route_tokens == 0 {
         return;
     }
@@ -5346,40 +6869,65 @@ fn prompt_done(layers: &[Layer], state: &mut State) {
         None => 1.0,
         Some(_) => std::env::var("CMF_QWEN_PACK_MIX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5f32).clamp(0.0, 1.0),
     };
-    let pack_counts = choice.as_ref().map(|(i, _)| &packs.unwrap().profiles[*i].counts);
+    // the chosen pack, or several close tasks at once (`CMF_QWEN_TASK_HINT` holding
+    // `label=weight,label=weight`: the text router's probabilities), each a per-layer share
+    let weighted: Vec<(usize, f32)> = match packs.and_then(PackSet::hint_weights) {
+        Some(w) => w,
+        None => choice.as_ref().map(|(i, _)| vec![(*i, 1.0)]).unwrap_or_default(),
+    };
     // per layer: experts by blended share, then round-robin over the layers by rank
     let mut per_layer: Vec<Vec<(f32, usize)>> = Vec::with_capacity(n);
     for l in 0..n {
         let h = &state.route_hist[l * ne..(l + 1) * ne];
         let hs = h.iter().map(|&c| c as f32).sum::<f32>().max(1.0);
-        let (pc, ps) = match pack_counts {
-            Some(pc) => {
-                let row = &pc[l * ne..(l + 1) * ne];
-                (Some(row), row.iter().map(|&c| c as f32).sum::<f32>().max(1.0))
+        let mut pk = vec![0f32; ne];
+        for &(i, w) in &weighted {
+            let row = &packs.unwrap().profiles[i].counts[l * ne..(l + 1) * ne];
+            let ps = row.iter().map(|&c| c as f32).sum::<f32>().max(1.0);
+            for (p, &c) in pk.iter_mut().zip(row) {
+                *p += w * c as f32 / ps;
             }
-            None => (None, 1.0),
-        };
+        }
         let mut v: Vec<(f32, usize)> = (0..ne)
             .map(|e| {
                 let own = h[e] as f32 / hs;
-                let pk = pc.map_or(0.0, |r| r[e] as f32 / ps);
-                (mix * own + (1.0 - mix) * pk, e)
+                (mix * own + (1.0 - mix) * pk[e], e)
             })
             .filter(|&(sc, _)| sc > 0.0)
             .collect();
         v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         per_layer.push(v);
     }
+    // the expert core every task shares (`CMF_QWEN_CORE=<profile>`: its nonzero experts)
+    // stays in the arena for good and leads the ranking; the request loads the rest
+    let core = core_set(n, ne);
     let mut ranked: Vec<(usize, usize)> = Vec::new();
-    for r in 0..ne {
+    if let Some(c) = core.as_ref() {
+        for (l, row) in c.iter().enumerate() {
+            ranked.extend(row.iter().map(|&e| (l, e)));
+        }
+    }
+    let in_core = |l: usize, e: usize| core.as_ref().is_some_and(|c| c[l].contains(&e));
+    let mut cursor = vec![0usize; n];
+    for _ in 0..ne {
         for (l, v) in per_layer.iter().enumerate() {
-            if let Some(&(_, e)) = v.get(r) {
-                ranked.push((l, e));
+            while let Some(&(_, e)) = v.get(cursor[l]) {
+                cursor[l] += 1;
+                if !in_core(l, e) {
+                    ranked.push((l, e));
+                    break;
+                }
             }
         }
     }
     let triples: Vec<Vec<(usize, usize, usize)>> = layers.iter().map(|l| l.expert_ids.clone()).collect();
     let arena = state.gpu_pool.as_mut().unwrap();
+    if let Some(c) = core.as_ref()
+        && !state.core_pinned
+    {
+        arena.set_pins(c);
+        state.core_pinned = true;
+    }
     let (evicted, admitted) = arena.repack(&model, &ranked, &triples);
     arena.flush_uploads();
     // every layer must hold its top_k for a masked ranking
@@ -5530,6 +7078,64 @@ fn mtp_k(raw: Option<&str>) -> (usize, bool) {
         Some(Ok(v)) => (v.clamp(1, max), !(1..=max).contains(&v)),
         Some(Err(_)) => (3, true),
     }
+}
+
+/// A verify window's logits as they came off the card: `rows` rows of `vocab` little-endian f32, row `t` at
+/// `lo + t·stride` of `bytes`.
+struct WindowRows {
+    bytes: Vec<u8>,
+    lo: usize,
+    stride: usize,
+    vocab: usize,
+    rows: usize,
+}
+
+impl WindowRows {
+    fn row(&self, t: usize) -> &[u8] {
+        let o = self.lo + t * self.stride;
+        &self.bytes[o..o + self.vocab * 4]
+    }
+
+    fn floats(&self, t: usize) -> Vec<f32> {
+        self.row(t).chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    }
+}
+
+/// The first index of the largest value in a row of little-endian f32; a NaN never wins and a row without a value
+/// above −∞ answers 0 — what a scalar first-maximum fold answers, as two passes the compiler turns into vector code
+/// (the fold's compare-and-carry chain ran a quarter of a millisecond per 248 320-entry row, four rows a round).
+fn argmax_le(row: &[u8]) -> usize {
+    const L: usize = 16;
+    let val = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let mut m = [f32::NEG_INFINITY; L];
+    let mut it = row.chunks_exact(4 * L);
+    for c in &mut it {
+        for (j, b) in c.chunks_exact(4).enumerate() {
+            let x = val(b);
+            m[j] = if x > m[j] { x } else { m[j] };
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    for &x in &m {
+        best = if x > best { x } else { best };
+    }
+    for b in it.remainder().chunks_exact(4) {
+        let x = val(b);
+        best = if x > best { x } else { best };
+    }
+    if best == f32::NEG_INFINITY {
+        return 0;
+    }
+    for (ci, c) in row.chunks(4 * L).enumerate() {
+        let mut hit = false;
+        for b in c.chunks_exact(4) {
+            hit |= val(b) == best;
+        }
+        if hit {
+            return ci * L + c.chunks_exact(4).position(|b| val(b) == best).unwrap_or(0);
+        }
+    }
+    0
 }
 
 /// One speculative round's outcome, in the shape the generation loop
@@ -5778,6 +7384,10 @@ pub fn spec_round(
     pool: Option<&Pool>,
 ) -> Option<SpecRound> {
     use crate::gpu_wgpu::qwen4 as q4;
+    #[cfg(feature = "cuda")]
+    if crate::gpu_cuda::selected() {
+        return cuda_spec_round(globals, layers, cfg, state, next_pos, all_ids, pool);
+    }
     if state.device_off || state.dev.is_none() || next_pos == 0 || all_ids.len() != next_pos + 1 {
         return None;
     }
@@ -5792,8 +7402,35 @@ pub fn spec_round(
     let g = device_geom(cfg, &first.moe, gu_q2);
     let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
     let t_round = std::time::Instant::now();
+    // the host between two rounds: sampling the round's last row, detokenizing and streaming its tokens
+    let t_gap = state.round_end.take().map(|t| t.elapsed()).unwrap_or_default();
+    if prof && (t_gap.is_zero() || t_gap.as_millis() > 100) {
+        // a request's first round: its context, for offline draft studies
+        eprintln!("qwen4-ctx pos={next_pos} ids={:?}", all_ids);
+    }
     // ── drafts ──
-    let (k, drafts) = {
+    let sfx = suffix_cfg();
+    // The context repeating itself (an edit of a file it was shown, a test
+    // after a test): what followed its tail before is the draft, and no
+    // chain runs.
+    // A copy that has held goes on as a frame (`CMF_QWEN_COPY_FRAME`).
+    let frame_k = copy_frame_cfg()
+        .filter(|_| {
+            (state.resident_all || state.masked) && state.dev.as_ref().is_some_and(|d| d.o1.is_none())
+        })
+        .and_then(|(most, factor)| copy_frame_drafts(most, factor, state.copy_run, state.draft_budget));
+    let copy = sfx.filter(|s| s.strong > 0 && state.mtp.is_some()).and_then(|s| {
+        let (m, cont) = suffix_draft(all_ids, s.strong, frame_k.unwrap_or(s.max));
+        (m > 0).then_some((m, cont))
+    });
+    let copied = copy.is_some();
+    // a continuation that fits a window goes as a window, snapshots and all
+    let framed = frame_k.is_some() && copy.as_ref().is_some_and(|(_, cont)| cont.len() + 1 > q4::TMAX);
+    let mut sfx_note = String::new();
+    let (k, drafts, conf) = if let Some((m, cont)) = copy {
+        sfx_note = format!(" sfx={}:{m}", if framed { "frame" } else { "copy" });
+        (cont.len(), cont, Vec::new())
+    } else {
         let head = state.mtp.as_mut()?;
         // The draft head routes over its own expert set: a backbone cut to
         // K experts a layer (`moe-defrag --keep`) keeps the head's full 512,
@@ -5824,18 +7461,32 @@ pub fn spec_round(
             return None;
         }
         let mut drafts: Vec<u32> = Vec::with_capacity(k);
+        // the chain's confidence in each draft (the device chain, when asked)
+        let mut conf: Vec<f32> = Vec::new();
         let tok_in = all_ids[next_pos];
         // ── the whole chain in one submit: each cell's argmax is re-embedded
         // on the card for the next; the host reads k ids, not k×vocab logits ──
         // opt-in: it pins the 0.6 GB embedding table, which costs the arena
         // more than the host round trips cost the round
         let device_chain = std::env::var("CMF_QWEN_MTP_DEVICE_DRAFT").as_deref() == Ok("1");
+        // The chain's head reads a vocabulary prefix (`CMF_QWEN_DRAFT_VOCAB`
+        // rows, 0 = all): a draft outside it is a draft the window rejects,
+        // never a wrong token. Text whose ids sit above the prefix (Cyrillic
+        // and CJK live past 131072) takes the full head while it lasts.
+        let draft_rows = {
+            let cut = draft_vocab_rows();
+            let guard = cut.max(131072) as u32;
+            let tail = &all_ids[all_ids.len().saturating_sub(16)..];
+            if cut > 0 && tail.iter().all(|&t| t < guard) { cut } else { 0 }
+        };
         let mut chained = false;
+        let (minp, report) = draft_gate();
+        let conf_buf = if report { q4::draft_conf_buf() } else { None };
         if device_chain
             && let Some(embed_idx) = globals.embed_idx
             && let Some(ids_buf) = q4::draft_ids(tok_in)
         {
-            let mut run = || -> Option<Vec<u32>> {
+            let mut run = || -> Option<(Vec<u32>, Vec<f32>)> {
                 let mut enc = q4::new_encoder("qwen4-mtp-draft")?;
                 let merge = q4::merge_guard(&enc);
                 for j in 0..k {
@@ -5903,23 +7554,34 @@ pub fn spec_round(
                         lm_head,
                         false,
                         1,
+                        draft_rows,
                     )?;
-                    q4::encode_argmax(&mut enc, mdev, &lb, vocab, &ids_buf, j + 1)?;
+                    q4::encode_argmax(&mut enc, mdev, &lb, vocab, &ids_buf, j + 1, draft_rows > 0)?;
+                    if let Some(cb) = &conf_buf {
+                        q4::encode_draft_conf(&mut enc, mdev, &lb, vocab, &ids_buf, cb, j + 1, draft_rows > 0)?;
+                    }
                 }
                 if !q4::copy_to_stage(&mut enc, mdev, &ids_buf, 4, 0, (k * 4) as u64) {
                     return None;
                 }
+                let mut read = k * 4;
+                if let Some(cb) = &conf_buf {
+                    if !q4::copy_to_stage(&mut enc, mdev, cb, 4, read as u64, (k * 4) as u64) {
+                        return None;
+                    }
+                    read += k * 4;
+                }
                 drop(merge);
-                let bytes = q4::submit_chain(mdev, enc, (k * 4) as u64)?.wait()?;
-                Some(
-                    bytes[..k * 4]
-                        .chunks_exact(4)
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect(),
-                )
+                let bytes = q4::submit_chain(mdev, enc, read as u64)?.wait()?;
+                let word = |b: &[u8]| [b[0], b[1], b[2], b[3]];
+                Some((
+                    bytes[..k * 4].chunks_exact(4).map(|b| u32::from_le_bytes(word(b))).collect(),
+                    bytes[k * 4..read].chunks_exact(4).map(|b| f32::from_le_bytes(word(b))).collect(),
+                ))
             };
-            if let Some(d) = run() {
+            if let Some((d, c)) = run() {
                 drafts = d;
+                conf = c;
                 chained = true;
             }
         }
@@ -5985,6 +7647,7 @@ pub fn spec_round(
                     lm_head,
                     false,
                     1,
+                    0,
                 )?;
                 if !q4::copy_to_stage(&mut enc, mdev, &lb, 0, 0, (vocab * 4) as u64) {
                     return None;
@@ -6002,67 +7665,141 @@ pub fn spec_round(
                 tok_in = best.0 as u32;
             }
         }
-        (k, drafts)
+        // the gate: the window verifies the drafts the chain still believed in
+        let kept = if conf.len() == k { draft_gate_keep(&conf, minp) } else { k };
+        drafts.truncate(kept);
+        // The chain's drafts continued by the context: where the tail with
+        // the drafts on it occurred before, what followed it there rides the
+        // same window (the chain agreeing with the old text is the evidence).
+        if let Some(s) = sfx.filter(|s| s.ext > 0 && kept == k && k < s.max) {
+            let mut ctx = all_ids.to_vec();
+            ctx.extend_from_slice(&drafts);
+            let (m, cont) = suffix_draft(&ctx, s.ext, s.max - k);
+            if m > 0 {
+                sfx_note = format!(" sfx=ext:{m}+{}", cont.len());
+                drafts.extend(cont);
+            }
+        }
+        (drafts.len(), drafts, conf)
     };
     let t_draft = t_round.elapsed();
     // ── verify: the window through the main model, every token's logits ──
     let mut ids = Vec::with_capacity(k + 1);
     ids.push(all_ids[next_pos]);
     ids.extend_from_slice(&drafts);
-    state.verify_window = true;
     let mut last_logits = Vec::new();
-    let ok = forward_tokens_device(
-        globals,
-        layers,
-        cfg,
-        state,
-        &ids,
-        next_pos,
-        inv_freq,
-        pool,
-        &mut last_logits,
-        true,
-    );
-    state.verify_window = false;
-    if !ok || state.window_logits.len() != k + 1 {
-        return None;
-    }
-    let argmax = |v: &[f32]| {
-        v.iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
-                if x > a.1 { (i, x) } else { a }
-            })
-            .0
+    let (a, logits, t_accept) = if framed {
+        // ── a copy frame: the prompt kernels over the whole stretch, every row's argmax
+        // taken on the card; the last row's logits come back with the ids ──
+        state.copy_frame = true;
+        state.frame_check = true;
+        state.frame_ids = None;
+        let ok = forward_tokens_device(
+            globals,
+            layers,
+            cfg,
+            state,
+            &ids,
+            next_pos,
+            inv_freq,
+            pool,
+            &mut last_logits,
+            true,
+        );
+        state.frame_check = false;
+        state.copy_frame = false;
+        let t_accept = std::time::Instant::now();
+        let rows = state.frame_ids.take().filter(|r| ok && r.len() == k + 1)?;
+        let mut a = 0usize;
+        while a < k && rows[a] == drafts[a] {
+            a += 1;
+        }
+        let t_accept = t_accept.elapsed();
+        if a < k {
+            // The frame ran past the copy's end and kept no per-token snapshot: back to
+            // the state before it, then the accepted stretch again, on its own. Its last
+            // row is the next token's logits.
+            let dev = state.dev.as_mut()?;
+            if !dev.restore_checkpoint(&g) {
+                return None;
+            }
+            dev.pos = next_pos;
+            let keep = state.token_history.len() - (k + 1);
+            state.token_history.truncate(keep);
+            state.pos = next_pos;
+            state.copy_frame = a + 1 > q4::TMAX;
+            let ok = forward_tokens_device(
+                globals,
+                layers,
+                cfg,
+                state,
+                &ids[..a + 1],
+                next_pos,
+                inv_freq,
+                pool,
+                &mut last_logits,
+                true,
+            );
+            state.copy_frame = false;
+            if !ok {
+                return None;
+            }
+            sfx_note.push_str(&format!(" redo={}", a + 1));
+        }
+        (a, last_logits, t_accept)
+    } else {
+        state.verify_window = true;
+        let ok = forward_tokens_device(
+            globals,
+            layers,
+            cfg,
+            state,
+            &ids,
+            next_pos,
+            inv_freq,
+            pool,
+            &mut last_logits,
+            true,
+        );
+        state.verify_window = false;
+        let t_accept = std::time::Instant::now();
+        let Some(win) = state.window_rows.take().filter(|w| ok && w.rows == k + 1) else {
+            return None;
+        };
+        let mut a = 0usize;
+        while a < k && argmax_le(win.row(a)) == drafts[a] as usize {
+            a += 1;
+        }
+        let logits = win.floats(a);
+        drop(win);
+        let t_accept = t_accept.elapsed();
+        // Sealed O(1) layers: the accepted rows' keys and values go from the spec
+        // stash into the ring and the far field; the rejected rows never happened.
+        if let Some(uid) = state.dev.as_ref().filter(|d| d.o1_sealed()).map(|d| d.uid()) {
+            if !crate::gpu_wgpu::o1_spec_commit(uid, next_pos, a + 1) {
+                return None;
+            }
+        }
+        // ── roll back what the rejected drafts changed ──
+        if a < k {
+            let dev = state.dev.as_mut()?;
+            if !dev.restore(&g, a + 1) {
+                return None;
+            }
+            let keep = state.token_history.len() - (k - a);
+            state.token_history.truncate(keep);
+            state.pos = next_pos + a + 1;
+            dev.pos = state.pos;
+            // the last accepted position's R for the next round's first cell
+            if let Some(mut enc) = q4::new_encoder("qwen4-keep-r") {
+                dev.keep_r(&mut enc, a);
+                q4::submit_only(enc);
+            }
+        }
+        (a, logits, t_accept)
     };
-    let mut a = 0usize;
-    while a < k && argmax(&state.window_logits[a]) == drafts[a] as usize {
-        a += 1;
-    }
-    let logits = std::mem::take(&mut state.window_logits).swap_remove(a);
-    // Sealed O(1) layers: the accepted rows' keys and values go from the spec
-    // stash into the ring and the far field; the rejected rows never happened.
-    if let Some(uid) = state.dev.as_ref().filter(|d| d.o1_sealed()).map(|d| d.uid()) {
-        if !crate::gpu_wgpu::o1_spec_commit(uid, next_pos, a + 1) {
-            return None;
-        }
-    }
-    // ── roll back what the rejected drafts changed ──
-    if a < k {
-        let dev = state.dev.as_mut()?;
-        if !dev.restore(&g, a + 1) {
-            return None;
-        }
-        let keep = state.token_history.len() - (k - a);
-        state.token_history.truncate(keep);
-        state.pos = next_pos + a + 1;
-        dev.pos = state.pos;
-        // the last accepted position's R for the next round's first cell
-        if let Some(mut enc) = q4::new_encoder("qwen4-keep-r") {
-            dev.keep_r(&mut enc, a);
-            q4::submit_only(enc);
-        }
-    }
+    // how long the copy has held: the next frame's size
+    state.copy_run = if copied && a == k { state.copy_run + k + 1 } else { 0 };
     if let Some(d) = state.dev.as_mut() {
         if d.o1_seal_at().is_some_and(|at| state.pos >= at) {
             d.seal(&g, state.pos);
@@ -6074,15 +7811,25 @@ pub fn spec_round(
         head.accepted += a as u64;
         if prof {
             eprintln!(
-                "qwen4-mtp round={} drafted={k} accepted={a} draft={:.1}ms total={:.1}ms (acceptance {:.1}%) ids={:?}",
+                "qwen4-mtp round={} drafted={k} accepted={a} draft={:.1}ms total={:.1}ms accept={:.2}ms gap={:.2}ms (acceptance {:.1}%) ids={:?}{}{} tok={}",
                 head.rounds,
                 t_draft.as_secs_f64() * 1e3,
                 t_round.elapsed().as_secs_f64() * 1e3,
+                t_accept.as_secs_f64() * 1e3,
+                t_gap.as_secs_f64() * 1e3,
                 head.accepted as f64 * 100.0 / head.drafted.max(1) as f64,
-                drafts
+                drafts,
+                if conf.is_empty() {
+                    String::new()
+                } else {
+                    format!(" conf={:?}", conf.iter().map(|p| (p * 1000.0).round() / 1000.0).collect::<Vec<_>>())
+                },
+                sfx_note,
+                all_ids[next_pos]
             );
         }
     }
+    state.round_end = Some(std::time::Instant::now());
     Some(SpecRound {
         accepted: drafts[..a].to_vec(),
         logits,
@@ -6104,6 +7851,113 @@ mod tests {
         );
         assert_eq!(cold_picks_from_slots(&slots, 4, 4, &[4]), None);
         assert_eq!(cold_picks_from_slots(&slots, 5, 4, &[0]), None);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn draft_gate_keeps_the_confident_prefix() {
+        // off: every draft stays
+        assert_eq!(draft_gate_keep(&[0.1, 0.1, 0.1], 0.0), 3);
+        // cumulative: 0.9, 0.72, 0.36
+        assert_eq!(draft_gate_keep(&[0.9, 0.8, 0.5], 0.5), 2);
+        assert_eq!(draft_gate_keep(&[0.9, 0.8, 0.5], 0.3), 3);
+        // never fewer than one draft, and a later confident cell does not rescue a cut chain
+        assert_eq!(draft_gate_keep(&[0.2, 0.99, 0.99], 0.5), 1);
+        assert_eq!(draft_gate_keep(&[0.9, 0.3, 0.99], 0.5), 1);
+        assert_eq!(draft_gate_keep(&[f32::NAN, 0.9], 0.5), 1);
+        assert_eq!(draft_gate_keep(&[], 0.5), 0);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn copy_frame_grows_with_the_copy_and_stops_at_the_request() {
+        assert_eq!(copy_frame_parse("63"), Some((63, 2.0)));
+        assert_eq!(copy_frame_parse("31:1"), Some((31, 1.0)));
+        assert_eq!(copy_frame_parse("999"), Some((255, 2.0)));
+        // fewer drafts than the smallest frame, a factor that is none
+        assert_eq!(copy_frame_parse("15"), None);
+        assert_eq!(copy_frame_parse("63:0"), None);
+        assert_eq!(copy_frame_parse("x"), None);
+        // nothing copied yet: a window; two windows of eight held: 32 tokens, then 64,
+        // 128, 256
+        assert_eq!(copy_frame_drafts(255, 2.0, 0, usize::MAX), None);
+        assert_eq!(copy_frame_drafts(255, 2.0, 8, usize::MAX), None);
+        assert_eq!(copy_frame_drafts(255, 2.0, 16, usize::MAX), Some(31));
+        assert_eq!(copy_frame_drafts(255, 2.0, 48, usize::MAX), Some(63));
+        assert_eq!(copy_frame_drafts(255, 2.0, 112, usize::MAX), Some(127));
+        assert_eq!(copy_frame_drafts(255, 2.0, 240, usize::MAX), Some(255));
+        assert_eq!(copy_frame_drafts(255, 4.0, 8, usize::MAX), Some(31));
+        assert_eq!(copy_frame_drafts(63, 1.0, 16, usize::MAX), None);
+        assert_eq!(copy_frame_drafts(63, 1.0, 32, usize::MAX), Some(31));
+        // the configured most and the request's end bound it
+        assert_eq!(copy_frame_drafts(31, 2.0, 500, usize::MAX), Some(31));
+        assert_eq!(copy_frame_drafts(63, 2.0, 500, 40), Some(31));
+        assert_eq!(copy_frame_drafts(63, 2.0, 500, 30), None);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn copy_cursor_copies_and_learns_insertions() {
+        // a plain copy
+        let mut ids: Vec<u32> = vec![5, 6, 7, 8, 9, 1, 5];
+        let mut cur = CopyCur::default();
+        cur.account(&ids);
+        cur.start(1, 1);
+        assert_eq!(cur.draft(&ids, 4), vec![6, 7, 8, 9]);
+        ids.extend([6, 7]);
+        cur.account(&ids);
+        assert_eq!(cur.at, Some(3));
+        assert_eq!(cur.draft(&ids, 3), vec![8, 9, 1]);
+
+        // an insertion before every 4: seen once it is only remembered, seen twice it is drafted
+        let p: Vec<u32> = vec![1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4];
+        let mut ids = p.clone();
+        ids.push(1);
+        let mut cur = CopyCur::default();
+        cur.account(&ids);
+        cur.start(1, 1);
+        ids.extend([2, 3, 100, 101, 4, 1, 2, 3]);
+        cur.account(&ids);
+        assert_eq!(cur.rules.get(&(3, 4)), Some(&(vec![100, 101], 1)));
+        assert_eq!(cur.draft(&ids, 3), vec![4, 1, 2]);
+        // the second time the insertion comes: inside it the rest of it is drafted, then the copy goes on
+        ids.push(100);
+        cur.account(&ids);
+        assert_eq!(cur.draft(&ids, 3), vec![101, 4, 1]);
+        ids.extend([101, 4, 1, 2, 3]);
+        cur.account(&ids);
+        assert_eq!(cur.rules.get(&(3, 4)).map(|r| r.1), Some(2));
+        assert_eq!(&cur.draft(&ids, 4)[..3], &[100, 101, 4]);
+    }
+
+    #[test]
+    fn suffix_draft_continues_the_latest_longest_occurrence() {
+        // the tail [1, 2, 3] occurred at 0..3; 9, 8 followed it
+        assert_eq!(suffix_draft(&[1, 2, 3, 9, 8, 7, 1, 2, 3], 3, 2), (3, vec![9, 8]));
+        // too short a match, an empty context, nothing asked for
+        assert_eq!(suffix_draft(&[1, 2, 3, 9, 8, 7, 1, 2, 3], 4, 2), (0, vec![]));
+        assert_eq!(suffix_draft(&[], 1, 2), (0, vec![]));
+        assert_eq!(suffix_draft(&[1, 2, 1, 2], 2, 0), (0, vec![]));
+        // the longer of two occurrences wins over the later one
+        assert_eq!(suffix_draft(&[5, 1, 2, 3, 4, 0, 2, 3, 6, 0, 1, 2, 3], 2, 1), (3, vec![4]));
+        // equal length: the later one
+        assert_eq!(suffix_draft(&[2, 3, 4, 0, 2, 3, 6, 0, 2, 3], 2, 1), (3, vec![6]));
+        // a period shorter than the draft runs through its own prediction
+        assert_eq!(suffix_draft(&[7, 1, 2, 1, 2, 1, 2], 2, 5), (4, vec![1, 2, 1, 2, 1]));
+        assert_eq!(suffix_draft(&[4, 4, 4], 1, 3), (2, vec![4, 4, 4]));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn suffix_cfg_parses_and_clamps_to_the_frame() {
+        let max = crate::gpu_wgpu::qwen4::TMAX - 1;
+        assert_eq!(suffix_parse("6:12:5"), Some(SuffixCfg { ext: 6, strong: 12, max: 5 }));
+        assert_eq!(suffix_parse("6"), Some(SuffixCfg { ext: 6, strong: 0, max }));
+        assert_eq!(suffix_parse("0:8:99"), Some(SuffixCfg { ext: 0, strong: 8, max }));
+        assert_eq!(suffix_parse("0:0"), None);
+        assert_eq!(suffix_parse("x"), None);
+        assert_eq!(suffix_parse(""), None);
     }
 
     #[cfg(feature = "gpu")]

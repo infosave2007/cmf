@@ -8336,16 +8336,20 @@ impl Pipeline {
                 && std::env::var("CMF_QWEN_MTP").as_deref() != Ok("0")
             {
                 let r = match &mut self.qwen4_exp {
-                    Some(b) => crate::qwen4_exp::spec_round(
-                        &b.0,
-                        &b.1,
-                        &b.2,
-                        &mut b.3,
-                        next_pos,
-                        &all_ids,
-                        &self.inv_freq,
-                        self.pool.as_deref(),
-                    ),
+                    Some(b) => {
+                        // a copy frame drafts no further than the request goes
+                        b.3.set_draft_budget(max_tokens - generated - 1);
+                        crate::qwen4_exp::spec_round(
+                            &b.0,
+                            &b.1,
+                            &b.2,
+                            &mut b.3,
+                            next_pos,
+                            &all_ids,
+                            &self.inv_freq,
+                            self.pool.as_deref(),
+                        )
+                    }
                     None => None,
                 };
                 if let Some(r) = r {
