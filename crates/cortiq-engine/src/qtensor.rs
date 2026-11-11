@@ -663,6 +663,23 @@ impl QTensor {
         }
     }
 
+    /// The mapped byte ranges decoding row `r` reads, as (address, length),
+    /// appended to `out`: what a caller hands the kernel as read-ahead advice
+    /// before a batch of row lookups in a table the page cache does not
+    /// hold. `false`, and nothing appended, for a tensor that is not mapped
+    /// or a codec whose rows have no fixed address.
+    pub fn row_spans(&self, r: usize, out: &mut Vec<(usize, usize)>) -> bool {
+        let Self::Mapped { dtype, .. } = self else {
+            return false;
+        };
+        let Some(spans) = row_span_offsets(*dtype, self.rows(), self.cols(), r) else {
+            return false;
+        };
+        let base = self.quant_bytes().as_ptr() as usize;
+        out.extend(spans.iter().filter(|s| s.1 > 0).map(|&(o, n)| (base + o, n)));
+        true
+    }
+
     /// Whether this mapped tensor belongs to the Prism/Bonsai transform
     /// contract.  Device graphs do not carry the descriptor, so callers use
     /// this conservative predicate to stay on the descriptor-aware CPU path
@@ -6115,6 +6132,34 @@ fn q4t_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
 /// Split view of a `q4tp` payload. The three planes are resolved once per
 /// matvec instead of per row — `q4tp_sections` is cheap, but doing it inside
 /// the row loop would put a division on the hot path for nothing.
+/// Where row `r` of a coded matrix lives inside its bytes, as up to three
+/// (offset, length) ranges (a zero length marks an unused one). A q4t row is
+/// one run of tiles; a q4tp row is its nibbles, its two ladder parameters
+/// and its scale codes, in three sections of the tensor.
+fn row_span_offsets(
+    dtype: TensorDtype,
+    rows: usize,
+    cols: usize,
+    r: usize,
+) -> Option<[(usize, usize); 3]> {
+    if r >= rows || cols % GROUP_SIZE != 0 {
+        return None;
+    }
+    let gpr = cols / GROUP_SIZE;
+    match dtype {
+        TensorDtype::Q4Tiled => Some([(r * gpr * Q4_TILE, gpr * Q4_TILE), (0, 0), (0, 0)]),
+        TensorDtype::Q4TiledP => {
+            let (params, codes, stride) = q4tp_sections(rows, cols);
+            Some([
+                (r * gpr * Q4TP_NIB, gpr * Q4TP_NIB),
+                (params + r * 4, 4),
+                (codes + r * stride, stride),
+            ])
+        }
+        _ => None,
+    }
+}
+
 struct Q4tpView<'a> {
     nib: &'a [u8],
     params: &'a [u8],
@@ -16550,6 +16595,51 @@ mod tests {
             "q1t matvec {rows}x{cols} (1 thread): div-decode {slow_ms:.2} ms  fused-LUT {fast_ms:.2} ms  => {:.2}x",
             slow_ms / fast_ms
         );
+    }
+}
+
+#[cfg(test)]
+mod row_span_tests {
+    use cortiq_core::TensorDtype;
+
+    /// The three ranges `row_span_offsets` names are exactly what decoding a
+    /// q4tp row reads: with every other byte of the tensor overwritten the
+    /// row's nibbles and scales come back unchanged.
+    #[test]
+    fn q4tp_row_spans_cover_the_row() {
+        let (rows, cols) = (37usize, 160usize);
+        let gpr = cols / 32;
+        let total = cortiq_core::quant::expected_nbytes(TensorDtype::Q4TiledP, &[rows, cols]).unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut bytes: Vec<u8> = (0..total).map(|i| (i * 61 % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            bytes[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            bytes[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        for r in [0usize, 1, 17, rows - 1] {
+            let spans = super::row_span_offsets(TensorDtype::Q4TiledP, rows, cols, r).unwrap();
+            assert_eq!(spans.iter().map(|s| s.1).sum::<usize>(), total / rows);
+            let mut keep = vec![false; total];
+            for &(o, n) in &spans {
+                keep[o..o + n].fill(true);
+            }
+            let other: Vec<u8> =
+                bytes.iter().zip(&keep).map(|(&b, &k)| if k { b } else { 0x5A }).collect();
+            let (a, b) = (super::Q4tpView::new(&bytes, rows, cols), super::Q4tpView::new(&other, rows, cols));
+            let (mut sa, mut sb) = (vec![0f32; gpr], vec![0f32; gpr]);
+            a.scales_into(r, gpr, &mut sa);
+            b.scales_into(r, gpr, &mut sb);
+            assert_eq!(sa, sb, "row {r} scales");
+            let nib = r * gpr * super::Q4TP_NIB..(r + 1) * gpr * super::Q4TP_NIB;
+            assert_eq!(a.nib[nib.clone()], b.nib[nib], "row {r} nibbles");
+        }
+        assert!(super::row_span_offsets(TensorDtype::Q4TiledP, rows, cols, rows).is_none());
+        assert!(super::row_span_offsets(TensorDtype::Q8_2f, rows, cols, 0).is_none());
+        let t = super::row_span_offsets(TensorDtype::Q4Tiled, rows, cols, 3).unwrap();
+        assert_eq!(t[0], (3 * gpr * super::Q4_TILE, gpr * super::Q4_TILE));
     }
 }
 

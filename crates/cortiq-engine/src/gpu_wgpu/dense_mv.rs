@@ -1971,6 +1971,19 @@ pub(crate) const GDN_SCAN_DK: usize = 128;
 /// barrier, no state traffic inside the position loop. Same recurrence as
 /// the step kernels; the sums run in another order (not bit-identical).
 fn gdn_scan_src(parts: usize) -> String {
+    gdn_scan_src_x(parts, false)
+}
+
+/// `gdn_scan_k`, or with `snap` its verify-window twin `gdn_scan_w`: the
+/// same scan that also leaves every position's state but the last in the
+/// layer's snapshot buffer (binding 10, the step kernel's slot layout:
+/// `i · stride + ring_els` floats in, then S). The window's step kernel
+/// reads and writes the whole state in device memory at every position and
+/// writes its snapshot beside it — 50 MB of traffic a layer for a 4-token
+/// window against the 15 MB here; the last position's snapshot is the state
+/// itself, and no rollback reads it.
+fn gdn_scan_src_x(parts: usize, snap: bool) -> String {
+    let entry = if snap { "gdn_scan_w" } else { "gdn_scan_k" };
     let rows = GDN_SCAN_DK / parts;
     let cols = 128 / parts;
     let dk = GDN_SCAN_DK;
@@ -1995,6 +2008,9 @@ fn gs_softplus(x: f32) -> f32 {
 }
 "#,
     );
+    if snap {
+        s.push_str("@group(0) @binding(10) var<storage, read_write> gs_snap : array<f32>;\n");
+    }
     let red = |v: &str| {
         let mut t = String::new();
         let mut m = 1;
@@ -2029,7 +2045,7 @@ fn gs_softplus(x: f32) -> f32 {
         t
     };
     s.push_str(&format!(
-        "@compute @workgroup_size(128)\nfn gdn_scan_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{\n    let r = lid % {parts}u;\n    let j0 = wid.y * {cols}u + lid / {parts}u;\n"
+        "@compute @workgroup_size(128)\nfn {entry}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{\n    let r = lid % {parts}u;\n    let j0 = wid.y * {cols}u + lid / {parts}u;\n"
     ));
     s.push_str(
         "    let dv = gs_p.dv;\n    let live = wid.x < gs_p.nv && j0 < dv;\n    let h = select(0u, wid.x, live);\n    let j = select(0u, j0, live);\n    let ko = h / gs_p.rep;\n",
@@ -2064,6 +2080,15 @@ fn gs_softplus(x: f32) -> f32 {
     s.push_str("        let dlt = (vt - g * (kv * invk)) * beta * invk;\n");
     for u in 0..rows {
         s.push_str(&format!("        s{u} = g * s{u} + k{u} * dlt;\n"));
+    }
+    if snap {
+        s.push_str(
+            "        if (live && gs_p.stride != 0u && i + 1u < gs_p.kb) {\n            let sn = i * gs_p.stride + gs_p.ring_els + sb;\n",
+        );
+        for u in 0..rows {
+            s.push_str(&format!("            gs_snap[sn + {u}u * dv] = s{u};\n"));
+        }
+        s.push_str("        }\n");
     }
     s.push_str(&dot("o", "q", "s"));
     s.push_str(&red("o"));
@@ -2536,6 +2561,26 @@ pub(crate) fn gdn(c: &Ctx) -> Option<&GdnSg> {
     c.gdn_sg_pipes.get_or_init(|| build_gdn(c)).as_ref()
 }
 
+/// The verify window's snapshotting scan (`gdn_scan_w`) and the columns a
+/// workgroup covers: None without 32-wide subgroups, under `CMF_GDN_SCAN=0`
+/// or `CMF_GDN_SCAN_W=0`, or on rejection (the step kernel then runs).
+/// Built on first use — only speculative decode asks for it.
+pub(crate) fn gdn_scan_w(c: &Ctx) -> Option<&(wgpu::ComputePipeline, usize)> {
+    c.gdn_scan_w_pipe
+        .get_or_init(|| {
+            let parts = gdn_scan_parts();
+            if parts == 0
+                || !sg32(c)
+                || std::env::var("CMF_GDN_SG").as_deref() == Ok("0")
+                || std::env::var("CMF_GDN_SCAN_W").as_deref() == Ok("0")
+            {
+                return None;
+            }
+            compile(c, "cmf-gdn-scan-w", &gdn_scan_src_x(parts, true), "gdn_scan_w").map(|p| (p, 128 / parts))
+        })
+        .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2555,6 +2600,19 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("parts {parts}: {e:?}"));
             assert!(s.contains(&format!("var s{} = gs_S", GDN_SCAN_DK / parts - 1)));
+            assert!(!s.contains("gs_snap"));
+            // the verify-window twin: the same scan plus the snapshot writes
+            let w = gdn_scan_src_x(parts, true);
+            let module = wgpu::naga::front::wgsl::parse_str(&w)
+                .unwrap_or_else(|e| panic!("window scan, parts {parts}: {e}"));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("window scan, parts {parts}: {e:?}"));
+            assert!(w.contains("fn gdn_scan_w("));
+            assert_eq!(w.matches("gs_snap[sn + ").count(), GDN_SCAN_DK / parts);
         }
         for parts in [4, 8] {
             for src in [gdn_scan2_src(parts), gdn_scan3_src(parts), GDN_PREP_WGSL.to_string()] {

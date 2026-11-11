@@ -603,6 +603,10 @@ macro_rules! kargs {
     };
 }
 
+/// The qwen4_exp stack (hyper-connection mixes, GDN, sparse attention, MoE)
+/// as whole-chunk GEMMs; declared after `kargs!`, which it uses.
+pub(crate) mod qwen4;
+
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
     let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("NVRTC: {e:?}"))?;
