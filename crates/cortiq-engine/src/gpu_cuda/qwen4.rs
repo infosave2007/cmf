@@ -62,6 +62,8 @@ macro_rules! qfuncs {
                 let mut defs: Vec<String> = Vec::new();
                 if prec().0 == Gemm::Half {
                     defs.push("-DEXP_DP4A=1".to_string());
+                    // and the norms, gates and conv in f32 (F64OPS; CMF_QWEN_DEFS="-DF64OPS=1" keeps f64)
+                    defs.push("-DF64OPS=0".to_string());
                 }
                 if let Ok(v) = std::env::var("CMF_QWEN_DEFS") {
                     defs.extend(v.split_whitespace().map(str::to_string));
@@ -1670,6 +1672,9 @@ impl Dev {
         c.current()?;
         super::pdl_set(std::env::var("CMF_QWEN_PDL").is_ok_and(|v| v == "1"));
         let q = qf(c)?;
+        if std::env::var("CMF_QWEN_NOP").is_ok_and(|v| v == "1") {
+            super::nop_set(q.zero);
+        }
         let (gw, ga) = prec();
         let ga = if ga == Gemm::Half { Gemm::Tf32 } else { ga };
         let half = gw == Gemm::Half;

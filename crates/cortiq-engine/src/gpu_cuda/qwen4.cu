@@ -20,6 +20,25 @@ typedef unsigned char u8;
 #define PDL_PRO() do { } while (0)
 #endif
 
+// F64OPS=0 (the fast precision): the norms, gates and the conv of the kernels below in f32. A GeForce part runs f64
+// at 1/64 of the f32 rate and these small kernels waited on chains of f64 exp/log/sqrt; the exact precision keeps
+// f64 (the host's arithmetic).
+#ifndef F64OPS
+#define F64OPS 1
+#endif
+#if F64OPS
+typedef double acc64;
+#define EXP64(x) exp(x)
+#define LOG1P64(x) log1p(x)
+#define SQRT64(x) sqrt(x)
+#define D64(x) (x)
+#else
+typedef float acc64;
+#define EXP64(x) expf(x)
+#define LOG1P64(x) log1pf(x)
+#define SQRT64(x) sqrtf(x)
+#define D64(x) ((float)(x))
+#endif
 __device__ __forceinline__ u16 f2h(float f) {
     u16 h;
     asm("{ cvt.rn.f16.f32 %0, %1; }" : "=h"(h) : "f"(f));
@@ -57,19 +76,19 @@ extern "C" __global__ void q4_tile(const float* __restrict__ emb, float* __restr
 extern "C" __global__ void q4_grms(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
                                    void* __restrict__ yh, int group, int groups, double eps, int half)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
     const float* xr = x + b * group;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < group; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < group; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] * inv * (1.0f + w[g * group + i]);
         if (y) y[b * group + i] = v;
@@ -83,18 +102,18 @@ extern "C" __global__ void q4_grms_inj(float* __restrict__ x, const float* __res
                                        void* __restrict__ yh, int group, int groups, double eps, int half,
                                        const float* __restrict__ block, const float* __restrict__ iw)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
     const u64 t = b / groups;
     float* xr = x + b * group;
     const float* bk = block + t * group;
     const float a = iw[b];
-    double ss = 0.0;
+    acc64 ss = D64(0.0);
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] + a * bk[i];
         xr[i] = v;
-        ss += (double)v * (double)v;
+        ss += (acc64)v * (acc64)v;
     }
     red[threadIdx.x] = ss;
     __syncthreads();
@@ -102,7 +121,7 @@ extern "C" __global__ void q4_grms_inj(float* __restrict__ x, const float* __res
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] * inv * (1.0f + w[g * group + i]);
         if (y) y[b * group + i] = v;
@@ -116,7 +135,7 @@ extern "C" __global__ void q4_grms_inj4(float* __restrict__ x, const float* __re
                                         void* __restrict__ yh, int group, int groups, double eps, int half,
                                         const float* __restrict__ block, const float* __restrict__ iw)
 { PDL_PRO();
-    __shared__ double red[32];
+    __shared__ acc64 red[32];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
     const u64 t = b / groups;
@@ -124,7 +143,7 @@ extern "C" __global__ void q4_grms_inj4(float* __restrict__ x, const float* __re
     float4* xr = (float4*)(x + b * group);
     const int n4 = group >> 2;
     float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    double ss = 0.0;
+    acc64 ss = D64(0.0);
     if (tid < n4) {
         v = xr[tid];
         if (block) {
@@ -133,18 +152,18 @@ extern "C" __global__ void q4_grms_inj4(float* __restrict__ x, const float* __re
             v.x = v.x + a * bk.x; v.y = v.y + a * bk.y; v.z = v.z + a * bk.z; v.w = v.w + a * bk.w;
             xr[tid] = v;
         }
-        ss = (double)v.x * (double)v.x + (double)v.y * (double)v.y + (double)v.z * (double)v.z + (double)v.w * (double)v.w;
+        ss = (acc64)v.x * (acc64)v.x + (acc64)v.y * (acc64)v.y + (acc64)v.z * (acc64)v.z + (acc64)v.w * (acc64)v.w;
     }
     for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     if (lane == 0) red[warp] = ss;
     __syncthreads();
     if (warp == 0) {
-        double r = lane < NW ? red[lane] : 0.0;
+        acc64 r = lane < NW ? red[lane] : D64(0.0);
         for (int o = 16; o > 0; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
         if (lane == 0) red[0] = r;
     }
     __syncthreads();
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
     if (tid < n4) {
         const float4 wv = ((const float4*)(w + (u64)g * group))[tid];
         const float o0 = v.x * inv * (1.0f + wv.x), o1 = v.y * inv * (1.0f + wv.y);
@@ -226,33 +245,33 @@ extern "C" __global__ void q4_gdn_conv(const float* __restrict__ qkv, const floa
     const int t = (int)(i / c_dim);
     const u64 c = i - (u64)t * c_dim;
     const float* tp = taps + c * kk;
-    double acc = (double)qkv[i] * (double)tp[kk - 1];
+    acc64 acc = (acc64)qkv[i] * (acc64)tp[kk - 1];
     for (int j = 0; j < kk - 1; j++) {
         const int src = t - (kk - 1 - j);
         const float v = src >= 0 ? qkv[(u64)src * c_dim + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
-        acc += (double)v * (double)tp[j];
+        acc += (acc64)v * (acc64)tp[j];
     }
-    cq[i] = (float)(acc / (1.0 + exp(-acc)));
+    cq[i] = (float)(acc / (D64(1.0) + EXP64(-acc)));
 }
 
 // L2 norm of the q and k heads in place, a block per (token, head of 2 * nk):
 // q heads also divided by sqrt(dk).
 extern "C" __global__ void q4_gdn_prep(float* __restrict__ cq, int c_dim, int nk, int dk)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 t = blockIdx.x / (2 * nk);
     const int g = (int)(blockIdx.x - t * (2 * nk));
     float* xr = cq + t * c_dim + (u64)g * dk;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const double nrm = sqrt(red[0] + 1e-6);
-    const float inv = (float)(1.0 / (g < nk ? nrm * sqrt((double)dk) : nrm));
+    const acc64 nrm = SQRT64(red[0] + D64(1e-6));
+    const float inv = (float)(D64(1.0) / (g < nk ? nrm * SQRT64((acc64)dk) : nrm));
     for (int i = threadIdx.x; i < dk; i += blockDim.x) xr[i] *= inv;
 }
 
@@ -266,10 +285,10 @@ extern "C" __global__ void q4_gdn_gb(const float* __restrict__ ab, const float* 
     if (i >= (u64)n * nv) return;
     const u64 t = i / nv;
     const int h = (int)(i - t * nv);
-    const double x = (double)ab[t * 2 * nv + h] + (double)dt_bias[h];
-    const double sp = x > 20.0 ? x : log1p(exp(x));
-    gb[t * 2 * nv + h] = (float)exp(-exp((double)a_log[h]) * sp);
-    gb[t * 2 * nv + nv + h] = (float)(1.0 / (1.0 + exp(-(double)ab[t * 2 * nv + nv + h])));
+    const acc64 x = (acc64)ab[t * 2 * nv + h] + (acc64)dt_bias[h];
+    const acc64 sp = x > D64(20.0) ? x : LOG1P64(EXP64(x));
+    gb[t * 2 * nv + h] = (float)EXP64(-EXP64((acc64)a_log[h]) * sp);
+    gb[t * 2 * nv + nv + h] = (float)(D64(1.0) / (D64(1.0) + EXP64(-(acc64)ab[t * 2 * nv + nv + h])));
 }
 
 __device__ __forceinline__ float wsum(float v) {
@@ -358,21 +377,21 @@ extern "C" __global__ void q4_gdn_out(const float* __restrict__ o, const float* 
                                       const float* __restrict__ norm, void* __restrict__ ofh,
                                       int dv, double eps, int half)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const float* xr = o + b * dv;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dv; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const double inv = 1.0 / sqrt(red[0] / (double)dv + eps);
+    const acc64 inv = D64(1.0) / SQRT64(red[0] / (acc64)dv + ((acc64)eps));
     for (int i = threadIdx.x; i < dv; i += blockDim.x) {
-        const double gate = 1.0 / (1.0 + exp(-(double)z[b * dv + i]));
-        stf(ofh, b * dv + i, (float)(((double)xr[i] * inv) * (double)norm[i] * gate), half);
+        const acc64 gate = D64(1.0) / (D64(1.0) + EXP64(-(acc64)z[b * dv + i]));
+        stf(ofh, b * dv + i, (float)(((acc64)xr[i] * inv) * (acc64)norm[i] * gate), half);
     }
 }
 
@@ -392,7 +411,7 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
                                         int nsum, double eps)
 { PDL_PRO();
     __shared__ float sv[256];
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 item = blockIdx.x / heads;
     const int head = (int)(blockIdx.x - item * heads);
     const int d = threadIdx.x;
@@ -400,13 +419,13 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
     if (d < hd) {
         for (int j = 0; j < nsum; j++) v += src[(item * nsum + j) * sstride + (u64)head * shead + d] / (float)nsum;
     }
-    red[d] = (double)v * (double)v;
+    red[d] = (acc64)v * (acc64)v;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if (d < s) red[d] += red[d + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)hd + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)hd + ((acc64)eps)));
     if (d < hd) sv[d] = v * (inv * (1.0f + w[d]));
     __syncthreads();
     if (d >= hd) return;
