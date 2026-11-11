@@ -352,6 +352,9 @@ The ten prompts on the RTX 3090, release build, tok/s:
 - The block is built once the first prompt has been read (0.9 s), so the first token comes 0.5 s later.
 - A copy or an edit loses 8–10 %. The block's first round makes the prompt's context once: 100 ms on the
   card, and more in host copies of the tapped rows.
+- A trunk without an MTP head ([Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf)) drafts
+  every round with the block: 49.2 → 102.1 tok/s on chat0, the same text. The sidecars of Qwen3.8-27B, Arete-27B
+  Turbo and OrcaCyber-Nano-1.0 Turbo, with routers at these prices, are on Hugging Face beside the files.
 
 ## Options
 

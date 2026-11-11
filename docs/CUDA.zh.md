@@ -312,6 +312,9 @@ RTX 3090 上的十个提示，release 构建，tok/s：
 - 文本与不用草稿时相同，四个服务器请求和三轮对话也一样。
 - 读完第一个提示后才构建这个块（0.9 秒），所以首词元晚 0.5 秒。
 - 复制和编辑慢 8–10 %：块的第一轮只构建一次提示的上下文，显卡上 100 ms，主机上复制抽头行用得更多。
+- 没有 MTP 头的主干（[Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf)）每一轮都由块起草：
+  chat0 从 49.2 提到 102.1 tok/s，文本相同。Qwen3.8-27B、Arete-27B Turbo 和 OrcaCyber-Nano-1.0 Turbo 的 sidecar
+  （路由器按这些代价拟合）放在 Hugging Face 上，与模型文件并列。
 
 ## 选项
 

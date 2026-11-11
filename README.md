@@ -123,6 +123,25 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Qwen3.8-27B on CUDA: chat at 120–128 tok/s on an RTX 3090 (0.8.68)
+
+The CUDA backend runs Qwen3.5-family hybrids (GDN mixers plus gated attention) with drafts and their verify on
+the card. On an RTX 3090 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) in four bits decodes
+chat at 120.2 tok/s with its MTP head and at 128.4 with the DFlash 2 drafter beside it (57.7 over Vulkan), plain
+at 49.1 (40.8), and reads a 4 000-token prompt at 983 tok/s (560). The text with drafts is the text without them.
+A chat's next turn reads only the new message. The same runs for
+[Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf) (no MTP head: DFlash takes code from 49 to
+102 tok/s) and [OrcaCyber-Nano-1.0 Turbo](https://huggingface.co/infosave/OrcaCyber-Nano-1.0-Turbo-cmf), each
+with its drafter on Hugging Face. The Fast Code stack runs on CUDA too.
+
+```sh
+cargo install cortiq-cli --features cuda
+hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf qwen38-27b-q4tp.dflash.cmf --local-dir .
+CMF_GPU=cuda CMF_DFLASH=1 cortiq serve qwen38-27b-q4tp.cmf --port 8080 --host 127.0.0.1
+```
+
+See [docs/CUDA.md](docs/CUDA.md#hybrids-the-qwen35-family).
+
 ## A CUDA backend for NVIDIA cards (0.8.67)
 
 A native CUDA backend beside wgpu and Metal, experimental and off by default: build with `--features cuda`,

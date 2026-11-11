@@ -16,6 +16,7 @@ tags:
   - long-context
   - low-vram
   - vulkan
+  - cuda
 language:
   - en
   - ru
@@ -29,7 +30,8 @@ The 4-bit weights of [OrcaCyber-Nano-1.0](https://huggingface.co/orcarouter/Orca
 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf), which holds device memory in place on
 long prompts. On a 16 GB card it reads 64 000 tokens in 14.8 GB of device memory and decodes there at
 26.0 tok/s; the standard file runs out of device memory from 16 000 tokens on that card. The model's own MTP head drafts tokens: about twice the plain
-speed on code. One [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no
+speed on code. On an RTX 3090 through CUDA it decodes at 49 tok/s plain and 111–117 tok/s on code with drafts.
+One [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no
 Python and no ML framework.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文说明)
@@ -42,7 +44,14 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-Measured with cortiq built from [infosave2007/cmf#99](https://github.com/infosave2007/cmf/pull/99), which comes in the next release; cortiq 0.8.63 runs the same file and reads prompts at about 75 tok/s instead of 98–112. `--no-think` asks for a direct answer; without it the model reasons first, so raise `--max-tokens`
+On an NVIDIA card, through CUDA (cortiq 0.8.68 or later; see [NVIDIA via CUDA](#nvidia-via-cuda)):
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+```
+
+cortiq 0.8.64 and later read prompts on the card below at 98–112 tok/s; 0.8.63 runs the same file at about 75. `--no-think` asks for a direct answer; without it the model reasons first, so raise `--max-tokens`
 (default 256). Each `cortiq run` loads the model again (about 8 s for 14 GB on the card measured); for chat keep it
 loaded with the server:
 
@@ -60,6 +69,7 @@ Endpoints: `/v1/chat/completions` (streaming, `tools`, `enable_thinking`), `/v1/
 | file | quantization | size | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4-bit (q4tp), text, MTP head | 14.3 GB | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
+| `orcacyber-nano-1.0-turbo.dflash.cmf` | DFlash 2 drafter, 4-bit (optional, CUDA) | 1.3 GB | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
 
 ## Performance
 
@@ -128,11 +138,38 @@ An answer of the file, `--greedy --no-think`:
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+## NVIDIA via CUDA
+
+```bash
+cargo install cortiq-cli --features cuda
+cortiq gpu      # says whether the card and the CUDA libraries are found
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+CMF_GPU=cuda cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
+```
+
+The build links nothing; at run time the backend opens the driver's `libcuda` and the CUDA 12.x libraries
+`libnvrtc` and `libcublas`. The MTP head drafts by default. For code, the DFlash 2 drafter beside the file
+does a little better: download `orcacyber-nano-1.0-turbo.dflash.cmf` and add `CMF_DFLASH=1`.
+
+RTX 3090 (24 GB), cortiq 0.8.68, `--greedy --no-think`, tok/s:
+
+| answer | plain | **MTP drafts** | **DFlash 2** |
+|---|---:|---:|---:|
+| a history question in four sentences, 163 tokens | 49.0 | **83.9** | 74.3 |
+| a Python LRU cache module with tests, 256 tokens | 49.0 | 111.4 | **116.8** |
+
+The text is the same in all three columns.
+
+Long prompts, `cortiq bench --core`: 4 000 tokens are read at 931 tok/s (first token 4.3 s), 32 000 at
+612 tok/s (first token 52.3 s), and past the seal it decodes at 37.9 tok/s, without drafts. The weights take
+13.7 GB of the card, the far field 301 MB at 32 000 tokens. A pass key in 60 000 characters of Wikipedia:
+2 of 2, first token 22 s.
+
 ## On a Mac
 
 MacBook Air M4 with 24 GB, native Metal: no fan, so long runs slow down as it heats, and the base M4's memory bus
-(120 GB/s by Apple's figure). Two switches make it faster: draft tokens, which are on by default from
-[infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) on (in cortiq 0.8.63 set `CMF_GRAPH_SPEC=1`), and the Neural Engine for reading prompts.
+(120 GB/s by Apple's figure). Two switches make it faster: draft tokens, which are on by default from cortiq
+0.8.64 on (in 0.8.63 set `CMF_GRAPH_SPEC=1`), and the Neural Engine for reading prompts.
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -148,7 +185,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 Greedy, 220 tokens, one answer a process; the same text with drafts and without in every pair.
 
-A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_ANE=1`, which reads the FFNs and part of the mixers on the Neural Engine beside the GPU (the same answer). 16 000 tokens, past the seal, with both switches: first token 205–211 s, decode 8.2 tok/s against 5.8 without drafts (#100 gives the Neural Engine's memory back once the prompt is read; before it, 6.4), a peak footprint of 5.8 GB beside the mapped weights, and a correct one-paragraph summary. An M4 Pro (273 GB/s) or M4 Max (up to 546 GB/s) was not measured.
+A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_ANE=1`, which reads the FFNs and part of the mixers on the Neural Engine beside the GPU (the same answer). 16 000 tokens, past the seal, with both switches: first token 205–211 s, decode 8.2 tok/s against 5.8 without drafts (0.8.64 gives the Neural Engine's memory back once the prompt is read; 0.8.63 decodes 6.4), a peak footprint of 5.8 GB beside the mapped weights, and a correct one-paragraph summary. An M4 Pro (273 GB/s) or M4 Max (up to 546 GB/s) was not measured.
 
 ## Options
 
@@ -156,19 +193,24 @@ A prompt of 3 600 tokens: first token 68–71 s on the GPU, 28–29 s with `CMF_
 |---|---|
 | `--o1-spill DIR` | a long prompt's rows in files in `DIR`, also `CMF_O1_SPILL` |
 | `--prompt-file FILE` | a prompt longer than a command line holds |
-| `CMF_GRAPH_SPEC=1` / `=0` | draft tokens on / off (on by default on Vulkan and DX12, off on a Mac) |
+| `CMF_GRAPH_SPEC=1` / `=0` | draft tokens on / off (on by default; on a Mac from 0.8.64) |
 | `CMF_ANE=1` | on a Mac, read prompts on the Neural Engine beside the GPU |
 | `CMF_O1=off` | the plain model, with exact attention at any length |
+| `CMF_GPU=cuda` | the CUDA backend (a build with `--features cuda`) |
+| `CMF_DFLASH=1` | the DFlash drafter beside the file drafts the rounds it wins (CUDA) |
 
 ## Limits
 
-- Text only: OrcaCyber's vision projector (`mmproj`) and its DFlash2 drafter are not in the file. On a 16 GB card
-  the drafter has no room beside the trunk, and the MTP head is the faster drafter there.
+- Text only: OrcaCyber's vision projector (`mmproj`) is not in the file, nor is its own DFlash2 drafter.
+  `orcacyber-nano-1.0-turbo.dflash.cmf` is Qwen3.8-27B's drafter,
+  [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), converted for this file and
+  measured on a 24 GB card. On a 16 GB card the drafter has no room beside the trunk, and the MTP head is the
+  faster drafter there.
 - OrcaCyber-Nano-1.0 is published only as GGUF. These weights are the Mix-15.7G file (an imatrix IQ4_XS/Q5_K/Q6_K
   mix) decoded and re-encoded as q4tp, so they carry both roundings.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact.
-- Measured on one card, an RTX 2000 Ada, and on a MacBook Air M4. The far field runs on Vulkan, DX12 and Metal; on the
-  CPU the file runs as the standard one.
+- Measured on an RTX 2000 Ada (Vulkan), an RTX 3090 (CUDA) and a MacBook Air M4. The far field runs on Vulkan, DX12,
+  Metal and CUDA; on the CPU the file runs as the standard one.
 
 ## How the file was made
 
@@ -198,7 +240,7 @@ Read the source page before use. The far field is a subject of U.S. patent appli
 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf), который держит память карты на месте при
 длинных промптах. На карте 16 ГБ файл читает 64 000 токенов в 14,8 ГБ памяти карты и декодирует там
 26,0 ток/с; обычный файл не помещается на карту уже с 16 000 токенов. Собственная MTP-голова модели пишет черновые токены: на коде это
-примерно вдвое быстрее обычного декода. Один [CMF](https://github.com/infosave2007/cmf)-файл для `cortiq`, движка на
+примерно вдвое быстрее обычного декода. На RTX 3090 через CUDA обычный декод — 49 ток/с, на коде с черновиками — 111–117 ток/с. Один [CMF](https://github.com/infosave2007/cmf)-файл для `cortiq`, движка на
 Rust без Python и ML-фреймворков.
 
 ### Быстрый старт
@@ -209,7 +251,14 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-Замерено на cortiq, собранном из [infosave2007/cmf#99](https://github.com/infosave2007/cmf/pull/99), он войдёт в следующий релиз; cortiq 0.8.63 запускает тот же файл и читает промпт примерно со скоростью 75 ток/с вместо 98–112. `--no-think` просит прямой ответ; без него модель сначала рассуждает, так что поднимите `--max-tokens`
+На карте NVIDIA, через CUDA (cortiq 0.8.68 или новее; см. «NVIDIA через CUDA» ниже):
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+```
+
+cortiq 0.8.64 и новее читает промпт на карте из раздела ниже со скоростью 98–112 ток/с; 0.8.63 запускает тот же файл примерно на 75. `--no-think` просит прямой ответ; без него модель сначала рассуждает, так что поднимите `--max-tokens`
 (по умолчанию 256). Каждый `cortiq run` загружает модель заново (около 8 с на 14 ГБ на замеренной карте); для чата
 держите её загруженной в сервере:
 
@@ -223,6 +272,7 @@ cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
 | файл | квантизация | размер | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4 бита (q4tp), текст, MTP-голова | 14,3 ГБ | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
+| `orcacyber-nano-1.0-turbo.dflash.cmf` | драфтер DFlash 2, 4 бита (необязательно, CUDA) | 1,3 ГБ | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
 
 ### Производительность
 
@@ -291,12 +341,38 @@ NVIDIA RTX 2000 Ada (16 ГБ, 70 Вт), Vulkan, `cortiq bench --core`, 60 ток
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+### NVIDIA через CUDA
+
+```bash
+cargo install cortiq-cli --features cuda
+cortiq gpu      # покажет, найдены ли карта и библиотеки CUDA
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+CMF_GPU=cuda cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
+```
+
+Сборка ничего не линкует; при запуске бэкенд открывает `libcuda` из драйвера и библиотеки CUDA 12.x
+`libnvrtc` и `libcublas`. По умолчанию черновики пишет MTP-голова. На коде драфтер DFlash 2 рядом с файлом
+немного лучше: скачайте `orcacyber-nano-1.0-turbo.dflash.cmf` и добавьте `CMF_DFLASH=1`.
+
+RTX 3090 (24 ГБ), cortiq 0.8.68, `--greedy --no-think`, ток/с:
+
+| ответ | обычный | **черновики MTP** | **DFlash 2** |
+|---|---:|---:|---:|
+| исторический вопрос в четыре предложения, 163 токена | 49,0 | **83,9** | 74,3 |
+| модуль LRU-кэша на Python с тестами, 256 токенов | 49,0 | 111,4 | **116,8** |
+
+Текст во всех трёх столбцах один и тот же.
+
+Длинные промпты, `cortiq bench --core`: 4 000 токенов читаются со скоростью 931 ток/с (первый токен через
+4,3 с), 32 000 — 612 ток/с (первый токен через 52,3 с), после печати декод 37,9 ток/с, без черновиков. Веса
+занимают 13,7 ГБ карты, дальнее поле — 301 МБ на 32 000 токенов. Ключ в 60 000 символов Википедии: 2 из 2,
+первый токен через 22 с.
+
 ### На Маке
 
 MacBook Air M4 с 24 ГБ, нативный Metal: без вентилятора, так что долгие прогоны замедляются по мере нагрева, и шина
 памяти базового M4 (120 ГБ/с по данным Apple). Ускоряют работу два переключателя: черновые токены, включённые по
-умолчанию начиная с [infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) (в cortiq 0.8.63 задайте `CMF_GRAPH_SPEC=1`), и Neural Engine для
-чтения промпта.
+умолчанию начиная с cortiq 0.8.64 (в 0.8.63 задайте `CMF_GRAPH_SPEC=1`), и Neural Engine для чтения промпта.
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -312,7 +388,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 Жадно, 220 токенов, один ответ на процесс; текст с черновиками и без совпадает в каждой паре.
 
-Промпт в 3 600 токенов: первый токен через 68–71 с на GPU и через 28–29 с с `CMF_ANE=1`, который читает FFN и часть миксеров на Neural Engine рядом с GPU (ответ тот же). 16 000 токенов, после печати, с обоими переключателями: первый токен через 205–211 с, декод 8,2 ток/с против 5,8 без черновиков (#100 возвращает память Neural Engine, как только промпт прочитан; до него — 6,4), пиковый footprint 5,8 ГБ помимо отображённых весов и верное краткое содержание одним абзацем. M4 Pro (273 ГБ/с) и M4 Max (до 546 ГБ/с) не замерялись.
+Промпт в 3 600 токенов: первый токен через 68–71 с на GPU и через 28–29 с с `CMF_ANE=1`, который читает FFN и часть миксеров на Neural Engine рядом с GPU (ответ тот же). 16 000 токенов, после печати, с обоими переключателями: первый токен через 205–211 с, декод 8,2 ток/с против 5,8 без черновиков (0.8.64 возвращает память Neural Engine, как только промпт прочитан; в 0.8.63 декод 6,4), пиковый footprint 5,8 ГБ помимо отображённых весов и верное краткое содержание одним абзацем. M4 Pro (273 ГБ/с) и M4 Max (до 546 ГБ/с) не замерялись.
 
 ### Опции
 
@@ -320,19 +396,23 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 |---|---|
 | `--o1-spill DIR` | строки длинного промпта в файлах в `DIR`, также `CMF_O1_SPILL` |
 | `--prompt-file FILE` | промпт длиннее командной строки |
-| `CMF_GRAPH_SPEC=1` / `=0` | черновые токены вкл. / выкл. (по умолчанию включены на Vulkan и DX12, выключены на Маке) |
+| `CMF_GRAPH_SPEC=1` / `=0` | черновые токены вкл. / выкл. (по умолчанию включены; на Маке — с 0.8.64) |
 | `CMF_ANE=1` | на Маке читать промпт на Neural Engine рядом с GPU |
 | `CMF_O1=off` | обычная модель с точным вниманием на любой длине |
+| `CMF_GPU=cuda` | бэкенд CUDA (сборка с `--features cuda`) |
+| `CMF_DFLASH=1` | драфтер DFlash рядом с файлом пишет черновики в раундах, где он выигрывает (CUDA) |
 
 ### Ограничения
 
-- Только текст: проектора зрения OrcaCyber (`mmproj`) и её драфтера DFlash2 в файле нет. На карте 16 ГБ драфтеру
-  нет места рядом со стволом, а MTP-голова там быстрее.
+- Только текст: проектора зрения OrcaCyber (`mmproj`) в файле нет, как и её собственного драфтера DFlash2.
+  `orcacyber-nano-1.0-turbo.dflash.cmf` — драфтер Qwen3.8-27B,
+  [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), сконвертированный под этот файл и
+  замеренный на карте 24 ГБ. На карте 16 ГБ драфтеру нет места рядом со стволом, а MTP-голова там быстрее.
 - OrcaCyber-Nano-1.0 опубликована только в GGUF. Эти веса — файл Mix-15.7G (imatrix-смесь IQ4_XS/Q5_K/Q6_K),
   раскодированный и перекодированный в q4tp, так что в них оба округления.
 - После печати текст приблизителен: далёкое прошлое тускнеет, кроме строк, оставленных точными.
-- Замерено на одной карте, RTX 2000 Ada, и на MacBook Air M4. Дальнее поле работает на Vulkan, DX12 и Metal; на CPU
-  файл идёт как обычный.
+- Замерено на RTX 2000 Ada (Vulkan), RTX 3090 (CUDA) и MacBook Air M4. Дальнее поле работает на Vulkan, DX12, Metal
+  и CUDA; на CPU файл идёт как обычный.
 
 ### Как сделан файл
 
@@ -360,7 +440,7 @@ Qwen3.8-27B, лежат в [репозитории](https://github.com/infosave2
 [OrcaCyber-Nano-1.0](https://huggingface.co/orcarouter/OrcaCyber-Nano-1.0) 的 4 位权重。这是 OrcaRouter 面向防御性网络安全工作的
 27B 模型（Qwen3.8-27B 架构），配上 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) 的头部：长提示下显存保持不变。
 在 16 GB 显卡上读取 64 000 token 时显存为 14.8 GB，此时解码 26.0 tok/s；普通文件从 16 000 token 起就放不进显卡。模型自带的 MTP 头生成草稿
-token：在代码上约为普通解码的两倍。一个 [CMF](https://github.com/infosave2007/cmf) 文件，供 `cortiq` 使用；`cortiq` 是一个
+token：在代码上约为普通解码的两倍。在 RTX 3090 上通过 CUDA，普通解码 49 tok/s，代码配合草稿 111–117 tok/s。一个 [CMF](https://github.com/infosave2007/cmf) 文件，供 `cortiq` 使用；`cortiq` 是一个
 Rust 推理引擎，不需要 Python，也不需要机器学习框架。
 
 ### 快速开始
@@ -371,7 +451,14 @@ hf download infosave/OrcaCyber-Nano-1.0-Turbo-cmf orcacyber-nano-1.0-turbo.cmf -
 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
 ```
 
-测量所用的 cortiq 由 [infosave2007/cmf#99](https://github.com/infosave2007/cmf/pull/99) 构建，将包含在下一个版本中；cortiq 0.8.63 也能运行同一文件，但读取提示约为 75 tok/s，而不是 98–112。 `--no-think` 要求直接回答；不加时模型会先推理，请调大 `--max-tokens`（默认 256）。每次 `cortiq run` 都会重新加载模型
+在 NVIDIA 显卡上通过 CUDA 运行（cortiq 0.8.68 或更新版本；见下文「NVIDIA（CUDA）」）：
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+```
+
+cortiq 0.8.64 及更新版本在下文那块显卡上读取提示为 98–112 tok/s；0.8.63 运行同一文件约为 75。`--no-think` 要求直接回答；不加时模型会先推理，请调大 `--max-tokens`（默认 256）。每次 `cortiq run` 都会重新加载模型
 （在实测显卡上 14 GB 约需 8 秒）；聊天请用服务器常驻：
 
 ```bash
@@ -383,6 +470,7 @@ cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
 | 文件 | 量化 | 大小 | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4 位（q4tp），文本，MTP 头 | 14.3 GB | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
+| `orcacyber-nano-1.0-turbo.dflash.cmf` | DFlash 2 草稿模型，4 位（可选，CUDA） | 1.3 GB | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
 
 ### 性能
 
@@ -447,10 +535,35 @@ NVIDIA RTX 2000 Ada（16 GB，70 W），Vulkan，`cortiq bench --core`，在该�
 >
 > This ensures `b` is always null-terminated and never overflows.
 
+### NVIDIA（CUDA）
+
+```bash
+cargo install cortiq-cli --features cuda
+cortiq gpu      # 显示是否找到显卡和 CUDA 库
+CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
+CMF_GPU=cuda cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
+```
+
+构建时不链接任何库；运行时后端打开驱动的 `libcuda` 和 CUDA 12.x 库 `libnvrtc`、`libcublas`。默认由 MTP 头起草。
+在代码上，文件旁的 DFlash 2 草稿模型略好一些：下载 `orcacyber-nano-1.0-turbo.dflash.cmf` 并加上 `CMF_DFLASH=1`。
+
+RTX 3090（24 GB），cortiq 0.8.68，`--greedy --no-think`，tok/s：
+
+| 回答 | 普通 | **MTP 草稿** | **DFlash 2** |
+|---|---:|---:|---:|
+| 四句话回答一个历史问题，163 个 token | 49.0 | **83.9** | 74.3 |
+| 带测试的 Python LRU 缓存模块，256 个 token | 49.0 | 111.4 | **116.8** |
+
+三列的文本完全相同。
+
+长提示，`cortiq bench --core`：4 000 token 的读取速度为 931 tok/s（首个 token 4.3 秒），32 000 为 612 tok/s
+（首个 token 52.3 秒），封存之后解码 37.9 tok/s，不使用草稿。权重占用 13.7 GB 显存，32 000 token 时远场占 301 MB。
+在 60 000 字符的维基百科文本中查找密钥：2/2，首个 token 22 秒。
+
 ### 在 Mac 上
 
 MacBook Air M4，24 GB，原生 Metal：没有风扇，长时间运行会因发热变慢；基础款 M4 的内存总线为 120 GB/s（Apple 标称）。
-两个开关可以提速：草稿 token（从 [infosave2007/cmf#100](https://github.com/infosave2007/cmf/pull/100) 起默认开启；cortiq 0.8.63 中请设置 `CMF_GRAPH_SPEC=1`），以及用 Neural Engine 读取提示。
+两个开关可以提速：草稿 token（从 cortiq 0.8.64 起默认开启；0.8.63 中请设置 `CMF_GRAPH_SPEC=1`），以及用 Neural Engine 读取提示。
 
 ```bash
 CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --no-think
@@ -466,7 +579,7 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 
 贪心解码，220 个 token，每个进程一个回答；每一对中有无草稿的文本完全相同。
 
-3 600 token 的提示：GPU 上首个 token 68–71 秒；开启 `CMF_ANE=1` 后为 28–29 秒，Neural Engine 在 GPU 旁读取 FFN 和部分混合层（回答相同）。16 000 token（超过封存点），两个开关都开：首个 token 205–211 秒，解码 8.2 tok/s，无草稿时 5.8（#100 在提示读完后归还 Neural Engine 的内存；此前为 6.4），除映射的权重外峰值占用 5.8 GB，一段话的概括正确。M4 Pro（273 GB/s）和 M4 Max（最高 546 GB/s）未测量。
+3 600 token 的提示：GPU 上首个 token 68–71 秒；开启 `CMF_ANE=1` 后为 28–29 秒，Neural Engine 在 GPU 旁读取 FFN 和部分混合层（回答相同）。16 000 token（超过封存点），两个开关都开：首个 token 205–211 秒，解码 8.2 tok/s，无草稿时 5.8（0.8.64 在提示读完后归还 Neural Engine 的内存；0.8.63 为 6.4），除映射的权重外峰值占用 5.8 GB，一段话的概括正确。M4 Pro（273 GB/s）和 M4 Max（最高 546 GB/s）未测量。
 
 ### 选项
 
@@ -474,16 +587,20 @@ CMF_GRAPH_SPEC=1 CMF_ANE=1 cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file
 |---|---|
 | `--o1-spill DIR` | 长提示的行存放在 `DIR` 的文件中，也可用 `CMF_O1_SPILL` |
 | `--prompt-file FILE` | 超过命令行长度的提示 |
-| `CMF_GRAPH_SPEC=1` / `=0` | 开启 / 关闭草稿 token（Vulkan 和 DX12 上默认开启，Mac 上默认关闭） |
+| `CMF_GRAPH_SPEC=1` / `=0` | 开启 / 关闭草稿 token（默认开启；Mac 上从 0.8.64 起） |
 | `CMF_ANE=1` | 在 Mac 上用 GPU 旁的 Neural Engine 读取提示 |
 | `CMF_O1=off` | 普通模型，任何长度都用精确注意力 |
+| `CMF_GPU=cuda` | CUDA 后端（需用 `--features cuda` 构建） |
+| `CMF_DFLASH=1` | 文件旁的 DFlash 草稿模型在它占优的轮次起草（CUDA） |
 
 ### 限制
 
-- 只有文本：文件中不含 OrcaCyber 的视觉投影器（`mmproj`）和 DFlash2 草稿模型。在 16 GB 显卡上草稿模型没有空间与主干并存，而且那里 MTP 头更快。
+- 只有文本：文件中不含 OrcaCyber 的视觉投影器（`mmproj`），也不含它自己的 DFlash2 草稿模型。
+  `orcacyber-nano-1.0-turbo.dflash.cmf` 是 Qwen3.8-27B 的草稿模型 [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)，
+  为此文件转换，在 24 GB 显卡上测量。在 16 GB 显卡上草稿模型没有空间与主干并存，而且那里 MTP 头更快。
 - OrcaCyber-Nano-1.0 只以 GGUF 形式发布。这些权重来自 Mix-15.7G 文件（imatrix 的 IQ4_XS/Q5_K/Q6_K 混合），解码后重新编码为 q4tp，因此带有两次舍入。
 - 超过封存点后文本是近似的：远处的内容会变淡，保留为精确的行除外。
-- 在一块显卡 RTX 2000 Ada 和一台 MacBook Air M4 上测量。远场可在 Vulkan、DX12 和 Metal 上运行；在 CPU 上该文件按普通文件运行。
+- 在 RTX 2000 Ada（Vulkan）、RTX 3090（CUDA）和 MacBook Air M4 上测量。远场可在 Vulkan、DX12、Metal 和 CUDA 上运行；在 CPU 上该文件按普通文件运行。
 
 ### 文件是如何制作的
 

@@ -112,6 +112,24 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## CUDA 上的 Qwen3.8-27B：RTX 3090 上聊天 120–128 tok/s(0.8.68)
+
+CUDA 后端在显卡上运行 Qwen3.5 系列混合模型（GDN 混合层加门控注意力），草稿及其验证也在显卡上完成。在 RTX 3090
+上，4 位的 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) 借助自带的 MTP 头以 120.2 tok/s 生成
+聊天回答，配上 DFlash 2 草稿模型为 128.4（Vulkan 为 57.7），不用草稿为 49.1（40.8），以 983 tok/s 读入 4 000
+词元的提示（560）。有草稿与无草稿的文本相同。聊天的下一轮只读取新消息。
+[Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf)（没有 MTP 头：DFlash 把代码从 49 提到
+102 tok/s）和 [OrcaCyber-Nano-1.0 Turbo](https://huggingface.co/infosave/OrcaCyber-Nano-1.0-Turbo-cmf) 同样可用，
+各自的草稿模型都在 Hugging Face 上。Fast Code 堆栈也能在 CUDA 上运行。
+
+```sh
+cargo install cortiq-cli --features cuda
+hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf qwen38-27b-q4tp.dflash.cmf --local-dir .
+CMF_GPU=cuda CMF_DFLASH=1 cortiq serve qwen38-27b-q4tp.cmf --port 8080 --host 127.0.0.1
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+
 ## 面向 NVIDIA 显卡的 CUDA 后端(0.8.67)
 
 在 wgpu 和 Metal 之外新增原生 CUDA 后端，属实验性质，默认关闭：用 `--features cuda` 构建，用 `CMF_GPU=cuda`

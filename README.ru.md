@@ -123,6 +123,25 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Qwen3.8-27B на CUDA: чат 120–128 tok/s на RTX 3090 (0.8.68)
+
+Бэкенд CUDA запускает гибриды семейства Qwen3.5 (миксеры GDN и внимание с гейтом) вместе с черновиками и их
+проверкой на карте. На RTX 3090 [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) в четырёх битах
+генерирует чат на 120,2 tok/s со своей MTP-головой и на 128,4 с драфтером DFlash 2 рядом (57,7 через Vulkan), без
+черновиков — 49,1 (40,8), а промпт в 4 000 токенов читает на 983 tok/s (560). Текст с черновиками совпадает с
+текстом без них. Следующий ход чата читает только новое сообщение. Так же работают
+[Arete-27B Turbo](https://huggingface.co/infosave/Arete-27B-Turbo-cmf) (без MTP-головы: DFlash поднимает код с 49
+до 102 tok/s) и [OrcaCyber-Nano-1.0 Turbo](https://huggingface.co/infosave/OrcaCyber-Nano-1.0-Turbo-cmf), у каждой
+свой драфтер на Hugging Face. Стек Fast Code тоже работает на CUDA.
+
+```sh
+cargo install cortiq-cli --features cuda
+hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf qwen38-27b-q4tp.dflash.cmf --local-dir .
+CMF_GPU=cuda CMF_DFLASH=1 cortiq serve qwen38-27b-q4tp.cmf --port 8080 --host 127.0.0.1
+```
+
+См. [docs/CUDA.ru.md](docs/CUDA.ru.md).
+
 ## Бэкенд CUDA для карт NVIDIA (0.8.67)
 
 Нативный бэкенд CUDA рядом с wgpu и Metal, экспериментальный и по умолчанию выключенный: сборка с
