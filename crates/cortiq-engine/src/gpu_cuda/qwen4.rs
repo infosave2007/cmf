@@ -676,6 +676,7 @@ impl Drop for Pinned {
 /// Host pages that stay in RAM for good: page-aligned spans of a read-only mapping registered with the driver
 /// (`cuMemHostRegister`, read-only) from a background thread, in pieces of 1 GiB. A container that refuses
 /// `mlock` (RLIMIT_MEMLOCK, no CAP_IPC_LOCK) still lets the driver pin. Returns at once; never unregistered.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 pub(crate) fn pin_host_for_good(name: &'static str, spans: Vec<(usize, usize)>) {
     let Some(c) = ctx() else { return };
     let _ = std::thread::Builder::new().name("pin-host".into()).spawn(move || {
