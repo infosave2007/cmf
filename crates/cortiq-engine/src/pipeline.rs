@@ -6159,6 +6159,56 @@ impl Pipeline {
             .ok_or("O(1) prefix: K/V readback failed")?;
         let (t_kv, t_app) = (t_kv.elapsed().as_secs_f64(), std::time::Instant::now());
         let row = nkv * hd;
+        if arch.is_none() {
+            // without an archive each layer's rows go into its own cache: the
+            // layers side by side
+            for ((&li, q), (k, v)) in o1_layers.iter().zip(&qs).zip(&kv) {
+                if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
+                    return Err(format!(
+                        "O(1) prefix: layer {li} read back {}/{}/{} values, expected {}/{}/{}",
+                        k.len(),
+                        v.len(),
+                        q.len(),
+                        n * row,
+                        n * row,
+                        n.div_ceil(QT_STRIDE) * qrow
+                    ));
+                }
+            }
+            let mut work: Vec<(&mut crate::kv_cache::LayerKvCache, Vec<f32>, (Vec<f32>, Vec<f32>))> = Vec::new();
+            let mut by_layer: Vec<Option<(Vec<f32>, (Vec<f32>, Vec<f32>))>> = (0..self.kv_cache.layers.len()).map(|_| None).collect();
+            for ((&li, q), kvp) in o1_layers.iter().zip(qs).zip(kv) {
+                by_layer[li] = Some((q, kvp));
+            }
+            for (cache, slot) in self.kv_cache.layers.iter_mut().zip(by_layer) {
+                if let Some((q, kvp)) = slot {
+                    work.push((cache, q, kvp));
+                }
+            }
+            let par = std::thread::available_parallelism().map_or(1, |p| p.get()).clamp(1, 8);
+            let per = work.len().div_ceil(par).max(1);
+            std::thread::scope(|sc| {
+                for part in work.chunks_mut(per) {
+                    sc.spawn(move || {
+                        for (cache, q, (k, v)) in part.iter_mut() {
+                            cache.o1_set_q_stride(QT_STRIDE);
+                            cache.reserve_rows(n);
+                            for p in 0..n {
+                                cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
+                            }
+                            cache.o1_set_q_trace(std::mem::take(q));
+                        }
+                    });
+                }
+            });
+            if prof {
+                eprintln!(
+                    "o1 prefix: {n} rows, chunks {t_chunks:.2} s, queries off the card {t_q:.2} s, K/V off the card {t_kv:.2} s, into the cache {:.2} s",
+                    t_app.elapsed().as_secs_f64()
+                );
+            }
+            return Ok(Some(last));
+        }
         for ((&li, q), (k, v)) in o1_layers.iter().zip(qs).zip(kv) {
             if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
                 return Err(format!(

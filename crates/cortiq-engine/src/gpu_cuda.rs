@@ -2879,12 +2879,21 @@ pub fn kv_pull_host(
                 cu::memcpy_dtoh_async(&mut vh, m.vptr() + off, c.stream).ok()?;
             }
             c.sync().ok()?;
-            for (d, h) in kb[dst..].iter_mut().zip(&kh) {
-                *d = cortiq_core::quant::f16_to_f32(*h);
-            }
-            for (d, h) in vb[dst..].iter_mut().zip(&vh) {
-                *d = cortiq_core::quant::f16_to_f32(*h);
-            }
+            // a long prompt's mirror is gigabytes: its rows to f32 on threads
+            let widen = |dst: &mut [f32], src: &[u16]| {
+                let per = src.len().div_ceil(16).max(1 << 16);
+                std::thread::scope(|sc| {
+                    for (o, i) in dst.chunks_mut(per).zip(src.chunks(per)) {
+                        sc.spawn(move || {
+                            for (d, h) in o.iter_mut().zip(i) {
+                                *d = cortiq_core::quant::f16_to_f32(*h);
+                            }
+                        });
+                    }
+                });
+            };
+            widen(&mut kb[dst..], &kh);
+            widen(&mut vb[dst..], &vh);
         } else {
             let off = ((first - m.base) * row * 4) as u64;
             unsafe {
