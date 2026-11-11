@@ -615,8 +615,52 @@ fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::
 }
 
 fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
-    unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
-        .map_err(|e| format!("kernel {name}: {e}"))
+    let f = unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
+        .map_err(|e| format!("kernel {name}: {e}"))?;
+    KT_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(f as usize, name.to_string());
+    Ok(f)
+}
+
+/// Kernel timing (`CMF_QWEN_NCU=<round>` of the qwen4 path): while on, every launch is bracketed by two
+/// events and `kt_stop` prints the time per kernel. A profiler that cannot read the counters (a container)
+/// still gets the time of each kernel this way.
+static KT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KT_NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+// SAFETY: events are plain driver handles, used from the thread that owns the context lock.
+struct KtEvent(usize, cs::CUevent, cs::CUevent);
+unsafe impl Send for KtEvent {}
+static KT_EVENTS: Mutex<Vec<KtEvent>> = Mutex::new(Vec::new());
+
+pub(crate) fn kt_start() {
+    KT_EVENTS.lock().unwrap().clear();
+    KT_ON.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn kt_stop() {
+    KT_ON.store(false, Ordering::SeqCst);
+    let events = std::mem::take(&mut *KT_EVENTS.lock().unwrap());
+    let names = KT_NAMES.lock().unwrap();
+    let mut by: HashMap<String, (usize, f64)> = HashMap::new();
+    let (mut total, mut n) = (0f64, 0usize);
+    for KtEvent(f, a, b) in events {
+        let ms = unsafe { cu::event::elapsed(a, b) }.unwrap_or(0.0) as f64;
+        let name = names.as_ref().and_then(|m| m.get(&f)).cloned().unwrap_or_else(|| format!("{f:x}"));
+        let e = by.entry(name).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += ms;
+        total += ms;
+        n += 1;
+        unsafe {
+            let _ = cu::event::destroy(a);
+            let _ = cu::event::destroy(b);
+        }
+    }
+    let mut rows: Vec<(String, (usize, f64))> = by.into_iter().collect();
+    rows.sort_by(|x, y| y.1.1.total_cmp(&x.1.1));
+    eprintln!("qwen4 cuda: kernel times of one round: {n} launches, {total:.2} ms between their events");
+    for (name, (c, ms)) in rows.iter().take(40) {
+        eprintln!("qwen4 cuda: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
+    }
 }
 
 fn init() -> Res<Ctx> {
@@ -809,7 +853,16 @@ impl Ctx {
         shared: usize,
         params: &mut [*mut c_void],
     ) -> Res<()> {
-        unsafe {
+        let timed = if KT_ON.load(Ordering::Relaxed) {
+            let a = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT).ok();
+            if let Some(a) = a {
+                let _ = unsafe { cu::event::record(a, self.stream) };
+            }
+            a
+        } else {
+            None
+        };
+        let r = unsafe {
             cu::launch_kernel(
                 f,
                 (grid.0.max(1), grid.1.max(1), 1),
@@ -819,7 +872,14 @@ impl Ctx {
                 params,
             )
         }
-        .map_err(derr)
+        .map_err(derr);
+        if let Some(a) = timed {
+            if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
+                let _ = unsafe { cu::event::record(b, self.stream) };
+                KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
+            }
+        }
+        r
     }
 
     /// C[m x n] = alpha * op(A) * op(B) + beta * C, column-major. C is f32;

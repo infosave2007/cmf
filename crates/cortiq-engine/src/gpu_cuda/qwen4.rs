@@ -81,8 +81,11 @@ struct QSmall {
     exp_gu: cs::CUfunction,
     exp_d: cs::CUfunction,
     exp_sum: cs::CUfunction,
-    /// Dynamic shared memory a block of these kernels may take.
-    shared_max: usize,
+    /// Dynamic shared memory a block of the matvec kernels, of the hyper-connection kernels, of the
+    /// expert kernels may take (each family has the most its kernels accept).
+    mvb_max: usize,
+    hc_max: usize,
+    ex_max: usize,
 }
 
 impl QSmall {
@@ -97,24 +100,28 @@ impl QSmall {
         let (mvb, hc_di, hc_up) = (set("mvb")?, set("hc_di")?, set("hc_up")?);
         let (exp_gu, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_d")?);
         // a block stages every row of the round: ask for all a block may have
-        let mut shared_max = 48 << 10;
-        for want in [200usize << 10, 96 << 10] {
-            let ok = mvb.iter().chain(&hc_di).chain(&hc_up).chain([&exp_gu, &exp_d]).all(|&f| {
-                unsafe {
-                    cu::function::set_function_attribute(
-                        f,
-                        cs::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        want as i32,
-                    )
+        let family = |fs: &[cs::CUfunction]| -> usize {
+            // the opt-in limit of a block is 227 KB on a datacenter part and 99 KB on a consumer Blackwell
+            for want in [200usize << 10, 99 << 10, 96 << 10] {
+                let ok = fs.iter().all(|&f| {
+                    unsafe {
+                        cu::function::set_function_attribute(
+                            f,
+                            cs::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            want as i32,
+                        )
+                    }
+                    .is_ok()
+                });
+                if ok {
+                    return want;
                 }
-                .is_ok()
-            });
-            if ok {
-                shared_max = want;
-                break;
             }
-        }
-        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_d, exp_sum: func(module, "q4_exp_sum")?, shared_max })
+            48 << 10
+        };
+        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_d]));
+        let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice()].concat());
+        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
     }
 }
 
@@ -172,7 +179,7 @@ impl Tune {
         };
         let threads = |t: usize| (t / 32 * 32).clamp(32, 1024);
         let hc = list("CMF_QWEN_CUDA_HC", &[1280, 512, 512]);
-        let ex = list("CMF_QWEN_CUDA_EXP", &[512, 32, 512, 64]);
+        let ex = list("CMF_QWEN_CUDA_EXP", &[512, 32, 256, 32]);
         let (g_t, d_t) = (threads(ex[0]), threads(ex[2]));
         Self {
             cw: (hc[0] / 8 * 8).max(8),
@@ -1742,7 +1749,7 @@ impl Dev {
         c.resident.fetch_add(b.held, std::sync::atomic::Ordering::Relaxed);
         if super::debug() || std::env::var_os("CMF_QWEN_PROF").is_some() {
             eprintln!(
-                "qwen4 cuda: {} layers on {}, {:.1} GiB held, arena {} of {} experts, chunk {}, weights {}",
+                "qwen4 cuda: {} layers on {}, {:.1} GiB held, arena {} of {} experts, chunk {}, weights {}, small path shared memory (matvec/hc/experts) {} KB",
                 layers.len(),
                 c.name,
                 b.held as f64 / (1u64 << 30) as f64,
@@ -1750,6 +1757,7 @@ impl Dev {
                 ne * layers.len(),
                 n,
                 if half { "f16" } else { "f32" },
+                format!("{}/{}/{}", q.sm.mvb_max >> 10, q.sm.hc_max >> 10, q.sm.ex_max >> 10),
             );
         }
         let prof = std::env::var_os("CMF_QWEN_PROF").map(|_| Mutex::new(Prof { t0: Instant::now(), acc: [0.0; STAGES.len()], steps: 0 }));
@@ -1834,6 +1842,11 @@ impl Dev {
             } else {
                 let _ = cs::cuProfilerStop();
             }
+        }
+        if on {
+            super::kt_start();
+        } else {
+            super::kt_stop();
         }
     }
 
@@ -2218,7 +2231,7 @@ impl Core {
     fn mvb(&self, ops: &[SOp], x: u64, xstride: usize, cols: usize, n: usize) -> Res<()> {
         let sm = &self.q.sm;
         let per = 16 * ((cols >> 4) | 1) * 4;
-        let cap = (sm.shared_max / per).min(SMALL_ROWS);
+        let cap = (sm.mvb_max / per).min(SMALL_ROWS);
         if cap == 0 || ops.is_empty() || ops.len() > 5 {
             return Err(format!("qwen4 cuda: a small matvec of {} jobs over {cols} columns", ops.len()));
         }
@@ -2276,7 +2289,7 @@ impl Core {
                 && cw.is_multiple_of(per)
                 && hc.lr.is_multiple_of(per)
                 && hc.r == hc.lr + d.hc
-                && dsh.max(ush) <= sm.shared_max
+                && dsh.max(ush) <= sm.hc_max
                 && nch * n * hc.r * 4 <= s.hcp.bytes;
             if fits {
                 unsafe {
@@ -2582,7 +2595,7 @@ impl Core {
             let (sm, t) = (&q.sm, &self.tune);
             let kk = topk + lw.shared.is_some() as usize;
             let (gg, gd) = (d.h >> 5, d.inter >> 5);
-            let room = sm.shared_max / 4;
+            let room = sm.ex_max / 4;
             // rows of a unit by what a block can stage
             let ur = [
                 if t.share { UNIT_ROWS } else { 1 },
