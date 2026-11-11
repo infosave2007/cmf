@@ -521,6 +521,34 @@ fn repack_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: u
     Ok((t, cc, Buf::from_slice(&lad)?))
 }
 
+/// `repack_on_card` for the leading `rows` rows of one q4tp payload, its
+/// three sections given apart (nibbles, ladders, codes of those rows), so
+/// they go to the card straight from the file's pages.
+fn repack_rows_on_card(c: &Ctx, fx: &HFuncs, nib: &[u8], params: &[u8], codes: &[u8], stride: usize, rows: usize, cols: usize) -> Res<(Buf, Buf, Buf)> {
+    use cortiq_core::quant::{GROUP_SIZE, f16_to_f32};
+    let gpr = cols / GROUP_SIZE;
+    if cols % GROUP_SIZE != 0 || nib.len() < rows * gpr * 16 || params.len() < rows * 4 || codes.len() < rows * stride {
+        return Err("repack: q4tp sections shorter than their rows".into());
+    }
+    let mut lad = vec![0f32; rows * 2];
+    for r in 0..rows {
+        let p = &params[r * 4..r * 4 + 4];
+        lad[r * 2] = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+        lad[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+    }
+    let (na, ca) = (Buf::from_slice(&nib[..rows * gpr * 16])?, Buf::from_slice(&codes[..rows * stride])?);
+    let ntile = rows.div_ceil(16);
+    let t = Buf::new(ntile * gpr * 64 * 4)?;
+    let cc = Buf::new(ntile * gpr * 16)?;
+    let (stride_i, pair_i, rows_i, cols_i) = (stride as i32, 0i32, rows as i32, cols as i32);
+    let threads = (ntile * gpr * 32) as u64;
+    unsafe {
+        c.launch(fx.repack, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(na.ptr, ca.ptr, na.ptr, ca.ptr, stride_i, pair_i, t.ptr, cc.ptr, rows_i, cols_i))?;
+    }
+    c.sync()?;
+    Ok((t, cc, Buf::from_slice(&lad)?))
+}
+
 /// Plan-build time spent repacking and uploading weights (ns).
 static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2140,21 +2168,20 @@ pub(super) fn mtp_chain(
             if entry.shape.get(1) != Some(&hidden) || rows > erows || rows % 16 != 0 {
                 return Err(format!("embedding {:?} against a {rows}-row shortlist of width {hidden}", entry.shape));
             }
-            // the first `rows` rows as a payload of their own: nibbles,
-            // ladders, codes, each section's leading rows
+            // the first `rows` rows: each section's leading rows, from the file
             let bytes = model.entry_bytes(entry);
             let (po, co, stride) = q4tp_sections(erows, hidden);
-            let (po2, _, _) = q4tp_sections(rows, hidden);
             if bytes.len() < co + erows * stride {
                 return Err("embedding payload shorter than its planes".into());
             }
-            let mut sub = Vec::with_capacity(po2 + rows * (4 + stride));
-            sub.extend_from_slice(&bytes[..po2]);
-            sub.extend_from_slice(&bytes[po..po + rows * 4]);
-            sub.extend_from_slice(&bytes[co..co + rows * stride]);
             let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
-            let (w, aux0, aux1) = repack_on_card(c, &fx, &[&sub], rows, rows, hidden)?;
-            let emb = DevMat { kind: 6, rows, cols: hidden, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: sub.len() as u64 };
+            let t0 = std::time::Instant::now();
+            let (w, aux0, aux1) = repack_rows_on_card(c, &fx, &bytes[..po], &bytes[po..co], &bytes[co..], stride, rows, hidden)?;
+            if debug() {
+                eprintln!("cuda hybrid draft chain: {rows} embedding rows on the card in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let held = (rows * (hidden / 32) * 16 + rows * (4 + stride)) as u64;
+            let emb = DevMat { kind: 6, rows, cols: hidden, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held };
             c.resident.fetch_add(emb.held, Ordering::Relaxed);
             st.hyb.chain = Some(ChainRes { key, emb, enorm: Buf::from_slice(enorm)?, hnorm: Buf::from_slice(hnorm)? });
         }
