@@ -538,7 +538,7 @@ extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __
     const int rows = m == 2 ? hid : inter, cols = m == 2 ? inter : hid;
     const u32 wi = blockIdx.x * blockDim.x + threadIdx.x;
     const u64 words = (u64)rows * cols / 8;
-    if (wi >= words) return;
+    if (wi >= words || !slots[j]) return;
     // gate and up are 2-bit (q2tp) or 4-bit (q4tp); the down matrix is 4-bit; section offsets of a matrix,
     // and of the three matrices in the slot
     const bool two = gbits == 2 && m < 2;
@@ -1354,6 +1354,128 @@ extern "C" __global__ void q4_units(const int* __restrict__ picks, const unsigne
         for (int j = 0; j < Q4_UR; j++) {
             const int t = g * Q4_UR + j;
             if (t < n) { w[2 + j] = (u32)t; refs[t * K + topk] = (total + g) * Q4_UR + j; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 8-bit tubes
+// A hot expert of a hot file is one q8_2f tube (gate, up, down, int8 body, row scale, column
+// field), resident on the card. A unit names its tube by the address of a descriptor of nine
+// words: for gate, up and down the body, the row scales and the column field.
+
+// Sixteen int8 weights of a 16-byte word as floats.
+__device__ __forceinline__ void dec_i8x16(const uint4 w, float* wf) {
+    wf[0] = (float)((int)(w.x << 24) >> 24);  wf[1] = (float)((int)(w.x << 16) >> 24);
+    wf[2] = (float)((int)(w.x << 8) >> 24);   wf[3] = (float)((int)w.x >> 24);
+    wf[4] = (float)((int)(w.y << 24) >> 24);  wf[5] = (float)((int)(w.y << 16) >> 24);
+    wf[6] = (float)((int)(w.y << 8) >> 24);   wf[7] = (float)((int)w.y >> 24);
+    wf[8] = (float)((int)(w.z << 24) >> 24);  wf[9] = (float)((int)(w.z << 16) >> 24);
+    wf[10] = (float)((int)(w.z << 8) >> 24);  wf[11] = (float)((int)w.z >> 24);
+    wf[12] = (float)((int)(w.w << 24) >> 24); wf[13] = (float)((int)(w.w << 16) >> 24);
+    wf[14] = (float)((int)(w.w << 8) >> 24);  wf[15] = (float)((int)w.w >> 24);
+}
+
+// act [(ub + unit) * Q4_UR + j][inter] = silu(gate x) * (up x) for the rows of the tube units.
+// Grid (ceil(inter / rb), tube units); a warp does a row of both matrices.
+extern "C" __global__ void q4_tube_gu(const u32* __restrict__ units, const float* __restrict__ folded,
+                                      float* __restrict__ act, int inter, int hid, int rb, int ub)
+{
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const u32* un = units + (u64)blockIdx.y * (2 + Q4_UR);
+    const u64* dsc = (const u64*)((u64)un[0] | ((u64)un[1] << 32));
+    if (!dsc) return;
+    int cnt = 0;
+    while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
+    const signed char* gw = (const signed char*)dsc[0];
+    const float* grs = (const float*)dsc[1];
+    const float* gcol = (const float*)dsc[2];
+    const signed char* uw = (const signed char*)dsc[3];
+    const float* urs = (const float*)dsc[4];
+    const float* ucol = (const float*)dsc[5];
+    const int nch = hid >> 4, CP = nch | 1, XS = 16 * CP;
+    float* xg = sh;
+    float* xu = sh + cnt * XS;
+    for (int j = 0; j < cnt; j++) {
+        const float* x = folded + (u64)un[2 + j] * hid;
+        for (int i = tid; i < hid; i += T) {
+            const int idx = (i & 15) * CP + (i >> 4);
+            xg[j * XS + idx] = x[i] * gcol[i];
+            xu[j * XS + idx] = x[i] * ucol[i];
+        }
+    }
+    __syncthreads();
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, inter);
+    for (int r = r0 + warp; r < r1; r += NW) {
+        const uint4* Wg = (const uint4*)(gw + (u64)r * hid);
+        const uint4* Wu = (const uint4*)(uw + (u64)r * hid);
+        float ag[Q4_UR], au[Q4_UR];
+        for (int j = 0; j < Q4_UR; j++) { ag[j] = 0.0f; au[j] = 0.0f; }
+        for (int c = lane; c < nch; c += 32) {
+            float wa[16], wb[16];
+            dec_i8x16(Wg[c], wa);
+            dec_i8x16(Wu[c], wb);
+            for (int j = 0; j < cnt; j++) {
+                const float* pg = xg + j * XS + c;
+                const float* pu = xu + j * XS + c;
+                float sg = 0.0f, su = 0.0f;
+                for (int k = 0; k < 16; k++) { sg += wa[k] * pg[k * CP]; su += wb[k] * pu[k * CP]; }
+                ag[j] += sg;
+                au[j] += su;
+            }
+        }
+        for (int j = 0; j < cnt; j++) {
+            float a = ag[j], b = au[j];
+            for (int o = 16; o > 0; o >>= 1) {
+                a += __shfl_xor_sync(0xffffffffu, a, o);
+                b += __shfl_xor_sync(0xffffffffu, b, o);
+            }
+            if (lane == 0) act[((u64)(ub + blockIdx.y) * Q4_UR + j) * inter + r] = silu_f(a * grs[r]) * (b * urs[r]);
+        }
+    }
+}
+
+// part [(ub + unit) * Q4_UR + j][hid] = down act for the rows of the tube units. Grid (ceil(hid / rb), tube units).
+extern "C" __global__ void q4_tube_d(const u32* __restrict__ units, const float* __restrict__ act,
+                                     float* __restrict__ part, int inter, int hid, int rb, int ub)
+{
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const u32* un = units + (u64)blockIdx.y * (2 + Q4_UR);
+    const u64* dsc = (const u64*)((u64)un[0] | ((u64)un[1] << 32));
+    if (!dsc) return;
+    int cnt = 0;
+    while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
+    const signed char* dw = (const signed char*)dsc[6];
+    const float* drs = (const float*)dsc[7];
+    const float* dcol = (const float*)dsc[8];
+    const int nch = inter >> 4, CP = nch | 1, XS = 16 * CP;
+    for (int j = 0; j < cnt; j++) {
+        const float* a = act + ((u64)(ub + blockIdx.y) * Q4_UR + j) * inter;
+        for (int i = tid; i < inter; i += T) sh[j * XS + (i & 15) * CP + (i >> 4)] = a[i] * dcol[i];
+    }
+    __syncthreads();
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, hid);
+    for (int r = r0 + warp; r < r1; r += NW) {
+        const uint4* W = (const uint4*)(dw + (u64)r * inter);
+        float acc[Q4_UR];
+        for (int j = 0; j < Q4_UR; j++) acc[j] = 0.0f;
+        for (int c = lane; c < nch; c += 32) {
+            float wf[16];
+            dec_i8x16(W[c], wf);
+            for (int j = 0; j < cnt; j++) {
+                const float* p = sh + j * XS + c;
+                float a = 0.0f;
+                for (int k = 0; k < 16; k++) a += wf[k] * p[k * CP];
+                acc[j] += a;
+            }
+        }
+        for (int j = 0; j < cnt; j++) {
+            float a = acc[j];
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (lane == 0) part[((u64)(ub + blockIdx.y) * Q4_UR + j) * hid + r] = a * drs[r];
         }
     }
 }

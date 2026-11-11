@@ -82,6 +82,9 @@ struct QSmall {
     /// The same for q2tp gate/up.
     exp_gu2: cs::CUfunction,
     exp_d: cs::CUfunction,
+    /// The 8-bit tubes of a hot file (gate/up, down).
+    tube_gu: cs::CUfunction,
+    tube_d: cs::CUfunction,
     exp_sum: cs::CUfunction,
     /// Dynamic shared memory a block of the matvec kernels, of the hyper-connection kernels, of the
     /// expert kernels may take (each family has the most its kernels accept).
@@ -101,6 +104,7 @@ impl QSmall {
         };
         let (mvb, hc_di, hc_up) = (set("mvb")?, set("hc_di")?, set("hc_up")?);
         let (exp_gu, exp_gu2, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_gu2")?, func(module, "q4_exp_d")?);
+        let (tube_gu, tube_d) = (func(module, "q4_tube_gu")?, func(module, "q4_tube_d")?);
         // a block stages every row of the round: ask for all a block may have
         let family = |fs: &[cs::CUfunction]| -> usize {
             // the opt-in limit of a block is 227 KB on a datacenter part and 99 KB on a consumer Blackwell
@@ -121,9 +125,9 @@ impl QSmall {
             }
             48 << 10
         };
-        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_gu2, exp_d]));
+        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_gu2, exp_d, tube_gu, tube_d]));
         let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice()].concat());
-        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_gu2, exp_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
+        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_gu2, exp_d, tube_gu, tube_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
     }
 }
 
@@ -444,6 +448,11 @@ struct MoeW {
     topk: usize,
     /// Routed experts of the layer (the MTP head has 512, the backbone's cut layers fewer).
     ne: usize,
+    /// Per routed expert the index of its 8-bit tube, -1 for none; the shared expert's. A hot expert's
+    /// own q2tp triple is zero in the rows the tube holds, so it is not read at all.
+    tubes: Vec<i32>,
+    shared_tube: i32,
+    has_tubes: bool,
 }
 
 struct LayerW {
@@ -1037,7 +1046,7 @@ fn expert_parts<'a>(f: &'a DenseFfn, d: &Dims) -> Res<[&'a [u8]; 3]> {
     if !matches!(f.act, Act::Silu) {
         return Err("qwen4 cuda: an expert without SiLU".into());
     }
-    if !f.segs.is_empty() {
+    if f.segs.len() > 1 {
         return Err("qwen4 cuda: an expert with task tubes".into());
     }
     let part = |t: &'a QTensor, rows: usize, cols: usize, len: usize, bits: usize| -> Res<&'a [u8]> {
@@ -1086,6 +1095,10 @@ struct Build {
     li: usize,
     /// Rows of a window's tape.
     tape: usize,
+    /// The 8-bit tubes of a hot file: nine words each (body, row scale, column field of gate, up, down),
+    /// and the matrices they point into.
+    tube_desc: Vec<u64>,
+    tube_keep: Vec<DevMat>,
 }
 
 impl Build {
@@ -1099,6 +1112,12 @@ impl Build {
     fn zeroed(&mut self, elems: usize) -> Res<Buf> {
         let b = self.buf(elems * 4)?;
         go!(self.c, self.q.zero, (blocks(elems), 1), 256; b.ptr, elems as u64);
+        Ok(b)
+    }
+
+    fn f32buf_u64(&mut self, d: &[u64]) -> Res<Buf> {
+        let b = Buf::from_slice(d)?;
+        self.held += b.bytes as u64;
         Ok(b)
     }
 
@@ -1328,6 +1347,37 @@ impl Build {
         })
     }
 
+    /// The expert's 8-bit tube on the card (`hot-bake`: gate, up and down at eight bits, the expert's own
+    /// rows zero): its index, -1 for an expert without one.
+    fn tube_of(&mut self, f: &DenseFfn, d: &Dims) -> Res<i32> {
+        match f.segs.as_slice() {
+            [] => Ok(-1),
+            [sg] => {
+                if sg.width != d.inter || sg.gate.rows() != d.inter || sg.up.rows() != d.inter || sg.gate.cols() != d.h || sg.up.cols() != d.h
+                    || sg.down.rows() != d.h || sg.down.cols() != d.inter
+                {
+                    return Err("qwen4 cuda: a tube that is not a whole expert".into());
+                }
+                let mut desc = [0u64; 9];
+                for (i, t) in [&sg.gate, &sg.up, &sg.down].into_iter().enumerate() {
+                    if t.mapped_q8_2f().is_none() {
+                        return Err("qwen4 cuda: a tube that is not q8_2f".into());
+                    }
+                    let bytes = t.mapped_bytes().ok_or_else(|| "qwen4 cuda: a tube without file bytes".to_string())?;
+                    let m = dev_mat(7, bytes, t.rows(), t.cols())?;
+                    self.held += m.held;
+                    desc[3 * i] = m.w.ptr;
+                    desc[3 * i + 1] = m.aux0();
+                    desc[3 * i + 2] = m.aux1();
+                    self.tube_keep.push(m);
+                }
+                self.tube_desc.extend(desc);
+                Ok((self.tube_desc.len() / 9 - 1) as i32)
+            }
+            _ => Err("qwen4 cuda: an expert with more than one tube".into()),
+        }
+    }
+
     fn moe(&mut self, m: &MoeFfn, d: &Dims, ne: usize) -> Res<MoeW> {
         if !moe_ok(m) || m.experts.len() != ne || m.router.rows() != ne || m.router.cols() != d.h {
             return Err("qwen4 cuda: a router this path does not reproduce".into());
@@ -1342,6 +1392,15 @@ impl Build {
                 self.wstat(&format!("{name}.down"), &host_rows(&[&f.down_proj]), d.inter);
             }
         }
+        let mut tubes = vec![-1i32; ne];
+        for (e, f) in m.experts.iter().enumerate() {
+            tubes[e] = self.tube_of(f, d)?;
+        }
+        let shared_tube = match &m.shared {
+            Some((f, _)) => self.tube_of(f, d)?,
+            None => -1,
+        };
+        let has_tubes = shared_tube >= 0 || tubes.iter().any(|&t| t >= 0);
         let mut ts = vec![&m.router];
         let (shared, gcol) = match &m.shared {
             Some((ffn, gate)) => {
@@ -1365,7 +1424,7 @@ impl Build {
             None => (None, -1),
         };
         let r = ts.iter().map(|t| t.rows()).sum();
-        Ok(MoeW { router: self.f32buf(&host_rows(&ts))?, shared, gcol, r, topk: m.top_k.min(ne), ne })
+        Ok(MoeW { router: self.f32buf(&host_rows(&ts))?, shared, gcol, r, topk: m.top_k.min(ne), ne, tubes, shared_tube, has_tubes })
     }
 }
 
@@ -1462,6 +1521,9 @@ struct Core {
     ds: usize,
     /// Decode steps and windows of a masked route (and the MTP head) build their expert units on
     /// the card and never wait for the host between the layers (`CMF_QWEN_CUDA_LEAN_ROUTE=0` off).
+    /// Address of the tubes' descriptors (nine words each) on the card, and their copy on the host.
+    tube_desc: u64,
+    tube_host: Vec<u64>,
     /// 0: never, 1: always, 2: every other round (`CMF_QWEN_CUDA_LEAN_ROUTE=alt`: both ways in one process, for A/B timing).
     lean_mode: u8,
     lean_flip: std::sync::atomic::AtomicBool,
@@ -1482,6 +1544,8 @@ pub(crate) struct Dev {
     held: u64,
     /// Keeps the mapped model (the pinned pages) alive until the arena is dropped.
     _keep: Option<Arc<cortiq_core::CmfModel>>,
+    /// The tubes' matrices and descriptors.
+    _tubes: (Vec<DevMat>, Option<Buf>),
     /// Tokens the device state holds.
     pub(crate) pos: usize,
     /// The window (position, rows) a `spec` pass left to settle.
@@ -1576,7 +1640,7 @@ impl Dev {
 
         let range = std::env::var_os("CMF_QWEN_CUDA_RANGE").is_some();
         let tape = tape_rows(n_cap);
-        let mut b = Build { c, q, half, held: 0, wq_elems: 16, range, li: 0, tape };
+        let mut b = Build { c, q, half, held: 0, wq_elems: 16, range, li: 0, tape, tube_desc: Vec::new(), tube_keep: Vec::new() };
         let mut lws = Vec::with_capacity(layers.len());
         let (mut r_max, mut lr_max, mut pin_max, mut hist_max, mut rl_max) = (1usize, 1usize, 16usize, 1usize, 1usize);
         for (li, l) in layers.iter().enumerate() {
@@ -1636,6 +1700,9 @@ impl Dev {
             None => None,
         };
         let topk = topk.max(mtp_w.as_ref().map_or(1, |m| m.lw.moe.topk));
+        // the 8-bit tubes of a hot file: the descriptors the units point at
+        let tube_host = b.tube_desc.clone();
+        let tube_buf = if tube_host.is_empty() { None } else { Some(b.f32buf_u64(&tube_host)?) };
         // the lean path's units: two of four rows for every expert of the widest layer, and the shared expert's
         let head_ne = mtp_w.as_ref().map_or(0, |m| m.lw.moe.ne);
         let lean_units = SMALL_ROWS * (topk + 1) + 2;
@@ -1790,6 +1857,8 @@ impl Dev {
                 range,
                 small: std::env::var("CMF_QWEN_CUDA_SMALL").map(|v| v != "0").unwrap_or(true),
                 tune,
+                tube_desc: tube_buf.as_ref().map_or(0, |t| t.ptr),
+                tube_host,
                 lean_mode: match std::env::var("CMF_QWEN_CUDA_LEAN_ROUTE").ok().as_deref().map(str::trim) {
                     Some("0") => 0,
                     Some("alt") => 2,
@@ -1811,6 +1880,7 @@ impl Dev {
             maskb,
             held: b.held,
             _keep: keep,
+            _tubes: (std::mem::take(&mut b.tube_keep), tube_buf),
             pos: 0,
             pending: None,
             launch_ms: 0.0,
@@ -1920,7 +1990,7 @@ impl Dev {
         for &(l, e) in &ranked {
             match arena.map.get(&(((l as u32) << 16) | e as u32)) {
                 Some(&s) => arena.last[s as usize] = pass,
-                None if swaps < max_swap => {
+                None if swaps < max_swap && layers[l].moe.experts[e].segs.is_empty() => {
                     missing[l].push(e);
                     swaps += 1;
                 }
@@ -2040,7 +2110,7 @@ impl Dev {
         c.current()?;
         let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); layers.len()];
         for &(l, e) in ranked.iter().take(arena.n) {
-            if l < layers.len() && e < d.ne {
+            if l < layers.len() && e < d.ne && layers[l].moe.experts[e].segs.is_empty() {
                 by_layer[l].push(e);
             }
         }
@@ -2079,7 +2149,8 @@ impl Dev {
                     if !sel[li][e] {
                         continue;
                     }
-                    let Ok(parts) = expert_parts(f, d) else {
+                    // a hot expert is read from its tube, not from the file's pages
+                    let Ok(parts) = expert_parts(f, d).and_then(|p| if f.segs.is_empty() { Ok(p) } else { Err(String::new()) }) else {
                         sel[li][e] = false;
                         continue;
                     };
@@ -2638,7 +2709,7 @@ impl Core {
                 let mask_p = if head { 0u64 } else { tbl_p };
                 go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, lw.ne as i32, lw.r as i32, topk as i32, self.tail, mask_p);
                 let mut lean_saved: Option<Vec<f32>> = None;
-                if small && self.lean_on() && tbl_p != 0 && ur == UNIT_ROWS && lw.ne <= arena.tbl_stride {
+                if small && self.lean_on() && !lw.has_tubes && tbl_p != 0 && ur == UNIT_ROWS && lw.ne <= arena.tbl_stride {
                     // every pick is in the arena: the units are built on the card and nothing waits for the host
                     let nsh = if lw.shared.is_some() { n.div_ceil(UNIT_ROWS) } else { 0 };
                     // at most one unit a pick, and the shared expert's
@@ -2702,7 +2773,9 @@ impl Core {
                     }
                 }
                 let mut slot_of = vec![0u64; lw.ne];
-                arena.admit_layer(li, &order, &layer.moe.experts, d, c, &mut slot_of)?;
+                // a hot expert is an 8-bit tube on the card: its own q2tp triple is not read
+                let (hot, cold): (Vec<usize>, Vec<usize>) = order.iter().copied().partition(|&e| lw.tubes[e] >= 0);
+                arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
                 self.lap(6)?;
                 // the units, then for each (token, place) the row of the
                 // partial outputs it takes
@@ -2726,12 +2799,22 @@ impl Core {
                         pairs += group.len();
                     }
                 };
-                for &e in &order {
+                let mut nu_q = 0usize;
+                for &e in &cold {
                     add(slot_of[e], &by_expert[e]);
+                    nu_q += by_expert[e].len().div_ceil(ur);
                 }
-                if let Some(sh) = &lw.shared {
-                    let places: Vec<usize> = (0..n).map(|t| t * kk + topk).collect();
-                    add(sh.ptr, &places);
+                let shared_places: Vec<usize> = (0..n).map(|t| t * kk + topk).collect();
+                if let (Some(sh), true) = (&lw.shared, lw.shared_tube < 0) {
+                    add(sh.ptr, &shared_places);
+                    nu_q += n.div_ceil(ur);
+                }
+                // the tubes' units follow the q-units' (the tube kernels start at unit `nu_q`)
+                for &e in &hot {
+                    add(self.tube_desc + lw.tubes[e] as u64 * 72, &by_expert[e]);
+                }
+                if lw.shared_tube >= 0 {
+                    add(self.tube_desc + lw.shared_tube as u64 * 72, &shared_places);
                 }
                 let nu = units.len() / UNIT_WORDS;
                 if nu == 0 {
@@ -2745,24 +2828,50 @@ impl Core {
                 self.put(s.slots.ptr, &units)?;
                 let gsh = (cmax * (32 * (gg | 1) + gg) + 2 * t.g_rb * 32) * 4;
                 let dsh = (cmax * (32 * (gd | 1) + gd) + t.d_rb * 32) * 4;
-                unsafe {
-                    c.launch(
-                        if d.gbits == 2 { sm.exp_gu2 } else { sm.exp_gu },
-                        (d.inter.div_ceil(t.g_rb) as u32, nu as u32),
-                        t.g_t as u32,
-                        gsh,
-                        kargs!(s.slots.ptr, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, t.g_rb as i32),
-                    )
-                }?;
-                unsafe {
-                    c.launch(
-                        sm.exp_d,
-                        (d.h.div_ceil(t.d_rb) as u32, nu as u32),
-                        t.d_t as u32,
-                        dsh,
-                        kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
-                    )
-                }?;
+                if nu_q > 0 {
+                    unsafe {
+                        c.launch(
+                            if d.gbits == 2 { sm.exp_gu2 } else { sm.exp_gu },
+                            (d.inter.div_ceil(t.g_rb) as u32, nu_q as u32),
+                            t.g_t as u32,
+                            gsh,
+                            kargs!(s.slots.ptr, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, t.g_rb as i32),
+                        )
+                    }?;
+                    unsafe {
+                        c.launch(
+                            sm.exp_d,
+                            (d.h.div_ceil(t.d_rb) as u32, nu_q as u32),
+                            t.d_t as u32,
+                            dsh,
+                            kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
+                        )
+                    }?;
+                }
+                if nu > nu_q {
+                    // the tubes: 16 rows a block, both matrices staged for every row of a unit
+                    let (rb, tu) = (16usize, s.slots.ptr + (nu_q * UNIT_WORDS * 4) as u64);
+                    let tsh_gu = 2 * UNIT_ROWS * 16 * ((d.h / 16) | 1) * 4;
+                    let tsh_d = UNIT_ROWS * 16 * ((d.inter / 16) | 1) * 4;
+                    unsafe {
+                        c.launch(
+                            sm.tube_gu,
+                            (d.inter.div_ceil(rb) as u32, (nu - nu_q) as u32),
+                            256,
+                            tsh_gu,
+                            kargs!(tu, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, rb as i32, nu_q as i32),
+                        )
+                    }?;
+                    unsafe {
+                        c.launch(
+                            sm.tube_d,
+                            (d.h.div_ceil(rb) as u32, (nu - nu_q) as u32),
+                            256,
+                            tsh_d,
+                            kargs!(tu, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, rb as i32, nu_q as i32),
+                        )
+                    }?;
+                }
                 go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
                     refs_at, s.d.ptr, s.wts.ptr, s.logits.ptr, s.blk.ptr,
                     n as i32, kk as i32, topk as i32, d.h as i32, lw.r as i32, lw.gcol);
@@ -2805,7 +2914,9 @@ impl Core {
         let mut order: Vec<usize> = (0..lw.ne).filter(|&e| !lists[e].is_empty()).collect();
         order.sort_by(|&x, &y| lists[y].len().cmp(&lists[x].len()).then(x.cmp(&y)));
         let mut slot_of = vec![0u64; lw.ne];
-        arena.admit_layer(li, &order, &layer.moe.experts, d, c, &mut slot_of)?;
+        // a hot expert's weights are its tube: no slot (the expansion skips slot 0), the tube is expanded instead
+        let cold: Vec<usize> = order.iter().copied().filter(|&e| lw.tubes[e] < 0).collect();
+        arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
         self.lap(6)?;
         let (mut i, mut first) = (0usize, true);
         while i < order.len() {
@@ -2837,6 +2948,12 @@ impl Core {
             self.put(s.tokrow.ptr, &tokrow)?;
             go!(c, q.expand_exp, (blocks(d.inter * d.h / 8), (3 * b) as u32), 256;
                 s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi, d.gbits as i32);
+            for j in 0..b {
+                let t = lw.tubes[order[i + j]];
+                if t >= 0 {
+                    self.expand_tube(t as usize, j)?;
+                }
+            }
             go!(c, q.gather, (blocks(rows * d.h), 1), 256; s.folded_h.ptr, s.rowtok.ptr, s.xg.ptr, rows as i32, d.h as i32, self.hi);
             let (gs, xs, as_, ds) = (d.inter * d.h, ne_max * d.h, ne_max * d.inter, ne_max * d.h);
             unsafe {
@@ -2875,9 +2992,13 @@ impl Core {
         }
         self.lap(7)?;
         if let Some(sh) = &lw.shared {
-            self.put(s.slots.ptr, &[sh.ptr])?;
-            go!(c, q.expand_exp, (blocks(d.inter * d.h / 8), 3), 256;
-                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi, d.gbits as i32);
+            if lw.shared_tube >= 0 {
+                self.expand_tube(lw.shared_tube as usize, 0)?;
+            } else {
+                self.put(s.slots.ptr, &[sh.ptr])?;
+                go!(c, q.expand_exp, (blocks(d.inter * d.h / 8), 3), 256;
+                    s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi, d.gbits as i32);
+            }
             // one GEMM per projection over all tokens, f32 results
             self.gemm_w(s.wg.ptr, d.inter, d.h, s.folded_h.ptr, n, s.g.ptr, self.gw)?;
             self.gemm_w(s.wu.ptr, d.inter, d.h, s.folded_h.ptr, n, s.u.ptr, self.gw)?;
@@ -2885,6 +3006,19 @@ impl Core {
             unsafe { c.gemm(true, false, d.h, n, d.inter, alpha, s.wd.ptr, d.inter, s.ah.ptr, d.inter, 0.0, s.d.ptr, d.h, self.gw) }?;
             go!(c, q.shared_add, (blocks(n * d.h), 1), 256; s.blk.ptr, s.d.ptr, s.logits.ptr, n as i32, d.h as i32, lw.r as i32, lw.gcol);
             self.lap(8)?;
+        }
+        Ok(())
+    }
+
+    /// Tube `t` (a hot expert's gate, up and down at eight bits) as dense planes in the batched path's
+    /// expert scratch, at the place of expert `j` of the sub-batch.
+    fn expand_tube(&self, t: usize, j: usize) -> Res<()> {
+        let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
+        let w = &self.tube_host[t * 9..t * 9 + 9];
+        let plane = (j * d.inter * d.h * self.es) as u64;
+        for (m, dst) in [s.wg.ptr, s.wu.ptr, s.wd.ptr].into_iter().enumerate() {
+            let (rows, cols) = if m == 2 { (d.h, d.inter) } else { (d.inter, d.h) };
+            go!(c, q.expand_q8, (blocks(rows * cols / 4), 1), 256; w[3 * m], w[3 * m + 1], w[3 * m + 2], dst + plane, rows as i32, cols as i32, self.hi);
         }
         Ok(())
     }
