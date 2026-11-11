@@ -10634,7 +10634,19 @@ impl Pipeline {
             && std::env::var_os("CMF_METAL_VERIFY_CHECK").is_none()
             && std::env::var_os("CMF_LOGIT_DUMP").is_none()
             && std::env::var("CMF_METAL_DEV_ARGMAX").as_deref() != Ok("0");
-        #[cfg(not(target_os = "macos"))]
+        // The CUDA hybrid arm the same way: each verify row's argmax on the
+        // card (the host's tie rule), 5 MB of logits not read back.
+        // `CMF_CUDA_DEV_ARGMAX=0` keeps the host path.
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        let greedy_dev = crate::gpu::cuda_active()
+            && !sampling
+            && !greedy_pen
+            && !self.confidence_on
+            && self.final_softcap.is_none()
+            && self.vocab_size == lm_rows
+            && std::env::var_os("CMF_LOGIT_DUMP").is_none()
+            && std::env::var("CMF_CUDA_DEV_ARGMAX").as_deref() != Ok("0");
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         let greedy_dev = false;
         let mut dev_ids: Vec<u32> = Vec::new();
         #[cfg(target_os = "macos")]
@@ -10666,6 +10678,8 @@ impl Pipeline {
                 }),
             )
         };
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        crate::gpu_cuda::verify_argmax_arm(greedy_dev);
         #[cfg(not(target_os = "macos"))]
         let verify_outcome = self.try_batch_graph_wgpu(
             &mut hiddens,
@@ -10679,6 +10693,12 @@ impl Pipeline {
                 pick: None,
             }),
         );
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        if greedy_dev {
+            if let Some(ids) = crate::gpu_cuda::verify_argmax_take() {
+                dev_ids = ids;
+            }
+        }
         match verify_outcome {
             crate::gpu::BatchGraphOutcome::Completed => {}
             crate::gpu::BatchGraphOutcome::Declined => {

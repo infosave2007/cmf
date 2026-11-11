@@ -2552,6 +2552,31 @@ pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize,
     }
 }
 
+thread_local! {
+    /// A greedy verify's row ids from the card (`verify_argmax_arm`):
+    /// None unarmed, Some(empty) armed, Some(ids) after the verify.
+    static VERIFY_IDS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Arm (or disarm) the next verify window of this thread to pick each row's
+/// argmax on the card and hand back the ids instead of the logits.
+pub fn verify_argmax_arm(on: bool) {
+    VERIFY_IDS.with(|v| *v.borrow_mut() = if on { Some(Vec::new()) } else { None });
+}
+
+fn verify_argmax_armed() -> bool {
+    VERIFY_IDS.with(|v| v.borrow().is_some())
+}
+
+fn verify_argmax_put(ids: Vec<u32>) {
+    VERIFY_IDS.with(|v| *v.borrow_mut() = Some(ids));
+}
+
+/// The ids the armed verify picked (None when it picked none); disarms.
+pub fn verify_argmax_take() -> Option<Vec<u32>> {
+    VERIFY_IDS.with(|v| v.borrow_mut().take()).filter(|ids| !ids.is_empty())
+}
+
 /// The hybrid arm's MTP draft chain: `k` greedy drafts in one graph
 /// (`hyb::mtp_chain`). Err(false) declined, Err(true) failed after admission.
 #[allow(clippy::too_many_arguments)]

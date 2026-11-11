@@ -1079,18 +1079,21 @@ extern "C" __global__ void hy_embed_gather(const uint2* __restrict__ T, const u8
     e[c] = __fmul_rn((float)(nib - 8), exp2f(fmaf((float)Cc[tg * 16 + rr], p.y, p.x)));
 }
 
-// The first of the largest of x[0..n) into out[j] (NaN never wins); one
-// block.
-extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int* __restrict__ out, int j)
+// The argmax of row blockIdx.x of x [rows][stride], its first n values, into
+// out[j + row], a block a row: the LAST of equal maxima, as the host's
+// `sampler::argmax` picks it (NaN never wins), so a verify on the card makes
+// the plain decode's choice.
+extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int stride, int* __restrict__ out, int j)
 {
     __shared__ float sv[32];
     __shared__ int si[32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const float* xr = x + (size_t)blockIdx.x * stride;
     float bv = -INF;
-    int bi = 0x7fffffff;
+    int bi = -1;
     for (int i = tid; i < n; i += blockDim.x) {
-        const float v = x[i];
-        if (v > bv) {
+        const float v = xr[i];
+        if (v >= bv) {
             bv = v;
             bi = i;
         }
@@ -1098,7 +1101,7 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int* __
     for (int o = 16; o > 0; o >>= 1) {
         const float ov = __shfl_xor_sync(FULL, bv, o);
         const int oi = __shfl_xor_sync(FULL, bi, o);
-        if (ov > bv || (ov == bv && oi < bi)) {
+        if (ov > bv || (ov == bv && oi > bi)) {
             bv = ov;
             bi = oi;
         }
@@ -1110,11 +1113,11 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int* __
     __syncthreads();
     if (tid == 0) {
         for (int w = 1; w < NW; w++)
-            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) {
+            if (sv[w] > bv || (sv[w] == bv && si[w] > bi)) {
                 bv = sv[w];
                 bi = si[w];
             }
-        out[j] = bi == 0x7fffffff ? 0 : bi;
+        out[j + blockIdx.x] = bi < 0 ? 0 : bi;
     }
 }
 

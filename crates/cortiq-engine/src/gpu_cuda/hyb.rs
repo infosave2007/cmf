@@ -218,6 +218,12 @@ struct MmaSet {
     ks16: bool,
     /// One tile a block when the launch's matrices are short (K/V).
     tb1: bool,
+    /// One tile a block for a one-row call over 12 288 rows or more: the
+    /// tail of a launch costs less than half the tiles' parallelism there
+    /// (3090: gate/up 801 against 745 GB/s, GDN input 746 / 679, head
+    /// 863 / 839; 5120-row matrices keep two). The arithmetic does not
+    /// depend on it.
+    tb1_n1: bool,
 }
 
 fn mmaset(list: &[JobSpec]) -> Res<MmaSet> {
@@ -269,7 +275,8 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     // measured on a 3090 (q4tp, 1/8/16 rows): KS 8 wins from ~16k rows
     // (gate/up 67.5/71.6/124 us against 69.4/76.3/146), KS 16 below it
     // (down 5120 x 17408: 61.1/66.8/113 against 76.3/79.3/117)
-    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 16384, tb1: max_rows <= 2048 })
+    let total_rows: usize = list.iter().map(|&(_, _, _, _, r)| r).sum();
+    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 16384, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288 })
 }
 
 /// The row planes a tensor-core launch reads: two bf16 parts of each f32
@@ -286,7 +293,7 @@ impl MmaSet {
     /// The window's rows of x (as split planes) through every matrix.
     unsafe fn run(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
         let nt = if n <= 8 { 1 } else { 2 };
-        let tb = if self.tb1 { 1 } else { 2 };
+        let tb = if self.tb1 || (n == 1 && self.tb1_n1) { 1 } else { 2 };
         let ks = if self.ks16 { 16 } else { 8 };
         let f = fx.mmp[nt - 1][tb - 1][self.ks16 as usize];
         let (nj, xs_i, n_i, cols_i) = (self.n, p.stride as i32, n as i32, cols as i32);
@@ -2218,7 +2225,7 @@ pub(super) fn mtp_chain(
                     ms.run(c, fx, &planes, 2 * hidden, 1)?;
                     launch(c, &plan, bk, 1, false, ci_b + (j * cilen * 4) as u64, tab_b + (j * tabrow * 4) as u64)?;
                     head_launch(c, &plan, 1)?;
-                    c.launch(fx.argmax, (1, 1), 1024, 0, kargs!(plan.logits.ptr, rows_i, tok_b, j1_i))?;
+                    c.launch(fx.argmax, (1, 1), 1024, 0, kargs!(plan.logits.ptr, rows_i, rows_i, tok_b, j1_i))?;
                 }
             }
             Ok(())
@@ -2328,7 +2335,18 @@ pub(super) fn batch(
                     cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                 }
                 let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &[])?;
-                if let Some(sp) = spec.as_mut() {
+                // a greedy verify the pipeline armed: each row's argmax on
+                // the card, the ids back instead of the logits
+                let pick = spec.is_some() && super::verify_argmax_armed();
+                if pick {
+                    let ids_b = st.scr(c, "hy_vids", NMAX * 4)?;
+                    let (rows_i, zero_i) = (rows as i32, 0i32);
+                    c.launch(plan.fx.argmax, (b as u32, 1), 1024, 0, kargs!(plan.logits.ptr, rows_i, rows_i, ids_b, zero_i))?;
+                    let mut ids = vec![0i32; b];
+                    cu::memcpy_dtoh_async(ids.as_mut_slice(), ids_b, c.stream).map_err(derr)?;
+                    c.sync()?;
+                    super::verify_argmax_put(ids.iter().map(|&t| t as u32).collect());
+                } else if let Some(sp) = spec.as_mut() {
                     sp.logits_out.resize(b * rows, 0.0);
                     cu::memcpy_dtoh_async(sp.logits_out.as_mut_slice(), plan.logits.ptr, c.stream).map_err(derr)?;
                 }
