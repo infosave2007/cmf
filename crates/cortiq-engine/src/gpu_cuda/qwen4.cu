@@ -1967,6 +1967,66 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
 }
 
 
+// The down projection of the int8 path with four lanes a row: lane (rr, sub) takes groups sub * GPL .. of row
+// rr of its warp's eight, so all 32 lanes work (one group a lane left 12 of 32 idle with 640-wide rows) and a lane
+// has GPL words in flight. `rb` rows a block (a multiple of 8 * warps for full use).
+extern "C" __global__ void q4_exp_d4(const u32* __restrict__ units, const float* __restrict__ act,
+                                     float* __restrict__ part, int inter, int hid, int rb, unsigned long long sgu)
+{ PDL_PRO();
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const u32* un = units + (u64)blockIdx.y * (2 + Q4_UR);
+    const u64 slot = (u64)un[0] | ((u64)un[1] << 32);
+    if (!slot) return;
+    int cnt = 0;
+    while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
+    const int gpr = inter >> 5, stride = (gpr * 5 + 7) / 8;
+    const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
+    const u8* mat = (const u8*)(slot + 2 * sgu);
+    int* xq = (int*)sh;                                  // [cnt][gpr][XQ_G]
+    float* lad = sh + Q4_UR * gpr * XQ_G;                // [rb][32]
+    const int r0 = blockIdx.x * rb;
+    stage_q8(xq, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, tid, T);
+    for (int i = tid; i < rb; i += T)
+        if (r0 + i < hid) q4_ladder((const u16*)(mat + params_off + (u64)(r0 + i) * 4), lad + i * 32);
+    __syncthreads();
+    const int rr = lane >> 2, sub = lane & 3, GPL = (gpr + 3) >> 2;
+    for (int base = warp * 8; base < rb; base += NW * 8) {
+        const int i = base + rr, r = r0 + i;
+        const bool ok = i < rb && r < hid;
+        uint4 w[8];
+        float lc[8];
+        if (ok) {
+            const u8* codes = mat + codes_off + (u64)r * stride;
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int g = sub * GPL + q;
+                if (q < GPL && g < gpr) {
+                    w[q] = ((const uint4*)(mat + (u64)r * gpr * 16))[g];
+                    lc[q] = lad[i * 32 + q4_code(codes, g, stride)];
+                }
+            }
+        }
+        float acc[Q4_UR];
+        for (int j = 0; j < Q4_UR; j++) acc[j] = 0.0f;
+        if (ok) {
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int g = sub * GPL + q;
+                if (q < GPL && g < gpr)
+                    for (int j = 0; j < cnt; j++) acc[j] += q4_group_q8(w[q], lc[q], xq + ((u64)j * gpr + g) * XQ_G);
+            }
+        }
+        for (int j = 0; j < cnt; j++) {
+            float a = acc[j];
+            a += __shfl_xor_sync(0xffffffffu, a, 1);
+            a += __shfl_xor_sync(0xffffffffu, a, 2);
+            if (ok && sub == 0) part[((u64)blockIdx.y * Q4_UR + j) * hid + r] = a;
+        }
+    }
+}
+
 // The weighted sum of a token's picks: blk [n][hid] = sum over its K places
 // of w_k * part[ref[t][k]] (ref < 0: no pick), with w_k = wts[t][k] for a
 // routed pick and, for place `topk` (the shared expert),

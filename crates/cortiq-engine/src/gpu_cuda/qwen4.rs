@@ -88,6 +88,9 @@ struct QSmall {
     mvb: [cs::CUfunction; SMALL_ROWS],
     /// The same matvecs with int8-quantized inputs (`__dp4a`), the fast precision.
     mvq: [cs::CUfunction; SMALL_ROWS],
+    /// Whether the matvec of b + 1 rows (f32 / int8) can run 512 threads (its registers allow it).
+    mv512: [bool; SMALL_ROWS],
+    mvq512: [bool; SMALL_ROWS],
     hc_di: [cs::CUfunction; SMALL_ROWS],
     hc_up: [cs::CUfunction; SMALL_ROWS],
     /// The fold with four streams at once (`hc == 4`, rows of at most 48 words).
@@ -96,6 +99,8 @@ struct QSmall {
     /// The same for q2tp gate/up.
     exp_gu2: cs::CUfunction,
     exp_d: cs::CUfunction,
+    /// The down projection of the int8 path, four lanes a row.
+    exp_d4: cs::CUfunction,
     /// The 8-bit tubes of a hot file (gate/up, down).
     tube_gu: cs::CUfunction,
     tube_d: cs::CUfunction,
@@ -117,7 +122,17 @@ impl QSmall {
             Ok(v)
         };
         let (mvb, mvq, hc_di, hc_up, hc_up4) = (set("mvb")?, set("mvq")?, set("hc_di")?, set("hc_up")?, set("hc_up4_")?);
+        let fits512 = |fs: &[cs::CUfunction; SMALL_ROWS]| -> [bool; SMALL_ROWS] {
+            let mut v = [false; SMALL_ROWS];
+            for (b, &f) in v.iter_mut().zip(fs) {
+                *b = unsafe { cu::function::get_function_attribute(f, cs::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK) }
+                    .is_ok_and(|t| t >= 512);
+            }
+            v
+        };
+        let (mv512, mvq512) = (fits512(&mvb), fits512(&mvq));
         let (exp_gu, exp_gu2, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_gu2")?, func(module, "q4_exp_d")?);
+        let exp_d4 = func(module, "q4_exp_d4")?;
         let (tube_gu, tube_d) = (func(module, "q4_tube_gu")?, func(module, "q4_tube_d")?);
         // a block stages every row of the round: ask for all a block may have
         let family = |fs: &[cs::CUfunction]| -> usize {
@@ -139,9 +154,9 @@ impl QSmall {
             }
             48 << 10
         };
-        let (mvb_max, ex_max) = (family(&[mvb.as_slice(), mvq.as_slice()].concat()), family(&[exp_gu, exp_gu2, exp_d, tube_gu, tube_d]));
+        let (mvb_max, ex_max) = (family(&[mvb.as_slice(), mvq.as_slice()].concat()), family(&[exp_gu, exp_gu2, exp_d, exp_d4, tube_gu, tube_d]));
         let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice(), hc_up4.as_slice()].concat());
-        Ok(Self { mvb, mvq, hc_di, hc_up, hc_up4, exp_gu, exp_gu2, exp_d, tube_gu, tube_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
+        Ok(Self { mvb, mvq, mv512, mvq512, hc_di, hc_up, hc_up4, exp_gu, exp_gu2, exp_d, exp_d4, tube_gu, tube_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
     }
 }
 
@@ -245,6 +260,17 @@ fn mv_int8() -> bool {
 fn grms4() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !std::env::var("CMF_QWEN_GRMS4").is_ok_and(|v| v.trim() == "0"))
+}
+
+fn exp_d4_on() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| prec().0 == Gemm::Half && !std::env::var("CMF_QWEN_EXP_D4").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// `CMF_QWEN_MV_WIDE=0`: every small-path matvec on 256 threads.
+fn mv_wide() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("CMF_QWEN_MV_WIDE").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// Shared memory a q4_mvb* block takes per input row: the side-by-side layout (MV_CONTIG, columns up to MV_CMAX)
@@ -2399,19 +2425,26 @@ impl Core {
     /// `mvb`; with `exact` (the vocabulary head) the f32 dot even in the fast precision.
     fn mvb_x(&self, ops: &[SOp], x: u64, xstride: usize, cols: usize, n: usize, exact: bool) -> Res<()> {
         let sm = &self.q.sm;
-        let fam = if !exact && mv_int8() { &sm.mvq } else { &sm.mvb };
+        let (fam, fam512) = if !exact && mv_int8() { (&sm.mvq, &sm.mvq512) } else { (&sm.mvb, &sm.mv512) };
         let per = mv_row_bytes(cols);
         let cap = (sm.mvb_max / per).min(SMALL_ROWS);
         if cap == 0 || ops.is_empty() || ops.len() > 5 {
             return Err(format!("qwen4 cuda: a small matvec of {} jobs over {cols} columns", ops.len()));
         }
         let mut jobs = [MvJob { w: 0, aux0: 0, aux1: 0, y: 0, res: 0, rows: 0, kind: 0, blk0: 0, rpb: 1 }; 5];
+        // a launch with a big matrix runs 512 threads and about rows / 128 rows a block (up to 80): the inputs are
+        // staged once for twice the rows (microbenchmark on the 5090: 10240 x 2560 23.7 -> 20.4 us, the vocabulary
+        // head 429 -> 392 us); small matrices keep 256 threads
+        let big = mv_wide() && ops.iter().any(|o| o.rows >= 4096);
         let mut t0 = 0;
         while t0 < n {
             let nb = (n - t0).min(cap);
+            // the kernels of many rows hold too many registers for 512 threads
+            let wide = big && fam512[nb - 1];
+            let threads = if wide { 512u32 } else { 256 };
             let mut blk = 0u32;
             for (j, o) in jobs.iter_mut().zip(ops) {
-                let rpb = rows_per_block(o.rows);
+                let rpb = if wide { (o.rows / 128).next_multiple_of(16).clamp(16, 80) } else { rows_per_block(o.rows) };
                 *j = MvJob {
                     w: o.w,
                     aux0: o.aux0,
@@ -2431,7 +2464,7 @@ impl Core {
                 self.c.launch(
                     fam[nb - 1],
                     (blk, 1),
-                    256,
+                    threads,
                     nb * per,
                     kargs!(j0, j1, j2, j3, j4, ops.len() as i32, xp, xstride as i32, cols as i32),
                 )
@@ -2544,6 +2577,37 @@ impl Core {
         go!(self.c, self.q.hc_fold, (blocks(n * d.h), 1), 256;
             s.mix.ptr, s.normed.ptr, s.folded.ptr, s.folded_h.ptr, n as i32, d.h as i32, d.hc as i32, self.hi);
         Ok(())
+    }
+
+    /// The down projections of `nu` units (`s.g` -> `s.d`): in the fast precision the int8 kernel with four lanes
+    /// a row (`q4_exp_d4`, rows of up to 32 groups; `CMF_QWEN_EXP_D4=0` keeps `q4_exp_d`).
+    fn exp_down(&self, nu: usize, dsh: usize) -> Res<()> {
+        let (d, s, c, sm, t) = (&self.d, &self.s, self.c, &self.q.sm, &self.tune);
+        let gd = d.inter / 32;
+        if exp_d4_on() && d.inter.is_multiple_of(32) && gd.div_ceil(4) <= 8 {
+            let rb = 64usize;
+            let sh4 = (UNIT_ROWS * gd * 12 + rb * 32) * 4;
+            if sh4 <= sm.ex_max {
+                return unsafe {
+                    c.launch(
+                        sm.exp_d4,
+                        (d.h.div_ceil(rb) as u32, nu as u32),
+                        256,
+                        sh4,
+                        kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, rb as i32, d.sgu as u64),
+                    )
+                };
+            }
+        }
+        unsafe {
+            c.launch(
+                sm.exp_d,
+                (d.h.div_ceil(t.d_rb) as u32, nu as u32),
+                t.d_t as u32,
+                dsh,
+                kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
+            )
+        }
     }
 
     fn inject(&self, n: usize) -> Res<()> {
@@ -2859,15 +2923,7 @@ impl Core {
                                 kargs!(s.slots.ptr, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, t.g_rb as i32),
                             )
                         }?;
-                        unsafe {
-                            c.launch(
-                                sm.exp_d,
-                                (d.h.div_ceil(t.d_rb) as u32, nu as u32),
-                                t.d_t as u32,
-                                dsh,
-                                kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
-                            )
-                        }?;
+                        self.exp_down(nu, dsh)?;
                         go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
                             refs_at, s.d.ptr, s.wts.ptr, s.logits.ptr, s.blk.ptr,
                             n as i32, kk as i32, topk as i32, d.h as i32, lw.r as i32, lw.gcol);
@@ -2964,15 +3020,7 @@ impl Core {
                             kargs!(s.slots.ptr, s.folded.ptr, s.g.ptr, d.inter as i32, d.h as i32, t.g_rb as i32),
                         )
                     }?;
-                    unsafe {
-                        c.launch(
-                            sm.exp_d,
-                            (d.h.div_ceil(t.d_rb) as u32, nu_q as u32),
-                            t.d_t as u32,
-                            dsh,
-                            kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
-                        )
-                    }?;
+                    self.exp_down(nu_q, dsh)?;
                 }
                 if nu > nu_q {
                     // the tubes: 16 rows a block, both matrices staged for every row of a unit
