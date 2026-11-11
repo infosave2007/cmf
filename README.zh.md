@@ -112,6 +112,20 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## CUDA 上的 Dory 和 Qwen3.8-27B Turbo(0.8.70)
+
+CUDA 后端可以运行循环的 nGPT [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf)，
+包括它的 turbo 文件：在 RTX 3090 上 turbo 文件以 201 tok/s 回答（同一块显卡走 Vulkan 为 121），读 64 000 个词元
+只需 33 秒（Vulkan 163 秒）。[Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) 现在在
+CUDA 上封口之后也用草稿：概括 100 000 个字符时以 80 tok/s 解码（之前 42），文本相同。
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --no-think
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+
 ## CUDA 上的 Qwen3.8-27B：RTX 3090 上聊天 120–128 tok/s(0.8.69)
 
 CUDA 后端在显卡上运行 Qwen3.5 系列混合模型（GDN 混合层加门控注意力），草稿及其验证也在显卡上完成。在 RTX 3090

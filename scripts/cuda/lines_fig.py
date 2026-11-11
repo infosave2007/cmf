@@ -71,6 +71,7 @@ def fig(spec, lang):
         for i, lb in enumerate(labels):
             s.text(X(i), y0 + 32, lb, 19, INK2, "400", "middle")
         s.text((x0 + x1) / 2, y0 + 66, t["ctx"], 19, INK2, "400", "middle")
+        placed = []
         for se in series:
             c = COLORS[se["color"]]
             pts = [(X(i), Y(v)) for i, v in enumerate(se[key]) if v is not None]
@@ -80,7 +81,12 @@ def fig(spec, lang):
                 s.dot(p[0], p[1], 7, c)
             last = [(i, v) for i, v in enumerate(se[key]) if v is not None][-1]
             d = 1 if key == "mem" or (key == "first" and last[1] < 100) else 0
-            s.text(X(last[0]) + 8, Y(last[1]) - 12, num(lang, last[1], d), 19, c, "700", "start")
+            ly = Y(last[1]) - 12
+            # labels that would touch one already placed move apart
+            while any(abs(ly - p) < 21 for p in placed):
+                ly += 22 if ly >= Y(last[1]) - 12 else -22
+            placed.append(ly)
+            s.text(X(last[0]) + 10, ly, num(lang, last[1], d), 19, c, "700", "start")
     s.text(50, 716, t["res"], 23, INK, "600")
     s.done(f"{spec['name']}_{lang}")
 

@@ -123,6 +123,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Dory and Qwen3.8-27B Turbo on CUDA (0.8.70)
+
+The CUDA backend runs [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf), the
+looped nGPT, its turbo file included: on an RTX 3090 the turbo file answers at 201 tok/s against 121 over Vulkan
+on the same card, and reads 64 000 tokens in 33 s against 163. [Qwen3.8-27B
+Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) now drafts past its seal on CUDA: a summary of
+100 000 characters decodes at 80 tok/s against 42, the same text.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list." --no-think
+```
+
+See [docs/CUDA.md](docs/CUDA.md#dory-the-looped-ngpt).
+
 ## Qwen3.8-27B on CUDA: chat at 120–128 tok/s on an RTX 3090 (0.8.69)
 
 The CUDA backend runs Qwen3.5-family hybrids (GDN mixers plus gated attention) with drafts and their verify on

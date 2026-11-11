@@ -15,6 +15,13 @@ hf download infosave/Nemotron-Labs-Dory1.0-4B-cmf dory-turbo.cmf --local-dir .
 cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list." --no-think
 ```
 
+On an NVIDIA card, the CUDA backend ([docs/CUDA.md](CUDA.md#dory-the-looped-ngpt)):
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list." --no-think
+```
+
 | file | weights | size | wikitext-2 ppl | use |
 |---|---|---:|---:|---|
 | `dory-turbo.cmf` | 4-bit GPTQ | 2.09 GB | 14.22 | the same weights as `q4tp-v2` with a router and a far field; **default** |
@@ -104,6 +111,14 @@ the others `cortiq bench --core` after a prompt of that length.
 | context 64 000 | prompt not read in 25 min | **53.0** |
 | first token at 16 000 / 32 000 / 64 000 | 78 s / 360 s / over 25 min | **53 s / 112 s / 228 s** |
 | device KV memory at 4 000 / 32 000 | 1.0 GB / 4.3 GB | **0.64 GB / 0.50 GB** |
+| **CUDA, NVIDIA RTX 3090 (24 GB)** | | |
+| real prompts | 159.6 | **201.4** |
+| context 1 000 | 156.9 | **231.9** |
+| context 4 000 | 146.0 | **215.2** |
+| context 16 000 | 127.9 | **212.7** |
+| context 32 000 | 111.3 | **216.0** |
+| context 64 000 | — | **214.1** |
+| first token at 16 000 / 32 000 / 64 000 | 5.4 s / 12.8 s / — | **6.1 s / 13.6 s / 33.0 s** |
 | **Metal, MacBook Air M4 (24 GB)** | | |
 | real prompts | 25.7 | **32.9** |
 | context 1 000 | 22.1 | **34.6** |

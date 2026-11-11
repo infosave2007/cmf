@@ -17,6 +17,7 @@ tags:
   - looped-transformer
   - vulkan
   - metal
+  - cuda
 language:
   - en
   - ru
@@ -29,8 +30,9 @@ language:
 looped transformer: a recurrent block of 40 sub-layers runs several times over the same weights,
 so one checkpoint serves 1, 2 or 4 loops. It reasons in `<think>` and calls tools. Here it comes as
 single [CMF](https://github.com/infosave2007/cmf) files for `cortiq`, a Rust inference engine with
-no Python and no ML framework: NVIDIA, AMD and Intel GPUs through Vulkan/DX12, Apple silicon through
-Metal, and the CPU.
+no Python and no ML framework: NVIDIA GPUs through CUDA or Vulkan/DX12, AMD and Intel GPUs through
+Vulkan/DX12, Apple silicon through Metal, and the CPU. On an RTX 3090 through CUDA the turbo file
+answers at 201 tok/s and reads 64 000 tokens in 33 s.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文说明)
 
@@ -45,6 +47,15 @@ cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list."
 Use cortiq 0.8.57 or later; prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). `--no-think` asks for a direct
 answer. Without it the model reasons first, so raise `--max-tokens`.
+
+On an NVIDIA card the CUDA backend is the fastest path (cortiq 0.8.70 or later; the CUDA toolkit's
+`libnvrtc` and `libcublas` 12.x at run time):
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Write a Rust function that reverses a list." --no-think
+CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
 
 ## Files
 
@@ -100,6 +111,16 @@ Decode in tok/s; the first row is 12 real prompts of 200 tokens through `cortiq 
 | context 64 000 | prompt not read in 25 min | **53.0** |
 | first token at 16 000 / 32 000 / 64 000 | 78 s / 360 s / over 25 min | **53 s / 112 s / 228 s** |
 | device KV memory at 4 000 / 32 000 | 1.0 GB / 4.3 GB | **0.64 GB / 0.50 GB** |
+| **CUDA, NVIDIA RTX 3090 (24 GB)** | | |
+| real prompts | 159.6 | **201.4** |
+| context 1 000 | 156.9 | **231.9** |
+| context 4 000 | 146.0 | **215.2** |
+| context 16 000 | 127.9 | **212.7** |
+| context 32 000 | 111.3 | **216.0** |
+| context 64 000 | — | **214.1** |
+| first token at 16 000 / 32 000 / 64 000 | 5.4 s / 12.8 s / — | **6.1 s / 13.6 s / 33.0 s** |
+| device KV memory at 4 000 / 32 000 | 0.50 GB / 2.14 GB | **0.32 GB / 0.26 GB** |
+| peak device memory at 4 000 / 32 000 / 64 000 | 4.0 GB / 6.1 GB / — | **3.9 GB / 5.9 GB / 7.7 GB** |
 | **Metal, MacBook Air M4 (24 GB)** | | |
 | real prompts | 25.7 | **32.9** |
 | context 1 000 | 22.1 | **34.6** |
@@ -112,6 +133,12 @@ Decode in tok/s; the first row is 12 real prompts of 200 tokens through `cortiq 
 | EPYC 9254, 24 cores, context 256 | 7.6 | **11.6** |
 | EPYC 9254, 24 cores, context 4 000 | 5.3 | **8.2** |
 
+![CUDA and Vulkan on one card](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/cuda_en.png)
+
+The RTX 3090 over Vulkan, the same build: real prompts 86.9 and 120.9 tok/s, first token at 64 000 tokens
+163 s, peak device memory 3.0–3.6 GB: on CUDA a long prompt's rows stay on the card until the seal. The texts of CUDA and Vulkan are the same. CUDA: facts in 60 000 and 100 000 characters 8 of 8 each,
+first token 6 and 10 s.
+
 About 85 % of tokens take one pass, on Wikipedia and on a code answer alike. `dory-q8_2f.cmf` on
 real prompts: 32.0 tok/s on Vulkan, 15.4 on Metal, 13.8 on the M4 CPU. Long windows, perplexity of
 two windows of 16384 tokens: exact 8.10, turbo's near and far fields 8.85, a cut to 2048 rows 11.03.
@@ -123,6 +150,8 @@ two windows of 16384 tokens: exact 8.10, turbo's near and far fields 8.85, a cut
 - A turn that goes back over a sealed conversation reads the whole prompt again, and chooses again.
 - Rows that arrive after a prompt ends can only stay in the last 1536 rows or go to the far field.
 - `--loops 2` on a turbo file turns the router, the far field and the rest off. See the [guide](https://github.com/infosave2007/cmf/blob/master/docs/DORY.md).
+- On CUDA a long prompt's rows stay on the card until the seal (2.4 GB at 64 000 tokens), and
+  `dory-q8_2f.cmf` runs on the CPU.
 
 ## Usage
 
@@ -147,8 +176,9 @@ grant: [PATENTS.md](https://github.com/infosave2007/cmf/blob/master/PATENTS.md).
 трансформер NVIDIA: рекуррентный блок из 40 подслоёв проходит несколько раз по одним и тем же весам,
 поэтому один чекпоинт работает с 1, 2 или 4 циклами. Модель рассуждает в `<think>` и вызывает
 инструменты. Здесь она лежит одиночными файлами [CMF](https://github.com/infosave2007/cmf) для
-`cortiq`, движка на Rust без Python и ML-фреймворков: GPU NVIDIA, AMD и Intel через Vulkan/DX12,
-Apple silicon через Metal и CPU.
+`cortiq`, движка на Rust без Python и ML-фреймворков: GPU NVIDIA через CUDA или Vulkan/DX12, GPU AMD
+и Intel через Vulkan/DX12, Apple silicon через Metal и CPU. На RTX 3090 через CUDA турбо-файл отвечает
+со скоростью 201 ток/с и читает 64 000 токенов за 33 с.
 
 ```bash
 cargo install cortiq-cli
@@ -158,6 +188,15 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 
 Нужен cortiq 0.8.57 или новее. `--no-think` просит прямой ответ; без него модель сначала рассуждает,
 поэтому увеличьте `--max-tokens`.
+
+На карте NVIDIA быстрее всего бэкенд CUDA (cortiq 0.8.70 или новее; при запуске нужны `libnvrtc` и
+`libcublas` 12.x из CUDA toolkit):
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, которая разворачивает список." --no-think
+CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
 
 ### Файлы
 
@@ -212,6 +251,16 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 | контекст 64 000 | промпт не прочитан за 25 мин | **53,0** |
 | первый токен при 16 000 / 32 000 / 64 000 | 78 с / 360 с / больше 25 мин | **53 с / 112 с / 228 с** |
 | память KV при 4 000 / 32 000 | 1,0 ГБ / 4,3 ГБ | **0,64 ГБ / 0,50 ГБ** |
+| **CUDA, NVIDIA RTX 3090 (24 ГБ)** | | |
+| реальные запросы | 159,6 | **201,4** |
+| контекст 1 000 | 156,9 | **231,9** |
+| контекст 4 000 | 146,0 | **215,2** |
+| контекст 16 000 | 127,9 | **212,7** |
+| контекст 32 000 | 111,3 | **216,0** |
+| контекст 64 000 | — | **214,1** |
+| первый токен на 16 000 / 32 000 / 64 000 | 5,4 с / 12,8 с / — | **6,1 с / 13,6 с / 33,0 с** |
+| память KV на устройстве при 4 000 / 32 000 | 0,50 ГБ / 2,14 ГБ | **0,32 ГБ / 0,26 ГБ** |
+| пик памяти карты при 4 000 / 32 000 / 64 000 | 4,0 ГБ / 6,1 ГБ / — | **3,9 ГБ / 5,9 ГБ / 7,7 ГБ** |
 | **Metal, MacBook Air M4 (24 ГБ)** | | |
 | реальные запросы | 25,7 | **32,9** |
 | контекст 1 000 | 22,1 | **34,6** |
@@ -224,6 +273,12 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 | EPYC 9254, 24 ядра, контекст 256 | 7,6 | **11,6** |
 | EPYC 9254, 24 ядра, контекст 4 000 | 5,3 | **8,2** |
 
+![CUDA и Vulkan на одной карте](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/cuda_ru.png)
+
+Та же RTX 3090 через Vulkan, та же сборка: реальные запросы 86,9 и 120,9 ток/с, первый токен на 64 000
+токенов через 163 с, пик памяти карты 3,0–3,6 ГБ: на CUDA строки длинного промпта лежат на карте до печати. Тексты CUDA и Vulkan совпадают. CUDA: факты в 60 000 и 100 000 символов — 8 из 8 в
+каждом, первый токен через 6 и 10 с.
+
 Примерно 85 % токенов идут за один проход: и на Википедии, и в ответе с кодом. `dory-q8_2f.cmf` на
 реальных запросах: 32,0 ток/с на Vulkan, 15,4 на Metal, 13,8 на CPU M4. Длинные окна, перплексия двух
 окон по 16384 токена: точно 8,10, ближнее и дальнее поле турбо 8,85, обрезка до 2048 строк 11,03.
@@ -235,6 +290,8 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 - Реплика, расходящаяся с запечатанной историей, читает весь промпт заново и выбирает строки снова.
 - Строки, пришедшие после конца промпта, могут быть только среди последних 1536 или в дальнем поле.
 - `--loops 2` на турбо-файле выключает роутер, дальнее поле и остальное. Подробнее в [руководстве](https://github.com/infosave2007/cmf/blob/master/docs/DORY.ru.md).
+- На CUDA строки длинного промпта лежат на карте до печати (2,4 ГБ на 64 000 токенов), а `dory-q8_2f.cmf`
+  идёт на CPU.
 
 ### Лицензия
 
@@ -249,8 +306,9 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 [Dory 1.0 4B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16) 是 NVIDIA 的循环
 Transformer:由 40 个子层组成的循环块在同一份权重上运行多次,因此同一个权重文件可以跑 1、2 或 4
 次循环。模型在 `<think>` 中推理,并能调用工具。这里提供单文件 [CMF](https://github.com/infosave2007/cmf),
-配合 `cortiq` 使用。`cortiq` 是 Rust 推理引擎,不需要 Python 和机器学习框架:NVIDIA、AMD、Intel
-GPU 走 Vulkan/DX12,Apple 芯片走 Metal,也可以用 CPU。
+配合 `cortiq` 使用。`cortiq` 是 Rust 推理引擎,不需要 Python 和机器学习框架:NVIDIA GPU 走 CUDA 或
+Vulkan/DX12,AMD、Intel GPU 走 Vulkan/DX12,Apple 芯片走 Metal,也可以用 CPU。在 RTX 3090 上通过 CUDA,
+turbo 文件以 201 tok/s 回答,读 64 000 个 token 只需 33 秒。
 
 ```bash
 cargo install cortiq-cli
@@ -259,6 +317,15 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 ```
 
 需要 cortiq 0.8.57 或更新版本。`--no-think` 要求直接回答;不加时模型会先推理,请调大 `--max-tokens`。
+
+在 NVIDIA 显卡上最快的是 CUDA 后端（cortiq 0.8.70 或更新版本；运行时需要 CUDA toolkit 的 `libnvrtc` 和
+`libcublas` 12.x）：
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --no-think
+CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
 
 ### 文件
 
@@ -309,6 +376,16 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 | 上下文 64 000 | 25 分钟未读完提示词 | 53.0 |
 | 首 token,16 000 / 32 000 / 64 000 | 78 秒 / 360 秒 / 超过 25 分钟 | 53 秒 / 112 秒 / 228 秒 |
 | 设备 KV 内存,4 000 / 32 000 | 1.0 GB / 4.3 GB | 0.64 GB / 0.50 GB |
+| CUDA,NVIDIA RTX 3090((24 GB) | | |
+| 真实提问 | 159.6 | 201.4 |
+| 上下文 1 000 | 156.9 | 231.9 |
+| 上下文 4 000 | 146.0 | 215.2 |
+| 上下文 16 000 | 127.9 | 212.7 |
+| 上下文 32 000 | 111.3 | 216.0 |
+| 上下文 64 000 | — | 214.1 |
+| 16 000 / 32 000 / 64 000 时首个 token | 5.4 秒 / 12.8 秒 / — | 6.1 秒 / 13.6 秒 / 33.0 秒 |
+| 4 000 / 32 000 时设备 KV 内存 | 0.50 GB / 2.14 GB | 0.32 GB / 0.26 GB |
+| 4 000 / 32 000 / 64 000 时显存峰值 | 4.0 GB / 6.1 GB / — | 3.9 GB / 5.9 GB / 7.7 GB |
 | Metal,MacBook Air M4((24 GB) | | |
 | 真实提问 | 25.7 | 32.9 |
 | 上下文 1 000 | 22.1 | 34.6 |
@@ -321,6 +398,11 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 | EPYC 9254,24 核,上下文 256 | 7.6 | 11.6 |
 | EPYC 9254,24 核,上下文 4 000 | 5.3 | 8.2 |
 
+![同一块显卡上的 CUDA 与 Vulkan](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/cuda_zh.png)
+
+同一块 RTX 3090 走 Vulkan、同一个构建:真实提问 86.9 和 120.9 tok/s,64 000 token 时首个 token 163 秒,显存峰值 3.0–3.6 GB:CUDA 上长提示的行在封口之前留在显卡上。
+CUDA 与 Vulkan 的文本相同。CUDA:60 000 和 100 000 字符中的事实各 8 中 8,首个 token 6 秒和 10 秒。
+
 约 85% 的 token 只走一次循环,维基百科文本和代码回答都是如此。`dory-q8_2f.cmf` 的真实提问速度:Vulkan
 32.0 tok/s,Metal 15.4,M4 CPU 13.8。长窗口,两个 16384 token 窗口的困惑度:精确 8.10,Turbo 的近场加
 远场 8.85,截断到 2048 行 11.03。
@@ -331,6 +413,7 @@ cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --n
 - 与已封存历史不一致的一轮对话会重新读取整个提示词,并重新选择。
 - 提示词结束后到达的行,只能留在最后 1536 行内或进入远场。
 - 在 Turbo 文件上使用 `--loops 2` 会关闭路由器、远场等功能。详见[指南](https://github.com/infosave2007/cmf/blob/master/docs/DORY.zh.md)。
+- 在 CUDA 上，长提示的行在封口之前留在显卡上（64 000 token 时 2.4 GB），`dory-q8_2f.cmf` 走 CPU。
 
 ### 许可证
 

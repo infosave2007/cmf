@@ -14,6 +14,13 @@ hf download infosave/Nemotron-Labs-Dory1.0-4B-cmf dory-turbo.cmf --local-dir .
 cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --no-think
 ```
 
+在 NVIDIA 显卡上用 CUDA 后端（[docs/CUDA.zh.md](CUDA.zh.md#dory循环的-ngpt)）：
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust 函数。" --no-think
+```
+
 | 文件 | 权重 | 大小 | wikitext-2 ppl | 用途 |
 |---|---|---:|---:|---|
 | `dory-turbo.cmf` | 4 位 GPTQ | 2.09 GB | 14.22 | 与 `q4tp-v2` 相同的权重,加上路由器和远场;默认 |
@@ -91,6 +98,14 @@ RTX 5090,Vulkan,磁盘写入 4.2 GB/s。其中权重占 1.95 GB,内存和文件�
 | 上下文 64 000 | 25 分钟未读完提示词 | 53.0 |
 | 首 token,16 000 / 32 000 / 64 000 | 78 秒 / 360 秒 / 超过 25 分钟 | 53 秒 / 112 秒 / 228 秒 |
 | 设备 KV 内存,4 000 / 32 000 | 1.0 GB / 4.3 GB | 0.64 GB / 0.50 GB |
+| CUDA,NVIDIA RTX 3090((24 GB) | | |
+| 真实提问 | 159.6 | 201.4 |
+| 上下文 1 000 | 156.9 | 231.9 |
+| 上下文 4 000 | 146.0 | 215.2 |
+| 上下文 16 000 | 127.9 | 212.7 |
+| 上下文 32 000 | 111.3 | 216.0 |
+| 上下文 64 000 | — | 214.1 |
+| 16 000 / 32 000 / 64 000 时首个 token | 5.4 秒 / 12.8 秒 / — | 6.1 秒 / 13.6 秒 / 33.0 秒 |
 | Metal,MacBook Air M4((24 GB) | | |
 | 真实提问 | 25.7 | 32.9 |
 | 上下文 1 000 | 22.1 | 34.6 |

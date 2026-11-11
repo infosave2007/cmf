@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.70] — 2026-11-12
+
+### Added
+- CUDA: Nemotron Labs Dory (`dory`, a looped nGPT) on the card, its turbo files included
+  ([docs/CUDA.md](docs/CUDA.md#dory-the-looped-ngpt)). It runs on the hybrid arm's tensor-core matvec, with
+  kernels of its own between the matvecs (`gpu_cuda/dory.cu`). Gate and up form one pair with their scales in the
+  q4tp ladders, and decode attention takes one pass over the keys. A token's stages are CUDA graphs, and the
+  router decides after the first pass. A prompt goes by GEMMs, 512 rows at a time, and its last rows take every
+  pass, as on the wgpu path. The far field and its exact rows are built at the prompt's end.
+  - RTX 3090 against Vulkan on the same card, 12 real prompts: 201.4 against 120.9 tok/s (turbo), 159.6 against
+    86.9 (q4tp-v2).
+  - A 64 000-token prompt: first token in 33.0 s against 162.6, then 214.1 tok/s against 91.6.
+  - Facts in 100 000 characters: 8 of 8. The texts are the wgpu path's.
+- CUDA hybrids: drafts over a turbo file's far field. A verify window's rows sit after the near rows, and the
+  rows after them read them; the state moves over the accepted ones only (`o1_spec_commit`, a B-row far part
+  `hy_far_prep_b`). The draft head reads the prompt's last 512 rows, warmed after a whole-prompt seal as over
+  the wgpu path's far field (before it, the bench kept 0 of 20 drafts). Qwen3.8-27B Turbo, a summary of 100 000
+  characters on an RTX 3090: 42.1 → 80.3 tok/s, the same text; `cortiq bench --core` past the seal 39 → 118–128.
+
+### Changed
+- CUDA hybrids: a sealed layer's far-field kernels. The ring's evicted row is folded in by a warp per (head,
+  landmark) instead of four blocks, and the far part by 256 threads a head: a token past the seal 23.6 → 21.9 ms
+  of kernels (Qwen3.8-27B Turbo without drafts 42.1 → 45.2 tok/s, Dory past the seal 184–191 → 212–216).
+- CUDA turbo: a whole prompt's rows come off the card and go into the layers' caches on threads: the first token
+  at 32 000 tokens 52.3 → 48.7 s.
+
 ## [0.8.69] — 2026-11-11
 
 `cortiq-core` and `cortiq-engine` 0.8.68 reached crates.io from a publish stopped halfway; 0.8.69 is the release.
