@@ -673,6 +673,41 @@ impl Drop for Pinned {
 /// Pinned pages cannot be dropped from the page cache, so only the experts
 /// outside the prefilled arena are taken. A thread pins layer after layer;
 /// `ready[li]` says when a layer's are pinned.
+/// Host pages that stay in RAM for good: page-aligned spans of a read-only mapping registered with the driver
+/// (`cuMemHostRegister`, read-only) from a background thread, in pieces of 1 GiB. A container that refuses
+/// `mlock` (RLIMIT_MEMLOCK, no CAP_IPC_LOCK) still lets the driver pin. Returns at once; never unregistered.
+pub(crate) fn pin_host_for_good(name: &'static str, spans: Vec<(usize, usize)>) {
+    let Some(c) = ctx() else { return };
+    let _ = std::thread::Builder::new().name("pin-host".into()).spawn(move || {
+        if c.current().is_err() {
+            return;
+        }
+        let t0 = Instant::now();
+        let (mut pinned, mut failed) = (0usize, 0usize);
+        for (a, len) in spans {
+            let mut at = a;
+            let end = a + len;
+            while at < end {
+                let n = (end - at).min(1 << 30);
+                // flag 8: the pages are read-only to the card
+                let rc = unsafe { cs::cuMemHostRegister_v2(at as *mut c_void, n, 8) };
+                if rc == cs::cudaError_enum::CUDA_SUCCESS {
+                    pinned += n;
+                } else {
+                    failed += n;
+                }
+                at += n;
+            }
+        }
+        eprintln!(
+            "qwen4 cuda: {name}: {:.1} GB pinned in RAM ({:.1} GB refused) in {:.1} s",
+            pinned as f64 / 1e9,
+            failed as f64 / 1e9,
+            t0.elapsed().as_secs_f64()
+        );
+    });
+}
+
 struct Pins {
     /// Per layer, per expert: pinned once the layer is ready.
     sel: Vec<Vec<bool>>,

@@ -2845,6 +2845,83 @@ fn ple_row_ids(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<i6
     ids
 }
 
+/// The n-gram table in RAM for good (`CMF_QWEN_PLE_LOCK`, on by default on the CUDA path; 0 = off): a decode
+/// step reads a few of its ~90-byte rows on three pages each of a ~26 GB mapping, and a host whose page cache
+/// does not keep the table (a 62 GB container with a 67 GB file) waits on the disk inside the step (thousands of
+/// major faults in a request). The table's pages are registered with the CUDA driver (pinned) from a background
+/// thread when the whole file fits beside it: the available RAM (the container's limit, if lower) must exceed the
+/// file by 8 GB. Pinning the table where it does not (a 62 GB container, a 67 GB file) evicts the pages a prompt
+/// needs and made every prompt wait on the disk (TTFT 12-15 s instead of 1.5-3 s). `CMF_QWEN_PLE_LOCK=1` pins
+/// whatever the memory, `0` never. Returns at once.
+#[cfg(feature = "gpu")]
+fn ple_lock(layers: &[Layer]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let mode = std::env::var("CMF_QWEN_PLE_LOCK").ok().map(|v| v.trim().to_string());
+        if DONE.set(()).is_err() || mode.as_deref() == Some("0") {
+            return;
+        }
+        // SAFETY: plain sysconf query.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut file = 0u64;
+        for l in layers {
+            let Some(pw) = l.ple.as_ref() else { continue };
+            if file == 0 {
+                file = pw.shards.first().and_then(|s| s.model_arc()).and_then(|m| std::fs::metadata(&m.path).ok()).map_or(0, |md| md.len());
+            }
+            for sh in &pw.shards {
+                if let Some(b) = sh.mapped_bytes() {
+                    let (a, len) = (b.as_ptr() as usize, b.len());
+                    let start = a / page * page;
+                    spans.push((start, (a + len).div_ceil(page) * page - start));
+                }
+            }
+        }
+        spans.sort_unstable();
+        spans.dedup();
+        let bytes: usize = spans.iter().map(|s| s.1).sum();
+        if bytes == 0 {
+            return;
+        }
+        let avail = mem_available();
+        let need = (file as usize).max(bytes) + (8 << 30);
+        if mode.as_deref() != Some("1") && avail < need {
+            eprintln!(
+                "qwen4: n-gram table: {:.1} GB of a {:.1} GB file, {:.1} GB of RAM available: left to the page cache",
+                bytes as f64 / 1e9,
+                file as f64 / 1e9,
+                avail as f64 / 1e9
+            );
+            return;
+        }
+        crate::gpu_cuda::qwen4::pin_host_for_good("n-gram table", spans);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = layers;
+}
+
+/// Bytes of RAM this process may still take: MemAvailable, or the container's memory limit minus its anonymous
+/// memory when lower.
+#[cfg(all(feature = "gpu", any(target_os = "linux", target_os = "android")))]
+fn mem_available() -> usize {
+    let kb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
+        .unwrap_or(0);
+    let mut avail = kb * 1024;
+    // the container's limit minus what it cannot give back (its page cache can be)
+    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let anon = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("anon ")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()));
+    if let (Some(max), Some(anon)) = (max, anon) {
+        avail = avail.min(max.saturating_sub(anon));
+    }
+    avail
+}
+
 /// Threads that ask the kernel for a prompt chunk's n-gram rows ahead of the
 /// gather (`CMF_QWEN_PLE_PREFETCH`, default 32; 0 turns the read-ahead off).
 #[cfg(feature = "gpu")]
@@ -4540,6 +4617,7 @@ fn cuda_forward(
         return false;
     }
     if state.cuda.is_none() {
+        ple_lock(layers);
         // the file's MTP draft head (`CMF_QWEN_MTP=0` leaves it out)
         if state.mtp.is_none() && !state.mtp_tried {
             state.mtp_tried = true;
