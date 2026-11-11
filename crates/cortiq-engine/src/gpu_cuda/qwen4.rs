@@ -2275,8 +2275,12 @@ impl Dev {
         arena.evicted = 0;
         arena.stage_ms = 0.0;
         // `CMF_QWEN_CUDA_REG=1`: the experts outside the prefilled arena (the ones it keeps
-        // missing) get their file pages pinned, up to `CMF_QWEN_CUDA_REG_MB` (default: all of them)
-        if std::env::var("CMF_QWEN_CUDA_REG").is_ok_and(|v| v.trim() == "1") && arena.stage.is_some() && arena.pins.is_none() {
+        // missing) get their file pages pinned, up to `CMF_QWEN_CUDA_REG_MB` (default: all of them).
+        // Unset, they are pinned when the RAM holds them beside the n-gram table with 8 GB to spare (a prompt's
+        // misses then never wait on the disk: on a 62 GB container the first requests ran 1.5-2x faster); `0`
+        // never pins.
+        let reg = std::env::var("CMF_QWEN_CUDA_REG").ok().map(|v| v.trim().to_string());
+        if reg.as_deref() != Some("0") && arena.stage.is_some() && arena.pins.is_none() {
             let budget = std::env::var("CMF_QWEN_CUDA_REG_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(usize::MAX, |mb| mb << 20);
             let mut sel: Vec<Vec<bool>> = vec![vec![true; d.ne]; layers.len()];
             // `CMF_QWEN_CUDA_REG_ALL=1`: the arena's own experts too (a host with the page cache for it)
@@ -2320,7 +2324,21 @@ impl Dev {
                 }
                 ranges.push(merged.into_iter().map(|(a, b)| (a, b - a)).collect::<Vec<_>>());
             }
-            arena.pins = Some(Pins::start(c, sel, ranges));
+            let fits = || {
+                let (avail, table) = (crate::qwen4_exp::mem_available(), crate::qwen4_exp::ple_table_bytes(layers));
+                let ok = avail >= total + table + (8 << 30);
+                eprintln!(
+                    "qwen4 cuda: {:.1} GB of experts outside the arena, the n-gram table {:.1} GB, {:.1} GB of RAM available: {}",
+                    total as f64 / 1e9,
+                    table as f64 / 1e9,
+                    avail as f64 / 1e9,
+                    if ok { "pinning them" } else { "left to the page cache" }
+                );
+                ok
+            };
+            if reg.as_deref() == Some("1") || fits() {
+                arena.pins = Some(Pins::start(c, sel, ranges));
+            }
         }
         Ok(n)
     }
