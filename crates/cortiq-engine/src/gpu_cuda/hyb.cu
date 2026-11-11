@@ -26,6 +26,21 @@ __device__ __forceinline__ void stf(void* p, u64 i, float v, int half) {
     if (half) ((u16*)p)[i] = f2h_sat(v); else ((float*)p)[i] = v;
 }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float h2f(u16 h) {
+    float f;
+    asm("{ cvt.f32.f16 %0, %1; }" : "=f"(f) : "h"(h));
+    return f;
+}
+// 8 f16 of a 16-byte aligned row slice as f32
+__device__ __forceinline__ void h8(const u16* p, float* o) {
+    const uint4 w = *(const uint4*)p;
+    const u32 a[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        o[2 * i] = h2f((u16)(a[i] & 0xFFFFu));
+        o[2 * i + 1] = h2f((u16)(a[i] >> 16));
+    }
+}
 
 // bf16 planes of the tensor-core small path (see its section below).
 __device__ __forceinline__ u16 f2bf(float f) {
@@ -189,9 +204,9 @@ extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float
 extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, const float* __restrict__ k,
                                  const float* __restrict__ v, int kvstride, const float* __restrict__ qn,
                                  const float* __restrict__ kn, float* __restrict__ qg, float* __restrict__ gate,
-                                 float* __restrict__ Km, float* __restrict__ Vm, const float* __restrict__ tab,
+                                 u16* __restrict__ Km, u16* __restrict__ Vm, const float* __restrict__ tab,
                                  int nh, int nkv, int half, float eps, int gemma, int gated, int slot0_, int B,
-                                 const int* __restrict__ ci)
+                                 const int* __restrict__ ci, u16* __restrict__ qgh)
 {
     // the mirror row of the call's first row: from the call record when
     // given (a replayed graph), else the argument
@@ -244,12 +259,15 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
         }
         if (isq) {
             const int g = u / HPK, j = u - g * HPK;
-            qg[(((size_t)g * B + b) * HPK + j) * HD + d] = val;
+            const size_t qi = (((size_t)g * B + b) * HPK + j) * HD + d;
+            qg[qi] = val;
+            if (qgh) qgh[qi] = f2h_sat(val);
             if (gated) gate[((size_t)b * nh + u) * HD + d] = src[HD + d];
         } else {
+            // the mirrors keep f16 rows (half the bytes a decode step reads)
             const int g = u - nh;
-            Km[((size_t)(slot0 + b) * nkv + g) * HD + d] = val;
-            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = v[(size_t)b * kvstride + (size_t)g * HD + d];
+            Km[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(val);
+            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(v[(size_t)b * kvstride + (size_t)g * HD + d]);
         }
     }
 }
@@ -261,7 +279,7 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
 // The call record ci (when given) carries n0, the mirror row of the first
 // row, rb, ncap and nbcap; the grid covers the largest key count a record
 // may give, blocks past this call's keys leave at once.
-extern "C" __global__ void hy_scores(const float* __restrict__ qg, const float* __restrict__ Km,
+extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __restrict__ Km,
                                      float* __restrict__ S, float* __restrict__ Mx, int n0, int r0, int nkv,
                                      float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci)
 {
@@ -287,10 +305,10 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const float* 
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
     float* Sb = S + (size_t)b * nh * ncap;
     for (int r = row0 + warp; r < row1; r += NW) {
-        const float* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
+        const u16* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float kv[DPL];
 #pragma unroll
-        for (int t = 0; t < DPL; t++) kv[t] = kr[t];
+        for (int t = 0; t < DPL; t += 8) h8(kr + t, kv + t);
 #pragma unroll
         for (int j = 0; j < HPK; j++) {
             float a = 0.0f;
@@ -313,7 +331,7 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const float* 
 }
 
 extern "C" __global__ void hy_values(const float* __restrict__ S, const float* __restrict__ Mx,
-                                     const float* __restrict__ Vm, float* __restrict__ P, float* __restrict__ E,
+                                     const u16* __restrict__ Vm, float* __restrict__ P, float* __restrict__ E,
                                      int n0, int r0, int nkv, int rb, int ncap, int nbcap, int B,
                                      const int* __restrict__ ci)
 {
@@ -349,10 +367,10 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
     }
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
     for (int r = row0 + warp; r < row1; r += NW) {
-        const float* vr = Vm + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
+        const u16* vr = Vm + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float vv[DPL];
 #pragma unroll
-        for (int t = 0; t < DPL; t++) vv[t] = vr[t];
+        for (int t = 0; t < DPL; t += 8) h8(vr + t, vv + t);
 #pragma unroll
         for (int j = 0; j < HPK; j++) {
             const float e = expf(__fsub_rn(Sb[(size_t)(g * HPK + j) * ncap + r], mx[j]));
@@ -1006,5 +1024,48 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
             code = (u8)((v >> sh) & 31u);
         }
         Cc[tg * 16 + lane] = code;
+    }
+}
+
+
+// The prompt path's causal softmax over f32 scores S [rows of a KV group][L]
+// (see `softmax_rows` of kernels.cu: row r is head r % hpk of the query at
+// position pos0 + r / hpk, column c the key at col_base + c), the
+// exponentials written as f16 into P (the value GEMM's operand) and each
+// row's 1 / sum into isum.
+extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
+                                        int L, int pos0, int col_base, int hpk, int cols, int istride)
+{
+    __shared__ float red[32];
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const float* s = S + (size_t)blockIdx.x * L;
+    u16* p = P + (size_t)blockIdx.x * L;
+    const int gk = (int)blockIdx.x / cols, r = (int)blockIdx.x - gk * cols;
+    const int pq = pos0 + r / hpk;
+    const int hi = pq - col_base;
+    float m = -INF;
+    for (int c = tid; c <= hi && c < L; c += T) m = fmaxf(m, s[c]);
+    for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, k));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    m = -INF;
+    for (int k = 0; k < NW; k++) m = fmaxf(m, red[k]);
+    __syncthreads();
+    float sum = 0.0f;
+    for (int c = tid; c < L; c += T) {
+        float e = 0.0f;
+        if (c <= hi) {
+            e = expf(s[c] - m);
+            sum += e;
+        }
+        p[c] = f2h(e);
+    }
+    for (int k = 16; k > 0; k >>= 1) sum += __shfl_xor_sync(FULL, sum, k);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        sum = 0.0f;
+        for (int k = 0; k < NW; k++) sum += red[k];
+        isum[(size_t)gk * istride + r] = sum > 0.0f ? 1.0f / sum : 1.0f;
     }
 }

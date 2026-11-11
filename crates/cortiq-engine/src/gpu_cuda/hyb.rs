@@ -147,6 +147,7 @@ pub(super) struct HFuncs {
     values: cs::CUfunction,
     finish: cs::CUfunction,
     attn_out: cs::CUfunction,
+    softmax_h: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -187,6 +188,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         values: func(module, "hy_values")?,
         finish: func(module, "hy_finish")?,
         attn_out: func(module, "hy_attn_out")?,
+        softmax_h: func(module, "hy_softmax_h")?,
     })
 }
 
@@ -397,6 +399,63 @@ fn repack_rows(srcs: &[(&[u8], usize)], rows: usize, cols: usize, map: &(dyn Fn(
         }
     });
     Ok((nib, codes, lad))
+}
+
+/// `count` GEMMs of one shape: A and B f16 (A transposed when `ta`), C f32,
+/// f32 accumulation; operand i sits `stride_*` elements after i - 1.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_batched_h(
+    c: &Ctx,
+    ta: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: u64,
+    lda: usize,
+    stride_a: usize,
+    b: u64,
+    ldb: usize,
+    stride_b: usize,
+    cptr: u64,
+    ldc: usize,
+    stride_c: usize,
+    count: usize,
+) -> Res<()> {
+    use super::bl;
+    let op = |t| if t { bl::cublasOperation_t::CUBLAS_OP_T } else { bl::cublasOperation_t::CUBLAS_OP_N };
+    let beta = 0.0f32;
+    let st = unsafe {
+        bl::cublasGemmStridedBatchedEx(
+            c.blas,
+            op(ta),
+            op(false),
+            m as i32,
+            n as i32,
+            k as i32,
+            std::ptr::from_ref(&alpha).cast(),
+            a as *const c_void,
+            bl::cudaDataType::CUDA_R_16F,
+            lda as i32,
+            stride_a as i64,
+            b as *const c_void,
+            bl::cudaDataType::CUDA_R_16F,
+            ldb as i32,
+            stride_b as i64,
+            std::ptr::from_ref(&beta).cast(),
+            cptr as *mut c_void,
+            bl::cudaDataType::CUDA_R_32F,
+            ldc as i32,
+            stride_c as i64,
+            count as i32,
+            bl::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            bl::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    };
+    if st as u32 != 0 {
+        return Err(format!("cuBLAS f16 batched gemm {count} x {m}x{n}x{k}: {st:?}"));
+    }
+    Ok(())
 }
 
 /// A q4tp matrix (one payload, or the gate/up pair of two) uploaded as it
@@ -672,6 +731,9 @@ pub(super) struct HState {
     mats: HashMap<(u64, usize), Arc<DevMat>>,
     /// Gate/up pairs (`hmat_pair`) by (model, gate, up).
     pairs: HashMap<(u64, usize, usize), Arc<DevMat>>,
+    /// K/V mirrors this arm keeps in f16 (by sequence and layer): a mirror's
+    /// `row` counts f32 slots, half its f16 values.
+    pub(super) half: std::collections::HashSet<(u64, usize)>,
     /// `rows_matvec`'s job tables, by tensor, with the output they point at.
     rowsets: HashMap<(u64, usize), (MmaSet, u64)>,
     /// The restore tables of `spec_restore`, by sequence: the layers' state
@@ -1094,6 +1156,52 @@ fn rope_rows(invf: &[f32], positions: impl Iterator<Item = usize>) -> Vec<f32> {
     tab
 }
 
+/// `KvMirror::sync_to` for an f16 mirror: rewind past rows of another
+/// continuation, or take the rows the host holds (as f16) and the card does
+/// not. Ok(false): the host does not hold them either.
+#[allow(clippy::too_many_arguments)]
+fn sync_half(c: &Ctx, m: &mut KvMirror, cpu_k: &[Vec<f32>], cpu_v: &[Vec<f32>], cpu_base: usize, nkv: usize, hd: usize, upto: usize) -> Res<bool> {
+    if m.stored > upto {
+        if upto >= m.base {
+            m.stored = upto;
+        } else {
+            m.base = 0;
+            m.stored = 0;
+        }
+    }
+    if m.stored == upto {
+        return Ok(true);
+    }
+    let from = m.stored;
+    let n = upto - from;
+    let have = cpu_k.first().map_or(0, |k| k.len() / hd);
+    if cpu_k.len() != nkv || cpu_v.len() != nkv || from < cpu_base || upto > cpu_base + have {
+        return Ok(false);
+    }
+    m.reserve(c, n, 0)?;
+    let row = nkv * hd;
+    let mut kb = vec![0u16; n * row];
+    let mut vb = vec![0u16; n * row];
+    for r in 0..n {
+        let src = (from - cpu_base + r) * hd;
+        for g in 0..nkv {
+            for d in 0..hd {
+                kb[r * row + g * hd + d] = cortiq_core::quant::f32_to_f16(cpu_k[g][src + d]);
+                vb[r * row + g * hd + d] = cortiq_core::quant::f32_to_f16(cpu_v[g][src + d]);
+            }
+        }
+    }
+    let off = ((from - m.base) * row * 2) as u64;
+    unsafe {
+        cu::memcpy_htod_async(m.kptr() + off, &kb, c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(m.vptr() + off, &vb, c.stream).map_err(derr)?;
+    }
+    // the host vectors go when this returns
+    c.sync()?;
+    m.stored = upto;
+    Ok(true)
+}
+
 /// Bring every layer's state to `pos0` rows before anything is launched:
 /// the K/V mirrors (from the host's rows where the card lacks them) and the
 /// GDN states (fresh at a sequence start, seeded from the host's state after
@@ -1115,14 +1223,18 @@ fn admit(
         let key = (kv_id, layer_base + li);
         match (&pl.mix, &l.attn) {
             (Mix::Attn(_), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
-                let row = plan.nkv * plan.hd;
+                // f16 rows: `row` counts f32 slots of a mirror, so half the values
+                let row = plan.nkv * plan.hd / 2;
+                let fresh_half = !st.hyb.half.contains(&key);
                 let m = st.kv.entry(key).or_insert_with(|| KvMirror::new(row, 0));
-                if m.row != row || m.window != 0 {
+                if m.row != row || m.window != 0 || fresh_half {
                     let _ = c.sync();
                     c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
                     *m = KvMirror::new(row, 0);
                 }
-                match m.sync_to(c, cpu_k, cpu_v, *cpu_base, plan.nkv, plan.hd, pos0) {
+                st.hyb.half.insert(key);
+                let m = st.kv.get_mut(&key).unwrap();
+                match sync_half(c, m, cpu_k, cpu_v, *cpu_base, plan.nkv, plan.hd, pos0) {
                     Ok(true) => m.reserve(c, n, hint).map_err(soft)?,
                     Ok(false) if m.stored < pos0 && m.stored >= m.base => {
                         // Rows neither on the card nor on the host: positions
@@ -1382,6 +1494,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
+                let nul16 = 0u64;
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
@@ -1392,7 +1505,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                         0,
                         kargs!(
                             plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
-                            plan.tab.ptr, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, n_i, cip
+                            plan.tab.ptr, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, n_i, cip, nul16
                         ),
                     )?;
                     // a grid for any record: blocks past the call's keys leave
@@ -1786,11 +1899,10 @@ unsafe fn big(
     defer: bool,
 ) -> Res<()> {
     let fx = &plan.fx;
-    let f = &c.f;
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    let (gw, ga) = prec();
+    let (gw, _) = prec();
     if gw != Gemm::Half {
         return Err("the hybrid prompt path runs f16 weight GEMMs only".into());
     }
@@ -1891,6 +2003,7 @@ unsafe fn big(
                 let yk = st.scr(c, "hb_k", b * nkv * hd * 4)?;
                 let yv = st.scr(c, "hb_v", b * nkv * hd * 4)?;
                 let qg = st.scr(c, "hb_qg", b * nh * hd * 4)?;
+                let qgh = st.scr(c, "hb_qgh", b * nh * hd * 2)?;
                 let gt = st.scr(c, "hb_gate", b * nh * hd * 4)?;
                 let aog = st.scr(c, "hb_aog", b * nh * hd * 4)?;
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
@@ -1914,7 +2027,7 @@ unsafe fn big(
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, b_i, nul),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, b_i, nul, qgh),
                     )?;
                 }
                 let lda = nkv * hd;
@@ -1932,14 +2045,16 @@ unsafe fn big(
                     let cols = bn * hpk;
                     let whole = (hint.max(pos0 + b) * b * nh * 4).min(400 << 20);
                     let bs = st.scr(c, "hb_s", (nkv * l_rows * cols * 4).max(whole))?;
-                    let (l_i, p0_i, cb_i, win_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, 0i32, hpk as i32);
+                    let bp = st.scr(c, "hb_p", (nkv * l_rows * cols * 2).max(whole / 2))?;
+                    let (l_i, p0_i, cb_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, hpk as i32);
                     let (cols_i, istride) = (cols as i32, (b * hpk) as i32);
-                    let goff = (b0 * grow * 4) as u64;
                     let isum = bis + (b0 * hpk * 4) as u64;
+                    // the mirrors hold f16 rows: both GEMMs on f16 operands
+                    // (the query copy and the exponentials), f32 out
                     unsafe {
-                        c.gemm_batched(true, l_rows, cols, hd, plan.scale, kp, lda, hd, qg + goff, hd, b * grow, bs, l_rows, l_rows * cols, nkv, ga)?;
-                        c.launch(f.softmax_rows, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, isum, l_i, p0_i, cb_i, win_i, hpk_i, cols_i, istride))?;
-                        c.gemm_batched(false, hd, cols, l_rows, 1.0, vp, lda, hd, bs, l_rows, l_rows * cols, aog + goff, hd, b * grow, nkv, ga)?;
+                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kp, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride))?;
+                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vp, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
                 }

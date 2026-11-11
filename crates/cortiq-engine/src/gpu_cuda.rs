@@ -2460,6 +2460,7 @@ pub fn kv_reset(kv_id: u64) {
         return;
     }
     hyb::reset(c, &mut st, kv_id);
+    st.hyb.half.retain(|k| k.0 != kv_id);
     st.kv.retain(|&(id, _), m| {
         if id == kv_id {
             c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
@@ -2604,20 +2605,39 @@ pub fn kv_pull_host(
     c.current().ok()?;
     let m = st.kv.get(&(kv_id, layer))?;
     let row = nkv * hd;
-    if m.row != row || to > m.stored || from > to {
+    // the hybrid arm keeps f16 rows (its mirror's `row` counts f32 slots)
+    let half = st.hyb.half.contains(&(kv_id, layer));
+    if m.row != if half { row / 2 } else { row } || to > m.stored || from > to {
         return None;
     }
     let first = from.max(m.base);
     let mut kb = vec![0f32; (to - from) * row];
     let mut vb = vec![0f32; (to - from) * row];
     if first < to {
-        let off = ((first - m.base) * row * 4) as u64;
         let dst = (first - from) * row;
-        unsafe {
-            cu::memcpy_dtoh_async(&mut kb[dst..], m.kptr() + off, c.stream).ok()?;
-            cu::memcpy_dtoh_async(&mut vb[dst..], m.vptr() + off, c.stream).ok()?;
+        if half {
+            let off = ((first - m.base) * row * 2) as u64;
+            let mut kh = vec![0u16; (to - first) * row];
+            let mut vh = vec![0u16; (to - first) * row];
+            unsafe {
+                cu::memcpy_dtoh_async(&mut kh, m.kptr() + off, c.stream).ok()?;
+                cu::memcpy_dtoh_async(&mut vh, m.vptr() + off, c.stream).ok()?;
+            }
+            c.sync().ok()?;
+            for (d, h) in kb[dst..].iter_mut().zip(&kh) {
+                *d = cortiq_core::quant::f16_to_f32(*h);
+            }
+            for (d, h) in vb[dst..].iter_mut().zip(&vh) {
+                *d = cortiq_core::quant::f16_to_f32(*h);
+            }
+        } else {
+            let off = ((first - m.base) * row * 4) as u64;
+            unsafe {
+                cu::memcpy_dtoh_async(&mut kb[dst..], m.kptr() + off, c.stream).ok()?;
+                cu::memcpy_dtoh_async(&mut vb[dst..], m.vptr() + off, c.stream).ok()?;
+            }
+            c.sync().ok()?;
         }
-        c.sync().ok()?;
     }
     Some((kb, vb, first.min(to)))
 }
