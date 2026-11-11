@@ -7,6 +7,15 @@ typedef unsigned long long u64;
 typedef unsigned short u16;
 typedef unsigned char u8;
 
+// Programmatic dependent launch (CMF_QWEN_PDL=1): a kernel may start while its predecessor drains. It first waits for the
+// predecessor to finish and flush (griddepcontrol.wait), then lets its own successor launch. Without the attribute on
+// the launch both are no-ops.
+#if __CUDA_ARCH__ >= 900
+#define PDL_PRO() do { asm volatile("griddepcontrol.wait;" ::: "memory"); asm volatile("griddepcontrol.launch_dependents;"); } while (0)
+#else
+#define PDL_PRO() do { } while (0)
+#endif
+
 __device__ __forceinline__ u16 f2h(float f) {
     u16 h;
     asm("{ cvt.rn.f16.f32 %0, %1; }" : "=h"(h) : "f"(f));
@@ -30,7 +39,7 @@ __device__ __forceinline__ float silu_f(float x) { return x * sigm(x); }
 
 // hyper [n][hc][hid] = the embedding row repeated over the streams.
 extern "C" __global__ void q4_tile(const float* __restrict__ emb, float* __restrict__ hyper, int n, int hid, int hc)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hid) return;
     const u64 t = i / hid, d = i - t * hid;
@@ -43,7 +52,7 @@ extern "C" __global__ void q4_tile(const float* __restrict__ emb, float* __restr
 // (either may be null).
 extern "C" __global__ void q4_grms(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
                                    void* __restrict__ yh, int group, int groups, double eps, int half)
-{
+{ PDL_PRO();
     __shared__ double red[256];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
@@ -64,12 +73,45 @@ extern "C" __global__ void q4_grms(const float* __restrict__ x, const float* __r
     }
 }
 
+// q4_grms after the previous block's inject, in one launch: row (t, s) of hyper first takes
+// hyper += iw[t][s] * block[t], is stored back, and is then normed as in q4_grms.
+extern "C" __global__ void q4_grms_inj(float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
+                                       void* __restrict__ yh, int group, int groups, double eps, int half,
+                                       const float* __restrict__ block, const float* __restrict__ iw)
+{ PDL_PRO();
+    __shared__ double red[256];
+    const u64 b = blockIdx.x;
+    const int g = (int)(b % groups);
+    const u64 t = b / groups;
+    float* xr = x + b * group;
+    const float* bk = block + t * group;
+    const float a = iw[b];
+    double ss = 0.0;
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
+        const float v = xr[i] + a * bk[i];
+        xr[i] = v;
+        ss += (double)v * (double)v;
+    }
+    red[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
+        const float v = xr[i] * inv * (1.0f + w[g * group + i]);
+        if (y) y[b * group + i] = v;
+        if (yh) stf(yh, b * group + i, v, half);
+    }
+}
+
 // The low-rank middle of a gated residual. low [n][R]: the first `lr` values
 // become the wt operand silu(low / hc); the rest are the inject weights
 // 2 * sigmoid(low / hc) -> iw [n][R - lr].
 extern "C" __global__ void q4_hc_low(const float* __restrict__ low, void* __restrict__ lowh, float* __restrict__ iw,
                                      int n, int R, int lr, float hc, int half)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * R) return;
     const u64 t = i / R;
@@ -83,7 +125,7 @@ extern "C" __global__ void q4_hc_low(const float* __restrict__ low, void* __rest
 extern "C" __global__ void q4_hc_fold(const float* __restrict__ mix, const float* __restrict__ normed,
                                       float* __restrict__ folded, void* __restrict__ foldedh,
                                       int n, int hid, int hc, int half)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hid) return;
     const u64 t = i / hid, d = i - t * hid;
@@ -99,7 +141,7 @@ extern "C" __global__ void q4_hc_fold(const float* __restrict__ mix, const float
 // hyper [n][hc][hid] += iw [n][hc] * block [n][hid].
 extern "C" __global__ void q4_inject(float* __restrict__ hyper, const float* __restrict__ block,
                                      const float* __restrict__ iw, int n, int hid, int hc)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hc * hid) return;
     const u64 t = i / ((u64)hc * hid);
@@ -112,7 +154,7 @@ extern "C" __global__ void q4_inject(float* __restrict__ hyper, const float* __r
 // out[r] = the row at chunk position n - cap + r, older ones from `hist`.
 extern "C" __global__ void q4_hist(const float* __restrict__ hist, const float* __restrict__ chunk,
                                    float* __restrict__ out, int cap, int width, int n)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)cap * width) return;
     const int r = (int)(i / width);
@@ -129,7 +171,7 @@ extern "C" __global__ void q4_hist(const float* __restrict__ hist, const float* 
 extern "C" __global__ void q4_gdn_conv(const float* __restrict__ qkv, const float* __restrict__ ring,
                                        const float* __restrict__ taps, float* __restrict__ cq,
                                        int n, int c_dim, int kk)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * c_dim) return;
     const int t = (int)(i / c_dim);
@@ -147,7 +189,7 @@ extern "C" __global__ void q4_gdn_conv(const float* __restrict__ qkv, const floa
 // L2 norm of the q and k heads in place, a block per (token, head of 2 * nk):
 // q heads also divided by sqrt(dk).
 extern "C" __global__ void q4_gdn_prep(float* __restrict__ cq, int c_dim, int nk, int dk)
-{
+{ PDL_PRO();
     __shared__ double red[256];
     const u64 t = blockIdx.x / (2 * nk);
     const int g = (int)(blockIdx.x - t * (2 * nk));
@@ -170,7 +212,7 @@ extern "C" __global__ void q4_gdn_prep(float* __restrict__ cq, int c_dim, int nk
 // ab [n][2 * nv] holds a then b.
 extern "C" __global__ void q4_gdn_gb(const float* __restrict__ ab, const float* __restrict__ a_log,
                                      const float* __restrict__ dt_bias, float* __restrict__ gb, int n, int nv)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * nv) return;
     const u64 t = i / nv;
@@ -193,7 +235,7 @@ __device__ __forceinline__ float wsum(float v) {
 extern "C" __global__ void q4_gdn_scan(const float* __restrict__ cq, const float* __restrict__ gb,
                                        const float* S, float* So, float* __restrict__ o,
                                        int n, int c_dim, int nv, int nk, int dk, int dv)
-{
+{ PDL_PRO();
     const int col = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (col >= nv * dv) return;
     const int lane = threadIdx.x & 31;
@@ -226,7 +268,7 @@ extern "C" __global__ void q4_gdn_scan(const float* __restrict__ cq, const float
 extern "C" __global__ void q4_gdn_out(const float* __restrict__ o, const float* __restrict__ z,
                                       const float* __restrict__ norm, void* __restrict__ ofh,
                                       int dv, double eps, int half)
-{
+{ PDL_PRO();
     __shared__ double red[256];
     const u64 b = blockIdx.x;
     const float* xr = o + b * dv;
@@ -259,7 +301,7 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
                                         int heads, int hd, u64 sstride, u64 shead, u64 dstride, u64 dhead,
                                         int dgroup, u64 dgstride, int rot, int nfreq, int pos0, int pstep,
                                         int nsum, double eps)
-{
+{ PDL_PRO();
     __shared__ float sv[256];
     __shared__ double red[256];
     const u64 item = blockIdx.x / heads;
@@ -295,7 +337,7 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
 // Indexer block scores: sc[t][b] = sum_h max(DS[t][h][b], 0) * inv.
 extern "C" __global__ void q4_idx_reduce(const float* __restrict__ ds, float* __restrict__ sc,
                                          int nb, int ih, int nact, float inv)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)nact * nb) return;
     const u64 t = i / nb, b = i - t * nb;
@@ -311,7 +353,7 @@ extern "C" __global__ void q4_idx_reduce(const float* __restrict__ ds, float* __
 // bisection over the 32 bits. A thread owns `per` blocks (a multiple of 32).
 extern "C" __global__ void q4_idx_topk(const float* __restrict__ sc, u32* __restrict__ maskb,
                                        int nb, int mwords, int keep, int p0, int cr, int per)
-{
+{ PDL_PRO();
     __shared__ int total;
     __shared__ int eqc[256];
     const int r = blockIdx.x;
@@ -364,7 +406,7 @@ extern "C" __global__ void q4_idx_topk(const float* __restrict__ sc, u32* __rest
 // the kept blocks plus the tail past the last complete block.
 extern "C" __global__ void q4_qsa_softmax(float* __restrict__ S, const u32* __restrict__ maskb,
                                           int L, int hpt, int ppos0, int mask_p0, int mwords, int keep, int cr)
-{
+{ PDL_PRO();
     __shared__ float red[256];
     float* col = S + (u64)blockIdx.x * L;
     const int p = ppos0 + blockIdx.x / hpt;
@@ -408,7 +450,7 @@ extern "C" __global__ void q4_qsa_softmax(float* __restrict__ S, const u32* __re
 // merged [n][nh][hd] (wt) = O (group-major, as Q) * sigmoid(gate half of QG).
 extern "C" __global__ void q4_qsa_merge(const float* __restrict__ O, const float* __restrict__ qg,
                                         void* __restrict__ mergedh, int n, int nh, int groups, int hd, int half)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * nh * hd) return;
     const u64 t = i / ((u64)nh * hd);
@@ -425,7 +467,7 @@ extern "C" __global__ void q4_qsa_merge(const float* __restrict__ O, const float
 // a block per (token, stream).
 extern "C" __global__ void q4_ple_gate(const float* __restrict__ key, const float* __restrict__ query,
                                        const float* __restrict__ value, float* __restrict__ gated, int hid, int hc)
-{
+{ PDL_PRO();
     __shared__ float red[256];
     const u64 b = blockIdx.x;
     const u64 t = b / hc;
@@ -449,7 +491,7 @@ extern "C" __global__ void q4_ple_gate(const float* __restrict__ key, const floa
 extern "C" __global__ void q4_ple_conv(const float* __restrict__ normed, const float* __restrict__ hist,
                                        const float* __restrict__ conv, const float* __restrict__ gated,
                                        float* __restrict__ hyper, int n, int width, int kernel, int dil)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * width) return;
     const int t = (int)(i / width);
@@ -473,7 +515,7 @@ extern "C" __global__ void q4_ple_conv(const float* __restrict__ normed, const f
 extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __restrict__ picks,
                                     float* __restrict__ wts, int ne, int R, int topk, float tail,
                                     const unsigned long long* __restrict__ tbl)
-{
+{ PDL_PRO();
     __shared__ float pe[1024];
     __shared__ float red[256];
     __shared__ int spick[32];
@@ -533,7 +575,7 @@ extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __res
 // blockIdx.y / 3 into plane j of Wg / Wu / Wd.
 extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __restrict__ Wg, void* __restrict__ Wu,
                                          void* __restrict__ Wd, int inter, int hid, int half, int gbits)
-{
+{ PDL_PRO();
     const int m = blockIdx.y % 3, j = blockIdx.y / 3;
     const int rows = m == 2 ? hid : inter, cols = m == 2 ? inter : hid;
     const u32 wi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -583,7 +625,7 @@ extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __
 extern "C" __global__ void q4_expand_q8(const u32* __restrict__ body, const float* __restrict__ rs,
                                         const float* __restrict__ col, void* __restrict__ W,
                                         int rows, int cols, int half)
-{
+{ PDL_PRO();
     const u64 idx = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     const int qpr = cols >> 2;
     if (idx >= (u64)rows * qpr) return;
@@ -600,13 +642,13 @@ extern "C" __global__ void q4_expand_q8(const u32* __restrict__ body, const floa
 
 // f32 -> wt.
 extern "C" __global__ void q4_to_wt(const float* __restrict__ src, void* __restrict__ dst, u64 n, int half)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) stf(dst, i, src[i], half);
 }
 
 extern "C" __global__ void q4_zero(float* __restrict__ p, u64 n)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) p[i] = 0.0f;
 }
@@ -614,7 +656,7 @@ extern "C" __global__ void q4_zero(float* __restrict__ p, u64 n)
 // Xg [rows][hid] (wt) = the token rows of xh named by rowtok, zeros for -1.
 extern "C" __global__ void q4_gather(const void* __restrict__ xh, const int* __restrict__ rowtok,
                                      void* __restrict__ xg, int rows, int hid, int half)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)rows * hid) return;
     const u64 r = i / hid;
@@ -627,7 +669,7 @@ extern "C" __global__ void q4_gather(const void* __restrict__ xh, const int* __r
 // a = silu(g) * u * inv over n values; g, u in `in_half` type, a in `out_half`.
 extern "C" __global__ void q4_act(const void* __restrict__ g, const void* __restrict__ u, void* __restrict__ a,
                                   u64 n, int in_half, int out_half, float inv)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) stf(a, i, silu_f(ldf(g, i, in_half)) * ldf(u, i, in_half) * inv, out_half);
 }
@@ -637,7 +679,7 @@ extern "C" __global__ void q4_act(const void* __restrict__ g, const void* __rest
 extern "C" __global__ void q4_scatter(const void* __restrict__ D, const int* __restrict__ tokrow,
                                       const float* __restrict__ wts, float* __restrict__ out,
                                       int n, int hid, int topk, int d_half, int init)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hid) return;
     const u64 t = i / hid, d = i - t * hid;
@@ -652,7 +694,7 @@ extern "C" __global__ void q4_scatter(const void* __restrict__ D, const int* __r
 // out [n][hid] += g * ds [n][hid], g = sigmoid(logits[t][gcol]) or 1 (gcol < 0).
 extern "C" __global__ void q4_shared_add(float* __restrict__ out, const float* __restrict__ ds,
                                          const float* __restrict__ logits, int n, int hid, int R, int gcol)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hid) return;
     const u64 t = i / hid;
@@ -714,6 +756,11 @@ __device__ __forceinline__ float crumb16(u32 w, const float* p, int st, float a)
     return a;
 }
 
+// 16-byte words of a q8_2f row a lane loads before using any of them.
+#ifndef MV_AH
+#define MV_AH 8
+#endif
+
 // Up to five matvecs of one input over NB rows: y_j [NB][rows_j] = W_j x.
 // x [NB] rows `xstride` apart, `cols` wide. Kind 7 = q8_2f (int8 body, row
 // scale aux0, column field aux1), kind 4 = f32. A block serves `rpb` rows of
@@ -734,6 +781,7 @@ __device__ __forceinline__ void mvb_t(MvJob j0, MvJob j1, MvJob j2, MvJob j3, Mv
     const int row0 = (bx - jb.blk0) * jb.rpb;
     const int row1 = min(row0 + jb.rpb, jb.rows);
     float* y = (float*)jb.y;
+    PDL_PRO();
     if (jb.kind == 7) {
         const int nch = cols >> 4, CP = nch | 1, XS = 16 * CP;
         const float* col = (const float*)jb.aux1;
@@ -748,22 +796,35 @@ __device__ __forceinline__ void mvb_t(MvJob j0, MvJob j1, MvJob j2, MvJob j3, Mv
             const uint4* W = (const uint4*)(jb.w + (size_t)r * cols);
             float acc[NB];
             for (int b = 0; b < NB; b++) acc[b] = 0.0f;
-            for (int c = lane; c < nch; c += 32) {
-                const uint4 w = W[c];
-                float wf[16];
-                wf[0] = (float)((int)(w.x << 24) >> 24);  wf[1] = (float)((int)(w.x << 16) >> 24);
-                wf[2] = (float)((int)(w.x << 8) >> 24);   wf[3] = (float)((int)w.x >> 24);
-                wf[4] = (float)((int)(w.y << 24) >> 24);  wf[5] = (float)((int)(w.y << 16) >> 24);
-                wf[6] = (float)((int)(w.y << 8) >> 24);   wf[7] = (float)((int)w.y >> 24);
-                wf[8] = (float)((int)(w.z << 24) >> 24);  wf[9] = (float)((int)(w.z << 16) >> 24);
-                wf[10] = (float)((int)(w.z << 8) >> 24);  wf[11] = (float)((int)w.z >> 24);
-                wf[12] = (float)((int)(w.w << 24) >> 24); wf[13] = (float)((int)(w.w << 16) >> 24);
-                wf[14] = (float)((int)(w.w << 8) >> 24);  wf[15] = (float)((int)w.w >> 24);
-                for (int b = 0; b < NB; b++) {
-                    const float* p = sh + b * XS + c;
-                    float a = 0.0f;
-                    for (int k = 0; k < 16; k++) a += wf[k] * p[k * CP];
-                    acc[b] += a;
+            // MV_AH words a lane in flight at once: one load at a time left the bus idle (each waited out the
+            // memory latency before the next began)
+            for (int c0 = lane; c0 < nch; c0 += 32 * MV_AH) {
+                uint4 w[MV_AH];
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) w[j] = W[c];
+                }
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) {
+                        float wf[16];
+                        wf[0] = (float)((int)(w[j].x << 24) >> 24);  wf[1] = (float)((int)(w[j].x << 16) >> 24);
+                        wf[2] = (float)((int)(w[j].x << 8) >> 24);   wf[3] = (float)((int)w[j].x >> 24);
+                        wf[4] = (float)((int)(w[j].y << 24) >> 24);  wf[5] = (float)((int)(w[j].y << 16) >> 24);
+                        wf[6] = (float)((int)(w[j].y << 8) >> 24);   wf[7] = (float)((int)w[j].y >> 24);
+                        wf[8] = (float)((int)(w[j].z << 24) >> 24);  wf[9] = (float)((int)(w[j].z << 16) >> 24);
+                        wf[10] = (float)((int)(w[j].z << 8) >> 24);  wf[11] = (float)((int)w[j].z >> 24);
+                        wf[12] = (float)((int)(w[j].w << 24) >> 24); wf[13] = (float)((int)(w[j].w << 16) >> 24);
+                        wf[14] = (float)((int)(w[j].w << 8) >> 24);  wf[15] = (float)((int)w[j].w >> 24);
+                        for (int b = 0; b < NB; b++) {
+                            const float* p = sh + b * XS + c;
+                            float a = 0.0f;
+                            for (int k = 0; k < 16; k++) a += wf[k] * p[k * CP];
+                            acc[b] += a;
+                        }
+                    }
                 }
             }
             const float sc = rs[r];
@@ -815,7 +876,9 @@ __device__ __forceinline__ float wt_acc(const float* wf, const float* p, int st,
 
 // Words a lane reads ahead of their use: the loads are in flight together,
 // where one load a step would wait out the memory latency each time.
+#ifndef Q4_AHEAD
 #define Q4_AHEAD 8
+#endif
 
 // The low-rank middle of a gated residual over NB rows, by column chunks:
 // part [chunk][NB][R] = <W[r][chunk], x[b][chunk]>, W [R][Wd] (wt). Grid
@@ -824,20 +887,22 @@ __device__ __forceinline__ float wt_acc(const float* wf, const float* p, int st,
 // sums the chunks.
 template <int NB>
 __device__ __forceinline__ void hc_di_t(const void* __restrict__ Wp, const float* __restrict__ x,
-                                        float* __restrict__ part, int R, int Wd, int cw, int half)
+                                        float* __restrict__ part, int R, int Wd, int cw, int half,
+                                        float* __restrict__ low, float* __restrict__ iw, u32* tick, int lr, int hc)
 {
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
     const int c0 = blockIdx.y * cw, cn = min(cw, Wd - c0);
     const int ps = half ? 3 : 2, per = 1 << ps, nl = cn >> ps, CP = nl | 1, XS = per * CP;
+    PDL_PRO();
     for (int i = tid; i < cn; i += T) {
         const int idx = (i & (per - 1)) * CP + (i >> ps);
         for (int b = 0; b < NB; b++) sh[b * XS + idx] = x[(u64)b * Wd + c0 + i];
     }
     __syncthreads();
     const int r = blockIdx.x * NW + warp;
-    if (r >= R) return;
+    if (r < R) {
     const uint4* W = (const uint4*)((const char*)Wp + ((u64)r * Wd + c0) * (half ? 2 : 4));
     float acc[NB];
     for (int b = 0; b < NB; b++) acc[b] = 0.0f;
@@ -861,6 +926,30 @@ __device__ __forceinline__ void hc_di_t(const void* __restrict__ Wp, const float
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
         if (lane == 0) part[((u64)blockIdx.y * NB + b) * R + r] = a;
     }
+    }
+    // the last chunk block of these rows sums the chunks (in order) and applies the nonlinearity:
+    // low [NB][R] = silu(sum / hc) for the first `lr` rows, iw [NB][R - lr] = 2 sigmoid(sum / hc) for the rest
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = (int)(atomicAdd(tick + blockIdx.x, 1u) == gridDim.y - 1);
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (tid == 0) tick[blockIdx.x] = 0u;
+    for (int i = tid; i < NB * NW; i += T) {
+        const int b = i / NW, rr = blockIdx.x * NW + (i - b * NW);
+        if (rr >= R) continue;
+        float pv[32];
+#pragma unroll
+        for (int ch = 0; ch < 32; ch++) pv[ch] = ch < (int)gridDim.y ? __ldcg(part + ((u64)ch * NB + b) * R + rr) : 0.0f;
+        float a = 0.0f;
+#pragma unroll
+        for (int ch = 0; ch < 32; ch++) if (ch < (int)gridDim.y) a += pv[ch];
+        const float v = a / (float)hc;
+        if (rr < lr) low[(u64)b * R + rr] = silu_f(v);
+        else iw[(u64)b * (R - lr) + (rr - lr)] = 2.0f * sigm(v);
+    }
 }
 
 // The fold of a gated residual over NB rows, a warp per output dim d. First
@@ -874,25 +963,15 @@ __device__ __forceinline__ void hc_up_t(const void* __restrict__ Wp, const float
                                         float* __restrict__ iw, const float* __restrict__ normed,
                                         float* __restrict__ folded, void* __restrict__ foldedh,
                                         int hid, int hc, int lr, int R, int nch, int half)
-{
+{ (void)iw; (void)nch;
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
     const int ps = half ? 3 : 2, per = 1 << ps, nl = lr >> ps, CP = nl | 1, XS = per * CP;
+    // `part` is the low vector now: silu(sum / hc), summed by the last block of q4_hc_di*
     for (int i = tid; i < NB * lr; i += T) {
         const int b = i / lr, c = i - b * lr;
-        float a = 0.0f;
-        for (int ch = 0; ch < nch; ch++) a += part[((u64)ch * NB + b) * R + c];
-        sh[b * XS + (c & (per - 1)) * CP + (c >> ps)] = silu_f(a / (float)hc);
-    }
-    if (blockIdx.x == 0) {
-        const int ni = R - lr;
-        for (int i = tid; i < NB * ni; i += T) {
-            const int b = i / ni, j = i - b * ni;
-            float a = 0.0f;
-            for (int ch = 0; ch < nch; ch++) a += part[((u64)ch * NB + b) * R + lr + j];
-            iw[i] = 2.0f * sigm(a / (float)hc);
-        }
+        sh[b * XS + (c & (per - 1)) * CP + (c >> ps)] = part[(u64)b * R + c];
     }
     __syncthreads();
     const int d = blockIdx.x * NW + warp;
@@ -943,13 +1022,14 @@ __device__ __forceinline__ void hc_up_t(const void* __restrict__ Wp, const float
                                           const float* __restrict__ x, int xstride, int cols) \
     { mvb_t<NB>(j0, j1, j2, j3, j4, njobs, x, xstride, cols); } \
     extern "C" __global__ void q4_hc_di##NB(const void* __restrict__ Wp, const float* __restrict__ x, \
-                                            float* __restrict__ part, int R, int Wd, int cw, int half) \
-    { hc_di_t<NB>(Wp, x, part, R, Wd, cw, half); } \
+                                            float* __restrict__ part, int R, int Wd, int cw, int half, \
+                                            float* __restrict__ low, float* __restrict__ iw, u32* tick, int lr, int hc) \
+    { hc_di_t<NB>(Wp, x, part, R, Wd, cw, half, low, iw, tick, lr, hc); } \
     extern "C" __global__ void q4_hc_up##NB(const void* __restrict__ Wp, const float* __restrict__ part, \
                                             float* __restrict__ iw, const float* __restrict__ normed, \
                                             float* __restrict__ folded, void* __restrict__ foldedh, \
                                             int hid, int hc, int lr, int R, int nch, int half) \
-    { hc_up_t<NB>(Wp, part, iw, normed, folded, foldedh, hid, hc, lr, R, nch, half); }
+    { PDL_PRO(); hc_up_t<NB>(Wp, part, iw, normed, folded, foldedh, hid, hc, lr, R, nch, half); }
 Q4_SMALL(1) Q4_SMALL(2) Q4_SMALL(3) Q4_SMALL(4) Q4_SMALL(5) Q4_SMALL(6) Q4_SMALL(7) Q4_SMALL(8)
 
 // A unit of the expert kernels: one expert's raw slot and up to Q4_UR token
@@ -957,8 +1037,12 @@ Q4_SMALL(1) Q4_SMALL(2) Q4_SMALL(3) Q4_SMALL(4) Q4_SMALL(5) Q4_SMALL(6) Q4_SMALL
 // from the first free place on).
 #define Q4_UR 4
 // Words of a matrix row a lane reads ahead: gate and up together, down.
+#ifndef Q4_GW
 #define Q4_GW 3
+#endif
+#ifndef Q4_DW
 #define Q4_DW 4
+#endif
 
 // One group of a row against the staged input of a unit row: the nibbles of
 // the 16 bytes minus the bias of 8, times the group's scale.
@@ -984,7 +1068,7 @@ __device__ __forceinline__ float q2_group(const uint2 w, float lc, const float* 
 // memory. A weight is read once for all the rows of the unit.
 extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float* __restrict__ folded,
                                      float* __restrict__ act, int inter, int hid, int rb)
-{
+{ PDL_PRO();
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1072,7 +1156,7 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
 // Gate and up of q2tp experts (2-bit codes, rung 0 = zero): the same as q4_exp_gu with 8-byte groups.
 extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float* __restrict__ folded,
                                      float* __restrict__ act, int inter, int hid, int rb)
-{
+{ PDL_PRO();
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1162,7 +1246,7 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
 // unit, its warps a row at a time.
 extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* __restrict__ act,
                                     float* __restrict__ part, int inter, int hid, int rb, unsigned long long sgu)
-{
+{ PDL_PRO();
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1237,7 +1321,7 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
 extern "C" __global__ void q4_exp_sum(const int* __restrict__ ref, const float* __restrict__ part,
                                       const float* __restrict__ wts, const float* __restrict__ logits,
                                       float* __restrict__ blk, int n, int K, int topk, int hid, int R, int gcol)
-{
+{ PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hid) return;
     const u64 t = i / hid, r = i - t * hid;
@@ -1253,7 +1337,7 @@ extern "C" __global__ void q4_exp_sum(const int* __restrict__ ref, const float* 
 
 // The index of the largest value of each row [vocab] (a block per row), ties to the lower index.
 extern "C" __global__ void q4_argmax(const float* __restrict__ rows, int* __restrict__ ids, int vocab)
-{
+{ PDL_PRO();
     __shared__ float bv[1024];
     __shared__ int bi[1024];
     const float* l = rows + (u64)blockIdx.x * vocab;
@@ -1284,7 +1368,7 @@ extern "C" __global__ void q4_argmax(const float* __restrict__ rows, int* __rest
 // embedding's projection on every stream).
 extern "C" __global__ void q4_mtp_fuse(const float* __restrict__ hs, const float* __restrict__ e,
                                        float* __restrict__ hyper, int hid, int hc)
-{
+{ PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hid * hc) return;
     hyper[i] = hs[i] + e[i % hid];
@@ -1300,7 +1384,7 @@ extern "C" __global__ void q4_mtp_fuse(const float* __restrict__ hs, const float
 extern "C" __global__ void q4_units(const int* __restrict__ picks, const unsigned long long* __restrict__ tbl,
                                     unsigned long long shared, u32* __restrict__ units, int* __restrict__ refs,
                                     int n, int topk, int K, int ne, int umax, int nsh)
-{
+{ PDL_PRO();
     __shared__ int sp[8 * 32];
     __shared__ int cnt[512];
     __shared__ int off[512];
@@ -1379,7 +1463,7 @@ __device__ __forceinline__ void dec_i8x16(const uint4 w, float* wf) {
 // Grid (ceil(inter / rb), tube units); a warp does a row of both matrices.
 extern "C" __global__ void q4_tube_gu(const u32* __restrict__ units, const float* __restrict__ folded,
                                       float* __restrict__ act, int inter, int hid, int rb, int ub)
-{
+{ PDL_PRO();
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1439,7 +1523,7 @@ extern "C" __global__ void q4_tube_gu(const u32* __restrict__ units, const float
 // part [(ub + unit) * Q4_UR + j][hid] = down act for the rows of the tube units. Grid (ceil(hid / rb), tube units).
 extern "C" __global__ void q4_tube_d(const u32* __restrict__ units, const float* __restrict__ act,
                                      float* __restrict__ part, int inter, int hid, int rb, int ub)
-{
+{ PDL_PRO();
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;

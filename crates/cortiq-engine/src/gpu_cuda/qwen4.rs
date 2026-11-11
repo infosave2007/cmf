@@ -56,14 +56,17 @@ macro_rules! qfuncs {
         struct QFuncs { $($name: cs::CUfunction,)* sm: QSmall }
         impl QFuncs {
             fn load(c: &Ctx) -> Res<Self> {
-                let module = compile(include_str!("qwen4.cu"), Vec::new(), c.arch)?;
+                // CMF_QWEN_DEFS="-DQ4_GW=6 -DQ4_DW=8 ...": compile-time constants of the kernels (see the #ifndef blocks of qwen4.cu)
+                let defs: Vec<String> =
+                    std::env::var("CMF_QWEN_DEFS").map(|v| v.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
+                let module = compile(include_str!("qwen4.cu"), defs, c.arch)?;
                 Ok(Self { $($name: func(module, concat!("q4_", stringify!($name)))?,)* sm: QSmall::load(module)? })
             }
         }
     };
 }
 qfuncs!(
-    tile, grms, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_out, norm_rope, idx_reduce,
+    tile, grms, grms_inj, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
     scatter, shared_add, argmax, mtp_fuse, units,
 );
@@ -217,6 +220,12 @@ macro_rules! go {
     ($c:expr, $f:expr, $grid:expr, $block:expr; $($a:expr),* $(,)?) => {
         unsafe { $c.launch($f, $grid, $block as u32, 0, kargs!($($a),*)) }?
     };
+}
+
+/// `CMF_QWEN_DRAFT_VOCAB=<n>`: the draft chooses among the first n token ids (0 = all).
+fn draft_vocab() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_DRAFT_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// Blocks of 256 threads that cover `n` items.
@@ -508,6 +517,7 @@ struct Scratch {
     lowh: Buf,
     /// The small path's chunk sums of the low-rank rows `[chunks][n][r]`.
     hcp: Buf,
+    tick: Buf,
     iw: Buf,
     mix: Buf,
     s1: Buf,
@@ -1574,6 +1584,7 @@ impl Dev {
         // one user of the card at a time: the generic entry points take the same lock
         let _st = c.st.lock().unwrap();
         c.current()?;
+        super::pdl_set(std::env::var("CMF_QWEN_PDL").is_ok_and(|v| v == "1"));
         let q = qf(c)?;
         let (gw, ga) = prec();
         let ga = if ga == Gemm::Half { Gemm::Tf32 } else { ga };
@@ -1729,6 +1740,7 @@ impl Dev {
             lowh: b.buf((n * lr_max * es).max(n.min(SMALL_ROWS) * lr_max * 4))?,
             hcp: b.buf(d.w.div_ceil(tune.cw.min(d.w)) * n.min(SMALL_ROWS) * r_max * 4)?,
             iw: b.buf(n * d.hc * 4)?,
+            tick: b.zeroed(1024)?,
             mix: b.buf(n * mixw * 4)?,
             s1: b.buf(n * s1w * 4)?,
             folded: b.buf(n * d.h * 4)?,
@@ -2086,12 +2098,11 @@ impl Dev {
                 *held += grown;
                 c.resident.fetch_add(grown, std::sync::atomic::Ordering::Relaxed);
             }
-            k.inject(1)?;
-            k.hc_mix(&m.lw.mlp, s.hyper.ptr, 1)?;
+            k.hc_mix_inj(&m.lw.mlp, s.hyper.ptr, 1, true)?;
             k.moe(&m.lw.moe, head, m.li, arena, 1, false)?;
             k.inject(1)?;
             let mut ids: Vec<u32> = Vec::new();
-            k.head_rows(&m.mixer, lm, 1, &mut ids)?;
+            k.head_rows_v(&m.mixer, lm, 1, &mut ids, draft_vocab())?;
             tok = ids.first().copied().unwrap_or(0);
             out.push(tok);
         }
@@ -2358,9 +2369,19 @@ impl Core {
     /// The hyper-connection fold of `n` tokens: `folded` (and its GEMM-typed
     /// copy), the inject weights in `iw`.
     fn hc_mix(&self, hc: &Hc, hyper: u64, n: usize) -> Res<()> {
+        self.hc_mix_inj(hc, hyper, n, false)
+    }
+
+    /// `hc_mix`, with the previous block's `inject` folded into its first launch when `inj` is set.
+    fn hc_mix_inj(&self, hc: &Hc, hyper: u64, n: usize, inj: bool) -> Res<()> {
         let (d, s) = (&self.d, &self.s);
-        go!(self.c, self.q.grms, ((n * d.hc) as u32, 1), 256;
-            hyper, hc.norm.ptr, s.normed.ptr, s.normed_h.ptr, d.h as i32, d.hc as i32, d.eps, self.hi);
+        if inj {
+            go!(self.c, self.q.grms_inj, ((n * d.hc) as u32, 1), 256;
+                hyper, hc.norm.ptr, s.normed.ptr, s.normed_h.ptr, d.h as i32, d.hc as i32, d.eps, self.hi, s.blk.ptr, s.iw.ptr);
+        } else {
+            go!(self.c, self.q.grms, ((n * d.hc) as u32, 1), 256;
+                hyper, hc.norm.ptr, s.normed.ptr, s.normed_h.ptr, d.h as i32, d.hc as i32, d.eps, self.hi);
+        }
         if self.small(n) {
             // two launches, the low-rank values kept in f32: the down rows by
             // column chunks, then their sums and the fold
@@ -2374,6 +2395,8 @@ impl Core {
                 && hc.lr.is_multiple_of(per)
                 && hc.r == hc.lr + d.hc
                 && dsh.max(ush) <= sm.hc_max
+                && nch <= 32
+                && n * hc.r <= s.low.bytes / 4
                 && nch * n * hc.r * 4 <= s.hcp.bytes;
             if fits {
                 unsafe {
@@ -2382,7 +2405,7 @@ impl Core {
                         (hc.r.div_ceil(t.di_t / 32) as u32, nch as u32),
                         t.di_t as u32,
                         dsh,
-                        kargs!(hc.di.ptr, s.normed.ptr, s.hcp.ptr, hc.r as i32, d.w as i32, cw as i32, self.hi),
+                        kargs!(hc.di.ptr, s.normed.ptr, s.hcp.ptr, hc.r as i32, d.w as i32, cw as i32, self.hi, s.low.ptr, s.iw.ptr, s.tick.ptr, hc.lr as i32, d.hc as i32),
                     )
                 }?;
                 unsafe {
@@ -2393,7 +2416,7 @@ impl Core {
                         ush,
                         kargs!(
                             hc.up.ptr,
-                            s.hcp.ptr,
+                            s.low.ptr,
                             s.iw.ptr,
                             s.normed.ptr,
                             s.folded.ptr,
@@ -3069,7 +3092,14 @@ impl Core {
     /// The most likely token of every row of the chunk, `n` of them: the
     /// logits of eight rows at a time go through `s.out` and a block-wide argmax.
     fn head_rows(&self, head: &Hc, lm: &DevMat, n: usize, ids: &mut Vec<u32>) -> Res<()> {
+        self.head_rows_v(head, lm, n, ids, 0)
+    }
+
+    /// `head_rows`, choosing among the first `vp` tokens of the vocabulary when `vp` is set (a draft: the
+    /// frequent ids carry nearly all of its picks, and the head's matvec is a tenth of the bytes).
+    fn head_rows_v(&self, head: &Hc, lm: &DevMat, n: usize, ids: &mut Vec<u32>, vp: usize) -> Res<()> {
         let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
+        let vp = if vp > 0 && vp < d.vocab && lm.kind == 7 && self.small { vp } else { d.vocab };
         self.hc_mix(head, s.hyper.ptr, n)?;
         let mut held: Vec<Buf> = Vec::new();
         let mut t0 = 0;
@@ -3077,7 +3107,9 @@ impl Core {
             let rows = (n - t0).min(SMALL_ROWS);
             let x = s.folded.ptr + (t0 * d.h * 4) as u64;
             if lm.kind == 7 && self.small {
-                self.mvb(&[SOp::q8(lm, s.out.ptr)], x, d.h, d.h, rows)?;
+                let mut op = SOp::q8(lm, s.out.ptr);
+                op.rows = vp;
+                self.mvb(&[op], x, d.h, d.h, rows)?;
             } else {
                 for r in 0..rows {
                     let (mut jobs, mut blk) = (Vec::new(), 0u32);
@@ -3096,7 +3128,7 @@ impl Core {
                     held.push(jb);
                 }
             }
-            go!(c, q.argmax, (rows as u32, 1), 1024; s.out.ptr, s.ids.ptr + (t0 * 4) as u64, d.vocab as i32);
+            go!(c, q.argmax, (rows as u32, 1), 1024; s.out.ptr, s.ids.ptr + (t0 * 4) as u64, vp as i32);
             t0 += rows;
         }
         let mut got = vec![0i32; n];
@@ -3201,18 +3233,27 @@ impl Dev {
             trace.push(("embedding", 0, last(s.emb.ptr, d.h)?));
         }
         k.lap(0)?;
+        // the inject that closes a block is folded into the norm launch that opens the next one
+        // (CMF_QWEN_FUSE_INJ=0 keeps them apart); a layer's PLE reads the hyper state, so it flushes first
+        let fuse = !tr && std::env::var("CMF_QWEN_FUSE_INJ").map(|v| v != "0").unwrap_or(true);
+        let mut pend = false;
         for (li, (lw, layer)) in lws.iter_mut().zip(layers).enumerate() {
             if let Some(p) = &mut lw.ple
                 && let rows = ple(li)
                 && !rows.is_empty()
             {
+                if pend {
+                    k.inject(n)?;
+                    pend = false;
+                }
                 k.ple(p, &rows, n, hold)?;
                 if tr {
                     trace.push(("post_ple", li, last(s.hyper.ptr, d.w)?));
                 }
                 k.lap(1)?;
             }
-            k.hc_mix(&lw.attn, s.hyper.ptr, n)?;
+            k.hc_mix_inj(&lw.attn, s.hyper.ptr, n, pend)?;
+            pend = false;
             if k.range {
                 k.range("attn normed", li, s.normed_h.ptr, n * d.w)?;
                 if !k.small(n) {
@@ -3245,11 +3286,13 @@ impl Dev {
             if tr {
                 trace.push(("attn_out", li, last(s.blk.ptr, d.h)?));
             }
-            k.inject(n)?;
+            if !fuse {
+                k.inject(n)?;
+            }
             if tr {
                 trace.push(("post_attn", li, last(s.hyper.ptr, d.w)?));
             }
-            k.hc_mix(&lw.mlp, s.hyper.ptr, n)?;
+            k.hc_mix_inj(&lw.mlp, s.hyper.ptr, n, fuse)?;
             if k.range {
                 k.range("moe normed", li, s.normed_h.ptr, n * d.w)?;
                 if !k.small(n) {
@@ -3265,10 +3308,17 @@ impl Dev {
             if tr {
                 trace.push(("moe_out", li, last(s.blk.ptr, d.h)?));
             }
-            k.inject(n)?;
+            if fuse {
+                pend = true;
+            } else {
+                k.inject(n)?;
+            }
             if tr {
                 trace.push(("post_moe", li, last(s.hyper.ptr, d.w)?));
             }
+        }
+        if pend {
+            k.inject(n)?;
         }
         *launch_ms = t_run.elapsed().as_secs_f64() * 1e3;
         match out {

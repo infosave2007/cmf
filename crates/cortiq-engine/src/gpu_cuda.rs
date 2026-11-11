@@ -618,7 +618,19 @@ fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
     let f = unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
         .map_err(|e| format!("kernel {name}: {e}"))?;
     KT_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(f as usize, name.to_string());
+    if name.starts_with("q4_") {
+        PDL_FUNCS.lock().unwrap().get_or_insert_with(std::collections::HashSet::new).insert(f as usize);
+    }
     Ok(f)
+}
+
+/// Programmatic dependent launch (`CMF_QWEN_PDL=1`): the kernels of the qwen4 module (each starts with
+/// `griddepcontrol.wait`) are launched so that one may begin to schedule while its predecessor drains.
+static PDL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PDL_FUNCS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(crate) fn pdl_set(on: bool) {
+    PDL_ON.store(on, Ordering::SeqCst);
 }
 
 /// Kernel timing (`CMF_QWEN_NCU=<round>` of the qwen4 path): while on, every launch is bracketed by two
@@ -862,17 +874,38 @@ impl Ctx {
         } else {
             None
         };
-        let r = unsafe {
-            cu::launch_kernel(
-                f,
-                (grid.0.max(1), grid.1.max(1), 1),
-                (block, 1, 1),
-                shared as u32,
-                self.stream,
-                params,
-            )
-        }
-        .map_err(derr);
+        let pdl = PDL_ON.load(Ordering::Relaxed)
+            && PDL_FUNCS.lock().unwrap().as_ref().is_some_and(|set| set.contains(&(f as usize)));
+        let r = if pdl {
+            let mut attr: cs::CUlaunchAttribute = unsafe { std::mem::zeroed() };
+            attr.id = cs::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+            attr.value.programmaticStreamSerializationAllowed = 1;
+            let cfg = cs::CUlaunchConfig {
+                gridDimX: grid.0.max(1),
+                gridDimY: grid.1.max(1),
+                gridDimZ: 1,
+                blockDimX: block,
+                blockDimY: 1,
+                blockDimZ: 1,
+                sharedMemBytes: shared as u32,
+                hStream: self.stream,
+                attrs: &mut attr,
+                numAttrs: 1,
+            };
+            unsafe { cs::cuLaunchKernelEx(&cfg, f, params.as_mut_ptr(), std::ptr::null_mut()) }.result().map_err(derr)
+        } else {
+            unsafe {
+                cu::launch_kernel(
+                    f,
+                    (grid.0.max(1), grid.1.max(1), 1),
+                    (block, 1, 1),
+                    shared as u32,
+                    self.stream,
+                    params,
+                )
+            }
+            .map_err(derr)
+        };
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, self.stream) };
