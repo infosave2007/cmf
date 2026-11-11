@@ -13,6 +13,8 @@ typedef unsigned short u16;
 typedef unsigned char u8;
 
 #define DPL (HD / 32)
+// rows of a call one gate block of `hy_gdn_front` takes
+#define GR 4
 #define INF __int_as_float(0x7f800000)
 #define FULL 0xffffffffu
 
@@ -191,6 +193,91 @@ extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float
     sp[dv] = s1;
     sp[2 * dv] = s2;
     sp[3 * dv] = s3;
+}
+
+// The delta-rule step with a lane a state COLUMN (value head h, value dim
+// j) for dk = 128: a block of 4 warps a (head, 32 columns), warp w the key
+// rows [32 w, 32 w + 32), so a warp reads 32 consecutive floats of a key
+// row. kv and o are summed in a fixed order (two halves in the warp, then
+// the four warps), the same in the scan and in the restore: a restored state
+// is the bits the plain decode would hold. Rows `n` from `Sin` into `Sout`
+// (the same buffer for a scan); `ssave` (if given) gets the state before
+// the rows, `o` (if given) the outputs.
+__device__ __forceinline__ void gdn_scan4_body(const float* __restrict__ cq, const float* __restrict__ gb,
+                                               const float* Sin, float* Sout, float* __restrict__ o, int n,
+                                               int c_dim, int nv, int nk, int dv, float* __restrict__ ssave)
+{
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int wpr = dv >> 5;
+    const int h = blockIdx.x / wpr, j = (blockIdx.x - h * wpr) * 32 + lane;
+    const int ko = h / (nv / nk), kd = nk * 128;
+    const size_t base = ((size_t)h * 128 + w * 32) * dv + j;
+    float s[32];
+#pragma unroll
+    for (int i = 0; i < 32; i++) s[i] = Sin[base + (size_t)i * dv];
+    if (ssave) {
+#pragma unroll
+        for (int i = 0; i < 32; i++) ssave[base + (size_t)i * dv] = s[i];
+    }
+    __shared__ float ks[128], qs[128];
+    __shared__ float part[2][4][32];
+    for (int t = 0; t < n; t++) {
+        const float* row = cq + (size_t)t * c_dim;
+        if (w == 0) *(float4*)(ks + lane * 4) = *(const float4*)(row + kd + (size_t)ko * 128 + lane * 4);
+        else if (w == 1) *(float4*)(qs + lane * 4) = *(const float4*)(row + (size_t)ko * 128 + lane * 4);
+        __syncthreads();
+        const float g = gb[(size_t)t * 2 * nv + h], beta = gb[(size_t)t * 2 * nv + nv + h];
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; i += 2) {
+            a0 = fmaf(s[i], ks[w * 32 + i], a0);
+            a1 = fmaf(s[i + 1], ks[w * 32 + i + 1], a1);
+        }
+        part[0][w][lane] = __fadd_rn(a0, a1);
+        __syncthreads();
+        const float kv = __fadd_rn(__fadd_rn(__fadd_rn(part[0][0][lane], part[0][1][lane]), part[0][2][lane]), part[0][3][lane]);
+        const float delta = __fmul_rn(__fsub_rn(row[2 * kd + (size_t)h * dv + j], __fmul_rn(g, kv)), beta);
+        float b0 = 0.0f, b1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; i += 2) {
+            s[i] = fmaf(ks[w * 32 + i], delta, __fmul_rn(g, s[i]));
+            s[i + 1] = fmaf(ks[w * 32 + i + 1], delta, __fmul_rn(g, s[i + 1]));
+            b0 = fmaf(qs[w * 32 + i], s[i], b0);
+            b1 = fmaf(qs[w * 32 + i + 1], s[i + 1], b1);
+        }
+        part[1][w][lane] = __fadd_rn(b0, b1);
+        __syncthreads();
+        if (w == 0 && o)
+            o[(size_t)t * nv * dv + (size_t)h * dv + j] =
+                __fadd_rn(__fadd_rn(__fadd_rn(part[1][0][lane], part[1][1][lane]), part[1][2][lane]), part[1][3][lane]);
+        // ks / qs / part are written again only past this barrier
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 32; i++) Sout[base + (size_t)i * dv] = s[i];
+}
+
+// The small path's scan for dk = 128 (`gdn_scan4_body`), 128 threads a
+// block; blocks past the state's move the conv ring as `hy_gdn_scan`'s do.
+extern "C" __global__ void __launch_bounds__(128) hy_gdn_scan4(const float* __restrict__ cq, const float* __restrict__ gb,
+                                                              float* S, float* __restrict__ o, int n, int c_dim, int nv,
+                                                              int nk, int dv, float* __restrict__ ring,
+                                                              const float* __restrict__ qkv, int qstride, int kk,
+                                                              float* __restrict__ ssave)
+{
+    const int sblocks = nv * (dv >> 5);
+    if ((int)blockIdx.x >= sblocks) {
+        const int c = ((int)blockIdx.x - sblocks) * blockDim.x + threadIdx.x;
+        if (!ring || c >= c_dim || n <= 0) return;
+        float nr[8];
+        for (int j = 0; j < kk - 1 && j < 8; j++) {
+            const int src = n - (kk - 1) + j;
+            nr[j] = src >= 0 ? qkv[(u64)src * qstride + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
+        }
+        for (int j = 0; j < kk - 1 && j < 8; j++) ring[(u64)j * c_dim + c] = nr[j];
+        return;
+    }
+    gdn_scan4_body(cq, gb, S, S, o, n, c_dim, nv, nk, dv, ssave);
 }
 
 // ------------------------------------------------------------- attention
@@ -698,38 +785,49 @@ extern "C" __global__ void hy_gdn_front(const float* __restrict__ qkv, int qstri
     const int NW = blockDim.x >> 5;
     const int units = c_dim / dk;
     if (u >= units) {
-        // the gates of head h = u - units for row t: the a and b projections
-        // of the normed row (f32 weights), then
-        // gb[t][h] = exp(-exp(a_log) softplus(a + dt_bias)), gb[t][nv + h] = sigmoid(b)
-        const int h = u - units;
-        const float* ra = wa + (size_t)h * hidden;
-        const float* rb = wb + (size_t)h * hidden;
-        const float* x = xn + (size_t)t * hidden;
-        float sa = 0.0f, sb = 0.0f;
-        for (int c = tid; c < hidden; c += blockDim.x) {
-            const float xv = x[c];
-            sa = fmaf(ra[c], xv, sa);
-            sb = fmaf(rb[c], xv, sb);
+        // the gates: block (units + r, y) is projection row r (a rows, then
+        // b rows) for the call's rows [GR y, GR y + GR), its weights read in
+        // float4 (hidden a multiple of 4); blocks past the rows have no work.
+        //   gb[t][h] = exp(-exp(a_log) softplus(a + dt_bias)), gb[t][nv + h] = sigmoid(b)
+        const int r0 = t * GR;
+        if (r0 >= n) return;
+        const int nr = min(GR, n - r0);
+        __shared__ float gred[GR][8];
+        const int r = u - units;
+        const bool isb = r >= nv;
+        const int h = isb ? r - nv : r;
+        const float4* w4 = (const float4*)((isb ? wb : wa) + (size_t)h * hidden);
+        float acc[GR];
+#pragma unroll
+        for (int i = 0; i < GR; i++) acc[i] = 0.0f;
+        for (int c = tid; c < (hidden >> 2); c += blockDim.x) {
+            const float4 w = w4[c];
+#pragma unroll
+            for (int i = 0; i < GR; i++) {
+                if (i >= nr) break;
+                const float4 x = ((const float4*)(xn + (size_t)(r0 + i) * hidden))[c];
+                acc[i] = fmaf(w.w, x.w, fmaf(w.z, x.z, fmaf(w.y, x.y, fmaf(w.x, x.x, acc[i]))));
+            }
         }
-        for (int o = 16; o > 0; o >>= 1) {
-            sa = __fadd_rn(sa, __shfl_xor_sync(FULL, sa, o));
-            sb = __fadd_rn(sb, __shfl_xor_sync(FULL, sb, o));
-        }
-        if (lane == 0) {
-            red[0][warp] = sa;
-            red[1][warp] = sb;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            if (i >= nr) break;
+            float v = acc[i];
+            for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(FULL, v, o));
+            if (lane == 0 && warp < 8) gred[i][warp] = v;
         }
         __syncthreads();
-        if (tid == 0) {
-            float a = 0.0f, b = 0.0f;
-            for (int w = 0; w < NW; w++) {
-                a = __fadd_rn(a, red[0][w]);
-                b = __fadd_rn(b, red[1][w]);
+        if (tid < nr) {
+            float v = 0.0f;
+            for (int w = 0; w < NW && w < 8; w++) v = __fadd_rn(v, gred[tid][w]);
+            const size_t row = (size_t)(r0 + tid) * 2 * nv;
+            if (isb) {
+                gb[row + nv + h] = 1.0f / (1.0f + expf(-v));
+            } else {
+                const float x2 = __fadd_rn(v, dt_bias[h]);
+                const float sp = x2 > 20.0f ? x2 : log1pf(expf(x2));
+                gb[row + h] = expf(-__fmul_rn(expf(a_log[h]), sp));
             }
-            const float x2 = __fadd_rn(a, dt_bias[h]);
-            const float sp = x2 > 20.0f ? x2 : log1pf(expf(x2));
-            gb[(size_t)t * 2 * nv + h] = expf(-__fmul_rn(expf(a_log[h]), sp));
-            gb[(size_t)t * 2 * nv + nv + h] = 1.0f / (1.0f + expf(-b));
         }
         return;
     }
@@ -923,6 +1021,16 @@ extern "C" __global__ void hy_gdn_restore_scan(const u64* __restrict__ tab, int 
     wp[dv] = s1;
     wp[2 * dv] = s2;
     wp[3 * dv] = s3;
+}
+
+// `hy_gdn_restore_scan` for layers the small path scanned with
+// `hy_gdn_scan4`: the same step, so the replayed rows give its bits.
+extern "C" __global__ void __launch_bounds__(128) hy_gdn_restore_scan4(const u64* __restrict__ tab, int keep, int c_dim,
+                                                                      int nv, int nk, int dv)
+{
+    const u64* tb = tab + (size_t)blockIdx.y * 7;
+    gdn_scan4_body((const float*)tb[2], (const float*)tb[3], (const float*)tb[0], (float*)tb[1], nullptr, keep, c_dim,
+                   nv, nk, dv, nullptr);
 }
 
 extern "C" __global__ void hy_gdn_restore_ring(const u64* __restrict__ tab, int keep, int qstride, int c_dim, int kk)

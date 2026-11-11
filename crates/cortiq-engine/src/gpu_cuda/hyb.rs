@@ -140,6 +140,8 @@ pub(super) struct HFuncs {
     gb32: cs::CUfunction,
     rs_scan: cs::CUfunction,
     rs_ring: cs::CUfunction,
+    scan4: cs::CUfunction,
+    rs_scan4: cs::CUfunction,
     silu_pair: cs::CUfunction,
     repack: cs::CUfunction,
     qk: cs::CUfunction,
@@ -183,6 +185,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         gb32: func(module, "hy_gdn_gb32")?,
         rs_scan: func(module, "hy_gdn_restore_scan")?,
         rs_ring: func(module, "hy_gdn_restore_ring")?,
+        scan4: func(module, "hy_gdn_scan4")?,
+        rs_scan4: func(module, "hy_gdn_restore_scan4")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         repack: func(module, "hy_repack")?,
         qk: func(module, "hy_qk")?,
@@ -1626,8 +1630,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                 unsafe {
                     g.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 1, &mut t0)?;
+                    // dk = 128 (every Qwen3.5-family file): the column scan,
+                    // which keeps the tape's state copy itself
+                    let col_scan = g.dk == 128 && g.dv % 32 == 0;
                     if tape {
-                        cu::memcpy_dtod_async(s_save, gs_s, s_bytes, c.stream).map_err(derr)?;
+                        if !col_scan {
+                            cu::memcpy_dtod_async(s_save, gs_s, s_bytes, c.stream).map_err(derr)?;
+                        }
                         if r_bytes > 0 {
                             cu::memcpy_dtod_async(ring_save, gs_ring, r_bytes, c.stream).map_err(derr)?;
                         }
@@ -1638,22 +1647,34 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                     let units = (g.cdim / g.dk) as u32;
                     c.launch(
                         fx.front,
-                        (units + g.nv as u32, n as u32),
+                        (units + 2 * g.nv as u32, n as u32),
                         g.dk.max(64) as u32,
                         0,
                         kargs!(plan.qkv.ptr, qs_i, gs_ring, g.taps.ptr, t_cq, n_i, cd_i, kk_i, nk_i, dk_i, plan.xn.ptr, hid_i, g.a.w.ptr, g.b.w.ptr, g.a_log.ptr, g.dt_bias.ptr, t_gb, nv_i),
                     )?;
                     let cols = g.nv * g.dv;
                     // the scan, with blocks after it that move the conv ring
-                    let ring_blocks = if g.kk > 1 { (g.cdim as u32).div_ceil(256) } else { 0 };
                     let ring_p = if g.kk > 1 { gs_ring } else { 0 };
-                    c.launch(
-                        fx.scan,
-                        ((cols as u32).div_ceil(8) + ring_blocks, 1),
-                        256,
-                        0,
-                        kargs!(t_cq, t_gb, gs_s, plan.o.ptr, n_i, cd_i, nv_i, nk_i, dk_i, dv_i, ring_p, plan.qkv.ptr, qs_i, kk_i),
-                    )?;
+                    if col_scan {
+                        let ring_blocks = if g.kk > 1 { (g.cdim as u32).div_ceil(128) } else { 0 };
+                        let save = if tape { s_save } else { 0 };
+                        c.launch(
+                            fx.scan4,
+                            ((g.nv * g.dv / 32) as u32 + ring_blocks, 1),
+                            128,
+                            0,
+                            kargs!(t_cq, t_gb, gs_s, plan.o.ptr, n_i, cd_i, nv_i, nk_i, dv_i, ring_p, plan.qkv.ptr, qs_i, kk_i, save),
+                        )?;
+                    } else {
+                        let ring_blocks = if g.kk > 1 { (g.cdim as u32).div_ceil(256) } else { 0 };
+                        c.launch(
+                            fx.scan,
+                            ((cols as u32).div_ceil(8) + ring_blocks, 1),
+                            256,
+                            0,
+                            kargs!(t_cq, t_gb, gs_s, plan.o.ptr, n_i, cd_i, nv_i, nk_i, dk_i, dv_i, ring_p, plan.qkv.ptr, qs_i, kk_i),
+                        )?;
+                    }
                     let zs_i = plan.vdmax as i32;
                     let sig0 = 0i32;
                     c.launch(
@@ -2397,7 +2418,11 @@ pub(super) fn spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected: u
         let (keep_i, cd_i, nv_i, nk_i, dk_i, dv_i, kk_i, qs_i) =
             (keep as i32, cdim as i32, nv as i32, nk as i32, dk as i32, dv as i32, kk as i32, tstride as i32);
         unsafe {
-            c.launch_3d(fx.rs_scan, (((nv * dv) as u32).div_ceil(8), nl, 1), 256, 0, kargs!(tab, keep_i, cd_i, nv_i, nk_i, dk_i, dv_i))?;
+            if dk == 128 && dv % 32 == 0 {
+                c.launch_3d(fx.rs_scan4, ((nv * dv / 32) as u32, nl, 1), 128, 0, kargs!(tab, keep_i, cd_i, nv_i, nk_i, dv_i))?;
+            } else {
+                c.launch_3d(fx.rs_scan, (((nv * dv) as u32).div_ceil(8), nl, 1), 256, 0, kargs!(tab, keep_i, cd_i, nv_i, nk_i, dk_i, dv_i))?;
+            }
             if kk > 1 {
                 c.launch_3d(fx.rs_ring, ((cdim as u32).div_ceil(256), nl, 1), 256, 0, kargs!(tab, keep_i, qs_i, cd_i, kk_i))?;
             }
