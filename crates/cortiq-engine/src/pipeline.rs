@@ -473,6 +473,15 @@ pub struct Pipeline {
     pub(crate) o1_turbo: Option<O1Turbo>,
     /// Over a far field the draft head starts at this prompt row, and counts from it.
     mtp_pos_base: usize,
+    /// The CUDA hybrid arm's chat snapshot: the prompt ids before the last
+    /// turn's assistant header, whose GDN states the card keeps a copy of
+    /// (`gpu::gdn_snapshot`). The next turn that starts with them goes back
+    /// there and reads only what follows.
+    gdn_snap: Option<Vec<u32>>,
+    /// The draft head's base position when the last turn warmed it over
+    /// its whole prompt on the batched path (None otherwise): its rows from
+    /// there to that prompt's end are prompt rows a chat snapshot keeps.
+    mtp_warm_base: Option<usize>,
     /// Bumped once per collecting→sealed transition — the GPU state mirror
     /// re-uploads when it sees a new epoch (each fresh sealed state).
     o1_epoch: u64,
@@ -2593,6 +2602,9 @@ impl Pipeline {
             crate::gpu::dory_reset(self.graph_kv_id);
         }
         crate::gpu::graph_kv_reset(self.graph_kv_id);
+        // the card's GDN snapshot went with the sequence's states
+        self.gdn_snap = None;
+        self.mtp_warm_base = None;
         // MTP is detached from `self` for the duration of generation, so its
         // device mirror is not covered by the trunk reset above.  Reset the
         // derived id as well: a failed/aborted warm-up must never leave a
@@ -4880,6 +4892,8 @@ impl Pipeline {
             o1_cfg: None,
             o1_turbo: None,
             mtp_pos_base: 0,
+            gdn_snap: None,
+            mtp_warm_base: None,
             o1_epoch: 0,
             o1_flags: Vec::new(),
             trace: false,
@@ -5169,6 +5183,45 @@ impl Pipeline {
     pub(crate) fn invalidate_for_weight_change(&mut self) {
         self.clear_sequence_state();
         self.embryo_graph = None;
+    }
+
+    /// The CUDA hybrid arm keeps a chat snapshot (GDN states copied on the
+    /// card): a GDN stack with exact attention, no far field, reuse on.
+    fn gdn_snap_ok(&self) -> bool {
+        crate::gpu::cuda_active()
+            && self.gdn_cfg.is_some()
+            && self.o1_cfg.is_none()
+            && self.dory.is_none()
+            && self.dsv41.is_none()
+            && self.qwen4_exp.is_none()
+            && std::env::var("CMF_KV_REUSE").as_deref() != Ok("0")
+    }
+
+    /// Where this prompt's snapshot goes: its last `<|im_start|>`, the
+    /// assistant header the next turn renders differently (a previous
+    /// answer loses its think block there), past `from` and before the
+    /// prompt's last row.
+    fn gdn_snap_target(&self, input_ids: &[u32], from: usize) -> Option<usize> {
+        if !self.gdn_snap_ok() {
+            return None;
+        }
+        let id = self.tokenizer.token_to_id("<|im_start|>")?;
+        let s = input_ids.iter().rposition(|&t| t == id)?;
+        (s > from && s + 1 < input_ids.len()).then_some(s)
+    }
+
+    /// Positions a turn takes back from the chat snapshot (0: none). The
+    /// card's states go back to it here, all layers or none.
+    fn gdn_snap_reuse(&mut self, input_ids: &[u32]) -> usize {
+        let n = match &self.gdn_snap {
+            Some(s) if !s.is_empty() && s.len() < input_ids.len() && input_ids[..s.len()] == s[..] => s.len(),
+            _ => return 0,
+        };
+        if !self.gdn_snap_ok() || !crate::gpu::gdn_snapshot_restore(self.graph_kv_id, n) {
+            self.gdn_snap = None;
+            return 0;
+        }
+        n
     }
 
     /// Prompt positions the cache already holds when `input_ids`
@@ -6371,6 +6424,9 @@ impl Pipeline {
         // such a mask — drop it here rather than pay 5x for a no-op.
         self.o1_turbo_gate(input_ids.len());
         self.mtp_pos_base = 0;
+        let prev_mtp_warm = self.mtp_warm_base.take();
+        // the draft head's rows a chat snapshot keeps (counted from its base)
+        let mut mtp_keep: Option<usize> = None;
         let task_mask = self.drop_open_mask(task_mask);
         // Unlimited-OCR: the page coordinates of this prompt.
         if self.dash.is_some() {
@@ -6419,6 +6475,40 @@ impl Pipeline {
         // writes only its mirror): hand them to the host, or start fresh.
         if reuse_from > 0 && !self.prepare_kv_reuse(reuse_from) {
             reuse_from = 0;
+        }
+        // The CUDA hybrid arm: a chat turn that starts with the ids before
+        // the last turn's assistant header goes back to the GDN snapshot the
+        // card took there; the attention mirrors rewind with it. The rows
+        // before it are prompt rows no decode wrote, so this is exact after
+        // any speculative round, and the draft head reads from there on.
+        if reuse_from == 0 && prompt_rows.is_none() && task_mask.is_none() {
+            let n = self.gdn_snap_reuse(input_ids);
+            if n > 0 {
+                reuse_from = n;
+                self.kv_history.truncate(n);
+                for l in &mut self.kv_cache.layers {
+                    let d = l.pos_len().saturating_sub(n);
+                    if d > 0 {
+                        l.truncate_last(d);
+                    }
+                }
+                self.graph_logits = None;
+                // The draft head's rows before `n` are the last prompt's
+                // rows when it was warmed over that whole prompt: they stay,
+                // and it reads the conversation, not just the new turn.
+                if self.mtp.is_some() {
+                    match prev_mtp_warm {
+                        Some(b) if b <= n => {
+                            self.mtp_pos_base = b;
+                            mtp_keep = Some(n - b);
+                        }
+                        _ => self.mtp_pos_base = n,
+                    }
+                }
+                if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                    eprintln!("kv-reuse: GDN snapshot at {n} of {} prompt positions", input_ids.len());
+                }
+            }
         }
         // A diverging turn (`rollback_prefix_len`): drop every row past the
         // common prefix, so the tail prefill appends at `reuse_from`.
@@ -6811,9 +6901,24 @@ impl Pipeline {
             );
         }
         if let Some(m) = &mut mtp {
-            m.kv.clear();
-            // The MTP block's own device mirror starts over with its cache.
-            crate::gpu::graph_kv_reset(self.mtp_kv_id());
+            let kept = mtp_keep.is_some_and(|rows| {
+                crate::gpu::graph_kv_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, rows)
+            });
+            if kept {
+                let rows = mtp_keep.unwrap_or(0);
+                let d = m.kv.pos_len().saturating_sub(rows);
+                if d > 0 {
+                    m.kv.truncate_last(d);
+                }
+            } else {
+                m.kv.clear();
+                // The MTP block's own device mirror starts over with its cache.
+                crate::gpu::graph_kv_reset(self.mtp_kv_id());
+                if mtp_keep.is_some() {
+                    // nothing kept: the head reads from the snapshot on
+                    self.mtp_pos_base = reuse_from;
+                }
+            }
             self.mtp_graph_mode = None;
         }
         // MiMo-V2's draft stack: greedy rounds (draft K with the chained
@@ -7584,6 +7689,9 @@ impl Pipeline {
             if o1_batch_ready && mtp.is_some() {
                 self.mtp_pos_base = tail_from.max(pos);
             }
+            // a chunk ends at the chat snapshot's row, the card copies the
+            // GDN states there before the next chunk runs
+            let snap_at = if o1_arch.is_none() && !o1_batch_ready { self.gdn_snap_target(input_ids, pos) } else { None };
             while pos < input_ids.len() {
                 // The prompt's last rows read the rows chosen just before them.
                 if pos >= tail_from {
@@ -7596,7 +7704,10 @@ impl Pipeline {
                     }
                 }
                 let stop = if o1_arch.is_some() { tail_from } else { input_ids.len() };
-                let end = (pos + chunk).min(stop);
+                let end = match snap_at {
+                    Some(s) if pos < s => (pos + chunk).min(stop).min(s),
+                    _ => (pos + chunk).min(stop),
+                };
                 let bk = end - pos;
                 let mut hiddens = vec![0f32; bk * hs];
                 for (j, &id) in input_ids[pos..end].iter().enumerate() {
@@ -7738,6 +7849,9 @@ impl Pipeline {
                     }
                     hidden.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                     pos = end;
+                    if snap_at == Some(end) {
+                        self.gdn_snap = crate::gpu::gdn_snapshot(self.graph_kv_id, end).then(|| input_ids[..end].to_vec());
+                    }
                 } else if outcome == crate::gpu::BatchGraphOutcome::Failed {
                     // A failed batch may have advanced a device recurrent
                     // state (ordinary GDN or sealed O(1)). A CPU fallback
@@ -7752,6 +7866,9 @@ impl Pipeline {
                 } else {
                     break; // unsupported → per-position graph handles the rest
                 }
+            }
+            if mtp_batch_prefill && mtp.is_some() && pos == input_ids.len() {
+                self.mtp_warm_base = Some(self.mtp_pos_base);
             }
             #[cfg(target_os = "macos")]
             if std::env::var("CMF_PREFILL_PROF").is_ok() {

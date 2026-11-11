@@ -726,6 +726,10 @@ struct GdnState {
     ring_save: Buf,
     /// (first position, rows) of the last window that kept a tape.
     tape: Option<(usize, usize)>,
+    /// A copy of `[s | ring]` at a prompt position (`gdn_snapshot`): the
+    /// next turn of a chat goes back there instead of reading the
+    /// conversation again.
+    snap: Option<(usize, Buf, Buf)>,
 }
 
 #[derive(Default)]
@@ -1319,6 +1323,7 @@ fn admit(
                         s_save: mk(s_n)?,
                         ring_save: mk(ring_n)?,
                         tape: None,
+                        snap: None,
                     })
                 };
                 let gs = alloc().map_err(soft)?;
@@ -2451,9 +2456,90 @@ pub(super) fn reset(c: &Ctx, st: &mut State, kv_id: u64) {
             let ring_n = (kk - 1) * cdim;
             let s_n = nv * dk * dv;
             c.kv_bytes.fetch_sub(((s_n * 2 + ring_n * 2 + NMAX * (2 * cdim + 2 * nv)) * 4) as u64, Ordering::Relaxed);
+            if g.snap.is_some() {
+                c.kv_bytes.fetch_sub(((s_n + ring_n.max(1)) * 4) as u64, Ordering::Relaxed);
+            }
         }
         id != kv_id
     });
+}
+
+/// Copy every GDN state of the sequence, all at prompt position `pos`, to
+/// its snapshot (a device-to-device copy on the stream, after the prompt
+/// rows before it). False when a layer is elsewhere or none is resident.
+pub(super) fn gdn_snapshot(kv_id: u64, pos: usize) -> bool {
+    let Some(c) = super::ctx() else { return false };
+    let mut st = c.st.lock().unwrap();
+    if c.current().is_err() {
+        return false;
+    }
+    let run = |st: &mut State| -> Res<bool> {
+        let keys: Vec<(u64, usize)> = st.hyb.gdn.keys().filter(|k| k.0 == kv_id).copied().collect();
+        if keys.is_empty() || keys.iter().any(|k| st.hyb.gdn[k].next_pos != pos) {
+            return Ok(false);
+        }
+        for k in keys {
+            let gs = st.hyb.gdn.get_mut(&k).unwrap();
+            let (nv, nk, dk, dv, kk) = gs.dims;
+            let ring_n = (kk - 1) * (2 * nk * dk + nv * dv);
+            let s_n = nv * dk * dv;
+            if gs.snap.is_none() {
+                let (bs, br) = (Buf::new(s_n * 4)?, Buf::new(ring_n.max(1) * 4)?);
+                c.kv_bytes.fetch_add(((s_n + ring_n.max(1)) * 4) as u64, Ordering::Relaxed);
+                gs.snap = Some((0, bs, br));
+            }
+            let (at, bs, br) = gs.snap.as_mut().unwrap();
+            unsafe {
+                cu::memcpy_dtod_async(bs.ptr, gs.s.ptr, s_n * 4, c.stream).map_err(derr)?;
+                if ring_n > 0 {
+                    cu::memcpy_dtod_async(br.ptr, gs.ring.ptr, ring_n * 4, c.stream).map_err(derr)?;
+                }
+            }
+            *at = pos;
+        }
+        Ok(true)
+    };
+    run(&mut st).unwrap_or_else(|e| {
+        tracing::warn!("cuda GDN snapshot failed: {e}");
+        false
+    })
+}
+
+/// Every GDN state of the sequence back to its snapshot at `pos`; the
+/// attention mirrors rewind themselves when the next call starts there.
+/// False (nothing changed) unless every layer holds a snapshot at `pos`.
+pub(super) fn gdn_snapshot_restore(kv_id: u64, pos: usize) -> bool {
+    let Some(c) = super::ctx() else { return false };
+    let mut st = c.st.lock().unwrap();
+    if c.current().is_err() {
+        return false;
+    }
+    let run = |st: &mut State| -> Res<bool> {
+        let keys: Vec<(u64, usize)> = st.hyb.gdn.keys().filter(|k| k.0 == kv_id).copied().collect();
+        if keys.is_empty() || keys.iter().any(|k| st.hyb.gdn[k].snap.as_ref().is_none_or(|s| s.0 != pos)) {
+            return Ok(false);
+        }
+        for k in keys {
+            let gs = st.hyb.gdn.get_mut(&k).unwrap();
+            let (nv, nk, dk, dv, kk) = gs.dims;
+            let ring_n = (kk - 1) * (2 * nk * dk + nv * dv);
+            let s_n = nv * dk * dv;
+            let (_, bs, br) = gs.snap.as_ref().unwrap();
+            unsafe {
+                cu::memcpy_dtod_async(gs.s.ptr, bs.ptr, s_n * 4, c.stream).map_err(derr)?;
+                if ring_n > 0 {
+                    cu::memcpy_dtod_async(gs.ring.ptr, br.ptr, ring_n * 4, c.stream).map_err(derr)?;
+                }
+            }
+            gs.next_pos = pos;
+            gs.tape = None;
+        }
+        Ok(true)
+    };
+    run(&mut st).unwrap_or_else(|e| {
+        tracing::warn!("cuda GDN snapshot restore failed: {e}");
+        false
+    })
 }
 
 /// y [n][rows] = W x [n][cols] on the card for a q4tp graph weight (the

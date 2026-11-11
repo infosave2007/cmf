@@ -2558,6 +2558,16 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
     hyb::spec_restore(kv_id, slot, base_pos, expected_layers)
 }
 
+/// Snapshot every GDN state of the sequence at prompt position `pos`.
+pub fn gdn_snapshot(kv_id: u64, pos: usize) -> bool {
+    hyb::gdn_snapshot(kv_id, pos)
+}
+
+/// Every GDN state of the sequence back to its snapshot at `pos`.
+pub fn gdn_snapshot_restore(kv_id: u64, pos: usize) -> bool {
+    hyb::gdn_snapshot_restore(kv_id, pos)
+}
+
 /// A recurrent state of this sequence's layer lives on the card.
 pub fn state_resident(kv_id: u64, layer: usize) -> bool {
     let Some(c) = ctx() else { return false };

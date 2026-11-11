@@ -2550,6 +2550,29 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
     }
 }
 
+/// CUDA hybrid arm: copy every GDN state of the sequence, all at prompt
+/// position `pos`, to a snapshot on the card (a chat's next turn goes back
+/// there). False on any other backend or when a layer is elsewhere.
+pub fn gdn_snapshot(kv_id: u64, pos: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_snapshot(kv_id, pos);
+    }
+    let _ = (kv_id, pos);
+    false
+}
+
+/// CUDA hybrid arm: every GDN state of the sequence back to its snapshot at
+/// `pos`, all or nothing. False leaves the states untouched.
+pub fn gdn_snapshot_restore(kv_id: u64, pos: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::gdn_snapshot_restore(kv_id, pos);
+    }
+    let _ = (kv_id, pos);
+    false
+}
+
 /// Re-point one exact-attention device mirror after a speculative round has
 /// discarded unaccepted rows. The rows beyond `stored` remain allocated and
 /// are overwritten by the next append; only the logical cursor moves. This
