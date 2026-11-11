@@ -133,7 +133,8 @@ pub fn run(
         Some(list) => {
             let v: Vec<f32> = list.split(',').map(|x| x.trim().parse::<f32>()).collect::<Result<_, _>>().context("--prices")?;
             ensure!(v.len() == 9, "--prices: nine numbers (seven rounds, the block, a chain draft), {} given", v.len());
-            ensure!(!write, "--prices measures another device: add --dry-run, the router is fitted at this one's prices");
+            // a router fitted at another device's prices labels each round by
+            // what it lands at those prices (the card it will run on)
             Some((v[..7].try_into().unwrap(), v[7], v[8]))
         }
         None => None,

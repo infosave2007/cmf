@@ -2553,6 +2553,38 @@ pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize,
 }
 
 thread_local! {
+    /// A DFlash drafter's taps (`layer_taps_arm`): the layers asked for, and
+    /// what the next graph call of this thread kept, `[slot][row][hidden]`.
+    static LAYER_TAPS: std::cell::RefCell<(Vec<usize>, Option<Vec<f32>>)> = const { std::cell::RefCell::new((Vec::new(), None)) };
+}
+
+/// Ask the next graph call of this thread to keep the residual stream after
+/// each of `layers` (absolute indices); an empty list disarms.
+pub fn layer_taps_arm(layers: &[usize]) {
+    LAYER_TAPS.with(|t| *t.borrow_mut() = (layers.to_vec(), None));
+}
+
+/// What the armed call kept; disarms. False when it kept nothing.
+pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
+    let (_, got) = LAYER_TAPS.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    match got {
+        Some(v) => {
+            *out = v;
+            true
+        }
+        None => false,
+    }
+}
+
+fn taps_wanted() -> Vec<usize> {
+    LAYER_TAPS.with(|t| t.borrow().0.clone())
+}
+
+fn taps_put(v: Vec<f32>) {
+    LAYER_TAPS.with(|t| t.borrow_mut().1 = Some(v));
+}
+
+thread_local! {
     /// A greedy verify's row ids from the card (`verify_argmax_arm`):
     /// None unarmed, Some(empty) armed, Some(ids) after the verify.
     static VERIFY_IDS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
@@ -2575,6 +2607,14 @@ fn verify_argmax_put(ids: Vec<u32>) {
 /// The ids the armed verify picked (None when it picked none); disarms.
 pub fn verify_argmax_take() -> Option<Vec<u32>> {
     VERIFY_IDS.with(|v| v.borrow_mut().take()).filter(|ids| !ids.is_empty())
+}
+
+pub use hyb::dflash::{Dev as DflashDev, LayerIn as DflashLayerIn, SETTLE_MAX as DFLASH_SETTLE_MAX, SpecIn as DflashSpecIn};
+
+/// The hybrid arm's kernels are built (a trunk plan ran): what the DFlash
+/// block borrows.
+pub fn hybrid_kernels_ready() -> bool {
+    ctx().is_some_and(|c| hyb::kernels_ready(&c.st.lock().unwrap()))
 }
 
 /// The hybrid arm's MTP draft chain: `k` greedy drafts in one graph
@@ -2658,6 +2698,9 @@ pub fn kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
             m.stored = stored;
             true
         }
+        // fewer rows than asked (an MTP mirror behind plain tokens): nothing
+        // to step back from, and the next call zero-fills up to its row
+        Some(m) if stored > m.stored => true,
         _ => false,
     }
 }

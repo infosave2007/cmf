@@ -4675,6 +4675,8 @@ pub fn layer_taps_arm(layers: &[usize]) {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::layer_taps_arm(layers),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::layer_taps_arm(layers),
         #[allow(unreachable_patterns)]
         _ => {
             let _ = layers;
@@ -4688,6 +4690,8 @@ pub fn layer_taps_take(out: &mut Vec<f32>) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::layer_taps_take(out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::layer_taps_take(out),
         #[allow(unreachable_patterns)]
         _ => {
             let _ = out;

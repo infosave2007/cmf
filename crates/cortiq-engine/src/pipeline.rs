@@ -422,6 +422,12 @@ pub struct Pipeline {
     /// The sidecar's block is the trunk's only drafter (the model has no MTP
     /// block): the wgpu graphs keep its rows without being asked to.
     pub(crate) dflash_solo: bool,
+    /// The first position whose tapped rows a DFlash drafter can still
+    /// read once the prompt is in (its layers' widest window back from the
+    /// prompt's end): the prompt's chunks before it keep none.
+    dflash_tap_from: usize,
+    /// Speculative rounds of this request so far.
+    spec_rounds_req: u32,
     /// The Metal verify graph of the round in flight, between its sync
     /// (logits read) and the commit that replays the accepted prefix.
     #[cfg(target_os = "macos")]
@@ -1457,6 +1463,14 @@ struct SpecMon {
 /// one flat price. MacBook Air M4, Qwen3.8-27B: a plain token 160 ms, a
 /// round of one draft 176, of two 204, of three 246, of seven 281.
 const METAL_ROUND_COST: [f32; 7] = [1.10, 1.275, 1.54, 1.59, 1.65, 1.70, 1.76];
+/// The same on the CUDA hybrid arm, verify and commit of a round of k
+/// drafts: RTX 3090, Qwen3.8-27B q4tp, a plain token 20.4 ms, a round of
+/// four chain drafts 24.3 ms past its drafts, of seven block drafts 25.1.
+const CUDA_ROUND_COST: [f32; 7] = [1.12, 1.15, 1.17, 1.19, 1.21, 1.22, 1.24];
+/// A DFlash block on the CUDA arm with its context rows and head (3.9 ms),
+/// and a step of the MTP chain (0.62 ms), in plain tokens.
+const CUDA_BLOCK_DRAFT: f32 = 0.19;
+const CUDA_DRAFT_STEP: f32 = 0.03;
 /// How often a draft holds once the one before it held, before any round has
 /// shown it: the 27B's chain on code and on prose holds its first draft in
 /// four rounds of five, the second in three of four after that, the third in
@@ -1566,6 +1580,14 @@ pub const DFLASH_LEAN_BAND: f32 = 0.0;
 /// for less than a block (edits and quotes: 8 keeps the code's rounds, where
 /// three or four tokens repeat all the time).
 pub const DFLASH_COPY_MIN: usize = 8;
+/// The running gain of the chain's lookups (`spec_lookup_gain`) past which a
+/// CUDA round stays the chain's: an edit of 512 tokens lost 15 % to the
+/// block's rounds between its copies.
+const DFLASH_LOOKUP_KEEPS: f32 = 5.0;
+/// A request's first rounds that are the chain's on CUDA (a copy would show
+/// itself to the lookup first). Two cost the chats 2.7 % for 2.7 % on a copy:
+/// the block's first round pays for the prompt's context whenever it comes.
+const DFLASH_CHAIN_FIRST: u32 = 0;
 const DFLASH_WAIT_DIP: u32 = 8;
 const DFLASH_TURN: u32 = 16;
 
@@ -4882,6 +4904,8 @@ impl Pipeline {
             dflash_rows: None,
             dflash_taps: std::sync::Mutex::new(Vec::new()),
             dflash_solo: false,
+            dflash_tap_from: 0,
+            spec_rounds_req: 0,
             #[cfg(target_os = "macos")]
             metal_verify: None,
             inv_freq,
@@ -6544,6 +6568,13 @@ impl Pipeline {
             self.graph_logits = None;
         }
         self.swa_trim_anchor = input_ids.len();
+        self.dflash_tap_from = match &self.dflash {
+            Some(d) if (0..d.g.layers).all(|l| d.g.window_of(l) > 0) => {
+                let w = (0..d.g.layers).map(|l| d.g.window_of(l)).max().unwrap_or(0);
+                input_ids.len().saturating_sub(w + crate::dflash::BLOCK_SLACK)
+            }
+            _ => 0,
+        };
         self.last_prefill_tokens = input_ids.len() - reuse_from;
         let bounded_native = self.bounded_native();
         if reuse_from == 0 {
@@ -7877,6 +7908,14 @@ impl Pipeline {
             if mtp_batch_prefill && mtp.is_some() && pos == input_ids.len() {
                 self.mtp_warm_base = Some(self.mtp_pos_base);
             }
+            // the CUDA DFlash block is built once the trunk's kernels are, so
+            // its first round does not pay it
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() {
+                if let Some(d) = &self.dflash {
+                    let _ = d.dev_ready();
+                }
+            }
             #[cfg(target_os = "macos")]
             if std::env::var("CMF_PREFILL_PROF").is_ok() {
                 crate::gpu_metal::cut_report();
@@ -8072,6 +8111,7 @@ impl Pipeline {
             gen0: generated,
             rounds: 0,
         };
+        self.spec_rounds_req = 0;
         // The token-count proxy prices a round at ~1.9 plain tokens. That
         // holds for the Metal rounds whose cost was measured — greedy and
         // the sparse sampling chain — so an expensive round (the dense
@@ -10231,13 +10271,19 @@ impl Pipeline {
         if !metal_native {
             self.dflash_taps_absorb();
         }
+        // The CUDA hybrid arm keeps the drafter's context at the tip every
+        // call (its graphs copy the tapped rows out) and verifies eight rows
+        // at about one price: the round goes to the drafter that lands more
+        // tokens at that card's prices, as on Metal.
+        let cuda_rate = !metal_native && crate::gpu::cuda_active();
+        self.spec_rounds_req += 1;
         let dflash_ok = !sampling
             && !greedy_pen
             && match &self.dflash {
-                Some(d) => metal_native || (dflash_pick() == Some(true) && d.next_position() == next_pos),
+                Some(d) => metal_native || ((dflash_pick() == Some(true) || cuda_rate) && d.next_position() == next_pos),
                 None => false,
             };
-        if !metal_native && self.dflash.is_some() && dflash_pick() != Some(true) {
+        if !metal_native && !cuda_rate && self.dflash.is_some() && dflash_pick() != Some(true) {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
                 tracing::info!(
@@ -10245,8 +10291,16 @@ impl Pipeline {
                 )
             });
         }
-        let (k_flash, rate_flash) = metal_spec_plan(&self.dflash_hold, DFLASH_ROUND_DRAFT);
-        let (_, rate_mtp) = metal_spec_plan(&self.spec_hold, 0.0);
+        let (k_flash, rate_flash) = if cuda_rate {
+            spec_plan_at(&CUDA_ROUND_COST, &self.dflash_hold, CUDA_BLOCK_DRAFT, 0.0)
+        } else {
+            metal_spec_plan(&self.dflash_hold, DFLASH_ROUND_DRAFT)
+        };
+        let (_, rate_mtp) = if cuda_rate {
+            spec_plan_at(&CUDA_ROUND_COST, &self.spec_hold, 0.0, CUDA_DRAFT_STEP)
+        } else {
+            metal_spec_plan(&self.spec_hold, 0.0)
+        };
         // A sidecar that carries a router says which drafter the text at the
         // tip is for, from the target's own row there: two subspaces of such
         // rows, one of the rounds the block won and one of the chain's, and
@@ -10260,14 +10314,27 @@ impl Pipeline {
         if let Some(m) = routed {
             self.dflash_lean += DFLASH_LEAN_STEP * (m - self.dflash_lean);
         }
-        let copying = routed.is_some() && dflash_pick().is_none() && tail_repeat(all_ids) >= DFLASH_COPY_MIN;
+        // CUDA verifies a lookup of sixteen rows at about one price: while the
+        // lookups land (their running gain past `DFLASH_LOOKUP_KEEPS`), an
+        // edit or a quote stays the chain's, which the router (fitted where
+        // the lookup was eight rows) would give the block
+        let copying = (routed.is_some() || cuda_rate)
+            && dflash_pick().is_none()
+            && (tail_repeat(all_ids) >= DFLASH_COPY_MIN
+                || (cuda_rate && (self.spec_lookup_gain > DFLASH_LOOKUP_KEEPS || self.spec_rounds_req <= DFLASH_CHAIN_FIRST)));
         let dflash_round = dflash_ok
             && match (dflash_pick(), routed) {
                 (Some(pin), _) => pin,
                 (None, Some(_)) if copying => false,
+                // the block drafts over the head's shortlist: text from the
+                // high table is the chain's (CUDA, where the router alone
+                // sent a Danish article to the block: 55 against 73 tok/s)
+                (None, Some(_)) if cuda_rate && self.draft_full_streak > 0 => false,
                 (None, Some(_)) if self.dflash_last => self.dflash_lean > -DFLASH_LEAN_BAND,
                 (None, Some(_)) => self.dflash_lean > DFLASH_LEAN_BAND,
-                (None, None) if !metal_small => true,
+                // the chain's short round with the prompt lookup copies for less
+                (None, None) if copying => false,
+                (None, None) if !metal_small && !cuda_rate => true,
                 (None, None) if self.draft_full_streak > 0 => false,
                 (None, None) if self.dflash_last => rate_flash * 1.05 >= rate_mtp,
                 (None, None) if self.dflash_wait > 0 => {
@@ -11411,6 +11478,11 @@ impl Pipeline {
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
             // draft it just paid for. Each drafter has its own depth.
+            if cuda_rate && dflash_round && !k_capped {
+                self.dflash_turn_sum.0 += (a + 1) as f32;
+                self.dflash_turn_sum.1 += CUDA_ROUND_COST[k_spec.clamp(1, 7) - 1] + CUDA_BLOCK_DRAFT;
+                spec_hold_update(&mut self.dflash_hold, k_spec, a.min(k_spec));
+            }
             let (ewma, k_min) = if dflash_round { (&mut self.dflash_acc_ewma, 3) } else { (&mut self.spec_acc_ewma, 2) };
             let f = a as f32 / k_spec.max(1) as f32;
             *ewma += 0.2 * (f - *ewma);
@@ -11515,6 +11587,9 @@ impl Pipeline {
                 let head = &self.weights.lm_head;
                 let mut hl = vec![0f32; n * head.rows()];
                 head.matmat(&out[hs..(n + 1) * hs], n, &mut hl, pool);
+                // the device may score only the head's first rows (CUDA: the shortlist)
+                let width = logits.len() / n.max(1);
+                let hl: Vec<f32> = (0..n).flat_map(|j| hl[j * head.rows()..j * head.rows() + width].to_vec()).collect();
                 let (hids, _) = d.select(&out[hs..(n + 1) * hs], &hl, t_next);
                 let (mut dmax, mut ref_max, mut dsum, mut cnt) = (0f32, 0f32, 0f64, 0usize);
                 for (a, b) in logits.iter().zip(&hl) {
@@ -11523,7 +11598,7 @@ impl Pipeline {
                     dsum += ((a - b) * (a - b)) as f64;
                     cnt += 1;
                 }
-                let arg = |v: &[f32]| (0..n).map(|j| sampler::argmax(&v[j * head.rows()..(j + 1) * head.rows()])).collect::<Vec<u32>>();
+                let arg = |v: &[f32]| (0..n).map(|j| sampler::argmax(&v[j * width..(j + 1) * width])).collect::<Vec<u32>>();
                 eprintln!(
                     "dflash-dev-check: logits max|Δ| {dmax:.4} of max {ref_max:.2}, rms Δ {:.5} | argmax device {:?} host {:?} | drafts device {:?} host {:?}",
                     (dsum / cnt.max(1) as f64).sqrt(),
@@ -20238,7 +20313,8 @@ impl Pipeline {
             }
             Clear
         });
-        let taps = self.dflash_taps_wanted(0, graph_end);
+        // a prompt chunk wholly before what the drafter's windows reach keeps none
+        let taps = if positions.last().is_some_and(|&p| p < self.dflash_tap_from) { Vec::new() } else { self.dflash_taps_wanted(0, graph_end) };
         crate::gpu::layer_taps_arm(&taps);
         let outcome = crate::gpu::forward_batch_graph(
             &model,
@@ -20273,7 +20349,7 @@ impl Pipeline {
     /// `from..upto_excl` is the whole stack (nothing otherwise).
     fn dflash_taps_wanted(&self, from: usize, upto_excl: usize) -> Vec<usize> {
         match &self.dflash {
-            Some(d) if (self.dflash_solo || dflash_pick() == Some(true)) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
+            Some(d) if (self.dflash_solo || dflash_pick() == Some(true) || crate::gpu::cuda_active()) && from == 0 && upto_excl >= self.num_layers => d.g.taps.clone(),
             _ => Vec::new(),
         }
     }
@@ -20308,7 +20384,13 @@ impl Pipeline {
         // `DFLASH_TAPS_ROWS` the oldest chunks go, and the drafter's context
         // starts at what is left
         let mut rows: usize = kept.iter().map(|(_, r)| r.len()).sum::<usize>() / (nt * hs);
-        while rows > DFLASH_TAPS_ROWS && kept.len() > 1 {
+        let cap = match &self.dflash {
+            Some(d) if (0..d.g.layers).all(|l| d.g.window_of(l) > 0) => {
+                DFLASH_TAPS_ROWS.min((0..d.g.layers).map(|l| d.g.window_of(l)).max().unwrap_or(0) + crate::dflash::BLOCK_SLACK)
+            }
+            _ => DFLASH_TAPS_ROWS,
+        };
+        while rows > cap && kept.len() > 1 {
             rows -= kept.remove(0).1.len() / (nt * hs);
         }
     }

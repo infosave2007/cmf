@@ -1189,9 +1189,10 @@ enum Commands {
         /// Every N-th sequence is held out of a first fit and measured (0: none)
         #[arg(long, default_value = "4")]
         hold_every: usize,
-        /// Measure at another device's prices, in plain tokens: the verify and
-        /// commit of a round of one to seven drafts, a block's drafts, one
-        /// draft of the chain (nine numbers, with --dry-run)
+        /// Price the rounds at another device's prices, in plain tokens: the
+        /// verify and commit of a round of one to seven drafts, a block's
+        /// drafts, one draft of the chain (nine numbers); the router is
+        /// fitted at them unless --dry-run
         #[arg(long)]
         prices: Option<String>,
         /// Only measure: do not write the router into the sidecar

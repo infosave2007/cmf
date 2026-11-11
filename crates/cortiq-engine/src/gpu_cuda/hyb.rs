@@ -30,6 +30,9 @@ use super::{Buf, Ctx, DevMat, Gemm, KvMirror, Res, State, compile, cs, cu, debug
 use crate::gpu::{BatchGraphOutcome, GraphAct, GraphAttn, GraphFfn, GraphLayer, GraphW, SpecTail, TokenGraphOutcome};
 
 const HYB_SRC: &str = include_str!("hyb.cu");
+
+/// The DFlash 2 block on the card, on this arm's kernels.
+pub(super) mod dflash;
 /// Rows of the small path.
 pub(super) const NMAX: usize = 16;
 /// Stages of `CMF_CUDA_PROF=1` on the small path (each closed by a stream
@@ -1642,7 +1645,7 @@ fn book(
 /// host, so a stream capture can record it. `tape`: keep what a verify
 /// needs to step back.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u64, tabp: u64) -> Res<()> {
+unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u64, tabp: u64, taps: &[(usize, u64)]) -> Res<()> {
     let fx = &plan.fx;
     let (hidden, nh, nkv, hd) = (plan.hidden, plan.nh, plan.nkv, plan.hd);
     let (eps, gemma_i, n_i) = (plan.eps, plan.gemma as i32, n as i32);
@@ -1838,6 +1841,12 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
             pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
             hst(c, 9, &mut t0)?;
+            // a DFlash drafter's taps: the residual stream after this layer
+            for &(tl, dst) in taps {
+                if tl == li {
+                    cu::memcpy_dtod_async(dst, plan.h.ptr, n * hidden * 4, c.stream).map_err(derr)?;
+                }
+            }
         }
     }
     Ok(())
@@ -1906,6 +1915,7 @@ unsafe fn run_small(
     head: bool,
     kcap: usize,
     sealed: &[bool],
+    taps: &[(usize, u64)],
 ) -> Res<usize> {
     let bk = book(c, st, plan, kv_id, layer_base, pos0, n, tape, kcap, sealed)?;
     let rows = plan.lm.as_ref().map_or(0, |l| l.1);
@@ -1914,7 +1924,7 @@ unsafe fn run_small(
             cu::memcpy_htod_async(plan.ci.ptr, &bk.ci, c.stream).map_err(derr)?;
         }
         if !graphs_on() {
-            launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr)?;
+            launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
             if head {
                 head_launch(c, plan, n)?;
             }
@@ -1924,11 +1934,16 @@ unsafe fn run_small(
         for (i, &f) in bk.far.iter().enumerate() {
             far_key ^= (f as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(i as u32 % 64);
         }
+        // a call with taps records copies a call without them has not
+        for &(tl, _) in taps {
+            far_key ^= ((tl as u64 + 1) << 40).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        }
         let key = (plan.id, kv_id, layer_base, n, tape, head, far_key);
         let mut sig: Vec<u64> = bk.layers.iter().flatten().copied().collect();
         sig.extend(bk.scratch);
         sig.extend(bk.far.iter().map(|&f| f as u64));
         sig.extend(bk.farp.iter().map(|&(m, sc, r)| (m as u64) << 33 | (sc.to_bits() as u64) << 1 | r as u64));
+        sig.extend(taps.iter().flat_map(|&(tl, dst)| [tl as u64, dst]));
         let hit = st.hyb.graphs.get(&key).is_some_and(|g| g.sig == sig);
         GRAPH_RUN.fetch_add(1, Ordering::Relaxed);
         if !hit {
@@ -1941,7 +1956,7 @@ unsafe fn run_small(
                 eprintln!("cuda hybrid: recording a graph for {n} rows (tape {tape}, head {head}): {why}");
             }
             let exec = capture(c, || {
-                launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr)?;
+                launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
                 if head {
                     head_launch(c, plan, n)?;
                 }
@@ -1953,6 +1968,30 @@ unsafe fn run_small(
         curesult(cs::cuGraphLaunch(g.exec, c.stream), "graph launch")?;
     }
     Ok(if head { rows } else { 0 })
+}
+
+/// The DFlash taps a small-path call keeps (`super::layer_taps_arm`): for
+/// every asked layer of a call over the whole stack, its plan index and a
+/// device slot of `NMAX` rows. None when nothing was asked or the call does
+/// not reach every asked layer.
+fn tap_slots(c: &Ctx, st: &mut State, nlayers: usize, layer_base: usize, hidden: usize) -> Res<Option<(Vec<(usize, u64)>, u64)>> {
+    let want = super::taps_wanted();
+    if want.is_empty() || layer_base != 0 || want.iter().any(|&l| l >= nlayers) {
+        return Ok(None);
+    }
+    let buf = st.scr(c, "hy_taps", want.len() * NMAX * hidden * 4)?;
+    let slots = want.iter().enumerate().map(|(s, &l)| (l, buf + (s * NMAX * hidden * 4) as u64)).collect();
+    Ok(Some((slots, buf)))
+}
+
+/// The kept tap rows (`n` a slot) to the host as `[slot][row][hidden]`, for
+/// `super::layer_taps_take` once the stream has run.
+unsafe fn taps_read(c: &Ctx, slots: &[(usize, u64)], n: usize, hidden: usize) -> Res<Vec<f32>> {
+    let mut raw = vec![0f32; slots.len() * n * hidden];
+    for (s, &(_, dst)) in slots.iter().enumerate() {
+        unsafe { cu::memcpy_dtoh_async(&mut raw[s * n * hidden..(s + 1) * n * hidden], dst, c.stream).map_err(derr)? };
+    }
+    Ok(raw)
 }
 
 /// The head over the rows in `plan.h`: logits [n][rows] into `plan.logits`.
@@ -2060,7 +2099,13 @@ pub(super) fn token(
             if !tab.is_empty() {
                 cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
             }
-            let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed)?;
+            let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
+            let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+            let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed, tl)?;
+            if taps.is_some() {
+                // a pageable read: the rows are there when it returns
+                super::taps_put(taps_read(c, tl, 1, hidden)?);
+            }
             if rows > 0 {
                 logits.resize(rows, 0.0);
                 cu::memcpy_dtoh_async(logits.as_mut_slice(), plan.logits.ptr, c.stream).map_err(derr)?;
@@ -2250,7 +2295,7 @@ pub(super) fn mtp_chain(
                     c.launch(fx.rmsnorm2, (hidden.div_ceil(1024) as u32, 1), 256, 0, kargs!(ej, enp, nullp, hid_i, eps, gemma_i, p0, p1, p2, ps_i))?;
                     c.launch(fx.rmsnorm2, (hidden.div_ceil(1024) as u32, 1), 256, 0, kargs!(hsrc, hnp, nullp, hid_i, eps, gemma_i, q0, q1, q2, ps_i))?;
                     ms.run(c, fx, &planes, 2 * hidden, 1)?;
-                    launch(c, &plan, bk, 1, false, ci_b + (j * cilen * 4) as u64, tab_b + (j * tabrow * 4) as u64)?;
+                    launch(c, &plan, bk, 1, false, ci_b + (j * cilen * 4) as u64, tab_b + (j * tabrow * 4) as u64, &[])?;
                     head_launch(c, &plan, 1)?;
                     c.launch(fx.argmax, (1, 1), 1024, 0, kargs!(plan.logits.ptr, rows_i, rows_i, tok_b, j1_i))?;
                 }
@@ -2361,7 +2406,12 @@ pub(super) fn batch(
                 if !tab.is_empty() {
                     cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                 }
-                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &[])?;
+                let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
+                let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &[], tl)?;
+                if taps.is_some() {
+                    super::taps_put(taps_read(c, tl, b, hidden)?);
+                }
                 // a greedy verify the pipeline armed: each row's argmax on
                 // the card, the ids back instead of the logits
                 let pick = spec.is_some() && super::verify_argmax_armed();
@@ -2446,6 +2496,10 @@ unsafe fn big(
         .max()
         .unwrap_or(0);
     let wd = st.scr(c, "hb_wd", wmax * 2)?;
+    // a DFlash drafter's taps: the chunk's rows after each asked layer
+    let want = super::taps_wanted();
+    let tapping = !want.is_empty() && layer_base == 0 && want.iter().all(|&l| l < plan.layers.len());
+    let mut tapped = if tapping { vec![0f32; want.len() * b * hidden] } else { Vec::new() };
     let tab = rope_rows(&plan.invf, positions.iter().copied());
     let btab = st.scr(c, "hb_tab", tab.len().max(1) * 4)?;
     unsafe {
@@ -2625,6 +2679,15 @@ unsafe fn big(
         }
         bst(c, 6, tm)?;
         mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
+        if tapping {
+            if let Some(s) = want.iter().position(|&l| l == li) {
+                // pageable: done when it returns
+                unsafe { cu::memcpy_dtoh_async(&mut tapped[s * b * hidden..(s + 1) * b * hidden], bh, c.stream).map_err(derr)? };
+            }
+        }
+    }
+    if tapping {
+        super::taps_put(tapped);
     }
     if !defer {
         unsafe { cu::memcpy_dtoh_async(h, bh, c.stream).map_err(derr)? };
@@ -2701,6 +2764,11 @@ pub(super) fn spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected: u
             false
         }
     }
+}
+
+/// The arm's kernels are compiled (a trunk plan was built).
+pub(super) fn kernels_ready(st: &State) -> bool {
+    !st.hyb.funcs.is_empty()
 }
 
 /// A recurrent state of this sequence lives on the card.
