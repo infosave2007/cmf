@@ -532,24 +532,25 @@ extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __res
 // expands one u32 of nibbles = 8 weights of matrix blockIdx.y % 3 of expert
 // blockIdx.y / 3 into plane j of Wg / Wu / Wd.
 extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __restrict__ Wg, void* __restrict__ Wu,
-                                         void* __restrict__ Wd, int inter, int hid, int half)
+                                         void* __restrict__ Wd, int inter, int hid, int half, int gbits)
 {
     const int m = blockIdx.y % 3, j = blockIdx.y / 3;
     const int rows = m == 2 ? hid : inter, cols = m == 2 ? inter : hid;
     const u32 wi = blockIdx.x * blockDim.x + threadIdx.x;
     const u64 words = (u64)rows * cols / 8;
     if (wi >= words) return;
-    // section offsets of a matrix, and of the three matrices in the slot
+    // gate and up are 2-bit (q2tp) or 4-bit (q4tp); the down matrix is 4-bit; section offsets of a matrix,
+    // and of the three matrices in the slot
+    const bool two = gbits == 2 && m < 2;
     const int gpr_gu = hid >> 5;
-    const u64 size_gu = (u64)inter * gpr_gu * 16 + (u64)inter * 4 + (u64)inter * ((gpr_gu * 5 + 7) / 8);
+    const u64 size_gu = (u64)inter * gpr_gu * (gbits == 2 ? 8 : 16) + (u64)inter * 4 + (u64)inter * ((gpr_gu * 5 + 7) / 8);
     const int gpr = cols >> 5;
-    const u64 params_off = (u64)rows * gpr * 16, codes_off = params_off + (u64)rows * 4;
+    const u64 params_off = (u64)rows * gpr * (two ? 8 : 16), codes_off = params_off + (u64)rows * 4;
     const int stride = (gpr * 5 + 7) / 8;
     const u8* mat = (const u8*)slots[j] + (u64)m * size_gu;
     const u64 base = (u64)wi * 8;
     const int r = (int)(base / cols);
     const int g = (int)(base - (u64)r * cols) >> 5;
-    const u32 w = *(const u32*)(mat + (u64)wi * 4);
     const u16* pp = (const u16*)(mat + params_off + (u64)r * 4);
     const u8* codes = mat + codes_off + (u64)r * stride;
     const int bit = g * 5, cb = bit >> 3, sh = bit & 7;
@@ -558,9 +559,18 @@ extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __
     const int code = (int)(((lo | (hi << 8)) >> sh) & 0x1Fu);
     float s = exp2f(h2f(pp[0]));
     const float ratio = exp2f(h2f(pp[1]));
-    for (int c = 0; c < code; c++) s *= ratio;
     void* W = m == 0 ? Wg : (m == 1 ? Wu : Wd);
     const u64 o = (u64)j * rows * cols + base;
+    if (two) {
+        // rung 0 is zero, rung c is the q4tp rung c - 1
+        for (int c2 = 1; c2 < code; c2++) s *= ratio;
+        if (code == 0) s = 0.0f;
+        const u32 w = *(const u16*)(mat + (u64)wi * 2);
+        for (int k = 0; k < 8; k++) stf(W, o + k, ((float)((w >> (2 * k)) & 3u) - 1.5f) * s, half);
+        return;
+    }
+    const u32 w = *(const u32*)(mat + (u64)wi * 4);
+    for (int c2 = 0; c2 < code; c2++) s *= ratio;
     for (int k = 0; k < 4; k++) {
         const u32 by = (w >> (8 * k)) & 0xFFu;
         stf(W, o + 2 * k, ((float)(by & 15u) - 8.0f) * s, half);
@@ -686,6 +696,22 @@ __device__ __forceinline__ void q4_ladder(const u16* pp, float* l) {
     const float ratio = exp2f(h2f(pp[1]));
     l[0] = s;
     for (int c = 1; c < 32; c++) { s *= ratio; l[c] = s; }
+}
+
+// The 32 scales of a q2tp row: rung 0 is exactly zero, rungs 1..=31 are the q4tp ladder shifted by one.
+__device__ __forceinline__ void q2_ladder(const u16* pp, float* l) {
+    float s = exp2f(h2f(pp[0]));
+    const float ratio = exp2f(h2f(pp[1]));
+    l[0] = 0.0f;
+    l[1] = s;
+    for (int c = 2; c < 32; c++) { s *= ratio; l[c] = s; }
+}
+
+// Sixteen 2-bit weights of a word against sixteen staged values `st` apart.
+__device__ __forceinline__ float crumb16(u32 w, const float* p, int st, float a) {
+#pragma unroll
+    for (int i = 0; i < 16; i++) a += (float)((w >> (2 * i)) & 3u) * p[i * st];
+    return a;
 }
 
 // Up to five matvecs of one input over NB rows: y_j [NB][rows_j] = W_j x.
@@ -944,6 +970,13 @@ __device__ __forceinline__ float q4_group(const uint4 w, float lc, const float* 
     return lc * (a - gsum);
 }
 
+// One 2-bit group of a row against the staged input of a unit row: the codes (0..3) minus 1.5, times the group's scale.
+__device__ __forceinline__ float q2_group(const uint2 w, float lc, const float* p, int GP, float gsum) {
+    float a = crumb16(w.x, p, GP, 0.0f);
+    a = crumb16(w.y, p + 16 * GP, GP, a);
+    return lc * (a - gsum);
+}
+
 // Gate and up of the round's units, straight from the raw slots:
 // act [U * Q4_UR][inter] = silu(gate x) * (up x) for each row of a unit,
 // folded [n][hid]. Grid (ceil(inter / rb), U): a block does `rb` rows of both
@@ -1036,11 +1069,99 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
     }
 }
 
+// Gate and up of q2tp experts (2-bit codes, rung 0 = zero): the same as q4_exp_gu with 8-byte groups.
+extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float* __restrict__ folded,
+                                     float* __restrict__ act, int inter, int hid, int rb)
+{
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const u32* un = units + (u64)blockIdx.y * (2 + Q4_UR);
+    const u64 slot = (u64)un[0] | ((u64)un[1] << 32);
+    if (!slot) return;
+    int cnt = 0;
+    while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
+    const int gpr = hid >> 5, GP = gpr | 1, XS = 32 * GP, stride = (gpr * 5 + 7) / 8;
+    const u64 params_off = (u64)inter * gpr * 8, codes_off = params_off + (u64)inter * 4;
+    const u64 sgu = codes_off + (u64)inter * stride;
+    float* xs = sh;                 // [cnt][32][GP]
+    float* gs = xs + cnt * XS;      // [cnt][gpr]
+    float* lad = gs + cnt * gpr;    // [2][rb][32]
+    const int r0 = blockIdx.x * rb;
+    for (int j = 0; j < cnt; j++) {
+        const float* x = folded + (u64)un[2 + j] * hid;
+        float* xj = xs + j * XS;
+        for (int i = tid; i < hid; i += T) xj[(i & 31) * GP + (i >> 5)] = x[i];
+    }
+    if (tid < 2 * rb) {
+        const int m = tid / rb, r = r0 + tid - m * rb;
+        if (r < inter) q2_ladder((const u16*)(slot + (u64)m * sgu + params_off + (u64)r * 4), lad + tid * 32);
+    }
+    __syncthreads();
+    for (int i = tid; i < cnt * gpr; i += T) {
+        const int j = i / gpr, g = i - j * gpr;
+        const float* p = xs + j * XS + g;
+        float s = 0.0f;
+        for (int k = 0; k < 32; k++) s += p[k * GP];
+        gs[i] = 1.5f * s;
+    }
+    __syncthreads();
+    // the words of this warp's rows in one sequence: row q, word it
+    const int nit = (gpr + 31) >> 5;
+    const int nz = warp < rb ? ((rb - warp + NW - 1) / NW) * nit : 0;
+    const u8* mg = (const u8*)slot;
+    const u8* mu = mg + sgu;
+    float ag[Q4_UR], au[Q4_UR];
+    for (int j = 0; j < Q4_UR; j++) { ag[j] = 0.0f; au[j] = 0.0f; }
+    for (int z0 = 0; z0 < nz; z0 += Q4_GW) {
+        uint2 wg[Q4_GW], wu[Q4_GW];
+        float lg[Q4_GW], lu[Q4_GW];
+        for (int k = 0; k < Q4_GW; k++) {
+            const int z = z0 + k;
+            if (z < nz) {
+                const int q = z / nit, g = lane + 32 * (z - q * nit), i = warp + q * NW, r = r0 + i;
+                if (r < inter && g < gpr) {
+                    wg[k] = ((const uint2*)(mg + (u64)r * gpr * 8))[g];
+                    wu[k] = ((const uint2*)(mu + (u64)r * gpr * 8))[g];
+                    lg[k] = lad[i * 32 + q4_code(mg + codes_off + (u64)r * stride, g, stride)];
+                    lu[k] = lad[(rb + i) * 32 + q4_code(mu + codes_off + (u64)r * stride, g, stride)];
+                }
+            }
+        }
+        for (int k = 0; k < Q4_GW; k++) {
+            const int z = z0 + k;
+            if (z >= nz) break;
+            const int q = z / nit, it = z - q * nit, g = lane + 32 * it, i = warp + q * NW, r = r0 + i;
+            if (r >= inter) break;
+            if (g < gpr) {
+                for (int j = 0; j < cnt; j++) {
+                    const float* p = xs + j * XS + g;
+                    const float gsum = gs[j * gpr + g];
+                    ag[j] += q2_group(wg[k], lg[k], p, GP, gsum);
+                    au[j] += q2_group(wu[k], lu[k], p, GP, gsum);
+                }
+            }
+            if (it == nit - 1) {
+                for (int j = 0; j < cnt; j++) {
+                    float a = ag[j], b = au[j];
+                    for (int o = 16; o > 0; o >>= 1) {
+                        a += __shfl_xor_sync(0xffffffffu, a, o);
+                        b += __shfl_xor_sync(0xffffffffu, b, o);
+                    }
+                    if (lane == 0) act[((u64)blockIdx.y * Q4_UR + j) * inter + r] = silu_f(a) * b;
+                    ag[j] = 0.0f;
+                    au[j] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
 // Down of the round's units: part [U * Q4_UR][hid] = down act for each row of
 // a unit. Grid (ceil(hid / rb), U): a block does `rb` output rows of one
 // unit, its warps a row at a time.
 extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* __restrict__ act,
-                                    float* __restrict__ part, int inter, int hid, int rb)
+                                    float* __restrict__ part, int inter, int hid, int rb, unsigned long long sgu)
 {
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
@@ -1051,8 +1172,6 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
     int cnt = 0;
     while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
     const int gpr = inter >> 5, GP = gpr | 1, XS = 32 * GP, stride = (gpr * 5 + 7) / 8;
-    const int gpr_gu = hid >> 5;
-    const u64 sgu = (u64)inter * gpr_gu * 16 + (u64)inter * 4 + (u64)inter * ((gpr_gu * 5 + 7) / 8);
     const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
     const u8* mat = (const u8*)(slot + 2 * sgu);
     float* xs = sh;                 // [cnt][32][GP]

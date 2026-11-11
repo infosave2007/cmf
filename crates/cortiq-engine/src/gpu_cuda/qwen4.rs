@@ -79,6 +79,8 @@ struct QSmall {
     hc_di: [cs::CUfunction; SMALL_ROWS],
     hc_up: [cs::CUfunction; SMALL_ROWS],
     exp_gu: cs::CUfunction,
+    /// The same for q2tp gate/up.
+    exp_gu2: cs::CUfunction,
     exp_d: cs::CUfunction,
     exp_sum: cs::CUfunction,
     /// Dynamic shared memory a block of the matvec kernels, of the hyper-connection kernels, of the
@@ -98,7 +100,7 @@ impl QSmall {
             Ok(v)
         };
         let (mvb, hc_di, hc_up) = (set("mvb")?, set("hc_di")?, set("hc_up")?);
-        let (exp_gu, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_d")?);
+        let (exp_gu, exp_gu2, exp_d) = (func(module, "q4_exp_gu")?, func(module, "q4_exp_gu2")?, func(module, "q4_exp_d")?);
         // a block stages every row of the round: ask for all a block may have
         let family = |fs: &[cs::CUfunction]| -> usize {
             // the opt-in limit of a block is 227 KB on a datacenter part and 99 KB on a consumer Blackwell
@@ -119,9 +121,9 @@ impl QSmall {
             }
             48 << 10
         };
-        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_d]));
+        let (mvb_max, ex_max) = (family(&mvb), family(&[exp_gu, exp_gu2, exp_d]));
         let hc_max = family(&[hc_di.as_slice(), hc_up.as_slice()].concat());
-        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
+        Ok(Self { mvb, hc_di, hc_up, exp_gu, exp_gu2, exp_d, exp_sum: func(module, "q4_exp_sum")?, mvb_max, hc_max, ex_max })
     }
 }
 
@@ -329,6 +331,11 @@ fn q4_bytes(rows: usize, cols: usize) -> usize {
     rows * (cols / 32) * 16 + rows * 4 + rows * (cols / 32 * 5).div_ceil(8)
 }
 
+/// Bytes of a q2tp matrix: 8 bytes of weights a group of 32, the rest as q4tp.
+fn q2_bytes(rows: usize, cols: usize) -> usize {
+    rows * (cols / 32) * 8 + rows * 4 + rows * (cols / 32 * 5).div_ceil(8)
+}
+
 /// A projection on the card: its q8_2f file form (expanded into the scratch
 /// plane right before its GEMM) or a resident plane in the GEMM operand type.
 enum DW {
@@ -476,6 +483,8 @@ struct Dims {
     /// Bytes of an expert's gate (and up) matrix, of its down matrix.
     sgu: usize,
     sd: usize,
+    /// Bits of the gate and up weights of an expert: 2 (q2tp) or 4 (q4tp); the down matrix is q4tp.
+    gbits: usize,
     vocab: usize,
     ple_k: usize,
     ple_dil: usize,
@@ -1031,9 +1040,10 @@ fn expert_parts<'a>(f: &'a DenseFfn, d: &Dims) -> Res<[&'a [u8]; 3]> {
     if !f.segs.is_empty() {
         return Err("qwen4 cuda: an expert with task tubes".into());
     }
-    let part = |t: &'a QTensor, rows: usize, cols: usize, len: usize| -> Res<&'a [u8]> {
-        if t.rows() != rows || t.cols() != cols || t.mapped_q4tp().is_none() {
-            return Err(format!("qwen4 cuda: an expert matrix is not q4tp {rows}x{cols}"));
+    let part = |t: &'a QTensor, rows: usize, cols: usize, len: usize, bits: usize| -> Res<&'a [u8]> {
+        let kind = if bits == 2 { t.mapped_q2tp().is_some() } else { t.mapped_q4tp().is_some() };
+        if t.rows() != rows || t.cols() != cols || !kind {
+            return Err(format!("qwen4 cuda: an expert matrix is not q{bits}tp {rows}x{cols}"));
         }
         match t.mapped_bytes() {
             Some(b) if b.len() == len => Ok(b),
@@ -1042,9 +1052,9 @@ fn expert_parts<'a>(f: &'a DenseFfn, d: &Dims) -> Res<[&'a [u8]; 3]> {
         }
     };
     Ok([
-        part(&f.gate_proj, d.inter, d.h, d.sgu)?,
-        part(&f.up_proj, d.inter, d.h, d.sgu)?,
-        part(&f.down_proj, d.h, d.inter, d.sd)?,
+        part(&f.gate_proj, d.inter, d.h, d.sgu, d.gbits)?,
+        part(&f.up_proj, d.inter, d.h, d.sgu, d.gbits)?,
+        part(&f.down_proj, d.h, d.inter, d.sd, 4)?,
     ])
 }
 
@@ -1513,6 +1523,8 @@ impl Dev {
         if ne == 0 || inter == 0 || !h.is_multiple_of(32) || !inter.is_multiple_of(32) || cfg.compress_ratio == 0 {
             return Err("qwen4 cuda: unexpected expert shapes".into());
         }
+        // the experts' gate and up: q2tp (the 2-bit codec) or q4tp
+        let gbits = if first.moe.experts.first().is_some_and(|e| e.gate_proj.mapped_q2tp().is_some()) { 2 } else { 4 };
         let d = Dims {
             h,
             hc: cfg.hc,
@@ -1537,8 +1549,9 @@ impl Dev {
             nfreq: inv_freq.len(),
             ne,
             inter,
-            sgu: q4_bytes(inter, h),
+            sgu: if gbits == 2 { q2_bytes(inter, h) } else { q4_bytes(inter, h) },
             sd: q4_bytes(h, inter),
+            gbits,
             vocab: globals.lm_head.rows(),
             ple_k: cfg.ple_kernel.max(1),
             ple_dil: cfg.ple_dilation.max(1),
@@ -2642,7 +2655,7 @@ impl Core {
                         let dsh = (UNIT_ROWS * (32 * (gd | 1) + gd) + t.d_rb * 32) * 4;
                         unsafe {
                             c.launch(
-                                sm.exp_gu,
+                                if d.gbits == 2 { sm.exp_gu2 } else { sm.exp_gu },
                                 (d.inter.div_ceil(t.g_rb) as u32, nu as u32),
                                 t.g_t as u32,
                                 gsh,
@@ -2655,7 +2668,7 @@ impl Core {
                                 (d.h.div_ceil(t.d_rb) as u32, nu as u32),
                                 t.d_t as u32,
                                 dsh,
-                                kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32),
+                                kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
                             )
                         }?;
                         go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
@@ -2734,7 +2747,7 @@ impl Core {
                 let dsh = (cmax * (32 * (gd | 1) + gd) + t.d_rb * 32) * 4;
                 unsafe {
                     c.launch(
-                        sm.exp_gu,
+                        if d.gbits == 2 { sm.exp_gu2 } else { sm.exp_gu },
                         (d.inter.div_ceil(t.g_rb) as u32, nu as u32),
                         t.g_t as u32,
                         gsh,
@@ -2747,7 +2760,7 @@ impl Core {
                         (d.h.div_ceil(t.d_rb) as u32, nu as u32),
                         t.d_t as u32,
                         dsh,
-                        kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32),
+                        kargs!(s.slots.ptr, s.g.ptr, s.d.ptr, d.inter as i32, d.h as i32, t.d_rb as i32, d.sgu as u64),
                     )
                 }?;
                 go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
@@ -2823,7 +2836,7 @@ impl Core {
             self.put(s.rowtok.ptr, &rowtok)?;
             self.put(s.tokrow.ptr, &tokrow)?;
             go!(c, q.expand_exp, (blocks(d.inter * d.h / 8), (3 * b) as u32), 256;
-                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi);
+                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi, d.gbits as i32);
             go!(c, q.gather, (blocks(rows * d.h), 1), 256; s.folded_h.ptr, s.rowtok.ptr, s.xg.ptr, rows as i32, d.h as i32, self.hi);
             let (gs, xs, as_, ds) = (d.inter * d.h, ne_max * d.h, ne_max * d.inter, ne_max * d.h);
             unsafe {
@@ -2864,7 +2877,7 @@ impl Core {
         if let Some(sh) = &lw.shared {
             self.put(s.slots.ptr, &[sh.ptr])?;
             go!(c, q.expand_exp, (blocks(d.inter * d.h / 8), 3), 256;
-                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi);
+                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, d.inter as i32, d.h as i32, self.hi, d.gbits as i32);
             // one GEMM per projection over all tokens, f32 results
             self.gemm_w(s.wg.ptr, d.inter, d.h, s.folded_h.ptr, n, s.g.ptr, self.gw)?;
             self.gemm_w(s.wu.ptr, d.inter, d.h, s.folded_h.ptr, n, s.u.ptr, self.gw)?;
