@@ -9697,6 +9697,121 @@ impl Pipeline {
         Some((logits, x))
     }
 
+    /// The round's `k` greedy drafts on the CUDA hybrid arm as ONE graph
+    /// (`gpu_cuda::mtp_chain`): the block input, the block and the shortlist
+    /// head k times, each step's token embedding gathered on the card from
+    /// the argmax before it. Err(false): declined before any state changed
+    /// (the per-step loop takes the round); Err(true): failed after the
+    /// block's mirror moved.
+    #[cfg(feature = "cuda")]
+    fn mtp_draft_chain_cuda(&self, m: &MtpModule, hidden: &[f32], t_next: u32, position: usize, k: usize) -> Result<Vec<u32>, bool> {
+        let position = position.saturating_sub(self.mtp_pos_base);
+        if !crate::gpu::cuda_active()
+            || !Self::mtp_chain_on()
+            || std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
+            || self.draft_full_streak > 0
+            || !self.mtp_graph_ok(m)
+            || hidden.len() != self.hidden_size
+        {
+            return Err(false);
+        }
+        let lw = &m.layer;
+        let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias } = &lw.attn else {
+            return Err(false);
+        };
+        let FfnKind::Dense(d) = &lw.ffn else {
+            return Err(false);
+        };
+        if !d.segs.is_empty() {
+            return Err(false);
+        }
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            let (_, i, kind, rs) = t.graph_weight()?;
+            Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false })
+        }
+        let mk = || -> Option<_> {
+            let (model, _, _, _) = wq.graph_weight()?;
+            let (_, li, lkind, lrs) = self.weights.lm_head.graph_weight()?;
+            if lkind != 6 {
+                return None;
+            }
+            let rows = Self::draft_vocab_rows(self.weights.lm_head.rows());
+            let lm = crate::gpu::GraphW { idx: li, kind: lkind, row_scale: lrs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            let eh = gw(&m.eh_proj)?;
+            let layer = crate::gpu::GraphLayer {
+                mhc: None,
+                input_norm: &lw.input_norm,
+                attn: crate::gpu::GraphAttn::Full {
+                    wq: gw(wq)?,
+                    wk: gw(wk)?,
+                    wv: gw(wv)?,
+                    wo: gw(wo)?,
+                    q_norm: q_norm.as_deref(),
+                    k_norm: k_norm.as_deref(),
+                    late_qk_norm: self.qk_norm_after_rope,
+                    bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                    output_gate: *output_gate,
+                    cpu_k: m.kv.k_heads(),
+                    cpu_v: m.kv.v_heads(),
+                    cpu_base: m.kv.base(),
+                    geom: None,
+                    head_gate: None,
+                },
+                post_norm: &lw.post_norm,
+                attn_out_norm: None,
+                ffn_out_norm: None,
+                layer_scale: None,
+                ffn: crate::gpu::GraphFfn::Dense {
+                    gate: gw(&d.gate_proj)?,
+                    up: gw(&d.up_proj)?,
+                    down: gw(&d.down_proj)?,
+                    act: d.act.graph_act()?,
+                    limit: 0.0,
+                    hot: None,
+                },
+            };
+            // the embedding: q4tp in the same file (the chain gathers its rows)
+            let (emodel, ei, ekind, ers) = self.weights.embed_tokens.graph_weight()?;
+            if ekind != 6 || !std::sync::Arc::ptr_eq(emodel, model) || crate::prism::is_inverse_embedding(model, &model.tensors[ei].name) {
+                return None;
+            }
+            let emb = crate::gpu::GraphW { idx: ei, kind: ekind, row_scale: ers, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            Some((model.clone(), lm, rows, eh, layer, emb))
+        };
+        let Some((model, lm, rows, eh, layer, emb)) = mk() else {
+            return Err(false);
+        };
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let e0 = self.embed_single(t_next);
+        crate::gpu_cuda::mtp_chain(
+            &model,
+            self.mtp_kv_id(),
+            &layer,
+            &self.inv_freq,
+            hidden,
+            &e0,
+            t_next,
+            k,
+            self.num_heads,
+            nkv,
+            hd,
+            self.attn_scale,
+            rd,
+            self.hidden_size,
+            position,
+            self.kv_cache.max_seq_len,
+            self.norm_style == cortiq_core::NormStyle::Gemma,
+            self.rms_eps as f32,
+            (&lm, rows),
+            &m.final_norm,
+            &eh,
+            &m.enorm,
+            &m.hnorm,
+            &emb,
+            Self::MTP_LAYER_BASE,
+        )
+    }
+
     /// The warm-ups of one speculative round on the device: every accepted
     /// (hidden, token) pair as ONE batched graph run over the MTP block
     /// (no head) — its kv_append lands the pairs in the block's mirror.
@@ -10293,6 +10408,41 @@ impl Pipeline {
                 }
                 Err(true) => {
                     tracing::error!("mtp Metal draft chain failed after commit");
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                Err(false) => {}
+            }
+        }
+        // CUDA hybrid arm, greedy: the whole chain as one graph (device
+        // argmax and embedding gather between the steps). A suppress list
+        // whose ids all sit past the draft shortlist cannot change its
+        // argmax. A decline hands the round to the per-step loop below; a
+        // failure after admission is terminal, like any graph failure.
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active()
+            && !dflash_round
+            && !sampling
+            && !spec_dbg
+            && drafts.is_empty()
+            && self.mtp_graph_mode != Some(false)
+            && (!greedy_pen
+                || (cfg.repetition_penalty == 1.0
+                    && cfg.presence_penalty == 0.0
+                    && cfg.suppress_tokens.iter().all(|&t| (t as usize) >= Self::draft_vocab_rows(self.weights.lm_head.rows()))))
+        {
+            match self.mtp_draft_chain_cuda(m, &hx, t_next, next_pos - 1, k_spec) {
+                Ok(ids) => {
+                    self.mtp_graph_mode = Some(true);
+                    drafts = ids;
+                    spec_stamp("d.chain");
+                }
+                Err(true) => {
+                    tracing::error!("cuda draft chain failed after admission");
                     self.clear_sequence_state();
                     self.graph_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);

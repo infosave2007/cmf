@@ -1048,6 +1048,76 @@ extern "C" __global__ void hy_gdn_restore_ring(const u64* __restrict__ tab, int 
 }
 
 
+// ------------------------------------------------- the MTP draft chain
+//
+// Step j's token embedding: row tok[j] of a q4tp matrix in the tensor-core
+// layout (`hy_repack`'s: the shortlist rows of the embedding), f32 into e,
+// a thread a column; a token past the rows gives a zero row (a draft no
+// verify keeps). The weight is (nibble - 8) exp2(lo + code step), as the
+// tensor-core kernel reads it.
+extern "C" __global__ void hy_embed_gather(const uint2* __restrict__ T, const u8* __restrict__ Cc,
+                                           const float2* __restrict__ par, int rows, int cols,
+                                           const int* __restrict__ tok, int j, float* __restrict__ e)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const int r = tok[j];
+    if (r < 0 || r >= rows) {
+        e[c] = 0.0f;
+        return;
+    }
+    const int gpr = cols >> 5;
+    const int tile = r >> 4, rr = r & 15, g = c >> 5, kk = c & 31;
+    // column kk of the group: step s (k 0..15 or 16..31), register a_m of
+    // the row half and k half, the low or high element of the pair
+    const int s = kk >> 4, q = kk & 15, m = ((q >> 3) << 1) + (rr >> 3), tig = (q & 7) >> 1, lh = q & 1;
+    const size_t tg = (size_t)tile * gpr + g;
+    const uint2 X = T[tg * 32 + (rr & 7) * 4 + tig];
+    const u32 w = s ? X.y : X.x;
+    const int nib = (int)((w >> (4 * (m + 4 * lh))) & 15u);
+    const float2 p = par[r];
+    e[c] = __fmul_rn((float)(nib - 8), exp2f(fmaf((float)Cc[tg * 16 + rr], p.y, p.x)));
+}
+
+// The first of the largest of x[0..n) into out[j] (NaN never wins); one
+// block.
+extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int* __restrict__ out, int j)
+{
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    float bv = -INF;
+    int bi = 0x7fffffff;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = x[i];
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(FULL, bv, o);
+        const int oi = __shfl_xor_sync(FULL, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) {
+        sv[warp] = bv;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int w = 1; w < NW; w++)
+            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) {
+                bv = sv[w];
+                bi = si[w];
+            }
+        out[j] = bi == 0x7fffffff ? 0 : bi;
+    }
+}
+
 // The prompt path's FFN middle from a gate/up pair GEMM: y [B][2 inter] in
 // the pair's row order (tile t: 8 gate rows, then the same 8 up rows) into
 // f16 xh [B][inter] = silu(gate) * up / 16.

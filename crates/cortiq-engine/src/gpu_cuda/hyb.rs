@@ -142,6 +142,8 @@ pub(super) struct HFuncs {
     rs_ring: cs::CUfunction,
     scan4: cs::CUfunction,
     rs_scan4: cs::CUfunction,
+    gather: cs::CUfunction,
+    argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
     repack: cs::CUfunction,
     qk: cs::CUfunction,
@@ -187,6 +189,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         rs_ring: func(module, "hy_gdn_restore_ring")?,
         scan4: func(module, "hy_gdn_scan4")?,
         rs_scan4: func(module, "hy_gdn_restore_scan4")?,
+        gather: func(module, "hy_embed_gather")?,
+        argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         repack: func(module, "hy_repack")?,
         qk: func(module, "hy_qk")?,
@@ -758,6 +762,21 @@ pub(super) struct HState {
     graphs: HashMap<(u64, u64, usize, usize, bool, bool, u64), GraphRec>,
     plans: HashMap<(u64, usize, usize, bool), Arc<HPlan>>,
     gdn: HashMap<(u64, usize), GdnState>,
+    /// The MTP draft chain's table and norms (`mtp_chain`).
+    chain: Option<ChainRes>,
+    /// The chain's eh_proj job tables by (plan, tensor): their output is
+    /// that plan's `h`.
+    chain_sets: HashMap<(u64, usize), MmaSet>,
+}
+
+/// The draft chain's resources for one model and shortlist: the shortlist
+/// rows of the embedding (a draft's token is always one of them), repacked
+/// for the tensor-core layout, and the block input's two norms.
+struct ChainRes {
+    key: (u64, usize, usize, u64, u64),
+    emb: DevMat,
+    enorm: Buf,
+    hnorm: Buf,
 }
 
 /// Does this stack belong to the hybrid arm? (A GDN layer, or full attention
@@ -1588,7 +1607,7 @@ fn book(
 /// host, so a stream capture can record it. `tape`: keep what a verify
 /// needs to step back.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<()> {
+unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u64, tabp: u64) -> Res<()> {
     let fx = &plan.fx;
     let (hidden, nh, nkv, hd) = (plan.hidden, plan.nh, plan.nkv, plan.hd);
     let (eps, gemma_i, n_i) = (plan.eps, plan.gemma as i32, n as i32);
@@ -1693,7 +1712,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                 let (kp, vp) = (lb[0], lb[1]);
                 let far = bk.far[li];
                 let (fm, fscale, frect) = bk.farp[li];
-                let cip = plan.ci.ptr + (ai * 8 * 4) as u64;
+                let cip = cib + (ai * 8 * 4) as u64;
                 let w = &bk.ci[ai * 8..ai * 8 + 8];
                 ai += 1;
                 let (n0_i, slot0, rb_i, ncap_i, nbcap_i, r0) = (w[0], w[1], w[2], w[3], w[4], 0i32);
@@ -1724,7 +1743,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool) -> Res<
                         0,
                         kargs!(
                             plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
-                            plan.tab.ptr, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, n_i, cip, nul16
+                            tabp, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, n_i, cip, nul16
                         ),
                     )?;
                     // a grid for any record: blocks past the call's keys leave
@@ -1860,7 +1879,7 @@ unsafe fn run_small(
             cu::memcpy_htod_async(plan.ci.ptr, &bk.ci, c.stream).map_err(derr)?;
         }
         if !graphs_on() {
-            launch(c, plan, &bk, n, tape)?;
+            launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr)?;
             if head {
                 head_launch(c, plan, n)?;
             }
@@ -1887,7 +1906,7 @@ unsafe fn run_small(
                 eprintln!("cuda hybrid: recording a graph for {n} rows (tape {tape}, head {head}): {why}");
             }
             let exec = capture(c, || {
-                launch(c, plan, &bk, n, tape)?;
+                launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr)?;
                 if head {
                     head_launch(c, plan, n)?;
                 }
@@ -2036,6 +2055,202 @@ pub(super) fn token(
             tracing::error!("cuda hybrid token graph failed: {e}");
             let _ = c.sync();
             TokenGraphOutcome::Failed
+        }
+    }
+}
+
+/// The round's `k` greedy drafts of an MTP block in ONE graph: per step,
+/// the block input (the token's embedding and the hidden row, each RMS-normed,
+/// through eh_proj), the block over its K/V mirror at `position + j`, the head
+/// over the shortlist and its argmax, whose token the next step's embedding
+/// is gathered for on the card. One upload, one launch, the k ids back.
+/// `e0` is the embedding of `t0` (the host's); `embed_row(id, out)` fills a
+/// shortlist row the first time the table is built. Err(false): declined
+/// before any state changed; Err(true): failed after the mirror moved.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mtp_chain(
+    c: &'static Ctx,
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: &GraphLayer,
+    invf: &[f32],
+    h0: &[f32],
+    e0: &[f32],
+    t0: u32,
+    k: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    attn_scale: f32,
+    rd: usize,
+    hidden: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    lm_head: (&GraphW, usize),
+    final_norm: &[f32],
+    eh: &GraphW,
+    enorm: &[f32],
+    hnorm: &[f32],
+    embed: &GraphW,
+    layer_base: usize,
+) -> Result<Vec<u32>, bool> {
+    let rows = lm_head.1;
+    if k == 0 || k > NMAX || h0.len() != hidden || e0.len() != hidden || enorm.len() != hidden || hnorm.len() != hidden {
+        return Err(false);
+    }
+    if position + k >= cap || eh.kind != 6 || embed.kind != 6 || embed.prism != crate::gpu::GraphPrismOp::None || hidden % 1024 != 0 {
+        return Err(false);
+    }
+    let layers = std::slice::from_ref(layer);
+    let mut st = c.st.lock().unwrap();
+    if c.current().is_err() {
+        return Err(false);
+    }
+    let st = &mut *st;
+    let plan = match plan_for(c, st, model, layers, layer_base, Some(lm_head), final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position) {
+        Ok(p) => p,
+        Err(e) => {
+            decline("hybrid draft chain", &e);
+            return Err(false);
+        }
+    };
+    if plan.pstride < 2 * hidden || plan.layers.iter().any(|l| !matches!(l.mix, Mix::Attn(_))) {
+        decline("hybrid draft chain", "planes narrower than the block input, or a GDN layer");
+        return Err(false);
+    }
+    // the table, the norms and eh_proj's job tables (built once)
+    let key = (model.uid(), embed.idx, rows, crate::gpu::fp_f32(enorm), crate::gpu::fp_f32(hnorm));
+    let prep = |st: &mut State| -> Res<()> {
+        if st.hyb.chain.as_ref().is_none_or(|r| r.key != key) {
+            if let Some(old) = st.hyb.chain.take() {
+                c.resident.fetch_sub(old.emb.held, Ordering::Relaxed);
+            }
+            use cortiq_core::quant::q4tp_sections;
+            let entry = model.tensors.get(embed.idx).ok_or("embedding index out of range")?;
+            let erows = *entry.shape.first().ok_or("embedding without a shape")?;
+            if entry.shape.get(1) != Some(&hidden) || rows > erows || rows % 16 != 0 {
+                return Err(format!("embedding {:?} against a {rows}-row shortlist of width {hidden}", entry.shape));
+            }
+            // the first `rows` rows as a payload of their own: nibbles,
+            // ladders, codes, each section's leading rows
+            let bytes = model.entry_bytes(entry);
+            let (po, co, stride) = q4tp_sections(erows, hidden);
+            let (po2, _, _) = q4tp_sections(rows, hidden);
+            if bytes.len() < co + erows * stride {
+                return Err("embedding payload shorter than its planes".into());
+            }
+            let mut sub = Vec::with_capacity(po2 + rows * (4 + stride));
+            sub.extend_from_slice(&bytes[..po2]);
+            sub.extend_from_slice(&bytes[po..po + rows * 4]);
+            sub.extend_from_slice(&bytes[co..co + rows * stride]);
+            let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
+            let (w, aux0, aux1) = repack_on_card(c, &fx, &[&sub], rows, rows, hidden)?;
+            let emb = DevMat { kind: 6, rows, cols: hidden, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: sub.len() as u64 };
+            c.resident.fetch_add(emb.held, Ordering::Relaxed);
+            st.hyb.chain = Some(ChainRes { key, emb, enorm: Buf::from_slice(enorm)?, hnorm: Buf::from_slice(hnorm)? });
+        }
+        if !st.hyb.chain_sets.contains_key(&(plan.id, eh.idx)) {
+            let m = hmat(c, st, model, eh, hidden, 2 * hidden)?;
+            let ms = mmaset(&[(&m, plan.h.ptr, 0, hidden, hidden)])?;
+            st.hyb.chain_sets.insert((plan.id, eh.idx), ms);
+        }
+        Ok(())
+    };
+    if let Err(e) = prep(st) {
+        decline("hybrid draft chain", &e);
+        return Err(false);
+    }
+    if let Err((hard, e)) = admit(c, st, &plan, layers, kv_id, layer_base, position, k, 0, &[false]) {
+        decline("hybrid draft chain", &e);
+        return Err(hard);
+    }
+    // from here the mirror moves: a failure is terminal
+    let run = |st: &mut State| -> Res<Vec<u32>> {
+        let mut books = Vec::with_capacity(k);
+        for j in 0..k {
+            books.push(book(c, st, &plan, kv_id, layer_base, position + j, 1, false, cap, &[false])?);
+        }
+        let cilen = books[0].ci.len();
+        let tabrow = plan.invf.len() * 2;
+        let ci_b = st.scr(c, "hy_chain_ci", NMAX * cilen.max(1) * 4)?;
+        let tab_b = st.scr(c, "hy_chain_tab", NMAX * tabrow.max(1) * 4)?;
+        let e_b = st.scr(c, "hy_chain_e", NMAX * hidden * 4)?;
+        let h0_b = st.scr(c, "hy_chain_h0", hidden * 4)?;
+        let tok_b = st.scr(c, "hy_chain_tok", (NMAX + 1) * 4)?;
+        let ci: Vec<i32> = books.iter().flat_map(|b| b.ci.iter().copied()).collect();
+        let tab = rope_rows(&plan.invf, position..position + k);
+        let ch = st.hyb.chain.as_ref().unwrap();
+        let (etab, ecod, epar, enp, hnp) = (ch.emb.w.ptr, ch.emb.aux0(), ch.emb.aux1.as_ref().map_or(0, |b| b.ptr), ch.enorm.ptr, ch.hnorm.ptr);
+        let tok0 = [t0 as i32];
+        unsafe {
+            if !ci.is_empty() {
+                cu::memcpy_htod_async(ci_b, &ci, c.stream).map_err(derr)?;
+            }
+            if !tab.is_empty() {
+                cu::memcpy_htod_async(tab_b, &tab, c.stream).map_err(derr)?;
+            }
+            cu::memcpy_htod_async(e_b, e0, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(h0_b, h0, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(tok_b, &tok0, c.stream).map_err(derr)?;
+        }
+        let ms = &st.hyb.chain_sets[&(plan.id, eh.idx)];
+        let fx = &plan.fx;
+        let (hid_i, gemma_i, rows_i) = (hidden as i32, gemma as i32, rows as i32);
+        let ps_i = plan.pstride as i32;
+        let (p0, p1, p2) = (plan.pp[0].ptr, plan.pp[1].ptr, plan.pp[2].ptr);
+        let off = (hidden * 2) as u64;
+        let planes = Planes { p0, p1, p2, stride: plan.pstride };
+        let body = || -> Res<()> {
+            let nullp = 0u64;
+            for (j, bk) in books.iter().enumerate() {
+                let ej = e_b + (j * hidden * 4) as u64;
+                let hsrc = if j == 0 { h0_b } else { plan.h.ptr };
+                let (j_i, j1_i) = (j as i32, j as i32 + 1);
+                let (q0, q1, q2) = (p0 + off, p1 + off, p2 + off);
+                unsafe {
+                    if j > 0 {
+                        c.launch(fx.gather, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(etab, ecod, epar, rows_i, hid_i, tok_b, j_i, ej))?;
+                    }
+                    c.launch(fx.rmsnorm2, (hidden.div_ceil(1024) as u32, 1), 256, 0, kargs!(ej, enp, nullp, hid_i, eps, gemma_i, p0, p1, p2, ps_i))?;
+                    c.launch(fx.rmsnorm2, (hidden.div_ceil(1024) as u32, 1), 256, 0, kargs!(hsrc, hnp, nullp, hid_i, eps, gemma_i, q0, q1, q2, ps_i))?;
+                    ms.run(c, fx, &planes, 2 * hidden, 1)?;
+                    launch(c, &plan, bk, 1, false, ci_b + (j * cilen * 4) as u64, tab_b + (j * tabrow * 4) as u64)?;
+                    head_launch(c, &plan, 1)?;
+                    c.launch(fx.argmax, (1, 1), 1024, 0, kargs!(plan.logits.ptr, rows_i, tok_b, j1_i))?;
+                }
+            }
+            Ok(())
+        };
+        unsafe {
+            if graphs_on() {
+                let gkey = (plan.id, kv_id, layer_base, k, true, true, 0xC4A1_0000u64);
+                let mut sig: Vec<u64> = books[0].layers.iter().flatten().copied().collect();
+                sig.extend(books[0].scratch);
+                sig.extend([etab, ecod, epar, enp, hnp, ci_b, tab_b, e_b, h0_b, tok_b, ms.bufs[0].ptr, ms.bufs[1].ptr]);
+                if st.hyb.graphs.get(&gkey).is_none_or(|g| g.sig != sig) {
+                    GRAPH_REC.fetch_add(1, Ordering::Relaxed);
+                    let exec = capture(c, body)?;
+                    st.hyb.graphs.insert(gkey, GraphRec { exec, sig });
+                }
+                GRAPH_RUN.fetch_add(1, Ordering::Relaxed);
+                curesult(cs::cuGraphLaunch(st.hyb.graphs[&gkey].exec, c.stream), "graph launch")?;
+            } else {
+                body()?;
+            }
+            let mut ids = vec![0i32; k + 1];
+            cu::memcpy_dtoh_async(ids.as_mut_slice(), tok_b, c.stream).map_err(derr)?;
+            c.sync()?;
+            Ok(ids[1..].iter().map(|&t| t as u32).collect())
+        }
+    };
+    match run(st) {
+        Ok(ids) => Ok(ids),
+        Err(e) => {
+            tracing::error!("cuda hybrid draft chain failed: {e}");
+            let _ = c.sync();
+            Err(true)
         }
     }
 }

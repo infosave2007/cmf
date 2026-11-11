@@ -2552,6 +2552,43 @@ pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize,
     }
 }
 
+/// The hybrid arm's MTP draft chain: `k` greedy drafts in one graph
+/// (`hyb::mtp_chain`). Err(false) declined, Err(true) failed after admission.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_chain(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: &GraphLayer,
+    invf: &[f32],
+    h0: &[f32],
+    e0: &[f32],
+    t0: u32,
+    k: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    attn_scale: f32,
+    rd: usize,
+    hidden: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    lm_head: (&GraphW, usize),
+    final_norm: &[f32],
+    eh: &GraphW,
+    enorm: &[f32],
+    hnorm: &[f32],
+    embed: &GraphW,
+    layer_base: usize,
+) -> Result<Vec<u32>, bool> {
+    let Some(c) = ctx() else { return Err(false) };
+    hyb::mtp_chain(
+        c, model, kv_id, layer, invf, h0, e0, t0, k, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps, lm_head,
+        final_norm, eh, enorm, hnorm, embed, layer_base,
+    )
+}
+
 /// After a partial speculative acceptance: the sequence's GDN states back to
 /// the verify window's start, the accepted rows `..= slot` replayed.
 pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
