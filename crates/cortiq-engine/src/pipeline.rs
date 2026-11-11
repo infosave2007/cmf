@@ -6627,10 +6627,20 @@ impl Pipeline {
         // exactly (`greedy_pen`, the plain loop's arithmetic), so the
         // text is the plain path's and only the round's shape changes.
         // Measured on this M4 — see the report for the interleaved run.
+        //
+        // On the CUDA hybrid arm a suppress list alone (a no-think chat
+        // masks `<think>`) does not count: it reads no history, the draft
+        // and the verify rows mask the same ids, and the verify rows are
+        // the plain rows bit for bit, so the round (`greedy_pen`) keeps the
+        // plain text. Qwen3.8-27B q4tp, RTX 3090, a no-think chat over
+        // `cortiq serve`: 44.8 tok/s plain before this.
+        let suppress_only_ok = crate::gpu::cuda_active()
+            && self.sampler_config.repetition_penalty == 1.0
+            && self.sampler_config.presence_penalty == 0.0;
         let penalized = !metal_graph
             && (self.sampler_config.repetition_penalty != 1.0
                 || self.sampler_config.presence_penalty != 0.0
-                || !self.sampler_config.suppress_tokens.is_empty());
+                || (!self.sampler_config.suppress_tokens.is_empty() && !suppress_only_ok));
         // …and not on wgpu-over-Metal: the batched verify graph there
         // returned 0 accepted drafts and garbage text on a GDN hybrid
         // (16.08, Qwen3.5-0.8B) while Vulkan is bit-exact; the Mac's
@@ -10283,9 +10293,12 @@ impl Pipeline {
         // 3090): a copy may run 15 drafts deep there.
         let cuda_window = crate::gpu::cuda_active();
         let k_room = room.min(if cuda_window && self.spec_lookup_wide { 15 } else { 7 });
+        // A suppress list alone scores a continuation the same at any
+        // history, so the CUDA window takes lookups under it too.
+        let history_free = cfg.repetition_penalty == 1.0 && cfg.presence_penalty == 0.0;
         if (metal_native || cuda_window)
             && !sampling
-            && !greedy_pen
+            && (!greedy_pen || (cuda_window && history_free))
             && k_mtp < k_room
             && drafts.len() == k_mtp
             && Self::spec_lookup_on()
