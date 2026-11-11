@@ -1,0 +1,23 @@
+Refactor this code for readability and performance, then explain each change:
+
+```python
+def f(d):
+    r = []
+    for k in d.keys():
+        if d[k] != None:
+            if type(d[k]) == list:
+                for i in range(len(d[k])):
+                    if d[k][i] > 0:
+                        r.append((k, d[k][i]))
+            else:
+                if d[k] > 0:
+                    r.append((k, d[k]))
+    s = sorted(r, key=lambda x: x[1], reverse=True)
+    out = {}
+    for k, v in s:
+        if k in out:
+            out[k] = out[k] + [v]
+        else:
+            out[k] = [v]
+    return out
+```

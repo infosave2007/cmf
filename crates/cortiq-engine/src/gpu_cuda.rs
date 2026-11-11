@@ -573,6 +573,8 @@ struct State {
     scratch: HashMap<&'static str, Buf>,
     attn: HashMap<(usize, usize), AttnFuncs>,
     kv_hint: usize,
+    /// The Qwen3.5-family hybrid arm's plans and recurrent states.
+    hyb: hyb::HState,
 }
 
 struct Ctx {
@@ -606,6 +608,10 @@ macro_rules! kargs {
 /// The qwen4_exp stack (hyper-connection mixes, GDN, sparse attention, MoE)
 /// as whole-chunk GEMMs; declared after `kargs!`, which it uses.
 pub(crate) mod qwen4;
+
+/// The Qwen3.5-family hybrid (GDN + gated full attention) behind the graph
+/// contracts; declared after `kargs!`, which it uses.
+mod hyb;
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
     let opts = cudarc::nvrtc::CompileOptions { options: defs, arch, ..Default::default() };
@@ -813,6 +819,27 @@ impl Ctx {
             cu::launch_kernel(
                 f,
                 (grid.0.max(1), grid.1.max(1), 1),
+                (block, 1, 1),
+                shared as u32,
+                self.stream,
+                params,
+            )
+        }
+        .map_err(derr)
+    }
+
+    unsafe fn launch_3d(
+        &self,
+        f: cs::CUfunction,
+        grid: (u32, u32, u32),
+        block: u32,
+        shared: usize,
+        params: &mut [*mut c_void],
+    ) -> Res<()> {
+        unsafe {
+            cu::launch_kernel(
+                f,
+                (grid.0.max(1), grid.1.max(1), grid.2.max(1)),
                 (block, 1, 1),
                 shared as u32,
                 self.stream,
@@ -1740,6 +1767,12 @@ pub fn forward_token_graph(
     hidden_too: bool,
 ) -> TokenGraphOutcome {
     let Some(c) = ctx() else { return TokenGraphOutcome::Declined };
+    if hyb::wants(layers, nh, nkv, hd) {
+        return hyb::token(
+            c, model, kv_id, layers, o1, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
+            lm_head, final_norm, logits, loop_norm_at, steps, layers_run, layer_base, hidden_too,
+        );
+    }
     let mut st = c.st.lock().unwrap();
     // A far-field state the card has moved has no host copy to return to
     // (the host's is the seal's): from there a refusal is a failure, not a
@@ -2050,12 +2083,19 @@ pub fn forward_batch_graph_at(
     attn_scale: f32,
     k: usize,
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
-    spec: bool,
+    spec: Option<crate::gpu::SpecTail<'_>>,
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
     let Some(c) = ctx() else { return BatchGraphOutcome::Declined };
+    if hyb::wants(layers, nh, nkv, hd) {
+        let defer = BATCH_DEFER.with(|d| d.get());
+        return hyb::batch(
+            c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
+            attn_scale, k, o1, spec, layers_run, defer,
+        );
+    }
     let b = k;
-    if spec || o1.iter().any(|v| v.is_some()) {
+    if spec.is_some() || o1.iter().any(|v| v.is_some()) {
         decline("batch", "a speculative verify tail or a sealed far field");
         return BatchGraphOutcome::Declined;
     }
@@ -2367,6 +2407,7 @@ pub fn kv_reset(kv_id: u64) {
     if c.current().is_err() || c.sync().is_err() {
         return;
     }
+    hyb::reset(c, &mut st, kv_id);
     st.kv.retain(|&(id, _), m| {
         if id == kv_id {
             c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
@@ -2446,6 +2487,39 @@ fn qcap_read(layers: Vec<usize>, bufs: Vec<(usize, usize, Buf)>) -> Option<Vec<(
 }
 
 /// Rows a layer's mirror holds (absolute), None without a mirror.
+/// y [n][rows] = W x [n][cols] on the card (a q4tp graph weight of the
+/// hybrid arm): false when the backend cannot take it.
+pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize, x: &[f32], n: usize, y: &mut [f32]) -> bool {
+    match hyb::rows_matvec(model, gw, rows, cols, x, n, y) {
+        Ok(()) => true,
+        Err(e) => {
+            decline("rows matvec", &e);
+            false
+        }
+    }
+}
+
+/// After a partial speculative acceptance: the sequence's GDN states back to
+/// the verify window's start, the accepted rows `..= slot` replayed.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
+    hyb::spec_restore(kv_id, slot, base_pos, expected_layers)
+}
+
+/// A recurrent state of this sequence's layer lives on the card.
+pub fn state_resident(kv_id: u64, layer: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let st = c.st.lock().unwrap();
+    hyb::state_resident(&st, kv_id, layer)
+}
+
+/// A GDN layer's state back to the host (`[ring | S]`).
+pub fn gdn_state_read(kv_id: u64, layer: usize) -> Option<Vec<f32>> {
+    let c = ctx()?;
+    let st = c.st.lock().unwrap();
+    c.current().ok()?;
+    hyb::gdn_state_read(c, &st, kv_id, layer)
+}
+
 pub fn kv_stored(kv_id: u64, layer: usize) -> Option<usize> {
     let c = ctx()?;
     c.st.lock().unwrap().kv.get(&(kv_id, layer)).map(|m| m.stored)
@@ -2545,6 +2619,7 @@ pub fn perf_report() {
     if !prof_on() && !debug() {
         return;
     }
+    hyb::report();
     let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
     let toks = TOKENS.load(Ordering::Relaxed).saturating_sub(16);
     if toks > 0 {

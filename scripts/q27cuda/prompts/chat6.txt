@@ -1,0 +1,1 @@
+Write a detailed technical blog post comparing Rust's ownership model with C++ RAII and Go's garbage collector, with code samples in all three languages and a section on when each approach wins.

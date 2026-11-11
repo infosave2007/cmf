@@ -382,6 +382,9 @@ pub struct Pipeline {
     /// held, a running average, and the rounds it sits out after that fell
     /// under `LOOKUP_PAYS`.
     pub spec_lookup_gain: f32,
+    /// CUDA: the context lookup may fill a 16-row verify window (after a
+    /// lookup round whose drafts all held), else 8 rows (one price there).
+    pub spec_lookup_wide: bool,
     pub spec_lookup_rest: u32,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
@@ -4844,6 +4847,7 @@ impl Pipeline {
             dflash_k_adapt: None,
             dflash_acc_ewma: 0.6,
             spec_lookup_gain: 2.0,
+            spec_lookup_wide: false,
             spec_lookup_rest: 0,
             rng,
             sampler_scratch: SamplerScratch::default(),
@@ -9290,14 +9294,45 @@ impl Pipeline {
     /// The block's input from (trunk hidden, token): eh_proj · [enorm(e);
     /// hnorm(h)] — the same arithmetic the per-op path starts with.
     fn mtp_block_input(&mut self, m: &MtpModule, hidden: &[f32], next_token: u32) -> Vec<f32> {
-        let e = self.embed_single(next_token);
-        let mut cat = vec![0.0f32; 2 * self.hidden_size];
-        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
-        inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
-        inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
-        let mut x = vec![0.0f32; self.hidden_size];
-        m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
-        x
+        self.mtp_block_inputs(m, &[(hidden, next_token)])
+    }
+
+    /// The block inputs of several (trunk hidden, token) pairs, `[n][hidden]`.
+    /// On the CUDA hybrid arm eh_proj runs on the card for all of them at
+    /// once (about 1 ms a pair on the host for Qwen3.8-27B's 27 MB matrix,
+    /// tens of microseconds there); everywhere else one host matvec a pair.
+    fn mtp_block_inputs(&mut self, m: &MtpModule, pairs: &[(&[f32], u32)]) -> Vec<f32> {
+        let hs = self.hidden_size;
+        let mut cats = vec![0.0f32; pairs.len() * 2 * hs];
+        for (i, (hidden, tok)) in pairs.iter().enumerate() {
+            let e = self.embed_single(*tok);
+            let cat = &mut cats[i * 2 * hs..(i + 1) * 2 * hs];
+            let (cat_e, cat_h) = cat.split_at_mut(hs);
+            inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+            inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
+        }
+        let mut xs = vec![0.0f32; pairs.len() * hs];
+        #[cfg(feature = "gpu")]
+        if crate::gpu::cuda_active() {
+            if let Some((model, idx, kind, rs)) = m.eh_proj.graph_weight() {
+                let gw = crate::gpu::GraphW {
+                    idx,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
+                };
+                let model = model.clone();
+                if crate::gpu::rows_matvec(&model, &gw, hs, 2 * hs, &cats, pairs.len(), &mut xs) {
+                    return xs;
+                }
+            }
+        }
+        for i in 0..pairs.len() {
+            m.eh_proj.matvec(&cats[i * 2 * hs..(i + 1) * 2 * hs], &mut xs[i * hs..(i + 1) * hs], self.pool.as_deref());
+        }
+        xs
     }
 
     /// Is the MTP block graphable at all (device up, full attention
@@ -9556,10 +9591,8 @@ impl Pipeline {
         let hs = self.hidden_size;
         // Block inputs for every pair (eh_proj on the per-op path, one
         // matvec each — the plan's own prologue).
-        let mut hiddens = Vec::with_capacity(pairs.len() * hs);
-        for (h, t) in pairs {
-            hiddens.extend_from_slice(&self.mtp_block_input(m, h, *t));
-        }
+        let mut hiddens = self.mtp_block_inputs(m, pairs);
+        debug_assert_eq!(hiddens.len(), pairs.len() * hs);
         let lw = &m.layer;
         let AttnKind::Full {
             wq,
@@ -10230,8 +10263,12 @@ impl Pipeline {
         // steps the MTP block took this round: its own round's drafts, the
         // chain run beside a DFlash block, or none
         let mtp_steps = if dflash_round { beside.len() } else { k_mtp };
-        let k_room = room.min(7);
-        if metal_native
+        // The CUDA hybrid arm verifies up to 16 rows on the tensor cores at
+        // about one price (8 rows 1.05x a plain token, 16 about 1.6x on a
+        // 3090): a copy may run 15 drafts deep there.
+        let cuda_window = crate::gpu::cuda_active();
+        let k_room = room.min(if cuda_window && self.spec_lookup_wide { 15 } else { 7 });
+        if (metal_native || cuda_window)
             && !sampling
             && !greedy_pen
             && k_mtp < k_room
@@ -11010,6 +11047,8 @@ impl Pipeline {
             // a lookup's round: what it added over the head's own drafts
             let extra = a.saturating_sub(k_mtp) as f32;
             self.spec_lookup_gain += 0.2 * (extra - self.spec_lookup_gain);
+            // a copy that holds whole earns the long window; a miss goes back
+            self.spec_lookup_wide = a == k_spec;
             if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
                 eprintln!(
                     "spec-lookup: {} drafts from the context, {extra} held (average {:.2})",
@@ -11041,6 +11080,11 @@ impl Pipeline {
         }
 
         if k_env.is_none() && !metal_native && !k_capped {
+            // The depth is the drafter's own: a round the context lookup
+            // lengthened (CUDA) adapts by the chain's drafts and what of them
+            // held, and its wall (a longer verify) is not a depth's price.
+            let lookup_round = k_spec > k_mtp;
+            let (k_spec, a) = (k_mtp, a.min(k_mtp));
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
             // draft it just paid for. Each drafter has its own depth.
@@ -11060,7 +11104,7 @@ impl Pipeline {
             // fifth row costs. A depth's first round pays its scratch and
             // is not counted; a change stands for six rounds.
             let mut planned = false;
-            if !dflash_round {
+            if !dflash_round && !lookup_round {
                 spec_hold_update(&mut self.spec_hold, k_spec, a);
                 let d = k_spec.clamp(1, 7) - 1;
                 let w = t_round.elapsed().as_secs_f32() * 1e3;

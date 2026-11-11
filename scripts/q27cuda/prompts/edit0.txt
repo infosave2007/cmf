@@ -1,0 +1,235 @@
+Here is a CUDA source file:
+
+```cuda
+// Decode attention of the native CUDA backend: one query row against a
+// layer's K/V mirror. Compiled per geometry: HPK query heads per KV head,
+// HD head width (a multiple of 32), DPL = HD / 32 values per lane.
+//
+// The mirror is [row][kv head][HD] f32. A warp owns a key row and reads it
+// once for all HPK heads of the KV group (as the host's `attend_group`
+// does); a block owns `rb` rows and leaves its partial sums for the last
+// kernel to add.
+#define DPL (HD / 32)
+#define INF __int_as_float(0x7f800000)
+
+// S [nh][ncap]: scores of the n visible rows; Mx [nh][nbcap]: block maxima.
+extern "C" __global__ void attn_scores(const float* __restrict__ q, const float* __restrict__ Km,
+                                       float* __restrict__ S, float* __restrict__ Mx,
+                                       int n, int r0, int nkv, float scale, int rb, int ncap, int nbcap)
+{
+    __shared__ float sm[32][HPK];
+    const int g = blockIdx.y, blk = blockIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    float qv[HPK][DPL];
+    for (int j = 0; j < HPK; j++)
+        for (int t = 0; t < DPL; t++) qv[j][t] = q[(g * HPK + j) * HD + lane * DPL + t];
+    float mx[HPK];
+    for (int j = 0; j < HPK; j++) mx[j] = -INF;
+    const int row0 = blk * rb, row1 = min(row0 + rb, n);
+    for (int r = row0 + warp; r < row1; r += NW) {
+        const float* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
+        float kv[DPL];
+        for (int t = 0; t < DPL; t++) kv[t] = kr[t];
+        for (int j = 0; j < HPK; j++) {
+            float a = 0.0f;
+            for (int t = 0; t < DPL; t++) a += qv[j][t] * kv[t];
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            a *= scale;
+            if (lane == 0) S[(size_t)(g * HPK + j) * ncap + r] = a;
+            mx[j] = fmaxf(mx[j], a);
+        }
+    }
+    if (lane == 0)
+        for (int j = 0; j < HPK; j++) sm[warp][j] = mx[j];
+    __syncthreads();
+    if (tid < HPK) {
+        float m = -INF;
+        for (int w = 0; w < NW; w++) m = fmaxf(m, sm[w][tid]);
+        Mx[(size_t)(g * HPK + tid) * nbcap + blk] = m;
+    }
+}
+
+// P [nblk][nh][HD]: each block's sum of exp(s - max) * v; E [nblk][nh]: its
+// sum of exp(s - max).
+extern "C" __global__ void attn_values(const float* __restrict__ S, const float* __restrict__ Mx,
+                                       const float* __restrict__ Vm, float* __restrict__ P, float* __restrict__ E,
+                                       int n, int r0, int nkv, int rb, int ncap, int nblk, int nbcap)
+{
+    __shared__ float sp[8][HPK][HD];
+    __shared__ float se[8][HPK];
+    const int g = blockIdx.y, blk = blockIdx.x, nh = nkv * HPK;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    float mx[HPK];
+    for (int j = 0; j < HPK; j++) {
+        float m = -INF;
+        for (int b = lane; b < nblk; b += 32) m = fmaxf(m, Mx[(size_t)(g * HPK + j) * nbcap + b]);
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        mx[j] = m;
+    }
+    float acc[HPK][DPL];
+    float es[HPK];
+    for (int j = 0; j < HPK; j++) {
+        es[j] = 0.0f;
+        for (int t = 0; t < DPL; t++) acc[j][t] = 0.0f;
+    }
+    const int row0 = blk * rb, row1 = min(row0 + rb, n);
+    for (int r = row0 + warp; r < row1; r += NW) {
+        const float* vr = Vm + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
+        float vv[DPL];
+        for (int t = 0; t < DPL; t++) vv[t] = vr[t];
+        for (int j = 0; j < HPK; j++) {
+            const float e = expf(S[(size_t)(g * HPK + j) * ncap + r] - mx[j]);
+            es[j] += e;
+            for (int t = 0; t < DPL; t++) acc[j][t] += e * vv[t];
+        }
+    }
+    for (int j = 0; j < HPK; j++) {
+        for (int t = 0; t < DPL; t++) sp[warp][j][lane * DPL + t] = acc[j][t];
+        if (lane == 0) se[warp][j] = es[j];
+    }
+    __syncthreads();
+    for (int i = tid; i < HPK * HD; i += blockDim.x) {
+        const int j = i / HD, d = i - j * HD;
+        float s = 0.0f;
+        for (int w = 0; w < NW; w++) s += sp[w][j][d];
+        P[((size_t)blk * nh + g * HPK + j) * HD + d] = s;
+    }
+    if (tid < HPK) {
+        float s = 0.0f;
+        for (int w = 0; w < NW; w++) s += se[w][tid];
+        E[(size_t)blk * nh + g * HPK + tid] = s;
+    }
+}
+
+// ao [nh][HD] = (sum of the blocks' partials) / (sum of their weights),
+// times sigmoid(gate[h]) where the layer has a head-wise gate.
+extern "C" __global__ void attn_finish(const float* __restrict__ P, const float* __restrict__ E,
+                                       const float* __restrict__ gate, float* __restrict__ ao, int nblk, int nh)
+{
+    const int h = blockIdx.x;
+    float tot = 0.0f;
+    for (int b = 0; b < nblk; b++) tot += E[(size_t)b * nh + h];
+    const float gg = gate ? 1.0f / (1.0f + expf(-gate[h])) : 1.0f;
+    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
+        float s = 0.0f;
+        for (int b = 0; b < nblk; b++) s += P[((size_t)b * nh + h) * HD + d];
+        ao[h * HD + d] = (tot > 0.0f ? s / tot : s) * gg;
+    }
+}
+
+// ── The far field of a sealed layer (nystrom.rs: far_insert, step) ──────────
+//
+// A sealed layer keeps its near rows — the sinks with the rows chosen to stay
+// exact, then the ring of the window — in one buffer laid out as a K/V
+// mirror, [row][kv head][HD], so `attn_scores` and `attn_values` read them as
+// they read a mirror. The far part of a row's attention comes out of
+// `o1_far_prep` as one more block of P and E and one more maximum of Mx, and
+// `attn_finish` adds it like any other block.
+//
+// QT [nh][m][HD] query landmarks; KT [nkv][m][HD] key landmarks; MU [nh][m][m]
+// the landmark inverse; MZ [nh][2m]: the running maxima, then the far mass at
+// that scale; TH [nh][m][HD] the far numerator at that scale.
+
+// The ring row a new key is about to replace goes into each head's far
+// accumulators. A block a KV group, a thread per (head of the group, landmark).
+extern "C" __global__ void o1_far_insert(const float* __restrict__ NK, const float* __restrict__ NV,
+                                         const float* __restrict__ QT, float* __restrict__ MZ, float* __restrict__ TH,
+                                         int row, int m, int nkv, float scale)
+{
+    const int g = blockIdx.x, tid = threadIdx.x;
+    const int j = tid / m, i = tid - j * m;
+    if (j >= HPK) return;
+    const int h = g * HPK + j;
+    const float* k = NK + ((size_t)row * nkv + g) * HD;
+    const float* v = NV + ((size_t)row * nkv + g) * HD;
+    const float* qt = QT + ((size_t)h * m + i) * HD;
+    float l = 0.0f;
+    for (int d = 0; d < HD; d++) l += qt[d] * k[d];
+    l *= scale;
+    float* mz = MZ + (size_t)h * 2 * m;
+    float mm = mz[i], z = mz[m + i], rs = 1.0f;
+    if (l > mm) {
+        // a new maximum: what is there moves to its scale
+        rs = expf(mm - l);
+        z *= rs;
+        mm = l;
+        mz[i] = l;
+    }
+    const float e = expf(l - mm);
+    mz[m + i] = z + e;
+    float* th = TH + ((size_t)h * m + i) * HD;
+    for (int d = 0; d < HD; d++) th[d] = th[d] * rs + e * v[d];
+}
+
+// The far part of one row's attention, a block a query head (at least m
+// threads, m <= 64): the scores against the key landmarks, the mixing row
+// through the landmark inverse, the joint shift over the near maxima and the
+// far terms, the gains. Leaves block `nblk` of P and E and maximum `nblk` of
+// Mx. A far mass below zero drops the far part of the row, as on the host.
+extern "C" __global__ void o1_far_prep(const float* __restrict__ q, const float* __restrict__ KT,
+                                       const float* __restrict__ MU, const float* __restrict__ MZ,
+                                       const float* __restrict__ TH, float* __restrict__ Mx,
+                                       float* __restrict__ P, float* __restrict__ E,
+                                       int nblk, int nbcap, int m, int nh, float scale, int far_on, int rect_fm)
+{
+    __shared__ float sf[64];
+    __shared__ float su[64];
+    __shared__ float sc[2];
+    const int h = blockIdx.x, g = h / HPK, tid = threadIdx.x;
+    const float* mz = MZ + (size_t)h * 2 * m;
+    if (far_on && tid < m) {
+        const float* kt = KT + ((size_t)g * m + tid) * HD;
+        const float* qh = q + (size_t)h * HD;
+        float s = 0.0f;
+        for (int d = 0; d < HD; d++) s += qh[d] * kt[d];
+        sf[tid] = s * scale;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float c = -INF, f = -INF;
+        for (int b = 0; b < nblk; b++) c = fmaxf(c, Mx[(size_t)h * nbcap + b]);
+        if (far_on) {
+            for (int a = 0; a < m; a++) f = fmaxf(f, sf[a]);
+            for (int b = 0; b < m; b++) c = fmaxf(c, f + mz[b]);
+        }
+        sc[0] = f;
+        sc[1] = c;
+    }
+    __syncthreads();
+    const float f = sc[0], call = sc[1];
+    if (far_on && tid < m) sf[tid] = expf(sf[tid] - f);
+    __syncthreads();
+    if (far_on && tid < m) {
+        const float* mu = MU + (size_t)h * m * m;
+        float s = 0.0f;
+        for (int a = 0; a < m; a++) s += sf[a] * mu[a * m + tid];
+        if (rect_fm) s = fmaxf(s, 0.0f);
+        su[tid] = s * expf(f + mz[tid] - call);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float den = 0.0f;
+        if (far_on)
+            for (int b = 0; b < m; b++) den += su[b] * mz[m + b];
+        sc[0] = den;
+    }
+    __syncthreads();
+    const float den = sc[0];
+    const bool have = far_on && den >= 0.0f;
+    for (int d = tid; d < HD; d += blockDim.x) {
+        float s = 0.0f;
+        if (have) {
+            const float* th = TH + (size_t)h * m * HD + d;
+            for (int b = 0; b < m; b++) s += su[b] * th[(size_t)b * HD];
+        }
+        P[((size_t)nblk * nh + h) * HD + d] = s;
+    }
+    if (tid == 0) {
+        E[(size_t)nblk * nh + h] = have ? den : 0.0f;
+        Mx[(size_t)h * nbcap + nblk] = call;
+    }
+}
+
+```
+
+Rename every kernel parameter `nkv` to `kv_heads` and print the whole file back with that change, nothing else.

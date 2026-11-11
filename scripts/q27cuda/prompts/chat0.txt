@@ -1,0 +1,1 @@
+Write a complete Python module implementing an LRU cache with TTL expiry, thread safety, and type hints. Include a docstring for every method, a small usage example, and unit tests using pytest. Explain your design decisions at the end.
