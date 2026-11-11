@@ -477,6 +477,9 @@ pub struct Pipeline {
     pub(crate) o1_turbo: Option<O1Turbo>,
     /// Over a far field the draft head starts at this prompt row, and counts from it.
     mtp_pos_base: usize,
+    /// A whole prompt's tail rows read by the far field's prefix (the draft
+    /// head is warmed over them).
+    o1_prefix_tail: Vec<f32>,
     /// The CUDA hybrid arm's chat snapshot: the prompt ids before the last
     /// turn's assistant header, whose GDN states the card keeps a copy of
     /// (`gpu::gdn_snapshot`). The next turn that starts with them goes back
@@ -4916,6 +4919,7 @@ impl Pipeline {
             o1_cfg: None,
             o1_turbo: None,
             mtp_pos_base: 0,
+            o1_prefix_tail: Vec::new(),
             gdn_snap: None,
             mtp_warm_base: None,
             o1_epoch: 0,
@@ -6078,6 +6082,7 @@ impl Pipeline {
         let n = ids.len();
         let mut last = vec![0f32; hs];
         let mut pos = 0;
+        self.o1_prefix_tail.clear();
         // `CMF_PREFILL_PROF`: where the prefix's time goes (the chunks, the
         // queries off the card, the K/V rows off the card, their way into the cache).
         let prof = std::env::var("CMF_PREFILL_PROF").is_ok();
@@ -6104,6 +6109,12 @@ impl Pipeline {
             match outcome {
                 crate::gpu::BatchGraphOutcome::Completed => {
                     last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
+                    // the prompt's tail for the draft head over the far field
+                    let tail_from = n.saturating_sub(crate::dory::EXACT_TAIL);
+                    if end > tail_from {
+                        let from = pos.max(tail_from);
+                        self.o1_prefix_tail.extend_from_slice(&hiddens[(from - pos) * hs..]);
+                    }
                 }
                 crate::gpu::BatchGraphOutcome::Declined if pos == 0 => {
                     let _ = crate::gpu::o1_qcap_take();
@@ -7270,6 +7281,22 @@ impl Pipeline {
                     Ok(Some(last)) => {
                         hidden.copy_from_slice(&last);
                         pos = px_len;
+                        // the whole prompt went by the prefix (CUDA): the draft head
+                        // reads its tail, as over the wgpu path's far field
+                        let tail = std::mem::take(&mut self.o1_prefix_tail);
+                        if px_len == input_ids.len() && mtp.is_some() && !tail.is_empty() {
+                            let hs = self.hidden_size;
+                            let from = px_len - tail.len() / hs;
+                            self.mtp_pos_base = from;
+                            let n_pairs = mtp_prefill_pair_count(from, px_len, input_ids.len());
+                            let pairs: Vec<(&[f32], u32)> = (0..n_pairs).map(|j| (&tail[j * hs..(j + 1) * hs], input_ids[from + j + 1])).collect();
+                            let warm_error = if let Some(m) = mtp.as_mut() { self.mtp_warm_prefill_pairs(m, &pairs, from).err() } else { None };
+                            if let Some(err) = warm_error {
+                                self.finish_generation(&mut mtp, &mut router, true);
+                                return Err(err.to_string());
+                            }
+                            self.mtp_warm_base = Some(from);
+                        }
                         if std::env::var("CMF_PREFILL_PROF").is_ok() {
                             eprintln!(
                                 "o1 prefix on the batch graph: {px_len} rows in {:.1} ms",
