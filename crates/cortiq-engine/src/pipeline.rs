@@ -5930,9 +5930,6 @@ impl Pipeline {
         self.o1_active()
             && self.o1_on_graph()
             && self.o1_graph_backend()
-            // the CUDA backend verifies no window over a far field: past
-            // the seal it decodes token by token
-            && !crate::gpu::cuda_active()
             && (self.o1_turbo.is_some() || std::env::var("CMF_O1_SPEC").as_deref() == Ok("1"))
             && std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
     }
