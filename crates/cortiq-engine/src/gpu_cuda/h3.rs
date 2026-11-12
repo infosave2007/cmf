@@ -47,6 +47,9 @@ pub use moss::moss_chain;
 #[path = "flux_vae.rs"]
 mod flux_vae;
 pub use flux_vae::{flux_vae_chain, qi21_vae_decode};
+#[path = "zimage.rs"]
+mod zimage;
+pub use zimage::{zimage_prepare, zimage_release, zimage_step};
 #[path = "qi21.rs"]
 mod qi21;
 pub use qi21::{qi21_prefill, qi21_release, qi21_release_key, qi21_step};
@@ -125,6 +128,10 @@ pub(super) struct H3State {
     q21_funcs: Option<qi21::Q21Funcs>,
     /// Its programs (a prompt's prefix cache), the most recently used last.
     q21: Vec<qi21::Q21Prog>,
+    /// The kernels of the Z-Image step (`zimage.rs`), once compiled.
+    zi_funcs: Option<zimage::ZiFuncs>,
+    /// Its programs (a prompt and resolution each), the most recently used last.
+    zi: Vec<zimage::ZiProg>,
 }
 
 impl H3State {

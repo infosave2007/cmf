@@ -6442,6 +6442,8 @@ pub fn zimage_prepare(a: &ZPrepareArgs) -> bool {
         Backend::Metal => crate::gpu_metal::zimage::prepare(a),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::prepare(a),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::zimage_prepare(a),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -6457,6 +6459,8 @@ pub fn zimage_step(a: &mut ZStepArgs) -> bool {
         Backend::Metal => crate::gpu_metal::zimage::step(a),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::step(a),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::zimage_step(a),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -6533,6 +6537,10 @@ pub fn zimage_release_dit() {
     crate::gpu_metal::zimage::release_dit();
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::zimage::release_dit();
+    #[cfg(feature = "cuda")]
+    if matches!(backend(), Backend::Cuda) {
+        crate::gpu_cuda::zimage_release();
+    }
 }
 
 /// Drop every Z-Image device resource (planes, prepared states, VAE chain
@@ -6544,6 +6552,10 @@ pub fn zimage_release() {
     crate::gpu_metal::zimage::release();
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::zimage::release();
+    #[cfg(feature = "cuda")]
+    if matches!(backend(), Backend::Cuda) {
+        crate::gpu_cuda::zimage_release();
+    }
 }
 
 /// Optional device context refiner: the same block math with scale = 0 and
