@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Dory Turbo с постоянным потолком на CUDA (0.8.72)
+
+Турбо-файл [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) теперь держит
+постоянный потолок памяти и на CUDA, вместе с промптом: на RTX 2000 Ada с 16 ГБ карта занята на 3,8 ГБ от 16 000 до
+64 000 токенов, а в 0.8.71 доходило до 7,5 ГБ. Промпт после первых 8 192 строк читается через дальнее поле кусками,
+поэтому 64 000 токенов доходят до первого токена за 33 с против 69 в 0.8.71 и 306 через Vulkan. Декод остаётся
+80 tok/s, а факты в 100 000 символов находятся 8 раз из 8.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt-file report.txt --greedy --no-think
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1   # API, совместимый с OpenAI
+```
+
+См. [docs/CUDA.ru.md](docs/CUDA.ru.md#dory-на-карте-16-гб); сервер описан в [docs/DORY.ru.md](docs/DORY.ru.md#сервер).
+
 ## Qwen3.8-27B Turbo на карте 16 ГБ через CUDA (0.8.71)
 
 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) теперь держит на CUDA постоянный потолок

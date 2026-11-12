@@ -55,3 +55,35 @@ fn gathered_seal_is_the_seal_over_ordered_copies() {
         same(&a.device_view(), &b.device_view());
     }
 }
+
+/// The same over rows that hold every KV head (`seal_gathered_rows`, Dory's
+/// slots and archive `[t][nkv][d]`): each group's state is the one sealed
+/// over its own rows, bit for bit, the far sums replayed by index too.
+#[test]
+fn gathered_seal_over_interleaved_rows_is_the_groups_own() {
+    let (t, d, m, w, sink, nkv) = (260usize, 16usize, 8usize, 24usize, 4usize, 3usize);
+    let (hpk, stride) = (2usize, 8usize);
+    let nh = nkv * hpk;
+    let mut seed = 23u64;
+    let ks: Vec<f32> = (0..t * nkv * d).map(|_| lcg(&mut seed)).collect();
+    let vs: Vec<f32> = (0..t * nkv * d).map(|_| lcg(&mut seed)).collect();
+    let q_trace: Vec<f32> = (0..t.div_ceil(stride) * nh * d).map(|_| lcg(&mut seed)).collect();
+    let keep = [33usize, 34, 120];
+    let mut chosen = vec![false; t];
+    keep.iter().for_each(|&r| chosen[r] = true);
+    let order: Vec<u32> = (0..sink).chain(keep.iter().copied()).chain((sink..t).filter(|&r| !chosen[r])).map(|r| r as u32).collect();
+    let st_sink = sink + keep.len();
+    let row = nkv * d;
+    for g in 0..nkv {
+        let own = |src: &[f32]| -> Vec<f32> { (0..t).flat_map(|r| src[r * row + g * d..r * row + (g + 1) * d].iter().copied()).collect() };
+        let (kg, vg) = (own(&ks), own(&vs));
+        let mut a = NystromState::new_group(m, w, st_sink, hpk);
+        let ra = a.seal_gathered(&kg, &vg, &q_trace, stride, nh, g * hpk, &order, t, d, d).expect("a seal past the window");
+        a.replay_far_idx(&kg, &vg, &order[ra.clone()]);
+        let mut b = NystromState::new_group(m, w, st_sink, hpk);
+        let rb = b.seal_gathered_rows(&ks[g * d..], row, &vs[g * d..], row, &q_trace, stride, nh, g * hpk, &order, t, d, d).expect("a seal past the window");
+        assert_eq!(ra, rb);
+        b.replay_far_idx_rows(&ks[g * d..], row, &vs[g * d..], row, &order[rb]);
+        same(&a.device_view(), &b.device_view());
+    }
+}

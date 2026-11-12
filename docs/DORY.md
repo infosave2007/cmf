@@ -31,6 +31,64 @@ CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Write a Rust function that reve
 Perplexity: twelve 512-token windows of wikitext-2 test, read token by token. The bf16
 original scores 13.42 on the same windows.
 
+## Server
+
+`cortiq serve` puts the file behind an OpenAI-compatible HTTP API, with a web dashboard on the same port:
+
+```bash
+cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+# on an NVIDIA card through CUDA, with room for long documents
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "dory",
+  "messages": [{"role": "user", "content": "Write a Rust function that reverses a list."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8080/v1"` and any API key:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="dory",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\nSummarize it."}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| endpoint | what it does |
+|---|---|
+| `POST /v1/chat/completions` | a chat turn; `stream: true` sends the answer as it is decoded, `tools` lets the model call functions |
+| `POST /v1/completions` | the continuation of a `prompt` |
+| `GET /v1/models` | the served model |
+| `GET /healthz` | 200 while the server is up |
+| `GET /` | the web dashboard |
+
+- `model` may be any name: one file is served. `"enable_thinking": false` asks for a direct answer, as
+  `--no-think` does; without it the model reasons first, so give it a larger `max_tokens`.
+- `--host 127.0.0.1` keeps the server local. The default, `0.0.0.0`, listens on every interface and checks no
+  keys.
+- `CMF_MAX_SEQ` is a request's context cap, 32 768 by default. A long document is read the turbo way, so the
+  card's memory stays flat: on a 16 GB RTX 2000 Ada through CUDA, 60 000 characters (15 277 tokens) are read in
+  8.3–9.4 s and answered at 79 tok/s, the card at 3.77 GB at most (66 s and 55 tok/s over Vulkan).
+- `CMF_SERVE_SLOTS=N` keeps N conversations at once, each with its own rows on the card. `CMF_O1_SPILL=DIR`
+  keeps a long prompt's rows in files instead of RAM while it is read.
+- A request that continues the previous one reads only what is new. A new turn of a conversation past the
+  seal reads the conversation again.
+
+More in [docs/CUDA.md](CUDA.md#the-server).
+
 ## Loop modes
 
 | option | meaning |
@@ -75,7 +133,9 @@ rows leave the card as the chunk ends, for RAM or for files, until the far field
 
 RTX 5090, Vulkan, a disk with 4.2 GB/s write. The weights are 1.95 GB of it, the speed is the same in RAM
 and in files, and the files go when the far field is built. On a MacBook Air M4 at 23 000 tokens, peak
-footprint: 3.27 GB, 1.64 GB with `--o1-spill`.
+footprint: 3.27 GB, 1.64 GB with `--o1-spill`. On CUDA an RTX 2000 Ada holds 3.8 GB from 16 000 to 64 000
+tokens (cortiq 0.8.72 or later; 0.8.71 read the prompt whole and reached 7.5 GB at 64 000), see
+[docs/CUDA.md](CUDA.md#dory-on-a-16-gb-card).
 
 ![What a long prompt keeps on the card](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_en.png)
 
@@ -119,6 +179,11 @@ the others `cortiq bench --core` after a prompt of that length.
 | context 32 000 | 111.3 | **216.0** |
 | context 64 000 | — | **214.1** |
 | first token at 16 000 / 32 000 / 64 000 | 5.4 s / 12.8 s / — | **6.1 s / 13.6 s / 33.0 s** |
+| **CUDA, NVIDIA RTX 2000 Ada (16 GB)** | | |
+| real prompts | — | **75.5** |
+| context 1 000 / 16 000 / 64 000 | — | **84.0 / 80.7 / 80.2** |
+| first token at 16 000 / 32 000 / 64 000 | — | **8.8 s / 17.1 s / 33.4 s** |
+| peak device memory at 4 000 / 16 000 / 64 000 | — | **3.5 GB / 3.8 GB / 3.8 GB** |
 | **Metal, MacBook Air M4 (24 GB)** | | |
 | real prompts | 25.7 | **32.9** |
 | context 1 000 | 22.1 | **34.6** |

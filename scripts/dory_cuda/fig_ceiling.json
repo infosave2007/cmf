@@ -1,0 +1,135 @@
+{
+ "name": "cuda_ceiling",
+ "ctx": [
+  1000,
+  4000,
+  16000,
+  32000,
+  64000
+ ],
+ "labels": [
+  "1k",
+  "4k",
+  "16k",
+  "32k",
+  "64k"
+ ],
+ "decode_max": 100,
+ "mem_max": 8,
+ "series": [
+  {
+   "key": "cuda",
+   "color": "blue",
+   "first": [
+    0.51,
+    1.72,
+    8.84,
+    17.07,
+    33.41
+   ],
+   "decode": [
+    84.0,
+    79.0,
+    80.7,
+    80.2,
+    80.2
+   ],
+   "mem": [
+    3.44,
+    3.49,
+    3.8,
+    3.8,
+    3.8
+   ]
+  },
+  {
+   "key": "old",
+   "color": "grey",
+   "first": [
+    0.51,
+    1.73,
+    10.8,
+    25.21,
+    69.14
+   ],
+   "decode": [
+    84.0,
+    79.0,
+    80.3,
+    80.1,
+    80.3
+   ],
+   "mem": [
+    3.49,
+    3.66,
+    4.99,
+    5.72,
+    7.47
+   ],
+   "dash": true
+  },
+  {
+   "key": "vk",
+   "color": "orange",
+   "first": [
+    1.84,
+    8.52,
+    70.53,
+    148.97,
+    306.02
+   ],
+   "decode": [
+    63.9,
+    56.0,
+    55.9,
+    56.1,
+    53.9
+   ],
+   "mem": [
+    2.92,
+    2.93,
+    3.52,
+    3.52,
+    3.52
+   ]
+  }
+ ],
+ "text": {
+  "en": {
+   "t": "dory-turbo on CUDA: a fixed ceiling while a long prompt is read",
+   "sub": "NVIDIA RTX 2000 Ada (16 GB), cortiq bench --core: 60 tokens after a prompt of that length. Release builds, the same file.",
+   "cuda": "CUDA",
+   "old": "CUDA, cortiq 0.8.71",
+   "vk": "Vulkan",
+   "first": "First token, s",
+   "decode": "Decode, tok/s",
+   "mem": "Peak device memory, GB",
+   "ctx": "prompt, tokens",
+   "res": "64 000 tokens: 3.8 GB on the card instead of 7.5, first token in 33.4 s instead of 69.1"
+  },
+  "ru": {
+   "t": "dory-turbo на CUDA: постоянный потолок, пока читается длинный промпт",
+   "sub": "NVIDIA RTX 2000 Ada (16 ГБ), cortiq bench --core: 60 токенов после промпта такой длины. Сборки release, тот же файл.",
+   "cuda": "CUDA",
+   "old": "CUDA, cortiq 0.8.71",
+   "vk": "Vulkan",
+   "first": "Первый токен, с",
+   "decode": "Декод, ток/с",
+   "mem": "Пик памяти карты, ГБ",
+   "ctx": "промпт, токенов",
+   "res": "64 000 токенов: 3,8 ГБ на карте вместо 7,5, первый токен через 33,4 с вместо 69,1"
+  },
+  "zh": {
+   "t": "dory-turbo 走 CUDA：读取长提示时显存上限固定",
+   "sub": "NVIDIA RTX 2000 Ada（16 GB），cortiq bench --core：在该长度的提示之后生成 60 个词元。release 构建，同一个文件。",
+   "cuda": "CUDA",
+   "old": "CUDA，cortiq 0.8.71",
+   "vk": "Vulkan",
+   "first": "首个词元，秒",
+   "decode": "解码，tok/s",
+   "mem": "显存峰值，GB",
+   "ctx": "提示，词元",
+   "res": "64 000 词元：显卡占用 3.8 GB（之前 7.5 GB），首个词元 33.4 秒（之前 69.1 秒）"
+  }
+ }
+}
