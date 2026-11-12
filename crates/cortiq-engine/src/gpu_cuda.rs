@@ -105,11 +105,16 @@ pub fn batch_rows() -> usize {
     })
 }
 
+/// The f32 constants' slab size.
+const SLAB: usize = 8 << 20;
+
 /// A device allocation, freed on drop (the context is current wherever one
 /// is dropped: inside an entry point, under the state lock).
 struct Buf {
     ptr: cs::CUdeviceptr,
     bytes: usize,
+    /// A view into another allocation (`view`) frees nothing.
+    owned: bool,
 }
 
 impl Buf {
@@ -117,7 +122,15 @@ impl Buf {
         let bytes = bytes.max(64);
         let ptr = unsafe { cu::malloc_sync(bytes) }
             .map_err(|e| format!("device allocation of {bytes} bytes: {e}"))?;
-        Ok(Self { ptr, bytes })
+        Ok(Self { ptr, bytes, owned: true })
+    }
+
+    /// `bytes` of this allocation from `off`, freed with it: the holder keeps
+    /// the owner alive at least as long (the card rounds each allocation up,
+    /// so a matrix's small planes go in one with its big one).
+    fn view(&self, off: usize, bytes: usize) -> Buf {
+        debug_assert!(off + bytes <= self.bytes);
+        Buf { ptr: self.ptr + off as u64, bytes, owned: false }
     }
 
     fn from_slice<T: Copy>(data: &[T]) -> Res<Self> {
@@ -132,8 +145,10 @@ impl Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
-        unsafe {
-            let _ = cu::free_sync(self.ptr);
+        if self.owned {
+            unsafe {
+                let _ = cu::free_sync(self.ptr);
+            }
         }
     }
 }
@@ -410,7 +425,9 @@ impl KvMirror {
         let new_cap = if self.window > 0 {
             (self.window - 1 + add.max(256)).max(keep + add)
         } else {
-            (keep + add).max(hint) + (self.cap / 8).max(1024)
+            // a hint that covers the rows is the size (the prompt's rows, and its
+            // first token); growth past it keeps some slack
+            if hint >= keep + add { hint } else { (keep + add) + (self.cap / 8).max(1024) }
         };
         let nk = Buf::new(new_cap * self.row * 4)?;
         let nv = Buf::new(new_cap * self.row * 4)?;
@@ -561,6 +578,87 @@ struct QCap {
 
 thread_local! {
     static QCAP: std::cell::RefCell<Option<QCap>> = const { std::cell::RefCell::new(None) };
+    static ACAP: std::cell::RefCell<Option<ACap>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The rows of sealed prompt chunks on their way to the archive
+/// (`o1_acap_begin` … `o1_acap_end`): a sealed layer's chunk leaves its K/V
+/// rows (f16, as the far field's mirror holds them) and one query row in
+/// `stride` by position, until `o1_acap_take` reads them.
+struct ACap {
+    stride: usize,
+    /// (layer, rows, K f16, V f16, kept query floats, queries [row][head][hd])
+    bufs: Vec<CapBufs>,
+}
+
+type CapBufs = (usize, usize, Buf, Buf, usize, Option<Buf>);
+
+/// Copy sealed prompt chunks' rows off the card until `o1_acap_end`; their
+/// query rows one in `stride` by position.
+pub fn o1_acap_begin(stride: usize) {
+    if ctx().is_some() {
+        ACAP.with(|a| *a.borrow_mut() = Some(ACap { stride: stride.max(1), bufs: Vec::new() }));
+    }
+}
+
+pub fn o1_acap_end() {
+    let a = ACAP.with(|a| a.borrow_mut().take());
+    if let (Some(a), Some(c)) = (a, ctx()) {
+        // freed with the context current, after the queued copies
+        let _st = c.st.lock().unwrap();
+        if c.current().is_ok() {
+            let _ = c.sync();
+        }
+        drop(a);
+    }
+}
+
+/// A layer's captured rows: (layer, queries, keys, values).
+type CapRows = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// The rows captured since the last call: per layer, (layer, queries one row
+/// in the stride, keys, values), keys and values `[row][kv head][hd]` in f32.
+pub fn o1_acap_take() -> Option<Vec<CapRows>> {
+    let bufs = ACAP.with(|a| a.borrow_mut().as_mut().map(|a| std::mem::take(&mut a.bufs)))?;
+    let c = ctx()?;
+    let _st = c.st.lock().unwrap();
+    c.current().ok()?;
+    c.sync().ok()?;
+    let mut out: Vec<CapRows> = Vec::new();
+    // every buffer off the card, then the f16 rows widened a buffer a thread
+    let mut raw: Vec<(usize, Vec<u16>, Vec<u16>, Vec<f32>)> = Vec::with_capacity(bufs.len());
+    for (layer, _rows, k, v, qf, q) in &bufs {
+        let mut kh = vec![0u16; k.bytes / 2];
+        let mut vh = vec![0u16; v.bytes / 2];
+        let mut qv = vec![0f32; *qf];
+        unsafe {
+            cu::memcpy_dtoh_async(kh.as_mut_slice(), k.ptr, c.stream).ok()?;
+            cu::memcpy_dtoh_async(vh.as_mut_slice(), v.ptr, c.stream).ok()?;
+            if let Some(q) = q {
+                cu::memcpy_dtoh_async(qv.as_mut_slice(), q.ptr, c.stream).ok()?;
+            }
+        }
+        c.sync().ok()?;
+        raw.push((*layer, kh, vh, qv));
+    }
+    let wide: Vec<CapRows> = std::thread::scope(|sc| {
+        let w = |h: &[u16]| h.iter().map(|&x| cortiq_core::quant::f16_to_f32(x)).collect::<Vec<f32>>();
+        let hs: Vec<_> = raw.into_iter().map(|(l, kh, vh, qv)| sc.spawn(move || (l, qv, w(&kh), w(&vh)))).collect();
+        hs.into_iter().map(|h| h.join().expect("archive widening")).collect()
+    });
+    for (layer, qv, kf, vf) in wide {
+        let layer = &layer;
+        match out.iter_mut().find(|o| o.0 == *layer) {
+            Some(o) => {
+                o.1.extend_from_slice(&qv);
+                o.2.extend_from_slice(&kf);
+                o.3.extend_from_slice(&vf);
+            }
+            None => out.push((*layer, qv, kf, vf)),
+        }
+    }
+    drop(bufs);
+    Some(out)
 }
 
 #[derive(Default)]
@@ -571,6 +669,9 @@ struct State {
     kv: HashMap<(u64, usize), KvMirror>,
     o1: HashMap<(u64, usize), O1Dev>,
     scratch: HashMap<&'static str, Buf>,
+    /// Slabs the small f32 constants live in (`f32_buf`), the last one filling.
+    slabs: Vec<Buf>,
+    slab_used: usize,
     attn: HashMap<(usize, usize), AttnFuncs>,
     kv_hint: usize,
     /// The Qwen3.5-family hybrid arm's plans and recurrent states.
@@ -818,6 +919,10 @@ fn init() -> Res<Ctx> {
         "cuda backend: {name} (compute {major}.{minor}, {:.1} GB), NVRTC kernels, cuBLAS",
         total_mem as f64 / 1e9
     );
+    if std::env::var("CMF_CUDA_MEM").as_deref() == Ok("1") {
+        let (free, total) = cu::mem_get_info().unwrap_or((0, 0));
+        eprintln!("cuda mem after the context and cuBLAS: used {:.0} of {:.0} MiB", (total - free) as f64 / 1048576.0, total as f64 / 1048576.0);
+    }
     Ok(Ctx {
         cuctx,
         stream,
@@ -1195,6 +1300,23 @@ impl State {
         Ok(p)
     }
 
+    /// `bytes` (at most a quarter slab) of a slab, as a view: for buffers that
+    /// live as long as the state.
+    fn slab_buf(&mut self, bytes: usize) -> Res<Buf> {
+        if bytes > SLAB / 4 {
+            return Buf::new(bytes);
+        }
+        let at = self.slab_used.next_multiple_of(256);
+        if self.slabs.is_empty() || at + bytes > SLAB {
+            self.slabs.push(Buf::new(SLAB)?);
+            self.slab_used = 0;
+        }
+        let at = self.slab_used.next_multiple_of(256);
+        let v = self.slabs.last().unwrap().view(at, bytes);
+        self.slab_used = at + bytes;
+        Ok(v)
+    }
+
     fn f32_buf(&mut self, data: &[f32]) -> Res<Arc<Buf>> {
         let key = (data.as_ptr() as usize, data.len());
         let fp = crate::gpu::fp_f32(data);
@@ -1203,7 +1325,19 @@ impl State {
                 return Ok(b.clone());
             }
         }
-        let b = Arc::new(Buf::from_slice(data)?);
+        // small constants (norms, gates, taps) share slabs: the card rounds
+        // every allocation up to its page, which on a 64-layer model came to
+        // several of them a layer
+        let need = std::mem::size_of_val(data) + 64;
+        let b = if need <= SLAB / 4 {
+            let v = self.slab_buf(need)?;
+            if !data.is_empty() {
+                unsafe { cu::memcpy_htod_sync(v.ptr, data) }.map_err(derr)?;
+            }
+            Arc::new(v)
+        } else {
+            Arc::new(Buf::from_slice(data)?)
+        };
         self.f32s.insert(key, (b.clone(), fp));
         Ok(b)
     }
@@ -2255,6 +2389,7 @@ pub fn forward_batch_graph_at(
     attn_scale: f32,
     k: usize,
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     spec: Option<crate::gpu::SpecTail<'_>>,
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
@@ -2263,7 +2398,7 @@ pub fn forward_batch_graph_at(
         let defer = BATCH_DEFER.with(|d| d.get());
         return hyb::batch(
             c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
-            attn_scale, k, o1, spec, layers_run, defer,
+            attn_scale, k, o1, o1_epoch, spec, layers_run, defer,
         );
     }
     let b = k;
@@ -2659,6 +2794,39 @@ fn qcap_read(layers: Vec<usize>, bufs: Vec<(usize, usize, Buf)>) -> Option<Vec<(
     ok.then_some(out)
 }
 
+/// A sealed chunk's rows into the armed archive capture (nothing when none is):
+/// `n` K/V rows of `row` values from row `n0` of the far field's mirror, and
+/// the chunk's query rows at positions that are multiples of the stride.
+#[allow(clippy::too_many_arguments)]
+fn acap_note(c: &Ctx, layer: usize, kp: u64, vp: u64, n0: usize, n: usize, row: usize, qg: u64, nh: usize, nkv: usize, hd: usize, pos0: usize) -> Res<()> {
+    let Some(stride) = ACAP.with(|a| a.borrow().as_ref().map(|a| a.stride.max(1))) else { return Ok(()) };
+    let bytes = n * row * 2;
+    let (k, v) = (Buf::new(bytes)?, Buf::new(bytes)?);
+    let at = (n0 * row * 2) as u64;
+    unsafe {
+        cu::memcpy_dtod_async(k.ptr, kp + at, bytes, c.stream).map_err(derr)?;
+        cu::memcpy_dtod_async(v.ptr, vp + at, bytes, c.stream).map_err(derr)?;
+    }
+    let first = (stride - pos0 % stride) % stride;
+    let kept = if first < n { (n - first).div_ceil(stride) } else { 0 };
+    let q = if kept > 0 {
+        let buf = Buf::new(kept * nh * hd * 4)?;
+        let (nh_i, nkv_i, hd_i, b_i, first_i, stride_i) = (nh as i32, nkv as i32, hd as i32, n as i32, first as i32, stride as i32);
+        unsafe {
+            c.launch(c.f.q_rows_strided, (kept as u32, 1), 256, 0, kargs!(qg, buf.ptr, nh_i, nkv_i, hd_i, b_i, first_i, stride_i))?;
+        }
+        Some(buf)
+    } else {
+        None
+    };
+    ACAP.with(|a| {
+        if let Some(a) = a.borrow_mut().as_mut() {
+            a.bufs.push((layer, n, k, v, kept * nh * hd, q));
+        }
+    });
+    Ok(())
+}
+
 /// Rows a layer's mirror holds (absolute), None without a mirror.
 /// y [n][rows] = W x [n][cols] on the card (a q4tp graph weight of the
 /// hybrid arm): false when the backend cannot take it.
@@ -2934,6 +3102,24 @@ pub fn kv_read_rows(
         out.push((k, v));
     }
     Some(out)
+}
+
+/// The backend came up (its context exists).
+pub fn ctx_ready() -> bool {
+    ctx().is_some()
+}
+
+/// A seal's far sums on the card (`gpu::o1_far_sums`).
+#[allow(clippy::too_many_arguments)]
+pub fn o1_far_sums(nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]]) -> Option<(Vec<f32>, Vec<f32>)> {
+    let c = ctx()?;
+    match hyb::far_sums(c, nkv, hpk, hd, m, scale, qt, idx, ks, vs) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            decline("far sums", &e);
+            None
+        }
+    }
 }
 
 /// What the card may hold: its memory less a reserve for the K/V mirrors,

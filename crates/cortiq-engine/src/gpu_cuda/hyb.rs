@@ -36,6 +36,21 @@ pub(super) mod dflash;
 pub(super) mod dory;
 /// Rows of the small path.
 pub(super) const NMAX: usize = 16;
+/// Rows of a prompt chunk read past a seal (`big` over sealed layers): the far
+/// field's mirror keeps room for them after its near rows.
+pub(super) const SEAL_ROWS: usize = 1024;
+/// A prompt chunk's weight expands to f16 in bands of at most this many bytes
+/// (`CMF_HYB_WD_MB`): the gate/up pair of a 27B layer is 356 MB whole.
+fn wd_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("CMF_HYB_WD_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) << 20)
+}
+/// Rows of a chunk one attention GEMM pass takes at most (`CMF_HYB_ATT_ROWS`):
+/// its score and weight buffers grow with rows x keys.
+fn att_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_HYB_ATT_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 16).unwrap_or(128))
+}
 /// Stages of `CMF_CUDA_PROF=1` on the small path (each closed by a stream
 /// sync, so the numbers are the card's).
 const HSTAGES: [&str; 12] = [
@@ -159,6 +174,11 @@ pub(super) struct HFuncs {
     far_insert: cs::CUfunction,
     far_prep: cs::CUfunction,
     far_prep_b: cs::CUfunction,
+    expand_pr: cs::CUfunction,
+    far_rows: cs::CUfunction,
+    softmax_hf: cs::CUfunction,
+    attn_out_f: cs::CUfunction,
+    far_insert_n: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -207,6 +227,11 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         far_insert: func(module, "hy_far_insert")?,
         far_prep: func(module, "hy_far_prep")?,
         far_prep_b: func(module, "hy_far_prep_b")?,
+        expand_pr: func(module, "hy_expand_pr")?,
+        far_rows: func(module, "hy_far_rows")?,
+        softmax_hf: func(module, "hy_softmax_hf")?,
+        attn_out_f: func(module, "hy_attn_out_f")?,
+        far_insert_n: func(module, "hy_far_insert_n")?,
     })
 }
 
@@ -515,8 +540,7 @@ fn repack_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: u
     let second = if pair { Some(up(srcs[1])?) } else { None };
     let (nb_p, cb_p) = second.as_ref().map_or((na.ptr, ca.ptr), |(n, c)| (n.ptr, c.ptr));
     let ntile = rows.div_ceil(16);
-    let t = Buf::new(ntile * gpr * 64 * 4)?;
-    let cc = Buf::new(ntile * gpr * 16)?;
+    let (t, cc, ld) = mat_planes(ntile * gpr * 64 * 4, ntile * gpr * 16, &lad)?;
     let (stride_i, pair_i, rows_i, cols_i) = (stride as i32, pair as i32, rows as i32, cols as i32);
     let threads = (ntile * gpr * 32) as u64;
     unsafe {
@@ -524,7 +548,49 @@ fn repack_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: u
     }
     // the stored planes are freed on return: the repack must be done
     c.sync()?;
-    Ok((t, cc, Buf::from_slice(&lad)?))
+    Ok((t, cc, ld))
+}
+
+thread_local! {
+    /// A plan build's weight arena (`build`): base, capacity, used. Matrices
+    /// come out of it while it has room, so the card's rounding of each
+    /// allocation (to 2 MiB) costs once instead of once a matrix.
+    static ARENA: std::cell::Cell<(u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// The bytes `mat_planes` takes for a rows x cols q4tp matrix.
+fn planes_bytes(rows: usize, cols: usize) -> usize {
+    let (ntile, gpr) = (rows.div_ceil(16), cols / 32);
+    let cc_at = (ntile * gpr * 256).next_multiple_of(256);
+    let lad_at = (cc_at + ntile * gpr * 16).next_multiple_of(256);
+    (lad_at + rows * 8 + 64).next_multiple_of(256)
+}
+
+fn arena_view(bytes: usize) -> Option<Buf> {
+    ARENA.with(|a| {
+        let (p, cap, used) = a.get();
+        if p == 0 || used + bytes > cap {
+            return None;
+        }
+        a.set((p, cap, used + bytes.next_multiple_of(256)));
+        Some(Buf { ptr: p + used as u64, bytes, owned: false })
+    })
+}
+
+/// A repacked matrix's three planes (tiles, rung codes, ladders) in one
+/// allocation (the plan's arena when it has room): the tiles hold it, the
+/// other two are views into it.
+fn mat_planes(t_bytes: usize, cc_bytes: usize, lad: &[f32]) -> Res<(Buf, Buf, Buf)> {
+    let cc_at = t_bytes.next_multiple_of(256);
+    let lad_at = (cc_at + cc_bytes).next_multiple_of(256);
+    let lad_bytes = std::mem::size_of_val(lad) + 64;
+    let all = match arena_view(lad_at + lad_bytes) {
+        Some(v) => v,
+        None => Buf::new(lad_at + lad_bytes)?,
+    };
+    let (cc, ld) = (all.view(cc_at, cc_bytes), all.view(lad_at, lad_bytes));
+    unsafe { cu::memcpy_htod_sync(ld.ptr, lad) }.map_err(derr)?;
+    Ok((all, cc, ld))
 }
 
 /// `repack_on_card` for the leading `rows` rows of one q4tp payload, its
@@ -544,15 +610,14 @@ fn repack_rows_on_card(c: &Ctx, fx: &HFuncs, nib: &[u8], params: &[u8], codes: &
     }
     let (na, ca) = (Buf::from_slice(&nib[..rows * gpr * 16])?, Buf::from_slice(&codes[..rows * stride])?);
     let ntile = rows.div_ceil(16);
-    let t = Buf::new(ntile * gpr * 64 * 4)?;
-    let cc = Buf::new(ntile * gpr * 16)?;
+    let (t, cc, ld) = mat_planes(ntile * gpr * 64 * 4, ntile * gpr * 16, &lad)?;
     let (stride_i, pair_i, rows_i, cols_i) = (stride as i32, 0i32, rows as i32, cols as i32);
     let threads = (ntile * gpr * 32) as u64;
     unsafe {
         c.launch(fx.repack, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(na.ptr, ca.ptr, na.ptr, ca.ptr, stride_i, pair_i, t.ptr, cc.ptr, rows_i, cols_i))?;
     }
     c.sync()?;
-    Ok((t, cc, Buf::from_slice(&lad)?))
+    Ok((t, cc, ld))
 }
 
 /// Plan-build time spent repacking and uploading weights (ns).
@@ -762,6 +827,9 @@ pub(super) struct HPlan {
 /// needs to step back.
 struct GdnState {
     dims: (usize, usize, usize, usize, usize),
+    /// The allocation the buffers below are views into (one a layer: the card
+    /// rounds each allocation up, and five of the seven are small).
+    _all: Buf,
     s: Buf,
     ring: Buf,
     next_pos: usize,
@@ -805,6 +873,8 @@ pub(super) struct HState {
     gdn: HashMap<(u64, usize), GdnState>,
     /// The MTP draft chain's table and norms (`mtp_chain`).
     chain: Option<ChainRes>,
+    /// Plan builds' weight arenas (the matrices in them are views).
+    arenas: Vec<Buf>,
     /// The chain's eh_proj job tables by (plan, tensor): their output is
     /// that plan's `h`.
     chain_sets: HashMap<(u64, usize), MmaSet>,
@@ -1004,7 +1074,61 @@ fn build(
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     let mut out = Vec::with_capacity(layers.len());
+    mem_report(c, st, "a plan's row buffers");
+    // the q4tp matrices this plan uploads, in one arena
+    let uid = model.uid();
+    let q6 = |w: &GraphW| w.kind == 6 && w.prism == crate::gpu::GraphPrismOp::None && !w.affine;
+    let mut need = 0usize;
+    for l in layers {
+        let GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } = &l.ffn else { continue };
+        let inter = rows_of(model, gw).unwrap_or(0);
+        if q6(gw) && q6(uw) && !st.hyb.pairs.contains_key(&(uid, gw.idx, uw.idx)) {
+            need += planes_bytes(2 * inter, hidden);
+        }
+        if q6(dw) && !st.hyb.mats.contains_key(&(uid, dw.idx)) {
+            need += planes_bytes(hidden, inter);
+        }
+        let mut one = |w: &GraphW, rows: usize, cols: usize| {
+            if q6(w) && !st.hyb.mats.contains_key(&(uid, w.idx)) {
+                need += planes_bytes(rows, cols);
+            }
+        };
+        match &l.attn {
+            GraphAttn::Gdn { qkv: qw, z: zw, out: ow, nv, nk, dk, dv, .. } => {
+                one(qw, 2 * nk * dk + nv * dv, hidden);
+                one(zw, nv * dv, hidden);
+                one(ow, hidden, nv * dv);
+            }
+            GraphAttn::Full { wq, wk, wv, wo, output_gate, .. } => {
+                one(wq, nh * hd * (1 + *output_gate as usize), hidden);
+                one(wk, nkv * hd, hidden);
+                one(wv, nkv * hd, hidden);
+                one(wo, hidden, nh * hd);
+            }
+            _ => {}
+        }
+    }
+    if let Some((gw, rows)) = lm {
+        if q6(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
+            need += planes_bytes(rows, hidden);
+        }
+    }
+    if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
+        let a = Buf::new(need)?;
+        ARENA.with(|x| x.set((a.ptr, need, 0)));
+        st.hyb.arenas.push(a);
+    }
+    struct ArenaEnd;
+    impl Drop for ArenaEnd {
+        fn drop(&mut self) {
+            ARENA.with(|x| x.set((0, 0, 0)));
+        }
+    }
+    let _arena_end = ArenaEnd;
     for (li, l) in layers.iter().enumerate() {
+        if li % 16 == 1 {
+            mem_report(c, st, &format!("{li} layers of a plan"));
+        }
         let GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } = &l.ffn else { unreachable!() };
         let inter = rows_of(model, gw).ok_or("f32 FFN")?;
         let gum = hmat_pair(c, st, model, gw, uw, inter, hidden)?;
@@ -1028,9 +1152,9 @@ fn build(
                 for d in [*conv1d, *a_log, *dt_bias, *norm] {
                     note(d);
                 }
-                let half_of = |m: &DevMat| -> Res<Buf> {
+                let half_of = |m: &DevMat, st: &mut State| -> Res<Buf> {
                     let n = m.rows * m.cols;
-                    let hb = Buf::new(n * 2)?;
+                    let hb = st.slab_buf(n * 2 + 64)?;
                     let src = if m.kind == 4 {
                         m.w.ptr
                     } else {
@@ -1040,8 +1164,8 @@ fn build(
                     unsafe { c.launch(fx.to_half, (n.div_ceil(256) as u32, 1), 256, 0, kargs!(src, hb.ptr, n64))? };
                     Ok(hb)
                 };
-                let a_h = half_of(&am)?;
-                let b_h = half_of(&bm)?;
+                let a_h = half_of(&am, st)?;
+                let b_h = half_of(&bm, st)?;
                 let ms_in = mmaset(&[(&qm, qkv.ptr, 0, cdmax, cdim), (&zm, z.ptr, 0, vdmax, nv * dv)])?;
                 let ms_out = mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?;
                 Mix::Gdn(GdnL {
@@ -1203,6 +1327,7 @@ fn plan_for(
     c.sync()?;
     let t0 = std::time::Instant::now();
     let p = Arc::new(build(c, st, model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, scale, invf, sig)?);
+    mem_report(c, st, &format!("a plan of {} layers", p.layers.len()));
     tracing::info!(
         "cuda hybrid graph: {} layers resident, {:.2} GB of weights, built in {:.1} s (repack {:.1} s, upload {:.1} s, single weights {:.1} s, job tables {:.1} s)",
         p.layers.len(),
@@ -1359,14 +1484,20 @@ fn admit(
                 if pos0 > 0 && cpu_state.len() != ring_n + s_n {
                     return Err(soft("GDN host seed missing for a nonzero position".into()));
                 }
-                let mk = |n: usize| -> Res<Buf> {
-                    let b = Buf::new(n.max(1) * 4)?;
-                    unsafe { cu::memset_d8_async(b.ptr, 0, n.max(1) * 4, c.stream).map_err(derr)? };
-                    Ok(b)
-                };
+                // the seven buffers of a layer in one allocation, zeroed
+                let sizes = [s_n, ring_n, NMAX * plan.cdmax, NMAX * g.cdim, NMAX * 2 * g.nv, s_n, ring_n].map(|n| (n.max(1) * 4).next_multiple_of(256));
                 let alloc = || -> Res<GdnState> {
-                    let s = mk(s_n)?;
-                    let ring = mk(ring_n)?;
+                    let all = Buf::new(sizes.iter().sum())?;
+                    unsafe { cu::memset_d8_async(all.ptr, 0, all.bytes, c.stream).map_err(derr)? };
+                    let mut at = 0usize;
+                    let mut v = Vec::with_capacity(sizes.len());
+                    for &n in &sizes {
+                        v.push(all.view(at, n));
+                        at += n;
+                    }
+                    let mut v = v.into_iter();
+                    let mut next = || v.next().ok_or("GDN state views");
+                    let (s, ring, t_qkv, t_cq, t_gb, s_save, ring_save) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
                     if pos0 > 0 {
                         unsafe {
                             if ring_n > 0 {
@@ -1377,15 +1508,16 @@ fn admit(
                     }
                     Ok(GdnState {
                         dims,
+                        _all: all,
                         s,
                         ring,
                         next_pos: pos0,
-                        t_qkv: mk(NMAX * plan.cdmax)?,
+                        t_qkv,
                         t_stride: plan.cdmax,
-                        t_cq: mk(NMAX * g.cdim)?,
-                        t_gb: mk(NMAX * 2 * g.nv)?,
-                        s_save: mk(s_n)?,
-                        ring_save: mk(ring_n)?,
+                        t_cq,
+                        t_gb,
+                        s_save,
+                        ring_save,
                         tape: None,
                         snap: None,
                     })
@@ -1466,9 +1598,10 @@ fn o1_ensure(c: &Ctx, st: &mut State, key: (u64, usize), views: &[crate::nystrom
     }
     let row = nkv * hd;
     let h16 = cortiq_core::quant::f32_to_f16;
-    // room after the near rows for a verify window's rows
-    let mut nk = vec![0u16; (ns + w + NMAX) * row];
-    let mut nv = vec![0u16; (ns + w + NMAX) * row];
+    // room after the near rows for a verify window's rows, or a prompt chunk's
+    let extra = NMAX.max(SEAL_ROWS);
+    let mut nk = vec![0u16; (ns + w + extra) * row];
+    let mut nv = vec![0u16; (ns + w + extra) * row];
     let (mut kt, mut qt, mut mu, mut mz, mut th) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (g, v) in views.iter().enumerate() {
         let have = (v.win_k.len() / hd).min(v.win_v.len() / hd).min(w);
@@ -1660,10 +1793,12 @@ fn book(
             }
         }
     }
-    // the attention scratch sized for the context cap, so a replayed graph's
-    // pointers hold from one call to the next
-    let kc = kcap.max(keys_max).next_multiple_of(4096);
-    let nbc = ATTN_NBLK + 64;
+    // the attention scratch sized for this call's records: it grows (by 4096
+    // keys at a time) as the rows do, and a graph whose pointers moved is
+    // recorded again (its signature holds them). `CMF_HYB_KCAP=1` sizes it for
+    // the context cap from the start.
+    let kc = if std::env::var("CMF_HYB_KCAP").as_deref() == Ok("1") { kcap.max(keys_max) } else { keys_max }.next_multiple_of(4096).max(4096);
+    let nbc = ci.chunks(8).map(|r| r[4].max(0) as usize).max().unwrap_or(0).max(1).min(ATTN_NBLK + 64);
     let scratch = [
         st.scr(c, "hy_S", NMAX * nh * kc * 4)?,
         st.scr(c, "hy_Mx", NMAX * nh * nbc * 4)?,
@@ -2193,6 +2328,9 @@ pub(super) fn token(
             if super::TOKENS.fetch_add(1, Ordering::Relaxed) >= 16 {
                 super::TOKEN_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
+            if position % 256 == 0 {
+                mem_report(c, &st, &format!("a token at {position}"));
+            }
             TokenGraphOutcome::Completed
         }
         Err(e) => {
@@ -2419,17 +2557,23 @@ pub(super) fn batch(
     attn_scale: f32,
     k: usize,
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     spec: Option<SpecTail<'_>>,
     layers_run: Option<&mut usize>,
     defer: bool,
 ) -> BatchGraphOutcome {
     let b = k;
     // a sealed layer takes a verify window over its far field (the state on
-    // the card at this position), nothing else of a batch
+    // the card at this position), or a prompt chunk read past the seal
     let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
     let any_sealed = sealed.iter().any(|&s| s);
-    if any_sealed && (spec.is_none() || b > NMAX || !far_spec_on()) {
-        decline("hybrid batch", "a sealed far field outside a verify window");
+    let prompt_far = any_sealed && spec.is_none();
+    if any_sealed && spec.is_some() && (b > NMAX || !far_spec_on()) {
+        decline("hybrid batch", "a sealed far field under a verify window longer than the small path");
+        return BatchGraphOutcome::Declined;
+    }
+    if prompt_far && !far_chunks_on() {
+        decline("hybrid batch", "a sealed far field under a prompt chunk (CMF_O1_CHUNKS=0)");
         return BatchGraphOutcome::Declined;
     }
     if b == 0
@@ -2460,7 +2604,32 @@ pub(super) fn batch(
             return BatchGraphOutcome::Declined;
         }
     };
-    if any_sealed {
+    if prompt_far {
+        // a prompt chunk past a seal: the epoch's far field goes up when it
+        // is new (its rows are this call's first position), and the layer's
+        // exact mirror goes
+        let moved = sealed.iter().enumerate().any(|(li, &s)| s && st.hyb.o1.get(&(kv_id, layer_base + li)).is_some_and(|d| d.epoch == o1_epoch && d.next_pos.is_some()));
+        for (li, views) in o1.iter().enumerate() {
+            let Some(views) = views else { continue };
+            let key = (kv_id, layer_base + li);
+            let at = st.hyb.o1.get(&key).filter(|d| d.epoch == o1_epoch).map(|d| d.next_pos);
+            let rows = views.first().map_or(0, |v| v.sink_len + v.win_len + v.far_len);
+            let res = match at {
+                Some(Some(next)) if next != pos0 => Err(format!("far field: the card is at row {next}, the call at {pos0}")),
+                Some(Some(_)) => Ok(()),
+                _ if rows != pos0 => Err(format!("far field: the seal holds {rows} rows, the call is at {pos0}")),
+                _ => o1_ensure(c, &mut st, key, views, o1_epoch, plan.hpk, nkv, hd),
+            };
+            if let Err(e) = res {
+                decline("hybrid batch", &e);
+                return if moved { BatchGraphOutcome::Failed } else { BatchGraphOutcome::Declined };
+            }
+            if let Some(m) = st.kv.remove(&key) {
+                let _ = c.sync();
+                c.kv_bytes.fetch_sub((m.cap * m.row * 8) as u64, Ordering::Relaxed);
+            }
+        }
+    } else if any_sealed {
         for (li, &s) in sealed.iter().enumerate() {
             let at = st.hyb.o1.get(&(kv_id, layer_base + li)).and_then(|d| d.next_pos);
             if s && at != Some(pos0) {
@@ -2476,7 +2645,7 @@ pub(super) fn batch(
     }
     let mut spec = spec;
     let mut run = || -> Res<()> {
-        if b <= NMAX {
+        if b <= NMAX && !prompt_far {
             unsafe {
                 cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
                 let tab = rope_rows(&plan.invf, positions.iter().copied());
@@ -2513,7 +2682,19 @@ pub(super) fn batch(
             }
             c.sync()
         } else {
-            unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer) }
+            if prompt_far && b > SEAL_ROWS {
+                // past a seal the far field's mirror has room for SEAL_ROWS rows
+                // after its near ones: the chunk in pieces of that many
+                let mut at = 0usize;
+                while at < b {
+                    let n = SEAL_ROWS.min(b - at);
+                    let last = at + n == b;
+                    unsafe { big(c, &mut st, &plan, kv_id, layer_base, &positions[at..at + n], &mut h[at * hidden..(at + n) * hidden], defer && last, &sealed)? };
+                    at += n;
+                }
+                return Ok(());
+            }
+            unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer, &sealed) }
         }
     };
     match run() {
@@ -2533,6 +2714,136 @@ pub(super) fn batch(
     }
 }
 
+/// A sealed layer's far sums on the card (`kv_cache`'s seal without the
+/// host's replay): `hy_far_insert_n` over the far rows a tile at a time, the
+/// running maxima, masses and numerators staying on the card between tiles.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn far_sums(c: &Ctx, nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]]) -> Res<(Vec<f32>, Vec<f32>)> {
+    let nh = nkv * hpk;
+    let n = idx.len();
+    let top = idx.iter().max().map_or(0, |&r| r as usize + 1);
+    if m == 0 || m > 64 || ks.len() != nkv || vs.len() != nkv || qt.len() != nh * m * hd || ks.iter().chain(vs).any(|x| x.len() < top * hd) {
+        return Err("far sums: unexpected geometry".into());
+    }
+    let t0 = std::time::Instant::now();
+    let mut st = c.st.lock().unwrap();
+    c.current()?;
+    let fx = match st.hyb.funcs.get(&(hpk, hd)) {
+        Some(f) => f.clone(),
+        None => {
+            let f = Arc::new(load_funcs(c, hpk, hd)?);
+            st.hyb.funcs.insert((hpk, hd), f.clone());
+            f
+        }
+    };
+    let mut mz0 = vec![0f32; nh * 2 * m];
+    for h in 0..nh {
+        mz0[h * 2 * m..h * 2 * m + m].fill(f32::NEG_INFINITY);
+    }
+    let qtb = Buf::from_slice(qt)?;
+    let mzb = Buf::from_slice(&mz0)?;
+    let thb = Buf::new(nh * m * hd * 4)?;
+    unsafe { cu::memset_d8_async(thb.ptr, 0, nh * m * hd * 4, c.stream).map_err(derr)? };
+    // a tile of rows [row][kv head][hd] in f16, as the far field's mirror keeps them
+    const TILE: usize = 8192;
+    let tile = TILE.min(n.max(1));
+    let row = nkv * hd;
+    let kb = st.scr(c, "fs_k", tile * row * 2)?;
+    let vb = st.scr(c, "fs_v", tile * row * 2)?;
+    // two host tiles: one fills on the threads while the card sums the other
+    let mut hk = [vec![0u16; tile * row], vec![0u16; tile * row]];
+    let mut hv = [vec![0u16; tile * row], vec![0u16; tile * row]];
+    let h16 = cortiq_core::quant::f32_to_f16;
+    let threads = std::thread::available_parallelism().map_or(4, |p| p.get()).clamp(1, 16);
+    let mut r0 = 0usize;
+    let mut slot = 0usize;
+    while r0 < n {
+        let nr = tile.min(n - r0);
+        let (kh, vh) = (&mut hk[slot], &mut hv[slot]);
+        let per = nr.div_ceil(threads).max(1);
+        std::thread::scope(|sc| {
+            for (ti, (kc, vc)) in kh[..nr * row].chunks_mut(per * row).zip(vh[..nr * row].chunks_mut(per * row)).enumerate() {
+                sc.spawn(move || {
+                    for (j, (kd, vd)) in kc.chunks_mut(row).zip(vc.chunks_mut(row)).enumerate() {
+                        let at = idx[r0 + ti * per + j] as usize * hd;
+                        for g in 0..nkv {
+                            let (ksrc, vsrc) = (&ks[g][at..at + hd], &vs[g][at..at + hd]);
+                            for d in 0..hd {
+                                kd[g * hd + d] = h16(ksrc[d]);
+                                vd[g * hd + d] = h16(vsrc[d]);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let (m_i, nkv_i, zero_i, w_i, e_i) = (m as i32, nkv as i32, 0i32, nr as i32, nr as i32);
+        let warps = nh * m;
+        unsafe {
+            // stream order: this tile's copy waits for the last tile's sums
+            cu::memcpy_htod_async(kb, &kh[..nr * row], c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(vb, &vh[..nr * row], c.stream).map_err(derr)?;
+            c.launch(fx.far_insert_n, ((warps * 32).div_ceil(256) as u32, 1), 256, 0, kargs!(kb, vb, qtb.ptr, mzb.ptr, thb.ptr, m_i, nkv_i, scale, zero_i, w_i, zero_i, e_i))?;
+        }
+        r0 += nr;
+        slot ^= 1;
+        if slot == 0 {
+            // both host tiles are queued: the older must be on the card before it is written again
+            c.sync()?;
+        }
+    }
+    let mut mz = vec![0f32; nh * 2 * m];
+    let mut th = vec![0f32; nh * m * hd];
+    unsafe {
+        cu::memcpy_dtoh_async(mz.as_mut_slice(), mzb.ptr, c.stream).map_err(derr)?;
+        cu::memcpy_dtoh_async(th.as_mut_slice(), thb.ptr, c.stream).map_err(derr)?;
+    }
+    c.sync()?;
+    if debug() {
+        eprintln!("cuda hybrid: far sums of {n} rows x {nkv} groups on the card in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok((mz, th))
+}
+
+/// `CMF_CUDA_MEM=1`: what the card holds, on stderr, after `what`.
+pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CMF_CUDA_MEM").as_deref() == Ok("1")) {
+        return;
+    }
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let (free, total) = cu::mem_get_info().unwrap_or((0, 0));
+    let scratch: u64 = st.scratch.values().map(|b| b.bytes as u64).sum();
+    let mut big: Vec<(&str, usize)> = st.scratch.iter().map(|(k, b)| (*k, b.bytes)).collect();
+    big.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let gdn: u64 = st
+        .hyb
+        .gdn
+        .values()
+        .map(|g| {
+            let snap = g.snap.as_ref().map_or(0, |s| s.1.bytes + s.2.bytes);
+            (g.s.bytes + g.ring.bytes + g.t_qkv.bytes + g.t_cq.bytes + g.t_gb.bytes + g.s_save.bytes + g.ring_save.bytes + snap) as u64
+        })
+        .sum();
+    let o1: u64 = st.hyb.o1.values().map(|d| d.bytes).sum();
+    let mirrors: Vec<(usize, usize)> = st.kv.values().map(|m| (m.cap, m.stored - m.base)).collect();
+    let mcap: usize = mirrors.iter().map(|m| m.0).max().unwrap_or(0);
+    eprintln!(
+        "cuda mem after {what}: used {:.0} of {:.0} MiB; weights {:.0}, K/V {:.0} (far fields {:.0}, {} mirrors of up to {mcap} rows), GDN states {:.0} in {}, scratch {:.0} (largest {}), graphs {}",
+        mb((total - free) as u64),
+        mb(total as u64),
+        mb(c.resident.load(Ordering::Relaxed)),
+        mb(c.kv_bytes.load(Ordering::Relaxed)),
+        mb(o1),
+        mirrors.len(),
+        mb(gdn),
+        st.hyb.gdn.len(),
+        mb(scratch),
+        big.iter().take(6).map(|(k, b)| format!("{k} {:.0}", mb(*b as u64))).collect::<Vec<_>>().join(", "),
+        st.hyb.graphs.len()
+    );
+}
+
 /// The prompt path: a chunk of `b > NMAX` rows on cuBLAS.
 #[allow(clippy::too_many_arguments)]
 unsafe fn big(
@@ -2544,6 +2855,7 @@ unsafe fn big(
     positions: &[usize],
     h: &mut [f32],
     defer: bool,
+    sealed: &[bool],
 ) -> Res<()> {
     let fx = &plan.fx;
     let b = positions.len();
@@ -2572,7 +2884,8 @@ unsafe fn big(
         .map(|(r, c)| r * c)
         .max()
         .unwrap_or(0);
-    let wd = st.scr(c, "hb_wd", wmax * 2)?;
+    // a large weight expands a band of rows at a time
+    let wd = st.scr(c, "hb_wd", (wmax * 2).min(wd_cap().max(1 << 20)))?;
     // a DFlash drafter's taps: the chunk's rows after each asked layer
     let want = super::taps_wanted();
     let tapping = !want.is_empty() && layer_base == 0 && want.iter().all(|&l| l < plan.layers.len());
@@ -2589,19 +2902,41 @@ unsafe fn big(
     let tm = &tm_;
     BROWS.fetch_add(b as u64, Ordering::Relaxed);
     bst(c, 7, tm)?;
-    // y [b][ldy] (+)= alpha W x: the weight expanded to f16, one GEMM
+    // y [b][ldy] (+)= alpha W x: the weight expanded to f16, a GEMM a band
+    // of rows (the whole matrix when it fits the band)
+    let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
         if m.kind != 6 {
             return Err("a weight other than repacked q4tp on the prompt path".into());
         }
-        let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
-        unsafe {
-            c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
-            bst(c, 1, tm)?;
-            c.gemm(true, false, m.rows, b, m.cols, alpha, wd, m.cols, x, m.cols, beta, y, ldy, Gemm::Half)?;
-            bst(c, 2, tm)
+        if m.rows * m.cols <= wd_rows {
+            let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
+            unsafe {
+                c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
+                bst(c, 1, tm)?;
+                c.gemm(true, false, m.rows, b, m.cols, alpha, wd, m.cols, x, m.cols, beta, y, ldy, Gemm::Half)?;
+                return bst(c, 2, tm);
+            }
         }
+        let tiles = m.rows.div_ceil(16);
+        let band = (wd_rows / m.cols / 16).max(1);
+        let mut t0 = 0usize;
+        while t0 < tiles {
+            let nt = band.min(tiles - t0);
+            let r0 = t0 * 16;
+            let nr = (nt * 16).min(m.rows - r0);
+            let threads = (nt * (m.cols / 32) * 32) as u64;
+            let (t0_i, nt_i) = (t0 as i32, nt as i32);
+            unsafe {
+                c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                bst(c, 1, tm)?;
+                c.gemm(true, false, nr, b, m.cols, alpha, wd, m.cols, x, m.cols, beta, y + (r0 * 4) as u64, ldy, Gemm::Half)?;
+                bst(c, 2, tm)?;
+            }
+            t0 += nt;
+        }
+        Ok(())
     };
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
@@ -2647,6 +2982,134 @@ unsafe fn big(
                 gs.next_pos = pos0 + b;
                 gs.tape = None;
                 mul(&g.out, yof, bh, hidden, 1.0, 1.0)?;
+            }
+            Mix::Attn(a) if sealed.get(li).copied().unwrap_or(false) => {
+                // past the seal: the chunk's rows after the far field's near
+                // rows, their attention over those and the landmarks, then
+                // the rows into the window (and the window's oldest into the
+                // far sums)
+                let qr = a.q.rows;
+                let yq = st.scr(c, "hb_q", b * qr * 4)?;
+                let yk = st.scr(c, "hb_k", b * nkv * hd * 4)?;
+                let yv = st.scr(c, "hb_v", b * nkv * hd * 4)?;
+                let qg = st.scr(c, "hb_qg", b * nh * hd * 4)?;
+                let qgh = st.scr(c, "hb_qgh", b * nh * hd * 2)?;
+                let gt = st.scr(c, "hb_gate", b * nh * hd * 4)?;
+                let aog = st.scr(c, "hb_aog", b * nh * hd * 4)?;
+                let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
+                let bis = st.scr(c, "hb_is", b * nh * 4)?;
+                let bfa = st.scr(c, "hb_fa", b * nh * 4)?;
+                let bfc = st.scr(c, "hb_fc", b * nh * 4)?;
+                let bfm = st.scr(c, "hb_fm", b * nh * 4)?;
+                let bfz = st.scr(c, "hb_fz", b * nh * 4)?;
+                let bfn = st.scr(c, "hb_fn", b * nh * hd * 4)?;
+                mul(&a.q, bxn, yq, qr, 1.0, 0.0)?;
+                mul(&a.k, bxn, yk, nkv * hd, 1.0, 0.0)?;
+                mul(&a.v, bxn, yv, nkv * hd, 1.0, 0.0)?;
+                let (kp, vp, kt, qt, mu, mz, th, ns, w, m, win_len, win_head, far_len, fscale, rect_fm) = {
+                    let d = st.hyb.o1.get(&key).ok_or("far field missing on the prompt path")?;
+                    if (d.nkv, d.hpk, d.hd) != (nkv, hpk, hd) {
+                        return Err("far field of another geometry".into());
+                    }
+                    if d.next_pos.is_some_and(|p| p != pos0) {
+                        return Err(format!("far field at row {:?}, the chunk at {pos0}", d.next_pos));
+                    }
+                    (d.nk.ptr, d.nv.ptr, d.kt.ptr, d.qt.ptr, d.mu.ptr, d.mz.ptr, d.th.ptr, d.ns, d.w, d.m, d.win_len, d.win_head, d.far_len, d.scale, d.rect_fm)
+                };
+                if b > SEAL_ROWS.max(NMAX) || b > w {
+                    return Err(format!("a chunk of {b} rows past a seal (window {w})"));
+                }
+                // the near rows before the chunk: the sinks with the kept rows,
+                // then the window (unwrapped until it is full)
+                let n0 = ns + win_len;
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
+                let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
+                unsafe {
+                    c.launch(
+                        fx.qk,
+                        ((nh + nkv) as u32, b as u32),
+                        hd as u32,
+                        0,
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, n0_i, b_i, nul, qgh),
+                    )?;
+                }
+                // the archive of a prompt past its first seal: the chunk's rows
+                // and one query row in the trace's stride off the card
+                super::acap_note(c, layer_base + li, kp, vp, n0, b, nkv * hd, qg, nh, nkv, hd, pos0)?;
+                let far_on = far_len > 0;
+                if far_on {
+                    let (m_i, sc, rf, bb_i) = (m as i32, fscale, rect_fm as i32, b as i32);
+                    unsafe {
+                        c.launch(fx.far_rows, (nh as u32, b as u32), 256, 0, kargs!(qg, kt, mu, mz, th, bfm, bfz, bfn, m_i, nh_i, sc, rf, bb_i))?;
+                    }
+                }
+                let lda = nkv * hd;
+                let grow = hpk * hd;
+                // a key r of the near rows sits at position col_base + r for the mask:
+                // all the rows before the chunk are visible, the chunk's causally
+                let col_base = pos0 - n0;
+                let mut b0 = 0usize;
+                while b0 < b {
+                    let bn = (b - b0).min(att_rows());
+                    let p0 = pos0 + b0;
+                    let l_rows = n0 + b0 + bn;
+                    let cols = bn * hpk;
+                    let bs = st.scr(c, "hb_s", nkv * l_rows * cols * 4)?;
+                    let bp = st.scr(c, "hb_p", nkv * l_rows * cols * 2)?;
+                    let (l_i, p0_i, cb_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, hpk as i32);
+                    let (cols_i, istride) = (cols as i32, (b * hpk) as i32);
+                    let off = (b0 * hpk * 4) as u64;
+                    let (fmp, fzp) = if far_on { (bfm + (b0 * nh * 4) as u64, bfz + (b0 * nh * 4) as u64) } else { (0u64, 0u64) };
+                    unsafe {
+                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kp, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
+                        c.launch(fx.softmax_hf, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, bis + off, bfa + off, bfc + off, l_i, p0_i, cb_i, hpk_i, cols_i, istride, fmp, fzp, nh_i))?;
+                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vp, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
+                    }
+                    b0 += bn;
+                }
+                let n_ao = (b * nh * hd) as u64;
+                let gate_p = if a.gated { gt } else { 0u64 };
+                let fnp = if far_on { bfn } else { 0u64 };
+                unsafe {
+                    c.launch(fx.attn_out_f, (n_ao.div_ceil(256) as u32, 1), 256, 0, kargs!(aog, bis, bfa, bfc, fnp, gate_p, bao, nh_i, b_i, one))?;
+                }
+                // the commit: the first rows fill the window where they are; past
+                // a full window each row takes the oldest's slot, which goes into
+                // the far sums first
+                let fill = b.min(w - win_len);
+                let rest = b - fill;
+                let head0 = if win_len == w { win_head } else { 0 };
+                if rest > 0 {
+                    let (m_i, ns_i, w_i, h0_i, e_i) = (m as i32, ns as i32, w as i32, head0 as i32, rest as i32);
+                    let warps = nkv * hpk * m;
+                    let row_b = (nkv * hd * 2) as u64;
+                    unsafe {
+                        c.launch(fx.far_insert_n, ((warps * 32).div_ceil(256) as u32, 1), 256, 0, kargs!(kp, vp, qt, mz, th, m_i, nkv_i, fscale, ns_i, w_i, h0_i, e_i))?;
+                        // the rows past the window's room into the freed slots: two runs at most
+                        let src = (n0 + fill) as u64;
+                        let r1 = rest.min(w - head0);
+                        for (dst, from, n) in [((ns + head0) as u64, src, r1), (ns as u64, src + r1 as u64, rest - r1)] {
+                            if n == 0 {
+                                continue;
+                            }
+                            cu::memcpy_dtod_async(kp + dst * row_b, kp + from * row_b, n * row_b as usize, c.stream).map_err(derr)?;
+                            cu::memcpy_dtod_async(vp + dst * row_b, vp + from * row_b, n * row_b as usize, c.stream).map_err(derr)?;
+                        }
+                    }
+                }
+                {
+                    let d = st.hyb.o1.get_mut(&key).ok_or("far field missing on the prompt path")?;
+                    d.win_len = (win_len + b).min(w);
+                    if rest > 0 {
+                        d.win_head = (head0 + rest) % w;
+                        d.far_len += rest;
+                    }
+                    d.next_pos = Some(pos0 + b);
+                    d.spec = None;
+                }
+                bst(c, 5, tm)?;
+                mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
             }
             Mix::Attn(a) => {
                 let qr = a.q.rows;
@@ -2710,13 +3173,13 @@ unsafe fn big(
                     let p0 = pos0 + b0;
                     let col_base = m_base;
                     let fit = |n: usize| (p0 + n - col_base) * n * nh * 4 <= 384 << 20;
-                    let mut bn = b - b0;
+                    let mut bn = (b - b0).min(att_rows());
                     while bn > 64 && !fit(bn) {
                         bn = bn.div_ceil(2);
                     }
                     let l_rows = p0 + bn - col_base;
                     let cols = bn * hpk;
-                    let whole = (hint.max(pos0 + b) * b * nh * 4).min(400 << 20);
+                    let whole = (hint.max(pos0 + b) * b.min(att_rows()) * nh * 4).min(400 << 20);
                     let bs = st.scr(c, "hb_s", (nkv * l_rows * cols * 4).max(whole))?;
                     let bp = st.scr(c, "hb_p", (nkv * l_rows * cols * 2).max(whole / 2))?;
                     let (l_i, p0_i, cb_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, hpk as i32);
@@ -2769,7 +3232,9 @@ unsafe fn big(
     if !defer {
         unsafe { cu::memcpy_dtoh_async(h, bh, c.stream).map_err(derr)? };
     }
-    c.sync()
+    let r = c.sync();
+    mem_report(c, st, &format!("a prompt chunk of {b} rows at {pos0}"));
+    r
 }
 
 /// After a verify window accepted rows `..= slot`: every GDN layer of the
@@ -2850,6 +3315,11 @@ pub(super) fn spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected: u
 /// Drafts over a far field (`CMF_O1_SPEC=0` turns them off).
 pub(crate) fn far_spec_on() -> bool {
     std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
+}
+
+/// A prompt read past a seal in chunks on the card (`CMF_O1_CHUNKS=0`: none).
+pub(crate) fn far_chunks_on() -> bool {
+    std::env::var("CMF_O1_CHUNKS").as_deref() != Ok("0")
 }
 
 pub(super) fn spec_commit(kv_id: u64, pos0: usize, rows: usize) -> bool {
@@ -3117,6 +3587,57 @@ mod tests {
         unsafe { cu::memcpy_dtoh_sync(&mut v, b.ptr) }.unwrap();
         let _ = c;
         v
+    }
+
+    /// A seal's far sums on the card (`far_sums`, several tiles of rows) are
+    /// the host's replay of the same rows: the keys and values exact in f16,
+    /// so only the dot products' order differs.
+    #[test]
+    fn card_far_sums_match_the_host_replay() {
+        let Some(c) = super::super::ctx() else { return };
+        let (nkv, hpk, hd, m, w, sink) = (2usize, 2usize, 64usize, 8usize, 32usize, 4usize);
+        let t = 9000usize;
+        let nh = nkv * hpk;
+        let mut seed = 5u64;
+        let mut f = || cortiq_core::quant::f16_to_f32(cortiq_core::quant::f32_to_f16((lcg(&mut seed) % 2000) as f32 / 1000.0 - 1.0));
+        let ks: Vec<Vec<f32>> = (0..nkv).map(|_| (0..t * hd).map(|_| f()).collect()).collect();
+        let vs: Vec<Vec<f32>> = (0..nkv).map(|_| (0..t * hd).map(|_| f()).collect()).collect();
+        let qtr: Vec<f32> = (0..t * nh * hd).map(|_| f()).collect();
+        let order: Vec<u32> = (0..t as u32).collect();
+        let mut host = Vec::new();
+        let mut qt = Vec::new();
+        let mut range = 0..0;
+        for g in 0..nkv {
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk);
+            range = st.seal_gathered(&ks[g], &vs[g], &qtr, 1, nh, g * hpk, &order, t, hd, hd).unwrap();
+            for h in 0..hpk {
+                qt.extend_from_slice(st.far_q_tilde(h));
+            }
+            st.replay_far_idx(&ks[g], &vs[g], &order[range.clone()]);
+            host.push(st);
+        }
+        let (kr, vr): (Vec<&[f32]>, Vec<&[f32]>) = (ks.iter().map(|k| &k[..]).collect(), vs.iter().map(|v| &v[..]).collect());
+        let scale = 1.0 / (hd as f32).sqrt();
+        let (mz, th) = far_sums(c, nkv, hpk, hd, m, scale, &qt, &order[range], &kr, &vr).unwrap();
+        let mut worst = 0f32;
+        for (g, st) in host.iter().enumerate() {
+            let view = st.device_view();
+            for (j, hv) in view.heads.iter().enumerate() {
+                let h = g * hpk + j;
+                for i in 0..m {
+                    let (mm, z) = (mz[h * 2 * m + i], mz[h * 2 * m + m + i]);
+                    assert!((mm - hv.m_max[i]).abs() < 1e-4, "largest logit {mm} against {}", hv.m_max[i]);
+                    // the sums at the two scales, brought to one
+                    let r = (hv.m_max[i] - mm).exp();
+                    worst = worst.max((z - hv.z_hat[i] * r).abs() / z);
+                    for d in 0..hd {
+                        let (a, b) = (th[(h * m + i) * hd + d], hv.t_hat[i * hd + d] * r);
+                        worst = worst.max((a - b).abs() / z);
+                    }
+                }
+            }
+        }
+        assert!(worst < 1e-4, "far sums off the host's by {worst}");
     }
 
     /// The card's repack (one matrix and a gate/up pair) is the host's,

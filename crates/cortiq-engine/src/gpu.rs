@@ -2518,7 +2518,7 @@ pub fn forward_batch_graph_at(
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::forward_batch_graph_at(
             model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap,
-            gemma, eps, attn_scale, k, o1, spec, layers_run,
+            gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run,
         ),
         #[allow(unreachable_patterns)]
         _ => {
@@ -2698,8 +2698,40 @@ pub fn o1_spec_commit(_kv_id: u64, _pos0: usize, _rows: usize) -> bool {
     false
 }
 
-/// Copy sealed prompt chunks' rows to host memory until `o1_acap_end`.
-pub fn o1_acap_begin() {
+/// A seal's far sums go to the card (`o1_far_sums`): CUDA, unless
+/// `CMF_O1_FAR_GPU=0`.
+pub fn o1_far_sums_on() -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return std::env::var("CMF_O1_FAR_GPU").as_deref() != Ok("0") && crate::gpu_cuda::ctx_ready();
+    }
+    false
+}
+
+/// One sealed layer's far sums on the card: `nkv` groups of `hpk` heads, `m`
+/// landmarks each (`qt` [head][m][hd]), over the far rows `idx` (in the
+/// replay's order) of each group's keys and values (`ks[g]`, `vs[g]`
+/// [row][hd]). Per head, the replay's largest logits then masses
+/// (`[head][2m]`) and numerators (`[head][m][hd]`); None when the card does
+/// not take it.
+#[allow(clippy::too_many_arguments)]
+pub fn o1_far_sums(nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]]) -> Option<(Vec<f32>, Vec<f32>)> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_far_sums(nkv, hpk, hd, m, scale, qt, idx, ks, vs);
+    }
+    let _ = (nkv, hpk, hd, m, scale, qt, idx, ks, vs);
+    None
+}
+
+/// Copy sealed prompt chunks' rows to host memory until `o1_acap_end`. A
+/// backend may keep one query row in `stride` by position (CUDA), the rows
+/// the archive's trace keeps; the others hand back every row.
+pub fn o1_acap_begin(_stride: usize) {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::o1_acap_begin(_stride);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::o1_acap_begin();
@@ -2711,6 +2743,10 @@ pub fn o1_acap_begin() {
 }
 
 pub fn o1_acap_end() {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::o1_acap_end();
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::o1_acap_end();
@@ -2723,6 +2759,10 @@ pub fn o1_acap_end() {
 
 /// The rows captured since the last call: (layer, queries, keys, values).
 pub fn o1_acap_take() -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_acap_take();
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::o1_acap_take();

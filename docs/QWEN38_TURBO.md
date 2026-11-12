@@ -159,9 +159,9 @@ same command with a fit of their own; only Qwen3.8-27B has been measured.
 
 ## What stays out
 
-- The far field runs on Vulkan, DX12, Metal (`gpu_metal/o1c.rs`) and CUDA ([docs/CUDA.md](CUDA.md#hybrids-the-qwen35-family): the prompt is
-  read whole on the card and sealed once, so there is no fixed ceiling on CUDA). On the CPU the file runs as the standard one. It was
-  measured on an NVIDIA card and an M4.
+- The far field runs on Vulkan, DX12, Metal (`gpu_metal/o1c.rs`) and CUDA ([docs/CUDA.md](CUDA.md#turbo-on-a-16-gb-card): on a
+  16 GB card the whole run stays at 15.0 GB, a 64 000-token prompt included). On the CPU the file runs as the standard one. It
+  was measured on NVIDIA cards and an M4.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact. The fit saw planted
   facts, and other kinds of important text were not tested.
 - Rows that arrive after a prompt ends stay in the window or go to the far field. A turn that diverges from a sealed

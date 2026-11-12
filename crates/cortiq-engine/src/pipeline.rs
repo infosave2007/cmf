@@ -5689,10 +5689,19 @@ impl Pipeline {
         let got = crate::gpu::o1_acap_take().ok_or("O(1) archive: readback failed")?;
         let qrow = a.nh * a.hd;
         let stride = a.stride;
+        // a backend may hand back the kept query rows alone (CUDA)
+        let kept = (pos..pos + bk).filter(|p| p % stride == 0).count();
         for (gl, q, k, v) in got {
             let Some(l) = a.layers.iter_mut().find(|l| l.li == gl) else { continue };
             l.k.push(&k)?;
             l.v.push(&v)?;
+            if q.len() == kept * qrow && kept != bk {
+                l.q.push(&q)?;
+                continue;
+            }
+            if q.len() != bk * qrow {
+                return Err(format!("O(1) archive: layer {gl} handed back {} query values", q.len()));
+            }
             for p in pos..pos + bk {
                 if p % stride == 0 {
                     l.q.push(&q[(p - pos) * qrow..(p - pos + 1) * qrow])?;
@@ -5722,14 +5731,62 @@ impl Pipeline {
         };
         let t_pick = t0.elapsed().as_secs_f64();
         let mut all = !layers.is_empty();
+        let prof = std::env::var("CMF_PREFILL_PROF").is_ok();
+        let t_layers = std::time::Instant::now();
+        // a few layers at a time (`CMF_O1_SEAL_PAR`), each on its own thread: a
+        // layer's rows into its cache, then its seal (its groups on threads of
+        // their own); RAM holds those layers' rows twice meanwhile
+        let par = std::env::var("CMF_O1_SEAL_PAR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()).div_ceil(8).clamp(1, 4));
+        let heads: Vec<usize> = (0..self.kv_cache.layers.len()).map(|li| self.layer_num_heads(li)).collect();
+        let mut by_li: Vec<Option<_>> = (0..self.kv_cache.layers.len()).map(|_| None).collect();
         for (li, k, v, q) in layers {
-            let num_heads = self.layer_num_heads(li);
-            let cache = &mut self.kv_cache.layers[li];
-            if !cache.o1_recollect(k.as_slice(), v.as_slice(), q.as_slice().to_vec(), stride, rows) {
-                return Err(format!("O(1) archive: layer {li} is not sealed"));
+            if li < by_li.len() {
+                by_li[li] = Some((k, v, q));
             }
-            cache.o1_keep = keep.clone();
-            all &= cache.o1_seal_checked(num_heads)?;
+        }
+        let mut jobs: Vec<(usize, &mut crate::kv_cache::LayerKvCache, _)> = Vec::new();
+        for (li, cache) in self.kv_cache.layers.iter_mut().enumerate() {
+            if let Some(d) = by_li[li].take() {
+                jobs.push((li, cache, d));
+            }
+        }
+        let keep_ref = &keep;
+        let heads = &heads;
+        let results: Vec<Result<bool, String>> = std::thread::scope(|sc| {
+            let mut out = Vec::new();
+            let mut jobs = jobs.into_iter();
+            loop {
+                let wave: Vec<_> = jobs.by_ref().take(par.max(1)).collect();
+                if wave.is_empty() {
+                    break;
+                }
+                let hs: Vec<_> = wave
+                    .into_iter()
+                    .map(|(li, cache, (k, v, q))| {
+                        sc.spawn(move || -> Result<bool, String> {
+                            if !cache.o1_recollect(k.as_slice(), v.as_slice(), q.as_slice().to_vec(), stride, rows) {
+                                return Err(format!("O(1) archive: layer {li} is not sealed"));
+                            }
+                            drop((k, v, q));
+                            cache.o1_keep = keep_ref.clone();
+                            cache.o1_seal_checked(heads[li])
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    out.push(h.join().unwrap_or_else(|_| Err("O(1) archive: a layer's seal panicked".into())));
+                }
+            }
+            out
+        });
+        for r in results {
+            all &= r?;
+        }
+        if prof {
+            eprintln!("o1 archive seal: {} layers {par} at a time in {:.2} s", by_li.len(), t_layers.elapsed().as_secs_f64());
         }
         self.o1_note_transition();
         tracing::info!(
@@ -5916,12 +5973,17 @@ impl Pipeline {
 
     /// The whole prompt is read exact on the card, and one seal after it
     /// chooses among all of its rows, with the question's queries in the
-    /// trace. The CUDA graph's way (it has the far field's token kernels and
-    /// no sealed-chunk ones); `CMF_O1_WHOLE=1` takes the wgpu graph the same
-    /// way, so the two can be compared row for row.
+    /// trace. The CUDA graph's way where it has no sealed-chunk kernels (the
+    /// dense arm); its hybrid arm reads a prompt past the first seal in chunks
+    /// as the wgpu graph does, so memory stays at the seal's
+    /// (`CMF_O1_CHUNKS=0` reads it whole there too). `CMF_O1_WHOLE=1` takes
+    /// either graph the whole way, so the two can be compared row for row.
     #[cfg(not(target_os = "macos"))]
     fn o1_whole_prompt(&self) -> bool {
-        crate::gpu::cuda_active() || std::env::var("CMF_O1_WHOLE").as_deref() == Ok("1")
+        if std::env::var("CMF_O1_WHOLE").as_deref() == Ok("1") {
+            return true;
+        }
+        crate::gpu::cuda_active() && (self.graph_gdn_layer_count() == 0 || std::env::var("CMF_O1_CHUNKS").as_deref() == Ok("0"))
     }
 
     pub fn far_turbo_seal(&self) -> usize {
@@ -7788,8 +7850,8 @@ impl Pipeline {
             if !self.o1_active() && o1_arch.is_none() && !o1_batch_ready {
                 crate::gpu::set_batch_kv_hint(input_ids.len() + 1);
             }
-            if o1_arch.is_some() {
-                crate::gpu::o1_acap_begin();
+            if let Some(a) = o1_arch.as_ref() {
+                crate::gpu::o1_acap_begin(a.stride);
             }
             if o1_batch_ready && mtp.is_some() {
                 self.mtp_pos_base = tail_from.max(pos);

@@ -1,0 +1,23 @@
+{
+ "name": "cuda",
+ "ctx": [1000, 4000, 16000, 32000, 64000],
+ "labels": ["1k", "4k", "16k", "32k", "64k"],
+ "decode_max": 100,
+ "mem_max": 16,
+ "series": [
+  {"key": "tur", "color": "blue", "first": [2.55, 9.71, 43.18, 86.20, 174.58], "decode": [87.3, 86.9, 94.4, 93.5, 93.8], "mem": [14.64, 14.90, 15.00, 15.00, 15.00]},
+  {"key": "std", "color": "grey", "first": [2.56, 9.59, null, null, null], "decode": [86.9, 86.5, null, null, null], "mem": [14.65, 15.00, null, null, null]},
+  {"key": "vk", "color": "orange", "first": [3.58, 14.88, 70.38, 135.56, 277.94], "decode": [27.9, 26.7, 25.4, 26.7, 26.5], "mem": [14.08, 14.30, 14.77, 14.77, 14.80]}
+ ],
+ "text": {
+  "en": {"t": "Qwen3.8-27B Turbo on a 16 GB card (RTX 2000 Ada)", "sub": "cortiq bench --core: 60 tokens after a prompt of that length, drafts on (the bench text repeats). Release build.",
+         "tur": "turbo, CUDA", "std": "standard, CUDA (out of memory from 16k)", "vk": "turbo, Vulkan", "first": "First token, s", "decode": "Decode, tok/s", "mem": "Peak device memory, GB", "ctx": "prompt, tokens",
+         "res": "A real summary of 100 000 characters: first token in 69.8 s, then 31.5 tok/s (Vulkan 114.3 s, 21.3)"},
+  "ru": {"t": "Qwen3.8-27B Turbo на карте 16 ГБ (RTX 2000 Ada)", "sub": "cortiq bench --core: 60 токенов после промпта такой длины, с черновиками (текст бенча повторяется). Сборка release.",
+         "tur": "турбо, CUDA", "std": "обычный, CUDA (не помещается с 16k)", "vk": "турбо, Vulkan", "first": "Первый токен, с", "decode": "Декод, ток/с", "mem": "Пик памяти карты, ГБ", "ctx": "промпт, токенов",
+         "res": "Реальный пересказ 100 000 символов: первый токен через 69,8 с, затем 31,5 ток/с (Vulkan 114,3 с, 21,3)"},
+  "zh": {"t": "16 GB 显卡上的 Qwen3.8-27B Turbo（RTX 2000 Ada）", "sub": "cortiq bench --core：在该长度的提示之后生成 60 个词元，开启草稿（bench 文本是重复的）。release 构建。",
+         "tur": "turbo，CUDA", "std": "普通，CUDA（16k 起显存不足）", "vk": "turbo，Vulkan", "first": "首个词元，秒", "decode": "解码，tok/s", "mem": "显存峰值，GB", "ctx": "提示，词元",
+         "res": "真实概括 100 000 个字符：首个词元 69.8 秒，之后 31.5 tok/s（Vulkan 114.3 秒，21.3）"}
+ }
+}

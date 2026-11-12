@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Qwen3.8-27B Turbo на карте 16 ГБ через CUDA (0.8.71)
+
+[Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) теперь держит на CUDA постоянный потолок
+памяти вместе с промптом: на RTX 2000 Ada с 16 ГБ весь прогон укладывается в 15,0 ГБ от 1 000 до 64 000 токенов.
+Промпт после первых строк читается через дальнее поле кусками, как через Vulkan, а суммы дальнего поля строятся на
+карте. На той же карте промпт в 64 000 токенов доходит до первого токена за 175 с против 278 через Vulkan, а
+пересказ 100 000 символов декодируется на 31,5 tok/s против 21,3. Обычный файл на 16 000 токенов в эту карту не
+помещается.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+См. [docs/CUDA.ru.md](docs/CUDA.ru.md#турбо-на-карте-16-гб).
+
 ## Dory и Qwen3.8-27B Turbo на CUDA (0.8.70)
 
 Бэкенд CUDA запускает [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf),
