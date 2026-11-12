@@ -122,5 +122,19 @@
    "strata",
    31.1
   ]
+ ],
+ "cards": [
+  {
+   "label": "12 GB",
+   "decode": 104.9
+  },
+  {
+   "label": "16 GB",
+   "decode": 117.6
+  },
+  {
+   "label": "24 GB",
+   "decode": 132.8
+  }
  ]
 }

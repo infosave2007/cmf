@@ -24,6 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `mxfp4` (OCP MX FP4) CPU kernels.
 mod mxfp4;
 
+/// Whole q4tp experts on the host's cores (AVX-512 VNNI): the misses of a
+/// card's expert arena.
+#[cfg(target_arch = "x86_64")]
+mod moe_fast;
+
 /// D5 GPU-matmat gate telemetry: large-GEMM calls that reached the gate
 /// vs those the q8_2f device kernel actually consumed (SAM3 profiling).
 pub static MATMAT_GATE: AtomicU64 = AtomicU64::new(0);
@@ -4432,6 +4437,49 @@ impl QTensor {
         };
         dispatch_rows(pool, downs.len() * rows, &run);
         true
+    }
+
+    /// Whole experts for SEVERAL tokens in one dispatch: expert `e`
+    /// (`experts[e]` = its gate, up and down, q4tp) serves the tokens
+    /// `groups[e]` (row indices into `xs`, each `hidden` wide), and
+    /// `out[p]` (`hidden` wide, flat in (expert, token-of-group) order) is
+    /// the term `down_e · (silu(gate_e · x) ⊙ (up_e · x))` the caller weights
+    /// and sums. The math of `moe_gate_up_rows` followed by `moe_down_rows`
+    /// (the same int8 activation split, outlier terms and SiLU) with every
+    /// row's sum taken in sixteen float lanes, so a value differs from
+    /// theirs by rounding only; the work is one pass over the weights at
+    /// the speed of the memory bus (see `qtensor/moe_fast.rs`). False =
+    /// not covered (no AVX-512 VNNI, not q4tp, float activations, a shape
+    /// outside 64-wide steps): the caller takes the two row kernels.
+    pub fn moe_expert_rows_fast(
+        experts: &[(&QTensor, &QTensor, &QTensor)],
+        groups: &[Vec<usize>],
+        xs: &[f32],
+        out: &mut [f32],
+        pool: Option<&Pool>,
+    ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            moe_fast::run(experts, groups, xs, out, pool)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (experts, groups, xs, out, pool);
+            false
+        }
+    }
+
+    /// Whether this host has the cores for [`QTensor::moe_expert_rows_fast`] (AVX-512 VNNI with the int8
+    /// activation path on).
+    pub fn moe_expert_rows_fast_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            avx512vnni_enabled() && a8w8_enabled()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 }
 
@@ -15714,6 +15762,167 @@ mod tests {
         QTensor::matvec_many([&a, &b], &x, [&mut ga, &mut gb], Some(&pool));
         assert_eq!(ea, ga, "Q4TP fused lane 1 must be bit-identical");
         assert_eq!(eb, gb, "Q4TP fused lane 2 must be bit-identical");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bus-speed expert kernel (`moe_fast`): its scales are bit for bit
+    /// those of `scales_into`, whole experts equal `moe_gate_up_rows` +
+    /// `moe_down_rows` up to the rounding of a sixteen-lane sum, with
+    /// activation outliers on both stages, empty groups, groups past four
+    /// tokens, and the same bits with and without a pool.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fast_expert_rows_match_the_row_kernels() {
+        use crate::pool::Pool;
+        use cortiq_core::{CMF_VERSION, CmfHeader, CmfModel, QuantType, TensorSpec};
+
+        // The scales, every row width the code decode has a path for.
+        for (rows, cols) in [(32usize, 2560usize), (16, 640), (48, 192), (16, 64)] {
+            let bytes = synth_q4tp(rows, cols);
+            let v = Q4tpView::new(&bytes, rows, cols);
+            let gpr = cols / GROUP_SIZE;
+            for r0 in (0..rows).step_by(16) {
+                let Some(got) = moe_fast::block_scales(&v, r0, gpr) else {
+                    eprintln!("fast_expert_rows: no AVX-512 VNNI here, skipped");
+                    return;
+                };
+                for i in 0..16 {
+                    let mut want = vec![0f32; gpr];
+                    v.scales_into(r0 + i, gpr, &mut want);
+                    assert_eq!(
+                        want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        got[i * gpr..(i + 1) * gpr].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "scales of row {} ({rows}x{cols})",
+                        r0 + i
+                    );
+                }
+            }
+        }
+
+        let (h, inter, ne) = (192usize, 640usize, 5usize);
+        let arch: cortiq_core::ModelArch = serde_json::from_value(serde_json::json!({
+            "arch_name": "tiny-q4tp-moe",
+            "hidden_size": h,
+            "intermediate_size": inter,
+            "num_layers": 1,
+            "num_attention_heads": h / 32,
+            "num_kv_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 8,
+            "layer_types": ["FullAttention"],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 8,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0
+        }))
+        .unwrap();
+        let header = CmfHeader {
+            format: "cmf".into(),
+            version: CMF_VERSION,
+            arch,
+            quant_type: QuantType::Q4Block,
+            provenance: None,
+            tokenizer_config: None,
+            section_hashes: None,
+            skills: Vec::new(),
+            shard: None,
+            calibration: None,
+            routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
+        };
+        let mut specs = Vec::new();
+        for e in 0..ne {
+            for (k, (n, r, c)) in [("g", inter, h), ("u", inter, h), ("d", h, inter)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut data = synth_q4tp(r, c);
+                for (i, byte) in data[..r * (c / GROUP_SIZE) * Q4TP_NIB]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *byte ^= ((i * (e * 3 + k + 1)) % 251) as u8;
+                }
+                specs.push(TensorSpec {
+                    name: format!("{n}{e}"),
+                    dtype: TensorDtype::Q4TiledP,
+                    shape: vec![r, c],
+                    data,
+                });
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("cmf-moe-fast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        let t = |n: String| QTensor::from_model(&model, &n).unwrap();
+        let g: Vec<QTensor> = (0..ne).map(|e| t(format!("g{e}"))).collect();
+        let u: Vec<QTensor> = (0..ne).map(|e| t(format!("u{e}"))).collect();
+        let d: Vec<QTensor> = (0..ne).map(|e| t(format!("d{e}"))).collect();
+        let b = 6usize;
+        let mut xs: Vec<f32> = (0..b * h)
+            .map(|i| ((i * 31 + 7) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+        xs[5] = 9.0; // an activation outlier on token 0
+        // Expert -> its tokens: five (a full chunk and one more), one, none, three, two.
+        let groups: Vec<Vec<usize>> = vec![vec![0, 1, 2, 3, 4], vec![5], vec![], vec![2, 0, 5], vec![1, 3]];
+        let lens: Vec<usize> = groups.iter().map(|v| v.len()).collect();
+        let n_pairs: usize = lens.iter().sum();
+        let pool = Pool::new(3);
+        let close = |want: &[f32], got: &[f32], rel: f32, what: &str| {
+            assert_eq!(want.len(), got.len(), "{what}: length");
+            let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(top > 0.0, "{what}: an all-zero reference proves nothing");
+            for (i, (w, v)) in want.iter().zip(got).enumerate() {
+                assert!((w - v).abs() <= rel * top, "{what}: [{i}] {w} vs {v} (scale {top})");
+            }
+        };
+
+        // The reference: the two row kernels.
+        let pairs: Vec<(&QTensor, &QTensor)> = (0..ne).map(|e| (&g[e], &u[e])).collect();
+        let mut gs: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; inter]).collect();
+        assert!(QTensor::moe_gate_up_rows(&pairs, &groups, &xs, &mut gs, Some(&pool)));
+        let downs: Vec<&QTensor> = d.iter().collect();
+        let mut ds: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; h]).collect();
+        assert!(QTensor::moe_down_rows(&downs, &lens, &gs, &mut ds, Some(&pool)));
+
+        let triples: Vec<(&QTensor, &QTensor, &QTensor)> = (0..ne).map(|e| (&g[e], &u[e], &d[e])).collect();
+        let mut out = vec![0f32; n_pairs * h];
+        let mut gs_fast = Vec::new();
+        if !moe_fast::run_stages(&triples, &groups, &xs, &mut out, Some(&pool), None, Some(&mut gs_fast)) {
+            eprintln!("fast_expert_rows: the int8 activation kernels are off here, skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        close(&gs.concat(), &gs_fast, 1e-4, "gate and up");
+        close(&ds.concat(), &out, 1e-2, "whole experts");
+
+        // The down stage alone on the reference's gate rows, one of them
+        // with an outlier (the gate rows of a real expert have them).
+        let mut gs_out = gs.clone();
+        let top = gs.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        gs_out[0][3] = 40.0 * top;
+        let mut ds_out: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; h]).collect();
+        assert!(QTensor::moe_down_rows(&downs, &lens, &gs_out, &mut ds_out, Some(&pool)));
+        let mut out2 = vec![0f32; n_pairs * h];
+        assert!(moe_fast::run_stages(&triples, &groups, &xs, &mut out2, Some(&pool), Some(&gs_out.concat()), None));
+        close(&ds_out.concat(), &out2, 1e-4, "down");
+
+        // The same bits on the calling thread alone, and a refusal the caller can fall back from.
+        let mut out3 = vec![0f32; n_pairs * h];
+        assert!(QTensor::moe_expert_rows_fast(&triples, &groups, &xs, &mut out3, None));
+        assert_eq!(
+            out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            out3.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "pooled and serial runs must agree bit for bit"
+        );
+        let mut short = vec![0f32; n_pairs * h - 1];
+        assert!(!QTensor::moe_expert_rows_fast(&triples, &groups, &xs, &mut short, Some(&pool)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

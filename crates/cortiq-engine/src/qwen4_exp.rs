@@ -4645,7 +4645,7 @@ fn cuda_run(
 /// prompt's share, default 0.5; 1 without a pack); `CMF_QWEN_PACK_SWAP` bounds the experts
 /// brought in (default 4096). Off unless `CMF_QWEN_SELF_PACK=1`: on the CUDA card the refill
 /// from the prompt's own routing alone changed the decode speed by less than the run-to-run
-/// spread, and the python pack on a writing task made it slower.
+/// spread (with zero copy too), and the python pack on a writing task made it slower.
 #[cfg(feature = "cuda")]
 fn cuda_prompt_done(layers: &[Layer], state: &mut State) {
     if std::env::var("CMF_QWEN_SELF_PACK").as_deref() != Ok("1") {
@@ -8155,6 +8155,7 @@ mod tests {
         assert_eq!(&cur.draft(&ids, 4)[..3], &[100, 101, 4]);
     }
 
+    #[cfg(feature = "gpu")]
     #[test]
     fn suffix_draft_continues_the_latest_longest_occurrence() {
         // the tail [1, 2, 3] occurred at 0..3; 9, 8 followed it

@@ -108,6 +108,149 @@ pub fn batch_rows() -> usize {
 /// The f32 constants' slab size.
 const SLAB: usize = 8 << 20;
 
+/// One driver allocation carved into buffers (`SlabScope`).
+struct Slab {
+    ptr: cs::CUdeviceptr,
+    /// The free extents (offset, length), by offset.
+    free: Mutex<Vec<(usize, usize)>>,
+}
+
+impl Slab {
+    fn carve(&self, need: usize) -> Option<usize> {
+        let mut f = self.free.lock().unwrap();
+        let i = f.iter().position(|&(_, len)| len >= need)?;
+        let (off, len) = f[i];
+        if len == need {
+            f.remove(i);
+        } else {
+            f[i] = (off + need, len - need);
+        }
+        Some(off)
+    }
+
+    fn release(&self, off: usize, len: usize) {
+        let mut f = self.free.lock().unwrap();
+        let i = f.partition_point(|&(o, _)| o < off);
+        f.insert(i, (off, len));
+        if i + 1 < f.len() && f[i].0 + f[i].1 == f[i + 1].0 {
+            f[i].1 += f[i + 1].1;
+            f.remove(i + 1);
+        }
+        if i > 0 && f[i - 1].0 + f[i - 1].1 == f[i].0 {
+            f[i - 1].1 += f[i].1;
+            f.remove(i);
+        }
+    }
+
+    fn left(&self) -> usize {
+        self.free.lock().unwrap().iter().map(|&(_, len)| len).sum()
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cu::free_sync(self.ptr);
+        }
+    }
+}
+
+/// The slabs a `SlabScope` carves this thread's buffers from.
+struct SlabPool {
+    slabs: Vec<Arc<Slab>>,
+    /// Buffers past this size stay the driver's own.
+    max_piece: usize,
+    pieces: usize,
+    carved: u64,
+    direct: u64,
+    direct_n: usize,
+}
+
+/// Bytes of a slab: a multiple of what the driver rounds an allocation to.
+const SLAB_BYTES: usize = 64 << 20;
+/// The largest buffer a slab holds.
+const SLAB_PIECE: usize = 16 << 20;
+
+impl SlabPool {
+    fn carve(&mut self, bytes: usize) -> Option<Buf> {
+        if bytes > self.max_piece {
+            self.direct += bytes as u64;
+            self.direct_n += 1;
+            return None;
+        }
+        let need = bytes.next_multiple_of(256);
+        let hit = self.slabs.iter().find_map(|s| s.carve(need).map(|off| (s.clone(), off)));
+        let (slab, off) = match hit {
+            Some(h) => h,
+            None => {
+                let ptr = unsafe { cu::malloc_sync(SLAB_BYTES) }.ok()?;
+                // the last page stays out: a kernel's last vector load may read past a buffer
+                let slab = Arc::new(Slab { ptr, free: Mutex::new(vec![(need, SLAB_BYTES - 4096 - need)]) });
+                self.slabs.push(slab.clone());
+                (slab, 0)
+            }
+        };
+        self.pieces += 1;
+        self.carved += need as u64;
+        Some(Buf { ptr: slab.ptr + off as u64, bytes, owned: true, slab: Some((slab, need)) })
+    }
+}
+
+thread_local! {
+    static SLABS: std::cell::RefCell<Option<SlabPool>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While it lives, the buffers this thread allocates are pieces of shared
+/// slabs: the driver rounds an allocation above a megabyte up to a multiple of
+/// two, and a model of a thousand buffers loses a gigabyte of the card to that.
+/// A buffer that is dropped gives its piece back to its slab; a slab goes back
+/// to the driver with its last buffer. Buffers that are replaced as a session
+/// runs (`Buf::direct`) and the large ones stay the driver's own.
+struct SlabScope;
+
+impl SlabScope {
+    fn enter() -> Self {
+        let off = std::env::var("CMF_CUDA_SLAB").is_ok_and(|v| v.trim() == "0");
+        if !off {
+            SLABS.with(|s| {
+                *s.borrow_mut() = Some(SlabPool { slabs: Vec::new(), max_piece: SLAB_PIECE, pieces: 0, carved: 0, direct: 0, direct_n: 0 })
+            });
+        }
+        Self
+    }
+
+    /// What the scope took so far, for the load report.
+    fn report(&self) -> String {
+        SLABS.with(|s| match s.borrow().as_ref() {
+            Some(p) => {
+                let left: usize = p.slabs.iter().map(|s| s.left()).sum();
+                format!(
+                    "{} slabs of {} MiB hold {} buffers ({:.0} MiB, {:.0} MiB unused), {} buffers of {:.0} MiB are the driver's own",
+                    p.slabs.len(),
+                    SLAB_BYTES >> 20,
+                    p.pieces,
+                    p.carved as f64 / (1u64 << 20) as f64,
+                    left as f64 / (1u64 << 20) as f64,
+                    p.direct_n,
+                    p.direct as f64 / (1u64 << 20) as f64,
+                )
+            }
+            None => "no slabs".into(),
+        })
+    }
+}
+
+impl Drop for SlabScope {
+    fn drop(&mut self) {
+        SLABS.with(|s| s.borrow_mut().take());
+    }
+}
+
+/// Free bytes of the card as the driver reports them (every process counted).
+fn mem_free() -> Option<u64> {
+    cu::mem_get_info().ok().map(|(free, _)| free as u64)
+}
+
 /// A device allocation, freed on drop (the context is current wherever one
 /// is dropped: inside an entry point, under the state lock).
 struct Buf {
@@ -115,14 +258,26 @@ struct Buf {
     bytes: usize,
     /// A view into another allocation (`view`) frees nothing.
     owned: bool,
+    /// The slab it is a piece of, and the piece's length (`SlabScope`).
+    slab: Option<(Arc<Slab>, usize)>,
 }
 
 impl Buf {
     fn new(bytes: usize) -> Res<Self> {
         let bytes = bytes.max(64);
+        if let Some(b) = SLABS.with(|s| s.borrow_mut().as_mut().and_then(|p| p.carve(bytes))) {
+            return Ok(b);
+        }
+        Self::direct(bytes)
+    }
+
+    /// An allocation of the driver's own, whatever the scope: for a buffer
+    /// that is replaced by a larger one as a session runs.
+    fn direct(bytes: usize) -> Res<Self> {
+        let bytes = bytes.max(64);
         let ptr = unsafe { cu::malloc_sync(bytes) }
             .map_err(|e| format!("device allocation of {bytes} bytes: {e}"))?;
-        Ok(Self { ptr, bytes, owned: true })
+        Ok(Self { ptr, bytes, owned: true, slab: None })
     }
 
     /// `bytes` of this allocation from `off`, freed with it: the holder keeps
@@ -130,7 +285,7 @@ impl Buf {
     /// so a matrix's small planes go in one with its big one).
     fn view(&self, off: usize, bytes: usize) -> Buf {
         debug_assert!(off + bytes <= self.bytes);
-        Buf { ptr: self.ptr + off as u64, bytes, owned: false }
+        Buf { ptr: self.ptr + off as u64, bytes, owned: false, slab: None }
     }
 
     fn from_slice<T: Copy>(data: &[T]) -> Res<Self> {
@@ -145,10 +300,12 @@ impl Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
-        if self.owned {
-            unsafe {
+        match self.slab.take() {
+            Some((slab, len)) => slab.release((self.ptr - slab.ptr) as usize, len),
+            None if self.owned => unsafe {
                 let _ = cu::free_sync(self.ptr);
-            }
+            },
+            None => {}
         }
     }
 }
