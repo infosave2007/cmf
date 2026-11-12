@@ -3113,7 +3113,7 @@ pub fn ctx_ready() -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn o1_far_sums(nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]]) -> Option<(Vec<f32>, Vec<f32>)> {
     let c = ctx()?;
-    match hyb::far_sums(c, nkv, hpk, hd, m, scale, qt, idx, ks, vs) {
+    match hyb::far_sums(c, nkv, hpk, hd, m, scale, qt, idx, ks, vs, hd) {
         Ok(r) => Some(r),
         Err(e) => {
             decline("far sums", &e);

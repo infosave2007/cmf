@@ -29,6 +29,62 @@ CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "写一个反转列表的 Rust �
 
 困惑度:wikitext-2 test 的 12 个 512-token 窗口,逐 token 计算。bf16 原始模型为 13.42。
 
+## 服务器
+
+`cortiq serve` 通过兼容 OpenAI 的 HTTP API 提供这个文件，同一端口上还有网页面板：
+
+```bash
+cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+# 在 NVIDIA 显卡上走 CUDA，为长文档留出上下文
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "dory",
+  "messages": [{"role": "user", "content": "写一个反转列表的 Rust 函数。"}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+任何 OpenAI 客户端都可以使用，`base_url="http://127.0.0.1:8080/v1"`，API 密钥随意：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="dory",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\n概括一下。"}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| 端点 | 作用 |
+|---|---|
+| `POST /v1/chat/completions` | 一轮对话；`stream: true` 边解码边返回，`tools` 让模型调用函数 |
+| `POST /v1/completions` | 续写 `prompt` |
+| `GET /v1/models` | 提供的模型 |
+| `GET /healthz` | 服务器运行时返回 200 |
+| `GET /` | 网页面板 |
+
+- `model` 可以是任意名字：服务器只提供一个文件。`"enable_thinking": false` 要求直接回答，和 `--no-think`
+  一样；不加时模型会先推理，请给更大的 `max_tokens`。
+- `--host 127.0.0.1` 让服务器只在本机可用。默认的 `0.0.0.0` 监听所有网卡，并且不检查密钥。
+- `CMF_MAX_SEQ` 是请求的上下文上限，默认 32 768。长文档按 turbo 的方式读取，显存不会增长：在 16 GB 的
+  RTX 2000 Ada 上走 CUDA，60 000 个字符（15 277 词元）8.3–9.4 秒读完，回答 79 tok/s，显卡最多 3.77 GB（走 Vulkan
+  为 66 秒和 55 tok/s）。
+- `CMF_SERVE_SLOTS=N` 同时保持 N 个对话，每个在显卡上有自己的行。`CMF_O1_SPILL=DIR` 让长提示读取时的行存在
+  文件里，而不是内存里。
+- 接续上一个请求的请求只读取新的部分。封口之后对话的新一轮会把对话重新读一遍。
+
+详见 [docs/CUDA.zh.md](CUDA.zh.md#服务器)。
+
 ## 循环模式
 
 | 参数 | 含义 |
@@ -66,7 +122,7 @@ token 和没有改变的 token 上。误差较小的一方决定 token 是否离
 | 32 000 | 3.76 GB | 3.6 GB | | |
 | 64 000 | 3.76 GB | 7.2 GB | 1.7 GB | 9.6 GB |
 
-RTX 5090,Vulkan,磁盘写入 4.2 GB/s。其中权重占 1.95 GB,内存和文件两种方式速度相同,远场建好后文件即被删除。MacBook Air M4 上 23 000 token 时,峰值 footprint 为 3.27 GB,使用 `--o1-spill` 时为 1.64 GB。
+RTX 5090,Vulkan,磁盘写入 4.2 GB/s。其中权重占 1.95 GB,内存和文件两种方式速度相同,远场建好后文件即被删除。MacBook Air M4 上 23 000 token 时,峰值 footprint 为 3.27 GB,使用 `--o1-spill` 时为 1.64 GB。在 CUDA 上,RTX 2000 Ada 从 16 000 到 64 000 token 都保持 3.8 GB(cortiq 0.8.72 或更新版本;0.8.71 整段读取提示,64 000 时达到 7.5 GB),见 [docs/CUDA.zh.md](CUDA.zh.md#dory-在-16-gb-显卡上)。
 
 ![长提示词在显卡上保留什么](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf/resolve/main/assets/far_field_zh.png)
 
@@ -106,6 +162,11 @@ RTX 5090,Vulkan,磁盘写入 4.2 GB/s。其中权重占 1.95 GB,内存和文件�
 | 上下文 32 000 | 111.3 | 216.0 |
 | 上下文 64 000 | — | 214.1 |
 | 16 000 / 32 000 / 64 000 时首个 token | 5.4 秒 / 12.8 秒 / — | 6.1 秒 / 13.6 秒 / 33.0 秒 |
+| CUDA,NVIDIA RTX 2000 Ada (16 GB) | | |
+| 真实提问 | — | 75.5 |
+| 上下文 1 000 / 16 000 / 64 000 | — | 84.0 / 80.7 / 80.2 |
+| 16 000 / 32 000 / 64 000 时首个 token | — | 8.8 秒 / 17.1 秒 / 33.4 秒 |
+| 4 000 / 16 000 / 64 000 时显存峰值 | — | 3.5 GB / 3.8 GB / 3.8 GB |
 | Metal,MacBook Air M4((24 GB) | | |
 | 真实提问 | 25.7 | 32.9 |
 | 上下文 1 000 | 22.1 | 34.6 |

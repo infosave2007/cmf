@@ -76,7 +76,9 @@ __device__ __forceinline__ int rec_pos(const int* cr, int pos0) { return cr ? cr
 // [B][nkv][HD]; rope [B][HD] (cos of the pairs, then their sin). qg
 // [nkv][B][HPK][HD] (the decode attention's layout), gate [B][nh][HD].
 // `qtr`: every QT-th position's queries [pos / QT][nh][HD] for a far
-// field's seal. `fci`: a sealed layer's call record, its K/V row at fci[1].
+// field's seal. `fci`: a sealed layer's call record, row b's K/V at fci[1] + b
+// (a prompt's last rows past the seal sit after the near rows, as a verify
+// window's do on the hybrid arm).
 extern "C" __global__ void dk_qk(const float* __restrict__ yq, const float* __restrict__ yk, const float* __restrict__ yv,
                                  const float* __restrict__ yg, const float* __restrict__ rope, const float* __restrict__ sq,
                                  const float* __restrict__ sg, float* __restrict__ qg, float* __restrict__ gate,
@@ -108,7 +110,7 @@ extern "C" __global__ void dk_qk(const float* __restrict__ yq, const float* __re
         return;
     }
     const int kh = a - nh;
-    const int row = fci ? fci[1] : (cap > 0 ? pos % cap : pos);
+    const int row = fci ? fci[1] + b : (cap > 0 ? pos % cap : pos);
     const size_t at = ((size_t)row * nkv + kh) * HD + t;
     Km[at] = f2h_sat(u * inv);
     Vm[at] = f2h_sat(yv[((size_t)b * nkv + kh) * HD + t]);

@@ -112,6 +112,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Dory Turbo 在 CUDA 上保持固定显存上限(0.8.72)
+
+[Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) 的 turbo 文件现在在 CUDA
+上也连同提示一起保持固定的显存上限：在 16 GB 的 RTX 2000 Ada 上，从 16 000 到 64 000 个词元显卡都占 3.8 GB，而
+0.8.71 会达到 7.5 GB。超过前 8 192 行的提示经远场分块读取，所以 64 000 个词元的提示 33 秒给出首个词元（0.8.71 为
+69 秒，Vulkan 为 306 秒）。解码仍是 80 tok/s，插在 100 000 个字符里的事实 8 次都能找到。
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt-file report.txt --greedy --no-think
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1   # 兼容 OpenAI 的 API
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md#dory-在-16-gb-显卡上)；服务器见 [docs/DORY.zh.md](docs/DORY.zh.md#服务器)。
+
 ## 通过 CUDA 在 16 GB 显卡上运行 Qwen3.8-27B Turbo(0.8.71)
 
 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) 现在在 CUDA 上连同提示一起保持固定的

@@ -2169,13 +2169,18 @@ const O1_PREFIX_MAX: usize = 8192;
 /// has no room for 8192 rows, and gives up a little prompt speed to keep the ceiling.
 /// `CMF_O1_PREFIX_MAX` chooses by hand.
 pub(crate) fn o1_seal_for_card(seal: usize, weight_bytes: u64) -> usize {
+    o1_seal_for_card_rows(seal, weight_bytes, 190 << 10)
+}
+
+/// `o1_seal_for_card` for rows of `row_bytes` on the card (Dory's full layers: 54 KB).
+pub(crate) fn o1_seal_for_card_rows(seal: usize, weight_bytes: u64, row_bytes: u64) -> usize {
     if let Some(s) = std::env::var("CMF_O1_PREFIX_MAX").ok().and_then(|v| v.parse().ok()) {
         return s;
     }
     let mut budget = crate::gpu::vram_budget();
     // Unified memory: what the system lets the GPU keep, and a row there lives twice, in the
     // host's cache and in the mirror.
-    let mut row = 190u64 << 10;
+    let mut row = row_bytes.max(1);
     #[cfg(target_os = "macos")]
     if budget == u64::MAX {
         budget = crate::gpu_metal::working_set_bytes();
