@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `CMF_GPU_VRAM_MB` on this path is a measured budget of the whole process on the card;
     `CMF_QWEN_CUDA_GROW_MB` (default 1024) is what stays free for the context to grow into.
   - RTX 5090 held to the memory of a smaller card (`CMF_GPU_VRAM_MB`), host 2× EPYC 9554 with 31 CPUs and 62 GB
-    for the container, one request at a time, `CMF_QWEN_ROUTE_TAIL=0.05`, the routing profile loaded. The 3D
+    for the container, one request at a time, `CMF_QWEN_ROUTE_TAIL=0.05`, `CMF_QWEN_CUDA_REG=1` (the experts outside the card
+    pinned in RAM), the routing profile loaded. The 3D
     aquarium spec, answered greedily to the end as a working page: 104.9 tok/s within 12 GB, 117.6 within 16 GB,
     132.8 within 24 GB. Within 12 GB: 38 of the first 40 HumanEval tasks; logits against the host path 1.7e-3
     relative with the same argmax.

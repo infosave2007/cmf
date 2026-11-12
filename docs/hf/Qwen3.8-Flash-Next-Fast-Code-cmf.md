@@ -58,7 +58,8 @@ An NVIDIA card from 12 GB through CUDA (cortiq 0.8.74 or later, built with the `
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 CMF_SERVE_SLOTS=1 \
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -121,6 +122,7 @@ the container, one request at a time, greedy, thinking off, draft tokens on, the
 answer is the complete working page in every row. Within 12 GB, 38 of the first 40 HumanEval tasks pass. The host
 needs AVX-512 VNNI (Zen 4, Sapphire Rapids or newer) and eight threads or more; on another host every missing expert
 is copied to the card instead, which is slower. `CMF_QWEN_CPU_EXPERT_THREADS` sets the number of host threads.
+`CMF_QWEN_CUDA_REG=1` keeps the experts outside the card pinned in RAM, so the host never waits on the disk for them.
 
 ## OpenAI-compatible server
 
@@ -192,7 +194,8 @@ CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 CMF_SERVE_SLOTS=1 \
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -250,6 +253,7 @@ llama.cpp, CUDA).
 в каждой строке — полная рабочая страница. В 12 ГБ проходят 38 из первых 40 задач HumanEval. Хосту нужны AVX-512 VNNI
 (Zen 4, Sapphire Rapids и новее) и не меньше восьми потоков; на другом хосте каждый недостающий эксперт копируется на
 карту, что медленнее. `CMF_QWEN_CPU_EXPERT_THREADS` задаёт число потоков хоста.
+`CMF_QWEN_CUDA_REG=1` закрепляет в памяти экспертов вне карты, чтобы хост не ждал их с диска.
 
 ### Железо и длинный контекст
 
@@ -288,7 +292,8 @@ CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 CMF_SERVE_SLOTS=1 \
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -329,7 +334,7 @@ token 之间迁入显卡。在 12 GB 内，显卡保留 12 288 个专家中的 1
 一张 RTX 5090，限制为表中显存（`CMF_GPU_VRAM_MB`），主机为 2× EPYC 9554，容器可用 31 个线程和 62 GB 内存，单路请求，贪心解码，
 关闭思考，开启草稿，命令见快速开始。每一行的回答都是完整可运行的页面。在 12 GB 内，HumanEval 前 40 题通过 38 题。主机需要
 AVX-512 VNNI（Zen 4、Sapphire Rapids 或更新）和至少 8 个线程；否则每个缺失的专家都要复制到显卡，速度更慢。
-`CMF_QWEN_CPU_EXPERT_THREADS` 设置主机线程数。
+`CMF_QWEN_CPU_EXPERT_THREADS` 设置主机线程数。`CMF_QWEN_CUDA_REG=1` 把显卡之外的专家锁定在内存中，主机不必等待磁盘。
 
 ### 硬件与长上下文
 
