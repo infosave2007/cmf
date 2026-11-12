@@ -210,6 +210,26 @@ impl Lin {
         Some((model, idx, self.w.rows(), self.w.cols()))
     }
 
+    /// This projection as the resident chain reads it: its container matrix
+    /// (or its dense one) and its bias. `None` with an adapter bound, or for
+    /// a weight the chain cannot read in place.
+    fn chain(&self) -> Option<crate::gpu::LtxLin<'_>> {
+        if self.has_lora() {
+            return None;
+        }
+        let (w, dense): (Option<usize>, &[f32]) = match &self.w {
+            Proj::F32 { w, .. } => (None, w),
+            Proj::Q(q) => (Some(q.mapped_device_gemm()?.1), &[]),
+        };
+        Some(crate::gpu::LtxLin {
+            w,
+            dense,
+            rows: self.w.rows(),
+            cols: self.w.cols(),
+            bias: self.b.as_deref().unwrap_or(&[]),
+        })
+    }
+
     /// The bias half of `apply`, for callers that got the product elsewhere.
     pub(crate) fn add_bias(&self, out: &mut [f32], n: usize, pool: Option<&Pool>) {
         let Some(b) = &self.b else { return };
@@ -463,6 +483,24 @@ impl Attn {
             },
             heads,
             dh,
+        })
+    }
+
+    /// This attention as the resident chain reads it (see `Lin::chain`).
+    fn chain(&self) -> Option<crate::gpu::LtxAttn<'_>> {
+        Some(crate::gpu::LtxAttn {
+            q: self.q.chain()?,
+            k: self.k.chain()?,
+            v: self.v.chain()?,
+            o: self.o.chain()?,
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            gate: match &self.gate {
+                Some(g) => Some(g.chain()?),
+                None => None,
+            },
+            heads: self.heads,
+            dh: self.dh,
         })
     }
 
@@ -1291,13 +1329,132 @@ impl LtxDit {
     }
 
     /// One denoising step: `(video velocity [T, C], audio velocity [T, C])`.
+    /// The blocks run as one resident chain where the backend has one
+    /// (`CMF_LTX_CHAIN=0` keeps the per-operation path).
     pub fn forward(
         &self,
         video: &StreamInput,
         audio: &StreamInput,
         pool: Option<&Pool>,
     ) -> (Vec<f32>, Vec<f32>) {
-        self.forward_traced(video, audio, pool, &mut |_, _| {})
+        self.forward_impl(video, audio, pool, &mut |_, _| {}, true)
+    }
+
+    /// The blocks over both streams as one resident chain on the card, when
+    /// the backend has one and every projection can ride it. `false`:
+    /// nothing was written.
+    fn run_chain(
+        &self,
+        video: &StreamInput,
+        audio: &StreamInput,
+        vx: &mut [f32],
+        ax: &mut [f32],
+        ts: [&TsTable; 8],
+        pes: [&Rope; 4],
+    ) -> bool {
+        use crate::gpu::{LtxBlock, LtxChain, LtxSide, LtxStream};
+        let [vt, at, vpt, apt, vxs, axs, vgt, agt] = ts;
+        let [v_pe, a_pe, v_xpe, a_xpe] = pes;
+        let (dim, a_dim) = (self.heads * self.dh, self.a_heads * self.a_dh);
+        // A block's table plus each distinct timestep's row, over `len`
+        // values; `None` when either is shorter than that.
+        let sum = |t: &TsTable, table: &[f32], len: usize, all: bool| -> Option<Vec<f32>> {
+            if table.len() < len || t.width < len || t.distinct() == 0 {
+                return None;
+            }
+            let rows = if all { t.distinct() } else { 1 };
+            let mut o = Vec::with_capacity(rows * len);
+            for r in 0..rows {
+                o.extend(table[..len].iter().zip(&t.row(r)[..len]).map(|(a, b)| a + b));
+            }
+            Some(o)
+        };
+        struct Tabs {
+            v: Vec<f32>,
+            a: Vec<f32>,
+            vc: Vec<f32>,
+            ac: Vec<f32>,
+            xv: Vec<f32>,
+            xa: Vec<f32>,
+            ga: Vec<f32>,
+            gv: Vec<f32>,
+        }
+        let mut tabs: Vec<Tabs> = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            if b.sst_a2v_video.len() < 5 * dim || b.sst_a2v_audio.len() < 5 * a_dim {
+                return false;
+            }
+            let (Some(v), Some(a), Some(vc), Some(ac), Some(xv), Some(xa), Some(ga), Some(gv)) = (
+                sum(vt, &b.video.sst, 9 * dim, true),
+                sum(at, &b.audio.sst, 9 * a_dim, true),
+                sum(vpt, &b.video.prompt_sst, 2 * dim, false),
+                sum(apt, &b.audio.prompt_sst, 2 * a_dim, false),
+                sum(vxs, &b.sst_a2v_video, 4 * dim, true),
+                sum(axs, &b.sst_a2v_audio, 4 * a_dim, true),
+                sum(vgt, &b.sst_a2v_video[4 * dim..], dim, false),
+                sum(agt, &b.sst_a2v_audio[4 * a_dim..], a_dim, false),
+            ) else {
+                return false;
+            };
+            tabs.push(Tabs { v, a, vc, ac, xv, xa, ga, gv });
+        }
+        fn stream<'a>(s: &'a Stream, mods: &'a [f32], ctx_mod: &'a [f32]) -> Option<LtxStream<'a>> {
+            Some(LtxStream {
+                attn1: s.attn1.chain()?,
+                attn2: s.attn2.chain()?,
+                ff_in: s.ff_in.chain()?,
+                ff_out: s.ff_out.chain()?,
+                mods,
+                ctx_mod,
+            })
+        }
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for (b, t) in self.blocks.iter().zip(&tabs) {
+            let (Some(v), Some(a), Some(a2v), Some(v2a)) =
+                (stream(&b.video, &t.v, &t.vc), stream(&b.audio, &t.a, &t.ac), b.a2v.chain(), b.v2a.chain())
+            else {
+                return false;
+            };
+            blocks.push(LtxBlock {
+                video: v,
+                audio: a,
+                a2v,
+                v2a,
+                xmods_v: &t.xv,
+                xmods_a: &t.xa,
+                gate_a2v: &t.ga,
+                gate_v2a: &t.gv,
+            });
+        }
+        let u32s = |i: &[usize]| i.iter().map(|&v| v as u32).collect::<Vec<u32>>();
+        let (vr, vxr, ar, axr) = (u32s(&vt.idx), u32s(&vxs.idx), u32s(&at.idx), u32s(&axs.idx));
+        fn side<'a>(
+            s: &'a StreamInput,
+            dim: usize,
+            rows: &'a [u32],
+            xrows: &'a [u32],
+            pe: &'a Rope,
+            xpe: &'a Rope,
+        ) -> LtxSide<'a> {
+            LtxSide {
+                n: s.tokens,
+                dim,
+                rows,
+                xrows,
+                pe: (&pe.cos, &pe.sin, pe.half),
+                xpe: (&xpe.cos, &xpe.sin, xpe.half),
+                ctx: &s.context,
+                ctx_len: s.ctx_len,
+                mask: &s.context_mask,
+            }
+        }
+        let job = LtxChain {
+            model: &self.model,
+            blocks: &blocks,
+            video: side(video, dim, &vr, &vxr, v_pe, v_xpe),
+            audio: side(audio, a_dim, &ar, &axr, a_pe, a_xpe),
+        };
+        crate::gpu::ltx_chain(&job, vx, ax)
     }
 
     pub fn forward_traced(
@@ -1306,6 +1463,18 @@ impl LtxDit {
         audio: &StreamInput,
         pool: Option<&Pool>,
         trace: &mut dyn FnMut(&str, &[f32]),
+    ) -> (Vec<f32>, Vec<f32>) {
+        // a trace reads the streams between blocks: the per-operation path
+        self.forward_impl(video, audio, pool, trace, false)
+    }
+
+    fn forward_impl(
+        &self,
+        video: &StreamInput,
+        audio: &StreamInput,
+        pool: Option<&Pool>,
+        trace: &mut dyn FnMut(&str, &[f32]),
+        chain_ok: bool,
     ) -> (Vec<f32>, Vec<f32>) {
         // A denoising step is the opposite of what the per-op probe is built
         // for: forty-eight identical blocks, the same shapes every time, the
@@ -1331,10 +1500,24 @@ impl LtxDit {
         trace("a.args.x", &ax);
 
         // --- adaLN tables, one row per distinct timestep -------------------
-        let vt = TsTable::build(&self.adaln, &video.timesteps, self.t_scale, pool);
-        let at = TsTable::build(&self.a_adaln, &audio.timesteps, self.t_scale, pool);
-        let vpt = TsTable::build(&self.prompt_adaln, &[video.sigma], self.t_scale, pool);
-        let apt = TsTable::build(&self.a_prompt_adaln, &[audio.sigma], self.t_scale, pool);
+        // Where the blocks will run as a resident chain, the tables are a few
+        // rows each and their exact weights (a gigabyte in f32) have no
+        // business on the card beside the chain's: the host builds them.
+        let to_chain = chain_ok
+            && std::env::var("CMF_LTX_CHAIN").as_deref() != Ok("0")
+            && crate::gpu::enabled_here()
+            && crate::gpu::ltx_chain_available();
+        let build = |a: &AdaLn, ts: &[f32], scale: f64| {
+            if to_chain {
+                crate::gpu::cpu_scope(|| TsTable::build(a, ts, scale, pool))
+            } else {
+                TsTable::build(a, ts, scale, pool)
+            }
+        };
+        let vt = build(&self.adaln, &video.timesteps, self.t_scale);
+        let at = build(&self.a_adaln, &audio.timesteps, self.t_scale);
+        let vpt = build(&self.prompt_adaln, &[video.sigma], self.t_scale);
+        let apt = build(&self.a_prompt_adaln, &[audio.sigma], self.t_scale);
         if std::env::var("CMF_LTX_PROMPTADALN").is_ok() {
             let r = vpt.row(0);
             let mx = r.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -1344,12 +1527,12 @@ impl LtxDit {
                 video.sigma
             );
         }
-        let vxs = TsTable::build(&self.av_v_ss, &video.timesteps, self.t_scale, pool);
-        let axs = TsTable::build(&self.av_a_ss, &audio.timesteps, self.t_scale, pool);
+        let vxs = build(&self.av_v_ss, &video.timesteps, self.t_scale);
+        let axs = build(&self.av_a_ss, &audio.timesteps, self.t_scale);
         // The fusion gate reads the *other* stream's sigma — the noise level
         // it is being asked to trust — at the A-V multiplier.
-        let vgt = TsTable::build(&self.av_a2v_gate, &[audio.sigma], self.av_t_scale, pool);
-        let agt = TsTable::build(&self.av_v2a_gate, &[video.sigma], self.av_t_scale, pool);
+        let vgt = build(&self.av_a2v_gate, &[audio.sigma], self.av_t_scale);
+        let agt = build(&self.av_v2a_gate, &[video.sigma], self.av_t_scale);
 
         // --- RoPE ---------------------------------------------------------
         let v_pe = Rope::build(&video.positions, &self.max_pos, dim, self.heads, self.theta);
@@ -1380,7 +1563,17 @@ impl LtxDit {
         let amask = (!audio.context_mask.is_empty()).then_some(&audio.context_mask[..]);
 
         let mut prof = Prof::new();
-        for (bi, blk) in self.blocks.iter().enumerate() {
+        let chained = to_chain
+            && self.run_chain(
+                video,
+                audio,
+                &mut vx,
+                &mut ax,
+                [&vt, &at, &vpt, &apt, &vxs, &axs, &vgt, &agt],
+                [&v_pe, &a_pe, &v_xpe, &a_xpe],
+            );
+        let blocks: &[Block] = if chained { &[] } else { &self.blocks };
+        for (bi, blk) in blocks.iter().enumerate() {
             let mut pt = std::time::Instant::now();
             let v_msa = vt.triples(&blk.video.sst, dim, 0);
             let v_ca = vt.triples(&blk.video.sst, dim, 6);

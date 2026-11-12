@@ -348,7 +348,44 @@ impl ConvVaeDecoder {
 
     /// Latent `[128, F, H, W]` → frames `[3, 8·(F−1)+1, 32·H, 32·W]`.
     pub fn decode(&self, latent: &Vol, pool: Option<&Pool>) -> Vol {
-        self.decode_traced(latent, pool, &mut |_, _| {})
+        self.decode_impl(latent, pool, &mut |_, _| {}, false)
+    }
+
+    /// Every stage of the decoder on the card, where the backend has the
+    /// chain: the un-normalized latent goes up and the output of `conv_out`
+    /// comes back. `None`: the host path (`CMF_LTX_VAE_CHAIN=0` forces it;
+    /// a trace reads the stages in between, so it takes the host path too).
+    fn decode_on_device(&self, x: &Vol, traced: bool) -> Option<Vol> {
+        use crate::gpu::Vae3dStep;
+        if traced || std::env::var("CMF_LTX_VAE_CHAIN").as_deref() == Ok("0") || !crate::gpu::enabled_here() {
+            return None;
+        }
+        fn conv(c: &Conv3d) -> Vae3dStep<'_> {
+            Vae3dStep::Conv { w: &c.w, b: &c.b, in_ch: c.c_in, out_ch: c.c_out }
+        }
+        let mut steps = vec![conv(&self.conv_in)];
+        for b in &self.blocks {
+            match b {
+                Block::Res(res) => {
+                    for r in res {
+                        steps.push(Vae3dStep::Save);
+                        steps.push(Vae3dStep::NormSilu { eps: 1e-8 });
+                        steps.push(conv(&r.conv1));
+                        steps.push(Vae3dStep::NormSilu { eps: 1e-8 });
+                        steps.push(conv(&r.conv2));
+                        steps.push(Vae3dStep::AddSaved);
+                    }
+                }
+                Block::Up(u) => {
+                    steps.push(conv(&u.conv));
+                    steps.push(Vae3dStep::DepthToSpace { p: u.stride });
+                }
+            }
+        }
+        steps.push(Vae3dStep::NormSilu { eps: 1e-8 });
+        steps.push(conv(&self.conv_out));
+        let (data, c, f, h, w) = crate::gpu::vae3d_chain(&steps, &x.data, x.c, x.f, x.h, x.w)?;
+        Some(Vol { c, f, h, w, data })
     }
 
     /// `decode` with a callback after every stage — the parity gate walks
@@ -359,6 +396,16 @@ impl ConvVaeDecoder {
         pool: Option<&Pool>,
         trace: &mut dyn FnMut(&str, &Vol),
     ) -> Vol {
+        self.decode_impl(latent, pool, trace, true)
+    }
+
+    fn decode_impl(
+        &self,
+        latent: &Vol,
+        pool: Option<&Pool>,
+        trace: &mut dyn FnMut(&str, &Vol),
+        traced: bool,
+    ) -> Vol {
         let mut x = latent.clone();
         // un_normalize: x·std + mean, per latent channel
         let npos = x.positions();
@@ -367,6 +414,12 @@ impl ConvVaeDecoder {
             for p in 0..npos {
                 x.data[c * npos + p] = x.data[c * npos + p] * s + m;
             }
+        }
+        if let Some(y) = self.decode_on_device(&x, traced) {
+            trace("after_conv_out", &y);
+            let out = unpatchify(&y, self.patch);
+            trace("frames", &out);
+            return out;
         }
         let mut h = self.conv_in.forward(&x, pool);
         trace("after_conv_in", &h);

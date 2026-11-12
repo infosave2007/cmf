@@ -16,6 +16,7 @@ tags:
 - nvidia
 - vulkan
 - metal
+- quantized
 ---
 
 # MiniMax-H3 Turbo — one file, no Python
@@ -106,7 +107,7 @@ what the reference does with each. Frames come in as binary P6 PPM.
 `cortiq` is one Rust binary. Either install it —
 
 ```bash
-cargo install cortiq-cli          # needs Rust 1.88+; brings the GPU backend
+cargo install cortiq-cli          # needs Rust 1.85+; brings the GPU backend
 ```
 
 — or take a prebuilt archive from the
@@ -269,13 +270,11 @@ What follows from them, if you are on such a machine:
   for reasons that are not contention — the report that had to gut
   `mm_kill` in the source was on exactly that. The kill now arms only
   when the denoise loop starts, and three strikes are still needed.
-- **The keyframe encode is CPU work today.** With `--first-frame` the
-  video-VAE encoder runs the reference picture on the host (~100–140 s
-  on an M4 for a 448×768 frame; 0.1 s without a keyframe). 0.5.80 puts
-  the pool's workers on the performance cores (they were landing on the
-  E-cores with the P-cores asleep — that report's `asitop`), which
-  shortens it; a device path for the encoder's 3-D convolutions is the
-  real fix and is on the list.
+- **The keyframe encode is host work on a Mac.** With `--first-frame` the
+  video-VAE encoder runs the reference picture on the host there (~100–140 s
+  on an M4 for a 448×768 frame; 0.1 s without a keyframe). On CUDA and over
+  Vulkan the encoder's convolutions and the vision tower run on the card:
+  2.2 s for a 512×288 keyframe on an RTX A5000 with CUDA.
 - **Frame budgets on 24 GB, from that user's sweep:** with the 25.7 GB
   file 512×256 is safe to ~70–90 frames and 768×448 caps at 40–50; with
   the 14.5 GB v2 file 448×768 at 50 frames is the sweet spot (136 s per
@@ -298,6 +297,27 @@ What follows from them, if you are on such a machine:
   `video-to-audio-video`, and the DiT takes both as conditioning rows. What
   is missing is on our side and it is not training — see
   [What this port does not do yet](#what-this-port-does-not-do-yet).
+
+## Draft small, refine big (two-stage with LTX-2.5)
+
+Since 0.5.100 the Turbo draft can hand its frames to
+[LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf) for a short
+refinement pass at full resolution — the draft supplies composition and
+motion, LTX reinvents the detail:
+
+```bash
+cortiq animate mmh3-turbo-clipproj4b-fl2va-v2-q4tp.cmf \
+  --prompt "…" --width 512 --height 288 --frames 39 --frames-dir draft/
+# upscale the frames 2x (any bicubic) and trim to 33 —
+# H3 renders 17k+5 frames, the LTX VAE takes 8k+1
+cortiq ltx-video --model ltx25-q4tp.cmf --prompt "…same prompt…" \
+  --video draft2x/ --video-strength 0.45 --width 1024 --height 576 --frames 33
+```
+
+On a 5090: draft 40 s, refine 499 s at 1024×576. A/B of the same seed is
+in `samples/refine_ab_*.mp4`. The two containers don't want RAM at the
+same time — run the stages sequentially. `--video-strength` is the dial:
+0.45 keeps the draft's motion, higher repaints more.
 
 ## Making it smaller
 
@@ -621,7 +641,7 @@ Two more, on the runtime side: the latent upscaler published for H3
 (a 345 M-parameter 3-D conv net) is not ported, and there is no fused
 device kernel for adapter branches on this model — see below.
 
-## The eight-bit build, and what it costs now
+## The eight-bit build, and what it costs today
 
 `mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf` (26.90 GB, 26.21 B parameters,
 `cortiq verify` clean) packs the DiT as **`q8_2f`** — the two-field int8,
@@ -629,67 +649,33 @@ device kernel for adapter branches on this model — see below.
 axis, which is where an activation-outlier channel shows up from the weight
 side. As a codec it is strictly more faithful than the four-bit ladder.
 
-Until today it was also the slow one. RTX 5090, 512×288, 22 frames, four
-steps. The last two rows are three alternating runs each — `q4 q8 q4 q8 q4 q8`,
-both containers warm — because a codec comparison taken any other way measures
-the page cache:
+**It renders on the card — after two gates were fixed, and the story is
+worth reading if you pack your own containers.**
 
-| | denoise | video VAE | wall |
-|---|---|---|---|
-| q8_2f, 0.5.94 | 103.3 s | 62.2 s | 171.5 s |
-| q8_2f, scalar int8 kernel | 56.2 s | 19.5 s | 81 s |
-| **q8_2f, 0.5.95** | **29.6 s** (27.5 / 29.9 / 31.3) | **8.6 s** | **43 s** |
-| q4tp | 21.5 s (20.8 / 24.3 / 19.4) | 8.8 s | 36 s |
+The first run of this file left the RTX 5090 idle at 2 MiB and took
+**357.3 s**. Neither cause was a missing kernel:
 
-**Four times faster than the file you may have downloaded, and its VAE now
-matches the four-bit one exactly. Four-bit still denoises 1.38× faster** —
-27 GB of weights against 15 GB is most of what is left of that gap.
+1. **The startup probe matched on `Q4TiledP` by name and dtype.** Finding no
+   four-bit qkv weight it declared the host path for the whole render — for a
+   codec that has a device GEMM of its own. The two-field int8 folds its
+   column field into the activation and what is left is the per-row int8
+   kernel both backends already ship. The probe now asks the tensor which
+   entry point its codec has (`QTensor::device_matmat`).
+2. **The weight-residency budget was the whole heap minus a gigabyte.** That
+   survived only because every container published before this one had
+   weights far under it; 24 GB of eight-bit weights took the card and the
+   first scratch allocation died with `wgpu error: Out of Memory`. A quarter
+   of the heap is held back now — 32 GB card → 24 GB of weights.
 
-**And the order reverses with the frame.** The same sandwich at 768×448,
-where the panels are three times the rows:
+With both: **171.5 s** on the same card and clip (103.3 s denoise,
+62.2 s video VAE), against 357.3 s on the host, and the probe agrees with
+the CPU arm to 5.77e-3.
 
-| | denoise | video VAE | wall |
-|---|---|---|---|
-| **q8_2f** | **51.6 / 52.2 s** | **11.7 / 11.8 s** | **69 / 70 s** |
-| q4tp | 77.8 / 78.4 s | 37.9 / 38.5 s | 130 / 131 s |
-
-Two runs each, alternating, and the repeats agree to a second. At this size
-the eight-bit build is **1.9× faster overall** and its VAE decodes in a third
-of the time. The reason is structural rather than about the codecs: int8 now
-unpacks each weight into an f16 plane *once* per call and both halves of the
-FFN go to the matrix units, while the four-bit path still unpacks inside its
-FFN kernel, per tile of activations — which costs more the wider the panel.
-That is the next piece of work, and it belongs to `q4tp`.
-
-Three things were in the way, and none of them was the codec:
-
-1. **The fused chains asked for a four-bit weight by name.**
-   `QTensor::mapped_q4tp` was the door to every fused submission in the DiT
-   and the 3D VAE, so an eight-bit container walked past all of them into
-   per-op GEMMs with a readback between each. `mapped_device_gemm` asks
-   instead whether the codec *has* a device GEMM.
-2. **int8 never reached the matrix units.** The four-bit path unpacks its
-   weight into an f16 plane once and hands that to the cooperative GEMM;
-   int8 ran the scalar kernel on the scalar ALUs. `q8_dq_f16` writes the same
-   plane — and folds the column field into it, so the activation is no longer
-   multiplied by that field on the host before every projection (a 40 MB pass,
-   four hundred times a render).
-3. **The panels stayed on the card.** qkv → attention → output projection and
-   the FFN pair are one submission for this codec now, as they always were for
-   four-bit.
-
-`CMF_Q8_COOP=0` puts the scalar kernel back, `CMF_FUSED_ANY=0` the per-op
-path — both arms above are from those switches, and both render the same
-picture. The startup probe agrees with the CPU arm to 5.78e-3.
-
-**The bug this shook out, since it is the more useful half of the story:**
-widening that gate sent int8 weights to `vae_qkv_attn_out`, which still called
-the four-bit entry points by name. It read the int8 payload as four-bit tiles,
-finished three times faster than it should have, and produced a **flat grey
-frame** — with every switch that could have explained it turned off. The
-four-bit GEMM now refuses a tensor that is not four-bit rather than returning
-plausible garbage, which is what turns that class of mistake into a fallback
-instead of a mystery.
+It is still slower than the four-bit file's 60.2 s, and that part *is* about
+kernels: `q4tp` has the fused qkv → attention → output submission and the
+packed FFN, `q8_2f` goes through the generic per-op GEMM. Fusing those for the
+two-field codec is the next piece of work, and it is worth roughly what the
+fusion is worth on q4tp.
 
 ## The latent upscaler
 
@@ -739,77 +725,6 @@ than two frames. It is **not** a port of the release's own `v2v` node, which
 conditions differently; what it gives you is composition and motion carried
 across a chain of shots, which is what the keyframe hack in discussion #6 was
 reaching for.
-
-## Streaming: a clip rendered in chunks
-
-`mmh3-raven-streaming-q4tp.cmf` — **14.88 GB**, 2698 tensors, the
-[RAVEN streaming adapter](https://huggingface.co/mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA)
-folded into the weights at pack time. It renders a clip the way that adapter
-was trained: chunk by chunk, each one extrapolated from the frames already
-finished, instead of denoising the whole sequence at once.
-
-```bash
-cortiq animate mmh3-raven-streaming-q4tp.cmf \
-  --prompt "a woman in a red raincoat walks down a neon-lit street at night" \
-  --width 384 --height 256 --frames 161 --steps 4 \
-  --stream-chunk 13 --stream-sink 2 --stream-window 2 --out take.avi
-```
-
-`--stream-chunk` is the chunk length in *latent* frames (one latent frame is
-four video frames). `--stream-sink` and `--stream-window` are counted in
-latent frames too — a couple pinned at the start, a couple trailing the
-current chunk, the attention-sink pattern the adapter trains — and the
-already-finished frames enter the sequence at timestep 0, as clean context
-rather than as noise being removed. (`CMF_STREAM_UNIT=chunks` counts them in
-whole chunks instead — the reading this port shipped first. Same pictures,
-and measured **109.6 s of denoise against 58.8 s** on one machine back to
-back, because a chunk then attends to four chunks' worth of rows.)
-
-**The chunk length is the knob that matters.** RTX 5090, 384×256, 41 frames
-in (56 out), four steps, `sink 2 / window 2` throughout:
-
-| | wall | denoise | picture |
-|---|---|---|---|
-| no streaming | 53 s | 36.8 s | coherent |
-| `--stream-chunk 13` | 63 s | 47.0 s | coherent, motion holds |
-| `--stream-chunk 9` | 69 s | 62.9 s | coherent |
-| `--stream-chunk 5` | 75 s | 58.8 s | **drifts**: the scene changes at chunk boundaries |
-| `--stream-chunk 5`, `sink 8 / window 8` | 122 s | 106.3 s | drifts *identically* |
-
-The last row is the one worth reading twice: quadrupling the context costs
-2.3× the denoise and changes nothing about the drift. Five latent frames is
-simply shorter than what the adapter learned; nine to thirteen is the range
-that holds.
-
-Streaming costs about **1.3× the denoise** of the bidirectional path at this
-clip length (47.0 s against 36.8 s), because a chunk's context rows are
-recomputed at every one of its four steps. A KV cache over those rows is what
-removes that, and it is an optimization of this path rather than a
-prerequisite for it: not packing the rows a chunk may not see produces the
-same attention pattern the reference gets from its cache.
-
-**Where streaming stops being a trade and starts being the only way.** Longer
-clips, same card and settings:
-
-| clip | bidirectional | streaming, chunk 13 |
-|---|---|---|
-| 41 frames | 53 s | 63 s |
-| 161 frames | 148 s (97.8 s denoise) | 190 s (142.8 s denoise) |
-| 321 frames | 404 s (274.7 s denoise) | **354 s** (258.8 s denoise) |
-
-The 321-frame bidirectional render did not run at all before 0.5.95: it asks
-for a `[gate|up]` FFN panel of exactly 2 GiB and hit the storage-binding limit
-(`2147483648 exceeds 2147483644`). That panel is now split into passes sized
-against the scratch allocator — which rounds capacity to the next power of
-two, so the largest pass that does not round into the wall is a gigabyte.
-
-The chunked path never builds a panel that size in the first place, and at
-this length it is also simply faster. Identity holds across the chunks: the
-same woman in the same red raincoat at frame 4 and at frame 150.
-
-A chunk that would leave a tail shorter than half a chunk swallows it — two
-latent frames with four frames of context was the one shape that reliably
-wandered into a different street half a second before the clip ended.
 
 ## Adapters at runtime
 

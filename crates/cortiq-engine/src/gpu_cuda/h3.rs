@@ -37,6 +37,11 @@ use cortiq_core::{CmfModel, TensorDtype};
 use super::{Buf, Ctx, DevMat, Gemm, Res, State, bl, compile, cs, cu, ctx, debug, decline, derr, dev_mat, func};
 use crate::gpu::H3Chain;
 
+/// LTX-2.5's blocks as a resident chain, on this module's weight store.
+#[path = "ltx.rs"]
+mod ltx;
+pub use ltx::{ltx_chain, ltx_vae_chain};
+
 const H3_SRC: &str = include_str!("h3.cu");
 const FLASH_SRC: &str = include_str!("h3_flash.cu");
 
@@ -87,6 +92,8 @@ pub(super) struct H3State {
     /// f16 planes of host f32 weights (a convolution's kernels), by the
     /// address and length of the host slice.
     host_w: HashMap<(usize, usize), Buf>,
+    /// The kernels of the LTX-2.5 chain (`ltx.rs`), once compiled.
+    ltx: Option<ltx::LxFuncs>,
 }
 
 impl H3State {
@@ -364,6 +371,12 @@ unsafe fn expand(
         Some(m) => Some(m.clone()),
         None if keep => {
             let m = Arc::new(dev_mat(kind, bytes, rows, cols)?);
+            // `dev_mat` copies from pageable memory on the default stream:
+            // the call returns once the bytes are staged, not once they are
+            // on the card, and the chain's stream does not wait for the
+            // default one. Without this, the first call of a chain read
+            // weights still in flight (two runs of one seed differed).
+            cu::ctx::synchronize().map_err(derr)?;
             st.h3.mats_bytes += dev_bytes(&m);
             st.h3.mats.insert(key, m.clone());
             Some(m)
@@ -1369,6 +1382,8 @@ unsafe fn conv_chain(
             return Ok(bf.ptr);
         }
         let bf = Buf::from_slice(v)?;
+        // the copy is staged, not landed (see `expand`)
+        cu::ctx::synchronize().map_err(derr)?;
         let p = bf.ptr;
         st.h3.host_w.insert(key, bf);
         Ok(p)

@@ -906,7 +906,9 @@ pub struct MmCfg {
     /// upsample of `act` (the image is at half the output size); 3 = the
     /// 3×3×3 causal convolution of a video VAE; 4 = 3×3 with one reflected
     /// row and column on every side; 5 = 3×3 stride 2 with one reflected
-    /// row and column on the far side (the image at twice the output size).
+    /// row and column on the far side (the image at twice the output size);
+    /// 6 = 3×3×3 with zero padding in space and replicated frames in time
+    /// (the LTX-2.5 video decoder).
     pub conv: u32,
     /// f16 accumulation flushed into f32 (vk2): 0 = f32 accumulators;
     /// F > 0 = the MMAs of F consecutive K slices accumulate in f16
@@ -1209,6 +1211,29 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
   sx = clamp(sx, 0, iw - 1);
   let px = u32(sy) * u32(iw) + u32(sx);
   return act[(px * p.cin + ci) / 4u];
+}}",
+            bk = g.bk
+        );
+    } else if g.conv == 6 {
+        // 3×3×3 over an `[F·H·W][C]` volume, `y` counting F·H rows: zero
+        // padding in space and replicated frames at both ends of time (the
+        // LTX-2.5 video decoder). `arow`: the volume's frames in bits 0-15,
+        // this dispatch's first output frame in bits 16-31.
+        let _ = writeln!(
+            s,
+            "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
+  let k0 = kt * {bk}u;
+  let tap = k0 / p.cin;
+  let ci = k0 - tap * p.cin + vc * 4u;
+  let nf = i32(p.arow & 0xFFFFu);
+  let fr = y / i32(p.ch) + i32(p.arow >> 16u);
+  let ro = y % i32(p.ch);
+  let sf = clamp(fr + i32(tap / 9u) - 1, 0, nf - 1);
+  let sy = ro + i32((tap / 3u) % 3u) - 1;
+  let sx = x + i32(tap % 3u) - 1;
+  if (sy < 0 || sx < 0 || sy >= i32(p.ch) || sx >= i32(p.cw)) {{ return vec4<f16>(0.0h); }}
+  let src = (u32(sf) * p.ch + u32(sy)) * p.cw + u32(sx);
+  return act[(src * p.cin + ci) / 4u];
 }}",
             bk = g.bk
         );

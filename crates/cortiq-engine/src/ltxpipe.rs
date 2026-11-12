@@ -546,6 +546,16 @@ pub fn run_stage_cond(
             sigma: if a_frozen { 0.0 } else { sigma },
         };
         let (vv, av) = dit.forward(&vin, &ain, pool);
+        // `CMF_LTX_DUMP=<prefix>`: this step's two velocities as raw f32
+        // (`<prefix>.v<sigma>.f32`, `<prefix>.a<sigma>.f32`), so one forward
+        // can be compared between two paths before the sampler amplifies
+        // their difference.
+        if let Ok(pre) = std::env::var("CMF_LTX_DUMP") {
+            let raw = |x: &[f32]| x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+            let tag = format!("{:.4}", sigma);
+            let _ = std::fs::write(format!("{pre}.v{tag}.f32"), raw(&vv));
+            let _ = std::fs::write(format!("{pre}.a{tag}.f32"), raw(&av));
+        }
         // velocity → denoised, at the token's own timestep
         // velocity → denoised at each token's own timestep, then the frozen
         // tokens are put back exactly as they were

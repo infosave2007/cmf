@@ -112,6 +112,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## LTX-2.5:CUDA 与 Vulkan，带声音的片段 24 秒(0.8.77)
+
+[LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf) 由一条提示词生成视频及其音轨，现在把 48 个音视频块作为一条
+常驻链放在显卡上运行，视频 VAE 也在显卡上。在 RTX A5000 上，提示词编码完成后（编码结果会缓存），384×256、49 帧
+带声音的片段在 CUDA 上用时 22.3 秒，Vulkan 上用时 28.9 秒；0.8.76 仅生成画面就需要 430 到 475 秒。本版本还修复了
+CUDA 上每条常驻链的第一次调用可能读到尚未复制完成的权重的问题:
+
+```sh
+cortiq ltx-video --model ltx25-q4tp.cmf --prompt "A corgi in a chef hat flips a pancake." \
+  --height 256 --width 384 --frames 49 --out corgi.y4m --out-audio corgi.wav
+```
+
 ## MiniMax-H3-Turbo:支持 CUDA，Vulkan 与 Metal 更快(0.8.76)
 
 [MiniMax-H3-Turbo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf) 由一条提示词生成带同步音频的视频，现在与
