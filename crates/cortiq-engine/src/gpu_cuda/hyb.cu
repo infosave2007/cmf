@@ -779,6 +779,44 @@ extern "C" __global__ void hy_expand_p(const uint2* __restrict__ T, const u8* __
     }
 }
 
+// `hy_expand_p` over row tiles [tile0, tile0 + nt) of a matrix of `rows`:
+// W holds those rows only (row tile0 * 16 first), so a large weight expands a
+// band at a time into a bounded buffer.
+extern "C" __global__ void hy_expand_pr(const uint2* __restrict__ T, const u8* __restrict__ Cc,
+                                        const float* __restrict__ lad, u16* __restrict__ W, int rows, int cols,
+                                        int tile0, int nt)
+{
+    const int gpr = cols >> 5;
+    const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx0 >= (size_t)nt * gpr * 32) return;
+    const size_t idx = idx0 + (size_t)tile0 * gpr * 32;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    const uint2 X = T[idx];
+    const int ra = tile * 16 + gid, rb = ra + 8;
+    const float2* par = (const float2*)lad;
+    const float sa = ra < rows ? exp2f(fmaf((float)Cc[tg * 16 + gid], par[ra].y, par[ra].x)) : 0.0f;
+    const float sb = rb < rows ? exp2f(fmaf((float)Cc[tg * 16 + gid + 8], par[rb].y, par[rb].x)) : 0.0f;
+    const int r0 = tile0 * 16;
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const u32 w = s ? X.y : X.x;
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = (m & 1) ? rb : ra;
+            if (r >= rows) continue;
+            const float sc = (m & 1) ? sb : sa;
+            const int k = g * 32 + 16 * s + 2 * tig + ((m & 2) ? 8 : 0);
+            const float lo = (float)((w >> (4 * m)) & 15u) - 8.0f;
+            const float hi = (float)((w >> (4 * m + 16)) & 15u) - 8.0f;
+            const u32 pk = (u32)f2h(lo * sc) | ((u32)f2h(hi * sc) << 16);
+            *(u32*)(W + (size_t)(r - r0) * cols + k) = pk;
+        }
+    }
+}
+
 // ---------------------------------------------------- GDN, one front launch
 //
 // Conv + SiLU of every channel, the L2 norm of the q and k heads (q also over
@@ -1420,4 +1458,202 @@ extern "C" __global__ void hy_far_prep(const float* __restrict__ q, const float*
                                        const int* __restrict__ ci, int m, int nh, float scale, int rect_fm)
 {
     far_prep_body(q, KT, MU, MZ, TH, Mx, P, E, ci, m, nh, scale, rect_fm, 1, 0);
+}
+
+// ------------------------------------------------- a sealed prompt chunk on the GEMMs
+//
+// A prompt read past a seal (`big` over a sealed layer): the chunk's rows sit
+// after the near rows of the far-field mirror, the near part of their
+// attention goes by the same batched GEMMs as an exact layer's, and the far
+// part comes from the landmarks, a row at a time:
+
+// Row b's far part for head h at its own scale: FM [B][nh] the scale (the
+// largest far logit bound, as `far_prep_body`'s), FZ [B][nh] the far mass and
+// FN [B][nh][HD] the far numerator at that scale. A block (head, row), 256
+// threads; the arithmetic of `far_prep_body` without the near blocks.
+extern "C" __global__ void hy_far_rows(const float* __restrict__ q, const float* __restrict__ KT,
+                                       const float* __restrict__ MU, const float* __restrict__ MZ,
+                                       const float* __restrict__ TH, float* __restrict__ FM,
+                                       float* __restrict__ FZ, float* __restrict__ FN,
+                                       int m, int nh, float scale, int rect_fm, int B)
+{
+    __shared__ float sf[64];
+    __shared__ float su[64];
+    __shared__ float sc[2];
+    const int h = blockIdx.x, b = blockIdx.y, g = h / HPK, j = h - g * HPK, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int NW = blockDim.x >> 5;
+    const float* mz = MZ + (size_t)h * 2 * m;
+    const float* qh = q + (((size_t)g * B + b) * HPK + j) * HD;
+    for (int a = warp; a < m; a += NW) {
+        const float* kt = KT + ((size_t)g * m + a) * HD;
+        float s = 0.0f;
+        for (int d = lane; d < HD; d += 32) s = fmaf(qh[d], kt[d], s);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+        if (lane == 0) sf[a] = s * scale;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float f = -INF, c = -INF;
+        for (int a = 0; a < m; a++) f = fmaxf(f, sf[a]);
+        for (int bb = 0; bb < m; bb++) c = fmaxf(c, f + mz[bb]);
+        sc[0] = f;
+        sc[1] = c;
+    }
+    __syncthreads();
+    const float f = sc[0], call = sc[1];
+    if (tid < m) sf[tid] = expf(sf[tid] - f);
+    __syncthreads();
+    if (tid < m) {
+        const float* mu = MU + (size_t)h * m * m;
+        float s = 0.0f;
+        for (int a = 0; a < m; a++) s += sf[a] * mu[a * m + tid];
+        if (rect_fm) s = fmaxf(s, 0.0f);
+        su[tid] = s * expf(f + mz[tid] - call);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float den = 0.0f;
+        for (int bb = 0; bb < m; bb++) den += su[bb] * mz[m + bb];
+        sc[0] = den;
+    }
+    __syncthreads();
+    const float den = sc[0];
+    const bool have = den >= 0.0f;
+    for (int d = tid; d < HD; d += blockDim.x) {
+        float s = 0.0f;
+        if (have) {
+            const float* th = TH + (size_t)h * m * HD + d;
+            for (int bb = 0; bb < m; bb++) s += su[bb] * th[(size_t)bb * HD];
+        }
+        FN[((size_t)b * nh + h) * HD + d] = s;
+    }
+    if (tid == 0) {
+        FM[(size_t)b * nh + h] = call;
+        FZ[(size_t)b * nh + h] = have ? den : 0.0f;
+    }
+}
+
+// `hy_softmax_h` with a far part. The weights stay at the near maximum (f16
+// keeps its precision), and the row's two factors go beside the mass: fa the
+// near part's (exp(near max - max)), fc the far numerator's (exp(FM - max)),
+// isum one over the whole mass. FM/FZ point at the sub-chunk's first row.
+extern "C" __global__ void hy_softmax_hf(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
+                                         float* __restrict__ fa, float* __restrict__ fc, int L, int pos0, int col_base,
+                                         int hpk, int cols, int istride, const float* __restrict__ FM,
+                                         const float* __restrict__ FZ, int nh)
+{
+    __shared__ float red[32];
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const float* s = S + (size_t)blockIdx.x * L;
+    u16* p = P + (size_t)blockIdx.x * L;
+    const int gk = (int)blockIdx.x / cols, r = (int)blockIdx.x - gk * cols;
+    const int b = r / hpk, h = gk * hpk + (r - b * hpk);
+    const int pq = pos0 + b;
+    const int hi = pq - col_base;
+    float m = -INF;
+    for (int c = tid; c <= hi && c < L; c += T) m = fmaxf(m, s[c]);
+    for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, k));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    m = -INF;
+    for (int k = 0; k < NW; k++) m = fmaxf(m, red[k]);
+    __syncthreads();
+    float sum = 0.0f;
+    for (int c = tid; c < L; c += T) {
+        float e = 0.0f;
+        if (c <= hi) {
+            e = expf(s[c] - m);
+            sum += e;
+        }
+        p[c] = f2h(e);
+    }
+    for (int k = 16; k > 0; k >>= 1) sum += __shfl_xor_sync(FULL, sum, k);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        sum = 0.0f;
+        for (int k = 0; k < NW; k++) sum += red[k];
+        float a = 1.0f, cf = 0.0f, fz = 0.0f;
+        if (FM) {
+            const float fm = FM[(size_t)b * nh + h], mm = fmaxf(m, fm);
+            a = expf(m - mm);
+            cf = expf(fm - mm);
+            fz = FZ[(size_t)b * nh + h];
+        }
+        const float tot = a * sum + cf * fz;
+        const size_t ix = (size_t)gk * istride + r;
+        isum[ix] = tot > 0.0f ? 1.0f / tot : 1.0f;
+        fa[ix] = a;
+        fc[ix] = cf;
+    }
+}
+
+// `hy_attn_out` with the far numerator: (fa * near + fc * far) * isum.
+extern "C" __global__ void hy_attn_out_f(const float* __restrict__ aog, const float* __restrict__ isum,
+                                         const float* __restrict__ fa, const float* __restrict__ fc,
+                                         const float* __restrict__ FN, const float* __restrict__ gate,
+                                         void* __restrict__ ao, int nh, int B, int half)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)B * nh * HD) return;
+    const int d = (int)(i % HD);
+    const size_t bh = i / HD;
+    const int h = (int)(bh % nh), b = (int)(bh / nh);
+    const int g = h / HPK, j = h - g * HPK;
+    const size_t ix = (size_t)g * B * HPK + (size_t)b * HPK + j;
+    float v = aog[(((size_t)g * B + b) * HPK + j) * HD + d] * fa[ix];
+    if (FN) v = fmaf(fc[ix], FN[((size_t)b * nh + h) * HD + d], v);
+    v *= isum[ix];
+    if (gate) v *= sigm(gate[i]);
+    stf(ao, i, v, half);
+}
+
+// The chunk's commit: E ring rows, the oldest first (slots ns + (head0 + t) % w),
+// into each head's far accumulators, row after row as `hy_far_insert` takes
+// one. A warp per (KV head, its head, landmark), the landmark and its
+// numerator row in registers.
+extern "C" __global__ void hy_far_insert_n(const u16* __restrict__ NK, const u16* __restrict__ NV,
+                                           const float* __restrict__ QT, float* __restrict__ MZ, float* __restrict__ TH,
+                                           int m, int nkv, float scale, int ns, int w, int head0, int E)
+{
+    const int wg = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5), lane = threadIdx.x & 31;
+    if (wg >= nkv * HPK * m) return;
+    const int g = wg / (HPK * m), r = wg - g * (HPK * m), j = r / m, i = r - j * m;
+    const int h = g * HPK + j;
+    const float* qt = QT + ((size_t)h * m + i) * HD;
+    float* th = TH + ((size_t)h * m + i) * HD;
+    float qr[DPL], acc[DPL];
+#pragma unroll
+    for (int k = 0; k < DPL; k++) {
+        qr[k] = qt[lane + 32 * k];
+        acc[k] = th[lane + 32 * k];
+    }
+    float* mz = MZ + (size_t)h * 2 * m;
+    float mm = mz[i], z = mz[m + i];
+    for (int t = 0; t < E; t++) {
+        const int row = ns + (head0 + t) % w;
+        const u16* k = NK + ((size_t)row * nkv + g) * HD;
+        const u16* v = NV + ((size_t)row * nkv + g) * HD;
+        float l = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < DPL; kk++) l = fmaf(qr[kk], h2f(k[lane + 32 * kk]), l);
+        for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(FULL, l, o);
+        l *= scale;
+        float rs = 1.0f;
+        if (l > mm) {
+            rs = expf(mm - l);
+            z *= rs;
+            mm = l;
+        }
+        const float e = expf(l - mm);
+        z = z + e;
+#pragma unroll
+        for (int kk = 0; kk < DPL; kk++) acc[kk] = acc[kk] * rs + e * h2f(v[lane + 32 * kk]);
+    }
+    if (lane == 0) {
+        mz[i] = mm;
+        mz[m + i] = z;
+    }
+#pragma unroll
+    for (int k = 0; k < DPL; k++) th[lane + 32 * k] = acc[k];
 }

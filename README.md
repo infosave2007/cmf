@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Qwen3.8-27B Turbo on a 16 GB card through CUDA (0.8.71)
+
+[Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) now keeps a fixed ceiling on CUDA, the
+prompt included: on a 16 GB RTX 2000 Ada the whole run stays within 15.0 GB from 1 000 to 64 000 tokens. A prompt
+past the first rows is read through the far field in chunks, as over Vulkan, and the far field's sums are built on
+the card. On the same card a 64 000-token prompt reaches the first token in 175 s against 278 over Vulkan, and a
+summary of 100 000 characters decodes at 31.5 tok/s against 21.3. The standard file does not fit 16 000 tokens
+there.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+See [docs/CUDA.md](docs/CUDA.md#turbo-on-a-16-gb-card).
+
 ## Dory and Qwen3.8-27B Turbo on CUDA (0.8.70)
 
 The CUDA backend runs [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf), the

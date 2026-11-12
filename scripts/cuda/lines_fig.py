@@ -81,7 +81,9 @@ def fig(spec, lang):
                 s.dot(p[0], p[1], 7, c)
             last = [(i, v) for i, v in enumerate(se[key]) if v is not None][-1]
             d = 1 if key == "mem" or (key == "first" and last[1] < 100) else 0
-            ly = Y(last[1]) - 12
+            # a line that stops early is labelled under its last point, where
+            # the lines that go on do not run
+            ly = Y(last[1]) - 12 if last[0] == len(ctx) - 1 else Y(last[1]) + 30
             # labels that would touch one already placed move apart
             while any(abs(ly - p) < 21 for p in placed):
                 ly += 22 if ly >= Y(last[1]) - 12 else -22

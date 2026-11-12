@@ -696,6 +696,165 @@ impl NystromState {
         }
     }
 
+    /// `prefill_group` without the replay of the far rows: the landmarks,
+    /// each head's skeleton, the sinks and the window as the replay leaves
+    /// them (the last `w` rows, row r in slot (r - sink) % w). Returns the
+    /// rows the replay would have absorbed into the far field
+    /// (`sink..t - w`), for the caller to sum (`set_far_sums`, or
+    /// `replay_far` on the host); None when it absorbs none (exact-only, or no
+    /// row past the window, or the reseal sample ring wants the replay).
+    pub fn prefill_group_split(
+        &mut self,
+        qs: &[&[f32]],
+        ks: &[f32],
+        vs: &[f32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let sink = self.group.sink;
+        if reseal_every() > 0 || t <= sink + self.group.w {
+            self.prefill_group(qs, ks, vs, t, d, dv);
+            return None;
+        }
+        assert_eq!(qs.len(), self.heads.len(), "one query block per head");
+        let calib = self.calib.take();
+        let Some(k_tilde64) = self.group.prefill_shared(ks, vs, t, d, dv, calib.as_ref()) else {
+            for h in &mut self.heads {
+                h.seal_exact(t);
+            }
+            return None;
+        };
+        for (hi, (h, q)) in self.heads.iter_mut().zip(qs).enumerate() {
+            let fixed = calib
+                .as_ref()
+                .map(|c| (&c.q_tilde[hi][..], c.mu.as_ref().map(|m| &m[hi][..])));
+            h.seal(&self.group, q, t, &k_tilde64, fixed);
+        }
+        let g = &mut self.group;
+        let w = g.w;
+        for r in t - w..t {
+            let slot = (r - sink) % w;
+            g.win_k[slot * d..(slot + 1) * d].copy_from_slice(&ks[r * d..(r + 1) * d]);
+            g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(&vs[r * dv..(r + 1) * dv]);
+        }
+        g.win_len = w;
+        g.win_head = (t - sink) % w;
+        Some(sink..t - w)
+    }
+
+    /// Landmark count, head width and score scale of a sealed group.
+    pub fn far_geometry(&self) -> (usize, usize, f32) {
+        (self.group.m_eff, self.group.d, self.group.scale)
+    }
+
+    /// Head `h`'s query landmarks `[m_eff][d]`.
+    pub fn far_q_tilde(&self, h: usize) -> &[f32] {
+        &self.heads[h].q_tilde
+    }
+
+    /// Head `h`'s far sums as the replay of `far_len` rows leaves them:
+    /// per landmark the largest logit, the mass and the numerator `[m][dv]`
+    /// at that scale.
+    pub fn set_far_sums(&mut self, h: usize, m_max: &[f32], z_hat: &[f32], t_hat: &[f32], far_len: usize) {
+        let hd = &mut self.heads[h];
+        hd.m_max.copy_from_slice(m_max);
+        hd.z_hat.copy_from_slice(z_hat);
+        hd.t_hat.copy_from_slice(t_hat);
+        hd.far_len = far_len;
+    }
+
+    /// `prefill_group_split` over rows given by index instead of copies: row j
+    /// of the seal's order is row `order[j]` of `ks`/`vs` (`[t][d]`), a head's
+    /// query that row's trace row, `q_trace[(order[j] / stride) * nh + h0 + h]`
+    /// (`[t / stride][nh][d]`). The same state as the split over the ordered
+    /// copies, without making them (on a 64 000-row prompt they were gigabytes
+    /// a layer). None, with the state untouched, where the split would not
+    /// skip the replay or a calibration is loaded: the caller seals the usual way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_gathered(
+        &mut self,
+        ks: &[f32],
+        vs: &[f32],
+        q_trace: &[f32],
+        stride: usize,
+        nh: usize,
+        h0: usize,
+        order: &[u32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let (sink, w) = (self.group.sink, self.group.w);
+        let exact_only = o1_deferred_boundary(self.group.base_w, sink).map(|b| t < b).unwrap_or(true);
+        let stride = stride.max(1);
+        if self.calib.is_some()
+            || reseal_every() > 0
+            || exact_only
+            || t <= sink + w
+            || order.len() != t
+            || ks.len() < t * d
+            || vs.len() < t * dv
+            || q_trace.len() < t.div_ceil(stride) * nh * d
+            || h0 + self.heads.len() > nh
+        {
+            return None;
+        }
+        let g = &mut self.group;
+        g.d = d;
+        g.dv = dv;
+        g.scale = 1.0 / (d as f32).sqrt();
+        g.exact_only = false;
+        g.sink_len = sink;
+        let kr = |j: usize| -> &[f32] { let r = order[j] as usize; &ks[r * d..(r + 1) * d] };
+        let vr = |j: usize| -> &[f32] { let r = order[j] as usize; &vs[r * dv..(r + 1) * dv] };
+        g.sink_k = (0..sink).flat_map(kr).copied().collect();
+        g.sink_v = (0..sink).flat_map(vr).copied().collect();
+        g.win_k = vec![0.0; w * d];
+        g.win_v = vec![0.0; w * dv];
+        let m_eff = (t / 8).clamp(4, g.m);
+        g.m_eff = m_eff;
+        let k_tilde64 = seg_means_by(t, d, m_eff, kr);
+        g.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
+        for r in t - w..t {
+            let slot = (r - sink) % w;
+            g.win_k[slot * d..(slot + 1) * d].copy_from_slice(kr(r));
+            g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(vr(r));
+        }
+        g.win_len = w;
+        g.win_head = (t - sink) % w;
+        let g = &self.group;
+        for (hi, h) in self.heads.iter_mut().enumerate() {
+            let qr = |j: usize| -> &[f32] {
+                let at = ((order[j] as usize / stride) * nh + h0 + hi) * d;
+                &q_trace[at..at + d]
+            };
+            h.seal_tilde(g, seg_means_by(t, d, m_eff, qr), &k_tilde64, None);
+        }
+        Some(sink..t - w)
+    }
+
+    /// `replay_far` over rows given by index (`ks[idx[j]]`).
+    pub fn replay_far_idx(&mut self, ks: &[f32], vs: &[f32], idx: &[u32]) {
+        let (m_eff, d, dv, scale) = (self.group.m_eff, self.group.d, self.group.dv, self.group.scale);
+        for &r in idx {
+            let r = r as usize;
+            for h in self.heads.iter_mut() {
+                h.far_absorb(m_eff, d, dv, scale, &ks[r * d..(r + 1) * d], &vs[r * dv..(r + 1) * dv]);
+            }
+        }
+    }
+
+    /// The far rows of `prefill_group_split` absorbed on the host, in order.
+    pub fn replay_far(&mut self, ks: &[f32], vs: &[f32], rows: std::ops::Range<usize>) {
+        let (m_eff, d, dv, scale) = (self.group.m_eff, self.group.d, self.group.dv, self.group.scale);
+        for j in rows {
+            for h in self.heads.iter_mut() {
+                h.far_absorb(m_eff, d, dv, scale, &ks[j * d..(j + 1) * d], &vs[j * dv..(j + 1) * dv]);
+            }
+        }
+    }
+
     /// One decode step for a single-head state — see `step_group`.
     pub fn step(&mut self, q: &[f32], k: &[f32], v: &[f32], out: &mut [f32]) {
         assert_eq!(self.heads.len(), 1, "use step_group for a GQA group");
@@ -1033,15 +1192,21 @@ impl NystromHead {
         k_tilde64: &[f64],
         fixed: Option<(&[f32], Option<&[f32]>)>,
     ) {
-        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
-        self.far_len = 0;
         let q_tilde64 = match fixed {
             Some((qt, _)) => qt.iter().map(|&x| x as f64).collect(),
-            None => seg_means(qs, t, d, m_eff),
+            None => seg_means(qs, t, g.d, g.m_eff),
         };
+        self.seal_tilde(g, q_tilde64, k_tilde64, fixed.and_then(|f| f.1));
+    }
+
+    /// The rest of `seal` once the query landmarks are known (`fixed_mu`: a
+    /// calibrated M).
+    fn seal_tilde(&mut self, g: &NystromGroup, q_tilde64: Vec<f64>, k_tilde64: &[f64], fixed_mu: Option<&[f32]>) {
+        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
+        self.far_len = 0;
         self.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
 
-        if let Some((_, Some(mu))) = fixed {
+        if let Some(mu) = fixed_mu {
             self.mu = mu.to_vec();
         } else {
             // Au and its regularized pseudo-inverse in f64 — one-off m×m
@@ -1257,6 +1422,26 @@ impl NystromHead {
 
 /// Contiguous segment means (the Nyströmformer landmark recipe), f64
 /// accumulation.  The split (i·t)/m matches the Python reference.
+/// `seg_means` over rows given by index: row j is `row(j)`.
+fn seg_means_by<'a>(t: usize, d: usize, m: usize, row: impl Fn(usize) -> &'a [f32]) -> Vec<f64> {
+    let mut out = vec![0.0f64; m * d];
+    for i in 0..m {
+        let lo = i * t / m;
+        let hi = (i + 1) * t / m;
+        let acc = &mut out[i * d..(i + 1) * d];
+        for j in lo..hi {
+            for (a, &x) in acc.iter_mut().zip(row(j)) {
+                *a += x as f64;
+            }
+        }
+        let inv = 1.0 / (hi - lo) as f64;
+        for a in acc.iter_mut() {
+            *a *= inv;
+        }
+    }
+    out
+}
+
 fn seg_means(xs: &[f32], t: usize, d: usize, m: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; m * d];
     for i in 0..m {

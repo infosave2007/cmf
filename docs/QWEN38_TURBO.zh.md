@@ -118,7 +118,7 @@ cortiq far-turbo qwen38-27b-q4tp.cmf qwen38-27b-turbo.cmf --exact-weights keep27
 
 ## 未包含的内容
 
-- 远场运行在 Vulkan、DX12、Metal(`gpu_metal/o1c.rs`)和 CUDA([docs/CUDA.zh.md](CUDA.zh.md):提示在显卡上整段读取并封存一次,所以 CUDA 上没有固定的显存上限)上。在 CPU 上,该文件按普通文件运行。测量在 NVIDIA 显卡和 M4 上进行。
+- 远场运行在 Vulkan、DX12、Metal(`gpu_metal/o1c.rs`)和 CUDA([docs/CUDA.zh.md](CUDA.zh.md#16-gb-显卡上的-turbo):在 16 GB 显卡上整个运行保持在 15.0 GB,64 000 词元的提示也是如此)上。在 CPU 上,该文件按普通文件运行。测量在 NVIDIA 显卡和 M4 上进行。
 - 封存点之后的文本是近似的:远处的内容会淡化,保持精确的行除外。拟合只见过插入的事实,其他类型的重要文本没有测试。
 - 提示结束后到达的行留在窗口中或进入远场。与已封存对话不一致的回合会重新读取整个提示。
 - 在 Vulkan 上,草稿需要不带惩罚的贪婪解码。

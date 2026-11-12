@@ -50,7 +50,7 @@ Use cortiq 0.8.59 or later; prebuilt binaries are on the
 [releases page](https://github.com/infosave2007/cmf/releases). `--greedy` turns on draft tokens, and
 `--no-think` asks for a direct answer.
 
-On an NVIDIA card through CUDA (cortiq 0.8.70 or later; the CUDA toolkit's `libnvrtc` and `libcublas`
+On an NVIDIA card through CUDA (cortiq 0.8.71 or later; the CUDA toolkit's `libnvrtc` and `libcublas`
 12.x at run time):
 
 ```bash
@@ -118,26 +118,24 @@ A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt.
 In a chat the depth of the draft chain settles on the card's own round times: of five turns in one process the
 second to the fifth run at 29.8 tok/s.
 
-**On NVIDIA through CUDA.** An RTX 3090 (24 GB), cortiq 0.8.70, `cortiq bench --core`, 60 tokens after a
-prompt of that length, drafts on (the bench's text repeats, so most of them hold).
+**On NVIDIA through CUDA.** A 16 GB card, the RTX 2000 Ada, cortiq 0.8.71, `cortiq bench --core`, 60 tokens
+after a prompt of that length, drafts on (the bench's text repeats, so most of them hold). The whole run stays
+within 15.0 GB, the prompt included (14.8 GB over Vulkan).
 
 ![Qwen3.8-27B Turbo on CUDA](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_en.png)
 
-| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak VRAM, GB (standard / turbo) |
+| prompt, tokens | first token, s (**CUDA**) | first token, s (Vulkan) | decode, tok/s (**CUDA**) | decode, tok/s (Vulkan) | peak VRAM, GB (CUDA / Vulkan) |
 |---:|---:|---:|---:|---:|---:|
-| 1 000 | 1.16 | **1.17** | 258.1 | **258.8** | 15.8 / 15.8 |
-| 4 000 | 4.06 | **4.25** | 251.6 | **252.1** | 16.5 / 16.5 |
-| 16 000 | 17.2 | **21.9** | 181.5 | **118.3** | 17.3 / 17.3 |
-| 32 000 | 39.0 | **48.7** | 139.4 | **120.6** | 18.4 / 18.3 |
-| 64 000 | 101 | **124** | 95.3 | **128.4** | 20.4 / 20.2 |
+| 1 000 | **2.55** | 3.58 | **87.3** | 27.9 | 14.6 / 14.1 |
+| 4 000 | **9.71** | 14.88 | **86.9** | 26.7 | 14.9 / 14.3 |
+| 16 000 | **43.2** | 70.4 | **94.4** | 25.4 | 15.0 / 14.8 |
+| 32 000 | **86.2** | 135.6 | **93.5** | 26.7 | 15.0 / 14.8 |
+| 64 000 | **174.6** | 277.9 | **93.8** | 26.5 | 15.0 / 14.8 |
 
-A real answer, a summary of 100 000 characters of Wikipedia, up to 400 tokens: first token 37.6 s, 80.3 tok/s
-with 42 % of the drafts kept (45.2 without them); the standard file 31.0 s and 76.5 tok/s. Facts in 100 000
-characters: 8 of 8. The same card over Vulkan: first token 209 s at 64 000 tokens, 63 tok/s.
-
-On CUDA the prompt is read whole on the card and sealed once after it: past the seal a token reads the far
-field, but the card holds the prompt's rows until then, so there is no fixed ceiling on CUDA, and the seal adds
-5 to 23 s to the first token.
+A real answer, a summary of 100 000 characters of Wikipedia, up to 400 tokens: first token in 69.8 s, then
+31.5 tok/s (13.8 without drafts, the same text); over Vulkan 114.3 s and 21.3 tok/s. Facts in 60 000 and
+100 000 characters: 8 of 8. The standard file runs out of this card's memory at 16 000 tokens. On an RTX 3090
+past the seal: 118–128 tok/s in the bench, 80.3 tok/s on the same summary.
 
 **On a Mac.** The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the
 base M4's memory bus, 120 GB/s by Apple's figure and 92 to 95 GB/s as measured. A token reads 13.6 GB of weights,
@@ -191,8 +189,6 @@ same path. A far field without exact rows finds 0 of 4. Perplexity on the rows p
 
 - The far field runs on Vulkan, DX12, Metal and CUDA. On the CPU this file runs as the standard one. It was
   measured on NVIDIA cards (Vulkan and CUDA) and an M4.
-- On CUDA a long prompt's rows stay on the card until the seal: the 16 GB ceiling holds over Vulkan, DX12 and
-  Metal only.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact. The
   fit behind those rows saw planted facts, and other kinds of important text were not tested.
 - Rows that arrive after a prompt ends stay in the window or go to the far field. A turn that diverges
@@ -249,7 +245,7 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 [странице релизов](https://github.com/infosave2007/cmf/releases). `--greedy` включает черновые токены,
 `--no-think` просит ответ без рассуждения.
 
-На карте NVIDIA через CUDA (cortiq 0.8.70 или новее; при запуске нужны `libnvrtc` и `libcublas` 12.x из
+На карте NVIDIA через CUDA (cortiq 0.8.71 или новее; при запуске нужны `libnvrtc` и `libcublas` 12.x из
 CUDA toolkit):
 
 ```bash
@@ -317,26 +313,24 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 В чате глубина цепочки черновиков подстраивается под время раундов самой карты: из пяти ходов одного процесса
 ходы со второго по пятый идут на 29,8 ток/с.
 
-**На NVIDIA через CUDA.** RTX 3090 (24 ГБ), cortiq 0.8.70, `cortiq bench --core`, 60 токенов после промпта
-такой длины, с черновиками (текст бенча повторяется, поэтому большинство из них принимается).
+**На NVIDIA через CUDA.** Карта на 16 ГБ, RTX 2000 Ada, cortiq 0.8.71, `cortiq bench --core`, 60 токенов
+после промпта такой длины, с черновиками (текст бенча повторяется, поэтому большинство из них принимается).
+Весь прогон вместе с промптом держится в пределах 15,0 ГБ (через Vulkan 14,8 ГБ).
 
 ![Qwen3.8-27B Turbo на CUDA](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_ru.png)
 
-| промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик VRAM, ГБ (обычный / турбо) |
+| промпт, токенов | первый токен, с (**CUDA**) | первый токен, с (Vulkan) | декод, ток/с (**CUDA**) | декод, ток/с (Vulkan) | пик VRAM, ГБ (CUDA / Vulkan) |
 |---:|---:|---:|---:|---:|---:|
-| 1 000 | 1,16 | **1,17** | 258,1 | **258,8** | 15,8 / 15,8 |
-| 4 000 | 4,06 | **4,25** | 251,6 | **252,1** | 16,5 / 16,5 |
-| 16 000 | 17,2 | **21,9** | 181,5 | **118,3** | 17,3 / 17,3 |
-| 32 000 | 39,0 | **48,7** | 139,4 | **120,6** | 18,4 / 18,3 |
-| 64 000 | 101 | **124** | 95,3 | **128,4** | 20,4 / 20,2 |
+| 1 000 | **2,55** | 3,58 | **87,3** | 27,9 | 14,6 / 14,1 |
+| 4 000 | **9,71** | 14,88 | **86,9** | 26,7 | 14,9 / 14,3 |
+| 16 000 | **43,2** | 70,4 | **94,4** | 25,4 | 15,0 / 14,8 |
+| 32 000 | **86,2** | 135,6 | **93,5** | 26,7 | 15,0 / 14,8 |
+| 64 000 | **174,6** | 277,9 | **93,8** | 26,5 | 15,0 / 14,8 |
 
-Реальный ответ — пересказ 100 000 символов Википедии, до 400 токенов: первый токен через 37,6 с, 80,3 ток/с
-при 42 % принятых черновиков (45,2 без них); обычный файл — 31,0 с и 76,5 ток/с. Факты в 100 000 символов:
-8 из 8. Та же карта через Vulkan: первый токен через 209 с на 64 000 токенов, 63 ток/с.
-
-На CUDA промпт читается на карте целиком и запечатывается один раз после него: после печати токен читает
-дальнее поле, но до неё карта держит строки промпта, так что постоянного потолка на CUDA нет, а печать
-добавляет к первому токену от 5 до 23 с.
+Реальный ответ — пересказ 100 000 символов Википедии, до 400 токенов: первый токен через 69,8 с, затем
+31,5 ток/с (13,8 без черновиков, тот же текст); через Vulkan 114,3 с и 21,3 ток/с. Факты в 60 000 и 100 000
+символов: 8 из 8. Обычному файлу на 16 000 токенов не хватает памяти этой карты. На RTX 3090 после печати:
+118–128 ток/с в бенче, 80,3 ток/с на том же пересказе.
 
 **На Маке.** Машина — MacBook Air M4, 24 ГБ: без вентилятора, поэтому на долгих прогонах она греется и
 замедляется, и с шиной памяти базового M4 — 120 ГБ/с по данным Apple, 92–95 ГБ/с по замеру. Токен читает 13,6 ГБ
@@ -390,8 +384,6 @@ Neural Engine, `CMF_ANE=1`, читает промпт рядом с GPU: пер�
 
 - Дальнее поле работает на Vulkan, DX12, Metal и CUDA. На CPU этот файл идёт как обычный. Замеры сделаны на
   картах NVIDIA (Vulkan и CUDA) и на M4.
-- На CUDA строки длинного промпта лежат на карте до печати: потолок 16 ГБ держится только через Vulkan, DX12
-  и Metal.
 - За местом запечатывания текст приближённый: далёкое блекнет, кроме строк, оставленных точными. Модель,
   которая их выбирает, видела вставленные факты; другие виды важного текста не проверялись.
 - Строки, пришедшие после конца промпта, остаются в окне или уходят в дальнее поле. Ход, который расходится
@@ -440,7 +432,7 @@ cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o
 
 需要 cortiq 0.8.59 或更新版本;预编译版本在[发布页](https://github.com/infosave2007/cmf/releases)。`--greedy` 开启草稿 token,`--no-think` 要求直接回答。
 
-在 NVIDIA 显卡上通过 CUDA（cortiq 0.8.70 或更新版本；运行时需要 CUDA toolkit 的 `libnvrtc` 和 `libcublas` 12.x）：
+在 NVIDIA 显卡上通过 CUDA（cortiq 0.8.71 或更新版本；运行时需要 CUDA toolkit 的 `libnvrtc` 和 `libcublas` 12.x）：
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -495,21 +487,19 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 
 在对话中,草稿链的深度按该显卡自身的轮次耗时调整:同一进程的五轮对话里,第二到第五轮为 29.8 tok/s。
 
-**NVIDIA（CUDA）。** RTX 3090（24 GB），cortiq 0.8.70，`cortiq bench --core`，在该长度的提示之后生成 60 个 token，开启草稿（bench 的文本是重复的，所以大多数草稿被接受）。
+**NVIDIA（CUDA）。** 一块 16 GB 显卡 RTX 2000 Ada，cortiq 0.8.71，`cortiq bench --core`，在该长度的提示之后生成 60 个 token，开启草稿（bench 的文本是重复的，所以大多数草稿被接受）。整个运行连同提示都不超过 15.0 GB（走 Vulkan 为 14.8 GB）。
 
 ![CUDA 上的 Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_zh.png)
 
-| 提示,token | 首个 token,秒(普通) | 首个 token,秒(**turbo**) | 解码,tok/s(普通) | 解码,tok/s(**turbo**) | 显存峰值,GB(普通 / turbo) |
+| 提示,token | 首个 token,秒(**CUDA**) | 首个 token,秒(Vulkan) | 解码,tok/s(**CUDA**) | 解码,tok/s(Vulkan) | 显存峰值,GB(CUDA / Vulkan) |
 |---:|---:|---:|---:|---:|---:|
-| 1 000 | 1.16 | **1.17** | 258.1 | **258.8** | 15.8 / 15.8 |
-| 4 000 | 4.06 | **4.25** | 251.6 | **252.1** | 16.5 / 16.5 |
-| 16 000 | 17.2 | **21.9** | 181.5 | **118.3** | 17.3 / 17.3 |
-| 32 000 | 39.0 | **48.7** | 139.4 | **120.6** | 18.4 / 18.3 |
-| 64 000 | 101 | **124** | 95.3 | **128.4** | 20.4 / 20.2 |
+| 1 000 | **2.55** | 3.58 | **87.3** | 27.9 | 14.6 / 14.1 |
+| 4 000 | **9.71** | 14.88 | **86.9** | 26.7 | 14.9 / 14.3 |
+| 16 000 | **43.2** | 70.4 | **94.4** | 25.4 | 15.0 / 14.8 |
+| 32 000 | **86.2** | 135.6 | **93.5** | 26.7 | 15.0 / 14.8 |
+| 64 000 | **174.6** | 277.9 | **93.8** | 26.5 | 15.0 / 14.8 |
 
-真实回答——概括 100 000 个字符的维基百科,最多 400 个 token:首个 token 37.6 秒,草稿接受 42% 时 80.3 tok/s(不用草稿 45.2);普通文件 31.0 秒、76.5 tok/s。100 000 字符中的事实:8/8。同一块显卡走 Vulkan:64 000 token 时首个 token 209 秒,63 tok/s。
-
-在 CUDA 上,提示在显卡上整段读取,读完后封存一次:封存之后一个 token 读取远场,但在那之前显卡要保存提示的行,所以 CUDA 上没有固定的显存上限,封存会给首个 token 增加 5 到 23 秒。
+真实回答——概括 100 000 个字符的维基百科,最多 400 个 token:首个 token 69.8 秒,之后 31.5 tok/s(不用草稿 13.8,文本相同);走 Vulkan 为 114.3 秒、21.3 tok/s。60 000 和 100 000 字符中的事实:8/8。普通文件在 16 000 token 时超出这块显卡的显存。RTX 3090 上封存之后:bench 中 118–128 tok/s,同一概括 80.3 tok/s。
 
 **在 Mac 上。** 测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s,实测 92 到 95 GB/s。每个 token 要读取 13.6 GB 权重,所以速度由总线决定:不带草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。
 
@@ -552,7 +542,6 @@ Neural Engine,`CMF_ANE=1`,与 GPU 一起读取提示:3 600 个 token 时首个 t
 ### 限制
 
 - 远场运行在 Vulkan、DX12、Metal 和 CUDA 上。在 CPU 上,这个文件按普通文件运行。测量在 NVIDIA 显卡(Vulkan 和 CUDA)和 M4 上进行。
-- 在 CUDA 上,长提示的行在封存之前留在显卡上:16 GB 的上限只在 Vulkan、DX12 和 Metal 上成立。
 - 封存点之后的文本是近似的:远处的内容会淡化,保持精确的行除外。选择这些行的拟合只见过插入的事实,其他类型的重要文本没有测试。
 - 提示结束后到达的行留在窗口中或进入远场。与已封存对话不一致的回合会重新读取整个提示。
 - 在 Vulkan 上,草稿需要不带惩罚的贪婪解码。不加 `--greedy` 时,封存后的 token 约为 57 tok/s。

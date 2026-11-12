@@ -112,6 +112,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## 通过 CUDA 在 16 GB 显卡上运行 Qwen3.8-27B Turbo(0.8.71)
+
+[Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) 现在在 CUDA 上连同提示一起保持固定的
+显存上限：在 16 GB 的 RTX 2000 Ada 上，从 1 000 到 64 000 个词元，整个运行都不超过 15.0 GB。超过最前几行的提示
+经远场分块读取，与 Vulkan 相同，远场的累加在显卡上构建。同一块显卡上，64 000 个词元的提示在 175 秒后给出首个
+词元（Vulkan 278 秒），概括 100 000 个字符时以 31.5 tok/s 解码（Vulkan 21.3）。普通文件在这块显卡上放不下
+16 000 个词元。
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md#16-gb-显卡上的-turbo)。
+
 ## CUDA 上的 Dory 和 Qwen3.8-27B Turbo(0.8.70)
 
 CUDA 后端可以运行循环的 nGPT [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf)，

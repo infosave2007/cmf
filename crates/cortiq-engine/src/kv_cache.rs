@@ -824,7 +824,26 @@ impl LayerKvCache {
         let keep = &self.o1_keep;
         let (ks, vs) = (&self.k, &self.v);
         let q_buf = &q_buf;
-        let seal_group = move |g: usize| -> crate::nystrom::NystromState {
+        // the far rows' sums on the card when it can take them (CUDA): the host
+        // seals each group from its rows by index, without the replay, and the
+        // card sums the far rows
+        let t_seal0 = std::time::Instant::now();
+        let dev = crate::gpu::o1_far_sums_on() && std::env::var_os("CMF_O1_CAPTURE").is_none();
+        let order: Vec<u32> = if keep.is_empty() { (0..t as u32).collect() } else { crate::dory::seal_order(t, sink, keep) };
+        let order = &order;
+        type Sealed = (crate::nystrom::NystromState, Option<std::ops::Range<usize>>);
+        let seal_group = move |g: usize| -> Sealed {
+            let calib = crate::nystrom::O1Calib::load(wire_layer, g, hd, hpk);
+            let wg = crate::nystrom::wide_window(wire_layer, g).unwrap_or(w);
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink + keep.len(), hpk)
+                .with_window(wg)
+                .with_rect(rect)
+                .with_calib(calib);
+            if dev {
+                if let Some(range) = st.seal_gathered(&ks[g], &vs[g], q_buf, stride, num_heads, g * hpk, order, t, hd, hd) {
+                    return (st, Some(range));
+                }
+            }
             let mut qh = vec![0.0f32; hpk * t * hd];
             for hh in 0..hpk {
                 let h = g * hpk + hh;
@@ -838,20 +857,13 @@ impl LayerKvCache {
                 .map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd])
                 .collect();
             crate::nystrom::capture_seal(wire_layer, g, t, hd, hpk, &qh, &ks[g], &vs[g]);
-            let calib = crate::nystrom::O1Calib::load(wire_layer, g, hd, hpk);
-            let wg = crate::nystrom::wide_window(wire_layer, g).unwrap_or(w);
-            let mut st = crate::nystrom::NystromState::new_group(m, w, sink + keep.len(), hpk)
-                .with_window(wg)
-                .with_rect(rect)
-                .with_calib(calib);
             if keep.is_empty() {
                 st.prefill_group(&qs, &ks[g], &vs[g], t, hd, hd);
             } else {
                 // The kept rows go right behind the sinks, and leave the far field.
-                let order = crate::dory::seal_order(t, sink, keep);
                 let pick = |src: &[f32]| -> Vec<f32> {
                     let mut out = Vec::with_capacity(t * hd);
-                    for &r in &order {
+                    for &r in order {
                         out.extend_from_slice(&src[r as usize * hd..(r as usize + 1) * hd]);
                     }
                     out
@@ -860,9 +872,9 @@ impl LayerKvCache {
                 let qr: Vec<&[f32]> = qo.iter().map(|q| &q[..]).collect();
                 st.prefill_group(&qr, &pick(&ks[g]), &pick(&vs[g]), t, hd, hd);
             }
-            st
+            (st, None)
         };
-        let groups: Vec<crate::nystrom::NystromState> = if self.num_kv_heads > 1 {
+        let sealed: Vec<Sealed> = if self.num_kv_heads > 1 {
             std::thread::scope(|s| {
                 let hs: Vec<_> = (0..self.num_kv_heads).map(|g| s.spawn(move || seal_group(g))).collect();
                 hs.into_iter().map(|h| h.join().expect("o1 seal: a group's thread panicked")).collect()
@@ -870,6 +882,49 @@ impl LayerKvCache {
         } else {
             vec![seal_group(0)]
         };
+        let t_groups = t_seal0.elapsed().as_secs_f64();
+        let (mut groups, fars): (Vec<_>, Vec<_>) = sealed.into_iter().unzip();
+        if fars.iter().any(Option::is_some) {
+            // every group's far rows on the card at once; the host's replay
+            // when the card declines (or the groups' windows differ)
+            let same = fars.iter().all(|f| f.is_some() && f == &fars[0]);
+            let (m_eff, _, scale) = groups[0].far_geometry();
+            let mut done = false;
+            if same && groups.iter().all(|g| g.far_geometry().0 == m_eff) {
+                let range = fars[0].clone().unwrap();
+                let mut qt = Vec::with_capacity(self.num_kv_heads * hpk * m_eff * hd);
+                for g in &groups {
+                    for h in 0..hpk {
+                        qt.extend_from_slice(g.far_q_tilde(h));
+                    }
+                }
+                let kf: Vec<&[f32]> = ks.iter().map(|k| &k[..]).collect();
+                let vf: Vec<&[f32]> = vs.iter().map(|v| &v[..]).collect();
+                if let Some((mz, th)) = crate::gpu::o1_far_sums(self.num_kv_heads, hpk, hd, m_eff, scale, &qt, &order[range.clone()], &kf, &vf) {
+                    for (gi, g) in groups.iter_mut().enumerate() {
+                        for h in 0..hpk {
+                            let hh = gi * hpk + h;
+                            let z = &mz[hh * 2 * m_eff..(hh + 1) * 2 * m_eff];
+                            g.set_far_sums(h, &z[..m_eff], &z[m_eff..], &th[hh * m_eff * hd..(hh + 1) * m_eff * hd], range.len());
+                        }
+                    }
+                    done = true;
+                }
+            }
+            if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                eprintln!("o1 seal of a layer: groups {t_groups:.3} s, far sums {:.3} s ({})", t_seal0.elapsed().as_secs_f64() - t_groups, if done { "card" } else { "host" });
+            }
+            if !done {
+                std::thread::scope(|s| {
+                    for (gi, (g, f)) in groups.iter_mut().zip(&fars).enumerate() {
+                        if let Some(range) = f {
+                            let (k, v) = (&ks[gi][..], &vs[gi][..]);
+                            s.spawn(move || g.replay_far_idx(k, v, &order[range.clone()]));
+                        }
+                    }
+                });
+            }
+        }
         // The states now carry everything decode needs — release the
         // O(context) storage (this is the memory claim, not a cosmetic).
         for h in 0..self.num_kv_heads {

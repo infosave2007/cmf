@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.71] — 2026-11-12
+
+### Changed
+- CUDA hybrids: a turbo file's prompt within the seal's memory, as on the wgpu path
+  ([docs/CUDA.md](docs/CUDA.md#turbo-on-a-16-gb-card)). The first rows are read exact (as many as the card holds
+  beside the weights), then sealed. The rest goes in chunks of 1 024 rows on the GEMMs: a chunk's rows sit after
+  the far field's near rows, the near part of their attention is an exact layer's batched GEMMs, the far part
+  comes from the landmarks (`hy_far_rows`, `hy_softmax_hf`, `hy_attn_out_f`), and the chunk then moves into the
+  window and its evicted rows into the far sums (`hy_far_insert_n`). Before the prompt's last 512 rows the far
+  field is built again over all the rows with the exact rows chosen among all. `CMF_O1_CHUNKS=0` reads the prompt
+  whole first, as 0.8.70 did.
+  - Qwen3.8-27B Turbo on a 16 GB RTX 2000 Ada: the whole run within 15.0 GB from 1 000 to 64 000 tokens (0.8.70
+    did not fit the card). First token at 64 000 tokens 174.6 s against 277.9 over Vulkan; decode 93.8 tok/s in the
+    bench against 26.5; a summary of 100 000 characters 69.8 s and 31.5 tok/s against 114.3 s and 21.3. Facts in
+    60 000 and 100 000 characters: 8 of 8.
+- CUDA turbo: a seal's far sums on the card (`hyb::far_sums`, 8 192 rows a tile). The host builds each group's
+  landmarks, skeletons, sinks and window from the rows by index (`NystromState::seal_gathered`, the same state
+  as the seal over ordered copies, bit for bit) and no longer replays every row; an archive's layers seal four at
+  a time. 32 000 tokens on the 16 GB card: the far field built again in 3.5 s against 8.6 s with the host's replay
+  on 48 CPUs (`CMF_O1_FAR_GPU=0` keeps the sums on the host).
+- CUDA hybrids: less card memory beside the weights. One allocation per repacked matrix and one per plan for all
+  of them (the card rounds each allocation up to 2 MiB: 0.95 GB on 64 layers), one per GDN layer's state, small
+  constants in shared blocks; a prompt chunk's weight expands to f16 in 64 MiB bands; the decode attention's
+  scratch sized by the keys a call reads instead of the context cap. `CMF_CUDA_MEM=1` reports what the card holds.
+
+
 ## [0.8.70] — 2026-11-12
 
 ### Added
