@@ -16,6 +16,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the slot and is served (Qwen3.8-27B Turbo on CUDA, two rounds of a 30 000-character request cut after 3 s:
   answered in 25 and 22 s, no panic).
 
+## [0.8.72] — 2026-11-12
+
+### Changed
+- CUDA: Nemotron Labs Dory's turbo file keeps a fixed ceiling on the card, the prompt included, as the hybrid arm
+  does since 0.8.71 ([docs/CUDA.md](docs/CUDA.md#dory-on-a-16-gb-card)). A long prompt's first 8 192 rows are read
+  exact, then sealed, and their rows go to an archive on the host (RAM, or files under `CMF_O1_SPILL`). The rest goes
+  in chunks of 512 rows on the GEMMs, a full layer's rows after the far field's near rows (`hy_far_rows`,
+  `hy_softmax_hf`, `hy_attn_out_f`, committed into the window by `hy_far_insert_n`), each chunk's rows to the archive.
+  Before the prompt's last 512 rows the far field is built again over all the rows with the exact rows chosen among
+  all; the last ((n − 1) mod 64) + 1 rows take every pass over it on the tensor-core path, up to 16 at a time after
+  the near rows. Every Dory seal builds its landmarks from the rows by index (`NystromState::seal_gathered_rows`)
+  and sums the far rows on the card (`hyb::far_sums`).
+  - `dory-turbo` on a 16 GB RTX 2000 Ada: 3.80 GB from 16 000 to 64 000 tokens, against 0.8.71's 4.99 / 5.72 /
+    7.47 GB at 16 000 / 32 000 / 64 000 (Vulkan 3.52). First token at 16 000 / 32 000 / 64 000 tokens 8.84 / 17.07 /
+    33.41 s against 10.80 / 25.21 / 69.14 s (Vulkan 70.5 / 149.0 / 306.0); decode 80 tok/s as before. Facts in 60 000 and 100 000 characters 8 of 8 each (first token 8.5–9.5 s
+    and 13.1–13.7 s against 9.9–11.4 and 17.2–18.1); real prompts, perplexity and short prompts' texts as in 0.8.71.
+    Past the prefix a long prompt is read as on the wgpu path, so long answers stay close to Vulkan's. Host RAM
+    at 64 000 tokens 8.0 GB against 21.1; with `CMF_O1_SPILL` 1.25 GB of the process's own and 5.45 GB of files.
+  - A prompt chunk's attention takes 128 query rows a GEMM pass (`CMF_DORY_ATT_ROWS`): 412 MiB less at the peak,
+    the same first token.
+- Docs: how to run Dory behind `cortiq serve` ([docs/DORY.md](docs/DORY.md#server), the CUDA guide's Dory section,
+  the model page), checked by `scripts/dory_cuda/serve_check.sh`: a chat and its follow-up, a document of 60 000
+  characters past the seal, a streamed answer, a completion, a tool call, two slots at once.
+
+### Fixed
+- CUDA Dory: a sequence whose build on the card failed (a card without room) stays on the host until the next
+  sequence. Before, every call tried the build again, and one that came through on a later call would have run on
+  rows the card never read.
+
 ## [0.8.71] — 2026-11-12
 
 ### Changed

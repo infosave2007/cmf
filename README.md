@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Dory Turbo with a fixed ceiling on CUDA (0.8.72)
+
+The turbo file of [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) now keeps
+a fixed ceiling on CUDA too, the prompt included: on a 16 GB RTX 2000 Ada the card holds 3.8 GB from 16 000 to
+64 000 tokens, where 0.8.71 reached 7.5 GB. A prompt past its first 8 192 rows is read through the far field in
+chunks, so 64 000 tokens reach the first token in 33 s against 69 in 0.8.71 and 306 over Vulkan. Decode stays at
+80 tok/s, and facts planted in 100 000 characters are found 8 times of 8.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt-file report.txt --greedy --no-think
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1   # OpenAI-compatible API
+```
+
+See [docs/CUDA.md](docs/CUDA.md#dory-on-a-16-gb-card); the server is in [docs/DORY.md](docs/DORY.md#server).
+
 ## Qwen3.8-27B Turbo on a 16 GB card through CUDA (0.8.71)
 
 [Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) now keeps a fixed ceiling on CUDA, the

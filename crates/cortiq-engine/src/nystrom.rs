@@ -785,6 +785,29 @@ impl NystromState {
         d: usize,
         dv: usize,
     ) -> Option<std::ops::Range<usize>> {
+        self.seal_gathered_rows(ks, d, vs, dv, q_trace, stride, nh, h0, order, t, d, dv)
+    }
+
+    /// `seal_gathered` over rows `ks_row` (`vs_row`) values apart: a group's
+    /// keys inside rows that hold every KV head (`[t][nkv][d]` from the
+    /// group's first value, Dory's slots and archive) as well as its own
+    /// `[t][d]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_gathered_rows(
+        &mut self,
+        ks: &[f32],
+        ks_row: usize,
+        vs: &[f32],
+        vs_row: usize,
+        q_trace: &[f32],
+        stride: usize,
+        nh: usize,
+        h0: usize,
+        order: &[u32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) -> Option<std::ops::Range<usize>> {
         let (sink, w) = (self.group.sink, self.group.w);
         let exact_only = o1_deferred_boundary(self.group.base_w, sink).map(|b| t < b).unwrap_or(true);
         let stride = stride.max(1);
@@ -793,8 +816,11 @@ impl NystromState {
             || exact_only
             || t <= sink + w
             || order.len() != t
-            || ks.len() < t * d
-            || vs.len() < t * dv
+            || ks_row < d
+            || vs_row < dv
+            || ks.len() < (t - 1) * ks_row + d
+            || vs.len() < (t - 1) * vs_row + dv
+            || order.iter().any(|&r| r as usize >= t)
             || q_trace.len() < t.div_ceil(stride) * nh * d
             || h0 + self.heads.len() > nh
         {
@@ -806,8 +832,8 @@ impl NystromState {
         g.scale = 1.0 / (d as f32).sqrt();
         g.exact_only = false;
         g.sink_len = sink;
-        let kr = |j: usize| -> &[f32] { let r = order[j] as usize; &ks[r * d..(r + 1) * d] };
-        let vr = |j: usize| -> &[f32] { let r = order[j] as usize; &vs[r * dv..(r + 1) * dv] };
+        let kr = |j: usize| -> &[f32] { let r = order[j] as usize; &ks[r * ks_row..r * ks_row + d] };
+        let vr = |j: usize| -> &[f32] { let r = order[j] as usize; &vs[r * vs_row..r * vs_row + dv] };
         g.sink_k = (0..sink).flat_map(kr).copied().collect();
         g.sink_v = (0..sink).flat_map(vr).copied().collect();
         g.win_k = vec![0.0; w * d];
@@ -836,11 +862,18 @@ impl NystromState {
 
     /// `replay_far` over rows given by index (`ks[idx[j]]`).
     pub fn replay_far_idx(&mut self, ks: &[f32], vs: &[f32], idx: &[u32]) {
+        let (d, dv) = (self.group.d, self.group.dv);
+        self.replay_far_idx_rows(ks, d, vs, dv, idx);
+    }
+
+    /// `replay_far_idx` over rows `ks_row` (`vs_row`) values apart (see
+    /// `seal_gathered_rows`).
+    pub fn replay_far_idx_rows(&mut self, ks: &[f32], ks_row: usize, vs: &[f32], vs_row: usize, idx: &[u32]) {
         let (m_eff, d, dv, scale) = (self.group.m_eff, self.group.d, self.group.dv, self.group.scale);
         for &r in idx {
             let r = r as usize;
             for h in self.heads.iter_mut() {
-                h.far_absorb(m_eff, d, dv, scale, &ks[r * d..(r + 1) * d], &vs[r * dv..(r + 1) * dv]);
+                h.far_absorb(m_eff, d, dv, scale, &ks[r * ks_row..r * ks_row + d], &vs[r * vs_row..r * vs_row + dv]);
             }
         }
     }

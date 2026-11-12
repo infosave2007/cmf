@@ -8,7 +8,8 @@ SPEC: {"name": "cuda", "ctx": [1000, ...], "labels": ["1 000", ...],
        "text": {"en": {"t": ..., "sub": ..., "first": ..., "decode": ..., "mem": ..., "ctx": ..., "res": ...,
                        "cuda": "<series name>", ...}, "ru": {...}, "zh": {...}},
        "mem_max": 24, "decode_max": 250}
-A value of null is not drawn (a run that did not finish)."""
+A value of null is not drawn (a run that did not finish). A series with "dash": true is drawn dashed with
+small dots: list it after the series it may coincide with, and both show."""
 import json
 import math
 import os
@@ -74,11 +75,14 @@ def fig(spec, lang):
         placed = []
         for se in series:
             c = COLORS[se["color"]]
+            # a dashed series (an earlier version, say) has small dots, so a
+            # line it coincides with shows under it
+            dashed = se.get("dash")
             pts = [(X(i), Y(v)) for i, v in enumerate(se[key]) if v is not None]
             if len(pts) > 1:
-                s.path("M " + " L ".join(f"{p[0]:.1f} {p[1]:.1f}" for p in pts), c, 3)
+                s.path("M " + " L ".join(f"{p[0]:.1f} {p[1]:.1f}" for p in pts), c, 3, dash="9 9" if dashed else None)
             for p in pts:
-                s.dot(p[0], p[1], 7, c)
+                s.dot(p[0], p[1], 4 if dashed else 7, c)
             last = [(i, v) for i, v in enumerate(se[key]) if v is not None][-1]
             d = 1 if key == "mem" or (key == "first" and last[1] < 100) else 0
             # a line that stops early is labelled under its last point, where

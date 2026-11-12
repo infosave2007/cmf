@@ -2717,12 +2717,15 @@ pub(super) fn batch(
 /// A sealed layer's far sums on the card (`kv_cache`'s seal without the
 /// host's replay): `hy_far_insert_n` over the far rows a tile at a time, the
 /// running maxima, masses and numerators staying on the card between tiles.
+/// Row r of group g is `ks[g][r * stride..][..hd]`: `stride` is `hd` for a
+/// group's own rows, the whole row's width for rows that hold every KV head
+/// (Dory's, `ks[g]` then starting at the group's first value).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn far_sums(c: &Ctx, nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]]) -> Res<(Vec<f32>, Vec<f32>)> {
+pub(super) fn far_sums(c: &Ctx, nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: &[f32], idx: &[u32], ks: &[&[f32]], vs: &[&[f32]], stride: usize) -> Res<(Vec<f32>, Vec<f32>)> {
     let nh = nkv * hpk;
     let n = idx.len();
     let top = idx.iter().max().map_or(0, |&r| r as usize + 1);
-    if m == 0 || m > 64 || ks.len() != nkv || vs.len() != nkv || qt.len() != nh * m * hd || ks.iter().chain(vs).any(|x| x.len() < top * hd) {
+    if m == 0 || m > 64 || stride < hd || ks.len() != nkv || vs.len() != nkv || qt.len() != nh * m * hd || ks.iter().chain(vs).any(|x| top > 0 && x.len() < (top - 1) * stride + hd) {
         return Err("far sums: unexpected geometry".into());
     }
     let t0 = std::time::Instant::now();
@@ -2765,7 +2768,7 @@ pub(super) fn far_sums(c: &Ctx, nkv: usize, hpk: usize, hd: usize, m: usize, sca
             for (ti, (kc, vc)) in kh[..nr * row].chunks_mut(per * row).zip(vh[..nr * row].chunks_mut(per * row)).enumerate() {
                 sc.spawn(move || {
                     for (j, (kd, vd)) in kc.chunks_mut(row).zip(vc.chunks_mut(row)).enumerate() {
-                        let at = idx[r0 + ti * per + j] as usize * hd;
+                        let at = idx[r0 + ti * per + j] as usize * stride;
                         for g in 0..nkv {
                             let (ksrc, vsrc) = (&ks[g][at..at + hd], &vs[g][at..at + hd]);
                             for d in 0..hd {
@@ -3618,7 +3621,7 @@ mod tests {
         }
         let (kr, vr): (Vec<&[f32]>, Vec<&[f32]>) = (ks.iter().map(|k| &k[..]).collect(), vs.iter().map(|v| &v[..]).collect());
         let scale = 1.0 / (hd as f32).sqrt();
-        let (mz, th) = far_sums(c, nkv, hpk, hd, m, scale, &qt, &order[range], &kr, &vr).unwrap();
+        let (mz, th) = far_sums(c, nkv, hpk, hd, m, scale, &qt, &order[range], &kr, &vr, hd).unwrap();
         let mut worst = 0f32;
         for (g, st) in host.iter().enumerate() {
             let view = st.device_view();

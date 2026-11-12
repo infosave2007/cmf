@@ -433,8 +433,14 @@ on the hybrid arm's kernels (`gpu_cuda/hyb/dory.rs`, `dory.cu`), q4tp files only
 
 ```bash
 CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "..." --no-think
-CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+# in another shell, once it listens
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "dory", "messages": [{"role": "user", "content": "Hello"}], "enable_thinking": false, "stream": true}'
 ```
+
+The server's endpoints and settings are in [The server](#the-server) and in
+[docs/DORY.md](DORY.md#server); `"enable_thinking": false` asks Dory for a direct answer.
 
 - **A token**: every matrix through the arm's tensor-core matvec, eight warps a tile and a tile a block
   (Dory's matrices are 2560 to 7168 columns wide). Gate and up are one pair with their scales in the q4tp
@@ -445,13 +451,28 @@ CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
 - **The router** of a turbo file decides after the first pass: the card runs the input block and that
   pass, the host scores the state (10 KB), and the card runs the output block, or the second pass first.
 - **A prompt** goes by GEMMs, 512 rows at a time: each weight expanded to f16 once a chunk, a full layer's
-  attention as two batched GEMMs around a masked softmax, a sliding layer's the same over its window
-  unwrapped from the ring. On a turbo file these rows take one pass. The last ((n − 1) mod 64) + 1 rows
-  take every pass on the tensor-core path, as the wgpu path's last chunk does, so the text is the same.
-- **The seal** of a turbo file at the prompt's end: the full layers' rows come to the host, the rows the far
-  field would lose are chosen and kept exact (`pick_exact_rows`), the landmarks are built (`far_states`, a
-  thread a layer) and go up as the arm's far fields. Past it a token reads its exact rows (sinks, the
-  chosen ones, the window) and 32 landmarks a head.
+  attention as two batched GEMMs around a masked softmax (128 query rows a pass, `CMF_DORY_ATT_ROWS`), a
+  sliding layer's the same over its window unwrapped from the ring. On a turbo file these rows take one
+  pass. The last ((n − 1) mod 64) + 1 rows take every pass on the tensor-core path, as the wgpu path's last
+  chunk does.
+- **The seal** of a turbo file: the full layers' rows come to the host and leave the card, the rows the far
+  field would lose are chosen and kept exact (`pick_exact_rows`), and the far fields go up as the arm's. The
+  host builds each KV head's landmarks, sinks and window from the rows by index (`seal_gathered_rows`), the
+  card sums the far rows (`hy_far_insert_n`). Past it a token reads its exact rows (sinks, the chosen ones,
+  the window) and 32 landmarks a head.
+- **A long turbo prompt** stays within a fixed ceiling, as on the wgpu path and the hybrid arm:
+  1. The first 8 192 rows go exact (fewer on a card without room for them; `CMF_O1_PREFIX_MAX` by hand), then
+     seal. Their rows open an archive on the host (RAM, or files under `CMF_O1_SPILL`).
+  2. The rest goes in chunks of 512 rows on the GEMMs. A full layer's rows sit after the far field's near
+     rows: the near part of their attention is an exact layer's batched GEMMs, the far part comes from the
+     landmarks a row at a time (`hy_far_rows`), and a softmax takes both (`hy_softmax_hf`, `hy_attn_out_f`).
+     The chunk then moves into the window, and the rows it pushes out go into the far sums. Each chunk's rows
+     go to the archive.
+  3. Before the prompt's last 512 rows the far field is built again over all the rows, the exact rows chosen
+     among all of them. The last rows read it: the last ((n − 1) mod 64) + 1 take every pass, up to 16 at a
+     time after the near rows, as a verify window does on the hybrid arm.
+
+  A prompt that ends within 512 rows of the prefix is read exact and sealed at its end.
 
 ### Dory on an RTX 3090
 
@@ -480,12 +501,50 @@ Release build, the same card and build for both columns; Vulkan is the wgpu path
   files of 128 tokens; the prompt's last logits agree with Vulkan's within a KL of 4e-6 to 7e-4.
 - Facts planted in 60 000 characters of Wikipedia (a pass key, an access code, a password, a room number):
   8 of 8, first token 5.7–6.4 s, decode 163–172 tok/s past the seal.
-- The far field holds 257 MB of K/V past the seal (Vulkan 502 MB). The card's peak while a long prompt is
-  read is higher on CUDA: `dory-turbo` 3.7 GB at 1 000 tokens, 5.2 at 16 000, 7.7 at 64 000 (Vulkan 2.9, 3.6,
-  3.6): the full layers' rows stay on the card until the seal, and the prompt's GEMMs take scratch.
+- The far field holds 257 MB of K/V past the seal (Vulkan 502 MB). In 0.8.70 and 0.8.71 the card's peak
+  grew while a long prompt was read, `dory-turbo` 3.7 GB at 1 000 tokens, 5.2 at 16 000, 7.7 at 64 000 (Vulkan
+  2.9, 3.6, 3.6): the prompt was read whole before the seal. It stays flat now, see
+  [Dory on a 16 GB card](#dory-on-a-16-gb-card).
 - Facts in 100 000 characters: 8 of 8 as well, first token 9.9–10.5 s. Wikitext-2 perplexity, 12 windows of
   512 tokens read by `cortiq ppl`: 13.689 against Vulkan's 13.683 (`dory-turbo`), 13.696 against 13.696
   (`dory-q4tp-v2`).
+
+### Dory on a 16 GB card
+
+`dory-turbo` on an RTX 2000 Ada (16 GB), release builds: this one, 0.8.71 (the prompt read whole, then
+sealed) and the wgpu path (Vulkan) on the same card, taking turns. `cortiq bench --core`, 60 tokens after a
+prompt of that length; the peak is the card's over the whole run, in GB of 1024 MiB
+(`scripts/dory_cuda/ceiling.sh`).
+
+| prompt, tokens | first token, s (**CUDA**) | 0.8.71 | Vulkan | decode, tok/s (**CUDA**) | 0.8.71 | Vulkan | peak, GB (**CUDA**) | 0.8.71 | Vulkan |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | **0.51** | 0.51 | 1.84 | **84.0** | 84.0 | 63.9 | **3.44** | 3.49 | 2.92 |
+| 4 000 | **1.72** | 1.73 | 8.52 | **79.0** | 79.0 | 56.0 | **3.49** | 3.66 | 2.93 |
+| 16 000 | **8.84** | 10.80 | 70.5 | **80.7** | 80.3 | 55.9 | **3.80** | 4.99 | 3.52 |
+| 32 000 | **17.07** | 25.21 | 149.0 | **80.2** | 80.1 | 56.1 | **3.80** | 5.72 | 3.52 |
+| 64 000 | **33.41** | 69.14 | 306.0 | **80.2** | 80.3 | 53.9 | **3.80** | 7.47 | 3.52 |
+
+- From 16 000 tokens on the card holds 3.80 GB whatever the prompt's length: the peak is the exact prefix's
+  last chunk, with the nine full layers' 8 192 rows on the card (288 MiB of K/V and 144 MiB of queries) and the
+  attention's score buffers. The rows leave the card before the far fields go up. Past the prefix a 512-row
+  chunk costs the same at any position, so the first token at 64 000 tokens comes in half 0.8.71's time.
+- 12 real prompts of 200 tokens: 75.5 tok/s on CUDA, 58.9 over Vulkan, 99.1 % of the text the same as
+  Vulkan's, as in 0.8.71 (a short prompt takes the same path as before). Wikitext-2 perplexity, 12 windows of
+  512 tokens: 13.689 (Vulkan 13.683), as before.
+- Facts planted in 60 000 and 100 000 characters: 8 of 8 each, first token 8.5–9.5 s and 13.1–13.7 s (0.8.71
+  9.9–11.4 and 17.2–18.1 s). A summary of 100 000 characters (about 25 000 tokens): first token 14.2 s, 19.5 in
+  0.8.71, 115.5 over Vulkan, then 80 tok/s.
+- Past the prefix the prompt is read through the far field, as the wgpu path reads it, where 0.8.71 read
+  every row exact. A long answer is therefore closer to Vulkan's: on that summary the two share their first 221
+  characters and go on nearly word for word, while 0.8.71 shares 76 and words the summary its own way.
+- The host holds the archive while the prompt is read, 92 KB a row: at 64 000 tokens the process peaks at
+  8.0 GB of RAM, against 21.1 GB in 0.8.71. With `CMF_O1_SPILL=DIR` the rows wait in files (5.45 GB, removed
+  once the far field is built again) and the process keeps 1.25 GB of its own memory beside the mapped file;
+  the first token and the text are the same.
+- `cortiq serve` with a document of 60 000 characters (15 277 tokens): read in 8.3–9.4 s and answered at
+  79 tok/s, the card at 3.77 GB at most over the server's whole run. Over Vulkan: 66.4 s, 55 tok/s, 4.34 GB,
+  and an answer that begins the same (`scripts/dory_cuda/serve_check.sh`; a follow-up turn, a tool call, a
+  streamed answer and two slots at once too).
 
 ## Options
 
@@ -501,7 +560,7 @@ Release build, the same card and build for both columns; Vulkan is the wgpu path
 | `CMF_CUDA_CACHE=DIR` | where compiled PTX is kept, `~/.cache/cortiq/cuda` by default |
 | `CMF_GRAPH_SPEC=0` | a hybrid without drafts |
 | `CMF_O1_SPEC=0` | a turbo file without drafts past the seal |
-| `CMF_O1_CHUNKS=0` | the hybrid arm reads a turbo prompt whole, then seals (0.8.70's way) |
+| `CMF_O1_CHUNKS=0` | the hybrid arm and Dory read a turbo prompt whole, then seal (0.8.70's way) |
 | `CMF_O1_FAR_GPU=0` | a seal's far sums on the host |
 | `CMF_O1_PREFIX_MAX=N` | the first `N` rows of a long prompt exact, instead of the choice for the card |
 | `CMF_CUDA_MEM=1` | what the card holds after each plan, prompt chunk and 256th token |
@@ -514,16 +573,16 @@ Release build, the same card and build for both columns; Vulkan is the wgpu path
 | `CMF_DORY_CUDA=0` | Dory on the CPU under `CMF_GPU=cuda` |
 | `CMF_DORY_BIG=0` | a Dory prompt by the tensor-core matvec, 16 rows at a time |
 | `CMF_DORY_KT=N`, `CMF_DORY_KT_AT=P` | kernel times of Dory's N-th token, of its prompt chunk at position P |
+| `CMF_DORY_ATT_ROWS=N` | query rows of a Dory prompt chunk per attention GEMM pass, 128 by default (512: the 0.8.71 way) |
 
 ## Limits
 
 - Four architecture classes are covered: dense Spark-class stacks (measured on an A40), Qwen3.5-family
   hybrids and Dory (measured on an RTX 3090), and the Fast Code stack. Dory's q8_2f file runs on the CPU. Other MoE stacks and Gemma-style stacks run on
   the CPU under `CMF_GPU=cuda`, not on wgpu.
-- The dense arm and Dory read a turbo prompt whole: their K/V rows stay on the card until the seal (the
-  dense arm 8.2 GB at 64 000 tokens, 4.5 GB on the wgpu path; Dory's nine full layers 2.4 GB). The hybrid
-  arm's prompt stays within the seal's memory. A new turn of a sealed conversation reads the conversation
-  again, as on the wgpu path.
+- The dense arm reads a turbo prompt whole: its K/V rows stay on the card until the seal (8.2 GB at 64 000
+  tokens, 4.5 GB on the wgpu path). The hybrid arm's and Dory's prompts stay within the seal's memory. A new
+  turn of a sealed conversation reads the conversation again, as on the wgpu path.
 - Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm.
 - The toolkit libraries must be on the loader's path; the bindings are for CUDA 12.x.
 - Decode is bound by its own arithmetic, about 350 GB/s of weights on an A40 against 500 for a kernel
