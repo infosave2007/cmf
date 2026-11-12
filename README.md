@@ -123,7 +123,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-## MiniMax-H3-Image, text to image and image editing (unreleased)
+## MiniMax-H3-Image, text to image and image editing (0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) generates and edits images of 4 to 16
 megapixels in six steps. One 24.6 GB file holds the 20B diffusion transformer and the Qwen3-VL prompt encoder

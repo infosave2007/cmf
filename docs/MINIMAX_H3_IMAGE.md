@@ -9,7 +9,7 @@ image VAE (8 bits). On an NVIDIA card the whole pipeline runs through the native
 it runs through Vulkan or Metal. A ceiling on the card's memory lets it run on a small card.
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 # text to image
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 # image editing: <Picture 1> in the prompt is the file given with --image

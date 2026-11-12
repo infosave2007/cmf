@@ -60,7 +60,7 @@ Image editing. Left: the picture given with `--image`. Right: the result.
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/MiniMax-H3-Image-cmf minimax-h3-image-q4tp.cmf --local-dir .
 # text to image
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
@@ -76,13 +76,13 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 |---|---|
 | card | CUDA: NVIDIA with its driver, and CUDA 12.x libraries `libnvrtc.so.12` and `libcublas.so.12` on the loader's path. Vulkan: any card |
 | memory | 16 GB of the card without a ceiling; from 4 GB with `CMF_GPU_VRAM_MB`. About 28 GB of RAM or page cache for the file |
-| engine | `cortiq` built from the branch above (stable Rust; nothing is linked against CUDA at build time); the 0.8.72 release does not include the model |
+| engine | `cortiq` 0.8.73 or later; for CUDA built with the `cuda` feature (stable Rust, nothing is linked against CUDA at build time; the prebuilt release binaries do not include that backend) |
 
 `--width` and `--height` are multiples of 32 and default to 2048 x 2048. The model works from about 4
 megapixels to 20; a smaller size is generated on a 2048 x 2048-area canvas and resized back (`--min-area 1024`
 turns that off). There is no guidance and no negative prompt. The model expects a detailed English description
 of the whole image; its authors expand a short request with a separate model, which this file does not
-include. Full guide: [docs/MINIMAX_H3_IMAGE.md](https://github.com/infosave2007/cmf/blob/h3-image/docs/MINIMAX_H3_IMAGE.md).
+include. Full guide: [docs/MINIMAX_H3_IMAGE.md](https://github.com/infosave2007/cmf/blob/master/docs/MINIMAX_H3_IMAGE.md).
 
 ## Speed
 
@@ -158,7 +158,7 @@ Apache-2.0.
 Примеры генерации и правки — [в начале страницы](#examples).
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/MiniMax-H3-Image-cmf minimax-h3-image-q4tp.cmf --local-dir .
 # текст в картинку
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
@@ -175,7 +175,7 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 умолчанию 2048 x 2048. Рабочий диапазон модели от 4 до 20 мегапикселей; меньший размер генерируется на холсте
 площадью 2048 x 2048 и уменьшается (`--min-area 1024` это отключает). Guidance и негативного промпта нет.
 Модель ждёт подробное английское описание всей картинки; расширителя промпта в файле нет. Полное руководство:
-[docs/MINIMAX_H3_IMAGE.ru.md](https://github.com/infosave2007/cmf/blob/h3-image/docs/MINIMAX_H3_IMAGE.ru.md).
+[docs/MINIMAX_H3_IMAGE.ru.md](https://github.com/infosave2007/cmf/blob/master/docs/MINIMAX_H3_IMAGE.ru.md).
 
 Скорость, NVIDIA RTX 2000 Ada, 16 GB, одна картинка, сид 42, одиночные прогоны (2048 x 2048 — медиана трёх):
 
@@ -219,7 +219,7 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 [页面开头](#examples)。
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/MiniMax-H3-Image-cmf minimax-h3-image-q4tp.cmf --local-dir .
 # 文生图
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
@@ -235,7 +235,7 @@ CUDA 需要 NVIDIA 驱动和 CUDA 12.x 库（`libnvrtc.so.12`、`libcublas.so.12
 设置 `CMF_GPU_VRAM_MB` 后 4 GB 即可。`--width` 和 `--height` 是 32 的倍数，默认 2048 x 2048。模型的工作
 范围是 4 到 20 百万像素；更小的尺寸会在面积为 2048 x 2048 的画布上生成再缩小（`--min-area 1024` 关闭此
 行为）。没有 guidance，也没有负面提示词。模型需要对整张图片的详细英文描述；文件不包含提示词扩展器。
-完整指南：[docs/MINIMAX_H3_IMAGE.zh.md](https://github.com/infosave2007/cmf/blob/h3-image/docs/MINIMAX_H3_IMAGE.zh.md)。
+完整指南：[docs/MINIMAX_H3_IMAGE.zh.md](https://github.com/infosave2007/cmf/blob/master/docs/MINIMAX_H3_IMAGE.zh.md)。
 
 速度，NVIDIA RTX 2000 Ada, 16 GB，一张图片，种子 42，单次运行（2048 x 2048 为三次的中位数）：
 

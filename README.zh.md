@@ -112,7 +112,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-## MiniMax-H3-Image:文生图与图片编辑(未发布)
+## MiniMax-H3-Image:文生图与图片编辑(0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) 用六步生成和编辑 4 到 16 百万像素的
 图片。一个 24.6 GB 的文件里有 4 位的 200 亿参数扩散 Transformer 和 Qwen3-VL 提示词编码器,以及 8 位的 VAE。

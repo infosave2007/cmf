@@ -123,7 +123,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
-## MiniMax-H3-Image: генерация и правка изображений (не выпущено)
+## MiniMax-H3-Image: генерация и правка изображений (0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) генерирует и редактирует изображения
 от 4 до 16 мегапикселей за шесть шагов. В одном файле на 24.6 ГБ лежат диффузионный трансформер на 20 млрд

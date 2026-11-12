@@ -8,7 +8,7 @@
 后端；在其他 GPU 上走 Vulkan 或 Metal。显存上限让它可以在小显卡上运行。
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 # 文生图
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 # 图片编辑：提示词里的 <Picture 1> 就是 --image 给出的文件

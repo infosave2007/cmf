@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.73] — 2026-11-12
+
 ### Added
 - MiniMax-H3-Image, text to image and image editing ([docs/MINIMAX_H3_IMAGE.md](docs/MINIMAX_H3_IMAGE.md),
   [the file](https://huggingface.co/infosave/MiniMax-H3-Image-cmf)). `cortiq imagine` runs a container of the

@@ -9,7 +9,7 @@
 Потолок памяти карты позволяет запускать модель на маленькой карте.
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch h3-image cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 # текст в картинку
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 # правка: <Picture 1> в промпте — файл из --image
