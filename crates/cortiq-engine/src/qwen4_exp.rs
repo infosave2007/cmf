@@ -3050,10 +3050,18 @@ fn ple_prefetch_threads() -> usize {
 /// of rows asked for.
 #[cfg(feature = "gpu")]
 fn ple_prefetch(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32]) -> usize {
+    ple_prefetch_min(layers, cfg, history, ids, 64)
+}
+
+/// `ple_prefetch` for chunks of at least `min_ids` tokens. A verify window (4 tokens) takes it too: its rows sit
+/// on ~100 pages, which the pool's few workers otherwise fault in one after another inside the round (14-34 ms
+/// on a host whose page cache does not hold the table); advised together they arrive in about one disk latency.
+#[cfg(feature = "gpu")]
+fn ple_prefetch_min(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32], min_ids: usize) -> usize {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         let threads = ple_prefetch_threads();
-        if threads == 0 || ids.len() < 64 {
+        if threads == 0 || ids.len() < min_ids.max(1) {
             return 0;
         }
         let t0 = std::time::Instant::now();
@@ -3133,7 +3141,7 @@ fn ple_prefetch(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32]) -> us
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
-        let _ = (layers, cfg, history, ids);
+        let _ = (layers, cfg, history, ids, min_ids);
         0
     }
 }
@@ -4328,6 +4336,10 @@ fn cuda_spec_round(
     let this_round = ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ncu_on = ncu_round == Some(this_round);
     let ids: Vec<u32> = std::iter::once(all_ids[next_pos]).chain(drafts.iter().copied()).collect();
+    if !std::env::var_os("CMF_QWEN_NO_PLE").is_some() && std::env::var("CMF_QWEN_WINDOW_PREFETCH").map(|v| v.trim() != "0").unwrap_or(true) {
+        // the window's n-gram rows are known now: their pages are asked for before the pass needs them
+        ple_prefetch_min(layers, cfg, &state.token_history, &ids, 1);
+    }
     let mut dev = state.cuda.take()?;
     let h = cfg.hidden;
     let no_ple = std::env::var_os("CMF_QWEN_NO_PLE").is_some();
