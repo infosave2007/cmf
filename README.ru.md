@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## MiniMax-H3-Image: генерация и правка изображений (не выпущено)
+
+[MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) генерирует и редактирует изображения
+от 4 до 16 мегапикселей за шесть шагов. В одном файле на 24.6 ГБ лежат диффузионный трансформер на 20 млрд
+параметров и энкодер промпта Qwen3-VL в 4 битах и VAE в 8. На RTX 2000 Ada с 16 ГБ бэкенд CUDA рисует
+2048×2048 за 50,3 с, а под потолком памяти карты 4 ГБ за 60,2 с, ту же картинку:
+
+```sh
+CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
+CMF_GPU=cuda CMF_GPU_VRAM_MB=4000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+```
+
+См. [руководство](docs/MINIMAX_H3_IMAGE.ru.md). Модель распространяется по лицензии MiniMax-H3-Image
+Community License.
+
 ## Dory Turbo с постоянным потолком на CUDA (0.8.72)
 
 Турбо-файл [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) теперь держит

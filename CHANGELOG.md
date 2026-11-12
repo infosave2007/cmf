@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- MiniMax-H3-Image, text to image and image editing ([docs/MINIMAX_H3_IMAGE.md](docs/MINIMAX_H3_IMAGE.md),
+  [the file](https://huggingface.co/infosave/MiniMax-H3-Image-cmf)). `cortiq imagine` runs a container of the
+  arch `minimax-h3-image`: six steps on the model's sigma grid through its bank of per-step output heads, no
+  guidance. `--image` (repeatable) makes the run an edit: each picture goes to the prompt encoder through the
+  Qwen3-VL vision tower and to the transformer as a VAE latent. `--min-area` (default 4194304) generates a
+  smaller size on a larger canvas and resizes it back, as the reference server does. `animate-pack --dit` reads
+  the image checkpoint, `--image-vae` the image VAE, `--drop` leaves a carried component out.
+  - CUDA: the transformer, the prompt encoder and the VAE run as chains on the card (`gpu_cuda/h3.rs`): weights
+    in their codec, a dense f16 plane only for the product, cuBLAS products on the tensor cores, and an attention
+    kernel that materializes nothing (`h3_flash.cu`: two `mma.sync` products with the online softmax between
+    them, keys and values stored in the order the lanes read them).
+  - A ceiling on the card's memory (`CMF_GPU_VRAM_MB`): the blocks that do not fit pass through the card every
+    step. RTX 2000 Ada 16 GB, 2048×2048: 50.3 s without a ceiling at 12.7 GB of the card, 53.5 s under 8 GB,
+    54.4 s under 6 GB, 60.2 s under 4 GB (3.7 GB used), the same picture (49.6 dB PSNR). 1024×1024 19.0 s,
+    4096×4096 283.7 s, an edit at 2048×2048 with one 1024×1024 picture 80.8 s. Over Vulkan the pipeline uses the
+    per-operation kernels of the MiniMax-H3 video path: 1024×1024 in 88.7 s on the same card.
+  - Known limit: an edit of a densely detailed, high-contrast picture comes out over-processed at 2048×2048 and
+    clean at 1024×1024; an 8-bit encoder, an 8-bit transformer and the per-operation f32 path give the same
+    result, the cause is not found.
+
+### Changed
+- wgpu, the fused four-bit FFN of the MiniMax-H3 stacks: the second product runs on the matrix units by default
+  (it was the scalar tile kernel unless `CMF_FFN_FC2_COOP=1`). RTX 2000 Ada 16 GB, MiniMax-H3-Image 1024×1024
+  over Vulkan: 88.7 s and 10.99 s a step against 97.8 s and 12.47 s. `CMF_FFN_FC2_COOP=0` keeps the scalar
+  kernel.
+
 ### Fixed
 - `cortiq serve`: a client that hangs up in the middle of a request no longer breaks the server. A generation's
   `spawn_blocking` closure captured only the slot guard's pipeline and card (edition 2021 captures fields), so
