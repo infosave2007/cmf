@@ -8,6 +8,7 @@ import card_figures as cf
 from card_figures import Svg, SURF, INK, INK2, MUTE, LINE, BLUE, ORANGE, AQUA, GREY, TINT, TINT2, head
 
 score_file, f0, f1, cf.out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+# SCORES.bin "-": the comparison and the ceiling only (the exact-rows figure needs the scores)
 os.makedirs(cf.out, exist_ok=True)
 
 # Measured on an RTX 5090, Vulkan: `cortiq bench --core --tokens 60 --ignore-eos`.
@@ -16,13 +17,15 @@ LABELS = ["1 000", "4 000", "16 000", "32 000", "64 000"]
 # Memory: nvidia-smi's peak in MiB / 1024, the unit a card's label uses.
 STD = dict(dec=[105.4, 103.8, 87.3, 70.9, 51.3], first=[2.20, 8.78, 42.27, 107.06, 316.25], vram=[14.5, 14.9, 16.5, 18.5, 22.8])
 TUR = dict(dec=[104.8, 103.9, 92.3, 91.0, 92.2], first=[2.16, 8.82, 47.01, 92.05, 177.47], vram=[14.4, 14.8, 15.5, 15.7, 15.7])
+# The turbo file through CUDA on a 16 GB RTX 2000 Ada, cortiq 0.8.71 (`scripts/q27cuda/ceiling/final.sh`).
+CUD = dict(dec=[87.3, 86.9, 94.4, 93.5, 93.8], first=[2.55, 9.71, 43.18, 86.20, 174.58], vram=[14.6, 14.9, 15.0, 15.0, 15.0])
 
 T = {
     "en": {
         "t": "Longer prompts cost no more on the card",
-        "sub": "Qwen3.8-27B q4tp, RTX 5090, Vulkan. Prompts below 8192 rows run exact in both files.",
+        "sub": "Qwen3.8-27B q4tp: Vulkan on an RTX 5090, CUDA on a 16 GB RTX 2000 Ada. Prompts below 8192 rows run exact.",
         "dec": "Decode, tok/s", "first": "First token, s", "vram": "Peak device memory, GB", "ctx": "prompt, tokens",
-        "std": "Standard", "tur": "Turbo", "card": "16 GB card",
+        "std": "Standard, Vulkan, RTX 5090", "tur": "Turbo, Vulkan, RTX 5090", "cud": "Turbo, CUDA, 16 GB RTX 2000 Ada", "card": "16 GB card",
         "c_t": "A long prompt on a small card",
         "c_sub": "Device memory stays where the first part of the prompt left it. The rest of the rows leave the card as they are read.",
         "a": "first 8192 rows", "a2": "exact, on the card (4096 on a 16 GB card)",
@@ -32,7 +35,7 @@ T = {
         "s2": "Build", "s2t": "The far field is built anew from the stored rows, one layer at a time: 32 landmarks per head.",
         "s3": "Keep exact", "s3t": "248 chosen rows, the first 4 and the last 1800 stay exact on the card.",
         "s4": "Decode", "s4t": "A token reads the exact rows and the far field. Draft tokens are verified together, so a token costs less.",
-        "res": "15.7 GB of device memory at 32 000 and at 64 000 tokens, 15.0 GB on a 16 GB card; 22.8 GB on the standard file at 64 000",
+        "res": "15.7 GB at 32 000 and 64 000 tokens; 15.0 GB on a 16 GB card through CUDA and Vulkan; the standard file 22.8 GB",
         "x_t": "Passwords and codes stay exact",
         "x_sub": "Each row is scored by what the layers do with it, with no word lists.",
         "x_y": "row’s score", "x_x": "prompt rows read before the choice", "x_fact": "“Remember this pass key.”",
@@ -44,9 +47,9 @@ T = {
     },
     "ru": {
         "t": "Длинный промпт не занимает больше памяти карты",
-        "sub": "Qwen3.8-27B q4tp, RTX 5090, Vulkan. Промпты короче 8192 строк в обоих файлах идут точно.",
+        "sub": "Qwen3.8-27B q4tp: Vulkan на RTX 5090, CUDA на RTX 2000 Ada с 16 ГБ. Промпты короче 8192 строк идут точно.",
         "dec": "Декод, ток/с", "first": "Первый токен, с", "vram": "Пик памяти карты, ГБ", "ctx": "промпт, токенов",
-        "std": "Обычный", "tur": "Турбо", "card": "карта 16 ГБ",
+        "std": "Обычный, Vulkan, RTX 5090", "tur": "Турбо, Vulkan, RTX 5090", "cud": "Турбо, CUDA, RTX 2000 Ada 16 ГБ", "card": "карта 16 ГБ",
         "c_t": "Длинный промпт на маленькой карте",
         "c_sub": "Память карты остаётся там, где её оставила первая часть промпта. Остальные строки уходят с карты по мере чтения.",
         "a": "первые 8192 строки", "a2": "точно, на карте (4096 на карте 16 ГБ)",
@@ -56,7 +59,7 @@ T = {
         "s2": "Сборка", "s2t": "Дальнее поле строится заново из сохранённых строк, слой за слоем: 32 опорные точки на голову.",
         "s3": "Точные", "s3t": "248 выбранных строк, первые 4 и последние 1800 остаются на карте точными.",
         "s4": "Декод", "s4t": "Токен читает точные строки и дальнее поле. Черновики проверяются вместе, и токен обходится дешевле.",
-        "res": "15,7 ГБ памяти карты на 32 000 и на 64 000 токенов, 15,0 ГБ на карте 16 ГБ; у обычного файла 22,8 ГБ на 64 000",
+        "res": "15,7 ГБ на 32 000 и 64 000 токенов; 15,0 ГБ на карте 16 ГБ через CUDA и Vulkan; у обычного файла 22,8 ГБ",
         "x_t": "Пароли и коды остаются точными",
         "x_sub": "Строка получает оценку по тому, что с ней делают слои. Списков слов нет.",
         "x_y": "оценка строки", "x_x": "строки промпта, прочитанные до выбора", "x_fact": "«Запомни этот ключ.»",
@@ -68,9 +71,9 @@ T = {
     },
     "zh": {
         "t": "提示再长,显存也不再增加",
-        "sub": "Qwen3.8-27B q4tp,RTX 5090,Vulkan。短于 8192 行的提示在两个文件中都走精确模式。",
+        "sub": "Qwen3.8-27B q4tp:Vulkan 在 RTX 5090 上,CUDA 在 16 GB 的 RTX 2000 Ada 上。短于 8192 行的提示走精确模式。",
         "dec": "解码,tok/s", "first": "首个 token,秒", "vram": "显存峰值,GB", "ctx": "提示,token 数",
-        "std": "普通", "tur": "Turbo", "card": "16 GB 显卡",
+        "std": "普通,Vulkan,RTX 5090", "tur": "Turbo,Vulkan,RTX 5090", "cud": "Turbo,CUDA,16 GB RTX 2000 Ada", "card": "16 GB 显卡",
         "c_t": "小显卡上的长提示",
         "c_sub": "显存停留在提示前段占用的位置,其余的行一读完就离开显卡。",
         "a": "前 8192 行", "a2": "精确,在显卡上(16 GB 显卡为 4096)",
@@ -80,7 +83,7 @@ T = {
         "s2": "构建", "s2t": "用保存的行逐层重建远场:每个头 32 个地标。",
         "s3": "保持精确", "s3t": "选出的 248 行、前 4 行和后 1800 行以精确形式留在显卡上。",
         "s4": "解码", "s4t": "每个 token 读取精确行和远场。草稿一起验证,单个 token 的成本更低。",
-        "res": "32 000 和 64 000 token 时显存均为 15.7 GB,16 GB 显卡上为 15.0 GB;普通文件在 64 000 时为 22.8 GB",
+        "res": "32 000 和 64 000 token 时显存 15.7 GB;16 GB 显卡上走 CUDA 和 Vulkan 均为 15.0 GB;普通文件 22.8 GB",
         "x_t": "密码和编码保持精确",
         "x_sub": "根据各层对每一行的处理来打分,不用词表。",
         "x_y": "行的分数", "x_x": "选择之前读取的提示行", "x_fact": "“记住这个密钥。”",
@@ -102,15 +105,15 @@ def compare(lang):
     s = Svg(1600, 680)
     head(s, t, t["t"], t["sub"])
     # A legend, and each line named at its end.
-    s.path("M 50 148 L 90 148", ORANGE, 3)
-    s.dot(70, 148, 8, ORANGE)
-    s.text(102, 156, t["std"], 22, INK)
-    s.path("M 250 148 L 290 148", BLUE, 3)
-    s.dot(270, 148, 8, BLUE)
-    s.text(302, 156, t["tur"], 22, INK)
+    x = 50
+    for key, c in (("std", ORANGE), ("tur", BLUE), ("cud", AQUA)):
+        s.path(f"M {x} 148 L {x + 40} 148", c, 3)
+        s.dot(x + 20, 148, 8, c)
+        s.text(x + 52, 156, t[key], 22, INK)
+        x += 90 + 11.5 * len(t[key]) * (1.5 if lang == "zh" else 1.0)
     n1 = (lambda v: f"{v:.1f}".replace(".", ",")) if lang == "ru" else (lambda v: f"{v:.1f}")
 
-    def panel(x0, x1, title, a, b, ymax, step, ends):
+    def panel(x0, x1, title, sers, ymax, step):
         y0, y1 = 570, 240
         s.text(x0, 215, title, 25, INK, "700")
         Y = lambda v: y0 + (y1 - y0) * v / ymax
@@ -125,18 +128,24 @@ def compare(lang):
             if i in (0, 2, 4):
                 s.text(X(i), y0 + 30, lb, 19, INK2, "400", "middle")
         s.text((x0 + x1) / 2, y0 + 62, t["ctx"], 19, INK2, "400", "middle")
-        for ser, c in ((a, ORANGE), (b, BLUE)):
+        for ser, c, _ in sers:
             pts = [(X(i), Y(v)) for i, v in enumerate(ser)]
             s.path("M " + " L ".join(f"{p[0]:.1f} {p[1]:.1f}" for p in pts), c, 3)
             for p in pts:
                 s.dot(p[0], p[1], 7, c)
-        s.text(X(4), Y(a[4]) + ends[0], n1(a[4]) if ymax < 40 else f"{a[4]:.0f}", 22, INK, "700", "end")
-        s.text(X(4), Y(b[4]) + ends[1], n1(b[4]) if ymax < 40 else f"{b[4]:.0f}", 22, INK, "700", "end")
+        for ser, c, dy in sers:
+            lab = n1(ser[4]) if ymax < 40 else f"{ser[4]:.0f}"
+            # a label beside its point (dy a string: right of it, where no line runs)
+            if isinstance(dy, str):
+                s.text(X(4) + 12, Y(ser[4]) + int(dy), lab, 22, c, "700", "start")
+            else:
+                s.text(X(4) - 12, Y(ser[4]) + dy, lab, 22, c, "700", "end")
         return X, Y
 
-    panel(50, 540, t["dec"], STD["dec"], TUR["dec"], 120, 20, (30, -16))
-    panel(570, 1060, t["first"], STD["first"], TUR["first"], 350, 50, (-16, 34))
-    X, Y = panel(1090, 1550, t["vram"], STD["vram"], TUR["vram"], 25, 5, (-16, 34))
+    O, B, A = ORANGE, BLUE, AQUA
+    panel(50, 540, t["dec"], ((STD["dec"], O, 30), (TUR["dec"], B, 34), (CUD["dec"], A, -16)), 120, 20)
+    panel(570, 1060, t["first"], ((STD["first"], O, -16), (TUR["first"], B, "-10"), (CUD["first"], A, "20")), 350, 50)
+    X, Y = panel(1090, 1550, t["vram"], ((STD["vram"], O, -16), (TUR["vram"], B, -16), (CUD["vram"], A, 36)), 25, 5)
     s.line(1134, Y(16), 1550, Y(16), INK2, 2, "8 6")
     s.text(1140, Y(16) - 10, t["card"], 19, INK2)
     s.done(f"compare_{lang}")
@@ -217,10 +226,11 @@ def exact(lang, sc, rows):
     s.done(f"exact_rows_{lang}")
 
 
-sc = np.fromfile(score_file, dtype=np.float32)
+sc = None if score_file == "-" else np.fromfile(score_file, dtype=np.float32)
 rows = list(range(f0, f1 + 1))
 for lang in T:
     compare(lang)
     ceiling(lang)
-    exact(lang, sc, rows)
-print("ok", cf.out, "places of the fact:", sorted(int(np.sum(sc > sc[r])) for r in rows))
+    if sc is not None:
+        exact(lang, sc, rows)
+print("ok", cf.out, "places of the fact:", sorted(int(np.sum(sc > sc[r])) for r in rows) if sc is not None else "-")
