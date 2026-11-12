@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.80] — 2026-11-13
+
+### Added
+- Qwen-Image-Edit-2509 (`cortiq imagine --image`, [the file](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf))
+  runs every transformer block of a step as one resident chain over CUDA (`gpu_cuda/qwen_image.rs`,
+  `qwen_image.cu`): each stream's LayerNorm with its shift and scale, the q/k/v products, per-head RMS norm of q and
+  k with the interleaved rotation, joint attention over [text | image] on `h3_flash`, the gated residuals and the
+  tanh-GELU MLPs, the weights kept on the card in their codec under `CMF_GPU_VRAM_MB`. The Qwen VAE's convolutions
+  and its single 512-wide attention head run on the card too (`gpu_cuda::h3_vae_conv2d`; heads wider than the
+  flash kernel take TF32 products around an f32 softmax). RTX A5000, release build, a 1024 x 1024 edit at 8 steps
+  with CFG 4: 105.8 s (0.8.79: 464 s), 115.1 s within an 8 GB ceiling (peak 7.4 GB); the card's 40 steps in
+  371.6 s. A seed gives the same picture twice. `CMF_QWEN_IMAGE_CUDA=0` keeps the per-operation path.
+
+### Changed
+- Qwen-Image-Edit over Vulkan runs its blocks on the H3 chain's parts (`gpu_wgpu/ltx.rs::qwen_chain`): the q4tp
+  products read in place on the 16x16 matrix units into one joint [q | k | v] panel (text rows first), q/k norm and
+  rotation in place on it, `vit_flash` over all rows, the gated residuals and MLPs between. A transformer pass
+  takes 4.3 s at 1024 x 1024 (0.8.79: 21.5 s): the edit above in 148.1 s (0.8.79: 442.5 s), 30.5 dB from the
+  CUDA picture. `CMF_QWEN_WGPU_H3=0` keeps the previous chain.
+- The Qwen-Image resident chain is on by default under `CMF_GPU=cuda` (it needed a discrete Vulkan adapter with
+  enough memory before).
+
 ## [0.8.79] — 2026-11-12
 
 ### Added

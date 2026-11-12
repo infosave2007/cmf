@@ -123,6 +123,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Qwen-Image-Edit-2509 на CUDA, быстрее на Vulkan (0.8.80)
+
+[Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) теперь считает все блоки
+трансформера одного шага на карте за один вызов на CUDA, а на Vulkan — на матричных ядрах цепочки H3. На RTX A5000
+правка 1024×1024 за 8 шагов с guidance занимает 105,8 с на CUDA (было 464 с) и 148,1 с через Vulkan (было 442,5 с);
+на CUDA правка помещается в карту на 8 ГБ (`CMF_GPU_VRAM_MB=8000`, 115,1 с):
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-edit-2509-q4tp.cmf --image input.png --prompt "Add a blue knitted scarf." \
+  --height 1024 --width 1024 --steps 8 --cfg 4 --reference-size 1024 --out edited.png
+```
+
 ## Lumina-Image 2.0 на CUDA (0.8.79)
 
 [Lumina-Image 2.0](https://huggingface.co/infosave/Lumina-Image-2.0cmf) теперь считает целый блок трансформера на
