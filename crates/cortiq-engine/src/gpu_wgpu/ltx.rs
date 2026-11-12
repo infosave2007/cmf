@@ -1185,6 +1185,428 @@ pub(crate) fn ltx_vae_chain(
     Some((out, out_ch, fr, hh, ww))
 }
 
+// ───────────────────────────── Qwen-Image ─────────────────────────────
+
+/// `out = f16(((x − mean) · inv · (1 + scale) + shift) · oscale)` a row, the
+/// affine-free LayerNorm; shift and scale at `sh` and `sc` of `cw`. One
+/// workgroup a row.
+const QLN_SRC: &str = r#"
+enable f16;
+struct LP { w: u32, sh: u32, sc: u32, _a: u32, eps: f32, oscale: f32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f16>;
+@group(0) @binding(2) var<storage, read> cw: array<f32>;
+@group(0) @binding(3) var<uniform> p: LP;
+var<workgroup> red: array<f32, 256>;
+
+fn wsum(v: f32, lid: u32) -> f32 {
+    red[lid] = v;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = red[lid] + red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let r = red[0];
+    workgroupBarrier();
+    return r;
+}
+
+@compute @workgroup_size(256)
+fn qw_ln(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let base = wid.x * p.w;
+    var s = 0.0;
+    for (var i = lid; i < p.w; i = i + 256u) { s = s + x[base + i]; }
+    let mean = wsum(s, lid) / f32(p.w);
+    var q = 0.0;
+    for (var i = lid; i < p.w; i = i + 256u) { let d = x[base + i] - mean; q = q + d * d; }
+    let inv = inverseSqrt(wsum(q, lid) / f32(p.w) + p.eps);
+    for (var i = lid; i < p.w; i = i + 256u) {
+        let v = (x[base + i] - mean) * inv * (1.0 + cw[p.sc + i]) + cw[p.sh + i];
+        o[base + i] = f16(clamp(v * p.oscale, -65504.0, 65504.0));
+    }
+}
+"#;
+
+/// In place on the joint `[q | k | v]` f16 panel (`ld` wide, parts `hs` wide,
+/// text rows first): workgroup `(part · heads + head, row)` takes its head of
+/// the row back to scale (`gin`) and adds the bias of the row's stream; q and
+/// k then take the head's RMS norm with the stream's weight and the
+/// interleaved rotation (pairs 2j, 2j + 1; cos at `co`, sin at `so`, rows of
+/// `hd / 2`), stored unscaled; v is stored times `vscale`.
+const QQK_SRC: &str = r#"
+enable f16;
+struct QP { ld: u32, hs: u32, hd: u32, heads: u32, nt: u32, n: u32, gin: f32, vscale: f32,
+            tb: u32, ib: u32, tn: u32, in_: u32, tco: u32, tso: u32, ico: u32, iso: u32, eps: f32, split: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read_write> pan: array<f16>;
+@group(0) @binding(1) var<storage, read> cw: array<f32>;
+@group(0) @binding(2) var<storage, read> pe: array<f32>;
+@group(0) @binding(3) var<uniform> p: QP;
+var<workgroup> red: array<f32, 64>;
+var<workgroup> nv: array<f32, 256>;
+
+@compute @workgroup_size(64)
+fn qw_qk(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let part = wid.x / p.heads;
+    let h = wid.x - part * p.heads;
+    let row = wid.y;
+    if (row >= p.n) { return; }
+    let text = row < p.nt;
+    // biases: [q | k | v] of the stream, norms: [q | k] of the stream
+    var bo = select(p.ib, p.tb, text);
+    var no = select(p.in_, p.tn, text);
+    let base = row * p.ld + part * p.hs + h * p.hd;
+    var ss = 0.0;
+    for (var i = lid; i < p.hd; i = i + 64u) {
+        var v = f32(pan[base + i]) * p.gin;
+        if (bo != 0xFFFFFFFFu) { v = v + cw[bo + part * p.hs + h * p.hd + i]; }
+        nv[i] = v;
+        ss = ss + v * v;
+    }
+    if (part == 2u) {
+        for (var i = lid; i < p.hd; i = i + 64u) { pan[base + i] = f16(clamp(nv[i] * p.vscale, -65504.0, 65504.0)); }
+        return;
+    }
+    red[lid] = ss;
+    workgroupBarrier();
+    var st = 32u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = red[lid] + red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let inv = inverseSqrt(red[0] / f32(p.hd) + p.eps);
+    let wo = no + part * p.hd;
+    let hp = p.hd / 2u;
+    var co = p.ico;
+    var so = p.iso;
+    var r = row - p.nt;
+    if (text) { co = p.tco; so = p.tso; r = row; }
+    let split = p.split != 0u;
+    for (var j = lid; j < hp; j = j + 64u) {
+        let i0 = select(2u * j, j, split);
+        let i1 = select(2u * j + 1u, j + hp, split);
+        let a = nv[i0] * inv * cw[wo + i0];
+        let b = nv[i1] * inv * cw[wo + i1];
+        let c = pe[co + r * hp + j];
+        let s = pe[so + r * hp + j];
+        pan[base + i0] = f16(a * c - b * s);
+        pan[base + i1] = f16(a * s + b * c);
+    }
+}
+"#;
+
+/// A Qwen-Image step's blocks over both streams (`image` `[ni][hs]`, `text`
+/// `[nt][hs]`) on the card: the zi_mm products reading the q4tp tensors in
+/// place, joint attention over [text | image] on `vit_flash`. `false`: nothing
+/// was written.
+pub(crate) fn qwen_chain(model: &Arc<CmfModel>, a: &mut crate::gpu::QwenImageChainArgs<'_>) -> bool {
+    if !ltx_enabled() || std::env::var("CMF_QWEN_WGPU_H3").as_deref() == Ok("0") {
+        return false;
+    }
+    let (ni, nt, heads, hd) = (a.image_tokens, a.text_tokens, a.heads, a.head_dim);
+    let hs = heads * hd;
+    let n = ni + nt;
+    let nb = a.blocks.len();
+    if nb == 0 || ni == 0 || nt == 0 || hd != 128 || !hs.is_multiple_of(128) || n > MAX_ROWS || a.image.len() != ni * hs || a.text.len() != nt * hs {
+        return not_mine("a Qwen-Image step outside the chain's shapes");
+    }
+    if a.image_cos.len() != ni * hd / 2 || a.text_cos.len() != nt * hd / 2 {
+        return not_mine("Qwen-Image rotation tables of the wrong size");
+    }
+    let Some(c) = zi::zctx() else {
+        return not_mine("no adapter with 16x16 f16 cooperative matrices");
+    };
+    // the twelve q4tp tensors of a block, in the order the chain reads them
+    let order = |b: &crate::gpu::QwenImageChainBlock<'_>| {
+        [b.text_q, b.text_k, b.text_v, b.image_q, b.image_k, b.image_v, b.text_out, b.image_out, b.text_mlp_in, b.text_mlp_out, b.image_mlp_in, b.image_mlp_out]
+    };
+    const QPER: usize = 12;
+    let mut spans = Vec::with_capacity(nb * QPER);
+    let mut inter = 0usize;
+    for b in a.blocks {
+        for (j, ix) in order(b).into_iter().enumerate() {
+            let e = match model.tensors.get(ix) {
+                Some(e) if e.shape.len() == 2 => e,
+                _ => return not_mine("a Qwen-Image projection that is not a matrix"),
+            };
+            if j == 8 {
+                inter = e.shape[0];
+            }
+            match span(model, ix, e.shape[0], e.shape[1]) {
+                Some(sp) => spans.push(sp),
+                None => return not_mine("a Qwen-Image projection that is not a q4tp matrix"),
+            }
+        }
+        if b.image_mod.len() != 6 * hs || b.text_mod.len() != 6 * hs {
+            return not_mine("a Qwen-Image modulation of the wrong width");
+        }
+    }
+    if inter == 0 || !inter.is_multiple_of(128) {
+        return not_mine("a Qwen-Image MLP width the tiles do not divide");
+    }
+    let _op = c.op_gate.enter();
+    let _gate = c.mm_gate.lock().unwrap();
+    let gd = Guards::from_env();
+    let fc = flash_cfg();
+    let lim = c.device.limits();
+
+    // ── constants ──
+    let mut cw = Cw::default();
+    struct BO {
+        tm: u32,
+        im: u32,
+        tb: u32,
+        ib: u32,
+        tn: u32,
+        in_: u32,
+        tob: u32,
+        iob: u32,
+        tf1: u32,
+        tf2: u32,
+        if1: u32,
+        if2: u32,
+    }
+    let cat = |x: &[&[f32]]| -> Vec<f32> { x.iter().flat_map(|v| v.iter().copied()).collect() };
+    let mut lay = Vec::with_capacity(nb);
+    for b in a.blocks {
+        let qkv_t = cat(&[b.text_q_bias, b.text_k_bias, b.text_v_bias]);
+        let qkv_i = cat(&[b.image_q_bias, b.image_k_bias, b.image_v_bias]);
+        if qkv_t.len() != 3 * hs || qkv_i.len() != 3 * hs || b.text_q_norm.len() != hd || b.image_q_norm.len() != hd {
+            return not_mine("Qwen-Image biases or norms of the wrong width");
+        }
+        lay.push(BO {
+            tm: cw.put(b.text_mod),
+            im: cw.put(b.image_mod),
+            tb: cw.put(&qkv_t),
+            ib: cw.put(&qkv_i),
+            tn: cw.put(&cat(&[b.text_q_norm, b.text_k_norm])),
+            in_: cw.put(&cat(&[b.image_q_norm, b.image_k_norm])),
+            tob: cw.put(b.text_out_bias),
+            iob: cw.put(b.image_out_bias),
+            tf1: cw.put(b.text_mlp_in_bias),
+            tf2: cw.put(b.text_mlp_out_bias),
+            if1: cw.put(b.image_mlp_in_bias),
+            if2: cw.put(b.image_mlp_out_bias),
+        });
+    }
+    let mut pev: Vec<f32> = Vec::new();
+    let mut put_pe = |v: &[f32]| -> u32 {
+        let at = pev.len() as u32;
+        pev.extend_from_slice(v);
+        at
+    };
+    let (tco, tso, ico, iso) = (put_pe(a.text_cos), put_pe(a.text_sin), put_pe(a.image_cos), put_pe(a.image_sin));
+    if (cw.0.len() * 4) as u64 > lim.max_storage_buffer_binding_size {
+        return decline("the Qwen-Image constants pass the largest storage binding");
+    }
+
+    // ── the working set ──
+    let rmax = zi::pad_rows(ni.max(nt));
+    let rn = zi::pad_rows(n) + 128;
+    let acts: u64 = (4 * n * hs + 2 * 2 * rmax * hs + 2 * rn * 3 * hs + 2 * rn * hs + 4 * rmax * hs + 2 * 2 * rmax * inter) as u64
+        + (cw.0.len() * 4 + pev.len() * 4) as u64;
+    if (2 * rn * 3 * hs) as u64 > lim.max_storage_buffer_binding_size || (2 * rmax * inter) as u64 > lim.max_storage_buffer_binding_size {
+        return decline("a Qwen-Image panel passes the largest storage binding");
+    }
+    let plan = match plan(c, model, &spans, QPER, acts) {
+        Ok(p) => p,
+        Err(said) => return said,
+    };
+    let sc_oom = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let xt = zi::sbuf(c, (nt * hs * 4) as u64, "qw_xt");
+    let xi = zi::sbuf(c, (ni * hs * 4) as u64, "qw_xi");
+    let nt_b = zi::sbuf(c, (rmax * hs * 2) as u64, "qw_nt");
+    let ni_b = zi::sbuf(c, (rmax * hs * 2) as u64, "qw_ni");
+    let panel = zi::sbuf(c, (rn * 3 * hs * 2) as u64, "qw_panel");
+    let att = zi::sbuf(c, (rn * hs * 2) as u64, "qw_att");
+    let y = zi::sbuf(c, (rmax * hs * 4) as u64, "qw_y");
+    let gu = zi::sbuf(c, (rmax * inter * 2) as u64, "qw_gu");
+    let hid = zi::sbuf(c, (rmax * inter * 2) as u64, "qw_hid");
+    let cwb = zi::sbuf_init(c, bytemuck::cast_slice(&cw.0), "qw_cw");
+    let peb = zi::sbuf_init(c, bytemuck::cast_slice(&pev), "qw_pe");
+    let rib = zi::sbuf(c, 16, "qw_ri");
+    if let Some(e) = pollster::block_on(sc_oom.pop()) {
+        eprintln!("qwen-image wgpu: {e}");
+        return decline("the Qwen-Image working set did not fit the card");
+    }
+    let t = tile();
+    let (f16c, f32c) = (site_cfg(t, Epi::F16), site_cfg(t, Epi::F32));
+    let fkey = format!("vit_flash_{}_{}_128_{}", fc.nw, fc.bc, zi::flash_thr());
+    let pipes = || -> Option<_> {
+        Some((
+            zi::pipeline(c, "qw_ln", QLN_SRC, "qw_ln")?,
+            zi::pipeline(c, "qw_qk", QQK_SRC, "qw_qk")?,
+            zi::pipeline(c, &fkey, &vit_flash_src(fc, 128)?, "vit_flash")?,
+            zi::pipeline(c, "lx_gelu", GELU_SRC, "lx_gelu")?,
+            zi::pipeline(c, "lx_addg", ADDG_SRC, "lx_addg")?,
+        ))
+    };
+    let Some((pln, pqk, pfl, pgelu, paddg)) = pipes() else {
+        return decline("a kernel of the Qwen-Image chain was rejected by the device");
+    };
+    // a product into rows from `orow` of an output `ldo` wide at column `ocol`
+    let prod = |g: MmCfg, m: usize, nn: usize, k: usize, ldo: usize, orow: usize, ocol: usize, arow: usize, oscale: f32, w: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer| {
+        let args = MmArgs {
+            m: m as u32,
+            n: nn as u32,
+            k: k as u32,
+            ldo: ldo as u32,
+            ocol: (orow * ldo + ocol) as u32,
+            arow: arow as u32,
+            oscale,
+            conv: [0; 3],
+        };
+        mm(c, g, &args, 0, w, act, out)
+    };
+    let ln = |calls: &mut ZCalls, x: &wgpu::Buffer, out: &wgpu::Buffer, rows: usize, sh: u32, sc: u32| {
+        let u = zi::ubuf(c, &[hs as u32, sh, sc, 0, 1e-6f32.to_bits(), p2(-gd.act).to_bits(), 0, 0]);
+        let bg = zi::bg(c, &pln, &[x, out, &cwb, &u]);
+        calls.push(Class::Rows, Call { pipe: pln.clone(), bg, grid: (rows as u32, 1, 1) });
+    };
+    let addg = |calls: &mut ZCalls, x: &wgpu::Buffer, rows: usize, gate: u32, b: u32| {
+        let total = rows * hs;
+        let u = zi::ubuf(c, &[total as u32, hs as u32, 1, gate, hs as u32, 0, 0, b, 0, 0, 0, 0]);
+        let bg = zi::bg(c, &paddg, &[x, &y, &cwb, &rib, &u]);
+        calls.push(Class::Rows, Call { pipe: paddg.clone(), bg, grid: grid1(total) });
+    };
+    let hs32 = hs as u32;
+    let build = |blocks: std::ops::Range<usize>, wb: &[wgpu::Buffer]| -> Option<ZCalls> {
+        let mut calls = ZCalls::default();
+        let ld = 3 * hs;
+        let qs = p2(gd.act - gd.qkv);
+        for (j, bi) in blocks.clone().enumerate() {
+            let (l, w) = (&lay[bi], &wb[j * QPER..(j + 1) * QPER]);
+            // each stream normed and modulated (shift chunk 0, scale chunk 1)
+            ln(&mut calls, &xt, &nt_b, nt, l.tm, l.tm + hs32);
+            ln(&mut calls, &xi, &ni_b, ni, l.im, l.im + hs32);
+            // q, k, v of the text rows, then of the image rows below them
+            for (part, wi) in [0usize, 1, 2].into_iter().zip([0usize, 1, 2]) {
+                calls.push_mm(Class::MmQkv, prod(f16c, nt, hs, hs, ld, 0, part * hs, 0, qs, &w[wi], &nt_b, &panel)?);
+            }
+            for (part, wi) in [0usize, 1, 2].into_iter().zip([3usize, 4, 5]) {
+                calls.push_mm(Class::MmQkv, prod(f16c, ni, hs, hs, ld, nt, part * hs, 0, qs, &w[wi], &ni_b, &panel)?);
+            }
+            {
+                let u = zi::ubuf(
+                    c,
+                    &[
+                        ld as u32,
+                        hs32,
+                        hd as u32,
+                        heads as u32,
+                        nt as u32,
+                        n as u32,
+                        p2(gd.qkv).to_bits(),
+                        p2(-gd.qkv).to_bits(),
+                        l.tb,
+                        l.ib,
+                        l.tn,
+                        l.in_,
+                        tco,
+                        tso,
+                        ico,
+                        iso,
+                        1e-6f32.to_bits(),
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                let bg = zi::bg(c, &pqk, &[&panel, &cwb, &peb, &u]);
+                calls.push(Class::Rows, Call { pipe: pqk.clone(), bg, grid: ((3 * heads) as u32, n as u32, 1) });
+            }
+            {
+                let scl = std::f32::consts::LOG2_E / (hd as f32).sqrt();
+                let u = zi::ubuf(c, &[n as u32, n as u32, ld as u32, hs32, (2 * hs) as u32, hs32, scl.to_bits(), 1.0f32.to_bits()]);
+                let bg = zi::bg(c, &pfl, &[&panel, &panel, &att, &u]);
+                calls.push(Class::Flash, Call { pipe: pfl.clone(), bg, grid: ((n as u32).div_ceil(fc.nw * 16), heads as u32, 1) });
+            }
+            // each stream's output product (its rows of the attention) and gated residual
+            calls.push_mm(Class::MmO, prod(f32c, nt, hs, hs, hs, 0, 0, 0, p2(gd.qkv), &w[6], &att, &y)?);
+            addg(&mut calls, &xt, nt, l.tm + 2 * hs32, l.tob);
+            calls.push_mm(Class::MmO, prod(f32c, ni, hs, hs, hs, 0, 0, nt, p2(gd.qkv), &w[7], &att, &y)?);
+            addg(&mut calls, &xi, ni, l.im + 2 * hs32, l.iob);
+            // each stream's MLP (shift chunk 3, scale 4, gate 5)
+            for (x, nb_, rows, m, wi, wo, b1, b2) in [(&xt, &nt_b, nt, l.tm, 8usize, 9usize, l.tf1, l.tf2), (&xi, &ni_b, ni, l.im, 10, 11, l.if1, l.if2)] {
+                ln(&mut calls, x, nb_, rows, m + 3 * hs32, m + 4 * hs32);
+                calls.push_mm(Class::MmW13, prod(f16c, rows, inter, hs, inter, 0, 0, 0, p2(gd.act - gd.gu), &w[wi], nb_, &gu)?);
+                let total = rows * inter;
+                let u = zi::ubuf(c, &[total as u32, inter as u32, p2(gd.gu).to_bits(), p2(-gd.hid).to_bits(), b1, 0, 0, 0]);
+                let bg = zi::bg(c, &pgelu, &[&gu, &hid, &cwb, &u]);
+                calls.push(Class::Rows, Call { pipe: pgelu.clone(), bg, grid: grid1(total) });
+                calls.push_mm(Class::MmW2, prod(f32c, rows, hs, inter, hs, 0, 0, 0, p2(gd.hid), &w[wo], &hid, &y)?);
+                addg(&mut calls, x, rows, m + 5 * hs32, b2);
+            }
+        }
+        Some(calls)
+    };
+
+    // ── the step ──
+    let uid = model.uid() as usize;
+    c.queue.write_buffer(&xt, 0, bytemuck::cast_slice(&*a.text));
+    c.queue.write_buffer(&xi, 0, bytemuck::cast_slice(&*a.image));
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut submitted = false;
+    for (kept, blocks) in plan.runs() {
+        let mine = &spans[blocks.start * QPER..blocks.end * QPER];
+        if !kept {
+            if submitted {
+                zi::wait(c);
+            }
+            let stale: Vec<(usize, usize)> = spans
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !plan.keep.contains(&(i / QPER)) && !blocks.contains(&(i / QPER)))
+                .map(|(_, (idx, _))| (uid, *idx))
+                .collect();
+            super::super::weight_evict(c, &stale);
+        }
+        let wb = match fetch(c, model, mine) {
+            Ok(wb) => wb,
+            Err(said) => {
+                let _ = pollster::block_on(sc.pop());
+                return said;
+            }
+        };
+        // a submission a few blocks at a time keeps the command buffers small
+        let mut start = blocks.start;
+        while start < blocks.end {
+            let end = (start + 4).min(blocks.end);
+            let Some(calls) = build(start..end, &wb[(start - blocks.start) * QPER..(end - blocks.start) * QPER]) else {
+                let _ = pollster::block_on(sc.pop());
+                return decline("a kernel of the Qwen-Image chain was rejected by the device");
+            };
+            let mut enc = c.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                calls.record(&mut pass, None);
+            }
+            c.queue.submit(Some(enc.finish()));
+            submitted = true;
+            start = end;
+        }
+    }
+    let rt = zi::read_bytes(c, &xt, (nt * hs * 4) as u64);
+    let ri = zi::read_bytes(c, &xi, (ni * hs * 4) as u64);
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        return decline(&format!("the Qwen-Image chain's command buffer failed: {e}"));
+    }
+    let (Some(rt), Some(ri)) = (rt, ri) else {
+        return decline("the readback failed");
+    };
+    let (ot, oi): (&[f32], &[f32]) = (bytemuck::cast_slice(&rt), bytemuck::cast_slice(&ri));
+    if ot.iter().chain(oi.iter()).any(|x| !x.is_finite()) {
+        return decline("the Qwen-Image chain produced a non-finite stream (an f16 range guard overflowed?)");
+    }
+    a.text.copy_from_slice(ot);
+    a.image.copy_from_slice(oi);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,6 +1630,8 @@ mod tests {
         check("vx_ns", VNS_SRC);
         check("vx_add", VADD_SRC);
         check("vx_d2s", VD2S_SRC);
+        check("qw_ln", QLN_SRC);
+        check("qw_qk", QQK_SRC);
         let g = MmCfg { conv: 6, ..zi::default_cfg(Epi::F32) };
         assert!(g.valid(), "{g:?}");
         check("conv6", &zi::mm_src(g));

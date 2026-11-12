@@ -37,6 +37,11 @@ use cortiq_core::{CmfModel, TensorDtype};
 use super::{Buf, Ctx, DevMat, Gemm, Res, State, bl, compile, cs, cu, ctx, debug, decline, derr, dev_mat, func};
 use crate::gpu::H3Chain;
 
+/// The Qwen-Image transformer as a resident chain, on this module's weight store.
+#[path = "qwen_image.rs"]
+mod qwen_image;
+pub use qwen_image::qwen_image_chain;
+
 /// The Lumina Next-DiT block, one block a call, on this module's weight store.
 #[path = "lumina.rs"]
 mod lumina;
@@ -45,7 +50,7 @@ pub use lumina::lumina_block;
 /// LTX-2.5's blocks as a resident chain, on this module's weight store.
 #[path = "ltx.rs"]
 mod ltx;
-pub use ltx::{ltx_chain, ltx_vae_chain};
+pub use ltx::{ltx_chain, ltx_vae_chain, vae_conv2d as h3_vae_conv2d};
 
 const H3_SRC: &str = include_str!("h3.cu");
 const FLASH_SRC: &str = include_str!("h3_flash.cu");
@@ -101,6 +106,8 @@ pub(super) struct H3State {
     ltx: Option<ltx::LxFuncs>,
     /// The kernels of the Lumina block (`lumina.rs`), once compiled.
     lumina: Option<lumina::LbFuncs>,
+    /// The kernels of the Qwen-Image chain (`qwen_image.rs`), once compiled.
+    qwen_image: Option<qwen_image::QiFuncs>,
 }
 
 impl H3State {
@@ -1106,7 +1113,14 @@ pub fn h3_attention(
     let mut run = |st: &mut State| -> Res<()> {
         let f = st.h3.funcs(c)?;
         let hdp = hd.next_multiple_of(32);
-        let fl = st.h3.flash(c, hdp, false).ok_or("no flash attention kernel for this head width")?;
+        let Some(fl) = st.h3.flash(c, hdp, false) else {
+            // one head wider than the flash kernel takes (a VAE's mid-block):
+            // two TF32 products a chunk of query rows
+            if nh == 1 && nkv == 1 {
+                return ltx::attention_wide(c, st, qh, kh, vh, n, hd, scale, out);
+            }
+            return Err("no flash attention kernel for this head width".into());
+        };
         let ns = n.next_multiple_of(16);
         let src = st.h3.buf(c, "at src", len * 4)?;
         let qp = st.h3.buf(c, "q", nh * n * hdp * 2)?;
