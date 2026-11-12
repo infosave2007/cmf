@@ -3038,6 +3038,12 @@ enum Commands {
         /// Condition/reference image (Qwen-Image-2.1, Qwen Image Edit); repeat for multiple images
         #[arg(long = "image")]
         images: Vec<String>,
+        /// MiniMax-H3-Image: the smallest canvas the model is run at, in pixels
+        /// (default 4194304 = 2048x2048, the low end of its working range). A
+        /// smaller --width x --height is generated at the same aspect ratio on
+        /// such a canvas and resized back; 1024 turns this off.
+        #[arg(long, value_name = "PIXELS")]
+        min_area: Option<usize>,
         /// Qwen2.5-VL CMF (default: text_encoder.cmf beside the transformer)
         #[arg(long)]
         text_encoder: Option<String>,
@@ -3504,6 +3510,17 @@ enum Commands {
         /// Video VAE (only the ViT3D decoder half is packed)
         #[arg(long)]
         video_vae: Option<String>,
+        /// MiniMax-H3-Image's VAE (`minimax_h3_image_vae_fp16.safetensors`):
+        /// with an image `--dit` this makes a text-to-image container
+        #[arg(long)]
+        image_vae: Option<String>,
+        /// Codec of the image VAE's projections (default: --quant)
+        #[arg(long)]
+        image_vae_quant: Option<String>,
+        /// Components of the `--in` file to leave behind, by prefix
+        /// (`--drop avae` when an image model is built over a video file)
+        #[arg(long, value_delimiter = ',')]
+        drop: Vec<String>,
         /// Audio VAE (only the BigVGAN decoder half is packed)
         #[arg(long)]
         audio_vae: Option<String>,
@@ -5850,6 +5867,7 @@ async fn main() -> anyhow::Result<()> {
             num_images,
             seed,
             images,
+            min_area,
             text_encoder,
             vae,
             negative_prompt,
@@ -5866,6 +5884,57 @@ async fn main() -> anyhow::Result<()> {
             };
             let zimage = arch == cortiq_engine::zimagegen::ARCH_NAME;
             let moss_image = arch == cortiq_engine::moss_imagegen::ARCH_NAME;
+            // A container with the H3 prompt encoder alone carries no DiT to
+            // tell the image pipeline from the video one; under `CMF_TE_DUMP`
+            // it is run for its conditioning (and stops where the DiT would
+            // load).
+            let te_only = arch == "minimax-h3-av"
+                && std::env::var("CMF_TE_DUMP").is_ok()
+                && CmfModel::open(&model_dir)
+                    .is_ok_and(|m| !m.tensors.iter().any(|t| t.name.starts_with("dit.")));
+            if arch == cortiq_engine::h3imagegen::ARCH_NAME || te_only {
+                anyhow::ensure!(
+                    layout.is_none() && layout_file.is_none(),
+                    "--layout/--layout-file apply only to MOSS-Image"
+                );
+                anyhow::ensure!(
+                    cfg.is_none_or(|g| g == 1.0)
+                        && negative_prompt.is_none()
+                        && text_encoder.is_none()
+                        && vae.is_none()
+                        && scheduler.is_none()
+                        && cfg_normalization.is_none()
+                        && cfg_truncation.is_none()
+                        && shift.is_none()
+                        && uncond_skip_layers.is_none()
+                        && slg_layers.is_none()
+                        && slg_scale.is_none()
+                        && slg_start.is_none()
+                        && slg_stop.is_none(),
+                    "MiniMax-H3-Image is distilled: no guidance, no negative prompt, its own sigma grid (--cfg/--negative-prompt/--shift/--scheduler/--text-encoder/--vae/--slg-* do not apply)"
+                );
+                let prompt = prompt
+                    .ok_or_else(|| anyhow::anyhow!("--prompt is required for this image model"))?;
+                return cmd_h3image(
+                    &model_dir,
+                    &prompt,
+                    H3ImageCli {
+                        height,
+                        width,
+                        steps,
+                        max_sequence_length,
+                        num_images,
+                        seed,
+                        images,
+                        min_area,
+                        out,
+                    },
+                );
+            }
+            anyhow::ensure!(
+                min_area.is_none(),
+                "--min-area applies only to MiniMax-H3-Image"
+            );
             let prompt = if moss_image {
                 resolve_moss_prompt(prompt, layout, layout_file)?
             } else {
@@ -6411,6 +6480,9 @@ async fn main() -> anyhow::Result<()> {
             music_dit,
             music_te,
             video_vae,
+            image_vae,
+            image_vae_quant,
+            drop,
             audio_vae,
             tokenizer,
             quant,
@@ -6433,6 +6505,9 @@ async fn main() -> anyhow::Result<()> {
             music_dit: music_dit.as_deref(),
             music_te: music_te.as_deref(),
             video_vae: video_vae.as_deref(),
+            image_vae: image_vae.as_deref(),
+            image_vae_quant: image_vae_quant.as_deref(),
+            drop,
             audio_vae: audio_vae.as_deref(),
             tokenizer: tokenizer.as_deref(),
             quant: &quant,
@@ -11891,6 +11966,127 @@ fn cmd_moss_image(model: &str, prompt: &str, o: MossImageCli) -> anyhow::Result<
         timing.median_step(),
         timing.vae
     );
+    Ok(())
+}
+
+/// `cortiq imagine` options that apply to a MiniMax-H3-Image container.
+struct H3ImageCli {
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
+    max_sequence_length: Option<usize>,
+    num_images: usize,
+    seed: u64,
+    /// Reference pictures: with any, the run is an edit of the first.
+    images: Vec<String>,
+    min_area: Option<usize>,
+    out: Option<String>,
+}
+
+/// MiniMax-H3-Image, text-to-image or — with `--image` — image editing: six
+/// steps on the grid the model's output heads were distilled for, no
+/// guidance.
+fn cmd_h3image(model: &str, prompt: &str, o: H3ImageCli) -> anyhow::Result<()> {
+    use cortiq_engine::h3imagegen::{canvas_size, edit_default_size, generate, H3ImageParams, DEFAULT_SIDE, MIN_AREA};
+    // A prompt file reads better than a 400-word shell argument: `@path`.
+    let prompt = match prompt.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("{path}: {e}"))?
+            .trim()
+            .to_string(),
+        None => prompt.to_string(),
+    };
+    // An edit comes out at the size of the picture it edits unless one is
+    // given; text-to-image at the model's 2048 x 2048.
+    let (dw, dh) = match o.images.first() {
+        Some(first) => edit_default_size(std::path::Path::new(first)).map_err(anyhow::Error::msg)?,
+        None => (DEFAULT_SIDE, DEFAULT_SIDE),
+    };
+    let p = H3ImageParams {
+        width: o.width.unwrap_or(dw),
+        height: o.height.unwrap_or(dh),
+        steps: o.steps.unwrap_or(0),
+        seed: o.seed,
+        max_tokens: o.max_sequence_length.unwrap_or(4096),
+        num_images: o.num_images.max(1),
+        images: o.images,
+        min_area: o.min_area.unwrap_or(MIN_AREA),
+    };
+    anyhow::ensure!(
+        p.height % 32 == 0 && p.width % 32 == 0 && p.height > 0 && p.width > 0,
+        "--height/--width must be positive multiples of 32 (got {}x{})",
+        p.width,
+        p.height
+    );
+    let (cw, ch) = canvas_size(p.width, p.height, p.min_area);
+    let out = o.out.unwrap_or_else(|| "out.png".into());
+    let path = std::path::Path::new(&out);
+    let names: Vec<std::path::PathBuf> = if p.num_images == 1 {
+        vec![path.to_path_buf()]
+    } else {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        (0..p.num_images)
+            .map(|i| path.with_file_name(format!("{stem}_{i}.{ext}")))
+            .collect()
+    };
+    eprintln!(
+        "minimax-h3-image ({}): {}x{}{}, seed {}, {} image(s), backend {}",
+        if p.images.is_empty() {
+            "text to image".to_string()
+        } else {
+            format!("edit, {} reference picture(s)", p.images.len())
+        },
+        p.width,
+        p.height,
+        if (cw, ch) == (p.width, p.height) {
+            String::new()
+        } else {
+            format!(" (generated at {cw}x{ch}, --min-area {})", p.min_area)
+        },
+        p.seed,
+        p.num_images,
+        cortiq_engine::gpu::backend_name()
+    );
+    let t0 = std::time::Instant::now();
+    let (imgs, tm) = generate(std::path::Path::new(model), &prompt, &p, |img, i, n| {
+        eprintln!(
+            "image {}/{}: step {i}/{n} ({:.1}s)",
+            img + 1,
+            p.num_images,
+            t0.elapsed().as_secs_f64()
+        );
+    })
+    .map_err(anyhow::Error::msg)?;
+    for (img, name) in imgs.iter().zip(&names) {
+        img.save(name).map_err(anyhow::Error::msg)?;
+        println!(
+            "{}: {}x{}, seed {}",
+            name.display(),
+            img.width,
+            img.height,
+            img.seed
+        );
+    }
+    println!(
+        "{} image(s), {} steps in {:.1}s (text {:.1}s for {} tokens, dit load {:.1}s, denoise {:.1}s, median step {:.2}s over {} image tokens, vae {:.1}s)",
+        imgs.len(),
+        tm.steps.len() / imgs.len().max(1),
+        tm.total,
+        tm.text_encode,
+        tm.prompt_tokens,
+        tm.dit_load,
+        tm.denoise(),
+        tm.median_step(),
+        tm.image_tokens,
+        tm.vae
+    );
+    if tm.ref_tokens > 0 {
+        println!(
+            "references: {} condition rows in the sequence, vision tower {:.1}s, vae encode {:.1}s",
+            tm.ref_tokens, tm.ref_vision, tm.ref_encode
+        );
+    }
     Ok(())
 }
 

@@ -48386,10 +48386,15 @@ pub fn q4tp_ffn_packed(
     //     stand drifting (its container pages had gone cold), not the
     //     kernel. A default set from that would have been noise shipped.
     //
-    // `CMF_FFN_FC2_COOP=1` takes it; a multi-workgroup reduction is what
-    // would tip it. Row counts are from the render itself — CMF_GPU_DEBUG=1
-    // prints them — not from arithmetic on the frame size.
-    let want_fc2_coop = std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1");
+    // Row counts are from the render itself — CMF_GPU_DEBUG=1 prints them —
+    // not from arithmetic on the frame size.
+    //
+    // ON BY DEFAULT since MiniMax-H3-Image: neutral on that RTX 5090, it is a
+    // tenth of the step on a smaller card, where the scalar tile kernel is
+    // the slow half of the call. RTX 2000 Ada 16 GB, 1024×1024 (1178 rows):
+    // 97.8 s and 12.47 s a step without, 88.7 s and 10.99 s with.
+    // `CMF_FFN_FC2_COOP=0` keeps fc2 on the scalar kernel.
+    let want_fc2_coop = std::env::var("CMF_FFN_FC2_COOP").as_deref() != Ok("0");
     let dq2 = if want_fc2_coop {
         let mut sc = c.scratch.lock().unwrap();
         dq_f16_plane_slot(c, &mut sc, &w2b, hidden, inter, true)

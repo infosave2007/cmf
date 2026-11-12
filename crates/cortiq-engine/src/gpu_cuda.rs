@@ -676,6 +676,8 @@ struct State {
     kv_hint: usize,
     /// The Qwen3.5-family hybrid arm's plans and recurrent states.
     hyb: hyb::HState,
+    /// The MiniMax-H3 chains' resident weights and working buffers.
+    h3: h3::H3State,
 }
 
 struct Ctx {
@@ -713,6 +715,14 @@ pub(crate) mod qwen4;
 /// The Qwen3.5-family hybrid (GDN + gated full attention) behind the graph
 /// contracts; declared after `kargs!`, which it uses.
 mod hyb;
+
+/// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
+/// under a memory ceiling; declared after `kargs!`, which it uses.
+mod h3;
+pub use h3::{
+    h3_attention, h3_chain, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
+    h3_te_chain,
+};
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
     // NVRTC takes seconds on a large module (the hybrid arm's: ~11 s on a

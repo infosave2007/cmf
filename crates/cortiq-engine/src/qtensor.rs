@@ -2333,6 +2333,26 @@ impl QTensor {
                     // someone else's queue.
                     // Row-exact batches stay on the host: the device GEMM
                     // is an f32 dequant-sgemm, not the host matvec's sum.
+                    //
+                    // The native CUDA backend takes every batch of a large
+                    // matrix, however narrow, and is not arbitrated against
+                    // the host: its plane is built on the card from the
+                    // codec's bytes in tens of milliseconds, where a wgpu
+                    // weight has an upload to amortise and a narrow batch
+                    // tiles badly.
+                    if crate::gpu::cuda_active()
+                        && b >= 2
+                        && rows * cols >= (1 << 20)
+                        && cols % 32 == 0
+                        && !row_exact()
+                        && crate::gpu::enabled_here()
+                    {
+                        if let Self::Mapped { model, idx, .. } = self {
+                            if crate::gpu::q4tp_matmat(model, *idx, xs_all, b, rows, cols, out) {
+                                return;
+                            }
+                        }
+                    }
                     if b >= 32
                         && b * rows * cols >= 128_000_000
                         && cols % 32 == 0

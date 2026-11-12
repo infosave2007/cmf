@@ -634,6 +634,75 @@ impl Layout {
             .find(|s| s.kind == kind)
             .expect("every layout carries all three streams")
     }
+
+    /// MiniMax-H3-Image: `[text | reference images | target image]`, one
+    /// latent frame and no audio. Each reference is `(lat_h, lat_w)` of
+    /// its own latent; it sits at its own step of the time axis on its
+    /// own area-normalized grid, and the target follows the last of them.
+    pub fn image(
+        text_len: usize,
+        lat_h: usize,
+        lat_w: usize,
+        refs: &[(usize, usize)],
+        text_tags: &[u8],
+    ) -> Self {
+        let mut pos: Vec<[f64; 3]> = Vec::new();
+        let mut segments = vec![Segment {
+            start: 0,
+            stop: text_len,
+            kind: Kind::Text,
+        }];
+        for i in 0..text_len {
+            pos.push([i as f64, 0.0, 0.0]);
+        }
+        let mut cursor = text_len as f64;
+        let frame = |pos: &mut Vec<[f64; 3]>, h: usize, w: usize, t: f64| -> usize {
+            let area = ((h * w) as f64).sqrt();
+            let (ha, wa) = (
+                axis_from_sqrt_area(h, 2, area),
+                axis_from_sqrt_area(w, 2, area),
+            );
+            for &y in &ha {
+                for &x in &wa {
+                    pos.push([t, y, x]);
+                }
+            }
+            ha.len() * wa.len()
+        };
+        for &(rh, rw) in refs {
+            let start = pos.len();
+            let n = frame(&mut pos, rh, rw, cursor);
+            segments.push(Segment {
+                start,
+                stop: start + n,
+                kind: Kind::RefImg,
+            });
+            cursor += 1.0;
+        }
+        let start = pos.len();
+        let frame_rows = frame(&mut pos, lat_h, lat_w, cursor);
+        segments.push(Segment {
+            start,
+            stop: start + frame_rows,
+            kind: Kind::Video,
+        });
+        Self {
+            seq_len: pos.len(),
+            segments,
+            pos,
+            text_len,
+            audio_t: 0,
+            latent_t: 1,
+            lat_h,
+            lat_w,
+            frame_rows,
+            text_tags: if text_tags.is_empty() {
+                vec![TAG_TEXT as u8; text_len]
+            } else {
+                text_tags.to_vec()
+            },
+        }
+    }
 }
 
 // ── weights ─────────────────────────────────────────────────────────
@@ -782,7 +851,8 @@ pub(crate) const CURVE_GRID: usize = 1025;
 pub struct MiniMaxH3 {
     video_patch: Proj,
     video_patch_b: Vec<f32>,
-    audio_patch: Proj,
+    /// `None` on MiniMax-H3-Image, which has no audio stream.
+    audio_patch: Option<Proj>,
     audio_patch_b: Vec<f32>,
     condition: Proj,
     condition_b: Vec<f32>,
@@ -793,8 +863,20 @@ pub struct MiniMaxH3 {
     final_adaln: Adaln,
     video_out: Proj,
     video_out_b: Vec<f32>,
-    audio_out: Proj,
+    audio_out: Option<Proj>,
     audio_out_b: Vec<f32>,
+    /// MiniMax-H3-Image's output layer as plain f32 `[pdd_steps · out, hidden]`:
+    /// a bank of per-step heads, block 0 a full head and the rest offsets
+    /// from it. Empty on the video model.
+    pdd_w: Vec<f32>,
+    /// How many heads the bank stacks (1: a plain output layer) and the
+    /// sigma grid they were distilled on.
+    pub pdd_steps: usize,
+    pub pdd_sigmas: Vec<f64>,
+    /// MiniMax-H3-Image: `[text | reference images | target image]`.
+    pub image: bool,
+    /// The container, for the device chain's weight lookups.
+    model: Arc<CmfModel>,
     inv_freq: Vec<f32>,
     pool: Option<Arc<Pool>>,
     pub hidden: usize,
@@ -855,6 +937,19 @@ impl MiniMaxH3 {
         let n_blocks = u("num_layers");
         let n_refiner = u("token_refiner_num_layers");
         let f32v = |n: &str| crate::dit::cmf_f32(model, n);
+        let image = cfg["image"].as_bool() == Some(true);
+        let pdd_steps = u("pdd_steps").max(1);
+        let pdd_sigmas: Vec<f64> = cfg["pdd_sigmas"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
+        if pdd_steps > 1 && pdd_sigmas.len() != pdd_steps + 1 {
+            return Err(format!(
+                "dit.config_json: {pdd_steps} PDD heads need {} sigmas, got {}",
+                pdd_steps + 1,
+                pdd_sigmas.len()
+            ));
+        }
 
         // Which of the adapter's names actually found a projection here.
         let bound: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
@@ -913,8 +1008,16 @@ impl MiniMaxH3 {
         Ok(Self {
             video_patch: Proj::from_model(model, "dit.video_patch_proj.weight")?,
             video_patch_b: f32v("dit.video_patch_proj.bias")?,
-            audio_patch: Proj::from_model(model, "dit.audio_patch_proj.weight")?,
-            audio_patch_b: f32v("dit.audio_patch_proj.bias")?,
+            audio_patch: if image {
+                None
+            } else {
+                Some(Proj::from_model(model, "dit.audio_patch_proj.weight")?)
+            },
+            audio_patch_b: if image {
+                Vec::new()
+            } else {
+                f32v("dit.audio_patch_proj.bias")?
+            },
             condition: Proj::from_model(model, "dit.condition_proj.weight")?,
             condition_b: f32v("dit.condition_proj.bias")?,
             refiner,
@@ -924,8 +1027,25 @@ impl MiniMaxH3 {
             final_adaln: Adaln::load(model, "dit.final_layer.adaln")?,
             video_out: Proj::from_model(model, "dit.final_layer.video_out.weight")?,
             video_out_b: f32v("dit.final_layer.video_out.bias")?,
-            audio_out: Proj::from_model(model, "dit.final_layer.audio_out.weight")?,
-            audio_out_b: f32v("dit.final_layer.audio_out.bias")?,
+            audio_out: if image {
+                None
+            } else {
+                Some(Proj::from_model(model, "dit.final_layer.audio_out.weight")?)
+            },
+            audio_out_b: if image {
+                Vec::new()
+            } else {
+                f32v("dit.final_layer.audio_out.bias")?
+            },
+            pdd_w: if pdd_steps > 1 {
+                f32v("dit.final_layer.video_out.weight")?
+            } else {
+                Vec::new()
+            },
+            pdd_steps,
+            pdd_sigmas,
+            image,
+            model: model.clone(),
             inv_freq: f32v("dit.rope_inv_freq")?,
             pool: Pool::from_env(),
             hidden: u("hidden_size"),
@@ -1013,10 +1133,7 @@ impl MiniMaxH3 {
                 *v += b;
             }
         }
-        let ids: Vec<[f64; 3]> = Vec::new();
-        for blk in &self.refiner {
-            self.block_forward(blk, &mut h, n, None, &ids, &[]);
-        }
+        self.run_blocks(&self.refiner, &mut h, n, &[], &[], &[]);
         let mut out = vec![0f32; n * self.hidden];
         for (o, x) in out
             .chunks_exact_mut(self.hidden)
@@ -1777,7 +1894,11 @@ impl MiniMaxH3 {
         h[tseg.start * hs..tseg.stop * hs].copy_from_slice(&text[..(tseg.stop - tseg.start) * hs]);
         self.video_patch
             .matmat(&v_rows, v_n, &mut h[vblk_start * hs..vblk_stop * hs], pool);
-        self.audio_patch.matmat(
+        let audio_patch = self
+            .audio_patch
+            .as_ref()
+            .expect("the audio-video forward on a model without an audio stream");
+        audio_patch.matmat(
             &a_rows,
             ablk_stop - ablk_start,
             &mut h[ablk_start * hs..ablk_stop * hs],
@@ -1851,7 +1972,9 @@ impl MiniMaxH3 {
             (
                 aseg,
                 row_a,
-                &self.audio_out,
+                self.audio_out
+                    .as_ref()
+                    .expect("the audio-video forward on a model without an audio stream"),
                 &self.audio_out_b,
                 &mut audio_out,
                 self.audio_dim,
@@ -1928,6 +2051,270 @@ impl MiniMaxH3 {
             video.iter().map(|&v| -v).collect(),
             audio.iter().map(|&v| -v).collect(),
         )
+    }
+}
+
+// ── MiniMax-H3-Image ────────────────────────────────────────────────
+
+impl MiniMaxH3 {
+    /// `blocks` over `h` `[n, hidden]`, in place. On a backend with a
+    /// resident chain the whole stack runs on the card — the stream goes
+    /// up once and comes back once; otherwise block by block through the
+    /// per-op paths. `ts` are the distinct timesteps (empty for the
+    /// unmodulated token refiner), `pos` the rows' positions (empty: no
+    /// rotation), `rows` each row's modulation row.
+    /// `CMF_MMH3_CHAIN=0` keeps the per-op path.
+    fn run_blocks(
+        &self,
+        blocks: &[Block],
+        h: &mut [f32],
+        n: usize,
+        ts: &[f64],
+        pos: &[[f64; 3]],
+        rows: &[u32],
+    ) {
+        let pool = self.pool.as_deref();
+        if std::env::var("CMF_MMH3_CHAIN").as_deref() != Ok("0")
+            && crate::gpu::enabled_here()
+            && crate::gpu::h3_chain_available()
+        {
+            let mods: Vec<Vec<f32>> = blocks
+                .iter()
+                .map(|b| b.adaln.as_ref().map(|a| a.eval(ts, pool)).unwrap_or_default())
+                .collect();
+            let angles = if pos.is_empty() {
+                Vec::new()
+            } else {
+                self.rope_angles(pos)
+            };
+            let idx = |p: &Proj| match p {
+                Proj::Q(q) => q.mapped_device_gemm().map(|(_, i)| i),
+                Proj::F32 { .. } => None,
+            };
+            let chain: Option<Vec<crate::gpu::H3ChainBlock>> = blocks
+                .iter()
+                .zip(&mods)
+                .map(|(b, m)| {
+                    if BlockLora::live(&b.lora.qkv)
+                        || BlockLora::live(&b.lora.out)
+                        || b.lora.ffn_any()
+                    {
+                        return None;
+                    }
+                    Some(crate::gpu::H3ChainBlock {
+                        qkv: idx(&b.qkv)?,
+                        out: idx(&b.out)?,
+                        fc1: idx(&b.fc1)?,
+                        fc2: idx(&b.fc2)?,
+                        norm1: &b.norm1,
+                        norm2: &b.norm2,
+                        q_norm: &b.q_norm,
+                        k_norm: &b.k_norm,
+                        mods: m,
+                        qkv_bias: &[],
+                        out_bias: &[],
+                        fc1_bias: &[],
+                        fc2_bias: &[],
+                        scale1: &[],
+                        scale2: &[],
+                    })
+                })
+                .collect();
+            if let Some(chain) = chain {
+                let job = crate::gpu::H3Chain {
+                    model: &self.model,
+                    blocks: &chain,
+                    n,
+                    hidden: self.hidden,
+                    heads: self.heads,
+                    head_dim: self.head_dim,
+                    ffn: self.ffn,
+                    eps: self.eps as f32,
+                    qk_eps: self.qk_eps as f32,
+                    angles: &angles,
+                    rows,
+                    groups: 1,
+                    qkv_interleaved: false,
+                };
+                if crate::gpu::h3_chain(&job, h) {
+                    return;
+                }
+            }
+        }
+        for (i, blk) in blocks.iter().enumerate() {
+            let mods = blk.adaln.as_ref().map(|a| a.eval(ts, pool));
+            self.block_forward(blk, h, n, mods.as_deref(), pos, rows);
+            if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
+                eprint!("\r  block {}/{}", i + 1, blocks.len());
+            }
+        }
+    }
+
+    /// One denoise evaluation of MiniMax-H3-Image.
+    ///
+    /// `latent` is `[latents_dim, lat_h, lat_w]`, channel-major; `text`
+    /// the refined `[n, hidden]` stream; `refs` each reference picture's
+    /// latent with its `(lat_h, lat_w)`, in the layout's order. The step
+    /// runs from `sigma` to `sigma_next` — the output layer is a bank of
+    /// per-step heads, and the step takes the heads of the grid intervals
+    /// it spans. Returns the velocity the sampler steps with
+    /// (`x += (sigma_next − sigma) · v`).
+    pub fn forward_image(
+        &self,
+        layout: &Layout,
+        text: &[f32],
+        latent: &[f32],
+        refs: &[(&[f32], usize, usize)],
+        sigma: f64,
+        sigma_next: f64,
+    ) -> Vec<f32> {
+        let hs = self.hidden;
+        let pool = self.pool.as_deref();
+        let t = 1.0 - sigma;
+        // Text follows the target; a reference's rows are conditions and
+        // pin near 1.
+        let has_ref = layout.segments.iter().any(|s| s.kind == Kind::RefImg);
+        let t_ref = t.max(self.cond_aug);
+        let mut ts = vec![t];
+        if has_ref && t_ref != t {
+            ts.push(t_ref);
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let row_of = |x: f64| ts.iter().position(|&v| v == x).unwrap();
+        let (row_t, row_r) = (row_of(t), if has_ref { row_of(t_ref) } else { 0 });
+
+        let mut rows = vec![0u32; layout.seq_len];
+        for s in &layout.segments {
+            match s.kind {
+                Kind::Text => {
+                    for (i, v) in rows[s.start..s.stop].iter_mut().enumerate() {
+                        let tag = *layout.text_tags.get(i).unwrap_or(&(TAG_TEXT as u8));
+                        *v = (row_t * MODALITIES + tag as usize) as u32;
+                    }
+                }
+                Kind::RefImg => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_r * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+                _ => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_t * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+            }
+        }
+
+        // ── embed ──
+        let vd = self.latents_dim * 4;
+        let mut h = vec![0f32; layout.seq_len * hs];
+        let tseg = layout.segment(Kind::Text);
+        h[tseg.start * hs..tseg.stop * hs].copy_from_slice(&text[..(tseg.stop - tseg.start) * hs]);
+        let embed = |r: &[f32], dst: &mut [f32]| {
+            self.video_patch.matmat(r, r.len() / vd, dst, pool);
+            for row in dst.chunks_exact_mut(hs) {
+                for (v, &b) in row.iter_mut().zip(&self.video_patch_b) {
+                    *v += b;
+                }
+            }
+        };
+        for (i, s) in layout
+            .segments
+            .iter()
+            .filter(|s| s.kind == Kind::RefImg)
+            .enumerate()
+        {
+            let (z, rh, rw) = refs[i];
+            let mut r = patchify_video(z, self.latents_dim, 1, rh, rw);
+            if self.cond_aug < 1.0 {
+                // The reference blends 0.1% of seeded noise into a
+                // condition row; ours is its own stream of the same law.
+                let noise = crate::videogen::gauss_pub(r.len(), 0x5EED ^ i as u64);
+                let a = self.cond_aug as f32;
+                for (v, n) in r.iter_mut().zip(&noise) {
+                    *v = a * *v + (1.0 - a) * n;
+                }
+            }
+            embed(&r, &mut h[s.start * hs..s.stop * hs]);
+        }
+        let vseg = layout.segment(Kind::Video);
+        let v_rows = patchify_video(latent, self.latents_dim, 1, layout.lat_h, layout.lat_w);
+        embed(&v_rows, &mut h[vseg.start * hs..vseg.stop * hs]);
+
+        // ── blocks ──
+        self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows);
+
+        // ── the output layer ──
+        let n = vseg.stop - vseg.start;
+        let fm = self.final_adaln.eval(&ts, pool);
+        let shift = &fm[row_t * 2 * hs..row_t * 2 * hs + hs];
+        let scale = &fm[row_t * 2 * hs + hs..(row_t + 1) * 2 * hs];
+        let mut hn = vec![0f32; n * hs];
+        for (o, src) in hn
+            .chunks_exact_mut(hs)
+            .zip(h[vseg.start * hs..vseg.stop * hs].chunks_exact(hs))
+        {
+            rms_norm_into(src, &self.final_norm, self.final_eps, o);
+            for ((v, &sc), &sh) in o.iter_mut().zip(scale).zip(shift) {
+                *v = *v * (1.0 + sc) + sh;
+            }
+        }
+        let mut out = vec![0f32; n * vd];
+        if self.pdd_steps > 1 {
+            let (w, b) = self.pdd_head(sigma, sigma_next);
+            crate::fcd_ops::gemm_nt(&hn, &w, &mut out, n, hs, vd, pool);
+            for r in out.chunks_exact_mut(vd) {
+                for (v, &bv) in r.iter_mut().zip(&b) {
+                    *v += bv;
+                }
+            }
+        } else {
+            self.video_out.matmat(&hn, n, &mut out, pool);
+            for r in out.chunks_exact_mut(vd) {
+                for (v, &bv) in r.iter_mut().zip(&self.video_out_b) {
+                    *v += bv;
+                }
+            }
+        }
+        let img = unpatchify_video(&out, self.latents_dim, 1, layout.lat_h, layout.lat_w);
+        img.iter().map(|&v| -v).collect()
+    }
+
+    /// The output head of the step `sigma → sigma_next`: block 0 of the
+    /// bank is a full head and the later blocks are offsets from it; a
+    /// step takes the Δσ-weighted mean of the heads of the grid intervals
+    /// it spans (one interval, on the grid the bank was distilled for).
+    fn pdd_head(&self, sigma: f64, sigma_next: f64) -> (Vec<f32>, Vec<f32>) {
+        let n = self.pdd_steps;
+        let grid = &self.pdd_sigmas;
+        let nearest = |s: f64| {
+            (0..=n)
+                .min_by(|&a, &b| {
+                    (grid[a] - s)
+                        .abs()
+                        .partial_cmp(&(grid[b] - s).abs())
+                        .unwrap()
+                })
+                .unwrap()
+        };
+        let start = nearest(sigma).min(n - 1);
+        let stop = nearest(sigma_next).max(start + 1);
+        let dt: Vec<f64> = (start..stop).map(|k| grid[k] - grid[k + 1]).collect();
+        let total: f64 = dt.iter().sum();
+        let (hs, vd) = (self.hidden, self.latents_dim * 4);
+        let mut w = self.pdd_w[..vd * hs].to_vec();
+        let mut b = self.video_out_b[..vd].to_vec();
+        let first = start.max(1);
+        for k in first..stop {
+            let wk = (dt[k - start] / total) as f32;
+            for (d, &s) in w.iter_mut().zip(&self.pdd_w[k * vd * hs..(k + 1) * vd * hs]) {
+                *d += wk * s;
+            }
+            for (d, &s) in b.iter_mut().zip(&self.video_out_b[k * vd..(k + 1) * vd]) {
+                *d += wk * s;
+            }
+        }
+        (w, b)
     }
 }
 
@@ -2050,6 +2437,35 @@ mod tests {
     /// row. Absolute positions are the whole point of the chunked path:
     /// if this drifts, every chunk after the first is told it is
     /// generating the opening again.
+    #[test]
+    fn an_image_layout_puts_references_between_the_text_and_the_target() {
+        // 5 text rows, one 4x8 reference latent (2x4 rows), an 8x8 target
+        // latent (4x4 rows)
+        let l = Layout::image(5, 8, 8, &[(4, 8)], &[]);
+        assert_eq!(l.seq_len, 5 + 8 + 16);
+        assert_eq!((l.latent_t, l.audio_t, l.frame_rows), (1, 0, 16));
+        let kinds: Vec<Kind> = l.segments.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, vec![Kind::Text, Kind::RefImg, Kind::Video]);
+        // text rows count along the time axis only
+        assert_eq!(l.pos[3], [3.0, 0.0, 0.0]);
+        // the reference sits at the text's end, on its own area-normalized
+        // grid: sqrt(4·8) = 5.657, so h spans 4/5.657 and w 8/5.657 of 32
+        let r = l.pos[5];
+        assert_eq!(r[0], 5.0);
+        let (ratio_h, ratio_w) = (4.0 / 32f64.sqrt(), 8.0 / 32f64.sqrt());
+        assert!((r[1] - (1.0 - ratio_h) / 2.0 * 32.0).abs() < 1e-9);
+        assert!((r[2] - (1.0 - ratio_w) / 2.0 * 32.0).abs() < 1e-9);
+        // the target follows the reference by one step, a square grid
+        // from 0 in steps of 32 / 4
+        assert_eq!(l.pos[13], [6.0, 0.0, 0.0]);
+        assert_eq!(l.pos[14], [6.0, 0.0, 8.0]);
+        assert_eq!(l.pos[13 + 4], [6.0, 8.0, 0.0]);
+        // without references the target starts where the text ends
+        let t = Layout::image(5, 8, 8, &[], &[]);
+        assert_eq!(t.pos[5], [5.0, 0.0, 0.0]);
+        assert_eq!(t.seq_len, 21);
+    }
+
     #[test]
     fn streaming_layout_degenerates_to_the_bidirectional_one() {
         let (lat_h, lat_w, latent_t, audio_t, text_len) = (16, 24, 7, 12, 5);

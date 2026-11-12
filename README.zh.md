@@ -112,6 +112,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## MiniMax-H3-Image:文生图与图片编辑(0.8.73)
+
+[MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) 用六步生成和编辑 4 到 16 百万像素的
+图片。一个 24.6 GB 的文件里有 4 位的 200 亿参数扩散 Transformer 和 Qwen3-VL 提示词编码器,以及 8 位的 VAE。
+在 16 GB 的 RTX 2000 Ada 上,CUDA 后端生成 2048×2048 用时 50.3 秒;在 4 GB 显存上限下用时 60.2 秒,得到
+同一张图片:
+
+```sh
+CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
+CMF_GPU=cuda CMF_GPU_VRAM_MB=4000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+```
+
+参见[指南](docs/MINIMAX_H3_IMAGE.zh.md)。模型采用 MiniMax-H3-Image Community License。
+
 ## Dory Turbo 在 CUDA 上保持固定显存上限(0.8.72)
 
 [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf) 的 turbo 文件现在在 CUDA
