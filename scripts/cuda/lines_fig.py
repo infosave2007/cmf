@@ -9,7 +9,8 @@ SPEC: {"name": "cuda", "ctx": [1000, ...], "labels": ["1 000", ...],
                        "cuda": "<series name>", ...}, "ru": {...}, "zh": {...}},
        "mem_max": 24, "decode_max": 250}
 A value of null is not drawn (a run that did not finish). A series with "dash": true is drawn dashed with
-small dots: list it after the series it may coincide with, and both show."""
+small dots: list it after the series it may coincide with, and both show. "panels": ["first", "decode"] draws
+those panels only, across the whole width."""
 import json
 import math
 import os
@@ -44,6 +45,12 @@ def fig(spec, lang):
         (570, 1040, "decode", False, spec.get("decode_max")),
         (1090, 1550, "mem", False, spec.get("mem_max")),
     )
+    want = spec.get("panels")
+    if want:
+        # fewer panels share the width evenly
+        kept = [p for p in panels if p[2] in want]
+        w = (1500 - 50 * (len(kept) - 1)) / len(kept)
+        panels = tuple((50 + i * (w + 50), 50 + i * (w + 50) + w - 30, p[2], p[3], p[4]) for i, p in enumerate(kept))
     for x0, x1, key, logy, vmax in panels:
         s.text(x0, 222, t[key], 24, INK, "700")
         X = lambda i: x0 + 70 + (x1 - x0 - 110) * (lg[i] - lg[0]) / (lg[-1] - lg[0])
