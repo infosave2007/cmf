@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of them (the card rounds each allocation up to 2 MiB: 0.95 GB on 64 layers), one per GDN layer's state, small
   constants in shared blocks; a prompt chunk's weight expands to f16 in 64 MiB bands; the decode attention's
   scratch sized by the keys a call reads instead of the context cap. `CMF_CUDA_MEM=1` reports what the card holds.
+- CUDA Fast Code (`qwen4_exp`): a faster decode on the small path (#112). Expert kernels in the fast precision
+  take int8 dot products (`__dp4a`), the down projection runs four lanes a row, the hyper-connection fold takes
+  all four streams at once, the small norm, gate and conv kernels run in f32 instead of f64, the draft vocabulary
+  is the first 65 536 ids, and the n-gram table is kept in the page cache. RTX 5090, a masked write task: a
+  verify window 15.2 → 10.2 ms, a draft round 2.5 → 1.2 ms, a client 173–187 → 256–291 tok/s.
 
 
 ## [0.8.70] — 2026-11-12
