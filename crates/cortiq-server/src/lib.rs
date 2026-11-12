@@ -52,6 +52,17 @@ pub struct SlotGuard {
     _permit: OwnedSemaphorePermit,
 }
 
+/// A guard with drop glue of its own cannot be taken apart: a `move` closure
+/// that reads `slot.pipe` captures the whole guard, permit included. Without
+/// it, edition 2021's disjoint capture moved only `pipe` and `device` into a
+/// generation's `spawn_blocking`, and the permit stayed in the handler: a
+/// client that hung up mid-prompt dropped the handler, freed the permit while
+/// the pipeline was still locked, and the next request hit the `unreachable!`
+/// in `acquire`.
+impl Drop for SlotGuard {
+    fn drop(&mut self) {}
+}
+
 impl PipelinePool {
     pub fn new(pipelines: Vec<Pipeline>) -> Self {
         let n = pipelines.len();

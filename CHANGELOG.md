@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `cortiq serve`: a client that hangs up in the middle of a request no longer breaks the server. A generation's
+  `spawn_blocking` closure captured only the slot guard's pipeline and card (edition 2021 captures fields), so
+  the handler dropped with the client freed the slot's permit while the pipeline was still locked, and the next
+  request panicked in `PipelinePool::acquire` ("semaphore permit held but every slot is locked") and got its
+  connection closed. The guard now has drop glue of its own, so a closure takes it whole: the next request waits
+  for the slot and is served (Qwen3.8-27B Turbo on CUDA, two rounds of a 30 000-character request cut after 3 s:
+  answered in 25 and 22 s, no panic).
+
 ## [0.8.71] — 2026-11-12
 
 ### Changed
