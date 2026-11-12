@@ -53,23 +53,73 @@ CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt 
 
 cortiq 0.8.64 and later read prompts on the card below at 98–112 tok/s; 0.8.63 runs the same file at about 75. `--no-think` asks for a direct answer; without it the model reasons first, so raise `--max-tokens`
 (default 256). Each `cortiq run` loads the model again (about 8 s for 14 GB on the card measured); for chat keep it
-loaded with the server:
-
-```bash
-cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
-
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model": "orcacyber-nano-1.0-turbo", "enable_thinking": false, "temperature": 0,
-       "messages": [{"role": "user", "content": "Is strcpy(b, s) into char b[16] safe? Fix it."}]}'
-```
-
-Endpoints: `/v1/chat/completions` (streaming, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
-`/healthz`. Without `--host` the server listens on all interfaces.
+loaded with the [server](#server).
 
 | file | quantization | size | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4-bit (q4tp), text, MTP head | 14.3 GB | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
 | `orcacyber-nano-1.0-turbo.dflash.cmf` | DFlash 2 drafter, 4-bit (optional, CUDA) | 1.3 GB | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
+
+## Server
+
+`cortiq serve` puts the file behind an OpenAI-compatible HTTP API, with a web dashboard on the same port.
+
+Vulkan, DX12 or Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+An NVIDIA card through CUDA (a build with `--features cuda`; from cortiq 0.8.71 a long prompt stays within the
+card's memory there too):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+A request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "orcacyber-nano-1.0-turbo",
+  "messages": [{"role": "user", "content": "Summarize the report below.\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8080/v1"` and any API key:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="orcacyber-nano-1.0-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\nSummarize it."}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| endpoint | what it does |
+|---|---|
+| `POST /v1/chat/completions` | a chat turn (`tools` too); `stream: true` sends the answer as it is decoded |
+| `POST /v1/completions` | the continuation of a `prompt` |
+| `GET /v1/models` | the served model |
+| `GET /healthz` | 200 while the server is up |
+| `GET /` | the web dashboard |
+
+- `CMF_MAX_SEQ` is the longest conversation a request may hold, 32 768 tokens by default. Set it above your
+  longest document: past the seal the card's memory stays where it is.
+- `temperature: 0` turns on the MTP head's draft tokens, as `--greedy` does for `cortiq run`; on CUDA, `CMF_DFLASH=1` with `orcacyber-nano-1.0-turbo.dflash.cmf` beside the file adds the DFlash drafter, a little faster on code. `enable_thinking: false` asks for a direct answer.
+- `model` may be any name: one file is served.
+- `--host 127.0.0.1` keeps the server local; the default is every interface, and no API key is checked.
+- A turn that continues the previous one reads only what is new. Past the seal of a long document, a new turn
+  reads the conversation again.
 
 ## Performance
 
@@ -260,19 +310,73 @@ CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt 
 
 cortiq 0.8.64 и новее читает промпт на карте из раздела ниже со скоростью 98–112 ток/с; 0.8.63 запускает тот же файл примерно на 75. `--no-think` просит прямой ответ; без него модель сначала рассуждает, так что поднимите `--max-tokens`
 (по умолчанию 256). Каждый `cortiq run` загружает модель заново (около 8 с на 14 ГБ на замеренной карте); для чата
-держите её загруженной в сервере:
-
-```bash
-cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
-```
-
-Эндпоинты: `/v1/chat/completions` (стриминг, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
-`/healthz`. Без `--host` сервер слушает все интерфейсы.
+держите её загруженной в [сервере](#сервер).
 
 | файл | квантизация | размер | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4 бита (q4tp), текст, MTP-голова | 14,3 ГБ | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
 | `orcacyber-nano-1.0-turbo.dflash.cmf` | драфтер DFlash 2, 4 бита (необязательно, CUDA) | 1,3 ГБ | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
+
+### Сервер
+
+`cortiq serve` открывает файл через HTTP API, совместимый с OpenAI, и веб-панель на том же порту.
+
+Vulkan, DX12 или Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+Карта NVIDIA через CUDA (сборка с `--features cuda`; начиная с cortiq 0.8.71 длинный промпт и там держится в
+памяти карты):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+Запрос:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "orcacyber-nano-1.0-turbo",
+  "messages": [{"role": "user", "content": "Перескажи отчёт ниже.\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+Подойдёт любой клиент OpenAI с `base_url="http://127.0.0.1:8080/v1"` и любым ключом API:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="orcacyber-nano-1.0-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\nПерескажи это."}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| адрес | что делает |
+|---|---|
+| `POST /v1/chat/completions` | реплика чата (и `tools`); `stream: true` отдаёт ответ по мере декодирования |
+| `POST /v1/completions` | продолжение `prompt` |
+| `GET /v1/models` | обслуживаемая модель |
+| `GET /healthz` | 200, пока сервер работает |
+| `GET /` | веб-панель |
+
+- `CMF_MAX_SEQ` — самый длинный диалог в запросе, по умолчанию 32 768 токенов. Ставьте больше самого длинного
+  документа: после печати память карты не растёт.
+- `temperature: 0` включает черновые токены MTP-головы, как `--greedy` у `cortiq run`; на CUDA `CMF_DFLASH=1` с `orcacyber-nano-1.0-turbo.dflash.cmf` рядом с файлом добавляет драфтер DFlash, на коде он чуть быстрее. `enable_thinking: false` просит прямой ответ.
+- `model` может быть любым именем: сервер отдаёт один файл.
+- `--host 127.0.0.1` оставляет сервер локальным; по умолчанию он слушает все интерфейсы и ключи API не проверяет.
+- Реплика, продолжающая предыдущую, читает только новое. После печати длинного документа новая реплика читает
+  диалог заново.
 
 ### Производительность
 
@@ -458,19 +562,70 @@ cargo install cortiq-cli --features cuda
 CMF_GPU=cuda cortiq run orcacyber-nano-1.0-turbo.cmf --prompt-file incident.txt --greedy --no-think
 ```
 
-cortiq 0.8.64 及更新版本在下文那块显卡上读取提示为 98–112 tok/s；0.8.63 运行同一文件约为 75。`--no-think` 要求直接回答；不加时模型会先推理，请调大 `--max-tokens`（默认 256）。每次 `cortiq run` 都会重新加载模型
-（在实测显卡上 14 GB 约需 8 秒）；聊天请用服务器常驻：
-
-```bash
-cortiq serve orcacyber-nano-1.0-turbo.cmf --host 127.0.0.1 --port 8080
-```
-
-接口：`/v1/chat/completions`（流式、`tools`、`enable_thinking`）、`/v1/completions`、`/v1/models`、`/healthz`。不加 `--host` 时服务器监听所有网卡。
+cortiq 0.8.64 及更新版本在下文那块显卡上读取提示为 98–112 tok/s；0.8.63 运行同一文件约为 75。`--no-think` 要求直接回答；不加时模型会先推理，请调大 `--max-tokens`（默认 256）。每次 `cortiq run` 都会重新加载模型(在实测显卡上 14 GB 约需 8 秒);聊天请用[服务器](#服务器)常驻。
 
 | 文件 | 量化 | 大小 | sha256 |
 |---|---|---:|---|
 | `orcacyber-nano-1.0-turbo.cmf` | 4 位（q4tp），文本，MTP 头 | 14.3 GB | `6ff230576c09672102f1f0dbc6020721bc1bad548aa4df9bb31e3c7d1251d5f7` |
 | `orcacyber-nano-1.0-turbo.dflash.cmf` | DFlash 2 草稿模型，4 位（可选，CUDA） | 1.3 GB | `db4fcbe9c4a71fd77c9c06416397dd6978c697f0ade30f5c789490ae28342e26` |
+
+### 服务器
+
+`cortiq serve` 通过与 OpenAI 兼容的 HTTP API 提供这个文件,同一端口上还有网页面板。
+
+Vulkan、DX12 或 Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+通过 CUDA 使用 NVIDIA 显卡(用 `--features cuda` 构建;从 cortiq 0.8.71 起,长提示在这里也不超出显卡内存):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve orcacyber-nano-1.0-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+请求:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "orcacyber-nano-1.0-turbo",
+  "messages": [{"role": "user", "content": "概括下面的报告。\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+任何 OpenAI 客户端都可以使用,`base_url="http://127.0.0.1:8080/v1"`,API 密钥随意:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="orcacyber-nano-1.0-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\n概括一下。"}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| 接口 | 作用 |
+|---|---|
+| `POST /v1/chat/completions` | 一轮对话(也支持 `tools`);`stream: true` 边解码边返回 |
+| `POST /v1/completions` | 续写 `prompt` |
+| `GET /v1/models` | 提供的模型 |
+| `GET /healthz` | 服务器运行时返回 200 |
+| `GET /` | 网页面板 |
+
+- `CMF_MAX_SEQ` 是一个请求能容纳的最长对话,默认 32 768 个 token。请设得比最长的文档更大:封存之后显存不再增长。
+- `temperature: 0` 开启 MTP 头的草稿 token,与 `cortiq run` 的 `--greedy` 相同;在 CUDA 上,设置 `CMF_DFLASH=1` 并把 `orcacyber-nano-1.0-turbo.dflash.cmf` 放在文件旁边,会加入 DFlash 草稿模型,代码上稍快一些。 `enable_thinking: false` 要求直接回答。
+- `model` 可以是任意名字:服务器只提供一个文件。
+- `--host 127.0.0.1` 让服务器只在本机可用;默认监听所有网卡,也不检查 API 密钥。
+- 接着上一轮的请求只读取新的内容。长文档封存之后,新的一轮会重新读取整段对话。
 
 ### 性能
 
