@@ -4769,18 +4769,23 @@ fn cuda_forward(
                 }
                 // `CMF_QWEN_PROFILE`: the experts earlier runs used most go in first
                 let ne = layers.first().map_or(0, |l| l.moe.experts.len());
-                if let Some(pr) = std::env::var("CMF_QWEN_PROFILE").ok().and_then(|path| ExpertProfile::load(&path, layers.len(), ne)) {
+                let profile = std::env::var("CMF_QWEN_PROFILE").ok().and_then(|path| ExpertProfile::load(&path, layers.len(), ne));
+                let ranked = profile.as_ref().map(|pr| pr.ranked()).unwrap_or_default();
+                // before the prefill pins the experts' pages: a pinned page stays on its node
+                d.host_nodes(layers, &ranked, pool);
+                if let Some(pr) = profile.as_ref() {
                     let t0 = std::time::Instant::now();
-                    match d.prefill(layers, &pr.ranked()) {
+                    match d.prefill(layers, &ranked) {
                         Ok(n) => eprintln!(
                             "qwen4 cuda: arena prefilled with {n} of {} profiled experts ({} tokens of history) in {:.2}s",
-                            pr.ranked().len(),
+                            ranked.len(),
                             pr.tokens,
                             t0.elapsed().as_secs_f64()
                         ),
                         Err(e) => eprintln!("qwen4 cuda: prefill: {e}"),
                     }
                 }
+                d.cpu_bench(layers);
                 cache_trim(layers);
                 state.cuda = Some(d)
             }

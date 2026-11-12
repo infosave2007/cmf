@@ -4446,9 +4446,10 @@ impl QTensor {
     /// the term `down_e · (silu(gate_e · x) ⊙ (up_e · x))` the caller weights
     /// and sums. The math of `moe_gate_up_rows` followed by `moe_down_rows`
     /// (the same int8 activation split, outlier terms and SiLU) with every
-    /// row's sum taken in sixteen float lanes, so a value differs from
-    /// theirs by rounding only; the work is one pass over the weights at
-    /// the speed of the memory bus (see `qtensor/moe_fast.rs`). False =
+    /// row's sum taken in sixteen float lanes and the SiLU's exponent a
+    /// sixteen-lane polynomial, so a value differs from theirs by rounding
+    /// only; the work is one dispatch and one pass over the weights at the
+    /// speed of the memory bus (see `qtensor/moe_fast.rs`). False =
     /// not covered (no AVX-512 VNNI, not q4tp, float activations, a shape
     /// outside 64-wide steps): the caller takes the two row kernels.
     pub fn moe_expert_rows_fast(
@@ -4466,6 +4467,70 @@ impl QTensor {
         {
             let _ = (experts, groups, xs, out, pool);
             false
+        }
+    }
+
+    /// Turn the clock of [`QTensor::moe_expert_rows_fast`] on or off; returns what it was.
+    pub fn moe_expert_rows_fast_prof(on: bool) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            moe_fast::PROF_ON.swap(on, Ordering::Relaxed)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = on;
+            false
+        }
+    }
+
+    /// What the clock of [`QTensor::moe_expert_rows_fast`] summed since the last call, as one line; `None`
+    /// when the kernel did not run.
+    pub fn moe_expert_rows_fast_prof_take() -> Option<String> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let p = moe_fast::prof_take();
+            let (calls, parts, experts) = (p[0], p[1], p[2]);
+            if calls == 0 || parts == 0 || experts == 0 {
+                return None;
+            }
+            // thread time a phase took of an expert, microseconds
+            let us = |ns: u64| ns as f64 / 1e3 / experts as f64;
+            let call = |ns: u64| ns as f64 / 1e3 / calls as f64;
+            Some(format!(
+                "{calls} calls of {:.1} threads, {experts} experts, {} pairs, outliers {:.1} a token row and {:.1} a gate row; \
+                 a call {:.0} us of setup ({:.0} the tokens' split) and {:.0} us of wall; thread time an expert, us: \
+                 entry {:.0}, gate/up {:.0}, gate rows {:.0}, down {:.0}, waiting {:.0}",
+                parts as f64 / calls as f64,
+                p[3],
+                p[5] as f64 / p[4].max(1) as f64,
+                p[6] as f64 / p[3].max(1) as f64,
+                call(p[7]),
+                call(p[8]),
+                call(p[9]),
+                us(p[10]),
+                us(p[11]),
+                us(p[12]),
+                us(p[13]),
+                us(p[14]),
+            ))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        None
+    }
+
+    /// Set a knob of [`QTensor::moe_expert_rows_fast`] for the calls to come: 0 = the bytes of weights a
+    /// row prefetches ahead of itself, 1 and 2 = the blocks of rows a core takes at a time of gate/up
+    /// and of down. For a measurement that compares them in one process; the defaults come from
+    /// `CMF_QWEN_CPU_PF` and `CMF_QWEN_CPU_CLAIM`. Returns the knob's value before the call.
+    pub fn moe_expert_rows_fast_tune(knob: usize, value: usize) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            moe_fast::set_tune(knob, value)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (knob, value);
+            0
         }
     }
 
@@ -15799,7 +15864,7 @@ mod tests {
             }
         }
 
-        let (h, inter, ne) = (192usize, 640usize, 5usize);
+        let (h, inter, ne) = (256usize, 640usize, 5usize);
         let arch: cortiq_core::ModelArch = serde_json::from_value(serde_json::json!({
             "arch_name": "tiny-q4tp-moe",
             "hidden_size": h,
@@ -15920,6 +15985,23 @@ mod tests {
             out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             out3.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             "pooled and serial runs must agree bit for bit"
+        );
+        // A pool on two NUMA nodes gives each side half of every matrix's rows: the same bits again.
+        pool.mark_two_nodes(true);
+        let mut out4 = vec![0f32; n_pairs * h];
+        assert!(QTensor::moe_expert_rows_fast(&triples, &groups, &xs, &mut out4, Some(&pool)));
+        let mut out5 = vec![0f32; n_pairs * h];
+        assert!(moe_fast::run_stages(&triples, &groups, &xs, &mut out5, Some(&pool), Some(&gs_out.concat()), None));
+        pool.mark_two_nodes(false);
+        assert_eq!(
+            out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            out4.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "the rows split over two sides must agree bit for bit"
+        );
+        assert_eq!(
+            out2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            out5.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "the down rows split over two sides must agree bit for bit"
         );
         let mut short = vec![0f32; n_pairs * h - 1];
         assert!(!QTensor::moe_expert_rows_fast(&triples, &groups, &xs, &mut short, Some(&pool)));
