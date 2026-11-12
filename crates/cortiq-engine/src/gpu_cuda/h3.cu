@@ -472,6 +472,25 @@ extern "C" __global__ void cv_im2col(const float* __restrict__ x, u16* __restric
     }
 }
 
+// im2col of output samples t0.. of a 1-D convolution over x [c][n]
+// (channel-major, zero outside): cols f32 [samples][c * k] in the weight's
+// (channel, tap) order, tap j reading sample t + j * dil - pad. A thread a
+// (sample, channel).
+extern "C" __global__ void cv_im2col1d(const float* __restrict__ x, float* __restrict__ cols, int c, int n, int k,
+                                       int pad, int dil, int t0, u64 total)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int ch = (int)(idx % c);
+    const int t = t0 + (int)(idx / c);
+    float* dst = cols + (idx / c) * (size_t)c * k + (size_t)ch * k;
+    const float* src = x + (size_t)ch * n;
+    for (int j = 0; j < k; j++) {
+        const int s = t + j * dil - pad;
+        dst[j] = (s >= 0 && s < n) ? src[s] : 0.0f;
+    }
+}
+
 // y [rows][c] += bias [c] (and `add` [rows][c] when given).
 extern "C" __global__ void cv_add(float* __restrict__ y, const float* __restrict__ bias, const float* __restrict__ add,
                                   int c, u64 total)

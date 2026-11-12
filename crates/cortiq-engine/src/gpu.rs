@@ -4590,10 +4590,14 @@ pub fn vision_gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m
     }
 }
 
+/// `y[n×m] = x[n×k] · wᵀ[m×k]`, all f32 from the host, on the device (the
+/// audio decoder's convolutions as im2col panels). `false` = refused.
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_gemm_nt(x, w, y, n, k, m),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4644,6 +4648,11 @@ pub fn conv1d_gemm(
         Backend::Metal => crate::gpu_metal::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt),
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => {
+            // Below a few million products the round trip loses to the host.
+            out_n * ic * k * oc >= (1 << 22) && crate::gpu_cuda::h3_conv1d(x, w, ic, oc, n, k, pad, dil, out_n, yt)
+        }
         #[allow(unreachable_patterns)]
         _ => false,
     }

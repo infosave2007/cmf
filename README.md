@@ -123,6 +123,19 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## MiniMax-H3-Turbo on CUDA, faster on Vulkan and Metal (0.8.76)
+
+[MiniMax-H3-Turbo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf), video with synchronized audio from one
+prompt, now runs its transformer as one resident chain on the GPU, as MiniMax-H3-Image does. On an RTX A5000 a
+512×288 clip of 39 frames in four steps takes 19.5 s on CUDA (was 165.1 s) and 25.8 s over Vulkan (was 97.2 s);
+within 4 GB of the card's memory CUDA takes 22.4 s. A MacBook Air M4 renders 512×256 in 157 s instead of 183 s.
+This release also fixes `cortiq animate` on Vulkan cards with 24 GB, which ran out of memory in 0.8.75:
+
+```sh
+cortiq animate mmh3-turbo-q4tp.cmf --prompt "A corgi in a chef hat flipping a pancake." --out corgi.avi
+CMF_GPU=cuda CMF_GPU_VRAM_MB=4000 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out clip.avi
+```
+
 ## MiniMax-H3-Image on Vulkan and Metal (0.8.75)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) now keeps the image on the GPU from the

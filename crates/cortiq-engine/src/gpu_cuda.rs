@@ -877,7 +877,7 @@ mod hyb;
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
 pub use h3::{
-    h3_attention, h3_chain, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
+    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
     h3_te_chain,
 };
 

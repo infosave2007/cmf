@@ -12,6 +12,10 @@ tags:
 - video
 - audio
 - 4-bit
+- cuda
+- nvidia
+- vulkan
+- metal
 ---
 
 # MiniMax-H3 Turbo — one file, no Python
@@ -23,7 +27,8 @@ brings it to four sampling steps. This is both of them in the
 [CMF container](https://github.com/infosave2007/cmf) — the DiT, the Qwen3-VL
 prompt encoder, the video VAE decoder and the audio vocoder in a single
 memory-mapped file — running on `cortiq`, a Rust binary with no ML framework
-underneath.
+underneath. On an RTX A5000 a 512×288 clip of 39 frames renders in **19.5 s on
+CUDA and 25.8 s over Vulkan**, and within 4 GB of the card's memory in 22.4 s.
 
 The reference checkout is 124.4 GB across four files plus a ComfyUI install.
 Here it is **one file between 13.2 and 23.9 GB**, and which one you take is
@@ -149,21 +154,33 @@ encoder and the RIFF muxer are inside the binary: a pipeline that ends in a
 shell-out to a 20 MB dependency is not a pipeline you can ship. If you want an
 mp4 for a browser, remux it yourself; the model never needs one.
 
-**On a GPU.** Nothing to opt into any more: `cortiq` probes this file's own
-first qkv weight against the host on startup and takes the device arm only if
-they agree, so the arm that renders is the arm that was checked.
+**On a GPU.** Nothing to opt into: `cortiq` uses Vulkan on Linux and Windows
+and Metal on a Mac. It probes this file's own first qkv weight against the
+host on startup and takes the device arm only if they agree, so the arm that
+renders is the arm that was checked.
 
 ```bash
 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
 ```
 
-On one RTX 5090, 512×288, 39 frames: **60.2 s at the default four steps**
-(91.6 s at eight, 42.8 at two). `RUST_LOG=info` prints a per-stage breakdown
-for every run, and the full table is under *What it costs to run* below. The
-whole pipeline stays on the card —
-the DiT block, both VAE decoders, and the vocoder's dilated convolutions — so
-nothing but the finished frames crosses the bus. `CMF_MMH3_GPU=0` forces the
-host path if you want to compare.
+On an NVIDIA card the native CUDA backend is faster still. It is a build
+feature (stable Rust, nothing is linked against CUDA at build time; the
+prebuilt release binaries do not include it) and needs the card's driver with
+the CUDA 12.x libraries `libnvrtc.so.12` and `libcublas.so.12` on the loader's
+path:
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
+```
+
+On one RTX A5000 (24 GB), 512×288, 39 frames, four steps: **19.5 s on CUDA,
+25.8 s over Vulkan**. `RUST_LOG=info` prints a per-stage breakdown for every
+run, and the full table is under *What it costs to run* below. The whole
+pipeline stays on the card — the transformer as one resident chain, the prompt
+encoder, both VAE decoders and the vocoder's convolutions — so nothing but the
+finished frames crosses the bus. `CMF_MMH3_GPU=0` forces the host path if you
+want to compare.
 
 **Two cards.** A render does not split across them, and should not: the DiT
 block and both decoders are already resident, so a second card would only add
@@ -202,13 +219,14 @@ binary both splits and replicates across cards — see
 ### What it needs
 
 RAM at least the file's size — 24 GB — or every step faults on non-resident
-pages; the weights are memory-mapped, not read. Disk: 24 GB. A GPU is optional
-and wants ~14 GB of VRAM for the DiT's planes. No network access at run time.
+pages; the weights are memory-mapped, not read. Disk: 24 GB. A GPU is
+optional. Without a ceiling a run peaks at 12.7 GB of VRAM — a whole-run
+maximum, polled, not a snapshot — and `CMF_GPU_VRAM_MB` caps it: from 4 GB on
+CUDA, from 6 GB over Vulkan (the table under *What it costs to run*). These
+speeds need `cortiq` 0.8.76 or later. No network access at run time.
 
-`mmh3-turbo-clipproj4b-q4tp.cmf` asks for 14 GB of RAM and disk instead, and
-peaks at 15.1 GB of VRAM — a whole-run maximum, polled, not a snapshot. That is
-what makes it the one to reach for on a 20 GB card: below that the prompt
-encoder pages, and on this workload paging costs more than any kernel.
+`mmh3-turbo-clipproj4b-q4tp.cmf` asks for 14 GB of RAM and disk instead: the
+one to reach for where RAM is short, a 24 GB Mac first of all.
 
 ### Field notes: 24 GB Macs and 20 GB cards
 
@@ -446,23 +464,33 @@ against 0.7930); it costs about 4 GB more.
 The file is memory-mapped, so plan on RAM at least its size or every step
 touches non-resident pages.
 
-One RTX 5090, 4 steps, 39 frames. `RUST_LOG=info` prints this breakdown for
-every run:
+One RTX A5000 (24 GB), `mmh3-turbo-q4tp.cmf`, 512×288, 39 frames, 4 steps,
+`cortiq` 0.8.76, single runs. `RUST_LOG=info` prints this breakdown for every
+run:
 
-| | text | denoise | video VAE | audio VAE | total |
-|---|---|---|---|---|---|
-| 512×288 | 2.5 s | 34.8 s | 16.6 s | 4.3 s | **60.2 s** |
-| 512×256 | 2.3 s | 31.4 s | 8.4 s | 4.3 s | **48.5 s** |
-| 256×160, 22 frames | | | | | **15.9 s** |
-| 512×288, host only (`CMF_MMH3_GPU=0`) | 2.6 s | 363.5 s | 271.5 s | 7.1 s | **646.1 s** |
+| | text | denoise | video VAE | audio VAE | total | peak VRAM |
+|---|---|---|---|---|---|---|
+| CUDA | 2.5 s | 7.7 s | 3.5 s | 3.9 s | **19.5 s** | 12.4 GB |
+| CUDA, `CMF_GPU_VRAM_MB=8000` | 2.4 s | 9.6 s | 3.3 s | 4.0 s | **21.1 s** | 7.7 GB |
+| CUDA, `CMF_GPU_VRAM_MB=4000` | 2.5 s | 10.9 s | 3.3 s | 3.9 s | **22.4 s** | 3.8 GB |
+| Vulkan | 3.3 s | 10.3 s | 5.8 s | 4.1 s | **25.8 s** | 12.7 GB |
+| Vulkan, `CMF_GPU_VRAM_MB=8000` | 3.7 s | 13.3 s | 5.4 s | 4.2 s | **28.9 s** | 9.2 GB |
+| Vulkan, `CMF_GPU_VRAM_MB=6000` | 4.0 s | 18.3 s | 5.8 s | 4.5 s | **35.3 s** | 7.1 GB |
+| CUDA, 768×448, 124 frames (5 s) | 2.6 s | 60.3 s | 15.2 s | 11.7 s | **94.4 s** | 13.8 GB |
+| Vulkan, 768×448, 124 frames (5 s) | 3.5 s | 68.1 s | 21.9 s | 12.7 s | **111.6 s** | 13.6 GB |
 
-The card is **10.7× the host path** on the same machine, same seed. At 8
-steps a 512×288 clip is **91.6 s**; at 2 it is 42.8. The same 4-step
-render took 172 s when this card was written — the pipeline has since moved
-onto the card end to end, both VAE decoders with it.
+Under a ceiling the transformer's blocks that do not fit pass through the
+card every step. Over Vulkan the clip under a ceiling is the clip without
+one, bit for bit, and the card's peak stays about 1.1 GB above the ceiling.
+Below 6 GB take CUDA: over Vulkan the video VAE then leaves the resident
+path (63.7 s under 4 GB).
 
-Nearly all of the decode is the video VAE — the vocoder is 4.3 s of it. The
-packed sequence is `[text | audio | video]` and everything attends to
+MacBook Air M4 (24 GB, no fan), Metal, `mmh3-turbo-clipproj4b-q4tp.cmf`,
+512×256, 39 frames, 4 steps: **157 s** — denoise 118.5 s, video VAE 31.2 s,
+audio VAE 2.4 s, 4.4 GB of process memory. The transformer's products run at
+2.8 TFLOP/s of the M4's about 3.5, so the time is the model's arithmetic.
+
+The packed sequence is `[text | audio | video]` and everything attends to
 everything, so cost grows with the token count and then with its square: a
 512×288 second is five times the tokens of a 256×160 one.
 
@@ -471,41 +499,19 @@ everything, so cost grows with the token count and then with its square: a
 so a 288-pixel edge is covered by two 256-pixel tiles overlapping by 224, and
 you pay for 512 rows to get 288. An edge of exactly 256 is one tile. 512×256
 therefore decodes three tiles where 512×288 decodes six, for 89% of the
-pixels. Measured on the current build: the video VAE goes 16.6 s → 8.4 s and
-the whole render 60.2 s → 48.5 s. The schedule is the reference's and this
-port reproduces it exactly; picking an edge that lands on it is free.
+pixels, and the video VAE takes half the time. The schedule is the
+reference's and this port reproduces it exactly; picking an edge that lands
+on it is free.
 
-**Host and device do not agree to the last bit, and neither is wrong.** The
-host arm quantizes activations to int8 (`CMF_SDOT`) where the device
-dequantizes to f32, so the two renders differ by a few per cent in latent rms
-and visibly in fine texture. Set `CMF_SDOT=0` on both sides to compare
-arithmetic instead of that approximation.
-
-**Why the device took a while to trust.** It is no longer opt-in — the parity
-probe decides per file — but getting there took three fixes, and one thing is
-still held back.
-
-The engine's blocked f32 GEMM cached its weight-side device buffer **by
-pointer address**. Every batched attention allocates one k/v scratch pair per
-call and refills it per head — same address, different matrix — so head 0's
-keys came back for every head, on the GPU only, silently. It is keyed on a
-content fingerprint now. The same GEMM also took every job over 4 M MACs on
-sight with no CPU arm to lose to, which on this model's decoder was three
-times *slower* than the host it displaced; it goes through the same
-measure-don't-assume probe as every other op class now, and on this stack the
-probe hands that work back (0.24 ms device against 0.13 host) while sending
-the weight GEMMs to the card (25.8 ms against 92.0).
-
-Still held: **the cooperative-matrix kernel runs this model out of f16 range.**
-At 256×160 the render is correct; at 512×288 the audio stream goes NaN on the
-second sampling step and the video follows. Bisected — `CMF_BAKE_GPU=0` does
-not help, `CMF_COOP=0` does — so `cortiq animate` pins `CMF_COOP=0`.
-
-That hold is specific to this model, not a verdict on the kernel: the image
-model on the same card and the same kernel renders 20.5 s without it against
-14.8 with, and the two agree to 42.6 dB — the price of f16 operands, which
-the kernel documents, not a fault. MiniMax-H3's activations are simply larger.
-Giving that kernel a scale is the next real speedup here.
+**Backends do not agree to the last bit, and none of them is wrong.** One
+forward of the transformer is within 0.3 % of the host's f32 arithmetic on
+CUDA and within 1.2 % over Vulkan, whose tensor-core kernel multiplies f16
+operands. A four-step sampler amplifies that: two backends render the same
+scene with the same motion, and their frames match to about 21 dB. Over
+Vulkan the same command twice gives the same clip bit for bit. The host arm
+quantizes activations to int8 (`CMF_SDOT`); set `CMF_SDOT=0` to compare its
+arithmetic instead of that approximation. `CMF_MMH3_CHAIN=0` keeps the
+per-operation path of the transformer.
 
 ## What the conversion did
 

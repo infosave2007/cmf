@@ -112,6 +112,19 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## MiniMax-H3-Turbo:支持 CUDA，Vulkan 与 Metal 更快(0.8.76)
+
+[MiniMax-H3-Turbo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf) 由一条提示词生成带同步音频的视频，现在与
+MiniMax-H3-Image 一样，把 Transformer 作为一条常驻链放在 GPU 上运行。在 RTX A5000 上，512×288、39 帧、四步的片段在
+CUDA 上用时 19.5 秒（之前 165.1 秒），Vulkan 上用时 25.8 秒（之前 97.2 秒）；显存限制在 4 GB 以内时 CUDA 用时
+22.4 秒。MacBook Air M4 生成 512×256 用时 157 秒，之前是 183 秒。本版本还修复了 0.8.75 中 `cortiq animate`
+在 24 GB 的 Vulkan 显卡上内存不足的问题:
+
+```sh
+cortiq animate mmh3-turbo-q4tp.cmf --prompt "A corgi in a chef hat flipping a pancake." --out corgi.avi
+CMF_GPU=cuda CMF_GPU_VRAM_MB=4000 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out clip.avi
+```
+
 ## MiniMax-H3-Image:Vulkan 与 Metal(0.8.75)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) 现在在 Vulkan 和 Apple 芯片上也把图片
