@@ -112,6 +112,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Lumina-Image 2.0:支持 CUDA(0.8.79)
+
+[Lumina-Image 2.0](https://huggingface.co/infosave/Lumina-Image-2.0cmf) 现在在 CUDA 上也一次调用就在显卡上完成整个
+Transformer 块，与之前的 Vulkan 和 Metal 一样。在 RTX A5000 上，带引导的 30 步 512×512 图片在 CUDA 上用时 40.5 秒
+（之前 332.2 秒），Vulkan 上用时 55.4 秒:
+
+```sh
+CMF_GPU=cuda cortiq imagine lumina-q4tp.cmf --prompt "a red fox sitting in snow at sunset" --out fox.ppm
+```
+
 ## LTX-2.5:CUDA 与 Vulkan，带声音的片段 24 秒(0.8.77)
 
 [LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf) 由一条提示词生成视频及其音轨，现在把 48 个音视频块作为一条
