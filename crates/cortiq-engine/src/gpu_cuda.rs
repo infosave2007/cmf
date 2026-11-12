@@ -685,6 +685,11 @@ fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
 /// Programmatic dependent launch (`CMF_QWEN_PDL=1`): the kernels of the qwen4 module (each starts with
 /// `griddepcontrol.wait`) are launched so that one may begin to schedule while its predecessor drains.
 static PDL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `CMF_QWEN_NOP=1` (a measurement): an empty kernel after every qwen4 launch, to see what a launch costs.
+static NOP_F: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn nop_set(f: cs::CUfunction) {
+    NOP_F.store(f as usize, Ordering::SeqCst);
+}
 static PDL_FUNCS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 pub(crate) fn pdl_set(on: bool) {
@@ -964,6 +969,12 @@ impl Ctx {
             }
             .map_err(derr)
         };
+        let nop = NOP_F.load(Ordering::Relaxed);
+        if nop != 0 && nop != f as usize && r.is_ok() {
+            let (mut p, mut n) = (0u64, 0u64);
+            let mut args = [std::ptr::from_mut(&mut p) as *mut c_void, std::ptr::from_mut(&mut n) as *mut c_void];
+            let _ = unsafe { cu::launch_kernel(nop as cs::CUfunction, (1, 1, 1), (32, 1, 1), 0, self.stream, &mut args) };
+        }
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, self.stream) };
