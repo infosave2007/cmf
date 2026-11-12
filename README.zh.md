@@ -112,6 +112,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## MOSS-Image:支持 CUDA、Vulkan 和 Metal(0.8.81)
+
+[MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) 现在在三个后端上都一次调用就在显卡上完成 DiT 一遍的全部块，
+q4tp 与 q8_2f 均可;在 CUDA 上 Flux2 VAE 解码器也作为一条链运行。在 RTX A5000 上，8 步 512×512 图片在 CUDA 上用时
+10.1 秒（之前 297.1 秒），Vulkan 上用时 17.3 秒（之前 414.7 秒）;1024×1024 的 50 步配方在 CUDA 上用时 123.1 秒。
+MacBook Air M4 生成 512×512 图片用时 69.8 秒（之前 123.7 秒）:
+
+```sh
+CMF_GPU=cuda cortiq imagine moss-image-sft-q4tp.cmf --prompt "A small red fox reading a book in a sunlit library" \
+  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --out fox.png
+```
+
 ## Qwen-Image-Edit-2509:支持 CUDA,Vulkan 更快(0.8.80)
 
 [Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) 现在在 CUDA 上一次调用就在显卡上完成

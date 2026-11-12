@@ -62,7 +62,7 @@ use crate::gpu::{H3Chain, TeChain};
 #[path = "ltx.rs"]
 mod ltx;
 #[cfg_attr(target_os = "macos", allow(unused_imports))]
-pub(crate) use ltx::{ltx_available, ltx_chain, ltx_vae_chain, qwen_chain};
+pub(crate) use ltx::{ltx_available, ltx_chain, ltx_vae_chain, moss_chain, qwen_chain};
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::{Arc, Mutex};
 

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.81] — 2026-11-13
+
+### Added
+- MOSS-Image ([SFT](https://huggingface.co/infosave/MOSS-Image-SFT-cmf),
+  [Base](https://huggingface.co/infosave/MOSS-Image-Base-cmf)) runs every block of a DiT pass as one resident chain
+  on CUDA, Vulkan and Metal (`gpu::moss_chain`): the RMS norm with its weight and the step's shift and scale, the
+  q/k/v products, per-head q/k norm with the split-half rotation, attention over the joint [image | text] rows, the
+  gated residuals, the fused up/gate product with its SiTU and the down product, the weights kept on the card in
+  their codec. CUDA (`gpu_cuda/moss.rs`, `moss.cu`) and Metal (`gpu_metal/h3.rs::moss_chain`, on the H3 chain's
+  kernels) take q4tp and q8_2f; Vulkan (`gpu_wgpu/ltx.rs::moss_chain`) reads q4tp in place on the 16x16 matrix
+  units and expands an int8 tensor into an f16 plane (`zi_dq8`) right before its product.
+  `CMF_MOSS_CHAIN=0` keeps the per-operation blocks.
+  - RTX A5000, release build, SFT q4tp, 512 x 512, 8 steps, CFG 3: CUDA 10.1 s (per-operation 297.1 s; a DiT step
+    36.2 -> 0.67 s), Vulkan 17.3 s (414.7 s; 49.3 -> 0.90 s). 1024 x 1024: CUDA 23.9 s, Vulkan 28.0 s; the
+    card's 50-step recipe at 1024 x 1024 on CUDA 123.1 s. q8_2f at 512 x 512: CUDA 10.6 s, Vulkan 20.8 s.
+  - MacBook Air M4 (Metal), 512 x 512, 8 steps: q4tp 123.7 -> 69.8 s, q8_2f 174.0 -> 72.6 s (a step 14.6 / 21.2 ->
+    8.1 s).
+  - The CUDA picture is 45.4 dB from the per-operation one, Metal's 41.7 dB; Vulkan is 33.7 dB from CUDA.
+- CUDA: the FLUX-class VAE decoder (Lumina-Image 2.0, Z-Image, MOSS-Image's Flux2 decoder) as one resident chain
+  (`gpu_cuda/flux_vae.rs`, `flux_vae.cu`): GroupNorm in three passes, every convolution an im2col with an f16
+  product (the nearest x2 upsampling folded into the gather), the mid-block's wide attention head on TF32 products,
+  residuals landing as the second product's accumulator. A 512 x 512 decode goes 2.5 s to 0.4 s for MOSS-Image
+  and 3.1 s to 0.8 s for Lumina (69.7 and 71.0 dB from the per-operation decoder). `CMF_FLUX_VAE_CUDA=0` keeps
+  the per-operation decoder.
+
+### Changed
+- Lumina-Image 2.0 decodes through the device VAE chain where the backend has one (`VaeDecoder::decode_fast`),
+  as Z-Image and MOSS-Image already did. RTX A5000, release build, 30 steps, CFG 4: CUDA 18.4 s at 512 x 512
+  (0.8.79: 40.5 s; the per-operation convolutions of 0.8.80 and the decode chain take the VAE from about 23 s to
+  0.8 s) and 83.2 s at 1024 x 1024 (180.0 s); Vulkan 49.5 s and 205.4 s (55.4 s and 252.7 s; the decode 11.3 s ->
+  0.6 s, 64.0 dB). On a MacBook Air M4 the decode goes 3.0 s to 1.4 s (68.2 dB).
+
+### Fixed
+- Vulkan: the resident FLUX-class VAE decoder declined MOSS-Image's Flux2 decoder without a word — its widths of
+  384, 192 and 96 channels were outside the GroupNorm kernel (divisors of 256 or exactly 512) and the convolutions
+  padded 192 and 96 to 128-wide tiles the resnets refused — so the picture was decoded one convolution at a time
+  (MOSS-Image's at 1024 x 1024 in 29.1 s, now 0.7 s, 69.1 dB from it). GroupNorm now walks any width up to 512
+  row by row, a width of whole 32s keeps its size with a 64- or 32-wide product tile, and a decline says once
+  where the chain gave up.
+
 ## [0.8.80] — 2026-11-13
 
 ### Added

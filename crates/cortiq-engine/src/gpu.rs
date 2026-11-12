@@ -3939,6 +3939,52 @@ pub fn qwen_image_chain(model: &Arc<CmfModel>, args: &mut QwenImageChainArgs<'_>
     }
 }
 
+/// One MOSS-Image block for [`moss_chain`]: the norm weights and the six
+/// projections' tensor indices.
+pub struct MossChainBlock<'a> {
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub q: usize,
+    pub k: usize,
+    pub v: usize,
+    pub o: usize,
+    /// `[hidden (inter) | gate (inter)]` rows of the fused feed-forward input.
+    pub up_gate: usize,
+    pub down: usize,
+}
+
+/// A MOSS-Image forward's blocks over the joint `[image | text]` rows `x`
+/// (`[tokens][heads · head_dim]`): one modulation `[6][dim]` for every
+/// block, the rotation's first halves `[tokens][head_dim / 2]`.
+pub struct MossChainArgs<'a> {
+    pub x: &'a mut [f32],
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub modulation: &'a [f32],
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub blocks: &'a [MossChainBlock<'a>],
+}
+
+/// Every block of a MOSS-Image forward on the card in one call; `false`:
+/// nothing was written and the caller runs its per-operation blocks.
+#[allow(unused_variables)]
+pub fn moss_chain(model: &Arc<CmfModel>, args: &mut MossChainArgs<'_>) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::moss_chain(model, args),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::moss_chain(model, args),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::h3::moss_chain(model, args),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// The Qwen Image second sub-block on WGPU: affine-free LayerNorm,
 /// shift/scale modulation, Q4TP input projection, exact tanh-GELU, output
 /// projection, bias and gated residual.  `data` is updated in place after a
@@ -6531,6 +6577,8 @@ pub fn vae_decode_chain(
         Backend::Metal => crate::gpu_metal::zimage::vae_decode_chain(a, z, h, w, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::vae_decode_chain(a, z, h, w, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::flux_vae_chain(a, z, h, w, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

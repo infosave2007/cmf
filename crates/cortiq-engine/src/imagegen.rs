@@ -269,7 +269,9 @@ pub fn generate(
         };
         lap(&mut marks, "denoise");
         let vae = VaeDecoder::from_cmf(&model)?;
-        let rgb = to_rgb01(vae.decode(&latents, lh, lw));
+        // the device chain first (`gpu::vae_decode_chain`), the per-operation
+        // decoder where the backend declines
+        let rgb = to_rgb01(vae.decode_fast(&latents, lh, lw));
         lap(&mut marks, "vae decode");
         tracing::info!(
             "stages: {}",

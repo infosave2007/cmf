@@ -1299,6 +1299,312 @@ fn qw_qk(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index)
 }
 "#;
 
+/// `hid = f16(situ(hidden · gin, gate · gin) · oscale)` over `n` values of
+/// rows `inter` wide, `gu` holding `[rows][hidden | gate]`. One thread an
+/// element.
+const SITU_SRC: &str = r#"
+enable f16;
+struct SP { n: u32, inter: u32, gin: f32, oscale: f32 };
+@group(0) @binding(0) var<storage, read> gu: array<f16>;
+@group(0) @binding(1) var<storage, read_write> hid: array<f16>;
+@group(0) @binding(2) var<uniform> p: SP;
+
+@compute @workgroup_size(256)
+fn mo_situ(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= p.n) { return; }
+    let r = i / p.inter;
+    let e = i - r * p.inter;
+    let hv = f32(gu[r * 2u * p.inter + e]) * p.gin;
+    let g = f32(gu[r * 2u * p.inter + p.inter + e]) * p.gin;
+    let sg = 1.0 / (1.0 + exp(-clamp(g, -60.0, 60.0)));
+    let v = 4.0 * tanh(clamp(g * 0.25, -15.0, 15.0)) * sg * 25.0 * tanh(clamp(hv * 0.04, -15.0, 15.0));
+    hid[i] = f16(v * p.oscale);
+}
+"#;
+
+/// A MOSS-Image tensor as the chain reads it: `None` for q4tp (read in place
+/// by the product), else the int8 codec's row-scale and column-field word
+/// offsets in its bytes and whether it has the column field — expanded by
+/// `zi_dq8` into an f16 plane before its product.
+type Q8 = Option<(u32, u32, bool)>;
+
+/// The bytes of an int8 tensor (q8_2f / q8_row) of this shape in the file.
+fn span8(model: &CmfModel, idx: usize, rows: usize, cols: usize) -> Option<((usize, std::ops::Range<usize>), Q8)> {
+    use cortiq_core::TensorDtype as T;
+    let e = model.tensors.get(idx)?;
+    if e.shape.len() != 2 || e.shape[0] != rows || e.shape[1] != cols || !(rows * cols).is_multiple_of(4) || !rows.is_multiple_of(2) || !cols.is_multiple_of(2) {
+        return None;
+    }
+    let has_col = match e.dtype {
+        T::Q8_2f => true,
+        T::Q8Row => false,
+        _ => return None,
+    };
+    let len = rows * cols + 2 * rows + if has_col { 2 * cols } else { 0 };
+    let abs = model.entry_abs_offset(e)?;
+    if e.nbytes as usize != len || abs + len > model.primary_bytes().len() {
+        return None;
+    }
+    let rs = (rows * cols / 4) as u32;
+    Some(((idx, abs..abs + len), Some((rs, rs + (rows / 2) as u32, has_col))))
+}
+
+/// A MOSS-Image forward's blocks over the joint `[image | text]` rows on the
+/// card: the zi_mm products reading q4tp tensors in place (int8 ones through
+/// an f16 plane), attention over all rows on `vit_flash`. `false`: nothing
+/// was written.
+pub(crate) fn moss_chain(model: &Arc<CmfModel>, a: &mut crate::gpu::MossChainArgs<'_>) -> bool {
+    if !ltx_enabled() || std::env::var("CMF_MOSS_WGPU").as_deref() == Ok("0") {
+        return false;
+    }
+    let (n, heads, hd) = (a.tokens, a.heads, a.head_dim);
+    let d = heads * hd;
+    let nb = a.blocks.len();
+    if nb == 0 || hd != 128 || !d.is_multiple_of(128) || n > MAX_ROWS || a.x.len() != n * d || a.modulation.len() != 6 * d {
+        return not_mine("a MOSS-Image forward outside the chain's shapes");
+    }
+    if a.cos.len() != n * hd / 2 || a.sin.len() != a.cos.len() {
+        return not_mine("MOSS-Image rotation tables of the wrong size");
+    }
+    let Some(c) = zi::zctx() else {
+        return not_mine("no adapter with 16x16 f16 cooperative matrices");
+    };
+    const MPER: usize = 6;
+    let mut spans = Vec::with_capacity(nb * MPER);
+    let mut q8s: Vec<Q8> = Vec::with_capacity(nb * MPER);
+    let mut inter = 0usize;
+    let mut plane = 0usize;
+    for b in a.blocks {
+        for (j, ix) in [b.q, b.k, b.v, b.o, b.up_gate, b.down].into_iter().enumerate() {
+            let e = match model.tensors.get(ix) {
+                Some(e) if e.shape.len() == 2 => e,
+                _ => return not_mine("a MOSS-Image projection that is not a matrix"),
+            };
+            let (rows, cols) = (e.shape[0], e.shape[1]);
+            if j == 4 {
+                inter = rows / 2;
+            }
+            if let Some(sp) = span(model, ix, rows, cols) {
+                spans.push(sp);
+                q8s.push(None);
+            } else if let Some((sp, q8)) = span8(model, ix, rows, cols) {
+                spans.push(sp);
+                q8s.push(q8);
+                plane = plane.max(rows * cols);
+            } else {
+                return not_mine("a MOSS-Image projection that is neither q4tp nor int8");
+            }
+        }
+        if b.norm1.len() != d || b.norm2.len() != d || b.q_norm.len() != hd || b.k_norm.len() != hd {
+            return not_mine("a MOSS-Image norm of the wrong width");
+        }
+    }
+    if inter == 0 || !inter.is_multiple_of(128) {
+        return not_mine("a MOSS-Image feed-forward width the tiles do not divide");
+    }
+    let _op = c.op_gate.enter();
+    let _gate = c.mm_gate.lock().unwrap();
+    let gd = Guards::from_env();
+    let fc = flash_cfg();
+    let lim = c.device.limits();
+
+    // ── constants: the norm weights folded into the step's scale ──
+    let mut cw = Cw::default();
+    let md = a.modulation;
+    let o_mod = cw.put(md);
+    let fold = |w: &[f32], sc: &[f32]| -> Vec<f32> { w.iter().zip(sc).map(|(&w, &s)| w * (1.0 + s) - 1.0).collect() };
+    let lay: Vec<[u32; 3]> = a
+        .blocks
+        .iter()
+        .map(|b| [cw.put(&fold(b.norm1, &md[d..2 * d])), cw.put(&fold(b.norm2, &md[4 * d..5 * d])), cw.put(&[b.q_norm, b.k_norm].concat())])
+        .collect();
+    let mut pev: Vec<f32> = Vec::with_capacity(2 * a.cos.len());
+    pev.extend_from_slice(a.cos);
+    pev.extend_from_slice(a.sin);
+    let (pco, pso) = (0u32, a.cos.len() as u32);
+    if (cw.0.len() * 4) as u64 > lim.max_storage_buffer_binding_size {
+        return decline("the MOSS-Image constants pass the largest storage binding");
+    }
+
+    // ── the working set ──
+    let rp = zi::pad_rows(n);
+    let rn = rp + 128;
+    let ld = 3 * d;
+    let acts: u64 = (4 * n * d + 2 * rp * d + 2 * rn * ld + 2 * rn * d + 4 * rp * d + 2 * rp * 2 * inter + 2 * rp * inter + 2 * plane) as u64
+        + (cw.0.len() * 4 + pev.len() * 4) as u64;
+    if (2 * plane) as u64 > lim.max_storage_buffer_binding_size {
+        return decline("a MOSS-Image f16 plane passes the largest storage binding");
+    }
+    if (2 * rn * ld) as u64 > lim.max_storage_buffer_binding_size || (2 * rp * 2 * inter) as u64 > lim.max_storage_buffer_binding_size {
+        return decline("a MOSS-Image panel passes the largest storage binding");
+    }
+    let plan = match plan(c, model, &spans, MPER, acts) {
+        Ok(p) => p,
+        Err(said) => return said,
+    };
+    let sc_oom = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let xb = zi::sbuf(c, (n * d * 4) as u64, "mo_x");
+    let xn = zi::sbuf(c, (rp * d * 2) as u64, "mo_xn");
+    let panel = zi::sbuf(c, (rn * ld * 2) as u64, "mo_panel");
+    let att = zi::sbuf(c, (rn * d * 2) as u64, "mo_att");
+    let y = zi::sbuf(c, (rp * d * 4) as u64, "mo_y");
+    let gu = zi::sbuf(c, (rp * 2 * inter * 2) as u64, "mo_gu");
+    let hid = zi::sbuf(c, (rp * inter * 2) as u64, "mo_hid");
+    let cwb = zi::sbuf_init(c, bytemuck::cast_slice(&cw.0), "mo_cw");
+    let peb = zi::sbuf_init(c, bytemuck::cast_slice(&pev), "mo_pe");
+    let rib = zi::sbuf(c, 16, "mo_ri");
+    // the f16 plane an int8 tensor is expanded into before its product
+    let slot = zi::sbuf(c, (2 * plane).max(16) as u64, "mo_plane");
+    if let Some(e) = pollster::block_on(sc_oom.pop()) {
+        eprintln!("moss wgpu: {e}");
+        return decline("the MOSS-Image working set did not fit the card");
+    }
+    let t = tile();
+    let (f16c, f32c) = (site_cfg(t, Epi::F16), site_cfg(t, Epi::F32));
+    // the same tiles over f16 weights (an expanded int8 tensor)
+    let (f16p, f32p) = (MmCfg::new(t.0, t.1, t.2, t.3, t.4, Epi::F16), MmCfg::new(t.0, t.1, t.2, t.3, t.4, Epi::F32));
+    let fkey = format!("vit_flash_{}_{}_128_{}", fc.nw, fc.bc, zi::flash_thr());
+    let pipes = || -> Option<_> {
+        Some((
+            zi::pipeline(c, "zi_dq8", zi::DQ8_SRC, "zi_dq8")?,
+            zi::pipeline(c, "lx_ada", ADA_SRC, "lx_ada")?,
+            zi::pipeline(c, "qw_qk", QQK_SRC, "qw_qk")?,
+            zi::pipeline(c, &fkey, &vit_flash_src(fc, 128)?, "vit_flash")?,
+            zi::pipeline(c, "mo_situ", SITU_SRC, "mo_situ")?,
+            zi::pipeline(c, "lx_addg", ADDG_SRC, "lx_addg")?,
+        ))
+    };
+    let Some((pdq8, pada, pqk, pfl, psitu, paddg)) = pipes() else {
+        return decline("a kernel of the MOSS-Image chain was rejected by the device");
+    };
+    // tensor `ti` of the stack (its buffer `w`) through a product: q4tp read in
+    // place, int8 expanded into the plane first
+    let prod = |calls: &mut ZCalls, cls: Class, ti: usize, half: bool, nn: usize, k: usize, ldo: usize, ocol: usize, oscale: f32, w: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer| -> Option<()> {
+        let args = margs(n, nn, k, ldo, ocol, oscale);
+        match q8s[ti] {
+            None => calls.push_mm(cls, mm(c, if half { f16c } else { f32c }, &args, 0, w, act, out)?),
+            Some((rs, cs, has_col)) => {
+                let u = zi::ubuf(c, &[k as u32, nn as u32, has_col as u32, 0, 0, rs, cs, 0]);
+                let bg = zi::bg(c, &pdq8, &[w, &slot, &u]);
+                calls.push(Class::Rows, Call { pipe: pdq8.clone(), bg, grid: grid1(nn * k / 4) });
+                calls.push_mm(cls, mm(c, if half { f16p } else { f32p }, &args, 0, &slot, act, out)?);
+            }
+        }
+        Some(())
+    };
+    // the RMS norm times the folded scale plus the shift
+    let ada = |calls: &mut ZCalls, sh: u32, sc: u32| {
+        let u = zi::ubuf(c, &[d as u32, 0, sh, sc, 3, 0, 0, 1e-6f32.to_bits(), p2(-gd.act).to_bits(), 0, 0, 0]);
+        let bg = zi::bg(c, &pada, &[&xb, &xn, &cwb, &rib, &u]);
+        calls.push(Class::Rows, Call { pipe: pada.clone(), bg, grid: (n as u32, 1, 1) });
+    };
+    let addg = |calls: &mut ZCalls, gate: u32| {
+        let total = n * d;
+        let u = zi::ubuf(c, &[total as u32, d as u32, 1, gate, d as u32, 0, 0, NONE, 0, 0, 0, 0]);
+        let bg = zi::bg(c, &paddg, &[&xb, &y, &cwb, &rib, &u]);
+        calls.push(Class::Rows, Call { pipe: paddg.clone(), bg, grid: grid1(total) });
+    };
+    let d32 = d as u32;
+    let build = |blocks: std::ops::Range<usize>, wb: &[wgpu::Buffer]| -> Option<ZCalls> {
+        let mut calls = ZCalls::default();
+        let qs = p2(gd.act - gd.qkv);
+        for (j, bi) in blocks.clone().enumerate() {
+            let (l, w) = (&lay[bi], &wb[j * MPER..(j + 1) * MPER]);
+            let ti = bi * MPER;
+            ada(&mut calls, o_mod, l[0]);
+            for part in 0..3 {
+                prod(&mut calls, Class::MmQkv, ti + part, true, d, d, ld, part * d, qs, &w[part], &xn, &panel)?;
+            }
+            {
+                let u = zi::ubuf(
+                    c,
+                    &[ld as u32, d32, hd as u32, heads as u32, 0, n as u32, p2(gd.qkv).to_bits(), p2(-gd.qkv).to_bits(), NONE, NONE, l[2], l[2], pco, pso, pco, pso, 1e-6f32.to_bits(), 1, 0, 0],
+                );
+                let bg = zi::bg(c, &pqk, &[&panel, &cwb, &peb, &u]);
+                calls.push(Class::Rows, Call { pipe: pqk.clone(), bg, grid: ((3 * heads) as u32, n as u32, 1) });
+            }
+            {
+                let scl = std::f32::consts::LOG2_E / (hd as f32).sqrt();
+                let u = zi::ubuf(c, &[n as u32, n as u32, ld as u32, d32, 2 * d32, d32, scl.to_bits(), 1.0f32.to_bits()]);
+                let bg = zi::bg(c, &pfl, &[&panel, &panel, &att, &u]);
+                calls.push(Class::Flash, Call { pipe: pfl.clone(), bg, grid: ((n as u32).div_ceil(fc.nw * 16), heads as u32, 1) });
+            }
+            prod(&mut calls, Class::MmO, ti + 3, false, d, d, d, 0, p2(gd.qkv), &w[3], &att, &y)?;
+            addg(&mut calls, o_mod + 2 * d32);
+            ada(&mut calls, o_mod + 3 * d32, l[1]);
+            prod(&mut calls, Class::MmW13, ti + 4, true, 2 * inter, d, 2 * inter, 0, p2(gd.act - gd.gu), &w[4], &xn, &gu)?;
+            {
+                let total = n * inter;
+                // the SiTU is bounded by 100: its middle needs no range guard
+                let u = zi::ubuf(c, &[total as u32, inter as u32, p2(gd.gu).to_bits(), 1.0f32.to_bits()]);
+                let bg = zi::bg(c, &psitu, &[&gu, &hid, &u]);
+                calls.push(Class::Rows, Call { pipe: psitu.clone(), bg, grid: grid1(total) });
+            }
+            prod(&mut calls, Class::MmW2, ti + 5, false, d, inter, d, 0, 1.0, &w[5], &hid, &y)?;
+            addg(&mut calls, o_mod + 5 * d32);
+        }
+        Some(calls)
+    };
+
+    // ── the forward ──
+    let uid = model.uid() as usize;
+    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(&*a.x));
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut submitted = false;
+    for (kept, blocks) in plan.runs() {
+        let mine = &spans[blocks.start * MPER..blocks.end * MPER];
+        if !kept {
+            if submitted {
+                zi::wait(c);
+            }
+            let stale: Vec<(usize, usize)> = spans
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !plan.keep.contains(&(i / MPER)) && !blocks.contains(&(i / MPER)))
+                .map(|(_, (idx, _))| (uid, *idx))
+                .collect();
+            super::super::weight_evict(c, &stale);
+        }
+        let wb = match fetch(c, model, mine) {
+            Ok(wb) => wb,
+            Err(said) => {
+                let _ = pollster::block_on(sc.pop());
+                return said;
+            }
+        };
+        let mut start = blocks.start;
+        while start < blocks.end {
+            let end = (start + 6).min(blocks.end);
+            let Some(calls) = build(start..end, &wb[(start - blocks.start) * MPER..(end - blocks.start) * MPER]) else {
+                let _ = pollster::block_on(sc.pop());
+                return decline("a kernel of the MOSS-Image chain was rejected by the device");
+            };
+            let mut enc = c.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                calls.record(&mut pass, None);
+            }
+            c.queue.submit(Some(enc.finish()));
+            submitted = true;
+            start = end;
+        }
+    }
+    let rx = zi::read_bytes(c, &xb, (n * d * 4) as u64);
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        return decline(&format!("the MOSS-Image chain's command buffer failed: {e}"));
+    }
+    let Some(rx) = rx else {
+        return decline("the readback failed");
+    };
+    let ox: &[f32] = bytemuck::cast_slice(&rx);
+    if ox.iter().any(|x| !x.is_finite()) {
+        return decline("the MOSS-Image chain produced a non-finite row (an f16 range guard overflowed?)");
+    }
+    a.x.copy_from_slice(ox);
+    true
+}
+
 /// A Qwen-Image step's blocks over both streams (`image` `[ni][hs]`, `text`
 /// `[nt][hs]`) on the card: the zi_mm products reading the q4tp tensors in
 /// place, joint attention over [text | image] on `vit_flash`. `false`: nothing
@@ -1632,6 +1938,9 @@ mod tests {
         check("vx_d2s", VD2S_SRC);
         check("qw_ln", QLN_SRC);
         check("qw_qk", QQK_SRC);
+        check("mo_situ", SITU_SRC);
+        // the VAE chain's GroupNorm passes (any width up to 512)
+        check("zv_gn_part", super::zi::VAE_GN_PART_SRC);
         let g = MmCfg { conv: 6, ..zi::default_cfg(Epi::F32) };
         assert!(g.valid(), "{g:?}");
         check("conv6", &zi::mm_src(g));
