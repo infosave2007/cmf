@@ -1916,27 +1916,33 @@ impl MiniMaxH3 {
         }
 
         // ── blocks ──
-        for (i, blk) in self.blocks.iter().enumerate() {
-            let mods = blk.adaln.as_ref().unwrap().eval(&ts, pool);
-            self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows);
-            // Per-block watch on the row that dies: growing magnitude is
-            // an overflow, a sudden jump from finite to NaN is a kernel.
-            if let Ok(w) = std::env::var("CMF_MMH3_WATCHROW") {
-                if let Ok(r) = w.parse::<usize>() {
-                    let row = &h[r * hs..(r + 1) * hs];
-                    let amax = row
-                        .iter()
-                        .filter(|v| v.is_finite())
-                        .fold(0f32, |a, v| a.max(v.abs()));
-                    let bad = row.iter().filter(|v| !v.is_finite()).count();
-                    if bad > 0 || i == 0 || amax > 1e3 {
-                        eprintln!("  watch blk {i}: row {r} absmax {amax:.3e} nonfinite {bad}");
-                    }
+        // One resident chain where the backend has one (`run_blocks`). The
+        // per-block watch reads the stream on the host between blocks, so
+        // it keeps the per-op loop.
+        let watch = std::env::var("CMF_MMH3_WATCHROW")
+            .ok()
+            .and_then(|w| w.parse::<usize>().ok());
+        if let Some(r) = watch {
+            for (i, blk) in self.blocks.iter().enumerate() {
+                let mods = blk.adaln.as_ref().unwrap().eval(&ts, pool);
+                self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows);
+                // Growing magnitude is an overflow, a sudden jump from
+                // finite to NaN is a kernel.
+                let row = &h[r * hs..(r + 1) * hs];
+                let amax = row
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .fold(0f32, |a, v| a.max(v.abs()));
+                let bad = row.iter().filter(|v| !v.is_finite()).count();
+                if bad > 0 || i == 0 || amax > 1e3 {
+                    eprintln!("  watch blk {i}: row {r} absmax {amax:.3e} nonfinite {bad}");
+                }
+                if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
+                    eprint!("\r  block {}/{}", i + 1, self.blocks.len());
                 }
             }
-            if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
-                eprint!("\r  block {}/{}", i + 1, self.blocks.len());
-            }
+        } else {
+            self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows);
         }
 
         // ── heads ──

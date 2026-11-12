@@ -63,6 +63,7 @@ struct Funcs {
     cv_gn_stats: cs::CUfunction,
     cv_gn_silu: cs::CUfunction,
     cv_im2col: cs::CUfunction,
+    cv_im2col1d: cs::CUfunction,
     cv_add: cs::CUfunction,
 }
 
@@ -111,6 +112,7 @@ impl H3State {
             cv_gn_stats: func(module, "cv_gn_stats")?,
             cv_gn_silu: func(module, "cv_gn_silu")?,
             cv_im2col: func(module, "cv_im2col")?,
+            cv_im2col1d: func(module, "cv_im2col1d")?,
             cv_add: func(module, "cv_add")?,
         };
         self.funcs = Some(f);
@@ -1532,6 +1534,73 @@ pub fn h3_gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: us
     }
 }
 
+/// A 1-D convolution as a product whose column matrix is built on the card:
+/// `x` `[ic][n]` (zero outside), `w` `[oc][ic * k]`, tap `j` reading sample
+/// `t + j * dil - pad`; `yt` comes back `[out_n][oc]`, the layout of
+/// `h3_gemm_nt`. Only `x` crosses the bus on the way in.
+#[allow(clippy::too_many_arguments)]
+pub fn h3_conv1d(
+    x: &[f32],
+    w: &[f32],
+    ic: usize,
+    oc: usize,
+    n: usize,
+    k: usize,
+    pad: usize,
+    dil: usize,
+    out_n: usize,
+    yt: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let kk = ic * k;
+    if c.current().is_err() || out_n == 0 || x.len() < ic * n || w.len() < oc * kk || yt.len() < out_n * oc {
+        return false;
+    }
+    // the last tap of the last sample stays within reach of an i32 index
+    if n > i32::MAX as usize / 2 || (out_n + k * dil) > i32::MAX as usize / 2 {
+        return false;
+    }
+    let mut st = c.st.lock().unwrap();
+    let mut run = |st: &mut State| -> Res<()> {
+        let f = st.h3.funcs(c)?;
+        let xb = st.h3.buf(c, "c1 x", ic * n * 4)?;
+        let wb = st.h3.buf(c, "c1 w", oc * kk * 4)?;
+        // a column chunk of at most 256 MB
+        let cb = ((256usize << 20) / (kk.max(oc) * 4)).clamp(1, out_n);
+        let cols = st.h3.buf(c, "c1 cols", cb * kk * 4)?;
+        let yb = st.h3.buf(c, "c1 y", cb * oc * 4)?;
+        let (ci, ni, ki, pi, di) = (ic as i32, n as i32, k as i32, pad as i32, dil as i32);
+        unsafe {
+            cu::memcpy_htod_async(xb, &x[..ic * n], c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(wb, &w[..oc * kk], c.stream).map_err(derr)?;
+            let mut t0 = 0usize;
+            while t0 < out_n {
+                let nb = cb.min(out_n - t0);
+                let (total, t0i) = ((nb * ic) as u64, t0 as i32);
+                c.launch(
+                    f.cv_im2col1d,
+                    (total.div_ceil(256) as u32, 1),
+                    256,
+                    0,
+                    kargs!(xb, cols, ci, ni, ki, pi, di, t0i, total),
+                )?;
+                c.gemm(true, false, oc, nb, kk, 1.0, wb, kk, cols, kk, 0.0, yb, oc, Gemm::Tf32)?;
+                cu::memcpy_dtoh_async(&mut yt[t0 * oc..(t0 + nb) * oc], yb, c.stream).map_err(derr)?;
+                t0 += nb;
+            }
+        }
+        c.sync()
+    };
+    match run(&mut st) {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("h3 conv1d", &e);
+            false
+        }
+    }
+}
+
 /// A pipeline stage is over: free the chain's resident weights, its working
 /// buffers and the plane cache.
 pub fn h3_release() {
@@ -1547,4 +1616,50 @@ pub fn h3_release() {
 /// Bytes of chain weights resident on the card (in their codec).
 pub fn h3_resident_bytes() -> u64 {
     ctx().map_or(0, |c| c.st.lock().unwrap().h3.mats_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The card's 1-D convolution against the loop it replaces: dilation,
+    /// zero padding on both sides, and a column chunk boundary inside the
+    /// run (TF32 products: three decimal digits).
+    #[test]
+    fn conv1d_matches_the_host() {
+        if ctx().is_none() {
+            eprintln!("cuda: no device or libraries here — conv1d parity skipped");
+            return;
+        }
+        let mut seed = 0x1d_c0de_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 2001) as f32 / 1000.0 - 1.0
+        };
+        for &(ic, oc, n, k, dil) in &[(24usize, 40usize, 3000usize, 7usize, 3usize), (16, 8, 513, 1, 1), (8, 12, 700, 3, 9)] {
+            let pad = dil * (k - 1) / 2;
+            let out_n = n + 2 * pad - dil * (k - 1);
+            let x: Vec<f32> = (0..ic * n).map(|_| rnd()).collect();
+            let w: Vec<f32> = (0..oc * ic * k).map(|_| rnd() * 0.1).collect();
+            let mut yt = vec![0f32; out_n * oc];
+            assert!(h3_conv1d(&x, &w, ic, oc, n, k, pad, dil, out_n, &mut yt), "the card refused {ic}x{oc}x{n}");
+            let (mut worst, mut top) = (0f32, 0f32);
+            for t in 0..out_n {
+                for o in 0..oc {
+                    let mut acc = 0f64;
+                    for i in 0..ic {
+                        for j in 0..k {
+                            let s = (t + j * dil) as isize - pad as isize;
+                            if s >= 0 && (s as usize) < n {
+                                acc += x[i * n + s as usize] as f64 * w[(o * ic + i) * k + j] as f64;
+                            }
+                        }
+                    }
+                    worst = worst.max((yt[t * oc + o] - acc as f32).abs());
+                    top = top.max((acc as f32).abs());
+                }
+            }
+            assert!(worst < 2e-3 * top.max(1.0), "conv1d {ic}x{oc}x{n} k{k} d{dil}: off by {worst:e} of {top:e}");
+        }
+    }
 }

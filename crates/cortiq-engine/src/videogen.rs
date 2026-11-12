@@ -517,6 +517,10 @@ fn generate_inner(
             );
         }
     }
+    // The same on the card: a resident chain keeps the encoder's weights
+    // until its stage is declared done, and the DiT does not fit beside
+    // them on a 24 GB card.
+    crate::gpu::stage_done(&model);
 
     // ── denoise ──
     let (mut video, audio) = {
@@ -787,6 +791,15 @@ fn generate_inner(
             }
             let (sv, sv_n) = (sg[i], sg[i + 1]);
             let (dv, da) = dit.forward(&layout, &text, &v, &a, sv, &cond);
+            // `CMF_ANIM_DUMP=<prefix>`: this step's two velocities as raw
+            // f32 (`<prefix>.v<i>.f32`, `<prefix>.a<i>.f32`), so one forward
+            // can be compared between two paths before the sampler
+            // amplifies their difference.
+            if let Ok(pre) = std::env::var("CMF_ANIM_DUMP") {
+                let raw = |x: &[f32]| x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+                let _ = std::fs::write(format!("{pre}.v{i}.f32"), raw(&dv));
+                let _ = std::fs::write(format!("{pre}.a{i}.f32"), raw(&da));
+            }
             let step_v = (sv_n - sv) as f32;
             for (x, &d) in v.iter_mut().zip(&dv) {
                 *x += step_v * d;
@@ -822,6 +835,8 @@ fn generate_inner(
     };
 
     lap(&mut marks, "denoise");
+    // The DiT is done: its weights leave the card before the decoders load.
+    crate::gpu::stage_done(&model);
 
     // ── the learned latent resize, when one was handed in ──
     let (mut out_h, mut out_w) = (p.height, p.width);
@@ -868,6 +883,7 @@ fn generate_inner(
     };
     progress("video vae", 1, 1);
     lap(&mut marks, "video vae");
+    crate::gpu::stage_done(&model);
     progress("audio vae", 0, 1);
     let (wave, samples, sr) = {
         let vae = AudioVae::from_cmf(&model)?;
