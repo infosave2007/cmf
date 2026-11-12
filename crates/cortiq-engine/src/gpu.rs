@@ -3924,7 +3924,16 @@ pub fn qwen_image_block(model: &Arc<CmfModel>, args: &mut QwenImageBlockArgs<'_>
 pub fn qwen_image_chain(model: &Arc<CmfModel>, args: &mut QwenImageChainArgs<'_>) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => crate::gpu_wgpu::qwen_image_chain(model, args),
+        Backend::Wgpu => {
+            // the H3 parts' chain first, the original one where it declines
+            #[cfg(not(target_os = "macos"))]
+            if crate::gpu_wgpu::h3::qwen_chain(model, args) {
+                return true;
+            }
+            crate::gpu_wgpu::qwen_image_chain(model, args)
+        }
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::qwen_image_chain(model, args),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4077,6 +4086,8 @@ pub fn vae_upsample_conv(
         Backend::Metal => crate::gpu_metal::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_vae_conv2d(w, bias, x, ic, oc, h, w_img, k, true, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4101,6 +4112,8 @@ pub fn vae_conv2d(
         Backend::Metal => crate::gpu_metal::vae_conv2d(w, bias, x, ic, oc, h, w_img, k, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vae_conv2d(w, bias, x, ic, oc, h, w_img, k, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_vae_conv2d(w, bias, x, ic, oc, h, w_img, k, false, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

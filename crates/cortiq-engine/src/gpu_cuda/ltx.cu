@@ -284,3 +284,58 @@ extern "C" __global__ void vx_d2s(const float* __restrict__ y, float* __restrict
     const size_t src = ((cc * p1 + a) * p2 + b) * p3 + d;
     out[idx] = y[((src * f + fr) * h + hh) * w + ww];
 }
+
+// im2col of output positions p0.. of a k x k convolution with zero padding
+// k / 2 over x [c][h][w] (channel-major), on the nearest 2x upsample of x when
+// `up`: cols f16 [positions][c * k * k] in the weight's (channel, ky, kx)
+// order. A thread a (position, channel).
+extern "C" __global__ void vx_im2col2d(const float* __restrict__ x, u16* __restrict__ cols, int c, int h, int w,
+                                       int ow, int oh, int k, int up, u64 p0, u64 total)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int ch = (int)(idx % c);
+    const size_t i = idx / c, p = p0 + i;
+    const int oy = (int)(p / ow), ox = (int)(p % ow);
+    const int pad = k / 2;
+    u16* dst = cols + i * (size_t)c * k * k + (size_t)ch * k * k;
+    const float* xc = x + (size_t)ch * h * w;
+    for (int ky = 0; ky < k; ky++) {
+        const int sy = oy + ky - pad;
+        for (int kx = 0; kx < k; kx++) {
+            const int sx = ox + kx - pad;
+            float v = 0.0f;
+            if (sy >= 0 && sx >= 0 && sy < oh && sx < ow) v = xc[(size_t)(up ? sy >> 1 : sy) * w + (up ? sx >> 1 : sx)];
+            dst[ky * k + kx] = f2h_sat(v);
+        }
+    }
+}
+
+// Rows of scores into softmax weights in place (a block a row of n).
+extern "C" __global__ void vx_softmax(float* __restrict__ S, int n)
+{
+    __shared__ float red[32];
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    float* s = S + (size_t)blockIdx.x * n;
+    float m = -3.0e38f;
+    for (int i = tid; i < n; i += T) m = fmaxf(m, s[i]);
+    for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, k));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    m = red[0];
+    for (int k = 1; k < NW; k++) m = fmaxf(m, red[k]);
+    __syncthreads();
+    float z = 0.0f;
+    for (int i = tid; i < n; i += T) {
+        const float e = expf(s[i] - m);
+        s[i] = e;
+        z += e;
+    }
+    for (int k = 16; k > 0; k >>= 1) z += __shfl_xor_sync(0xffffffffu, z, k);
+    if (lane == 0) red[warp] = z;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int k = 0; k < NW; k++) tot += red[k];
+    const float inv = 1.0f / tot;
+    for (int i = tid; i < n; i += T) s[i] *= inv;
+}

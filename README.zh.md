@@ -112,6 +112,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Qwen-Image-Edit-2509:支持 CUDA,Vulkan 更快(0.8.80)
+
+[Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) 现在在 CUDA 上一次调用就在显卡上完成
+每一步的全部 Transformer 块，在 Vulkan 上则使用 H3 链的矩阵内核。在 RTX A5000 上，带引导的 8 步 1024×1024 编辑在 CUDA
+上用时 105.8 秒（之前 464 秒），Vulkan 上用时 148.1 秒（之前 442.5 秒）;在 CUDA 上 8 GB 显卡即可完成
+(`CMF_GPU_VRAM_MB=8000`,115.1 秒):
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-edit-2509-q4tp.cmf --image input.png --prompt "Add a blue knitted scarf." \
+  --height 1024 --width 1024 --steps 8 --cfg 4 --reference-size 1024 --out edited.png
+```
+
 ## Lumina-Image 2.0:支持 CUDA(0.8.79)
 
 [Lumina-Image 2.0](https://huggingface.co/infosave/Lumina-Image-2.0cmf) 现在在 CUDA 上也一次调用就在显卡上完成整个

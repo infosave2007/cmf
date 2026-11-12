@@ -119,7 +119,12 @@ fn qwen_resident_enabled() -> bool {
         Some("0") => false,
         Some("1") => true,
         Some(_) => false,
-        None => crate::gpu::discrete() && crate::gpu::vram_budget() >= QWEN_RESIDENT_MIN_VRAM,
+        // The CUDA chain keeps what fits under the budget and streams the
+        // rest, so it does not need the wgpu arm's whole-stack minimum.
+        None => {
+            crate::gpu::cuda_active()
+                || (crate::gpu::discrete() && crate::gpu::vram_budget() >= QWEN_RESIDENT_MIN_VRAM)
+        }
     }
 }
 

@@ -123,6 +123,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Qwen-Image-Edit-2509 on CUDA, faster on Vulkan (0.8.80)
+
+[Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) now keeps every transformer block
+of a step on the card in one call over CUDA, and over Vulkan on the H3 chain's matrix kernels. On an RTX A5000 a
+1024×1024 edit in 8 steps with guidance takes 105.8 s on CUDA (was 464 s) and 148.1 s over Vulkan (was 442.5 s);
+on CUDA it fits an 8 GB card (`CMF_GPU_VRAM_MB=8000`, 115.1 s):
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-edit-2509-q4tp.cmf --image input.png --prompt "Add a blue knitted scarf." \
+  --height 1024 --width 1024 --steps 8 --cfg 4 --reference-size 1024 --out edited.png
+```
+
 ## Lumina-Image 2.0 on CUDA (0.8.79)
 
 [Lumina-Image 2.0](https://huggingface.co/infosave/Lumina-Image-2.0cmf) runs a whole transformer block on the card

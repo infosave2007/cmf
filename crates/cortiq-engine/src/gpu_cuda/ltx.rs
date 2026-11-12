@@ -34,11 +34,13 @@ pub(super) struct LxFuncs {
     copy: cs::CUfunction,
     norm_silu: cs::CUfunction,
     im2col3d: cs::CUfunction,
-    bias: cs::CUfunction,
+    pub(super) bias: cs::CUfunction,
     d2s: cs::CUfunction,
+    pub(super) im2col2d: cs::CUfunction,
+    pub(super) softmax_f32: cs::CUfunction,
 }
 
-fn funcs(st: &mut State, c: &Ctx) -> Res<LxFuncs> {
+pub(super) fn funcs(st: &mut State, c: &Ctx) -> Res<LxFuncs> {
     if let Some(f) = st.h3.ltx {
         return Ok(f);
     }
@@ -56,6 +58,8 @@ fn funcs(st: &mut State, c: &Ctx) -> Res<LxFuncs> {
         im2col3d: func(module, "vx_im2col3d")?,
         bias: func(module, "vx_bias")?,
         d2s: func(module, "vx_d2s")?,
+        im2col2d: func(module, "vx_im2col2d")?,
+        softmax_f32: func(module, "vx_softmax")?,
     };
     st.h3.ltx = Some(f);
     Ok(f)
@@ -862,4 +866,111 @@ unsafe fn vae_chain(
         return Err("the decoder came back with a value that is not finite".into());
     }
     Ok((out, ch, fr, hh, ww))
+}
+
+/// A same-padded k x k convolution of `x` `[ci][h][w]` (or of its nearest 2x
+/// upsample, `up`) into `out` `[co][oh][ow]`, on the card: im2col and an f16
+/// product on the tensor cores. The weights `[co][ci][k][k]` are converted
+/// on the card every call — the callers hand weights they free afterwards,
+/// so nothing keyed by their address may be kept. `false`: not done.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_conv2d(
+    wt: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ci: usize,
+    co: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    up: bool,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let (oh, ow) = if up { (2 * h, 2 * w) } else { (h, w) };
+    let (p, kk) = (oh * ow, ci * k * k);
+    if c.current().is_err() || k.is_multiple_of(2) || x.len() < ci * h * w || wt.len() < co * kk || out.len() < co * p {
+        return false;
+    }
+    if !bias.is_empty() && bias.len() < co {
+        return false;
+    }
+    let mut st = c.st.lock().unwrap();
+    let mut run = |st: &mut State| -> Res<()> {
+        let f = funcs(st, c)?;
+        let to_half = st.h3.funcs(c)?.to_half;
+        let xb = st.h3.buf(c, "c2 x", ci * h * w * 4)?;
+        let wf = st.h3.buf(c, "c2 wf", co * kk * 4)?;
+        let wh = st.h3.buf(c, "c2 wh", co * kk * 2 + 64)?;
+        let bb = st.h3.buf(c, "c2 b", co * 4 + 64)?;
+        let yb = st.h3.buf(c, "c2 y", co * p * 4)?;
+        let chunk = ((256usize << 20) / (kk * 2)).clamp(1, p);
+        let cols = st.h3.buf(c, "c2 cols", chunk * kk * 2)?;
+        let nw = (co * kk) as u64;
+        let (cii, hi, wi, owi, ohi, ki, upi) = (ci as i32, h as i32, w as i32, ow as i32, oh as i32, k as i32, up as i32);
+        unsafe {
+            cu::memcpy_htod_async(xb, &x[..ci * h * w], c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(wf, &wt[..co * kk], c.stream).map_err(derr)?;
+            c.launch(to_half, (nw.div_ceil(256) as u32, 1), 256, 0, kargs!(wf, wh, nw))?;
+            if !bias.is_empty() {
+                cu::memcpy_htod_async(bb, &bias[..co], c.stream).map_err(derr)?;
+            }
+            let mut p0 = 0usize;
+            while p0 < p {
+                let np = chunk.min(p - p0);
+                let (p0u, total) = (p0 as u64, (np * ci) as u64);
+                c.launch(f.im2col2d, (total.div_ceil(256) as u32, 1), 256, 0, kargs!(xb, cols, cii, hi, wi, owi, ohi, ki, upi, p0u, total))?;
+                c.gemm(true, false, np, co, kk, 1.0, cols, kk, wh, kk, 0.0, yb + (p0 * 4) as u64, p, Gemm::Half)?;
+                p0 += np;
+            }
+            if !bias.is_empty() {
+                let (pu, n, nul) = (p as u64, (co * p) as u64, 0u64);
+                c.launch(f.bias, (n.div_ceil(256) as u32, 1), 256, 0, kargs!(yb, bb, nul, pu, n))?;
+            }
+            cu::memcpy_dtoh_async(&mut out[..co * p], yb, c.stream).map_err(derr)?;
+        }
+        c.sync()
+    };
+    match run(&mut st) {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("vae conv2d", &e);
+            false
+        }
+    }
+}
+
+/// One wide head of full attention (a VAE's mid-block: one head as wide as
+/// its channels, past what the flash kernel takes): `q`, `k`, `v` `[n][hd]`
+/// into `out` `[n][hd]`, scores a chunk of query rows at a time as TF32
+/// products with an f32 softmax between them.
+pub(super) fn attention_wide(c: &Ctx, st: &mut State, q: &[f32], k: &[f32], v: &[f32], n: usize, hd: usize, scale: f32, out: &mut [f32]) -> Res<()> {
+    let f = funcs(st, c)?;
+    let len = n * hd;
+    let qb = st.h3.buf(c, "aw q", len * 4)?;
+    let kb = st.h3.buf(c, "aw k", len * 4)?;
+    let vb = st.h3.buf(c, "aw v", len * 4)?;
+    let ob = st.h3.buf(c, "aw o", len * 4)?;
+    // a chunk of score rows of at most 256 MB
+    let cq = ((256usize << 20) / (n * 4)).clamp(1, n);
+    let sb = st.h3.buf(c, "aw s", cq * n * 4)?;
+    let ni = n as i32;
+    unsafe {
+        cu::memcpy_htod_async(qb, &q[..len], c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(kb, &k[..len], c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(vb, &v[..len], c.stream).map_err(derr)?;
+        let mut q0 = 0usize;
+        while q0 < n {
+            let rows = cq.min(n - q0);
+            // S [rows][n] = scale * Q · Kᵀ
+            c.gemm(true, false, n, rows, hd, scale, kb, hd, qb + (q0 * hd * 4) as u64, hd, 0.0, sb, n, Gemm::Tf32)?;
+            c.launch(f.softmax_f32, (rows as u32, 1), 256, 0, kargs!(sb, ni))?;
+            // O [rows][hd] = P · V
+            c.gemm(false, false, hd, rows, n, 1.0, vb, hd, sb, n, 0.0, ob + (q0 * hd * 4) as u64, hd, Gemm::Tf32)?;
+            q0 += rows;
+        }
+        cu::memcpy_dtoh_async(&mut out[..len], ob, c.stream).map_err(derr)?;
+    }
+    c.sync()
 }
