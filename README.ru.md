@@ -123,6 +123,19 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## LTX-2.5 на CUDA и Vulkan: клип со звуком за 24 с (0.8.77)
+
+[LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf), видео и его звуковая дорожка по одному промпту, теперь
+считает свои 48 блоков одной резидентной цепочкой на карте, и видео-VAE тоже на карте. На RTX A5000 клип
+384×256 из 49 кадров со звуком занимает 22,3 с на CUDA и 28,9 с через Vulkan, когда промпт уже закодирован
+(он кэшируется); 0.8.76 тратил 430–475 с на одну картинку. Этот выпуск также чинит первый вызов любой
+резидентной цепочки на CUDA, который мог читать ещё не докопированные веса:
+
+```sh
+cortiq ltx-video --model ltx25-q4tp.cmf --prompt "A corgi in a chef hat flips a pancake." \
+  --height 256 --width 384 --frames 49 --out corgi.y4m --out-audio corgi.wav
+```
+
 ## MiniMax-H3-Turbo на CUDA, быстрее на Vulkan и Metal (0.8.76)
 
 [MiniMax-H3-Turbo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf), видео с синхронным звуком по одному

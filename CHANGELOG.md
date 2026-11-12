@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.77] — 2026-11-12
+
+### Added
+- LTX-2.5 (`cortiq ltx-video`, [the file](https://huggingface.co/infosave/LTX-2.5-cmf)) runs its 48 audio-video
+  blocks as one resident chain on CUDA and over Vulkan: both streams stay on the card from the first block to the
+  last, the six attentions of a block (each stream's own and its prompt's, and both directions of the fusion,
+  which read the streams as they were before it) included. Until now every projection and every head went to the
+  device on its own. RTX A5000, release build, 384 x 256, 49 frames, eight steps, the prompt from the cache:
+  - **CUDA** (`gpu_cuda/ltx.rs`, `ltx.cu`): 22.3 s for the clip and its soundtrack; 0.8.76 took 430.4 s for the
+    picture alone. Denoising 8.6 s instead of 363.5 s, the video VAE 1.3 s instead of 62.9 s. With the prompt
+    encoded: 57.4 s. 768 x 512: 37.4 s, and 38.8 s with `--two-stage`. Within `CMF_GPU_VRAM_MB=8000` 27.0 s at a
+    peak of 7.4 GB, within 6000 27.2 s at 5.5 GB, the same clip.
+  - **Vulkan** (`gpu_wgpu/ltx.rs`): 28.9 s. Denoising 12.1 s instead of 322.7 s (0.64 s a step once the weights
+    are on the card), the video VAE 2.2 s instead of 105.6 s; with the prompt encoded 78.8 s, where 0.8.76 took
+    474.7 s for the picture alone. 768 x 512: 47.5 s, 48.8 s with `--two-stage`. Within 8000 34.3 s at a peak of
+    9.3 GB, within 6000 41.9 s at 7.2 GB, the same clip. The products read the q4tp tensors in place on the
+    matrix units (`zi_mm`), attention is `vit_flash` for heads of 128 and 64.
+  - The video VAE on the card: on CUDA im2col and cuBLAS (`ltx_vae_chain`), over Vulkan a new convolution mode
+    of `zi_mm` (6: 3 x 3 x 3, zero padding in space, replicated frames in time). 87 dB from the host decoder.
+  - One forward of the chain against the per-operation path: 0.26 % on CUDA, 0.30 % over Vulkan. A seed gives
+    the same clip bit for bit on both, and the two agree to 39 dB.
+  - `CMF_LTX_CHAIN=0` and `CMF_LTX_VAE_CHAIN=0` keep the per-operation paths, `CMF_LTX_WGPU=0` and
+    `CMF_LTX_WGPU_VAE=0` the same over Vulkan only; `CMF_LTX_DUMP=<prefix>` writes each step's velocities.
+- The LTX vocoder gathers its convolutions' columns on the device (`gpu::conv1d_gemm`) and runs its resampling
+  filters, activations and transposed convolutions across the cores: the soundtrack of the clip above in 7 s
+  instead of 23 s on CUDA, and in 3.8 s instead of 8.6 s on a MacBook Air M4.
+
+### Fixed
+- CUDA: the first call of a resident chain (MiniMax-H3, MiniMax-H3-Image, MiniMax-H3-Turbo, LTX-2.5) could read
+  weights still in flight. They are copied from pageable memory on the default stream, which returns once the
+  bytes are staged, and the chain's stream does not wait for it: two runs of one seed differed. The chain now
+  waits for the copies to land.
+- `cortiq ltx-video` pins the op arbitration (`CMF_GPU_PROBE=0` unless set), as `cortiq animate` does: a seed
+  reproduces.
+- `cortiq ltx-video` releases what the card holds of a stage when the stage ends (the prompt encoder, the
+  transformer), and builds the transformer's timestep tables on the host when the chain runs.
+
 ## [0.8.76] — 2026-11-12
 
 ### Added

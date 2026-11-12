@@ -25,6 +25,10 @@ tags:
 - ltx-2.5
 - rust
 - 4-bit
+- quantized
+- cuda
+- vulkan
+- metal
 ---
 
 # LTX-2.5 — the whole pipeline in one 22 GB file, rendered by Rust
@@ -46,6 +50,9 @@ tags:
 **Every frame above was produced by `cortiq`** — a single Rust binary with no
 PyTorch, no diffusers, no CUDA toolkit and no Python anywhere in the process —
 reading one memory-mapped [CMF](https://github.com/infosave2007/cmf) file.
+On an RTX A5000 a 384×256 clip of 49 frames **with its soundtrack** takes
+**22.3 s on CUDA and 28.9 s over Vulkan** once the prompt is encoded (it is
+cached; the first take of a prompt adds 35–45 s).
 
 **All nine modes run from this one file**: text → video, text → sound,
 text → video + sound, image + text → video, video → video, video → sound,
@@ -76,7 +83,7 @@ and every config inside it.
 ## Quick start
 
 ```bash
-# 1 — the runtime (Rust 1.88+; nothing else)
+# 1 — the runtime (Rust 1.85+; nothing else)
 cargo install cortiq-cli
 
 # 2 — the model
@@ -96,6 +103,22 @@ ffmpeg -i corgi.y4m -pix_fmt yuv420p corgi.mp4
 That is the whole thing: prompt in, frames out, one process, one file. The
 GPU is found at run time — Vulkan on Linux and Windows, Metal on Apple
 silicon — and everything falls back to the CPU when there is none.
+
+On an NVIDIA card the native CUDA backend is faster still. It is a build
+feature (stable Rust, nothing is linked against CUDA at build time; the
+prebuilt release binaries do not include it) and needs the card's driver with
+the CUDA 12.x libraries `libnvrtc.so.12` and `libcublas.so.12` on the
+loader's path:
+
+```bash
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq ltx-video --model ltx25-q4tp.cmf --prompt "…" --out clip.y4m
+```
+
+On CUDA and over Vulkan the 48 blocks of a step run as one resident chain on
+the card and the video VAE decodes there too; `CMF_GPU_VRAM_MB` caps what the
+process holds on the card (the table under [Measured](#measured)). These
+speeds need `cortiq` 0.8.77 or later.
 
 > **Keep the file on local storage.** It is memory-mapped, so every weight is
 > a page fault. On a network filesystem (NFS, MooseFS, a rented pod's
@@ -214,16 +237,35 @@ They cost sequence length: three references at 384×256 add 1152 tokens beside
 
 ## Measured
 
-49 frames at 24 fps, container on local storage:
+NVIDIA RTX A5000 (24 GB), `cortiq` 0.8.77, 49 frames at 24 fps, eight steps,
+seed 42, single runs. "Prompt" is the Gemma-4 encoder's first pass over a
+prompt; a second take of the same prompt reads it from the cache.
 
-| stage | RTX 5090, 384×256 | RTX 5090, 768×512 `--two-stage` | **M4 MacBook, 24 GB**, 384×256 |
-|---|---|---|---|
-| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 32 s, then cached |
-| denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 13 s |
-| latent upscale | — | 12 s | — |
-| audio VAE + vocoder | 8 s | 8 s | 8.6 s |
-| video VAE | 50 s | 200 s | 24 s |
-| **total** | **3 min** | **10 min** | **2.3 min** |
+| | prompt | denoise | audio VAE + vocoder | video VAE | **total** | peak VRAM |
+|---|---|---|---|---|---|---|
+| CUDA, 384×256 | 35.7 s | 8.6 s | 7.0 s | 1.3 s | **57.4 s** | 14.4 GB |
+| CUDA, 384×256, prompt cached | — | 8.6 s | 7.1 s | 1.3 s | **22.3 s** | 14.4 GB |
+| CUDA, 384×256, `CMF_GPU_VRAM_MB=8000` | — | 13.8 s | 7.0 s | 1.3 s | **27.0 s** | 7.4 GB |
+| CUDA, 384×256, `CMF_GPU_VRAM_MB=6000` | — | 14.0 s | 7.1 s | 1.3 s | **27.2 s** | 5.5 GB |
+| CUDA, 768×512 | — | 19.1 s | 7.6 s | 5.5 s | **37.4 s** | 14.9 GB |
+| CUDA, 768×512 `--two-stage` | — | 8.5 s + upscale 3.9 s + 6.4 s | 7.2 s | 5.5 s | **38.8 s** | 15.3 GB |
+| Vulkan, 384×256 | 44.4 s | 18.7 s | 8.8 s | 2.2 s | **78.8 s** | 11.8 GB |
+| Vulkan, 384×256, prompt cached | — | 12.1 s | 9.0 s | 2.2 s | **28.9 s** | 11.5 GB |
+| Vulkan, 384×256, `CMF_GPU_VRAM_MB=8000` | — | 17.1 s | 9.8 s | 2.1 s | **34.3 s** | 9.3 GB |
+| Vulkan, 384×256, `CMF_GPU_VRAM_MB=6000` | — | 25.1 s | 9.2 s | 2.3 s | **41.9 s** | 7.2 GB |
+| Vulkan, 768×512 | — | 28.9 s | 9.0 s | 4.0 s | **47.5 s** | 12.0 GB |
+| Vulkan, 768×512 `--two-stage` | — | 12.5 s + upscale 7.2 s + 8.7 s | 8.6 s | 3.8 s | **48.8 s** | 12.5 GB |
+
+Under a ceiling the clip is the clip without one, bit for bit; the blocks
+that do not fit pass through the card every step, and over Vulkan the card's
+peak stays about 1.3 GB above the ceiling. A seed gives the same clip twice
+on either backend, and the two backends agree to 39 dB: one forward of
+the chain is within 0.3 % of the per-operation path, and eight sampling steps
+amplify that. Over Vulkan the first step carries the transformer's 10.8 GB
+onto the card (about 10 s); every later step takes 0.64 s.
+
+**M4 MacBook, 24 GB**, Metal, 384×256: prompt 32 s, then cached; denoise
+8 × 13 s; audio VAE + vocoder 3.8 s; video VAE 24 s; **2.3 min** in all.
 
 The Mac number is the interesting one, and it took three rounds to get there.
 

@@ -123,6 +123,19 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## LTX-2.5 on CUDA and Vulkan: a clip with sound in 24 s (0.8.77)
+
+[LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf), video and its soundtrack from one prompt, now runs its 48
+audio-video blocks as one resident chain on the card, and its video VAE on the card too. On an RTX A5000 a
+384×256 clip of 49 frames with sound takes 22.3 s on CUDA and 28.9 s over Vulkan once the prompt is encoded
+(it is cached); 0.8.76 took 430 to 475 s for the picture alone. This release also fixes the first call of every
+resident chain on CUDA, which could read weights still being copied:
+
+```sh
+cortiq ltx-video --model ltx25-q4tp.cmf --prompt "A corgi in a chef hat flips a pancake." \
+  --height 256 --width 384 --frames 49 --out corgi.y4m --out-audio corgi.wav
+```
+
 ## MiniMax-H3-Turbo on CUDA, faster on Vulkan and Metal (0.8.76)
 
 [MiniMax-H3-Turbo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf), video with synchronized audio from one
