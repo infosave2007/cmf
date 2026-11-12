@@ -6,6 +6,10 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 typedef unsigned short u16;
 typedef unsigned char u8;
+// The sparse-index top-k by radix select (q4_idx_topk; 0 = the one-bit search).
+#ifndef TOPK_RADIX
+#define TOPK_RADIX 1
+#endif
 
 // Programmatic dependent launch (CMF_QWEN_PDL=1): a kernel may start while its predecessor drains. It first waits for the
 // predecessor to finish and flush (griddepcontrol.wait), then lets its own successor launch. Without the attribute on
@@ -16,6 +20,25 @@ typedef unsigned char u8;
 #define PDL_PRO() do { } while (0)
 #endif
 
+// F64OPS=0 (the fast precision): the norms, gates and the conv of the kernels below in f32. A GeForce part runs f64
+// at 1/64 of the f32 rate and these small kernels waited on chains of f64 exp/log/sqrt; the exact precision keeps
+// f64 (the host's arithmetic).
+#ifndef F64OPS
+#define F64OPS 1
+#endif
+#if F64OPS
+typedef double acc64;
+#define EXP64(x) exp(x)
+#define LOG1P64(x) log1p(x)
+#define SQRT64(x) sqrt(x)
+#define D64(x) (x)
+#else
+typedef float acc64;
+#define EXP64(x) expf(x)
+#define LOG1P64(x) log1pf(x)
+#define SQRT64(x) sqrtf(x)
+#define D64(x) ((float)(x))
+#endif
 __device__ __forceinline__ u16 f2h(float f) {
     u16 h;
     asm("{ cvt.rn.f16.f32 %0, %1; }" : "=h"(h) : "f"(f));
@@ -53,19 +76,19 @@ extern "C" __global__ void q4_tile(const float* __restrict__ emb, float* __restr
 extern "C" __global__ void q4_grms(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
                                    void* __restrict__ yh, int group, int groups, double eps, int half)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
     const float* xr = x + b * group;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < group; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < group; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] * inv * (1.0f + w[g * group + i]);
         if (y) y[b * group + i] = v;
@@ -79,18 +102,18 @@ extern "C" __global__ void q4_grms_inj(float* __restrict__ x, const float* __res
                                        void* __restrict__ yh, int group, int groups, double eps, int half,
                                        const float* __restrict__ block, const float* __restrict__ iw)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const int g = (int)(b % groups);
     const u64 t = b / groups;
     float* xr = x + b * group;
     const float* bk = block + t * group;
     const float a = iw[b];
-    double ss = 0.0;
+    acc64 ss = D64(0.0);
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] + a * bk[i];
         xr[i] = v;
-        ss += (double)v * (double)v;
+        ss += (acc64)v * (acc64)v;
     }
     red[threadIdx.x] = ss;
     __syncthreads();
@@ -98,11 +121,56 @@ extern "C" __global__ void q4_grms_inj(float* __restrict__ x, const float* __res
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)group + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xr[i] * inv * (1.0f + w[g * group + i]);
         if (y) y[b * group + i] = v;
         if (yh) stf(yh, b * group + i, v, half);
+    }
+}
+
+// q4_grms_inj with a float4 a thread (blockDim * 4 >= group) and the sum of squares by warp shuffles: the same row
+// in one pass of loads and two reduction steps instead of eight barrier-separated ones.
+extern "C" __global__ void q4_grms_inj4(float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
+                                        void* __restrict__ yh, int group, int groups, double eps, int half,
+                                        const float* __restrict__ block, const float* __restrict__ iw)
+{ PDL_PRO();
+    __shared__ acc64 red[32];
+    const u64 b = blockIdx.x;
+    const int g = (int)(b % groups);
+    const u64 t = b / groups;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    float4* xr = (float4*)(x + b * group);
+    const int n4 = group >> 2;
+    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    acc64 ss = D64(0.0);
+    if (tid < n4) {
+        v = xr[tid];
+        if (block) {
+            const float a = iw[b];
+            const float4 bk = ((const float4*)(block + t * group))[tid];
+            v.x = v.x + a * bk.x; v.y = v.y + a * bk.y; v.z = v.z + a * bk.z; v.w = v.w + a * bk.w;
+            xr[tid] = v;
+        }
+        ss = (acc64)v.x * (acc64)v.x + (acc64)v.y * (acc64)v.y + (acc64)v.z * (acc64)v.z + (acc64)v.w * (acc64)v.w;
+    }
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        acc64 r = lane < NW ? red[lane] : D64(0.0);
+        for (int o = 16; o > 0; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
+        if (lane == 0) red[0] = r;
+    }
+    __syncthreads();
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)group + ((acc64)eps)));
+    if (tid < n4) {
+        const float4 wv = ((const float4*)(w + (u64)g * group))[tid];
+        const float o0 = v.x * inv * (1.0f + wv.x), o1 = v.y * inv * (1.0f + wv.y);
+        const float o2 = v.z * inv * (1.0f + wv.z), o3 = v.w * inv * (1.0f + wv.w);
+        const u64 i0 = b * group + (u64)tid * 4;
+        if (y) ((float4*)(y + b * group))[tid] = make_float4(o0, o1, o2, o3);
+        if (yh) { stf(yh, i0, o0, half); stf(yh, i0 + 1, o1, half); stf(yh, i0 + 2, o2, half); stf(yh, i0 + 3, o3, half); }
     }
 }
 
@@ -177,33 +245,33 @@ extern "C" __global__ void q4_gdn_conv(const float* __restrict__ qkv, const floa
     const int t = (int)(i / c_dim);
     const u64 c = i - (u64)t * c_dim;
     const float* tp = taps + c * kk;
-    double acc = (double)qkv[i] * (double)tp[kk - 1];
+    acc64 acc = (acc64)qkv[i] * (acc64)tp[kk - 1];
     for (int j = 0; j < kk - 1; j++) {
         const int src = t - (kk - 1 - j);
         const float v = src >= 0 ? qkv[(u64)src * c_dim + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
-        acc += (double)v * (double)tp[j];
+        acc += (acc64)v * (acc64)tp[j];
     }
-    cq[i] = (float)(acc / (1.0 + exp(-acc)));
+    cq[i] = (float)(acc / (D64(1.0) + EXP64(-acc)));
 }
 
 // L2 norm of the q and k heads in place, a block per (token, head of 2 * nk):
 // q heads also divided by sqrt(dk).
 extern "C" __global__ void q4_gdn_prep(float* __restrict__ cq, int c_dim, int nk, int dk)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 t = blockIdx.x / (2 * nk);
     const int g = (int)(blockIdx.x - t * (2 * nk));
     float* xr = cq + t * c_dim + (u64)g * dk;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const double nrm = sqrt(red[0] + 1e-6);
-    const float inv = (float)(1.0 / (g < nk ? nrm * sqrt((double)dk) : nrm));
+    const acc64 nrm = SQRT64(red[0] + D64(1e-6));
+    const float inv = (float)(D64(1.0) / (g < nk ? nrm * SQRT64((acc64)dk) : nrm));
     for (int i = threadIdx.x; i < dk; i += blockDim.x) xr[i] *= inv;
 }
 
@@ -217,10 +285,10 @@ extern "C" __global__ void q4_gdn_gb(const float* __restrict__ ab, const float* 
     if (i >= (u64)n * nv) return;
     const u64 t = i / nv;
     const int h = (int)(i - t * nv);
-    const double x = (double)ab[t * 2 * nv + h] + (double)dt_bias[h];
-    const double sp = x > 20.0 ? x : log1p(exp(x));
-    gb[t * 2 * nv + h] = (float)exp(-exp((double)a_log[h]) * sp);
-    gb[t * 2 * nv + nv + h] = (float)(1.0 / (1.0 + exp(-(double)ab[t * 2 * nv + nv + h])));
+    const acc64 x = (acc64)ab[t * 2 * nv + h] + (acc64)dt_bias[h];
+    const acc64 sp = x > D64(20.0) ? x : LOG1P64(EXP64(x));
+    gb[t * 2 * nv + h] = (float)EXP64(-EXP64((acc64)a_log[h]) * sp);
+    gb[t * 2 * nv + nv + h] = (float)(D64(1.0) / (D64(1.0) + EXP64(-(acc64)ab[t * 2 * nv + nv + h])));
 }
 
 __device__ __forceinline__ float wsum(float v) {
@@ -265,25 +333,65 @@ extern "C" __global__ void q4_gdn_scan(const float* __restrict__ cq, const float
 }
 
 // of [n][nv][dv] (wt) = rms(o) * norm * sigmoid(z), a block per (token, head), f64.
+// The gated delta rule with a state column per thread (dk == 128): thread dj of head h keeps S[h][*][dj] in
+// registers, so a warp reads and writes 32 neighbouring floats of a state row at a time (q4_gdn_scan gave each lane
+// four rows of one column: a 32-byte sector for every float). The key and query of a token are broadcast from
+// shared memory; no warp sums. Grid (nv, dv / blockDim), block <= 128 columns.
+extern "C" __global__ void q4_gdn_scan_c(const float* __restrict__ cq, const float* __restrict__ gb,
+                                         const float* S, float* So, float* __restrict__ o,
+                                         int n, int c_dim, int nv, int nk, int dk, int dv)
+{ PDL_PRO();
+    __shared__ float qs[128], ks[128];
+    const int h = blockIdx.x, dj = blockIdx.y * blockDim.x + threadIdx.x;
+    const int ko = h / (nv / nk);
+    const int kd = nk * dk;
+    const u64 qo = (u64)ko * dk, kofs = (u64)kd + qo, vo = (u64)2 * kd + (u64)h * dv + dj;
+    const float* sp = S + (u64)h * dk * dv + dj;
+    float st[128];
+#pragma unroll
+    for (int k = 0; k < 128; k++) st[k] = sp[(u64)k * dv];
+    for (int t = 0; t < n; t++) {
+        const float* row = cq + (u64)t * c_dim;
+        __syncthreads();
+        for (int k = threadIdx.x; k < 128; k += blockDim.x) { qs[k] = row[qo + k]; ks[k] = row[kofs + k]; }
+        __syncthreads();
+        const float g = gb[(u64)t * 2 * nv + h], beta = gb[(u64)t * 2 * nv + nv + h];
+        float kv = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 128; k++) kv += st[k] * ks[k];
+        const float delta = (row[vo] - g * kv) * beta;
+        float ov = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 128; k++) {
+            st[k] = g * st[k] + ks[k] * delta;
+            ov += qs[k] * st[k];
+        }
+        o[(u64)t * nv * dv + (u64)h * dv + dj] = ov;
+    }
+    float* wp = So + (u64)h * dk * dv + dj;
+#pragma unroll
+    for (int k = 0; k < 128; k++) wp[(u64)k * dv] = st[k];
+}
+
 extern "C" __global__ void q4_gdn_out(const float* __restrict__ o, const float* __restrict__ z,
                                       const float* __restrict__ norm, void* __restrict__ ofh,
                                       int dv, double eps, int half)
 { PDL_PRO();
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 b = blockIdx.x;
     const float* xr = o + b * dv;
-    double ss = 0.0;
-    for (int i = threadIdx.x; i < dv; i += blockDim.x) { const double v = xr[i]; ss += v * v; }
+    acc64 ss = D64(0.0);
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) { const acc64 v = xr[i]; ss += v * v; }
     red[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const double inv = 1.0 / sqrt(red[0] / (double)dv + eps);
+    const acc64 inv = D64(1.0) / SQRT64(red[0] / (acc64)dv + ((acc64)eps));
     for (int i = threadIdx.x; i < dv; i += blockDim.x) {
-        const double gate = 1.0 / (1.0 + exp(-(double)z[b * dv + i]));
-        stf(ofh, b * dv + i, (float)(((double)xr[i] * inv) * (double)norm[i] * gate), half);
+        const acc64 gate = D64(1.0) / (D64(1.0) + EXP64(-(acc64)z[b * dv + i]));
+        stf(ofh, b * dv + i, (float)(((acc64)xr[i] * inv) * (acc64)norm[i] * gate), half);
     }
 }
 
@@ -303,7 +411,7 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
                                         int nsum, double eps)
 { PDL_PRO();
     __shared__ float sv[256];
-    __shared__ double red[256];
+    __shared__ acc64 red[256];
     const u64 item = blockIdx.x / heads;
     const int head = (int)(blockIdx.x - item * heads);
     const int d = threadIdx.x;
@@ -311,13 +419,13 @@ extern "C" __global__ void q4_norm_rope(const float* __restrict__ src, float* __
     if (d < hd) {
         for (int j = 0; j < nsum; j++) v += src[(item * nsum + j) * sstride + (u64)head * shead + d] / (float)nsum;
     }
-    red[d] = (double)v * (double)v;
+    red[d] = (acc64)v * (acc64)v;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if (d < s) red[d] += red[d + s];
         __syncthreads();
     }
-    const float inv = (float)(1.0 / sqrt(red[0] / (double)hd + eps));
+    const float inv = (float)(D64(1.0) / SQRT64(red[0] / (acc64)hd + ((acc64)eps)));
     if (d < hd) sv[d] = v * (inv * (1.0f + w[d]));
     __syncthreads();
     if (d >= hd) return;
@@ -364,6 +472,56 @@ extern "C" __global__ void q4_idx_topk(const float* __restrict__ sc, u32* __rest
     int b1 = b0 + per;
     if (b1 > complete) b1 = complete;
     u32 T = 0;
+#if TOPK_RADIX
+    // the keep-th largest key by four 8-bit digits (a histogram and a scan each) instead of 32 one-bit passes of
+    // three barriers: the same threshold, so the same mask
+    {
+        __shared__ int hist[256];
+        __shared__ int dig, above, all;
+        u32 prefix = 0, pmask = 0;
+        int need = keep;
+        for (int pass = 0; pass < 4; pass++) {
+            const int sh = 24 - 8 * pass;
+            for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+            __syncthreads();
+            for (int b = b0; b < b1; b++) {
+                const u32 v = row[b];
+                if ((v & pmask) == prefix) atomicAdd(&hist[(v >> sh) & 255u], 1);
+            }
+            __syncthreads();
+            if (threadIdx.x < 32) {
+                // lane l holds digits 255 - 8l .. 248 - 8l (from the top)
+                const int l = threadIdx.x;
+                int loc[8], ls = 0;
+#pragma unroll
+                for (int k = 0; k < 8; k++) { loc[k] = hist[255 - 8 * l - k]; ls += loc[k]; }
+                int inc = ls;
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int u = __shfl_up_sync(0xffffffffu, inc, o);
+                    if (l >= o) inc += u;
+                }
+                const int exc = inc - ls;
+                const int tot = __shfl_sync(0xffffffffu, inc, 31);
+                if (l == 0) all = tot;
+                if (exc < need && inc >= need) {
+                    int run = exc;
+#pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        if (run + loc[k] >= need) { dig = 255 - 8 * l - k; above = run; break; }
+                        run += loc[k];
+                    }
+                }
+            }
+            __syncthreads();
+            if (all < need) break;   // fewer keys than wanted: the threshold stays where it is (all are kept)
+            prefix |= (u32)dig << sh;
+            pmask |= 255u << sh;
+            need -= above;
+            __syncthreads();
+        }
+        T = (all < need && pmask == 0) ? 0u : prefix;
+    }
+#else
     for (int bit = 31; bit >= 0; bit--) {
         const u32 cand = T | (1u << bit);
         if (threadIdx.x == 0) total = 0;
@@ -375,6 +533,7 @@ extern "C" __global__ void q4_idx_topk(const float* __restrict__ sc, u32* __rest
         if (total >= keep) T = cand;
         __syncthreads();
     }
+#endif
     if (threadIdx.x == 0) total = 0;
     __syncthreads();
     int gt = 0, eq = 0;
@@ -712,7 +871,22 @@ extern "C" __global__ void q4_shared_add(float* __restrict__ out, const float* _
 struct MvJob { u64 w, aux0, aux1, y, res; int rows, kind, blk0, rpb; };
 
 // Eight 4-bit weights of a word against eight staged values `st` apart.
+// An integer 0..2^23 as a float without I2F (a quarter-rate instruction): its bits under the exponent of 2^23.
+// Exact, so the sums below are bit-identical to (float)n.
+__device__ __forceinline__ float u2f_small(u32 n) { return __int_as_float(0x4B000000u | n) - 8388608.0f; }
+// Four int8 codes (low byte first) in one word, the operand of __dp4a.
+__device__ __forceinline__ int pack4(int a, int b, int c, int d) {
+    return (a & 0xff) | ((b & 0xff) << 8) | ((c & 0xff) << 16) | (d << 24);
+}
+
+#ifndef NIB_FAST
+#define NIB_FAST 0
+#endif
 __device__ __forceinline__ float nib8(u32 w, const float* p, int st, float a) {
+#if NIB_FAST
+#pragma unroll
+    for (int i = 0; i < 8; i++) a += u2f_small((w >> (4 * i)) & 15u) * p[i * st];
+#else
     a += (float)(w & 15u) * p[0];
     a += (float)((w >> 4) & 15u) * p[st];
     a += (float)((w >> 8) & 15u) * p[2 * st];
@@ -721,6 +895,7 @@ __device__ __forceinline__ float nib8(u32 w, const float* p, int st, float a) {
     a += (float)((w >> 20) & 15u) * p[5 * st];
     a += (float)((w >> 24) & 15u) * p[6 * st];
     a += (float)(w >> 28) * p[7 * st];
+#endif
     return a;
 }
 
@@ -752,11 +927,24 @@ __device__ __forceinline__ void q2_ladder(const u16* pp, float* l) {
 // Sixteen 2-bit weights of a word against sixteen staged values `st` apart.
 __device__ __forceinline__ float crumb16(u32 w, const float* p, int st, float a) {
 #pragma unroll
-    for (int i = 0; i < 16; i++) a += (float)((w >> (2 * i)) & 3u) * p[i * st];
+    for (int i = 0; i < 16; i++) a += (NIB_FAST ? u2f_small((w >> (2 * i)) & 3u) : (float)((w >> (2 * i)) & 3u)) * p[i * st];
     return a;
 }
 
 // 16-byte words of a q8_2f row a lane loads before using any of them.
+// Ints of an int8-staged 16-column chunk of the matvec (four packed, the scale; 12 keeps a phase of 128-bit loads on
+// distinct banks).
+#define MQ_G 12
+#ifndef MV_CONTIG
+#define MV_CONTIG 1
+#endif
+#define MV_CS 20
+// widest rows the side-by-side layout takes (its shared memory per input row is 5 bytes a column; the host sizes
+// the launch the same way, see `mv_row_bytes`)
+#define MV_CMAX 4096
+#ifndef MV_SG
+#define MV_SG 3
+#endif
 #ifndef MV_AH
 #define MV_AH 8
 #endif
@@ -765,7 +953,7 @@ __device__ __forceinline__ float crumb16(u32 w, const float* p, int st, float a)
 // x [NB] rows `xstride` apart, `cols` wide. Kind 7 = q8_2f (int8 body, row
 // scale aux0, column field aux1), kind 4 = f32. A block serves `rpb` rows of
 // the job its index falls into; shared memory holds the NB staged inputs.
-template <int NB>
+template <int NB, bool Q>
 __device__ __forceinline__ void mvb_t(MvJob j0, MvJob j1, MvJob j2, MvJob j3, MvJob j4, int njobs,
                                       const float* __restrict__ x, int xstride, int cols)
 {
@@ -782,13 +970,187 @@ __device__ __forceinline__ void mvb_t(MvJob j0, MvJob j1, MvJob j2, MvJob j3, Mv
     const int row1 = min(row0 + jb.rpb, jb.rows);
     float* y = (float*)jb.y;
     PDL_PRO();
+    if (Q && jb.kind == 7 && ((cols | xstride) & 3) == 0 && (((size_t)x | (size_t)jb.aux1) & 15) == 0) {
+        // the int8 path (fast precision): the inputs times the column field are quantized per 16 columns (a lane's
+        // word) to int8 with their scale, and a word of weights meets them in four __dp4a
+        const int nch = cols >> 4;
+        const float* col = (const float*)jb.aux1;
+        const float* rs = (const float*)jb.aux0;
+        int* xq = (int*)sh;                       // [NB][nch][MQ_G]: four packed ints, the scale
+        const int c4 = cols >> 2, tot = NB * c4;
+        for (int t = tid; t < tot; t += T) {
+            const unsigned am = __activemask();
+            const int b = t / c4, m = t - b * c4;
+            const float4 cv = ((const float4*)col)[m];
+            const float4 xv = ((const float4*)(x + (size_t)b * xstride))[m];
+            const float v0 = xv.x * cv.x, v1 = xv.y * cv.y, v2 = xv.z * cv.z, v3 = xv.w * cv.w;
+            float mx = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+            mx = fmaxf(mx, __shfl_xor_sync(am, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(am, mx, 2));
+            const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+            int* dst = xq + ((size_t)b * nch + (m >> 2)) * MQ_G;
+            dst[m & 3] = pack4(__float2int_rn(v0 * inv), __float2int_rn(v1 * inv), __float2int_rn(v2 * inv),
+                               __float2int_rn(v3 * inv));
+            if ((m & 3) == 0) dst[4] = __float_as_int(mx > 0.0f ? mx / 127.0f : 0.0f);
+        }
+        __syncthreads();
+        for (int r = row0 + warp; r < row1; r += NW) {
+            const uint4* W = (const uint4*)(jb.w + (size_t)r * cols);
+            float acc[NB];
+            for (int b = 0; b < NB; b++) acc[b] = 0.0f;
+            for (int c0 = lane; c0 < nch; c0 += 32 * MV_AH) {
+                uint4 w[MV_AH];
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) w[j] = W[c];
+                }
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) {
+                        for (int b = 0; b < NB; b++) {
+                            const int* g = xq + ((size_t)b * nch + c) * MQ_G;
+                            const int4 q = *(const int4*)g;
+                            int sacc = __dp4a((int)w[j].x, q.x, 0);
+                            sacc = __dp4a((int)w[j].y, q.y, sacc);
+                            sacc = __dp4a((int)w[j].z, q.z, sacc);
+                            sacc = __dp4a((int)w[j].w, q.w, sacc);
+                            acc[b] += __int_as_float(g[4]) * (float)sacc;
+                        }
+                    }
+                }
+            }
+            const float sc = rs[r];
+            for (int b = 0; b < NB; b++) {
+                float a = acc[b];
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (lane == 0) y[(size_t)b * jb.rows + r] = a * sc;
+            }
+        }
+        return;
+    }
+#if MV_CONTIG
+    if (jb.kind == 7 && cols <= MV_CMAX && ((cols | xstride) & 3) == 0 && (((size_t)x | (size_t)jb.aux1) & 15) == 0) {
+        // a lane's 16 inputs side by side (stride MV_CS floats, a phase of 128-bit loads on distinct banks): four
+        // vector loads a word and row instead of sixteen scalar ones with an address multiply each
+        const int nch = cols >> 4, XS = nch * MV_CS;
+        const float* col = (const float*)jb.aux1;
+        const float* rs = (const float*)jb.aux0;
+        const int c4 = cols >> 2;
+        for (int m0 = tid; m0 < c4; m0 += T * MV_SG) {
+            float4 cv[MV_SG], xv[MV_SG][NB];
+#pragma unroll
+            for (int k = 0; k < MV_SG; k++) {
+                const int m = m0 + k * T;
+                if (m < c4) {
+                    cv[k] = ((const float4*)col)[m];
+#pragma unroll
+                    for (int b = 0; b < NB; b++) xv[k][b] = ((const float4*)(x + (size_t)b * xstride))[m];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < MV_SG; k++) {
+                const int m = m0 + k * T;
+                if (m < c4) {
+                    const int c = m >> 2, q = (m & 3) * 4;
+#pragma unroll
+                    for (int b = 0; b < NB; b++)
+                        *(float4*)(sh + b * XS + c * MV_CS + q) =
+                            make_float4(xv[k][b].x * cv[k].x, xv[k][b].y * cv[k].y, xv[k][b].z * cv[k].z, xv[k][b].w * cv[k].w);
+                }
+            }
+        }
+        __syncthreads();
+        for (int r = row0 + warp; r < row1; r += NW) {
+            const uint4* W = (const uint4*)(jb.w + (size_t)r * cols);
+            float acc[NB];
+            for (int b = 0; b < NB; b++) acc[b] = 0.0f;
+            for (int c0 = lane; c0 < nch; c0 += 32 * MV_AH) {
+                uint4 w[MV_AH];
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) w[j] = W[c];
+                }
+#pragma unroll
+                for (int j = 0; j < MV_AH; j++) {
+                    const int c = c0 + 32 * j;
+                    if (c < nch) {
+                        float wf[16];
+                        wf[0] = (float)((int)(w[j].x << 24) >> 24);  wf[1] = (float)((int)(w[j].x << 16) >> 24);
+                        wf[2] = (float)((int)(w[j].x << 8) >> 24);   wf[3] = (float)((int)w[j].x >> 24);
+                        wf[4] = (float)((int)(w[j].y << 24) >> 24);  wf[5] = (float)((int)(w[j].y << 16) >> 24);
+                        wf[6] = (float)((int)(w[j].y << 8) >> 24);   wf[7] = (float)((int)w[j].y >> 24);
+                        wf[8] = (float)((int)(w[j].z << 24) >> 24);  wf[9] = (float)((int)(w[j].z << 16) >> 24);
+                        wf[10] = (float)((int)(w[j].z << 8) >> 24);  wf[11] = (float)((int)w[j].z >> 24);
+                        wf[12] = (float)((int)(w[j].w << 24) >> 24); wf[13] = (float)((int)(w[j].w << 16) >> 24);
+                        wf[14] = (float)((int)(w[j].w << 8) >> 24);  wf[15] = (float)((int)w[j].w >> 24);
+                        for (int b = 0; b < NB; b++) {
+                            const float4* p = (const float4*)(sh + b * XS + c * MV_CS);
+                            float a = 0.0f;
+#pragma unroll
+                            for (int q = 0; q < 4; q++) {
+                                const float4 v = p[q];
+                                a += wf[4 * q] * v.x;
+                                a += wf[4 * q + 1] * v.y;
+                                a += wf[4 * q + 2] * v.z;
+                                a += wf[4 * q + 3] * v.w;
+                            }
+                            acc[b] += a;
+                        }
+                    }
+                }
+            }
+            const float sc = rs[r];
+            for (int b = 0; b < NB; b++) {
+                float a = acc[b];
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (lane == 0) y[(size_t)b * jb.rows + r] = a * sc;
+            }
+        }
+        return;
+    }
+#endif
     if (jb.kind == 7) {
         const int nch = cols >> 4, CP = nch | 1, XS = 16 * CP;
         const float* col = (const float*)jb.aux1;
-        for (int i = tid; i < cols; i += T) {
-            const float cv = col[i];
-            const int idx = (i & 15) * CP + (i >> 4);
-            for (int b = 0; b < NB; b++) sh[b * XS + idx] = x[(size_t)b * xstride + i] * cv;
+        // the inputs times the column field into shared memory, four columns a thread with the loads of every row
+        // in flight together (a scalar loop waited out the L2 latency on each column)
+        if (((cols | xstride) & 3) == 0 && (((size_t)x | (size_t)col) & 15) == 0) {
+            const int c4 = cols >> 2;
+            for (int m0 = tid; m0 < c4; m0 += T * MV_SG) {
+                float4 cv[MV_SG], xv[MV_SG][NB];
+#pragma unroll
+                for (int k = 0; k < MV_SG; k++) {
+                    const int m = m0 + k * T;
+                    if (m < c4) {
+                        cv[k] = ((const float4*)col)[m];
+#pragma unroll
+                        for (int b = 0; b < NB; b++) xv[k][b] = ((const float4*)(x + (size_t)b * xstride))[m];
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < MV_SG; k++) {
+                    const int m = m0 + k * T;
+                    if (m < c4) {
+                        const int i = m * 4;
+#pragma unroll
+                        for (int b = 0; b < NB; b++) {
+                            sh[b * XS + ((i) & 15) * CP + ((i) >> 4)] = xv[k][b].x * cv[k].x;
+                            sh[b * XS + ((i + 1) & 15) * CP + ((i + 1) >> 4)] = xv[k][b].y * cv[k].y;
+                            sh[b * XS + ((i + 2) & 15) * CP + ((i + 2) >> 4)] = xv[k][b].z * cv[k].z;
+                            sh[b * XS + ((i + 3) & 15) * CP + ((i + 3) >> 4)] = xv[k][b].w * cv[k].w;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int i = tid; i < cols; i += T) {
+                const float cv = col[i];
+                const int idx = (i & 15) * CP + (i >> 4);
+                for (int b = 0; b < NB; b++) sh[b * XS + idx] = x[(size_t)b * xstride + i] * cv;
+            }
         }
         __syncthreads();
         const float* rs = (const float*)jb.aux0;
@@ -896,21 +1258,58 @@ __device__ __forceinline__ void hc_di_t(const void* __restrict__ Wp, const float
     const int c0 = blockIdx.y * cw, cn = min(cw, Wd - c0);
     const int ps = half ? 3 : 2, per = 1 << ps, nl = cn >> ps, CP = nl | 1, XS = per * CP;
     PDL_PRO();
-    for (int i = tid; i < cn; i += T) {
-        const int idx = (i & (per - 1)) * CP + (i >> ps);
-        for (int b = 0; b < NB; b++) sh[b * XS + idx] = x[(u64)b * Wd + c0 + i];
+    const int r = blockIdx.x * NW + warp;
+    const uint4* W = (const uint4*)((const char*)Wp + ((u64)(r < R ? r : 0) * Wd + c0) * (half ? 2 : 4));
+    // this row's first batch of words is requested before the inputs are staged (it does not depend on them)
+    uint4 w[Q4_AHEAD];
+    if (r < R) {
+#pragma unroll
+        for (int k = 0; k < Q4_AHEAD; k++) {
+            const int c = lane + 32 * k;
+            if (c < nl) w[k] = W[c];
+        }
+    }
+    if (((cn | Wd | c0) & 3) == 0) {
+        // the inputs four at a time, every load of a thread in flight before its stores
+        const int c4 = cn >> 2, tot = NB * c4;
+        for (int m0 = tid; m0 < tot; m0 += T * 4) {
+            float4 v[4];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const int m = m0 + k * T;
+                if (m < tot) {
+                    const int b = m / c4, q = m - b * c4;
+                    v[k] = ((const float4*)(x + (u64)b * Wd + c0))[q];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const int m = m0 + k * T;
+                if (m < tot) {
+                    const int b = m / c4, i = (m - b * c4) * 4;
+                    sh[b * XS + ((i) & (per - 1)) * CP + ((i) >> ps)] = v[k].x;
+                    sh[b * XS + ((i + 1) & (per - 1)) * CP + ((i + 1) >> ps)] = v[k].y;
+                    sh[b * XS + ((i + 2) & (per - 1)) * CP + ((i + 2) >> ps)] = v[k].z;
+                    sh[b * XS + ((i + 3) & (per - 1)) * CP + ((i + 3) >> ps)] = v[k].w;
+                }
+            }
+        }
+    } else {
+        for (int i = tid; i < cn; i += T) {
+            const int idx = (i & (per - 1)) * CP + (i >> ps);
+            for (int b = 0; b < NB; b++) sh[b * XS + idx] = x[(u64)b * Wd + c0 + i];
+        }
     }
     __syncthreads();
-    const int r = blockIdx.x * NW + warp;
     if (r < R) {
-    const uint4* W = (const uint4*)((const char*)Wp + ((u64)r * Wd + c0) * (half ? 2 : 4));
     float acc[NB];
     for (int b = 0; b < NB; b++) acc[b] = 0.0f;
     for (int c1 = lane; c1 < nl; c1 += 32 * Q4_AHEAD) {
-        uint4 w[Q4_AHEAD];
-        for (int k = 0; k < Q4_AHEAD; k++) {
-            const int c = c1 + 32 * k;
-            if (c < nl) w[k] = W[c];
+        if (c1 != lane) {
+            for (int k = 0; k < Q4_AHEAD; k++) {
+                const int c = c1 + 32 * k;
+                if (c < nl) w[k] = W[c];
+            }
         }
         for (int k = 0; k < Q4_AHEAD; k++) {
             const int c = c1 + 32 * k;
@@ -1017,10 +1416,69 @@ __device__ __forceinline__ void hc_up_t(const void* __restrict__ Wp, const float
     }
 }
 
+// The fold of a gated residual with four streams, all four at once: lane group s = lane / 8 takes stream s, its
+// eight lanes the row's words (nl <= 48), so a d is one load a lane, a three-step sum within the group and a
+// two-step sum over the streams (q4_hc_up* walked the streams one after another, each with a full warp sum).
+template <int NB>
+__device__ __forceinline__ void hc_up4_t(const void* __restrict__ Wp, const float* __restrict__ low,
+                                         const float* __restrict__ normed, float* __restrict__ folded,
+                                         void* __restrict__ foldedh, int hid, int lr, int R, int half)
+{
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const int ps = half ? 3 : 2, per = 1 << ps, nl = lr >> ps, CP = nl | 1, XS = per * CP;
+    const int s = lane >> 3, l8 = lane & 7;
+    const int d = blockIdx.x * NW + warp;
+    const bool ok = d < hid;
+    const u64 rowb = (u64)lr * (half ? 2 : 4);
+    const uint4* W = (const uint4*)((const char*)Wp + ((u64)s * hid + (ok ? d : 0)) * rowb);
+    uint4 w[6];
+    float nv[NB];
+    if (ok) {
+#pragma unroll
+        for (int k = 0; k < 6; k++)
+            if (l8 + 8 * k < nl) w[k] = W[l8 + 8 * k];
+        for (int b = 0; b < NB; b++) nv[b] = normed[((u64)b * 4 + s) * hid + d];
+    }
+    for (int i = tid; i < NB * lr; i += T) {
+        const int b = i / lr, c = i - b * lr;
+        sh[b * XS + (c & (per - 1)) * CP + (c >> ps)] = low[(u64)b * R + c];
+    }
+    __syncthreads();
+    if (!ok) return;
+    float acc[NB];
+    for (int b = 0; b < NB; b++) acc[b] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 6; k++) {
+        if (l8 + 8 * k < nl) {
+            float wf[8];
+            wt_dec(w[k], half, wf);
+            for (int b = 0; b < NB; b++) acc[b] += wt_acc(wf, sh + b * XS + l8 + 8 * k, CP, half);
+        }
+    }
+    for (int b = 0; b < NB; b++) {
+        float a = acc[b];
+        a += __shfl_xor_sync(0xffffffffu, a, 4);
+        a += __shfl_xor_sync(0xffffffffu, a, 2);
+        a += __shfl_xor_sync(0xffffffffu, a, 1);
+        float f = sigm(a) * nv[b] / 4.0f;
+        f += __shfl_xor_sync(0xffffffffu, f, 8);
+        f += __shfl_xor_sync(0xffffffffu, f, 16);
+        if (lane == 0) {
+            folded[(u64)b * hid + d] = f;
+            if (foldedh) stf(foldedh, (u64)b * hid + d, f, half);
+        }
+    }
+}
+
 #define Q4_SMALL(NB) \
     extern "C" __global__ void q4_mvb##NB(MvJob j0, MvJob j1, MvJob j2, MvJob j3, MvJob j4, int njobs, \
                                           const float* __restrict__ x, int xstride, int cols) \
-    { mvb_t<NB>(j0, j1, j2, j3, j4, njobs, x, xstride, cols); } \
+    { mvb_t<NB, false>(j0, j1, j2, j3, j4, njobs, x, xstride, cols); } \
+    extern "C" __global__ void q4_mvq##NB(MvJob j0, MvJob j1, MvJob j2, MvJob j3, MvJob j4, int njobs, \
+                                          const float* __restrict__ x, int xstride, int cols) \
+    { mvb_t<NB, true>(j0, j1, j2, j3, j4, njobs, x, xstride, cols); } \
     extern "C" __global__ void q4_hc_di##NB(const void* __restrict__ Wp, const float* __restrict__ x, \
                                             float* __restrict__ part, int R, int Wd, int cw, int half, \
                                             float* __restrict__ low, float* __restrict__ iw, u32* tick, int lr, int hc) \
@@ -1029,7 +1487,11 @@ __device__ __forceinline__ void hc_up_t(const void* __restrict__ Wp, const float
                                             float* __restrict__ iw, const float* __restrict__ normed, \
                                             float* __restrict__ folded, void* __restrict__ foldedh, \
                                             int hid, int hc, int lr, int R, int nch, int half) \
-    { PDL_PRO(); hc_up_t<NB>(Wp, part, iw, normed, folded, foldedh, hid, hc, lr, R, nch, half); }
+    { PDL_PRO(); hc_up_t<NB>(Wp, part, iw, normed, folded, foldedh, hid, hc, lr, R, nch, half); } \
+    extern "C" __global__ void q4_hc_up4_##NB(const void* __restrict__ Wp, const float* __restrict__ low, \
+                                              const float* __restrict__ normed, float* __restrict__ folded, \
+                                              void* __restrict__ foldedh, int hid, int lr, int R, int half) \
+    { PDL_PRO(); hc_up4_t<NB>(Wp, low, normed, folded, foldedh, hid, lr, R, half); }
 Q4_SMALL(1) Q4_SMALL(2) Q4_SMALL(3) Q4_SMALL(4) Q4_SMALL(5) Q4_SMALL(6) Q4_SMALL(7) Q4_SMALL(8)
 
 // A unit of the expert kernels: one expert's raw slot and up to Q4_UR token
@@ -1037,6 +1499,12 @@ Q4_SMALL(1) Q4_SMALL(2) Q4_SMALL(3) Q4_SMALL(4) Q4_SMALL(5) Q4_SMALL(6) Q4_SMALL
 // from the first free place on).
 #define Q4_UR 4
 // Words of a matrix row a lane reads ahead: gate and up together, down.
+#ifndef EXP_STAGE2
+#define EXP_STAGE2 0
+#endif
+#ifndef EXP_NOW
+#define EXP_NOW 0
+#endif
 #ifndef Q4_GW
 #define Q4_GW 3
 #endif
@@ -1054,11 +1522,160 @@ __device__ __forceinline__ float q4_group(const uint4 w, float lc, const float* 
     return lc * (a - gsum);
 }
 
+// The staged inputs of the expert kernels: XS_CONTIG lays a group's 32 values side by side (a row of XC_G floats,
+// 16-byte aligned, so a lane reads them with eight 128-bit loads at fixed offsets; the stride of 36 keeps the
+// eight lanes of a phase on distinct banks). The old layout (value k of group g at k * GP + g) cost a load and an
+// address multiply per weight. Same values, same order of summation.
+#ifndef XS_CONTIG
+#define XS_CONTIG 0
+#endif
+#ifndef STG_N
+#define STG_N 8
+#endif
+#define XC_G 36
+__device__ __forceinline__ float q4_group_c(const uint4 w, float lc, const float* p, float gsum) {
+    const float4* q = (const float4*)p;
+    const u32 ws[4] = {w.x, w.y, w.z, w.w};
+    float a = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        const float4 A = q[2 * m], B = q[2 * m + 1];
+        const u32 x = ws[m];
+        a += u2f_small(x & 15u) * A.x;
+        a += u2f_small((x >> 4) & 15u) * A.y;
+        a += u2f_small((x >> 8) & 15u) * A.z;
+        a += u2f_small((x >> 12) & 15u) * A.w;
+        a += u2f_small((x >> 16) & 15u) * B.x;
+        a += u2f_small((x >> 20) & 15u) * B.y;
+        a += u2f_small((x >> 24) & 15u) * B.z;
+        a += u2f_small(x >> 28) * B.w;
+    }
+    return lc * (a - gsum);
+}
+// The int8 path of the expert kernels (EXP_DP4A, the fast precision): a unit row's inputs are quantized per group of
+// 32 to int8 with the group's scale amax/127, packed so that one __dp4a meets four nibbles of a weight word: word m
+// of a group pairs (x[8m], x[8m+2], x[8m+4], x[8m+6]) with its low nibbles and (x[8m+1], ...) with its high ones.
+// A group is XQ_G ints: E0 O0 E1 O1 E2 O2 E3 O3, the scale, the sum of the 32 codes (the bias of 8 comes off it).
+#ifndef EXP_DP4A
+#define EXP_DP4A 0
+#endif
+#define XQ_G 12
+// Stage `cnt` rows of n floats (row j at base + row(j) * n) as int8 groups; 8 threads a group.
+__device__ __forceinline__ void stage_q8(int* xq, const float* base, int n, const u32* idx, u64 row0, int cnt, int tid, int T)
+{
+    const int gpr = n >> 5, tot = cnt * gpr * 8;
+    for (int t8 = tid; t8 < tot; t8 += T) {
+        const unsigned am = __activemask();
+        const int gq = t8 >> 3, sub = t8 & 7;
+        const int j = gq / gpr, g = gq - j * gpr;
+        const u64 row = idx ? (u64)idx[j] : row0 + j;
+        const float4 v = ((const float4*)(base + row * n + g * 32))[sub];
+        float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        m = fmaxf(m, __shfl_xor_sync(am, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(am, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(am, m, 4));
+        const float sc = m > 0.0f ? m / 127.0f : 1.0f, inv = m > 0.0f ? 127.0f / m : 0.0f;
+        const int q0 = __float2int_rn(v.x * inv), q1 = __float2int_rn(v.y * inv);
+        const int q2 = __float2int_rn(v.z * inv), q3 = __float2int_rn(v.w * inv);
+        int sum = q0 + q1 + q2 + q3;
+        sum += __shfl_xor_sync(am, sum, 1);
+        sum += __shfl_xor_sync(am, sum, 2);
+        sum += __shfl_xor_sync(am, sum, 4);
+        const int p0 = __shfl_xor_sync(am, q0, 1), p1 = __shfl_xor_sync(am, q1, 1);
+        const int p2 = __shfl_xor_sync(am, q2, 1), p3 = __shfl_xor_sync(am, q3, 1);
+        int* dst = xq + (u64)gq * XQ_G;
+        if ((sub & 1) == 0) dst[sub] = pack4(q0, q2, p0, p2);
+        else dst[sub] = pack4(p1, p3, q1, q3);
+        if (sub == 0) { dst[8] = __float_as_int(sc); dst[9] = sum; }
+    }
+}
+// One q4tp group of a row against an int8-staged group: lc * scale * (sum of nibble * code - 8 * sum of codes).
+__device__ __forceinline__ float q4_group_q8(const uint4 w, float lc, const int* g) {
+    const int4 a = *(const int4*)g, b = *(const int4*)(g + 4);
+    const int M = 0x0F0F0F0F;
+    int s = 0;
+    s = __dp4a((int)(w.x & M), a.x, s);
+    s = __dp4a((int)((w.x >> 4) & M), a.y, s);
+    s = __dp4a((int)(w.y & M), a.z, s);
+    s = __dp4a((int)((w.y >> 4) & M), a.w, s);
+    s = __dp4a((int)(w.z & M), b.x, s);
+    s = __dp4a((int)((w.z >> 4) & M), b.y, s);
+    s = __dp4a((int)(w.w & M), b.z, s);
+    s = __dp4a((int)((w.w >> 4) & M), b.w, s);
+    return lc * __int_as_float(g[8]) * (float)(s - 8 * g[9]);
+}
+
+// Rows of a unit's input in the side-by-side layout: element i of row j at j * XS + (i >> 5) * XC_G + (i & 31).
+__device__ __forceinline__ void stage_contig(float* xs, const float* base, int n, const u32* idx, u64 row0, int cnt,
+                                             int XS, int tid, int T)
+{
+    const int n4 = n >> 2, tot = cnt * n4;
+    for (int m0 = tid; m0 < tot; m0 += T * STG_N) {
+        float4 v[STG_N];
+#pragma unroll
+        for (int k = 0; k < STG_N; k++) {
+            const int m = m0 + k * T;
+            if (m < tot) {
+                const int j = m / n4;
+                const u64 row = idx ? (u64)idx[j] : row0 + j;
+                v[k] = ((const float4*)(base + row * n))[m - j * n4];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < STG_N; k++) {
+            const int m = m0 + k * T;
+            if (m < tot) {
+                const int j = m / n4, i = (m - j * n4) * 4;
+                *(float4*)(xs + (u64)j * XS + (i >> 5) * XC_G + (i & 31)) = v[k];
+            }
+        }
+    }
+}
+
 // One 2-bit group of a row against the staged input of a unit row: the codes (0..3) minus 1.5, times the group's scale.
 __device__ __forceinline__ float q2_group(const uint2 w, float lc, const float* p, int GP, float gsum) {
     float a = crumb16(w.x, p, GP, 0.0f);
     a = crumb16(w.y, p + 16 * GP, GP, a);
     return lc * (a - gsum);
+}
+
+#ifdef EXP_CLK
+__device__ unsigned long long* g_clk;
+#endif
+// Rows of an expert unit's input into shared memory in the transposed layout xs[row][i & 31][i >> 5] (stride GP):
+// float4 loads, STG_N of them in flight per thread before the first store (the old element-at-a-time loop waited
+// out the L2 latency on each element and was most of an expert kernel's time).
+#ifndef STG_N
+#define STG_N 8
+#endif
+__device__ __forceinline__ void stage_scatter(float* xs, const float* base, int n, const u32* idx, u64 row0, int cnt,
+                                              int XS, int GP, int tid, int T)
+{
+    const int n4 = n >> 2, tot = cnt * n4;
+    for (int m0 = tid; m0 < tot; m0 += T * STG_N) {
+        float4 v[STG_N];
+#pragma unroll
+        for (int k = 0; k < STG_N; k++) {
+            const int m = m0 + k * T;
+            if (m < tot) {
+                const int j = m / n4;
+                const u64 row = idx ? (u64)idx[j] : row0 + j;
+                v[k] = ((const float4*)(base + row * n))[m - j * n4];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < STG_N; k++) {
+            const int m = m0 + k * T;
+            if (m < tot) {
+                const int j = m / n4, i = (m - j * n4) * 4;
+                float* xj = xs + j * XS;
+                xj[(i & 31) * GP + (i >> 5)] = v[k].x;
+                xj[((i + 1) & 31) * GP + ((i + 1) >> 5)] = v[k].y;
+                xj[((i + 2) & 31) * GP + ((i + 2) >> 5)] = v[k].z;
+                xj[((i + 3) & 31) * GP + ((i + 3) >> 5)] = v[k].w;
+            }
+        }
+    }
 }
 
 // Gate and up of the round's units, straight from the raw slots:
@@ -1084,16 +1701,21 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [2][rb][32]
     const int r0 = blockIdx.x * rb;
-    for (int j = 0; j < cnt; j++) {
-        const float* x = folded + (u64)un[2 + j] * hid;
-        float* xj = xs + j * XS;
-        for (int i = tid; i < hid; i += T) xj[(i & 31) * GP + (i >> 5)] = x[i];
-    }
+#if EXP_DP4A
+    stage_q8((int*)xs, folded, hid, un + 2, 0, cnt, tid, T);
+#elif !defined(EXP_NOSTAGE)
+    stage_scatter(xs, folded, hid, un + 2, 0, cnt, XS, GP, tid, T);
+#if EXP_STAGE2
+    __syncthreads();
+    stage_scatter(xs, folded, hid, un + 2, 0, cnt, XS, GP, tid, T);
+#endif
+#endif
     if (tid < 2 * rb) {
         const int m = tid / rb, r = r0 + tid - m * rb;
         if (r < inter) q4_ladder((const u16*)(slot + (u64)m * sgu + params_off + (u64)r * 4), lad + tid * 32);
     }
     __syncthreads();
+#if !defined(EXP_NOSTAGE) && !EXP_DP4A
     for (int i = tid; i < cnt * gpr; i += T) {
         const int j = i / gpr, g = i - j * gpr;
         const float* p = xs + j * XS + g;
@@ -1101,6 +1723,7 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
         for (int k = 0; k < 32; k++) s += p[k * GP];
         gs[i] = 8.0f * s;
     }
+#endif
     __syncthreads();
     // the words of this warp's rows in one sequence: row q, word it
     const int nit = (gpr + 31) >> 5;
@@ -1116,7 +1739,7 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
             const int z = z0 + k;
             if (z < nz) {
                 const int q = z / nit, g = lane + 32 * (z - q * nit), i = warp + q * NW, r = r0 + i;
-                if (r < inter && g < gpr) {
+                if (r < inter && g < gpr && !EXP_NOW) {
                     wg[k] = ((const uint4*)(mg + (u64)r * gpr * 16))[g];
                     wu[k] = ((const uint4*)(mu + (u64)r * gpr * 16))[g];
                     lg[k] = lad[i * 32 + q4_code(mg + codes_off + (u64)r * stride, g, stride)];
@@ -1131,10 +1754,16 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
             if (r >= inter) break;
             if (g < gpr) {
                 for (int j = 0; j < cnt; j++) {
+#if EXP_DP4A
+                    const int* qg = (const int*)xs + ((u64)j * gpr + g) * XQ_G;
+                    ag[j] += q4_group_q8(wg[k], lg[k], qg);
+                    au[j] += q4_group_q8(wu[k], lu[k], qg);
+#else
                     const float* p = xs + j * XS + g;
                     const float gsum = gs[j * gpr + g];
                     ag[j] += q4_group(wg[k], lg[k], p, GP, gsum);
                     au[j] += q4_group(wu[k], lu[k], p, GP, gsum);
+#endif
                 }
             }
             if (it == nit - 1) {
@@ -1172,11 +1801,11 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [2][rb][32]
     const int r0 = blockIdx.x * rb;
-    for (int j = 0; j < cnt; j++) {
-        const float* x = folded + (u64)un[2 + j] * hid;
-        float* xj = xs + j * XS;
-        for (int i = tid; i < hid; i += T) xj[(i & 31) * GP + (i >> 5)] = x[i];
-    }
+    stage_scatter(xs, folded, hid, un + 2, 0, cnt, XS, GP, tid, T);
+#if EXP_STAGE2
+    __syncthreads();
+    stage_scatter(xs, folded, hid, un + 2, 0, cnt, XS, GP, tid, T);
+#endif
     if (tid < 2 * rb) {
         const int m = tid / rb, r = r0 + tid - m * rb;
         if (r < inter) q2_ladder((const u16*)(slot + (u64)m * sgu + params_off + (u64)r * 4), lad + tid * 32);
@@ -1247,6 +1876,10 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
 extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* __restrict__ act,
                                     float* __restrict__ part, int inter, int hid, int rb, unsigned long long sgu)
 { PDL_PRO();
+#ifdef EXP_CLK
+    u64 tk[5];
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tk[0]));
+#endif
     extern __shared__ float sh[];
     const int tid = threadIdx.x, T = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1255,28 +1888,50 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
     if (!slot) return;
     int cnt = 0;
     while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
-    const int gpr = inter >> 5, GP = gpr | 1, XS = 32 * GP, stride = (gpr * 5 + 7) / 8;
+    const int gpr = inter >> 5, GP = gpr | 1, XS = XS_CONTIG ? gpr * XC_G : 32 * GP, stride = (gpr * 5 + 7) / 8;
     const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
     const u8* mat = (const u8*)(slot + 2 * sgu);
     float* xs = sh;                 // [cnt][32][GP]
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [rb][32]
     const int r0 = blockIdx.x * rb;
-    for (int j = 0; j < cnt; j++) {
-        const float* a = act + ((u64)blockIdx.y * Q4_UR + j) * inter;
-        float* xj = xs + j * XS;
-        for (int i = tid; i < inter; i += T) xj[(i & 31) * GP + (i >> 5)] = a[i];
-    }
+#if EXP_DP4A
+    stage_q8((int*)xs, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, tid, T);
+#elif !defined(EXP_NOSTAGE)
+#if XS_CONTIG
+    stage_contig(xs, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, XS, tid, T);
+#else
+    stage_scatter(xs, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, XS, GP, tid, T);
+#endif
+#if EXP_STAGE2
+    __syncthreads();
+    stage_scatter(xs, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, XS, GP, tid, T);
+#endif
+#endif
     if (tid < rb && r0 + tid < hid) q4_ladder((const u16*)(mat + params_off + (u64)(r0 + tid) * 4), lad + tid * 32);
     __syncthreads();
+#ifdef EXP_CLK
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tk[1]));
+#endif
+#if !defined(EXP_NOSTAGE) && !EXP_DP4A
     for (int i = tid; i < cnt * gpr; i += T) {
         const int j = i / gpr, g = i - j * gpr;
+#if XS_CONTIG
+        const float* p = xs + j * XS + g * XC_G;
+        float s = 0.0f;
+        for (int k = 0; k < 32; k++) s += p[k];
+#else
         const float* p = xs + j * XS + g;
         float s = 0.0f;
         for (int k = 0; k < 32; k++) s += p[k * GP];
+#endif
         gs[i] = 8.0f * s;
     }
+#endif
     __syncthreads();
+#ifdef EXP_CLK
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tk[2]));
+#endif
     const int nit = (gpr + 31) >> 5;
     const int nz = warp < rb ? ((rb - warp + NW - 1) / NW) * nit : 0;
     float acc[Q4_UR];
@@ -1288,7 +1943,7 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
             const int z = z0 + k;
             if (z < nz) {
                 const int q = z / nit, g = lane + 32 * (z - q * nit), i = warp + q * NW, r = r0 + i;
-                if (r < hid && g < gpr) {
+                if (r < hid && g < gpr && !EXP_NOW) {
                     w[k] = ((const uint4*)(mat + (u64)r * gpr * 16))[g];
                     lc[k] = lad[i * 32 + q4_code(mat + codes_off + (u64)r * stride, g, stride)];
                 }
@@ -1300,7 +1955,15 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
             const int q = z / nit, it = z - q * nit, g = lane + 32 * it, i = warp + q * NW, r = r0 + i;
             if (r >= hid) break;
             if (g < gpr) {
+#ifdef EXP_NOMATH
+                for (int j = 0; j < cnt; j++) acc[j] += lc[k] * __int_as_float((int)((w[k].x ^ w[k].y ^ w[k].z ^ w[k].w) & 0x3f7fffffu));
+#elif EXP_DP4A
+                for (int j = 0; j < cnt; j++) acc[j] += q4_group_q8(w[k], lc[k], (const int*)xs + ((u64)j * gpr + g) * XQ_G);
+#elif XS_CONTIG
+                for (int j = 0; j < cnt; j++) acc[j] += q4_group_c(w[k], lc[k], xs + j * XS + g * XC_G, gs[j * gpr + g]);
+#else
                 for (int j = 0; j < cnt; j++) acc[j] += q4_group(w[k], lc[k], xs + j * XS + g, GP, gs[j * gpr + g]);
+#endif
             }
             if (it == nit - 1) {
                 for (int j = 0; j < cnt; j++) {
@@ -1310,6 +1973,75 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
                     acc[j] = 0.0f;
                 }
             }
+        }
+    }
+#ifdef EXP_CLK
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tk[3]));
+    __syncthreads();
+    if (tid == 0 && g_clk) {
+        u64* o = g_clk + ((u64)blockIdx.y * gridDim.x + blockIdx.x) * 4;
+        o[0] = tk[0]; o[1] = tk[1]; o[2] = tk[2]; o[3] = tk[3];
+    }
+#endif
+}
+
+
+// The down projection of the int8 path with four lanes a row: lane (rr, sub) takes groups sub * GPL .. of row
+// rr of its warp's eight, so all 32 lanes work (one group a lane left 12 of 32 idle with 640-wide rows) and a lane
+// has GPL words in flight. `rb` rows a block (a multiple of 8 * warps for full use).
+extern "C" __global__ void q4_exp_d4(const u32* __restrict__ units, const float* __restrict__ act,
+                                     float* __restrict__ part, int inter, int hid, int rb, unsigned long long sgu)
+{ PDL_PRO();
+    extern __shared__ float sh[];
+    const int tid = threadIdx.x, T = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const u32* un = units + (u64)blockIdx.y * (2 + Q4_UR);
+    const u64 slot = (u64)un[0] | ((u64)un[1] << 32);
+    if (!slot) return;
+    int cnt = 0;
+    while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
+    const int gpr = inter >> 5, stride = (gpr * 5 + 7) / 8;
+    const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
+    const u8* mat = (const u8*)(slot + 2 * sgu);
+    int* xq = (int*)sh;                                  // [cnt][gpr][XQ_G]
+    float* lad = sh + Q4_UR * gpr * XQ_G;                // [rb][32]
+    const int r0 = blockIdx.x * rb;
+    stage_q8(xq, act, inter, nullptr, (u64)blockIdx.y * Q4_UR, cnt, tid, T);
+    for (int i = tid; i < rb; i += T)
+        if (r0 + i < hid) q4_ladder((const u16*)(mat + params_off + (u64)(r0 + i) * 4), lad + i * 32);
+    __syncthreads();
+    const int rr = lane >> 2, sub = lane & 3, GPL = (gpr + 3) >> 2;
+    for (int base = warp * 8; base < rb; base += NW * 8) {
+        const int i = base + rr, r = r0 + i;
+        const bool ok = i < rb && r < hid;
+        uint4 w[8];
+        float lc[8];
+        if (ok) {
+            const u8* codes = mat + codes_off + (u64)r * stride;
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int g = sub * GPL + q;
+                if (q < GPL && g < gpr) {
+                    w[q] = ((const uint4*)(mat + (u64)r * gpr * 16))[g];
+                    lc[q] = lad[i * 32 + q4_code(codes, g, stride)];
+                }
+            }
+        }
+        float acc[Q4_UR];
+        for (int j = 0; j < Q4_UR; j++) acc[j] = 0.0f;
+        if (ok) {
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int g = sub * GPL + q;
+                if (q < GPL && g < gpr)
+                    for (int j = 0; j < cnt; j++) acc[j] += q4_group_q8(w[q], lc[q], xq + ((u64)j * gpr + g) * XQ_G);
+            }
+        }
+        for (int j = 0; j < cnt; j++) {
+            float a = acc[j];
+            a += __shfl_xor_sync(0xffffffffu, a, 1);
+            a += __shfl_xor_sync(0xffffffffu, a, 2);
+            if (ok && sub == 0) part[((u64)blockIdx.y * Q4_UR + j) * hid + r] = a;
         }
     }
 }

@@ -2845,6 +2845,185 @@ fn ple_row_ids(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<i6
     ids
 }
 
+/// Room in the page cache for what the host still reads (`CMF_QWEN_CACHE_TRIM`, on by default on the CUDA path;
+/// 0 = off): once the device holds its weights and the arena is prefilled, the file's pages other than the n-gram
+/// table are dropped from this process's mapping and from the page cache (they are on the card, or come back on
+/// demand), and the table is asked for ahead (`MADV_WILLNEED`). A host whose RAM does not hold the whole file then
+/// keeps the table (the decode steps' random reads) instead of the pages the load happened to read last. From a
+/// background thread; returns at once.
+#[cfg(feature = "cuda")]
+fn cache_trim(layers: &[Layer]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if std::env::var("CMF_QWEN_CACHE_TRIM").is_ok_and(|v| v.trim() == "0") {
+            return;
+        }
+        let Some(model) = layers.iter().find_map(|l| l.ple.as_ref()?.shards.first()?.model_arc()) else { return };
+        // SAFETY: plain sysconf query.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        for l in layers {
+            let Some(pw) = l.ple.as_ref() else { continue };
+            for sh in &pw.shards {
+                if let Some(b) = sh.mapped_bytes() {
+                    keep.push((b.as_ptr() as usize, b.len()));
+                }
+            }
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        let _ = std::thread::Builder::new().name("cache-trim".into()).spawn(move || {
+            let t0 = std::time::Instant::now();
+            let Ok(f) = std::fs::File::open(&model.path) else { return };
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+            let in_keep = |a: usize, n: usize| keep.iter().any(|&(k, kl)| a < k + kl && k < a + n);
+            let (mut dropped, mut spans) = (0usize, 0usize);
+            for e in &model.tensors {
+                if e.shard != 0 {
+                    continue;
+                }
+                let b = model.entry_bytes(e);
+                let (a, n) = (b.as_ptr() as usize, b.len());
+                if n < (1 << 20) || in_keep(a, n) {
+                    continue;
+                }
+                // whole pages inside the tensor only, so a neighbour that is kept keeps its pages
+                let start = a.div_ceil(page) * page;
+                let end = (a + n) / page * page;
+                if end <= start {
+                    continue;
+                }
+                let Some(abs) = model.entry_abs_offset(e) else { continue };
+                let off = abs + (start - a);
+                // SAFETY: whole pages of our read-only file mapping; a later read faults them back in.
+                unsafe {
+                    libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+                    libc::posix_fadvise(fd, off as libc::off_t, (end - start) as libc::off_t, libc::POSIX_FADV_DONTNEED);
+                }
+                dropped += end - start;
+                spans += 1;
+            }
+            let mut asked = 0usize;
+            for &(a, n) in &keep {
+                let start = a / page * page;
+                let len = (a + n).div_ceil(page) * page - start;
+                // SAFETY: advice on our read-only mapping.
+                unsafe { libc::madvise(start as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+                asked += len;
+            }
+            eprintln!(
+                "qwen4 cuda: page cache: {:.1} GB of {spans} tensors dropped, the n-gram table ({:.1} GB) asked for, in {:.1} s",
+                dropped as f64 / 1e9,
+                asked as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+        });
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = layers;
+}
+
+/// The n-gram table in RAM for good (`CMF_QWEN_PLE_LOCK`, on by default on the CUDA path; 0 = off): a decode
+/// step reads a few of its ~90-byte rows on three pages each of a ~26 GB mapping, and a host whose page cache
+/// does not keep the table (a 62 GB container with a 67 GB file) waits on the disk inside the step (thousands of
+/// major faults in a request). The table's pages are registered with the CUDA driver (pinned) from a background
+/// thread when the whole file fits beside it: the available RAM (the container's limit, if lower) must exceed the
+/// file by 8 GB. Pinning the table where it does not (a 62 GB container, a 67 GB file) evicts the pages a prompt
+/// needs and made every prompt wait on the disk (TTFT 12-15 s instead of 1.5-3 s). `CMF_QWEN_PLE_LOCK=1` pins
+/// whatever the memory, `0` never. Returns at once.
+#[cfg(feature = "cuda")]
+fn ple_lock(layers: &[Layer]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let mode = std::env::var("CMF_QWEN_PLE_LOCK").ok().map(|v| v.trim().to_string());
+        if DONE.set(()).is_err() || mode.as_deref() == Some("0") {
+            return;
+        }
+        // SAFETY: plain sysconf query.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut file = 0u64;
+        for l in layers {
+            let Some(pw) = l.ple.as_ref() else { continue };
+            if file == 0 {
+                file = pw.shards.first().and_then(|s| s.model_arc()).and_then(|m| std::fs::metadata(&m.path).ok()).map_or(0, |md| md.len());
+            }
+            for sh in &pw.shards {
+                if let Some(b) = sh.mapped_bytes() {
+                    let (a, len) = (b.as_ptr() as usize, b.len());
+                    let start = a / page * page;
+                    spans.push((start, (a + len).div_ceil(page) * page - start));
+                }
+            }
+        }
+        spans.sort_unstable();
+        spans.dedup();
+        let bytes: usize = spans.iter().map(|s| s.1).sum();
+        if bytes == 0 {
+            return;
+        }
+        let avail = mem_available();
+        let need = (file as usize).max(bytes) + (8 << 30);
+        if mode.as_deref() != Some("1") && avail < need {
+            eprintln!(
+                "qwen4: n-gram table: {:.1} GB of a {:.1} GB file, {:.1} GB of RAM available: left to the page cache",
+                bytes as f64 / 1e9,
+                file as f64 / 1e9,
+                avail as f64 / 1e9
+            );
+            return;
+        }
+        crate::gpu_cuda::qwen4::pin_host_for_good("n-gram table", spans);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = layers;
+}
+
+/// Bytes of the n-gram tables' file pages (the decode steps' random host reads).
+#[cfg(feature = "cuda")]
+pub(crate) fn ple_table_bytes(layers: &[Layer]) -> usize {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for l in layers {
+        let Some(pw) = l.ple.as_ref() else { continue };
+        for sh in &pw.shards {
+            if let Some(b) = sh.mapped_bytes() {
+                spans.push((b.as_ptr() as usize, b.len()));
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    spans.iter().map(|s| s.1).sum()
+}
+
+/// Bytes of RAM this process may still take: MemAvailable, or the container's memory limit minus its anonymous
+/// memory when lower (0 where neither can be read).
+#[cfg(all(feature = "cuda", not(any(target_os = "linux", target_os = "android"))))]
+pub(crate) fn mem_available() -> usize {
+    0
+}
+
+/// Bytes of RAM this process may still take: MemAvailable, or the container's memory limit minus its anonymous
+/// memory when lower.
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "android")))]
+pub(crate) fn mem_available() -> usize {
+    let kb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
+        .unwrap_or(0);
+    let mut avail = kb * 1024;
+    // the container's limit minus what it cannot give back (its page cache can be)
+    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let anon = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        .ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("anon ")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()));
+    if let (Some(max), Some(anon)) = (max, anon) {
+        avail = avail.min(max.saturating_sub(anon));
+    }
+    avail
+}
+
 /// Threads that ask the kernel for a prompt chunk's n-gram rows ahead of the
 /// gather (`CMF_QWEN_PLE_PREFETCH`, default 32; 0 turns the read-ahead off).
 #[cfg(feature = "gpu")]
@@ -2871,10 +3050,18 @@ fn ple_prefetch_threads() -> usize {
 /// of rows asked for.
 #[cfg(feature = "gpu")]
 fn ple_prefetch(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32]) -> usize {
+    ple_prefetch_min(layers, cfg, history, ids, 64)
+}
+
+/// `ple_prefetch` for chunks of at least `min_ids` tokens. A verify window (4 tokens) takes it too: its rows sit
+/// on ~100 pages, which the pool's few workers otherwise fault in one after another inside the round (14-34 ms
+/// on a host whose page cache does not hold the table); advised together they arrive in about one disk latency.
+#[cfg(feature = "gpu")]
+fn ple_prefetch_min(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32], min_ids: usize) -> usize {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         let threads = ple_prefetch_threads();
-        if threads == 0 || ids.len() < 64 {
+        if threads == 0 || ids.len() < min_ids.max(1) {
             return 0;
         }
         let t0 = std::time::Instant::now();
@@ -2954,7 +3141,7 @@ fn ple_prefetch(layers: &[Layer], cfg: &Cfg, history: &[u32], ids: &[u32]) -> us
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
-        let _ = (layers, cfg, history, ids);
+        let _ = (layers, cfg, history, ids, min_ids);
         0
     }
 }
@@ -4127,7 +4314,7 @@ fn cuda_spec_round(
                 };
                 let kmax = head.k.min(budget).min(tape.saturating_sub(1)).min(7);
                 let mut out: Vec<u32> = Vec::new();
-                match dev.draft(&head.layer, &embed, all_ids[next_pos], next_pos, kmax, &mut out) {
+                match dev.draft(&head.layer, &embed, all_ids[next_pos], next_pos, kmax, &all_ids[all_ids.len().saturating_sub(256)..], &mut out) {
                     Ok(true) => drafts = out,
                     Ok(false) => {}
                     Err(e) => {
@@ -4149,6 +4336,10 @@ fn cuda_spec_round(
     let this_round = ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ncu_on = ncu_round == Some(this_round);
     let ids: Vec<u32> = std::iter::once(all_ids[next_pos]).chain(drafts.iter().copied()).collect();
+    if !std::env::var_os("CMF_QWEN_NO_PLE").is_some() && std::env::var("CMF_QWEN_WINDOW_PREFETCH").map(|v| v.trim() != "0").unwrap_or(true) {
+        // the window's n-gram rows are known now: their pages are asked for before the pass needs them
+        ple_prefetch_min(layers, cfg, &state.token_history, &ids, 1);
+    }
     let mut dev = state.cuda.take()?;
     let h = cfg.hidden;
     let no_ple = std::env::var_os("CMF_QWEN_NO_PLE").is_some();
@@ -4540,6 +4731,7 @@ fn cuda_forward(
         return false;
     }
     if state.cuda.is_none() {
+        ple_lock(layers);
         // the file's MTP draft head (`CMF_QWEN_MTP=0` leaves it out)
         if state.mtp.is_none() && !state.mtp_tried {
             state.mtp_tried = true;
@@ -4589,6 +4781,7 @@ fn cuda_forward(
                         Err(e) => eprintln!("qwen4 cuda: prefill: {e}"),
                     }
                 }
+                cache_trim(layers);
                 state.cuda = Some(d)
             }
             Err(e) => {
