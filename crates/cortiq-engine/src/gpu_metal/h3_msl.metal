@@ -160,6 +160,25 @@ kernel void h3_swiglu(
     *(device half4*)(h + (ulong)row * p.ffn + 4u * c4) = half4(sl * u * p.oscale);
 }
 
+// ───── MOSS-Image's SiTU of a [hidden | gate] f32 panel, times oscale ─────
+// h = 4·tanh(g/4)·sigmoid(g) · 25·tanh(u/25), bounded by 100.
+kernel void mo_situ(
+    device const float* gu [[buffer(0)]],
+    device half* h [[buffer(1)]],
+    constant HSw& p [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= p.n4) return;
+    const uint f4 = p.ffn / 4u;
+    const uint row = i / f4, c4 = i - row * f4;
+    device const float* gr = gu + (ulong)row * 2u * p.ffn + 4u * c4;
+    const float4 u = *(device const float4*)gr;
+    const float4 g = *(device const float4*)(gr + p.ffn);
+    const float4 sg = 1.0f / (1.0f + exp(-clamp(g, -60.0f, 60.0f)));
+    const float4 v = 4.0f * tanh(clamp(g * 0.25f, -15.0f, 15.0f)) * sg * 25.0f * tanh(clamp(u * 0.04f, -15.0f, 15.0f));
+    *(device half4*)(h + (ulong)row * p.ffn + 4u * c4) = half4(v * p.oscale);
+}
+
 // ─────────── flash attention: grouped, causal, batched, hd 64 / 128 ───────────
 // `qi_flash`'s schedule for the stacks it does not address: a key head
 // shared by `rep` query heads (keys at `k_col`, values at `v_col` of the

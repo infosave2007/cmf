@@ -35,7 +35,7 @@
 //! (the largest stored value of each half site),
 //! `CMF_H3_METAL_{ACT,QKV,HID}_SHIFT` (the guards).
 
-use crate::gpu::{H3Chain, TeChain};
+use crate::gpu::{H3Chain, MossChainArgs, TeChain};
 use cortiq_core::{CmfModel, TensorDtype};
 use metal::{
     Buffer, CommandBuffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions,
@@ -85,6 +85,8 @@ struct Pipes {
     rowop: ComputePipelineState,
     qkrope: ComputePipelineState,
     swiglu: ComputePipelineState,
+    /// `mo_situ`: MOSS-Image's feed-forward middle.
+    situ: ComputePipelineState,
     /// `qi_swiglu`: the gate and up panels as two planes (the encoder's).
     swiglu2: ComputePipelineState,
     /// `h3_flash_128`: grouped, causal attention (the encoder's).
@@ -124,6 +126,7 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
         rowop: pso("h3_rowop")?,
         qkrope: pso("h3_qkrope")?,
         swiglu: pso("h3_swiglu")?,
+        situ: pso("mo_situ")?,
         swiglu2: pso("qi_swiglu")?,
         flash_g: pso("h3_flash_128")?,
         mm_q8: pso("qi_mm_q8")?,
@@ -1031,6 +1034,190 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         return decline("the chain produced a non-finite stream (a half range guard overflowed?)");
     }
     h.copy_from_slice(out);
+    if std::env::var("CMF_H3_METAL_PROF").as_deref() == Ok("1") {
+        eprintln!("h3 metal chain, {what}: {:.3} s", t0.elapsed().as_secs_f64());
+    }
+    true
+}
+
+// ───────────────────────── MOSS-Image ─────────────────────────
+
+/// A MOSS-Image forward's blocks over the joint `[image | text]` rows, in
+/// place, on the chain's kernels: the RMS norm with its weight and the
+/// step's one modulation row (`h3_rowop`, every row reading row 0), the q, k
+/// and v products into one panel (q4tp or int8 read in place), per-head
+/// q/k norm with the split-half rotation (`h3_qkrope`), `qi_flash`, the
+/// gated residuals, the fused up/gate product and the SiTU (`mo_situ`).
+/// `false`: nothing was written. `CMF_MOSS_METAL=0` keeps the per-op path.
+pub(crate) fn moss_chain(model: &Arc<CmfModel>, a: &mut MossChainArgs<'_>) -> bool {
+    if !enabled() || std::env::var("CMF_MOSS_METAL").as_deref() == Ok("0") {
+        return false;
+    }
+    let (n, nh, hd) = (a.tokens, a.heads, a.head_dim);
+    let hs = nh * hd;
+    let nb = a.blocks.len();
+    if hd != 128 || nb == 0 || n < 8 || a.x.len() != n * hs || a.modulation.len() != EXPAND * hs {
+        return not_mine("a MOSS-Image forward outside the chain's shapes");
+    }
+    if a.cos.len() != n * hd / 2 || a.sin.len() != a.cos.len() {
+        return decline("MOSS-Image rotation tables of the wrong size");
+    }
+    if a.blocks.iter().any(|b| b.norm1.len() != hs || b.norm2.len() != hs || b.q_norm.len() != hd || b.k_norm.len() != hd) {
+        return decline("a MOSS-Image norm of the wrong width");
+    }
+    let ffn = match model.tensors.get(a.blocks[0].up_gate) {
+        Some(e) if e.shape.len() == 2 => e.shape[0] / 2,
+        _ => return not_mine("a MOSS-Image feed-forward that is not a matrix"),
+    };
+    if !hs.is_multiple_of(256) || hs > 8192 || !ffn.is_multiple_of(64) {
+        return not_mine("widths the kernels do not divide");
+    }
+    let Some((c, p)) = device() else { return false };
+    let Some((arena, safe_len)) = super::file_buffer(c, model) else {
+        return decline("the file mapping cannot be wrapped as a Metal buffer");
+    };
+    let mut aux: Vec<f32> = Vec::new();
+    let mut ts = Vec::with_capacity(6 * nb);
+    for b in a.blocks {
+        for t in [
+            tens_any(model, b.q, hs, hs, safe_len, &mut aux),
+            tens_any(model, b.k, hs, hs, safe_len, &mut aux),
+            tens_any(model, b.v, hs, hs, safe_len, &mut aux),
+            tens_any(model, b.o, hs, hs, safe_len, &mut aux),
+            tens_any(model, b.up_gate, 2 * ffn, hs, safe_len, &mut aux),
+            tens_any(model, b.down, hs, ffn, safe_len, &mut aux),
+        ] {
+            match t {
+                Some(t) => ts.push(t),
+                None => return not_mine("a MOSS-Image projection that is not a q4tp or int8 tensor of the block's shape"),
+            }
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let gd = Guards::from_env();
+    let mut st = STATE.lock().unwrap();
+    if !ensure_acts(c, &mut st, n, hs, 3 * hs, hs, ffn) {
+        return false;
+    }
+    let acts = st.0.as_ref().unwrap();
+
+    // per call: the norms' weights, the modulation row, the rows' (cos, sin)
+    let cstride = 2 * hs + 2 * hd;
+    let mut cwv = Vec::with_capacity(nb * cstride);
+    for b in a.blocks {
+        cwv.extend_from_slice(b.norm1);
+        cwv.extend_from_slice(b.norm2);
+        cwv.extend_from_slice(b.q_norm);
+        cwv.extend_from_slice(b.k_norm);
+    }
+    let cw = buf_from(c, &cwv);
+    let auxb = if aux.is_empty() { buf_zeroed(c, 16) } else { buf_from(c, &aux) };
+    let mods = buf_from(c, a.modulation);
+    let mrow = buf_zeroed(c, n * 4);
+    let csv: Vec<f32> = a.cos.iter().zip(a.sin.iter()).flat_map(|(&co, &si)| [co, si]).collect();
+    let cs = buf_from(c, &csv);
+    unsafe {
+        std::ptr::copy_nonoverlapping(a.x.as_ptr(), acts.x.contents() as *mut f32, n * hs);
+    }
+    // the SiTU is bounded by 100: its middle needs no range guard
+    let hid_shift = 0;
+    let mut rec = Rec::new(c);
+    {
+        let mut e = Enc {
+            rec: &mut rec,
+            p,
+            arena: &arena,
+            a: acts,
+            n,
+            hs,
+            cw: &cw,
+            aux: &auxb,
+            own: None,
+            mods: &mods,
+            mrow: &mrow,
+            modded: true,
+            eps: 1e-6,
+            amax: None,
+        };
+        // 0 = before the attention, 1 = before the feed-forward
+        let norm = |l: usize, half: usize| (3 * half * hs, (3 * half + 1) * hs, l * cstride + half * hs);
+        let act = p2(-gd.act);
+        let per_cut = if n > 2048 { 1 } else { 2 };
+        e.rowop(None, Some(norm(0, 0)), act);
+        for l in 0..nb {
+            let w = &ts[6 * l..6 * l + 6];
+            for (part, &t) in w[..3].iter().enumerate() {
+                e.gemm(t, &acts.xn, &acts.panel, part * hs, 3 * hs, true, p2(gd.act - gd.qkv));
+            }
+            {
+                let pq = PQk {
+                    ldp: (3 * hs) as u32,
+                    nq: nh as u32,
+                    nk: nh as u32,
+                    k_col: hs as u32,
+                    pairs: (hd / 2) as u32,
+                    w_off: (l * cstride + 2 * hs) as u32,
+                    eps: 1e-6 * p2(-2 * gd.qkv),
+                    qmul: std::f32::consts::LOG2_E / (hd as f32).sqrt(),
+                };
+                let enc = e.rec.enc("rope");
+                enc.set_compute_pipeline_state(&p.qkrope);
+                enc.set_buffer(0, Some(&acts.panel), 0);
+                enc.set_buffer(1, Some(&cw), 0);
+                enc.set_buffer(2, Some(&cs), 0);
+                set_p(enc, 3, &pq);
+                enc.dispatch_thread_groups(MTLSize::new(n as u64, (2 * nh).div_ceil(4) as u64, 1), MTLSize::new(128, 1, 1));
+            }
+            {
+                let pf = PFa {
+                    q_row0: 0,
+                    nq: n as u32,
+                    n_pre: 0,
+                    n_own: n as u32,
+                    ldp: (3 * hs) as u32,
+                    h: hs as u32,
+                    ldo: hs as u32,
+                    oscale: 1.0,
+                    ..Default::default()
+                };
+                let enc = e.rec.enc("flash");
+                enc.set_compute_pipeline_state(&p.flash);
+                enc.set_buffer(0, Some(&acts.panel), 0);
+                enc.set_buffer(1, Some(&acts.attn), 0);
+                enc.set_buffer(2, Some(&acts.panel), 0);
+                enc.set_buffer(3, Some(&acts.y), 0);
+                set_p(enc, 4, &pf);
+                enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, nh as u64, 1), MTLSize::new(256, 1, 1));
+            }
+            e.gemm(w[3], &acts.attn, &acts.y, 0, hs, false, p2(gd.qkv));
+            e.rowop(Some(2 * hs), Some(norm(l, 1)), act);
+            e.gemm(w[4], &acts.xn, &acts.gu, 0, 2 * ffn, false, p2(gd.act));
+            {
+                let ps = PSw { n4: (n * ffn / 4) as u32, ffn: ffn as u32, oscale: p2(-hid_shift), has_b: 0 };
+                let enc = e.rec.enc("situ");
+                enc.set_compute_pipeline_state(&p.situ);
+                enc.set_buffer(0, Some(&acts.gu), 0);
+                enc.set_buffer(1, Some(&acts.hid), 0);
+                set_p(enc, 2, &ps);
+                enc.dispatch_thread_groups(MTLSize::new((ps.n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+            }
+            e.gemm(w[5], &acts.hid, &acts.y, 0, hs, false, p2(hid_shift));
+            let next = (l + 1 < nb).then(|| norm(l + 1, 0));
+            e.rowop(Some(5 * hs), next, act);
+            if (l + 1).is_multiple_of(per_cut) {
+                e.rec.cut();
+            }
+        }
+    }
+    let what = format!("MOSS {n} rows x {nb} blocks");
+    if !rec.finish(&what) {
+        return decline("a command buffer of the MOSS-Image chain failed");
+    }
+    let out = unsafe { std::slice::from_raw_parts(acts.x.contents() as *const f32, n * hs) };
+    if out.iter().any(|v| !v.is_finite()) {
+        return decline("the MOSS-Image chain produced a non-finite row (a half range guard overflowed?)");
+    }
+    a.x.copy_from_slice(out);
     if std::env::var("CMF_H3_METAL_PROF").as_deref() == Ok("1") {
         eprintln!("h3 metal chain, {what}: {:.3} s", t0.elapsed().as_secs_f64());
     }

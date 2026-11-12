@@ -289,8 +289,9 @@ impl MossDit {
         let time = self.time_embedding(timestep);
         let modulation = linear_small(&time, &self.shared_mod_w, &self.shared_mod_b);
         let head = linear_small(&time, &self.head_mod_w, &self.head_mod_b);
+        let chained = self.chain(&mut x, image_tokens + text_tokens, &rope, &modulation, skip_layers);
         for (i, block) in self.layers.iter().enumerate() {
-            if !skip_layers.contains(&i) {
+            if !chained && !skip_layers.contains(&i) {
                 main_block(
                     block,
                     &mut x,
@@ -333,6 +334,64 @@ impl MossDit {
             }
         }
         Ok(velocity)
+    }
+
+    /// Every block but the skipped ones on the card in one call
+    /// (`gpu::moss_chain`); `false`: nothing was written. `CMF_MOSS_CHAIN=0`
+    /// keeps the per-operation blocks.
+    fn chain(&self, x: &mut [f32], n: usize, rope: &Rope, modulation: &[f32], skip: &[usize]) -> bool {
+        if !crate::gpu::enabled_here() || crate::gpu::mm_killed() || std::env::var("CMF_MOSS_CHAIN").as_deref() == Ok("0") {
+            return false;
+        }
+        let hd = self.cfg.head_dim();
+        let half = hd / 2;
+        let mut model: Option<Arc<CmfModel>> = None;
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for (i, b) in self.layers.iter().enumerate() {
+            if skip.contains(&i) {
+                continue;
+            }
+            let mut ix = [0usize; 6];
+            for (slot, p) in ix.iter_mut().zip([&b.q, &b.k, &b.v, &b.o, &b.ffn_up_gate, &b.ffn_down]) {
+                let Some((m, g)) = p.graph_w() else { return false };
+                if model.as_ref().is_some_and(|have| !Arc::ptr_eq(have, m)) {
+                    return false;
+                }
+                model.get_or_insert_with(|| m.clone());
+                *slot = g.idx;
+            }
+            blocks.push(crate::gpu::MossChainBlock {
+                norm1: &b.norm1,
+                norm2: &b.norm2,
+                q_norm: &b.q_norm,
+                k_norm: &b.k_norm,
+                q: ix[0],
+                k: ix[1],
+                v: ix[2],
+                o: ix[3],
+                up_gate: ix[4],
+                down: ix[5],
+            });
+        }
+        let Some(model) = model else { return false };
+        // the rotation's first halves (the second repeats them)
+        let mut cos = vec![0f32; n * half];
+        let mut sin = vec![0f32; n * half];
+        for t in 0..n {
+            cos[t * half..(t + 1) * half].copy_from_slice(&rope.cos[t * hd..t * hd + half]);
+            sin[t * half..(t + 1) * half].copy_from_slice(&rope.sin[t * hd..t * hd + half]);
+        }
+        let mut args = crate::gpu::MossChainArgs {
+            x,
+            tokens: n,
+            heads: self.cfg.num_heads,
+            head_dim: hd,
+            modulation,
+            cos: &cos,
+            sin: &sin,
+            blocks: &blocks,
+        };
+        crate::gpu::moss_chain(&model, &mut args)
     }
 
     fn time_embedding(&self, t: f32) -> Vec<f32> {

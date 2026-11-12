@@ -41,6 +41,12 @@ use crate::gpu::H3Chain;
 #[path = "qwen_image.rs"]
 mod qwen_image;
 pub use qwen_image::qwen_image_chain;
+#[path = "moss.rs"]
+mod moss;
+pub use moss::moss_chain;
+#[path = "flux_vae.rs"]
+mod flux_vae;
+pub use flux_vae::flux_vae_chain;
 
 /// The Lumina Next-DiT block, one block a call, on this module's weight store.
 #[path = "lumina.rs"]
@@ -108,6 +114,10 @@ pub(super) struct H3State {
     lumina: Option<lumina::LbFuncs>,
     /// The kernels of the Qwen-Image chain (`qwen_image.rs`), once compiled.
     qwen_image: Option<qwen_image::QiFuncs>,
+    /// The kernels of the MOSS-Image chain (`moss.rs`), once compiled.
+    moss: Option<moss::MoFuncs>,
+    /// The kernels of the FLUX-class VAE decoder chain (`flux_vae.rs`), once compiled.
+    flux_vae: Option<flux_vae::FvFuncs>,
 }
 
 impl H3State {

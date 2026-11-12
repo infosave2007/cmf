@@ -20,6 +20,8 @@ case $backend in
   *) echo "backend: cuda | vulkan | cpu"; exit 2 ;;
 esac
 [ -n "${VRAM_MB:-}" ] && export CMF_GPU_VRAM_MB=$VRAM_MB
+# the card is shared with other runs: the clock starts once it is ours
+exec 9>"$root/gpu.lock"; flock 9
 ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; sleep 0.25; done ) > "$out.vram_trace" 2>/dev/null &
 tr=$!
 t0=$(date +%s.%N)
