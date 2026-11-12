@@ -123,6 +123,18 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## MOSS-Image на CUDA, Vulkan и Metal (0.8.81)
+
+[MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) теперь считает все блоки прохода DiT на карте за
+один вызов на всех трёх бэкендах, и в q4tp, и в q8_2f; на CUDA декодер Flux2 VAE тоже идёт одной цепочкой. На
+RTX A5000 картинка 512×512 за 8 шагов занимает 10,1 с на CUDA (было 297,1 с) и 17,3 с через Vulkan (было 414,7 с);
+рецепт 1024×1024 на 50 шагов на CUDA — 123,1 с. MacBook Air M4 рисует 512×512 за 69,8 с (было 123,7 с):
+
+```sh
+CMF_GPU=cuda cortiq imagine moss-image-sft-q4tp.cmf --prompt "A small red fox reading a book in a sunlit library" \
+  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --out fox.png
+```
+
 ## Qwen-Image-Edit-2509 на CUDA, быстрее на Vulkan (0.8.80)
 
 [Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) теперь считает все блоки

@@ -123,6 +123,19 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## MOSS-Image on CUDA, Vulkan and Metal (0.8.81)
+
+[MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) runs every block of a DiT pass on the card in one
+call on all three backends, q4tp and q8_2f alike; on CUDA the Flux2 VAE decoder runs as one chain too. On an
+RTX A5000 a 512×512 picture in 8 steps takes 10.1 s on CUDA (was 297.1 s) and 17.3 s over Vulkan (was 414.7 s);
+the 50-step 1024×1024 recipe takes 123.1 s on CUDA. A MacBook Air M4 draws the 512×512 picture in 69.8 s (was
+123.7 s):
+
+```sh
+CMF_GPU=cuda cortiq imagine moss-image-sft-q4tp.cmf --prompt "A small red fox reading a book in a sunlit library" \
+  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --out fox.png
+```
+
 ## Qwen-Image-Edit-2509 on CUDA, faster on Vulkan (0.8.80)
 
 [Qwen-Image-Edit-2509](https://huggingface.co/infosave/Qwen-Image-Edit-2509-cmf) now keeps every transformer block
