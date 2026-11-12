@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## MiniMax-H3-Image on Vulkan and Metal (0.8.75)
+
+[MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) now keeps the image on the GPU from the
+transformer's first block to its last on Vulkan and on Apple silicon too, as it did on CUDA. On an RTX A5000 the
+default backend, Vulkan, renders 2048×2048 in 33.7 s where 0.8.74 took 260.1 s (CUDA: 24.8 s), and an edit of a
+1024×1024 picture in 30.6 s instead of 164.5 s. `CMF_GPU_VRAM_MB` is a ceiling on Vulkan as well: 2048×2048 in
+46.8 s within 4 GB, the same picture bit for bit. A MacBook Air M4 with 24 GB renders 1024×1024 in 138.8 s
+instead of 305.2 s:
+
+```sh
+cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+CMF_GPU_VRAM_MB=8000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+```
+
+See [the guide](docs/MINIMAX_H3_IMAGE.md).
+
 ## MiniMax-H3-Image, text to image and image editing (0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) generates and edits images of 4 to 16

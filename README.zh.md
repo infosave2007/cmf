@@ -112,6 +112,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## MiniMax-H3-Image:Vulkan 与 Metal(0.8.75)
+
+[MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) 现在在 Vulkan 和 Apple 芯片上也把图片
+从 Transformer 的第一个块到最后一个块都留在 GPU 上，与之前的 CUDA 一样。在 RTX A5000 上，默认后端 Vulkan 生成
+2048×2048 用时 33.7 秒，0.8.74 需要 260.1 秒（CUDA 为 24.8 秒）；编辑一张 1024×1024 的图片用时 30.6 秒，之前是
+164.5 秒。`CMF_GPU_VRAM_MB` 在 Vulkan 上同样是显存上限：4 GB 以内生成 2048×2048 用时 46.8 秒，图片逐位相同。
+24 GB 的 MacBook Air M4 生成 1024×1024 用时 138.8 秒，之前是 305.2 秒:
+
+```sh
+cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+CMF_GPU_VRAM_MB=8000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+```
+
+参见[指南](docs/MINIMAX_H3_IMAGE.zh.md)。
+
 ## MiniMax-H3-Image:文生图与图片编辑(0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) 用六步生成和编辑 4 到 16 百万像素的

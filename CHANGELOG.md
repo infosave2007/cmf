@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.75] — 2026-11-12
+
+### Added
+- MiniMax-H3-Image on Vulkan and Metal as resident chains ([docs/MINIMAX_H3_IMAGE.md](docs/MINIMAX_H3_IMAGE.md)):
+  the image stays on the GPU from the transformer's first block to its last, as on CUDA.
+  - **Vulkan** (`gpu_wgpu/h3.rs`, `h3_conv.rs`): the transformer, the prompt encoder, the VAE decoder and the
+    reference pictures' VAE encoder. The products read the q4tp tensors directly on the 16 x 16 matrix units
+    (`zi_mm` with `MmCfg::q4`; `q4h` for a `[gate | up]` projection under the SwiGLU epilogue), attention is
+    `qi_flash` over the q/k/v panel (causal and grouped for the encoder, a variant for 64-wide heads and tile
+    batches for the VAE), convolutions gather their taps inside the product (`MmCfg::conv` 4 and 5: reflect
+    padding, stride 2). RTX A5000, release build, against the per-operation path it replaces: 1024 x 1024 in
+    16.2 s (was 91.8), 2048 x 2048 in 33.7 s (was 260.1), an edit of a 1024 x 1024 picture in 30.6 s (was 164.5);
+    CUDA on the same card takes 10.8, 24.8 and 25.4 s. 4096 x 4096: 142.3 s against 138.6 on CUDA. Pictures
+    against CUDA: 45.9, 44.5, 43.8 and 40.3 dB.
+  - **A memory ceiling on Vulkan**: `CMF_GPU_VRAM_MB` is the budget of the weights. The blocks that fit stay on
+    the card, the rest pass through it every step in runs of at most 1 GB. 2048 x 2048 on the RTX A5000:
+    32.8 s without one, 38.1 s under 8 GB, 41.6 s under 6 GB, 46.8 s under 4 GB; the pictures are identical to the
+    one without a ceiling.
+  - **Metal** (`gpu_metal/h3.rs`, `h3_msl.metal`): the transformer, the prompt encoder and the VAE decoder, on
+    the Qwen-Image-2.1 GEMM with kernels of their own for the modulated RMS norm, the split-half rotation and
+    grouped, causal and batched attention. MacBook Air M4 with 24 GB: 1024 x 1024 in 138.8 s (was 305.2), a step
+    in 20.2 s (was 43.2); 2048 x 2048 in 565.8 s; an edit of a 1024 x 1024 picture in 431.6 s (was 516.8). The
+    pictures are 47.2 and 43.7 dB from CUDA's.
+  - The vision tower of an edit runs on the device on every GPU backend, its encoder layers resident between
+    deepstack taps (`gpu::vit_encode` in runs of layers): 41.6 s to 2.9 s on Vulkan.
+  - `CMF_H3_WGPU=0` and `CMF_H3_METAL=0` keep the per-operation paths.
+
+### Changed
+- The Vulkan chains of MiniMax-H3-Image upload their weights in 4 MB staging chunks (a scoped hint,
+  `gpu_wgpu::UploadChunk`; `CMF_GPU_UPLOAD_CHUNK_MB` still overrides): 12.7 GB of the prompt encoder in 3.7 s
+  instead of 9.8 s with the 64 MB default, 10.0 GB of the transformer in 3.3 s instead of 4.3 s.
+
 ## [0.8.74] — 2026-11-12
 
 ### Added

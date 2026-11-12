@@ -29,6 +29,8 @@ pub mod zimage;
 // Qwen-Image-2.1 denoiser — child module, `gpu_metal/qi21.rs`.
 #[doc(hidden)]
 pub mod qi21;
+/// MiniMax-H3 stacks (the DiT of MiniMax-H3-Image) as a resident chain.
+pub(crate) mod h3;
 
 // EmbeddingGemma 2 text encoder — child module, `gpu_metal/egemma2.rs`.
 #[doc(hidden)]

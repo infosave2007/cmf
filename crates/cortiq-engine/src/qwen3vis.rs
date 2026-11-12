@@ -527,9 +527,15 @@ impl VisionTower {
         let merge_dim = hd * self.merge * self.merge;
         let mut deep = Vec::new();
         let (mut t_mm, mut t_att) = (0f64, 0f64);
-        // The device tower: the whole encoder stack resident when the
-        // backend takes it (f32 matrices, no deepstack taps).
-        let resident = self.device && self.deepstack_at.is_empty() && crate::gpu::enabled_here() && {
+        // The device tower: the encoder stack resident when the backend
+        // takes it (f32 matrices) — in one piece, or in the runs of layers
+        // between deepstack taps, the stream coming home at each tap for
+        // its merger. `done` layers ran there; the rest take the per-op
+        // path below. MiniMax-H3-Image's tower (4096 patches of a
+        // 1024 x 1024 picture) on an RTX A5000 over Vulkan took 41.6 s
+        // per-op, 28.3 s of it attention: with taps it never came here.
+        let mut done = 0usize;
+        if self.device && crate::gpu::enabled_here() {
             let f32w = |p: &'_ Proj| -> Option<*const Vec<f32>> {
                 match p {
                     Proj::F32 { w, .. } => Some(w as *const Vec<f32>),
@@ -546,54 +552,65 @@ impl VisionTower {
                     sin[p * self.head_dim + j] = s;
                 }
             }
-            let layers: Option<Vec<crate::gpu::VitLayer>> = self
-                .blocks
-                .iter()
-                .map(|b| {
-                    // SAFETY: the pointers come from `b`, alive for this call.
-                    let (q, pr, f1, f2) = unsafe {
-                        (&*f32w(&b.qkv)?, &*f32w(&b.proj)?, &*f32w(&b.fc1)?, &*f32w(&b.fc2)?)
-                    };
-                    Some(crate::gpu::VitLayer {
-                        ln1_w: &b.n1_w,
-                        ln1_b: &b.n1_b,
-                        qkv: q,
-                        qkv_b: &b.qkv_b,
-                        proj: pr,
-                        proj_b: &b.proj_b,
-                        ln2_w: &b.n2_w,
-                        ln2_b: &b.n2_b,
-                        fc1: f1,
-                        fc1_b: &b.fc1_b,
-                        fc2: f2,
-                        fc2_b: &b.fc2_b,
-                    })
-                })
-                .collect();
-            match layers {
-                Some(layers) => {
-                    let args = crate::gpu::VitArgs {
-                        key: self as *const Self as u64,
-                        layers,
-                        n,
-                        d: hd,
-                        heads: self.heads,
-                        head_dim: self.head_dim,
-                        inter,
-                        eps: EPS,
-                        gelu_tanh: true,
-                        quick_gelu: false,
-                rope_halves: true,
-                        cos: &cos,
-                        sin: &sin,
-                        prof,
-                    };
-                    crate::gpu::vit_encode(&args, &mut x)
+            let mut ends: Vec<usize> = self.deepstack_at.iter().map(|&d| d + 1).collect();
+            ends.push(self.blocks.len());
+            ends.sort_unstable();
+            ends.dedup();
+            for (si, &end) in ends.iter().enumerate() {
+                if end <= done || end > self.blocks.len() {
+                    continue;
                 }
-                None => false,
+                let layers: Option<Vec<crate::gpu::VitLayer>> = self.blocks[done..end]
+                    .iter()
+                    .map(|b| {
+                        // SAFETY: the pointers come from `b`, alive for this call.
+                        let (q, pr, f1, f2) = unsafe {
+                            (&*f32w(&b.qkv)?, &*f32w(&b.proj)?, &*f32w(&b.fc1)?, &*f32w(&b.fc2)?)
+                        };
+                        Some(crate::gpu::VitLayer {
+                            ln1_w: &b.n1_w,
+                            ln1_b: &b.n1_b,
+                            qkv: q,
+                            qkv_b: &b.qkv_b,
+                            proj: pr,
+                            proj_b: &b.proj_b,
+                            ln2_w: &b.n2_w,
+                            ln2_b: &b.n2_b,
+                            fc1: f1,
+                            fc1_b: &b.fc1_b,
+                            fc2: f2,
+                            fc2_b: &b.fc2_b,
+                        })
+                    })
+                    .collect();
+                let Some(layers) = layers else { break };
+                let args = crate::gpu::VitArgs {
+                    // a run of layers is a tower of its own to the device
+                    key: (self as *const Self as u64).wrapping_add((si as u64) << 56),
+                    layers,
+                    n,
+                    d: hd,
+                    heads: self.heads,
+                    head_dim: self.head_dim,
+                    inter,
+                    eps: EPS,
+                    gelu_tanh: true,
+                    quick_gelu: false,
+                    rope_halves: true,
+                    cos: &cos,
+                    sin: &sin,
+                    prof,
+                };
+                if !crate::gpu::vit_encode(&args, &mut x) {
+                    break;
+                }
+                if let Some(k) = self.deepstack_at.iter().position(|&d| d + 1 == end) {
+                    deep.push(self.deepstack[k].apply(&x, n, hd, merge_dim, pool));
+                }
+                done = end;
             }
-        };
-        for (li, blk) in self.blocks.iter().enumerate().filter(|_| !resident) {
+        }
+        for (li, blk) in self.blocks.iter().enumerate().skip(done) {
             norm_rows(&x, &blk.n1_w, &blk.n1_b, &mut xn, hd, pool);
             let tm = std::time::Instant::now();
             self.mm(&blk.qkv, &xn, n, &mut qkv, pool);

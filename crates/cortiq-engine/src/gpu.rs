@@ -4222,6 +4222,10 @@ pub fn te_chain(job: &TeChain<'_>, h: &mut [f32]) -> bool {
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_te_chain(job, h),
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::te_chain(job, h),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::h3::te_chain(job, h),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4258,6 +4262,8 @@ pub fn conv_chain(steps: &[ConvStep<'_>], x: &[f32], c: usize, h: usize, w: usiz
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_conv_chain(steps, x, c, h, w),
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3_conv::conv_chain(steps, x, c, h, w),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -4268,6 +4274,10 @@ pub fn h3_chain_available() -> bool {
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => true,
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::available(),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::h3::available(),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4281,6 +4291,10 @@ pub fn h3_chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_chain(job, h),
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::chain(job, h),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::h3::chain(job, h),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4892,9 +4906,15 @@ pub fn q4tp_matmat(
 pub fn stage_done(model: &CmfModel) {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => crate::gpu_wgpu::release_model_buffers(model),
+        Backend::Wgpu => {
+            crate::gpu_wgpu::h3::release();
+            crate::gpu_wgpu::h3_conv::release();
+            crate::gpu_wgpu::release_model_buffers(model)
+        }
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_release(),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::h3::release(),
         #[allow(unreachable_patterns)]
         _ => {}
     }

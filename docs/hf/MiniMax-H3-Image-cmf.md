@@ -15,6 +15,7 @@ tags:
   - cuda
   - nvidia
   - vulkan
+  - metal
   - text-to-image
   - image-to-image
   - image-editing
@@ -31,7 +32,9 @@ language:
 Rust inference engine with no Python and no ML framework. The diffusion transformer and the prompt encoder are
 in 4 bits, the VAE in 8. On a 16 GB RTX 2000 Ada the native CUDA backend renders 2048 x 2048 in 50.3 s,
 and under a ceiling of 4 GB on the card's memory in 60.2 s, the same picture. The same file runs over
-Vulkan on any vendor's card.
+Vulkan: 2048 x 2048 in 33.7 s on an RTX A5000 against 24.8 s on CUDA, and in 46.8 s under a
+4 GB ceiling. A MacBook Air M4 with 24 GB renders it through Metal in 565.8 s, and 1024 x 1024 in
+138.8 s.
 
 [English](#examples) · [Русский](#документация-на-русском) · [中文](#中文说明)
 
@@ -68,15 +71,15 @@ CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
 # a card with 6 GB
 CMF_GPU=cuda CMF_GPU_VRAM_MB=6000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
-# Vulkan, any vendor's card
+# Vulkan or Metal: the default backend
 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 ```
 
 | what it needs | |
 |---|---|
-| card | CUDA: NVIDIA with its driver, and CUDA 12.x libraries `libnvrtc.so.12` and `libcublas.so.12` on the loader's path. Vulkan: any card |
-| memory | 16 GB of the card without a ceiling; from 4 GB with `CMF_GPU_VRAM_MB`. About 28 GB of RAM or page cache for the file |
-| engine | `cortiq` 0.8.73 or later; for CUDA built with the `cuda` feature (stable Rust, nothing is linked against CUDA at build time; the prebuilt release binaries do not include that backend) |
+| card | CUDA: NVIDIA with its driver, and CUDA 12.x libraries `libnvrtc.so.12` and `libcublas.so.12` on the loader's path. Vulkan: an NVIDIA RTX card for the speeds below, any other card on a slower path. Metal: Apple silicon |
+| memory | 16 GB of the card without a ceiling; from 4 GB with `CMF_GPU_VRAM_MB` on CUDA and Vulkan. About 28 GB of RAM or page cache for the file; a Mac with 24 GB runs it and reads each stage from disk |
+| engine | `cortiq` 0.8.73 or later, 0.8.75 for the Vulkan and Metal speeds below; for CUDA built with the `cuda` feature (stable Rust, nothing is linked against CUDA at build time; the prebuilt release binaries do not include that backend) |
 
 `--width` and `--height` are multiples of 32 and default to 2048 x 2048. The model works from about 4
 megapixels to 20; a smaller size is generated on a 2048 x 2048-area canvas and resized back (`--min-area 1024`
@@ -94,12 +97,30 @@ NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the me
 | CUDA, 2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA, 4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA, edit at 2048 x 2048, one 1024 x 1024 picture | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
-| Vulkan, 1024 x 1024 (`--min-area 1024`) | 13.0 | 70.0 | 10.99 | 4.0 | **88.7** | 12 529 |
+
+NVIDIA RTX A5000, 24 GB, the same file on both backends, single runs.
+
+| run | CUDA: a step, s | CUDA: total, s | Vulkan: a step, s | Vulkan: total, s | Vulkan: peak memory of the card, MiB |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 0.90 | 10.8 | 1.15 | **16.2** | 12 673 |
+| 2048 x 2048 | 3.31 | 24.8 | 4.01 | **33.7** | 12 673 |
+| 4096 x 4096 | 21.69 | 138.6 | 21.59 | **142.3** | 13 759 |
+| edit at 1024 x 1024, one 1024 x 1024 picture | 2.34 | 25.4 | 2.85 | **30.6** | 13 824 |
+| edit at 2048 x 2048, one 1024 x 1024 picture | 5.49 | 45.1 | 6.16 | **52.1** | 13 824 |
+
+MacBook Air M4, 24 GB, Metal, single runs. The machine has no fan and slows down as it warms: a step at 1024 x 1024 takes 18 s
+cool and 20 to 22 s warm.
+
+| run | prompt, s | six steps, s | a step, s | decode, s | total, s | peak memory of the process, MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 12.0 | 119.3 | 20.23 | 2.9 | **138.8** | 10 654 |
+| 2048 x 2048 | 12.3 | 537.2 | 89.96 | 12.7 | **565.8** | 8 551 |
+| edit at 1024 x 1024, one 1024 x 1024 picture | 55.0 | 366.2 | 61.17 | 2.9 | **431.6** | 12 604 |
 
 ## Small cards
 
 `CMF_GPU_VRAM_MB` is a ceiling on what the process holds on the card. The blocks of the transformer that do
-not fit under it pass through the card every step. 2048 x 2048 on CUDA:
+not fit under it pass through the card every step. 2048 x 2048 on CUDA, NVIDIA RTX 2000 Ada, 16 GB:
 
 | ceiling | total, s | a step, s | peak memory of the card, MiB |
 |---|---:|---:|---:|
@@ -109,6 +130,17 @@ not fit under it pass through the card every step. 2048 x 2048 on CUDA:
 | `CMF_GPU_VRAM_MB=4000` | 60.2 | 9.15 | 3 710 |
 
 The picture under the 4 GB ceiling is the same picture: 49.6 dB PSNR against the run without one.
+
+2048 x 2048 on Vulkan, NVIDIA RTX A5000, 24 GB; the pictures are identical to the one without a ceiling, and the card's peak
+stays within 0.8 GB of it:
+
+| ceiling | total, s | a step, s | peak memory of the card, MiB |
+|---|---:|---:|---:|
+| none | 32.8 | 4.02 | 12 673 |
+| `CMF_GPU_VRAM_MB=12000` | 32.2 | 4.02 | 11 962 |
+| `CMF_GPU_VRAM_MB=8000` | 38.1 | 5.17 | 8 560 |
+| `CMF_GPU_VRAM_MB=6000` | 41.6 | 5.71 | 6 647 |
+| `CMF_GPU_VRAM_MB=4000` | 46.8 | 6.64 | 4 754 |
 
 ## Image editing
 
@@ -133,9 +165,11 @@ An 8-bit encoder, an 8-bit transformer and the f32 path give the same result; th
 `f4af395ada66213cd401a455fcc7fd7252d2d4c4813f8d1437ff58a89740f309`. The weights are quantized from the
 originals; nothing was retrained.
 
-Checked: the CUDA chain against a per-operation f32 path (54.0 dB PSNR on a 2048 x 2048 edit), CUDA against
-Vulkan (47.0 dB), the 4 GB ceiling against none (49.6 dB). Not checked: the reference implementation was
-not run on the same card, so there is no picture-to-picture comparison with it.
+Checked: the CUDA chain against a per-operation f32 path (54.0 dB PSNR on a 2048 x 2048 edit), Vulkan against
+CUDA on one card (45.9 dB at 1024 x 1024, 44.5 dB at 2048 x 2048), Metal against those CUDA pictures (47.2 and
+43.7 dB),
+the 4 GB ceiling against none (49.6 dB on CUDA, identical on Vulkan). Not checked: the reference
+implementation was not run on the same card, so there is no picture-to-picture comparison with it.
 
 ## License
 
@@ -154,8 +188,9 @@ Apache-2.0.
 16 мегапикселей за шесть шагов, в одном файле [CMF](https://github.com/infosave2007/cmf) на 24.6 ГБ для
 `cortiq`, движка на Rust без Python и без ML-фреймворка. Трансформер и энкодер промпта в 4 битах, VAE в 8.
 На RTX 2000 Ada с 16 ГБ собственный бэкенд CUDA рисует 2048 x 2048 за 50,3 с, а под потолком памяти карты
-4 ГБ за 60,2 с, ту же картинку. Тот же файл работает через Vulkan на карте любого производителя.
-Примеры генерации и правки — [в начале страницы](#examples).
+4 ГБ за 60,2 с, ту же картинку. Тот же файл работает через Vulkan: 2048 x 2048 за 33,7 с на RTX A5000
+против 24,8 с на CUDA и за 46,8 с под потолком 4 ГБ. MacBook Air M4 с 24 ГБ рисует её через Metal
+за 565,8 с, а 1024 x 1024 за 138,8 с. Примеры генерации и правки — [в начале страницы](#examples).
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -166,12 +201,14 @@ CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
 # карта с 6 ГБ
 CMF_GPU=cuda CMF_GPU_VRAM_MB=6000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
-# Vulkan, карта любого производителя
+# Vulkan или Metal: бэкенд по умолчанию
 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 ```
 
 Для CUDA нужны драйвер NVIDIA и библиотеки CUDA 12.x (`libnvrtc.so.12`, `libcublas.so.12`); без потолка
-требуется 16 ГБ памяти карты, с `CMF_GPU_VRAM_MB` достаточно 4 ГБ. `--width` и `--height` кратны 32, по
+требуется 16 ГБ памяти карты, с `CMF_GPU_VRAM_MB` достаточно 4 ГБ (CUDA и Vulkan). Скорости Vulkan ниже
+получены на карте NVIDIA RTX, остальные карты идут более медленным путём; для скоростей Vulkan и Metal нужен
+`cortiq` 0.8.75. `--width` и `--height` кратны 32, по
 умолчанию 2048 x 2048. Рабочий диапазон модели от 4 до 20 мегапикселей; меньший размер генерируется на холсте
 площадью 2048 x 2048 и уменьшается (`--min-area 1024` это отключает). Guidance и негативного промпта нет.
 Модель ждёт подробное английское описание всей картинки; расширителя промпта в файле нет. Полное руководство:
@@ -185,10 +222,28 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 | CUDA, 2048 x 2048 | 2,6 | 44,3 | 7,38 | 1,7 | **50,3** | 12 654 |
 | CUDA, 4096 x 4096 | 9,2 | 264,5 | 43,90 | 8,3 | **283,7** | 13 414 |
 | CUDA, правка 2048 x 2048, одна картинка 1024 x 1024 | 9,8 | 67,9 | 11,37 | 1,7 | **80,8** | 12 854 |
-| Vulkan, 1024 x 1024 (`--min-area 1024`) | 13,0 | 70,0 | 10,99 | 4,0 | **88,7** | 12 529 |
 
-Потолок памяти карты, 2048 x 2048 на CUDA. Блоки трансформера, не поместившиеся под потолок, проходят через
-карту каждый шаг; под потолком 4 ГБ получается та же картинка (PSNR 49,6 дБ):
+NVIDIA RTX A5000, 24 GB, один и тот же файл на обоих бэкендах, одиночные прогоны:
+
+| прогон | CUDA: шаг, с | CUDA: всего, с | Vulkan: шаг, с | Vulkan: всего, с | Vulkan: пик памяти карты, МиБ |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 0,90 | 10,8 | 1,15 | **16,2** | 12 673 |
+| 2048 x 2048 | 3,31 | 24,8 | 4,01 | **33,7** | 12 673 |
+| 4096 x 4096 | 21,69 | 138,6 | 21,59 | **142,3** | 13 759 |
+| правка 1024 x 1024, одна картинка 1024 x 1024 | 2,34 | 25,4 | 2,85 | **30,6** | 13 824 |
+| правка 2048 x 2048, одна картинка 1024 x 1024 | 5,49 | 45,1 | 6,16 | **52,1** | 13 824 |
+
+MacBook Air M4, 24 GB, Metal, одиночные прогоны. У машины нет вентилятора, и по мере нагрева она замедляется: шаг на
+1024 x 1024 занимает 18 с на холодной машине и 20–22 с на прогретой:
+
+| прогон | промпт, с | шесть шагов, с | шаг, с | декодер, с | всего, с | пик памяти процесса, МиБ |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 12,0 | 119,3 | 20,23 | 2,9 | **138,8** | 10 654 |
+| 2048 x 2048 | 12,3 | 537,2 | 89,96 | 12,7 | **565,8** | 8 551 |
+| правка 1024 x 1024, одна картинка 1024 x 1024 | 55,0 | 366,2 | 61,17 | 2,9 | **431,6** | 12 604 |
+
+Потолок памяти карты, 2048 x 2048 на CUDA, NVIDIA RTX 2000 Ada, 16 GB. Блоки трансформера, не поместившиеся под потолок, проходят
+через карту каждый шаг; под потолком 4 ГБ получается та же картинка (PSNR 49,6 дБ):
 
 | потолок | всего, с | шаг, с | пик памяти карты, МиБ |
 |---|---:|---:|---:|
@@ -196,6 +251,17 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 | `CMF_GPU_VRAM_MB=8000` | 53,5 | 8,05 | 7 634 |
 | `CMF_GPU_VRAM_MB=6000` | 54,4 | 8,18 | 5 720 |
 | `CMF_GPU_VRAM_MB=4000` | 60,2 | 9,15 | 3 710 |
+
+То же на Vulkan, NVIDIA RTX A5000, 24 GB; картинки совпадают с прогоном без потолка, пик памяти карты выходит за потолок не
+больше чем на 0,8 ГБ:
+
+| потолок | всего, с | шаг, с | пик памяти карты, МиБ |
+|---|---:|---:|---:|
+| нет | 32,8 | 4,02 | 12 673 |
+| `CMF_GPU_VRAM_MB=12000` | 32,2 | 4,02 | 11 962 |
+| `CMF_GPU_VRAM_MB=8000` | 38,1 | 5,17 | 8 560 |
+| `CMF_GPU_VRAM_MB=6000` | 41,6 | 5,71 | 6 647 |
+| `CMF_GPU_VRAM_MB=4000` | 46,8 | 6,64 | 4 754 |
 
 Правка: `--image FILE`, опцию можно повторять (`<Picture 1>`, `<Picture 2>`, ... в промпте, первая картинка
 редактируется). Известное ограничение: **правка плотно детализированной контрастной картинки на холсте
@@ -215,8 +281,9 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 图片，打包成一个 24.6 GB 的 [CMF](https://github.com/infosave2007/cmf) 文件，由 `cortiq` 运行。`cortiq` 是
 用 Rust 写的推理引擎，不需要 Python，也不依赖任何机器学习框架。Transformer 和提示词编码器为 4 位，VAE
 为 8 位。在 16 GB 的 RTX 2000 Ada 上，原生 CUDA 后端生成 2048 x 2048 用时 50.3 秒；在 4 GB 显存上限下用时
-60.2 秒，得到同一张图片。同一个文件可以通过 Vulkan 在任何厂商的显卡上运行。生成和编辑的示例见
-[页面开头](#examples)。
+60.2 秒，得到同一张图片。同一个文件也走 Vulkan：在 RTX A5000 上生成 2048 x 2048 用时 33.7 秒
+（CUDA 为 24.8 秒），4 GB 上限下用时 46.8 秒。24 GB 的 MacBook Air M4 通过 Metal 生成它用时
+565.8 秒，生成 1024 x 1024 用时 138.8 秒。生成和编辑的示例见[页面开头](#examples)。
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -227,12 +294,14 @@ CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
 # 6 GB 显卡
 CMF_GPU=cuda CMF_GPU_VRAM_MB=6000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
-# Vulkan，任何厂商的显卡
+# Vulkan 或 Metal：默认后端
 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 ```
 
 CUDA 需要 NVIDIA 驱动和 CUDA 12.x 库（`libnvrtc.so.12`、`libcublas.so.12`）；不设上限时需要 16 GB 显存，
-设置 `CMF_GPU_VRAM_MB` 后 4 GB 即可。`--width` 和 `--height` 是 32 的倍数，默认 2048 x 2048。模型的工作
+设置 `CMF_GPU_VRAM_MB` 后 4 GB 即可（CUDA 和 Vulkan）。下面的 Vulkan 速度是在 NVIDIA RTX 显卡上测得的，
+其他显卡走较慢的路径；Vulkan 和 Metal 的这些速度需要 `cortiq` 0.8.75。`--width` 和 `--height` 是 32
+的倍数，默认 2048 x 2048。模型的工作
 范围是 4 到 20 百万像素；更小的尺寸会在面积为 2048 x 2048 的画布上生成再缩小（`--min-area 1024` 关闭此
 行为）。没有 guidance，也没有负面提示词。模型需要对整张图片的详细英文描述；文件不包含提示词扩展器。
 完整指南：[docs/MINIMAX_H3_IMAGE.zh.md](https://github.com/infosave2007/cmf/blob/master/docs/MINIMAX_H3_IMAGE.zh.md)。
@@ -245,10 +314,28 @@ CUDA 需要 NVIDIA 驱动和 CUDA 12.x 库（`libnvrtc.so.12`、`libcublas.so.12
 | CUDA，2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA，4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA，2048 x 2048 编辑，一张 1024 x 1024 参考图 | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
-| Vulkan，1024 x 1024（`--min-area 1024`） | 13.0 | 70.0 | 10.99 | 4.0 | **88.7** | 12 529 |
 
-显存上限，CUDA 上 2048 x 2048。放不进上限的 Transformer 块每一步都流经显卡；4 GB 上限下得到的是同一张
-图片（PSNR 49.6 dB）：
+NVIDIA RTX A5000, 24 GB，同一个文件在两个后端上，单次运行：
+
+| 运行 | CUDA：每步，秒 | CUDA：总计，秒 | Vulkan：每步，秒 | Vulkan：总计，秒 | Vulkan：显存峰值，MiB |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024（`--min-area 1024`） | 0.90 | 10.8 | 1.15 | **16.2** | 12 673 |
+| 2048 x 2048 | 3.31 | 24.8 | 4.01 | **33.7** | 12 673 |
+| 4096 x 4096 | 21.69 | 138.6 | 21.59 | **142.3** | 13 759 |
+| 1024 x 1024 编辑，一张 1024 x 1024 参考图 | 2.34 | 25.4 | 2.85 | **30.6** | 13 824 |
+| 2048 x 2048 编辑，一张 1024 x 1024 参考图 | 5.49 | 45.1 | 6.16 | **52.1** | 13 824 |
+
+MacBook Air M4, 24 GB，Metal，单次运行。这台机器没有风扇，变热后会降速：1024 x 1024 的一步在冷机上是 18 秒，热机上是
+20 到 22 秒：
+
+| 运行 | 提示词，秒 | 六步，秒 | 每步，秒 | 解码，秒 | 总计，秒 | 进程内存峰值，MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024 x 1024（`--min-area 1024`） | 12.0 | 119.3 | 20.23 | 2.9 | **138.8** | 10 654 |
+| 2048 x 2048 | 12.3 | 537.2 | 89.96 | 12.7 | **565.8** | 8 551 |
+| 1024 x 1024 编辑，一张 1024 x 1024 参考图 | 55.0 | 366.2 | 61.17 | 2.9 | **431.6** | 12 604 |
+
+显存上限，CUDA 上 2048 x 2048，NVIDIA RTX 2000 Ada, 16 GB。放不进上限的 Transformer 块每一步都流经显卡；4 GB 上限下得到的是
+同一张图片（PSNR 49.6 dB）：
 
 | 上限 | 总计，秒 | 每步，秒 | 显存峰值，MiB |
 |---|---:|---:|---:|
@@ -256,6 +343,16 @@ CUDA 需要 NVIDIA 驱动和 CUDA 12.x 库（`libnvrtc.so.12`、`libcublas.so.12
 | `CMF_GPU_VRAM_MB=8000` | 53.5 | 8.05 | 7 634 |
 | `CMF_GPU_VRAM_MB=6000` | 54.4 | 8.18 | 5 720 |
 | `CMF_GPU_VRAM_MB=4000` | 60.2 | 9.15 | 3 710 |
+
+Vulkan 上同样的测试，NVIDIA RTX A5000, 24 GB；图片与无上限时完全相同，显存峰值超出上限不到 0.8 GB：
+
+| 上限 | 总计，秒 | 每步，秒 | 显存峰值，MiB |
+|---|---:|---:|---:|
+| 无 | 32.8 | 4.02 | 12 673 |
+| `CMF_GPU_VRAM_MB=12000` | 32.2 | 4.02 | 11 962 |
+| `CMF_GPU_VRAM_MB=8000` | 38.1 | 5.17 | 8 560 |
+| `CMF_GPU_VRAM_MB=6000` | 41.6 | 5.71 | 6 647 |
+| `CMF_GPU_VRAM_MB=4000` | 46.8 | 6.64 | 4 754 |
 
 编辑：`--image FILE`，可以重复（提示词中为 `<Picture 1>`、`<Picture 2>` 等，第一张是被编辑的图片）。
 已知限制：**在 2048 x 2048 上编辑细节密集、对比强烈的图片，结果会过度处理**（过饱和、色调分离）。同样的
