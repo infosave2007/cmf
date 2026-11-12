@@ -46,7 +46,10 @@ mod moss;
 pub use moss::moss_chain;
 #[path = "flux_vae.rs"]
 mod flux_vae;
-pub use flux_vae::flux_vae_chain;
+pub use flux_vae::{flux_vae_chain, qi21_vae_decode};
+#[path = "qi21.rs"]
+mod qi21;
+pub use qi21::{qi21_prefill, qi21_release, qi21_release_key, qi21_step};
 
 /// The Lumina Next-DiT block, one block a call, on this module's weight store.
 #[path = "lumina.rs"]
@@ -118,6 +121,10 @@ pub(super) struct H3State {
     moss: Option<moss::MoFuncs>,
     /// The kernels of the FLUX-class VAE decoder chain (`flux_vae.rs`), once compiled.
     flux_vae: Option<flux_vae::FvFuncs>,
+    /// The kernels of the Qwen-Image-2.1 denoiser (`qi21.rs`), once compiled.
+    q21_funcs: Option<qi21::Q21Funcs>,
+    /// Its programs (a prompt's prefix cache), the most recently used last.
+    q21: Vec<qi21::Q21Prog>,
 }
 
 impl H3State {

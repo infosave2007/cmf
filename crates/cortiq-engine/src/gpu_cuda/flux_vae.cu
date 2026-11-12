@@ -86,3 +86,41 @@ extern "C" __global__ void fv_bias_rows(float* __restrict__ y, const float* __re
     if (i >= total) return;
     y[i] += b[i % c];
 }
+
+// Qwen-Image-2.1's RMS norm over the channels of each position of NCHW
+// [c][hw]: x / max(|x|, 1e-12) * sqrt(c) * gamma[ch], SiLU under `silu`; `out`
+// may be `x`. A thread a position.
+extern "C" __global__ void fv_rms_ch(const float* x, float* out, const float* __restrict__ gamma, int c, u64 hw, int silu)
+{
+    const u64 p = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= hw) return;
+    float ss = 0.0f;
+    for (int ch = 0; ch < c; ch++) {
+        const float v = x[(u64)ch * hw + p];
+        ss += v * v;
+    }
+    const float inv = sqrtf((float)c) / fmaxf(sqrtf(ss), 1e-12f);
+    for (int ch = 0; ch < c; ch++) {
+        float v = x[(u64)ch * hw + p] * inv * gamma[ch];
+        if (silu) v = v / (1.0f + __expf(-v));
+        out[(u64)ch * hw + p] = v;
+    }
+}
+
+// DupUp of a block input `src` [cin][h][w] added onto `dst` [cout][2h][2w]:
+// dst[o, 2y+sy, 2x+sx] += src[(o·f·4 + (f−1)·4 + 2·sy + sx) / repeats, y, x],
+// f the temporal factor, repeats = cout·f·4 / cin. A thread a value.
+extern "C" __global__ void fv_dupup_add(float* __restrict__ dst, const float* __restrict__ src, int cin, int cout, int ft,
+                                        int h, int w, u64 total)
+{
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int w2 = 2 * w;
+    const u64 hw2 = (u64)4 * h * w;
+    const int o = (int)(i / hw2);
+    const u64 r = i - (u64)o * hw2;
+    const int yy = (int)(r / w2), xx = (int)(r % w2);
+    const int factor = ft * 4, repeats = cout * factor / cin;
+    const int j = o * factor + (ft - 1) * 4 + 2 * (yy & 1) + (xx & 1);
+    dst[i] += src[(u64)(j / repeats) * h * w + (u64)(yy >> 1) * w + (xx >> 1)];
+}

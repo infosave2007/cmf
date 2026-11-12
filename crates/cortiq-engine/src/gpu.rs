@@ -6179,6 +6179,8 @@ pub fn qi21_prefill(a: &Qi21PrefillArgs) -> bool {
         Backend::Metal => crate::gpu_metal::qi21::prefill(a),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::qi21::prefill(a),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::qi21_prefill(a),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -6192,6 +6194,8 @@ pub fn qi21_step(key: u64, xtok: &[f32], mods: &[f32], fs: &[f32], out: &mut [f3
         Backend::Metal => crate::gpu_metal::qi21::step(key, xtok, mods, fs, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::qi21::step(key, xtok, mods, fs, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::qi21_step(key, xtok, mods, fs, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -6207,6 +6211,10 @@ pub fn qi21_release_key(key: u64) {
     }
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::qi21::release_key(key);
+    #[cfg(feature = "cuda")]
+    if matches!(backend(), Backend::Cuda) {
+        crate::gpu_cuda::qi21_release_key(key);
+    }
 }
 
 /// Drop the denoiser's device state (see `qi21_release_key`), and the
@@ -6220,6 +6228,10 @@ pub fn qi21_release() {
     {
         crate::gpu_wgpu::qi21::release();
         crate::gpu_wgpu::qi21_vae::release();
+    }
+    #[cfg(feature = "cuda")]
+    if matches!(backend(), Backend::Cuda) {
+        crate::gpu_cuda::qi21_release();
     }
 }
 
@@ -6280,6 +6292,8 @@ pub fn qi21_vae_decode(a: &Qi21VaeDecodeArgs, z: &[f32], h: usize, w: usize, out
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::qi21_vae::decode(a, z, h, w, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::qi21_vae_decode(a, z, h, w, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

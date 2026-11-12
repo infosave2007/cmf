@@ -24,6 +24,8 @@ pub(super) struct FvFuncs {
     fin: cs::CUfunction,
     apply: cs::CUfunction,
     bias_rows: cs::CUfunction,
+    rms_ch: cs::CUfunction,
+    dupup: cs::CUfunction,
 }
 
 fn funcs(st: &mut State, c: &Ctx) -> Res<FvFuncs> {
@@ -36,6 +38,8 @@ fn funcs(st: &mut State, c: &Ctx) -> Res<FvFuncs> {
         fin: func(module, "fv_gn_fin")?,
         apply: func(module, "fv_gn_apply")?,
         bias_rows: func(module, "fv_bias_rows")?,
+        rms_ch: func(module, "fv_rms_ch")?,
+        dupup: func(module, "fv_dupup_add")?,
     };
     st.h3.flux_vae = Some(f);
     Ok(f)
@@ -56,6 +60,56 @@ pub fn flux_vae_chain(a: &VaeChainArgs<'_>, z: &[f32], h: usize, w: usize, out: 
             decline("flux vae chain", &e);
             false
         }
+    }
+}
+
+/// `y` [co][oh·ow] (= or +=, `acc`) of a k×k same-padding convolution
+/// `(weights [co][ci][k][k], bias [co], ci, co, k)` over `src` [ci][h][w],
+/// nearest ×2 first under `up`; then the bias. Im2col a panel of positions
+/// at a time into f16, an f16 product against the weights in f16.
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv2d(
+    c: &Ctx,
+    st: &mut State,
+    lx: &super::ltx::LxFuncs,
+    to_half: cs::CUfunction,
+    cv: (&[f32], &[f32], usize, usize, usize),
+    src: u64,
+    h: usize,
+    w: usize,
+    up: bool,
+    y: u64,
+    acc: bool,
+) -> Res<()> {
+    let (wt, bias, ci, co, k) = cv;
+    let (oh, ow) = if up { (2 * h, 2 * w) } else { (h, w) };
+    let (p, kk) = (oh * ow, ci * k * k);
+    if k.is_multiple_of(2) || wt.len() != co * kk || bias.len() != co {
+        return Err("a convolution of an unexpected shape".into());
+    }
+    let wf = st.h3.buf(c, "fv wf", co * kk * 4)?;
+    let wh = st.h3.buf(c, "fv wh", co * kk * 2 + 64)?;
+    let bb = st.h3.buf(c, "fv b", co * 4 + 64)?;
+    let chunk = (PANEL / (kk * 2)).clamp(1, p);
+    let cols = st.h3.buf(c, "fv cols", chunk * kk * 2)?;
+    let nw = (co * kk) as u64;
+    let (cii, hi, wi, owi, ohi, ki, upi) = (ci as i32, h as i32, w as i32, ow as i32, oh as i32, k as i32, up as i32);
+    let nul = 0u64;
+    unsafe {
+        cu::memcpy_htod_async(wf, wt, c.stream).map_err(derr)?;
+        c.launch(to_half, (nw.div_ceil(256) as u32, 1), 256, 0, kargs!(wf, wh, nw))?;
+        cu::memcpy_htod_async(bb, bias, c.stream).map_err(derr)?;
+        let beta = if acc { 1.0 } else { 0.0 };
+        let mut p0 = 0usize;
+        while p0 < p {
+            let np = chunk.min(p - p0);
+            let (p0u, total) = (p0 as u64, (np * ci) as u64);
+            c.launch(lx.im2col2d, (total.div_ceil(256) as u32, 1), 256, 0, kargs!(src, cols, cii, hi, wi, owi, ohi, ki, upi, p0u, total))?;
+            c.gemm(true, false, np, co, kk, 1.0, cols, kk, wh, kk, beta, y + (p0 * 4) as u64, p, Gemm::Half)?;
+            p0 += np;
+        }
+        let (pu, n) = (p as u64, (co * p) as u64);
+        c.launch(lx.bias, (n.div_ceil(256) as u32, 1), 256, 0, kargs!(y, bb, nul, pu, n))
     }
 }
 
@@ -94,38 +148,8 @@ unsafe fn run(c: &Ctx, st: &mut State, a: &VaeChainArgs<'_>, z: &[f32], h: usize
     unsafe { cu::memcpy_htod_async(x, z, c.stream).map_err(derr)? };
 
     // ── the parts ──
-    // `y` [oc][oh·ow] (= or +=, `acc`) of the conv over `src` [ic][h][w],
-    // nearest ×2 first under `up`; then the bias
     let conv = |st: &mut State, cv: &VaeConvRef<'_>, src: u64, h: usize, w: usize, up: bool, y: u64, acc: bool| -> Res<()> {
-        let (ci, co, k) = (cv.ic, cv.oc, cv.k);
-        let (oh, ow) = if up { (2 * h, 2 * w) } else { (h, w) };
-        let (p, kk) = (oh * ow, ci * k * k);
-        if k.is_multiple_of(2) || cv.w.len() != co * kk || cv.b.len() != co {
-            return Err("a convolution of an unexpected shape".into());
-        }
-        let wf = st.h3.buf(c, "fv wf", co * kk * 4)?;
-        let wh = st.h3.buf(c, "fv wh", co * kk * 2 + 64)?;
-        let bb = st.h3.buf(c, "fv b", co * 4 + 64)?;
-        let chunk = (PANEL / (kk * 2)).clamp(1, p);
-        let cols = st.h3.buf(c, "fv cols", chunk * kk * 2)?;
-        let nw = (co * kk) as u64;
-        let (cii, hi, wi, owi, ohi, ki, upi) = (ci as i32, h as i32, w as i32, ow as i32, oh as i32, k as i32, up as i32);
-        unsafe {
-            cu::memcpy_htod_async(wf, cv.w, c.stream).map_err(derr)?;
-            c.launch(to_half, (nw.div_ceil(256) as u32, 1), 256, 0, kargs!(wf, wh, nw))?;
-            cu::memcpy_htod_async(bb, cv.b, c.stream).map_err(derr)?;
-            let beta = if acc { 1.0 } else { 0.0 };
-            let mut p0 = 0usize;
-            while p0 < p {
-                let np = chunk.min(p - p0);
-                let (p0u, total) = (p0 as u64, (np * ci) as u64);
-                c.launch(lx.im2col2d, (total.div_ceil(256) as u32, 1), 256, 0, kargs!(src, cols, cii, hi, wi, owi, ohi, ki, upi, p0u, total))?;
-                c.gemm(true, false, np, co, kk, 1.0, cols, kk, wh, kk, beta, y + (p0 * 4) as u64, p, Gemm::Half)?;
-                p0 += np;
-            }
-            let (pu, n) = (p as u64, (co * p) as u64);
-            c.launch(lx.bias, (n.div_ceil(256) as u32, 1), 256, 0, kargs!(y, bb, nul, pu, n))
-        }
+        unsafe { conv2d(c, st, &lx, to_half, (cv.w, cv.b, cv.ic, cv.oc, cv.k), src, h, w, up, y, acc) }
     };
     // GroupNorm of `src` [ch][hw] into `dst` (may be `src`), SiLU under `silu`
     let gn = |st: &mut State, nr: &VaeNormRef<'_>, src: u64, dst: u64, ch: usize, hw: usize, silu: bool| -> Res<()> {
@@ -229,6 +253,164 @@ unsafe fn run(c: &Ctx, st: &mut State, a: &VaeChainArgs<'_>, z: &[f32], h: usize
         }
     }
     gn(st, &a.norm_out, x, t, a.norm_out.w.len(), hh * ww, true)?;
+    conv(st, &a.conv_out, t, hh, ww, false, u, false)?;
+    unsafe { cu::memcpy_dtoh_async(out, u, c.stream).map_err(derr)? };
+    c.sync()?;
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err("the picture came back with a value that is not finite".into());
+    }
+    Ok(())
+}
+
+// ───────────────────────── Qwen-Image-2.1 ─────────────────────────
+
+/// The Qwen-Image-2.1 (Wan-class) VAE decoder as one resident chain:
+/// RMS norm over channels with SiLU, the convolutions as above, the mid
+/// block's single head over every position (TF32 products around an f32
+/// softmax), each up block's DupUp shortcut added onto its upsampled
+/// output. `z` raw latent planes `[z_dim][h][w]` into `out`
+/// `[out_channels][H][W]` before the clamp. `false`: nothing was written.
+/// `CMF_QI21_VAE_CUDA=0` keeps the per-convolution path.
+pub fn qi21_vae_decode(a: &crate::gpu::Qi21VaeDecodeArgs<'_>, z: &[f32], h: usize, w: usize, out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    if c.current().is_err() || std::env::var("CMF_QI21_VAE_CUDA").as_deref() == Ok("0") {
+        return false;
+    }
+    let mut st = c.st.lock().unwrap();
+    match unsafe { run_qi21(c, &mut st, a, z, h, w, out) } {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("qwen-image-2.1 vae chain", &e);
+            false
+        }
+    }
+}
+
+unsafe fn run_qi21(c: &Ctx, st: &mut State, a: &crate::gpu::Qi21VaeDecodeArgs<'_>, z: &[f32], h: usize, w: usize, out: &mut [f32]) -> Res<()> {
+    use crate::gpu::{Qi21VaeConvRef, Qi21VaeResRef};
+    // the largest tensor, and the picture's size
+    let (mut hh, mut ww) = (h, w);
+    let mut most = a.post_quant.ci.max(a.post_quant.co).max(a.conv_in.co) * h * w;
+    let res_most = |r: &Qi21VaeResRef<'_>, hw: usize| r.c1.ci.max(r.c1.co).max(r.c2.co) * hw;
+    for r in &a.mid_res {
+        most = most.max(res_most(r, h * w));
+    }
+    most = most.max(3 * a.attn_qkv.ci * h * w);
+    for up in &a.ups {
+        for r in &up.resnets {
+            most = most.max(res_most(r, hh * ww));
+        }
+        if let Some((u, _)) = &up.up {
+            hh *= 2;
+            ww *= 2;
+            most = most.max(u.ci.max(u.co).max(up.out_dim) * hh * ww);
+        }
+    }
+    most = most.max(a.conv_out.ci.max(a.conv_out.co) * hh * ww);
+    if z.len() != a.post_quant.ci * h * w || out.len() != a.conv_out.co * hh * ww {
+        return Err("a latent or picture of the wrong size".into());
+    }
+    let f = funcs(st, c)?;
+    let lx = super::ltx::funcs(st, c)?;
+    let to_half = st.h3.funcs(c)?.to_half;
+    let b = [
+        st.h3.buf(c, "fv x", most * 4)?,
+        st.h3.buf(c, "fv t", most * 4)?,
+        st.h3.buf(c, "fv u", most * 4)?,
+        st.h3.buf(c, "fv s", most * 4)?,
+        st.h3.buf(c, "fv copy", most * 4)?,
+    ];
+    let (mut x, mut t, u, mut s, cp) = (b[0], b[1], b[2], b[3], b[4]);
+    let gam = st.h3.buf(c, "fv gamma", 4096 * 4)?;
+    unsafe { cu::memcpy_htod_async(t, z, c.stream).map_err(derr)? };
+
+    let conv = |st: &mut State, cv: &Qi21VaeConvRef<'_>, src: u64, h: usize, w: usize, up: bool, y: u64, acc: bool| -> Res<()> {
+        unsafe { conv2d(c, st, &lx, to_half, (cv.w, cv.b, cv.ci, cv.co, cv.k), src, h, w, up, y, acc) }
+    };
+    // the RMS norm over channels of `src` [ch][hw] into `dst`, SiLU under `silu`
+    let rms = |gamma: &[f32], src: u64, dst: u64, ch: usize, hw: usize, silu: bool| -> Res<()> {
+        if gamma.len() != ch || ch > 4096 {
+            return Err("an RMS norm of an unexpected width".into());
+        }
+        let (chi, hwu, si) = (ch as i32, hw as u64, silu as i32);
+        unsafe {
+            cu::memcpy_htod_async(gam, gamma, c.stream).map_err(derr)?;
+            c.launch(f.rms_ch, (hwu.div_ceil(256) as u32, 1), 256, 0, kargs!(src, dst, gam, chi, hwu, si))
+        }
+    };
+    // a resnet over `x` [ci][hw]: the result lands in `x` (or, through a
+    // shortcut, in `s`, which then swaps with `x`)
+    let resnet = |st: &mut State, r: &Qi21VaeResRef<'_>, x: &mut u64, s: &mut u64, t: u64, h: usize, w: usize| -> Res<()> {
+        let hw = h * w;
+        rms(r.g1, *x, t, r.c1.ci, hw, true)?;
+        conv(st, &r.c1, t, h, w, false, u, false)?;
+        rms(r.g2, u, u, r.c1.co, hw, true)?;
+        match &r.shortcut {
+            Some(sc) => {
+                conv(st, sc, *x, h, w, false, *s, false)?;
+                conv(st, &r.c2, u, h, w, false, *s, true)?;
+                std::mem::swap(x, s);
+            }
+            None => conv(st, &r.c2, u, h, w, false, *x, true)?,
+        }
+        Ok(())
+    };
+
+    conv(st, &a.post_quant, t, h, w, false, x, false)?;
+    conv(st, &a.conv_in, x, h, w, false, t, false)?;
+    std::mem::swap(&mut x, &mut t);
+    resnet(st, &a.mid_res[0], &mut x, &mut s, t, h, w)?;
+    // the mid attention: one head as wide as the channels
+    {
+        let (ch, n) = (a.attn_qkv.ci, h * w);
+        if a.attn_qkv.co != 3 * ch {
+            return Err("a mid attention of an unexpected shape".into());
+        }
+        rms(a.attn_gamma, x, u, ch, n, false)?;
+        conv(st, &a.attn_qkv, u, h, w, false, t, false)?;
+        let (q, k, v) = (t, t + (ch * n * 4) as u64, t + (2 * ch * n * 4) as u64);
+        let cq = (PANEL / (n * 4)).clamp(1, n);
+        let sb = st.h3.buf(c, "fv sc", cq * n * 4)?;
+        let scale = 1.0 / (ch as f32).sqrt();
+        let ni = n as i32;
+        let mut q0 = 0usize;
+        while q0 < n {
+            let rows = cq.min(n - q0);
+            unsafe {
+                // S [rows][n] = scale · Qᵀ K over the channel-major planes
+                c.gemm(false, true, n, rows, ch, scale, k, n, q + (q0 * 4) as u64, n, 0.0, sb, n, Gemm::Tf32)?;
+                c.launch(lx.softmax_f32, (rows as u32, 1), 256, 0, kargs!(sb, ni))?;
+                // O [ch][q0 + i] = Σ_j P[i][j] V[ch][j], channel-major
+                c.gemm(true, false, rows, ch, n, 1.0, sb, n, v, n, 0.0, u + (q0 * 4) as u64, n, Gemm::Tf32)?;
+            }
+            q0 += rows;
+        }
+        conv(st, &a.attn_proj, u, h, w, false, x, true)?;
+    }
+    resnet(st, &a.mid_res[1], &mut x, &mut s, t, h, w)?;
+    let (mut hh, mut ww) = (h, w);
+    for up in &a.ups {
+        if up.up.is_some() {
+            unsafe { cu::memcpy_dtod_async(cp, x, up.in_dim * hh * ww * 4, c.stream).map_err(derr)? };
+        }
+        for r in &up.resnets {
+            resnet(st, r, &mut x, &mut s, t, hh, ww)?;
+        }
+        if let Some((cv, ft)) = &up.up {
+            conv(st, cv, x, hh, ww, true, t, false)?;
+            if cv.co != up.out_dim || up.in_dim == 0 || !(up.out_dim * ft * 4).is_multiple_of(up.in_dim) {
+                return Err("an up block's shortcut of an unexpected shape".into());
+            }
+            let total = (up.out_dim * 4 * hh * ww) as u64;
+            let (ci, co, fti, hi, wi) = (up.in_dim as i32, up.out_dim as i32, *ft as i32, hh as i32, ww as i32);
+            unsafe { c.launch(f.dupup, (total.div_ceil(256) as u32, 1), 256, 0, kargs!(t, cp, ci, co, fti, hi, wi, total))? };
+            std::mem::swap(&mut x, &mut t);
+            hh *= 2;
+            ww *= 2;
+        }
+    }
+    rms(a.norm_out, x, t, a.conv_out.ci, hh * ww, true)?;
     conv(st, &a.conv_out, t, hh, ww, false, u, false)?;
     unsafe { cu::memcpy_dtoh_async(out, u, c.stream).map_err(derr)? };
     c.sync()?;
