@@ -123,6 +123,17 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Qwen-Image-2.1 на CUDA (0.8.82)
+
+[Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) теперь работает и на CUDA: шаги трансформера
+по закэшированным ключам и значениям промпта и декодер VAE идут каждый одной цепочкой на карте. На RTX A5000
+картинка 1024×1024 за 40 шагов занимает 53,0 с на CUDA (раньше трансформер считался на хосте, 65 с на шаг) и
+69,8 с через Vulkan:
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-2.1.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## MOSS-Image на CUDA, Vulkan и Metal (0.8.81)
 
 [MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) теперь считает все блоки прохода DiT на карте за
