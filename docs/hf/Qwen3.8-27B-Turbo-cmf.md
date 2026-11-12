@@ -61,6 +61,67 @@ CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy -
 CMF_GPU=cuda cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
 ```
 
+## Server
+
+`cortiq serve` puts the file behind an OpenAI-compatible HTTP API, with a web dashboard on the same port.
+
+Vulkan, DX12 or Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+An NVIDIA card through CUDA (a build with `--features cuda`, cortiq 0.8.71 or later):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+A request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "qwen38-27b-turbo",
+  "messages": [{"role": "user", "content": "Summarize the report below.\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8080/v1"` and any API key:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="qwen38-27b-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\nSummarize it."}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| endpoint | what it does |
+|---|---|
+| `POST /v1/chat/completions` | a chat turn; `stream: true` sends the answer as it is decoded |
+| `POST /v1/completions` | the continuation of a `prompt` |
+| `GET /v1/models` | the served model |
+| `GET /healthz` | 200 while the server is up |
+| `GET /` | the web dashboard |
+
+- `CMF_MAX_SEQ` is the longest conversation a request may hold, 32 768 tokens by default. Set it above your
+  longest document: past the seal the card's memory stays where it is.
+- `temperature: 0` turns on draft tokens, as `--greedy` does for `cortiq run`. `enable_thinking: false` asks
+  for a direct answer.
+- `model` may be any name: one file is served.
+- `--host 127.0.0.1` keeps the server local; the default is every interface, and no API key is checked.
+- A turn that continues the previous one reads only what is new. Past the seal of a long document, a new turn
+  reads the conversation again.
+
 ## What the file does
 
 ![A long prompt on a small card](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/ceiling_en.png)
@@ -245,6 +306,67 @@ CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy -
 CMF_GPU=cuda cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
 ```
 
+### Сервер
+
+`cortiq serve` открывает файл через HTTP API, совместимый с OpenAI, и веб-панель на том же порту.
+
+Vulkan, DX12 или Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+Карта NVIDIA через CUDA (сборка с `--features cuda`, cortiq 0.8.71 или новее):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+Запрос:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "qwen38-27b-turbo",
+  "messages": [{"role": "user", "content": "Перескажи отчёт ниже.\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+Подойдёт любой клиент OpenAI с `base_url="http://127.0.0.1:8080/v1"` и любым ключом API:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="qwen38-27b-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\nПерескажи это."}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| адрес | что делает |
+|---|---|
+| `POST /v1/chat/completions` | реплика чата; `stream: true` отдаёт ответ по мере декодирования |
+| `POST /v1/completions` | продолжение `prompt` |
+| `GET /v1/models` | обслуживаемая модель |
+| `GET /healthz` | 200, пока сервер работает |
+| `GET /` | веб-панель |
+
+- `CMF_MAX_SEQ` — самый длинный диалог в запросе, по умолчанию 32 768 токенов. Ставьте больше самого длинного
+  документа: после печати память карты не растёт.
+- `temperature: 0` включает черновые токены, как `--greedy` у `cortiq run`. `enable_thinking: false` просит
+  прямой ответ.
+- `model` может быть любым именем: сервер отдаёт один файл.
+- `--host 127.0.0.1` оставляет сервер локальным; по умолчанию он слушает все интерфейсы и ключи API не проверяет.
+- Реплика, продолжающая предыдущую, читает только новое. После печати длинного документа новая реплика читает
+  диалог заново.
+
 ### Что делает файл
 
 ![Длинный промпт на маленькой карте](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/ceiling_ru.png)
@@ -417,6 +539,64 @@ cargo install cortiq-cli --features cuda
 CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 CMF_GPU=cuda cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
 ```
+
+### 服务器
+
+`cortiq serve` 通过与 OpenAI 兼容的 HTTP API 提供这个文件,同一端口上还有网页面板。
+
+Vulkan、DX12 或 Metal:
+
+```bash
+CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+通过 CUDA 使用 NVIDIA 显卡(用 `--features cuda` 构建,cortiq 0.8.71 或更新版本):
+
+```bash
+CMF_GPU=cuda CMF_MAX_SEQ=131072 cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+请求:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "qwen38-27b-turbo",
+  "messages": [{"role": "user", "content": "概括下面的报告。\n\n..."}],
+  "max_tokens": 512,
+  "temperature": 0,
+  "enable_thinking": false,
+  "stream": true
+}'
+```
+
+任何 OpenAI 客户端都可以使用,`base_url="http://127.0.0.1:8080/v1"`,API 密钥随意:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(
+    model="qwen38-27b-turbo",
+    messages=[{"role": "user", "content": open("report.txt").read() + "\n\n概括一下。"}],
+    temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+| 接口 | 作用 |
+|---|---|
+| `POST /v1/chat/completions` | 一轮对话;`stream: true` 边解码边返回 |
+| `POST /v1/completions` | 续写 `prompt` |
+| `GET /v1/models` | 提供的模型 |
+| `GET /healthz` | 服务器运行时返回 200 |
+| `GET /` | 网页面板 |
+
+- `CMF_MAX_SEQ` 是一个请求能容纳的最长对话,默认 32 768 个 token。请设得比最长的文档更大:封存之后显存不再增长。
+- `temperature: 0` 开启草稿 token,与 `cortiq run` 的 `--greedy` 相同。`enable_thinking: false` 要求直接回答。
+- `model` 可以是任意名字:服务器只提供一个文件。
+- `--host 127.0.0.1` 让服务器只在本机可用;默认监听所有网卡,也不检查 API 密钥。
+- 接着上一轮的请求只读取新的内容。长文档封存之后,新的一轮会重新读取整段对话。
 
 ### 这个文件做了什么
 
