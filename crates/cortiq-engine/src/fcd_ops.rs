@@ -324,6 +324,18 @@ pub fn gemm_nt(
     let _t_gemm = std::time::Instant::now();
     crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guard = scopeguard_gemm(_t_gemm, n, k, m);
+    // The native CUDA backend takes a large f32 GEMM on the tensor cores
+    // (TF32) without arbitration against the host — the convolutions of a
+    // VAE encoder arrive here as im2col products.
+    #[cfg(feature = "cuda")]
+    if n * k * m >= (1 << 22)
+        && m >= 16
+        && crate::gpu::cuda_active()
+        && crate::gpu::enabled_here()
+        && crate::gpu_cuda::h3_gemm_nt(x, w, y, n, k, m)
+    {
+        return;
+    }
     // A thin output (m < 64: a per-head gate projection) never fills a
     // tensor-core tile and only costs the round trip — host.
     #[cfg(feature = "gpu")]

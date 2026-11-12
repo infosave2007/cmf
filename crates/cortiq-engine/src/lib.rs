@@ -67,6 +67,7 @@ pub mod mimo_vision;
 pub mod minicpm_ocr;
 pub mod onevision2;
 pub mod mm_ab;
+pub mod h3imagegen;
 pub mod mmh3;
 pub mod mmh3ups;
 pub mod music3;

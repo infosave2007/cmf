@@ -541,6 +541,98 @@ impl Qwen3Encoder {
         pos
     }
 
+    /// The leading layers on the device's resident chain; returns how many
+    /// ran (0: none, and `h` is untouched). A deepstack feature lands on
+    /// the visual rows after its layer, so the stack is cut there and the
+    /// addition done on the host between two runs of the chain.
+    fn chain(
+        &self,
+        h: &mut [f32],
+        n: usize,
+        pos: &[[f32; 3]],
+        deepstack: &[Vec<f32>],
+        visual: &[usize],
+    ) -> usize {
+        let hs = self.hidden;
+        let half = self.hd / 2;
+        let mapped = |p: &Proj| match p {
+            Proj::Q(q) => q.mapped_device_gemm().map(|(m, i)| (m.clone(), i)),
+            Proj::F32 { .. } => None,
+        };
+        let Some((model, _)) = self.layers.first().and_then(|l| mapped(&l.q)) else {
+            return 0;
+        };
+        let layers: Option<Vec<crate::gpu::TeChainLayer>> = self
+            .layers
+            .iter()
+            .map(|l| {
+                Some(crate::gpu::TeChainLayer {
+                    q: mapped(&l.q)?.1,
+                    k: mapped(&l.k)?.1,
+                    v: mapped(&l.v)?.1,
+                    o: mapped(&l.o)?.1,
+                    gate: mapped(&l.gate)?.1,
+                    up: mapped(&l.up)?.1,
+                    down: mapped(&l.down)?.1,
+                    input_norm: &l.input_norm,
+                    post_norm: &l.post_attn_norm,
+                    q_norm: &l.q_norm,
+                    k_norm: &l.k_norm,
+                })
+            })
+            .collect();
+        let Some(layers) = layers else { return 0 };
+        // (cos, sin) of every row's rotation: `norm_rope`'s angles.
+        let mut cs = Vec::with_capacity(n * half * 2);
+        for p in pos.iter().take(n) {
+            for i in 0..half {
+                let freq = 1.0 / self.theta.powf(2.0 * i as f32 / self.hd as f32);
+                let axis = if i < 60 && i % 3 == 1 {
+                    1
+                } else if i < 60 && i % 3 == 2 {
+                    2
+                } else {
+                    0
+                };
+                let (sn, c) = (p[axis] * freq).sin_cos();
+                cs.push(c);
+                cs.push(sn);
+            }
+        }
+        let inter = self.layers[0].gate.rows();
+        let mut done = 0usize;
+        while done < layers.len() {
+            // up to and including the next layer a deepstack feature follows
+            let stop = if done < deepstack.len() { done + 1 } else { layers.len() };
+            let job = crate::gpu::TeChain {
+                model: &model,
+                layers: &layers[done..stop],
+                n,
+                hidden: hs,
+                heads: self.nh,
+                kv_heads: self.nkv,
+                head_dim: self.hd,
+                inter,
+                eps: self.eps as f32,
+                cs: &cs,
+            };
+            if !crate::gpu::te_chain(&job, h) {
+                return done;
+            }
+            for li in done..stop {
+                if let Some(f) = deepstack.get(li) {
+                    for (k, &row) in visual.iter().enumerate() {
+                        for c in 0..hs {
+                            h[row * hs + c] += f[k * hs + c];
+                        }
+                    }
+                }
+            }
+            done = stop;
+        }
+        done
+    }
+
     /// Full forward with images. `embeds` replaces the token embedding
     /// at `[span.start, span.start + span.len)` with the vision tower's
     /// merged tokens; `deepstack[k]` is added at the visual positions
@@ -593,7 +685,20 @@ impl Qwen3Encoder {
                 );
             }
         };
-        for (li, layer) in self.layers.iter().enumerate() {
+        // The stack on the card as one resident chain where the backend has
+        // one: the stream goes up once, every layer's weights pass through
+        // on their way to a GEMM, and nothing but the result comes back.
+        // `CMF_TE_CHAIN=0` keeps the per-op path; the taps need it.
+        let chained = if taps.is_none()
+            && std::env::var("CMF_TE_CHAIN").as_deref() != Ok("0")
+            && crate::gpu::enabled_here()
+            && crate::gpu::h3_chain_available()
+        {
+            self.chain(&mut h, n, &pos, deepstack, &visual)
+        } else {
+            0
+        };
+        for (li, layer) in self.layers.iter().enumerate().skip(chained) {
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.input_norm, self.eps, o);
             }

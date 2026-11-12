@@ -65,6 +65,8 @@ struct StFile {
     map: Mmap,
     dir: HashMap<String, StEntry>,
     order: Vec<String>,
+    /// The header's `__metadata__` map (string values), empty when absent.
+    meta: serde_json::Value,
 }
 
 impl StFile {
@@ -84,8 +86,10 @@ impl StFile {
         let base = 8 + hlen;
         let mut dir = HashMap::new();
         let mut order = Vec::new();
+        let mut file_meta = serde_json::Value::Null;
         for (name, meta) in header.as_object().ok_or_else(|| anyhow!("header"))? {
             if name == "__metadata__" {
+                file_meta = meta.clone();
                 continue;
             }
             let offs = meta["data_offsets"]
@@ -108,7 +112,12 @@ impl StFile {
             order.push(name.clone());
         }
         order.sort();
-        Ok(Self { map, dir, order })
+        Ok(Self {
+            map,
+            dir,
+            order,
+            meta: file_meta,
+        })
     }
 
     fn shape(&self, name: &str) -> Option<&[usize]> {
@@ -558,8 +567,18 @@ fn pack_dit(
     let heads = dit.shape("blocks.0.attn.qkv_proj.weight").unwrap()[0] / (3 * head_dim);
     let ffn = dit.shape("blocks.0.mlp.fc1.weight").unwrap()[0] / 2;
     let text_dim = dit.shape("condition_proj.weight").unwrap()[1];
-    let latents_dim = dit.shape("final_layer.video_out.weight").unwrap()[0] / 4;
-    let audio_dim = dit.shape("final_layer.audio_out.weight").unwrap()[0];
+    // MiniMax-H3-Image is this stack without the audio stream, and its
+    // output layer is a bank of per-step heads (PDD) stacked along the
+    // rows; the file's metadata carries how many and the sigma grid they
+    // were distilled on.
+    let image = !dit.has("final_layer.audio_out.weight");
+    let (pdd_steps, pdd_sigmas) = pdd_of(&dit)?;
+    let latents_dim = dit.shape("final_layer.video_out.weight").unwrap()[0] / (4 * pdd_steps);
+    let audio_dim = if image {
+        0
+    } else {
+        dit.shape("final_layer.audio_out.weight").unwrap()[0]
+    };
 
     // The curve. A pruned base is required: the whole point of this
     // packer is that adaLN never becomes 13 B parameters again.
@@ -710,6 +729,9 @@ fn pack_dit(
         ),
         ("rope.inv_freq", "dit.rope_inv_freq", Level::F32),
     ] {
+        if image && k.contains("audio") {
+            continue;
+        }
         push_exact(specs, &dit, k, o, l)?;
     }
     push_proj(
@@ -729,6 +751,9 @@ fn pack_dit(
         "video_patch_proj",
         "audio_patch_proj",
     ] {
+        if image && key.contains("audio") {
+            continue;
+        }
         push_proj(
             specs,
             &dit,
@@ -757,7 +782,37 @@ fn pack_dit(
         "final_norm_eps": 1e-5,
         "sigma_shift_video": 12.0,
         "sigma_shift_audio": 3.0,
+        "image": image,
+        "pdd_steps": pdd_steps,
+        "pdd_sigmas": pdd_sigmas,
     }))
+}
+
+/// The PDD head bank of a checkpoint: how many stacked heads its output
+/// layer carries and the sigma grid they were distilled on. A plain
+/// checkpoint has one head and no grid. ComfyUI's single files keep both
+/// in the header metadata as `config = {"transformer": {"pdd_steps": n,
+/// "pdd_sigmas": [...]}}`.
+fn pdd_of(dit: &StFile) -> anyhow::Result<(usize, Vec<f64>)> {
+    let Some(raw) = dit.meta.get("config").and_then(|v| v.as_str()) else {
+        return Ok((1, Vec::new()));
+    };
+    let cfg: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| anyhow!("metadata config: {e}"))?;
+    let t = &cfg["transformer"];
+    let steps = t["pdd_steps"].as_u64().unwrap_or(1) as usize;
+    let sigmas: Vec<f64> = t["pdd_sigmas"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+    if steps > 1 && sigmas.len() != steps + 1 {
+        return Err(anyhow!(
+            "pdd_steps {steps} needs {} sigmas, the file has {}",
+            steps + 1,
+            sigmas.len()
+        ));
+    }
+    Ok((steps.max(1), sigmas))
 }
 
 fn pack_te(
@@ -937,11 +992,72 @@ fn pack_clip_proj_at(
 
 /// Video VAE: the ViT3D decoder only. The 3-D conv encoder is a third
 /// of the file and t2va never runs it.
+/// The H3 latent statistics. The video VAE's file carries them as
+/// tensors; the image VAE's does not (they live in its `config.json`),
+/// and they are the same 24 + 24 numbers.
+const H3_LATENTS_MEAN: [f32; 24] = [
+    0.858_090_34,
+    -0.960_659_15,
+    1.066_164,
+    -0.509_032_55,
+    -0.272_758_2,
+    -1.367_541_4,
+    -0.255_325_5,
+    -0.269_075_54,
+    -0.537_684_1,
+    -0.046_409_73,
+    0.665_737_03,
+    0.196_901_28,
+    -0.546_060_8,
+    -0.403_534_2,
+    -0.236_830_25,
+    0.259_284_53,
+    -0.301_339_45,
+    0.211_342,
+    -1.120_684_9,
+    0.358_193_34,
+    -0.042_251_438,
+    0.260_483,
+    0.228_640_93,
+    0.705_603_2,
+];
+const H3_LATENTS_STD: [f32; 24] = [
+    1.222_377_4,
+    1.276_726_4,
+    1.683_177_5,
+    1.754_945_5,
+    1.563_621_6,
+    2.194_143_5,
+    0.965_313_8,
+    1.056_988_6,
+    0.841_948_9,
+    0.772_995_3,
+    1.895_593_8,
+    0.946_841_84,
+    0.799_680_95,
+    0.449_889,
+    0.719_739_97,
+    0.693_629_3,
+    2.961_095,
+    2.769_42,
+    3.049_618_5,
+    2.108_805_4,
+    3.276_226_3,
+    3.162_735_7,
+    2.281_681_3,
+    2.612_784_4,
+];
+
+/// `image`: MiniMax-H3-Image's VAE — the same encoder, a 2-D ViT decoder
+/// (one frame per latent, RoPE over (h, w) on half of each head) and a
+/// 2-D post-quant conv. It lands under the same `vvae.` names, told
+/// apart by its config.
 fn pack_video_vae(
     specs: &mut Vec<TensorSpec>,
     path: &Path,
     level: Level,
     heads: usize,
+    image: bool,
 ) -> anyhow::Result<serde_json::Value> {
     let v = StFile::open(path)?;
     let n = (0..)
@@ -995,10 +1111,18 @@ fn pack_video_vae(
         ("decoder.proj_out.bias", "vvae.proj_out.bias"),
         ("post_quant_conv.weight", "vvae.post_quant_conv.weight"),
         ("post_quant_conv.bias", "vvae.post_quant_conv.bias"),
-        ("latents_mean", "vvae.latents_mean"),
-        ("latents_std", "vvae.latents_std"),
     ] {
         push_exact(specs, &v, k, o, Level::F32)?;
+    }
+    for (k, o, known) in [
+        ("latents_mean", "vvae.latents_mean", &H3_LATENTS_MEAN),
+        ("latents_std", "vvae.latents_std", &H3_LATENTS_STD),
+    ] {
+        if v.has(k) {
+            push_exact(specs, &v, k, o, Level::F32)?;
+        } else {
+            specs.push(spec(o.to_string(), known, vec![known.len()], Level::F32));
+        }
     }
     push_exact(
         specs,
@@ -1092,8 +1216,10 @@ fn pack_video_vae(
 
     Ok(serde_json::json!({
         "num_layers": n, "dim": dim, "heads": heads, "dim_head": dim / heads,
-        "z_channels": z, "patch_size": 16, "patch_size_t": 4,
-        "rope_theta": 100.0, "rope_dim_ratio": 0.75,
+        "z_channels": z, "patch_size": 16, "patch_size_t": if image { 1 } else { 4 },
+        "rope_theta": 100.0, "rope_dim_ratio": if image { 0.5 } else { 0.75 },
+        "rope_dims": if image { 2 } else { 3 },
+        "image": image,
         "num_register_tokens": 4, "eps": 1e-5,
         "space_down": space_down, "num_res_blocks": n_res, "num_levels": n_levels,
     }))
@@ -1782,6 +1908,12 @@ pub struct PackArgs<'a> {
     pub music_te: Option<&'a str>,
     pub te_layers: Option<usize>,
     pub video_vae: Option<&'a str>,
+    /// MiniMax-H3-Image's VAE (`minimax_h3_image_vae_fp16.safetensors`).
+    pub image_vae: Option<&'a str>,
+    /// Codec of the image VAE's projections (default: `quant`).
+    pub image_vae_quant: Option<&'a str>,
+    /// Component prefixes of the carried file to leave behind.
+    pub drop: Vec<String>,
     pub audio_vae: Option<&'a str>,
     pub tokenizer: Option<&'a str>,
     pub quant: &'a str,
@@ -1791,8 +1923,8 @@ pub struct PackArgs<'a> {
     pub vis_deepstack: Vec<usize>,
 }
 
-pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
-    let level = match args.quant {
+fn level_of(flag: &str, name: &str) -> anyhow::Result<Level> {
+    Ok(match name {
         "q4tp" | "q4" => Level::Q4tp,
         "q2tp" | "q2" => Level::Q2tp,
         "q8" => Level::Q8,
@@ -1803,10 +1935,14 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         "f32" => Level::F32,
         other => {
             return Err(anyhow!(
-                "--quant {other}: expected q4tp, q2tp, q8_2f, q8, f16 or f32"
+                "{flag} {other}: expected q4tp, q2tp, q8_2f, q8, f16 or f32"
             ));
         }
-    };
+    })
+}
+
+pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
+    let level = level_of("--quant", args.quant)?;
     let t0 = std::time::Instant::now();
     let mut specs: Vec<TensorSpec> = Vec::new();
     let mut prov = serde_json::Map::new();
@@ -1888,11 +2024,28 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
             None => return Err(anyhow!("{p}: no vision tower (no patch_embed.proj)")),
         }
     }
+    if args.video_vae.is_some() && args.image_vae.is_some() {
+        return Err(anyhow!(
+            "--video-vae and --image-vae fill the same slot: one model has one of them"
+        ));
+    }
     if let Some(p) = args.video_vae {
-        let cfg = pack_video_vae(&mut specs, Path::new(p), level, args.vvae_heads)?;
+        let cfg = pack_video_vae(&mut specs, Path::new(p), level, args.vvae_heads, false)?;
         specs.push(config_spec("vvae", &cfg));
         prov.insert("video_vae".into(), serde_json::json!(p));
         eprintln!("video vae packed ({:.1}s)", t0.elapsed().as_secs_f64());
+    }
+    if let Some(p) = args.image_vae {
+        let vl = match args.image_vae_quant {
+            Some(q) => level_of("--image-vae-quant", q)?,
+            None => level,
+        };
+        // The image decoder's ViT is 16 heads of 64 — a constant of the
+        // release, like the video decoder's 32.
+        let cfg = pack_video_vae(&mut specs, Path::new(p), vl, 16, true)?;
+        specs.push(config_spec("vvae", &cfg));
+        prov.insert("image_vae".into(), serde_json::json!(p));
+        eprintln!("image vae packed ({:.1}s)", t0.elapsed().as_secs_f64());
     }
     if let Some(p) = args.audio_vae {
         let cfg = pack_audio_vae(&mut specs, Path::new(p), level)?;
@@ -1955,12 +2108,23 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
     for (on, pre) in [
         (args.dit.is_some(), "dit."),
         (args.vision.is_some(), "vis."),
-        (args.video_vae.is_some(), "vvae."),
+        (args.video_vae.is_some() || args.image_vae.is_some(), "vvae."),
         (args.audio_vae.is_some(), "avae."),
     ] {
         if on {
             drop_pre.push(pre);
         }
+    }
+    // `--drop avae,te.proj`: components of the carried file that this
+    // model does not have (an image model built over a video container
+    // leaves the audio decoder behind).
+    let dropped: Vec<String> = args
+        .drop
+        .iter()
+        .map(|d| format!("{}.", d.trim_end_matches('.')))
+        .collect();
+    for d in &dropped {
+        drop_pre.push(d.as_str());
     }
     if let Some(m) = &carried {
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
@@ -2009,8 +2173,31 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
     // to a null the arch deserializer rejects.
     let n = |k: &str| te_cfg[k].as_u64().unwrap_or(0);
     let nl = n("num_hidden_layers") as usize;
+    // The image model is told apart by its DiT: no audio stream.
+    let image = refs
+        .iter()
+        .find(|r| r.name == "dit.config_json")
+        .and_then(|r| serde_json::from_slice::<serde_json::Value>(r.data).ok())
+        .is_some_and(|c| c["image"].as_bool() == Some(true));
+    // Sources by file name only: the header of a published file is not
+    // the place for somebody's directory layout.
+    let prov: serde_json::Map<String, serde_json::Value> = prov
+        .into_iter()
+        .map(|(k, v)| {
+            let v = match v.as_str() {
+                Some(p) => serde_json::json!(
+                    Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ),
+                None => v,
+            };
+            (k, v)
+        })
+        .collect();
     let arch: ModelArch = serde_json::from_value(serde_json::json!({
-        "arch_name": "minimax-h3-av",
+        "arch_name": if image { "minimax-h3-image" } else { "minimax-h3-av" },
         "hidden_size": n("hidden_size"),
         "intermediate_size": n("intermediate_size"),
         "num_layers": nl,
@@ -2034,17 +2221,31 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
             Level::Q2tp => QuantType::Q4Block,
             _ => QuantType::Q4Block,
         },
-        provenance: Some(serde_json::json!({
-            "pipeline": "minimax-h3",
-            "components": {
-                "te": "qwen3-vl-32b (50 layers)",
-                "dit": "minimax-h3 audio-video dit",
-                "vvae": "vit3d video vae decoder",
-                "avae": "bigvgan audio vae decoder",
-            },
-            "sources": prov,
-            "quant": args.quant,
-        })),
+        provenance: Some(if image {
+            serde_json::json!({
+                "pipeline": "minimax-h3-image",
+                "components": {
+                    "te": "qwen3-vl-32b (50 layers)",
+                    "vis": "qwen3-vl vision tower (image editing)",
+                    "dit": "minimax-h3-image dit, 6-step head bank",
+                    "vvae": "image vae: cnn encoder, 2-d vit decoder",
+                },
+                "sources": prov,
+                "quant": args.quant,
+            })
+        } else {
+            serde_json::json!({
+                "pipeline": "minimax-h3",
+                "components": {
+                    "te": "qwen3-vl-32b (50 layers)",
+                    "dit": "minimax-h3 audio-video dit",
+                    "vvae": "vit3d video vae decoder",
+                    "avae": "bigvgan audio vae decoder",
+                },
+                "sources": prov,
+                "quant": args.quant,
+            })
+        }),
         tokenizer_config: None,
         section_hashes: None,
         skills: Vec::new(),

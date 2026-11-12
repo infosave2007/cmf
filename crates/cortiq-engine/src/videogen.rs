@@ -249,7 +249,7 @@ pub fn generate(
 /// ~24%, honest drift is ~1e-5, so the gate has a decade of margin on
 /// each side. Any refusal (no adapter, dtype outside the kernel) is a
 /// clean "no": the host path is never wrong, only slower.
-fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
+pub(crate) fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
     let model = Arc::new(
         cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
     );
@@ -257,10 +257,18 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
     // device arm against the host, and a container packed as q8_2f has one
     // too. Matching on dtype sent every non-q4tp build to the CPU for the
     // whole render — measured at 357 s against 60 on the same card.
+    // A container with the prompt encoder alone (`animate-pack --te` by
+    // itself) is probed on the encoder's first projection instead.
     let Some(idx) = model
         .tensors
         .iter()
         .position(|t| t.name.starts_with("dit.") && t.name.ends_with("attn.qkv_proj.weight"))
+        .or_else(|| {
+            model
+                .tensors
+                .iter()
+                .position(|t| t.name.starts_with("te.layers.") && t.name.ends_with("mlp.gate_proj.weight"))
+        })
     else {
         tracing::info!("mmh3 GPU parity probe: no qkv weight — host path");
         return Ok(false);
@@ -283,7 +291,15 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
         );
     }
     let qt = crate::qtensor::QTensor::from_model(&model, &entry.name.clone())?;
-    if !qt.device_matmat(&xs, b, &mut gpu) {
+    // The native CUDA backend reads q4tp and q8_2f alike through one
+    // product (`gpu::q4tp_matmat`'s arm there); the per-codec device entry
+    // points of `device_matmat` are wgpu's and Metal's.
+    let took = if crate::gpu::cuda_active() {
+        crate::gpu::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut gpu)
+    } else {
+        qt.device_matmat(&xs, b, &mut gpu)
+    };
+    if !took {
         tracing::info!(
             "mmh3 GPU parity probe: {:?} device GEMM refused ({rows}x{cols}) — host path",
             entry.dtype

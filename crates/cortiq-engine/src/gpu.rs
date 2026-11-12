@@ -4136,6 +4136,156 @@ pub fn dit_qkv_attention(
     }
 }
 
+/// One block of a MiniMax-H3 stack for the resident chain: the four
+/// projections by directory index, its norms, and its modulation table.
+pub struct H3ChainBlock<'a> {
+    pub qkv: usize,
+    pub out: usize,
+    pub fc1: usize,
+    pub fc2: usize,
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    /// `[modulation rows][6 · hidden]` (shift, scale, gate for attention,
+    /// then for the MLP); empty for an unmodulated block.
+    pub mods: &'a [f32],
+    /// The ViT decoder's extras, each empty where a stack has none: the
+    /// projections' biases and the per-channel scale of each residual.
+    pub qkv_bias: &'a [f32],
+    pub out_bias: &'a [f32],
+    pub fc1_bias: &'a [f32],
+    pub fc2_bias: &'a [f32],
+    pub scale1: &'a [f32],
+    pub scale2: &'a [f32],
+}
+
+/// A stack of MiniMax-H3 blocks over one packed sequence.
+pub struct H3Chain<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub blocks: &'a [H3ChainBlock<'a>],
+    pub n: usize,
+    pub hidden: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub ffn: usize,
+    pub eps: f32,
+    pub qk_eps: f32,
+    /// `[n][pairs]` rotation angles; empty: no rotation.
+    pub angles: &'a [f32],
+    /// `[n]` modulation row of every token (unread without modulation).
+    pub rows: &'a [u32],
+    /// Independent sequences in the batch, `n` rows each (`h` is
+    /// `[groups · n][hidden]`): attention stays inside a group, and the
+    /// angles are one group's, shared by all.
+    pub groups: usize,
+    /// The qkv panel's row layout: `[q | k | v]` planes (false) or
+    /// per-head `[q k v]` triples (true).
+    pub qkv_interleaved: bool,
+}
+
+/// One layer of a language-model prompt encoder for the resident chain: its
+/// seven projections by directory index and its norms.
+pub struct TeChainLayer<'a> {
+    pub q: usize,
+    pub k: usize,
+    pub v: usize,
+    pub o: usize,
+    pub gate: usize,
+    pub up: usize,
+    pub down: usize,
+    pub input_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+}
+
+/// A run of prompt-encoder layers over one causal sequence.
+pub struct TeChain<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub layers: &'a [TeChainLayer<'a>],
+    pub n: usize,
+    pub hidden: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub inter: usize,
+    pub eps: f32,
+    /// `[n][head_dim / 2][2]`: (cos, sin) of every row's rotation angles.
+    pub cs: &'a [f32],
+}
+
+/// The layers over `h` `[n][hidden]`, in place, on the card. `false`: nothing
+/// was written and the caller runs its per-op path.
+#[allow(unused_variables)]
+pub fn te_chain(job: &TeChain<'_>, h: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_te_chain(job, h),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// One stage of a convolution chain over an activation `[c][h][w]`.
+pub enum ConvStep<'a> {
+    /// GroupNorm(32) with its affine weights, then SiLU, in place.
+    GnSilu { w: &'a [f32], b: &'a [f32] },
+    /// A `k`×`k` convolution `[out, in, k, k]` and its bias. `pad`: rows and
+    /// columns of reflect padding on every side; `far`: one reflected row
+    /// and column on the far side instead (a downsample's padding).
+    Conv {
+        w: &'a [f32],
+        b: &'a [f32],
+        out_ch: usize,
+        in_ch: usize,
+        k: usize,
+        stride: usize,
+        pad: usize,
+        far: bool,
+    },
+    /// Keep the current activation as the residual branch's input.
+    Save,
+    /// Add the kept activation — through a 1×1 convolution (weight, bias)
+    /// when the branch changes the channel count.
+    AddSaved { via: Option<(&'a [f32], &'a [f32])> },
+}
+
+/// The stages over `x` `[c][h][w]` on the card; `([c'][h'][w'], c', h', w')`,
+/// or None where the backend has no such chain (the caller runs its own).
+#[allow(unused_variables)]
+pub fn conv_chain(steps: &[ConvStep<'_>], x: &[f32], c: usize, h: usize, w: usize) -> Option<(Vec<f32>, usize, usize, usize)> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_conv_chain(steps, x, c, h, w),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Whether this backend runs a MiniMax-H3 stack as one resident chain.
+pub fn h3_chain_available() -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => true,
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The stack over `h` `[n][hidden]`, in place, with the stream on the card
+/// from the first block to the last. `false`: nothing was written and the
+/// caller runs its per-op path.
+#[allow(unused_variables)]
+pub fn h3_chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_chain(job, h),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// The whole attention half of a DiT block on the card: qkv GEMM,
 /// attention, output projection. Only `proj` comes home.
 #[allow(clippy::too_many_arguments)]
@@ -4419,6 +4569,8 @@ pub fn vision_gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m
         Backend::Metal => crate::gpu_metal::egemma2::gemm_nt(x, w, y, n, k, m),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_gemm_nt(x, w, y, n, k, m),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4561,6 +4713,8 @@ pub fn dit_attention(
         Backend::Metal => crate::gpu_metal::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4723,8 +4877,36 @@ pub fn q4tp_matmat(
         Backend::Metal => crate::gpu_metal::q4tp_matmat(model, idx, xs, b, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q4tp_matmat(model, idx, xs, b, rows, cols, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unreachable_patterns)]
         _ => false,
+    }
+}
+
+/// A stage of a staged pipeline over `model` is done (the prompt encoder
+/// before the denoiser, the denoiser before the decoder): the device drops
+/// what it cached of that model's weights, so the next stage starts from a
+/// card that holds one component and not their sum.
+#[allow(unused_variables)]
+pub fn stage_done(model: &CmfModel) {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::release_model_buffers(model),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_release(),
+        #[allow(unreachable_patterns)]
+        _ => {}
+    }
+}
+
+/// The resident chain's stage times, when the backend keeps them.
+pub fn h3_prof_report() -> Option<String> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_prof_report(),
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 

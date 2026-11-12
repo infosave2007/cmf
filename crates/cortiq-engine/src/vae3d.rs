@@ -135,6 +135,9 @@ pub struct VideoVae {
     n_reg: usize,
     rope_theta: f32,
     rope_dim: usize,
+    /// Position axes the rotation covers: (t, h, w) on the video decoder,
+    /// (h, w) on MiniMax-H3-Image's.
+    rope_axes: usize,
     eps: f64,
 }
 
@@ -296,6 +299,7 @@ impl VideoVae {
             rope_theta: cfg["rope_theta"].as_f64().unwrap_or(100.0) as f32,
             rope_dim: ((dim / heads) as f64 * cfg["rope_dim_ratio"].as_f64().unwrap_or(0.75))
                 as usize,
+            rope_axes: u("rope_dims", 3).clamp(2, 3),
             eps: cfg["eps"].as_f64().unwrap_or(1e-5),
         })
     }
@@ -309,24 +313,28 @@ impl VideoVae {
             .collect()
     }
 
-    /// `[S, rope_dim/2]` angles: three axes × `rope_dim/6` frequencies,
-    /// scaled by 2π. Suffix tokens sit at the origin and get zeros.
+    /// `[S, rope_dim/2]` angles: the position axes × `rope_dim/(2·axes)`
+    /// frequencies each, scaled by 2π — (t, h, w) on the video decoder,
+    /// (h, w) on the image one. Suffix tokens sit at the origin and get
+    /// zeros.
     fn rope_angles(&self, t: usize, h: usize, w: usize, suffix: usize) -> Vec<f32> {
-        let k = self.rope_dim / 6; // frequencies per axis
+        let ax = self.rope_axes;
+        let k = self.rope_dim / (2 * ax); // frequencies per axis
         let inv: Vec<f32> = (0..k)
             .map(|i| {
                 1.0 / self
                     .rope_theta
-                    .powf(i as f32 * 2.0 * 3.0 / self.rope_dim as f32)
+                    .powf(i as f32 * 2.0 * ax as f32 / self.rope_dim as f32)
             })
             .collect();
         let (ta, ha, wa) = (Self::axis(t), Self::axis(h), Self::axis(w));
         let tau = 2.0 * std::f32::consts::PI;
-        let mut out = Vec::with_capacity((t * h * w + suffix) * 3 * k);
+        let mut out = Vec::with_capacity((t * h * w + suffix) * ax * k);
         for ti in 0..t {
             for hi in 0..h {
                 for wi in 0..w {
-                    for &c in &[ta[ti], ha[hi], wa[wi]] {
+                    let coords = [ta[ti], ha[hi], wa[wi]];
+                    for &c in &coords[3 - ax..] {
                         for &f in &inv {
                             out.push(tau * c * f);
                         }
@@ -334,7 +342,7 @@ impl VideoVae {
                 }
             }
         }
-        out.extend(std::iter::repeat_n(0.0, suffix * 3 * k));
+        out.extend(std::iter::repeat_n(0.0, suffix * ax * k));
         out
     }
 
@@ -614,9 +622,10 @@ impl VideoVae {
         }
     }
 
-    /// One tile-clip: latents `[z_channels, t, h, w]` → pixels
-    /// `[3, t·4, h·16, w·16]`, both channel-major.
-    fn decode_tile(&self, z: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
+    /// A tile's latents `[z_channels, t, h, w]` as the decoder's token
+    /// stream `[n, dim]`: the patches through the post-quant conv and the
+    /// embedder, then the register tokens and one all-zero token.
+    fn embed_tile(&self, z: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
         let pool = self.pool.as_deref();
         let dim = self.dim;
         let np = t * h * w;
@@ -648,6 +657,18 @@ impl VideoVae {
         }
         // register tokens, then one all-zero token
         x[np * dim..(np + self.n_reg) * dim].copy_from_slice(&self.registers);
+        x
+    }
+
+    /// One tile-clip: latents `[z_channels, t, h, w]` → pixels
+    /// `[3, t·4, h·16, w·16]`, both channel-major.
+    fn decode_tile(&self, z: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
+        let pool = self.pool.as_deref();
+        let dim = self.dim;
+        let np = t * h * w;
+        let suffix = 1 + self.n_reg;
+        let n = np + suffix;
+        let mut x = self.embed_tile(z, t, h, w);
 
         let angles = self.rope_angles(t, h, w, suffix);
         let mut xn = vec![0f32; n * dim];
@@ -878,6 +899,16 @@ impl VideoVae {
             vprof(5, t_ffn);
         }
 
+        self.head_tile(&x, t, h, w)
+    }
+
+    /// The decoder's output layer over a tile's token stream: the final
+    /// norm and projection of the patch tokens, unpatchified to
+    /// `[3, t·pt, h·ps, w·ps]`.
+    fn head_tile(&self, x: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
+        let pool = self.pool.as_deref();
+        let dim = self.dim;
+        let np = t * h * w;
         let (pt, ps) = (self.patch_t, self.patch);
         let od = 3 * pt * ps * ps;
         let t_head = std::time::Instant::now();
@@ -933,6 +964,98 @@ impl VideoVae {
         px
     }
 
+    /// Every tile of a clip, all of one shape, in order. On a backend with
+    /// a resident chain the tiles go through the decoder's blocks in
+    /// batches — each tile an independent sequence of one launch — and
+    /// one at a time through the per-op path otherwise.
+    /// `CMF_VAE3D_CHAIN=0` keeps the per-op path.
+    fn decode_tiles(&self, subs: &[Vec<f32>], t: usize, h: usize, w: usize) -> Vec<Vec<f32>> {
+        if let Some(out) = self.decode_tiles_chain(subs, t, h, w) {
+            return out;
+        }
+        subs.iter().map(|z| self.decode_tile(z, t, h, w)).collect()
+    }
+
+    fn decode_tiles_chain(
+        &self,
+        subs: &[Vec<f32>],
+        t: usize,
+        h: usize,
+        w: usize,
+    ) -> Option<Vec<Vec<f32>>> {
+        if std::env::var("CMF_VAE3D_CHAIN").as_deref() == Ok("0")
+            || !crate::gpu::enabled_here()
+            || !crate::gpu::h3_chain_available()
+        {
+            return None;
+        }
+        let dim = self.dim;
+        let n = t * h * w + 1 + self.n_reg;
+        let mapped = |p: &Proj| match p {
+            Proj::Q(q) => q.mapped_device_gemm().map(|(m, i)| (m.clone(), i)),
+            Proj::F32 { .. } => None,
+        };
+        let model = mapped(&self.blocks.first()?.qkv)?.0;
+        let chain: Vec<crate::gpu::H3ChainBlock> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                Some(crate::gpu::H3ChainBlock {
+                    qkv: mapped(&b.qkv)?.1,
+                    out: mapped(&b.out)?.1,
+                    fc1: mapped(&b.w1)?.1,
+                    fc2: mapped(&b.w2)?.1,
+                    norm1: &b.norm1,
+                    norm2: &b.norm2,
+                    q_norm: &[],
+                    k_norm: &[],
+                    mods: &[],
+                    qkv_bias: &b.qkv_b,
+                    out_bias: &b.out_b,
+                    fc1_bias: &b.w1_b,
+                    fc2_bias: &b.w2_b,
+                    scale1: &b.scale1,
+                    scale2: &b.scale2,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let angles = self.rope_angles(t, h, w, 1 + self.n_reg);
+        // Tiles a batch: the score rows are tiles · heads · n², six bytes
+        // an entry on the card.
+        let g_max = ((256usize << 20) / (self.heads * n * n * 6)).clamp(1, 64);
+        let mut out = Vec::with_capacity(subs.len());
+        for batch in subs.chunks(g_max) {
+            let t_blk = std::time::Instant::now();
+            let mut x = Vec::with_capacity(batch.len() * n * dim);
+            for z in batch {
+                x.extend_from_slice(&self.embed_tile(z, t, h, w));
+            }
+            let job = crate::gpu::H3Chain {
+                model: &model,
+                blocks: &chain,
+                n,
+                hidden: dim,
+                heads: self.heads,
+                head_dim: self.head_dim,
+                ffn: 4 * dim,
+                eps: self.eps as f32,
+                qk_eps: self.eps as f32,
+                angles: &angles,
+                rows: &[],
+                groups: batch.len(),
+                qkv_interleaved: true,
+            };
+            if !crate::gpu::h3_chain(&job, &mut x) {
+                return None;
+            }
+            vprof(3, t_blk);
+            for k in 0..batch.len() {
+                out.push(self.head_tile(&x[k * n * dim..(k + 1) * n * dim], t, h, w));
+            }
+        }
+        Some(out)
+    }
+
     /// Spatially tiled decode of one temporal clip. `z` is
     /// `[z_channels, t, zh, zw]`; the result is `[3, t·4, zh·16, zw·16]`.
     fn decode_clip(&self, z: &[f32], t: usize, zh: usize, zw: usize) -> Vec<f32> {
@@ -943,30 +1066,42 @@ impl VideoVae {
         let frames = t * self.patch_t;
         let mut canvas = vec![0f32; 3 * frames * height * width];
 
-        // The reference blends each tile into its predecessor's tail and
-        // then trims the overlap off, so a pixel is written once.
-        let mut row_tails: Vec<Vec<f32>> = Vec::new();
-        let mut out_y = 0usize;
-        for (i, (&ip, &il)) in ys.iter().zip(&yl).enumerate() {
+        // Every tile's latents first: the tiles are independent, so the
+        // decoder may take them in batches; the blend below is sequential.
+        let mut subs: Vec<Vec<f32>> = Vec::with_capacity(ys.len() * xs.len());
+        for (&ip, &il) in ys.iter().zip(&yl) {
             let (zi, zl) = (ip / r, il / r);
-            let mut new_tails: Vec<Vec<f32>> = Vec::new();
-            let mut left_tail: Option<Vec<f32>> = None;
-            let mut out_x = 0usize;
-            let mut row_h = 0usize;
-            for (j, (&jp, &jl)) in xs.iter().zip(&xl).enumerate() {
+            for (&jp, &jl) in xs.iter().zip(&xl) {
                 let (zj, zw_t) = (jp / r, jl / r);
                 let mut sub = vec![0f32; self.z_channels * t * zl * zw_t];
                 for c in 0..self.z_channels {
                     for ti in 0..t {
                         for hh in 0..zl {
-                            for ww in 0..zw_t {
-                                sub[((c * t + ti) * zl + hh) * zw_t + ww] =
-                                    z[((c * t + ti) * zh + zi + hh) * zw + zj + ww];
-                            }
+                            let s = ((c * t + ti) * zh + zi + hh) * zw + zj;
+                            let d = ((c * t + ti) * zl + hh) * zw_t;
+                            sub[d..d + zw_t].copy_from_slice(&z[s..s + zw_t]);
                         }
                     }
                 }
-                let mut tile = self.decode_tile(&sub, t, zl, zw_t);
+                subs.push(sub);
+            }
+        }
+        let mut tiles = self.decode_tiles(&subs, t, yl[0] / r, xl[0] / r);
+        drop(subs);
+
+        // The reference blends each tile into its predecessor's tail and
+        // then trims the overlap off, so a pixel is written once.
+        let mut row_tails: Vec<Vec<f32>> = Vec::new();
+        let mut out_y = 0usize;
+        for (i, &il) in yl.iter().enumerate() {
+            let zl = il / r;
+            let mut new_tails: Vec<Vec<f32>> = Vec::new();
+            let mut left_tail: Option<Vec<f32>> = None;
+            let mut out_x = 0usize;
+            let mut row_h = 0usize;
+            for (j, &jl) in xl.iter().enumerate() {
+                let zw_t = jl / r;
+                let mut tile = std::mem::take(&mut tiles[i * xs.len() + j]);
                 let (mut th, mut tw) = (zl * r, zw_t * r);
                 if i + 1 < ys.len() {
                     new_tails.push(crop(&tile, frames, th, tw, th - yo[i], th, 0, tw));
@@ -1123,6 +1258,31 @@ impl VideoVae {
             out = trimmed;
         }
         (out, keep)
+    }
+
+    /// MiniMax-H3-Image: one normalized latent frame `[z_channels, zh, zw]`
+    /// → RGB in [0, 1], `[3, zh·16, zw·16]`. The decoder takes the latent
+    /// as it is (no clip of copies around it), tiled the way the video
+    /// one is.
+    pub fn decode_image(&self, z: &[f32], zh: usize, zw: usize) -> Vec<f32> {
+        debug_assert_eq!(self.patch_t, 1, "decode_image on a video decoder");
+        let zc = self.z_channels;
+        let np = zh * zw;
+        let mut zz = vec![0f32; zc * np];
+        for c in 0..zc {
+            let (m, s) = (self.latents_mean[c], self.latents_std[c]);
+            for i in 0..np {
+                zz[c * np + i] = z[c * np + i] * s + m;
+            }
+        }
+        let mut out = self.decode_clip(&zz, 1, zh, zw);
+        let hw = zh * self.patch * zw * self.patch;
+        for c in 0..3 {
+            for v in out[c * hw..(c + 1) * hw].iter_mut() {
+                *v = (*v * IMAGENET_STD[c] + IMAGENET_MEAN[c]).clamp(0.0, 1.0);
+            }
+        }
+        out
     }
 
     pub fn spatial_ratio(&self) -> usize {
@@ -1350,6 +1510,59 @@ impl EncConv {
             i as usize
         };
         let mut out = vec![0f32; self.out_ch * oh * ow];
+        // A convolution of any size is an im2col panel and one GEMM: the
+        // panel rows are output pixels, its columns the kernel's (channel,
+        // ky, kx) taps — the weight's own layout — and the GEMM is the
+        // pooled host one, or the device's where a device is on. The loop
+        // below did the same sums one output channel a worker and was
+        // minutes a tile on a reference picture.
+        let kk = self.in_ch * self.k * self.k;
+        if kk * self.out_ch >= (1 << 12) && oh * ow >= 64 {
+            let n = oh * ow;
+            let chunk = ((64usize << 20) / (kk * 4)).clamp(1, n);
+            let mut cols = vec![0f32; chunk * kk];
+            let mut y = vec![0f32; chunk * self.out_ch];
+            let (k, stride, pad) = (self.k, self.stride, self.pad as isize);
+            for p0 in (0..n).step_by(chunk) {
+                let np = chunk.min(n - p0);
+                {
+                    let cp = SendPtr(cols.as_mut_ptr());
+                    rows_par(pool, np, &|lo, hi| {
+                        for p in lo..hi {
+                            let (oy, ox) = ((p0 + p) / ow, (p0 + p) % ow);
+                            // SAFETY: workers own disjoint panel rows.
+                            let row = unsafe { cp.row(p * kk, kk) };
+                            for ky in 0..k {
+                                let sy = refl((oy * stride + ky) as isize - pad, h);
+                                for kx in 0..k {
+                                    let sx = refl((ox * stride + kx) as isize - pad, w);
+                                    let at = sy * w + sx;
+                                    for i in 0..self.in_ch {
+                                        row[(i * k + ky) * k + kx] = x[i * h * w + at];
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                crate::fcd_ops::gemm_nt(
+                    &cols[..np * kk],
+                    &self.w,
+                    &mut y[..np * self.out_ch],
+                    np,
+                    kk,
+                    self.out_ch,
+                    pool,
+                );
+                for o in 0..self.out_ch {
+                    let dst = &mut out[o * n + p0..o * n + p0 + np];
+                    for (p, d) in dst.iter_mut().enumerate() {
+                        *d = y[p * self.out_ch + o] + self.b[o];
+                    }
+                }
+            }
+            return (out, oh, ow);
+        }
         let ptr = SendPtr(out.as_mut_ptr());
         let work = |lo: usize, hi: usize| {
             for o in lo..hi {
@@ -1499,8 +1712,71 @@ impl VideoVaeEncoder {
         })
     }
 
+    /// The encoder's stages as one chain for a device that runs it whole:
+    /// the tile goes up once and the pre-quant moments come back.
+    fn encode_tile_chain(&self, x: &[f32], h: usize, w: usize) -> Option<(Vec<f32>, usize, usize)> {
+        use crate::gpu::ConvStep;
+        if std::env::var("CMF_VAE3D_CHAIN").as_deref() == Ok("0") || !crate::gpu::enabled_here() {
+            return None;
+        }
+        fn conv(c: &EncConv, far: bool) -> ConvStep<'_> {
+            ConvStep::Conv {
+                w: &c.w,
+                b: &c.b,
+                out_ch: c.out_ch,
+                in_ch: c.in_ch,
+                k: c.k,
+                stride: c.stride,
+                pad: c.pad,
+                far,
+            }
+        }
+        let mut steps = vec![conv(&self.conv_in, false)];
+        for (blocks, down) in &self.levels {
+            for b in blocks {
+                steps.push(ConvStep::Save);
+                steps.push(ConvStep::GnSilu { w: &b.norm1.w, b: &b.norm1.b });
+                steps.push(conv(&b.conv1, false));
+                steps.push(ConvStep::GnSilu { w: &b.norm2.w, b: &b.norm2.b });
+                steps.push(conv(&b.conv2, false));
+                steps.push(ConvStep::AddSaved {
+                    via: b.shortcut.as_ref().map(|s| (&s.w[..], &s.b[..])),
+                });
+            }
+            if let Some(d) = down {
+                // one reflected row and column on the far side, then the
+                // unpadded stride-2 kernel
+                steps.push(conv(d, true));
+            }
+        }
+        steps.push(ConvStep::GnSilu { w: &self.norm_out.w, b: &self.norm_out.b });
+        steps.push(conv(&self.conv_out, false));
+        let (moments, _, mh, mw) = crate::gpu::conv_chain(&steps, x, 3, h, w)?;
+        Some((moments, mh, mw))
+    }
+
+    /// The 1×1×1 quant conv over the encoder's moments: a per-position
+    /// linear.
+    fn quant_moments(&self, moments: &[f32], hw: usize) -> Vec<f32> {
+        let n = 2 * self.z_channels;
+        let mut out = vec![0f32; n * hw];
+        for o in 0..n {
+            for p in 0..hw {
+                let mut acc = self.quant_b[o];
+                for i in 0..n {
+                    acc += self.quant[o * n + i] * moments[i * hw + p];
+                }
+                out[o * hw + p] = acc;
+            }
+        }
+        out
+    }
+
     /// One tile, unpadded: `[3, h, w]` → moments `[2·z, h/16, w/16]`.
     fn encode_tile(&self, x: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        if let Some((moments, mh, mw)) = self.encode_tile_chain(x, h, w) {
+            return (self.quant_moments(&moments, mh * mw), mh, mw);
+        }
         let pool = self.pool.as_deref();
         let (mut cur, mut ch, mut cw) = self.conv_in.apply(x, h, w, pool);
         let mut c = self.conv_in.out_ch;
@@ -1539,19 +1815,7 @@ impl VideoVaeEncoder {
             *v = silu(*v);
         }
         let (moments, mh, mw) = self.conv_out.apply(&cur, ch, cw, pool);
-        // quant_conv is 1x1x1: a per-position linear.
-        let n = 2 * self.z_channels;
-        let mut out = vec![0f32; n * mh * mw];
-        for o in 0..n {
-            for p in 0..mh * mw {
-                let mut acc = self.quant_b[o];
-                for i in 0..n {
-                    acc += self.quant[o * n + i] * moments[i * mh * mw + p];
-                }
-                out[o * mh * mw + p] = acc;
-            }
-        }
-        (out, mh, mw)
+        (self.quant_moments(&moments, mh * mw), mh, mw)
     }
 
     fn norm_out_like(&self, g: &GroupNorm, x: &mut [f32], ch: usize, hw: usize) {
@@ -1559,8 +1823,53 @@ impl VideoVaeEncoder {
     }
 
     /// A single frame in [-1, 1], `[3, h, w]` → normalized latents
-    /// `[z, h/16, w/16]`, spatially tiled exactly as the reference does.
+    /// `[z, h/16, w/16]`, spatially tiled exactly as the reference does:
+    /// the posterior MEAN, no sampling (what a video keyframe conditions
+    /// on).
     pub fn encode_frame(&self, rgb: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        let (canvas, zh, zw) = self.moments(rgb, h, w);
+        let mut z = vec![0f32; self.z_channels * zh * zw];
+        for c in 0..self.z_channels {
+            let (m, s) = (self.latents_mean[c], self.latents_std[c]);
+            for p in 0..zh * zw {
+                z[c * zh * zw + p] = (canvas[c * zh * zw + p] - m) / s;
+            }
+        }
+        (z, zh, zw)
+    }
+
+    /// The same frame as a SAMPLE of the posterior — mean + σ·ε with
+    /// `logvar` clamped to [-30, 20] — which is what MiniMax-H3-Image's
+    /// reference pictures condition on. The reference draws ε from a
+    /// torch generator at a fixed seed; ours is its own stream of the
+    /// same law, fixed by `seed`.
+    pub fn encode_frame_sampled(
+        &self,
+        rgb: &[f32],
+        h: usize,
+        w: usize,
+        seed: u64,
+    ) -> (Vec<f32>, usize, usize) {
+        let (canvas, zh, zw) = self.moments(rgb, h, w);
+        let zc = self.z_channels;
+        let noise = crate::videogen::gauss_pub(zc * zh * zw, seed);
+        let mut z = vec![0f32; zc * zh * zw];
+        for c in 0..zc {
+            let (m, s) = (self.latents_mean[c], self.latents_std[c]);
+            for p in 0..zh * zw {
+                let mean = canvas[c * zh * zw + p];
+                let logvar = canvas[(zc + c) * zh * zw + p].clamp(-30.0, 20.0);
+                let v = mean + (0.5 * logvar).exp() * noise[c * zh * zw + p];
+                z[c * zh * zw + p] = (v - m) / s;
+            }
+        }
+        (z, zh, zw)
+    }
+
+    /// The posterior moments of one frame: `[2·z, h/16, w/16]`, the mean's
+    /// channels then the log-variance's, tiles blended as the reference
+    /// blends them.
+    fn moments(&self, rgb: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
         // [-1, 1] → [0, 1] → ImageNet-normalized, the reference's order.
         let mut x = vec![0f32; 3 * h * w];
         for c in 0..3 {
@@ -1647,15 +1956,7 @@ impl VideoVaeEncoder {
             }
             out_y += row_h;
         }
-        // The posterior MEAN is the first z channels; no sampling.
-        let mut z = vec![0f32; self.z_channels * zh * zw];
-        for c in 0..self.z_channels {
-            let (m, s) = (self.latents_mean[c], self.latents_std[c]);
-            for p in 0..zh * zw {
-                z[c * zh * zw + p] = (canvas[c * zh * zw + p] - m) / s;
-            }
-        }
-        (z, zh, zw)
+        (canvas, zh, zw)
     }
 }
 
