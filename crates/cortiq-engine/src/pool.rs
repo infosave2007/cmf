@@ -127,6 +127,11 @@ struct Inner {
     /// or waiting caller — yields the CPU between short spin bursts.
     /// The default size (available_parallelism − 1 workers) never is.
     oversubscribed: bool,
+    /// The odd workers run on a second NUMA node (`Pool::bind_two_nodes`).
+    two_node: AtomicBool,
+    /// The CPUs the pool sat on before `bind_two_nodes` (what `unbind_two_nodes` restores).
+    #[cfg(target_os = "linux")]
+    home_mask: Mutex<Vec<usize>>,
     /// Per-pool registration state. `WORKER_TIDS` is a process-wide
     /// snapshot for ADPF and cannot be a construction barrier: another
     /// pool may clear and republish that snapshot concurrently.
@@ -208,6 +213,9 @@ impl Pool {
             shutdown: AtomicBool::new(false),
             spin_budget: AtomicUsize::new(spin_budget),
             oversubscribed: n_workers + 1 > cpus,
+            two_node: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            home_mask: Mutex::new(Vec::new()),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             registered: AtomicUsize::new(0),
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -443,6 +451,270 @@ impl Pool {
         let _ = regions;
     }
 
+    /// The odd workers run on a second NUMA node (`bind_two_nodes`).
+    pub fn two_nodes(&self) -> bool {
+        self.inner.two_node.load(Ordering::Relaxed)
+    }
+
+    /// Worker `w` of a job runs on the far node of a two-node pool (the
+    /// caller, participant `n_workers()`, never does).
+    pub fn far_worker(&self, w: usize) -> bool {
+        w % 2 == 1 && w < self.threads.len() && self.two_nodes()
+    }
+
+    /// Put the odd workers on a second NUMA node, the even ones and the
+    /// caller staying where they are: `(home node, far node, threads at
+    /// home with the caller, threads on the far node)`. Linux with two or
+    /// more nodes; the home node is the one `bind_numa` chose, or `hint`
+    /// where it chose none (a file spread over the nodes), and the node's
+    /// mask is then published for every pool's callers as `bind_numa` does.
+    ///
+    /// WHY: a job that streams weights is bound by the node's memory bus,
+    /// not by its cores. Measured on 2 x EPYC 9554 under a 31-CPU quota:
+    /// 28 threads on one node read 153-180 GB/s (the node gives 220-230),
+    /// 14 + 14 over both nodes with each half's data on its own node read
+    /// 393-421 GB/s. It only pays when the job gives the far workers data
+    /// that lives on their node, so the caller places it there (the far
+    /// workers read it first) and asks `far_worker` for the side of a
+    /// participant; `unbind_two_nodes` takes it back.
+    pub fn bind_two_nodes(&self, hint: Option<usize>) -> Option<(usize, usize, usize, usize)> {
+        #[cfg(target_os = "linux")]
+        {
+            let nw = self.threads.len();
+            let far_n = nw / 2;
+            if far_n < 2 || self.two_nodes() {
+                return None;
+            }
+            let nodes = numa::nodes();
+            if nodes.len() < 2 {
+                return None;
+            }
+            let before = numa::allowed();
+            let mut home_mask = numa::published();
+            let fresh = home_mask.is_empty();
+            let home = if fresh {
+                let home = hint?;
+                home_mask = numa::node_mask(&nodes, home, nw + 1)?;
+                home
+            } else {
+                nodes.iter().find(|(_, cpus)| home_mask.iter().all(|c| cpus.contains(c)))?.0
+            };
+            // the far node: the other node with the most cores, its first SMT siblings when they are enough
+            let mut best: Option<(usize, Vec<usize>)> = None;
+            for (id, cpus) in nodes.iter().filter(|(id, _)| *id != home) {
+                let prim: Vec<usize> = cpus.iter().copied().filter(|&c| numa::primary(c)).collect();
+                let set = if prim.len() >= far_n { prim } else { cpus.clone() };
+                if set.len() >= far_n && best.as_ref().is_none_or(|b| set.len() > b.1.len()) {
+                    best = Some((*id, set));
+                }
+            }
+            let (far, far_cpus) = best?;
+            // each worker moves itself: the tids were registered in spawn order, not in worker order
+            let moved = AtomicUsize::new(0);
+            self.run(&|w, _n| {
+                if w >= nw {
+                    return;
+                }
+                if w % 2 == 0 {
+                    // a pool made before anything was bound has its workers on every node
+                    numa::set_affinity(0, &home_mask);
+                } else if numa::set_affinity(0, &far_cpus) {
+                    let now = numa::allowed();
+                    if !now.is_empty() && now.iter().all(|c| far_cpus.contains(c)) {
+                        moved.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            if moved.load(Ordering::Relaxed) != far_n {
+                let back = if fresh { &before } else { &home_mask };
+                self.run(&|w, _n| {
+                    if w < nw && (fresh || w % 2 == 1) {
+                        numa::set_affinity(0, back);
+                    }
+                });
+                return None;
+            }
+            if fresh {
+                numa::publish(home_mask.clone());
+                numa::adopt_caller();
+            }
+            if let Ok(mut m) = self.inner.home_mask.lock() {
+                *m = home_mask;
+            }
+            self.inner.two_node.store(true, Ordering::Relaxed);
+            tracing::info!("numa: pool on two nodes: {} threads on node {home}, {far_n} on node {far}", nw - far_n + 1);
+            Some((home, far, nw - far_n + 1, far_n))
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
+    /// Tests: mark the pool as on two nodes without moving a thread (a
+    /// kernel then splits its work by side on any host).
+    #[cfg(test)]
+    pub(crate) fn mark_two_nodes(&self, on: bool) {
+        self.inner.two_node.store(on, Ordering::Relaxed);
+    }
+
+    /// Take the odd workers back to the home node (`bind_two_nodes`).
+    pub fn unbind_two_nodes(&self) {
+        if !self.inner.two_node.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let nw = self.threads.len();
+            let home = self.inner.home_mask.lock().map(|m| m.clone()).unwrap_or_default();
+            if !home.is_empty() {
+                self.run(&|w, _n| {
+                    if w % 2 == 1 && w < nw {
+                        numa::set_affinity(0, &home);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Keep the pool's workers on the node of the published mask, or on
+    /// `node` where nothing published one (`bind_numa` chose no node: a
+    /// file spread over them); the caller adopts the same mask.
+    pub fn bind_node(&self, node: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            let mut mask = numa::published();
+            if mask.is_empty() {
+                let Some(m) = numa::node_mask(&numa::nodes(), node, self.threads.len() + 1) else {
+                    return;
+                };
+                numa::publish(m.clone());
+                mask = m;
+            }
+            if let Ok(tids) = self.inner.worker_tids.lock() {
+                for &tid in tids.iter() {
+                    numa::set_affinity(tid, &mask);
+                }
+            }
+            numa::adopt_caller();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = node;
+    }
+
+    /// Put the page-cache pages behind `home` on the home node of a
+    /// two-node pool and the ones behind `far` on its far node (`nodes`,
+    /// as `bind_two_nodes` returned them); both are spans of mapped files.
+    /// `None` where that cannot be done or told: no two-node pool, not
+    /// Linux, spans that are no whole pages of a file this process can
+    /// open.
+    ///
+    /// WHY: a file's pages stay on the node whose thread read them first,
+    /// and a container gets no call that moves them (`move_pages` and
+    /// `mbind` are refused under RunPod's seccomp profile). What it does
+    /// get: drop a span from the page cache (`posix_fadvise(DONTNEED)`)
+    /// and read it again from a thread of the wanted node. Measured on
+    /// 2 x EPYC 9554: a 1 GB range that sat 85-88 % on node 0 came back
+    /// 98.6-99.8 % on node 1, read by 14 threads at 22 GB/s.
+    ///
+    /// A side is read again only when under 90 % of a sample of it sits
+    /// on its node (`on_move` hears the bytes first: on a slow disk it
+    /// takes a while), so a second start moves nothing. Of the first
+    /// `fill` spans of each side, the ones the cache does not hold at all
+    /// are read by their node before anything else places them.
+    pub fn place_file_pages(
+        &self,
+        home: &[&[u8]],
+        far: &[&[u8]],
+        nodes: (usize, usize),
+        fill: usize,
+        on_move: &dyn Fn(usize),
+    ) -> Option<NodePlacement> {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.two_nodes() {
+                return None;
+            }
+            let mut files = Vec::new();
+            let spans = [numa::file_spans(home, &mut files)?, numa::file_spans(far, &mut files)?];
+            let node = [nodes.0, nodes.1];
+            let mut out = NodePlacement::default();
+            // what the cache does not hold: its node reads it first
+            let filled = AtomicUsize::new(0);
+            self.run_sides([spans[0].len().min(fill), spans[1].len().min(fill)], &|s, i| {
+                let sp = &spans[s][i];
+                if !numa::cached(sp) {
+                    numa::read_in(sp);
+                    filled.fetch_add(sp.len, Ordering::Relaxed);
+                }
+            });
+            out.filled = filled.load(Ordering::Relaxed);
+            let mut share = [0.0f64; 2];
+            for s in 0..2 {
+                share[s] = self.side_share(&spans[s], s == 1, node[s], 0)?;
+            }
+            // a side on the wrong node: what the cache holds of it is dropped and read again by its node
+            let todo: [Vec<usize>; 2] = [0, 1].map(|s| {
+                if share[s] >= 0.9 {
+                    return Vec::new();
+                }
+                (0..spans[s].len()).filter(|&i| numa::cached(&spans[s][i])).collect()
+            });
+            out.moved = (0..2).map(|s| todo[s].iter().map(|&i| spans[s][i].len).sum::<usize>()).sum();
+            if out.moved > 0 {
+                on_move(out.moved);
+                for s in 0..2 {
+                    for &i in &todo[s] {
+                        numa::drop_cached(&spans[s][i]);
+                    }
+                }
+                self.run_sides([todo[0].len(), todo[1].len()], &|s, i| numa::read_in(&spans[s][todo[s][i]]));
+                for s in 0..2 {
+                    if !todo[s].is_empty() {
+                        share[s] = self.side_share(&spans[s], s == 1, node[s], 1)?;
+                    }
+                }
+            }
+            (out.home, out.far) = (share[0], share[1]);
+            Some(out)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (home, far, nodes, fill, on_move);
+            None
+        }
+    }
+
+    /// `f(side, i)` for every `i < n[side]`, each side (0 home, 1 far) on
+    /// its own threads of a two-node pool.
+    #[cfg(target_os = "linux")]
+    fn run_sides(&self, n: [usize; 2], f: &(dyn Fn(usize, usize) + Sync)) {
+        let cur = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        self.run(&|w, _n| {
+            let s = usize::from(self.far_worker(w));
+            loop {
+                let i = cur[s].fetch_add(1, Ordering::Relaxed);
+                if i >= n[s] {
+                    break;
+                }
+                f(s, i);
+            }
+        });
+    }
+
+    /// Share of a sample of a side's spans on `node`, the sample read by
+    /// the side's own threads (a page the cache does not hold goes to the
+    /// node of its reader).
+    #[cfg(target_os = "linux")]
+    fn side_share(&self, spans: &[numa::Span], far: bool, node: usize, salt: usize) -> Option<f64> {
+        let side = usize::from(far);
+        let by = numa::sample_nodes(spans, salt, &|maps| {
+            let mut n = [0usize; 2];
+            n[side] = maps.len();
+            self.run_sides(n, &|_s, i| numa::touch(maps[i].0, maps[i].1));
+        });
+        let total: usize = by.iter().sum();
+        (total > 0).then(|| by.get(node).copied().unwrap_or(0) as f64 / total as f64)
+    }
+
     /// Retune an already-created pool for an architecture with a measured
     /// dispatch cadence. The environment remains the operator override; this
     /// hook only changes the automatic default after model geometry is known.
@@ -624,6 +896,42 @@ impl Drop for Pool {
     }
 }
 
+/// Where two sets of file spans sit after `Pool::place_file_pages`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NodePlacement {
+    /// Share of a sample of the home spans on the home node.
+    pub home: f64,
+    /// Share of a sample of the far spans on the far node.
+    pub far: f64,
+    /// Bytes dropped from the page cache and read again by their node.
+    pub moved: usize,
+    /// Bytes the page cache did not hold, read by their node.
+    pub filled: usize,
+}
+
+/// The NUMA node that holds most of the page-cache pages behind `regions`
+/// (spans of mapped files), from a sample of them; `None` where the host
+/// does not tell.
+pub fn file_pages_node(regions: &[&[u8]]) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut files = Vec::new();
+        let spans = numa::file_spans(regions, &mut files)?;
+        let by = numa::sample_nodes(&spans, 0, &|maps| {
+            for &(a, l) in maps {
+                numa::touch(a, l);
+            }
+        });
+        let (node, &pages) = by.iter().enumerate().max_by_key(|(_, c)| **c)?;
+        (pages > 0).then_some(node)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = regions;
+        None
+    }
+}
+
 /// NUMA placement for the pool (see `Pool::bind_numa`).
 #[cfg(target_os = "linux")]
 mod numa {
@@ -660,6 +968,11 @@ mod numa {
         }
     }
 
+    /// The mask `bind_numa` published (empty when it bound nothing).
+    pub(super) fn published() -> Vec<usize> {
+        MASK.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
     pub(super) fn parse_list(s: &str) -> Vec<usize> {
         let mut out = Vec::new();
         for part in s.trim().split(',') {
@@ -683,7 +996,7 @@ mod numa {
         out
     }
 
-    fn nodes() -> Vec<(usize, Vec<usize>)> {
+    pub(super) fn nodes() -> Vec<(usize, Vec<usize>)> {
         let mut v = Vec::new();
         let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") else {
             return v;
@@ -704,7 +1017,7 @@ mod numa {
         v
     }
 
-    fn allowed() -> Vec<usize> {
+    pub(super) fn allowed() -> Vec<usize> {
         // SAFETY: plain syscall into a zeroed, correctly sized set.
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -718,7 +1031,7 @@ mod numa {
     }
 
     /// First SMT sibling of its core (or no topology info: count it).
-    fn primary(cpu: usize) -> bool {
+    pub(super) fn primary(cpu: usize) -> bool {
         let p = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
         match std::fs::read_to_string(p) {
             Ok(l) => parse_list(&l).first().is_none_or(|&f| f == cpu),
@@ -796,7 +1109,7 @@ mod numa {
 
     /// Mapped pages per node of every mapping that overlaps `regions`,
     /// from `/proc/self/maps` (ranges) + `/proc/self/numa_maps` (`N<k>=`).
-    fn numa_maps_nodes(regions: &[&[u8]]) -> Vec<usize> {
+    pub(super) fn numa_maps_nodes(regions: &[&[u8]]) -> Vec<usize> {
         let (Ok(maps), Ok(nm)) = (
             std::fs::read_to_string("/proc/self/maps"),
             std::fs::read_to_string("/proc/self/numa_maps"),
@@ -850,6 +1163,156 @@ mod numa {
         by
     }
 
+    const PAGE: usize = 4096;
+
+    /// Whole pages of a mapped file: where they are mapped, the file's
+    /// descriptor, where they are in the file.
+    pub(super) struct Span {
+        pub addr: usize,
+        pub len: usize,
+        fd: i32,
+        off: i64,
+    }
+
+    /// The whole pages inside each region with the file behind them, from
+    /// `/proc/self/maps`; a region that is not inside one file mapping is
+    /// left out. `None` when nothing is left or a file does not read back
+    /// through its path as it is mapped. `files` keeps the descriptors.
+    pub(super) fn file_spans(regions: &[&[u8]], files: &mut Vec<(String, std::fs::File)>) -> Option<Vec<Span>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        // the file mappings (start, end, offset in the file, path), in address order as the kernel lists them
+        let mut vmas: Vec<(usize, usize, u64, &str)> = Vec::new();
+        for line in maps.lines() {
+            let mut it = line.splitn(6, ' ');
+            let (Some(range), Some(_), Some(off), Some(_), Some(_), Some(path)) =
+                (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
+            else {
+                continue;
+            };
+            let path = path.trim();
+            let Some((a, b)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(a), Ok(b), Ok(off)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16), u64::from_str_radix(off, 16))
+            else {
+                continue;
+            };
+            if path.starts_with('/') {
+                vmas.push((a, b, off, path));
+            }
+        }
+        let mut out = Vec::with_capacity(regions.len());
+        for r in regions {
+            let a = (r.as_ptr() as usize).div_ceil(PAGE) * PAGE;
+            let e = (r.as_ptr() as usize + r.len()) / PAGE * PAGE;
+            if e <= a {
+                continue;
+            }
+            let Some(v) = vmas.get(vmas.partition_point(|v| v.1 <= a)).filter(|v| v.0 <= a && e <= v.1) else {
+                continue;
+            };
+            let off = v.2 + (a - v.0) as u64;
+            let fi = match files.iter().position(|f| f.0 == v.3) {
+                Some(fi) => fi,
+                None => {
+                    let f = std::fs::File::open(v.3).ok()?;
+                    // the same bytes through the descriptor as through the mapping, or the path names another file now
+                    let mut page = [0u8; PAGE];
+                    f.read_exact_at(&mut page, off).ok()?;
+                    // SAFETY: a whole page inside the caller's live region.
+                    if page[..] != unsafe { std::slice::from_raw_parts(a as *const u8, PAGE) }[..] {
+                        return None;
+                    }
+                    files.push((v.3.to_string(), f));
+                    files.len() - 1
+                }
+            };
+            out.push(Span { addr: a, len: e - a, fd: files[fi].1.as_raw_fd(), off: off as i64 });
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Every page of the span is in the page cache.
+    pub(super) fn cached(s: &Span) -> bool {
+        let mut v = vec![0u8; s.len / PAGE];
+        // SAFETY: whole pages of a live mapping, one byte of `v` a page.
+        unsafe { libc::mincore(s.addr as *mut libc::c_void, s.len, v.as_mut_ptr()) == 0 && v.iter().all(|b| b & 1 == 1) }
+    }
+
+    /// Out of this process's page table and out of the page cache (pages
+    /// another process maps or pins stay).
+    pub(super) fn drop_cached(s: &Span) {
+        // SAFETY: a read-only file mapping: the pages come back from the file on the next read.
+        unsafe {
+            libc::madvise(s.addr as *mut libc::c_void, s.len, libc::MADV_DONTNEED);
+            libc::posix_fadvise(s.fd, s.off as libc::off_t, s.len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+
+    /// The calling thread reads the span: what the cache does not hold
+    /// lands on its node.
+    pub(super) fn read_in(s: &Span) {
+        // SAFETY: an advice on whole pages of a live mapping.
+        unsafe { libc::madvise(s.addr as *mut libc::c_void, s.len, libc::MADV_WILLNEED) };
+        touch(s.addr, s.len);
+    }
+
+    /// One byte of every page.
+    pub(super) fn touch(addr: usize, len: usize) {
+        let mut a = addr;
+        while a < addr + len {
+            // SAFETY: a readable mapped byte; volatile so it is not elided.
+            unsafe { std::ptr::read_volatile(a as *const u8) };
+            a += PAGE;
+        }
+    }
+
+    /// Pages per node of a sample of `spans` (up to 192 of them, `salt`
+    /// shifts which). The sample is mapped a second time, since the node
+    /// counts of `/proc/self/numa_maps` are per mapping and cover only
+    /// the pages this process has read through it; `touch_all` reads them
+    /// (address, bytes of each).
+    pub(super) fn sample_nodes(spans: &[Span], salt: usize, touch_all: &dyn Fn(&[(usize, usize)])) -> Vec<usize> {
+        let step = spans.len().div_ceil(192).max(1);
+        let mut maps: Vec<(usize, usize)> = Vec::new();
+        for s in spans.iter().skip(salt * (step / 2) % step).step_by(step) {
+            // SAFETY: a new read-only mapping of an open file, unmapped below.
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), s.len, libc::PROT_READ, libc::MAP_SHARED, s.fd, s.off as libc::off_t) };
+            if p != libc::MAP_FAILED {
+                maps.push((p as usize, s.len));
+            }
+        }
+        touch_all(&maps);
+        // SAFETY: the mappings made above, live until the unmap below.
+        let views: Vec<&[u8]> = maps.iter().map(|&(a, l)| unsafe { std::slice::from_raw_parts(a as *const u8, l) }).collect();
+        let by = numa_maps_nodes(&views);
+        drop(views);
+        for &(a, l) in &maps {
+            // SAFETY: a mapping made above that nothing refers to any more.
+            unsafe { libc::munmap(a as *mut libc::c_void, l) };
+        }
+        by
+    }
+
+    /// The cores of `node` this process may use for `threads`
+    /// participants: its first SMT siblings when they are enough, else
+    /// all of them, else None.
+    pub(super) fn node_mask(nodes: &[(usize, Vec<usize>)], node: usize, threads: usize) -> Option<Vec<usize>> {
+        let cpus = &nodes.iter().find(|(id, _)| *id == node)?.1;
+        let allowed = allowed();
+        let usable: Vec<usize> = cpus.iter().copied().filter(|c| allowed.contains(c)).collect();
+        let prim: Vec<usize> = usable.iter().copied().filter(|&c| primary(c)).collect();
+        if prim.len() >= threads {
+            Some(prim)
+        } else if usable.len() >= threads {
+            Some(usable)
+        } else {
+            None
+        }
+    }
+
     /// (node, cpu mask) for a pool of `threads` participants, or None.
     pub(super) fn choose(regions: &[&[u8]], threads: usize) -> Option<(usize, Vec<usize>)> {
         let env = std::env::var("CMF_NUMA").ok();
@@ -893,17 +1356,7 @@ mod numa {
                 n
             }
         };
-        let cpus = &nodes.iter().find(|(id, _)| *id == node)?.1;
-        let allowed = allowed();
-        let usable: Vec<usize> = cpus.iter().copied().filter(|c| allowed.contains(c)).collect();
-        let prim: Vec<usize> = usable.iter().copied().filter(|&c| primary(c)).collect();
-        if prim.len() >= threads {
-            Some((node, prim))
-        } else if usable.len() >= threads {
-            Some((node, usable))
-        } else {
-            None
-        }
+        Some((node, node_mask(&nodes, node, threads)?))
     }
 
     /// Bind thread `tid` (0 = the calling thread) to `cpus`.

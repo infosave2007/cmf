@@ -126,15 +126,42 @@
  "cards": [
   {
    "label": "12 GB",
-   "decode": 104.9
+   "decode": {
+    "fastcode": 145.0,
+    "strata": 154.1
+   }
   },
   {
    "label": "16 GB",
-   "decode": 117.6
+   "decode": {
+    "fastcode": 174.6,
+    "strata": 192.5
+   }
   },
   {
    "label": "24 GB",
-   "decode": 132.8
+   "decode": {
+    "fastcode": 206.7,
+    "strata": 212.0
+   }
   }
- ]
+ ],
+ "cards_series": [
+  "fastcode",
+  "strata"
+ ],
+ "cards_fill": {
+  "en": {
+   "pct": "94 / 91 / 97 %",
+   "he": "38 / 39 / 39"
+  },
+  "ru": {
+   "pct": "94 / 91 / 97 %",
+   "he": "38 / 39 / 39"
+  },
+  "zh": {
+   "pct": "94 / 91 / 97 %",
+   "he": "38 / 39 / 39"
+  }
+ }
 }

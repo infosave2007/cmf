@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.78] — 2026-11-12
+
+### Changed
+- Qwen3.8 Fast Code on CUDA ([the file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf)) is
+  faster on cards from 12 GB. The host's expert kernel (`qtensor/moe_fast.rs`, the experts the card does not hold)
+  does half the arithmetic: a step reads 64 packed bytes (128 weights) and feeds the low and the high nibbles
+  straight into two chained `vpdpbusd` against the even and the odd columns of a token, the `-8` of the unsigned
+  nibbles folded into one sum per eight columns. The four stages of a call are one dispatch without a barrier:
+  the cores take blocks of gate and up rows from one cursor, the core that ends an expert splits its gate rows and
+  publishes it, and the down rows follow in the order the experts were published.
+  - The host pool works on both NUMA nodes of a two-socket host: the lower rows of every expert matrix are read
+    by the threads of one node, the upper rows by the other's, each from its own node's memory
+    (`CMF_QWEN_CPU_NODES=1` keeps one node). The page placement adds about 14 s to the first start.
+  - RTX 5090 held to the memory of a smaller card (`CMF_GPU_VRAM_MB`), host 2× EPYC 9554 with 31 CPUs and 62 GB
+    for the container, one request at a time, the routing profile loaded, `CMF_QWEN_ROUTE_TAIL=0.05`,
+    `CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` (every expert pinned in RAM). The 3D aquarium spec, answered
+    greedily to the end as a working page, the mean of two runs: 145.0 tok/s within 12 GB (was 104.9), 174.6
+    within 16 GB (was 117.6), 206.7 within 24 GB (was 132.8), 94 / 91 / 97 % of the 2-bit Strata Coder on its own
+    engine with its expert cache at 1 500 / 3 000 / 5 000 experts; 38 / 39 / 39 of the first 40 HumanEval tasks pass.
+  - One expert a window moves into the card's arena by default (`CMF_QWEN_ADMIT`, was four): the copies ride the
+    stream the window waits on. Four gave 128 / 142 / 177 tok/s on the aquarium within 12 / 16 / 24 GB.
+
+### Added
+- The load report of the CUDA path (`CMF_CUDA_DEBUG=1` or `CMF_QWEN_PROF`) says what the card holds before the
+  experts, by kind: hyper-connections, GDN weights and state, QSA weights and attention cache, PLE, routers and
+  shared experts, LM head, MTP head, prompt scratch, tables, and the driver's share.
+- `CMF_QWEN_HEAD_HOST=1`: the MTP head keeps no experts of its own on the card; they take slots by use as the
+  backbone's do, and the host computes the absent ones.
+- `CMF_QWEN_PROF=2`: the host path's own clock, without waiting for the stream at every stage.
+- `CMF_QWEN_CPU_BENCH=<calls>` times the host kernel alone on the model's own experts at load;
+  `CMF_QWEN_CPU_CLAIM=<gate/up>:<down>` (blocks a core takes at a time, default 8:32) and `CMF_QWEN_CPU_PF`
+  (prefetch distance, default off) are its knobs.
+- `CMF_QWEN_STAGERS=<n>` copies the experts the windows keep missing on streams of their own (default 0: on the
+  main stream, the same speed within the noise); `CMF_QWEN_WAIT=poll` polls the stream instead of waiting.
+
 ## [0.8.77] — 2026-11-12
 
 ### Added

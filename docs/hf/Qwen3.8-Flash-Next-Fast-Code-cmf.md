@@ -32,8 +32,9 @@ draft (MTP) head and the n-gram table in one 66.8 GB [CMF](https://github.com/in
 Strata Coder cut of the same model needed a repair turn. The experts fit on one 96 GB card: a prompt is read at
 **~840 tokens/s**, four times the full 512-expert file on the same card, and code is written at **136–166 tokens/s**,
 in 41 GB of VRAM instead of 60. Over CUDA it runs on **cards from 12 GB**: the card keeps the experts that fit and the
-host's cores compute the rest, and the same working aquarium page is written at **105 / 118 / 133 tokens/s** within
-12 / 16 / 24 GB of card memory. It runs with `cortiq`, a Rust inference engine with no Python and no ML framework.
+host's cores compute the rest, and the same working aquarium page is written at **145 / 175 / 207 tokens/s** within
+12 / 16 / 24 GB of card memory: 94 / 91 / 97 % of the 2-bit Strata Coder's speed on the same cards, with the experts
+kept at 4 bits and the attention at 8. It runs with `cortiq`, a Rust inference engine with no Python and no ML framework.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)
 
@@ -54,12 +55,12 @@ Use cortiq 0.8.65 or later ([prebuilt binaries](https://github.com/infosave2007/
 for a direct answer; without it the model reasons first, so raise `--max-tokens`. Each `cortiq run` loads the model
 again; for chat and editors keep it loaded with [`cortiq serve`](#openai-compatible-server).
 
-An NVIDIA card from 12 GB through CUDA (cortiq 0.8.74 or later, built with the `cuda` feature):
+An NVIDIA card from 12 GB through CUDA (cortiq 0.8.78 or later, built with the `cuda` feature):
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
 CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -105,24 +106,29 @@ speeds are the mean of two runs. The n-gram table (28 GB) stays in system RAM in
 
 ## Cards from 12 GB (CUDA)
 
-From cortiq 0.8.74 the CUDA backend serves the file on a card that cannot hold all its experts. The card keeps the
+The CUDA backend serves the file on a card that cannot hold all its experts. The card keeps the
 experts that fit, the busiest of the routing profile first; an expert a token routes to outside of them is computed
 by the host's cores (an AVX-512 VNNI kernel on the 4-bit weights) while the card computes the held ones, and the
-experts a text keeps asking for move to the card between tokens. Within 12 GB the card holds 1 357 of the 12 288
-experts.
+experts a text keeps asking for move to the card between tokens. Within 12 GB the card holds 927 of the 12 288
+experts and the draft head's 512.
 
-| card memory | aquarium page written to the end, tok/s |
-|---|---:|
-| 12 GB | **104.9** |
-| 16 GB | **117.6** |
-| 24 GB | **132.8** |
+| card memory | Fast Code (cortiq), tok/s | Strata Coder (Strata), tok/s | Fast Code against Strata Coder |
+|---|---:|---:|---:|
+| 12 GB | **145.0** | 154.1 | 94 % |
+| 16 GB | **174.6** | 192.5 | 91 % |
+| 24 GB | **206.7** | 212.0 | 97 % |
+| expert weights | 4 bits | 2 bits | |
 
 One RTX 5090 held to the memory shown (`CMF_GPU_VRAM_MB`), host 2× EPYC 9554 with 31 threads and 62 GB of RAM for
-the container, one request at a time, greedy, thinking off, draft tokens on, the command of the quick start. The
-answer is the complete working page in every row. Within 12 GB, 38 of the first 40 HumanEval tasks pass. The host
+the container, one request at a time, greedy, thinking off, draft tokens on, the command of the quick start; the
+aquarium speed is the mean of two runs and the answer is the complete working page in every run. Strata Coder ran
+on the same pod with its expert cache at 1 500 / 3 000 / 5 000 experts, 10.7 / 14.5 / 19.6 GB of the card. Fast
+Code spends its card on more precise weights: the 2-bit cut is smaller and faster to read, and Fast Code's code
+perplexity is the lower one (3.337 against 3.436, [above](#speed-and-accuracy)). Of the first 40 HumanEval tasks
+38 / 39 / 39 pass within 12 / 16 / 24 GB. The host
 needs AVX-512 VNNI (Zen 4, Sapphire Rapids or newer) and eight threads or more; on another host every missing expert
 is copied to the card instead, which is slower. `CMF_QWEN_CPU_EXPERT_THREADS` sets the number of host threads.
-`CMF_QWEN_CUDA_REG=1` keeps the experts outside the card pinned in RAM, so the host never waits on the disk for them.
+`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` keep every expert pinned in RAM, so neither the host nor the card waits on the disk.
 
 ## OpenAI-compatible server
 
@@ -171,7 +177,8 @@ Weights derive from Qwen's release and remain under its license. Review generate
 читается со скоростью **~840 токенов/с** — вчетверо быстрее полного файла на той же карте, — код пишется со скоростью
 **136–166 токенов/с**, в 41 ГБ видеопамяти вместо 60. Через CUDA она работает на **картах от 12 ГБ**: карта держит экспертов, которые
 поместились, остальных считают ядра процессора, и та же рабочая страница аквариума пишется со скоростью
-**105 / 118 / 133 токена/с** в 12 / 16 / 24 ГБ видеопамяти. Запускается движком `cortiq` на Rust, без Python и
+**145 / 175 / 207 токена/с** в 12 / 16 / 24 ГБ видеопамяти — 94 / 91 / 97 % скорости 2-битной Strata Coder на тех же картах, при
+том что эксперты остаются в 4 битах, а внимание — в 8. Запускается движком `cortiq` на Rust, без Python и
 ML-фреймворков.
 
 ![Страница аквариума от Fast Code](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_aquarium.png)
@@ -190,12 +197,12 @@ CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --
 Нужен cortiq 0.8.65 или новее. `--no-think` — ответ без рассуждений; без него поднимите `--max-tokens`. Для чата и
 редакторов держите модель загруженной через `cortiq serve` (OpenAI-совместимый сервер, см. выше).
 
-Карта NVIDIA от 12 ГБ через CUDA (cortiq 0.8.74 или новее, сборка с признаком `cuda`):
+Карта NVIDIA от 12 ГБ через CUDA (cortiq 0.8.78 или новее, сборка с признаком `cuda`):
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
 CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -237,23 +244,28 @@ llama.cpp, CUDA).
 
 ### Карты от 12 ГБ (CUDA)
 
-Начиная с cortiq 0.8.74 CUDA-бэкенд обслуживает файл на карте, куда все эксперты не помещаются. Карта держит тех,
+CUDA-бэкенд обслуживает файл на карте, куда все эксперты не помещаются. Карта держит тех,
 что поместились, начиная с самых востребованных по профилю маршрутизации; эксперта вне карты считают ядра процессора
 (ядро AVX-512 VNNI на 4-битных весах), пока карта считает своих, а эксперты, к которым текст обращается постоянно,
-переезжают на карту между токенами. В 12 ГБ карта держит 1 357 экспертов из 12 288.
+переезжают на карту между токенами. В 12 ГБ карта держит 927 экспертов из 12 288 и 512 экспертов головы черновиков.
 
-| память карты | страница аквариума, написанная до конца, ток/с |
-|---|---:|
-| 12 ГБ | **104.9** |
-| 16 ГБ | **117.6** |
-| 24 ГБ | **132.8** |
+| память карты | Fast Code (cortiq), ток/с | Strata Coder (Strata), ток/с | Fast Code к Strata Coder |
+|---|---:|---:|---:|
+| 12 ГБ | **145.0** | 154.1 | 94 % |
+| 16 ГБ | **174.6** | 192.5 | 91 % |
+| 24 ГБ | **206.7** | 212.0 | 97 % |
+| веса экспертов | 4 бита | 2 бита | |
 
 Одна RTX 5090, ограниченная указанной памятью (`CMF_GPU_VRAM_MB`), хост 2× EPYC 9554 с 31 потоком и 62 ГБ ОЗУ на
-контейнер, один запрос за раз, жадный выбор, без рассуждений, черновики включены, команда из быстрого старта. Ответ
-в каждой строке — полная рабочая страница. В 12 ГБ проходят 38 из первых 40 задач HumanEval. Хосту нужны AVX-512 VNNI
+контейнер, один запрос за раз, жадный выбор, без рассуждений, черновики включены, команда из быстрого старта;
+скорость аквариума — среднее двух запусков, и в каждом ответ — полная рабочая страница. Strata Coder запускалась на
+том же поде с кешем экспертов на 1 500 / 3 000 / 5 000 экспертов — 10,7 / 14,5 / 19,6 ГБ карты. Fast Code тратит
+память карты на более точные веса: 2-битная сборка меньше и быстрее читается, а перплексия на коде ниже у Fast Code
+(3.337 против 3.436, см. выше). Из первых 40 задач HumanEval в 12 / 16 / 24 ГБ проходят 38 / 39 / 39.
+Хосту нужны AVX-512 VNNI
 (Zen 4, Sapphire Rapids и новее) и не меньше восьми потоков; на другом хосте каждый недостающий эксперт копируется на
 карту, что медленнее. `CMF_QWEN_CPU_EXPERT_THREADS` задаёт число потоков хоста.
-`CMF_QWEN_CUDA_REG=1` закрепляет в памяти экспертов вне карты, чтобы хост не ждал их с диска.
+`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` закрепляют в памяти всех экспертов, чтобы ни хост, ни карта не ждали их с диска.
 
 ### Железо и длинный контекст
 
@@ -271,7 +283,7 @@ llama.cpp, CUDA).
 面对 2 151 token 的 3D 水族箱需求说明，它**一次写出可运行的 three.js 页面**（4 次中 4 次）；同一模型的 2 位 Strata Coder 裁剪版需要一轮修复。
 专家可完整放入一张 96 GB 显卡：读取提示约 **840 token/s**，是同卡完整文件的 4 倍；生成代码 **136–166 token/s**，显存 41 GB 而非 60 GB。
 通过 CUDA 可在 **12 GB 起的显卡**上运行：显卡保留放得下的专家，其余由主机 CPU 核心计算，在 12 / 16 / 24 GB 显存内以
-**105 / 118 / 133 token/s** 写出同一可运行的水族箱页面。使用 `cortiq` 运行：Rust 推理引擎，无需 Python 和机器学习框架。
+**145 / 175 / 207 token/s** 写出同一可运行的水族箱页面：在同样的显卡上达到 2 位 Strata Coder 速度的 94 / 91 / 97 %，而专家保持 4 位、注意力保持 8 位。使用 `cortiq` 运行：Rust 推理引擎，无需 Python 和机器学习框架。
 
 ![Fast Code 写出的水族箱页面](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_aquarium.png)
 
@@ -288,12 +300,12 @@ CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --
 需要 cortiq 0.8.65 或更高版本。`--no-think` 直接回答；否则模型先推理，请调大 `--max-tokens`。聊天与编辑器请用
 `cortiq serve`（兼容 OpenAI 的服务器）保持模型常驻。
 
-12 GB 起的 NVIDIA 显卡通过 CUDA 运行（cortiq 0.8.74 或更高版本，启用 `cuda` 特性构建）：
+12 GB 起的 NVIDIA 显卡通过 CUDA 运行（cortiq 0.8.78 或更高版本，启用 `cuda` 特性构建）：
 
 ```bash
 cargo install cortiq-cli --locked --features cuda
 CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
   cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
 ```
 
@@ -321,20 +333,23 @@ CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
 
 ### 12 GB 起的显卡（CUDA）
 
-从 cortiq 0.8.74 起，CUDA 后端可在放不下全部专家的显卡上运行该文件。显卡保留放得下的专家，按路由画像从最常用的开始；
+CUDA 后端可在放不下全部专家的显卡上运行该文件。显卡保留放得下的专家，按路由画像从最常用的开始；
 路由到显卡之外的专家由主机 CPU 核心计算（针对 4 位权重的 AVX-512 VNNI 内核），显卡同时计算已保留的专家；文本反复使用的专家会在
-token 之间迁入显卡。在 12 GB 内，显卡保留 12 288 个专家中的 1 357 个。
+token 之间迁入显卡。在 12 GB 内，显卡保留 12 288 个专家中的 927 个以及草稿头的 512 个。
 
-| 显存 | 完整写出水族箱页面，token/s |
-|---|---:|
-| 12 GB | **104.9** |
-| 16 GB | **117.6** |
-| 24 GB | **132.8** |
+| 显存 | Fast Code（cortiq），token/s | Strata Coder（Strata），token/s | Fast Code 相对 Strata Coder |
+|---|---:|---:|---:|
+| 12 GB | **145.0** | 154.1 | 94 % |
+| 16 GB | **174.6** | 192.5 | 91 % |
+| 24 GB | **206.7** | 212.0 | 97 % |
+| 专家权重 | 4 位 | 2 位 | |
 
 一张 RTX 5090，限制为表中显存（`CMF_GPU_VRAM_MB`），主机为 2× EPYC 9554，容器可用 31 个线程和 62 GB 内存，单路请求，贪心解码，
-关闭思考，开启草稿，命令见快速开始。每一行的回答都是完整可运行的页面。在 12 GB 内，HumanEval 前 40 题通过 38 题。主机需要
+关闭思考，开启草稿，命令见快速开始；水族箱速度为两次运行的平均值，每次的回答都是完整可运行的页面。Strata Coder 在同一台机器上运行，
+专家缓存为 1 500 / 3 000 / 5 000 个专家，占显卡 10.7 / 14.5 / 19.6 GB。Fast Code 把显存用在更精确的权重上：2 位裁剪版更小、读取更快，
+而代码困惑度更低的是 Fast Code（3.337 对 3.436，见上文）。在 12 / 16 / 24 GB 内，HumanEval 前 40 题分别通过 38 / 39 / 39 题。主机需要
 AVX-512 VNNI（Zen 4、Sapphire Rapids 或更新）和至少 8 个线程；否则每个缺失的专家都要复制到显卡，速度更慢。
-`CMF_QWEN_CPU_EXPERT_THREADS` 设置主机线程数。`CMF_QWEN_CUDA_REG=1` 把显卡之外的专家锁定在内存中，主机不必等待磁盘。
+`CMF_QWEN_CPU_EXPERT_THREADS` 设置主机线程数。`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` 把全部专家锁定在内存中，主机和显卡都不必等待磁盘。
 
 ### 硬件与长上下文
 
