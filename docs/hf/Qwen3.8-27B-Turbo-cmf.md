@@ -23,9 +23,11 @@ language:
 # Qwen3.8-27B Turbo — CMF
 
 The 4-bit weights of [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) under a header that holds
-device memory in place on long prompts. It fits a 16 GB card at any prompt length, reads 64 000 tokens
-in 177 s against 316 s, and decodes at 92 tok/s there against 51, with passwords and codes in the text
-still exact. Prompts under 8192 tokens run exact attention, as in the
+device memory in place on long prompts: a 64 000-token prompt takes 15–16 GB, against 22.8 GB for the
+standard file. Through CUDA a 16 GB RTX 2000 Ada keeps pace with an RTX 5090 over Vulkan: 64 000 tokens to
+the first token in 175 s (177 on the 5090), then 94 tok/s (92). An RTX 3090 through CUDA writes a summary of
+100 000 characters at 80 tok/s. Passwords and codes in the text stay exact: facts planted in 100 000
+characters come back 8 times of 8. Prompts under 8192 tokens run exact attention, as in the
 [standard file](https://huggingface.co/infosave/Qwen3.8-27B-cmf). It is one
 [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no Python
 and no ML framework.
@@ -83,7 +85,9 @@ accepted ones only. Greedy text stays the same with and without drafts.
 
 ![Standard and turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/compare_en.png)
 
-RTX 5090, Vulkan, `cortiq bench --core`, 60 tokens after a prompt of that length.
+`cortiq bench --core`, 60 tokens after a prompt of that length. The orange and blue lines are an RTX 5090
+over Vulkan (the table below); the green one is the turbo file through CUDA on a 16 GB RTX 2000 Ada,
+cortiq 0.8.71: it stays at 15.0 GB and matches the 5090 from 16 000 tokens on.
 
 | prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak VRAM, GB (standard) | peak VRAM, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -100,27 +104,10 @@ A real answer, 400 tokens of a summary of Wikipedia articles, with about half of
 | 30 000 characters | 19.2 | **18.6** | 76.4 | **76.3** |
 | 100 000 characters | 76.7 | **72.1** | 50.9 | **60.4** |
 
-**On a 16 GB card.** With the budget of such a card set on the same 5090 (`CMF_GPU_VRAM_MB=15000`), the
-file seals at 4096 rows and stays at 15.0 GB. First token 43 s at 16 000, 87 s at 32 000, 176 s at
-64 000, decode 92 tok/s.
-
-A real 16 GB card, an RTX 2000 Ada, holds the file in 14.2 GB on a short prompt. `cortiq run --greedy --no-think`,
-220 tokens of an answer:
-
-| answer | without drafts, tok/s | with drafts, tok/s |
-|---|---:|---:|
-| an essay | 13.3 | **20.5** |
-| an explanation in Russian | 13.4 | **21.0** |
-| a Rust function with tests | 13.4 | **24.4** |
-| quotes from the prompt | 13.1 | **25.1** |
-| an edit of the prompt's code | 13.1 | **28.4** |
-
-In a chat the depth of the draft chain settles on the card's own round times: of five turns in one process the
-second to the fifth run at 29.8 tok/s.
-
-**On NVIDIA through CUDA.** A 16 GB card, the RTX 2000 Ada, cortiq 0.8.71, `cortiq bench --core`, 60 tokens
-after a prompt of that length, drafts on (the bench's text repeats, so most of them hold). The whole run stays
-within 15.0 GB, the prompt included (14.8 GB over Vulkan).
+**On a 16 GB card through CUDA.** An RTX 2000 Ada, cortiq 0.8.71, the same bench (its text repeats, so most
+drafts hold). The whole run stays within 15.0 GB, the prompt included; the standard file runs out of this
+card's memory at 16 000 tokens. Against Vulkan on the same card CUDA reaches the first token 1.4–1.6 times
+sooner and decodes 3.1–3.7 times faster.
 
 ![Qwen3.8-27B Turbo on CUDA](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_en.png)
 
@@ -133,9 +120,11 @@ within 15.0 GB, the prompt included (14.8 GB over Vulkan).
 | 64 000 | **174.6** | 277.9 | **93.8** | 26.5 | 15.0 / 14.8 |
 
 A real answer, a summary of 100 000 characters of Wikipedia, up to 400 tokens: first token in 69.8 s, then
-31.5 tok/s (13.8 without drafts, the same text); over Vulkan 114.3 s and 21.3 tok/s. Facts in 60 000 and
-100 000 characters: 8 of 8. The standard file runs out of this card's memory at 16 000 tokens. On an RTX 3090
-past the seal: 118–128 tok/s in the bench, 80.3 tok/s on the same summary.
+31.5 tok/s, the same text without drafts (Vulkan: 114.3 s and 21.3 tok/s). Facts in 60 000 and 100 000
+characters: 8 of 8.
+
+**On an RTX 3090 through CUDA** the turbo file decodes at 118–128 tok/s past the seal in the same bench and
+writes the summary of 100 000 characters at 80.3 tok/s.
 
 **On a Mac.** The machine is a MacBook Air M4 with 24 GB: no fan, so long runs slow down as it heats, and the
 base M4's memory bus, 120 GB/s by Apple's figure and 92 to 95 GB/s as measured. A token reads 13.6 GB of weights,
@@ -221,9 +210,11 @@ application No. 19/738,763; see
 ## Документация на русском
 
 4-битные веса [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) с заголовком, который держит память
-карты на месте при длинных промптах. Файл помещается на карту 16 ГБ при любой длине промпта, читает
-64 000 токенов за 177 с вместо 316 и декодирует там 92 ток/с вместо 51, а пароли и коды в тексте остаются
-точными. Промпты короче 8192 токенов идут с точным вниманием, как в
+карты на месте при длинных промптах: промпт в 64 000 токенов занимает 15–16 ГБ против 22,8 ГБ у обычного
+файла. Через CUDA RTX 2000 Ada с 16 ГБ идёт вровень с RTX 5090 через Vulkan: 64 000 токенов до первого
+токена за 175 с (177 на 5090), затем 94 ток/с (92). RTX 3090 через CUDA пишет пересказ 100 000 символов на
+80 ток/с. Пароли и коды в тексте остаются точными: факты, вставленные в 100 000 символов, возвращаются 8 раз
+из 8. Промпты короче 8192 токенов идут с точным вниманием, как в
 [обычном файле](https://huggingface.co/infosave/Qwen3.8-27B-cmf). Это один
 [CMF](https://github.com/infosave2007/cmf)-файл для `cortiq`, движка на Rust без Python и ML-фреймворков.
 
@@ -278,7 +269,9 @@ CMF_GPU=cuda cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
 
 ![Обычный файл и турбо](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/compare_ru.png)
 
-RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промпта этой длины.
+`cortiq bench --core`, 60 токенов после промпта этой длины. Оранжевая и синяя линии — RTX 5090 через Vulkan
+(таблица ниже); зелёная — турбо-файл через CUDA на RTX 2000 Ada с 16 ГБ, cortiq 0.8.71: он держится в 15,0 ГБ
+и с 16 000 токенов идёт вровень с 5090.
 
 | промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик VRAM, ГБ (обычный) | пик VRAM, ГБ (**турбо**) |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -295,27 +288,10 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 | 30 000 символов | 19,2 | **18,6** | 76,4 | **76,3** |
 | 100 000 символов | 76,7 | **72,1** | 50,9 | **60,4** |
 
-**На карте 16 ГБ.** С бюджетом такой карты на той же 5090 (`CMF_GPU_VRAM_MB=15000`) файл запечатывает на
-4096 строках и держится на 15,0 ГБ. Первый токен: 43 с на 16 000, 87 с на 32 000, 176 с на 64 000, декод
-92 ток/с.
-
-Настоящая карта на 16 ГБ, RTX 2000 Ada, держит файл в 14,2 ГБ на коротком промпте. `cortiq run --greedy --no-think`,
-220 токенов ответа:
-
-| ответ | без черновиков, ток/с | с черновиками, ток/с |
-|---|---:|---:|
-| эссе | 13,3 | **20,5** |
-| объяснение на русском | 13,4 | **21,0** |
-| функция на Rust с тестами | 13,4 | **24,4** |
-| цитаты из промпта | 13,1 | **25,1** |
-| правка кода из промпта | 13,1 | **28,4** |
-
-В чате глубина цепочки черновиков подстраивается под время раундов самой карты: из пяти ходов одного процесса
-ходы со второго по пятый идут на 29,8 ток/с.
-
-**На NVIDIA через CUDA.** Карта на 16 ГБ, RTX 2000 Ada, cortiq 0.8.71, `cortiq bench --core`, 60 токенов
-после промпта такой длины, с черновиками (текст бенча повторяется, поэтому большинство из них принимается).
-Весь прогон вместе с промптом держится в пределах 15,0 ГБ (через Vulkan 14,8 ГБ).
+**На карте 16 ГБ через CUDA.** RTX 2000 Ada, cortiq 0.8.71, тот же бенч (его текст повторяется, поэтому
+большинство черновиков принимается). Весь прогон вместе с промптом держится в 15,0 ГБ; обычному файлу на
+16 000 токенов памяти этой карты не хватает. Против Vulkan на той же карте CUDA доходит до первого токена в
+1,4–1,6 раза быстрее и декодирует в 3,1–3,7 раза быстрее.
 
 ![Qwen3.8-27B Turbo на CUDA](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_ru.png)
 
@@ -328,9 +304,11 @@ RTX 5090, Vulkan, `cortiq bench --core`, 60 токенов после промп
 | 64 000 | **174,6** | 277,9 | **93,8** | 26,5 | 15,0 / 14,8 |
 
 Реальный ответ — пересказ 100 000 символов Википедии, до 400 токенов: первый токен через 69,8 с, затем
-31,5 ток/с (13,8 без черновиков, тот же текст); через Vulkan 114,3 с и 21,3 ток/с. Факты в 60 000 и 100 000
-символов: 8 из 8. Обычному файлу на 16 000 токенов не хватает памяти этой карты. На RTX 3090 после печати:
-118–128 ток/с в бенче, 80,3 ток/с на том же пересказе.
+31,5 ток/с, тот же текст и без черновиков (Vulkan: 114,3 с и 21,3 ток/с). Факты в 60 000 и 100 000 символов:
+8 из 8.
+
+**На RTX 3090 через CUDA** турбо-файл после печати декодирует 118–128 ток/с в том же бенче и пишет пересказ
+100 000 символов на 80,3 ток/с.
 
 **На Маке.** Машина — MacBook Air M4, 24 ГБ: без вентилятора, поэтому на долгих прогонах она греется и
 замедляется, и с шиной памяти базового M4 — 120 ГБ/с по данным Apple, 92–95 ГБ/с по замеру. Токен читает 13,6 ГБ
@@ -414,7 +392,7 @@ cortiq far-turbo qwen38-27b-q4tp.cmf qwen38-27b-turbo.cmf --exact-weights keep27
 
 ## 中文说明
 
-[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) 的 4 位权重,文件头让长提示下的显存保持不变。任何长度的提示都能放进 16 GB 显卡;读取 64 000 个 token 用时 177 秒(普通文件 316 秒),此后解码 92 tok/s(普通文件 51 tok/s),文本中的密码和编码依然精确。短于 8192 个 token 的提示使用精确注意力,与[普通文件](https://huggingface.co/infosave/Qwen3.8-27B-cmf)相同。这是一个供 `cortiq` 使用的 [CMF](https://github.com/infosave2007/cmf) 文件。`cortiq` 是 Rust 推理引擎,不需要 Python,也不需要机器学习框架。
+[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) 的 4 位权重,文件头让长提示下的显存保持不变:64 000 个 token 的提示占用 15–16 GB,普通文件为 22.8 GB。通过 CUDA,16 GB 的 RTX 2000 Ada 与走 Vulkan 的 RTX 5090 不相上下:64 000 个 token 的首个 token 用时 175 秒(5090 为 177 秒),之后 94 tok/s(5090 为 92)。RTX 3090 通过 CUDA 以 80 tok/s 写出 100 000 个字符的概括。文本中的密码和编码依然精确:植入 100 000 个字符中的事实 8 次全部答对。短于 8192 个 token 的提示使用精确注意力,与[普通文件](https://huggingface.co/infosave/Qwen3.8-27B-cmf)相同。这是一个供 `cortiq` 使用的 [CMF](https://github.com/infosave2007/cmf) 文件。`cortiq` 是 Rust 推理引擎,不需要 Python,也不需要机器学习框架。
 
 ### 快速开始
 
@@ -456,7 +434,7 @@ CMF_GPU=cuda cortiq serve qwen38-27b-turbo.cmf --port 8080 --host 127.0.0.1
 
 ![普通文件与 turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/compare_zh.png)
 
-RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 token。
+`cortiq bench --core`,在该长度的提示之后生成 60 个 token。橙线和蓝线是走 Vulkan 的 RTX 5090(见下表);绿线是 turbo 文件在 16 GB RTX 2000 Ada 上走 CUDA,cortiq 0.8.71:显存保持在 15.0 GB,从 16 000 个 token 起与 5090 不相上下。
 
 | 提示,token 数 | 首个 token,秒(普通) | 首个 token,秒(**turbo**) | 解码,tok/s(普通) | 解码,tok/s(**turbo**) | 显存峰值,GB(普通) | 显存峰值,GB(**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -473,21 +451,7 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 30 000 字符 | 19.2 | **18.6** | 76.4 | **76.3** |
 | 100 000 字符 | 76.7 | **72.1** | 50.9 | **60.4** |
 
-**在 16 GB 显卡上。** 在同一张 5090 上设置这种显卡的预算(`CMF_GPU_VRAM_MB=15000`),文件在 4096 行封存,保持在 15.0 GB。首个 token:16 000 时 43 秒,32 000 时 87 秒,64 000 时 176 秒,解码 92 tok/s。
-
-真正的 16 GB 显卡 RTX 2000 Ada 在短提示下占用 14.2 GB。`cortiq run --greedy --no-think`,回答 220 个 token:
-
-| 回答 | 不带草稿,tok/s | 带草稿,tok/s |
-|---|---:|---:|
-| 一篇文章 | 13.3 | **20.5** |
-| 俄语讲解 | 13.4 | **21.0** |
-| 带测试的 Rust 函数 | 13.4 | **24.4** |
-| 引用提示中的原文 | 13.1 | **25.1** |
-| 修改提示中的代码 | 13.1 | **28.4** |
-
-在对话中,草稿链的深度按该显卡自身的轮次耗时调整:同一进程的五轮对话里,第二到第五轮为 29.8 tok/s。
-
-**NVIDIA（CUDA）。** 一块 16 GB 显卡 RTX 2000 Ada，cortiq 0.8.71，`cortiq bench --core`，在该长度的提示之后生成 60 个 token，开启草稿（bench 的文本是重复的，所以大多数草稿被接受）。整个运行连同提示都不超过 15.0 GB（走 Vulkan 为 14.8 GB）。
+**16 GB 显卡上走 CUDA。** RTX 2000 Ada,cortiq 0.8.71,同样的 bench(文本是重复的,所以大多数草稿被接受)。整个运行连同提示都不超过 15.0 GB;普通文件在 16 000 个 token 时超出这块显卡的显存。与同一显卡上的 Vulkan 相比,CUDA 首个 token 快 1.4–1.6 倍,解码快 3.1–3.7 倍。
 
 ![CUDA 上的 Qwen3.8-27B Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf/resolve/main/assets/cuda_zh.png)
 
@@ -499,7 +463,9 @@ RTX 5090,Vulkan,`cortiq bench --core`,在该长度的提示之后生成 60 个 t
 | 32 000 | **86.2** | 135.6 | **93.5** | 26.7 | 15.0 / 14.8 |
 | 64 000 | **174.6** | 277.9 | **93.8** | 26.5 | 15.0 / 14.8 |
 
-真实回答——概括 100 000 个字符的维基百科,最多 400 个 token:首个 token 69.8 秒,之后 31.5 tok/s(不用草稿 13.8,文本相同);走 Vulkan 为 114.3 秒、21.3 tok/s。60 000 和 100 000 字符中的事实:8/8。普通文件在 16 000 token 时超出这块显卡的显存。RTX 3090 上封存之后:bench 中 118–128 tok/s,同一概括 80.3 tok/s。
+真实回答——概括 100 000 个字符的维基百科,最多 400 个 token:首个 token 69.8 秒,之后 31.5 tok/s,不用草稿时文本相同(Vulkan:114.3 秒、21.3 tok/s)。60 000 和 100 000 字符中的事实:8/8。
+
+**RTX 3090 走 CUDA** 时,turbo 文件封存之后在同样的 bench 中解码 118–128 tok/s,以 80.3 tok/s 写出 100 000 个字符的概括。
 
 **在 Mac 上。** 测量机器是 MacBook Air M4,24 GB:没有风扇,长时间运行会发热降速;内存总线是基础版 M4 的,Apple 标称 120 GB/s,实测 92 到 95 GB/s。每个 token 要读取 13.6 GB 权重,所以速度由总线决定:不带草稿时 6.4 tok/s。M4 Pro 的总线标称 273 GB/s,M4 Max 最高 546 GB/s;这些机器没有测量。
 
