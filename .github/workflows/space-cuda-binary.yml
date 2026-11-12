@@ -1,0 +1,37 @@
+name: CUDA Linux binary for the cmf-animate Space
+
+# A one-off build on a branch of its own: the release tag's source with
+# `--features gpu,phonon,cuda`, on ubuntu-22.04 so the binary needs glibc
+# 2.35 at most (the HF Space images are Debian bookworm, 2.36). The CUDA
+# libraries are opened at run time, so no toolkit is needed here.
+on:
+  push:
+    branches: [space-cuda-binary]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Build
+        run: cargo build --locked --release -p cortiq-cli --features gpu,phonon,cuda
+      - name: Package
+        run: |
+          set -e
+          bin=target/release/cortiq
+          ./$bin --version
+          echo "glibc symbols needed:"; objdump -T $bin | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
+          ldd $bin
+          tar -C target/release -czf cortiq-0.8.76-cuda-x86_64-unknown-linux-gnu.tar.gz cortiq
+          sha256sum cortiq-0.8.76-cuda-x86_64-unknown-linux-gnu.tar.gz | tee cortiq-0.8.76-cuda-x86_64-unknown-linux-gnu.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cortiq-cuda-linux
+          path: cortiq-0.8.76-cuda-x86_64-unknown-linux-gnu.tar.gz*
+          retention-days: 30
