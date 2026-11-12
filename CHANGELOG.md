@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.76] — 2026-11-12
+
+### Added
+- MiniMax-H3-Turbo (`cortiq animate`, [the file](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf)) runs its
+  video transformer as the resident chain of MiniMax-H3-Image on CUDA, Vulkan and Metal: the stream of a sampling
+  step stays on the GPU from the first block to the last. Until now only the text refiner and the image model
+  took that chain, and the video forward went block by block through the per-operation paths. RTX A5000, release
+  build, 512 x 288, 39 frames, four steps:
+  - **CUDA**: 19.5 s, was 165.1 s (denoising 7.7 s instead of 131.9 s). Within `CMF_GPU_VRAM_MB=8000` 21.1 s,
+    within 4000 22.4 s at a peak of 3.8 GB.
+  - **Vulkan**: 25.8 s, was 97.2 s on the per-operation path (denoising 10.3 s instead of 57.0 s, the video VAE
+    5.8 s instead of 27.5 s). Within 8000 28.9 s, within 6000 35.3 s, the clip identical to the one without a
+    ceiling; under 4000 the video VAE leaves the resident path (63.7 s).
+  - **Metal**, MacBook Air M4, the `clipproj4b` file, 512 x 256: 157 s, was 183 s. The transformer's products run
+    at 2.8 TFLOP/s of the M4's about 3.5.
+  - Five seconds at 768 x 448 (124 frames): 94.4 s on CUDA, 111.6 s over Vulkan.
+  - One forward against the host's f32 arithmetic: 0.3 % on CUDA, 1.2 % over Vulkan. `CMF_MMH3_CHAIN=0` keeps
+    the per-operation path; `CMF_ANIM_DUMP=<prefix>` writes each sampling step's velocities.
+- CUDA: the audio decoder's convolutions run on the card (`gpu_cuda::h3_conv1d`, kernel `cv_im2col1d`: the
+  column matrix is gathered on the card and only the input crosses the bus), and `gpu::gemm_nt_f32` has a CUDA
+  arm. The audio VAE of the clip above: 3.9 s instead of 25.8 s on the host.
+
+### Fixed
+- `cortiq animate` on Vulkan with a 24 GB card ended with `wgpu error: Out of Memory` after the prompt encoder
+  (0.8.75): the encoder's resident chain kept its 12.7 GB of weights on the card and the video generator never
+  declared a stage done. It now releases the card after the prompt encoder, after denoising and after the video
+  VAE, as the image generator does.
+
 ## [0.8.75] — 2026-11-12
 
 ### Added
