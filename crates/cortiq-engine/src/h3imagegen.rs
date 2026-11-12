@@ -361,10 +361,12 @@ fn generate_inner(
         // "Picture i: " and a vision block BEFORE the prompt, and
         // separately conditions the DiT as a latent. Both halves come
         // from the same file, each at its own size policy.
-        // On the native CUDA backend the tower's products and attention run
-        // on the card (its matrices as f32 planes); elsewhere it keeps the
-        // host path the video pipeline uses.
-        let tower = if crate::gpu::cuda_active() && crate::gpu::enabled_here() {
+        // On a GPU backend the tower runs on the card with its matrices as
+        // f32 planes: the encoder layers resident where the backend has
+        // that (Vulkan, Metal), its products and attention one by one on
+        // CUDA; without a device it keeps the host path the video pipeline
+        // uses.
+        let tower = if crate::gpu::enabled_here() {
             VisionTower::from_cmf_device(&model)?
         } else {
             VisionTower::from_cmf(&model)?

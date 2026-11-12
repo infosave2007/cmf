@@ -4,8 +4,9 @@
 
 [MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) 用六个采样步生成和编辑 4 到 16
 百万像素的图片。cortiq 从一个 24.6 GB 的 CMF 文件运行它：其中有扩散 Transformer（200 亿参数，4 位）、
-带视觉塔的 Qwen3-VL 提示词编码器（4 位）和图像 VAE（8 位）。在 NVIDIA 显卡上，整条流水线走原生 CUDA
-后端；在其他 GPU 上走 Vulkan 或 Metal。显存上限让它可以在小显卡上运行。
+带视觉塔的 Qwen3-VL 提示词编码器（4 位）和图像 VAE（8 位）。它在 NVIDIA 显卡上走原生 CUDA 后端，也可以
+走 Vulkan，在 Apple 芯片上走 Metal；三种后端下，图片从 Transformer 的第一个块到最后一个块都留在 GPU 上。
+在 CUDA 和 Vulkan 上，显存上限让它可以在小显卡上运行。
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -15,7 +16,7 @@ CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
 # 6 GB 显卡
 CMF_GPU=cuda CMF_GPU_VRAM_MB=6000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
-# Vulkan（任何厂商）和 Metal：默认后端
+# Vulkan 和 Metal：默认后端（显存上限在 Vulkan 上同样有效）
 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 ```
 
@@ -68,6 +69,19 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 
 4 GB 上限下得到的是同一张图片：与无上限运行相比 PSNR 为 49.6 dB。
 
+在 Vulkan 上，同一个变量是权重的预算。放得下的块留在显卡上；其余的块每一步分批流经显卡，每批不超过
+1 GB。2048 x 2048，Vulkan，NVIDIA RTX A5000, 24 GB：
+
+| 上限 | 总计，秒 | 每步，秒 | 显存峰值，MiB |
+|---|---:|---:|---:|
+| 无 | 32.8 | 4.02 | 12 673 |
+| `CMF_GPU_VRAM_MB=12000` | 32.2 | 4.02 | 11 962 |
+| `CMF_GPU_VRAM_MB=8000` | 38.1 | 5.17 | 8 560 |
+| `CMF_GPU_VRAM_MB=6000` | 41.6 | 5.71 | 6 647 |
+| `CMF_GPU_VRAM_MB=4000` | 46.8 | 6.64 | 4 754 |
+
+任何上限下的图片都与无上限时逐位相同。显存峰值超出上限不到 0.8 GB。
+
 ## 速度
 
 NVIDIA RTX 2000 Ada, 16 GB，一张图片，种子 42，单次运行（2048 x 2048 为三次的中位数）。
@@ -78,7 +92,26 @@ NVIDIA RTX 2000 Ada, 16 GB，一张图片，种子 42，单次运行（2048 x 20
 | CUDA，2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA，4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA，2048 x 2048 编辑，一张 1024 x 1024 参考图 | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
-| Vulkan，1024 x 1024（`--min-area 1024`） | 13.0 | 70.0 | 10.99 | 4.0 | **88.7** | 12 529 |
+
+NVIDIA RTX A5000, 24 GB，同一个文件在两个后端上，单次运行。
+
+| 运行 | CUDA：每步，秒 | CUDA：总计，秒 | Vulkan：每步，秒 | Vulkan：总计，秒 | Vulkan：显存峰值，MiB |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024（`--min-area 1024`） | 0.90 | 10.8 | 1.15 | **16.2** | 12 673 |
+| 2048 x 2048 | 3.31 | 24.8 | 4.01 | **33.7** | 12 673 |
+| 4096 x 4096 | 21.69 | 138.6 | 21.59 | **142.3** | 13 759 |
+| 1024 x 1024 编辑，一张 1024 x 1024 参考图 | 2.34 | 25.4 | 2.85 | **30.6** | 13 824 |
+| 2048 x 2048 编辑，一张 1024 x 1024 参考图 | 5.49 | 45.1 | 6.16 | **52.1** | 13 824 |
+
+MacBook Air M4, 24 GB，Metal，单次运行。
+
+| 运行 | 提示词，秒 | 六步，秒 | 每步，秒 | 解码，秒 | 总计，秒 | 进程内存峰值，MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024 x 1024（`--min-area 1024`） | 12.0 | 119.3 | 20.23 | 2.9 | **138.8** | 10 654 |
+| 2048 x 2048 | 12.3 | 537.2 | 89.96 | 12.7 | **565.8** | 8 551 |
+| 1024 x 1024 编辑，一张 1024 x 1024 参考图 | 55.0 | 366.2 | 61.17 | 2.9 | **431.6** | 12 604 |
+
+MacBook Air 没有风扇，机身变热后会降速：1024 x 1024 的一步在冷机上是 18 秒，热机上是 20 到 22 秒。
 
 ## 在 CUDA 上如何运行
 
@@ -95,7 +128,21 @@ NVIDIA RTX 2000 Ada, 16 GB，一张图片，种子 42，单次运行（2048 x 20
 - **VAE** 把 256 像素的瓦片分批通过同一条链解码；编辑的参考图片由一条卷积链编码（im2col 面板，每个卷积
   一次乘积）。
 
-在 Vulkan 和 Metal 上，流水线使用 MiniMax-H3 视频路径的逐算子内核：每个块的激活都要往返主机。
+## 在 Vulkan 和 Metal 上
+
+同样的链，按每个后端自己的矩阵单元编写。
+
+- **Vulkan。** 乘积直接在显卡的 16 x 16 矩阵单元上读取 4 位张量（`VK_KHR_cooperative_matrix`，f16 操作数，
+  f32 累加）：在 RTX A5000 上达到 50 到 58 TFLOP/s，这张卡的纯矩阵单元上限是 103。注意力是直接读取 q/k/v
+  面板的 flash 内核。提示词编码器以同样方式运行，使用因果的分组注意力；VAE 解码器每批处理最多 41 个瓦片；
+  编辑的参考图片由卷积编码，卷积在乘积内部收集各个抽头，不需要 im2col 面板。一个阶段的权重以自己的编码
+  留在显卡上，或者在上限下流经显卡。
+- **Metal。** Transformer 的乘积在为 8 x 8 simdgroup 矩阵准备数据时解量化 4 位瓦片，并从文件映射中原地读取
+  权重。提示词编码器的权重逐层经过一个缓冲区，VAE 解码器的权重放在自己的缓冲区里：在内存小于文件的 Mac
+  上，原地读取会让 GPU 先把文件的一个 13 GB 窗口换入内存。
+
+Vulkan 的链需要 16 x 16 半精度协作矩阵和 32 线程的子组，NVIDIA RTX 显卡具备这些条件。没有这些条件时，
+或者设置了 `CMF_H3_WGPU=0`、`CMF_H3_METAL=0` 时，流水线使用 MiniMax-H3 视频路径的逐算子内核。
 
 ## 打包
 
@@ -114,9 +161,12 @@ cortiq animate-pack --out minimax-h3-image-q4tp.cmf \
 ## 做过的检查
 
 - 链与逐算子路径（每个乘积是单独的 f32 GEMM）在 2048 x 2048 编辑上对比：图片间 PSNR 54.0 dB。
-- CUDA 与 Vulkan，1024 x 1024，同一种子：47.0 dB。
-- 4 GB 上限与无上限：49.6 dB。
-- VAE 解码器的链与逐算子路径：47.5 dB；与 f16 权重：48.5 dB。
+- RTX A5000 上 Vulkan 与 CUDA 对比，同一种子：1024 x 1024 为 45.9 dB，2048 x 2048 为 44.5 dB，
+  4096 x 4096 为 40.3 dB，1024 x 1024 编辑为 43.8 dB。Metal 与这些 CUDA 图片对比：1024 x 1024 为 47.2 dB，
+  2048 x 2048 为 43.7 dB。
+- CUDA 上 4 GB 上限与无上限：49.6 dB。Vulkan 上 12、8、6 和 4 GB 上限下的图片与无上限时完全相同。
+- Vulkan 和 Metal 上提示词编码器的输出与逐算子路径对比：相差不超过 4e-4（相对 RMS）。
+- VAE 解码器的链与逐算子路径：CUDA 上 47.5 dB，Vulkan 上 65.6 dB，Metal 上 66.3 dB；与 f16 权重：48.5 dB。
 - `CMF_H3_SAT=1` 统计面板中达到饱和值的 f16 数：文生图和编辑运行中都没有。
 - 同一 Transformer 下换用 8 位提示词编码器：条件状态相差 3 %（相对 RMS），图片相差 17.7 到 25.4 dB，
   细节水平相同。文件保留 4 位。
@@ -127,11 +177,12 @@ cortiq animate-pack --out minimax-h3-image-q4tp.cmf \
 | 变量 | 作用 |
 |---|---|
 | `CMF_GPU=cuda` | 原生 CUDA 后端（用 `--features cuda` 构建） |
-| `CMF_GPU_VRAM_MB=N` | 显存上限 |
+| `CMF_GPU_VRAM_MB=N` | 显存上限（CUDA 和 Vulkan） |
 | `CMF_CUDA_PROF=1` | 链的各阶段耗时（同步，较慢） |
 | `CMF_H3_SAT=1` | 统计链中面板的饱和 f16 数和最大幅值 |
 | `CMF_MMH3_CHAIN=0`、`CMF_TE_CHAIN=0`、`CMF_VAE3D_CHAIN=0` | Transformer、编码器、VAE 走逐算子路径 |
 | `CMF_H3_FLASH=0` | 注意力按块用两次批量乘积计算，不用 flash 内核 |
+| `CMF_H3_WGPU=0`、`CMF_H3_METAL=0` | Vulkan、Metal 走逐算子路径 |
 | `CMF_LATENT_OUT=FILE`、`CMF_INIT_LATENT=FILE` | 写出最终 latent；从给定噪声开始 |
 | `CMF_TE_DUMP=FILE`、`CMF_TE_LOAD=FILE`、`CMF_TE_FROM=FILE.cmf` | 写出提示词条件；使用另一次运行的条件；从另一个容器取编码器 |
 
@@ -141,7 +192,8 @@ cortiq animate-pack --out minimax-h3-image-q4tp.cmf \
   1024 x 1024 上（`--width 1024 --height 1024 --min-area 1024`）是干净的，较柔和的图片在 2048 x 2048 上
   的编辑也是干净的。8 位编码器、8 位 Transformer 和 f32 逐算子路径给出相同结果，因此排除了编码和链；
   原因尚未找到。
-- Vulkan 逐算子运行，在同一张显卡上比 CUDA 慢 5.5 倍。Metal 使用相同的内核，尚未测量。
+- Vulkan 的链需要 NVIDIA RTX 显卡（16 x 16 半精度协作矩阵，32 线程的子组）。其他显卡走逐算子路径，慢几倍。
+- 在 24 GB 的 Mac 上，文件比内存大：每个阶段都要从磁盘重新读取自己的部分。
 - 注意力内核需要支持 `mma.sync` 的张量核心（compute capability 8.0 及以上）；更老的显卡改用两次批量乘积。
 - 语言模型 turbo 文件的远场（O(1)）注意力在这里不适用：在 2048 x 2048 上用模型自己的操作数评估，
   它会让注意力输出改变 12 % 到 65 %。

@@ -140,6 +140,95 @@ mod imp {
         }
     }
 
+    /// `h3 [M …]`: the four GEMM sites of a MiniMax-H3 DiT block (hidden 5376,
+    /// 56 heads of 128, FFN 14336) at the row counts of a 1024² and a 2048²
+    /// image: `zi_mm` over an f16 plane, the expansion of the q4tp tensor
+    /// into that plane, and `zi_mm` reading the q4tp tensor itself; then the
+    /// attention. `ZB_Q4_TILES=bm,bn,bk,wm,wn;…` adds q4 tiles.
+    fn cmd_h3(args: &[String]) {
+        const SH: [(&str, usize, usize, Epi); 4] = [
+            ("qkv", 21504, 5376, Epi::F16),
+            ("out", 5376, 7168, Epi::F32),
+            ("fc1", 28672, 5376, Epi::SwiGlu),
+            ("fc2", 5376, 14336, Epi::F32),
+        ];
+        let mut ms: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
+        if ms.is_empty() {
+            ms = vec![1178, 4250];
+        }
+        let mut tiles: Vec<[u32; 5]> = vec![[128, 128, 32, 2, 2]];
+        if let Ok(s) = std::env::var("ZB_Q4_TILES") {
+            for t in s.split(';') {
+                let v: Vec<u32> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if v.len() == 5 {
+                    tiles.push([v[0], v[1], v[2], v[3], v[4]]);
+                }
+            }
+        }
+        let mut rng = Rng(0x9e3779b97f4a7c15);
+        for &m in &ms {
+            println!("M = {m}");
+            let (mut t_plane, mut t_dq) = (0f64, 0f64);
+            let mut t_q4 = vec![0f64; tiles.len()];
+            let mut fl = 0f64;
+            for &(name, n, k, epi) in &SH {
+                let q: Vec<u8> = (0..q4tp_len(n, k)).map(|_| (rng.next() >> 32) as u8).collect();
+                fl += 2.0 * (m * n * k) as f64;
+                let mut line = format!("  {name:>4} N={n:<5} K={k:<5}");
+                match bench::mm_time(zi::default_cfg(epi), m, k, n) {
+                    Some(s) => {
+                        t_plane += s;
+                        line += &format!("  plane {:.2} ms {:.1} TF", s * 1e3, tflops(m, n, k, s));
+                    }
+                    None => line += "  plane n/a",
+                }
+                match bench::dq_time(n, k, &q) {
+                    Some(s) => {
+                        t_dq += s;
+                        line += &format!("  dq {:.2} ms", s * 1e3);
+                    }
+                    None => line += "  dq n/a",
+                }
+                for (i, t) in tiles.iter().enumerate() {
+                    let cfg = MmCfg { q4: true, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) };
+                    match cfg.valid().then(|| bench::mm_time_q4(cfg, m, k, n, &q)).flatten() {
+                        Some(s) => {
+                            t_q4[i] += s;
+                            line += &format!("  q4{:?} {:.2} ms {:.1} TF", (t[0], t[1], t[3], t[4]), s * 1e3, tflops(m, n, k, s));
+                        }
+                        None => {
+                            t_q4[i] = f64::NAN;
+                            line += &format!("  q4{:?} n/a", (t[0], t[1], t[3], t[4]));
+                        }
+                    }
+                }
+                println!("{line}");
+            }
+            let m16 = m.div_ceil(32) * 32;
+            let mut line = format!("  attention, 56 heads, {m16} rows:");
+            let mut t_fl = f64::INFINITY;
+            for (nw, bc) in [(4u32, 16u32), (8, 16), (4, 32)] {
+                match bench::flash_time(FlashCfg { nw, bc }, 56, &[(0, m16)]) {
+                    Some(s) => {
+                        t_fl = t_fl.min(s);
+                        line += &format!("  {nw}x{bc} {:.2} ms", s * 1e3);
+                    }
+                    None => line += &format!("  {nw}x{bc} n/a"),
+                }
+            }
+            println!("{line}");
+            println!(
+                "  a block: plane {:.1} ms + dq {:.1} ms = {:.1} ms ({:.1} TF); q4 {:?} ms; attention {:.1} ms",
+                t_plane * 1e3,
+                t_dq * 1e3,
+                (t_plane + t_dq) * 1e3,
+                fl / (t_plane + t_dq) / 1e12,
+                t_q4.iter().map(|t| (t * 1e4).round() / 10.0).collect::<Vec<_>>(),
+                t_fl * 1e3
+            );
+        }
+    }
+
     /// `qwen [cfg …]`: the batched-prefill GEMM shapes of Qwen3.5-4B
     /// (hidden 2560, FFN 9216, GDN qkv 8192 + z 4096, out 4096) at 512- and
     /// 1024-row prompt chunks, F32 epilogue; the per-chunk total weights each
@@ -1090,6 +1179,7 @@ mod imp {
             Some("mm") => cmd_mm(rest),
             Some("mmt") => cmd_mmt(rest),
             Some("qwen") => cmd_qwen(rest),
+            Some("h3") => cmd_h3(rest),
             Some("prec") => cmd_prec(rest),
             Some("flash") => cmd_flash(rest),
             Some("flashdbg") => cmd_flashdbg(rest),

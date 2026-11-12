@@ -123,6 +123,22 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## MiniMax-H3-Image на Vulkan и Metal (0.8.75)
+
+[MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) теперь держит картинку на GPU от
+первого блока трансформера до последнего и на Vulkan, и на Apple silicon, как раньше на CUDA. На RTX A5000
+бэкенд по умолчанию, Vulkan, рисует 2048×2048 за 33,7 с вместо 260,1 с в 0.8.74 (на CUDA 24,8 с), а правку
+картинки 1024×1024 за 30,6 с вместо 164,5 с. `CMF_GPU_VRAM_MB` работает потолком и на Vulkan: 2048×2048 за
+46,8 с в пределах 4 ГБ, картинка побитно та же. MacBook Air M4 с 24 ГБ рисует 1024×1024 за 138,8 с вместо
+305,2 с:
+
+```sh
+cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+CMF_GPU_VRAM_MB=8000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
+```
+
+Подробности в [руководстве](docs/MINIMAX_H3_IMAGE.ru.md).
+
 ## MiniMax-H3-Image: генерация и правка изображений (0.8.73)
 
 [MiniMax-H3-Image](https://huggingface.co/infosave/MiniMax-H3-Image-cmf) генерирует и редактирует изображения

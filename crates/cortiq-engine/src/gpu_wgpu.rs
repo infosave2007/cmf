@@ -26,6 +26,13 @@ pub mod zimage;
 // `gpu_wgpu/qi21.rs` and `gpu_wgpu/qi21_vae.rs`.
 pub(crate) mod qi21;
 pub(crate) mod qi21_vae;
+/// MiniMax-H3 stacks (the DiT of MiniMax-H3-Image, its prompt encoder) as
+/// resident chains. Native Metal has its own on macOS (`gpu_metal/h3.rs`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) mod h3;
+/// The MiniMax-H3 VAE encoder's convolution chain.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) mod h3_conv;
 // MiMo-V2 expert-bank frame — child module, `gpu_wgpu/mimo_bank.rs`.
 #[doc(hidden)]
 pub mod mimo_bank;
@@ -49080,16 +49087,57 @@ fn upload_threads() -> usize {
 }
 
 fn upload_chunk_bytes() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("CMF_GPU_UPLOAD_CHUNK_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            .max(1)
-            * 1024
-            * 1024
-    })
+    // (bytes, whether `CMF_GPU_UPLOAD_CHUNK_MB` set them)
+    static N: std::sync::OnceLock<(usize, bool)> = std::sync::OnceLock::new();
+    let (bytes, set) = *N.get_or_init(|| {
+        let mb = std::env::var("CMF_GPU_UPLOAD_CHUNK_MB").ok().and_then(|v| v.parse::<usize>().ok());
+        (mb.unwrap_or(64).max(1) * 1024 * 1024, mb.is_some())
+    });
+    let hint = UPLOAD_CHUNK_HINT.load(std::sync::atomic::Ordering::Relaxed);
+    if hint != 0 && !set { hint } else { bytes }
+}
+
+/// Drop these tensors from the residency cache: a caller that passes a
+/// stack through the card under a ceiling lets a run of blocks go before
+/// the next arrives. The buffers free once the work that reads them is done.
+pub(super) fn weight_evict(c: &Ctx, keys: &[(usize, usize)]) {
+    let mut freed = 0u64;
+    {
+        let mut map = c.weight_bufs.lock().unwrap();
+        for k in keys {
+            if let Some(e) = map.remove(k) {
+                freed += e.bytes;
+            }
+        }
+    }
+    if freed > 0 {
+        resident_sub(c, freed);
+    }
+}
+
+/// The staging chunk a caller asks for while it uploads a stack of its own
+/// (0: the default class); `CMF_GPU_UPLOAD_CHUNK_MB` overrides it.
+static UPLOAD_CHUNK_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Upload in `mb`-megabyte staging chunks until the guard drops. A stack of
+/// hundreds of mid-size tensors pays for the 64 MB class: every staging
+/// buffer is the full chunk whatever the tensor's tail, and it is mapped
+/// fresh. MiniMax-H3-Image on an RTX A5000 (12.68 GB of the prompt encoder
+/// in 350 tensors / 10.02 GB of the DiT in 200), seconds by chunk: 64 MB
+/// 9.8 / 4.3, 16 MB 7.3 / 4.2, 8 MB 5.0 / 3.9, 4 MB 3.7 / 3.3, 2 MB 5.8 /
+/// 2.5 (below 4 MB a chunk is copied by one thread), 256 MB 47 s for the DiT.
+pub(super) struct UploadChunk(usize);
+
+impl UploadChunk {
+    pub(super) fn mb(mb: usize) -> UploadChunk {
+        UploadChunk(UPLOAD_CHUNK_HINT.swap(mb * 1024 * 1024, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for UploadChunk {
+    fn drop(&mut self) {
+        UPLOAD_CHUNK_HINT.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[inline]

@@ -903,7 +903,10 @@ pub struct MmCfg {
     /// Implicit-GEMM 3×3 convolution (the VAE, B2): 0 = plain GEMM,
     /// 1 = 3×3 pad-1 conv over an NHWC f16 image (`act` = the image,
     /// K = 9·cin in (tap, channel) order), 2 = the same on the nearest-2×
-    /// upsample of `act` (the image is at half the output size).
+    /// upsample of `act` (the image is at half the output size); 3 = the
+    /// 3×3×3 causal convolution of a video VAE; 4 = 3×3 with one reflected
+    /// row and column on every side; 5 = 3×3 stride 2 with one reflected
+    /// row and column on the far side (the image at twice the output size).
     pub conv: u32,
     /// f16 accumulation flushed into f32 (vk2): 0 = f32 accumulators;
     /// F > 0 = the MMAs of F consecutive K slices accumulate in f16
@@ -937,15 +940,23 @@ pub struct MmCfg {
     /// f16 as the staging tile is filled — `zi_act_f16`'s arithmetic, with
     /// no f16 panel pass. Rows past `m` read as zero. Needs `dscale`.
     pub a32: bool,
+    /// `q4` under a SwiGLU epilogue whose tensor stores every gate row and
+    /// then every up row (`[gate | up]`, MiniMax-H3's fc1) instead of the
+    /// 16-row gate/up panels the epilogue pairs: plane row `r` reads tensor
+    /// row `(r / 32)·16 + r % 16`, plus `n / 2` in the odd (up) panels.
+    pub q4h: bool,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16, dscale: false, q4: false, a32: false }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16, dscale: false, q4: false, a32: false, q4h: false }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
         if self.a32 && (!self.dscale || self.direct || self.conv != 0 || self.stages != 1 || self.acc16 != 0 || self.acc16_probe) {
+            return false;
+        }
+        if self.q4h && (!self.q4 || !self.epi.is_swiglu()) {
             return false;
         }
         if self.q4
@@ -1031,6 +1042,7 @@ impl MmCfg {
             + if self.dscale { "_ds" } else { "" }
             + if self.q4 { "_q4" } else { "" }
             + if self.a32 { "_a32" } else { "" }
+            + if self.q4h { "_q4h" } else { "" }
     }
     /// Workgroup-shared bytes this variant declares.
     pub fn shared_bytes(&self) -> u32 {
@@ -1166,6 +1178,40 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
 }}",
             bk = g.bk
         );
+    } else if g.conv == 4 || g.conv == 5 {
+        // 3×3 over a reflect-padded image: one reflected row and column on
+        // every side (4), or stride 2 with one reflected row and column on
+        // the far side only (5: the image is at twice the output size).
+        let src = if g.conv == 4 {
+            "  var sy = y + i32(tap / 3u) - 1;
+  var sx = x + i32(tap % 3u) - 1;
+  let ih = i32(p.ch);
+  let iw = i32(p.cw);
+  if (sy < 0) { sy = -sy; }
+  if (sx < 0) { sx = -sx; }"
+        } else {
+            "  var sy = 2 * y + i32(tap / 3u);
+  var sx = 2 * x + i32(tap % 3u);
+  let ih = 2 * i32(p.ch);
+  let iw = 2 * i32(p.cw);"
+        };
+        let _ = writeln!(
+            s,
+            "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
+  let k0 = kt * {bk}u;
+  let tap = k0 / p.cin;
+  let ci = k0 - tap * p.cin + vc * 4u;
+{src}
+  if (sy >= ih) {{ sy = 2 * ih - 2 - sy; }}
+  if (sx >= iw) {{ sx = 2 * iw - 2 - sx; }}
+  // rows past the image (the last tile's padding) stay inside the buffer
+  sy = clamp(sy, 0, ih - 1);
+  sx = clamp(sx, 0, iw - 1);
+  let px = u32(sy) * u32(iw) + u32(sx);
+  return act[(px * p.cin + ci) / 4u];
+}}",
+            bk = g.bk
+        );
     } else if g.conv != 0 {
         let up = if g.conv == 2 { 1 } else { 0 };
         let _ = writeln!(
@@ -1294,7 +1340,12 @@ fn qcode(cb0: u32, g: u32) -> u32 {{ let bit = g * 5u; let cb = cb0 + (bit >> 3u
         };
         if g.q4 {
             let _ = writeln!(s, "  let qgpr = p.k / 32u;");
-            let _ = writeln!(s, "  let qrow = n0 + tid;");
+            if g.q4h {
+                let _ = writeln!(s, "  let qpl = n0 + tid;");
+                let _ = writeln!(s, "  let qrow = (qpl / 32u) * 16u + (qpl % 16u) + ((qpl / 16u) & 1u) * (p.n / 2u);");
+            } else {
+                let _ = writeln!(s, "  let qrow = n0 + tid;");
+            }
             let _ = writeln!(s, "  let qpb = p.n * qgpr * 16u;");
             let _ = writeln!(s, "  let qcb = qpb + p.n * 4u + qrow * ((qgpr * 5u + 7u) / 8u);");
             let _ = writeln!(s, "  let qpr = unpack2x16float(qwd((qpb >> 2u) + qrow));");
@@ -2632,6 +2683,44 @@ pub mod bench {
         Some(time_pass(c, reps, 5, &|pass| call.record(pass)))
     }
 
+    /// Seconds per `zi_mm` whose plane operand is the q4tp tensor itself
+    /// ([`MmCfg::q4`]) at M×K×N; `q4tp` = the tensor's payload.
+    pub fn mm_time_q4(cfg: MmCfg, m: usize, k: usize, n: usize, q4tp: &[u8]) -> Option<f64> {
+        let c = zctx()?;
+        if !cfg.q4 || cfg.a32 || cfg.dscale {
+            return None;
+        }
+        let mp = pad_rows(m);
+        let ab = sbuf(c, (mp * k * 2) as u64, "act");
+        fill(c, &ab, (mp * k / 2) as u64, 7, 1.0, false)?;
+        let wb = sbuf_init(c, q4tp, "q4tp");
+        let ncol = if cfg.epi.is_swiglu() { n / 2 } else { n };
+        let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
+        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
+        let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
+        wait(c);
+        let reps = if m * n * k > 50_000_000_000 { 4 } else { 10 };
+        Some(time_pass(c, reps, 5, &|pass| call.record(pass)))
+    }
+
+    /// Seconds per expansion of a q4tp tensor `[n][k]` into its f16 plane
+    /// (the parent's `q4tp_dq_f16_g`, a thread per 32-column group).
+    pub fn dq_time(n: usize, k: usize, q4tp: &[u8]) -> Option<f64> {
+        let c = super::super::ctx()?;
+        let pg = c.q4tp_dq_f16_g.as_ref()?;
+        let wb = sbuf_init(c, q4tp, "q4tp");
+        let plane = sbuf(c, (n * k * 2) as u64, "plane");
+        let u = ubuf(c, &[k as u32, n as u32, 0, 0]);
+        let b = bg(c, pg, &[&wb, &plane, &u]);
+        wait(c);
+        Some(time_pass(c, 4, 5, &|pass| {
+            pass.set_pipeline(pg);
+            pass.set_bind_group(0, &b, &[]);
+            let groups = ((n * k / 32) as u32).div_ceil(256);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }))
+    }
+
     /// Flash attention over a packed qkv panel `[m][3·nh·128]` (f16 bits),
     /// segments `(offset, len)`; returns `[m][nh·128]` f32.
     pub fn flash_run(f: FlashCfg, nh: usize, qkv: &[u16], segs: &[(usize, usize)]) -> Option<Vec<f32>> {
@@ -2886,7 +2975,7 @@ impl ZBlockDev {
 /// Q8Row and Q8_2f dequantized on the device by the parent's
 /// `q4tp_dq_f16` / `q8_dq_f16` (the plane layout the parent's coop GEMM
 /// eats). Other codecs → `None`.
-fn tensor_to_plane(
+pub(super) fn tensor_to_plane(
     c: &Ctx,
     model: &Arc<CmfModel>,
     idx: usize,
@@ -4076,7 +4165,7 @@ fn vae_gn_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
 }
 "#;
 
-const VAE_GN_FIN_SRC: &str = r#"
+pub(super) const VAE_GN_FIN_SRC: &str = r#"
 struct VP { m: u32, c: u32, cpg: u32, rows: u32, nchunk: u32, flags: u32, g: u32, eps: f32 };
 @group(0) @binding(0) var<storage, read> part: array<f32>;
 @group(0) @binding(1) var<storage, read_write> stat: array<f32>;
@@ -4109,7 +4198,7 @@ fn vae_gn_fin(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
 }
 "#;
 
-const VAE_GN_APPLY_SRC: &str = r#"
+pub(super) const VAE_GN_APPLY_SRC: &str = r#"
 enable f16;
 struct VP { m: u32, c: u32, cpg: u32, rows: u32, nchunk: u32, flags: u32, g: u32, mp: u32 };
 @group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;

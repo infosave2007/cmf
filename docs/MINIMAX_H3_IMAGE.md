@@ -5,8 +5,9 @@
 [MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) generates and edits images of 4 to 16
 megapixels in six sampling steps. cortiq runs it from one CMF file of 24.6 GB that holds the diffusion
 transformer (20 B parameters in 4 bits), the Qwen3-VL prompt encoder with its vision tower (4 bits), and the
-image VAE (8 bits). On an NVIDIA card the whole pipeline runs through the native CUDA backend; on any other GPU
-it runs through Vulkan or Metal. A ceiling on the card's memory lets it run on a small card.
+image VAE (8 bits). It runs on NVIDIA through the native CUDA backend, over Vulkan, and on Apple silicon through
+Metal; on all three the image stays on the GPU from the transformer's first block to its last. On CUDA and
+Vulkan a ceiling on the card's memory lets it run on a small card.
 
 ```bash
 cargo install cortiq-cli --features cuda
@@ -16,7 +17,7 @@ CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out
 CMF_GPU=cuda cortiq imagine minimax-h3-image-q4tp.cmf --image photo.png --prompt @edit.txt --out edit.png
 # a card with 6 GB
 CMF_GPU=cuda CMF_GPU_VRAM_MB=6000 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
-# Vulkan (any vendor) and Metal: the default backend
+# Vulkan and Metal: the default backend (the ceiling works on Vulkan too)
 cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 ```
 
@@ -72,6 +73,20 @@ is small: panels are produced a chunk of rows at a time and attention keeps no s
 
 The picture under the 4 GB ceiling is the same picture: 49.6 dB PSNR against the run without one.
 
+On Vulkan the same variable is the budget of the weights. The blocks that fit stay on the card; the rest pass
+through it every step in runs of at most 1 GB. 2048 x 2048, Vulkan, NVIDIA RTX A5000, 24 GB:
+
+| ceiling | total, s | a step, s | peak memory of the card, MiB |
+|---|---:|---:|---:|
+| none | 32.8 | 4.02 | 12 673 |
+| `CMF_GPU_VRAM_MB=12000` | 32.2 | 4.02 | 11 962 |
+| `CMF_GPU_VRAM_MB=8000` | 38.1 | 5.17 | 8 560 |
+| `CMF_GPU_VRAM_MB=6000` | 41.6 | 5.71 | 6 647 |
+| `CMF_GPU_VRAM_MB=4000` | 46.8 | 6.64 | 4 754 |
+
+Under every ceiling the picture is the one without, bit for bit. The card's peak stays within 0.8 GB of the
+ceiling.
+
 ## Speed
 
 NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the median of three).
@@ -82,7 +97,27 @@ NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the me
 | CUDA, 2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA, 4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA, edit at 2048 x 2048, one 1024 x 1024 picture | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
-| Vulkan, 1024 x 1024 (`--min-area 1024`) | 13.0 | 70.0 | 10.99 | 4.0 | **88.7** | 12 529 |
+
+NVIDIA RTX A5000, 24 GB, the same file on both backends, single runs.
+
+| run | CUDA: a step, s | CUDA: total, s | Vulkan: a step, s | Vulkan: total, s | Vulkan: peak memory of the card, MiB |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 0.90 | 10.8 | 1.15 | **16.2** | 12 673 |
+| 2048 x 2048 | 3.31 | 24.8 | 4.01 | **33.7** | 12 673 |
+| 4096 x 4096 | 21.69 | 138.6 | 21.59 | **142.3** | 13 759 |
+| edit at 1024 x 1024, one 1024 x 1024 picture | 2.34 | 25.4 | 2.85 | **30.6** | 13 824 |
+| edit at 2048 x 2048, one 1024 x 1024 picture | 5.49 | 45.1 | 6.16 | **52.1** | 13 824 |
+
+MacBook Air M4, 24 GB, Metal, single runs.
+
+| run | prompt, s | six steps, s | a step, s | decode, s | total, s | peak memory of the process, MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024 x 1024 (`--min-area 1024`) | 12.0 | 119.3 | 20.23 | 2.9 | **138.8** | 10 654 |
+| 2048 x 2048 | 12.3 | 537.2 | 89.96 | 12.7 | **565.8** | 8 551 |
+| edit at 1024 x 1024, one 1024 x 1024 picture | 55.0 | 366.2 | 61.17 | 2.9 | **431.6** | 12 604 |
+
+The MacBook Air has no fan and slows down as it warms: a step at 1024 x 1024 takes 18 s on a cool machine and
+20 to 22 s on a warm one.
 
 ## How it runs on CUDA
 
@@ -101,8 +136,24 @@ NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the me
 - **The VAE** decodes 256-pixel tiles in batches through the same chain; an edit's reference pictures are
   encoded by a chain of convolutions (im2col panels and one product each).
 
-On Vulkan and Metal the pipeline uses the per-operation kernels of the MiniMax-H3 video path: each block's
-activations cross to the host and back.
+## On Vulkan and Metal
+
+The same chains, written for each backend's own matrix units.
+
+- **Vulkan.** The products read the 4-bit tensors directly on the card's 16 x 16 matrix units
+  (`VK_KHR_cooperative_matrix`, f16 operands, f32 sums): 50 to 58 TFLOP/s on an RTX A5000 whose bare matrix
+  units reach 103. Attention is a flash kernel straight from the q/k/v panel. The prompt encoder runs the same
+  way with causal, grouped attention; the VAE decoder takes up to 41 tiles a batch; an edit's reference picture
+  is encoded by convolutions that gather their taps inside the product, with no im2col panel. A stage's weights
+  stay on the card in their codec, or pass through it under a ceiling.
+- **Metal.** The transformer's products dequantize the 4-bit tiles as they stage them for the 8 x 8 simdgroup
+  matrices and read the weights in place from the file mapping. The prompt encoder's weights pass through a
+  buffer a layer at a time, and the VAE decoder's sit in a buffer of their own: on a Mac with less memory than
+  the file, reading either in place makes the GPU page a 13 GB window of the file in first.
+
+The Vulkan chains need 16 x 16 half-precision cooperative matrices and 32-wide subgroups, which NVIDIA RTX
+cards have. Without them, and under `CMF_H3_WGPU=0` or `CMF_H3_METAL=0`, the pipeline uses the per-operation
+kernels of the MiniMax-H3 video path.
 
 ## Packing
 
@@ -122,9 +173,15 @@ carries it and the vision tower over from a MiniMax-H3 container; `--te` packs i
 
 - The chain against the per-operation path (every product a separate f32 GEMM) on a 2048 x 2048 edit:
   54.0 dB PSNR between the pictures.
-- CUDA against Vulkan, 1024 x 1024, the same seed: 47.0 dB.
-- A 4 GB ceiling against none: 49.6 dB.
-- The VAE decoder's chain against its per-operation path: 47.5 dB; against f16 weights: 48.5 dB.
+- Vulkan against CUDA on an RTX A5000, the same seed: 45.9 dB at 1024 x 1024, 44.5 dB at 2048 x 2048, 40.3 dB
+  at 4096 x 4096, 43.8 dB on a 1024 x 1024 edit. Metal against those CUDA pictures: 47.2 dB at 1024 x 1024,
+  43.7 dB at 2048 x 2048.
+- A 4 GB ceiling against none on CUDA: 49.6 dB. On Vulkan the pictures under 12, 8, 6 and 4 GB are
+  identical to the one without a ceiling.
+- The prompt encoder's output on Vulkan and on Metal against the per-operation path: within 4e-4 (relative
+  RMS).
+- The VAE decoder's chain against its per-operation path: 47.5 dB on CUDA, 65.6 dB on Vulkan, 66.3 dB on Metal;
+  against f16 weights: 48.5 dB.
 - `CMF_H3_SAT=1` counts the halves a panel stores at the saturation value: none on text-to-image and edit runs.
 - A prompt encoder in 8 bits under the same transformer: the conditioning differs by 3 % (relative RMS), the
   pictures by 17.7 to 25.4 dB, with the same level of detail. The file keeps 4 bits.
@@ -136,11 +193,12 @@ carries it and the vision tower over from a MiniMax-H3 container; `--te` packs i
 | variable | effect |
 |---|---|
 | `CMF_GPU=cuda` | the native CUDA backend (a build with `--features cuda`) |
-| `CMF_GPU_VRAM_MB=N` | the ceiling on the card's memory |
+| `CMF_GPU_VRAM_MB=N` | the ceiling on the card's memory (CUDA and Vulkan) |
 | `CMF_CUDA_PROF=1` | stage times of the chains (synchronous, slower) |
 | `CMF_H3_SAT=1` | count clamped halves and the largest magnitudes of the chain's panels |
 | `CMF_MMH3_CHAIN=0`, `CMF_TE_CHAIN=0`, `CMF_VAE3D_CHAIN=0` | the per-operation path for the transformer, the encoder, the VAE |
 | `CMF_H3_FLASH=0` | attention as two batched products a chunk instead of the flash kernel |
+| `CMF_H3_WGPU=0`, `CMF_H3_METAL=0` | the per-operation path on Vulkan, on Metal |
 | `CMF_LATENT_OUT=FILE`, `CMF_INIT_LATENT=FILE` | write the final latent; start from a given noise |
 | `CMF_TE_DUMP=FILE`, `CMF_TE_LOAD=FILE`, `CMF_TE_FROM=FILE.cmf` | write the prompt's conditioning; use another run's; take the encoder from another container |
 
@@ -150,8 +208,9 @@ carries it and the vision tower over from a MiniMax-H3 container; `--te` packs i
   posterized). The same edit at 1024 x 1024 (`--width 1024 --height 1024 --min-area 1024`) is clean, and so are
   edits of softer pictures at 2048 x 2048. An 8-bit encoder, an 8-bit transformer and the per-operation f32
   path give the same result, so the codec and the chain are ruled out; the cause is not found.
-- Vulkan runs per operation and is 5.5 times slower than CUDA on the same card. Metal uses the same
-  kernels and has not been measured.
+- The Vulkan chains need an NVIDIA RTX card (16 x 16 half-precision cooperative matrices, 32-wide subgroups).
+  Other cards run per operation, several times slower.
+- On a Mac with 24 GB the file is larger than memory: every stage reads its part from disk again.
 - The attention kernel needs tensor cores with `mma.sync` (compute capability 8.0 and up); older cards take
   two batched products instead.
 - The far-field (O(1)) attention of the turbo language models does not apply: priced on the model's own
