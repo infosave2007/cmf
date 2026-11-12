@@ -25,44 +25,142 @@ language:
 
 # Qwen3.8-Flash-Next Fast Code — CMF
 
-[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) cut for code: of the 512 routed experts of
-every layer it keeps the 256 that code and a long front-end task route to, at 4 bits, with the shared expert, the
-draft (MTP) head and the n-gram table in one 66.8 GB [CMF](https://github.com/infosave2007/cmf) file. Given a
-2 151-token spec of a 3D aquarium, it writes **a working three.js page on the first try** (4 of 4 runs); the 2-bit
-Strata Coder cut of the same model needed a repair turn. The experts fit on one 96 GB card: a prompt is read at
-**~840 tokens/s**, four times the full 512-expert file on the same card, and code is written at **136–166 tokens/s**,
-in 41 GB of VRAM instead of 60. Over CUDA it runs on **cards from 12 GB**: the card keeps the experts that fit and the
-host's cores compute the rest, and the same working aquarium page is written at **145 / 175 / 207 tokens/s** within
-12 / 16 / 24 GB of card memory: 94 / 91 / 97 % of the 2-bit Strata Coder's speed on the same cards, with the experts
-kept at 4 bits and the attention at 8. It runs with `cortiq`, a Rust inference engine with no Python and no ML framework.
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) cut for code: 256 of the 512 routed experts of
+every layer at 4 bits, with the shared expert, the draft (MTP) head and the n-gram table, in one 66.8 GB
+[CMF](https://github.com/infosave2007/cmf) file. Runs with `cortiq`, a Rust inference engine.
 
-[English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)
+- **One card with 48 GB or more:** prompt ~840 tok/s, code 136–166 tok/s, 41 GB of VRAM.
+- **NVIDIA cards from 12 GB (CUDA):** code 145 / 175 / 207 tok/s within 12 / 16 / 24 GB — 94 / 91 / 97 % of the
+  2-bit Strata Coder's speed, with the experts at 4 bits and the attention at 8.
+- **HumanEval pass@1:** 93.3 % (164 tasks).
 
-![The aquarium page Fast Code wrote](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_aquarium.png)
+[English](#requirements) · [Русский](#документация-на-русском) · [中文](#中文文档)
 
-*Fast Code's greedy answer to the aquarium spec, rendered as written: one HTML file, a glass tank, three clownfish,
-plants and stones.*
+## Requirements
 
-## Quick start
+| | one card with 48 GB or more | NVIDIA card from 12 GB |
+|---|---|---|
+| GPU | 48 GB of VRAM or more, Vulkan or CUDA | NVIDIA, 12 GB or more; driver 570+, CUDA 12.8+ libraries (`libnvrtc`, `libcublas`) |
+| CPU | any x86-64 or ARM64 | x86-64 with AVX-512 VNNI (AMD Zen 4/5, Intel Sapphire Rapids or newer), 8 threads or more |
+| RAM | 32 GB (the n-gram table, 28 GB, stays in RAM) | 64 GB |
+| disk | 67 GB | 67 GB |
+| cortiq | 0.8.65 or later, [prebuilt binaries](https://github.com/infosave2007/cmf/releases) or `cargo install` | 0.8.78 or later, built with `--features cuda` (the prebuilt binaries have no CUDA) |
+
+Tested on Linux.
+
+## Install
 
 ```bash
+# a card with 48 GB or more (Vulkan); or download a prebuilt binary from the releases page
 cargo install cortiq-cli --locked
-hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile --local-dir .
+
+# an NVIDIA card from 12 GB (CUDA): Rust 1.88+, then
+cargo install cortiq-cli --locked --features cuda
+```
+
+## Download
+
+```bash
+pip install -U huggingface_hub
+hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile \
+  qwen38-flash-next-fast-code.cmf.sha256 --local-dir .
+sha256sum -c qwen38-flash-next-fast-code.cmf.sha256
+```
+
+## Run
+
+A card with 48 GB or more:
+
+```bash
+CMF_QWEN_PROFILE=fast-code.profile \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+An NVIDIA card from 12 GB:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH   # where libnvrtc and libcublas are
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+The server is ready when it answers on `/v1/models`; the first start reads the 66.8 GB file and takes a minute or
+more. Then:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "fast-code", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "Write a Rust function that parses a semantic version, with tests."}]}'
+```
+
+Endpoints: `/v1/chat/completions` (streaming, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
+`/healthz`, a web dashboard on `/`. Draft tokens are used under `temperature: 0`. Any OpenAI-compatible editor or
+agent can point at `http://127.0.0.1:8080/v1`.
+
+One prompt without a server:
+
+```bash
 CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --prompt-file task.txt --greedy --no-think
 ```
 
-Use cortiq 0.8.65 or later ([prebuilt binaries](https://github.com/infosave2007/cmf/releases)). `--no-think` asks
-for a direct answer; without it the model reasons first, so raise `--max-tokens`. Each `cortiq run` loads the model
-again; for chat and editors keep it loaded with [`cortiq serve`](#openai-compatible-server).
+## Settings
 
-An NVIDIA card from 12 GB through CUDA (cortiq 0.8.78 or later, built with the `cuda` feature):
+| variable | what it does |
+|---|---|
+| `CMF_QWEN_PROFILE=fast-code.profile` | the experts' order on the card; always set it |
+| `CMF_GPU=cuda` | the CUDA backend (a `--features cuda` build) |
+| `CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` | keep every expert pinned in RAM, so nothing waits on the disk; needs 64 GB of RAM |
+| `CMF_QWEN_ROUTE_TAIL=0.05` | skip the experts with under 5 % of a token's routing weight (the measured setting) |
+| `CMF_SERVE_SLOTS=1` | one request at a time, at full speed |
+| `CMF_GPU_VRAM_MB=<MiB>` | cap the card memory the model takes (default: what is free) |
+| `CMF_QWEN_CUDA_GROW_MB=<MiB>` | card memory kept free for a growing context (default 1024) |
+| `CMF_QWEN_CPU_EXPERT_THREADS=<n>` | host threads for the experts outside the card (default: all but three) |
+| `CMF_GPU_ADAPTER=<n>` | which GPU (`cortiq gpu` lists them) |
+| `XDG_RUNTIME_DIR=/tmp` | Vulkan on headless Linux |
 
-```bash
-cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
-  cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
-```
+## Troubleshooting
+
+- **`libnvrtc (CUDA toolkit) was not found`** or **`qwen4 cuda: …; staying on the host path`**: install the CUDA
+  12.8+ toolkit and put its `lib64` on `LD_LIBRARY_PATH`. The server then logs `qwen4 cuda: arena prefilled with …`.
+- **Out of memory on the card**: close other GPU programs or set `CMF_GPU_VRAM_MB` a little lower.
+- **Less than 64 GB of RAM**: drop `CMF_QWEN_CUDA_REG_ALL=1` (and if needed `CMF_QWEN_CUDA_REG=1`); it runs slower.
+- **A host without AVX-512 VNNI**: every expert outside the card is copied to it instead; it runs, slower.
+- **The answer starts with reasoning**: send `"enable_thinking": false` (`--no-think` for `cortiq run`).
+- **Slow first request**: the weights are still coming from the disk; keep the server running between requests.
+
+## Speed and accuracy
+
+One RTX PRO 6000 (96 GB, Vulkan), one stream, greedy, thinking off, draft tokens on. Strata Coder is ISTA-DASLab's
+2-bit cut of the same model on its own engine Strata 0.1.58 (CUDA); the full file is the 512-expert
+[q4tp file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf) on cortiq.
+
+| | Fast Code | Strata Coder (Strata) | full file (cortiq) |
+|---|---:|---:|---:|
+| HumanEval pass@1 (164 tasks) | 93.3 % | 94.5 % | 94.5 % |
+| code perplexity, code written after 20.10.2026 (8192 tokens) | **3.337** | 3.436¹ | 3.366 |
+| code perplexity, Rust (1536 tokens) | 4.900 | 4.690¹ | 4.111 |
+| prompt 1K / 4K / 16K / 32K tokens, tok/s | 798 / 827 / 844 / 842 | 1916 / 5492 / 7229 / 7659 | 171 / 208 / 206 / 210 |
+| generation after a 4K / 16K / 32K prompt, tok/s | 161 / 166 / 136 | 220 / 223 / 222 | 118 / 138 / 116 |
+| expert weights | 4 bits | 2 bits | 4 bits |
+| file on disk | 66.8 GB | 58.4 GB + 5.2 GB MTP | 98.6 GB |
+| peak VRAM (32K context) | 40.9 GB | 31.1 GB | 59.6 GB |
+
+¹ Strata Coder's weights imported into CMF and run by cortiq: the same text and tokenizer for both.
+
+NVIDIA cards from 12 GB: one RTX 5090 held to the memory shown, host 2× EPYC 9554 (31 threads, 62 GB of RAM), the
+command above, code generation on a 2 151-token spec, mean of two runs. Strata Coder ran on the same machine with an
+expert cache of 1 500 / 3 000 / 5 000 experts (10.7 / 14.5 / 19.6 GB of the card).
+
+| card memory | Fast Code (cortiq), tok/s | Strata Coder (Strata), tok/s | | HumanEval, first 40 |
+|---|---:|---:|---:|---:|
+| 12 GB | **145.0** | 154.1 | 94 % | 38 / 40 |
+| 16 GB | **174.6** | 192.5 | 91 % | 39 / 40 |
+| 24 GB | **206.7** | 212.0 | 97 % | 39 / 40 |
+
+![Speed](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_en.png)
+
+![Accuracy on code](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_quality_en.png)
 
 ## Files
 
@@ -72,286 +170,301 @@ CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
 | `fast-code.profile` | routing profile (not weights): the experts' order on the card | 49 KB |
 | `qwen38-flash-next-fast-code.cmf.sha256` | checksum | |
 
-The kept experts are those routed to most over two texts, each normalized and weighted equally: 450 KB of
-programming tasks and answers (Magicoder OSS-Instruct across its languages and Evol-Instruct) and the aquarium spec
-with six answers to it. They hold 83 % of code's routing mass and 81 % of the task's; a cut by code alone held 87 %
-and 65 %, and its aquarium page did not run. The aquarium spec was among the selection texts. The cut is made for
-code; for general chat use the [full file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf).
-
-## Speed and accuracy
-
-One RTX PRO 6000 (96 GB, Vulkan), one stream, the same HTTP client and prompts for every row, greedy, thinking off,
-draft tokens on. Strata Coder is ISTA-DASLab's 2-bit cut of the same model (256 experts chosen for code, agents and
-vision) on its own engine Strata 0.1.58 (llama.cpp-based, CUDA); the full file is the 512-expert
-[q4tp file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf) on cortiq.
-
-| | Fast Code | Strata Coder (Strata) | full file (cortiq) |
-|---|---:|---:|---:|
-| aquarium spec, greedy: a working page | **first try** | after a repair turn | first try |
-| HumanEval pass@1 (164 tasks) | 93.3 % | 94.5 % | 94.5 % |
-| code perplexity, code written after 20.10.2026 (8192 tokens) | **3.337** | 3.436¹ | 3.366 |
-| code perplexity, Rust (1536 tokens) | 4.900 | 4.690¹ | 4.111 |
-| prompt 1K / 4K / 16K / 32K tokens, tok/s | 798 / 827 / 844 / 842 | 1916 / 5492 / 7229 / 7659 | 171 / 208 / 206 / 210 |
-| generation after a 4K / 16K / 32K prompt, tok/s | 161 / 166 / 136 | 220 / 223 / 222 | 118 / 138 / 116 |
-| file on disk | 66.8 GB | 58.4 GB + 5.2 GB MTP | 98.6 GB |
-| peak VRAM (32K context) | 40.9 GB | 31.1 GB | 59.6 GB |
-
-¹ Strata Coder's weights imported into CMF and run by cortiq: the same text and tokenizer for both.
-HumanEval: greedy, no thinking, the answer's code run against the tests (±3 tasks is run-to-run noise). Fast Code's
-speeds are the mean of two runs. The n-gram table (28 GB) stays in system RAM in every row.
-
-![Speed on one RTX PRO 6000](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_en.png)
-
-![Accuracy on code](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_quality_en.png)
-
-## Cards from 12 GB (CUDA)
-
-The CUDA backend serves the file on a card that cannot hold all its experts. The card keeps the
-experts that fit, the busiest of the routing profile first; an expert a token routes to outside of them is computed
-by the host's cores (an AVX-512 VNNI kernel on the 4-bit weights) while the card computes the held ones, and the
-experts a text keeps asking for move to the card between tokens. Within 12 GB the card holds 927 of the 12 288
-experts and the draft head's 512.
-
-| card memory | Fast Code (cortiq), tok/s | Strata Coder (Strata), tok/s | Fast Code against Strata Coder |
-|---|---:|---:|---:|
-| 12 GB | **145.0** | 154.1 | 94 % |
-| 16 GB | **174.6** | 192.5 | 91 % |
-| 24 GB | **206.7** | 212.0 | 97 % |
-| expert weights | 4 bits | 2 bits | |
-
-One RTX 5090 held to the memory shown (`CMF_GPU_VRAM_MB`), host 2× EPYC 9554 with 31 threads and 62 GB of RAM for
-the container, one request at a time, greedy, thinking off, draft tokens on, the command of the quick start; the
-aquarium speed is the mean of two runs and the answer is the complete working page in every run. Strata Coder ran
-on the same pod with its expert cache at 1 500 / 3 000 / 5 000 experts, 10.7 / 14.5 / 19.6 GB of the card. Fast
-Code spends its card on more precise weights: the 2-bit cut is smaller and faster to read, and Fast Code's code
-perplexity is the lower one (3.337 against 3.436, [above](#speed-and-accuracy)). Of the first 40 HumanEval tasks
-38 / 39 / 39 pass within 12 / 16 / 24 GB. The host
-needs AVX-512 VNNI (Zen 4, Sapphire Rapids or newer) and eight threads or more; on another host every missing expert
-is copied to the card instead, which is slower. `CMF_QWEN_CPU_EXPERT_THREADS` sets the number of host threads.
-`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` keep every expert pinned in RAM, so neither the host nor the card waits on the disk.
-
-## OpenAI-compatible server
-
-```bash
-CMF_QWEN_PROFILE=fast-code.profile cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
-
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model": "fast-code", "enable_thinking": false, "temperature": 0,
-       "messages": [{"role": "user", "content": "Write a Rust function that parses a semantic version, with tests."}]}'
-```
-
-Endpoints: `/v1/chat/completions` (streaming, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
-`/healthz`, a web dashboard on `/`. Draft tokens are used under `temperature: 0`. Without `--host` the server listens
-on all interfaces.
-
-## Hardware
-
-The experts live on the card: about 41 GB of VRAM at a 32K context, plus 28 GB of system RAM for the n-gram table.
-Measured on an RTX PRO 6000 (96 GB). A card from 12 GB runs it through CUDA with the host's cores computing the
-experts that do not fit ([above](#cards-from-12-gb-cuda)); the file then stays in system RAM (62 GB measured). `cortiq gpu` lists the adapters; `CMF_GPU_ADAPTER` picks one. On headless Linux set
-`XDG_RUNTIME_DIR=/tmp`.
-
-## Long context
-
-Attention is exact on the card up to 262 144 tokens (the sparse attention keeps 2 048 positions a token).
-Generation holds with length: 166 tok/s after 16K tokens, 136 after 32K.
-
-## Verify the download
-
-```bash
-sha256sum -c qwen38-flash-next-fast-code.cmf.sha256
-cortiq verify qwen38-flash-next-fast-code.cmf
-```
-
+The kept experts are the ones code routes to most. For general chat use the
+[full file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf). Attention is exact up to 262 144 tokens.
 Weights derive from Qwen's release and remain under its license. Review generated code before running it.
 
 ---
 
 ## Документация на русском
 
-[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), урезанная под код: из 512 экспертов каждого
-слоя оставлены 256, к которым обращаются код и большая фронтенд-задача, в 4 битах, вместе с общим экспертом, головой
-черновиков (MTP) и таблицей n-грамм, в одном файле [CMF](https://github.com/infosave2007/cmf) на 66.8 ГБ. По ТЗ
-3D-аквариума на 2 151 токен она пишет **рабочую страницу на three.js с первой попытки** (4 из 4 запусков); 2-битной
-сборке Strata Coder той же модели понадобился ход с исправлением. Эксперты помещаются на одну карту на 96 ГБ: промпт
-читается со скоростью **~840 токенов/с** — вчетверо быстрее полного файла на той же карте, — код пишется со скоростью
-**136–166 токенов/с**, в 41 ГБ видеопамяти вместо 60. Через CUDA она работает на **картах от 12 ГБ**: карта держит экспертов, которые
-поместились, остальных считают ядра процессора, и та же рабочая страница аквариума пишется со скоростью
-**145 / 175 / 207 токена/с** в 12 / 16 / 24 ГБ видеопамяти — 94 / 91 / 97 % скорости 2-битной Strata Coder на тех же картах, при
-том что эксперты остаются в 4 битах, а внимание — в 8. Запускается движком `cortiq` на Rust, без Python и
-ML-фреймворков.
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), урезанная под код: 256 из 512 экспертов
+каждого слоя в 4 битах, с общим экспертом, головой черновиков (MTP) и таблицей n-грамм, в одном файле
+[CMF](https://github.com/infosave2007/cmf) на 66.8 ГБ. Запускается движком `cortiq` на Rust.
 
-![Страница аквариума от Fast Code](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_aquarium.png)
+- **Одна карта от 48 ГБ:** промпт ~840 ток/с, код 136–166 ток/с, 41 ГБ видеопамяти.
+- **Карты NVIDIA от 12 ГБ (CUDA):** код 145 / 175 / 207 ток/с в 12 / 16 / 24 ГБ — 94 / 91 / 97 % скорости
+  2-битной Strata Coder, при экспертах в 4 битах и внимании в 8.
+- **HumanEval pass@1:** 93.3 % (164 задачи).
 
-*Жадный ответ Fast Code на ТЗ аквариума, как он написан: один HTML-файл, стеклянный аквариум, три рыбы-клоуна,
-растения и камни.*
+### Требования
 
-### Быстрый старт
+| | одна карта от 48 ГБ | карта NVIDIA от 12 ГБ |
+|---|---|---|
+| видеокарта | от 48 ГБ, Vulkan или CUDA | NVIDIA от 12 ГБ; драйвер 570+, библиотеки CUDA 12.8+ (`libnvrtc`, `libcublas`) |
+| процессор | любой x86-64 или ARM64 | x86-64 с AVX-512 VNNI (AMD Zen 4/5, Intel Sapphire Rapids и новее), от 8 потоков |
+| ОЗУ | 32 ГБ (таблица n-грамм, 28 ГБ, живёт в ОЗУ) | 64 ГБ |
+| диск | 67 ГБ | 67 ГБ |
+| cortiq | 0.8.65 или новее, [готовые сборки](https://github.com/infosave2007/cmf/releases) или `cargo install` | 0.8.78 или новее, сборка с `--features cuda` (в готовых сборках CUDA нет) |
+
+Проверено на Linux.
+
+### Установка
 
 ```bash
+# карта от 48 ГБ (Vulkan); либо готовая сборка со страницы релизов
 cargo install cortiq-cli --locked
-hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile --local-dir .
+
+# карта NVIDIA от 12 ГБ (CUDA): Rust 1.88+, затем
+cargo install cortiq-cli --locked --features cuda
+```
+
+### Загрузка
+
+```bash
+pip install -U huggingface_hub
+hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile \
+  qwen38-flash-next-fast-code.cmf.sha256 --local-dir .
+sha256sum -c qwen38-flash-next-fast-code.cmf.sha256
+```
+
+### Запуск
+
+Карта от 48 ГБ:
+
+```bash
+CMF_QWEN_PROFILE=fast-code.profile \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+Карта NVIDIA от 12 ГБ:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH   # где лежат libnvrtc и libcublas
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+Сервер готов, когда отвечает на `/v1/models`; первый запуск читает файл на 66.8 ГБ, это минута и дольше. Затем:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "fast-code", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "Напиши функцию на Rust, которая разбирает semver, с тестами."}]}'
+```
+
+Точки входа: `/v1/chat/completions` (потоковый вывод, `tools`, `enable_thinking`), `/v1/completions`, `/v1/models`,
+`/healthz`, веб-панель на `/`. Черновики работают при `temperature: 0`. Любой редактор или агент с OpenAI API
+подключается к `http://127.0.0.1:8080/v1`.
+
+Один запрос без сервера:
+
+```bash
 CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --prompt-file task.txt --greedy --no-think
 ```
 
-Нужен cortiq 0.8.65 или новее. `--no-think` — ответ без рассуждений; без него поднимите `--max-tokens`. Для чата и
-редакторов держите модель загруженной через `cortiq serve` (OpenAI-совместимый сервер, см. выше).
+### Настройки
 
-Карта NVIDIA от 12 ГБ через CUDA (cortiq 0.8.78 или новее, сборка с признаком `cuda`):
+| переменная | что делает |
+|---|---|
+| `CMF_QWEN_PROFILE=fast-code.profile` | порядок экспертов на карте; задавайте всегда |
+| `CMF_GPU=cuda` | CUDA-бэкенд (сборка с `--features cuda`) |
+| `CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` | все эксперты закреплены в ОЗУ, ничто не ждёт диск; нужно 64 ГБ ОЗУ |
+| `CMF_QWEN_ROUTE_TAIL=0.05` | пропускать экспертов с долей маршрута токена меньше 5 % (так измерено) |
+| `CMF_SERVE_SLOTS=1` | один запрос за раз, на полной скорости |
+| `CMF_GPU_VRAM_MB=<МиБ>` | сколько памяти карты брать (по умолчанию — свободную) |
+| `CMF_QWEN_CUDA_GROW_MB=<МиБ>` | запас памяти карты под растущий контекст (по умолчанию 1024) |
+| `CMF_QWEN_CPU_EXPERT_THREADS=<n>` | потоки хоста для экспертов вне карты (по умолчанию все, кроме трёх) |
+| `CMF_GPU_ADAPTER=<n>` | какая видеокарта (`cortiq gpu` выводит список) |
+| `XDG_RUNTIME_DIR=/tmp` | Vulkan на Linux без экрана |
 
-```bash
-cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
-  cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
-```
+### Если не работает
+
+- **`libnvrtc (CUDA toolkit) was not found`** или **`qwen4 cuda: …; staying on the host path`**: поставьте CUDA
+  12.8+ и добавьте её `lib64` в `LD_LIBRARY_PATH`. После этого в логе есть `qwen4 cuda: arena prefilled with …`.
+- **Не хватает памяти карты**: закройте другие программы на GPU или задайте `CMF_GPU_VRAM_MB` чуть меньше.
+- **ОЗУ меньше 64 ГБ**: уберите `CMF_QWEN_CUDA_REG_ALL=1` (при нехватке и `CMF_QWEN_CUDA_REG=1`); работает медленнее.
+- **Процессор без AVX-512 VNNI**: каждый эксперт вне карты копируется на неё; работает, медленнее.
+- **Ответ начинается с рассуждений**: передайте `"enable_thinking": false` (`--no-think` для `cortiq run`).
+- **Медленный первый запрос**: веса ещё читаются с диска; держите сервер запущенным.
+
+### Скорость и точность
+
+Одна RTX PRO 6000 (96 ГБ, Vulkan), один поток, жадный выбор, без рассуждений, черновики включены. Strata Coder —
+2-битная сборка ISTA-DASLab той же модели на собственном движке Strata 0.1.58 (CUDA); полный файл — 512 экспертов,
+[q4tp](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf), cortiq.
+
+| | Fast Code | Strata Coder (Strata) | полный файл (cortiq) |
+|---|---:|---:|---:|
+| HumanEval pass@1 (164 задачи) | 93.3 % | 94.5 % | 94.5 % |
+| перплексия на коде, написанном после 20.10.2026 (8192 токена) | **3.337** | 3.436¹ | 3.366 |
+| перплексия на коде Rust (1536 токенов) | 4.900 | 4.690¹ | 4.111 |
+| промпт 1K / 4K / 16K / 32K токенов, ток/с | 798 / 827 / 844 / 842 | 1916 / 5492 / 7229 / 7659 | 171 / 208 / 206 / 210 |
+| генерация после промпта 4K / 16K / 32K, ток/с | 161 / 166 / 136 | 220 / 223 / 222 | 118 / 138 / 116 |
+| веса экспертов | 4 бита | 2 бита | 4 бита |
+| файл на диске | 66.8 ГБ | 58.4 ГБ + 5.2 ГБ MTP | 98.6 ГБ |
+| пик видеопамяти (контекст 32K) | 40.9 ГБ | 31.1 ГБ | 59.6 ГБ |
+
+¹ Веса Strata Coder, импортированные в CMF и запущенные cortiq: один текст и один токенизатор.
+
+Карты NVIDIA от 12 ГБ: одна RTX 5090, ограниченная указанной памятью, хост 2× EPYC 9554 (31 поток, 62 ГБ ОЗУ),
+команда выше, генерация кода по ТЗ на 2 151 токен, среднее двух запусков. Strata Coder — на той же машине с кешем на
+1 500 / 3 000 / 5 000 экспертов (10,7 / 14,5 / 19,6 ГБ карты).
+
+| память карты | Fast Code (cortiq), ток/с | Strata Coder (Strata), ток/с | | HumanEval, первые 40 |
+|---|---:|---:|---:|---:|
+| 12 ГБ | **145.0** | 154.1 | 94 % | 38 / 40 |
+| 16 ГБ | **174.6** | 192.5 | 91 % | 39 / 40 |
+| 24 ГБ | **206.7** | 212.0 | 97 % | 39 / 40 |
+
+![Скорость](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_ru.png)
+
+![Точность на коде](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_quality_ru.png)
 
 ### Файлы
 
 | файл | содержимое | размер |
 |---|---|---:|
-| `qwen38-flash-next-fast-code.cmf` | 256 из 512 экспертов слоя (4 бита, q4tp) и общий эксперт; внимание, эмбеддинги и выходная голова — 8 бит; таблица n-грамм — 4 бита; голова черновиков (MTP) | 66.76 ГБ |
+| `qwen38-flash-next-fast-code.cmf` | 256 из 512 экспертов слоя (4 бита, q4tp) и общий эксперт; внимание, эмбеддинги и выходная голова в 8 битах; таблица n-грамм в 4 битах; голова черновиков (MTP) | 66.76 ГБ |
 | `fast-code.profile` | профиль маршрутизации (не веса): порядок экспертов на карте | 49 КБ |
+| `qwen38-flash-next-fast-code.cmf.sha256` | контрольная сумма | |
 
-Оставлены эксперты, к которым чаще всего обращаются два текста, каждый нормирован, веса равные: 450 КБ задач и решений
-(Magicoder OSS-Instruct на всех его языках и Evol-Instruct) и ТЗ аквариума с шестью ответами на него. Они держат 83 %
-массы маршрутизации кода и 81 % задачи; срез только по коду держал 87 % и 65 %, и его страница аквариума не работала.
-ТЗ аквариума было среди текстов отбора. Срез сделан под код; для общего чата нужен
-[полный файл](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf).
-
-### Скорость и точность
-
-Одна RTX PRO 6000 (96 ГБ, Vulkan), один поток, один HTTP-клиент и одни промпты, жадный выбор, без рассуждений, черновики
-включены. Strata Coder — 2-битная сборка ISTA-DASLab той же модели на собственном движке Strata 0.1.58 (на основе
-llama.cpp, CUDA).
-
-| | Fast Code | Strata Coder (Strata) | полный файл (cortiq) |
-|---|---:|---:|---:|
-| ТЗ аквариума, жадно: рабочая страница | **с первой попытки** | после хода с исправлением | с первой попытки |
-| HumanEval pass@1 (164 задачи) | 93.3 % | 94.5 % | 94.5 % |
-| перплексия на коде после 20.10.2026 (8192 токена) | **3.337** | 3.436¹ | 3.366 |
-| перплексия на Rust (1536 токенов) | 4.900 | 4.690¹ | 4.111 |
-| промпт 1K / 4K / 16K / 32K токенов, ток/с | 798 / 827 / 844 / 842 | 1916 / 5492 / 7229 / 7659 | 171 / 208 / 206 / 210 |
-| генерация после промпта 4K / 16K / 32K, ток/с | 161 / 166 / 136 | 220 / 223 / 222 | 118 / 138 / 116 |
-| пик VRAM (контекст 32K) | 40.9 ГБ | 31.1 ГБ | 59.6 ГБ |
-
-¹ Веса Strata Coder, импортированные в CMF и запущенные cortiq: один текст и один токенизатор. HumanEval: ±3 задачи —
-разброс между прогонами. Скорости Fast Code — среднее двух прогонов.
-
-![Скорость на одной RTX PRO 6000](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_ru.png)
-
-![Точность на коде](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_quality_ru.png)
-
-### Карты от 12 ГБ (CUDA)
-
-CUDA-бэкенд обслуживает файл на карте, куда все эксперты не помещаются. Карта держит тех,
-что поместились, начиная с самых востребованных по профилю маршрутизации; эксперта вне карты считают ядра процессора
-(ядро AVX-512 VNNI на 4-битных весах), пока карта считает своих, а эксперты, к которым текст обращается постоянно,
-переезжают на карту между токенами. В 12 ГБ карта держит 927 экспертов из 12 288 и 512 экспертов головы черновиков.
-
-| память карты | Fast Code (cortiq), ток/с | Strata Coder (Strata), ток/с | Fast Code к Strata Coder |
-|---|---:|---:|---:|
-| 12 ГБ | **145.0** | 154.1 | 94 % |
-| 16 ГБ | **174.6** | 192.5 | 91 % |
-| 24 ГБ | **206.7** | 212.0 | 97 % |
-| веса экспертов | 4 бита | 2 бита | |
-
-Одна RTX 5090, ограниченная указанной памятью (`CMF_GPU_VRAM_MB`), хост 2× EPYC 9554 с 31 потоком и 62 ГБ ОЗУ на
-контейнер, один запрос за раз, жадный выбор, без рассуждений, черновики включены, команда из быстрого старта;
-скорость аквариума — среднее двух запусков, и в каждом ответ — полная рабочая страница. Strata Coder запускалась на
-том же поде с кешем экспертов на 1 500 / 3 000 / 5 000 экспертов — 10,7 / 14,5 / 19,6 ГБ карты. Fast Code тратит
-память карты на более точные веса: 2-битная сборка меньше и быстрее читается, а перплексия на коде ниже у Fast Code
-(3.337 против 3.436, см. выше). Из первых 40 задач HumanEval в 12 / 16 / 24 ГБ проходят 38 / 39 / 39.
-Хосту нужны AVX-512 VNNI
-(Zen 4, Sapphire Rapids и новее) и не меньше восьми потоков; на другом хосте каждый недостающий эксперт копируется на
-карту, что медленнее. `CMF_QWEN_CPU_EXPERT_THREADS` задаёт число потоков хоста.
-`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` закрепляют в памяти всех экспертов, чтобы ни хост, ни карта не ждали их с диска.
-
-### Железо и длинный контекст
-
-Эксперты лежат на карте: около 41 ГБ VRAM при контексте 32K и 28 ГБ оперативной памяти под таблицу n-грамм. Карта
-от 12 ГБ запускает модель через CUDA, а не поместившихся экспертов считают ядра процессора (см. выше); файл при этом
-лежит в оперативной памяти (измерено с 62 ГБ). Внимание точное до 262 144 токенов; скорость
-генерации держится: 166 ток/с после 16K токенов, 136 — после 32K.
+Оставлены эксперты, к которым код обращается чаще всего. Для общего чата —
+[полный файл](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf). Внимание точное до 262 144 токенов.
+Веса получены из релиза Qwen и остаются под его лицензией. Проверяйте сгенерированный код перед запуском.
 
 ---
 
 ## 中文文档
 
-[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) 的代码专用裁剪版：每层 512 个路由专家中保留代码与一个大型前端任务最常用的
-256 个（4 位），连同共享专家、草稿（MTP）头和 n-gram 表，打包为一个 66.8 GB 的 [CMF](https://github.com/infosave2007/cmf) 文件。
-面对 2 151 token 的 3D 水族箱需求说明，它**一次写出可运行的 three.js 页面**（4 次中 4 次）；同一模型的 2 位 Strata Coder 裁剪版需要一轮修复。
-专家可完整放入一张 96 GB 显卡：读取提示约 **840 token/s**，是同卡完整文件的 4 倍；生成代码 **136–166 token/s**，显存 41 GB 而非 60 GB。
-通过 CUDA 可在 **12 GB 起的显卡**上运行：显卡保留放得下的专家，其余由主机 CPU 核心计算，在 12 / 16 / 24 GB 显存内以
-**145 / 175 / 207 token/s** 写出同一可运行的水族箱页面：在同样的显卡上达到 2 位 Strata Coder 速度的 94 / 91 / 97 %，而专家保持 4 位、注意力保持 8 位。使用 `cortiq` 运行：Rust 推理引擎，无需 Python 和机器学习框架。
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) 的代码专用裁剪版：每层 512 个路由专家保留 256 个（4 位），
+连同共享专家、草稿（MTP）头和 n-gram 表，打包为一个 66.8 GB 的 [CMF](https://github.com/infosave2007/cmf) 文件，由 Rust 推理引擎 `cortiq` 运行。
 
-![Fast Code 写出的水族箱页面](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_aquarium.png)
+- **一张 48 GB 以上的显卡：** 读取提示约 840 token/s，生成代码 136–166 token/s，显存 41 GB。
+- **12 GB 起的 NVIDIA 显卡（CUDA）：** 在 12 / 16 / 24 GB 内生成代码 145 / 175 / 207 token/s，为 2 位 Strata Coder
+  速度的 94 / 91 / 97 %，专家保持 4 位、注意力保持 8 位。
+- **HumanEval pass@1：** 93.3 %（164 题）。
 
-*Fast Code 对水族箱需求的贪心回答，按原样渲染：一个 HTML 文件，玻璃水族箱、三条小丑鱼、水草和石头。*
+### 环境要求
 
-### 快速开始
+| | 一张 48 GB 以上的显卡 | 12 GB 起的 NVIDIA 显卡 |
+|---|---|---|
+| 显卡 | 48 GB 以上，Vulkan 或 CUDA | NVIDIA 12 GB 以上；驱动 570+，CUDA 12.8+ 库（`libnvrtc`、`libcublas`） |
+| CPU | 任意 x86-64 或 ARM64 | 支持 AVX-512 VNNI 的 x86-64（AMD Zen 4/5、Intel Sapphire Rapids 或更新），8 线程以上 |
+| 内存 | 32 GB（n-gram 表 28 GB 常驻内存） | 64 GB |
+| 磁盘 | 67 GB | 67 GB |
+| cortiq | 0.8.65 或更高，[预编译版本](https://github.com/infosave2007/cmf/releases)或 `cargo install` | 0.8.78 或更高，以 `--features cuda` 构建（预编译版本不含 CUDA） |
+
+已在 Linux 上验证。
+
+### 安装
 
 ```bash
+# 48 GB 以上的显卡（Vulkan）；或从发布页下载预编译版本
 cargo install cortiq-cli --locked
-hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile --local-dir .
+
+# 12 GB 起的 NVIDIA 显卡（CUDA）：Rust 1.88+，然后
+cargo install cortiq-cli --locked --features cuda
+```
+
+### 下载
+
+```bash
+pip install -U huggingface_hub
+hf download infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf fast-code.profile \
+  qwen38-flash-next-fast-code.cmf.sha256 --local-dir .
+sha256sum -c qwen38-flash-next-fast-code.cmf.sha256
+```
+
+### 运行
+
+48 GB 以上的显卡：
+
+```bash
+CMF_QWEN_PROFILE=fast-code.profile \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+12 GB 起的 NVIDIA 显卡：
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH   # libnvrtc 与 libcublas 所在目录
+CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
+  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
+  cortiq serve qwen38-flash-next-fast-code.cmf --host 127.0.0.1 --port 8080
+```
+
+服务器在 `/v1/models` 有响应即就绪；首次启动需读取 66.8 GB 文件，约一分钟或更久。然后：
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "fast-code", "enable_thinking": false, "temperature": 0,
+       "messages": [{"role": "user", "content": "用 Rust 写一个解析语义化版本号的函数，并附测试。"}]}'
+```
+
+接口：`/v1/chat/completions`（流式、`tools`、`enable_thinking`）、`/v1/completions`、`/v1/models`、`/healthz`，`/` 为网页面板。
+`temperature: 0` 时启用草稿。任何兼容 OpenAI 的编辑器或智能体都可连接 `http://127.0.0.1:8080/v1`。
+
+不启动服务器、单次提示：
+
+```bash
 CMF_QWEN_PROFILE=fast-code.profile cortiq run qwen38-flash-next-fast-code.cmf --prompt-file task.txt --greedy --no-think
 ```
 
-需要 cortiq 0.8.65 或更高版本。`--no-think` 直接回答；否则模型先推理，请调大 `--max-tokens`。聊天与编辑器请用
-`cortiq serve`（兼容 OpenAI 的服务器）保持模型常驻。
+### 设置
 
-12 GB 起的 NVIDIA 显卡通过 CUDA 运行（cortiq 0.8.78 或更高版本，启用 `cuda` 特性构建）：
+| 变量 | 作用 |
+|---|---|
+| `CMF_QWEN_PROFILE=fast-code.profile` | 专家在显卡上的顺序；务必设置 |
+| `CMF_GPU=cuda` | CUDA 后端（需 `--features cuda` 构建） |
+| `CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` | 全部专家锁定在内存中，不等待磁盘；需要 64 GB 内存 |
+| `CMF_QWEN_ROUTE_TAIL=0.05` | 跳过路由权重低于 5 % 的专家（测试所用设置） |
+| `CMF_SERVE_SLOTS=1` | 一次一个请求，全速 |
+| `CMF_GPU_VRAM_MB=<MiB>` | 模型可用的显存上限（默认：全部空闲显存） |
+| `CMF_QWEN_CUDA_GROW_MB=<MiB>` | 为增长的上下文预留的显存（默认 1024） |
+| `CMF_QWEN_CPU_EXPERT_THREADS=<n>` | 计算显卡外专家的主机线程数（默认：除三个外的全部） |
+| `CMF_GPU_ADAPTER=<n>` | 选择显卡（`cortiq gpu` 列出） |
+| `XDG_RUNTIME_DIR=/tmp` | 无显示器的 Linux 上使用 Vulkan |
 
-```bash
-cargo install cortiq-cli --locked --features cuda
-CMF_GPU=cuda CMF_QWEN_PROFILE=fast-code.profile CMF_QWEN_ROUTE_TAIL=0.05 \
-  CMF_SERVE_SLOTS=1 CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1 \
-  cortiq serve qwen38-flash-next-fast-code.cmf --port 8080 --host 127.0.0.1
-```
+### 常见问题
+
+- 日志出现 `libnvrtc (CUDA toolkit) was not found` 或 `qwen4 cuda: …; staying on the host path`：安装 CUDA 12.8+，并把其
+  `lib64` 加入 `LD_LIBRARY_PATH`。之后日志中会出现 `qwen4 cuda: arena prefilled with …`。
+- **显存不足**：关闭其他使用 GPU 的程序，或把 `CMF_GPU_VRAM_MB` 设小一些。
+- **内存不足 64 GB**：去掉 `CMF_QWEN_CUDA_REG_ALL=1`（必要时也去掉 `CMF_QWEN_CUDA_REG=1`），速度会变慢。
+- **CPU 不支持 AVX-512 VNNI**：显卡外的专家改为复制到显卡；可以运行，但更慢。
+- **回答以推理开头**：发送 `"enable_thinking": false`（`cortiq run` 用 `--no-think`）。
+- **首个请求较慢**：权重仍在从磁盘读取；请保持服务器运行。
 
 ### 速度与准确率
 
-一张 RTX PRO 6000（96 GB，Vulkan），单路请求，所有行使用同一 HTTP 客户端与提示，贪心解码，关闭思考，开启草稿。
+一张 RTX PRO 6000（96 GB，Vulkan），单路，贪心解码，关闭思考，开启草稿。Strata Coder 是 ISTA-DASLab 对同一模型的 2 位裁剪版，
+运行于其自有引擎 Strata 0.1.58（CUDA）；完整文件为 512 专家的 [q4tp 文件](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf)，由 cortiq 运行。
 
 | | Fast Code | Strata Coder（Strata） | 完整文件（cortiq） |
 |---|---:|---:|---:|
-| 水族箱需求，贪心：可运行页面 | 一次成功 | 一轮修复后 | 一次成功 |
-| HumanEval pass@1（164 题） | 93.3% | 94.5% | 94.5% |
-| 2026-10-20 之后代码的困惑度（8192 token） | 3.337 | 3.436¹ | 3.366 |
-| Rust 代码困惑度（1536 token） | 4.900 | 4.690¹ | 4.111 |
+| HumanEval pass@1（164 题） | 93.3 % | 94.5 % | 94.5 % |
+| 代码困惑度，2026-10-20 之后写的代码（8192 token） | **3.337** | 3.436¹ | 3.366 |
+| 代码困惑度，Rust（1536 token） | 4.900 | 4.690¹ | 4.111 |
 | 提示 1K / 4K / 16K / 32K token，token/s | 798 / 827 / 844 / 842 | 1916 / 5492 / 7229 / 7659 | 171 / 208 / 206 / 210 |
 | 4K / 16K / 32K 提示后的生成，token/s | 161 / 166 / 136 | 220 / 223 / 222 | 118 / 138 / 116 |
+| 专家权重 | 4 位 | 2 位 | 4 位 |
+| 磁盘文件 | 66.8 GB | 58.4 GB + 5.2 GB MTP | 98.6 GB |
 | 显存峰值（32K 上下文） | 40.9 GB | 31.1 GB | 59.6 GB |
 
-¹ Strata Coder 权重导入 CMF 后由 cortiq 运行：相同文本与分词器。HumanEval 的 ±3 题属于运行间波动。Fast Code 的速度为两次运行的平均值。
+¹ Strata Coder 的权重导入 CMF 后由 cortiq 运行：两者使用相同文本与分词器。
 
-专家选择：两段文本各自归一化、等权合并——450 KB 编程任务与答案（Magicoder OSS-Instruct、Evol-Instruct）以及水族箱需求及其六个回答；覆盖代码路由质量的 83%、任务的 81%。水族箱需求属于选择文本。
+12 GB 起的 NVIDIA 显卡：一张 RTX 5090，限制为表中显存，主机 2× EPYC 9554（31 线程，62 GB 内存），上面的命令，按 2 151 token 的需求生成代码，
+两次运行的平均值。Strata Coder 在同一台机器上运行，专家缓存 1 500 / 3 000 / 5 000 个（占显卡 10.7 / 14.5 / 19.6 GB）。
 
-![单张 RTX PRO 6000 上的速度](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_zh.png)
+| 显存 | Fast Code（cortiq），token/s | Strata Coder（Strata），token/s | | HumanEval 前 40 题 |
+|---|---:|---:|---:|---:|
+| 12 GB | **145.0** | 154.1 | 94 % | 38 / 40 |
+| 16 GB | **174.6** | 192.5 | 91 % | 39 / 40 |
+| 24 GB | **206.7** | 212.0 | 97 % | 39 / 40 |
+
+![速度](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_speed_zh.png)
 
 ![代码准确率](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf/resolve/main/assets/fc_quality_zh.png)
 
-### 12 GB 起的显卡（CUDA）
+### 文件
 
-CUDA 后端可在放不下全部专家的显卡上运行该文件。显卡保留放得下的专家，按路由画像从最常用的开始；
-路由到显卡之外的专家由主机 CPU 核心计算（针对 4 位权重的 AVX-512 VNNI 内核），显卡同时计算已保留的专家；文本反复使用的专家会在
-token 之间迁入显卡。在 12 GB 内，显卡保留 12 288 个专家中的 927 个以及草稿头的 512 个。
+| 文件 | 内容 | 大小 |
+|---|---|---:|
+| `qwen38-flash-next-fast-code.cmf` | 每层 512 个路由专家中的 256 个（4 位 q4tp）与共享专家；注意力、嵌入与输出头 8 位；n-gram 表 4 位；草稿（MTP）头 | 66.76 GB |
+| `fast-code.profile` | 路由画像（非权重）：专家在显卡上的顺序 | 49 KB |
+| `qwen38-flash-next-fast-code.cmf.sha256` | 校验和 | |
 
-| 显存 | Fast Code（cortiq），token/s | Strata Coder（Strata），token/s | Fast Code 相对 Strata Coder |
-|---|---:|---:|---:|
-| 12 GB | **145.0** | 154.1 | 94 % |
-| 16 GB | **174.6** | 192.5 | 91 % |
-| 24 GB | **206.7** | 212.0 | 97 % |
-| 专家权重 | 4 位 | 2 位 | |
-
-一张 RTX 5090，限制为表中显存（`CMF_GPU_VRAM_MB`），主机为 2× EPYC 9554，容器可用 31 个线程和 62 GB 内存，单路请求，贪心解码，
-关闭思考，开启草稿，命令见快速开始；水族箱速度为两次运行的平均值，每次的回答都是完整可运行的页面。Strata Coder 在同一台机器上运行，
-专家缓存为 1 500 / 3 000 / 5 000 个专家，占显卡 10.7 / 14.5 / 19.6 GB。Fast Code 把显存用在更精确的权重上：2 位裁剪版更小、读取更快，
-而代码困惑度更低的是 Fast Code（3.337 对 3.436，见上文）。在 12 / 16 / 24 GB 内，HumanEval 前 40 题分别通过 38 / 39 / 39 题。主机需要
-AVX-512 VNNI（Zen 4、Sapphire Rapids 或更新）和至少 8 个线程；否则每个缺失的专家都要复制到显卡，速度更慢。
-`CMF_QWEN_CPU_EXPERT_THREADS` 设置主机线程数。`CMF_QWEN_CUDA_REG=1 CMF_QWEN_CUDA_REG_ALL=1` 把全部专家锁定在内存中，主机和显卡都不必等待磁盘。
-
-### 硬件与长上下文
-
-专家常驻显卡：32K 上下文约 41 GB 显存，另需 28 GB 内存存放 n-gram 表。12 GB 起的显卡通过 CUDA 运行，放不下的专家由主机 CPU 核心计算（见上）；此时文件驻留在内存中（实测 62 GB）。
-注意力在显卡上精确支持到 262 144 token；生成速度随长度保持：16K 后 166 token/s，32K 后 136 token/s。
+保留的是代码最常路由到的专家。通用对话请使用[完整文件](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf)。注意力在 262 144 token 内为精确计算。
+权重源自 Qwen 的发布，仍受其许可约束。运行生成的代码前请先审阅。

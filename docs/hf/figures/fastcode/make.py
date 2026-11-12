@@ -22,8 +22,8 @@ T = {
         size="Size and memory", size_sub="file on disk and peak VRAM while serving",
         file="file, GB", vram="peak VRAM, GB", better="better",
         cards="Cards from 12 GB (CUDA)", cards_sub="one RTX 5090 held to the memory shown; the experts that do not fit run on the host's cores",
-        cards_y="the aquarium page written to the end, tok/s", cards_x="card memory",
-        cards_note=["{pct} of Strata Coder's speed on the same cards,", "with experts at 4 bits and attention at 8 bits:", "Strata Coder is a 2-bit cut of the same model", "", "the answer is a complete working page in every bar;", "{he} of the first 40 HumanEval tasks pass"],
+        cards_y="code generation, tok/s", cards_x="card memory",
+        cards_note=["{pct} of Strata Coder's speed on the same cards,", "with experts at 4 bits and attention at 8 bits:", "Strata Coder is a 2-bit cut of the same model", "", "{he} of the first 40 HumanEval tasks pass"],
     ),
     "ru": dict(
         speed="Скорость на одной RTX PRO 6000 (96 ГБ)", speed_sub="один под, один клиент, жадный выбор, без размышлений",
@@ -33,8 +33,8 @@ T = {
         size="Размер и память", size_sub="файл на диске и пик VRAM при работе сервера",
         file="файл, ГБ", vram="пик VRAM, ГБ", better="лучше",
         cards="Карты от 12 ГБ (CUDA)", cards_sub="одна RTX 5090, ограниченная указанной памятью; не поместившихся экспертов считают ядра процессора",
-        cards_y="страница аквариума, написанная до конца, ток/с", cards_x="память карты",
-        cards_note=["{pct} скорости Strata Coder на тех же картах,", "с экспертами в 4 битах и вниманием в 8 битах:", "Strata Coder — 2-битная сборка той же модели", "", "ответ в каждом столбце — полная рабочая страница;", "проходят {he} из первых 40 задач HumanEval"],
+        cards_y="генерация кода, ток/с", cards_x="память карты",
+        cards_note=["{pct} скорости Strata Coder на тех же картах,", "с экспертами в 4 битах и вниманием в 8 битах:", "Strata Coder — 2-битная сборка той же модели", "", "проходят {he} из первых 40 задач HumanEval"],
     ),
     "zh": dict(
         speed="单张 RTX PRO 6000（96 GB）上的速度", speed_sub="同一台机器、同一客户端、贪心解码、关闭思考",
@@ -44,8 +44,8 @@ T = {
         size="大小与显存", size_sub="磁盘文件与服务时的显存峰值",
         file="文件，GB", vram="显存峰值，GB", better="更好",
         cards="12 GB 起的显卡（CUDA）", cards_sub="一张 RTX 5090，限制为图中显存；放不下的专家由主机 CPU 核心计算",
-        cards_y="完整写出水族箱页面，tok/s", cards_x="显存",
-        cards_note=["在同样的显卡上达到 Strata Coder 速度的 {pct}，", "专家保持 4 位、注意力保持 8 位：", "Strata Coder 是同一模型的 2 位裁剪版", "", "每根柱子的回答都是完整可运行的页面；", "HumanEval 前 40 题通过 {he} 题"],
+        cards_y="生成代码，tok/s", cards_x="显存",
+        cards_note=["在同样的显卡上达到 Strata Coder 速度的 {pct}，", "专家保持 4 位、注意力保持 8 位：", "Strata Coder 是同一模型的 2 位裁剪版", "", "HumanEval 前 40 题通过 {he} 题"],
     ),
 }
 
