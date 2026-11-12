@@ -477,6 +477,9 @@ pub struct Pipeline {
     pub(crate) o1_turbo: Option<O1Turbo>,
     /// Over a far field the draft head starts at this prompt row, and counts from it.
     mtp_pos_base: usize,
+    /// A whole prompt's tail rows read by the far field's prefix (the draft
+    /// head is warmed over them).
+    o1_prefix_tail: Vec<f32>,
     /// The CUDA hybrid arm's chat snapshot: the prompt ids before the last
     /// turn's assistant header, whose GDN states the card keeps a copy of
     /// (`gpu::gdn_snapshot`). The next turn that starts with them goes back
@@ -4916,6 +4919,7 @@ impl Pipeline {
             o1_cfg: None,
             o1_turbo: None,
             mtp_pos_base: 0,
+            o1_prefix_tail: Vec::new(),
             gdn_snap: None,
             mtp_warm_base: None,
             o1_epoch: 0,
@@ -5930,9 +5934,6 @@ impl Pipeline {
         self.o1_active()
             && self.o1_on_graph()
             && self.o1_graph_backend()
-            // the CUDA backend verifies no window over a far field: past
-            // the seal it decodes token by token
-            && !crate::gpu::cuda_active()
             && (self.o1_turbo.is_some() || std::env::var("CMF_O1_SPEC").as_deref() == Ok("1"))
             && std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
     }
@@ -6081,6 +6082,7 @@ impl Pipeline {
         let n = ids.len();
         let mut last = vec![0f32; hs];
         let mut pos = 0;
+        self.o1_prefix_tail.clear();
         // `CMF_PREFILL_PROF`: where the prefix's time goes (the chunks, the
         // queries off the card, the K/V rows off the card, their way into the cache).
         let prof = std::env::var("CMF_PREFILL_PROF").is_ok();
@@ -6107,6 +6109,12 @@ impl Pipeline {
             match outcome {
                 crate::gpu::BatchGraphOutcome::Completed => {
                     last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
+                    // the prompt's tail for the draft head over the far field
+                    let tail_from = n.saturating_sub(crate::dory::EXACT_TAIL);
+                    if end > tail_from {
+                        let from = pos.max(tail_from);
+                        self.o1_prefix_tail.extend_from_slice(&hiddens[(from - pos) * hs..]);
+                    }
                 }
                 crate::gpu::BatchGraphOutcome::Declined if pos == 0 => {
                     let _ = crate::gpu::o1_qcap_take();
@@ -6151,6 +6159,56 @@ impl Pipeline {
             .ok_or("O(1) prefix: K/V readback failed")?;
         let (t_kv, t_app) = (t_kv.elapsed().as_secs_f64(), std::time::Instant::now());
         let row = nkv * hd;
+        if arch.is_none() {
+            // without an archive each layer's rows go into its own cache: the
+            // layers side by side
+            for ((&li, q), (k, v)) in o1_layers.iter().zip(&qs).zip(&kv) {
+                if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
+                    return Err(format!(
+                        "O(1) prefix: layer {li} read back {}/{}/{} values, expected {}/{}/{}",
+                        k.len(),
+                        v.len(),
+                        q.len(),
+                        n * row,
+                        n * row,
+                        n.div_ceil(QT_STRIDE) * qrow
+                    ));
+                }
+            }
+            let mut work: Vec<(&mut crate::kv_cache::LayerKvCache, Vec<f32>, (Vec<f32>, Vec<f32>))> = Vec::new();
+            let mut by_layer: Vec<Option<(Vec<f32>, (Vec<f32>, Vec<f32>))>> = (0..self.kv_cache.layers.len()).map(|_| None).collect();
+            for ((&li, q), kvp) in o1_layers.iter().zip(qs).zip(kv) {
+                by_layer[li] = Some((q, kvp));
+            }
+            for (cache, slot) in self.kv_cache.layers.iter_mut().zip(by_layer) {
+                if let Some((q, kvp)) = slot {
+                    work.push((cache, q, kvp));
+                }
+            }
+            let par = std::thread::available_parallelism().map_or(1, |p| p.get()).clamp(1, 8);
+            let per = work.len().div_ceil(par).max(1);
+            std::thread::scope(|sc| {
+                for part in work.chunks_mut(per) {
+                    sc.spawn(move || {
+                        for (cache, q, (k, v)) in part.iter_mut() {
+                            cache.o1_set_q_stride(QT_STRIDE);
+                            cache.reserve_rows(n);
+                            for p in 0..n {
+                                cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
+                            }
+                            cache.o1_set_q_trace(std::mem::take(q));
+                        }
+                    });
+                }
+            });
+            if prof {
+                eprintln!(
+                    "o1 prefix: {n} rows, chunks {t_chunks:.2} s, queries off the card {t_q:.2} s, K/V off the card {t_kv:.2} s, into the cache {:.2} s",
+                    t_app.elapsed().as_secs_f64()
+                );
+            }
+            return Ok(Some(last));
+        }
         for ((&li, q), (k, v)) in o1_layers.iter().zip(qs).zip(kv) {
             if k.len() != n * row || v.len() != n * row || q.len() != n.div_ceil(QT_STRIDE) * qrow {
                 return Err(format!(
@@ -7273,6 +7331,22 @@ impl Pipeline {
                     Ok(Some(last)) => {
                         hidden.copy_from_slice(&last);
                         pos = px_len;
+                        // the whole prompt went by the prefix (CUDA): the draft head
+                        // reads its tail, as over the wgpu path's far field
+                        let tail = std::mem::take(&mut self.o1_prefix_tail);
+                        if px_len == input_ids.len() && mtp.is_some() && !tail.is_empty() {
+                            let hs = self.hidden_size;
+                            let from = px_len - tail.len() / hs;
+                            self.mtp_pos_base = from;
+                            let n_pairs = mtp_prefill_pair_count(from, px_len, input_ids.len());
+                            let pairs: Vec<(&[f32], u32)> = (0..n_pairs).map(|j| (&tail[j * hs..(j + 1) * hs], input_ids[from + j + 1])).collect();
+                            let warm_error = if let Some(m) = mtp.as_mut() { self.mtp_warm_prefill_pairs(m, &pairs, from).err() } else { None };
+                            if let Some(err) = warm_error {
+                                self.finish_generation(&mut mtp, &mut router, true);
+                                return Err(err.to_string());
+                            }
+                            self.mtp_warm_base = Some(from);
+                        }
                         if std::env::var("CMF_PREFILL_PROF").is_ok() {
                             eprintln!(
                                 "o1 prefix on the batch graph: {px_len} rows in {:.1} ms",

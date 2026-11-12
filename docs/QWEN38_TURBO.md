@@ -13,6 +13,7 @@ cargo install cortiq-cli
 hf download infosave/Qwen3.8-27B-Turbo-cmf qwen38-27b-turbo.cmf --local-dir .
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think   # a build with --features cuda
 ```
 
 | option | meaning |
@@ -158,7 +159,8 @@ same command with a fit of their own; only Qwen3.8-27B has been measured.
 
 ## What stays out
 
-- The far field runs on Vulkan, DX12 and Metal (`gpu_metal/o1c.rs`). On the CPU the file runs as the standard one. It was
+- The far field runs on Vulkan, DX12, Metal (`gpu_metal/o1c.rs`) and CUDA ([docs/CUDA.md](CUDA.md#hybrids-the-qwen35-family): the prompt is
+  read whole on the card and sealed once, so there is no fixed ceiling on CUDA). On the CPU the file runs as the standard one. It was
   measured on an NVIDIA card and an M4.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact. The fit saw planted
   facts, and other kinds of important text were not tested.

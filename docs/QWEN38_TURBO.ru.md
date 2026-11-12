@@ -13,6 +13,7 @@ cargo install cortiq-cli
 hf download infosave/Qwen3.8-27B-Turbo-cmf qwen38-27b-turbo.cmf --local-dir .
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think
 cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
+CMF_GPU=cuda cortiq run qwen38-27b-turbo.cmf --prompt-file report.txt --greedy --no-think   # сборка с --features cuda
 ```
 
 | параметр | значение |
@@ -159,7 +160,8 @@ cortiq far-turbo qwen38-27b-q4tp.cmf qwen38-27b-turbo.cmf --exact-weights keep27
 
 ## Что не вошло
 
-- Дальнее поле работает на Vulkan, DX12 и Metal (`gpu_metal/o1c.rs`). На CPU файл идёт как обычный. Замеры сделаны на карте NVIDIA и на M4.
+- Дальнее поле работает на Vulkan, DX12, Metal (`gpu_metal/o1c.rs`) и CUDA ([docs/CUDA.ru.md](CUDA.ru.md): промпт
+  читается на карте целиком и запечатывается один раз, так что постоянного потолка на CUDA нет). На CPU файл идёт как обычный. Замеры сделаны на карте NVIDIA и на M4.
 - За местом запечатывания текст приближённый: далёкое блекнет, кроме строк, оставленных точными. Модель видела вставленные
   факты; другие виды важного текста не проверялись.
 - Строки, пришедшие после конца промпта, остаются в окне или уходят в дальнее поле. Ход, который расходится с запечатанным

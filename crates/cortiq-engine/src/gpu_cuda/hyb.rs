@@ -33,6 +33,7 @@ const HYB_SRC: &str = include_str!("hyb.cu");
 
 /// The DFlash 2 block on the card, on this arm's kernels.
 pub(super) mod dflash;
+pub(super) mod dory;
 /// Rows of the small path.
 pub(super) const NMAX: usize = 16;
 /// Stages of `CMF_CUDA_PROF=1` on the small path (each closed by a stream
@@ -157,6 +158,7 @@ pub(super) struct HFuncs {
     softmax_h: cs::CUfunction,
     far_insert: cs::CUfunction,
     far_prep: cs::CUfunction,
+    far_prep_b: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -204,6 +206,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         softmax_h: func(module, "hy_softmax_h")?,
         far_insert: func(module, "hy_far_insert")?,
         far_prep: func(module, "hy_far_prep")?,
+        far_prep_b: func(module, "hy_far_prep_b")?,
     })
 }
 
@@ -1422,6 +1425,13 @@ struct HO1 {
     far_len: usize,
     scale: f32,
     rect_fm: bool,
+    /// A verify window's rows (the first row's index, rows): written after the
+    /// near rows, not yet in the window; `spec_commit` moves the accepted ones.
+    spec: Option<(usize, usize)>,
+    /// The layer's geometry: KV heads, query heads a KV head, head width.
+    nkv: usize,
+    hpk: usize,
+    hd: usize,
 }
 
 /// A sealed layer's far field up for this epoch (unless it is already).
@@ -1456,8 +1466,9 @@ fn o1_ensure(c: &Ctx, st: &mut State, key: (u64, usize), views: &[crate::nystrom
     }
     let row = nkv * hd;
     let h16 = cortiq_core::quant::f32_to_f16;
-    let mut nk = vec![0u16; (ns + w) * row];
-    let mut nv = vec![0u16; (ns + w) * row];
+    // room after the near rows for a verify window's rows
+    let mut nk = vec![0u16; (ns + w + NMAX) * row];
+    let mut nv = vec![0u16; (ns + w + NMAX) * row];
     let (mut kt, mut qt, mut mu, mut mz, mut th) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (g, v) in views.iter().enumerate() {
         let have = (v.win_k.len() / hd).min(v.win_v.len() / hd).min(w);
@@ -1510,6 +1521,10 @@ fn o1_ensure(c: &Ctx, st: &mut State, key: (u64, usize), views: &[crate::nystrom
         far_len: g0.far_len,
         scale: g0.scale,
         rect_fm,
+        spec: None,
+        nkv,
+        hpk,
+        hd,
     };
     if debug() {
         eprintln!(
@@ -1586,12 +1601,30 @@ fn book(
                 gs.next_pos = pos0 + n;
                 gs.tape = if tape { Some((pos0, n)) } else { None };
             }
+            Mix::Attn(_) if st.hyb.o1.contains_key(&key) && sealed.get(li).copied().unwrap_or(false) && (tape || n > 1) => {
+                // a verify window over the far field: its rows after the near
+                // ones, read by the rows after them; the state moves over the
+                // accepted ones only (`spec_commit`)
+                if n > NMAX {
+                    return Err("a verify window over a far field of more than 16 rows".into());
+                }
+                let d = st.hyb.o1.get_mut(&key).unwrap();
+                let base = d.ns + d.win_len;
+                d.spec = Some((base, n));
+                let keys = base + n;
+                let rb = attn_rb(keys);
+                let ncap = keys.next_multiple_of(4096);
+                let nbcap = ncap.div_ceil(rb) + 1;
+                ci.extend([base as i32, base as i32, rb as i32, ncap as i32, nbcap as i32, 1, base as i32, (d.far_len > 0) as i32]);
+                layers.push([d.nk.ptr, d.nv.ptr, d.kt.ptr, d.qt.ptr, d.mu.ptr, d.mz.ptr, d.th.ptr]);
+                far.push(1);
+                farp.push((d.m, d.scale, d.rect_fm));
+                keys_max = keys_max.max(keys);
+                continue;
+            }
             Mix::Attn(_) if st.hyb.o1.contains_key(&key) && sealed.get(li).copied().unwrap_or(false) => {
                 // the far field (`nystrom.rs` advance): the ring row the new
                 // key replaces goes into the far sums first, once the ring is full
-                if n != 1 {
-                    return Err("a far field takes one row a call".into());
-                }
                 let d = st.hyb.o1.get_mut(&key).unwrap();
                 let full = d.win_len == d.w;
                 let row = d.ns + if full { d.win_head } else { d.win_len };
@@ -1768,8 +1801,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         let (fm_i, nkv_i2) = (fm as i32, nkv as i32);
                         c.launch(
                             fx.far_insert,
-                            (nkv as u32, 1),
-                            (plan.hpk * fm) as u32,
+                            ((nkv * plan.hpk * fm).div_ceil(8) as u32, 1),
+                            256,
                             0,
                             kargs!(kp, vp, lb[3], lb[5], lb[6], cip, fm_i, nkv_i2, fscale),
                         )?;
@@ -1795,14 +1828,25 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     )?;
                     if far != 0 {
                         // the far part: one more block of P and E, and its maximum
+                        // (each row of a verify window its own)
                         let (fm_i, frect_i) = (fm as i32, frect as i32);
-                        c.launch(
-                            fx.far_prep,
-                            (nh as u32, 1),
-                            64,
-                            0,
-                            kargs!(plan.qg.ptr, lb[2], lb[4], lb[5], lb[6], mx_p, p_p, e_p, cip, fm_i, nh_i, fscale, frect_i),
-                        )?;
+                        if n == 1 {
+                            c.launch(
+                                fx.far_prep,
+                                (nh as u32, 1),
+                                256,
+                                0,
+                                kargs!(plan.qg.ptr, lb[2], lb[4], lb[5], lb[6], mx_p, p_p, e_p, cip, fm_i, nh_i, fscale, frect_i),
+                            )?;
+                        } else {
+                            c.launch(
+                                fx.far_prep_b,
+                                (nh as u32, n as u32),
+                                256,
+                                0,
+                                kargs!(plan.qg.ptr, lb[2], lb[4], lb[5], lb[6], mx_p, p_p, e_p, cip, fm_i, nh_i, fscale, frect_i, n_i),
+                            )?;
+                        }
                     }
                     c.launch_3d(
                         fx.values,
@@ -1870,7 +1914,12 @@ impl Drop for GraphRec {
 
 fn graphs_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_CUDA_GRAPH").as_deref() != Ok("0")) && !super::prof_on()
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_GRAPH").as_deref() != Ok("0")) && !super::prof_on() && !KT_TOKEN.with(|k| k.get())
+}
+
+thread_local! {
+    /// This token's kernels are timed (`CMF_HYB_KT=N`): launched one by one.
+    static KT_TOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn curesult(r: cs::CUresult, what: &str) -> Res<()> {
@@ -2092,6 +2141,16 @@ pub(super) fn token(
         return if hard || moved { TokenGraphOutcome::Failed } else { TokenGraphOutcome::Declined };
     }
     let t0 = std::time::Instant::now();
+    // `CMF_HYB_KT=N`: the kernel times of the N-th token
+    static TOKENS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let kt = {
+        let n = TOKENS_SEEN.fetch_add(1, Ordering::Relaxed);
+        std::env::var("CMF_HYB_KT").ok().and_then(|v| v.parse::<usize>().ok()) == Some(n)
+    };
+    if kt {
+        KT_TOKEN.with(|k| k.set(true));
+        super::kt_start();
+    }
     let mut run = || -> Res<()> {
         unsafe {
             cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
@@ -2118,7 +2177,12 @@ pub(super) fn token(
         }
         c.sync()
     };
-    match run() {
+    let res = run();
+    if kt {
+        super::kt_stop();
+        KT_TOKEN.with(|k| k.set(false));
+    }
+    match res {
         Ok(()) => {
             if let Some(lr) = layers_run {
                 *lr = layers.len();
@@ -2360,8 +2424,12 @@ pub(super) fn batch(
     defer: bool,
 ) -> BatchGraphOutcome {
     let b = k;
-    if o1.iter().any(|v| v.is_some()) {
-        decline("hybrid batch", "a sealed far field");
+    // a sealed layer takes a verify window over its far field (the state on
+    // the card at this position), nothing else of a batch
+    let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
+    let any_sealed = sealed.iter().any(|&s| s);
+    if any_sealed && (spec.is_none() || b > NMAX || !far_spec_on()) {
+        decline("hybrid batch", "a sealed far field outside a verify window");
         return BatchGraphOutcome::Declined;
     }
     if b == 0
@@ -2392,8 +2460,17 @@ pub(super) fn batch(
             return BatchGraphOutcome::Declined;
         }
     };
+    if any_sealed {
+        for (li, &s) in sealed.iter().enumerate() {
+            let at = st.hyb.o1.get(&(kv_id, layer_base + li)).and_then(|d| d.next_pos);
+            if s && at != Some(pos0) {
+                decline("hybrid batch", "a far field the card has not moved to this row");
+                return BatchGraphOutcome::Declined;
+            }
+        }
+    }
     let hint = st.kv_hint;
-    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, pos0, b, hint, &[]) {
+    if let Err((hard, e)) = admit(c, &mut st, &plan, layers, kv_id, layer_base, pos0, b, hint, &sealed) {
         decline("hybrid batch", &e);
         return if hard { BatchGraphOutcome::Failed } else { BatchGraphOutcome::Declined };
     }
@@ -2408,7 +2485,7 @@ pub(super) fn batch(
                 }
                 let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
                 let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
-                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &[], tl)?;
+                let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &sealed, tl)?;
                 if taps.is_some() {
                     super::taps_put(taps_read(c, tl, b, hidden)?);
                 }
@@ -2767,6 +2844,78 @@ pub(super) fn spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected: u
 }
 
 /// The arm's kernels are compiled (a trunk plan was built).
+/// A verify window over the far fields of `kv_id` kept `rows` rows: they move
+/// into the window in order, each pushing the ring's oldest row into the far
+/// sums once the ring is full (`nystrom.rs` advance, as a decode step does).
+/// Drafts over a far field (`CMF_O1_SPEC=0` turns them off).
+pub(crate) fn far_spec_on() -> bool {
+    std::env::var("CMF_O1_SPEC").as_deref() != Ok("0")
+}
+
+pub(super) fn spec_commit(kv_id: u64, pos0: usize, rows: usize) -> bool {
+    let Some(c) = super::ctx() else { return false };
+    let mut st = c.st.lock().unwrap();
+    if c.current().is_err() {
+        return false;
+    }
+    let r = (|| -> Res<()> {
+        let mut recs: Vec<i32> = Vec::new();
+        // (layer key, record offset, the row to move, the ring slot it takes)
+        let mut steps: Vec<((u64, usize), usize, usize, usize)> = Vec::new();
+        let mut keys: Vec<(u64, usize)> = st.hyb.o1.keys().filter(|k| k.0 == kv_id).copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            let d = st.hyb.o1.get_mut(&key).unwrap();
+            let Some((base, n)) = d.spec.take() else { continue };
+            for j in 0..rows.min(n) {
+                let row = base + j;
+                if d.win_len < d.w {
+                    // the row is where the window's next slot is
+                    debug_assert_eq!(row, d.ns + d.win_len);
+                    d.win_len += 1;
+                    continue;
+                }
+                let slot = d.ns + d.win_head;
+                let keys_n = d.ns + d.w;
+                let rb = attn_rb(keys_n);
+                let ncap = keys_n.next_multiple_of(4096);
+                let at = recs.len();
+                recs.extend([(keys_n - 1) as i32, slot as i32, rb as i32, ncap as i32, (ncap.div_ceil(rb) + 1) as i32, 1, slot as i32, 1]);
+                steps.push((key, at, row, slot));
+                d.far_len += 1;
+                d.win_head = (d.win_head + 1) % d.w;
+            }
+            d.next_pos = Some(pos0 + rows);
+        }
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let rb = st.scr(c, "hy_spec_ci", recs.len() * 4)?;
+        unsafe { cu::memcpy_htod_async(rb, &recs, c.stream).map_err(derr)? };
+        for (key, at, row, slot) in steps {
+            let d = &st.hyb.o1[&key];
+            let fx = st.hyb.funcs.get(&(d.hpk, d.hd)).ok_or("far field commit before the arm's kernels")?;
+            let row_b = (d.nkv * d.hd * 2) as u64;
+            let cip = rb + (at * 4) as u64;
+            let (fm_i, nkv_i) = (d.m as i32, d.nkv as i32);
+            unsafe {
+                // the oldest row into the far sums, then the kept row in its slot
+                c.launch(fx.far_insert, ((d.nkv * d.hpk * d.m).div_ceil(8) as u32, 1), 256, 0, kargs!(d.nk.ptr, d.nv.ptr, d.qt.ptr, d.mz.ptr, d.th.ptr, cip, fm_i, nkv_i, d.scale))?;
+                cu::memcpy_dtod_async(d.nk.ptr + slot as u64 * row_b, d.nk.ptr + row as u64 * row_b, row_b as usize, c.stream).map_err(derr)?;
+                cu::memcpy_dtod_async(d.nv.ptr + slot as u64 * row_b, d.nv.ptr + row as u64 * row_b, row_b as usize, c.stream).map_err(derr)?;
+            }
+        }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("cuda hybrid: far field commit: {e}");
+            false
+        }
+    }
+}
+
 pub(super) fn kernels_ready(st: &State) -> bool {
     !st.hyb.funcs.is_empty()
 }

@@ -2238,6 +2238,10 @@ pub fn dory_forward(
     if backend() == Backend::Metal {
         return model.is_some_and(|md| crate::gpu_metal::dory::forward(id, md, m, ids, pos, loops, want, logits));
     }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::dory_forward(id, m, ids, pos, loops, want, logits);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::dory::forward(id, m, ids, pos, loops, want, logits);
@@ -2251,6 +2255,11 @@ pub fn dory_reset(id: u64) {
     #[cfg(target_os = "macos")]
     if backend() == Backend::Metal {
         crate::gpu_metal::dory::reset(id);
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::dory_reset(id);
         return;
     }
     #[cfg(feature = "gpu")]
@@ -2267,6 +2276,10 @@ pub fn dory_sealed(id: u64) -> bool {
     if backend() == Backend::Metal {
         return crate::gpu_metal::dory::sealed(id);
     }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::dory_sealed(id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::dory::sealed(id);
@@ -2279,6 +2292,10 @@ pub fn dory_kv_bytes(id: u64) -> Option<u64> {
     #[cfg(target_os = "macos")]
     if backend() == Backend::Metal {
         return crate::gpu_metal::dory::kv_bytes(id);
+    }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::dory_kv_bytes(id);
     }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
@@ -2666,6 +2683,10 @@ pub fn o1_qcap_drain() -> Option<Vec<(usize, Vec<f32>)>> {
 
 /// The accepted rows of a verify: the sealed layers' state moves over them.
 pub fn o1_spec_commit(_kv_id: u64, _pos0: usize, _rows: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::o1_spec_commit(_kv_id, _pos0, _rows);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::o1_spec_commit(_kv_id, _pos0, _rows);

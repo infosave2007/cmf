@@ -82,7 +82,8 @@ backend serves the two graph contracts the wgpu backend serves:
 Hybrids of the Qwen3.5 family (`qwen3_5`: GDN mixers and gated full attention with Q/K norms, dense FFNs,
 an MTP block; Qwen3.8-27B) run on a second arm of the backend with drafts and their verify on the card,
 see [Hybrids](#hybrids-the-qwen35-family). The Fast Code stack (`qwen4_exp`) has its own path
-(`gpu_cuda/qwen4.rs`). Anything else (other MoE stacks, sandwich norms, output gates other than these) is
+(`gpu_cuda/qwen4.rs`). Nemotron Labs Dory (`dory`, a looped nGPT) runs on the hybrid arm's kernels, its
+turbo files included, see [Dory](#dory-the-looped-ngpt). Anything else (other MoE stacks, sandwich norms, output gates other than these) is
 declined before any state changes, and the model runs on the CPU path; `CMF_CUDA_DEBUG=1` prints the
 reason.
 
@@ -304,7 +305,41 @@ rename in a 10 KB file).
 - Through `cortiq serve`, four greedy requests with and without thinking: 86–173 tok/s against 48.9–49.1
   without drafts, the same texts (`scripts/q27cuda/serve_ab.sh`).
 - The turbo file: facts planted in 60 000 characters of Wikipedia text are answered 8 times of 8. The first
-  token comes in 21–23 s, against 52–58 s over Vulkan; past the seal it decodes without drafts.
+  token comes in 21–23 s, against 52–58 s over Vulkan.
+
+**Drafts over the far field.** Past a turbo file's seal a verify window's rows sit right after the near
+rows (the sinks, the rows kept exact, the window), so a row reads its window's earlier rows as near ones and
+the far field as it stood before the window (`hy_far_prep_b`, one body with the one-row kernel). The state
+moves over the accepted rows only (`o1_spec_commit`): each takes the ring's next slot, and once the ring is
+full the row it replaces goes into the far sums first. The ring's evicted row is folded in by a warp per
+(head, landmark), the far part by 256 threads a head: past the seal a token costs 21.9 ms of kernels against
+23.6 before, and 21.5 for the standard file at 1 000 tokens. `CMF_O1_SPEC=0` decodes past the seal without
+drafts.
+
+Qwen3.8-27B on the same RTX 3090, release build: `cortiq bench --core`, 60 tokens after a prompt of that
+length (the bench's text repeats, so most drafts hold; the last column is the turbo file without them). The
+turbo file over Vulkan on the same card: first token 3.1 / 6.9 / 53.3 / 100.2 / 208.6 s, decode 61–72 tok/s,
+peak 14.2–15.4 GB.
+
+| prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | turbo without drafts | peak VRAM, GB (standard / turbo) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 1.16 | **1.17** | 258.1 | **258.8** | 49.3 | 15.8 / 15.8 |
+| 4 000 | 4.06 | **4.25** | 251.6 | **252.1** | 48.1 | 16.5 / 16.5 |
+| 16 000 | 17.2 | **21.9** | 181.5 | **118.3** | 40.4 | 17.3 / 17.3 |
+| 32 000 | 39.0 | **48.7** | 139.4 | **120.6** | 40.4 | 18.4 / 18.3 |
+| 64 000 | 101.0 | **123.9** | 95.3 | **128.4** | 40.2 | 20.4 / 20.2 |
+
+A real answer, a summary of 100 000 characters of Wikipedia (about 24 000 tokens), up to 400 tokens: the
+turbo file 37.6 s to the first token, 80.3 tok/s with 42 % of the drafts kept and 45.2 without them; the
+standard file 31.0 s, 76.5 and 42.3. The text with drafts is the text without them. Facts in 100 000
+characters: 8 of 8.
+
+- On CUDA the prompt is read whole with exact attention and sealed once after it (`o1_whole_prompt`), so
+  the turbo file costs the seal on top of the standard file's prompt: its rows come off the card (2.8 s at
+  32 000 tokens), the exact rows are chosen (0.4 s) and the far field is built on the host (7.3 s on the
+  pod's ~7 cores). The device memory is the standard file's until the seal.
+- The draft head reads the prompt's last 512 rows, warmed after the seal as over the wgpu path's far
+  field: in the bench 0 of 20 drafts held before it, 54 of 61 after.
 
 ### DFlash 2 beside the file
 
@@ -356,6 +391,68 @@ The ten prompts on the RTX 3090, release build, tok/s:
   every round with the block: 49.2 → 102.1 tok/s on chat0, the same text. The sidecars of Qwen3.8-27B, Arete-27B
   Turbo and OrcaCyber-Nano-1.0 Turbo, with routers at these prices, are on Hugging Face beside the files.
 
+## Dory: the looped nGPT
+
+Nemotron Labs Dory has an input block, a recurrent block that runs several times over the same weights and
+an output block; a sub-layer is attention or a SwiGLU MLP, and every row lives on the unit sphere. It runs
+on the hybrid arm's kernels (`gpu_cuda/hyb/dory.rs`, `dory.cu`), q4tp files only.
+
+```bash
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "..." --no-think
+CMF_GPU=cuda cortiq serve dory-turbo.cmf --port 8080 --host 127.0.0.1
+```
+
+- **A token**: every matrix through the arm's tensor-core matvec, eight warps a tile and a tile a block
+  (Dory's matrices are 2560 to 7168 columns wide). Gate and up are one pair with their scales in the q4tp
+  ladders, so the matvec's epilogue writes silu(g) · u. Between the matvecs: the rotation with the unit
+  heads and the query scale, one pass over the keys (flash decoding, each block under its own maximum), the
+  gate, the nGPT residual with the row in registers. K and V are f16: a sliding layer's in a ring of its
+  window and a turn's rewind, a full layer's at their position. Each stage of a token is one CUDA graph.
+- **The router** of a turbo file decides after the first pass: the card runs the input block and that
+  pass, the host scores the state (10 KB), and the card runs the output block, or the second pass first.
+- **A prompt** goes by GEMMs, 512 rows at a time: each weight expanded to f16 once a chunk, a full layer's
+  attention as two batched GEMMs around a masked softmax, a sliding layer's the same over its window
+  unwrapped from the ring. On a turbo file these rows take one pass. The last ((n − 1) mod 64) + 1 rows
+  take every pass on the tensor-core path, as the wgpu path's last chunk does, so the text is the same.
+- **The seal** of a turbo file at the prompt's end: the full layers' rows come to the host, the rows the far
+  field would lose are chosen and kept exact (`pick_exact_rows`), the landmarks are built (`far_states`, a
+  thread a layer) and go up as the arm's far fields. Past it a token reads its exact rows (sinks, the
+  chosen ones, the window) and 32 landmarks a head.
+
+### Dory on an RTX 3090
+
+Release build, the same card and build for both columns; Vulkan is the wgpu path.
+
+| | CUDA | Vulkan |
+|---|---:|---:|
+| `dory-turbo`, 12 real prompts of 200 tokens, tok/s | **201.4** | 120.9 |
+| `dory-q4tp-v2`, the same, tok/s | **159.6** | 86.9 |
+
+`cortiq bench --core`, 60 tokens after a prompt of that length:
+
+| prompt, tokens | first token, s (CUDA) | first token, s (Vulkan) | decode, tok/s (CUDA) | decode, tok/s (Vulkan) |
+|---:|---:|---:|---:|---:|
+| `dory-turbo` 1 000 | **0.26** | 1.09 | **231.9** | 110.1 |
+| 4 000 | **0.78** | 4.90 | **215.2** | 88.0 |
+| 16 000 | **6.11** | 39.05 | **212.7** | 84.1 |
+| 32 000 | **13.64** | 78.42 | **216.0** | 85.2 |
+| 64 000 | **32.95** | 162.58 | **214.1** | 91.6 |
+| `dory-q4tp-v2` 1 000 | **0.36** | 1.66 | **156.9** | 72.1 |
+| 4 000 | **1.17** | 7.64 | **146.0** | 58.3 |
+| 16 000 | **5.38** | 60.07 | **127.9** | 33.3 |
+| 32 000 | **12.82** | 197.27 | **111.3** | 21.4 |
+
+- The greedy texts of the 12 prompts are the CUDA path's own in a second run, and the wgpu path's on two
+  files of 128 tokens; the prompt's last logits agree with Vulkan's within a KL of 4e-6 to 7e-4.
+- Facts planted in 60 000 characters of Wikipedia (a pass key, an access code, a password, a room number):
+  8 of 8, first token 5.7–6.4 s, decode 163–172 tok/s past the seal.
+- The far field holds 257 MB of K/V past the seal (Vulkan 502 MB). The card's peak while a long prompt is
+  read is higher on CUDA: `dory-turbo` 3.7 GB at 1 000 tokens, 5.2 at 16 000, 7.7 at 64 000 (Vulkan 2.9, 3.6,
+  3.6): the full layers' rows stay on the card until the seal, and the prompt's GEMMs take scratch.
+- Facts in 100 000 characters: 8 of 8 as well, first token 9.9–10.5 s. Wikitext-2 perplexity, 12 windows of
+  512 tokens read by `cortiq ppl`: 13.689 against Vulkan's 13.683 (`dory-turbo`), 13.696 against 13.696
+  (`dory-q4tp-v2`).
+
 ## Options
 
 | variable | meaning |
@@ -369,20 +466,25 @@ The ten prompts on the RTX 3090, release build, tok/s:
 | `CMF_CUDA_PROF=1` | stage timers of the prompt and of a token, with a wait after each stage |
 | `CMF_CUDA_CACHE=DIR` | where compiled PTX is kept, `~/.cache/cortiq/cuda` by default |
 | `CMF_GRAPH_SPEC=0` | a hybrid without drafts |
+| `CMF_O1_SPEC=0` | a turbo file without drafts past the seal |
+| `CMF_HYB_KT=N` | kernel times of the hybrid's N-th token |
 | `CMF_KV_REUSE=0` | every chat turn read from the start |
 | `CMF_DFLASH=1` | the DFlash sidecar beside the file drafts the rounds it wins (`CMF_DFLASH_PICK=dflash\|mtp` pins one) |
 | `CMF_CUDA_DEBUG=1` | why a graph declined, and a decode / prompt summary at exit |
+| `CMF_DORY_CUDA=0` | Dory on the CPU under `CMF_GPU=cuda` |
+| `CMF_DORY_BIG=0` | a Dory prompt by the tensor-core matvec, 16 rows at a time |
+| `CMF_DORY_KT=N`, `CMF_DORY_KT_AT=P` | kernel times of Dory's N-th token, of its prompt chunk at position P |
 
 ## Limits
 
-- Three architecture classes are covered: dense Spark-class stacks (measured on an A40), Qwen3.5-family
-  hybrids (measured on an RTX 3090) and the Fast Code stack. Other MoE stacks and Gemma-style stacks run on
+- Four architecture classes are covered: dense Spark-class stacks (measured on an A40), Qwen3.5-family
+  hybrids and Dory (measured on an RTX 3090), and the Fast Code stack. Dory's q8_2f file runs on the CPU. Other MoE stacks and Gemma-style stacks run on
   the CPU under `CMF_GPU=cuda`, not on wgpu.
 - The far field's prompt is read whole: its K/V rows are on the card until the seal (8.2 GB at
-  64 000 tokens, 4.5 GB on the wgpu path), and its time grows faster than the text. A new turn of a
+  64 000 tokens, 4.5 GB on the wgpu path; Dory's nine full layers 2.4 GB), and its time grows faster than
+  the text. A new turn of a
   sealed conversation reads the conversation again, as on the wgpu path.
-- Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm. Past a turbo file's seal
-  the hybrid decodes without them.
+- Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm.
 - The toolkit libraries must be on the loader's path; the bindings are for CUDA 12.x.
 - Decode is bound by its own arithmetic, about 350 GB/s of weights on an A40 against 500 for a kernel
   that only loads them (`scripts/cuda/bench/mv_bench.cu`).

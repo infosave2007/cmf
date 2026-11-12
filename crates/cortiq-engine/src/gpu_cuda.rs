@@ -981,7 +981,16 @@ impl Ctx {
         shared: usize,
         params: &mut [*mut c_void],
     ) -> Res<()> {
-        unsafe {
+        let timed = if KT_ON.load(Ordering::Relaxed) {
+            let a = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT).ok();
+            if let Some(a) = a {
+                let _ = unsafe { cu::event::record(a, self.stream) };
+            }
+            a
+        } else {
+            None
+        };
+        let r = unsafe {
             cu::launch_kernel(
                 f,
                 (grid.0.max(1), grid.1.max(1), grid.2.max(1)),
@@ -991,7 +1000,14 @@ impl Ctx {
                 params,
             )
         }
-        .map_err(derr)
+        .map_err(derr);
+        if let Some(a) = timed {
+            if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
+                let _ = unsafe { cu::event::record(b, self.stream) };
+                KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
+            }
+        }
+        r
     }
 
     /// C[m x n] = alpha * op(A) * op(B) + beta * C, column-major. C is f32;
@@ -2704,6 +2720,37 @@ pub fn verify_argmax_take() -> Option<Vec<u32>> {
 
 pub use hyb::dflash::{Dev as DflashDev, LayerIn as DflashLayerIn, SETTLE_MAX as DFLASH_SETTLE_MAX, SpecIn as DflashSpecIn};
 
+/// A verify window over the far fields of `kv_id` kept `rows` rows: they
+/// move into the window (`hyb::spec_commit`).
+pub fn o1_spec_commit(kv_id: u64, pos0: usize, rows: usize) -> bool {
+    hyb::spec_commit(kv_id, pos0, rows)
+}
+
+/// Drafts ride a far field on this backend.
+pub fn o1_spec_on() -> bool {
+    hyb::far_spec_on()
+}
+
+/// Dory's forward on the card (`hyb::dory`); `false` leaves the host to run it.
+pub fn dory_forward(id: u64, m: &crate::dory::Dory, ids: &[u32], pos: usize, loops: usize, want: crate::dory::Want, logits: &mut Vec<f32>) -> bool {
+    selected() && hyb::dory::forward(id, m, ids, pos, loops, want, logits)
+}
+
+/// A new Dory sequence on the card.
+pub fn dory_reset(id: u64) {
+    hyb::dory::reset(id);
+}
+
+/// Has this Dory sequence gone over to the far field on the card?
+pub fn dory_sealed(id: u64) -> bool {
+    hyb::dory::sealed(id)
+}
+
+/// The K/V bytes a Dory sequence holds on the card.
+pub fn dory_kv_bytes(id: u64) -> Option<u64> {
+    hyb::dory::kv_bytes(id)
+}
+
 /// The hybrid arm's kernels are built (a trunk plan ran): what the DFlash
 /// block borrows.
 pub fn hybrid_kernels_ready() -> bool {
@@ -2832,12 +2879,21 @@ pub fn kv_pull_host(
                 cu::memcpy_dtoh_async(&mut vh, m.vptr() + off, c.stream).ok()?;
             }
             c.sync().ok()?;
-            for (d, h) in kb[dst..].iter_mut().zip(&kh) {
-                *d = cortiq_core::quant::f16_to_f32(*h);
-            }
-            for (d, h) in vb[dst..].iter_mut().zip(&vh) {
-                *d = cortiq_core::quant::f16_to_f32(*h);
-            }
+            // a long prompt's mirror is gigabytes: its rows to f32 on threads
+            let widen = |dst: &mut [f32], src: &[u16]| {
+                let per = src.len().div_ceil(16).max(1 << 16);
+                std::thread::scope(|sc| {
+                    for (o, i) in dst.chunks_mut(per).zip(src.chunks(per)) {
+                        sc.spawn(move || {
+                            for (d, h) in o.iter_mut().zip(i) {
+                                *d = cortiq_core::quant::f16_to_f32(*h);
+                            }
+                        });
+                    }
+                });
+            };
+            widen(&mut kb[dst..], &kh);
+            widen(&mut vb[dst..], &vh);
         } else {
             let off = ((first - m.base) * row * 4) as u64;
             unsafe {

@@ -123,6 +123,21 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Dory и Qwen3.8-27B Turbo на CUDA (0.8.70)
+
+Бэкенд CUDA запускает [Nemotron Labs Dory 1.0 4B](https://huggingface.co/infosave/Nemotron-Labs-Dory1.0-4B-cmf),
+зацикленный nGPT, вместе с турбо-файлом: на RTX 3090 турбо-файл отвечает на 201 tok/s против 121 через Vulkan на
+той же карте и читает 64 000 токенов за 33 с против 163. [Qwen3.8-27B
+Turbo](https://huggingface.co/infosave/Qwen3.8-27B-Turbo-cmf) теперь пишет черновики и после печати на CUDA:
+пересказ 100 000 символов декодируется на 80 tok/s против 42, текст тот же.
+
+```sh
+cargo install cortiq-cli --features cuda
+CMF_GPU=cuda cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, которая разворачивает список." --no-think
+```
+
+См. [docs/CUDA.ru.md](docs/CUDA.ru.md).
+
 ## Qwen3.8-27B на CUDA: чат 120–128 tok/s на RTX 3090 (0.8.69)
 
 Бэкенд CUDA запускает гибриды семейства Qwen3.5 (миксеры GDN и внимание с гейтом) вместе с черновиками и их
