@@ -21,6 +21,9 @@ T = {
         he="HumanEval pass@1, %", ppl="code perplexity, lower is better",
         size="Size and memory", size_sub="file on disk and peak VRAM while serving",
         file="file, GB", vram="peak VRAM, GB", better="better",
+        cards="Cards from 12 GB (CUDA)", cards_sub="one RTX 5090 held to the memory shown; the experts that do not fit run on the host's cores",
+        cards_y="the aquarium page written to the end, tok/s", cards_x="card memory",
+        cards_note=["the answer is the complete working page in every bar", "within 12 GB: 1 357 of 12 288 experts on the card,", "38 of the first 40 HumanEval tasks pass"],
     ),
     "ru": dict(
         speed="Скорость на одной RTX PRO 6000 (96 ГБ)", speed_sub="один под, один клиент, жадный выбор, без размышлений",
@@ -29,6 +32,9 @@ T = {
         he="HumanEval pass@1, %", ppl="перплексия на коде, меньше — лучше",
         size="Размер и память", size_sub="файл на диске и пик VRAM при работе сервера",
         file="файл, ГБ", vram="пик VRAM, ГБ", better="лучше",
+        cards="Карты от 12 ГБ (CUDA)", cards_sub="одна RTX 5090, ограниченная указанной памятью; не поместившихся экспертов считают ядра процессора",
+        cards_y="страница аквариума, написанная до конца, ток/с", cards_x="память карты",
+        cards_note=["ответ в каждом столбце — полная рабочая страница", "в 12 ГБ: на карте 1 357 экспертов из 12 288,", "проходят 38 из первых 40 задач HumanEval"],
     ),
     "zh": dict(
         speed="单张 RTX PRO 6000（96 GB）上的速度", speed_sub="同一台机器、同一客户端、贪心解码、关闭思考",
@@ -37,6 +43,9 @@ T = {
         he="HumanEval pass@1，%", ppl="代码困惑度，越低越好",
         size="大小与显存", size_sub="磁盘文件与服务时的显存峰值",
         file="文件，GB", vram="显存峰值，GB", better="更好",
+        cards="12 GB 起的显卡（CUDA）", cards_sub="一张 RTX 5090，限制为图中显存；放不下的专家由主机 CPU 核心计算",
+        cards_y="完整写出水族箱页面，tok/s", cards_x="显存",
+        cards_note=["每根柱子的回答都是完整可运行的页面", "12 GB 内：显卡保留 12 288 个专家中的 1 357 个，", "HumanEval 前 40 题通过 38 题"],
     ),
 }
 
@@ -119,7 +128,19 @@ def main():
         body += grouped(30, 130, 440, 230, groups_d, series, t["decode"])
         body += grouped(520, 130, 440, 230, groups_p, series, t["prefill"])
         body += txt(30 + 220, 400, t["ctx"], 12, MUTED, "middle") + txt(520 + 220, 400, t["ctx"], 12, MUTED, "middle")
-        write(out_dir, f"fc_speed_{lang}", svg(W, 420, body))
+        H = 420
+        if data.get("cards"):
+            # second row: the same model on smaller cards (CUDA, host cores for the experts that do not fit)
+            y2 = 462
+            body += f'<line x1="30" y1="{y2 - 32}" x2="{W - 30}" y2="{y2 - 32}" stroke="{GRID}"/>'
+            body += txt(30, y2, t["cards"], 20, INK, weight="bold") + txt(30, y2 + 22, t["cards_sub"], 13, MUTED)
+            groups_c = [{"label": c["label"], "vals": {"fastcode": c["decode"]}} for c in data["cards"]]
+            body += grouped(30, y2 + 70, 440, 200, groups_c, [("fastcode", names["fastcode"])], t["cards_y"])
+            body += txt(30 + 220, y2 + 70 + 200 + 40, t["cards_x"], 12, MUTED, "middle")
+            for i, line in enumerate(t["cards_note"]):
+                body += txt(520, y2 + 110 + 24 * i, line, 14, INK2)
+            H = y2 + 70 + 200 + 58
+        write(out_dir, f"fc_speed_{lang}", svg(W, H, body))
         # quality: HumanEval and code ppl
         he = [(k, names[k], v) for k, v in data["humaneval"]]
         pp = [(k, names[k], v) for k, v in data["ppl"]]

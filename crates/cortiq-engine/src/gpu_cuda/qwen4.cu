@@ -748,7 +748,9 @@ extern "C" __global__ void q4_expand_exp(const u64* __restrict__ slots, void* __
     const int gpr = cols >> 5;
     const u64 params_off = (u64)rows * gpr * (two ? 8 : 16), codes_off = params_off + (u64)rows * 4;
     const int stride = (gpr * 5 + 7) / 8;
-    const u8* mat = (const u8*)slots[j] + (u64)m * size_gu;
+    // a slot with the top bit is a descriptor: the three matrices' addresses (pinned host pages the card reads in place)
+    const u64 sj = slots[j];
+    const u8* mat = (sj >> 63) ? (const u8*)((const u64*)(sj & 0x7fffffffffffffffull))[m] : (const u8*)sj + (u64)m * size_gu;
     const u64 base = (u64)wi * 8;
     const int r = (int)(base / cols);
     const int g = (int)(base - (u64)r * cols) >> 5;
@@ -1494,6 +1496,17 @@ __device__ __forceinline__ void hc_up4_t(const void* __restrict__ Wp, const floa
     { PDL_PRO(); hc_up4_t<NB>(Wp, low, normed, folded, foldedh, hid, lr, R, half); }
 Q4_SMALL(1) Q4_SMALL(2) Q4_SMALL(3) Q4_SMALL(4) Q4_SMALL(5) Q4_SMALL(6) Q4_SMALL(7) Q4_SMALL(8)
 
+// A unit's expert: a raw slot (gate, up and down at 0, sgu, 2 sgu) or, with bit 63 set, the address of three
+// pointers {gate, up, down} (an expert read in place from pinned host memory, whose matrices the file keeps apart).
+__device__ __forceinline__ void unit_parts(u64 slot, u64 sgu, u64& g, u64& u, u64& dn) {
+    if (slot >> 63) {
+        const u64* ds = (const u64*)(slot & 0x7fffffffffffffffull);
+        g = ds[0]; u = ds[1]; dn = ds[2];
+    } else {
+        g = slot; u = slot + sgu; dn = slot + 2 * sgu;
+    }
+}
+
 // A unit of the expert kernels: one expert's raw slot and up to Q4_UR token
 // rows that picked it, as 2 + Q4_UR words (slot lo, hi, then the rows, -1
 // from the first free place on).
@@ -1697,6 +1710,9 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
     const int gpr = hid >> 5, GP = gpr | 1, XS = 32 * GP, stride = (gpr * 5 + 7) / 8;
     const u64 params_off = (u64)inter * gpr * 16, codes_off = params_off + (u64)inter * 4;
     const u64 sgu = codes_off + (u64)inter * stride;
+    u64 pg, pu, pd;
+    unit_parts(slot, sgu, pg, pu, pd);
+    (void)pd;
     float* xs = sh;                 // [cnt][32][GP]
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [2][rb][32]
@@ -1712,7 +1728,7 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
 #endif
     if (tid < 2 * rb) {
         const int m = tid / rb, r = r0 + tid - m * rb;
-        if (r < inter) q4_ladder((const u16*)(slot + (u64)m * sgu + params_off + (u64)r * 4), lad + tid * 32);
+        if (r < inter) q4_ladder((const u16*)((m ? pu : pg) + params_off + (u64)r * 4), lad + tid * 32);
     }
     __syncthreads();
 #if !defined(EXP_NOSTAGE) && !EXP_DP4A
@@ -1728,8 +1744,8 @@ extern "C" __global__ void q4_exp_gu(const u32* __restrict__ units, const float*
     // the words of this warp's rows in one sequence: row q, word it
     const int nit = (gpr + 31) >> 5;
     const int nz = warp < rb ? ((rb - warp + NW - 1) / NW) * nit : 0;
-    const u8* mg = (const u8*)slot;
-    const u8* mu = mg + sgu;
+    const u8* mg = (const u8*)pg;
+    const u8* mu = (const u8*)pu;
     float ag[Q4_UR], au[Q4_UR];
     for (int j = 0; j < Q4_UR; j++) { ag[j] = 0.0f; au[j] = 0.0f; }
     for (int z0 = 0; z0 < nz; z0 += Q4_GW) {
@@ -1797,6 +1813,9 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
     const int gpr = hid >> 5, GP = gpr | 1, XS = 32 * GP, stride = (gpr * 5 + 7) / 8;
     const u64 params_off = (u64)inter * gpr * 8, codes_off = params_off + (u64)inter * 4;
     const u64 sgu = codes_off + (u64)inter * stride;
+    u64 pg, pu, pd;
+    unit_parts(slot, sgu, pg, pu, pd);
+    (void)pd;
     float* xs = sh;                 // [cnt][32][GP]
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [2][rb][32]
@@ -1808,7 +1827,7 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
 #endif
     if (tid < 2 * rb) {
         const int m = tid / rb, r = r0 + tid - m * rb;
-        if (r < inter) q2_ladder((const u16*)(slot + (u64)m * sgu + params_off + (u64)r * 4), lad + tid * 32);
+        if (r < inter) q2_ladder((const u16*)((m ? pu : pg) + params_off + (u64)r * 4), lad + tid * 32);
     }
     __syncthreads();
     for (int i = tid; i < cnt * gpr; i += T) {
@@ -1822,8 +1841,8 @@ extern "C" __global__ void q4_exp_gu2(const u32* __restrict__ units, const float
     // the words of this warp's rows in one sequence: row q, word it
     const int nit = (gpr + 31) >> 5;
     const int nz = warp < rb ? ((rb - warp + NW - 1) / NW) * nit : 0;
-    const u8* mg = (const u8*)slot;
-    const u8* mu = mg + sgu;
+    const u8* mg = (const u8*)pg;
+    const u8* mu = (const u8*)pu;
     float ag[Q4_UR], au[Q4_UR];
     for (int j = 0; j < Q4_UR; j++) { ag[j] = 0.0f; au[j] = 0.0f; }
     for (int z0 = 0; z0 < nz; z0 += Q4_GW) {
@@ -1890,7 +1909,9 @@ extern "C" __global__ void q4_exp_d(const u32* __restrict__ units, const float* 
     while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
     const int gpr = inter >> 5, GP = gpr | 1, XS = XS_CONTIG ? gpr * XC_G : 32 * GP, stride = (gpr * 5 + 7) / 8;
     const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
-    const u8* mat = (const u8*)(slot + 2 * sgu);
+    u64 pg, pu, pd;
+    unit_parts(slot, sgu, pg, pu, pd);
+    const u8* mat = (const u8*)pd;
     float* xs = sh;                 // [cnt][32][GP]
     float* gs = xs + cnt * XS;      // [cnt][gpr]
     float* lad = gs + cnt * gpr;    // [rb][32]
@@ -2002,7 +2023,9 @@ extern "C" __global__ void q4_exp_d4(const u32* __restrict__ units, const float*
     while (cnt < Q4_UR && (int)un[2 + cnt] >= 0) cnt++;
     const int gpr = inter >> 5, stride = (gpr * 5 + 7) / 8;
     const u64 params_off = (u64)hid * gpr * 16, codes_off = params_off + (u64)hid * 4;
-    const u8* mat = (const u8*)(slot + 2 * sgu);
+    u64 pg, pu, pd;
+    unit_parts(slot, sgu, pg, pu, pd);
+    const u8* mat = (const u8*)pd;
     int* xq = (int*)sh;                                  // [cnt][gpr][XQ_G]
     float* lad = sh + Q4_UR * gpr * XQ_G;                // [rb][32]
     const int r0 = blockIdx.x * rb;

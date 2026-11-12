@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.74] — 2026-11-12
+
+### Added
+- Qwen3.8 Fast Code on CUDA for cards from 12 GB (`CMF_GPU=cuda`,
+  [the file](https://huggingface.co/infosave/Qwen3.8-Flash-Next-Fast-Code-cmf)). The card holds the experts that
+  fit. An expert a token routes to outside of them is computed by the host's cores instead of being copied to the
+  card: a q4tp expert kernel on AVX-512 VNNI (`qtensor/moe_fast.rs`) runs the misses on a pool of threads while
+  the card runs the held experts, and their rows join the card's rows before the weighted sum.
+  - On by default where the host has AVX-512 VNNI and eight threads or more. `CMF_QWEN_CPU_EXPERTS=0` turns it
+    off (every miss is then an admission to the card), `=1` forces it; `CMF_QWEN_CPU_EXPERT_THREADS` sets the
+    pool, `CMF_QWEN_CPU_EXPERT_SPIN` how long a worker spins before it sleeps.
+  - The experts a text keeps asking for move to the card between tokens, hottest first:
+    `CMF_QWEN_ADMIT=<n>[:<heat>[:<decay>]]`, four admissions a window by default, `0` none.
+  - The card buffers of an expert are pieces of 64 MiB slabs (`CMF_CUDA_SLAB=0` allocates each on its own): under
+    a 12 GB ceiling the card holds 1357 experts instead of 1068.
+  - `CMF_GPU_VRAM_MB` on this path is a measured budget of the whole process on the card;
+    `CMF_QWEN_CUDA_GROW_MB` (default 1024) is what stays free for the context to grow into.
+  - RTX 5090 held to the memory of a smaller card (`CMF_GPU_VRAM_MB`), host 2× EPYC 9554 with 31 CPUs and 62 GB
+    for the container, one request at a time, `CMF_QWEN_ROUTE_TAIL=0.05`, the routing profile loaded. The 3D
+    aquarium spec, answered greedily to the end as a working page: 104.9 tok/s within 12 GB, 117.6 within 16 GB,
+    132.8 within 24 GB. Within 12 GB: 38 of the first 40 HumanEval tasks; logits against the host path 1.7e-3
+    relative with the same argmax.
+  - Known limit: on a card of 26 GB or more the default precision of the prompt path (TF32 products) moved the
+    argmax in a 24-token check against the host (4.7e-2 relative); `CMF_QWEN_CUDA_LEAN=1` (1.7e-3, same argmax)
+    or `CMF_CUDA_PREC=exact` (5.3e-6) keeps it.
+
 ## [0.8.73] — 2026-11-12
 
 ### Added

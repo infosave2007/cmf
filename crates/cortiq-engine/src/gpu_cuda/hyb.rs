@@ -573,7 +573,7 @@ fn arena_view(bytes: usize) -> Option<Buf> {
             return None;
         }
         a.set((p, cap, used + bytes.next_multiple_of(256)));
-        Some(Buf { ptr: p + used as u64, bytes, owned: false })
+        Some(Buf { ptr: p + used as u64, bytes, owned: false, slab: None })
     })
 }
 

@@ -281,6 +281,111 @@ fn mv_row_bytes(cols: usize) -> usize {
     if cols <= 4096 { (cols >> 4) * 20 * 4 } else { 16 * ((cols >> 4) | 1) * 4 }
 }
 
+/// `CMF_QWEN_ZERO_COPY=1`: the experts outside the arena are mapped into the card's address space and read in
+/// place over the bus, so the full route runs on the lean path with no host wait (same text as the host-admitted
+/// route). Off by default: on a 5090 + EPYC host the bus (52 GB/s) carries about a fifth of the routing of the
+/// 256-expert cut and the window took 33-35 ms against 27 ms with host admissions (aquarium 81 vs 86 tok/s);
+/// the first request of a server was faster (66 vs 40 tok/s), and a slow host CPU would favour it.
+fn zero_copy() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_ZERO_COPY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// In a decode step or a verify window, the experts the arena does not hold are computed by the host's cores
+/// (the q4tp int8 kernels of the CPU path) while the card runs the ones it holds; only their inputs and outputs
+/// cross the bus, a few KB instead of 2.6 MB an expert, and the arena takes only the admissions of
+/// `CMF_QWEN_ADMIT`. On by default where the host has the bus-speed kernel (AVX-512 VNNI) and eight threads or
+/// more; `CMF_QWEN_CPU_EXPERTS=1` forces it, `=0` keeps every miss an admission.
+fn cpu_experts() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("CMF_QWEN_CPU_EXPERTS").ok().as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => QTensor::moe_expert_rows_fast_available() && std::thread::available_parallelism().map_or(1, |n| n.get()) >= 8,
+    })
+}
+
+/// The host's expert workers: `CMF_QWEN_CPU_EXPERT_THREADS`, by default every core the process may use but one
+/// (the thread that drives the card). They spin `CMF_QWEN_CPU_EXPERT_SPIN` rounds (default 400 000, a few
+/// milliseconds) before parking: a layer's misses come every few hundred microseconds, and waking thirty
+/// parked threads twice a layer cost more than the experts' arithmetic (83 experts of a window in 37.6 ms).
+fn cpu_pool() -> &'static crate::pool::Pool {
+    static P: OnceLock<crate::pool::Pool> = OnceLock::new();
+    P.get_or_init(|| {
+        let n = std::env::var("CMF_QWEN_CPU_EXPERT_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).max(1)
+        });
+        let spin = std::env::var("CMF_QWEN_CPU_EXPERT_SPIN").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(400_000);
+        eprintln!("qwen4 cuda: {n} host threads compute the experts outside the arena (spin {spin})");
+        crate::pool::Pool::with_spin(n, spin)
+    })
+}
+
+/// `CMF_QWEN_CPU_FAST=0`: the host's experts go through the two row kernels, not the bus-speed kernel (the
+/// reference of a measurement).
+fn cpu_fast() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("CMF_QWEN_CPU_FAST").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// `CMF_QWEN_ADMIT=<n>[:<heat>[:<decay>]]`: with the host computing the arena's misses, up to `n` of a layer's
+/// misses a window move into the arena for the windows to come (default 4; 0: the arena stays as the request
+/// filled it), the ones picked most lately first: an expert's heat is one a window that picked it, times
+/// `decay` (default 0.95) a pass since; `heat` (default 0) is the least that is admitted.
+fn admit_policy() -> (usize, f32, f32) {
+    static V: OnceLock<(usize, f32, f32)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("CMF_QWEN_ADMIT").unwrap_or_default();
+        let mut it = v.split(':').map(str::trim);
+        let n = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(4);
+        let heat = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
+        let decay = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.95).clamp(0.0, 1.0);
+        (n, heat, decay)
+    })
+}
+
+/// The unweighted down outputs of the experts `miss` for the places `by_expert[e]` (token = place / `kk`),
+/// on the host, into `out`: `[place in that order][hid]`. Whole experts in one dispatch at the speed of the
+/// memory bus where the cores have AVX-512 VNNI, the two row kernels otherwise. False: a matrix the CPU kernels
+/// do not cover.
+fn cpu_expert_rows(moe: &MoeFfn, miss: &[usize], by_expert: &[Vec<usize>], kk: usize, xs: &[f32], hid: usize, out: &mut [f32]) -> bool {
+    let groups: Vec<Vec<usize>> = miss.iter().map(|&e| by_expert[e].iter().map(|&p| p / kk).collect()).collect();
+    let n_pairs: usize = groups.iter().map(|g| g.len()).sum();
+    let Some(&first) = miss.first() else { return false };
+    if out.len() != n_pairs * hid {
+        return false;
+    }
+    let pool = Some(cpu_pool());
+    if cpu_fast() {
+        let experts: Vec<(&QTensor, &QTensor, &QTensor)> = miss
+            .iter()
+            .map(|&e| {
+                let x = &moe.experts[e];
+                (&x.gate_proj, &x.up_proj, &x.down_proj)
+            })
+            .collect();
+        if QTensor::moe_expert_rows_fast(&experts, &groups, xs, out, pool) {
+            return true;
+        }
+    }
+    let pairs: Vec<(&QTensor, &QTensor)> = miss.iter().map(|&e| (&moe.experts[e].gate_proj, &moe.experts[e].up_proj)).collect();
+    let inter = moe.experts[first].gate_proj.rows();
+    let mut gs: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; inter]).collect();
+    if !QTensor::moe_gate_up_rows(&pairs, &groups, xs, &mut gs, pool) {
+        return false;
+    }
+    let downs: Vec<&QTensor> = miss.iter().map(|&e| &moe.experts[e].down_proj).collect();
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let mut ds: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; hid]).collect();
+    if !QTensor::moe_down_rows(&downs, &lens, &gs, &mut ds, pool) {
+        return false;
+    }
+    for (o, d) in out.chunks_exact_mut(hid).zip(&ds) {
+        o.copy_from_slice(d);
+    }
+    true
+}
+
 /// How many of the first token ids the draft chooses among. `CMF_QWEN_DRAFT_VOCAB=<n>` fixes it (0 = all). By
 /// default it adapts: the first 65 536 ids (the draft's vocabulary matvec reads a quarter of the head) while at
 /// most 10 % of the recent tokens lie beyond them (English prose and code: 3-5 %), all ids otherwise (text whose
@@ -666,6 +771,42 @@ impl Drop for Pinned {
     }
 }
 
+/// The host's scratch of a layer (`CMF_QWEN_CPU_EXPERTS`): the picks and the experts' input come down into it
+/// and the missed experts' rows go up from it. Page-locked when the driver gives the memory (a transfer is then
+/// a plain DMA the calling thread does not wait for), ordinary memory otherwise.
+struct HostScratch {
+    pin: Option<Pinned>,
+    plain: Vec<u64>,
+    /// Bytes of the three parts: picks, input rows, output rows.
+    cap: [usize; 3],
+}
+
+impl HostScratch {
+    fn new() -> Self {
+        Self { pin: None, plain: Vec::new(), cap: [0; 3] }
+    }
+
+    /// Room for `picks` ids, `xs` input and `rows` output values: where the three parts start. `drain` runs
+    /// before a block in use is replaced (a transfer from it may still be under way).
+    fn parts(&mut self, picks: usize, xs: usize, rows: usize, drain: impl FnOnce() -> Res<()>) -> Res<(*mut i32, *mut f32, *mut f32)> {
+        let need = [picks, xs, rows].map(|n| (n * 4).next_multiple_of(64));
+        if need.iter().zip(&self.cap).any(|(n, c)| n > c) {
+            drain()?;
+            let cap = [need[0].max(self.cap[0]), need[1].max(self.cap[1]), need[2].max(self.cap[2])];
+            let total: usize = cap.iter().sum();
+            self.pin = Pinned::new(total);
+            self.plain = if self.pin.is_none() { vec![0u64; total / 8] } else { Vec::new() };
+            self.cap = cap;
+        }
+        let base = match &self.pin {
+            Some(p) => p.ptr,
+            None => self.plain.as_mut_ptr() as *mut u8,
+        };
+        // SAFETY: the three parts lie inside the block of `cap[0] + cap[1] + cap[2]` bytes
+        Ok(unsafe { (base as *mut i32, base.add(self.cap[0]) as *mut f32, base.add(self.cap[0] + self.cap[1]) as *mut f32) })
+    }
+}
+
 /// The file pages of the experts the arena keeps losing, pinned where they are
 /// (`cuMemHostRegister`, read-only): an upload is one DMA straight from the
 /// mapped file, with no copy through the staging first (RTX 5090: 19 us for
@@ -720,7 +861,7 @@ struct Pins {
 
 impl Pins {
     /// `ranges[li]` = the page-aligned, disjoint (address, bytes) of layer `li`.
-    fn start(c: &'static Ctx, sel: Vec<Vec<bool>>, ranges: Vec<Vec<(usize, usize)>>) -> Self {
+    fn start(c: &'static Ctx, sel: Vec<Vec<bool>>, ranges: Vec<Vec<(usize, usize)>>, wait: bool) -> Self {
         let ready: Arc<Vec<AtomicBool>> = Arc::new((0..ranges.len()).map(|_| AtomicBool::new(false)).collect());
         let done = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -737,8 +878,8 @@ impl Pins {
                     if s2.load(Ordering::Acquire) {
                         break 'layers;
                     }
-                    // flag 8: the pages are read-only to the card
-                    let rc = unsafe { cs::cuMemHostRegister_v2(at as *mut c_void, len, 8) };
+                    // flag 8: the pages are read-only to the card; 2: mapped into its address space (zero copy)
+                    let rc = unsafe { cs::cuMemHostRegister_v2(at as *mut c_void, len, if zero_copy() { 8 | 2 } else { 8 }) };
                     if rc == cs::cudaError_enum::CUDA_SUCCESS {
                         d2.lock().unwrap().push((at, len));
                         bytes += len;
@@ -753,11 +894,20 @@ impl Pins {
                 // a layer with a failed range stays on the staging as a whole
                 r2[li].store(ok, Ordering::Release);
             }
-            if std::env::var_os("CMF_QWEN_PROF").is_some() {
+            if wait || std::env::var_os("CMF_QWEN_PROF").is_some() {
                 eprintln!("qwen4 cuda: pinned {:.2} GiB of expert pages in {:.1} s", bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
             }
         };
         let thread = std::thread::Builder::new().name("cmf-qwen-pin".into()).spawn(run).ok();
+        // the thread binds the context itself; joined here, the pins are in place before the first request
+        let thread = if wait {
+            if let Some(t) = thread {
+                let _ = t.join();
+            }
+            None
+        } else {
+            thread
+        };
         Self { sel, ready, done, stop, thread }
     }
 
@@ -908,6 +1058,29 @@ struct Arena {
     tbl_held: Vec<usize>,
     tbl_epoch: u64,
     epoch: u64,
+    /// The heat of every backbone expert the host computed, `[layer][expert]`, as of the pass `heat_at`
+    /// (`admit_hot`), and the hot misses left on the host for want of pinned pages.
+    heat: Vec<f32>,
+    heat_at: Vec<u64>,
+    unpinned: u64,
+    /// Zero-copy experts (`CMF_QWEN_ZERO_COPY`, on by default with pinned experts): the host address of every
+    /// expert outside the arena whose three matrices lie in the file as a slot does (0 otherwise), and, once its
+    /// layer is pinned, the device's address for it. The address table then names them, so a route over all the
+    /// experts runs on the lean path and the kernels read the missing ones over the bus: nothing waits for the host.
+    zc: Vec<Vec<[u64; 3]>>,
+    zc_dev: Vec<Vec<u64>>,
+    /// The three device addresses {gate, up, down} of each zero-copy expert, `[layer][expert]`; a table entry
+    /// names its triple with bit 63 set (`unit_parts` in the kernels).
+    zc_dsc: Option<Buf>,
+    zc_ready: Vec<bool>,
+    /// Every backbone layer pinned and mapped: the route covers all experts through the table.
+    zc_full: bool,
+    /// Host-computed expert rows, experts and milliseconds (`CMF_QWEN_CPU_EXPERTS`), since the last report.
+    cpu_rows: u64,
+    cpu_experts: u64,
+    cpu_ms: f64,
+    /// Where the host's share of a layer meets the card.
+    host: HostScratch,
 }
 
 /// Copy the experts' file bytes `parts` into the slot-sized `dst` slices, on
@@ -950,7 +1123,8 @@ fn copy_jobs(pool: Option<&CopyPool>, jobs: &mut [(&mut [u8], [&[u8]; 3])], sgu:
 impl Arena {
     /// The table of slot addresses, rebuilt if the arena changed since.
     fn refresh_table(&mut self, c: &Ctx) -> Res<()> {
-        if self.tbl_epoch == self.epoch {
+        let zc_changed = self.zc_poll();
+        if self.tbl_epoch == self.epoch && !zc_changed {
             return Ok(());
         }
         let mut host = vec![0u64; self.tbl_ne.len() * self.tbl_stride];
@@ -959,6 +1133,11 @@ impl Arena {
             for e in 0..ne {
                 if let Some(&s) = self.map.get(&(((li as u32) << 16) | e as u32)) {
                     host[li * self.tbl_stride + e] = self.buf.ptr + (s as usize * self.slot) as u64;
+                    held += 1;
+                } else if let Some(&a) = self.zc_dev.get(li).and_then(|v| v.get(e))
+                    && a != 0
+                {
+                    host[li * self.tbl_stride + e] = a;
                     held += 1;
                 }
             }
@@ -978,11 +1157,83 @@ impl Arena {
         Ok(())
     }
 
+    /// Map the experts of the layers pinned since the last call (their device addresses); true when any changed.
+    fn zc_poll(&mut self) -> bool {
+        let Some(pins) = self.pins.as_ref() else { return false };
+        let mut changed = false;
+        let (mut want, mut got, mut first_err) = (0usize, 0usize, None);
+        for li in 0..self.zc.len() {
+            if self.zc_ready[li] || !pins.ready.get(li).is_some_and(|f| f.load(Ordering::Acquire)) {
+                continue;
+            }
+            let ne = self.zc[li].len();
+            let mut triples = vec![0u64; ne * 3];
+            for (e, parts) in self.zc[li].iter().enumerate() {
+                if parts[0] == 0 || !pins.sel[li].get(e).copied().unwrap_or(false) {
+                    continue;
+                }
+                want += 1;
+                let mut ok = true;
+                for (k, &a) in parts.iter().enumerate() {
+                    let mut dp: cs::CUdeviceptr = 0;
+                    // SAFETY: a host address inside a range registered with the driver (DEVICEMAP)
+                    let rc = unsafe { cs::cuMemHostGetDevicePointer_v2(&mut dp, a as *mut c_void, 0) };
+                    if rc == cs::cudaError_enum::CUDA_SUCCESS && dp != 0 {
+                        triples[e * 3 + k] = dp;
+                    } else {
+                        ok = false;
+                        if first_err.is_none() {
+                            first_err = Some(rc);
+                        }
+                    }
+                }
+                if ok {
+                    got += 1;
+                } else {
+                    triples[e * 3..e * 3 + 3].fill(0);
+                }
+            }
+            if let Some(dsc) = self.zc_dsc.as_ref() {
+                let at = dsc.ptr + (li * ne * 24) as u64;
+                // SAFETY: the triples of layer li go to their rows of the descriptor buffer; the copy is synchronous
+                if unsafe { cu::memcpy_htod_sync(at, &triples) }.is_ok() {
+                    for e in 0..ne {
+                        if triples[e * 3] != 0 {
+                            self.zc_dev[li][e] = (at + (e * 24) as u64) | (1u64 << 63);
+                        }
+                    }
+                }
+            }
+            self.zc_ready[li] = true;
+            changed = true;
+        }
+        if want > 0 && got < want {
+            eprintln!("qwen4 cuda: zero copy: {got} of {want} experts mapped for the card (first error {first_err:?})");
+        }
+        if changed {
+            let main = self.main_layers().min(self.zc_ready.len());
+            // only a layer whose every expert is on the card or mapped makes a full route
+            let full = main > 0
+                && self.zc_ready[..main].iter().all(|&r| r)
+                && (0..main).all(|li| {
+                    (0..self.zc_dev[li].len()).all(|e| self.zc_dev[li][e] != 0 || self.map.contains_key(&(((li as u32) << 16) | e as u32)))
+                });
+            if full && !self.zc_full {
+                eprintln!("qwen4 cuda: every expert outside the arena is mapped for the card: the route covers them all on the lean path");
+            }
+            self.zc_full = full;
+        }
+        changed
+    }
+
     /// The table row of layer `li` as a device address, when the route may use it: the
     /// route is masked and the layer holds more than `topk` experts, or `force` (the MTP
     /// head, whose experts all stay). 0: no.
     fn tbl_ptr(&mut self, c: &Ctx, li: usize, topk: usize, force: bool) -> Res<u64> {
-        if li >= self.tbl_ne.len() || !(self.masked || force) {
+        if !self.zc.is_empty() && !self.zc_full {
+            self.refresh_table(c)?;
+        }
+        if li >= self.tbl_ne.len() || !(self.masked || force || self.zc_full) {
             return Ok(0);
         }
         self.refresh_table(c)?;
@@ -990,6 +1241,47 @@ impl Arena {
             return Ok(0);
         }
         Ok(self.tbl.ptr + (li * self.tbl_stride * 8) as u64)
+    }
+
+    /// With every expert outside the arena mapped for the card (zero copy), the slots of `order` without an
+    /// admission: an arena slot, or the expert's descriptor (the card reads it from its pinned file pages). The
+    /// arena then stays as the profile filled it. False when not in that mode or an expert is neither: then
+    /// `admit_layer`, which rewrites every entry of `order`.
+    fn resolve_layer(&mut self, li: usize, order: &[usize], slot_of: &mut [u64]) -> bool {
+        if !self.zc_full {
+            return false;
+        }
+        let pass = self.pass;
+        for &e in order {
+            match self.map.get(&(((li as u32) << 16) | e as u32)) {
+                Some(&s) => {
+                    self.last[s as usize] = pass;
+                    slot_of[e] = self.buf.ptr + (s as usize * self.slot) as u64;
+                }
+                None => match self.zc_dev.get(li).and_then(|v| v.get(e)) {
+                    Some(&a) if a != 0 => slot_of[e] = a,
+                    _ => return false,
+                },
+            }
+        }
+        true
+    }
+
+    /// The slot of expert `e` of layer `li` when the arena holds it (marked used this pass); None: a miss.
+    fn hit(&mut self, li: usize, e: usize) -> Option<u64> {
+        let &s = self.map.get(&(((li as u32) << 16) | e as u32))?;
+        self.last[s as usize] = self.pass;
+        Some(self.buf.ptr + (s as usize * self.slot) as u64)
+    }
+
+    /// Whether the arena may give up the expert in a slot (`key`): always, unless the route covers every expert
+    /// through zero copy, which holds only while each evicted expert stays mapped for the card.
+    fn evictable(&self, key: u32) -> bool {
+        if !self.zc_full {
+            return true;
+        }
+        let (l, e) = ((key >> 16) as usize, (key & 0xffff) as usize);
+        self.zc_dev.get(l).and_then(|v| v.get(e)).is_some_and(|&a| a != 0)
     }
 
     /// Layers of the backbone (the rows before the MTP head's).
@@ -1008,6 +1300,51 @@ impl Arena {
                 row[e as usize] += 1;
             }
         }
+    }
+
+    /// With the host computing the misses: the hottest of the layer's misses `miss`, up to the budget of
+    /// `admit_policy`, go into the arena for the windows to come, in place of the experts unused the longest.
+    /// The copies ride the stream behind the layer's queued kernels while the host computes this window's rows,
+    /// so only experts whose file pages are pinned are taken: one of them costs this thread three calls.
+    fn admit_hot(&mut self, li: usize, miss: &[usize], experts: &[DenseFfn], d: &Dims, c: &Ctx) -> Res<()> {
+        let (budget, least, decay) = admit_policy();
+        let ne = self.hist_ne;
+        if budget == 0 || self.zc_full || (li + 1) * ne > self.heat.len() {
+            return Ok(());
+        }
+        let pass = self.pass;
+        let mut cand: Vec<(f32, usize)> = Vec::with_capacity(miss.len());
+        for &e in miss.iter().filter(|&&e| e < ne) {
+            let i = li * ne + e;
+            let idle = pass.saturating_sub(self.heat_at[i]).min(512) as i32;
+            let h = self.heat[i] * decay.powi(idle) + 1.0;
+            (self.heat[i], self.heat_at[i]) = (h, pass);
+            if h >= least {
+                cand.push((h, e));
+            }
+        }
+        // the head's experts stay; what is left has to outnumber a layer's picks by far
+        let sticky = if self.sticky_from == u32::MAX { 0 } else { self.tbl_ne.get(self.main_layers()).copied().unwrap_or(0) };
+        if cand.is_empty() || self.n < sticky + 4 * ne.min(64) + budget {
+            return Ok(());
+        }
+        cand.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let mut order: Vec<usize> = Vec::with_capacity(budget);
+        for &(_, e) in &cand {
+            if order.len() == budget {
+                break;
+            }
+            if self.pins.as_ref().is_some_and(|p| p.has(li, e)) {
+                order.push(e);
+            } else {
+                self.unpinned += 1;
+            }
+        }
+        if order.is_empty() {
+            return Ok(());
+        }
+        let mut slot_of = vec![0u64; ne];
+        self.admit_layer(li, &order, experts, d, c, &mut slot_of)
     }
 
     /// The slots of the layer's experts `order` into `slot_of`, uploading the
@@ -1037,7 +1374,7 @@ impl Arena {
         let mut need = miss.len() - slots.len();
         while need > 0 {
             let Some((s, key, last)) = self.spare.pop() else { break };
-            if self.key[s as usize] != key || self.last[s as usize] != last {
+            if self.key[s as usize] != key || self.last[s as usize] != last || !self.evictable(key) {
                 continue;
             }
             self.map.remove(&key);
@@ -1058,7 +1395,7 @@ impl Arena {
                         continue;
                     }
                     let (j, lp) = ((key >> 16) as u64, self.last[s]);
-                    if (key >> 16) >= self.sticky_from || (j == lu && lp == pass) {
+                    if (key >> 16) >= self.sticky_from || (j == lu && lp == pass) || !self.evictable(key) {
                         continue;
                     }
                     // passes the expert went unused when its layer came up
@@ -1069,6 +1406,14 @@ impl Arena {
                 if cand.len() >= need {
                     break;
                 }
+            }
+            if cand.len() < need && self.zc_full {
+                // zero copy: what finds no slot stays where the card reads it in place
+                for &e in &miss[slots.len() + cand.len()..] {
+                    slot_of[e] = self.zc_dev[li][e];
+                }
+                miss.truncate(slots.len() + cand.len());
+                need = cand.len();
             }
             if cand.len() < need {
                 return Err("qwen4 cuda: the expert arena is smaller than one layer's experts".into());
@@ -1243,6 +1588,15 @@ impl Build {
     /// `elems` zeroed f32.
     fn zeroed(&mut self, elems: usize) -> Res<Buf> {
         let b = self.buf(elems * 4)?;
+        go!(self.c, self.q.zero, (blocks(elems), 1), 256; b.ptr, elems as u64);
+        Ok(b)
+    }
+
+    /// `elems` zeroed f32 in an allocation of the driver's own: the attention
+    /// state, replaced by a larger one as a session grows.
+    fn zeroed_direct(&mut self, elems: usize) -> Res<Buf> {
+        let b = Buf::direct(elems * 4)?;
+        self.held += b.bytes as u64;
         go!(self.c, self.q.zero, (blocks(elems), 1), 256; b.ptr, elems as u64);
         Ok(b)
     }
@@ -1444,10 +1798,10 @@ impl Build {
             k_norm: self.f32buf(&a.k_norm)?,
             iq_norm: self.f32buf(&a.index_q_norm)?,
             ik_norm: self.f32buf(&a.index_k_norm)?,
-            keys: self.zeroed(cap * kv)?,
-            vals: self.zeroed(cap * kv)?,
-            ikraw: self.zeroed(cap * d.idim)?,
-            bkey: self.zeroed((cap / d.cr + 1) * d.idim)?,
+            keys: self.zeroed_direct(cap * kv)?,
+            vals: self.zeroed_direct(cap * kv)?,
+            ikraw: self.zeroed_direct(cap * d.idim)?,
+            bkey: self.zeroed_direct((cap / d.cr + 1) * d.idim)?,
             cap,
         })
     }
@@ -1574,15 +1928,22 @@ impl Prof {
     /// Print the stage times gathered since the last report, and start over.
     fn report(&mut self, arena: &mut Arena, what: String) {
         let line = STAGES.iter().zip(&self.acc).map(|(name, ms)| format!("{name} {ms:.1}")).collect::<Vec<_>>().join(" ");
+        let host = if arena.cpu_rows > 0 {
+            format!("; host experts {} ({} rows) in {:.1} ms", arena.cpu_experts, arena.cpu_rows, arena.cpu_ms)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "qwen4 cuda: {what}: {line} ms; arena +{} -{}, staged in {:.1} ms, {} units for {} picks",
-            arena.admitted, arena.evicted, arena.stage_ms, arena.units, arena.pairs
+            "qwen4 cuda: {what}: {line} ms; arena +{} -{} ({} hot misses without pinned pages), staged in {:.1} ms, {} units for {} picks{host}",
+            arena.admitted, arena.evicted, arena.unpinned, arena.stage_ms, arena.units, arena.pairs
         );
+        (arena.cpu_rows, arena.cpu_experts, arena.cpu_ms) = (0, 0, 0.0);
         self.acc = [0.0; STAGES.len()];
         self.steps = 0;
         arena.admitted = 0;
         arena.evicted = 0;
         arena.stage_ms = 0.0;
+        arena.unpinned = 0;
         arena.units = 0;
         arena.pairs = 0;
     }
@@ -1706,6 +2067,10 @@ impl Dev {
         // one user of the card at a time: the generic entry points take the same lock
         let _st = c.st.lock().unwrap();
         c.current()?;
+        // what the card had free before this model, and one slab pool for its many small buffers
+        let free0 = super::mem_free();
+        let slabs = super::SlabScope::enter();
+        let res0 = c.resident.load(std::sync::atomic::Ordering::Relaxed);
         super::pdl_set(std::env::var("CMF_QWEN_PDL").is_ok_and(|v| v == "1"));
         let q = qf(c)?;
         if std::env::var("CMF_QWEN_NOP").is_ok_and(|v| v == "1") {
@@ -1903,12 +2268,25 @@ impl Dev {
         };
         let maskb = b.buf(n * 64 * 4)?;
 
-        // The arena takes what the budget leaves after the resident weights,
-        // the scratch and a reserve for the attention state of a long prompt.
+        // The arena takes what the card has left, as the driver reports it,
+        // less what a session grows into (the attention state of a long
+        // prompt, `CMF_QWEN_CUDA_GROW_MB`); under `CMF_GPU_VRAM_MB` no more
+        // than that budget less the driver's context and what is taken so far.
         let slot = 2 * d.sgu + d.sd;
-        let reserve = 1536u64 << 20;
-        let taken = c.resident.load(std::sync::atomic::Ordering::Relaxed) + b.held + reserve;
-        let mut slots = (vram_budget().saturating_sub(taken) / slot as u64) as usize;
+        let mib = |v: u64| v as f64 / (1u64 << 20) as f64;
+        let grow = std::env::var("CMF_QWEN_CUDA_GROW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20;
+        let free1 = super::mem_free();
+        let room = match (free0, free1) {
+            (Some(f0), Some(f1)) => {
+                let spare = f1.saturating_sub((96 << 20) + grow);
+                match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+                    Some(mb) => spare.min((mb << 20).saturating_sub(CTX_BYTES + (32 << 20) + res0 + f0.saturating_sub(f1) + grow)),
+                    None => spare,
+                }
+            }
+            _ => vram_budget().saturating_sub(c.resident.load(std::sync::atomic::Ordering::Relaxed) + b.held + (512 << 20) + grow),
+        };
+        let mut slots = (room / slot as u64) as usize;
         if let Some(mb) = std::env::var("CMF_QWEN_CUDA_ARENA_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
             slots = slots.min((mb << 20) / slot);
         }
@@ -1958,6 +2336,18 @@ impl Dev {
             tbl_ne,
             tbl_held: vec![0; tbl_rows],
             tbl_epoch: 0,
+            heat: vec![0.0; layers.len() * ne],
+            heat_at: vec![0; layers.len() * ne],
+            unpinned: 0,
+            zc: Vec::new(),
+            zc_dev: Vec::new(),
+            zc_dsc: None,
+            zc_ready: Vec::new(),
+            zc_full: false,
+            cpu_rows: 0,
+            cpu_experts: 0,
+            cpu_ms: 0.0,
+            host: HostScratch::new(),
             epoch: 1,
         };
         // the pinned expert pages (`Dev::prefill`) need the mapped model to outlive them
@@ -1975,6 +2365,15 @@ impl Dev {
                 n,
                 if half { "f16" } else { "f32" },
                 format!("{}/{}/{}", q.sm.mvb_max >> 10, q.sm.hc_max >> 10, q.sm.ex_max >> 10),
+            );
+            eprintln!(
+                "qwen4 cuda: card free {:.0} MiB at the start, {:.0} before the arena, {:.0} now; arena {:.0} MiB, {:.0} MiB left to grow into; {}",
+                mib(free0.unwrap_or(0)),
+                mib(free1.unwrap_or(0)),
+                mib(super::mem_free().unwrap_or(0)),
+                mib((slots * slot) as u64),
+                mib(grow),
+                slabs.report(),
             );
         }
         let prof = std::env::var_os("CMF_QWEN_PROF").map(|_| Mutex::new(Prof { t0: Instant::now(), acc: [0.0; STAGES.len()], steps: 0 }));
@@ -2256,10 +2655,11 @@ impl Dev {
         let _st = c.st.lock().unwrap();
         c.current()?;
         let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); layers.len()];
-        for &(l, e) in ranked.iter().take(arena.n) {
-            if l < layers.len() && e < d.ne && layers[l].moe.experts[e].segs.is_empty() {
-                by_layer[l].push(e);
-            }
+        // the free slots only: the MTP head's experts already hold theirs, and an admission past the room
+        // would evict a hotter expert of an earlier layer
+        let room = arena.n.saturating_sub(arena.used);
+        for &(l, e) in ranked.iter().filter(|&&(l, e)| l < layers.len() && e < d.ne && layers[l].moe.experts[e].segs.is_empty()).take(room) {
+            by_layer[l].push(e);
         }
         let mut slot_of = vec![0u64; d.ne];
         let mut n = 0;
@@ -2286,13 +2686,39 @@ impl Dev {
             let mut sel: Vec<Vec<bool>> = vec![vec![true; d.ne]; layers.len()];
             // `CMF_QWEN_CUDA_REG_ALL=1`: the arena's own experts too (a host with the page cache for it)
             if !std::env::var("CMF_QWEN_CUDA_REG_ALL").is_ok_and(|v| v.trim() == "1") {
-                for &(l, e) in ranked.iter().take(arena.n) {
+                // the experts the arena holds now, not the profile's head: these two differ by what did not fit
+                for &key in arena.map.keys() {
+                    let (l, e) = ((key >> 16) as usize, (key & 0xffff) as usize);
                     if l < sel.len() && e < d.ne {
                         sel[l][e] = false;
                     }
                 }
+                // zero copy: `CMF_QWEN_ZC_SPARE=<n>` pins up to n of the arena's coldest experts too, as far as the
+                // RAM holds them beside the n-gram table with 8 GB to spare, so a refill (`CMF_QWEN_SELF_PACK=1`)
+                // may trade them for what a request routes to. Off by default: the refill from the prompt's
+                // routing left the aquarium's window as it was (35.4 vs 35.0 ms)
+                if zero_copy() && !layers.iter().any(|l| l.moe.experts.iter().any(|f| !f.segs.is_empty())) {
+                    let outside: usize = sel.iter().map(|v| v.iter().filter(|&&b| b).count()).sum();
+                    let (avail, table) = (crate::qwen4_exp::mem_available(), crate::qwen4_exp::ple_table_bytes(layers));
+                    let room = avail.saturating_sub(table + (8 << 30) + outside * slot_bytes(d)) / slot_bytes(d).max(1);
+                    let cap = std::env::var("CMF_QWEN_ZC_SPARE").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                    let mut extra = 0usize;
+                    let held: Vec<(usize, usize)> = ranked
+                        .iter()
+                        .copied()
+                        .filter(|&(l, e)| l < sel.len() && e < d.ne && arena.map.contains_key(&(((l as u32) << 16) | e as u32)))
+                        .collect();
+                    for &(l, e) in held.iter().rev().take(room.min(cap)) {
+                        sel[l][e] = true;
+                        extra += 1;
+                    }
+                    if extra > 0 {
+                        eprintln!("qwen4 cuda: zero copy: {extra} of the arena's coldest experts pinned too (the arena trades them per request)");
+                    }
+                }
             }
             let (mut ranges, mut total) = (Vec::with_capacity(layers.len()), 0usize);
+            let mut zc: Vec<Vec<[u64; 3]>> = vec![vec![[0u64; 3]; d.ne]; layers.len()];
             for (li, l) in layers.iter().enumerate() {
                 // page runs of the layer's chosen experts, merged where they touch
                 let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -2309,6 +2735,8 @@ impl Dev {
                         sel[li][e] = false;
                         continue;
                     }
+                    // the three matrices in the file: the card reads them in place through a descriptor
+                    zc[li][e] = [parts[0].as_ptr() as u64, parts[1].as_ptr() as u64, parts[2].as_ptr() as u64];
                     for p in parts {
                         let a = p.as_ptr() as usize;
                         runs.push((a & !4095, (a + p.len() + 4095) & !4095));
@@ -2338,7 +2766,23 @@ impl Dev {
                 ok
             };
             if reg.as_deref() == Some("1") || fits() {
-                arena.pins = Some(Pins::start(c, sel, ranges));
+                let zc_on = zero_copy() && !layers.iter().any(|l| l.moe.experts.iter().any(|f| !f.segs.is_empty()));
+                // zero copy waits for the pins: a prompt that came first would evict experts nobody maps
+                arena.pins = Some(Pins::start(c, sel, ranges, zc_on));
+                if zc_on {
+                    let n = zc.len();
+                    let cand: usize = zc.iter().map(|v| v.iter().filter(|p| p[0] != 0).count()).sum();
+                    arena.zc_dsc = Buf::new(n * d.ne * 24).ok();
+                    eprintln!("qwen4 cuda: zero copy: {cand} experts can be read in place");
+                    arena.zc_dev = vec![vec![0u64; d.ne]; n];
+                    arena.zc_ready = vec![false; n];
+                    arena.zc = zc;
+                    // mapped now, so the first prompt's experts are read in place instead of evicting the arena's
+                    arena.zc_poll();
+                    if !arena.zc_full {
+                        eprintln!("qwen4 cuda: zero copy: the route does not cover every expert; misses stay on the staging");
+                    }
+                }
             }
         }
         Ok(n)
@@ -2380,19 +2824,27 @@ impl Dev {
     }
 }
 
+/// What the driver's context takes of a card before the first buffer.
+const CTX_BYTES: u64 = 512 << 20;
+
 /// A card whose budget leaves little beyond the weights: below 26 GiB.
 pub(crate) fn lean_card() -> bool {
     vram_budget() < (26u64 << 30)
 }
 
 /// Rows of a window's tape: eight (a verify round), or `CMF_QWEN_CUDA_TAPE`
-/// (up to 256; 256 when the copy frames are on).
+/// (up to 256; with the copy frames on, 256, or 64 on a lean card).
 fn tape_rows(n_cap: usize) -> usize {
     let frames = std::env::var("CMF_QWEN_COPY_FRAME").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0");
     let want = std::env::var("CMF_QWEN_CUDA_TAPE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(if frames { 256 } else { SMALL_ROWS });
+        .unwrap_or(match frames {
+            // a lean card keeps the short frames only: 192 rows of tape less is 500 MiB of experts more
+            true if lean_card() => 64,
+            true => 256,
+            false => SMALL_ROWS,
+        });
     want.clamp(SMALL_ROWS, 256).min(n_cap).max(1)
 }
 
@@ -2953,7 +3405,9 @@ impl Core {
                     self.gemm_w(lw.router.ptr, lw.r, d.h, s.folded.ptr, n, s.logits.ptr, Gemm::F32)?;
                 }
                 let head = li >= arena.main_layers();
-                let tbl_p = arena.tbl_ptr(c, li, topk, head)?;
+                // the host computes the misses: the route stays whole and the host path runs, with no table
+                let cpu_on = small && cpu_experts() && !head && d.gbits == 4 && !lw.has_tubes;
+                let tbl_p = if cpu_on { 0 } else { arena.tbl_ptr(c, li, topk, head)? };
                 // the route is masked by the table in the backbone's layers; the head routes over all its experts
                 let mask_p = if head { 0u64 } else { tbl_p };
                 go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, lw.ne as i32, lw.r as i32, topk as i32, self.tail, mask_p);
@@ -2994,11 +3448,33 @@ impl Core {
                         lean_saved = Some(self.grab(s.blk.ptr, n * d.h)?);
                     }
                 }
-                let mut picks = vec![0i32; n * topk];
-                unsafe { cu::memcpy_dtoh_async(&mut picks, s.picks.ptr, c.stream) }.map_err(derr)?;
+                let mut picks_own: Vec<i32> = Vec::new();
+                let (mut xs_host, mut rows_host): (&[f32], &mut [f32]) = (&[], &mut []);
+                let picks: &[i32] = if cpu_on {
+                    // the host's share: the picks and the experts' input come down in the same wait, into the
+                    // scratch the rows later go up from
+                    let (pp, xp, rp) = arena.host.parts(n * topk, n * d.h, n * topk * d.h, || c.sync())?;
+                    // SAFETY: the scratch lives as long as the arena and only this call uses it; the upload of
+                    // the rows of the layer before ended by the wait below, ahead of any write here
+                    let (pk, xs, rows) = unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(pp, n * topk),
+                            std::slice::from_raw_parts_mut(xp, n * d.h),
+                            std::slice::from_raw_parts_mut(rp, n * topk * d.h),
+                        )
+                    };
+                    unsafe { cu::memcpy_dtoh_async(&mut *pk, s.picks.ptr, c.stream) }.map_err(derr)?;
+                    unsafe { cu::memcpy_dtoh_async(&mut *xs, s.folded.ptr, c.stream) }.map_err(derr)?;
+                    (xs_host, rows_host) = (xs, rows);
+                    pk
+                } else {
+                    picks_own.resize(n * topk, 0);
+                    unsafe { cu::memcpy_dtoh_async(&mut picks_own, s.picks.ptr, c.stream) }.map_err(derr)?;
+                    &picks_own
+                };
                 c.sync()?;
                 arena.pending = false;
-                arena.note(li, &picks);
+                arena.note(li, picks);
                 self.lap(5)?;
                 let valid = |e: i32| e >= 0 && (e as usize) < lw.ne;
                 // the experts of the round in order of first pick, and the places each took
@@ -3016,7 +3492,26 @@ impl Core {
                 let mut slot_of = vec![0u64; lw.ne];
                 // a hot expert is an 8-bit tube on the card: its own q2tp triple is not read
                 let (hot, cold): (Vec<usize>, Vec<usize>) = order.iter().copied().partition(|&e| lw.tubes[e] >= 0);
-                arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
+                // the arena's misses for the host (`cpu_on`), or admitted
+                let mut cpu_miss: Vec<usize> = Vec::new();
+                let cold: Vec<usize> = if cpu_on {
+                    let mut held = Vec::with_capacity(cold.len());
+                    for &e in &cold {
+                        match arena.hit(li, e) {
+                            Some(a) => {
+                                slot_of[e] = a;
+                                held.push(e);
+                            }
+                            None => cpu_miss.push(e),
+                        }
+                    }
+                    held
+                } else {
+                    if !arena.resolve_layer(li, &cold, &mut slot_of) {
+                        arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
+                    }
+                    cold
+                };
                 self.lap(6)?;
                 // the units, then for each (token, place) the row of the
                 // partial outputs it takes
@@ -3058,7 +3553,19 @@ impl Core {
                     add(self.tube_desc + lw.shared_tube as u64 * 72, &shared_places);
                 }
                 let nu = units.len() / UNIT_WORDS;
-                if nu == 0 {
+                // the host's rows of the partial outputs follow the units' rows
+                let cpu_base = nu * UNIT_ROWS;
+                let mut cpu_rows = 0usize;
+                for &e in &cpu_miss {
+                    for &p in &by_expert[e] {
+                        refs[p] = (cpu_base + cpu_rows) as i32;
+                        cpu_rows += 1;
+                    }
+                }
+                if (cpu_base + cpu_rows) * d.h * 4 > s.d.bytes {
+                    return Err("qwen4 cuda: the host's expert rows do not fit the partial outputs".into());
+                }
+                if nu == 0 && cpu_rows == 0 {
                     go!(c, q.zero, (blocks(n * d.h), 1), 256; s.blk.ptr, (n * d.h) as u64);
                     return self.lap(7);
                 }
@@ -3105,6 +3612,22 @@ impl Core {
                         )
                     }?;
                 }
+                if cpu_on && !cpu_miss.is_empty() {
+                    // behind the layer's kernels, under the host's work on this window's rows
+                    arena.admit_hot(li, &cpu_miss, &layer.moe.experts, d, c)?;
+                }
+                if cpu_rows > 0 {
+                    // the card runs the held experts meanwhile
+                    let t0 = Instant::now();
+                    let rows = &mut rows_host[..cpu_rows * d.h];
+                    if !cpu_expert_rows(&layer.moe, &cpu_miss, &by_expert, kk, xs_host, d.h, rows) {
+                        return Err("qwen4 cuda: the CPU expert kernels do not cover this layer (CMF_QWEN_CPU_EXPERTS)".into());
+                    }
+                    arena.cpu_ms += t0.elapsed().as_secs_f64() * 1e3;
+                    self.put(s.d.ptr + (cpu_base * d.h * 4) as u64, rows)?;
+                    arena.cpu_rows += cpu_rows as u64;
+                    arena.cpu_experts += cpu_miss.len() as u64;
+                }
                 go!(c, sm.exp_sum, (blocks(n * d.h), 1), 256;
                     refs_at, s.d.ptr, s.wts.ptr, s.logits.ptr, s.blk.ptr,
                     n as i32, kk as i32, topk as i32, d.h as i32, lw.r as i32, lw.gcol);
@@ -3149,7 +3672,10 @@ impl Core {
         let mut slot_of = vec![0u64; lw.ne];
         // a hot expert's weights are its tube: no slot (the expansion skips slot 0), the tube is expanded instead
         let cold: Vec<usize> = order.iter().copied().filter(|&e| lw.tubes[e] < 0).collect();
-        arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
+        // `hold` (the MTP head's step) keeps its experts in the arena already
+        if !(li < arena.main_layers() && arena.resolve_layer(li, &cold, &mut slot_of)) {
+            arena.admit_layer(li, &cold, &layer.moe.experts, d, c, &mut slot_of)?;
+        }
         self.lap(6)?;
         let (mut i, mut first) = (0usize, true);
         while i < order.len() {
