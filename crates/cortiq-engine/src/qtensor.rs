@@ -15830,7 +15830,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bus-speed expert kernel (`moe_fast`): its scales are bit for bit
+    /// The fast expert kernel (`moe_fast`): its scales are bit for bit
     /// those of `scales_into`, whole experts equal `moe_gate_up_rows` +
     /// `moe_down_rows` up to the rounding of a sixteen-lane sum, with
     /// activation outliers on both stages, empty groups, groups past four

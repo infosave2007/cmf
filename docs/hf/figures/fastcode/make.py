@@ -23,7 +23,7 @@ T = {
         file="file, GB", vram="peak VRAM, GB", better="better",
         cards="Cards from 12 GB (CUDA)", cards_sub="one RTX 5090 held to the memory shown; the experts that do not fit run on the host's cores",
         cards_y="the aquarium page written to the end, tok/s", cards_x="card memory",
-        cards_note=["the answer is the complete working page in every bar", "within 12 GB: 1 357 of 12 288 experts on the card,", "38 of the first 40 HumanEval tasks pass"],
+        cards_note=["{pct} of Strata Coder's speed on the same cards,", "with experts at 4 bits and attention at 8 bits:", "Strata Coder is a 2-bit cut of the same model", "", "the answer is a complete working page in every bar;", "{he} of the first 40 HumanEval tasks pass"],
     ),
     "ru": dict(
         speed="Скорость на одной RTX PRO 6000 (96 ГБ)", speed_sub="один под, один клиент, жадный выбор, без размышлений",
@@ -34,7 +34,7 @@ T = {
         file="файл, ГБ", vram="пик VRAM, ГБ", better="лучше",
         cards="Карты от 12 ГБ (CUDA)", cards_sub="одна RTX 5090, ограниченная указанной памятью; не поместившихся экспертов считают ядра процессора",
         cards_y="страница аквариума, написанная до конца, ток/с", cards_x="память карты",
-        cards_note=["ответ в каждом столбце — полная рабочая страница", "в 12 ГБ: на карте 1 357 экспертов из 12 288,", "проходят 38 из первых 40 задач HumanEval"],
+        cards_note=["{pct} скорости Strata Coder на тех же картах,", "с экспертами в 4 битах и вниманием в 8 битах:", "Strata Coder — 2-битная сборка той же модели", "", "ответ в каждом столбце — полная рабочая страница;", "проходят {he} из первых 40 задач HumanEval"],
     ),
     "zh": dict(
         speed="单张 RTX PRO 6000（96 GB）上的速度", speed_sub="同一台机器、同一客户端、贪心解码、关闭思考",
@@ -45,7 +45,7 @@ T = {
         file="文件，GB", vram="显存峰值，GB", better="更好",
         cards="12 GB 起的显卡（CUDA）", cards_sub="一张 RTX 5090，限制为图中显存；放不下的专家由主机 CPU 核心计算",
         cards_y="完整写出水族箱页面，tok/s", cards_x="显存",
-        cards_note=["每根柱子的回答都是完整可运行的页面", "12 GB 内：显卡保留 12 288 个专家中的 1 357 个，", "HumanEval 前 40 题通过 38 题"],
+        cards_note=["在同样的显卡上达到 Strata Coder 速度的 {pct}，", "专家保持 4 位、注意力保持 8 位：", "Strata Coder 是同一模型的 2 位裁剪版", "", "每根柱子的回答都是完整可运行的页面；", "HumanEval 前 40 题通过 {he} 题"],
     ),
 }
 
@@ -134,12 +134,14 @@ def main():
             y2 = 462
             body += f'<line x1="30" y1="{y2 - 32}" x2="{W - 30}" y2="{y2 - 32}" stroke="{GRID}"/>'
             body += txt(30, y2, t["cards"], 20, INK, weight="bold") + txt(30, y2 + 22, t["cards_sub"], 13, MUTED)
-            groups_c = [{"label": c["label"], "vals": {"fastcode": c["decode"]}} for c in data["cards"]]
-            body += grouped(30, y2 + 70, 440, 200, groups_c, [("fastcode", names["fastcode"])], t["cards_y"])
-            body += txt(30 + 220, y2 + 70 + 200 + 40, t["cards_x"], 12, MUTED, "middle")
+            cs = data.get("cards_series", ["fastcode"])
+            groups_c = [{"label": c["label"], "vals": c["decode"] if isinstance(c["decode"], dict) else {"fastcode": c["decode"]}} for c in data["cards"]]
+            body += legend(30, y2 + 50, [(k, names[k]) for k in cs])
+            body += grouped(30, y2 + 90, 440, 200, groups_c, [(k, names[k]) for k in cs], t["cards_y"])
+            body += txt(30 + 220, y2 + 90 + 200 + 40, t["cards_x"], 12, MUTED, "middle")
             for i, line in enumerate(t["cards_note"]):
-                body += txt(520, y2 + 110 + 24 * i, line, 14, INK2)
-            H = y2 + 70 + 200 + 58
+                body += txt(520, y2 + 110 + 24 * i, line.format(**data.get("cards_fill", {}).get(lang, {})), 14, INK2)
+            H = y2 + 90 + 200 + 58
         write(out_dir, f"fc_speed_{lang}", svg(W, H, body))
         # quality: HumanEval and code ppl
         he = [(k, names[k], v) for k, v in data["humaneval"]]

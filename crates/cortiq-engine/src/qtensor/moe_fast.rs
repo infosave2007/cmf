@@ -1,5 +1,4 @@
-//! Whole q4tp experts on the host's cores at the speed of the memory bus: the
-//! kernel behind [`QTensor::moe_expert_rows_fast`], for the experts a card's
+//! Whole q4tp experts on the host's cores: the kernel behind [`QTensor::moe_expert_rows_fast`], for the experts a card's
 //! arena does not hold.
 //!
 //! The row kernels of `moe_gate_up_rows` / `moe_down_rows` spend most of a

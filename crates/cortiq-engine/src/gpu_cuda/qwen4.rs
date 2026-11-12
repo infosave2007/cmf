@@ -294,7 +294,7 @@ fn zero_copy() -> bool {
 /// In a decode step or a verify window, the experts the arena does not hold are computed by the host's cores
 /// (the q4tp int8 kernels of the CPU path) while the card runs the ones it holds; only their inputs and outputs
 /// cross the bus, a few KB instead of 2.6 MB an expert, and the arena takes only the admissions of
-/// `CMF_QWEN_ADMIT`. On by default where the host has the bus-speed kernel (AVX-512 VNNI) and eight threads or
+/// `CMF_QWEN_ADMIT`. On by default where the host has the fast kernel (AVX-512 VNNI) and eight threads or
 /// more; `CMF_QWEN_CPU_EXPERTS=1` forces it, `=0` keeps every miss an admission.
 fn cpu_experts() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -323,7 +323,7 @@ fn cpu_pool() -> &'static crate::pool::Pool {
     })
 }
 
-/// `CMF_QWEN_CPU_FAST=0`: the host's experts go through the two row kernels, not the bus-speed kernel (the
+/// `CMF_QWEN_CPU_FAST=0`: the host's experts go through the two row kernels, not the fast kernel (the
 /// reference of a measurement).
 fn cpu_fast() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -331,7 +331,7 @@ fn cpu_fast() -> bool {
 }
 
 /// `CMF_QWEN_ADMIT=<n>[:<heat>[:<decay>]]`: with the host computing the arena's misses, up to `n` of a layer's
-/// misses a window move into the arena for the windows to come (default 4; 0: the arena stays as the request
+/// misses a window move into the arena for the windows to come (default 1; 0: the arena stays as the request
 /// filled it), the ones picked most lately first: an expert's heat is one a window that picked it, times
 /// `decay` (default 0.95) a pass since; `heat` (default 0) is the least that is admitted.
 fn admit_policy() -> (usize, f32, f32) {
@@ -339,7 +339,9 @@ fn admit_policy() -> (usize, f32, f32) {
     *V.get_or_init(|| {
         let v = std::env::var("CMF_QWEN_ADMIT").unwrap_or_default();
         let mut it = v.split(':').map(str::trim);
-        let n = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(4);
+        // one: the copies ride the stream the window waits on, and the aquarium within 12 / 16 / 24 GB ran at
+        // 145 / 175 / 207 tok/s with one, 139 / 171 / 186 with two, 128 / 142 / 177 with four
+        let n = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
         let heat = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.0);
         let decay = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.95).clamp(0.0, 1.0);
         (n, heat, decay)
@@ -3004,9 +3006,10 @@ impl Dev {
     /// lower rows' weights in the memory of the node the process sits on, the upper rows' in the other
     /// node's, each computed by the threads of its node (`CMF_QWEN_CPU_NODES=1` keeps one node).
     ///
-    /// WHY: the host kernel is bound by the memory bus, and a node has one. On 2 x EPYC 9554 the 28 threads
-    /// of one node read the experts at 153-180 GB/s of a ceiling of 220-230, and 14 + 14 threads over both
-    /// nodes, each on weights of its own node, at 393-421 GB/s. The weights are page-cache pages of the model
+    /// WHY: a node has one memory bus. On 2 x EPYC 9554 a plain reader gets 220-230 GB/s on one node and
+    /// 393-421 GB/s with 14 + 14 threads over both, each on weights of its own node; the expert kernel itself
+    /// is bound by its arithmetic at 28 threads (273 us of a thread an expert at an idle bus), so the split
+    /// did not move the aquarium's speed, and it keeps the far threads off the near bus. The weights are page-cache pages of the model
     /// file, which stay on the node that read them first: `Pool::place_file_pages` has the upper half of
     /// every matrix read again by the far node's threads where it is not there yet. It runs before anything
     /// pins the pages (a pinned page cannot leave the page cache), and a second start finds them placed.
