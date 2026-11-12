@@ -123,6 +123,17 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Qwen-Image-2.1 on CUDA (0.8.82)
+
+[Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) now runs on CUDA too, its transformer steps
+against the prompt's cached keys and values and its VAE decoder each as one chain on the card. On an RTX A5000
+a 1024×1024 picture in 40 steps takes 53.0 s on CUDA (before, the transformer ran on the host at 65 s a
+step) and 69.8 s over Vulkan:
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-2.1.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## MOSS-Image on CUDA, Vulkan and Metal (0.8.81)
 
 [MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) runs every block of a DiT pass on the card in one

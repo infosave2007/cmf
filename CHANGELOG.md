@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.82] — 2026-11-13
+
+### Added
+- Qwen-Image-2.1 ([the file](https://huggingface.co/infosave/Qwen-Image-2.1-cmf),
+  [Uncensored](https://huggingface.co/infosave/Qwen-Image-2.1-Uncensored-CMF)) runs on CUDA: the `gpu::qi21_*`
+  contract the Metal and Vulkan modules serve (`gpu_cuda/qi21.rs`, `qi21.cu`). The prefill runs the prompt
+  prefix through every block once with the block-causal mask (TF32 products around a softmax over each row's
+  visible keys) and keeps each layer's keys and values on the card in the flash kernel's layouts of the whole
+  sequence; a denoiser call writes its own keys and values after them and runs `h3_flash` over the lot. Blocks:
+  LayerNorm times `1 + s`, q/k/v products, per-head q/k RMS norm with the interleaved rotation, `tanh`-gated
+  residuals, the SwiGLU; the weights in the H3 store under `CMF_GPU_VRAM_MB`. Before, `CMF_GPU=cuda` ran the
+  transformer on the host (65 s a step at 512 x 512). The VAE decoder runs as one chain too
+  (`gpu_cuda::qi21_vae_decode`: RMS norm over channels, im2col convolutions with f16 products, the mid block's
+  wide head on TF32 products, the DupUp shortcuts): 24.0 s -> 2.9 s at 1024 x 1024, 64.4 dB from the
+  per-convolution decoder. RTX A5000, release build, 40 steps: 15.3 s at 512 x 512 and 53.0 s at
+  1024 x 1024 (a step 1.15 s; Vulkan on the same card 22.7 s and 69.8 s, a step 1.49 s); the CUDA picture is
+  45.8 dB from the Vulkan one at 1024 x 1024, and a seed gives the same picture twice. `CMF_QI21_CUDA=0` and
+  `CMF_QI21_VAE_CUDA=0` keep the host transformer and the per-convolution decoder.
+
 ## [0.8.81] — 2026-11-13
 
 ### Added

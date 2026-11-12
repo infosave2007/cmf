@@ -112,6 +112,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Qwen-Image-2.1:支持 CUDA(0.8.82)
+
+[Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) 现在也可在 CUDA 上运行：基于提示词缓存的键值进行的
+Transformer 步骤和 VAE 解码器都各自作为一条链在显卡上运行。在 RTX A5000 上，40 步 1024×1024 图片在 CUDA 上用时
+53.0 秒（之前 Transformer 在主机上运行，每步 65 秒），Vulkan 上用时 69.8 秒:
+
+```sh
+CMF_GPU=cuda cortiq imagine qwen-image-2.1.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## MOSS-Image:支持 CUDA、Vulkan 和 Metal(0.8.81)
 
 [MOSS-Image](https://huggingface.co/infosave/MOSS-Image-SFT-cmf) 现在在三个后端上都一次调用就在显卡上完成 DiT 一遍的全部块，
