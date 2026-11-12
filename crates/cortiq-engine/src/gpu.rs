@@ -4231,6 +4231,160 @@ pub fn te_chain(job: &TeChain<'_>, h: &mut [f32]) -> bool {
     }
 }
 
+/// One projection of the LTX-2.5 transformer for the resident chain: a
+/// container matrix `[rows][cols]` (q4tp or q8_2f) by directory index, or a
+/// dense f32 one, and its bias (`[rows]`, or empty).
+#[derive(Clone, Copy)]
+pub struct LtxLin<'a> {
+    pub w: Option<usize>,
+    pub dense: &'a [f32],
+    pub rows: usize,
+    pub cols: usize,
+    pub bias: &'a [f32],
+}
+
+/// One attention of an LTX-2.5 block: the query reads the tokens, the keys
+/// and values read the context (the tokens again for self-attention), q and
+/// k take an RMS norm over the whole inner width, and every head's output
+/// is scaled by `2 * sigmoid(gate(x))` where the block has gate logits.
+#[derive(Clone, Copy)]
+pub struct LtxAttn<'a> {
+    pub q: LtxLin<'a>,
+    pub k: LtxLin<'a>,
+    pub v: LtxLin<'a>,
+    pub o: LtxLin<'a>,
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub gate: Option<LtxLin<'a>>,
+    pub heads: usize,
+    pub dh: usize,
+}
+
+/// One modality's half of an LTX-2.5 block.
+pub struct LtxStream<'a> {
+    pub attn1: LtxAttn<'a>,
+    pub attn2: LtxAttn<'a>,
+    pub ff_in: LtxLin<'a>,
+    pub ff_out: LtxLin<'a>,
+    /// `[distinct][9][dim]`: (shift, scale, gate) of self-attention, of the
+    /// feed-forward and of the prompt attention, for each distinct timestep
+    /// of the stream (the block's table plus the timestep's row).
+    pub mods: &'a [f32],
+    /// `[2][dim]`: shift and scale of the prompt before its keys and values.
+    pub ctx_mod: &'a [f32],
+}
+
+/// One LTX-2.5 block: both streams and the two directions of their fusion.
+pub struct LtxBlock<'a> {
+    pub video: LtxStream<'a>,
+    pub audio: LtxStream<'a>,
+    pub a2v: LtxAttn<'a>,
+    pub v2a: LtxAttn<'a>,
+    /// `[distinct][4][dim]`: (scale, shift) of the audio-to-video attention
+    /// and (scale, shift) of the video-to-audio one, for the video stream.
+    pub xmods_v: &'a [f32],
+    /// The same for the audio stream, `[distinct][4][a_dim]`.
+    pub xmods_a: &'a [f32],
+    /// `[dim]`: the gate of what audio adds to video.
+    pub gate_a2v: &'a [f32],
+    /// `[a_dim]`: the gate of what video adds to audio.
+    pub gate_v2a: &'a [f32],
+}
+
+/// What a stream brings to one denoising step besides its tokens.
+pub struct LtxSide<'a> {
+    pub n: usize,
+    pub dim: usize,
+    /// `[n]`: each token's row of `LtxStream::mods`.
+    pub rows: &'a [u32],
+    /// `[n]`: each token's row of the fusion tables.
+    pub xrows: &'a [u32],
+    /// Self-attention rotation: cos and sin `[n][dim / 2]` and the half
+    /// width of a rotation group (pairs are `(i, i + half)` inside a group).
+    pub pe: (&'a [f32], &'a [f32], usize),
+    /// The same for the fusion attentions, over their inner width.
+    pub xpe: (&'a [f32], &'a [f32], usize),
+    /// The prompt as this stream reads it, `[ctx_len][dim]`.
+    pub ctx: &'a [f32],
+    pub ctx_len: usize,
+    /// Additive per-key bias of the prompt attention; empty: none.
+    pub mask: &'a [f32],
+}
+
+/// The 48 blocks of one LTX-2.5 denoising step.
+pub struct LtxChain<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub blocks: &'a [LtxBlock<'a>],
+    pub video: LtxSide<'a>,
+    pub audio: LtxSide<'a>,
+}
+
+/// Whether this backend runs an LTX-2.5 step as one resident chain.
+pub fn ltx_chain_available() -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => true,
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::ltx_available(),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The blocks over both streams (`vx` `[n][dim]`, `ax` `[m][a_dim]`), in
+/// place, with the streams on the card from the first block to the last.
+/// `false`: nothing was written and the caller runs its per-op path.
+#[allow(unused_variables)]
+pub fn ltx_chain(job: &LtxChain<'_>, vx: &mut [f32], ax: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::ltx_chain(job, vx, ax),
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::ltx_chain(job, vx, ax),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// One stage of the LTX-2.5 video VAE's decode over a volume
+/// `[c][f][h][w]`.
+pub enum Vae3dStep<'a> {
+    /// A 3x3x3 convolution with zero padding in space and replicated frames
+    /// in time: `w` `[out_ch][in_ch * 27]`, `b` `[out_ch]`.
+    Conv { w: &'a [f32], b: &'a [f32], in_ch: usize, out_ch: usize },
+    /// The RMS over the channels at every position (`eps` under the root),
+    /// then SiLU.
+    NormSilu { eps: f32 },
+    /// Keep the activation for a later `AddSaved`.
+    Save,
+    /// Add the kept activation.
+    AddSaved,
+    /// Depth to space over (frames, height, width), the channels laid out
+    /// `(c p1 p2 p3)`; a frame stride of 2 leaves the first frame out.
+    DepthToSpace { p: (usize, usize, usize) },
+}
+
+/// The stages over `x` `[c][f][h][w]` on the card: the result and its
+/// `(c, f, h, w)`. `None`: the caller runs its host path.
+#[allow(unused_variables)]
+pub fn vae3d_chain(
+    steps: &[Vae3dStep<'_>],
+    x: &[f32],
+    c: usize,
+    f: usize,
+    h: usize,
+    w: usize,
+) -> Option<(Vec<f32>, usize, usize, usize, usize)> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::ltx_vae_chain(steps, x, c, f, h, w),
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::h3::ltx_vae_chain(steps, x, c, f, h, w),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
 /// One stage of a convolution chain over an activation `[c][h][w]`.
 pub enum ConvStep<'a> {
     /// GroupNorm(32) with its affine weights, then SiLU, in place.

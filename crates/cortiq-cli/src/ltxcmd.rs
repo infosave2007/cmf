@@ -795,6 +795,15 @@ pub struct VideoArgs<'a> {
 /// Prompt in, video out — the whole pipeline in one process and one file.
 pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     use cortiq_engine::ltxpipe::{Geometry, Rng, Stage, run_stage, unpatchify_video};
+    // A seeded render must come out the same twice. While a probe class is
+    // undecided the arbitration alternates the device and the host arm on
+    // real data (the host arm quantizes activations to int8), so the first
+    // step of two runs of one seed differed by up to several per cent.
+    // The render pins the arms; an explicit CMF_GPU_PROBE still wins.
+    if std::env::var_os("CMF_GPU_PROBE").is_none() {
+        // SAFETY: single-threaded, before any engine or GPU init.
+        unsafe { std::env::set_var("CMF_GPU_PROBE", "0") };
+    }
     use cortiq_engine::ltxte::LtxTextEncoder;
     use cortiq_engine::tokenizer::Tokenizer;
 
@@ -1611,6 +1620,9 @@ fn read_ppm_f32(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
 /// prefixed by component in the LTX container (`te.`, `dit.`, `vvae.`,
 /// `avae.`), and a stage that has run is never read again in one render.
 fn release_pages(model: &std::sync::Arc<cortiq_core::CmfModel>, prefix: &str) {
+    // the stage is over on the card as well: what a resident chain keeps of
+    // it leaves before the next stage needs the room
+    cortiq_engine::gpu::stage_done(model);
     let dropped = model.advise_done(|n| n.starts_with(prefix));
     if dropped > 0 {
         tracing::info!("{prefix}* pages released: {} MB", dropped / (1024 * 1024));

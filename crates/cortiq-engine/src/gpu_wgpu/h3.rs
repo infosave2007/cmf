@@ -57,6 +57,12 @@
 //! `CMF_H3_WGPU_TILE=bm,bn,bk,wm,wn`, `CMF_H3_WGPU_FLASH=nw,bc`.
 
 use crate::gpu::{H3Chain, TeChain};
+
+/// LTX-2.5's blocks as a resident chain, on this module's parts.
+#[path = "ltx.rs"]
+mod ltx;
+#[cfg_attr(target_os = "macos", allow(unused_imports))]
+pub(crate) use ltx::{ltx_available, ltx_chain, ltx_vae_chain};
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::{Arc, Mutex};
 

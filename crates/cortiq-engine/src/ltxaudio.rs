@@ -345,6 +345,33 @@ impl Sig {
     }
 }
 
+/// `f(channel, row)` over the channels of a `[c][t]` buffer, across the
+/// cores: the vocoder's activations and resampling filters treat every
+/// channel on its own.
+fn par_channels(data: &mut [f32], t: usize, f: &(dyn Fn(usize, &mut [f32]) + Sync)) {
+    if t == 0 || data.is_empty() {
+        return;
+    }
+    let c = data.len() / t;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(c).min(32);
+    if threads <= 1 || data.len() < (1 << 16) {
+        for (i, row) in data.chunks_mut(t).enumerate() {
+            f(i, row);
+        }
+        return;
+    }
+    let per = c.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (g, chunk) in data.chunks_mut(per * t).enumerate() {
+            sc.spawn(move || {
+                for (i, row) in chunk.chunks_mut(t).enumerate() {
+                    f(g * per + i, row);
+                }
+            });
+        }
+    });
+}
+
 struct Conv1d {
     w: Vec<f32>,
     b: Option<Vec<f32>>,
@@ -374,19 +401,26 @@ impl Conv1d {
     fn forward(&self, x: &Sig, pool: Option<&Pool>) -> Sig {
         let t = x.t;
         let kk = self.c_in * self.k;
-        let mut patches = vec![0f32; t * kk];
-        for p in 0..t {
-            for ci in 0..self.c_in {
-                for a in 0..self.k {
-                    let s = p as isize + (a * self.dilation) as isize - self.pad as isize;
-                    if s >= 0 && s < t as isize {
-                        patches[p * kk + ci * self.k + a] = x.data[ci * t + s as usize];
+        let mut ys = vec![0f32; t * self.c_out];
+        // The device gathers the columns itself where it has the kernel
+        // (only `x` crosses the bus); the host builds them otherwise.
+        let on_device = std::env::var("CMF_LTX_CONV1D_GPU").as_deref() != Ok("0")
+            && crate::gpu::enabled_here()
+            && crate::gpu::conv1d_gemm(&x.data, &self.w, self.c_in, self.c_out, t, self.k, self.pad, self.dilation, t, &mut ys);
+        if !on_device {
+            let mut patches = vec![0f32; t * kk];
+            for p in 0..t {
+                for ci in 0..self.c_in {
+                    for a in 0..self.k {
+                        let s = p as isize + (a * self.dilation) as isize - self.pad as isize;
+                        if s >= 0 && s < t as isize {
+                            patches[p * kk + ci * self.k + a] = x.data[ci * t + s as usize];
+                        }
                     }
                 }
             }
+            crate::fcd_ops::gemm_nt(&patches, &self.w, &mut ys, t, kk, self.c_out, pool);
         }
-        let mut ys = vec![0f32; t * self.c_out];
-        crate::fcd_ops::gemm_nt(&patches, &self.w, &mut ys, t, kk, self.c_out, pool);
         let mut out = Sig::zeros(self.c_out, t);
         for p in 0..t {
             for co in 0..self.c_out {
@@ -428,33 +462,31 @@ impl ConvT1d {
     fn forward(&self, x: &Sig) -> Sig {
         let t_out = (x.t - 1) * self.stride + self.k - 2 * self.pad;
         let mut out = Sig::zeros(self.c_out, t_out);
-        for ci in 0..self.c_in {
-            for p in 0..x.t {
-                let v = &x.data[ci * x.t + p];
-                if *v == 0.0 {
-                    continue;
-                }
-                let base = p * self.stride;
-                for a in 0..self.k {
-                    let o = base + a;
-                    if o < self.pad || o - self.pad >= t_out {
+        // An output channel at a time, across the cores; each value still
+        // sums its taps in (input channel, position, tap) order.
+        par_channels(&mut out.data, t_out, &|co, row| {
+            for ci in 0..self.c_in {
+                let w = &self.w[(ci * self.c_out + co) * self.k..][..self.k];
+                for (p, &v) in x.data[ci * x.t..(ci + 1) * x.t].iter().enumerate() {
+                    if v == 0.0 {
                         continue;
                     }
-                    let oo = o - self.pad;
-                    for co in 0..self.c_out {
-                        out.data[co * t_out + oo] +=
-                            v * self.w[(ci * self.c_out + co) * self.k + a];
+                    let base = p * self.stride;
+                    for (a, &wa) in w.iter().enumerate() {
+                        let o = base + a;
+                        if o < self.pad || o - self.pad >= t_out {
+                            continue;
+                        }
+                        row[o - self.pad] += v * wa;
                     }
                 }
             }
-        }
-        if let Some(b) = &self.b {
-            for co in 0..self.c_out {
-                for v in out.data[co * t_out..(co + 1) * t_out].iter_mut() {
+            if let Some(b) = &self.b {
+                for v in row.iter_mut() {
                     *v += b[co];
                 }
             }
-        }
+        });
         out
     }
 }
@@ -486,8 +518,11 @@ impl Aliasing {
         // reference takes
         let tp = x.t + 2 * pad;
         let full = (tp - 1) * stride + k;
-        let mut out = Sig::zeros(x.c, full);
-        for c in 0..x.c {
+        let (lo, hi) = (pad_left, full - pad_right);
+        let t2 = hi - lo;
+        let mut trimmed = Sig::zeros(x.c, t2);
+        par_channels(&mut trimmed.data, t2, &|c, row| {
+            let mut out = vec![0f32; full];
             for p in 0..tp {
                 let src = (p as isize - pad as isize).clamp(0, x.t as isize - 1) as usize;
                 let v = x.data[c * x.t + src] * self.ratio as f32;
@@ -495,17 +530,11 @@ impl Aliasing {
                     continue;
                 }
                 for a in 0..k {
-                    out.data[c * full + p * stride + a] += v * self.up[a];
+                    out[p * stride + a] += v * self.up[a];
                 }
             }
-        }
-        let (lo, hi) = (pad_left, full - pad_right);
-        let t2 = hi - lo;
-        let mut trimmed = Sig::zeros(x.c, t2);
-        for c in 0..x.c {
-            trimmed.data[c * t2..(c + 1) * t2]
-                .copy_from_slice(&out.data[c * full + lo..c * full + hi]);
-        }
+            row.copy_from_slice(&out[lo..hi]);
+        });
         trimmed
     }
 
@@ -516,17 +545,17 @@ impl Aliasing {
         let tp = x.t + pad_left + pad_right;
         let t2 = (tp - k) / self.ratio + 1;
         let mut out = Sig::zeros(x.c, t2);
-        for c in 0..x.c {
-            for p in 0..t2 {
+        par_channels(&mut out.data, t2, &|c, row| {
+            for (p, o) in row.iter_mut().enumerate() {
                 let mut acc = 0f32;
                 for a in 0..k {
                     let s = (p * self.ratio + a) as isize - pad_left as isize;
                     let s = s.clamp(0, x.t as isize - 1) as usize;
                     acc += x.data[c * x.t + s] * self.down[a];
                 }
-                out.data[c * t2 + p] = acc;
+                *o = acc;
             }
-        }
+        });
         out
     }
 }
@@ -549,14 +578,15 @@ impl SnakeBeta {
 
     fn forward(&self, x: &Sig) -> Sig {
         let mut up = self.aa.upsample(x);
-        for c in 0..up.c {
+        let t = up.t;
+        par_channels(&mut up.data, t, &|c, row| {
             let a = self.alpha[c].exp();
             let b = self.beta[c].exp();
-            for v in up.data[c * up.t..(c + 1) * up.t].iter_mut() {
+            for v in row.iter_mut() {
                 let s = (*v * a).sin();
                 *v += s * s / (b + 1e-9);
             }
-        }
+        });
         self.aa.downsample(&up)
     }
 }
