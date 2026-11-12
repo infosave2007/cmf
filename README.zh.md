@@ -112,6 +112,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Z-Image:支持 CUDA(0.8.83)
+
+[Z-Image-Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf) 和 [Z-Image](https://huggingface.co/infosave/Z-Image-cmf)
+现在在 CUDA 上运行 Transformer，每一步一次调用在显卡上完成;之前 `CMF_GPU=cuda` 时它在主机上运行。在 RTX A5000 上，
+Turbo 以 8 步生成 1024×1024 图片在 CUDA 上用时 12.1 秒，Vulkan 上用时 13.0 秒:
+
+```sh
+CMF_GPU=cuda cortiq imagine z-image-turbo.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## Qwen-Image-2.1:支持 CUDA(0.8.82)
 
 [Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) 现在也可在 CUDA 上运行：基于提示词缓存的键值进行的

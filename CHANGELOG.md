@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.83] — 2026-11-13
+
+### Added
+- Z-Image ([Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf), [the base model](https://huggingface.co/infosave/Z-Image-cmf))
+  runs on CUDA: the `gpu::zimage_prepare` / `zimage_step` contract the Metal and Vulkan modules serve
+  (`gpu_cuda/zimage.rs`, `zimage.cu`), one DiT forward a step on the card — the embed with its pad rows, the two
+  noise refiners over the image rows, the refined caption after them, the thirty layers over [image | caption],
+  the final LayerNorm times the step's scale and its linear. A block is the Lumina Next-DiT block's arithmetic, so
+  it runs on `lumina.rs::block_dev` (the Lumina block now also works on rows that stay on the card). The caption's
+  context refiner and a CFG pair stay as before (host refiner, the two items stepped one by one). Before,
+  `CMF_GPU=cuda` ran the transformer on the host (45 s a step at 512 x 512). RTX A5000, release build: Turbo
+  (8 steps) 5.3 s at 512 x 512 and 12.1 s at 1024 x 1024 (Vulkan on the same card 6.3 s and 13.0 s); the
+  base model (28 steps, CFG 4) 17.5 s and 62.4 s (Vulkan 19.2 s and 70.1 s). Turbo's CUDA picture is 51-53 dB
+  from the Vulkan one (the base model's, through CFG, 28-38 dB) and the same twice. `CMF_ZIMAGE_CUDA=0` keeps the host path.
+
 ## [0.8.82] — 2026-11-13
 
 ### Added
