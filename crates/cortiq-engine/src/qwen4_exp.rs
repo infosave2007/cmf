@@ -2851,7 +2851,7 @@ fn ple_row_ids(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<i6
 /// demand), and the table is asked for ahead (`MADV_WILLNEED`). A host whose RAM does not hold the whole file then
 /// keeps the table (the decode steps' random reads) instead of the pages the load happened to read last. From a
 /// background thread; returns at once.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 fn cache_trim(layers: &[Layer]) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -2931,7 +2931,7 @@ fn cache_trim(layers: &[Layer]) {
 /// file by 8 GB. Pinning the table where it does not (a 62 GB container, a 67 GB file) evicts the pages a prompt
 /// needs and made every prompt wait on the disk (TTFT 12-15 s instead of 1.5-3 s). `CMF_QWEN_PLE_LOCK=1` pins
 /// whatever the memory, `0` never. Returns at once.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 fn ple_lock(layers: &[Layer]) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -2981,7 +2981,7 @@ fn ple_lock(layers: &[Layer]) {
 }
 
 /// Bytes of the n-gram tables' file pages (the decode steps' random host reads).
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 pub(crate) fn ple_table_bytes(layers: &[Layer]) -> usize {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for l in layers {
@@ -2999,14 +2999,14 @@ pub(crate) fn ple_table_bytes(layers: &[Layer]) -> usize {
 
 /// Bytes of RAM this process may still take: MemAvailable, or the container's memory limit minus its anonymous
 /// memory when lower (0 where neither can be read).
-#[cfg(all(feature = "gpu", not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(feature = "cuda", not(any(target_os = "linux", target_os = "android"))))]
 pub(crate) fn mem_available() -> usize {
     0
 }
 
 /// Bytes of RAM this process may still take: MemAvailable, or the container's memory limit minus its anonymous
 /// memory when lower.
-#[cfg(all(feature = "gpu", any(target_os = "linux", target_os = "android")))]
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "android")))]
 pub(crate) fn mem_available() -> usize {
     let kb = std::fs::read_to_string("/proc/meminfo")
         .ok()
