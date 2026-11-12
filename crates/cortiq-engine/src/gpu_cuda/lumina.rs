@@ -55,9 +55,31 @@ pub fn lumina_block(model: &Arc<CmfModel>, a: &DitBlockArgs<'_>, segs: &[usize],
 }
 
 unsafe fn block(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, a: &DitBlockArgs<'_>, segs: &[usize], x: &mut [f32]) -> Res<()> {
+    if x.len() != a.n * a.hidden {
+        return Err("a block of the wrong shape".into());
+    }
+    let xb = st.h3.buf(c, "lb x", a.n * a.hidden * 4)?;
+    unsafe {
+        cu::memcpy_htod_async(xb, x, c.stream).map_err(derr)?;
+        block_dev(c, st, model, a, segs, xb)?;
+    }
+    let mut out = vec![0f32; a.n * a.hidden];
+    unsafe { cu::memcpy_dtoh_async(&mut out, xb, c.stream).map_err(derr)? };
+    c.sync()?;
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err("the block produced a value that is not finite".into());
+    }
+    x.copy_from_slice(&out);
+    Ok(())
+}
+
+/// One block over the rows `xb` (`[n][hidden]` f32 on the card), in place
+/// on the card: the Lumina Next-DiT block, and Z-Image's (`zimage.rs`), whose
+/// block is the same arithmetic. The gates arrive `tanh`-ed.
+pub(super) unsafe fn block_dev(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, a: &DitBlockArgs<'_>, segs: &[usize], xb: u64) -> Res<()> {
     let (n, hs, inter, nh, nkv, hd) = (a.n, a.hidden, a.inter, a.nh, a.nkv, a.hd);
     let (qd, kd) = (nh * hd, nkv * hd);
-    if n == 0 || x.len() != n * hs || segs.iter().sum::<usize>() != n || nkv == 0 || !nh.is_multiple_of(nkv) {
+    if n == 0 || segs.iter().sum::<usize>() != n || nkv == 0 || !nh.is_multiple_of(nkv) {
         return Err("a block of the wrong shape".into());
     }
     if !hd.is_multiple_of(32) || a.rope_cos.len() != n * hd / 2 || a.rope_sin.len() != n * hd / 2 {
@@ -82,7 +104,6 @@ unsafe fn block(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, a: &DitBlockArgs
     let at = |o: usize| cb + (o * 4) as u64;
 
     let ns_max = segs.iter().map(|s| s.next_multiple_of(16)).max().unwrap_or(16);
-    let xb = st.h3.buf(c, "lb x", n * hs * 4)?;
     let xn = st.h3.buf(c, "lb xn", n * hs.max(inter) * 2)?;
     let y = st.h3.buf(c, "lb y", n * qd.max(inter) * 4)?;
     let y2 = st.h3.buf(c, "lb y2", n * kd.max(inter) * 4)?;
@@ -94,10 +115,7 @@ unsafe fn block(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, a: &DitBlockArgs
     let ao = st.h3.buf(c, "lb ao", n * qd * 2)?;
     let w = st.h3.buf(c, "lb w", hs.max(inter) * qd.max(inter).max(hs) * 2)?;
     let w2 = st.h3.buf(c, "lb w2", hs.max(inter) * hs.max(inter) * 2)?;
-    unsafe {
-        cu::memcpy_htod_async(xb, x, c.stream).map_err(derr)?;
-        cu::memcpy_htod_async(cb, &cv, c.stream).map_err(derr)?;
-    }
+    unsafe { cu::memcpy_htod_async(cb, &cv, c.stream).map_err(derr)? };
     let eps = a.eps;
     let rows = (n as u32, 1);
     let hsi = hs as i32;
@@ -159,12 +177,5 @@ unsafe fn block(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, a: &DitBlockArgs
         c.gemm(true, false, hs, n, inter, 1.0 / INV, w, inter, xn, inter, 0.0, y, hs, Gemm::Half)?;
         c.launch(f.res, rows, 256, 0, kargs!(xb, y, at(o_f2), at(o_gf), hsi, eps))?;
     }
-    let mut out = vec![0f32; n * hs];
-    unsafe { cu::memcpy_dtoh_async(&mut out, xb, c.stream).map_err(derr)? };
-    c.sync()?;
-    if out.iter().any(|v| !v.is_finite()) {
-        return Err("the block produced a value that is not finite".into());
-    }
-    x.copy_from_slice(&out);
     Ok(())
 }

@@ -123,6 +123,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Z-Image на CUDA (0.8.83)
+
+[Z-Image-Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf) и [Z-Image](https://huggingface.co/infosave/Z-Image-cmf)
+теперь считают трансформер на CUDA, шаг за один вызов на карте; раньше при `CMF_GPU=cuda` он шёл на хосте. На
+RTX A5000 Turbo рисует картинку 1024×1024 за 8 шагов за 12,1 с на CUDA и 13,0 с через Vulkan:
+
+```sh
+CMF_GPU=cuda cortiq imagine z-image-turbo.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## Qwen-Image-2.1 на CUDA (0.8.82)
 
 [Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) теперь работает и на CUDA: шаги трансформера

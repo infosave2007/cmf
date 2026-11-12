@@ -123,6 +123,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Z-Image on CUDA (0.8.83)
+
+[Z-Image-Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf) and [Z-Image](https://huggingface.co/infosave/Z-Image-cmf)
+now run their transformer on CUDA, a step as one call on the card; before, `CMF_GPU=cuda` ran it on the host. On
+an RTX A5000 Turbo draws a 1024×1024 picture in 8 steps in 12.1 s on CUDA and 13.0 s over Vulkan:
+
+```sh
+CMF_GPU=cuda cortiq imagine z-image-turbo.cmf --prompt "A red fox sitting in fresh snow at sunset" --out fox.png
+```
+
 ## Qwen-Image-2.1 on CUDA (0.8.82)
 
 [Qwen-Image-2.1](https://huggingface.co/infosave/Qwen-Image-2.1-cmf) now runs on CUDA too, its transformer steps
