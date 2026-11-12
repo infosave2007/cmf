@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     them, keys and values stored in the order the lanes read them).
   - A ceiling on the card's memory (`CMF_GPU_VRAM_MB`): the blocks that do not fit pass through the card every
     step. RTX 2000 Ada 16 GB, 2048×2048: 50.3 s without a ceiling at 12.7 GB of the card, 53.5 s under 8 GB,
-    54.4 s under 6 GB, 60.2 s under 4 GB (3.7 GB used), the same picture (49.6 dB PSNR). 1024×1024 19.0 s,
+    54.4 s under 6 GB, 60.2 s under 4 GB (3.7 GB used), the same picture (49.6 dB PSNR). 1024×1024 16.1 s,
     4096×4096 283.7 s, an edit at 2048×2048 with one 1024×1024 picture 80.8 s. Over Vulkan the pipeline uses the
     per-operation kernels of the MiniMax-H3 video path: 1024×1024 in 88.7 s on the same card.
   - Known limit: an edit of a densely detailed, high-contrast picture comes out over-processed at 2048×2048 and

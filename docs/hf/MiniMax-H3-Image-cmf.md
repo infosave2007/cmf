@@ -90,7 +90,7 @@ NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the me
 
 | run | prompt, s | six steps, s | a step, s | decode, s | total, s | peak memory of the card, MiB |
 |---|---:|---:|---:|---:|---:|---:|
-| CUDA, 1024 x 1024 (`--min-area 1024`) | 3.4 | 13.4 | 1.92 | 0.6 | **19.0** | 12 116 |
+| CUDA, 1024 x 1024 (`--min-area 1024`) | 2.4 | 11.7 | 1.95 | 0.5 | **16.1** | 12 116 |
 | CUDA, 2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA, 4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA, edit at 2048 x 2048, one 1024 x 1024 picture | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
@@ -134,7 +134,7 @@ An 8-bit encoder, an 8-bit transformer and the f32 path give the same result; th
 originals; nothing was retrained.
 
 Checked: the CUDA chain against a per-operation f32 path (54.0 dB PSNR on a 2048 x 2048 edit), CUDA against
-Vulkan (44.6 dB), the 4 GB ceiling against none (49.6 dB). Not checked: the reference implementation was
+Vulkan (47.0 dB), the 4 GB ceiling against none (49.6 dB). Not checked: the reference implementation was
 not run on the same card, so there is no picture-to-picture comparison with it.
 
 ## License
@@ -181,7 +181,7 @@ cortiq imagine minimax-h3-image-q4tp.cmf --prompt @prompt.txt --out out.png
 
 | прогон | промпт, с | шесть шагов, с | шаг, с | декодер, с | всего, с | пик памяти карты, МиБ |
 |---|---:|---:|---:|---:|---:|---:|
-| CUDA, 1024 x 1024 (`--min-area 1024`) | 3,4 | 13,4 | 1,92 | 0,6 | **19,0** | 12 116 |
+| CUDA, 1024 x 1024 (`--min-area 1024`) | 2,4 | 11,7 | 1,95 | 0,5 | **16,1** | 12 116 |
 | CUDA, 2048 x 2048 | 2,6 | 44,3 | 7,38 | 1,7 | **50,3** | 12 654 |
 | CUDA, 4096 x 4096 | 9,2 | 264,5 | 43,90 | 8,3 | **283,7** | 13 414 |
 | CUDA, правка 2048 x 2048, одна картинка 1024 x 1024 | 9,8 | 67,9 | 11,37 | 1,7 | **80,8** | 12 854 |
@@ -241,7 +241,7 @@ CUDA 需要 NVIDIA 驱动和 CUDA 12.x 库（`libnvrtc.so.12`、`libcublas.so.12
 
 | 运行 | 提示词，秒 | 六步，秒 | 每步，秒 | 解码，秒 | 总计，秒 | 显存峰值，MiB |
 |---|---:|---:|---:|---:|---:|---:|
-| CUDA，1024 x 1024（`--min-area 1024`） | 3.4 | 13.4 | 1.92 | 0.6 | **19.0** | 12 116 |
+| CUDA，1024 x 1024（`--min-area 1024`） | 2.4 | 11.7 | 1.95 | 0.5 | **16.1** | 12 116 |
 | CUDA，2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA，4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA，2048 x 2048 编辑，一张 1024 x 1024 参考图 | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |

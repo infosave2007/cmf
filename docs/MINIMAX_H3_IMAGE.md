@@ -78,7 +78,7 @@ NVIDIA RTX 2000 Ada, 16 GB, one image, seed 42, single runs (2048 x 2048: the me
 
 | run | prompt, s | six steps, s | a step, s | decode, s | total, s | peak memory of the card, MiB |
 |---|---:|---:|---:|---:|---:|---:|
-| CUDA, 1024 x 1024 (`--min-area 1024`) | 3.4 | 13.4 | 1.92 | 0.6 | **19.0** | 12 116 |
+| CUDA, 1024 x 1024 (`--min-area 1024`) | 2.4 | 11.7 | 1.95 | 0.5 | **16.1** | 12 116 |
 | CUDA, 2048 x 2048 | 2.6 | 44.3 | 7.38 | 1.7 | **50.3** | 12 654 |
 | CUDA, 4096 x 4096 | 9.2 | 264.5 | 43.90 | 8.3 | **283.7** | 13 414 |
 | CUDA, edit at 2048 x 2048, one 1024 x 1024 picture | 9.8 | 67.9 | 11.37 | 1.7 | **80.8** | 12 854 |
@@ -122,7 +122,7 @@ carries it and the vision tower over from a MiniMax-H3 container; `--te` packs i
 
 - The chain against the per-operation path (every product a separate f32 GEMM) on a 2048 x 2048 edit:
   54.0 dB PSNR between the pictures.
-- CUDA against Vulkan, 1024 x 1024, the same seed: 44.6 dB.
+- CUDA against Vulkan, 1024 x 1024, the same seed: 47.0 dB.
 - A 4 GB ceiling against none: 49.6 dB.
 - The VAE decoder's chain against its per-operation path: 47.5 dB; against f16 weights: 48.5 dB.
 - `CMF_H3_SAT=1` counts the halves a panel stores at the saturation value: none on text-to-image and edit runs.
@@ -150,7 +150,7 @@ carries it and the vision tower over from a MiniMax-H3 container; `--te` packs i
   posterized). The same edit at 1024 x 1024 (`--width 1024 --height 1024 --min-area 1024`) is clean, and so are
   edits of softer pictures at 2048 x 2048. An 8-bit encoder, an 8-bit transformer and the per-operation f32
   path give the same result, so the codec and the chain are ruled out; the cause is not found.
-- Vulkan runs per operation and is 4.7 times slower than CUDA on the same card. Metal uses the same
+- Vulkan runs per operation and is 5.5 times slower than CUDA on the same card. Metal uses the same
   kernels and has not been measured.
 - The attention kernel needs tensor cores with `mma.sync` (compute capability 8.0 and up); older cards take
   two batched products instead.
