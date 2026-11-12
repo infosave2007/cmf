@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.79] — 2026-11-12
+
+### Added
+- Lumina-Image 2.0 (`cortiq imagine`, [the file](https://huggingface.co/infosave/Lumina-Image-2.0cmf)) runs a whole
+  Next-DiT block on the card in one call over CUDA (`gpu_cuda/lumina.rs`, `lumina.cu`), as it already did over
+  Vulkan and Metal: the sandwich RMS norms with the timestep scale, the q/k/v products, per-head q/k norm with the
+  interleaved rotation, grouped-query attention per sequence on `h3_flash`, the gated post-normed residuals and
+  the SwiGLU feed-forward, the weights kept on the card in their codec. RTX A5000, release build, 30 steps, CFG 4:
+  512 x 512 in 40.5 s (0.8.78: 332.2 s), 1024 x 1024 in 180.0 s; over Vulkan on the same card 55.4 s and
+  252.7 s. The picture is 62.6 dB from the per-operation CUDA render and 40.7 dB from the Vulkan one; a seed gives
+  the same picture twice. `CMF_LUMINA_CUDA=0` keeps the per-operation path.
+
+### Fixed
+- CUDA: the per-operation attention (`gpu::dit_attention`) declined grouped-query heads, so Lumina's attention
+  (24 query heads on 8 key heads) ran on the host under `CMF_GPU=cuda`. It now packs the key and value heads on
+  their own and hands the group size to the flash kernel: the per-operation render goes 332.2 s to 210.1 s.
+
 ## [0.8.78] — 2026-11-12
 
 ### Changed

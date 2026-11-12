@@ -123,6 +123,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Lumina-Image 2.0 на CUDA (0.8.79)
+
+[Lumina-Image 2.0](https://huggingface.co/infosave/Lumina-Image-2.0cmf) теперь считает целый блок трансформера на
+карте за один вызов и на CUDA, как раньше на Vulkan и Metal. На RTX A5000 картинка 512×512 за 30 шагов с
+guidance занимает 40,5 с на CUDA (было 332,2 с) и 55,4 с через Vulkan:
+
+```sh
+CMF_GPU=cuda cortiq imagine lumina-q4tp.cmf --prompt "a red fox sitting in snow at sunset" --out fox.ppm
+```
+
 ## LTX-2.5 на CUDA и Vulkan: клип со звуком за 24 с (0.8.77)
 
 [LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf), видео и его звуковая дорожка по одному промпту, теперь

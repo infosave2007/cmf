@@ -4016,6 +4016,10 @@ pub fn dit_block_seg(
         {
             crate::gpu_wgpu::dit_block_seg(model, a, segs, x)
         }
+        // The whole block on the card, one block a call (`CMF_LUMINA_CUDA=0`
+        // keeps the per-operation path).
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::lumina_block(model, a, segs, x),
         #[allow(unreachable_patterns)]
         _ => false,
     }

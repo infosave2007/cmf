@@ -878,7 +878,7 @@ mod hyb;
 mod h3;
 pub use h3::{
     h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
-    h3_te_chain, ltx_chain, ltx_vae_chain,
+    h3_te_chain, lumina_block, ltx_chain, ltx_vae_chain,
 };
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {

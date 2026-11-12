@@ -37,6 +37,11 @@ use cortiq_core::{CmfModel, TensorDtype};
 use super::{Buf, Ctx, DevMat, Gemm, Res, State, bl, compile, cs, cu, ctx, debug, decline, derr, dev_mat, func};
 use crate::gpu::H3Chain;
 
+/// The Lumina Next-DiT block, one block a call, on this module's weight store.
+#[path = "lumina.rs"]
+mod lumina;
+pub use lumina::lumina_block;
+
 /// LTX-2.5's blocks as a resident chain, on this module's weight store.
 #[path = "ltx.rs"]
 mod ltx;
@@ -94,6 +99,8 @@ pub(super) struct H3State {
     host_w: HashMap<(usize, usize), Buf>,
     /// The kernels of the LTX-2.5 chain (`ltx.rs`), once compiled.
     ltx: Option<ltx::LxFuncs>,
+    /// The kernels of the Lumina block (`lumina.rs`), once compiled.
+    lumina: Option<lumina::LbFuncs>,
 }
 
 impl H3State {
@@ -1087,11 +1094,12 @@ pub fn h3_attention(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if c.current().is_err() || nkv != nh || n == 0 {
+    // grouped-query attention: `nh / nkv` query heads share a key head
+    if c.current().is_err() || nkv == 0 || !nh.is_multiple_of(nkv) || n == 0 {
         return false;
     }
-    let len = nh * n * hd;
-    if qh.len() < len || kh.len() < len || vh.len() < len || out.len() < len {
+    let (len, klen) = (nh * n * hd, nkv * n * hd);
+    if qh.len() < len || kh.len() < klen || vh.len() < klen || out.len() < len {
         return false;
     }
     let mut st = c.st.lock().unwrap();
@@ -1102,20 +1110,20 @@ pub fn h3_attention(
         let ns = n.next_multiple_of(16);
         let src = st.h3.buf(c, "at src", len * 4)?;
         let qp = st.h3.buf(c, "q", nh * n * hdp * 2)?;
-        let kp = st.h3.buf(c, "k", nh * n * hdp * 2)?;
-        let vp = st.h3.buf(c, "v", nh * ns * hdp * 2 + 64)?;
+        let kp = st.h3.buf(c, "k", nkv * n * hdp * 2)?;
+        let vp = st.h3.buf(c, "v", nkv * ns * hdp * 2 + 64)?;
         let ao = st.h3.buf(c, "ao", n * nh * hdp * 2)?;
         let res = st.h3.buf(c, "at out", len * 4)?;
-        let (ni, nsi, nhi, hsi, hdi) = (n as i32, ns as i32, nh as i32, hd as i32, hdp as i32);
-        let blocks = ((nh * ns * hdp).div_ceil(256)) as u32;
+        let (ni, nsi, hsi, hdi) = (n as i32, ns as i32, hd as i32, hdp as i32);
         unsafe {
-            for (mode, (plane, dst)) in [(&qh[..len], qp), (&kh[..len], kp), (&vh[..len], vp)].into_iter().enumerate() {
-                let mode = mode as i32;
+            for (mode, (plane, planes, dst)) in [(&qh[..len], nh, qp), (&kh[..klen], nkv, kp), (&vh[..klen], nkv, vp)].into_iter().enumerate() {
+                let (mode, pi) = (mode as i32, planes as i32);
+                let blocks = ((planes * ns * hdp).div_ceil(256)) as u32;
                 cu::memcpy_htod_async(src, plane, c.stream).map_err(derr)?;
-                c.launch(f.pack, (blocks, 1), 256, 0, kargs!(src, dst, ni, nsi, nhi, hsi, hdi, mode))?;
+                c.launch(f.pack, (blocks, 1), 256, 0, kargs!(src, dst, ni, nsi, pi, hsi, hdi, mode))?;
             }
-            let one = 1i32;
-            c.launch(fl, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(qp, kp, vp, ao, ni, nsi, nhi, scale, one))?;
+            let (nhi, hpk) = (nh as i32, (nh / nkv) as i32);
+            c.launch(fl, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(qp, kp, vp, ao, ni, nsi, nhi, scale, hpk))?;
             c.launch(f.unpack, (len.div_ceil(256) as u32, 1), 256, 0, kargs!(ao, res, ni, nhi, hsi, hdi))?;
             cu::memcpy_dtoh_async(&mut out[..len], res, c.stream).map_err(derr)?;
         }
