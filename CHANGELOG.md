@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- q2tp weights and Prism's activation boundary on the CUDA hybrid arm. q2tp tiles (job kinds 1 and 9) carry a
+  lane's 16 two-bit codes a 32-column group beside q4tp's ladder and rung codes (rung 0 a zero group), the
+  registers built exactly as bf16 (the mid-rise 2c - 3 with the half in the scale, or the affine correction's
+  c - 1); `hy_repack2`, and `hy_expand_q2r` for the prompt path. A Prism file's forward matrices read their
+  input through `hy_prism_p` (the planes in place) or `hy_prism_h` (f16 rows): every 1024-block of a row as
+  FWHT(x * signs) / 32 cast to f16, the host's butterflies in their order, at every input site of the token
+  graph and the prompt path (the GDN gates keep the untouched rows); a stack whose matrices are not all in
+  the forward basis declines. Ternary-Bonsai-2-27B (q2tp affine, prism_hadamard_qwen35), which ran op by op
+  on CUDA at 0.44 tok/s, runs the whole token graph: RTX A5000, fast build, CUDA against Vulkan on the same
+  card, decode 26.1 against 24.5 tok/s, a 4096-token prompt 740 against 117 tok/s (first token 5.5 against
+  34.9 s); the greedy text identical to the CPU's.
+
 ## [0.8.95] — 2026-11-13
 
 ### Added

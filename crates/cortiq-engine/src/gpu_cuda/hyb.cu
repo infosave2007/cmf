@@ -631,6 +631,23 @@ __device__ __forceinline__ u32 a_q1t(u32 W, int r) {
     return v;
 }
 
+// The A register r of a q2tp tile lane: two-bit codes c at bits 4r and
+// 4r + 2 as bf16x2 2c - 3 (the mid-rise (c - 1.5) s with the half in the
+// scale) or, `aff`, c - 1; both exact.
+__device__ __forceinline__ u32 a_q2(u32 W, int r, bool aff) {
+    const u32 t = W >> (4 * r);
+    const u32 h = (t & 3u) | ((t & 0xCu) << 14) | 0x43004300u;
+    u32 v;
+    if (aff) {
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(v) : "r"(h), "r"(0x3F803F80u), "r"(0xC301C301u));
+    } else {
+        u32 c;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(c) : "r"(h), "r"(0x3F803F80u), "r"(0xC300C300u));
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(v) : "r"(c), "r"(0x40004000u), "r"(0xC040C040u));
+    }
+    return v;
+}
+
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -674,6 +691,10 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     // kind 2: ternary tiles (a lane's 16 two-bit codes, value + 1), the same scales
     const bool q1 = (jb.kind & 0xFF) == 3;
     const bool q1t = (jb.kind & 0xFF) == 2;
+    // kind 1 / 9: q2tp tiles (a lane's 16 two-bit codes), the q4tp ladder and
+    // rung codes (rung 0 = zero); 1 = (c - 1.5) s, 9 = the affine (c - 1) s
+    const bool q2 = (jb.kind & 0xFF) == 1 || (jb.kind & 0xFF) == 9;
+    const bool q2a = (jb.kind & 0xFF) == 9;
     // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
     for (int i = tid; i < 16 * TB; i += blockDim.x) {
         const int rr = tile0 * 16 + i;
@@ -746,7 +767,16 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
             const size_t tg = (size_t)tile * gpr + g;
             u32 a00, a01, a02, a03, a10, a11, a12, a13;
             float sa, sb;
-            if (q1t) {
+            if (q2) {
+                const u32 W2 = ((const u32*)jb.w)[tg * 32 + lane];
+                const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                const int ca = Cc[tg * 16 + gid], cb = Cc[tg * 16 + gid + 8];
+                const float half = q2a ? 1.0f : 0.5f;
+                sa = ca ? half * exp2f(fmaf((float)(ca - 1), pa.y, pa.x)) : 0.0f;
+                sb = cb ? half * exp2f(fmaf((float)(cb - 1), pb.y, pb.x)) : 0.0f;
+                a00 = a_q2(W2, 0, q2a), a01 = a_q2(W2, 1, q2a), a02 = a_q2(W2, 2, q2a), a03 = a_q2(W2, 3, q2a);
+                a10 = a_q2(W2, 4, q2a), a11 = a_q2(W2, 5, q2a), a12 = a_q2(W2, 6, q2a), a13 = a_q2(W2, 7, q2a);
+            } else if (q1t) {
                 const u32 W2 = ((const u32*)jb.w)[tg * 32 + lane];
                 const u16* S1 = (const u16*)jb.aux0 + tg * 16;
                 sa = h2f(S1[gid]);
@@ -2473,4 +2503,136 @@ extern "C" __global__ void hy_expand_q1tr(const u32* __restrict__ T, const u16* 
             const float hi = ((float)((w >> (4 * reg + 2)) & 3u) - 1.0f) * sc;
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
+}
+
+// A q2tp matrix ([2-bit chunks: 8 bytes a (row, group), weight k at byte k/4,
+// bits 2 (k % 4)][row params][5-bit rung codes]) as q2tp tiles (kinds 1 / 9):
+// lane l holds at bits 4r, 4r + 2 the codes of its A register r's two
+// elements (`hy_repack1t`'s order); Cc[t][g][16] the rows' rung codes as
+// `hy_repack` lays them. `pair`: a gate/up pair's rows as `hy_repack` maps them.
+extern "C" __global__ void hy_repack2(const u8* __restrict__ chA, const u8* __restrict__ codesA, const u8* __restrict__ chB,
+                                      const u8* __restrict__ codesB, int stride, int pair, u32* __restrict__ T,
+                                      u8* __restrict__ Cc, int rows, int cols)
+{
+    const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)ntile * gpr * 32) return;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    u32 w = 0u;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const bool second = pair && (r & 15) >= 8;
+            const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+            const u8* ch = (second ? chB : chA) + ((size_t)sr * gpr + g) * 8;
+            const int c = 16 * s + 8 * (m >> 1) + 2 * tig;
+            const u32 lo = (ch[c >> 2] >> (2 * (c & 3))) & 3u;
+            const u32 hi = (ch[(c + 1) >> 2] >> (2 * ((c + 1) & 3))) & 3u;
+            w |= (lo | (hi << 2)) << (4 * (s * 4 + m));
+        }
+    T[idx] = w;
+    if (lane < 16) {
+        const int r = tile * 16 + lane;
+        u8 code = 0;
+        if (r < rows) {
+            const bool second = pair && (r & 15) >= 8;
+            const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+            const u8* cr = (second ? codesB : codesA) + (size_t)sr * stride;
+            const int bit = g * 5, b = bit >> 3, sh = bit & 7;
+            u32 v = cr[b];
+            if (sh > 3) v |= (u32)cr[b + 1] << 8;
+            code = (u8)((v >> sh) & 31u);
+        }
+        Cc[tg * 16 + lane] = code;
+    }
+}
+
+// `hy_expand_pr` for kinds 1 / 9 (q2tp tiles): row tiles [tile0, tile0 + nt)
+// as f16 rows, W holding those rows only.
+extern "C" __global__ void hy_expand_q2r(const u32* __restrict__ T, const u8* __restrict__ Cc, const float* __restrict__ lad,
+                                         u16* __restrict__ W, int rows, int cols, int tile0, int nt, int aff)
+{
+    const int gpr = cols >> 5;
+    const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx0 >= (size_t)nt * gpr * 32) return;
+    const size_t idx = idx0 + (size_t)tile0 * gpr * 32;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    const u32 w = T[idx];
+    const int r0 = tile0 * 16;
+    const float2* par = (const float2*)lad;
+    const float off = aff ? 1.0f : 1.5f;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
+            const int reg = s * 4 + m;
+            const int code = Cc[tg * 16 + gid + 8 * (m & 1)];
+            const float sc = code ? exp2f(fmaf((float)(code - 1), par[r].y, par[r].x)) : 0.0f;
+            const float lo = ((float)((w >> (4 * reg)) & 3u) - off) * sc;
+            const float hi = ((float)((w >> (4 * reg + 2)) & 3u) - off) * sc;
+            *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
+        }
+}
+
+// Prism's activation boundary (`prism::forward`): every block of `blk` (a
+// power of two) of a row becomes FWHT(x * signs) / sqrt(blk), rounded to f16
+// under `f16`, the butterflies in the host's order. A CUDA block a (row,
+// block), the block in shared memory. `hy_prism_p`: the row's planes in
+// place; `hy_prism_h`: f16 rows `src` into `dst` (in place allowed).
+__device__ __forceinline__ void prism_fwht(float* sv, int blk) {
+    for (int w = 1; w < blk; w <<= 1) {
+        for (int i = threadIdx.x; i < blk / 2; i += blockDim.x) {
+            const int a = (i / w) * 2 * w + (i % w), b = a + w;
+            const float x = sv[a], y = sv[b];
+            sv[a] = __fadd_rn(x, y);
+            sv[b] = __fsub_rn(x, y);
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void hy_prism_p(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ signs,
+                                      int blk, int f16)
+{
+    extern __shared__ float sv[];
+    const int r = blockIdx.y, b0 = blockIdx.x * blk;
+    const size_t at = (size_t)r * pstride + b0;
+    for (int i = threadIdx.x; i < blk; i += blockDim.x) sv[i] = __fmul_rn(__fadd_rn(bf2f(p0[at + i]), bf2f(p1[at + i])), signs[b0 + i]);
+    __syncthreads();
+    prism_fwht(sv, blk);
+    const float inv = 1.0f / sqrtf((float)blk);
+    for (int i = threadIdx.x; i < blk; i += blockDim.x) {
+        float v = __fmul_rn(sv[i], inv);
+        if (f16) v = h2f(f2h(v));
+        put3(p0, p1, p1, at + i, v);
+    }
+}
+
+extern "C" __global__ void hy_prism_h(const u16* src, u16* dst, int stride, const float* __restrict__ signs,
+                                      int blk, int f16)
+{
+    extern __shared__ float sv[];
+    const int r = blockIdx.y, b0 = blockIdx.x * blk;
+    const size_t at = (size_t)r * stride + b0;
+    for (int i = threadIdx.x; i < blk; i += blockDim.x) sv[i] = __fmul_rn(h2f(src[at + i]), signs[b0 + i]);
+    __syncthreads();
+    prism_fwht(sv, blk);
+    const float inv = 1.0f / sqrtf((float)blk);
+    for (int i = threadIdx.x; i < blk; i += blockDim.x) {
+        float v = __fmul_rn(sv[i], inv);
+        if (f16) v = h2f(f2h(v));
+        dst[at + i] = f2h(v);
+    }
 }

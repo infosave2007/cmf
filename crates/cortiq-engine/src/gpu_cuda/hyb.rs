@@ -178,6 +178,10 @@ pub(super) struct HFuncs {
     expand_q1: cs::CUfunction,
     repack1t: cs::CUfunction,
     expand_q1t: cs::CUfunction,
+    repack2: cs::CUfunction,
+    expand_q2: cs::CUfunction,
+    prism_p: cs::CUfunction,
+    prism_h: cs::CUfunction,
     qk: cs::CUfunction,
     scores: cs::CUfunction,
     values: cs::CUfunction,
@@ -254,6 +258,10 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         expand_q1: func(module, "hy_expand_q1r")?,
         repack1t: func(module, "hy_repack1t")?,
         expand_q1t: func(module, "hy_expand_q1tr")?,
+        repack2: func(module, "hy_repack2")?,
+        expand_q2: func(module, "hy_expand_q2r")?,
+        prism_p: func(module, "hy_prism_p")?,
+        prism_h: func(module, "hy_prism_h")?,
         qk: func(module, "hy_qk")?,
         scores: func(module, "hy_scores")?,
         values: func(module, "hy_values")?,
@@ -318,8 +326,8 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
 }
 
 fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
-    if list.iter().any(|(m, ..)| !matches!(m.kind, 2 | 3 | 5 | 6) || m.cols % 32 != 0) {
-        return Err("a tensor-core job over a matrix that is not repacked (q4tp, int8, q1 or ternary tiles)".into());
+    if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9) || m.cols % 32 != 0) {
+        return Err("a tensor-core job over a matrix that is not repacked (q4tp, q2tp, int8, q1 or ternary tiles)".into());
     }
     let max_rows = list.iter().map(|&(_, _, _, _, r)| r).max().unwrap_or(0);
     let mut bufs = Vec::with_capacity(2);
@@ -335,7 +343,7 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 y,
                 res,
                 rows: rows as i32,
-                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3, ternary 2), the epilogue bits from the call
+                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3, ternary 2, q2tp 1 / 9 affine), the epilogue bits from the call
                 kind: (m.kind as i32) | (kind & !0xFF),
                 blk0: blk as i32,
                 ystride: ystride as i32,
@@ -797,6 +805,141 @@ fn repack1x_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows:
     Ok((all, sv))
 }
 
+/// The bytes `repack2_on_card` takes for a rows x cols q2tp matrix.
+fn q2_bytes(rows: usize, cols: usize) -> usize {
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let cc_at = (tg * 128).next_multiple_of(256);
+    let lad_at = (cc_at + tg * 16).next_multiple_of(256);
+    (lad_at + rows * 8 + 64).next_multiple_of(256)
+}
+
+/// A q2tp matrix (one payload, or a gate/up pair laid out as `hy_repack`
+/// lays a q4tp pair) as q2tp tiles (`hy_repack2`): (tiles, rung codes, row
+/// ladders) as `repack_on_card` gives them for q4tp.
+fn repack2_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize) -> Res<(Buf, Buf, Buf)> {
+    use cortiq_core::quant::{f16_to_f32, q2tp_sections};
+    if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
+        return Err("repack: a q2tp payload (or a pair) 32 columns wide".into());
+    }
+    let pair = srcs.len() == 2;
+    let gpr = cols / 32;
+    let (params_off, codes_off, stride) = q2tp_sections(src_rows, cols);
+    if srcs.iter().any(|b| b.len() < codes_off + src_rows * stride) {
+        return Err("q2tp payload shorter than its planes".into());
+    }
+    let map = |r: usize| -> (usize, usize) { if pair { (((r & 15) >= 8) as usize, (r >> 4) * 8 + (r & 7)) } else { (0, r) } };
+    let mut lad = vec![0f32; rows * 2];
+    for r in 0..rows {
+        let (i, sr) = map(r);
+        let p = &srcs[i][params_off + sr * 4..params_off + sr * 4 + 4];
+        lad[r * 2] = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+        lad[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+    }
+    let up = |b: &[u8]| -> Res<(Buf, Buf)> { Ok((Buf::from_slice(&b[..params_off])?, Buf::from_slice(&b[codes_off..codes_off + src_rows * stride])?)) };
+    let (ca, ka) = up(srcs[0])?;
+    let second = if pair { Some(up(srcs[1])?) } else { None };
+    let (cb_p, kb_p) = second.as_ref().map_or((ca.ptr, ka.ptr), |(x, y)| (x.ptr, y.ptr));
+    let ntile = rows.div_ceil(16);
+    let (t, cc, ld) = mat_planes(ntile * gpr * 128, ntile * gpr * 16, &lad)?;
+    let (stride_i, pair_i, rows_i, cols_i) = (stride as i32, pair as i32, rows as i32, cols as i32);
+    let threads = (ntile * gpr * 32) as u64;
+    unsafe {
+        c.launch(fx.repack2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(ca.ptr, ka.ptr, cb_p, kb_p, stride_i, pair_i, t.ptr, cc.ptr, rows_i, cols_i))?;
+    }
+    c.sync()?;
+    Ok((t, cc, ld))
+}
+
+/// Prism's activation boundary for a stack (`prism::forward`): each input
+/// width's sign vector on the card, the FWHT block, the f16 cast.
+struct PrismPlan {
+    blk: usize,
+    f16: bool,
+    signs: Vec<(usize, Buf)>,
+}
+
+/// A stack's Prism plan: none without a Prism header (and then no Prism
+/// weight); with one, every matrix an input site feeds must be in the
+/// forward basis (the GDN gates a / b in none), the head too, since the
+/// transform is made once at the site for all of them.
+fn prism_plan(model: &CmfModel, layers: &[GraphLayer], lm: Option<(&GraphW, usize)>) -> Res<Option<PrismPlan>> {
+    use crate::gpu::GraphPrismOp as P;
+    let fwd = |w: &GraphW| w.prism == P::Forward;
+    let none = |w: &GraphW| w.prism == P::None;
+    let Some(cfg) = model.header.arch.prism_hadamard.as_ref() else {
+        let mut any = lm.is_some_and(|(w, _)| !none(w));
+        for l in layers {
+            match &l.attn {
+                GraphAttn::Gdn { qkv, z, out, .. } => any |= !none(qkv) || !none(z) || !none(out),
+                GraphAttn::Full { wq, wk, wv, wo, .. } => any |= !none(wq) || !none(wk) || !none(wv) || !none(wo),
+                _ => {}
+            }
+            if let GraphFfn::Dense { gate, up, down, .. } = &l.ffn {
+                any |= !none(gate) || !none(up) || !none(down);
+            }
+        }
+        return if any { Err("a Prism weight without a Prism header".into()) } else { Ok(None) };
+    };
+    let mixed = || -> Res<Option<PrismPlan>> { Err("a Prism stack whose matrices are not all in the forward basis".into()) };
+    for l in layers {
+        match &l.attn {
+            GraphAttn::Gdn { qkv, z, a, b, out, .. } => {
+                if !(fwd(qkv) && fwd(z) && fwd(out) && none(a) && none(b)) {
+                    return mixed();
+                }
+            }
+            GraphAttn::Full { wq, wk, wv, wo, head_gate, .. } => {
+                if !(fwd(wq) && fwd(wk) && fwd(wv) && fwd(wo)) || head_gate.is_some() {
+                    return mixed();
+                }
+            }
+            _ => return Err("a Prism stack with a token mixer the transform is not wired for".into()),
+        }
+        match &l.ffn {
+            GraphFfn::Dense { gate, up, down, .. } if fwd(gate) && fwd(up) && fwd(down) => {}
+            _ => return mixed(),
+        }
+    }
+    if lm.is_some_and(|(w, _)| !fwd(w)) {
+        return mixed();
+    }
+    let blk = cfg.block_size;
+    if blk == 0 || !blk.is_power_of_two() || blk > 4096 || cfg.widths.iter().any(|w| w % blk != 0) {
+        return Err(format!("Prism block {blk} over widths {:?}", cfg.widths));
+    }
+    let mut signs = Vec::with_capacity(cfg.widths.len());
+    let mut off = 0usize;
+    for &w in &cfg.widths {
+        let s = cfg.signs.get(off..off + w).ok_or("Prism signs shorter than their widths")?;
+        signs.push((w, Buf::from_slice(s)?));
+        off += w;
+    }
+    Ok(Some(PrismPlan { blk, f16: cfg.activation_f16, signs }))
+}
+
+impl PrismPlan {
+    fn signs(&self, width: usize) -> Res<u64> {
+        self.signs.iter().find(|(w, _)| *w == width).map(|(_, b)| b.ptr).ok_or_else(|| format!("a Prism input of width {width} without signs"))
+    }
+}
+
+/// The Prism boundary on `n` rows of planes (`p0`, `p1`, `stride` a row) of
+/// `width` columns, in place; nothing without a Prism plan.
+unsafe fn prism_planes(c: &Ctx, plan: &HPlan, p0: u64, p1: u64, stride: usize, width: usize, n: usize) -> Res<()> {
+    let Some(pr) = &plan.prism else { return Ok(()) };
+    let s = pr.signs(width)?;
+    let (st_i, blk_i, f_i) = (stride as i32, pr.blk as i32, pr.f16 as i32);
+    unsafe { c.launch(plan.fx.prism_p, ((width / pr.blk) as u32, n as u32), 256, pr.blk * 4, kargs!(p0, p1, st_i, s, blk_i, f_i)) }
+}
+
+/// The Prism boundary on `n` f16 rows `src` (`stride` a row) into `dst`.
+unsafe fn prism_rows(c: &Ctx, plan: &HPlan, src: u64, dst: u64, stride: usize, width: usize, n: usize) -> Res<()> {
+    let Some(pr) = &plan.prism else { return Ok(()) };
+    let s = pr.signs(width)?;
+    let (st_i, blk_i, f_i) = (stride as i32, pr.blk as i32, pr.f16 as i32);
+    unsafe { c.launch(plan.fx.prism_h, ((width / pr.blk) as u32, n as u32), 256, pr.blk * 4, kargs!(src, dst, st_i, s, blk_i, f_i)) }
+}
+
 /// Plan-build time spent repacking and uploading weights (ns).
 static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -823,12 +966,15 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     let q8 = matches!(dtype, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
     let q1 = dtype == Some(TensorDtype::Q1);
     let q1t = dtype == Some(TensorDtype::Q1T);
-    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t {
+    let q2 = dtype == Some(TensorDtype::Q2TiledP);
+    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t && !q2 {
         let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
         return Err(format!("weight codec {dtype:?} has no hybrid kernel ({name})"));
     }
-    if gw.prism != crate::gpu::GraphPrismOp::None || gw.affine {
-        return Err("Prism / affine weight".into());
+    // a Prism matrix's input is transformed at its site (`prism_plan` checks
+    // the stack); the affine correction is a q2tp codec's
+    if gw.prism == crate::gpu::GraphPrismOp::InverseEmbedding || (gw.affine && dtype != Some(TensorDtype::Q2TiledP)) {
+        return Err("an inverse-basis or affine weight outside a q2tp matrix".into());
     }
     let key = (model.uid(), gw.idx);
     if let Some(m) = st.hyb.mats.get(&key) {
@@ -858,6 +1004,9 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     } else if q1 {
         let (w, s) = repack1_on_card(c, &fx, &[bytes], rows, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if q2 {
+        let (w, cc, ld) = repack2_on_card(c, &fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: bytes.len() as u64 }
     } else if q1t {
         let base = q1t_base(bytes, rows, cols).ok_or_else(|| format!("{}: a q1t matrix with outlier rows", entry.name))?;
         let (w, s) = repack1x_on_card(c, &fx, &[base], rows, rows, cols, true)?;
@@ -886,7 +1035,8 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let both8 = q8(dg) && q8(du);
     let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
     let both1t = dg == Some(TensorDtype::Q1T) && du == Some(TensorDtype::Q1T);
-    if !(both8 || both1 || both1t || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
+    let both2 = dg == Some(TensorDtype::Q2TiledP) && du == Some(TensorDtype::Q2TiledP) && gw.affine == uw.affine;
+    if !(both8 || both1 || both1t || both2 || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
         return Err(format!("a gate/up pair of one codec (q4tp, int8 or q1) with rows a multiple of 8, not {dg:?} / {du:?}"));
     }
     let key = (model.uid(), gw.idx, uw.idx);
@@ -915,6 +1065,9 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     } else if both1 {
         let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if both2 {
+        let (w, cc, ld) = repack2_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: (gb.len() + ub.len()) as u64 }
     } else if both1t {
         let (g0, u0) = (q1t_base(gb, inter, cols), q1t_base(ub, inter, cols));
         let (Some(g0), Some(u0)) = (g0, u0) else {
@@ -1093,6 +1246,8 @@ pub(super) struct HPlan {
     /// The other rotations (other layers' frequencies and YaRN amplitude; their
     /// rows follow the call's in `tab`, a table after the other).
     invf_local: Vec<(Vec<f32>, f32)>,
+    /// Prism's activation boundary at every input site (a Prism file).
+    prism: Option<PrismPlan>,
     half: usize,
     nh: usize,
     nkv: usize,
@@ -1342,6 +1497,7 @@ fn build(
     if nkv == 0 || nh % nkv != 0 || (layers.is_empty() && lm.is_none()) {
         return Err("empty stack or head geometry".into());
     }
+    let prism = prism_plan(model, layers, lm)?;
     if hidden % 32 != 0 {
         return Err("hidden width not a multiple of 32".into());
     }
@@ -1530,6 +1686,7 @@ fn build(
             && matches!(model.tensors.get(w.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T))
     };
     let tern = |idx: usize| model.tensors.get(idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1T);
+    let is2 = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q2TiledP);
     let is8 = |w: &GraphW| {
         w.prism == crate::gpu::GraphPrismOp::None
             && !w.affine
@@ -1538,7 +1695,7 @@ fn build(
     let mut need = 0usize;
     for l in layers {
         let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
-            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) => {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) || (is2(gw) && is2(uw) && is2(dw)) => {
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
             }
             GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
@@ -1558,6 +1715,7 @@ fn build(
         let sized = |idx: usize, rows: usize, cols: usize| match model.tensors.get(idx).map(|e| e.dtype) {
             Some(cortiq_core::TensorDtype::Q1) => q1_layout(rows, cols).1,
             Some(cortiq_core::TensorDtype::Q1T) => q1_layout_of(rows, cols, true).1,
+            Some(cortiq_core::TensorDtype::Q2TiledP) => q2_bytes(rows, cols),
             _ => planes_bytes(rows, cols),
         };
         for (g, u, d, inter) in ffn {
@@ -1576,6 +1734,8 @@ fn build(
                 need += i8_layout(rows, cols).2;
             } else if is1(w) {
                 need += q1_layout_of(rows, cols, tern(w.idx)).1;
+            } else if is2(w) {
+                need += q2_bytes(rows, cols);
             } else if q6(w) {
                 need += planes_bytes(rows, cols);
             }
@@ -1604,6 +1764,8 @@ fn build(
             need += planes_bytes(rows, hidden);
         } else if is1(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
             need += q1_layout_of(rows_of(model, gw).unwrap_or(rows), hidden, tern(gw.idx)).1;
+        } else if is2(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
+            need += q2_bytes(rows_of(model, gw).unwrap_or(rows), hidden);
         }
     }
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
@@ -1866,7 +2028,10 @@ fn build(
                 return Err("final norm width".into());
             }
             let logits = f4(NMAX * rows)?;
-            let head_q1 = matches!(model.tensors.get(gw.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T));
+            let head_q1 = matches!(
+                model.tensors.get(gw.idx).map(|e| e.dtype),
+                Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T | cortiq_core::TensorDtype::Q2TiledP)
+            );
             let head = if gw.kind == 6 || head_q1 {
                 let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
                 if rows == 0 || rows > m.rows {
@@ -1914,6 +2079,7 @@ fn build(
         final_norm: final_norm_buf,
         invf: invf[..half].to_vec(),
         invf_local,
+        prism,
         half,
         nh,
         nkv,
@@ -2562,6 +2728,9 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 0,
                 kargs!(plan.h.ptr, pl.in_norm.ptr, plan.xn.ptr, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
             )?;
+            // a Prism file: the projections' input in their basis (the GDN
+            // gates read the f32 rows in `xn`, untouched)
+            prism_planes(c, plan, pp0, pp1, plan.pstride, hidden, n)?;
         }
         hst(c, 0, &mut t0)?;
         match &pl.mix {
@@ -2646,6 +2815,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         kargs!(plan.o.ptr, plan.z.ptr, zs_i, g.norm.ptr, plan.of.ptr, nv_i, dv_i, eps, sig0, zero, pp0, pp1, pp2, ps_i),
                     )?;
                     hst(c, 2, &mut t0)?;
+                    prism_planes(c, plan, pp0, pp1, plan.pstride, cols, n)?;
                     g.ms_out.run(c, fx, planes, cols, n)?;
                     sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 3, &mut t0)?;
@@ -2746,6 +2916,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         let (hd_i2, nh_i2, n_i3) = (hd as i32, nh as i32, n as i32);
                         c.launch(fx.head_gate, ((nh * hd).div_ceil(256) as u32, n as u32), 256, 0, kargs!(pp0, pp1, ps_i, plan.hgv.ptr, nh_i2, hd_i2, n_i3))?;
                     }
+                    prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
                     sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 6, &mut t0)?;
@@ -2763,6 +2934,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 0,
                 kargs!(plan.h.ptr, pl.post_norm.ptr, xn32, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
             )?;
+            prism_planes(c, plan, pp0, pp1, plan.pstride, hidden, n)?;
             hst(c, 0, &mut t0)?;
             if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
                 moe_routed(c, fx, plan, m, mb, n)?;
@@ -2777,6 +2949,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             hst(c, 7, &mut t0)?;
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
             if dense_pair {
+                prism_planes(c, plan, mid.p0, mid.p1, mid.stride, pl.inter, n)?;
                 pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
             }
             sandwich_add(c, fx, plan, pl.ffn_out.as_deref(), n)?;
@@ -3065,6 +3238,7 @@ unsafe fn head_launch(c: &Ctx, plan: &HPlan, n: usize) -> Res<usize> {
             0,
             kargs!(plan.h.ptr, fnorm, nullp, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
         )?;
+        prism_planes(c, plan, pp0, pp1, plan.pstride, plan.hidden, n)?;
         js.run(c, fx, &planes, plan.hidden, n)?;
     }
     hst(c, 10, &mut t0)?;
@@ -3896,8 +4070,8 @@ unsafe fn big(
     let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
-        if !matches!(m.kind, 2 | 3 | 5 | 6) {
-            return Err("a weight other than repacked q4tp, int8, q1 or ternary tiles on the prompt path".into());
+        if !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9) {
+            return Err("a weight other than repacked q4tp, q2tp, int8, q1 or ternary tiles on the prompt path".into());
         }
         if m.kind == 6 && m.rows * m.cols <= wd_rows {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
@@ -3918,7 +4092,10 @@ unsafe fn big(
             let threads = (nt * (m.cols / 32) * 32) as u64;
             let (t0_i, nt_i) = (t0 as i32, nt as i32);
             unsafe {
-                if m.kind == 2 {
+                if m.kind == 1 || m.kind == 9 {
+                    let aff_i = (m.kind == 9) as i32;
+                    c.launch(fx.expand_q2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i, aff_i))?;
+                } else if m.kind == 2 {
                     c.launch(fx.expand_q1t, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 } else if m.kind == 3 {
                     c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
@@ -3940,6 +4117,15 @@ unsafe fn big(
         unsafe {
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
+        // a Prism file: the projections read the rows in their basis, the GDN
+        // gates the untouched ones
+        let bxf = if plan.prism.is_some() {
+            let bxp = st.scr(c, "hb_xp", b * hidden * 2)?;
+            unsafe { prism_rows(c, plan, bxn, bxp, hidden, hidden, b)? };
+            bxp
+        } else {
+            bxn
+        };
         bst(c, 0, tm)?;
         match &pl.mix {
             // the prompt path is not entered with such a layer (see its guard)
@@ -3955,8 +4141,8 @@ unsafe fn big(
                 let gbp = st.scr(c, "hb_gb", b * 2 * g.nv * 4)?;
                 let yo = st.scr(c, "hb_o", b * vd * 4)?;
                 let yof = st.scr(c, "hb_of", b * vd * 2)?;
-                mul(&g.qkv, bxn, yq, g.cdim, 1.0, 0.0)?;
-                mul(&g.z, bxn, yz, vd, 1.0, 0.0)?;
+                mul(&g.qkv, bxf, yq, g.cdim, 1.0, 0.0)?;
+                mul(&g.z, bxf, yz, vd, 1.0, 0.0)?;
                 unsafe {
                     c.gemm(true, false, g.nv, b, hidden, 1.0, g.a_h.ptr, hidden, bxn, hidden, 0.0, yab, 2 * g.nv, Gemm::Half)?;
                     c.gemm(true, false, g.nv, b, hidden, 1.0, g.b_h.ptr, hidden, bxn, hidden, 0.0, yab + (g.nv * 4) as u64, 2 * g.nv, Gemm::Half)?;
@@ -3980,6 +4166,7 @@ unsafe fn big(
                 bst(c, 3, tm)?;
                 gs.next_pos = pos0 + b;
                 gs.tape = None;
+                unsafe { prism_rows(c, plan, yof, yof, vd, vd, b)? };
                 mul(&g.out, yof, bh, hidden, 1.0, 1.0)?;
             }
             Mix::Attn(a) if sealed.get(li).copied().unwrap_or(false) => {
@@ -4002,9 +4189,9 @@ unsafe fn big(
                 let bfm = st.scr(c, "hb_fm", b * nh * 4)?;
                 let bfz = st.scr(c, "hb_fz", b * nh * 4)?;
                 let bfn = st.scr(c, "hb_fn", b * nh * hd * 4)?;
-                mul(&a.q, bxn, yq, qr, 1.0, 0.0)?;
-                mul(&a.k, bxn, yk, nkv * hd, 1.0, 0.0)?;
-                mul(&a.v, bxn, yv, nkv * hd, 1.0, 0.0)?;
+                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
                 let (kp, vp, kt, qt, mu, mz, th, ns, w, m, win_len, win_head, far_len, fscale, rect_fm) = {
                     let d = st.hyb.o1.get(&key).ok_or("far field missing on the prompt path")?;
                     if (d.nkv, d.hpk, d.hd) != (nkv, hpk, hd) {
@@ -4111,6 +4298,7 @@ unsafe fn big(
                     d.spec = None;
                 }
                 bst(c, 5, tm)?;
+                unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
                 mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
             }
             Mix::Attn(a) => {
@@ -4124,9 +4312,9 @@ unsafe fn big(
                 let aog = st.scr(c, "hb_aog", b * nh * hd * 4)?;
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
                 let bis = st.scr(c, "hb_is", b * nh * 4)?;
-                mul(&a.q, bxn, yq, qr, 1.0, 0.0)?;
-                mul(&a.k, bxn, yk, nkv * hd, 1.0, 0.0)?;
-                mul(&a.v, bxn, yv, nkv * hd, 1.0, 0.0)?;
+                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
                 let hint = st.kv_hint;
                 let (slot0, kp, vp, m_base) = {
                     let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
@@ -4208,6 +4396,7 @@ unsafe fn big(
                     c.launch(fx.attn_out, (n_ao.div_ceil(256) as u32, 1), 256, 0, kargs!(aog, bis, gate_p, bao, nh_i, b_i, one))?;
                 }
                 bst(c, 5, tm)?;
+                unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
                 mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
             }
         }
@@ -4226,6 +4415,7 @@ unsafe fn big(
             _ => 0,
         };
         if dense_pair {
+            unsafe { prism_rows(c, plan, bxn, bxn, hidden, hidden, b)? };
             mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
             let tot = (b * inter) as u64;
             let (in_i, bb_i) = (inter as i32, b as i32);
@@ -4233,6 +4423,7 @@ unsafe fn big(
                 c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
             }
             bst(c, 6, tm)?;
+            unsafe { prism_rows(c, plan, bmh, bmh, inter, inter, b)? };
             if pl.moe.is_some() {
                 mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
             } else {
@@ -4866,6 +5057,150 @@ mod tests {
         let n = o.len();
         o[n - 4] = 1;
         assert!(q1t_base(&o, 16, 64).is_none());
+    }
+
+    /// q2tp matrices (mid-rise and affine) as q2tp tiles: expanded back they
+    /// are the host's f16 of (c - 1.5) s / (c - 1) s word for word, and the
+    /// tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_q2tp_tiles_match_the_host() {
+        use cortiq_core::quant::{f32_to_f16, q2tp_ladder, q2tp_sections, q4tp_code};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 41u64;
+        let q2 = |rows: usize, cols: usize, seed: &mut u64| -> Vec<u8> {
+            let (po, co, stride) = q2tp_sections(rows, cols);
+            let mut b: Vec<u8> = (0..co + rows * stride).map(|_| lcg(seed) as u8).collect();
+            for r in 0..rows {
+                b[po + r * 4..po + r * 4 + 2].copy_from_slice(&f32_to_f16(-9.0 + (r % 5) as f32 * 0.1).to_le_bytes());
+                b[po + r * 4 + 2..po + r * 4 + 4].copy_from_slice(&f32_to_f16(0.05).to_le_bytes());
+            }
+            b
+        };
+        let host = |b: &[u8], rows: usize, cols: usize, aff: bool| -> Vec<f32> {
+            let (po, co, stride) = q2tp_sections(rows, cols);
+            let gpr = cols / 32;
+            let mut w = vec![0f32; rows * cols];
+            for r in 0..rows {
+                let tab = q2tp_ladder(&b[po..po + rows * 4], r);
+                for g in 0..gpr {
+                    let sc = tab[q4tp_code(&b[co + r * stride..co + (r + 1) * stride], g)];
+                    for k in 0..32 {
+                        let cv = ((b[(r * gpr + g) * 8 + k / 4] >> (2 * (k % 4))) & 3) as f32;
+                        w[r * cols + g * 32 + k] = (cv - if aff { 1.0 } else { 1.5 }) * sc;
+                    }
+                }
+            }
+            w
+        };
+        let expand = |t: &(Buf, Buf, Buf), rows: usize, cols: usize, aff: bool| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt, a_i) = (rows as i32, cols as i32, 0i32, ntile as i32, aff as i32);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_q2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, t.2.ptr, o.ptr, r_i, c_i, t0, nt, a_i)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        for (rows, cols) in [(40usize, 512usize), (2048, 2048)] {
+            let b = q2(rows, cols, &mut seed);
+            let t = repack2_on_card(c, &fx, &[&b], rows, rows, cols).unwrap();
+            for aff in [false, true] {
+                let w = host(&b, rows, cols, aff);
+                let got = expand(&t, rows, cols, aff);
+                for i in 0..rows * cols {
+                    assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} aff {aff} at {},{}", i / cols, i % cols);
+                }
+                for n in [1usize, 11] {
+                    let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+                    let xb = Buf::from_slice(&x).unwrap();
+                    let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                    let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                    let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                    let y = Buf::new(n * rows * 4 + 64).unwrap();
+                    let kind = if aff { 9 } else { 1 };
+                    let dm = DevMat {
+                        kind,
+                        rows,
+                        cols,
+                        held: 0,
+                        w: Arc::new(t.0.view(0, t.0.bytes)),
+                        aux0: Some(t.1.view(0, t.1.bytes)),
+                        aux1: Some(t.2.view(0, t.2.bytes)),
+                    };
+                    let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                    unsafe {
+                        split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                        set.run(c, &fx, &planes, cols, n).unwrap();
+                    }
+                    c.sync().unwrap();
+                    let yd = down::<f32>(c, &y, n * rows);
+                    for j in 0..n {
+                        for r in 0..rows {
+                            let (mut s, mut a) = (0f64, 0f64);
+                            for k in 0..cols {
+                                let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                                s += p;
+                                a += p.abs();
+                            }
+                            let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                            assert!(e < 1e-4, "{rows}x{cols} aff {aff} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Prism boundary on planes and on f16 rows is the host's
+    /// `signed_fwht_forward` with the f16 cast, word for word.
+    #[test]
+    fn card_prism_matches_the_host() {
+        use cortiq_core::hadamard::{prism_f32_to_f16_rne, signed_fwht_forward};
+        use cortiq_core::quant::{f16_to_f32, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 53u64;
+        let (n, width, blk) = (3usize, 3072usize, 1024usize);
+        let signs: Vec<f32> = (0..width).map(|_| if lcg(&mut seed) & 1 == 1 { 1.0 } else { -1.0 }).collect();
+        let sb = Buf::from_slice(&signs).unwrap();
+        let x: Vec<f32> = (0..n * width).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 3.0).collect();
+        // planes: the host takes their sum as the input
+        let xb = Buf::from_slice(&x).unwrap();
+        let pl = |_: ()| Buf::new(n * width * 2 + 64).unwrap();
+        let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+        let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: width };
+        unsafe { split(c, &fx, &planes, xb.ptr, width, width, n).unwrap() };
+        c.sync().unwrap();
+        let bf = |h: u16| f32::from_bits((h as u32) << 16);
+        let (a0, a1) = (down::<u16>(c, &p0, n * width), down::<u16>(c, &p1, n * width));
+        let mut want = Vec::with_capacity(n * width);
+        for j in 0..n {
+            let mut row: Vec<f32> = (0..width).map(|i| bf(a0[j * width + i]) + bf(a1[j * width + i])).collect();
+            signed_fwht_forward(&mut row, &signs, blk).unwrap();
+            want.extend(row.iter().map(|&v| f16_to_f32(prism_f32_to_f16_rne(v))));
+        }
+        let (st_i, blk_i, f_i) = (width as i32, blk as i32, 1i32);
+        unsafe { c.launch(fx.prism_p, ((width / blk) as u32, n as u32), 256, blk * 4, kargs!(p0.ptr, p1.ptr, st_i, sb.ptr, blk_i, f_i)).unwrap() };
+        c.sync().unwrap();
+        let (b0, b1) = (down::<u16>(c, &p0, n * width), down::<u16>(c, &p1, n * width));
+        for i in 0..n * width {
+            assert_eq!(bf(b0[i]) + bf(b1[i]), want[i], "planes at {i}");
+        }
+        // f16 rows, in place
+        let h: Vec<u16> = x.iter().map(|&v| f32_to_f16(v)).collect();
+        let hb = Buf::from_slice(&h).unwrap();
+        let mut want = Vec::with_capacity(n * width);
+        for j in 0..n {
+            let mut row: Vec<f32> = (0..width).map(|i| f16_to_f32(h[j * width + i])).collect();
+            signed_fwht_forward(&mut row, &signs, blk).unwrap();
+            want.extend(row.iter().map(|&v| prism_f32_to_f16_rne(v)));
+        }
+        unsafe { c.launch(fx.prism_h, ((width / blk) as u32, n as u32), 256, blk * 4, kargs!(hb.ptr, hb.ptr, st_i, sb.ptr, blk_i, f_i)).unwrap() };
+        c.sync().unwrap();
+        assert_eq!(down::<u16>(c, &hb, n * width), want, "f16 rows");
     }
 
     /// int8 matrices (q8_2f with its column field, q8_row without) as int8
