@@ -33,3 +33,18 @@ Both on private HF (`infosave/Edge0-145B-cmf`, `infosave/Edge0-120B-cmf`), verif
 
 CUDA 145B: prompt 1437 / 2778 / 2641 / 2543 and 1808 / 2842 / 2730 / 2629 tok/s; generation 146 / 143 / 134 / 135 and
 147 / 143 / 135 / 141 tok/s. HumanEval pass@1 156/164 = 95.12 % (159 tok/s end to end).
+
+Vulkan 145B (b5, per-pick kernels in prompt frames): prompt 443 / 447 / 461 / 456 and 465 / 464 / 462 / 456 tok/s;
+generation 105 / 107 / 109 / 118 and 112 / 116 / 109 / 118 tok/s.
+CUDA 120B: prompt 1689 / 3316 / 3154 / 3027 and 2333 / 3516 / 3322 / 3114 tok/s; generation 172 / 162 / 159 / 138 and
+177 / 166 / 155 / 138 tok/s. HumanEval 153/164 = 93.29 % (198 tok/s end to end).
+Vulkan 120B: prompt 557 / 567 / 577 / 569 and 585 / 584 / 578 / 570 tok/s; generation 113 / 111 / 119 / 124 and
+124 / 115 / 121 / 115 tok/s; card 45 795 MiB after the 32K test, server RSS 54.9 GB.
+
+## b6 (in chain B)
+
+- CUDA small rounds: `q4_lat_mv` reads D and U once for every row of the round and skips the groups no row picked
+  (`mvb` re-read U's 14 336-wide rows once per row). Chunks: each sub-batch writes its picks' down rows
+  (`q4_lat_put`), one `q4_lat_sum` in pick order after the last sub-batch (was a full scatter per sub-batch).
+- Vulkan prompt frames: picks sorted by expert on the card (`lat_sort`), `lat_gu_g` / `lat_dn_g` decode an expert's
+  32-row tile once per tile of 32 picks (`CMF_QWEN_LAT_GROUPED=0` keeps the per-pick kernels).

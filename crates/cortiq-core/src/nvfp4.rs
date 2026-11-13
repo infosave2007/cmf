@@ -83,7 +83,7 @@ pub fn global_offset(rows: usize, cols: usize) -> usize {
 /// Payload length of a `[rows, cols]` tensor (None for a shape the format
 /// does not allow: cols not a positive multiple of 16, or overflow).
 pub fn nbytes(rows: usize, cols: usize) -> Option<usize> {
-    if cols == 0 || cols % GROUP != 0 {
+    if cols == 0 || !cols.is_multiple_of(GROUP) {
         return None;
     }
     let n = rows.checked_mul(cols)?;
@@ -132,7 +132,7 @@ pub fn dequant(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
 /// high one) and its per-tensor f32 scale into the `nvfp4` payload. Only bits
 /// move: codes and scale bytes are copied unchanged.
 pub fn repack_ggml(blocks: &[u8], rows: usize, cols: usize, global: f32) -> Result<Vec<u8>, String> {
-    if cols == 0 || cols % GGML_BLOCK != 0 {
+    if cols == 0 || !cols.is_multiple_of(GGML_BLOCK) {
         return Err(format!("nvfp4: cols {cols} not a positive multiple of {GGML_BLOCK}"));
     }
     let bpr = cols / GGML_BLOCK;

@@ -908,7 +908,7 @@ pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Re
         if shape.len() != 2 {
             return Err(format!("nvfp4 tensor must be 2-D, got {shape:?}"));
         }
-        if shape[1] == 0 || shape[1] % crate::nvfp4::GROUP != 0 {
+        if shape[1] == 0 || !shape[1].is_multiple_of(crate::nvfp4::GROUP) {
             return Err(format!(
                 "nvfp4 cols {} not a positive multiple of {}",
                 shape[1],
