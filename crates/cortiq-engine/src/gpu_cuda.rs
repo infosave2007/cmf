@@ -2674,7 +2674,10 @@ pub fn forward_batch_graph_at(
     let mut layers_run = layers_run;
     // a verify tail stays with the arm that takes the stack's token graph
     // (the hybrid one for every stack unless `CMF_CUDA_HYB_ALL=0`)
-    if hyb::wants(layers, nh, nkv, hd) || (hyb::all_on() && spec.is_some()) {
+    // a Looped Transformer's loop norms (`gpu::set_batch_loop_norm`): the
+    // hybrid arm alone applies them
+    let looped = crate::gpu::batch_loop_norm().is_some();
+    if hyb::wants(layers, nh, nkv, hd) || looped || (hyb::all_on() && spec.is_some()) {
         let defer = BATCH_DEFER.with(|d| d.get());
         return hyb::batch(
             c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,

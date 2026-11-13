@@ -4041,8 +4041,15 @@ pub(super) fn batch(
         return BatchGraphOutcome::Declined;
     }
     let lm = spec.as_ref().map(|s| (&s.lm, s.lm_rows));
-    let final_norm: &[f32] = spec.as_ref().map_or(&[], |s| s.final_norm);
-    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0, &[]) {
+    // a Looped Transformer's loop norms (the final norm, as the head's)
+    let looped = crate::gpu::batch_loop_norm();
+    let loop_at: &[usize] = looped.as_ref().map_or(&[], |(at, _)| at.as_slice());
+    let final_norm: &[f32] = match (&spec, &looped) {
+        (Some(s), _) => s.final_norm,
+        (None, Some((_, w))) => w.as_slice(),
+        (None, None) => &[],
+    };
+    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0, loop_at) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid batch", &e);
@@ -4875,6 +4882,11 @@ unsafe fn big(
             // Gemma-4's layer scalar on the whole residual row
             let tot = (b * hidden) as u64;
             unsafe { c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bh, s, tot))? };
+        }
+        // a Looped Transformer's loop boundary: the final norm on the rows
+        if let (true, Some(w)) = (plan.loop_norm.contains(&li), plan.loop_w.as_ref()) {
+            let (nullp, zero_h) = (0u64, 0i32);
+            unsafe { c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, w.ptr, bh, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))? };
         }
         if tapping {
             if let Some(s) = want.iter().position(|&l| l == li) {

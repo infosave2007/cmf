@@ -20453,6 +20453,22 @@ impl Pipeline {
             }
             Clear
         });
+        // A Looped Transformer: the final norm on the stream after each
+        // loop's last layer, as the token graph's `loop_norm_at` (the
+        // stack's own last layer aside: the head norms it). Without them
+        // the batch graph ran the loops back to back: Nanbeige's long
+        // prompts read as noise on both GPU backends.
+        let _loop = self.loop_final_norm.then(|| {
+            let at: Vec<usize> = (0..graph_end.min(self.num_layers - 1)).filter(|&li| self.is_loop_end(li)).collect();
+            crate::gpu::set_batch_loop_norm(Some((at, self.weights.final_norm.to_vec())));
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    crate::gpu::set_batch_loop_norm(None);
+                }
+            }
+            Clear
+        });
         // a prompt chunk wholly before what the drafter's windows reach keeps none
         let taps = if positions.last().is_some_and(|&p| p < self.dflash_tap_from) { Vec::new() } else { self.dflash_taps_wanted(0, graph_end) };
         crate::gpu::layer_taps_arm(&taps);

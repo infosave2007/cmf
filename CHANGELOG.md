@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop's last layer, `loop_norm_at`), which now takes such stacks from the dense arm; `CMF_CUDA_HYB_ALL=1` sends
   every stack to the hybrid arm. Nanbeige4.2-3B (q4_tiled, 22 layers run twice), which ran op by op on CUDA at
   5.2 tok/s, decodes at 68.5 tok/s against Vulkan's 61.7 on an RTX A5000 (fast build); its greedy text
-  identical to the CPU's. Its prompt still goes the pipeline's chunked path.
+  identical to the CPU's.
 
 - q8_2f gate/up pairs (two column fields: a tile's up rows read the input under their own, job kind 15) on
   the CUDA hybrid arm, and a launch's input rows put under its jobs' column fields once a call
@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against 7.17 s), decode 121 against 91.5.
 
 ### Fixed
+- A Looped Transformer's batched prefill (Nanbeige4.2) ran the loops back to back without the final norm between
+  them, on both GPU backends: a prompt of more than a few tokens read as noise (the first step's top logit 2.4
+  against the CPU's 45.4). The pipeline hands the batch graph its loop boundaries (`gpu::set_batch_loop_norm`):
+  Vulkan norms the stream in the plain residual tail (a sandwich or mHC tail declines), CUDA on the hybrid arm's
+  small and prompt paths (the dense arm declines). Nanbeige4.2-3B on an RTX A5000: a 4096-token prompt at 2517
+  tok/s on CUDA (first token 1.63 s) and 255 on Vulkan, decode 103-105 and 62; a 450-token prompt's greedy text
+  identical to the CPU's on both.
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
   every MoE prompt through the batch graph that reached them, Escha-W2's, flint's and KAT-Coder's, crashed. Both flush the

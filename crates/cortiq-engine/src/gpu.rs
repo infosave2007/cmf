@@ -2875,6 +2875,24 @@ pub fn set_batch_kv_hint(_rows: usize) {
     }
 }
 
+thread_local! {
+    /// A Looped Transformer's batch-graph call (`set_batch_loop_norm`).
+    static BATCH_LOOP: std::cell::RefCell<Option<(Vec<usize>, std::sync::Arc<Vec<f32>>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A Looped Transformer's next batch-graph calls on this thread: the
+/// span-relative layers after which the final norm goes on the stream
+/// (`loop_norm_at` of the token graph), and that norm; `None` clears it. A
+/// backend that cannot apply them declines the call.
+pub fn set_batch_loop_norm(v: Option<(Vec<usize>, Vec<f32>)>) {
+    BATCH_LOOP.with(|b| *b.borrow_mut() = v.map(|(at, w)| (at, std::sync::Arc::new(w))));
+}
+
+/// The loop norms `set_batch_loop_norm` armed (`None`: a plain stack).
+pub(crate) fn batch_loop_norm() -> Option<(Vec<usize>, std::sync::Arc<Vec<f32>>)> {
+    BATCH_LOOP.with(|b| b.borrow().clone()).filter(|(at, _)| !at.is_empty())
+}
+
 /// Whether a sequence's wgpu K/V mirrors may be f16 (`gpu_wgpu::kv16`):
 /// the first note after a reset decides.
 pub fn graph_kv16_note(_kv_id: u64, _allowed: bool) {
