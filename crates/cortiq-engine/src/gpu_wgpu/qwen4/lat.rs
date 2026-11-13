@@ -750,6 +750,8 @@ fn lat_pipes(c: &Ctx) -> Option<&'static LatPipes> {
 /// expert (q8_2f, resident with the skeleton).
 pub(crate) struct LatDev {
     bank: wgpu::Buffer,
+    /// The bank lives in system memory (the card had no room for it): the kernels read it over the bus.
+    host: Option<crate::gpu_wgpu::host_mem::SysBuf>,
     labels: wgpu::Buffer,
     router: wgpu::Buffer,
     d_idx: usize,
@@ -767,7 +769,15 @@ pub(crate) struct LatDev {
 impl LatDev {
     /// Upload a latent layer's experts, groups and router. None when a matrix is not where the stage
     /// expects it (the caller keeps the layer off the card).
-    pub(crate) fn new(model: &CmfModel, lat: &crate::qwen4_exp::Latent, moe: &crate::pipeline::MoeFfn, hidden: usize) -> Option<Self> {
+    /// Bytes of a layer's bank (every routed expert), None for shapes the stage does not take.
+    pub(crate) fn bank_bytes(lat: &crate::qwen4_exp::Latent, moe: &crate::pipeline::MoeFfn) -> Option<u64> {
+        let ff = moe.experts.first()?.gate_proj.rows();
+        let pg = cortiq_core::nvfp4::nbytes(ff, lat.dim)?;
+        Some((moe.experts.len() * 3 * pg.div_ceil(16) * 16) as u64)
+    }
+
+    /// `on_host`: the bank in host-visible system memory instead of the card's (Vulkan on Linux).
+    pub(crate) fn new(model: &CmfModel, lat: &crate::qwen4_exp::Latent, moe: &crate::pipeline::MoeFfn, hidden: usize, on_host: bool) -> Option<Self> {
         let c = ctx()?;
         lat_pipes(c)?;
         let ne = moe.experts.len();
@@ -784,12 +794,16 @@ impl LatDev {
         }
         let pw = pad(pg);
         let slot = 3 * pw;
-        let bank = c.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("qwen4-latent-bank"),
-            size: (ne * slot) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let host = if on_host { Some(crate::gpu_wgpu::host_mem::sysmem_storage_buffer(&c.device, (ne * slot) as u64)?) } else { None };
+        let bank = match &host {
+            Some(h) => h.buffer.clone(),
+            None => c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("qwen4-latent-bank"),
+                size: (ne * slot) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        };
         let mut stage = vec![0u8; slot * 32];
         for (c0, chunk) in moe.experts.chunks(32).enumerate() {
             stage.iter_mut().for_each(|b| *b = 0);
@@ -806,7 +820,14 @@ impl LatDev {
                     stage[at..at + pg].copy_from_slice(b);
                 }
             }
-            c.queue.write_buffer(&bank, (c0 * 32 * slot) as u64, &stage[..chunk.len() * slot]);
+            match &host {
+                Some(h) => {
+                    if !h.write((c0 * 32 * slot) as u64, &stage[..chunk.len() * slot]) {
+                        return None;
+                    }
+                }
+                None => c.queue.write_buffer(&bank, (c0 * 32 * slot) as u64, &stage[..chunk.len() * slot]),
+            }
         }
         let labels_u: Vec<u32> = lat.labels.iter().map(|&g| g as u32).collect();
         let labels = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -835,6 +856,7 @@ impl LatDev {
         let _ = model;
         Some(Self {
             bank,
+            host,
             labels,
             router,
             d_idx: lat.down_idx.filter(|_| q8(&lat.down).is_some())?,
@@ -852,7 +874,12 @@ impl LatDev {
 
     /// Bytes this layer holds on the card.
     pub(crate) fn bytes(&self) -> u64 {
-        self.bank.size() + self.labels.size() + self.router.size()
+        (if self.host.is_some() { 0 } else { self.bank.size() }) + self.labels.size() + self.router.size()
+    }
+
+    /// Bytes of this layer's bank in system memory.
+    pub(crate) fn host_bytes(&self) -> u64 {
+        self.host.as_ref().map_or(0, |h| h.size())
     }
 
 }
