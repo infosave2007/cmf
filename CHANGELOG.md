@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.92] — 2026-11-13
+
+### Added
+- A routed MoE model's long prompt takes the CUDA hybrid arm's prompt path, where it ran the small path 16 rows
+  at a time (every expert over all 16 rows, the attention row by row). The chunk's routed FFN is grouped by
+  expert: the router and the shared gate as f32 GEMMs, every row's top k on the card (`hy_moe_topk`, the
+  arithmetic of the small path's selection), the (row, pick) entries sorted by expert in one block
+  (`hy_moe_group`, ballots, entry order kept) with a gate/up and a down job for every 32 rows of an expert
+  (their row count in the job's `nr`), the picked rows laid out as input planes (`hy_moe_gather`), two
+  tensor-core launches over every expert's q4tp or int8 tiles (`hy_mmp_4_2_8`; `CMF_HYB_MOE_RMAX=64` takes
+  `hy_mmp_8_1_8`), and the weighted mixture with the shared expert (`hy_moe_gcombine`). The prompt path also
+  takes a sliding window (keys left of a row's window weigh nothing, a row block's keys start where its first
+  row's window does) and a local layer's rotation table. `CMF_HYB_MOE_BIG=0` keeps the small-path chunks.
+  RTX A5000, release build, a 4096-token prompt, CUDA against Vulkan on the same card (the greedy texts
+  identical): Mellum2.1-12B-A2.5B 3746 against 693 tok/s (first token 1.09 against 5.91 s), Ornith-1.5-35B
+  3058 against 1101 (1.34 / 3.72 s), Apex-35B 2974 against 441 (1.38 / 9.28 s), Qwen3.6-35B-A3B 2905 against
+  890 (1.41 / 4.60 s), Hy-MT2-30B-A3B 2385 against 343 (1.72 / 11.96 s); before, the small-path chunks read
+  such a prompt at 160-430 tok/s.
+
+### Fixed
+- A CUDA K/V mirror sized to a prompt's rows exactly took the answer's second token to grow: every layer's
+  rows reallocated, the stream synced and every token graph recorded again, inside the first tokens of a
+  reply (64 tokens after a 4096-token prompt measured 109 tok/s on Mellum2.1 where the card spent 6.4 ms a
+  token). The first size now has room for an eighth more rows (256 at least): 151.5 tok/s, Vulkan 121.4.
+
 ## [0.8.91] — 2026-11-13
 
 ### Added
