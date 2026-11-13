@@ -699,10 +699,11 @@ const T_LSO: u8 = 169;
 const T_LOFF: u8 = 166;
 const T_LORD: u8 = 167;
 
-/// The expert-grouped kernels of a prompt frame (`CMF_QWEN_LAT_GROUPED=0`: the per-pick ones).
+/// The expert-grouped kernels of a prompt frame (`CMF_QWEN_LAT_GROUPED=1`); off by default: on the RTX PRO 6000
+/// they read a 4K prompt at 380 tok/s against 445 for the per-pick ones (an expert gets about five picks a frame).
 fn grouped_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_QWEN_LAT_GROUPED").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_LAT_GROUPED").as_deref() == Ok("1"))
 }
 
 /// The latent MoE of `nt` token rows: `x2` (rows `hs` floats apart) in, `mo` (the same stride) out.
@@ -739,8 +740,11 @@ pub(super) fn encode(
     let sob = tbuf(c, T_LSO, hidden * 4, false);
     let ffs = es(ff * 4);
     let rows = (ne + 1) as u32;
+    // `CMF_Q4_SKIP=lat_r,lat_d,lat_x,lat_u,lat_s`: leave the router, D, the experts, U or the shared expert
+    // out (a cost probe: the output goes wrong)
     // the router and the shared expert's gate
     let (rt, lg) = (lat.router.clone(), logits.clone());
+    if !skip("lat_r") {
     dispatch(
         c,
         pass,
@@ -762,10 +766,12 @@ pub(super) fn encode(
         || vec![lg, pk, wt, uniform_u32x4(c, [ne as u32, k as u32, rows, 0])],
         (nt as u32, 1, 1),
     );
+    }
     // D
-    if !q82_t(c, p, pass, &wd, x2, hs, &xl, xls, nt, bc, 702) {
+    if !skip("lat_d") && !q82_t(c, p, pass, &wd, x2, hs, &xl, xls, nt, bc, 702) {
         return None;
     }
+    if !skip("lat_x") {
     // a prompt frame: the picks sorted by expert, every expert's rows read once per tile of 32 picks
     if nt > TMAX && grouped_on() {
         let off = tbuf_exact(c, T_LOFF, (ne + 1) * 4 / TROWS + 4, false);
@@ -838,6 +844,7 @@ pub(super) fn encode(
         ((l as u32).div_ceil(rb), (nt * k) as u32, 1),
     );
     }
+    }
     let (pk, lb, wt, yy, ac) = (picks.clone(), lat.labels.clone(), wts.clone(), y.clone(), acc.clone());
     dispatch(
         c,
@@ -850,8 +857,11 @@ pub(super) fn encode(
         ((gl as u32).div_ceil(256), nt as u32, 1),
     );
     // U into the MoE output
-    if !q82_t(c, p, pass, &wu, &acc, xls, mo, hs, nt, bc, 706) {
+    if !skip("lat_u") && !q82_t(c, p, pass, &wu, &acc, xls, mo, hs, nt, bc, 706) {
         return None;
+    }
+    if skip("lat_s") {
+        return Some(());
     }
     // the shared expert at full width, gated
     if !q82_t(c, p, pass, &wsg, x2, hs, &sgb, ffs, nt, bc, 707)

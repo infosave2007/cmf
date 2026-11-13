@@ -4858,7 +4858,7 @@ impl Core {
                 q.lat_mv,
                 (w.rows.div_ceil(rb) as u32, gy),
                 256,
-                n * ch * 4,
+                n * 16 * ((ch / 16) | 1) * 4,
                 kargs!(w.w.ptr, w.aux0(), w.aux1(), x, xs as i32, y, ys as i32, w.rows as i32, w.cols as i32, n as i32, glen as i32, s.lmask.ptr, mode, ch as i32),
             )
         }?;

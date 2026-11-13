@@ -2529,11 +2529,14 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
     for (int a = 0; a < RPW; a++)
         #pragma unroll
         for (int t = 0; t < 8; t++) acc[a][t] = 0.0f;
+    // the staged chunk is transposed: element j of 16-group q of row t at t * 16 * CP + j * CP + q, CP odd,
+    // so the 32 lanes of one load (consecutive q) hit 32 different banks
+    const int nq = ch >> 4, CP = nq | 1;
     for (int c0 = cb; c0 < ce; c0 += ch) {
         __syncthreads();
         for (int i = threadIdx.x; i < n * ch; i += blockDim.x) {
             const int t = i / ch, c = i - t * ch;
-            sx[i] = x[(u64)t * xs + c0 + c] * col[c0 + c];
+            sx[t * 16 * CP + (c & 15) * CP + (c >> 4)] = x[(u64)t * xs + c0 + c] * col[c0 + c];
         }
         __syncthreads();
         #pragma unroll
@@ -2547,14 +2550,14 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
                 #pragma unroll
                 for (int t = 0; t < 8; t++) {
                     if (t >= n) break;
-                    const float* p = sx + t * ch + q * 16;
+                    const float* p = sx + t * 16 * CP + q;
                     float s = 0.0f;
                     #pragma unroll
                     for (int k = 0; k < 4; k++) {
-                        s += (float)((int)(ws[k] << 24) >> 24) * p[4 * k];
-                        s += (float)((int)(ws[k] << 16) >> 24) * p[4 * k + 1];
-                        s += (float)((int)(ws[k] << 8) >> 24) * p[4 * k + 2];
-                        s += (float)((int)ws[k] >> 24) * p[4 * k + 3];
+                        s += (float)((int)(ws[k] << 24) >> 24) * p[(4 * k) * CP];
+                        s += (float)((int)(ws[k] << 16) >> 24) * p[(4 * k + 1) * CP];
+                        s += (float)((int)(ws[k] << 8) >> 24) * p[(4 * k + 2) * CP];
+                        s += (float)((int)ws[k] >> 24) * p[(4 * k + 3) * CP];
                     }
                     acc[a][t] += s;
                 }
