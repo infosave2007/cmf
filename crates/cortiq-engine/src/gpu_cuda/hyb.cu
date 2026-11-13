@@ -85,7 +85,7 @@ struct HyJob {
     int blk0;  // first block of this job in the launch
     int ystride;
     int xoff;  // elements into the input planes this job's rows start at (a MoE slot's own input)
-    int pad_;
+    int nr;    // > 0: this job's input rows (fewer than the launch's), a grouped expert's
 };
 
 // RMS norm of every row of x [B][n] into f32 or f16 (a block of 256 threads
@@ -624,12 +624,12 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 // A block of 32 KS threads takes TB tiles; its KS warps take contiguous
 // ranges of the groups, every warp all TB tiles of its range, and the KS
 // partials are summed in order. NT n tiles of 8 input rows (rows past
-// `nrows` are not read). The arithmetic of an output depends on KS alone,
-// never on TB, NT or the window's row count.
+// `nrows`, or past the job's own `nr`, are not read). The arithmetic of an
+// output depends on KS alone, never on TB, NT or the window's row count.
 template <int NT, int TB, int KS>
 __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njobs, const u16* __restrict__ x0,
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
-                                         int nrows, int cols)
+                                         int nrows_in, int cols)
 {
     __shared__ float2 par_s[16 * TB];
     __shared__ float part[KS][TB][NT][32][4];
@@ -643,6 +643,9 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         else jhi = mid - 1;
     }
     const HyJob jb = jobs[jx];
+    // an empty job (a dead MoE slot, a grouped launch's spare) has no blocks' work
+    if (jb.rows <= 0) return;
+    const int nrows = jb.nr > 0 ? min(nrows_in, jb.nr) : nrows_in;
     const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
     const int rows = jb.rows;
     const int ntile = (rows + 15) >> 4;
@@ -812,6 +815,9 @@ MMP(1, 1, 16)
 MMP(1, 2, 16)
 MMP(2, 1, 16)
 MMP(2, 2, 16)
+// a prompt chunk's experts, grouped (up to 32 or 64 rows a job)
+MMP(4, 2, 8)
+MMP(8, 1, 8)
 
 // f32 rows [n][xstride] into the three planes [n][ostride] (what the
 // producers below do in place; for inputs no kernel of this arm makes).
@@ -1352,7 +1358,7 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
 // exponentials written as f16 into P (the value GEMM's operand) and each
 // row's 1 / sum into isum.
 extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
-                                        int L, int pos0, int col_base, int hpk, int cols, int istride)
+                                        int L, int pos0, int col_base, int hpk, int cols, int istride, int win)
 {
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1361,8 +1367,11 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     const int gk = (int)blockIdx.x / cols, r = (int)blockIdx.x - gk * cols;
     const int pq = pos0 + r / hpk;
     const int hi = pq - col_base;
+    // a sliding window: the keys left of its `win` (`hy_scores`' rule) weigh nothing
+    const int lo = win > 0 ? hi - win + 1 : 0;
     float m = -INF;
-    for (int c = tid; c <= hi && c < L; c += T) m = fmaxf(m, s[c]);
+    for (int c = tid; c <= hi && c < L; c += T)
+        if (c >= lo) m = fmaxf(m, s[c]);
     for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, k));
     if (lane == 0) red[warp] = m;
     __syncthreads();
@@ -1372,7 +1381,7 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     float sum = 0.0f;
     for (int c = tid; c < L; c += T) {
         float e = 0.0f;
-        if (c <= hi) {
+        if (c <= hi && c >= lo) {
             e = expf(s[c] - m);
             sum += e;
         }
@@ -1918,6 +1927,202 @@ extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __
         const float w = wsel[(size_t)r * S + s];
         if (w != 0.0f) acc = fmaf(w, dnS[((size_t)s * n + r) * hidden + i], acc);
     }
+    if (dsh) {
+        const float w = gated ? 1.0f / (1.0f + expf(-sg[r])) : 1.0f;
+        acc = fmaf(w, dsh[(size_t)r * hidden + i], acc);
+    }
+    h[(size_t)r * hidden + i] += acc;
+}
+
+// ---------------------------------------------- MoE on the prompt path
+//
+// A prompt chunk's routed FFN grouped by expert. `hy_moe_topk` picks every
+// row's k experts and their mixing weights (`hy_moe_select`'s arithmetic);
+// `hy_moe_group` (one block) sorts the (row, pick) entries by expert, in
+// entry order, and writes a gate/up and a down job for every `rmax` rows of
+// an expert (the job's row count in `nr`, its rows' planes at `xoff`);
+// `hy_moe_gather` lays the picked rows out in that order as input planes;
+// two tensor-core launches run the jobs; `hy_moe_gcombine` adds the weighted
+// outputs (and the shared expert) to the stream.
+
+// A warp a row: pidx[r][j], pwt[r][j] for its k picks.
+extern "C" __global__ void hy_moe_topk(const float* __restrict__ logits, const float* __restrict__ bias, int n, int E,
+                                       int k, int flags, float route_scale, int* __restrict__ pidx, float* __restrict__ pwt)
+{
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= n) return;
+    const bool sigm = (flags & 2) != 0;
+    const float* L = logits + (size_t)r * E;
+    float key[32], lg[32];
+#pragma unroll
+    for (int q = 0; q < 32; q++) {
+        const int e = lane + 32 * q;
+        lg[q] = e < E ? L[e] : -3.0e38f;
+    }
+    float mx = -3.0e38f, sum = 0.0f;
+    if (!sigm) {
+#pragma unroll
+        for (int q = 0; q < 32; q++) mx = fmaxf(mx, lg[q]);
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o));
+#pragma unroll
+        for (int q = 0; q < 32; q++)
+            if (lane + 32 * q < E) sum += expf(lg[q] - mx);
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(FULL, sum, o);
+    }
+#pragma unroll
+    for (int q = 0; q < 32; q++) {
+        const int e = lane + 32 * q;
+        float kk = lg[q];
+        if (sigm && e < E) {
+            kk = 1.0f / (1.0f + expf(-kk));
+            if ((flags & 4) && bias) kk += bias[e];
+        }
+        key[q] = e < E ? kk : -3.0e38f;
+    }
+    float tot = 0.0f;
+    for (int j = 0; j < k; j++) {
+        float best = -3.0e38f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int q = 0; q < 32; q++) {
+            const int e = lane + 32 * q;
+            if (key[q] > best || (key[q] == best && e < bi)) {
+                best = key[q];
+                bi = e;
+            }
+        }
+        moe_argmax(best, bi);
+#pragma unroll
+        for (int q = 0; q < 32; q++)
+            if (lane + 32 * q == bi) key[q] = -3.0e38f;
+        if (lane == 0) {
+            const float lb = L[bi];
+            const float w = sigm ? 1.0f / (1.0f + expf(-lb)) : expf(lb - mx) / sum;
+            pidx[(size_t)r * k + j] = bi;
+            pwt[(size_t)r * k + j] = w;
+            tot += w;
+        }
+    }
+    if (lane == 0) {
+        const float dn = sigm ? tot + ((flags & 32) ? 1e-20f : 1e-6f) : tot;
+        for (int j = 0; j < k; j++) {
+            float w = pwt[(size_t)r * k + j];
+            if (flags & 1) w = w / dn;
+            pwt[(size_t)r * k + j] = w * route_scale;
+        }
+    }
+}
+
+// One block (E <= 1024): pos[i] = entry i's place in the expert-sorted order
+// (an expert's entries in entry order), src[pos] = its row (i / k), and the
+// jobs: per `rmax` rows of an expert a gate/up job from gu_t (input planes
+// at its first row's place of the gathered rows, `hidden` a row; output
+// planes qq0, qq1, `inter_s` a row) and a down job from dn_t (input the
+// gate/up's planes, output ys, `hidden` floats a row); jobs past the count
+// up to jmax are empty, their first blocks still ascending.
+extern "C" __global__ void hy_moe_group(const int* __restrict__ pidx, int nk, int k, int E, int rmax, int jmax,
+                                        const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t,
+                                        HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a, int* __restrict__ pos,
+                                        int* __restrict__ src, u64 qq0, u64 qq1, int hidden, int inter_s, u64 ys,
+                                        int bpj_gu, int bpj_dn)
+{
+    __shared__ int cnt[1024], off[1024], jb0[1024];
+    __shared__ int njobs;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    // a warp an expert: its entries by ballots, in entry order
+    for (int e = warp; e < E; e += NW) {
+        int c = 0;
+        for (int base = 0; base < nk; base += 32) {
+            const int i = base + lane;
+            c += __popc(__ballot_sync(FULL, i < nk && pidx[i] == e));
+        }
+        if (lane == 0) cnt[e] = c;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int o = 0, j = 0;
+        for (int e = 0; e < E; e++) {
+            off[e] = o;
+            jb0[e] = j;
+            o += cnt[e];
+            j += (cnt[e] + rmax - 1) / rmax;
+        }
+        njobs = min(j, jmax);
+    }
+    __syncthreads();
+    for (int e = warp; e < E; e += NW) {
+        int p = off[e];
+        for (int base = 0; base < nk; base += 32) {
+            const int i = base + lane;
+            const bool m = i < nk && pidx[i] == e;
+            const unsigned b = __ballot_sync(FULL, m);
+            if (m) {
+                const int q = p + __popc(b & ((1u << lane) - 1u));
+                pos[i] = q;
+                src[q] = i / k;
+            }
+            p += __popc(b);
+        }
+    }
+    for (int e = tid; e < E; e += blockDim.x) {
+        const int c = cnt[e];
+        for (int ps = 0; ps * rmax < c; ps++) {
+            const int j = jb0[e] + ps;
+            if (j >= jmax) break;
+            const int r0 = off[e] + ps * rmax, nr = min(rmax, c - ps * rmax);
+            HyJob g = gu_t[e];
+            g.y = qq0 + (u64)r0 * inter_s * 2;
+            g.res = qq1 + (u64)r0 * inter_s * 2;
+            g.ystride = inter_s;
+            g.blk0 = j * bpj_gu;
+            g.xoff = r0 * hidden;
+            g.nr = nr;
+            HyJob d = dn_t[e];
+            d.y = ys + (u64)r0 * hidden * 4;
+            d.res = 0;
+            d.ystride = hidden;
+            d.blk0 = j * bpj_dn;
+            d.xoff = r0 * inter_s;
+            d.nr = nr;
+            gu_a[j] = g;
+            dn_a[j] = d;
+        }
+    }
+    for (int j = njobs + tid; j < jmax; j += blockDim.x) {
+        HyJob g = gu_t[0], d = dn_t[0];
+        g.rows = 0;
+        d.rows = 0;
+        g.blk0 = j * bpj_gu;
+        d.blk0 = j * bpj_dn;
+        g.nr = 0;
+        d.nr = 0;
+        gu_a[j] = g;
+        dn_a[j] = d;
+    }
+}
+
+// The picked rows in sorted order as input planes: row q of the planes is
+// row src[q] of xn [n][hidden] f32.
+extern "C" __global__ void hy_moe_gather(const float* __restrict__ xn, const int* __restrict__ src, int total, int hidden,
+                                         u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)total * hidden) return;
+    const int q = (int)(idx / hidden), i = (int)(idx - (size_t)q * hidden);
+    put3(p0, p1, p2, idx, xn[(size_t)src[q] * hidden + i]);
+}
+
+// h[r] += sum over its picks of pwt[r][j] * ys[pos[r][j]] (+ the shared
+// expert's rows times sigmoid(sg[r]) under `gated`, else 1).
+extern "C" __global__ void hy_moe_gcombine(float* __restrict__ h, const float* __restrict__ ys, const int* __restrict__ pos,
+                                           const float* __restrict__ pwt, const float* __restrict__ dsh,
+                                           const float* __restrict__ sg, int gated, int n, int k, int hidden)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= hidden || r >= n) return;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) acc = fmaf(pwt[(size_t)r * k + j], ys[(size_t)pos[(size_t)r * k + j] * hidden + i], acc);
     if (dsh) {
         const float w = gated ? 1.0f / (1.0f + expf(-sg[r])) : 1.0f;
         acc = fmaf(w, dsh[(size_t)r * hidden + i], acc);

@@ -621,9 +621,12 @@ impl KvMirror {
         let new_cap = if self.window > 0 {
             (self.window - 1 + add.max(256)).max(keep + add)
         } else {
-            // a hint that covers the rows is the size (the prompt's rows, and its
-            // first token); growth past it keeps some slack
-            if hint >= keep + add { hint } else { (keep + add) + (self.cap / 8).max(1024) }
+            // a hint that covers the rows sizes it (the prompt's rows, and its
+            // first token) with room for the answer's first tokens: sized to the
+            // hint exactly, the second token reallocated every layer's rows (a
+            // sync, a copy, every token graph recorded again); growth past it
+            // keeps some slack
+            if hint >= keep + add { hint + (hint / 8).max(256) } else { (keep + add) + (self.cap / 8).max(1024) }
         };
         let nk = Buf::new(new_cap * self.row * 4)?;
         let nv = Buf::new(new_cap * self.row * 4)?;

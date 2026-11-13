@@ -142,12 +142,15 @@ struct HyJob {
     ystride: i32,
     /// Elements into the input planes this job's rows start at (a MoE slot's own input).
     xoff: i32,
-    pad_: i32,
+    /// > 0: this job's input rows, fewer than the launch's (a grouped expert's).
+    nr: i32,
 }
 
 pub(super) struct HFuncs {
     /// `hy_mmp_{NT}_{TB}_{KS}` by [NT - 1][TB - 1][KS == 16].
     mmp: [[[cs::CUfunction; 2]; 2]; 2],
+    /// The grouped experts' launches: `hy_mmp_4_2_8` (32 rows a job), `hy_mmp_8_1_8` (64).
+    mmp_g: [cs::CUfunction; 2],
     split: cs::CUfunction,
     expand_p: cs::CUfunction,
     rmsnorm: cs::CUfunction,
@@ -187,6 +190,10 @@ pub(super) struct HFuncs {
     moe_router: cs::CUfunction,
     moe_select: cs::CUfunction,
     moe_combine: cs::CUfunction,
+    moe_topk: cs::CUfunction,
+    moe_group: cs::CUfunction,
+    moe_gather: cs::CUfunction,
+    moe_gcombine: cs::CUfunction,
     norm_add: cs::CUfunction,
     scale: cs::CUfunction,
     sconv: cs::CUfunction,
@@ -210,6 +217,11 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     }
     Ok(HFuncs {
         mmp,
+        mmp_g: [func(module, "hy_mmp_4_2_8")?, func(module, "hy_mmp_8_1_8")?],
+        moe_topk: func(module, "hy_moe_topk")?,
+        moe_group: func(module, "hy_moe_group")?,
+        moe_gather: func(module, "hy_moe_gather")?,
+        moe_gcombine: func(module, "hy_moe_gcombine")?,
         split: func(module, "hy_split")?,
         expand_p: func(module, "hy_expand_p")?,
         rmsnorm: func(module, "hy_rmsnorm")?,
@@ -318,7 +330,7 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 blk0: blk as i32,
                 ystride: ystride as i32,
                 xoff: 0,
-                pad_: 0,
+                nr: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
         }
@@ -1524,7 +1536,7 @@ fn build(
                     blk0: 0,
                     ystride: 0,
                     xoff: 0,
-                    pad_: 0,
+                    nr: 0,
                 };
                 for &(g, u, d) in &experts[..e] {
                     let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
@@ -2733,6 +2745,30 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
     Ok(())
 }
 
+/// A layer the prompt path has no kernels for (sandwich norms, a layer
+/// scale, a short convolution or a head-wise gate): such a
+/// stack's long prompt runs the small path a chunk at a time.
+fn small_only(l: &HLayer) -> bool {
+    l.attn_out.is_some()
+        || l.ffn_out.is_some()
+        || l.layer_scale.is_some()
+        || matches!(l.mix, Mix::Conv(_))
+        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
+}
+
+/// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
+/// NMAX rows at a time instead of the prompt path's grouped experts.
+fn moe_big_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_MOE_BIG").as_deref() != Ok("0"))
+}
+
+/// Rows a grouped expert job takes (`CMF_HYB_MOE_RMAX`: 32 or 64).
+fn moe_rmax() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| if std::env::var("CMF_HYB_MOE_RMAX").as_deref() == Ok("64") { 64 } else { 32 })
+}
+
 /// A replayable small-path call: the instantiated graph and the pointers it
 /// was recorded with.
 pub(super) struct GraphRec {
@@ -3337,7 +3373,10 @@ pub(super) fn batch(
     // a longer prompt goes through it NMAX rows at a time
     // what the prompt path has no kernels for (a routed FFN, sandwich norms, a
     // layer scale) runs the small path
-    let moe = plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some() || matches!(l.mix, Mix::Conv(_)) || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.window.is_some()));
+    // a routed FFN's long prompt takes the prompt path (its experts grouped)
+    // unless the stack has a layer only the small path runs
+    let grouped = moe_big_on() && spec.is_none() && !prompt_far && b > NMAX && !plan.layers.iter().any(small_only);
+    let moe = !grouped && plan.layers.iter().any(|l| l.moe.is_some() || small_only(l));
     if spec.is_some() && plan.layers.iter().any(|l| matches!(l.mix, Mix::Conv(_))) {
         decline("hybrid batch", "a verify window over a short convolution");
         return BatchGraphOutcome::Declined;
@@ -3620,6 +3659,65 @@ pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
 
 /// The prompt path: a chunk of `b > NMAX` rows on cuBLAS.
 #[allow(clippy::too_many_arguments)]
+/// A prompt chunk's routed FFN, its experts grouped (see `hy_moe_group`):
+/// the normed rows in f32, the router and the shared gate as f32 GEMMs,
+/// every row's picks, the (row, pick) entries sorted by expert and laid out
+/// as input planes, a tensor-core launch over every expert's gate/up and one
+/// over its down, the mixture (and `dsh`, the shared expert's rows) into h.
+#[allow(clippy::too_many_arguments)]
+unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
+    let (e, k, inter) = (m.e, m.k, m.inter);
+    if e > 1024 || k > 64 || inter % 32 != 0 {
+        return Err(format!("a grouped routed FFN of {e} experts, top {k}, width {inter}"));
+    }
+    let nk = b * k;
+    let rmax = moe_rmax();
+    let jmax = e + nk.div_ceil(rmax);
+    let (nul, zero_i, hid_i) = (0u64, 0i32, hidden as i32);
+    let x32 = st.scr(c, "hb_mx32", b * hidden * 4)?;
+    let logits = st.scr(c, "hb_mlog", b * e * 4)?;
+    let sg = if m.sgw.is_some() { st.scr(c, "hb_msg", b * 4)? } else { 0 };
+    let pidx = st.scr(c, "hb_mpidx", nk * 4)?;
+    let pwt = st.scr(c, "hb_mpwt", nk * 4)?;
+    let pos = st.scr(c, "hb_mpos", nk * 4)?;
+    let src = st.scr(c, "hb_msrc", nk * 4)?;
+    let xg0 = st.scr(c, "hb_mxg0", nk * hidden * 2)?;
+    let xg1 = st.scr(c, "hb_mxg1", nk * hidden * 2)?;
+    let qq0 = st.scr(c, "hb_mqq0", nk * inter * 2)?;
+    let qq1 = st.scr(c, "hb_mqq1", nk * inter * 2)?;
+    let ys = st.scr(c, "hb_mys", nk * hidden * 4)?;
+    let gu_a = st.scr(c, "hb_mgua", jmax * std::mem::size_of::<HyJob>())?;
+    let dn_a = st.scr(c, "hb_mdna", jmax * std::mem::size_of::<HyJob>())?;
+    let (gi, tb) = if rmax == 64 { (1usize, 1u32) } else { (0, 2) };
+    let (bpg, bpd) = (m.bpj_gu.div_ceil(tb), m.bpj_dn.div_ceil(tb));
+    let (n_i, e_i, k_i, nk_i, rmax_i, jmax_i, inter_i) = (b as i32, e as i32, k as i32, nk as i32, rmax as i32, jmax as i32, inter as i32);
+    let (bg_i, bd_i) = (bpg as i32, bpd as i32);
+    let bias = m.bias.as_ref().map_or(0, |x| x.ptr);
+    unsafe {
+        c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, norm, x32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+        c.gemm(true, false, e, b, hidden, 1.0, m.router.w.ptr, hidden, x32, hidden, 0.0, logits, e, Gemm::F32)?;
+        if let Some(g) = &m.sgw {
+            c.gemm(true, false, 1, b, hidden, 1.0, g.w.ptr, hidden, x32, hidden, 0.0, sg, 1, Gemm::F32)?;
+        }
+        c.launch(fx.moe_topk, (b.div_ceil(8) as u32, 1), 256, 0, kargs!(logits, bias, n_i, e_i, k_i, m.flags, m.route_scale, pidx, pwt))?;
+        c.launch(
+            fx.moe_group,
+            (1, 1),
+            1024,
+            0,
+            kargs!(pidx, nk_i, k_i, e_i, rmax_i, jmax_i, m.gu_t.ptr, m.dn_t.ptr, gu_a, dn_a, pos, src, qq0, qq1, hid_i, inter_i, ys, bg_i, bd_i),
+        )?;
+        let tot = (nk * hidden) as u64;
+        c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x32, src, nk_i, hid_i, xg0, xg1, xg1))?;
+        let f = fx.mmp_g[gi];
+        c.launch(f, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(gu_a, jmax_i, xg0, xg1, xg1, hid_i, rmax_i, hid_i))?;
+        c.launch(f, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(dn_a, jmax_i, qq0, qq1, qq1, inter_i, rmax_i, inter_i))?;
+        let gated_i = (m.gated && sg != 0) as i32;
+        c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, b as u32), 256, 0, kargs!(bh, ys, pos, pwt, dsh, sg, gated_i, n_i, k_i, hid_i))?;
+    }
+    Ok(())
+}
+
 unsafe fn big(
     c: &Ctx,
     st: &mut State,
@@ -3635,8 +3733,9 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    if plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some() || matches!(l.mix, Mix::Conv(_)) || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.window.is_some())) {
-        return Err("a routed FFN or sandwich norms on the prompt path".into());
+    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some()));
+    if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
+        return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
     }
     let (gw, _) = prec();
     if gw != Gemm::Half {
@@ -3668,7 +3767,8 @@ unsafe fn big(
     let want = super::taps_wanted();
     let tapping = !want.is_empty() && layer_base == 0 && want.iter().all(|&l| l < plan.layers.len());
     let mut tapped = if tapping { vec![0f32; want.len() * b * hidden] } else { Vec::new() };
-    let tab = rope_rows(&plan.invf, positions.iter().copied());
+    // the call's rotation rows, then each extra table's (a local layer's)
+    let tab = plan_tab(plan, positions.iter().copied());
     let btab = st.scr(c, "hb_tab", tab.len().max(1) * 4)?;
     unsafe {
         cu::memcpy_htod_async(bh, h, c.stream).map_err(derr)?;
@@ -3810,13 +3910,15 @@ unsafe fn big(
                 let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                // a local layer's rotation rows follow the call's (`plan_tab`)
+                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, n0_i, b_i, nul, qgh, bqp, bkp, bvp),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, n0_i, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // the archive of a prompt past its first seal: the chunk's rows
@@ -3921,13 +4023,15 @@ unsafe fn big(
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                // a local layer's rotation rows follow the call's (`plan_tab`)
+                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, b_i, nul, qgh, bqp, bkp, bvp),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // a far-field layer of a prompt read for its seal: the rotated
@@ -3955,9 +4059,12 @@ unsafe fn big(
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
+                // a sliding window: the block's keys start where its first row's window does
+                let win = a.window.unwrap_or(0);
                 while b0 < b {
                     let p0 = pos0 + b0;
-                    let col_base = m_base;
+                    let col_base = if win > 0 { m_base.max((p0 + 1).saturating_sub(win)) } else { m_base };
+                    let (kpw, vpw) = (kp + ((col_base - m_base) * lda * 2) as u64, vp + ((col_base - m_base) * lda * 2) as u64);
                     let fit = |n: usize| (p0 + n - col_base) * n * nh * 4 <= 384 << 20;
                     let mut bn = (b - b0).min(att_rows());
                     while bn > 64 && !fit(bn) {
@@ -3969,14 +4076,14 @@ unsafe fn big(
                     let bs = st.scr(c, "hb_s", (nkv * l_rows * cols * 4).max(whole))?;
                     let bp = st.scr(c, "hb_p", (nkv * l_rows * cols * 2).max(whole / 2))?;
                     let (l_i, p0_i, cb_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, hpk as i32);
-                    let (cols_i, istride) = (cols as i32, (b * hpk) as i32);
+                    let (cols_i, istride, win_i) = (cols as i32, (b * hpk) as i32, win as i32);
                     let isum = bis + (b0 * hpk * 4) as u64;
                     // the mirrors hold f16 rows: both GEMMs on f16 operands
                     // (the query copy and the exponentials), f32 out
                     unsafe {
-                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kp, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
-                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride))?;
-                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vp, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
+                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i))?;
+                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
                 }
@@ -3996,15 +4103,31 @@ unsafe fn big(
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.post_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
         bst(c, 0, tm)?;
-        // the gate/up pair as one GEMM, its rows in the pair's order
-        mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
-        let tot = (b * inter) as u64;
-        let (in_i, bb_i) = (inter as i32, b as i32);
-        unsafe {
-            c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+        // the shared expert, or the dense FFN: the gate/up pair as one GEMM,
+        // its rows in the pair's order
+        let dense_pair = pl.moe.as_ref().is_none_or(|m| m.shared);
+        let dsh = match &pl.moe {
+            Some(_) if dense_pair => st.scr(c, "hb_dsh", b * hidden * 4)?,
+            _ => 0,
+        };
+        if dense_pair {
+            mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
+            let tot = (b * inter) as u64;
+            let (in_i, bb_i) = (inter as i32, b as i32);
+            unsafe {
+                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+            }
+            bst(c, 6, tm)?;
+            if pl.moe.is_some() {
+                mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
+            } else {
+                mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
+            }
         }
-        bst(c, 6, tm)?;
-        mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
+        if let Some(m) = &pl.moe {
+            unsafe { moe_grouped(c, st, fx, m, bh, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            bst(c, 6, tm)?;
+        }
         if tapping {
             if let Some(s) = want.iter().position(|&l| l == li) {
                 // pageable: done when it returns
