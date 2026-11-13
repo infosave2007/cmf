@@ -32,10 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RTX A5000 (fast build), a 4096-token prompt 3322 against 149 tok/s (first token 1.23 against 27.5 s) and
   109.9 against 72.1 tok/s after it; the greedy text identical to the CPU's on both.
 
+- q4_tiled weights on the CUDA hybrid arm (job kind 10): a lane's 16 nibbles a 32-column group (8 bytes, as q4tp's
+  tiles) and a (row, group)'s f16 scale (`hy_repack4t`, `hy_expand_q4gr`), matrices, gate/up pairs, heads and
+  routed experts (`q4tp: false`). KAT-Coder-V2.5 (every matrix q4_tiled), which ran op by op on CUDA at 3.3 tok/s,
+  decodes at 135.3 tok/s against Vulkan's 56.5 on an RTX A5000 (fast build), a 4096-token prompt 3320 against
+  90 tok/s (first token 1.23 against 45.5 s); the greedy text identical to Vulkan's.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
-  every MoE prompt through the batch graph that reached them, Escha-W2's and flint's, crashed. Both flush the
+  every MoE prompt through the batch graph that reached them, Escha-W2's, flint's and KAT-Coder's, crashed. Both flush the
   pass first: Escha-W2 decodes at 99.0 tok/s, flint at 76.2 (its greedy text identical to the CPU's).
 
 ## [0.8.95] — 2026-11-13
