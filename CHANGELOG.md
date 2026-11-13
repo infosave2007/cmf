@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.93] — 2026-11-13
+
+### Added
+- q1 weights on the CUDA hybrid arm (job kind 3): a q1 matrix or gate/up pair is tiled once on the card
+  (`hy_repack1`) into a lane's 16 sign bits a 32-column group, its register pairs built as bf16 +-1 from two
+  bits, a (row, group)'s f16 scale the group's factor; the prompt path expands the tiles to f16 by bands
+  (`hy_expand_q1r`), and a q1 vocabulary head (Bonsai's tied embedding) takes the tensor-core kernels. Bonsai,
+  which declined on its q1 gate/up pairs and ran op by op on CUDA at 1.7-25 tok/s, runs the whole token graph.
+  RTX A5000, release build, CUDA against Vulkan on the same card (the greedy texts identical to the CPU's):
+  Bonsai-1.7B 270.2-276.6 against 180.5-184.7 tok/s, a 4096-token prompt 10229 against 338 tok/s (first token
+  0.40 against 12.1 s); Bonsai-27B 35.3-35.6 against 26.3-26.9, the 4096-token prompt 932 against 32 tok/s
+  (4.4 against 127.8 s). At one row the q1 decode is bound by the tensor cores' eight-row tile, not the bus
+  (Bonsai-27B 27 ms a token over 5.1 GB): a CUDA-core matvec for that case is the next lever.
+
 ## [0.8.92] — 2026-11-13
 
 ### Added
