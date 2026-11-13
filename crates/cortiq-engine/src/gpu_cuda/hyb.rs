@@ -1613,8 +1613,11 @@ fn build(
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
             }
             GraphFfn::Moe { act, q4tp, gu_q2, q82, n_exp, top_k, inter, experts, has_shared, detached_shared, router, .. } => {
-                if *act != GraphAct::Silu || !*q4tp || *gu_q2 || *q82 {
-                    return Err(format!("layer {li}: a routed FFN other than q4tp SwiGLU"));
+                // q2tp gate/up beside q4tp down (`gu_q2`) load by their file codec;
+                // q8_2f experts (two column fields a pair) have no tiles
+                let _ = gu_q2;
+                if *act != GraphAct::Silu || !*q4tp || *q82 {
+                    return Err(format!("layer {li}: a routed FFN other than q4tp / q2tp SwiGLU"));
                 }
                 if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
                     return Err(format!("layer {li}: a routed FFN of {n_exp} experts, top {top_k}"));

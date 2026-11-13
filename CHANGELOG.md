@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on CUDA at 0.44 tok/s, runs the whole token graph: RTX A5000, fast build, CUDA against Vulkan on the same
   card, decode 26.1 against 24.5 tok/s, a 4096-token prompt 740 against 117 tok/s (first token 5.5 against
   34.9 s); the greedy text identical to the CPU's.
+- A routed FFN with q2tp gate/up experts beside q4tp down ones (the `gu_q2` profile) on the CUDA hybrid arm,
+  each expert loaded by its file codec: Qwen3.6-35B-A3B-Escha-W2, which ran op by op at 9 tok/s, decodes at
+  131.4 tok/s against Vulkan's 99.0 on an RTX A5000 (fast build), a 4096-token prompt 3109 against 177 tok/s
+  (first token 1.3 against 23.2 s); the greedy text identical to Vulkan's.
+
+### Fixed
+- Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
+  was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
+  every MoE prompt through the batch graph that reached them, Escha-W2's and flint's, crashed. Both flush the
+  pass first: Escha-W2 decodes at 99.0 tok/s, flint at 76.2 (its greedy text identical to the CPU's).
 
 ## [0.8.95] — 2026-11-13
 

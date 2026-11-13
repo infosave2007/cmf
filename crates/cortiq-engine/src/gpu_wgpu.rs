@@ -36677,7 +36677,11 @@ pub fn forward_batch_graph_at(
          src: &wgpu::Buffer,
          so: usize,
          dst: &wgpu::Buffer,
-         n: usize| enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, 0, (n * 4) as u64);
+         n: usize| {
+            // the merged pass ends before a copy (an open pass locks the encoder)
+            flush_pass(&*enc);
+            enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, 0, (n * 4) as u64)
+        };
     // Однострочные срезы батча для MoE: его ядра написаны на ОДИН токен,
     // поэтому i-я строка копируется сюда, считается и уезжает обратно.
     let row_in = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -36757,7 +36761,10 @@ pub fn forward_batch_graph_at(
          src: &wgpu::Buffer,
          dst: &wgpu::Buffer,
          dof: usize,
-         n: usize| enc.copy_buffer_to_buffer(src, 0, dst, (dof * 4) as u64, (n * 4) as u64);
+         n: usize| {
+            flush_pass(&*enc);
+            enc.copy_buffer_to_buffer(src, 0, dst, (dof * 4) as u64, (n * 4) as u64)
+        };
     // Bootstrap first layer's input norm over all k rows.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
     go(
