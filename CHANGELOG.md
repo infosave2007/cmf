@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   op by op on CUDA at 4.4 tok/s, decodes at 48.9 tok/s against Vulkan's 35.5 on an RTX A5000 (fast build); the
   greedy text identical to the CPU's. Its long prompts take the small path 16 rows at a time.
 
+### Changed
+- Every stack on CUDA tries the hybrid arm first (the dense arm after a decline; `CMF_CUDA_HYB_ALL=0` keeps plain
+  attention stacks on the dense arm), a verify tail with it. RTX A5000, fast build, decode hybrid / dense / Vulkan:
+  Granite-4.2-8B 91.9 / 65.9 / 78.0 tok/s (79.6 / 57.2 / 72.0 after a 4096-token prompt, read at 2396 / 2525 / 537
+  tok/s), CherryPit-1.2-2B 173 / 140 / 125 (4096-token prompt 4588 / 5559 / 1002), MiniCPM5-2B 177-183 / 145-146 /
+  138-142; the hybrid arm's greedy text identical to the dense arm's.
+- Clover's block-preview weights no longer keep the hybrid arm's prompt path away while no block preview is
+  active (Clover is causal by default): a 4096-token prompt 2947 against Vulkan's 571 tok/s (first token 1.39
+  against 7.17 s), decode 121 against 91.5.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):

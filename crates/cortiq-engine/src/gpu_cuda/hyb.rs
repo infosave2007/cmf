@@ -1466,11 +1466,17 @@ struct ChainRes {
 /// with Q/K norms or the element-wise output gate.) An empty stack with a
 /// head goes here when the dense arm's attention kernels cannot take the
 /// geometry.
-/// `CMF_CUDA_HYB_ALL=1`: every stack takes the hybrid arm (the dense arm's
-/// plain attention stacks included).
+/// A Clover block preview is active over this stack (its GDN layers' preview
+/// operator, which the arm has no kernels for; a cached plan is causal).
+fn previewing(layers: &[GraphLayer]) -> bool {
+    crate::gpu::block_preview().is_some() && layers.iter().any(|l| matches!(&l.attn, GraphAttn::Gdn { preview: Some(_), .. }))
+}
+
+/// Every stack tries the hybrid arm first (the dense arm's plain attention
+/// stacks included); `CMF_CUDA_HYB_ALL=0` keeps those on the dense arm.
 pub(super) fn all_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_CUDA_HYB_ALL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_HYB_ALL").as_deref() != Ok("0"))
 }
 
 pub(super) fn wants(layers: &[GraphLayer], nh: usize, nkv: usize, hd: usize) -> bool {
@@ -1675,7 +1681,9 @@ fn build(
         }
         match &l.attn {
             GraphAttn::Gdn { nv, nk, dk, dv, kk, preview, .. } => {
-                if preview.is_some() {
+                // Clover carries its preview weights on every call; only an
+                // active block preview (`enter_block_preview`) reads them
+                if preview.is_some() && crate::gpu::block_preview().is_some() {
                     return Err(format!("layer {li}: block preview"));
                 }
                 if *dk != 128 || *dv != *dk || *nk == 0 || nv % nk != 0 || *kk < 1 || *kk > 9 {
@@ -3543,6 +3551,10 @@ pub(super) fn token(
     layer_base: usize,
     hidden_too: bool,
 ) -> TokenGraphOutcome {
+    if previewing(layers) {
+        decline("hybrid token", "an active block preview");
+        return TokenGraphOutcome::Declined;
+    }
     if steps != 1 || (!o1.is_empty() && o1.len() != layers.len()) {
         decline("hybrid token", "a multi-step burst or far-field views short of the layers");
         return TokenGraphOutcome::Declined;
@@ -3882,6 +3894,10 @@ pub(super) fn batch(
     defer: bool,
 ) -> BatchGraphOutcome {
     let b = k;
+    if previewing(layers) {
+        decline("hybrid batch", "an active block preview");
+        return BatchGraphOutcome::Declined;
+    }
     // a sealed layer takes a verify window over its far field (the state on
     // the card at this position), or a prompt chunk read past the seal
     let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
