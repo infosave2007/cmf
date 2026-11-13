@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.94] — 2026-11-13
+
 ### Added
 - Edge0-145B and Edge0-120B (latent MoE on Qwen3.8-Flash-Next, Edge0's NVFP4 build) run from one CMF file each:
   `cortiq edge0-import` copies the routed experts bit for bit into the new `nvfp4` tensor type (dtype 22: E2M1
