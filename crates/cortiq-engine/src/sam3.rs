@@ -47,21 +47,21 @@ pub fn preprocess(frame: &crate::media::RgbFrame) -> Vec<f32> {
 }
 
 const PIX: usize = 1008;
-const PATCH: usize = 14;
-const GRID: usize = PIX / PATCH; // 72
-const WIN: usize = 24;
-const TD: usize = 1024;
-const TH: usize = 16;
-const TL: usize = 32;
-const TI: usize = 4736;
-const T_EPS: f32 = 1e-6;
-const GLOBAL: [usize; 4] = [7, 15, 23, 31];
+pub(crate) const PATCH: usize = 14;
+pub(crate) const GRID: usize = PIX / PATCH; // 72
+pub(crate) const WIN: usize = 24;
+pub(crate) const TD: usize = 1024;
+pub(crate) const TH: usize = 16;
+pub(crate) const TL: usize = 32;
+pub(crate) const TI: usize = 4736;
+pub(crate) const T_EPS: f32 = 1e-6;
+pub(crate) const GLOBAL: [usize; 4] = [7, 15, 23, 31];
 
-const SS: usize = 32;
-const SD: usize = 1024;
-const SL: usize = 24;
-const SI: usize = 4096;
-const S_EPS: f32 = 1e-5;
+pub(crate) const SS: usize = 32;
+pub(crate) const SD: usize = 1024;
+pub(crate) const SL: usize = 24;
+pub(crate) const SI: usize = 4096;
+pub(crate) const S_EPS: f32 = 1e-5;
 const PROJ: usize = 512;
 
 const FD: usize = 256;
@@ -216,6 +216,8 @@ pub struct Sam3 {
     /// `trunk.pos_embed` is [1,577,1024]: Meta's leading cls row is
     /// dropped by the HF conversion (SAM3_POS=first keeps rows 0..576).
     pos_skip_cls: bool,
+    /// The text tower's result for the last prompt (a video's frames share it).
+    text_cache: Option<(Vec<u32>, Vec<u8>, Vec<f32>, Vec<f32>)>,
 }
 
 impl Sam3 {
@@ -228,7 +230,7 @@ impl Sam3 {
             _ => "fpn.convs",
         };
         let pos_skip_cls = std::env::var("SAM3_POS").as_deref() != Ok("first");
-        Ok(Self { model, pool: Pool::from_env(), fpn_prefix, pos_skip_cls })
+        Ok(Self { model, pool: Pool::from_env(), fpn_prefix, pos_skip_cls, text_cache: None })
     }
 
     /// The shared CMF handle (the video tracker reads its `trk.*` section
@@ -317,7 +319,14 @@ impl Sam3 {
         let pool = self.pool.as_deref();
         let mut stg = StageTimer::new_session();
         let _p = crate::cpuprof::spans::span("text");
-        let (text_embeds, text_feats) = self.text(ids, attn, pool)?;
+        let (text_embeds, text_feats) = match &self.text_cache {
+            Some((i, a, e, f)) if i == ids && a == attn => (e.clone(), f.clone()),
+            _ => {
+                let (e, f) = self.text(ids, attn, pool)?;
+                self.text_cache = Some((ids.to_vec(), attn.to_vec(), e.clone(), f.clone()));
+                (e, f)
+            }
+        };
         drop(_p);
         stg.lap("text");
         let blank = |te: Vec<f32>, tf: Vec<f32>| Sam3Out {
@@ -422,6 +431,7 @@ impl Sam3 {
 
     fn text(&self, ids: &[u32], attn: &[u8], pool: Option<&Pool>) -> Result<(Vec<f32>, Vec<f32>)> {
         let m = &self.model;
+        let mut tst = StageTimer::new();
         let tok = lin(m, "text.encoder.token_embedding.weight")?;
         let pos = load_vec(m, "text.encoder.positional_embedding")?;
         let mut x = vec![0f32; SS * SD];
@@ -447,7 +457,10 @@ impl Sam3 {
                 cm[q * SS + k] = NEG;
             }
         }
-        for l in 0..SL {
+        tst.lap("txt_embed");
+        let on_device = std::env::var("SAM3_DUMP_DIR").is_err() && crate::gpu::sam3_text(m, &mut x, &cm);
+        tst.lap("txt_tower");
+        for l in 0..if on_device { 0 } else { SL } {
             let b = format!("text.encoder.transformer.resblocks.{l}.");
             let (lw, lb) = (load_vec(m, &format!("{b}ln_1.weight"))?, load_vec(m, &format!("{b}ln_1.bias"))?);
             // Pre-norm: branch reads a normalized CLONE, x keeps the residual.
@@ -471,21 +484,24 @@ impl Sam3 {
             let f2 = lin(m, &format!("{b}mlp.c_proj.weight"))?;
             let f2b = load_vec(m, &format!("{b}mlp.c_proj.bias"))?;
             let mut ff = vec![0f32; SS * SI];
-            f1.matmat(&h, SS, &mut ff, pool);
+            f1.matmat_dev(&h, SS, &mut ff, pool);
             add_bias(&mut ff, SI, &f1b);
             ff.iter_mut().for_each(|v| *v = gelu_erf(*v));
             let mut fo = vec![0f32; SS * SD];
-            f2.matmat(&ff, SS, &mut fo, pool);
+            f2.matmat_dev(&ff, SS, &mut fo, pool);
             add_bias(&mut fo, SD, &f2b);
             for (a, c) in x.iter_mut().zip(&fo) { *a += *c; }
             dbg_stats(&format!("text.l{l}"), &x);
         }
-        let (lw, lb) = (load_vec(m, "text.encoder.ln_final.weight")?, load_vec(m, "text.encoder.ln_final.bias")?);
-        layer_norm_rows(&mut x, &lw, &lb, S_EPS);
+        if !on_device {
+            let (lw, lb) = (load_vec(m, "text.encoder.ln_final.weight")?, load_vec(m, "text.encoder.ln_final.bias")?);
+            layer_norm_rows(&mut x, &lw, &lb, S_EPS);
+        }
         dbg_stats("text.ln_final", &x);
         if let Some(d) = std::env::var("SAM3_DUMP_DIR").ok() {
             dump_f32(&d, "text_lh", &x);
         }
+        tst.lap("txt_tower");
         // CLIP pools at the first eos token: (ids == eos).argmax()
         let p = ids.iter().position(|&v| v == 49407).ok_or_else(|| anyhow!("no eos token"))?;
         let pooled = &x[p * SD..(p + 1) * SD];
@@ -504,9 +520,10 @@ impl Sam3 {
         let rz = lin(m, "text.resizer.weight")?;
         let rb = load_vec(m, "text.resizer.bias")?;
         let mut feats = vec![0f32; SS * FD];
-        rz.matmat(&x, SS, &mut feats, pool);
+        rz.matmat_dev(&x, SS, &mut feats, pool);
         add_bias(&mut feats, FD, &rb);
         dbg_stats("text.feats", &feats);
+        tst.lap("txt_proj");
         Ok((embeds, feats))
     }
 
@@ -542,6 +559,12 @@ impl Sam3 {
             }
         };
         match pool { Some(p) => p.run_rows(np, &fill), None => fill(0, np) };
+        // the whole trunk on the device when it takes it (not under the dumps)
+        if dump.is_none()
+            && let Some(x) = crate::gpu::sam3_trunk(m, &pv, self.pos_skip_cls)
+        {
+            return Ok(x);
+        }
         let mut x = vec![0f32; np * TD];
         let xb = x.as_mut_ptr() as usize;
         let gemm = |s: usize, e: usize| {
@@ -616,11 +639,11 @@ impl Sam3 {
             let f2 = lin(m, &format!("{b}mlp.fc2.weight"))?;
             let f2b = load_vec(m, &format!("{b}mlp.fc2.bias"))?;
             let mut ff = vec![0f32; np * TI];
-            f1.matmat(&h, np, &mut ff, pool);
+            f1.matmat_dev(&h, np, &mut ff, pool);
             add_bias(&mut ff, TI, &f1b);
             gelu_slice(&mut ff);
             let mut fo = vec![0f32; np * TD];
-            f2.matmat(&ff, np, &mut fo, pool);
+            f2.matmat_dev(&ff, np, &mut fo, pool);
             add_bias(&mut fo, TD, &f2b);
             if let (Some(d), true) = (&dump, dbg0) { dump_f32(d, "b0_mlp", &fo); }
             for (a, c) in x.iter_mut().zip(&fo) { *a += *c; }
@@ -736,11 +759,11 @@ impl Sam3 {
             let l2 = lin(m, &format!("{b}linear2.weight"))?;
             let l2b = load_vec(m, &format!("{b}linear2.bias"))?;
             let mut mid = vec![0f32; n * FI];
-            l1.matmat(&h, n, &mut mid, pool);
+            l1.matmat_dev(&h, n, &mut mid, pool);
             add_bias(&mut mid, FI, &l1b);
             mid.iter_mut().for_each(|v| *v = v.max(0.0));
             let mut fo = vec![0f32; n * FD];
-            l2.matmat(&mid, n, &mut fo, pool);
+            l2.matmat_dev(&mid, n, &mut fo, pool);
             add_bias(&mut fo, FD, &l2b);
             for (a, c) in xs.iter_mut().zip(&fo) { *a += *c; }
             tse.lap("enc_ffn");
@@ -800,16 +823,18 @@ impl Sam3 {
             // query position from the sine encoding of the reference boxes
             let sine = sine_boxes(&refs);
             let mut qp = vec![0f32; NQ * FD];
-            rh0.matmat(&sine, NQ, &mut qp, pool);
+            rh0.matmat_dev(&sine, NQ, &mut qp, pool);
             add_bias(&mut qp, FD, &rh0b);
             qp.iter_mut().for_each(|v| *v = v.max(0.0)); // DecoderMLP: relu between
             let mut qp2 = vec![0f32; NQ * FD];
-            rh1.matmat(&qp, NQ, &mut qp2, pool);
+            rh1.matmat_dev(&qp, NQ, &mut qp2, pool);
             add_bias(&mut qp2, FD, &rh1b);
             let qp = qp2;
             let mut qp_full = vec![0f32; (NQ + 1) * FD];
             qp_full[FD..].copy_from_slice(&qp);
+            tsd.lap("dec_qpos");
             let rpb = rpb_bias(&refs, &rx, &ry, n, pool)?;
+            tsd.lap("dec_rpb");
             // self attention: q=k=h+qp (pad row stays qp=0), v=h ; POST-norm
             let hqp = add_rows(&hidden, &qp_full);
             let qkv = lin(m, &format!("{b}self_attn.in_proj_weight"))?;
@@ -852,11 +877,11 @@ impl Sam3 {
             let l2 = lin(m, &format!("{b}linear2.weight"))?;
             let l2b = load_vec(m, &format!("{b}linear2.bias"))?;
             let mut mid = vec![0f32; (NQ + 1) * FI];
-            l1.matmat(&hidden, NQ + 1, &mut mid, pool);
+            l1.matmat_dev(&hidden, NQ + 1, &mut mid, pool);
             add_bias(&mut mid, FI, &l1b);
             mid.iter_mut().for_each(|v| *v = v.max(0.0));
             let mut fo = vec![0f32; (NQ + 1) * FD];
-            l2.matmat(&mid, NQ + 1, &mut fo, pool);
+            l2.matmat_dev(&mid, NQ + 1, &mut fo, pool);
             add_bias(&mut fo, FD, &l2b);
             for (a, c) in hidden.iter_mut().zip(&fo) { *a += *c; }
             tsd.lap("dec_ffn");
@@ -926,13 +951,13 @@ impl Sam3 {
         let pt = lin(m, "det.scoring.prompt_proj.weight")?;
         let pb = load_vec(m, "det.scoring.prompt_proj.bias")?;
         let mut tp = vec![0f32; FD];
-        pt.matmat(&pooled, 1, &mut tp, pool);
+        pt.matmat_dev(&pooled, 1, &mut tp, pool);
         add_bias(&mut tp, FD, &pb);
         let nq = dec.len() / FD;
         let hs = lin(m, "det.scoring.hs_proj.weight")?;
         let hb = load_vec(m, "det.scoring.hs_proj.bias")?;
         let mut q = vec![0f32; nq * FD];
-        hs.matmat(dec, nq, &mut q, pool);
+        hs.matmat_dev(dec, nq, &mut q, pool);
         add_bias(&mut q, FD, &hb);
         let scale = 1.0 / (FD as f32).sqrt();
         Ok(q
@@ -1009,16 +1034,21 @@ impl Sam3 {
             let w = lin(m, &format!("{db}mask_predictor.mask_embed.layers.{i}.weight"))?;
             let b = load_vec(m, &format!("{db}mask_predictor.mask_embed.layers.{i}.bias"))?;
             let mut o = vec![0f32; NQ * FD];
-            w.matmat(&q, NQ, &mut o, pool);
+            w.matmat_dev(&q, NQ, &mut o, pool);
             add_bias(&mut o, FD, &b);
             if i < 2 { o.iter_mut().for_each(|v| *v = v.max(0.0)); }
             q = o;
         }
         tsm.lap("msk_inst_head");
         let hw = MH * MH;
+        let _pe = crate::cpuprof::spans::span("mask.einsum");
+        if let Some(out) = crate::gpu::sam3_mm(&q, &inst, NQ, FD, hw) {
+            drop(_pe);
+            tsm.lap("msk_einsum");
+            return Ok(out);
+        }
         let mut out = vec![0f32; NQ * hw];
         let ob2 = out.as_mut_ptr() as usize;
-        let _pe = crate::cpuprof::spans::span("mask.einsum");
         let run = |s: usize, e: usize| {
             let o = unsafe { std::slice::from_raw_parts_mut(ob2 as *mut f32, NQ * hw) };
             for qi in s..e {
@@ -1114,11 +1144,11 @@ impl DecoderMlp {
     }
     fn forward(&self, x: &[f32], rows: usize, pool: Option<&Pool>, out_w: usize) -> Vec<f32> {
         let mut h = vec![0f32; rows * self.b0.len()];
-        self.w0.matmat(x, rows, &mut h, pool);
+        self.w0.matmat_dev(x, rows, &mut h, pool);
         add_bias(&mut h, self.b0.len(), &self.b0);
         h.iter_mut().for_each(|v| *v = v.max(0.0));
         let mut o = vec![0f32; rows * out_w];
-        self.w1.matmat(&h, rows, &mut o, pool);
+        self.w1.matmat_dev(&h, rows, &mut o, pool);
         add_bias(&mut o, out_w, &self.b1);
         o
     }
@@ -1147,15 +1177,15 @@ impl DecoderMlp3 {
     }
     fn forward(&self, x: &[f32], rows: usize, pool: Option<&Pool>) -> Vec<f32> {
         let mut d = vec![0f32; rows * self.b0.len()];
-        self.w0.matmat(x, rows, &mut d, pool);
+        self.w0.matmat_dev(x, rows, &mut d, pool);
         add_bias(&mut d, self.b0.len(), &self.b0);
         d.iter_mut().for_each(|v| *v = v.max(0.0));
         let mut d2 = vec![0f32; rows * self.b1.len()];
-        self.w1.matmat(&d, rows, &mut d2, pool);
+        self.w1.matmat_dev(&d, rows, &mut d2, pool);
         add_bias(&mut d2, self.b1.len(), &self.b1);
         d2.iter_mut().for_each(|v| *v = v.max(0.0));
         let mut o = vec![0f32; rows * self.b2.len()];
-        self.w2.matmat(&d2, rows, &mut o, pool);
+        self.w2.matmat_dev(&d2, rows, &mut o, pool);
         add_bias(&mut o, self.b2.len(), &self.b2);
         o
     }
@@ -1293,11 +1323,43 @@ fn attn_core_gpu(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
+    if std::env::var("CMF_SAM3_GPU").as_deref() == Ok("0") {
+        return false;
+    }
+    {
+        let (mode, mt): (i32, &[f32]) = match mask {
+            Mask::None => (0, &[]),
+            Mask::Key(km) => (1, km),
+            Mask::Add(am) => (2, am),
+            Mask::Head(hm) => (3, hm),
+        };
+        if n_q * n_k * (dim / heads.max(1)) >= 1 << 20
+            && crate::gpu::sam3_attn_core(qkv_q, k, v, n_q, n_k, dim, heads, mode, mt, scale, out)
+        {
+            return true;
+        }
+        // an unmasked self-attention (the DETR encoder's) on the device's
+        // flash path over head-major planes: Vulkan and Metal
+        let hd = dim / heads.max(1);
+        if mode == 0 && n_q == n_k && hd * heads == dim && n_q * n_k * hd >= 1 << 24 && crate::gpu::enabled_here() {
+            let h3 = dim * 3;
+            let plane = |src: &[f32], off: usize| -> Vec<f32> {
+                let mut p = vec![0f32; heads * n_q * hd];
+                for t in 0..heads {
+                    for i in 0..n_q {
+                        p[(t * n_q + i) * hd..(t * n_q + i + 1) * hd].copy_from_slice(&src[i * h3 + off + t * hd..i * h3 + off + (t + 1) * hd]);
+                    }
+                }
+                p
+            };
+            let (qh, kh, vh) = (plane(qkv_q, 0), plane(k, dim), plane(v, 2 * dim));
+            if crate::gpu::dit_attention(&qh, &kh, &vh, heads, heads, n_q, hd, scale, out) {
+                return true;
+            }
+        }
+    }
     #[cfg(feature = "gpu")]
     {
-        if std::env::var("CMF_SAM3_GPU").as_deref() == Ok("0") {
-            return false;
-        }
         if !crate::gpu::enabled_here() {
             return false;
         }
@@ -1434,20 +1496,20 @@ pub(crate) fn run_attn(
     let _tp = std::time::Instant::now();
     let mut qkv_q = vec![0f32; n_q * h3];
     let _pg = crate::cpuprof::spans::span("attn.gemm");
-    w_qkv.matmat(xs_q, n_q, &mut qkv_q, pool);
+    w_qkv.matmat_dev(xs_q, n_q, &mut qkv_q, pool);
     add_bias(&mut qkv_q, h3, qb);
     let same_k = xs_k.as_ptr() == xs_q.as_ptr();
     let mut kbuf = Vec::new();
     if !same_k {
         kbuf = vec![0f32; n_k * h3];
-        w_qkv.matmat(xs_k, n_k, &mut kbuf, pool);
+        w_qkv.matmat_dev(xs_k, n_k, &mut kbuf, pool);
         add_bias(&mut kbuf, h3, qb);
     }
     let same_v = xs_v.as_ptr() == xs_q.as_ptr();
     let mut vbuf = Vec::new();
     if !same_v {
         vbuf = vec![0f32; n_k * h3];
-        w_qkv.matmat(xs_v, n_k, &mut vbuf, pool);
+        w_qkv.matmat_dev(xs_v, n_k, &mut vbuf, pool);
         add_bias(&mut vbuf, h3, qb);
     }
     drop(_pg);
@@ -1466,7 +1528,7 @@ pub(crate) fn run_attn(
     if attn_core_gpu(&qkv_q, qkv_k, qkv_v, n_q, n_k, dim, heads, mask, scale, &mut attn) {
         ATT_CORE_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _tw = std::time::Instant::now();
-        w_o.matmat(&attn, n_q, out, pool);
+        w_o.matmat_dev(&attn, n_q, out, pool);
         add_bias(out, dim, ob);
         ATT_PROJ_NS.fetch_add(_tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
         return;
@@ -1583,7 +1645,7 @@ pub(crate) fn run_attn(
     let _pg = crate::cpuprof::spans::span("attn.gemm");
     ATT_CORE_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let _tw = std::time::Instant::now();
-    w_o.matmat(&attn, n_q, out, pool);
+    w_o.matmat_dev(&attn, n_q, out, pool);
     add_bias(out, dim, ob);
     ATT_PROJ_NS.fetch_add(_tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
@@ -1609,6 +1671,12 @@ pub(crate) fn conv2d(
     let oh = (h + 2 * pad - kh) / stride + 1;
     let ow = (wid + 2 * pad - kw) / stride + 1;
     let _p = crate::cpuprof::spans::span("op.conv2d");
+    // the device takes the large ones (the transfer outweighs a small one)
+    if co * oh * ow * ci * kh * kw >= 1 << 25
+        && let Some(o) = crate::gpu::sam3_conv2d(w, b, x, ci, h, wid, kh, kw, stride, pad)
+    {
+        return o;
+    }
     let mut out = vec![0f32; co * oh * ow];
     let ob = out.as_mut_ptr() as usize;
     // One output ROW per unit instead of one pixel: the (c, dy, dx)
@@ -1668,6 +1736,11 @@ pub(crate) fn convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid
     debug_assert_eq!(w.len(), ci * co * 4);
     let (oh, ow) = (h * 2, wid * 2);
     let _p = crate::cpuprof::spans::span("op.convt");
+    if co * oh * ow * ci >= 1 << 25
+        && let Some(o) = crate::gpu::sam3_convt2x2(w, b, x, ci, h, wid)
+    {
+        return o;
+    }
     let mut out = vec![0f32; co * oh * ow];
     let ob = out.as_mut_ptr() as usize;
     // Per output row: (kh, kx) = (oy & 1, ox & 1), so even columns take
@@ -1863,16 +1936,23 @@ fn rpb_bias(refs: &[[f32; 4]], rx: &DecoderMlp, ry: &DecoderMlp, n: usize, pool:
     let py = ry.forward(&dy, refs.len() * gh, pool, FH);
     let px = rx.forward(&dx, refs.len() * gh, pool, FH);
     let mut out = vec![0f32; FH * (NQ + 1) * n];
-    for t in 0..FH {
-        for q in 0..refs.len() {
+    let nq = refs.len();
+    let ob = out.as_mut_ptr() as usize;
+    // one (head, query) row of keys a unit, across the pool
+    let fill = |s: usize, e: usize| {
+        let o = unsafe { std::slice::from_raw_parts_mut(ob as *mut f32, FH * (NQ + 1) * n) };
+        for u in s..e {
+            let (t, q) = (u / nq, u % nq);
+            let row = &mut o[(t * (NQ + 1) + (q + 1)) * n..][..n];
             for hi in 0..gh {
+                let y = py[(q * gh + hi) * FH + t];
                 for wi in 0..gh {
-                    out[(t * (NQ + 1) + (q + 1)) * n + hi * gh + wi] =
-                        py[(q * gh + hi) * FH + t] + px[(q * gh + wi) * FH + t];
+                    row[hi * gh + wi] = y + px[(q * gh + wi) * FH + t];
                 }
             }
         }
-    }
+    };
+    match pool { Some(p) => p.run_rows(FH * nq, &fill), None => fill(0, FH * nq) }
     Ok(out)
 }
 

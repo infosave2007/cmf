@@ -41,7 +41,7 @@ pub(crate) fn dense(w: &QTensor, b: &[f32], x: &[f32], rows: usize, pool: Option
     let out_dim = w.rows();
     debug_assert_eq!(out_dim, b.len());
     let mut out = vec![0f32; rows * out_dim];
-    w.matmat(x, rows, &mut out, pool);
+    w.matmat_dev(x, rows, &mut out, pool);
     sam3::add_bias(&mut out, out_dim, b);
     out
 }
@@ -197,13 +197,13 @@ impl<'a> Net<'a> {
 
         let mut q = vec![0f32; nq * int_dim];
         let _pg = crate::cpuprof::spans::span("vid.attn.gemm");
-        wq.matmat(xs_q, nq, &mut q, self.pool);
+        wq.matmat_dev(xs_q, nq, &mut q, self.pool);
         sam3::add_bias(&mut q, int_dim, &bq);
         let mut k = vec![0f32; nk * int_dim];
-        wk.matmat(xs_k, nk, &mut k, self.pool);
+        wk.matmat_dev(xs_k, nk, &mut k, self.pool);
         sam3::add_bias(&mut k, int_dim, &bk);
         let mut v = vec![0f32; nk * int_dim];
-        wv.matmat(xs_v, nk, &mut v, self.pool);
+        wv.matmat_dev(xs_v, nk, &mut v, self.pool);
         sam3::add_bias(&mut v, int_dim, &bv);
         drop(_pg);
 
@@ -231,8 +231,15 @@ impl<'a> Net<'a> {
         dbgw("k_rope", &k);
         let scale = 1.0 / (hd as f32).sqrt();
         let mut res = vec![0f32; nq * int_dim];
-        let rb = res.as_mut_ptr() as usize;
         let _pc = crate::cpuprof::spans::span("vid.attn.core");
+        if dbg_dir.is_none() && nq * nk * hd >= 1 << 20 && crate::gpu::sam3_attn_sep(&q, &k, &v, nq, nk, int_dim, n_heads, scale, &mut res) {
+            drop(_pc);
+            let _pg = crate::cpuprof::spans::span("vid.attn.gemm");
+            wo.matmat_dev(&res, nq, out, self.pool);
+            sam3::add_bias(out, wo.rows(), &ob);
+            return Ok(());
+        }
+        let rb = res.as_mut_ptr() as usize;
         let run = |s: usize, e: usize| {
             if s >= e {
                 return;
@@ -305,7 +312,7 @@ impl<'a> Net<'a> {
         }
         drop(_pc);
         let _pg = crate::cpuprof::spans::span("vid.attn.gemm");
-        wo.matmat(&res, nq, out, self.pool);
+        wo.matmat_dev(&res, nq, out, self.pool);
         sam3::add_bias(out, wo.rows(), &ob);
         Ok(())
     }

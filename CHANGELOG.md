@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.86] — 2026-11-13
+
+### Added
+- SAM3 ([the file](https://huggingface.co/infosave/SAM3-cmf), `cortiq segment`) on the GPU. CUDA: the 32-layer
+  ViT trunk resident (`gpu_cuda/sam3.rs`, `sam3.cu`: LayerNorm, the q|k|v product, its bias and axial rotation
+  into the flash planes with the 24 x 24 windows as groups, `h3_flash2` at head width 64, the erf-GELU MLP), the
+  CLIP text tower resident, the neck's and mask decoder's convolutions and transposed convolutions (K-major
+  im2col, TF32), the attention cores of the detector and the tracker (f32, every mask kind), the mask einsum,
+  and the int8 products through the codec's dense plane on the card past the per-op probe
+  (`QTensor::matmat_dev`: a detector touches each weight once a forward, so the probe never sampled the
+  device). Vulkan (`gpu_wgpu/sam3.rs`): the trunk on `zi_mm`, `zi_dq8` and `vit_flash` with four kernels of its
+  own (LayerNorm, the window-order q|k|v panel with the rotation, the raster-order residual, the erf GELU), and
+  the DETR encoder's self-attention on the device flash path. The text tower's result is kept
+  per prompt, so a video's frames share it. RTX A5000 with a Xeon Gold 6342 (96 threads), release build, one
+  prompt: a 1008 x 1008 image 3.7 s on CUDA and 15.5 s on Vulkan, 46.2 s on the host (0.8.85: CUDA
+  50.2 s, the same host path; Vulkan 78.2 s, slower than the host); an 8-frame video 3.5 s a frame on CUDA,
+  18.6 s on Vulkan, 68.0 s on the host. Masks match the host's pixel for pixel, tracks
+  within a pixel. `CMF_SAM3_CUDA=0` and `CMF_SAM3_WGPU=0` keep the host paths.
+- The CUDA weight store reads the q8_row codec (int8 rows without the column field), which SAM3's detector
+  and trunk use.
+
+### Fixed
+- On CUDA the per-op probe never sampled the device for an int8 product: `q8_resident_or_upload` had no CUDA
+  arm and always answered "not resident". It now builds the dense plane (`h3_plane_ready`), and
+  `q8_matmat_2f` runs on `h3_matmat`.
+
 ## [0.8.85] — 2026-11-13
 
 ### Added
