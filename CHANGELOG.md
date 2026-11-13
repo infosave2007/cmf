@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.91] — 2026-11-13
+
+### Added
+- The CUDA hybrid arm reads int8 weights inside the layers. A q8_2f or q8_row matrix is tiled once on the card
+  (`hy_repack8`) into int8 tiles in the tensor-core kernel's register layout, 16 bytes a lane a group (job
+  kind 5): `hy_mmp_*` turns a byte pair into its bf16x2 register exactly (2^23 + u, one subtraction), takes the
+  row scale as a group's factor and folds the column field into the input fragments, so the product is the
+  int8 weight's own; the prompt path expands the tiles to f16 by bands (`hy_expand_i8r`). A routed MoE layer
+  without a shared expert, and up to two extra rotation tables (a YaRN table's amplitude folded in), no longer
+  decline. Mellum2.1-12B-A2.5B-Thinking (q8_2f attention) and Apex-35B-V1.0 `q4tp-v2` (q8_2f attention and
+  linear-attention projections), which declined on "codec kind 7" and ran op by op on CUDA, now run the whole
+  token graph. RTX A5000, release build, 64 tokens, CUDA against Vulkan on the same card: Mellum2.1 166.4-167.4
+  against 136.3-138.5 tok/s (147.4-148.6 against 126.7 at a 4k depth; the greedy text identical to Vulkan's),
+  Apex-35B 120.3-121.1 against 89.6-92.4 (121.2-121.3 against 98.2 at 4k). On Apex the greedy text parts from
+  the CPU's at the first token, a near tie: the CPU and Vulkan round the input of a q8_2f product to int8, this
+  kernel keeps it at ~17 bits (perplexity over 512 tokens 10.550 against 10.540 / 10.541; Mellum2.1 5.567
+  against 5.568). A 4k-token prompt still reads faster on Vulkan (796 / 738 against 426 / 357 tok/s).
+
+### Fixed
+- CUDA uploads landed late: `cuMemcpyHtoD` from pageable memory returns once the data is staged, its DMA
+  still running on the legacy stream, which the backend's non-blocking stream does not wait for — a kernel
+  launched right after a large upload read its last few percent as they were before (zeros in the tail of a
+  9 MB int8 matrix). Every upload now goes through `htod`, which waits for that DMA.
+
 ## [0.8.90] — 2026-11-13
 
 ### Added
