@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.90] — 2026-11-13
+
+### Added
+- The LFM family on the CUDA hybrid arm, which declined it and ran it per op at 21-32 tok/s: LFM2's gated
+  short convolution (`hy_sconv`: the fused B | C | x projection, the depthwise causal conv over a per-layer ring
+  kept as a recurrent state, the C gate, the out projection), the head-wise output gate of the attention
+  (`hy_head_gate` over a matvec of the normed row, as Spark-X2.5 and LFM3 carry it), a sliding window on the
+  attention's exact mirror (word 7 of the layer's call record; `hy_scores` gives the keys left of it no
+  weight), a second rotation table for the local layers, and a per-layer geometry equal to the call-wide one
+  taken as it. A prompt over such a stack runs the small path 16 rows at a time with direct launches. RTX
+  A5000, release build, 64 tokens, CUDA against Vulkan on the same card: LFM3-1.7B 274.3-282.4 against
+  262.9-267.1 tok/s (the greedy text identical to the CPU's), LFM3-VL-2B 278.4-280.1 against 263.0-273.3,
+  d1-2B 245.0-283.7 against 261.2-263.2 (both texts identical to the CPU's and Vulkan's), LFM2.5-2.6B
+  245.8-246.9 against 128.7-204.8 (the text identical to Vulkan's).
+
 ## [0.8.89] — 2026-11-13
 
 ### Added

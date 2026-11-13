@@ -187,6 +187,8 @@ pub(super) struct HFuncs {
     moe_combine: cs::CUfunction,
     norm_add: cs::CUfunction,
     scale: cs::CUfunction,
+    sconv: cs::CUfunction,
+    head_gate: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -245,6 +247,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         moe_combine: func(module, "hy_moe_combine")?,
         norm_add: func(module, "hy_norm_add")?,
         scale: func(module, "hy_scale")?,
+        sconv: func(module, "hy_sconv")?,
+        head_gate: func(module, "hy_head_gate")?,
     })
 }
 
@@ -776,6 +780,13 @@ struct AttnL {
     late: bool,
     /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
     bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
+    /// A head-wise output gate: its matrix (the dense arm's, any codec) and a
+    /// job table a row, into `hgv`; `hy_head_gate` scales the heads with it.
+    hg: Option<(Arc<DevMat>, Vec<Buf>, u32)>,
+    /// A sliding window (positions a query sees, its own included).
+    window: Option<usize>,
+    /// The rotation of the plan's second (local) table.
+    local: bool,
     ms_in: MmaSet,
     ms_out: MmaSet,
 }
@@ -783,6 +794,19 @@ struct AttnL {
 enum Mix {
     Gdn(GdnL),
     Attn(AttnL),
+    Conv(ConvL),
+}
+
+/// LFM2's gated short convolution: the fused B | C | x projection into the
+/// GDN rows (`qkv`), `hy_sconv` over the layer's ring (kept as a GDN state of
+/// ring only), the out projection.
+struct ConvL {
+    inp: Arc<DevMat>,
+    out: Arc<DevMat>,
+    taps: Arc<Buf>,
+    kernel: usize,
+    ms_in: MmaSet,
+    ms_out: MmaSet,
 }
 
 struct HLayer {
@@ -866,6 +890,8 @@ pub(super) struct HPlan {
     lm: Option<Head>,
     final_norm: Option<Arc<Buf>>,
     invf: Vec<f32>,
+    /// The local layers' rotation (their rows follow the call's in `tab`).
+    invf_local: Option<Vec<f32>>,
     half: usize,
     nh: usize,
     nkv: usize,
@@ -905,6 +931,7 @@ pub(super) struct HPlan {
     nvmax: usize,
     moe: Option<MoeBufs>,
     yo: Buf,
+    hgv: Buf,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -1036,8 +1063,15 @@ fn hsig(
                 }
                 s.extend([*nv, *nk, *dk, *dv, *kk]);
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
                 s.push(2);
+                if let Some(g) = geom {
+                    s.extend([8, g.window.unwrap_or(0)]);
+                }
+                if let Some(g) = head_gate {
+                    s.push(7);
+                    w(&mut s, g);
+                }
                 for g in [wq, wk, wv, wo] {
                     w(&mut s, g);
                 }
@@ -1048,6 +1082,13 @@ fn hsig(
                 for d in bias.map_or([&[][..]; 3], |(a, b, c)| [a, b, c]) {
                     f(&mut s, d);
                 }
+            }
+            GraphAttn::ShortConv { inp, out, taps, kernel, .. } => {
+                s.push(6);
+                w(&mut s, inp);
+                w(&mut s, out);
+                f(&mut s, taps);
+                s.push(*kernel);
             }
             _ => s.push(3),
         }
@@ -1126,6 +1167,7 @@ fn build(
     let mut qrow = nh * hd;
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
+    let mut invf_local: Option<Vec<f32>> = None;
     for (li, l) in layers.iter().enumerate() {
         if l.mhc.is_some() {
             return Err(format!("layer {li}: mHC streams"));
@@ -1153,16 +1195,53 @@ fn build(
                 nvmax = nvmax.max(*nv);
             }
             GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
-                if geom.is_some() {
-                    return Err(format!("layer {li}: an attention geometry of its own"));
+                // a geometry equal to the call-wide one (a stack where only some
+                // layers differ) is the call-wide one, a sliding window aside
+                let same = geom.as_ref().is_none_or(|g| {
+                    g.nkv == nkv
+                        && g.hd == hd
+                        && g.dv == hd
+                        && g.rd == rd
+                        && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
+                        && g.sink.is_none()
+                        && !g.v_norm
+                        && g.dash.is_none()
+                        && g.vres.is_none()
+                        && g.rope_scale == 1.0
+                        && g.invf.len() >= rd / 2
+                        && invf.len() >= rd / 2
+                        && (g.invf[..rd / 2] == invf[..rd / 2] || {
+                            // one second table (the local layers' base) besides the call's
+                            let lt = invf_local.get_or_insert_with(|| g.invf[..rd / 2].to_vec());
+                            lt[..] == g.invf[..rd / 2]
+                        })
+                });
+                if let (false, Some(g)) = (same, geom) {
+                    return Err(format!(
+                        "layer {li}: an attention geometry of its own (nkv {} hd {} dv {} rd {} window {:?} sink {} v-norm {} rope x{} of call nkv {nkv} hd {hd} rd {rd})",
+                        g.nkv,
+                        g.hd,
+                        g.dv,
+                        g.rd,
+                        g.window,
+                        g.sink.is_some(),
+                        g.v_norm,
+                        g.rope_scale
+                    ));
                 }
-                if head_gate.is_some() {
-                    return Err(format!("layer {li}: a head-wise output gate"));
+                if head_gate.is_some() && super::mv_shared_bytes(hidden) > c.max_shared {
+                    return Err(format!("layer {li}: a head-wise output gate over a row wider than shared memory"));
                 }
                 if bias.is_some() && *output_gate {
                     return Err(format!("layer {li}: projection biases beside a gated query"));
                 }
                 qrow = qrow.max(nh * hd * (1 + *output_gate as usize));
+            }
+            GraphAttn::ShortConv { kernel, taps, cpu_state, .. } => {
+                if *kernel == 0 || *kernel > 9 || taps.len() != hidden * kernel || !(cpu_state.is_empty() || cpu_state.len() == (kernel - 1) * hidden) {
+                    return Err(format!("layer {li}: a short convolution of kernel {kernel}"));
+                }
+                cdmax = cdmax.max(3 * hidden);
             }
             _ => return Err(format!("layer {li}: a token mixer the hybrid arm has no kernels for")),
         }
@@ -1208,13 +1287,15 @@ fn build(
     let z = f4(NMAX * vdmax)?;
     let o = f4(NMAX * vdmax)?;
     let of = f4(NMAX * vdmax)?;
-    let tab = f4(NMAX * half * 2)?;
+    // the call's rotation rows, then (a stack with local layers) theirs
+    let tab = f4(NMAX * half * 4)?;
     let ids = f4(NMAX)?;
     let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
-    // a sandwich-normed product's rows before their norm
+    // a sandwich-normed product's rows before their norm; a head gate's logits
     let yo = f4(NMAX * hidden)?;
+    let hgv = f4(NMAX * nh)?;
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
     let moe_bufs = if moe_e > 0 {
         let smax = (NMAX * moe_k).min(moe_e);
@@ -1281,6 +1362,10 @@ fn build(
                 one(wk, nkv * hd, hidden);
                 one(wv, nkv * hd, hidden);
                 one(wo, hidden, nh * hd);
+            }
+            GraphAttn::ShortConv { inp, out, .. } => {
+                one(inp, 3 * hidden, hidden);
+                one(out, hidden, hidden);
             }
             _ => {}
         }
@@ -1442,8 +1527,24 @@ fn build(
                     ms_out,
                 })
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
                 let qr = nh * hd * (1 + *output_gate as usize);
+                let window = geom.as_ref().and_then(|g| g.window);
+                let local = geom.as_ref().is_some_and(|g| invf.len() >= rd / 2 && g.invf.len() >= rd / 2 && g.invf[..rd / 2] != invf[..rd / 2]);
+                let hg = match head_gate {
+                    Some(gw) => {
+                        let m = st.mat(c, model, gw, nh, hidden)?;
+                        let (mut tabs, mut blk) = (Vec::with_capacity(NMAX), 0u32);
+                        for r in 0..NMAX {
+                            let (mut jobs, mut b) = (Vec::new(), 0u32);
+                            super::push_job(&mut jobs, &mut b, &m, hgv.ptr + (r * nh * 4) as u64, 0);
+                            blk = b;
+                            tabs.push(Buf::from_slice(&jobs)?);
+                        }
+                        Some((m, tabs, blk))
+                    }
+                    None => None,
+                };
                 let qm = hmat(c, st, model, wq, qr, hidden)?;
                 let km = hmat(c, st, model, wk, nkv * hd, hidden)?;
                 let vm = hmat(c, st, model, wv, nkv * hd, hidden)?;
@@ -1484,7 +1585,19 @@ fn build(
                     Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, ms_in, ms_out })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, local, ms_in, ms_out })
+            }
+            GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
+                let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
+                let om = hmat(c, st, model, ow, hidden, hidden)?;
+                note(taps);
+                let taps = st.f32_buf(taps)?;
+                let ms_in = mmaset(&[(&im, qkv.ptr, 0, cdmax, 3 * hidden)])?;
+                let ms_out = match l.attn_out_norm {
+                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Conv(ConvL { inp: im, out: om, taps, kernel: *kernel, ms_in, ms_out })
             }
             _ => unreachable!(),
         };
@@ -1560,6 +1673,7 @@ fn build(
         lm,
         final_norm: final_norm_buf,
         invf: invf[..half].to_vec(),
+        invf_local,
         half,
         nh,
         nkv,
@@ -1593,6 +1707,7 @@ fn build(
         nvmax,
         moe: moe_bufs,
         yo,
+        hgv,
     })
 }
 
@@ -1650,6 +1765,15 @@ fn plan_for(
 }
 
 /// (sin, cos) per row and frequency, `[row][pair][2]`, as the host's table.
+/// The call's rotation rows, followed by the local table's when the plan has one.
+fn plan_tab(plan: &HPlan, positions: impl Iterator<Item = usize> + Clone) -> Vec<f32> {
+    let mut t = rope_rows(&plan.invf, positions.clone());
+    if let Some(l) = &plan.invf_local {
+        t.extend(rope_rows(l, positions));
+    }
+    t
+}
+
 fn rope_rows(invf: &[f32], positions: impl Iterator<Item = usize>) -> Vec<f32> {
     let mut tab = Vec::new();
     for p in positions {
@@ -1831,6 +1955,50 @@ fn admit(
                 };
                 let gs = alloc().map_err(soft)?;
                 c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nv)) * 4) as u64, Ordering::Relaxed);
+                st.hyb.gdn.insert(key, gs);
+            }
+            (Mix::Conv(cv), GraphAttn::ShortConv { cpu_state, .. }) => {
+                // the ring rides a GDN state with no recurrent matrix: dims whose
+                // conv width is the hidden one (nv 1, dv hidden, no keys), so the
+                // state helpers size its ring right ([channel][k - 1], the host's)
+                let dims = (1, 0, 0, plan.hidden, cv.kernel);
+                let ring_n = (cv.kernel - 1) * plan.hidden;
+                if let Some(gs) = st.hyb.gdn.get_mut(&key) {
+                    if gs.dims == dims && gs.next_pos == pos0 {
+                        continue;
+                    }
+                    if gs.dims == dims && pos0 == 0 {
+                        unsafe { cu::memset_d8_async(gs.ring.ptr, 0, ring_n.max(1) * 4, c.stream).map_err(|e| soft(derr(e)))? };
+                        gs.next_pos = 0;
+                        gs.tape = None;
+                        continue;
+                    }
+                    return Err((true, format!("short-conv ring of layer {li} is at row {}, the call at {pos0}", gs.next_pos)));
+                }
+                if pos0 > 0 && cpu_state.len() != ring_n {
+                    return Err(soft("short-conv host seed missing for a nonzero position".into()));
+                }
+                let sizes = [1usize, ring_n, 1, 1, 1, 1, ring_n].map(|n| (n.max(1) * 4).next_multiple_of(256));
+                let alloc = || -> Res<GdnState> {
+                    let all = Buf::new(sizes.iter().sum())?;
+                    unsafe { cu::memset_d8_async(all.ptr, 0, all.bytes, c.stream).map_err(derr)? };
+                    let mut at = 0usize;
+                    let mut v = Vec::with_capacity(sizes.len());
+                    for &n in &sizes {
+                        v.push(all.view(at, n));
+                        at += n;
+                    }
+                    let mut v = v.into_iter();
+                    let mut next = || v.next().ok_or("short-conv state views");
+                    let (s, ring, t_qkv, t_cq, t_gb, s_save, ring_save) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
+                    if pos0 > 0 && ring_n > 0 {
+                        unsafe { cu::memcpy_htod_async(ring.ptr, &cpu_state[..ring_n], c.stream).map_err(derr)? };
+                    }
+                    Ok(GdnState { dims, _all: all, s, ring, next_pos: pos0, t_qkv, t_stride: plan.cdmax, t_cq, t_gb, s_save, ring_save, tape: None, snap: None })
+                };
+                let gs = alloc().map_err(soft)?;
+                // the count `reset` takes back for these dims
+                c.kv_bytes.fetch_add(((ring_n * 2 + NMAX * (2 * plan.hidden + 2)) * 4) as u64, Ordering::Relaxed);
                 st.hyb.gdn.insert(key, gs);
             }
             _ => return Err(soft(format!("layer {li}: descriptors changed under the plan"))),
@@ -2035,7 +2203,10 @@ fn book(
             farp.push((0, 0.0, false));
         }
         match &pl.mix {
-            Mix::Gdn(_) => {
+            Mix::Gdn(_) | Mix::Conv(_) => {
+                if tape && matches!(pl.mix, Mix::Conv(_)) {
+                    return Err("a verify window over a short convolution".into());
+                }
                 let gs = st.hyb.gdn.get_mut(&key).ok_or("GDN state missing")?;
                 layers.push([gs.s.ptr, gs.ring.ptr, gs.t_qkv.ptr, gs.t_cq.ptr, gs.t_gb.ptr, gs.s_save.ptr, gs.ring_save.ptr]);
                 gs.next_pos = pos0 + n;
@@ -2095,7 +2266,11 @@ fn book(
                 let rb = attn_rb(keys);
                 let ncap = keys.next_multiple_of(4096);
                 let nbcap = ncap.div_ceil(rb);
-                ci.extend([n0 as i32, n0 as i32, rb as i32, ncap as i32, nbcap as i32, 0, 0, 0]);
+                let win = match &pl.mix {
+                    Mix::Attn(a) => a.window.unwrap_or(0) as i32,
+                    _ => 0,
+                };
+                ci.extend([n0 as i32, n0 as i32, rb as i32, ncap as i32, nbcap as i32, 0, 0, win]);
                 keys_max = keys_max.max(keys);
             }
         }
@@ -2149,6 +2324,19 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
         hst(c, 0, &mut t0)?;
         match &pl.mix {
+            Mix::Conv(cv) => {
+                let ring = lb[1];
+                let (cd_i, k_i, n_i2) = (plan.cdmax as i32, cv.kernel as i32, n as i32);
+                unsafe {
+                    cv.ms_in.run(c, fx, planes, hidden, n)?;
+                    hst(c, 1, &mut t0)?;
+                    c.launch(fx.sconv, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.qkv.ptr, cd_i, cv.taps.ptr, ring, hid_i, k_i, n_i2, pp0, pp1, pp2, ps_i))?;
+                    hst(c, 2, &mut t0)?;
+                    cv.ms_out.run(c, fx, planes, hidden, n)?;
+                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    hst(c, 3, &mut t0)?;
+                }
+            }
             Mix::Gdn(g) => {
                 let [gs_s, gs_ring, t_qkv, t_cq, t_gb, s_save, ring_save] = lb;
                 if plan.nvmax != g.nv {
@@ -2234,6 +2422,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                let tabl = if a.local { tabp + (n * plan.half * 2 * 4) as u64 } else { tabp };
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
                 let nul16 = 0u64;
                 unsafe {
@@ -2258,7 +2447,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         0,
                         kargs!(
                             plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
-                            tabp, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
+                            tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
                         ),
                     )?;
                     // a grid for any record: blocks past the call's keys leave
@@ -2307,6 +2496,15 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         kargs!(p_p, e_p, gate_p, pp0, pp1, pp2, ps_i, n0_i, rb_i, nh_i, nbcap_i, cip),
                     )?;
                     hst(c, 5, &mut t0)?;
+                    if let Some((_, tabs, blk)) = &a.hg {
+                        let (nullp, no_act, zero_g) = (0u64, -1i32, 0i32);
+                        for (r, jt) in tabs.iter().enumerate().take(n) {
+                            let x = plan.xn.ptr + (r * hidden * 4) as u64;
+                            c.launch(c.f.mv_multi, (*blk, 1), 256, super::mv_shared_bytes(hidden), kargs!(jt.ptr, 1i32, x, nullp, no_act, nullp, eps, zero_g, hid_i))?;
+                        }
+                        let (hd_i2, nh_i2, n_i3) = (hd as i32, nh as i32, n as i32);
+                        c.launch(fx.head_gate, ((nh * hd).div_ceil(256) as u32, n as u32), 256, 0, kargs!(pp0, pp1, ps_i, plan.hgv.ptr, nh_i2, hd_i2, n_i3))?;
+                    }
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
                     sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 6, &mut t0)?;
@@ -2466,6 +2664,11 @@ unsafe fn capture(c: &Ctx, f: impl FnOnce() -> Res<()>) -> Res<cs::CUgraphExec> 
 /// `CMF_CUDA_PROF=1`). The rows in `plan.h` and the RoPE table in
 /// `plan.tab` must be on the stream already.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// Set while a long prompt goes through the small path a chunk at a time.
+    static DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 unsafe fn run_small(
     c: &Ctx,
     st: &mut State,
@@ -2486,7 +2689,9 @@ unsafe fn run_small(
         if !bk.ci.is_empty() {
             cu::memcpy_htod_async(plan.ci.ptr, &bk.ci, c.stream).map_err(derr)?;
         }
-        if !graphs_on() {
+        // a prompt read through this path a chunk at a time launches directly:
+        // capturing a graph per chunk shape cost more than the chunk
+        if !graphs_on() || DIRECT.with(|d| d.get()) {
             launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
             if head {
                 head_launch(c, plan, n)?;
@@ -2682,7 +2887,7 @@ pub(super) fn token(
     let mut run = || -> Res<()> {
         unsafe {
             cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
-            let tab = rope_rows(&plan.invf, std::iter::once(position));
+            let tab = plan_tab(&plan, std::iter::once(position));
             if !tab.is_empty() {
                 cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
             }
@@ -2832,6 +3037,10 @@ pub(super) fn mtp_chain(
         }
         Ok(())
     };
+    if plan.invf_local.is_some() {
+        decline("hybrid draft chain", "a stack with local rotations");
+        return Err(false);
+    }
     if let Err(e) = prep(st) {
         decline("hybrid draft chain", &e);
         return Err(false);
@@ -2854,6 +3063,8 @@ pub(super) fn mtp_chain(
         let h0_b = st.scr(c, "hy_chain_h0", hidden * 4)?;
         let tok_b = st.scr(c, "hy_chain_tok", (NMAX + 1) * 4)?;
         let ci: Vec<i32> = books.iter().flat_map(|b| b.ci.iter().copied()).collect();
+        // a launch a position here: the rows of one table (a stack with local
+        // layers is refused before the mirror moves)
         let tab = rope_rows(&plan.invf, position..position + k);
         let ch = st.hyb.chain.as_ref().unwrap();
         let (etab, ecod, epar, enp, hnp) = (ch.emb.w.ptr, ch.emb.aux0(), ch.emb.aux1.as_ref().map_or(0, |b| b.ptr), ch.enorm.ptr, ch.hnorm.ptr);
@@ -3001,7 +3212,11 @@ pub(super) fn batch(
     // a longer prompt goes through it NMAX rows at a time
     // what the prompt path has no kernels for (a routed FFN, sandwich norms, a
     // layer scale) runs the small path
-    let moe = plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some());
+    let moe = plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some() || matches!(l.mix, Mix::Conv(_)) || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.window.is_some()));
+    if spec.is_some() && plan.layers.iter().any(|l| matches!(l.mix, Mix::Conv(_))) {
+        decline("hybrid batch", "a verify window over a short convolution");
+        return BatchGraphOutcome::Declined;
+    }
     // CMF_HYB_MOE_CHUNKS=0: such a long prompt declines (the per-op path)
     let chunks_on = std::env::var("CMF_HYB_MOE_CHUNKS").as_deref() != Ok("0");
     if moe && (prompt_far || (b > NMAX && (spec.is_some() || !chunks_on))) {
@@ -3050,12 +3265,20 @@ pub(super) fn batch(
     let mut spec = spec;
     let mut run = || -> Res<()> {
         if moe && b > NMAX {
+            struct Direct;
+            impl Drop for Direct {
+                fn drop(&mut self) {
+                    DIRECT.with(|d| d.set(false));
+                }
+            }
+            DIRECT.with(|d| d.set(true));
+            let _direct = Direct;
             let mut at = 0usize;
             while at < b {
                 let n = NMAX.min(b - at);
                 unsafe {
                     cu::memcpy_htod_async(plan.h.ptr, &h[at * hidden..(at + n) * hidden], c.stream).map_err(derr)?;
-                    let tab = rope_rows(&plan.invf, positions[at..at + n].iter().copied());
+                    let tab = plan_tab(&plan, positions[at..at + n].iter().copied());
                     if !tab.is_empty() {
                         cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                     }
@@ -3071,7 +3294,7 @@ pub(super) fn batch(
         if b <= NMAX && !prompt_far {
             unsafe {
                 cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
-                let tab = rope_rows(&plan.invf, positions.iter().copied());
+                let tab = plan_tab(&plan, positions.iter().copied());
                 if !tab.is_empty() {
                     cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                 }
@@ -3287,7 +3510,7 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    if plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some()) {
+    if plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some() || matches!(l.mix, Mix::Conv(_)) || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.window.is_some())) {
         return Err("a routed FFN or sandwich norms on the prompt path".into());
     }
     let (gw, _) = prec();
@@ -3307,6 +3530,7 @@ unsafe fn big(
             match &l.mix {
                 Mix::Gdn(g) => v.extend([(g.qkv.rows, g.qkv.cols), (g.z.rows, g.z.cols), (g.out.rows, g.out.cols)]),
                 Mix::Attn(a) => v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]),
+                Mix::Conv(cv) => v.extend([(cv.inp.rows, cv.inp.cols), (cv.out.rows, cv.out.cols)]),
             }
             v
         })
@@ -3374,6 +3598,8 @@ unsafe fn big(
         }
         bst(c, 0, tm)?;
         match &pl.mix {
+            // the prompt path is not entered with such a layer (see its guard)
+            Mix::Conv(_) => return Err("a short convolution on the prompt path".into()),
             Mix::Gdn(g) => {
                 let (cd_i, kk_i, nv_i, nk_i, dk_i, dv_i) =
                     (g.cdim as i32, g.kk as i32, g.nv as i32, g.nk as i32, g.dk as i32, g.dv as i32);

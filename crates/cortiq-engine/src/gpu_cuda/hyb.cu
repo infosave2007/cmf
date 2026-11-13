@@ -399,16 +399,22 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
                                      float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci)
 {
     __shared__ float sm[32][HPK];
+    // an exact mirror's record carries a sliding window in word 7 (word 5 is
+    // the far-field flag of the other records)
+    int win = 0;
     if (ci) {
         n0 = ci[0];
         rb = ci[2];
         ncap = ci[3];
         nbcap = ci[4];
+        if (ci[5] == 0) win = ci[7];
     }
     const int g = blockIdx.y, blk = blockIdx.x, b = blockIdx.z, nh = nkv * HPK;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const int n = n0 + b + 1;
     if (blk * rb >= n) return;
+    // keys left of the window take no weight
+    const int lo = win > 0 ? max(0, n - win) : 0;
     float qv[HPK][DPL];
 #pragma unroll
     for (int j = 0; j < HPK; j++)
@@ -420,6 +426,11 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
     float* Sb = S + (size_t)b * nh * ncap;
     for (int r = row0 + warp; r < row1; r += NW) {
+        if (r < lo) {
+            if (lane == 0)
+                for (int j = 0; j < HPK; j++) Sb[(size_t)(g * HPK + j) * ncap + r] = -INF;
+            continue;
+        }
         const u16* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float kv[DPL];
 #pragma unroll
@@ -1892,4 +1903,53 @@ extern "C" __global__ void hy_scale(float* __restrict__ h, float s, unsigned lon
 {
     const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) h[i] *= s;
+}
+
+
+// LFM2's gated short convolution over n rows in order: y [n][ystride] holds
+// each row's B | C | x (hidden each), the ring [channel][k - 1] (slot 0 the
+// newest) the conv's history; row r's C * (taps . (B x, ring)) goes into the
+// planes the out projection reads, and the ring moves row by row. A thread a
+// channel; k <= 9.
+extern "C" __global__ void hy_sconv(const float* __restrict__ y, int ystride, const float* __restrict__ taps,
+                                    float* __restrict__ ring, int hidden, int k, int n, u16* __restrict__ p0,
+                                    u16* __restrict__ p1, u16* __restrict__ p2, int pstride)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= hidden) return;
+    const int rl = k - 1;
+    float rg[8];
+#pragma unroll
+    for (int s = 0; s < 8; s++) rg[s] = s < rl ? ring[(size_t)ch * rl + s] : 0.0f;
+    const float* t = taps + (size_t)ch * k;
+    for (int r = 0; r < n; r++) {
+        const float* yr = y + (size_t)r * ystride;
+        const float bx = yr[ch] * yr[2 * hidden + ch];
+        float acc = t[k - 1] * bx;
+#pragma unroll
+        for (int s = 0; s < 8; s++)
+            if (s < rl) acc += t[k - 2 - s] * rg[s];
+        put3(p0, p1, p2, (size_t)r * pstride + ch, yr[hidden + ch] * acc);
+#pragma unroll
+        for (int s = 7; s > 0; s--)
+            if (s < rl) rg[s] = rg[s - 1];
+        if (rl > 0) rg[0] = bx;
+    }
+#pragma unroll
+    for (int s = 0; s < 8; s++)
+        if (s < rl) ring[(size_t)ch * rl + s] = rg[s];
+}
+
+
+// Spark-X2.5 / LFM3's head-wise output gate on the attention's output planes
+// (before the O projection): head h of row r times sigmoid(g[r][h]).
+extern "C" __global__ void hy_head_gate(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ g,
+                                        int nh, int hd, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= nh * hd || r >= n) return;
+    const size_t at = (size_t)r * pstride + i;
+    const float v = __fadd_rn(bf2f(p0[at]), bf2f(p1[at]));
+    const float s = 1.0f / (1.0f + expf(-g[(size_t)r * nh + i / hd]));
+    put3(p0, p1, p1, at, __fmul_rn(v, s));
 }
