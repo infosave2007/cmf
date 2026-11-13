@@ -459,7 +459,7 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
 extern "C" __global__ void hy_values(const float* __restrict__ S, const float* __restrict__ Mx,
                                      const u16* __restrict__ Vm, float* __restrict__ P, float* __restrict__ E,
                                      int n0, int r0, int nkv, int rb, int ncap, int nbcap, int B,
-                                     const int* __restrict__ ci)
+                                     const int* __restrict__ ci, const float* __restrict__ sink)
 {
     __shared__ float sp[8][HD];
     // `extra`: a far field's block after the near ones (ci[5])
@@ -484,6 +484,8 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
         float m = -INF;
         for (int q = lane; q < nblk + extra; q += 32) m = fmaxf(m, Mx[((size_t)b * nh + g * HPK + j) * nbcap + q]);
         for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+        // a learned sink logit joins the max (and, block 0, the weights) with no value
+        if (sink) m = fmaxf(m, sink[g * HPK + j]);
         mx[j] = m;
     }
     float acc[HPK][DPL];
@@ -527,6 +529,13 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
     if (tid < HPK) {
         float s = 0.0f;
         for (int w = 0; w < NW; w++) s = __fadd_rn(s, se[w][tid]);
+        if (sink && blk == 0) {
+            float mj = mx[0];
+#pragma unroll
+            for (int j = 1; j < HPK; j++)
+                if (j == tid) mj = mx[j];
+            s = __fadd_rn(s, expf(__fsub_rn(sink[g * HPK + tid], mj)));
+        }
         Eb[(size_t)blk * nh + g * HPK + tid] = s;
     }
 }
@@ -1423,7 +1432,8 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
 // exponentials written as f16 into P (the value GEMM's operand) and each
 // row's 1 / sum into isum.
 extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
-                                        int L, int pos0, int col_base, int hpk, int cols, int istride, int win)
+                                        int L, int pos0, int col_base, int hpk, int cols, int istride, int win,
+                                        const float* __restrict__ sink)
 {
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1442,6 +1452,9 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     __syncthreads();
     m = -INF;
     for (int k = 0; k < NW; k++) m = fmaxf(m, red[k]);
+    // a learned sink logit (head gk * hpk + r % hpk) joins the max and the sum
+    const float sk = sink ? sink[gk * hpk + r % hpk] : -INF;
+    m = fmaxf(m, sk);
     __syncthreads();
     float sum = 0.0f;
     for (int c = tid; c < L; c += T) {
@@ -1458,6 +1471,7 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     if (tid == 0) {
         sum = 0.0f;
         for (int k = 0; k < NW; k++) sum += red[k];
+        if (sink) sum += expf(sk - m);
         isum[(size_t)gk * istride + r] = sum > 0.0f ? 1.0f / sum : 1.0f;
     }
 }

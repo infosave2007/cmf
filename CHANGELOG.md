@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   131.4 tok/s against Vulkan's 99.0 on an RTX A5000 (fast build), a 4096-token prompt 3109 against 177 tok/s
   (first token 1.3 against 23.2 s); the greedy text identical to Vulkan's.
 
+- Learned attention sinks and a rotary width of a layer's own on the CUDA hybrid arm. A sink logit joins the
+  softmax's max and denominator with no value row (`hy_values` on the token graph, `hy_softmax_h` on the
+  prompt path); each extra rotation table keeps its layer's own width (a NoPE layer's is empty), the layer's
+  rotary pairs and table offset passed to `hy_qk`. flint (q2tp; global NoPE layers, sliding RoPE layers of
+  513 with sinks), which ran op by op on CUDA at 4.4 tok/s, decodes at 125.2 tok/s against Vulkan's 72.3 on an
+  RTX A5000 (fast build), a 4096-token prompt 3322 against 149 tok/s (first token 1.23 against 27.5 s) and
+  109.9 against 72.1 tok/s after it; the greedy text identical to the CPU's on both.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):

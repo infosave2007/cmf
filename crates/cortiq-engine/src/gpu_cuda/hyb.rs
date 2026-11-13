@@ -923,6 +923,19 @@ impl PrismPlan {
     }
 }
 
+impl HPlan {
+    /// Floats into `tab` (or the prompt path's copy) where table `local`'s
+    /// rows of `n` positions start: the call's table first, then each other
+    /// one at its own width (`plan_tab`'s order).
+    fn tab_off(&self, local: usize, n: usize) -> usize {
+        if local == 0 {
+            return 0;
+        }
+        let before: usize = self.invf_local[..local - 1].iter().map(|(f, _)| f.len()).sum();
+        n * 2 * (self.half + before)
+    }
+}
+
 /// The Prism boundary on `n` rows of planes (`p0`, `p1`, `stride` a row) of
 /// `width` columns, in place; nothing without a Prism plan.
 unsafe fn prism_planes(c: &Ctx, plan: &HPlan, p0: u64, p1: u64, stride: usize, width: usize, n: usize) -> Res<()> {
@@ -1136,8 +1149,12 @@ struct AttnL {
     hg: Option<(Arc<DevMat>, Vec<Buf>, u32)>,
     /// A sliding window (positions a query sees, its own included).
     window: Option<usize>,
+    /// Learned per-Q-head sink logits (in the softmax, no value row).
+    sink: Option<Arc<Buf>>,
     /// The rotation table of the layer in `tab`: 0 the call's, k the k-th other.
     local: usize,
+    /// The layer's rotary pairs (its table's width).
+    half: usize,
     ms_in: MmaSet,
     ms_out: MmaSet,
 }
@@ -1558,18 +1575,21 @@ fn build(
                     g.nkv == nkv
                         && g.hd == hd
                         && g.dv == hd
-                        && g.rd == rd
+                        && g.rd % 2 == 0
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
-                        && g.sink.is_none()
+                        && g.sink.is_none_or(|s| s.len() == nh)
                         && !g.v_norm
                         && g.dash.is_none()
                         && g.vres.is_none()
-                        && g.invf.len() >= rd / 2
+                        && g.invf.len() >= g.rd / 2
                         && invf.len() >= rd / 2
-                        && ((g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
+                        && ((g.rd == rd && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
                             // up to two more tables besides the call's: other layers'
-                            // bases (local ones), a YaRN amplitude baked into the rows
-                            let key = (g.invf[..rd / 2].to_vec(), g.rope_scale);
+                            // bases (local ones), a YaRN amplitude baked into the rows,
+                            // a rotary width of the layer's own (flint: none on its
+                            // global layers, 128 on the sliding ones), each table as
+                            // wide as its layer's rotation
+                            let key = (g.invf[..g.rd / 2].to_vec(), g.rope_scale);
                             invf_local.contains(&key) || {
                                 invf_local.push(key);
                                 invf_local.len() <= 2
@@ -1652,7 +1672,8 @@ fn build(
     let o = f4(NMAX * vdmax)?;
     let of = f4(NMAX * vdmax)?;
     // the call's rotation rows, then (a stack with other rotations) theirs
-    let tab = f4(NMAX * half * 2 * 3)?;
+    // the call's rotation rows, then each other table's at its own width
+    let tab = f4((NMAX * 2 * (half + invf_local.iter().map(|(f, _)| f.len()).sum::<usize>())).max(1))?;
     let ids = f4(NMAX)?;
     let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
@@ -1930,11 +1951,20 @@ fn build(
             GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
                 let qr = nh * hd * (1 + *output_gate as usize);
                 let window = geom.as_ref().and_then(|g| g.window);
+                let sink = match geom.as_ref().and_then(|g| g.sink) {
+                    Some(s) => {
+                        note(s);
+                        Some(st.f32_buf(s)?)
+                    }
+                    None => None,
+                };
                 let local = geom
                     .as_ref()
-                    .filter(|g| invf.len() >= rd / 2 && g.invf.len() >= rd / 2 && (g.invf[..rd / 2] != invf[..rd / 2] || g.rope_scale != 1.0))
-                    .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..rd / 2] && *s == g.rope_scale))
+                    .filter(|g| g.invf.len() >= g.rd / 2 && !(g.rd == rd && invf.len() >= rd / 2 && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0))
+                    .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..g.rd / 2] && *s == g.rope_scale))
                     .map_or(0, |i| i + 1);
+                // this layer's rotation width (pairs)
+                let lhalf = geom.as_ref().map_or(rd / 2, |g| g.rd / 2);
                 let hg = match head_gate {
                     Some(gw) => {
                         let m = st.mat(c, model, gw, nh, hidden)?;
@@ -1989,7 +2019,7 @@ fn build(
                     Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, local, ms_in, ms_out })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, sink, local, half: lhalf, ms_in, ms_out })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
                 let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
@@ -2832,11 +2862,11 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let w = &bk.ci[ai * 8..ai * 8 + 8];
                 ai += 1;
                 let (n0_i, slot0, rb_i, ncap_i, nbcap_i, r0) = (w[0], w[1], w[2], w[3], w[4], 0i32);
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
-                let tabl = tabp + (a.local * n * plan.half * 2 * 4) as u64;
+                let tabl = tabp + (plan.tab_off(a.local, n) * 4) as u64;
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
                 let nul16 = 0u64;
                 unsafe {
@@ -2895,12 +2925,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                             )?;
                         }
                     }
+                    let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
                     c.launch_3d(
                         fx.values,
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip),
+                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip, sinkp),
                     )?;
                     c.launch(
                         fx.finish,
@@ -4021,7 +4052,7 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some()));
+    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some()));
     if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
         return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
     }
@@ -4211,12 +4242,12 @@ unsafe fn big(
                 // the near rows before the chunk: the sinks with the kept rows,
                 // then the window (unwrapped until it is full)
                 let n0 = ns + win_len;
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 // a local layer's rotation rows follow the call's (`plan_tab`)
-                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
+                let tabl = btab + (plan.tab_off(a.local, b) * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
@@ -4325,12 +4356,12 @@ unsafe fn big(
                     m.stored += b;
                     out
                 };
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 // a local layer's rotation rows follow the call's (`plan_tab`)
-                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
+                let tabl = btab + (plan.tab_off(a.local, b) * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
@@ -4388,7 +4419,8 @@ unsafe fn big(
                     // (the query copy and the exponentials), f32 out
                     unsafe {
                         gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
-                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i))?;
+                        let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i, sinkp))?;
                         gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
