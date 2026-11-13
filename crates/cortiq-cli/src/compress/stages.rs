@@ -1278,6 +1278,12 @@ fn s5_quant(run: &Run) -> Result<()> {
                 q2tp_debias: true,
                 q4tp_debias: false,
                 chunk_layers: 0,
+                channel_scale: 0.0,
+                refine_iters: 0,
+                refine_ridge: 1.0,
+                channel_scale_qkv: false,
+                channel_refit: false,
+                refine_q4tp: false,
             };
             crate::gptq::run_quantize_gptq_tiled(&opts)?;
         }

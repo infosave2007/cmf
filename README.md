@@ -783,7 +783,8 @@ precision while large matrix blocks use a compact codec.
 
 See [Q1T/PTQ](docs/Q1T_PTQ.md) for the experimental low-bit path and the
 [quantization coverage matrix](docs/QUANT_COVERAGE.md) for codec support by
-execution path.
+execution path. The 2-bit recipe with a channel scale and code refinement is in
+[q2tp: channel scale and code refinement](docs/Q2TP_SCALE_REFINE.md).
 
 The `q2tp_affine` profile is an explicit Prism/Bonsai operator, not a
 reinterpretation of ordinary `q2tp`: its signed Hadamard descriptor and affine

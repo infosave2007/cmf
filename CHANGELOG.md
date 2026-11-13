@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `quantize-gptq --codec q2tp`: two steps that cost no bits ([docs](docs/Q2TP_SCALE_REFINE.md)). `--channel-scale
+  ALPHA` (with `--channel-scale-qkv`) multiplies every input channel by `t_j = σ_j^α / rms_j^(1−α)` before the sweep
+  and folds `t` into the RMSNorm gain in front (`post_attention_layernorm` for gate/up, `input_layernorm` for
+  q/k/v): the same function in floating point, checked by `CMF_CHSCALE_FP=1`. `--refine ITERS --refine-ridge
+  LAMBDA` (with `--refine-q4tp` for 4-bit tensors) moves single codes to the adjacent level after GPTQ where the
+  ridge-regularized layer error falls. MiniCPM5-2B at `--channel-scale 0.75 --channel-scale-qkv --refine 256
+  --refine-ridge 0.3`, the same 1.314 GB file and Hessians: WikiText-2 test 28.431 → 26.426 (−7.05 % ± 1.20),
+  validation 28.337 → 26.384, documentation 69.2 → 60.4, Rust source 27.5 → 23.7; the native file on 12 windows
+  26.106 → 23.898. `--channel-refit` (the closed-form input-channel gain of the NVG encoder) is measured to add
+  nothing and stays off.
+- `requant --quant tiled-q8_2f`: a q8_2f copy of a q4tp/q2tp file for scoring on the CPU, 7 times faster than the
+  tiled prefill and 0.4–0.7 % higher in perplexity.
+
 ## [0.8.95] — 2026-11-13
 
 ### Added

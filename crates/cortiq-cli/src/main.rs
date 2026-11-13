@@ -904,7 +904,7 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: blr-q8_2f (every blr tensor expanded to a dense q8_2f weight, for evaluation on the dense paths), q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
+        /// Target layout: tiled-q8_2f (every q4tp/q2tp tensor dequantized to q8_2f, for evaluation on the dense paths), blr-q8_2f (every blr tensor expanded to a dense q8_2f weight, for evaluation on the dense paths), q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
@@ -1486,6 +1486,32 @@ enum Commands {
         /// at 4 bits the shrinkage is ~16× smaller than at 2)
         #[arg(long)]
         q4tp_debias: bool,
+        /// q2tp: fold MACaQ's channel scale `t_j = σ_j^α / rms_j^(1−α)` into
+        /// each layer's gate/up pair and the RMSNorm gain in front of it
+        /// (`W' = W/t`, `H' = tHt`, `γ' = γ·t`: the same function in floating
+        /// point, different rounding noise). 0 = off; the paper uses 0.75
+        #[arg(long, value_name = "ALPHA", default_value = "0")]
+        channel_scale: f64,
+        /// q2tp: after each GPTQ sweep, ITERS rounds of greedy code moves
+        /// c → c±1 (ladders and rungs fixed, one best move per row per round)
+        /// on the ridge-regularized layer error; 0 = off
+        #[arg(long, value_name = "ITERS", default_value = "0")]
+        refine: usize,
+        /// Ridge of the --refine objective, × the mean Hessian diagonal
+        #[arg(long, value_name = "LAMBDA", default_value = "1.0")]
+        refine_ridge: f64,
+        /// q4tp: the --channel-scale also folds into `input_layernorm` and
+        /// the q/k/v group
+        #[arg(long)]
+        channel_scale_qkv: bool,
+        /// q2tp: after the sweep, solve NVG's closed-form input-channel gain
+        /// (least squares on the layer error) and fold it into the norm gain
+        /// on top of --channel-scale
+        #[arg(long)]
+        channel_refit: bool,
+        /// The --refine rounds also run on q4tp tensors (16-level grid)
+        #[arg(long)]
+        refine_q4tp: bool,
     },
     /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), of
     /// DeepSeek-V4.1 (deepseek_v41) or of a Qwen3.5/3.6-MoE stack (Clover
@@ -4908,7 +4934,10 @@ async fn main() -> anyhow::Result<()> {
             allow_tol,
             tol,
         } => {
-            if quant == "blr-q8_2f" {
+            if quant == "tiled-q8_2f" {
+                let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant tiled-q8_2f needs --output"))?;
+                requant::cmd_requant_tiled_q8(&model, out)
+            } else if quant == "blr-q8_2f" {
                 let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant blr-q8_2f needs --output"))?;
                 requant::cmd_requant_blr_q8(&model, out)
             } else if quant == "q1g" {
@@ -5287,10 +5316,19 @@ async fn main() -> anyhow::Result<()> {
             q2tp_rule_tensor,
             q2tp_debias,
             q4tp_debias,
+            channel_scale,
+            refine,
+            refine_ridge,
+            channel_scale_qkv,
+            channel_refit,
+            refine_q4tp,
         } => {
             let codec = codec.to_ascii_lowercase();
-            let q2tp_flags =
-                q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias.is_some();
+            let tiled_flags = channel_scale > 0.0 || refine > 0 || channel_scale_qkv || refine_q4tp;
+            let q2tp_flags = q2tp_rule.is_some()
+                || !q2tp_rule_tensor.is_empty()
+                || q2tp_debias.is_some()
+                || channel_refit;
             let q2tp_debias = match q2tp_debias.as_deref().map(str::to_ascii_lowercase).as_deref() {
                 None | Some("on" | "true" | "1") => true,
                 Some("off" | "false" | "0") => false,
@@ -5332,6 +5370,12 @@ async fn main() -> anyhow::Result<()> {
                         q2tp_debias,
                         q4tp_debias,
                         chunk_layers: calib_chunk_layers,
+                        channel_scale,
+                        refine_iters: refine,
+                        refine_ridge,
+                        channel_scale_qkv,
+                        channel_refit,
+                        refine_q4tp,
                     };
                     gptq::run_quantize_gptq_tiled(&opts)?;
                 }
@@ -5340,6 +5384,7 @@ async fn main() -> anyhow::Result<()> {
                         calib_model.is_none()
                             && tensor_quant.is_empty()
                             && !q2tp_flags
+                            && !tiled_flags
                             && !q4tp_debias
                             && calib_chunk_layers == 0,
                         "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* / --q4tp-debias apply to --codec q4tp|q2tp"

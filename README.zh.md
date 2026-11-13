@@ -565,7 +565,8 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 | `q1`、`q1t`、`q1s` | 训练二值或实验性的三值/PTQ 路径 |
 
 实验性低比特路径见 [Q1T/PTQ](docs/Q1T_PTQ.md)，编码支持矩阵见
-[量化覆盖表](docs/QUANT_COVERAGE.zh.md)。
+[量化覆盖表](docs/QUANT_COVERAGE.zh.md)。带通道缩放和码值精修的 2 比特配方见
+[q2tp：通道缩放与码值精修](docs/Q2TP_SCALE_REFINE.zh.md)。
 
 ## 运行时能力
 
