@@ -25,6 +25,10 @@
 use super::*;
 use crate::gpu::{LtxAttn, LtxChain, LtxLin, LtxSide};
 
+#[path = "sam3.rs"]
+mod sam3;
+pub(crate) use sam3::sam3_trunk;
+
 /// q4tp tensors of a block, in the order `spans` lists them: per stream the
 /// four projections of self-attention, of prompt attention and the two of
 /// the feed-forward, then the four of each fusion direction.

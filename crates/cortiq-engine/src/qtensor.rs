@@ -2077,6 +2077,22 @@ impl QTensor {
         }
     }
 
+    /// `matmat` with the device's dense-plane product tried first, past the
+    /// probe (CUDA: `h3_matmat`, the codec's plane cached on the card): for a
+    /// stack whose every weight is touched once a forward (a detector), where
+    /// the probe never sees a warm weight and keeps the host.
+    pub fn matmat_dev(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
+        if b >= 8
+            && b * self.rows() * self.cols() >= 1 << 24
+            && crate::gpu::enabled_here()
+            && let Self::Mapped { model, idx, .. } = self
+            && crate::gpu::plane_matmat(model, *idx, &xs_all[..b * self.cols()], b, self.rows(), self.cols(), &mut out[..b * self.rows()])
+        {
+            return;
+        }
+        self.matmat(xs_all, b, out, pool)
+    }
+
     pub fn matmat(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         if self.exact_cpu_default() {
             return float_activations_scope(|| self.matmat(xs_all, b, out, pool));

@@ -53,6 +53,9 @@ pub use s2v::s2v_prepare;
 #[path = "s2v_vae.rs"]
 mod s2v_vae;
 pub use s2v_vae::{s2v_vae_decode, s2v_vae_encode, s2v_vae_release};
+#[path = "sam3.rs"]
+mod sam3;
+pub use sam3::{sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk};
 #[path = "primal.rs"]
 mod primal;
 pub use primal::primal_vae_run;
@@ -149,6 +152,10 @@ pub(super) struct H3State {
     /// The kernels of the HunyuanVideo VAE decoder (`s2v_vae.rs`) and its weights.
     hv_funcs: Option<s2v_vae::HvFuncs>,
     hv: Option<s2v_vae::HvDev>,
+    /// The kernels of SAM3's trunk (`sam3.rs`) and one model's weights.
+    sm_funcs: Option<sam3::SmFuncs>,
+    sm: Option<sam3::SmDev>,
+    sm_text: Option<sam3::TxDev>,
 }
 
 impl H3State {
@@ -317,6 +324,8 @@ fn packed(model: &Arc<CmfModel>, idx: usize) -> Res<(u8, usize, usize, &[u8])> {
     let kind = match e.dtype {
         TensorDtype::Q4TiledP => 6u8,
         TensorDtype::Q8_2f => 7u8,
+        // int8 rows without the column field: kind 7's planes with a field of ones
+        TensorDtype::Q8Row => 8u8,
         d => return Err(format!("{}: codec {d:?} has no CUDA plane", e.name)),
     };
     if e.shape.len() != 2 {
@@ -387,7 +396,8 @@ fn host_planes(kind: u8, bytes: &[u8], rows: usize, cols: usize) -> Res<HostPlan
                 return Err("q8_2f width not a multiple of 16".into());
             }
             let body = rows * cols;
-            if bytes.len() < body + rows * 2 + cols * 2 {
+            let field = if kind == 8 { 0 } else { cols * 2 };
+            if bytes.len() < body + rows * 2 + field {
                 return Err("q8_2f payload shorter than its planes".into());
             }
             let f16s = |b: &[u8]| -> Vec<f32> {
@@ -396,7 +406,7 @@ fn host_planes(kind: u8, bytes: &[u8], rows: usize, cols: usize) -> Res<HostPlan
             Ok(HostPlanes::Q8(
                 &bytes[..body],
                 f16s(&bytes[body..body + rows * 2]),
-                f16s(&bytes[body + rows * 2..body + rows * 2 + cols * 2]),
+                if kind == 8 { vec![1.0; cols] } else { f16s(&bytes[body + rows * 2..body + rows * 2 + cols * 2]) },
             ))
         }
     }
@@ -1062,15 +1072,65 @@ unsafe fn matmat(
     cols: usize,
     out: &mut [f32],
 ) -> Res<()> {
-    let key = (model.uid(), idx);
     let (_, r, co, _) = packed(model, idx)?;
     if r != rows || co != cols {
         return Err(format!("tensor is {r}x{co}, the product wants {rows}x{cols}"));
     }
+    let plane = unsafe { plane_of(c, st, model, idx)? };
+    MM_CALLS.fetch_add(1, Ordering::Relaxed);
+    // a chunk of rows at a time: the two activation panels stay bounded
+    let cb = ((192usize << 20) / (rows.max(cols) * 4)).clamp(1, b);
+    let xb = st.h3.buf(c, "mm x", cb * cols * 4)?;
+    let yb = st.h3.buf(c, "mm y", cb * rows * 4)?;
+    let mut b0 = 0usize;
+    while b0 < b {
+        let nb = cb.min(b - b0);
+        unsafe {
+            let t = std::time::Instant::now();
+            cu::memcpy_htod_async(xb, &xs[b0 * cols..(b0 + nb) * cols], c.stream).map_err(derr)?;
+            mm_add(3, t);
+            let t = std::time::Instant::now();
+            c.gemm(true, false, rows, nb, cols, 1.0, plane, cols, xb, cols, 0.0, yb, rows, Gemm::Tf32)?;
+            if prof_on() {
+                c.sync()?;
+            }
+            mm_add(4, t);
+            let t = std::time::Instant::now();
+            cu::memcpy_dtoh_async(&mut out[b0 * rows..(b0 + nb) * rows], yb, c.stream).map_err(derr)?;
+            mm_add(5, t);
+        }
+        b0 += nb;
+    }
+    c.sync()
+}
+
+/// Whether tensor `idx`'s dense plane is on the card for `h3_matmat`; when it
+/// is not and `upload` allows, it is built now (the caller's probe samples the
+/// device on the next touch, not on this cold one).
+pub fn h3_plane_ready(model: &Arc<CmfModel>, idx: usize, upload: bool) -> bool {
+    let Some(c) = ctx() else { return false };
+    if c.current().is_err() || packed(model, idx).is_err() {
+        return false;
+    }
+    let mut st = c.st.lock().unwrap();
+    if st.h3.planes.contains_key(&(model.uid(), idx)) {
+        return true;
+    }
+    if upload && unsafe { plane_of(c, &mut st, model, idx) }.is_err() {
+        let _ = c.sync();
+    }
+    false
+}
+
+/// Tensor `idx`'s dense f32 plane on the card, built (and the least recently
+/// used ones dropped past the cap) when it is not there.
+unsafe fn plane_of(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize) -> Res<u64> {
+    let key = (model.uid(), idx);
+    let (_, rows, cols, _) = packed(model, idx)?;
     st.h3.tick += 1;
     let tick = st.h3.tick;
     let need = (rows * cols * 4 + 64) as u64;
-    let plane = match st.h3.planes.get_mut(&key) {
+    Ok(match st.h3.planes.get_mut(&key) {
         Some((buf, t)) => {
             *t = tick;
             buf.ptr
@@ -1099,32 +1159,7 @@ unsafe fn matmat(
             }
             p
         }
-    };
-    MM_CALLS.fetch_add(1, Ordering::Relaxed);
-    // a chunk of rows at a time: the two activation panels stay bounded
-    let cb = ((192usize << 20) / (rows.max(cols) * 4)).clamp(1, b);
-    let xb = st.h3.buf(c, "mm x", cb * cols * 4)?;
-    let yb = st.h3.buf(c, "mm y", cb * rows * 4)?;
-    let mut b0 = 0usize;
-    while b0 < b {
-        let nb = cb.min(b - b0);
-        unsafe {
-            let t = std::time::Instant::now();
-            cu::memcpy_htod_async(xb, &xs[b0 * cols..(b0 + nb) * cols], c.stream).map_err(derr)?;
-            mm_add(3, t);
-            let t = std::time::Instant::now();
-            c.gemm(true, false, rows, nb, cols, 1.0, plane, cols, xb, cols, 0.0, yb, rows, Gemm::Tf32)?;
-            if prof_on() {
-                c.sync()?;
-            }
-            mm_add(4, t);
-            let t = std::time::Instant::now();
-            cu::memcpy_dtoh_async(&mut out[b0 * rows..(b0 + nb) * rows], yb, c.stream).map_err(derr)?;
-            mm_add(5, t);
-        }
-        b0 += nb;
-    }
-    c.sync()
+    })
 }
 
 /// Full bidirectional attention over head-major f32 planes from the host

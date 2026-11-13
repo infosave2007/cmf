@@ -920,7 +920,7 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
         Backend::Wgpu => crate::gpu_wgpu::q8_resident_or_upload(model, idx, may_upload),
         Backend::None => false,
         #[cfg(feature = "cuda")]
-        Backend::Cuda => false,
+        Backend::Cuda => crate::gpu_cuda::h3_plane_ready(model, idx, may_upload),
     };
     if !resident && may_upload {
         PROBE_UPLOADS.fetch_add(1, Ordering::Relaxed);
@@ -1631,6 +1631,9 @@ pub fn q8_matmat_2f(
         Backend::Wgpu => {
             crate::gpu_wgpu::q8_matmat_2f(model, idx, row_scale, col_field, xs, b, rows, cols, out)
         }
+        // the codec's dense plane on the card (cached while it fits), TF32
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_matmat(model, idx, xs, b, rows, cols, out),
         _ => false,
     }
 }
@@ -6668,6 +6671,121 @@ pub fn s2v_vae_decode(vae: &crate::s2v_vae::S2vVae, z: &crate::ltxvae::Vol) -> O
         Backend::Cuda => crate::gpu_cuda::s2v_vae_decode(vae, z),
         #[allow(unreachable_patterns)]
         _ => None,
+    }
+}
+
+/// SAM3's ViT trunk on the device: the patch rows `[5184][588]` in, the trunk
+/// features `[5184][1024]` out, or `None` for the host trunk.
+#[allow(unused_variables)]
+pub fn sam3_trunk(m: &std::sync::Arc<cortiq_core::CmfModel>, pv: &[f32], pos_skip_cls: bool) -> Option<Vec<f32>> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_trunk(m, pv, pos_skip_cls),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::h3::sam3_trunk(m, pv, pos_skip_cls),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// `out[b][rows] = xs[b][cols] · Wᵀ` for a q4tp / q8_2f container tensor on a
+/// backend that keeps its dense plane on the card (CUDA), past the probe;
+/// `false` elsewhere.
+#[allow(unused_variables)]
+pub fn plane_matmat(model: &Arc<CmfModel>, idx: usize, xs: &[f32], b: usize, rows: usize, cols: usize, out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The tracker's attention core on the device: q `[n_q][dim]`, k and v
+/// `[n_k][dim]`, softmax(q kᵀ · scale) v into `out` `[n_q][dim]`, or `false`.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn sam3_attn_sep(q: &[f32], k: &[f32], v: &[f32], n_q: usize, n_k: usize, dim: usize, heads: usize, scale: f32, out: &mut [f32]) -> bool {
+    if !enabled_here() {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_attn_sep(q, k, v, n_q, n_k, dim, heads, scale, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// `c[m][n] = a[m][k] · b[k][n]` in f32 on the device (SAM3's mask einsum), or `None`.
+#[allow(unused_variables)]
+pub fn sam3_mm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Option<Vec<f32>> {
+    if !enabled_here() {
+        return None;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_mm(a, b, m, k, n),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// SAM3's CLIP text tower on the device: `x` the embedded tokens `[32][1024]`
+/// in, the final LayerNorm's rows out (in place); `cm` the causal + padding
+/// mask `[32][32]`. `false`: `x` untouched.
+#[allow(unused_variables)]
+pub fn sam3_text(m: &Arc<CmfModel>, x: &mut [f32], cm: &[f32]) -> bool {
+    if !enabled_here() {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_text(m, x, cm),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// SAM3's convolutions on the device (zero padding, `sam3::conv2d`'s shapes), or `None`.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn sam3_conv2d(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid: usize, kh: usize, kw: usize, stride: usize, pad: usize) -> Option<Vec<f32>> {
+    if !enabled_here() {
+        return None;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_conv2d(w, b, x, ci, h, wid, kh, kw, stride, pad),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// SAM3's 2 x 2 stride-2 transposed convolution on the device, or `None`.
+#[allow(unused_variables)]
+pub fn sam3_convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid: usize) -> Option<Vec<f32>> {
+    if !enabled_here() {
+        return None;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_convt2x2(w, b, x, ci, h, wid),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// SAM3's attention core over fused q|k|v rows on the device (`mode`: 0 no
+/// mask, 1 key, 2 additive, 3 per head), or `false`.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn sam3_attn_core(q: &[f32], k: &[f32], v: &[f32], n_q: usize, n_k: usize, dim: usize, heads: usize, mode: i32, mask: &[f32], scale: f32, out: &mut [f32]) -> bool {
+    if !enabled_here() {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam3_attn_core(q, k, v, n_q, n_k, dim, heads, mode, mask, scale, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
     }
 }
 

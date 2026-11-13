@@ -369,20 +369,22 @@ fn dev_mat(kind: u8, bytes: &[u8], rows: usize, cols: usize) -> Res<DevMat> {
                 held: bytes.len() as u64,
             })
         }
-        7 => {
+        // 8: int8 rows without the column field (a field of ones)
+        7 | 8 => {
             use cortiq_core::quant::f16_to_f32;
             if cols % 16 != 0 {
                 return Err("q8_2f width not a multiple of 16".into());
             }
             let body = rows * cols;
-            if bytes.len() < body + rows * 2 + cols * 2 {
+            let field = if kind == 8 { 0 } else { cols * 2 };
+            if bytes.len() < body + rows * 2 + field {
                 return Err("q8_2f payload shorter than its planes".into());
             }
             let f16s = |b: &[u8]| -> Vec<f32> {
                 b.chunks_exact(2).map(|p| f16_to_f32(u16::from_le_bytes([p[0], p[1]]))).collect()
             };
             let rs = f16s(&bytes[body..body + rows * 2]);
-            let col = f16s(&bytes[body + rows * 2..body + rows * 2 + cols * 2]);
+            let col = if kind == 8 { vec![1.0; cols] } else { f16s(&bytes[body + rows * 2..body + rows * 2 + cols * 2]) };
             Ok(DevMat {
                 kind: 7,
                 rows,
@@ -877,9 +879,9 @@ mod hyb;
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
 pub use h3::{
-    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
+    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_plane_ready, h3_prof_report, h3_release, h3_resident_bytes,
     flux_vae_chain, h3_te_chain, h3_vae_conv2d, lumina_block, ltx_chain, ltx_vae_chain, moss_chain, primal_vae_run, qi21_prefill, qi21_release,
-    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, zimage_prepare, zimage_release, zimage_step,
+    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, zimage_prepare, zimage_release, zimage_step,
 };
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
