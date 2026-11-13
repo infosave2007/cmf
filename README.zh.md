@@ -112,6 +112,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+## Primal VAE:支持 CUDA(0.8.84)
+
+[Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) 现在也可在 CUDA 上编码和解码，整个前向在显卡上一次运行完成;
+之前 `CMF_GPU=cuda` 时它在主机上运行。在 RTX A5000 上，1024×1024 图像编码用时 0.25 秒，解码用时 0.12 秒
+（主机上为 13.3 秒和 12.9 秒）:
+
+```sh
+CMF_GPU=cuda cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
 ## Z-Image:支持 CUDA(0.8.83)
 
 [Z-Image-Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf) 和 [Z-Image](https://huggingface.co/infosave/Z-Image-cmf)
