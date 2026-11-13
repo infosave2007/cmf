@@ -464,8 +464,9 @@ fn lat_dn_g(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 }
 
 // ── a prompt frame's gate/up by expert, a row a thread: workgroup (256 rows, expert); the thread decodes
-// its row's 16-groups once per tile of 8 picks and keeps the eight sums in registers; x of the tile is staged
-// 256 columns at a time (every lane reads the same x: a broadcast) ──
+// its row's 16-groups once per tile of 8 picks into four vec4 and keeps the picks' sums in two vec4 (no
+// dynamic indexing: nothing spills); x of the tile is staged 256 columns at a time as vec4 (every lane reads
+// the same x: a broadcast). Picks past the tile's count read zeros. ──
 @group(0) @binding(0) var<storage, read>       gr_bank : array<u32>;
 @group(0) @binding(1) var<storage, read>       gr_lab : array<u32>;
 @group(0) @binding(2) var<storage, read>       gr_off : array<u32>;
@@ -473,9 +474,18 @@ fn lat_dn_g(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 @group(0) @binding(4) var<storage, read>       gr_x : array<f32>;
 @group(0) @binding(5) var<storage, read_write> gr_a : array<f32>;
 @group(0) @binding(6) var<uniform>             gr_p : LgG;
-var<workgroup> gr_xt: array<f32, 2048>;   // [8 picks][256]
+var<workgroup> gr_xt: array<vec4<f32>, 512>;   // [8 picks][64 vec4]
 var<workgroup> gr_n: vec2<u32>;
 fn gr_byte(base: u32, i: u32) -> u32 { return (gr_bank[base + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu; }
+fn lat_e4(w: u32, half: u32) -> vec4<f32> {
+    // four E2M1 values from two bytes of `w` (half 0: bytes 0-1, half 1: bytes 2-3), element order kept
+    let b0 = (w >> (16u * half)) & 0xFFu;
+    let b1 = (w >> (16u * half + 8u)) & 0xFFu;
+    return vec4<f32>(lat_e2m1(b0 & 15u), lat_e2m1(b0 >> 4u), lat_e2m1(b1 & 15u), lat_e2m1(b1 >> 4u));
+}
+fn gr_dot16(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, w3: vec4<f32>, xb: u32) -> f32 {
+    return dot(w0, gr_xt[xb]) + dot(w1, gr_xt[xb + 1u]) + dot(w2, gr_xt[xb + 2u]) + dot(w3, gr_xt[xb + 3u]);
+}
 @compute @workgroup_size(256)
 fn lat_gu_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let e = wid.y;
@@ -497,17 +507,19 @@ fn lat_gu_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     let gpr = gr_p.l / 16u;
     for (var pt = 0u; pt < np; pt = pt + 8u) {
         let cnt = min(8u, np - pt);
-        var ag: array<f32, 8>;
-        var au: array<f32, 8>;
-        for (var j = 0u; j < 8u; j = j + 1u) { ag[j] = 0.0; au[j] = 0.0; }
+        var ga = vec4<f32>(0.0);
+        var gz = vec4<f32>(0.0);
+        var ua = vec4<f32>(0.0);
+        var uz = vec4<f32>(0.0);
         for (var k0 = 0u; k0 < gr_p.l; k0 = k0 + 256u) {
             workgroupBarrier();
-            for (var i = lid; i < 8u * 256u; i = i + 256u) {
-                let pp = i >> 8u;
-                var v = 0.0;
+            for (var i = lid; i < 512u; i = i + 256u) {
+                let pp = i >> 6u;
+                var v = vec4<f32>(0.0);
                 if (pp < cnt) {
                     let pick = gr_ord[p0 + pt + pp];
-                    v = gr_x[(pick / gr_p.k) * gr_p.xs + grp * gr_p.l + k0 + (i & 255u)];
+                    let b = (pick / gr_p.k) * gr_p.xs + grp * gr_p.l + k0 + (i & 63u) * 4u;
+                    v = vec4<f32>(gr_x[b], gr_x[b + 1u], gr_x[b + 2u], gr_x[b + 3u]);
                 }
                 gr_xt[i] = v;
             }
@@ -516,41 +528,34 @@ fn lat_gu_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
                 let o = rr * gpr + k0 / 16u + q;
                 let gs = lat_ue4m3(gr_byte(gb + cw, o));
                 let us = lat_ue4m3(gr_byte(ub + cw, o));
-                let gw = vec2<u32>(gr_bank[gb + 2u * o], gr_bank[gb + 2u * o + 1u]);
-                let uw = vec2<u32>(gr_bank[ub + 2u * o], gr_bank[ub + 2u * o + 1u]);
-                var wg: array<f32, 16>;
-                var wu: array<f32, 16>;
-                for (var j = 0u; j < 8u; j = j + 1u) {
-                    let bg = (gw[j >> 2u] >> (8u * (j & 3u))) & 0xFFu;
-                    let bu = (uw[j >> 2u] >> (8u * (j & 3u))) & 0xFFu;
-                    wg[2u * j] = lat_e2m1(bg & 15u);
-                    wg[2u * j + 1u] = lat_e2m1(bg >> 4u);
-                    wu[2u * j] = lat_e2m1(bu & 15u);
-                    wu[2u * j + 1u] = lat_e2m1(bu >> 4u);
-                }
-                for (var pp = 0u; pp < 8u; pp = pp + 1u) {
-                    if (pp < cnt) {
-                        var sg2 = 0.0;
-                        var su2 = 0.0;
-                        let xb = pp * 256u + q * 16u;
-                        for (var j = 0u; j < 16u; j = j + 1u) {
-                            let xv = gr_xt[xb + j];
-                            sg2 = sg2 + wg[j] * xv;
-                            su2 = su2 + wu[j] * xv;
-                        }
-                        ag[pp] = ag[pp] + sg2 * gs;
-                        au[pp] = au[pp] + su2 * us;
-                    }
+                let gx = gr_bank[gb + 2u * o];
+                let gy = gr_bank[gb + 2u * o + 1u];
+                let ux = gr_bank[ub + 2u * o];
+                let uy = gr_bank[ub + 2u * o + 1u];
+                let g0 = lat_e4(gx, 0u) * gs; let g1 = lat_e4(gx, 1u) * gs; let g2 = lat_e4(gy, 0u) * gs; let g3 = lat_e4(gy, 1u) * gs;
+                let u0 = lat_e4(ux, 0u) * us; let u1 = lat_e4(ux, 1u) * us; let u2 = lat_e4(uy, 0u) * us; let u3 = lat_e4(uy, 1u) * us;
+                let xb = q * 4u;
+                ga = ga + vec4<f32>(gr_dot16(g0, g1, g2, g3, xb), gr_dot16(g0, g1, g2, g3, 64u + xb),
+                                    gr_dot16(g0, g1, g2, g3, 128u + xb), gr_dot16(g0, g1, g2, g3, 192u + xb));
+                ua = ua + vec4<f32>(gr_dot16(u0, u1, u2, u3, xb), gr_dot16(u0, u1, u2, u3, 64u + xb),
+                                    gr_dot16(u0, u1, u2, u3, 128u + xb), gr_dot16(u0, u1, u2, u3, 192u + xb));
+                if (cnt > 4u) {
+                    gz = gz + vec4<f32>(gr_dot16(g0, g1, g2, g3, 256u + xb), gr_dot16(g0, g1, g2, g3, 320u + xb),
+                                        gr_dot16(g0, g1, g2, g3, 384u + xb), gr_dot16(g0, g1, g2, g3, 448u + xb));
+                    uz = uz + vec4<f32>(gr_dot16(u0, u1, u2, u3, 256u + xb), gr_dot16(u0, u1, u2, u3, 320u + xb),
+                                        gr_dot16(u0, u1, u2, u3, 384u + xb), gr_dot16(u0, u1, u2, u3, 448u + xb));
                 }
             }
         }
         if (live) {
-            for (var pp = 0u; pp < 8u; pp = pp + 1u) {
-                if (pp < cnt) {
-                    let pick = gr_ord[p0 + pt + pp];
-                    let gv = sg * ag[pp];
-                    gr_a[pick * gr_p.as_ + row] = gv / (1.0 + exp(-gv)) * (su * au[pp]);
-                }
+            let gl = sg * ga;
+            let gh = sg * gz;
+            let al = gl / (1.0 + exp(-gl)) * (su * ua);
+            let ah = gh / (1.0 + exp(-gh)) * (su * uz);
+            for (var pp = 0u; pp < cnt; pp = pp + 1u) {
+                let pick = gr_ord[p0 + pt + pp];
+                let v = select(ah[pp & 3u], al[pp & 3u], pp < 4u);
+                gr_a[pick * gr_p.as_ + row] = v;
             }
         }
     }
@@ -563,9 +568,12 @@ fn lat_gu_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 @group(0) @binding(3) var<storage, read>       dr_a : array<f32>;
 @group(0) @binding(4) var<storage, read_write> dr_y : array<f32>;
 @group(0) @binding(5) var<uniform>             dr_p : LdG;
-var<workgroup> dr_xt: array<f32, 1024>;   // [8 picks][128]
+var<workgroup> dr_xt: array<vec4<f32>, 256>;   // [8 picks][32 vec4]
 var<workgroup> dr_n: vec2<u32>;
 fn dr_byte(base: u32, i: u32) -> u32 { return (dr_bank[base + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu; }
+fn dr_dot16(w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, w3: vec4<f32>, xb: u32) -> f32 {
+    return dot(w0, dr_xt[xb]) + dot(w1, dr_xt[xb + 1u]) + dot(w2, dr_xt[xb + 2u]) + dot(w3, dr_xt[xb + 3u]);
+}
 @compute @workgroup_size(256)
 fn lat_dn_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let e = wid.y;
@@ -584,16 +592,17 @@ fn lat_dn_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     let gpr = dr_p.ff / 16u;
     for (var pt = 0u; pt < np; pt = pt + 8u) {
         let cnt = min(8u, np - pt);
-        var acc: array<f32, 8>;
-        for (var j = 0u; j < 8u; j = j + 1u) { acc[j] = 0.0; }
+        var aa = vec4<f32>(0.0);
+        var az = vec4<f32>(0.0);
         for (var k0 = 0u; k0 < dr_p.ff; k0 = k0 + 128u) {
             workgroupBarrier();
-            for (var i = lid; i < 8u * 128u; i = i + 256u) {
-                let pp = i >> 7u;
-                var v = 0.0;
+            for (var i = lid; i < 256u; i = i + 256u) {
+                let pp = i >> 5u;
+                var v = vec4<f32>(0.0);
                 if (pp < cnt) {
                     let pick = dr_ord[p0 + pt + pp];
-                    v = dr_a[pick * dr_p.as_ + k0 + (i & 127u)];
+                    let b = pick * dr_p.as_ + k0 + (i & 31u) * 4u;
+                    v = vec4<f32>(dr_a[b], dr_a[b + 1u], dr_a[b + 2u], dr_a[b + 3u]);
                 }
                 dr_xt[i] = v;
             }
@@ -601,29 +610,23 @@ fn lat_dn_r(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
             for (var q = 0u; q < 8u; q = q + 1u) {
                 let o = rr * gpr + k0 / 16u + q;
                 let sc = lat_ue4m3(dr_byte(db + cw, o));
-                let ww = vec2<u32>(dr_bank[db + 2u * o], dr_bank[db + 2u * o + 1u]);
-                var w: array<f32, 16>;
-                for (var j = 0u; j < 8u; j = j + 1u) {
-                    let b = (ww[j >> 2u] >> (8u * (j & 3u))) & 0xFFu;
-                    w[2u * j] = lat_e2m1(b & 15u);
-                    w[2u * j + 1u] = lat_e2m1(b >> 4u);
-                }
-                for (var pp = 0u; pp < 8u; pp = pp + 1u) {
-                    if (pp < cnt) {
-                        var s2 = 0.0;
-                        let xb = pp * 128u + q * 16u;
-                        for (var j = 0u; j < 16u; j = j + 1u) { s2 = s2 + w[j] * dr_xt[xb + j]; }
-                        acc[pp] = acc[pp] + s2 * sc;
-                    }
+                let wx = dr_bank[db + 2u * o];
+                let wy = dr_bank[db + 2u * o + 1u];
+                let w0 = lat_e4(wx, 0u) * sc; let w1 = lat_e4(wx, 1u) * sc; let w2 = lat_e4(wy, 0u) * sc; let w3 = lat_e4(wy, 1u) * sc;
+                let xb = q * 4u;
+                aa = aa + vec4<f32>(dr_dot16(w0, w1, w2, w3, xb), dr_dot16(w0, w1, w2, w3, 32u + xb),
+                                    dr_dot16(w0, w1, w2, w3, 64u + xb), dr_dot16(w0, w1, w2, w3, 96u + xb));
+                if (cnt > 4u) {
+                    az = az + vec4<f32>(dr_dot16(w0, w1, w2, w3, 128u + xb), dr_dot16(w0, w1, w2, w3, 160u + xb),
+                                        dr_dot16(w0, w1, w2, w3, 192u + xb), dr_dot16(w0, w1, w2, w3, 224u + xb));
                 }
             }
         }
         if (live) {
-            for (var pp = 0u; pp < 8u; pp = pp + 1u) {
-                if (pp < cnt) {
-                    let pick = dr_ord[p0 + pt + pp];
-                    dr_y[pick * dr_p.ys + row] = sd * acc[pp];
-                }
+            for (var pp = 0u; pp < cnt; pp = pp + 1u) {
+                let pick = dr_ord[p0 + pt + pp];
+                let v = select(az[pp & 3u], aa[pp & 3u], pp < 4u);
+                dr_y[pick * dr_p.ys + row] = sd * v;
             }
         }
     }
