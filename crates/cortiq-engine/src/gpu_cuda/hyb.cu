@@ -2779,3 +2779,135 @@ extern "C" __global__ void hy_expand_q4gr(const uint2* __restrict__ T, const u16
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }
+
+// ---------------------------------------------------------- mHC streams
+//
+// SenseNova-Loop's manifold hyper-connections (`sensenova::Mhc`): inside the
+// range the residual is `ns` streams R [row][ns][dim]. Before a sub-layer
+// `hy_mhc_route` RMS-normalizes a row's streams, takes the router's `out`
+// logits, and writes the sub-layer's input h = pre_scale * sum_s pre_s R_s
+// and the merge coefficients (post_i, then mix_ij, Sinkhorn-normalized);
+// after it `hy_mhc_merge` makes R_i = sum_j mix_ij R_j + post_i y.
+// `hy_mhc_enter` copies h into every stream, `hy_mhc_leave` takes their mean.
+
+extern "C" __global__ void hy_mhc_enter(const float* __restrict__ h, float* __restrict__ R, int ns, int dim)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (e >= dim) return;
+    const float v = h[(size_t)r * dim + e];
+    for (int s = 0; s < ns; s++) R[((size_t)r * ns + s) * dim + e] = v;
+}
+
+extern "C" __global__ void hy_mhc_leave(const float* __restrict__ R, float* __restrict__ h, int ns, int dim)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (e >= dim) return;
+    float v = 0.0f;
+    for (int s = 0; s < ns; s++) v = __fadd_rn(v, R[((size_t)r * ns + s) * dim + e]);
+    h[(size_t)r * dim + e] = __fdiv_rn(v, (float)ns);
+}
+
+// The router's logits of a row's streams: a block a (logit k, row), the
+// streams' RMS and the k-th row of W against them; L[row][24].
+extern "C" __global__ void hy_mhc_logits(const float* __restrict__ R, const float* __restrict__ W, float* __restrict__ L, int ns,
+                                         int dim)
+{
+    __shared__ float red[2][32];
+    const int k = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const int n = ns * dim;
+    const float* Rr = R + (size_t)r * n;
+    const float* Wk = W + (size_t)k * n;
+    float s2 = 0.0f, d = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float x = Rr[i];
+        s2 = fmaf(x, x, s2);
+        d = fmaf(Wk[i], x, d);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s2 += __shfl_xor_sync(FULL, s2, o);
+        d += __shfl_xor_sync(FULL, d, o);
+    }
+    if (lane == 0) {
+        red[0][warp] = s2;
+        red[1][warp] = d;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double ss = 0.0, dd = 0.0;
+        for (int w = 0; w < NW; w++) {
+            ss += (double)red[0][w];
+            dd += (double)red[1][w];
+        }
+        L[(size_t)r * 24 + k] = (float)(dd / sqrt(ss / (double)n + 1e-6));
+    }
+}
+
+// A block a row: the logits (`hy_mhc_logits`) plus the bias into pre, post
+// and the Sinkhorn mix; the sub-layer's input rows into h.
+extern "C" __global__ void hy_mhc_route(const float* __restrict__ R, const float* __restrict__ L, const float* __restrict__ bvec,
+                                        float* __restrict__ h, float* __restrict__ coef, int ns, int dim, int out, int iters,
+                                        int fixed, float pre_scale)
+{
+    __shared__ float pre_s[4];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* Rr = R + (size_t)r * ns * dim;
+    float* cr = coef + (size_t)r * 20;
+    if (tid == 0) {
+        float l[24];
+        for (int k = 0; k < out; k++) l[k] = L[(size_t)r * 24 + k] + bvec[k];
+        for (int s = 0; s < ns; s++) {
+            pre_s[s] = 1.0f / (1.0f + expf(-l[s]));
+            cr[s] = 2.0f / (1.0f + expf(-l[ns + s]));
+        }
+        // Sinkhorn in the log domain, f32 (a 4 x 4: the f64 exp / log of the
+        // host's took 159 us a call on the card)
+        float m[4][4];
+        for (int i = 0; i < ns; i++)
+            for (int j = 0; j < ns; j++) m[i][j] = fixed ? 0.0f : l[2 * ns + i * ns + j];
+        if (!fixed) {
+            for (int it = 0; it < iters; it++) {
+                for (int i = 0; i < ns; i++) {
+                    float mx = -3.0e38f;
+                    for (int j = 0; j < ns; j++) mx = fmaxf(mx, m[i][j]);
+                    float se = 0.0f;
+                    for (int j = 0; j < ns; j++) se += expf(m[i][j] - mx);
+                    const float lse = mx + logf(se);
+                    for (int j = 0; j < ns; j++) m[i][j] -= lse;
+                }
+                for (int j = 0; j < ns; j++) {
+                    float mx = -3.0e38f;
+                    for (int i = 0; i < ns; i++) mx = fmaxf(mx, m[i][j]);
+                    float se = 0.0f;
+                    for (int i = 0; i < ns; i++) se += expf(m[i][j] - mx);
+                    const float lse = mx + logf(se);
+                    for (int i = 0; i < ns; i++) m[i][j] -= lse;
+                }
+            }
+        }
+        for (int i = 0; i < ns; i++)
+            for (int j = 0; j < ns; j++) cr[4 + i * 4 + j] = fixed ? (i == j ? 1.0f : 0.0f) : expf(m[i][j]);
+    }
+    __syncthreads();
+    for (int e = tid; e < dim; e += blockDim.x) {
+        float v = 0.0f;
+        for (int s = 0; s < ns; s++) v = fmaf(pre_s[s], Rr[s * dim + e], v);
+        h[(size_t)r * dim + e] = __fmul_rn(v, pre_scale);
+    }
+}
+
+extern "C" __global__ void hy_mhc_merge(float* __restrict__ R, const float* __restrict__ y, const float* __restrict__ coef, int ns,
+                                        int dim)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (e >= dim) return;
+    const float* cr = coef + (size_t)r * 20;
+    float* Rr = R + (size_t)r * ns * dim;
+    float t[4];
+    const float yv = y[(size_t)r * dim + e];
+    for (int i = 0; i < ns; i++) {
+        float v = __fmul_rn(cr[i], yv);
+        for (int j = 0; j < ns; j++) v = fmaf(cr[4 + i * 4 + j], Rr[j * dim + e], v);
+        t[i] = v;
+    }
+    for (int i = 0; i < ns; i++) Rr[i * dim + e] = t[i];
+}

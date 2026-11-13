@@ -182,6 +182,11 @@ pub(super) struct HFuncs {
     expand_q2: cs::CUfunction,
     repack4t: cs::CUfunction,
     expand_q4g: cs::CUfunction,
+    mhc_enter: cs::CUfunction,
+    mhc_leave: cs::CUfunction,
+    mhc_route: cs::CUfunction,
+    mhc_logits: cs::CUfunction,
+    mhc_merge: cs::CUfunction,
     prism_p: cs::CUfunction,
     prism_h: cs::CUfunction,
     qk: cs::CUfunction,
@@ -262,6 +267,11 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         expand_q1t: func(module, "hy_expand_q1tr")?,
         repack2: func(module, "hy_repack2")?,
         repack4t: func(module, "hy_repack4t")?,
+        mhc_enter: func(module, "hy_mhc_enter")?,
+        mhc_leave: func(module, "hy_mhc_leave")?,
+        mhc_route: func(module, "hy_mhc_route")?,
+        mhc_logits: func(module, "hy_mhc_logits")?,
+        mhc_merge: func(module, "hy_mhc_merge")?,
         expand_q4g: func(module, "hy_expand_q4gr")?,
         expand_q2: func(module, "hy_expand_q2r")?,
         prism_p: func(module, "hy_prism_p")?,
@@ -1216,6 +1226,31 @@ struct ConvL {
     ms_out: MmaSet,
 }
 
+/// A layer's mHC routers (`sensenova::Mhc`): the attention's and the FFN's
+/// weights [out][ns·hidden] and biases, whether the layer enters / leaves the
+/// streams.
+struct MhcL {
+    aw: Arc<Buf>,
+    ab: Arc<Buf>,
+    fw: Arc<Buf>,
+    fb: Arc<Buf>,
+    out: usize,
+    enter: bool,
+    leave: bool,
+}
+
+/// The stack's mHC streams: their count, Sinkhorn iterations, branch scale,
+/// and the call's rows of streams and merge coefficients.
+struct MhcPlan {
+    ns: usize,
+    iters: usize,
+    pre_scale: f32,
+    r: Buf,
+    coef: Buf,
+    /// The router's logits [row][24] (`hy_mhc_logits`).
+    lg: Buf,
+}
+
 struct HLayer {
     mix: Mix,
     /// gate and up as one pair (`hmat_pair`); a routed FFN's shared expert
@@ -1230,6 +1265,8 @@ struct HLayer {
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
     moe: Option<MoeL>,
+    /// SenseNova-Loop's mHC routers around both sub-layers.
+    mhc: Option<MhcL>,
     /// Gemma's sandwich norms (the mixer's and the FFN's output normed before
     /// their residual adds: the products then write `yo`) and layer scalar.
     attn_out: Option<Arc<Buf>>,
@@ -1308,6 +1345,8 @@ pub(super) struct HPlan {
     prism: Option<PrismPlan>,
     /// The widest head of the stack (a layer of its own geometry).
     hdmax: usize,
+    /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
+    mhc: Option<MhcPlan>,
     /// A Looped Transformer: the layers after which the final norm is applied
     /// to the stream (`loop_norm_at`), and its weights.
     loop_norm: Vec<usize>,
@@ -1602,9 +1641,27 @@ fn build(
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
     let mut invf_local: Vec<(Vec<f32>, f32)> = Vec::new();
+    // SenseNova-Loop's mHC: the streams' count (from the router's shape), its
+    // Sinkhorn iterations and the branch scale, one for the stack
+    let mut mhc_geo: Option<(usize, usize, f32)> = None;
     for (li, l) in layers.iter().enumerate() {
-        if l.mhc.is_some() {
-            return Err(format!("layer {li}: mHC streams"));
+        if let Some(m) = &l.mhc {
+            let out = m.attn_b.len();
+            let ns = if out > 0 { m.attn_w.len() / (out * hidden).max(1) } else { 0 };
+            let ok = (1..=4).contains(&ns)
+                && (out == 2 * ns + ns * ns || out == 2 * ns)
+                && out <= 24
+                && m.attn_w.len() == out * ns * hidden
+                && m.ffn_b.len() == out
+                && m.ffn_w.len() == out * ns * hidden
+                && !matches!(l.ffn, GraphFfn::Moe { .. })
+                && l.attn_out_norm.is_none()
+                && l.ffn_out_norm.is_none();
+            let geo = (ns, m.iters, m.pre_scale);
+            if !ok || mhc_geo.is_some_and(|g| g != geo) {
+                return Err(format!("layer {li}: mHC streams of a shape the kernels do not take"));
+            }
+            mhc_geo = Some(geo);
         }
         let sandwich = l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some();
         if sandwich && !matches!(l.ffn, GraphFfn::Dense { .. }) {
@@ -1986,9 +2043,10 @@ fn build(
                 let a_h = half_of(&am, st)?;
                 let b_h = half_of(&bm, st)?;
                 let ms_in = mmaset(&[(&qm, qkv.ptr, 0, cdmax, cdim), (&zm, z.ptr, 0, vdmax, nv * dv)])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
                 Mix::Gdn(GdnL {
                     qkv: qm,
@@ -2095,9 +2153,10 @@ fn build(
                     (&km, k.ptr, 0, nkv * hd, nkv * hd),
                     (&vm, v.ptr, 0, nkv * hd, nkv * hd),
                 ])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
                 Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out })
             }
@@ -2107,9 +2166,10 @@ fn build(
                 note(taps);
                 let taps = st.f32_buf(taps)?;
                 let ms_in = mmaset(&[(&im, qkv.ptr, 0, cdmax, 3 * hidden)])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
                 Mix::Conv(ConvL { inp: im, out: om, taps, kernel: *kernel, ms_in, ms_out })
             }
@@ -2120,7 +2180,7 @@ fn build(
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
-            _ if l.ffn_out_norm.is_some() => mmaset(&[(&dm, yo.ptr, 0, hidden, hidden)])?,
+            _ if l.ffn_out_norm.is_some() || l.mhc.is_some() => mmaset(&[(&dm, yo.ptr, 0, hidden, hidden)])?,
             _ => mmaset(&[(&dm, h.ptr, h.ptr, hidden, hidden)])?,
         };
         let mut sw = |w: Option<&[f32]>, st: &mut State| -> Res<Option<Arc<Buf>>> {
@@ -2134,7 +2194,24 @@ fn build(
         };
         let attn_out = sw(l.attn_out_norm, st)?;
         let ffn_out = sw(l.ffn_out_norm, st)?;
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
+        let mhc = match &l.mhc {
+            Some(m) => {
+                for d in [m.attn_w, m.attn_b, m.ffn_w, m.ffn_b] {
+                    note(d);
+                }
+                Some(MhcL {
+                    aw: st.f32_buf(m.attn_w)?,
+                    ab: st.f32_buf(m.attn_b)?,
+                    fw: st.f32_buf(m.ffn_w)?,
+                    fb: st.f32_buf(m.ffn_b)?,
+                    out: m.attn_b.len(),
+                    enter: m.enter,
+                    leave: m.leave,
+                })
+            }
+            None => None,
+        };
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, mhc, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
     let loop_w = if loop_norm.is_empty() {
         None
@@ -2206,6 +2283,10 @@ fn build(
         hdmax,
         loop_norm: loop_norm.to_vec(),
         loop_w,
+        mhc: match mhc_geo {
+            Some((ns, iters, pre_scale)) => Some(MhcPlan { ns, iters, pre_scale, r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
+            None => None,
+        },
         own_geom: hdmax != hd || kvmax != nkv * hd,
         half,
         nh,
@@ -2856,6 +2937,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
     for (li, pl) in plan.layers.iter().enumerate() {
         let lb = bk.layers[li];
         unsafe {
+            // SenseNova-Loop: the attention's input from the mHC streams
+            sub_in(c, fx, plan, pl, false, n)?;
             c.launch(
                 fx.rmsnorm2,
                 (hidden.div_ceil(1024) as u32, n as u32),
@@ -2878,7 +2961,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     c.launch(fx.sconv, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.qkv.ptr, cd_i, cv.taps.ptr, ring, hid_i, k_i, n_i2, pp0, pp1, pp2, ps_i))?;
                     hst(c, 2, &mut t0)?;
                     cv.ms_out.run(c, fx, planes, hidden, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 3, &mut t0)?;
                 }
             }
@@ -2952,7 +3035,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     hst(c, 2, &mut t0)?;
                     prism_planes(c, plan, pp0, pp1, plan.pstride, cols, n)?;
                     g.ms_out.run(c, fx, planes, cols, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 3, &mut t0)?;
                 }
             }
@@ -3058,7 +3141,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     }
                     prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 6, &mut t0)?;
                 }
             }
@@ -3067,6 +3150,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             let nullp = 0u64;
             // a routed FFN also wants the normed rows in f32 (the router's input)
             let xn32 = if pl.moe.is_some() { plan.xn.ptr } else { nullp };
+            sub_in(c, fx, plan, pl, true, n)?;
             c.launch(
                 fx.rmsnorm2,
                 (hidden.div_ceil(1024) as u32, n as u32),
@@ -3092,7 +3176,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 prism_planes(c, plan, mid.p0, mid.p1, mid.stride, pl.inter, n)?;
                 pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
             }
-            sandwich_add(c, fx, plan, pl.ffn_out.as_deref(), n)?;
+            sub_out(c, fx, plan, pl, true, n)?;
             if let Some(s) = pl.layer_scale {
                 let tot = (n * hidden) as u64;
                 c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.h.ptr, s, tot))?;
@@ -3125,6 +3209,45 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
     }
     Ok(())
+}
+
+/// A sub-layer's product in `yo` into the residual: a sandwich norm's add, or
+/// the mHC streams' merge (and, after the range's last FFN, the stream back
+/// as their mean); nothing when the product went to the stream.
+unsafe fn sub_out(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
+    match (&pl.mhc, &plan.mhc) {
+        (Some(m), Some(mp)) => {
+            let (ns_i, hid_i) = (mp.ns as i32, plan.hidden as i32);
+            let grid = (plan.hidden.div_ceil(256) as u32, n as u32);
+            unsafe {
+                c.launch(fx.mhc_merge, grid, 256, 0, kargs!(mp.r.ptr, plan.yo.ptr, mp.coef.ptr, ns_i, hid_i))?;
+                if ffn && m.leave {
+                    c.launch(fx.mhc_leave, grid, 256, 0, kargs!(mp.r.ptr, plan.h.ptr, ns_i, hid_i))?;
+                }
+            }
+            Ok(())
+        }
+        _ => unsafe { sandwich_add(c, fx, plan, if ffn { pl.ffn_out.as_deref() } else { pl.attn_out.as_deref() }, n) },
+    }
+}
+
+/// The mHC routing before a sub-layer: entering the range (the attention of
+/// its first layer) the streams take the stream's rows, then the router
+/// writes the sub-layer's input rows into the stream and the merge
+/// coefficients.
+unsafe fn sub_in(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
+    let (Some(m), Some(mp)) = (&pl.mhc, &plan.mhc) else { return Ok(()) };
+    let (ns_i, hid_i) = (mp.ns as i32, plan.hidden as i32);
+    unsafe {
+        if !ffn && m.enter {
+            c.launch(fx.mhc_enter, (plan.hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(plan.h.ptr, mp.r.ptr, ns_i, hid_i))?;
+        }
+        let (w, b) = if ffn { (&m.fw, &m.fb) } else { (&m.aw, &m.ab) };
+        let (out_i, it_i, fixed_i) = (m.out as i32, mp.iters as i32, (m.out == 2 * mp.ns) as i32);
+        // the logits a block each, then the coefficients and the input rows
+        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(mp.r.ptr, w.ptr, mp.lg.ptr, ns_i, hid_i))?;
+        c.launch(fx.mhc_route, (n as u32, 1), 256, 0, kargs!(mp.r.ptr, mp.lg.ptr, b.ptr, plan.h.ptr, mp.coef.ptr, ns_i, hid_i, out_i, it_i, fixed_i, mp.pre_scale))
+    }
 }
 
 /// A sandwich norm's add: the product's rows in `yo`, normed with `w`, onto
@@ -3181,6 +3304,7 @@ fn small_only(l: &HLayer) -> bool {
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
     (l.moe.is_some() && l.ffn_out.is_some())
+        || l.mhc.is_some()
         || matches!(l.mix, Mix::Conv(_))
         || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
 }
@@ -3628,7 +3752,7 @@ pub(super) fn mtp_chain(
         }
         Ok(())
     };
-    if !plan.invf_local.is_empty() || plan.own_geom {
+    if !plan.invf_local.is_empty() || plan.own_geom || plan.mhc.is_some() {
         decline("hybrid draft chain", "a stack with local rotations or a layer head geometry of its own");
         return Err(false);
     }

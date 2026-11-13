@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.2 tok/s, decodes at 68.5 tok/s against Vulkan's 61.7 on an RTX A5000 (fast build); its greedy text
   identical to the CPU's. Its prompt still goes the pipeline's chunked path.
 
+- SenseNova-Loop's mHC streams on the CUDA hybrid arm: the residual as up to four streams around both sub-layers,
+  the router's logits a block each (`hy_mhc_logits`), its sigmoids and log-domain Sinkhorn mix (`hy_mhc_route`,
+  which writes the sub-layer's input rows), the merge after it (`hy_mhc_merge`), the streams' entry and mean
+  (`hy_mhc_enter`, `hy_mhc_leave`); a sub-layer's product goes apart from the stream. SenseNova-Loop-9B, which ran
+  op by op on CUDA at 4.4 tok/s, decodes at 48.9 tok/s against Vulkan's 35.5 on an RTX A5000 (fast build); the
+  greedy text identical to the CPU's. Its long prompts take the small path 16 rows at a time.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
