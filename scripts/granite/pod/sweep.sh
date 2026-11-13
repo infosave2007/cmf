@@ -19,7 +19,7 @@ while read -r repo file; do
   for be in cuda 1; do cmp -s out/${tag}_cpu.txt out/${tag}_run_$be.txt && echo "$be text == CPU" || echo "$be text != CPU"; done
   for i in 1 2; do
     for be in cuda 1; do
-      echo "$be bench $i: $(flock gpu.lock env CMF_GPU=$be timeout 900 bin/cortiq bench cmf/$file --tokens 64 --json 2>/dev/null | grep -oE '(decode_tok_s_steady|prefill_tok_s).: *[0-9.]*' | tr '\n' ' ')"
+      echo "$be bench $i: $(flock gpu.lock env CMF_GPU=$be timeout 900 bin/cortiq bench cmf/$file --tokens 64 ${BENCH_ARGS:-} --json 2>/dev/null | grep -oE '(decode_tok_s_steady|prefill_tok_s).: *[0-9.]*' | tr '\n' ' ')"
     done
   done
   [ "${DEL:-0}" = 1 ] && rm -f cmf/$file
