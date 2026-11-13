@@ -872,6 +872,12 @@ const T_LSO: u8 = 169;
 const T_LOFF: u8 = 166;
 const T_LORD: u8 = 167;
 
+/// `CMF_QWEN_LAT_ROWS_ALL=1`: the row-a-thread kernels for decode frames too.
+fn rows_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_LAT_ROWS_ALL").as_deref() == Ok("1"))
+}
+
 /// The expert kernels of a prompt frame (`CMF_QWEN_LAT_GROUPED`): `rows` (default) sorts the picks by expert and
 /// gives every thread one row decoded once for up to eight picks; `tiles` the shared-memory tiles (on the RTX PRO
 /// 6000 a 4K prompt read at 380 tok/s); `0` the per-pick kernels of a decode step (445 tok/s).
@@ -951,7 +957,7 @@ pub(super) fn encode(
     }
     if !skip("lat_x") {
     // a prompt frame: the picks sorted by expert, every expert's rows read once per tile of 32 picks
-    if nt > TMAX && grouped_mode() != 0 {
+    if (nt > TMAX && grouped_mode() != 0) || rows_all() {
         let off = tbuf_exact(c, T_LOFF, (ne + 1) * 4 / TROWS + 4, false);
         let ord = tbuf_exact(c, T_LORD, k * 4, false);
         let (pk, o1, o2) = (picks.clone(), off.clone(), ord.clone());
@@ -965,7 +971,7 @@ pub(super) fn encode(
             || vec![pk, o1, o2, uniform_u32x4(c, [ne as u32, (nt * k) as u32, 0, 0])],
             (1, 1, 1),
         );
-        let rows_mode = grouped_mode() == 2;
+        let rows_mode = grouped_mode() == 2 || rows_all();
         let (bk, lb, o1, o2, xx, aa) = (lat.bank.clone(), lat.labels.clone(), off.clone(), ord.clone(), xl.clone(), act.clone());
         dispatch(
             c,
