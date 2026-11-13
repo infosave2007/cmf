@@ -952,6 +952,28 @@ pub(crate) struct GptqTiledOpts<'a> {
     /// Capture this many layers per calibration pass (0 = all at once):
     /// bounds the Hessian RAM at the price of one forward per pass.
     pub chunk_layers: usize,
+    /// `--channel-scale ALPHA` (0 = off): fold a per-input-channel scale
+    /// `t_j = σ_j^α / rms_j^(1−α)` (σ_j the column RMS of the stacked
+    /// weights, rms_j the calibration RMS of the input) into the gate/up
+    /// pair and the RMSNorm gain in front of it. `W' = W·diag(1/t)`,
+    /// `H' = diag(t)·H·diag(t)`, `γ' = γ⊙t`: the same function in floating
+    /// point, different rounding noise. Only q2tp gate/up groups.
+    pub channel_scale: f64,
+    /// `--refine ITERS` (0 = off): after each q2tp sweep, greedy code moves
+    /// c → c±1 (ladder and rungs fixed), one best move per row per
+    /// iteration, on `r·(H + ridge·mean(diag H)·I)·rᵀ`, `r = Ŵ − W`.
+    pub refine_iters: usize,
+    /// Ridge of the refinement objective (× the mean Hessian diagonal).
+    pub refine_ridge: f64,
+    /// `--refine-q4tp`: the refinement also runs on q4tp tensors (16 levels).
+    pub refine_q4tp: bool,
+    /// `--channel-scale-qkv`: the channel scale also folds into
+    /// `input_layernorm` and the q/k/v group (q4tp tensors).
+    pub channel_scale_qkv: bool,
+    /// `--channel-refit`: after the sweep, NVG's closed-form input-channel
+    /// gain `g` (least squares on the layer's real output error, folded into
+    /// the norm gain on top of the channel scale) for the gate/up pair.
+    pub channel_refit: bool,
 }
 
 impl GptqTiledOpts<'_> {
@@ -1607,6 +1629,13 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
     let results = std::sync::Mutex::new(Vec::<(usize, TensorDtype, Vec<u8>)>::new());
     let n_gptq = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::<String>::new());
+    // Norm tensor name → the channel scale folded into its gain.
+    let chscale_folds = std::sync::Mutex::new(std::collections::HashMap::<String, Vec<f32>>::new());
+    let refine_log = std::sync::Mutex::new(Vec::<(String, RefineStats)>::new());
+    anyhow::ensure!(
+        !(o.channel_scale > 0.0 && o.act_order),
+        "--channel-scale does not combine with --act-order"
+    );
     for (lo, hi, slots) in &chunks {
         let missed_before = no_hessian.len();
         let cache = o.hessians.map(|p| {
@@ -1718,8 +1747,18 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         // q4tp (natural order) is folded and swept there by one thread
         // (`gpu::gptq_fold_dev`); CMF_GPTQ_GPU_FOLD=0 keeps the host fold.
         let dev_fold = std::env::var("CMF_GPTQ_GPU_FOLD").as_deref() != Ok("0") && !o.act_order;
+        // A group the channel scale or the code refinement touches is folded
+        // and swept on the host (both read the Hessian there); every other
+        // group keeps the device path.
+        let host_only = |g: &HGroup| {
+            let quants: Vec<Quant> = g.slots.iter().map(|&s| quant_of(&model.tensors[s].name)).collect();
+            (o.channel_scale > 0.0 && chscale_norm_for(&model, g, &quants, o.channel_scale_qkv).is_some())
+                || (o.refine_iters > 0
+                    && (quants.contains(&Quant::Q2TiledP) || (o.refine_q4tp && quants.contains(&Quant::Q4TiledP))))
+        };
         let on_device = |g: &HGroup| {
             dev_fold
+                && !host_only(g)
                 && matches!(g.src, HSrc::Device(_))
                 && g.slots.iter().all(|&s| {
                     let name = &model.tensors[s].name;
@@ -1744,7 +1783,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         // sweep (`inner` threads each).
         let host_group = |gi: usize, inner: usize| {
                         let grp = &groups[gi];
-                        let h = match grp.take_h() {
+                        let mut h = match grp.take_h() {
                             Ok(h) => h,
                             Err(e) => {
                                 failed.lock().unwrap().push(format!("group {gi}: {e}"));
@@ -1752,12 +1791,89 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                             }
                         };
                         let n = grp.cols;
-                        let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
                         let quants: Vec<Quant> =
                             grp.slots.iter().map(|&s| quant_of(&model.tensors[s].name)).collect();
-                        let keep_h = ((o.q2tp_debias && quants.contains(&Quant::Q2TiledP))
-                            || (o.q4tp_debias && quants.contains(&Quant::Q4TiledP)))
+                        // Channel scale: fold t into the weights, the Hessian
+                        // and (after the loop) the norm gain in front.
+                        let mut preload: Vec<Vec<f32>> = Vec::new();
+                        if o.channel_scale > 0.0
+                            && let Some(norm) = chscale_norm_for(&model, grp, &quants, o.channel_scale_qkv)
+                        {
+                            let mut ws = Vec::with_capacity(grp.slots.len());
+                            let mut colsq = vec![0f64; n];
+                            let mut rows_total = 0usize;
+                            let mut ok = true;
+                            for &slot in &grp.slots {
+                                let entry = &model.tensors[slot];
+                                let mut w = vec![0f32; entry.shape[0] * n];
+                                if let Err(e) = dequant_tensor(entry, model.entry_bytes(entry), &mut w) {
+                                    failed.lock().unwrap().push(format!("{}: {e}", entry.name));
+                                    ok = false;
+                                    break;
+                                }
+                                for row in w.chunks_exact(n) {
+                                    for (a, &x) in colsq.iter_mut().zip(row) {
+                                        *a += (x as f64) * (x as f64);
+                                    }
+                                }
+                                rows_total += entry.shape[0];
+                                ws.push(w);
+                            }
+                            if !ok {
+                                return;
+                            }
+                            let hd: Vec<f64> = (0..n).map(|i| h[i * n + i]).collect();
+                            let t = chscale_vector(&hd, &colsq, rows_total, o.channel_scale);
+                            let (tmin, tmax) = t.iter().fold((f32::MAX, 0f32), |(a, b), &v| (a.min(v), b.max(v)));
+                            for i in 0..n {
+                                let ti = t[i] as f64;
+                                for (x, &tj) in h[i * n..(i + 1) * n].iter_mut().zip(&t) {
+                                    *x *= ti * tj as f64;
+                                }
+                            }
+                            for w in &mut ws {
+                                for row in w.chunks_exact_mut(n) {
+                                    for (x, &tj) in row.iter_mut().zip(&t) {
+                                        *x /= tj;
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "\n  channel scale {norm}: t in [{tmin:.3}, {tmax:.3}] (α = {})",
+                                o.channel_scale
+                            );
+                            chscale_folds.lock().unwrap().insert(norm, t);
+                            preload = ws;
+                        }
+                        let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
+                        let keep_h = (((o.q2tp_debias || o.refine_iters > 0) && quants.contains(&Quant::Q2TiledP))
+                            || ((o.q4tp_debias || (o.refine_q4tp && o.refine_iters > 0)) && quants.contains(&Quant::Q4TiledP)))
                         .then(|| h.clone());
+                        let n_pre = preload.len();
+                        if std::env::var("CMF_CHSCALE_FP").as_deref() == Ok("1") {
+                            // Function-identity check: no fold, no sweep — every
+                            // tensor of the group goes out as f16, the channel-
+                            // scaled ones with W/t, so the whole file must score
+                            // as the unquantized model.
+                            for (si, &slot) in grp.slots.iter().enumerate() {
+                                let entry = &model.tensors[slot];
+                                let mut w = if si < n_pre {
+                                    std::mem::take(&mut preload[si])
+                                } else {
+                                    let mut w = vec![0f32; entry.shape[0] * entry.shape[1]];
+                                    if let Err(e) = dequant_tensor(entry, model.entry_bytes(entry), &mut w) {
+                                        failed.lock().unwrap().push(format!("{}: {e}", entry.name));
+                                        continue;
+                                    }
+                                    w
+                                };
+                                let bytes: Vec<u8> = w.drain(..).flat_map(|x| f32_to_f16(x).to_le_bytes()).collect();
+                                results.lock().unwrap().push((slot, TensorDtype::F16, bytes));
+                                n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return;
+                        }
                         let perm = o.act_order.then(|| act_order_perm(&hdiag));
                         let (u, dead) = match &perm {
                             Some(p) => {
@@ -1768,20 +1884,45 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                             }
                             None => gptq_fold_operator_par(h, n, o.lambda, inner),
                         };
-                        for (&slot, &q) in grp.slots.iter().zip(&quants) {
+                        // channel-refit: the q2tp members wait for the group's gain.
+                        let mut pending: Vec<(usize, Vec<u8>, Vec<f32>)> = Vec::new();
+                        let refit = o.channel_refit && n_pre > 0 && keep_h.is_some();
+                        for (si, (&slot, &q)) in grp.slots.iter().zip(&quants).enumerate() {
                             let entry = &model.tensors[slot];
                             let (rows, cols) = (entry.shape[0], entry.shape[1]);
-                            let mut w = vec![0f32; rows * cols];
-                            if let Err(e) = dequant_tensor(entry, model.entry_bytes(entry), &mut w) {
-                                failed.lock().unwrap().push(format!("{}: {e}", entry.name));
-                                continue;
-                            }
+                            let w = if si < preload.len() {
+                                std::mem::take(&mut preload[si])
+                            } else {
+                                let mut w = vec![0f32; rows * cols];
+                                if let Err(e) = dequant_tensor(entry, model.entry_bytes(entry), &mut w) {
+                                    failed.lock().unwrap().push(format!("{}: {e}", entry.name));
+                                    continue;
+                                }
+                                w
+                            };
                             let out = match (q, &perm) {
                                 (Quant::Q4TiledP, _) => {
                                     let mut b = match &perm {
                                         Some(p) => gptq_quantize_q4tp_act_order(&w, rows, cols, &u, &dead, p, inner),
                                         None => gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
                                     };
+                                    if o.refine_q4tp
+                                        && o.refine_iters > 0
+                                        && perm.is_none()
+                                        && let Some(h) = &keep_h
+                                    {
+                                        let st = q4tp_refine_codes(
+                                            &mut b,
+                                            &w,
+                                            rows,
+                                            cols,
+                                            h,
+                                            o.refine_ridge,
+                                            o.refine_iters,
+                                            inner,
+                                        );
+                                        refine_log.lock().unwrap().push((entry.name.clone(), st));
+                                    }
                                     if o.q4tp_debias
                                         && let Some(h) = &keep_h
                                     {
@@ -1802,6 +1943,25 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                         perm.as_deref(),
                                         inner,
                                     );
+                                    if o.refine_iters > 0
+                                        && let Some(h) = &keep_h
+                                    {
+                                        let st = q2tp_refine_codes(
+                                            &mut b,
+                                            &w,
+                                            rows,
+                                            cols,
+                                            h,
+                                            o.refine_ridge,
+                                            o.refine_iters,
+                                            inner,
+                                        );
+                                        refine_log.lock().unwrap().push((entry.name.clone(), st));
+                                    }
+                                    if refit {
+                                        pending.push((slot, b, w));
+                                        continue;
+                                    }
                                     if o.q2tp_debias
                                         && let Some(h) = &keep_h
                                     {
@@ -1814,6 +1974,43 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                             n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             eprint!("\r  gptq {k}/{n_chunk}  {:.0}s   ", t0.elapsed().as_secs_f64());
+                        }
+                        if !pending.is_empty() {
+                            // NVG's closed-form input-channel gain on the finished codes.
+                            let h = keep_h.as_ref().expect("refit needs the Hessian");
+                            let shapes: Vec<usize> = pending.iter().map(|p| model.tensors[p.0].shape[0]).collect();
+                            let deq: Vec<Vec<f32>> = pending
+                                .iter()
+                                .zip(&shapes)
+                                .map(|(p, &r)| {
+                                    let mut d = vec![0f32; r * n];
+                                    cortiq_core::quant::dequant_q2tp(&p.1, r, n, &mut d);
+                                    d
+                                })
+                                .collect();
+                            let tg: Vec<&[f32]> = pending.iter().map(|p| p.2.as_slice()).collect();
+                            let qd: Vec<&[f32]> = deq.iter().map(|d| d.as_slice()).collect();
+                            let (gain, e0, e1) = channel_refit_gain(&tg, &qd, n, h, inner);
+                            eprintln!("\n  channel refit: gain in [{:.3}, {:.3}], layer error {:.4e} → {:.4e} ({:.2}%)",
+                                gain.iter().cloned().fold(f32::MAX, f32::min),
+                                gain.iter().cloned().fold(0f32, f32::max), e0, e1, (e1 / e0 - 1.0) * 100.0);
+                            drop(deq);
+                            for (slot, mut b, w) in pending {
+                                let rows = model.tensors[slot].shape[0];
+                                if o.q2tp_debias {
+                                    q2tp_debias_gemm_scaled(&mut b, &w, rows, n, h, Some(&gain), inner);
+                                }
+                                results.lock().unwrap().push((slot, TensorDtype::Q2TiledP, b));
+                                n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some(norm) = chscale_norm_for(&model, grp, &quants, false) {
+                                if let Some(t) = chscale_folds.lock().unwrap().get_mut(&norm) {
+                                    for (x, &g) in t.iter_mut().zip(&gain) {
+                                        *x *= g;
+                                    }
+                                }
+                            }
                         }
         };
         std::thread::scope(|s| {
@@ -1915,6 +2112,27 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             dequant_tensor(entry, model.entry_bytes(entry), &mut w)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
             crate::convert::quantize_2d(quant_of(&entry.name), &w, entry.shape[0], entry.shape[1])
+        } else if let Some(t) = chscale_folds.lock().unwrap().remove(&entry.name) {
+            // γ' = γ ⊙ t: the norm in front of a channel-scaled group.
+            let n = entry.shape.iter().product::<usize>();
+            anyhow::ensure!(n == t.len(), "{}: gain length {n} ≠ scale length {}", entry.name, t.len());
+            let src = model.entry_bytes(entry);
+            let data = match entry.dtype {
+                TensorDtype::F16 => (0..n)
+                    .flat_map(|i| {
+                        let g = f16_to_f32(u16::from_le_bytes([src[2 * i], src[2 * i + 1]]));
+                        f32_to_f16(g * t[i]).to_le_bytes()
+                    })
+                    .collect::<Vec<u8>>(),
+                TensorDtype::F32 => (0..n)
+                    .flat_map(|i| {
+                        let g = f32::from_le_bytes(src[4 * i..4 * i + 4].try_into().unwrap());
+                        (g * t[i]).to_le_bytes()
+                    })
+                    .collect::<Vec<u8>>(),
+                other => anyhow::bail!("{}: cannot fold a channel scale into a {other:?} norm gain", entry.name),
+            };
+            (entry.dtype, data)
         } else {
             (entry.dtype, model.entry_bytes(entry).to_vec())
         };
@@ -1924,6 +2142,37 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             shape: entry.shape.clone(),
             data,
         });
+    }
+    {
+        let left = chscale_folds.lock().unwrap();
+        anyhow::ensure!(
+            left.is_empty(),
+            "channel scale computed for norms that were not rewritten: {:?}",
+            left.keys().collect::<Vec<_>>()
+        );
+    }
+    {
+        let log = refine_log.lock().unwrap();
+        if !log.is_empty() {
+            let (mut mv, mut b, mut a, mut bp, mut ap) = (0usize, 0f64, 0f64, 0f64, 0f64);
+            for (_, s) in log.iter() {
+                mv += s.moves;
+                b += s.obj_before;
+                a += s.obj_after;
+                bp += s.plain_before;
+                ap += s.plain_after;
+            }
+            eprintln!(
+                "refine: {} tensors, {mv} code moves; r·H_f·rᵀ {:.4e} → {:.4e} ({:.2}%), r·H·rᵀ {:.4e} → {:.4e} ({:.2}%)",
+                log.len(),
+                b,
+                a,
+                (a / b - 1.0) * 100.0,
+                bp,
+                ap,
+                (ap / bp - 1.0) * 100.0
+            );
+        }
     }
     for (slot, dtype, data) in results.into_inner().unwrap() {
         let entry = &model.tensors[slot];
@@ -1975,6 +2224,22 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
     }
     if o.q4tp_debias {
         gptq["q4tp_debias"] = serde_json::json!(true);
+    }
+    if o.channel_scale > 0.0 {
+        gptq["channel_scale"] = serde_json::json!(o.channel_scale);
+    }
+    if o.refine_iters > 0 {
+        gptq["refine_iters"] = serde_json::json!(o.refine_iters);
+        gptq["refine_ridge"] = serde_json::json!(o.refine_ridge);
+    }
+    if o.channel_scale_qkv {
+        gptq["channel_scale_qkv"] = serde_json::json!(true);
+    }
+    if o.channel_refit {
+        gptq["channel_refit"] = serde_json::json!(true);
+    }
+    if o.refine_q4tp {
+        gptq["refine_q4tp"] = serde_json::json!(true);
     }
     if o.calib.len() > 1 {
         if let Some(used) = &calib_used {
@@ -2917,6 +3182,279 @@ fn q2_trailing_impl(w: &mut [f32], rb: usize, cols: usize, e: &[f32], b0: usize,
     }
 }
 
+/// The RMSNorm gain a channel scale of this Hessian group folds into: the
+/// group must be exactly one layer's q2tp `gate_proj` + `up_proj` (the only
+/// readers of `post_attention_layernorm`'s output), and the gain an f16/f32
+/// vector of the input width.
+fn chscale_norm_for(
+    model: &cortiq_core::format::CmfModel,
+    grp: &HGroup,
+    quants: &[crate::convert::Quant],
+    qkv: bool,
+) -> Option<String> {
+    use cortiq_core::types::TensorDtype;
+    if qkv && grp.slots.len() == 3 && quants.iter().all(|&q| q == crate::convert::Quant::Q4TiledP) {
+        // q/k/v read `input_layernorm`'s output (and nothing else does).
+        let names: Vec<&str> = grp.slots.iter().map(|&s| model.tensors[s].name.as_str()).collect();
+        let prefix = names[0].strip_suffix(".self_attn.q_proj.weight")
+            .or_else(|| names[0].strip_suffix(".self_attn.k_proj.weight"))
+            .or_else(|| names[0].strip_suffix(".self_attn.v_proj.weight"))?;
+        for part in ["q_proj", "k_proj", "v_proj"] {
+            let want = format!("{prefix}.self_attn.{part}.weight");
+            if !names.iter().any(|n| *n == want) {
+                return None;
+            }
+        }
+        let norm = format!("{prefix}.input_layernorm.weight");
+        let e = model.tensors.iter().find(|e| e.name == norm)?;
+        let ok = matches!(e.dtype, TensorDtype::F16 | TensorDtype::F32) && e.shape.iter().product::<usize>() == grp.cols;
+        return ok.then_some(norm);
+    }
+    // The gate/up pair, both 2-bit or both 4-bit tiled.
+    let tiled = |q: crate::convert::Quant| matches!(q, crate::convert::Quant::Q2TiledP | crate::convert::Quant::Q4TiledP);
+    if grp.slots.len() != 2 || !quants.iter().all(|&q| tiled(q)) {
+        return None;
+    }
+    let (a, b) = (&model.tensors[grp.slots[0]].name, &model.tensors[grp.slots[1]].name);
+    let (ga, ua) = (a.strip_suffix(".mlp.gate_proj.weight"), a.strip_suffix(".mlp.up_proj.weight"));
+    let (gb, ub) = (b.strip_suffix(".mlp.gate_proj.weight"), b.strip_suffix(".mlp.up_proj.weight"));
+    let prefix = match (ga, ub, ua, gb) {
+        (Some(p), Some(q), _, _) if p == q => p,
+        (_, _, Some(p), Some(q)) if p == q => p,
+        _ => return None,
+    };
+    let norm = format!("{prefix}.post_attention_layernorm.weight");
+    let e = model.tensors.iter().find(|e| e.name == norm)?;
+    let ok = matches!(e.dtype, TensorDtype::F16 | TensorDtype::F32) && e.shape.iter().product::<usize>() == grp.cols;
+    ok.then_some(norm)
+}
+
+/// MACaQ's channel scale for a weight-only quantizer: `t_j = σ_j^α /
+/// rms_j^(1−α)`, `σ_j` the RMS of weight column `j` over all stacked rows,
+/// `rms_j` the RMS of the calibration input (`√H_jj` — the constant `1/√N`
+/// drops out in the normalization). The weights become `W/t` and the
+/// inputs `t⊙x`; `t` is normalized to unit geometric mean over the live
+/// channels (so the folded norm gain keeps its range) and clamped to
+/// `[1e-3, 1e3]`. Dead channels (`H_jj = 0` or an all-zero column) get 1.
+fn chscale_vector(hdiag: &[f64], colsq: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
+    let n = hdiag.len();
+    let mut lt = vec![f64::NAN; n];
+    let (mut sum, mut cnt) = (0f64, 0usize);
+    for j in 0..n {
+        let sigma = (colsq[j] / rows as f64).sqrt();
+        let rms = hdiag[j].max(0.0).sqrt();
+        if sigma > 0.0 && rms > 0.0 {
+            let l = alpha * sigma.ln() - (1.0 - alpha) * rms.ln();
+            lt[j] = l;
+            sum += l;
+            cnt += 1;
+        }
+    }
+    let gm = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+    lt.iter()
+        .map(|&l| if l.is_nan() { 1.0 } else { (l - gm).clamp(-6.9078, 6.9078).exp() as f32 })
+        .collect()
+}
+
+/// What [`q2tp_refine_codes`] did to one tensor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefineStats {
+    pub moves: usize,
+    /// `Σ_rows r·H_f·rᵀ` before / after (the refined objective).
+    pub obj_before: f64,
+    pub obj_after: f64,
+    /// The same with the plain Hessian (`H`, no ridge).
+    pub plain_before: f64,
+    pub plain_after: f64,
+}
+
+/// Greedy code refinement of a finished q2tp tensor (MACaQ's Flip-Refinement
+/// on our ladder). Ladders and rungs stay; a move shifts one weight to the
+/// adjacent level, `Δ = ±s_group`. Per row, `r = Ŵ − W`, `g = H_f·r` with
+/// `H_f = H + ridge·mean(diag H)·I`; a move on column `j` changes
+/// `r·H_f·rᵀ` by `2Δ·g_j + Δ²·H_f[j,j]`. Each iteration applies the most
+/// negative one (none → the row is done) and updates `g += Δ·H_f[:, j]`.
+/// Dead channels (`H_jj = 0`) are left alone. Rows are independent and each
+/// is handled by one thread in a fixed order, so the bytes do not depend on
+/// the thread count (up to the f32 GEMM that seeds `g`). The output debias
+/// should run afterwards.
+#[allow(clippy::too_many_arguments)]
+pub fn q2tp_refine_codes(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    ridge: f64,
+    iters: usize,
+    threads: usize,
+) -> RefineStats {
+    tiled_refine_codes(bytes, w0, rows, cols, h, ridge, iters, threads, true)
+}
+
+/// [`q2tp_refine_codes`] on the 16-level grid of a q4tp tensor (`(c − 8)·s`).
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_refine_codes(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    ridge: f64,
+    iters: usize,
+    threads: usize,
+) -> RefineStats {
+    tiled_refine_codes(bytes, w0, rows, cols, h, ridge, iters, threads, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tiled_refine_codes(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    ridge: f64,
+    iters: usize,
+    threads: usize,
+    two_bit: bool,
+) -> RefineStats {
+    use cortiq_core::quant::{Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_code, q4tp_sections};
+    // Bytes per group, weights per byte, bits per code, level offset, top code.
+    let (cb, wpb, bits, off, maxc) = if two_bit { (Q2TP_CHUNK, 4usize, 2u32, 1.5f32, 3u8) } else { (Q4TP_NIB, 2usize, 4u32, 8.0f32, 15u8) };
+    let mask = (1u8 << bits) - 1;
+    let ladder = move |p: &[u8]| if two_bit { crate::convert::det_q2tp_ladder(p, 0) } else { crate::convert::det_q4tp_ladder(p, 0) };
+    assert_eq!(h.len(), cols * cols);
+    assert_eq!(w0.len(), rows * cols);
+    let gpr = cols / GROUP_SIZE;
+    let (po, co, stride) = if two_bit { q2tp_sections(rows, cols) } else { q4tp_sections(rows, cols) };
+    let mean_diag = (0..cols).map(|i| h[i * cols + i]).sum::<f64>() / cols as f64;
+    let add = ridge * mean_diag;
+    let hf: Vec<f32> = h
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| (if k / cols == k % cols { v + add } else { v }) as f32)
+        .collect();
+    let live: Vec<bool> = (0..cols).map(|i| h[i * cols + i] > 0.0).collect();
+    let (plane, rest) = bytes.split_at_mut(po);
+    let (params, codes) = rest.split_at_mut(co - po);
+    let (params, codes) = (&*params, &*codes);
+    // Residuals of every row through the encoder's own ladder.
+    let mut res = vec![0f32; rows * cols];
+    {
+        let plane_r = &*plane;
+        let per = rows.div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|s| {
+            for (ci, chunk) in res.chunks_mut(per * cols).enumerate() {
+                s.spawn(move || {
+                    for (k, rrow) in chunk.chunks_exact_mut(cols).enumerate() {
+                        let r = ci * per + k;
+                        let tab = ladder(&params[r * 4..r * 4 + 4]);
+                        let crow = &codes[r * stride..(r + 1) * stride];
+                        for g in 0..gpr {
+                            let sg = tab[q4tp_code(crow, g)];
+                            let ch = &plane_r[(r * gpr + g) * cb..(r * gpr + g + 1) * cb];
+                            for (b, &byte) in ch.iter().enumerate() {
+                                for j in 0..wpb {
+                                    let c = g * GROUP_SIZE + b * wpb + j;
+                                    rrow[c] = (((byte >> (bits as usize * j)) & mask) as f32 - off) * sg - w0[r * cols + c];
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let mut grad = gemm_rows_square(&res, rows, cols, &hf, threads);
+    let per = rows.div_ceil(threads.max(1)).max(1);
+    let stats = std::sync::Mutex::new(RefineStats::default());
+    std::thread::scope(|s| {
+        for (ci, ((pl, rs), gs)) in plane
+            .chunks_mut(per * gpr * cb)
+            .zip(res.chunks_mut(per * cols))
+            .zip(grad.chunks_mut(per * cols))
+            .enumerate()
+        {
+            let (hf, live, stats) = (&hf, &live, &stats);
+            s.spawn(move || {
+                let mut st = RefineStats::default();
+                let mut code = vec![0u8; cols];
+                let mut step = vec![0f32; cols];
+                for (k, (rrow, grow)) in rs.chunks_exact_mut(cols).zip(gs.chunks_exact_mut(cols)).enumerate() {
+                    let r = ci * per + k;
+                    let tab = ladder(&params[r * 4..r * 4 + 4]);
+                    let crow = &codes[r * stride..(r + 1) * stride];
+                    let prow = &mut pl[k * gpr * cb..(k + 1) * gpr * cb];
+                    for g in 0..gpr {
+                        let sg = tab[q4tp_code(crow, g)];
+                        for (b, &byte) in prow[g * cb..(g + 1) * cb].iter().enumerate() {
+                            for j in 0..wpb {
+                                let c = g * GROUP_SIZE + b * wpb + j;
+                                code[c] = (byte >> (bits as usize * j)) & mask;
+                                step[c] = sg;
+                            }
+                        }
+                    }
+                    let (mut rgr, mut rr) = (0f64, 0f64);
+                    for (&a, &b) in rrow.iter().zip(grow.iter()) {
+                        rgr += a as f64 * b as f64;
+                        rr += a as f64 * a as f64;
+                    }
+                    st.obj_before += rgr;
+                    st.plain_before += rgr - add * rr;
+                    for _ in 0..iters {
+                        let mut best = (0f32, usize::MAX, 0i8);
+                        for j in 0..cols {
+                            let sj = step[j];
+                            if sj == 0.0 || !live[j] {
+                                continue;
+                            }
+                            let q = sj * sj * hf[j * cols + j];
+                            let gj2 = 2.0 * sj * grow[j];
+                            if code[j] < maxc && gj2 + q < best.0 {
+                                best = (gj2 + q, j, 1);
+                            }
+                            if code[j] > 0 && q - gj2 < best.0 {
+                                best = (q - gj2, j, -1);
+                            }
+                        }
+                        if best.1 == usize::MAX {
+                            break;
+                        }
+                        let (j, dir) = (best.1, best.2);
+                        let d = dir as f32 * step[j];
+                        code[j] = (code[j] as i8 + dir) as u8;
+                        rrow[j] += d;
+                        for (gv, &hv) in grow.iter_mut().zip(&hf[j * cols..(j + 1) * cols]) {
+                            *gv += d * hv;
+                        }
+                        st.moves += 1;
+                    }
+                    let (mut rgr, mut rr) = (0f64, 0f64);
+                    for (&a, &b) in rrow.iter().zip(grow.iter()) {
+                        rgr += a as f64 * b as f64;
+                        rr += a as f64 * a as f64;
+                    }
+                    st.obj_after += rgr;
+                    st.plain_after += rgr - add * rr;
+                    prow.fill(0);
+                    for (c, &v) in code.iter().enumerate() {
+                        prow[(c / GROUP_SIZE) * cb + (c % GROUP_SIZE) / wpb] |= v << (bits as usize * (c % wpb));
+                    }
+                }
+                let mut tot = stats.lock().unwrap();
+                tot.moves += st.moves;
+                tot.obj_before += st.obj_before;
+                tot.obj_after += st.obj_after;
+                tot.plain_before += st.plain_before;
+                tot.plain_after += st.plain_after;
+            });
+        }
+    });
+    stats.into_inner().unwrap()
+}
+
 /// Output debias of a q2tp tensor in the calibration metric: per row the
 /// regression slope `b = (Ŵ H Wᵀ)_rr / (W H Wᵀ)_rr` is removed through the
 /// row's f16 `lo` ([`crate::convert::q2tp_unshrink_row`]) — zero bits;
@@ -3041,6 +3579,24 @@ pub fn q4tp_debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, 
     debias_gemm(bytes, w0, rows, cols, h, threads, false);
 }
 
+/// [`q2tp_debias_gemm`] for a tensor whose columns carry a gain `cs` on top
+/// of the codes (the effective weight is `Ŵ·diag(cs)`): the row slope is
+/// taken against that, so the `lo` shift removes what is left after the gain.
+pub fn q2tp_debias_gemm_scaled(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    cs: Option<&[f32]>,
+    threads: usize,
+) {
+    assert_eq!(h.len(), cols * cols);
+    let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+    let hw = gemm_rows_square(w0, rows, cols, &h32, threads);
+    debias_tiled_rows_cs(bytes, w0, rows, cols, &hw, threads, true, cs);
+}
+
 fn debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize, two_bit: bool) {
     assert_eq!(h.len(), cols * cols);
     let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
@@ -3049,6 +3605,20 @@ fn debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64]
 }
 
 fn debias_tiled_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw: &[f32], threads: usize, two_bit: bool) {
+    debias_tiled_rows_cs(bytes, w0, rows, cols, hw, threads, two_bit, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn debias_tiled_rows_cs(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    hw: &[f32],
+    threads: usize,
+    two_bit: bool,
+    cs: Option<&[f32]>,
+) {
     use cortiq_core::quant::{Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_code, q4tp_sections};
     assert_eq!(w0.len(), rows * cols);
     assert_eq!(hw.len(), rows * cols);
@@ -3085,6 +3655,11 @@ fn debias_tiled_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw:
                             }
                         }
                     }
+                    if let Some(c) = cs {
+                        for (x, &g) in wh.iter_mut().zip(c) {
+                            *x *= g;
+                        }
+                    }
                     let num: f64 = wh.iter().zip(y).map(|(&a, &b)| a as f64 * b as f64).sum();
                     let den: f64 = wr.iter().zip(y).map(|(&a, &b)| a as f64 * b as f64).sum();
                     crate::convert::q2tp_unshrink_row(p, num, den);
@@ -3092,6 +3667,125 @@ fn debias_tiled_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw:
             });
         }
     });
+}
+
+/// NVG's closed-form input-channel gain, for finished codes. With
+/// `Ŵ_i` the dequantized rows and `W_i` their targets (both in the basis the
+/// sweep ran in, Hessian `h`), the error of a column gain `s` is
+/// `E(s) = Σ_i (Ŵ_i⊙s − W_i)·H·(Ŵ_i⊙s − W_i)ᵀ = sᵀ A s − 2 bᵀ s + c`,
+/// `A = H ∘ (ŴᵀŴ)`, `b_j = Σ_k H_jk (ŴᵀW)_jk` — a positive semi-definite
+/// system. Solved by Jacobi-preconditioned conjugate gradients with a pull
+/// toward 1 (`μ·diag(A)·|s − 1|²`, μ = 0.05) and `s` kept in `[0.5, 2]`.
+/// Returns `(s, E(1), E(s))` over all stacked tensors.
+fn channel_refit_gain(targets: &[&[f32]], quant: &[&[f32]], n: usize, h: &[f64], threads: usize) -> (Vec<f32>, f64, f64) {
+    let r_tot: usize = targets.iter().map(|t| t.len() / n).sum();
+    // Stack, and transpose the quantized rows: Ŵᵀ is n × R.
+    let mut what_t = vec![0f32; n * r_tot];
+    let mut wq = Vec::with_capacity(r_tot * n);
+    let mut wt = Vec::with_capacity(r_tot * n);
+    let mut r0 = 0usize;
+    for (t, q) in targets.iter().zip(quant) {
+        let rows = t.len() / n;
+        wt.extend_from_slice(t);
+        wq.extend_from_slice(q);
+        for r in 0..rows {
+            for j in 0..n {
+                what_t[j * r_tot + r0 + r] = q[r * n + j];
+            }
+        }
+        r0 += rows;
+    }
+    let mul = |b: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; n * n];
+        let per = n.div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|s| {
+            for (ci, chunk) in out.chunks_mut(per * n).enumerate() {
+                let m = chunk.len() / n;
+                let a = &what_t[ci * per * r_tot..(ci * per + m) * r_tot];
+                s.spawn(move || cortiq_engine::qtensor::sgemm_public(m, n, r_tot, 1.0, a, r_tot, b, n, false, chunk, n));
+            }
+        });
+        out
+    };
+    let g = mul(&wq);
+    let c = mul(&wt);
+    drop((what_t, wq, wt));
+    let mut a = vec![0f64; n * n];
+    let mut b = vec![0f64; n];
+    for j in 0..n {
+        let mut bj = 0f64;
+        for k in 0..n {
+            a[j * n + k] = h[j * n + k] * g[j * n + k] as f64;
+            bj += h[j * n + k] * c[j * n + k] as f64;
+        }
+        b[j] = bj;
+    }
+    let mu = 0.05f64;
+    let dg: Vec<f64> = (0..n).map(|j| a[j * n + j]).collect();
+    let energy = |s: &[f64]| -> f64 {
+        // sᵀAs − 2bᵀs (the constant cancels in the ratio's difference)
+        let mut e = 0f64;
+        for j in 0..n {
+            let aj: f64 = (0..n).map(|k| a[j * n + k] * s[k]).sum();
+            e += s[j] * aj - 2.0 * b[j] * s[j];
+        }
+        e
+    };
+    let apply = |p: &[f64]| -> Vec<f64> {
+        (0..n)
+            .map(|j| (0..n).map(|k| a[j * n + k] * p[k]).sum::<f64>() + mu * dg[j] * p[j])
+            .collect()
+    };
+    let rhs: Vec<f64> = (0..n).map(|j| b[j] + mu * dg[j]).collect();
+    let mdiag: Vec<f64> = dg.iter().map(|&d| if d > 0.0 { d * (1.0 + mu) } else { 1.0 }).collect();
+    let mut s = vec![1.0f64; n];
+    let ap = apply(&s);
+    let mut r: Vec<f64> = (0..n).map(|j| rhs[j] - ap[j]).collect();
+    let mut z: Vec<f64> = (0..n).map(|j| r[j] / mdiag[j]).collect();
+    let mut p = z.clone();
+    let mut rz: f64 = r.iter().zip(&z).map(|(x, y)| x * y).sum();
+    let bnorm = rhs.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-300);
+    for _ in 0..300 {
+        let q = apply(&p);
+        let pq: f64 = p.iter().zip(&q).map(|(x, y)| x * y).sum();
+        if !(pq > 0.0) {
+            break;
+        }
+        let alpha = rz / pq;
+        for j in 0..n {
+            s[j] += alpha * p[j];
+            r[j] -= alpha * q[j];
+        }
+        if r.iter().map(|x| x * x).sum::<f64>().sqrt() / bnorm < 1e-9 {
+            break;
+        }
+        for j in 0..n {
+            z[j] = r[j] / mdiag[j];
+        }
+        let rz2: f64 = r.iter().zip(&z).map(|(x, y)| x * y).sum();
+        let beta = rz2 / rz;
+        rz = rz2;
+        for j in 0..n {
+            p[j] = z[j] + beta * p[j];
+        }
+    }
+    for x in s.iter_mut() {
+        *x = x.clamp(0.5, 2.0);
+    }
+    let ones = vec![1.0f64; n];
+    let (e0, e1) = (energy(&ones), energy(&s));
+    // Report the energies as the fraction of the full objective: E = sᵀAs − 2bᵀs + c, c = Σ‖W‖²_H.
+    let c_const: f64 = {
+        let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+        let mut tot = 0f64;
+        for t in targets {
+            let rows = t.len() / n;
+            let hw = gemm_rows_square(t, rows, n, &h32, threads);
+            tot += t.iter().zip(&hw).map(|(&x, &y)| x as f64 * y as f64).sum::<f64>();
+        }
+        tot
+    };
+    (s.iter().map(|&x| x as f32).collect(), e0 + c_const, e1 + c_const)
 }
 
 /// `A·B` for row-major `a` (`m × k`) and a square `b` (`k × k`), rows split
@@ -3830,6 +4524,145 @@ mod tests {
         assert!(diff * 1000 <= rows * cols, "{diff} codes differ from RTN");
     }
 
+    /// Code refinement lowers the ridge-regularized layer error it optimizes
+    /// (the reported before/after match an independent evaluation), moves
+    /// codes only (params and rungs untouched) and never leaves the 2-bit range.
+    #[test]
+    fn q2tp_refine_lowers_its_objective_and_touches_only_codes() {
+        let (rows, cols, t) = (24usize, 128usize, 500usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 5, 2.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let g = gptq_quantize_q2tp(&w, rows, cols, &u, &dead, &hdiag, Q2tpRule::Placed, None, 2);
+        let mut d = g.clone();
+        let ridge = 0.5;
+        let st = q2tp_refine_codes(&mut d, &w, rows, cols, &h, ridge, 40, 3);
+        let (po, _, _) = cortiq_core::quant::q2tp_sections(rows, cols);
+        assert_eq!(&g[po..], &d[po..], "params and rungs untouched");
+        assert!(st.moves > 0, "a GPTQ result still has improving moves");
+        assert!(st.obj_after < st.obj_before, "{st:?}");
+        let mean_diag = (0..cols).map(|i| h[i * cols + i]).sum::<f64>() / cols as f64;
+        let obj = |bytes: &[u8]| -> f64 {
+            let mut deq = vec![0f32; rows * cols];
+            cortiq_core::quant::dequant_q2tp(bytes, rows, cols, &mut deq);
+            let mut total = 0f64;
+            for r in 0..rows {
+                let res: Vec<f64> = (0..cols).map(|j| (deq[r * cols + j] - w[r * cols + j]) as f64).collect();
+                for i in 0..cols {
+                    let hr: f64 = (0..cols).map(|j| h[i * cols + j] * res[j]).sum::<f64>() + ridge * mean_diag * res[i];
+                    total += res[i] * hr;
+                }
+            }
+            total
+        };
+        let (b, a) = (obj(&g), obj(&d));
+        assert!((b / st.obj_before - 1.0).abs() < 1e-3, "before {b} vs {}", st.obj_before);
+        assert!((a / st.obj_after - 1.0).abs() < 1e-3, "after {a} vs {}", st.obj_after);
+        assert!(a < b);
+        // The thread count changes no code.
+        let mut d1 = g.clone();
+        q2tp_refine_codes(&mut d1, &w, rows, cols, &h, ridge, 40, 1);
+        assert_eq!(d, d1);
+    }
+
+    /// The same refinement on the 16-level q4tp grid: the objective falls,
+    /// only the nibble plane changes, and the reported energy matches an
+    /// independent evaluation of the dequantized result.
+    #[test]
+    fn q4tp_refine_lowers_its_objective_and_touches_only_codes() {
+        let (rows, cols, t) = (24usize, 128usize, 500usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 6, 2.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let g = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 2);
+        let mut d = g.clone();
+        let ridge = 0.3;
+        let st = q4tp_refine_codes(&mut d, &w, rows, cols, &h, ridge, 40, 3);
+        let (po, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        assert_eq!(&g[po..], &d[po..], "params and rungs untouched");
+        assert!(st.obj_after <= st.obj_before, "{st:?}");
+        let mean_diag = (0..cols).map(|i| h[i * cols + i]).sum::<f64>() / cols as f64;
+        let obj = |bytes: &[u8]| -> f64 {
+            let mut deq = vec![0f32; rows * cols];
+            cortiq_core::quant::dequant_q4tp(bytes, rows, cols, &mut deq);
+            let mut total = 0f64;
+            for r in 0..rows {
+                let res: Vec<f64> = (0..cols).map(|j| (deq[r * cols + j] - w[r * cols + j]) as f64).collect();
+                for i in 0..cols {
+                    let hr: f64 = (0..cols).map(|j| h[i * cols + j] * res[j]).sum::<f64>() + ridge * mean_diag * res[i];
+                    total += res[i] * hr;
+                }
+            }
+            total
+        };
+        let (b, a) = (obj(&g), obj(&d));
+        assert!((b / st.obj_before - 1.0).abs() < 1e-3, "before {b} vs {}", st.obj_before);
+        assert!((a / st.obj_after - 1.0).abs() < 1e-3, "after {a} vs {}", st.obj_after);
+    }
+
+    /// The closed-form channel gain never raises the layer error, stays in
+    /// its clamp and finds a planted column gain's direction.
+    #[test]
+    fn channel_refit_gain_lowers_the_layer_error() {
+        let (rows, cols, t) = (40usize, 64usize, 400usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 13, 1.0);
+        // "Quantized" rows = the targets with columns 3 and 10 shrunk/grown.
+        let mut q = w.clone();
+        for r in 0..rows {
+            q[r * cols + 3] *= 0.8;
+            q[r * cols + 10] *= 1.25;
+        }
+        let (gain, e0, e1) = channel_refit_gain(&[&w], &[&q], cols, &h, 2);
+        assert!(e1 <= e0 * (1.0 + 1e-9), "{e0} → {e1}");
+        assert!(gain.iter().all(|&g| (0.5..=2.0).contains(&g)));
+        assert!(gain[3] > 1.1 && gain[10] < 0.92, "gain[3] = {}, gain[10] = {}", gain[3], gain[10]);
+        assert!((gain[20] - 1.0).abs() < 0.05, "an untouched column stays near 1: {}", gain[20]);
+    }
+
+    /// The channel scale is a change of basis: `(W/t)(t⊙x) = W·x`, `H' = tHt`,
+    /// unit geometric mean, dead channels untouched.
+    #[test]
+    fn chscale_is_a_function_preserving_change_of_basis() {
+        let (rows, cols, t) = (16usize, 64usize, 300usize);
+        let (w, x, mut h) = q2_problem_with(rows, cols, t, 9, 3.0);
+        let dead = 5usize;
+        for k in 0..cols {
+            h[dead * cols + k] = 0.0;
+            h[k * cols + dead] = 0.0;
+        }
+        let hd: Vec<f64> = (0..cols).map(|i| h[i * cols + i]).collect();
+        let mut colsq = vec![0f64; cols];
+        for row in w.chunks_exact(cols) {
+            for (a, &v) in colsq.iter_mut().zip(row) {
+                *a += v as f64 * v as f64;
+            }
+        }
+        for alpha in [0.5, 0.75] {
+            let tv = chscale_vector(&hd, &colsq, rows, alpha);
+            assert_eq!(tv[dead], 1.0, "a dead channel keeps scale 1");
+            let live: Vec<f64> = (0..cols).filter(|&j| j != dead).map(|j| (tv[j] as f64).ln()).collect();
+            assert!((live.iter().sum::<f64>() / live.len() as f64).abs() < 1e-4, "unit geometric mean");
+            // Salient (large-rms) inputs get larger weights, as AWQ does.
+            let mut others: Vec<f32> = (0..cols).filter(|&j| j != 7 && j != dead).map(|j| tv[j]).collect();
+            others.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert!(tv[7] < others[others.len() / 2], "channel 7 is 6× louder: its weights grow (÷t)");
+            // Function identity on the calibration inputs.
+            let mut worst = 0f64;
+            for k in 0..t {
+                let xr = &x[k * cols..(k + 1) * cols];
+                for r in 0..rows {
+                    let (mut a, mut b) = (0f64, 0f64);
+                    for j in 0..cols {
+                        a += w[r * cols + j] as f64 * xr[j] as f64;
+                        b += (w[r * cols + j] / tv[j]) as f64 * (xr[j] * tv[j]) as f64;
+                    }
+                    worst = worst.max((a - b).abs() / (a.abs() + 1e-3));
+                }
+            }
+            assert!(worst < 1e-4, "function changed: {worst}");
+        }
+    }
+
     /// The Hessian debias brings every row's output slope back to ~1 (the
     /// gain clipped to 0.8..1.25) and touches nothing but the row `lo`.
     #[test]
@@ -4249,6 +5082,12 @@ mod tests {
                 q2tp_debias: false,
                 q4tp_debias: false,
                 chunk_layers: chunk,
+                channel_scale: 0.0,
+                refine_iters: 0,
+                refine_ridge: 1.0,
+                channel_scale_qkv: false,
+                channel_refit: false,
+                refine_q4tp: false,
             })
             .unwrap();
             std::fs::read(&output).unwrap()
