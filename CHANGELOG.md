@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path; the host's candidate lists go up a call at a time. Unlimited-OCR-2 on an RTX A5000, one page: decode
   327.9 tok/s against 50.8 before and Vulkan's 210.4, first token after the page's rows 1.1 s against 21.1 (Vulkan
   2.5); the text the CPU's but for a box coordinate off by one, as Vulkan's.
+- Kimi-Linear on the CUDA hybrid arm: the graph contract carries Kimi Delta Attention (`GraphAttn::Kda`) and
+  Multi-head Latent Attention (`GraphAttn::Mla`; the wgpu graphs decline them at their entry). KDA rides a GDN
+  layer's state and front (the conv, SiLU and q / k norms over the q | k | v channels), its low-rank decay, β and
+  output gate are f32 products, `hy_kda_gates` the per-channel decay, `hy_kda_scan4` the delta rule with it, the
+  sigmoid-gated norm `hy_gdn_out32`'s; MLA's latent norm, kv_b and the heads' `[k_rope | k_nope]` keys and padded
+  values feed the hybrid attention at heads 192 wide (`hy_mla_*`; the mirror rows of heads that are no multiple of
+  256 load two halves at a time), cut back to v wide for the output product. Kimi-Linear-48B-A3B on an RTX A5000:
+  decode 164 tok/s against 8.8 op by op (Vulkan 8.1), a 4096-token prompt 378 tok/s (first token 10.8 s) and
+  136 tok/s after it against Vulkan's 4.3 and 2.6; the batched prefill bit for bit the per-position one, the text
+  the CPU's up to a near tie at token 39 (26.678 against 26.620).
 - Vision towers on CUDA (`gpu::vit_encode`, `gpu::sam_encode`, `gpu_cuda/vit.rs`): the pre-norm ViT blocks of a
   CLIP-class tower and SAM's blocks (windowed attention with decomposed relative positions, the global blocks'
   bias in the softmax) and neck with the activations on the card, cuBLAS f32 products; they ran on the host

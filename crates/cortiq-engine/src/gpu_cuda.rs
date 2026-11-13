@@ -1303,7 +1303,9 @@ impl Ctx {
                     params,
                 )
             }
-            .map_err(derr)
+            // the launch's shape beside the driver's word: a refused launch names
+            // what it asked for
+            .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)))
         };
         let nop = NOP_F.load(Ordering::Relaxed);
         if nop != 0 && nop != f as usize && r.is_ok() {
@@ -1347,7 +1349,7 @@ impl Ctx {
                 params,
             )
         }
-        .map_err(derr);
+        .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)));
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, self.stream) };

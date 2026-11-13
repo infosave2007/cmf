@@ -28084,6 +28084,8 @@ fn graph_layer_payload_bytes(
             add(inp)?;
             add(out)?;
         }
+        // no wgpu kernels: the graphs decline these stacks at their entry
+        crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => {}
     }
     match &layer.ffn {
         crate::gpu::GraphFfn::AttentionOnly => {}
@@ -28239,6 +28241,10 @@ pub fn forward_token_graph(
         return token_graph_outcome(o1_started || state_started, false);
     };
     let _op = c.op_gate.enter();
+    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
+        graph_refused("a KDA or MLA layer: no wgpu kernels");
+        return token_graph_outcome(o1_started || state_started, false);
+    }
     let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
@@ -28744,6 +28750,7 @@ pub fn forward_token_graph(
                     cdim,
                 }
             }
+            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
             crate::gpu::GraphAttn::ShortConv {
                 inp, out, kernel, ..
             } => {
@@ -29662,6 +29669,7 @@ pub fn forward_token_graph(
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -30659,6 +30667,7 @@ pub fn forward_token_graph(
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
             }
         }
         {
@@ -34828,6 +34837,10 @@ pub fn forward_batch_graph_at(
         bgraph_refused("k/positions mismatch");
         return batch_outcome(o1_started || state_started, false);
     }
+    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
+        bgraph_refused("a KDA or MLA layer: no wgpu kernels");
+        return batch_outcome(o1_started || state_started, false);
+    }
     // A Looped Transformer's loop boundaries (`gpu::set_batch_loop_norm`):
     // the final norm on the stream after a loop's last layer, which a plain
     // residual tail takes (a sandwich or mHC tail declines).
@@ -35349,6 +35362,7 @@ pub fn forward_batch_graph_at(
                 // walks positions in order yet; prefill stays per-op.
                 return batch_outcome(o1_started || state_started, false);
             }
+            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
         };
         let bffn = match &l.ffn {
             crate::gpu::GraphFfn::AttentionOnly => BFfn::AttentionOnly,
@@ -35596,6 +35610,7 @@ pub fn forward_batch_graph_at(
                         }
                     }
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -35684,6 +35699,7 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
             }
         }
         // Upload every layer's sealed state before the first command dispatch.
@@ -36177,6 +36193,7 @@ pub fn forward_batch_graph_at(
                     kvbufs.push(None);
                     gdnbufs.push(None);
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
             }
         }
     }

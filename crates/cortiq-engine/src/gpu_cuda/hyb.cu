@@ -44,6 +44,23 @@ __device__ __forceinline__ void h8(const u16* p, float* o) {
     }
 }
 
+// A lane's DPL halves of a mirror row as floats: eight a 16-byte load when
+// DPL is a multiple of 8 (heads of 256 and 512), else two a 4-byte one (MLA's
+// heads of 192: DPL 6).
+__device__ __forceinline__ void hdpl(const u16* p, float* o) {
+#if DPL % 8 == 0
+#pragma unroll
+    for (int t = 0; t < DPL; t += 8) h8(p + t, o + t);
+#else
+#pragma unroll
+    for (int t = 0; t < DPL; t += 2) {
+        const u32 w = *(const u32*)(p + t);
+        o[t] = h2f((u16)(w & 0xFFFFu));
+        o[t + 1] = h2f((u16)(w >> 16));
+    }
+#endif
+}
+
 // bf16 planes of the tensor-core small path (see its section below).
 __device__ __forceinline__ u16 f2bf(float f) {
     u16 h;
@@ -454,8 +471,7 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
         }
         const u16* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float kv[DPL];
-#pragma unroll
-        for (int t = 0; t < DPL; t += 8) h8(kr + t, kv + t);
+        hdpl(kr, kv);
 #pragma unroll
         for (int j = 0; j < HPK; j++) {
             float a = 0.0f;
@@ -521,8 +537,7 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
     for (int r = row0 + warp; r < row1; r += NW) {
         const u16* vr = Vm + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float vv[DPL];
-#pragma unroll
-        for (int t = 0; t < DPL; t += 8) h8(vr + t, vv + t);
+        hdpl(vr, vv);
 #pragma unroll
         for (int j = 0; j < HPK; j++) {
             const float e = expf(__fsub_rn(Sb[(size_t)(g * HPK + j) * ncap + r], mx[j]));
@@ -3323,4 +3338,165 @@ extern "C" __global__ void __launch_bounds__(256) hy_dash_attend(
             else oh[((size_t)row * nh + h) * HD + dd] = f2h_sat(a);
         }
     }
+}
+
+// ------------------------------------------------------------------- KDA
+//
+// Kimi Delta Attention (`linear_core::kda_step`): the GDN front's conv,
+// SiLU and q / k L2 norms (`hy_gdn_front` over the q | k | v channels), then
+// a decay per key channel and the delta rule with it.
+
+// gd [n][nh dk] = exp(log-decay(f + dt_bias)), beta [n][nh] = sigmoid(b):
+// log-decay -exp(A) softplus(x), or lb sigmoid(exp(A) x) (`lb_on`); A by
+// head, by key dim or by channel as `a_len` says.
+extern "C" __global__ void hy_kda_gates(const float* __restrict__ f, int fstride, const float* __restrict__ braw, int bstride,
+                                        const float* __restrict__ a_log, int a_len, const float* __restrict__ dt_bias,
+                                        float* __restrict__ gd, float* __restrict__ beta, int n, int nh, int dk, int lb_on,
+                                        float lb)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int kd = nh * dk;
+    if (i >= (size_t)n * kd) return;
+    const int t = (int)(i / kd), c = (int)(i % kd), h = c / dk, d = c - h * dk;
+    const float a = a_len == nh ? a_log[h] : (a_len == dk ? a_log[d] : a_log[c]);
+    const float x = __fadd_rn(f[(size_t)t * fstride + c], dt_bias[c]);
+    float ld;
+    if (lb_on) ld = lb / (1.0f + expf(-__fmul_rn(expf(a), x)));
+    else ld = -__fmul_rn(expf(a), x > 20.0f ? x : log1pf(expf(x)));
+    gd[i] = expf(ld);
+    if (d == 0) beta[(size_t)t * nh + h] = 1.0f / (1.0f + expf(-braw[(size_t)t * bstride + h]));
+}
+
+// The KDA step with a lane a state column for dk = 128, `gdn_scan4_body`'s
+// layout: the key channels' decay folds into the k readout (kv = (k gd)ᵀ S),
+// delta = beta (v - kv), S = gd S + k deltaᵀ, o = qᵀ S. cq rows [c_dim]
+// (q | k | v, normed), gd [n][nh 128], beta [n][nh]; n <= 16.
+extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __restrict__ cq, const float* __restrict__ gdr,
+                                                              const float* __restrict__ betar, float* S, float* __restrict__ o,
+                                                              int n, int c_dim, int nh, int dv, float* __restrict__ ring,
+                                                              const float* __restrict__ qkv, int qstride, int kk)
+{
+    const int sblocks = nh * (dv >> 5);
+    if ((int)blockIdx.x >= sblocks) {
+        // blocks past the state's move the conv ring, as `hy_gdn_scan4`'s do
+        const int c = ((int)blockIdx.x - sblocks) * blockDim.x + threadIdx.x;
+        if (!ring || c >= c_dim || n <= 0) return;
+        float nr[8];
+        for (int j = 0; j < kk - 1 && j < 8; j++) {
+            const int src = n - (kk - 1) + j;
+            nr[j] = src >= 0 ? qkv[(u64)src * qstride + c] : ring[(u64)(kk - 1 + src) * c_dim + c];
+        }
+        for (int j = 0; j < kk - 1 && j < 8; j++) ring[(u64)j * c_dim + c] = nr[j];
+        return;
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int wpr = dv >> 5;
+    const int h = blockIdx.x / wpr, j = (blockIdx.x - h * wpr) * 32 + lane;
+    const int kd = nh * 128;
+    const size_t base = ((size_t)h * 128 + w * 32) * dv + j;
+    float s[32];
+#pragma unroll
+    for (int i = 0; i < 32; i++) s[i] = S[base + (size_t)i * dv];
+    __shared__ float ks[16][128], qs[16][128], gs[16][128];
+    __shared__ float bs[16];
+    __shared__ float part[2][4][32];
+    const int nn = min(n, 16);
+    for (int t = w; t < nn; t += 4) {
+        const float* row = cq + (size_t)t * c_dim;
+        *(float4*)(&ks[t][lane * 4]) = *(const float4*)(row + kd + (size_t)h * 128 + lane * 4);
+        *(float4*)(&qs[t][lane * 4]) = *(const float4*)(row + (size_t)h * 128 + lane * 4);
+        *(float4*)(&gs[t][lane * 4]) = *(const float4*)(gdr + (size_t)t * kd + (size_t)h * 128 + lane * 4);
+        if (lane == 0) bs[t] = betar[(size_t)t * nh + h];
+    }
+    float vv[16];
+#pragma unroll
+    for (int t = 0; t < 16; t++) vv[t] = t < nn ? cq[(size_t)t * c_dim + 2 * kd + (size_t)h * dv + j] : 0.0f;
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+        if (t >= nn) break;
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; i += 2) {
+            a0 = fmaf(s[i], __fmul_rn(ks[t][w * 32 + i], gs[t][w * 32 + i]), a0);
+            a1 = fmaf(s[i + 1], __fmul_rn(ks[t][w * 32 + i + 1], gs[t][w * 32 + i + 1]), a1);
+        }
+        part[0][w][lane] = __fadd_rn(a0, a1);
+        __syncthreads();
+        const float kv = __fadd_rn(__fadd_rn(__fadd_rn(part[0][0][lane], part[0][1][lane]), part[0][2][lane]), part[0][3][lane]);
+        const float delta = __fmul_rn(__fsub_rn(vv[t], kv), bs[t]);
+        float b0 = 0.0f, b1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; i += 2) {
+            s[i] = fmaf(ks[t][w * 32 + i], delta, __fmul_rn(gs[t][w * 32 + i], s[i]));
+            s[i + 1] = fmaf(ks[t][w * 32 + i + 1], delta, __fmul_rn(gs[t][w * 32 + i + 1], s[i + 1]));
+            b0 = fmaf(qs[t][w * 32 + i], s[i], b0);
+            b1 = fmaf(qs[t][w * 32 + i + 1], s[i + 1], b1);
+        }
+        part[1][w][lane] = __fadd_rn(b0, b1);
+        __syncthreads();
+        if (w == 0 && o)
+            o[(size_t)t * nh * dv + (size_t)h * dv + j] =
+                __fadd_rn(__fadd_rn(__fadd_rn(part[1][0][lane], part[1][1][lane]), part[1][2][lane]), part[1][3][lane]);
+    }
+#pragma unroll
+    for (int i = 0; i < 32; i++) S[base + (size_t)i * dv] = s[i];
+}
+
+// ------------------------------------------------------------------- MLA
+//
+// DeepSeek-V2 Multi-head Latent Attention as multi-head attention
+// (`pipeline::mla_attention`): the latent's RMS norm into the planes for
+// kv_b, the heads' keys [k_rope | k_nope] and values [v | 0] (as wide as the
+// keys), and the attention's output heads cut back to v wide.
+
+// The latent (the first `lora` of a row `stride` long) RMS-normed with w, a
+// block a row, into the planes (`pstride` a row).
+extern "C" __global__ void hy_mla_lat(const float* __restrict__ kva, int stride, const float* __restrict__ w, int lora,
+                                      float eps, u16* __restrict__ p0, u16* __restrict__ p1, int pstride)
+{
+    __shared__ float red[32];
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const float* x = kva + (size_t)r * stride;
+    float s = 0.0f;
+    for (int i = tid; i < lora; i += blockDim.x) s = fmaf(x[i], x[i], s);
+    for (int k = 16; k > 0; k >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, k));
+    if (lane == 0) red[warp] = s;
+    __syncthreads();
+    double tot = 0.0;
+    for (int k = 0; k < NW; k++) tot += (double)red[k];
+    const float inv = 1.0f / (float)sqrt(tot / (double)lora + (double)eps);
+    for (int i = tid; i < lora; i += blockDim.x) put3(p0, p1, p1, (size_t)r * pstride + i, __fmul_rn(__fmul_rn(x[i], inv), w[i]));
+}
+
+// k [n][nh][rope + nope] = [k_rope (the row's shared rope key) | k_nope],
+// v [n][nh][rope + nope] = [v | 0]; kva rows `kstride` long (the latent,
+// then the rope key), kvb [n][nh][nope + v].
+extern "C" __global__ void hy_mla_kv(const float* __restrict__ kva, int kstride, const float* __restrict__ kvb, float* __restrict__ k,
+                                     float* __restrict__ v, int n, int nh, int rope, int nope, int vd, int lora)
+{
+    const int hd = rope + nope;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * nh * hd) return;
+    const int d = (int)(i % hd);
+    const size_t th = i / hd;
+    const int h = (int)(th % nh), t = (int)(th / nh);
+    const float* b = kvb + ((size_t)t * nh + h) * (nope + vd);
+    k[i] = d < rope ? kva[(size_t)t * kstride + lora + d] : b[d - rope];
+    v[i] = d < vd ? b[nope + d] : 0.0f;
+}
+
+// Planes [n][nh][hd] (the attention's heads) into planes [n][nh][vd] (the
+// first vd of each head), for the output projection.
+extern "C" __global__ void hy_mla_cut(const u16* __restrict__ s0, const u16* __restrict__ s1, int sstride, u16* __restrict__ d0,
+                                      u16* __restrict__ d1, int dstride, int n, int nh, int hd, int vd)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * nh * vd) return;
+    const int e = (int)(i % vd);
+    const size_t th = i / vd;
+    const int h = (int)(th % nh), t = (int)(th / nh);
+    const size_t src = (size_t)t * sstride + (size_t)h * hd + e, dst = (size_t)t * dstride + (size_t)h * vd + e;
+    d0[dst] = s0[src];
+    d1[dst] = s1[src];
 }

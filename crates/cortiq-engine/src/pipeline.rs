@@ -16476,6 +16476,82 @@ impl Pipeline {
     /// heads, V width, rotary width and RoPE table, window and sinks of
     /// THIS layer, exactly what the CPU attention reads for it.
     /// Unlimited-OCR: layer `li`'s router for the device graphs.
+    /// Kimi-Linear's mixers for the graphs (`GraphAttn::Kda` / `Mla`), with
+    /// the model the weights live in; `gw` the caller's weight resolver.
+    fn graph_attn_kimi<'s>(
+        &'s self,
+        li: usize,
+        attn: &'s AttnKind,
+        gw: &dyn Fn(&'s QTensor) -> Option<crate::gpu::GraphW<'s>>,
+    ) -> Option<(crate::gpu::GraphAttn<'s>, std::sync::Arc<cortiq_core::CmfModel>)> {
+        match attn {
+            AttnKind::Kda(w) => {
+                let cfg = self.kda_cfg?;
+                let (m, _, _, _) = w.q_proj.graph_weight_or_blr()?;
+                let (g_a, g_b) = match &w.gate {
+                    crate::linear_core::KdaOutGate::Full(g) => (gw(g)?, None),
+                    crate::linear_core::KdaOutGate::LowRank(a, b) => (gw(a)?, Some(gw(b)?)),
+                };
+                Some((
+                    crate::gpu::GraphAttn::Kda {
+                        q: gw(&w.q_proj)?,
+                        k: gw(&w.k_proj)?,
+                        v: gw(&w.v_proj)?,
+                        conv_q: &w.conv_q,
+                        conv_k: &w.conv_k,
+                        conv_v: &w.conv_v,
+                        f_a: gw(&w.f_a)?,
+                        f_b: gw(&w.f_b)?,
+                        dt_bias: &w.dt_bias,
+                        a_log: &w.a_log,
+                        b: gw(&w.b_proj)?,
+                        g_a,
+                        g_b,
+                        o_norm: &w.o_norm,
+                        out: gw(&w.o_proj)?,
+                        nh: cfg.num_heads,
+                        dk: cfg.head_k_dim,
+                        dv: cfg.head_v_dim,
+                        kk: cfg.conv_kernel,
+                        lower_bound: w.gate_lower_bound,
+                        cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
+                    },
+                    m.clone(),
+                ))
+            }
+            AttnKind::Mla(w) => {
+                let (m, _, _, _) = w.kv_a.graph_weight_or_blr()?;
+                let q_a = match &w.q_a {
+                    Some(t) => Some(gw(t)?),
+                    None => None,
+                };
+                Some((
+                    crate::gpu::GraphAttn::Mla {
+                        q_a,
+                        q_a_norm: w.q_a_norm.as_deref(),
+                        q: gw(&w.q_proj)?,
+                        kv_a: gw(&w.kv_a)?,
+                        kv_a_norm: &w.kv_a_norm,
+                        kv_b: gw(&w.kv_b)?,
+                        o: gw(&w.o_proj)?,
+                        nh: w.nh,
+                        rope: w.qk_rope,
+                        nope: w.qk_nope,
+                        v_dim: w.v_dim,
+                        lora: w.lora,
+                        scale: w.scale,
+                        no_rope: w.nope,
+                        cpu_k: self.kv_cache.layers[li].k_heads(),
+                        cpu_v: self.kv_cache.layers[li].v_heads(),
+                        cpu_base: self.kv_cache.layers[li].base(),
+                    },
+                    m.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn graph_dash(&self, li: usize) -> Option<crate::gpu::GraphDash<'_>> {
         self.dash.as_deref().map(|d| {
             let l = &d.layers[li];
@@ -18156,6 +18232,13 @@ impl Pipeline {
                         kernel: cfg.kernel,
                         cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
                     }
+                }
+                // Kimi-Linear's mixers: the CUDA hybrid arm runs them, the
+                // wgpu graphs decline them at their entry
+                AttnKind::Kda(_) | AttnKind::Mla(_) => {
+                    let (attn, m) = self.graph_attn_kimi(li, &lw.attn, &gw)?;
+                    model = Some(m);
+                    attn
                 }
                 _ => return None,
             };
@@ -20391,6 +20474,11 @@ impl Pipeline {
                             cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
                             preview: self.clover.as_ref().and_then(|c| c.graph_preview(li)),
                         }
+                    }
+                    AttnKind::Kda(_) | AttnKind::Mla(_) => {
+                        let (attn, m) = self.graph_attn_kimi(li, &lw.attn, &gw)?;
+                        model = Some(m);
+                        attn
                     }
                     _ => return None,
                 };

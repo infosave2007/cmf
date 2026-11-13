@@ -178,6 +178,11 @@ pub(super) struct HFuncs {
     dash_route: cs::CUfunction,
     dash_close: cs::CUfunction,
     dash_attend: cs::CUfunction,
+    kda_gates: cs::CUfunction,
+    kda_scan4: cs::CUfunction,
+    mla_lat: cs::CUfunction,
+    mla_kv: cs::CUfunction,
+    mla_cut: cs::CUfunction,
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
@@ -280,6 +285,11 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         dash_route: func(module, "hy_dash_route")?,
         dash_close: func(module, "hy_dash_close")?,
         dash_attend: func(module, "hy_dash_attend")?,
+        kda_gates: func(module, "hy_kda_gates")?,
+        kda_scan4: func(module, "hy_kda_scan4")?,
+        mla_lat: func(module, "hy_mla_lat")?,
+        mla_kv: func(module, "hy_mla_kv")?,
+        mla_cut: func(module, "hy_mla_cut")?,
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
@@ -1311,6 +1321,8 @@ struct AttnL {
     ms_out: MmaSet,
     /// Unlimited-OCR's DASH router (the attend over its read set).
     dash: Option<DashL>,
+    /// MLA's latent projections (`k` holds kv_a, `v` kv_b).
+    mla: Option<MlaL>,
 }
 
 /// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
@@ -1360,10 +1372,77 @@ fn dash_admits(d: &crate::gpu::GraphDash<'_>, hidden: usize, hd: usize, rd: usiz
         && d.block * d.k + d.block * d.local_blocks <= 512
 }
 
+/// Kimi Delta Attention (`hy_kda_*`): q / k / v and the output on the tensor
+/// cores, the low-rank decay and gate and β as f32 products, the GDN front's
+/// conv and norms over the q | k | v channels, the delta rule with a decay
+/// per key channel, the sigmoid-gated output norm. Its state is a GDN
+/// layer's (`GdnState`: the conv ring of the channels, S).
+struct KdaL {
+    q: Arc<DevMat>,
+    k: Arc<DevMat>,
+    v: Arc<DevMat>,
+    out: Arc<DevMat>,
+    /// `[q | k | v channels][kk]`.
+    taps: Arc<Buf>,
+    fa: Arc<DevMat>,
+    fb: Arc<DevMat>,
+    b: Arc<DevMat>,
+    ga: Arc<DevMat>,
+    gb: Option<Arc<DevMat>>,
+    a_log: Arc<Buf>,
+    a_len: usize,
+    dt_bias: Arc<Buf>,
+    o_norm: Arc<Buf>,
+    lower: Option<f32>,
+    nh: usize,
+    dk: usize,
+    dv: usize,
+    kk: usize,
+    cdim: usize,
+    ms_in: MmaSet,
+    ms_out: MmaSet,
+}
+
+/// MLA's projections beside the attention (`AttnL::mla`): the latent and
+/// rope key (`ms_in`'s second job), the latent's norm, kv_b over it, and the
+/// widths; the attention runs on heads `rope + nope` wide, V padded to them.
+struct MlaL {
+    kv_b: Arc<DevMat>,
+    kv_a_norm: Arc<Buf>,
+    ms_kvb: MmaSet,
+    rope: usize,
+    nope: usize,
+    vd: usize,
+    lora: usize,
+    scale: f32,
+}
+
+/// A plan's KDA rows (NMAX of them): the low-rank stages, f, the raw β, the
+/// gate, the decays and β.
+struct KdaBufs {
+    fa: Buf,
+    f: Buf,
+    braw: Buf,
+    ga: Buf,
+    gate: Buf,
+    gd: Buf,
+    beta: Buf,
+}
+
+/// A plan's MLA rows: the latent and rope key, kv_b's output, the latent's
+/// planes and the output heads cut to v wide (planes).
+struct MlaBufs {
+    kva: Buf,
+    kvb: Buf,
+    lp: [Buf; 2],
+    op: [Buf; 2],
+}
+
 enum Mix {
     Gdn(GdnL),
     Attn(AttnL),
     Conv(ConvL),
+    Kda(KdaL),
 }
 
 /// LFM2's gated short convolution: the fused B | C | x projection into the
@@ -1502,6 +1581,8 @@ pub(super) struct HPlan {
     /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
     mhc: Option<MhcPlan>,
     dash: Option<DashBufs>,
+    kda: Option<KdaBufs>,
+    mla: Option<MlaBufs>,
     /// A Looped Transformer: the layers after which the final norm is applied
     /// to the stream (`loop_norm_at`), and its weights.
     loop_norm: Vec<usize>,
@@ -1643,7 +1724,7 @@ pub(super) fn wants(layers: &[GraphLayer], nh: usize, nkv: usize, hd: usize) -> 
         return 8 * hpk * hd * 4 > 44_000;
     }
     layers.iter().any(|l| match &l.attn {
-        GraphAttn::Gdn { .. } => true,
+        GraphAttn::Gdn { .. } | GraphAttn::Kda { .. } | GraphAttn::Mla { .. } => true,
         GraphAttn::Full { q_norm, k_norm, output_gate, .. } => *output_gate || q_norm.is_some() || k_norm.is_some(),
         _ => false,
     })
@@ -1729,6 +1810,29 @@ fn hsig(
                 w(&mut s, out);
                 f(&mut s, taps);
                 s.push(*kernel);
+            }
+            GraphAttn::Kda { q, k, v, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b, g_a, g_b, o_norm, out, nh, dk, dv, kk, lower_bound, .. } => {
+                s.extend([10, *nh, *dk, *dv, *kk, lower_bound.map_or(0, |v| v.to_bits() as usize + 1)]);
+                for g in [q, k, v, f_a, f_b, b, g_a, out] {
+                    w(&mut s, g);
+                }
+                if let Some(g) = g_b {
+                    w(&mut s, g);
+                }
+                for d in [*conv_q, *conv_k, *conv_v, *dt_bias, *a_log, *o_norm] {
+                    f(&mut s, d);
+                }
+            }
+            GraphAttn::Mla { q_a, q_a_norm, q, kv_a, kv_a_norm, kv_b, o, nh, rope, nope, v_dim, lora, scale, no_rope, .. } => {
+                s.extend([11, *nh, *rope, *nope, *v_dim, *lora, scale.to_bits() as usize, *no_rope as usize]);
+                for g in [q, kv_a, kv_b, o] {
+                    w(&mut s, g);
+                }
+                if let Some(g) = q_a {
+                    w(&mut s, g);
+                }
+                f(&mut s, q_a_norm.unwrap_or(&[]));
+                f(&mut s, kv_a_norm);
             }
             _ => s.push(3),
         }
@@ -1859,6 +1963,36 @@ fn build(
                 vdmax = vdmax.max(nv * dv);
                 nvmax = nvmax.max(*nv);
             }
+            GraphAttn::Kda { nh: knh, dk, dv, kk, a_log, dt_bias, o_norm, conv_q, conv_k, conv_v, f_a, f_b, b, g_a, g_b, .. } => {
+                let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
+                if dk != 128 || dv != dk || knh == 0 || kk < 1 || kk > 9 {
+                    return Err(format!("layer {li}: KDA geometry nh {knh} dk {dk} dv {dv} kk {kk}"));
+                }
+                let kd = knh * dk;
+                if conv_q.len() != kd * kk
+                    || conv_k.len() != kd * kk
+                    || conv_v.len() != knh * dv * kk
+                    || dt_bias.len() != kd
+                    || o_norm.len() != dv
+                    || !(a_log.len() == knh || a_log.len() == dk || a_log.len() == kd)
+                {
+                    return Err(format!("layer {li}: KDA constants of unexpected lengths"));
+                }
+                if [f_a, f_b, b, g_a].iter().any(|g| g.kind != 4) || g_b.as_ref().is_some_and(|g| g.kind != 4) {
+                    return Err(format!("layer {li}: KDA low-rank projections that are not f32"));
+                }
+                cdmax = cdmax.max(2 * kd + knh * dv);
+                vdmax = vdmax.max(knh * dv);
+            }
+            GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, no_rope, q_a, .. } => {
+                let hdm = rope + nope;
+                if *mnh != nh || hdm % 32 != 0 || hdm > 512 || *v_dim > hdm || v_dim % 32 != 0 || lora % 32 != 0 || !*no_rope || q_a.is_some() {
+                    return Err(format!("layer {li}: MLA geometry rope {rope} nope {nope} v {v_dim} lora {lora} (rotary {})", !no_rope));
+                }
+                qrow = qrow.max(nh * hdm);
+                kvmax = kvmax.max(nh * hdm);
+                hdmax = hdmax.max(hdm);
+            }
             GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
                 // a geometry equal to the call-wide one (a stack where only some
                 // layers differ) is the call-wide one, a sliding window aside
@@ -1976,6 +2110,35 @@ fn build(
     // a sandwich-normed product's rows before their norm; a head gate's logits
     let yo = f4(NMAX * hidden)?;
     let hgv = f4(NMAX * nh)?;
+    // Kimi-Linear: the KDA layers' rows (their low-rank widths at most 512)
+    // and the MLA layers' (the latent and rope key, kv_b's heads, planes)
+    let kda_bufs = match layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Kda { nh, dk, dv, .. } => Some((*nh, *dk, *dv)),
+        _ => None,
+    }) {
+        Some((knh, dk, dv)) => Some(KdaBufs {
+            fa: f4(NMAX * 512)?,
+            f: f4(NMAX * knh * dk)?,
+            braw: f4(NMAX * knh)?,
+            ga: f4(NMAX * 512.max(knh * dv))?,
+            gate: f4(NMAX * knh * dv)?,
+            gd: f4(NMAX * knh * dk)?,
+            beta: f4(NMAX * knh)?,
+        }),
+        None => None,
+    };
+    let mla_bufs = match layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Mla { nh, rope, nope, v_dim, lora, .. } => Some((*nh, *rope, *nope, *v_dim, *lora)),
+        _ => None,
+    }) {
+        Some((mnh, rope, nope, vd, lora)) => Some(MlaBufs {
+            kva: f4(NMAX * (lora + rope))?,
+            kvb: f4(NMAX * mnh * (nope + vd))?,
+            lp: [Buf::new(NMAX * lora * 2 + 64)?, Buf::new(NMAX * lora * 2 + 64)?],
+            op: [Buf::new(NMAX * mnh * vd * 2 + 64)?, Buf::new(NMAX * mnh * vd * 2 + 64)?],
+        }),
+        None => None,
+    };
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
     let moe_bufs = if moe_e > 0 {
         let smax = (NMAX * moe_k).min(moe_e);
@@ -2361,7 +2524,121 @@ fn build(
                     }
                     None => None,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None })
+            }
+            GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
+                let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
+                let (kd, vd) = (knh * dk, knh * dv);
+                let cdim = 2 * kd + vd;
+                let qm = hmat(c, st, model, qw, kd, hidden)?;
+                let km = hmat(c, st, model, kw, kd, hidden)?;
+                let vm = hmat(c, st, model, vw, vd, hidden)?;
+                let om = hmat(c, st, model, ow, hidden, vd)?;
+                // the low-rank projections are f32 (no tensor index): their
+                // ranks from their lengths
+                if f_a.data.len() % hidden != 0 || g_a.data.len() % hidden != 0 {
+                    return Err(format!("layer {li}: KDA low-rank projections of unexpected lengths"));
+                }
+                let (rank_f, rank_g) = (f_a.data.len() / hidden, g_a.data.len() / hidden);
+                if rank_f > 512 || (g_b.is_some() && rank_g > 512) {
+                    return Err(format!("layer {li}: KDA ranks {rank_f} / {rank_g} past 512"));
+                }
+                let fa = hmat(c, st, model, f_a, rank_f, hidden)?;
+                let fb = hmat(c, st, model, f_b, kd, rank_f)?;
+                let bm = hmat(c, st, model, bw, knh, hidden)?;
+                if f_b.data.len() != kd * rank_f || bw.data.len() != knh * hidden || g_b.as_ref().is_some_and(|g| g.data.len() != vd * rank_g) || (g_b.is_none() && rank_g != vd) {
+                    return Err(format!("layer {li}: KDA projections of unexpected lengths"));
+                }
+                let gam = hmat(c, st, model, g_a, rank_g, hidden)?;
+                let gbm = match g_b {
+                    Some(g) => Some(hmat(c, st, model, g, vd, rank_g)?),
+                    None => None,
+                };
+                for d in [*conv_q, *conv_k, *conv_v, *dt_bias, *a_log, *o_norm] {
+                    note(d);
+                }
+                let taps: Vec<f32> = conv_q.iter().chain(conv_k.iter()).chain(conv_v.iter()).copied().collect();
+                let ms_in = mmaset(&[
+                    (&qm, qkv.ptr, 0, cdmax, kd),
+                    (&km, qkv.ptr + (kd * 4) as u64, 0, cdmax, kd),
+                    (&vm, qkv.ptr + (2 * kd * 4) as u64, 0, cdmax, vd),
+                ])?;
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Kda(KdaL {
+                    q: qm,
+                    k: km,
+                    v: vm,
+                    out: om,
+                    taps: Arc::new(Buf::from_slice(&taps)?),
+                    fa,
+                    fb,
+                    b: bm,
+                    ga: gam,
+                    gb: gbm,
+                    a_log: st.f32_buf(a_log)?,
+                    a_len: a_log.len(),
+                    dt_bias: st.f32_buf(dt_bias)?,
+                    o_norm: st.f32_buf(o_norm)?,
+                    lower: *lower_bound,
+                    nh: knh,
+                    dk,
+                    dv,
+                    kk,
+                    cdim,
+                    ms_in,
+                    ms_out,
+                })
+            }
+            GraphAttn::Mla { q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, .. } => {
+                let (rope, nope, vd, lora) = (*rope, *nope, *v_dim, *lora);
+                let lhd = rope + nope;
+                let lfx = match st.hyb.funcs.get(&(1, lhd)) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = Arc::new(load_funcs(c, 1, lhd)?);
+                        st.hyb.funcs.insert((1, lhd), f.clone());
+                        f
+                    }
+                };
+                let mb = mla_bufs.as_ref().ok_or("MLA rows missing")?;
+                let qm = hmat(c, st, model, qw, mnh * lhd, hidden)?;
+                let kvam = hmat(c, st, model, kv_a, lora + rope, hidden)?;
+                let kvbm = hmat(c, st, model, kv_b, mnh * (nope + vd), lora)?;
+                let om = hmat(c, st, model, ow, hidden, mnh * vd)?;
+                note(kv_a_norm);
+                let ms_in = mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?;
+                let ms_kvb = mmaset(&[(&kvbm, mb.kvb.ptr, 0, mnh * (nope + vd), mnh * (nope + vd))])?;
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Attn(AttnL {
+                    q: qm,
+                    k: kvam,
+                    v: kvbm.clone(),
+                    o: om,
+                    qn: None,
+                    kn: None,
+                    gated: false,
+                    late: false,
+                    v_norm: false,
+                    bias: None,
+                    hg: None,
+                    window: None,
+                    sink: None,
+                    local: 0,
+                    half: 0,
+                    nkv: *mnh,
+                    hd: lhd,
+                    fx: lfx,
+                    ms_in,
+                    ms_out,
+                    dash: None,
+                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale }),
+                })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
                 let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
@@ -2470,7 +2747,8 @@ fn build(
     let _ = lm_rows;
     let pp = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     static PLAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. })).count();
+    // every attention layer's call record (MLA's included)
+    let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. } | GraphAttn::Mla { .. })).count();
     let has_dash = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.dash.is_some()));
     Ok(HPlan {
         id: PLAN_ID.fetch_add(1, Ordering::Relaxed),
@@ -2491,6 +2769,8 @@ fn build(
             Some((ns, iters, pre_scale)) => Some(MhcPlan { ns, iters, pre_scale, r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
             None => None,
         },
+        kda: kda_bufs,
+        mla: mla_bufs,
         dash: if has_dash {
             let cand = DASH_ROWS * DASH_BLOCKS;
             Some(DashBufs {
@@ -2693,7 +2973,7 @@ fn admit(
             continue;
         }
         match (&pl.mix, &l.attn) {
-            (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
+            (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. } | GraphAttn::Mla { cpu_k, cpu_v, cpu_base, .. }) => {
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
                 // (the layer's own head geometry)
                 let row = a.nkv * a.hd / 2;
@@ -2793,6 +3073,83 @@ fn admit(
                 };
                 let gs = alloc().map_err(soft)?;
                 c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nv)) * 4) as u64, Ordering::Relaxed);
+                st.hyb.gdn.insert(key, gs);
+            }
+            (Mix::Kda(g), GraphAttn::Kda { cpu_state, .. }) => {
+                // a GDN layer's state (nv = nk = the heads): the conv ring of the
+                // q | k | v channels, S; the host's rings are one a projection
+                let dims = (g.nh, g.nh, g.dk, g.dv, g.kk);
+                let ring_n = (g.kk - 1) * g.cdim;
+                let s_n = g.nh * g.dk * g.dv;
+                if let Some(gs) = st.hyb.gdn.get_mut(&key) {
+                    if gs.dims == dims && gs.next_pos == pos0 {
+                        continue;
+                    }
+                    if gs.dims == dims && pos0 == 0 {
+                        // a new sequence on the same id: no history
+                        unsafe {
+                            cu::memset_d8_async(gs.s.ptr, 0, s_n * 4, c.stream).map_err(|e| soft(derr(e)))?;
+                            cu::memset_d8_async(gs.ring.ptr, 0, ring_n.max(1) * 4, c.stream).map_err(|e| soft(derr(e)))?;
+                        }
+                        gs.next_pos = 0;
+                        gs.tape = None;
+                        continue;
+                    }
+                    return Err((true, format!("KDA state of layer {li} is at row {}, the call at {pos0}", gs.next_pos)));
+                }
+                if pos0 > 0 && cpu_state.len() != ring_n + s_n {
+                    return Err(soft("KDA host seed missing for a nonzero position".into()));
+                }
+                // the seven buffers of a layer in one allocation, zeroed
+                let sizes = [s_n, ring_n, NMAX * plan.cdmax, NMAX * g.cdim, NMAX * 2 * g.nh, s_n, ring_n].map(|n| (n.max(1) * 4).next_multiple_of(256));
+                let alloc = || -> Res<GdnState> {
+                    let all = Buf::new(sizes.iter().sum())?;
+                    unsafe { cu::memset_d8_async(all.ptr, 0, all.bytes, c.stream).map_err(derr)? };
+                    let mut at = 0usize;
+                    let mut v = Vec::with_capacity(sizes.len());
+                    for &n in &sizes {
+                        v.push(all.view(at, n));
+                        at += n;
+                    }
+                    let mut v = v.into_iter();
+                    let mut next = || v.next().ok_or("GDN state views");
+                    let (s, ring, t_qkv, t_cq, t_gb, s_save, ring_save) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
+                    if pos0 > 0 {
+                        unsafe {
+                            if ring_n > 0 {
+                                // [q ring | k ring | v ring] (each [kk - 1][its channels])
+                                // into one ring of [kk - 1][q | k | v]
+                                let (kd, vd, rows) = (g.nh * g.dk, g.nh * g.dv, g.kk - 1);
+                                let mut r = vec![0f32; ring_n];
+                                for j in 0..rows {
+                                    let dst = &mut r[j * g.cdim..(j + 1) * g.cdim];
+                                    dst[..kd].copy_from_slice(&cpu_state[j * kd..(j + 1) * kd]);
+                                    dst[kd..2 * kd].copy_from_slice(&cpu_state[rows * kd + j * kd..rows * kd + (j + 1) * kd]);
+                                    dst[2 * kd..].copy_from_slice(&cpu_state[2 * rows * kd + j * vd..2 * rows * kd + (j + 1) * vd]);
+                                }
+                                super::htod(ring.ptr, &r)?;
+                            }
+                            cu::memcpy_htod_async(s.ptr, &cpu_state[ring_n..], c.stream).map_err(derr)?;
+                        }
+                    }
+                    Ok(GdnState {
+                        dims,
+                        _all: all,
+                        s,
+                        ring,
+                        next_pos: pos0,
+                        t_qkv,
+                        t_stride: plan.cdmax,
+                        t_cq,
+                        t_gb,
+                        s_save,
+                        ring_save,
+                        tape: None,
+                        snap: None,
+                    })
+                };
+                let gs = alloc().map_err(soft)?;
+                c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nh)) * 4) as u64, Ordering::Relaxed);
                 st.hyb.gdn.insert(key, gs);
             }
             (Mix::Conv(cv), GraphAttn::ShortConv { cpu_state, .. }) => {
@@ -3044,9 +3401,9 @@ fn book(
             farp.push((0, 0.0, false));
         }
         match &pl.mix {
-            Mix::Gdn(_) | Mix::Conv(_) => {
-                if tape && matches!(pl.mix, Mix::Conv(_)) {
-                    return Err("a verify window over a short convolution".into());
+            Mix::Gdn(_) | Mix::Conv(_) | Mix::Kda(_) => {
+                if tape && matches!(pl.mix, Mix::Conv(_) | Mix::Kda(_)) {
+                    return Err("a verify window over a short convolution or a KDA layer".into());
                 }
                 let gs = st.hyb.gdn.get_mut(&key).ok_or("GDN state missing")?;
                 layers.push([gs.s.ptr, gs.ring.ptr, gs.t_qkv.ptr, gs.t_cq.ptr, gs.t_gb.ptr, gs.s_save.ptr, gs.ring_save.ptr]);
@@ -3181,6 +3538,80 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
         hst(c, 0, &mut t0)?;
         match &pl.mix {
+            Mix::Kda(g) => {
+                let [gs_s, gs_ring, _t_qkv, t_cq, _t_gb, _s_save, _ring_save] = lb;
+                let kb = plan.kda.as_ref().ok_or("KDA rows missing")?;
+                let (kd, vd) = (g.nh * g.dk, g.nh * g.dv);
+                let (cd_i, kk_i, nh_i, dk_i, dv_i) = (g.cdim as i32, g.kk as i32, g.nh as i32, g.dk as i32, g.dv as i32);
+                let qs_i = plan.cdmax as i32;
+                let xn = plan.xn.ptr;
+                let nul = 0u64;
+                unsafe {
+                    g.ms_in.run(c, fx, planes, hidden, n)?;
+                    hst(c, 1, &mut t0)?;
+                    // the low-rank decay, β and the output gate: f32 products over the normed rows
+                    let rank_f = g.fa.rows;
+                    c.gemm(true, false, rank_f, n, hidden, 1.0, g.fa.w.ptr, hidden, xn, hidden, 0.0, kb.fa.ptr, rank_f, Gemm::F32)?;
+                    c.gemm(true, false, kd, n, rank_f, 1.0, g.fb.w.ptr, rank_f, kb.fa.ptr, rank_f, 0.0, kb.f.ptr, kd, Gemm::F32)?;
+                    c.gemm(true, false, g.nh, n, hidden, 1.0, g.b.w.ptr, hidden, xn, hidden, 0.0, kb.braw.ptr, g.nh, Gemm::F32)?;
+                    let gate = match &g.gb {
+                        Some(gb) => {
+                            let rank_g = g.ga.rows;
+                            c.gemm(true, false, rank_g, n, hidden, 1.0, g.ga.w.ptr, hidden, xn, hidden, 0.0, kb.ga.ptr, rank_g, Gemm::F32)?;
+                            c.gemm(true, false, vd, n, rank_g, 1.0, gb.w.ptr, rank_g, kb.ga.ptr, rank_g, 0.0, kb.gate.ptr, vd, Gemm::F32)?;
+                            kb.gate.ptr
+                        }
+                        None => {
+                            c.gemm(true, false, vd, n, hidden, 1.0, g.ga.w.ptr, hidden, xn, hidden, 0.0, kb.ga.ptr, vd, Gemm::F32)?;
+                            kb.ga.ptr
+                        }
+                    };
+                    // the conv, SiLU and the q / k norms: the GDN front without its gate blocks
+                    let units = (g.cdim / g.dk) as u32;
+                    c.launch(
+                        fx.front,
+                        (units, n as u32),
+                        g.dk.max(64) as u32,
+                        0,
+                        kargs!(plan.qkv.ptr, qs_i, gs_ring, g.taps.ptr, t_cq, n_i, cd_i, kk_i, nh_i, dk_i, xn, hid_i, nul, nul, g.a_log.ptr, g.dt_bias.ptr, nul, nh_i),
+                    )?;
+                    let (lb_on, lbv) = match g.lower {
+                        Some(v) => (1i32, v),
+                        None => (0i32, 0f32),
+                    };
+                    let (kd_i, al_i) = (kd as i32, g.a_len as i32);
+                    c.launch(
+                        fx.kda_gates,
+                        ((n * kd).div_ceil(256) as u32, 1),
+                        256,
+                        0,
+                        kargs!(kb.f.ptr, kd_i, kb.braw.ptr, nh_i, g.a_log.ptr, al_i, g.dt_bias.ptr, kb.gd.ptr, kb.beta.ptr, n_i, nh_i, dk_i, lb_on, lbv),
+                    )?;
+                    // the delta rule, with blocks after it that move the conv ring
+                    let ring_p = if g.kk > 1 { gs_ring } else { 0 };
+                    let ring_blocks = if g.kk > 1 { (g.cdim as u32).div_ceil(128) } else { 0 };
+                    c.launch(
+                        fx.kda_scan4,
+                        ((g.nh * g.dv / 32) as u32 + ring_blocks, 1),
+                        128,
+                        0,
+                        kargs!(t_cq, kb.gd.ptr, kb.beta.ptr, gs_s, plan.o.ptr, n_i, cd_i, nh_i, dv_i, ring_p, plan.qkv.ptr, qs_i, kk_i),
+                    )?;
+                    hst(c, 2, &mut t0)?;
+                    // the sigmoid-gated norm of each head into the planes, the output product
+                    let (zs_i, sig1, zero_h) = (vd as i32, 1i32, 0i32);
+                    c.launch(
+                        fx.out32,
+                        ((n * g.nh) as u32, 1),
+                        g.dv as u32,
+                        0,
+                        kargs!(plan.o.ptr, gate, zs_i, g.o_norm.ptr, nul, nh_i, dv_i, eps, sig1, zero_h, pp0, pp1, pp2, ps_i),
+                    )?;
+                    hst(c, 3, &mut t0)?;
+                    g.ms_out.run(c, fx, planes, vd, n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
+                }
+            }
             Mix::Conv(cv) => {
                 let ring = lb[1];
                 let (cd_i, k_i, n_i2) = (plan.cdmax as i32, cv.kernel as i32, n as i32);
@@ -3289,6 +3720,22 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
+                    if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
+                        // MLA: the latent's norm into its planes, kv_b over it, the
+                        // heads' keys [k_rope | k_nope] and values [v | 0]
+                        let (lora_i, st_i) = (ml.lora as i32, (ml.lora + ml.rope) as i32);
+                        c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, mb.lp[0].ptr, mb.lp[1].ptr, lora_i))?;
+                        let lpl = Planes { p0: mb.lp[0].ptr, p1: mb.lp[1].ptr, p2: mb.lp[1].ptr, stride: ml.lora };
+                        ml.ms_kvb.run(c, fx, &lpl, ml.lora, n)?;
+                        let (rope_i, nope_i, vd_i) = (ml.rope as i32, ml.nope as i32, ml.vd as i32);
+                        c.launch(
+                            fx.mla_kv,
+                            ((n * nh * hd).div_ceil(256) as u32, 1),
+                            256,
+                            0,
+                            kargs!(mb.kva.ptr, st_i, mb.kvb.ptr, plan.k.ptr, plan.v.ptr, n_i, nh_i, rope_i, nope_i, vd_i, lora_i),
+                        )?;
+                    }
                     if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
                         // DASH: the rows rotated by their own angles and appended,
                         // the router a row, the closing blocks' summaries, the
@@ -3357,12 +3804,14 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     )?;
                     // a grid for any record: blocks past the call's keys leave
                     let nblk = ATTN_NBLK as u32;
+                    // MLA's own softmax scale (1/√(rope + nope), YaRN-corrected)
+                    let scale_l = a.mla.as_ref().map_or(plan.scale, |m| m.scale);
                     c.launch_3d(
                         fx.scores,
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, plan.scale, rb_i, ncap_i, nbcap_i, n_i, cip),
+                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, scale_l, rb_i, ncap_i, nbcap_i, n_i, cip),
                     )?;
                     if far != 0 {
                         // the far part: one more block of P and E, and its maximum
@@ -3412,7 +3861,16 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         c.launch(fx.head_gate, ((nh * hd).div_ceil(256) as u32, n as u32), 256, 0, kargs!(pp0, pp1, ps_i, plan.hgv.ptr, nh_i2, hd_i2, n_i3))?;
                     }
                     prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
-                    a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                    if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
+                        // MLA: the heads cut back to v wide for the output product
+                        let tot = n * nh * ml.vd;
+                        let (od_i, hd_i2, vd_i) = ((nh * ml.vd) as i32, hd as i32, ml.vd as i32);
+                        c.launch(fx.mla_cut, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pp0, pp1, ps_i, mb.op[0].ptr, mb.op[1].ptr, od_i, n_i, nh_i, hd_i2, vd_i))?;
+                        let opl = Planes { p0: mb.op[0].ptr, p1: mb.op[1].ptr, p2: mb.op[1].ptr, stride: nh * ml.vd };
+                        a.ms_out.run(c, fx, &opl, nh * ml.vd, n)?;
+                    } else {
+                        a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                    }
                     sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 6, &mut t0)?;
                     }
@@ -3610,8 +4068,8 @@ fn small_only(l: &HLayer) -> bool {
     // FFN's sandwich aside
     (l.moe.is_some() && l.ffn_out.is_some())
         || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
-        || matches!(l.mix, Mix::Conv(_))
-        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
+        || matches!(l.mix, Mix::Conv(_) | Mix::Kda(_))
+        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.mla.is_some())
 }
 
 /// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
@@ -4676,6 +5134,7 @@ unsafe fn big(
             let mut v = vec![(l.gu.rows, l.gu.cols), (l.down.rows, l.down.cols)];
             match &l.mix {
                 Mix::Gdn(g) => v.extend([(g.qkv.rows, g.qkv.cols), (g.z.rows, g.z.cols), (g.out.rows, g.out.cols)]),
+                Mix::Kda(g) => v.extend([(g.q.rows, g.q.cols), (g.k.rows, g.k.cols), (g.v.rows, g.v.cols), (g.out.rows, g.out.cols)]),
                 Mix::Attn(a) => v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]),
                 Mix::Conv(cv) => v.extend([(cv.inp.rows, cv.inp.cols), (cv.out.rows, cv.out.cols)]),
             }
@@ -4791,6 +5250,7 @@ unsafe fn big(
         match &pl.mix {
             // the prompt path is not entered with such a layer (see its guard)
             Mix::Conv(_) => return Err("a short convolution on the prompt path".into()),
+            Mix::Kda(_) => return Err("a KDA layer on the prompt path".into()),
             Mix::Gdn(g) => {
                 let (cd_i, kk_i, nv_i, nk_i, dk_i, dv_i) =
                     (g.cdim as i32, g.kk as i32, g.nv as i32, g.nk as i32, g.dk as i32, g.dv as i32);
