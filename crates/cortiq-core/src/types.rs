@@ -141,6 +141,17 @@ pub enum TensorDtype {
     /// cols % 32 == 0 only.
     #[serde(rename = "mxfp4")]
     Mxfp4 = 21,
+    /// NVIDIA NVFP4: FP4 E2M1 elements with ONE unsigned E4M3 scale byte per
+    /// 16 consecutive elements of a row and one f32 scale per tensor
+    /// (`crate::nvfp4`). 4.5 bits/weight.
+    ///
+    /// `[codes: rows · cols/2][scales: rows · cols/16][global: f32]` — the
+    /// `mxfp4` code plane, a 16-element UE4M3 scale plane and the tensor
+    /// factor last. Value = `E2M1(code) · UE4M3(scale) · global`. ggml's
+    /// `block_nvfp4` re-packs into it without touching a value. 2-D tensors
+    /// with cols % 16 == 0 only.
+    #[serde(rename = "nvfp4")]
+    Nvfp4 = 22,
 }
 
 impl TensorDtype {
@@ -168,6 +179,7 @@ impl TensorDtype {
             19 => Self::BinaryLowRank,
             20 => Self::Q1G,
             21 => Self::Mxfp4,
+            22 => Self::Nvfp4,
             _ => return None,
         })
     }
@@ -207,6 +219,7 @@ impl TensorDtype {
             Self::BinaryLowRank => "blr",
             Self::Q1G => "q1g",
             Self::Mxfp4 => "mxfp4",
+            Self::Nvfp4 => "nvfp4",
         }
     }
 
@@ -233,6 +246,7 @@ impl TensorDtype {
                 | Self::Q2TiledP
                 | Self::BinaryLowRank
                 | Self::Mxfp4
+                | Self::Nvfp4
         )
     }
 }
@@ -452,6 +466,14 @@ pub struct Qwen4ExpConfig {
     pub make_ngram_vocab_size_divisible_by: usize,
     pub split_ngram_parts: usize,
     pub seed: u64,
+    /// Latent MoE (Edge0): the routed experts read and write a
+    /// `latent_dim`-wide copy of the token, through `latent_groups` D/U
+    /// pairs per layer (`mlp.latent_down` / `mlp.latent_up`, the expert's
+    /// group in `mlp.latent_groups`). Absent: experts at full width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent_groups: Option<usize>,
 }
 
 /// Block-diffusion text generation (Clover, `clover_moe`): the model does not

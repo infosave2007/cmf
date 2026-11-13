@@ -24454,7 +24454,7 @@ thread_local! {
 }
 
 /// Dense SwiGLU FFN through QTensor matvecs (any storage).
-fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+pub(crate) fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     // Per-token sparsity, when the file was built for it: gate first,
     // then only the chosen neurons' up/down rows leave the mmap.
     if gate_topk() > 0

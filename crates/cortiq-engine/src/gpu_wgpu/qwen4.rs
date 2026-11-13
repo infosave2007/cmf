@@ -28,6 +28,9 @@ use super::*;
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
 
+/// Latent MoE layers (Edge0).
+pub(crate) mod lat;
+
 /// WGSL for the kernels this stack adds on top of the main module.
 pub(crate) const QWEN4_WGSL: &str = r#"
 enable wgpu_binding_array;
@@ -6712,6 +6715,8 @@ pub(crate) struct Dev {
     /// Routing kept to the experts the arena holds (`set_masked`): the narrow bundle of a
     /// request decodes with no cold winner, as a resident model does.
     pub(crate) masked: bool,
+    /// Latent MoE layers (Edge0): per layer its resident experts and router, or None.
+    pub(crate) lat: Vec<Option<lat::LatDev>>,
 }
 
 /// Indirect-argument slots per layer row (16 bytes each).
@@ -7553,6 +7558,7 @@ impl Dev {
             sbank: Vec::new(),
             route_cap: None,
             masked: false,
+            lat: Vec::new(),
         })
     }
 
@@ -10008,21 +10014,29 @@ pub(crate) fn encode_layer(
     if grew {
         dev.forget_layer(li);
     }
-    let global = c.dsv4_global_moe.lock().unwrap().get(&uid).cloned()?;
-    if global.gu_q2 != g.gu_q2 || global.fp4 {
-        return None;
-    }
-    let (p_gu, p_dn) = dsv4_global_moe_pipelines(c, g.gu_q2, global.segments)?;
-    // Per layer, not the shared frame pool: a chain writes every layer's
-    // remap before one submit, and one buffer would route all of them with
-    // the last layer's table.
-    let remapb = store_slot(
-        c,
-        T_REMAP,
-        uid,
-        li,
-        bytemuck::cast_slice(&remap[..g.n_experts]),
-    );
+    // a latent layer (Edge0) runs its own MoE stage: no expert arena
+    let latent_here = dev.lat.get(li).is_some_and(Option::is_some);
+    let global = c.dsv4_global_moe.lock().unwrap().get(&uid).cloned();
+    let arena_parts = if latent_here {
+        None
+    } else {
+        let global = global.as_ref()?;
+        if global.gu_q2 != g.gu_q2 || global.fp4 {
+            return None;
+        }
+        let (p_gu, p_dn) = dsv4_global_moe_pipelines(c, g.gu_q2, global.segments)?;
+        // Per layer, not the shared frame pool: a chain writes every layer's
+        // remap before one submit, and one buffer would route all of them with
+        // the last layer's table.
+        let remapb = store_slot(
+            c,
+            T_REMAP,
+            uid,
+            li,
+            bytemuck::cast_slice(&remap[..g.n_experts]),
+        );
+        Some((p_gu, p_dn, remapb))
+    };
 
     let d: &Dev = &*dev;
     let bc = Bc {
@@ -11660,6 +11674,23 @@ pub(crate) fn encode_layer(
         )?;
     }
     ts_pass(&mut pass, 5);
+    if let Some(Some(lt)) = d.lat.get(li) {
+        if !skip("experts") {
+            lat::encode(c, p, &mut pass, bc, model, lt, hidden, &x2, hs, &mo, nt)?;
+        }
+        ts_pass(&mut pass, 7);
+        drop(pass);
+        for (t, h, r) in ple_snapped {
+            if let Some(e) = dev.ple_snaps[li].get_mut(t) {
+                e.1 = h;
+                e.2 = r;
+            }
+        }
+        dev.ple_touched[li] += ple_pushes;
+        dev.pending_inject = true;
+        return Some(LayerOut { cold: tbuf(c, T_COLD, 4 * g.top_k * 4, false), x2 });
+    }
+    let (global, (p_gu, p_dn, remapb)) = (global?, arena_parts?);
     let slots = g.top_k + 1;
     let logits = tbuf(c, T_LOGITS, g.n_experts * 4, false);
     let forced = tbuf_exact(c, T_FORCED, slots * 4, false);

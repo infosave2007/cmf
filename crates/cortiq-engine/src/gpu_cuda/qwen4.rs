@@ -28,7 +28,7 @@ use super::{
 use crate::linear_core::GdnWeights;
 use crate::pipeline::{Act, DenseFfn, MoeFfn};
 use crate::qtensor::QTensor;
-use crate::qwen4_exp::{Cfg, GatedResidual, Globals, Layer, Mixer, PleWeights, QsaWeights};
+use crate::qwen4_exp::{Cfg, GatedResidual, Globals, Latent, Layer, Mixer, PleWeights, QsaWeights};
 
 /// Rows of one expert sub-batch (experts x the longest token list among them).
 const XR: usize = 16384;
@@ -42,6 +42,9 @@ const DS_BUDGET: usize = 256 << 20;
 pub(crate) const MAX_CHUNK: usize = 8192;
 /// Token rows the small path takes: a decode step or a verify round.
 const SMALL_ROWS: usize = 8;
+/// Picks (token rows x top-k) a latent layer still computes straight from the NVFP4 slots; past
+/// them a chunk expands each sub-batch's experts for the batched GEMMs.
+const LAT_PICKS: usize = 512;
 /// Token rows of one unit of the expert kernels (`Q4_UR` of `qwen4.cu`), the
 /// words of a unit: the slot address, then the rows.
 const UNIT_ROWS: usize = 4;
@@ -77,7 +80,7 @@ macro_rules! qfuncs {
 qfuncs!(
     tile, grms, grms_inj, grms_inj4, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_scan_c, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
-    scatter, shared_add, argmax, mtp_fuse, units,
+    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_scatter,
 );
 unsafe impl Send for QFuncs {}
 unsafe impl Sync for QFuncs {}
@@ -681,6 +684,32 @@ struct LayerW {
     mix: Mix,
     ple: Option<PleW>,
     moe: MoeW,
+    /// A latent layer's MoE (Edge0); `moe` is then a placeholder.
+    lat: Option<LatW>,
+}
+
+/// A latent MoE layer on the card: the router (and the shared expert's gate row), D and U, the shared
+/// expert as q8 planes, every routed expert resident as an NVFP4 slot, the experts' groups.
+struct LatW {
+    router: Buf,
+    r: usize,
+    gcol: i32,
+    topk: usize,
+    ne: usize,
+    dmat: DevMat,
+    umat: DevMat,
+    sh: [DevMat; 3],
+    labels: Buf,
+    /// Per expert the address of its slot.
+    tbl: Buf,
+    tbl_host: Vec<u64>,
+    /// Per expert the globals of gate, up and down.
+    glob: Vec<[f32; 3]>,
+    labels_host: Vec<i32>,
+    _experts: Buf,
+    l: usize,
+    groups: usize,
+    ff: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -765,6 +794,16 @@ struct Scratch {
     out: Buf,
     /// Token ids of a window's rows.
     ids: Buf,
+    /// Latent layers: D's output `[n][G·L]` (f32 and the GEMM type), the experts' sums `[n][G·L]` (f32 and
+    /// the GEMM type), the small path's per-pick act `[rows·topk][ff]` and down `[rows·topk][L]`, the
+    /// sub-batch factors.
+    lxl: Buf,
+    lxlh: Buf,
+    lacc: Buf,
+    lacch: Buf,
+    lact: Buf,
+    ly: Buf,
+    lf: Buf,
 }
 
 /// Page-locked host memory the expert uploads are staged in: a copy from it
@@ -2097,7 +2136,7 @@ impl Build {
         };
         let (fc_e, fc_h) = (mat(p.fc_e)?, mat(p.fc_h)?);
         Ok(MtpW {
-            lw: LayerW { attn, mlp, mix, ple: None, moe },
+            lw: LayerW { attn, mlp, mix, ple: None, moe, lat: None },
             li,
             mixer,
             fc_e,
@@ -2256,6 +2295,100 @@ impl Build {
         };
         let r = ts.iter().map(|t| t.rows()).sum();
         Ok(MoeW { router: self.f32buf(&host_rows(&ts))?, shared, gcol, r, topk: m.top_k.min(ne), ne, tubes, shared_tube, has_tubes })
+    }
+
+    /// A latent layer: every routed expert goes to the card whole, NVFP4 as the file has it, each matrix
+    /// padded to 16 bytes in its slot.
+    fn moe_lat(&mut self, m: &MoeFfn, lat: &Latent, d: &Dims) -> Res<(LatW, MoeW)> {
+        let ne = m.experts.len();
+        if !moe_ok(m) || m.router.rows() != ne || m.router.cols() != d.h {
+            return Err("qwen4 cuda: a latent router this path does not reproduce".into());
+        }
+        let (l, groups) = (lat.dim, lat.groups);
+        let ff = m.experts.first().map_or(0, |e| e.gate_proj.rows());
+        if ff == 0 || !ff.is_multiple_of(16) || !l.is_multiple_of(16) {
+            return Err("qwen4 cuda: latent expert shapes".into());
+        }
+        let q8 = |t: &QTensor, what: &str| -> Res<DevMat> {
+            if t.mapped_q8_2f().is_none() || !t.cols().is_multiple_of(16) {
+                return Err(format!("qwen4 cuda: latent {what} is not q8_2f"));
+            }
+            let bytes = t.mapped_bytes().ok_or_else(|| format!("qwen4 cuda: latent {what} has no file bytes"))?;
+            dev_mat(7, bytes, t.rows(), t.cols())
+        };
+        let dmat = q8(&lat.down, "D")?;
+        let umat = q8(&lat.up, "U")?;
+        let (shf, gate) = m.shared.as_ref().ok_or_else(|| "qwen4 cuda: a latent layer without a shared expert".to_string())?;
+        let sh = [q8(&shf.gate_proj, "shared gate")?, q8(&shf.up_proj, "shared up")?, q8(&shf.down_proj, "shared down")?];
+        for mm in [&dmat, &umat].into_iter().chain(sh.iter()) {
+            self.held += mm.held;
+            self.wq_elems = self.wq_elems.max(mm.rows * mm.cols);
+        }
+        let pad = |n: usize| n.div_ceil(16) * 16;
+        let pg = cortiq_core::nvfp4::nbytes(ff, l).ok_or("qwen4 cuda: latent expert size")?;
+        let pd = cortiq_core::nvfp4::nbytes(l, ff).ok_or("qwen4 cuda: latent expert size")?;
+        let slot = 2 * pad(pg) + pad(pd);
+        let buf = self.buf(ne * slot)?;
+        let mut stage = vec![0u8; slot * 64];
+        let mut glob = Vec::with_capacity(ne);
+        for (c0, chunk) in m.experts.chunks(64).enumerate() {
+            stage.iter_mut().for_each(|b| *b = 0);
+            for (j, e) in chunk.iter().enumerate() {
+                let mut gl = [0f32; 3];
+                for (k, (t, rows, cols, len)) in
+                    [(&e.gate_proj, ff, l, pg), (&e.up_proj, ff, l, pg), (&e.down_proj, l, ff, pd)].into_iter().enumerate()
+                {
+                    let ok = t.rows() == rows && t.cols() == cols && t.model_dtype() == Some(cortiq_core::TensorDtype::Nvfp4);
+                    let bytes = t.mapped_bytes().filter(|b| ok && b.len() == len).ok_or_else(|| {
+                        format!("qwen4 cuda: latent expert {} matrix {k} is not nvfp4 {rows}x{cols}", c0 * 64 + j)
+                    })?;
+                    let at = j * slot + k * pad(pg);
+                    stage[at..at + len].copy_from_slice(bytes);
+                    gl[k] = cortiq_core::nvfp4::global(bytes, rows, cols);
+                }
+                glob.push(gl);
+            }
+            let dst = buf.ptr + (c0 * 64 * slot) as u64;
+            unsafe { cu::memcpy_htod_sync(dst, &stage[..chunk.len() * slot]) }.map_err(derr)?;
+        }
+        let tbl_host: Vec<u64> = (0..ne).map(|e| buf.ptr + (e * slot) as u64).collect();
+        let labels_host: Vec<i32> = lat.labels.iter().map(|&g| g as i32).collect();
+        let tbl = self.f32buf_u64(&tbl_host)?;
+        let labels = Buf::from_slice(&labels_host)?;
+        let mut ts = vec![&m.router];
+        let gcol = match gate {
+            Some(g) if g.rows() == 1 && g.cols() == d.h => {
+                ts.push(g);
+                ne as i32
+            }
+            Some(_) => return Err("qwen4 cuda: unexpected shared-expert gate".into()),
+            None => -1,
+        };
+        let r = ts.iter().map(|t| t.rows()).sum();
+        let router = self.f32buf(&host_rows(&ts))?;
+        let topk = m.top_k.min(ne);
+        let lw = LatW {
+            router,
+            r,
+            gcol,
+            topk,
+            ne,
+            dmat,
+            umat,
+            sh,
+            labels,
+            tbl,
+            tbl_host,
+            glob,
+            labels_host,
+            _experts: buf,
+            l,
+            groups,
+            ff,
+        };
+        // the placeholder of the layer's MoeW: nothing of it is read
+        let ph = MoeW { router: self.buf(16)?, shared: None, gcol: -1, r, topk, ne, tubes: vec![-1; ne], shared_tube: -1, has_tubes: false };
+        Ok((lw, ph))
     }
 }
 
@@ -2456,14 +2589,21 @@ impl Dev {
         let es = if half { 2 } else { 4 };
         let g = &cfg.gdn;
         let first = layers.first().ok_or_else(|| "qwen4 cuda: no layers".to_string())?;
+        // latent layers (Edge0) keep their experts out of the arena, which then serves the MTP head alone:
+        // its geometry is the head's (or Qwen's 640-wide q4tp experts without a head)
+        let latent = layers.iter().any(|l| l.latent.is_some());
+        if latent && !layers.iter().all(|l| l.latent.is_some()) {
+            return Err("qwen4 cuda: latent and full-width layers mixed".into());
+        }
+        let arena_moe = if latent { mtp.map(|p| &p.layer.moe) } else { Some(&first.moe) };
         let ne = first.moe.experts.len();
-        let inter = first.moe.experts.first().map_or(0, |e| e.gate_proj.rows());
+        let inter = arena_moe.and_then(|m| m.experts.first()).map_or(if latent { 640 } else { 0 }, |e| e.gate_proj.rows());
         let h = cfg.hidden;
         if ne == 0 || inter == 0 || !h.is_multiple_of(32) || !inter.is_multiple_of(32) || cfg.compress_ratio == 0 {
             return Err("qwen4 cuda: unexpected expert shapes".into());
         }
         // the experts' gate and up: q2tp (the 2-bit codec) or q4tp
-        let gbits = if first.moe.experts.first().is_some_and(|e| e.gate_proj.mapped_q2tp().is_some()) { 2 } else { 4 };
+        let gbits = if arena_moe.and_then(|m| m.experts.first()).is_some_and(|e| e.gate_proj.mapped_q2tp().is_some()) { 2 } else { 4 };
         let d = Dims {
             h,
             hc: cfg.hc,
@@ -2522,6 +2662,7 @@ impl Dev {
         // shared experts, LM head, MTP head, prompt scratch, tables; and the GDN and QSA layers there are
         let mut mem = [0u64; 9];
         let (mut n_gdn, mut n_qsa) = (0usize, 0usize);
+        let mut lat_dims: Option<(usize, usize, usize)> = None;
         for (li, l) in layers.iter().enumerate() {
             b.li = li;
             let h0 = b.held;
@@ -2546,7 +2687,14 @@ impl Dev {
             };
             mem[3] += b.held - h0;
             let h0 = b.held;
-            let moe = b.moe(&l.moe, &d, d.ne)?;
+            let (moe, lat) = match &l.latent {
+                Some(lt) => {
+                    let (lw, ph) = b.moe_lat(&l.moe, lt, &d)?;
+                    lat_dims = Some((lw.l, lw.groups, lw.ff));
+                    (ph, Some(lw))
+                }
+                None => (b.moe(&l.moe, &d, d.ne)?, None),
+            };
             mem[4] += b.held - h0;
             r_max = r_max.max(attn.r).max(mlp.r);
             lr_max = lr_max.max(attn.lr).max(mlp.lr);
@@ -2555,7 +2703,7 @@ impl Dev {
                 pin_max = pin_max.max(p.pin);
                 hist_max = hist_max.max((d.ple_k - 1) * d.ple_dil * d.w);
             }
-            lws.push(LayerW { attn, mlp, mix, ple, moe });
+            lws.push(LayerW { attn, mlp, mix, ple, moe, lat });
         }
         let h0 = b.held;
         let head = b.hc(&globals.head_hc, &d, false)?;
@@ -2662,6 +2810,13 @@ impl Dev {
             wq: b.buf(b.wq_elems * es)?,
             out: b.buf(SMALL_ROWS * d.vocab * 4)?,
             ids: b.buf(n.max(SMALL_ROWS) * 4)?,
+            lxl: b.buf(lat_dims.map_or(16, |(l, g, _)| n * g * l * 4))?,
+            lxlh: b.buf(lat_dims.map_or(16, |(l, g, _)| n * g * l * es))?,
+            lacc: b.buf(lat_dims.map_or(16, |(l, g, _)| n * g * l * 4))?,
+            lacch: b.buf(lat_dims.map_or(16, |(l, g, _)| n * g * l * es))?,
+            lact: b.buf(lat_dims.map_or(16, |(_, _, ff)| LAT_PICKS.max(tape.max(SMALL_ROWS) * topk) * ff * 4))?,
+            ly: b.buf(lat_dims.map_or(16, |(l, _, _)| LAT_PICKS.max(tape.max(SMALL_ROWS) * topk) * l * 4))?,
+            lf: b.buf(3 * xb * 4 + 64)?,
         };
         mem[7] += b.held - h0;
         let h0 = b.held;
@@ -2690,6 +2845,10 @@ impl Dev {
             slots = slots.min((mb << 20) / slot);
         }
         slots = slots.min(ne * layers.len());
+        if latent {
+            // the arena holds the MTP head's experts only
+            slots = slots.min(2 * ne.max(head_ne));
+        }
         if slots < ne.max(256).min(ne * layers.len()) {
             return Err(format!("qwen4 cuda: room for {slots} experts only, a layer has {ne}"));
         }
@@ -3574,6 +3733,13 @@ impl Core {
                 Ok(self.s.wq.ptr)
             }
         }
+    }
+
+    /// A q8 matrix expanded into the one scratch plane (valid until the next q8 one).
+    fn plane_q8(&self, m: &DevMat) -> Res<u64> {
+        go!(self.c, self.q.expand_q8, (blocks(m.rows * m.cols / 4), 1), 256;
+            m.w.ptr, m.aux0(), m.aux1(), self.s.wq.ptr, m.rows as i32, m.cols as i32, self.hi);
+        Ok(self.s.wq.ptr)
     }
 
     /// Close stage `k` of the profile (waits for the stream).
@@ -4512,6 +4678,203 @@ impl Core {
         Ok(())
     }
 
+    /// A latent layer's MoE (Edge0): the route as the base model's, D, the routed experts in their
+    /// groups' latent rows, U, the shared expert. A few rows take the per-pick kernels straight from the
+    /// NVFP4 slots; a chunk expands each sub-batch's experts for the batched GEMMs.
+    fn moe_lat(&self, lw: &LatW, li: usize, n: usize) -> Res<()> {
+        let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
+        let (l, g, ff, ne, topk) = (lw.l, lw.groups, lw.ff, lw.ne, lw.topk);
+        let gl = g * l;
+        let small = self.small(n);
+        if small {
+            self.mvb(&[SOp::f32(lw.router.ptr, lw.r, s.logits.ptr)], s.folded.ptr, d.h, d.h, n)?;
+        } else {
+            self.gemm_w(lw.router.ptr, lw.r, d.h, s.folded.ptr, n, s.logits.ptr, Gemm::F32)?;
+        }
+        let tail = if small { self.tail } else { 0.0f32 };
+        go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, ne as i32, lw.r as i32, topk as i32, tail, 0u64);
+        self.lap(5)?;
+        let half = self.hi != 0;
+        let (inv, alpha) = if half { (1.0f32 / 16.0, 16.0f32) } else { (1.0f32, 1.0f32) };
+        if !small && n * topk <= LAT_PICKS {
+            // a short chunk: the dense parts as GEMMs, the experts straight from their slots
+            let dp = self.plane_q8(&lw.dmat)?;
+            self.gemm_w(dp, gl, d.h, s.folded_h.ptr, n, s.lxl.ptr, self.gw)?;
+            self.lat_picks(lw, n)?;
+            let acc_g = if half {
+                go!(c, q.to_wt, (blocks(n * gl), 1), 256; s.lacc.ptr, s.lacch.ptr, (n * gl) as u64, 1i32);
+                s.lacch.ptr
+            } else {
+                s.lacc.ptr
+            };
+            let up = self.plane_q8(&lw.umat)?;
+            self.gemm_w(up, d.h, gl, acc_g, n, s.blk.ptr, self.gw)?;
+            self.lap(7)?;
+            return self.lat_shared_chunk(lw, n, inv, alpha);
+        }
+        if small {
+            // D, the picks' gate/up and down straight from their slots, the groups' sums, U
+            self.mvb(&[SOp::q8(&lw.dmat, s.lxl.ptr)], s.folded.ptr, d.h, d.h, n)?;
+            self.lat_picks(lw, n)?;
+            self.mvb(&[SOp::q8(&lw.umat, s.blk.ptr)], s.lacc.ptr, gl, gl, n)?;
+            self.lap(7)?;
+            // the shared expert at full width
+            self.mvb(&[SOp::q8(&lw.sh[0], s.g.ptr), SOp::q8(&lw.sh[1], s.u.ptr)], s.folded.ptr, d.h, d.h, n)?;
+            go!(c, q.act, (blocks(n * ff), 1), 256; s.g.ptr, s.u.ptr, s.ah.ptr, (n * ff) as u64, 0i32, 0i32, 1.0f32);
+            self.mvb(&[SOp::q8(&lw.sh[2], s.d.ptr)], s.ah.ptr, ff, ff, n)?;
+            go!(c, q.shared_add, (blocks(n * d.h), 1), 256; s.blk.ptr, s.d.ptr, s.logits.ptr, n as i32, d.h as i32, lw.r as i32, lw.gcol);
+            return self.lap(8);
+        }
+        // D over the chunk, its GEMM-typed copy for the gathers
+        let dp = self.plane_q8(&lw.dmat)?;
+        self.gemm_w(dp, gl, d.h, s.folded_h.ptr, n, s.lxl.ptr, self.gw)?;
+        let xl_g = if half {
+            go!(c, q.to_wt, (blocks(n * gl), 1), 256; s.lxl.ptr, s.lxlh.ptr, (n * gl) as u64, 1i32);
+            s.lxlh.ptr
+        } else {
+            s.lxl.ptr
+        };
+        let mut picks = vec![0i32; n * topk];
+        unsafe { cu::memcpy_dtoh_async(&mut picks, s.picks.ptr, c.stream) }.map_err(derr)?;
+        c.sync()?;
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
+        for (i, &e) in picks.iter().enumerate() {
+            if e >= 0 && (e as usize) < ne {
+                lists[e as usize].push(i as u32);
+            }
+        }
+        let mut order: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty()).collect();
+        order.sort_by(|&x, &y| lists[y].len().cmp(&lists[x].len()).then(x.cmp(&y)));
+        let (mut i, mut first) = (0usize, true);
+        while i < order.len() {
+            let ne_max = lists[order[i]].len();
+            if ne_max > self.xr {
+                return Err("qwen4 cuda: a latent expert with more rows than the sub-batch".into());
+            }
+            let mut b = 1usize;
+            while i + b < order.len() && b < self.xb && (b + 1) * ne_max <= self.xr {
+                if b >= 8 && lists[order[i + b]].len() * 2 < ne_max {
+                    break;
+                }
+                b += 1;
+            }
+            let rows = b * ne_max;
+            let mut slots = vec![0u64; b];
+            let mut rowtok = vec![-1i32; rows];
+            let mut tokrow = vec![-1i32; n * topk];
+            // the sub-batch's GEMM alphas (the mean globals) and each expert's factor against them
+            let (mut ag, mut au, mut ad) = (0f32, 0f32, 0f32);
+            for j in 0..b {
+                let gl3 = lw.glob[order[i + j]];
+                (ag, au, ad) = (ag + gl3[0].abs(), au + gl3[1].abs(), ad + gl3[2].abs());
+            }
+            let nb = b as f32;
+            let (ag, au, ad) = ((ag / nb).max(1e-30), (au / nb).max(1e-30), (ad / nb).max(1e-30));
+            let mut f = vec![0f32; 3 * b];
+            for j in 0..b {
+                let e = order[i + j];
+                slots[j] = lw.tbl_host[e];
+                let gl3 = lw.glob[e];
+                f[2 * j] = gl3[0] / ag;
+                f[2 * j + 1] = gl3[1] / au;
+                f[2 * b + j] = gl3[2] / ad;
+                let grp = lw.labels_host[e];
+                for (r, &entry) in lists[e].iter().enumerate() {
+                    rowtok[j * ne_max + r] = (entry as usize / topk) as i32 * g as i32 + grp;
+                    tokrow[entry as usize] = (j * ne_max + r) as i32;
+                }
+            }
+            self.put(s.slots.ptr, &slots)?;
+            self.put(s.rowtok.ptr, &rowtok)?;
+            self.put(s.tokrow.ptr, &tokrow)?;
+            self.put(s.lf.ptr, &f)?;
+            go!(c, q.lat_expand, (blocks(ff * l / 8), (3 * b) as u32), 256;
+                s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, ff as i32, l as i32, self.hi);
+            go!(c, q.gather, (blocks(rows * l), 1), 256; xl_g, s.rowtok.ptr, s.xg.ptr, rows as i32, l as i32, self.hi);
+            let (gs, xs, as_, ds) = (ff * l, ne_max * l, ne_max * ff, ne_max * l);
+            unsafe {
+                if half {
+                    gemm_batched_half(c, true, ff, ne_max, l, ag, s.wg.ptr, l, gs, s.xg.ptr, l, xs, s.g.ptr, ff, as_, b)?;
+                    gemm_batched_half(c, true, ff, ne_max, l, au, s.wu.ptr, l, gs, s.xg.ptr, l, xs, s.u.ptr, ff, as_, b)?;
+                } else {
+                    c.gemm_batched(true, ff, ne_max, l, ag, s.wg.ptr, l, gs, s.xg.ptr, l, xs, s.g.ptr, ff, as_, b, self.gw)?;
+                    c.gemm_batched(true, ff, ne_max, l, au, s.wu.ptr, l, gs, s.xg.ptr, l, xs, s.u.ptr, ff, as_, b, self.gw)?;
+                }
+            }
+            go!(c, q.lat_act, (blocks(rows * ff), 1), 256; s.g.ptr, s.u.ptr, s.ah.ptr, s.lf.ptr, rows as i32, ne_max as i32, ff as i32, self.hi, self.hi, inv);
+            unsafe {
+                if half {
+                    gemm_batched_half(c, true, l, ne_max, ff, alpha * ad, s.wd.ptr, ff, gs, s.ah.ptr, ff, as_, s.d.ptr, l, ds, b)?;
+                } else {
+                    c.gemm_batched(true, l, ne_max, ff, alpha * ad, s.wd.ptr, ff, gs, s.ah.ptr, ff, as_, s.d.ptr, l, ds, b, self.gw)?;
+                }
+            }
+            go!(c, q.lat_scatter, (blocks(n * gl), 1), 256;
+                s.d.ptr, s.tokrow.ptr, s.picks.ptr, lw.labels.ptr, s.lf.ptr + (2 * b * 4) as u64, s.wts.ptr, s.lacc.ptr,
+                n as i32, g as i32, l as i32, ne_max as i32, topk as i32, self.hi, first as i32);
+            first = false;
+            i += b;
+        }
+        if first {
+            go!(c, q.zero, (blocks(n * gl), 1), 256; s.lacc.ptr, (n * gl) as u64);
+        }
+        // U over the groups' sums
+        let acc_g = if half {
+            go!(c, q.to_wt, (blocks(n * gl), 1), 256; s.lacc.ptr, s.lacch.ptr, (n * gl) as u64, 1i32);
+            s.lacch.ptr
+        } else {
+            s.lacc.ptr
+        };
+        let up = self.plane_q8(&lw.umat)?;
+        self.gemm_w(up, d.h, gl, acc_g, n, s.blk.ptr, self.gw)?;
+        self.lap(7)?;
+        let _ = li;
+        self.lat_shared_chunk(lw, n, inv, alpha)
+    }
+
+    /// The routed experts of `n` rows straight from their NVFP4 slots: every pick's gate/up and
+    /// down, then the groups' sums into `lacc`.
+    fn lat_picks(&self, lw: &LatW, n: usize) -> Res<()> {
+        let (s, c, q) = (&self.s, self.c, self.q);
+        let (l, g, ff, topk) = (lw.l, lw.groups, lw.ff, lw.topk);
+        let (rb, routes) = (8usize, n * topk);
+        unsafe {
+            c.launch(
+                q.lat_gu,
+                (ff.div_ceil(rb) as u32, routes as u32),
+                256,
+                l * 4,
+                kargs!(s.picks.ptr, lw.labels.ptr, lw.tbl.ptr, s.lxl.ptr, s.lact.ptr, ff as i32, l as i32, g as i32, topk as i32, rb as i32),
+            )
+        }?;
+        unsafe {
+            c.launch(
+                q.lat_dn,
+                (l.div_ceil(rb) as u32, routes as u32),
+                256,
+                ff * 4,
+                kargs!(s.picks.ptr, lw.tbl.ptr, s.lact.ptr, s.ly.ptr, ff as i32, l as i32, rb as i32),
+            )
+        }?;
+        go!(c, q.lat_sum, (blocks(n * g * l), 1), 256; s.picks.ptr, lw.labels.ptr, s.wts.ptr, s.ly.ptr, s.lacc.ptr, n as i32, g as i32, l as i32, topk as i32);
+        Ok(())
+    }
+
+    /// The shared expert of a chunk: one GEMM per projection over all tokens, gated into `blk`.
+    fn lat_shared_chunk(&self, lw: &LatW, n: usize, inv: f32, alpha: f32) -> Res<()> {
+        let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
+        let ff = lw.ff;
+        let sg = self.plane_q8(&lw.sh[0])?;
+        self.gemm_w(sg, ff, d.h, s.folded_h.ptr, n, s.g.ptr, self.gw)?;
+        let su = self.plane_q8(&lw.sh[1])?;
+        self.gemm_w(su, ff, d.h, s.folded_h.ptr, n, s.u.ptr, self.gw)?;
+        go!(c, q.act, (blocks(n * ff), 1), 256; s.g.ptr, s.u.ptr, s.ah.ptr, (n * ff) as u64, 0i32, self.hi, inv);
+        let sd = self.plane_q8(&lw.sh[2])?;
+        unsafe { c.gemm(true, false, d.h, n, ff, alpha, sd, ff, s.ah.ptr, ff, 0.0, s.d.ptr, d.h, self.gw) }?;
+        go!(c, q.shared_add, (blocks(n * d.h), 1), 256; s.blk.ptr, s.d.ptr, s.logits.ptr, n as i32, d.h as i32, lw.r as i32, lw.gcol);
+        self.lap(8)
+    }
+
     /// Tube `t` (a hot expert's gate, up and down at eight bits) as dense planes in the batched path's
     /// expert scratch, at the place of expert `j` of the sub-batch.
     fn expand_tube(&self, t: usize, j: usize) -> Res<()> {
@@ -4784,7 +5147,10 @@ impl Dev {
                 trace.push(("moe_in", li, last(s.folded.ptr, d.h)?));
             }
             k.lap(2)?;
-            k.moe(&lw.moe, layer, li, arena, n, hold)?;
+            match &lw.lat {
+                Some(lt) => k.moe_lat(lt, li, n)?,
+                None => k.moe(&lw.moe, layer, li, arena, n, hold)?,
+            }
             if tr {
                 trace.push(("moe_out", li, last(s.blk.ptr, d.h)?));
             }

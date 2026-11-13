@@ -14,6 +14,7 @@ mod nemotron_pack;
 mod embed;
 mod flint;
 mod hotmix;
+mod edge0;
 mod flint_hybrid;
 mod gguf;
 mod gguf_iq;
@@ -969,6 +970,24 @@ enum Commands {
         /// w the routing weight
         #[arg(long)]
         experts: bool,
+    },
+    /// Import an Edge0 release folder (Edge0-145B / Edge0-120B, the NVFP4
+    /// build): its latent routed experts (NVFP4, bit for bit), the D/U
+    /// projections, group labels, router and shared expert, on the skeleton
+    /// of a Qwen3.8-Flash-Next CMF
+    Edge0Import {
+        /// A Qwen3.8-Flash-Next .cmf: attention, GDN, hyper-connections,
+        /// embeddings, head, MTP head and the n-gram table come from it
+        base: String,
+        /// The Edge0 folder (`model-skeleton.gguf`, `experts.bin`,
+        /// `latent_dense_q8.bin`, `labels.bin`, `native_experts.txt`)
+        edge0: String,
+        /// Output .cmf
+        output: String,
+        /// The n-gram table: `base` (the base file's) or `edge0` (the
+        /// folder's FP8 table, stored as q8_2f)
+        #[arg(long, default_value = "edge0")]
+        ple: String,
     },
     /// A 2-bit FFN with its busiest neurons at 8 bits: every q2tp layer of
     /// COLD cut into the ordinary triple (cold neurons, their 2-bit rows as
@@ -4914,6 +4933,7 @@ async fn main() -> anyhow::Result<()> {
                 hotmix::cmd_hot_probe(&model, &text, &out, tokens, window, skip, &stat, topk)
             }
         }
+        Commands::Edge0Import { base, edge0: dir, output, ple } => edge0::cmd_edge0_import(&base, &dir, &output, &ple),
         Commands::HotBake { cold, hot, stat, output, frac, pick, no_readout, seed, take, experts, bf16_down, shared_q8, whole_experts, scratch, defrag_stats } => {
             if experts {
                 hotmix::cmd_hot_bake_experts(&cold, &hot, &stat, &output, frac, &pick, !no_readout, seed, bf16_down, shared_q8, whole_experts, scratch.as_deref(), defrag_stats.as_deref())

@@ -2318,3 +2318,192 @@ extern "C" __global__ void q4_tube_d(const u32* __restrict__ units, const float*
         }
     }
 }
+
+// ---------------------------------------------------------------- latent NVFP4 experts (Edge0)
+// A latent layer's routed experts work in an `L`-wide copy of the token: expert e of group
+// labels[e] reads row (t * G + g) of xl [n * G][L] (D_g x) and its weighted output is summed into
+// row (t * G + g) of acc [n * G][L], which U brings back to the hidden width. An expert slot holds
+// gate [ff][L], up [ff][L], down [L][ff], each an `nvfp4` payload: E2M1 codes (rows * cols / 2,
+// element 2j in the low nibble of byte j), UE4M3 scales (one per 16 elements), an f32 global.
+
+// E2M1 code -> float, from the bits (sign bit 3, exponent bits 2..1, mantissa bit 0).
+__device__ __forceinline__ float lat_e2m1(u32 c) {
+    const u32 e = (c >> 1) & 3u, m = c & 1u;
+    const u32 mag = e ? (((e + 126u) << 23) | (m << 22)) : (m ? 0x3F000000u : 0u);
+    return __int_as_float((int)(mag | ((c & 8u) << 28)));
+}
+// UE4M3 byte -> float (ggml's contract: bit 7 ignored, 0x7F reads as zero).
+__device__ __forceinline__ float lat_ue4m3(u32 b) {
+    b &= 0x7Fu;
+    if (b == 0u || b == 0x7Fu) return 0.0f;
+    const u32 e = (b >> 3) & 15u, m = b & 7u;
+    return e ? __int_as_float((int)(((e + 120u) << 23) | (m << 20))) : (float)m * 0.001953125f;
+}
+// Bytes a payload of rows x cols takes in a slot: the payload, rounded up to 16 so every matrix's
+// codes start 16-byte aligned.
+__device__ __forceinline__ u64 lat_pbytes(int rows, int cols) {
+    return ((u64)rows * cols / 2 + (u64)rows * cols / 16 + 4 + 15) & ~(u64)15;
+}
+// The f32 global of a payload.
+__device__ __forceinline__ float lat_glob(const u8* p, int rows, int cols) {
+    return *(const float*)(p + (u64)rows * cols / 2 + (u64)rows * cols / 16);
+}
+// Sixteen elements (one scale group) of a row against sixteen staged values.
+__device__ __forceinline__ float lat_dot16(const u8* codes, u32 sc, const float* x) {
+    const uint2 w = *(const uint2*)codes;
+    float a = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const u32 by = (w.x >> (8 * k)) & 0xFFu;
+        a += lat_e2m1(by & 15u) * x[2 * k] + lat_e2m1(by >> 4) * x[2 * k + 1];
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const u32 by = (w.y >> (8 * k)) & 0xFFu;
+        a += lat_e2m1(by & 15u) * x[8 + 2 * k] + lat_e2m1(by >> 4) * x[8 + 2 * k + 1];
+    }
+    return a * lat_ue4m3(sc);
+}
+
+// Gate and up of every pick: act [n * topk][ff] = silu(sg * (G x)) * (su * (U x)), x the pick's latent
+// row. Grid (ff / rb, n * topk), 256 threads; the row of x is staged once a block.
+extern "C" __global__ void q4_lat_gu(const int* __restrict__ picks, const int* __restrict__ labels,
+                                     const u64* __restrict__ tbl, const float* __restrict__ xl,
+                                     float* __restrict__ act, int ff, int L, int G, int topk, int rb)
+{ PDL_PRO();
+    extern __shared__ float lx[];
+    const int r = blockIdx.y, e = picks[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, NW = blockDim.x >> 5;
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, ff);
+    if (e < 0) {
+        for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) act[(u64)r * ff + i] = 0.0f;
+        return;
+    }
+    const float* x = xl + ((u64)(r / topk) * G + labels[e]) * L;
+    for (int i = threadIdx.x; i < L; i += blockDim.x) lx[i] = x[i];
+    __syncthreads();
+    const u8* gp = (const u8*)tbl[e];
+    const u64 pb = lat_pbytes(ff, L);
+    const u8* up = gp + pb;
+    const int gpr = L >> 4;
+    const float sg = lat_glob(gp, ff, L), su = lat_glob(up, ff, L);
+    const u8* gsc = gp + (u64)ff * L / 2;
+    const u8* usc = up + (u64)ff * L / 2;
+    for (int row = r0 + warp; row < r1; row += NW) {
+        float ag = 0.0f, au = 0.0f;
+        for (int k = lane; k < gpr; k += 32) {
+            const u64 o = (u64)row * gpr + k;
+            ag += lat_dot16(gp + o * 8, gsc[o], lx + k * 16);
+            au += lat_dot16(up + o * 8, usc[o], lx + k * 16);
+        }
+        for (int s = 16; s > 0; s >>= 1) {
+            ag += __shfl_xor_sync(0xffffffffu, ag, s);
+            au += __shfl_xor_sync(0xffffffffu, au, s);
+        }
+        if (lane == 0) act[(u64)r * ff + row] = silu_f(sg * ag) * (su * au);
+    }
+}
+
+// Down of every pick: y [n * topk][L] = sd * (D act). Grid (L / rb, n * topk), 256 threads.
+extern "C" __global__ void q4_lat_dn(const int* __restrict__ picks, const u64* __restrict__ tbl,
+                                     const float* __restrict__ act, float* __restrict__ y, int ff, int L, int rb)
+{ PDL_PRO();
+    extern __shared__ float la[];
+    const int r = blockIdx.y, e = picks[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, NW = blockDim.x >> 5;
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, L);
+    if (e < 0) {
+        for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) y[(u64)r * L + i] = 0.0f;
+        return;
+    }
+    for (int i = threadIdx.x; i < ff; i += blockDim.x) la[i] = act[(u64)r * ff + i];
+    __syncthreads();
+    const u8* dp = (const u8*)tbl[e] + 2 * lat_pbytes(ff, L);
+    const int gpr = ff >> 4;
+    const float sd = lat_glob(dp, L, ff);
+    const u8* dsc = dp + (u64)L * ff / 2;
+    for (int row = r0 + warp; row < r1; row += NW) {
+        float a = 0.0f;
+        for (int k = lane; k < gpr; k += 32) {
+            const u64 o = (u64)row * gpr + k;
+            a += lat_dot16(dp + o * 8, dsc[o], la + k * 16);
+        }
+        for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
+        if (lane == 0) y[(u64)r * L + row] = sd * a;
+    }
+}
+
+// acc [n * G][L]: row (t * G + g) = sum over the picks k of token t in group g of wts * y[t * topk + k].
+extern "C" __global__ void q4_lat_sum(const int* __restrict__ picks, const int* __restrict__ labels,
+                                      const float* __restrict__ wts, const float* __restrict__ y,
+                                      float* __restrict__ acc, int n, int G, int L, int topk)
+{ PDL_PRO();
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)n * G * L) return;
+    const u64 tg = i / L, j = i - tg * L;
+    const int t = (int)(tg / G), g = (int)(tg - (u64)t * G);
+    float a = 0.0f;
+    for (int k = 0; k < topk; k++) {
+        const int e = picks[t * topk + k];
+        if (e >= 0 && labels[e] == g) a += wts[t * topk + k] * y[((u64)t * topk + k) * L + j];
+    }
+    acc[i] = a;
+}
+
+// NVFP4 experts -> dense wt planes without their globals (E2M1 * UE4M3, exact in f16): grid
+// (words of a matrix / 256, 3 * B), a thread expands one u32 of codes (8 values).
+extern "C" __global__ void q4_lat_expand(const u64* __restrict__ slots, void* __restrict__ Wg, void* __restrict__ Wu,
+                                         void* __restrict__ Wd, int ff, int L, int half)
+{ PDL_PRO();
+    const int m = blockIdx.y % 3, j = blockIdx.y / 3;
+    const int rows = m == 2 ? L : ff, cols = m == 2 ? ff : L;
+    const u64 wi = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (wi >= (u64)rows * cols / 8 || !slots[j]) return;
+    const u8* p = (const u8*)slots[j] + (u64)m * lat_pbytes(ff, L);
+    const u64 base = wi * 8;
+    const float s = lat_ue4m3(p[(u64)rows * cols / 2 + base / 16]);
+    const u32 w = *(const u32*)(p + wi * 4);
+    void* W = m == 0 ? Wg : (m == 1 ? Wu : Wd);
+    const u64 o = (u64)j * rows * cols + base;
+    for (int k = 0; k < 4; k++) {
+        const u32 by = (w >> (8 * k)) & 0xFFu;
+        stf(W, o + 2 * k, lat_e2m1(by & 15u) * s, half);
+        stf(W, o + 2 * k + 1, lat_e2m1(by >> 4) * s, half);
+    }
+}
+
+// a = silu(fg * g) * (fu * u) * inv for the rows of a sub-batch: row r is expert j = r / per's, whose
+// gate and up GEMMs ran with the sub-batch's alphas; f [2 * B] = (sg_j / alpha_g, su_j / alpha_u).
+extern "C" __global__ void q4_lat_act(const void* __restrict__ g, const void* __restrict__ u, void* __restrict__ a,
+                                      const float* __restrict__ f, int rows, int per, int ff, int in_half,
+                                      int out_half, float inv)
+{ PDL_PRO();
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)rows * ff) return;
+    const int j = (int)(i / ff) / per;
+    stf(a, i, silu_f(f[2 * j] * ldf(g, i, in_half)) * (f[2 * j + 1] * ldf(u, i, in_half)) * inv, out_half);
+}
+
+// acc [n * G][L] (+)= the picks of this sub-batch: row (t * G + g) adds wts * fd * D[row] of every pick
+// k of token t in group g; tokrow [n * topk] is the pick's row of D (-1: not in the sub-batch), whose
+// expert is j = row / per with fd [j] = sd_j / alpha_d.
+extern "C" __global__ void q4_lat_scatter(const void* __restrict__ D, const int* __restrict__ tokrow,
+                                          const int* __restrict__ picks, const int* __restrict__ labels,
+                                          const float* __restrict__ fd, const float* __restrict__ wts,
+                                          float* __restrict__ acc, int n, int G, int L, int per, int topk,
+                                          int d_half, int init)
+{ PDL_PRO();
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)n * G * L) return;
+    const u64 tg = i / L, j = i - tg * L;
+    const int t = (int)(tg / G), g = (int)(tg - (u64)t * G);
+    float a = 0.0f;
+    for (int k = 0; k < topk; k++) {
+        const int row = tokrow[t * topk + k];
+        if (row < 0) continue;
+        const int e = picks[t * topk + k];
+        if (labels[e] != g) continue;
+        a += wts[t * topk + k] * fd[row / per] * ldf(D, (u64)row * L + j, d_half);
+    }
+    acc[i] = init ? a : acc[i] + a;
+}

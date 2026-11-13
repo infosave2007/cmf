@@ -7,7 +7,7 @@
 
 use crate::linear_core::{GdnCfg, GdnWeights, gdn_forward};
 use crate::loader::{Overlay, build_ffn_at, load_f32, load_matrix};
-use crate::pipeline::{FfnKind, MoeFfn, moe_ffn};
+use crate::pipeline::{FfnKind, MoeFfn, dense_ffn, moe_ffn, moe_ffn_route};
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
 use cortiq_core::{CmfError, CmfModel, LayerType, ModelArch, Qwen4ExpConfig, TensorDtype};
@@ -78,6 +78,103 @@ pub enum Mixer {
     Qsa(QsaWeights),
 }
 
+/// A latent MoE layer (Edge0): the routed experts read and write a
+/// `dim`-wide copy of the token. Expert `e` belongs to group `labels[e]`;
+/// group `g` reads `D_g · x` (rows `g·dim..(g+1)·dim` of `down`) and its
+/// experts' weighted outputs go back through `U_g` (columns
+/// `g·dim..(g+1)·dim` of `up`), so the layer's routed part is
+/// `U · concat_g(Σ_{e ∈ g} w_e · E_e(D_g · x))`. The shared expert and the
+/// router work at full width as in the base model.
+pub struct Latent {
+    /// D: `[groups·dim, hidden]`.
+    pub(crate) down: QTensor,
+    /// U: `[hidden, groups·dim]`.
+    pub(crate) up: QTensor,
+    /// The group of every routed expert.
+    pub(crate) labels: Vec<u8>,
+    pub(crate) dim: usize,
+    pub(crate) groups: usize,
+    pub(crate) down_idx: Option<usize>,
+    pub(crate) up_idx: Option<usize>,
+}
+
+impl Latent {
+    fn load(model: &Arc<CmfModel>, prefix: &str, n_experts: usize, hidden: usize) -> Result<Option<Self>, CmfError> {
+        let dn = format!("{prefix}mlp.latent_down.weight");
+        if model.tensor(&dn).is_none() {
+            return Ok(None);
+        }
+        let un = format!("{prefix}mlp.latent_up.weight");
+        let ln = format!("{prefix}mlp.latent_groups");
+        let down = t(model, &dn)?;
+        let up = t(model, &un)?;
+        let labels = model.tensor_bytes(&ln).map_err(|_| err(format!("{ln} missing")))?.to_vec();
+        if labels.len() != n_experts {
+            return Err(err(format!("{ln}: {} labels for {n_experts} experts", labels.len())));
+        }
+        let groups = labels.iter().copied().max().map_or(0, |g| g as usize + 1);
+        if groups == 0 || down.rows() % groups != 0 {
+            return Err(err(format!("{dn}: {} rows do not split into {groups} groups", down.rows())));
+        }
+        let dim = down.rows() / groups;
+        if down.cols() != hidden || up.rows() != hidden || up.cols() != groups * dim {
+            return Err(err(format!(
+                "{prefix}: latent D {}x{} / U {}x{} do not fit hidden {hidden}, {groups} groups of {dim}",
+                down.rows(),
+                down.cols(),
+                up.rows(),
+                up.cols()
+            )));
+        }
+        Ok(Some(Self {
+            down,
+            up,
+            labels,
+            dim,
+            groups,
+            down_idx: model.tensor_index(&dn),
+            up_idx: model.tensor_index(&un),
+        }))
+    }
+}
+
+/// The host latent MoE of one token (see [`Latent`]): the base model's
+/// routing and shared expert, the routed experts between D and U.
+pub(crate) fn latent_moe(m: &MoeFfn, lat: &Latent, x: &[f32], pool: Option<&crate::pool::Pool>) -> Vec<f32> {
+    let r = moe_ffn_route(m, x, pool, None);
+    let (dim, gl) = (lat.dim, lat.groups * lat.dim);
+    let mut used = vec![false; lat.groups];
+    for &e in &r.idx {
+        used[lat.labels[e] as usize] = true;
+    }
+    let mut xl = vec![0f32; gl];
+    lat.down.matvec(x, &mut xl, pool);
+    let mut acc = vec![0f32; gl];
+    for &e in &r.idx {
+        let w = r.p[e] / r.wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
+        let g = lat.labels[e] as usize;
+        let y = dense_ffn(&m.experts[e], &xl[g * dim..(g + 1) * dim], pool);
+        for (a, v) in acc[g * dim..(g + 1) * dim].iter_mut().zip(&y) {
+            *a += w * v;
+        }
+    }
+    let mut out = vec![0f32; lat.up.rows()];
+    lat.up.matvec(&acc, &mut out, pool);
+    if let Some((se, gate)) = &m.shared {
+        let so = dense_ffn(se, x, pool);
+        let g = gate.as_ref().map_or(1.0, |gate| {
+            let mut gl = [0.0f32; 1];
+            gate.matvec(x, &mut gl, pool);
+            1.0 / (1.0 + (-gl[0]).exp())
+        });
+        for (o, s) in out.iter_mut().zip(&so) {
+            *o += g * s;
+        }
+    }
+    let _ = used;
+    out
+}
+
 pub struct Layer {
     pub(crate) attn_hc: GatedResidual,
     pub(crate) mlp_hc: GatedResidual,
@@ -93,6 +190,8 @@ pub struct Layer {
     /// the established dynamic DSV4 pool does for its shared branch.
     shared_ids: Option<(usize, usize, usize)>,
     idx: Option<LayerIdx>,
+    /// The latent D/U pair of an Edge0 layer (None: experts at full width).
+    pub(crate) latent: Option<Latent>,
 }
 
 impl Layer {
@@ -2411,6 +2510,15 @@ pub fn load(
         let attn_hc = load_hc(model, &format!("{p}attn_hyper_connection."), true)?;
         let mlp_hc = load_hc(model, &format!("{p}mlp_hyper_connection."), true)?;
         let idx = layer_idx(model, &p, matches!(mixer, Mixer::Gdn(_)), ple.is_some());
+        let latent = Latent::load(model, &p, moe.experts.len(), arch.hidden_size)?;
+        if let Some(lt) = &latent {
+            // the device frame reads D, U and the shared expert as resident skeleton weights
+            skeleton_idxs.extend(lt.down_idx);
+            skeleton_idxs.extend(lt.up_idx);
+            if let Some((se, _)) = &moe.shared {
+                skeleton_idxs.extend([se.gate_proj.model_idx(), se.up_proj.model_idx(), se.down_proj.model_idx()].into_iter().flatten());
+            }
+        }
         skeleton_idxs.extend(attn_hc.idxs());
         skeleton_idxs.extend(mlp_hc.idxs());
         if let Some(ix) = &idx {
@@ -2431,6 +2539,7 @@ pub fn load(
             expert_ids,
             shared_ids: Some(shared_ids),
             idx,
+            latent,
         });
     }
     let globals = Globals {
@@ -3600,19 +3709,20 @@ pub fn forward_token(
         observe("moe_in", li, position, &mixed);
         let t0 = std::time::Instant::now();
         #[cfg(feature = "gpu")]
-        let gpu_moe = dynamic_moe_gpu(layer, li, &mixed, state, pool);
+        let gpu_moe = if layer.latent.is_some() { None } else { dynamic_moe_gpu(layer, li, &mixed, state, pool) };
         #[cfg(not(feature = "gpu"))]
         let gpu_moe: Option<(Vec<f32>, Vec<usize>)> = None;
         let block = match gpu_moe {
             Some((block, _)) => block,
-            None => {
+            None => match &layer.latent {
+                Some(lat) => latent_moe(&layer.moe, lat, &mixed, pool),
                 // `moe_ffn` already routed once. The old implementation ran
                 // the 512×hidden router a SECOND time merely to predict a
                 // future cache fill, but the dynamic path computes the exact
                 // current route before dispatch and never consumed that
                 // prediction. Removing it saves 48 matrix passes per token.
-                moe_ffn(&layer.moe, &mixed, pool, None)
-            }
+                None => moe_ffn(&layer.moe, &mixed, pool, None),
+            },
         };
         moe_dt += t0.elapsed();
         observe("moe_out", li, position, &block);
@@ -5295,8 +5405,13 @@ fn forward_tokens_device(
     let Some(model) = e0.gate_proj.model_arc() else {
         return off(state, "experts are not mmap-backed");
     };
-    let gu_q2 = e0.gate_proj.model_dtype() == Some(TensorDtype::Q2TiledP);
-    if !gu_q2 && e0.gate_proj.model_dtype() != Some(TensorDtype::Q4TiledP) {
+    // latent layers (Edge0) run their own MoE stage beside an arena that serves nothing
+    let latent = first.latent.is_some();
+    if latent && !layers.iter().all(|l| l.latent.is_some()) {
+        return off(state, "latent and full-width layers mixed");
+    }
+    let gu_q2 = !latent && e0.gate_proj.model_dtype() == Some(TensorDtype::Q2TiledP);
+    if !latent && !gu_q2 && e0.gate_proj.model_dtype() != Some(TensorDtype::Q4TiledP) {
         return off(state, "expert gate/up are neither q2tp nor q4tp");
     }
     if first.moe.router_sigmoid
@@ -5324,6 +5439,26 @@ fn forward_tokens_device(
         let Some(mut dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
             return off(state, "device state allocation refused");
         };
+        if latent {
+            let t0 = std::time::Instant::now();
+            let mut lats = Vec::with_capacity(layers.len());
+            for l in layers {
+                let Some(lt) = l.latent.as_ref() else {
+                    lats.push(None);
+                    continue;
+                };
+                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden) {
+                    Some(d) => lats.push(Some(d)),
+                    None => return off(state, "latent experts do not load"),
+                }
+            }
+            let held: u64 = lats.iter().flatten().map(|d| d.bytes()).sum();
+            tracing::info!("qwen4 device: latent experts resident ({} MB) in {:.2}s", held >> 20, t0.elapsed().as_secs_f64());
+            if prof {
+                eprintln!("qwen4-device: latent experts resident, {} MB in {:.2}s", held >> 20, t0.elapsed().as_secs_f64());
+            }
+            dev.lat = lats;
+        }
         // The attention layers' far field: the file's turbo header or `CMF_QWEN_O1`.
         if let Some(o1) = crate::qwen4_o1::Qwen4O1::from_model(&model) {
             match o1.check(g.head_dim) {
@@ -5462,6 +5597,9 @@ fn forward_tokens_device(
         if std::env::var("CMF_QWEN_RESIDENT").as_deref() != Ok("0") && slots >= whole {
             slots = whole;
         }
+        if latent {
+            slots = slots.min(64);
+        }
         // staging for the cold passes: one slot per token slot and rank
         let staging = q4::TMAX * g.top_k;
         let Some(arena) = QwenGpuPool::create_explicit(
@@ -5494,9 +5632,10 @@ fn forward_tokens_device(
         let pinned = {
             let arena = state.gpu_pool.as_mut().unwrap();
             layers.iter().enumerate().all(|(li, l)| {
-                arena
-                    .ensure(&model, li, &[], &l.expert_ids, l.shared_ids)
-                    .is_some_and(|(_, s)| s != u32::MAX)
+                l.latent.is_some()
+                    || arena
+                        .ensure(&model, li, &[], &l.expert_ids, l.shared_ids)
+                        .is_some_and(|(_, s)| s != u32::MAX)
             })
         };
         if !pinned {
@@ -5507,7 +5646,7 @@ fn forward_tokens_device(
             layers.iter().map(|l| l.expert_ids.clone()).collect();
         // The host tiers behind the arena: a RAM tier sized from free memory
         // and direct reads from the file (see `expert_store`).
-        let store = (std::env::var("CMF_QWEN_STORE").as_deref() != Ok("0"))
+        let store = (std::env::var("CMF_QWEN_STORE").as_deref() != Ok("0") && !latent)
             .then(|| {
                 crate::expert_store::ExpertStore::new(&model, &triples, n_experts, cap_slots)
             })
@@ -5608,7 +5747,7 @@ fn forward_tokens_device(
             // and DMA from the tier at PCIe speed (16 GB card: prompt 110 → 356 tok/s).
             // `CMF_QWEN_HTIER_MB=0` keeps it off.
             let asked = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
-                None | Some("") if cap_slots < n_keys => want,
+                None | Some("") if cap_slots < n_keys && !latent => want,
                 None | Some("") => 0,
                 Some("auto") => want,
                 Some(v) => v.parse::<u64>().map_or(0, |mb| mb << 20),
@@ -5677,6 +5816,10 @@ fn forward_tokens_device(
                 }
                 state.gpu_pool.as_mut().unwrap().tier = tier;
             }
+        }
+        // a latent model's experts are all on the card in their layers' banks
+        if latent {
+            state.resident_all = true;
         }
         if std::env::var_os("CMF_QWEN_PROFILE_SAVE").is_some() && profile.is_none() {
             profile = Some(ExpertProfile::new(layers.len(), n_experts));
@@ -5935,15 +6078,13 @@ fn forward_tokens_device(
                 let ix = layer.idx.as_ref().ok_or("layer index")?;
                 let w = device_layer_w(layer, ix).ok_or("layer weights")?;
                 let ta = std::time::Instant::now();
-                let (remap, shared_slot) = match arena.ensure(
-                    &model,
-                    f,
-                    &picks_prev[f],
-                    &layer.expert_ids,
-                    layer.shared_ids,
-                ) {
-                    Some(r) => r,
-                    None => arena.remap_snapshot(f),
+                let (remap, shared_slot) = if layer.latent.is_some() {
+                    (vec![0u32; layer.moe.experts.len()], 0)
+                } else {
+                    match arena.ensure(&model, f, &picks_prev[f], &layer.expert_ids, layer.shared_ids) {
+                        Some(r) => r,
+                        None => arena.remap_snapshot(f),
+                    }
                 };
                 pf.admit += ta.elapsed();
                 if shared_slot == u32::MAX {
@@ -7501,6 +7642,7 @@ impl MtpHead {
                     expert_ids,
                     shared_ids: Some(shared_ids),
                     idx,
+                    latent: None,
                 };
                 let mixer_hc = load_hc(&side, "model.mtp.hyper_connection_mixer.", false)?;
                 let enorm = f(&side, "model.mtp.enorm.weight")?;
@@ -8253,6 +8395,8 @@ mod tests {
             make_ngram_vocab_size_divisible_by: 128,
             split_ngram_parts: 128,
             seed: 1234,
+            latent_dim: None,
+            latent_groups: None,
         };
         let (m, sizes, offsets) = ple_tables(&q, 248_320, 0);
         assert_eq!(
