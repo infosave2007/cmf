@@ -65,6 +65,68 @@ __device__ __forceinline__ float i8x4(u32 w, const float* p, int st, float a) {
     return a;
 }
 
+// The rows of job `jb` this block owns against the staged row `xs` (its
+// q4tp group sums in `gs`): shared memory for `mv_multi`, global for the
+// rows wider than a block's shared memory (`mv_multi_g`).
+__device__ __forceinline__ void mv_rows(const MvJob& jb, const float* xs, const float* gs, int cols, int warp, int lane, int NW)
+{
+    const int gpr = cols >> 5, nch = cols >> 4;
+    const int GP = gpr | 1, CP = nch | 1;
+    const int row0 = ((int)blockIdx.x - jb.blk0) * jb.rpb;
+    const int row1 = min(row0 + jb.rpb, jb.rows);
+    float* y = (float*)jb.y;
+    const float* res = (const float*)jb.res;
+    for (int r = row0 + warp; r < row1; r += NW) {
+        float acc = 0.0f;
+        if (jb.kind == 6) {
+            const uint4* W = (const uint4*)jb.w + (size_t)r * gpr;
+            const u8* C = (const u8*)jb.aux0 + (size_t)r * gpr;
+            // The row's 32 scales sit in the lanes' registers: a group's
+            // scale is a shuffle, not a second load that waits on the code
+            // (measured on an A40: down 46 -> 37 us, o 16.5 -> 14 us). A
+            // shuffle needs the whole warp at one program point, so every
+            // lane runs every iteration; a lane past the row's last group
+            // loads nothing and adds nothing.
+            const float lad = ((const float*)jb.aux1)[(size_t)r * 32 + lane];
+            const int iters = (gpr + 31) >> 5;
+            for (int it = 0; it < iters; it++) {
+                const int g = lane + (it << 5);
+                float a = 0.0f, s0 = 0.0f;
+                int code = 0;
+                if (g < gpr) {
+                    const uint4 w = W[g];
+                    code = C[g];
+                    const float* p = xs + g;
+                    a = nib8(w.x, p, GP, a);
+                    a = nib8(w.y, p + 8 * GP, GP, a);
+                    a = nib8(w.z, p + 16 * GP, GP, a);
+                    a = nib8(w.w, p + 24 * GP, GP, a);
+                    s0 = gs[g];
+                }
+                acc += __shfl_sync(0xffffffffu, lad, code) * (a - s0);
+            }
+        } else if (jb.kind == 7) {
+            const uint4* W = (const uint4*)(jb.w + (size_t)r * cols);
+            for (int c = lane; c < nch; c += 32) {
+                const uint4 w = W[c];
+                const float* p = xs + c;
+                float a = 0.0f;
+                a = i8x4(w.x, p, CP, a);
+                a = i8x4(w.y, p + 4 * CP, CP, a);
+                a = i8x4(w.z, p + 8 * CP, CP, a);
+                a = i8x4(w.w, p + 12 * CP, CP, a);
+                acc += a;
+            }
+            acc *= ((const float*)jb.aux0)[r];
+        } else {
+            const float* W = (const float*)jb.w + (size_t)r * cols;
+            for (int c = lane; c < cols; c += 32) acc += W[c] * xs[c];
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) y[r] = res ? res[r] + acc : acc;
+    }
+}
+
 // One launch, several matrices against one input row: y_j = (res_j +) W_j x.
 // The input is staged into shared memory once per block, with what precedes
 // the product folded in: the RMS norm of the row (`nw`), a dense FFN's
@@ -135,60 +197,246 @@ extern "C" __global__ void mv_multi(const MvJob* __restrict__ jobs, int njobs,
         }
         __syncthreads();
     }
-    const int row0 = ((int)blockIdx.x - jb.blk0) * jb.rpb;
-    const int row1 = min(row0 + jb.rpb, jb.rows);
-    float* y = (float*)jb.y;
-    const float* res = (const float*)jb.res;
-    for (int r = row0 + warp; r < row1; r += NW) {
-        float acc = 0.0f;
+    mv_rows(jb, xs, gs, cols, warp, lane, NW);
+}
+
+// Rows wider than a block's shared memory (a 32768-wide FFN): the row one
+// job reads, staged once into global memory in `mv_multi`'s layout by one
+// block (`mv_stage_g`: the q4tp transpose and group sums, or the q8_2f
+// column field), then every block reads it from there (`mv_multi_g`, one job).
+extern "C" __global__ void mv_stage_g(const MvJob* __restrict__ jobs, const float* __restrict__ x, float* __restrict__ xg, int cols)
+{
+    const MvJob jb = jobs[0];
+    const int T = blockDim.x, tid = threadIdx.x;
+    const int cpad = (cols + 31) & ~31;
+    float* xs = xg;
+    float* gs = xg + cpad + 64;
+    const int gpr = cols >> 5, nch = cols >> 4;
+    const int GP = gpr | 1, CP = nch | 1;
+    for (int i = tid; i < cols; i += T) {
+        float v = x[i];
+        int idx = i;
         if (jb.kind == 6) {
-            const uint4* W = (const uint4*)jb.w + (size_t)r * gpr;
-            const u8* C = (const u8*)jb.aux0 + (size_t)r * gpr;
-            // The row's 32 scales sit in the lanes' registers: a group's
-            // scale is a shuffle, not a second load that waits on the code
-            // (measured on an A40: down 46 -> 37 us, o 16.5 -> 14 us). A
-            // shuffle needs the whole warp at one program point, so every
-            // lane runs every iteration; a lane past the row's last group
-            // loads nothing and adds nothing.
-            const float lad = ((const float*)jb.aux1)[(size_t)r * 32 + lane];
-            const int iters = (gpr + 31) >> 5;
-            for (int it = 0; it < iters; it++) {
-                const int g = lane + (it << 5);
-                float a = 0.0f, s0 = 0.0f;
-                int code = 0;
-                if (g < gpr) {
-                    const uint4 w = W[g];
-                    code = C[g];
-                    const float* p = xs + g;
-                    a = nib8(w.x, p, GP, a);
-                    a = nib8(w.y, p + 8 * GP, GP, a);
-                    a = nib8(w.z, p + 16 * GP, GP, a);
-                    a = nib8(w.w, p + 24 * GP, GP, a);
-                    s0 = gs[g];
-                }
-                acc += __shfl_sync(0xffffffffu, lad, code) * (a - s0);
-            }
+            idx = (i & 31) * GP + (i >> 5);
         } else if (jb.kind == 7) {
-            const uint4* W = (const uint4*)(jb.w + (size_t)r * cols);
-            for (int c = lane; c < nch; c += 32) {
-                const uint4 w = W[c];
-                const float* p = xs + c;
-                float a = 0.0f;
-                a = i8x4(w.x, p, CP, a);
-                a = i8x4(w.y, p + 4 * CP, CP, a);
-                a = i8x4(w.z, p + 8 * CP, CP, a);
-                a = i8x4(w.w, p + 12 * CP, CP, a);
-                acc += a;
-            }
-            acc *= ((const float*)jb.aux0)[r];
-        } else {
-            const float* W = (const float*)jb.w + (size_t)r * cols;
-            for (int c = lane; c < cols; c += 32) acc += W[c] * xs[c];
+            v *= ((const float*)jb.aux1)[i];
+            idx = (i & 15) * CP + (i >> 4);
         }
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-        if (lane == 0) y[r] = res ? res[r] + acc : acc;
+        xs[idx] = v;
+    }
+    __syncthreads();
+    if (jb.kind == 6) {
+        for (int g = tid; g < gpr; g += T) {
+            const float* p = xs + g;
+            float s = 0.0f;
+            for (int k = 0; k < 32; k++) s += p[k * GP];
+            gs[g] = 8.0f * s;
+        }
     }
 }
+
+// The same with the row staged a K chunk at a time (`kc` columns, a multiple
+// of 32) in shared memory: a block reads the row from memory once, and the
+// partial sums of its rows (at most 64) build up across the chunks. One job.
+extern "C" __global__ void mv_multi_k(const MvJob* __restrict__ jobs, const float* __restrict__ x, int cols, int kc)
+{
+    extern __shared__ float sh[];
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const MvJob jb = jobs[0];
+    float* acc_s = sh;            // [64]
+    float* xs = sh + 64;          // [kc + 64]
+    float* gs = xs + kc + 64;     // [kc / 32 + 8]
+    const int row0 = ((int)blockIdx.x - jb.blk0) * jb.rpb;
+    const int row1 = min(row0 + jb.rpb, jb.rows);
+    for (int i = tid; i < 64; i += T) acc_s[i] = 0.0f;
+    const int gall = cols >> 5;
+    for (int c0 = 0; c0 < cols; c0 += kc) {
+        const int n = min(kc, cols - c0);
+        const int gpr = n >> 5, nch = n >> 4;
+        const int GP = gpr | 1, CP = nch | 1;
+        __syncthreads();
+        for (int i = tid; i < n; i += T) {
+            float v = x[c0 + i];
+            int idx = i;
+            if (jb.kind == 6) {
+                idx = (i & 31) * GP + (i >> 5);
+            } else if (jb.kind == 7) {
+                v *= ((const float*)jb.aux1)[c0 + i];
+                idx = (i & 15) * CP + (i >> 4);
+            }
+            xs[idx] = v;
+        }
+        __syncthreads();
+        if (jb.kind == 6) {
+            for (int g = tid; g < gpr; g += T) {
+                const float* p = xs + g;
+                float s = 0.0f;
+                for (int k = 0; k < 32; k++) s += p[k * GP];
+                gs[g] = 8.0f * s;
+            }
+            __syncthreads();
+        }
+        for (int r = row0 + warp; r < row1; r += NW) {
+            float acc = 0.0f;
+            if (jb.kind == 6) {
+                const uint4* W = (const uint4*)jb.w + (size_t)r * gall + (c0 >> 5);
+                const u8* C = (const u8*)jb.aux0 + (size_t)r * gall + (c0 >> 5);
+                const float lad = ((const float*)jb.aux1)[(size_t)r * 32 + lane];
+                const int iters = (gpr + 31) >> 5;
+                for (int it = 0; it < iters; it++) {
+                    const int g = lane + (it << 5);
+                    float a = 0.0f, s0 = 0.0f;
+                    int code = 0;
+                    if (g < gpr) {
+                        const uint4 w = W[g];
+                        code = C[g];
+                        const float* p = xs + g;
+                        a = nib8(w.x, p, GP, a);
+                        a = nib8(w.y, p + 8 * GP, GP, a);
+                        a = nib8(w.z, p + 16 * GP, GP, a);
+                        a = nib8(w.w, p + 24 * GP, GP, a);
+                        s0 = gs[g];
+                    }
+                    acc += __shfl_sync(0xffffffffu, lad, code) * (a - s0);
+                }
+            } else if (jb.kind == 7) {
+                const uint4* W = (const uint4*)(jb.w + (size_t)r * cols + c0);
+                for (int c = lane; c < nch; c += 32) {
+                    const uint4 w = W[c];
+                    const float* p = xs + c;
+                    float a = 0.0f;
+                    a = i8x4(w.x, p, CP, a);
+                    a = i8x4(w.y, p + 4 * CP, CP, a);
+                    a = i8x4(w.z, p + 8 * CP, CP, a);
+                    a = i8x4(w.w, p + 12 * CP, CP, a);
+                    acc += a;
+                }
+                acc *= ((const float*)jb.aux0)[r];
+            } else {
+                const float* W = (const float*)jb.w + (size_t)r * cols + c0;
+                for (int c = lane; c < n; c += 32) acc += W[c] * xs[c];
+            }
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            if (lane == 0) acc_s[r - row0] += acc;
+        }
+    }
+    __syncthreads();
+    float* y = (float*)jb.y;
+    const float* res = (const float*)jb.res;
+    for (int r = row0 + tid; r < row1; r += T) y[r] = res ? res[r] + acc_s[r - row0] : acc_s[r - row0];
+}
+
+// Split-K: block (row block, chunk) writes its partial sums; `mv_reduce_k` adds them.
+extern "C" __global__ void mv_multi_ks(const MvJob* __restrict__ jobs, const float* __restrict__ x, int cols, int kc,
+                                    float* __restrict__ part)
+{
+    extern __shared__ float sh[];
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    const MvJob jb = jobs[0];
+    float* acc_s = sh;            // [64]
+    float* xs = sh + 64;          // [kc + 64]
+    float* gs = xs + kc + 64;     // [kc / 32 + 8]
+    const int row0 = ((int)blockIdx.x - jb.blk0) * jb.rpb;
+    const int row1 = min(row0 + jb.rpb, jb.rows);
+    for (int i = tid; i < 64; i += T) acc_s[i] = 0.0f;
+    const int gall = cols >> 5;
+    {
+        const int c0 = (int)blockIdx.y * kc;
+        const int n = min(kc, cols - c0);
+        const int gpr = n >> 5, nch = n >> 4;
+        const int GP = gpr | 1, CP = nch | 1;
+        __syncthreads();
+        for (int i = tid; i < n; i += T) {
+            float v = x[c0 + i];
+            int idx = i;
+            if (jb.kind == 6) {
+                idx = (i & 31) * GP + (i >> 5);
+            } else if (jb.kind == 7) {
+                v *= ((const float*)jb.aux1)[c0 + i];
+                idx = (i & 15) * CP + (i >> 4);
+            }
+            xs[idx] = v;
+        }
+        __syncthreads();
+        if (jb.kind == 6) {
+            for (int g = tid; g < gpr; g += T) {
+                const float* p = xs + g;
+                float s = 0.0f;
+                for (int k = 0; k < 32; k++) s += p[k * GP];
+                gs[g] = 8.0f * s;
+            }
+            __syncthreads();
+        }
+        for (int r = row0 + warp; r < row1; r += NW) {
+            float acc = 0.0f;
+            if (jb.kind == 6) {
+                const uint4* W = (const uint4*)jb.w + (size_t)r * gall + (c0 >> 5);
+                const u8* C = (const u8*)jb.aux0 + (size_t)r * gall + (c0 >> 5);
+                const float lad = ((const float*)jb.aux1)[(size_t)r * 32 + lane];
+                const int iters = (gpr + 31) >> 5;
+                for (int it = 0; it < iters; it++) {
+                    const int g = lane + (it << 5);
+                    float a = 0.0f, s0 = 0.0f;
+                    int code = 0;
+                    if (g < gpr) {
+                        const uint4 w = W[g];
+                        code = C[g];
+                        const float* p = xs + g;
+                        a = nib8(w.x, p, GP, a);
+                        a = nib8(w.y, p + 8 * GP, GP, a);
+                        a = nib8(w.z, p + 16 * GP, GP, a);
+                        a = nib8(w.w, p + 24 * GP, GP, a);
+                        s0 = gs[g];
+                    }
+                    acc += __shfl_sync(0xffffffffu, lad, code) * (a - s0);
+                }
+            } else if (jb.kind == 7) {
+                const uint4* W = (const uint4*)(jb.w + (size_t)r * cols + c0);
+                for (int c = lane; c < nch; c += 32) {
+                    const uint4 w = W[c];
+                    const float* p = xs + c;
+                    float a = 0.0f;
+                    a = i8x4(w.x, p, CP, a);
+                    a = i8x4(w.y, p + 4 * CP, CP, a);
+                    a = i8x4(w.z, p + 8 * CP, CP, a);
+                    a = i8x4(w.w, p + 12 * CP, CP, a);
+                    acc += a;
+                }
+                acc *= ((const float*)jb.aux0)[r];
+            } else {
+                const float* W = (const float*)jb.w + (size_t)r * cols + c0;
+                for (int c = lane; c < n; c += 32) acc += W[c] * xs[c];
+            }
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            if (lane == 0) acc_s[r - row0] += acc;
+        }
+    }
+    __syncthreads();
+    for (int r = row0 + tid; r < row1; r += T) part[(size_t)blockIdx.y * jb.rows + r] = acc_s[r - row0];
+}
+
+// y[r] = (res[r] +) the sum of the split-K partials part[c][r].
+extern "C" __global__ void mv_reduce_k(const MvJob* __restrict__ jobs, const float* __restrict__ part, int nc)
+{
+    const MvJob jb = jobs[0];
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= jb.rows) return;
+    float acc = 0.0f;
+    for (int c = 0; c < nc; c++) acc += part[(size_t)c * jb.rows + r];
+    const float* res = (const float*)jb.res;
+    ((float*)jb.y)[r] = res ? res[r] + acc : acc;
+}
+
+extern "C" __global__ void mv_multi_g(const MvJob* __restrict__ jobs, int njobs, const float* __restrict__ xg, int cols)
+{
+    const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
+    int j = 0;
+    while (j + 1 < njobs && (int)blockIdx.x >= jobs[j + 1].blk0) j++;
+    const MvJob jb = jobs[j];
+    const int cpad = (cols + 31) & ~31;
+    mv_rows(jb, xg, xg + cpad + 64, cols, warp, lane, NW);
+}
+
 
 // f32 -> IEEE half, round to nearest (what `__float2half` of cuda_fp16.h is;
 // spelled out because NVRTC is given no include path).

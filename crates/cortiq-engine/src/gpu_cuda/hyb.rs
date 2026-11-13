@@ -742,6 +742,12 @@ struct GdnL {
     ms_out: MmaSet,
 }
 
+/// `hy_qk`'s flag word (gemma, bit 1 the late norm) and its bias pointers.
+fn qk_flags(a: &AttnL, gemma_i: i32) -> (i32, (u64, u64, u64)) {
+    let b = a.bias.as_ref().map_or((0, 0, 0), |(q, k, v)| (q.ptr, k.ptr, v.ptr));
+    (gemma_i | ((a.late as i32) << 1), b)
+}
+
 struct AttnL {
     q: Arc<DevMat>,
     k: Arc<DevMat>,
@@ -750,6 +756,10 @@ struct AttnL {
     qn: Option<Arc<Buf>>,
     kn: Option<Arc<Buf>>,
     gated: bool,
+    /// q/k norm after the rotation (HunYuan)
+    late: bool,
+    /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
+    bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
     ms_in: MmaSet,
     ms_out: MmaSet,
 }
@@ -952,7 +962,7 @@ fn hsig(
                 }
                 s.extend([*nv, *nk, *dk, *dv, *kk]);
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
                 s.push(2);
                 for g in [wq, wk, wv, wo] {
                     w(&mut s, g);
@@ -960,6 +970,10 @@ fn hsig(
                 f(&mut s, q_norm.unwrap_or(&[]));
                 f(&mut s, k_norm.unwrap_or(&[]));
                 s.push(*output_gate as usize);
+                s.push(*late_qk_norm as usize);
+                for d in bias.map_or([&[][..]; 3], |(a, b, c)| [a, b, c]) {
+                    f(&mut s, d);
+                }
             }
             _ => s.push(3),
         }
@@ -1038,9 +1052,15 @@ fn build(
                 vdmax = vdmax.max(nv * dv);
                 nvmax = nvmax.max(*nv);
             }
-            GraphAttn::Full { late_qk_norm, bias, output_gate, geom, head_gate, .. } => {
-                if *late_qk_norm || bias.is_some() || geom.is_some() || head_gate.is_some() {
-                    return Err(format!("layer {li}: late Q/K norm, biases, own geometry or a head-wise gate"));
+            GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
+                if geom.is_some() {
+                    return Err(format!("layer {li}: an attention geometry of its own"));
+                }
+                if head_gate.is_some() {
+                    return Err(format!("layer {li}: a head-wise output gate"));
+                }
+                if bias.is_some() && *output_gate {
+                    return Err(format!("layer {li}: projection biases beside a gated query"));
                 }
                 qrow = qrow.max(nh * hd * (1 + *output_gate as usize));
             }
@@ -1190,7 +1210,7 @@ fn build(
                     ms_out,
                 })
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
                 let qr = nh * hd * (1 + *output_gate as usize);
                 let qm = hmat(c, st, model, wq, qr, hidden)?;
                 let km = hmat(c, st, model, wk, nkv * hd, hidden)?;
@@ -1211,13 +1231,25 @@ fn build(
                 }
                 let qn = nrm(*q_norm, st)?;
                 let kn = nrm(*k_norm, st)?;
+                let bias = match bias {
+                    Some((bq, bk, bv)) => {
+                        if bq.len() != nh * hd || bk.len() != nkv * hd || bv.len() != nkv * hd {
+                            return Err(format!("layer {li}: projection bias widths"));
+                        }
+                        for d in [*bq, *bk, *bv] {
+                            note(d);
+                        }
+                        Some((st.f32_buf(bq)?, st.f32_buf(bk)?, st.f32_buf(bv)?))
+                    }
+                    None => None,
+                };
                 let ms_in = mmaset(&[
                     (&qm, q.ptr, 0, qrow, qr),
                     (&km, k.ptr, 0, nkv * hd, nkv * hd),
                     (&vm, v.ptr, 0, nkv * hd, nkv * hd),
                 ])?;
                 let ms_out = mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?;
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, ms_in, ms_out })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, ms_in, ms_out })
             }
             _ => unreachable!(),
         };
@@ -1925,6 +1957,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
+                let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
                 let nul16 = 0u64;
                 unsafe {
@@ -1949,7 +1982,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         0,
                         kargs!(
                             plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
-                            tabp, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, n_i, cip, nul16
+                            tabp, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
                         ),
                     )?;
                     // a grid for any record: blocks past the call's keys leave
@@ -3028,13 +3061,14 @@ unsafe fn big(
                 let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
                 let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
+                let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, n0_i, b_i, nul, qgh),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, n0_i, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // the archive of a prompt past its first seal: the chunk's rows
@@ -3138,13 +3172,14 @@ unsafe fn big(
                 let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
+                let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, gemma_i, gated_i, slot0, b_i, nul, qgh),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // a far-field layer of a prompt read for its seal: the rotated

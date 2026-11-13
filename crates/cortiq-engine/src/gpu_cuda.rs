@@ -64,6 +64,19 @@ fn debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("CMF_CUDA_DEBUG").is_some())
 }
 
+/// Columns a K chunk of a down row wider than shared memory
+/// (`CMF_CUDA_DN_KC`; 0 = stage the row in global memory instead).
+fn dn_kc() -> usize {
+    static KC: OnceLock<usize> = OnceLock::new();
+    *KC.get_or_init(|| std::env::var("CMF_CUDA_DN_KC").ok().and_then(|v| v.parse::<usize>().ok()).map_or(4096, |v| v / 32 * 32))
+}
+
+/// `CMF_CUDA_SPLITK=0`: a wide down row's chunks in one block, not across blocks.
+fn split_k() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_SPLITK").as_deref() != Ok("0"))
+}
+
 fn prof_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CMF_CUDA_PROF").is_some())
@@ -427,7 +440,10 @@ fn rows_per_block(rows: usize) -> usize {
 }
 
 fn push_job(jobs: &mut Vec<MvJob>, blk: &mut u32, m: &DevMat, y: u64, res: u64) {
-    let rpb = rows_per_block(m.rows);
+    push_job_rpb(jobs, blk, m, y, res, rows_per_block(m.rows));
+}
+
+fn push_job_rpb(jobs: &mut Vec<MvJob>, blk: &mut u32, m: &DevMat, y: u64, res: u64, rpb: usize) {
     jobs.push(MvJob {
         w: m.w.ptr,
         aux0: m.aux0(),
@@ -475,6 +491,8 @@ struct PlanLayer {
     blk_gu: u32,
     jobs_dn: Buf,
     blk_dn: u32,
+    /// Rows a block of the down projection owns (`mv_multi_k` takes 64 at most).
+    rpb_dn: usize,
 }
 
 /// A layer stack resolved for the device: weights, norms, job tables and the
@@ -506,6 +524,9 @@ struct Plan {
     qmax: usize,
     kvmax: usize,
     intermax: usize,
+    /// The staged FFN row in global memory, for an FFN wider than a block's
+    /// shared memory holds (`mv_stage_g` / `mv_multi_g`).
+    xg: Option<Buf>,
 }
 
 /// A layer's K/V rows on the card: `[row][kv head][hd]` f32, row 0 at
@@ -672,6 +693,14 @@ impl KvMirror {
 
 struct Funcs {
     mv_multi: cs::CUfunction,
+    /// A row wider than a block's shared memory: staged in global memory
+    /// by one block, then read from there.
+    mv_stage_g: cs::CUfunction,
+    mv_multi_g: cs::CUfunction,
+    /// The row a K chunk at a time in shared memory (one job, <= 64 rows a block).
+    mv_multi_k: cs::CUfunction,
+    mv_multi_ks: cs::CUfunction,
+    mv_reduce_k: cs::CUfunction,
     rmsnorm_rows: cs::CUfunction,
     expand_q4tp: cs::CUfunction,
     expand_q8: cs::CUfunction,
@@ -1047,6 +1076,11 @@ fn init() -> Res<Ctx> {
     let module = compile(KERNELS_SRC, Vec::new(), arch)?;
     let f = Funcs {
         mv_multi: func(module, "mv_multi")?,
+        mv_stage_g: func(module, "mv_stage_g")?,
+        mv_multi_g: func(module, "mv_multi_g")?,
+        mv_multi_k: func(module, "mv_multi_k")?,
+        mv_multi_ks: func(module, "mv_multi_ks")?,
+        mv_reduce_k: func(module, "mv_reduce_k")?,
         rmsnorm_rows: func(module, "rmsnorm_rows")?,
         expand_q4tp: func(module, "expand_q4tp")?,
         expand_q8: func(module, "expand_q8")?,
@@ -1076,6 +1110,14 @@ fn init() -> Res<Ctx> {
     } else {
         48 << 10
     };
+    if max_shared > 48 << 10 {
+        // the K-chunked matvec fills the same room
+        for k in [f.mv_multi_k, f.mv_multi_ks] {
+            let _ = unsafe {
+                cu::function::set_function_attribute(k, cs::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared as i32)
+            };
+        }
+    }
     let mut blas: bl::cublasHandle_t = std::ptr::null_mut();
     let s = unsafe { bl::cublasCreate_v2(&mut blas) };
     if s as u32 != 0 {
@@ -1813,10 +1855,17 @@ fn build_plan(
     let qmax = g.nh * g.hd;
     let kvmax = g.nkv * g.hd;
     let intermax = pre.iter().map(|p| p.inter).max().unwrap_or(0);
-    let widest = g.hidden.max(qmax).max(intermax);
+    // the FFN's down row may be staged in global memory instead
+    let widest = g.hidden.max(qmax);
     if mv_shared_bytes(widest) > c.max_shared {
         return Err(format!("a {widest}-wide row does not fit a block's shared memory"));
     }
+    // the staged row, or the split-K partials (a chunk of at least 4096 columns a row)
+    let xg = if mv_shared_bytes(intermax) > c.max_shared {
+        Some(Buf::new(mv_shared_bytes(intermax).max(intermax.div_ceil(4096) * g.hidden * 4))?)
+    } else {
+        None
+    };
     st.attn_funcs(c, hpk, g.hd)?;
     let (lm_mat, lm_rows) = match lm {
         Some((gw, rows)) => (Some(st.mat(c, model, gw, rows, g.hidden)?), rows),
@@ -1860,7 +1909,13 @@ fn build_plan(
         push_job(&mut jobs, &mut blk_gu, &p.up, uu.ptr, 0);
         let jobs_gu = Buf::from_slice(&jobs)?;
         let (mut jobs, mut blk_dn) = (Vec::new(), 0u32);
-        push_job(&mut jobs, &mut blk_dn, &p.down, h.ptr, h.ptr);
+        // a down row staged a K chunk at a time: more rows a block spread the staging
+        let wide = mv_shared_bytes(p.inter) > c.max_shared;
+        let rpb_dn = match std::env::var("CMF_CUDA_DN_RPB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(r) if wide => r.next_multiple_of(8).clamp(8, 64),
+            _ => rows_per_block(p.down.rows),
+        };
+        push_job_rpb(&mut jobs, &mut blk_dn, &p.down, h.ptr, h.ptr, rpb_dn);
         let jobs_dn = Buf::from_slice(&jobs)?;
         // a small f32 head gate: an f16 copy for the prompt's f16 GEMMs
         let hg_h = match &p.hg {
@@ -1903,6 +1958,7 @@ fn build_plan(
             blk_gu,
             jobs_dn,
             blk_dn,
+            rpb_dn,
         });
     }
     let lm = match lm_mat {
@@ -1936,6 +1992,7 @@ fn build_plan(
         qmax,
         kvmax,
         intermax,
+        xg,
     })
 }
 
@@ -2461,13 +2518,34 @@ pub fn forward_token_graph(
                 // 63 against 42 us a layer).
                 let n_inter = pl.inter as u64;
                 c.launch(f.act_mul, (n_inter.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.gg.ptr, plan.uu.ptr, pl.act, n_inter))?;
-                c.launch(
-                    f.mv_multi,
-                    (pl.blk_dn, 1),
-                    256,
-                    shared(pl.inter),
-                    kargs!(pl.jobs_dn.ptr, 1i32, plan.gg.ptr, nullp, no_act, nullp, eps_f, gemma_i, inter_i),
-                )?;
+                match &plan.xg {
+                    Some(xg) if shared(pl.inter) > c.max_shared && pl.rpb_dn <= 64 && dn_kc() > 0 && split_k() => {
+                        // split-K: (row block, chunk) blocks into partials in `xg`, then their sum
+                        let kc = dn_kc().min(((c.max_shared / 4 - 64 - 64 - 8) * 32 / 33) / 32 * 32);
+                        let nc = pl.inter.div_ceil(kc);
+                        let (kci, nci) = (kc as i32, nc as i32);
+                        c.launch(f.mv_multi_ks, (pl.blk_dn, nc as u32), 256, (64 + kc + 64 + kc / 32 + 8) * 4, kargs!(pl.jobs_dn.ptr, plan.gg.ptr, inter_i, kci, xg.ptr))?;
+                        let rows = hidden as u32;
+                        c.launch(f.mv_reduce_k, (rows.div_ceil(256), 1), 256, 0, kargs!(pl.jobs_dn.ptr, xg.ptr, nci))?;
+                    }
+                    Some(_) if shared(pl.inter) > c.max_shared && pl.rpb_dn <= 64 && dn_kc() > 0 => {
+                        // K chunks small enough for several blocks an SM
+                        let kc = dn_kc().min(((c.max_shared / 4 - 64 - 64 - 8) * 32 / 33) / 32 * 32);
+                        let kci = kc as i32;
+                        c.launch(f.mv_multi_k, (pl.blk_dn, 1), 256, (64 + kc + 64 + kc / 32 + 8) * 4, kargs!(pl.jobs_dn.ptr, plan.gg.ptr, inter_i, kci))?;
+                    }
+                    Some(xg) if shared(pl.inter) > c.max_shared => {
+                        c.launch(f.mv_stage_g, (1, 1), 1024, 0, kargs!(pl.jobs_dn.ptr, plan.gg.ptr, xg.ptr, inter_i))?;
+                        c.launch(f.mv_multi_g, (pl.blk_dn, 1), 256, 0, kargs!(pl.jobs_dn.ptr, 1i32, xg.ptr, inter_i))?;
+                    }
+                    _ => c.launch(
+                        f.mv_multi,
+                        (pl.blk_dn, 1),
+                        256,
+                        shared(pl.inter),
+                        kargs!(pl.jobs_dn.ptr, 1i32, plan.gg.ptr, nullp, no_act, nullp, eps_f, gemma_i, inter_i),
+                    )?,
+                }
                 c.dstage(7, &mut t0)?;
             }
         }

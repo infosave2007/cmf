@@ -308,8 +308,13 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
                                  const float* __restrict__ kn, float* __restrict__ qg, float* __restrict__ gate,
                                  u16* __restrict__ Km, u16* __restrict__ Vm, const float* __restrict__ tab,
                                  int nh, int nkv, int half, float eps, int gemma, int gated, int slot0_, int B,
-                                 const int* __restrict__ ci, u16* __restrict__ qgh)
+                                 const int* __restrict__ ci, u16* __restrict__ qgh, const float* __restrict__ bq,
+                                 const float* __restrict__ bk, const float* __restrict__ bv)
 {
+    // gemma bit 1: the head's RMS norm after the rotation (HunYuan), its
+    // weight then applied to the rotated dims
+    const bool late = (gemma & 2) != 0;
+    gemma &= 1;
     // the mirror row of the call's first row: from the call record when
     // given (a replayed graph), else the argument
     const int slot0 = ci ? ci[1] : slot0_;
@@ -320,16 +325,19 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
     const bool isq = u < nh;
     const float* src;
     const float* nw;
+    const float* bias;
     if (isq) {
         src = qraw + (size_t)b * qstride + (size_t)u * HD * (gated ? 2 : 1);
         nw = qn;
+        bias = bq ? bq + (size_t)u * HD : 0;
     } else {
         src = k + (size_t)b * kvstride + (size_t)(u - nh) * HD;
         nw = kn;
+        bias = bk ? bk + (size_t)(u - nh) * HD : 0;
     }
     float s = 0.0f;
     for (int i = tid; i < HD; i += blockDim.x) {
-        const float x = src[i];
+        const float x = bias ? __fadd_rn(src[i], bias[i]) : src[i];
         xs[i] = x;
         s = fmaf(x, x, s);
     }
@@ -344,7 +352,8 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
     }
     __syncthreads();
     if (nw)
-        for (int i = tid; i < HD; i += blockDim.x) xs[i] = __fmul_rn(__fmul_rn(xs[i], inv), gemma ? 1.0f + nw[i] : nw[i]);
+        for (int i = tid; i < HD; i += blockDim.x)
+            xs[i] = late ? __fmul_rn(xs[i], inv) : __fmul_rn(__fmul_rn(xs[i], inv), gemma ? 1.0f + nw[i] : nw[i]);
     __syncthreads();
     const float* t = tab + (size_t)b * half * 2;
     for (int d = tid; d < HD; d += blockDim.x) {
@@ -359,6 +368,7 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
         } else {
             val = xs[d];
         }
+        if (late && nw) val = __fmul_rn(val, gemma ? 1.0f + nw[d] : nw[d]);
         if (isq) {
             const int g = u / HPK, j = u - g * HPK;
             const size_t qi = (((size_t)g * B + b) * HPK + j) * HD + d;
@@ -369,7 +379,8 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
             // the mirrors keep f16 rows (half the bytes a decode step reads)
             const int g = u - nh;
             Km[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(val);
-            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(v[(size_t)b * kvstride + (size_t)g * HD + d]);
+            const float vv = v[(size_t)b * kvstride + (size_t)g * HD + d];
+            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(bv ? __fadd_rn(vv, bv[(size_t)g * HD + d]) : vv);
         }
     }
 }
