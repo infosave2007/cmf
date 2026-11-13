@@ -27,6 +27,15 @@ T = {
         tiles=["prompt reading, 4K–32K", "code generation, 4K–32K", "HumanEval pass@1, 164 tasks"],
         note=["One stream, greedy, thinking off, MTP draft tokens on; a new session tag before every prompt, so nothing comes from a cache.",
               "Mean of two runs. The whole model is on the card; the experts are Edge0's NVFP4 weights."],
+        cards_title={"cuda": "Edge0 on 12–32 GB cards, CUDA", "vulkan": "Edge0 on 12–32 GB cards, Vulkan"},
+        cards_stand={"cuda": "one RTX PRO 6000 limited to the card size named · cortiq, CUDA backend",
+                     "vulkan": "one RTX PRO 6000 limited to the card size named · cortiq, Vulkan backend"},
+        cards_cap="by card memory, 4K-token prompt", gb="GB",
+        cards_tiles=["code generation", "prompt reading, 4K tokens", "experts on the card"],
+        cards_note={"cuda": ["The card keeps the experts used most; a decode step computes the others on the CPU, a prompt carries them up in batches.",
+                             "One run a size; the rest of the card's memory was held by another process. One stream, greedy, thinking off."],
+                    "vulkan": ["The card keeps the expert banks of as many layers as fit; the others stay in system memory and are read over the bus.",
+                               "One run a size; the rest of the card's memory was held by another process. One stream, greedy, thinking off."]},
     ),
     "ru": dict(
         engine="cortiq", stand="Стенд:", tok="ток/с",
@@ -37,6 +46,15 @@ T = {
         tiles=["чтение промпта, 4K–32K", "генерация кода, 4K–32K", "HumanEval pass@1, 164 задачи"],
         note=["Один поток, жадный выбор, без рассуждений, черновики MTP включены; перед каждым промптом новая метка сессии — кеш не участвует.",
               "Среднее двух запусков. Вся модель на карте; эксперты — NVFP4-веса Edge0."],
+        cards_title={"cuda": "Edge0 на картах 12–32 ГБ, CUDA", "vulkan": "Edge0 на картах 12–32 ГБ, Vulkan"},
+        cards_stand={"cuda": "одна RTX PRO 6000, ограниченная до названного объёма · cortiq, бэкенд CUDA",
+                     "vulkan": "одна RTX PRO 6000, ограниченная до названного объёма · cortiq, бэкенд Vulkan"},
+        cards_cap="по памяти карты, промпт 4K токенов", gb="ГБ",
+        cards_tiles=["генерация кода", "чтение промпта, 4K токенов", "экспертов на карте"],
+        cards_note={"cuda": ["На карте самые используемые эксперты; остальных шаг генерации считает на CPU, промпт подгружает пакетами.",
+                             "Один запуск на объём; остальную память карты держал другой процесс. Один поток, жадный выбор, без рассуждений."],
+                    "vulkan": ["На карте банки экспертов стольких слоёв, сколько помещается; остальные в системной памяти, карта читает их по шине.",
+                               "Один запуск на объём; остальную память карты держал другой процесс. Один поток, жадный выбор, без рассуждений."]},
     ),
     "zh": dict(
         engine="cortiq", stand="测试平台：", tok="token/s",
@@ -47,6 +65,15 @@ T = {
         tiles=["读取提示词，4K–32K", "生成代码，4K–32K", "HumanEval pass@1，164 题"],
         note=["单路，贪心解码，关闭思考，开启 MTP 草稿；每个提示词前加新的会话标记，因此不使用缓存。",
               "两次运行的平均值。整个模型在显卡上；专家为 Edge0 的 NVFP4 权重。"],
+        cards_title={"cuda": "Edge0 · 12–32 GB 显卡，CUDA", "vulkan": "Edge0 · 12–32 GB 显卡，Vulkan"},
+        cards_stand={"cuda": "一张 RTX PRO 6000，限制为所示显存 · cortiq，CUDA 后端",
+                     "vulkan": "一张 RTX PRO 6000，限制为所示显存 · cortiq，Vulkan 后端"},
+        cards_cap="按显存大小，4K token 提示词", gb="GB",
+        cards_tiles=["生成代码", "读取提示词，4K token", "显卡上的专家"],
+        cards_note={"cuda": ["显卡保留最常用的专家；其余专家在生成时由 CPU 计算，读取提示词时分批送入显卡。",
+                             "每种显存运行一次；显卡其余显存由另一进程占用。单路，贪心解码，关闭思考。"],
+                    "vulkan": ["显卡保留能放下的若干层的专家库；其余留在系统内存，由显卡经总线读取。",
+                               "每种显存运行一次；显卡其余显存由另一进程占用。单路，贪心解码，关闭思考。"]},
     ),
 }
 
@@ -236,6 +263,41 @@ def figure(t, data, backend, model):
         COL = saved
 
 
+def figure_cards(t, data, backend, model):
+    """The smaller cards of one backend: generation and prompt reading by card memory (None without the rows)."""
+    global COL
+    rows = data.get(backend + "_tiers", {}).get(model)
+    if not rows or len(rows) < 2:
+        return None
+    saved, COL = COL, {model: COL_OWN}
+    try:
+        at = lambda r, key: r[key][r["ctx"].index("4K")] if "4K" in r["ctx"] else r[key][-1]
+        labels = [f'{r["gb"]} {t["gb"]}' for r in rows]
+        gen = [at(r, "decode") for r in rows]
+        rd = [at(r, "prefill") for r in rows]
+        pct = [r.get("experts_pct", 0.0) for r in rows]
+        f0 = lambda v: f"{v:,.0f}".replace(",", " ")
+        badge = backend.upper()
+        bw = tw(badge, 11) + 1.2 * len(badge) + 22
+        body = f'<rect x="{PAD}" y="26" width="{bw:.1f}" height="22" rx="11" fill="{INK}"/>'
+        body += txt(PAD + bw / 2 + 0.6, 41, badge, 11, "#ffffff", "middle", "bold", ' letter-spacing="1.2"')
+        body += spans(PAD + bw + 10, 41.5, [(t["engine"], 13, INK, "bold"), ("·  " + t["name"][model] + " CMF", 13, MUTED, "normal")])
+        body += txt(PAD, 82, t["cards_title"][backend], 23, INK, weight="bold")
+        body += spans(PAD, 105, [(t["stand"], 13, INK, "bold"), (t["cards_stand"][backend], 13, INK2, "normal")])
+        body += tiles(124, [
+            (f"{f0(min(gen))}–{f0(max(gen))}", t["tok"], t["cards_tiles"][0]),
+            (f"{f0(min(rd))}–{f0(max(rd))}", t["tok"], t["cards_tiles"][1]),
+            (f"{min(pct):.0f}–{max(pct):.0f} %", "", t["cards_tiles"][2]),
+        ], COL_OWN)
+        pw = (W - 2 * PAD - 40) / 2
+        a, y = hpanel(PAD, 216, pw, t["gen"], t["cards_cap"], labels, {model: gen}, [model], model)
+        b, y = hpanel(PAD + pw + 40, 216, pw, t["read"], t["cards_cap"], labels, {model: rd}, [model], model)
+        n, y = notes(y + 30, t["cards_note"][backend])
+        return svg(y + 8, body + a + b + n)
+    finally:
+        COL = saved
+
+
 def write(out_dir, name, s):
     p = os.path.join(out_dir, name + ".svg")
     open(p, "w").write(s)
@@ -250,6 +312,9 @@ def main():
         for backend in ("cuda", "vulkan"):
             for model, tag in (("m145", "145"), ("m120", "120")):
                 write(out_dir, f"e0_{tag}_{backend}_{lang}", figure(t, data, backend, model))
+                cards = figure_cards(t, data, backend, model)
+                if cards:
+                    write(out_dir, f"e0_{tag}_{backend}_cards_{lang}", cards)
 
 
 if __name__ == "__main__":
