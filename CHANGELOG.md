@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.87] — 2026-11-13
+
+### Fixed
+- Granite-4.2-30B ([the files](https://huggingface.co/infosave/Granite-4.2-cmf)) on CUDA: its 32768-wide FFN row
+  did not fit a block's shared memory, so the token and batch graphs declined and decode ran per op at 2.5
+  tok/s. A row wider than the shared memory now goes through a split-K matvec (`mv_multi_ks`: a block a row
+  block and a 4096-column chunk, staged in shared memory, the partial sums added by `mv_reduce_k`;
+  `CMF_CUDA_DN_KC` sets the chunk). RTX A5000, release build, 64 tokens: 28.9 tok/s steady (Vulkan on the same
+  card 28.6-28.9), the greedy text identical to Vulkan's.
+- Hy-MT2-7B ([the files](https://huggingface.co/infosave/Hy-MT2-cmf)) on CUDA: the hybrid arm declined the
+  HunYuan q/k norm after the rotation, and with it every Qwen2-class stack with projection biases. `hy_qk` now
+  adds the biases before the norm and, under the late flag, rotates first and applies the norm's weight to the
+  rotated dims. RTX A5000, release build: 116.7-117.8 tok/s steady (9.2 before; Vulkan on the same card 91.3-91.5),
+  prefill 180-213 tok/s (Vulkan 100-139), the greedy text identical to Vulkan's. The decline messages of the arm now name the one cause
+  (a geometry of its own, a head-wise gate, biases beside a gated query).
+
 ## [0.8.86] — 2026-11-13
 
 ### Added
