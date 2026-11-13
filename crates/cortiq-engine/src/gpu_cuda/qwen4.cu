@@ -2503,9 +2503,11 @@ extern "C" __global__ void q4_lat_gmask(const int* __restrict__ picks, const int
 #endif
 // y [n][rows] (rows ys apart) = W x for n <= 8 rows of x (xs apart), W q8_2f [rows][cols]: int8 body,
 // f32 row scale `rs`, f32 column field `col`. The row is read once for all n rows. Group blocks no row
-// picked are skipped: mode 0 (D) skips the row blocks of glen rows, mode 1 (U) the column blocks of
-// glen columns (their inputs are zero). The columns go in chunks of `ch` (a divisor of cols, of glen in
-// mode 1), staged for all rows. 256 threads, LAT_MV_RB rows a block (a divisor of glen in mode 0).
+// picked are skipped: mode 0 (D) skips the row blocks of glen rows; mode 1 (U) gives every group of glen
+// columns its own blocks (grid y = the group) and writes partial sums to `y` = part [G][n][rows], which
+// `q4_lat_red` adds in group order (the inputs of an unpicked group are zero, its blocks return). The
+// columns go in chunks of `ch` (a divisor of cols, of glen in mode 1), staged for all rows. 256 threads,
+// LAT_MV_RB rows a block (a divisor of glen in mode 0).
 extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* __restrict__ rs,
                                      const float* __restrict__ col, const float* __restrict__ x, int xs,
                                      float* __restrict__ y, int ys, int rows, int cols, int n, int glen,
@@ -2516,6 +2518,10 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
     const int r0 = blockIdx.x * LAT_MV_RB;
     if (r0 >= rows) return;
     if (mode == 0 && !((m >> ((r0 / glen) & 31)) & 1u)) return;
+    if (mode == 1 && !((m >> (blockIdx.y & 31)) & 1u)) return;
+    // mode 1: this block's column range is its group's
+    const int cb = mode == 1 ? (int)blockIdx.y * glen : 0;
+    const int ce = mode == 1 ? cb + glen : cols;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     constexpr int RPW = LAT_MV_RB / 8;
     float acc[RPW][8];
@@ -2523,8 +2529,7 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
     for (int a = 0; a < RPW; a++)
         #pragma unroll
         for (int t = 0; t < 8; t++) acc[a][t] = 0.0f;
-    for (int c0 = 0; c0 < cols; c0 += ch) {
-        if (mode == 1 && !((m >> ((c0 / glen) & 31)) & 1u)) continue;
+    for (int c0 = cb; c0 < ce; c0 += ch) {
         __syncthreads();
         for (int i = threadIdx.x; i < n * ch; i += blockDim.x) {
             const int t = i / ch, c = i - t * ch;
@@ -2563,9 +2568,26 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
         for (int t = 0; t < 8; t++) {
             float v = acc[a][t];
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (lane == 0 && r < rows && t < n) y[(u64)t * ys + r] = v * rs[r];
+            if (lane == 0 && r < rows && t < n) {
+                if (mode == 1) y[((u64)blockIdx.y * n + t) * rows + r] = v * rs[r];
+                else y[(u64)t * ys + r] = v * rs[r];
+            }
         }
     }
+}
+
+// y [n][rows] (ys apart) = the sum over the picked groups of part [G][n][rows], in group order.
+extern "C" __global__ void q4_lat_red(const float* __restrict__ part, const u32* __restrict__ gmask,
+                                      float* __restrict__ y, int ys, int rows, int n, int G)
+{ PDL_PRO();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * rows) return;
+    const int t = i / rows, r = i - t * rows;
+    const u32 m = gmask[0];
+    float a = 0.0f;
+    for (int g = 0; g < G; g++)
+        if ((m >> g) & 1u) a += part[((u64)g * n + t) * rows + r];
+    y[(u64)t * ys + r] = a;
 }
 
 // y [picks][L]: the rows of this sub-batch's D output, each at its pick (rowpick[row]), times its

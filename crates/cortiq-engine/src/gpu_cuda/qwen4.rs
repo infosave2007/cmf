@@ -80,7 +80,7 @@ macro_rules! qfuncs {
 qfuncs!(
     tile, grms, grms_inj, grms_inj4, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_scan_c, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
-    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_gmask, lat_mv, lat_put,
+    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_gmask, lat_mv, lat_put, lat_red,
 );
 unsafe impl Send for QFuncs {}
 unsafe impl Sync for QFuncs {}
@@ -806,6 +806,8 @@ struct Scratch {
     lf: Buf,
     /// The groups a small round picked (one word).
     lmask: Buf,
+    /// U's partial sums by group `[G][n][hidden]`.
+    lpart: Buf,
     /// A chunk's per-pick down rows `[n·topk][L]`, and the pick of each sub-batch row.
     lyc: Buf,
     lrp: Buf,
@@ -2823,6 +2825,7 @@ impl Dev {
             ly: b.buf(lat_dims.map_or(16, |(l, _, _)| LAT_PICKS.max(tape.max(SMALL_ROWS) * topk) * l * 4))?,
             lf: b.buf(3 * xb * 4 + 64)?,
             lmask: b.buf(64)?,
+            lpart: b.buf(lat_dims.map_or(16, |(_, g, _)| g * SMALL_ROWS * d.h * 4))?,
             lyc: b.buf(lat_dims.map_or(16, |(l, _, _)| n * topk * l * 4))?,
             lrp: b.buf(xr * 4)?,
         };
@@ -4726,7 +4729,8 @@ impl Core {
             go!(c, q.lat_gmask, (1u32, 1), 32; s.picks.ptr, lw.labels.ptr, s.lmask.ptr, n as i32, topk as i32);
             self.lat_mv(&lw.dmat, s.folded.ptr, d.h, s.lxl.ptr, gl, n, l, 0, 1280)?;
             self.lat_picks(lw, n)?;
-            self.lat_mv(&lw.umat, s.lacc.ptr, gl, s.blk.ptr, d.h, n, l, 1, l / 2)?;
+            self.lat_mv(&lw.umat, s.lacc.ptr, gl, s.lpart.ptr, d.h, n, l, 1, l / 2)?;
+            go!(c, q.lat_red, (blocks(n * d.h), 1), 256; s.lpart.ptr, s.lmask.ptr, s.blk.ptr, d.h as i32, d.h as i32, n as i32, g as i32);
             self.lap(7)?;
             // the shared expert at full width
             self.mvb(&[SOp::q8(&lw.sh[0], s.g.ptr), SOp::q8(&lw.sh[1], s.u.ptr)], s.folded.ptr, d.h, d.h, n)?;
@@ -4847,10 +4851,12 @@ impl Core {
         if n > 8 || !w.cols.is_multiple_of(ch) || !ch.is_multiple_of(16) || (mode == 1 && !glen.is_multiple_of(ch)) || (mode == 0 && !glen.is_multiple_of(rb)) {
             return Err(format!("qwen4 cuda: latent matvec shape {}x{} chunk {ch} group {glen}", w.rows, w.cols));
         }
+        // mode 1: one row of blocks per group of columns
+        let gy = if mode == 1 { (w.cols / glen) as u32 } else { 1 };
         unsafe {
             c.launch(
                 q.lat_mv,
-                (w.rows.div_ceil(rb) as u32, 1),
+                (w.rows.div_ceil(rb) as u32, gy),
                 256,
                 n * ch * 4,
                 kargs!(w.w.ptr, w.aux0(), w.aux1(), x, xs as i32, y, ys as i32, w.rows as i32, w.cols as i32, n as i32, glen as i32, s.lmask.ptr, mode, ch as i32),
