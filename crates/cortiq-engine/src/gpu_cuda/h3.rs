@@ -47,6 +47,12 @@ pub use moss::moss_chain;
 #[path = "flux_vae.rs"]
 mod flux_vae;
 pub use flux_vae::{flux_vae_chain, qi21_vae_decode};
+#[path = "s2v.rs"]
+mod s2v;
+pub use s2v::s2v_prepare;
+#[path = "s2v_vae.rs"]
+mod s2v_vae;
+pub use s2v_vae::{s2v_vae_decode, s2v_vae_encode, s2v_vae_release};
 #[path = "primal.rs"]
 mod primal;
 pub use primal::primal_vae_run;
@@ -138,6 +144,11 @@ pub(super) struct H3State {
     /// The kernels of the Primal VAE (`primal.rs`) and its weights on the card.
     pv_funcs: Option<primal::PvFuncs>,
     pv: Option<primal::PvDev>,
+    /// The kernels of the Kandinsky S2V denoiser (`s2v.rs`), once compiled.
+    s2v_funcs: Option<s2v::S2Funcs>,
+    /// The kernels of the HunyuanVideo VAE decoder (`s2v_vae.rs`) and its weights.
+    hv_funcs: Option<s2v_vae::HvFuncs>,
+    hv: Option<s2v_vae::HvDev>,
 }
 
 impl H3State {
@@ -183,7 +194,9 @@ impl H3State {
             && !matches!(c.arch, None | Some("compute_75"));
         let f = if ok {
             let defs = vec![format!("-DHD={hd}"), format!("-DCAUSAL={}", causal as u32)];
-            match compile(FLASH_SRC, defs, c.arch).and_then(|m| func(m, "h3_flash")) {
+            // CMF_H3_FLASH=1: the kernel without the shared tiles
+            let name = if std::env::var("CMF_H3_FLASH").as_deref() == Ok("1") { "h3_flash" } else { "h3_flash2" };
+            match compile(FLASH_SRC, defs, c.arch).and_then(|m| func(m, name)) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     if debug() {

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.85] — 2026-11-13
+
+### Added
+- Kandinsky S2V ([the file](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf), `cortiq s2v`)
+  runs on CUDA: the `gpu::s2v_prepare` stepper the Metal and Vulkan modules serve (`gpu_cuda/s2v.rs`, `s2v.cu`)
+  and the HunyuanVideo VAE decoder (`gpu_cuda/s2v_vae.rs`, `s2v_vae.cu`). Per render the modulations of every
+  step are computed once; per step the four prompt blocks run once and are kept, per speech chunk the four audio
+  blocks and the clean rows; the sixty visual blocks run on the card with each row's modulation (memory and
+  reference rows at t = 0, the noisy tail at t), attention over every row on `h3_flash`, the prompt
+  cross-attention on TF32 products, the frame-aligned speech attention and the erf-GELU feed-forward, the
+  weights in the H3 store. The VAE keeps an f16 channel-major stream: 3-D causal convolutions (any stride, so
+  the encoder of the reference frame runs there too) as a K-major im2col with replicate padding and f16
+  products, GroupNorm in three passes, the mid attention a query frame at a time. Before, `CMF_GPU=cuda` ran
+  all of it on the host (a 256 x 256 render had not reached its first step in 11 minutes). RTX A5000, release
+  build, one 5 s chunk at 512 x 512 (16 steps): 631.7 s, a step 36.9 s, VAE encode 1.3 s (20.9 s on the host)
+  and decode 31.5 s, peak 22.9 GB; Vulkan on the same card 832.6 s, a step 50.6 s; frames 50.0-51.6 dB from
+  Vulkan's.
+  `CMF_S2V_CUDA=0` and `CMF_S2V_VAE_CUDA=0` keep the host paths; `CMF_S2V_CUDA_PROF=1` prints the seconds of
+  each class of work per step and per VAE tile.
+
+### Changed
+- CUDA flash attention (`h3_flash2`, every resident image / video chain and the causal H3 path): the four
+  warps of a block share each 32-key tile of K and V through shared memory, copied with asynchronous 16-byte
+  copies into two stages while the warps work on the other, the chunks XOR-swizzled so a quarter-warp's loads
+  hit eight bank groups. Same layouts and launch as `h3_flash`, which `CMF_H3_FLASH=1` keeps. RTX A5000,
+  36736 rows, 16 planes: head width 128 347 -> 155 ms (31.8 -> 71.2 TFLOPS), 256 768 -> 331 ms, 64 98 -> 83 ms,
+  causal 128 173 -> 91 ms, the same error against an f32 reference (`scripts/flash/pod/flash_bench.cu`).
+
 ## [0.8.84] — 2026-11-13
 
 ### Added
