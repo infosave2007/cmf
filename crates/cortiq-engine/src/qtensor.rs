@@ -4609,6 +4609,41 @@ impl QTensor {
         }
     }
 
+    /// Latent (Edge0) experts on the host: expert `i` = `experts[i]` (gate, up `[ff, cols]`, down
+    /// `[cols, ff]`, all `nvfp4` file tensors) takes the input rows `groups[i]` of `xs` (`[row][cols]`);
+    /// `out` gets one `[cols]` row per pair, expert after expert. False: a tensor is not `nvfp4` of
+    /// those shapes.
+    pub fn nvfp4_latent_rows(
+        experts: &[(&QTensor, &QTensor, &QTensor)],
+        groups: &[Vec<usize>],
+        xs: &[f32],
+        out: &mut [f32],
+        pool: Option<&Pool>,
+    ) -> bool {
+        let Some(&(g0, _, _)) = experts.first() else { return true };
+        let (ff, cols) = (g0.rows(), g0.cols());
+        let mut views = Vec::with_capacity(experts.len());
+        for &(g, u, d) in experts {
+            let ok = [g, u, d].iter().all(|t| t.is_nvfp4())
+                && g.rows() == ff
+                && u.rows() == ff
+                && g.cols() == cols
+                && u.cols() == cols
+                && d.rows() == cols
+                && d.cols() == ff;
+            if !ok {
+                return false;
+            }
+            views.push((g.quant_bytes(), u.quant_bytes(), d.quant_bytes()));
+        }
+        let pairs: usize = groups.iter().map(|g| g.len()).sum();
+        if out.len() < pairs * cols || groups.len() != experts.len() {
+            return false;
+        }
+        nvfp4::latent_rows(&views, ff, cols, groups, xs, out, pool);
+        true
+    }
+
     /// Whether this host has the cores for [`QTensor::moe_expert_rows_fast`] (AVX-512 VNNI with the int8
     /// activation path on).
     pub fn moe_expert_rows_fast_available() -> bool {

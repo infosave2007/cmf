@@ -108,7 +108,7 @@ impl<'a> Nv<'a> {
 #[allow(unreachable_code)]
 fn dot_i8(codes: &[u8], scales: &[u8], xq: &[i8]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if avx2_enabled() && scales.len() % 2 == 0 {
+    if avx2_enabled() && scales.len().is_multiple_of(2) {
         return unsafe { dot_i8_avx2(codes, scales, xq) };
     }
     dot_i8_scalar(codes, scales, xq)
@@ -305,6 +305,223 @@ pub(super) fn matmat(bytes: &[u8], xs: &[f32], b: usize, rows: usize, cols: usiz
     dispatch_rows(pool, rows, &run);
 }
 
+/// AVX-512 VNNI: one row against up to eight int8 activations, 64 elements (four scale groups) a step: the
+/// codes become `2·E2M1 + 12` bytes by `vpshufb`, `vpdpbusd` sums four products a lane, the offset comes off
+/// by the activation's quad sums (`xs4`, times 12), and the lanes stay floats (times their group's scale)
+/// until the row ends. `out[b]` = Σ_g (Σ 2·E2M1·xq) · UE4M3/2, as [`dot_i8`] up to float rounding.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2")]
+unsafe fn rows_dot_v512(codes: &[u8], scales: &[u8], xq: &[&[i8]], xs4: &[&[i32]], out: &mut [f32]) {
+    use core::arch::x86_64::*;
+    const T: [i8; 16] = [12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0];
+    // SAFETY: codes holds 32 bytes, scales 4, every xq 64 and every xs4 16 per step (the caller's shapes).
+    unsafe {
+        let tab = _mm256_broadcastsi128_si256(_mm_loadu_si128(T.as_ptr() as *const __m128i));
+        let m4 = _mm256_set1_epi8(0x0F);
+        let gidx = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+        let nb = xq.len().min(8);
+        let mut acc = [_mm512_setzero_ps(); 8];
+        for st in 0..scales.len() / 4 {
+            let c = _mm256_loadu_si256(codes.as_ptr().add(st * 32) as *const __m256i);
+            let lo = _mm256_shuffle_epi8(tab, _mm256_and_si256(c, m4));
+            let hi = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16::<4>(c), m4));
+            let e0 = _mm256_unpacklo_epi8(lo, hi);
+            let e1 = _mm256_unpackhi_epi8(lo, hi);
+            let w = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_permute2x128_si256::<0x20>(e0, e1)),
+                _mm256_permute2x128_si256::<0x31>(e0, e1),
+            );
+            let sc = scales.as_ptr().add(st * 4);
+            let sv = _mm_set_ps(
+                UE4M3_HALF[*sc.add(3) as usize],
+                UE4M3_HALF[*sc.add(2) as usize],
+                UE4M3_HALF[*sc.add(1) as usize],
+                UE4M3_HALF[*sc as usize],
+            );
+            let scv = _mm512_permutexvar_ps(gidx, _mm512_castps128_ps512(sv));
+            for b in 0..nb {
+                let x = _mm512_loadu_si512(xq[b].as_ptr().add(st * 64) as *const _);
+                let d = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w, x);
+                let off = _mm512_loadu_si512(xs4[b].as_ptr().add(st * 16) as *const _);
+                acc[b] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(d, off)), scv, acc[b]);
+            }
+        }
+        for b in 0..nb {
+            out[b] = _mm512_reduce_add_ps(acc[b]);
+        }
+    }
+}
+
+/// `12 · Σ` of every four consecutive int8 activations (the offset [`rows_dot_v512`] takes off).
+fn quad_sums12(xq: &[i8]) -> Vec<i32> {
+    xq.as_chunks::<4>().0.iter().map(|q| 12 * q.iter().map(|&v| v as i32).sum::<i32>()).collect()
+}
+
+/// Whether [`rows_dot_v512`] runs here (AVX-512 VNNI and the int8 activation path).
+fn v512_on() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            use_a8w8()
+                && avx512vnni_enabled()
+                && !std::env::var("CMF_NVFP4_V512").is_ok_and(|v| v.trim() == "0")
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Rows `start..end` of `m` against the activations `ps` (pairs' indices into `acts`), `put(pair, row, value)`
+/// with the full value (activation scale, outliers, the tensor's global). The VNNI kernel for 64-wide rows.
+fn rows_against(m: &Nv<'_>, start: usize, end: usize, ps: std::ops::Range<usize>, acts: &[SplitAct], xs4: &[Vec<i32>], put: &mut dyn FnMut(usize, usize, f32)) {
+    #[cfg(target_arch = "x86_64")]
+    if !xs4.is_empty() && m.gpr.is_multiple_of(4) {
+        // eight activations a pass over the rows; nothing is allocated per row
+        let mut p0 = ps.start;
+        while p0 < ps.end {
+            let p1 = (p0 + 8).min(ps.end);
+            let nb = p1 - p0;
+            let mut xq: [&[i8]; 8] = [&[]; 8];
+            let mut x4: [&[i32]; 8] = [&[]; 8];
+            for (k, (a, x)) in acts[p0..p1].iter().zip(&xs4[p0..p1]).enumerate() {
+                xq[k] = &a.xq[..];
+                x4[k] = &x[..];
+            }
+            let mut tmp = [0f32; 8];
+            for r in start..end {
+                // SAFETY: the feature check of `v512_on` (xs4 is empty without it); 64-wide rows
+                unsafe { rows_dot_v512(m.row_codes(r), m.row_scales(r), &xq[..nb], &x4[..nb], &mut tmp) };
+                for (k, a) in acts[p0..p1].iter().enumerate() {
+                    let mut v = tmp[k] * a.sx;
+                    for &(j, xv) in &a.outliers {
+                        v += m.weight(r, j) * xv;
+                    }
+                    put(p0 + k, r, v * m.g);
+                }
+            }
+            p0 = p1;
+        }
+        return;
+    }
+    let _ = xs4;
+    for r in start..end {
+        for p in ps.clone() {
+            put(p, r, row_a8w8(m, r, &acts[p]));
+        }
+    }
+}
+
+/// Latent experts on the host (Edge0's experts a card does not hold): expert `i` takes the input rows
+/// `groups[i]` of `xs` (`[row][cols]`), and `out` gets, pair after pair in that order, `[cols]` =
+/// `down · (silu(gate · x) ⊙ (up · x))` — gate and up `[ff, cols]`, down `[cols, ff]`, all `nvfp4`. Two
+/// dispatches over every expert's rows (gate with up, then down), each row read once for all its pairs.
+#[allow(clippy::type_complexity)]
+pub(super) fn latent_rows(
+    experts: &[(&[u8], &[u8], &[u8])],
+    ff: usize,
+    cols: usize,
+    groups: &[Vec<usize>],
+    xs: &[f32],
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let pairs: usize = groups.iter().map(|g| g.len()).sum();
+    debug_assert!(out.len() >= pairs * cols);
+    let mut base = Vec::with_capacity(groups.len());
+    let mut at = 0usize;
+    for g in groups {
+        base.push(at);
+        at += g.len();
+    }
+    let gate: Vec<(Nv<'_>, Nv<'_>, Nv<'_>)> =
+        experts.iter().map(|&(g, u, d)| (Nv::new(g, ff, cols), Nv::new(u, ff, cols), Nv::new(d, cols, ff))).collect();
+    let a8 = use_a8w8();
+    let row_of = |p: usize| -> &[f32] {
+        let mut k = 0usize;
+        for (i, g) in groups.iter().enumerate() {
+            if p < base[i] + g.len() {
+                k = g[p - base[i]];
+                break;
+            }
+        }
+        &xs[k * cols..(k + 1) * cols]
+    };
+    let acts: Vec<SplitAct> = if a8 { (0..pairs).map(|p| split_act(row_of(p))).collect() } else { Vec::new() };
+    let v512 = a8 && v512_on() && cols.is_multiple_of(64) && ff.is_multiple_of(64);
+    let xs4: Vec<Vec<i32>> = if v512 { acts.iter().map(|a| quad_sums12(&a.xq)).collect() } else { Vec::new() };
+    let mut gu = vec![0f32; 2 * pairs * ff];
+    let gu_at = SendMut(gu.as_mut_ptr());
+    let run_gu = |i: usize, start: usize, end: usize| {
+        let (g, u, _) = &gate[i];
+        if v512 {
+            let ps = base[i]..base[i] + groups[i].len();
+            // SAFETY: (pair, row) cells are disjoint across the workers' row ranges.
+            rows_against(g, start, end, ps.clone(), &acts, &xs4, &mut |p, r, v| unsafe { *gu_at.at(2 * p * ff + r) = v });
+            rows_against(u, start, end, ps, &acts, &xs4, &mut |p, r, v| unsafe { *gu_at.at((2 * p + 1) * ff + r) = v });
+            return;
+        }
+        for r in start..end {
+            for p in base[i]..base[i] + groups[i].len() {
+                let (a, b) = if a8 {
+                    (row_a8w8(g, r, &acts[p]), row_a8w8(u, r, &acts[p]))
+                } else {
+                    let x = row_of(p);
+                    (g.row_exact(r, x), u.row_exact(r, x))
+                };
+                // SAFETY: (pair, row) cells are disjoint across the workers' row ranges.
+                unsafe {
+                    *gu_at.at(2 * p * ff + r) = a;
+                    *gu_at.at((2 * p + 1) * ff + r) = b;
+                }
+            }
+        }
+    };
+    let fs: Vec<Box<dyn Fn(usize, usize) + Sync + '_>> =
+        (0..experts.len()).map(|i| Box::new(move |s: usize, e: usize| run_gu(i, s, e)) as Box<dyn Fn(usize, usize) + Sync>).collect();
+    let parts: Vec<(usize, &(dyn Fn(usize, usize) + Sync))> = fs.iter().map(|f| (ff, f.as_ref())).collect();
+    match pool {
+        Some(p) => p.run_many(&parts),
+        None => parts.iter().for_each(|(n, f)| f(0, *n)),
+    }
+    let mut act = vec![0f32; pairs * ff];
+    for p in 0..pairs {
+        for r in 0..ff {
+            let (g, u) = (gu[2 * p * ff + r], gu[(2 * p + 1) * ff + r]);
+            act[p * ff + r] = g / (1.0 + (-g).exp()) * u;
+        }
+    }
+    let acts2: Vec<SplitAct> = if a8 { (0..pairs).map(|p| split_act(&act[p * ff..(p + 1) * ff])).collect() } else { Vec::new() };
+    let xs42: Vec<Vec<i32>> = if v512 { acts2.iter().map(|a| quad_sums12(&a.xq)).collect() } else { Vec::new() };
+    let out_at = SendMut(out.as_mut_ptr());
+    let run_d = |i: usize, start: usize, end: usize| {
+        let d = &gate[i].2;
+        if v512 {
+            let ps = base[i]..base[i] + groups[i].len();
+            // SAFETY: (pair, row) cells are disjoint across the workers' row ranges.
+            rows_against(d, start, end, ps, &acts2, &xs42, &mut |p, r, v| unsafe { *out_at.at(p * cols + r) = v });
+            return;
+        }
+        for r in start..end {
+            for p in base[i]..base[i] + groups[i].len() {
+                let v = if a8 { row_a8w8(d, r, &acts2[p]) } else { d.row_exact(r, &act[p * ff..(p + 1) * ff]) };
+                // SAFETY: (pair, row) cells are disjoint across the workers' row ranges.
+                unsafe { *out_at.at(p * cols + r) = v };
+            }
+        }
+    };
+    let fs: Vec<Box<dyn Fn(usize, usize) + Sync + '_>> =
+        (0..experts.len()).map(|i| Box::new(move |s: usize, e: usize| run_d(i, s, e)) as Box<dyn Fn(usize, usize) + Sync>).collect();
+    let parts: Vec<(usize, &(dyn Fn(usize, usize) + Sync))> = fs.iter().map(|f| (cols, f.as_ref())).collect();
+    match pool {
+        Some(p) => p.run_many(&parts),
+        None => parts.iter().for_each(|(n, f)| f(0, *n)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +559,42 @@ mod tests {
             assert!((a - want[r]).abs() <= 2e-2 * norm, "a8w8 row {r}: {a} vs {}", want[r]);
             let s = dot_i8_scalar(m.row_codes(r), m.row_scales(r), &act.xq);
             assert_eq!(dot_i8(m.row_codes(r), m.row_scales(r), &act.xq), s, "simd == scalar, row {r}");
+        }
+    }
+
+    #[test]
+    fn latent_rows_match_the_dequantized_expert() {
+        let (ff, l) = (64usize, 128usize);
+        let ex: Vec<[Vec<u8>; 3]> = (0..2).map(|i| [payload(ff, l, 10 + i), payload(ff, l, 20 + i), payload(l, ff, 30 + i)]).collect();
+        let xs: Vec<f32> = (0..3 * l).map(|j| ((j * 7919 % 113) as f32 - 56.0) / 97.0).collect();
+        let groups = vec![vec![2usize, 0], vec![1usize]];
+        let views: Vec<(&[u8], &[u8], &[u8])> = ex.iter().map(|e| (&e[0][..], &e[1][..], &e[2][..])).collect();
+        let mut out = vec![0f32; 3 * l];
+        let pool = Pool::new(3);
+        latent_rows(&views, ff, l, &groups, &xs, &mut out, Some(&pool));
+        let mut p = 0usize;
+        for (i, g) in groups.iter().enumerate() {
+            let deq = |b: &[u8], rows: usize, cols: usize| {
+                let mut w = vec![0f32; rows * cols];
+                cortiq_core::nvfp4::dequant(b, rows, cols, &mut w);
+                w
+            };
+            let (wg, wu, wd) = (deq(&ex[i][0], ff, l), deq(&ex[i][1], ff, l), deq(&ex[i][2], l, ff));
+            for &k in g {
+                let x = &xs[k * l..(k + 1) * l];
+                let a: Vec<f64> = (0..ff)
+                    .map(|r| {
+                        let g: f64 = (0..l).map(|j| wg[r * l + j] as f64 * x[j] as f64).sum();
+                        let u: f64 = (0..l).map(|j| wu[r * l + j] as f64 * x[j] as f64).sum();
+                        g / (1.0 + (-g).exp()) * u
+                    })
+                    .collect();
+                let want: Vec<f64> = (0..l).map(|r| (0..ff).map(|j| wd[r * ff + j] as f64 * a[j]).sum()).collect();
+                let norm = want.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let err = (0..l).map(|r| (out[p * l + r] as f64 - want[r]).powi(2)).sum::<f64>().sqrt();
+                assert!(err <= 3e-2 * norm, "expert {i} input {k}: relative error {}", err / norm);
+                p += 1;
+            }
         }
     }
 }

@@ -71,7 +71,10 @@ macro_rules! qfuncs {
                 if let Ok(v) = std::env::var("CMF_QWEN_DEFS") {
                     defs.extend(v.split_whitespace().map(str::to_string));
                 }
-                let module = compile(include_str!("qwen4.cu"), defs, c.arch)?;
+                // `CMF_QWEN_CU_FILE=<path>`: the kernels' source from that file instead of the built-in one (kernel
+                // work without a rebuild; the launches must still match)
+                let file = std::env::var("CMF_QWEN_CU_FILE").ok().and_then(|p| std::fs::read_to_string(p).ok());
+                let module = compile(file.as_deref().unwrap_or(include_str!("qwen4.cu")), defs, c.arch)?;
                 Ok(Self { $($name: func(module, concat!("q4_", stringify!($name)))?,)* sm: QSmall::load(module)? })
             }
         }
@@ -80,7 +83,7 @@ macro_rules! qfuncs {
 qfuncs!(
     tile, grms, grms_inj, grms_inj4, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_scan_c, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
-    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_gmask, lat_mv, lat_put, lat_red,
+    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_gu2, lat_dn2, lat_ggu, lat_gdn, gdn_scan_p, lat_mv2, lat_units, lat_gu3, lat_dn3, lat_sum, lat_expand, lat_act, lat_gmask, lat_mv, lat_put, lat_red,
 );
 unsafe impl Send for QFuncs {}
 unsafe impl Sync for QFuncs {}
@@ -239,7 +242,12 @@ static QF: OnceLock<Result<QFuncs, String>> = OnceLock::new();
 fn qf(c: &Ctx) -> Res<&'static QFuncs> {
     QF.get_or_init(|| {
         c.current()?;
-        QFuncs::load(c)
+        let q = QFuncs::load(c)?;
+        // a round of eight rows stages 64 KB of latent inputs in `q4_lat_gu3`
+        for f in [q.lat_gu3, q.lat_dn3] {
+            let _ = unsafe { cu::function::set_function_attribute(f, cs::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10) };
+        }
+        Ok(q)
     })
     .as_ref()
     .map_err(Clone::clone)
@@ -431,8 +439,16 @@ fn draft_vocab(recent: &[u32], vocab: usize) -> usize {
 fn scan(c: &Ctx, q: &QFuncs, d: &Dims, mix: u64, gb: u64, st: u64, st2: u64, out: u64, n: usize) -> Res<()> {
     static COL: OnceLock<bool> = OnceLock::new();
     let col = *COL.get_or_init(|| !std::env::var("CMF_QWEN_SCAN_C").is_ok_and(|v| v.trim() == "0"));
+    // a state column split over GDN_PARTS lanes (`q4_gdn_scan_p`; Edge0-145B 16K prompt 4045 -> 4426 tok/s on a
+    // PRO 6000 against the column a thread); `CMF_QWEN_SCAN_P=0` keeps `q4_gdn_scan_c`
+    static PARTS: OnceLock<bool> = OnceLock::new();
+    let parts = *PARTS.get_or_init(|| !std::env::var("CMF_QWEN_SCAN_P").is_ok_and(|v| v.trim() == "0"));
     let bt = d.dv.min(128);
-    if col && d.dk == 128 && d.dv.is_multiple_of(bt) && d.nk > 0 && d.nv.is_multiple_of(d.nk) {
+    let gp = def_value("GDN_PARTS").unwrap_or(8);
+    if parts && d.dk == 128 && d.nk > 0 && d.nv.is_multiple_of(d.nk) && (d.dv * gp).is_multiple_of(128) && gp > 0 && 128usize.is_multiple_of(gp) {
+        go!(c, q.gdn_scan_p, (d.nv as u32, (d.dv * gp / 128) as u32), 128;
+            mix, gb, st, st2, out, n as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
+    } else if col && d.dk == 128 && d.dv.is_multiple_of(bt) && d.nk > 0 && d.nv.is_multiple_of(d.nk) {
         go!(c, q.gdn_scan_c, (d.nv as u32, (d.dv / bt) as u32), bt;
             mix, gb, st, st2, out, n as i32, d.c_dim as i32, d.nv as i32, d.nk as i32, d.dk as i32, d.dv as i32);
     } else {
@@ -689,7 +705,7 @@ struct LayerW {
 }
 
 /// A latent MoE layer on the card: the router (and the shared expert's gate row), D and U, the shared
-/// expert as q8 planes, every routed expert resident as an NVFP4 slot, the experts' groups.
+/// expert as q8 planes, the routed experts' NVFP4 slots in the bank (`LatBank`), the experts' groups.
 struct LatW {
     router: Buf,
     r: usize,
@@ -700,16 +716,206 @@ struct LatW {
     umat: DevMat,
     sh: [DevMat; 3],
     labels: Buf,
-    /// Per expert the address of its slot.
+    /// Per expert the address of its slot in the bank, 0 for an expert the host keeps.
     tbl: Buf,
     tbl_host: Vec<u64>,
     /// Per expert the globals of gate, up and down.
     glob: Vec<[f32; 3]>,
     labels_host: Vec<i32>,
-    _experts: Buf,
     l: usize,
     groups: usize,
     ff: usize,
+    /// Every expert of the layer is in the bank: nothing waits for the host.
+    all: bool,
+}
+
+/// Rows a block of `q4_lat_mv` takes: its `LAT_MV_RB`, from `CMF_QWEN_DEFS` when set there (default 16).
+fn lat_mv_rb() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| def_value("LAT_MV_RB").unwrap_or(16))
+}
+
+/// The value of `-D<name>=<v>` in `CMF_QWEN_DEFS`.
+fn def_value(name: &str) -> Option<usize> {
+    let defs = std::env::var("CMF_QWEN_DEFS").ok()?;
+    let key = format!("-D{name}=");
+    defs.split_whitespace().find_map(|d| d.strip_prefix(&key)?.parse().ok())
+}
+
+/// Rows of an expert matrix a block of `q4_lat_gu` / `q4_lat_dn` takes (`CMF_QWEN_LAT_RB`, default 8).
+fn lat_rb() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_LAT_RB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).max(1))
+}
+
+/// A prompt chunk's latent experts as grouped GEMMs straight from the NVFP4 slots (`q4_lat_ggu` /
+/// `q4_lat_gdn`, f16 tensor cores, no dense copy of the weights); `CMF_QWEN_LAT_FUSED=0` keeps the expanded
+/// planes and cuBLAS' batched GEMMs.
+fn lat_fused() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("CMF_QWEN_LAT_FUSED").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// The latent D / U matvecs of a decode step or a verify round in the small path's form (`q4_lat_mv2`);
+/// `CMF_QWEN_LAT_MV=1` keeps `q4_lat_mv`.
+fn lat_mv2() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("CMF_QWEN_LAT_MV").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `CMF_QWEN_LAT_UNITS=1`: a round's latent picks grouped by expert on the card (`q4_lat_units`, `q4_lat_gu3` /
+/// `q4_lat_dn3`), an expert two rows picked read once. Off by default: the four-row rounds of Edge0-145B pick
+/// few experts twice, and gate/up took 68.6 us a layer against 54.3 per pick (PRO 6000).
+fn lat_units() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_LAT_UNITS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `CMF_QWEN_LAT_V=2`: the picks' kernels with `LAT_RPW` rows a warp in flight and 16-byte loads
+/// (`q4_lat_gu2` / `q4_lat_dn2`, eight warps x LAT_RPW rows a block).
+fn lat_v2() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_LAT_V").is_ok_and(|v| v.trim() == "2"))
+}
+
+impl Core {
+    /// The picks' gate/up and down kernels (`lat_v2` picks the form) over `routes` picks.
+    #[allow(clippy::too_many_arguments)]
+    fn lat_gu_dn(&self, picks: u64, labels: u64, tbl: u64, xl: u64, act: u64, y: u64, ff: usize, l: usize, g: usize, topk: usize, routes: usize) -> Res<()> {
+        let c = self.c;
+        let q = self.q;
+        if lat_units() && routes <= 256 && l.is_multiple_of(32) && ff.is_multiple_of(32) {
+            // the round's picks by expert, each expert read once for all its rows
+            let s = &self.s;
+            let nun = s.lmask.ptr + 4;
+            go!(c, q.lat_units, (1u32, 1), 256; picks, routes as i32, s.lunits.ptr, nun);
+            let rows = (routes / topk.max(1)).clamp(1, 8);
+            let rb = 8 * def_value("LAT_U_RPW").unwrap_or(2);
+            let (sgu, sdn) = (rows * (l / 32) * 36 * 4, rows * (ff / 32) * 36 * 4);
+            unsafe {
+                c.launch(q.lat_gu3, (ff.div_ceil(rb) as u32, routes as u32), 256, sgu, kargs!(s.lunits.ptr, nun, labels, tbl, xl, act, ff as i32, l as i32, g as i32, topk as i32))
+            }?;
+            unsafe { c.launch(q.lat_dn3, (l.div_ceil(rb) as u32, routes as u32), 256, sdn, kargs!(s.lunits.ptr, nun, tbl, act, y, ff as i32, l as i32)) }?;
+            return Ok(());
+        }
+        let (fgu, fdn, rb, ss) = if lat_v2() {
+            let rb = 8 * def_value("LAT_RPW").unwrap_or(4);
+            (q.lat_gu2, q.lat_dn2, rb, 32 * 4)
+        } else {
+            (q.lat_gu, q.lat_dn, lat_rb(), 0)
+        };
+        let sh_gu = if ss > 0 { ss * ((l >> 5) | 1) } else { l * 4 };
+        let sh_dn = if ss > 0 { ss * ((ff >> 5) | 1) } else { ff * 4 };
+        unsafe {
+            c.launch(fgu, (ff.div_ceil(rb) as u32, routes as u32), 256, sh_gu, kargs!(picks, labels, tbl, xl, act, ff as i32, l as i32, g as i32, topk as i32, rb as i32))
+        }?;
+        unsafe { c.launch(fdn, (l.div_ceil(rb) as u32, routes as u32), 256, sh_dn, kargs!(picks, tbl, act, y, ff as i32, l as i32, rb as i32)) }?;
+        Ok(())
+    }
+}
+
+/// Experts outside the bank a prompt batch carries up at once (its staging slots).
+const LAT_STAGE: usize = 64;
+
+/// `CMF_QWEN_LAT_BANK=<n>`: at most `n` latent experts on the card (a smaller card's split on a large one).
+fn lat_bank_cap() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_QWEN_LAT_BANK").ok().and_then(|v| v.trim().parse::<usize>().ok()))
+}
+
+/// The card's bank of latent experts (Edge0). With the room, every expert of every layer; otherwise the
+/// hottest by the routing profile (`Dev::lat_fill`) and the rest stay in the mapped file: a decode step or a
+/// verify round computes their rows on the host's cores while the card runs the bank's, and a prompt chunk
+/// carries them up through two pinned blocks for its batched GEMMs.
+struct LatBank {
+    buf: Buf,
+    /// Bytes of a slot (gate, up, down, each padded to 16), of a gate/up payload and of a down payload.
+    slot: usize,
+    pg: usize,
+    pd: usize,
+    /// Slots of the bank and experts of the model.
+    n: usize,
+    total: usize,
+    /// The host's scratch of a round: picks and latent rows down, the host's rows up.
+    host: HostScratch,
+    /// A prompt sub-batch's experts outside the bank: their slots on the card, two pinned blocks and the
+    /// event of each block's last upload.
+    dstage: Option<Buf>,
+    pstage: Vec<Pinned>,
+    ev: Vec<cs::CUevent>,
+    flip: usize,
+    /// Since the last report: picks the bank served and the host computed, the host's time (waiting for
+    /// the card, its own rows), experts carried up for prompts and the time spent filling their blocks.
+    hits: u64,
+    miss: u64,
+    wait_ms: f64,
+    host_ms: f64,
+    staged: u64,
+    stage_ms: f64,
+    /// `CMF_QWEN_LAT_PROFILE_SAVE=<path>`: the routing of every token counted per (layer, expert) and written
+    /// there (the `CMF_QWEN_PROFILE` form) at every report and when the bank goes; the rows counted.
+    prof: Option<(String, Vec<u32>, u64)>,
+    ne: usize,
+}
+
+// SAFETY: the events and blocks are used under the device's state lock only, by one thread at a time.
+unsafe impl Send for LatBank {}
+
+impl Drop for LatBank {
+    fn drop(&mut self) {
+        self.save();
+        for &e in &self.ev {
+            let _ = unsafe { cu::event::synchronize(e) };
+            let _ = unsafe { cu::event::destroy(e) };
+        }
+    }
+}
+
+impl LatBank {
+    /// Count a layer's picks into the routing profile (when one is recorded).
+    fn note(&mut self, li: usize, picks: &[i32], rows: usize) {
+        let ne = self.ne;
+        if let Some((_, counts, toks)) = self.prof.as_mut() {
+            for &e in picks {
+                if e >= 0 && (e as usize) < ne {
+                    counts[li * ne + e as usize] = counts[li * ne + e as usize].saturating_add(1);
+                }
+            }
+            if li == 0 {
+                *toks += rows as u64;
+            }
+        }
+    }
+
+    /// Write the routing profile (the layout `CMF_QWEN_PROFILE` reads).
+    fn save(&self) {
+        let Some((path, counts, toks)) = self.prof.as_ref() else { return };
+        let nl = counts.len() / self.ne.max(1);
+        let mut out = Vec::with_capacity(32 + counts.len() * 4);
+        out.extend_from_slice(b"CMFQ4PF\0");
+        out.extend_from_slice(&(nl as u64).to_le_bytes());
+        out.extend_from_slice(&(self.ne as u64).to_le_bytes());
+        out.extend_from_slice(&toks.to_le_bytes());
+        for &c in counts {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            eprintln!("qwen4 cuda: the latent routing profile was not written to {path}: {e}");
+        }
+    }
+
+    /// One line of what the bank did since the last one (`CMF_QWEN_PROF`), then the counters restart.
+    fn report(&mut self) {
+        if self.hits + self.miss + self.staged == 0 {
+            return;
+        }
+        let share = 100.0 * self.hits as f64 / (self.hits + self.miss).max(1) as f64;
+        eprintln!(
+            "qwen4 cuda: latent bank {} of {} experts: picks {} on the card ({share:.1} %), {} on the host ({:.1} ms waiting, {:.1} ms computing); {} experts carried up for prompts ({:.1} ms filling)",
+            self.n, self.total, self.hits, self.miss, self.wait_ms, self.host_ms, self.staged, self.stage_ms
+        );
+        (self.hits, self.miss, self.wait_ms, self.host_ms, self.staged, self.stage_ms) = (0, 0, 0.0, 0.0, 0, 0.0);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -811,6 +1017,12 @@ struct Scratch {
     /// A chunk's per-pick down rows `[n·topk][L]`, and the pick of each sub-batch row.
     lyc: Buf,
     lrp: Buf,
+    /// A latent chunk's fused path: the units (expert slot, first row, rows), the rows' latent inputs and
+    /// picks in expert order, and the rows' activations (f16).
+    lunits: Buf,
+    lrt: Buf,
+    lrk: Buf,
+    lah: Buf,
 }
 
 /// Page-locked host memory the expert uploads are staged in: a copy from it
@@ -2331,34 +2543,24 @@ impl Build {
             self.held += mm.held;
             self.wq_elems = self.wq_elems.max(mm.rows * mm.cols);
         }
-        let pad = |n: usize| n.div_ceil(16) * 16;
         let pg = cortiq_core::nvfp4::nbytes(ff, l).ok_or("qwen4 cuda: latent expert size")?;
         let pd = cortiq_core::nvfp4::nbytes(l, ff).ok_or("qwen4 cuda: latent expert size")?;
-        let slot = 2 * pad(pg) + pad(pd);
-        let buf = self.buf(ne * slot)?;
-        let mut stage = vec![0u8; slot * 64];
+        // the experts go to the bank once the card's room is known (`Dev::lat_fill`); here their form is
+        // checked and their globals kept
         let mut glob = Vec::with_capacity(ne);
-        for (c0, chunk) in m.experts.chunks(64).enumerate() {
-            stage.iter_mut().for_each(|b| *b = 0);
-            for (j, e) in chunk.iter().enumerate() {
-                let mut gl = [0f32; 3];
-                for (k, (t, rows, cols, len)) in
-                    [(&e.gate_proj, ff, l, pg), (&e.up_proj, ff, l, pg), (&e.down_proj, l, ff, pd)].into_iter().enumerate()
-                {
-                    let ok = t.rows() == rows && t.cols() == cols && t.model_dtype() == Some(cortiq_core::TensorDtype::Nvfp4);
-                    let bytes = t.mapped_bytes().filter(|b| ok && b.len() == len).ok_or_else(|| {
-                        format!("qwen4 cuda: latent expert {} matrix {k} is not nvfp4 {rows}x{cols}", c0 * 64 + j)
-                    })?;
-                    let at = j * slot + k * pad(pg);
-                    stage[at..at + len].copy_from_slice(bytes);
-                    gl[k] = cortiq_core::nvfp4::global(bytes, rows, cols);
-                }
-                glob.push(gl);
+        for (ei, e) in m.experts.iter().enumerate() {
+            let mut gl = [0f32; 3];
+            for (k, (t, rows, cols, len)) in [(&e.gate_proj, ff, l, pg), (&e.up_proj, ff, l, pg), (&e.down_proj, l, ff, pd)].into_iter().enumerate() {
+                let ok = t.rows() == rows && t.cols() == cols && t.model_dtype() == Some(cortiq_core::TensorDtype::Nvfp4);
+                let bytes = t
+                    .mapped_bytes()
+                    .filter(|b| ok && b.len() == len)
+                    .ok_or_else(|| format!("qwen4 cuda: latent expert {ei} matrix {k} is not nvfp4 {rows}x{cols}"))?;
+                gl[k] = cortiq_core::nvfp4::global(bytes, rows, cols);
             }
-            let dst = buf.ptr + (c0 * 64 * slot) as u64;
-            unsafe { cu::memcpy_htod_sync(dst, &stage[..chunk.len() * slot]) }.map_err(derr)?;
+            glob.push(gl);
         }
-        let tbl_host: Vec<u64> = (0..ne).map(|e| buf.ptr + (e * slot) as u64).collect();
+        let tbl_host = vec![0u64; ne];
         let labels_host: Vec<i32> = lat.labels.iter().map(|&g| g as i32).collect();
         let tbl = self.f32buf_u64(&tbl_host)?;
         let labels = Buf::from_slice(&labels_host)?;
@@ -2388,10 +2590,10 @@ impl Build {
             tbl_host,
             glob,
             labels_host,
-            _experts: buf,
             l,
             groups,
             ff,
+            all: false,
         };
         // the placeholder of the layer's MoeW: nothing of it is read
         let ph = MoeW { router: self.buf(16)?, shared: None, gcol: -1, r, topk, ne, tubes: vec![-1; ne], shared_tube: -1, has_tubes: false };
@@ -2562,6 +2764,8 @@ pub(crate) struct Dev {
     /// Keep the stage rows of each chunk's last token (check mode).
     pub(crate) want_trace: bool,
     pub(crate) trace: Vec<(&'static str, usize, Vec<f32>)>,
+    /// The latent experts' bank (Edge0).
+    lat: Option<LatBank>,
 }
 
 impl Drop for Dev {
@@ -2828,6 +3032,10 @@ impl Dev {
             lpart: b.buf(lat_dims.map_or(16, |(_, g, _)| g * SMALL_ROWS * d.h * 4))?,
             lyc: b.buf(lat_dims.map_or(16, |(l, _, _)| n * topk * l * 4))?,
             lrp: b.buf(xr * 4)?,
+            lunits: b.buf(lat_dims.map_or(16, |_| (n * topk / 64 + d.ne + 1) * 16))?,
+            lrt: b.buf(lat_dims.map_or(16, |_| n * topk * 4))?,
+            lrk: b.buf(lat_dims.map_or(16, |_| n * topk * 4))?,
+            lah: b.buf(lat_dims.map_or(16, |(_, _, ff)| n * topk * ff * 2))?,
         };
         mem[7] += b.held - h0;
         let h0 = b.held;
@@ -2857,10 +3065,11 @@ impl Dev {
         }
         slots = slots.min(ne * layers.len());
         if latent {
-            // the arena holds the MTP head's experts only
-            slots = slots.min(2 * ne.max(head_ne));
+            // the arena holds the MTP head's experts only: all of them, the head routes over every one
+            slots = slots.min(head_ne.max(16));
         }
-        if slots < ne.max(256).min(ne * layers.len()) {
+        let least = if latent { head_ne } else { ne.max(256).min(ne * layers.len()) };
+        if slots < least {
             return Err(format!("qwen4 cuda: room for {slots} experts only, a layer has {ne}"));
         }
         // one layer's experts of staging (`CMF_QWEN_CUDA_STAGE=0`: the driver's own)
@@ -2875,6 +3084,65 @@ impl Dev {
         let tbl = b.buf(tbl_rows * tbl_stride * 8)?;
         mem[8] += b.held - h0;
         let buf = b.buf(slots * slot)?;
+        // the latent experts' bank: what the card has left after the arena, less what a session grows into
+        let lat_bank = match lat_dims {
+            Some((l, _, ff)) => {
+                let pad = |n: usize| n.div_ceil(16) * 16;
+                let pg = cortiq_core::nvfp4::nbytes(ff, l).ok_or("qwen4 cuda: latent expert size")?;
+                let pd = cortiq_core::nvfp4::nbytes(l, ff).ok_or("qwen4 cuda: latent expert size")?;
+                let lslot = 2 * pad(pg) + pad(pd);
+                let total = ne * layers.len();
+                let free2 = super::mem_free();
+                let room = match (free0, free2) {
+                    (Some(f0), Some(f2)) => {
+                        let spare = f2.saturating_sub((96 << 20) + grow);
+                        match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+                            Some(mb) => spare.min((mb << 20).saturating_sub(CTX_BYTES + (32 << 20) + res0 + f0.saturating_sub(f2) + grow)),
+                            None => spare,
+                        }
+                    }
+                    _ => vram_budget().saturating_sub(c.resident.load(std::sync::atomic::Ordering::Relaxed) + b.held + (512 << 20) + grow),
+                };
+                let mut nb = ((room / lslot as u64) as usize).min(total);
+                if let Some(cap) = lat_bank_cap() {
+                    nb = nb.min(cap);
+                }
+                let (mut dstage, mut pstage, mut ev) = (None, Vec::new(), Vec::new());
+                if nb < total {
+                    // a prompt batch's experts outside the bank come up through its own slots
+                    let st = LAT_STAGE.max(xb) * lslot;
+                    nb = nb.min((room.saturating_sub(st as u64) / lslot as u64) as usize);
+                    dstage = Some(b.buf(st)?);
+                    for _ in 0..2 {
+                        pstage.push(Pinned::new(st).ok_or("qwen4 cuda: no page-locked memory for the latent staging")?);
+                        ev.push(cu::event::create(cs::CUevent_flags::CU_EVENT_DISABLE_TIMING).map_err(derr)?);
+                    }
+                }
+                let buf = b.buf(nb.max(1) * lslot)?;
+                Some(LatBank {
+                    buf,
+                    slot: lslot,
+                    pg,
+                    pd,
+                    n: nb,
+                    total,
+                    host: HostScratch::new(),
+                    dstage,
+                    pstage,
+                    ev,
+                    flip: 0,
+                    hits: 0,
+                    miss: 0,
+                    wait_ms: 0.0,
+                    host_ms: 0.0,
+                    staged: 0,
+                    stage_ms: 0.0,
+                    prof: std::env::var("CMF_QWEN_LAT_PROFILE_SAVE").ok().map(|p| (p, vec![0u32; total], 0u64)),
+                    ne,
+                })
+            }
+            None => None,
+        };
         let stagers = if cpu_experts() { Stagers::start(c, slot, d.sgu) } else { None };
         let arena = Arena {
             stagers,
@@ -3036,12 +3304,80 @@ impl Dev {
             mtp: mtp_w,
             want_trace: false,
             trace: Vec::new(),
+            lat: lat_bank,
         })
     }
 
     /// Largest chunk a call takes.
     pub(crate) fn chunk(&self) -> usize {
         self.k.n_cap
+    }
+
+    /// Fill the latent bank: every expert when it has the room, otherwise the `ranked` `(layer, expert)`
+    /// pairs first (hottest first) and then expert after expert across the layers; the layers' tables then
+    /// point at their slots. Returns the experts placed (0 for a model without latent layers).
+    pub(crate) fn lat_fill(&mut self, layers: &[Layer], ranked: &[(usize, usize)]) -> Res<usize> {
+        let Self { k, layers: lws, lat, .. } = self;
+        let Some(bank) = lat.as_mut() else { return Ok(0) };
+        let c = k.c;
+        let _st = c.st.lock().unwrap();
+        c.current()?;
+        let nl = lws.len();
+        let ne = k.d.ne;
+        if layers.len() != nl || bank.total != nl * ne {
+            return Err("qwen4 cuda: the latent bank of other layers".into());
+        }
+        let mut chosen = vec![false; nl * ne];
+        let mut list: Vec<usize> = Vec::with_capacity(bank.n);
+        for &(l, e) in ranked {
+            if list.len() >= bank.n {
+                break;
+            }
+            if l < nl && e < ne && !chosen[l * ne + e] {
+                chosen[l * ne + e] = true;
+                list.push(l * ne + e);
+            }
+        }
+        'fill: for e in 0..ne {
+            for l in 0..nl {
+                if list.len() >= bank.n {
+                    break 'fill;
+                }
+                if !chosen[l * ne + e] {
+                    chosen[l * ne + e] = true;
+                    list.push(l * ne + e);
+                }
+            }
+        }
+        list.sort_unstable();
+        let pad = |n: usize| n.div_ceil(16) * 16;
+        let (slot, pg) = (bank.slot, bank.pg);
+        let mut stage = vec![0u8; 64 * slot];
+        let mut slot_of = vec![u32::MAX; nl * ne];
+        for (ci, chunk) in list.chunks(64).enumerate() {
+            for (j, &key) in chunk.iter().enumerate() {
+                let x = &layers[key / ne].moe.experts[key % ne];
+                for (m, t) in [&x.gate_proj, &x.up_proj, &x.down_proj].into_iter().enumerate() {
+                    let src = t.mapped_bytes().ok_or("qwen4 cuda: a latent expert without file bytes")?;
+                    let at = j * slot + m * pad(pg);
+                    stage[at..at + src.len()].copy_from_slice(src);
+                }
+                slot_of[key] = (ci * 64 + j) as u32;
+            }
+            let dst = bank.buf.ptr + (ci * 64 * slot) as u64;
+            unsafe { cu::memcpy_htod_sync(dst, &stage[..chunk.len() * slot]) }.map_err(derr)?;
+        }
+        for (li, lw) in lws.iter_mut().enumerate() {
+            if let Some(lt) = lw.lat.as_mut() {
+                for e in 0..ne {
+                    let sl = slot_of[li * ne + e];
+                    lt.tbl_host[e] = if sl == u32::MAX { 0 } else { bank.buf.ptr + sl as u64 * slot as u64 };
+                }
+                lt.all = lt.tbl_host.iter().all(|&a| a != 0);
+                unsafe { cu::memcpy_htod_sync(lt.tbl.ptr, &lt.tbl_host) }.map_err(derr)?;
+            }
+        }
+        Ok(list.len())
     }
 
     /// Rows a window can take back in part (the tape).
@@ -4692,22 +5028,35 @@ impl Core {
     /// A latent layer's MoE (Edge0): the route as the base model's, D, the routed experts in their
     /// groups' latent rows, U, the shared expert. A few rows take the per-pick kernels straight from the
     /// NVFP4 slots; a chunk expands each sub-batch's experts for the batched GEMMs.
-    fn moe_lat(&self, lw: &LatW, li: usize, n: usize) -> Res<()> {
+    fn moe_lat(&self, lw: &LatW, layer: &Layer, bank: &mut LatBank, li: usize, n: usize) -> Res<()> {
         let (d, s, c, q) = (&self.d, &self.s, self.c, self.q);
         let (l, g, ff, ne, topk) = (lw.l, lw.groups, lw.ff, lw.ne, lw.topk);
         let gl = g * l;
         let small = self.small(n);
         if small {
-            self.mvb(&[SOp::f32(lw.router.ptr, lw.r, s.logits.ptr)], s.folded.ptr, d.h, d.h, n)?;
+            // the router and the shared expert's gate and up read the same rows: one launch
+            self.mvb(
+                &[SOp::f32(lw.router.ptr, lw.r, s.logits.ptr), SOp::q8(&lw.sh[0], s.g.ptr), SOp::q8(&lw.sh[1], s.u.ptr)],
+                s.folded.ptr,
+                d.h,
+                d.h,
+                n,
+            )?;
         } else {
             self.gemm_w(lw.router.ptr, lw.r, d.h, s.folded.ptr, n, s.logits.ptr, Gemm::F32)?;
         }
         let tail = if small { self.tail } else { 0.0f32 };
         go!(c, q.route, (n as u32, 1), 256; s.logits.ptr, s.picks.ptr, s.wts.ptr, ne as i32, lw.r as i32, topk as i32, tail, 0u64);
+        if bank.prof.is_some() {
+            let mut pk = vec![0i32; n * topk];
+            unsafe { cu::memcpy_dtoh_async(&mut pk, s.picks.ptr, c.stream) }.map_err(derr)?;
+            c.sync()?;
+            bank.note(li, &pk, n);
+        }
         self.lap(5)?;
         let half = self.hi != 0;
         let (inv, alpha) = if half { (1.0f32 / 16.0, 16.0f32) } else { (1.0f32, 1.0f32) };
-        if !small && n * topk <= LAT_PICKS {
+        if !small && n * topk <= LAT_PICKS && lw.all {
             // a short chunk: the dense parts as GEMMs, the experts straight from their slots
             let dp = self.plane_q8(&lw.dmat)?;
             self.gemm_w(dp, gl, d.h, s.folded_h.ptr, n, s.lxl.ptr, self.gw)?;
@@ -4728,12 +5077,15 @@ impl Core {
             // sums, U over the groups picked (each matrix read once for every row of the round)
             go!(c, q.lat_gmask, (1u32, 1), 32; s.picks.ptr, lw.labels.ptr, s.lmask.ptr, n as i32, topk as i32);
             self.lat_mv(&lw.dmat, s.folded.ptr, d.h, s.lxl.ptr, gl, n, l, 0, 1280)?;
-            self.lat_picks(lw, n)?;
+            if lw.all {
+                self.lat_picks(lw, n)?;
+            } else {
+                self.lat_picks_host(lw, layer, bank, n)?;
+            }
             self.lat_mv(&lw.umat, s.lacc.ptr, gl, s.lpart.ptr, d.h, n, l, 1, l / 2)?;
             go!(c, q.lat_red, (blocks(n * d.h), 1), 256; s.lpart.ptr, s.lmask.ptr, s.blk.ptr, d.h as i32, d.h as i32, n as i32, g as i32);
             self.lap(7)?;
-            // the shared expert at full width
-            self.mvb(&[SOp::q8(&lw.sh[0], s.g.ptr), SOp::q8(&lw.sh[1], s.u.ptr)], s.folded.ptr, d.h, d.h, n)?;
+            // the shared expert at full width (its gate and up came with the router)
             go!(c, q.act, (blocks(n * ff), 1), 256; s.g.ptr, s.u.ptr, s.ah.ptr, (n * ff) as u64, 0i32, 0i32, 1.0f32);
             self.mvb(&[SOp::q8(&lw.sh[2], s.d.ptr)], s.ah.ptr, ff, ff, n)?;
             go!(c, q.shared_add, (blocks(n * d.h), 1), 256; s.blk.ptr, s.d.ptr, s.logits.ptr, n as i32, d.h as i32, lw.r as i32, lw.gcol);
@@ -4756,6 +5108,64 @@ impl Core {
             if e >= 0 && (e as usize) < ne {
                 lists[e as usize].push(i as u32);
             }
+        }
+        if half && (lw.all || bank.dstage.is_some()) && lat_fused() && ff.is_multiple_of(64) && l.is_multiple_of(64) {
+            // the rows in expert order, a unit per 64 of an expert's rows
+            let (mut rt, mut rk) = (Vec::with_capacity(n * topk), Vec::with_capacity(n * topk));
+            let mut exps: Vec<(usize, usize, usize)> = Vec::new();
+            for (e, lst) in lists.iter().enumerate() {
+                if lst.is_empty() {
+                    continue;
+                }
+                exps.push((e, rt.len(), lst.len()));
+                for &entry in lst {
+                    rt.push((entry as usize / topk) as i32 * g as i32 + lw.labels_host[e]);
+                    rk.push(entry as i32);
+                }
+            }
+            self.put(s.lrt.ptr, &rt)?;
+            self.put(s.lrk.ptr, &rk)?;
+            // one launch with every expert in the bank; otherwise batches, each with up to LAT_STAGE experts
+            // carried up from the host into the staging slots
+            let cap = bank.dstage.as_ref().map_or(0, |b| b.bytes / bank.slot);
+            let mut i = 0usize;
+            while i < exps.len() {
+                let mut units: Vec<i32> = Vec::new();
+                let mut up: Vec<(usize, usize)> = Vec::new();
+                while i < exps.len() {
+                    let (e, off0, len) = exps[i];
+                    let mut slot = lw.tbl_host[e];
+                    if slot == 0 {
+                        if up.len() >= cap {
+                            break;
+                        }
+                        let ds = bank.dstage.as_ref().ok_or("qwen4 cuda: a latent expert outside the bank and no staging")?;
+                        slot = ds.ptr + (up.len() * bank.slot) as u64;
+                        up.push((e, up.len()));
+                    }
+                    for t0 in (0..len).step_by(64) {
+                        units.extend([slot as u32 as i32, (slot >> 32) as u32 as i32, (off0 + t0) as i32, (len - t0).min(64) as i32]);
+                    }
+                    i += 1;
+                }
+                if units.is_empty() {
+                    return Err("qwen4 cuda: a latent prompt batch without staging room".into());
+                }
+                if !up.is_empty() {
+                    self.lat_stage(layer, bank, &up)?;
+                }
+                let nu = units.len() / 4;
+                self.put(s.lunits.ptr, &units)?;
+                unsafe { c.launch(q.lat_ggu, (nu as u32, (ff / 64) as u32), 128, 0, kargs!(s.lunits.ptr, s.lrt.ptr, xl_g, s.lah.ptr, ff as i32, l as i32)) }?;
+                unsafe { c.launch(q.lat_gdn, (nu as u32, (l / 64) as u32), 128, 0, kargs!(s.lunits.ptr, s.lrk.ptr, s.lah.ptr, s.lyc.ptr, ff as i32, l as i32)) }?;
+            }
+            go!(c, q.lat_sum, (blocks(n * gl), 1), 256; s.picks.ptr, lw.labels.ptr, s.wts.ptr, s.lyc.ptr, s.lacc.ptr, n as i32, g as i32, l as i32, topk as i32);
+            go!(c, q.to_wt, (blocks(n * gl), 1), 256; s.lacc.ptr, s.lacch.ptr, (n * gl) as u64, 1i32);
+            let up = self.plane_q8(&lw.umat)?;
+            self.gemm_w(up, d.h, gl, s.lacch.ptr, n, s.blk.ptr, self.gw)?;
+            self.lap(7)?;
+            let _ = li;
+            return self.lat_shared_chunk(lw, n, inv, alpha);
         }
         let mut order: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty()).collect();
         order.sort_by(|&x, &y| lists[y].len().cmp(&lists[x].len()).then(x.cmp(&y)));
@@ -4785,9 +5195,16 @@ impl Core {
             let nb = b as f32;
             let (ag, au, ad) = ((ag / nb).max(1e-30), (au / nb).max(1e-30), (ad / nb).max(1e-30));
             let mut f = vec![0f32; 3 * b];
+            // the sub-batch's experts outside the bank: their staging slots, then one upload
+            let mut up: Vec<(usize, usize)> = Vec::new();
             for j in 0..b {
                 let e = order[i + j];
                 slots[j] = lw.tbl_host[e];
+                if slots[j] == 0 {
+                    let ds = bank.dstage.as_ref().ok_or("qwen4 cuda: a latent expert outside the bank and no staging")?;
+                    slots[j] = ds.ptr + (up.len() * bank.slot) as u64;
+                    up.push((e, up.len()));
+                }
                 let gl3 = lw.glob[e];
                 f[2 * j] = gl3[0] / ag;
                 f[2 * j + 1] = gl3[1] / au;
@@ -4797,6 +5214,9 @@ impl Core {
                     rowtok[j * ne_max + r] = (entry as usize / topk) as i32 * g as i32 + grp;
                     rowpick[j * ne_max + r] = entry as i32;
                 }
+            }
+            if !up.is_empty() {
+                self.lat_stage(layer, bank, &up)?;
             }
             self.put(s.slots.ptr, &slots)?;
             self.put(s.rowtok.ptr, &rowtok)?;
@@ -4847,7 +5267,31 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lat_mv(&self, w: &DevMat, x: u64, xs: usize, y: u64, ys: usize, n: usize, glen: usize, mode: i32, ch: usize) -> Res<()> {
         let (c, q, s) = (self.c, self.q, &self.s);
-        let rb = 16usize;
+        if lat_mv2() && (1..=8).contains(&n) {
+            // the chunk: the widest divisor of the columns (of a group in mode 1) whose staging fits 48 KB
+            let span = if mode == 1 { glen } else { w.cols };
+            let ch2 = (1..=span / 16)
+                .map(|k| span / k)
+                .find(|&cw| span.is_multiple_of(cw) && cw.is_multiple_of(16) && n * 5 * cw <= 48 << 10)
+                .unwrap_or(16);
+            let rb = 8 * def_value("LAT_MV2_RPW").unwrap_or(2);
+            if (mode == 0 && !glen.is_multiple_of(rb)) || !w.cols.is_multiple_of(16) {
+                return Err(format!("qwen4 cuda: latent matvec shape {}x{} group {glen}", w.rows, w.cols));
+            }
+            let gy = if mode == 1 { (w.cols / glen) as u32 } else { 1 };
+            unsafe {
+                c.launch(
+                    q.lat_mv2,
+                    (w.rows.div_ceil(rb) as u32, gy),
+                    256,
+                    n * (ch2 / 16) * 20 * 4,
+                    kargs!(w.w.ptr, w.aux0(), w.aux1(), x, xs as i32, y, ys as i32, w.rows as i32, w.cols as i32, n as i32, glen as i32, s.lmask.ptr, mode, ch2 as i32),
+                )
+            }?;
+            let _ = ch;
+            return Ok(());
+        }
+        let rb = lat_mv_rb();
         if n > 8 || !w.cols.is_multiple_of(ch) || !ch.is_multiple_of(16) || (mode == 1 && !glen.is_multiple_of(ch)) || (mode == 0 && !glen.is_multiple_of(rb)) {
             return Err(format!("qwen4 cuda: latent matvec shape {}x{} chunk {ch} group {glen}", w.rows, w.cols));
         }
@@ -4870,26 +5314,130 @@ impl Core {
     fn lat_picks(&self, lw: &LatW, n: usize) -> Res<()> {
         let (s, c, q) = (&self.s, self.c, self.q);
         let (l, g, ff, topk) = (lw.l, lw.groups, lw.ff, lw.topk);
-        let (rb, routes) = (8usize, n * topk);
-        unsafe {
-            c.launch(
-                q.lat_gu,
-                (ff.div_ceil(rb) as u32, routes as u32),
-                256,
-                l * 4,
-                kargs!(s.picks.ptr, lw.labels.ptr, lw.tbl.ptr, s.lxl.ptr, s.lact.ptr, ff as i32, l as i32, g as i32, topk as i32, rb as i32),
-            )
-        }?;
-        unsafe {
-            c.launch(
-                q.lat_dn,
-                (l.div_ceil(rb) as u32, routes as u32),
-                256,
-                ff * 4,
-                kargs!(s.picks.ptr, lw.tbl.ptr, s.lact.ptr, s.ly.ptr, ff as i32, l as i32, rb as i32),
-            )
-        }?;
+        let routes = n * topk;
+        self.lat_gu_dn(s.picks.ptr, lw.labels.ptr, lw.tbl.ptr, s.lxl.ptr, s.lact.ptr, s.ly.ptr, ff, l, g, topk, routes)?;
         go!(c, q.lat_sum, (blocks(n * g * l), 1), 256; s.picks.ptr, lw.labels.ptr, s.wts.ptr, s.ly.ptr, s.lacc.ptr, n as i32, g as i32, l as i32, topk as i32);
+        Ok(())
+    }
+
+    /// `lat_picks` with part of the layer's experts outside the bank: the picks and the latent rows come
+    /// down, the card runs the bank's picks while the host's cores compute the others, whose rows then go
+    /// up to their picks' places before the groups' sums.
+    fn lat_picks_host(&self, lw: &LatW, layer: &Layer, bank: &mut LatBank, n: usize) -> Res<()> {
+        let (s, c, q) = (&self.s, self.c, self.q);
+        let (l, g, ff, topk) = (lw.l, lw.groups, lw.ff, lw.topk);
+        let (routes, gl) = (n * topk, g * l);
+        let t0 = Instant::now();
+        // the rows' block keeps room behind them for the picks' places and their unit factors
+        let (pp, xp, rp) = bank.host.parts(routes, n * gl, routes * l + 2 * routes, || c.sync())?;
+        // SAFETY: the scratch lives as long as the bank and only this call uses it; the uploads of the
+        // layer before ended by the wait below, ahead of any write here
+        let (pk, xs, rows) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(pp, routes),
+                std::slice::from_raw_parts_mut(xp, n * gl),
+                std::slice::from_raw_parts_mut(rp, routes * l + 2 * routes),
+            )
+        };
+        unsafe { cu::memcpy_dtoh_async(&mut *pk, s.picks.ptr, c.stream) }.map_err(derr)?;
+        unsafe { cu::memcpy_dtoh_async(&mut *xs, s.lxl.ptr, c.stream) }.map_err(derr)?;
+        wait_stream(c)?;
+        let t1 = Instant::now();
+        // the bank's picks on the card (the kernels pass over the others)
+        self.lat_gu_dn(s.picks.ptr, lw.labels.ptr, lw.tbl.ptr, s.lxl.ptr, s.lact.ptr, s.ly.ptr, ff, l, g, topk, routes)?;
+        // the host's picks, expert by expert in order of first pick
+        let mut miss: Vec<(usize, usize)> = Vec::new();
+        for (r, &e) in pk.iter().enumerate() {
+            if e >= 0 && (e as usize) < lw.ne {
+                if lw.tbl_host[e as usize] == 0 {
+                    miss.push((e as usize, r));
+                } else {
+                    bank.hits += 1;
+                }
+            }
+        }
+        if !miss.is_empty() {
+            miss.sort_by_key(|&(e, _)| e);
+            let mut experts: Vec<(&QTensor, &QTensor, &QTensor)> = Vec::new();
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            let mut xin = vec![0f32; miss.len() * l];
+            let mut last = usize::MAX;
+            for (p, &(e, r)) in miss.iter().enumerate() {
+                if e != last {
+                    let x = &layer.moe.experts[e];
+                    experts.push((&x.gate_proj, &x.up_proj, &x.down_proj));
+                    groups.push(Vec::new());
+                    last = e;
+                }
+                groups.last_mut().unwrap().push(p);
+                let at = (r / topk) * gl + lw.labels_host[e] as usize * l;
+                xin[p * l..(p + 1) * l].copy_from_slice(&xs[at..at + l]);
+            }
+            let m = miss.len();
+            let (out, tail) = rows.split_at_mut(m * l);
+            if !QTensor::nvfp4_latent_rows(&experts, &groups, &xin, out, Some(cpu_pool())) {
+                return Err("qwen4 cuda: the host's latent experts are not nvfp4".into());
+            }
+            for (p, &(_, r)) in miss.iter().enumerate() {
+                tail[p] = f32::from_bits(r as u32);
+                tail[m + p] = 1.0;
+            }
+            self.put(s.lyc.ptr, &*out)?;
+            self.put(s.lrp.ptr, &tail[..m])?;
+            self.put(s.lf.ptr, &tail[m..2 * m])?;
+            go!(c, q.lat_put, (blocks(m * l), 1), 256; s.lyc.ptr, s.lrp.ptr, s.lf.ptr, s.ly.ptr, m as i32, l as i32, 1i32, 0i32);
+            bank.miss += m as u64;
+        }
+        bank.wait_ms += (t1 - t0).as_secs_f64() * 1e3;
+        bank.host_ms += t1.elapsed().as_secs_f64() * 1e3;
+        go!(c, q.lat_sum, (blocks(n * g * l), 1), 256; s.picks.ptr, lw.labels.ptr, s.wts.ptr, s.ly.ptr, s.lacc.ptr, n as i32, g as i32, l as i32, topk as i32);
+        Ok(())
+    }
+
+    /// The experts `up` (expert, staging slot) of a prompt sub-batch, outside the bank: their file bytes
+    /// into a pinned block (the one whose last upload has landed) on the host's cores, then one upload to the
+    /// staging slots ahead of the sub-batch's expansion.
+    fn lat_stage(&self, layer: &Layer, bank: &mut LatBank, up: &[(usize, usize)]) -> Res<()> {
+        let c = self.c;
+        let t0 = Instant::now();
+        let f = bank.flip;
+        bank.flip ^= 1;
+        unsafe { cu::event::synchronize(bank.ev[f]) }.map_err(derr)?;
+        let pin = &bank.pstage[f];
+        let (slot, pg) = (bank.slot, bank.pg);
+        if up.len() * slot > pin.len {
+            return Err("qwen4 cuda: a latent sub-batch larger than its staging".into());
+        }
+        let pad = |n: usize| n.div_ceil(16) * 16;
+        let base = pin.ptr as usize;
+        // the payloads' places in the mapped file (the layer itself does not cross threads)
+        let mut src: Vec<(usize, [(usize, usize); 3])> = Vec::with_capacity(up.len());
+        for &(e, k) in up {
+            let x = &layer.moe.experts[e];
+            let mut parts = [(0usize, 0usize); 3];
+            for (m, t) in [&x.gate_proj, &x.up_proj, &x.down_proj].into_iter().enumerate() {
+                let b = t.mapped_bytes().ok_or("qwen4 cuda: a latent expert without file bytes")?;
+                parts[m] = (b.as_ptr() as usize, b.len());
+            }
+            src.push((k, parts));
+        }
+        cpu_pool().run_rows(src.len(), &|a, b| {
+            for &(k, parts) in &src[a..b] {
+                for (m, (at, len)) in parts.into_iter().enumerate() {
+                    // SAFETY: slot k of the pinned block is this worker's alone and holds the payload; the
+                    // source lies in the model's mapping, alive for the layer's lifetime
+                    unsafe { std::ptr::copy_nonoverlapping(at as *const u8, (base + k * slot + m * pad(pg)) as *mut u8, len) };
+                }
+            }
+        });
+        let ds = bank.dstage.as_ref().ok_or("qwen4 cuda: no latent staging")?;
+        // SAFETY: the block stays put until the event below says the upload has landed
+        let src = unsafe { std::slice::from_raw_parts(pin.ptr as *const u8, up.len() * slot) };
+        unsafe { cu::memcpy_htod_async(ds.ptr, src, c.stream) }.map_err(derr)?;
+        unsafe { cu::event::record(bank.ev[f], c.stream) }.map_err(derr)?;
+        bank.staged += up.len() as u64;
+        bank.stage_ms += t0.elapsed().as_secs_f64() * 1e3;
+        let _ = bank.pd;
         Ok(())
     }
 
@@ -5064,7 +5612,7 @@ impl Dev {
     }
 
     fn run(&mut self, layers: &[Layer], emb: &[f32], ple: &dyn Fn(usize) -> Vec<Vec<f32>>, pos0: usize, out: Out) -> Res<()> {
-        let Self { k, layers: lws, head, lm, arena, maskb, held, pos, pending, want_trace, trace, mtp, launch_ms, .. } = self;
+        let Self { k, layers: lws, head, lm, arena, maskb, held, pos, pending, want_trace, trace, mtp, launch_ms, lat, .. } = self;
         let t_run = Instant::now();
         let k = &*k;
         let (d, s, c, q) = (&k.d, &k.s, k.c, k.q);
@@ -5181,7 +5729,7 @@ impl Dev {
             }
             k.lap(2)?;
             match &lw.lat {
-                Some(lt) => k.moe_lat(lt, li, n)?,
+                Some(lt) => k.moe_lat(lt, layer, lat.as_mut().ok_or("qwen4 cuda: a latent layer without its bank")?, li, n)?,
                 None => k.moe(&lw.moe, layer, li, arena, n, hold)?,
             }
             if tr {
@@ -5234,6 +5782,17 @@ impl Dev {
                     p.report(arena, what);
                 }
             }
+            if let Some(bank) = lat.as_mut()
+                && (n > 1 || p.steps == 0)
+            {
+                bank.report();
+            }
+        }
+        if let Some(bank) = lat.as_mut()
+            && bank.prof.is_some()
+            && n > 1
+        {
+            bank.save();
         }
         Ok(())
     }

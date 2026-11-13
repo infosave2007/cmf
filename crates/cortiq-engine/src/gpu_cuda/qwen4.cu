@@ -373,6 +373,59 @@ extern "C" __global__ void q4_gdn_scan_c(const float* __restrict__ cq, const flo
     for (int k = 0; k < 128; k++) wp[(u64)k * dv] = st[k];
 }
 
+#ifndef GDN_PARTS
+#define GDN_PARTS 8
+#endif
+// `q4_gdn_scan_c` with each state column split over GDN_PARTS adjacent lanes (128 / GDN_PARTS key rows each):
+// GDN_PARTS times the blocks of a head, no barrier between tokens (a lane reads its slice of q and k straight
+// from the row, the block's lanes share the loads), the two dot products summed over the parts by shuffles.
+// Grid (nv, dv * GDN_PARTS / blockDim.x).
+extern "C" __global__ void q4_gdn_scan_p(const float* __restrict__ cq, const float* __restrict__ gb,
+                                         const float* S, float* So, float* __restrict__ o,
+                                         int n, int c_dim, int nv, int nk, int dk, int dv)
+{ PDL_PRO();
+    constexpr int P = GDN_PARTS, KP = 128 / GDN_PARTS;
+    const int h = blockIdx.x, tid = threadIdx.x, p = tid % P;
+    const int dj = blockIdx.y * (blockDim.x / P) + tid / P;
+    const int ko = h / (nv / nk);
+    const int kd = nk * dk;
+    const u64 qo = (u64)ko * dk + (u64)p * KP, kofs = (u64)kd + qo, vo = (u64)2 * kd + (u64)h * dv + dj;
+    const float* sp = S + (u64)h * dk * dv + dj;
+    float st[KP];
+#pragma unroll
+    for (int k = 0; k < KP; k++) st[k] = sp[(u64)(p * KP + k) * dv];
+    for (int t = 0; t < n; t++) {
+        const float* row = cq + (u64)t * c_dim;
+        float qs[KP], ks[KP];
+#pragma unroll
+        for (int k = 0; k < KP; k += 4) {
+            const float4 a = *(const float4*)(row + qo + k), b = *(const float4*)(row + kofs + k);
+            qs[k] = a.x; qs[k + 1] = a.y; qs[k + 2] = a.z; qs[k + 3] = a.w;
+            ks[k] = b.x; ks[k + 1] = b.y; ks[k + 2] = b.z; ks[k + 3] = b.w;
+        }
+        const float g = gb[(u64)t * 2 * nv + h], beta = gb[(u64)t * 2 * nv + nv + h];
+        const float vv = row[vo];
+        float kv = 0.0f;
+#pragma unroll
+        for (int k = 0; k < KP; k++) kv += st[k] * ks[k];
+#pragma unroll
+        for (int m = 1; m < P; m <<= 1) kv += __shfl_xor_sync(0xffffffffu, kv, m);
+        const float delta = (vv - g * kv) * beta;
+        float ov = 0.0f;
+#pragma unroll
+        for (int k = 0; k < KP; k++) {
+            st[k] = g * st[k] + ks[k] * delta;
+            ov += qs[k] * st[k];
+        }
+#pragma unroll
+        for (int m = 1; m < P; m <<= 1) ov += __shfl_xor_sync(0xffffffffu, ov, m);
+        if (p == 0) o[(u64)t * nv * dv + (u64)h * dv + dj] = ov;
+    }
+    float* wp = So + (u64)h * dk * dv + dj;
+#pragma unroll
+    for (int k = 0; k < KP; k++) wp[(u64)(p * KP + k) * dv] = st[k];
+}
+
 extern "C" __global__ void q4_gdn_out(const float* __restrict__ o, const float* __restrict__ z,
                                       const float* __restrict__ norm, void* __restrict__ ofh,
                                       int dv, double eps, int half)
@@ -689,14 +742,21 @@ extern "C" __global__ void q4_route(const float* __restrict__ logits, int* __res
         __syncthreads();
     }
     mx = red[0];
-    for (int i = threadIdx.x; i < ne; i += blockDim.x) pe[i] = (!tbl || tbl[i]) ? expf(l[i] - mx) : 0.0f;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float s = 0.0f;
-        for (int i = 0; i < ne; i++) s += pe[i];
-        red[0] = s;
+    // the exponentials and their sum (a tree over the block: one thread summing 512 of them in a row was
+    // the better part of the kernel)
+    float ls = 0.0f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) {
+        const float v = (!tbl || tbl[i]) ? expf(l[i] - mx) : 0.0f;
+        pe[i] = v;
+        ls += v;
     }
     __syncthreads();
+    red[threadIdx.x] = ls;
+    __syncthreads();
+    for (int st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if ((int)threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
     const float s = red[0];
     __syncthreads();
     for (int i = threadIdx.x; i < ne; i += blockDim.x) pe[i] /= s;
@@ -2379,10 +2439,12 @@ extern "C" __global__ void q4_lat_gu(const int* __restrict__ picks, const int* _
         for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) act[(u64)r * ff + i] = 0.0f;
         return;
     }
+    // an expert outside the card's bank: the host computes its rows (`q4_lat_put` lays them in)
+    const u8* gp = (const u8*)tbl[e];
+    if (!gp) return;
     const float* x = xl + ((u64)(r / topk) * G + labels[e]) * L;
     for (int i = threadIdx.x; i < L; i += blockDim.x) lx[i] = x[i];
     __syncthreads();
-    const u8* gp = (const u8*)tbl[e];
     const u64 pb = lat_pbytes(ff, L);
     const u8* up = gp + pb;
     const int gpr = L >> 4;
@@ -2416,6 +2478,7 @@ extern "C" __global__ void q4_lat_dn(const int* __restrict__ picks, const u64* _
         for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) y[(u64)r * L + i] = 0.0f;
         return;
     }
+    if (!tbl[e]) return;
     for (int i = threadIdx.x; i < ff; i += blockDim.x) la[i] = act[(u64)r * ff + i];
     __syncthreads();
     const u8* dp = (const u8*)tbl[e] + 2 * lat_pbytes(ff, L);
@@ -2430,6 +2493,534 @@ extern "C" __global__ void q4_lat_dn(const int* __restrict__ picks, const u64* _
         }
         for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
         if (lane == 0) y[(u64)r * L + row] = sd * a;
+    }
+}
+
+#ifndef LAT_RPW
+#define LAT_RPW 4
+#endif
+// 32 elements (two scale groups: codes w, scales s2 low and high byte) against the staged x chunk xv.
+__device__ __forceinline__ float lat_dot32(uint4 w, u32 s2, const float* xv) {
+    float a0 = 0.0f, a1 = 0.0f;
+    const u32 ws[4] = {w.x, w.y, w.z, w.w};
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        float a = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const u32 by = (ws[k] >> (8 * b)) & 0xFFu;
+            a += lat_e2m1(by & 15u) * xv[8 * k + 2 * b] + lat_e2m1(by >> 4) * xv[8 * k + 2 * b + 1];
+        }
+        if (k < 2) a0 += a; else a1 += a;
+    }
+    return a0 * lat_ue4m3(s2 & 0xFFu) + a1 * lat_ue4m3((s2 >> 8) & 0xFFu);
+}
+
+// `q4_lat_gu` with LAT_RPW rows a warp in flight together and 16-byte loads (two scale groups a load);
+// the latent row is staged transposed (element j of 32-chunk q at j * CP + q, CP odd: no bank conflicts).
+// Grid (ff / rb, n * topk), rb = 8 warps x LAT_RPW.
+extern "C" __global__ void q4_lat_gu2(const int* __restrict__ picks, const int* __restrict__ labels,
+                                      const u64* __restrict__ tbl, const float* __restrict__ xl,
+                                      float* __restrict__ act, int ff, int L, int G, int topk, int rb)
+{ PDL_PRO();
+    extern __shared__ float lx[];
+    const int r = blockIdx.y, e = picks[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, NW = blockDim.x >> 5;
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, ff);
+    if (e < 0) {
+        for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) act[(u64)r * ff + i] = 0.0f;
+        return;
+    }
+    const u8* gp = (const u8*)tbl[e];
+    if (!gp) return;
+    const int nq = L >> 5, CP = nq | 1;
+    const float* x = xl + ((u64)(r / topk) * G + labels[e]) * L;
+    for (int i = threadIdx.x; i < L; i += blockDim.x) lx[(i & 31) * CP + (i >> 5)] = x[i];
+    __syncthreads();
+    const u8* up = gp + lat_pbytes(ff, L);
+    const float sg = lat_glob(gp, ff, L), su = lat_glob(up, ff, L);
+    const u8* gsc = gp + (u64)ff * L / 2;
+    const u8* usc = up + (u64)ff * L / 2;
+    const int gpr = L >> 4;
+    float ag[LAT_RPW], au[LAT_RPW];
+    #pragma unroll
+    for (int a = 0; a < LAT_RPW; a++) ag[a] = au[a] = 0.0f;
+    for (int q = lane; q < nq; q += 32) {
+        float xv[32];
+        #pragma unroll
+        for (int j = 0; j < 32; j++) xv[j] = lx[j * CP + q];
+        #pragma unroll
+        for (int a = 0; a < LAT_RPW; a++) {
+            const int row = r0 + warp + a * NW;
+            if (row >= r1) break;
+            const uint4 wg = *(const uint4*)(gp + (u64)row * (L / 2) + q * 16);
+            const uint4 wu = *(const uint4*)(up + (u64)row * (L / 2) + q * 16);
+            const u32 s2g = *(const unsigned short*)(gsc + (u64)row * gpr + 2 * q);
+            const u32 s2u = *(const unsigned short*)(usc + (u64)row * gpr + 2 * q);
+            ag[a] += lat_dot32(wg, s2g, xv);
+            au[a] += lat_dot32(wu, s2u, xv);
+        }
+    }
+    #pragma unroll
+    for (int a = 0; a < LAT_RPW; a++) {
+        float g = ag[a], u = au[a];
+        for (int o = 16; o > 0; o >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, o);
+            u += __shfl_xor_sync(0xffffffffu, u, o);
+        }
+        const int row = r0 + warp + a * NW;
+        if (lane == 0 && row < r1) act[(u64)r * ff + row] = silu_f(sg * g) * (su * u);
+    }
+}
+
+// `q4_lat_dn` in the same form: y [n * topk][L] = sd * (D act). Grid (L / rb, n * topk).
+extern "C" __global__ void q4_lat_dn2(const int* __restrict__ picks, const u64* __restrict__ tbl,
+                                      const float* __restrict__ act, float* __restrict__ y, int ff, int L, int rb)
+{ PDL_PRO();
+    extern __shared__ float la[];
+    const int r = blockIdx.y, e = picks[r];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, NW = blockDim.x >> 5;
+    const int r0 = blockIdx.x * rb, r1 = min(r0 + rb, L);
+    if (e < 0) {
+        for (int i = r0 + threadIdx.x; i < r1; i += blockDim.x) y[(u64)r * L + i] = 0.0f;
+        return;
+    }
+    if (!tbl[e]) return;
+    const int nq = ff >> 5, CP = nq | 1;
+    for (int i = threadIdx.x; i < ff; i += blockDim.x) la[(i & 31) * CP + (i >> 5)] = act[(u64)r * ff + i];
+    __syncthreads();
+    const u8* dp = (const u8*)tbl[e] + 2 * lat_pbytes(ff, L);
+    const float sd = lat_glob(dp, L, ff);
+    const u8* dsc = dp + (u64)L * ff / 2;
+    const int gpr = ff >> 4;
+    float ad[LAT_RPW];
+    #pragma unroll
+    for (int a = 0; a < LAT_RPW; a++) ad[a] = 0.0f;
+    for (int q = lane; q < nq; q += 32) {
+        float xv[32];
+        #pragma unroll
+        for (int j = 0; j < 32; j++) xv[j] = la[j * CP + q];
+        #pragma unroll
+        for (int a = 0; a < LAT_RPW; a++) {
+            const int row = r0 + warp + a * NW;
+            if (row >= r1) break;
+            const uint4 w = *(const uint4*)(dp + (u64)row * (ff / 2) + q * 16);
+            const u32 s2 = *(const unsigned short*)(dsc + (u64)row * gpr + 2 * q);
+            ad[a] += lat_dot32(w, s2, xv);
+        }
+    }
+    #pragma unroll
+    for (int a = 0; a < LAT_RPW; a++) {
+        float v = ad[a];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        const int row = r0 + warp + a * NW;
+        if (lane == 0 && row < r1) y[(u64)r * L + row] = sd * v;
+    }
+}
+
+// ---------------------------------------------------------------- latent prompt GEMMs straight from NVFP4
+//
+// A prompt chunk's routed experts as grouped GEMMs on the tensor cores with no dense copy of the weights:
+// a block takes one unit (an expert's run of up to 64 rows of the chunk, `units` = {slot lo, slot hi,
+// first row, rows}) and 64 output features; each warp 16 of them. The A fragments of `mma.m16n8k16` come
+// from the slot's E2M1 codes and UE4M3 scales decoded in registers into exact f16 (a code's magnitude by
+// two byte permutes, its sign by a shift, the group's scale by one multiply: a product of a 2-bit and a
+// 4-bit significand), the B fragments from the rows' f16 inputs staged in shared memory 32 columns at a
+// time; f32 accumulators, the tensor's global applied once at the end.
+
+// A byte of two E2M1 codes -> their f16 pair (low code first), exact.
+__device__ __forceinline__ u32 lat_h2(u32 b) {
+    const u32 hb = __byte_perm(0x3E3C3800u, 0x46444240u, b & 0x77u);
+    return __byte_perm(hb, 0u, 0x1404u) | ((b & 0x8u) << 12) | ((b & 0x80u) << 24);
+}
+__device__ __forceinline__ u32 lat_hmul2(u32 a, u32 s) {
+    u32 r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(s));
+    return r;
+}
+// a UE4M3 byte as an f16 pair (exact)
+__device__ __forceinline__ u32 lat_s2(u32 b) {
+    const u32 v = (u32)f2h(lat_ue4m3(b));
+    return v | (v << 16);
+}
+__device__ __forceinline__ void lat_mma(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// The A fragment of k16 half `h` of a 32-column step: rows `wa` / `wb` (16 code bytes each), their two
+// scale bytes `sa` / `sb`; lane (gid, tig) takes bytes tig and tig + 4 of the half's 8.
+__device__ __forceinline__ void lat_afrag(uint4 wa, uint4 wb, u32 sa, u32 sb, int h, int tig, u32* a) {
+    const u32 xa0 = h ? wa.z : wa.x, xa1 = h ? wa.w : wa.y, xb0 = h ? wb.z : wb.x, xb1 = h ? wb.w : wb.y;
+    const u32 ssa = lat_s2((sa >> (8 * h)) & 0xFFu), ssb = lat_s2((sb >> (8 * h)) & 0xFFu);
+    a[0] = lat_hmul2(lat_h2((xa0 >> (8 * tig)) & 0xFFu), ssa);
+    a[1] = lat_hmul2(lat_h2((xb0 >> (8 * tig)) & 0xFFu), ssb);
+    a[2] = lat_hmul2(lat_h2((xa1 >> (8 * tig)) & 0xFFu), ssa);
+    a[3] = lat_hmul2(lat_h2((xb1 >> (8 * tig)) & 0xFFu), ssb);
+}
+
+#define LAT_XP 20
+// gate and up of every unit's rows: act [row][ff] (f16) = silu(sg * (G x)) * (su * (U x)), x the row's latent
+// input xl [rowtok[row]] (f16, L wide). Grid (units, ff / 64), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) q4_lat_ggu(const int4* __restrict__ units, const int* __restrict__ rowtok,
+                                                             const unsigned short* __restrict__ xl, unsigned short* __restrict__ act,
+                                                             int ff, int L)
+{ PDL_PRO();
+    __shared__ __align__(16) u32 xs[2][64 * LAT_XP];
+    const int4 un = units[blockIdx.x];
+    const u8* gp = (const u8*)(((u64)(u32)un.y << 32) | (u64)(u32)un.x);
+    const int off = un.z, cnt = un.w;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const u8* upp = gp + lat_pbytes(ff, L);
+    const u8* gsc = gp + (u64)ff * L / 2;
+    const u8* usc = upp + (u64)ff * L / 2;
+    const int gpr = L >> 4, half_l = L >> 1;
+    const int ra = blockIdx.y * 64 + warp * 16 + gid, rb = ra + 8;
+    float ag[8][4], au[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) ag[n][i] = au[n][i] = 0.0f;
+    const int nt = (cnt + 7) >> 3;
+    auto load = [&](int buf, int k0) {
+        for (int i = tid; i < 256; i += 128) {
+            const int t = i >> 2, part = i & 3;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (t < cnt) v = *(const uint4*)(xl + (u64)rowtok[off + t] * L + k0 + part * 8);
+            *(uint4*)&xs[buf][t * LAT_XP + part * 4] = v;
+        }
+    };
+    const int nk = L >> 5;
+    load(0, 0);
+    __syncthreads();
+    for (int kk = 0; kk < nk; kk++) {
+        const int buf = kk & 1;
+        if (kk + 1 < nk) load(buf ^ 1, (kk + 1) * 32);
+        const uint4 ga = *(const uint4*)(gp + (u64)ra * half_l + kk * 16);
+        const uint4 gb = *(const uint4*)(gp + (u64)rb * half_l + kk * 16);
+        const uint4 ua = *(const uint4*)(upp + (u64)ra * half_l + kk * 16);
+        const uint4 ub = *(const uint4*)(upp + (u64)rb * half_l + kk * 16);
+        const u32 sga = *(const unsigned short*)(gsc + (u64)ra * gpr + 2 * kk);
+        const u32 sgb = *(const unsigned short*)(gsc + (u64)rb * gpr + 2 * kk);
+        const u32 sua = *(const unsigned short*)(usc + (u64)ra * gpr + 2 * kk);
+        const u32 sub = *(const unsigned short*)(usc + (u64)rb * gpr + 2 * kk);
+        const u32* X = xs[buf];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            u32 a[4], b[4];
+            lat_afrag(ga, gb, sga, sgb, h, tig, a);
+            lat_afrag(ua, ub, sua, sub, h, tig, b);
+            #pragma unroll
+            for (int n = 0; n < 8; n++) {
+                if (n >= nt) break;
+                const u32 b0 = X[(n * 8 + gid) * LAT_XP + h * 8 + tig];
+                const u32 b1 = X[(n * 8 + gid) * LAT_XP + h * 8 + tig + 4];
+                lat_mma(ag[n], a[0], a[1], a[2], a[3], b0, b1);
+                lat_mma(au[n], b[0], b[1], b[2], b[3], b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+    const float sg = lat_glob(gp, ff, L), su = lat_glob(upp, ff, L);
+    #pragma unroll
+    for (int n = 0; n < 8; n++) {
+        if (n >= nt) break;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int t = n * 8 + 2 * tig + (i & 1), row = i < 2 ? ra : rb;
+            if (t < cnt)
+                act[(u64)(off + t) * ff + row] = f2h_sat(silu_f(sg * ag[n][i]) * (su * au[n][i]));
+        }
+    }
+}
+
+// down of every unit's rows: y [rowpick[row]][L] = sd * (D act[row]) (f32). Grid (units, L / 64), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) q4_lat_gdn(const int4* __restrict__ units, const int* __restrict__ rowpick,
+                                                             const unsigned short* __restrict__ act, float* __restrict__ y,
+                                                             int ff, int L)
+{ PDL_PRO();
+    __shared__ __align__(16) u32 xs[2][64 * LAT_XP];
+    const int4 un = units[blockIdx.x];
+    const u8* dp = (const u8*)(((u64)(u32)un.y << 32) | (u64)(u32)un.x) + 2 * lat_pbytes(ff, L);
+    const int off = un.z, cnt = un.w;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const u8* dsc = dp + (u64)L * ff / 2;
+    const int gpr = ff >> 4, half_f = ff >> 1;
+    const int ra = blockIdx.y * 64 + warp * 16 + gid, rb = ra + 8;
+    float ad[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) ad[n][i] = 0.0f;
+    const int nt = (cnt + 7) >> 3;
+    auto load = [&](int buf, int k0) {
+        for (int i = tid; i < 256; i += 128) {
+            const int t = i >> 2, part = i & 3;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (t < cnt) v = *(const uint4*)(act + (u64)(off + t) * ff + k0 + part * 8);
+            *(uint4*)&xs[buf][t * LAT_XP + part * 4] = v;
+        }
+    };
+    const int nk = ff >> 5;
+    load(0, 0);
+    __syncthreads();
+    for (int kk = 0; kk < nk; kk++) {
+        const int buf = kk & 1;
+        if (kk + 1 < nk) load(buf ^ 1, (kk + 1) * 32);
+        const uint4 wa = *(const uint4*)(dp + (u64)ra * half_f + kk * 16);
+        const uint4 wb = *(const uint4*)(dp + (u64)rb * half_f + kk * 16);
+        const u32 sa = *(const unsigned short*)(dsc + (u64)ra * gpr + 2 * kk);
+        const u32 sb = *(const unsigned short*)(dsc + (u64)rb * gpr + 2 * kk);
+        const u32* X = xs[buf];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            u32 a[4];
+            lat_afrag(wa, wb, sa, sb, h, tig, a);
+            #pragma unroll
+            for (int n = 0; n < 8; n++) {
+                if (n >= nt) break;
+                const u32 b0 = X[(n * 8 + gid) * LAT_XP + h * 8 + tig];
+                const u32 b1 = X[(n * 8 + gid) * LAT_XP + h * 8 + tig + 4];
+                lat_mma(ad[n], a[0], a[1], a[2], a[3], b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+    const float sd = lat_glob(dp, L, ff);
+    #pragma unroll
+    for (int n = 0; n < 8; n++) {
+        if (n >= nt) break;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int t = n * 8 + 2 * tig + (i & 1), row = i < 2 ? ra : rb;
+            if (t < cnt) y[(u64)rowpick[off + t] * L + row] = sd * ad[n][i];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- a round's picks by expert
+//
+// A verify round's picks grouped by expert (`q4_lat_units`, one block, a thread a pick): unit u = units[10 u ..]
+// {expert, picks, pick 0..7} in order of the expert's first pick, their count at nunits[0]. The unit kernels
+// then read each picked expert once for all its rows (a round of four rows picks some experts twice or more).
+extern "C" __global__ void q4_lat_units(const int* __restrict__ picks, int routes, int* __restrict__ units,
+                                        u32* __restrict__ nunits)
+{ PDL_PRO();
+    __shared__ int sp[256], lead[256], uid[256];
+    const int i = threadIdx.x;
+    const int e = i < routes ? picks[i] : -1;
+    sp[i] = e;
+    __syncthreads();
+    int ld = -1, k = 0;
+    if (e >= 0) {
+        ld = i;
+        for (int j = 0; j < i; j++)
+            if (sp[j] == e) {
+                if (ld == i) ld = j;
+                k++;
+            }
+    }
+    lead[i] = ld;
+    __syncthreads();
+    if (ld == i) {
+        int u = 0;
+        for (int j = 0; j < i; j++) u += lead[j] == j;
+        uid[i] = u;
+    }
+    __syncthreads();
+    if (ld >= 0) {
+        const int u = uid[ld];
+        if (ld == i) {
+            int c = 1;
+            for (int j = i + 1; j < routes; j++) c += sp[j] == e;
+            units[u * 10] = e;
+            units[u * 10 + 1] = min(c, 8);
+        }
+        if (k < 8) units[u * 10 + 2 + k] = i;
+    }
+    if (i == 0) {
+        int nu = 0;
+        for (int j = 0; j < routes; j++) nu += lead[j] == j;
+        nunits[0] = (u32)nu;
+    }
+}
+
+#ifndef LAT_U_RPW
+#define LAT_U_RPW 2
+#endif
+#define LAT_U_CS 36
+// Gate and up of a unit's rows: act [pick][ff] = silu(sg * (G x)) * (su * (U x)). Grid (ff / (8 LAT_U_RPW),
+// routes), 256 threads; blocks past the round's units return, as do units of an expert outside the bank (the
+// host's). The unit's latent rows are staged side by side (LAT_U_CS floats a 32-column chunk), each weight row
+// decoded once for all of them.
+extern "C" __global__ void q4_lat_gu3(const int* __restrict__ units, const u32* __restrict__ nunits,
+                                      const int* __restrict__ labels, const u64* __restrict__ tbl,
+                                      const float* __restrict__ xl, float* __restrict__ act,
+                                      int ff, int L, int G, int topk)
+{ PDL_PRO();
+    extern __shared__ __align__(16) float ux[];
+    if (blockIdx.y >= nunits[0]) return;
+    const int* un = units + blockIdx.y * 10;
+    const int e = un[0], cnt = un[1];
+    const u8* gp = (const u8*)tbl[e];
+    if (!gp) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nq = L >> 5, XS = nq * LAT_U_CS;
+    const int grp = labels[e];
+    for (int i = threadIdx.x; i < cnt * L; i += blockDim.x) {
+        const int j = i / L, c = i - j * L;
+        const int p = un[2 + j];
+        ux[j * XS + (c >> 5) * LAT_U_CS + (c & 31)] = xl[((u64)(p / topk) * G + grp) * L + c];
+    }
+    __syncthreads();
+    constexpr int RPW = LAT_U_RPW;
+    const int r0 = blockIdx.x * 8 * RPW + warp * RPW;
+    const u8* up = gp + lat_pbytes(ff, L);
+    const u8* gsc = gp + (u64)ff * L / 2;
+    const u8* usc = up + (u64)ff * L / 2;
+    const int gpr = L >> 4;
+    float ag[RPW][8], au[RPW][8];
+    #pragma unroll
+    for (int a = 0; a < RPW; a++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ag[a][j] = au[a][j] = 0.0f;
+    for (int q = lane; q < nq; q += 32) {
+        uint4 wg[RPW], wu[RPW];
+        u32 sg2[RPW], su2[RPW];
+        #pragma unroll
+        for (int a = 0; a < RPW; a++) {
+            const int row = min(r0 + a, ff - 1);
+            wg[a] = *(const uint4*)(gp + (u64)row * (L / 2) + q * 16);
+            wu[a] = *(const uint4*)(up + (u64)row * (L / 2) + q * 16);
+            sg2[a] = *(const unsigned short*)(gsc + (u64)row * gpr + 2 * q);
+            su2[a] = *(const unsigned short*)(usc + (u64)row * gpr + 2 * q);
+        }
+        #pragma unroll
+        for (int a = 0; a < RPW; a++) {
+            float fg[32], fu[32];
+            const u32 xg[4] = {wg[a].x, wg[a].y, wg[a].z, wg[a].w}, xu[4] = {wu[a].x, wu[a].y, wu[a].z, wu[a].w};
+            #pragma unroll
+            for (int k = 0; k < 4; k++)
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const u32 bg = (xg[k] >> (8 * b)) & 0xFFu, bu = (xu[k] >> (8 * b)) & 0xFFu;
+                    fg[8 * k + 2 * b] = lat_e2m1(bg & 15u);
+                    fg[8 * k + 2 * b + 1] = lat_e2m1(bg >> 4);
+                    fu[8 * k + 2 * b] = lat_e2m1(bu & 15u);
+                    fu[8 * k + 2 * b + 1] = lat_e2m1(bu >> 4);
+                }
+            const float g0 = lat_ue4m3(sg2[a] & 0xFFu), g1 = lat_ue4m3(sg2[a] >> 8);
+            const float u0 = lat_ue4m3(su2[a] & 0xFFu), u1 = lat_ue4m3(su2[a] >> 8);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                if (j >= cnt) break;
+                const float4* xp = (const float4*)(ux + j * XS + q * LAT_U_CS);
+                float pg0 = 0.0f, pg1 = 0.0f, pu0 = 0.0f, pu1 = 0.0f;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const float4 x4 = xp[v];
+                    const float sgv = fg[4 * v] * x4.x + fg[4 * v + 1] * x4.y + fg[4 * v + 2] * x4.z + fg[4 * v + 3] * x4.w;
+                    const float suv = fu[4 * v] * x4.x + fu[4 * v + 1] * x4.y + fu[4 * v + 2] * x4.z + fu[4 * v + 3] * x4.w;
+                    if (v < 4) { pg0 += sgv; pu0 += suv; } else { pg1 += sgv; pu1 += suv; }
+                }
+                ag[a][j] += pg0 * g0 + pg1 * g1;
+                au[a][j] += pu0 * u0 + pu1 * u1;
+            }
+        }
+    }
+    const float sg = lat_glob(gp, ff, L), su = lat_glob(up, ff, L);
+    #pragma unroll
+    for (int a = 0; a < RPW; a++) {
+        const int row = r0 + a;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j >= cnt) break;
+            float g = ag[a][j], u = au[a][j];
+            for (int o = 16; o > 0; o >>= 1) {
+                g += __shfl_xor_sync(0xffffffffu, g, o);
+                u += __shfl_xor_sync(0xffffffffu, u, o);
+            }
+            if (lane == 0 && row < ff) act[(u64)un[2 + j] * ff + row] = silu_f(sg * g) * (su * u);
+        }
+    }
+}
+
+// Down of a unit's rows: y [pick][L] = sd * (D act[pick]). Grid (L / (8 LAT_U_RPW), routes), 256 threads.
+extern "C" __global__ void q4_lat_dn3(const int* __restrict__ units, const u32* __restrict__ nunits,
+                                      const u64* __restrict__ tbl, const float* __restrict__ act,
+                                      float* __restrict__ y, int ff, int L)
+{ PDL_PRO();
+    extern __shared__ __align__(16) float ua[];
+    if (blockIdx.y >= nunits[0]) return;
+    const int* un = units + blockIdx.y * 10;
+    const int e = un[0], cnt = un[1];
+    if (!tbl[e]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nq = ff >> 5, XS = nq * LAT_U_CS;
+    for (int i = threadIdx.x; i < cnt * ff; i += blockDim.x) {
+        const int j = i / ff, c = i - j * ff;
+        ua[j * XS + (c >> 5) * LAT_U_CS + (c & 31)] = act[(u64)un[2 + j] * ff + c];
+    }
+    __syncthreads();
+    constexpr int RPW = LAT_U_RPW;
+    const int r0 = blockIdx.x * 8 * RPW + warp * RPW;
+    const u8* dp = (const u8*)tbl[e] + 2 * lat_pbytes(ff, L);
+    const u8* dsc = dp + (u64)L * ff / 2;
+    const int gpr = ff >> 4;
+    float ad[RPW][8];
+    #pragma unroll
+    for (int a = 0; a < RPW; a++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ad[a][j] = 0.0f;
+    for (int q = lane; q < nq; q += 32) {
+        uint4 w[RPW];
+        u32 s2[RPW];
+        #pragma unroll
+        for (int a = 0; a < RPW; a++) {
+            const int row = min(r0 + a, L - 1);
+            w[a] = *(const uint4*)(dp + (u64)row * (ff / 2) + q * 16);
+            s2[a] = *(const unsigned short*)(dsc + (u64)row * gpr + 2 * q);
+        }
+        #pragma unroll
+        for (int a = 0; a < RPW; a++) {
+            float f[32];
+            const u32 xw[4] = {w[a].x, w[a].y, w[a].z, w[a].w};
+            #pragma unroll
+            for (int k = 0; k < 4; k++)
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const u32 by = (xw[k] >> (8 * b)) & 0xFFu;
+                    f[8 * k + 2 * b] = lat_e2m1(by & 15u);
+                    f[8 * k + 2 * b + 1] = lat_e2m1(by >> 4);
+                }
+            const float d0 = lat_ue4m3(s2[a] & 0xFFu), d1 = lat_ue4m3(s2[a] >> 8);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                if (j >= cnt) break;
+                const float4* xp = (const float4*)(ua + j * XS + q * LAT_U_CS);
+                float p0 = 0.0f, p1 = 0.0f;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const float4 x4 = xp[v];
+                    const float sv = f[4 * v] * x4.x + f[4 * v + 1] * x4.y + f[4 * v + 2] * x4.z + f[4 * v + 3] * x4.w;
+                    if (v < 4) p0 += sv; else p1 += sv;
+                }
+                ad[a][j] += p0 * d0 + p1 * d1;
+            }
+        }
+    }
+    const float sd = lat_glob(dp, L, ff);
+    #pragma unroll
+    for (int a = 0; a < RPW; a++) {
+        const int row = r0 + a;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j >= cnt) break;
+            float v = ad[a][j];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && row < L) y[(u64)un[2 + j] * L + row] = sd * v;
+        }
     }
 }
 
@@ -2489,13 +3080,15 @@ extern "C" __global__ void q4_lat_act(const void* __restrict__ g, const void* __
 extern "C" __global__ void q4_lat_gmask(const int* __restrict__ picks, const int* __restrict__ labels,
                                         u32* __restrict__ mask, int n, int topk)
 { PDL_PRO();
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // one warp: the picks a lane apart, the groups' bits or-ed across the lanes
+    if (blockIdx.x != 0 || threadIdx.x >= 32) return;
     u32 m = 0u;
-    for (int i = 0; i < n * topk; i++) {
+    for (int i = threadIdx.x; i < n * topk; i += 32) {
         const int e = picks[i];
         if (e >= 0) m |= 1u << (labels[e] & 31);
     }
-    mask[0] = m;
+    m = __reduce_or_sync(0xffffffffu, m);
+    if (threadIdx.x == 0) mask[0] = m;
 }
 
 #ifndef LAT_MV_RB
@@ -2576,6 +3169,113 @@ extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* _
                 else y[(u64)t * ys + r] = v * rs[r];
             }
         }
+    }
+}
+
+#ifndef LAT_MV2_RPW
+#define LAT_MV2_RPW 2
+#endif
+// `q4_lat_mv` in the form of the small path's matvec: the chunk's inputs (times the column field) side by side,
+// MV_CS floats a 16-column word (four 128-bit loads a word and row), staged with 128-bit loads, and the
+// LAT_MV2_RPW rows of a warp loaded together before any is used. Same grid, modes and results' layout;
+// LAT_MV2_RPW * 8 rows a block.
+template <int NB>
+__device__ __forceinline__ void lat_mv2_body(const u8* __restrict__ body, const float* __restrict__ rs,
+                                             const float* __restrict__ col, const float* __restrict__ x, int xs,
+                                             float* __restrict__ y, int ys, int rows, int cols, int glen,
+                                             int mode, int ch, float* sh)
+{
+    constexpr int RPW = LAT_MV2_RPW;
+    const int r0 = blockIdx.x * (8 * RPW);
+    const int cb = mode == 1 ? (int)blockIdx.y * glen : 0;
+    const int ce = mode == 1 ? cb + glen : cols;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int nch = ch >> 4, XS = nch * MV_CS, c4 = ch >> 2;
+    float acc[RPW][NB];
+    #pragma unroll
+    for (int a = 0; a < RPW; a++)
+        #pragma unroll
+        for (int b = 0; b < NB; b++) acc[a][b] = 0.0f;
+    for (int c0 = cb; c0 < ce; c0 += ch) {
+        __syncthreads();
+        for (int m4 = tid; m4 < c4; m4 += blockDim.x) {
+            const float4 cv = ((const float4*)(col + c0))[m4];
+            float4 xv[NB];
+            #pragma unroll
+            for (int b = 0; b < NB; b++) xv[b] = ((const float4*)(x + (u64)b * xs + c0))[m4];
+            const int c = m4 >> 2, q = (m4 & 3) * 4;
+            #pragma unroll
+            for (int b = 0; b < NB; b++)
+                *(float4*)(sh + b * XS + c * MV_CS + q) = make_float4(xv[b].x * cv.x, xv[b].y * cv.y, xv[b].z * cv.z, xv[b].w * cv.w);
+        }
+        __syncthreads();
+        for (int c = lane; c < nch; c += 32) {
+            uint4 w[RPW];
+            #pragma unroll
+            for (int a = 0; a < RPW; a++) {
+                const int r = r0 + warp * RPW + a;
+                w[a] = r < rows ? ((const uint4*)(body + (u64)r * cols + c0))[c] : make_uint4(0u, 0u, 0u, 0u);
+            }
+            #pragma unroll
+            for (int a = 0; a < RPW; a++) {
+                float wf[16];
+                const u32 ws[4] = {w[a].x, w[a].y, w[a].z, w[a].w};
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    wf[4 * k] = (float)((int)(ws[k] << 24) >> 24);
+                    wf[4 * k + 1] = (float)((int)(ws[k] << 16) >> 24);
+                    wf[4 * k + 2] = (float)((int)(ws[k] << 8) >> 24);
+                    wf[4 * k + 3] = (float)((int)ws[k] >> 24);
+                }
+                #pragma unroll
+                for (int b = 0; b < NB; b++) {
+                    const float4* p = (const float4*)(sh + b * XS + c * MV_CS);
+                    float s = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float4 v = p[q];
+                        s += wf[4 * q] * v.x + wf[4 * q + 1] * v.y + wf[4 * q + 2] * v.z + wf[4 * q + 3] * v.w;
+                    }
+                    acc[a][b] += s;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int a = 0; a < RPW; a++) {
+        const int r = r0 + warp * RPW + a;
+        #pragma unroll
+        for (int b = 0; b < NB; b++) {
+            float v = acc[a][b];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && r < rows) {
+                if (mode == 1) y[((u64)blockIdx.y * NB + b) * rows + r] = v * rs[r];
+                else y[(u64)b * ys + r] = v * rs[r];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void q4_lat_mv2(const u8* __restrict__ body, const float* __restrict__ rs,
+                                      const float* __restrict__ col, const float* __restrict__ x, int xs,
+                                      float* __restrict__ y, int ys, int rows, int cols, int n, int glen,
+                                      const u32* __restrict__ gmask, int mode, int ch)
+{ PDL_PRO();
+    extern __shared__ __align__(16) float sx[];
+    const u32 m = gmask[0];
+    const int r0 = blockIdx.x * (8 * LAT_MV2_RPW);
+    if (r0 >= rows) return;
+    if (mode == 0 && !((m >> ((r0 / glen) & 31)) & 1u)) return;
+    if (mode == 1 && !((m >> (blockIdx.y & 31)) & 1u)) return;
+    switch (n) {
+        case 1: lat_mv2_body<1>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 2: lat_mv2_body<2>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 3: lat_mv2_body<3>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 4: lat_mv2_body<4>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 5: lat_mv2_body<5>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 6: lat_mv2_body<6>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        case 7: lat_mv2_body<7>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
+        default: lat_mv2_body<8>(body, rs, col, x, xs, y, ys, rows, cols, glen, mode, ch, sx); break;
     }
 }
 

@@ -2512,6 +2512,8 @@ pub fn load(
         let idx = layer_idx(model, &p, matches!(mixer, Mixer::Gdn(_)), ple.is_some());
         let latent = Latent::load(model, &p, moe.experts.len(), arch.hidden_size)?;
         if let Some(lt) = &latent {
+            #[cfg(feature = "gpu")]
+            LATENT_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
             // the device frame reads D, U and the shared expert as resident skeleton weights
             skeleton_idxs.extend(lt.down_idx);
             skeleton_idxs.extend(lt.up_idx);
@@ -3934,6 +3936,24 @@ impl ExpertProfile {
 
     fn load(path: &str, n_layers: usize, n_experts: usize) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
+        // Strata's expert profile (`STRP`, version 1): five u32 (version, layers, experts, slots wanted,
+        // pairs) and the ranked (u16 layer, u16 expert) pairs, hottest first; the rank becomes a count
+        if bytes.len() >= 24 && &bytes[..4] == b"STRP" {
+            let rd = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+            let (ver, nl, ne, pairs) = (rd(4), rd(8), rd(12), rd(20));
+            if ver != 1 || nl != n_layers || ne != n_experts || bytes.len() < 24 + 4 * pairs {
+                return None;
+            }
+            let mut counts = vec![0u32; nl * ne];
+            for i in 0..pairs {
+                let o = 24 + 4 * i;
+                let (l, e) = (u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize, u16::from_le_bytes([bytes[o + 2], bytes[o + 3]]) as usize);
+                if l < nl && e < ne && counts[l * ne + e] == 0 {
+                    counts[l * ne + e] = (pairs - i) as u32;
+                }
+            }
+            return Some(Self { n_layers, n_experts, counts, tokens: 0 });
+        }
         if bytes.len() < 24 || &bytes[..8] != Self::MAGIC {
             return None;
         }
@@ -4606,6 +4626,9 @@ impl DevProf {
     }
 }
 
+/// A model with latent layers (Edge0) is loaded: its prompt chunks are sized for the experts' staging.
+pub(crate) static LATENT_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The whole token on the card. Returns `false` when the device path is
 /// not available (the caller then runs the host path); a refusal after
 /// the first token of a sequence is reported once and turns the path off.
@@ -4615,10 +4638,22 @@ pub fn prefill_chunk() -> usize {
     // CUDA runs a chunk as plain GEMMs over all of its tokens
     #[cfg(feature = "cuda")]
     if crate::gpu_cuda::selected() {
+        // a latent model (Edge0) with part of its experts on the host carries those up once a chunk: a long chunk
+        // is what its prompt speed comes from (Edge0-145B within 24 GB: 4096 tokens a chunk read a 4K prompt at
+        // 2072 tok/s, 1024 at 852, for 4 % of the decode speed); a card under 20 GB has no room for its scratch
+        let lean = if LATENT_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+            match crate::gpu_cuda::vram_budget() >> 30 {
+                20.. => 4096,
+                14..=19 => 2048,
+                _ => 1024,
+            }
+        } else {
+            1024
+        };
         return std::env::var("CMF_QWEN_CUDA_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(if crate::gpu_cuda::qwen4::lean_card() { 1024 } else { 4096 })
+            .unwrap_or(if crate::gpu_cuda::qwen4::lean_card() { lean } else { 4096 })
             .clamp(1, crate::gpu_cuda::qwen4::MAX_CHUNK);
     }
     // `forward_tokens` cuts a chunk into TROWS-token frames when every expert is
@@ -4860,7 +4895,16 @@ fn cuda_forward(
             fc_e: fe,
             fc_h: fh,
         });
-        match crate::gpu_cuda::qwen4::Dev::new(globals, layers, cfg, inv_freq, prefill_chunk(), parts.as_ref()) {
+        // a card too small for the MTP head's experts beside the model runs without the head
+        let made = match crate::gpu_cuda::qwen4::Dev::new(globals, layers, cfg, inv_freq, prefill_chunk(), parts.as_ref()) {
+            Err(e) if parts.is_some() && e.contains("room for") => {
+                eprintln!("qwen4 cuda: {e}; the MTP head stays off to make room");
+                state.mtp = None;
+                crate::gpu_cuda::qwen4::Dev::new(globals, layers, cfg, inv_freq, prefill_chunk(), None)
+            }
+            r => r,
+        };
+        match made {
             Ok(mut d) => {
                 // the MTP head's experts stay in the arena
                 if let Some(head) = state.mtp.as_ref() {
@@ -4881,21 +4925,52 @@ fn cuda_forward(
                 let ne = layers.first().map_or(0, |l| l.moe.experts.len());
                 let profile = std::env::var("CMF_QWEN_PROFILE").ok().and_then(|path| ExpertProfile::load(&path, layers.len(), ne));
                 let ranked = profile.as_ref().map(|pr| pr.ranked()).unwrap_or_default();
-                // before the prefill pins the experts' pages: a pinned page stays on its node
-                d.host_nodes(layers, &ranked, pool);
-                if let Some(pr) = profile.as_ref() {
+                if layers.iter().any(|l| l.latent.is_some()) {
+                    // a latent model's experts go to its bank, the hottest first when the card holds a part: the
+                    // routing profile of `CMF_QWEN_PROFILE`, else the one beside the model (`<model>.profile`)
+                    let side = layers
+                        .first()
+                        .and_then(|l| l.moe.experts.first())
+                        .and_then(|f| f.gate_proj.model_arc())
+                        .map(|m| m.path.with_extension("profile"));
+                    let lp = match profile.as_ref() {
+                        Some(pr) => Some(pr.ranked()),
+                        None => side
+                            .as_ref()
+                            .and_then(|p| ExpertProfile::load(&p.to_string_lossy(), layers.len(), ne))
+                            .map(|pr| pr.ranked()),
+                    };
                     let t0 = std::time::Instant::now();
-                    match d.prefill(layers, &ranked) {
+                    match d.lat_fill(layers, lp.as_deref().unwrap_or(&[])) {
                         Ok(n) => eprintln!(
-                            "qwen4 cuda: arena prefilled with {n} of {} profiled experts ({} tokens of history) in {:.2}s",
-                            ranked.len(),
-                            pr.tokens,
+                            "qwen4 cuda: {n} of {} latent experts on the card{} in {:.1}s",
+                            layers.len() * ne,
+                            if lp.is_some() { " (hottest first by the routing profile)" } else { "" },
                             t0.elapsed().as_secs_f64()
                         ),
-                        Err(e) => eprintln!("qwen4 cuda: prefill: {e}"),
+                        Err(e) => {
+                            eprintln!("qwen4 cuda: {e}; staying on the host path");
+                            state.cuda_off = true;
+                            return false;
+                        }
                     }
+                } else {
+                    // before the prefill pins the experts' pages: a pinned page stays on its node
+                    d.host_nodes(layers, &ranked, pool);
+                    if let Some(pr) = profile.as_ref() {
+                        let t0 = std::time::Instant::now();
+                        match d.prefill(layers, &ranked) {
+                            Ok(n) => eprintln!(
+                                "qwen4 cuda: arena prefilled with {n} of {} profiled experts ({} tokens of history) in {:.2}s",
+                                ranked.len(),
+                                pr.tokens,
+                                t0.elapsed().as_secs_f64()
+                            ),
+                            Err(e) => eprintln!("qwen4 cuda: prefill: {e}"),
+                        }
+                    }
+                    d.cpu_bench(layers);
                 }
-                d.cpu_bench(layers);
                 cache_trim(layers);
                 state.cuda = Some(d)
             }
@@ -5441,21 +5516,46 @@ fn forward_tokens_device(
         };
         if latent {
             let t0 = std::time::Instant::now();
+            // The card takes the layers' expert banks its budget has room for beside the skeleton, the draft head
+            // and the working memory; the banks of the other layers stay in host-visible system memory and the
+            // kernels read them over the bus (`CMF_QWEN_LAT_VRAM_LAYERS=<n>` fixes how many go to the card).
+            let bank = layers.iter().find_map(|l| q4::lat::LatDev::bank_bytes(l.latent.as_ref()?, &l.moe)).unwrap_or(0);
+            let skel: u64 = globals.skeleton_idxs.iter().filter_map(|&i| model.tensors.get(i)).map(|t| t.nbytes).sum();
+            let room = crate::gpu_wgpu::device_vram_budget().saturating_sub(skel + (3u64 << 30));
+            let on_card = std::env::var("CMF_QWEN_LAT_VRAM_LAYERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(if bank == 0 { usize::MAX } else { (room / bank) as usize });
             let mut lats = Vec::with_capacity(layers.len());
+            let mut placed = 0usize;
             for l in layers {
                 let Some(lt) = l.latent.as_ref() else {
                     lats.push(None);
                     continue;
                 };
-                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden) {
+                let on_host = placed >= on_card;
+                placed += 1;
+                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
                     Some(d) => lats.push(Some(d)),
+                    None if on_host => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
                     None => return off(state, "latent experts do not load"),
                 }
             }
             let held: u64 = lats.iter().flatten().map(|d| d.bytes()).sum();
-            tracing::info!("qwen4 device: latent experts resident ({} MB) in {:.2}s", held >> 20, t0.elapsed().as_secs_f64());
-            if prof {
-                eprintln!("qwen4-device: latent experts resident, {} MB in {:.2}s", held >> 20, t0.elapsed().as_secs_f64());
+            let hosted: u64 = lats.iter().flatten().map(|d| d.host_bytes()).sum();
+            tracing::info!(
+                "qwen4 device: latent experts resident ({} MB on the card, {} MB in system memory) in {:.2}s",
+                held >> 20,
+                hosted >> 20,
+                t0.elapsed().as_secs_f64()
+            );
+            if prof || hosted > 0 {
+                eprintln!(
+                    "qwen4-device: latent experts: {} MB on the card, {} MB in system memory (read over the bus), in {:.2}s",
+                    held >> 20,
+                    hosted >> 20,
+                    t0.elapsed().as_secs_f64()
+                );
             }
             dev.lat = lats;
         }
