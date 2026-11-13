@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A5000 (fast build), a 4096-token prompt 779 against 597 tok/s (first token 5.3 against 6.9 s); the greedy text
   identical to the CPU's on both.
 
+- A Looped Transformer's mid-stack norms on the CUDA hybrid arm (the final norm on the stream after each
+  loop's last layer, `loop_norm_at`), which now takes such stacks from the dense arm; `CMF_CUDA_HYB_ALL=1` sends
+  every stack to the hybrid arm. Nanbeige4.2-3B (q4_tiled, 22 layers run twice), which ran op by op on CUDA at
+  5.2 tok/s, decodes at 68.5 tok/s against Vulkan's 61.7 on an RTX A5000 (fast build); its greedy text
+  identical to the CPU's. Its prompt still goes the pipeline's chunked path.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):

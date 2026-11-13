@@ -1308,6 +1308,10 @@ pub(super) struct HPlan {
     prism: Option<PrismPlan>,
     /// The widest head of the stack (a layer of its own geometry).
     hdmax: usize,
+    /// A Looped Transformer: the layers after which the final norm is applied
+    /// to the stream (`loop_norm_at`), and its weights.
+    loop_norm: Vec<usize>,
+    loop_w: Option<Arc<Buf>>,
     /// Some layer's head geometry is its own (its kernels a module of their own).
     own_geom: bool,
     half: usize,
@@ -1423,6 +1427,13 @@ struct ChainRes {
 /// with Q/K norms or the element-wise output gate.) An empty stack with a
 /// head goes here when the dense arm's attention kernels cannot take the
 /// geometry.
+/// `CMF_CUDA_HYB_ALL=1`: every stack takes the hybrid arm (the dense arm's
+/// plain attention stacks included).
+pub(super) fn all_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_HYB_ALL").as_deref() == Ok("1"))
+}
+
 pub(super) fn wants(layers: &[GraphLayer], nh: usize, nkv: usize, hd: usize) -> bool {
     if layers.is_empty() {
         let hpk = if nkv > 0 { nh / nkv } else { 0 };
@@ -1555,6 +1566,7 @@ fn build(
     scale: f32,
     invf: &[f32],
     sig: Vec<usize>,
+    loop_norm: &[usize],
 ) -> Res<HPlan> {
     if nkv == 0 || nh % nkv != 0 || (layers.is_empty() && lm.is_none()) {
         return Err("empty stack or head geometry".into());
@@ -2124,6 +2136,15 @@ fn build(
         let ffn_out = sw(l.ffn_out_norm, st)?;
         out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
+    let loop_w = if loop_norm.is_empty() {
+        None
+    } else {
+        if final_norm.len() != hidden || loop_norm.iter().any(|&l| l >= layers.len()) {
+            return Err("a mid-stack norm past the stack or of the wrong width".into());
+        }
+        note(final_norm);
+        Some(st.f32_buf(final_norm)?)
+    };
     let (lm, logits, final_norm_buf) = match lm {
         Some((gw, rows)) => {
             if final_norm.len() != hidden {
@@ -2183,6 +2204,8 @@ fn build(
         invf_local,
         prism,
         hdmax,
+        loop_norm: loop_norm.to_vec(),
+        loop_w,
         own_geom: hdmax != hd || kvmax != nkv * hd,
         half,
         nh,
@@ -2240,9 +2263,13 @@ fn plan_for(
     scale: f32,
     invf: &[f32],
     first_pos: usize,
+    loop_norm: &[usize],
 ) -> Res<Arc<HPlan>> {
     let key = (model.uid(), layer_base, layers.len(), lm.is_some());
-    let sig = hsig(model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, invf);
+    let mut sig = hsig(model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, invf);
+    // a Looped Transformer's mid-stack norms are part of the plan
+    sig.push(usize::MAX);
+    sig.extend_from_slice(loop_norm);
     if let Some(p) = st.hyb.plans.get(&key) {
         if p.sig == sig && p.eps == eps && p.scale == scale {
             // SAFETY: the signature holds these addresses and lengths, and the
@@ -2258,7 +2285,7 @@ fn plan_for(
     }
     c.sync()?;
     let t0 = std::time::Instant::now();
-    let p = Arc::new(build(c, st, model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, scale, invf, sig)?);
+    let p = Arc::new(build(c, st, model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, scale, invf, sig, loop_norm)?);
     mem_report(c, st, &format!("a plan of {} layers", p.layers.len()));
     tracing::info!(
         "cuda hybrid graph: {} layers resident, {:.2} GB of weights, built in {:.1} s (repack {:.1} s, upload {:.1} s, single weights {:.1} s, job tables {:.1} s)",
@@ -3084,6 +3111,11 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 )?;
             }
             hst(c, 9, &mut t0)?;
+            // a Looped Transformer: the final norm on the stream after a loop's last layer
+            if let (true, Some(w)) = (plan.loop_norm.contains(&li), plan.loop_w.as_ref()) {
+                let (nullp, zero_h) = (0u64, 0i32);
+                c.launch(fx.rmsnorm, (n as u32, 1), 256, 0, kargs!(plan.h.ptr, w.ptr, plan.h.ptr, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))?;
+            }
             // a DFlash drafter's taps: the residual stream after this layer
             for &(tl, dst) in taps {
                 if tl == li {
@@ -3387,8 +3419,8 @@ pub(super) fn token(
     layer_base: usize,
     hidden_too: bool,
 ) -> TokenGraphOutcome {
-    if steps != 1 || !loop_norm_at.is_empty() || (!o1.is_empty() && o1.len() != layers.len()) {
-        decline("hybrid token", "a multi-step burst, a mid-stack norm or far-field views short of the layers");
+    if steps != 1 || (!o1.is_empty() && o1.len() != layers.len()) {
+        decline("hybrid token", "a multi-step burst or far-field views short of the layers");
         return TokenGraphOutcome::Declined;
     }
     let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
@@ -3400,7 +3432,7 @@ pub(super) fn token(
     if c.current().is_err() {
         return TokenGraphOutcome::Declined;
     }
-    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm_head, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position) {
+    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm_head, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position, loop_norm_at) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid token", &e);
@@ -3548,7 +3580,7 @@ pub(super) fn mtp_chain(
         return Err(false);
     }
     let st = &mut *st;
-    let plan = match plan_for(c, st, model, layers, layer_base, Some(lm_head), final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position) {
+    let plan = match plan_for(c, st, model, layers, layer_base, Some(lm_head), final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position, &[]) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid draft chain", &e);
@@ -3760,7 +3792,7 @@ pub(super) fn batch(
     }
     let lm = spec.as_ref().map(|s| (&s.lm, s.lm_rows));
     let final_norm: &[f32] = spec.as_ref().map_or(&[], |s| s.final_norm);
-    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0) {
+    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0, &[]) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid batch", &e);

@@ -2319,7 +2319,9 @@ pub fn forward_token_graph(
     hidden_too: bool,
 ) -> TokenGraphOutcome {
     let Some(c) = ctx() else { return TokenGraphOutcome::Declined };
-    if hyb::wants(layers, nh, nkv, hd) {
+    // the hybrid arm also takes a Looped Transformer (its mid-stack norms) and,
+    // under `CMF_CUDA_HYB_ALL=1`, every stack
+    if hyb::wants(layers, nh, nkv, hd) || !loop_norm_at.is_empty() || hyb::all_on() {
         return hyb::token(
             c, model, kv_id, layers, o1, o1_epoch, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
             lm_head, final_norm, logits, loop_norm_at, steps, layers_run, layer_base, hidden_too,
@@ -2661,7 +2663,7 @@ pub fn forward_batch_graph_at(
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
     let Some(c) = ctx() else { return BatchGraphOutcome::Declined };
-    if hyb::wants(layers, nh, nkv, hd) {
+    if hyb::wants(layers, nh, nkv, hd) || hyb::all_on() {
         let defer = BATCH_DEFER.with(|d| d.get());
         return hyb::batch(
             c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
