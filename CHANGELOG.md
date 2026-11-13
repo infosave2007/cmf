@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.88] — 2026-11-13
+
+### Added
+- Routed MoE FFNs on the CUDA hybrid arm (`gpu_cuda/hyb.rs`, `hyb.cu`): the Qwen3.5/3.6-MoE class (Qwen3.6-35B-A3B,
+  Ornith-1.5-35B-A3B, Apex-35B, KAT-Coder-V2.5) and HunYuan hy_v3 (Hy-MT2-30B-A3B), which the arm declined and ran
+  per op at 3-13 tok/s. Inside the token graph: the router's logits and the shared expert's gate
+  (`hy_moe_router`), every row's top k (softmax, or sigmoid scores with a selection bias, renormalized and
+  scaled as the source does) and the union of the picks laid out as slots (`hy_moe_select`: the gate/up and
+  down jobs of each slot's expert, written on the card from the layer's templates, so the layer is captured
+  with the rest of the token), two tensor-core launches over every slot (a down job reads its own slot's
+  planes through the new `xoff` of the job record), the shared expert as the layer's dense pair, and the
+  mixture added in one kernel (`hy_moe_combine`). A prompt longer than the small path runs through it 16 rows
+  at a time (`CMF_HYB_MOE_CHUNKS=0` keeps the per-op prompt path), two tiles a block past one row. RTX A5000,
+  release build, 64 tokens, CUDA against Vulkan on the same card, the greedy text identical: Qwen3.6-35B-A3B
+  142.6-145.2 against 104.6-105.2 tok/s (11.1 on CUDA before), Ornith-1.5-35B-A3B 143.7-145.8 against
+  102.7-102.9 (9.3), Hy-MT2-30B-A3B 107-120 against 96.9-99.4 (6.0). Hy-MT2-30B-A3B at a 1024 / 4096-token
+  prompt: CUDA prefills at 200 / 164 tok/s and decodes at 109 / 88, Vulkan 682 / 507 and 94 / 82. Apex-35B
+  (q8_2f tensors), KAT-Coder-V2.5 (q4_tiled experts) and the q2tp experts of Escha-W2 still decline.
+
+### Changed
+- The tensor-core matvec of the hybrid arm finds its block's job by a binary search of the job table (a
+  scan was a dependent load a job: a hundred and more in a MoE launch).
+
 ## [0.8.87] — 2026-11-13
 
 ### Fixed

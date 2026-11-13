@@ -84,6 +84,8 @@ struct HyJob {
     int kind;  // 6 = q4tp, 4 = f32; bits 16.. rows a warp owns (q4tp)
     int blk0;  // first block of this job in the launch
     int ystride;
+    int xoff;  // elements into the input planes this job's rows start at (a MoE slot's own input)
+    int pad_;
 };
 
 // RMS norm of every row of x [B][n] into f32 or f16 (a block of 256 threads
@@ -610,8 +612,14 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     __shared__ float2 par_s[16 * TB];
     __shared__ float part[KS][TB][NT][32][4];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    int jx = 0;
-    while (jx + 1 < njobs && (int)blockIdx.x >= jobs[jx + 1].blk0) jx++;
+    // the block's job: a binary search of the first blocks (a MoE launch has
+    // a hundred slots and more, where a scan was a hundred dependent loads)
+    int jx = 0, jhi = njobs - 1;
+    while (jx < jhi) {
+        const int mid = (jx + jhi + 1) >> 1;
+        if ((int)blockIdx.x >= jobs[mid].blk0) jx = mid;
+        else jhi = mid - 1;
+    }
     const HyJob jb = jobs[jx];
     const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
     const int rows = jb.rows;
@@ -643,7 +651,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         for (int t = 0; t < NT; t++) {
             const int j = t * 8 + gid;
             if (j < nrows) {
-                const size_t xo = (size_t)j * xstride + k0;
+                const size_t xo = (size_t)jb.xoff + (size_t)j * xstride + k0;
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
                     bx[t][0][q] = *(const u32*)(x0 + xo + 8 * q);
@@ -1667,4 +1675,192 @@ extern "C" __global__ void hy_far_insert_n(const u16* __restrict__ NK, const u16
     }
 #pragma unroll
     for (int k = 0; k < DPL; k++) th[lane + 32 * k] = acc[k];
+}
+
+
+// ------------------------------------------------------------- MoE
+//
+// A routed FFN inside the token graph. The router's logits and the shared
+// expert's gate come from `hy_moe_router`; `hy_moe_select` picks every row's
+// top k and lays the union of the picked experts out as the launch's slots:
+// per slot the gate/up and the down job of its expert (the layer's job
+// templates, outputs at slot offsets), and the mixing weight of every (row,
+// slot), 0 where the row did not pick that expert. Two tensor-core launches
+// then run every slot (`hy_mmp_*`, the down jobs reading their own slot's
+// planes through `xoff`), and `hy_moe_combine` adds the mixture (and the
+// shared expert) to the stream. Nothing leaves the card, so the layer is
+// captured with the rest of the token.
+
+// logits[r][e] = Wr[e] . xn[r] for e < E; with `sgw` the shared gate's
+// pre-sigmoid score sg[r] (as row E). A warp a router row.
+extern "C" __global__ void hy_moe_router(const float* __restrict__ xn, const float* __restrict__ Wr,
+                                         const float* __restrict__ sgw, float* __restrict__ logits,
+                                         float* __restrict__ sg, int n, int E, int hidden)
+{
+    const int lane = threadIdx.x & 31;
+    const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (e > E || (e == E && !sgw)) return;
+    const float* w = e < E ? Wr + (size_t)e * hidden : sgw;
+    // a row a grid row
+    {
+        const int r = blockIdx.y;
+        const float* x = xn + (size_t)r * hidden;
+        float acc = 0.0f;
+        for (int i = lane; i < hidden; i += 32) acc = fmaf(w[i], x[i], acc);
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(FULL, acc, o);
+        if (lane == 0) {
+            if (e < E) logits[(size_t)r * E + e] = acc;
+            else sg[r] = acc;
+        }
+    }
+}
+
+__device__ __forceinline__ void moe_argmax(float& v, int& i)
+{
+    for (int o = 16; o > 0; o >>= 1) {
+        const float v2 = __shfl_xor_sync(FULL, v, o);
+        const int i2 = __shfl_xor_sync(FULL, i, o);
+        if (v2 > v || (v2 == v && i2 < i)) {
+            v = v2;
+            i = i2;
+        }
+    }
+}
+
+// One block, a warp a row (n <= 16 warps); E <= 1024 experts, k <= 64,
+// S <= 1024 slots. A row's scores sit in its lanes' registers and its top k
+// are k warp-wide argmax shuffles; the union is laid out by one thread.
+// flags: bit0 renormalize the picked weights, bit1 sigmoid scores (else a
+// softmax), bit2 a selection bias on the sigmoid ranking key, bit5 the
+// sigmoid renormalization floor is 1e-20 (else 1e-6).
+extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const float* __restrict__ bias, int n, int E,
+                                         int k, int flags, float route_scale, const HyJob* __restrict__ gu_t,
+                                         const HyJob* __restrict__ dn_t, HyJob* __restrict__ gu_a,
+                                         HyJob* __restrict__ dn_a, float* __restrict__ wsel, int S, u64 qq0, u64 qq1,
+                                         int pstride, u64 dnS, int hidden, int bpj_gu, int bpj_dn)
+{
+    __shared__ int slot_of[1024];
+    __shared__ int U[1024];
+    __shared__ int pick[16][64];
+    __shared__ float pw[16][64];
+    __shared__ int used;
+    const int tid = threadIdx.x, lane = tid & 31, r = tid >> 5;
+    const bool sigm = (flags & 2) != 0;
+    for (int e = tid; e < E; e += blockDim.x) slot_of[e] = -1;
+    for (int i = tid; i < n * S; i += blockDim.x) wsel[i] = 0.0f;
+    if (r < n) {
+        const float* L = logits + (size_t)r * E;
+        float key[32], lg[32];
+#pragma unroll
+        for (int q = 0; q < 32; q++) {
+            const int e = lane + 32 * q;
+            lg[q] = e < E ? L[e] : -3.0e38f;
+        }
+        float mx = -3.0e38f, sum = 0.0f;
+        if (!sigm) {
+#pragma unroll
+            for (int q = 0; q < 32; q++) mx = fmaxf(mx, lg[q]);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o));
+#pragma unroll
+            for (int q = 0; q < 32; q++)
+                if (lane + 32 * q < E) sum += expf(lg[q] - mx);
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(FULL, sum, o);
+        }
+#pragma unroll
+        for (int q = 0; q < 32; q++) {
+            const int e = lane + 32 * q;
+            float kk = lg[q];
+            if (sigm && e < E) {
+                kk = 1.0f / (1.0f + expf(-kk));
+                if ((flags & 4) && bias) kk += bias[e];
+            }
+            key[q] = e < E ? kk : -3.0e38f;
+        }
+        for (int j = 0; j < k; j++) {
+            float best = -3.0e38f;
+            int bi = 0x7fffffff;
+#pragma unroll
+            for (int q = 0; q < 32; q++) {
+                const int e = lane + 32 * q;
+                if (key[q] > best || (key[q] == best && e < bi)) {
+                    best = key[q];
+                    bi = e;
+                }
+            }
+            moe_argmax(best, bi);
+            // the owner lane takes the pick out of the running
+#pragma unroll
+            for (int q = 0; q < 32; q++)
+                if (lane + 32 * q == bi) key[q] = -3.0e38f;
+            if (lane == 0) {
+                const float lb = L[bi];
+                pick[r][j] = bi;
+                pw[r][j] = sigm ? 1.0f / (1.0f + expf(-lb)) : expf(lb - mx) / sum;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        used = 0;
+        for (int rr = 0; rr < n; rr++) {
+            float tot = 0.0f;
+            for (int j = 0; j < k; j++) tot += pw[rr][j];
+            const float dn = sigm ? tot + ((flags & 32) ? 1e-20f : 1e-6f) : tot;
+            for (int j = 0; j < k; j++) {
+                float w = pw[rr][j];
+                if (flags & 1) w = w / dn;
+                w *= route_scale;
+                const int e = pick[rr][j];
+                int s = slot_of[e];
+                if (s < 0 && used < S) {
+                    s = used++;
+                    slot_of[e] = s;
+                    U[s] = e;
+                }
+                if (s >= 0) wsel[(size_t)rr * S + s] = w;
+            }
+        }
+    }
+    __syncthreads();
+    for (int s = tid; s < S; s += blockDim.x) {
+        const bool live = s < used;
+        HyJob g = gu_t[live ? U[s] : 0];
+        HyJob d = dn_t[live ? U[s] : 0];
+        if (!live) {
+            g.rows = 0;
+            d.rows = 0;
+        }
+        g.y = qq0 + (u64)s * n * pstride * 2;
+        g.res = qq1 + (u64)s * n * pstride * 2;
+        g.ystride = pstride;
+        g.blk0 = s * bpj_gu;
+        g.xoff = 0;
+        d.y = dnS + (u64)s * n * hidden * 4;
+        d.res = 0;
+        d.ystride = hidden;
+        d.blk0 = s * bpj_dn;
+        d.xoff = s * n * pstride;
+        gu_a[s] = g;
+        dn_a[s] = d;
+    }
+}
+
+// h[r] += sum over slots of wsel[r][s] * dnS[s][r] (+ the shared expert's
+// output times its weight: sigmoid(sg[r]) under `gated`, else 1).
+extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __restrict__ dnS,
+                                          const float* __restrict__ wsel, const float* __restrict__ dsh,
+                                          const float* __restrict__ sg, int gated, int n, int hidden, int S)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= hidden || r >= n) return;
+    float acc = 0.0f;
+    for (int s = 0; s < S; s++) {
+        const float w = wsel[(size_t)r * S + s];
+        if (w != 0.0f) acc = fmaf(w, dnS[((size_t)s * n + r) * hidden + i], acc);
+    }
+    if (dsh) {
+        const float w = gated ? 1.0f / (1.0f + expf(-sg[r])) : 1.0f;
+        acc = fmaf(w, dsh[(size_t)r * hidden + i], acc);
+    }
+    h[(size_t)r * hidden + i] += acc;
 }

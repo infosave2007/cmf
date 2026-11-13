@@ -140,6 +140,9 @@ struct HyJob {
     kind: i32,
     blk0: i32,
     ystride: i32,
+    /// Elements into the input planes this job's rows start at (a MoE slot's own input).
+    xoff: i32,
+    pad_: i32,
 }
 
 pub(super) struct HFuncs {
@@ -179,6 +182,9 @@ pub(super) struct HFuncs {
     softmax_hf: cs::CUfunction,
     attn_out_f: cs::CUfunction,
     far_insert_n: cs::CUfunction,
+    moe_router: cs::CUfunction,
+    moe_select: cs::CUfunction,
+    moe_combine: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -232,6 +238,9 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         softmax_hf: func(module, "hy_softmax_hf")?,
         attn_out_f: func(module, "hy_attn_out_f")?,
         far_insert_n: func(module, "hy_far_insert_n")?,
+        moe_router: func(module, "hy_moe_router")?,
+        moe_select: func(module, "hy_moe_select")?,
+        moe_combine: func(module, "hy_moe_combine")?,
     })
 }
 
@@ -295,6 +304,8 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 kind,
                 blk0: blk as i32,
                 ystride: ystride as i32,
+                xoff: 0,
+                pad_: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
         }
@@ -771,14 +782,49 @@ enum Mix {
 
 struct HLayer {
     mix: Mix,
-    /// gate and up as one pair (`hmat_pair`)
+    /// gate and up as one pair (`hmat_pair`); a routed FFN's shared expert
     gu: Arc<DevMat>,
     down: Arc<DevMat>,
     in_norm: Arc<Buf>,
     post_norm: Arc<Buf>,
     inter: usize,
     ms_gu: MmaSet,
+    /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
+    moe: Option<MoeL>,
+}
+
+/// A routed FFN: the router, every routed expert's gate/up pair and down as
+/// job templates (`hy_moe_select` points the picked ones at the launch's
+/// slots); the shared expert is the layer's `gu` / `down`.
+struct MoeL {
+    router: Arc<DevMat>,
+    sgw: Option<Arc<DevMat>>,
+    bias: Option<Arc<Buf>>,
+    gu_t: Buf,
+    dn_t: Buf,
+    e: usize,
+    k: usize,
+    inter: usize,
+    flags: i32,
+    route_scale: f32,
+    gated: bool,
+    bpj_gu: u32,
+    bpj_dn: u32,
+    _mats: Vec<Arc<DevMat>>,
+}
+
+/// The routed FFN's per-call rows (`NMAX` rows, `smax` slots), one set a plan.
+struct MoeBufs {
+    logits: Buf,
+    sg: Buf,
+    wsel: Buf,
+    gu_a: Buf,
+    dn_a: Buf,
+    qq: [Buf; 2],
+    dns: Buf,
+    dsh: Buf,
+    smax: usize,
 }
 
 /// A hybrid stack resolved for the card.
@@ -831,6 +877,7 @@ pub(super) struct HPlan {
     cdmax: usize,
     vdmax: usize,
     nvmax: usize,
+    moe: Option<MoeBufs>,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -977,10 +1024,25 @@ fn hsig(
             }
             _ => s.push(3),
         }
-        if let GraphFfn::Dense { gate, up, down, .. } = &l.ffn {
-            for g in [gate, up, down] {
-                w(&mut s, g);
+        match &l.ffn {
+            GraphFfn::Dense { gate, up, down, .. } => {
+                for g in [gate, up, down] {
+                    w(&mut s, g);
+                }
             }
+            GraphFfn::Moe { router, shared_gate, experts, n_exp, top_k, inter, norm_topk, sigmoid, bias, detached_shared, shared_gated, route_scale, .. } => {
+                s.extend([4, *n_exp, *top_k, *inter, *norm_topk as usize, *sigmoid as usize, *shared_gated as usize, route_scale.to_bits() as usize]);
+                w(&mut s, router);
+                w(&mut s, shared_gate);
+                for &(g, u, d) in experts.iter() {
+                    s.extend([g, u, d]);
+                }
+                if let Some(d) = detached_shared {
+                    s.extend([d.gate.idx, d.up.idx, d.down.idx, d.width]);
+                }
+                f(&mut s, bias.unwrap_or(&[]));
+            }
+            _ => s.push(5),
         }
     }
     s
@@ -1033,6 +1095,7 @@ fn build(
     // geometry first: the row buffers the job tables point into
     let mut qrow = nh * hd;
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
+    let (mut moe_e, mut moe_k) = (0usize, 0usize);
     for (li, l) in layers.iter().enumerate() {
         if l.mhc.is_some() || l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some() {
             return Err(format!("layer {li}: mHC streams, sandwich norms or a layer scale"));
@@ -1066,13 +1129,33 @@ fn build(
             }
             _ => return Err(format!("layer {li}: a token mixer the hybrid arm has no kernels for")),
         }
-        let GraphFfn::Dense { gate, act, limit, hot, .. } = &l.ffn else {
-            return Err(format!("layer {li}: an FFN other than a dense one"));
-        };
-        if *act != GraphAct::Silu || *limit != 0.0 || hot.is_some() {
-            return Err(format!("layer {li}: an FFN other than plain SwiGLU"));
+        match &l.ffn {
+            GraphFfn::Dense { gate, act, limit, hot, .. } => {
+                if *act != GraphAct::Silu || *limit != 0.0 || hot.is_some() {
+                    return Err(format!("layer {li}: an FFN other than plain SwiGLU"));
+                }
+                intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
+            }
+            GraphFfn::Moe { act, q4tp, gu_q2, q82, n_exp, top_k, inter, experts, has_shared, detached_shared, router, .. } => {
+                if *act != GraphAct::Silu || !*q4tp || *gu_q2 || *q82 {
+                    return Err(format!("layer {li}: a routed FFN other than q4tp SwiGLU"));
+                }
+                if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
+                    return Err(format!("layer {li}: a routed FFN of {n_exp} experts, top {top_k}"));
+                }
+                if *has_shared == detached_shared.is_some() {
+                    return Err(format!("layer {li}: a routed FFN without exactly one shared expert"));
+                }
+                let sh = match detached_shared {
+                    Some(d) => d.width,
+                    None => model.tensors.get(experts[*n_exp].0).and_then(|e| e.shape.first().copied()).ok_or("shared expert shape")?,
+                };
+                intermax = intermax.max(*inter).max(sh);
+                moe_e = moe_e.max(*n_exp);
+                moe_k = moe_k.max(*top_k);
+            }
+            _ => return Err(format!("layer {li}: an FFN other than a dense or a routed one")),
         }
-        intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
     }
     let lm_rows = lm.map_or(0, |(_, r)| r);
     let f4 = |n: usize| Buf::new(n.max(1) * 4);
@@ -1093,6 +1176,24 @@ fn build(
     let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
+    // a routed FFN's rows: at most NMAX x top_k distinct experts a call
+    let moe_bufs = if moe_e > 0 {
+        let smax = (NMAX * moe_k).min(moe_e);
+        let job = std::mem::size_of::<HyJob>();
+        Some(MoeBufs {
+            logits: f4(NMAX * moe_e)?,
+            sg: f4(NMAX)?,
+            wsel: f4(NMAX * smax)?,
+            gu_a: Buf::new(smax * job)?,
+            dn_a: Buf::new(smax * job)?,
+            qq: [Buf::new(smax * NMAX * pstride * 2)?, Buf::new(smax * NMAX * pstride * 2)?],
+            dns: f4(smax * NMAX * hidden)?,
+            dsh: f4(NMAX * hidden)?,
+            smax,
+        })
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(layers.len());
     mem_report(c, st, "a plan's row buffers");
     // the q4tp matrices this plan uploads, in one arena
@@ -1100,13 +1201,30 @@ fn build(
     let q6 = |w: &GraphW| w.kind == 6 && w.prism == crate::gpu::GraphPrismOp::None && !w.affine;
     let mut need = 0usize;
     for l in layers {
-        let GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } = &l.ffn else { continue };
-        let inter = rows_of(model, gw).unwrap_or(0);
-        if q6(gw) && q6(uw) && !st.hyb.pairs.contains_key(&(uid, gw.idx, uw.idx)) {
-            need += planes_bytes(2 * inter, hidden);
-        }
-        if q6(dw) && !st.hyb.mats.contains_key(&(uid, dw.idx)) {
-            need += planes_bytes(hidden, inter);
+        let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if q6(gw) && q6(uw) && q6(dw) => {
+                vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
+            }
+            GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
+                let mut v: Vec<_> = experts[..*n_exp].iter().map(|&(g, u, d)| (g, u, d, *inter)).collect();
+                match detached_shared {
+                    Some(d) => v.push((d.gate.idx, d.up.idx, d.down.idx, d.width)),
+                    None => {
+                        let (g, u, d) = experts[*n_exp];
+                        v.push((g, u, d, model.tensors.get(g).and_then(|e| e.shape.first().copied()).unwrap_or(0)));
+                    }
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+        for (g, u, d, inter) in ffn {
+            if !st.hyb.pairs.contains_key(&(uid, g, u)) {
+                need += planes_bytes(2 * inter, hidden);
+            }
+            if !st.hyb.mats.contains_key(&(uid, d)) {
+                need += planes_bytes(hidden, inter);
+            }
         }
         let mut one = |w: &GraphW, rows: usize, cols: usize| {
             if q6(w) && !st.hyb.mats.contains_key(&(uid, w.idx)) {
@@ -1149,10 +1267,82 @@ fn build(
         if li % 16 == 1 {
             mem_report(c, st, &format!("{li} layers of a plan"));
         }
-        let GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } = &l.ffn else { unreachable!() };
-        let inter = rows_of(model, gw).ok_or("f32 FFN")?;
-        let gum = hmat_pair(c, st, model, gw, uw, inter, hidden)?;
-        let dm = hmat(c, st, model, dw, hidden, inter)?;
+        let gw6 = |idx: usize| GraphW { idx, kind: 6, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+        let (gum, dm, inter, moe) = match &l.ffn {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } => {
+                let inter = rows_of(model, gw).ok_or("f32 FFN")?;
+                (hmat_pair(c, st, model, gw, uw, inter, hidden)?, hmat(c, st, model, dw, hidden, inter)?, inter, None)
+            }
+            GraphFfn::Moe {
+                router, shared_gate, experts, n_exp, top_k, inter, norm_topk, sigmoid, sigmoid_denom_eps, bias, has_shared,
+                detached_shared, shared_gated, route_scale, ..
+            } => {
+                let (e, k, inter) = (*n_exp, *top_k, *inter);
+                let mut mats = Vec::with_capacity(2 * e);
+                let (mut gu_t, mut dn_t) = (Vec::with_capacity(e), Vec::with_capacity(e));
+                let job = |m: &DevMat, rows: usize, kind: i32| HyJob {
+                    w: m.w.ptr,
+                    aux0: m.aux0(),
+                    aux1: m.aux1(),
+                    y: 0,
+                    res: 0,
+                    rows: rows as i32,
+                    kind,
+                    blk0: 0,
+                    ystride: 0,
+                    xoff: 0,
+                    pad_: 0,
+                };
+                for &(g, u, d) in &experts[..e] {
+                    let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
+                    let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
+                    gu_t.push(job(&pm, 2 * inter, 6 | 0x100));
+                    dn_t.push(job(&dmx, hidden, 6));
+                    mats.push(pm);
+                    mats.push(dmx);
+                }
+                // the shared expert: the last entry, or one of its own width
+                let (sg_, su_, sd_, sh) = match detached_shared {
+                    Some(d) => (d.gate.idx, d.up.idx, d.down.idx, d.width),
+                    None => {
+                        let (g, u, d) = experts[e];
+                        (g, u, d, model.tensors.get(g).and_then(|t| t.shape.first().copied()).ok_or("shared expert shape")?)
+                    }
+                };
+                let gated = *has_shared && *shared_gated;
+                let pm = hmat_pair(c, st, model, &gw6(sg_), &gw6(su_), sh, hidden)?;
+                let dmx = hmat(c, st, model, &gw6(sd_), hidden, sh)?;
+                let routerm = st.mat(c, model, router, e, hidden)?;
+                let sgw = if gated { Some(st.mat(c, model, shared_gate, 1, hidden)?) } else { None };
+                let biasb = match bias {
+                    Some(b) if b.len() == e => {
+                        note(b);
+                        Some(st.f32_buf(b)?)
+                    }
+                    Some(_) => return Err(format!("layer {li}: a selection bias of the wrong width")),
+                    None => None,
+                };
+                let flags = (*norm_topk as i32) | ((*sigmoid as i32) << 1) | ((biasb.is_some() as i32) << 2) | (((*sigmoid && *sigmoid_denom_eps < 1e-10) as i32) << 5);
+                let ml = MoeL {
+                    router: routerm,
+                    sgw,
+                    bias: biasb,
+                    gu_t: Buf::from_slice(&gu_t)?,
+                    dn_t: Buf::from_slice(&dn_t)?,
+                    e,
+                    k,
+                    inter,
+                    flags,
+                    route_scale: *route_scale,
+                    gated,
+                    bpj_gu: (2 * inter).div_ceil(16) as u32,
+                    bpj_dn: hidden.div_ceil(16) as u32,
+                    _mats: mats,
+                };
+                (pm, dmx, sh, Some(ml))
+            }
+            _ => unreachable!(),
+        };
         note(l.input_norm);
         note(l.post_norm);
         let in_norm = st.f32_buf(l.input_norm)?;
@@ -1254,8 +1444,12 @@ fn build(
             _ => unreachable!(),
         };
         let ms_gu = mmaset_pair(&gum, qq[0].ptr, qq[1].ptr, pstride)?;
-        let ms_dn = mmaset(&[(&dm, h.ptr, h.ptr, hidden, hidden)])?;
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn });
+        // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
+        let ms_dn = match (&moe, &moe_bufs) {
+            (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
+            _ => mmaset(&[(&dm, h.ptr, h.ptr, hidden, hidden)])?,
+        };
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn, moe });
     }
     let (lm, logits, final_norm_buf) = match lm {
         Some((gw, rows)) => {
@@ -1318,6 +1512,7 @@ fn build(
         cdmax,
         vdmax,
         nvmax,
+        moe: moe_bufs,
     })
 }
 
@@ -2038,20 +2233,37 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
         unsafe {
             let nullp = 0u64;
+            // a routed FFN also wants the normed rows in f32 (the router's input)
+            let xn32 = if pl.moe.is_some() { plan.xn.ptr } else { nullp };
             c.launch(
                 fx.rmsnorm2,
                 (hidden.div_ceil(1024) as u32, n as u32),
                 256,
                 0,
-                kargs!(plan.h.ptr, pl.post_norm.ptr, nullp, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
+                kargs!(plan.h.ptr, pl.post_norm.ptr, xn32, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
             )?;
             hst(c, 0, &mut t0)?;
+            if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
+                moe_routed(c, fx, plan, m, mb, n)?;
+            }
             // gate/up with silu(gate) * up made in its epilogue, into the
-            // middle's planes; down reads them
+            // middle's planes; down reads them (a routed FFN: its shared expert)
             pl.ms_gu.run(c, fx, planes, hidden, n)?;
             hst(c, 7, &mut t0)?;
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
             pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
+            if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
+                // the mixture and the shared expert into the stream
+                let s_n = (n * m.k).min(m.e).min(mb.smax);
+                let (gi, ni, si) = (m.gated as i32, n as i32, s_n as i32);
+                c.launch(
+                    fx.moe_combine,
+                    (hidden.div_ceil(256) as u32, n as u32),
+                    256,
+                    0,
+                    kargs!(plan.h.ptr, mb.dns.ptr, mb.wsel.ptr, mb.dsh.ptr, mb.sg.ptr, gi, ni, hid_i, si),
+                )?;
+            }
             hst(c, 9, &mut t0)?;
             // a DFlash drafter's taps: the residual stream after this layer
             for &(tl, dst) in taps {
@@ -2060,6 +2272,45 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// A routed FFN's experts for the call's `n` rows: the router's logits (and
+/// the shared gate), the picks and their union as slots, every slot's gate/up
+/// and down on the tensor cores. The mixture is added by `hy_moe_combine`.
+unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs, n: usize) -> Res<()> {
+    let hidden = plan.hidden;
+    let s_n = (n * m.k).min(m.e).min(mb.smax);
+    let (ni, ei, hi, ki, fl, si) = (n as i32, m.e as i32, hidden as i32, m.k as i32, m.flags, s_n as i32);
+    let sgw = m.sgw.as_ref().map_or(0, |d| d.w.ptr);
+    let bias = m.bias.as_ref().map_or(0, |b| b.ptr);
+    let (ps_i, inter_i) = (plan.pstride as i32, m.inter as i32);
+    // two tiles a block past one row: every block reads the whole input, and a
+    // window's slots are many (CMF_HYB_MOE_TB=1 keeps one)
+    let tb = if n > 1 && std::env::var("CMF_HYB_MOE_TB").as_deref() != Ok("1") { 2u32 } else { 1u32 };
+    let (bpg, bpd) = (m.bpj_gu.div_ceil(tb), m.bpj_dn.div_ceil(tb));
+    let (bg, bd) = (bpg as i32, bpd as i32);
+    unsafe {
+        c.launch(fx.moe_router, ((m.e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, m.router.w.ptr, sgw, mb.logits.ptr, mb.sg.ptr, ni, ei, hi))?;
+        c.launch(
+            fx.moe_select,
+            (1, 1),
+            (32 * n.max(1)) as u32,
+            0,
+            kargs!(
+                mb.logits.ptr, bias, ni, ei, ki, fl, m.route_scale, m.gu_t.ptr, m.dn_t.ptr, mb.gu_a.ptr, mb.dn_a.ptr, mb.wsel.ptr, si,
+                mb.qq[0].ptr, mb.qq[1].ptr, ps_i, mb.dns.ptr, hi, bg, bd
+            ),
+        )?;
+        let nt = if n <= 8 { 0 } else { 1 };
+        let (pp0, pp1, pp2) = (plan.pp[0].ptr, plan.pp[1].ptr, plan.pp[2].ptr);
+        let t = (tb - 1) as usize;
+        // every slot's gate/up from the normed rows
+        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(mb.gu_a.ptr, si, pp0, pp1, pp2, ps_i, ni, hi))?;
+        // every slot's down from its own planes (the job's `xoff`)
+        let (q0, q1) = (mb.qq[0].ptr, mb.qq[1].ptr);
+        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(mb.dn_a.ptr, si, q0, q1, q1, ps_i, ni, inter_i))?;
     }
     Ok(())
 }
@@ -2637,6 +2888,15 @@ pub(super) fn batch(
             return BatchGraphOutcome::Declined;
         }
     };
+    // a routed FFN runs on the small path only (its rows' experts as slots):
+    // a longer prompt goes through it NMAX rows at a time
+    let moe = plan.layers.iter().any(|l| l.moe.is_some());
+    // CMF_HYB_MOE_CHUNKS=0: a long routed prompt declines (the per-op path)
+    let chunks_on = std::env::var("CMF_HYB_MOE_CHUNKS").as_deref() != Ok("0");
+    if moe && (prompt_far || (b > NMAX && (spec.is_some() || !chunks_on))) {
+        decline("hybrid batch", "a routed FFN past a seal or in a long verify window");
+        return BatchGraphOutcome::Declined;
+    }
     if prompt_far {
         // a prompt chunk past a seal: the epoch's far field goes up when it
         // is new (its rows are this call's first position), and the layer's
@@ -2678,6 +2938,25 @@ pub(super) fn batch(
     }
     let mut spec = spec;
     let mut run = || -> Res<()> {
+        if moe && b > NMAX {
+            let mut at = 0usize;
+            while at < b {
+                let n = NMAX.min(b - at);
+                unsafe {
+                    cu::memcpy_htod_async(plan.h.ptr, &h[at * hidden..(at + n) * hidden], c.stream).map_err(derr)?;
+                    let tab = rope_rows(&plan.invf, positions[at..at + n].iter().copied());
+                    if !tab.is_empty() {
+                        cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
+                    }
+                    run_small(c, &mut st, &plan, kv_id, layer_base, pos0 + at, n, false, false, cap, &sealed, &[])?;
+                    if !defer {
+                        cu::memcpy_dtoh_async(&mut h[at * hidden..(at + n) * hidden], plan.h.ptr, c.stream).map_err(derr)?;
+                    }
+                }
+                at += n;
+            }
+            return c.sync();
+        }
         if b <= NMAX && !prompt_far {
             unsafe {
                 cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
@@ -2897,6 +3176,9 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
+    if plan.layers.iter().any(|l| l.moe.is_some()) {
+        return Err("a routed FFN on the prompt path".into());
+    }
     let (gw, _) = prec();
     if gw != Gemm::Half {
         return Err("the hybrid prompt path runs f16 weight GEMMs only".into());
