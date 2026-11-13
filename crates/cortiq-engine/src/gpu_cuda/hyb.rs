@@ -185,6 +185,8 @@ pub(super) struct HFuncs {
     moe_router: cs::CUfunction,
     moe_select: cs::CUfunction,
     moe_combine: cs::CUfunction,
+    norm_add: cs::CUfunction,
+    scale: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -241,6 +243,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         moe_router: func(module, "hy_moe_router")?,
         moe_select: func(module, "hy_moe_select")?,
         moe_combine: func(module, "hy_moe_combine")?,
+        norm_add: func(module, "hy_norm_add")?,
+        scale: func(module, "hy_scale")?,
     })
 }
 
@@ -652,7 +656,8 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
         if gw.kind == 4 {
             return st.mat(c, model, gw, rows, cols);
         }
-        return Err(format!("weight codec kind {} has no hybrid kernel", gw.kind));
+        let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
+        return Err(format!("weight codec kind {} has no hybrid kernel ({name})", gw.kind));
     }
     if gw.prism != crate::gpu::GraphPrismOp::None || gw.affine {
         return Err("Prism / affine weight".into());
@@ -792,6 +797,27 @@ struct HLayer {
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
     moe: Option<MoeL>,
+    /// Gemma's sandwich norms (the mixer's and the FFN's output normed before
+    /// their residual adds: the products then write `yo`) and layer scalar.
+    attn_out: Option<Arc<Buf>>,
+    ffn_out: Option<Arc<Buf>>,
+    layer_scale: Option<f32>,
+}
+
+/// The vocabulary head: q4tp on the tensor cores, or another codec (a q8_2f
+/// head or tied embedding) through the dense arm's `mv_multi`, one launch a
+/// row with the final norm folded into its staging (a job table a row).
+enum Head {
+    Mma(Arc<DevMat>, usize, MmaSet),
+    Dense(Arc<DevMat>, usize, Vec<Buf>, u32),
+}
+
+impl Head {
+    fn rows(&self) -> usize {
+        match self {
+            Head::Mma(_, r, _) | Head::Dense(_, r, _, _) => *r,
+        }
+    }
 }
 
 /// A routed FFN: the router, every routed expert's gate/up pair and down as
@@ -837,7 +863,7 @@ pub(super) struct HPlan {
     consts: Vec<(usize, usize, u64)>,
     fx: Arc<HFuncs>,
     layers: Vec<HLayer>,
-    lm: Option<(Arc<DevMat>, usize, MmaSet)>,
+    lm: Option<Head>,
     final_norm: Option<Arc<Buf>>,
     invf: Vec<f32>,
     half: usize,
@@ -878,6 +904,7 @@ pub(super) struct HPlan {
     vdmax: usize,
     nvmax: usize,
     moe: Option<MoeBufs>,
+    yo: Buf,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -1044,6 +1071,9 @@ fn hsig(
             }
             _ => s.push(5),
         }
+        f(&mut s, l.attn_out_norm.unwrap_or(&[]));
+        f(&mut s, l.ffn_out_norm.unwrap_or(&[]));
+        s.push(l.layer_scale.map_or(0, |v| v.to_bits() as usize + 1));
     }
     s
 }
@@ -1097,8 +1127,15 @@ fn build(
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
     for (li, l) in layers.iter().enumerate() {
-        if l.mhc.is_some() || l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some() {
-            return Err(format!("layer {li}: mHC streams, sandwich norms or a layer scale"));
+        if l.mhc.is_some() {
+            return Err(format!("layer {li}: mHC streams"));
+        }
+        let sandwich = l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some();
+        if sandwich && !matches!(l.ffn, GraphFfn::Dense { .. }) {
+            return Err(format!("layer {li}: sandwich norms beside a routed FFN"));
+        }
+        if l.attn_out_norm.is_some_and(|w| w.len() != hidden) || l.ffn_out_norm.is_some_and(|w| w.len() != hidden) {
+            return Err(format!("layer {li}: sandwich norm width"));
         }
         if l.input_norm.len() != hidden || l.post_norm.len() != hidden {
             return Err(format!("layer {li}: norm width"));
@@ -1176,6 +1213,8 @@ fn build(
     let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
+    // a sandwich-normed product's rows before their norm
+    let yo = f4(NMAX * hidden)?;
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
     let moe_bufs = if moe_e > 0 {
         let smax = (NMAX * moe_k).min(moe_e);
@@ -1377,7 +1416,10 @@ fn build(
                 let a_h = half_of(&am, st)?;
                 let b_h = half_of(&bm, st)?;
                 let ms_in = mmaset(&[(&qm, qkv.ptr, 0, cdmax, cdim), (&zm, z.ptr, 0, vdmax, nv * dv)])?;
-                let ms_out = mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?;
+                let ms_out = match l.attn_out_norm {
+                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
                 Mix::Gdn(GdnL {
                     qkv: qm,
                     z: zm,
@@ -1438,7 +1480,10 @@ fn build(
                     (&km, k.ptr, 0, nkv * hd, nkv * hd),
                     (&vm, v.ptr, 0, nkv * hd, nkv * hd),
                 ])?;
-                let ms_out = mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?;
+                let ms_out = match l.attn_out_norm {
+                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
                 Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, ms_in, ms_out })
             }
             _ => unreachable!(),
@@ -1447,23 +1492,57 @@ fn build(
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
+            _ if l.ffn_out_norm.is_some() => mmaset(&[(&dm, yo.ptr, 0, hidden, hidden)])?,
             _ => mmaset(&[(&dm, h.ptr, h.ptr, hidden, hidden)])?,
         };
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn, moe });
+        let mut sw = |w: Option<&[f32]>, st: &mut State| -> Res<Option<Arc<Buf>>> {
+            match w {
+                Some(w) => {
+                    note(w);
+                    Ok(Some(st.f32_buf(w)?))
+                }
+                None => Ok(None),
+            }
+        };
+        let attn_out = sw(l.attn_out_norm, st)?;
+        let ffn_out = sw(l.ffn_out_norm, st)?;
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
     let (lm, logits, final_norm_buf) = match lm {
         Some((gw, rows)) => {
-            let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
-            if rows == 0 || rows > m.rows {
-                return Err(format!("head of {rows} rows over a {}-row matrix", m.rows));
-            }
             if final_norm.len() != hidden {
                 return Err("final norm width".into());
             }
-            // (in the signature by content: no pointer of it is kept)
             let logits = f4(NMAX * rows)?;
-            let js = mmaset(&[(&m, logits.ptr, 0, rows, rows)])?;
-            (Some((m, rows, js)), logits, Some(st.f32_buf(final_norm)?))
+            let head = if gw.kind == 6 {
+                let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
+                if rows == 0 || rows > m.rows {
+                    return Err(format!("head of {rows} rows over a {}-row matrix", m.rows));
+                }
+                let js = mmaset(&[(&m, logits.ptr, 0, rows, rows)])?;
+                Head::Mma(m, rows, js)
+            } else {
+                // a q8_2f (or f32) head: the dense arm's matrix and matvec
+                let full = model.tensors.get(gw.idx).and_then(|e| e.shape.first().copied()).ok_or("head shape")?;
+                if rows == 0 || rows > full || super::mv_shared_bytes(hidden) > c.max_shared {
+                    return Err(format!("head of {rows} rows over a {full}-row matrix"));
+                }
+                let m = st.mat(c, model, gw, full, hidden)?;
+                let mut tabs = Vec::with_capacity(NMAX);
+                let mut blk = 0u32;
+                for r in 0..NMAX {
+                    let (mut jobs, mut b) = (Vec::new(), 0u32);
+                    super::push_job(&mut jobs, &mut b, &m, logits.ptr + (r * rows * 4) as u64, 0);
+                    // only the head's first `rows` rows (a trimmed vocabulary)
+                    jobs[0].rows = rows as i32;
+                    b = rows.div_ceil(jobs[0].rpb as usize) as u32;
+                    blk = b;
+                    tabs.push(Buf::from_slice(&jobs)?);
+                }
+                Head::Dense(m, rows, tabs, blk)
+            };
+            // (in the signature by content: no pointer of it is kept)
+            (Some(head), logits, Some(st.f32_buf(final_norm)?))
         }
         None => (None, f4(1)?, None),
     };
@@ -1513,6 +1592,7 @@ fn build(
         vdmax,
         nvmax,
         moe: moe_bufs,
+        yo,
     })
 }
 
@@ -2138,6 +2218,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     )?;
                     hst(c, 2, &mut t0)?;
                     g.ms_out.run(c, fx, planes, cols, n)?;
+                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 3, &mut t0)?;
                 }
             }
@@ -2227,6 +2308,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     )?;
                     hst(c, 5, &mut t0)?;
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 6, &mut t0)?;
                 }
             }
@@ -2252,6 +2334,11 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             hst(c, 7, &mut t0)?;
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
             pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
+            sandwich_add(c, fx, plan, pl.ffn_out.as_deref(), n)?;
+            if let Some(s) = pl.layer_scale {
+                let tot = (n * hidden) as u64;
+                c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.h.ptr, s, tot))?;
+            }
             if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
                 // the mixture and the shared expert into the stream
                 let s_n = (n * m.k).min(m.e).min(mb.smax);
@@ -2274,6 +2361,14 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
     }
     Ok(())
+}
+
+/// A sandwich norm's add: the product's rows in `yo`, normed with `w`, onto
+/// the stream (nothing without a norm: the product went to the stream).
+unsafe fn sandwich_add(c: &Ctx, fx: &HFuncs, plan: &HPlan, w: Option<&Buf>, n: usize) -> Res<()> {
+    let Some(w) = w else { return Ok(()) };
+    let (hi, gi) = (plan.hidden as i32, plan.gemma as i32);
+    unsafe { c.launch(fx.norm_add, (n as u32, 1), 256, 0, kargs!(plan.h.ptr, plan.yo.ptr, w.ptr, hi, plan.eps, gi)) }
 }
 
 /// A routed FFN's experts for the call's `n` rows: the router's logits (and
@@ -2386,7 +2481,7 @@ unsafe fn run_small(
     taps: &[(usize, u64)],
 ) -> Res<usize> {
     let bk = book(c, st, plan, kv_id, layer_base, pos0, n, tape, kcap, sealed)?;
-    let rows = plan.lm.as_ref().map_or(0, |l| l.1);
+    let rows = plan.lm.as_ref().map_or(0, |l| l.rows());
     unsafe {
         if !bk.ci.is_empty() {
             cu::memcpy_htod_async(plan.ci.ptr, &bk.ci, c.stream).map_err(derr)?;
@@ -2464,11 +2559,25 @@ unsafe fn taps_read(c: &Ctx, slots: &[(usize, u64)], n: usize, hidden: usize) ->
 
 /// The head over the rows in `plan.h`: logits [n][rows] into `plan.logits`.
 unsafe fn head_launch(c: &Ctx, plan: &HPlan, n: usize) -> Res<usize> {
-    let Some((_, rows, js)) = &plan.lm else { return Ok(0) };
+    let Some(head) = &plan.lm else { return Ok(0) };
     let fx = &plan.fx;
     let (hid_i, eps, gemma_i) = (plan.hidden as i32, plan.eps, plan.gemma as i32);
     let fnorm = plan.final_norm.as_ref().unwrap().ptr;
     let mut t0 = std::time::Instant::now();
+    let (rows, js) = match head {
+        Head::Mma(_, rows, js) => (rows, js),
+        Head::Dense(_, rows, jobs, blk) => {
+            let (nullp, no_act) = (0u64, -1i32);
+            for (r, jt) in jobs.iter().enumerate().take(n) {
+                let x = plan.h.ptr + (r * plan.hidden * 4) as u64;
+                unsafe {
+                    c.launch(c.f.mv_multi, (*blk, 1), 256, super::mv_shared_bytes(plan.hidden), kargs!(jt.ptr, 1i32, x, nullp, no_act, fnorm, eps, gemma_i, hid_i))?;
+                }
+            }
+            hst(c, 10, &mut t0)?;
+            return Ok(*rows);
+        }
+    };
     let planes = Planes { p0: plan.pp[0].ptr, p1: plan.pp[1].ptr, p2: plan.pp[2].ptr, stride: plan.pstride };
     let (pp0, pp1, pp2, ps_i, nullp) = (planes.p0, planes.p1, planes.p2, plan.pstride as i32, 0u64);
     unsafe {
@@ -2890,8 +2999,10 @@ pub(super) fn batch(
     };
     // a routed FFN runs on the small path only (its rows' experts as slots):
     // a longer prompt goes through it NMAX rows at a time
-    let moe = plan.layers.iter().any(|l| l.moe.is_some());
-    // CMF_HYB_MOE_CHUNKS=0: a long routed prompt declines (the per-op path)
+    // what the prompt path has no kernels for (a routed FFN, sandwich norms, a
+    // layer scale) runs the small path
+    let moe = plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some());
+    // CMF_HYB_MOE_CHUNKS=0: such a long prompt declines (the per-op path)
     let chunks_on = std::env::var("CMF_HYB_MOE_CHUNKS").as_deref() != Ok("0");
     if moe && (prompt_far || (b > NMAX && (spec.is_some() || !chunks_on))) {
         decline("hybrid batch", "a routed FFN past a seal or in a long verify window");
@@ -3176,8 +3287,8 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    if plan.layers.iter().any(|l| l.moe.is_some()) {
-        return Err("a routed FFN on the prompt path".into());
+    if plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some()) {
+        return Err("a routed FFN or sandwich norms on the prompt path".into());
     }
     let (gw, _) = prec();
     if gw != Gemm::Half {

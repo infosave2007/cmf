@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.89] — 2026-11-13
+
+### Added
+- The CUDA hybrid arm takes a vocabulary head in a codec its tensor-core kernels do not read (a q8_2f
+  `lm_head`, or the tied q8_2f embedding): the dense arm's matrix and `mv_multi`, a launch a row with the
+  final norm folded into the staging. MiniCPM-V-4.7-1B and MiniCPM-OCR-1.0, which declined on their head and
+  ran per op (38.7 and 56.1 tok/s), now run the whole token on the card. RTX A5000, release build, 64 tokens:
+  MiniCPM-V-4.7-1B 280.6-330.6 tok/s (Vulkan on the same card 117.6-174.7), MiniCPM-OCR-1.0 276.9-321.4
+  (Vulkan 125.1-153.6), the greedy text identical to Vulkan's.
+- The hybrid arm accepts Gemma's sandwich norms (the mixer's and the FFN's outputs RMS-normed before their
+  residual adds, `hy_norm_add`) and the layer scalar (`hy_scale`); such a stack's long prompt runs through the
+  small path 16 rows at a time. The models that carry them still decline on another part: LFM3 and d1 on
+  their short-convolution mixer, Gemma-4 (humanizer) on its per-layer attention geometry.
+- The arm's decline messages name the tensor of a codec it has no kernel for, and mHC streams, sandwich norms
+  and a layer scale apart.
+
 ## [0.8.88] — 2026-11-13
 
 ### Added
