@@ -224,7 +224,10 @@ pub(crate) fn build_ffn_at(
                 down_proj.cols()
             )));
         }
-        if down_proj.rows() != arch.hidden_size {
+        // a latent MoE's routed experts (Edge0) work in the latent width
+        let latent = arch.qwen4_exp.as_ref().and_then(|q| q.latent_dim);
+        let latent_expert = p.contains(".mlp.experts.") && latent == Some(down_proj.rows()) && gate_proj.cols() == down_proj.rows();
+        if down_proj.rows() != arch.hidden_size && !latent_expert {
             return Err(CmfError::Parse(format!(
                 "{p}: down_proj.rows={} != hidden_size={}",
                 down_proj.rows(),

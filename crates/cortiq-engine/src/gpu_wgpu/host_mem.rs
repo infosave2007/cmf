@@ -58,6 +58,23 @@ impl SysBuf {
 /// refuses.
 #[cfg(target_os = "linux")]
 pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<SysBuf> {
+    sysmem_buffer_with(device, size, cached, false)
+}
+
+/// [`sysmem_buffer`] that a shader may also bind (`STORAGE`): weights the card's memory has no room for stay
+/// in system RAM and the kernels read them over the bus.
+#[cfg(target_os = "linux")]
+pub fn sysmem_storage_buffer(device: &wgpu::Device, size: u64) -> Option<SysBuf> {
+    sysmem_buffer_with(device, size, true, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sysmem_storage_buffer(_device: &wgpu::Device, _size: u64) -> Option<SysBuf> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sysmem_buffer_with(device: &wgpu::Device, size: u64, cached: bool, storage: bool) -> Option<SysBuf> {
     use ash::vk;
     if size == 0 || size > device.limits().max_buffer_size {
         return None;
@@ -73,7 +90,11 @@ pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<S
             .get_physical_device_memory_properties(hal.raw_physical_device());
         let info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .usage(
+                vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | if storage { vk::BufferUsageFlags::STORAGE_BUFFER } else { vk::BufferUsageFlags::empty() },
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buf = raw.create_buffer(&info, None).ok()?;
         let req = raw.get_buffer_memory_requirements(buf);
@@ -119,7 +140,9 @@ pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<S
             &wgpu::BufferDescriptor {
                 label: Some("cortiq-sysmem"),
                 size,
-                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST
+                    | if storage { wgpu::BufferUsages::STORAGE } else { wgpu::BufferUsages::empty() },
                 mapped_at_creation: false,
             },
         );

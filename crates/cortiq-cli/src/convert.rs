@@ -8306,6 +8306,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 .unwrap_or(128),
             split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
+            latent_dim: None,
+            latent_groups: None,
         }),
         block_diffusion: None,
         dory: None,

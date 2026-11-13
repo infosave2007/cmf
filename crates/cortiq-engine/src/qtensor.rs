@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `mxfp4` (OCP MX FP4) CPU kernels.
 mod mxfp4;
+/// `nvfp4` (NVIDIA NVFP4) CPU kernels.
+mod nvfp4;
 
 /// Whole q4tp experts on the host's cores (AVX-512 VNNI): the misses of a
 /// card's expert arena.
@@ -376,6 +378,19 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // nvfp4: E2M1 codes + UE4M3 scales + tensor factor straight from
+            // the mmap (`qtensor::nvfp4`).
+            TensorDtype::Nvfp4 if cols % cortiq_core::nvfp4::GROUP == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
             // q1t (ternary + outlier overlay): fused per-row dequant kernel
             // reads straight from mmap — a 12B q1t stays ~its file size in
             // RAM instead of dequantizing to ~48 GB of f32.
@@ -424,10 +439,22 @@ impl QTensor {
         )
     }
 
+    /// Memory-mapped `nvfp4` tensor? No row-range kernel in the fused
+    /// multi-tensor jobs either.
+    pub fn is_nvfp4(&self) -> bool {
+        matches!(
+            self,
+            Self::Mapped {
+                dtype: TensorDtype::Nvfp4,
+                ..
+            }
+        )
+    }
+
     /// Codecs the fused multi-tensor jobs (`matvec_many`, the SwiGLU and
     /// MoE row kernels) do not carry: they fall back to per-tensor calls.
     fn per_tensor_only(&self) -> bool {
-        self.is_blr() || self.is_mxfp4()
+        self.is_blr() || self.is_mxfp4() || self.is_nvfp4()
     }
 
     /// (model, idx) of a `blr` tensor, for the wgpu graphs only (their
@@ -1053,6 +1080,10 @@ impl QTensor {
                     }
                     return;
                 }
+                if *dtype == TensorDtype::Nvfp4 {
+                    nvfp4::Nv::new(self.quant_bytes(), self.rows(), cols).row_f32(r, dst);
+                    return;
+                }
                 if *dtype == TensorDtype::Q1 {
                     let bytes = self.quant_bytes();
                     let gpr = cols / GROUP_SIZE;
@@ -1548,6 +1579,9 @@ impl QTensor {
                         TensorDtype::Mxfp4 => {
                             mxfp4::matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
                         }
+                        TensorDtype::Nvfp4 => {
+                            nvfp4::matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
                         TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatvec(
                             self.quant_bytes(),
                             vbit_offsets,
@@ -1664,6 +1698,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Mxfp4 {
                     self.mxfp4_matvec(x, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Nvfp4 {
+                    nvfp4::matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1 || *dtype == TensorDtype::Q1G {
@@ -1954,6 +1992,16 @@ impl QTensor {
                         TensorDtype::Q1T => {
                             q1t_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
                         }
+                        TensorDtype::Nvfp4 => nvfp4::matvec2(
+                            self.quant_bytes(),
+                            &tx1,
+                            &tx2,
+                            *rows,
+                            *cols,
+                            o1,
+                            o2,
+                            pool,
+                        ),
                         TensorDtype::Mxfp4 => mxfp4::matvec2(
                             self.quant_bytes(),
                             &tx1,
@@ -2010,6 +2058,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Mxfp4 {
                     mxfp4::matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Nvfp4 {
+                    nvfp4::matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if let Some(w) = self.bin_w() {
@@ -2306,6 +2358,9 @@ impl QTensor {
                         TensorDtype::Mxfp4 => {
                             mxfp4::matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
                         }
+                        TensorDtype::Nvfp4 => {
+                            nvfp4::matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
                         TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatmat(
                             self.quant_bytes(),
                             vbit_offsets,
@@ -2338,6 +2393,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Mxfp4 {
                     self.mxfp4_matmat(xs_all, b, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Nvfp4 {
+                    nvfp4::matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q4TiledP {
@@ -4548,6 +4607,41 @@ impl QTensor {
             let _ = (knob, value);
             0
         }
+    }
+
+    /// Latent (Edge0) experts on the host: expert `i` = `experts[i]` (gate, up `[ff, cols]`, down
+    /// `[cols, ff]`, all `nvfp4` file tensors) takes the input rows `groups[i]` of `xs` (`[row][cols]`);
+    /// `out` gets one `[cols]` row per pair, expert after expert. False: a tensor is not `nvfp4` of
+    /// those shapes.
+    pub fn nvfp4_latent_rows(
+        experts: &[(&QTensor, &QTensor, &QTensor)],
+        groups: &[Vec<usize>],
+        xs: &[f32],
+        out: &mut [f32],
+        pool: Option<&Pool>,
+    ) -> bool {
+        let Some(&(g0, _, _)) = experts.first() else { return true };
+        let (ff, cols) = (g0.rows(), g0.cols());
+        let mut views = Vec::with_capacity(experts.len());
+        for &(g, u, d) in experts {
+            let ok = [g, u, d].iter().all(|t| t.is_nvfp4())
+                && g.rows() == ff
+                && u.rows() == ff
+                && g.cols() == cols
+                && u.cols() == cols
+                && d.rows() == cols
+                && d.cols() == ff;
+            if !ok {
+                return false;
+            }
+            views.push((g.quant_bytes(), u.quant_bytes(), d.quant_bytes()));
+        }
+        let pairs: usize = groups.iter().map(|g| g.len()).sum();
+        if out.len() < pairs * cols || groups.len() != experts.len() {
+            return false;
+        }
+        nvfp4::latent_rows(&views, ff, cols, groups, xs, out, pool);
+        true
     }
 
     /// Whether this host has the cores for [`QTensor::moe_expert_rows_fast`] (AVX-512 VNNI with the int8

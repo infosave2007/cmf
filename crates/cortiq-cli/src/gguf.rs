@@ -119,7 +119,7 @@ impl Val {
             _ => None,
         }
     }
-    fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Val::F64(v) => Some(*v),
             Val::U64(v) => Some(*v as f64),

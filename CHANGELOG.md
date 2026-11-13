@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.95] — 2026-11-13
+
+### Added
+- Edge0-145B and Edge0-120B (latent MoE on Qwen3.8-Flash-Next, Edge0's NVFP4 build) run from one CMF file each:
+  `cortiq edge0-import` copies the routed experts bit for bit into the new `nvfp4` tensor type (dtype 22: E2M1
+  codes, a UE4M3 scale per 16 values, an f32 scale per tensor) and takes the skeleton from a Qwen3.8-Flash-Next
+  CMF. The whole token runs on the card on CUDA and on Vulkan. One RTX PRO 6000 96 GB, drafts on: Edge0-145B on
+  CUDA reads a prompt at 3.6-5.3K tok/s and writes code at 162-175 tok/s (Vulkan 611-634 and 107-113);
+  Edge0-120B 4.2-5.9K and 149-188 tok/s (Vulkan 721-757 and 108-122). HumanEval pass@1 94.5 % and 93.3 %.
+- CUDA: a latent model's prompt chunks run their experts as grouped GEMMs straight from the NVFP4 slots (codes
+  and scales decoded in registers into exact f16 for the tensor cores, no dense copy of the weights), and the
+  GDN scan splits a state column over eight lanes.
+- CUDA: a card that does not hold every latent expert keeps the hottest by a routing profile (`<model>.profile`
+  beside the file, or `CMF_QWEN_PROFILE`) and leaves the rest in the mapped file: a decode step computes those
+  on the host's cores (an AVX-512 VNNI NVFP4 kernel) while the card runs its own, a prompt chunk carries them up
+  in batches. The same RTX PRO 6000 limited to 32 / 24 / 16 / 12 GB: Edge0-145B writes code at 102-110 / 78-81 /
+  50 / 34-36 tok/s, Edge0-120B at 130-145 / 100-118 / 71-73 / 40-42. `CMF_QWEN_LAT_PROFILE_SAVE=<path>` records
+  a profile.
+- Vulkan: the expert banks of the layers a card has no room for stay in host-visible system memory and the
+  kernels read them over the bus (Linux). Edge0-145B within 24 GB: 35 tok/s of code, 25 tok/s of prompt.
+
 ## [0.8.94] — 2026-11-13
 
 ### Added
