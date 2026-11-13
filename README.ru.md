@@ -123,6 +123,16 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Привет"}]}'
 ```
 
+## Primal VAE на CUDA (0.8.84)
+
+[Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) теперь кодирует и декодирует и на CUDA, весь проход одним
+запуском на карте; раньше при `CMF_GPU=cuda` он шёл на хосте. На RTX A5000 картинка 1024×1024 кодируется за 0,25 с
+и декодируется за 0,12 с (на хосте 13,3 и 12,9 с):
+
+```sh
+CMF_GPU=cuda cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
 ## Z-Image на CUDA (0.8.83)
 
 [Z-Image-Turbo](https://huggingface.co/infosave/Z-Image-Turbo-cmf) и [Z-Image](https://huggingface.co/infosave/Z-Image-cmf)

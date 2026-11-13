@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.84] — 2026-11-13
+
+### Added
+- Primal VAE ([the files](https://huggingface.co/infosave/primal_vae-cmf), `cortiq vae`) runs on CUDA: a
+  `primal_vae::PvPlan` (encode or decode) whole on the card, as the Metal and Vulkan modules run it
+  (`gpu_cuda/primal.rs`, `primal.cu`): one upload, the steps, one readback. A 3×3 convolution is an im2col with
+  its dilation into f16 and an f16 product with the residual as its accumulator; the RMS norm with SiLU and pixel
+  (un)shuffle are kernels of their own; the weights go up as f16 once per model. Before, `CMF_GPU=cuda` ran the
+  forward on the host. RTX A5000, release build, `primal_vae_2x2`, 1024 x 1024 encode / decode: 0.25 s / 0.12 s
+  (host 13.3 s / 12.9 s; Vulkan on the same card 0.70 s / 0.33 s), 512 x 512 0.13 s / 0.04 s, the round trip's PSNR the same as
+  the host's and Vulkan's. `CMF_PRIMAL_VAE_CUDA=0` keeps the host steps.
+
 ## [0.8.83] — 2026-11-13
 
 ### Added
