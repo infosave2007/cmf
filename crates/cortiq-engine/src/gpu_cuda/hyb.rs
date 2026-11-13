@@ -151,6 +151,7 @@ pub(super) struct HFuncs {
     mmp: [[[cs::CUfunction; 2]; 2]; 2],
     /// The grouped experts' launches: `hy_mmp_4_2_8` (32 rows a job), `hy_mmp_8_1_8` (64).
     mmp_g: [cs::CUfunction; 2],
+
     split: cs::CUfunction,
     expand_p: cs::CUfunction,
     rmsnorm: cs::CUfunction,
@@ -173,6 +174,8 @@ pub(super) struct HFuncs {
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
+    repack1: cs::CUfunction,
+    expand_q1: cs::CUfunction,
     qk: cs::CUfunction,
     scores: cs::CUfunction,
     values: cs::CUfunction,
@@ -218,6 +221,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     Ok(HFuncs {
         mmp,
         mmp_g: [func(module, "hy_mmp_4_2_8")?, func(module, "hy_mmp_8_1_8")?],
+
         moe_topk: func(module, "hy_moe_topk")?,
         moe_group: func(module, "hy_moe_group")?,
         moe_gather: func(module, "hy_moe_gather")?,
@@ -244,6 +248,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
+        repack1: func(module, "hy_repack1")?,
+        expand_q1: func(module, "hy_expand_q1r")?,
         qk: func(module, "hy_qk")?,
         scores: func(module, "hy_scores")?,
         values: func(module, "hy_values")?,
@@ -308,8 +314,8 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
 }
 
 fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
-    if list.iter().any(|(m, ..)| !matches!(m.kind, 5 | 6) || m.cols % 32 != 0) {
-        return Err("a tensor-core job over a matrix that is not repacked (q4tp or int8 tiles)".into());
+    if list.iter().any(|(m, ..)| !matches!(m.kind, 3 | 5 | 6) || m.cols % 32 != 0) {
+        return Err("a tensor-core job over a matrix that is not repacked (q4tp, int8 or q1 tiles)".into());
     }
     let max_rows = list.iter().map(|&(_, _, _, _, r)| r).max().unwrap_or(0);
     let mut bufs = Vec::with_capacity(2);
@@ -325,7 +331,7 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 y,
                 res,
                 rows: rows as i32,
-                // the codec from the matrix (q4tp 6, int8 tiles 5), the epilogue bits from the call
+                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3), the epilogue bits from the call
                 kind: (m.kind as i32) | (kind & !0xFF),
                 blk0: blk as i32,
                 ystride: ystride as i32,
@@ -723,6 +729,46 @@ fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)],
     Ok((all, rsb, cfb))
 }
 
+/// Where a q1-tile matrix's scales sit in its one allocation: (scales at,
+/// bytes in all).
+fn q1_layout(rows: usize, cols: usize) -> (usize, usize) {
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let s_at = (tg * 64).next_multiple_of(256);
+    (s_at, (s_at + tg * 32 + 64).next_multiple_of(256))
+}
+
+/// q1 matrices (one, or a gate/up pair laid out as `hy_repack` lays a q4tp
+/// pair) as q1 tiles of the tensor-core kernel (kind 3, `hy_repack1`): the
+/// payloads go to the card and are tiled there. (tiles, scales) in one
+/// allocation.
+fn repack1_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize) -> Res<(Buf, Buf)> {
+    if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
+        return Err("repack: a q1 matrix (or a pair) 32 columns wide".into());
+    }
+    let need = src_rows * (cols / 32) * cortiq_core::quant::Q1_TILE;
+    if srcs.iter().any(|b| b.len() < need) {
+        return Err("q1 payload shorter than its tiles".into());
+    }
+    let (s_at, bytes) = q1_layout(rows, cols);
+    let all = match arena_view(bytes) {
+        Some(v) => v,
+        None => Buf::new(bytes)?,
+    };
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let sv = all.view(s_at, tg * 32);
+    let a = Buf::from_slice(&srcs[0][..need])?;
+    let b = if srcs.len() == 2 { Some(Buf::from_slice(&srcs[1][..need])?) } else { None };
+    let b_p = b.as_ref().map_or(a.ptr, |x| x.ptr);
+    let (pair_i, rows_i, cols_i) = (b.is_some() as i32, rows as i32, cols as i32);
+    let threads = (tg * 32) as u64;
+    unsafe {
+        c.launch(fx.repack1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(a.ptr, b_p, pair_i, all.ptr, sv.ptr, rows_i, cols_i))?;
+    }
+    // the payloads are freed on return
+    c.sync()?;
+    Ok((all, sv))
+}
+
 /// Plan-build time spent repacking and uploading weights (ns).
 static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -747,7 +793,8 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     // the codec from the file (MoE experts come with a nominal kind)
     let dtype = model.tensors.get(gw.idx).map(|e| e.dtype);
     let q8 = matches!(dtype, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
-    if dtype != Some(TensorDtype::Q4TiledP) && !q8 {
+    let q1 = dtype == Some(TensorDtype::Q1);
+    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 {
         let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
         return Err(format!("weight codec {dtype:?} has no hybrid kernel ({name})"));
     }
@@ -779,6 +826,9 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     let m = if q8 {
         let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(entry.dtype, bytes, rows, cols)?], rows, cols)?;
         DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+    } else if q1 {
+        let (w, s) = repack1_on_card(c, &fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else {
         let (w, aux0, aux1) = repack_on_card(c, &fx, &[bytes], rows, rows, cols)?;
         DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 }
@@ -801,8 +851,9 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let q8 = |d: Option<TensorDtype>| matches!(d, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
     let (dg, du) = (dt(gw), dt(uw));
     let both8 = q8(dg) && q8(du);
-    if !(both8 || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
-        return Err(format!("a gate/up pair of one codec (q4tp or int8) with rows a multiple of 8, not {dg:?} / {du:?}"));
+    let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
+    if !(both8 || both1 || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
+        return Err(format!("a gate/up pair of one codec (q4tp, int8 or q1) with rows a multiple of 8, not {dg:?} / {du:?}"));
     }
     let key = (model.uid(), gw.idx, uw.idx);
     if let Some(m) = st.hyb.pairs.get(&key) {
@@ -827,6 +878,9 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let m = if both8 {
         let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
         DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+    } else if both1 {
+        let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else {
         let (w, aux0, aux1) = repack_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: (gb.len() + ub.len()) as u64 }
@@ -1429,6 +1483,7 @@ fn build(
     // the q4tp matrices this plan uploads, in one arena
     let uid = model.uid();
     let q6 = |w: &GraphW| w.kind == 6 && w.prism == crate::gpu::GraphPrismOp::None && !w.affine;
+    let is1 = |w: &GraphW| w.prism == crate::gpu::GraphPrismOp::None && !w.affine && model.tensors.get(w.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1);
     let is8 = |w: &GraphW| {
         w.prism == crate::gpu::GraphPrismOp::None
             && !w.affine
@@ -1437,7 +1492,7 @@ fn build(
     let mut need = 0usize;
     for l in layers {
         let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
-            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if q6(gw) && q6(uw) && q6(dw) => {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) => {
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
             }
             GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
@@ -1454,12 +1509,16 @@ fn build(
             }
             _ => Vec::new(),
         };
+        let sized = |idx: usize, rows: usize, cols: usize| match model.tensors.get(idx).map(|e| e.dtype) {
+            Some(cortiq_core::TensorDtype::Q1) => q1_layout(rows, cols).1,
+            _ => planes_bytes(rows, cols),
+        };
         for (g, u, d, inter) in ffn {
             if !st.hyb.pairs.contains_key(&(uid, g, u)) {
-                need += planes_bytes(2 * inter, hidden);
+                need += sized(g, 2 * inter, hidden);
             }
             if !st.hyb.mats.contains_key(&(uid, d)) {
-                need += planes_bytes(hidden, inter);
+                need += sized(d, hidden, inter);
             }
         }
         let mut one = |w: &GraphW, rows: usize, cols: usize| {
@@ -1468,6 +1527,8 @@ fn build(
             }
             if is8(w) {
                 need += i8_layout(rows, cols).2;
+            } else if is1(w) {
+                need += q1_layout(rows, cols).1;
             } else if q6(w) {
                 need += planes_bytes(rows, cols);
             }
@@ -1494,6 +1555,8 @@ fn build(
     if let Some((gw, rows)) = lm {
         if q6(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
             need += planes_bytes(rows, hidden);
+        } else if is1(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
+            need += q1_layout(rows_of(model, gw).unwrap_or(rows), hidden).1;
         }
     }
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
@@ -1756,7 +1819,8 @@ fn build(
                 return Err("final norm width".into());
             }
             let logits = f4(NMAX * rows)?;
-            let head = if gw.kind == 6 {
+            let head_q1 = model.tensors.get(gw.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1);
+            let head = if gw.kind == 6 || head_q1 {
                 let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
                 if rows == 0 || rows > m.rows {
                     return Err(format!("head of {rows} rows over a {}-row matrix", m.rows));
@@ -3785,8 +3849,8 @@ unsafe fn big(
     let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
-        if !matches!(m.kind, 5 | 6) {
-            return Err("a weight other than repacked q4tp or int8 tiles on the prompt path".into());
+        if !matches!(m.kind, 3 | 5 | 6) {
+            return Err("a weight other than repacked q4tp, int8 or q1 tiles on the prompt path".into());
         }
         if m.kind == 6 && m.rows * m.cols <= wd_rows {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
@@ -3807,7 +3871,9 @@ unsafe fn big(
             let threads = (nt * (m.cols / 32) * 32) as u64;
             let (t0_i, nt_i) = (t0 as i32, nt as i32);
             unsafe {
-                if m.kind == 5 {
+                if m.kind == 3 {
+                    c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else if m.kind == 5 {
                     c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 } else {
                     c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
@@ -4574,6 +4640,90 @@ mod tests {
         assert_eq!(down::<u32>(c, &dn, hn.len()), hn, "pair nibbles");
         assert_eq!(down::<u8>(c, &dc, hc.len()), hc, "pair codes");
         assert_eq!(down::<f32>(c, &dl, hl.len()), hl, "pair params");
+    }
+
+    /// q1 matrices as q1 tiles: expanded back they are `dequant_q1`'s
+    /// values word for word (one matrix and a gate/up pair), and the
+    /// tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_q1_tiles_match_the_host() {
+        use cortiq_core::quant::{dequant_q1, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 23u64;
+        let q1 = |rows: usize, cols: usize, seed: &mut u64| -> Vec<u8> {
+            let mut b = Vec::with_capacity(rows * cols / 32 * 6);
+            for _ in 0..rows * cols / 32 {
+                b.extend(f32_to_f16(0.002 + (lcg(seed) % 1000) as f32 * 1e-5).to_le_bytes());
+                for _ in 0..4 {
+                    b.push(lcg(seed) as u8);
+                }
+            }
+            b
+        };
+        let host = |b: &[u8], rows: usize, cols: usize| -> Vec<f32> {
+            let mut w = vec![0f32; rows * cols];
+            dequant_q1(b, &mut w);
+            w
+        };
+        let expand = |t: &(Buf, Buf), rows: usize, cols: usize| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        for (rows, cols) in [(40usize, 512usize), (2048, 2048), (6144, 2048)] {
+            let b = q1(rows, cols, &mut seed);
+            let w = host(&b, rows, cols);
+            let t = repack1_on_card(c, &fx, &[&b], rows, rows, cols).unwrap();
+            let got = expand(&t, rows, cols);
+            for i in 0..rows * cols {
+                assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} at {},{}", i / cols, i % cols);
+            }
+            for n in [1usize, 11] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let dm = DevMat { kind: 3, rows, cols, held: 0, w: Arc::new(t.0.view(0, t.0.bytes)), aux0: Some(t.1.view(0, t.1.bytes)), aux1: None };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "{rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
+        let (inter, cols) = (24usize, 64usize);
+        let (g, u) = (q1(inter, cols, &mut seed), q1(inter, cols, &mut seed));
+        let (wg, wu) = (host(&g, inter, cols), host(&u, inter, cols));
+        let t = repack1_on_card(c, &fx, &[&g, &u], inter, 2 * inter, cols).unwrap();
+        let got = expand(&t, 2 * inter, cols);
+        for r in 0..2 * inter {
+            let (src, sr) = if (r & 15) >= 8 { (&wu, (r >> 4) * 8 + (r & 7)) } else { (&wg, (r >> 4) * 8 + (r & 7)) };
+            for k in 0..cols {
+                assert_eq!(got[r * cols + k], f32_to_f16(src[sr * cols + k]), "pair at {r},{k}");
+            }
+        }
     }
 
     /// int8 matrices (q8_2f with its column field, q8_row without) as int8
