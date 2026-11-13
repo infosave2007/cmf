@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logits of its own, `mhc_in` / `mhc_out`): a 4096-token prompt at 1393 tok/s against 464 on the small path's
   16-row chunks and Vulkan's 1335 (first token 2.94 s), a 450-token prompt's greedy text identical to the CPU's.
 
+- Unlimited-OCR's DASH attention on the CUDA hybrid arm (`hy_dash_route`, `hy_dash_close`, `hy_dash_attend`): the
+  rows rotated by their own angles and appended to the f16 mirror (`hy_qk` over the call's table), the router a
+  row (index rows, entmax-1.5 over the best 16 candidate blocks, the read set and its log priors), a closing
+  block's summary key, and the attend over the read set and the local window, on the token graph and the prompt
+  path; the host's candidate lists go up a call at a time. Unlimited-OCR-2 on an RTX A5000, one page: decode
+  327.9 tok/s against 50.8 before and Vulkan's 210.4, first token after the page's rows 1.1 s against 21.1 (Vulkan
+  2.5); the text the CPU's but for a box coordinate off by one, as Vulkan's.
+
 ### Changed
 - The CUDA hybrid arm's tensor-core matvec: a launch of its own for each codec (q4tp, int8, q1, ternary, q2tp,
   q4_tiled) whose loop carries none of the others' branches (the all-codec loop was some 540 instructions, and

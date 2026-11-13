@@ -175,6 +175,9 @@ pub(super) struct HFuncs {
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
     field_planes: cs::CUfunction,
+    dash_route: cs::CUfunction,
+    dash_close: cs::CUfunction,
+    dash_attend: cs::CUfunction,
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
@@ -274,6 +277,9 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         field_planes: func(module, "hy_field_planes")?,
+        dash_route: func(module, "hy_dash_route")?,
+        dash_close: func(module, "hy_dash_close")?,
+        dash_attend: func(module, "hy_dash_attend")?,
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
@@ -1303,6 +1309,55 @@ struct AttnL {
     fx: Arc<HFuncs>,
     ms_in: MmaSet,
     ms_out: MmaSet,
+    /// Unlimited-OCR's DASH router (the attend over its read set).
+    dash: Option<DashL>,
+}
+
+/// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
+/// the block summaries' head, and its constants.
+struct DashL {
+    w: Arc<Buf>,
+    qn: Arc<Buf>,
+    kn: Arc<Buf>,
+    hc: Arc<Buf>,
+    k: usize,
+    block: usize,
+    local_blocks: usize,
+    idx_scale: f32,
+    floor: f32,
+    sigma: f32,
+}
+
+/// Rows a DASH call takes (`gpu::DASH_CHUNK_MAX`), blocks a sequence holds.
+const DASH_ROWS: usize = crate::gpu::DASH_CHUNK_MAX;
+const DASH_BLOCKS: usize = 4096;
+
+/// A plan's DASH call buffers (the host's candidate lists, row offsets and
+/// rotation table of the call's rows, and its record: first position, block
+/// count), and the router's scratch; shared by the layers.
+struct DashBufs {
+    cands: Buf,
+    coff: Buf,
+    tab: Buf,
+    rec: Buf,
+    sc: Buf,
+    sel: Buf,
+    bias: Buf,
+}
+
+/// Can the DASH kernels hold this router (index width 128, a head of 128)?
+fn dash_admits(d: &crate::gpu::GraphDash<'_>, hidden: usize, hd: usize, rd: usize) -> bool {
+    d.q_norm.len() == 128
+        && d.k_norm.len() == 128
+        && d.head_cls.len() == 128
+        && d.qk_proj.len() == 256 * hidden
+        && hidden % 4 == 0
+        && hd == 128
+        && rd == hd
+        && d.block > 0
+        && d.block <= 64
+        && d.k <= 16
+        && d.block * d.k + d.block * d.local_blocks <= 512
 }
 
 enum Mix {
@@ -1446,6 +1501,7 @@ pub(super) struct HPlan {
     hdmax: usize,
     /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
     mhc: Option<MhcPlan>,
+    dash: Option<DashBufs>,
     /// A Looped Transformer: the layers after which the final norm is applied
     /// to the stream (`loop_norm_at`), and its weights.
     loop_norm: Vec<usize>,
@@ -1542,6 +1598,9 @@ pub(super) struct HState {
     graphs: HashMap<(u64, u64, usize, usize, bool, bool, u64), GraphRec>,
     plans: HashMap<(u64, usize, usize, bool), Arc<HPlan>>,
     gdn: HashMap<(u64, usize), GdnState>,
+    /// DASH layers' open blocks (three, the router's keys) and block
+    /// summaries, by sequence and layer.
+    dash: HashMap<(u64, usize), (Buf, Buf)>,
     /// The MTP draft chain's table and norms (`mtp_chain`).
     chain: Option<ChainRes>,
     /// Plan builds' weight arenas (the matrices in them are views).
@@ -1640,6 +1699,14 @@ fn hsig(
                 s.push(2);
                 if let Some(g) = geom {
                     s.extend([8, g.window.unwrap_or(0)]);
+                    // a DASH router: its weights (by address) and constants; the
+                    // call's candidates and angles go up a call at a time
+                    if let Some(d) = &g.dash {
+                        s.extend([9, d.block, d.k, d.local_blocks, d.idx_scale.to_bits() as usize, d.floor.to_bits() as usize, d.sigma.to_bits() as usize]);
+                        for w in [d.qk_proj, d.q_norm, d.k_norm, d.head_cls] {
+                            f(&mut s, w);
+                        }
+                    }
                 }
                 if let Some(g) = head_gate {
                     s.push(7);
@@ -1803,11 +1870,12 @@ fn build(
                         && g.rd % 2 == 0
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
                         && g.sink.is_none_or(|s| s.len() == nh)
-                        && g.dash.is_none()
+                        && g.dash.as_ref().is_none_or(|d| dash_admits(d, hidden, g.hd, g.rd) && g.window.is_none() && g.sink.is_none())
                         && g.vres.is_none()
                         && g.invf.len() >= g.rd / 2
                         && invf.len() >= rd / 2
-                        && ((g.rd == rd && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
+                        // a DASH layer rotates by its rows' own angles (the call's table)
+                        && (g.dash.is_some() || (g.rd == rd && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
                             // up to two more tables besides the call's: other layers'
                             // bases (local ones), a YaRN amplitude baked into the rows,
                             // a rotary width of the layer's own (flint: none on its
@@ -2212,6 +2280,7 @@ fn build(
                 };
                 let local = geom
                     .as_ref()
+                    .filter(|g| g.dash.is_none())
                     .filter(|g| g.invf.len() >= g.rd / 2 && !(g.rd == rd && invf.len() >= rd / 2 && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0))
                     .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..g.rd / 2] && *s == g.rope_scale))
                     .map_or(0, |i| i + 1);
@@ -2272,7 +2341,27 @@ fn build(
                     true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out })
+                let dash = match geom.as_ref().and_then(|g| g.dash.as_ref()) {
+                    Some(d) => {
+                        for w in [d.qk_proj, d.q_norm, d.k_norm, d.head_cls] {
+                            note(w);
+                        }
+                        Some(DashL {
+                            w: st.f32_buf(d.qk_proj)?,
+                            qn: st.f32_buf(d.q_norm)?,
+                            kn: st.f32_buf(d.k_norm)?,
+                            hc: st.f32_buf(d.head_cls)?,
+                            k: d.k,
+                            block: d.block,
+                            local_blocks: d.local_blocks,
+                            idx_scale: d.idx_scale,
+                            floor: d.floor,
+                            sigma: d.sigma,
+                        })
+                    }
+                    None => None,
+                };
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
                 let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
@@ -2382,6 +2471,7 @@ fn build(
     let pp = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     static PLAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. })).count();
+    let has_dash = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.dash.is_some()));
     Ok(HPlan {
         id: PLAN_ID.fetch_add(1, Ordering::Relaxed),
         ci: Buf::new(n_attn.max(1) * 8 * 4)?,
@@ -2400,6 +2490,20 @@ fn build(
         mhc: match mhc_geo {
             Some((ns, iters, pre_scale)) => Some(MhcPlan { ns, iters, pre_scale, r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
             None => None,
+        },
+        dash: if has_dash {
+            let cand = DASH_ROWS * DASH_BLOCKS;
+            Some(DashBufs {
+                cands: Buf::new(cand * 4)?,
+                coff: Buf::new((DASH_ROWS + 1) * 4)?,
+                tab: Buf::new(DASH_ROWS * 64 * 2 * 4)?,
+                rec: Buf::new(4 * 4)?,
+                sc: Buf::new(cand * 4)?,
+                sel: Buf::new(DASH_ROWS * 17 * 4)?,
+                bias: Buf::new(DASH_ROWS * 16 * 4)?,
+            })
+        } else {
+            None
         },
         own_geom: hdmax != hd || kvmax != nkv * hd,
         half,
@@ -2994,10 +3098,21 @@ fn book(
                 keys_max = keys_max.max(keys);
                 continue;
             }
-            Mix::Attn(_) => {
+            Mix::Attn(a) => {
+                // a DASH layer: its open blocks and block summaries beside the mirror
+                let (dopen, dbar) = match &a.dash {
+                    Some(dl) => {
+                        let e = match st.hyb.dash.entry(key) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(v) => v.insert((Buf::new(3 * dl.block * 128 * 4)?, Buf::new(DASH_BLOCKS * 128 * 4)?)),
+                        };
+                        (e.0.ptr, e.1.ptr)
+                    }
+                    None => (0, 0),
+                };
                 let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
                 let n0 = m.stored - m.base;
-                layers.push([m.kptr(), m.vptr(), 0, 0, 0, 0, 0]);
+                layers.push([m.kptr(), m.vptr(), dopen, dbar, 0, 0, 0]);
                 m.stored += n;
                 let keys = n0 + n;
                 let rb = attn_rb(keys);
@@ -3174,6 +3289,49 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
+                    if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
+                        // DASH: the rows rotated by their own angles and appended,
+                        // the router a row, the closing blocks' summaries, the
+                        // attend over the read set and the local window
+                        let (dopen, dbar) = (lb[2], lb[3]);
+                        c.launch(
+                            fx.qk,
+                            ((nh + nkv) as u32, n as u32),
+                            hd as u32,
+                            0,
+                            kargs!(
+                                plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
+                                db.tab.ptr, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
+                            ),
+                        )?;
+                        let (blk_i, k_i, win_i) = (dl.block as i32, dl.k as i32, (dl.block * dl.local_blocks) as i32);
+                        c.launch(
+                            fx.dash_route,
+                            (n as u32, 1),
+                            256,
+                            0,
+                            kargs!(
+                                plan.xn.ptr, hid_i, dl.w.ptr, dl.qn.ptr, dl.kn.ptr, db.tab.ptr, dopen, dbar, db.coff.ptr, db.cands.ptr,
+                                db.sc.ptr, db.sel.ptr, db.bias.ptr, db.rec.ptr, n_i, blk_i, k_i, eps, dl.idx_scale, dl.floor, dl.sigma
+                            ),
+                        )?;
+                        c.launch(fx.dash_close, (1, 1), 128, 0, kargs!(dopen, dl.hc.ptr, dbar, db.rec.ptr, n_i, blk_i))?;
+                        c.launch(
+                            fx.dash_attend,
+                            (nh as u32, n as u32),
+                            256,
+                            0,
+                            kargs!(
+                                plan.qg.ptr, kp, vp, db.sel.ptr, db.bias.ptr, gate_p, pp0, pp1, ps_i, nul16, db.rec.ptr, cip, slot0,
+                                nh_i, nkv_i, n_i, blk_i, win_i, plan.scale
+                            ),
+                        )?;
+                        hst(c, 5, &mut t0)?;
+                        prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
+                        a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                        sub_out(c, fx, plan, pl, false, n)?;
+                        hst(c, 6, &mut t0)?;
+                    } else {
                     if far == 2 {
                         let _ = hpk_l;
                         // the ring row this key replaces into the far sums,
@@ -3257,6 +3415,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
                     sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 6, &mut t0)?;
+                    }
                 }
             }
         }
@@ -3523,6 +3682,42 @@ thread_local! {
     static DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A DASH stack's call lists for rows [r0, r0 + n) of the call (its first
+/// row at `pos`): the candidates (the call's), those rows' offsets into them,
+/// their rotation table (sin and cos of the rows' angles, `hy_qk`'s rows) and
+/// the record (first position, the router's block count). Synchronous: the
+/// lists are the caller's.
+fn dash_upload(plan: &HPlan, layers: &[GraphLayer], pos: usize, r0: usize, n: usize) -> Res<()> {
+    let Some(db) = &plan.dash else { return Ok(()) };
+    let d = layers
+        .iter()
+        .find_map(|l| match &l.attn {
+            GraphAttn::Full { geom: Some(g), .. } => g.dash.as_ref(),
+            _ => None,
+        })
+        .ok_or("DASH layers without their router")?;
+    if n == 0
+        || n > DASH_ROWS
+        || d.coff.len() < r0 + n + 1
+        || d.cands.len() > DASH_ROWS * DASH_BLOCKS
+        || d.angles.len() < (r0 + n) * 64
+        || d.nblk > DASH_BLOCKS
+        || (pos + r0 + n) / d.block >= DASH_BLOCKS
+    {
+        return Err(format!("DASH lists of {n} rows past the kernels ({} candidates, {} blocks)", d.cands.len(), d.nblk));
+    }
+    let tab: Vec<f32> = d.angles[r0 * 64..(r0 + n) * 64].iter().flat_map(|&a| [a.sin(), a.cos()]).collect();
+    let rec = [(pos + r0) as i32, d.nblk as i32, 0, 0];
+    unsafe {
+        if !d.cands.is_empty() {
+            super::htod(db.cands.ptr, d.cands)?;
+        }
+        super::htod(db.coff.ptr, &d.coff[r0..r0 + n + 1])?;
+        super::htod(db.tab.ptr, &tab)?;
+        super::htod(db.rec.ptr, &rec)
+    }
+}
+
 /// The small path, with the head when `head`: book, then the launches —
 /// replayed from a recorded graph when one with the same pointers is there,
 /// else recorded now (or launched directly, `CMF_CUDA_GRAPH=0` and under
@@ -3758,6 +3953,7 @@ pub(super) fn token(
             }
             let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
             let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+            dash_upload(&plan, layers, position, 0, 1)?;
             let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed, tl)?;
             if taps.is_some() {
                 // a pageable read: the rows are there when it returns
@@ -4161,6 +4357,7 @@ pub(super) fn batch(
                     if !tab.is_empty() {
                         cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                     }
+                    dash_upload(&plan, layers, pos0, at, n)?;
                     run_small(c, &mut st, &plan, kv_id, layer_base, pos0 + at, n, false, false, cap, &sealed, &[])?;
                     if !defer {
                         cu::memcpy_dtoh_async(&mut h[at * hidden..(at + n) * hidden], plan.h.ptr, c.stream).map_err(derr)?;
@@ -4179,6 +4376,7 @@ pub(super) fn batch(
                 }
                 let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
                 let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+                dash_upload(&plan, layers, pos0, 0, b)?;
                 let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &sealed, tl)?;
                 if taps.is_some() {
                     super::taps_put(taps_read(c, tl, b, hidden)?);
@@ -4219,6 +4417,7 @@ pub(super) fn batch(
                 }
                 return Ok(());
             }
+            dash_upload(&plan, layers, pos0, 0, b)?;
             unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer, &sealed) }
         }
     };
@@ -4813,8 +5012,12 @@ unsafe fn big(
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
-                // a local layer's rotation rows follow the call's (`plan_tab`)
-                let tabl = btab + (plan.tab_off(a.local, b) * 4) as u64;
+                // a local layer's rotation rows follow the call's (`plan_tab`);
+                // a DASH layer's are its rows' own (`dash_upload`)
+                let tabl = match (&a.dash, &plan.dash) {
+                    (Some(_), Some(db)) => db.tab.ptr,
+                    _ => btab + (plan.tab_off(a.local, b) * 4) as u64,
+                };
                 unsafe {
                     c.launch(
                         fx.qk,
@@ -4846,6 +5049,41 @@ unsafe fn big(
                         });
                     }
                 }
+                if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
+                    // DASH: the router over the rows normed in f32, the closing
+                    // blocks' summaries, the attend over the read set into bao
+                    let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                    let (dopen, dbar) = match st.hyb.dash.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(e) => (e.get().0.ptr, e.get().1.ptr),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let e = v.insert((Buf::new(3 * dl.block * 128 * 4)?, Buf::new(DASH_BLOCKS * 128 * 4)?));
+                            (e.0.ptr, e.1.ptr)
+                        }
+                    };
+                    let (blk_i, k_i, win_i) = (dl.block as i32, dl.k as i32, (dl.block * dl.local_blocks) as i32);
+                    let gate_p = if a.gated { gt } else { 0u64 };
+                    unsafe {
+                        c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+                        c.launch(
+                            fx.dash_route,
+                            (b as u32, 1),
+                            256,
+                            0,
+                            kargs!(
+                                bx32, hid_i, dl.w.ptr, dl.qn.ptr, dl.kn.ptr, db.tab.ptr, dopen, dbar, db.coff.ptr, db.cands.ptr, db.sc.ptr,
+                                db.sel.ptr, db.bias.ptr, db.rec.ptr, b_i, blk_i, k_i, eps, dl.idx_scale, dl.floor, dl.sigma
+                            ),
+                        )?;
+                        c.launch(fx.dash_close, (1, 1), 128, 0, kargs!(dopen, dl.hc.ptr, dbar, db.rec.ptr, b_i, blk_i))?;
+                        c.launch(
+                            fx.dash_attend,
+                            (nh as u32, b as u32),
+                            256,
+                            0,
+                            kargs!(qg, kp, vp, db.sel.ptr, db.bias.ptr, gate_p, nul, nul, zero_i, bao, db.rec.ptr, nul, slot0, nh_i, nkv_i, b_i, blk_i, win_i, plan.scale),
+                        )?;
+                    }
+                } else {
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
@@ -4882,6 +5120,7 @@ unsafe fn big(
                 let gate_p = if a.gated { gt } else { 0u64 };
                 unsafe {
                     c.launch(fx.attn_out, (n_ao.div_ceil(256) as u32, 1), 256, 0, kargs!(aog, bis, gate_p, bao, nh_i, b_i, one))?;
+                }
                 }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };

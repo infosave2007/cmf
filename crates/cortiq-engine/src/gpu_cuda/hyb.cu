@@ -3015,3 +3015,312 @@ extern "C" __global__ void hy_mhc_merge(float* __restrict__ R, const float* __re
     }
     for (int i = 0; i < ns; i++) Rr[i * dim + e] = t[i];
 }
+
+// ------------------------------------------------------------------ DASH
+//
+// Unlimited-OCR's block-sparse attend (`gpu_wgpu/uocr.rs` has the semantics):
+// a router a row (its q and k index rows against the normed row, RMSNorm and
+// rotation, the key into its slot of the open block, the candidate blocks'
+// scores, entmax-1.5 over the best 16, the read set and its centered log
+// priors), a closing block's summary key, and the attend over the read set
+// and the local window from the mirror's f16 rows. Index width 128, blocks
+// of at most 64 rows, at most 16 blocks read, 512 rows a query. `rec`: the
+// call's first position and the router's block count (0: every block so far);
+// `tab`: the rows' rotation table (sin, cos a pair, `hy_qk`'s), 64 pairs a row.
+
+#define DASH_ACT 10000.0f
+#define DASH_NONE 0xffffffffu
+
+__device__ __forceinline__ float dash_clamp(float x) { return fminf(fmaxf(x, -DASH_ACT), DASH_ACT); }
+
+extern "C" __global__ void __launch_bounds__(256) hy_dash_route(
+    const float* __restrict__ xn, int hidden, const float* __restrict__ W, const float* __restrict__ qn,
+    const float* __restrict__ kn, const float* __restrict__ tab, float* __restrict__ open, const float* __restrict__ kbar,
+    const unsigned* __restrict__ coff, const unsigned* __restrict__ cands, float* __restrict__ sc,
+    unsigned* __restrict__ sel, float* __restrict__ sbias, const int* __restrict__ rec, int n, int block, int kk,
+    float eps, float idx_scale, float floor_, float sigma)
+{
+    const int row = blockIdx.x, lid = threadIdx.x, lane = lid & 31, warp = lid >> 5;
+    if (row >= n) return;
+    const int d = 128, half = 64;
+    const unsigned pos = (unsigned)(rec[0] + row);
+    __shared__ float rr[256];
+    __shared__ float qs[128];
+    __shared__ float red[8];
+    // lane lid: row lid of the router (the q rows, then the k rows) against x
+    {
+        const float4* x4 = (const float4*)(xn + (size_t)row * hidden);
+        const float4* w4 = (const float4*)(W + (size_t)lid * hidden);
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int c = 0; c < hidden / 4; c++) {
+            const float4 a = w4[c], b = x4[c];
+            acc.x = fmaf(a.x, b.x, acc.x);
+            acc.y = fmaf(a.y, b.y, acc.y);
+            acc.z = fmaf(a.z, b.z, acc.z);
+            acc.w = fmaf(a.w, b.w, acc.w);
+        }
+        rr[lid] = acc.x + acc.y + acc.z + acc.w;
+    }
+    // the two sums of squares: warps 0..3 (q), 4..7 (k)
+    float s2 = rr[lid] * rr[lid];
+    for (int o = 16; o > 0; o >>= 1) s2 += __shfl_xor_sync(FULL, s2, o);
+    if (lane == 0) red[warp] = s2;
+    __syncthreads();
+    const float inv_q = rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float)d + eps);
+    const float inv_k = rsqrtf((red[4] + red[5] + red[6] + red[7]) / (float)d + eps);
+    if (lid < half) {
+        const int j = lid;
+        const float s = tab[((size_t)row * half + j) * 2], c = tab[((size_t)row * half + j) * 2 + 1];
+        const float a = dash_clamp(dash_clamp(rr[j] * inv_q) * (1.0f + qn[j]));
+        const float b = dash_clamp(dash_clamp(rr[half + j] * inv_q) * (1.0f + qn[half + j]));
+        qs[j] = a * c - b * s;
+        qs[half + j] = b * c + a * s;
+    } else if (lid >= d && lid < d + half) {
+        const int j = lid - d;
+        const float s = tab[((size_t)row * half + j) * 2], c = tab[((size_t)row * half + j) * 2 + 1];
+        const float a = dash_clamp(dash_clamp(rr[d + j] * inv_k) * (1.0f + kn[j]));
+        const float b = dash_clamp(dash_clamp(rr[d + half + j] * inv_k) * (1.0f + kn[half + j]));
+        const size_t at = ((size_t)((pos / block) % 3u) * block + pos % block) * d;
+        open[at + j] = a * c - b * s;
+        open[at + half + j] = b * c + a * s;
+    }
+    __syncthreads();
+    const unsigned c0 = coff[row], ncand = coff[row + 1] - c0;
+    const float inv_sqrt = rsqrtf((float)d);
+    for (unsigned i = lid; i < ncand; i += 256) {
+        const float4* k4 = (const float4*)(kbar + (size_t)cands[c0 + i] * d);
+        const float4* q4 = (const float4*)qs;
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int e = 0; e < d / 4; e++) {
+            const float4 a = q4[e], b = k4[e];
+            acc.x = fmaf(a.x, b.x, acc.x);
+            acc.y = fmaf(a.y, b.y, acc.y);
+            acc.z = fmaf(a.z, b.z, acc.z);
+            acc.w = fmaf(a.w, b.w, acc.w);
+        }
+        sc[c0 + i] = dash_clamp((acc.x + acc.y + acc.z + acc.w) * inv_sqrt);
+    }
+    __syncthreads();
+    if (lid != 0) return;
+    float vals[16], taus[16], logp[16];
+    unsigned ids[16];
+    const unsigned nblk_ = rec[1] != 0 ? (unsigned)rec[1] : (pos + block) / block;
+    const unsigned m = min(max(min(16u, nblk_), 1u), 16u);
+    for (unsigned t = 0; t < m; t++) {
+        vals[t] = -10000.0f;
+        ids[t] = DASH_NONE;
+    }
+    unsigned cnt = 0;
+    for (unsigned t = 0; t < ncand; t++) {
+        const float x = sc[c0 + t] * idx_scale;
+        if (cnt == m && x <= vals[m - 1]) continue;
+        unsigned j = min(cnt, m - 1);
+        while (j != 0 && vals[j - 1] < x) {
+            vals[j] = vals[j - 1];
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        vals[j] = x;
+        ids[j] = cands[c0 + t];
+        cnt = min(cnt + 1, m);
+    }
+    unsigned count = 0;
+    if (cnt > 0) {
+        const float top = vals[0];
+        float sum = 0.0f, sum2 = 0.0f;
+        unsigned support = 0;
+        for (unsigned t = 0; t < m; t++) {
+            const float y = (vals[t] - top) / 2.0f;
+            sum += y;
+            sum2 += y * y;
+            const float rho = (float)(t + 1);
+            const float mean = sum / rho;
+            const float ss = rho * (sum2 / rho - mean * mean);
+            const float delta = fmaxf((1.0f - ss) / rho, 0.0f);
+            const float tau = mean - sqrtf(delta);
+            taus[t] = tau;
+            if (tau <= y) support++;
+        }
+        const float tau_star = taus[max(support, 1u) - 1];
+        const unsigned k = min(max(min((unsigned)kk, m), 1u), 16u);
+        float mu = 0.0f;
+        unsigned valid = 0;
+        for (unsigned t = 0; t < k; t++) {
+            const float y = (vals[t] - top) / 2.0f - tau_star;
+            logp[t] = logf(fmaxf(y > 0.0f ? y * y : 0.0f, floor_));
+            if (ids[t] != DASH_NONE) {
+                mu += logp[t];
+                valid++;
+            }
+        }
+        mu /= (float)max(valid, 1u);
+        for (unsigned t = 0; t < k; t++) {
+            if (ids[t] == DASH_NONE) continue;
+            sel[row * 17 + 1 + count] = ids[t];
+            sbias[row * 16 + count] = (logp[t] - mu) / sigma;
+            count++;
+        }
+    }
+    sel[row * 17] = count;
+}
+
+// The blocks closing in the call's rows: a block's keys against head_cls,
+// their softmax, the weighted mean key into kbar[block] (one block of 128).
+extern "C" __global__ void __launch_bounds__(128) hy_dash_close(const float* __restrict__ open, const float* __restrict__ hc,
+                                                                float* __restrict__ kbar, const int* __restrict__ rec, int n,
+                                                                int block)
+{
+    __shared__ float aw[64];
+    const int tid = threadIdx.x, d = 128;
+    const int pos0 = rec[0], end = pos0 + n;
+    const float inv_sqrt = rsqrtf((float)d);
+    for (int b = pos0 / block; b <= (end - 1) / block; b++) {
+        if ((b + 1) * block > end) break;
+        const size_t at = (size_t)(b % 3) * block;
+        if (tid < block) {
+            const float4* k4 = (const float4*)(open + (at + tid) * d);
+            const float4* h4 = (const float4*)hc;
+            float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int e = 0; e < d / 4; e++) {
+                const float4 a = k4[e], c = h4[e];
+                acc.x = fmaf(a.x, c.x, acc.x);
+                acc.y = fmaf(a.y, c.y, acc.y);
+                acc.z = fmaf(a.z, c.z, acc.z);
+                acc.w = fmaf(a.w, c.w, acc.w);
+            }
+            aw[tid] = dash_clamp((acc.x + acc.y + acc.z + acc.w) * inv_sqrt);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float mx = -1.0e30f;
+            for (int t = 0; t < block; t++) mx = fmaxf(mx, aw[t]);
+            float den = 0.0f;
+            for (int t = 0; t < block; t++) {
+                const float v = expf(aw[t] - mx);
+                aw[t] = v;
+                den += v;
+            }
+            den = 1.0f / fmaxf(den, 1.0e-6f);
+            for (int t = 0; t < block; t++) aw[t] *= den;
+        }
+        __syncthreads();
+        float acc = 0.0f;
+        for (int t = 0; t < block; t++) acc = fmaf(aw[t], open[(at + t) * d + tid], acc);
+        kbar[(size_t)b * d + tid] = acc;
+        __syncthreads();
+    }
+}
+
+// The attend of head h of row b (grid (nh, n), 256 threads) over the read set
+// and the local window: q from `hy_qk`'s layout [kv head][row][head of the
+// group][HD], K / V the mirror's f16 rows [slot][nkv][HD] (position r at slot
+// slot0 + r - pos0); the output (gated) into the planes, or f16 rows [n][nh][HD].
+extern "C" __global__ void __launch_bounds__(256) hy_dash_attend(
+    const float* __restrict__ qg, const u16* __restrict__ Km, const u16* __restrict__ Vm, const unsigned* __restrict__ sel,
+    const float* __restrict__ sbias, const float* __restrict__ gate, u16* __restrict__ p0, u16* __restrict__ p1, int pstride,
+    u16* __restrict__ oh, const int* __restrict__ rec, const int* __restrict__ ci, int slot0_, int nh, int nkv, int n, int block,
+    int window, float scale)
+{
+    const int h = blockIdx.x, row = blockIdx.y, lid = threadIdx.x;
+    if (h >= nh || row >= n) return;
+    const int hpk = nh / nkv, g = h / hpk, jh = h - g * hpk;
+    const int pos0 = rec[0], pos = pos0 + row;
+    const int slot0 = ci ? ci[1] : slot0_;
+    const unsigned* s = sel + row * 17;
+    const int remote = (int)s[0] * block, total = remote + window;
+    const int lo = max(pos + 1 - window, 0);
+    __shared__ float wsc[512];
+    __shared__ int wrow[512];
+    __shared__ float red[256];
+    __shared__ float4 vsum[256];
+    __shared__ float qsh[HD];
+    const float* q = qg + (((size_t)g * n + row) * hpk + jh) * HD;
+    for (int i = lid; i < HD; i += 256) qsh[i] = q[i];
+    __syncthreads();
+    float mym = -1.0e30f;
+    for (int part = 0; part < 2; part++) {
+        const int i = lid + part * 256;
+        int r = -1;
+        float bias = 0.0f;
+        if (i < remote) {
+            const int sb = i / block;
+            const int rr = (int)s[1 + sb] * block + i % block;
+            // the local window wins on overlap
+            if (rr < lo) {
+                r = rr;
+                bias = sbias[row * 16 + sb];
+            }
+        } else if (i < total) {
+            const int rr = lo + i - remote;
+            if (rr <= pos) r = rr;
+        }
+        wrow[i] = r;
+        if (r >= 0) {
+            const u16* kr = Km + ((size_t)(slot0 + r - pos0) * nkv + g) * HD;
+            float acc = 0.0f;
+            for (int e = 0; e < HD; e++) acc = fmaf(qsh[e], h2f(kr[e]), acc);
+            const float v = acc * scale + bias;
+            wsc[i] = v;
+            mym = fmaxf(mym, v);
+        }
+    }
+    red[lid] = mym;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (lid < st) red[lid] = fmaxf(red[lid], red[lid + st]);
+        __syncthreads();
+    }
+    const float mx = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int part = 0; part < 2; part++) {
+        const int i = lid + part * 256;
+        if (wrow[i] >= 0) {
+            const float e = expf(wsc[i] - mx);
+            wsc[i] = e;
+            sum += e;
+        }
+    }
+    red[lid] = sum;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (lid < st) red[lid] += red[lid + st];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    // the rows split over the eight warps: (warp lid >> 5, four values lid & 31)
+    const int quad = lid & 31, warp = lid >> 5;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (quad < HD / 4) {
+        for (int i = warp; i < total; i += 8) {
+            const int r = wrow[i];
+            if (r < 0) continue;
+            const u16* vr = Vm + ((size_t)(slot0 + r - pos0) * nkv + g) * HD + quad * 4;
+            const float w = wsc[i];
+            acc.x = fmaf(w, h2f(vr[0]), acc.x);
+            acc.y = fmaf(w, h2f(vr[1]), acc.y);
+            acc.z = fmaf(w, h2f(vr[2]), acc.z);
+            acc.w = fmaf(w, h2f(vr[3]), acc.w);
+        }
+    }
+    vsum[lid] = acc;
+    __syncthreads();
+    for (int wst = 4; wst > 0; wst >>= 1) {
+        if (warp < wst) {
+            float4 a = vsum[lid], b = vsum[lid + wst * 32];
+            vsum[lid] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+        }
+        __syncthreads();
+    }
+    if (warp == 0 && quad < HD / 4) {
+        const float4 v = vsum[lid];
+        const float o[4] = {v.x * inv, v.y * inv, v.z * inv, v.w * inv};
+        for (int c = 0; c < 4; c++) {
+            const int dd = quad * 4 + c;
+            float a = o[c];
+            if (gate) a = __fmul_rn(a, sigm(gate[((size_t)row * nh + h) * HD + dd]));
+            if (p0) put3(p0, p1, p1, (size_t)row * pstride + (size_t)h * HD + dd, a);
+            else oh[((size_t)row * nh + h) * HD + dd] = f2h_sat(a);
+        }
+    }
+}
