@@ -80,7 +80,7 @@ macro_rules! qfuncs {
 qfuncs!(
     tile, grms, grms_inj, grms_inj4, hc_low, hc_fold, inject, hist, gdn_conv, gdn_prep, gdn_gb, gdn_scan, gdn_scan_c, gdn_out, norm_rope, idx_reduce,
     idx_topk, qsa_softmax, qsa_merge, ple_gate, ple_conv, route, expand_exp, expand_q8, to_wt, zero, gather, act,
-    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_scatter,
+    scatter, shared_add, argmax, mtp_fuse, units, lat_gu, lat_dn, lat_sum, lat_expand, lat_act, lat_gmask, lat_mv, lat_put,
 );
 unsafe impl Send for QFuncs {}
 unsafe impl Sync for QFuncs {}
@@ -804,6 +804,11 @@ struct Scratch {
     lact: Buf,
     ly: Buf,
     lf: Buf,
+    /// The groups a small round picked (one word).
+    lmask: Buf,
+    /// A chunk's per-pick down rows `[n·topk][L]`, and the pick of each sub-batch row.
+    lyc: Buf,
+    lrp: Buf,
 }
 
 /// Page-locked host memory the expert uploads are staged in: a copy from it
@@ -2817,6 +2822,9 @@ impl Dev {
             lact: b.buf(lat_dims.map_or(16, |(_, _, ff)| LAT_PICKS.max(tape.max(SMALL_ROWS) * topk) * ff * 4))?,
             ly: b.buf(lat_dims.map_or(16, |(l, _, _)| LAT_PICKS.max(tape.max(SMALL_ROWS) * topk) * l * 4))?,
             lf: b.buf(3 * xb * 4 + 64)?,
+            lmask: b.buf(64)?,
+            lyc: b.buf(lat_dims.map_or(16, |(l, _, _)| n * topk * l * 4))?,
+            lrp: b.buf(xr * 4)?,
         };
         mem[7] += b.held - h0;
         let h0 = b.held;
@@ -4713,10 +4721,12 @@ impl Core {
             return self.lat_shared_chunk(lw, n, inv, alpha);
         }
         if small {
-            // D, the picks' gate/up and down straight from their slots, the groups' sums, U
-            self.mvb(&[SOp::q8(&lw.dmat, s.lxl.ptr)], s.folded.ptr, d.h, d.h, n)?;
+            // D for the groups picked, the picks' gate/up and down straight from their slots, the groups'
+            // sums, U over the groups picked (each matrix read once for every row of the round)
+            go!(c, q.lat_gmask, (1u32, 1), 32; s.picks.ptr, lw.labels.ptr, s.lmask.ptr, n as i32, topk as i32);
+            self.lat_mv(&lw.dmat, s.folded.ptr, d.h, s.lxl.ptr, gl, n, l, 0, 1280)?;
             self.lat_picks(lw, n)?;
-            self.mvb(&[SOp::q8(&lw.umat, s.blk.ptr)], s.lacc.ptr, gl, gl, n)?;
+            self.lat_mv(&lw.umat, s.lacc.ptr, gl, s.blk.ptr, d.h, n, l, 1, l / 2)?;
             self.lap(7)?;
             // the shared expert at full width
             self.mvb(&[SOp::q8(&lw.sh[0], s.g.ptr), SOp::q8(&lw.sh[1], s.u.ptr)], s.folded.ptr, d.h, d.h, n)?;
@@ -4745,7 +4755,7 @@ impl Core {
         }
         let mut order: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty()).collect();
         order.sort_by(|&x, &y| lists[y].len().cmp(&lists[x].len()).then(x.cmp(&y)));
-        let (mut i, mut first) = (0usize, true);
+        let mut i = 0usize;
         while i < order.len() {
             let ne_max = lists[order[i]].len();
             if ne_max > self.xr {
@@ -4761,7 +4771,7 @@ impl Core {
             let rows = b * ne_max;
             let mut slots = vec![0u64; b];
             let mut rowtok = vec![-1i32; rows];
-            let mut tokrow = vec![-1i32; n * topk];
+            let mut rowpick = vec![-1i32; rows];
             // the sub-batch's GEMM alphas (the mean globals) and each expert's factor against them
             let (mut ag, mut au, mut ad) = (0f32, 0f32, 0f32);
             for j in 0..b {
@@ -4781,12 +4791,12 @@ impl Core {
                 let grp = lw.labels_host[e];
                 for (r, &entry) in lists[e].iter().enumerate() {
                     rowtok[j * ne_max + r] = (entry as usize / topk) as i32 * g as i32 + grp;
-                    tokrow[entry as usize] = (j * ne_max + r) as i32;
+                    rowpick[j * ne_max + r] = entry as i32;
                 }
             }
             self.put(s.slots.ptr, &slots)?;
             self.put(s.rowtok.ptr, &rowtok)?;
-            self.put(s.tokrow.ptr, &tokrow)?;
+            self.put(s.lrp.ptr, &rowpick)?;
             self.put(s.lf.ptr, &f)?;
             go!(c, q.lat_expand, (blocks(ff * l / 8), (3 * b) as u32), 256;
                 s.slots.ptr, s.wg.ptr, s.wu.ptr, s.wd.ptr, ff as i32, l as i32, self.hi);
@@ -4809,15 +4819,12 @@ impl Core {
                     c.gemm_batched(true, l, ne_max, ff, alpha * ad, s.wd.ptr, ff, gs, s.ah.ptr, ff, as_, s.d.ptr, l, ds, b, self.gw)?;
                 }
             }
-            go!(c, q.lat_scatter, (blocks(n * gl), 1), 256;
-                s.d.ptr, s.tokrow.ptr, s.picks.ptr, lw.labels.ptr, s.lf.ptr + (2 * b * 4) as u64, s.wts.ptr, s.lacc.ptr,
-                n as i32, g as i32, l as i32, ne_max as i32, topk as i32, self.hi, first as i32);
-            first = false;
+            go!(c, q.lat_put, (blocks(rows * l), 1), 256;
+                s.d.ptr, s.lrp.ptr, s.lf.ptr + (2 * b * 4) as u64, s.lyc.ptr, rows as i32, l as i32, ne_max as i32, self.hi);
             i += b;
         }
-        if first {
-            go!(c, q.zero, (blocks(n * gl), 1), 256; s.lacc.ptr, (n * gl) as u64);
-        }
+        // the groups' sums over every pick of the chunk, in pick order
+        go!(c, q.lat_sum, (blocks(n * gl), 1), 256; s.picks.ptr, lw.labels.ptr, s.wts.ptr, s.lyc.ptr, s.lacc.ptr, n as i32, g as i32, l as i32, topk as i32);
         // U over the groups' sums
         let acc_g = if half {
             go!(c, q.to_wt, (blocks(n * gl), 1), 256; s.lacc.ptr, s.lacch.ptr, (n * gl) as u64, 1i32);
@@ -4830,6 +4837,26 @@ impl Core {
         self.lap(7)?;
         let _ = li;
         self.lat_shared_chunk(lw, n, inv, alpha)
+    }
+
+    /// `y [n][rows]` = W x over the groups the round picked (`q4_lat_mv`), W q8_2f.
+    #[allow(clippy::too_many_arguments)]
+    fn lat_mv(&self, w: &DevMat, x: u64, xs: usize, y: u64, ys: usize, n: usize, glen: usize, mode: i32, ch: usize) -> Res<()> {
+        let (c, q, s) = (self.c, self.q, &self.s);
+        let rb = 16usize;
+        if n > 8 || !w.cols.is_multiple_of(ch) || !ch.is_multiple_of(16) || (mode == 1 && !glen.is_multiple_of(ch)) || (mode == 0 && !glen.is_multiple_of(rb)) {
+            return Err(format!("qwen4 cuda: latent matvec shape {}x{} chunk {ch} group {glen}", w.rows, w.cols));
+        }
+        unsafe {
+            c.launch(
+                q.lat_mv,
+                (w.rows.div_ceil(rb) as u32, 1),
+                256,
+                n * ch * 4,
+                kargs!(w.w.ptr, w.aux0(), w.aux1(), x, xs as i32, y, ys as i32, w.rows as i32, w.cols as i32, n as i32, glen as i32, s.lmask.ptr, mode, ch as i32),
+            )
+        }?;
+        Ok(())
     }
 
     /// The routed experts of `n` rows straight from their NVFP4 slots: every pick's gate/up and

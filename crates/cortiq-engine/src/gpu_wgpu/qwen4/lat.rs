@@ -260,6 +260,216 @@ fn lat_dn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index
     }
 }
 
+// ── a prompt frame's picks sorted by expert (one workgroup): off[e]..off[e+1] of `order` are expert e's picks ──
+struct LoP { ne: u32, np: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       lo_pk : array<i32>;
+@group(0) @binding(1) var<storage, read_write> lo_off : array<u32>;
+@group(0) @binding(2) var<storage, read_write> lo_ord : array<u32>;
+@group(0) @binding(3) var<uniform>             lo_p : LoP;
+var<workgroup> lo_cnt: array<atomic<u32>, 1024>;
+var<workgroup> lo_base: array<u32, 1025>;
+@compute @workgroup_size(256)
+fn lat_sort(@builtin(local_invocation_index) lid: u32) {
+    for (var i = lid; i < lo_p.ne; i = i + 256u) { atomicStore(&lo_cnt[i], 0u); }
+    workgroupBarrier();
+    for (var q = lid; q < lo_p.np; q = q + 256u) {
+        let e = lo_pk[q];
+        if (e >= 0) { atomicAdd(&lo_cnt[u32(e)], 1u); }
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var acc = 0u;
+        for (var i = 0u; i < lo_p.ne; i = i + 1u) {
+            lo_base[i] = acc;
+            acc = acc + atomicLoad(&lo_cnt[i]);
+            atomicStore(&lo_cnt[i], 0u);
+        }
+        lo_base[lo_p.ne] = acc;
+    }
+    workgroupBarrier();
+    for (var q = lid; q < lo_p.np; q = q + 256u) {
+        let e = lo_pk[q];
+        if (e >= 0) {
+            let at = atomicAdd(&lo_cnt[u32(e)], 1u);
+            lo_ord[lo_base[u32(e)] + at] = q;
+        }
+    }
+    for (var i = lid; i <= lo_p.ne; i = i + 256u) { lo_off[i] = lo_base[i]; }
+}
+
+// ── a prompt frame's gate/up, by expert: workgroup (row tile of 32, expert); the expert's picks in tiles
+// of 32, its rows decoded once per tile into shared memory, 64 columns at a time ──
+struct LgG { ff: u32, l: u32, g: u32, k: u32, slot: u32, pw: u32, xs: u32, as_: u32 };
+@group(0) @binding(0) var<storage, read>       gg_bank : array<u32>;
+@group(0) @binding(1) var<storage, read>       gg_lab : array<u32>;
+@group(0) @binding(2) var<storage, read>       gg_off : array<u32>;
+@group(0) @binding(3) var<storage, read>       gg_ord : array<u32>;
+@group(0) @binding(4) var<storage, read>       gg_x : array<f32>;
+@group(0) @binding(5) var<storage, read_write> gg_a : array<f32>;
+@group(0) @binding(6) var<uniform>             gg_p : LgG;
+var<workgroup> gg_wg: array<f32, 2048>;   // gate tile [32 rows][64]
+var<workgroup> gg_wu: array<f32, 2048>;   // up tile
+var<workgroup> gg_xt: array<f32, 2048>;   // x tile [32 picks][64]
+var<workgroup> gg_n: vec2<u32>;
+fn gg_byte(base: u32, i: u32) -> u32 { return (gg_bank[base + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu; }
+@compute @workgroup_size(256)
+fn lat_gu_g(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let e = wid.y;
+    if (lid == 0u) { gg_n = vec2<u32>(gg_off[e], gg_off[e + 1u] - gg_off[e]); }
+    let nn = workgroupUniformLoad(&gg_n);
+    let p0 = nn.x;
+    let np = nn.y;
+    if (np == 0u) { return; }
+    let r0 = wid.x * 32u;
+    let gb = e * gg_p.slot;
+    let ub = gb + gg_p.pw;
+    let cw = gg_p.ff * gg_p.l / 8u;
+    let sb = gg_p.ff * gg_p.l / 16u;
+    let sg = bitcast<f32>(gg_bank[gb + cw + sb / 4u]);
+    let su = bitcast<f32>(gg_bank[ub + cw + sb / 4u]);
+    let grp = gg_lab[e];
+    let gpr = gg_p.l / 16u;
+    // this thread's outputs: row tr, picks tp..tp+4
+    let tr = lid >> 3u;
+    let tp = (lid & 7u) * 4u;
+    for (var pt = 0u; pt < np; pt = pt + 32u) {
+        var ag = vec4<f32>(0.0);
+        var au = vec4<f32>(0.0);
+        for (var k0 = 0u; k0 < gg_p.l; k0 = k0 + 64u) {
+            workgroupBarrier();
+            // decode the tiles: 32 rows x 64 columns of gate and up (four 16-groups a row), x of 32 picks
+            for (var i = lid; i < 32u * 4u; i = i + 256u) {
+                let rr = i >> 2u;
+                let q = i & 3u;
+                let row = min(r0 + rr, gg_p.ff - 1u);
+                let o = row * gpr + k0 / 16u + q;
+                let gsc = lat_ue4m3(gg_byte(gb + cw, o));
+                let usc = lat_ue4m3(gg_byte(ub + cw, o));
+                let w0 = gg_bank[gb + 2u * o];
+                let w1 = gg_bank[gb + 2u * o + 1u];
+                let u0 = gg_bank[ub + 2u * o];
+                let u1 = gg_bank[ub + 2u * o + 1u];
+                for (var j = 0u; j < 8u; j = j + 1u) {
+                    let wsel = select(w1, w0, j < 4u);
+                    let usel = select(u1, u0, j < 4u);
+                    let by = (wsel >> (8u * (j & 3u))) & 0xFFu;
+                    let bu = (usel >> (8u * (j & 3u))) & 0xFFu;
+                    let c = rr * 64u + q * 16u + 2u * j;
+                    gg_wg[c] = lat_e2m1(by & 15u) * gsc;
+                    gg_wg[c + 1u] = lat_e2m1(by >> 4u) * gsc;
+                    gg_wu[c] = lat_e2m1(bu & 15u) * usc;
+                    gg_wu[c + 1u] = lat_e2m1(bu >> 4u) * usc;
+                }
+            }
+            for (var i = lid; i < 32u * 64u; i = i + 256u) {
+                let pp = i >> 6u;
+                let kk = i & 63u;
+                var v = 0.0;
+                if (pt + pp < np) {
+                    let pick = gg_ord[p0 + pt + pp];
+                    v = gg_x[(pick / gg_p.k) * gg_p.xs + grp * gg_p.l + k0 + kk];
+                }
+                gg_xt[i] = v;
+            }
+            workgroupBarrier();
+            for (var kk = 0u; kk < 64u; kk = kk + 1u) {
+                let wgv = gg_wg[tr * 64u + kk];
+                let wuv = gg_wu[tr * 64u + kk];
+                let xv = vec4<f32>(gg_xt[tp * 64u + kk], gg_xt[(tp + 1u) * 64u + kk], gg_xt[(tp + 2u) * 64u + kk], gg_xt[(tp + 3u) * 64u + kk]);
+                ag = ag + wgv * xv;
+                au = au + wuv * xv;
+            }
+        }
+        let row = r0 + tr;
+        if (row < gg_p.ff) {
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                if (pt + tp + j < np) {
+                    let pick = gg_ord[p0 + pt + tp + j];
+                    let gv = sg * ag[j];
+                    gg_a[pick * gg_p.as_ + row] = gv / (1.0 + exp(-gv)) * (su * au[j]);
+                }
+            }
+        }
+    }
+}
+
+// ── a prompt frame's down, by expert: workgroup (row tile of 32 of L, expert) ──
+struct LdG { ff: u32, l: u32, slot: u32, pw: u32, as_: u32, ys: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       dg_bank : array<u32>;
+@group(0) @binding(1) var<storage, read>       dg_off : array<u32>;
+@group(0) @binding(2) var<storage, read>       dg_ord : array<u32>;
+@group(0) @binding(3) var<storage, read>       dg_a : array<f32>;
+@group(0) @binding(4) var<storage, read_write> dg_y : array<f32>;
+@group(0) @binding(5) var<uniform>             dg_p : LdG;
+var<workgroup> dg_wt: array<f32, 2048>;
+var<workgroup> dg_at: array<f32, 2048>;
+var<workgroup> dg_n: vec2<u32>;
+fn dg_byte(base: u32, i: u32) -> u32 { return (dg_bank[base + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu; }
+@compute @workgroup_size(256)
+fn lat_dn_g(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let e = wid.y;
+    if (lid == 0u) { dg_n = vec2<u32>(dg_off[e], dg_off[e + 1u] - dg_off[e]); }
+    let nn = workgroupUniformLoad(&dg_n);
+    let p0 = nn.x;
+    let np = nn.y;
+    if (np == 0u) { return; }
+    let r0 = wid.x * 32u;
+    let db = e * dg_p.slot + 2u * dg_p.pw;
+    let cw = dg_p.ff * dg_p.l / 8u;
+    let sb = dg_p.ff * dg_p.l / 16u;
+    let sd = bitcast<f32>(dg_bank[db + cw + sb / 4u]);
+    let gpr = dg_p.ff / 16u;
+    let tr = lid >> 3u;
+    let tp = (lid & 7u) * 4u;
+    for (var pt = 0u; pt < np; pt = pt + 32u) {
+        var acc = vec4<f32>(0.0);
+        for (var k0 = 0u; k0 < dg_p.ff; k0 = k0 + 64u) {
+            workgroupBarrier();
+            for (var i = lid; i < 32u * 4u; i = i + 256u) {
+                let rr = i >> 2u;
+                let q = i & 3u;
+                let row = min(r0 + rr, dg_p.l - 1u);
+                let o = row * gpr + k0 / 16u + q;
+                let sc = lat_ue4m3(dg_byte(db + cw, o));
+                let w0 = dg_bank[db + 2u * o];
+                let w1 = dg_bank[db + 2u * o + 1u];
+                for (var j = 0u; j < 8u; j = j + 1u) {
+                    let wsel = select(w1, w0, j < 4u);
+                    let by = (wsel >> (8u * (j & 3u))) & 0xFFu;
+                    let c = rr * 64u + q * 16u + 2u * j;
+                    dg_wt[c] = lat_e2m1(by & 15u) * sc;
+                    dg_wt[c + 1u] = lat_e2m1(by >> 4u) * sc;
+                }
+            }
+            for (var i = lid; i < 32u * 64u; i = i + 256u) {
+                let pp = i >> 6u;
+                let kk = i & 63u;
+                var v = 0.0;
+                if (pt + pp < np) {
+                    let pick = dg_ord[p0 + pt + pp];
+                    v = dg_a[pick * dg_p.as_ + k0 + kk];
+                }
+                dg_at[i] = v;
+            }
+            workgroupBarrier();
+            for (var kk = 0u; kk < 64u; kk = kk + 1u) {
+                let wv = dg_wt[tr * 64u + kk];
+                let av = vec4<f32>(dg_at[tp * 64u + kk], dg_at[(tp + 1u) * 64u + kk], dg_at[(tp + 2u) * 64u + kk], dg_at[(tp + 3u) * 64u + kk]);
+                acc = acc + wv * av;
+            }
+        }
+        let row = r0 + tr;
+        if (row < dg_p.l) {
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                if (pt + tp + j < np) {
+                    let pick = dg_ord[p0 + pt + tp + j];
+                    dg_y[pick * dg_p.ys + row] = sd * acc[j];
+                }
+            }
+        }
+    }
+}
+
 // ── the groups' sums: acc[t][g·L + j] = Σ_{picks k of t in group g} w·y[t·K + k][j] ──
 struct LsP { n: u32, g: u32, l: u32, k: u32, ys: u32, accs: u32, _a: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read>       ls_pk : array<i32>;
@@ -324,6 +534,9 @@ pub(crate) struct LatPipes {
     sum: wgpu::ComputePipeline,
     silu: wgpu::ComputePipeline,
     shadd: wgpu::ComputePipeline,
+    sort: wgpu::ComputePipeline,
+    gu_g: wgpu::ComputePipeline,
+    dn_g: wgpu::ComputePipeline,
 }
 
 static LAT_PIPES: std::sync::OnceLock<Option<LatPipes>> = std::sync::OnceLock::new();
@@ -358,6 +571,9 @@ fn lat_pipes(c: &Ctx) -> Option<&'static LatPipes> {
                 sum: pipe("lat_sum"),
                 silu: pipe("lat_silu"),
                 shadd: pipe("lat_shadd"),
+                sort: pipe("lat_sort"),
+                gu_g: pipe("lat_gu_g"),
+                dn_g: pipe("lat_dn_g"),
             })
         })
         .as_ref()
@@ -473,10 +689,6 @@ impl LatDev {
         self.bank.size() + self.labels.size() + self.router.size()
     }
 
-    /// The directory indices the frame reads as skeleton weights.
-    pub(crate) fn weight_idxs(&self) -> [usize; 5] {
-        [self.d_idx, self.u_idx, self.sh_idx[0], self.sh_idx[1], self.sh_idx[2]]
-    }
 }
 
 /// Frame-buffer tags of the latent stage.
@@ -491,10 +703,18 @@ const T_LSG: u8 = 177;
 const T_LSU: u8 = 178;
 const T_LSA: u8 = 168;
 const T_LSO: u8 = 169;
+const T_LOFF: u8 = 166;
+const T_LORD: u8 = 167;
+
+/// The expert-grouped kernels of a prompt frame (`CMF_QWEN_LAT_GROUPED=0`: the per-pick ones).
+fn grouped_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_LAT_GROUPED").as_deref() != Ok("0"))
+}
 
 /// The latent MoE of `nt` token rows: `x2` (rows `hs` floats apart) in, `mo` (the same stride) out.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode(
+pub(super) fn encode(
     c: &Ctx,
     p: &Pipes,
     pass: &mut wgpu::ComputePass<'_>,
@@ -553,6 +773,44 @@ pub(crate) fn encode(
     if !q82_t(c, p, pass, &wd, x2, hs, &xl, xls, nt, bc, 702) {
         return None;
     }
+    // a prompt frame: the picks sorted by expert, every expert's rows read once per tile of 32 picks
+    if nt > TMAX && grouped_on() {
+        let off = tbuf_exact(c, T_LOFF, (ne + 1) * 4 / TROWS + 4, false);
+        let ord = tbuf_exact(c, T_LORD, k * 4, false);
+        let (pk, o1, o2) = (picks.clone(), off.clone(), ord.clone());
+        dispatch(
+            c,
+            pass,
+            &lp.sort,
+            bc,
+            713,
+            "qwen4-lat-sort",
+            || vec![pk, o1, o2, uniform_u32x4(c, [ne as u32, (nt * k) as u32, 0, 0])],
+            (1, 1, 1),
+        );
+        let (bk, lb, o1, o2, xx, aa) = (lat.bank.clone(), lat.labels.clone(), off.clone(), ord.clone(), xl.clone(), act.clone());
+        dispatch(
+            c,
+            pass,
+            &lp.gu_g,
+            bc,
+            703,
+            "qwen4-lat-gu-g",
+            || vec![bk, lb, o1, o2, xx, aa, uniform_u32x8(c, [ff as u32, l as u32, g as u32, k as u32, lat.slot_w, lat.pw_w, xls, ff as u32])],
+            ((ff as u32).div_ceil(32), ne as u32, 1),
+        );
+        let (bk, o1, o2, aa, yy) = (lat.bank.clone(), off.clone(), ord.clone(), act.clone(), y.clone());
+        dispatch(
+            c,
+            pass,
+            &lp.dn_g,
+            bc,
+            704,
+            "qwen4-lat-dn-g",
+            || vec![bk, o1, o2, aa, yy, uniform_u32x8(c, [ff as u32, l as u32, lat.slot_w, lat.pw_w, ff as u32, l as u32, 0, 0])],
+            ((l as u32).div_ceil(32), ne as u32, 1),
+        );
+    } else {
     // the picks' gate/up and down, the groups' sums
     let rb = 8u32;
     let (bk, lb, pk, xx, aa) = (lat.bank.clone(), lat.labels.clone(), picks.clone(), xl.clone(), act.clone());
@@ -586,6 +844,7 @@ pub(crate) fn encode(
         || vec![bk, pk, aa, yy, uniform_u32x8(c, [ff as u32, l as u32, lat.slot_w, lat.pw_w, ff as u32, l as u32, rb, 0])],
         ((l as u32).div_ceil(rb), (nt * k) as u32, 1),
     );
+    }
     let (pk, lb, wt, yy, ac) = (picks.clone(), lat.labels.clone(), wts.clone(), y.clone(), acc.clone());
     dispatch(
         c,
@@ -643,7 +902,7 @@ mod tests {
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
             .validate(&module)
             .expect("latent WGSL validates");
-        for ep in ["lat_router", "lat_route", "lat_gu", "lat_dn", "lat_sum", "lat_silu", "lat_shadd"] {
+        for ep in ["lat_router", "lat_route", "lat_gu", "lat_dn", "lat_sum", "lat_silu", "lat_shadd", "lat_sort", "lat_gu_g", "lat_dn_g"] {
             assert!(module.entry_points.iter().any(|e| e.name == ep), "{ep} missing");
         }
     }

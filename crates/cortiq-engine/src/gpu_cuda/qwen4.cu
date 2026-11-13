@@ -2484,26 +2484,102 @@ extern "C" __global__ void q4_lat_act(const void* __restrict__ g, const void* __
     stf(a, i, silu_f(f[2 * j] * ldf(g, i, in_half)) * (f[2 * j + 1] * ldf(u, i, in_half)) * inv, out_half);
 }
 
-// acc [n * G][L] (+)= the picks of this sub-batch: row (t * G + g) adds wts * fd * D[row] of every pick
-// k of token t in group g; tokrow [n * topk] is the pick's row of D (-1: not in the sub-batch), whose
-// expert is j = row / per with fd [j] = sd_j / alpha_d.
-extern "C" __global__ void q4_lat_scatter(const void* __restrict__ D, const int* __restrict__ tokrow,
-                                          const int* __restrict__ picks, const int* __restrict__ labels,
-                                          const float* __restrict__ fd, const float* __restrict__ wts,
-                                          float* __restrict__ acc, int n, int G, int L, int per, int topk,
-                                          int d_half, int init)
+
+// The groups any of the n rows picked: bit g of mask[0].
+extern "C" __global__ void q4_lat_gmask(const int* __restrict__ picks, const int* __restrict__ labels,
+                                        u32* __restrict__ mask, int n, int topk)
+{ PDL_PRO();
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    u32 m = 0u;
+    for (int i = 0; i < n * topk; i++) {
+        const int e = picks[i];
+        if (e >= 0) m |= 1u << (labels[e] & 31);
+    }
+    mask[0] = m;
+}
+
+#ifndef LAT_MV_RB
+#define LAT_MV_RB 16
+#endif
+// y [n][rows] (rows ys apart) = W x for n <= 8 rows of x (xs apart), W q8_2f [rows][cols]: int8 body,
+// f32 row scale `rs`, f32 column field `col`. The row is read once for all n rows. Group blocks no row
+// picked are skipped: mode 0 (D) skips the row blocks of glen rows, mode 1 (U) the column blocks of
+// glen columns (their inputs are zero). The columns go in chunks of `ch` (a divisor of cols, of glen in
+// mode 1), staged for all rows. 256 threads, LAT_MV_RB rows a block (a divisor of glen in mode 0).
+extern "C" __global__ void q4_lat_mv(const u8* __restrict__ body, const float* __restrict__ rs,
+                                     const float* __restrict__ col, const float* __restrict__ x, int xs,
+                                     float* __restrict__ y, int ys, int rows, int cols, int n, int glen,
+                                     const u32* __restrict__ gmask, int mode, int ch)
+{ PDL_PRO();
+    extern __shared__ float sx[];
+    const u32 m = gmask[0];
+    const int r0 = blockIdx.x * LAT_MV_RB;
+    if (r0 >= rows) return;
+    if (mode == 0 && !((m >> ((r0 / glen) & 31)) & 1u)) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int RPW = LAT_MV_RB / 8;
+    float acc[RPW][8];
+    #pragma unroll
+    for (int a = 0; a < RPW; a++)
+        #pragma unroll
+        for (int t = 0; t < 8; t++) acc[a][t] = 0.0f;
+    for (int c0 = 0; c0 < cols; c0 += ch) {
+        if (mode == 1 && !((m >> ((c0 / glen) & 31)) & 1u)) continue;
+        __syncthreads();
+        for (int i = threadIdx.x; i < n * ch; i += blockDim.x) {
+            const int t = i / ch, c = i - t * ch;
+            sx[i] = x[(u64)t * xs + c0 + c] * col[c0 + c];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int a = 0; a < RPW; a++) {
+            const int r = r0 + warp * RPW + a;
+            if (r >= rows) continue;
+            const uint4* W = (const uint4*)(body + (u64)r * cols + c0);
+            for (int q = lane; q < ch / 16; q += 32) {
+                const uint4 w = W[q];
+                const u32 ws[4] = {w.x, w.y, w.z, w.w};
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    if (t >= n) break;
+                    const float* p = sx + t * ch + q * 16;
+                    float s = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        s += (float)((int)(ws[k] << 24) >> 24) * p[4 * k];
+                        s += (float)((int)(ws[k] << 16) >> 24) * p[4 * k + 1];
+                        s += (float)((int)(ws[k] << 8) >> 24) * p[4 * k + 2];
+                        s += (float)((int)ws[k] >> 24) * p[4 * k + 3];
+                    }
+                    acc[a][t] += s;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int a = 0; a < RPW; a++) {
+        const int r = r0 + warp * RPW + a;
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            float v = acc[a][t];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && r < rows && t < n) y[(u64)t * ys + r] = v * rs[r];
+        }
+    }
+}
+
+// y [picks][L]: the rows of this sub-batch's D output, each at its pick (rowpick[row]), times its
+// expert's factor fd[row / per] (sd / alpha_d). Every pick's row is written once over the chunk; the
+// groups' sums then take them in pick order (`q4_lat_sum`), so the result does not depend on the
+// sub-batches.
+extern "C" __global__ void q4_lat_put(const void* __restrict__ D, const int* __restrict__ rowpick,
+                                      const float* __restrict__ fd, float* __restrict__ y, int rows, int L,
+                                      int per, int d_half)
 { PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (u64)n * G * L) return;
-    const u64 tg = i / L, j = i - tg * L;
-    const int t = (int)(tg / G), g = (int)(tg - (u64)t * G);
-    float a = 0.0f;
-    for (int k = 0; k < topk; k++) {
-        const int row = tokrow[t * topk + k];
-        if (row < 0) continue;
-        const int e = picks[t * topk + k];
-        if (labels[e] != g) continue;
-        a += wts[t * topk + k] * fd[row / per] * ldf(D, (u64)row * L + j, d_half);
-    }
-    acc[i] = init ? a : acc[i] + a;
+    if (i >= (u64)rows * L) return;
+    const int row = (int)(i / L), j = (int)(i - (u64)row * L);
+    const int p = rowpick[row];
+    if (p < 0) return;
+    y[(u64)p * L + j] = fd[row / per] * ldf(D, i, d_half);
 }
