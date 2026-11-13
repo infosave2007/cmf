@@ -1161,7 +1161,7 @@ struct GdnL {
 /// `hy_qk`'s flag word (gemma, bit 1 the late norm) and its bias pointers.
 fn qk_flags(a: &AttnL, gemma_i: i32) -> (i32, (u64, u64, u64)) {
     let b = a.bias.as_ref().map_or((0, 0, 0), |(q, k, v)| (q.ptr, k.ptr, v.ptr));
-    (gemma_i | ((a.late as i32) << 1), b)
+    (gemma_i | ((a.late as i32) << 1) | ((a.v_norm as i32) << 2), b)
 }
 
 struct AttnL {
@@ -1174,6 +1174,8 @@ struct AttnL {
     gated: bool,
     /// q/k norm after the rotation (HunYuan)
     late: bool,
+    /// Gemma-4's scale-less V norm before the mirror
+    v_norm: bool,
     /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
     bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
     /// A head-wise output gate: its matrix (the dense arm's, any codec) and a
@@ -1187,6 +1189,11 @@ struct AttnL {
     local: usize,
     /// The layer's rotary pairs (its table's width).
     half: usize,
+    /// The layer's KV heads and head width (the call's, or Gemma-4's global
+    /// layers' own), and the attention kernels compiled for them.
+    nkv: usize,
+    hd: usize,
+    fx: Arc<HFuncs>,
     ms_in: MmaSet,
     ms_out: MmaSet,
 }
@@ -1217,6 +1224,8 @@ struct HLayer {
     in_norm: Arc<Buf>,
     post_norm: Arc<Buf>,
     inter: usize,
+    /// GeGLU (tanh GELU, the Gemma family) instead of SwiGLU
+    gelu: bool,
     ms_gu: MmaSet,
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
@@ -1297,6 +1306,10 @@ pub(super) struct HPlan {
     invf_local: Vec<(Vec<f32>, f32)>,
     /// Prism's activation boundary at every input site (a Prism file).
     prism: Option<PrismPlan>,
+    /// The widest head of the stack (a layer of its own geometry).
+    hdmax: usize,
+    /// Some layer's head geometry is its own (its kernels a module of their own).
+    own_geom: bool,
     half: usize,
     nh: usize,
     nkv: usize,
@@ -1571,6 +1584,9 @@ fn build(
     let mut note = |d: &[f32]| consts.push((d.as_ptr() as usize, d.len(), crate::gpu::fp_f32(d)));
     // geometry first: the row buffers the job tables point into
     let mut qrow = nh * hd;
+    // the widest attention a layer of its own geometry (Gemma-4's global
+    // layers: one KV head of 512) takes: K/V rows, head width
+    let (mut kvmax, mut hdmax) = (nkv * hd, hd);
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
     let mut invf_local: Vec<(Vec<f32>, f32)> = Vec::new();
@@ -1603,14 +1619,14 @@ fn build(
             GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
                 // a geometry equal to the call-wide one (a stack where only some
                 // layers differ) is the call-wide one, a sliding window aside
+                // a head geometry of the layer's own: its kernels a module of their own
+                let own = |g: &crate::gpu::GraphAttnGeom| g.hd % 32 == 0 && g.hd <= 512 && g.nkv > 0 && nh % g.nkv == 0 && nh / g.nkv <= 16;
                 let same = geom.as_ref().is_none_or(|g| {
-                    g.nkv == nkv
-                        && g.hd == hd
-                        && g.dv == hd
+                    ((g.nkv == nkv && g.hd == hd) || own(g))
+                        && g.dv == g.hd
                         && g.rd % 2 == 0
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
                         && g.sink.is_none_or(|s| s.len() == nh)
-                        && !g.v_norm
                         && g.dash.is_none()
                         && g.vres.is_none()
                         && g.invf.len() >= g.rd / 2
@@ -1647,7 +1663,10 @@ fn build(
                 if bias.is_some() && *output_gate {
                     return Err(format!("layer {li}: projection biases beside a gated query"));
                 }
-                qrow = qrow.max(nh * hd * (1 + *output_gate as usize));
+                let (lnkv, lhd) = geom.as_ref().map_or((nkv, hd), |g| (g.nkv, g.hd));
+                qrow = qrow.max(nh * lhd * (1 + *output_gate as usize));
+                kvmax = kvmax.max(lnkv * lhd);
+                hdmax = hdmax.max(lhd);
             }
             GraphAttn::ShortConv { kernel, taps, cpu_state, .. } => {
                 if *kernel == 0 || *kernel > 9 || taps.len() != hidden * kernel || !(cpu_state.is_empty() || cpu_state.len() == (kernel - 1) * hidden) {
@@ -1659,8 +1678,8 @@ fn build(
         }
         match &l.ffn {
             GraphFfn::Dense { gate, act, limit, hot, .. } => {
-                if *act != GraphAct::Silu || *limit != 0.0 || hot.is_some() {
-                    return Err(format!("layer {li}: an FFN other than plain SwiGLU"));
+                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh) || *limit != 0.0 || hot.is_some() {
+                    return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
             }
@@ -1694,11 +1713,11 @@ fn build(
     let h = f4(NMAX * hidden)?;
     let xn = f4(NMAX * hidden)?;
     let q = f4(NMAX * qrow)?;
-    let k = f4(NMAX * nkv * hd)?;
-    let v = f4(NMAX * nkv * hd)?;
-    let qg = f4(NMAX * nh * hd)?;
-    let gate = f4(NMAX * nh * hd)?;
-    let ao = f4(NMAX * nh * hd)?;
+    let k = f4(NMAX * kvmax)?;
+    let v = f4(NMAX * kvmax)?;
+    let qg = f4(NMAX * nh * hdmax)?;
+    let gate = f4(NMAX * nh * hdmax)?;
+    let ao = f4(NMAX * nh * hdmax)?;
     let qkv = f4(NMAX * cdmax)?;
     let z = f4(NMAX * vdmax)?;
     let o = f4(NMAX * vdmax)?;
@@ -1707,7 +1726,7 @@ fn build(
     // the call's rotation rows, then each other table's at its own width
     let tab = f4((NMAX * 2 * (half + invf_local.iter().map(|(f, _)| f.len()).sum::<usize>())).max(1))?;
     let ids = f4(NMAX)?;
-    let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
+    let pstride = hidden.max(intermax).max(vdmax).max(nh * hdmax).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     // a sandwich-normed product's rows before their norm; a head gate's logits
@@ -1982,6 +2001,22 @@ fn build(
                 })
             }
             GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
+                // the layer's head geometry and its kernels (the call's module for the call's)
+                let (lnkv, lhd) = geom.as_ref().map_or((nkv, hd), |g| (g.nkv, g.hd));
+                let lhpk = nh / lnkv;
+                let lfx = if (lnkv, lhd) == (nkv, hd) {
+                    fx.clone()
+                } else {
+                    match st.hyb.funcs.get(&(lhpk, lhd)) {
+                        Some(f) => f.clone(),
+                        None => {
+                            let f = Arc::new(load_funcs(c, lhpk, lhd)?);
+                            st.hyb.funcs.insert((lhpk, lhd), f.clone());
+                            f
+                        }
+                    }
+                };
+                let (nkv, hd) = (lnkv, lhd);
                 let qr = nh * hd * (1 + *output_gate as usize);
                 let window = geom.as_ref().and_then(|g| g.window);
                 let sink = match geom.as_ref().and_then(|g| g.sink) {
@@ -2052,7 +2087,7 @@ fn build(
                     Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, sink, local, half: lhalf, ms_in, ms_out })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
                 let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
@@ -2068,7 +2103,8 @@ fn build(
             }
             _ => unreachable!(),
         };
-        let ms_gu = mmaset_pair(&gum, qq[0].ptr, qq[1].ptr, pstride)?;
+        let gelu = matches!(&l.ffn, GraphFfn::Dense { act: GraphAct::GeluTanh, .. });
+        let ms_gu = mmaset_kind(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | if gelu { 0x200 } else { 0 })?;
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
@@ -2086,7 +2122,7 @@ fn build(
         };
         let attn_out = sw(l.attn_out_norm, st)?;
         let ffn_out = sw(l.ffn_out_norm, st)?;
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
     let (lm, logits, final_norm_buf) = match lm {
         Some((gw, rows)) => {
@@ -2146,6 +2182,8 @@ fn build(
         invf: invf[..half].to_vec(),
         invf_local,
         prism,
+        hdmax,
+        own_geom: hdmax != hd || kvmax != nkv * hd,
         half,
         nh,
         nkv,
@@ -2329,9 +2367,10 @@ fn admit(
             continue;
         }
         match (&pl.mix, &l.attn) {
-            (Mix::Attn(_), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
+            (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
-                let row = plan.nkv * plan.hd / 2;
+                // (the layer's own head geometry)
+                let row = a.nkv * a.hd / 2;
                 let fresh_half = !st.hyb.half.contains(&key);
                 let m = st.kv.entry(key).or_insert_with(|| KvMirror::new(row, 0));
                 if m.row != row || m.window != 0 || fresh_half {
@@ -2341,7 +2380,7 @@ fn admit(
                 }
                 st.hyb.half.insert(key);
                 let m = st.kv.get_mut(&key).unwrap();
-                match sync_half(c, m, cpu_k, cpu_v, *cpu_base, plan.nkv, plan.hd, pos0) {
+                match sync_half(c, m, cpu_k, cpu_v, *cpu_base, a.nkv, a.hd, pos0) {
                     Ok(true) => m.reserve(c, n, hint).map_err(soft)?,
                     Ok(false) if m.stored < pos0 && m.stored >= m.base => {
                         // Rows neither on the card nor on the host: positions
@@ -2671,6 +2710,9 @@ fn book(
     let mut keys_max = 0usize;
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        if sealed.get(li).copied().unwrap_or(false) && matches!(&pl.mix, Mix::Attn(a) if a.nkv != plan.nkv || a.hd != plan.hd) {
+            return Err("a sealed far field over a layer head geometry of its own".into());
+        }
         if !matches!(&pl.mix, Mix::Attn(_)) || !sealed.get(li).copied().unwrap_or(false) || !st.hyb.o1.contains_key(&key) {
             far.push(0);
             farp.push((0, 0.0, false));
@@ -2757,7 +2799,7 @@ fn book(
     let scratch = [
         st.scr(c, "hy_S", NMAX * nh * kc * 4)?,
         st.scr(c, "hy_Mx", NMAX * nh * nbc * 4)?,
-        st.scr(c, "hy_P", NMAX * nbc * nh * hd * 4)?,
+        st.scr(c, "hy_P", NMAX * nbc * nh * hd.max(plan.hdmax) * 4)?,
         st.scr(c, "hy_E", NMAX * nbc * nh * 4)?,
     ];
     Ok(Book { layers, ci, scratch, far, farp })
@@ -2770,7 +2812,7 @@ fn book(
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u64, tabp: u64, taps: &[(usize, u64)]) -> Res<()> {
     let fx = &plan.fx;
-    let (hidden, nh, nkv, hd) = (plan.hidden, plan.nh, plan.nkv, plan.hd);
+    let (hidden, nh) = (plan.hidden, plan.nh);
     let (eps, gemma_i, n_i) = (plan.eps, plan.gemma as i32, n as i32);
     let hid_i = hidden as i32;
     let zero = 0i32;
@@ -2888,6 +2930,9 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 }
             }
             Mix::Attn(a) => {
+                // the layer's head geometry and its kernels
+                let (nkv, hd, fx) = (a.nkv, a.hd, &*a.fx);
+                let hpk_l = nh / nkv;
                 let (kp, vp) = (lb[0], lb[1]);
                 let far = bk.far[li];
                 let (fm, fscale, frect) = bk.farp[li];
@@ -2906,12 +2951,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
                     if far == 2 {
+                        let _ = hpk_l;
                         // the ring row this key replaces into the far sums,
                         // before the key takes its place
                         let (fm_i, nkv_i2) = (fm as i32, nkv as i32);
                         c.launch(
                             fx.far_insert,
-                            ((nkv * plan.hpk * fm).div_ceil(8) as u32, 1),
+                            ((nkv * hpk_l * fm).div_ceil(8) as u32, 1),
                             256,
                             0,
                             kargs!(kp, vp, lb[3], lb[5], lb[6], cip, fm_i, nkv_i2, fscale),
@@ -3100,9 +3146,9 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
 /// scale, a short convolution or a head-wise gate): such a
 /// stack's long prompt runs the small path a chunk at a time.
 fn small_only(l: &HLayer) -> bool {
-    l.attn_out.is_some()
-        || l.ffn_out.is_some()
-        || l.layer_scale.is_some()
+    // sandwich norms and a layer scale run on the prompt path too, a routed
+    // FFN's sandwich aside
+    (l.moe.is_some() && l.ffn_out.is_some())
         || matches!(l.mix, Mix::Conv(_))
         || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
 }
@@ -3550,8 +3596,8 @@ pub(super) fn mtp_chain(
         }
         Ok(())
     };
-    if !plan.invf_local.is_empty() {
-        decline("hybrid draft chain", "a stack with local rotations");
+    if !plan.invf_local.is_empty() || plan.own_geom {
+        decline("hybrid draft chain", "a stack with local rotations or a layer head geometry of its own");
         return Err(false);
     }
     if let Err(e) = prep(st) {
@@ -4070,6 +4116,13 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, d
     Ok(())
 }
 
+/// The prompt path's residual add of a product `y` [b][hidden] under a
+/// sandwich norm `w` (Gemma): h += rmsnorm(y) * w, a block a row.
+unsafe fn sandwich_rows(c: &Ctx, plan: &HPlan, w: &Buf, h: u64, y: u64, b: usize) -> Res<()> {
+    let (hi, gi) = (plan.hidden as i32, plan.gemma as i32);
+    unsafe { c.launch(plan.fx.norm_add, (b as u32, 1), 256, 0, kargs!(h, y, w.ptr, hi, plan.eps, gi)) }
+}
+
 unsafe fn big(
     c: &Ctx,
     st: &mut State,
@@ -4085,7 +4138,9 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some()));
+    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| {
+        s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some() || a.nkv != plan.nkv || a.hd != plan.hd)
+    });
     if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
         return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
     }
@@ -4236,7 +4291,14 @@ unsafe fn big(
                 gs.next_pos = pos0 + b;
                 gs.tape = None;
                 unsafe { prism_rows(c, plan, yof, yof, vd, vd, b)? };
-                mul(&g.out, yof, bh, hidden, 1.0, 1.0)?;
+                match pl.attn_out.as_deref() {
+                    Some(w) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&g.out, yof, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    None => mul(&g.out, yof, bh, hidden, 1.0, 1.0)?,
+                }
             }
             Mix::Attn(a) if sealed.get(li).copied().unwrap_or(false) => {
                 // past the seal: the chunk's rows after the far field's near
@@ -4368,9 +4430,19 @@ unsafe fn big(
                 }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
-                mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
+                match pl.attn_out.as_deref() {
+                    Some(w) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    None => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                }
             }
             Mix::Attn(a) => {
+                // the layer's head geometry and its kernels
+                let (nkv, hd, fx) = (a.nkv, a.hd, &*a.fx);
+                let hpk = nh / nkv;
                 let qr = a.q.rows;
                 let yq = st.scr(c, "hb_q", b * qr * 4)?;
                 let yk = st.scr(c, "hb_k", b * nkv * hd * 4)?;
@@ -4467,7 +4539,14 @@ unsafe fn big(
                 }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
-                mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
+                match pl.attn_out.as_deref() {
+                    Some(w) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    None => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                }
             }
         }
         let inter = pl.inter;
@@ -4490,12 +4569,17 @@ unsafe fn big(
             let tot = (b * inter) as u64;
             let (in_i, bb_i) = (inter as i32, b as i32);
             unsafe {
-                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+                let act_i = pl.gelu as i32;
+                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i, act_i))?;
             }
             bst(c, 6, tm)?;
             unsafe { prism_rows(c, plan, bmh, bmh, inter, inter, b)? };
             if pl.moe.is_some() {
                 mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
+            } else if let Some(w) = pl.ffn_out.as_deref() {
+                let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                mul(&pl.down, bmh, by, hidden, 16.0, 0.0)?;
+                unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
             } else {
                 mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
             }
@@ -4503,6 +4587,11 @@ unsafe fn big(
         if let Some(m) = &pl.moe {
             unsafe { moe_grouped(c, st, fx, m, bh, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
             bst(c, 6, tm)?;
+        }
+        if let Some(s) = pl.layer_scale {
+            // Gemma-4's layer scalar on the whole residual row
+            let tot = (b * hidden) as u64;
+            unsafe { c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bh, s, tot))? };
         }
         if tapping {
             if let Some(s) = want.iter().position(|&l| l == li) {

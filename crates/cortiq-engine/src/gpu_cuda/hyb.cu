@@ -316,6 +316,9 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
     // gemma bit 1: the head's RMS norm after the rotation (HunYuan), its
     // weight then applied to the rotated dims
     const bool late = (gemma & 2) != 0;
+    // bit 2: Gemma-4's scale-less V norm (`vnorm_head`): every V head
+    // RMS-normalized before the mirror keeps it
+    const bool vnorm = (gemma & 4) != 0;
     gemma &= 1;
     // the mirror row of the call's first row: from the call record when
     // given (a replayed graph), else the argument
@@ -357,6 +360,23 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
         for (int i = tid; i < HD; i += blockDim.x)
             xs[i] = late ? __fmul_rn(xs[i], inv) : __fmul_rn(__fmul_rn(xs[i], inv), gemma ? 1.0f + nw[i] : nw[i]);
     __syncthreads();
+    float vinv = 1.0f;
+    if (!isq && vnorm) {
+        const int g = u - nh;
+        float s2 = 0.0f;
+        for (int i = tid; i < HD; i += blockDim.x) {
+            float vv = v[(size_t)b * kvstride + (size_t)g * HD + i];
+            if (bv) vv = __fadd_rn(vv, bv[(size_t)g * HD + i]);
+            s2 = fmaf(vv, vv, s2);
+        }
+        for (int o = 16; o > 0; o >>= 1) s2 = __fadd_rn(s2, __shfl_xor_sync(FULL, s2, o));
+        if (lane == 0) red[warp] = s2;
+        __syncthreads();
+        double tot = 0.0;
+        for (int w = 0; w < NW; w++) tot += (double)red[w];
+        vinv = (float)(1.0 / sqrt(tot / (double)HD + (double)eps));
+        __syncthreads();
+    }
     const float* t = tab + (size_t)b * half * 2;
     for (int d = tid; d < HD; d += blockDim.x) {
         float val;
@@ -382,7 +402,8 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
             const int g = u - nh;
             Km[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(val);
             const float vv = v[(size_t)b * kvstride + (size_t)g * HD + d];
-            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(bv ? __fadd_rn(vv, bv[(size_t)g * HD + d]) : vv);
+            const float vb = bv ? __fadd_rn(vv, bv[(size_t)g * HD + d]) : vv;
+            Vm[((size_t)(slot0 + b) * nkv + g) * HD + d] = f2h_sat(vnorm ? __fmul_rn(vb, vinv) : vb);
         }
     }
 }
@@ -667,6 +688,15 @@ __device__ __forceinline__ u32 a_q4g(u32 W, int r) {
     return v;
 }
 
+// tanh-approximated GELU (HF `gelu_pytorch_tanh`), `inference::gelu_tanh`
+// term for term: GeGLU's activation in the pair epilogue and the prompt path.
+__device__ __forceinline__ float gelu_t(float x) {
+    const float c = 0.7978846f;
+    const float x3 = __fmul_rn(__fmul_rn(__fmul_rn(0.044715f, x), x), x);
+    const float t = tanhf(__fmul_rn(c, __fadd_rn(x, x3)));
+    return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, t));
+}
+
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -872,7 +902,9 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 g = __fadd_rn(g, part[k][b][t][ln][i]);
                 u = __fadd_rn(u, part[k][b][t][ln][i + 2]);
             }
-            const float v = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u);
+            // kind bit 0x200: GeGLU (tanh GELU), else SwiGLU
+            const float act = (jb.kind & 0x200) ? gelu_t(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
+            const float v = __fmul_rn(act, u);
             put3(q0, q1, q1, (size_t)j * jb.ystride + r, v);
         }
         return;
@@ -1355,7 +1387,7 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int str
 // The prompt path's FFN middle from a gate/up pair GEMM: y [B][2 inter] in
 // the pair's row order (tile t: 8 gate rows, then the same 8 up rows) into
 // f16 xh [B][inter] = silu(gate) * up / 16.
-extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B)
+extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B, int act)
 {
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)B * inter) return;
@@ -1364,7 +1396,8 @@ extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* _
     const float* yr = y + b * 2 * inter;
     const int base = (r >> 3) * 16 + (r & 7);
     const float g = yr[base], u = yr[base + 8];
-    xh[i] = f2h_sat(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u) * 0.0625f);
+    const float a = act ? gelu_t(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
+    xh[i] = f2h_sat(__fmul_rn(a, u) * 0.0625f);
 }
 
 // ---------------------------------------------------------- repack on card

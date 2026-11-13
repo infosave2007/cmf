@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decodes at 135.3 tok/s against Vulkan's 56.5 on an RTX A5000 (fast build), a 4096-token prompt 3320 against
   90 tok/s (first token 1.23 against 45.5 s); the greedy text identical to Vulkan's.
 
+- Gemma-4 on the CUDA hybrid arm: a layer's own head geometry (the global layers' one KV head of 512 beside the
+  sliding layers' eight of 256: their attention kernels a module of their own, the K/V mirror's rows, the
+  buffers at the widest layer), the scale-less V norm before the mirror (`hy_qk`), GeGLU (tanh GELU) in the
+  gate/up pair's epilogue and on the prompt path, and the sandwich norms and layer scale on the prompt path.
+  humanizer-12B, which ran op by op on CUDA at 5.1 tok/s, decodes at 48.0 tok/s against Vulkan's 42.1 on an RTX
+  A5000 (fast build), a 4096-token prompt 779 against 597 tok/s (first token 5.3 against 6.9 s); the greedy text
+  identical to the CPU's on both.
+
 ### Fixed
 - Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
   was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
