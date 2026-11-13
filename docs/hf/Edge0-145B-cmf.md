@@ -42,9 +42,9 @@ Measured on one RTX PRO 6000 96 GB, with draft tokens (MTP) on.
 
 | your card | backend | what it needs |
 |---|---|---|
-| NVIDIA, 80 GB or more | [CUDA](#cuda-one-nvidia-card), the whole model on the card | cortiq 0.8.94+ built with `--features cuda`, CUDA 12.8+ libraries |
+| NVIDIA, 80 GB or more | [CUDA](#cuda-one-nvidia-card), the whole model on the card | cortiq 0.8.95+ built with `--features cuda`, CUDA 12.8+ libraries |
 | NVIDIA, 12 GB to 80 GB | [CUDA](#cuda--smaller-cards), part of the experts in RAM | the same, and 128 GB of RAM |
-| 64 GB or more, with a Vulkan driver | [Vulkan](#vulkan-one-card) | cortiq 0.8.94+ (prebuilt binaries) |
+| 64 GB or more, with a Vulkan driver | [Vulkan](#vulkan-one-card) | cortiq 0.8.95+ (prebuilt binaries) |
 | 24 GB to 64 GB, with a Vulkan driver | [Vulkan](#vulkan--smaller-cards), part of the experts in RAM | the same, and 128 GB of RAM |
 
 The file and the server API are the same for both backends; an NVIDIA card can run either. For a smaller card, take [Edge0-120B](https://huggingface.co/infosave/Edge0-120B-cmf).
@@ -113,7 +113,7 @@ on it. What each backend needs, its settings and speeds are below; server option
 | RAM | 96 GB (the n-gram table, 52 GB, is pinned in RAM); 128 GB on a smaller card |
 | disk | 111 GB |
 | OS | Linux |
-| cortiq | 0.8.94 or later, built with `--features cuda`; the prebuilt binaries have no CUDA |
+| cortiq | 0.8.95 or later, built with `--features cuda`; the prebuilt binaries have no CUDA |
 
 ### CUDA · Install
 
@@ -198,7 +198,7 @@ A 16K prompt does not fit a 12 GB card with this model: take [Edge0-120B](https:
 | RAM | 64 GB (the n-gram table, 52 GB, stays in RAM); 128 GB on a smaller card |
 | disk | 111 GB |
 | OS | Linux |
-| cortiq | 0.8.94 or later: a [prebuilt binary](https://github.com/infosave2007/cmf/releases) or `cargo install` |
+| cortiq | 0.8.95 or later: a [prebuilt binary](https://github.com/infosave2007/cmf/releases) or `cargo install` |
 
 ### Vulkan · Install
 
@@ -335,9 +335,9 @@ CMF of it (they match Edge0's to within Q8_0's rounding; the draft head's expert
 
 | ваша карта | бэкенд | что нужно |
 |---|---|---|
-| NVIDIA от 80 ГБ | [CUDA](#cuda-одна-карта-nvidia), вся модель на карте | cortiq 0.8.94+ со сборкой `--features cuda`, библиотеки CUDA 12.8+ |
+| NVIDIA от 80 ГБ | [CUDA](#cuda-одна-карта-nvidia), вся модель на карте | cortiq 0.8.95+ со сборкой `--features cuda`, библиотеки CUDA 12.8+ |
 | NVIDIA от 12 до 80 ГБ | [CUDA](#cuda--карты-поменьше), часть экспертов в ОЗУ | то же и 128 ГБ ОЗУ |
-| от 64 ГБ, с драйвером Vulkan | [Vulkan](#vulkan-одна-карта) | cortiq 0.8.94+ (готовые сборки) |
+| от 64 ГБ, с драйвером Vulkan | [Vulkan](#vulkan-одна-карта) | cortiq 0.8.95+ (готовые сборки) |
 | от 24 до 64 ГБ, с драйвером Vulkan | [Vulkan](#vulkan--карты-поменьше), часть экспертов в ОЗУ | то же и 128 ГБ ОЗУ |
 
 Файл и API сервера одни для обоих бэкендов; карта NVIDIA работает с любым из них. Для карты поменьше — [Edge0-120B](https://huggingface.co/infosave/Edge0-120B-cmf).
@@ -406,7 +406,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | ОЗУ | 96 ГБ (таблица n-грамм, 52 ГБ, закреплена в ОЗУ); 128 ГБ на карте поменьше |
 | диск | 111 ГБ |
 | ОС | Linux |
-| cortiq | 0.8.94 или новее, сборка с `--features cuda`; в готовых сборках CUDA нет |
+| cortiq | 0.8.95 или новее, сборка с `--features cuda`; в готовых сборках CUDA нет |
 
 #### CUDA · Установка
 
@@ -491,7 +491,7 @@ CMF_GPU=cuda CMF_SERVE_SLOTS=1 cortiq serve edge0-145b.cmf --host 127.0.0.1 --po
 | ОЗУ | 64 ГБ (таблица n-грамм, 52 ГБ, живёт в ОЗУ); 128 ГБ на карте поменьше |
 | диск | 111 ГБ |
 | ОС | Linux |
-| cortiq | 0.8.94 или новее: [готовая сборка](https://github.com/infosave2007/cmf/releases) или `cargo install` |
+| cortiq | 0.8.95 или новее: [готовая сборка](https://github.com/infosave2007/cmf/releases) или `cargo install` |
 
 #### Vulkan · Установка
 
@@ -627,9 +627,9 @@ Edge0 的 [Edge0-145B](https://huggingface.co/Edge0/Edge0-145B-NVFP4) 是基于 
 
 | 你的显卡 | 后端 | 需要 |
 |---|---|---|
-| NVIDIA，80 GB 以上 | [CUDA](#cuda-后端一张-nvidia-显卡)，整个模型在显卡上 | cortiq 0.8.94+，以 `--features cuda` 构建；CUDA 12.8+ 库 |
+| NVIDIA，80 GB 以上 | [CUDA](#cuda-后端一张-nvidia-显卡)，整个模型在显卡上 | cortiq 0.8.95+，以 `--features cuda` 构建；CUDA 12.8+ 库 |
 | NVIDIA，12 GB 至 80 GB | [CUDA](#cuda--较小的显卡)，部分专家在内存中 | 同上，另需 128 GB 内存 |
-| 64 GB 以上，带 Vulkan 驱动 | [Vulkan](#vulkan-后端一张显卡) | cortiq 0.8.94+（预编译版本） |
+| 64 GB 以上，带 Vulkan 驱动 | [Vulkan](#vulkan-后端一张显卡) | cortiq 0.8.95+（预编译版本） |
 | 24 GB 至 64 GB，带 Vulkan 驱动 | [Vulkan](#vulkan--较小的显卡)，部分专家在内存中 | 同上，另需 128 GB 内存 |
 
 两种后端使用相同的文件和服务器 API；NVIDIA 显卡两种都能用。显存较小时请用 [Edge0-120B](https://huggingface.co/infosave/Edge0-120B-cmf)。
@@ -696,7 +696,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | 内存 | 96 GB（n-gram 表 52 GB 锁定在内存中）；较小的显卡需 128 GB |
 | 磁盘 | 111 GB |
 | 系统 | Linux |
-| cortiq | 0.8.94 或更高，以 `--features cuda` 构建；预编译版本不含 CUDA |
+| cortiq | 0.8.95 或更高，以 `--features cuda` 构建；预编译版本不含 CUDA |
 
 #### CUDA · 安装
 
@@ -779,7 +779,7 @@ CMF_GPU=cuda CMF_SERVE_SLOTS=1 cortiq serve edge0-145b.cmf --host 127.0.0.1 --po
 | 内存 | 64 GB（n-gram 表 52 GB 常驻内存）；较小的显卡需 128 GB |
 | 磁盘 | 111 GB |
 | 系统 | Linux |
-| cortiq | 0.8.94 或更高：[预编译版本](https://github.com/infosave2007/cmf/releases)或 `cargo install` |
+| cortiq | 0.8.95 或更高：[预编译版本](https://github.com/infosave2007/cmf/releases)或 `cargo install` |
 
 #### Vulkan · 安装
 

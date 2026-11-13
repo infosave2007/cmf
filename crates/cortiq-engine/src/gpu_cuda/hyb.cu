@@ -621,6 +621,16 @@ __device__ __forceinline__ u32 a_q1(u32 B, int r) {
     return 0x3F803F80u | ((nb & 1u) << 15) | ((nb & 2u) << 30);
 }
 
+// The A register r of a ternary tile lane: two-bit codes c at bits 4r and
+// 4r + 2 as bf16x2 c - 1 (128 + c is 0x4300 | c; one fma takes 129 off).
+__device__ __forceinline__ u32 a_q1t(u32 W, int r) {
+    const u32 t = W >> (4 * r);
+    const u32 h = (t & 3u) | ((t & 0xCu) << 14) | 0x43004300u;
+    u32 v;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(v) : "r"(h), "r"(0x3F803F80u), "r"(0xC301C301u));
+    return v;
+}
+
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -660,12 +670,14 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     // field (aux0, or none) taken into the input rows
     const bool i8 = (jb.kind & 0xFF) == 5;
     const float* cf = i8 ? (const float*)jb.aux0 : nullptr;
-    // kind 3: q1 tiles (a lane's 16 sign bits a group), a (row, group)'s f16 scale in aux0
+    // kind 3: q1 tiles (a lane's 16 sign bits a group), a (row, group)'s f16 scale in aux0;
+    // kind 2: ternary tiles (a lane's 16 two-bit codes, value + 1), the same scales
     const bool q1 = (jb.kind & 0xFF) == 3;
+    const bool q1t = (jb.kind & 0xFF) == 2;
     // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
     for (int i = tid; i < 16 * TB; i += blockDim.x) {
         const int rr = tile0 * 16 + i;
-        par_s[i] = (rr >= rows || q1) ? make_float2(0.0f, 0.0f)
+        par_s[i] = (rr >= rows || q1 || q1t) ? make_float2(0.0f, 0.0f)
                    : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
                                       : ((const float2*)jb.aux1)[rr];
     }
@@ -734,7 +746,14 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
             const size_t tg = (size_t)tile * gpr + g;
             u32 a00, a01, a02, a03, a10, a11, a12, a13;
             float sa, sb;
-            if (q1) {
+            if (q1t) {
+                const u32 W2 = ((const u32*)jb.w)[tg * 32 + lane];
+                const u16* S1 = (const u16*)jb.aux0 + tg * 16;
+                sa = h2f(S1[gid]);
+                sb = h2f(S1[gid + 8]);
+                a00 = a_q1t(W2, 0), a01 = a_q1t(W2, 1), a02 = a_q1t(W2, 2), a03 = a_q1t(W2, 3);
+                a10 = a_q1t(W2, 4), a11 = a_q1t(W2, 5), a12 = a_q1t(W2, 6), a13 = a_q1t(W2, 7);
+            } else if (q1) {
                 const u32 B = ((const u16*)jb.w)[tg * 32 + lane];
                 const u16* S1 = (const u16*)jb.aux0 + tg * 16;
                 sa = h2f(S1[gid]);
@@ -2367,6 +2386,91 @@ extern "C" __global__ void hy_expand_q1r(const u16* __restrict__ T, const u16* _
             const float sc = h2f(S[tg * 16 + gid + 8 * (m & 1)]);
             const float lo = ((B >> (2 * reg)) & 1u) ? sc : -sc;
             const float hi = ((B >> (2 * reg + 1)) & 1u) ? sc : -sc;
+            *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
+        }
+}
+
+// A q1t matrix (per 32-column group [f16 scale][7 bytes of base-3 codes, five
+// a byte: 0 -> 0, 1 -> +s, 2 -> -s]; no outlier rows) as ternary tiles (kind
+// 2): lane l holds at bits 4r, 4r + 2 the codes (value + 1) of its A register
+// r's two elements (`hy_repack1`'s order); S[t][g][16] the rows' f16 scales.
+__device__ __forceinline__ u32 q1t_val1(const u8* c7, int k) {
+    const u32 p3[5] = {1u, 3u, 9u, 27u, 81u};
+    const u32 d = ((u32)c7[k / 5] / p3[k % 5]) % 3u;
+    return d == 1u ? 2u : (d == 2u ? 0u : 1u);
+}
+
+extern "C" __global__ void hy_repack1t(const u8* __restrict__ A, const u8* __restrict__ Bm, int pair, u32* __restrict__ T,
+                                       u16* __restrict__ S, int rows, int cols)
+{
+    const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)ntile * gpr * 32) return;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    u32 w = 0u;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            const int reg = s * 4 + m;
+            u32 lo = 1u, hi = 1u;
+            if (r < rows) {
+                const bool second = pair && (r & 15) >= 8;
+                const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+                const u8* c7 = (second ? Bm : A) + ((size_t)sr * gpr + g) * 9 + 2;
+                const int c = 16 * s + 8 * (m >> 1) + 2 * tig;
+                lo = q1t_val1(c7, c);
+                hi = q1t_val1(c7, c + 1);
+            }
+            w |= (lo | (hi << 2)) << (4 * reg);
+        }
+    T[idx] = w;
+    if (tig == 0) {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int r = tile * 16 + gid + 8 * h;
+            u16 sc = 0;
+            if (r < rows) {
+                const bool second = pair && (r & 15) >= 8;
+                const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+                const u8* t9 = (second ? Bm : A) + ((size_t)sr * gpr + g) * 9;
+                sc = (u16)(t9[0] | (t9[1] << 8));
+            }
+            S[tg * 16 + gid + 8 * h] = sc;
+        }
+    }
+}
+
+// `hy_expand_pr` for kind 2 (ternary tiles): row tiles [tile0, tile0 + nt)
+// as f16 rows, W holding those rows only.
+extern "C" __global__ void hy_expand_q1tr(const u32* __restrict__ T, const u16* __restrict__ S, u16* __restrict__ W, int rows,
+                                          int cols, int tile0, int nt)
+{
+    const int gpr = cols >> 5;
+    const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx0 >= (size_t)nt * gpr * 32) return;
+    const size_t idx = idx0 + (size_t)tile0 * gpr * 32;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    const u32 w = T[idx];
+    const int r0 = tile0 * 16;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
+            const int reg = s * 4 + m;
+            const float sc = h2f(S[tg * 16 + gid + 8 * (m & 1)]);
+            const float lo = ((float)((w >> (4 * reg)) & 3u) - 1.0f) * sc;
+            const float hi = ((float)((w >> (4 * reg + 2)) & 3u) - 1.0f) * sc;
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }

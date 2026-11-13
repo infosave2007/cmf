@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.94] — 2026-11-13
+## [0.8.95] — 2026-11-13
 
 ### Added
 - Edge0-145B and Edge0-120B (latent MoE on Qwen3.8-Flash-Next, Edge0's NVFP4 build) run from one CMF file each:
@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a profile.
 - Vulkan: the expert banks of the layers a card has no room for stay in host-visible system memory and the
   kernels read them over the bus (Linux). Edge0-145B within 24 GB: 35 tok/s of code, 25 tok/s of prompt.
+
+## [0.8.94] — 2026-11-13
+
+### Added
+- q1t (ternary) weights on the CUDA hybrid arm (job kind 2): a q1t matrix or gate/up pair without outlier rows
+  is tiled once on the card (`hy_repack1t`) into a lane's 16 two-bit codes (value + 1) a 32-column group,
+  built into bf16x2 registers exactly (128 + c, one fma takes 129 off), a (row, group)'s f16 scale the group's
+  factor; the prompt path expands them to f16 by bands (`hy_expand_q1tr`) and a q1t head takes the
+  tensor-core kernels. A q1t matrix with outlier rows still declines. Bonsai-8B, which ran op by op on CUDA at
+  1.3 tok/s, runs the whole token graph. RTX A5000, release build, CUDA against Vulkan on the same card (the
+  greedy texts identical to the CPU's): decode 100.4-100.7 against 8.3 tok/s, a 3072-token prompt 2117 against
+  36 tok/s (first token 1.45 against 74.9 s) and 92.1 against 7.0 tok/s after it.
 
 ## [0.8.93] — 2026-11-13
 

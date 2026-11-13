@@ -204,9 +204,9 @@ Measured on one RTX PRO 6000 96 GB, with draft tokens (MTP) on.
 
 | your card | backend | what it needs |
 |---|---|---|
-| NVIDIA, {cg} GB or more | [CUDA](#cuda-one-nvidia-card), the whole model on the card | cortiq 0.8.94+ built with `--features cuda`, CUDA 12.8+ libraries |
+| NVIDIA, {cg} GB or more | [CUDA](#cuda-one-nvidia-card), the whole model on the card | cortiq 0.8.95+ built with `--features cuda`, CUDA 12.8+ libraries |
 | NVIDIA, {c_min} GB to {cg} GB | [CUDA](#cuda--smaller-cards), part of the experts in RAM | the same, and {ram_small} GB of RAM |
-| {vg} GB or more, with a Vulkan driver | [Vulkan](#vulkan-one-card) | cortiq 0.8.94+ (prebuilt binaries) |
+| {vg} GB or more, with a Vulkan driver | [Vulkan](#vulkan-one-card) | cortiq 0.8.95+ (prebuilt binaries) |
 {f"| {v_min} GB to {vg} GB, with a Vulkan driver | [Vulkan](#vulkan--smaller-cards), part of the experts in RAM | the same, and {ram_small} GB of RAM |" if vt else ""}
 
 The file and the server API are the same for both backends; an NVIDIA card can run either. {alt["en"]}
@@ -266,7 +266,7 @@ on it. What each backend needs, its settings and speeds are below; server option
 | RAM | 96 GB (the n-gram table, 52 GB, is pinned in RAM){f"; {ram_small} GB on a smaller card" if ram_small != 96 else ""} |
 | disk | {disk} GB |
 | OS | Linux |
-| cortiq | 0.8.94 or later, built with `--features cuda`; the prebuilt binaries have no CUDA |
+| cortiq | 0.8.95 or later, built with `--features cuda`; the prebuilt binaries have no CUDA |
 
 ### CUDA · Install
 
@@ -336,7 +336,7 @@ compute the experts off the card. One run per size, the protocol above.{f" Draft
 | RAM | 64 GB (the n-gram table, 52 GB, stays in RAM){f"; {ram_small} GB on a smaller card" if vt else ""} |
 | disk | {disk} GB |
 | OS | Linux |
-| cortiq | 0.8.94 or later: a [prebuilt binary](https://github.com/infosave2007/cmf/releases) or `cargo install` |
+| cortiq | 0.8.95 or later: a [prebuilt binary](https://github.com/infosave2007/cmf/releases) or `cargo install` |
 
 ### Vulkan · Install
 
@@ -454,9 +454,9 @@ CMF of it (they match Edge0's to within Q8_0's rounding; the draft head's expert
 
 | ваша карта | бэкенд | что нужно |
 |---|---|---|
-| NVIDIA от {cg} ГБ | [CUDA](#cuda-одна-карта-nvidia), вся модель на карте | cortiq 0.8.94+ со сборкой `--features cuda`, библиотеки CUDA 12.8+ |
+| NVIDIA от {cg} ГБ | [CUDA](#cuda-одна-карта-nvidia), вся модель на карте | cortiq 0.8.95+ со сборкой `--features cuda`, библиотеки CUDA 12.8+ |
 | NVIDIA от {c_min} до {cg} ГБ | [CUDA](#cuda--карты-поменьше), часть экспертов в ОЗУ | то же и {ram_small} ГБ ОЗУ |
-| от {vg} ГБ, с драйвером Vulkan | [Vulkan](#vulkan-одна-карта) | cortiq 0.8.94+ (готовые сборки) |
+| от {vg} ГБ, с драйвером Vulkan | [Vulkan](#vulkan-одна-карта) | cortiq 0.8.95+ (готовые сборки) |
 {f"| от {v_min} до {vg} ГБ, с драйвером Vulkan | [Vulkan](#vulkan--карты-поменьше), часть экспертов в ОЗУ | то же и {ram_small} ГБ ОЗУ |" if vt else ""}
 
 Файл и API сервера одни для обоих бэкендов; карта NVIDIA работает с любым из них. {alt["ru"]}
@@ -516,7 +516,7 @@ Linux, одна карта. Пять шагов от нуля до ответа.
 | ОЗУ | 96 ГБ (таблица n-грамм, 52 ГБ, закреплена в ОЗУ){f"; {ram_small} ГБ на карте поменьше" if ram_small != 96 else ""} |
 | диск | {disk} ГБ |
 | ОС | Linux |
-| cortiq | 0.8.94 или новее, сборка с `--features cuda`; в готовых сборках CUDA нет |
+| cortiq | 0.8.95 или новее, сборка с `--features cuda`; в готовых сборках CUDA нет |
 
 #### CUDA · Установка
 
@@ -586,7 +586,7 @@ cargo install cortiq-cli --locked --features cuda
 | ОЗУ | 64 ГБ (таблица n-грамм, 52 ГБ, живёт в ОЗУ){f"; {ram_small} ГБ на карте поменьше" if vt else ""} |
 | диск | {disk} ГБ |
 | ОС | Linux |
-| cortiq | 0.8.94 или новее: [готовая сборка](https://github.com/infosave2007/cmf/releases) или `cargo install` |
+| cortiq | 0.8.95 или новее: [готовая сборка](https://github.com/infosave2007/cmf/releases) или `cargo install` |
 
 #### Vulkan · Установка
 
@@ -703,9 +703,9 @@ Edge0 的 [{name}](https://huggingface.co/{src}) 是基于 [Qwen3.8-Flash-Next](
 
 | 你的显卡 | 后端 | 需要 |
 |---|---|---|
-| NVIDIA，{cg} GB 以上 | [CUDA](#cuda-后端一张-nvidia-显卡)，整个模型在显卡上 | cortiq 0.8.94+，以 `--features cuda` 构建；CUDA 12.8+ 库 |
+| NVIDIA，{cg} GB 以上 | [CUDA](#cuda-后端一张-nvidia-显卡)，整个模型在显卡上 | cortiq 0.8.95+，以 `--features cuda` 构建；CUDA 12.8+ 库 |
 | NVIDIA，{c_min} GB 至 {cg} GB | [CUDA](#cuda--较小的显卡)，部分专家在内存中 | 同上，另需 {ram_small} GB 内存 |
-| {vg} GB 以上，带 Vulkan 驱动 | [Vulkan](#vulkan-后端一张显卡) | cortiq 0.8.94+（预编译版本） |
+| {vg} GB 以上，带 Vulkan 驱动 | [Vulkan](#vulkan-后端一张显卡) | cortiq 0.8.95+（预编译版本） |
 {f"| {v_min} GB 至 {vg} GB，带 Vulkan 驱动 | [Vulkan](#vulkan--较小的显卡)，部分专家在内存中 | 同上，另需 {ram_small} GB 内存 |" if vt else ""}
 
 两种后端使用相同的文件和服务器 API；NVIDIA 显卡两种都能用。{alt["zh"]}
@@ -763,7 +763,7 @@ Linux，一张显卡。五步即可得到回答。
 | 内存 | 96 GB（n-gram 表 52 GB 锁定在内存中）{f"；较小的显卡需 {ram_small} GB" if ram_small != 96 else ""} |
 | 磁盘 | {disk} GB |
 | 系统 | Linux |
-| cortiq | 0.8.94 或更高，以 `--features cuda` 构建；预编译版本不含 CUDA |
+| cortiq | 0.8.95 或更高，以 `--features cuda` 构建；预编译版本不含 CUDA |
 
 #### CUDA · 安装
 
@@ -831,7 +831,7 @@ cargo install cortiq-cli --locked --features cuda
 | 内存 | 64 GB（n-gram 表 52 GB 常驻内存）{f"；较小的显卡需 {ram_small} GB" if vt else ""} |
 | 磁盘 | {disk} GB |
 | 系统 | Linux |
-| cortiq | 0.8.94 或更高：[预编译版本](https://github.com/infosave2007/cmf/releases)或 `cargo install` |
+| cortiq | 0.8.95 或更高：[预编译版本](https://github.com/infosave2007/cmf/releases)或 `cargo install` |
 
 #### Vulkan · 安装
 
