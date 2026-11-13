@@ -4721,6 +4721,8 @@ pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
         Backend::Metal => crate::gpu_metal::vit::encode(a, x),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::encode(a, x),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::vit_encode(a, x),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4783,6 +4785,8 @@ pub fn sam_encode(a: &SamArgs, x: &[f32], out: &mut Vec<f32>) -> bool {
         Backend::Metal => crate::gpu_metal::vit::sam_encode(a, x, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::sam_encode(a, x, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam_encode(a, x, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

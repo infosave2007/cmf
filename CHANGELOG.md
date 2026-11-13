@@ -75,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path; the host's candidate lists go up a call at a time. Unlimited-OCR-2 on an RTX A5000, one page: decode
   327.9 tok/s against 50.8 before and Vulkan's 210.4, first token after the page's rows 1.1 s against 21.1 (Vulkan
   2.5); the text the CPU's but for a box coordinate off by one, as Vulkan's.
+- Vision towers on CUDA (`gpu::vit_encode`, `gpu::sam_encode`, `gpu_cuda/vit.rs`): the pre-norm ViT blocks of a
+  CLIP-class tower and SAM's blocks (windowed attention with decomposed relative positions, the global blocks'
+  bias in the softmax) and neck with the activations on the card, cuBLAS f32 products; they ran on the host
+  before. Unlimited-OCR-2 on an RTX A5000, a one-page run end to end: 8.4 s against 66.7 (Vulkan 16.5), a tile's
+  SAM 0.11-0.15 s and CLIP 0.015-0.03 s; the text the same as with the host's towers.
 
 ### Changed
 - The CUDA hybrid arm's tensor-core matvec: a launch of its own for each codec (q4tp, int8, q1, ternary, q2tp,
