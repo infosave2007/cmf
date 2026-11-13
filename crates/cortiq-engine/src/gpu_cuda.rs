@@ -879,7 +879,7 @@ mod h3;
 pub use h3::{
     h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_prof_report, h3_release, h3_resident_bytes,
     flux_vae_chain, h3_te_chain, h3_vae_conv2d, lumina_block, ltx_chain, ltx_vae_chain, moss_chain, primal_vae_run, qi21_prefill, qi21_release,
-    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, zimage_prepare, zimage_release, zimage_step,
+    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, zimage_prepare, zimage_release, zimage_step,
 };
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {

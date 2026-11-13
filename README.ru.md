@@ -389,8 +389,8 @@ cortiq run dory-turbo.cmf --prompt "Напиши функцию на Rust, ко�
 [Kandinsky S2V](https://huggingface.co/infosave/Kandinsky-S2V-1.0-Pro-distill-cmf)
 превращает опорный кадр и дорожку речи в видео с аватаром, где движется вся фигура. В одном
 файле на 24 ГБ лежат DiT на 21B, энкодеры речи и текста, CLIP и VAE. L40S рендерит 5 с видео
-512×512 за 5.6 минуты при 16.2 ГБ видеопамяти, MacBook Air M4 — за 4.45 часа при 14.6 ГБ
-общей памяти:
+512×512 за 5.6 минуты при 16.2 ГБ видеопамяти (Vulkan), RTX A5000 — за 10.5 минуты (CUDA;
+Vulkan на этой карте 13.9), MacBook Air M4 — за 4.45 часа при 14.6 ГБ общей памяти:
 
 ```sh
 cortiq s2v --model kandinsky-s2v-pro-q4tp.cmf --image reference.png --audio speech.wav --out avatar.avi

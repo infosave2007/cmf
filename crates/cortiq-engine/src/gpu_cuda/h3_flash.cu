@@ -185,3 +185,175 @@ extern "C" __global__ void h3_flash(const u16* __restrict__ Q, const u16* __rest
         if (rB < n) *(u32*)(oB + 8 * j) = pack2h_sat(o[j][2] * iB, o[j][3] * iB);
     }
 }
+
+// The same attention with the block's four warps sharing each key / value
+// tile through shared memory: a tile of BN keys (two or one 16-key steps) is
+// one contiguous run of K and of V in the layouts above, copied with 16-byte
+// asynchronous copies into one of two stages while the warps work on the
+// other. A warp reads its operands from the stage exactly as `h3_flash` reads
+// them from memory; the 16-byte chunks sit XOR-swizzled (chunk ^ (chunk >> 3)
+// & 7) so the eight lanes of each quarter-warp load hit eight bank groups.
+// Same arguments, layouts and launch (128 threads, 64 query rows a block).
+#define BN (HD <= 128 ? 32 : 16)
+#define KCH (BN * HD / 8)
+#define LOG2E 1.4426950408889634f
+
+__device__ __forceinline__ int swz(int c) { return c ^ ((c >> 3) & 7); }
+
+__device__ __forceinline__ float ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void cp16(void* s, const void* g) {
+    const u32 sa = (u32)__cvta_generic_to_shared(s);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(g));
+}
+
+extern "C" __global__ void __launch_bounds__(128) h3_flash2(const u16* __restrict__ Q, const u16* __restrict__ K,
+                                                            const u16* __restrict__ V, u16* __restrict__ AO, int n, int ns,
+                                                            int nh, float scale, int hpk)
+{
+    __shared__ __align__(16) uint4 sK[2][KCH];
+    __shared__ __align__(16) uint4 sV[2][KCH];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int plane = blockIdx.y, g = plane / nh, h = plane - g * nh;
+    const int b0 = (int)blockIdx.x * 64;
+    const int q0 = b0 + warp * 16;
+    const int kplane = plane / hpk;
+    const u16* Kg = K + (size_t)kplane * n * HD;
+    const u16* Vg = V + (size_t)kplane * ns * HD;
+    const int nsub = ns >> 4;
+    const int rA = q0 + gid, rB = q0 + gid + 8;
+    const u16* Qp = Q + (size_t)plane * n * HD;
+    const u16* qA = Qp + (size_t)min(rA, n - 1) * HD + 2 * tig;
+    const u16* qB = Qp + (size_t)min(rB, n - 1) * HD + 2 * tig;
+    u32 qa[NS][4];
+#pragma unroll
+    for (int s = 0; s < NS; s++) {
+        qa[s][0] = *(const u32*)(qA + 16 * s);
+        qa[s][1] = *(const u32*)(qB + 16 * s);
+        qa[s][2] = *(const u32*)(qA + 16 * s + 8);
+        qa[s][3] = *(const u32*)(qB + 16 * s + 8);
+    }
+    float o[ND][4];
+#pragma unroll
+    for (int j = 0; j < ND; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+    float mA = -INF, mB = -INF, lA = 0.0f, lB = 0.0f;
+    const float sl = scale * LOG2E;
+#if CAUSAL
+    const int bend = min(n, b0 + 64), kend = min(n, q0 + 16);
+#else
+    const int bend = n, kend = n;
+#endif
+    // a tile's copy: chunk c of K is row c / (HD/8) (clamped to the last key)
+    // and of V the 16-key step c / (2 HD) (clamped to the last step)
+    auto load = [&](int st, int k0) {
+#pragma unroll
+        for (int c = tid; c < KCH; c += 128) {
+            const int row = c / (HD / 8), cc = c - row * (HD / 8);
+            cp16(&sK[st][swz(c)], Kg + (size_t)min(k0 + row, n - 1) * HD + cc * 8);
+            const int sub = c / (2 * HD), w = c - sub * (2 * HD);
+            cp16(&sV[st][swz(c)], Vg + (size_t)min((k0 >> 4) + sub, nsub - 1) * (16 * HD) + w * 8);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    const int nt = (bend + BN - 1) / BN;
+    load(0, 0);
+    for (int t = 0; t < nt; t++) {
+        if (t + 1 < nt) {
+            load((t + 1) & 1, (t + 1) * BN);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+        const uint4* tk = sK[t & 1];
+        const uint4* tv = sV[t & 1];
+#pragma unroll
+        for (int u = 0; u < BN / 16; u++) {
+            const int k0 = t * BN + u * 16;
+            if (k0 >= kend) break;
+            // K rows 16 u + gid and 16 u + 8 + gid of the tile, this lane's
+            // chunks tig·HD/32 + j
+            const int ra = (16 * u + gid) * (HD / 8) + tig * (HD / 32), rb = ra + 8 * (HD / 8);
+            float c0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, c1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int s = 0; s < NS; s += 2) {
+                const uint4 a = tk[swz(ra + (s >> 1))], b = tk[swz(rb + (s >> 1))];
+                mma_f16(c0, qa[s][0], qa[s][1], qa[s][2], qa[s][3], a.x, a.y);
+                mma_f16(c1, qa[s][0], qa[s][1], qa[s][2], qa[s][3], b.x, b.y);
+                mma_f16(c0, qa[s + 1][0], qa[s + 1][1], qa[s + 1][2], qa[s + 1][3], a.z, a.w);
+                mma_f16(c1, qa[s + 1][0], qa[s + 1][1], qa[s + 1][2], qa[s + 1][3], b.z, b.w);
+            }
+            const int kc = k0 + 2 * tig;
+            float sA[4] = {c0[0], c0[1], c1[0], c1[1]};
+            float sB[4] = {c0[2], c0[3], c1[2], c1[3]};
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int key = kc + (i & 1) + (i >> 1) * 8;
+#if CAUSAL
+                sA[i] = (key < n && key <= rA) ? sA[i] * sl : -INF;
+                sB[i] = (key < n && key <= rB) ? sB[i] * sl : -INF;
+#else
+                sA[i] = key < n ? sA[i] * sl : -INF;
+                sB[i] = key < n ? sB[i] * sl : -INF;
+#endif
+            }
+            float tA = fmaxf(fmaxf(sA[0], sA[1]), fmaxf(sA[2], sA[3]));
+            float tB = fmaxf(fmaxf(sB[0], sB[1]), fmaxf(sB[2], sB[3]));
+            tA = fmaxf(tA, __shfl_xor_sync(0xffffffffu, tA, 1));
+            tB = fmaxf(tB, __shfl_xor_sync(0xffffffffu, tB, 1));
+            tA = fmaxf(tA, __shfl_xor_sync(0xffffffffu, tA, 2));
+            tB = fmaxf(tB, __shfl_xor_sync(0xffffffffu, tB, 2));
+            const float nA = fmaxf(mA, tA), nB = fmaxf(mB, tB);
+            const float fA = ex2(mA - nA), fB = ex2(mB - nB);
+            mA = nA;
+            mB = nB;
+            float eA[4], eB[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                eA[i] = ex2(sA[i] - nA);
+                eB[i] = ex2(sB[i] - nB);
+            }
+            lA = lA * fA + (eA[0] + eA[1]) + (eA[2] + eA[3]);
+            lB = lB * fB + (eB[0] + eB[1]) + (eB[2] + eB[3]);
+            if (fA != 1.0f || fB != 1.0f) {
+#pragma unroll
+                for (int j = 0; j < ND; j++) {
+                    o[j][0] *= fA;
+                    o[j][1] *= fA;
+                    o[j][2] *= fB;
+                    o[j][3] *= fB;
+                }
+            }
+            const u32 p0 = pack2h(eA[0] * PS, eA[1] * PS), p1 = pack2h(eB[0] * PS, eB[1] * PS);
+            const u32 p2 = pack2h(eA[2] * PS, eA[3] * PS), p3 = pack2h(eB[2] * PS, eB[3] * PS);
+            // the 16-key step u of V: this lane's chunks lane·HD/16 + j
+            const int vb = u * (2 * HD) + lane * (HD / 16);
+#pragma unroll
+            for (int j = 0; j < ND; j += 2) {
+                const uint4 v = tv[swz(vb + (j >> 1))];
+                mma_f16(o[j], p0, p1, p2, p3, v.x, v.y);
+                mma_f16(o[j + 1], p0, p1, p2, p3, v.z, v.w);
+            }
+        }
+        // the stage is refilled two tiles on
+        __syncthreads();
+    }
+    lA += __shfl_xor_sync(0xffffffffu, lA, 1);
+    lB += __shfl_xor_sync(0xffffffffu, lB, 1);
+    lA += __shfl_xor_sync(0xffffffffu, lA, 2);
+    lB += __shfl_xor_sync(0xffffffffu, lB, 2);
+    const float iA = 1.0f / (lA * PS), iB = 1.0f / (lB * PS);
+    const size_t inner = (size_t)nh * HD;
+    u16* oA = AO + ((size_t)g * n + rA) * inner + (size_t)h * HD + 2 * tig;
+    u16* oB = AO + ((size_t)g * n + rB) * inner + (size_t)h * HD + 2 * tig;
+#pragma unroll
+    for (int j = 0; j < ND; j++) {
+        if (rA < n) *(u32*)(oA + 8 * j) = pack2h_sat(o[j][0] * iA, o[j][1] * iA);
+        if (rB < n) *(u32*)(oB + 8 * j) = pack2h_sat(o[j][2] * iB, o[j][3] * iB);
+    }
+}

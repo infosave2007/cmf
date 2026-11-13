@@ -59,10 +59,14 @@ bytes stay on the card as they are and one block's planes are expanded right bef
 that block runs, so q4tp needs about 14 GB of VRAM for the DiT. On Metal the weights
 stay in the file mapping and are dequantized as a GEMM reads them, with one block
 viewed at a time, because the driver counts a view's whole length against its
-working-set limit. The VAE runs resident on both. `cortiq s2v` falls back to the CPU
-when the device declines, which at 36736 tokens is hours per segment.
+working-set limit. On CUDA the 60 visual blocks run as one chain over the H3 store,
+attention on the shared-tile flash kernel, and the VAE's encoder and decoder keep an f16
+stream on the card. The VAE runs resident on every backend. `cortiq s2v` falls back to
+the CPU when the device declines, which at 36736 tokens is hours per segment.
 
-An L40S renders 5 s at 512² in 5.6 minutes. A MacBook Air M4 (10-core GPU, 24 GB, no
+An L40S renders 5 s at 512² in 5.6 minutes (Vulkan). An RTX A5000 (24 GB) takes 36.9 s a
+step and 10.5 minutes for the clip on CUDA, with 1.3 s of VAE encode and 31.5 s of decode,
+at a peak of 22.9 GB; Vulkan on the same card takes 50.6 s a step and 13.9 minutes. A MacBook Air M4 (10-core GPU, 24 GB, no
 fan) takes 955–1047 s a step and 4.45 hours for the same clip, at a peak of 14.6 GB of
 unified memory.
 
