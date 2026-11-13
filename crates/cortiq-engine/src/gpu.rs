@@ -4782,6 +4782,8 @@ pub fn primal_vae_run(
         Backend::Metal => crate::gpu_metal::primal_vae::run(key, weights, plan, input, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::primal_vae::run(key, weights, plan, input, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::primal_vae_run(key, weights, plan, input, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

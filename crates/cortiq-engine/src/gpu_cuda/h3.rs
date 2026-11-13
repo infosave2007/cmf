@@ -47,6 +47,9 @@ pub use moss::moss_chain;
 #[path = "flux_vae.rs"]
 mod flux_vae;
 pub use flux_vae::{flux_vae_chain, qi21_vae_decode};
+#[path = "primal.rs"]
+mod primal;
+pub use primal::primal_vae_run;
 #[path = "zimage.rs"]
 mod zimage;
 pub use zimage::{zimage_prepare, zimage_release, zimage_step};
@@ -132,6 +135,9 @@ pub(super) struct H3State {
     zi_funcs: Option<zimage::ZiFuncs>,
     /// Its programs (a prompt and resolution each), the most recently used last.
     zi: Vec<zimage::ZiProg>,
+    /// The kernels of the Primal VAE (`primal.rs`) and its weights on the card.
+    pv_funcs: Option<primal::PvFuncs>,
+    pv: Option<primal::PvDev>,
 }
 
 impl H3State {
