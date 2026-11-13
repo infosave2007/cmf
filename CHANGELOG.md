@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.93] — 2026-11-13
+
+### Added
+- q1 weights on the CUDA hybrid arm (job kind 3): a q1 matrix or gate/up pair is tiled once on the card
+  (`hy_repack1`) into a lane's 16 sign bits a 32-column group, its register pairs built as bf16 +-1 from two
+  bits, a (row, group)'s f16 scale the group's factor; the prompt path expands the tiles to f16 by bands
+  (`hy_expand_q1r`), and a q1 vocabulary head (Bonsai's tied embedding) takes the tensor-core kernels. Bonsai,
+  which declined on its q1 gate/up pairs and ran op by op on CUDA at 1.7-25 tok/s, runs the whole token graph.
+  RTX A5000, release build, CUDA against Vulkan on the same card (the greedy texts identical to the CPU's):
+  Bonsai-1.7B 270.2-276.6 against 180.5-184.7 tok/s, a 4096-token prompt 10229 against 338 tok/s (first token
+  0.40 against 12.1 s); Bonsai-27B 35.3-35.6 against 26.3-26.9, the 4096-token prompt 932 against 32 tok/s
+  (4.4 against 127.8 s). At one row the q1 decode is bound by the tensor cores' eight-row tile, not the bus
+  (Bonsai-27B 27 ms a token over 5.1 GB): a CUDA-core matvec for that case is the next lever.
+
+## [0.8.92] — 2026-11-13
+
+### Added
+- A routed MoE model's long prompt takes the CUDA hybrid arm's prompt path, where it ran the small path 16 rows
+  at a time (every expert over all 16 rows, the attention row by row). The chunk's routed FFN is grouped by
+  expert: the router and the shared gate as f32 GEMMs, every row's top k on the card (`hy_moe_topk`, the
+  arithmetic of the small path's selection), the (row, pick) entries sorted by expert in one block
+  (`hy_moe_group`, ballots, entry order kept) with a gate/up and a down job for every 32 rows of an expert
+  (their row count in the job's `nr`), the picked rows laid out as input planes (`hy_moe_gather`), two
+  tensor-core launches over every expert's q4tp or int8 tiles (`hy_mmp_4_2_8`; `CMF_HYB_MOE_RMAX=64` takes
+  `hy_mmp_8_1_8`), and the weighted mixture with the shared expert (`hy_moe_gcombine`). The prompt path also
+  takes a sliding window (keys left of a row's window weigh nothing, a row block's keys start where its first
+  row's window does) and a local layer's rotation table. `CMF_HYB_MOE_BIG=0` keeps the small-path chunks.
+  RTX A5000, release build, a 4096-token prompt, CUDA against Vulkan on the same card (the greedy texts
+  identical): Mellum2.1-12B-A2.5B 3746 against 693 tok/s (first token 1.09 against 5.91 s), Ornith-1.5-35B
+  3058 against 1101 (1.34 / 3.72 s), Apex-35B 2974 against 441 (1.38 / 9.28 s), Qwen3.6-35B-A3B 2905 against
+  890 (1.41 / 4.60 s), Hy-MT2-30B-A3B 2385 against 343 (1.72 / 11.96 s); before, the small-path chunks read
+  such a prompt at 160-430 tok/s.
+
+### Fixed
+- A CUDA K/V mirror sized to a prompt's rows exactly took the answer's second token to grow: every layer's
+  rows reallocated, the stream synced and every token graph recorded again, inside the first tokens of a
+  reply (64 tokens after a 4096-token prompt measured 109 tok/s on Mellum2.1 where the card spent 6.4 ms a
+  token). The first size now has room for an eighth more rows (256 at least): 151.5 tok/s, Vulkan 121.4.
+
+## [0.8.91] — 2026-11-13
+
+### Added
+- The CUDA hybrid arm reads int8 weights inside the layers. A q8_2f or q8_row matrix is tiled once on the card
+  (`hy_repack8`) into int8 tiles in the tensor-core kernel's register layout, 16 bytes a lane a group (job
+  kind 5): `hy_mmp_*` turns a byte pair into its bf16x2 register exactly (2^23 + u, one subtraction), takes the
+  row scale as a group's factor and folds the column field into the input fragments, so the product is the
+  int8 weight's own; the prompt path expands the tiles to f16 by bands (`hy_expand_i8r`). A routed MoE layer
+  without a shared expert, and up to two extra rotation tables (a YaRN table's amplitude folded in), no longer
+  decline. Mellum2.1-12B-A2.5B-Thinking (q8_2f attention) and Apex-35B-V1.0 `q4tp-v2` (q8_2f attention and
+  linear-attention projections), which declined on "codec kind 7" and ran op by op on CUDA, now run the whole
+  token graph. RTX A5000, release build, 64 tokens, CUDA against Vulkan on the same card: Mellum2.1 166.4-167.4
+  against 136.3-138.5 tok/s (147.4-148.6 against 126.7 at a 4k depth; the greedy text identical to Vulkan's),
+  Apex-35B 120.3-121.1 against 89.6-92.4 (121.2-121.3 against 98.2 at 4k). On Apex the greedy text parts from
+  the CPU's at the first token, a near tie: the CPU and Vulkan round the input of a q8_2f product to int8, this
+  kernel keeps it at ~17 bits (perplexity over 512 tokens 10.550 against 10.540 / 10.541; Mellum2.1 5.567
+  against 5.568). A 4k-token prompt still reads faster on Vulkan (796 / 738 against 426 / 357 tok/s).
+
+### Fixed
+- CUDA uploads landed late: `cuMemcpyHtoD` from pageable memory returns once the data is staged, its DMA
+  still running on the legacy stream, which the backend's non-blocking stream does not wait for — a kernel
+  launched right after a large upload read its last few percent as they were before (zeros in the tail of a
+  9 MB int8 matrix). Every upload now goes through `htod`, which waits for that DMA.
+
+## [0.8.90] — 2026-11-13
+
+### Added
+- The LFM family on the CUDA hybrid arm, which declined it and ran it per op at 21-32 tok/s: LFM2's gated
+  short convolution (`hy_sconv`: the fused B | C | x projection, the depthwise causal conv over a per-layer ring
+  kept as a recurrent state, the C gate, the out projection), the head-wise output gate of the attention
+  (`hy_head_gate` over a matvec of the normed row, as Spark-X2.5 and LFM3 carry it), a sliding window on the
+  attention's exact mirror (word 7 of the layer's call record; `hy_scores` gives the keys left of it no
+  weight), a second rotation table for the local layers, and a per-layer geometry equal to the call-wide one
+  taken as it. A prompt over such a stack runs the small path 16 rows at a time with direct launches. RTX
+  A5000, release build, 64 tokens, CUDA against Vulkan on the same card: LFM3-1.7B 274.3-282.4 against
+  262.9-267.1 tok/s (the greedy text identical to the CPU's), LFM3-VL-2B 278.4-280.1 against 263.0-273.3,
+  d1-2B 245.0-283.7 against 261.2-263.2 (both texts identical to the CPU's and Vulkan's), LFM2.5-2.6B
+  245.8-246.9 against 128.7-204.8 (the text identical to Vulkan's).
+
 ## [0.8.89] — 2026-11-13
 
 ### Added

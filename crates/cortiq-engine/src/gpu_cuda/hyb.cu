@@ -85,7 +85,7 @@ struct HyJob {
     int blk0;  // first block of this job in the launch
     int ystride;
     int xoff;  // elements into the input planes this job's rows start at (a MoE slot's own input)
-    int pad_;
+    int nr;    // > 0: this job's input rows (fewer than the launch's), a grouped expert's
 };
 
 // RMS norm of every row of x [B][n] into f32 or f16 (a block of 256 threads
@@ -399,16 +399,22 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
                                      float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci)
 {
     __shared__ float sm[32][HPK];
+    // an exact mirror's record carries a sliding window in word 7 (word 5 is
+    // the far-field flag of the other records)
+    int win = 0;
     if (ci) {
         n0 = ci[0];
         rb = ci[2];
         ncap = ci[3];
         nbcap = ci[4];
+        if (ci[5] == 0) win = ci[7];
     }
     const int g = blockIdx.y, blk = blockIdx.x, b = blockIdx.z, nh = nkv * HPK;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const int n = n0 + b + 1;
     if (blk * rb >= n) return;
+    // keys left of the window take no weight
+    const int lo = win > 0 ? max(0, n - win) : 0;
     float qv[HPK][DPL];
 #pragma unroll
     for (int j = 0; j < HPK; j++)
@@ -420,6 +426,11 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
     float* Sb = S + (size_t)b * nh * ncap;
     for (int r = row0 + warp; r < row1; r += NW) {
+        if (r < lo) {
+            if (lane == 0)
+                for (int j = 0; j < HPK; j++) Sb[(size_t)(g * HPK + j) * ncap + r] = -INF;
+            continue;
+        }
         const u16* kr = Km + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float kv[DPL];
 #pragma unroll
@@ -592,6 +603,24 @@ __device__ __forceinline__ u32 a_reg(u32 X, int m) {
     return r;
 }
 
+// The A register of half h of an int8 tile word: its two signed bytes as
+// bf16x2, exactly. A byte's unsigned twin u = b + 128 makes the float
+// 2^23 + u (0x4B0000uu), one subtraction leaves b; an integer of 8 bits is
+// a bf16, so its float's upper half is it.
+__device__ __forceinline__ u32 a_i8(u32 W, int h) {
+    const u32 u = W ^ 0x80808080u;
+    const float lo = __uint_as_float(__byte_perm(u, 0x4B000000u, 0x7440 | (2 * h))) - 8388736.0f;
+    const float hi = __uint_as_float(__byte_perm(u, 0x4B000000u, 0x7440 | (2 * h + 1))) - 8388736.0f;
+    return __byte_perm(__float_as_uint(lo), __float_as_uint(hi), 0x7632);
+}
+
+// The A register r of a q1 tile lane: bits 2r, 2r + 1 of its 16 as bf16x2
+// +-1 (a set bit +1, a clear one -1; the sign bit is the clear bit's).
+__device__ __forceinline__ u32 a_q1(u32 B, int r) {
+    const u32 nb = ~B >> (2 * r);
+    return 0x3F803F80u | ((nb & 1u) << 15) | ((nb & 2u) << 30);
+}
+
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -602,12 +631,12 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 // A block of 32 KS threads takes TB tiles; its KS warps take contiguous
 // ranges of the groups, every warp all TB tiles of its range, and the KS
 // partials are summed in order. NT n tiles of 8 input rows (rows past
-// `nrows` are not read). The arithmetic of an output depends on KS alone,
-// never on TB, NT or the window's row count.
+// `nrows`, or past the job's own `nr`, are not read). The arithmetic of an
+// output depends on KS alone, never on TB, NT or the window's row count.
 template <int NT, int TB, int KS>
 __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njobs, const u16* __restrict__ x0,
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
-                                         int nrows, int cols)
+                                         int nrows_in, int cols)
 {
     __shared__ float2 par_s[16 * TB];
     __shared__ float part[KS][TB][NT][32][4];
@@ -621,13 +650,24 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         else jhi = mid - 1;
     }
     const HyJob jb = jobs[jx];
+    // an empty job (a dead MoE slot, a grouped launch's spare) has no blocks' work
+    if (jb.rows <= 0) return;
+    const int nrows = jb.nr > 0 ? min(nrows_in, jb.nr) : nrows_in;
     const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
     const int rows = jb.rows;
     const int ntile = (rows + 15) >> 4;
+    // kind 5: int8 tiles, a row's scale its one number (aux1), the column
+    // field (aux0, or none) taken into the input rows
+    const bool i8 = (jb.kind & 0xFF) == 5;
+    const float* cf = i8 ? (const float*)jb.aux0 : nullptr;
+    // kind 3: q1 tiles (a lane's 16 sign bits a group), a (row, group)'s f16 scale in aux0
+    const bool q1 = (jb.kind & 0xFF) == 3;
     // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
     for (int i = tid; i < 16 * TB; i += blockDim.x) {
         const int rr = tile0 * 16 + i;
-        par_s[i] = rr < rows ? ((const float2*)jb.aux1)[rr] : make_float2(0.0f, 0.0f);
+        par_s[i] = (rr >= rows || q1) ? make_float2(0.0f, 0.0f)
+                   : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
+                                      : ((const float2*)jb.aux1)[rr];
     }
     __syncthreads();
     const int gid = lane >> 2, tig = lane & 3;
@@ -658,6 +698,28 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                     bx[t][1][q] = *(const u32*)(x1 + xo + 8 * q);
                     if (NPL > 2) bx[t][NPL - 1][q] = *(const u32*)(x2 + xo + 8 * q);
                 }
+                if (cf) {
+                    // x * field, split again into the planes: W x with W = int8 * rs * cf
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float2 f = *(const float2*)(cf + k0 + 8 * q);
+                        float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+                        for (int pl = 0; pl < NPL; pl++) {
+                            lo = __fadd_rn(lo, bf2f((u16)(bx[t][pl][q] & 0xFFFFu)));
+                            hi = __fadd_rn(hi, bf2f((u16)(bx[t][pl][q] >> 16)));
+                        }
+                        lo = __fmul_rn(lo, f.x);
+                        hi = __fmul_rn(hi, f.y);
+#pragma unroll
+                        for (int pl = 0; pl < NPL; pl++) {
+                            const u16 a = f2bf(lo), b = f2bf(hi);
+                            bx[t][pl][q] = (u32)a | ((u32)b << 16);
+                            lo = __fsub_rn(lo, bf2f(a));
+                            hi = __fsub_rn(hi, bf2f(b));
+                        }
+                    }
+                }
             } else {
 #pragma unroll
                 for (int pl = 0; pl < NPL; pl++)
@@ -670,12 +732,29 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
             const int tile = tile0 + b;
             if (tile >= ntile) break;
             const size_t tg = (size_t)tile * gpr + g;
-            const uint2 X = T[tg * 32 + lane];
-            const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
-            const float sa = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
-            const float sb = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb.y, pb.x));
-            const u32 a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
-            const u32 a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
+            u32 a00, a01, a02, a03, a10, a11, a12, a13;
+            float sa, sb;
+            if (q1) {
+                const u32 B = ((const u16*)jb.w)[tg * 32 + lane];
+                const u16* S1 = (const u16*)jb.aux0 + tg * 16;
+                sa = h2f(S1[gid]);
+                sb = h2f(S1[gid + 8]);
+                a00 = a_q1(B, 0), a01 = a_q1(B, 1), a02 = a_q1(B, 2), a03 = a_q1(B, 3);
+                a10 = a_q1(B, 4), a11 = a_q1(B, 5), a12 = a_q1(B, 6), a13 = a_q1(B, 7);
+            } else if (i8) {
+                const uint4 X8 = ((const uint4*)jb.w)[tg * 32 + lane];
+                sa = par_s[b * 16 + gid].x;
+                sb = par_s[b * 16 + gid + 8].x;
+                a00 = a_i8(X8.x, 0), a01 = a_i8(X8.x, 1), a02 = a_i8(X8.y, 0), a03 = a_i8(X8.y, 1);
+                a10 = a_i8(X8.z, 0), a11 = a_i8(X8.z, 1), a12 = a_i8(X8.w, 0), a13 = a_i8(X8.w, 1);
+            } else {
+                const uint2 X = T[tg * 32 + lane];
+                const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                sa = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
+                sb = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb.y, pb.x));
+                a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
+                a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
+            }
 #pragma unroll
             for (int t = 0; t < NT; t++) {
                 if (t * 8 >= nrows) break;
@@ -752,6 +831,9 @@ MMP(1, 1, 16)
 MMP(1, 2, 16)
 MMP(2, 1, 16)
 MMP(2, 2, 16)
+// a prompt chunk's experts, grouped (up to 32 or 64 rows a job)
+MMP(4, 2, 8)
+MMP(8, 1, 8)
 
 // f32 rows [n][xstride] into the three planes [n][ostride] (what the
 // producers below do in place; for inputs no kernel of this arm makes).
@@ -1292,7 +1374,7 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
 // exponentials written as f16 into P (the value GEMM's operand) and each
 // row's 1 / sum into isum.
 extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
-                                        int L, int pos0, int col_base, int hpk, int cols, int istride)
+                                        int L, int pos0, int col_base, int hpk, int cols, int istride, int win)
 {
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1301,8 +1383,11 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     const int gk = (int)blockIdx.x / cols, r = (int)blockIdx.x - gk * cols;
     const int pq = pos0 + r / hpk;
     const int hi = pq - col_base;
+    // a sliding window: the keys left of its `win` (`hy_scores`' rule) weigh nothing
+    const int lo = win > 0 ? hi - win + 1 : 0;
     float m = -INF;
-    for (int c = tid; c <= hi && c < L; c += T) m = fmaxf(m, s[c]);
+    for (int c = tid; c <= hi && c < L; c += T)
+        if (c >= lo) m = fmaxf(m, s[c]);
     for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, k));
     if (lane == 0) red[warp] = m;
     __syncthreads();
@@ -1312,7 +1397,7 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     float sum = 0.0f;
     for (int c = tid; c < L; c += T) {
         float e = 0.0f;
-        if (c <= hi) {
+        if (c <= hi && c >= lo) {
             e = expf(s[c] - m);
             sum += e;
         }
@@ -1865,6 +1950,202 @@ extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __
     h[(size_t)r * hidden + i] += acc;
 }
 
+// ---------------------------------------------- MoE on the prompt path
+//
+// A prompt chunk's routed FFN grouped by expert. `hy_moe_topk` picks every
+// row's k experts and their mixing weights (`hy_moe_select`'s arithmetic);
+// `hy_moe_group` (one block) sorts the (row, pick) entries by expert, in
+// entry order, and writes a gate/up and a down job for every `rmax` rows of
+// an expert (the job's row count in `nr`, its rows' planes at `xoff`);
+// `hy_moe_gather` lays the picked rows out in that order as input planes;
+// two tensor-core launches run the jobs; `hy_moe_gcombine` adds the weighted
+// outputs (and the shared expert) to the stream.
+
+// A warp a row: pidx[r][j], pwt[r][j] for its k picks.
+extern "C" __global__ void hy_moe_topk(const float* __restrict__ logits, const float* __restrict__ bias, int n, int E,
+                                       int k, int flags, float route_scale, int* __restrict__ pidx, float* __restrict__ pwt)
+{
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= n) return;
+    const bool sigm = (flags & 2) != 0;
+    const float* L = logits + (size_t)r * E;
+    float key[32], lg[32];
+#pragma unroll
+    for (int q = 0; q < 32; q++) {
+        const int e = lane + 32 * q;
+        lg[q] = e < E ? L[e] : -3.0e38f;
+    }
+    float mx = -3.0e38f, sum = 0.0f;
+    if (!sigm) {
+#pragma unroll
+        for (int q = 0; q < 32; q++) mx = fmaxf(mx, lg[q]);
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o));
+#pragma unroll
+        for (int q = 0; q < 32; q++)
+            if (lane + 32 * q < E) sum += expf(lg[q] - mx);
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(FULL, sum, o);
+    }
+#pragma unroll
+    for (int q = 0; q < 32; q++) {
+        const int e = lane + 32 * q;
+        float kk = lg[q];
+        if (sigm && e < E) {
+            kk = 1.0f / (1.0f + expf(-kk));
+            if ((flags & 4) && bias) kk += bias[e];
+        }
+        key[q] = e < E ? kk : -3.0e38f;
+    }
+    float tot = 0.0f;
+    for (int j = 0; j < k; j++) {
+        float best = -3.0e38f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int q = 0; q < 32; q++) {
+            const int e = lane + 32 * q;
+            if (key[q] > best || (key[q] == best && e < bi)) {
+                best = key[q];
+                bi = e;
+            }
+        }
+        moe_argmax(best, bi);
+#pragma unroll
+        for (int q = 0; q < 32; q++)
+            if (lane + 32 * q == bi) key[q] = -3.0e38f;
+        if (lane == 0) {
+            const float lb = L[bi];
+            const float w = sigm ? 1.0f / (1.0f + expf(-lb)) : expf(lb - mx) / sum;
+            pidx[(size_t)r * k + j] = bi;
+            pwt[(size_t)r * k + j] = w;
+            tot += w;
+        }
+    }
+    if (lane == 0) {
+        const float dn = sigm ? tot + ((flags & 32) ? 1e-20f : 1e-6f) : tot;
+        for (int j = 0; j < k; j++) {
+            float w = pwt[(size_t)r * k + j];
+            if (flags & 1) w = w / dn;
+            pwt[(size_t)r * k + j] = w * route_scale;
+        }
+    }
+}
+
+// One block (E <= 1024): pos[i] = entry i's place in the expert-sorted order
+// (an expert's entries in entry order), src[pos] = its row (i / k), and the
+// jobs: per `rmax` rows of an expert a gate/up job from gu_t (input planes
+// at its first row's place of the gathered rows, `hidden` a row; output
+// planes qq0, qq1, `inter_s` a row) and a down job from dn_t (input the
+// gate/up's planes, output ys, `hidden` floats a row); jobs past the count
+// up to jmax are empty, their first blocks still ascending.
+extern "C" __global__ void hy_moe_group(const int* __restrict__ pidx, int nk, int k, int E, int rmax, int jmax,
+                                        const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t,
+                                        HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a, int* __restrict__ pos,
+                                        int* __restrict__ src, u64 qq0, u64 qq1, int hidden, int inter_s, u64 ys,
+                                        int bpj_gu, int bpj_dn)
+{
+    __shared__ int cnt[1024], off[1024], jb0[1024];
+    __shared__ int njobs;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    // a warp an expert: its entries by ballots, in entry order
+    for (int e = warp; e < E; e += NW) {
+        int c = 0;
+        for (int base = 0; base < nk; base += 32) {
+            const int i = base + lane;
+            c += __popc(__ballot_sync(FULL, i < nk && pidx[i] == e));
+        }
+        if (lane == 0) cnt[e] = c;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int o = 0, j = 0;
+        for (int e = 0; e < E; e++) {
+            off[e] = o;
+            jb0[e] = j;
+            o += cnt[e];
+            j += (cnt[e] + rmax - 1) / rmax;
+        }
+        njobs = min(j, jmax);
+    }
+    __syncthreads();
+    for (int e = warp; e < E; e += NW) {
+        int p = off[e];
+        for (int base = 0; base < nk; base += 32) {
+            const int i = base + lane;
+            const bool m = i < nk && pidx[i] == e;
+            const unsigned b = __ballot_sync(FULL, m);
+            if (m) {
+                const int q = p + __popc(b & ((1u << lane) - 1u));
+                pos[i] = q;
+                src[q] = i / k;
+            }
+            p += __popc(b);
+        }
+    }
+    for (int e = tid; e < E; e += blockDim.x) {
+        const int c = cnt[e];
+        for (int ps = 0; ps * rmax < c; ps++) {
+            const int j = jb0[e] + ps;
+            if (j >= jmax) break;
+            const int r0 = off[e] + ps * rmax, nr = min(rmax, c - ps * rmax);
+            HyJob g = gu_t[e];
+            g.y = qq0 + (u64)r0 * inter_s * 2;
+            g.res = qq1 + (u64)r0 * inter_s * 2;
+            g.ystride = inter_s;
+            g.blk0 = j * bpj_gu;
+            g.xoff = r0 * hidden;
+            g.nr = nr;
+            HyJob d = dn_t[e];
+            d.y = ys + (u64)r0 * hidden * 4;
+            d.res = 0;
+            d.ystride = hidden;
+            d.blk0 = j * bpj_dn;
+            d.xoff = r0 * inter_s;
+            d.nr = nr;
+            gu_a[j] = g;
+            dn_a[j] = d;
+        }
+    }
+    for (int j = njobs + tid; j < jmax; j += blockDim.x) {
+        HyJob g = gu_t[0], d = dn_t[0];
+        g.rows = 0;
+        d.rows = 0;
+        g.blk0 = j * bpj_gu;
+        d.blk0 = j * bpj_dn;
+        g.nr = 0;
+        d.nr = 0;
+        gu_a[j] = g;
+        dn_a[j] = d;
+    }
+}
+
+// The picked rows in sorted order as input planes: row q of the planes is
+// row src[q] of xn [n][hidden] f32.
+extern "C" __global__ void hy_moe_gather(const float* __restrict__ xn, const int* __restrict__ src, int total, int hidden,
+                                         u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)total * hidden) return;
+    const int q = (int)(idx / hidden), i = (int)(idx - (size_t)q * hidden);
+    put3(p0, p1, p2, idx, xn[(size_t)src[q] * hidden + i]);
+}
+
+// h[r] += sum over its picks of pwt[r][j] * ys[pos[r][j]] (+ the shared
+// expert's rows times sigmoid(sg[r]) under `gated`, else 1).
+extern "C" __global__ void hy_moe_gcombine(float* __restrict__ h, const float* __restrict__ ys, const int* __restrict__ pos,
+                                           const float* __restrict__ pwt, const float* __restrict__ dsh,
+                                           const float* __restrict__ sg, int gated, int n, int k, int hidden)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= hidden || r >= n) return;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) acc = fmaf(pwt[(size_t)r * k + j], ys[(size_t)pos[(size_t)r * k + j] * hidden + i], acc);
+    if (dsh) {
+        const float w = gated ? 1.0f / (1.0f + expf(-sg[r])) : 1.0f;
+        acc = fmaf(w, dsh[(size_t)r * hidden + i], acc);
+    }
+    h[(size_t)r * hidden + i] += acc;
+}
+
 
 // Gemma's sandwich norm: h[r] += rmsnorm(y[r]) * w (1 + w under `gemma`), a
 // block a row; then, with `ls` given, the layer's scale on the whole row.
@@ -1892,4 +2173,200 @@ extern "C" __global__ void hy_scale(float* __restrict__ h, float s, unsigned lon
 {
     const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) h[i] *= s;
+}
+
+
+// LFM2's gated short convolution over n rows in order: y [n][ystride] holds
+// each row's B | C | x (hidden each), the ring [channel][k - 1] (slot 0 the
+// newest) the conv's history; row r's C * (taps . (B x, ring)) goes into the
+// planes the out projection reads, and the ring moves row by row. A thread a
+// channel; k <= 9.
+extern "C" __global__ void hy_sconv(const float* __restrict__ y, int ystride, const float* __restrict__ taps,
+                                    float* __restrict__ ring, int hidden, int k, int n, u16* __restrict__ p0,
+                                    u16* __restrict__ p1, u16* __restrict__ p2, int pstride)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= hidden) return;
+    const int rl = k - 1;
+    float rg[8];
+#pragma unroll
+    for (int s = 0; s < 8; s++) rg[s] = s < rl ? ring[(size_t)ch * rl + s] : 0.0f;
+    const float* t = taps + (size_t)ch * k;
+    for (int r = 0; r < n; r++) {
+        const float* yr = y + (size_t)r * ystride;
+        const float bx = yr[ch] * yr[2 * hidden + ch];
+        float acc = t[k - 1] * bx;
+#pragma unroll
+        for (int s = 0; s < 8; s++)
+            if (s < rl) acc += t[k - 2 - s] * rg[s];
+        put3(p0, p1, p2, (size_t)r * pstride + ch, yr[hidden + ch] * acc);
+#pragma unroll
+        for (int s = 7; s > 0; s--)
+            if (s < rl) rg[s] = rg[s - 1];
+        if (rl > 0) rg[0] = bx;
+    }
+#pragma unroll
+    for (int s = 0; s < 8; s++)
+        if (s < rl) ring[(size_t)ch * rl + s] = rg[s];
+}
+
+
+// Spark-X2.5 / LFM3's head-wise output gate on the attention's output planes
+// (before the O projection): head h of row r times sigmoid(g[r][h]).
+extern "C" __global__ void hy_head_gate(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ g,
+                                        int nh, int hd, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= nh * hd || r >= n) return;
+    const size_t at = (size_t)r * pstride + i;
+    const float v = __fadd_rn(bf2f(p0[at]), bf2f(p1[at]));
+    const float s = 1.0f / (1.0f + expf(-g[(size_t)r * nh + i / hd]));
+    put3(p0, p1, p1, at, __fmul_rn(v, s));
+}
+
+
+// An int8 matrix (q8_2f / q8_row) as the tensor-core kernel's int8 tiles
+// (kind 5): for tile t and group g, 32 lanes x 16 bytes; lane l = 4 gid + tig
+// holds the elements of its eight A registers (s, m) — row gid + 8 (m & 1),
+// columns 32 g + 16 s + 8 (m >> 1) + 2 tig and the next — register 2q + h at
+// bytes 4q + 2h, 4q + 2h + 1. `pair`: a gate/up pair's rows as `hy_repack`
+// maps them (8 rows of A, then the same 8 of B). The row scales and the
+// column field stay apart (f32, hyb.rs).
+extern "C" __global__ void hy_repack8(const signed char* __restrict__ bA, const signed char* __restrict__ bB, int pair,
+                                      uint4* __restrict__ T, int rows, int cols)
+{
+    const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)ntile * gpr * 32) return;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    u32 wd[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const int col = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
+            const bool second = pair && (r & 15) >= 8;
+            const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+            const signed char* b = (second ? bB : bA) + (size_t)sr * cols + col;
+            const int reg = s * 4 + m;
+            const u32 two = (u32)(u8)b[0] | ((u32)(u8)b[1] << 8);
+            wd[reg >> 1] |= two << (16 * (reg & 1));
+        }
+    T[idx] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+}
+
+// `hy_expand_pr` for kind 5 (int8 tiles, f32 row scales `rs`, f32 column
+// field `cf` or null): row tiles [tile0, tile0 + nt) as f16 rows, W holding
+// those rows only.
+extern "C" __global__ void hy_expand_i8r(const uint4* __restrict__ T, const float* __restrict__ rs, const float* __restrict__ cf,
+                                         u16* __restrict__ W, int rows, int cols, int tile0, int nt)
+{
+    const int gpr = cols >> 5;
+    const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx0 >= (size_t)nt * gpr * 32) return;
+    const size_t idx = idx0 + (size_t)tile0 * gpr * 32;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    const uint4 X = T[idx];
+    const u32 wd[4] = {X.x, X.y, X.z, X.w};
+    const int r0 = tile0 * 16;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
+            const int reg = s * 4 + m;
+            const u32 two = wd[reg >> 1] >> (16 * (reg & 1));
+            const float sc = rs[r];
+            const float lo = (float)(signed char)(two & 0xFF) * sc * (cf ? cf[k] : 1.0f);
+            const float hi = (float)(signed char)((two >> 8) & 0xFF) * sc * (cf ? cf[k + 1] : 1.0f);
+            *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
+        }
+}
+
+// A q1 matrix (per 32-column group [f16 scale][4 bytes of sign bits, LSB
+// first]) as the tensor-core kernel's q1 tiles (kind 3): for tile t and group
+// g, lane l = 4 gid + tig holds in bits 2r, 2r + 1 the signs of its A register
+// r = 4 s + m (row gid + 8 (m & 1), columns 32 g + 16 s + 8 (m >> 1) + 2 tig and
+// the next); S[t][g][16] the rows' f16 scales. `pair`: a gate/up pair's rows
+// as `hy_repack` maps them.
+extern "C" __global__ void hy_repack1(const u8* __restrict__ A, const u8* __restrict__ Bm, int pair, u16* __restrict__ T,
+                                      u16* __restrict__ S, int rows, int cols)
+{
+    const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)ntile * gpr * 32) return;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    u32 bits = 0u;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const bool second = pair && (r & 15) >= 8;
+            const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+            const u8* t6 = (second ? Bm : A) + ((size_t)sr * gpr + g) * 6 + 2;
+            const int c = 16 * s + 8 * (m >> 1) + 2 * tig;
+            const int reg = s * 4 + m;
+            bits |= (u32)((t6[c >> 3] >> (c & 7)) & 1) << (2 * reg);
+            bits |= (u32)((t6[(c + 1) >> 3] >> ((c + 1) & 7)) & 1) << (2 * reg + 1);
+        }
+    T[idx] = (u16)bits;
+    if (tig == 0) {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int r = tile * 16 + gid + 8 * h;
+            u16 sc = 0;
+            if (r < rows) {
+                const bool second = pair && (r & 15) >= 8;
+                const int sr = pair ? (r >> 4) * 8 + (r & 7) : r;
+                const u8* t6 = (second ? Bm : A) + ((size_t)sr * gpr + g) * 6;
+                sc = (u16)(t6[0] | (t6[1] << 8));
+            }
+            S[tg * 16 + gid + 8 * h] = sc;
+        }
+    }
+}
+
+// `hy_expand_pr` for kind 3 (q1 tiles): row tiles [tile0, tile0 + nt) as f16
+// rows, W holding those rows only.
+extern "C" __global__ void hy_expand_q1r(const u16* __restrict__ T, const u16* __restrict__ S, u16* __restrict__ W, int rows,
+                                         int cols, int tile0, int nt)
+{
+    const int gpr = cols >> 5;
+    const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx0 >= (size_t)nt * gpr * 32) return;
+    const size_t idx = idx0 + (size_t)tile0 * gpr * 32;
+    const int lane = (int)(idx & 31);
+    const size_t tg = idx >> 5;
+    const int tile = (int)(tg / gpr), g = (int)(tg - (size_t)tile * gpr);
+    const int gid = lane >> 2, tig = lane & 3;
+    const u32 B = T[idx];
+    const int r0 = tile0 * 16;
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int r = tile * 16 + gid + 8 * (m & 1);
+            if (r >= rows) continue;
+            const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
+            const int reg = s * 4 + m;
+            const float sc = h2f(S[tg * 16 + gid + 8 * (m & 1)]);
+            const float lo = ((B >> (2 * reg)) & 1u) ? sc : -sc;
+            const float hi = ((B >> (2 * reg + 1)) & 1u) ? sc : -sc;
+            *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
+        }
 }

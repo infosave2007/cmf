@@ -305,9 +305,25 @@ impl Buf {
         // 64 spare bytes: a kernel's last vector load may read past the body.
         let b = Self::new(std::mem::size_of_val(data) + 64)?;
         if !data.is_empty() {
-            unsafe { cu::memcpy_htod_sync(b.ptr, data) }.map_err(derr)?;
+            unsafe { htod(b.ptr, data) }?;
         }
         Ok(b)
+    }
+}
+
+/// Host memory to the card, landed when this returns. `cuMemcpyHtoD` from
+/// pageable memory returns once the data is staged, its DMA still running
+/// on the legacy stream — which this backend's non-blocking stream does not
+/// wait for, so a kernel launched right after read the tail of a large
+/// upload as it was before (the last few percent of a 9 MB int8 matrix,
+/// zeros). The legacy stream's sync waits for that DMA alone.
+///
+/// # Safety
+/// `dst` must hold `size_of_val(data)` bytes.
+unsafe fn htod<T>(dst: cs::CUdeviceptr, data: &[T]) -> Res<()> {
+    unsafe {
+        cu::memcpy_htod_sync(dst, data).map_err(derr)?;
+        cu::stream::synchronize(std::ptr::null_mut()).map_err(derr)
     }
 }
 
@@ -605,9 +621,12 @@ impl KvMirror {
         let new_cap = if self.window > 0 {
             (self.window - 1 + add.max(256)).max(keep + add)
         } else {
-            // a hint that covers the rows is the size (the prompt's rows, and its
-            // first token); growth past it keeps some slack
-            if hint >= keep + add { hint } else { (keep + add) + (self.cap / 8).max(1024) }
+            // a hint that covers the rows sizes it (the prompt's rows, and its
+            // first token) with room for the answer's first tokens: sized to the
+            // hint exactly, the second token reallocated every layer's rows (a
+            // sync, a copy, every token graph recorded again); growth past it
+            // keeps some slack
+            if hint >= keep + add { hint + (hint / 8).max(256) } else { (keep + add) + (self.cap / 8).max(1024) }
         };
         let nk = Buf::new(new_cap * self.row * 4)?;
         let nv = Buf::new(new_cap * self.row * 4)?;
@@ -1544,7 +1563,7 @@ impl State {
         let b = if need <= SLAB / 4 {
             let v = self.slab_buf(need)?;
             if !data.is_empty() {
-                unsafe { cu::memcpy_htod_sync(v.ptr, data) }.map_err(derr)?;
+                unsafe { htod(v.ptr, data) }?;
             }
             Arc::new(v)
         } else {

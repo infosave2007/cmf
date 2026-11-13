@@ -1652,7 +1652,7 @@ impl Arena {
             if let Some(dsc) = self.zc_dsc.as_ref() {
                 let at = dsc.ptr + (li * ne * 24) as u64;
                 // SAFETY: the triples of layer li go to their rows of the descriptor buffer; the copy is synchronous
-                if unsafe { cu::memcpy_htod_sync(at, &triples) }.is_ok() {
+                if unsafe { super::htod(at, &triples) }.is_ok() {
                     for e in 0..ne {
                         if triples[e * 3] != 0 {
                             self.zc_dev[li][e] = (at + (e * 24) as u64) | (1u64 << 63);

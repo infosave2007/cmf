@@ -142,12 +142,16 @@ struct HyJob {
     ystride: i32,
     /// Elements into the input planes this job's rows start at (a MoE slot's own input).
     xoff: i32,
-    pad_: i32,
+    /// > 0: this job's input rows, fewer than the launch's (a grouped expert's).
+    nr: i32,
 }
 
 pub(super) struct HFuncs {
     /// `hy_mmp_{NT}_{TB}_{KS}` by [NT - 1][TB - 1][KS == 16].
     mmp: [[[cs::CUfunction; 2]; 2]; 2],
+    /// The grouped experts' launches: `hy_mmp_4_2_8` (32 rows a job), `hy_mmp_8_1_8` (64).
+    mmp_g: [cs::CUfunction; 2],
+
     split: cs::CUfunction,
     expand_p: cs::CUfunction,
     rmsnorm: cs::CUfunction,
@@ -168,6 +172,10 @@ pub(super) struct HFuncs {
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
     repack: cs::CUfunction,
+    repack8: cs::CUfunction,
+    expand_i8: cs::CUfunction,
+    repack1: cs::CUfunction,
+    expand_q1: cs::CUfunction,
     qk: cs::CUfunction,
     scores: cs::CUfunction,
     values: cs::CUfunction,
@@ -185,8 +193,14 @@ pub(super) struct HFuncs {
     moe_router: cs::CUfunction,
     moe_select: cs::CUfunction,
     moe_combine: cs::CUfunction,
+    moe_topk: cs::CUfunction,
+    moe_group: cs::CUfunction,
+    moe_gather: cs::CUfunction,
+    moe_gcombine: cs::CUfunction,
     norm_add: cs::CUfunction,
     scale: cs::CUfunction,
+    sconv: cs::CUfunction,
+    head_gate: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -206,6 +220,12 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     }
     Ok(HFuncs {
         mmp,
+        mmp_g: [func(module, "hy_mmp_4_2_8")?, func(module, "hy_mmp_8_1_8")?],
+
+        moe_topk: func(module, "hy_moe_topk")?,
+        moe_group: func(module, "hy_moe_group")?,
+        moe_gather: func(module, "hy_moe_gather")?,
+        moe_gcombine: func(module, "hy_moe_gcombine")?,
         split: func(module, "hy_split")?,
         expand_p: func(module, "hy_expand_p")?,
         rmsnorm: func(module, "hy_rmsnorm")?,
@@ -226,6 +246,10 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         repack: func(module, "hy_repack")?,
+        repack8: func(module, "hy_repack8")?,
+        expand_i8: func(module, "hy_expand_i8r")?,
+        repack1: func(module, "hy_repack1")?,
+        expand_q1: func(module, "hy_expand_q1r")?,
         qk: func(module, "hy_qk")?,
         scores: func(module, "hy_scores")?,
         values: func(module, "hy_values")?,
@@ -245,6 +269,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         moe_combine: func(module, "hy_moe_combine")?,
         norm_add: func(module, "hy_norm_add")?,
         scale: func(module, "hy_scale")?,
+        sconv: func(module, "hy_sconv")?,
+        head_gate: func(module, "hy_head_gate")?,
     })
 }
 
@@ -288,8 +314,8 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
 }
 
 fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
-    if list.iter().any(|(m, ..)| m.kind != 6 || m.cols % 32 != 0) {
-        return Err("a tensor-core job over a matrix that is not repacked q4tp".into());
+    if list.iter().any(|(m, ..)| !matches!(m.kind, 3 | 5 | 6) || m.cols % 32 != 0) {
+        return Err("a tensor-core job over a matrix that is not repacked (q4tp, int8 or q1 tiles)".into());
     }
     let max_rows = list.iter().map(|&(_, _, _, _, r)| r).max().unwrap_or(0);
     let mut bufs = Vec::with_capacity(2);
@@ -305,11 +331,12 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 y,
                 res,
                 rows: rows as i32,
-                kind,
+                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3), the epilogue bits from the call
+                kind: (m.kind as i32) | (kind & !0xFF),
                 blk0: blk as i32,
                 ystride: ystride as i32,
                 xoff: 0,
-                pad_: 0,
+                nr: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
         }
@@ -604,7 +631,7 @@ fn mat_planes(t_bytes: usize, cc_bytes: usize, lad: &[f32]) -> Res<(Buf, Buf, Bu
         None => Buf::new(lad_at + lad_bytes)?,
     };
     let (cc, ld) = (all.view(cc_at, cc_bytes), all.view(lad_at, lad_bytes));
-    unsafe { cu::memcpy_htod_sync(ld.ptr, lad) }.map_err(derr)?;
+    unsafe { super::htod(ld.ptr, lad) }?;
     Ok((all, cc, ld))
 }
 
@@ -635,6 +662,113 @@ fn repack_rows_on_card(c: &Ctx, fx: &HFuncs, nib: &[u8], params: &[u8], codes: &
     Ok((t, cc, ld))
 }
 
+/// A q8_2f / q8_row payload's planes: (int8 body, f16 row scales, f16
+/// column field — none for q8_row).
+fn q8_parts(dtype: cortiq_core::TensorDtype, bytes: &[u8], rows: usize, cols: usize) -> Res<(&[u8], &[u8], Option<&[u8]>)> {
+    let body = rows * cols;
+    let field = dtype == cortiq_core::TensorDtype::Q8_2f;
+    if bytes.len() < body + rows * 2 + if field { cols * 2 } else { 0 } {
+        return Err("q8 payload shorter than its planes".into());
+    }
+    Ok((&bytes[..body], &bytes[body..body + rows * 2], field.then(|| &bytes[body + rows * 2..body + rows * 2 + cols * 2])))
+}
+
+/// Where an int8-tile matrix's three parts sit in its one allocation:
+/// (row scales at, column field at, bytes in all).
+fn i8_layout(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let rs_at = (rows.div_ceil(16) * (cols / 32) * 512).next_multiple_of(256);
+    let cf_at = (rs_at + rows * 4).next_multiple_of(256);
+    (rs_at, cf_at, (cf_at + cols * 4 + 64).next_multiple_of(256))
+}
+
+/// int8 matrices (one, or a gate/up pair laid out as `hy_repack` lays a
+/// q4tp pair) as int8 tiles of the tensor-core kernel (kind 5,
+/// `hy_repack8`): the bodies go to the card and are tiled there, the f16
+/// row scales (pair rows mapped) and the column field as f32 beside them.
+/// (tiles, row scales, column field — none for q8_row) in one allocation.
+fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)], rows: usize, cols: usize) -> Res<(Buf, Buf, Option<Buf>)> {
+    use cortiq_core::quant::f16_to_f32;
+    if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
+        return Err("repack: an int8 matrix (or a pair) 32 columns wide".into());
+    }
+    let pair = srcs.len() == 2;
+    if pair && srcs.iter().any(|s| s.2.is_some()) {
+        // one tile's rows share the input, so they share its column scaling
+        return Err("a gate/up pair of q8_2f matrices (two column fields) has no int8 tiles".into());
+    }
+    let f16 = |b: &[u8], i: usize| f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
+    let rs: Vec<f32> = (0..rows)
+        .map(|r| if pair { f16(srcs[((r & 15) >= 8) as usize].1, (r >> 4) * 8 + (r & 7)) } else { f16(srcs[0].1, r) })
+        .collect();
+    let cf: Option<Vec<f32>> = srcs[0].2.map(|b| (0..cols).map(|k| f16(b, k)).collect());
+    let (rs_at, cf_at, bytes) = i8_layout(rows, cols);
+    let all = match arena_view(bytes) {
+        Some(v) => v,
+        None => Buf::new(bytes)?,
+    };
+    let rsb = all.view(rs_at, rows * 4);
+    unsafe { super::htod(rsb.ptr, &rs) }?;
+    let cfb = match &cf {
+        Some(v) => {
+            let b = all.view(cf_at, cols * 4);
+            unsafe { super::htod(b.ptr, v) }?;
+            Some(b)
+        }
+        None => None,
+    };
+    let ba = Buf::from_slice(srcs[0].0)?;
+    let bb = if pair { Some(Buf::from_slice(srcs[1].0)?) } else { None };
+    let bb_p = bb.as_ref().map_or(ba.ptr, |b| b.ptr);
+    let (pair_i, rows_i, cols_i) = (pair as i32, rows as i32, cols as i32);
+    let threads = (rows.div_ceil(16) * (cols / 32) * 32) as u64;
+    unsafe {
+        c.launch(fx.repack8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(ba.ptr, bb_p, pair_i, all.ptr, rows_i, cols_i))?;
+    }
+    // the int8 bodies are freed on return
+    c.sync()?;
+    Ok((all, rsb, cfb))
+}
+
+/// Where a q1-tile matrix's scales sit in its one allocation: (scales at,
+/// bytes in all).
+fn q1_layout(rows: usize, cols: usize) -> (usize, usize) {
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let s_at = (tg * 64).next_multiple_of(256);
+    (s_at, (s_at + tg * 32 + 64).next_multiple_of(256))
+}
+
+/// q1 matrices (one, or a gate/up pair laid out as `hy_repack` lays a q4tp
+/// pair) as q1 tiles of the tensor-core kernel (kind 3, `hy_repack1`): the
+/// payloads go to the card and are tiled there. (tiles, scales) in one
+/// allocation.
+fn repack1_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize) -> Res<(Buf, Buf)> {
+    if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
+        return Err("repack: a q1 matrix (or a pair) 32 columns wide".into());
+    }
+    let need = src_rows * (cols / 32) * cortiq_core::quant::Q1_TILE;
+    if srcs.iter().any(|b| b.len() < need) {
+        return Err("q1 payload shorter than its tiles".into());
+    }
+    let (s_at, bytes) = q1_layout(rows, cols);
+    let all = match arena_view(bytes) {
+        Some(v) => v,
+        None => Buf::new(bytes)?,
+    };
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let sv = all.view(s_at, tg * 32);
+    let a = Buf::from_slice(&srcs[0][..need])?;
+    let b = if srcs.len() == 2 { Some(Buf::from_slice(&srcs[1][..need])?) } else { None };
+    let b_p = b.as_ref().map_or(a.ptr, |x| x.ptr);
+    let (pair_i, rows_i, cols_i) = (b.is_some() as i32, rows as i32, cols as i32);
+    let threads = (tg * 32) as u64;
+    unsafe {
+        c.launch(fx.repack1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(a.ptr, b_p, pair_i, all.ptr, sv.ptr, rows_i, cols_i))?;
+    }
+    // the payloads are freed on return
+    c.sync()?;
+    Ok((all, sv))
+}
+
 /// Plan-build time spent repacking and uploading weights (ns).
 static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -652,12 +786,17 @@ fn hmat(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usize
 }
 
 fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize) -> Res<Arc<DevMat>> {
-    if gw.kind != 6 {
-        if gw.kind == 4 {
-            return st.mat(c, model, gw, rows, cols);
-        }
+    use cortiq_core::TensorDtype;
+    if gw.kind == 4 {
+        return st.mat(c, model, gw, rows, cols);
+    }
+    // the codec from the file (MoE experts come with a nominal kind)
+    let dtype = model.tensors.get(gw.idx).map(|e| e.dtype);
+    let q8 = matches!(dtype, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
+    let q1 = dtype == Some(TensorDtype::Q1);
+    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 {
         let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
-        return Err(format!("weight codec kind {} has no hybrid kernel ({name})", gw.kind));
+        return Err(format!("weight codec {dtype:?} has no hybrid kernel ({name})"));
     }
     if gw.prism != crate::gpu::GraphPrismOp::None || gw.affine {
         return Err("Prism / affine weight".into());
@@ -684,8 +823,16 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     }
     let t0 = std::time::Instant::now();
     let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
-    let (w, aux0, aux1) = repack_on_card(c, &fx, &[bytes], rows, rows, cols)?;
-    let m = DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 };
+    let m = if q8 {
+        let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(entry.dtype, bytes, rows, cols)?], rows, cols)?;
+        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+    } else if q1 {
+        let (w, s) = repack1_on_card(c, &fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else {
+        let (w, aux0, aux1) = repack_on_card(c, &fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 }
+    };
     REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     c.resident.fetch_add(m.held, Ordering::Relaxed);
     let m = Arc::new(m);
@@ -698,9 +845,15 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
 /// row's gate and up in one lane, and the kernel's epilogue makes
 /// silu(gate) * up there.
 fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &GraphW, inter: usize, cols: usize) -> Res<Arc<DevMat>> {
+    use cortiq_core::TensorDtype;
     use cortiq_core::quant::GROUP_SIZE;
-    if gw.kind != 6 || uw.kind != 6 || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
-        return Err("a gate/up pair of q4tp matrices with rows a multiple of 8".into());
+    let dt = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype);
+    let q8 = |d: Option<TensorDtype>| matches!(d, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
+    let (dg, du) = (dt(gw), dt(uw));
+    let both8 = q8(dg) && q8(du);
+    let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
+    if !(both8 || both1 || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
+        return Err(format!("a gate/up pair of one codec (q4tp, int8 or q1) with rows a multiple of 8, not {dg:?} / {du:?}"));
     }
     let key = (model.uid(), gw.idx, uw.idx);
     if let Some(m) = st.hyb.pairs.get(&key) {
@@ -722,8 +875,16 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     // the pair's rows straight from the two payloads, on the card
     let rows = 2 * inter;
     let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
-    let (w, aux0, aux1) = repack_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
-    let m = DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: (gb.len() + ub.len()) as u64 };
+    let m = if both8 {
+        let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
+        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+    } else if both1 {
+        let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else {
+        let (w, aux0, aux1) = repack_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: (gb.len() + ub.len()) as u64 }
+    };
     REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     c.resident.fetch_add(m.held, Ordering::Relaxed);
     let m = Arc::new(m);
@@ -776,6 +937,13 @@ struct AttnL {
     late: bool,
     /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
     bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
+    /// A head-wise output gate: its matrix (the dense arm's, any codec) and a
+    /// job table a row, into `hgv`; `hy_head_gate` scales the heads with it.
+    hg: Option<(Arc<DevMat>, Vec<Buf>, u32)>,
+    /// A sliding window (positions a query sees, its own included).
+    window: Option<usize>,
+    /// The rotation table of the layer in `tab`: 0 the call's, k the k-th other.
+    local: usize,
     ms_in: MmaSet,
     ms_out: MmaSet,
 }
@@ -783,6 +951,19 @@ struct AttnL {
 enum Mix {
     Gdn(GdnL),
     Attn(AttnL),
+    Conv(ConvL),
+}
+
+/// LFM2's gated short convolution: the fused B | C | x projection into the
+/// GDN rows (`qkv`), `hy_sconv` over the layer's ring (kept as a GDN state of
+/// ring only), the out projection.
+struct ConvL {
+    inp: Arc<DevMat>,
+    out: Arc<DevMat>,
+    taps: Arc<Buf>,
+    kernel: usize,
+    ms_in: MmaSet,
+    ms_out: MmaSet,
 }
 
 struct HLayer {
@@ -837,6 +1018,8 @@ struct MoeL {
     gated: bool,
     bpj_gu: u32,
     bpj_dn: u32,
+    /// Whether a shared expert rides beside the routed ones (the layer's pair).
+    shared: bool,
     _mats: Vec<Arc<DevMat>>,
 }
 
@@ -866,6 +1049,9 @@ pub(super) struct HPlan {
     lm: Option<Head>,
     final_norm: Option<Arc<Buf>>,
     invf: Vec<f32>,
+    /// The other rotations (other layers' frequencies and YaRN amplitude; their
+    /// rows follow the call's in `tab`, a table after the other).
+    invf_local: Vec<(Vec<f32>, f32)>,
     half: usize,
     nh: usize,
     nkv: usize,
@@ -905,6 +1091,7 @@ pub(super) struct HPlan {
     nvmax: usize,
     moe: Option<MoeBufs>,
     yo: Buf,
+    hgv: Buf,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -1036,8 +1223,15 @@ fn hsig(
                 }
                 s.extend([*nv, *nk, *dk, *dv, *kk]);
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
                 s.push(2);
+                if let Some(g) = geom {
+                    s.extend([8, g.window.unwrap_or(0)]);
+                }
+                if let Some(g) = head_gate {
+                    s.push(7);
+                    w(&mut s, g);
+                }
                 for g in [wq, wk, wv, wo] {
                     w(&mut s, g);
                 }
@@ -1048,6 +1242,13 @@ fn hsig(
                 for d in bias.map_or([&[][..]; 3], |(a, b, c)| [a, b, c]) {
                     f(&mut s, d);
                 }
+            }
+            GraphAttn::ShortConv { inp, out, taps, kernel, .. } => {
+                s.push(6);
+                w(&mut s, inp);
+                w(&mut s, out);
+                f(&mut s, taps);
+                s.push(*kernel);
             }
             _ => s.push(3),
         }
@@ -1126,6 +1327,7 @@ fn build(
     let mut qrow = nh * hd;
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
+    let mut invf_local: Vec<(Vec<f32>, f32)> = Vec::new();
     for (li, l) in layers.iter().enumerate() {
         if l.mhc.is_some() {
             return Err(format!("layer {li}: mHC streams"));
@@ -1153,16 +1355,56 @@ fn build(
                 nvmax = nvmax.max(*nv);
             }
             GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
-                if geom.is_some() {
-                    return Err(format!("layer {li}: an attention geometry of its own"));
+                // a geometry equal to the call-wide one (a stack where only some
+                // layers differ) is the call-wide one, a sliding window aside
+                let same = geom.as_ref().is_none_or(|g| {
+                    g.nkv == nkv
+                        && g.hd == hd
+                        && g.dv == hd
+                        && g.rd == rd
+                        && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
+                        && g.sink.is_none()
+                        && !g.v_norm
+                        && g.dash.is_none()
+                        && g.vres.is_none()
+                        && g.invf.len() >= rd / 2
+                        && invf.len() >= rd / 2
+                        && ((g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
+                            // up to two more tables besides the call's: other layers'
+                            // bases (local ones), a YaRN amplitude baked into the rows
+                            let key = (g.invf[..rd / 2].to_vec(), g.rope_scale);
+                            invf_local.contains(&key) || {
+                                invf_local.push(key);
+                                invf_local.len() <= 2
+                            }
+                        })
+                });
+                if let (false, Some(g)) = (same, geom) {
+                    return Err(format!(
+                        "layer {li}: an attention geometry of its own (nkv {} hd {} dv {} rd {} window {:?} sink {} v-norm {} rope x{} of call nkv {nkv} hd {hd} rd {rd})",
+                        g.nkv,
+                        g.hd,
+                        g.dv,
+                        g.rd,
+                        g.window,
+                        g.sink.is_some(),
+                        g.v_norm,
+                        g.rope_scale
+                    ));
                 }
-                if head_gate.is_some() {
-                    return Err(format!("layer {li}: a head-wise output gate"));
+                if head_gate.is_some() && super::mv_shared_bytes(hidden) > c.max_shared {
+                    return Err(format!("layer {li}: a head-wise output gate over a row wider than shared memory"));
                 }
                 if bias.is_some() && *output_gate {
                     return Err(format!("layer {li}: projection biases beside a gated query"));
                 }
                 qrow = qrow.max(nh * hd * (1 + *output_gate as usize));
+            }
+            GraphAttn::ShortConv { kernel, taps, cpu_state, .. } => {
+                if *kernel == 0 || *kernel > 9 || taps.len() != hidden * kernel || !(cpu_state.is_empty() || cpu_state.len() == (kernel - 1) * hidden) {
+                    return Err(format!("layer {li}: a short convolution of kernel {kernel}"));
+                }
+                cdmax = cdmax.max(3 * hidden);
             }
             _ => return Err(format!("layer {li}: a token mixer the hybrid arm has no kernels for")),
         }
@@ -1180,12 +1422,13 @@ fn build(
                 if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
                     return Err(format!("layer {li}: a routed FFN of {n_exp} experts, top {top_k}"));
                 }
-                if *has_shared == detached_shared.is_some() {
-                    return Err(format!("layer {li}: a routed FFN without exactly one shared expert"));
+                if *has_shared && detached_shared.is_some() {
+                    return Err(format!("layer {li}: a routed FFN with two shared experts"));
                 }
                 let sh = match detached_shared {
                     Some(d) => d.width,
-                    None => model.tensors.get(experts[*n_exp].0).and_then(|e| e.shape.first().copied()).ok_or("shared expert shape")?,
+                    None if *has_shared => model.tensors.get(experts[*n_exp].0).and_then(|e| e.shape.first().copied()).ok_or("shared expert shape")?,
+                    None => *inter,
                 };
                 intermax = intermax.max(*inter).max(sh);
                 moe_e = moe_e.max(*n_exp);
@@ -1208,13 +1451,15 @@ fn build(
     let z = f4(NMAX * vdmax)?;
     let o = f4(NMAX * vdmax)?;
     let of = f4(NMAX * vdmax)?;
-    let tab = f4(NMAX * half * 2)?;
+    // the call's rotation rows, then (a stack with other rotations) theirs
+    let tab = f4(NMAX * half * 2 * 3)?;
     let ids = f4(NMAX)?;
     let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
-    // a sandwich-normed product's rows before their norm
+    // a sandwich-normed product's rows before their norm; a head gate's logits
     let yo = f4(NMAX * hidden)?;
+    let hgv = f4(NMAX * nh)?;
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
     let moe_bufs = if moe_e > 0 {
         let smax = (NMAX * moe_k).min(moe_e);
@@ -1238,35 +1483,53 @@ fn build(
     // the q4tp matrices this plan uploads, in one arena
     let uid = model.uid();
     let q6 = |w: &GraphW| w.kind == 6 && w.prism == crate::gpu::GraphPrismOp::None && !w.affine;
+    let is1 = |w: &GraphW| w.prism == crate::gpu::GraphPrismOp::None && !w.affine && model.tensors.get(w.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1);
+    let is8 = |w: &GraphW| {
+        w.prism == crate::gpu::GraphPrismOp::None
+            && !w.affine
+            && matches!(model.tensors.get(w.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row))
+    };
     let mut need = 0usize;
     for l in layers {
         let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
-            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if q6(gw) && q6(uw) && q6(dw) => {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) => {
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
             }
             GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
                 let mut v: Vec<_> = experts[..*n_exp].iter().map(|&(g, u, d)| (g, u, d, *inter)).collect();
                 match detached_shared {
                     Some(d) => v.push((d.gate.idx, d.up.idx, d.down.idx, d.width)),
-                    None => {
+                    None if experts.len() > *n_exp => {
                         let (g, u, d) = experts[*n_exp];
                         v.push((g, u, d, model.tensors.get(g).and_then(|e| e.shape.first().copied()).unwrap_or(0)));
                     }
+                    None => {}
                 }
                 v
             }
             _ => Vec::new(),
         };
+        let sized = |idx: usize, rows: usize, cols: usize| match model.tensors.get(idx).map(|e| e.dtype) {
+            Some(cortiq_core::TensorDtype::Q1) => q1_layout(rows, cols).1,
+            _ => planes_bytes(rows, cols),
+        };
         for (g, u, d, inter) in ffn {
             if !st.hyb.pairs.contains_key(&(uid, g, u)) {
-                need += planes_bytes(2 * inter, hidden);
+                need += sized(g, 2 * inter, hidden);
             }
             if !st.hyb.mats.contains_key(&(uid, d)) {
-                need += planes_bytes(hidden, inter);
+                need += sized(d, hidden, inter);
             }
         }
         let mut one = |w: &GraphW, rows: usize, cols: usize| {
-            if q6(w) && !st.hyb.mats.contains_key(&(uid, w.idx)) {
+            if st.hyb.mats.contains_key(&(uid, w.idx)) {
+                return;
+            }
+            if is8(w) {
+                need += i8_layout(rows, cols).2;
+            } else if is1(w) {
+                need += q1_layout(rows, cols).1;
+            } else if q6(w) {
                 need += planes_bytes(rows, cols);
             }
         };
@@ -1282,12 +1545,18 @@ fn build(
                 one(wv, nkv * hd, hidden);
                 one(wo, hidden, nh * hd);
             }
+            GraphAttn::ShortConv { inp, out, .. } => {
+                one(inp, 3 * hidden, hidden);
+                one(out, hidden, hidden);
+            }
             _ => {}
         }
     }
     if let Some((gw, rows)) = lm {
         if q6(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
             need += planes_bytes(rows, hidden);
+        } else if is1(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
+            need += q1_layout(rows_of(model, gw).unwrap_or(rows), hidden).1;
         }
     }
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
@@ -1330,23 +1599,26 @@ fn build(
                     blk0: 0,
                     ystride: 0,
                     xoff: 0,
-                    pad_: 0,
+                    nr: 0,
                 };
                 for &(g, u, d) in &experts[..e] {
                     let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
                     let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
-                    gu_t.push(job(&pm, 2 * inter, 6 | 0x100));
-                    dn_t.push(job(&dmx, hidden, 6));
+                    gu_t.push(job(&pm, 2 * inter, pm.kind as i32 | 0x100));
+                    dn_t.push(job(&dmx, hidden, dmx.kind as i32));
                     mats.push(pm);
                     mats.push(dmx);
                 }
-                // the shared expert: the last entry, or one of its own width
+                // the shared expert: the last entry, one of its own width, or
+                // none (the first routed expert then stands in, never launched)
+                let shared = *has_shared || detached_shared.is_some();
                 let (sg_, su_, sd_, sh) = match detached_shared {
                     Some(d) => (d.gate.idx, d.up.idx, d.down.idx, d.width),
-                    None => {
+                    None if *has_shared => {
                         let (g, u, d) = experts[e];
                         (g, u, d, model.tensors.get(g).and_then(|t| t.shape.first().copied()).ok_or("shared expert shape")?)
                     }
+                    None => (experts[0].0, experts[0].1, experts[0].2, inter),
                 };
                 let gated = *has_shared && *shared_gated;
                 let pm = hmat_pair(c, st, model, &gw6(sg_), &gw6(su_), sh, hidden)?;
@@ -1376,6 +1648,7 @@ fn build(
                     gated,
                     bpj_gu: (2 * inter).div_ceil(16) as u32,
                     bpj_dn: hidden.div_ceil(16) as u32,
+                    shared,
                     _mats: mats,
                 };
                 (pm, dmx, sh, Some(ml))
@@ -1442,8 +1715,28 @@ fn build(
                     ms_out,
                 })
             }
-            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, .. } => {
+            GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
                 let qr = nh * hd * (1 + *output_gate as usize);
+                let window = geom.as_ref().and_then(|g| g.window);
+                let local = geom
+                    .as_ref()
+                    .filter(|g| invf.len() >= rd / 2 && g.invf.len() >= rd / 2 && (g.invf[..rd / 2] != invf[..rd / 2] || g.rope_scale != 1.0))
+                    .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..rd / 2] && *s == g.rope_scale))
+                    .map_or(0, |i| i + 1);
+                let hg = match head_gate {
+                    Some(gw) => {
+                        let m = st.mat(c, model, gw, nh, hidden)?;
+                        let (mut tabs, mut blk) = (Vec::with_capacity(NMAX), 0u32);
+                        for r in 0..NMAX {
+                            let (mut jobs, mut b) = (Vec::new(), 0u32);
+                            super::push_job(&mut jobs, &mut b, &m, hgv.ptr + (r * nh * 4) as u64, 0);
+                            blk = b;
+                            tabs.push(Buf::from_slice(&jobs)?);
+                        }
+                        Some((m, tabs, blk))
+                    }
+                    None => None,
+                };
                 let qm = hmat(c, st, model, wq, qr, hidden)?;
                 let km = hmat(c, st, model, wk, nkv * hd, hidden)?;
                 let vm = hmat(c, st, model, wv, nkv * hd, hidden)?;
@@ -1484,7 +1777,19 @@ fn build(
                     Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, ms_in, ms_out })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, local, ms_in, ms_out })
+            }
+            GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
+                let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
+                let om = hmat(c, st, model, ow, hidden, hidden)?;
+                note(taps);
+                let taps = st.f32_buf(taps)?;
+                let ms_in = mmaset(&[(&im, qkv.ptr, 0, cdmax, 3 * hidden)])?;
+                let ms_out = match l.attn_out_norm {
+                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Conv(ConvL { inp: im, out: om, taps, kernel: *kernel, ms_in, ms_out })
             }
             _ => unreachable!(),
         };
@@ -1514,7 +1819,8 @@ fn build(
                 return Err("final norm width".into());
             }
             let logits = f4(NMAX * rows)?;
-            let head = if gw.kind == 6 {
+            let head_q1 = model.tensors.get(gw.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1);
+            let head = if gw.kind == 6 || head_q1 {
                 let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
                 if rows == 0 || rows > m.rows {
                     return Err(format!("head of {rows} rows over a {}-row matrix", m.rows));
@@ -1560,6 +1866,7 @@ fn build(
         lm,
         final_norm: final_norm_buf,
         invf: invf[..half].to_vec(),
+        invf_local,
         half,
         nh,
         nkv,
@@ -1593,6 +1900,7 @@ fn build(
         nvmax,
         moe: moe_bufs,
         yo,
+        hgv,
     })
 }
 
@@ -1650,6 +1958,16 @@ fn plan_for(
 }
 
 /// (sin, cos) per row and frequency, `[row][pair][2]`, as the host's table.
+/// The call's rotation rows, followed by the local table's when the plan has one.
+fn plan_tab(plan: &HPlan, positions: impl Iterator<Item = usize> + Clone) -> Vec<f32> {
+    let mut t = rope_rows(&plan.invf, positions.clone());
+    for (l, sc) in &plan.invf_local {
+        // the amplitude multiplies the rotated pair: both sin and cos
+        t.extend(rope_rows(l, positions.clone()).into_iter().map(|v| v * sc));
+    }
+    t
+}
+
 fn rope_rows(invf: &[f32], positions: impl Iterator<Item = usize>) -> Vec<f32> {
     let mut tab = Vec::new();
     for p in positions {
@@ -1831,6 +2149,50 @@ fn admit(
                 };
                 let gs = alloc().map_err(soft)?;
                 c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nv)) * 4) as u64, Ordering::Relaxed);
+                st.hyb.gdn.insert(key, gs);
+            }
+            (Mix::Conv(cv), GraphAttn::ShortConv { cpu_state, .. }) => {
+                // the ring rides a GDN state with no recurrent matrix: dims whose
+                // conv width is the hidden one (nv 1, dv hidden, no keys), so the
+                // state helpers size its ring right ([channel][k - 1], the host's)
+                let dims = (1, 0, 0, plan.hidden, cv.kernel);
+                let ring_n = (cv.kernel - 1) * plan.hidden;
+                if let Some(gs) = st.hyb.gdn.get_mut(&key) {
+                    if gs.dims == dims && gs.next_pos == pos0 {
+                        continue;
+                    }
+                    if gs.dims == dims && pos0 == 0 {
+                        unsafe { cu::memset_d8_async(gs.ring.ptr, 0, ring_n.max(1) * 4, c.stream).map_err(|e| soft(derr(e)))? };
+                        gs.next_pos = 0;
+                        gs.tape = None;
+                        continue;
+                    }
+                    return Err((true, format!("short-conv ring of layer {li} is at row {}, the call at {pos0}", gs.next_pos)));
+                }
+                if pos0 > 0 && cpu_state.len() != ring_n {
+                    return Err(soft("short-conv host seed missing for a nonzero position".into()));
+                }
+                let sizes = [1usize, ring_n, 1, 1, 1, 1, ring_n].map(|n| (n.max(1) * 4).next_multiple_of(256));
+                let alloc = || -> Res<GdnState> {
+                    let all = Buf::new(sizes.iter().sum())?;
+                    unsafe { cu::memset_d8_async(all.ptr, 0, all.bytes, c.stream).map_err(derr)? };
+                    let mut at = 0usize;
+                    let mut v = Vec::with_capacity(sizes.len());
+                    for &n in &sizes {
+                        v.push(all.view(at, n));
+                        at += n;
+                    }
+                    let mut v = v.into_iter();
+                    let mut next = || v.next().ok_or("short-conv state views");
+                    let (s, ring, t_qkv, t_cq, t_gb, s_save, ring_save) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
+                    if pos0 > 0 && ring_n > 0 {
+                        unsafe { cu::memcpy_htod_async(ring.ptr, &cpu_state[..ring_n], c.stream).map_err(derr)? };
+                    }
+                    Ok(GdnState { dims, _all: all, s, ring, next_pos: pos0, t_qkv, t_stride: plan.cdmax, t_cq, t_gb, s_save, ring_save, tape: None, snap: None })
+                };
+                let gs = alloc().map_err(soft)?;
+                // the count `reset` takes back for these dims
+                c.kv_bytes.fetch_add(((ring_n * 2 + NMAX * (2 * plan.hidden + 2)) * 4) as u64, Ordering::Relaxed);
                 st.hyb.gdn.insert(key, gs);
             }
             _ => return Err(soft(format!("layer {li}: descriptors changed under the plan"))),
@@ -2035,7 +2397,10 @@ fn book(
             farp.push((0, 0.0, false));
         }
         match &pl.mix {
-            Mix::Gdn(_) => {
+            Mix::Gdn(_) | Mix::Conv(_) => {
+                if tape && matches!(pl.mix, Mix::Conv(_)) {
+                    return Err("a verify window over a short convolution".into());
+                }
                 let gs = st.hyb.gdn.get_mut(&key).ok_or("GDN state missing")?;
                 layers.push([gs.s.ptr, gs.ring.ptr, gs.t_qkv.ptr, gs.t_cq.ptr, gs.t_gb.ptr, gs.s_save.ptr, gs.ring_save.ptr]);
                 gs.next_pos = pos0 + n;
@@ -2095,7 +2460,11 @@ fn book(
                 let rb = attn_rb(keys);
                 let ncap = keys.next_multiple_of(4096);
                 let nbcap = ncap.div_ceil(rb);
-                ci.extend([n0 as i32, n0 as i32, rb as i32, ncap as i32, nbcap as i32, 0, 0, 0]);
+                let win = match &pl.mix {
+                    Mix::Attn(a) => a.window.unwrap_or(0) as i32,
+                    _ => 0,
+                };
+                ci.extend([n0 as i32, n0 as i32, rb as i32, ncap as i32, nbcap as i32, 0, 0, win]);
                 keys_max = keys_max.max(keys);
             }
         }
@@ -2149,6 +2518,19 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
         hst(c, 0, &mut t0)?;
         match &pl.mix {
+            Mix::Conv(cv) => {
+                let ring = lb[1];
+                let (cd_i, k_i, n_i2) = (plan.cdmax as i32, cv.kernel as i32, n as i32);
+                unsafe {
+                    cv.ms_in.run(c, fx, planes, hidden, n)?;
+                    hst(c, 1, &mut t0)?;
+                    c.launch(fx.sconv, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.qkv.ptr, cd_i, cv.taps.ptr, ring, hid_i, k_i, n_i2, pp0, pp1, pp2, ps_i))?;
+                    hst(c, 2, &mut t0)?;
+                    cv.ms_out.run(c, fx, planes, hidden, n)?;
+                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    hst(c, 3, &mut t0)?;
+                }
+            }
             Mix::Gdn(g) => {
                 let [gs_s, gs_ring, t_qkv, t_cq, t_gb, s_save, ring_save] = lb;
                 if plan.nvmax != g.nv {
@@ -2234,6 +2616,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                let tabl = tabp + (a.local * n * plan.half * 2 * 4) as u64;
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
                 let nul16 = 0u64;
                 unsafe {
@@ -2258,7 +2641,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         0,
                         kargs!(
                             plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
-                            tabp, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
+                            tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
                         ),
                     )?;
                     // a grid for any record: blocks past the call's keys leave
@@ -2307,6 +2690,15 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         kargs!(p_p, e_p, gate_p, pp0, pp1, pp2, ps_i, n0_i, rb_i, nh_i, nbcap_i, cip),
                     )?;
                     hst(c, 5, &mut t0)?;
+                    if let Some((_, tabs, blk)) = &a.hg {
+                        let (nullp, no_act, zero_g) = (0u64, -1i32, 0i32);
+                        for (r, jt) in tabs.iter().enumerate().take(n) {
+                            let x = plan.xn.ptr + (r * hidden * 4) as u64;
+                            c.launch(c.f.mv_multi, (*blk, 1), 256, super::mv_shared_bytes(hidden), kargs!(jt.ptr, 1i32, x, nullp, no_act, nullp, eps, zero_g, hid_i))?;
+                        }
+                        let (hd_i2, nh_i2, n_i3) = (hd as i32, nh as i32, n as i32);
+                        c.launch(fx.head_gate, ((nh * hd).div_ceil(256) as u32, n as u32), 256, 0, kargs!(pp0, pp1, ps_i, plan.hgv.ptr, nh_i2, hd_i2, n_i3))?;
+                    }
                     a.ms_out.run(c, fx, planes, nh * hd, n)?;
                     sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
                     hst(c, 6, &mut t0)?;
@@ -2329,11 +2721,17 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 moe_routed(c, fx, plan, m, mb, n)?;
             }
             // gate/up with silu(gate) * up made in its epilogue, into the
-            // middle's planes; down reads them (a routed FFN: its shared expert)
-            pl.ms_gu.run(c, fx, planes, hidden, n)?;
+            // middle's planes; down reads them (a routed FFN: its shared expert,
+            // when it has one)
+            let dense_pair = pl.moe.as_ref().is_none_or(|m| m.shared);
+            if dense_pair {
+                pl.ms_gu.run(c, fx, planes, hidden, n)?;
+            }
             hst(c, 7, &mut t0)?;
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
-            pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
+            if dense_pair {
+                pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
+            }
             sandwich_add(c, fx, plan, pl.ffn_out.as_deref(), n)?;
             if let Some(s) = pl.layer_scale {
                 let tot = (n * hidden) as u64;
@@ -2343,12 +2741,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 // the mixture and the shared expert into the stream
                 let s_n = (n * m.k).min(m.e).min(mb.smax);
                 let (gi, ni, si) = (m.gated as i32, n as i32, s_n as i32);
+                let dsh = if m.shared { mb.dsh.ptr } else { 0u64 };
                 c.launch(
                     fx.moe_combine,
                     (hidden.div_ceil(256) as u32, n as u32),
                     256,
                     0,
-                    kargs!(plan.h.ptr, mb.dns.ptr, mb.wsel.ptr, mb.dsh.ptr, mb.sg.ptr, gi, ni, hid_i, si),
+                    kargs!(plan.h.ptr, mb.dns.ptr, mb.wsel.ptr, dsh, mb.sg.ptr, gi, ni, hid_i, si),
                 )?;
             }
             hst(c, 9, &mut t0)?;
@@ -2410,6 +2809,30 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
     Ok(())
 }
 
+/// A layer the prompt path has no kernels for (sandwich norms, a layer
+/// scale, a short convolution or a head-wise gate): such a
+/// stack's long prompt runs the small path a chunk at a time.
+fn small_only(l: &HLayer) -> bool {
+    l.attn_out.is_some()
+        || l.ffn_out.is_some()
+        || l.layer_scale.is_some()
+        || matches!(l.mix, Mix::Conv(_))
+        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
+}
+
+/// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
+/// NMAX rows at a time instead of the prompt path's grouped experts.
+fn moe_big_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_MOE_BIG").as_deref() != Ok("0"))
+}
+
+/// Rows a grouped expert job takes (`CMF_HYB_MOE_RMAX`: 32 or 64).
+fn moe_rmax() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| if std::env::var("CMF_HYB_MOE_RMAX").as_deref() == Ok("64") { 64 } else { 32 })
+}
+
 /// A replayable small-path call: the instantiated graph and the pointers it
 /// was recorded with.
 pub(super) struct GraphRec {
@@ -2460,6 +2883,11 @@ unsafe fn capture(c: &Ctx, f: impl FnOnce() -> Res<()>) -> Res<cs::CUgraphExec> 
     }
 }
 
+thread_local! {
+    /// Set while a long prompt goes through the small path a chunk at a time.
+    static DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The small path, with the head when `head`: book, then the launches —
 /// replayed from a recorded graph when one with the same pointers is there,
 /// else recorded now (or launched directly, `CMF_CUDA_GRAPH=0` and under
@@ -2486,7 +2914,9 @@ unsafe fn run_small(
         if !bk.ci.is_empty() {
             cu::memcpy_htod_async(plan.ci.ptr, &bk.ci, c.stream).map_err(derr)?;
         }
-        if !graphs_on() {
+        // a prompt read through this path a chunk at a time launches directly:
+        // capturing a graph per chunk shape cost more than the chunk
+        if !graphs_on() || DIRECT.with(|d| d.get()) {
             launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
             if head {
                 head_launch(c, plan, n)?;
@@ -2682,7 +3112,7 @@ pub(super) fn token(
     let mut run = || -> Res<()> {
         unsafe {
             cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
-            let tab = rope_rows(&plan.invf, std::iter::once(position));
+            let tab = plan_tab(&plan, std::iter::once(position));
             if !tab.is_empty() {
                 cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
             }
@@ -2832,6 +3262,10 @@ pub(super) fn mtp_chain(
         }
         Ok(())
     };
+    if !plan.invf_local.is_empty() {
+        decline("hybrid draft chain", "a stack with local rotations");
+        return Err(false);
+    }
     if let Err(e) = prep(st) {
         decline("hybrid draft chain", &e);
         return Err(false);
@@ -2854,6 +3288,8 @@ pub(super) fn mtp_chain(
         let h0_b = st.scr(c, "hy_chain_h0", hidden * 4)?;
         let tok_b = st.scr(c, "hy_chain_tok", (NMAX + 1) * 4)?;
         let ci: Vec<i32> = books.iter().flat_map(|b| b.ci.iter().copied()).collect();
+        // a launch a position here: the rows of one table (a stack with local
+        // layers is refused before the mirror moves)
         let tab = rope_rows(&plan.invf, position..position + k);
         let ch = st.hyb.chain.as_ref().unwrap();
         let (etab, ecod, epar, enp, hnp) = (ch.emb.w.ptr, ch.emb.aux0(), ch.emb.aux1.as_ref().map_or(0, |b| b.ptr), ch.enorm.ptr, ch.hnorm.ptr);
@@ -3001,7 +3437,14 @@ pub(super) fn batch(
     // a longer prompt goes through it NMAX rows at a time
     // what the prompt path has no kernels for (a routed FFN, sandwich norms, a
     // layer scale) runs the small path
-    let moe = plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some());
+    // a routed FFN's long prompt takes the prompt path (its experts grouped)
+    // unless the stack has a layer only the small path runs
+    let grouped = moe_big_on() && spec.is_none() && !prompt_far && b > NMAX && !plan.layers.iter().any(small_only);
+    let moe = !grouped && plan.layers.iter().any(|l| l.moe.is_some() || small_only(l));
+    if spec.is_some() && plan.layers.iter().any(|l| matches!(l.mix, Mix::Conv(_))) {
+        decline("hybrid batch", "a verify window over a short convolution");
+        return BatchGraphOutcome::Declined;
+    }
     // CMF_HYB_MOE_CHUNKS=0: such a long prompt declines (the per-op path)
     let chunks_on = std::env::var("CMF_HYB_MOE_CHUNKS").as_deref() != Ok("0");
     if moe && (prompt_far || (b > NMAX && (spec.is_some() || !chunks_on))) {
@@ -3050,12 +3493,20 @@ pub(super) fn batch(
     let mut spec = spec;
     let mut run = || -> Res<()> {
         if moe && b > NMAX {
+            struct Direct;
+            impl Drop for Direct {
+                fn drop(&mut self) {
+                    DIRECT.with(|d| d.set(false));
+                }
+            }
+            DIRECT.with(|d| d.set(true));
+            let _direct = Direct;
             let mut at = 0usize;
             while at < b {
                 let n = NMAX.min(b - at);
                 unsafe {
                     cu::memcpy_htod_async(plan.h.ptr, &h[at * hidden..(at + n) * hidden], c.stream).map_err(derr)?;
-                    let tab = rope_rows(&plan.invf, positions[at..at + n].iter().copied());
+                    let tab = plan_tab(&plan, positions[at..at + n].iter().copied());
                     if !tab.is_empty() {
                         cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                     }
@@ -3071,7 +3522,7 @@ pub(super) fn batch(
         if b <= NMAX && !prompt_far {
             unsafe {
                 cu::memcpy_htod_async(plan.h.ptr, h, c.stream).map_err(derr)?;
-                let tab = rope_rows(&plan.invf, positions.iter().copied());
+                let tab = plan_tab(&plan, positions.iter().copied());
                 if !tab.is_empty() {
                     cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                 }
@@ -3272,6 +3723,65 @@ pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
 
 /// The prompt path: a chunk of `b > NMAX` rows on cuBLAS.
 #[allow(clippy::too_many_arguments)]
+/// A prompt chunk's routed FFN, its experts grouped (see `hy_moe_group`):
+/// the normed rows in f32, the router and the shared gate as f32 GEMMs,
+/// every row's picks, the (row, pick) entries sorted by expert and laid out
+/// as input planes, a tensor-core launch over every expert's gate/up and one
+/// over its down, the mixture (and `dsh`, the shared expert's rows) into h.
+#[allow(clippy::too_many_arguments)]
+unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
+    let (e, k, inter) = (m.e, m.k, m.inter);
+    if e > 1024 || k > 64 || inter % 32 != 0 {
+        return Err(format!("a grouped routed FFN of {e} experts, top {k}, width {inter}"));
+    }
+    let nk = b * k;
+    let rmax = moe_rmax();
+    let jmax = e + nk.div_ceil(rmax);
+    let (nul, zero_i, hid_i) = (0u64, 0i32, hidden as i32);
+    let x32 = st.scr(c, "hb_mx32", b * hidden * 4)?;
+    let logits = st.scr(c, "hb_mlog", b * e * 4)?;
+    let sg = if m.sgw.is_some() { st.scr(c, "hb_msg", b * 4)? } else { 0 };
+    let pidx = st.scr(c, "hb_mpidx", nk * 4)?;
+    let pwt = st.scr(c, "hb_mpwt", nk * 4)?;
+    let pos = st.scr(c, "hb_mpos", nk * 4)?;
+    let src = st.scr(c, "hb_msrc", nk * 4)?;
+    let xg0 = st.scr(c, "hb_mxg0", nk * hidden * 2)?;
+    let xg1 = st.scr(c, "hb_mxg1", nk * hidden * 2)?;
+    let qq0 = st.scr(c, "hb_mqq0", nk * inter * 2)?;
+    let qq1 = st.scr(c, "hb_mqq1", nk * inter * 2)?;
+    let ys = st.scr(c, "hb_mys", nk * hidden * 4)?;
+    let gu_a = st.scr(c, "hb_mgua", jmax * std::mem::size_of::<HyJob>())?;
+    let dn_a = st.scr(c, "hb_mdna", jmax * std::mem::size_of::<HyJob>())?;
+    let (gi, tb) = if rmax == 64 { (1usize, 1u32) } else { (0, 2) };
+    let (bpg, bpd) = (m.bpj_gu.div_ceil(tb), m.bpj_dn.div_ceil(tb));
+    let (n_i, e_i, k_i, nk_i, rmax_i, jmax_i, inter_i) = (b as i32, e as i32, k as i32, nk as i32, rmax as i32, jmax as i32, inter as i32);
+    let (bg_i, bd_i) = (bpg as i32, bpd as i32);
+    let bias = m.bias.as_ref().map_or(0, |x| x.ptr);
+    unsafe {
+        c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, norm, x32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+        c.gemm(true, false, e, b, hidden, 1.0, m.router.w.ptr, hidden, x32, hidden, 0.0, logits, e, Gemm::F32)?;
+        if let Some(g) = &m.sgw {
+            c.gemm(true, false, 1, b, hidden, 1.0, g.w.ptr, hidden, x32, hidden, 0.0, sg, 1, Gemm::F32)?;
+        }
+        c.launch(fx.moe_topk, (b.div_ceil(8) as u32, 1), 256, 0, kargs!(logits, bias, n_i, e_i, k_i, m.flags, m.route_scale, pidx, pwt))?;
+        c.launch(
+            fx.moe_group,
+            (1, 1),
+            1024,
+            0,
+            kargs!(pidx, nk_i, k_i, e_i, rmax_i, jmax_i, m.gu_t.ptr, m.dn_t.ptr, gu_a, dn_a, pos, src, qq0, qq1, hid_i, inter_i, ys, bg_i, bd_i),
+        )?;
+        let tot = (nk * hidden) as u64;
+        c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x32, src, nk_i, hid_i, xg0, xg1, xg1))?;
+        let f = fx.mmp_g[gi];
+        c.launch(f, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(gu_a, jmax_i, xg0, xg1, xg1, hid_i, rmax_i, hid_i))?;
+        c.launch(f, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(dn_a, jmax_i, qq0, qq1, qq1, inter_i, rmax_i, inter_i))?;
+        let gated_i = (m.gated && sg != 0) as i32;
+        c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, b as u32), 256, 0, kargs!(bh, ys, pos, pwt, dsh, sg, gated_i, n_i, k_i, hid_i))?;
+    }
+    Ok(())
+}
+
 unsafe fn big(
     c: &Ctx,
     st: &mut State,
@@ -3287,8 +3797,9 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    if plan.layers.iter().any(|l| l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some() || l.layer_scale.is_some()) {
-        return Err("a routed FFN or sandwich norms on the prompt path".into());
+    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some()));
+    if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
+        return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
     }
     let (gw, _) = prec();
     if gw != Gemm::Half {
@@ -3307,6 +3818,7 @@ unsafe fn big(
             match &l.mix {
                 Mix::Gdn(g) => v.extend([(g.qkv.rows, g.qkv.cols), (g.z.rows, g.z.cols), (g.out.rows, g.out.cols)]),
                 Mix::Attn(a) => v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]),
+                Mix::Conv(cv) => v.extend([(cv.inp.rows, cv.inp.cols), (cv.out.rows, cv.out.cols)]),
             }
             v
         })
@@ -3319,7 +3831,8 @@ unsafe fn big(
     let want = super::taps_wanted();
     let tapping = !want.is_empty() && layer_base == 0 && want.iter().all(|&l| l < plan.layers.len());
     let mut tapped = if tapping { vec![0f32; want.len() * b * hidden] } else { Vec::new() };
-    let tab = rope_rows(&plan.invf, positions.iter().copied());
+    // the call's rotation rows, then each extra table's (a local layer's)
+    let tab = plan_tab(plan, positions.iter().copied());
     let btab = st.scr(c, "hb_tab", tab.len().max(1) * 4)?;
     unsafe {
         cu::memcpy_htod_async(bh, h, c.stream).map_err(derr)?;
@@ -3336,10 +3849,10 @@ unsafe fn big(
     let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
-        if m.kind != 6 {
-            return Err("a weight other than repacked q4tp on the prompt path".into());
+        if !matches!(m.kind, 3 | 5 | 6) {
+            return Err("a weight other than repacked q4tp, int8 or q1 tiles on the prompt path".into());
         }
-        if m.rows * m.cols <= wd_rows {
+        if m.kind == 6 && m.rows * m.cols <= wd_rows {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
             unsafe {
                 c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
@@ -3358,7 +3871,13 @@ unsafe fn big(
             let threads = (nt * (m.cols / 32) * 32) as u64;
             let (t0_i, nt_i) = (t0 as i32, nt as i32);
             unsafe {
-                c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                if m.kind == 3 {
+                    c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else if m.kind == 5 {
+                    c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else {
+                    c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                }
                 bst(c, 1, tm)?;
                 c.gemm(true, false, nr, b, m.cols, alpha, wd, m.cols, x, m.cols, beta, y + (r0 * 4) as u64, ldy, Gemm::Half)?;
                 bst(c, 2, tm)?;
@@ -3374,6 +3893,8 @@ unsafe fn big(
         }
         bst(c, 0, tm)?;
         match &pl.mix {
+            // the prompt path is not entered with such a layer (see its guard)
+            Mix::Conv(_) => return Err("a short convolution on the prompt path".into()),
             Mix::Gdn(g) => {
                 let (cd_i, kk_i, nv_i, nk_i, dk_i, dv_i) =
                     (g.cdim as i32, g.kk as i32, g.nv as i32, g.nk as i32, g.dk as i32, g.dv as i32);
@@ -3455,13 +3976,15 @@ unsafe fn big(
                 let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                // a local layer's rotation rows follow the call's (`plan_tab`)
+                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, n0_i, b_i, nul, qgh, bqp, bkp, bvp),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, n0_i, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // the archive of a prompt past its first seal: the chunk's rows
@@ -3566,13 +4089,15 @@ unsafe fn big(
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
+                // a local layer's rotation rows follow the call's (`plan_tab`)
+                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
                         ((nh + nkv) as u32, b as u32),
                         hd as u32,
                         0,
-                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, btab, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, b_i, nul, qgh, bqp, bkp, bvp),
+                        kargs!(yq, qs_i, yk, yv, kvs_i, qn, kn, qg, gt, kp, vp, tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, b_i, nul, qgh, bqp, bkp, bvp),
                     )?;
                 }
                 // a far-field layer of a prompt read for its seal: the rotated
@@ -3600,9 +4125,12 @@ unsafe fn big(
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
+                // a sliding window: the block's keys start where its first row's window does
+                let win = a.window.unwrap_or(0);
                 while b0 < b {
                     let p0 = pos0 + b0;
-                    let col_base = m_base;
+                    let col_base = if win > 0 { m_base.max((p0 + 1).saturating_sub(win)) } else { m_base };
+                    let (kpw, vpw) = (kp + ((col_base - m_base) * lda * 2) as u64, vp + ((col_base - m_base) * lda * 2) as u64);
                     let fit = |n: usize| (p0 + n - col_base) * n * nh * 4 <= 384 << 20;
                     let mut bn = (b - b0).min(att_rows());
                     while bn > 64 && !fit(bn) {
@@ -3614,14 +4142,14 @@ unsafe fn big(
                     let bs = st.scr(c, "hb_s", (nkv * l_rows * cols * 4).max(whole))?;
                     let bp = st.scr(c, "hb_p", (nkv * l_rows * cols * 2).max(whole / 2))?;
                     let (l_i, p0_i, cb_i, hpk_i) = (l_rows as i32, p0 as i32, col_base as i32, hpk as i32);
-                    let (cols_i, istride) = (cols as i32, (b * hpk) as i32);
+                    let (cols_i, istride, win_i) = (cols as i32, (b * hpk) as i32, win as i32);
                     let isum = bis + (b0 * hpk * 4) as u64;
                     // the mirrors hold f16 rows: both GEMMs on f16 operands
                     // (the query copy and the exponentials), f32 out
                     unsafe {
-                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kp, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
-                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride))?;
-                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vp, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
+                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i))?;
+                        gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
                 }
@@ -3641,15 +4169,31 @@ unsafe fn big(
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.post_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
         bst(c, 0, tm)?;
-        // the gate/up pair as one GEMM, its rows in the pair's order
-        mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
-        let tot = (b * inter) as u64;
-        let (in_i, bb_i) = (inter as i32, b as i32);
-        unsafe {
-            c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+        // the shared expert, or the dense FFN: the gate/up pair as one GEMM,
+        // its rows in the pair's order
+        let dense_pair = pl.moe.as_ref().is_none_or(|m| m.shared);
+        let dsh = match &pl.moe {
+            Some(_) if dense_pair => st.scr(c, "hb_dsh", b * hidden * 4)?,
+            _ => 0,
+        };
+        if dense_pair {
+            mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
+            let tot = (b * inter) as u64;
+            let (in_i, bb_i) = (inter as i32, b as i32);
+            unsafe {
+                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+            }
+            bst(c, 6, tm)?;
+            if pl.moe.is_some() {
+                mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
+            } else {
+                mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
+            }
         }
-        bst(c, 6, tm)?;
-        mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
+        if let Some(m) = &pl.moe {
+            unsafe { moe_grouped(c, st, fx, m, bh, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            bst(c, 6, tm)?;
+        }
         if tapping {
             if let Some(s) = want.iter().position(|&l| l == li) {
                 // pageable: done when it returns
@@ -4096,5 +4640,185 @@ mod tests {
         assert_eq!(down::<u32>(c, &dn, hn.len()), hn, "pair nibbles");
         assert_eq!(down::<u8>(c, &dc, hc.len()), hc, "pair codes");
         assert_eq!(down::<f32>(c, &dl, hl.len()), hl, "pair params");
+    }
+
+    /// q1 matrices as q1 tiles: expanded back they are `dequant_q1`'s
+    /// values word for word (one matrix and a gate/up pair), and the
+    /// tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_q1_tiles_match_the_host() {
+        use cortiq_core::quant::{dequant_q1, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 23u64;
+        let q1 = |rows: usize, cols: usize, seed: &mut u64| -> Vec<u8> {
+            let mut b = Vec::with_capacity(rows * cols / 32 * 6);
+            for _ in 0..rows * cols / 32 {
+                b.extend(f32_to_f16(0.002 + (lcg(seed) % 1000) as f32 * 1e-5).to_le_bytes());
+                for _ in 0..4 {
+                    b.push(lcg(seed) as u8);
+                }
+            }
+            b
+        };
+        let host = |b: &[u8], rows: usize, cols: usize| -> Vec<f32> {
+            let mut w = vec![0f32; rows * cols];
+            dequant_q1(b, &mut w);
+            w
+        };
+        let expand = |t: &(Buf, Buf), rows: usize, cols: usize| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        for (rows, cols) in [(40usize, 512usize), (2048, 2048), (6144, 2048)] {
+            let b = q1(rows, cols, &mut seed);
+            let w = host(&b, rows, cols);
+            let t = repack1_on_card(c, &fx, &[&b], rows, rows, cols).unwrap();
+            let got = expand(&t, rows, cols);
+            for i in 0..rows * cols {
+                assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} at {},{}", i / cols, i % cols);
+            }
+            for n in [1usize, 11] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let dm = DevMat { kind: 3, rows, cols, held: 0, w: Arc::new(t.0.view(0, t.0.bytes)), aux0: Some(t.1.view(0, t.1.bytes)), aux1: None };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "{rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
+        let (inter, cols) = (24usize, 64usize);
+        let (g, u) = (q1(inter, cols, &mut seed), q1(inter, cols, &mut seed));
+        let (wg, wu) = (host(&g, inter, cols), host(&u, inter, cols));
+        let t = repack1_on_card(c, &fx, &[&g, &u], inter, 2 * inter, cols).unwrap();
+        let got = expand(&t, 2 * inter, cols);
+        for r in 0..2 * inter {
+            let (src, sr) = if (r & 15) >= 8 { (&wu, (r >> 4) * 8 + (r & 7)) } else { (&wg, (r >> 4) * 8 + (r & 7)) };
+            for k in 0..cols {
+                assert_eq!(got[r * cols + k], f32_to_f16(src[sr * cols + k]), "pair at {r},{k}");
+            }
+        }
+    }
+
+    /// int8 matrices (q8_2f with its column field, q8_row without) as int8
+    /// tiles: expanded back they are the host's f16 of int8 * row scale *
+    /// field, word for word (one matrix and a q8_row gate/up pair), and the
+    /// tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_int8_tiles_match_the_host() {
+        use cortiq_core::quant::{f16_to_f32, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 11u64;
+        type Q8 = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+        let q8 = |rows: usize, cols: usize, field: bool, seed: &mut u64| -> Q8 {
+            let body: Vec<u8> = (0..rows * cols).map(|_| lcg(seed) as u8).collect();
+            let h = |v: f32| f32_to_f16(v).to_le_bytes();
+            let rs: Vec<u8> = (0..rows).flat_map(|r| h(0.001 + 0.0001 * (r % 7) as f32)).collect();
+            let cf = field.then(|| (0..cols).flat_map(|k| h(0.5 + 0.03 * (k % 11) as f32)).collect());
+            (body, rs, cf)
+        };
+        // the weight as the card's expand makes it: (int8 * rs) * cf in f32
+        let w = |m: &Q8, r: usize, k: usize, cols: usize| -> f32 {
+            let f = |b: &[u8], i: usize| f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
+            let cf = m.2.as_ref().map_or(1.0, |b| f(b, k));
+            (m.0[r * cols + k] as i8) as f32 * f(&m.1, r) * cf
+        };
+        let expand = |t: &(Buf, Buf, Option<Buf>), rows: usize, cols: usize| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
+            let cf = t.2.as_ref().map_or(0, |b| b.ptr);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, cf, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        fn parts(m: &(Vec<u8>, Vec<u8>, Option<Vec<u8>>)) -> (&[u8], &[u8], Option<&[u8]>) {
+            (m.0.as_slice(), m.1.as_slice(), m.2.as_deref())
+        }
+        // the last three: Mellum2.1's q, k and o shapes (two tiles a block past 2048 rows)
+        for (rows, cols, field) in [(40usize, 512usize, true), (48, 96, false), (4096, 2304, true), (512, 2304, true), (2304, 4096, true)] {
+            let m = q8(rows, cols, field, &mut seed);
+            let t = repack8_on_card(c, &fx, &[parts(&m)], rows, cols).unwrap();
+            let got = expand(&t, rows, cols);
+            for r in 0..rows {
+                for k in 0..cols {
+                    assert_eq!(got[r * cols + k], f32_to_f16(w(&m, r, k, cols)), "{rows}x{cols} at {r},{k}");
+                }
+            }
+            // y = W x over 1, 3 and 11 rows through the tensor-core kernel
+            for n in [1usize, 3, 11] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 37.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let (tw, trs, tcf) = (t.0.view(0, t.0.bytes), t.1.view(0, t.1.bytes), t.2.as_ref().map(|b| b.view(0, b.bytes)));
+                let dm = DevMat { kind: 5, rows, cols, held: 0, w: Arc::new(tw), aux0: tcf, aux1: Some(trs) };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w(&m, r, k, cols) as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "{rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
+        // a q8_row gate/up pair: 8 gate rows, then the same 8 up rows, a tile
+        let (inter, cols) = (24usize, 64usize);
+        let g = q8(inter, cols, false, &mut seed);
+        let u = q8(inter, cols, false, &mut seed);
+        let t = repack8_on_card(c, &fx, &[parts(&g), parts(&u)], 2 * inter, cols).unwrap();
+        let got = expand(&t, 2 * inter, cols);
+        for r in 0..2 * inter {
+            let (src, sr) = if (r & 15) >= 8 { (&u, (r >> 4) * 8 + (r & 7)) } else { (&g, (r >> 4) * 8 + (r & 7)) };
+            for k in 0..cols {
+                assert_eq!(got[r * cols + k], f32_to_f16(w(src, sr, k, cols)), "pair at {r},{k}");
+            }
+        }
+        // a q8_2f pair would need two column scalings of one input
+        let g2 = q8(inter, cols, true, &mut seed);
+        assert!(repack8_on_card(c, &fx, &[parts(&g2), parts(&g2)], 2 * inter, cols).is_err());
     }
 }
