@@ -3330,19 +3330,41 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
 /// as their mean); nothing when the product went to the stream.
 unsafe fn sub_out(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
     match (&pl.mhc, &plan.mhc) {
-        (Some(m), Some(mp)) => {
-            let (ns_i, hid_i) = (mp.ns as i32, plan.hidden as i32);
-            let grid = (plan.hidden.div_ceil(256) as u32, n as u32);
-            unsafe {
-                c.launch(fx.mhc_merge, grid, 256, 0, kargs!(mp.r.ptr, plan.yo.ptr, mp.coef.ptr, ns_i, hid_i))?;
-                if ffn && m.leave {
-                    c.launch(fx.mhc_leave, grid, 256, 0, kargs!(mp.r.ptr, plan.h.ptr, ns_i, hid_i))?;
-                }
-            }
-            Ok(())
-        }
+        (Some(m), Some(mp)) => unsafe { mhc_out(c, fx, plan.hidden, m, mp, MhcRows::small(plan, mp), ffn, n) },
         _ => unsafe { sandwich_add(c, fx, plan, if ffn { pl.ffn_out.as_deref() } else { pl.attn_out.as_deref() }, n) },
     }
+}
+
+/// The rows an mHC sub-layer reads and writes: its input rows (`h`), its
+/// product (`yo`), the streams, the merge coefficients and the router's
+/// logits; the small path's plan buffers or the prompt path's own.
+#[derive(Clone, Copy)]
+struct MhcRows {
+    h: u64,
+    yo: u64,
+    r: u64,
+    coef: u64,
+    lg: u64,
+}
+
+impl MhcRows {
+    fn small(plan: &HPlan, mp: &MhcPlan) -> Self {
+        MhcRows { h: plan.h.ptr, yo: plan.yo.ptr, r: mp.r.ptr, coef: mp.coef.ptr, lg: mp.lg.ptr }
+    }
+}
+
+/// After an mHC sub-layer: its product merged into the streams; the range's
+/// last sub-layer hands their mean on as the stream.
+unsafe fn mhc_out(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, rows: MhcRows, ffn: bool, n: usize) -> Res<()> {
+    let (ns_i, hid_i) = (mp.ns as i32, hidden as i32);
+    let grid = (hidden.div_ceil(256) as u32, n as u32);
+    unsafe {
+        c.launch(fx.mhc_merge, grid, 256, 0, kargs!(rows.r, rows.yo, rows.coef, ns_i, hid_i))?;
+        if ffn && m.leave {
+            c.launch(fx.mhc_leave, grid, 256, 0, kargs!(rows.r, rows.h, ns_i, hid_i))?;
+        }
+    }
+    Ok(())
 }
 
 /// The mHC routing before a sub-layer: entering the range (the attention of
@@ -3351,16 +3373,22 @@ unsafe fn sub_out(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n:
 /// coefficients.
 unsafe fn sub_in(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
     let (Some(m), Some(mp)) = (&pl.mhc, &plan.mhc) else { return Ok(()) };
-    let (ns_i, hid_i) = (mp.ns as i32, plan.hidden as i32);
+    unsafe { mhc_in(c, fx, plan.hidden, m, mp, MhcRows::small(plan, mp), ffn, n) }
+}
+
+/// Before an mHC sub-layer: entering the range the streams take the stream's
+/// rows; the router's logits, its coefficients and the sub-layer's input rows.
+unsafe fn mhc_in(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, rows: MhcRows, ffn: bool, n: usize) -> Res<()> {
+    let (ns_i, hid_i) = (mp.ns as i32, hidden as i32);
     unsafe {
         if !ffn && m.enter {
-            c.launch(fx.mhc_enter, (plan.hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(plan.h.ptr, mp.r.ptr, ns_i, hid_i))?;
+            c.launch(fx.mhc_enter, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(rows.h, rows.r, ns_i, hid_i))?;
         }
         let (w, b) = if ffn { (&m.fw, &m.fb) } else { (&m.aw, &m.ab) };
         let (out_i, it_i, fixed_i) = (m.out as i32, mp.iters as i32, (m.out == 2 * mp.ns) as i32);
         // the logits a block each, then the coefficients and the input rows
-        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(mp.r.ptr, w.ptr, mp.lg.ptr, ns_i, hid_i))?;
-        c.launch(fx.mhc_route, (n as u32, 1), 256, 0, kargs!(mp.r.ptr, mp.lg.ptr, b.ptr, plan.h.ptr, mp.coef.ptr, ns_i, hid_i, out_i, it_i, fixed_i, mp.pre_scale))
+        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i))?;
+        c.launch(fx.mhc_route, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, out_i, it_i, fixed_i, mp.pre_scale))
     }
 }
 
@@ -3415,14 +3443,14 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
     Ok(())
 }
 
-/// A layer the prompt path has no kernels for (sandwich norms, a layer
-/// scale, a short convolution or a head-wise gate): such a
-/// stack's long prompt runs the small path a chunk at a time.
+/// A layer the prompt path has no kernels for (a routed FFN's sandwich, mHC
+/// beside a sandwich or a routed FFN, a short convolution or a head-wise
+/// gate): such a stack's long prompt runs the small path a chunk at a time.
 fn small_only(l: &HLayer) -> bool {
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
     (l.moe.is_some() && l.ffn_out.is_some())
-        || l.mhc.is_some()
+        || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
         || matches!(l.mix, Mix::Conv(_))
         || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
 }
@@ -4526,9 +4554,29 @@ unsafe fn big(
         }
         Ok(())
     };
+    // mHC (SenseNova-Loop): the chunk's streams, coefficients and logits;
+    // a sub-layer reads its input rows from bh and leaves its product in
+    // "hb_yo" for the merge
+    let mrows = match &plan.mhc {
+        Some(mp) => Some(MhcRows {
+            h: bh,
+            yo: st.scr(c, "hb_yo", b * hidden * 4)?,
+            r: st.scr(c, "hb_mr", b * mp.ns * hidden * 4)?,
+            coef: st.scr(c, "hb_mc", b * 20 * 4)?,
+            lg: st.scr(c, "hb_ml", b * 24 * 4)?,
+        }),
+        None => None,
+    };
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        let mh = match (&pl.mhc, &plan.mhc, mrows) {
+            (Some(m), Some(mp), Some(r)) => Some((m, mp, r)),
+            _ => None,
+        };
         unsafe {
+            if let Some((m, mp, r)) = mh {
+                mhc_in(c, fx, hidden, m, mp, r, false, b)?;
+            }
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
         // a Prism file: the projections read the rows in their basis, the GDN
@@ -4581,13 +4629,17 @@ unsafe fn big(
                 gs.next_pos = pos0 + b;
                 gs.tape = None;
                 unsafe { prism_rows(c, plan, yof, yof, vd, vd, b)? };
-                match pl.attn_out.as_deref() {
-                    Some(w) => {
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&g.out, yof, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
                         let by = st.scr(c, "hb_yo", b * hidden * 4)?;
                         mul(&g.out, yof, by, hidden, 1.0, 0.0)?;
                         unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
                     }
-                    None => mul(&g.out, yof, bh, hidden, 1.0, 1.0)?,
+                    (None, None) => mul(&g.out, yof, bh, hidden, 1.0, 1.0)?,
                 }
             }
             Mix::Attn(a) if sealed.get(li).copied().unwrap_or(false) => {
@@ -4720,13 +4772,17 @@ unsafe fn big(
                 }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
-                match pl.attn_out.as_deref() {
-                    Some(w) => {
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&a.o, bao, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
                         let by = st.scr(c, "hb_yo", b * hidden * 4)?;
                         mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
                         unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
                     }
-                    None => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                    (None, None) => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
                 }
             }
             Mix::Attn(a) => {
@@ -4829,13 +4885,17 @@ unsafe fn big(
                 }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
-                match pl.attn_out.as_deref() {
-                    Some(w) => {
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&a.o, bao, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
                         let by = st.scr(c, "hb_yo", b * hidden * 4)?;
                         mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
                         unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
                     }
-                    None => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                    (None, None) => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
                 }
             }
         }
@@ -4843,6 +4903,9 @@ unsafe fn big(
         let bgu = st.scr(c, "hb_gu", b * 2 * inter * 4)?;
         let bmh = st.scr(c, "hb_mh", b * inter * 2)?;
         unsafe {
+            if let Some((m, mp, r)) = mh {
+                mhc_in(c, fx, hidden, m, mp, r, true, b)?;
+            }
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.post_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
         bst(c, 0, tm)?;
@@ -4866,6 +4929,9 @@ unsafe fn big(
             unsafe { prism_rows(c, plan, bmh, bmh, inter, inter, b)? };
             if pl.moe.is_some() {
                 mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
+            } else if let Some((m, mp, r)) = mh {
+                mul(&pl.down, bmh, r.yo, hidden, 16.0, 0.0)?;
+                unsafe { mhc_out(c, fx, hidden, m, mp, r, true, b)? };
             } else if let Some(w) = pl.ffn_out.as_deref() {
                 let by = st.scr(c, "hb_yo", b * hidden * 4)?;
                 mul(&pl.down, bmh, by, hidden, 16.0, 0.0)?;

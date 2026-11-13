@@ -64,7 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which writes the sub-layer's input rows), the merge after it (`hy_mhc_merge`), the streams' entry and mean
   (`hy_mhc_enter`, `hy_mhc_leave`); a sub-layer's product goes apart from the stream. SenseNova-Loop-9B, which ran
   op by op on CUDA at 4.4 tok/s, decodes at 48.9 tok/s against Vulkan's 35.5 on an RTX A5000 (fast build); the
-  greedy text identical to the CPU's. Its long prompts take the small path 16 rows at a time.
+  greedy text identical to the CPU's. The prompt path runs the streams too (a chunk's streams, coefficients and
+  logits of its own, `mhc_in` / `mhc_out`): a 4096-token prompt at 1393 tok/s against 464 on the small path's
+  16-row chunks and Vulkan's 1335 (first token 2.94 s), a 450-token prompt's greedy text identical to the CPU's.
 
 ### Changed
 - The CUDA hybrid arm's tensor-core matvec: a launch of its own for each codec (q4tp, int8, q1, ternary, q2tp,
