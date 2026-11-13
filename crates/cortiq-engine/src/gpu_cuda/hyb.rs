@@ -147,9 +147,12 @@ struct HyJob {
 }
 
 pub(super) struct HFuncs {
-    /// `hy_mmp_{NT}_{TB}_{KS}` by [NT - 1][TB - 1][KS == 16].
-    mmp: [[[cs::CUfunction; 2]; 2]; 2],
-    /// The grouped experts' launches: `hy_mmp_4_2_8` (32 rows a job), `hy_mmp_8_1_8` (64).
+    /// `hy_mmp_{NT}_{TB}_{KS}` by [NT 1, 2, 4 (windows of 4, 8, 16 rows)][TB - 1][KS == 16].
+    mmp: [[[cs::CUfunction; 2]; 2]; 3],
+    /// One codec's windows, `hy_mmpk_{NT}_{TB}_{KS}_{KD}` by [NT as in
+    /// `mmp`][TB - 1][KS == 16][`KDS` index of KD].
+    mmpk: [[[[cs::CUfunction; 6]; 2]; 2]; 3],
+    /// The grouped experts' launches: `hy_mmp_8_2_8` (32 rows a job), `hy_mmp_16_1_8` (64).
     mmp_g: [cs::CUfunction; 2],
 
     split: cs::CUfunction,
@@ -171,6 +174,7 @@ pub(super) struct HFuncs {
     gather: cs::CUfunction,
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
+    field_planes: cs::CUfunction,
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
@@ -223,17 +227,28 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         return Err(format!("attention geometry {hpk} heads per KV head x {hd} outside the kernels"));
     }
     let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}")], c.arch)?;
-    let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 2];
-    for nt in 1..=2usize {
+    let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 3];
+    for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
         for tb in 1..=2usize {
             for (ki, ks) in [8usize, 16].into_iter().enumerate() {
-                mmp[nt - 1][tb - 1][ki] = func(module, &format!("hy_mmp_{nt}_{tb}_{ks}"))?;
+                mmp[ni][tb - 1][ki] = func(module, &format!("hy_mmp_{nt}_{tb}_{ks}"))?;
+            }
+        }
+    }
+    let mut mmpk = [[[[std::ptr::null_mut(); 6]; 2]; 2]; 3];
+    for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
+        for tb in 1..=2usize {
+            for (ki, ks) in [8usize, 16].into_iter().enumerate() {
+                for (di, kd) in KDS.into_iter().enumerate() {
+                    mmpk[ni][tb - 1][ki][di] = func(module, &format!("hy_mmpk_{nt}_{tb}_{ks}_{kd}"))?;
+                }
             }
         }
     }
     Ok(HFuncs {
         mmp,
-        mmp_g: [func(module, "hy_mmp_4_2_8")?, func(module, "hy_mmp_8_1_8")?],
+        mmpk,
+        mmp_g: [func(module, "hy_mmp_8_2_8")?, func(module, "hy_mmp_16_1_8")?],
 
         moe_topk: func(module, "hy_moe_topk")?,
         moe_group: func(module, "hy_moe_group")?,
@@ -258,6 +273,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         gather: func(module, "hy_embed_gather")?,
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
+        field_planes: func(module, "hy_field_planes")?,
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
@@ -303,6 +319,21 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
 /// (matrix, output, residual or 0, output row stride, rows to compute)
 type JobSpec<'a> = (&'a DevMat, u64, u64, usize, usize);
 
+/// The codecs with a launch of their own (`hy_mmpk_*`, KD in hyb.cu):
+/// q4tp, int8 tiles, q1, ternary, q2tp (both forms), q4_tiled.
+const KDS: [i32; 6] = [6, 5, 3, 2, 1, 10];
+
+/// The `KDS` index of a tile kind (q2tp's affine 9 rides 1, the two-field
+/// int8 pair 15 rides 5).
+fn kd_of(kind: i32) -> Option<usize> {
+    let k = match kind {
+        9 => 1,
+        15 => 5,
+        k => k,
+    };
+    KDS.iter().position(|&d| d == k)
+}
+
 /// One launch's q4tp matrices for the tensor-core kernel: job tables for one
 /// and two tiles a block, and the split of the groups (`KS` warps) the
 /// arithmetic of every output depends on.
@@ -320,6 +351,22 @@ struct MmaSet {
     /// 863 / 839; 5120-row matrices keep two). The arithmetic does not
     /// depend on it.
     tb1_n1: bool,
+    /// The `KDS` index of the one codec of every job, if they share one.
+    kd: Option<usize>,
+    /// int8 jobs under a column field: the launch's rows go through the
+    /// fields once a call (`hy_field_planes`) instead of once a tile.
+    pre: Option<Prescale>,
+}
+
+/// A launch's rows under its jobs' column fields: each job's region of
+/// `fields` (0: none, the rows as they are) x its columns, side by side in
+/// rows `width` long, up to `NMAX` rows, two planes.
+struct Prescale {
+    p0: Buf,
+    p1: Buf,
+    width: usize,
+    /// (field(s) or 0, fields, columns, region at)
+    ents: Vec<(u64, usize, usize, usize)>,
 }
 
 fn mmaset(list: &[JobSpec]) -> Res<MmaSet> {
@@ -340,16 +387,34 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
 }
 
 fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
-    if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10) || m.cols % 32 != 0) {
+    if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) || m.cols % 32 != 0) {
         return Err("a tensor-core job over a matrix that is not repacked (q4tp, q2tp, int8, q1 or ternary tiles)".into());
     }
     let max_rows = list.iter().map(|&(_, _, _, _, r)| r).max().unwrap_or(0);
+    // a q8_2f job (one field; a pair's two) puts the whole launch on
+    // prescaled rows: A5000, one row, 34816 x 5120 under one field 312 us,
+    // none 263, a pair's two 404
+    let fields_of = |m: &DevMat| if matches!(m.kind, 5 | 15) && m.aux0.is_some() { if m.kind == 15 { 2 } else { 1 } } else { 0 };
+    let pre = if list.iter().any(|(m, ..)| fields_of(m) > 0) {
+        let mut at = 0usize;
+        let ents: Vec<_> = list
+            .iter()
+            .map(|(m, ..)| {
+                let e = (m.aux0(), fields_of(m), m.cols, at);
+                at += fields_of(m).max(1) * m.cols;
+                e
+            })
+            .collect();
+        Some(Prescale { p0: Buf::new(NMAX * at * 2 + 64)?, p1: Buf::new(NMAX * at * 2 + 64)?, width: at, ents })
+    } else {
+        None
+    };
     let mut bufs = Vec::with_capacity(2);
     let mut blocks = [0u32; 2];
     for tb in 1..=2usize {
         let mut jobs = Vec::with_capacity(list.len());
         let mut blk = 0u32;
-        for &(m, y, res, ystride, rows) in list {
+        for (i, &(m, y, res, ystride, rows)) in list.iter().enumerate() {
             jobs.push(HyJob {
                 w: m.w.ptr,
                 aux0: m.aux0(),
@@ -357,11 +422,13 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 y,
                 res,
                 rows: rows as i32,
-                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3, ternary 2, q2tp 1 / 9 affine), the epilogue bits from the call
-                kind: (m.kind as i32) | (kind & !0xFF),
+                // the codec from the matrix (q4tp 6, int8 tiles 5 / 15 two
+                // fields, q1 tiles 3, ternary 2, q2tp 1 / 9 affine), the
+                // epilogue bits from the call, 0x800 prescaled rows
+                kind: (m.kind as i32) | (kind & !0xFF) | if pre.is_some() { 0x800 } else { 0 },
                 blk0: blk as i32,
                 ystride: ystride as i32,
-                xoff: 0,
+                xoff: pre.as_ref().map_or(0, |p| p.ents[i].3 as i32),
                 nr: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
@@ -371,11 +438,16 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     }
     let b1 = bufs.pop().unwrap();
     let b0 = bufs.pop().unwrap();
-    // measured on a 3090 (q4tp, 1/8/16 rows): KS 8 wins from ~16k rows
-    // (gate/up 67.5/71.6/124 us against 69.4/76.3/146), KS 16 below it
-    // (down 5120 x 17408: 61.1/66.8/113 against 76.3/79.3/117)
     let total_rows: usize = list.iter().map(|&(_, _, _, _, r)| r).sum();
-    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 16384, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288 })
+    let kd = list
+        .first()
+        .and_then(|(m, ..)| kd_of(m.kind as i32))
+        .filter(|&d| list.iter().all(|(m, ..)| kd_of(m.kind as i32) == Some(d)));
+    // KS 16 under 4096 rows: one codec's decode row on an A5000 (q1 / q4tp,
+    // us at KS 8 against 16): 5120 x 17408 49.8 / 52.7, 78.5 / 86.7;
+    // 10240 x 5120 25.5 / 27.8, 48.9 / 53.2; 2048 x 2048 4.9 / 4.3, 5.9 / 5.4
+    // (the all-codec loop's 16 384 came from a 3090)
+    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 4096, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288, kd, pre })
 }
 
 /// The row planes a tensor-core launch reads: two bf16 parts of each f32
@@ -391,21 +463,41 @@ struct Planes {
 impl MmaSet {
     /// The window's rows of x (as split planes) through every matrix.
     unsafe fn run(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
-        let nt = if n <= 8 { 1 } else { 2 };
-        let tb = if self.tb1 || (n == 1 && self.tb1_n1) { 1 } else { 2 };
+        // one codec's decode row takes one tile a block at any height (A5000,
+        // q4tp 5120 x 17408: 76.7 against 80.5 us; 10240 x 5120 49.3 / 56.3)
+        let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
         let ks = if self.ks16 { 16 } else { 8 };
-        let f = fx.mmp[nt - 1][tb - 1][self.ks16 as usize];
-        let (nj, xs_i, n_i, cols_i) = (self.n, p.stride as i32, n as i32, cols as i32);
-        unsafe {
-            c.launch(
-                f,
-                (self.blocks[tb - 1], 1),
-                (32 * ks) as u32,
-                0,
-                kargs!(self.bufs[tb - 1].ptr, nj, p.p0, p.p1, p.p2, xs_i, n_i, cols_i),
-            )
-        }
+        let f = match self.kd {
+            Some(d) => fx.mmpk[nt_of(n)][tb - 1][self.ks16 as usize][d],
+            None => fx.mmp[nt_of(n)][tb - 1][self.ks16 as usize],
+        };
+        // the rows under the fields first, every job's region
+        let (x0, x1, xs) = match &self.pre {
+            Some(pre) => {
+                if n > NMAX {
+                    return Err(format!("a prescaled tile launch of {n} rows"));
+                }
+                let (ps_i, n_i, os_i) = (p.stride as i32, n as i32, pre.width as i32);
+                for &(cf, fields, cols_j, at) in &pre.ents {
+                    let (f_i, c_i, at_i) = (fields as i32, cols_j as i32, at as i32);
+                    let tot = (n * fields.max(1) * cols_j) as u64;
+                    unsafe {
+                        c.launch(fx.field_planes, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(p.p0, p.p1, ps_i, cf, f_i, c_i, n_i, pre.p0.ptr, pre.p1.ptr, os_i, at_i))?;
+                    }
+                }
+                (pre.p0.ptr, pre.p1.ptr, pre.width)
+            }
+            None => (p.p0, p.p1, p.stride),
+        };
+        let (nj, xs_i, n_i, cols_i) = (self.n, xs as i32, n as i32, cols as i32);
+        unsafe { c.launch(f, (self.blocks[tb - 1], 1), (32 * ks) as u32, 0, kargs!(self.bufs[tb - 1].ptr, nj, x0, x1, x1, xs_i, n_i, cols_i)) }
     }
+}
+
+/// The tile launch of a window of `n` rows (at most 16): n tiles of 4 rows.
+fn nt_of(n: usize) -> usize {
+    debug_assert!(n <= 16, "a tile window of {n} rows");
+    if n <= 4 { 0 } else if n <= 8 { 1 } else { 2 }
 }
 
 /// x [n][xstride] f32 into the planes, the first `cols` columns (for an
@@ -700,34 +792,37 @@ fn q8_parts(dtype: cortiq_core::TensorDtype, bytes: &[u8], rows: usize, cols: us
 }
 
 /// Where an int8-tile matrix's three parts sit in its one allocation:
-/// (row scales at, column field at, bytes in all).
-fn i8_layout(rows: usize, cols: usize) -> (usize, usize, usize) {
+/// (row scales at, column field at, bytes in all); `fields` column fields
+/// (two: a q8_2f gate/up pair's, gate then up).
+fn i8_layout(rows: usize, cols: usize, fields: usize) -> (usize, usize, usize) {
     let rs_at = (rows.div_ceil(16) * (cols / 32) * 512).next_multiple_of(256);
     let cf_at = (rs_at + rows * 4).next_multiple_of(256);
-    (rs_at, cf_at, (cf_at + cols * 4 + 64).next_multiple_of(256))
+    (rs_at, cf_at, (cf_at + fields * cols * 4 + 64).next_multiple_of(256))
 }
 
 /// int8 matrices (one, or a gate/up pair laid out as `hy_repack` lays a
 /// q4tp pair) as int8 tiles of the tensor-core kernel (kind 5,
 /// `hy_repack8`): the bodies go to the card and are tiled there, the f16
 /// row scales (pair rows mapped) and the column field as f32 beside them.
-/// (tiles, row scales, column field — none for q8_row) in one allocation.
+/// A q8_2f pair keeps both fields, gate then up (kind 15: a tile's up rows
+/// read the input under the up field). (tiles, row scales, column fields
+/// — none for q8_row) in one allocation.
 fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)], rows: usize, cols: usize) -> Res<(Buf, Buf, Option<Buf>)> {
     use cortiq_core::quant::f16_to_f32;
     if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
         return Err("repack: an int8 matrix (or a pair) 32 columns wide".into());
     }
     let pair = srcs.len() == 2;
-    if pair && srcs.iter().any(|s| s.2.is_some()) {
-        // one tile's rows share the input, so they share its column scaling
-        return Err("a gate/up pair of q8_2f matrices (two column fields) has no int8 tiles".into());
+    if pair && srcs[0].2.is_some() != srcs[1].2.is_some() {
+        return Err("a gate/up pair of a q8_2f and a q8_row matrix".into());
     }
     let f16 = |b: &[u8], i: usize| f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
     let rs: Vec<f32> = (0..rows)
         .map(|r| if pair { f16(srcs[((r & 15) >= 8) as usize].1, (r >> 4) * 8 + (r & 7)) } else { f16(srcs[0].1, r) })
         .collect();
-    let cf: Option<Vec<f32>> = srcs[0].2.map(|b| (0..cols).map(|k| f16(b, k)).collect());
-    let (rs_at, cf_at, bytes) = i8_layout(rows, cols);
+    let cf: Option<Vec<f32>> = srcs[0].2.map(|_| srcs.iter().flat_map(|s| (0..cols).map(|k| f16(s.2.unwrap(), k))).collect());
+    let fields = cf.as_ref().map_or(1, |v| v.len() / cols);
+    let (rs_at, cf_at, bytes) = i8_layout(rows, cols, fields);
     let all = match arena_view(bytes) {
         Some(v) => v,
         None => Buf::new(bytes)?,
@@ -736,7 +831,7 @@ fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)],
     unsafe { super::htod(rsb.ptr, &rs) }?;
     let cfb = match &cf {
         Some(v) => {
-            let b = all.view(cf_at, cols * 4);
+            let b = all.view(cf_at, v.len() * 4);
             unsafe { super::htod(b.ptr, v) }?;
             Some(b)
         }
@@ -1113,7 +1208,9 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
     let m = if both8 {
         let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
-        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+        // two column fields: the up rows' own (kind 15)
+        let kind = if cf.is_some() { 15 } else { 5 };
+        DevMat { kind, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
     } else if both1 {
         let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
@@ -1307,6 +1404,8 @@ struct MoeL {
     gated: bool,
     bpj_gu: u32,
     bpj_dn: u32,
+    /// The `KDS` index of the experts' one codec (gate/up, down), if they share one.
+    kd: (Option<usize>, Option<usize>),
     /// Whether a shared expert rides beside the routed ones (the layer's pair).
     shared: bool,
     _mats: Vec<Arc<DevMat>>,
@@ -1869,6 +1968,7 @@ fn build(
             Some(cortiq_core::TensorDtype::Q1T) => q1_layout_of(rows, cols, true).1,
             Some(cortiq_core::TensorDtype::Q2TiledP) => q2_bytes(rows, cols),
             Some(cortiq_core::TensorDtype::Q4Tiled) => low_layout(rows, cols, 10).1,
+            Some(cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row) => i8_layout(rows, cols, 2).2,
             _ => planes_bytes(rows, cols),
         };
         for (g, u, d, inter) in ffn {
@@ -1884,7 +1984,7 @@ fn build(
                 return;
             }
             if is8(w) {
-                need += i8_layout(rows, cols).2;
+                need += i8_layout(rows, cols, 1).2;
             } else if is1(w) {
                 need += q1_layout_of(rows, cols, tern(w.idx)).1;
             } else if is2(w) {
@@ -1996,6 +2096,11 @@ fn build(
                     None => None,
                 };
                 let flags = (*norm_topk as i32) | ((*sigmoid as i32) << 1) | ((biasb.is_some() as i32) << 2) | (((*sigmoid && *sigmoid_denom_eps < 1e-10) as i32) << 5);
+                let one_kd = |t: &[HyJob]| {
+                    let d = t.first().and_then(|j| kd_of(j.kind & 0xFF))?;
+                    t.iter().all(|j| kd_of(j.kind & 0xFF) == Some(d)).then_some(d)
+                };
+                let kd = (one_kd(&gu_t), one_kd(&dn_t));
                 let ml = MoeL {
                     router: routerm,
                     sgw,
@@ -2010,6 +2115,7 @@ fn build(
                     gated,
                     bpj_gu: (2 * inter).div_ceil(16) as u32,
                     bpj_dn: hidden.div_ceil(16) as u32,
+                    kd,
                     shared,
                     _mats: mats,
                 };
@@ -3293,14 +3399,18 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
                 mb.qq[0].ptr, mb.qq[1].ptr, ps_i, mb.dns.ptr, hi, bg, bd
             ),
         )?;
-        let nt = if n <= 8 { 0 } else { 1 };
         let (pp0, pp1, pp2) = (plan.pp[0].ptr, plan.pp[1].ptr, plan.pp[2].ptr);
         let t = (tb - 1) as usize;
+        // experts of one codec: that codec's launch
+        let pick = |kd: Option<usize>| match kd {
+            Some(d) => fx.mmpk[nt_of(n)][t][1][d],
+            None => fx.mmp[nt_of(n)][t][1],
+        };
         // every slot's gate/up from the normed rows
-        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(mb.gu_a.ptr, si, pp0, pp1, pp2, ps_i, ni, hi))?;
+        c.launch(pick(m.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(mb.gu_a.ptr, si, pp0, pp1, pp2, ps_i, ni, hi))?;
         // every slot's down from its own planes (the job's `xoff`)
         let (q0, q1) = (mb.qq[0].ptr, mb.qq[1].ptr);
-        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(mb.dn_a.ptr, si, q0, q1, q1, ps_i, ni, inter_i))?;
+        c.launch(pick(m.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(mb.dn_a.ptr, si, q0, q1, q1, ps_i, ni, inter_i))?;
     }
     Ok(())
 }
@@ -4364,7 +4474,7 @@ unsafe fn big(
     let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
-        if !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10) {
+        if !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) {
             return Err("a weight other than repacked q4tp, q2tp, int8, q1 or ternary tiles on the prompt path".into());
         }
         if m.kind == 6 && m.rows * m.cols <= wd_rows {
@@ -4395,8 +4505,9 @@ unsafe fn big(
                     c.launch(fx.expand_q1t, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 } else if m.kind == 3 {
                     c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
-                } else if m.kind == 5 {
-                    c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else if m.kind == 5 || m.kind == 15 {
+                    let dual_i = (m.kind == 15) as i32;
+                    c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i, dual_i))?;
                 } else {
                     c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 }
@@ -5128,6 +5239,83 @@ mod tests {
         b
     }
 
+    /// The tile matvec's speed by codec (q1, q4tp), shape, window rows and
+    /// launch shape: the numbers behind `MmaSet`'s KS / TB choices
+    /// (`bench_tile_matvec -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn bench_tile_matvec() {
+        use cortiq_core::quant::f32_to_f16;
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 5u64;
+        for (rows, cols) in [(34816usize, 5120usize), (5120, 17408), (10240, 5120), (4096, 2048), (2048, 2048)] {
+            let q1b: Vec<u8> = (0..rows * cols / 32)
+                .flat_map(|_| {
+                    let mut v = f32_to_f16(0.002 + (lcg(&mut seed) % 1000) as f32 * 1e-5).to_le_bytes().to_vec();
+                    v.extend((0..4).map(|_| lcg(&mut seed) as u8));
+                    v
+                })
+                .collect();
+            let (w1, s1) = repack1_on_card(c, &fx, &[&q1b], rows, rows, cols).unwrap();
+            let m1 = DevMat { kind: 3, rows, cols, held: (w1.bytes + s1.bytes) as u64, w: Arc::new(w1.view(0, w1.bytes)), aux0: Some(s1.view(0, s1.bytes)), aux1: None };
+            let q4b = payload(rows, cols, &mut seed);
+            let (w4, a0, a1) = repack_on_card(c, &fx, &[&q4b], rows, rows, cols).unwrap();
+            let m4 = DevMat { kind: 6, rows, cols, held: (w4.bytes + a0.bytes + a1.bytes) as u64, w: Arc::new(w4.view(0, w4.bytes)), aux0: Some(a0.view(0, a0.bytes)), aux1: Some(a1.view(0, a1.bytes)) };
+            let x: Vec<f32> = (0..8 * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+            let xb = Buf::from_slice(&x).unwrap();
+            let pl = |_: ()| Buf::new(8 * cols * 2 + 64).unwrap();
+            let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+            let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+            let y = Buf::new(8 * rows * 4 + 64).unwrap();
+            unsafe { split(c, &fx, &planes, xb.ptr, cols, cols, 8).unwrap() };
+            // int8 tiles with a column field (q8_2f), without (q8_row), and a
+            // q8_2f gate/up pair (two fields)
+            let i8b = |field: bool, seed: &mut u64| {
+                let body: Vec<u8> = (0..rows * cols).map(|_| lcg(seed) as u8).collect();
+                let rs: Vec<u8> = (0..rows).flat_map(|_| f32_to_f16(0.001).to_le_bytes()).collect();
+                let cf: Option<Vec<u8>> = field.then(|| (0..cols).flat_map(|k| f32_to_f16(0.5 + 0.01 * (k % 7) as f32).to_le_bytes()).collect());
+                (body, rs, cf)
+            };
+            let (f8, r8) = (i8b(true, &mut seed), i8b(false, &mut seed));
+            // the matrix owns the allocation its scales and fields sit in
+            let mk8 = |t: (Buf, Buf, Option<Buf>), kind: u8| DevMat { kind, rows, cols, held: t.0.bytes as u64, aux0: t.2, aux1: Some(t.1), w: Arc::new(t.0) };
+            let m8f = mk8(repack8_on_card(c, &fx, &[(&f8.0, &f8.1, f8.2.as_deref())], rows, cols).unwrap(), 5);
+            let m8r = mk8(repack8_on_card(c, &fx, &[(&r8.0, &r8.1, None)], rows, cols).unwrap(), 5);
+            let half = |v: &[u8], each: usize| v[..rows / 2 * each].to_vec();
+            let (gb, gr, gc) = (half(&f8.0, cols), half(&f8.1, 2), f8.2.clone());
+            let m8d = mk8(
+                repack8_on_card(c, &fx, &[(&gb, &gr, gc.as_deref()), (&gb, &gr, gc.as_deref())], rows, cols).unwrap(),
+                15,
+            );
+            for (name, m) in [("q1", &m1), ("q4tp", &m4), ("q8_2f", &m8f), ("q8_row", &m8r), ("q8_2f-pair", &m8d)] {
+                for n in [1usize, 4, 8] {
+                    for (ks16, tb1) in [(false, true), (true, true), (false, false), (true, false)] {
+                        let mut set = mmaset(&[(m, y.ptr, 0, rows, rows)]).unwrap();
+                        set.ks16 = ks16;
+                        set.tb1 = tb1;
+                        let it = 40;
+                        unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+                        c.sync().unwrap();
+                        let t = std::time::Instant::now();
+                        for _ in 0..it {
+                            unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+                        }
+                        c.sync().unwrap();
+                        let us = t.elapsed().as_secs_f64() * 1e6 / it as f64;
+                        println!(
+                            "BENCH {name} {rows}x{cols} n {n} ks {} tb {}: {us:.1} us, {:.0} GB/s",
+                            if ks16 { 16 } else { 8 },
+                            if tb1 { 1 } else { 2 },
+                            m.held as f64 / us / 1e3
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn down<T: Copy + Default>(c: &Ctx, b: &Buf, n: usize) -> Vec<T> {
         let mut v = vec![T::default(); n];
         unsafe { cu::memcpy_dtoh_sync(&mut v, b.ptr) }.unwrap();
@@ -5634,7 +5822,8 @@ mod tests {
             let body: Vec<u8> = (0..rows * cols).map(|_| lcg(seed) as u8).collect();
             let h = |v: f32| f32_to_f16(v).to_le_bytes();
             let rs: Vec<u8> = (0..rows).flat_map(|r| h(0.001 + 0.0001 * (r % 7) as f32)).collect();
-            let cf = field.then(|| (0..cols).flat_map(|k| h(0.5 + 0.03 * (k % 11) as f32)).collect());
+            let fo = (lcg(seed) % 7) as usize;
+            let cf = field.then(|| (0..cols).flat_map(|k| h(0.5 + 0.03 * ((k + fo) % 11) as f32)).collect());
             (body, rs, cf)
         };
         // the weight as the card's expand makes it: (int8 * rs) * cf in f32
@@ -5648,8 +5837,10 @@ mod tests {
             let ntile = rows.div_ceil(16);
             let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
             let cf = t.2.as_ref().map_or(0, |b| b.ptr);
+            // two fields (a q8_2f pair's): the up rows under the second
+            let dual_i = t.2.as_ref().is_some_and(|b| b.bytes == 2 * cols * 4) as i32;
             let threads = (ntile * (cols / 32) * 32) as u64;
-            unsafe { c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, cf, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            unsafe { c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, cf, o.ptr, r_i, c_i, t0, nt, dual_i)).unwrap() };
             c.sync().unwrap();
             down::<u16>(c, &o, rows * cols)
         };
@@ -5709,8 +5900,51 @@ mod tests {
                 assert_eq!(got[r * cols + k], f32_to_f16(w(src, sr, k, cols)), "pair at {r},{k}");
             }
         }
-        // a q8_2f pair would need two column scalings of one input
-        let g2 = q8(inter, cols, true, &mut seed);
-        assert!(repack8_on_card(c, &fx, &[parts(&g2), parts(&g2)], 2 * inter, cols).is_err());
+        // a q8_2f pair: two column fields, the up rows under their own
+        // (kind 15), expanded and through the tensor-core kernel (1 and 3 rows)
+        for (inter, cols) in [(24usize, 64usize), (1024, 2048)] {
+            let g2 = q8(inter, cols, true, &mut seed);
+            let u2 = q8(inter, cols, true, &mut seed);
+            let rows = 2 * inter;
+            let t = repack8_on_card(c, &fx, &[parts(&g2), parts(&u2)], rows, cols).unwrap();
+            let src = |r: usize| if (r & 15) >= 8 { (&u2, (r >> 4) * 8 + (r & 7)) } else { (&g2, (r >> 4) * 8 + (r & 7)) };
+            let got = expand(&t, rows, cols);
+            for r in 0..rows {
+                let (m, sr) = src(r);
+                for k in 0..cols {
+                    assert_eq!(got[r * cols + k], f32_to_f16(w(m, sr, k, cols)), "q8_2f pair at {r},{k}");
+                }
+            }
+            for n in [1usize, 3] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 37.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let (tw, trs, tcf) = (t.0.view(0, t.0.bytes), t.1.view(0, t.1.bytes), t.2.as_ref().map(|b| b.view(0, b.bytes)));
+                let dm = DevMat { kind: 15, rows, cols, held: 0, w: Arc::new(tw), aux0: tcf, aux1: Some(trs) };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (m, sr) = src(r);
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w(m, sr, k, cols) as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "q8_2f pair {rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
     }
 }

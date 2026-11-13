@@ -644,29 +644,31 @@ __device__ __forceinline__ u32 a_i8(u32 W, int h) {
     return __byte_perm(__float_as_uint(lo), __float_as_uint(hi), 0x7632);
 }
 
-// The A register r of a q1 tile lane: bits 2r, 2r + 1 of its 16 as bf16x2
-// +-1 (a set bit +1, a clear one -1; the sign bit is the clear bit's).
-__device__ __forceinline__ u32 a_q1(u32 B, int r) {
-    const u32 nb = ~B >> (2 * r);
-    return 0x3F803F80u | ((nb & 1u) << 15) | ((nb & 2u) << 30);
+// A q1 tile lane's 16 sign bits (register r's two at bits r and r + 8)
+// spread: the high byte to bits 16..23, so register r's pair sits at r, 16 + r.
+__device__ __forceinline__ u32 q1_spread(u32 B) { return __byte_perm(B, 0u, 0x4140); }
+
+// The A register r of a q1 tile lane from its spread bits D: bf16x2 +-1 (a
+// set bit +1, a clear one -1; the sign bit is the clear bit's). A shift and a
+// lop3.
+__device__ __forceinline__ u32 a_q1(u32 D, int r) {
+    return 0x3F803F80u | (~(D << (15 - r)) & 0x80008000u);
 }
 
-// The A register r of a ternary tile lane: two-bit codes c at bits 4r and
-// 4r + 2 as bf16x2 c - 1 (128 + c is 0x4300 | c; one fma takes 129 off).
+// The A register r of a ternary tile lane: two-bit codes c at bits 2r and
+// 16 + 2r as bf16x2 c - 1 (128 + c is 0x4300 | c; one fma takes 129 off).
 __device__ __forceinline__ u32 a_q1t(u32 W, int r) {
-    const u32 t = W >> (4 * r);
-    const u32 h = (t & 3u) | ((t & 0xCu) << 14) | 0x43004300u;
+    const u32 h = ((W >> (2 * r)) & 0x00030003u) | 0x43004300u;
     u32 v;
     asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(v) : "r"(h), "r"(0x3F803F80u), "r"(0xC301C301u));
     return v;
 }
 
-// The A register r of a q2tp tile lane: two-bit codes c at bits 4r and
-// 4r + 2 as bf16x2 2c - 3 (the mid-rise (c - 1.5) s with the half in the
+// The A register r of a q2tp tile lane: two-bit codes c at bits 2r and
+// 16 + 2r as bf16x2 2c - 3 (the mid-rise (c - 1.5) s with the half in the
 // scale) or, `aff`, c - 1; both exact.
 __device__ __forceinline__ u32 a_q2(u32 W, int r, bool aff) {
-    const u32 t = W >> (4 * r);
-    const u32 h = (t & 3u) | ((t & 0xCu) << 14) | 0x43004300u;
+    const u32 h = ((W >> (2 * r)) & 0x00030003u) | 0x43004300u;
     u32 v;
     if (aff) {
         asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(v) : "r"(h), "r"(0x3F803F80u), "r"(0xC301C301u));
@@ -697,6 +699,21 @@ __device__ __forceinline__ float gelu_t(float x) {
     return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, t));
 }
 
+// Plane `pl` of an input pair (x = w0 + w1 as bf16 planes, two columns)
+// under a column field f: (x * f) split again into the planes.
+__device__ __forceinline__ u32 field_plane(u32 w0, u32 w1, float2 f, int pl) {
+    float lo = __fadd_rn(__fadd_rn(0.0f, bf2f((u16)(w0 & 0xFFFFu))), bf2f((u16)(w1 & 0xFFFFu)));
+    float hi = __fadd_rn(__fadd_rn(0.0f, bf2f((u16)(w0 >> 16))), bf2f((u16)(w1 >> 16)));
+    lo = __fmul_rn(lo, f.x);
+    hi = __fmul_rn(hi, f.y);
+    u16 a = f2bf(lo), b = f2bf(hi);
+    if (pl) {
+        a = f2bf(__fsub_rn(lo, bf2f(a)));
+        b = f2bf(__fsub_rn(hi, bf2f(b)));
+    }
+    return (u32)a | ((u32)b << 16);
+}
+
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -706,16 +723,24 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 
 // A block of 32 KS threads takes TB tiles; its KS warps take contiguous
 // ranges of the groups, every warp all TB tiles of its range, and the KS
-// partials are summed in order. NT n tiles of 8 input rows (rows past
-// `nrows`, or past the job's own `nr`, are not read). The arithmetic of an
-// output depends on KS alone, never on TB, NT or the window's row count.
-template <int NT, int TB, int KS>
+// partials are summed in order. NT n tiles of 4 input rows: an n tile's
+// column 2i is plane 0 of its row i, column 2i + 1 plane 1, so a decode row
+// costs two mma a group, not four (rows past `nrows`, or past the job's own
+// `nr`, are not read). The arithmetic of an output depends on KS alone,
+// never on TB, NT, KD or the window's row count. KD 0 reads each job's
+// codec from its kind; KD > 0 is a launch of that codec alone (1 = q2tp,
+// either form), whose loop carries none of the others' branches (a decode
+// row's q1 matvec: 156 against 86 us on an A5000).
+#if NPL != 2
+#error "the tensor-core tiles take two bf16 planes"
+#endif
+template <int NT, int TB, int KS, int KD>
 __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njobs, const u16* __restrict__ x0,
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
                                          int nrows_in, int cols)
 {
     __shared__ float2 par_s[16 * TB];
-    __shared__ float part[KS][TB][NT][32][4];
+    __shared__ float part[KS][TB][NT][32][2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     // the block's job: a binary search of the first blocks (a MoE launch has
     // a hundred slots and more, where a scan was a hundred dependent loads)
@@ -734,18 +759,24 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const int ntile = (rows + 15) >> 4;
     // kind 5: int8 tiles, a row's scale its one number (aux1), the column
     // field (aux0, or none) taken into the input rows
-    const bool i8 = (jb.kind & 0xFF) == 5;
-    const float* cf = i8 ? (const float*)jb.aux0 : nullptr;
+    const int kk = jb.kind & 0xFF;
+    const bool i8 = KD ? KD == 5 : (kk == 5 || kk == 15);
+    // bit 0x800: the launch's rows come under the field already
+    // (`hy_field_planes`), the job's at its `xoff`
+    const float* cf = (i8 && !(jb.kind & 0x800)) ? (const float*)jb.aux0 : nullptr;
+    // kind 15: a q8_2f gate/up pair, two column fields (gate's, then up's
+    // `cols` later): a tile's up rows (gid + 8) take the input under up's
+    const bool dual = i8 && kk == 15;
     // kind 3: q1 tiles (a lane's 16 sign bits a group), a (row, group)'s f16 scale in aux0;
     // kind 2: ternary tiles (a lane's 16 two-bit codes, value + 1), the same scales
-    const bool q1 = (jb.kind & 0xFF) == 3;
-    const bool q1t = (jb.kind & 0xFF) == 2;
+    const bool q1 = KD ? KD == 3 : kk == 3;
+    const bool q1t = KD ? KD == 2 : kk == 2;
     // kind 1 / 9: q2tp tiles (a lane's 16 two-bit codes), the q4tp ladder and
     // rung codes (rung 0 = zero); 1 = (c - 1.5) s, 9 = the affine (c - 1) s
-    const bool q2 = (jb.kind & 0xFF) == 1 || (jb.kind & 0xFF) == 9;
-    const bool q2a = (jb.kind & 0xFF) == 9;
+    const bool q2 = KD ? KD == 1 : (kk == 1 || kk == 9);
+    const bool q2a = q2 && kk == 9;
     // kind 10: q4_tiled tiles (a lane's 16 nibbles), a (row, group)'s f16 scale in aux0
-    const bool q4g = (jb.kind & 0xFF) == 10;
+    const bool q4g = KD ? KD == 10 : kk == 10;
     // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
     for (int i = tid; i < 16 * TB; i += blockDim.x) {
         const int rr = tile0 * 16 + i;
@@ -758,149 +789,171 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const int gpr = cols >> 5;
     const int per = (gpr + KS - 1) / KS;
     const int g0 = min(gpr, warp * per), g1 = min(gpr, g0 + per);
-    float acc[TB][NT][4];
+    float acc[TB][NT][2];
 #pragma unroll
     for (int b = 0; b < TB; b++)
 #pragma unroll
-        for (int t = 0; t < NT; t++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) acc[b][t][i] = 0.0f;
+        for (int t = 0; t < NT; t++) acc[b][t][0] = acc[b][t][1] = 0.0f;
     const uint2* T = (const uint2*)jb.w;
     const u8* Cc = (const u8*)jb.aux0;
-    for (int g = g0; g < g1; g++) {
-        // B fragments: [n tile][plane][4 words]
-        u32 bx[NT][NPL][4];
-        const int k0 = g * 32 + 2 * tig;
+    // UG groups' weight words and scales are read before any of them is
+    // used (one codec's decode-row loop: q1 86 -> 80 us; the all-codec loop
+    // ran slower with it); the arithmetic is the one-group loop's.
+    constexpr int UG = (KD && NT == 1) ? 2 : 1;
+    for (int gb = g0; gb < g1; gb += UG) {
+        u32 wx[UG][TB][4];
+        float wsa[UG][TB], wsb[UG][TB];
 #pragma unroll
-        for (int t = 0; t < NT; t++) {
-            const int j = t * 8 + gid;
-            if (j < nrows) {
-                const size_t xo = (size_t)jb.xoff + (size_t)j * xstride + k0;
+        for (int u = 0; u < UG; u++)
 #pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    bx[t][0][q] = *(const u32*)(x0 + xo + 8 * q);
-                    bx[t][1][q] = *(const u32*)(x1 + xo + 8 * q);
-                    if (NPL > 2) bx[t][NPL - 1][q] = *(const u32*)(x2 + xo + 8 * q);
+            for (int b = 0; b < TB; b++) {
+                const int g = gb + u, tile = tile0 + b;
+                wx[u][b][0] = wx[u][b][1] = wx[u][b][2] = wx[u][b][3] = 0u;
+                wsa[u][b] = wsb[u][b] = 0.0f;
+                if (g >= g1 || tile >= ntile) continue;
+                const size_t tg = (size_t)tile * gpr + g;
+                if (q4g) {
+                    const uint2 X4 = ((const uint2*)jb.w)[tg * 32 + lane];
+                    const u16* S1 = (const u16*)jb.aux0 + tg * 16;
+                    wx[u][b][0] = X4.x;
+                    wx[u][b][1] = X4.y;
+                    wsa[u][b] = h2f(S1[gid]);
+                    wsb[u][b] = h2f(S1[gid + 8]);
+                } else if (q2) {
+                    wx[u][b][0] = ((const u32*)jb.w)[tg * 32 + lane];
+                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    const int ca = Cc[tg * 16 + gid], cb = Cc[tg * 16 + gid + 8];
+                    const float half = q2a ? 1.0f : 0.5f;
+                    wsa[u][b] = ca ? half * exp2f(fmaf((float)(ca - 1), pa.y, pa.x)) : 0.0f;
+                    wsb[u][b] = cb ? half * exp2f(fmaf((float)(cb - 1), pb.y, pb.x)) : 0.0f;
+                } else if (q1t || q1) {
+                    wx[u][b][0] = q1 ? q1_spread(((const u16*)jb.w)[tg * 32 + lane]) : ((const u32*)jb.w)[tg * 32 + lane];
+                    const u16* S1 = (const u16*)jb.aux0 + tg * 16;
+                    wsa[u][b] = h2f(S1[gid]);
+                    wsb[u][b] = h2f(S1[gid + 8]);
+                } else if (i8) {
+                    const uint4 X8 = ((const uint4*)jb.w)[tg * 32 + lane];
+                    wx[u][b][0] = X8.x;
+                    wx[u][b][1] = X8.y;
+                    wx[u][b][2] = X8.z;
+                    wx[u][b][3] = X8.w;
+                    wsa[u][b] = par_s[b * 16 + gid].x;
+                    wsb[u][b] = par_s[b * 16 + gid + 8].x;
+                } else {
+                    const uint2 X = T[tg * 32 + lane];
+                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    wx[u][b][0] = X.x;
+                    wx[u][b][1] = X.y;
+                    wsa[u][b] = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
+                    wsb[u][b] = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb.y, pb.x));
                 }
-                if (cf) {
-                    // x * field, split again into the planes: W x with W = int8 * rs * cf
-#pragma unroll
-                    for (int q = 0; q < 4; q++) {
-                        const float2 f = *(const float2*)(cf + k0 + 8 * q);
-                        float lo = 0.0f, hi = 0.0f;
-#pragma unroll
-                        for (int pl = 0; pl < NPL; pl++) {
-                            lo = __fadd_rn(lo, bf2f((u16)(bx[t][pl][q] & 0xFFFFu)));
-                            hi = __fadd_rn(hi, bf2f((u16)(bx[t][pl][q] >> 16)));
-                        }
-                        lo = __fmul_rn(lo, f.x);
-                        hi = __fmul_rn(hi, f.y);
-#pragma unroll
-                        for (int pl = 0; pl < NPL; pl++) {
-                            const u16 a = f2bf(lo), b = f2bf(hi);
-                            bx[t][pl][q] = (u32)a | ((u32)b << 16);
-                            lo = __fsub_rn(lo, bf2f(a));
-                            hi = __fsub_rn(hi, bf2f(b));
-                        }
-                    }
-                }
-            } else {
-#pragma unroll
-                for (int pl = 0; pl < NPL; pl++)
-#pragma unroll
-                    for (int q = 0; q < 4; q++) bx[t][pl][q] = 0u;
             }
-        }
 #pragma unroll
-        for (int b = 0; b < TB; b++) {
-            const int tile = tile0 + b;
-            if (tile >= ntile) break;
-            const size_t tg = (size_t)tile * gpr + g;
-            u32 a00, a01, a02, a03, a10, a11, a12, a13;
-            float sa, sb;
-            if (q4g) {
-                const uint2 X4 = ((const uint2*)jb.w)[tg * 32 + lane];
-                const u16* S1 = (const u16*)jb.aux0 + tg * 16;
-                sa = h2f(S1[gid]);
-                sb = h2f(S1[gid + 8]);
-                a00 = a_q4g(X4.x, 0), a01 = a_q4g(X4.x, 1), a02 = a_q4g(X4.x, 2), a03 = a_q4g(X4.x, 3);
-                a10 = a_q4g(X4.y, 0), a11 = a_q4g(X4.y, 1), a12 = a_q4g(X4.y, 2), a13 = a_q4g(X4.y, 3);
-            } else if (q2) {
-                const u32 W2 = ((const u32*)jb.w)[tg * 32 + lane];
-                const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
-                const int ca = Cc[tg * 16 + gid], cb = Cc[tg * 16 + gid + 8];
-                const float half = q2a ? 1.0f : 0.5f;
-                sa = ca ? half * exp2f(fmaf((float)(ca - 1), pa.y, pa.x)) : 0.0f;
-                sb = cb ? half * exp2f(fmaf((float)(cb - 1), pb.y, pb.x)) : 0.0f;
-                a00 = a_q2(W2, 0, q2a), a01 = a_q2(W2, 1, q2a), a02 = a_q2(W2, 2, q2a), a03 = a_q2(W2, 3, q2a);
-                a10 = a_q2(W2, 4, q2a), a11 = a_q2(W2, 5, q2a), a12 = a_q2(W2, 6, q2a), a13 = a_q2(W2, 7, q2a);
-            } else if (q1t) {
-                const u32 W2 = ((const u32*)jb.w)[tg * 32 + lane];
-                const u16* S1 = (const u16*)jb.aux0 + tg * 16;
-                sa = h2f(S1[gid]);
-                sb = h2f(S1[gid + 8]);
-                a00 = a_q1t(W2, 0), a01 = a_q1t(W2, 1), a02 = a_q1t(W2, 2), a03 = a_q1t(W2, 3);
-                a10 = a_q1t(W2, 4), a11 = a_q1t(W2, 5), a12 = a_q1t(W2, 6), a13 = a_q1t(W2, 7);
-            } else if (q1) {
-                const u32 B = ((const u16*)jb.w)[tg * 32 + lane];
-                const u16* S1 = (const u16*)jb.aux0 + tg * 16;
-                sa = h2f(S1[gid]);
-                sb = h2f(S1[gid + 8]);
-                a00 = a_q1(B, 0), a01 = a_q1(B, 1), a02 = a_q1(B, 2), a03 = a_q1(B, 3);
-                a10 = a_q1(B, 4), a11 = a_q1(B, 5), a12 = a_q1(B, 6), a13 = a_q1(B, 7);
-            } else if (i8) {
-                const uint4 X8 = ((const uint4*)jb.w)[tg * 32 + lane];
-                sa = par_s[b * 16 + gid].x;
-                sb = par_s[b * 16 + gid + 8].x;
-                a00 = a_i8(X8.x, 0), a01 = a_i8(X8.x, 1), a02 = a_i8(X8.y, 0), a03 = a_i8(X8.y, 1);
-                a10 = a_i8(X8.z, 0), a11 = a_i8(X8.z, 1), a12 = a_i8(X8.w, 0), a13 = a_i8(X8.w, 1);
-            } else {
-                const uint2 X = T[tg * 32 + lane];
-                const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
-                sa = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
-                sb = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb.y, pb.x));
-                a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
-                a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
-            }
+        for (int u = 0; u < UG; u++) {
+            const int g = gb + u;
+            if (g >= g1) break;
+            // B fragments: [n tile][4 words], lane gid's column plane (gid & 1)
+            // of the tile's input row gid >> 1 (bx2: under the up field)
+            u32 bx[NT][4], bx2[NT][4];
+            const int k0 = g * 32 + 2 * tig;
 #pragma unroll
             for (int t = 0; t < NT; t++) {
-                if (t * 8 >= nrows) break;
-                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int j = t * 4 + (gid >> 1);
+                if (j < nrows) {
+                    const size_t xo = (size_t)jb.xoff + (size_t)j * xstride + k0;
+                    if (!cf) {
+                        const u16* xp = (gid & 1) ? x1 : x0;
 #pragma unroll
-                for (int pl = 0; pl < NPL; pl++) {
-                    mma16816(c, a00, a01, a02, a03, bx[t][pl][0], bx[t][pl][1]);
-                    mma16816(c, a10, a11, a12, a13, bx[t][pl][2], bx[t][pl][3]);
+                        for (int q = 0; q < 4; q++) {
+                            bx[t][q] = *(const u32*)(xp + xo + 8 * q);
+                            // a prescaled two-field pair: up's rows `cols` on
+                            if (dual) bx2[t][q] = *(const u32*)(xp + xo + cols + 8 * q);
+                        }
+                    } else {
+                        // x * field, split again into the planes: W x with W = int8 * rs * cf
+#pragma unroll
+                        for (int q = 0; q < 4; q++) {
+                            const u32 w0 = *(const u32*)(x0 + xo + 8 * q), w1 = *(const u32*)(x1 + xo + 8 * q);
+                            bx[t][q] = field_plane(w0, w1, *(const float2*)(cf + k0 + 8 * q), gid & 1);
+                            if (dual) bx2[t][q] = field_plane(w0, w1, *(const float2*)(cf + cols + k0 + 8 * q), gid & 1);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int q = 0; q < 4; q++) bx[t][q] = bx2[t][q] = 0u;
                 }
-                acc[b][t][0] = fmaf(sa, c[0], acc[b][t][0]);
-                acc[b][t][1] = fmaf(sa, c[1], acc[b][t][1]);
-                acc[b][t][2] = fmaf(sb, c[2], acc[b][t][2]);
-                acc[b][t][3] = fmaf(sb, c[3], acc[b][t][3]);
+            }
+#pragma unroll
+            for (int b = 0; b < TB; b++) {
+                const int tile = tile0 + b;
+                if (tile >= ntile) break;
+                u32 a00, a01, a02, a03, a10, a11, a12, a13;
+                const float sa = wsa[u][b], sb = wsb[u][b];
+                const u32* W = wx[u][b];
+                if (q4g) {
+                    a00 = a_q4g(W[0], 0), a01 = a_q4g(W[0], 1), a02 = a_q4g(W[0], 2), a03 = a_q4g(W[0], 3);
+                    a10 = a_q4g(W[1], 0), a11 = a_q4g(W[1], 1), a12 = a_q4g(W[1], 2), a13 = a_q4g(W[1], 3);
+                } else if (q2) {
+                    a00 = a_q2(W[0], 0, q2a), a01 = a_q2(W[0], 1, q2a), a02 = a_q2(W[0], 2, q2a), a03 = a_q2(W[0], 3, q2a);
+                    a10 = a_q2(W[0], 4, q2a), a11 = a_q2(W[0], 5, q2a), a12 = a_q2(W[0], 6, q2a), a13 = a_q2(W[0], 7, q2a);
+                } else if (q1t) {
+                    a00 = a_q1t(W[0], 0), a01 = a_q1t(W[0], 1), a02 = a_q1t(W[0], 2), a03 = a_q1t(W[0], 3);
+                    a10 = a_q1t(W[0], 4), a11 = a_q1t(W[0], 5), a12 = a_q1t(W[0], 6), a13 = a_q1t(W[0], 7);
+                } else if (q1) {
+                    a00 = a_q1(W[0], 0), a01 = a_q1(W[0], 1), a02 = a_q1(W[0], 2), a03 = a_q1(W[0], 3);
+                    a10 = a_q1(W[0], 4), a11 = a_q1(W[0], 5), a12 = a_q1(W[0], 6), a13 = a_q1(W[0], 7);
+                } else if (i8) {
+                    a00 = a_i8(W[0], 0), a01 = a_i8(W[0], 1), a02 = a_i8(W[1], 0), a03 = a_i8(W[1], 1);
+                    a10 = a_i8(W[2], 0), a11 = a_i8(W[2], 1), a12 = a_i8(W[3], 0), a13 = a_i8(W[3], 1);
+                } else {
+                    a00 = a_reg(W[0], 0), a01 = a_reg(W[0], 1), a02 = a_reg(W[0], 2), a03 = a_reg(W[0], 3);
+                    a10 = a_reg(W[1], 0), a11 = a_reg(W[1], 1), a12 = a_reg(W[1], 2), a13 = a_reg(W[1], 3);
+                }
+#pragma unroll
+                for (int t = 0; t < NT; t++) {
+                    if (t * 4 >= nrows) break;
+                    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816(c, a00, a01, a02, a03, bx[t][0], bx[t][1]);
+                    mma16816(c, a10, a11, a12, a13, bx[t][2], bx[t][3]);
+                    if (dual) {
+                        // the up rows (gid + 8) again, under their own field
+                        float c2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma16816(c2, a00, a01, a02, a03, bx2[t][0], bx2[t][1]);
+                        mma16816(c2, a10, a11, a12, a13, bx2[t][2], bx2[t][3]);
+                        c[2] = c2[2];
+                        c[3] = c2[3];
+                    }
+                    // the planes of input row 4t + tig: columns 2 tig, 2 tig + 1
+                    acc[b][t][0] = fmaf(sa, __fadd_rn(c[0], c[1]), acc[b][t][0]);
+                    acc[b][t][1] = fmaf(sb, __fadd_rn(c[2], c[3]), acc[b][t][1]);
+                }
             }
         }
     }
 #pragma unroll
     for (int b = 0; b < TB; b++)
 #pragma unroll
-        for (int t = 0; t < NT; t++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) part[warp][b][t][lane][i] = acc[b][t][i];
+        for (int t = 0; t < NT; t++) {
+            part[warp][b][t][lane][0] = acc[b][t][0];
+            part[warp][b][t][lane][1] = acc[b][t][1];
+        }
     __syncthreads();
     if (jb.kind & 0x100) {
         // a gate/up pair (rows of a tile: 8 of gate, then the same 8 of up):
         // silu(gate) * up of output row (tile, gid) into the planes y, res
         u16* q0 = (u16*)jb.y;
         u16* q1 = (u16*)jb.res;
-        for (int o = tid; o < TB * NT * 32 * 2; o += blockDim.x) {
-            const int i = o & 1, ln = (o >> 1) & 31, t = (o >> 6) % NT, b = (o >> 6) / NT;
+        for (int o = tid; o < TB * NT * 32; o += blockDim.x) {
+            const int ln = o & 31, t = (o >> 5) % NT, b = (o >> 5) / NT;
             const int gd = ln >> 2, tg = ln & 3;
-            const int j = t * 8 + 2 * tg + i;
+            const int j = t * 4 + tg;
             const int r = (tile0 + b) * 8 + gd;
             if (j >= nrows || 2 * r >= rows) continue;
-            float g = part[0][b][t][ln][i], u = part[0][b][t][ln][i + 2];
+            float g = part[0][b][t][ln][0], u = part[0][b][t][ln][1];
 #pragma unroll
             for (int k = 1; k < KS; k++) {
-                g = __fadd_rn(g, part[k][b][t][ln][i]);
-                u = __fadd_rn(u, part[k][b][t][ln][i + 2]);
+                g = __fadd_rn(g, part[k][b][t][ln][0]);
+                u = __fadd_rn(u, part[k][b][t][ln][1]);
             }
             // kind bit 0x200: GeGLU (tanh GELU), else SwiGLU
             const float act = (jb.kind & 0x200) ? gelu_t(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
@@ -911,11 +964,11 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     }
     float* y = (float*)jb.y;
     const float* res = (const float*)jb.res;
-    for (int o = tid; o < TB * NT * 32 * 4; o += blockDim.x) {
-        const int i = o & 3, ln = (o >> 2) & 31, t = (o >> 7) % NT, b = (o >> 7) / NT;
+    for (int o = tid; o < TB * NT * 32 * 2; o += blockDim.x) {
+        const int i = o & 1, ln = (o >> 1) & 31, t = (o >> 6) % NT, b = (o >> 6) / NT;
         const int gd = ln >> 2, tg = ln & 3;
-        const int j = t * 8 + 2 * tg + (i & 1);
-        const int r = (tile0 + b) * 16 + gd + (i < 2 ? 0 : 8);
+        const int j = t * 4 + tg;
+        const int r = (tile0 + b) * 16 + gd + 8 * i;
         if (j >= nrows || r >= rows) continue;
         float v = part[0][b][t][ln][i];
 #pragma unroll
@@ -930,19 +983,68 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
         const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
     {                                                                                                           \
-        mmp_body<NT, TB, KS>(j, nj, x0, x1, x2, xstride, n, cols);                                              \
+        mmp_body<NT, TB, KS, 0>(j, nj, x0, x1, x2, xstride, n, cols);                                           \
     }
+// one codec's window (KD as above)
+#define MMPK(NT, TB, KS, KD)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(32 * KS) hy_mmpk_##NT##_##TB##_##KS##_##KD(                    \
+        const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
+        const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
+    {                                                                                                           \
+        mmp_body<NT, TB, KS, KD>(j, nj, x0, x1, x2, xstride, n, cols);                                          \
+    }
+#define MMPK3(TB, KS, KD) MMPK(1, TB, KS, KD) MMPK(2, TB, KS, KD) MMPK(4, TB, KS, KD)
+#define MMPK4(KD) MMPK3(1, 8, KD) MMPK3(2, 8, KD) MMPK3(1, 16, KD) MMPK3(2, 16, KD)
+MMPK4(6)
+MMPK4(5)
+MMPK4(3)
+MMPK4(2)
+MMPK4(1)
+MMPK4(10)
+// windows of up to 4, 8 and 16 rows
 MMP(1, 1, 8)
 MMP(1, 2, 8)
 MMP(2, 1, 8)
 MMP(2, 2, 8)
+MMP(4, 1, 8)
+MMP(4, 2, 8)
 MMP(1, 1, 16)
 MMP(1, 2, 16)
 MMP(2, 1, 16)
 MMP(2, 2, 16)
+MMP(4, 1, 16)
+MMP(4, 2, 16)
 // a prompt chunk's experts, grouped (up to 32 or 64 rows a job)
-MMP(4, 2, 8)
-MMP(8, 1, 8)
+MMP(8, 2, 8)
+MMP(16, 1, 8)
+
+// A launch's input rows under its jobs' column fields, once a call: rows
+// [n] of planes p0 + p1 (`pstride` a row) into o0, o1 at column `ooff` of
+// rows `ostride` long, `fields` fields of `cols` (cf, one after the other)
+// side by side, `field_plane`'s arithmetic element for element; no field
+// (`fields` 0): the planes as they are.
+extern "C" __global__ void hy_field_planes(const u16* __restrict__ p0, const u16* __restrict__ p1, int pstride,
+                                           const float* __restrict__ cf, int fields, int cols, int n, u16* __restrict__ o0,
+                                           u16* __restrict__ o1, int ostride, int ooff)
+{
+    const int nf = fields > 0 ? fields : 1;
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)n * nf * cols) return;
+    const int k = (int)(i % cols);
+    const u64 jf = i / cols;
+    const int fi = (int)(jf % nf), j = (int)(jf / nf);
+    const u16 a0 = p0[(size_t)j * pstride + k], a1 = p1[(size_t)j * pstride + k];
+    const size_t at = (size_t)j * ostride + ooff + (size_t)fi * cols + k;
+    if (fields == 0) {
+        o0[at] = a0;
+        o1[at] = a1;
+        return;
+    }
+    const float v = __fmul_rn(__fadd_rn(__fadd_rn(0.0f, bf2f(a0)), bf2f(a1)), cf[(size_t)fi * cols + k]);
+    const u16 b0 = f2bf(v);
+    o0[at] = b0;
+    o1[at] = f2bf(__fsub_rn(v, bf2f(b0)));
+}
 
 // f32 rows [n][xstride] into the three planes [n][ostride] (what the
 // producers below do in place; for inputs no kernel of this arm makes).
@@ -2379,7 +2481,7 @@ extern "C" __global__ void hy_repack8(const signed char* __restrict__ bA, const 
 // field `cf` or null): row tiles [tile0, tile0 + nt) as f16 rows, W holding
 // those rows only.
 extern "C" __global__ void hy_expand_i8r(const uint4* __restrict__ T, const float* __restrict__ rs, const float* __restrict__ cf,
-                                         u16* __restrict__ W, int rows, int cols, int tile0, int nt)
+                                         u16* __restrict__ W, int rows, int cols, int tile0, int nt, int dual)
 {
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2402,15 +2504,17 @@ extern "C" __global__ void hy_expand_i8r(const uint4* __restrict__ T, const floa
             const int reg = s * 4 + m;
             const u32 two = wd[reg >> 1] >> (16 * (reg & 1));
             const float sc = rs[r];
-            const float lo = (float)(signed char)(two & 0xFF) * sc * (cf ? cf[k] : 1.0f);
-            const float hi = (float)(signed char)((two >> 8) & 0xFF) * sc * (cf ? cf[k + 1] : 1.0f);
+            // `dual` (kind 15): a pair's up rows under the second field
+            const float* f = (cf && dual && (r & 15) >= 8) ? cf + cols : cf;
+            const float lo = (float)(signed char)(two & 0xFF) * sc * (f ? f[k] : 1.0f);
+            const float hi = (float)(signed char)((two >> 8) & 0xFF) * sc * (f ? f[k + 1] : 1.0f);
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }
 
 // A q1 matrix (per 32-column group [f16 scale][4 bytes of sign bits, LSB
 // first]) as the tensor-core kernel's q1 tiles (kind 3): for tile t and group
-// g, lane l = 4 gid + tig holds in bits 2r, 2r + 1 the signs of its A register
+// g, lane l = 4 gid + tig holds in bits r, r + 8 the signs of its A register
 // r = 4 s + m (row gid + 8 (m & 1), columns 32 g + 16 s + 8 (m >> 1) + 2 tig and
 // the next); S[t][g][16] the rows' f16 scales. `pair`: a gate/up pair's rows
 // as `hy_repack` maps them.
@@ -2436,8 +2540,8 @@ extern "C" __global__ void hy_repack1(const u8* __restrict__ A, const u8* __rest
             const u8* t6 = (second ? Bm : A) + ((size_t)sr * gpr + g) * 6 + 2;
             const int c = 16 * s + 8 * (m >> 1) + 2 * tig;
             const int reg = s * 4 + m;
-            bits |= (u32)((t6[c >> 3] >> (c & 7)) & 1) << (2 * reg);
-            bits |= (u32)((t6[(c + 1) >> 3] >> ((c + 1) & 7)) & 1) << (2 * reg + 1);
+            bits |= (u32)((t6[c >> 3] >> (c & 7)) & 1) << reg;
+            bits |= (u32)((t6[(c + 1) >> 3] >> ((c + 1) & 7)) & 1) << (reg + 8);
         }
     T[idx] = (u16)bits;
     if (tig == 0) {
@@ -2480,15 +2584,15 @@ extern "C" __global__ void hy_expand_q1r(const u16* __restrict__ T, const u16* _
             const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
             const int reg = s * 4 + m;
             const float sc = h2f(S[tg * 16 + gid + 8 * (m & 1)]);
-            const float lo = ((B >> (2 * reg)) & 1u) ? sc : -sc;
-            const float hi = ((B >> (2 * reg + 1)) & 1u) ? sc : -sc;
+            const float lo = ((B >> reg) & 1u) ? sc : -sc;
+            const float hi = ((B >> (reg + 8)) & 1u) ? sc : -sc;
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }
 
 // A q1t matrix (per 32-column group [f16 scale][7 bytes of base-3 codes, five
 // a byte: 0 -> 0, 1 -> +s, 2 -> -s]; no outlier rows) as ternary tiles (kind
-// 2): lane l holds at bits 4r, 4r + 2 the codes (value + 1) of its A register
+// 2): lane l holds at bits 2r, 16 + 2r the codes (value + 1) of its A register
 // r's two elements (`hy_repack1`'s order); S[t][g][16] the rows' f16 scales.
 __device__ __forceinline__ u32 q1t_val1(const u8* c7, int k) {
     const u32 p3[5] = {1u, 3u, 9u, 27u, 81u};
@@ -2522,7 +2626,7 @@ extern "C" __global__ void hy_repack1t(const u8* __restrict__ A, const u8* __res
                 lo = q1t_val1(c7, c);
                 hi = q1t_val1(c7, c + 1);
             }
-            w |= (lo | (hi << 2)) << (4 * reg);
+            w |= (lo << (2 * reg)) | (hi << (16 + 2 * reg));
         }
     T[idx] = w;
     if (tig == 0) {
@@ -2565,15 +2669,15 @@ extern "C" __global__ void hy_expand_q1tr(const u32* __restrict__ T, const u16* 
             const int k = g * 32 + 16 * s + 8 * (m >> 1) + 2 * tig;
             const int reg = s * 4 + m;
             const float sc = h2f(S[tg * 16 + gid + 8 * (m & 1)]);
-            const float lo = ((float)((w >> (4 * reg)) & 3u) - 1.0f) * sc;
-            const float hi = ((float)((w >> (4 * reg + 2)) & 3u) - 1.0f) * sc;
+            const float lo = ((float)((w >> (2 * reg)) & 3u) - 1.0f) * sc;
+            const float hi = ((float)((w >> (16 + 2 * reg)) & 3u) - 1.0f) * sc;
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }
 
 // A q2tp matrix ([2-bit chunks: 8 bytes a (row, group), weight k at byte k/4,
 // bits 2 (k % 4)][row params][5-bit rung codes]) as q2tp tiles (kinds 1 / 9):
-// lane l holds at bits 4r, 4r + 2 the codes of its A register r's two
+// lane l holds at bits 2r, 16 + 2r the codes of its A register r's two
 // elements (`hy_repack1t`'s order); Cc[t][g][16] the rows' rung codes as
 // `hy_repack` lays them. `pair`: a gate/up pair's rows as `hy_repack` maps them.
 extern "C" __global__ void hy_repack2(const u8* __restrict__ chA, const u8* __restrict__ codesA, const u8* __restrict__ chB,
@@ -2600,7 +2704,7 @@ extern "C" __global__ void hy_repack2(const u8* __restrict__ chA, const u8* __re
             const int c = 16 * s + 8 * (m >> 1) + 2 * tig;
             const u32 lo = (ch[c >> 2] >> (2 * (c & 3))) & 3u;
             const u32 hi = (ch[(c + 1) >> 2] >> (2 * ((c + 1) & 3))) & 3u;
-            w |= (lo | (hi << 2)) << (4 * (s * 4 + m));
+            w |= (lo << (2 * (s * 4 + m))) | (hi << (16 + 2 * (s * 4 + m)));
         }
     T[idx] = w;
     if (lane < 16) {
@@ -2646,8 +2750,8 @@ extern "C" __global__ void hy_expand_q2r(const u32* __restrict__ T, const u8* __
             const int reg = s * 4 + m;
             const int code = Cc[tg * 16 + gid + 8 * (m & 1)];
             const float sc = code ? exp2f(fmaf((float)(code - 1), par[r].y, par[r].x)) : 0.0f;
-            const float lo = ((float)((w >> (4 * reg)) & 3u) - off) * sc;
-            const float hi = ((float)((w >> (4 * reg + 2)) & 3u) - off) * sc;
+            const float lo = ((float)((w >> (2 * reg)) & 3u) - off) * sc;
+            const float hi = ((float)((w >> (16 + 2 * reg)) & 3u) - off) * sc;
             *(u32*)(W + (size_t)(r - r0) * cols + k) = (u32)f2h(lo) | ((u32)f2h(hi) << 16);
         }
 }

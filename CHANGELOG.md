@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.2 tok/s, decodes at 68.5 tok/s against Vulkan's 61.7 on an RTX A5000 (fast build); its greedy text
   identical to the CPU's. Its prompt still goes the pipeline's chunked path.
 
+- q8_2f gate/up pairs (two column fields: a tile's up rows read the input under their own, job kind 15) on
+  the CUDA hybrid arm, and a launch's input rows put under its jobs' column fields once a call
+  (`hy_field_planes`) instead of once a tile (one row, 34816 x 5120: one field 312 -> 282 us, a pair's two
+  404 -> 275). MiniCPM5-2B q8_2f, whose pairs sent it to the dense arm, decodes at 141-144 tok/s against 89-100
+  and Vulkan's 133-139 on an RTX A5000; its greedy text the CPU's up to a near tie at token 17 (24.224 against
+  24.211), as Vulkan's.
+
 - SenseNova-Loop's mHC streams on the CUDA hybrid arm: the residual as up to four streams around both sub-layers,
   the router's logits a block each (`hy_mhc_logits`), its sigmoids and log-domain Sinkhorn mix (`hy_mhc_route`,
   which writes the sub-layer's input rows), the merge after it (`hy_mhc_merge`), the streams' entry and mean
@@ -60,6 +67,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   greedy text identical to the CPU's. Its long prompts take the small path 16 rows at a time.
 
 ### Changed
+- The CUDA hybrid arm's tensor-core matvec: a launch of its own for each codec (q4tp, int8, q1, ternary, q2tp,
+  q4_tiled) whose loop carries none of the others' branches (the all-codec loop was some 540 instructions, and
+  a q1 and a q4tp matrix of one shape ran equally long: instruction-bound, not bus-bound), a row's two bf16
+  planes as two columns of one mma (two mma a group, not four, up to four rows), the q1 / ternary / q2tp
+  tiles in shift-and-mask layouts, KS 16 under 4096 rows. One row on an RTX A5000, 34816 x 5120: q1 156 -> 80
+  us, q4tp 173 -> 150. Decode, release build, before -> after: Bonsai-27B (q1) 35.1 -> 60.7-61.2 tok/s,
+  Ternary-Bonsai-2-27B (q2tp) 26.3 -> 33.0-33.7, Bonsai-8B (q1t) 103-104 -> 138, LFM3-1.7B (q4tp) 174-235 ->
+  229-251; the greedy texts unchanged (the CPU's).
 - Every stack on CUDA tries the hybrid arm first (the dense arm after a decline; `CMF_CUDA_HYB_ALL=0` keeps plain
   attention stacks on the dense arm), a verify tail with it. RTX A5000, fast build, decode hybrid / dense / Vulkan:
   Granite-4.2-8B 91.9 / 65.9 / 78.0 tok/s (79.6 / 57.2 / 72.0 after a 4096-token prompt, read at 2396 / 2525 / 537
