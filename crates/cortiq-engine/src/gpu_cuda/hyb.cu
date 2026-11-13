@@ -1864,3 +1864,32 @@ extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __
     }
     h[(size_t)r * hidden + i] += acc;
 }
+
+
+// Gemma's sandwich norm: h[r] += rmsnorm(y[r]) * w (1 + w under `gemma`), a
+// block a row; then, with `ls` given, the layer's scale on the whole row.
+extern "C" __global__ void hy_norm_add(float* __restrict__ h, const float* __restrict__ y, const float* __restrict__ w,
+                                       int hidden, float eps, int gemma)
+{
+    __shared__ float red[32];
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const float* yr = y + (size_t)r * hidden;
+    float s = 0.0f;
+    for (int i = tid; i < hidden; i += blockDim.x) s = fmaf(yr[i], yr[i], s);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+    if (lane == 0) red[warp] = s;
+    __syncthreads();
+    double tot = 0.0;
+    for (int k = 0; k < NW; k++) tot += (double)red[k];
+    const float inv = 1.0f / (float)sqrt(tot / (double)hidden + (double)eps);
+    float* hr = h + (size_t)r * hidden;
+    for (int i = tid; i < hidden; i += blockDim.x)
+        hr[i] = __fadd_rn(hr[i], __fmul_rn(__fmul_rn(yr[i], inv), gemma ? 1.0f + w[i] : w[i]));
+}
+
+// h *= s over `total` values (Gemma-4's layer scalar).
+extern "C" __global__ void hy_scale(float* __restrict__ h, float s, unsigned long long total)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) h[i] *= s;
+}
