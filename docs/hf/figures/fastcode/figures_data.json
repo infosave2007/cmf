@@ -1,167 +1,48 @@
 {
- "names": {
-  "fastcode": {
-   "en": "Fast Code (cortiq)",
-   "ru": "Fast Code (cortiq)",
-   "zh": "Fast Code（cortiq）"
+ "cuda": {
+  "stand": "RTX 5090, card memory held with CMF_GPU_VRAM_MB; cortiq 0.8.78, CUDA backend; 12.11.2026",
+  "tiers": ["12", "16", "24"],
+  "decode": {
+   "fastcode": [145.0, 174.6, 206.7],
+   "strata": [154.1, 192.5, 212.0]
   },
-  "strata": {
-   "en": "Strata Coder (Strata)",
-   "ru": "Strata Coder (Strata)",
-   "zh": "Strata Coder（Strata）"
+  "decode_vs_strata_pct": [94, 91, 97],
+  "prompt_tokens": 2151,
+  "strata_expert_cache": [1500, 3000, 5000],
+  "strata_card_mib": [10732, 14542, 19622],
+  "humaneval_first40": [38, 39, 39]
+ },
+ "vulkan": {
+  "stand": "RTX PRO 6000 96 GB; cortiq, Vulkan backend; 09.11.2026 (scripts/fastcode/JOURNAL_FASTCODE_2026-11-09.md)",
+  "prompts": ["4K", "16K", "32K"],
+  "decode": {
+   "fastcode": [161.4, 166.2, 135.7],
+   "q4tp": [117.7, 137.8, 116.1]
   },
-  "strata_cmf": {
-   "en": "Strata Coder weights (cortiq)",
-   "ru": "веса Strata Coder (cortiq)",
-   "zh": "Strata Coder 权重（cortiq）"
+  "prefill": {
+   "fastcode": [826.8, 843.8, 842.2],
+   "q4tp": [207.6, 206.3, 209.7]
   },
-  "q4tp": {
-   "en": "full 512-expert file (cortiq)",
-   "ru": "полный файл (cortiq)",
-   "zh": "完整文件（cortiq）"
+  "vram_gb": {
+   "fastcode": 40.9,
+   "q4tp": 59.6
   }
  },
- "speed_series": [
-  "fastcode",
-  "strata",
-  "q4tp"
- ],
- "speed": [
-  {
-   "label": "4K",
-   "decode": {
-    "fastcode": 161.4,
-    "strata": 219.8,
-    "q4tp": 117.7
-   },
-   "prefill": {
-    "fastcode": 826.8,
-    "strata": 5492.1,
-    "q4tp": 207.6
-   }
+ "quality": {
+  "humaneval": {
+   "fastcode": 93.29,
+   "strata": 94.51,
+   "q4tp": 94.51
   },
-  {
-   "label": "16K",
-   "decode": {
-    "fastcode": 166.2,
-    "strata": 223.0,
-    "q4tp": 137.8
-   },
-   "prefill": {
-    "fastcode": 843.8,
-    "strata": 7228.5,
-    "q4tp": 206.3
-   }
+  "ppl": {
+   "fastcode": 3.337,
+   "strata": 3.436,
+   "q4tp": 3.366
   },
-  {
-   "label": "32K",
-   "decode": {
-    "fastcode": 135.7,
-    "strata": 221.7,
-    "q4tp": 116.1
-   },
-   "prefill": {
-    "fastcode": 842.2,
-    "strata": 7659.4,
-    "q4tp": 209.7
-   }
-  }
- ],
- "humaneval": [
-  [
-   "fastcode",
-   93.29
-  ],
-  [
-   "q4tp",
-   94.51
-  ],
-  [
-   "strata",
-   94.51
-  ]
- ],
- "ppl": [
-  [
-   "fastcode",
-   3.337
-  ],
-  [
-   "q4tp",
-   3.366
-  ],
-  [
-   "strata_cmf",
-   3.436
-  ]
- ],
- "file_gb": [
-  [
-   "fastcode",
-   66.76
-  ],
-  [
-   "q4tp",
-   98.62
-  ],
-  [
-   "strata",
-   63.6
-  ]
- ],
- "vram_gb": [
-  [
-   "fastcode",
-   40.9
-  ],
-  [
-   "q4tp",
-   59.6
-  ],
-  [
-   "strata",
-   31.1
-  ]
- ],
- "cards": [
-  {
-   "label": "12 GB",
-   "decode": {
-    "fastcode": 145.0,
-    "strata": 154.1
-   }
-  },
-  {
-   "label": "16 GB",
-   "decode": {
-    "fastcode": 174.6,
-    "strata": 192.5
-   }
-  },
-  {
-   "label": "24 GB",
-   "decode": {
-    "fastcode": 206.7,
-    "strata": 212.0
-   }
-  }
- ],
- "cards_series": [
-  "fastcode",
-  "strata"
- ],
- "cards_fill": {
-  "en": {
-   "pct": "94 / 91 / 97 %",
-   "he": "38 / 39 / 39"
-  },
-  "ru": {
-   "pct": "94 / 91 / 97 %",
-   "he": "38 / 39 / 39"
-  },
-  "zh": {
-   "pct": "94 / 91 / 97 %",
-   "he": "38 / 39 / 39"
+  "expert_bits": {
+   "fastcode": 4,
+   "strata": 2,
+   "q4tp": 4
   }
  }
 }
