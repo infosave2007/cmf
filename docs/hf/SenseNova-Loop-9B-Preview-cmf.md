@@ -29,8 +29,9 @@ manifold-constrained hyper-connections (mHC) inside the loop, hybrid linear /
 full attention, and a vision encoder for images at native resolution —
 packaged as single [CMF](https://github.com/infosave2007/cmf) files. They run
 with `cortiq`, a Rust inference engine with no Python and no ML framework:
-NVIDIA, AMD and Intel GPUs through Vulkan/DX12, Apple silicon through Metal,
-and the CPU.
+NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through Vulkan/DX12,
+Apple silicon through Metal, and the CPU. On an RTX A5000 with CUDA `q4tp`
+decodes at 52 tok/s and reads a 4096-token prompt in 2.3 s.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文说明)
 
@@ -65,7 +66,18 @@ the file. The vision encoder stays 16-bit and runs in float32.
 
 ## Performance
 
-cortiq 0.8.51, NVIDIA A40 (48 GB, Vulkan), `cortiq bench`:
+### RTX A5000 (24 GB), CUDA
+
+cortiq 0.8.96, `cortiq bench`, `CMF_GPU=cuda` on a build with the CUDA backend
+(`cargo install cortiq-cli --features cuda`, the NVIDIA driver and the CUDA 12.x libraries):
+
+| file | decode, tok/s | 4096-token prompt | decode after it |
+|---|---:|---:|---:|
+| `q4tp` | 52.4 | 1818 tok/s (first token 2.25 s) | 50.8 |
+
+### NVIDIA A40 (48 GB), Vulkan
+
+cortiq 0.8.51, `cortiq bench`:
 
 | file | decode, tok/s | 2k-token prompt, tok/s | decode at 2k |
 |---|---:|---:|---:|
@@ -151,9 +163,9 @@ cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "Опиши э�
 
 План петли, роутеры mHC (в float32, как в релизе) и процессор изображений
 лежат в файле. У `q8_2f` 48 жадных токенов описания изображения и двух
-текстовых промптов совпадают с Transformers float32. На NVIDIA A40 (Vulkan)
-`q4tp` генерирует 29.1 ток/с, `q8_2f` — 21.3; на Apple M4 (Metal) `q4tp` —
-11.1 ток/с. Каждый токен проходит 56 слоёв (24 из них дважды). `cortiq serve` принимает изображения в формате OpenAI
+текстовых промптов совпадают с Transformers float32. На RTX A5000 с CUDA (cortiq 0.8.96)
+`q4tp` генерирует 52.4 ток/с и читает промпт в 4096 токенов за 2.25 с; на NVIDIA A40 (Vulkan)
+`q4tp` — 29.1 ток/с, `q8_2f` — 21.3; на Apple M4 (Metal) `q4tp` — 11.1 ток/с. Каждый токен проходит 56 слоёв (24 из них дважды). `cortiq serve` принимает изображения в формате OpenAI
 (`image_url`). Лицензия Apache-2.0, как у оригинала.
 
 ---
@@ -179,6 +191,6 @@ cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "描述这张�
 
 循环计划、mHC 路由（按发布版本保持 float32）与图像预处理参数都存放在文件中。`q8_2f`
 在一条图像描述和两条文本提示上的 48 个贪心 token 与 Transformers float32 一致。
-NVIDIA A40（Vulkan）上 `q4tp` 生成 29.1 tok/s，`q8_2f` 21.3 tok/s；Apple M4（Metal）上
+RTX A5000（CUDA，cortiq 0.8.96）上 `q4tp` 生成 52.4 tok/s，4096 token 的提示 2.25 秒读完；NVIDIA A40（Vulkan）上 `q4tp` 生成 29.1 tok/s，`q8_2f` 21.3 tok/s；Apple M4（Metal）上
 `q4tp` 11.1 tok/s。每个 token 经过 56 层（其中 24 层两次）。
 `cortiq serve` 接受 OpenAI 格式的图像（`image_url`）。许可证与原模型相同，为 Apache-2.0。

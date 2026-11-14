@@ -714,6 +714,22 @@ __device__ __forceinline__ float gelu_t(float x) {
     return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, t));
 }
 
+// Exact erf GELU (HF `gelu`), `inference::gelu_erf` term for term: erf by
+// Abramowitz-Stegun 7.1.26 of x / sqrt(2).
+__device__ __forceinline__ float gelu_e(float x) {
+    const float z = __fmul_rn(x, 0.70710678f);
+    const float a = fabsf(z);
+    const float t = __fdiv_rn(1.0f, __fadd_rn(1.0f, __fmul_rn(0.3275911f, a)));
+    float p = __fmul_rn(1.0614054f, t);
+    p = __fmul_rn(__fadd_rn(p, -1.4531521f), t);
+    p = __fmul_rn(__fadd_rn(p, 1.4214138f), t);
+    p = __fmul_rn(__fadd_rn(p, -0.28449674f), t);
+    p = __fmul_rn(__fadd_rn(p, 0.2548296f), t);
+    float y = __fsub_rn(1.0f, __fmul_rn(p, expf(-__fmul_rn(a, a))));
+    if (z < 0.0f) y = -y;
+    return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, y));
+}
+
 // Plane `pl` of an input pair (x = w0 + w1 as bf16 planes, two columns)
 // under a column field f: (x * f) split again into the planes.
 __device__ __forceinline__ u32 field_plane(u32 w0, u32 w1, float2 f, int pl) {
@@ -970,8 +986,8 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 g = __fadd_rn(g, part[k][b][t][ln][0]);
                 u = __fadd_rn(u, part[k][b][t][ln][1]);
             }
-            // kind bit 0x200: GeGLU (tanh GELU), else SwiGLU
-            const float act = (jb.kind & 0x200) ? gelu_t(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
+            // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU), else SwiGLU
+            const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
             const float v = __fmul_rn(act, u);
             put3(q0, q1, q1, (size_t)j * jb.ystride + r, v);
         }
@@ -1513,7 +1529,8 @@ extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* _
     const float* yr = y + b * 2 * inter;
     const int base = (r >> 3) * 16 + (r & 7);
     const float g = yr[base], u = yr[base + 8];
-    const float a = act ? gelu_t(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
+    // act 1: tanh GELU, 2: erf GELU, else SiLU
+    const float a = act == 1 ? gelu_t(g) : act == 2 ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
     xh[i] = f2h_sat(__fmul_rn(a, u) * 0.0625f);
 }
 
@@ -2443,6 +2460,48 @@ extern "C" __global__ void hy_sconv(const float* __restrict__ y, int ystride, co
 }
 
 
+// `hy_sconv` for the prompt path: the convolution's rows as f16 [n][ostride]
+// (the output GEMM's operand) instead of the small path's bf16 planes.
+extern "C" __global__ void hy_sconv_h(const float* __restrict__ y, int ystride, const float* __restrict__ taps,
+                                      float* __restrict__ ring, int hidden, int k, int n, u16* __restrict__ out,
+                                      int ostride)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= hidden) return;
+    const int rl = k - 1;
+    float rg[8];
+#pragma unroll
+    for (int s = 0; s < 8; s++) rg[s] = s < rl ? ring[(size_t)ch * rl + s] : 0.0f;
+    const float* t = taps + (size_t)ch * k;
+    for (int r = 0; r < n; r++) {
+        const float* yr = y + (size_t)r * ystride;
+        const float bx = yr[ch] * yr[2 * hidden + ch];
+        float acc = t[k - 1] * bx;
+#pragma unroll
+        for (int s = 0; s < 8; s++)
+            if (s < rl) acc += t[k - 2 - s] * rg[s];
+        out[(size_t)r * ostride + ch] = f2h_sat(yr[hidden + ch] * acc);
+#pragma unroll
+        for (int s = 7; s > 0; s--)
+            if (s < rl) rg[s] = rg[s - 1];
+        if (rl > 0) rg[0] = bx;
+    }
+#pragma unroll
+    for (int s = 0; s < 8; s++)
+        if (s < rl) ring[(size_t)ch * rl + s] = rg[s];
+}
+
+// The head-wise gate on the prompt path's f16 attention rows [n][nh·hd]:
+// head h of row r times sigmoid(g[r][h]).
+extern "C" __global__ void hy_head_gate_h(u16* __restrict__ ao, const float* __restrict__ g, int nh, int hd, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= nh * hd || r >= n) return;
+    const size_t at = (size_t)r * nh * hd + i;
+    const float s = 1.0f / (1.0f + expf(-g[(size_t)r * nh + i / hd]));
+    ao[at] = f2h_sat(h2f(ao[at]) * s);
+}
+
 // Spark-X2.5 / LFM3's head-wise output gate on the attention's output planes
 // (before the O projection): head h of row r times sigmoid(g[r][h]).
 extern "C" __global__ void hy_head_gate(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ g,
@@ -3370,7 +3429,8 @@ extern "C" __global__ void hy_kda_gates(const float* __restrict__ f, int fstride
 // The KDA step with a lane a state column for dk = 128, `gdn_scan4_body`'s
 // layout: the key channels' decay folds into the k readout (kv = (k gd)ᵀ S),
 // delta = beta (v - kv), S = gd S + k deltaᵀ, o = qᵀ S. cq rows [c_dim]
-// (q | k | v, normed), gd [n][nh 128], beta [n][nh]; n <= 16.
+// (q | k | v, normed), gd [n][nh 128], beta [n][nh]; any n, 16 rows at a
+// time through the workgroup tiles (the prompt path's chunks).
 extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __restrict__ cq, const float* __restrict__ gdr,
                                                               const float* __restrict__ betar, float* S, float* __restrict__ o,
                                                               int n, int c_dim, int nh, int dv, float* __restrict__ ring,
@@ -3400,17 +3460,20 @@ extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __re
     __shared__ float ks[16][128], qs[16][128], gs[16][128];
     __shared__ float bs[16];
     __shared__ float part[2][4][32];
-    const int nn = min(n, 16);
+    for (int t0 = 0; t0 < n; t0 += 16) {
+    const int nn = min(n - t0, 16);
+    // the previous chunk's reads of the tiles are done
+    __syncthreads();
     for (int t = w; t < nn; t += 4) {
-        const float* row = cq + (size_t)t * c_dim;
+        const float* row = cq + (size_t)(t0 + t) * c_dim;
         *(float4*)(&ks[t][lane * 4]) = *(const float4*)(row + kd + (size_t)h * 128 + lane * 4);
         *(float4*)(&qs[t][lane * 4]) = *(const float4*)(row + (size_t)h * 128 + lane * 4);
-        *(float4*)(&gs[t][lane * 4]) = *(const float4*)(gdr + (size_t)t * kd + (size_t)h * 128 + lane * 4);
-        if (lane == 0) bs[t] = betar[(size_t)t * nh + h];
+        *(float4*)(&gs[t][lane * 4]) = *(const float4*)(gdr + (size_t)(t0 + t) * kd + (size_t)h * 128 + lane * 4);
+        if (lane == 0) bs[t] = betar[(size_t)(t0 + t) * nh + h];
     }
     float vv[16];
 #pragma unroll
-    for (int t = 0; t < 16; t++) vv[t] = t < nn ? cq[(size_t)t * c_dim + 2 * kd + (size_t)h * dv + j] : 0.0f;
+    for (int t = 0; t < 16; t++) vv[t] = t < nn ? cq[(size_t)(t0 + t) * c_dim + 2 * kd + (size_t)h * dv + j] : 0.0f;
     __syncthreads();
 #pragma unroll
     for (int t = 0; t < 16; t++) {
@@ -3436,8 +3499,9 @@ extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __re
         part[1][w][lane] = __fadd_rn(b0, b1);
         __syncthreads();
         if (w == 0 && o)
-            o[(size_t)t * nh * dv + (size_t)h * dv + j] =
+            o[(size_t)(t0 + t) * nh * dv + (size_t)h * dv + j] =
                 __fadd_rn(__fadd_rn(__fadd_rn(part[1][0][lane], part[1][1][lane]), part[1][2][lane]), part[1][3][lane]);
+    }
     }
 #pragma unroll
     for (int i = 0; i < 32; i++) S[base + (size_t)i * dv] = s[i];
@@ -3499,4 +3563,34 @@ extern "C" __global__ void hy_mla_cut(const u16* __restrict__ s0, const u16* __r
     const size_t src = (size_t)t * sstride + (size_t)h * hd + e, dst = (size_t)t * dstride + (size_t)h * vd + e;
     d0[dst] = s0[src];
     d1[dst] = s1[src];
+}
+
+// `hy_mla_lat` for the prompt path: the normed latent as f16 rows [n][lora]
+// (kv_b's GEMM operand) instead of the small path's bf16 planes.
+extern "C" __global__ void hy_mla_lat_h(const float* __restrict__ kva, int stride, const float* __restrict__ w, int lora,
+                                        float eps, u16* __restrict__ out)
+{
+    __shared__ float red[32];
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const float* x = kva + (size_t)r * stride;
+    float s = 0.0f;
+    for (int i = tid; i < lora; i += blockDim.x) s = fmaf(x[i], x[i], s);
+    for (int k = 16; k > 0; k >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, k));
+    if (lane == 0) red[warp] = s;
+    __syncthreads();
+    double tot = 0.0;
+    for (int k = 0; k < NW; k++) tot += (double)red[k];
+    const float inv = 1.0f / (float)sqrt(tot / (double)lora + (double)eps);
+    for (int i = tid; i < lora; i += blockDim.x) out[(size_t)r * lora + i] = f2h_sat(__fmul_rn(__fmul_rn(x[i], inv), w[i]));
+}
+
+// `hy_mla_cut` for the prompt path: f16 attention rows [n][nh][hd] into
+// [n][nh][vd] for the output GEMM.
+extern "C" __global__ void hy_mla_cut_h(const u16* __restrict__ src, u16* __restrict__ dst, int n, int nh, int hd, int vd)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * nh * vd) return;
+    const int e = (int)(i % vd);
+    const size_t th = i / vd;
+    dst[i] = src[th * hd + e];
 }

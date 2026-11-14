@@ -4326,6 +4326,9 @@ pub struct H3ChainBlock<'a> {
     pub fc2_bias: &'a [f32],
     pub scale1: &'a [f32],
     pub scale2: &'a [f32],
+    /// VSA's compression-branch gate `[heads·hd, hidden]` by directory index
+    /// (`usize::MAX`: none). Read only under [`H3Chain::vsa`].
+    pub gate: usize,
 }
 
 /// A stack of MiniMax-H3 blocks over one packed sequence.
@@ -4350,6 +4353,10 @@ pub struct H3Chain<'a> {
     /// The qkv panel's row layout: `[q | k | v]` planes (false) or
     /// per-head `[q k v]` triples (true).
     pub qkv_interleaved: bool,
+    /// Video sparse attention over the tiles of this plan instead of the
+    /// full attention (a VSA-trained student; one group only). A backend
+    /// without it refuses the chain.
+    pub vsa: Option<&'a crate::mmh3::VsaPlan>,
 }
 
 /// One layer of a language-model prompt encoder for the resident chain: its
@@ -4613,10 +4620,13 @@ pub fn h3_chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_chain(job, h),
+        // Metal's VSA kernels (an M4 within 0.55 % of the host reference)
+        // are on; `CMF_H3_METAL_VSA=0` sends a sparse student's chain to the
+        // per-op path (the host reference), never through the dense kernels.
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::h3::chain(job, h),
         #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::h3::chain(job, h),
+        Backend::Metal => (job.vsa.is_none() || std::env::var("CMF_H3_METAL_VSA").as_deref() != Ok("0")) && crate::gpu_metal::h3::chain(job, h),
         #[allow(unreachable_patterns)]
         _ => false,
     }

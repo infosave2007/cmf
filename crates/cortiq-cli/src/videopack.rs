@@ -164,6 +164,71 @@ impl StFile {
     }
 }
 
+/// A diffusers component directory (`transformer/`): the shards its
+/// `*.safetensors.index.json` lists, or every `*.safetensors` in it, behind
+/// one name lookup.
+struct StShards {
+    files: Vec<StFile>,
+    at: HashMap<String, usize>,
+}
+
+impl StShards {
+    fn open(dir: &Path) -> anyhow::Result<Self> {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        let index = std::fs::read_dir(dir)
+            .with_context(|| dir.display().to_string())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().ends_with(".safetensors.index.json"));
+        if let Some(ix) = index {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ix)?)?;
+            let mut names: Vec<String> = v["weight_map"]
+                .as_object()
+                .ok_or_else(|| anyhow!("{}: no weight_map", ix.display()))?
+                .values()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names.dedup();
+            paths.extend(names.iter().map(|n| dir.join(n)));
+        } else {
+            for e in std::fs::read_dir(dir)? {
+                let p = e?.path();
+                if p.extension().is_some_and(|x| x == "safetensors") {
+                    paths.push(p);
+                }
+            }
+            paths.sort();
+        }
+        if paths.is_empty() {
+            return Err(anyhow!("{}: no safetensors shards", dir.display()));
+        }
+        let mut files = Vec::with_capacity(paths.len());
+        let mut at = HashMap::new();
+        for (i, p) in paths.iter().enumerate() {
+            let f = StFile::open(p)?;
+            for name in &f.order {
+                at.insert(name.clone(), i);
+            }
+            files.push(f);
+        }
+        Ok(Self { files, at })
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.at.contains_key(name)
+    }
+
+    fn shape(&self, name: &str) -> anyhow::Result<&[usize]> {
+        let i = *self.at.get(name).ok_or_else(|| anyhow!("missing tensor {name}"))?;
+        Ok(self.files[i].shape(name).expect("indexed"))
+    }
+
+    fn get(&self, name: &str) -> anyhow::Result<Vec<f32>> {
+        let i = *self.at.get(name).ok_or_else(|| anyhow!("missing tensor {name}"))?;
+        self.files[i].get(name)
+    }
+}
+
 // ── codecs ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -341,6 +406,14 @@ fn time_curve(te: &StFile, lora: Option<&StFile>, scale: f32) -> anyhow::Result<
             }
         }
     }
+    Ok((tabulate_curve(&w_in, &b_in, &w_out, &b_out), t_dim))
+}
+
+/// The time embedder's `silu(e(t))` at every point of the curve grid:
+/// `[CURVE_GRID, t_dim]` from its two linears (`w_in` `[hidden, 256]`,
+/// `w_out` `[t_dim, hidden]`).
+fn tabulate_curve(w_in: &[f32], b_in: &[f32], w_out: &[f32], b_out: &[f32]) -> Vec<f32> {
+    let (hidden, t_dim) = (b_in.len(), b_out.len());
     let half = FREQ_DIM / 2;
     let mut out = vec![0f32; CURVE_GRID * t_dim];
     for i in 0..CURVE_GRID {
@@ -367,7 +440,135 @@ fn time_curve(te: &StFile, lora: Option<&StFile>, scale: f32) -> anyhow::Result<
             *d = silu(b_out[o] + row.iter().zip(&h).map(|(&a, &b)| a * b).sum::<f32>());
         }
     }
-    Ok((out, t_dim))
+    out
+}
+
+/// Eigen-decomposition of a symmetric `n × n` matrix (row-major, f64) by
+/// cyclic Jacobi rotations: eigenvalues descending, and the matching
+/// eigenvectors as the COLUMNS of the returned `n × n` matrix. `a` is
+/// destroyed.
+fn sym_eig(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut v = vec![0f64; n * n];
+    for i in 0..n {
+        v[i * n + i] = 1.0;
+    }
+    let total: f64 = a.iter().map(|x| x * x).sum::<f64>().max(f64::MIN_POSITIVE);
+    for _sweep in 0..60 {
+        let off: f64 = (0..n)
+            .flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j)))
+            .map(|(i, j)| a[i * n + j] * a[i * n + j])
+            .sum();
+        if off <= total * 1e-30 {
+            break;
+        }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a[p * n + q];
+                if apq.abs() <= 1e-300 {
+                    continue;
+                }
+                let (app, aqq) = (a[p * n + p], a[q * n + q]);
+                let theta = (aqq - app) / (2.0 * apq);
+                let sgn = if theta >= 0.0 { 1.0 } else { -1.0 };
+                let t = sgn / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..n {
+                    let (akp, akq) = (a[k * n + p], a[k * n + q]);
+                    a[k * n + p] = c * akp - s * akq;
+                    a[k * n + q] = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let (apk, aqk) = (a[p * n + k], a[q * n + k]);
+                    a[p * n + k] = c * apk - s * aqk;
+                    a[q * n + k] = s * apk + c * aqk;
+                }
+                for k in 0..n {
+                    let (vkp, vkq) = (v[k * n + p], v[k * n + q]);
+                    v[k * n + p] = c * vkp - s * vkq;
+                    v[k * n + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&i, &j| a[j * n + j].total_cmp(&a[i * n + i]));
+    let vals = order.iter().map(|&i| a[i * n + i]).collect();
+    let mut vecs = vec![0f64; n * n];
+    for (c, &i) in order.iter().enumerate() {
+        for k in 0..n {
+            vecs[k * n + c] = v[k * n + i];
+        }
+    }
+    (vals, vecs)
+}
+
+/// A low-rank basis of the time curve `u` (`[CURVE_GRID, t_dim]`): `u ≈
+/// table · btᵀ` with `table` `[CURVE_GRID, rank]` orthonormal and `bt`
+/// `[rank, t_dim]`. A block's adaLN `W · u(t)` is then `table · (W · btᵀ)ᵀ`
+/// — the curve form the runtime reads, at a rank the curve itself picks.
+struct CurveBasis {
+    table: Vec<f32>,
+    bt: Vec<f32>,
+    rank: usize,
+    /// `‖u − table · btᵀ‖ / ‖u‖` (Frobenius).
+    resid: f64,
+}
+
+fn curve_basis(u: &[f32], t_dim: usize) -> CurveBasis {
+    let g = CURVE_GRID;
+    // the grid's Gram matrix u·uᵀ, f64
+    let mut gram = vec![0f64; g * g];
+    for i in 0..g {
+        let ri = &u[i * t_dim..(i + 1) * t_dim];
+        for j in i..g {
+            let rj = &u[j * t_dim..(j + 1) * t_dim];
+            let d: f64 = ri.iter().zip(rj).map(|(&a, &b)| a as f64 * b as f64).sum();
+            gram[i * g + j] = d;
+            gram[j * g + i] = d;
+        }
+    }
+    let total: f64 = (0..g).map(|i| gram[i * g + i]).sum();
+    let (vals, vecs) = sym_eig(&mut gram, g);
+    // the smallest rank whose discarded energy is under 1e-9 of the
+    // curve's (a relative Frobenius residual of 3e-5, below the f16 the
+    // weights are stored in), at most 128
+    let mut rank = 0;
+    let mut kept = 0f64;
+    while rank < 128.min(g) {
+        kept += vals[rank].max(0.0);
+        rank += 1;
+        if total - kept <= total * 1e-9 {
+            break;
+        }
+    }
+    let mut table = vec![0f32; g * rank];
+    for i in 0..g {
+        for c in 0..rank {
+            table[i * rank + c] = vecs[i * g + c] as f32;
+        }
+    }
+    // bt = tableᵀ · u, in f64
+    let mut bt = vec![0f32; rank * t_dim];
+    for c in 0..rank {
+        let mut acc = vec![0f64; t_dim];
+        for i in 0..g {
+            let w = vecs[i * g + c];
+            for (a, &x) in acc.iter_mut().zip(&u[i * t_dim..(i + 1) * t_dim]) {
+                *a += w * x as f64;
+            }
+        }
+        for (d, a) in bt[c * t_dim..(c + 1) * t_dim].iter_mut().zip(acc) {
+            *d = a as f32;
+        }
+    }
+    let resid = ((total - kept).max(0.0) / total.max(f64::MIN_POSITIVE)).sqrt();
+    CurveBasis {
+        table,
+        bt,
+        rank,
+        resid,
+    }
 }
 
 /// One block's merged adaLN: the pruned rank-8 weight beside the LoRA's
@@ -793,6 +994,253 @@ fn pack_dit(
 /// checkpoint has one head and no grid. ComfyUI's single files keep both
 /// in the header metadata as `config = {"transformer": {"pdd_steps": n,
 /// "pdd_sigmas": [...]}}`.
+/// A full MiniMax-H3 DiT in the diffusers layout — FastVideo's FastH3
+/// students: `transformer/` of the repository, every weight trained, the
+/// adaLN of each block a full `[96768, 2688]` matrix over the student's own
+/// time embedder. Packed to the names and curve form `pack_dit` writes, so
+/// the runtime sees the same model, plus what the student adds:
+///
+/// - `attn.to_gate_compress` (VSA's compression-branch gate) as
+///   `dit.blocks.N.attn.gate_compress.weight`;
+/// - the trained sparse attention and few-step schedule from the
+///   repository's `fastvideo_inference.json` into `dit.config_json`
+///   (`vsa_sparsity`, `vsa_tile`, `sampler_base_sigmas`).
+///
+/// Three renames are not renames: `qkv_proj` is `to_q | to_k | to_v` stacked
+/// (the runtime's `[q_all; k_all; v_all]` planes), `mlp.fc1` is
+/// `ff.net.0.proj` with its halves swapped back (diffusers' SwiGLU reads
+/// `[value; gate]`, the reference stores `[gate; value]`), and
+/// `rope_inv_freq` is recomputed — diffusers drops it as a pure function of
+/// θ and the frequency count.
+fn pack_dit_diffusers(
+    specs: &mut Vec<TensorSpec>,
+    dir: &Path,
+    level: Level,
+    sparsity: Option<f64>,
+) -> anyhow::Result<serde_json::Value> {
+    let st = StShards::open(dir)?;
+    let n_blocks = (0..)
+        .take_while(|i| st.has(&format!("transformer_blocks.{i}.attn.to_q.weight")))
+        .count();
+    let n_refiner = (0..)
+        .take_while(|i| st.has(&format!("token_refiner.refiner_blocks.{i}.attn.to_q.weight")))
+        .count();
+    if n_blocks == 0 {
+        return Err(anyhow!("{}: no transformer_blocks — not a diffusers MiniMax-H3 DiT", dir.display()));
+    }
+    if !st.has("audio_proj_out.weight") {
+        return Err(anyhow!("{}: no audio stream; only the audio-video DiT packs from diffusers", dir.display()));
+    }
+    let hidden = st.shape("proj_in.weight")?[0];
+    let head_dim = st.shape("transformer_blocks.0.attn.norm_q.weight")?[0];
+    let inner = st.shape("transformer_blocks.0.attn.to_q.weight")?[0];
+    let heads = inner / head_dim;
+    let ffn = st.shape("transformer_blocks.0.ff.net.0.proj.weight")?[0] / 2;
+    let text_dim = st.shape("context_embedder.weight")?[1];
+    let latents_dim = st.shape("proj_out.weight")?[0] / 4;
+    let audio_dim = st.shape("audio_proj_out.weight")?[0];
+    let gates = st.has("transformer_blocks.0.attn.to_gate_compress.weight");
+
+    // The student's own time curve and its low-rank basis: every adaLN
+    // below is `W · u(t)`, so one basis of u serves all of them.
+    let t0 = std::time::Instant::now();
+    let u = tabulate_curve(
+        &st.get("time_embedder.linear_1.weight")?,
+        &st.get("time_embedder.linear_1.bias")?,
+        &st.get("time_embedder.linear_2.weight")?,
+        &st.get("time_embedder.linear_2.bias")?,
+    );
+    let t_dim = st.shape("time_embedder.linear_2.weight")?[0];
+    let basis = curve_basis(&u, t_dim);
+    eprintln!(
+        "adaLN curve: rank {} (residual {:.1e}, {:.1}s)",
+        basis.rank,
+        basis.resid,
+        t0.elapsed().as_secs_f64()
+    );
+    let pool = Pool::from_env();
+    let collapse = |key: &str| -> anyhow::Result<(Vec<f32>, usize)> {
+        let name = format!("{key}.weight");
+        let shape = st.shape(&name)?.to_vec();
+        if shape != [shape[0], t_dim] {
+            return Err(anyhow!("{name}: {shape:?}, expected [_, {t_dim}]"));
+        }
+        let w = st.get(&name)?;
+        let mut y = vec![0f32; shape[0] * basis.rank];
+        cortiq_engine::fcd_ops::gemm_nt_host(&w, &basis.bt, &mut y, shape[0], t_dim, basis.rank, pool.as_deref());
+        Ok((y, shape[0]))
+    };
+    let push = |specs: &mut Vec<TensorSpec>, src: &str, dst: &str, lv: Level| -> anyhow::Result<()> {
+        let shape = st.shape(src)?.to_vec();
+        specs.push(spec(dst.to_string(), &st.get(src)?, shape, lv));
+        Ok(())
+    };
+
+    for (src, dst, block) in (0..n_blocks)
+        .map(|i| (format!("transformer_blocks.{i}"), format!("blocks.{i}"), true))
+        .chain((0..n_refiner).map(|i| {
+            (
+                format!("token_refiner.refiner_blocks.{i}"),
+                format!("token_refiner.blocks.{i}"),
+                false,
+            )
+        }))
+    {
+        let mut qkv = Vec::with_capacity(3 * inner * hidden);
+        for p in ["to_q", "to_k", "to_v"] {
+            let name = format!("{src}.attn.{p}.weight");
+            if st.shape(&name)? != [inner, hidden] {
+                return Err(anyhow!("{name}: {:?}, expected [{inner}, {hidden}]", st.shape(&name)?));
+            }
+            qkv.extend(st.get(&name)?);
+        }
+        specs.push(spec(
+            format!("dit.{dst}.attn.qkv_proj.weight"),
+            &qkv,
+            vec![3 * inner, hidden],
+            level,
+        ));
+        drop(qkv);
+        push(specs, &format!("{src}.attn.to_out.0.weight"), &format!("dit.{dst}.attn.out_proj.weight"), level)?;
+        let fc1_name = format!("{src}.ff.net.0.proj.weight");
+        let fc1 = st.get(&fc1_name)?;
+        let half = ffn * hidden;
+        if fc1.len() != 2 * half {
+            return Err(anyhow!("{fc1_name}: {} values, expected {}", fc1.len(), 2 * half));
+        }
+        // [value; gate] → [gate; value]
+        let mut gate_value = Vec::with_capacity(2 * half);
+        gate_value.extend_from_slice(&fc1[half..]);
+        gate_value.extend_from_slice(&fc1[..half]);
+        drop(fc1);
+        specs.push(spec(
+            format!("dit.{dst}.mlp.fc1.weight"),
+            &gate_value,
+            vec![2 * ffn, hidden],
+            level,
+        ));
+        drop(gate_value);
+        push(specs, &format!("{src}.ff.net.2.weight"), &format!("dit.{dst}.mlp.fc2.weight"), level)?;
+        for (s, d) in [
+            ("norm1", "norm1"),
+            ("norm2", "norm2"),
+            ("attn.norm_q", "attn.q_norm"),
+            ("attn.norm_k", "attn.k_norm"),
+        ] {
+            push(specs, &format!("{src}.{s}.weight"), &format!("dit.{dst}.{d}.weight"), Level::F32)?;
+        }
+        if block {
+            let (w, out) = collapse(&format!("{src}.adaln_proj.linear"))?;
+            specs.push(spec(format!("dit.{dst}.adaln.weight"), &w, vec![out, basis.rank], Level::F16));
+            specs.push(spec(
+                format!("dit.{dst}.adaln.table"),
+                &basis.table,
+                vec![CURVE_GRID, basis.rank],
+                Level::F32,
+            ));
+            push(specs, &format!("{src}.adaln_proj.linear.bias"), &format!("dit.{dst}.adaln.bias"), Level::F32)?;
+            if gates {
+                push(
+                    specs,
+                    &format!("{src}.attn.to_gate_compress.weight"),
+                    &format!("dit.{dst}.attn.gate_compress.weight"),
+                    level,
+                )?;
+            }
+        }
+        eprint!("\rdit blocks {dst}   ");
+    }
+    eprintln!();
+
+    // the final layer and the stream projections: the fp32 island
+    let (w, out) = collapse("norm_out.linear")?;
+    specs.push(spec("dit.final_layer.adaln.weight".into(), &w, vec![out, basis.rank], Level::F32));
+    specs.push(spec(
+        "dit.final_layer.adaln.table".into(),
+        &basis.table,
+        vec![CURVE_GRID, basis.rank],
+        Level::F32,
+    ));
+    for (s, d, lv) in [
+        ("norm_out.linear.bias", "dit.final_layer.adaln.bias", Level::F32),
+        ("norm_out.norm.weight", "dit.final_layer.norm.weight", Level::F32),
+        ("proj_out.weight", "dit.final_layer.video_out.weight", Level::F32),
+        ("proj_out.bias", "dit.final_layer.video_out.bias", Level::F32),
+        ("audio_proj_out.weight", "dit.final_layer.audio_out.weight", Level::F32),
+        ("audio_proj_out.bias", "dit.final_layer.audio_out.bias", Level::F32),
+        ("proj_in.weight", "dit.video_patch_proj.weight", Level::F32),
+        ("proj_in.bias", "dit.video_patch_proj.bias", Level::F32),
+        ("audio_proj_in.weight", "dit.audio_patch_proj.weight", Level::F32),
+        ("audio_proj_in.bias", "dit.audio_patch_proj.bias", Level::F32),
+        ("context_embedder.weight", "dit.condition_proj.weight", level),
+        ("context_embedder.bias", "dit.condition_proj.bias", Level::F32),
+        ("token_refiner.final_norm.weight", "dit.token_refiner.final_norm.weight", Level::F32),
+    ] {
+        push(specs, s, d, lv)?;
+    }
+    // 1 / θ^(2j / 2F) for the F = 16 frequencies of each axis, θ = 10000
+    let freqs = 16usize;
+    let inv_freq: Vec<f32> = (0..freqs)
+        .map(|j| 1.0 / 10000f32.powf((2 * j) as f32 / (2 * freqs) as f32))
+        .collect();
+    specs.push(spec("dit.rope_inv_freq".into(), &inv_freq, vec![freqs], Level::F32));
+
+    // What the student was trained to run with, from the repository root
+    // (or the component directory).
+    let contract = [dir.join("fastvideo_inference.json"), dir.join("../fastvideo_inference.json")]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut cfg = serde_json::json!({
+        "hidden_size": hidden,
+        "num_layers": n_blocks,
+        "token_refiner_num_layers": n_refiner,
+        "num_attention_heads": heads,
+        "attention_head_dim": head_dim,
+        "ffn_hidden_size": ffn,
+        "latents_dim": latents_dim,
+        "audio_latents_dim": audio_dim,
+        "text_dim": text_dim,
+        "patch_size": [1, 2, 2],
+        "adaln_curve_grid": CURVE_GRID,
+        "adaln_rank": basis.rank,
+        "norm_eps": 1e-5,
+        "qk_norm_eps": 1e-5,
+        "final_norm_eps": 1e-5,
+        "sigma_shift_video": 12.0,
+        "sigma_shift_audio": 3.0,
+        "image": false,
+        "pdd_steps": 1,
+        "pdd_sigmas": [],
+    });
+    if let Some(c) = &contract {
+        if let Some(steps) = c["dmd_denoising_steps"].as_array() {
+            let mut base: Vec<f64> = steps.iter().filter_map(|v| v.as_f64()).map(|s| s / 1000.0).collect();
+            base.push(0.0);
+            cfg["sampler_base_sigmas"] = serde_json::json!(base);
+        }
+        if let Some(g) = c["guidance_scale"].as_f64() {
+            cfg["sampler_guidance"] = serde_json::json!(g);
+        }
+    }
+    let sp = sparsity.or_else(|| contract.as_ref().and_then(|c| c["vsa_sparsity"].as_f64()));
+    if gates || sp.is_some() {
+        let tile = contract
+            .as_ref()
+            .and_then(|c| c["vsa_tile_size"].as_u64())
+            .unwrap_or(64);
+        let shape = match tile {
+            64 => [4, 4, 4],
+            256 => [4, 8, 8],
+            other => return Err(anyhow!("vsa_tile_size {other}: expected 64 or 256")),
+        };
+        cfg["vsa_sparsity"] = serde_json::json!(sp.unwrap_or(0.9));
+        cfg["vsa_tile"] = serde_json::json!(shape);
+        cfg["vsa_gate"] = serde_json::json!(gates);
+    }
+    Ok(cfg)
+}
+
 fn pdd_of(dit: &StFile) -> anyhow::Result<(usize, Vec<f64>)> {
     let Some(raw) = dit.meta.get("config").and_then(|v| v.as_str()) else {
         return Ok((1, Vec::new()));
@@ -1897,6 +2345,12 @@ pub struct PackArgs<'a> {
     pub out: &'a str,
     pub carry: Option<&'a str>,
     pub dit: Option<&'a str>,
+    /// A full DiT in the diffusers layout (FastH3's `transformer/`).
+    pub dit_diffusers: Option<&'a str>,
+    /// Override of the student's VSA sparsity.
+    pub vsa_sparsity: Option<f64>,
+    /// Another .cmf whose `dit.*` replaces the carried file's DiT.
+    pub dit_from: Option<&'a str>,
     pub lora: Option<&'a str>,
     pub time_embedder: Option<&'a str>,
     pub lora_scale: f32,
@@ -2013,6 +2467,23 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         }
         eprintln!("dit packed ({:.1}s)", t0.elapsed().as_secs_f64());
     }
+    if let Some(p) = args.dit_diffusers {
+        if args.dit.is_some() || args.dit_from.is_some() {
+            return Err(anyhow!("--dit-diffusers, --dit and --dit-from each supply the whole DiT: pass one"));
+        }
+        if args.lora.is_some() {
+            return Err(anyhow!("--lora folds into a pruned --dit; a diffusers DiT is already the trained model"));
+        }
+        let cfg = pack_dit_diffusers(&mut specs, Path::new(p), level, args.vsa_sparsity)?;
+        specs.push(config_spec("dit", &cfg));
+        prov.insert("dit".into(), serde_json::json!(p));
+        eprintln!("dit packed ({:.1}s)", t0.elapsed().as_secs_f64());
+    } else if args.vsa_sparsity.is_some() {
+        return Err(anyhow!("--vsa-sparsity only means something with --dit-diffusers"));
+    }
+    if args.dit_from.is_some() && args.dit.is_some() {
+        return Err(anyhow!("--dit-from and --dit each supply the whole DiT: pass one"));
+    }
     if let Some(p) = args.vision {
         let src = StFile::open(Path::new(p))?;
         match pack_vision(&mut specs, &src, level, args.vis_heads, &args.vis_deepstack)? {
@@ -2063,6 +2534,14 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         )),
         None => None,
     };
+    // `--dit-from`: the DiT of another container, by reference as well —
+    // a DiT packed on its own beside a carried encoder and decoders.
+    let dit_src = match args.dit_from {
+        Some(p) => Some(Arc::new(
+            CmfModel::open(p).map_err(|e| anyhow!("{p}: {e}"))?,
+        )),
+        None => None,
+    };
     // A projection that does not land in the DiT's conditioning width
     // is some other model's projection. Say so before writing 14 GB.
     if clip_d_out != 0 {
@@ -2106,7 +2585,10 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         drop_pre.push("te.proj.");
     }
     for (on, pre) in [
-        (args.dit.is_some(), "dit."),
+        (
+            args.dit.is_some() || args.dit_diffusers.is_some() || args.dit_from.is_some(),
+            "dit.",
+        ),
         (args.vision.is_some(), "vis."),
         (args.video_vae.is_some() || args.image_vae.is_some(), "vvae."),
         (args.audio_vae.is_some(), "avae."),
@@ -2143,6 +2625,21 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
             });
         }
         vocab_carried = m.vocab.clone();
+    }
+    if let Some(m) = &dit_src {
+        let before = refs.len();
+        for e in m.tensors.iter().filter(|e| e.name.starts_with("dit.")) {
+            refs.push(TensorSpecRef {
+                name: e.name.clone(),
+                dtype: e.dtype,
+                shape: e.shape.clone(),
+                data: m.entry_bytes(e),
+            });
+        }
+        if refs.len() == before {
+            return Err(anyhow!("{}: no dit.* tensors", args.dit_from.unwrap_or_default()));
+        }
+        prov.insert("dit".into(), serde_json::json!(args.dit_from));
     }
     for s in &specs {
         refs.push(TensorSpecRef {

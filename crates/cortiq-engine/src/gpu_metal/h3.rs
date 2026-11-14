@@ -48,6 +48,8 @@ use super::{Ctx, WeightArena};
 
 const QI_MSL: &str = include_str!("qi21_msl.metal");
 const H3_MSL: &str = include_str!("h3_msl.metal");
+/// Video sparse attention (FastH3), a library of its own (`vsa_pipes`).
+const VSA_MSL: &str = include_str!("h3_vsa.metal");
 
 /// Chunks of a block's modulation row: shift, scale, gate for the attention
 /// half, then for the MLP.
@@ -173,6 +175,119 @@ fn device() -> Option<(&'static Ctx, &'static Pipes)> {
         Err(e) => {
             decline(e);
             None
+        }
+    }
+}
+
+/// The VSA kernels (`h3_vsa.metal`), compiled the first time a VSA student
+/// runs, into a library of their own: a fault there leaves the dense chain
+/// as it is.
+struct VsaPipes {
+    qpad: ComputePipelineState,
+    pool: ComputePipelineState,
+    scores: ComputePipelineState,
+    select: ComputePipelineState,
+    flash: ComputePipelineState,
+    compress: ComputePipelineState,
+    gate_add: ComputePipelineState,
+}
+unsafe impl Send for VsaPipes {}
+unsafe impl Sync for VsaPipes {}
+
+static VSA_PIPES: OnceLock<Result<VsaPipes, String>> = OnceLock::new();
+
+fn vsa_pipes(c: &Ctx) -> Option<&'static VsaPipes> {
+    let r = VSA_PIPES.get_or_init(|| {
+        let opts = metal::CompileOptions::new();
+        opts.set_language_version(metal::MTLLanguageVersion::V3_0);
+        let lib = c
+            ._device
+            .new_library_with_source(&format!("{QI_MSL}\n{VSA_MSL}"), &opts)
+            .map_err(|e| format!("h3 VSA MSL compile: {e}"))?;
+        let pso = |name: &str| -> Result<ComputePipelineState, String> {
+            let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
+            c._device.new_compute_pipeline_state_with_function(&f).map_err(|e| format!("pipeline {name}: {e}"))
+        };
+        Ok(VsaPipes {
+            qpad: pso("vsa_qpad")?,
+            pool: pso("vsa_pool")?,
+            scores: pso("vsa_scores")?,
+            select: pso("vsa_select")?,
+            flash: pso("vsa_flash")?,
+            compress: pso("vsa_compress")?,
+            gate_add: pso("vsa_gate_add")?,
+        })
+    });
+    match r {
+        Ok(p) => Some(p),
+        Err(e) => {
+            decline(e);
+            None
+        }
+    }
+}
+
+/// `VPd` of h3_vsa.metal.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VPd {
+    np: u32,
+    ldp: u32,
+    inner: u32,
+    t: u32,
+    p: u32,
+    k: u32,
+    wantv: u32,
+    n: u32,
+}
+
+/// A VSA plan's buffers for one chain call.
+struct VsaBufs {
+    rowof: Buffer,
+    slot: Buffer,
+    size: Buffer,
+    qpad: Buffer,
+    pq: Buffer,
+    pk: Buffer,
+    pv: Buffer,
+    s: Buffer,
+    oc: Buffer,
+    list: Buffer,
+    /// half `[alloc][inner]`: the gate GEMM's output
+    gate: Buffer,
+    v: VPd,
+}
+
+impl VsaBufs {
+    fn new(c: &Ctx, plan: &crate::mmh3::VsaPlan, nh: usize, inner: usize, alloc: usize, gated: bool) -> VsaBufs {
+        let (t, np) = (plan.tiles, plan.tiles * crate::mmh3::VSA_TILE);
+        let lw = plan.prefix_tiles + plan.topk;
+        let mut rowof = vec![u32::MAX; np];
+        for (r, &sl) in plan.slot.iter().enumerate() {
+            rowof[sl as usize] = r as u32;
+        }
+        VsaBufs {
+            rowof: buf_from(c, &rowof),
+            slot: buf_from(c, &plan.slot),
+            size: buf_from(c, &plan.size),
+            qpad: buf_zeroed(c, np * inner * 2),
+            pq: buf_zeroed(c, nh * t * 128 * 4),
+            pk: buf_zeroed(c, nh * t * 128 * 4),
+            pv: buf_zeroed(c, nh * t * 128 * 4),
+            s: buf_zeroed(c, nh * t * t * 4),
+            oc: buf_zeroed(c, nh * t * 128 * 4),
+            list: buf_zeroed(c, nh * t * lw.max(1) * 4),
+            gate: buf_zeroed(c, if gated { alloc * inner * 2 } else { 16 }),
+            v: VPd {
+                np: np as u32,
+                ldp: (3 * inner) as u32,
+                inner: inner as u32,
+                t: t as u32,
+                p: plan.prefix_tiles as u32,
+                k: plan.topk as u32,
+                wantv: gated as u32,
+                n: plan.n as u32,
+            },
         }
     }
 }
@@ -847,14 +962,35 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
     let Some((arena, safe_len)) = super::file_buffer(c, job.model) else {
         return decline("the file mapping cannot be wrapped as a Metal buffer");
     };
-    let mut ts = Vec::with_capacity(4 * nb);
+    // a VSA student (FastH3): the gate is a fifth projection a block, on
+    // every block or none; the sparse kernels are a library of their own
+    let gated = job.vsa.is_some() && job.blocks.iter().all(|b| b.gate != usize::MAX);
+    if job.vsa.is_some() && !gated && job.blocks.iter().any(|b| b.gate != usize::MAX) {
+        return decline("VSA gates on some blocks only");
+    }
+    if job.vsa.is_some_and(|v| v.n != n) {
+        return decline("a VSA plan of another sequence");
+    }
+    let vp = match job.vsa {
+        Some(_) => match vsa_pipes(c) {
+            Some(v) => Some(v),
+            None => return false,
+        },
+        None => None,
+    };
+    let per = if gated { 5 } else { 4 };
+    let mut ts = Vec::with_capacity(per * nb);
     for b in job.blocks {
-        for t in [
+        let mut want = vec![
             tens(job.model, b.qkv, 3 * inner, hs, safe_len),
             tens(job.model, b.out, hs, inner, safe_len),
             tens(job.model, b.fc1, 2 * ffn, hs, safe_len),
             tens(job.model, b.fc2, hs, ffn, safe_len),
-        ] {
+        ];
+        if gated {
+            want.push(tens(job.model, b.gate, inner, hs, safe_len));
+        }
+        for t in want {
             match t {
                 Some(t) => ts.push(t),
                 None => return not_mine("a projection that is not a q4tp tensor of the stack's shape"),
@@ -869,6 +1005,7 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         return false;
     }
     let a = st.0.as_ref().unwrap();
+    let vb = job.vsa.map(|plan| VsaBufs::new(c, plan, nh, inner, a.alloc, gated));
 
     // Per call: the norms' weights, the modulation tables, the rows' angles.
     let cstride = 2 * hs + 2 * hd;
@@ -928,7 +1065,7 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         let per_cut = if n > 2048 { 1 } else { 2 };
         e.rowop(None, Some(norm(0, 0)), act);
         for l in 0..nb {
-            let w = &ts[4 * l..4 * l + 4];
+            let w = &ts[per * l..per * l + per];
             e.amax(&a.xn, n * hs, 0);
             e.gemm(w[0], &a.xn, &a.panel, 0, 3 * inner, true, p2(gd.act - gd.qkv));
             e.amax(&a.panel, n * 3 * inner, 1);
@@ -955,7 +1092,67 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
                     MTLSize::new(128, 1, 1),
                 );
             }
-            {
+            if let (Some(vp), Some(vb)) = (vp, &vb) {
+                // the gate reads the attention's input at its true scale
+                if gated {
+                    e.gemm(w[4], &a.xn, &vb.gate, 0, inner, true, p2(gd.act));
+                }
+                let v = vb.v;
+                let (t, np) = (v.t as u64, v.np as u64);
+                let enc = e.rec.enc("vsa");
+                enc.set_compute_pipeline_state(&vp.qpad);
+                enc.set_buffer(0, Some(&a.panel), 0);
+                enc.set_buffer(1, Some(&vb.rowof), 0);
+                enc.set_buffer(2, Some(&vb.qpad), 0);
+                set_p(enc, 3, &v);
+                enc.dispatch_thread_groups(MTLSize::new(np, 1, 1), MTLSize::new(256, 1, 1));
+                enc.set_compute_pipeline_state(&vp.pool);
+                enc.set_buffer(0, Some(&a.panel), 0);
+                enc.set_buffer(1, Some(&vb.rowof), 0);
+                enc.set_buffer(2, Some(&vb.size), 0);
+                enc.set_buffer(3, Some(&vb.pq), 0);
+                enc.set_buffer(4, Some(&vb.pk), 0);
+                enc.set_buffer(5, Some(&vb.pv), 0);
+                set_p(enc, 6, &v);
+                enc.dispatch_thread_groups(MTLSize::new(t, nh as u64, 1), MTLSize::new(128, 1, 1));
+                enc.set_compute_pipeline_state(&vp.scores);
+                enc.set_buffer(0, Some(&vb.pq), 0);
+                enc.set_buffer(1, Some(&vb.pk), 0);
+                enc.set_buffer(2, Some(&vb.s), 0);
+                set_p(enc, 3, &v);
+                enc.dispatch_thread_groups(MTLSize::new(t.div_ceil(16), t.div_ceil(16), nh as u64), MTLSize::new(256, 1, 1));
+                if v.t > v.p {
+                    enc.set_compute_pipeline_state(&vp.select);
+                    enc.set_buffer(0, Some(&vb.s), 0);
+                    enc.set_buffer(1, Some(&vb.list), 0);
+                    set_p(enc, 2, &v);
+                    enc.dispatch_thread_groups(MTLSize::new((v.t - v.p) as u64, nh as u64, 1), MTLSize::new(256, 1, 1));
+                }
+                enc.set_compute_pipeline_state(&vp.flash);
+                enc.set_buffer(0, Some(&vb.qpad), 0);
+                enc.set_buffer(1, Some(&a.panel), 0);
+                enc.set_buffer(2, Some(&a.attn), 0);
+                enc.set_buffer(3, Some(&vb.rowof), 0);
+                enc.set_buffer(4, Some(&vb.size), 0);
+                enc.set_buffer(5, Some(&vb.list), 0);
+                set_p(enc, 6, &v);
+                enc.dispatch_thread_groups(MTLSize::new(t, nh as u64, 1), MTLSize::new(256, 1, 1));
+                if gated {
+                    enc.set_compute_pipeline_state(&vp.compress);
+                    enc.set_buffer(0, Some(&vb.s), 0);
+                    enc.set_buffer(1, Some(&vb.pv), 0);
+                    enc.set_buffer(2, Some(&vb.oc), 0);
+                    set_p(enc, 3, &v);
+                    enc.dispatch_thread_groups(MTLSize::new(t, nh as u64, 1), MTLSize::new(128, 1, 1));
+                    enc.set_compute_pipeline_state(&vp.gate_add);
+                    enc.set_buffer(0, Some(&a.attn), 0);
+                    enc.set_buffer(1, Some(&vb.gate), 0);
+                    enc.set_buffer(2, Some(&vb.oc), 0);
+                    enc.set_buffer(3, Some(&vb.slot), 0);
+                    set_p(enc, 4, &v);
+                    enc.dispatch_thread_groups(MTLSize::new(((n * inner) as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+                }
+            } else {
                 let pf = PFa {
                     q_row0: 0,
                     nq: n as u32,

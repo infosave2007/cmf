@@ -343,29 +343,47 @@ fn windows(shard: &Shard, n: usize, len: usize) -> Vec<Vec<u32>> {
 
 // ───────────────────────── the cortiq binary ─────────────────────────
 
-/// `cortiq` next to this test's profile dir (`CORTIQ_BIN` overrides);
-/// built with `cargo build -p cortiq-cli --bin cortiq` into the same
-/// target dir when absent.
+/// `cortiq` in this test's profile dir (`CORTIQ_BIN` overrides); built
+/// with `cargo build -p cortiq-cli --bin cortiq` into the same target dir
+/// when absent, at the path cargo reports.
+///
+/// The profile dir is the parent of the `deps` (or, under cargo's newer
+/// build-dir layout, `build`) directory the test runs from: a test binary
+/// sits at `target/debug/deps/…` or `target/debug/build/<pkg>/<hash>/out/…`,
+/// and two levels up from the second is not the profile dir.
 fn cortiq_bin() -> PathBuf {
     if let Ok(p) = std::env::var("CORTIQ_BIN") {
         return PathBuf::from(p);
     }
     let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
+    let profile_dir = exe
+        .ancestors()
+        .find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("deps" | "build")))
+        .and_then(Path::parent)
+        .unwrap_or_else(|| exe.parent().unwrap().parent().unwrap())
+        .to_path_buf();
     let cand = profile_dir.join(format!("cortiq{}", std::env::consts::EXE_SUFFIX));
     if cand.exists() {
         return cand;
     }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut c = Command::new(cargo);
-    c.args(["build", "-p", "cortiq-cli", "--bin", "cortiq"]);
+    c.args(["build", "-p", "cortiq-cli", "--bin", "cortiq", "--message-format=json-render-diagnostics"]);
     if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
         c.arg("--release");
     }
     eprintln!("building {} …", cand.display());
-    let st = c.status().expect("spawn cargo build");
-    assert!(st.success() && cand.exists(), "cargo build -p cortiq-cli --bin cortiq failed");
-    cand
+    let out = c.stderr(std::process::Stdio::inherit()).output().expect("spawn cargo build");
+    assert!(out.status.success(), "cargo build -p cortiq-cli --bin cortiq failed");
+    // the binary where cargo put it, whatever the layout
+    let built = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == "cortiq")
+        .find_map(|v| v["executable"].as_str().map(PathBuf::from));
+    let bin = built.unwrap_or(cand);
+    assert!(bin.exists(), "cargo built cortiq, but {} is missing", bin.display());
+    bin
 }
 
 fn s(p: &Path) -> &str {

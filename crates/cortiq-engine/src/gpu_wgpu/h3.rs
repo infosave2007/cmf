@@ -59,6 +59,9 @@
 use crate::gpu::{H3Chain, TeChain};
 
 /// LTX-2.5's blocks as a resident chain, on this module's parts.
+/// Video sparse attention in the DiT chain (FastH3).
+#[path = "h3_vsa.rs"]
+mod vsa;
 #[path = "ltx.rs"]
 mod ltx;
 #[cfg_attr(target_os = "macos", allow(unused_imports))]
@@ -923,14 +926,28 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         return decline("the attention tile does not fit the workgroup memory");
     }
 
-    let mut spans = Vec::with_capacity(4 * nb);
+    // a VSA student (FastH3): the gate is a fifth projection a block, on
+    // every block or none
+    let gated = job.vsa.is_some() && job.blocks.iter().all(|b| b.gate != usize::MAX);
+    if job.vsa.is_some() && !gated && job.blocks.iter().any(|b| b.gate != usize::MAX) {
+        return decline("VSA gates on some blocks only");
+    }
+    if job.vsa.is_some_and(|p| p.n != n) {
+        return decline("a VSA plan of another sequence");
+    }
+    let per = if gated { 5 } else { 4 };
+    let mut spans = Vec::with_capacity(per * nb);
     for b in job.blocks {
-        for s in [
+        let mut want = vec![
             span(job.model, b.qkv, 3 * inner, hs),
             span(job.model, b.out, hs, inner),
             span(job.model, b.fc1, 2 * ffn, hs),
             span(job.model, b.fc2, hs, ffn),
-        ] {
+        ];
+        if gated {
+            want.push(span(job.model, b.gate, inner, hs));
+        }
+        for s in want {
             match s {
                 Some(s) => spans.push(s),
                 None => return not_mine("a projection that is not a q4tp tensor of the stack's shape"),
@@ -944,9 +961,17 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         Ok(a) => a,
         Err(said) => return said,
     };
-    let plan = match plan(c, job.model, &spans, 4, a.w.bytes(a.mp)) {
+    let vsa_bytes = job.vsa.map_or(0, |p| vsa::VsaDev::bytes(p, nh, inner, a.mp));
+    let plan = match plan(c, job.model, &spans, per, a.w.bytes(a.mp) + vsa_bytes) {
         Ok(p) => p,
         Err(said) => return said,
+    };
+    let vdev = match job.vsa {
+        None => None,
+        Some(p) => match vsa::VsaDev::new(c, p, nh, inner, a.mp) {
+            Some(v) => Some(v),
+            None => return decline("the VSA kernels do not build on this device"),
+        },
     };
 
     // Per call: the norms' weights, the modulation tables, the rows' angles.
@@ -1000,7 +1025,7 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
             calls.push(Class::Rows, row(None, Some(norm(0, 0))));
         }
         for l in blocks.clone() {
-            let w = &wb[4 * (l - blocks.start)..][..4];
+            let w = &wb[per * (l - blocks.start)..][..per];
             probe(&mut calls, &a.xn, n * hs, 0)?;
             let aq = margs(n, 3 * inner, hs, 3 * inner, 0, p2(gd.act - gd.qkv));
             calls.push_mm(Class::MmQkv, mm(c, site_cfg(t, Epi::F16), &aq, 0, &w[0], &a.xn, &a.panel)?);
@@ -1012,7 +1037,19 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
                 let bg = zi::bg(c, &qkpipe, &[&a.panel, &cw_buf, &cs_buf, &u]);
                 calls.push(Class::Rows, Call { pipe: qkpipe.clone(), bg, grid: (2 * nh as u32, n as u32, 1) });
             }
-            calls.push(Class::Flash, flash_call(c, &fpipe, fc, a, None, &dummy, n, nh, inner, 2 * inner));
+            match &vdev {
+                Some(v) => {
+                    // the gate reads the attention's input at its true scale
+                    if gated {
+                        let ag = margs(n, inner, hs, inner, 0, p2(gd.act));
+                        calls.push_mm(Class::MmQkv, mm(c, site_cfg(t, Epi::F16), &ag, 0, &w[4], &a.xn, &v.gate)?);
+                    }
+                    for k in v.calls(c, &a.panel, &a.att, nh, inner, gated) {
+                        calls.push(Class::Flash, k);
+                    }
+                }
+                None => calls.push(Class::Flash, flash_call(c, &fpipe, fc, a, None, &dummy, n, nh, inner, 2 * inner)),
+            }
             probe(&mut calls, &a.att, n * inner, 2)?;
             let ao = margs(n, hs, inner, hs, 0, p2(gd.qkv));
             calls.push_mm(Class::MmO, mm(c, site_cfg(t, Epi::F32), &ao, 0, &w[1], &a.att, &a.y)?);
@@ -1042,11 +1079,11 @@ pub(crate) fn chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
         c,
         job.model,
         &spans,
-        4,
+        per,
         &plan,
         a,
         h,
-        &format!("{n} rows x {nb} blocks"),
+        &format!("{n} rows x {nb} blocks{}", if vdev.is_some() { ", vsa" } else { "" }),
         t0,
         amax.as_ref().map(|b| (b, &sites[..])),
         &build,

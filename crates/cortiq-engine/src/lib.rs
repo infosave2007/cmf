@@ -44,6 +44,8 @@ pub mod inference;
 pub mod kv_cache;
 pub mod lfm3_audio;
 pub mod lfm3_speech;
+pub mod qwen3_tts;
+pub mod haru;
 pub mod lfm3_vl;
 pub mod linear_core;
 pub mod loader;

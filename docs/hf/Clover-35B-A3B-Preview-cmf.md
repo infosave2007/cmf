@@ -28,9 +28,9 @@ expert; 30 Gated DeltaNet and 10 gated full-attention layers; 128k context).
 It is built to write in 32-token blocks by repeated denoising passes, and its
 trunk also reads as an ordinary causal model — packaged as single
 [CMF](https://github.com/infosave2007/cmf) files for `cortiq`, a Rust inference
-engine with no Python and no ML framework. `cortiq` decodes causally by default,
-the fastest on every machine we measured; block denoising and self-speculation
-are one setting away.
+engine with no Python and no ML framework (CUDA, Vulkan, Metal and the CPU). `cortiq`
+decodes causally by default, the fastest on every machine we measured; block denoising
+and self-speculation are one setting away.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文说明)
 
@@ -75,6 +75,10 @@ Tokens per second after the prompt, `q4tp-v2`:
 
 The whole model and its head take 18.7 GB on the card. `q8_2f` does not fit
 32 GB whole and runs at 46–49 tok/s there.
+
+RTX A5000 (24 GB), CUDA, cortiq 0.8.96, `cortiq bench` (`CMF_GPU=cuda` on a build with the CUDA backend (`cargo install cortiq-cli --features cuda`, the NVIDIA driver and the CUDA 12.x libraries)):
+`q4tp-v2` decodes at 111.5–112.5 tok/s and reads a 4096-token prompt at 2356 tok/s
+(first token 1.7 s); Vulkan on the same card gives 76 tok/s and 445 tok/s (9.2 s).
 
 ### Decoding modes
 
@@ -182,6 +186,9 @@ cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как �
 видеопамяти — 54 и 53; Mac mini M4 (24 ГБ, промпт на Metal ~170 ток/с, декод на
 CPU) — 13–18 и 14–18; только CPU, 15 ядер Xeon — 13.8 и 10.9.
 
+RTX A5000 (24 ГБ) с CUDA (cortiq 0.8.96, `cortiq bench`, сборка `--features cuda`, `CMF_GPU=cuda`): `q4tp-v2`
+генерирует 111.5–112.5 ток/с и читает промпт в 4096 токенов со скоростью 2356 ток/с (первый токен через 1.7 с).
+
 `CMF_CLOVER_MODE` выбирает режим: `ar` (по умолчанию) — каузальный декод со
 штрафами из релиза; `draft` — самоспекуляция, проход денойзинга предлагает
 16 токенов, каузальный путь их проверяет (RTX 5090: 42 и 104 ток/с); `denoise` —
@@ -199,6 +206,8 @@ Clover-35B-A3B-Preview 是 DiffuSpace 基于 Qwen3.6-35B-A3B 的扩散语言模�
 每秒 token 数（提示之后，`q4tp-v2`）：RTX 5090（Vulkan）文本 120、代码 121，2048 个
 token 的提示 1143 token/s；16 GB 显存 54 和 53；Mac mini M4（24 GB，提示走 Metal 约
 170 token/s，解码走 CPU）13–18 和 14–18；仅 CPU（15 核 Xeon）13.8 和 10.9。
+
+RTX A5000（24 GB）上使用 CUDA（cortiq 0.8.96，`cortiq bench`，`--features cuda` 构建，`CMF_GPU=cuda`）：`q4tp-v2` 解码 111.5–112.5 token/s，4096 token 的提示 2356 token/s（首 token 1.7 秒）。
 
 `CMF_CLOVER_MODE` 选择模式：`ar`（默认）为因果解码；`draft` 为自推测，一次去噪提出
 16 个 token，由因果路径验证（RTX 5090：42 和 104）；`denoise` 为发布版的 LowConfidence

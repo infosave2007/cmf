@@ -83,7 +83,7 @@ extern "C" __global__ void h3_qkv_split(const float* __restrict__ y, const float
                                         const float* __restrict__ qn, const float* __restrict__ kn,
                                         const float* __restrict__ cs, u16* __restrict__ Q, u16* __restrict__ K,
                                         u16* __restrict__ VT, int row0, int n, int ns, int nh, int hd, int pairs,
-                                        float eps, int inter, int lanes)
+                                        float eps, int inter, int lanes, const int* __restrict__ map, int np)
 {
     __shared__ float red[2][8];
     __shared__ float qs[256], ks[256];
@@ -140,28 +140,31 @@ extern "C" __global__ void h3_qkv_split(const float* __restrict__ y, const float
             k = ks[j] * s + ks[j + pairs] * c;
         }
     }
-    const int row = row0 + r, g = row / n, local = row - g * n;
+    // `map`: video sparse attention keeps the rows in tile-padded order, row
+    // `local` at slot map[local] of `np` (the pad slots are zeroed before)
+    const int row = row0 + r, g = row / n, local0 = row - g * n;
+    const int local = map ? map[local0] : local0;
     const size_t plane = (size_t)g * nh + h;
-    const size_t o = (plane * n + local) * hd + d;
+    const size_t o = (plane * np + local) * hd + d;
     Q[o] = f2h_sat(q);
     if (!lanes) {
         K[o] = f2h_sat(k);
         u16* vt = VT + (plane * hd + d) * ns;
         vt[local] = f2h_sat(v);
-        if (local == n - 1)
+        if (!map && local == n - 1)
             for (int i = n; i < ns; i++) vt[i] = 0;
         return;
     }
     // dim d = 8 m + 2 tig + e
     const int m = d >> 3, tig = (d & 7) >> 1, e = d & 1;
-    K[(plane * n + local) * hd + (size_t)tig * (hd >> 2) + 2 * m + e] = f2h_sat(k);
+    K[(plane * np + local) * hd + (size_t)tig * (hd >> 2) + 2 * m + e] = f2h_sat(k);
     // key kk of tile kt: fragment half = kk / 8, tig = (kk % 8) / 2, e = kk % 2;
     // dim d = 8 j + gid
     const int j = d >> 3, gid = d & 7;
     u16* vt = VT + (plane * (ns >> 4) * 8 + gid) * (size_t)(hd >> 1) * 4;
     #define VPOS(key) ((((size_t)((key) >> 4) * 8) * 4 + (((key) & 7) >> 1)) * (hd >> 1) + (size_t)j * 4 + (((key) & 15) >> 3) * 2 + ((key) & 1))
     vt[VPOS(local)] = f2h_sat(v);
-    if (local == n - 1)
+    if (!map && local == n - 1)
         for (int i = n; i < ns; i++) vt[VPOS(i)] = 0;
     #undef VPOS
 }

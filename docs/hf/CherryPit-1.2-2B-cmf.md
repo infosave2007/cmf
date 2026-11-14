@@ -24,8 +24,9 @@ language:
 [CherryPit-1.2-2B](https://huggingface.co/DRUPEs/CherryPit-1.2-2B) by DRUPEs — a 2.5B coding assistant
 fine-tuned from MiniCPM5-2B for web apps, Python, math and tool calling (42 layers, 128k context, a
 thinking mode) — packaged as single [CMF](https://github.com/infosave2007/cmf) files. They run with
-`cortiq`, a Rust inference engine with no Python and no ML framework: NVIDIA, AMD and Intel GPUs through
-Vulkan/DX12, Apple silicon through Metal, and the CPU.
+`cortiq`, a Rust inference engine with no Python and no ML framework: NVIDIA GPUs through CUDA or Vulkan,
+AMD and Intel GPUs through Vulkan/DX12, Apple silicon through Metal, and the CPU. On an RTX A5000 with CUDA
+a 4096-token prompt reaches its first token in 0.6 s.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)
 
@@ -70,6 +71,14 @@ speed after a prompt of that length.
 
 The MacBook Air has no fan and the base M4's memory bus; an M4 Pro or Max was not measured. Peak memory
 is for the 2k and 8k prompts.
+
+RTX A5000 (24 GB), CUDA, cortiq 0.8.96, `cortiq bench` (`CMF_GPU=cuda` on a build with
+`cargo install cortiq-cli --features cuda`):
+
+| file | decode, tok/s | 4096-token prompt | decode after it |
+|---|---:|---:|---:|
+| `q4tp` | 174.8–176.2 | 6869 tok/s (first token 0.59 s) | 166.9 |
+| `q8_2f` | 147.9–150.2 | 6665 tok/s (first token 0.61 s) | 137.0 |
 
 ## Usage
 
@@ -150,7 +159,7 @@ Weights: [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0), from
 2,5 млрд параметров, дообученный из MiniCPM5-2B для веб-приложений, Python, математики и вызова
 инструментов (42 слоя, контекст 128k, режим рассуждений), — в виде отдельных файлов
 [CMF](https://github.com/infosave2007/cmf). Запускается движком `cortiq` на Rust без Python и
-ML-фреймворков: GPU NVIDIA, AMD и Intel через Vulkan/DX12, Apple silicon через Metal, а также CPU.
+ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Intel через Vulkan/DX12, Apple silicon через Metal, а также CPU.
 
 ### Быстрый старт
 
@@ -193,6 +202,14 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 
 У MacBook Air нет вентилятора и шина памяти базового M4; M4 Pro и Max не измерялись. Пик памяти — для
 промптов 2k и 8k.
+
+RTX A5000 (24 ГБ), CUDA, cortiq 0.8.96, `cortiq bench` (`CMF_GPU=cuda` в сборке
+`cargo install cortiq-cli --features cuda`):
+
+| файл | генерация, ток/с | промпт 4096 токенов | генерация после него |
+|---|---:|---:|---:|
+| `q4tp` | 174,8–176,2 | 6869 ток/с (первый токен 0,59 с) | 166,9 |
+| `q8_2f` | 147,9–150,2 | 6665 ток/с (первый токен 0,61 с) | 137,0 |
 
 ### Использование
 
@@ -240,7 +257,7 @@ cortiq verify CherryPit-1.2-2B-q8_2f.cmf
 DRUPEs 的 [CherryPit-1.2-2B](https://huggingface.co/DRUPEs/CherryPit-1.2-2B) 是一个 25 亿参数的代码助手，
 由 MiniCPM5-2B 微调而来，擅长 Web 应用、Python、数学和工具调用（42 层，128k 上下文，支持思考模式），
 这里打包为独立的 [CMF](https://github.com/infosave2007/cmf) 文件，由 `cortiq` 运行——一个不依赖 Python
-和机器学习框架的 Rust 推理引擎：NVIDIA、AMD、Intel 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在
+和机器学习框架的 Rust 推理引擎：NVIDIA 显卡走 CUDA 或 Vulkan，AMD、Intel 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在
 CPU 上运行。
 
 ### 快速开始
@@ -281,6 +298,13 @@ cortiq run CherryPit-1.2-2B-q8_2f.cmf --prompt "Build a React component with a s
 | MacBook Air M4（24 GB） | CPU，10 核 | `q4tp` | 30.5 | 9.9 s | 25.5 | — | — | 2.3 GB 内存 |
 
 MacBook Air 无风扇，采用基础款 M4 的内存总线；未测试 M4 Pro 或 Max。内存峰值对应 2k 和 8k 提示词。
+
+RTX A5000（24 GB），CUDA，cortiq 0.8.96，`cortiq bench`（`cargo install cortiq-cli --features cuda` 构建，设置 `CMF_GPU=cuda`）：
+
+| 文件 | 生成，tok/s | 4096 token 提示词 | 之后的生成 |
+|---|---:|---:|---:|
+| `q4tp` | 174.8–176.2 | 6869 tok/s（首 token 0.59 s） | 166.9 |
+| `q8_2f` | 147.9–150.2 | 6665 tok/s（首 token 0.61 s） | 137.0 |
 
 ### 使用
 
