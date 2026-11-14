@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.96] — 2026-11-14
+
 ### Added
 - The resident Embryo graph on CUDA (`gpu_cuda/embryo.rs`, `embryo.cu`): the wide token path of
   `gpu_wgpu/embryo_wide.wgsl` (GDN mixers, bounded anchors with their sinks, the resonance router, the
