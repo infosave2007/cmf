@@ -1034,6 +1034,42 @@ mod tests {
     }
 }
 
+/// `requant --quant tiled-q8_2f`: every `q4tp`/`q2tp` tensor dequantized and
+/// stored as q8_2f; everything else copied. An evaluation bridge — the CPU
+/// prefill of the tiled codecs is scalar (~18 tok/s on a 2B model), the q8_2f
+/// one is a GEMM; the q8 rounding is ~0.4 % of a weight against the 2-bit
+/// step's 50 %.
+pub fn cmd_requant_tiled_q8(model_path: &str, output: &str) -> anyhow::Result<()> {
+    use cortiq_core::format::CmfStreamWriter;
+    let t0 = std::time::Instant::now();
+    let model = CmfModel::open_sharded(model_path)?;
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+    let avg = model.tensors.iter().map(|e| e.name.len()).sum::<usize>() / model.tensors.len().max(1);
+    let mut out = CmfStreamWriter::new(output, CmfStreamWriter::head_reserve_for(model.tensors.len(), avg))?;
+    let mut n = 0usize;
+    for e in &model.tensors {
+        let bytes = model.entry_bytes(e);
+        if !matches!(e.dtype, TensorDtype::Q4TiledP | TensorDtype::Q2TiledP) {
+            out.push_bounded(&e.name, e.dtype, &e.shape, bytes, 1 << 28)?;
+            continue;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_tensor(e, bytes, &mut w).map_err(|m| anyhow::anyhow!("{}: {m}", e.name))?;
+        let (dt, enc) = quantize_2d(Quant::Q8_2f, &w, rows, cols);
+        out.push(&e.name, dt, &e.shape, &enc)?;
+        n += 1;
+    }
+    let mut header = model.header.clone();
+    header.section_hashes = None;
+    let mut prov = header.provenance.clone().unwrap_or_else(|| serde_json::json!({}));
+    prov["tiled_expanded"] = serde_json::json!({ "to": "q8_2f", "tensors": n, "source": std::path::Path::new(model_path).file_name().map(|f| f.to_string_lossy().into_owned()) });
+    header.provenance = Some(prov);
+    out.finish(&header, None, model.vocab.as_deref())?;
+    eprintln!("requant tiled-q8_2f: {n} q4tp/q2tp tensors expanded to q8_2f → {output} in {:.0}s", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// `requant --quant blr-q8_2f`: every `blr` tensor expanded to its dense
 /// weight `Σ_p (S_U·diag h·diag ℓ)(S_V·diag g)ᵀ` (one GEMM per tensor, rows
 /// split over the cores) and stored as q8_2f; every other tensor copied. The
