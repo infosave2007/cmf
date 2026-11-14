@@ -10,6 +10,14 @@
 use cortiq_embryo::metal::{Cmd, GBuf, GemmBatch, Op, ctx};
 use cortiq_embryo::ops::lcg_vec;
 
+/// These cases are about the tile kernels: on CUDA keep cuBLAS (TF32 on the
+/// large plain GEMMs by default) out of them. Read at context creation.
+fn kernels_only() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: set once, before the context of this test process reads it
+    ONCE.call_once(|| unsafe { std::env::set_var("CMF_CUDA_CUBLAS", "0") });
+}
+
 fn as_f64(x: &[f32]) -> Vec<f64> {
     x.iter().map(|v| *v as f64).collect()
 }
@@ -32,6 +40,7 @@ fn cpu_gemm(ta: Op, tb: Op, m: usize, n: usize, k: usize, a: &[f64], lda: usize,
 
 #[test]
 fn gemm64_microbench_4096x1280x1280() {
+    kernels_only();
     let c = ctx().expect("native Vulkan adapter is required");
     let on = std::env::var("CMF_VULKAN_GEMM64").map(|v| v != "0").unwrap_or(false);
     let (m, n, k) = (4096usize, 1280usize, 1280usize);
@@ -70,6 +79,7 @@ fn gemm64_microbench_4096x1280x1280() {
 
 #[test]
 fn gemm64_matches_tile16_bits_batched_causal_transposed() {
+    kernels_only();
     let c = ctx().expect("native Vulkan adapter is required");
     // Chunked-anchor-like batched GEMMs: z = (b, h, c), 64×64 tiles, causal,
     // every operand orientation. The tile16 reference runs through the same

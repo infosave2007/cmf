@@ -1,0 +1,1 @@
+{"vocab":32768,"anchor_q_heads":8,"anchor_kv_heads":2,"anchor_hd":128,"experts":4,"head_clusters":128,"conv_k":0,"anchor_window":128,"anchor_sink":4,"anchor_train_windows":[64,128],"anchor_wide_window":2048,"anchor_wide_groups":[1],"mixer":"gdn","hidden":768,"inter":1536,"layers":16,"anchor_every":8,"anchor_layers":[3,7,11,15]}
