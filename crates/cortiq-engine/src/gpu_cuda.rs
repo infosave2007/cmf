@@ -923,13 +923,21 @@ pub(crate) mod qwen4;
 /// contracts; declared after `kargs!`, which it uses.
 mod hyb;
 
+/// The resident Embryo graph (GDN mixers, bounded anchors, the resonance
+/// router, the hierarchical head); declared after `kargs!`, which it uses.
+mod embryo;
+pub use embryo::{
+    embryo_device_next_position, embryo_device_state_bytes, embryo_graph_reset, embryo_wide_ready, forward_embryo_graph,
+    forward_embryo_graph_chunk,
+};
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
 pub use h3::{
     h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_plane_ready, h3_prof_report, h3_release, h3_resident_bytes,
     flux_vae_chain, h3_te_chain, h3_vae_conv2d, lumina_block, ltx_chain, ltx_vae_chain, moss_chain, primal_vae_run, qi21_prefill, qi21_release,
-    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, zimage_prepare, zimage_release, zimage_step,
+    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, sam_encode, vit_encode, zimage_prepare, zimage_release, zimage_step,
 };
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
@@ -1303,7 +1311,9 @@ impl Ctx {
                     params,
                 )
             }
-            .map_err(derr)
+            // the launch's shape beside the driver's word: a refused launch names
+            // what it asked for
+            .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)))
         };
         let nop = NOP_F.load(Ordering::Relaxed);
         if nop != 0 && nop != f as usize && r.is_ok() {
@@ -1347,7 +1357,7 @@ impl Ctx {
                 params,
             )
         }
-        .map_err(derr);
+        .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)));
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, self.stream) };
@@ -2319,11 +2329,21 @@ pub fn forward_token_graph(
     hidden_too: bool,
 ) -> TokenGraphOutcome {
     let Some(c) = ctx() else { return TokenGraphOutcome::Declined };
-    if hyb::wants(layers, nh, nkv, hd) {
-        return hyb::token(
-            c, model, kv_id, layers, o1, o1_epoch, invf, h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
-            lm_head, final_norm, logits, loop_norm_at, steps, layers_run, layer_base, hidden_too,
+    let mut layers_run = layers_run;
+    // the hybrid arm takes the stacks only it has kernels for (GDN, gated or
+    // normed attention, a Looped Transformer's mid-stack norms) and, first,
+    // every other one (`CMF_CUDA_HYB_ALL=0` keeps those on the dense arm):
+    // a plain stack it declines goes on to the dense arm (A5000: Granite-8B
+    // 92 against the dense arm's 66 tok/s, MiniCPM5-2B 180 against 146)
+    let hyb_only = hyb::wants(layers, nh, nkv, hd) || !loop_norm_at.is_empty();
+    if hyb_only || hyb::all_on() {
+        let r = hyb::token(
+            c, model, kv_id, layers, o1, o1_epoch, invf, &mut *h, nh, nkv, hd, attn_scale, rd, hidden, position, cap, gemma, eps,
+            lm_head, final_norm, logits, loop_norm_at, steps, layers_run.as_deref_mut(), layer_base, hidden_too,
         );
+        if hyb_only || !matches!(r, TokenGraphOutcome::Declined) {
+            return r;
+        }
     }
     let mut st = c.st.lock().unwrap();
     // A far-field state the card has moved has no host copy to return to
@@ -2661,12 +2681,29 @@ pub fn forward_batch_graph_at(
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
     let Some(c) = ctx() else { return BatchGraphOutcome::Declined };
-    if hyb::wants(layers, nh, nkv, hd) {
+    let mut layers_run = layers_run;
+    // a verify tail stays with the arm that takes the stack's token graph
+    // (the hybrid one for every stack unless `CMF_CUDA_HYB_ALL=0`)
+    // a Looped Transformer's loop norms (`gpu::set_batch_loop_norm`): the
+    // hybrid arm alone applies them
+    let looped = crate::gpu::batch_loop_norm().is_some();
+    if hyb::wants(layers, nh, nkv, hd) || looped || (hyb::all_on() && spec.is_some()) {
         let defer = BATCH_DEFER.with(|d| d.get());
         return hyb::batch(
             c, model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
             attn_scale, k, o1, o1_epoch, spec, layers_run, defer,
         );
+    }
+    // a plain stack's prompt tries the hybrid arm first, the dense arm after a decline
+    if hyb::all_on() {
+        let defer = BATCH_DEFER.with(|d| d.get());
+        let r = hyb::batch(
+            c, model, kv_id, layer_base, layers, invf, &mut *h, nh, nkv, hd, rd, hidden, positions, cap, gemma, eps,
+            attn_scale, k, o1, o1_epoch, None, layers_run.as_deref_mut(), defer,
+        );
+        if !matches!(r, BatchGraphOutcome::Declined) {
+            return r;
+        }
     }
     let b = k;
     if spec.is_some() || o1.iter().any(|v| v.is_some()) {

@@ -147,9 +147,12 @@ struct HyJob {
 }
 
 pub(super) struct HFuncs {
-    /// `hy_mmp_{NT}_{TB}_{KS}` by [NT - 1][TB - 1][KS == 16].
-    mmp: [[[cs::CUfunction; 2]; 2]; 2],
-    /// The grouped experts' launches: `hy_mmp_4_2_8` (32 rows a job), `hy_mmp_8_1_8` (64).
+    /// `hy_mmp_{NT}_{TB}_{KS}` by [NT 1, 2, 4 (windows of 4, 8, 16 rows)][TB - 1][KS == 16].
+    mmp: [[[cs::CUfunction; 2]; 2]; 3],
+    /// One codec's windows, `hy_mmpk_{NT}_{TB}_{KS}_{KD}` by [NT as in
+    /// `mmp`][TB - 1][KS == 16][`KDS` index of KD].
+    mmpk: [[[[cs::CUfunction; 6]; 2]; 2]; 3],
+    /// The grouped experts' launches: `hy_mmp_8_2_8` (32 rows a job), `hy_mmp_16_1_8` (64).
     mmp_g: [cs::CUfunction; 2],
 
     split: cs::CUfunction,
@@ -171,6 +174,15 @@ pub(super) struct HFuncs {
     gather: cs::CUfunction,
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
+    field_planes: cs::CUfunction,
+    dash_route: cs::CUfunction,
+    dash_close: cs::CUfunction,
+    dash_attend: cs::CUfunction,
+    kda_gates: cs::CUfunction,
+    kda_scan4: cs::CUfunction,
+    mla_lat: cs::CUfunction,
+    mla_kv: cs::CUfunction,
+    mla_cut: cs::CUfunction,
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
@@ -178,6 +190,17 @@ pub(super) struct HFuncs {
     expand_q1: cs::CUfunction,
     repack1t: cs::CUfunction,
     expand_q1t: cs::CUfunction,
+    repack2: cs::CUfunction,
+    expand_q2: cs::CUfunction,
+    repack4t: cs::CUfunction,
+    expand_q4g: cs::CUfunction,
+    mhc_enter: cs::CUfunction,
+    mhc_leave: cs::CUfunction,
+    mhc_route: cs::CUfunction,
+    mhc_logits: cs::CUfunction,
+    mhc_merge: cs::CUfunction,
+    prism_p: cs::CUfunction,
+    prism_h: cs::CUfunction,
     qk: cs::CUfunction,
     scores: cs::CUfunction,
     values: cs::CUfunction,
@@ -212,17 +235,28 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         return Err(format!("attention geometry {hpk} heads per KV head x {hd} outside the kernels"));
     }
     let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}")], c.arch)?;
-    let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 2];
-    for nt in 1..=2usize {
+    let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 3];
+    for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
         for tb in 1..=2usize {
             for (ki, ks) in [8usize, 16].into_iter().enumerate() {
-                mmp[nt - 1][tb - 1][ki] = func(module, &format!("hy_mmp_{nt}_{tb}_{ks}"))?;
+                mmp[ni][tb - 1][ki] = func(module, &format!("hy_mmp_{nt}_{tb}_{ks}"))?;
+            }
+        }
+    }
+    let mut mmpk = [[[[std::ptr::null_mut(); 6]; 2]; 2]; 3];
+    for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
+        for tb in 1..=2usize {
+            for (ki, ks) in [8usize, 16].into_iter().enumerate() {
+                for (di, kd) in KDS.into_iter().enumerate() {
+                    mmpk[ni][tb - 1][ki][di] = func(module, &format!("hy_mmpk_{nt}_{tb}_{ks}_{kd}"))?;
+                }
             }
         }
     }
     Ok(HFuncs {
         mmp,
-        mmp_g: [func(module, "hy_mmp_4_2_8")?, func(module, "hy_mmp_8_1_8")?],
+        mmpk,
+        mmp_g: [func(module, "hy_mmp_8_2_8")?, func(module, "hy_mmp_16_1_8")?],
 
         moe_topk: func(module, "hy_moe_topk")?,
         moe_group: func(module, "hy_moe_group")?,
@@ -247,6 +281,15 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         gather: func(module, "hy_embed_gather")?,
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
+        field_planes: func(module, "hy_field_planes")?,
+        dash_route: func(module, "hy_dash_route")?,
+        dash_close: func(module, "hy_dash_close")?,
+        dash_attend: func(module, "hy_dash_attend")?,
+        kda_gates: func(module, "hy_kda_gates")?,
+        kda_scan4: func(module, "hy_kda_scan4")?,
+        mla_lat: func(module, "hy_mla_lat")?,
+        mla_kv: func(module, "hy_mla_kv")?,
+        mla_cut: func(module, "hy_mla_cut")?,
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
@@ -254,6 +297,17 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         expand_q1: func(module, "hy_expand_q1r")?,
         repack1t: func(module, "hy_repack1t")?,
         expand_q1t: func(module, "hy_expand_q1tr")?,
+        repack2: func(module, "hy_repack2")?,
+        repack4t: func(module, "hy_repack4t")?,
+        mhc_enter: func(module, "hy_mhc_enter")?,
+        mhc_leave: func(module, "hy_mhc_leave")?,
+        mhc_route: func(module, "hy_mhc_route")?,
+        mhc_logits: func(module, "hy_mhc_logits")?,
+        mhc_merge: func(module, "hy_mhc_merge")?,
+        expand_q4g: func(module, "hy_expand_q4gr")?,
+        expand_q2: func(module, "hy_expand_q2r")?,
+        prism_p: func(module, "hy_prism_p")?,
+        prism_h: func(module, "hy_prism_h")?,
         qk: func(module, "hy_qk")?,
         scores: func(module, "hy_scores")?,
         values: func(module, "hy_values")?,
@@ -281,6 +335,21 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
 /// (matrix, output, residual or 0, output row stride, rows to compute)
 type JobSpec<'a> = (&'a DevMat, u64, u64, usize, usize);
 
+/// The codecs with a launch of their own (`hy_mmpk_*`, KD in hyb.cu):
+/// q4tp, int8 tiles, q1, ternary, q2tp (both forms), q4_tiled.
+const KDS: [i32; 6] = [6, 5, 3, 2, 1, 10];
+
+/// The `KDS` index of a tile kind (q2tp's affine 9 rides 1, the two-field
+/// int8 pair 15 rides 5).
+fn kd_of(kind: i32) -> Option<usize> {
+    let k = match kind {
+        9 => 1,
+        15 => 5,
+        k => k,
+    };
+    KDS.iter().position(|&d| d == k)
+}
+
 /// One launch's q4tp matrices for the tensor-core kernel: job tables for one
 /// and two tiles a block, and the split of the groups (`KS` warps) the
 /// arithmetic of every output depends on.
@@ -298,6 +367,22 @@ struct MmaSet {
     /// 863 / 839; 5120-row matrices keep two). The arithmetic does not
     /// depend on it.
     tb1_n1: bool,
+    /// The `KDS` index of the one codec of every job, if they share one.
+    kd: Option<usize>,
+    /// int8 jobs under a column field: the launch's rows go through the
+    /// fields once a call (`hy_field_planes`) instead of once a tile.
+    pre: Option<Prescale>,
+}
+
+/// A launch's rows under its jobs' column fields: each job's region of
+/// `fields` (0: none, the rows as they are) x its columns, side by side in
+/// rows `width` long, up to `NMAX` rows, two planes.
+struct Prescale {
+    p0: Buf,
+    p1: Buf,
+    width: usize,
+    /// (field(s) or 0, fields, columns, region at)
+    ents: Vec<(u64, usize, usize, usize)>,
 }
 
 fn mmaset(list: &[JobSpec]) -> Res<MmaSet> {
@@ -318,16 +403,34 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
 }
 
 fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
-    if list.iter().any(|(m, ..)| !matches!(m.kind, 2 | 3 | 5 | 6) || m.cols % 32 != 0) {
-        return Err("a tensor-core job over a matrix that is not repacked (q4tp, int8, q1 or ternary tiles)".into());
+    if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) || m.cols % 32 != 0) {
+        return Err("a tensor-core job over a matrix that is not repacked (q4tp, q2tp, int8, q1 or ternary tiles)".into());
     }
     let max_rows = list.iter().map(|&(_, _, _, _, r)| r).max().unwrap_or(0);
+    // a q8_2f job (one field; a pair's two) puts the whole launch on
+    // prescaled rows: A5000, one row, 34816 x 5120 under one field 312 us,
+    // none 263, a pair's two 404
+    let fields_of = |m: &DevMat| if matches!(m.kind, 5 | 15) && m.aux0.is_some() { if m.kind == 15 { 2 } else { 1 } } else { 0 };
+    let pre = if list.iter().any(|(m, ..)| fields_of(m) > 0) {
+        let mut at = 0usize;
+        let ents: Vec<_> = list
+            .iter()
+            .map(|(m, ..)| {
+                let e = (m.aux0(), fields_of(m), m.cols, at);
+                at += fields_of(m).max(1) * m.cols;
+                e
+            })
+            .collect();
+        Some(Prescale { p0: Buf::new(NMAX * at * 2 + 64)?, p1: Buf::new(NMAX * at * 2 + 64)?, width: at, ents })
+    } else {
+        None
+    };
     let mut bufs = Vec::with_capacity(2);
     let mut blocks = [0u32; 2];
     for tb in 1..=2usize {
         let mut jobs = Vec::with_capacity(list.len());
         let mut blk = 0u32;
-        for &(m, y, res, ystride, rows) in list {
+        for (i, &(m, y, res, ystride, rows)) in list.iter().enumerate() {
             jobs.push(HyJob {
                 w: m.w.ptr,
                 aux0: m.aux0(),
@@ -335,11 +438,13 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 y,
                 res,
                 rows: rows as i32,
-                // the codec from the matrix (q4tp 6, int8 tiles 5, q1 tiles 3, ternary 2), the epilogue bits from the call
-                kind: (m.kind as i32) | (kind & !0xFF),
+                // the codec from the matrix (q4tp 6, int8 tiles 5 / 15 two
+                // fields, q1 tiles 3, ternary 2, q2tp 1 / 9 affine), the
+                // epilogue bits from the call, 0x800 prescaled rows
+                kind: (m.kind as i32) | (kind & !0xFF) | if pre.is_some() { 0x800 } else { 0 },
                 blk0: blk as i32,
                 ystride: ystride as i32,
-                xoff: 0,
+                xoff: pre.as_ref().map_or(0, |p| p.ents[i].3 as i32),
                 nr: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
@@ -349,11 +454,16 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     }
     let b1 = bufs.pop().unwrap();
     let b0 = bufs.pop().unwrap();
-    // measured on a 3090 (q4tp, 1/8/16 rows): KS 8 wins from ~16k rows
-    // (gate/up 67.5/71.6/124 us against 69.4/76.3/146), KS 16 below it
-    // (down 5120 x 17408: 61.1/66.8/113 against 76.3/79.3/117)
     let total_rows: usize = list.iter().map(|&(_, _, _, _, r)| r).sum();
-    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 16384, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288 })
+    let kd = list
+        .first()
+        .and_then(|(m, ..)| kd_of(m.kind as i32))
+        .filter(|&d| list.iter().all(|(m, ..)| kd_of(m.kind as i32) == Some(d)));
+    // KS 16 under 4096 rows: one codec's decode row on an A5000 (q1 / q4tp,
+    // us at KS 8 against 16): 5120 x 17408 49.8 / 52.7, 78.5 / 86.7;
+    // 10240 x 5120 25.5 / 27.8, 48.9 / 53.2; 2048 x 2048 4.9 / 4.3, 5.9 / 5.4
+    // (the all-codec loop's 16 384 came from a 3090)
+    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 4096, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288, kd, pre })
 }
 
 /// The row planes a tensor-core launch reads: two bf16 parts of each f32
@@ -369,21 +479,41 @@ struct Planes {
 impl MmaSet {
     /// The window's rows of x (as split planes) through every matrix.
     unsafe fn run(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
-        let nt = if n <= 8 { 1 } else { 2 };
-        let tb = if self.tb1 || (n == 1 && self.tb1_n1) { 1 } else { 2 };
+        // one codec's decode row takes one tile a block at any height (A5000,
+        // q4tp 5120 x 17408: 76.7 against 80.5 us; 10240 x 5120 49.3 / 56.3)
+        let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
         let ks = if self.ks16 { 16 } else { 8 };
-        let f = fx.mmp[nt - 1][tb - 1][self.ks16 as usize];
-        let (nj, xs_i, n_i, cols_i) = (self.n, p.stride as i32, n as i32, cols as i32);
-        unsafe {
-            c.launch(
-                f,
-                (self.blocks[tb - 1], 1),
-                (32 * ks) as u32,
-                0,
-                kargs!(self.bufs[tb - 1].ptr, nj, p.p0, p.p1, p.p2, xs_i, n_i, cols_i),
-            )
-        }
+        let f = match self.kd {
+            Some(d) => fx.mmpk[nt_of(n)][tb - 1][self.ks16 as usize][d],
+            None => fx.mmp[nt_of(n)][tb - 1][self.ks16 as usize],
+        };
+        // the rows under the fields first, every job's region
+        let (x0, x1, xs) = match &self.pre {
+            Some(pre) => {
+                if n > NMAX {
+                    return Err(format!("a prescaled tile launch of {n} rows"));
+                }
+                let (ps_i, n_i, os_i) = (p.stride as i32, n as i32, pre.width as i32);
+                for &(cf, fields, cols_j, at) in &pre.ents {
+                    let (f_i, c_i, at_i) = (fields as i32, cols_j as i32, at as i32);
+                    let tot = (n * fields.max(1) * cols_j) as u64;
+                    unsafe {
+                        c.launch(fx.field_planes, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(p.p0, p.p1, ps_i, cf, f_i, c_i, n_i, pre.p0.ptr, pre.p1.ptr, os_i, at_i))?;
+                    }
+                }
+                (pre.p0.ptr, pre.p1.ptr, pre.width)
+            }
+            None => (p.p0, p.p1, p.stride),
+        };
+        let (nj, xs_i, n_i, cols_i) = (self.n, xs as i32, n as i32, cols as i32);
+        unsafe { c.launch(f, (self.blocks[tb - 1], 1), (32 * ks) as u32, 0, kargs!(self.bufs[tb - 1].ptr, nj, x0, x1, x1, xs_i, n_i, cols_i)) }
     }
+}
+
+/// The tile launch of a window of `n` rows (at most 16): n tiles of 4 rows.
+fn nt_of(n: usize) -> usize {
+    debug_assert!(n <= 16, "a tile window of {n} rows");
+    if n <= 4 { 0 } else if n <= 8 { 1 } else { 2 }
 }
 
 /// x [n][xstride] f32 into the planes, the first `cols` columns (for an
@@ -678,34 +808,37 @@ fn q8_parts(dtype: cortiq_core::TensorDtype, bytes: &[u8], rows: usize, cols: us
 }
 
 /// Where an int8-tile matrix's three parts sit in its one allocation:
-/// (row scales at, column field at, bytes in all).
-fn i8_layout(rows: usize, cols: usize) -> (usize, usize, usize) {
+/// (row scales at, column field at, bytes in all); `fields` column fields
+/// (two: a q8_2f gate/up pair's, gate then up).
+fn i8_layout(rows: usize, cols: usize, fields: usize) -> (usize, usize, usize) {
     let rs_at = (rows.div_ceil(16) * (cols / 32) * 512).next_multiple_of(256);
     let cf_at = (rs_at + rows * 4).next_multiple_of(256);
-    (rs_at, cf_at, (cf_at + cols * 4 + 64).next_multiple_of(256))
+    (rs_at, cf_at, (cf_at + fields * cols * 4 + 64).next_multiple_of(256))
 }
 
 /// int8 matrices (one, or a gate/up pair laid out as `hy_repack` lays a
 /// q4tp pair) as int8 tiles of the tensor-core kernel (kind 5,
 /// `hy_repack8`): the bodies go to the card and are tiled there, the f16
 /// row scales (pair rows mapped) and the column field as f32 beside them.
-/// (tiles, row scales, column field — none for q8_row) in one allocation.
+/// A q8_2f pair keeps both fields, gate then up (kind 15: a tile's up rows
+/// read the input under the up field). (tiles, row scales, column fields
+/// — none for q8_row) in one allocation.
 fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)], rows: usize, cols: usize) -> Res<(Buf, Buf, Option<Buf>)> {
     use cortiq_core::quant::f16_to_f32;
     if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
         return Err("repack: an int8 matrix (or a pair) 32 columns wide".into());
     }
     let pair = srcs.len() == 2;
-    if pair && srcs.iter().any(|s| s.2.is_some()) {
-        // one tile's rows share the input, so they share its column scaling
-        return Err("a gate/up pair of q8_2f matrices (two column fields) has no int8 tiles".into());
+    if pair && srcs[0].2.is_some() != srcs[1].2.is_some() {
+        return Err("a gate/up pair of a q8_2f and a q8_row matrix".into());
     }
     let f16 = |b: &[u8], i: usize| f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
     let rs: Vec<f32> = (0..rows)
         .map(|r| if pair { f16(srcs[((r & 15) >= 8) as usize].1, (r >> 4) * 8 + (r & 7)) } else { f16(srcs[0].1, r) })
         .collect();
-    let cf: Option<Vec<f32>> = srcs[0].2.map(|b| (0..cols).map(|k| f16(b, k)).collect());
-    let (rs_at, cf_at, bytes) = i8_layout(rows, cols);
+    let cf: Option<Vec<f32>> = srcs[0].2.map(|_| srcs.iter().flat_map(|s| (0..cols).map(|k| f16(s.2.unwrap(), k))).collect());
+    let fields = cf.as_ref().map_or(1, |v| v.len() / cols);
+    let (rs_at, cf_at, bytes) = i8_layout(rows, cols, fields);
     let all = match arena_view(bytes) {
         Some(v) => v,
         None => Buf::new(bytes)?,
@@ -714,7 +847,7 @@ fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)],
     unsafe { super::htod(rsb.ptr, &rs) }?;
     let cfb = match &cf {
         Some(v) => {
-            let b = all.view(cf_at, cols * 4);
+            let b = all.view(cf_at, v.len() * 4);
             unsafe { super::htod(b.ptr, v) }?;
             Some(b)
         }
@@ -736,8 +869,24 @@ fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)],
 /// Where a q1-tile matrix's scales sit in its one allocation: (scales at,
 /// bytes in all). `ternary`: two-bit codes, 4 bytes a lane instead of 2.
 fn q1_layout_of(rows: usize, cols: usize, ternary: bool) -> (usize, usize) {
+    low_layout(rows, cols, if ternary { 2 } else { 3 })
+}
+
+/// A per-group-scale tile kind's sizes: (bytes a lane a group, bytes a
+/// source group tile) — q1 (3), q1t (2), q4_tiled (10).
+fn low_sizes(kind: u8) -> (usize, usize) {
+    use cortiq_core::quant::{Q1_TILE, Q1T_TILE, Q4_TILE};
+    match kind {
+        2 => (4, Q1T_TILE),
+        10 => (8, Q4_TILE),
+        _ => (2, Q1_TILE),
+    }
+}
+
+/// (scales at, bytes in all) of a per-group-scale tile matrix of `kind`.
+fn low_layout(rows: usize, cols: usize, kind: u8) -> (usize, usize) {
     let tg = rows.div_ceil(16) * (cols / 32);
-    let s_at = (tg * if ternary { 128 } else { 64 }).next_multiple_of(256);
+    let s_at = (tg * 32 * low_sizes(kind).0).next_multiple_of(256);
     (s_at, (s_at + tg * 32 + 64).next_multiple_of(256))
 }
 
@@ -762,21 +911,21 @@ fn q1t_base(bytes: &[u8], rows: usize, cols: usize) -> Option<&[u8]> {
 /// payloads go to the card and are tiled there. (tiles, scales) in one
 /// allocation.
 fn repack1_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize) -> Res<(Buf, Buf)> {
-    repack1x_on_card(c, fx, srcs, src_rows, rows, cols, false)
+    repack1x_on_card(c, fx, srcs, src_rows, rows, cols, 3)
 }
 
-/// `repack1_on_card` for q1 (`ternary` false, kind 3) or q1t tiles (kind 2,
-/// `hy_repack1t`; the payloads without their empty overlay).
-fn repack1x_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize, ternary: bool) -> Res<(Buf, Buf)> {
-    use cortiq_core::quant::{Q1_TILE, Q1T_TILE};
+/// `repack1_on_card` for a per-group-scale tile `kind`: q1 (3), q1t (2,
+/// `hy_repack1t`; the payloads without their empty overlay) or q4_tiled (10,
+/// `hy_repack4t`).
+fn repack1x_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize, kind: u8) -> Res<(Buf, Buf)> {
     if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
         return Err("repack: a q1 matrix (or a pair) 32 columns wide".into());
     }
-    let need = src_rows * (cols / 32) * if ternary { Q1T_TILE } else { Q1_TILE };
+    let need = src_rows * (cols / 32) * low_sizes(kind).1;
     if srcs.iter().any(|b| b.len() < need) {
         return Err("q1 payload shorter than its tiles".into());
     }
-    let (s_at, bytes) = q1_layout_of(rows, cols, ternary);
+    let (s_at, bytes) = low_layout(rows, cols, kind);
     let all = match arena_view(bytes) {
         Some(v) => v,
         None => Buf::new(bytes)?,
@@ -788,13 +937,165 @@ fn repack1x_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows:
     let b_p = b.as_ref().map_or(a.ptr, |x| x.ptr);
     let (pair_i, rows_i, cols_i) = (b.is_some() as i32, rows as i32, cols as i32);
     let threads = (tg * 32) as u64;
-    let f = if ternary { fx.repack1t } else { fx.repack1 };
+    let f = match kind {
+        2 => fx.repack1t,
+        10 => fx.repack4t,
+        _ => fx.repack1,
+    };
     unsafe {
         c.launch(f, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(a.ptr, b_p, pair_i, all.ptr, sv.ptr, rows_i, cols_i))?;
     }
     // the payloads are freed on return
     c.sync()?;
     Ok((all, sv))
+}
+
+/// The bytes `repack2_on_card` takes for a rows x cols q2tp matrix.
+fn q2_bytes(rows: usize, cols: usize) -> usize {
+    let tg = rows.div_ceil(16) * (cols / 32);
+    let cc_at = (tg * 128).next_multiple_of(256);
+    let lad_at = (cc_at + tg * 16).next_multiple_of(256);
+    (lad_at + rows * 8 + 64).next_multiple_of(256)
+}
+
+/// A q2tp matrix (one payload, or a gate/up pair laid out as `hy_repack`
+/// lays a q4tp pair) as q2tp tiles (`hy_repack2`): (tiles, rung codes, row
+/// ladders) as `repack_on_card` gives them for q4tp.
+fn repack2_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: usize, cols: usize) -> Res<(Buf, Buf, Buf)> {
+    use cortiq_core::quant::{f16_to_f32, q2tp_sections};
+    if cols % 32 != 0 || srcs.is_empty() || srcs.len() > 2 {
+        return Err("repack: a q2tp payload (or a pair) 32 columns wide".into());
+    }
+    let pair = srcs.len() == 2;
+    let gpr = cols / 32;
+    let (params_off, codes_off, stride) = q2tp_sections(src_rows, cols);
+    if srcs.iter().any(|b| b.len() < codes_off + src_rows * stride) {
+        return Err("q2tp payload shorter than its planes".into());
+    }
+    let map = |r: usize| -> (usize, usize) { if pair { (((r & 15) >= 8) as usize, (r >> 4) * 8 + (r & 7)) } else { (0, r) } };
+    let mut lad = vec![0f32; rows * 2];
+    for r in 0..rows {
+        let (i, sr) = map(r);
+        let p = &srcs[i][params_off + sr * 4..params_off + sr * 4 + 4];
+        lad[r * 2] = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+        lad[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+    }
+    let up = |b: &[u8]| -> Res<(Buf, Buf)> { Ok((Buf::from_slice(&b[..params_off])?, Buf::from_slice(&b[codes_off..codes_off + src_rows * stride])?)) };
+    let (ca, ka) = up(srcs[0])?;
+    let second = if pair { Some(up(srcs[1])?) } else { None };
+    let (cb_p, kb_p) = second.as_ref().map_or((ca.ptr, ka.ptr), |(x, y)| (x.ptr, y.ptr));
+    let ntile = rows.div_ceil(16);
+    let (t, cc, ld) = mat_planes(ntile * gpr * 128, ntile * gpr * 16, &lad)?;
+    let (stride_i, pair_i, rows_i, cols_i) = (stride as i32, pair as i32, rows as i32, cols as i32);
+    let threads = (ntile * gpr * 32) as u64;
+    unsafe {
+        c.launch(fx.repack2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(ca.ptr, ka.ptr, cb_p, kb_p, stride_i, pair_i, t.ptr, cc.ptr, rows_i, cols_i))?;
+    }
+    c.sync()?;
+    Ok((t, cc, ld))
+}
+
+/// Prism's activation boundary for a stack (`prism::forward`): each input
+/// width's sign vector on the card, the FWHT block, the f16 cast.
+struct PrismPlan {
+    blk: usize,
+    f16: bool,
+    signs: Vec<(usize, Buf)>,
+}
+
+/// A stack's Prism plan: none without a Prism header (and then no Prism
+/// weight); with one, every matrix an input site feeds must be in the
+/// forward basis (the GDN gates a / b in none), the head too, since the
+/// transform is made once at the site for all of them.
+fn prism_plan(model: &CmfModel, layers: &[GraphLayer], lm: Option<(&GraphW, usize)>) -> Res<Option<PrismPlan>> {
+    use crate::gpu::GraphPrismOp as P;
+    let fwd = |w: &GraphW| w.prism == P::Forward;
+    let none = |w: &GraphW| w.prism == P::None;
+    let Some(cfg) = model.header.arch.prism_hadamard.as_ref() else {
+        let mut any = lm.is_some_and(|(w, _)| !none(w));
+        for l in layers {
+            match &l.attn {
+                GraphAttn::Gdn { qkv, z, out, .. } => any |= !none(qkv) || !none(z) || !none(out),
+                GraphAttn::Full { wq, wk, wv, wo, .. } => any |= !none(wq) || !none(wk) || !none(wv) || !none(wo),
+                _ => {}
+            }
+            if let GraphFfn::Dense { gate, up, down, .. } = &l.ffn {
+                any |= !none(gate) || !none(up) || !none(down);
+            }
+        }
+        return if any { Err("a Prism weight without a Prism header".into()) } else { Ok(None) };
+    };
+    let mixed = || -> Res<Option<PrismPlan>> { Err("a Prism stack whose matrices are not all in the forward basis".into()) };
+    for l in layers {
+        match &l.attn {
+            GraphAttn::Gdn { qkv, z, a, b, out, .. } => {
+                if !(fwd(qkv) && fwd(z) && fwd(out) && none(a) && none(b)) {
+                    return mixed();
+                }
+            }
+            GraphAttn::Full { wq, wk, wv, wo, head_gate, .. } => {
+                if !(fwd(wq) && fwd(wk) && fwd(wv) && fwd(wo)) || head_gate.is_some() {
+                    return mixed();
+                }
+            }
+            _ => return Err("a Prism stack with a token mixer the transform is not wired for".into()),
+        }
+        match &l.ffn {
+            GraphFfn::Dense { gate, up, down, .. } if fwd(gate) && fwd(up) && fwd(down) => {}
+            _ => return mixed(),
+        }
+    }
+    if lm.is_some_and(|(w, _)| !fwd(w)) {
+        return mixed();
+    }
+    let blk = cfg.block_size;
+    if blk == 0 || !blk.is_power_of_two() || blk > 4096 || cfg.widths.iter().any(|w| w % blk != 0) {
+        return Err(format!("Prism block {blk} over widths {:?}", cfg.widths));
+    }
+    let mut signs = Vec::with_capacity(cfg.widths.len());
+    let mut off = 0usize;
+    for &w in &cfg.widths {
+        let s = cfg.signs.get(off..off + w).ok_or("Prism signs shorter than their widths")?;
+        signs.push((w, Buf::from_slice(s)?));
+        off += w;
+    }
+    Ok(Some(PrismPlan { blk, f16: cfg.activation_f16, signs }))
+}
+
+impl PrismPlan {
+    fn signs(&self, width: usize) -> Res<u64> {
+        self.signs.iter().find(|(w, _)| *w == width).map(|(_, b)| b.ptr).ok_or_else(|| format!("a Prism input of width {width} without signs"))
+    }
+}
+
+impl HPlan {
+    /// Floats into `tab` (or the prompt path's copy) where table `local`'s
+    /// rows of `n` positions start: the call's table first, then each other
+    /// one at its own width (`plan_tab`'s order).
+    fn tab_off(&self, local: usize, n: usize) -> usize {
+        if local == 0 {
+            return 0;
+        }
+        let before: usize = self.invf_local[..local - 1].iter().map(|(f, _)| f.len()).sum();
+        n * 2 * (self.half + before)
+    }
+}
+
+/// The Prism boundary on `n` rows of planes (`p0`, `p1`, `stride` a row) of
+/// `width` columns, in place; nothing without a Prism plan.
+unsafe fn prism_planes(c: &Ctx, plan: &HPlan, p0: u64, p1: u64, stride: usize, width: usize, n: usize) -> Res<()> {
+    let Some(pr) = &plan.prism else { return Ok(()) };
+    let s = pr.signs(width)?;
+    let (st_i, blk_i, f_i) = (stride as i32, pr.blk as i32, pr.f16 as i32);
+    unsafe { c.launch(plan.fx.prism_p, ((width / pr.blk) as u32, n as u32), 256, pr.blk * 4, kargs!(p0, p1, st_i, s, blk_i, f_i)) }
+}
+
+/// The Prism boundary on `n` f16 rows `src` (`stride` a row) into `dst`.
+unsafe fn prism_rows(c: &Ctx, plan: &HPlan, src: u64, dst: u64, stride: usize, width: usize, n: usize) -> Res<()> {
+    let Some(pr) = &plan.prism else { return Ok(()) };
+    let s = pr.signs(width)?;
+    let (st_i, blk_i, f_i) = (stride as i32, pr.blk as i32, pr.f16 as i32);
+    unsafe { c.launch(plan.fx.prism_h, ((width / pr.blk) as u32, n as u32), 256, pr.blk * 4, kargs!(src, dst, st_i, s, blk_i, f_i)) }
 }
 
 /// Plan-build time spent repacking and uploading weights (ns).
@@ -823,12 +1124,16 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     let q8 = matches!(dtype, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
     let q1 = dtype == Some(TensorDtype::Q1);
     let q1t = dtype == Some(TensorDtype::Q1T);
-    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t {
+    let q2 = dtype == Some(TensorDtype::Q2TiledP);
+    let q4g = dtype == Some(TensorDtype::Q4Tiled);
+    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t && !q2 && !q4g {
         let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
         return Err(format!("weight codec {dtype:?} has no hybrid kernel ({name})"));
     }
-    if gw.prism != crate::gpu::GraphPrismOp::None || gw.affine {
-        return Err("Prism / affine weight".into());
+    // a Prism matrix's input is transformed at its site (`prism_plan` checks
+    // the stack); the affine correction is a q2tp codec's
+    if gw.prism == crate::gpu::GraphPrismOp::InverseEmbedding || (gw.affine && dtype != Some(TensorDtype::Q2TiledP)) {
+        return Err("an inverse-basis or affine weight outside a q2tp matrix".into());
     }
     let key = (model.uid(), gw.idx);
     if let Some(m) = st.hyb.mats.get(&key) {
@@ -858,9 +1163,15 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     } else if q1 {
         let (w, s) = repack1_on_card(c, &fx, &[bytes], rows, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if q4g {
+        let (w, s) = repack1x_on_card(c, &fx, &[bytes], rows, rows, cols, 10)?;
+        DevMat { kind: 10, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if q2 {
+        let (w, cc, ld) = repack2_on_card(c, &fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: bytes.len() as u64 }
     } else if q1t {
         let base = q1t_base(bytes, rows, cols).ok_or_else(|| format!("{}: a q1t matrix with outlier rows", entry.name))?;
-        let (w, s) = repack1x_on_card(c, &fx, &[base], rows, rows, cols, true)?;
+        let (w, s) = repack1x_on_card(c, &fx, &[base], rows, rows, cols, 2)?;
         DevMat { kind: 2, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else {
         let (w, aux0, aux1) = repack_on_card(c, &fx, &[bytes], rows, rows, cols)?;
@@ -886,7 +1197,9 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let both8 = q8(dg) && q8(du);
     let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
     let both1t = dg == Some(TensorDtype::Q1T) && du == Some(TensorDtype::Q1T);
-    if !(both8 || both1 || both1t || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
+    let both2 = dg == Some(TensorDtype::Q2TiledP) && du == Some(TensorDtype::Q2TiledP) && gw.affine == uw.affine;
+    let both4g = dg == Some(TensorDtype::Q4Tiled) && du == Some(TensorDtype::Q4Tiled);
+    if !(both8 || both1 || both1t || both2 || both4g || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
         return Err(format!("a gate/up pair of one codec (q4tp, int8 or q1) with rows a multiple of 8, not {dg:?} / {du:?}"));
     }
     let key = (model.uid(), gw.idx, uw.idx);
@@ -911,16 +1224,24 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
     let m = if both8 {
         let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
-        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+        // two column fields: the up rows' own (kind 15)
+        let kind = if cf.is_some() { 15 } else { 5 };
+        DevMat { kind, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
     } else if both1 {
         let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if both4g {
+        let (w, s) = repack1x_on_card(c, &fx, &[gb, ub], inter, rows, cols, 10)?;
+        DevMat { kind: 10, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if both2 {
+        let (w, cc, ld) = repack2_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: (gb.len() + ub.len()) as u64 }
     } else if both1t {
         let (g0, u0) = (q1t_base(gb, inter, cols), q1t_base(ub, inter, cols));
         let (Some(g0), Some(u0)) = (g0, u0) else {
             return Err(format!("{} / {}: a q1t pair with outlier rows", ge.name, ue.name));
         };
-        let (w, s) = repack1x_on_card(c, &fx, &[g0, u0], inter, rows, cols, true)?;
+        let (w, s) = repack1x_on_card(c, &fx, &[g0, u0], inter, rows, cols, 2)?;
         DevMat { kind: 2, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else {
         let (w, aux0, aux1) = repack_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
@@ -963,7 +1284,7 @@ struct GdnL {
 /// `hy_qk`'s flag word (gemma, bit 1 the late norm) and its bias pointers.
 fn qk_flags(a: &AttnL, gemma_i: i32) -> (i32, (u64, u64, u64)) {
     let b = a.bias.as_ref().map_or((0, 0, 0), |(q, k, v)| (q.ptr, k.ptr, v.ptr));
-    (gemma_i | ((a.late as i32) << 1), b)
+    (gemma_i | ((a.late as i32) << 1) | ((a.v_norm as i32) << 2), b)
 }
 
 struct AttnL {
@@ -976,6 +1297,8 @@ struct AttnL {
     gated: bool,
     /// q/k norm after the rotation (HunYuan)
     late: bool,
+    /// Gemma-4's scale-less V norm before the mirror
+    v_norm: bool,
     /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
     bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
     /// A head-wise output gate: its matrix (the dense arm's, any codec) and a
@@ -983,16 +1306,143 @@ struct AttnL {
     hg: Option<(Arc<DevMat>, Vec<Buf>, u32)>,
     /// A sliding window (positions a query sees, its own included).
     window: Option<usize>,
+    /// Learned per-Q-head sink logits (in the softmax, no value row).
+    sink: Option<Arc<Buf>>,
     /// The rotation table of the layer in `tab`: 0 the call's, k the k-th other.
     local: usize,
+    /// The layer's rotary pairs (its table's width).
+    half: usize,
+    /// The layer's KV heads and head width (the call's, or Gemma-4's global
+    /// layers' own), and the attention kernels compiled for them.
+    nkv: usize,
+    hd: usize,
+    fx: Arc<HFuncs>,
     ms_in: MmaSet,
     ms_out: MmaSet,
+    /// Unlimited-OCR's DASH router (the attend over its read set).
+    dash: Option<DashL>,
+    /// MLA's latent projections (`k` holds kv_a, `v` kv_b).
+    mla: Option<MlaL>,
+}
+
+/// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
+/// the block summaries' head, and its constants.
+struct DashL {
+    w: Arc<Buf>,
+    qn: Arc<Buf>,
+    kn: Arc<Buf>,
+    hc: Arc<Buf>,
+    k: usize,
+    block: usize,
+    local_blocks: usize,
+    idx_scale: f32,
+    floor: f32,
+    sigma: f32,
+}
+
+/// Rows a DASH call takes (`gpu::DASH_CHUNK_MAX`), blocks a sequence holds.
+const DASH_ROWS: usize = crate::gpu::DASH_CHUNK_MAX;
+const DASH_BLOCKS: usize = 4096;
+
+/// A plan's DASH call buffers (the host's candidate lists, row offsets and
+/// rotation table of the call's rows, and its record: first position, block
+/// count), and the router's scratch; shared by the layers.
+struct DashBufs {
+    cands: Buf,
+    coff: Buf,
+    tab: Buf,
+    rec: Buf,
+    sc: Buf,
+    sel: Buf,
+    bias: Buf,
+}
+
+/// Can the DASH kernels hold this router (index width 128, a head of 128)?
+fn dash_admits(d: &crate::gpu::GraphDash<'_>, hidden: usize, hd: usize, rd: usize) -> bool {
+    d.q_norm.len() == 128
+        && d.k_norm.len() == 128
+        && d.head_cls.len() == 128
+        && d.qk_proj.len() == 256 * hidden
+        && hidden % 4 == 0
+        && hd == 128
+        && rd == hd
+        && d.block > 0
+        && d.block <= 64
+        && d.k <= 16
+        && d.block * d.k + d.block * d.local_blocks <= 512
+}
+
+/// Kimi Delta Attention (`hy_kda_*`): q / k / v and the output on the tensor
+/// cores, the low-rank decay and gate and β as f32 products, the GDN front's
+/// conv and norms over the q | k | v channels, the delta rule with a decay
+/// per key channel, the sigmoid-gated output norm. Its state is a GDN
+/// layer's (`GdnState`: the conv ring of the channels, S).
+struct KdaL {
+    q: Arc<DevMat>,
+    k: Arc<DevMat>,
+    v: Arc<DevMat>,
+    out: Arc<DevMat>,
+    /// `[q | k | v channels][kk]`.
+    taps: Arc<Buf>,
+    fa: Arc<DevMat>,
+    fb: Arc<DevMat>,
+    b: Arc<DevMat>,
+    ga: Arc<DevMat>,
+    gb: Option<Arc<DevMat>>,
+    a_log: Arc<Buf>,
+    a_len: usize,
+    dt_bias: Arc<Buf>,
+    o_norm: Arc<Buf>,
+    lower: Option<f32>,
+    nh: usize,
+    dk: usize,
+    dv: usize,
+    kk: usize,
+    cdim: usize,
+    ms_in: MmaSet,
+    ms_out: MmaSet,
+}
+
+/// MLA's projections beside the attention (`AttnL::mla`): the latent and
+/// rope key (`ms_in`'s second job), the latent's norm, kv_b over it, and the
+/// widths; the attention runs on heads `rope + nope` wide, V padded to them.
+struct MlaL {
+    kv_b: Arc<DevMat>,
+    kv_a_norm: Arc<Buf>,
+    ms_kvb: MmaSet,
+    rope: usize,
+    nope: usize,
+    vd: usize,
+    lora: usize,
+    scale: f32,
+}
+
+/// A plan's KDA rows (NMAX of them): the low-rank stages, f, the raw β, the
+/// gate, the decays and β.
+struct KdaBufs {
+    fa: Buf,
+    f: Buf,
+    braw: Buf,
+    ga: Buf,
+    gate: Buf,
+    gd: Buf,
+    beta: Buf,
+}
+
+/// A plan's MLA rows: the latent and rope key, kv_b's output, the latent's
+/// planes and the output heads cut to v wide (planes).
+struct MlaBufs {
+    kva: Buf,
+    kvb: Buf,
+    lp: [Buf; 2],
+    op: [Buf; 2],
 }
 
 enum Mix {
     Gdn(GdnL),
     Attn(AttnL),
     Conv(ConvL),
+    Kda(KdaL),
 }
 
 /// LFM2's gated short convolution: the fused B | C | x projection into the
@@ -1007,6 +1457,31 @@ struct ConvL {
     ms_out: MmaSet,
 }
 
+/// A layer's mHC routers (`sensenova::Mhc`): the attention's and the FFN's
+/// weights [out][ns·hidden] and biases, whether the layer enters / leaves the
+/// streams.
+struct MhcL {
+    aw: Arc<Buf>,
+    ab: Arc<Buf>,
+    fw: Arc<Buf>,
+    fb: Arc<Buf>,
+    out: usize,
+    enter: bool,
+    leave: bool,
+}
+
+/// The stack's mHC streams: their count, Sinkhorn iterations, branch scale,
+/// and the call's rows of streams and merge coefficients.
+struct MhcPlan {
+    ns: usize,
+    iters: usize,
+    pre_scale: f32,
+    r: Buf,
+    coef: Buf,
+    /// The router's logits [row][24] (`hy_mhc_logits`).
+    lg: Buf,
+}
+
 struct HLayer {
     mix: Mix,
     /// gate and up as one pair (`hmat_pair`); a routed FFN's shared expert
@@ -1015,10 +1490,14 @@ struct HLayer {
     in_norm: Arc<Buf>,
     post_norm: Arc<Buf>,
     inter: usize,
+    /// GeGLU (tanh GELU, the Gemma family) instead of SwiGLU
+    gelu: bool,
     ms_gu: MmaSet,
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
     moe: Option<MoeL>,
+    /// SenseNova-Loop's mHC routers around both sub-layers.
+    mhc: Option<MhcL>,
     /// Gemma's sandwich norms (the mixer's and the FFN's output normed before
     /// their residual adds: the products then write `yo`) and layer scalar.
     attn_out: Option<Arc<Buf>>,
@@ -1059,6 +1538,8 @@ struct MoeL {
     gated: bool,
     bpj_gu: u32,
     bpj_dn: u32,
+    /// The `KDS` index of the experts' one codec (gate/up, down), if they share one.
+    kd: (Option<usize>, Option<usize>),
     /// Whether a shared expert rides beside the routed ones (the layer's pair).
     shared: bool,
     _mats: Vec<Arc<DevMat>>,
@@ -1093,6 +1574,21 @@ pub(super) struct HPlan {
     /// The other rotations (other layers' frequencies and YaRN amplitude; their
     /// rows follow the call's in `tab`, a table after the other).
     invf_local: Vec<(Vec<f32>, f32)>,
+    /// Prism's activation boundary at every input site (a Prism file).
+    prism: Option<PrismPlan>,
+    /// The widest head of the stack (a layer of its own geometry).
+    hdmax: usize,
+    /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
+    mhc: Option<MhcPlan>,
+    dash: Option<DashBufs>,
+    kda: Option<KdaBufs>,
+    mla: Option<MlaBufs>,
+    /// A Looped Transformer: the layers after which the final norm is applied
+    /// to the stream (`loop_norm_at`), and its weights.
+    loop_norm: Vec<usize>,
+    loop_w: Option<Arc<Buf>>,
+    /// Some layer's head geometry is its own (its kernels a module of their own).
+    own_geom: bool,
     half: usize,
     nh: usize,
     nkv: usize,
@@ -1183,6 +1679,9 @@ pub(super) struct HState {
     graphs: HashMap<(u64, u64, usize, usize, bool, bool, u64), GraphRec>,
     plans: HashMap<(u64, usize, usize, bool), Arc<HPlan>>,
     gdn: HashMap<(u64, usize), GdnState>,
+    /// DASH layers' open blocks (three, the router's keys) and block
+    /// summaries, by sequence and layer.
+    dash: HashMap<(u64, usize), (Buf, Buf)>,
     /// The MTP draft chain's table and norms (`mtp_chain`).
     chain: Option<ChainRes>,
     /// Plan builds' weight arenas (the matrices in them are views).
@@ -1206,13 +1705,26 @@ struct ChainRes {
 /// with Q/K norms or the element-wise output gate.) An empty stack with a
 /// head goes here when the dense arm's attention kernels cannot take the
 /// geometry.
+/// A Clover block preview is active over this stack (its GDN layers' preview
+/// operator, which the arm has no kernels for; a cached plan is causal).
+fn previewing(layers: &[GraphLayer]) -> bool {
+    crate::gpu::block_preview().is_some() && layers.iter().any(|l| matches!(&l.attn, GraphAttn::Gdn { preview: Some(_), .. }))
+}
+
+/// Every stack tries the hybrid arm first (the dense arm's plain attention
+/// stacks included); `CMF_CUDA_HYB_ALL=0` keeps those on the dense arm.
+pub(super) fn all_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_HYB_ALL").as_deref() != Ok("0"))
+}
+
 pub(super) fn wants(layers: &[GraphLayer], nh: usize, nkv: usize, hd: usize) -> bool {
     if layers.is_empty() {
         let hpk = if nkv > 0 { nh / nkv } else { 0 };
         return 8 * hpk * hd * 4 > 44_000;
     }
     layers.iter().any(|l| match &l.attn {
-        GraphAttn::Gdn { .. } => true,
+        GraphAttn::Gdn { .. } | GraphAttn::Kda { .. } | GraphAttn::Mla { .. } => true,
         GraphAttn::Full { q_norm, k_norm, output_gate, .. } => *output_gate || q_norm.is_some() || k_norm.is_some(),
         _ => false,
     })
@@ -1268,6 +1780,14 @@ fn hsig(
                 s.push(2);
                 if let Some(g) = geom {
                     s.extend([8, g.window.unwrap_or(0)]);
+                    // a DASH router: its weights (by address) and constants; the
+                    // call's candidates and angles go up a call at a time
+                    if let Some(d) = &g.dash {
+                        s.extend([9, d.block, d.k, d.local_blocks, d.idx_scale.to_bits() as usize, d.floor.to_bits() as usize, d.sigma.to_bits() as usize]);
+                        for w in [d.qk_proj, d.q_norm, d.k_norm, d.head_cls] {
+                            f(&mut s, w);
+                        }
+                    }
                 }
                 if let Some(g) = head_gate {
                     s.push(7);
@@ -1290,6 +1810,29 @@ fn hsig(
                 w(&mut s, out);
                 f(&mut s, taps);
                 s.push(*kernel);
+            }
+            GraphAttn::Kda { q, k, v, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b, g_a, g_b, o_norm, out, nh, dk, dv, kk, lower_bound, .. } => {
+                s.extend([10, *nh, *dk, *dv, *kk, lower_bound.map_or(0, |v| v.to_bits() as usize + 1)]);
+                for g in [q, k, v, f_a, f_b, b, g_a, out] {
+                    w(&mut s, g);
+                }
+                if let Some(g) = g_b {
+                    w(&mut s, g);
+                }
+                for d in [*conv_q, *conv_k, *conv_v, *dt_bias, *a_log, *o_norm] {
+                    f(&mut s, d);
+                }
+            }
+            GraphAttn::Mla { q_a, q_a_norm, q, kv_a, kv_a_norm, kv_b, o, nh, rope, nope, v_dim, lora, scale, no_rope, .. } => {
+                s.extend([11, *nh, *rope, *nope, *v_dim, *lora, scale.to_bits() as usize, *no_rope as usize]);
+                for g in [q, kv_a, kv_b, o] {
+                    w(&mut s, g);
+                }
+                if let Some(g) = q_a {
+                    w(&mut s, g);
+                }
+                f(&mut s, q_a_norm.unwrap_or(&[]));
+                f(&mut s, kv_a_norm);
             }
             _ => s.push(3),
         }
@@ -1338,10 +1881,12 @@ fn build(
     scale: f32,
     invf: &[f32],
     sig: Vec<usize>,
+    loop_norm: &[usize],
 ) -> Res<HPlan> {
     if nkv == 0 || nh % nkv != 0 || (layers.is_empty() && lm.is_none()) {
         return Err("empty stack or head geometry".into());
     }
+    let prism = prism_plan(model, layers, lm)?;
     if hidden % 32 != 0 {
         return Err("hidden width not a multiple of 32".into());
     }
@@ -1366,12 +1911,33 @@ fn build(
     let mut note = |d: &[f32]| consts.push((d.as_ptr() as usize, d.len(), crate::gpu::fp_f32(d)));
     // geometry first: the row buffers the job tables point into
     let mut qrow = nh * hd;
+    // the widest attention a layer of its own geometry (Gemma-4's global
+    // layers: one KV head of 512) takes: K/V rows, head width
+    let (mut kvmax, mut hdmax) = (nkv * hd, hd);
     let (mut cdmax, mut vdmax, mut nvmax, mut intermax) = (0usize, 0usize, 0usize, 0usize);
     let (mut moe_e, mut moe_k) = (0usize, 0usize);
     let mut invf_local: Vec<(Vec<f32>, f32)> = Vec::new();
+    // SenseNova-Loop's mHC: the streams' count (from the router's shape), its
+    // Sinkhorn iterations and the branch scale, one for the stack
+    let mut mhc_geo: Option<(usize, usize, f32)> = None;
     for (li, l) in layers.iter().enumerate() {
-        if l.mhc.is_some() {
-            return Err(format!("layer {li}: mHC streams"));
+        if let Some(m) = &l.mhc {
+            let out = m.attn_b.len();
+            let ns = if out > 0 { m.attn_w.len() / (out * hidden).max(1) } else { 0 };
+            let ok = (1..=4).contains(&ns)
+                && (out == 2 * ns + ns * ns || out == 2 * ns)
+                && out <= 24
+                && m.attn_w.len() == out * ns * hidden
+                && m.ffn_b.len() == out
+                && m.ffn_w.len() == out * ns * hidden
+                && !matches!(l.ffn, GraphFfn::Moe { .. })
+                && l.attn_out_norm.is_none()
+                && l.ffn_out_norm.is_none();
+            let geo = (ns, m.iters, m.pre_scale);
+            if !ok || mhc_geo.is_some_and(|g| g != geo) {
+                return Err(format!("layer {li}: mHC streams of a shape the kernels do not take"));
+            }
+            mhc_geo = Some(geo);
         }
         let sandwich = l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some();
         if sandwich && !matches!(l.ffn, GraphFfn::Dense { .. }) {
@@ -1385,7 +1951,9 @@ fn build(
         }
         match &l.attn {
             GraphAttn::Gdn { nv, nk, dk, dv, kk, preview, .. } => {
-                if preview.is_some() {
+                // Clover carries its preview weights on every call; only an
+                // active block preview (`enter_block_preview`) reads them
+                if preview.is_some() && crate::gpu::block_preview().is_some() {
                     return Err(format!("layer {li}: block preview"));
                 }
                 if *dk != 128 || *dv != *dk || *nk == 0 || nv % nk != 0 || *kk < 1 || *kk > 9 {
@@ -1395,25 +1963,59 @@ fn build(
                 vdmax = vdmax.max(nv * dv);
                 nvmax = nvmax.max(*nv);
             }
+            GraphAttn::Kda { nh: knh, dk, dv, kk, a_log, dt_bias, o_norm, conv_q, conv_k, conv_v, f_a, f_b, b, g_a, g_b, .. } => {
+                let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
+                if dk != 128 || dv != dk || knh == 0 || kk < 1 || kk > 9 {
+                    return Err(format!("layer {li}: KDA geometry nh {knh} dk {dk} dv {dv} kk {kk}"));
+                }
+                let kd = knh * dk;
+                if conv_q.len() != kd * kk
+                    || conv_k.len() != kd * kk
+                    || conv_v.len() != knh * dv * kk
+                    || dt_bias.len() != kd
+                    || o_norm.len() != dv
+                    || !(a_log.len() == knh || a_log.len() == dk || a_log.len() == kd)
+                {
+                    return Err(format!("layer {li}: KDA constants of unexpected lengths"));
+                }
+                if [f_a, f_b, b, g_a].iter().any(|g| g.kind != 4) || g_b.as_ref().is_some_and(|g| g.kind != 4) {
+                    return Err(format!("layer {li}: KDA low-rank projections that are not f32"));
+                }
+                cdmax = cdmax.max(2 * kd + knh * dv);
+                vdmax = vdmax.max(knh * dv);
+            }
+            GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, no_rope, q_a, .. } => {
+                let hdm = rope + nope;
+                if *mnh != nh || hdm % 32 != 0 || hdm > 512 || *v_dim > hdm || v_dim % 32 != 0 || lora % 32 != 0 || !*no_rope || q_a.is_some() {
+                    return Err(format!("layer {li}: MLA geometry rope {rope} nope {nope} v {v_dim} lora {lora} (rotary {})", !no_rope));
+                }
+                qrow = qrow.max(nh * hdm);
+                kvmax = kvmax.max(nh * hdm);
+                hdmax = hdmax.max(hdm);
+            }
             GraphAttn::Full { bias, output_gate, geom, head_gate, .. } => {
                 // a geometry equal to the call-wide one (a stack where only some
                 // layers differ) is the call-wide one, a sliding window aside
+                // a head geometry of the layer's own: its kernels a module of their own
+                let own = |g: &crate::gpu::GraphAttnGeom| g.hd % 32 == 0 && g.hd <= 512 && g.nkv > 0 && nh % g.nkv == 0 && nh / g.nkv <= 16;
                 let same = geom.as_ref().is_none_or(|g| {
-                    g.nkv == nkv
-                        && g.hd == hd
-                        && g.dv == hd
-                        && g.rd == rd
+                    ((g.nkv == nkv && g.hd == hd) || own(g))
+                        && g.dv == g.hd
+                        && g.rd % 2 == 0
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
-                        && g.sink.is_none()
-                        && !g.v_norm
-                        && g.dash.is_none()
+                        && g.sink.is_none_or(|s| s.len() == nh)
+                        && g.dash.as_ref().is_none_or(|d| dash_admits(d, hidden, g.hd, g.rd) && g.window.is_none() && g.sink.is_none())
                         && g.vres.is_none()
-                        && g.invf.len() >= rd / 2
+                        && g.invf.len() >= g.rd / 2
                         && invf.len() >= rd / 2
-                        && ((g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
+                        // a DASH layer rotates by its rows' own angles (the call's table)
+                        && (g.dash.is_some() || (g.rd == rd && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0) || {
                             // up to two more tables besides the call's: other layers'
-                            // bases (local ones), a YaRN amplitude baked into the rows
-                            let key = (g.invf[..rd / 2].to_vec(), g.rope_scale);
+                            // bases (local ones), a YaRN amplitude baked into the rows,
+                            // a rotary width of the layer's own (flint: none on its
+                            // global layers, 128 on the sliding ones), each table as
+                            // wide as its layer's rotation
+                            let key = (g.invf[..g.rd / 2].to_vec(), g.rope_scale);
                             invf_local.contains(&key) || {
                                 invf_local.push(key);
                                 invf_local.len() <= 2
@@ -1439,7 +2041,10 @@ fn build(
                 if bias.is_some() && *output_gate {
                     return Err(format!("layer {li}: projection biases beside a gated query"));
                 }
-                qrow = qrow.max(nh * hd * (1 + *output_gate as usize));
+                let (lnkv, lhd) = geom.as_ref().map_or((nkv, hd), |g| (g.nkv, g.hd));
+                qrow = qrow.max(nh * lhd * (1 + *output_gate as usize));
+                kvmax = kvmax.max(lnkv * lhd);
+                hdmax = hdmax.max(lhd);
             }
             GraphAttn::ShortConv { kernel, taps, cpu_state, .. } => {
                 if *kernel == 0 || *kernel > 9 || taps.len() != hidden * kernel || !(cpu_state.is_empty() || cpu_state.len() == (kernel - 1) * hidden) {
@@ -1451,14 +2056,17 @@ fn build(
         }
         match &l.ffn {
             GraphFfn::Dense { gate, act, limit, hot, .. } => {
-                if *act != GraphAct::Silu || *limit != 0.0 || hot.is_some() {
-                    return Err(format!("layer {li}: an FFN other than plain SwiGLU"));
+                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh) || *limit != 0.0 || hot.is_some() {
+                    return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
             }
             GraphFfn::Moe { act, q4tp, gu_q2, q82, n_exp, top_k, inter, experts, has_shared, detached_shared, router, .. } => {
-                if *act != GraphAct::Silu || !*q4tp || *gu_q2 || *q82 {
-                    return Err(format!("layer {li}: a routed FFN other than q4tp SwiGLU"));
+                // q2tp gate/up beside q4tp down (`gu_q2`) load by their file codec;
+                // q8_2f experts (two column fields a pair) have no tiles
+                let _ = (gu_q2, q4tp);
+                if *act != GraphAct::Silu || *q82 {
+                    return Err(format!("layer {li}: a routed FFN other than q4tp / q2tp SwiGLU"));
                 }
                 if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
                     return Err(format!("layer {li}: a routed FFN of {n_exp} experts, top {top_k}"));
@@ -1483,24 +2091,54 @@ fn build(
     let h = f4(NMAX * hidden)?;
     let xn = f4(NMAX * hidden)?;
     let q = f4(NMAX * qrow)?;
-    let k = f4(NMAX * nkv * hd)?;
-    let v = f4(NMAX * nkv * hd)?;
-    let qg = f4(NMAX * nh * hd)?;
-    let gate = f4(NMAX * nh * hd)?;
-    let ao = f4(NMAX * nh * hd)?;
+    let k = f4(NMAX * kvmax)?;
+    let v = f4(NMAX * kvmax)?;
+    let qg = f4(NMAX * nh * hdmax)?;
+    let gate = f4(NMAX * nh * hdmax)?;
+    let ao = f4(NMAX * nh * hdmax)?;
     let qkv = f4(NMAX * cdmax)?;
     let z = f4(NMAX * vdmax)?;
     let o = f4(NMAX * vdmax)?;
     let of = f4(NMAX * vdmax)?;
     // the call's rotation rows, then (a stack with other rotations) theirs
-    let tab = f4(NMAX * half * 2 * 3)?;
+    // the call's rotation rows, then each other table's at its own width
+    let tab = f4((NMAX * 2 * (half + invf_local.iter().map(|(f, _)| f.len()).sum::<usize>())).max(1))?;
     let ids = f4(NMAX)?;
-    let pstride = hidden.max(intermax).max(vdmax).max(nh * hd).next_multiple_of(32);
+    let pstride = hidden.max(intermax).max(vdmax).max(nh * hdmax).next_multiple_of(32);
     // the FFN middle's planes (the gate/up pair writes them, down reads them)
     let qq = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     // a sandwich-normed product's rows before their norm; a head gate's logits
     let yo = f4(NMAX * hidden)?;
     let hgv = f4(NMAX * nh)?;
+    // Kimi-Linear: the KDA layers' rows (their low-rank widths at most 512)
+    // and the MLA layers' (the latent and rope key, kv_b's heads, planes)
+    let kda_bufs = match layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Kda { nh, dk, dv, .. } => Some((*nh, *dk, *dv)),
+        _ => None,
+    }) {
+        Some((knh, dk, dv)) => Some(KdaBufs {
+            fa: f4(NMAX * 512)?,
+            f: f4(NMAX * knh * dk)?,
+            braw: f4(NMAX * knh)?,
+            ga: f4(NMAX * 512.max(knh * dv))?,
+            gate: f4(NMAX * knh * dv)?,
+            gd: f4(NMAX * knh * dk)?,
+            beta: f4(NMAX * knh)?,
+        }),
+        None => None,
+    };
+    let mla_bufs = match layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Mla { nh, rope, nope, v_dim, lora, .. } => Some((*nh, *rope, *nope, *v_dim, *lora)),
+        _ => None,
+    }) {
+        Some((mnh, rope, nope, vd, lora)) => Some(MlaBufs {
+            kva: f4(NMAX * (lora + rope))?,
+            kvb: f4(NMAX * mnh * (nope + vd))?,
+            lp: [Buf::new(NMAX * lora * 2 + 64)?, Buf::new(NMAX * lora * 2 + 64)?],
+            op: [Buf::new(NMAX * mnh * vd * 2 + 64)?, Buf::new(NMAX * mnh * vd * 2 + 64)?],
+        }),
+        None => None,
+    };
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
     let moe_bufs = if moe_e > 0 {
         let smax = (NMAX * moe_k).min(moe_e);
@@ -1530,6 +2168,7 @@ fn build(
             && matches!(model.tensors.get(w.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T))
     };
     let tern = |idx: usize| model.tensors.get(idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q1T);
+    let is2 = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype) == Some(cortiq_core::TensorDtype::Q2TiledP);
     let is8 = |w: &GraphW| {
         w.prism == crate::gpu::GraphPrismOp::None
             && !w.affine
@@ -1538,7 +2177,7 @@ fn build(
     let mut need = 0usize;
     for l in layers {
         let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
-            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) => {
+            GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) || (is2(gw) && is2(uw) && is2(dw)) => {
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
             }
             GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
@@ -1558,6 +2197,9 @@ fn build(
         let sized = |idx: usize, rows: usize, cols: usize| match model.tensors.get(idx).map(|e| e.dtype) {
             Some(cortiq_core::TensorDtype::Q1) => q1_layout(rows, cols).1,
             Some(cortiq_core::TensorDtype::Q1T) => q1_layout_of(rows, cols, true).1,
+            Some(cortiq_core::TensorDtype::Q2TiledP) => q2_bytes(rows, cols),
+            Some(cortiq_core::TensorDtype::Q4Tiled) => low_layout(rows, cols, 10).1,
+            Some(cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row) => i8_layout(rows, cols, 2).2,
             _ => planes_bytes(rows, cols),
         };
         for (g, u, d, inter) in ffn {
@@ -1573,9 +2215,11 @@ fn build(
                 return;
             }
             if is8(w) {
-                need += i8_layout(rows, cols).2;
+                need += i8_layout(rows, cols, 1).2;
             } else if is1(w) {
                 need += q1_layout_of(rows, cols, tern(w.idx)).1;
+            } else if is2(w) {
+                need += q2_bytes(rows, cols);
             } else if q6(w) {
                 need += planes_bytes(rows, cols);
             }
@@ -1604,6 +2248,8 @@ fn build(
             need += planes_bytes(rows, hidden);
         } else if is1(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
             need += q1_layout_of(rows_of(model, gw).unwrap_or(rows), hidden, tern(gw.idx)).1;
+        } else if is2(gw) && !st.hyb.mats.contains_key(&(uid, gw.idx)) {
+            need += q2_bytes(rows_of(model, gw).unwrap_or(rows), hidden);
         }
     }
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
@@ -1681,6 +2327,11 @@ fn build(
                     None => None,
                 };
                 let flags = (*norm_topk as i32) | ((*sigmoid as i32) << 1) | ((biasb.is_some() as i32) << 2) | (((*sigmoid && *sigmoid_denom_eps < 1e-10) as i32) << 5);
+                let one_kd = |t: &[HyJob]| {
+                    let d = t.first().and_then(|j| kd_of(j.kind & 0xFF))?;
+                    t.iter().all(|j| kd_of(j.kind & 0xFF) == Some(d)).then_some(d)
+                };
+                let kd = (one_kd(&gu_t), one_kd(&dn_t));
                 let ml = MoeL {
                     router: routerm,
                     sgw,
@@ -1695,6 +2346,7 @@ fn build(
                     gated,
                     bpj_gu: (2 * inter).div_ceil(16) as u32,
                     bpj_dn: hidden.div_ceil(16) as u32,
+                    kd,
                     shared,
                     _mats: mats,
                 };
@@ -1736,9 +2388,10 @@ fn build(
                 let a_h = half_of(&am, st)?;
                 let b_h = half_of(&bm, st)?;
                 let ms_in = mmaset(&[(&qm, qkv.ptr, 0, cdmax, cdim), (&zm, z.ptr, 0, vdmax, nv * dv)])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
                 Mix::Gdn(GdnL {
                     qkv: qm,
@@ -1763,13 +2416,39 @@ fn build(
                 })
             }
             GraphAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, late_qk_norm, bias, head_gate, geom, .. } => {
+                // the layer's head geometry and its kernels (the call's module for the call's)
+                let (lnkv, lhd) = geom.as_ref().map_or((nkv, hd), |g| (g.nkv, g.hd));
+                let lhpk = nh / lnkv;
+                let lfx = if (lnkv, lhd) == (nkv, hd) {
+                    fx.clone()
+                } else {
+                    match st.hyb.funcs.get(&(lhpk, lhd)) {
+                        Some(f) => f.clone(),
+                        None => {
+                            let f = Arc::new(load_funcs(c, lhpk, lhd)?);
+                            st.hyb.funcs.insert((lhpk, lhd), f.clone());
+                            f
+                        }
+                    }
+                };
+                let (nkv, hd) = (lnkv, lhd);
                 let qr = nh * hd * (1 + *output_gate as usize);
                 let window = geom.as_ref().and_then(|g| g.window);
+                let sink = match geom.as_ref().and_then(|g| g.sink) {
+                    Some(s) => {
+                        note(s);
+                        Some(st.f32_buf(s)?)
+                    }
+                    None => None,
+                };
                 let local = geom
                     .as_ref()
-                    .filter(|g| invf.len() >= rd / 2 && g.invf.len() >= rd / 2 && (g.invf[..rd / 2] != invf[..rd / 2] || g.rope_scale != 1.0))
-                    .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..rd / 2] && *s == g.rope_scale))
+                    .filter(|g| g.dash.is_none())
+                    .filter(|g| g.invf.len() >= g.rd / 2 && !(g.rd == rd && invf.len() >= rd / 2 && g.invf[..rd / 2] == invf[..rd / 2] && g.rope_scale == 1.0))
+                    .and_then(|g| invf_local.iter().position(|(f, s)| f[..] == g.invf[..g.rd / 2] && *s == g.rope_scale))
                     .map_or(0, |i| i + 1);
+                // this layer's rotation width (pairs)
+                let lhalf = geom.as_ref().map_or(rd / 2, |g| g.rd / 2);
                 let hg = match head_gate {
                     Some(gw) => {
                         let m = st.mat(c, model, gw, nh, hidden)?;
@@ -1820,11 +2499,146 @@ fn build(
                     (&km, k.ptr, 0, nkv * hd, nkv * hd),
                     (&vm, v.ptr, 0, nkv * hd, nkv * hd),
                 ])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, bias, hg, window, local, ms_in, ms_out })
+                let dash = match geom.as_ref().and_then(|g| g.dash.as_ref()) {
+                    Some(d) => {
+                        for w in [d.qk_proj, d.q_norm, d.k_norm, d.head_cls] {
+                            note(w);
+                        }
+                        Some(DashL {
+                            w: st.f32_buf(d.qk_proj)?,
+                            qn: st.f32_buf(d.q_norm)?,
+                            kn: st.f32_buf(d.k_norm)?,
+                            hc: st.f32_buf(d.head_cls)?,
+                            k: d.k,
+                            block: d.block,
+                            local_blocks: d.local_blocks,
+                            idx_scale: d.idx_scale,
+                            floor: d.floor,
+                            sigma: d.sigma,
+                        })
+                    }
+                    None => None,
+                };
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None })
+            }
+            GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
+                let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
+                let (kd, vd) = (knh * dk, knh * dv);
+                let cdim = 2 * kd + vd;
+                let qm = hmat(c, st, model, qw, kd, hidden)?;
+                let km = hmat(c, st, model, kw, kd, hidden)?;
+                let vm = hmat(c, st, model, vw, vd, hidden)?;
+                let om = hmat(c, st, model, ow, hidden, vd)?;
+                // the low-rank projections are f32 (no tensor index): their
+                // ranks from their lengths
+                if f_a.data.len() % hidden != 0 || g_a.data.len() % hidden != 0 {
+                    return Err(format!("layer {li}: KDA low-rank projections of unexpected lengths"));
+                }
+                let (rank_f, rank_g) = (f_a.data.len() / hidden, g_a.data.len() / hidden);
+                if rank_f > 512 || (g_b.is_some() && rank_g > 512) {
+                    return Err(format!("layer {li}: KDA ranks {rank_f} / {rank_g} past 512"));
+                }
+                let fa = hmat(c, st, model, f_a, rank_f, hidden)?;
+                let fb = hmat(c, st, model, f_b, kd, rank_f)?;
+                let bm = hmat(c, st, model, bw, knh, hidden)?;
+                if f_b.data.len() != kd * rank_f || bw.data.len() != knh * hidden || g_b.as_ref().is_some_and(|g| g.data.len() != vd * rank_g) || (g_b.is_none() && rank_g != vd) {
+                    return Err(format!("layer {li}: KDA projections of unexpected lengths"));
+                }
+                let gam = hmat(c, st, model, g_a, rank_g, hidden)?;
+                let gbm = match g_b {
+                    Some(g) => Some(hmat(c, st, model, g, vd, rank_g)?),
+                    None => None,
+                };
+                for d in [*conv_q, *conv_k, *conv_v, *dt_bias, *a_log, *o_norm] {
+                    note(d);
+                }
+                let taps: Vec<f32> = conv_q.iter().chain(conv_k.iter()).chain(conv_v.iter()).copied().collect();
+                let ms_in = mmaset(&[
+                    (&qm, qkv.ptr, 0, cdmax, kd),
+                    (&km, qkv.ptr + (kd * 4) as u64, 0, cdmax, kd),
+                    (&vm, qkv.ptr + (2 * kd * 4) as u64, 0, cdmax, vd),
+                ])?;
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Kda(KdaL {
+                    q: qm,
+                    k: km,
+                    v: vm,
+                    out: om,
+                    taps: Arc::new(Buf::from_slice(&taps)?),
+                    fa,
+                    fb,
+                    b: bm,
+                    ga: gam,
+                    gb: gbm,
+                    a_log: st.f32_buf(a_log)?,
+                    a_len: a_log.len(),
+                    dt_bias: st.f32_buf(dt_bias)?,
+                    o_norm: st.f32_buf(o_norm)?,
+                    lower: *lower_bound,
+                    nh: knh,
+                    dk,
+                    dv,
+                    kk,
+                    cdim,
+                    ms_in,
+                    ms_out,
+                })
+            }
+            GraphAttn::Mla { q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, .. } => {
+                let (rope, nope, vd, lora) = (*rope, *nope, *v_dim, *lora);
+                let lhd = rope + nope;
+                let lfx = match st.hyb.funcs.get(&(1, lhd)) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = Arc::new(load_funcs(c, 1, lhd)?);
+                        st.hyb.funcs.insert((1, lhd), f.clone());
+                        f
+                    }
+                };
+                let mb = mla_bufs.as_ref().ok_or("MLA rows missing")?;
+                let qm = hmat(c, st, model, qw, mnh * lhd, hidden)?;
+                let kvam = hmat(c, st, model, kv_a, lora + rope, hidden)?;
+                let kvbm = hmat(c, st, model, kv_b, mnh * (nope + vd), lora)?;
+                let om = hmat(c, st, model, ow, hidden, mnh * vd)?;
+                note(kv_a_norm);
+                let ms_in = mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?;
+                let ms_kvb = mmaset(&[(&kvbm, mb.kvb.ptr, 0, mnh * (nope + vd), mnh * (nope + vd))])?;
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                };
+                Mix::Attn(AttnL {
+                    q: qm,
+                    k: kvam,
+                    v: kvbm.clone(),
+                    o: om,
+                    qn: None,
+                    kn: None,
+                    gated: false,
+                    late: false,
+                    v_norm: false,
+                    bias: None,
+                    hg: None,
+                    window: None,
+                    sink: None,
+                    local: 0,
+                    half: 0,
+                    nkv: *mnh,
+                    hd: lhd,
+                    fx: lfx,
+                    ms_in,
+                    ms_out,
+                    dash: None,
+                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale }),
+                })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
                 let im = hmat(c, st, model, inp, 3 * hidden, hidden)?;
@@ -1832,19 +2646,21 @@ fn build(
                 note(taps);
                 let taps = st.f32_buf(taps)?;
                 let ms_in = mmaset(&[(&im, qkv.ptr, 0, cdmax, 3 * hidden)])?;
-                let ms_out = match l.attn_out_norm {
-                    Some(_) => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
-                    None => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
+                // a sandwich norm or the mHC streams take the product apart from the stream
+                let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
+                    true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
+                    false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
                 };
                 Mix::Conv(ConvL { inp: im, out: om, taps, kernel: *kernel, ms_in, ms_out })
             }
             _ => unreachable!(),
         };
-        let ms_gu = mmaset_pair(&gum, qq[0].ptr, qq[1].ptr, pstride)?;
+        let gelu = matches!(&l.ffn, GraphFfn::Dense { act: GraphAct::GeluTanh, .. });
+        let ms_gu = mmaset_kind(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | if gelu { 0x200 } else { 0 })?;
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
-            _ if l.ffn_out_norm.is_some() => mmaset(&[(&dm, yo.ptr, 0, hidden, hidden)])?,
+            _ if l.ffn_out_norm.is_some() || l.mhc.is_some() => mmaset(&[(&dm, yo.ptr, 0, hidden, hidden)])?,
             _ => mmaset(&[(&dm, h.ptr, h.ptr, hidden, hidden)])?,
         };
         let mut sw = |w: Option<&[f32]>, st: &mut State| -> Res<Option<Arc<Buf>>> {
@@ -1858,15 +2674,44 @@ fn build(
         };
         let attn_out = sw(l.attn_out_norm, st)?;
         let ffn_out = sw(l.ffn_out_norm, st)?;
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, ms_gu, ms_dn, moe, attn_out, ffn_out, layer_scale: l.layer_scale });
+        let mhc = match &l.mhc {
+            Some(m) => {
+                for d in [m.attn_w, m.attn_b, m.ffn_w, m.ffn_b] {
+                    note(d);
+                }
+                Some(MhcL {
+                    aw: st.f32_buf(m.attn_w)?,
+                    ab: st.f32_buf(m.attn_b)?,
+                    fw: st.f32_buf(m.ffn_w)?,
+                    fb: st.f32_buf(m.ffn_b)?,
+                    out: m.attn_b.len(),
+                    enter: m.enter,
+                    leave: m.leave,
+                })
+            }
+            None => None,
+        };
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, mhc, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
+    let loop_w = if loop_norm.is_empty() {
+        None
+    } else {
+        if final_norm.len() != hidden || loop_norm.iter().any(|&l| l >= layers.len()) {
+            return Err("a mid-stack norm past the stack or of the wrong width".into());
+        }
+        note(final_norm);
+        Some(st.f32_buf(final_norm)?)
+    };
     let (lm, logits, final_norm_buf) = match lm {
         Some((gw, rows)) => {
             if final_norm.len() != hidden {
                 return Err("final norm width".into());
             }
             let logits = f4(NMAX * rows)?;
-            let head_q1 = matches!(model.tensors.get(gw.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T));
+            let head_q1 = matches!(
+                model.tensors.get(gw.idx).map(|e| e.dtype),
+                Some(cortiq_core::TensorDtype::Q1 | cortiq_core::TensorDtype::Q1T | cortiq_core::TensorDtype::Q2TiledP | cortiq_core::TensorDtype::Q4Tiled)
+            );
             let head = if gw.kind == 6 || head_q1 {
                 let m = hmat(c, st, model, gw, rows_of(model, gw).ok_or("an f32 head")?, hidden)?;
                 if rows == 0 || rows > m.rows {
@@ -1902,7 +2747,9 @@ fn build(
     let _ = lm_rows;
     let pp = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     static PLAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. })).count();
+    // every attention layer's call record (MLA's included)
+    let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. } | GraphAttn::Mla { .. })).count();
+    let has_dash = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.dash.is_some()));
     Ok(HPlan {
         id: PLAN_ID.fetch_add(1, Ordering::Relaxed),
         ci: Buf::new(n_attn.max(1) * 8 * 4)?,
@@ -1914,6 +2761,31 @@ fn build(
         final_norm: final_norm_buf,
         invf: invf[..half].to_vec(),
         invf_local,
+        prism,
+        hdmax,
+        loop_norm: loop_norm.to_vec(),
+        loop_w,
+        mhc: match mhc_geo {
+            Some((ns, iters, pre_scale)) => Some(MhcPlan { ns, iters, pre_scale, r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
+            None => None,
+        },
+        kda: kda_bufs,
+        mla: mla_bufs,
+        dash: if has_dash {
+            let cand = DASH_ROWS * DASH_BLOCKS;
+            Some(DashBufs {
+                cands: Buf::new(cand * 4)?,
+                coff: Buf::new((DASH_ROWS + 1) * 4)?,
+                tab: Buf::new(DASH_ROWS * 64 * 2 * 4)?,
+                rec: Buf::new(4 * 4)?,
+                sc: Buf::new(cand * 4)?,
+                sel: Buf::new(DASH_ROWS * 17 * 4)?,
+                bias: Buf::new(DASH_ROWS * 16 * 4)?,
+            })
+        } else {
+            None
+        },
+        own_geom: hdmax != hd || kvmax != nkv * hd,
         half,
         nh,
         nkv,
@@ -1970,9 +2842,13 @@ fn plan_for(
     scale: f32,
     invf: &[f32],
     first_pos: usize,
+    loop_norm: &[usize],
 ) -> Res<Arc<HPlan>> {
     let key = (model.uid(), layer_base, layers.len(), lm.is_some());
-    let sig = hsig(model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, invf);
+    let mut sig = hsig(model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, invf);
+    // a Looped Transformer's mid-stack norms are part of the plan
+    sig.push(usize::MAX);
+    sig.extend_from_slice(loop_norm);
     if let Some(p) = st.hyb.plans.get(&key) {
         if p.sig == sig && p.eps == eps && p.scale == scale {
             // SAFETY: the signature holds these addresses and lengths, and the
@@ -1988,7 +2864,7 @@ fn plan_for(
     }
     c.sync()?;
     let t0 = std::time::Instant::now();
-    let p = Arc::new(build(c, st, model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, scale, invf, sig)?);
+    let p = Arc::new(build(c, st, model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, scale, invf, sig, loop_norm)?);
     mem_report(c, st, &format!("a plan of {} layers", p.layers.len()));
     tracing::info!(
         "cuda hybrid graph: {} layers resident, {:.2} GB of weights, built in {:.1} s (repack {:.1} s, upload {:.1} s, single weights {:.1} s, job tables {:.1} s)",
@@ -2097,9 +2973,10 @@ fn admit(
             continue;
         }
         match (&pl.mix, &l.attn) {
-            (Mix::Attn(_), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. }) => {
+            (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. } | GraphAttn::Mla { cpu_k, cpu_v, cpu_base, .. }) => {
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
-                let row = plan.nkv * plan.hd / 2;
+                // (the layer's own head geometry)
+                let row = a.nkv * a.hd / 2;
                 let fresh_half = !st.hyb.half.contains(&key);
                 let m = st.kv.entry(key).or_insert_with(|| KvMirror::new(row, 0));
                 if m.row != row || m.window != 0 || fresh_half {
@@ -2109,7 +2986,7 @@ fn admit(
                 }
                 st.hyb.half.insert(key);
                 let m = st.kv.get_mut(&key).unwrap();
-                match sync_half(c, m, cpu_k, cpu_v, *cpu_base, plan.nkv, plan.hd, pos0) {
+                match sync_half(c, m, cpu_k, cpu_v, *cpu_base, a.nkv, a.hd, pos0) {
                     Ok(true) => m.reserve(c, n, hint).map_err(soft)?,
                     Ok(false) if m.stored < pos0 && m.stored >= m.base => {
                         // Rows neither on the card nor on the host: positions
@@ -2196,6 +3073,83 @@ fn admit(
                 };
                 let gs = alloc().map_err(soft)?;
                 c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nv)) * 4) as u64, Ordering::Relaxed);
+                st.hyb.gdn.insert(key, gs);
+            }
+            (Mix::Kda(g), GraphAttn::Kda { cpu_state, .. }) => {
+                // a GDN layer's state (nv = nk = the heads): the conv ring of the
+                // q | k | v channels, S; the host's rings are one a projection
+                let dims = (g.nh, g.nh, g.dk, g.dv, g.kk);
+                let ring_n = (g.kk - 1) * g.cdim;
+                let s_n = g.nh * g.dk * g.dv;
+                if let Some(gs) = st.hyb.gdn.get_mut(&key) {
+                    if gs.dims == dims && gs.next_pos == pos0 {
+                        continue;
+                    }
+                    if gs.dims == dims && pos0 == 0 {
+                        // a new sequence on the same id: no history
+                        unsafe {
+                            cu::memset_d8_async(gs.s.ptr, 0, s_n * 4, c.stream).map_err(|e| soft(derr(e)))?;
+                            cu::memset_d8_async(gs.ring.ptr, 0, ring_n.max(1) * 4, c.stream).map_err(|e| soft(derr(e)))?;
+                        }
+                        gs.next_pos = 0;
+                        gs.tape = None;
+                        continue;
+                    }
+                    return Err((true, format!("KDA state of layer {li} is at row {}, the call at {pos0}", gs.next_pos)));
+                }
+                if pos0 > 0 && cpu_state.len() != ring_n + s_n {
+                    return Err(soft("KDA host seed missing for a nonzero position".into()));
+                }
+                // the seven buffers of a layer in one allocation, zeroed
+                let sizes = [s_n, ring_n, NMAX * plan.cdmax, NMAX * g.cdim, NMAX * 2 * g.nh, s_n, ring_n].map(|n| (n.max(1) * 4).next_multiple_of(256));
+                let alloc = || -> Res<GdnState> {
+                    let all = Buf::new(sizes.iter().sum())?;
+                    unsafe { cu::memset_d8_async(all.ptr, 0, all.bytes, c.stream).map_err(derr)? };
+                    let mut at = 0usize;
+                    let mut v = Vec::with_capacity(sizes.len());
+                    for &n in &sizes {
+                        v.push(all.view(at, n));
+                        at += n;
+                    }
+                    let mut v = v.into_iter();
+                    let mut next = || v.next().ok_or("GDN state views");
+                    let (s, ring, t_qkv, t_cq, t_gb, s_save, ring_save) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
+                    if pos0 > 0 {
+                        unsafe {
+                            if ring_n > 0 {
+                                // [q ring | k ring | v ring] (each [kk - 1][its channels])
+                                // into one ring of [kk - 1][q | k | v]
+                                let (kd, vd, rows) = (g.nh * g.dk, g.nh * g.dv, g.kk - 1);
+                                let mut r = vec![0f32; ring_n];
+                                for j in 0..rows {
+                                    let dst = &mut r[j * g.cdim..(j + 1) * g.cdim];
+                                    dst[..kd].copy_from_slice(&cpu_state[j * kd..(j + 1) * kd]);
+                                    dst[kd..2 * kd].copy_from_slice(&cpu_state[rows * kd + j * kd..rows * kd + (j + 1) * kd]);
+                                    dst[2 * kd..].copy_from_slice(&cpu_state[2 * rows * kd + j * vd..2 * rows * kd + (j + 1) * vd]);
+                                }
+                                super::htod(ring.ptr, &r)?;
+                            }
+                            cu::memcpy_htod_async(s.ptr, &cpu_state[ring_n..], c.stream).map_err(derr)?;
+                        }
+                    }
+                    Ok(GdnState {
+                        dims,
+                        _all: all,
+                        s,
+                        ring,
+                        next_pos: pos0,
+                        t_qkv,
+                        t_stride: plan.cdmax,
+                        t_cq,
+                        t_gb,
+                        s_save,
+                        ring_save,
+                        tape: None,
+                        snap: None,
+                    })
+                };
+                let gs = alloc().map_err(soft)?;
+                c.kv_bytes.fetch_add(((s_n * 2 + ring_n * 2 + NMAX * (2 * g.cdim + 2 * g.nh)) * 4) as u64, Ordering::Relaxed);
                 st.hyb.gdn.insert(key, gs);
             }
             (Mix::Conv(cv), GraphAttn::ShortConv { cpu_state, .. }) => {
@@ -2439,14 +3393,17 @@ fn book(
     let mut keys_max = 0usize;
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        if sealed.get(li).copied().unwrap_or(false) && matches!(&pl.mix, Mix::Attn(a) if a.nkv != plan.nkv || a.hd != plan.hd) {
+            return Err("a sealed far field over a layer head geometry of its own".into());
+        }
         if !matches!(&pl.mix, Mix::Attn(_)) || !sealed.get(li).copied().unwrap_or(false) || !st.hyb.o1.contains_key(&key) {
             far.push(0);
             farp.push((0, 0.0, false));
         }
         match &pl.mix {
-            Mix::Gdn(_) | Mix::Conv(_) => {
-                if tape && matches!(pl.mix, Mix::Conv(_)) {
-                    return Err("a verify window over a short convolution".into());
+            Mix::Gdn(_) | Mix::Conv(_) | Mix::Kda(_) => {
+                if tape && matches!(pl.mix, Mix::Conv(_) | Mix::Kda(_)) {
+                    return Err("a verify window over a short convolution or a KDA layer".into());
                 }
                 let gs = st.hyb.gdn.get_mut(&key).ok_or("GDN state missing")?;
                 layers.push([gs.s.ptr, gs.ring.ptr, gs.t_qkv.ptr, gs.t_cq.ptr, gs.t_gb.ptr, gs.s_save.ptr, gs.ring_save.ptr]);
@@ -2498,10 +3455,21 @@ fn book(
                 keys_max = keys_max.max(keys);
                 continue;
             }
-            Mix::Attn(_) => {
+            Mix::Attn(a) => {
+                // a DASH layer: its open blocks and block summaries beside the mirror
+                let (dopen, dbar) = match &a.dash {
+                    Some(dl) => {
+                        let e = match st.hyb.dash.entry(key) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(v) => v.insert((Buf::new(3 * dl.block * 128 * 4)?, Buf::new(DASH_BLOCKS * 128 * 4)?)),
+                        };
+                        (e.0.ptr, e.1.ptr)
+                    }
+                    None => (0, 0),
+                };
                 let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
                 let n0 = m.stored - m.base;
-                layers.push([m.kptr(), m.vptr(), 0, 0, 0, 0, 0]);
+                layers.push([m.kptr(), m.vptr(), dopen, dbar, 0, 0, 0]);
                 m.stored += n;
                 let keys = n0 + n;
                 let rb = attn_rb(keys);
@@ -2525,7 +3493,7 @@ fn book(
     let scratch = [
         st.scr(c, "hy_S", NMAX * nh * kc * 4)?,
         st.scr(c, "hy_Mx", NMAX * nh * nbc * 4)?,
-        st.scr(c, "hy_P", NMAX * nbc * nh * hd * 4)?,
+        st.scr(c, "hy_P", NMAX * nbc * nh * hd.max(plan.hdmax) * 4)?,
         st.scr(c, "hy_E", NMAX * nbc * nh * 4)?,
     ];
     Ok(Book { layers, ci, scratch, far, farp })
@@ -2538,7 +3506,7 @@ fn book(
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u64, tabp: u64, taps: &[(usize, u64)]) -> Res<()> {
     let fx = &plan.fx;
-    let (hidden, nh, nkv, hd) = (plan.hidden, plan.nh, plan.nkv, plan.hd);
+    let (hidden, nh) = (plan.hidden, plan.nh);
     let (eps, gemma_i, n_i) = (plan.eps, plan.gemma as i32, n as i32);
     let hid_i = hidden as i32;
     let zero = 0i32;
@@ -2555,6 +3523,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
     for (li, pl) in plan.layers.iter().enumerate() {
         let lb = bk.layers[li];
         unsafe {
+            // SenseNova-Loop: the attention's input from the mHC streams
+            sub_in(c, fx, plan, pl, false, n)?;
             c.launch(
                 fx.rmsnorm2,
                 (hidden.div_ceil(1024) as u32, n as u32),
@@ -2562,9 +3532,86 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 0,
                 kargs!(plan.h.ptr, pl.in_norm.ptr, plan.xn.ptr, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
             )?;
+            // a Prism file: the projections' input in their basis (the GDN
+            // gates read the f32 rows in `xn`, untouched)
+            prism_planes(c, plan, pp0, pp1, plan.pstride, hidden, n)?;
         }
         hst(c, 0, &mut t0)?;
         match &pl.mix {
+            Mix::Kda(g) => {
+                let [gs_s, gs_ring, _t_qkv, t_cq, _t_gb, _s_save, _ring_save] = lb;
+                let kb = plan.kda.as_ref().ok_or("KDA rows missing")?;
+                let (kd, vd) = (g.nh * g.dk, g.nh * g.dv);
+                let (cd_i, kk_i, nh_i, dk_i, dv_i) = (g.cdim as i32, g.kk as i32, g.nh as i32, g.dk as i32, g.dv as i32);
+                let qs_i = plan.cdmax as i32;
+                let xn = plan.xn.ptr;
+                let nul = 0u64;
+                unsafe {
+                    g.ms_in.run(c, fx, planes, hidden, n)?;
+                    hst(c, 1, &mut t0)?;
+                    // the low-rank decay, β and the output gate: f32 products over the normed rows
+                    let rank_f = g.fa.rows;
+                    c.gemm(true, false, rank_f, n, hidden, 1.0, g.fa.w.ptr, hidden, xn, hidden, 0.0, kb.fa.ptr, rank_f, Gemm::F32)?;
+                    c.gemm(true, false, kd, n, rank_f, 1.0, g.fb.w.ptr, rank_f, kb.fa.ptr, rank_f, 0.0, kb.f.ptr, kd, Gemm::F32)?;
+                    c.gemm(true, false, g.nh, n, hidden, 1.0, g.b.w.ptr, hidden, xn, hidden, 0.0, kb.braw.ptr, g.nh, Gemm::F32)?;
+                    let gate = match &g.gb {
+                        Some(gb) => {
+                            let rank_g = g.ga.rows;
+                            c.gemm(true, false, rank_g, n, hidden, 1.0, g.ga.w.ptr, hidden, xn, hidden, 0.0, kb.ga.ptr, rank_g, Gemm::F32)?;
+                            c.gemm(true, false, vd, n, rank_g, 1.0, gb.w.ptr, rank_g, kb.ga.ptr, rank_g, 0.0, kb.gate.ptr, vd, Gemm::F32)?;
+                            kb.gate.ptr
+                        }
+                        None => {
+                            c.gemm(true, false, vd, n, hidden, 1.0, g.ga.w.ptr, hidden, xn, hidden, 0.0, kb.ga.ptr, vd, Gemm::F32)?;
+                            kb.ga.ptr
+                        }
+                    };
+                    // the conv, SiLU and the q / k norms: the GDN front without its gate blocks
+                    let units = (g.cdim / g.dk) as u32;
+                    c.launch(
+                        fx.front,
+                        (units, n as u32),
+                        g.dk.max(64) as u32,
+                        0,
+                        kargs!(plan.qkv.ptr, qs_i, gs_ring, g.taps.ptr, t_cq, n_i, cd_i, kk_i, nh_i, dk_i, xn, hid_i, nul, nul, g.a_log.ptr, g.dt_bias.ptr, nul, nh_i),
+                    )?;
+                    let (lb_on, lbv) = match g.lower {
+                        Some(v) => (1i32, v),
+                        None => (0i32, 0f32),
+                    };
+                    let (kd_i, al_i) = (kd as i32, g.a_len as i32);
+                    c.launch(
+                        fx.kda_gates,
+                        ((n * kd).div_ceil(256) as u32, 1),
+                        256,
+                        0,
+                        kargs!(kb.f.ptr, kd_i, kb.braw.ptr, nh_i, g.a_log.ptr, al_i, g.dt_bias.ptr, kb.gd.ptr, kb.beta.ptr, n_i, nh_i, dk_i, lb_on, lbv),
+                    )?;
+                    // the delta rule, with blocks after it that move the conv ring
+                    let ring_p = if g.kk > 1 { gs_ring } else { 0 };
+                    let ring_blocks = if g.kk > 1 { (g.cdim as u32).div_ceil(128) } else { 0 };
+                    c.launch(
+                        fx.kda_scan4,
+                        ((g.nh * g.dv / 32) as u32 + ring_blocks, 1),
+                        128,
+                        0,
+                        kargs!(t_cq, kb.gd.ptr, kb.beta.ptr, gs_s, plan.o.ptr, n_i, cd_i, nh_i, dv_i, ring_p, plan.qkv.ptr, qs_i, kk_i),
+                    )?;
+                    hst(c, 2, &mut t0)?;
+                    // the sigmoid-gated norm of each head into the planes, the output product
+                    let (zs_i, sig1, zero_h) = (vd as i32, 1i32, 0i32);
+                    c.launch(
+                        fx.out32,
+                        ((n * g.nh) as u32, 1),
+                        g.dv as u32,
+                        0,
+                        kargs!(plan.o.ptr, gate, zs_i, g.o_norm.ptr, nul, nh_i, dv_i, eps, sig1, zero_h, pp0, pp1, pp2, ps_i),
+                    )?;
+                    hst(c, 3, &mut t0)?;
+                    g.ms_out.run(c, fx, planes, vd, n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
+                }
+            }
             Mix::Conv(cv) => {
                 let ring = lb[1];
                 let (cd_i, k_i, n_i2) = (plan.cdmax as i32, cv.kernel as i32, n as i32);
@@ -2574,7 +3621,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     c.launch(fx.sconv, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.qkv.ptr, cd_i, cv.taps.ptr, ring, hid_i, k_i, n_i2, pp0, pp1, pp2, ps_i))?;
                     hst(c, 2, &mut t0)?;
                     cv.ms_out.run(c, fx, planes, hidden, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 3, &mut t0)?;
                 }
             }
@@ -2646,12 +3693,16 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         kargs!(plan.o.ptr, plan.z.ptr, zs_i, g.norm.ptr, plan.of.ptr, nv_i, dv_i, eps, sig0, zero, pp0, pp1, pp2, ps_i),
                     )?;
                     hst(c, 2, &mut t0)?;
+                    prism_planes(c, plan, pp0, pp1, plan.pstride, cols, n)?;
                     g.ms_out.run(c, fx, planes, cols, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 3, &mut t0)?;
                 }
             }
             Mix::Attn(a) => {
+                // the layer's head geometry and its kernels
+                let (nkv, hd, fx) = (a.nkv, a.hd, &*a.fx);
+                let hpk_l = nh / nkv;
                 let (kp, vp) = (lb[0], lb[1]);
                 let far = bk.far[li];
                 let (fm, fscale, frect) = bk.farp[li];
@@ -2659,23 +3710,83 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let w = &bk.ci[ai * 8..ai * 8 + 8];
                 ai += 1;
                 let (n0_i, slot0, rb_i, ncap_i, nbcap_i, r0) = (w[0], w[1], w[2], w[3], w[4], 0i32);
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (plan.qrow as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
-                let tabl = tabp + (a.local * n * plan.half * 2 * 4) as u64;
+                let tabl = tabp + (plan.tab_off(a.local, n) * 4) as u64;
                 let gate_p = if a.gated { plan.gate.ptr } else { 0 };
                 let nul16 = 0u64;
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
                     hst(c, 4, &mut t0)?;
+                    if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
+                        // MLA: the latent's norm into its planes, kv_b over it, the
+                        // heads' keys [k_rope | k_nope] and values [v | 0]
+                        let (lora_i, st_i) = (ml.lora as i32, (ml.lora + ml.rope) as i32);
+                        c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, mb.lp[0].ptr, mb.lp[1].ptr, lora_i))?;
+                        let lpl = Planes { p0: mb.lp[0].ptr, p1: mb.lp[1].ptr, p2: mb.lp[1].ptr, stride: ml.lora };
+                        ml.ms_kvb.run(c, fx, &lpl, ml.lora, n)?;
+                        let (rope_i, nope_i, vd_i) = (ml.rope as i32, ml.nope as i32, ml.vd as i32);
+                        c.launch(
+                            fx.mla_kv,
+                            ((n * nh * hd).div_ceil(256) as u32, 1),
+                            256,
+                            0,
+                            kargs!(mb.kva.ptr, st_i, mb.kvb.ptr, plan.k.ptr, plan.v.ptr, n_i, nh_i, rope_i, nope_i, vd_i, lora_i),
+                        )?;
+                    }
+                    if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
+                        // DASH: the rows rotated by their own angles and appended,
+                        // the router a row, the closing blocks' summaries, the
+                        // attend over the read set and the local window
+                        let (dopen, dbar) = (lb[2], lb[3]);
+                        c.launch(
+                            fx.qk,
+                            ((nh + nkv) as u32, n as u32),
+                            hd as u32,
+                            0,
+                            kargs!(
+                                plan.q.ptr, qs_i, plan.k.ptr, plan.v.ptr, kvs_i, qn, kn, plan.qg.ptr, plan.gate.ptr, kp, vp,
+                                db.tab.ptr, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
+                            ),
+                        )?;
+                        let (blk_i, k_i, win_i) = (dl.block as i32, dl.k as i32, (dl.block * dl.local_blocks) as i32);
+                        c.launch(
+                            fx.dash_route,
+                            (n as u32, 1),
+                            256,
+                            0,
+                            kargs!(
+                                plan.xn.ptr, hid_i, dl.w.ptr, dl.qn.ptr, dl.kn.ptr, db.tab.ptr, dopen, dbar, db.coff.ptr, db.cands.ptr,
+                                db.sc.ptr, db.sel.ptr, db.bias.ptr, db.rec.ptr, n_i, blk_i, k_i, eps, dl.idx_scale, dl.floor, dl.sigma
+                            ),
+                        )?;
+                        c.launch(fx.dash_close, (1, 1), 128, 0, kargs!(dopen, dl.hc.ptr, dbar, db.rec.ptr, n_i, blk_i))?;
+                        c.launch(
+                            fx.dash_attend,
+                            (nh as u32, n as u32),
+                            256,
+                            0,
+                            kargs!(
+                                plan.qg.ptr, kp, vp, db.sel.ptr, db.bias.ptr, gate_p, pp0, pp1, ps_i, nul16, db.rec.ptr, cip, slot0,
+                                nh_i, nkv_i, n_i, blk_i, win_i, plan.scale
+                            ),
+                        )?;
+                        hst(c, 5, &mut t0)?;
+                        prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
+                        a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                        sub_out(c, fx, plan, pl, false, n)?;
+                        hst(c, 6, &mut t0)?;
+                    } else {
                     if far == 2 {
+                        let _ = hpk_l;
                         // the ring row this key replaces into the far sums,
                         // before the key takes its place
                         let (fm_i, nkv_i2) = (fm as i32, nkv as i32);
                         c.launch(
                             fx.far_insert,
-                            ((nkv * plan.hpk * fm).div_ceil(8) as u32, 1),
+                            ((nkv * hpk_l * fm).div_ceil(8) as u32, 1),
                             256,
                             0,
                             kargs!(kp, vp, lb[3], lb[5], lb[6], cip, fm_i, nkv_i2, fscale),
@@ -2693,12 +3804,14 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     )?;
                     // a grid for any record: blocks past the call's keys leave
                     let nblk = ATTN_NBLK as u32;
+                    // MLA's own softmax scale (1/√(rope + nope), YaRN-corrected)
+                    let scale_l = a.mla.as_ref().map_or(plan.scale, |m| m.scale);
                     c.launch_3d(
                         fx.scores,
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, plan.scale, rb_i, ncap_i, nbcap_i, n_i, cip),
+                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, scale_l, rb_i, ncap_i, nbcap_i, n_i, cip),
                     )?;
                     if far != 0 {
                         // the far part: one more block of P and E, and its maximum
@@ -2722,12 +3835,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                             )?;
                         }
                     }
+                    let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
                     c.launch_3d(
                         fx.values,
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip),
+                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip, sinkp),
                     )?;
                     c.launch(
                         fx.finish,
@@ -2746,9 +3860,20 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         let (hd_i2, nh_i2, n_i3) = (hd as i32, nh as i32, n as i32);
                         c.launch(fx.head_gate, ((nh * hd).div_ceil(256) as u32, n as u32), 256, 0, kargs!(pp0, pp1, ps_i, plan.hgv.ptr, nh_i2, hd_i2, n_i3))?;
                     }
-                    a.ms_out.run(c, fx, planes, nh * hd, n)?;
-                    sandwich_add(c, fx, plan, pl.attn_out.as_deref(), n)?;
+                    prism_planes(c, plan, pp0, pp1, plan.pstride, nh * hd, n)?;
+                    if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
+                        // MLA: the heads cut back to v wide for the output product
+                        let tot = n * nh * ml.vd;
+                        let (od_i, hd_i2, vd_i) = ((nh * ml.vd) as i32, hd as i32, ml.vd as i32);
+                        c.launch(fx.mla_cut, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pp0, pp1, ps_i, mb.op[0].ptr, mb.op[1].ptr, od_i, n_i, nh_i, hd_i2, vd_i))?;
+                        let opl = Planes { p0: mb.op[0].ptr, p1: mb.op[1].ptr, p2: mb.op[1].ptr, stride: nh * ml.vd };
+                        a.ms_out.run(c, fx, &opl, nh * ml.vd, n)?;
+                    } else {
+                        a.ms_out.run(c, fx, planes, nh * hd, n)?;
+                    }
+                    sub_out(c, fx, plan, pl, false, n)?;
                     hst(c, 6, &mut t0)?;
+                    }
                 }
             }
         }
@@ -2756,6 +3881,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             let nullp = 0u64;
             // a routed FFN also wants the normed rows in f32 (the router's input)
             let xn32 = if pl.moe.is_some() { plan.xn.ptr } else { nullp };
+            sub_in(c, fx, plan, pl, true, n)?;
             c.launch(
                 fx.rmsnorm2,
                 (hidden.div_ceil(1024) as u32, n as u32),
@@ -2763,6 +3889,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 0,
                 kargs!(plan.h.ptr, pl.post_norm.ptr, xn32, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
             )?;
+            prism_planes(c, plan, pp0, pp1, plan.pstride, hidden, n)?;
             hst(c, 0, &mut t0)?;
             if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
                 moe_routed(c, fx, plan, m, mb, n)?;
@@ -2777,9 +3904,10 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             hst(c, 7, &mut t0)?;
             let mid = Planes { p0: plan.qq[0].ptr, p1: plan.qq[1].ptr, p2: plan.qq[1].ptr, stride: plan.pstride };
             if dense_pair {
+                prism_planes(c, plan, mid.p0, mid.p1, mid.stride, pl.inter, n)?;
                 pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
             }
-            sandwich_add(c, fx, plan, pl.ffn_out.as_deref(), n)?;
+            sub_out(c, fx, plan, pl, true, n)?;
             if let Some(s) = pl.layer_scale {
                 let tot = (n * hidden) as u64;
                 c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.h.ptr, s, tot))?;
@@ -2798,6 +3926,11 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 )?;
             }
             hst(c, 9, &mut t0)?;
+            // a Looped Transformer: the final norm on the stream after a loop's last layer
+            if let (true, Some(w)) = (plan.loop_norm.contains(&li), plan.loop_w.as_ref()) {
+                let (nullp, zero_h) = (0u64, 0i32);
+                c.launch(fx.rmsnorm, (n as u32, 1), 256, 0, kargs!(plan.h.ptr, w.ptr, plan.h.ptr, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))?;
+            }
             // a DFlash drafter's taps: the residual stream after this layer
             for &(tl, dst) in taps {
                 if tl == li {
@@ -2807,6 +3940,73 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
         }
     }
     Ok(())
+}
+
+/// A sub-layer's product in `yo` into the residual: a sandwich norm's add, or
+/// the mHC streams' merge (and, after the range's last FFN, the stream back
+/// as their mean); nothing when the product went to the stream.
+unsafe fn sub_out(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
+    match (&pl.mhc, &plan.mhc) {
+        (Some(m), Some(mp)) => unsafe { mhc_out(c, fx, plan.hidden, m, mp, MhcRows::small(plan, mp), ffn, n) },
+        _ => unsafe { sandwich_add(c, fx, plan, if ffn { pl.ffn_out.as_deref() } else { pl.attn_out.as_deref() }, n) },
+    }
+}
+
+/// The rows an mHC sub-layer reads and writes: its input rows (`h`), its
+/// product (`yo`), the streams, the merge coefficients and the router's
+/// logits; the small path's plan buffers or the prompt path's own.
+#[derive(Clone, Copy)]
+struct MhcRows {
+    h: u64,
+    yo: u64,
+    r: u64,
+    coef: u64,
+    lg: u64,
+}
+
+impl MhcRows {
+    fn small(plan: &HPlan, mp: &MhcPlan) -> Self {
+        MhcRows { h: plan.h.ptr, yo: plan.yo.ptr, r: mp.r.ptr, coef: mp.coef.ptr, lg: mp.lg.ptr }
+    }
+}
+
+/// After an mHC sub-layer: its product merged into the streams; the range's
+/// last sub-layer hands their mean on as the stream.
+unsafe fn mhc_out(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, rows: MhcRows, ffn: bool, n: usize) -> Res<()> {
+    let (ns_i, hid_i) = (mp.ns as i32, hidden as i32);
+    let grid = (hidden.div_ceil(256) as u32, n as u32);
+    unsafe {
+        c.launch(fx.mhc_merge, grid, 256, 0, kargs!(rows.r, rows.yo, rows.coef, ns_i, hid_i))?;
+        if ffn && m.leave {
+            c.launch(fx.mhc_leave, grid, 256, 0, kargs!(rows.r, rows.h, ns_i, hid_i))?;
+        }
+    }
+    Ok(())
+}
+
+/// The mHC routing before a sub-layer: entering the range (the attention of
+/// its first layer) the streams take the stream's rows, then the router
+/// writes the sub-layer's input rows into the stream and the merge
+/// coefficients.
+unsafe fn sub_in(c: &Ctx, fx: &HFuncs, plan: &HPlan, pl: &HLayer, ffn: bool, n: usize) -> Res<()> {
+    let (Some(m), Some(mp)) = (&pl.mhc, &plan.mhc) else { return Ok(()) };
+    unsafe { mhc_in(c, fx, plan.hidden, m, mp, MhcRows::small(plan, mp), ffn, n) }
+}
+
+/// Before an mHC sub-layer: entering the range the streams take the stream's
+/// rows; the router's logits, its coefficients and the sub-layer's input rows.
+unsafe fn mhc_in(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, rows: MhcRows, ffn: bool, n: usize) -> Res<()> {
+    let (ns_i, hid_i) = (mp.ns as i32, hidden as i32);
+    unsafe {
+        if !ffn && m.enter {
+            c.launch(fx.mhc_enter, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(rows.h, rows.r, ns_i, hid_i))?;
+        }
+        let (w, b) = if ffn { (&m.fw, &m.fb) } else { (&m.aw, &m.ab) };
+        let (out_i, it_i, fixed_i) = (m.out as i32, mp.iters as i32, (m.out == 2 * mp.ns) as i32);
+        // the logits a block each, then the coefficients and the input rows
+        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i))?;
+        c.launch(fx.mhc_route, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, out_i, it_i, fixed_i, mp.pre_scale))
+    }
 }
 
 /// A sandwich norm's add: the product's rows in `yo`, normed with `w`, onto
@@ -2844,27 +4044,32 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
                 mb.qq[0].ptr, mb.qq[1].ptr, ps_i, mb.dns.ptr, hi, bg, bd
             ),
         )?;
-        let nt = if n <= 8 { 0 } else { 1 };
         let (pp0, pp1, pp2) = (plan.pp[0].ptr, plan.pp[1].ptr, plan.pp[2].ptr);
         let t = (tb - 1) as usize;
+        // experts of one codec: that codec's launch
+        let pick = |kd: Option<usize>| match kd {
+            Some(d) => fx.mmpk[nt_of(n)][t][1][d],
+            None => fx.mmp[nt_of(n)][t][1],
+        };
         // every slot's gate/up from the normed rows
-        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(mb.gu_a.ptr, si, pp0, pp1, pp2, ps_i, ni, hi))?;
+        c.launch(pick(m.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(mb.gu_a.ptr, si, pp0, pp1, pp2, ps_i, ni, hi))?;
         // every slot's down from its own planes (the job's `xoff`)
         let (q0, q1) = (mb.qq[0].ptr, mb.qq[1].ptr);
-        c.launch(fx.mmp[nt][t][1], (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(mb.dn_a.ptr, si, q0, q1, q1, ps_i, ni, inter_i))?;
+        c.launch(pick(m.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(mb.dn_a.ptr, si, q0, q1, q1, ps_i, ni, inter_i))?;
     }
     Ok(())
 }
 
-/// A layer the prompt path has no kernels for (sandwich norms, a layer
-/// scale, a short convolution or a head-wise gate): such a
-/// stack's long prompt runs the small path a chunk at a time.
+/// A layer the prompt path has no kernels for (a routed FFN's sandwich, mHC
+/// beside a sandwich or a routed FFN, a short convolution or a head-wise
+/// gate): such a stack's long prompt runs the small path a chunk at a time.
 fn small_only(l: &HLayer) -> bool {
-    l.attn_out.is_some()
-        || l.ffn_out.is_some()
-        || l.layer_scale.is_some()
-        || matches!(l.mix, Mix::Conv(_))
-        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some())
+    // sandwich norms and a layer scale run on the prompt path too, a routed
+    // FFN's sandwich aside
+    (l.moe.is_some() && l.ffn_out.is_some())
+        || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
+        || matches!(l.mix, Mix::Conv(_) | Mix::Kda(_))
+        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.mla.is_some())
 }
 
 /// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
@@ -2933,6 +4138,42 @@ unsafe fn capture(c: &Ctx, f: impl FnOnce() -> Res<()>) -> Res<cs::CUgraphExec> 
 thread_local! {
     /// Set while a long prompt goes through the small path a chunk at a time.
     static DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A DASH stack's call lists for rows [r0, r0 + n) of the call (its first
+/// row at `pos`): the candidates (the call's), those rows' offsets into them,
+/// their rotation table (sin and cos of the rows' angles, `hy_qk`'s rows) and
+/// the record (first position, the router's block count). Synchronous: the
+/// lists are the caller's.
+fn dash_upload(plan: &HPlan, layers: &[GraphLayer], pos: usize, r0: usize, n: usize) -> Res<()> {
+    let Some(db) = &plan.dash else { return Ok(()) };
+    let d = layers
+        .iter()
+        .find_map(|l| match &l.attn {
+            GraphAttn::Full { geom: Some(g), .. } => g.dash.as_ref(),
+            _ => None,
+        })
+        .ok_or("DASH layers without their router")?;
+    if n == 0
+        || n > DASH_ROWS
+        || d.coff.len() < r0 + n + 1
+        || d.cands.len() > DASH_ROWS * DASH_BLOCKS
+        || d.angles.len() < (r0 + n) * 64
+        || d.nblk > DASH_BLOCKS
+        || (pos + r0 + n) / d.block >= DASH_BLOCKS
+    {
+        return Err(format!("DASH lists of {n} rows past the kernels ({} candidates, {} blocks)", d.cands.len(), d.nblk));
+    }
+    let tab: Vec<f32> = d.angles[r0 * 64..(r0 + n) * 64].iter().flat_map(|&a| [a.sin(), a.cos()]).collect();
+    let rec = [(pos + r0) as i32, d.nblk as i32, 0, 0];
+    unsafe {
+        if !d.cands.is_empty() {
+            super::htod(db.cands.ptr, d.cands)?;
+        }
+        super::htod(db.coff.ptr, &d.coff[r0..r0 + n + 1])?;
+        super::htod(db.tab.ptr, &tab)?;
+        super::htod(db.rec.ptr, &rec)
+    }
 }
 
 /// The small path, with the head when `head`: book, then the launches —
@@ -3065,6 +4306,7 @@ unsafe fn head_launch(c: &Ctx, plan: &HPlan, n: usize) -> Res<usize> {
             0,
             kargs!(plan.h.ptr, fnorm, nullp, hid_i, eps, gemma_i, pp0, pp1, pp2, ps_i),
         )?;
+        prism_planes(c, plan, pp0, pp1, plan.pstride, plan.hidden, n)?;
         js.run(c, fx, &planes, plan.hidden, n)?;
     }
     hst(c, 10, &mut t0)?;
@@ -3100,8 +4342,12 @@ pub(super) fn token(
     layer_base: usize,
     hidden_too: bool,
 ) -> TokenGraphOutcome {
-    if steps != 1 || !loop_norm_at.is_empty() || (!o1.is_empty() && o1.len() != layers.len()) {
-        decline("hybrid token", "a multi-step burst, a mid-stack norm or far-field views short of the layers");
+    if previewing(layers) {
+        decline("hybrid token", "an active block preview");
+        return TokenGraphOutcome::Declined;
+    }
+    if steps != 1 || (!o1.is_empty() && o1.len() != layers.len()) {
+        decline("hybrid token", "a multi-step burst or far-field views short of the layers");
         return TokenGraphOutcome::Declined;
     }
     let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
@@ -3113,7 +4359,7 @@ pub(super) fn token(
     if c.current().is_err() {
         return TokenGraphOutcome::Declined;
     }
-    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm_head, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position) {
+    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm_head, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position, loop_norm_at) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid token", &e);
@@ -3165,6 +4411,7 @@ pub(super) fn token(
             }
             let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
             let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+            dash_upload(&plan, layers, position, 0, 1)?;
             let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed, tl)?;
             if taps.is_some() {
                 // a pageable read: the rows are there when it returns
@@ -3261,7 +4508,7 @@ pub(super) fn mtp_chain(
         return Err(false);
     }
     let st = &mut *st;
-    let plan = match plan_for(c, st, model, layers, layer_base, Some(lm_head), final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position) {
+    let plan = match plan_for(c, st, model, layers, layer_base, Some(lm_head), final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, position, &[]) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid draft chain", &e);
@@ -3309,8 +4556,8 @@ pub(super) fn mtp_chain(
         }
         Ok(())
     };
-    if !plan.invf_local.is_empty() {
-        decline("hybrid draft chain", "a stack with local rotations");
+    if !plan.invf_local.is_empty() || plan.own_geom || plan.mhc.is_some() {
+        decline("hybrid draft chain", "a stack with local rotations or a layer head geometry of its own");
         return Err(false);
     }
     if let Err(e) = prep(st) {
@@ -3439,6 +4686,10 @@ pub(super) fn batch(
     defer: bool,
 ) -> BatchGraphOutcome {
     let b = k;
+    if previewing(layers) {
+        decline("hybrid batch", "an active block preview");
+        return BatchGraphOutcome::Declined;
+    }
     // a sealed layer takes a verify window over its far field (the state on
     // the card at this position), or a prompt chunk read past the seal
     let sealed: Vec<bool> = (0..layers.len()).map(|li| o1.get(li).is_some_and(Option::is_some)).collect();
@@ -3472,8 +4723,15 @@ pub(super) fn batch(
         return BatchGraphOutcome::Declined;
     }
     let lm = spec.as_ref().map(|s| (&s.lm, s.lm_rows));
-    let final_norm: &[f32] = spec.as_ref().map_or(&[], |s| s.final_norm);
-    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0) {
+    // a Looped Transformer's loop norms (the final norm, as the head's)
+    let looped = crate::gpu::batch_loop_norm();
+    let loop_at: &[usize] = looped.as_ref().map_or(&[], |(at, _)| at.as_slice());
+    let final_norm: &[f32] = match (&spec, &looped) {
+        (Some(s), _) => s.final_norm,
+        (None, Some((_, w))) => w.as_slice(),
+        (None, None) => &[],
+    };
+    let plan = match plan_for(c, &mut st, model, layers, layer_base, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, eps, attn_scale, invf, pos0, loop_at) {
         Ok(p) => p,
         Err(e) => {
             decline("hybrid batch", &e);
@@ -3557,6 +4815,7 @@ pub(super) fn batch(
                     if !tab.is_empty() {
                         cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                     }
+                    dash_upload(&plan, layers, pos0, at, n)?;
                     run_small(c, &mut st, &plan, kv_id, layer_base, pos0 + at, n, false, false, cap, &sealed, &[])?;
                     if !defer {
                         cu::memcpy_dtoh_async(&mut h[at * hidden..(at + n) * hidden], plan.h.ptr, c.stream).map_err(derr)?;
@@ -3575,6 +4834,7 @@ pub(super) fn batch(
                 }
                 let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
                 let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
+                dash_upload(&plan, layers, pos0, 0, b)?;
                 let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &sealed, tl)?;
                 if taps.is_some() {
                     super::taps_put(taps_read(c, tl, b, hidden)?);
@@ -3615,6 +4875,7 @@ pub(super) fn batch(
                 }
                 return Ok(());
             }
+            dash_upload(&plan, layers, pos0, 0, b)?;
             unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer, &sealed) }
         }
     };
@@ -3829,6 +5090,13 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, d
     Ok(())
 }
 
+/// The prompt path's residual add of a product `y` [b][hidden] under a
+/// sandwich norm `w` (Gemma): h += rmsnorm(y) * w, a block a row.
+unsafe fn sandwich_rows(c: &Ctx, plan: &HPlan, w: &Buf, h: u64, y: u64, b: usize) -> Res<()> {
+    let (hi, gi) = (plan.hidden as i32, plan.gemma as i32);
+    unsafe { c.launch(plan.fx.norm_add, (b as u32, 1), 256, 0, kargs!(h, y, w.ptr, hi, plan.eps, gi)) }
+}
+
 unsafe fn big(
     c: &Ctx,
     st: &mut State,
@@ -3844,7 +5112,9 @@ unsafe fn big(
     let b = positions.len();
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
-    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some()));
+    let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| {
+        s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some() || a.nkv != plan.nkv || a.hd != plan.hd)
+    });
     if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
         return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
     }
@@ -3864,6 +5134,7 @@ unsafe fn big(
             let mut v = vec![(l.gu.rows, l.gu.cols), (l.down.rows, l.down.cols)];
             match &l.mix {
                 Mix::Gdn(g) => v.extend([(g.qkv.rows, g.qkv.cols), (g.z.rows, g.z.cols), (g.out.rows, g.out.cols)]),
+                Mix::Kda(g) => v.extend([(g.q.rows, g.q.cols), (g.k.rows, g.k.cols), (g.v.rows, g.v.cols), (g.out.rows, g.out.cols)]),
                 Mix::Attn(a) => v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]),
                 Mix::Conv(cv) => v.extend([(cv.inp.rows, cv.inp.cols), (cv.out.rows, cv.out.cols)]),
             }
@@ -3896,8 +5167,8 @@ unsafe fn big(
     let wd_rows = (wd_cap().max(1 << 20) / 2).max(1);
     let mul = |m: &DevMat, x: u64, y: u64, ldy: usize, alpha: f32, beta: f32| -> Res<()> {
         let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
-        if !matches!(m.kind, 2 | 3 | 5 | 6) {
-            return Err("a weight other than repacked q4tp, int8, q1 or ternary tiles on the prompt path".into());
+        if !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) {
+            return Err("a weight other than repacked q4tp, q2tp, int8, q1 or ternary tiles on the prompt path".into());
         }
         if m.kind == 6 && m.rows * m.cols <= wd_rows {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
@@ -3918,12 +5189,18 @@ unsafe fn big(
             let threads = (nt * (m.cols / 32) * 32) as u64;
             let (t0_i, nt_i) = (t0 as i32, nt as i32);
             unsafe {
-                if m.kind == 2 {
+                if m.kind == 10 {
+                    c.launch(fx.expand_q4g, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else if m.kind == 1 || m.kind == 9 {
+                    let aff_i = (m.kind == 9) as i32;
+                    c.launch(fx.expand_q2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i, aff_i))?;
+                } else if m.kind == 2 {
                     c.launch(fx.expand_q1t, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 } else if m.kind == 3 {
                     c.launch(fx.expand_q1, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
-                } else if m.kind == 5 {
-                    c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i))?;
+                } else if m.kind == 5 || m.kind == 15 {
+                    let dual_i = (m.kind == 15) as i32;
+                    c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i, dual_i))?;
                 } else {
                     c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
                 }
@@ -3935,15 +5212,45 @@ unsafe fn big(
         }
         Ok(())
     };
+    // mHC (SenseNova-Loop): the chunk's streams, coefficients and logits;
+    // a sub-layer reads its input rows from bh and leaves its product in
+    // "hb_yo" for the merge
+    let mrows = match &plan.mhc {
+        Some(mp) => Some(MhcRows {
+            h: bh,
+            yo: st.scr(c, "hb_yo", b * hidden * 4)?,
+            r: st.scr(c, "hb_mr", b * mp.ns * hidden * 4)?,
+            coef: st.scr(c, "hb_mc", b * 20 * 4)?,
+            lg: st.scr(c, "hb_ml", b * 24 * 4)?,
+        }),
+        None => None,
+    };
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        let mh = match (&pl.mhc, &plan.mhc, mrows) {
+            (Some(m), Some(mp), Some(r)) => Some((m, mp, r)),
+            _ => None,
+        };
         unsafe {
+            if let Some((m, mp, r)) = mh {
+                mhc_in(c, fx, hidden, m, mp, r, false, b)?;
+            }
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
+        // a Prism file: the projections read the rows in their basis, the GDN
+        // gates the untouched ones
+        let bxf = if plan.prism.is_some() {
+            let bxp = st.scr(c, "hb_xp", b * hidden * 2)?;
+            unsafe { prism_rows(c, plan, bxn, bxp, hidden, hidden, b)? };
+            bxp
+        } else {
+            bxn
+        };
         bst(c, 0, tm)?;
         match &pl.mix {
             // the prompt path is not entered with such a layer (see its guard)
             Mix::Conv(_) => return Err("a short convolution on the prompt path".into()),
+            Mix::Kda(_) => return Err("a KDA layer on the prompt path".into()),
             Mix::Gdn(g) => {
                 let (cd_i, kk_i, nv_i, nk_i, dk_i, dv_i) =
                     (g.cdim as i32, g.kk as i32, g.nv as i32, g.nk as i32, g.dk as i32, g.dv as i32);
@@ -3955,8 +5262,8 @@ unsafe fn big(
                 let gbp = st.scr(c, "hb_gb", b * 2 * g.nv * 4)?;
                 let yo = st.scr(c, "hb_o", b * vd * 4)?;
                 let yof = st.scr(c, "hb_of", b * vd * 2)?;
-                mul(&g.qkv, bxn, yq, g.cdim, 1.0, 0.0)?;
-                mul(&g.z, bxn, yz, vd, 1.0, 0.0)?;
+                mul(&g.qkv, bxf, yq, g.cdim, 1.0, 0.0)?;
+                mul(&g.z, bxf, yz, vd, 1.0, 0.0)?;
                 unsafe {
                     c.gemm(true, false, g.nv, b, hidden, 1.0, g.a_h.ptr, hidden, bxn, hidden, 0.0, yab, 2 * g.nv, Gemm::Half)?;
                     c.gemm(true, false, g.nv, b, hidden, 1.0, g.b_h.ptr, hidden, bxn, hidden, 0.0, yab + (g.nv * 4) as u64, 2 * g.nv, Gemm::Half)?;
@@ -3980,7 +5287,19 @@ unsafe fn big(
                 bst(c, 3, tm)?;
                 gs.next_pos = pos0 + b;
                 gs.tape = None;
-                mul(&g.out, yof, bh, hidden, 1.0, 1.0)?;
+                unsafe { prism_rows(c, plan, yof, yof, vd, vd, b)? };
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&g.out, yof, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&g.out, yof, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    (None, None) => mul(&g.out, yof, bh, hidden, 1.0, 1.0)?,
+                }
             }
             Mix::Attn(a) if sealed.get(li).copied().unwrap_or(false) => {
                 // past the seal: the chunk's rows after the far field's near
@@ -4002,9 +5321,9 @@ unsafe fn big(
                 let bfm = st.scr(c, "hb_fm", b * nh * 4)?;
                 let bfz = st.scr(c, "hb_fz", b * nh * 4)?;
                 let bfn = st.scr(c, "hb_fn", b * nh * hd * 4)?;
-                mul(&a.q, bxn, yq, qr, 1.0, 0.0)?;
-                mul(&a.k, bxn, yk, nkv * hd, 1.0, 0.0)?;
-                mul(&a.v, bxn, yv, nkv * hd, 1.0, 0.0)?;
+                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
                 let (kp, vp, kt, qt, mu, mz, th, ns, w, m, win_len, win_head, far_len, fscale, rect_fm) = {
                     let d = st.hyb.o1.get(&key).ok_or("far field missing on the prompt path")?;
                     if (d.nkv, d.hpk, d.hd) != (nkv, hpk, hd) {
@@ -4021,12 +5340,12 @@ unsafe fn big(
                 // the near rows before the chunk: the sinks with the kept rows,
                 // then the window (unwrapped until it is full)
                 let n0 = ns + win_len;
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i, n0_i) = (qr as i32, (nkv * hd) as i32, n0 as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
                 // a local layer's rotation rows follow the call's (`plan_tab`)
-                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
+                let tabl = btab + (plan.tab_off(a.local, b) * 4) as u64;
                 unsafe {
                     c.launch(
                         fx.qk,
@@ -4111,9 +5430,24 @@ unsafe fn big(
                     d.spec = None;
                 }
                 bst(c, 5, tm)?;
-                mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
+                unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&a.o, bao, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    (None, None) => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                }
             }
             Mix::Attn(a) => {
+                // the layer's head geometry and its kernels
+                let (nkv, hd, fx) = (a.nkv, a.hd, &*a.fx);
+                let hpk = nh / nkv;
                 let qr = a.q.rows;
                 let yq = st.scr(c, "hb_q", b * qr * 4)?;
                 let yk = st.scr(c, "hb_k", b * nkv * hd * 4)?;
@@ -4124,9 +5458,9 @@ unsafe fn big(
                 let aog = st.scr(c, "hb_aog", b * nh * hd * 4)?;
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
                 let bis = st.scr(c, "hb_is", b * nh * 4)?;
-                mul(&a.q, bxn, yq, qr, 1.0, 0.0)?;
-                mul(&a.k, bxn, yk, nkv * hd, 1.0, 0.0)?;
-                mul(&a.v, bxn, yv, nkv * hd, 1.0, 0.0)?;
+                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
                 let hint = st.kv_hint;
                 let (slot0, kp, vp, m_base) = {
                     let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
@@ -4134,12 +5468,16 @@ unsafe fn big(
                     m.stored += b;
                     out
                 };
-                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, plan.half as i32, a.gated as i32);
+                let (nh_i, nkv_i, half_i, gated_i) = (nh as i32, nkv as i32, a.half as i32, a.gated as i32);
                 let (qs_i, kvs_i) = (qr as i32, (nkv * hd) as i32);
                 let (qn, kn) = (a.qn.as_ref().map_or(0, |b| b.ptr), a.kn.as_ref().map_or(0, |b| b.ptr));
                 let (qk_g, (bqp, bkp, bvp)) = qk_flags(a, gemma_i);
-                // a local layer's rotation rows follow the call's (`plan_tab`)
-                let tabl = btab + (a.local * b * plan.half * 2 * 4) as u64;
+                // a local layer's rotation rows follow the call's (`plan_tab`);
+                // a DASH layer's are its rows' own (`dash_upload`)
+                let tabl = match (&a.dash, &plan.dash) {
+                    (Some(_), Some(db)) => db.tab.ptr,
+                    _ => btab + (plan.tab_off(a.local, b) * 4) as u64,
+                };
                 unsafe {
                     c.launch(
                         fx.qk,
@@ -4171,6 +5509,41 @@ unsafe fn big(
                         });
                     }
                 }
+                if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
+                    // DASH: the router over the rows normed in f32, the closing
+                    // blocks' summaries, the attend over the read set into bao
+                    let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                    let (dopen, dbar) = match st.hyb.dash.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(e) => (e.get().0.ptr, e.get().1.ptr),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let e = v.insert((Buf::new(3 * dl.block * 128 * 4)?, Buf::new(DASH_BLOCKS * 128 * 4)?));
+                            (e.0.ptr, e.1.ptr)
+                        }
+                    };
+                    let (blk_i, k_i, win_i) = (dl.block as i32, dl.k as i32, (dl.block * dl.local_blocks) as i32);
+                    let gate_p = if a.gated { gt } else { 0u64 };
+                    unsafe {
+                        c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+                        c.launch(
+                            fx.dash_route,
+                            (b as u32, 1),
+                            256,
+                            0,
+                            kargs!(
+                                bx32, hid_i, dl.w.ptr, dl.qn.ptr, dl.kn.ptr, db.tab.ptr, dopen, dbar, db.coff.ptr, db.cands.ptr, db.sc.ptr,
+                                db.sel.ptr, db.bias.ptr, db.rec.ptr, b_i, blk_i, k_i, eps, dl.idx_scale, dl.floor, dl.sigma
+                            ),
+                        )?;
+                        c.launch(fx.dash_close, (1, 1), 128, 0, kargs!(dopen, dl.hc.ptr, dbar, db.rec.ptr, b_i, blk_i))?;
+                        c.launch(
+                            fx.dash_attend,
+                            (nh as u32, b as u32),
+                            256,
+                            0,
+                            kargs!(qg, kp, vp, db.sel.ptr, db.bias.ptr, gate_p, nul, nul, zero_i, bao, db.rec.ptr, nul, slot0, nh_i, nkv_i, b_i, blk_i, win_i, plan.scale),
+                        )?;
+                    }
+                } else {
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
@@ -4197,7 +5570,8 @@ unsafe fn big(
                     // (the query copy and the exponentials), f32 out
                     unsafe {
                         gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
-                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i))?;
+                        let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i, sinkp))?;
                         gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
@@ -4207,14 +5581,30 @@ unsafe fn big(
                 unsafe {
                     c.launch(fx.attn_out, (n_ao.div_ceil(256) as u32, 1), 256, 0, kargs!(aog, bis, gate_p, bao, nh_i, b_i, one))?;
                 }
+                }
                 bst(c, 5, tm)?;
-                mul(&a.o, bao, bh, hidden, 1.0, 1.0)?;
+                unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&a.o, bao, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&a.o, bao, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    (None, None) => mul(&a.o, bao, bh, hidden, 1.0, 1.0)?,
+                }
             }
         }
         let inter = pl.inter;
         let bgu = st.scr(c, "hb_gu", b * 2 * inter * 4)?;
         let bmh = st.scr(c, "hb_mh", b * inter * 2)?;
         unsafe {
+            if let Some((m, mp, r)) = mh {
+                mhc_in(c, fx, hidden, m, mp, r, true, b)?;
+            }
             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.post_norm.ptr, bxn, hid_i, eps, gemma_i, one, nul, nul, nul, zero_i))?;
         }
         bst(c, 0, tm)?;
@@ -4226,15 +5616,25 @@ unsafe fn big(
             _ => 0,
         };
         if dense_pair {
+            unsafe { prism_rows(c, plan, bxn, bxn, hidden, hidden, b)? };
             mul(&pl.gu, bxn, bgu, 2 * inter, 1.0, 0.0)?;
             let tot = (b * inter) as u64;
             let (in_i, bb_i) = (inter as i32, b as i32);
             unsafe {
-                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i))?;
+                let act_i = pl.gelu as i32;
+                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i, act_i))?;
             }
             bst(c, 6, tm)?;
+            unsafe { prism_rows(c, plan, bmh, bmh, inter, inter, b)? };
             if pl.moe.is_some() {
                 mul(&pl.down, bmh, dsh, hidden, 16.0, 0.0)?;
+            } else if let Some((m, mp, r)) = mh {
+                mul(&pl.down, bmh, r.yo, hidden, 16.0, 0.0)?;
+                unsafe { mhc_out(c, fx, hidden, m, mp, r, true, b)? };
+            } else if let Some(w) = pl.ffn_out.as_deref() {
+                let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                mul(&pl.down, bmh, by, hidden, 16.0, 0.0)?;
+                unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
             } else {
                 mul(&pl.down, bmh, bh, hidden, 16.0, 1.0)?;
             }
@@ -4242,6 +5642,16 @@ unsafe fn big(
         if let Some(m) = &pl.moe {
             unsafe { moe_grouped(c, st, fx, m, bh, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
             bst(c, 6, tm)?;
+        }
+        if let Some(s) = pl.layer_scale {
+            // Gemma-4's layer scalar on the whole residual row
+            let tot = (b * hidden) as u64;
+            unsafe { c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bh, s, tot))? };
+        }
+        // a Looped Transformer's loop boundary: the final norm on the rows
+        if let (true, Some(w)) = (plan.loop_norm.contains(&li), plan.loop_w.as_ref()) {
+            let (nullp, zero_h) = (0u64, 0i32);
+            unsafe { c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, w.ptr, bh, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))? };
         }
         if tapping {
             if let Some(s) = want.iter().position(|&l| l == li) {
@@ -4606,6 +6016,83 @@ mod tests {
         b
     }
 
+    /// The tile matvec's speed by codec (q1, q4tp), shape, window rows and
+    /// launch shape: the numbers behind `MmaSet`'s KS / TB choices
+    /// (`bench_tile_matvec -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn bench_tile_matvec() {
+        use cortiq_core::quant::f32_to_f16;
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 5u64;
+        for (rows, cols) in [(34816usize, 5120usize), (5120, 17408), (10240, 5120), (4096, 2048), (2048, 2048)] {
+            let q1b: Vec<u8> = (0..rows * cols / 32)
+                .flat_map(|_| {
+                    let mut v = f32_to_f16(0.002 + (lcg(&mut seed) % 1000) as f32 * 1e-5).to_le_bytes().to_vec();
+                    v.extend((0..4).map(|_| lcg(&mut seed) as u8));
+                    v
+                })
+                .collect();
+            let (w1, s1) = repack1_on_card(c, &fx, &[&q1b], rows, rows, cols).unwrap();
+            let m1 = DevMat { kind: 3, rows, cols, held: (w1.bytes + s1.bytes) as u64, w: Arc::new(w1.view(0, w1.bytes)), aux0: Some(s1.view(0, s1.bytes)), aux1: None };
+            let q4b = payload(rows, cols, &mut seed);
+            let (w4, a0, a1) = repack_on_card(c, &fx, &[&q4b], rows, rows, cols).unwrap();
+            let m4 = DevMat { kind: 6, rows, cols, held: (w4.bytes + a0.bytes + a1.bytes) as u64, w: Arc::new(w4.view(0, w4.bytes)), aux0: Some(a0.view(0, a0.bytes)), aux1: Some(a1.view(0, a1.bytes)) };
+            let x: Vec<f32> = (0..8 * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+            let xb = Buf::from_slice(&x).unwrap();
+            let pl = |_: ()| Buf::new(8 * cols * 2 + 64).unwrap();
+            let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+            let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+            let y = Buf::new(8 * rows * 4 + 64).unwrap();
+            unsafe { split(c, &fx, &planes, xb.ptr, cols, cols, 8).unwrap() };
+            // int8 tiles with a column field (q8_2f), without (q8_row), and a
+            // q8_2f gate/up pair (two fields)
+            let i8b = |field: bool, seed: &mut u64| {
+                let body: Vec<u8> = (0..rows * cols).map(|_| lcg(seed) as u8).collect();
+                let rs: Vec<u8> = (0..rows).flat_map(|_| f32_to_f16(0.001).to_le_bytes()).collect();
+                let cf: Option<Vec<u8>> = field.then(|| (0..cols).flat_map(|k| f32_to_f16(0.5 + 0.01 * (k % 7) as f32).to_le_bytes()).collect());
+                (body, rs, cf)
+            };
+            let (f8, r8) = (i8b(true, &mut seed), i8b(false, &mut seed));
+            // the matrix owns the allocation its scales and fields sit in
+            let mk8 = |t: (Buf, Buf, Option<Buf>), kind: u8| DevMat { kind, rows, cols, held: t.0.bytes as u64, aux0: t.2, aux1: Some(t.1), w: Arc::new(t.0) };
+            let m8f = mk8(repack8_on_card(c, &fx, &[(&f8.0, &f8.1, f8.2.as_deref())], rows, cols).unwrap(), 5);
+            let m8r = mk8(repack8_on_card(c, &fx, &[(&r8.0, &r8.1, None)], rows, cols).unwrap(), 5);
+            let half = |v: &[u8], each: usize| v[..rows / 2 * each].to_vec();
+            let (gb, gr, gc) = (half(&f8.0, cols), half(&f8.1, 2), f8.2.clone());
+            let m8d = mk8(
+                repack8_on_card(c, &fx, &[(&gb, &gr, gc.as_deref()), (&gb, &gr, gc.as_deref())], rows, cols).unwrap(),
+                15,
+            );
+            for (name, m) in [("q1", &m1), ("q4tp", &m4), ("q8_2f", &m8f), ("q8_row", &m8r), ("q8_2f-pair", &m8d)] {
+                for n in [1usize, 4, 8] {
+                    for (ks16, tb1) in [(false, true), (true, true), (false, false), (true, false)] {
+                        let mut set = mmaset(&[(m, y.ptr, 0, rows, rows)]).unwrap();
+                        set.ks16 = ks16;
+                        set.tb1 = tb1;
+                        let it = 40;
+                        unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+                        c.sync().unwrap();
+                        let t = std::time::Instant::now();
+                        for _ in 0..it {
+                            unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+                        }
+                        c.sync().unwrap();
+                        let us = t.elapsed().as_secs_f64() * 1e6 / it as f64;
+                        println!(
+                            "BENCH {name} {rows}x{cols} n {n} ks {} tb {}: {us:.1} us, {:.0} GB/s",
+                            if ks16 { 16 } else { 8 },
+                            if tb1 { 1 } else { 2 },
+                            m.held as f64 / us / 1e3
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn down<T: Copy + Default>(c: &Ctx, b: &Buf, n: usize) -> Vec<T> {
         let mut v = vec![T::default(); n];
         unsafe { cu::memcpy_dtoh_sync(&mut v, b.ptr) }.unwrap();
@@ -4816,7 +6303,7 @@ mod tests {
             let b = q1t(rows, cols, &mut seed);
             let w = host(&b, rows, cols);
             let base = q1t_base(&b, rows, cols).unwrap();
-            let t = repack1x_on_card(c, &fx, &[base], rows, rows, cols, true).unwrap();
+            let t = repack1x_on_card(c, &fx, &[base], rows, rows, cols, 2).unwrap();
             let got = expand(&t, rows, cols);
             for i in 0..rows * cols {
                 assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} at {},{}", i / cols, i % cols);
@@ -4853,7 +6340,7 @@ mod tests {
         let (inter, cols) = (24usize, 64usize);
         let (g, u) = (q1t(inter, cols, &mut seed), q1t(inter, cols, &mut seed));
         let (wg, wu) = (host(&g, inter, cols), host(&u, inter, cols));
-        let t = repack1x_on_card(c, &fx, &[q1t_base(&g, inter, cols).unwrap(), q1t_base(&u, inter, cols).unwrap()], inter, 2 * inter, cols, true).unwrap();
+        let t = repack1x_on_card(c, &fx, &[q1t_base(&g, inter, cols).unwrap(), q1t_base(&u, inter, cols).unwrap()], inter, 2 * inter, cols, 2).unwrap();
         let got = expand(&t, 2 * inter, cols);
         for r in 0..2 * inter {
             let (src, sr) = if (r & 15) >= 8 { (&wu, (r >> 4) * 8 + (r & 7)) } else { (&wg, (r >> 4) * 8 + (r & 7)) };
@@ -4866,6 +6353,234 @@ mod tests {
         let n = o.len();
         o[n - 4] = 1;
         assert!(q1t_base(&o, 16, 64).is_none());
+    }
+
+    /// q2tp matrices (mid-rise and affine) as q2tp tiles: expanded back they
+    /// are the host's f16 of (c - 1.5) s / (c - 1) s word for word, and the
+    /// tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_q2tp_tiles_match_the_host() {
+        use cortiq_core::quant::{f32_to_f16, q2tp_ladder, q2tp_sections, q4tp_code};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 41u64;
+        let q2 = |rows: usize, cols: usize, seed: &mut u64| -> Vec<u8> {
+            let (po, co, stride) = q2tp_sections(rows, cols);
+            let mut b: Vec<u8> = (0..co + rows * stride).map(|_| lcg(seed) as u8).collect();
+            for r in 0..rows {
+                b[po + r * 4..po + r * 4 + 2].copy_from_slice(&f32_to_f16(-9.0 + (r % 5) as f32 * 0.1).to_le_bytes());
+                b[po + r * 4 + 2..po + r * 4 + 4].copy_from_slice(&f32_to_f16(0.05).to_le_bytes());
+            }
+            b
+        };
+        let host = |b: &[u8], rows: usize, cols: usize, aff: bool| -> Vec<f32> {
+            let (po, co, stride) = q2tp_sections(rows, cols);
+            let gpr = cols / 32;
+            let mut w = vec![0f32; rows * cols];
+            for r in 0..rows {
+                let tab = q2tp_ladder(&b[po..po + rows * 4], r);
+                for g in 0..gpr {
+                    let sc = tab[q4tp_code(&b[co + r * stride..co + (r + 1) * stride], g)];
+                    for k in 0..32 {
+                        let cv = ((b[(r * gpr + g) * 8 + k / 4] >> (2 * (k % 4))) & 3) as f32;
+                        w[r * cols + g * 32 + k] = (cv - if aff { 1.0 } else { 1.5 }) * sc;
+                    }
+                }
+            }
+            w
+        };
+        let expand = |t: &(Buf, Buf, Buf), rows: usize, cols: usize, aff: bool| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt, a_i) = (rows as i32, cols as i32, 0i32, ntile as i32, aff as i32);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_q2, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, t.2.ptr, o.ptr, r_i, c_i, t0, nt, a_i)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        for (rows, cols) in [(40usize, 512usize), (2048, 2048)] {
+            let b = q2(rows, cols, &mut seed);
+            let t = repack2_on_card(c, &fx, &[&b], rows, rows, cols).unwrap();
+            for aff in [false, true] {
+                let w = host(&b, rows, cols, aff);
+                let got = expand(&t, rows, cols, aff);
+                for i in 0..rows * cols {
+                    assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} aff {aff} at {},{}", i / cols, i % cols);
+                }
+                for n in [1usize, 11] {
+                    let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+                    let xb = Buf::from_slice(&x).unwrap();
+                    let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                    let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                    let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                    let y = Buf::new(n * rows * 4 + 64).unwrap();
+                    let kind = if aff { 9 } else { 1 };
+                    let dm = DevMat {
+                        kind,
+                        rows,
+                        cols,
+                        held: 0,
+                        w: Arc::new(t.0.view(0, t.0.bytes)),
+                        aux0: Some(t.1.view(0, t.1.bytes)),
+                        aux1: Some(t.2.view(0, t.2.bytes)),
+                    };
+                    let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                    unsafe {
+                        split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                        set.run(c, &fx, &planes, cols, n).unwrap();
+                    }
+                    c.sync().unwrap();
+                    let yd = down::<f32>(c, &y, n * rows);
+                    for j in 0..n {
+                        for r in 0..rows {
+                            let (mut s, mut a) = (0f64, 0f64);
+                            for k in 0..cols {
+                                let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                                s += p;
+                                a += p.abs();
+                            }
+                            let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                            assert!(e < 1e-4, "{rows}x{cols} aff {aff} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Prism boundary on planes and on f16 rows is the host's
+    /// `signed_fwht_forward` with the f16 cast, word for word.
+    #[test]
+    fn card_prism_matches_the_host() {
+        use cortiq_core::hadamard::{prism_f32_to_f16_rne, signed_fwht_forward};
+        use cortiq_core::quant::{f16_to_f32, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 53u64;
+        let (n, width, blk) = (3usize, 3072usize, 1024usize);
+        let signs: Vec<f32> = (0..width).map(|_| if lcg(&mut seed) & 1 == 1 { 1.0 } else { -1.0 }).collect();
+        let sb = Buf::from_slice(&signs).unwrap();
+        let x: Vec<f32> = (0..n * width).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 3.0).collect();
+        // planes: the host takes their sum as the input
+        let xb = Buf::from_slice(&x).unwrap();
+        let pl = |_: ()| Buf::new(n * width * 2 + 64).unwrap();
+        let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+        let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: width };
+        unsafe { split(c, &fx, &planes, xb.ptr, width, width, n).unwrap() };
+        c.sync().unwrap();
+        let bf = |h: u16| f32::from_bits((h as u32) << 16);
+        let (a0, a1) = (down::<u16>(c, &p0, n * width), down::<u16>(c, &p1, n * width));
+        let mut want = Vec::with_capacity(n * width);
+        for j in 0..n {
+            let mut row: Vec<f32> = (0..width).map(|i| bf(a0[j * width + i]) + bf(a1[j * width + i])).collect();
+            signed_fwht_forward(&mut row, &signs, blk).unwrap();
+            want.extend(row.iter().map(|&v| f16_to_f32(prism_f32_to_f16_rne(v))));
+        }
+        let (st_i, blk_i, f_i) = (width as i32, blk as i32, 1i32);
+        unsafe { c.launch(fx.prism_p, ((width / blk) as u32, n as u32), 256, blk * 4, kargs!(p0.ptr, p1.ptr, st_i, sb.ptr, blk_i, f_i)).unwrap() };
+        c.sync().unwrap();
+        let (b0, b1) = (down::<u16>(c, &p0, n * width), down::<u16>(c, &p1, n * width));
+        for i in 0..n * width {
+            assert_eq!(bf(b0[i]) + bf(b1[i]), want[i], "planes at {i}");
+        }
+        // f16 rows, in place
+        let h: Vec<u16> = x.iter().map(|&v| f32_to_f16(v)).collect();
+        let hb = Buf::from_slice(&h).unwrap();
+        let mut want = Vec::with_capacity(n * width);
+        for j in 0..n {
+            let mut row: Vec<f32> = (0..width).map(|i| f16_to_f32(h[j * width + i])).collect();
+            signed_fwht_forward(&mut row, &signs, blk).unwrap();
+            want.extend(row.iter().map(|&v| prism_f32_to_f16_rne(v)));
+        }
+        unsafe { c.launch(fx.prism_h, ((width / blk) as u32, n as u32), 256, blk * 4, kargs!(hb.ptr, hb.ptr, st_i, sb.ptr, blk_i, f_i)).unwrap() };
+        c.sync().unwrap();
+        assert_eq!(down::<u16>(c, &hb, n * width), want, "f16 rows");
+    }
+
+    /// q4_tiled matrices as q4_tiled tiles: expanded back they are
+    /// `dequant_q4_tiled`'s values word for word (one matrix and a gate/up
+    /// pair), and the tensor-core matvec over them is the host's product.
+    #[test]
+    fn card_q4_tiled_tiles_match_the_host() {
+        use cortiq_core::quant::{dequant_q4_tiled, f32_to_f16};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 61u64;
+        let q4 = |rows: usize, cols: usize, seed: &mut u64| -> Vec<u8> {
+            let mut b = Vec::with_capacity(rows * cols / 32 * 18);
+            for _ in 0..rows * cols / 32 {
+                b.extend(f32_to_f16(0.002 + (lcg(seed) % 1000) as f32 * 1e-5).to_le_bytes());
+                for _ in 0..16 {
+                    b.push(lcg(seed) as u8);
+                }
+            }
+            b
+        };
+        let host = |b: &[u8], rows: usize, cols: usize| -> Vec<f32> {
+            let mut w = vec![0f32; rows * cols];
+            dequant_q4_tiled(b, &mut w);
+            w
+        };
+        let expand = |t: &(Buf, Buf), rows: usize, cols: usize| -> Vec<u16> {
+            let o = Buf::new(rows * cols * 2 + 64).unwrap();
+            let ntile = rows.div_ceil(16);
+            let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
+            let threads = (ntile * (cols / 32) * 32) as u64;
+            unsafe { c.launch(fx.expand_q4g, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            c.sync().unwrap();
+            down::<u16>(c, &o, rows * cols)
+        };
+        for (rows, cols) in [(40usize, 512usize), (2048, 2048)] {
+            let b = q4(rows, cols, &mut seed);
+            let w = host(&b, rows, cols);
+            let t = repack1x_on_card(c, &fx, &[&b], rows, rows, cols, 10).unwrap();
+            let got = expand(&t, rows, cols);
+            for i in 0..rows * cols {
+                assert_eq!(got[i], f32_to_f16(w[i]), "{rows}x{cols} at {},{}", i / cols, i % cols);
+            }
+            for n in [1usize, 11] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 5.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let dm = DevMat { kind: 10, rows, cols, held: 0, w: Arc::new(t.0.view(0, t.0.bytes)), aux0: Some(t.1.view(0, t.1.bytes)), aux1: None };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "{rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
+        let (inter, cols) = (24usize, 64usize);
+        let (g, u) = (q4(inter, cols, &mut seed), q4(inter, cols, &mut seed));
+        let (wg, wu) = (host(&g, inter, cols), host(&u, inter, cols));
+        let t = repack1x_on_card(c, &fx, &[&g, &u], inter, 2 * inter, cols, 10).unwrap();
+        let got = expand(&t, 2 * inter, cols);
+        for r in 0..2 * inter {
+            let (src, sr) = if (r & 15) >= 8 { (&wu, (r >> 4) * 8 + (r & 7)) } else { (&wg, (r >> 4) * 8 + (r & 7)) };
+            for k in 0..cols {
+                assert_eq!(got[r * cols + k], f32_to_f16(src[sr * cols + k]), "pair at {r},{k}");
+            }
+        }
     }
 
     /// int8 matrices (q8_2f with its column field, q8_row without) as int8
@@ -4884,7 +6599,8 @@ mod tests {
             let body: Vec<u8> = (0..rows * cols).map(|_| lcg(seed) as u8).collect();
             let h = |v: f32| f32_to_f16(v).to_le_bytes();
             let rs: Vec<u8> = (0..rows).flat_map(|r| h(0.001 + 0.0001 * (r % 7) as f32)).collect();
-            let cf = field.then(|| (0..cols).flat_map(|k| h(0.5 + 0.03 * (k % 11) as f32)).collect());
+            let fo = (lcg(seed) % 7) as usize;
+            let cf = field.then(|| (0..cols).flat_map(|k| h(0.5 + 0.03 * ((k + fo) % 11) as f32)).collect());
             (body, rs, cf)
         };
         // the weight as the card's expand makes it: (int8 * rs) * cf in f32
@@ -4898,8 +6614,10 @@ mod tests {
             let ntile = rows.div_ceil(16);
             let (r_i, c_i, t0, nt) = (rows as i32, cols as i32, 0i32, ntile as i32);
             let cf = t.2.as_ref().map_or(0, |b| b.ptr);
+            // two fields (a q8_2f pair's): the up rows under the second
+            let dual_i = t.2.as_ref().is_some_and(|b| b.bytes == 2 * cols * 4) as i32;
             let threads = (ntile * (cols / 32) * 32) as u64;
-            unsafe { c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, cf, o.ptr, r_i, c_i, t0, nt)).unwrap() };
+            unsafe { c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(t.0.ptr, t.1.ptr, cf, o.ptr, r_i, c_i, t0, nt, dual_i)).unwrap() };
             c.sync().unwrap();
             down::<u16>(c, &o, rows * cols)
         };
@@ -4959,8 +6677,51 @@ mod tests {
                 assert_eq!(got[r * cols + k], f32_to_f16(w(src, sr, k, cols)), "pair at {r},{k}");
             }
         }
-        // a q8_2f pair would need two column scalings of one input
-        let g2 = q8(inter, cols, true, &mut seed);
-        assert!(repack8_on_card(c, &fx, &[parts(&g2), parts(&g2)], 2 * inter, cols).is_err());
+        // a q8_2f pair: two column fields, the up rows under their own
+        // (kind 15), expanded and through the tensor-core kernel (1 and 3 rows)
+        for (inter, cols) in [(24usize, 64usize), (1024, 2048)] {
+            let g2 = q8(inter, cols, true, &mut seed);
+            let u2 = q8(inter, cols, true, &mut seed);
+            let rows = 2 * inter;
+            let t = repack8_on_card(c, &fx, &[parts(&g2), parts(&u2)], rows, cols).unwrap();
+            let src = |r: usize| if (r & 15) >= 8 { (&u2, (r >> 4) * 8 + (r & 7)) } else { (&g2, (r >> 4) * 8 + (r & 7)) };
+            let got = expand(&t, rows, cols);
+            for r in 0..rows {
+                let (m, sr) = src(r);
+                for k in 0..cols {
+                    assert_eq!(got[r * cols + k], f32_to_f16(w(m, sr, k, cols)), "q8_2f pair at {r},{k}");
+                }
+            }
+            for n in [1usize, 3] {
+                let x: Vec<f32> = (0..n * cols).map(|_| ((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0) * 37.0).collect();
+                let xb = Buf::from_slice(&x).unwrap();
+                let pl = |_: ()| Buf::new(n * cols * 2 + 64).unwrap();
+                let (p0, p1, p2) = (pl(()), pl(()), pl(()));
+                let planes = Planes { p0: p0.ptr, p1: p1.ptr, p2: p2.ptr, stride: cols };
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let (tw, trs, tcf) = (t.0.view(0, t.0.bytes), t.1.view(0, t.1.bytes), t.2.as_ref().map(|b| b.view(0, b.bytes)));
+                let dm = DevMat { kind: 15, rows, cols, held: 0, w: Arc::new(tw), aux0: tcf, aux1: Some(trs) };
+                let set = mmaset(&[(&dm, y.ptr, 0, rows, rows)]).unwrap();
+                unsafe {
+                    split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap();
+                    set.run(c, &fx, &planes, cols, n).unwrap();
+                }
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for r in 0..rows {
+                        let (m, sr) = src(r);
+                        let (mut s, mut a) = (0f64, 0f64);
+                        for k in 0..cols {
+                            let p = w(m, sr, k, cols) as f64 * x[j * cols + k] as f64;
+                            s += p;
+                            a += p.abs();
+                        }
+                        let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "q8_2f pair {rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
+                    }
+                }
+            }
+        }
     }
 }

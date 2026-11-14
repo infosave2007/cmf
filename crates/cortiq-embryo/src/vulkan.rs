@@ -33,6 +33,11 @@ struct OpRec {
 #[derive(Clone)]
 pub struct DeviceBuf(Arc<BufInner>);
 
+/// A device buffer of the wgpu layer (the split-K pool's element).
+#[cfg(not(feature = "cuda"))]
+type RawBuf = wgpu::Buffer;
+
+#[cfg(not(feature = "cuda"))]
 struct BufInner {
     raw: wgpu::Buffer,
     len: usize,
@@ -42,6 +47,7 @@ struct BufInner {
     ctx: Arc<CtxInner>,
 }
 
+#[cfg(not(feature = "cuda"))]
 struct TsState {
     // wgpu caps a query set at 4096 entries; a full step takes more pairs.
     query_sets: Vec<wgpu::QuerySet>,
@@ -50,6 +56,7 @@ struct TsState {
     period_ns: f32,
 }
 
+#[cfg(not(feature = "cuda"))]
 /// Process-wide device context.  The card is deliberately selected through
 /// Vulkan only; a software adapter is rejected unless CMF_GPU_SOFTWARE=1.
 struct CtxInner {
@@ -98,12 +105,15 @@ struct CtxInner {
     /// commit), so concurrent command streams never share one.
     splitk_pool: Mutex<Vec<(wgpu::Buffer, usize)>>,
 }
+#[cfg(not(feature = "cuda"))]
 pub struct Ctx {
     inner: Arc<CtxInner>,
 }
 
+#[cfg(not(feature = "cuda"))]
 static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
 
+#[cfg(not(feature = "cuda"))]
 /// Process-wide Vulkan context.  `None` is an honest capability refusal; the
 /// caller must not silently run a CPU implementation under the GPU name.
 pub fn ctx() -> Option<&'static Ctx> {
@@ -117,6 +127,7 @@ pub fn ctx() -> Option<&'static Ctx> {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
 fn init() -> Result<Ctx, String> {
     // On Linux this is the production Vulkan backend. On macOS this file is
     // only the private `vulkan_validation` build (lib.rs): the same WGSL runs
@@ -328,6 +339,7 @@ fn init() -> Result<Ctx, String> {
     })
 }
 
+#[cfg(not(feature = "cuda"))]
 impl CtxInner {
     /// Return the operation-specialized pipeline, or the single fallback
     /// pipeline when explicitly disabled for an A/B comparison.  The shader
@@ -402,6 +414,7 @@ pub struct GBuf {
     pub len: usize,
 }
 
+#[cfg(not(feature = "cuda"))]
 impl DeviceBuf {
     fn raw(&self) -> &wgpu::Buffer {
         &self.0.raw
@@ -577,6 +590,7 @@ impl GBuf {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
 fn new_buf(ctx: &Arc<CtxInner>, len: usize, init: Option<&[u32]>) -> Arc<BufInner> {
     let n = len.max(1);
     let raw = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -612,7 +626,7 @@ pub struct Cmd<'a> {
     /// 0 (state carried across windows) instead of S = 0 (op 29 p[9]).
     hk_carry: std::cell::Cell<bool>,
     /// The split-K partial buffer this stream borrowed from the pool.
-    splitk: RefCell<Option<(wgpu::Buffer, usize)>>,
+    splitk: RefCell<Option<(RawBuf, usize)>>,
 }
 
 impl<'a> Cmd<'a> {
@@ -630,18 +644,9 @@ impl<'a> Cmd<'a> {
     }
 
     fn rec(&self, op: u32, slots: &[(&GBuf, usize)], mut p: Vec<u32>, n: usize) {
-        let mut binds = std::array::from_fn(|_| DeviceBuf(Arc::clone(&self.c.inner_dummy().0)));
-        // `inner_dummy` is only a helper for array initialisation; replace all
-        // slots with the context's real 4-byte dummy below.
-        let dummy = DeviceBuf(Arc::new(BufInner {
-            raw: self.c.inner.dummy.clone(),
-            len: 1,
-            host: UnsafeCell::new(vec![0]),
-            host_dirty: std::sync::atomic::AtomicBool::new(false),
-            gpu_dirty: std::sync::atomic::AtomicBool::new(false),
-            ctx: Arc::clone(&self.c.inner),
-        }));
-        binds = std::array::from_fn(|_| dummy.clone());
+        // the context's dummy in every slot the operation leaves unbound
+        let dummy = self.c.inner_dummy();
+        let mut binds: [DeviceBuf; SLOTS] = std::array::from_fn(|_| dummy.clone());
         for (x, i) in slots {
             binds[*i] = x.buf.clone();
         }
@@ -906,6 +911,10 @@ impl<'a> Cmd<'a> {
         // deliberately fixed, but rows outside the GPU-produced count are
         // guarded in the shader and never reach a weight update.
         p[27] = causal as u32;
+        #[cfg(feature = "cuda")]
+        if self.cublas_gemm(&p, a, b, c, causal, dynamic, &table, band) {
+            return;
+        }
         p[28] = dynamic.kcount.is_some() as u32;
         if let Some((_, koff)) = dynamic.kcount {
             p[29] = koff as u32;
@@ -3409,6 +3418,7 @@ impl<'a> Cmd<'a> {
         }
     }
 
+#[cfg(not(feature = "cuda"))]
     /// The split-K partial buffer of this stream (≥ `n` floats): borrowed
     /// from the context pool on first use, kept until `commit`.
     fn splitk_scratch(&self, n: usize) -> GBuf {
@@ -3449,6 +3459,7 @@ impl<'a> Cmd<'a> {
         }
     }
 
+#[cfg(not(feature = "cuda"))]
     pub fn commit(self) -> f64 {
         let splitk = self.splitk.borrow_mut().take();
         let ops = self.ops.into_inner();
@@ -3639,6 +3650,7 @@ impl<'a> Cmd<'a> {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
 // `create_buffer_init` is the only utility trait used by the backend.
 use wgpu::util::DeviceExt;
 
@@ -4958,6 +4970,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+#[cfg(not(feature = "cuda"))]
 impl Ctx {
     fn inner_dummy(&self) -> DeviceBuf {
         DeviceBuf(Arc::new(BufInner {
@@ -4969,14 +4982,33 @@ impl Ctx {
             ctx: Arc::clone(&self.inner),
         }))
     }
+}
+
+impl Ctx {
     pub fn adapter_name(&self) -> &str {
         &self.inner.adapter_name
     }
 }
 
+// The CUDA device layer in place of the wgpu one above.
+#[cfg(feature = "cuda")]
+include!("cuda_dev.rs");
+
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
+
+    /// The CUDA C of the kernels, for a look or an offline `nvcc` check
+    /// (`CMF_EMBRYO_CU_OUT`, default `embryo_train.cu` in the temp dir).
+    #[test]
+    #[ignore]
+    fn dump_cuda_translation() {
+        let out = std::env::var("CMF_EMBRYO_CU_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("embryo_train.cu"));
+        std::fs::write(&out, crate::wgsl_cuda::translate(EMBRYO_WGSL)).unwrap();
+        eprintln!("wrote {}", out.display());
+    }
 
     /// The residual from products picks the same expert as the per-row reduction.
     #[test]

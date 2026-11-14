@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-cli"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "axum",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-core"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-decision"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-embryo"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -640,6 +640,7 @@ dependencies = [
  "clap",
  "cortiq-core",
  "cortiq-engine",
+ "cudarc",
  "fancy-regex 0.14.0",
  "flate2",
  "metal",
@@ -653,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-engine"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "ash",
@@ -687,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-ffi"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "cortiq-core",
  "cortiq-engine",
@@ -698,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-net"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "bincode",
  "cortiq-core",
@@ -710,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-server"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "axum",
@@ -735,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-spectra"
-version = "0.8.95"
+version = "0.8.96"
 dependencies = [
  "anyhow",
  "clap",

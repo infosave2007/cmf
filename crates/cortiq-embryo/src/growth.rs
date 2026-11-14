@@ -886,7 +886,7 @@ pub fn train_grown_experts(
                 gt.e0
             );
             let g0 = EmbryoGpu::new_eval_dropless(g.cfg.clone(), a.batch, a.seq, &g.params)
-                .ok_or_else(|| anyhow::anyhow!("no GPU backend (Metal on macOS / --features vulkan)"))?;
+                .ok_or_else(|| anyhow::anyhow!("no GPU backend (Metal on macOS / --features vulkan / --features cuda)"))?;
             g0.set_desc(&g.extras);
             g0.desc_updates.set(false);
             let l = eval_windows(&g0, &batches);
@@ -896,7 +896,7 @@ pub fn train_grown_experts(
         None => None,
     };
     let mut gpu = EmbryoGpu::new_eval_dropless(cfg.clone(), a.batch, a.seq, &ck.params)
-        .ok_or_else(|| anyhow::anyhow!("no GPU backend (Metal on macOS / --features vulkan)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no GPU backend (Metal on macOS / --features vulkan / --features cuda)"))?;
     gpu.set_desc(&ck.extras);
     gpu.desc_frozen_below.set(gt.e0);
     if gt.freeze_bias {

@@ -1459,7 +1459,7 @@ fn main() {
                     phi_prompts, general_prompts, refit_base, phi_max, phi_batch, phi_max_len,
                     route_margin, target_fpr,
                 );
-                eprintln!("skill-bake needs a GPU backend: Metal (macOS) or --features vulkan");
+                eprintln!("skill-bake needs a GPU backend: Metal (macOS), --features vulkan or --features cuda");
                 std::process::exit(1);
             }
         }
@@ -1747,7 +1747,7 @@ fn main() {
                     shell_quantile, shell_target_shift, bias_mode, source_mode, novel_quantile, desc_mode, record_out,
                     base, id, out_ckpt, export, steps, lr, batch, seq, gate, held_batches, noise, shift, seed,
                 );
-                eprintln!("grow needs a GPU backend: Metal (macOS) or --features vulkan");
+                eprintln!("grow needs a GPU backend: Metal (macOS), --features vulkan or --features cuda");
                 std::process::exit(1);
             }
         }
@@ -1838,7 +1838,7 @@ fn main() {
                     shell_quantile, shell_target_shift, bias_mode, source_mode, novel_quantile, desc_mode, seed,
                     record_out, base, id, batch, seq,
                 );
-                eprintln!("reshell needs a GPU backend: Metal (macOS) or --features vulkan");
+                eprintln!("reshell needs a GPU backend: Metal (macOS), --features vulkan or --features cuda");
                 std::process::exit(1);
             }
         }
@@ -2059,7 +2059,7 @@ fn main() {
             #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
             {
                 let _ = (ckpt, shard, windows, batch, seq, seed, one_pass);
-                eprintln!("needs a training device: Metal (macOS) or Vulkan (--features vulkan)");
+                eprintln!("needs a training device: Metal (macOS), Vulkan (--features vulkan) or CUDA (--features cuda)");
                 std::process::exit(1);
             }
         }
@@ -2085,7 +2085,7 @@ fn main() {
             #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
             {
                 let _ = (ckpt, shard, pairs, dists, trials, seed, max_seq);
-                eprintln!("needs a training device: Metal (macOS) or Vulkan (--features vulkan)");
+                eprintln!("needs a training device: Metal (macOS), Vulkan (--features vulkan) or CUDA (--features cuda)");
                 std::process::exit(1);
             }
         }
@@ -2101,7 +2101,7 @@ fn main() {
             #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
             {
                 let _ = (batch, seq, steps, tiny, cfg_json);
-                eprintln!("needs a training device: Metal (macOS) or Vulkan (--features vulkan)");
+                eprintln!("needs a training device: Metal (macOS), Vulkan (--features vulkan) or CUDA (--features cuda)");
                 std::process::exit(1);
             }
         }

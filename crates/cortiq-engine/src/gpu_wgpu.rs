@@ -28084,6 +28084,8 @@ fn graph_layer_payload_bytes(
             add(inp)?;
             add(out)?;
         }
+        // no wgpu kernels: the graphs decline these stacks at their entry
+        crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => {}
     }
     match &layer.ffn {
         crate::gpu::GraphFfn::AttentionOnly => {}
@@ -28239,6 +28241,10 @@ pub fn forward_token_graph(
         return token_graph_outcome(o1_started || state_started, false);
     };
     let _op = c.op_gate.enter();
+    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
+        graph_refused("a KDA or MLA layer: no wgpu kernels");
+        return token_graph_outcome(o1_started || state_started, false);
+    }
     let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
@@ -28744,6 +28750,7 @@ pub fn forward_token_graph(
                     cdim,
                 }
             }
+            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
             crate::gpu::GraphAttn::ShortConv {
                 inp, out, kernel, ..
             } => {
@@ -29662,6 +29669,7 @@ pub fn forward_token_graph(
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -30659,6 +30667,7 @@ pub fn forward_token_graph(
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
             }
         }
         {
@@ -34828,6 +34837,23 @@ pub fn forward_batch_graph_at(
         bgraph_refused("k/positions mismatch");
         return batch_outcome(o1_started || state_started, false);
     }
+    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
+        bgraph_refused("a KDA or MLA layer: no wgpu kernels");
+        return batch_outcome(o1_started || state_started, false);
+    }
+    // A Looped Transformer's loop boundaries (`gpu::set_batch_loop_norm`):
+    // the final norm on the stream after a loop's last layer, which a plain
+    // residual tail takes (a sandwich or mHC tail declines).
+    let loop_norm = crate::gpu::batch_loop_norm();
+    let loop_at: &[usize] = loop_norm.as_ref().map_or(&[], |(at, _)| at.as_slice());
+    if loop_norm.as_ref().is_some_and(|(_, w)| w.len() != hidden)
+        || loop_at
+            .iter()
+            .any(|&li| layers.get(li).is_none_or(|l| l.ffn_out_norm.is_some() || l.layer_scale.is_some() || l.mhc.is_some()))
+    {
+        bgraph_refused("a loop boundary the batch graph has no norm for");
+        return batch_outcome(o1_started || state_started, false);
+    }
     if layers.iter().any(|l| matches!(l.ffn, crate::gpu::GraphFfn::AttentionOnly))
         && (layers.len() != 1 || spec.is_some() || !matches!(layers[0].attn, crate::gpu::GraphAttn::Full { .. }))
     {
@@ -35336,6 +35362,7 @@ pub fn forward_batch_graph_at(
                 // walks positions in order yet; prefill stays per-op.
                 return batch_outcome(o1_started || state_started, false);
             }
+            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
         };
         let bffn = match &l.ffn {
             crate::gpu::GraphFfn::AttentionOnly => BFfn::AttentionOnly,
@@ -35583,6 +35610,7 @@ pub fn forward_batch_graph_at(
                         }
                     }
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -35671,6 +35699,7 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
             }
         }
         // Upload every layer's sealed state before the first command dispatch.
@@ -35806,6 +35835,7 @@ pub fn forward_batch_graph_at(
     // Layer outputs a caller asked to keep (`layer_taps_arm`), every row's.
     let layer_taps = layer_taps_plan(c, layer_base, layers.len(), k, hidden);
     let n1 = rwc(k * hidden);
+    let loop_fnw = loop_norm.as_ref().map(|(_, w)| stor(bytemuck::cast_slice(&w[..])));
     // Ripple's value residual: the chunk's embedding rows (from the host with
     // the geometry) and the blended V input of the layer being encoded.
     let vres_rows = layers.iter().find_map(|l| match &l.attn {
@@ -36163,6 +36193,7 @@ pub fn forward_batch_graph_at(
                     kvbufs.push(None);
                     gdnbufs.push(None);
                 }
+                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
             }
         }
     }
@@ -36677,7 +36708,11 @@ pub fn forward_batch_graph_at(
          src: &wgpu::Buffer,
          so: usize,
          dst: &wgpu::Buffer,
-         n: usize| enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, 0, (n * 4) as u64);
+         n: usize| {
+            // the merged pass ends before a copy (an open pass locks the encoder)
+            flush_pass(&*enc);
+            enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, 0, (n * 4) as u64)
+        };
     // Однострочные срезы батча для MoE: его ядра написаны на ОДИН токен,
     // поэтому i-я строка копируется сюда, считается и уезжает обратно.
     let row_in = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -36757,7 +36792,10 @@ pub fn forward_batch_graph_at(
          src: &wgpu::Buffer,
          dst: &wgpu::Buffer,
          dof: usize,
-         n: usize| enc.copy_buffer_to_buffer(src, 0, dst, (dof * 4) as u64, (n * 4) as u64);
+         n: usize| {
+            flush_pass(&*enc);
+            enc.copy_buffer_to_buffer(src, 0, dst, (dof * 4) as u64, (n * 4) as u64)
+        };
     // Bootstrap first layer's input norm over all k rows.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
     go(
@@ -39592,6 +39630,16 @@ pub fn forward_batch_graph_at(
             let (mr, mk) = mhc::bufs_k(c, hidden, k);
             let um = unif(&mhc::params_k(hidden, k, false, m.leave, m.iters, m.pre_scale));
             go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, &ob, &mk, &um]), ((k * hidden) as u32).div_ceil(256));
+            if li + 1 < layers.len() {
+                let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw_next, &n1, &rms_u]), k as u32);
+            }
+        } else if let (true, Some(fnw)) = (loop_at.contains(&li), loop_fnw.as_ref()) {
+            // a loop's last layer: h += ffn; h = rms(h)·final_norm; then the
+            // next layer's input norm (none past the span's last layer)
+            go(&mut enc, &c.add_rmsnorm_b, &bg(&c.layout_add_rmsnorm_b, &[&h_buf, ffn_out, fnw, &n1, &rms_u]), k as u32);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (k * hidden * 4) as u64);
             if li + 1 < layers.len() {
                 let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
                 go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw_next, &n1, &rms_u]), k as u32);

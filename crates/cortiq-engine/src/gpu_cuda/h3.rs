@@ -56,6 +56,9 @@ pub use s2v_vae::{s2v_vae_decode, s2v_vae_encode, s2v_vae_release};
 #[path = "sam3.rs"]
 mod sam3;
 pub use sam3::{sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk};
+#[path = "vit.rs"]
+mod vit;
+pub use vit::{sam_encode, vit_encode};
 #[path = "primal.rs"]
 mod primal;
 pub use primal::primal_vae_run;

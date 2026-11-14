@@ -114,6 +114,10 @@ pub fn forward_embryo_graph_chunk(
     n: usize,
     logits: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::forward_embryo_graph_chunk(model, kv_id, rows, position, n, logits);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::forward_embryo_graph_chunk(model, kv_id, rows, position, n, logits);
@@ -128,6 +132,10 @@ pub fn forward_embryo_graph_chunk(
 /// long-context claim of the resident path — a bounded genome reports
 /// the same two numbers at every context depth.
 pub fn embryo_device_state_bytes(kv_id: u64) -> Option<(u64, u64)> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_device_state_bytes(kv_id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_device_state_bytes(kv_id);
@@ -165,6 +173,10 @@ pub fn placement_weight_bytes(model: &CmfModel) -> u64 {
 /// device holds positions `0..n` of it), `None` when the device holds no
 /// initialized image of that sequence — the host owns it (or none began).
 pub fn embryo_device_next_position(kv_id: u64) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_device_next_position(kv_id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_device_next_position(kv_id);
@@ -1854,6 +1866,69 @@ pub enum GraphAttn<'a> {
         /// this mixer is always (the batch graph declines it).
         cpu_state: &'a [f32],
     },
+    /// Kimi Delta Attention (Kimi-Linear): the delta rule with a decay per
+    /// key channel, separate q / k / v short convolutions over one ring, a
+    /// low-rank decay projection and a sigmoid-gated output norm
+    /// (`linear_core::kda_step` has the semantics).
+    Kda {
+        q: GraphW<'a>,
+        k: GraphW<'a>,
+        v: GraphW<'a>,
+        /// Depthwise taps `[channel][kk]` of the q, k and v convs (one ring
+        /// of their channels on the device).
+        conv_q: &'a [f32],
+        conv_k: &'a [f32],
+        conv_v: &'a [f32],
+        /// Low-rank decay `f = f_b · (f_a · x)`: `[rank, hidden]`, `[nh·dk, rank]`.
+        f_a: GraphW<'a>,
+        f_b: GraphW<'a>,
+        dt_bias: &'a [f32],
+        /// `[nh]`, `[dk]` or `[nh·dk]` (broadcast by length).
+        a_log: &'a [f32],
+        /// `[nh, hidden]`: β = σ(b · x).
+        b: GraphW<'a>,
+        /// The output gate `g_b · (g_a · x)` (`g_b` None: `g_a` is full rank).
+        g_a: GraphW<'a>,
+        g_b: Option<GraphW<'a>>,
+        /// `[dv]`, the per-head gated RMS norm.
+        o_norm: &'a [f32],
+        out: GraphW<'a>,
+        nh: usize,
+        dk: usize,
+        dv: usize,
+        kk: usize,
+        /// Some(lb): log-decay = lb·σ(exp(A)·(f + bias)); None: −exp(A)·softplus(f + bias).
+        lower_bound: Option<f32>,
+        /// CPU state `[q ring | k ring | v ring | S]` (`KdaCfg::state_len`).
+        cpu_state: &'a [f32],
+    },
+    /// DeepSeek-V2 Multi-head Latent Attention as multi-head attention
+    /// (`pipeline::mla_attention`): q (through its low-rank stage), the
+    /// latent and its norm, the per-head `[k_rope | k_nope]` keys and the
+    /// values; the attention itself is `Full`'s with heads `rope + nope`
+    /// wide and V `v_dim` wide.
+    Mla {
+        q_a: Option<GraphW<'a>>,
+        q_a_norm: Option<&'a [f32]>,
+        q: GraphW<'a>,
+        /// `[lora + rope, hidden]`, the latent first.
+        kv_a: GraphW<'a>,
+        kv_a_norm: &'a [f32],
+        /// `[nh·(nope + v), lora]`, per head `[k_nope | v]`.
+        kv_b: GraphW<'a>,
+        o: GraphW<'a>,
+        nh: usize,
+        rope: usize,
+        nope: usize,
+        v_dim: usize,
+        lora: usize,
+        scale: f32,
+        /// Kimi-Linear: no rotation at all.
+        no_rope: bool,
+        cpu_k: &'a [Vec<f32>],
+        cpu_v: &'a [Vec<f32>],
+        cpu_base: usize,
+    },
 }
 
 /// Per-layer attention geometry for the wgpu graphs (see
@@ -2310,6 +2385,10 @@ pub fn dory_kv_bytes(id: u64) -> Option<u64> {
 
 /// Is the f16 token path of the resident graph there on this device?
 pub fn embryo_wide_ready(q8: bool) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_wide_ready(q8);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_wide_ready(q8);
@@ -2329,6 +2408,10 @@ pub fn forward_embryo_graph(
     position: usize,
     logits: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::forward_embryo_graph(model, kv_id, hidden, position, logits);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::forward_embryo_graph(model, kv_id, hidden, position, logits);
@@ -2875,6 +2958,24 @@ pub fn set_batch_kv_hint(_rows: usize) {
     }
 }
 
+thread_local! {
+    /// A Looped Transformer's batch-graph call (`set_batch_loop_norm`).
+    static BATCH_LOOP: std::cell::RefCell<Option<(Vec<usize>, std::sync::Arc<Vec<f32>>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A Looped Transformer's next batch-graph calls on this thread: the
+/// span-relative layers after which the final norm goes on the stream
+/// (`loop_norm_at` of the token graph), and that norm; `None` clears it. A
+/// backend that cannot apply them declines the call.
+pub fn set_batch_loop_norm(v: Option<(Vec<usize>, Vec<f32>)>) {
+    BATCH_LOOP.with(|b| *b.borrow_mut() = v.map(|(at, w)| (at, std::sync::Arc::new(w))));
+}
+
+/// The loop norms `set_batch_loop_norm` armed (`None`: a plain stack).
+pub(crate) fn batch_loop_norm() -> Option<(Vec<usize>, std::sync::Arc<Vec<f32>>)> {
+    BATCH_LOOP.with(|b| b.borrow().clone()).filter(|(at, _)| !at.is_empty())
+}
+
 /// Whether a sequence's wgpu K/V mirrors may be f16 (`gpu_wgpu::kv16`):
 /// the first note after a reset decides.
 pub fn graph_kv16_note(_kv_id: u64, _allowed: bool) {
@@ -2889,6 +2990,7 @@ pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         crate::gpu_cuda::kv_reset(_kv_id);
+        crate::gpu_cuda::embryo_graph_reset(_kv_id);
     }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
@@ -4703,6 +4805,8 @@ pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
         Backend::Metal => crate::gpu_metal::vit::encode(a, x),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::encode(a, x),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::vit_encode(a, x),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4765,6 +4869,8 @@ pub fn sam_encode(a: &SamArgs, x: &[f32], out: &mut Vec<f32>) -> bool {
         Backend::Metal => crate::gpu_metal::vit::sam_encode(a, x, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::vit::sam_encode(a, x, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::sam_encode(a, x, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

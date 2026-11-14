@@ -7,7 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.96] — 2026-11-14
+
 ### Added
+- The resident Embryo graph on CUDA (`gpu_cuda/embryo.rs`, `embryo.cu`): the wide token path of
+  `gpu_wgpu/embryo_wide.wgsl` (GDN mixers, bounded anchors with their sinks, the resonance router, the
+  hierarchical head with its cluster gate) over the same packed model, q8_2f or f16, recurrent state and rings
+  on the card for the whole sequence; `CMF_EMBRYO_RESIDENT=1` with `CMF_GPU=cuda`, the chunked prefill
+  included. Embryo-56M, which ran op by op on CUDA at 390-410 tok/s, decodes at 884-957 tok/s against the
+  Vulkan resident graph's 661-720 and the CPU's 424-443 on an RTX A5000 (fast build); the greedy text
+  identical to the CPU's.
+- The Embryo trainer on CUDA (`cortiq-embryo --features cuda`): the Vulkan backend's operation recording with
+  a CUDA device layer (`src/cuda_dev.rs`), its WGSL kernels translated to CUDA C at start (`src/wgsl_cuda.rs`,
+  one source for both backends) and compiled by NVRTC, the PTX kept on disk. Every backend and `vulkan_*` suite
+  passes on it. On an RTX A5000, B8×T1024: an Embryo-0 step 339 ms against Vulkan's 708 (24 100 against 11 600
+  tok/s), a GDN genome's 350 against 511, the first step 0.36 against 2.4 s; the losses of the first six steps
+  equal Vulkan's (Embryo-0) or within 0.003 (GDN). cuBLAS for the plain GEMMs is opt-in (`CMF_CUDA_CUBLAS=1`):
+  no faster here, and it gives up the bit identity of a GEMM's loop and table forms.
+- q2tp weights and Prism's activation boundary on the CUDA hybrid arm. q2tp tiles (job kinds 1 and 9) carry a
+  lane's 16 two-bit codes a 32-column group beside q4tp's ladder and rung codes (rung 0 a zero group), the
+  registers built exactly as bf16 (the mid-rise 2c - 3 with the half in the scale, or the affine correction's
+  c - 1); `hy_repack2`, and `hy_expand_q2r` for the prompt path. A Prism file's forward matrices read their
+  input through `hy_prism_p` (the planes in place) or `hy_prism_h` (f16 rows): every 1024-block of a row as
+  FWHT(x * signs) / 32 cast to f16, the host's butterflies in their order, at every input site of the token
+  graph and the prompt path (the GDN gates keep the untouched rows); a stack whose matrices are not all in
+  the forward basis declines. Ternary-Bonsai-2-27B (q2tp affine, prism_hadamard_qwen35), which ran op by op
+  on CUDA at 0.44 tok/s, runs the whole token graph: RTX A5000, fast build, CUDA against Vulkan on the same
+  card, decode 26.1 against 24.5 tok/s, a 4096-token prompt 740 against 117 tok/s (first token 5.5 against
+  34.9 s); the greedy text identical to the CPU's.
+- A routed FFN with q2tp gate/up experts beside q4tp down ones (the `gu_q2` profile) on the CUDA hybrid arm,
+  each expert loaded by its file codec: Qwen3.6-35B-A3B-Escha-W2, which ran op by op at 9 tok/s, decodes at
+  131.4 tok/s against Vulkan's 99.0 on an RTX A5000 (fast build), a 4096-token prompt 3109 against 177 tok/s
+  (first token 1.3 against 23.2 s); the greedy text identical to Vulkan's.
+
+- Learned attention sinks and a rotary width of a layer's own on the CUDA hybrid arm. A sink logit joins the
+  softmax's max and denominator with no value row (`hy_values` on the token graph, `hy_softmax_h` on the
+  prompt path); each extra rotation table keeps its layer's own width (a NoPE layer's is empty), the layer's
+  rotary pairs and table offset passed to `hy_qk`. flint (q2tp; global NoPE layers, sliding RoPE layers of
+  513 with sinks), which ran op by op on CUDA at 4.4 tok/s, decodes at 125.2 tok/s against Vulkan's 72.3 on an
+  RTX A5000 (fast build), a 4096-token prompt 3322 against 149 tok/s (first token 1.23 against 27.5 s) and
+  109.9 against 72.1 tok/s after it; the greedy text identical to the CPU's on both.
+
+- q4_tiled weights on the CUDA hybrid arm (job kind 10): a lane's 16 nibbles a 32-column group (8 bytes, as q4tp's
+  tiles) and a (row, group)'s f16 scale (`hy_repack4t`, `hy_expand_q4gr`), matrices, gate/up pairs, heads and
+  routed experts (`q4tp: false`). KAT-Coder-V2.5 (every matrix q4_tiled), which ran op by op on CUDA at 3.3 tok/s,
+  decodes at 135.3 tok/s against Vulkan's 56.5 on an RTX A5000 (fast build), a 4096-token prompt 3320 against
+  90 tok/s (first token 1.23 against 45.5 s); the greedy text identical to Vulkan's.
+
+- Gemma-4 on the CUDA hybrid arm: a layer's own head geometry (the global layers' one KV head of 512 beside the
+  sliding layers' eight of 256: their attention kernels a module of their own, the K/V mirror's rows, the
+  buffers at the widest layer), the scale-less V norm before the mirror (`hy_qk`), GeGLU (tanh GELU) in the
+  gate/up pair's epilogue and on the prompt path, and the sandwich norms and layer scale on the prompt path.
+  humanizer-12B, which ran op by op on CUDA at 5.1 tok/s, decodes at 48.0 tok/s against Vulkan's 42.1 on an RTX
+  A5000 (fast build), a 4096-token prompt 779 against 597 tok/s (first token 5.3 against 6.9 s); the greedy text
+  identical to the CPU's on both.
+
+- A Looped Transformer's mid-stack norms on the CUDA hybrid arm (the final norm on the stream after each
+  loop's last layer, `loop_norm_at`), which now takes such stacks from the dense arm; `CMF_CUDA_HYB_ALL=1` sends
+  every stack to the hybrid arm. Nanbeige4.2-3B (q4_tiled, 22 layers run twice), which ran op by op on CUDA at
+  5.2 tok/s, decodes at 68.5 tok/s against Vulkan's 61.7 on an RTX A5000 (fast build); its greedy text
+  identical to the CPU's.
+
+- q8_2f gate/up pairs (two column fields: a tile's up rows read the input under their own, job kind 15) on
+  the CUDA hybrid arm, and a launch's input rows put under its jobs' column fields once a call
+  (`hy_field_planes`) instead of once a tile (one row, 34816 x 5120: one field 312 -> 282 us, a pair's two
+  404 -> 275). MiniCPM5-2B q8_2f, whose pairs sent it to the dense arm, decodes at 141-144 tok/s against 89-100
+  and Vulkan's 133-139 on an RTX A5000; its greedy text the CPU's up to a near tie at token 17 (24.224 against
+  24.211), as Vulkan's.
+
+- SenseNova-Loop's mHC streams on the CUDA hybrid arm: the residual as up to four streams around both sub-layers,
+  the router's logits a block each (`hy_mhc_logits`), its sigmoids and log-domain Sinkhorn mix (`hy_mhc_route`,
+  which writes the sub-layer's input rows), the merge after it (`hy_mhc_merge`), the streams' entry and mean
+  (`hy_mhc_enter`, `hy_mhc_leave`); a sub-layer's product goes apart from the stream. SenseNova-Loop-9B, which ran
+  op by op on CUDA at 4.4 tok/s, decodes at 48.9 tok/s against Vulkan's 35.5 on an RTX A5000 (fast build); the
+  greedy text identical to the CPU's. The prompt path runs the streams too (a chunk's streams, coefficients and
+  logits of its own, `mhc_in` / `mhc_out`): a 4096-token prompt at 1393 tok/s against 464 on the small path's
+  16-row chunks and Vulkan's 1335 (first token 2.94 s), a 450-token prompt's greedy text identical to the CPU's.
+
+- Unlimited-OCR's DASH attention on the CUDA hybrid arm (`hy_dash_route`, `hy_dash_close`, `hy_dash_attend`): the
+  rows rotated by their own angles and appended to the f16 mirror (`hy_qk` over the call's table), the router a
+  row (index rows, entmax-1.5 over the best 16 candidate blocks, the read set and its log priors), a closing
+  block's summary key, and the attend over the read set and the local window, on the token graph and the prompt
+  path; the host's candidate lists go up a call at a time. Unlimited-OCR-2 on an RTX A5000, one page: decode
+  327.9 tok/s against 50.8 before and Vulkan's 210.4, first token after the page's rows 1.1 s against 21.1 (Vulkan
+  2.5); the text the CPU's but for a box coordinate off by one, as Vulkan's.
+- Kimi-Linear on the CUDA hybrid arm: the graph contract carries Kimi Delta Attention (`GraphAttn::Kda`) and
+  Multi-head Latent Attention (`GraphAttn::Mla`; the wgpu graphs decline them at their entry). KDA rides a GDN
+  layer's state and front (the conv, SiLU and q / k norms over the q | k | v channels), its low-rank decay, β and
+  output gate are f32 products, `hy_kda_gates` the per-channel decay, `hy_kda_scan4` the delta rule with it, the
+  sigmoid-gated norm `hy_gdn_out32`'s; MLA's latent norm, kv_b and the heads' `[k_rope | k_nope]` keys and padded
+  values feed the hybrid attention at heads 192 wide (`hy_mla_*`; the mirror rows of heads that are no multiple of
+  256 load two halves at a time), cut back to v wide for the output product. Kimi-Linear-48B-A3B on an RTX A5000:
+  decode 164 tok/s against 8.8 op by op (Vulkan 8.1), a 4096-token prompt 378 tok/s (first token 10.8 s) and
+  136 tok/s after it against Vulkan's 4.3 and 2.6; the batched prefill bit for bit the per-position one, the text
+  the CPU's up to a near tie at token 39 (26.678 against 26.620).
+- Vision towers on CUDA (`gpu::vit_encode`, `gpu::sam_encode`, `gpu_cuda/vit.rs`): the pre-norm ViT blocks of a
+  CLIP-class tower and SAM's blocks (windowed attention with decomposed relative positions, the global blocks'
+  bias in the softmax) and neck with the activations on the card, cuBLAS f32 products; they ran on the host
+  before. Unlimited-OCR-2 on an RTX A5000, a one-page run end to end: 8.4 s against 66.7 (Vulkan 16.5), a tile's
+  SAM 0.11-0.15 s and CLIP 0.015-0.03 s; the text the same as with the host's towers.
 - `quantize-gptq --codec q2tp`: two steps that cost no bits ([docs](docs/Q2TP_SCALE_REFINE.md)). `--channel-scale
   ALPHA` (with `--channel-scale-qkv`) multiplies every input channel by `t_j = σ_j^α / rms_j^(1−α)` before the sweep
   and folds `t` into the RMSNorm gain in front (`post_attention_layernorm` for gate/up, `input_layernorm` for
@@ -20,6 +118,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing and stays off.
 - `requant --quant tiled-q8_2f`: a q8_2f copy of a q4tp/q2tp file for scoring on the CPU, 7 times faster than the
   tiled prefill and 0.4–0.7 % higher in perplexity.
+
+### Changed
+- The CUDA hybrid arm's tensor-core matvec: a launch of its own for each codec (q4tp, int8, q1, ternary, q2tp,
+  q4_tiled) whose loop carries none of the others' branches (the all-codec loop was some 540 instructions, and
+  a q1 and a q4tp matrix of one shape ran equally long: instruction-bound, not bus-bound), a row's two bf16
+  planes as two columns of one mma (two mma a group, not four, up to four rows), the q1 / ternary / q2tp
+  tiles in shift-and-mask layouts, KS 16 under 4096 rows. One row on an RTX A5000, 34816 x 5120: q1 156 -> 80
+  us, q4tp 173 -> 150. Decode, release build, before -> after: Bonsai-27B (q1) 35.1 -> 60.7-61.2 tok/s,
+  Ternary-Bonsai-2-27B (q2tp) 26.3 -> 33.0-33.7, Bonsai-8B (q1t) 103-104 -> 138, LFM3-1.7B (q4tp) 174-235 ->
+  229-251; the greedy texts unchanged (the CPU's).
+- Every stack on CUDA tries the hybrid arm first (the dense arm after a decline; `CMF_CUDA_HYB_ALL=0` keeps plain
+  attention stacks on the dense arm), a verify tail with it. RTX A5000, fast build, decode hybrid / dense / Vulkan:
+  Granite-4.2-8B 91.9 / 65.9 / 78.0 tok/s (79.6 / 57.2 / 72.0 after a 4096-token prompt, read at 2396 / 2525 / 537
+  tok/s), CherryPit-1.2-2B 173 / 140 / 125 (4096-token prompt 4588 / 5559 / 1002), MiniCPM5-2B 177-183 / 145-146 /
+  138-142; the hybrid arm's greedy text identical to the dense arm's.
+- Clover's block-preview weights no longer keep the hybrid arm's prompt path away while no block preview is
+  active (Clover is causal by default): a 4096-token prompt 2947 against Vulkan's 571 tok/s (first token 1.39
+  against 7.17 s), decode 121 against 91.5.
+
+### Fixed
+- A Looped Transformer's batched prefill (Nanbeige4.2) ran the loops back to back without the final norm between
+  them, on both GPU backends: a prompt of more than a few tokens read as noise (the first step's top logit 2.4
+  against the CPU's 45.4). The pipeline hands the batch graph its loop boundaries (`gpu::set_batch_loop_norm`):
+  Vulkan norms the stream in the plain residual tail (a sandwich or mHC tail declines), CUDA on the hybrid arm's
+  small and prompt paths (the dense arm declines). Nanbeige4.2-3B on an RTX A5000: a 4096-token prompt at 2517
+  tok/s on CUDA (first token 1.63 s) and 255 on Vulkan, decode 103-105 and 62; a 450-token prompt's greedy text
+  identical to the CPU's on both.
+- Vulkan: the batch graph's row copies of a routed FFN (`cp`, `cpo`) were recorded while a merged compute pass
+  was still open ("Encoder is locked by a previously created render/compute pass", a fatal validation error):
+  every MoE prompt through the batch graph that reached them, Escha-W2's, flint's and KAT-Coder's, crashed. Both flush the
+  pass first: Escha-W2 decodes at 99.0 tok/s, flint at 76.2 (its greedy text identical to the CPU's).
 
 ## [0.8.95] — 2026-11-13
 
