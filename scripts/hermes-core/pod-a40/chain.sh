@@ -28,7 +28,4 @@ vals=(); for v in "${VALS[@]}"; do vals+=(--val-extra "$v"); done
 rm -f "$R/$NAME.base.ckpt"
 echo "$(date -u +%T) starting $NAME" >> "$R/chain.log"
 setsid nohup ./train2.sh "$CONF" < /dev/null > /dev/null 2>&1 &
-exec venv/bin/python stage_sync2.py --run "$R" --name "$NAME" --repo infosave/cmf-experiments \
-  --prefix runs/hermes_core_a40_20261114 --subdir "$NAME" --start-step "$ORIGIN" --steps "$STEPS" --batch "${BATCH:-8}" --seq 1024 \
-  --ckpt-every 1 --keep 3 --title "$TITLE" --about "/root/hc/$NAME.about.md" --base "$R/$NAME.base.log" \
-  --also /root/hc/train2.sh "$CONF" /root/hc/stage_sync2.py /root/hc/convert.py /root/hc/shard_all.sh /root/hc/data/shards.tsv
+exec ./uploader.sh "$CONF" "$TITLE"

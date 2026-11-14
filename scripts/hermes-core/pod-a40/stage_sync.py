@@ -158,6 +158,8 @@ def report(args, stages: list[dict], last: dict | None, base: dict | None, state
     else:
         eta = (total - done) * per_step / speed if speed else None
     names = sorted({n for s in stages for n in s["extra"]} | set((base or {}).get("extra", {})))
+    also = [Path(a).name for a in args.also]
+    runner = next((a for a in also if a.startswith("train") and a.endswith(".sh")), "train.sh")
     title = {"hermes": "Hermes", "docs": "Документация ОС", "se": "Stack Exchange", "general": "Общий текст",
              "chat": "Диалоги", "multilingual": "Многоязычные", "think": "Рассуждения", "tools": "Инструменты",
              "lookup": "Справочник", "harness": "Код харнессов"}
@@ -201,7 +203,8 @@ def report(args, stages: list[dict], last: dict | None, base: dict | None, state
             "Продолжить с любого из них на том же расписании:",
             "",
             "```",
-            f"cortiq-embryo birth --resume <файл> --schedule-from 0 --steps {args.steps} --lr-restart …остальные флаги из train.sh",
+            f"cortiq-embryo birth --resume <файл> --schedule-from {args.start_step} --steps {args.steps} --lr-restart "
+            f"…остальные флаги из {runner}",
             "```",
         ]
     else:
@@ -209,7 +212,8 @@ def report(args, stages: list[dict], last: dict | None, base: dict | None, state
     if state.get("problems"):
         out += ["", "## Сбои", ""] + [f"- {p}" for p in state["problems"][-10:]]
     out += ["", "Файлы рядом: `train.log` — полный журнал тренера, `metrics.jsonl` — этапы числами, "
-            "`sync.log` — журнал загрузок, `train.sh`, `stage_sync.py`, `JOURNAL.ru.md` — как ускорялся тренер.", ""]
+            "`sync.log` — журнал загрузок" + ("; скрипты и конфигурация прогона: " + ", ".join(f"`{a}`" for a in also) if also else "")
+            + ".", ""]
     return "\n".join(out)
 
 
