@@ -81,6 +81,19 @@ pub use ltx::{ltx_chain, ltx_vae_chain, vae_conv2d as h3_vae_conv2d};
 
 const H3_SRC: &str = include_str!("h3.cu");
 const FLASH_SRC: &str = include_str!("h3_flash.cu");
+/// Video sparse attention, compiled after `FLASH_SRC` (its helpers and lanes).
+const VSA_SRC: &str = include_str!("h3_vsa.cu");
+
+/// The VSA kernels of one head width (`h3_vsa.cu`).
+#[derive(Clone, Copy)]
+struct VsaFuncs {
+    pool: cs::CUfunction,
+    scores: cs::CUfunction,
+    select: cs::CUfunction,
+    flash: cs::CUfunction,
+    compress: cs::CUfunction,
+    gather: cs::CUfunction,
+}
 
 /// The MLP's middle is stored divided by this before its GEMM (`h3_swiglu`).
 const ACT_INV: f32 = 1.0 / 64.0;
@@ -115,6 +128,8 @@ pub(super) struct H3State {
     /// The flash attention kernel by (head width, causal) (None: this card
     /// or width has none, and attention is two GEMMs a chunk).
     flash: HashMap<(usize, bool), Option<cs::CUfunction>>,
+    /// The VSA kernels by head width (None: they do not compile here).
+    vsa: HashMap<usize, Option<VsaFuncs>>,
     /// Chain weights kept on the card in their codec, by (model, tensor).
     mats: HashMap<(u64, usize), Arc<DevMat>>,
     mats_bytes: u64,
@@ -129,6 +144,11 @@ pub(super) struct H3State {
     /// f16 planes of host f32 weights (a convolution's kernels), by the
     /// address and length of the host slice.
     host_w: HashMap<(usize, usize), Buf>,
+    /// f32 weights of `h3_gemm_nt` kept on the card, by the address and
+    /// length of the host slice, with a fingerprint of sampled values that
+    /// tells a slice reused at that address from the one uploaded.
+    nt_w: HashMap<(usize, usize), (Buf, u64)>,
+    nt_w_bytes: u64,
     /// The kernels of the LTX-2.5 chain (`ltx.rs`), once compiled.
     ltx: Option<ltx::LxFuncs>,
     /// The kernels of the Lumina block (`lumina.rs`), once compiled.
@@ -219,6 +239,39 @@ impl H3State {
             None
         };
         self.flash.insert((hd, causal), f);
+        f
+    }
+
+    /// The VSA kernels for head width `hd` (the flash kernel's lanes and
+    /// tensor-core steps; same requirements).
+    fn vsa(&mut self, c: &Ctx, hd: usize) -> Option<VsaFuncs> {
+        if let Some(f) = self.vsa.get(&hd) {
+            return *f;
+        }
+        let ok = hd % 32 == 0 && (32..=256).contains(&hd) && !matches!(c.arch, None | Some("compute_75"));
+        let f = if ok {
+            let defs = vec![format!("-DHD={hd}"), "-DCAUSAL=0".to_string()];
+            let src = format!("{FLASH_SRC}\n{VSA_SRC}");
+            match compile(&src, defs, c.arch).and_then(|m| {
+                Ok(VsaFuncs {
+                    pool: func(m, "h3_vsa_pool")?,
+                    scores: func(m, "h3_vsa_scores")?,
+                    select: func(m, "h3_vsa_select")?,
+                    flash: func(m, "h3_vsa_flash")?,
+                    compress: func(m, "h3_vsa_compress")?,
+                    gather: func(m, "h3_vsa_gather")?,
+                })
+            }) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("cuda h3: no VSA kernels for head width {hd}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.vsa.insert(hd, f);
         f
     }
 
@@ -645,22 +698,37 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
     } else {
         (panel / (nh * n * 6)).clamp(8, n)
     };
-    if flash.is_none() && g * nh * ca * n * 6 > (2usize << 30) {
+    if flash.is_none() && g * nh * ca * n * 6 > (2usize << 30) && job.vsa.is_none() {
         return Err(format!("{g} groups of {n} rows: the score rows do not fit a chunk"));
     }
+    // Video sparse attention keeps q, k and v in tile-padded order (`np`
+    // slots, 64 a tile); it rides the flash kernel's lanes and one group.
+    let vsa = job.vsa;
+    let vf = match vsa {
+        None => None,
+        Some(p) => {
+            if g != 1 || p.n != n || flash.is_none() {
+                return Err("vsa: one group of the plan's rows, on the flash kernel".into());
+            }
+            Some(st.h3.vsa(c, hd).ok_or("no VSA kernels for this head width")?)
+        }
+    };
+    let np = vsa.map_or(n, |p| p.tiles * crate::mmh3::VSA_TILE);
+    let gate_any = vsa.is_some() && job.blocks.iter().any(|b| b.gate != usize::MAX);
     // values are stored dim-major with the keys rounded up to 16
-    let ns = n.next_multiple_of(16);
+    let ns = np.next_multiple_of(16);
     let x = st.h3.buf(c, "x", rows_all * hs * 4)?;
     let xn = st.h3.buf(c, "xn", cq * hs * 2)?;
     let y = st.h3.buf(c, "y", cq * (3 * inner).max(2 * ffn) * 4)?;
     let y2 = st.h3.buf(c, "y2", cq.max(ca * g) * hs * 4)?;
     let act = st.h3.buf(c, "act", cq * ffn * 2)?;
-    let qp = st.h3.buf(c, "q", rows_all * inner * 2)?;
-    let kp = st.h3.buf(c, "k", rows_all * inner * 2)?;
+    let qp = st.h3.buf(c, "q", g * np * inner * 2)?;
+    let kp = st.h3.buf(c, "k", g * np * inner * 2)?;
     let vp = st.h3.buf(c, "v", g * inner * ns * 2 + 64)?;
     let (sp, pp, op, zp, ao) = if flash.is_some() {
-        // the attention output of every row, as the output projection reads it
-        (0, 0, 0, 0, st.h3.buf(c, "ao", rows_all * inner * 2)?)
+        // the attention output of every row (of every slot under VSA), as
+        // the output projection reads it
+        (0, 0, 0, 0, st.h3.buf(c, "ao", g * np * inner * 2)?)
     } else {
         (
             st.h3.buf(c, "s", g * nh * ca * n * 4)?,
@@ -670,8 +738,40 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
             st.h3.buf(c, "ao", g * ca * inner * 2)?,
         )
     };
-    // one plane buffer: [fc1 | fc2] of the MLP half, [qkv | out] of the other
-    let w = st.h3.buf(c, "w", (3 * ffn * hs).max(4 * inner * hs) * 2)?;
+    // one plane buffer: [fc1 | fc2] of the MLP half, [qkv | out | gate] of the other
+    let w = st.h3.buf(c, "w", (3 * ffn * hs).max((4 + gate_any as usize) * inner * hs) * 2)?;
+    // the VSA working set: the plan, tile means, tile scores, key lists,
+    // the compression branch and a chunk of gathered rows
+    struct VsaBufs {
+        slot: u64,
+        size: u64,
+        list: u64,
+        pq: u64,
+        pk: u64,
+        pv: u64,
+        s: u64,
+        oc: u64,
+        gch: u64,
+        aog: u64,
+    }
+    let vb = match vsa {
+        None => None,
+        Some(p) => {
+            let (t, lw) = (p.tiles, p.prefix_tiles + p.topk);
+            Some(VsaBufs {
+                slot: st.h3.buf(c, "vsa slot", n * 4 + 64)?,
+                size: st.h3.buf(c, "vsa size", t * 4 + 64)?,
+                list: st.h3.buf(c, "vsa list", nh * t * lw * 4 + 64)?,
+                pq: st.h3.buf(c, "vsa pq", nh * t * hd * 4)?,
+                pk: st.h3.buf(c, "vsa pk", nh * t * hd * 4)?,
+                pv: st.h3.buf(c, "vsa pv", nh * t * hd * 4)?,
+                s: st.h3.buf(c, "vsa s", nh * t * t * 4)?,
+                oc: st.h3.buf(c, "vsa oc", nh * t * hd * 4)?,
+                gch: st.h3.buf(c, "vsa gate", cq * inner * 4)?,
+                aog: st.h3.buf(c, "vsa ao", cq * inner * 2)?,
+            })
+        }
+    };
 
     // ── constants: one upload ──
     let mut consts: Vec<f32> = Vec::new();
@@ -743,7 +843,8 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
     let mut all_before = true;
     for (i, b) in job.blocks.iter().enumerate() {
         let mut need = 0u64;
-        for ix in [b.qkv, b.out, b.fc1, b.fc2] {
+        let gate = (vsa.is_some() && b.gate != usize::MAX).then_some(b.gate);
+        for ix in [b.qkv, b.out, b.fc1, b.fc2].into_iter().chain(gate) {
             if !st.h3.mats.contains_key(&(uid, ix)) {
                 let (kind, r, co, _) = packed(job.model, ix)?;
                 need += packed_dev_bytes(kind, r, co);
@@ -788,6 +889,14 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
         if sat {
             cu::memcpy_htod_async(satb, &[0u32; 32], c.stream).map_err(derr)?;
         }
+        if let (Some(p), Some(b)) = (vsa, &vb) {
+            cu::memcpy_htod_async(b.slot, &p.slot, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(b.size, &p.size, c.stream).map_err(derr)?;
+            // the pad slots are read as zeros (and never written)
+            cu::memset_d8_async(qp, 0, np * inner * 2, c.stream).map_err(derr)?;
+            cu::memset_d8_async(kp, 0, np * inner * 2, c.stream).map_err(derr)?;
+            cu::memset_d8_async(vp, 0, inner * ns * 2, c.stream).map_err(derr)?;
+        }
     }
     stage(c, 0, &mut t0)?;
     let count = |p: u64, len: usize, cell: usize| -> Res<()> {
@@ -808,6 +917,8 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
     let at = |off: usize| -> u64 { if off == usize::MAX { 0 } else { cb + (off * 4) as u64 } };
     let (hsi, nhi, hdi, ni, pi, ffni, gi) = (hs as i32, nh as i32, hd as i32, n as i32, pairs as i32, ffn as i32, g as i32);
     let nsi = ns as i32;
+    let npi = np as i32;
+    let slotp = vb.as_ref().map_or(0u64, |b| b.slot);
     let inter = job.qkv_interleaved as i32;
     // K and V in the flash kernel's lane order, or plain for the GEMMs
     let lanes = flash.is_some() as i32;
@@ -845,7 +956,7 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
                     (rows as u32, nh as u32),
                     hd_block,
                     0,
-                    kargs!(y, at(l.qkv_bias), at(l.q_norm), at(l.k_norm), csr, qp, kp, vp, r0i, ni, nsi, nhi, hdi, pi, job.qk_eps, inter, lanes),
+                    kargs!(y, at(l.qkv_bias), at(l.q_norm), at(l.k_norm), csr, qp, kp, vp, r0i, ni, nsi, nhi, hdi, pi, job.qk_eps, inter, lanes, slotp, npi),
                 )?;
                 stage(c, 4, &mut t0)?;
             }
@@ -881,7 +992,61 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
         count(qp, rows_all * inner, 4)?;
         count(kp, rows_all * inner, 6)?;
         count(vp, g * inner * ns, 8)?;
-        if let Some(fl) = flash {
+        if let (Some(p), Some(vf), Some(b)) = (vsa, vf, &vb) {
+            let gate = blk.gate != usize::MAX;
+            let (t, pt, k) = (p.tiles, p.prefix_tiles, p.topk);
+            let (ti, pti, ki, wantv) = (t as i32, pt as i32, k as i32, gate as i32);
+            unsafe {
+                c.launch(vf.pool, (t as u32, nh as u32), hd_block, 0, kargs!(qp, kp, vp, b.size, b.pq, b.pk, b.pv, npi, nsi, ti, wantv))?;
+                c.launch_3d(vf.scores, (t.div_ceil(16) as u32, t.div_ceil(16) as u32, nh as u32), 256, 0, kargs!(b.pq, b.pk, b.s, ti, scale))?;
+                if t > pt {
+                    c.launch(vf.select, ((t - pt) as u32, nh as u32), 256, 0, kargs!(b.s, b.list, ti, pti, ki))?;
+                }
+                c.launch(vf.flash, (t as u32, nh as u32), 128, 0, kargs!(qp, kp, vp, ao, b.list, b.size, npi, nsi, nhi, ti, pti, ki, scale))?;
+                if gate {
+                    c.launch(vf.compress, (t as u32, nh as u32), hd_block, 0, kargs!(b.s, b.pv, b.oc, ti))?;
+                }
+            }
+            stage(c, 5, &mut t0)?;
+            let wg = w + (4 * inner * hs * 2) as u64;
+            if gate {
+                let (gr, gc) = unsafe { expand(c, st, job.model, blk.gate, wg, keep[bi], true)? };
+                if gr != inner || gc != hs {
+                    return Err("a VSA gate of the wrong shape".into());
+                }
+            }
+            let mut r0 = 0usize;
+            while r0 < rows_all {
+                let rows = cq.min(rows_all - r0);
+                let xr = x + (r0 * hs * 4) as u64;
+                let mr = if mrowp == 0 { 0 } else { mrowp + (r0 * 4) as u64 };
+                let (e0, e1, e2) = (0i32, 1i32, 2i32);
+                let (r0i, rowsi) = (r0 as i32, rows as i32);
+                unsafe {
+                    // the gate reads the input qkv read: norm1 and the modulation
+                    let gp = if gate {
+                        c.launch(f.norm_mod, (rows as u32, 1), 256, 0, kargs!(xr, at(l.norm1), modp, mr, xn, hsi, job.eps, e0, e1))?;
+                        c.gemm(true, false, inner, rows, hs, 1.0, wg, hs, xn, hs, 0.0, b.gch, inner, Gemm::Half)?;
+                        b.gch
+                    } else {
+                        0u64
+                    };
+                    let tot = rows * inner;
+                    c.launch(vf.gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(ao, gp, b.oc, b.slot, b.aog, r0i, rowsi, nhi, ti))?;
+                    c.gemm(true, false, hs, rows, inner, 1.0, wo, inner, b.aog, inner, 0.0, y2, hs, Gemm::Half)?;
+                    let tot = (rows * hs) as u64;
+                    c.launch(
+                        f.resid,
+                        (tot.div_ceil(256) as u32, 1),
+                        256,
+                        0,
+                        kargs!(xr, y2, modp, mr, at(l.scale1), at(l.out_bias), hsi, e2, tot),
+                    )?;
+                }
+                stage(c, 8, &mut t0)?;
+                r0 += rows;
+            }
+        } else if let Some(fl) = flash {
             // every (group, head) plane in one launch: a warp takes 16
             // query rows through all the keys, nothing materialized
             unsafe {
@@ -1625,12 +1790,38 @@ pub fn h3_gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: us
     }
     let mut st = c.st.lock().unwrap();
     let mut run = |st: &mut State| -> Res<()> {
-        let wb = st.h3.buf(c, "nt w", m * k * 4)?;
+        // the weights stay on the card for the next call with the same
+        // slice (a model's persistent matrices: Haru's head, a codec's
+        // convolutions), up to 4 GB of them
+        let len = m * k;
+        let wsl = &w[..len];
+        let fp = (0..8).fold(0xcbf2_9ce4_8422_2325u64, |h, i| (h ^ wsl[i * (len - 1) / 7].to_bits() as u64).wrapping_mul(0x100_0000_01b3));
+        let key = (wsl.as_ptr() as usize, len);
+        let cached = st.h3.nt_w.get(&key).filter(|(_, f)| *f == fp).map(|(b, _)| b.ptr);
+        let wb = match cached {
+            Some(p) => p,
+            None if st.h3.nt_w_bytes + (len * 4) as u64 <= 4 << 30 => {
+                if let Some((old, _)) = st.h3.nt_w.remove(&key) {
+                    c.sync()?;
+                    st.h3.nt_w_bytes -= old.bytes as u64;
+                }
+                let b = Buf::new(len * 4)?;
+                unsafe { cu::memcpy_htod_async(b.ptr, wsl, c.stream).map_err(derr)? };
+                let p = b.ptr;
+                st.h3.nt_w_bytes += b.bytes as u64;
+                st.h3.nt_w.insert(key, (b, fp));
+                p
+            }
+            None => {
+                let p = st.h3.buf(c, "nt w", len * 4)?;
+                unsafe { cu::memcpy_htod_async(p, wsl, c.stream).map_err(derr)? };
+                p
+            }
+        };
         let cb = ((256usize << 20) / (k.max(m) * 4)).clamp(1, n);
         let xb = st.h3.buf(c, "nt x", cb * k * 4)?;
         let yb = st.h3.buf(c, "nt y", cb * m * 4)?;
         unsafe {
-            cu::memcpy_htod_async(wb, &w[..m * k], c.stream).map_err(derr)?;
             let mut r0 = 0usize;
             while r0 < n {
                 let nb = cb.min(n - r0);

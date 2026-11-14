@@ -1,0 +1,22 @@
+# repo file prompt-ctx [env...] — the 0.8.96 release sweep, smallest first
+infosave/BotPsy-0.8B-cmf botpsy-0.8b-q8_2f.cmf 4096
+infosave/BotPsy-0.8B-cmf botpsy-0.8b-q4tp.cmf 4096
+infosave/LFM3-1.7B-cmf lfm3-1.7b-q4tp.cmf 4096
+infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf 4096
+infosave/MiniCPM5-2B-cmf MiniCPM5-2B-q4tp.cmf 4096
+infosave/MiniCPM5-2B-cmf MiniCPM5-2B-q8_2f.cmf 4096
+infosave/CherryPit-1.2-2B-cmf CherryPit-1.2-2B-q4tp.cmf 4096
+infosave/CherryPit-1.2-2B-cmf CherryPit-1.2-2B-q8_2f.cmf 4096
+infosave/Granite-4.2-cmf granite-4.2-3b-q4tp.cmf 4096
+infosave/Granite-4.2-cmf granite-4.2-8b-q4tp.cmf 4096
+infosave/Bonsai-8B_2bit_cmf bonsai-8b-q1t.cmf 3072
+infosave/Nanbeige4.2-3Bcmf nanbeige42-3b-q4t.cmf 4096
+infosave/Bonsai-27Bcmf bonsai-27b-q1.cmf 4096
+infosave/SenseNova-Loop-9B-Preview-cmf sensenova-loop-9b-q4tp.cmf 4096
+infosave/humanizer-cmf humanizer-12b-q4tp-ffn.cmf 4096
+infosave/Ternary-Bonsai-2-27B-cmf Ternary-Bonsai-2-27B-Q2TP-Affine.cmf 4096
+infosave/KAT-Coder-V2.5-CMF KAT-Coder-V2.5-CMF.cmf 4096
+infosave/Qwen3.6-35B-A3B-Escha-W2cmf qwen36-35b-a3b-escha-w2-q2tp.cmf 4096
+infosave/flint-cmf flint-q2tp.cmf 4096
+infosave/Kimi-Linear-48B-A3B-Code-CMF kimi48-code.cmf 4096
+infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.cmf 4096

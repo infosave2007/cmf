@@ -29,11 +29,14 @@ as standalone [CMF](https://github.com/infosave2007/cmf) files for the Rust
 `cortiq` runtime. Python and a machine-learning framework are not required to
 run a downloaded CMF.
 
-> **Use cortiq 0.8.30 or newer.** This is the first release that executes
-> Flint's complete attention and routing profile: its mixed sliding/full
-> attention schedule, no-RoPE full-attention layers, learned attention sinks,
-> and normalized sigmoid routing. An older runtime can open an old CMF but is
-> not a compatible Flint executor.
+> **Use cortiq 0.8.30 or newer** (0.8.96 or newer for CUDA). This is the first
+> release that executes Flint's complete attention and routing profile: its mixed
+> sliding/full attention schedule, no-RoPE full-attention layers, learned attention
+> sinks, and normalized sigmoid routing. An older runtime can open an old CMF but
+> is not a compatible Flint executor.
+
+On an RTX A5000 with CUDA `flint-q2tp.cmf` decodes at **140 tok/s** and reads a
+4096-token prompt in **1.7 s**.
 
 The package is a **text model**, not a general tool-execution environment.
 The upstream model card describes tool use and reasoning; validate those
@@ -41,7 +44,7 @@ workflows, generated code, permissions, and output limits in the application
 where the model will actually run.
 
 [Quick start](#quick-start) · [Artifacts](#artifacts) ·
-[Measured Vulkan run](#measured-vulkan-run) ·
+[Measured CUDA run](#measured-cuda-run) · [Measured Vulkan run](#measured-vulkan-run) ·
 [Русская документация](#документация-на-русском)
 
 ## Quick start
@@ -120,6 +123,21 @@ The source configuration is preserved rather than approximated:
 The configured context length is a model capacity field. It is not a measured
 uniform-quality or full-GPU-context guarantee; memory use and performance
 change with prompt length and hardware.
+
+## Measured CUDA run
+
+RTX A5000 (24 GB), cortiq 0.8.96, `cortiq bench`, `CMF_GPU=cuda` on a build with the
+CUDA backend (`cargo install cortiq-cli --features cuda`, the NVIDIA driver and the
+CUDA 12.x libraries), `flint-q2tp.cmf`:
+
+| Mode | Speed |
+|---|---:|
+| decode | **139.3–141.2 tok/s** |
+| 4096-token prompt | **2452 tok/s** (first token 1.67 s) |
+| decode after the 4096-token prompt | 117.9 tok/s |
+
+Vulkan on the same card: decode 78.7–79.0 tok/s, the 4096-token prompt 150 tok/s
+(first token 27.3 s).
 
 ## Measured Vulkan run
 
@@ -239,7 +257,7 @@ MoE-модель Recursive для coding agents: по данным исходн�
 [CMF](https://github.com/infosave2007/cmf)-файлы для Rust-движка `cortiq`.
 Для запуска скачанного CMF не нужны Python и ML-фреймворк.
 
-> **Нужен cortiq 0.8.30 или новее.** В этой версии реализован полный
+> **Нужен cortiq 0.8.30 или новее** (для CUDA — 0.8.96 или новее). В этой версии реализован полный
 > профиль Flint: чередование sliding/full attention, 14 слоёв без RoPE,
 > обученные attention sinks и нормированная sigmoid-маршрутизация. Старый
 > runtime не является совместимым исполнителем Flint, даже если открывает
@@ -297,6 +315,14 @@ CMF_GPU=wgpu CMF_GPU_WGPU_GRAPH=1 CMF_MULTISTEP=4 \
 
 Заявленные 262,144 токена контекста — поле конфигурации модели, а не измеренная
 гарантия качества, задержки или полного GPU-размещения на такой длине.
+
+### Измерение CUDA
+
+RTX A5000 (24 ГБ), cortiq 0.8.96, `cortiq bench`, `CMF_GPU=cuda` в сборке с CUDA
+(`cargo install cortiq-cli --features cuda`, драйвер NVIDIA и библиотеки CUDA 12.x),
+`flint-q2tp.cmf`: генерация **139.3–141.2 ток/с**, промпт в 4096 токенов — **2452 ток/с**
+(первый токен через 1.67 с), генерация после него — 117.9 ток/с. Vulkan на той же карте:
+78.7–79.0 ток/с и 150 ток/с (27.3 с).
 
 ### Измерение Vulkan
 

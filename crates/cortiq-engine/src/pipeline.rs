@@ -16459,7 +16459,10 @@ impl Pipeline {
         if self.weights.layers.iter().any(|lw| lw.layer_scale.is_some()) {
             return Some("layer scale");
         }
+        // CUDA's hybrid prompt path takes plain sandwich norms itself (LFM3's,
+        // beside its short convolutions and head gate): its batch arm decides.
         if self.value_blend.is_none()
+            && !crate::gpu::cuda_active()
             && self
                 .weights
                 .layers
@@ -20480,13 +20483,31 @@ impl Pipeline {
                         model = Some(m);
                         attn
                     }
+                    // LFM2/3's short convolution: the CUDA hybrid arm's prompt
+                    // path runs it (the wgpu batch graph has no kernels for it)
+                    AttnKind::ShortConv(w) if crate::gpu::cuda_active() => {
+                        let cfg = self.short_conv_cfg?;
+                        let (m, _, _, _) = w
+                            .in_proj
+                            .graph_weight()
+                            .or_else(|| w.in_proj.graph_weight_descriptor())?;
+                        model = Some(m.clone());
+                        crate::gpu::GraphAttn::ShortConv {
+                            inp: gw(&w.in_proj)?,
+                            out: gw(&w.out_proj)?,
+                            taps: &w.conv,
+                            kernel: cfg.kernel,
+                            cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
+                        }
+                    }
                     _ => return None,
                 };
                 // Gemma-4's sandwich norms and layer scalar (`gemma_batch`),
-                // Ripple's sandwich norms (the plain tails); every other
-                // model hands the graph none, as before.
+                // Ripple's sandwich norms (the plain tails), and on CUDA any
+                // plain sandwich norms (LFM3's: the hybrid prompt path's
+                // `sandwich_rows`); every other model hands the graph none.
                 let g4 = self.global_attn.is_some() || self.attn_v_norm;
-                let sandwich = g4 || self.value_blend.is_some();
+                let sandwich = g4 || self.value_blend.is_some() || crate::gpu::cuda_active();
                 layers.push(crate::gpu::GraphLayer {
                     mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li)),
                     input_norm: &lw.input_norm,

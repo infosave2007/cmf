@@ -1016,6 +1016,7 @@ impl VideoVae {
                     fc2_bias: &b.w2_b,
                     scale1: &b.scale1,
                     scale2: &b.scale2,
+                    gate: usize::MAX,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1044,6 +1045,7 @@ impl VideoVae {
                 rows: &[],
                 groups: batch.len(),
                 qkv_interleaved: true,
+                vsa: None,
             };
             if !crate::gpu::h3_chain(&job, &mut x) {
                 return None;

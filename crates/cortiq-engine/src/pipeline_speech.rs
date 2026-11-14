@@ -45,6 +45,35 @@ impl Pipeline {
         self.final_normed(&hidden)
     }
 
+    /// One position like [`Self::speech_step`], and the vocabulary logits
+    /// of it (a Haru frame needs both). The token graph that folds the head
+    /// in reads back the logits *instead of* the hidden state, so the
+    /// hidden comes from the plain step and the head runs on its own.
+    pub fn speech_step_logits(&mut self, row: &[f32], position: usize) -> (Vec<f32>, Vec<f32>) {
+        let normed = self.speech_step(row, position);
+        let logits = self.lm_head_forward(&normed);
+        (normed, logits)
+    }
+
+    /// Start a fresh short sequence on the same buffers: the host caches
+    /// emptied, every device K/V cursor back to row 0 (the rows stay
+    /// allocated and the next steps overwrite them). The cheap reset of a
+    /// stack that runs many tiny sequences — Qwen3-TTS's code predictor,
+    /// sixteen positions a frame — where a full reset would free and
+    /// rebuild the device mirrors every frame. Exact-attention stacks only:
+    /// a recurrent state is not rewound this way.
+    pub fn speech_rewind(&mut self) -> bool {
+        if self.gdn_cfg.is_some() {
+            return false;
+        }
+        self.kv_cache.clear();
+        self.graph_logits = None;
+        for li in 0..self.num_layers {
+            crate::gpu::graph_kv_set_stored(self.graph_kv_id, li, 0);
+        }
+        true
+    }
+
     /// The vocabulary logits of a final-normed hidden state.
     pub fn speech_logits(&self, normed: &[f32]) -> Vec<f32> {
         self.lm_head_forward(normed)
