@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The resident Embryo graph on CUDA (`gpu_cuda/embryo.rs`, `embryo.cu`): the wide token path of
+  `gpu_wgpu/embryo_wide.wgsl` (GDN mixers, bounded anchors with their sinks, the resonance router, the
+  hierarchical head with its cluster gate) over the same packed model, q8_2f or f16, recurrent state and rings
+  on the card for the whole sequence; `CMF_EMBRYO_RESIDENT=1` with `CMF_GPU=cuda`, the chunked prefill
+  included. Embryo-56M, which ran op by op on CUDA at 390-410 tok/s, decodes at 884-957 tok/s against the
+  Vulkan resident graph's 661-720 and the CPU's 424-443 on an RTX A5000 (fast build); the greedy text
+  identical to the CPU's.
 - q2tp weights and Prism's activation boundary on the CUDA hybrid arm. q2tp tiles (job kinds 1 and 9) carry a
   lane's 16 two-bit codes a 32-column group beside q4tp's ladder and rung codes (rung 0 a zero group), the
   registers built exactly as bf16 (the mid-rise 2c - 3 with the half in the scale, or the affine correction's

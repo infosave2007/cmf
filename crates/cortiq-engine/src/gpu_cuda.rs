@@ -923,6 +923,14 @@ pub(crate) mod qwen4;
 /// contracts; declared after `kargs!`, which it uses.
 mod hyb;
 
+/// The resident Embryo graph (GDN mixers, bounded anchors, the resonance
+/// router, the hierarchical head); declared after `kargs!`, which it uses.
+mod embryo;
+pub use embryo::{
+    embryo_device_next_position, embryo_device_state_bytes, embryo_graph_reset, embryo_wide_ready, forward_embryo_graph,
+    forward_embryo_graph_chunk,
+};
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;

@@ -114,6 +114,10 @@ pub fn forward_embryo_graph_chunk(
     n: usize,
     logits: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::forward_embryo_graph_chunk(model, kv_id, rows, position, n, logits);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::forward_embryo_graph_chunk(model, kv_id, rows, position, n, logits);
@@ -128,6 +132,10 @@ pub fn forward_embryo_graph_chunk(
 /// long-context claim of the resident path — a bounded genome reports
 /// the same two numbers at every context depth.
 pub fn embryo_device_state_bytes(kv_id: u64) -> Option<(u64, u64)> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_device_state_bytes(kv_id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_device_state_bytes(kv_id);
@@ -165,6 +173,10 @@ pub fn placement_weight_bytes(model: &CmfModel) -> u64 {
 /// device holds positions `0..n` of it), `None` when the device holds no
 /// initialized image of that sequence — the host owns it (or none began).
 pub fn embryo_device_next_position(kv_id: u64) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_device_next_position(kv_id);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_device_next_position(kv_id);
@@ -2373,6 +2385,10 @@ pub fn dory_kv_bytes(id: u64) -> Option<u64> {
 
 /// Is the f16 token path of the resident graph there on this device?
 pub fn embryo_wide_ready(q8: bool) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::embryo_wide_ready(q8);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::embryo_wide_ready(q8);
@@ -2392,6 +2408,10 @@ pub fn forward_embryo_graph(
     position: usize,
     logits: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::forward_embryo_graph(model, kv_id, hidden, position, logits);
+    }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::forward_embryo_graph(model, kv_id, hidden, position, logits);
@@ -2970,6 +2990,7 @@ pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         crate::gpu_cuda::kv_reset(_kv_id);
+        crate::gpu_cuda::embryo_graph_reset(_kv_id);
     }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
