@@ -41,7 +41,8 @@ pub fn for_each_doc(path: &Path, mut f: impl FnMut(&str)) -> anyhow::Result<usiz
     }
     let file = std::fs::File::open(path)?;
     let reader: Box<dyn Read> = if name.ends_with(".gz") {
-        Box::new(flate2::read::GzDecoder::new(file))
+        // every member: a corpus file may be several gzip streams written one after another
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };

@@ -50,8 +50,10 @@ pub fn train_tokenizer(
 }
 
 /// Encode corpus files into one u16 shard (documents separated by EOT),
-/// multi-threaded over document batches.
-pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, max_tokens: usize) {
+/// multi-threaded over document batches. `specials`: the documents are
+/// rendered chat transcripts, so a special token written out in the text
+/// (`<|im_start|>`, `<|im_end|>`) becomes its id.
+pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, max_tokens: usize, specials: bool) {
     use crate::tokenizer::{Bpe, EOT};
     let bpe = std::sync::Arc::new(Bpe::load(tok).expect("load tokenizer"));
     let eot = bpe.special_id(EOT).expect("EOT id") as u16;
@@ -81,7 +83,11 @@ pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, m
                             let mut out = Vec::new();
                             for d in ds {
                                 ids.clear();
-                                bpe.encode(d, &mut cache, &mut ids);
+                                if specials {
+                                    bpe.encode_with_specials(d, &mut cache, &mut ids);
+                                } else {
+                                    bpe.encode(d, &mut cache, &mut ids);
+                                }
                                 out.extend(ids.iter().map(|&i| i as u16));
                                 out.push(eot);
                             }

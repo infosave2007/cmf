@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
-# One pass of the grown 340M genome over the text corpus on the pod
-# (Hermes sources, OS command documentation, Stack Exchange: 493.3 M tokens
-# = 60 200 steps of B8 x T1024). A stage is 2000 steps: held-out losses per
-# domain and a checkpoint; `stage_sync.py` turns each stage into a report
-# and a backup on the Hub.
+# One `birth` run of the Hermes core campaign on the pod, described by a
+# config file (pass1.conf, base1.conf): where it starts, how far it goes,
+# which shards with which weights, which held-out sets.
 #
-#   train.sh            (detached: setsid nohup ./train.sh < /dev/null > /dev/null 2>&1 &)
+#   train.sh CONF       (detached: setsid nohup ./train.sh base1.conf < /dev/null > /dev/null 2>&1 &)
+#
+# The config is a bash file that sets
+#   NAME     run name: run/NAME.log, run/NAME.ckpt, run/NAME.start, run/NAME.done | run/NAME.failed
+#   START    the checkpoint the run begins from
+#   ORIGIN   the step of START (0 for a checkpoint without optimizer moments): the schedule and
+#            the stages count from it
+#   STEPS    the last step, absolute
+#   SHARDS   (file:weight ...)  under /root/hc/data
+#   VAL      the main held-out shard;  VALS  (name=file ...)  the per-domain ones
+# and optionally STAGE [2000] (steps between held-out losses and checkpoints), WARMUP [300],
+# LR [1e-4], SEED [17], BATCH [8].
 #
 # A run that dies or is stopped is resumed from its last checkpoint on the
-# same schedule (--schedule-from 0), up to three times per launch. Every
-# attempt takes its own sampler seed (17 + the attempts already in the
-# log): a resumed sampler starts its streams anew, and with one seed it
-# would read the run's first windows again. Files: run/pass1.log,
-# run/pass1.ckpt, run/pass1.start, run/pass1.done or run/pass1.failed.
+# same schedule (--schedule-from ORIGIN), up to three times per launch.
+# Every attempt takes its own sampler seed (SEED + the attempts already in
+# the log): a resumed sampler starts its streams anew, and with one seed it
+# would read the run's first windows again. `stage_sync.py` turns each
+# stage into a report and a backup on the Hub.
 set -u
+source "$1"
+: "${NAME:?}" "${START:?}" "${STEPS:?}" "${VAL:?}"
+ORIGIN="${ORIGIN:-0}"; STAGE="${STAGE:-2000}"; WARMUP="${WARMUP:-300}"; LR="${LR:-1e-4}"; SEED="${SEED:-17}"; BATCH="${BATCH:-8}"
 cd /root/hc/data
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 E=/root/hc/cmf/target/release/cortiq-embryo
 R=/root/hc/run
-NAME="${NAME:-pass1}"
-STEPS="${STEPS:-60200}"
-STAGE="${STAGE:-2000}"
 [ -f "$R/$NAME.start" ] || date -u +%s > "$R/$NAME.start"
-common=(--shard se.u16:0.884 docs.u16:0.076 hermes_code.u16:0.040 --val val.u16
-  --val-extra hermes=val_hermes.u16 --val-extra docs=val_docs.u16 --val-extra se=val_se.u16
-  --batch 8 --seq 1024 --steps "$STEPS" --warmup 300 --lr 1e-4 --lr-restart
+vals=()
+for v in "${VALS[@]}"; do vals+=(--val-extra "$v"); done
+common=(--shard "${SHARDS[@]}" --val "$VAL" "${vals[@]}"
+  --batch "$BATCH" --seq 1024 --steps "$STEPS" --warmup "$WARMUP" --lr "$LR" --lr-restart
   --eval-every "$STAGE" --save-every "$STAGE"
   --carry --carry-reset-every 16 --carry-eot 32760 --dropless --out "$R/$NAME.ckpt")
 for attempt in 1 2 3 4; do
-  if [ -f "$R/$NAME.ckpt" ]; then src="$R/$NAME.ckpt"; extra=(--schedule-from 0); else src=grown340.ckpt; extra=(); fi
+  if [ -f "$R/$NAME.ckpt" ]; then src="$R/$NAME.ckpt"; extra=(--schedule-from "$ORIGIN"); else src="$START"; extra=(); fi
   prior=$(grep -c "^== attempt" "$R/$NAME.log" 2>/dev/null)
-  seed=$((17 + ${prior:-0}))
+  seed=$((SEED + ${prior:-0}))
   echo "== attempt $attempt, resume $src, seed $seed, $(date -u +%FT%TZ)" >> "$R/$NAME.log"
   "$E" birth --resume "$src" "${common[@]}" "${extra[@]}" --seed "$seed" >> "$R/$NAME.log" 2>&1
   code=$?

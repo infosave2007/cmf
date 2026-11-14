@@ -9,7 +9,7 @@
 use crate::tokenizer::{Bpe, EOT};
 use crate::train::Shard;
 use anyhow::{ensure, Context};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder as GzDecoder; // every member of a concatenated .gz
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};

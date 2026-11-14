@@ -64,6 +64,10 @@ enum Sub {
         out: PathBuf,
         #[arg(long, default_value_t = usize::MAX)]
         max_tokens: usize,
+        /// the documents are rendered chat transcripts: special tokens
+        /// written out in the text become their ids
+        #[arg(long)]
+        specials: bool,
     },
     /// Download corpus files (curl, resumable) into a directory.
     Fetch {
@@ -1079,8 +1083,9 @@ fn main() {
             inputs,
             out,
             max_tokens,
+            specials,
         } => {
-            cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+            cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens, specials);
         }
         Sub::GrowTrunk {
             ckpt,

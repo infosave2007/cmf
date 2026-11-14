@@ -2,7 +2,13 @@
 
     IFS= read -r HF_TOKEN; export HF_TOKEN       # the token comes on stdin, never from a file
     python3 stage_sync.py --run /root/hc/run --name pass1 --repo infosave/cmf-experiments \
-        --prefix runs/hermes_core_a40_20261114 --steps 60200 --batch 8 --seq 1024 --ckpt-every 1 --keep 3
+        --prefix runs/hermes_core_a40_20261114 --steps 60200 --batch 8 --seq 1024 --ckpt-every 1 --keep 3 \
+        [--subdir base1 --start-step 60200 --title "..." --about about.md]
+
+`--subdir` puts the report files of a later run of the same campaign into
+their own folder; the checkpoints of all its runs share `<prefix>/ckpt/`,
+so `--keep` counts them together. `--start-step` is the step the run began
+at (its schedule and its stages count from there).
 
 Watches `<run>/<name>.log`. A stage is complete when the trainer has printed
 its held-out losses and `saved … (step N)`. For every complete stage the
@@ -115,7 +121,7 @@ def hub_ckpts(hub: "Hub", name: str) -> list[dict]:
     out = []
     try:
         for f in hub.api.list_repo_tree(hub.repo, path_in_repo=f"{hub.prefix}/ckpt", repo_type="model", expand=True):
-            m = re.search(rf"/ckpt/{re.escape(name)}-step(\d+)\.ckpt$", f.path)
+            m = re.search(r"/ckpt/[\w.\-]+-step(\d+)\.ckpt$", f.path)
             if m and lfs_oid(f):
                 out.append({"step": int(m.group(1)), "file": f.path.rsplit("/", 1)[1], "size": f.size, "sha256": lfs_oid(f)})
     except Exception:  # no folder yet
@@ -142,26 +148,35 @@ def drop_ckpt(hub: "Hub", c: dict) -> bool:
 def report(args, stages: list[dict], last: dict | None, base: dict | None, state: dict, status: str, started: float) -> str:
     per_step = args.batch * args.seq
     now = time.time()
-    done = last["step"] + 1 if last else 0
+    first, total = args.start_step, args.steps - args.start_step
+    done = max(0, (last["step"] + 1 if last else first) - first)
     elapsed = now - started
     speed = stages[-1]["tok_s"] if stages else (last or {}).get("tok_s")
-    eta = (args.steps - done) * per_step / speed if speed else None
+    # the wall clock of the stages done so far: the printed tok/s leaves out the subspace refreshes, evals and saves
+    if stages and stages[-1]["step"] > first and elapsed > 0:
+        eta = elapsed * (total - done) / max(done, 1)
+    else:
+        eta = (total - done) * per_step / speed if speed else None
     names = sorted({n for s in stages for n in s["extra"]} | set((base or {}).get("extra", {})))
-    title = {"hermes": "Hermes", "docs": "Документация ОС", "se": "Stack Exchange"}
-    out = [
-        "# Ядро Hermes: проход 340M по корпусу на A40",
-        "",
-        f"Обновлено {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(now))}. Состояние: **{status}**.",
-        "",
-        f"- Шаг {done} из {args.steps} ({100 * done / args.steps:.1f} %), прочитано {done * per_step / 1e6:.1f} млн токенов "
-        f"из {args.steps * per_step / 1e6:.1f} млн.",
-        f"- Идёт {elapsed / 3600:.2f} ч" + (f", осталось около {eta / 3600:.1f} ч." if eta is not None and status == "идёт" else "."),
-        f"- Скорость последнего этапа: {speed or '—'} ток/с.",
-        "",
+    title = {"hermes": "Hermes", "docs": "Документация ОС", "se": "Stack Exchange", "general": "Общий текст",
+             "chat": "Диалоги", "multilingual": "Многоязычные", "think": "Рассуждения", "tools": "Инструменты",
+             "lookup": "Справочник", "harness": "Код харнессов"}
+    about = Path(args.about).read_text().strip() if args.about and Path(args.about).exists() else (
         "Модель: выращенный из Embryo-56M ствол 340M (16 слоёв × 768). Рецепт: `birth --carry --dropless`, "
         f"B{args.batch}×T{args.seq}, lr 1e-4 с разогревом 300 шагов и косинусом, зерно 17. Корпус: Stack Exchange "
         "435,9 млн токенов (вес 0,884), документация ОС 37,3 млн (0,076), исходники Hermes 20,1 млн (0,040). "
-        "Отложенные потери считаются на 8 фиксированных пакетах каждого набора.",
+        "Отложенные потери считаются на 8 фиксированных пакетах каждого набора.")
+    out = [
+        "# " + (args.title or "Ядро Hermes: проход 340M по корпусу на A40"),
+        "",
+        f"Обновлено {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(now))}. Состояние: **{status}**.",
+        "",
+        f"- Шаг {done} из {total} ({100 * done / total:.1f} %), прочитано {done * per_step / 1e6:.1f} млн токенов "
+        f"из {total * per_step / 1e6:.1f} млн." + (f" Счёт шагов в журнале тренера идёт с {first}." if first else ""),
+        f"- Идёт {elapsed / 3600:.2f} ч" + (f", осталось около {eta / 3600:.1f} ч." if eta is not None and status == "идёт" else "."),
+        f"- Скорость последнего этапа: {speed or '—'} ток/с.",
+        "",
+        about,
         "",
         "## Этапы",
         "",
@@ -173,11 +188,11 @@ def report(args, stages: list[dict], last: dict | None, base: dict | None, state
         out.append("| 0, до обучения | 0 | 0 | — | " + f"{base['val']:.4f} | "
                    + " | ".join(f"{base['extra'].get(n, float('nan')):.4f}" for n in names) + " | — |")
     for i, s in enumerate(stages, 1):
-        out.append(f"| {i} | {s['step']} | {s['step'] * per_step / 1e6:.1f} | {s['ema']:.4f} | {s['val']:.4f} | "
+        out.append(f"| {i} | {s['step'] - first} | {(s['step'] - first) * per_step / 1e6:.1f} | {s['ema']:.4f} | {s['val']:.4f} | "
                    + " | ".join(f"{s['extra'].get(n, float('nan')):.4f}" for n in names) + f" | {s['tok_s']} |")
     out += ["", "## Резервная копия", ""]
     if state.get("ckpts"):
-        out += [f"В `{args.prefix}/ckpt/` хранятся {args.keep} последних чекпойнта (с моментами оптимизатора); "
+        out += [f"В `{args.prefix}/ckpt/` хранятся {args.keep} последних чекпойнта кампании (с моментами оптимизатора); "
                 "размер и sha256 каждого сверены с Hub после загрузки, более старые удаляются.", "",
                 "| Шаг | Файл | Размер, ГБ | sha256 |", "|---|---|---|---|"]
         out += [f"| {c['step']} | `{c['file']}` | {c['size'] / 1e9:.2f} | `{c['sha256']}` |" for c in reversed(state["ckpts"])]
@@ -209,12 +224,16 @@ def main() -> None:
     ap.add_argument("--seq", type=int, required=True)
     ap.add_argument("--ckpt-every", type=int, default=1)
     ap.add_argument("--keep", type=int, default=3, help="checkpoints kept on the Hub")
+    ap.add_argument("--subdir", default="", help="folder of this run's report files under the prefix")
+    ap.add_argument("--start-step", type=int, default=0)
+    ap.add_argument("--title")
+    ap.add_argument("--about", help="a text file: the paragraph of the report that describes the run")
     ap.add_argument("--base", help="log of a one-step run: the losses before training")
     ap.add_argument("--also", nargs="*", default=[], help="files uploaded once, as they are")
     args = ap.parse_args()
     run = Path(args.run)
     log, ckpt = run / f"{args.name}.log", run / f"{args.name}.ckpt"
-    hub = Hub(args.repo, args.prefix, run / "sync.log")
+    hub = Hub(args.repo, args.prefix, run / f"{args.name}.sync.log")
     base = None
     if args.base and Path(args.base).exists():
         m = [VAL.match(l) for l in Path(args.base).read_text(errors="replace").splitlines()]
@@ -222,8 +241,9 @@ def main() -> None:
         if m:
             base = {"val": float(m[-1].group(1)), "extra": {n: float(v) for n, v, _, _ in EXTRA.findall(m[-1].group(3))}}
     state: dict = {"problems": [], "ckpts": hub_ckpts(hub, args.name)}
+    sub = (args.subdir.strip("/") + "/") if args.subdir else ""
     for extra in args.also:
-        if not hub.put(Path(extra), Path(extra).name, f"{args.name}: {Path(extra).name}"):
+        if not hub.put(Path(extra), sub + Path(extra).name, f"{args.name}: {Path(extra).name}"):
             state["problems"].append(f"не загружен {Path(extra).name}")
     seen, first, final_sent = -1, True, False
     while True:
@@ -255,13 +275,16 @@ def main() -> None:
                 else:
                     state["problems"].append(f"чекпойнт шага {step} не загружен")
                 copy.unlink(missing_ok=True)
-            (run / "metrics.jsonl").write_text("".join(json.dumps(s, ensure_ascii=False) + "\n" for s in stages))
-            (run / "REPORT.md").write_text(report(args, stages, last, base, state, status, started))
+            (run / f"{args.name}.metrics.jsonl").write_text("".join(json.dumps(s, ensure_ascii=False) + "\n" for s in stages))
+            (run / f"{args.name}.REPORT.md").write_text(report(args, stages, last, base, state, status, started))
             label = f"{args.name}: stage {n}" + (" (final)" if finished else " (failed)" if failed else "")
-            ok = all([hub.put(run / "REPORT.md", "REPORT.md", label),
-                      hub.put(run / "metrics.jsonl", "metrics.jsonl", label),
-                      hub.put(log, "train.log", label) if log.exists() else True])
-            hub.put(run / "sync.log", "sync.log", label)
+            snap = run / f"{args.name}.upload.log"  # the trainer keeps appending to its log
+            if log.exists():
+                shutil.copyfile(log, snap)
+            ok = all([hub.put(run / f"{args.name}.REPORT.md", sub + "REPORT.md", label),
+                      hub.put(run / f"{args.name}.metrics.jsonl", sub + "metrics.jsonl", label),
+                      hub.put(snap, sub + "train.log", label) if log.exists() else True])
+            hub.put(hub.log, sub + "sync.log", label)
             if ok:
                 seen, first = n, False
                 final_sent = finished or failed
