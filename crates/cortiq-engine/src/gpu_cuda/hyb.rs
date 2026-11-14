@@ -226,6 +226,10 @@ pub(super) struct HFuncs {
     scale: cs::CUfunction,
     sconv: cs::CUfunction,
     head_gate: cs::CUfunction,
+    sconv_h: cs::CUfunction,
+    head_gate_h: cs::CUfunction,
+    mla_lat_h: cs::CUfunction,
+    mla_cut_h: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
 unsafe impl Sync for HFuncs {}
@@ -329,6 +333,10 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         scale: func(module, "hy_scale")?,
         sconv: func(module, "hy_sconv")?,
         head_gate: func(module, "hy_head_gate")?,
+        sconv_h: func(module, "hy_sconv_h")?,
+        head_gate_h: func(module, "hy_head_gate_h")?,
+        mla_lat_h: func(module, "hy_mla_lat_h")?,
+        mla_cut_h: func(module, "hy_mla_cut_h")?,
     })
 }
 
@@ -1301,9 +1309,11 @@ struct AttnL {
     v_norm: bool,
     /// (bq, bk, bv) projection biases (Qwen2-class), added before norm and rotation
     bias: Option<(Arc<Buf>, Arc<Buf>, Arc<Buf>)>,
-    /// A head-wise output gate: its matrix (the dense arm's, any codec) and a
+    /// A head-wise output gate: its matrix (the dense arm's, any codec), a
     /// job table a row, into `hgv`; `hy_head_gate` scales the heads with it.
-    hg: Option<(Arc<DevMat>, Vec<Buf>, u32)>,
+    /// The last: an f32 gate's f16 copy, the prompt path's GEMM operand
+    /// (without it a long prompt goes the small path).
+    hg: Option<(Arc<DevMat>, Vec<Buf>, u32, Option<Buf>)>,
     /// A sliding window (positions a query sees, its own included).
     window: Option<usize>,
     /// Learned per-Q-head sink logits (in the softmax, no value row).
@@ -1491,7 +1501,8 @@ struct HLayer {
     post_norm: Arc<Buf>,
     inter: usize,
     /// GeGLU (tanh GELU, the Gemma family) instead of SwiGLU
-    gelu: bool,
+    /// The pair's activation: 0 SiLU, 1 tanh GELU, 2 erf GELU.
+    gelu: u8,
     ms_gu: MmaSet,
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
@@ -2056,16 +2067,18 @@ fn build(
         }
         match &l.ffn {
             GraphFfn::Dense { gate, act, limit, hot, .. } => {
-                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh) || *limit != 0.0 || hot.is_some() {
+                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || *limit != 0.0 || hot.is_some() {
                     return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
             }
             GraphFfn::Moe { act, q4tp, gu_q2, q82, n_exp, top_k, inter, experts, has_shared, detached_shared, router, .. } => {
-                // q2tp gate/up beside q4tp down (`gu_q2`) load by their file codec;
-                // q8_2f experts (two column fields a pair) have no tiles
-                let _ = (gu_q2, q4tp);
-                if *act != GraphAct::Silu || *q82 {
+                // q2tp gate/up beside q4tp down (`gu_q2`) load by their file
+                // codec, and so do q8_2f experts: int8 tiles (a pair's kind 15,
+                // two column fields), the fields taken in tile by tile since a
+                // slot's expert is chosen on the card
+                let _ = (gu_q2, q4tp, q82);
+                if *act != GraphAct::Silu {
                     return Err(format!("layer {li}: a routed FFN other than q4tp / q2tp SwiGLU"));
                 }
                 if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
@@ -2459,7 +2472,17 @@ fn build(
                             blk = b;
                             tabs.push(Buf::from_slice(&jobs)?);
                         }
-                        Some((m, tabs, blk))
+                        let hgh = if m.kind == 4 && m.rows * m.cols % 4 == 0 {
+                            let hb = Buf::new(m.rows * m.cols * 2)?;
+                            let quads = (m.rows * m.cols / 4) as u64;
+                            unsafe {
+                                c.launch(c.f.to_half, (quads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, hb.ptr, quads))?;
+                            }
+                            Some(hb)
+                        } else {
+                            None
+                        };
+                        Some((m, tabs, blk, hgh))
                     }
                     None => None,
                 };
@@ -2655,8 +2678,12 @@ fn build(
             }
             _ => unreachable!(),
         };
-        let gelu = matches!(&l.ffn, GraphFfn::Dense { act: GraphAct::GeluTanh, .. });
-        let ms_gu = mmaset_kind(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | if gelu { 0x200 } else { 0 })?;
+        let gelu = match &l.ffn {
+            GraphFfn::Dense { act: GraphAct::GeluTanh, .. } => 1u8,
+            GraphFfn::Dense { act: GraphAct::GeluErf, .. } => 2u8,
+            _ => 0u8,
+        };
+        let ms_gu = mmaset_kind(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400][gelu as usize])?;
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
@@ -2844,6 +2871,17 @@ fn plan_for(
     first_pos: usize,
     loop_norm: &[usize],
 ) -> Res<Arc<HPlan>> {
+    // A call-wide table narrower than the call-wide width (Spark-X2.5: the
+    // width is layer 0's, a sliding layer rotating all 256 dims, the table
+    // the full layers' 32 frequencies): the first attention layer's own
+    // rotation is the call's, the others ride their own tables.
+    let (rd, invf) = match layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Full { geom: Some(g), .. } if g.dash.is_none() && g.invf.len() >= g.rd / 2 => Some((g.rd, g.invf)),
+        _ => None,
+    }) {
+        Some(own) if invf.len() < rd / 2 => own,
+        _ => (rd, invf),
+    };
     let key = (model.uid(), layer_base, layers.len(), lm.is_some());
     let mut sig = hsig(model, layers, lm, final_norm, nh, nkv, hd, rd, hidden, gemma, invf);
     // a Looped Transformer's mid-stack norms are part of the plan
@@ -3851,7 +3889,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         kargs!(p_p, e_p, gate_p, pp0, pp1, pp2, ps_i, n0_i, rb_i, nh_i, nbcap_i, cip),
                     )?;
                     hst(c, 5, &mut t0)?;
-                    if let Some((_, tabs, blk)) = &a.hg {
+                    if let Some((_, tabs, blk, _)) = &a.hg {
                         let (nullp, no_act, zero_g) = (0u64, -1i32, 0i32);
                         for (r, jt) in tabs.iter().enumerate().take(n) {
                             let x = plan.xn.ptr + (r * hidden * 4) as u64;
@@ -4061,15 +4099,15 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
 }
 
 /// A layer the prompt path has no kernels for (a routed FFN's sandwich, mHC
-/// beside a sandwich or a routed FFN, a short convolution or a head-wise
-/// gate): such a stack's long prompt runs the small path a chunk at a time.
+/// beside a sandwich or a routed FFN, a head-wise gate in a codec other
+/// than f32): such a stack's long prompt runs the small path a chunk at a
+/// time.
 fn small_only(l: &HLayer) -> bool {
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
     (l.moe.is_some() && l.ffn_out.is_some())
         || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
-        || matches!(l.mix, Mix::Conv(_) | Mix::Kda(_))
-        || matches!(&l.mix, Mix::Attn(a) if a.hg.is_some() || a.mla.is_some())
+        || matches!(&l.mix, Mix::Attn(a) if a.hg.as_ref().is_some_and(|g| g.3.is_none()))
 }
 
 /// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
@@ -4750,6 +4788,11 @@ pub(super) fn batch(
         decline("hybrid batch", "a verify window over a short convolution");
         return BatchGraphOutcome::Declined;
     }
+    // the prompt path has no far field for an MLA layer
+    if prompt_far && plan.layers.iter().zip(&sealed).any(|(l, &s)| s && matches!(&l.mix, Mix::Attn(a) if a.mla.is_some())) {
+        decline("hybrid batch", "an MLA layer past a seal");
+        return BatchGraphOutcome::Declined;
+    }
     // CMF_HYB_MOE_CHUNKS=0: such a long prompt declines (the per-op path)
     let chunks_on = std::env::var("CMF_HYB_MOE_CHUNKS").as_deref() != Ok("0");
     if moe && (prompt_far || (b > NMAX && (spec.is_some() || !chunks_on))) {
@@ -5113,10 +5156,10 @@ unsafe fn big(
     let pos0 = positions[0];
     let (hidden, nh, nkv, hd, hpk) = (plan.hidden, plan.nh, plan.nkv, plan.hd, plan.hpk);
     let sealed_window = plan.layers.iter().zip(sealed).any(|(l, &s)| {
-        s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some() || a.nkv != plan.nkv || a.hd != plan.hd)
+        s && matches!(&l.mix, Mix::Attn(a) if a.window.is_some() || a.sink.is_some() || a.nkv != plan.nkv || a.hd != plan.hd || a.hg.is_some() || a.mla.is_some())
     });
     if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
-        return Err("sandwich norms, a short convolution or a sealed routed FFN on the prompt path".into());
+        return Err("a layer without prompt-path kernels, or a sealed window or routed FFN, on the prompt path".into());
     }
     let (gw, _) = prec();
     if gw != Gemm::Half {
@@ -5248,9 +5291,126 @@ unsafe fn big(
         };
         bst(c, 0, tm)?;
         match &pl.mix {
-            // the prompt path is not entered with such a layer (see its guard)
-            Mix::Conv(_) => return Err("a short convolution on the prompt path".into()),
-            Mix::Kda(_) => return Err("a KDA layer on the prompt path".into()),
+            Mix::Conv(cv) => {
+                // LFM2/3's short convolution: B | C | x by one GEMM, the
+                // convolution down the chunk from the layer's ring (the small
+                // path's), its rows f16 for the output GEMM
+                let yq = st.scr(c, "hb_cv", b * 3 * hidden * 4)?;
+                let yof = st.scr(c, "hb_of", b * hidden * 2)?;
+                mul(&cv.inp, bxf, yq, 3 * hidden, 1.0, 0.0)?;
+                let gs = st.hyb.gdn.get_mut(&key).ok_or("short convolution state missing")?;
+                let (s3_i, k_i) = ((3 * hidden) as i32, cv.kernel as i32);
+                unsafe {
+                    c.launch(fx.sconv_h, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(yq, s3_i, cv.taps.ptr, gs.ring.ptr, hid_i, k_i, b_i, yof, hid_i))?;
+                }
+                gs.next_pos = pos0 + b;
+                gs.tape = None;
+                bst(c, 3, tm)?;
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&cv.out, yof, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&cv.out, yof, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    (None, None) => mul(&cv.out, yof, bh, hidden, 1.0, 1.0)?,
+                }
+            }
+            Mix::Kda(g) => {
+                // KDA (Kimi Linear): q | k | v by three GEMMs into one row,
+                // the low-rank decay, beta and the output gate as f32
+                // products over the rows normed in f32 (the small path's),
+                // the conv and the q / k norms (its front), the delta rule
+                // down the chunk 16 rows a pass, the gated norm as f16 rows
+                // for the output GEMM
+                let (kd, vd, cdim) = (g.nh * g.dk, g.nh * g.dv, g.cdim);
+                let (cd_i, kk_i, nh_i, dk_i, dv_i) = (cdim as i32, g.kk as i32, g.nh as i32, g.dk as i32, g.dv as i32);
+                let rank_f = g.fa.rows;
+                let yq = st.scr(c, "hb_qkv", b * cdim * 4)?;
+                let cq = st.scr(c, "hb_cq", b * cdim * 4)?;
+                let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                let kfa = st.scr(c, "hb_kfa", b * rank_f * 4)?;
+                let kf = st.scr(c, "hb_kf", b * kd * 4)?;
+                let kbr = st.scr(c, "hb_kbr", b * g.nh * 4)?;
+                let kgd = st.scr(c, "hb_kgd", b * kd * 4)?;
+                let kbeta = st.scr(c, "hb_kbeta", b * g.nh * 4)?;
+                let kga = st.scr(c, "hb_kga", b * g.ga.rows * 4)?;
+                let kgate = st.scr(c, "hb_kgate", b * vd * 4)?;
+                let yo = st.scr(c, "hb_o", b * vd * 4)?;
+                let yof = st.scr(c, "hb_of", b * vd * 2)?;
+                mul(&g.q, bxf, yq, cdim, 1.0, 0.0)?;
+                mul(&g.k, bxf, yq + (kd * 4) as u64, cdim, 1.0, 0.0)?;
+                mul(&g.v, bxf, yq + (2 * kd * 4) as u64, cdim, 1.0, 0.0)?;
+                let gate = unsafe {
+                    c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+                    c.gemm(true, false, rank_f, b, hidden, 1.0, g.fa.w.ptr, hidden, bx32, hidden, 0.0, kfa, rank_f, Gemm::F32)?;
+                    c.gemm(true, false, kd, b, rank_f, 1.0, g.fb.w.ptr, rank_f, kfa, rank_f, 0.0, kf, kd, Gemm::F32)?;
+                    c.gemm(true, false, g.nh, b, hidden, 1.0, g.b.w.ptr, hidden, bx32, hidden, 0.0, kbr, g.nh, Gemm::F32)?;
+                    match &g.gb {
+                        Some(gb) => {
+                            let rank_g = g.ga.rows;
+                            c.gemm(true, false, rank_g, b, hidden, 1.0, g.ga.w.ptr, hidden, bx32, hidden, 0.0, kga, rank_g, Gemm::F32)?;
+                            c.gemm(true, false, vd, b, rank_g, 1.0, gb.w.ptr, rank_g, kga, rank_g, 0.0, kgate, vd, Gemm::F32)?;
+                            kgate
+                        }
+                        None => {
+                            c.gemm(true, false, vd, b, hidden, 1.0, g.ga.w.ptr, hidden, bx32, hidden, 0.0, kga, vd, Gemm::F32)?;
+                            kga
+                        }
+                    }
+                };
+                let gs = st.hyb.gdn.get_mut(&key).ok_or("KDA state missing")?;
+                unsafe {
+                    let units = (cdim / g.dk) as u32;
+                    c.launch(
+                        fx.front,
+                        (units, b as u32),
+                        g.dk.max(64) as u32,
+                        0,
+                        kargs!(yq, cd_i, gs.ring.ptr, g.taps.ptr, cq, b_i, cd_i, kk_i, nh_i, dk_i, bx32, hid_i, nul, nul, g.a_log.ptr, g.dt_bias.ptr, nul, nh_i),
+                    )?;
+                    // the front read the ring: now it moves past the chunk
+                    if g.kk > 1 {
+                        c.launch(fx.ring, ((cdim as u32).div_ceil(256), 1), 256, 0, kargs!(gs.ring.ptr, yq, cd_i, b_i, cd_i, kk_i))?;
+                    }
+                    let (lb_on, lbv) = match g.lower {
+                        Some(v) => (1i32, v),
+                        None => (0i32, 0f32),
+                    };
+                    let (kd_i, al_i) = (kd as i32, g.a_len as i32);
+                    c.launch(
+                        fx.kda_gates,
+                        ((b * kd).div_ceil(256) as u32, 1),
+                        256,
+                        0,
+                        kargs!(kf, kd_i, kbr, nh_i, g.a_log.ptr, al_i, g.dt_bias.ptr, kgd, kbeta, b_i, nh_i, dk_i, lb_on, lbv),
+                    )?;
+                    bst(c, 3, tm)?;
+                    c.launch(fx.kda_scan4, ((g.nh * g.dv / 32) as u32, 1), 128, 0, kargs!(cq, kgd, kbeta, gs.s.ptr, yo, b_i, cd_i, nh_i, dv_i, nul, nul, cd_i, kk_i))?;
+                    bst(c, 4, tm)?;
+                    let (vd_i, sig1) = (vd as i32, 1i32);
+                    c.launch(fx.out32, ((b * g.nh) as u32, 1), g.dv as u32, 0, kargs!(yo, gate, vd_i, g.o_norm.ptr, yof, nh_i, dv_i, eps, sig1, one, nul, nul, nul, zero_i))?;
+                }
+                gs.next_pos = pos0 + b;
+                gs.tape = None;
+                bst(c, 3, tm)?;
+                unsafe { prism_rows(c, plan, yof, yof, vd, vd, b)? };
+                match (pl.attn_out.as_deref(), mh) {
+                    (_, Some((m, mp, r))) => {
+                        mul(&g.out, yof, r.yo, hidden, 1.0, 0.0)?;
+                        unsafe { mhc_out(c, fx, hidden, m, mp, r, false, b)? };
+                    }
+                    (Some(w), None) => {
+                        let by = st.scr(c, "hb_yo", b * hidden * 4)?;
+                        mul(&g.out, yof, by, hidden, 1.0, 0.0)?;
+                        unsafe { sandwich_rows(c, plan, w, bh, by, b)? };
+                    }
+                    (None, None) => mul(&g.out, yof, bh, hidden, 1.0, 1.0)?,
+                }
+            }
             Mix::Gdn(g) => {
                 let (cd_i, kk_i, nv_i, nk_i, dk_i, dv_i) =
                     (g.cdim as i32, g.kk as i32, g.nv as i32, g.nk as i32, g.dk as i32, g.dv as i32);
@@ -5459,8 +5619,35 @@ unsafe fn big(
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
                 let bis = st.scr(c, "hb_is", b * nh * 4)?;
                 mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
-                mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
-                mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
+                match &a.mla {
+                    Some(ml) => {
+                        // MLA: the latent and the rope key by one GEMM, the
+                        // latent's norm as f16 rows, kv_b over it, the heads'
+                        // keys [k_rope | k_nope] and values [v | 0]
+                        let st_w = ml.lora + ml.rope;
+                        let kva = st.scr(c, "hb_kva", b * st_w * 4)?;
+                        let lat = st.scr(c, "hb_lat", b * ml.lora * 2)?;
+                        let kvb = st.scr(c, "hb_kvb", b * nkv * (ml.nope + ml.vd) * 4)?;
+                        mul(&a.k, bxf, kva, st_w, 1.0, 0.0)?;
+                        let (st_i, lora_i) = (st_w as i32, ml.lora as i32);
+                        unsafe { c.launch(fx.mla_lat_h, (b as u32, 1), 256, 0, kargs!(kva, st_i, ml.kv_a_norm.ptr, lora_i, eps, lat))? };
+                        mul(&ml.kv_b, lat, kvb, nkv * (ml.nope + ml.vd), 1.0, 0.0)?;
+                        let (nkv_i, rope_i, nope_i, vd_i) = (nkv as i32, ml.rope as i32, ml.nope as i32, ml.vd as i32);
+                        unsafe {
+                            c.launch(
+                                fx.mla_kv,
+                                ((b * nkv * hd).div_ceil(256) as u32, 1),
+                                256,
+                                0,
+                                kargs!(kva, st_i, kvb, yk, yv, b_i, nkv_i, rope_i, nope_i, vd_i, lora_i),
+                            )?;
+                        }
+                    }
+                    None => {
+                        mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                        mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
+                    }
+                }
                 let hint = st.kv_hint;
                 let (slot0, kp, vp, m_base) = {
                     let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
@@ -5568,8 +5755,10 @@ unsafe fn big(
                     let isum = bis + (b0 * hpk * 4) as u64;
                     // the mirrors hold f16 rows: both GEMMs on f16 operands
                     // (the query copy and the exponentials), f32 out
+                    // MLA's own softmax scale (1/sqrt(rope + nope), YaRN-corrected)
+                    let scale_l = a.mla.as_ref().map_or(plan.scale, |m| m.scale);
                     unsafe {
-                        gemm_batched_h(c, true, l_rows, cols, hd, plan.scale, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
+                        gemm_batched_h(c, true, l_rows, cols, hd, scale_l, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
                         let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
                         c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i, sinkp))?;
                         gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
@@ -5582,8 +5771,30 @@ unsafe fn big(
                     c.launch(fx.attn_out, (n_ao.div_ceil(256) as u32, 1), 256, 0, kargs!(aog, bis, gate_p, bao, nh_i, b_i, one))?;
                 }
                 }
+                // LFM3's head-wise gate: sigmoid(Wg · x) a head, from the
+                // layer's normed rows
+                if let Some((_, _, _, hgh)) = &a.hg {
+                    let hgh = hgh.as_ref().ok_or("a head gate without its f16 copy on the prompt path")?;
+                    let bg = st.scr(c, "hb_hg", b * nh * 4)?;
+                    let hd_i = hd as i32;
+                    unsafe {
+                        c.gemm(true, false, nh, b, hidden, 1.0, hgh.ptr, hidden, bxn, hidden, 0.0, bg, nh, Gemm::Half)?;
+                        c.launch(fx.head_gate_h, ((nh * hd).div_ceil(256) as u32, b as u32), 256, 0, kargs!(bao, bg, nh_i, hd_i, b_i))?;
+                    }
+                }
                 bst(c, 5, tm)?;
                 unsafe { prism_rows(c, plan, bao, bao, nh * hd, nh * hd, b)? };
+                // MLA: the heads cut back to v wide for the output product
+                let bao = match &a.mla {
+                    Some(ml) => {
+                        let cut = st.scr(c, "hb_aocut", b * nh * ml.vd * 2)?;
+                        let tot = b * nh * ml.vd;
+                        let (nh_i2, hd_i2, vd_i2) = (nh as i32, hd as i32, ml.vd as i32);
+                        unsafe { c.launch(fx.mla_cut_h, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bao, cut, b_i, nh_i2, hd_i2, vd_i2))? };
+                        cut
+                    }
+                    None => bao,
+                };
                 match (pl.attn_out.as_deref(), mh) {
                     (_, Some((m, mp, r))) => {
                         mul(&a.o, bao, r.yo, hidden, 1.0, 0.0)?;

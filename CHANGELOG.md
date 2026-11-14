@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.97] — 2026-11-14
+
+### Added
+- FastH3 (FastVideo's 4-step MiniMax-H3 students, `FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`):
+  `animate-pack --dit-diffusers <transformer/>` packs a full MiniMax-H3 DiT in the diffusers layout — `to_q |
+  to_k | to_v` stacked into the fused panel, the SwiGLU halves swapped back, `rope_inv_freq` recomputed, every
+  block's full adaLN matrix folded into the curve form through one low-rank basis of the student's own time
+  embedding (ranked by its spectrum) — with the trained VSA gates and the repository's few-step schedule and
+  sparsity in `dit.config_json`; `--dit-from <cmf>` takes the DiT of another container by reference over an
+  `--in` file's encoder and decoders. The runtime follows the student's own sigma schedule when the step
+  count matches it.
+- Video sparse attention (VSA) as FastVideo's VSA-H3 runs it: the packed sequence in tiles of 4×4×4 video
+  tokens and 64-row chunks of the other streams, per head tile scores from the tile means of q and k, each
+  video query tile attending its top-k video tiles (10 % at sparsity 0.9) and every non-video tile, non-video
+  queries attending everything, and the trained gate on the compression branch (softmax over the tile scores
+  times the tile means of v). The CUDA chain runs it on the card (`gpu_cuda/h3_vsa.cu`: tile means, scores, a
+  radix top-k select, the flash kernel over a query tile's key-tile list, the compression branch, the gather
+  back to row order with the gate); the Vulkan / wgpu chain runs the same kernels in WGSL
+  (`gpu_wgpu/h3_vsa.rs`) and the Metal chain in MSL (`gpu_metal/h3_vsa.metal`, `CMF_H3_METAL_VSA=0` turns it off;
+  on an M4 within 0.55 % of the host reference at sparsity 0, 512×288×39 denoised in 129 s against 775 s
+  on the host). `CMF_VSA=0` forces dense attention, `CMF_VSA_SPARSITY` overrides the packed sparsity,
+  `CMF_VSA_GATE=0` drops the compression branch (a diagnostic).
+- Qwen3-TTS 12 Hz (`Qwen3TTSForConditionalGeneration`, the CustomVoice models) runs natively: `convert` takes
+  the HF snapshot (the talker as a Qwen3 stack, its text embedding, text projection, code predictor and the
+  speech tokenizer's decoder as `qtts.*`, a `tokenizer.json` built from `vocab.json` + `merges.txt`), and
+  `cortiq tts <file> "text" --lang ru --speaker serena` speaks: the talker and the code predictor (a second
+  pipeline over the same file) on the engine's backends, the decoder (RVQ, a sliding-window transformer,
+  ConvNeXt upsampling, a SnakeBeta vocoder) on the host with its big products on the device. Greedy codes
+  match `qwen_tts` 0.1.1 frame for frame; the decoder on its codes is within 9.3e-4 of its waveform. An
+  M4 speaks 1.7–1.9× faster than real time, an RTX A5000 1.2× (q4tp).
+- Haru (higurashi-ai/Haru-4B, full-duplex spoken dialogue at 7.5 Hz): `convert` takes the checkpoint (the
+  Qwen3.5 language model, its audio projectors, the MeanFlow head and the VibeVoice codec as `haru.*`), and
+  `cortiq duplex <file> user.wav reply.wav --reference voice.wav` plays a recording to the model frame by frame,
+  as in a live call, and writes its answer: the three streams summed into one position, the text token and
+  the next latent from each final-normed state (DRY, PAD / EOP in float32, one MeanFlow step), the causal
+  codec over the whole recording and the whole reply.
+- `CmfModel::open_view`: a file opened again under other tensor names and another architecture (its own uid),
+  so a stack inside a file can run as a pipeline of its own.
+- CUDA: the hybrid arm's gate/up pair takes the exact erf GELU (Spark-X2.5), and a stack whose call-wide
+  rotary table is narrower than its rotary width takes its first attention layer's own rotation as the
+  call's: Spark-X2.5-4B decodes at 116 tokens/s instead of 94 (q4mix) and 101 instead of 85 (q8_2f) on an
+  RTX A5000.
+
+### Fixed
+- CUDA: a short convolution (LFM2/LFM3) and an f32 head-wise output gate now run on the hybrid arm's prompt
+  path, and the batched prompt graph takes the short-conv layers and the sandwich norms on CUDA, so such a
+  stack reads a long prompt in one batch: LFM3-1.7B on an RTX A5000 reads 4096 tokens at 9 300–10 200
+  tokens/s instead of 247.
+- CUDA: KDA and MLA layers (Kimi Linear) run on the hybrid arm's prompt path — q | k | v, the latent and
+  kv_b as GEMMs, the KDA delta rule over any chunk 16 rows a pass — instead of 16-row chunks through the
+  small path: Kimi-Linear-48B-A3B reads 4096 tokens at 2 210–2 255 tokens/s instead of 378 (first token
+  1.8 s instead of 10.8) on an RTX A5000.
+- CUDA: routed experts in q8_2f run on the hybrid arm (the tile kernel applies the column field itself)
+  instead of the CPU: Unlimited-OCR-2 q8_2f reads a page in 7.4 s instead of 33–58 s.
+
 ## [0.8.96] — 2026-11-14
 
 ### Added
