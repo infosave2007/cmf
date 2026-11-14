@@ -4,7 +4,10 @@
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
-    <out>.messages.jsonl   {"system", "tools", "messages", "group", "cat", "mode"} per line
+    <out>.messages.jsonl   {"messages": [{"role", "content"}], "group", "cat", "mode"} per line: the turns
+                           of the contract as they are rendered (tools in the system turn, `<think>` and
+                           `<tool_call>` in the assistant's, `<tool_response>` in the tool's), the input
+                           of `cortiq-embryo sft-prepare --format messages --group-field group`
     <out>.jsonl.gz         the same conversations as text of the training contract ({"text": ...})
     <out>.val.jsonl.gz     held out by group (1 group in 100)
 
@@ -41,7 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "datasets"))
 
-from convert import render  # noqa: E402
+from convert import render, render_turns  # noqa: E402
 
 SYSTEM = ("You are the command core of an agent. Work from reference cards, not from memory: if the card for a "
           "command is not in the conversation, fetch it with lookup. Run commands with terminal. If no card can do "
@@ -282,17 +285,12 @@ def main() -> None:
                 skipped += 1
                 continue
             counts[mode] = counts.get(mode, 0) + 1
-            msgs = []
-            for t in turns:
-                if t[0] == "assistant":
-                    msgs.append({"role": "assistant", "think": t[1], "content": t[2] or "", "tool_calls": t[3]})
-                else:
-                    msgs.append({"role": t[0], "content": t[1]})
+            msgs = [{"role": role, "content": content}
+                    for role, content in render_turns(None if direct else SYSTEM, None if direct else TOOLS, turns)]
             held = int(hashlib.md5(r["group"].encode()).hexdigest()[:8], 16) % 100 == 0
             (fv if held else ft).write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
             if not held:
-                fm.write(json.dumps({"system": None if direct else SYSTEM, "tools": None if direct else TOOLS, "messages": msgs,
-                                     "group": r["group"], "cat": r["cat"], "mode": mode}, ensure_ascii=False) + "\n")
+                fm.write(json.dumps({"messages": msgs, "group": r["group"], "cat": r["cat"], "mode": mode}, ensure_ascii=False) + "\n")
     print(f"{sum(counts.values())} conversations, {skipped} tasks skipped; modes: {counts}; cards in the pool: {len(pool)}")
 
 

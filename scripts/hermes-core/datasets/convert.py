@@ -121,15 +121,19 @@ def split_assistant(content):
     return think, text, calls
 
 
-def render(system, tools, turns):
-    """turns: (role, text) for system/user/tool, (assistant, think, text, calls)."""
+def render_turns(system, tools, turns):
+    """The conversation as (role, content) per turn of the contract.
+
+    turns: (role, text) for system/user/tool, (assistant, think, text, calls).
+    `render` frames the result; `sft-prepare --format messages` takes it as it is.
+    """
     out = []
     sys_text = (system or "").strip()
     if tools:
         block = TOOLS_HEAD + "\n<tools>\n" + "\n".join(json.dumps(t, ensure_ascii=False) for t in tools) + "\n</tools>"
         sys_text = (sys_text + "\n\n" + block) if sys_text else block
     if sys_text:
-        out.append("<|im_start|>system\n" + sys_text + "<|im_end|>\n")
+        out.append(("system", sys_text))
     seen_assistant = False
     merged = None
     for t in turns:
@@ -139,12 +143,12 @@ def render(system, tools, turns):
         if role == "user":
             if not (t[1] or "").strip():
                 raise Skip("empty user turn")
-            out.append("<|im_start|>user\n" + t[1].strip() + "<|im_end|>\n")
+            out.append(("user", t[1].strip()))
         elif role == "tool":
             body = (t[1] or "").strip()
             if len(body) > TOOL_CUT:
                 body = body[:TOOL_CUT] + " …"
-            out.append("<|im_start|>tool\n<tool_response>\n" + body + "\n</tool_response><|im_end|>\n")
+            out.append(("tool", "<tool_response>\n" + body + "\n</tool_response>"))
         elif role == "assistant":
             _, think, text, calls = t
             if out and merged is not None:
@@ -163,13 +167,19 @@ def render(system, tools, turns):
                 parts.append("<tool_call>\n" + json.dumps(c, ensure_ascii=False) + "\n</tool_call>")
             if not parts:
                 raise Skip("empty assistant turn")
-            out.append("<|im_start|>assistant\n" + "\n".join(parts) + "<|im_end|>\n")
+            out.append(("assistant", "\n".join(parts)))
             seen_assistant = True
         else:
             raise Skip(f"role {role}")
     if not seen_assistant:
         raise Skip("no assistant turn")
-    doc = "".join(out)
+    return out
+
+
+def render(system, tools, turns):
+    """The conversation as one text of the contract (see `render_turns`)."""
+    out = render_turns(system, tools, turns)
+    doc = "".join(f"<|im_start|>{role}\n{content}<|im_end|>\n" for role, content in out)
     if len(doc) > DOC_MAX:
         raise Skip("too long")
     if "<|endoftext|>" in doc or doc.count("<|im_start|>") != len(out):

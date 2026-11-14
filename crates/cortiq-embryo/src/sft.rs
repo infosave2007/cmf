@@ -681,9 +681,12 @@ fn encode_record(
     let mut prefix = Vec::new();
     for (role, text) in context {
         prefix.push(im_start);
+        // `tool` is the turn that carries a tool's result back to the model
+        // (the Hermes function-calling frame the base run is trained on).
         let role = match role.as_str() {
             "prompter" | "user" => "user",
             "system" => "system",
+            "tool" => "tool",
             _ => "assistant",
         };
         push_text(bpe, role, cache, &mut prefix);
