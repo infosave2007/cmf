@@ -15,7 +15,7 @@ use std::time::Instant;
 
 /// Fail-closed message when no training context can be built: no device,
 /// or (Vulkan) a genome outside the resident graph's contract.
-const NO_DEVICE: &str = "no training device: Metal (macOS) or Vulkan (`--features vulkan`, Linux); \
+const NO_DEVICE: &str = "no training device: Metal (macOS), Vulkan (`--features vulkan`) or CUDA (`--features cuda`, Linux); \
 on Vulkan the constructor also refuses gdn_lane / learn_decay / router_smooth_k4 / router_top2_margin";
 const NO_DEVICE_TEACHER: &str = "no training device for the --distill-from teacher (same contract as the student)";
 

@@ -40,6 +40,17 @@ data = ["dep:parquet"]
 # the portable CPU/reference/export build remains dependency-free; on Linux
 # wgpu is forced to Vulkan by the backend probe.
 vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# The same trainer on NVIDIA through CUDA: the Vulkan backend's operation
+# recording with a CUDA device layer (`src/cuda_dev.rs`), its WGSL kernels
+# translated to CUDA C (`src/wgsl_cuda.rs`) and compiled by NVRTC at start.
+# The driver and NVRTC are opened at run time, so the build needs no toolkit.
+cuda = ["vulkan", "dep:cudarc"]
+
+[dependencies.cudarc]
+version = "0.19"
+optional = true
+default-features = false
+features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12080"]
 
 [dependencies.wgpu]
 version = "30"

@@ -640,6 +640,7 @@ dependencies = [
  "clap",
  "cortiq-core",
  "cortiq-engine",
+ "cudarc",
  "fancy-regex 0.14.0",
  "flate2",
  "metal",

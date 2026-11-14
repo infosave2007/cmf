@@ -44,6 +44,8 @@ pub mod sleep;
 pub mod tokenizer;
 pub mod train;
 pub mod trunk;
+/// The trainer's WGSL as CUDA C (the `cuda` build's kernels).
+pub mod wgsl_cuda;
 #[cfg(all(feature = "vulkan", target_os = "macos"))]
 #[path = "vulkan.rs"]
 mod vulkan_validation;

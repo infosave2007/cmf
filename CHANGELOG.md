@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included. Embryo-56M, which ran op by op on CUDA at 390-410 tok/s, decodes at 884-957 tok/s against the
   Vulkan resident graph's 661-720 and the CPU's 424-443 on an RTX A5000 (fast build); the greedy text
   identical to the CPU's.
+- The Embryo trainer on CUDA (`cortiq-embryo --features cuda`): the Vulkan backend's operation recording with
+  a CUDA device layer (`src/cuda_dev.rs`), its WGSL kernels translated to CUDA C at start (`src/wgsl_cuda.rs`,
+  one source for both backends) and compiled by NVRTC, the PTX kept on disk. Every backend and `vulkan_*` suite
+  passes on it. On an RTX A5000, B8×T1024: an Embryo-0 step 339 ms against Vulkan's 708 (24 100 against 11 600
+  tok/s), a GDN genome's 350 against 511, the first step 0.36 against 2.4 s; the losses of the first six steps
+  equal Vulkan's (Embryo-0) or within 0.003 (GDN). cuBLAS for the plain GEMMs is opt-in (`CMF_CUDA_CUBLAS=1`):
+  no faster here, and it gives up the bit identity of a GEMM's loop and table forms.
 - q2tp weights and Prism's activation boundary on the CUDA hybrid arm. q2tp tiles (job kinds 1 and 9) carry a
   lane's 16 two-bit codes a 32-column group beside q4tp's ladder and rung codes (rung 0 a zero group), the
   registers built exactly as bf16 (the mid-rise 2c - 3 with the half in the scale, or the affine correction's
