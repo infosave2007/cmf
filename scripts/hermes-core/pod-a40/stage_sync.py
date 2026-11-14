@@ -2,15 +2,18 @@
 
     IFS= read -r HF_TOKEN; export HF_TOKEN       # the token comes on stdin, never from a file
     python3 stage_sync.py --run /root/hc/run --name pass1 --repo infosave/cmf-experiments \
-        --prefix runs/hermes_core_a40_20261114 --steps 60200 --batch 8 --seq 1024 --ckpt-every 3
+        --prefix runs/hermes_core_a40_20261114 --steps 60200 --batch 8 --seq 1024 --ckpt-every 1 --keep 3
 
 Watches `<run>/<name>.log`. A stage is complete when the trainer has printed
 its held-out losses and `saved … (step N)`. For every complete stage the
 script rewrites `REPORT.md` and `metrics.jsonl` and uploads them with the
 log; for every `--ckpt-every`-th stage and for the last one it also uploads
-a copy of the checkpoint (the trainer replaces its file by rename, so the
-copy is whole). Every upload is checked against the Hub: the size, and the
-sha256 of a large file. Nothing is uploaded unless the repo is private.
+a copy of the checkpoint as `ckpt/<name>-step<N>.ckpt` (the trainer replaces
+its file by rename, so the copy is whole). Every upload is checked against
+the Hub: the size, and the sha256 of a large file. Only the last `--keep`
+checkpoints stay: an older one is removed from the tree and its LFS object
+is deleted for good, by the sha256 this script uploaded it with and only
+under `<prefix>/ckpt/`. Nothing is uploaded unless the repo is private.
 Ends when the run is done or has failed and that state is on the Hub.
 """
 
@@ -89,8 +92,7 @@ class Hub:
                 self.api.upload_file(path_or_fileobj=str(local), path_in_repo=remote, repo_id=self.repo,
                                      repo_type="model", commit_message=message)
                 info = self.api.get_paths_info(self.repo, [remote], repo_type="model")[0]
-                lfs = getattr(info, "lfs", None)
-                oid = (lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)) if lfs else None
+                oid = lfs_oid(info)
                 ok = info.size == local.stat().st_size and (digest is None or oid == digest)
                 self.say(f"{'ok' if ok else 'MISMATCH'} {remote} size {info.size} sha256 {oid or '-'}")
                 if ok:
@@ -98,6 +100,42 @@ class Hub:
             except Exception as e:  # the network, the Hub
                 self.say(f"upload of {remote} failed (attempt {attempt}): {type(e).__name__}: {str(e)[:200]}")
             time.sleep(30 * attempt)
+        return False
+
+
+def lfs_oid(info) -> str | None:
+    lfs = getattr(info, "lfs", None)
+    if not lfs:
+        return None
+    return lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+
+
+def hub_ckpts(hub: "Hub", name: str) -> list[dict]:
+    """The checkpoints of this run already on the Hub, oldest first."""
+    out = []
+    try:
+        for f in hub.api.list_repo_tree(hub.repo, path_in_repo=f"{hub.prefix}/ckpt", repo_type="model", expand=True):
+            m = re.search(rf"/ckpt/{re.escape(name)}-step(\d+)\.ckpt$", f.path)
+            if m and lfs_oid(f):
+                out.append({"step": int(m.group(1)), "file": f.path.rsplit("/", 1)[1], "size": f.size, "sha256": lfs_oid(f)})
+    except Exception:  # no folder yet
+        pass
+    return sorted(out, key=lambda c: c["step"])
+
+
+def drop_ckpt(hub: "Hub", c: dict) -> bool:
+    """Remove a superseded checkpoint: from the tree, then its LFS object."""
+    remote = f"{hub.prefix}/ckpt/{c['file']}"
+    try:
+        hub.api.delete_file(remote, hub.repo, repo_type="model", commit_message=f"drop superseded checkpoint of step {c['step']}")
+        gone = [f for f in hub.api.list_lfs_files(hub.repo, repo_type="model")
+                if f.file_oid == c["sha256"] and f.filename.startswith(f"{hub.prefix}/ckpt/")]
+        if gone:
+            hub.api.permanently_delete_lfs_files(hub.repo, gone, rewrite_history=False, repo_type="model")
+        hub.say(f"dropped {remote} (LFS objects deleted: {len(gone)})")
+        return True
+    except Exception as e:
+        hub.say(f"drop of {remote} failed: {type(e).__name__}: {str(e)[:200]}")
         return False
 
 
@@ -138,16 +176,17 @@ def report(args, stages: list[dict], last: dict | None, base: dict | None, state
         out.append(f"| {i} | {s['step']} | {s['step'] * per_step / 1e6:.1f} | {s['ema']:.4f} | {s['val']:.4f} | "
                    + " | ".join(f"{s['extra'].get(n, float('nan')):.4f}" for n in names) + f" | {s['tok_s']} |")
     out += ["", "## Резервная копия", ""]
-    if state.get("ckpt"):
-        c = state["ckpt"]
+    if state.get("ckpts"):
+        out += [f"В `{args.prefix}/ckpt/` хранятся {args.keep} последних чекпойнта (с моментами оптимизатора); "
+                "размер и sha256 каждого сверены с Hub после загрузки, более старые удаляются.", "",
+                "| Шаг | Файл | Размер, ГБ | sha256 |", "|---|---|---|---|"]
+        out += [f"| {c['step']} | `{c['file']}` | {c['size'] / 1e9:.2f} | `{c['sha256']}` |" for c in reversed(state["ckpts"])]
         out += [
-            f"Чекпойнт шага {c['step']}: `{args.prefix}/ckpt/{args.name}.ckpt`, {c['size'] / 1e9:.2f} ГБ, sha256 `{c['sha256']}`"
-            " (размер и хеш сверены с Hub после загрузки).",
             "",
-            "Продолжить с него на том же расписании:",
+            "Продолжить с любого из них на том же расписании:",
             "",
             "```",
-            f"cortiq-embryo birth --resume {args.name}.ckpt --schedule-from 0 --steps {args.steps} --lr-restart …остальные флаги из train.sh",
+            f"cortiq-embryo birth --resume <файл> --schedule-from 0 --steps {args.steps} --lr-restart …остальные флаги из train.sh",
             "```",
         ]
     else:
@@ -168,7 +207,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, required=True)
     ap.add_argument("--batch", type=int, required=True)
     ap.add_argument("--seq", type=int, required=True)
-    ap.add_argument("--ckpt-every", type=int, default=3)
+    ap.add_argument("--ckpt-every", type=int, default=1)
+    ap.add_argument("--keep", type=int, default=3, help="checkpoints kept on the Hub")
     ap.add_argument("--base", help="log of a one-step run: the losses before training")
     ap.add_argument("--also", nargs="*", default=[], help="files uploaded once, as they are")
     args = ap.parse_args()
@@ -181,7 +221,7 @@ def main() -> None:
         m = [x for x in m if x]
         if m:
             base = {"val": float(m[-1].group(1)), "extra": {n: float(v) for n, v, _, _ in EXTRA.findall(m[-1].group(3))}}
-    state: dict = {"problems": []}
+    state: dict = {"problems": [], "ckpts": hub_ckpts(hub, args.name)}
     for extra in args.also:
         if not hub.put(Path(extra), Path(extra).name, f"{args.name}: {Path(extra).name}"):
             state["problems"].append(f"не загружен {Path(extra).name}")
@@ -195,17 +235,25 @@ def main() -> None:
         status = "завершено" if finished else "остановлено с ошибкой" if failed else "идёт"
         if len(stages) > seen or first or ((finished or failed) and not final_sent):
             n = len(stages)
+            on_hub = {c["step"] for c in state["ckpts"]}
             want_ckpt = n > 0 and n > seen and (n % args.ckpt_every == 0 or finished) and ckpt.exists()
             if (finished or failed) and not final_sent and ckpt.exists() and n > 0:
-                want_ckpt = want_ckpt or state.get("ckpt", {}).get("step") != stages[-1]["step"]
-            if want_ckpt:
+                want_ckpt = True
+            if want_ckpt and stages[-1]["step"] not in on_hub:
+                step = stages[-1]["step"]
+                fname = f"{args.name}-step{step:06d}.ckpt"
                 copy = run / f"{args.name}.upload.ckpt"
                 shutil.copyfile(ckpt, copy)
                 digest = sha256(copy)
-                if hub.put(copy, f"ckpt/{args.name}.ckpt", f"{args.name}: checkpoint of step {stages[-1]['step']}", digest):
-                    state["ckpt"] = {"step": stages[-1]["step"], "size": copy.stat().st_size, "sha256": digest}
+                if hub.put(copy, f"ckpt/{fname}", f"{args.name}: checkpoint of step {step}", digest):
+                    state["ckpts"].append({"step": step, "file": fname, "size": copy.stat().st_size, "sha256": digest})
+                    state["ckpts"].sort(key=lambda c: c["step"])
+                    while len(state["ckpts"]) > args.keep:
+                        if not drop_ckpt(hub, state["ckpts"][0]):
+                            state["problems"].append(f"старый чекпойнт шага {state['ckpts'][0]['step']} не удалён")
+                        state["ckpts"].pop(0)
                 else:
-                    state["problems"].append(f"чекпойнт шага {stages[-1]['step']} не загружен")
+                    state["problems"].append(f"чекпойнт шага {step} не загружен")
                 copy.unlink(missing_ok=True)
             (run / "metrics.jsonl").write_text("".join(json.dumps(s, ensure_ascii=False) + "\n" for s in stages))
             (run / "REPORT.md").write_text(report(args, stages, last, base, state, status, started))

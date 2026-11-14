@@ -7919,18 +7919,34 @@ impl EmbryoGpu {
             *cov_ema = vec![0.0; cov_h.len()];
         }
         let mut u_all = vec![0.0f32; l_n * ne * k * h];
-        for le in 0..l_n * ne {
-            let n = counts[le].min(cap as u32) as f32;
-            let blk = &cov_h[le * h * h..(le + 1) * h * h];
-            let ema_blk = &mut cov_ema[le * h * h..(le + 1) * h * h];
-            if n >= 2.0 {
-                for i in 0..h * h {
-                    ema_blk[i] = ema * ema_blk[i] + (1.0 - ema) * blk[i] / n;
-                }
+        // A (layer, expert) block is independent of the others: its EMA and
+        // its power iteration run on one thread exactly as in a plain loop,
+        // so the threads change the time (seconds per refresh on a 16-layer
+        // genome), not the bits.
+        let blocks = l_n * ne;
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, blocks);
+        let per = blocks.div_ceil(threads);
+        std::thread::scope(|sc| {
+            let chunks = cov_ema.chunks_mut(per * h * h).zip(u_all.chunks_mut(per * k * h));
+            for (ti, (ema_chunk, u_chunk)) in chunks.enumerate() {
+                let (cov_h, counts) = (&cov_h, &counts);
+                sc.spawn(move || {
+                    let pairs = ema_chunk.chunks_mut(h * h).zip(u_chunk.chunks_mut(k * h));
+                    for (j, (ema_blk, u_blk)) in pairs.enumerate() {
+                        let le = ti * per + j;
+                        let n = counts[le].min(cap as u32) as f32;
+                        let blk = &cov_h[le * h * h..(le + 1) * h * h];
+                        if n >= 2.0 {
+                            for i in 0..h * h {
+                                ema_blk[i] = ema * ema_blk[i] + (1.0 - ema) * blk[i] / n;
+                            }
+                        }
+                        let u = top_eigenvectors(ema_blk, h, k, 24, le as u64);
+                        u_blk.copy_from_slice(&u);
+                    }
+                });
             }
-            let u = top_eigenvectors(ema_blk, h, k, 24, le as u64);
-            u_all[le * k * h..(le + 1) * k * h].copy_from_slice(&u);
-        }
+        });
         self.desc.u.write_from(&u_all);
     }
 }
