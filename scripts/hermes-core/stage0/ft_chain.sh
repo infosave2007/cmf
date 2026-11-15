@@ -9,7 +9,12 @@
 # Environment: STAGE0 (run root), EMBRYO (trainer), CORTIQ (engine),
 # O1 (the Embryo run directory with the replay and raw-val shards),
 # SET (prefix of the SFT shards in $STAGE0/ft: SET-train.sft, SET-dev.sft,
-# SET-final.sft) [cards], SEQ (their window) [512]. With an empty EVAL_STEPS
+# SET-final.sft) [cards], SEQ (their window) [512], ORIGIN (the optimizer
+# step of START: the run keeps the checkpoint's AdamW moments and counts its
+# steps from there; without it the moments start from zero, which at a
+# constant lr and no warmup moves every weight by lr on the first steps: for
+# a checkpoint without moments or one that does not know the task yet).
+# With an empty EVAL_STEPS
 # nothing is answered here (a model of the lookup contract goes through
 # run_lookup.py).
 set -euo pipefail
@@ -22,13 +27,13 @@ O="${O1:-$HOME/embryo-data/o1}"
 PY="$B/venv/bin/python"
 TOK="$O/sft-t27/gen1.tokenizer.json"
 NAME="$1"; START="$2"; BATCH="$3"; LR="$4"; EVALS=" $5 "; LAST="$6"
-SET="${SET:-cards}"; SEQ="${SEQ:-512}"
+SET="${SET:-cards}"; SEQ="${SEQ:-512}"; ORIGIN="${ORIGIN:-0}"
 cd "$B/ft"
 log() { echo "$(date +%T) $*" | tee -a "$NAME.status"; }
 
 prev=0; prev_ck="$START"
 while [ "$prev" -lt "$LAST" ]; do
-  if [ "$prev" -eq 0 ]; then next=100; extra="--fresh-moments"
+  if [ "$prev" -eq 0 ]; then next=100; extra="--fresh-moments"; [ "$ORIGIN" -gt 0 ] && extra=""
   elif [ "$prev" -eq 100 ]; then next=500; extra="--allow-extended --sampler-skip $prev --skip-eval-before"
   else next=$((prev + 500)); extra="--allow-extended --sampler-skip $prev --skip-eval-before"; fi
   [ "$next" -gt "$LAST" ] && next="$LAST"
@@ -36,7 +41,7 @@ while [ "$prev" -lt "$LAST" ]; do
   # shellcheck disable=SC2086
   "$E" sft --ckpt "$prev_ck" --shard "$SET-train.sft" --val "$SET-dev.sft" --final-val "$SET-final.sft" \
     --replay "$O/chat-sft/replay-16m.u16" --raw-val "$O/sft-t27/rawval-tails-2m.u16" --out "$out" \
-    --batch "$BATCH" --seq "$SEQ" --steps "$next" --val-batches 32 --raw-val-batches 8 --lr "$LR" --dropless $extra \
+    --batch "$BATCH" --seq "$SEQ" --steps "$((ORIGIN + next))" --val-batches 32 --raw-val-batches 8 --lr "$LR" --dropless $extra \
     > "$NAME-stage-$next.log" 2>&1
   [ -f "$out" ] || { log "stage $next FAILED, see $NAME-stage-$next.log"; exit 1; }
   rec="$(grep 'SFT receipt' "$NAME-stage-$next.log" | tail -1)"
