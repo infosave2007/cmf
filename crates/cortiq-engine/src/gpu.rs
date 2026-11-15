@@ -1540,6 +1540,28 @@ pub fn cuda_batch_rows() -> Option<usize> {
 }
 
 /// The CUDA backend is the one in use.
+/// CUDA: whether a narrow product of tensor `idx` may take the dense plane
+/// without evicting another (see `gpu_cuda::h3_plane_fits`).
+#[allow(unused_variables)]
+pub fn cuda_plane_fits(model: &Arc<CmfModel>, idx: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::h3_plane_fits(model, idx)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// CUDA: a pipeline that has the card to itself lets the per-op plane cache
+/// grow into free memory (see `gpu_cuda::h3_planes_grow`). A no-op elsewhere.
+#[allow(unused_variables)]
+pub fn planes_may_grow(on: bool) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::h3_planes_grow(on);
+}
+
 pub fn cuda_active() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -4960,6 +4982,8 @@ pub fn music3_ffn(
         Backend::Wgpu => {
             crate::gpu_wgpu::music3_ffn(model, idx_in, idx_out, h, bias_in, n, hs, inter, out)
         }
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_music3_ffn(model, idx_in, idx_out, h, bias_in, n, hs, inter, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -5674,6 +5698,10 @@ pub fn lfm_set_forward(
         ),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::lfm_set::forward(
+            model, layers, dims, final_norm, rows, t, state, group, head,
+        ),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_lfm_set_forward(
             model, layers, dims, final_norm, rows, t, state, group, head,
         ),
         _ => None,

@@ -2145,6 +2145,48 @@ impl QTensor {
         self.matmat(xs_all, b, out, pool)
     }
 
+    /// `CMF_CUDA_MM_VERIFY=1`: a device product against f32 rows of the same
+    /// weight (and the host's own q4tp product), the first three calls of a
+    /// tensor and every 50th after — printed when the device is off by 1e-3.
+    fn verify_product(&self, name: &str, xs: &[f32], b: usize, dev: &[f32], pool: Option<&Pool>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+        static BAD: AtomicU64 = AtomicU64::new(0);
+        let k = {
+            let mut m = CALLS.lock().unwrap();
+            let e = m.get_or_insert_with(Default::default).entry(name.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if k > 3 && k % 50 != 0 {
+            return;
+        }
+        let (rows, cols) = (self.rows(), self.cols());
+        let mut exact = vec![0f32; b * rows];
+        let mut w = vec![0f32; cols];
+        for r in 0..rows {
+            self.row_f32(r, &mut w);
+            for bi in 0..b {
+                let x = &xs[bi * cols..(bi + 1) * cols];
+                exact[bi * rows + r] = w.iter().zip(x).map(|(a, c)| (*a as f64) * (*c as f64)).sum::<f64>() as f32;
+            }
+        }
+        let mut host = vec![0f32; b * rows];
+        q4tp_matmat(self.quant_bytes(), xs, b, rows, cols, &mut host, pool);
+        let rel = |a: &[f32]| {
+            let d: f64 = a.iter().zip(&exact).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+            let n: f64 = exact.iter().map(|y| (*y as f64).powi(2)).sum();
+            (d / n.max(1e-30)).sqrt()
+        };
+        let (rd, rh) = (rel(&dev[..b * rows]), rel(&host));
+        if rd > 1e-3 {
+            let bad = BAD.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!("cuda mm verify #{bad}: {name} b={b} {rows}x{cols} call {k}: device rel {rd:.3e}, host q4tp rel {rh:.3e}");
+        } else if k <= 1 {
+            eprintln!("cuda mm verify ok: {name} b={b} {rows}x{cols}: device rel {rd:.3e}, host q4tp rel {rh:.3e}");
+        }
+    }
+
     pub fn matmat(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         if self.exact_cpu_default() {
             return float_activations_scope(|| self.matmat(xs_all, b, out, pool));
@@ -2419,7 +2461,11 @@ impl QTensor {
                     // the host: its plane is built on the card from the
                     // codec's bytes in tens of milliseconds, where a wgpu
                     // weight has an upload to amortise and a narrow batch
-                    // tiles badly.
+                    // tiles badly. A decode-narrow batch (under 8 rows)
+                    // takes it only while the plane is cached or fits
+                    // without evicting another: a stack larger than the
+                    // cache would otherwise rebuild every plane every token
+                    // (MiniMax-Music-3's AR at batch 2: 6.4 s a frame).
                     if crate::gpu::cuda_active()
                         && b >= 2
                         && rows * cols >= (1 << 20)
@@ -2428,7 +2474,12 @@ impl QTensor {
                         && crate::gpu::enabled_here()
                     {
                         if let Self::Mapped { model, idx, .. } = self {
-                            if crate::gpu::q4tp_matmat(model, *idx, xs_all, b, rows, cols, out) {
+                            if (b >= 8 || crate::gpu::cuda_plane_fits(model, *idx))
+                                && crate::gpu::q4tp_matmat(model, *idx, xs_all, b, rows, cols, out)
+                            {
+                                if cuda_mm_verify() {
+                                    self.verify_product(&model.tensors[*idx].name, xs_all, b, out, pool);
+                                }
                                 return;
                             }
                         }
@@ -8551,6 +8602,11 @@ unsafe fn dot_q4tp_row_1x4_sdot(
             vaddvq_f32(v3),
         ]
     }
+}
+
+fn cuda_mm_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_CUDA_MM_VERIFY").as_deref() == Ok("1"))
 }
 
 /// Fused q4tp matmat — the same three arms `q4t_matmat` has. Shipping only

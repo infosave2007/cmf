@@ -102,12 +102,22 @@ const P_SCALE: f32 = 4096.0;
 
 #[derive(Clone, Copy)]
 struct Funcs {
+    /// d1's set forward (`lfm_set_forward`)
+    ls_rms: cs::CUfunction,
+    ls_norm_add: cs::CUfunction,
+    ls_sconv: cs::CUfunction,
+    ls_qk_rope: cs::CUfunction,
+    ls_attn: cs::CUfunction,
+    ls_head_gate: cs::CUfunction,
+    ls_silu_mul: cs::CUfunction,
+    ls_gather: cs::CUfunction,
     norm_mod: cs::CUfunction,
     qkv_split: cs::CUfunction,
     softmax: cs::CUfunction,
     heads_join: cs::CUfunction,
     resid: cs::CUfunction,
     swiglu: cs::CUfunction,
+    glu_vg: cs::CUfunction,
     pack: cs::CUfunction,
     unpack: cs::CUfunction,
     part_split: cs::CUfunction,
@@ -188,12 +198,21 @@ impl H3State {
         }
         let module = compile(H3_SRC, Vec::new(), c.arch)?;
         let f = Funcs {
+            ls_rms: func(module, "ls_rms_rows")?,
+            ls_norm_add: func(module, "ls_norm_add_rows")?,
+            ls_sconv: func(module, "ls_sconv")?,
+            ls_qk_rope: func(module, "ls_qk_rope")?,
+            ls_attn: func(module, "ls_attn")?,
+            ls_head_gate: func(module, "ls_head_gate")?,
+            ls_silu_mul: func(module, "ls_silu_mul")?,
+            ls_gather: func(module, "ls_gather_rows")?,
             norm_mod: func(module, "h3_norm_mod")?,
             qkv_split: func(module, "h3_qkv_split")?,
             softmax: func(module, "h3_softmax")?,
             heads_join: func(module, "h3_heads_join")?,
             resid: func(module, "h3_resid")?,
             swiglu: func(module, "h3_swiglu")?,
+            glu_vg: func(module, "h3_glu_vg")?,
             pack: func(module, "h3_pack")?,
             unpack: func(module, "h3_unpack")?,
             part_split: func(module, "h3_part_split")?,
@@ -1191,6 +1210,47 @@ unsafe fn chain(c: &Ctx, st: &mut State, job: &H3Chain<'_>, h: &mut [f32]) -> Re
     Ok(())
 }
 
+/// Set by a pipeline that has the card to itself (MiniMax-Music-3): the plane
+/// cache may grow into the card's free memory instead of stopping at the
+/// fixed cap — its DiT is 9.7 GB of planes, and at 1.4 GB every denoise step
+/// rebuilt all of them. Off for everything else: an encoder's planes would
+/// otherwise take the room a later chain sizes its resident blocks by.
+static PLANES_GROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn h3_planes_grow(on: bool) {
+    PLANES_GROW.store(on, Ordering::Relaxed);
+}
+
+/// The cap for the next plane, with `held` bytes of planes cached: the fixed
+/// cap, or with `h3_planes_grow` (and no ceiling or explicit cap) what the
+/// card has free past a quarter of it (at least 3 GB) for cuBLAS, scratch and
+/// the other stages.
+fn plane_cap_now(held: u64) -> u64 {
+    let cap = plane_cap();
+    if !PLANES_GROW.load(Ordering::Relaxed) || ceiling().is_some() || std::env::var("CMF_CUDA_MM_CACHE_MB").is_ok() {
+        return cap;
+    }
+    // cuMemGetInfo is a driver round trip, and a decode loop asks before
+    // every product whose plane is not cached: one reading a second, the
+    // planes allocated since taken off it (asking each time cost
+    // MiniMax-Music-3's AR a third of its time).
+    static SEEN: std::sync::Mutex<Option<(std::time::Instant, u64, u64, u64)>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap();
+    let (free, total) = match *seen {
+        Some((t, free, total, held0)) if t.elapsed() < std::time::Duration::from_secs(1) => {
+            ((free as i64 - (held as i64 - held0 as i64)).max(0) as u64, total)
+        }
+        _ => match cu::mem_get_info() {
+            Ok((free, total)) => {
+                *seen = Some((std::time::Instant::now(), free as u64, total as u64, held));
+                (free as u64, total as u64)
+            }
+            Err(_) => return cap,
+        },
+    };
+    cap.max(held + free.saturating_sub((total / 4).max(3 << 30)))
+}
+
 /// What the plane cache of the per-op product may hold.
 fn plane_cap() -> u64 {
     if let Some(mb) = std::env::var("CMF_CUDA_MM_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -1246,6 +1306,10 @@ unsafe fn matmat(
     }
     let plane = unsafe { plane_of(c, st, model, idx)? };
     MM_CALLS.fetch_add(1, Ordering::Relaxed);
+    // A narrow batch is a decode loop: bandwidth-bound, so plain f32 costs
+    // nothing, and its rounding compounds token after token — TF32 here
+    // ended MiniMax-Music-3 songs early (the stop code sampled at frame 4).
+    let prec = if b < 32 { Gemm::F32 } else { Gemm::Tf32 };
     // a chunk of rows at a time: the two activation panels stay bounded
     let cb = ((192usize << 20) / (rows.max(cols) * 4)).clamp(1, b);
     let xb = st.h3.buf(c, "mm x", cb * cols * 4)?;
@@ -1258,7 +1322,7 @@ unsafe fn matmat(
             cu::memcpy_htod_async(xb, &xs[b0 * cols..(b0 + nb) * cols], c.stream).map_err(derr)?;
             mm_add(3, t);
             let t = std::time::Instant::now();
-            c.gemm(true, false, rows, nb, cols, 1.0, plane, cols, xb, cols, 0.0, yb, rows, Gemm::Tf32)?;
+            c.gemm(true, false, rows, nb, cols, 1.0, plane, cols, xb, cols, 0.0, yb, rows, prec)?;
             if prof_on() {
                 c.sync()?;
             }
@@ -1268,6 +1332,98 @@ unsafe fn matmat(
             mm_add(5, t);
         }
         b0 += nb;
+    }
+    c.sync()
+}
+
+/// MiniMax-Music-3's feed-forward half on the card: `ff_in` (value and gate,
+/// `2·inter` rows), the GLU with its bias, `ff_out` — only `out = act·W_outᵀ`
+/// comes home (the caller adds `ff_out`'s bias). The host arm moved the
+/// `[n, 2·inter]` panel down and the `[n, inter]` one up again a block-step.
+#[allow(clippy::too_many_arguments)]
+pub fn h3_music3_ffn(
+    model: &Arc<CmfModel>,
+    idx_in: usize,
+    idx_out: usize,
+    h: &[f32],
+    bias_in: &[f32],
+    n: usize,
+    hs: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if n == 0 || h.len() < n * hs || bias_in.len() < 2 * inter || out.len() < n * hs || c.current().is_err() {
+        return false;
+    }
+    let mut st = c.st.lock().unwrap();
+    match unsafe { music3_ffn(c, &mut st, model, idx_in, idx_out, h, bias_in, n, hs, inter, out) } {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("music3 ffn", &e);
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn music3_ffn(
+    c: &Ctx,
+    st: &mut State,
+    model: &Arc<CmfModel>,
+    idx_in: usize,
+    idx_out: usize,
+    h: &[f32],
+    bias_in: &[f32],
+    n: usize,
+    hs: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> Res<()> {
+    let (_, r1, c1, _) = packed(model, idx_in)?;
+    let (_, r2, c2, _) = packed(model, idx_out)?;
+    if (r1, c1, r2, c2) != (2 * inter, hs, hs, inter) {
+        return Err(format!("ff_in {r1}x{c1} and ff_out {r2}x{c2} are not a {hs}->{inter} GLU"));
+    }
+    let f = st.h3.funcs(c)?;
+    let w_in = unsafe { plane_of(c, st, model, idx_in)? };
+    let w_out = unsafe { plane_of(c, st, model, idx_out)? };
+    // the second plane may have pushed the first out of a full cache
+    if !st.h3.planes.contains_key(&(model.uid(), idx_in)) {
+        return Err("the two planes do not fit the cache together".into());
+    }
+    MM_CALLS.fetch_add(2, Ordering::Relaxed);
+    let prec = if n < 32 { Gemm::F32 } else { Gemm::Tf32 };
+    let cb = ((256usize << 20) / (2 * inter * 4)).clamp(1, n);
+    let xb = st.h3.buf(c, "m3 x", cb * hs * 4)?;
+    let gu = st.h3.buf(c, "m3 gu", cb * 2 * inter * 4)?;
+    let act = st.h3.buf(c, "m3 act", cb * inter * 4)?;
+    let yb = st.h3.buf(c, "m3 y", cb * hs * 4)?;
+    let bias = st.h3.buf(c, "m3 bias", 2 * inter * 4)?;
+    let ffn = inter as i32;
+    unsafe {
+        cu::memcpy_htod_async(bias, &bias_in[..2 * inter], c.stream).map_err(derr)?;
+        let mut b0 = 0usize;
+        while b0 < n {
+            let nb = cb.min(n - b0);
+            let t = std::time::Instant::now();
+            cu::memcpy_htod_async(xb, &h[b0 * hs..(b0 + nb) * hs], c.stream).map_err(derr)?;
+            mm_add(3, t);
+            let t = std::time::Instant::now();
+            c.gemm(true, false, 2 * inter, nb, hs, 1.0, w_in, hs, xb, hs, 0.0, gu, 2 * inter, prec)?;
+            let tot = (nb * inter) as u64;
+            c.launch(f.glu_vg, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(gu, bias, act, ffn, tot))?;
+            c.gemm(true, false, hs, nb, inter, 1.0, w_out, inter, act, inter, 0.0, yb, hs, prec)?;
+            if prof_on() {
+                c.sync()?;
+            }
+            mm_add(4, t);
+            let t = std::time::Instant::now();
+            cu::memcpy_dtoh_async(&mut out[b0 * hs..(b0 + nb) * hs], yb, c.stream).map_err(derr)?;
+            mm_add(5, t);
+            b0 += nb;
+        }
     }
     c.sync()
 }
@@ -1290,6 +1446,22 @@ pub fn h3_plane_ready(model: &Arc<CmfModel>, idx: usize, upload: bool) -> bool {
     false
 }
 
+/// Whether a NARROW product may use tensor `idx`'s plane: it is on the card,
+/// or it fits beside the others without dropping one. A decode loop touches
+/// its whole stack once a token, so when the stack's planes outgrow the cap
+/// the LRU drops every plane just before its next use and the loop rebuilds
+/// all of them each step (MiniMax-Music-3's AR at batch 2: 6.4 s a frame
+/// against 0.7 on the host). Planes that fit stay; the rest run on the host.
+pub fn h3_plane_fits(model: &Arc<CmfModel>, idx: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Ok((_, rows, cols, _)) = packed(model, idx) else { return false };
+    if c.current().is_err() {
+        return false;
+    }
+    let st = c.st.lock().unwrap();
+    st.h3.planes.contains_key(&(model.uid(), idx)) || st.h3.plane_bytes + (rows * cols * 4 + 64) as u64 <= plane_cap_now(st.h3.plane_bytes)
+}
+
 /// Tensor `idx`'s dense f32 plane on the card, built (and the least recently
 /// used ones dropped past the cap) when it is not there.
 unsafe fn plane_of(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize) -> Res<u64> {
@@ -1305,7 +1477,7 @@ unsafe fn plane_of(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize) -
         }
         None => {
             // make room: the least recently used planes go first
-            let cap = plane_cap();
+            let cap = plane_cap_now(st.h3.plane_bytes);
             if st.h3.plane_bytes + need > cap && !st.h3.planes.is_empty() {
                 c.sync()?;
                 while st.h3.plane_bytes + need > cap && !st.h3.planes.is_empty() {
@@ -1328,6 +1500,212 @@ unsafe fn plane_of(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize) -
             p
         }
     })
+}
+
+/// d1's `set` forward on CUDA (`gpu::lfm_set_forward`): every layer of an
+/// LFM3 stack over the whole packed row on the card — the projections as
+/// GEMMs over the weights' f32 planes (the plane cache may grow into free
+/// memory for the call: a 2B stack's planes are ~9 GB), the short
+/// convolution walked over the positions from an empty ring, Q/K norm +
+/// RoPE per row, the `set` attention (causal within a sliding window) and
+/// the per-head gate, as the Metal port runs them. Returns the final-normed
+/// rows `[t, hidden]` and the logits of `head`'s rows, or None (the host path
+/// answers).
+#[allow(clippy::too_many_arguments)]
+pub fn h3_lfm_set_forward(
+    model: &Arc<CmfModel>,
+    layers: &[crate::gpu::SetLayer],
+    d: &crate::gpu::SetDims,
+    final_norm: &[f32],
+    rows: &[f32],
+    t: usize,
+    state: usize,
+    group: &[i32],
+    head: Option<&crate::gpu::SetHead>,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let c = ctx()?;
+    let hs = d.hidden;
+    if t == 0 || rows.len() != t * hs || group.len() != t || state > t || d.hd % 4 != 0 || d.hd > 256 || d.nh == 0 || c.current().is_err() {
+        return None;
+    }
+    let mut st = c.st.lock().unwrap();
+    let grow = PLANES_GROW.swap(true, Ordering::Relaxed);
+    let r = unsafe { lfm_set(c, &mut st, model, layers, d, final_norm, rows, t, state, group, head) };
+    PLANES_GROW.store(grow, Ordering::Relaxed);
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let _ = c.sync();
+            decline("d1 set forward", &e);
+            None
+        }
+    }
+}
+
+/// y [t][w rows] = x [t][w cols] W^T over the weight's f32 plane.
+unsafe fn ls_mm(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, w: crate::gpu::SetW, x: u64, y: u64, t: usize, prec: Gemm) -> Res<()> {
+    let p = unsafe { plane_of(c, st, model, w.0)? };
+    MM_CALLS.fetch_add(1, Ordering::Relaxed);
+    unsafe { c.gemm(true, false, w.1, t, w.2, 1.0, p, w.2, x, w.2, 0.0, y, w.1, prec) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn lfm_set(
+    c: &Ctx,
+    st: &mut State,
+    model: &Arc<CmfModel>,
+    layers: &[crate::gpu::SetLayer],
+    d: &crate::gpu::SetDims,
+    final_norm: &[f32],
+    rows: &[f32],
+    t: usize,
+    state: usize,
+    group: &[i32],
+    head: Option<&crate::gpu::SetHead>,
+) -> Res<(Vec<f32>, Vec<f32>)> {
+    use crate::gpu::SetMixer;
+    let f = st.h3.funcs(c)?;
+    let (hs, nh, hd) = (d.hidden, d.nh, d.hd);
+    let qd = nh * hd;
+    // the whole stack checked before anything is queued
+    let shape = |w: crate::gpu::SetW, r: usize, cc: usize| -> Res<()> {
+        packed(model, w.0)?;
+        if w.1 != r || w.2 != cc {
+            return Err(format!("tensor {} is {}x{}, the layer wants {r}x{cc}", w.0, w.1, w.2));
+        }
+        Ok(())
+    };
+    let (mut inter_max, mut kvd_max) = (0usize, 0usize);
+    for l in layers {
+        let inter = l.gate.1;
+        shape(l.gate, inter, hs)?;
+        shape(l.up, inter, hs)?;
+        shape(l.down, hs, inter)?;
+        inter_max = inter_max.max(inter);
+        match &l.mixer {
+            SetMixer::Conv { in_proj, out_proj, taps, kernel } => {
+                shape(*in_proj, 3 * hs, hs)?;
+                shape(*out_proj, hs, hs)?;
+                if !(1..=16).contains(kernel) || taps.len() != hs * kernel {
+                    return Err("short convolution taps of another shape".into());
+                }
+            }
+            SetMixer::Attn { wq, wk, wv, wo, q_norm, k_norm, head_gate, inv_freq, rd, nkv, .. } => {
+                if *nkv == 0 || nh % nkv != 0 || *rd > hd || inv_freq.len() * 2 != *rd {
+                    return Err("attention geometry outside the kernels".into());
+                }
+                let kvd = nkv * hd;
+                kvd_max = kvd_max.max(kvd);
+                shape(*wq, qd, hs)?;
+                shape(*wk, kvd, hs)?;
+                shape(*wv, kvd, hs)?;
+                shape(*wo, hs, qd)?;
+                if head_gate.is_some_and(|g| g.len() != nh * hs) || q_norm.is_some_and(|w| w.len() != hd) || k_norm.is_some_and(|w| w.len() != hd) {
+                    return Err("a q/k norm or head gate of another shape".into());
+                }
+            }
+        }
+    }
+    if let Some(hd_) = head {
+        shape(hd_.w, hd_.w.1, hs)?;
+        if hd_.rows.iter().any(|&r| r >= t) {
+            return Err("a head row past the sequence".into());
+        }
+    }
+    // f32 GEMMs below 512 rows (the host's arithmetic); TF32 for a long row
+    let prec = if t >= 512 { Gemm::Tf32 } else { Gemm::F32 };
+    let b4 = |n: usize| n.max(1) * 4;
+    let h = st.h3.buf(c, "ls h", b4(t * hs))?;
+    let xn = st.h3.buf(c, "ls xn", b4(t * hs))?;
+    let mix = st.h3.buf(c, "ls mix", b4(t * hs))?;
+    let bcx = st.h3.buf(c, "ls bcx", b4(t * 3 * hs))?;
+    let qb = st.h3.buf(c, "ls q", b4(t * qd))?;
+    let kb = st.h3.buf(c, "ls k", b4(t * kvd_max))?;
+    let vb = st.h3.buf(c, "ls v", b4(t * kvd_max))?;
+    let ao = st.h3.buf(c, "ls ao", b4(t * qd))?;
+    let gb = st.h3.buf(c, "ls g", b4(t * inter_max))?;
+    let ub = st.h3.buf(c, "ls u", b4(t * inter_max))?;
+    let grp = st.h3.buf(c, "ls grp", 4 * t)?;
+    let (eps, gemma_i) = (d.eps, d.gemma as i32);
+    let (hs_i, t_i) = (hs as i32, t as i32);
+    unsafe {
+        cu::memcpy_htod_async(h, rows, c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(grp, group, c.stream).map_err(derr)?;
+    }
+    let rows_grid = (t as u32, 1u32);
+    for l in layers {
+        let in_norm = st.f32_buf(l.input_norm)?;
+        unsafe { c.launch(f.ls_rms, rows_grid, 256, 0, kargs!(h, in_norm.ptr, xn, hs_i, gemma_i, eps))? };
+        match &l.mixer {
+            SetMixer::Conv { in_proj, out_proj, taps, kernel } => {
+                let tp = st.f32_buf(taps)?;
+                let k_i = *kernel as i32;
+                unsafe {
+                    ls_mm(c, st, model, *in_proj, xn, bcx, t, prec)?;
+                    c.launch(f.ls_sconv, (hs.div_ceil(128) as u32, 1), 128, 0, kargs!(bcx, tp.ptr, ao, hs_i, k_i, t_i))?;
+                    ls_mm(c, st, model, *out_proj, ao, mix, t, prec)?;
+                }
+            }
+            SetMixer::Attn { wq, wk, wv, wo, q_norm, k_norm, head_gate, inv_freq, rd, nkv, window } => {
+                let invf = st.f32_buf(inv_freq)?;
+                let qn = q_norm.map(|w| st.f32_buf(w)).transpose()?;
+                let kn = k_norm.map(|w| st.f32_buf(w)).transpose()?;
+                let hg = head_gate.map(|w| st.f32_buf(w)).transpose()?;
+                let (nh_i, nkv_i, hd_i, rd_i) = (nh as i32, *nkv as i32, hd as i32, *rd as i32);
+                let (st_i, win_i) = (state as i32, window.unwrap_or(0) as i32);
+                unsafe {
+                    ls_mm(c, st, model, *wq, xn, qb, t, prec)?;
+                    ls_mm(c, st, model, *wk, xn, kb, t, prec)?;
+                    ls_mm(c, st, model, *wv, xn, vb, t, prec)?;
+                    for (buf, nw, heads) in [(qb, &qn, nh_i), (kb, &kn, nkv_i)] {
+                        let (wp, hasw) = nw.as_ref().map_or((0u64, 0i32), |b| (b.ptr, 1));
+                        c.launch(f.ls_qk_rope, (heads as u32, t as u32), 32, 0, kargs!(buf, wp, invf.ptr, heads, hd_i, rd_i, hasw, gemma_i, eps))?;
+                    }
+                    c.launch(f.ls_attn, (t as u32, nh as u32), 128, 0, kargs!(qb, kb, vb, ao, grp, t_i, nh_i, nkv_i, hd_i, st_i, win_i, d.scale))?;
+                    if let Some(g) = &hg {
+                        c.launch(f.ls_head_gate, (nh as u32, t as u32), 256, 0, kargs!(ao, xn, g.ptr, nh_i, hd_i, hs_i))?;
+                    }
+                    ls_mm(c, st, model, *wo, ao, mix, t, prec)?;
+                }
+            }
+        }
+        let aon = l.attn_out_norm.map(|w| st.f32_buf(w)).transpose()?;
+        let (wp, hasw) = aon.as_ref().map_or((0u64, 0i32), |b| (b.ptr, 1));
+        unsafe { c.launch(f.ls_norm_add, rows_grid, 256, 0, kargs!(h, mix, wp, hs_i, gemma_i, eps, hasw))? };
+        let post = st.f32_buf(l.post_norm)?;
+        let n_ff = (t * l.gate.1) as u64;
+        unsafe {
+            c.launch(f.ls_rms, rows_grid, 256, 0, kargs!(h, post.ptr, xn, hs_i, gemma_i, eps))?;
+            ls_mm(c, st, model, l.gate, xn, gb, t, prec)?;
+            ls_mm(c, st, model, l.up, xn, ub, t, prec)?;
+            c.launch(f.ls_silu_mul, (n_ff.div_ceil(256) as u32, 1), 256, 0, kargs!(gb, ub, gb, n_ff))?;
+            ls_mm(c, st, model, l.down, gb, mix, t, prec)?;
+        }
+        let fon = l.ffn_out_norm.map(|w| st.f32_buf(w)).transpose()?;
+        let (wp, hasw) = fon.as_ref().map_or((0u64, 0i32), |b| (b.ptr, 1));
+        unsafe { c.launch(f.ls_norm_add, rows_grid, 256, 0, kargs!(h, mix, wp, hs_i, gemma_i, eps, hasw))? };
+    }
+    let fin = st.f32_buf(final_norm)?;
+    unsafe { c.launch(f.ls_rms, rows_grid, 256, 0, kargs!(h, fin.ptr, xn, hs_i, gemma_i, eps))? };
+    let mut hidden = vec![0f32; t * hs];
+    let mut logits = Vec::new();
+    if let Some(hd_) = head {
+        let n = hd_.rows.len();
+        let idx: Vec<u32> = hd_.rows.iter().map(|&r| r as u32).collect();
+        let ib = st.h3.buf(c, "ls idx", 4 * n.max(1))?;
+        let gath = st.h3.buf(c, "ls gath", b4(n * hs))?;
+        let lg = st.h3.buf(c, "ls logits", b4(n * hd_.w.1))?;
+        unsafe {
+            cu::memcpy_htod_async(ib, &idx[..], c.stream).map_err(derr)?;
+            c.launch(f.ls_gather, (hs.div_ceil(256) as u32, n as u32), 256, 0, kargs!(xn, ib, gath, hs_i))?;
+            ls_mm(c, st, model, hd_.w, gath, lg, n, Gemm::F32)?;
+        }
+        logits = vec![0f32; n * hd_.w.1];
+        unsafe { cu::memcpy_dtoh_async(&mut logits[..], lg, c.stream).map_err(derr)? };
+    }
+    unsafe { cu::memcpy_dtoh_async(&mut hidden[..], xn, c.stream).map_err(derr)? };
+    c.sync()?;
+    Ok((hidden, logits))
 }
 
 /// Full bidirectional attention over head-major f32 planes from the host

@@ -257,6 +257,19 @@ extern "C" __global__ void h3_swiglu(const float* __restrict__ gu, const float* 
     a[idx] = f2h_sat(g / (1.0f + expf(-g)) * u * inv);
 }
 
+// MiniMax-Music-3's GLU: the VALUE half first, the gate second, the input
+// projection's bias on both before they meet; f32 out for the next GEMM.
+extern "C" __global__ void h3_glu_vg(const float* __restrict__ gu, const float* __restrict__ bias,
+                                     float* __restrict__ a, int ffn, u64 total)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const size_t r = idx / ffn, i = idx - r * ffn;
+    const float v = gu[r * 2 * ffn + i] + bias[i];
+    const float g = gu[r * 2 * ffn + ffn + i] + bias[ffn + i];
+    a[idx] = v * (g / (1.0f + expf(-g)));
+}
+
 // f32 -> f16 over n values, saturating (a batch of rows on its way to a GEMM).
 extern "C" __global__ void h3_to_half(const float* __restrict__ x, u16* __restrict__ xh, u64 n)
 {
@@ -504,4 +517,224 @@ extern "C" __global__ void cv_add(float* __restrict__ y, const float* __restrict
     if (bias) v += bias[idx % c];
     if (add) v += add[idx];
     y[idx] = v;
+}
+
+// ---- d1's set forward (`lfm_set_forward` in h3.rs) -------------------------
+// LFM3 rows over a packed row (the Metal port's kernels, lfm_set_msl.metal):
+// row norms, the short convolution walked over the positions, Q/K norm + RoPE
+// per row, the `set` attention and the per-head gate; the GEMMs between them
+// are cuBLAS over the weights' f32 planes.
+
+#define LS_INF __int_as_float(0x7f800000)
+
+// o = rms(x) w per row (x(1 + w) when `gemma`), a 256-thread block a row; in place is safe.
+extern "C" __global__ void ls_rms_rows(const float* __restrict__ x, const float* __restrict__ w, float* o, int n, int gemma, float eps)
+{
+    __shared__ float part[8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* orow = o + (size_t)blockIdx.x * n;
+    float acc = 0.0f;
+    for (int i = tid; i < n; i += 256) { const float v = xr[i]; acc += v * v; }
+    for (int k = 16; k > 0; k >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, k);
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int k = 0; k < 8; k++) tot += part[k];
+    const float inv = rsqrtf(tot / (float)n + eps);
+    for (int i = tid; i < n; i += 256) {
+        const float wv = gemma ? w[i] + 1.0f : w[i];
+        orow[i] = xr[i] * inv * wv;
+    }
+}
+
+// h += rms(d) w per row (the sandwich norm before the residual add), or h += d
+// when `hasw` is 0.
+extern "C" __global__ void ls_norm_add_rows(float* __restrict__ h, const float* __restrict__ d, const float* __restrict__ w, int n,
+                                            int gemma, float eps, int hasw)
+{
+    __shared__ float part[8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float* hr = h + (size_t)blockIdx.x * n;
+    const float* dr = d + (size_t)blockIdx.x * n;
+    float inv = 1.0f;
+    if (hasw) {
+        float acc = 0.0f;
+        for (int i = tid; i < n; i += 256) { const float v = dr[i]; acc += v * v; }
+        for (int k = 16; k > 0; k >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, k);
+        if (lane == 0) part[warp] = acc;
+        __syncthreads();
+        float tot = 0.0f;
+        for (int k = 0; k < 8; k++) tot += part[k];
+        inv = rsqrtf(tot / (float)n + eps);
+    }
+    for (int i = tid; i < n; i += 256) {
+        float f = dr[i];
+        if (hasw) f = f * inv * (gemma ? w[i] + 1.0f : w[i]);
+        hr[i] += f;
+    }
+}
+
+// The gated short convolution over `t` positions from an empty ring, a thread
+// a channel: bcx rows [B | C | x] (3h), taps [h][k] with tap k-1 on the
+// current position; y = C (tap[k-1] B x + sum tap[k-2-s] ring[s]).
+extern "C" __global__ void ls_sconv(const float* __restrict__ bcx, const float* __restrict__ taps, float* __restrict__ y, int h, int k, int t)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= h) return;
+    float ring[15];
+    for (int s = 0; s < 15; s++) ring[s] = 0.0f;
+    const float* tp = taps + (size_t)ch * k;
+    const int rl = k - 1;
+    for (int r = 0; r < t; r++) {
+        const float* row = bcx + (size_t)r * 3 * h;
+        const float bx = row[ch] * row[2 * h + ch];
+        float acc = tp[k - 1] * bx;
+        for (int s = 0; s < rl; s++) acc += tp[k - 2 - s] * ring[s];
+        y[(size_t)r * h + ch] = row[h + ch] * acc;
+        for (int s = rl; s > 1; s--) ring[s - 1] = ring[s - 2];
+        if (rl > 0) ring[0] = bx;
+    }
+}
+
+// Per (head, row): the head's RMS norm (when `hasw`), then RoPE at the row's own
+// position over the first `rd` dims (pairs i, i + rd/2); in place on
+// x [t][heads hd], one warp a head.
+extern "C" __global__ void ls_qk_rope(float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ invf, int heads, int hd,
+                                      int rd, int hasw, int gemma, float eps)
+{
+    __shared__ float a[512];
+    const int head = blockIdx.x, row = blockIdx.y, lane = threadIdx.x;
+    float* v = x + ((size_t)row * heads + head) * hd;
+    float ss = 0.0f;
+    for (int d = lane; d < hd; d += 32) { const float e = v[d]; a[d] = e; ss += e * e; }
+    for (int k = 16; k > 0; k >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, k);
+    if (hasw) {
+        const float inv = rsqrtf(ss / (float)hd + eps);
+        for (int d = lane; d < hd; d += 32) a[d] = a[d] * inv * (gemma ? w[d] + 1.0f : w[d]);
+    }
+    __syncwarp();
+    const int hr = rd / 2;
+    const float pos = (float)row;
+    for (int i = lane; i < hr; i += 32) {
+        const float ang = pos * invf[i];
+        const float sn = sinf(ang), cs = cosf(ang);
+        const float x0 = a[i], x1 = a[i + hr];
+        a[i] = x0 * cs - x1 * sn;
+        a[i + hr] = x0 * sn + x1 * cs;
+    }
+    __syncwarp();
+    for (int d = lane; d < hd; d += 32) v[d] = a[d];
+}
+
+// Attention of row i, head hh over the packed row (online softmax in 128-key
+// blocks, a key a thread for the scores, a dim a thread for P V). `window` 0:
+// d1's `set` mask (the state reads every row and is read by every row; a
+// question row reads its own question); otherwise causal within the window.
+// hd <= 256, a multiple of 4; 128 threads.
+extern "C" __global__ void ls_attn(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ o,
+                                   const int* __restrict__ grp, int t, int nh, int nkv, int hd, int state, int window, float scale)
+{
+    __shared__ float qs[256];
+    __shared__ float p[128];
+    __shared__ float red[4];
+    const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = hh / (nh / nkv);
+    const float* qr = q + ((size_t)i * nh + hh) * hd;
+    for (int d = tid; d < hd; d += 128) qs[d] = qr[d];
+    __syncthreads();
+    const int gi = grp[i];
+    const int kvs = nkv * hd;
+    int j_lo = 0, j_hi = t;
+    if (window != 0) {
+        j_lo = i + 1 > window ? i + 1 - window : 0;
+        j_hi = i + 1;
+    }
+    float m = -LS_INF, l = 0.0f, acc0 = 0.0f, acc1 = 0.0f;
+    for (int j0 = j_lo; j0 < j_hi; j0 += 128) {
+        const int j = j0 + tid;
+        bool ok = j < j_hi;
+        if (ok && window == 0) ok = (i < state) || (j < state) || (grp[j] == gi);
+        float s = -LS_INF;
+        if (ok) {
+            const float4* kr = (const float4*)(k + (size_t)j * kvs + (size_t)g * hd);
+            float dot = 0.0f;
+            for (int d4 = 0; d4 < hd / 4; d4++) {
+                const float4 kk = kr[d4];
+                const int d = d4 * 4;
+                dot += qs[d] * kk.x + qs[d + 1] * kk.y + qs[d + 2] * kk.z + qs[d + 3] * kk.w;
+            }
+            s = dot * scale;
+        }
+        float bm = s;
+        for (int kk = 16; kk > 0; kk >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, kk));
+        if (lane == 0) red[warp] = bm;
+        __syncthreads();
+        bm = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+        __syncthreads();
+        const float mn = fmaxf(m, bm);
+        if (mn == -LS_INF) continue;
+        const float pj = ok ? expf(s - mn) : 0.0f;
+        p[tid] = pj;
+        float bs = pj;
+        for (int kk = 16; kk > 0; kk >>= 1) bs += __shfl_xor_sync(0xffffffffu, bs, kk);
+        if (lane == 0) red[warp] = bs;
+        __syncthreads();
+        bs = red[0] + red[1] + red[2] + red[3];
+        const float corr = (m == -LS_INF) ? 0.0f : expf(m - mn);
+        l = l * corr + bs;
+        acc0 *= corr;
+        acc1 *= corr;
+        const int nb = min(128, j_hi - j0);
+        for (int jj = 0; jj < nb; jj++) {
+            const float pv = p[jj];
+            if (pv == 0.0f) continue;
+            const float* vr = v + (size_t)(j0 + jj) * kvs + (size_t)g * hd;
+            if (tid < hd) acc0 += pv * vr[tid];
+            if (tid + 128 < hd) acc1 += pv * vr[tid + 128];
+        }
+        m = mn;
+        __syncthreads();
+    }
+    float* orow = o + ((size_t)i * nh + hh) * hd;
+    const float il = l > 0.0f ? 1.0f / l : 0.0f;
+    if (tid < hd) orow[tid] = acc0 * il;
+    if (tid + 128 < hd) orow[tid + 128] = acc1 * il;
+}
+
+// The per-head sigmoid gate: sigma(x_row . gw[head]) scales the head's attention
+// output, a 256-thread block per (head, row).
+extern "C" __global__ void ls_head_gate(float* __restrict__ ao, const float* __restrict__ x, const float* __restrict__ gw, int nh, int hd, int hidden)
+{
+    __shared__ float part[8];
+    const int hh = blockIdx.x, row = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* xr = x + (size_t)row * hidden;
+    const float* wr = gw + (size_t)hh * hidden;
+    float acc = 0.0f;
+    for (int i = tid; i < hidden; i += 256) acc += xr[i] * wr[i];
+    for (int k = 16; k > 0; k >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, k);
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int k = 0; k < 8; k++) tot += part[k];
+    const float gate = 1.0f / (1.0f + expf(-tot));
+    float* a = ao + ((size_t)row * nh + hh) * hd;
+    for (int d = tid; d < hd; d += 256) a[d] *= gate;
+}
+
+// a = silu(g) u over n elements.
+extern "C" __global__ void ls_silu_mul(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ a, unsigned long long n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = g[i];
+    a[i] = x / (1.0f + expf(-x)) * u[i];
+}
+
+// dst[r] = src[idx[r]] for rows of n floats (the head's answer slots).
+extern "C" __global__ void ls_gather_rows(const float* __restrict__ src, const unsigned int* __restrict__ idx, float* __restrict__ dst, int n)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n) return;
+    dst[(size_t)blockIdx.y * n + x] = src[(size_t)idx[blockIdx.y] * n + x];
 }

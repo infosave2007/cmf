@@ -229,6 +229,8 @@ pub(super) struct HFuncs {
     sconv_h: cs::CUfunction,
     head_gate_h: cs::CUfunction,
     mla_lat_h: cs::CUfunction,
+    /// `blr` (NVG): g x of every (matrix, path) slot of a job set.
+    blr_z: cs::CUfunction,
     mla_cut_h: cs::CUfunction,
 }
 unsafe impl Send for HFuncs {}
@@ -337,6 +339,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         head_gate_h: func(module, "hy_head_gate_h")?,
         mla_lat_h: func(module, "hy_mla_lat_h")?,
         mla_cut_h: func(module, "hy_mla_cut_h")?,
+        blr_z: func(module, "hy_blr_z")?,
     })
 }
 
@@ -380,6 +383,9 @@ struct MmaSet {
     /// int8 jobs under a column field: the launch's rows go through the
     /// fields once a call (`hy_field_planes`) instead of once a tile.
     pre: Option<Prescale>,
+    /// `blr` (NVG) matrices of the launch, as binary tile matrices after
+    /// the tile launch (see `BlrDev`).
+    blr: Option<Box<BlrChain>>,
 }
 
 /// A launch's rows under its jobs' column fields: each job's region of
@@ -391,6 +397,215 @@ struct Prescale {
     width: usize,
     /// (field(s) or 0, fields, columns, region at)
     ents: Vec<(u64, usize, usize, usize)>,
+}
+
+/// A `blr` (NVG) weight on the card as binary tile matrices of the q1
+/// kernels (kind 3): per path a V' block (its latents, the rank rounded up
+/// to 32, over d_in; group scales l_p[k], 0 on the padding rows) applied to
+/// g_p x, then U' (the output rows over all the blocks' latents; group
+/// scales h_p[i]). A gate/up pair keeps both matrices' blocks, gate first,
+/// and one interleaved U' whose gate rows weigh only gate latents and up
+/// rows only up latents (scale 0 elsewhere). `W` is never formed.
+struct BlrDev {
+    /// (V' block, the g of its path)
+    v: Vec<(Arc<DevMat>, Vec<f32>)>,
+    u: Arc<DevMat>,
+}
+
+/// The parts of every `blr` weight on the card, by the device pointer of
+/// its handle (`DevMat` kind 11, a pair 12): the job sets look them up.
+static BLR_DEV: std::sync::Mutex<Option<std::collections::HashMap<u64, Arc<BlrDev>>>> = std::sync::Mutex::new(None);
+
+fn blr_dev_of(m: &DevMat) -> Res<Arc<BlrDev>> {
+    BLR_DEV.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|t| t.get(&m.w.ptr).cloned()).ok_or_else(|| "a blr job over a weight with no parts on the card".into())
+}
+
+/// One `blr` payload read as q1 tile bytes (a group: f16 scale, 4 bytes of
+/// signs, LSB first: the payload's own bit order).
+struct BlrParts<'a> {
+    b: &'a [u8],
+    h: cortiq_core::blr::BlrHeader,
+    /// the rank rounded up to 32 (U' groups never straddle two paths)
+    rp: usize,
+}
+
+impl<'a> BlrParts<'a> {
+    fn new(b: &'a [u8], shape: &[usize]) -> Res<Self> {
+        let h = cortiq_core::blr::validate_blr(shape, b)?;
+        if h.d_in % 32 != 0 {
+            return Err(format!("blr d_in {} is not a multiple of 32", h.d_in));
+        }
+        let rp = h.rank.div_ceil(32) * 32;
+        Ok(BlrParts { b, h, rp })
+    }
+
+    fn latents(&self) -> usize {
+        self.h.paths * self.rp
+    }
+
+    fn f16(&self, at: usize) -> [u8; 2] {
+        [self.b[at], self.b[at + 1]]
+    }
+
+    /// V' of path `p`: rp rows over d_in.
+    fn v_q1(&self, p: usize) -> Vec<u8> {
+        let o = cortiq_core::blr::blr_path_offsets(&self.h, p);
+        let (din, gpr) = (self.h.d_in, self.h.d_in / 32);
+        let mut out = vec![0u8; self.rp * gpr * 6];
+        for k in 0..self.h.rank {
+            let sc = self.f16(o.l + 2 * k);
+            let row = o.v + k * (din / 8);
+            for g in 0..gpr {
+                let at = (k * gpr + g) * 6;
+                out[at..at + 2].copy_from_slice(&sc);
+                out[at + 2..at + 6].copy_from_slice(&self.b[row + 4 * g..row + 4 * g + 4]);
+            }
+        }
+        out
+    }
+
+    fn g(&self, p: usize) -> Vec<f32> {
+        cortiq_core::blr::blr_f16s(self.b, cortiq_core::blr::blr_path_offsets(&self.h, p).g, self.h.d_in)
+    }
+
+    /// Output row `i` of U' into `dst` (one row of q1 groups) from latent
+    /// column `at` on: each path's rp latents under scale h_p[i], the
+    /// padding latents' bits 0 (their latents are 0).
+    fn u_row(&self, i: usize, dst: &mut [u8], at: usize) {
+        let r = self.h.rank;
+        for p in 0..self.h.paths {
+            let o = cortiq_core::blr::blr_path_offsets(&self.h, p);
+            let sc = self.f16(o.h + 2 * i);
+            let row = o.u + i * (r / 8);
+            for g in 0..self.rp / 32 {
+                let gi = (at + p * self.rp) / 32 + g;
+                dst[gi * 6..gi * 6 + 2].copy_from_slice(&sc);
+                for q in 0..4 {
+                    if 32 * g + 8 * q < r {
+                        dst[gi * 6 + 2 + q] = self.b[row + 4 * g + q];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A `blr` weight (one payload) or a gate/up pair (two) as `BlrDev`, with
+/// the bytes it holds on the card.
+fn blr_dev(c: &Ctx, fx: &HFuncs, payloads: &[(&[u8], &[usize])]) -> Res<(BlrDev, u64)> {
+    let parts = payloads.iter().map(|&(b, sh)| BlrParts::new(b, sh)).collect::<Res<Vec<_>>>()?;
+    let (rows, cols) = (parts[0].h.d_out, parts[0].h.d_in);
+    if parts.iter().any(|p| p.h.d_out != rows || p.h.d_in != cols) {
+        return Err("a blr pair of two shapes".into());
+    }
+    let mut held = 0u64;
+    let mut v = Vec::new();
+    for pt in &parts {
+        for p in 0..pt.h.paths {
+            let (w, sc) = repack1_on_card(c, fx, &[&pt.v_q1(p)], pt.rp, pt.rp, cols)?;
+            held += w.bytes as u64;
+            v.push((Arc::new(DevMat { kind: 3, rows: pt.rp, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(sc), aux1: None }), pt.g(p)));
+        }
+    }
+    let lat: usize = parts.iter().map(|p| p.latents()).sum();
+    let gpr = lat / 32;
+    let mut srcs = Vec::with_capacity(parts.len());
+    let mut at = 0;
+    for pt in &parts {
+        let mut buf = vec![0u8; rows * gpr * 6];
+        for i in 0..rows {
+            pt.u_row(i, &mut buf[i * gpr * 6..(i + 1) * gpr * 6], at);
+        }
+        at += pt.latents();
+        srcs.push(buf);
+    }
+    let src: Vec<&[u8]> = srcs.iter().map(|b| &b[..]).collect();
+    let urows = rows * parts.len();
+    let (w, sc) = repack1_on_card(c, fx, &src, rows, urows, lat)?;
+    held += w.bytes as u64;
+    let u = Arc::new(DevMat { kind: 3, rows: urows, cols: lat, held: w.bytes as u64, w: Arc::new(w), aux0: Some(sc), aux1: None });
+    Ok((BlrDev { v, u }, held))
+}
+
+/// `BlrDev` behind a handle `DevMat` of `kind` (11 a matrix, 12 a pair).
+fn blr_handle(dev: BlrDev, kind: u8, rows: usize, cols: usize, held: u64) -> Res<DevMat> {
+    let id = Buf::new(64)?;
+    BLR_DEV.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id.ptr, Arc::new(dev));
+    Ok(DevMat { kind, rows, cols, held, w: Arc::new(id), aux0: None, aux1: None })
+}
+
+/// A job set's `blr` matrices (they share its input x): g x into z for
+/// every (matrix, path) slot, the V' blocks in one tile launch into the
+/// latents, the latents as planes, then each matrix's U' into the job's
+/// output.
+struct BlrChain {
+    din: usize,
+    slots: usize,
+    g: Buf,
+    z: (Buf, Buf),
+    v_set: MmaSet,
+    /// latents f32 [NMAX][tw] and as planes
+    t: Buf,
+    tp: (Buf, Buf),
+    tw: usize,
+    /// (set, its latent columns)
+    u_sets: Vec<(MmaSet, usize)>,
+    /// the parts the tile jobs point into
+    _devs: Vec<Arc<BlrDev>>,
+}
+
+fn blr_chain(jobs: &[JobSpec], kind: i32) -> Res<BlrChain> {
+    let devs = jobs.iter().map(|(m, ..)| blr_dev_of(m)).collect::<Res<Vec<_>>>()?;
+    let din = jobs[0].0.cols;
+    if jobs.iter().any(|(m, ..)| m.cols != din) {
+        return Err("blr jobs of one set over inputs of two widths".into());
+    }
+    let mut g = Vec::new();
+    let (mut vl, mut vx) = (Vec::new(), Vec::new());
+    let mut lat_at = Vec::with_capacity(devs.len());
+    let (mut slot, mut tw) = (0usize, 0usize);
+    for d in &devs {
+        lat_at.push(tw);
+        for (vm, gp) in &d.v {
+            g.extend_from_slice(gp);
+            vl.push((vm.clone(), tw));
+            vx.push((slot * din) as i32);
+            slot += 1;
+            tw += vm.rows;
+        }
+    }
+    let t = Buf::new(NMAX * tw * 4 + 64)?;
+    let v_list: Vec<JobSpec> = vl.iter().map(|(m, at)| (&**m, t.ptr + (*at * 4) as u64, 0u64, tw, m.rows)).collect();
+    let v_set = mmaset_core(&v_list, 6, Some(&vx))?;
+    let mut u_sets = Vec::with_capacity(devs.len());
+    for (k, (d, &(_, y, res, ystride, rows))) in devs.iter().zip(jobs).enumerate() {
+        let u = &*d.u;
+        u_sets.push((mmaset_core(&[(u, y, res, ystride, rows.min(u.rows))], kind, Some(&[lat_at[k] as i32]))?, u.cols));
+    }
+    let plane = || Buf::new(NMAX * tw * 2 + 64);
+    let zplane = || Buf::new(NMAX * slot * din * 2 + 64);
+    Ok(BlrChain { din, slots: slot, g: Buf::from_slice(&g)?, z: (zplane()?, zplane()?), v_set, t, tp: (plane()?, plane()?), tw, u_sets, _devs: devs })
+}
+
+impl BlrChain {
+    unsafe fn run(&self, c: &Ctx, fx: &HFuncs, p: &Planes, n: usize) -> Res<()> {
+        if n > NMAX {
+            return Err(format!("a blr launch of {n} rows"));
+        }
+        let (xs_i, din_i, sl_i) = (p.stride as i32, self.din as i32, self.slots as i32);
+        let tot = (self.slots * self.din) as u64;
+        unsafe {
+            c.launch(fx.blr_z, (tot.div_ceil(256) as u32, n as u32), 256, 0, kargs!(p.p0, p.p1, p.p2, xs_i, self.g.ptr, din_i, sl_i, self.z.0.ptr, self.z.1.ptr))?;
+            let zp = Planes { p0: self.z.0.ptr, p1: self.z.1.ptr, p2: self.z.1.ptr, stride: self.slots * self.din };
+            self.v_set.run(c, fx, &zp, self.din, n)?;
+            let tp = Planes { p0: self.tp.0.ptr, p1: self.tp.1.ptr, p2: self.tp.1.ptr, stride: self.tw };
+            split(c, fx, &tp, self.t.ptr, self.tw, self.tw, n)?;
+            for (u, cols) in &self.u_sets {
+                u.run(c, fx, &tp, *cols, n)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn mmaset(list: &[JobSpec]) -> Res<MmaSet> {
@@ -410,7 +625,20 @@ fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     r
 }
 
-fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
+fn mmaset_kind_(all: &[JobSpec], kind: i32) -> Res<MmaSet> {
+    // `blr` matrices run as their own chain of binary tile launches
+    let blr_jobs: Vec<JobSpec> = all.iter().filter(|(m, ..)| matches!(m.kind, 11 | 12)).copied().collect();
+    let list: Vec<JobSpec> = all.iter().filter(|(m, ..)| !matches!(m.kind, 11 | 12)).copied().collect();
+    let mut set = mmaset_core(&list, kind, None)?;
+    if !blr_jobs.is_empty() {
+        set.blr = Some(Box::new(blr_chain(&blr_jobs, kind)?));
+    }
+    Ok(set)
+}
+
+/// The tile jobs of `list`; `xoffs`: each job's offset into the input
+/// planes (a blr chain's slots), else 0 (or the prescaled region).
+fn mmaset_core(list: &[JobSpec], kind: i32, xoffs: Option<&[i32]>) -> Res<MmaSet> {
     if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) || m.cols % 32 != 0) {
         return Err("a tensor-core job over a matrix that is not repacked (q4tp, q2tp, int8, q1 or ternary tiles)".into());
     }
@@ -452,7 +680,7 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
                 kind: (m.kind as i32) | (kind & !0xFF) | if pre.is_some() { 0x800 } else { 0 },
                 blk0: blk as i32,
                 ystride: ystride as i32,
-                xoff: pre.as_ref().map_or(0, |p| p.ents[i].3 as i32),
+                xoff: pre.as_ref().map_or_else(|| xoffs.map_or(0, |x| x[i]), |p| p.ents[i].3 as i32),
                 nr: 0,
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
@@ -471,7 +699,7 @@ fn mmaset_kind_(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
     // us at KS 8 against 16): 5120 x 17408 49.8 / 52.7, 78.5 / 86.7;
     // 10240 x 5120 25.5 / 27.8, 48.9 / 53.2; 2048 x 2048 4.9 / 4.3, 5.9 / 5.4
     // (the all-codec loop's 16 384 came from a 3090)
-    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 4096, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288, kd, pre })
+    Ok(MmaSet { bufs: [b0, b1], blocks, n: list.len() as i32, ks16: max_rows < 4096, tb1: max_rows <= 2048, tb1_n1: total_rows >= 12288, kd, pre, blr: None })
 }
 
 /// The row planes a tensor-core launch reads: two bf16 parts of each f32
@@ -485,8 +713,22 @@ struct Planes {
 }
 
 impl MmaSet {
+    fn has_blr(&self) -> bool {
+        self.blr.is_some()
+    }
+
     /// The window's rows of x (as split planes) through every matrix.
     unsafe fn run(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
+        if self.n > 0 {
+            unsafe { self.run_tiles(c, fx, p, cols, n)? };
+        }
+        if let Some(ch) = &self.blr {
+            unsafe { ch.run(c, fx, p, n)? };
+        }
+        Ok(())
+    }
+
+    unsafe fn run_tiles(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
         // one codec's decode row takes one tile a block at any height (A5000,
         // q4tp 5120 x 17408: 76.7 against 80.5 us; 10240 x 5120 49.3 / 56.3)
         let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
@@ -1134,6 +1376,9 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     let q1t = dtype == Some(TensorDtype::Q1T);
     let q2 = dtype == Some(TensorDtype::Q2TiledP);
     let q4g = dtype == Some(TensorDtype::Q4Tiled);
+    if dtype == Some(TensorDtype::BinaryLowRank) {
+        return blr_mat(c, st, model, gw.idx, rows, cols);
+    }
     if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t && !q2 && !q4g {
         let name = model.tensors.get(gw.idx).map_or("?", |e| e.name.as_str());
         return Err(format!("weight codec {dtype:?} has no hybrid kernel ({name})"));
@@ -1192,6 +1437,35 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     Ok(m)
 }
 
+/// A `blr` (NVG) weight as its binary tile matrices (`BlrDev`) behind a
+/// handle of kind 11.
+fn blr_mat(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize, rows: usize, cols: usize) -> Res<Arc<DevMat>> {
+    let key = (model.uid(), idx);
+    if let Some(m) = st.hyb.mats.get(&key) {
+        if m.rows == rows && m.cols == cols {
+            return Ok(m.clone());
+        }
+    }
+    let entry = model.tensors.get(idx).ok_or("tensor index out of range")?;
+    if entry.shape.first() != Some(&rows) || entry.shape.get(1) != Some(&cols) {
+        return Err(format!("blr tensor {} is {:?}, the graph wants {rows}x{cols}", entry.name, entry.shape));
+    }
+    let bytes = model.entry_bytes(entry);
+    // the tiles take 1.5 bits a sign (a group's f16 scale)
+    let held = c.resident.load(Ordering::Relaxed);
+    if held + (bytes.len() as u64) * 3 / 2 > super::vram_budget() {
+        return Err("weights do not fit the card".into());
+    }
+    let t0 = std::time::Instant::now();
+    let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
+    let (dev, held) = blr_dev(c, &fx, &[(bytes, &entry.shape)]).map_err(|e| format!("{}: {e}", entry.name))?;
+    let m = Arc::new(blr_handle(dev, 11, rows, cols, held)?);
+    REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    c.resident.fetch_add(held, Ordering::Relaxed);
+    st.hyb.mats.insert(key, m.clone());
+    Ok(m)
+}
+
 /// A dense FFN's gate and up as one repacked matrix of 2 inter rows, its
 /// 16-row tiles 8 gate rows then the same 8 up rows: an mma tile holds a
 /// row's gate and up in one lane, and the kernel's epilogue makes
@@ -1202,6 +1476,32 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let dt = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype);
     let q8 = |d: Option<TensorDtype>| matches!(d, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
     let (dg, du) = (dt(gw), dt(uw));
+    if dg == Some(TensorDtype::BinaryLowRank) && du == Some(TensorDtype::BinaryLowRank) {
+        // both payloads' blocks and one interleaved U' (kind 12)
+        let key = (model.uid(), gw.idx, uw.idx);
+        if let Some(m) = st.hyb.pairs.get(&key) {
+            return Ok(m.clone());
+        }
+        let ge = model.tensors.get(gw.idx).ok_or("tensor index out of range")?;
+        let ue = model.tensors.get(uw.idx).ok_or("tensor index out of range")?;
+        for e in [ge, ue] {
+            if e.shape.first() != Some(&inter) || e.shape.get(1) != Some(&cols) {
+                return Err(format!("tensor {} is {:?}, the pair wants {inter}x{cols}", e.name, e.shape));
+            }
+        }
+        let (gb, ub) = (model.entry_bytes(ge), model.entry_bytes(ue));
+        if c.resident.load(Ordering::Relaxed) + (gb.len() + ub.len()) as u64 * 2 > super::vram_budget() {
+            return Err("weights do not fit the card".into());
+        }
+        let t0 = std::time::Instant::now();
+        let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
+        let (dev, held) = blr_dev(c, &fx, &[(gb, &ge.shape), (ub, &ue.shape)]).map_err(|e| format!("{} / {}: {e}", ge.name, ue.name))?;
+        let m = Arc::new(blr_handle(dev, 12, 2 * inter, cols, held)?);
+        REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        c.resident.fetch_add(held, Ordering::Relaxed);
+        st.hyb.pairs.insert(key, m.clone());
+        return Ok(m);
+    }
     let both8 = q8(dg) && q8(du);
     let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
     let both1t = dg == Some(TensorDtype::Q1T) && du == Some(TensorDtype::Q1T);
@@ -4103,9 +4403,19 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
 /// than f32): such a stack's long prompt runs the small path a chunk at a
 /// time.
 fn small_only(l: &HLayer) -> bool {
+    // `blr` (NVG) matrices have no prompt-path GEMM: their stages run the
+    // small path NMAX rows at a time
+    let blr = match &l.mix {
+        Mix::Gdn(g) => g.ms_in.has_blr() || g.ms_out.has_blr(),
+        Mix::Attn(a) => a.ms_in.has_blr() || a.ms_out.has_blr(),
+        Mix::Conv(v) => v.ms_in.has_blr() || v.ms_out.has_blr(),
+        Mix::Kda(k) => k.ms_in.has_blr() || k.ms_out.has_blr(),
+    };
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
-    (l.moe.is_some() && l.ffn_out.is_some())
+    blr || l.ms_gu.has_blr()
+        || l.ms_dn.has_blr()
+        || (l.moe.is_some() && l.ffn_out.is_some())
         || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
         || matches!(&l.mix, Mix::Attn(a) if a.hg.as_ref().is_some_and(|g| g.3.is_none()))
 }
@@ -6931,6 +7241,105 @@ mod tests {
                         let e = (yd[j * rows + r] as f64 - s).abs() / a.max(1e-30);
                         assert!(e < 1e-4, "q8_2f pair {rows}x{cols} n {n} y[{j}][{r}] {} against {s} ({e})", yd[j * rows + r]);
                     }
+                }
+            }
+        }
+    }
+
+    /// `blr` (NVG) as binary tile chains against the host's dense rows: one
+    /// and two paths, a rank off a word (40) and one on it (64), 1 / 3 / 11
+    /// rows of x, and a gate/up pair's act(gate) * up.
+    #[test]
+    fn card_blr_matches_the_host() {
+        use cortiq_core::blr::{BlrPathIn, dequant_blr, encode_blr};
+        let Some(c) = super::super::ctx() else { return };
+        c.current().unwrap();
+        let fx = load_funcs(c, 4, 64).unwrap();
+        let mut seed = 41u64;
+        let mut payload = |rows: usize, cols: usize, r: usize, np: usize, seed: &mut u64| -> Vec<u8> {
+            let f = |n: usize, lo: f32, seed: &mut u64| -> Vec<f32> { (0..n).map(|_| lo + (lcg(seed) % 1000) as f32 * 1e-3).collect() };
+            let b = |n: usize, seed: &mut u64| -> Vec<bool> { (0..n).map(|_| lcg(seed) & 1 == 1).collect() };
+            let parts: Vec<_> = (0..np).map(|_| (f(rows, 0.01, seed), f(cols, 0.5, seed), f(r, 0.02, seed), b(rows * r, seed), b(cols * r, seed))).collect();
+            let ins: Vec<BlrPathIn> = parts.iter().map(|(h, g, l, su, sv)| BlrPathIn { h, g, l, su, sv }).collect();
+            encode_blr(rows, cols, r, &ins)
+        };
+        let host = |b: &[u8], rows: usize, cols: usize| -> Vec<f32> {
+            let mut w = vec![0f32; rows * cols];
+            dequant_blr(b, rows, cols, &mut w).unwrap();
+            w
+        };
+        let upload = |b: &[u8], rows: usize, cols: usize| -> DevMat {
+            let (dev, held) = blr_dev(c, &fx, &[(b, &[rows, cols][..])]).unwrap();
+            blr_handle(dev, 11, rows, cols, held).unwrap()
+        };
+        let xs = |n: usize, cols: usize, seed: &mut u64| -> Vec<f32> { (0..n * cols).map(|_| ((lcg(seed) % 2001) as f32 / 1000.0 - 1.0) * 3.0).collect() };
+        let planes_of = |x: &[f32], n: usize, cols: usize| -> (Planes, Vec<Buf>) {
+            let xb = Buf::from_slice(x).unwrap();
+            let bufs: Vec<Buf> = (0..3).map(|_| Buf::new(n * cols * 2 + 64).unwrap()).collect();
+            let planes = Planes { p0: bufs[0].ptr, p1: bufs[1].ptr, p2: bufs[2].ptr, stride: cols };
+            unsafe { split(c, &fx, &planes, xb.ptr, cols, cols, n).unwrap() };
+            let mut keep = bufs;
+            keep.push(xb);
+            (planes, keep)
+        };
+        let dot = |w: &[f32], x: &[f32], r: usize, j: usize, cols: usize| -> (f64, f64) {
+            let (mut s, mut a) = (0f64, 0f64);
+            for k in 0..cols {
+                let p = w[r * cols + k] as f64 * x[j * cols + k] as f64;
+                s += p;
+                a += p.abs();
+            }
+            (s, a)
+        };
+        for (rows, cols, r, np) in [(40usize, 64usize, 40usize, 1usize), (300, 256, 64, 2), (1000, 512, 40, 2)] {
+            let b = payload(rows, cols, r, np, &mut seed);
+            let w = host(&b, rows, cols);
+            let dm = upload(&b, rows, cols);
+            for n in [1usize, 3, 11] {
+                let x = xs(n, cols, &mut seed);
+                let (planes, _keep) = planes_of(&x, n, cols);
+                let res: Vec<f32> = (0..n * rows).map(|i| (i % 7) as f32 * 0.25).collect();
+                let rb = Buf::from_slice(&res).unwrap();
+                let y = Buf::new(n * rows * 4 + 64).unwrap();
+                let set = mmaset(&[(&dm, y.ptr, rb.ptr, rows, rows)]).unwrap();
+                unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+                c.sync().unwrap();
+                let yd = down::<f32>(c, &y, n * rows);
+                for j in 0..n {
+                    for i in 0..rows {
+                        let (s, a) = dot(&w, &x, i, j, cols);
+                        let e = (yd[j * rows + i] as f64 - res[j * rows + i] as f64 - s).abs() / a.max(1e-30);
+                        assert!(e < 1e-4, "{rows}x{cols} r {r} np {np} n {n} y[{j}][{i}] {} against {s} ({e})", yd[j * rows + i]);
+                    }
+                }
+            }
+        }
+        // a gate/up pair: act(gate) * up into two bf16 planes
+        let (inter, cols, r) = (264usize, 128usize, 48usize);
+        let (gb, ub) = (payload(inter, cols, r, 1, &mut seed), payload(inter, cols, r, 2, &mut seed));
+        let (wg, wu) = (host(&gb, inter, cols), host(&ub, inter, cols));
+        let pm = {
+            let (dev, held) = blr_dev(c, &fx, &[(&gb, &[inter, cols][..]), (&ub, &[inter, cols][..])]).unwrap();
+            blr_handle(dev, 12, 2 * inter, cols, held).unwrap()
+        };
+        for n in [1usize, 5] {
+            let x = xs(n, cols, &mut seed);
+            let (planes, _keep) = planes_of(&x, n, cols);
+            let (q0, q1) = (Buf::new(n * inter * 2 + 64).unwrap(), Buf::new(n * inter * 2 + 64).unwrap());
+            let set = mmaset_pair(&pm, q0.ptr, q1.ptr, inter).unwrap();
+            unsafe { set.run(c, &fx, &planes, cols, n).unwrap() };
+            c.sync().unwrap();
+            let (a0, a1) = (down::<u16>(c, &q0, n * inter), down::<u16>(c, &q1, n * inter));
+            for j in 0..n {
+                for i in 0..inter {
+                    let (gv, ga) = dot(&wg, &x, i, j, cols);
+                    let (uv, ua) = dot(&wu, &x, i, j, cols);
+                    let want = gv / (1.0 + (-gv).exp()) * uv;
+                    let bf = |h: u16| f32::from_bits((h as u32) << 16) as f64;
+                    let got = bf(a0[j * inter + i]) + bf(a1[j * inter + i]);
+                    // f32 sums of signed terms: the error scales with the terms' magnitudes
+                    let tol = 1e-4 * (ga * uv.abs() + gv.abs() * ua) + 1e-6;
+                    assert!((got - want).abs() <= tol, "pair n {n} [{j}][{i}] {got} against {want} (tolerance {tol})");
                 }
             }
         }
