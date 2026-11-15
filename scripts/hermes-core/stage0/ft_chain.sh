@@ -7,7 +7,11 @@
 #   ft_chain.sh NAME START_CKPT BATCH LR "EVAL_STEPS" LAST_STEP
 #
 # Environment: STAGE0 (run root), EMBRYO (trainer), CORTIQ (engine),
-# O1 (the Embryo run directory with the replay and raw-val shards).
+# O1 (the Embryo run directory with the replay and raw-val shards),
+# SET (prefix of the SFT shards in $STAGE0/ft: SET-train.sft, SET-dev.sft,
+# SET-final.sft) [cards], SEQ (their window) [512]. With an empty EVAL_STEPS
+# nothing is answered here (a model of the lookup contract goes through
+# run_lookup.py).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
@@ -18,6 +22,7 @@ O="${O1:-$HOME/embryo-data/o1}"
 PY="$B/venv/bin/python"
 TOK="$O/sft-t27/gen1.tokenizer.json"
 NAME="$1"; START="$2"; BATCH="$3"; LR="$4"; EVALS=" $5 "; LAST="$6"
+SET="${SET:-cards}"; SEQ="${SEQ:-512}"
 cd "$B/ft"
 log() { echo "$(date +%T) $*" | tee -a "$NAME.status"; }
 
@@ -29,9 +34,9 @@ while [ "$prev" -lt "$LAST" ]; do
   [ "$next" -gt "$LAST" ] && next="$LAST"
   out="$NAME-$next.ckpt"
   # shellcheck disable=SC2086
-  "$E" sft --ckpt "$prev_ck" --shard cards-train.sft --val cards-dev.sft --final-val cards-final.sft \
+  "$E" sft --ckpt "$prev_ck" --shard "$SET-train.sft" --val "$SET-dev.sft" --final-val "$SET-final.sft" \
     --replay "$O/chat-sft/replay-16m.u16" --raw-val "$O/sft-t27/rawval-tails-2m.u16" --out "$out" \
-    --batch "$BATCH" --seq 512 --steps "$next" --val-batches 32 --raw-val-batches 8 --lr "$LR" --dropless $extra \
+    --batch "$BATCH" --seq "$SEQ" --steps "$next" --val-batches 32 --raw-val-batches 8 --lr "$LR" --dropless $extra \
     > "$NAME-stage-$next.log" 2>&1
   [ -f "$out" ] || { log "stage $next FAILED, see $NAME-stage-$next.log"; exit 1; }
   rec="$(grep 'SFT receipt' "$NAME-stage-$next.log" | tail -1)"

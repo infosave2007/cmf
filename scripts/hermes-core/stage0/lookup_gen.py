@@ -1,6 +1,6 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
-    python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11]
+    python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -29,14 +29,27 @@ out through `terminal`. Modes of a task:
 `react` and `arith` tasks have no card and stay direct answers. The
 reasoning is procedural and short, built by this program from the card:
 which card, which pattern, which value goes where. No model wrote it.
+
+Without options the cards that come back next to the right one (and the
+cards of a missed query) are drawn at random from the pool: unrelated, easy
+to tell apart. A search returns neighbours. `--near P`: with probability P
+those cards are the pool's nearest to the query by words (command name,
+description, example captions, weighted by rarity), the reasoning names the
+chosen card whenever more than one came back, and a lone card gets
+neighbours four times in five instead of every second time. `--cite`: the
+reasoning quotes the caption of the chosen example before its pattern
+(which line of the card, then what goes where). The default output is
+byte-identical to the set the base run's shard was made from.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import gzip
 import hashlib
 import json
+import math
 import random
 import re
 import sys
@@ -146,14 +159,41 @@ def call(name, **args):
     return {"name": name, "arguments": args}
 
 
-def pattern_think(card, what, tpl, pairs, lead=""):
-    head = f"{lead}Card {card['name']}" + (f", section {card['os']}" if card["os"] else "") + f": `{tpl}`."
+WORD = re.compile(r"[a-z0-9]+")
+
+
+class Near:
+    """The pool's cards nearest to a text by words: what a search puts next to the right card."""
+
+    def __init__(self, pool):
+        self.pool = pool
+        bags = [set(WORD.findall(" ".join([c["name"], c["desc"]] + [w for w, _ in c["ex"]]).lower())) for c in pool]
+        df = collections.Counter(w for b in bags for w in b)
+        self.idf = {w: math.log(len(pool) / d) for w, d in df.items()}
+        self.inv = collections.defaultdict(list)
+        for i, b in enumerate(bags):
+            for w in b:
+                self.inv[w].append(i)
+
+    def cards(self, text, k, avoid, rng):
+        score = collections.Counter()
+        for w in set(WORD.findall(text.lower())):
+            if self.idf.get(w, 0.0) > 1.0:  # a word of a third of the cards says nothing
+                for i in self.inv[w]:
+                    score[i] += self.idf[w]
+        top = [self.pool[i] for i, _ in score.most_common(k + 12) if self.pool[i]["name"] not in avoid][: k + 3]
+        return rng.sample(top, k) if len(top) >= k else None
+
+
+def pattern_think(card, what, tpl, pairs, lead="", cite=False):
+    head = f"{lead}Card {card['name']}" + (f", section {card['os']}" if card["os"] else "")
+    head += (f', "{what_query(what)}"' if cite and what else "") + f": `{tpl}`."
     if not pairs:
         return head + " No values to fill in."
     return head + " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "."
 
 
-def build(rec, pool, rng):
+def build(rec, pool, rng, near=None, p_near=0.0, cite=False):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat in ("react", "arith"):
@@ -162,7 +202,13 @@ def build(rec, pool, rng):
     if not cards:
         raise Skip
     user = ("\n\n".join(ctx) + "\n\n" if ctx else "") + task
-    others = lambda k, avoid: [c for c in rng.sample(pool, k + 6) if c["name"] not in avoid][:k]
+    def others(k, avoid, text=""):
+        if near is not None and rng.random() < p_near:
+            got = near.cards(text, k, avoid, rng)
+            if got:
+                return got
+        return [c for c in rng.sample(pool, k + 6) if c["name"] not in avoid][:k]
+
     store = lambda cs: "\n\n".join(c["text"] for c in cs)
 
     if cat == "none":
@@ -171,7 +217,7 @@ def build(rec, pool, rng):
         turns += [("assistant", rng.choice(NEED), None, [call("lookup", query=q1)]), ("tool", store(cards))]
         if rng.random() < 0.4:
             q2 = vague(task, rng, tail=True)
-            more = others(rng.choice([1, 2]), {c["name"] for c in cards})
+            more = others(rng.choice([1, 2]), {c["name"] for c in cards}, q2)
             body = store(more) if rng.random() < 0.7 else "No cards found."
             turns += [("assistant", rng.choice(MISS), None, [call("lookup", query=q2)]), ("tool", body)]
         turns.append(("assistant", "None of the cards covers this task.", "NONE", []))
@@ -211,7 +257,7 @@ def build(rec, pool, rng):
             think = (f"`{bad.pop()}` does not exist; the listing has `{good.copy().pop().rsplit('/', 1)[-1]}`. "
                      f"Same command with `{good.pop()}`.")
         elif hit:
-            think = pattern_think(*hit, lead="The form for this case is on the card. ")
+            think = pattern_think(*hit, lead="The form for this case is on the card. ", cite=cite)
         elif answer.startswith("sudo "):
             think = "The error is about privileges: run the same command with sudo."
         else:
@@ -226,7 +272,7 @@ def build(rec, pool, rng):
             lead = f"The task is for {target['os']}. "
         elif len(cards) > 1:
             lead = f"Of these cards, {target['name']} does it. "
-        think = pattern_think(target, what, tpl, pairs, lead)
+        think = pattern_think(target, what, tpl, pairs, lead, cite)
         name = target["name"]
 
     final = ("assistant", think, None, [call("terminal", command=answer)])
@@ -238,13 +284,21 @@ def build(rec, pool, rng):
     if cat == "os":
         query = rng.choice([f"{query} {target['os']}", query])
     shown = list(cards)
-    if len(shown) == 1 and rng.random() < 0.5:  # a router returns neighbours too
-        shown += others(rng.choice([1, 2]), {name})
+    if len(shown) == 1 and rng.random() < (0.8 if near is not None else 0.5):  # a router returns neighbours too
+        shown += others(rng.choice([1, 2]), {name}, f"{query} {task}")
         rng.shuffle(shown)
+        if near is not None and cat not in ("fix", "os") and hit:  # more than one card came back: say which one
+            final = ("assistant", pattern_think(target, what, tpl, pairs, f"Of these cards, {name} does it. ", cite), None,
+                     [call("terminal", command=answer)])
     turns = [("user", user)]
     if mode < 0.45:  # the first query misses
-        wrong = others(rng.choice([2, 3]), {c["name"] for c in cards})
-        turns += [("assistant", rng.choice(NEED), None, [call("lookup", query=vague(task, rng))]), ("tool", store(wrong)),
+        k, avoid = rng.choice([2, 3]), {c["name"] for c in cards}
+        if near is None:  # the order of the draws of the first set
+            wrong, need, loose = others(k, avoid), rng.choice(NEED), vague(task, rng)
+        else:
+            need, loose = rng.choice(NEED), vague(task, rng)
+            wrong = others(k, avoid, loose)
+        turns += [("assistant", need, None, [call("lookup", query=loose)]), ("tool", store(wrong)),
                   ("assistant", rng.choice(MISS), None, [call("lookup", query=query)]), ("tool", store(shown)), final]
         return "retry", turns
     turns += [("assistant", rng.choice(NEED), None, [call("lookup", query=query)]), ("tool", store(shown)), final]
@@ -256,6 +310,8 @@ def main() -> None:
     ap.add_argument("--tasks", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--near", type=float, default=0.0, help="share of the extra cards that are the nearest by words, not random")
+    ap.add_argument("--cite", action="store_true", help="the reasoning quotes the caption of the chosen example")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     recs = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
@@ -270,13 +326,14 @@ def main() -> None:
                     pool.append(c)
         except Skip:
             pass
+    near = Near(pool) if args.near > 0 else None
     counts: dict[str, int] = {}
     skipped = 0
     with open(args.out + ".messages.jsonl", "w") as fm, gzip.open(args.out + ".jsonl.gz", "wt", encoding="utf-8") as ft, \
             gzip.open(args.out + ".val.jsonl.gz", "wt", encoding="utf-8") as fv:
         for r in recs:
             try:
-                mode, turns = build(r, pool, rng)
+                mode, turns = build(r, pool, rng, near, args.near, args.cite)
                 direct = mode == "direct"
                 text = render(None if direct else SYSTEM, None if direct else TOOLS, turns)
             except Exception as e:
