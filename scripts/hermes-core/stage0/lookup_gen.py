@@ -75,6 +75,13 @@ TOOLS = [
     {"name": "terminal", "description": "Run a shell command.",
      "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
 ]
+NOTE = {"name": "note", "description": "Save a new card to the local reference store, so that lookup finds it next time: the "
+        "command's name, what the example does, and the command with {{placeholders}} for its values.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "what": {"type": "string"},
+                                                           "command": {"type": "string"}},
+                       "required": ["name", "what", "command"]}}
+TOOLS_NOTE = [TOOLS[0], NOTE, TOOLS[1]]
+TOLD = ["Use `{c}`.", "`{c}`", "Do it with `{c}`.", "The command is `{c}`.", "No card for it yet. This works: `{c}`."]
 HEAD = re.compile(r"^(?:\[(Linux|macOS|Windows)\] — )?(.+?): (.*)$")
 NEED = ["I need the card for this.", "The exact syntax should come from the reference.", "No card in the conversation yet: look it up.",
         "Check the reference before writing the command.", "I should fetch the card first."]
@@ -342,6 +349,48 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked
     return "lookup", turns
 
 
+def note_card(name: str, what: str, tpl: str) -> str:
+    """A saved note as the store returns it: a card with one example."""
+    return f"{name}: Saved note.\n- {what}: {tpl}"
+
+
+def build_teach(rec, pool, rng, near=None, need=False):
+    """A command the store does not have: NONE, the user gives the command, the model saves a card and runs it."""
+    prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
+    cards, ctx, task, _ = split_prompt(prompt)
+    hit = find(cards, answer) if rec["cat"] in ("slot", "direct", "choose") and not ctx else None
+    if not hit or hit[0]["os"]:
+        raise Skip
+    target, what, tpl, pairs = hit
+    q = what_query(what) if rng.random() < 0.6 else vague(task, rng)
+    k = rng.choice([0, 1, 2, 3])
+    wrong = []
+    if k:
+        wrong = (near.cards(f"{q} {task}", k, {target["name"]}, rng) if near is not None else None) or \
+                [c for c in rng.sample(pool, k + 6) if c["name"] != target["name"]][:k]
+    pre = f"Need: {what_query(what)}. " if need else ""
+    told = rng.choice(TOLD).format(c=answer if rng.random() < 0.7 else tpl)
+    fill = "; ".join(f"{ph} → {v}" for ph, v in pairs) + "." if pairs else "No values to fill in."
+    think = f"{pre}A command the reference does not have: save it as a card, then run it. Card {target['name']}: `{tpl}`. {fill}"
+    return [("user", task),
+            ("assistant", rng.choice(NEED), None, [call("lookup", query=q)]),
+            ("tool", "\n\n".join(c["text"] for c in wrong) if wrong else "No cards found."),
+            ("assistant", pre + "None of the cards covers this task.", "NONE", []),
+            ("user", told),
+            ("assistant", think, None, [{"name": "note", "arguments": {"name": target["name"], "what": what, "command": tpl}},
+                                        call("terminal", command=answer)])]
+
+
+def as_note(turns, rec):
+    """The card the answer uses comes back as a saved note: one example, no description."""
+    cards = split_prompt(rec["messages"][0]["content"])[0]
+    hit = find(cards, rec["messages"][1]["content"]) if rec["cat"] in ("slot", "direct", "choose") else None
+    if not hit or hit[0]["os"]:
+        return turns
+    card, what, tpl, _ = hit
+    return [(t[0], t[1].replace(card["text"], note_card(card["name"], what, tpl))) if t[0] == "tool" else t for t in turns]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", required=True)
@@ -355,8 +404,13 @@ def main() -> None:
                          "several always opens the same way, fewer first queries miss, NONE also with the cards in the user turn")
     ap.add_argument("--need", action="store_true",
                     help="after a tool response the reasoning first says what is needed, in the words of a card's caption")
+    ap.add_argument("--teach", type=float, default=0.0,
+                    help="share of conversations where the store lacks the command, the user gives it after NONE and the model "
+                         "saves a card with the note tool; half of the other conversations then list that tool too, and in "
+                         "8 of 100 lookups the card comes back as a saved note")
     args = ap.parse_args()
     rng = random.Random(args.seed)
+    rng2 = random.Random(args.seed + 1009)  # the draws of --teach: the other conversations stay as without it
     recs = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
     pool, seen = [], set()
     for r in recs:
@@ -378,7 +432,18 @@ def main() -> None:
             try:
                 mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need)
                 direct = mode == "direct"
-                text = render(None if direct else SYSTEM, None if direct else TOOLS, turns)
+                tools = TOOLS
+                if args.teach > 0 and not direct:
+                    if rng2.random() < args.teach:
+                        try:
+                            mode, turns = "teach", build_teach(r, pool, rng2, near, args.need)
+                        except Skip:
+                            pass
+                    if mode == "teach" or rng2.random() < 0.5:
+                        tools = TOOLS_NOTE
+                    if mode in ("lookup", "retry") and rng2.random() < 0.08:
+                        turns = as_note(turns, r)
+                text = render(None if direct else SYSTEM, None if direct else tools, turns)
             except Exception as e:
                 if not isinstance(e, Skip) and type(e).__name__ != "Skip":
                     raise
@@ -386,7 +451,7 @@ def main() -> None:
                 continue
             counts[mode] = counts.get(mode, 0) + 1
             msgs = [{"role": role, "content": content}
-                    for role, content in render_turns(None if direct else SYSTEM, None if direct else TOOLS, turns)]
+                    for role, content in render_turns(None if direct else SYSTEM, None if direct else tools, turns)]
             held = int(hashlib.md5(r["group"].encode()).hexdigest()[:8], 16) % 100 == 0
             (fv if held else ft).write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
             if not held:
