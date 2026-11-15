@@ -5485,9 +5485,19 @@ impl Pipeline {
                 matches!(&lw.ffn, FfnKind::Moe(m)
                     if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4tp().is_some()))
             });
+            // q4_tiled experts on wgpu take the split layout (`moe_q4ts`),
+            // whose grouped prefill reads each expert once a chunk as q4tp's
+            // does: Kimi-Linear-48B on an RTX A5000, 4096-token prompt, 302
+            // tok/s at 32 rows, 464-503 at 256.
+            let q4ts_moe = crate::gpu::wgpu_active()
+                && std::env::var("CMF_MOE_Q4TS").as_deref() != Ok("0")
+                && self.weights.layers.iter().any(|lw| {
+                    matches!(&lw.ffn, FfnKind::Moe(m)
+                        if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4t().is_some()))
+                });
             return if q82 {
                 128
-            } else if q4tp_moe || self.onevision2_prefill() {
+            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() {
                 256
             } else if moe {
                 32
@@ -20137,8 +20147,17 @@ impl Pipeline {
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        // `blr` rides as GRAPH_KIND_BLR on CUDA, whose hybrid arm runs it
+        // the small path's rows at a time (the wgpu batch graph declines it)
+        fn bw(t: &QTensor) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, u8, &[f32])> {
+            if crate::gpu::cuda_active() {
+                t.graph_weight_or_blr()
+            } else {
+                t.graph_weight().or_else(|| t.graph_weight_descriptor())
+            }
+        }
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-            if let Some((m, i, kind, rs)) = t.graph_weight().or_else(|| t.graph_weight_descriptor())
+            if let Some((m, i, kind, rs)) = bw(t)
             {
                 let name = &m.tensors[i].name;
                 let prism = if crate::prism::is_inverse_embedding(m, name) {
@@ -20425,8 +20444,7 @@ impl Pipeline {
                             }
                             return None;
                         }
-                        let (m, _, _, _) =
-                            wq.graph_weight().or_else(|| wq.graph_weight_descriptor())?;
+                        let (m, _, _, _) = bw(wq)?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Full {
                             wq: gw(wq)?,
@@ -20454,10 +20472,7 @@ impl Pipeline {
                             }
                             return None;
                         };
-                        let (m, _, _, _) = w
-                            .in_proj_qkv
-                            .graph_weight()
-                            .or_else(|| w.in_proj_qkv.graph_weight_descriptor())?;
+                        let (m, _, _, _) = bw(&w.in_proj_qkv)?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Gdn {
                             qkv: gw(&w.in_proj_qkv)?,
@@ -20487,10 +20502,7 @@ impl Pipeline {
                     // path runs it (the wgpu batch graph has no kernels for it)
                     AttnKind::ShortConv(w) if crate::gpu::cuda_active() => {
                         let cfg = self.short_conv_cfg?;
-                        let (m, _, _, _) = w
-                            .in_proj
-                            .graph_weight()
-                            .or_else(|| w.in_proj.graph_weight_descriptor())?;
+                        let (m, _, _, _) = bw(&w.in_proj)?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::ShortConv {
                             inp: gw(&w.in_proj)?,

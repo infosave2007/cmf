@@ -831,88 +831,110 @@ impl RvqDepthDecoder {
     /// Run the stack over `[n, hidden]` and return the LAST position's
     /// normed hidden — the only one the caller reads.
     pub fn forward_last(&self, seq: &[f32], n: usize) -> Vec<f32> {
+        self.forward_last_streams(seq, 1, n)
+    }
+
+    /// `forward_last` over `streams` independent sequences of `n` positions
+    /// each, `[streams, n, hidden]` — the CFG pair runs the depth decoder
+    /// as one batch, each stream attending only to itself. Returns the last
+    /// position's normed hidden per stream, `[streams, hidden]`.
+    pub fn forward_last_streams(&self, seq: &[f32], streams: usize, n: usize) -> Vec<f32> {
         let (hs, nh, hd) = (self.hidden, self.nh, self.hd);
         let pool = self.pool.as_deref();
-        let mut x = seq.to_vec();
-        for p in 0..n {
-            for (v, &pe) in x[p * hs..(p + 1) * hs]
-                .iter_mut()
-                .zip(&self.pos[p * hs..(p + 1) * hs])
-            {
-                *v += pe;
+        let rows = streams * n;
+        let mut x = seq[..rows * hs].to_vec();
+        for st in 0..streams {
+            for p in 0..n {
+                let r = st * n + p;
+                for (v, &pe) in x[r * hs..(r + 1) * hs]
+                    .iter_mut()
+                    .zip(&self.pos[p * hs..(p + 1) * hs])
+                {
+                    *v += pe;
+                }
             }
         }
         for blk in &self.blocks {
             let mut h = x.clone();
             blk.n1.apply(&mut h, hs);
             let (mut q, mut k, mut v) =
-                (vec![0f32; n * hs], vec![0f32; n * hs], vec![0f32; n * hs]);
-            blk.q.matmat(&h, n, &mut q, pool);
-            blk.k.matmat(&h, n, &mut k, pool);
-            blk.v.matmat(&h, n, &mut v, pool);
+                (vec![0f32; rows * hs], vec![0f32; rows * hs], vec![0f32; rows * hs]);
+            blk.q.matmat(&h, rows, &mut q, pool);
+            blk.k.matmat(&h, rows, &mut k, pool);
+            blk.v.matmat(&h, rows, &mut v, pool);
             let scale = 1.0 / (hd as f32).sqrt();
-            let mut attn = vec![0f32; n * hs];
-            for hh in 0..nh {
-                for i in 0..n {
-                    let qi = &q[i * hs + hh * hd..i * hs + hh * hd + hd];
-                    // Causal: position i sees 0..=i and nothing after.
-                    let mut sc = vec![0f32; i + 1];
-                    let mut mx = f32::NEG_INFINITY;
-                    for (j, s) in sc.iter_mut().enumerate() {
-                        let kj = &k[j * hs + hh * hd..j * hs + hh * hd + hd];
-                        *s = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
-                        mx = mx.max(*s);
-                    }
-                    let mut sum = 0.0;
-                    for s in sc.iter_mut() {
-                        *s = (*s - mx).exp();
-                        sum += *s;
-                    }
-                    let inv = 1.0 / sum;
-                    let dst = &mut attn[i * hs + hh * hd..i * hs + hh * hd + hd];
-                    for (j, &s) in sc.iter().enumerate() {
-                        let w = s * inv;
-                        let vj = &v[j * hs + hh * hd..j * hs + hh * hd + hd];
-                        for (d, &vv) in dst.iter_mut().zip(vj) {
-                            *d += w * vv;
+            let mut attn = vec![0f32; rows * hs];
+            for st in 0..streams {
+                let base = st * n;
+                for hh in 0..nh {
+                    for i in 0..n {
+                        let qi = &q[(base + i) * hs + hh * hd..(base + i) * hs + hh * hd + hd];
+                        // Causal: position i sees 0..=i and nothing after.
+                        let mut sc = vec![0f32; i + 1];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, s) in sc.iter_mut().enumerate() {
+                            let kj = &k[(base + j) * hs + hh * hd..(base + j) * hs + hh * hd + hd];
+                            *s = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+                            mx = mx.max(*s);
+                        }
+                        let mut sum = 0.0;
+                        for s in sc.iter_mut() {
+                            *s = (*s - mx).exp();
+                            sum += *s;
+                        }
+                        let inv = 1.0 / sum;
+                        let dst = &mut attn[(base + i) * hs + hh * hd..(base + i) * hs + hh * hd + hd];
+                        for (j, &s) in sc.iter().enumerate() {
+                            let w = s * inv;
+                            let vj = &v[(base + j) * hs + hh * hd..(base + j) * hs + hh * hd + hd];
+                            for (d, &vv) in dst.iter_mut().zip(vj) {
+                                *d += w * vv;
+                            }
                         }
                     }
                 }
             }
-            let mut proj = vec![0f32; n * hs];
-            blk.o.matmat(&attn, n, &mut proj, pool);
+            let mut proj = vec![0f32; rows * hs];
+            blk.o.matmat(&attn, rows, &mut proj, pool);
             for (a, b) in x.iter_mut().zip(&proj) {
                 *a += b;
             }
 
             let mut h = x.clone();
             blk.n2.apply(&mut h, hs);
-            let (mut g, mut u) = (vec![0f32; n * self.inter], vec![0f32; n * self.inter]);
-            blk.gate.matmat(&h, n, &mut g, pool);
-            blk.up.matmat(&h, n, &mut u, pool);
+            let (mut g, mut u) = (vec![0f32; rows * self.inter], vec![0f32; rows * self.inter]);
+            blk.gate.matmat(&h, rows, &mut g, pool);
+            blk.up.matmat(&h, rows, &mut u, pool);
             for (a, b) in g.iter_mut().zip(&u) {
                 *a = silu(*a) * b;
             }
-            let mut ffo = vec![0f32; n * hs];
-            blk.down.matmat(&g, n, &mut ffo, pool);
+            let mut ffo = vec![0f32; rows * hs];
+            blk.down.matmat(&g, rows, &mut ffo, pool);
             for (a, b) in x.iter_mut().zip(&ffo) {
                 *a += b;
             }
         }
-        let mut last = x[(n - 1) * hs..].to_vec();
-        self.norm.apply(&mut last, hs);
+        let mut last = Vec::with_capacity(streams * hs);
+        for st in 0..streams {
+            let r = st * n + n - 1;
+            let mut l = x[r * hs..(r + 1) * hs].to_vec();
+            self.norm.apply(&mut l, hs);
+            last.extend_from_slice(&l);
+        }
         last
     }
 
-    /// Logits for codebook `level` (1-based; level 1 uses head 0).
+    /// Logits for codebook `level` (1-based; level 1 uses head 0) of each
+    /// of the `hidden.len() / hidden_size` rows, row after row.
     pub fn head(&self, level: usize, hidden: &[f32]) -> Vec<f32> {
         let h = &self.heads[level - 1];
         let rows = match h {
             Proj::F32 { rows, .. } => *rows,
             Proj::Q(q) => q.rows(),
         };
-        let mut out = vec![0f32; rows];
-        h.matmat(hidden, 1, &mut out, self.pool.as_deref());
+        let b = hidden.len() / self.hidden;
+        let mut out = vec![0f32; b * rows];
+        h.matmat(&hidden[..b * self.hidden], b, &mut out, self.pool.as_deref());
         out
     }
 }
@@ -1104,6 +1126,41 @@ impl Music3Ar {
         out
     }
 
+    /// `CMF_MUSIC3_GRAPH_CHECK=1`: run every graph position through the host
+    /// stack too (its own cache, the same input) and print how far the
+    /// graph's logits are from the host's — a check that does not depend on
+    /// the sampled trajectory, which two backends never share for long.
+    fn graph_check(
+        &self,
+        x: &[f32],
+        pos: usize,
+        shadow: &mut [Vec<KvRun>],
+        glogits: &[Vec<f32>; 2],
+    ) {
+        let hs = self.hidden;
+        let mut xs = x.to_vec();
+        self.step_blocks(&mut xs, 2, pos, shadow);
+        self.norm.apply(&mut xs, hs);
+        let vocab = self.lm_head_rows();
+        let mut lg = vec![0f32; 2 * vocab];
+        self.lm_head.matmat(&xs, 2, &mut lg, self.pool.as_deref());
+        let rel = |a: &[f32], b: &[f32]| {
+            let d: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+            let n: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+            (d / n.max(1e-30)).sqrt()
+        };
+        let top = |v: &[f32]| (0..v.len()).max_by(|&i, &j| v[i].total_cmp(&v[j])).unwrap_or(0);
+        eprintln!(
+            "graph check pos {pos}: rel cond {:.3e}, uncond {:.3e}, top {} / host {}, stop logit {:.2} / host {:.2}",
+            rel(&glogits[0][..vocab], &lg[..vocab]),
+            rel(&glogits[1][..vocab], &lg[vocab..]),
+            top(&glogits[0][..vocab]),
+            top(&lg[..vocab]),
+            glogits[0][0],
+            lg[0]
+        );
+    }
+
     /// One decode position through the WHOLE stack in a single device
     /// submission, per CFG branch.
     ///
@@ -1215,7 +1272,11 @@ impl Music3Ar {
                 None,
                 None,
                 0,
-                false,
+                // The hidden comes back too: the depth decoder and the
+                // DiT's condition read it. Without it CUDA leaves `h` as the
+                // frame's input embedding (wgpu returns it either way), and
+                // songs on the CUDA graph ended a few frames in.
+                true,
             );
             if ok != crate::gpu::TokenGraphOutcome::Completed || out.len() < lm_rows {
                 return false;
@@ -1355,11 +1416,24 @@ impl Music3Ar {
         // 2.9x SLOWER. The AR is batch-1/2 matvec, so every layer is a
         // bandwidth errand too small to amortise a submit, while the host
         // arm has 256 cores to spread it over. The graph is the right
-        // shape for a thin CPU; it is the wrong one here, so it ships off.
-        // (Gating this on `enabled_here()` was also wrong — the AR runs
-        // before the backend is up, so that read false and the graph was
-        // never once attempted. Keep it un-gated so the A/B stays honest.)
-        let mut graph = std::env::var("CMF_MUSIC3_GRAPH").as_deref() == Ok("1");
+        // shape for a thin CPU; it is the wrong one here, so wgpu ships it
+        // off. The native CUDA backend ships it on (`CMF_MUSIC3_GRAPH=0`
+        // opts out): its graph is one replayed launch list, and on an A5000
+        // with six host threads it takes the AR of ten seconds of song from
+        // 198 s to 22 s. (Gating on `enabled_here()` was wrong — the AR
+        // runs before the backend is up, so that read false and the graph
+        // was never once attempted; `cuda_active` brings the backend up.)
+        let mut graph = match std::env::var("CMF_MUSIC3_GRAPH").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::gpu::cuda_active(),
+        };
+        let check = graph && std::env::var("CMF_MUSIC3_GRAPH_CHECK").as_deref() == Ok("1");
+        let mut shadow: Vec<Vec<KvRun>> = if check {
+            (0..self.blocks.len()).map(|_| vec![KvRun::init(self.nkv); 2]).collect()
+        } else {
+            Vec::new()
+        };
         let mut glogits: [Vec<f32>; 2] = Default::default();
         let mut last = vec![0f32; 2 * hs];
         for (pos, (&a, &b)) in prompt_ids.iter().zip(&uncond).enumerate() {
@@ -1367,7 +1441,11 @@ impl Music3Ar {
             x[..hs].copy_from_slice(&Self::embed_row(&self.embed_prefill, a as usize, hs));
             x[hs..].copy_from_slice(&Self::embed_row(&self.embed_prefill, b as usize, hs));
             if graph {
+                let x_in = if check { x.clone() } else { Vec::new() };
                 if self.graph_step(&mut x, pos, cap, &mut cache, &mut glogits) {
+                    if check {
+                        self.graph_check(&x_in, pos, &mut shadow, &glogits);
+                    }
                     last = x;
                     if pos % 64 == 0 {
                         progress(0, want);
@@ -1391,7 +1469,10 @@ impl Music3Ar {
         let mut out: Vec<f32> = Vec::with_capacity(want * self.codebooks * hs);
         let mut done = 0usize;
         let scale = (self.codebooks as f32).powf(-0.5);
-        for frame in 0..want {
+        // One step more than frames kept: the reference keeps no frame for
+        // the first sample (its hidden is the prompt's last position, not a
+        // frame), feeding its codes back all the same.
+        for frame in 0..=want {
             let mut normed = last.clone();
             self.norm.apply(&mut normed, hs);
             // c0 with classifier-free guidance and a top-k mask taken
@@ -1405,6 +1486,12 @@ impl Music3Ar {
                 logits[vocab..].copy_from_slice(&glogits[1][..vocab]);
             } else {
                 self.lm_head.matmat(&normed, 2, &mut logits, pool);
+            }
+            if frame == 0
+                && let Ok(p) = std::env::var("CMF_MUSIC3_LOGITS_DUMP")
+            {
+                let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(p, bytes);
             }
             let (cond, unc) = logits.split_at(vocab);
             let mut thr: Vec<f32> = cond.to_vec();
@@ -1426,29 +1513,50 @@ impl Music3Ar {
             let c0 = code - 1;
             let c0_embed = Self::embed_row(&self.embed_audio, c0, hs);
             // Depth: the remaining seven codebooks, and their hidden
-            // states are seven eighths of what the DiT will see.
-            let mut seq = self.depth.project(&normed[..hs]);
-            seq.extend_from_slice(&self.depth.project(&c0_embed));
+            // states are seven eighths of what the DiT will see. It runs
+            // as the CFG pair too — each stream starts from its own branch's
+            // hidden — and every level samples the GUIDED logits
+            // (`_depth_codes`): one stream without guidance picks codes the
+            // model did not mean, and a song ended a few frames in once
+            // those products were exact.
+            let start = self.depth.project(&normed[..2 * hs]);
+            let c0p = self.depth.project(&c0_embed);
+            let mut streams: [Vec<f32>; 2] = [start[..hs].to_vec(), start[hs..2 * hs].to_vec()];
+            for s in streams.iter_mut() {
+                s.extend_from_slice(&c0p);
+            }
             let mut codes = vec![c0];
             let mut frame_hidden = normed[..hs].to_vec();
             for level in 1..self.codebooks {
-                let n = seq.len() / hs;
-                let h = self.depth.forward_last(&seq, n);
-                frame_hidden.extend_from_slice(&h);
+                let n = streams[0].len() / hs;
+                let mut seq = streams[0].clone();
+                seq.extend_from_slice(&streams[1]);
+                let h = self.depth.forward_last_streams(&seq, 2, n);
+                frame_hidden.extend_from_slice(&h[..hs]);
                 let lg = self.depth.head(level, &h);
-                let c = sample_topk(&lg, self.top_k, &mut rng);
+                let rows = lg.len() / 2;
+                let (cond, unc) = lg.split_at(rows);
+                let guided: Vec<f32> = (0..rows)
+                    .map(|i| unc[i] + (cond[i] - unc[i]) * self.cfg_scale)
+                    .collect();
+                let c = sample_topk(&guided, self.top_k, &mut rng);
                 codes.push(c);
                 if level < self.codebooks - 1 {
                     let e =
                         Self::embed_row(&self.embed_extra, c + (level - 1) * self.audio_vocab, hs);
-                    seq.extend_from_slice(&self.depth.project(&e));
+                    let ep = self.depth.project(&e);
+                    for s in streams.iter_mut() {
+                        s.extend_from_slice(&ep);
+                    }
                 }
             }
-            out.extend_from_slice(&frame_hidden);
-            done += 1;
-            progress(done, want);
-            if done >= want {
-                break;
+            if frame > 0 {
+                out.extend_from_slice(&frame_hidden);
+                done += 1;
+                progress(done, want);
+                if done >= want {
+                    break;
+                }
             }
             // Feed the whole frame back: c0's embedding plus the extras,
             // scaled by 1/sqrt(codebooks).
@@ -1466,11 +1574,14 @@ impl Music3Ar {
             x[..hs].copy_from_slice(&fb);
             x[hs..].copy_from_slice(&fb);
             let pos = prompt_ids.len() + frame;
+            let x_in = if check { x.clone() } else { Vec::new() };
             if !graph || !self.graph_step(&mut x, pos, cap, &mut cache, &mut glogits) {
                 if graph {
                     return Err("the token graph refused mid-song".into());
                 }
                 self.step_blocks(&mut x, 2, pos, &mut cache);
+            } else if check {
+                self.graph_check(&x_in, pos, &mut shadow, &glogits);
             }
             last = x;
         }
@@ -1589,6 +1700,42 @@ mod tests {
             - logits.iter().fold(f32::MAX, |m, v| m.min(*v));
         assert!(spread > 1e-3, "head is flat, spread {spread}");
         eprintln!("music3 rvq: 8 codebooks, head spread {spread:.3}");
+    }
+
+    /// The CFG pair runs the depth decoder as one batch of two streams:
+    /// each must come out as it would alone — a stream that attends into
+    /// the other would mix the conditioned branch with the unconditioned.
+    #[test]
+    fn music3_rvq_depth_streams_are_independent() {
+        let Ok(p) = std::env::var("CMF_MUSIC3_TE") else {
+            eprintln!("CMF_MUSIC3_TE unset — skipping RVQ streams test");
+            return;
+        };
+        let model = Arc::new(CmfModel::open(&p).expect("open packed AR stack"));
+        let dec = RvqDepthDecoder::from_cmf(&model).expect("load RVQ decoder");
+        let hs = dec.hidden;
+        let n = 3;
+        let seq: Vec<f32> = (0..2 * n * hs)
+            .map(|i| 0.05 * ((i as f32) * 0.013).sin() + if i >= n * hs { 0.02 } else { 0.0 })
+            .collect();
+        // Exact activations: the default A8W8 host kernels take different
+        // arms for a batch of 3 and of 6, which is noise, not a leak.
+        let (both, a, b) = crate::qtensor::float_activations_scope(|| {
+            (
+                dec.forward_last_streams(&seq, 2, n),
+                dec.forward_last(&seq[..n * hs], n),
+                dec.forward_last(&seq[n * hs..], n),
+            )
+        });
+        let rel = |x: &[f32], y: &[f32]| {
+            let d: f32 = x.iter().zip(y).map(|(p, q)| (p - q) * (p - q)).sum();
+            (d / y.iter().map(|q| q * q).sum::<f32>().max(1e-30)).sqrt()
+        };
+        let (ra, rb) = (rel(&both[..hs], &a), rel(&both[hs..], &b));
+        assert!(ra < 1e-4 && rb < 1e-4, "streams differ from single runs: {ra:.2e}, {rb:.2e}");
+        assert!(rel(&a, &b) > 1e-3, "the two streams' inputs differ, so must their outputs");
+        let lg = dec.head(1, &both);
+        assert_eq!(lg.len(), 2 * 1024, "one head row per stream");
     }
 
     /// Forward the packed DiT and check what the reference fixes: a

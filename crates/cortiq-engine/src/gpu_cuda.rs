@@ -935,10 +935,9 @@ pub use embryo::{
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
 pub use h3::{
-    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_plane_ready, h3_prof_report, h3_release, h3_resident_bytes,
+    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_music3_ffn, h3_plane_fits, h3_plane_ready, h3_planes_grow, h3_prof_report, h3_release, h3_resident_bytes,
     flux_vae_chain, h3_te_chain, h3_vae_conv2d, lumina_block, ltx_chain, ltx_vae_chain, moss_chain, primal_vae_run, qi21_prefill, qi21_release,
-    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, sam_encode, vit_encode, zimage_prepare, zimage_release, zimage_step,
-};
+    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, sam_encode, vit_encode, zimage_prepare, zimage_release, zimage_step, h3_lfm_set_forward};
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
     // NVRTC takes seconds on a large module (the hybrid arm's: ~11 s on a

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.98] — 2026-11-15
+
+### Added
+- CUDA: binary low-rank (`blr`, NVG) weights in the hybrid arm. Each one is repacked at load into binary tile
+  matrices of the q1 kernels — a V' block per path (group scales ℓ) over `g ⊙ x`, then U' (group scales h) over
+  the latents; a gate/up pair shares one interleaved U' — so both stages run on the tensor cores. Qwen3.8-27B-NVG
+  on an RTX A5000 decodes at 55–58 tokens/s instead of 2.5 (Vulkan: 44) and reads a 4096-token prompt at 282
+  tokens/s instead of timing out (Vulkan: 48); the batch graph builder takes `blr` on CUDA, whose hybrid arm runs
+  such stacks the small path's 16 rows at a time.
+- CUDA: d1's one-pass `set` forward on the card (`h3_lfm_set_forward`, the Metal port's kernels over the weights'
+  f32 planes). A warm d1-2B question through `/v1/system_one` takes 40 ms on an RTX A5000 instead of 850 ms on the
+  CPU (Vulkan: 65 ms); the first call pays the planes' upload (1.7 s).
+- Kimi-Linear on the Vulkan / wgpu token and prompt graphs (it used to fall back to the CPU there). KDA layers
+  run in WGSL (`gpu_wgpu/kimi.rs`): the short conv with SiLU and the q/k L2 norm, the low-rank decay and β
+  and the output gate, the delta-rule scan over 128-wide state columns, the gated RMS norm; their state lives
+  in the GDN maps, laid out as on CUDA. MLA layers take the full-attention arm with their own head geometry
+  (192-wide keys, 128-wide values, no RoPE) behind a latent RMS norm kernel. q4_tiled experts are repacked on
+  the device into a nibble plane and an f16 scale plane (`gpu_wgpu/moe_q4ts.rs`, `CMF_MOE_Q4TS=0` keeps the
+  old layout) and run through the 4-row decode and the grouped prefill kernels; prompts of such models go in
+  256-row chunks. Kimi-Linear-48B-A3B on an RTX A5000: decode 7.7 → 97 tok/s, a 4096-token prompt 4.3 → 507
+  tok/s; the text equals the CUDA arm's byte for byte.
+
+### Fixed
+- MiniMax-Music-3 follows ComfyUI's `ar.py` where the port did not: the RVQ depth decoder runs as the CFG pair
+  (each stream from its own branch's hidden) and samples every level from the guided logits, and the first
+  sample's frame is fed back but not kept in the DiT's condition.
+- MiniMax-Music-3 on CUDA: 10 s of song at 8 steps on an RTX A5000 in 115 s instead of 1126 s (Vulkan: 333 s).
+  The AR runs as the CUDA token graph by default (`CMF_MUSIC3_GRAPH=0` opts out), which now reads the hidden state
+  back alongside the logits — without it the depth decoder read the frame's input and songs ended a few frames
+  in; the feed-forward half of the DiT runs on the card (`h3_music3_ffn`); the plane cache may grow into free VRAM
+  for this pipeline, so the DiT's and the depth decoder's planes stay cached between steps.
+- CUDA per-op products: a decode-narrow batch (under 8 rows) takes the dense plane only when it is cached or fits
+  without evicting another, instead of rebuilding a whole stack's planes every token, and batches under 32 rows
+  multiply in f32 instead of TF32. `CMF_CUDA_MM_VERIFY=1` checks device products against f32 rows of the weight.
+
 ## [0.8.97] — 2026-11-14
 
 ### Added

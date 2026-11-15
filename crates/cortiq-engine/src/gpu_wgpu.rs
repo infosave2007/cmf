@@ -81,6 +81,10 @@ pub mod dflash_dev;
 pub(crate) mod vit;
 pub(crate) mod dory;
 pub(crate) mod uocr;
+// Kimi-Linear's KDA and MLA mixers on the token and batch graphs.
+pub(crate) mod kimi;
+// q4_tiled MoE experts in a split layout with row-blocked kernels.
+pub(crate) mod moe_q4ts;
 pub(crate) mod primal_vae;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
@@ -19774,6 +19778,156 @@ fn bind_pairs(
 /// sees one stable address.
 static GRAPH_ONES: [f32; 512] = [1.0; 512];
 
+/// A KDA layer's device state (ring, S), zeroed, or seeded from the host
+/// state when the host ran the earlier positions (`kimi::device_seed`
+/// re-lays its three rings into one).
+fn kda_state_new(c: &Ctx, d: &kimi::KdaDims, host: &[f32]) -> (wgpu::Buffer, wgpu::Buffer) {
+    let mk = |words: usize| {
+        let sz = (words * 4).max(4) as u64;
+        let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kda-state"),
+            size: sz,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&bf, 0, &vec![0u8; sz as usize]);
+        bf
+    };
+    let (ring, s) = (mk(d.ring_words()), mk(d.s_words()));
+    if let Some((r, sv)) = kimi::device_seed(d, host) {
+        if !r.is_empty() {
+            c.queue.write_buffer(&ring, 0, bytemuck::cast_slice(&r));
+        }
+        c.queue.write_buffer(&s, 0, bytemuck::cast_slice(sv));
+    }
+    (ring, s)
+}
+
+/// The RoPE table an MLA layer binds (it rotates nothing).
+static MLA_INVF: [f32; 4] = [0.0; 4];
+
+/// Kimi-Linear's MLA layer as the graphs' per-layer attention geometry:
+/// multi-head attention with heads `rope + nope` wide, V `v_dim` wide, no
+/// rotation (`pipeline::mla_attention`; the host cache keeps K rows that wide
+/// and V rows zero-padded to them, as `GraphAttnGeom` expects).
+fn mla_geom<'a>(attn: &crate::gpu::GraphAttn<'a>) -> Option<crate::gpu::GraphAttnGeom<'a>> {
+    match attn {
+        crate::gpu::GraphAttn::Mla { nh, rope, nope, v_dim, .. } => Some(crate::gpu::GraphAttnGeom {
+            nkv: *nh,
+            hd: rope + nope,
+            dv: *v_dim,
+            rd: 0,
+            invf: &MLA_INVF,
+            rope_scale: 1.0,
+            window: None,
+            sink: None,
+            v_norm: false,
+            dash: None,
+            vres: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Why the wgpu graphs cannot run a stack's Kimi-Linear layers (KDA, MLA),
+/// if they cannot.
+fn kimi_problem(
+    c: &Ctx,
+    layers: &[crate::gpu::GraphLayer],
+    nh: usize,
+    hd: usize,
+    hidden: usize,
+) -> Option<&'static str> {
+    let mut any = false;
+    for l in layers {
+        match &l.attn {
+            crate::gpu::GraphAttn::Kda {
+                conv_q,
+                conv_k,
+                conv_v,
+                f_a,
+                f_b,
+                b,
+                g_a,
+                g_b,
+                dt_bias,
+                a_log,
+                o_norm,
+                nh: knh,
+                dk,
+                dv,
+                kk,
+                ..
+            } => {
+                any = true;
+                let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                if !d.admitted() {
+                    return Some("KDA geometry outside the kernels (128-wide heads, a conv of at most 9 taps)");
+                }
+                let (kd, vd) = (d.kd(), d.vd());
+                if conv_q.len() != kd * kk
+                    || conv_k.len() != kd * kk
+                    || conv_v.len() != vd * kk
+                    || dt_bias.len() != kd
+                    || o_norm.len() != *dv
+                    || !(a_log.len() == *knh || a_log.len() == *dk || a_log.len() == kd)
+                {
+                    return Some("KDA constants of unexpected lengths");
+                }
+                if [f_a, f_b, b, g_a].iter().any(|g| g.kind != 4) || g_b.as_ref().is_some_and(|g| g.kind != 4) {
+                    return Some("KDA low-rank projections that are not f32");
+                }
+                if hidden == 0 || f_a.data.len() % hidden != 0 || g_a.data.len() % hidden != 0 {
+                    return Some("KDA low-rank projections of unexpected lengths");
+                }
+                let (rf, rg) = (f_a.data.len() / hidden, g_a.data.len() / hidden);
+                let gb_bad = match g_b {
+                    Some(g) => g.data.len() != vd * rg,
+                    None => rg != vd,
+                };
+                if rf == 0 || f_b.data.len() != kd * rf || b.data.len() != knh * hidden || gb_bad {
+                    return Some("KDA projections of unexpected lengths");
+                }
+            }
+            crate::gpu::GraphAttn::Mla {
+                nh: mnh,
+                rope,
+                nope,
+                v_dim,
+                lora,
+                no_rope,
+                q_a,
+                kv_a_norm,
+                ..
+            } => {
+                any = true;
+                let lhd = rope + nope;
+                if *mnh != nh
+                    || !*no_rope
+                    || q_a.is_some()
+                    || lhd % 4 != 0
+                    || lhd > 256
+                    || *v_dim == 0
+                    || *v_dim > lhd
+                    || v_dim % 4 != 0
+                    || *lora == 0
+                    || kv_a_norm.len() != *lora
+                {
+                    return Some("MLA geometry outside the kernels (a rotary or q low-rank stage, heads past 256)");
+                }
+                if let Some(why) = mla_geom(&l.attn).and_then(|g| graph_geom_problem(c, &g, nh, hd)) {
+                    return Some(why);
+                }
+            }
+            _ => {}
+        }
+    }
+    if any && !kimi::available(c) {
+        return Some("Kimi-Linear kernels unavailable on this device");
+    }
+    None
+}
+
 fn graph_geom_problem(
     c: &Ctx,
     g: &crate::gpu::GraphAttnGeom<'_>,
@@ -21828,6 +21982,33 @@ fn is_packed_moe_payload(dtype: cortiq_core::TensorDtype, name: &str) -> bool {
 }
 
 fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
+    // The directory walk below names every tensor of the file (13 000 on
+    // Kimi-Linear-48B: ~ms of host time) and both graphs ask on every call;
+    // its sums are the loaded file's, so they are kept per model.
+    static TOTALS: std::sync::Mutex<Option<HashMap<u64, (u64, u64, u64)>>> = std::sync::Mutex::new(None);
+    let key = model.uid() as u64;
+    let hit = TOTALS.lock().unwrap().as_ref().and_then(|m| m.get(&key).copied());
+    let (total, q8, packed_moe) = match hit {
+        Some(t) => t,
+        None => {
+            let t = graph_live_weight_totals(model);
+            TOTALS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, t);
+            t
+        }
+    };
+    let override_mb = std::env::var("CMF_GRAPH_LIVE_MB").ok();
+    graph_live_budget_with_override(
+        c.vram_budget,
+        total,
+        q8,
+        packed_moe,
+        override_mb.as_deref(),
+        c.exact_alloc,
+    )
+}
+
+/// The placement-weight bytes of a file: all, q8_2f, packed MoE experts.
+fn graph_live_weight_totals(model: &Arc<CmfModel>) -> (u64, u64, u64) {
     let (mut total, mut q8, mut packed_moe) = (0u64, 0u64, 0u64);
     for e in &model.tensors {
         if !crate::gpu::counts_as_placement_weight(model, &e.name) {
@@ -21841,15 +22022,7 @@ fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
             packed_moe = packed_moe.saturating_add(e.nbytes);
         }
     }
-    let override_mb = std::env::var("CMF_GRAPH_LIVE_MB").ok();
-    graph_live_budget_with_override(
-        c.vram_budget,
-        total,
-        q8,
-        packed_moe,
-        override_mb.as_deref(),
-        c.exact_alloc,
-    )
+    (total, q8, packed_moe)
 }
 
 /// Automatic prefix for ordinary per-op layer walks (most importantly the
@@ -24559,7 +24732,7 @@ pub(crate) fn release_idle_model_buffers(uid: u64) {
                 .saturating_add(down.size())
         });
         resident_sub(c, bytes);
-        bytes
+        bytes + moe_q4ts::release(c, owner)
     };
     let global_moe_bytes = {
         let mut map = c.dsv4_global_moe.lock().unwrap();
@@ -28084,8 +28257,26 @@ fn graph_layer_payload_bytes(
             add(inp)?;
             add(out)?;
         }
-        // no wgpu kernels: the graphs decline these stacks at their entry
-        crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => {}
+        crate::gpu::GraphAttn::Kda {
+            q, k, v, f_a, f_b, b, g_a, g_b, out, ..
+        } => {
+            for w in [q, k, v, f_a, f_b, b, g_a, out] {
+                add(w)?;
+            }
+            if let Some(g) = g_b {
+                add(g)?;
+            }
+        }
+        crate::gpu::GraphAttn::Mla {
+            q_a, q, kv_a, kv_b, o, ..
+        } => {
+            if let Some(g) = q_a {
+                add(g)?;
+            }
+            for w in [q, kv_a, kv_b, o] {
+                add(w)?;
+            }
+        }
     }
     match &layer.ffn {
         crate::gpu::GraphFfn::AttentionOnly => {}
@@ -28241,8 +28432,8 @@ pub fn forward_token_graph(
         return token_graph_outcome(o1_started || state_started, false);
     };
     let _op = c.op_gate.enter();
-    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
-        graph_refused("a KDA or MLA layer: no wgpu kernels");
+    if let Some(why) = kimi_problem(c, layers, nh, hd, hidden) {
+        graph_refused(why);
         return token_graph_outcome(o1_started || state_started, false);
     }
     let graph_live_budget = graph_live_weight_budget(c, model);
@@ -28335,6 +28526,22 @@ pub fn forward_token_graph(
             kk: usize,
             cdim: usize,
         },
+        /// Kimi Delta Attention: q / k / v and the output in the graph's
+        /// codecs, the low-rank decay, beta and the output gate in f32.
+        Kda {
+            q: GMat,
+            k: GMat,
+            v: GMat,
+            out: GMat,
+            fa: GMat,
+            fb: GMat,
+            b: GMat,
+            ga: GMat,
+            gb: Option<GMat>,
+            d: kimi::KdaDims,
+            rank_f: usize,
+            rank_g: usize,
+        },
     }
     /// A shared expert that cannot be packed alongside the routed MoE bank.
     /// Its output is added to the routed accumulation before the FFN residual
@@ -28385,6 +28592,8 @@ pub fn forward_token_graph(
             norm_topk: bool,
             q4tp: bool,
             gu_q2: bool,
+            /// q4_tiled experts in the split layout (`moe_q4ts`).
+            q4ts: bool,
             /// q8_2f experts: `moe_q82`'s decode pair.
             q82: bool,
             sigmoid: bool,
@@ -28750,7 +28959,94 @@ pub fn forward_token_graph(
                     cdim,
                 }
             }
-            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
+            crate::gpu::GraphAttn::Kda {
+                q: wq,
+                k: wk,
+                v: wv,
+                f_a,
+                f_b,
+                b: wb,
+                g_a,
+                g_b,
+                out: wo,
+                nh: knh,
+                dk,
+                dv,
+                kk,
+                ..
+            } => {
+                // geometry and lengths checked at the entry (`kimi_problem`)
+                let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                let (kd, vd) = (d.kd(), d.vd());
+                let (rank_f, rank_g) = (f_a.data.len() / hidden, g_a.data.len() / hidden);
+                let (Some(q), Some(k), Some(v), Some(out), Some(fa), Some(fb), Some(b), Some(ga)) = (
+                    resolve(wq, kd, hidden),
+                    resolve(wk, kd, hidden),
+                    resolve(wv, vd, hidden),
+                    resolve(wo, hidden, vd),
+                    resolve(f_a, rank_f, hidden),
+                    resolve(f_b, kd, rank_f),
+                    resolve(wb, *knh, hidden),
+                    resolve(g_a, rank_g, hidden),
+                ) else {
+                    graph_decline("KDA weight resolve (dtype/shape outside graph contract)");
+                    return token_graph_outcome(o1_started || state_started, false);
+                };
+                let gb = match g_b {
+                    Some(g) => match resolve(g, vd, rank_g) {
+                        Some(m) => Some(m),
+                        None => {
+                            graph_decline("KDA gate resolve");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    },
+                    None => None,
+                };
+                if [&q, &k, &v, &out].iter().any(|m| m.prism != crate::gpu::GraphPrismOp::None || m.affine) {
+                    graph_decline("KDA projections with a Prism plane");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                LAttn::Kda { q, k, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g }
+            }
+            crate::gpu::GraphAttn::Mla {
+                q: wq,
+                kv_a,
+                kv_b,
+                o: wo,
+                nh: mnh,
+                rope,
+                nope,
+                v_dim,
+                lora,
+                ..
+            } => {
+                // multi-head attention over heads rope + nope wide: the Full
+                // arm with this layer's geometry; wk / wv hold kv_a / kv_b
+                let lhd = rope + nope;
+                let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
+                    resolve(wq, mnh * lhd, hidden),
+                    resolve(kv_a, lora + rope, hidden),
+                    resolve(kv_b, mnh * (nope + v_dim), *lora),
+                    resolve(wo, hidden, mnh * v_dim),
+                ) else {
+                    graph_decline("MLA weight resolve (dtype/shape outside graph contract)");
+                    return token_graph_outcome(o1_started || state_started, false);
+                };
+                if [&wq, &wk, &wv, &wo].iter().any(|m| m.prism != crate::gpu::GraphPrismOp::None || m.affine) {
+                    graph_decline("MLA projections with a Prism plane");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                LAttn::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    nkv: *mnh,
+                    hd: lhd,
+                    dv: *v_dim,
+                    hg: None,
+                }
+            }
             crate::gpu::GraphAttn::ShortConv {
                 inp, out, kernel, ..
             } => {
@@ -28977,10 +29273,8 @@ pub fn forward_token_graph(
                 // boundary. Keep this arena check for other resident data
                 // that may already occupy the explicit weight budget.
                 let cached = experts.first().is_some_and(|e| {
-                    c.moe_expw
-                        .lock()
-                        .unwrap()
-                        .contains_key(&(model.uid() as usize, e.0))
+                    let key = (model.uid() as usize, e.0);
+                    c.moe_expw.lock().unwrap().contains_key(&key) || moe_q4ts::resident(key)
                 });
                 let need = if *q82 {
                     (experts.len()
@@ -29010,8 +29304,12 @@ pub fn forward_token_graph(
                     graph_decline("Prism MoE experts require an unimplemented resident transform");
                     return token_graph_outcome(o1_started || state_started, false);
                 }
+                // q4_tiled experts: the split layout and its row-blocked kernels
+                let q4ts = !*q82 && !*q4tp && !*gu_q2 && moe_q4ts::on(c, hidden, *mi);
                 let packed = if *q82 {
                     moe_expert_bufs_q82(c, model, experts, *mi, hidden)
+                } else if q4ts {
+                    moe_q4ts::banks(c, model, experts, *mi, hidden)
                 } else {
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 };
@@ -29032,6 +29330,7 @@ pub fn forward_token_graph(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    q4ts,
                     q82: *q82,
                     sigmoid: *sigmoid,
                     sigmoid_denom_eps: *sigmoid_denom_eps,
@@ -29351,6 +29650,10 @@ pub fn forward_token_graph(
                 }
                 LAttn::Gdn { qkv, z, a, b, out, .. } => v.extend([qkv, z, a, b, out]),
                 LAttn::Conv { inp, out, .. } => v.extend([inp, out]),
+                LAttn::Kda { q, k, v: vm, out, fa, fb, b, ga, gb, .. } => {
+                    v.extend([q, k, vm, out, fa, fb, b, ga]);
+                    v.extend(gb.iter());
+                }
             }
             if let LFfn::Dense { gate, up, down, .. } = &lw.ffn {
                 v.extend([gate, up, down]);
@@ -29669,7 +29972,60 @@ pub fn forward_token_graph(
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
+                crate::gpu::GraphAttn::Mla {
+                    cpu_k,
+                    cpu_v,
+                    cpu_base,
+                    ..
+                } => {
+                    // the per-layer-geometry mirror: K rows rope + nope wide,
+                    // V rows v wide, seeded from the host rows it lacks
+                    let g = mla_geom(&l.attn).expect("an MLA layer");
+                    let e = kv_mirror_ensure_x(c, &mut kvm, (kv_id, layer_base + li), g.nkv, g.hd, g.dv, cap, None);
+                    if e.synced > position {
+                        graph_refused("KV mirror is ahead of token-graph position");
+                        return token_graph_outcome(true, false);
+                    }
+                    if e.synced < position && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, *cpu_base, position) {
+                        graph_refused("host KV rows missing for the device mirror seed");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    xcaps.insert(li, e.cap);
+                    kvbufs.push(Some((e.k.clone(), e.v.clone())));
+                    gdnbufs.push(None);
+                }
+                crate::gpu::GraphAttn::Kda {
+                    cpu_state,
+                    nh: knh,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                    let key = (kv_id, layer_base + li);
+                    let dims = (*knh, *knh, *dk, *dv, *kk, d.cdim());
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == position => {}
+                        (Some(_), Some(_)) => {
+                            graph_refused("KDA device state position/geometry mismatch");
+                            return token_graph_outcome(true, false);
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            graph_refused("KDA device state and cursor out of step");
+                            return token_graph_outcome(true, false);
+                        }
+                        (None, None) => {}
+                    }
+                    if !gsm.contains_key(&key) && position > 0 && cpu_state.len() != d.ring_words() + d.s_words() {
+                        graph_refused("KDA CPU seed missing for nonzero token position");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    let e = gsm.entry(key).or_insert_with(|| kda_state_new(c, &d, cpu_state));
+                    gcm.entry(key).or_insert(GdnCursor { dims, next_pos: position });
+                    gdnbufs.push(Some((e.0.clone(), e.1.clone())));
+                    kvbufs.push(None);
+                }
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -30488,6 +30844,35 @@ pub fn forward_token_graph(
         let (bind, wg) = mv_x2_bind(c, &a.buf, &b.buf, xs, ya, yb, rows_a, rows_b, cols);
         Some((x2_pipe(c), bind, wg))
     };
+    // A matvec of the Kimi-Linear arms whose (pipeline, bind group) is kept
+    // per (layer, site) across tokens (`kimi::bind_get`); emat when prep has
+    // no kernel for the codec.
+    let mv_c = |enc: &mut wgpu::CommandEncoder,
+                li: usize,
+                site: u32,
+                m: &GMat,
+                xs: &wgpu::Buffer,
+                y: &wgpu::Buffer,
+                rows: usize,
+                cols: usize| {
+        let key = (kv_id, layer_base + li, site);
+        let bufs = [&m.buf, xs, y];
+        let t = kimi::bind_get(key, &bufs).and_then(|(p, b, w)| p.map(|p| (p, b, w))).or_else(|| {
+            prep(m, xs, y, rows, cols).map(|(p, b, w)| {
+                kimi::bind_put(key, &bufs, Some(p.clone()), b.clone(), w);
+                (p.clone(), b, w)
+            })
+        });
+        match t {
+            Some((p, b, w)) => {
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&p);
+                pass.set_bind_group(0, &b, &[]);
+                pass.dispatch_workgroups(w, 1, 1);
+            }
+            None => emat(enc, m, xs, y, rows, cols),
+        }
+    };
     // Emit a set of mutually-INDEPENDENT matvecs. When grouping is on and every
     // one preps, they share a single compute pass (no barrier between them);
     // otherwise each goes through emat as its own pass. Correctness rests on the
@@ -30667,7 +31052,11 @@ pub fn forward_token_graph(
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
-                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, Some(_)) => {
+                    graph_refused("o1 view attached to a KDA or MLA layer");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
             }
         }
         {
@@ -30868,11 +31257,20 @@ pub fn forward_token_graph(
                 li == first || (li > first && (li - first) % chunk == 0)
             }
         };
+        let mut hp_ffn: Option<std::time::Instant> = None;
+        // (a first call's weight upload is not the steady setup)
+        if kimi::hostprof_on() && stp == 0 && _hp_t0.elapsed().as_millis() < 50 {
+            kimi::hostprof_add(3, _hp_t0.elapsed());
+        }
         for (li, l) in layers.iter().enumerate() {
+            if let Some(t0) = hp_ffn.take() {
+                kimi::hostprof_add(2, t0.elapsed());
+            }
             if li >= layer_cap {
                 break;
             }
             if boundary(li) {
+                let hp_sub = kimi::hostprof_on().then(std::time::Instant::now);
                 flush_pass(&enc);
                 let full = std::mem::replace(
                     &mut enc,
@@ -30882,6 +31280,9 @@ pub fn forward_token_graph(
                         }),
                 );
                 submit(c, finish_enc(full));
+                if let Some(t0) = hp_sub {
+                    kimi::hostprof_add(4, t0.elapsed());
+                }
             }
             let lw = &lws[li];
             let rope_u = rope_us[stp * layers.len() + li].clone();
@@ -30907,6 +31308,7 @@ pub fn forward_token_graph(
                 go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
             }
             // ── token mixing (attention or GDN) → ob ──
+            let hp_mix = kimi::hostprof_on().then(std::time::Instant::now);
             match (&lw.attn, &l.attn) {
                 (
                     LAttn::Full {
@@ -30919,16 +31321,32 @@ pub fn forward_token_graph(
                         dv: ldv,
                         hg,
                     },
-                    crate::gpu::GraphAttn::Full {
-                        q_norm,
-                        k_norm,
-                        late_qk_norm,
-                        bias,
-                        output_gate,
-                        geom,
-                        ..
-                    },
+                    la @ (crate::gpu::GraphAttn::Full { .. } | crate::gpu::GraphAttn::Mla { .. }),
                 ) => {
+                    // Kimi-Linear's MLA: this arm with the layer's geometry
+                    // (`mla_geom`), its own K / V projections and scale.
+                    let mla_g = mla_geom(la);
+                    let (q_norm, k_norm, late_qk_norm, bias, output_gate, geom) = match la {
+                        crate::gpu::GraphAttn::Full {
+                            q_norm,
+                            k_norm,
+                            late_qk_norm,
+                            bias,
+                            output_gate,
+                            geom,
+                            ..
+                        } => (q_norm, k_norm, late_qk_norm, bias, output_gate, geom),
+                        _ => (&None, &None, &false, &None, &false, &mla_g),
+                    };
+                    let (mla, lscale) = match la {
+                        crate::gpu::GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, kv_a_norm, scale, .. } => (
+                            Some((kimi::MlaDims { nh: *mnh, rope: *rope, nope: *nope, vd: *v_dim, lora: *lora }, *kv_a_norm)),
+                            *scale,
+                        ),
+                        _ => (None, attn_scale),
+                    };
+                    // every attend below scales by the layer's own
+                    let attn_scale = lscale;
                     let (lnkv, ldv) = (*lnkv, *ldv);
                     // This layer's head width: every size below (projection
                     // rows, rope/qk-norm, mirror rows, attend) is the layer's.
@@ -30966,6 +31384,28 @@ pub fn forward_token_graph(
                         rope_words[10] = g.dv as u32;
                     }
                     c.queue.write_buffer(&rope_u, 0, bytemuck::cast_slice(&rope_words));
+                    if let Some((md, kvn)) = mla {
+                        // MLA's projections: q and kv_a (the latent, then the
+                        // rope key) from n1, the latent's norm, kv_b over it,
+                        // the heads' [k_rope | k_nope] keys and v-wide values
+                        let kva = kimi::scratch(c, "mla-kva", md.kva_rows());
+                        let lat = kimi::scratch(c, "mla-lat", md.lora);
+                        let kvbo = kimi::scratch(c, "mla-kvb", md.kvb_rows());
+                        let qrows = nh * hd;
+                        mv_c(&mut enc, li, 1, wq, &n1, &qraw, qrows, hidden);
+                        mv_c(&mut enc, li, 2, wk, &n1, &kva, md.kva_rows(), hidden);
+                        let kvn_b = stor(bytemuck::cast_slice(kvn));
+                        let bkey = |site: u32| Some((kv_id, layer_base + li, site));
+                        if !kimi::encode_mla_lat(c, &mut enc, bkey(3), &md, eps, 1, &kva, &kvn_b, &lat) {
+                            graph_decline("MLA kernels unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        mv_c(&mut enc, li, 4, wv, &lat, &kvbo, md.kvb_rows(), md.lora);
+                        if !kimi::encode_mla_kv(c, &mut enc, bkey(5), &md, 1, &kva, &kvbo, &kb, &vb) {
+                            graph_decline("MLA kernels unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    } else {
                     let qkv_in = match prism_input(
                         &mut enc,
                         &[wq, wk, wv],
@@ -31171,6 +31611,7 @@ pub fn forward_token_graph(
                             &bgc(15, li, &c.layout_axpy, &[&bvb, &vb, &axv]),
                             ((lnkv * ldv) as u32).div_ceil(256),
                         );
+                    }
                     }
                     // Spark-X2.5 head gate logits g = g_proj · n1, beside the
                     // QKV projections (same input, no dependency on them, so
@@ -31459,7 +31900,7 @@ pub fn forward_token_graph(
                                 mcap as u32,
                                 n as u32,
                                 first as u32,
-                                attn_scale.to_bits(),
+                                lscale.to_bits(),
                                 u32::from(g.sink.is_some()),
                                 nc as u32,
                                 xg_ck,
@@ -32419,6 +32860,51 @@ pub fn forward_token_graph(
                     }
                 }
                 (
+                    LAttn::Kda { q, k, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g },
+                    crate::gpu::GraphAttn::Kda {
+                        conv_q,
+                        conv_k,
+                        conv_v,
+                        dt_bias,
+                        a_log,
+                        o_norm,
+                        lower_bound,
+                        ..
+                    },
+                ) => {
+                    state_started = true;
+                    let (ring, s) = gdnbufs[li].as_ref().unwrap();
+                    let (kd, vd, knh) = (d.kd(), d.vd(), d.nh);
+                    let consts = kimi::kda_consts(c, &kimi::KdaHost { conv_q, conv_k, conv_v, dt_bias, a_log, o_norm });
+                    let xq = kimi::scratch(c, "kda-xq", kd);
+                    let xk = kimi::scratch(c, "kda-xk", kd);
+                    let xv = kimi::scratch(c, "kda-xv", vd);
+                    let fl = kimi::scratch(c, "kda-fl", *rank_f);
+                    let braw = kimi::scratch(c, "kda-braw", knh);
+                    let gl = kimi::scratch(c, "kda-gl", *rank_g);
+                    let gate = kimi::scratch(c, "kda-gate", vd);
+                    let ko = kimi::scratch(c, "kda-o", vd);
+                    // n1's projections: q / k / v in their codecs, f_a, b and
+                    // g_a in f32 (g_a straight into the gate when full rank)
+                    let ga_out = if gb.is_some() { &gl } else { &gate };
+                    for (site, (m, y, rows)) in [(q, &xq, kd), (k, &xk, kd), (v, &xv, vd), (fa, &fl, *rank_f), (b, &braw, knh), (ga, ga_out, *rank_g)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        mv_c(&mut enc, li, 10 + site as u32, m, &n1, y, rows, hidden);
+                    }
+                    ts_point!(enc, 53); // KDA: q / k / v / f_a / b / g_a
+                    let io = kimi::KdaIo { xq: &xq, xk: &xk, xv: &xv, fl: &fl, gl: &gl, braw: &braw, gate: &gate, ring, s, o: &ko };
+                    let lr = kimi::KdaLowRank { fb: &fb.buf, gb: gb.as_ref().map(|g| &g.buf), rank_f: *rank_f, rank_g: *rank_g };
+                    if !kimi::encode_kda(c, &mut enc, (kv_id, layer_base + li, 0), d, &consts, &lr, *lower_bound, eps, 1, &io) {
+                        graph_decline("KDA kernels unavailable");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    ts_point!(enc, 54); // KDA conv + recurrent step + norm
+                    mv_c(&mut enc, li, 18, out, &ko, &ob, hidden, vd);
+                    ts_point!(enc, 14); // KDA output projection
+                }
+                (
                     LAttn::Conv { inp, out, kernel },
                     crate::gpu::GraphAttn::ShortConv { taps, .. },
                 ) => {
@@ -32451,6 +32937,10 @@ pub fn forward_token_graph(
                     emat(&mut enc, out, &out_in, &ob, hidden, hidden);
                 }
                 _ => return token_graph_outcome(o1_started || state_started, false),
+            }
+            if let Some(t0) = hp_mix {
+                kimi::hostprof_add(usize::from(matches!(lw.attn, LAttn::Kda { .. })), t0.elapsed());
+                hp_ffn = Some(std::time::Instant::now());
             }
             ts!(enc, 1, lkind);
             // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm).
@@ -33346,6 +33836,7 @@ pub fn forward_token_graph(
                     norm_topk,
                     q4tp,
                     gu_q2,
+                    q4ts,
                     q82: false,
                     sigmoid,
                     sigmoid_denom_eps,
@@ -33517,7 +34008,50 @@ pub fn forward_token_graph(
                         && *n_exp <= 64
                         && slots <= 32
                         && std::env::var("CMF_MOE_FOLD").as_deref() != Ok("0");
-                    let (p_gu, p_dn, bg_gu, bg_dn, gu_wg, dn_wg) = if let (Some(r4), true) =
+                    let q4ts_p = if *q4ts { moe_q4ts::pipes(c) } else { None };
+                    if *q4ts && (q4ts_p.is_none() || slots > 32) {
+                        graph_decline("q4_tiled split experts without their kernels");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    let (p_gu, p_dn, bg_gu, bg_dn, gu_wg, dn_wg) = if let Some(qp) = q4ts_p {
+                        // q4_tiled experts in the split layout: four rows a
+                        // workgroup (`moe_q4ts`), the select dispatched as usual
+                        (
+                            &qp.gu.p,
+                            &qp.dn.p,
+                            kimi::bind_cached(
+                                c,
+                                Some((kv_id, layer_base + li, 30)),
+                                &qp.gu.l,
+                                &[
+                                    (0, gate_all),
+                                    (1, up_all),
+                                    (2, &n1),
+                                    (3, msel),
+                                    (4, mact),
+                                    (5, &gu_u),
+                                    (6, gate_all),
+                                    (7, up_all),
+                                ],
+                            ),
+                            kimi::bind_cached(
+                                c,
+                                Some((kv_id, layer_base + li, 31)),
+                                &qp.dn.l,
+                                &[
+                                    (8, down_all),
+                                    (9, down_all),
+                                    (10, mact),
+                                    (11, msel),
+                                    (12, mwt),
+                                    (13, &ob),
+                                    (14, &dn_u),
+                                ],
+                            ),
+                            (*mi / 4) as u32,
+                            (hidden / 4) as u32,
+                        )
+                    } else if let (Some(r4), true) =
                         (r4, sel_fold)
                     {
                         let guf_u = uniform_u32x8(
@@ -34837,8 +35371,13 @@ pub fn forward_batch_graph_at(
         bgraph_refused("k/positions mismatch");
         return batch_outcome(o1_started || state_started, false);
     }
-    if layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. })) {
-        bgraph_refused("a KDA or MLA layer: no wgpu kernels");
+    if let Some(why) = kimi_problem(c, layers, nh, hd, hidden) {
+        bgraph_refused(why);
+        return batch_outcome(o1_started || state_started, false);
+    }
+    // a verify would need a KDA state snapshot a row (GDN's `gdn_snap`)
+    if spec.is_some() && layers.iter().any(|l| matches!(l.attn, crate::gpu::GraphAttn::Kda { .. })) {
+        bgraph_refused("KDA layers under a speculative verify");
         return batch_outcome(o1_started || state_started, false);
     }
     // A Looped Transformer's loop boundaries (`gpu::set_batch_loop_norm`):
@@ -35066,6 +35605,22 @@ pub fn forward_batch_graph_at(
             kk: usize,
             cdim: usize,
         },
+        /// Kimi Delta Attention: q / k / v and the output in the graph's
+        /// codecs, the low-rank decay, beta and the output gate in f32.
+        Kda {
+            q: GMat,
+            k: GMat,
+            v: GMat,
+            out: GMat,
+            fa: GMat,
+            fb: GMat,
+            b: GMat,
+            ga: GMat,
+            gb: Option<GMat>,
+            d: kimi::KdaDims,
+            rank_f: usize,
+            rank_g: usize,
+        },
     }
     /// Батчевый FFN слоя. MoE маршрутизируется ПО ТОКЕНАМ, поэтому его
     /// эксперты кодируются в цикле внутри того же submit'а, тогда как
@@ -35111,6 +35666,8 @@ pub fn forward_batch_graph_at(
             /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
             /// whole-chunk q4tp fast lane must NOT take these bytes.
             gu_q2: bool,
+            /// q4_tiled experts in the split layout (`moe_q4ts`).
+            q4ts: bool,
             /// q8_2f experts: `moe_q82`'s grouped prefill pair.
             q82: bool,
             sigmoid: bool,
@@ -35362,7 +35919,96 @@ pub fn forward_batch_graph_at(
                 // walks positions in order yet; prefill stays per-op.
                 return batch_outcome(o1_started || state_started, false);
             }
-            crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
+            crate::gpu::GraphAttn::Kda {
+                q: wq,
+                k: wk,
+                v: wv,
+                f_a,
+                f_b,
+                b: wb,
+                g_a,
+                g_b,
+                out: wo,
+                nh: knh,
+                dk,
+                dv,
+                kk,
+                ..
+            } => {
+                // geometry and lengths checked at the entry (`kimi_problem`)
+                let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                let (kd, vd) = (d.kd(), d.vd());
+                let (rank_f, rank_g) = (f_a.data.len() / hidden, g_a.data.len() / hidden);
+                let (Some(q), Some(k), Some(v), Some(out), Some(fa), Some(fb), Some(b), Some(ga)) = (
+                    resolve(wq, kd, hidden),
+                    resolve(wk, kd, hidden),
+                    resolve(wv, vd, hidden),
+                    resolve(wo, hidden, vd),
+                    resolve(f_a, rank_f, hidden),
+                    resolve(f_b, kd, rank_f),
+                    resolve(wb, *knh, hidden),
+                    resolve(g_a, rank_g, hidden),
+                ) else {
+                    bgraph_refused("KDA weight resolve (dtype/shape outside graph contract)");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                let gb = match g_b {
+                    Some(g) => match resolve(g, vd, rank_g) {
+                        Some(m) => Some(m),
+                        None => {
+                            bgraph_refused("KDA gate resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                    },
+                    None => None,
+                };
+                if ![&q, &k, &v, &out].iter().all(|m| gemmable(m) && m.prism == crate::gpu::GraphPrismOp::None && !m.affine)
+                    || ![&fa, &fb, &b, &ga].iter().all(|m| m.kind == 4)
+                    || gb.as_ref().is_some_and(|m| m.kind != 4)
+                {
+                    bgraph_refused("KDA weights not gemmable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                LAttn::Kda { q, k, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g }
+            }
+            crate::gpu::GraphAttn::Mla {
+                q: wq,
+                kv_a,
+                kv_b,
+                o: wo,
+                nh: mnh,
+                rope,
+                nope,
+                v_dim,
+                lora,
+                ..
+            } => {
+                // the Full arm with this layer's geometry; wk / wv hold kv_a / kv_b
+                let lhd = rope + nope;
+                let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
+                    resolve(wq, mnh * lhd, hidden),
+                    resolve(kv_a, lora + rope, hidden),
+                    resolve(kv_b, mnh * (nope + v_dim), *lora),
+                    resolve(wo, hidden, mnh * v_dim),
+                ) else {
+                    bgraph_refused("MLA weight resolve (dtype/shape outside graph contract)");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                if ![&wq, &wk, &wv, &wo].iter().all(|m| gemmable(m) && m.prism == crate::gpu::GraphPrismOp::None && !m.affine) {
+                    bgraph_refused("MLA weights not gemmable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                LAttn::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    nkv: *mnh,
+                    hd: lhd,
+                    dv: *v_dim,
+                    hg: None,
+                }
+            }
         };
         let bffn = match &l.ffn {
             crate::gpu::GraphFfn::AttentionOnly => BFfn::AttentionOnly,
@@ -35479,8 +36125,12 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("q8_2f MoE: router weight neither f32 nor gemmable");
                     return batch_outcome(o1_started || state_started, false);
                 }
+                // q4_tiled experts: the split layout and its row-blocked kernels
+                let q4ts = !*q82 && !*q4tp && !*gu_q2 && moe_q4ts::on(c, hidden, *mi);
                 let packed = if *q82 {
                     moe_expert_bufs_q82(c, model, experts, *mi, hidden)
+                } else if q4ts {
+                    moe_q4ts::banks(c, model, experts, *mi, hidden)
                 } else {
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 };
@@ -35520,6 +36170,7 @@ pub fn forward_batch_graph_at(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    q4ts,
                     q82: *q82,
                     sigmoid: *sigmoid,
                     bias: bias.map(|b| {
@@ -35610,7 +36261,40 @@ pub fn forward_batch_graph_at(
                         }
                     }
                 }
-                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
+                crate::gpu::GraphAttn::Mla { .. } => {
+                    if kvm.get(&key).is_some_and(|m| m.synced > pos0) {
+                        bgraph_refused("KV mirror is ahead of batch position");
+                        return batch_outcome(true, false);
+                    }
+                }
+                crate::gpu::GraphAttn::Kda {
+                    cpu_state,
+                    nh: knh,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                    let dims = (*knh, *knh, *dk, *dv, *kk, d.cdim());
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == pos0 => {}
+                        (Some(_), Some(_)) => {
+                            bgraph_refused("KDA device state position/geometry mismatch");
+                            return batch_outcome(true, false);
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            bgraph_refused("KDA device state and cursor out of step");
+                            return batch_outcome(true, false);
+                        }
+                        (None, None) => {
+                            if pos0 > 0 && cpu_state.len() != d.ring_words() + d.s_words() {
+                                bgraph_refused("KDA CPU seed missing for nonzero batch position");
+                                return batch_outcome(o1_started || state_started, false);
+                            }
+                        }
+                    }
+                }
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
@@ -35699,7 +36383,11 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 }
                 (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
-                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, _) => unreachable!("declined at the entry"),
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, None) => {}
+                (crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. }, Some(_)) => {
+                    bgraph_refused("o1 view attached to a KDA or MLA layer");
+                    return batch_outcome(o1_started || state_started, false);
+                }
             }
         }
         // Upload every layer's sealed state before the first command dispatch.
@@ -36193,7 +36881,44 @@ pub fn forward_batch_graph_at(
                     kvbufs.push(None);
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Kda { .. } | crate::gpu::GraphAttn::Mla { .. } => unreachable!("declined at the entry"),
+                crate::gpu::GraphAttn::Mla {
+                    cpu_k,
+                    cpu_v,
+                    cpu_base,
+                    ..
+                } => {
+                    let g = mla_geom(&l.attn).expect("an MLA layer");
+                    let e = kv_mirror_ensure_x(c, &mut kvm, (kv_id, layer_base + li), g.nkv, g.hd, g.dv, cap, None);
+                    if e.synced > pos0 {
+                        bgraph_refused("KV mirror is ahead of batch position");
+                        return batch_outcome(true, false);
+                    }
+                    if e.synced < pos0 && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, *cpu_base, pos0) {
+                        bgraph_refused("CPU KV seed missing for nonzero batch position");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                    xcaps.insert(li, e.cap);
+                    kvbufs.push(Some((e.k.clone(), e.v.clone())));
+                    gdnbufs.push(None);
+                }
+                crate::gpu::GraphAttn::Kda {
+                    cpu_state,
+                    nh: knh,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let d = kimi::KdaDims { nh: *knh, dk: *dk, dv: *dv, kk: *kk };
+                    let key = (kv_id, layer_base + li);
+                    let e = gsm.entry(key).or_insert_with(|| kda_state_new(c, &d, cpu_state));
+                    gcm.entry(key).or_insert(GdnCursor {
+                        dims: (*knh, *knh, *dk, *dv, *kk, d.cdim()),
+                        next_pos: pos0,
+                    });
+                    gdnbufs.push(Some((e.0.clone(), e.1.clone())));
+                    kvbufs.push(None);
+                }
             }
         }
     }
@@ -36884,15 +37609,29 @@ pub fn forward_batch_graph_at(
                     dv: ldv,
                     hg,
                 },
-                crate::gpu::GraphAttn::Full {
-                    q_norm,
-                    k_norm,
-                    late_qk_norm,
-                    output_gate,
-                    geom,
-                    ..
-                },
+                la @ (crate::gpu::GraphAttn::Full { .. } | crate::gpu::GraphAttn::Mla { .. }),
             ) => {
+                // Kimi-Linear's MLA: this arm with the layer's geometry
+                // (`mla_geom`), its own K / V projections and scale.
+                let mla_g = mla_geom(la);
+                let (q_norm, k_norm, late_qk_norm, output_gate, geom) = match la {
+                    crate::gpu::GraphAttn::Full {
+                        q_norm,
+                        k_norm,
+                        late_qk_norm,
+                        output_gate,
+                        geom,
+                        ..
+                    } => (q_norm, k_norm, late_qk_norm, output_gate, geom),
+                    _ => (&None, &None, &false, &false, &mla_g),
+                };
+                let (mla, attn_scale) = match la {
+                    crate::gpu::GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, kv_a_norm, scale, .. } => (
+                        Some((kimi::MlaDims { nh: *mnh, rope: *rope, nope: *nope, vd: *v_dim, lora: *lora }, *kv_a_norm)),
+                        *scale,
+                    ),
+                    _ => (None, attn_scale),
+                };
                 let (lnkv, ldv) = (*lnkv, *ldv);
                 // This layer's head width: every size below is the layer's.
                 // Equal to the call's `hd` except on Gemma-4 global layers.
@@ -36908,7 +37647,25 @@ pub fn forward_batch_graph_at(
                 // "qkv" = the input norm and the q, k and v projections.
                 bts!(enc, 4);
                 ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden);
-                if let (Some((blend, _)), Some((vp, e0b, vinb))) =
+                if let Some((md, kvn)) = mla {
+                    // MLA: kv_a (the latent, then the rope key) of every row,
+                    // the latents' norm, kv_b over them, the heads' K and V
+                    let kz = if k >= 128 { k.div_ceil(128) * 128 } else { k };
+                    let kva = kimi::scratch(c, "mla-kva", kz * md.kva_rows());
+                    let lat = kimi::scratch(c, "mla-lat", kz * md.lora);
+                    let kvbo = kimi::scratch(c, "mla-kvb", kz * md.kvb_rows());
+                    ematb(&mut enc, wk, &n1_p, &kva, md.kva_rows(), hidden);
+                    let kvn_b = stor(bytemuck::cast_slice(kvn));
+                    if !kimi::encode_mla_lat(c, &mut enc, None, &md, eps, k, &kva, &kvn_b, &lat) {
+                        bgraph_refused("MLA kernels unavailable");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                    ematb(&mut enc, wv, &lat, &kvbo, md.kvb_rows(), md.lora);
+                    if !kimi::encode_mla_kv(c, &mut enc, None, &md, k, &kva, &kvbo, &kb_b, &vb_b) {
+                        bgraph_refused("MLA kernels unavailable");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                } else if let (Some((blend, _)), Some((vp, e0b, vinb))) =
                     (geom.and_then(|g| g.vres), vres_bufs.as_ref())
                 {
                     // Ripple: V projects the normed rows pulled toward the
@@ -38515,6 +39272,63 @@ pub fn forward_batch_graph_at(
                 bts!(enc, 1);
             }
             (
+                LAttn::Kda { q, k: kw, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g },
+                crate::gpu::GraphAttn::Kda {
+                    conv_q,
+                    conv_k,
+                    conv_v,
+                    dt_bias,
+                    a_log,
+                    o_norm,
+                    lower_bound,
+                    ..
+                },
+            ) => {
+                state_started = true;
+                let (ring, s) = gdnbufs[li].as_ref().unwrap();
+                let (kd, vd, knh) = (d.kd(), d.vd(), d.nh);
+                // GEMM outputs hold whole 128-row tiles (see `kz` above)
+                let kz = if k >= 128 { k.div_ceil(128) * 128 } else { k };
+                let consts = kimi::kda_consts(c, &kimi::KdaHost { conv_q, conv_k, conv_v, dt_bias, a_log, o_norm });
+                let xq = kimi::scratch(c, "kda-xq", kz * kd);
+                let xk = kimi::scratch(c, "kda-xk", kz * kd);
+                let xv = kimi::scratch(c, "kda-xv", kz * vd);
+                let fl = kimi::scratch(c, "kda-fl", kz * *rank_f);
+                let braw = kimi::scratch(c, "kda-braw", kz * knh);
+                let gl = kimi::scratch(c, "kda-gl", kz * *rank_g);
+                let gate = kimi::scratch(c, "kda-gate", kz * vd);
+                let ko = kimi::scratch(c, "kda-o", kz * vd);
+                bts!(enc, 4);
+                // q, then k and v reading the panel q's GEMM just cast
+                ematb(&mut enc, q, &n1, &xq, kd, hidden);
+                zi_cast_reuse_next(true);
+                ematb2(&mut enc, kw, v, &n1, &xk, &xv, kd, vd, hidden);
+                zi_cast_reuse_next(false);
+                // the f32 low-rank decay, beta and the output gate: every row
+                // in one dispatch a matrix (`f32_matvec_b`)
+                let f32b = |enc: &mut wgpu::CommandEncoder, w: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| {
+                    let u = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(&c.f32_matvec_b);
+                    pass.set_bind_group(0, &bg(&c.layout_f32b, &[w, x, y, &u]), &[]);
+                    pass.dispatch_workgroups((rows as u32).min(MAX_WG), k as u32, 1);
+                };
+                let ga_out = if gb.is_some() { &gl } else { &gate };
+                f32b(&mut enc, &fa.buf, &n1, &fl, *rank_f, hidden);
+                f32b(&mut enc, &b.buf, &n1, &braw, knh, hidden);
+                f32b(&mut enc, &ga.buf, &n1, ga_out, *rank_g, hidden);
+                bts!(enc, 6);
+                let io = kimi::KdaIo { xq: &xq, xk: &xk, xv: &xv, fl: &fl, gl: &gl, braw: &braw, gate: &gate, ring, s, o: &ko };
+                let lr = kimi::KdaLowRank { fb: &fb.buf, gb: gb.as_ref().map(|g| &g.buf), rank_f: *rank_f, rank_g: *rank_g };
+                if !kimi::encode_kda(c, &mut enc, (kv_id, layer_base + li, 1), d, &consts, &lr, *lower_bound, eps, k, &io) {
+                    bgraph_refused("KDA kernels unavailable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                bts!(enc, 7);
+                ematb(&mut enc, out, &ko, &ob, hidden, vd);
+                bts!(enc, 1);
+            }
+            (
                 LAttn::Gdn {
                     qkv,
                     z,
@@ -39242,6 +40056,7 @@ pub fn forward_batch_graph_at(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                q4ts,
                 q82: false,
                 sigmoid,
                 bias,
@@ -39365,7 +40180,15 @@ pub fn forward_batch_graph_at(
                         );
                     }
                 }
-                if *q4tp && !*gu_q2 && router.kind == 4 && sgate.kind == 4 && *n_exp <= 256 {
+                // q4_tiled split experts (`moe_q4ts`) ride the expert-grouped
+                // arm below with their own gate/up and down kernels; no other
+                // batch arm reads that layout
+                let q4ts_p = if *q4ts { moe_q4ts::pipes(c) } else { None };
+                if *q4ts && (q4ts_p.is_none() || preview.is_some() || *act == 3 || router.kind != 4 || sgate.kind != 4 || *n_exp > 256) {
+                    bgraph_refused("q4_tiled split experts outside the grouped prefill");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                if (*q4tp || *q4ts) && !*gu_q2 && router.kind == 4 && sgate.kind == 4 && *n_exp <= 256 {
                     // Uniform q4tp experts + f32 router/gate: k router
                     // matvecs (offset bindings, no staging rows) plus THREE
                     // token-axis dispatches for select/experts/down. The
@@ -39452,9 +40275,14 @@ pub fn forward_batch_graph_at(
                             &pg.group_l,
                             &[(0, msel), (1, &goff), (2, &gent), (3, &gr_u)],
                         );
+                        // the split layout's gate/up and down (same bindings)
+                        let (ggu_p, ggu_l, gdn_p, gdn_l) = match q4ts_p {
+                            Some(qp) => (&qp.ggu.p, &qp.ggu.l, &qp.gdn.p, &qp.gdn.l),
+                            None => (&pg.gu, &pg.gu_l, &pg.dn, &pg.dn_l),
+                        };
                         let bg_ggu = bind_pairs(
                             c,
-                            &pg.gu_l,
+                            ggu_l,
                             &[
                                 (0, gate_all),
                                 (1, up_all),
@@ -39469,7 +40297,7 @@ pub fn forward_batch_graph_at(
                         );
                         let bg_gdn = bind_pairs(
                             c,
-                            &pg.dn_l,
+                            gdn_l,
                             &[
                                 (0, down_all),
                                 (1, down_all),
@@ -39495,16 +40323,20 @@ pub fn forward_batch_graph_at(
                                 mact, &ypart, &gu_u, &dn_u, buckets, n_ent, *mi, hidden,
                             );
                         } else {
-                            pass.set_pipeline(&pg.gu);
+                            pass.set_pipeline(ggu_p);
                             pass.set_bind_group(0, &bg_ggu, &[]);
                             pass.dispatch_workgroups((*mi as u32).div_ceil(64), buckets as u32, tz);
-                            pass.set_pipeline(&pg.dn);
+                            pass.set_pipeline(gdn_p);
                             pass.set_bind_group(0, &bg_gdn, &[]);
                             pass.dispatch_workgroups((hidden as u32).div_ceil(64), buckets as u32, tz);
                         }
                         pass.set_pipeline(&pg.sum);
                         pass.set_bind_group(0, &bg_gs, &[]);
                         pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
+                    } else if *q4ts {
+                        drop(pass);
+                        bgraph_refused("q4_tiled split experts without the grouped prefill buckets");
+                        return batch_outcome(o1_started || state_started, false);
                     } else {
                         pass.set_pipeline(&c.moe_gate_up_q4tp_b);
                         pass.set_bind_group(0, &bg_gu, &[]);
@@ -41685,6 +42517,7 @@ fn forward_embryo_graph_rows(
 pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
         let _op = c.op_gate.enter();
+        kimi::binds_forget(kv_id);
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
         kv16::forget(kv_id);
         c.gdn_state

@@ -3594,3 +3594,22 @@ extern "C" __global__ void hy_mla_cut_h(const u16* __restrict__ src, u16* __rest
     const size_t th = i / vd;
     dst[i] = src[th * hd + e];
 }
+
+// ---- binary low-rank (`blr`, NVG; docs/BLR_NVG.md §3) ---------------------
+// A blr matrix runs as two binary tile matrices of the q1 kernels (kind 3):
+// V' (a path's latent rows over d_in, group scales l_p[k]) over z = g_p * x,
+// then U' (the output rows over the paths' latents, group scales h_p[i]) over
+// the latents. This kernel forms z for every (matrix, path) slot of a job set:
+// z planes [n][slots * din] = g [slots][din] * x (x as NPL bf16 planes).
+extern "C" __global__ void hy_blr_z(const u16* __restrict__ x0, const u16* __restrict__ x1, const u16* __restrict__ x2,
+                                    int xstride, const float* __restrict__ g, int din, int slots, u16* __restrict__ z0,
+                                    u16* __restrict__ z1)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = blockIdx.y;
+    if (i >= (size_t)slots * din) return;
+    const size_t xi = (size_t)j * xstride + (int)(i % din);
+    float x = __fadd_rn(bf2f(x0[xi]), bf2f(x1[xi]));
+    if (NPL > 2) x = __fadd_rn(x, bf2f(x2[xi]));
+    put3(z0, z1, z1, (size_t)j * slots * din + i, __fmul_rn(g[i], x));
+}
