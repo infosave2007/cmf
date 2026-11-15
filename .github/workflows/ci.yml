@@ -39,6 +39,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every test binary links the whole engine; with full debug info the
+  # workspace's tests ran the ubuntu runner out of disk. Line tables keep
+  # file:line in panics and backtraces.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   test:
