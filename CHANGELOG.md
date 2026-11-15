@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Kimi-Linear on the Vulkan / wgpu token and prompt graphs (it used to fall back to the CPU there). KDA layers
+  run in WGSL (`gpu_wgpu/kimi.rs`): the short conv with SiLU and the q/k L2 norm, the low-rank decay and β
+  and the output gate, the delta-rule scan over 128-wide state columns, the gated RMS norm; their state lives
+  in the GDN maps, laid out as on CUDA. MLA layers take the full-attention arm with their own head geometry
+  (192-wide keys, 128-wide values, no RoPE) behind a latent RMS norm kernel. q4_tiled experts are repacked on
+  the device into a nibble plane and an f16 scale plane (`gpu_wgpu/moe_q4ts.rs`, `CMF_MOE_Q4TS=0` keeps the
+  old layout) and run through the 4-row decode and the grouped prefill kernels; prompts of such models go in
+  256-row chunks. Kimi-Linear-48B-A3B on an RTX A5000: decode 7.7 → 97 tok/s, a 4096-token prompt 4.3 → 507
+  tok/s; the text equals the CUDA arm's byte for byte.
+
 ## [0.8.97] — 2026-11-14
 
 ### Added

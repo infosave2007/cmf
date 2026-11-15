@@ -5485,9 +5485,19 @@ impl Pipeline {
                 matches!(&lw.ffn, FfnKind::Moe(m)
                     if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4tp().is_some()))
             });
+            // q4_tiled experts on wgpu take the split layout (`moe_q4ts`),
+            // whose grouped prefill reads each expert once a chunk as q4tp's
+            // does: Kimi-Linear-48B on an RTX A5000, 4096-token prompt, 302
+            // tok/s at 32 rows, 464-503 at 256.
+            let q4ts_moe = crate::gpu::wgpu_active()
+                && std::env::var("CMF_MOE_Q4TS").as_deref() != Ok("0")
+                && self.weights.layers.iter().any(|lw| {
+                    matches!(&lw.ffn, FfnKind::Moe(m)
+                        if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4t().is_some()))
+                });
             return if q82 {
                 128
-            } else if q4tp_moe || self.onevision2_prefill() {
+            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() {
                 256
             } else if moe {
                 32
