@@ -363,7 +363,7 @@ def build_teach(rec, pool, rng, near=None, need=False):
         raise Skip
     target, what, tpl, pairs = hit
     q = what_query(what) if rng.random() < 0.6 else vague(task, rng)
-    k = rng.choice([0, 1, 2, 3])
+    k = 0 if rng.random() < 0.6 else rng.choice([1, 2, 3])  # mostly the store has nothing near: a plain "No cards found."
     wrong = []
     if k:
         wrong = (near.cards(f"{q} {task}", k, {target["name"]}, rng) if near is not None else None) or \
