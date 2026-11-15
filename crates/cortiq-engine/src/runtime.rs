@@ -218,9 +218,20 @@ impl CortiqRuntime {
 
     /// Get current runtime status.
     pub async fn status(&self) -> RuntimeStatus {
+        // The GPU is chosen at run time and comes up lazily, so the mode
+        // detected at load cannot name it: ask the backend now.
+        let gpu = crate::gpu::active_device().map(|device| {
+            let budget = crate::gpu::vram_budget();
+            let budget_mb = if budget == u64::MAX { 0.0 } else { budget as f64 / (1024.0 * 1024.0) };
+            let used = crate::gpu::device_bytes_in_use().unwrap_or_else(crate::gpu::resident_bytes);
+            (ExecutionMode::Gpu { backend: crate::gpu::backend_name(), device, budget_mb }, used)
+        });
         let state = self.state.read().await;
         let mut metrics = state.metrics.clone();
         metrics.uptime_seconds = self.started_at.elapsed().as_secs();
+        if let Some((_, resident)) = &gpu {
+            metrics.vram_used_mb = *resident as f64 / (1024.0 * 1024.0);
+        }
 
         let active_sparsity = state
             .active_mask
@@ -235,7 +246,7 @@ impl CortiqRuntime {
             model_path: self.model.path.display().to_string(),
             format: format!("CMF v{}", self.model.header.version),
             quantization: format!("{:?}", self.model.header.quant_type),
-            execution_mode: state.execution_mode.clone(),
+            execution_mode: gpu.map_or_else(|| state.execution_mode.clone(), |(mode, _)| mode),
             active_task: state.active_task.clone(),
             active_sparsity,
             active_params: self.estimate_active_params(&state),

@@ -3445,6 +3445,13 @@ pub fn kv_bytes() -> u64 {
     ctx().map_or(0, |c| c.kv_bytes.load(Ordering::Relaxed))
 }
 
+/// Bytes in use on the card as the driver reports them (every process
+/// counted), None without a context.
+pub fn device_bytes_in_use() -> Option<u64> {
+    let c = ctx()?;
+    mem_free().map(|free| c.total_mem.saturating_sub(free))
+}
+
 /// The card's name, for reports.
 pub fn device_name() -> Option<String> {
     ctx().map(|c| c.name.clone())

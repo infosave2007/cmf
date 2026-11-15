@@ -809,14 +809,16 @@ enum Commands {
         transcript: Option<String>,
     },
     Tts {
-        /// Path to a Gradium Phonon or Qwen3-TTS `.cmf` model.
+        /// Path to a Gradium Phonon, Qwen3-TTS or OmniVoice `.cmf` model.
         model: String,
         /// Text to synthesize. Long input is split on sentence boundaries (Phonon).
         text: String,
         /// Language: Phonon normalizes en, fr, de, es or pt; Qwen3-TTS speaks
-        /// zh, en, de, it, pt, es, ja, ko, fr, ru (a code or a name) or auto.
-        #[arg(long, visible_alias = "language", default_value = "en")]
-        lang: String,
+        /// zh, en, de, it, pt, es, ja, ko, fr, ru (a code or a name) or auto
+        /// (both default to en). OmniVoice: any of its 600+ languages as an
+        /// ISO 639 code or an English name; without it the model guesses.
+        #[arg(long, visible_alias = "language")]
+        lang: Option<String>,
         /// Output mono 24 kHz WAV path.
         #[arg(long, default_value = "speech.wav")]
         out: String,
@@ -850,6 +852,25 @@ enum Commands {
         /// Text-token limit for each sentence chunk.
         #[arg(long)]
         max_tokens_per_chunk: Option<usize>,
+        /// OmniVoice voice design: comma-separated speaker attributes, e.g.
+        /// "female, low pitch, british accent" or "男，四川话".
+        #[arg(long)]
+        instruct: Option<String>,
+        /// OmniVoice voice cloning: a 3–10 s WAV of the voice to speak with.
+        #[arg(long)]
+        ref_audio: Option<String>,
+        /// The transcript of --ref-audio.
+        #[arg(long)]
+        ref_text: Option<String>,
+        /// OmniVoice: decoding steps (32; 16 is faster and a little rougher).
+        #[arg(long)]
+        steps: Option<usize>,
+        /// OmniVoice: seconds of speech (instead of the estimate from the text).
+        #[arg(long)]
+        duration: Option<f32>,
+        /// OmniVoice: speaking rate (above 1 faster, below 1 slower).
+        #[arg(long)]
+        speed: Option<f32>,
     },
     /// Rewrite a container tightly, or calibrate/compact an existing MTP
     /// draft from a prompt set:
@@ -4872,12 +4893,23 @@ async fn main() -> anyhow::Result<()> {
             duration_delta,
             eos_threshold,
             max_tokens_per_chunk,
+            instruct,
+            ref_audio,
+            ref_text,
+            steps,
+            duration,
+            speed,
         } => {
             if let Ok(m) = CmfModel::open(&model) {
+                if cortiq_engine::omnivoice::is_omnivoice(&m) {
+                    let o = OmniSay { lang: lang.as_deref(), instruct: instruct.as_deref(), ref_audio: ref_audio.as_deref(), ref_text: ref_text.as_deref(), steps, guidance, temperature, seed, duration, speed };
+                    return omnivoice_say(Arc::new(m), &text, &o, &out);
+                }
                 if cortiq_engine::qwen3_tts::is_qwen3_tts(&m) {
-                    return qwen3_tts_say(Arc::new(m), &text, &lang, &voice, temperature, seed, &out);
+                    return qwen3_tts_say(Arc::new(m), &text, lang.as_deref().unwrap_or("en"), &voice, temperature, seed, &out);
                 }
             }
+            let lang = lang.unwrap_or_else(|| "en".to_string());
             let options = cortiq_engine::phonon::SynthesisOptions {
                 language: &lang,
                 voice_file: voice_file.as_deref().map(std::path::Path::new),
@@ -14840,6 +14872,96 @@ fn qwen3_tts_say(
     if let Some(r) = qt::prof_report() {
         eprintln!("qwen3-tts stages: {r}");
     }
+    Ok(())
+}
+
+struct OmniSay<'a> {
+    lang: Option<&'a str>,
+    instruct: Option<&'a str>,
+    ref_audio: Option<&'a str>,
+    ref_text: Option<&'a str>,
+    steps: Option<usize>,
+    guidance: Option<f32>,
+    temperature: Option<f32>,
+    seed: u64,
+    duration: Option<f32>,
+    speed: Option<f32>,
+}
+
+/// `cortiq tts` on an OmniVoice file: the codes from the bidirectional
+/// stack, the Higgs decoder, the release's post-processing.
+fn omnivoice_say(model: Arc<CmfModel>, text: &str, o: &OmniSay, out: &str) -> anyhow::Result<()> {
+    use cortiq_engine::omnivoice as ov;
+    let cfg = ov::OmniVoiceConfig::from_model(&model).map_err(anyhow::Error::msg)?;
+    let pool = cortiq_engine::pool::Pool::from_env();
+    let rate = cfg.sample_rate;
+    let mut generation = ov::GenConfig { seed: o.seed, ..Default::default() };
+    if let Some(s) = o.steps {
+        anyhow::ensure!(s > 0, "--steps must be positive");
+        generation.steps = s;
+    }
+    if let Some(g) = o.guidance {
+        generation.guidance = g;
+    }
+    if let Some(t) = o.temperature {
+        generation.class_temperature = t;
+    }
+    // test knobs: the position temperature (0: deterministic) and no post-processing
+    if let Some(t) = std::env::var("CMF_OV_POS_TEMP").ok().and_then(|v| v.parse().ok()) {
+        generation.position_temperature = t;
+    }
+    if std::env::var("CMF_OV_POSTPROCESS").as_deref() == Ok("0") {
+        generation.postprocess = false;
+    }
+    let t0 = std::time::Instant::now();
+    let codec = ov::Codec::from_model(&model, &cfg, pool.clone()).map_err(anyhow::Error::msg)?;
+    let voice = match (o.ref_audio, std::env::var("CMF_OV_REF_CODES").ok()) {
+        (_, Some(f)) => {
+            let codes: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(&f)?)?;
+            let text = o.ref_text.ok_or_else(|| anyhow::anyhow!("CMF_OV_REF_CODES needs --ref-text"))?;
+            let rms = std::env::var("CMF_OV_REF_RMS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
+            Some(ov::VoicePrompt { codes, text: ov::add_punctuation(text), rms })
+        }
+        (Some(path), None) => {
+            let text = o.ref_text.ok_or_else(|| anyhow::anyhow!("--ref-audio needs --ref-text (its transcript)"))?;
+            let wav = wav_mono(path, rate as u32)?;
+            let enc = ov::Encoder::from_model(&model, &cfg, pool.clone()).map_err(anyhow::Error::msg)?;
+            Some(enc.voice_prompt(&wav, text).map_err(anyhow::Error::msg)?)
+        }
+        (None, None) => None,
+    };
+    let t_ref = t0.elapsed().as_secs_f64();
+    if let (Ok(f), Some(v)) = (std::env::var("CMF_OV_REF_DUMP"), voice.as_ref()) {
+        std::fs::write(&f, serde_json::to_vec(&serde_json::json!({"codes": v.codes, "text": v.text, "rms": v.rms}))?)?;
+    }
+    let chunks: Vec<Vec<Vec<u32>>> = match std::env::var("CMF_OV_TOKENS_IN") {
+        Ok(f) => vec![serde_json::from_slice::<Vec<Vec<u32>>>(&std::fs::read(&f)?)?],
+        Err(_) => {
+            let pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+            let req = ov::Request { text, language: o.lang, instruct: o.instruct, voice: voice.as_ref(), duration: o.duration, speed: o.speed, generation: generation.clone() };
+            ov::generate_chunks(&pipeline, &model, &cfg, &req, pool.as_deref()).map_err(anyhow::Error::msg)?
+        }
+    };
+    let t_gen = t0.elapsed().as_secs_f64() - t_ref;
+    if let Ok(f) = std::env::var("CMF_OV_TOKENS_DUMP") {
+        std::fs::write(&f, serde_json::to_vec(&chunks[0])?)?;
+    }
+    let t1 = std::time::Instant::now();
+    let pieces: Vec<Vec<f32>> = chunks.iter().map(|c| codec.decode(c)).collect();
+    let raw = ov::cross_fade(&pieces, rate);
+    let codes: usize = chunks.iter().map(|c| c.first().map_or(0, |b| b.len())).sum();
+    if let Ok(f) = std::env::var("CMF_OV_RAW_DUMP") {
+        cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(&f), &raw, rate as u32)?;
+    }
+    let wav = ov::post_process(&raw, rate, voice.as_ref().map(|v| v.rms), generation.postprocess);
+    let t_dec = t1.elapsed().as_secs_f64();
+    cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(out), &wav, rate as u32)?;
+    let secs = wav.len() as f64 / rate as f64;
+    println!("✓ wrote {out} ({secs:.2}s, {rate} Hz, {} frames in {} chunk(s), {} steps)", codes, chunks.len(), generation.steps);
+    eprintln!(
+        "[reference {t_ref:.1} s · generated in {t_gen:.1} s · decoded in {t_dec:.1} s · {:.2}× real time]",
+        secs / (t_gen + t_dec).max(1e-9)
+    );
     Ok(())
 }
 

@@ -776,7 +776,7 @@ impl LatDev {
         Some((moe.experts.len() * 3 * pg.div_ceil(16) * 16) as u64)
     }
 
-    /// `on_host`: the bank in host-visible system memory instead of the card's (Vulkan on Linux).
+    /// `on_host`: the bank in host-visible system memory instead of the card's (Vulkan on Linux and Windows).
     pub(crate) fn new(model: &CmfModel, lat: &crate::qwen4_exp::Latent, moe: &crate::pipeline::MoeFfn, hidden: usize, on_host: bool) -> Option<Self> {
         let c = ctx()?;
         lat_pipes(c)?;

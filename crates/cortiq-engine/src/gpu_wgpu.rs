@@ -21868,6 +21868,17 @@ pub fn device_vram_budget() -> u64 {
     ctx().map(|c| c.vram_budget).unwrap_or(0)
 }
 
+/// The current adapter for reports: "<name> / <API>", None without one.
+pub fn device_label() -> Option<String> {
+    ctx().map(|c| format!("{} / {:?}", c.adapter_info.name, c.adapter_info.backend))
+}
+
+/// Bytes the allocator holds on the current adapter (its memory blocks, the
+/// graphs' buffers included); None where the backend keeps no report.
+pub fn device_bytes_in_use() -> Option<u64> {
+    ctx().and_then(|c| c.device.generate_allocator_report()).map(|r| r.total_reserved_bytes)
+}
+
 /// The trainer device's memory budget ([`trainer_ctx`]): bytes, or
 /// `u64::MAX` on unified memory (Apple Silicon — the host's memory is the
 /// device's); None without a trainer device.
@@ -22150,8 +22161,8 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
 /// Streaming multiprocessors of an NVIDIA card on Vulkan, from
 /// `VK_NV_shader_sm_builtins` (`shaderSMCount`). None on other vendors,
 /// backends and platforms. The narrow-matvec grid cap scales with it.
-/// Linux only: the query needs `ash`, which the engine builds there alone
-/// (Windows and Android keep the default grid cap).
+/// Linux only (measured there): Windows and Android keep the default grid
+/// cap.
 #[cfg(target_os = "linux")]
 fn vulkan_sm_count(adapter: &wgpu::Adapter) -> Option<u32> {
     use ash::vk;
@@ -26522,7 +26533,7 @@ impl MoeStage<'_> {
 }
 
 /// Build the small, all-or-nothing host-RAM staging ring for one MoE layer.
-/// `host_mem` returns `None` on non-Linux/non-Vulkan or if the driver has no
+/// `host_mem` returns `None` off Linux and Windows, off Vulkan, or if the driver has no
 /// coherent non-device-local type; callers then use `MoeStage::Mapped` exactly
 /// as before.  Keeping just `slots` chunks bounds the host-visible live set.
 fn moe_sys_staging(c: &Ctx, slots: usize, chunk: usize) -> Option<Vec<host_mem::SysBuf>> {

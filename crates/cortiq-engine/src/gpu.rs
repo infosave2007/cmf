@@ -1409,6 +1409,32 @@ pub fn vram_budget() -> u64 {
     }
 }
 
+/// The card the selected GPU backend runs on, for status reports: "<name> /
+/// CUDA" or "<name> / Vulkan" (DX12, …); None on the CPU and on Apple's Metal
+/// path. Brings the backend up when it is selected and not up yet, as the
+/// first request would.
+pub fn active_device() -> Option<String> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::device_name().map(|n| format!("{n} / CUDA")),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::device_label(),
+        _ => None,
+    }
+}
+
+/// Memory in use on the active card for status reports: the allocator's
+/// blocks on wgpu, the driver's count on CUDA; None on the CPU and Metal.
+pub fn device_bytes_in_use() -> Option<u64> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::device_bytes_in_use(),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::device_bytes_in_use(),
+        _ => None,
+    }
+}
+
 /// Bytes currently accounted as resident weight buffers on the active wgpu
 /// adapter.  This is the logical device-local weight set; physical driver
 /// allocations are reported separately by the platform tools.

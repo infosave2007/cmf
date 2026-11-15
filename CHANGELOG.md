@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.99] — 2026-11-15
+
+### Added
+- OmniVoice (k2-fsa), zero-shot text-to-speech in 600+ languages, native in the engine: `cortiq convert` packs
+  the checkpoint and its Higgs audio tokenizer v2 into one file (the Qwen3 stack in q8_2f, the audio embeddings
+  and heads in f16), and `cortiq tts FILE TEXT` speaks it — `--lang`, `--instruct` (voice design: "female, low
+  pitch, british accent", "男，四川话"), `--ref-audio` with `--ref-text` (voice cloning), `--steps`, `--duration`,
+  `--speed`; text over 30 s of speech goes in ~15 s pieces joined by short fades. The 32 unmasking passes run
+  both ways over the row through d1's set forward (the conditional and the unconditional rows as two groups of
+  one forward), the head as one device GEMM; the codec's decoder (RVQ, DAC) and encoder (HuBERT, the semantic
+  and acoustic encoders, nearest codes) and the release's duration estimate and post-processing (pydub's silence
+  trimming) are ported term for term. Against the float32 release the prompt and the post-processed length are
+  identical, the first pass's log-probabilities within 0.011 on average, and Whisper transcribes our audio as the
+  release's. On an NVIDIA A40, 4.5 s of speech take 4.4 s on CUDA and 10.6 s on Vulkan; a MacBook Air M4
+  (Metal) 14.3 s.
+- CUDA hybrid arm: Ripple's value residual (V reads `lerp(e0, normed, blend)`) and clamped SwiGLU, on the token
+  and the prompt paths. Ripple-65B q4tp on an A40 decodes at 13.3 tokens/s instead of 0.6–0.9 (Vulkan 13.5) and
+  reads a 4096-token prompt at 146 tokens/s instead of 9.4; the greedy text is Vulkan's.
+- CUDA hybrid arm: weights past the card go to mapped host memory, routed experts first, so a MoE larger than
+  the card runs on it: a plan's arena takes the card's free memory less a reserve (`CMF_HYB_RESERVE_MB`, 3 GiB,
+  plus the head when the plan has none), the rest is pinned and read over the bus (`CMF_HYB_HOST_EXPERTS=0`
+  turns it off; a spill past the container's memory declines instead). On a 46 GB A40: Ornith-1.5-122B q2tp-v2
+  (48 GB) decodes at 38.5–38.9 tokens/s instead of 1.5–2.4 (Vulkan 14.4) and reads a 4096-token prompt at 774
+  tokens/s instead of 4.1; q4tp (64 GB, 23 GB of it pinned) 15.4–15.9 instead of 1.9–4.3 (Vulkan 4.5).
+
+### Fixed
+- Windows: models larger than the card on Vulkan ran entirely on the CPU (#151). The expert banks a card has no
+  room for live in host-visible system memory that the kernels read over the bus, and that allocation was built
+  for Linux only; on Windows the device path refused ("latent experts do not fit the card and system memory cannot
+  hold them for it") and Edge0-145B on a 32 GB Intel Arc Pro B70 stayed on the CPU. The host-memory buffers now
+  build on Windows too; `CMF_SYSMEM=0` turns them off.
+- `cortiq serve` status and dashboard: the execution mode always read "CPU Only" and the GPU memory 0.0 GB off
+  macOS, whatever ran. They now name the backend and the card (`Gpu { backend, device, budget_mb }`) and show the
+  memory in use on it.
+- Qwen3.8-Flash-Next / Edge0 on CUDA in a container with a cgroup v1 memory limit: the free-memory estimate read
+  only cgroup v2, took the host's 426 GB for the container's 46.6 GiB, pinned the n-gram table past the limit and
+  the OOM killer ended the run. It now reads v1 (`memory.limit_in_bytes` less RSS and unevictable pages) too:
+  Edge0-120B on a 46 GB A40 decodes at 52–56 tokens/s (106 after a 4096-token prompt read at 2041 tokens/s),
+  Edge0-145B at 18–20 (36 after the prompt at 1208).
+
 ## [0.8.98] — 2026-11-15
 
 ### Added

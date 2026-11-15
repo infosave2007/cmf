@@ -1426,6 +1426,9 @@ pub enum ExecutionMode {
     CpuOnly { simd_type: SimdType, threads: usize },
     /// Apple Silicon unified memory (CPU compute today; label for metrics)
     AppleUnified { metal_layers: Vec<usize> },
+    /// A GPU backend is up: `backend` is "cuda" or "wgpu", `device` the
+    /// card and its API, `budget_mb` the weight budget on it.
+    Gpu { backend: String, device: String, budget_mb: f64 },
 }
 
 /// SIMD instruction set available on CPU.

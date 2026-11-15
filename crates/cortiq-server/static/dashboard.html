@@ -538,7 +538,8 @@ function updateDashboard(s) {
   const modeStr = typeof s.execution_mode === 'object' 
     ? Object.keys(s.execution_mode)[0] 
     : s.execution_mode;
-  document.getElementById('exec-mode').textContent = formatMode(modeStr);
+  const gpu = modeStr === 'Gpu' ? s.execution_mode.Gpu : null;
+  document.getElementById('exec-mode').textContent = gpu ? `GPU · ${gpu.device}` : formatMode(modeStr);
   document.getElementById('exec-mode-sub').textContent = 
     `${s.active_layers}/${s.total_layers} layers active`;
 
@@ -550,7 +551,8 @@ function updateDashboard(s) {
   document.getElementById('active-params').textContent = s.active_params;
   
   const sparsityPct = ((1 - s.active_sparsity) * 100).toFixed(0);
-  document.getElementById('vram-bar').style.width = `${Math.min(100, vramGB / 24 * 100)}%`;
+  const vramCapGB = gpu && gpu.budget_mb > 0 ? gpu.budget_mb / 1024 : 24;
+  document.getElementById('vram-bar').style.width = `${Math.min(100, vramGB / vramCapGB * 100)}%`;
   document.getElementById('ram-bar').style.width = `${Math.min(100, ramGB / 64 * 100)}%`;
   document.getElementById('params-bar').style.width = `${sparsityPct}%`;
 
@@ -660,6 +662,7 @@ function formatMode(mode) {
     'CpuGpuOffload': 'CPU + GPU',
     'CpuOnly': 'CPU Only',
     'AppleUnified': 'Apple Unified',
+    'Gpu': 'GPU',
   };
   return map[mode] || mode;
 }

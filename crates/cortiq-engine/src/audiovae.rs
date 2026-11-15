@@ -82,7 +82,7 @@ use std::sync::Arc;
 /// this kernel length.
 const FILTER_LEN: usize = 12;
 
-struct Conv1d {
+pub(crate) struct Conv1d {
     w: Vec<f32>, // [out, in, k]
     b: Option<Vec<f32>>,
     out_ch: usize,
@@ -93,7 +93,7 @@ struct Conv1d {
 }
 
 impl Conv1d {
-    fn load(
+    pub(crate) fn load(
         model: &Arc<CmfModel>,
         name: &str,
         pad: usize,
@@ -117,7 +117,7 @@ impl Conv1d {
 
     /// `x` is `[in_ch, n]`; the result is `[out_ch, n]` for the
     /// paddings used here (all `same`).
-    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let out_n = (n + 2 * self.pad).saturating_sub(self.dilation * (self.k - 1));
         let mut out = vec![0f32; self.out_ch * out_n];
         let ptr = SendPtr(out.as_mut_ptr());
@@ -324,17 +324,27 @@ impl Conv1d {
     }
 }
 
-struct ConvT1d {
+pub(crate) struct ConvT1d {
     w: Vec<f32>, // [in, out, k]
     b: Vec<f32>,
     in_ch: usize,
     out_ch: usize,
     k: usize,
-    stride: usize,
+    pub(crate) stride: usize,
     pad: usize,
+    /// Extra samples at the end (`output_padding`).
+    out_pad: usize,
 }
 
 impl ConvT1d {
+    /// PyTorch's `ConvTranspose1d(.., kernel, stride, padding, output_padding)`.
+    pub(crate) fn load_padded(model: &Arc<CmfModel>, name: &str, stride: usize, pad: usize, out_pad: usize) -> Result<Self, String> {
+        let mut c = Self::load(model, name, stride)?;
+        c.pad = pad;
+        c.out_pad = out_pad;
+        Ok(c)
+    }
+
     fn load(model: &Arc<CmfModel>, name: &str, stride: usize) -> Result<Self, String> {
         let e = model
             .tensor(&format!("{name}.weight"))
@@ -348,12 +358,13 @@ impl ConvT1d {
             k,
             stride,
             pad: (k - stride) / 2,
+            out_pad: 0,
         })
     }
 
-    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let full = (n - 1) * self.stride + self.k;
-        let out_n = full - 2 * self.pad;
+        let out_n = full + self.out_pad - 2 * self.pad;
         let mut out = vec![0f32; self.out_ch * out_n];
         let ptr = SendPtr(out.as_mut_ptr());
         let work = |lo: usize, hi: usize| {
@@ -396,18 +407,18 @@ impl ConvT1d {
 /// (`(alpha + 1e-9).reciprocal() * sin(alpha * x)**2`). Feeding one
 /// model's parameters to the other's loader silently raises the
 /// activation to an exponent, and the only symptom is worse audio.
-struct Snake {
+pub(crate) struct Snake {
     alpha: Vec<f32>,
 }
 
 impl Snake {
-    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+    pub(crate) fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
         Ok(Self {
             alpha: crate::dit::cmf_f32(model, &format!("{name}.alpha"))?,
         })
     }
 
-    fn apply(&self, x: &mut [f32], n: usize) {
+    pub(crate) fn apply(&self, x: &mut [f32], n: usize) {
         for (c, row) in x.chunks_exact_mut(n).enumerate() {
             let a = self.alpha[c];
             let inv = 1.0 / (a + 1e-9);

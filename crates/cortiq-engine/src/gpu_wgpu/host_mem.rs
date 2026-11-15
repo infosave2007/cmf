@@ -54,29 +54,29 @@ impl SysBuf {
 
 /// Allocate `size` bytes of host-heap memory as a `COPY_SRC | COPY_DST`
 /// buffer: HOST_VISIBLE | HOST_COHERENT, with HOST_CACHED when `cached`,
-/// never DEVICE_LOCAL. None off Vulkan (and off Linux) or when the driver
-/// refuses.
-#[cfg(target_os = "linux")]
+/// never DEVICE_LOCAL. None off Vulkan (and off Linux and Windows), when the
+/// driver refuses, or with `CMF_SYSMEM=0`.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<SysBuf> {
     sysmem_buffer_with(device, size, cached, false)
 }
 
 /// [`sysmem_buffer`] that a shader may also bind (`STORAGE`): weights the card's memory has no room for stay
 /// in system RAM and the kernels read them over the bus.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn sysmem_storage_buffer(device: &wgpu::Device, size: u64) -> Option<SysBuf> {
     sysmem_buffer_with(device, size, true, true)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn sysmem_storage_buffer(_device: &wgpu::Device, _size: u64) -> Option<SysBuf> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn sysmem_buffer_with(device: &wgpu::Device, size: u64, cached: bool, storage: bool) -> Option<SysBuf> {
     use ash::vk;
-    if size == 0 || size > device.limits().max_buffer_size {
+    if size == 0 || size > device.limits().max_buffer_size || std::env::var("CMF_SYSMEM").as_deref() == Ok("0") {
         return None;
     }
     // SAFETY: plain Vulkan object creation on the device wgpu owns; every
@@ -155,7 +155,7 @@ fn sysmem_buffer_with(device: &wgpu::Device, size: u64, cached: bool, storage: b
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn sysmem_buffer(_device: &wgpu::Device, _size: u64, _cached: bool) -> Option<SysBuf> {
     None
 }
