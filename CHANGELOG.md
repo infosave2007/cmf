@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.98] — 2026-11-15
+
 ### Added
 - CUDA: binary low-rank (`blr`, NVG) weights in the hybrid arm. Each one is repacked at load into binary tile
   matrices of the q1 kernels — a V' block per path (group scales ℓ) over `g ⊙ x`, then U' (group scales h) over
