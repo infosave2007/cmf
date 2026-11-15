@@ -61,6 +61,10 @@ head -c 20000 /tmp/probe
         subprocess.run(["docker", "kill", name], capture_output=True)
         return {"exit": 124, "stdout": "", "probe": ""}
     text = p.stdout.decode("utf-8", "replace")
+    if "---8<---OUT" not in text and p.returncode != 137:
+        # docker itself failed (daemon down, image missing): not an answer to grade as wrong.
+        # 137 is the container killed for memory: the command's own doing.
+        raise RuntimeError("the sandbox did not start: " + p.stderr.decode("utf-8", "replace").strip()[:300])
     head, _, rest = text.partition("---8<---OUT\n")
     out, _, pr = rest.partition("\n---8<---PROBE\n")
     try:

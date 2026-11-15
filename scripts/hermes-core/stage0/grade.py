@@ -48,6 +48,13 @@ def main() -> None:
     else:
         answers = {o["id"]: o for o in (json.loads(l) for l in Path(args.outputs).read_text().splitlines() if l.strip())}
 
+    try:  # a dead Docker must stop the run, not grade every answer as wrong
+        probe = S.run("echo sandbox-ok")
+    except RuntimeError as e:
+        raise SystemExit(f"{e}\nis Docker up and the image built?")
+    if probe["exit"] != 0 or "sandbox-ok" not in probe["stdout"]:
+        raise SystemExit(f"the sandbox does not run commands (exit {probe['exit']}): is Docker up and the image built?")
+
     def one(i):
         ok, detail = S.grade(tasks[i], answers[i]["answer"])
         return {**answers[i], "cat": tasks[i]["cat"], "family": tasks[i]["family"], "ref": tasks[i]["ref"],
