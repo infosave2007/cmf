@@ -155,6 +155,13 @@ def vague(task: str, rng, tail=False) -> str:
     return " ".join(words[-k:] if tail else words[:k]).lower().strip(" ,;—-")
 
 
+def need_of(task: str) -> str:
+    """What the task asks for, without its values: the task's sentence up to where the values start."""
+    t = LEAD.sub("", LEAD.sub("", task.split("\n")[0])).strip()
+    t = re.split(r": | — |, namely | \(|\. The | for /|\?", t, maxsplit=1)[0].rstrip(".")
+    return t[0].lower() + t[1:] if t else t
+
+
 def what_query(what: str) -> str:
     q = re.sub(r"\[([A-Za-z])\]", r"\1", what).replace("`", "")
     q = re.sub(r"\s*\(.*?\)", "", q).strip().rstrip(".")
@@ -205,7 +212,7 @@ def pattern_think(card, what, tpl, pairs, lead="", cite=False):
     return head + " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "."
 
 
-def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False):
+def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat in ("react", "arith"):
@@ -225,8 +232,15 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False):
     which = lambda cs, n: said(cs, f"{n} does it. ") if weigh else f"Of these cards, {n} does it. "
     missed = lambda cs, m: said(cs, m) if weigh else m
 
+    def best_last(cs, best):  # a ranked router: the best match is the last card, the nearest to the answer
+        return [c for c in cs if c is not best] + [best] if rng.random() < 0.7 else cs
+
     if cat == "none":
+        if ranked and rng.random() < 0.3:  # the cards are already in the user turn, and none of them fits
+            return "none", [("user", f"Reference cards:\n{store(cards)}\n\n{user}"),
+                            ("assistant", "None of the cards covers this task.", "NONE", [])]
         turns = [("user", user)]
+        pre = f"Need: {need_of(task)}. " if need else ""  # the task is far behind the cards: say what is needed first
         q1 = vague(task, rng)
         turns += [("assistant", rng.choice(NEED), None, [call("lookup", query=q1)]), ("tool", store(cards))]
         last = cards
@@ -234,10 +248,10 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False):
             q2 = vague(task, rng, tail=True)
             more = others(rng.choice([1, 2]), {c["name"] for c in cards}, q2)
             last = more if rng.random() < 0.7 else []
-            turns += [("assistant", missed(cards, rng.choice(MISS)), None, [call("lookup", query=q2)]),
+            turns += [("assistant", pre + missed(cards, rng.choice(MISS)), None, [call("lookup", query=q2)]),
                       ("tool", store(last) if last else "No cards found.")]
         end = said(last, "None of them covers the task.") if weigh and last else "None of the cards covers this task."
-        turns.append(("assistant", end, "NONE", []))
+        turns.append(("assistant", pre + end, "NONE", []))
         return "none", turns
 
     if cat == "two":
@@ -284,6 +298,8 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False):
         if not hit:
             raise Skip
         target, what, tpl, pairs = hit
+        if ranked and cat != "os" and len(cards) > 1:
+            cards = best_last(cards, target)
         lead = ""
         if cat == "os":
             lead = f"The task is for {target['os']}. "
@@ -304,19 +320,23 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False):
     if len(shown) == 1 and rng.random() < (0.8 if near is not None else 0.5):  # a router returns neighbours too
         shown += others(rng.choice([1, 2]), {name}, f"{query} {task}")
         rng.shuffle(shown)
-        if near is not None and cat not in ("fix", "os") and hit:  # more than one card came back: say which one
+        if ranked and hit:
+            shown = best_last(shown, target)
+        if (near is not None or ranked) and cat not in ("fix", "os") and hit:  # more than one card came back: say which one
             final = ("assistant", pattern_think(target, what, tpl, pairs, which(shown, name), cite), None,
                      [call("terminal", command=answer)])
     turns = [("user", user)]
-    if mode < 0.45:  # the first query misses
-        k, avoid = rng.choice([2, 3]), {c["name"] for c in cards}
+    pre = f"Need: {what_query(hit[1])}. " if need and hit else ""
+    final = (final[0], pre + final[1], final[2], final[3])
+    if mode < (0.36 if ranked else 0.45):  # the first query misses
+        k, avoid = rng.choice([1, 2, 3] if ranked else [2, 3]), {c["name"] for c in cards}
         if near is None:  # the order of the draws of the first set
             wrong, need, loose = others(k, avoid), rng.choice(NEED), vague(task, rng)
         else:
             need, loose = rng.choice(NEED), vague(task, rng)
             wrong = others(k, avoid, loose)
         turns += [("assistant", need, None, [call("lookup", query=loose)]), ("tool", store(wrong)),
-                  ("assistant", missed(wrong, rng.choice(MISS)), None, [call("lookup", query=query)]), ("tool", store(shown)), final]
+                  ("assistant", pre + missed(wrong, rng.choice(MISS)), None, [call("lookup", query=query)]), ("tool", store(shown)), final]
         return "retry", turns
     turns += [("assistant", rng.choice(NEED), None, [call("lookup", query=query)]), ("tool", store(shown)), final]
     return "lookup", turns
@@ -330,6 +350,11 @@ def main() -> None:
     ap.add_argument("--near", type=float, default=0.0, help="share of the extra cards that are the nearest by words, not random")
     ap.add_argument("--cite", action="store_true", help="the reasoning quotes the caption of the chosen example")
     ap.add_argument("--weigh", action="store_true", help="the reasoning says what each returned card is for before choosing")
+    ap.add_argument("--ranked", action="store_true",
+                    help="the cards come back as from a ranked router (the fitting one last in 7 of 10), a choice among "
+                         "several always opens the same way, fewer first queries miss, NONE also with the cards in the user turn")
+    ap.add_argument("--need", action="store_true",
+                    help="after a tool response the reasoning first says what is needed, in the words of a card's caption")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     recs = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
@@ -351,7 +376,7 @@ def main() -> None:
             gzip.open(args.out + ".val.jsonl.gz", "wt", encoding="utf-8") as fv:
         for r in recs:
             try:
-                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh)
+                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need)
                 direct = mode == "direct"
                 text = render(None if direct else SYSTEM, None if direct else TOOLS, turns)
             except Exception as e:
