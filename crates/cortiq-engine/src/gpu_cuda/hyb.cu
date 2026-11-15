@@ -103,7 +103,34 @@ struct HyJob {
     int ystride;
     int xoff;  // elements into the input planes this job's rows start at (a MoE slot's own input)
     int nr;    // > 0: this job's input rows (fewer than the launch's), a grouped expert's
+    float lim; // a gate/up pair's clamp (Ripple's SwiGLU limit), 0 = none
+    int pad0, pad1, pad2;
 };
+
+// Ripple's value residual: lerp(e0, xn, blend) of every row into V's input
+// planes, in the form the host's `vres_lerp` and wgpu's kernel take.
+extern "C" __global__ void hy_vres(const float* __restrict__ xn, const float* __restrict__ e0, float blend, int n,
+                                   int hidden, u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2,
+                                   int pstride)
+{
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)n * hidden) return;
+    const int j = (int)(i / hidden), c = (int)(i % hidden);
+    const float e = e0[i], x = xn[i];
+    const float v = blend < 0.5f ? __fadd_rn(e, __fmul_rn(blend, __fsub_rn(x, e))) : __fsub_rn(x, __fmul_rn(__fsub_rn(x, e), __fsub_rn(1.0f, blend)));
+    put3(p0, p1, p2, (size_t)j * pstride + c, v);
+}
+
+// The prompt path's value residual: lerp(e0, x, blend) of every row as the
+// f16 rows V's GEMM reads.
+extern "C" __global__ void hy_vres_half(const float* __restrict__ x, const float* __restrict__ e0, float blend, u64 total,
+                                        u16* __restrict__ out)
+{
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const float e = e0[i], v = x[i];
+    out[i] = f2h_sat(blend < 0.5f ? __fadd_rn(e, __fmul_rn(blend, __fsub_rn(v, e))) : __fsub_rn(v, __fmul_rn(__fsub_rn(v, e), __fsub_rn(1.0f, blend))));
+}
 
 // RMS norm of every row of x [B][n] into f32 or f16 (a block of 256 threads
 // a row): the very arithmetic `mv_multi` folds into its staging.
@@ -986,6 +1013,11 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 g = __fadd_rn(g, part[k][b][t][ln][0]);
                 u = __fadd_rn(u, part[k][b][t][ln][1]);
             }
+            // Ripple's clamped SwiGLU: the gate from above, up on both sides
+            if (jb.lim > 0.0f) {
+                g = fminf(g, jb.lim);
+                u = fminf(fmaxf(u, -jb.lim), jb.lim);
+            }
             // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU), else SwiGLU
             const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
             const float v = __fmul_rn(act, u);
@@ -1520,7 +1552,8 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int str
 // The prompt path's FFN middle from a gate/up pair GEMM: y [B][2 inter] in
 // the pair's row order (tile t: 8 gate rows, then the same 8 up rows) into
 // f16 xh [B][inter] = silu(gate) * up / 16.
-extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B, int act)
+extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B, int act,
+                                             float lim)
 {
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)B * inter) return;
@@ -1528,7 +1561,12 @@ extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* _
     const int r = (int)(i - b * inter);
     const float* yr = y + b * 2 * inter;
     const int base = (r >> 3) * 16 + (r & 7);
-    const float g = yr[base], u = yr[base + 8];
+    float g = yr[base], u = yr[base + 8];
+    // Ripple's clamped SwiGLU: the gate from above, up on both sides
+    if (lim > 0.0f) {
+        g = fminf(g, lim);
+        u = fminf(fmaxf(u, -lim), lim);
+    }
     // act 1: tanh GELU, 2: erf GELU, else SiLU
     const float a = act == 1 ? gelu_t(g) : act == 2 ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
     xh[i] = f2h_sat(__fmul_rn(a, u) * 0.0625f);

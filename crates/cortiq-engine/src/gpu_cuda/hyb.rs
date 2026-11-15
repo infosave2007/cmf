@@ -144,6 +144,10 @@ struct HyJob {
     xoff: i32,
     /// > 0: this job's input rows, fewer than the launch's (a grouped expert's).
     nr: i32,
+    /// A gate/up pair's clamp (Ripple's SwiGLU limit): the gate cut from
+    /// above and the up branch on both sides before the product; 0 = none.
+    lim: f32,
+    pad: [i32; 3],
 }
 
 pub(super) struct HFuncs {
@@ -178,6 +182,10 @@ pub(super) struct HFuncs {
     dash_route: cs::CUfunction,
     dash_close: cs::CUfunction,
     dash_attend: cs::CUfunction,
+    /// Ripple's value residual into V's planes.
+    vres: cs::CUfunction,
+    /// The same as the prompt path's f16 rows.
+    vres_half: cs::CUfunction,
     kda_gates: cs::CUfunction,
     kda_scan4: cs::CUfunction,
     mla_lat: cs::CUfunction,
@@ -291,6 +299,8 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         dash_route: func(module, "hy_dash_route")?,
         dash_close: func(module, "hy_dash_close")?,
         dash_attend: func(module, "hy_dash_attend")?,
+        vres: func(module, "hy_vres")?,
+        vres_half: func(module, "hy_vres_half")?,
         kda_gates: func(module, "hy_kda_gates")?,
         kda_scan4: func(module, "hy_kda_scan4")?,
         mla_lat: func(module, "hy_mla_lat")?,
@@ -576,11 +586,11 @@ fn blr_chain(jobs: &[JobSpec], kind: i32) -> Res<BlrChain> {
     }
     let t = Buf::new(NMAX * tw * 4 + 64)?;
     let v_list: Vec<JobSpec> = vl.iter().map(|(m, at)| (&**m, t.ptr + (*at * 4) as u64, 0u64, tw, m.rows)).collect();
-    let v_set = mmaset_core(&v_list, 6, Some(&vx))?;
+    let v_set = mmaset_core(&v_list, 6, Some(&vx), 0.0)?;
     let mut u_sets = Vec::with_capacity(devs.len());
     for (k, (d, &(_, y, res, ystride, rows))) in devs.iter().zip(jobs).enumerate() {
         let u = &*d.u;
-        u_sets.push((mmaset_core(&[(u, y, res, ystride, rows.min(u.rows))], kind, Some(&[lat_at[k] as i32]))?, u.cols));
+        u_sets.push((mmaset_core(&[(u, y, res, ystride, rows.min(u.rows))], kind, Some(&[lat_at[k] as i32]), 0.0)?, u.cols));
     }
     let plane = || Buf::new(NMAX * tw * 2 + 64);
     let zplane = || Buf::new(NMAX * slot * din * 2 + 64);
@@ -619,18 +629,26 @@ fn mmaset_pair(m: &DevMat, p0: u64, p1: u64, pstride: usize) -> Res<MmaSet> {
 }
 
 fn mmaset_kind(list: &[JobSpec], kind: i32) -> Res<MmaSet> {
+    mmaset_kind_lim(list, kind, 0.0)
+}
+
+/// [`mmaset_kind`] whose gate/up pairs clamp at `lim` (0: none).
+fn mmaset_kind_lim(list: &[JobSpec], kind: i32, lim: f32) -> Res<MmaSet> {
     let t = std::time::Instant::now();
-    let r = mmaset_kind_(list, kind);
+    let r = mmaset_kind_(list, kind, lim);
     SETS_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     r
 }
 
-fn mmaset_kind_(all: &[JobSpec], kind: i32) -> Res<MmaSet> {
+fn mmaset_kind_(all: &[JobSpec], kind: i32, lim: f32) -> Res<MmaSet> {
     // `blr` matrices run as their own chain of binary tile launches
     let blr_jobs: Vec<JobSpec> = all.iter().filter(|(m, ..)| matches!(m.kind, 11 | 12)).copied().collect();
     let list: Vec<JobSpec> = all.iter().filter(|(m, ..)| !matches!(m.kind, 11 | 12)).copied().collect();
-    let mut set = mmaset_core(&list, kind, None)?;
+    let mut set = mmaset_core(&list, kind, None, lim)?;
     if !blr_jobs.is_empty() {
+        if lim > 0.0 {
+            return Err("a clamped gate/up pair over blr matrices".into());
+        }
         set.blr = Some(Box::new(blr_chain(&blr_jobs, kind)?));
     }
     Ok(set)
@@ -638,7 +656,7 @@ fn mmaset_kind_(all: &[JobSpec], kind: i32) -> Res<MmaSet> {
 
 /// The tile jobs of `list`; `xoffs`: each job's offset into the input
 /// planes (a blr chain's slots), else 0 (or the prescaled region).
-fn mmaset_core(list: &[JobSpec], kind: i32, xoffs: Option<&[i32]>) -> Res<MmaSet> {
+fn mmaset_core(list: &[JobSpec], kind: i32, xoffs: Option<&[i32]>, lim: f32) -> Res<MmaSet> {
     if list.iter().any(|(m, ..)| !matches!(m.kind, 1 | 2 | 3 | 5 | 6 | 9 | 10 | 15) || m.cols % 32 != 0) {
         return Err("a tensor-core job over a matrix that is not repacked (q4tp, q2tp, int8, q1 or ternary tiles)".into());
     }
@@ -682,6 +700,8 @@ fn mmaset_core(list: &[JobSpec], kind: i32, xoffs: Option<&[i32]>) -> Res<MmaSet
                 ystride: ystride as i32,
                 xoff: pre.as_ref().map_or_else(|| xoffs.map_or(0, |x| x[i]), |p| p.ents[i].3 as i32),
                 nr: 0,
+                lim,
+                pad: [0; 3],
             });
             blk += rows.div_ceil(16).div_ceil(tb) as u32;
         }
@@ -982,6 +1002,104 @@ thread_local! {
     /// come out of it while it has room, so the card's rounding of each
     /// allocation (to 2 MiB) costs once instead of once a matrix.
     static ARENA: std::cell::Cell<(u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    /// The build's overflow in mapped host memory (its device address,
+    /// capacity, used): what the card has no room for, routed experts first.
+    /// The kernels read it over the bus.
+    static ARENA_HOST: std::cell::Cell<(u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    /// What the routed experts may still take of the device arena.
+    static ARENA_EXP_DEV: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// A routed expert's matrices are being built.
+    static EXPERT_MAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mapped, pinned host memory (`cuMemHostAlloc`, PORTABLE | DEVICEMAP): a
+/// plan's weights past the card's room, read by the kernels over the bus.
+pub(super) struct HostArena {
+    host: *mut std::ffi::c_void,
+    dev: u64,
+    len: usize,
+}
+
+// SAFETY: the block is owned by the state and freed once, on drop.
+unsafe impl Send for HostArena {}
+unsafe impl Sync for HostArena {}
+
+impl HostArena {
+    fn new(len: usize) -> Res<Self> {
+        let host = unsafe { cu::malloc_host(len, 0x01 | 0x02) }.map_err(|e| format!("mapped host memory of {len} bytes: {e:?}"))?;
+        let mut dev: cs::CUdeviceptr = 0;
+        // SAFETY: `host` came from cuMemHostAlloc with DEVICEMAP
+        let rc = unsafe { cs::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
+        if rc != cs::cudaError_enum::CUDA_SUCCESS || dev == 0 {
+            let _ = unsafe { cu::free_host(host) };
+            return Err(format!("mapped host memory: no device address ({rc:?})"));
+        }
+        Ok(Self { host, dev, len })
+    }
+
+    fn holds(&self, ptr: u64) -> bool {
+        ptr >= self.dev && ptr < self.dev + self.len as u64
+    }
+}
+
+/// Host memory a pinned overflow may take: the container's limit less what it
+/// uses (cgroup v2 or v1), and the host's MemAvailable, the smaller. Pinned
+/// pages count against the limit and cannot be reclaimed, so a spill past it
+/// would end in the OOM killer instead of a declined plan.
+fn host_room() -> usize {
+    let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    // the file cache in the usage (the model's own mapped pages among it) gives way
+    let cache = |p: &str, keys: &[&str]| -> u64 {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| keys.iter().find_map(|k| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))))
+            .unwrap_or(0)
+    };
+    let mut room = u64::MAX;
+    for (lim, used, stat, keys) in [
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", &["file "][..]),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            "/sys/fs/cgroup/memory/memory.stat",
+            &["total_cache ", "cache "][..],
+        ),
+    ] {
+        if let (Some(l), Some(u)) = (read(lim), read(used)) {
+            if l < (1 << 60) {
+                room = room.min(l.saturating_sub(u.saturating_sub(cache(stat, keys))));
+            }
+        }
+    }
+    if let Ok(mi) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(kb) = mi.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()) {
+            room = room.min(kb << 10);
+        }
+    }
+    room.min(usize::MAX as u64) as usize
+}
+
+/// The card memory a matrix takes: none when it lives in a plan's mapped
+/// host arena (the budget gates count the card).
+fn card_held(st: &State, w: u64, held: u64) -> u64 {
+    if st.hyb.host_arenas.iter().any(|h| h.holds(w)) { 0 } else { held }
+}
+
+impl Drop for HostArena {
+    fn drop(&mut self) {
+        let _ = unsafe { cu::free_host(self.host) };
+    }
+}
+
+fn arena_take(a: &'static std::thread::LocalKey<std::cell::Cell<(u64, usize, usize)>>, bytes: usize) -> Option<Buf> {
+    a.with(|a| {
+        let (p, cap, used) = a.get();
+        if p == 0 || used + bytes > cap {
+            return None;
+        }
+        a.set((p, cap, used + bytes.next_multiple_of(256)));
+        Some(Buf { ptr: p + used as u64, bytes, owned: false, slab: None })
+    })
 }
 
 /// The bytes `mat_planes` takes for a rows x cols q4tp matrix.
@@ -992,15 +1110,24 @@ fn planes_bytes(rows: usize, cols: usize) -> usize {
     (lad_at + rows * 8 + 64).next_multiple_of(256)
 }
 
+/// A plan build's arena is open: it was sized against the card's free memory
+/// (the overflow in mapped host memory), so the per-matrix budget gates stand aside.
+fn arena_active() -> bool {
+    ARENA.with(|a| a.get().1 > 0) || ARENA_HOST.with(|a| a.get().1 > 0)
+}
+
 fn arena_view(bytes: usize) -> Option<Buf> {
-    ARENA.with(|a| {
-        let (p, cap, used) = a.get();
-        if p == 0 || used + bytes > cap {
-            return None;
+    let b = bytes.next_multiple_of(256);
+    let expert = EXPERT_MAT.with(|e| e.get());
+    if !expert || ARENA_EXP_DEV.with(|x| x.get()) >= b {
+        if let Some(v) = arena_take(&ARENA, bytes) {
+            if expert {
+                ARENA_EXP_DEV.with(|x| x.set(x.get().saturating_sub(b)));
+            }
+            return Some(v);
         }
-        a.set((p, cap, used + bytes.next_multiple_of(256)));
-        Some(Buf { ptr: p + used as u64, bytes, owned: false, slab: None })
-    })
+    }
+    arena_take(&ARENA_HOST, bytes)
 }
 
 /// A repacked matrix's three planes (tiles, rung codes, ladders) in one
@@ -1401,7 +1528,7 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     let bytes = model.entry_bytes(entry);
     let budget = super::vram_budget();
     let held = c.resident.load(Ordering::Relaxed);
-    if held + bytes.len() as u64 > budget {
+    if !arena_active() && held + bytes.len() as u64 > budget {
         return Err(format!(
             "weights do not fit the card ({:.1} GB held, budget {:.1} GB)",
             held as f64 / 1e9,
@@ -1431,7 +1558,7 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
         DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 }
     };
     REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    c.resident.fetch_add(m.held, Ordering::Relaxed);
+    c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
     let m = Arc::new(m);
     st.hyb.mats.insert(key, m.clone());
     Ok(m)
@@ -1453,7 +1580,7 @@ fn blr_mat(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize, rows: usi
     let bytes = model.entry_bytes(entry);
     // the tiles take 1.5 bits a sign (a group's f16 scale)
     let held = c.resident.load(Ordering::Relaxed);
-    if held + (bytes.len() as u64) * 3 / 2 > super::vram_budget() {
+    if !arena_active() && held + (bytes.len() as u64) * 3 / 2 > super::vram_budget() {
         return Err("weights do not fit the card".into());
     }
     let t0 = std::time::Instant::now();
@@ -1490,7 +1617,7 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
             }
         }
         let (gb, ub) = (model.entry_bytes(ge), model.entry_bytes(ue));
-        if c.resident.load(Ordering::Relaxed) + (gb.len() + ub.len()) as u64 * 2 > super::vram_budget() {
+        if !arena_active() && c.resident.load(Ordering::Relaxed) + (gb.len() + ub.len()) as u64 * 2 > super::vram_budget() {
             return Err("weights do not fit the card".into());
         }
         let t0 = std::time::Instant::now();
@@ -1524,7 +1651,7 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     let t0 = std::time::Instant::now();
     let (gb, ub) = (model.entry_bytes(ge), model.entry_bytes(ue));
     let held = c.resident.load(Ordering::Relaxed);
-    if held + (gb.len() + ub.len()) as u64 > super::vram_budget() {
+    if !arena_active() && held + (gb.len() + ub.len()) as u64 > super::vram_budget() {
         return Err("weights do not fit the card".into());
     }
     // the pair's rows straight from the two payloads, on the card
@@ -1556,7 +1683,7 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
         DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: (gb.len() + ub.len()) as u64 }
     };
     REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    c.resident.fetch_add(m.held, Ordering::Relaxed);
+    c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
     let m = Arc::new(m);
     st.hyb.pairs.insert(key, m.clone());
     Ok(m)
@@ -1633,6 +1760,9 @@ struct AttnL {
     dash: Option<DashL>,
     /// MLA's latent projections (`k` holds kv_a, `v` kv_b).
     mla: Option<MlaL>,
+    /// Ripple's value residual: the blend, and V alone over the planes of
+    /// `lerp(e0, normed, blend)` (`ms_in` then holds Q and K).
+    vres: Option<(f32, MmaSet)>,
 }
 
 /// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
@@ -1803,6 +1933,8 @@ struct HLayer {
     /// GeGLU (tanh GELU, the Gemma family) instead of SwiGLU
     /// The pair's activation: 0 SiLU, 1 tanh GELU, 2 erf GELU.
     gelu: u8,
+    /// The pair's clamp (Ripple's SwiGLU limit), 0 = none.
+    lim: f32,
     ms_gu: MmaSet,
     /// into the stream, or (a routed FFN) the shared expert's output rows
     ms_dn: MmaSet,
@@ -1892,6 +2024,9 @@ pub(super) struct HPlan {
     /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
     mhc: Option<MhcPlan>,
     dash: Option<DashBufs>,
+    /// Ripple's value residual: the call's embedding rows `[NMAX][hidden]`
+    /// and V's input planes.
+    vres: Option<(Buf, [Buf; 3])>,
     kda: Option<KdaBufs>,
     mla: Option<MlaBufs>,
     /// A Looped Transformer: the layers after which the final norm is applied
@@ -1997,6 +2132,8 @@ pub(super) struct HState {
     chain: Option<ChainRes>,
     /// Plan builds' weight arenas (the matrices in them are views).
     arenas: Vec<Buf>,
+    /// Their overflow in mapped host memory.
+    host_arenas: Vec<HostArena>,
     /// The chain's eh_proj job tables by (plan, tensor): their output is
     /// that plan's `h`.
     chain_sets: HashMap<(u64, usize), MmaSet>,
@@ -2316,7 +2453,8 @@ fn build(
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
                         && g.sink.is_none_or(|s| s.len() == nh)
                         && g.dash.as_ref().is_none_or(|d| dash_admits(d, hidden, g.hd, g.rd) && g.window.is_none() && g.sink.is_none())
-                        && g.vres.is_none()
+                        // Ripple's value residual: the call's embedding rows, a row a position
+                        && g.vres.is_none_or(|(_, e0)| !e0.is_empty() && e0.len() % hidden == 0 && g.dash.is_none())
                         && g.invf.len() >= g.rd / 2
                         && invf.len() >= rd / 2
                         // a DASH layer rotates by its rows' own angles (the call's table)
@@ -2367,7 +2505,7 @@ fn build(
         }
         match &l.ffn {
             GraphFfn::Dense { gate, act, limit, hot, .. } => {
-                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || *limit != 0.0 || hot.is_some() {
+                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || !(*limit == 0.0 || (*limit > 0.0 && *act == GraphAct::Silu)) || hot.is_some() {
                     return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
@@ -2488,7 +2626,12 @@ fn build(
             && matches!(model.tensors.get(w.idx).map(|e| e.dtype), Some(cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row))
     };
     let mut need = 0usize;
+    let mut need_exp = 0usize;
     for l in layers {
+        let routed = match &l.ffn {
+            GraphFfn::Moe { n_exp, .. } => *n_exp,
+            _ => 0,
+        };
         let ffn: Vec<(usize, usize, usize, usize)> = match &l.ffn {
             GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } if (q6(gw) && q6(uw) && q6(dw)) || (is1(gw) && is1(uw) && is1(dw)) || (is2(gw) && is2(uw) && is2(dw)) => {
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
@@ -2515,12 +2658,17 @@ fn build(
             Some(cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row) => i8_layout(rows, cols, 2).2,
             _ => planes_bytes(rows, cols),
         };
-        for (g, u, d, inter) in ffn {
+        for (i, (g, u, d, inter)) in ffn.into_iter().enumerate() {
+            let mut b = 0;
             if !st.hyb.pairs.contains_key(&(uid, g, u)) {
-                need += sized(g, 2 * inter, hidden);
+                b += sized(g, 2 * inter, hidden);
             }
             if !st.hyb.mats.contains_key(&(uid, d)) {
-                need += sized(d, hidden, inter);
+                b += sized(d, hidden, inter);
+            }
+            need += b;
+            if i < routed {
+                need_exp += b;
             }
         }
         let mut one = |w: &GraphW, rows: usize, cols: usize| {
@@ -2566,14 +2714,56 @@ fn build(
         }
     }
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
-        let a = Buf::new(need)?;
-        ARENA.with(|x| x.set((a.ptr, need, 0)));
-        st.hyb.arenas.push(a);
+        // The card keeps a reserve for the K/V mirrors, the rows, cuBLAS and
+        // the repack's staging (`CMF_HYB_RESERVE_MB`, 3 GiB); weights past
+        // that go to mapped host memory, routed experts first, the dense
+        // matrices and the attention staying on the card.
+        let free = cu::mem_get_info().map(|(f, _)| f).unwrap_or(0);
+        let mut reserve = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3072) << 20;
+        // a plan without the head (the prompt's) leaves room for it: the
+        // token plan, built after, puts it on the card
+        if lm.is_none() {
+            reserve += ["lm_head.weight", "model.embed_tokens.weight"]
+                .iter()
+                .find_map(|n| model.tensor(n))
+                .map_or(0, |e| model.entry_bytes(e).len() * 11 / 10);
+        }
+        let dev_cap = need.min(free.saturating_sub(reserve));
+        if dev_cap > 0 {
+            let a = Buf::new(dev_cap)?;
+            ARENA.with(|x| x.set((a.ptr, dev_cap, 0)));
+            st.hyb.arenas.push(a);
+        }
+        if dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0") {
+            let host_cap = need - dev_cap + (64 << 20);
+            // page cache counts in the container's usage but gives way; keep
+            // a quarter of the room for it and the process
+            let room = host_room();
+            if host_cap > room / 4 * 3 {
+                return Err(format!(
+                    "{:.1} GB of weights past the card, {:.1} GB of host memory to pin them in",
+                    (need - dev_cap) as f64 / 1e9,
+                    room as f64 / 1e9
+                ));
+            }
+            let h = HostArena::new(host_cap)?;
+            ARENA_HOST.with(|x| x.set((h.dev, host_cap, 0)));
+            st.hyb.host_arenas.push(h);
+            ARENA_EXP_DEV.with(|x| x.set(dev_cap.saturating_sub(need - need_exp)));
+            tracing::info!(
+                "cuda hybrid: {:.1} GB of a plan's weights on the card, {:.1} GB (routed experts first) in mapped host memory",
+                dev_cap as f64 / 1e9,
+                (need - dev_cap) as f64 / 1e9
+            );
+        }
     }
     struct ArenaEnd;
     impl Drop for ArenaEnd {
         fn drop(&mut self) {
             ARENA.with(|x| x.set((0, 0, 0)));
+            ARENA_HOST.with(|x| x.set((0, 0, 0)));
+            ARENA_EXP_DEV.with(|x| x.set(usize::MAX));
+            EXPERT_MAT.with(|x| x.set(false));
         }
     }
     let _arena_end = ArenaEnd;
@@ -2606,15 +2796,24 @@ fn build(
                     ystride: 0,
                     xoff: 0,
                     nr: 0,
+                    lim: 0.0,
+                    pad: [0; 3],
                 };
-                for &(g, u, d) in &experts[..e] {
-                    let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
-                    let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
-                    gu_t.push(job(&pm, 2 * inter, pm.kind as i32 | 0x100));
-                    dn_t.push(job(&dmx, hidden, dmx.kind as i32));
-                    mats.push(pm);
-                    mats.push(dmx);
-                }
+                // routed experts take the card's room after the dense matrices
+                EXPERT_MAT.with(|x| x.set(true));
+                let built = (|| -> Res<()> {
+                    for &(g, u, d) in &experts[..e] {
+                        let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
+                        let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
+                        gu_t.push(job(&pm, 2 * inter, pm.kind as i32 | 0x100));
+                        dn_t.push(job(&dmx, hidden, dmx.kind as i32));
+                        mats.push(pm);
+                        mats.push(dmx);
+                    }
+                    Ok(())
+                })();
+                EXPERT_MAT.with(|x| x.set(false));
+                built?;
                 // the shared expert: the last entry, one of its own width, or
                 // none (the first routed expert then stands in, never launched)
                 let shared = *has_shared || detached_shared.is_some();
@@ -2817,11 +3016,21 @@ fn build(
                     }
                     None => None,
                 };
-                let ms_in = mmaset(&[
-                    (&qm, q.ptr, 0, qrow, qr),
-                    (&km, k.ptr, 0, nkv * hd, nkv * hd),
-                    (&vm, v.ptr, 0, nkv * hd, nkv * hd),
-                ])?;
+                let vres_l = geom.as_ref().and_then(|g| g.vres).map(|(b, _)| b);
+                let (ms_in, vres) = match vres_l {
+                    Some(blend) => (
+                        mmaset(&[(&qm, q.ptr, 0, qrow, qr), (&km, k.ptr, 0, nkv * hd, nkv * hd)])?,
+                        Some((blend, mmaset(&[(&vm, v.ptr, 0, nkv * hd, nkv * hd)])?)),
+                    ),
+                    None => (
+                        mmaset(&[
+                            (&qm, q.ptr, 0, qrow, qr),
+                            (&km, k.ptr, 0, nkv * hd, nkv * hd),
+                            (&vm, v.ptr, 0, nkv * hd, nkv * hd),
+                        ])?,
+                        None,
+                    ),
+                };
                 // a sandwich norm or the mHC streams take the product apart from the stream
                 let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
                     true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
@@ -2847,7 +3056,7 @@ fn build(
                     }
                     None => None,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres })
             }
             GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
                 let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
@@ -2959,6 +3168,7 @@ fn build(
                     fx: lfx,
                     ms_in,
                     ms_out,
+                    vres: None,
                     dash: None,
                     mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale }),
                 })
@@ -2983,7 +3193,11 @@ fn build(
             GraphFfn::Dense { act: GraphAct::GeluErf, .. } => 2u8,
             _ => 0u8,
         };
-        let ms_gu = mmaset_kind(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400][gelu as usize])?;
+        let lim = match &l.ffn {
+            GraphFfn::Dense { limit, .. } => *limit,
+            _ => 0.0,
+        };
+        let ms_gu = mmaset_kind_lim(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400][gelu as usize], lim)?;
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
@@ -3018,7 +3232,7 @@ fn build(
             }
             None => None,
         };
-        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, ms_gu, ms_dn, moe, mhc, attn_out, ffn_out, layer_scale: l.layer_scale });
+        out.push(HLayer { mix, gu: gum, down: dm, in_norm, post_norm, inter, gelu, lim, ms_gu, ms_dn, moe, mhc, attn_out, ffn_out, layer_scale: l.layer_scale });
     }
     let loop_w = if loop_norm.is_empty() {
         None
@@ -3077,6 +3291,7 @@ fn build(
     // every attention layer's call record (MLA's included)
     let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. } | GraphAttn::Mla { .. })).count();
     let has_dash = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.dash.is_some()));
+    let has_vres = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.vres.is_some()));
     Ok(HPlan {
         id: PLAN_ID.fetch_add(1, Ordering::Relaxed),
         ci: Buf::new(n_attn.max(1) * 8 * 4)?,
@@ -3098,6 +3313,11 @@ fn build(
         },
         kda: kda_bufs,
         mla: mla_bufs,
+        vres: if has_vres {
+            Some((f4(NMAX * hidden)?, [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?]))
+        } else {
+            None
+        },
         dash: if has_dash {
             let cand = DASH_ROWS * DASH_BLOCKS;
             Some(DashBufs {
@@ -4057,6 +4277,12 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 let nul16 = 0u64;
                 unsafe {
                     a.ms_in.run(c, fx, planes, hidden, n)?;
+                    if let (Some((blend, ms_v)), Some((e0, vp))) = (&a.vres, &plan.vres) {
+                        let tot = (n * hidden) as u64;
+                        c.launch(fx.vres, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.xn.ptr, e0.ptr, *blend, n_i, hid_i, vp[0].ptr, vp[1].ptr, vp[2].ptr, ps_i))?;
+                        let vpl = Planes { p0: vp[0].ptr, p1: vp[1].ptr, p2: vp[2].ptr, stride: plan.pstride };
+                        ms_v.run(c, fx, &vpl, hidden, n)?;
+                    }
                     hst(c, 4, &mut t0)?;
                     if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
                         // MLA: the latent's norm into its planes, kv_b over it, the
@@ -4493,6 +4719,33 @@ thread_local! {
 /// their rotation table (sin and cos of the rows' angles, `hy_qk`'s rows) and
 /// the record (first position, the router's block count). Synchronous: the
 /// lists are the caller's.
+/// The call's embedding rows of Ripple's value residual, if a layer has one.
+fn vres_rows<'a>(layers: &'a [GraphLayer<'a>]) -> Option<&'a [f32]> {
+    layers.iter().find_map(|l| match &l.attn {
+        GraphAttn::Full { geom: Some(g), .. } => g.vres.map(|v| v.1),
+        _ => None,
+    })
+}
+
+/// Ripple's value residual: rows `r0..r0 + n` of the call's embedding rows
+/// into `plan.vres` before the launches that read them.
+fn vres_upload(c: &Ctx, plan: &HPlan, layers: &[GraphLayer], r0: usize, n: usize) -> Res<()> {
+    let Some((e0, _)) = &plan.vres else { return Ok(()) };
+    let rows = layers
+        .iter()
+        .find_map(|l| match &l.attn {
+            GraphAttn::Full { geom: Some(g), .. } => g.vres.map(|v| v.1),
+            _ => None,
+        })
+        .ok_or("value-residual layers without their embedding rows")?;
+    let h = plan.hidden;
+    if n == 0 || n > NMAX || rows.len() < (r0 + n) * h {
+        return Err(format!("value residual: {} embedding values for rows {r0}..{}", rows.len(), r0 + n));
+    }
+    // on the stream: an earlier chunk's launches may still read the buffer
+    unsafe { cu::memcpy_htod_async(e0.ptr, &rows[r0 * h..(r0 + n) * h], c.stream).map_err(derr) }
+}
+
 fn dash_upload(plan: &HPlan, layers: &[GraphLayer], pos: usize, r0: usize, n: usize) -> Res<()> {
     let Some(db) = &plan.dash else { return Ok(()) };
     let d = layers
@@ -4760,6 +5013,7 @@ pub(super) fn token(
             let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
             let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
             dash_upload(&plan, layers, position, 0, 1)?;
+            vres_upload(c, &plan, layers, 0, 1)?;
             let rows = run_small(c, &mut st, &plan, kv_id, layer_base, position, 1, false, plan.lm.is_some(), cap, &sealed, tl)?;
             if taps.is_some() {
                 // a pageable read: the rows are there when it returns
@@ -5169,6 +5423,7 @@ pub(super) fn batch(
                         cu::memcpy_htod_async(plan.tab.ptr, &tab, c.stream).map_err(derr)?;
                     }
                     dash_upload(&plan, layers, pos0, at, n)?;
+                    vres_upload(c, &plan, layers, at, n)?;
                     run_small(c, &mut st, &plan, kv_id, layer_base, pos0 + at, n, false, false, cap, &sealed, &[])?;
                     if !defer {
                         cu::memcpy_dtoh_async(&mut h[at * hidden..(at + n) * hidden], plan.h.ptr, c.stream).map_err(derr)?;
@@ -5188,6 +5443,7 @@ pub(super) fn batch(
                 let taps = tap_slots(c, &mut st, layers.len(), layer_base, hidden)?;
                 let tl = taps.as_ref().map_or(&[][..], |t| &t.0[..]);
                 dash_upload(&plan, layers, pos0, 0, b)?;
+                vres_upload(c, &plan, layers, 0, b)?;
                 let rows = run_small(c, &mut st, &plan, kv_id, layer_base, pos0, b, spec.is_some(), spec.is_some(), cap, &sealed, tl)?;
                 if taps.is_some() {
                     super::taps_put(taps_read(c, tl, b, hidden)?);
@@ -5223,13 +5479,15 @@ pub(super) fn batch(
                 while at < b {
                     let n = SEAL_ROWS.min(b - at);
                     let last = at + n == b;
-                    unsafe { big(c, &mut st, &plan, kv_id, layer_base, &positions[at..at + n], &mut h[at * hidden..(at + n) * hidden], defer && last, &sealed)? };
+                    let e0 = vres_rows(layers).map(|r| &r[at * hidden..(at + n) * hidden]);
+                    unsafe { big(c, &mut st, &plan, kv_id, layer_base, &positions[at..at + n], &mut h[at * hidden..(at + n) * hidden], defer && last, &sealed, e0)? };
                     at += n;
                 }
                 return Ok(());
             }
             dash_upload(&plan, layers, pos0, 0, b)?;
-            unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer, &sealed) }
+            let e0 = vres_rows(layers).map(|r| &r[..b * hidden]);
+            unsafe { big(c, &mut st, &plan, kv_id, layer_base, positions, h, defer, &sealed, e0) }
         }
     };
     match run() {
@@ -5460,6 +5718,7 @@ unsafe fn big(
     h: &mut [f32],
     defer: bool,
     sealed: &[bool],
+    e0: Option<&[f32]>,
 ) -> Res<()> {
     let fx = &plan.fx;
     let b = positions.len();
@@ -5929,6 +6188,26 @@ unsafe fn big(
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
                 let bis = st.scr(c, "hb_is", b * nh * 4)?;
                 mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                // Ripple's value residual: V reads lerp(e0, normed, blend) of the chunk's rows
+                let bxv = match (&a.vres, e0) {
+                    (Some((blend, _)), Some(e0)) => {
+                        if e0.len() != b * hidden {
+                            return Err(format!("value residual: {} embedding values for {b} rows", e0.len()));
+                        }
+                        let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                        let be0 = st.scr(c, "hb_e0", b * hidden * 4)?;
+                        let bxv = st.scr(c, "hb_xv", b * hidden * 2)?;
+                        let tot = (b * hidden) as u64;
+                        unsafe {
+                            cu::memcpy_htod_async(be0, e0, c.stream).map_err(derr)?;
+                            c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+                            c.launch(fx.vres_half, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bx32, be0, *blend, tot, bxv))?;
+                        }
+                        bxv
+                    }
+                    (Some(_), None) => return Err("value-residual layers without their embedding rows".into()),
+                    _ => bxf,
+                };
                 match &a.mla {
                     Some(ml) => {
                         // MLA: the latent and the rope key by one GEMM, the
@@ -5955,7 +6234,7 @@ unsafe fn big(
                     }
                     None => {
                         mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
-                        mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
+                        mul(&a.v, bxv, yv, nkv * hd, 1.0, 0.0)?;
                     }
                 }
                 let hint = st.kv_hint;
@@ -6143,7 +6422,8 @@ unsafe fn big(
             let (in_i, bb_i) = (inter as i32, b as i32);
             unsafe {
                 let act_i = pl.gelu as i32;
-                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i, act_i))?;
+                let lim = pl.lim;
+                c.launch(fx.silu_pair, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bgu, bmh, in_i, bb_i, act_i, lim))?;
             }
             bst(c, 6, tm)?;
             unsafe { prism_rows(c, plan, bmh, bmh, inter, inter, b)? };

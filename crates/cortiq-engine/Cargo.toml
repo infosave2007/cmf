@@ -30,6 +30,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 fancy-regex = { workspace = true }
 unicode-normalization = { workspace = true }
+# Unicode general categories for OmniVoice's duration estimate.
+unicode_categories = "0.1"
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 base64 = { workspace = true }
@@ -99,10 +101,11 @@ libc = "0.2"
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
 
 # The same `ash` wgpu-hal is built on: host-heap buffers for DMA uploads
-# (`gpu_wgpu::host_mem`) need a memory type wgpu does not let one choose.
-# Linux only: measured there (RTX 3090); Windows and Android builds keep
-# the `write_buffer` admissions and do not compile it.
-[target.'cfg(target_os = "linux")'.dependencies]
+# and for expert banks the card has no room for (`gpu_wgpu::host_mem`)
+# need a memory type wgpu does not let one choose. Linux and Windows (the
+# Vulkan drivers expose the same host-visible system-memory types there);
+# Android keeps the `write_buffer` admissions and does not compile it.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]

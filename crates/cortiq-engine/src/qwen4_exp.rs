@@ -3124,13 +3124,31 @@ pub(crate) fn mem_available() -> usize {
         .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
         .unwrap_or(0);
     let mut avail = kb * 1024;
-    // the container's limit minus what it cannot give back (its page cache can be)
-    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|v| v.trim().parse::<usize>().ok());
-    let anon = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
-        .ok()
-        .and_then(|m| m.lines().find(|l| l.starts_with("anon ")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()));
-    if let (Some(max), Some(anon)) = (max, anon) {
-        avail = avail.min(max.saturating_sub(anon));
+    // the container's limit minus what it cannot give back: anonymous memory and
+    // pinned pages (its page cache can be). cgroup v2, else v1 (RunPod: a 503 GB host
+    // under a 46.6 GiB v1 limit, where MemAvailable alone pinned past it into the OOM killer)
+    let stat = |path: &str, keys: &[&str]| -> Option<usize> {
+        let m = std::fs::read_to_string(path).ok()?;
+        let mut sum = None;
+        for k in keys {
+            if let Some(v) = m.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()) {
+                sum = Some(sum.unwrap_or(0) + v);
+            }
+        }
+        sum
+    };
+    let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let limits = [
+        (read("/sys/fs/cgroup/memory.max"), stat("/sys/fs/cgroup/memory.stat", &["anon ", "unevictable "])),
+        (
+            read("/sys/fs/cgroup/memory/memory.limit_in_bytes").filter(|&l| l < (1usize << 60)),
+            stat("/sys/fs/cgroup/memory/memory.stat", &["total_rss ", "total_unevictable "]),
+        ),
+    ];
+    for (max, held) in limits {
+        if let (Some(max), Some(held)) = (max, held) {
+            avail = avail.min(max.saturating_sub(held));
+        }
     }
     avail
 }
@@ -5528,16 +5546,26 @@ fn forward_tokens_device(
                 .unwrap_or(if bank == 0 { usize::MAX } else { (room / bank) as usize });
             let mut lats = Vec::with_capacity(layers.len());
             let mut placed = 0usize;
+            // a bank the card refused moves its layer and every later one to system memory
+            let mut card_full = false;
             for l in layers {
                 let Some(lt) = l.latent.as_ref() else {
                     lats.push(None);
                     continue;
                 };
-                let on_host = placed >= on_card;
+                let on_host = card_full || placed >= on_card;
                 placed += 1;
-                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                let d = match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                    None if !on_host => {
+                        card_full = true;
+                        tracing::warn!("qwen4 device: the card refused layer {}'s latent experts; it and the later layers go to system memory", placed - 1);
+                        q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, true)
+                    }
+                    d => d,
+                };
+                match d {
                     Some(d) => lats.push(Some(d)),
-                    None if on_host => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
+                    None if on_host || card_full => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
                     None => return off(state, "latent experts do not load"),
                 }
             }

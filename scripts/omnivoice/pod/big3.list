@@ -1,0 +1,7 @@
+# the rest on the new build (B=bin/cortiq-fast): the Edge0 pair, GLM, MiniMax, MiMo, Ornith q4tp
+infosave/Edge0-120B-cmf edge0-120b.cmf
+infosave/Edge0-145B-cmf edge0-145b.cmf
+infosave/Ornith-1.5-122B-cmf ornith-1.5-122b-q4tp.cmf
+infosave/GLM-5.3-Flash-cmf glm-5.3-flash-q2tp.cmf
+infosave/MiniMax-M3.1-Flash-cmf minimax-m3.1-flash-q2tp-mix.cmf
+infosave/MiMo-V2.6-Flash-RL-cmf MiMo-V2.6-Flash-RL-q4tp.cmf
