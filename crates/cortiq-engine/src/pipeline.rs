@@ -278,6 +278,15 @@ pub struct Pipeline {
             crate::qwen4_exp::State,
         )>,
     >,
+    /// GLM-5.3-Flash owns four mHC streams plus KDA/DSA state.
+    pub glm5_next: Option<
+        Box<(
+            crate::glm5_next::Globals,
+            Vec<crate::glm5_next::Layer>,
+            crate::glm5_next::Cfg,
+            crate::glm5_next::State,
+        )>,
+    >,
     /// DeepSeek-V4's own speculation stack: three draft modules, each a full
     /// layer, plus a confidence head on the last. Empty when the file has
     /// none, which is the only signal the decode path needs.
@@ -2373,6 +2382,7 @@ impl Pipeline {
             && self.dsv41.is_none()
             && self.dory.is_none()
             && self.qwen4_exp.is_none()
+            && self.glm5_next.is_none()
             && self.weights.layers.iter().all(|lw| {
                 // LFM2/LFM3's short-conv mixer is two projection GEMMs and
                 // an elementwise conv: the host-driven chunk walk starves
@@ -4844,6 +4854,7 @@ impl Pipeline {
             dsv41_vision: None,
             dsv41_prefill: None,
             qwen4_exp: None,
+            glm5_next: None,
             clover: None,
             clover_stats: clover::CloverStats::default(),
             clover_pen: Default::default(),
@@ -5227,6 +5238,7 @@ impl Pipeline {
             && self.dory.is_none()
             && self.dsv41.is_none()
             && self.qwen4_exp.is_none()
+            && self.glm5_next.is_none()
             && std::env::var("CMF_KV_REUSE").as_deref() != Ok("0")
     }
 
@@ -5502,9 +5514,17 @@ impl Pipeline {
                     matches!(&lw.ffn, FfnKind::Moe(m)
                         if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4t().is_some()))
                 });
+            // A file past a discrete card on wgpu keeps banks in system
+            // memory, and a chunk copies each of them to the card once
+            // (`moe_cache::staging`): at 32 rows Ornith-122B q2tp-v2 within
+            // 32 GB copied 43 banks every 32 tokens (512 in 30 s). q8_2f
+            // banks have no system-memory arm.
+            let banked = crate::gpu::wgpu_active()
+                && crate::gpu::discrete()
+                && self.model.as_ref().is_some_and(|m| m.primary_bytes().len() as u64 > crate::gpu::vram_budget());
             return if q82 {
                 128
-            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() {
+            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() || (moe && banked) {
                 256
             } else if moe {
                 32
@@ -7212,6 +7232,24 @@ impl Pipeline {
         // Bounded chunks preserve cancellation responsiveness. Only the
         // prompt's final chunk asks for logits; every earlier head projection
         // would produce 129 280 values that no caller reads.
+        // GLM-5.3-Flash runs its own mHC / KDA / DSA stack a token at a time.
+        while self.glm5_next.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let token_id = input_ids[pos];
+            let want_logits = pos + 1 == input_ids.len();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.glm5_next {
+                crate::glm5_next::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, pos, self.pool.as_deref(), &mut lg, want_logits);
+            }
+            if want_logits {
+                self.graph_logits = Some(lg);
+            }
+            pos += 1;
+            hidden.fill(0.0);
+        }
         while self.qwen4_exp.is_some()
             && mtp.is_none()
             && pos < input_ids.len()
@@ -12516,6 +12554,25 @@ impl Pipeline {
                 pos = ids.len();
             }
         }
+        // Flash-Next class: the prompt in the frames generation reads it in
+        // (`qwen4_exp::forward_tokens`, a chunk a call) — the per-position
+        // walk below read a 4096-token prompt on Vulkan at 46 tok/s where
+        // generation's own prefill took 6.4 s.
+        if task_mask.is_none() && pos == 0 && self.qwen4_exp.is_some() {
+            while pos < ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let end = (pos + crate::qwen4_exp::prefill_chunk()).min(ids.len());
+                let want = end == ids.len();
+                let mut lg = Vec::new();
+                if let Some(b) = &mut self.qwen4_exp {
+                    crate::qwen4_exp::forward_tokens(&b.0, &b.1, &b.2, &mut b.3, &ids[pos..end], pos, &self.inv_freq, self.pool.as_deref(), &mut lg, want);
+                }
+                if want {
+                    self.graph_logits = Some(lg);
+                }
+                pos = end;
+            }
+            hidden = vec![0.0; self.hidden_size];
+        }
         while pos < ids.len() {
             hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
             self.check_forward_graph("forward_ids", pos)?;
@@ -15670,7 +15727,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() {
+        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() || self.glm5_next.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -16478,7 +16535,11 @@ impl Pipeline {
         }
         // CUDA's hybrid prompt path takes plain sandwich norms itself (LFM3's,
         // beside its short convolutions and head gate): its batch arm decides.
+        // So does wgpu's batch graph for the LFM stacks (short convolutions):
+        // their sandwich norms ride its plain tails, as Ripple's do.
+        let lfm = self.short_conv_cfg.is_some() && self.weights.layers.iter().any(|lw| matches!(lw.attn, AttnKind::ShortConv(_)));
         if self.value_blend.is_none()
+            && !lfm
             && !crate::gpu::cuda_active()
             && self
                 .weights
@@ -17064,6 +17125,9 @@ impl Pipeline {
             return Err(
                 "network split: Qwen3.8-Flash-Next hyper/QSA stack is not splittable yet".into(),
             );
+        }
+        if self.glm5_next.is_some() {
+            return Err("network split: GLM-5.3-Flash mHC/KDA/DSA stack is not splittable yet".into());
         }
         if self.per_token_stack() {
             return Err(
@@ -19852,6 +19916,7 @@ impl Pipeline {
             || self.dsv41.is_some()
             || self.dory.is_some()
             || self.qwen4_exp.is_some()
+            || self.glm5_next.is_some()
             || self.per_token_stack()
         {
             return Err(false);
@@ -20506,8 +20571,8 @@ impl Pipeline {
                         attn
                     }
                     // LFM2/3's short convolution: the CUDA hybrid arm's prompt
-                    // path runs it (the wgpu batch graph has no kernels for it)
-                    AttnKind::ShortConv(w) if crate::gpu::cuda_active() => {
+                    // path and the wgpu batch graph (`sconv_batch`) run it
+                    AttnKind::ShortConv(w) => {
                         let cfg = self.short_conv_cfg?;
                         let (m, _, _, _) = bw(&w.in_proj)?;
                         model = Some(m.clone());
@@ -20522,11 +20587,13 @@ impl Pipeline {
                     _ => return None,
                 };
                 // Gemma-4's sandwich norms and layer scalar (`gemma_batch`),
-                // Ripple's sandwich norms (the plain tails), and on CUDA any
-                // plain sandwich norms (LFM3's: the hybrid prompt path's
-                // `sandwich_rows`); every other model hands the graph none.
+                // Ripple's and the LFM stacks' sandwich norms (wgpu's plain
+                // tails), and on CUDA any plain sandwich norms (the hybrid
+                // prompt path's `sandwich_rows`); every other model hands the
+                // graph none.
                 let g4 = self.global_attn.is_some() || self.attn_v_norm;
-                let sandwich = g4 || self.value_blend.is_some() || crate::gpu::cuda_active();
+                let lfm = self.short_conv_cfg.is_some();
+                let sandwich = g4 || self.value_blend.is_some() || lfm || crate::gpu::cuda_active();
                 layers.push(crate::gpu::GraphLayer {
                     mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li)),
                     input_norm: &lw.input_norm,
@@ -21356,6 +21423,7 @@ impl Pipeline {
             || self.dsv41.is_some()
             || self.dory.is_some()
             || self.qwen4_exp.is_some()
+            || self.glm5_next.is_some()
             // Dynamic routing swaps FFN weights mid-sequence under the
             // packed graph; a blend has no single overlay. A STATIC skill
             // (`from_model_with_skill`) is fine: the pack reads the live
@@ -22230,6 +22298,7 @@ impl Pipeline {
                 || (self.dsv4.is_none()
                     && self.dsv41.is_none()
                     && self.qwen4_exp.is_none()
+                    && self.glm5_next.is_none()
                     && !self.per_token_stack())
         );
         // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
@@ -22240,6 +22309,14 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         if !crate::gpu_metal::wait_replay() {
             self.fail_metal_graph("the pending async replay failed before a plain forward");
+            return vec![0.0; self.hidden_size];
+        }
+        if let Some(b) = &mut self.glm5_next {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let mut logits = Vec::new();
+            crate::glm5_next::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, position, self.pool.as_deref(), &mut logits, true);
+            self.graph_logits = Some(logits);
             return vec![0.0; self.hidden_size];
         }
         if let Some(b) = &mut self.qwen4_exp {

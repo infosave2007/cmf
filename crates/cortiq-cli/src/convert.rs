@@ -7733,6 +7733,7 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
             router_resonance: false,
         }),
         qwen4_exp: None,
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         deepseek_v41: None,
@@ -8631,6 +8632,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             latent_dim: None,
             latent_groups: None,
         }),
+        // GLM-5.3 converts on its own branch; the runtime reads the record
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         // Keep the complete original HF object, including the text/vision

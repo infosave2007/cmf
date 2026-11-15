@@ -58,6 +58,7 @@ fn arch(moe: bool) -> ModelArch {
             router_resonance: true,
         }),
         qwen4_exp: None,
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         deepseek_v41: None,

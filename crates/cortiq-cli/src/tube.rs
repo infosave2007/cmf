@@ -2230,6 +2230,7 @@ mod mtp_plan_tests {
                 }),
                 moe: None,
                 qwen4_exp: None,
+                glm5_next: None,
                 block_diffusion: None,
                 dory: None,
                 deepseek_v41: None,

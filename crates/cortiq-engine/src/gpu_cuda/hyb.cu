@@ -1018,9 +1018,12 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 g = fminf(g, jb.lim);
                 u = fminf(fmaxf(u, -jb.lim), jb.lim);
             }
-            // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU), else SwiGLU
-            const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
-            const float v = __fmul_rn(act, u);
+            // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU),
+            // 0x1000: MiniMax M3's SwiGLU-OAI g·σ(1.702 g)·(u + 1), else SwiGLU
+            const bool oai = (jb.kind & 0x1000) != 0;
+            const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g)
+                : __fdiv_rn(g, __fadd_rn(1.0f, expf(oai ? -1.702f * g : -g)));
+            const float v = __fmul_rn(act, oai ? __fadd_rn(u, 1.0f) : u);
             put3(q0, q1, q1, (size_t)j * jb.ystride + r, v);
         }
         return;
@@ -1567,9 +1570,9 @@ extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* _
         g = fminf(g, lim);
         u = fminf(fmaxf(u, -lim), lim);
     }
-    // act 1: tanh GELU, 2: erf GELU, else SiLU
-    const float a = act == 1 ? gelu_t(g) : act == 2 ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
-    xh[i] = f2h_sat(__fmul_rn(a, u) * 0.0625f);
+    // act 1: tanh GELU, 2: erf GELU, 3: SwiGLU-OAI (MiniMax M3), else SiLU
+    const float a = act == 1 ? gelu_t(g) : act == 2 ? gelu_e(g) : __fdiv_rn(g, __fadd_rn(1.0f, expf(act == 3 ? -1.702f * g : -g)));
+    xh[i] = f2h_sat(__fmul_rn(a, act == 3 ? __fadd_rn(u, 1.0f) : u) * 0.0625f);
 }
 
 // ---------------------------------------------------------- repack on card
@@ -3620,6 +3623,19 @@ extern "C" __global__ void hy_mla_lat_h(const float* __restrict__ kva, int strid
     for (int k = 0; k < NW; k++) tot += (double)red[k];
     const float inv = 1.0f / (float)sqrt(tot / (double)lora + (double)eps);
     for (int i = tid; i < lora; i += blockDim.x) out[(size_t)r * lora + i] = f2h_sat(__fmul_rn(__fmul_rn(x[i], inv), w[i]));
+}
+
+// A narrow V (MiMo: 128 of a 192-wide head) widened to the head:
+// dst [n][nkv][hd] = [v | 0] from src [n][nkv][vd], so the mirror, the
+// attend and the CPU cache all see hd-wide rows; the attention's output is
+// cut back to vd (`hy_mla_cut`) for the output product.
+extern "C" __global__ void hy_vpad(const float* __restrict__ src, float* __restrict__ dst, int n, int nkv, int vd, int hd)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * nkv * hd) return;
+    const int d = (int)(i % hd);
+    const size_t th = i / hd;
+    dst[i] = d < vd ? src[th * vd + d] : 0.0f;
 }
 
 // `hy_mla_cut` for the prompt path: f16 attention rows [n][nh][hd] into
