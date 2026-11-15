@@ -5411,8 +5411,15 @@ impl Pipeline {
             return k;
         }
         // Gemma-4 (`g4_batch_prefill`): 128-row chunks, the GEMM tile's
-        // two 64-row halves full.
+        // two 64-row halves full. The CUDA batch graph expands each weight
+        // once a chunk: its own chunk (`CMF_CUDA_BATCH`, 1024) — Ripple-65B
+        // q4tp on an A40, a 4096-token prompt, 141 tok/s at 128 rows, 422 at
+        // 1024.
         if self.g4_batch_prefill() {
+            #[cfg(not(target_os = "macos"))]
+            if let Some(k) = crate::gpu::cuda_batch_rows() {
+                return k;
+            }
             return 128;
         }
         #[cfg(target_os = "macos")]

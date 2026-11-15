@@ -41,6 +41,11 @@ CMF_GPU=cuda cortiq tts omnivoice-q8_2f.cmf "Hello! This voice comes from a sing
 Use cortiq 0.8.99 or later. `CMF_GPU=cuda` needs the NVIDIA driver and the CUDA 12.x libraries; drop it to run on
 Vulkan, `CMF_GPU=0` runs on the CPU.
 
+Listen to this file on CUDA, the release's sampling: [English](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/en.wav) ·
+[Russian, a designed voice](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/ru_design.wav) · [Chinese](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/zh.wav) · [Sichuanese](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/zh_sichuan.wav) ·
+[a laugh tag](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/en_laughter.wav) · [a cloned voice](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/clone.wav) (its reference: [ref](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/clone_reference.wav)) ·
+[a 34 s text in three pieces](https://huggingface.co/infosave/OmniVoice-cmf/resolve/main/samples/long.wav).
+
 ## Three ways to pick a voice
 
 ```bash
@@ -106,11 +111,21 @@ Stand: the fanless Air with the base M4's memory bus; an M4 Pro or Max was not m
 | Russian, voice design | 3.3 s | 9.5 s | 0.7 s | 10.2 s |
 | Chinese | 2.8 s | 8.1 s | 0.6 s | 8.7 s |
 
+## Verify the download
+
+```bash
+sha256sum omnivoice-q8_2f.cmf
+# 696792de99feefe3757ec7626ca5b6bc9c7179f146d5fca39c16ec5791726ddb  (1 173 250 290 bytes)
+```
+
 ## License
 
-The weights are the release's under CC-BY-NC-4.0 (non-commercial, from its training data); see
-[k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice). Do not clone a voice without its owner's consent. The CMF
-format and cortiq are Apache-2.0.
+The OmniVoice weights are the release's under CC-BY-NC-4.0 (non-commercial, from its training data); see
+[k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice). The audio tokenizer is Boson AI's Higgs Audio 2
+tokenizer under the Boson Higgs Audio 2 Community License ([LICENSE-HIGGS-AUDIO-2](LICENSE-HIGGS-AUDIO-2), notices in
+[NOTICE](NOTICE)): Built with Higgs Materials licensed from Boson AI USA, Inc., Copyright Boson AI USA, Inc., All Rights
+Reserved and Meta Llama 3 licensed under the Meta Llama 3 Community License, Copyright Meta Platforms, Inc., All Rights
+Reserved. Do not clone a voice without its owner's consent. The CMF format and cortiq are Apache-2.0.
 
 ## Документация на русском
 
@@ -147,7 +162,10 @@ cortiq tts omnivoice-q8_2f.cmf "Эта фраза звучит клониров�
 по признакам 3,3 с — 2,0 + 1,3 с; 90 слов (3 куска) 33,8 с — 17,9 + 14,2 с. Vulkan на той же карте: 4,5 с речи — 8,6 + 2,0 с.
 Metal, MacBook Air M4 24 ГБ (без вентилятора, базовая шина памяти): 4,5 с речи — 13,1 + 1,2 с.
 
-Лицензия весов — CC-BY-NC-4.0 релиза (некоммерческая). Не клонируйте голос без согласия его владельца.
+Проверка: `sha256sum omnivoice-q8_2f.cmf` → `696792de99feefe3757ec7626ca5b6bc9c7179f146d5fca39c16ec5791726ddb`.
+
+Лицензия весов — CC-BY-NC-4.0 релиза (некоммерческая); аудиотокенизатор — Boson Higgs Audio 2 Community License
+([LICENSE-HIGGS-AUDIO-2](LICENSE-HIGGS-AUDIO-2), [NOTICE](NOTICE)). Не клонируйте голос без согласия его владельца.
 
 ## 中文说明
 
@@ -181,4 +199,7 @@ cortiq tts omnivoice-q8_2f.cmf "这句话用克隆的声音说出。" --lang zh 
 秒语音生成 17.9 秒、解码 14.2 秒。同卡 Vulkan：4.5 秒语音生成 8.6 秒、解码 2.0 秒。Metal（MacBook Air M4 24 GB，无风扇、基础内存带宽）：4.5
 秒语音生成 13.1 秒、解码 1.2 秒。
 
-权重沿用原版的 CC-BY-NC-4.0 许可（非商业）。未经本人同意请勿克隆其声音。
+校验：`sha256sum omnivoice-q8_2f.cmf` → `696792de99feefe3757ec7626ca5b6bc9c7179f146d5fca39c16ec5791726ddb`。
+
+权重沿用原版的 CC-BY-NC-4.0 许可（非商业）；音频分词器采用 Boson Higgs Audio 2 Community License（见 [LICENSE-HIGGS-AUDIO-2](LICENSE-HIGGS-AUDIO-2) 与
+[NOTICE](NOTICE)）。未经本人同意请勿克隆其声音。

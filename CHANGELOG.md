@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Metal) 14.3 s.
 - CUDA hybrid arm: Ripple's value residual (V reads `lerp(e0, normed, blend)`) and clamped SwiGLU, on the token
   and the prompt paths. Ripple-65B q4tp on an A40 decodes at 13.3 tokens/s instead of 0.6–0.9 (Vulkan 13.5) and
-  reads a 4096-token prompt at 146 tokens/s instead of 9.4; the greedy text is Vulkan's.
+  reads a 4096-token prompt at 428 tokens/s instead of 9.4 (Vulkan 172); the greedy text is Vulkan's.
 - CUDA hybrid arm: weights past the card go to mapped host memory, routed experts first, so a MoE larger than
   the card runs on it: a plan's arena takes the card's free memory less a reserve (`CMF_HYB_RESERVE_MB`, 3 GiB,
   plus the head when the plan has none), the rest is pinned and read over the bus (`CMF_HYB_HOST_EXPERTS=0`
@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the OOM killer ended the run. It now reads v1 (`memory.limit_in_bytes` less RSS and unevictable pages) too:
   Edge0-120B on a 46 GB A40 decodes at 52–56 tokens/s (106 after a 4096-token prompt read at 2041 tokens/s),
   Edge0-145B at 18–20 (36 after the prompt at 1208).
+- CUDA: the Gemma-4 / Ripple prompt path took 128-row chunks, tuned for wgpu, and the CUDA batch graph expands every
+  weight once a chunk; it now takes the CUDA chunk (`CMF_CUDA_BATCH`, 1024). A 4096-token prompt on an A40:
+  humanizer-12B (Gemma-4) 778 → 2095 tokens/s with the same greedy text, Ripple-65B 141 → 428.
+- Vulkan: Edge0 (latent experts) panicked with wgpu's "Out of Memory" when a layer's expert bank did not fit the
+  card after all: the allocation is now a refusal, and that layer and the later ones go to system memory.
+  Edge0-120B on a 46 GB A40 decodes at 32.7 tokens/s on Vulkan.
 
 ## [0.8.98] — 2026-11-15
 

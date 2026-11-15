@@ -797,12 +797,21 @@ impl LatDev {
         let host = if on_host { Some(crate::gpu_wgpu::host_mem::sysmem_storage_buffer(&c.device, (ne * slot) as u64)?) } else { None };
         let bank = match &host {
             Some(h) => h.buffer.clone(),
-            None => c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("qwen4-latent-bank"),
-                size: (ne * slot) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
+            None => {
+                // a card fuller than the budget said answers out of memory: a refusal here
+                // (the caller moves the layer to system memory), not wgpu's fatal handler
+                let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("qwen4-latent-bank"),
+                    size: (ne * slot) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                if pollster::block_on(scope.pop()).is_some() {
+                    return None;
+                }
+                b
+            }
         };
         let mut stage = vec![0u8; slot * 32];
         for (c0, chunk) in moe.experts.chunks(32).enumerate() {

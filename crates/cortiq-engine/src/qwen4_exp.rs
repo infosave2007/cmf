@@ -5546,16 +5546,26 @@ fn forward_tokens_device(
                 .unwrap_or(if bank == 0 { usize::MAX } else { (room / bank) as usize });
             let mut lats = Vec::with_capacity(layers.len());
             let mut placed = 0usize;
+            // a bank the card refused moves its layer and every later one to system memory
+            let mut card_full = false;
             for l in layers {
                 let Some(lt) = l.latent.as_ref() else {
                     lats.push(None);
                     continue;
                 };
-                let on_host = placed >= on_card;
+                let on_host = card_full || placed >= on_card;
                 placed += 1;
-                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                let d = match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                    None if !on_host => {
+                        card_full = true;
+                        tracing::warn!("qwen4 device: the card refused layer {}'s latent experts; it and the later layers go to system memory", placed - 1);
+                        q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, true)
+                    }
+                    d => d,
+                };
+                match d {
                     Some(d) => lats.push(Some(d)),
-                    None if on_host => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
+                    None if on_host || card_full => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
                     None => return off(state, "latent experts do not load"),
                 }
             }
