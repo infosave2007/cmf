@@ -20,6 +20,15 @@ with `LD_LIBRARY_PATH` and `ADSP_LIBRARY_PATH` pointing at them.
 reference and times it. Snapdragon 778G (Hexagon V68): 8192x2048 in 1.44 ms,
 relative L2 error 1.2e-3 at alpha 1.2, 2.0e-3 at 2, 8.1e-3 at 8.
 
-Knobs read by the engine: `CMF_NPU=1`, `CMF_NPU_LIB`, `CMF_NPU_QNN`,
+The engine decides per process whether the lane is worth it: the first
+matrix gets a lane, ten fused gate+up calls are timed with the NPU and ten on
+the CPU (alternating, after two warm-up calls each), and the lane stays on
+only when the NPU's median beats the CPU's by `CMF_NPU_MARGIN` (0.92).
+`cortiq_engine::npu::status()` reports the verdict and both medians; an app
+switches the lane with `npu::set_enabled` and points it at its native library
+directory with `npu::set_lib_dir`.
+
+Knobs read by the engine: `CMF_NPU=1` (`0` forces it off), `CMF_NPU_PROBE=0`
+(no trial, always use the NPU), `CMF_NPU_MARGIN`, `CMF_NPU_LIB`, `CMF_NPU_QNN`,
 `CMF_NPU_ALPHA` (0.5), `CMF_NPU_MIN_M` (2: smallest matrix, millions of
 weights), `CMF_NPU_MB` (1024), `CMF_NPU_PROF=1`.

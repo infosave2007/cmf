@@ -28,7 +28,7 @@
 use crate::qtensor::QTensor;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 struct Api {
@@ -37,37 +37,80 @@ struct Api {
     err: unsafe extern "C" fn() -> *const c_char,
 }
 
+static ENABLED: AtomicBool = AtomicBool::new(false);
+/// 0 unknown, 1 use the NPU, 2 the CPU is faster here.
+static VERDICT: AtomicU32 = AtomicU32::new(0);
+static LIB_DIR: Mutex<Option<String>> = Mutex::new(None);
+static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+/// Turn the lane on or off at run time (the app's switch). `CMF_NPU=1` turns
+/// it on too; `CMF_NPU=0` keeps it off whatever the caller asks.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Where `libcortiq_npu.so`, the QNN libraries and the Hexagon skeletons
+/// live (an app's native library directory). Must be called before the first
+/// use; without it the loader's default search path is used.
+pub fn set_lib_dir(dir: &str) {
+    *LIB_DIR.lock().unwrap() = Some(dir.to_string());
+}
+
+fn wanted() -> bool {
+    match std::env::var("CMF_NPU").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => ENABLED.load(Ordering::Relaxed),
+    }
+}
+
+fn fail(why: String) -> Option<Api> {
+    eprintln!("[cortiq] npu: {why}");
+    *LAST_ERROR.lock().unwrap() = why;
+    None
+}
+
 fn api() -> Option<&'static Api> {
+    if !wanted() {
+        return None;
+    }
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
-        if std::env::var("CMF_NPU").as_deref() != Ok("1") {
-            return None;
+        let dir = LIB_DIR.lock().unwrap().clone();
+        let lib = std::env::var("CMF_NPU_LIB").ok().unwrap_or_else(|| match &dir {
+            Some(d) => format!("{d}/libcortiq_npu.so"),
+            None => "libcortiq_npu.so".into(),
+        });
+        if let Some(d) = &dir {
+            // The DSP side loads its skeleton from this list; the vendor
+            // directories stay on it for the device's own libraries.
+            if std::env::var_os("ADSP_LIBRARY_PATH").is_none() {
+                let v = CString::new(format!("{d};/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/system/lib/rfsa/adsp;/dsp")).ok()?;
+                unsafe { libc::setenv(c"ADSP_LIBRARY_PATH".as_ptr(), v.as_ptr(), 1) };
+            }
         }
-        let lib = std::env::var("CMF_NPU_LIB").unwrap_or_else(|_| "libcortiq_npu.so".into());
         let lib_c = CString::new(lib.clone()).ok()?;
         unsafe {
             let h = libc::dlopen(lib_c.as_ptr(), libc::RTLD_NOW);
             if h.is_null() {
                 let e = libc::dlerror();
                 let why = if e.is_null() { String::new() } else { CStr::from_ptr(e).to_string_lossy().into_owned() };
-                eprintln!("[cortiq] npu: cannot load {lib}: {why}");
-                return None;
+                return fail(format!("cannot load {lib}: {why}"));
             }
             let sym = |n: &str| {
                 let c = CString::new(n).unwrap();
                 let p = libc::dlsym(h, c.as_ptr());
                 if p.is_null() { None } else { Some(p) }
             };
-            let init: unsafe extern "C" fn(*const c_char) -> c_int = std::mem::transmute(sym("cq_npu_init")?);
-            let api = Api {
-                add: std::mem::transmute(sym("cq_npu_add")?),
-                run: std::mem::transmute(sym("cq_npu_run")?),
-                err: std::mem::transmute(sym("cq_npu_error")?),
+            let (Some(init), Some(add), Some(run), Some(err)) = (sym("cq_npu_init"), sym("cq_npu_add"), sym("cq_npu_run"), sym("cq_npu_error")) else {
+                return fail(format!("{lib} is not a cortiq-npu shim"));
             };
-            let qnn = std::env::var("CMF_NPU_QNN").ok().and_then(|s| CString::new(s).ok());
+            let init: unsafe extern "C" fn(*const c_char) -> c_int = std::mem::transmute(init);
+            let api = Api { add: std::mem::transmute(add), run: std::mem::transmute(run), err: std::mem::transmute(err) };
+            let qnn = std::env::var("CMF_NPU_QNN").ok().or_else(|| dir.as_ref().map(|d| format!("{d}/libQnnHtp.so")));
+            let qnn = qnn.and_then(|s| CString::new(s).ok());
             if init(qnn.as_ref().map_or(std::ptr::null(), |c| c.as_ptr())) != 0 {
-                eprintln!("[cortiq] npu: init failed: {}", CStr::from_ptr((api.err)()).to_string_lossy());
-                return None;
+                return fail(format!("QNN HTP did not come up: {}", CStr::from_ptr((api.err)()).to_string_lossy()));
             }
             eprintln!("[cortiq] npu: QNN HTP backend up ({lib})");
             Some(api)
@@ -104,11 +147,19 @@ fn env_f32(name: &str, default: f32) -> f32 {
 /// matrix is too small to be worth a call, the budget is spent, or the
 /// backend refused it.
 pub fn lane(t: &QTensor) -> Option<Arc<Lane>> {
+    if VERDICT.load(Ordering::Relaxed) == 2 {
+        return None;
+    }
     let api = api()?;
     let key = t.npu_key()?;
     let mut map = lanes().lock().unwrap();
     if let Some(slot) = map.get(&key) {
         return slot.clone();
+    }
+    // Until the trial has spoken, one matrix is enough to measure with:
+    // every lane costs a graph build and its weights on the DSP.
+    if VERDICT.load(Ordering::Relaxed) == 0 && map.values().any(|s| s.is_some()) {
+        return None;
     }
     let (rows, cols) = (t.rows(), t.cols());
     let min = env_f32("CMF_NPU_MIN_M", 2.0) as u64 * 1_000_000;
@@ -250,28 +301,105 @@ pub fn stats() -> (u64, u64) {
     (CALLS.load(Ordering::Relaxed), FALLBACKS.load(Ordering::Relaxed))
 }
 
-static T_START: AtomicU64 = AtomicU64::new(0);
-static T_GATE: AtomicU64 = AtomicU64::new(0);
-static T_WAIT: AtomicU64 = AtomicU64::new(0);
-static T_N: AtomicU64 = AtomicU64::new(0);
+// ---- the trial: is the NPU worth it on this device? ----------------------
 
-/// `CMF_NPU_PROF=1`: where a fused call's time goes, every 1200 calls.
-pub fn note_times(start: std::time::Duration, gate: std::time::Duration, wait: std::time::Duration) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("CMF_NPU_PROF").is_ok()) {
+const TRIAL_SKIP: usize = 2;
+const TRIAL_SAMPLES: usize = 10;
+static TRIAL: Mutex<(Vec<u64>, Vec<u64>)> = Mutex::new((Vec::new(), Vec::new()));
+static TRIAL_TURN: AtomicU32 = AtomicU32::new(0);
+static MEDIANS: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// What a fused call should do while the verdict is open.
+pub enum Arm {
+    /// Take the NPU path (and time it when `timed`).
+    Npu { timed: bool },
+    /// Take the CPU path and time it.
+    Cpu,
+}
+
+/// Which arm this call runs. After the verdict every call is `Npu`.
+pub fn arm() -> Arm {
+    if VERDICT.load(Ordering::Relaxed) == 1 {
+        return Arm::Npu { timed: false };
+    }
+    if TRIAL_TURN.fetch_add(1, Ordering::Relaxed) % 2 == 0 { Arm::Npu { timed: true } } else { Arm::Cpu }
+}
+
+fn median(v: &[u64]) -> u64 {
+    let mut s = v[TRIAL_SKIP..].to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
+}
+
+/// Record a trial sample; decides once both arms have enough.
+///
+/// The NPU must beat the CPU by a margin (`CMF_NPU_MARGIN`, 0.92): a tie is
+/// not worth a second copy of the weights and a busy DSP. `CMF_NPU_PROBE=0`
+/// skips the trial and uses the NPU regardless.
+pub fn trial_sample(npu: bool, us: u64) {
+    if VERDICT.load(Ordering::Relaxed) != 0 {
         return;
     }
-    T_START.fetch_add(start.as_micros() as u64, Ordering::Relaxed);
-    T_GATE.fetch_add(gate.as_micros() as u64, Ordering::Relaxed);
-    T_WAIT.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
-    let n = T_N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 1200 == 0 {
-        let (c, f) = stats();
-        eprintln!(
-            "[cortiq] npu prof: start {} us, cpu gate {} us, wait+finish {} us per call; calls {c}, fallbacks {f}",
-            T_START.swap(0, Ordering::Relaxed) / 1200,
-            T_GATE.swap(0, Ordering::Relaxed) / 1200,
-            T_WAIT.swap(0, Ordering::Relaxed) / 1200
-        );
+    if std::env::var("CMF_NPU_PROBE").as_deref() == Ok("0") {
+        VERDICT.store(1, Ordering::Relaxed);
+        return;
+    }
+    let mut t = TRIAL.lock().unwrap();
+    if npu { t.0.push(us) } else { t.1.push(us) }
+    let need = TRIAL_SKIP + TRIAL_SAMPLES;
+    if t.0.len() < need || t.1.len() < need {
+        return;
+    }
+    let (n, c) = (median(&t.0), median(&t.1));
+    *MEDIANS.lock().unwrap() = (n, c);
+    let margin = env_f32("CMF_NPU_MARGIN", 0.92);
+    let use_npu = (n as f32) < (c as f32) * margin;
+    VERDICT.store(if use_npu { 1 } else { 2 }, Ordering::Relaxed);
+    eprintln!(
+        "[cortiq] npu trial: gate+up {n} us with the NPU against {c} us on the CPU -> {}",
+        if use_npu { "NPU lane on" } else { "CPU is faster here, NPU lane off" }
+    );
+}
+
+/// The lane's state for a status line or an app's settings screen.
+#[derive(Clone, Debug, Default)]
+pub struct Status {
+    /// The caller (or `CMF_NPU=1`) asked for the NPU.
+    pub requested: bool,
+    /// The backend came up on this device.
+    pub available: bool,
+    /// "untested", "npu" or "cpu".
+    pub verdict: &'static str,
+    /// Median microseconds of a fused gate+up with the NPU / on the CPU.
+    pub npu_us: u64,
+    pub cpu_us: u64,
+    pub lanes: usize,
+    pub weights_mb: u64,
+    pub calls: u64,
+    pub fallbacks: u64,
+    /// Why the backend is not available, when it is not.
+    pub error: String,
+}
+
+pub fn status() -> Status {
+    let requested = wanted();
+    let available = requested && api().is_some();
+    let (npu_us, cpu_us) = *MEDIANS.lock().unwrap();
+    let (calls, fallbacks) = stats();
+    Status {
+        requested,
+        available,
+        verdict: match VERDICT.load(Ordering::Relaxed) {
+            1 => "npu",
+            2 => "cpu",
+            _ => "untested",
+        },
+        npu_us,
+        cpu_us,
+        lanes: lanes().lock().unwrap().values().filter(|s| s.is_some()).count(),
+        weights_mb: BYTES.load(Ordering::Relaxed) / 1_000_000,
+        calls,
+        fallbacks,
+        error: if available { String::new() } else { LAST_ERROR.lock().unwrap().clone() },
     }
 }

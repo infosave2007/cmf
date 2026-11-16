@@ -3807,33 +3807,79 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
+        #[cfg(target_os = "android")]
+        if let Some(done) = Self::npu_silu_mul(gate, up, x, out, limit, pool) {
+            return done;
+        }
+        Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
+    }
+
+    /// The NPU lane of the fused gate+up (`npu.rs`): `up` on the Hexagon NPU
+    /// while this thread's pool computes `gate`. `None`: no lane for this
+    /// pair, the caller takes the CPU kernel. While the lane's trial is open
+    /// the calls alternate between the two paths and both are timed.
+    #[cfg(target_os = "android")]
+    fn npu_silu_mul(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> Option<bool> {
+        if gate.has_prism_contract() || up.has_prism_contract() {
+            return None;
+        }
+        let lane = crate::npu::lane(up)?;
+        let inter = gate.rows();
+        let t0 = std::time::Instant::now();
+        let timed = match crate::npu::arm() {
+            crate::npu::Arm::Cpu => {
+                // The CPU's own best for this pair: the fused kernel, or two
+                // ordinary matvecs where it declines.
+                if !Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool) {
+                    let mut g = vec![0f32; inter];
+                    let mut u = vec![0f32; inter];
+                    gate.matvec(x, &mut g, pool);
+                    up.matvec(x, &mut u, pool);
+                    for r in 0..inter {
+                        out[r] = silu_mul_limited(g[r], u[r], limit);
+                    }
+                }
+                crate::npu::trial_sample(false, t0.elapsed().as_micros() as u64);
+                return Some(true);
+            }
+            crate::npu::Arm::Npu { timed } => timed,
+        };
+        let mut g = vec![0f32; inter];
+        let mut u = vec![0f32; inter];
+        let pending = crate::npu::start(&lane, x);
+        gate.matvec(x, &mut g, pool);
+        let ok = pending.is_some_and(|p| p.finish(&mut u));
+        if !ok {
+            up.matvec(x, &mut u, pool);
+        }
+        for r in 0..inter {
+            out[r] = silu_mul_limited(g[r], u[r], limit);
+        }
+        if timed && ok {
+            crate::npu::trial_sample(true, t0.elapsed().as_micros() as u64);
+        }
+        Some(true)
+    }
+
+    fn matvec_silu_mul_cpu(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> bool {
         if gate.exact_cpu_default() || up.exact_cpu_default() {
             return float_activations_scope(|| {
-                Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
+                Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
             });
-        }
-        // NPU lane (Android, `CMF_NPU=1`): `up` on the Hexagon NPU while this
-        // thread's pool computes `gate`; see `npu.rs`.
-        #[cfg(target_os = "android")]
-        if !gate.has_prism_contract() && !up.has_prism_contract() {
-            if let Some(lane) = crate::npu::lane(up) {
-                let inter = gate.rows();
-                let mut g = vec![0f32; inter];
-                let mut u = vec![0f32; inter];
-                let t0 = std::time::Instant::now();
-                let pending = crate::npu::start(&lane, x);
-                let t1 = std::time::Instant::now();
-                gate.matvec(x, &mut g, pool);
-                let t2 = std::time::Instant::now();
-                if !pending.is_some_and(|p| p.finish(&mut u)) {
-                    up.matvec(x, &mut u, pool);
-                }
-                crate::npu::note_times(t1 - t0, t2 - t1, t2.elapsed());
-                for r in 0..inter {
-                    out[r] = silu_mul_limited(g[r], u[r], limit);
-                }
-                return true;
-            }
         }
         if gate.has_prism_contract()
             || up.has_prism_contract()
