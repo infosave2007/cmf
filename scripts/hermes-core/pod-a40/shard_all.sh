@@ -39,6 +39,7 @@ mk b_tools_misc.u16 1 $P/glaive.jsonl.gz $P/hermes_fc.jsonl.gz $P/smolagents.jso
 mk b_lookup.u16 1 $P/lookup.jsonl.gz
 mk b_lookup4.u16 1 $P/lookup4.jsonl.gz  # lookup_gen.py --near 0.8 --ranked
 mk b_lookup5.u16 1 $P/lookup5.jsonl.gz  # lookup_gen.py --near 0.8 --ranked --need
+mk b_lookup6.u16 1 $P/lookup6.jsonl.gz  # lookup_gen.py --near 0.8 --ranked --need --teach 0.06
 mk b_q27_answers.u16 1 $P/q27_answers.jsonl.gz  # q27_data.py: answers of Qwen3.8-27B to coding prompts
 mk b_q27_chat.u16 1 $P/q27_chat.jsonl.gz
 mk b_q27_code.u16 0 $P/q27_code.jsonl.gz
@@ -52,6 +53,7 @@ mk bv_tools.u16 1 $P/toolmind.val.jsonl.gz $P/toucan_kimi.val.jsonl.gz $P/glaive
 mk bv_lookup.u16 1 $P/lookup.val.jsonl.gz
 mk bv_lookup4.u16 1 $P/lookup4.val.jsonl.gz
 mk bv_lookup5.u16 1 $P/lookup5.val.jsonl.gz
+mk bv_lookup6.u16 1 $P/lookup6.val.jsonl.gz
 mk bv_q27.u16 1 $P/q27_answers.val.jsonl.gz $P/q27_chat.val.jsonl.gz
 mk bv_harness.u16 0 $P/harness_code.val.jsonl.gz
 ( cd $D && for f in b_*.u16 bv_*.u16 en.u16 ru.u16 code.u16 math.u16 se.u16 docs.u16 hermes_code.u16 val_*.u16 rawval.u16; do
