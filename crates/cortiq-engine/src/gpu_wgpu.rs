@@ -22194,6 +22194,56 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
+/// The weight budget of an integrated GPU on Linux (no `CMF_GPU_VRAM_MB`):
+/// three quarters of what it can address, that being the largest
+/// device-local heap (an AMD APU's GTT) within MemTotal, or MemTotal when
+/// the driver reports only a small carve-out. It used to be unlimited, so a
+/// model larger than the machine was all planned onto the "card" and only
+/// the allocator's refusals placed the rest: a Ryzen AI Max+ 395 (121 GiB,
+/// 103 GB of GTT) needed the budget pinned by hand. None elsewhere
+/// (unlimited, as before): Android's and macOS's shared memory keep their
+/// own rules.
+#[cfg(target_os = "linux")]
+fn uma_budget(adapter: &wgpu::Adapter) -> Option<u64> {
+    let mi = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = mi.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(uma_share(kb << 10, vulkan_vram_total(adapter)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uma_budget(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
+}
+
+/// `uma_budget`'s arithmetic: three quarters of the heap within `mem`, or
+/// of `mem` when the heap is under a quarter of it (a carve-out, not the
+/// memory the GPU really shares).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn uma_share(mem: u64, heap: Option<u64>) -> u64 {
+    let total = match heap {
+        Some(h) if h >= mem / 4 => h.min(mem),
+        _ => mem,
+    };
+    total / 4 * 3
+}
+
+#[cfg(test)]
+mod uma_budget_tests {
+    use super::uma_share;
+
+    #[test]
+    fn uma_share_takes_the_shared_heap_or_the_memory() {
+        let gib = 1u64 << 30;
+        // Ryzen AI Max+ 395: 121 GiB, its 103 GB GTT the device-local heap
+        assert_eq!(uma_share(121 * gib, Some(96 * gib)), 72 * gib);
+        // a 512 MB carve-out is not the memory the GPU shares
+        assert_eq!(uma_share(64 * gib, Some(gib / 2)), 48 * gib);
+        // a heap past MemTotal counts as MemTotal
+        assert_eq!(uma_share(32 * gib, Some(64 * gib)), 24 * gib);
+        assert_eq!(uma_share(16 * gib, None), 12 * gib);
+    }
+}
+
 /// Streaming multiprocessors of an NVIDIA card on Vulkan, from
 /// `VK_NV_shader_sm_builtins` (`shaderSMCount`). None on other vendors,
 /// backends and platforms. The narrow-matvec grid cap scales with it.
@@ -22573,7 +22623,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 None => 8 * 1024 * 1024 * 1024,
             }
         } else {
-            u64::MAX // UMA: the OS pages shared memory
+            // UMA: the OS pages shared memory; on Linux the plan gets a
+            // finite share of it (`uma_budget`)
+            uma_budget(&adapter).unwrap_or(u64::MAX)
         });
     // The probe cache is keyed by this: a verdict belongs to one piece
     // of silicon on one backend, and must not be adopted by another.

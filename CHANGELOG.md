@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 4.4, a 34 s text in 22 s instead of 32; Whisper still reads every sample as its text.
 
 ### Fixed
+- Vulkan, Edge0-145B and other latent-expert `qwen4_exp` files: loading the expert banks held every layer's bytes
+  twice, once in the queue's staging and once on the card, until the first frame. On a Radeon 8060S (121 GiB of
+  unified memory) the load pushed the GTT to 90.6 GB and filled swap before settling at 59 GB. The upload now
+  hands its writes to the GPU every 192 MiB, as the expert pool's prefill already did.
+- Vulkan on an integrated GPU under Linux: with no `CMF_GPU_VRAM_MB` the weight budget was unlimited, so a model
+  larger than the machine was all planned onto the "card" and only the allocator's refusals placed the rest
+  (a Ryzen AI Max+ 395 needed the budget set by hand). It is now three quarters of what the GPU can address: its
+  largest device-local heap (an APU's GTT) within the host's memory, or the host's memory when the driver reports
+  only a small carve-out. `CMF_GPU_VRAM_MB` still overrides it; Android and macOS keep their own rules.
 - GLM-5.3-Flash (`glm5_next`) files ran as a plain transformer and answered with noise: the release had no
   runtime for them. The `glm5_next` stack — four-stream mHC residuals, KDA recurrent mixers and NoPE MLA with
   the DSA indexer — is in: the published q2tp file answers the card's check ("What is 2+2?" → "4"). DSA's
