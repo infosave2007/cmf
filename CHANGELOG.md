@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-11-16
+
+### Fixed
+- Vulkan on a phone driver: every process that answered once compiled the batch graph's kernels again. They are
+  built at first use, after `init` wrote the pipeline cache, and the only later save was at the start of a second
+  generation, which `cortiq run -p`, a bench or an app closed after one reply never reaches. A generation's end
+  now saves the cache when the driver's blob differs from the file (a CPU generation does not bring the device
+  up for it). On a Snapdragon 778G (Adreno 642L), lfm2.5-230m q4tp with the whole-token graph forced: the first
+  token of a one-shot run in 6.9 s instead of 41.4 s once the cache holds them.
+- Vulkan: the token graph compiled GLM's DSA kernels for every model, with no pipeline cache — it asked for the
+  kernels before asking whether any layer has DSA. The layers are asked first and the DSA pipelines take the
+  cache: on the same phone decode over 40 tokens at 10.4 tokens/s from the first run instead of 2.4.
+
 ## [0.9.1] — 2026-11-16
 
 ### Fixed
