@@ -1,7 +1,7 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
-                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]]
+                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -77,6 +77,12 @@ rule tasks go 0 -> 9 of 25 in 500 steps (the first two rules of R's five
 are read right). The tables do not: the pairs come out mixed up (a size
 stands before its name in `ls -l`) and the sums are wrong, 1 of 40 against
 6 for bare answers, so the sets for the base take `--reason react` only.
+
+`--labels`: the labels of every rule task are replaced by words drawn from a
+list of 297, R's five left out. The tasks of `train_gen.py` use 22 labels, few
+enough to know by heart, and a model that knows them writes one of them where
+the rule says another: with the rule copied word for word the answer after it
+was "RENAME" for a copied "answer RETRY.", "CONTINUE" for INSTALL.
 """
 
 from __future__ import annotations
@@ -277,6 +283,21 @@ def pattern_think(card, what, tpl, pairs, lead="", cite=False):
     return head + " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "."
 
 
+LABELS = """ABORT ACCEPT ADJUST ADVANCE ALERT ALLOW AMEND APPEND APPLY APPROVE ARCHIVE ARM ASSIGN ATTACH AUDIT BACKUP BALANCE
+BAN BATCH BIND BLOCK BOOST BOUNCE BRANCH BRIDGE BUFFER BUILD BYPASS CACHE CALL CANCEL CAP CAPTURE CHAIN CHARGE CHECK CLAIM CLEAN
+CLEAR CLONE CLOSE COLLECT COMMIT COMPACT COMPARE COMPILE CONFIRM CONNECT CONTINUE CONVERT COPY COUNT COVER CRAWL CREATE CUT CYCLE
+DEBUG DECODE DEFER DELAY DELETE DENY DEPLOY DETACH DIAL DIFF DIG DISABLE DISCARD DISMISS DISPATCH DIVERT DOCK DOWNGRADE DRAIN DRAW
+DROP DUMP EDIT EJECT EMIT ENABLE ENCODE ENFORCE ENLIST ENTER ERASE ESCALATE EVICT EXPAND EXPIRE EXPORT EXTEND FALLBACK FENCE FETCH
+FILE FILL FILTER FINISH FIX FLAG FLIP FLUSH FOLD FOLLOW FORCE FORGET FORK FORMAT FORWARD FREE FREEZE GATHER GRANT GROUP GROW GUARD
+HALT HANDLE HASH HEAL HIDE HOLD HOOK IGNORE IMPORT INDEX INFORM INJECT INSPECT INVERT INVOKE ISOLATE JOIN JUMP KEEP LABEL LAUNCH
+LEASE LEAVE LIFT LIMIT LINK LIST LOAD LOCK LOG LOOP LOWER MAP MARK MASK MATCH MERGE MIGRATE MIRROR MOUNT MOVE MUTE NOTIFY NUDGE
+OFFLOAD OK OPEN ORDER OVERRIDE PACK PAD PAGE PARK PARSE PATCH PAUSE PEEK PIN PING PLAN POLL POP PREPARE PRINT PROBE PROMOTE PRUNE
+PUBLISH PULL PURGE PUSH QUEUE QUIT RAISE RANK READ REBASE REBOOT REBUILD RECALL RECORD RECOVER REDO REDUCE REFRESH REFUSE REGISTER
+REJECT RELAX RELEASE RELOAD RELOGIN REMOUNT REMOVE RENAME RENEW REPAIR REPEAT REPLACE REPLAY REPORT REQUEUE RESCAN RESERVE RESET
+RESIZE RESOLVE RESTART RESTORE RESUME RETAIN RETIRE REVERT REVIEW REVOKE REWIND ROLLBACK ROTATE ROUTE SAVE SCALE SCAN SCHEDULE
+SCRUB SEAL SEARCH SELECT SEND SETTLE SHARE SHIFT SHRINK SIGN SKIP SLEEP SNAPSHOT SORT SPLIT STAGE STALL START STASH STEP STOP
+STORE STREAM STRIP SUBMIT SUSPEND SWAP SWEEP SYNC TAG THAW THROTTLE TIDY TRACE TRACK TRIM TUNE UNBIND UNDO UNLOCK UNMOUNT UNPACK
+UPDATE UPGRADE UPLOAD VACUUM VERIFY WAIT WAKE WARN WATCH WIPE WRAP YIELD ZERO""".split()  # none of R's: SUDO, ASK, INSTALL, RETRY, DONE
 RULE = re.compile(r"^- If the output contains (.+), answer (\S+)\.$")
 LS_ROW = re.compile(r"^\S+ +\d+ \S+ \S+ +(\d+) \w+ +\d+ [\d:]+ (\S+)$")
 ASKS = [
@@ -357,9 +378,14 @@ def arith_think(prompt: str, answer: str) -> str:
 
 
 def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False,
-          reason=()):
+          reason=(), relabel=None):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
+    if cat == "react" and relabel is not None:  # other words for the labels, the same rule set
+        names = re.findall(r"answer (\S+)\.$", prompt, re.M)
+        other = dict(zip(names, relabel.sample(LABELS, len(names))))
+        prompt = re.sub(r"answer (\S+)\.$", lambda m: f"answer {other[m.group(1)]}.", prompt, flags=re.M)
+        answer = other[answer]
     if cat in ("react", "arith"):
         think = (react_think if cat == "react" else arith_think)(prompt, answer) if cat in reason else None
         return "direct", [("user", prompt), ("assistant", think, answer, [])]
@@ -588,6 +614,9 @@ def main() -> None:
     ap.add_argument("--pipes", action="store_true",
                     help="a pipeline is looked up by what is needed, not by command names, and built from the cards that "
                          "came back: which gives the output, which works on it, each example and its values")
+    ap.add_argument("--labels", action="store_true",
+                    help="the labels of a rule task are replaced by words drawn from a list of 297: a label has to be "
+                         "copied from its rule, it cannot be recalled")
     ap.add_argument("--reason", default="",
                     help="react, arith or both, comma-separated: these answers come after the reasoning they are read from "
                          "(the matching rule copied word for word; the table's column as pairs and the operation)")
@@ -598,6 +627,7 @@ def main() -> None:
     args = ap.parse_args()
     rng = random.Random(args.seed)
     rng2 = random.Random(args.seed + 1009)  # the draws of --teach: the other conversations stay as without it
+    rng3 = random.Random(args.seed + 2003) if args.labels else None  # the draws of --labels, likewise
     recs = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
     pool, seen = [], set()
     for r in recs:
@@ -618,7 +648,7 @@ def main() -> None:
         for r in recs:
             try:
                 mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes,
-                                    set(filter(None, args.reason.split(","))))
+                                    set(filter(None, args.reason.split(","))), rng3)
                 direct = mode == "direct"
                 tools = TOOLS
                 if args.teach > 0 and not direct:
