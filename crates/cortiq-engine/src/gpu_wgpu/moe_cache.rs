@@ -373,11 +373,12 @@ pub(crate) fn staging(c: &Ctx, sizes: [u64; 3]) -> Option<Arc<[wgpu::Buffer; 3]>
         return None;
     }
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    // COPY_SRC: a streamed layer's pools are seeded from it (`moe_stream::Stream::warm`)
     let mk = |label: &'static str, size: u64| {
         c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         })
     };
@@ -407,6 +408,11 @@ pub(crate) struct Plan {
     /// Card bytes held for the staging bank (`staging`): the largest bank,
     /// when any is in system memory.
     pub stage_bytes: u64,
+    /// Every routed layer streams its experts through card slots
+    /// (`moe_stream`): neither the card nor the host's room holds them.
+    pub stream: bool,
+    /// The slots' card bytes then.
+    pub pool_bytes: u64,
 }
 
 /// The placement of `layers`' routed experts within `exp_budget` card bytes
@@ -418,18 +424,38 @@ pub(crate) struct Plan {
 /// an LRU of a fraction f of a layer's experts misses at most as often as
 /// reading a fraction f of the layers in place, and less whenever the
 /// routing comes back to an expert.
-pub(crate) fn plan(routed: &[(u64, usize, usize)], exp_budget: u64, room: u64, cache: bool, stage_on: bool) -> Plan {
+pub(crate) fn plan(routed: &[(u64, usize, usize)], exp_budget: u64, room: u64, cache: bool, stage_on: bool, stream: bool) -> Plan {
+    plan_with(routed, exp_budget, room, room, cache, stage_on, stream)
+}
+
+/// [`plan`] with the host's whole room apart from the ¾ the banks plan
+/// with: the experts stream only when the spill is past all of it — banks in
+/// place read RAM, a stream's misses and staging read the file (Ornith q4tp
+/// within 24 GB on a 46 GB container: 9.4 tokens/s and the first token in
+/// 6.7 s in place, 9.6 and 84 s streamed). The room is the banks' (see
+/// `bank_room_bytes`): where it holds every bank, all of them go to system
+/// memory and the card's expert bytes all become slots (the same card:
+/// 30.6 tokens/s against 8.7 with 15 layers whole and no slots).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_with(routed: &[(u64, usize, usize)], exp_budget: u64, room: u64, hard_room: u64, cache: bool, stage_on: bool, stream: bool) -> Plan {
     let n = routed.len();
     let mut sys = vec![false; n];
     let mut cap = vec![0usize; n];
     let mut cache_bytes = vec![0u64; n];
     let total: u64 = routed.iter().map(|r| r.0).sum();
     if total <= exp_budget {
-        return Plan { sys, cap, cache_bytes, stage_bytes: 0 };
+        return Plan { sys, cap, cache_bytes, stage_bytes: 0, stream: false, pool_bytes: 0 };
     }
     // a prompt copies one bank at a time to the card: its room comes first
     let stage = if stage_on { routed.iter().map(|r| r.0).max().unwrap_or(0) } else { 0 };
     let exp_budget = exp_budget.saturating_sub(stage);
+    // past the card and the host's room: every routed layer through card
+    // slots fed from the file, when they hold a fifth of the experts (a
+    // smaller pool misses more than the in-place banks cost: CUDA's stream
+    // within 12 / 16 GB of Ornith-122B, 5.7 / 7.0 tokens/s against 7.9 / 8.3)
+    if stream && total.saturating_sub(exp_budget) > hard_room && exp_budget.saturating_mul(5) >= total {
+        return Plan { sys, cap, cache_bytes, stage_bytes: stage, stream: true, pool_bytes: exp_budget / 20 * 19 };
+    }
     // the fewest trailing banks out of the card
     let mut on_card = total;
     let mut k_min = 0usize;
@@ -463,13 +489,13 @@ pub(crate) fn plan(routed: &[(u64, usize, usize)], exp_budget: u64, room: u64, c
     }
     let stage_bytes = if k > 0 { stage } else { 0 };
     if !cache {
-        return Plan { sys, cap, cache_bytes, stage_bytes };
+        return Plan { sys, cap, cache_bytes, stage_bytes, stream: false, pool_bytes: 0 };
     }
     let resident: u64 = moe.iter().filter(|&&i| !sys[i]).map(|&i| routed[i].0).sum();
     let left = exp_budget.saturating_sub(resident) / 20 * 19;
     let banked: u64 = out.iter().map(|&i| routed[i].0).sum();
     if banked == 0 {
-        return Plan { sys, cap, cache_bytes, stage_bytes };
+        return Plan { sys, cap, cache_bytes, stage_bytes, stream: false, pool_bytes: 0 };
     }
     for &i in &out {
         let (bytes, ne, slots) = routed[i];
@@ -485,7 +511,7 @@ pub(crate) fn plan(routed: &[(u64, usize, usize)], exp_budget: u64, room: u64, c
             cache_bytes[i] = c as u64 * per;
         }
     }
-    Plan { sys, cap, cache_bytes, stage_bytes }
+    Plan { sys, cap, cache_bytes, stage_bytes, stream: false, pool_bytes: 0 }
 }
 
 #[cfg(test)]
@@ -496,45 +522,52 @@ mod tests {
     fn plan_fills_the_card_then_banks_the_rest() {
         // 4 layers of 10 GB experts (100 a layer, 9 picks), 25 GB for experts
         let r = vec![(10u64 << 30, 100, 9); 4];
-        let p = plan(&r, 25 << 30, 1 << 40, false, false);
+        let p = plan(&r, 25 << 30, 1 << 40, false, false, false);
         assert_eq!(p.sys, vec![false, false, true, true]);
         assert!(p.cap.iter().all(|&c| c == 0));
         // with the caches: every bank the host holds, the card's bytes as slots
-        let p = plan(&r, 25 << 30, 1 << 40, true, false);
+        let p = plan(&r, 25 << 30, 1 << 40, true, false, false);
         assert_eq!(p.sys, vec![true; 4]);
         // 25 GB * 0.95 over 40 GB of banks: 59 of 100 experts a layer
         assert!(p.cap.iter().all(|&c| c == 59), "{:?}", p.cap);
         // a host that holds three banks: one layer stays whole
-        let p = plan(&r, 25 << 30, 31 << 30, true, false);
+        let p = plan(&r, 25 << 30, 31 << 30, true, false, false);
         assert_eq!(p.sys, vec![false, true, true, true]);
         assert!(p.cap[1..].iter().all(|&c| c == 47), "{:?}", p.cap);
         // everything fits: nothing moves
-        let p = plan(&r, 40 << 30, 1 << 40, true, false);
+        let p = plan(&r, 40 << 30, 1 << 40, true, false, false);
         assert!(p.sys.iter().all(|&s| !s));
         // a spill of an eighth or less stays read in place
         let r16 = vec![(1u64 << 30, 100, 9); 16];
-        let p = plan(&r16, 14 << 30, 1 << 40, true, false);
+        let p = plan(&r16, 14 << 30, 1 << 40, true, false, false);
         assert_eq!(p.sys.iter().filter(|&&s| s).count(), 2);
         assert!(p.cap.iter().all(|&c| c == 0), "{:?}", p.cap);
-        let p = plan(&r16, 13 << 30, 1 << 40, true, false);
+        let p = plan(&r16, 13 << 30, 1 << 40, true, false, false);
         assert_eq!(p.sys.iter().filter(|&&s| s).count(), 16);
         // dense layers keep no bank
         let r2 = vec![(0u64, 0, 0), (10 << 30, 100, 9), (10 << 30, 100, 9)];
-        let p = plan(&r2, 5 << 30, 1 << 40, true, false);
+        let p = plan(&r2, 5 << 30, 1 << 40, true, false, false);
         assert_eq!(p.sys, vec![false, true, true]);
         assert!(p.cap[1] == 23 && p.cap[2] == 23, "{:?}", p.cap);
         // the staging bank's room comes off the card first
-        let p = plan(&r, 25 << 30, 1 << 40, true, true);
+        let p = plan(&r, 25 << 30, 1 << 40, true, true, false);
         assert_eq!(p.stage_bytes, 10 << 30);
         assert_eq!(p.sys, vec![true; 4]);
         // 15 GB * 0.95 over 40 GB of banks: 35 of 100 a layer
         assert!(p.cap.iter().all(|&c| c == 35), "{:?}", p.cap);
         // too little left for two tokens' picks: the banks read in place
-        let p = plan(&r, 25 << 30, 31 << 30, true, true);
+        let p = plan(&r, 25 << 30, 31 << 30, true, true, false);
         assert_eq!(p.sys, vec![false, true, true, true]);
         assert!(p.cap.iter().all(|&c| c == 0), "{:?}", p.cap);
-        let p = plan(&r, 40 << 30, 1 << 40, true, true);
+        let p = plan(&r, 40 << 30, 1 << 40, true, true, false);
         assert_eq!(p.stage_bytes, 0);
+        // past the card and the host: every layer streams through slots
+        let p = plan(&r, 25 << 30, 4 << 30, true, true, true);
+        assert!(p.stream && p.sys.iter().all(|&s| !s));
+        assert_eq!(p.pool_bytes, ((15u64 << 30) / 20) * 19);
+        // a pool under a fifth of the experts: the banks in place instead
+        let p = plan(&r, 15 << 30, 4 << 30, true, true, true);
+        assert!(!p.stream);
     }
 
     #[test]

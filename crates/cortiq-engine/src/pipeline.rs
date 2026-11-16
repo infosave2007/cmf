@@ -5522,9 +5522,15 @@ impl Pipeline {
             let banked = crate::gpu::wgpu_active()
                 && crate::gpu::discrete()
                 && self.model.as_ref().is_some_and(|m| m.primary_bytes().len() as u64 > crate::gpu::vram_budget());
+            // banks streamed or staged from system memory: a chunk reads every
+            // bank of the stack once, so the widest chunk the scratch takes
+            // (GLM-5.3 on Vulkan streamed 108 GB of experts every 256 rows)
+            if moe && banked && !q82 {
+                return 512;
+            }
             return if q82 {
                 128
-            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() || (moe && banked) {
+            } else if q4tp_moe || q4ts_moe || self.onevision2_prefill() {
                 256
             } else if moe {
                 32
@@ -7232,7 +7238,22 @@ impl Pipeline {
         // Bounded chunks preserve cancellation responsiveness. Only the
         // prompt's final chunk asks for logits; every earlier head projection
         // would produce 129 280 values that no caller reads.
-        // GLM-5.3-Flash runs its own mHC / KDA / DSA stack a token at a time.
+        // GLM-5.3-Flash runs its own mHC / KDA / DSA stack: the prompt on the
+        // card's batch graph when it takes it, else a token at a time.
+        if mtp.is_none() && pos + 1 < input_ids.len() {
+            let mut lg = Vec::new();
+            let taken = match &mut self.glm5_next {
+                Some(b) => crate::glm5_next::forward_prompt(&b.0, &b.1, &b.2, &mut b.3, &input_ids[pos..], pos, self.pool.as_deref(), &mut lg),
+                None => 0,
+            };
+            if taken > 0 {
+                pos += taken;
+                if pos == input_ids.len() {
+                    self.graph_logits = Some(lg);
+                }
+                hidden.fill(0.0);
+            }
+        }
         while self.glm5_next.is_some()
             && mtp.is_none()
             && pos < input_ids.len()
@@ -11989,6 +12010,18 @@ impl Pipeline {
             );
             return (0.0, 0.0);
         }
+        // Routed experts past the card live in the graphs' placement only
+        // (system-memory banks under card slots): per op they run on the
+        // host and the matrices' device copies outgrow the card (MiniMax-M3.1
+        // on a whole A40: out of memory before the timed run).
+        #[cfg(feature = "gpu")]
+        let past = crate::gpu_wgpu::experts_past_card();
+        #[cfg(not(feature = "gpu"))]
+        let past = false;
+        if past {
+            tracing::info!("pair micro-benchmark skipped: routed experts past the card have no per-op route");
+            return (0.0, 0.0);
+        }
         // This is a host-side pair micro-benchmark. It truncates the host KV
         // after every probe, so letting the whole-token graph participate
         // would leave its device GDN/KV mirror ahead of the next probe and
@@ -16625,6 +16658,7 @@ impl Pipeline {
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
                         cpu_base: self.kv_cache.layers[li].base(),
+                        dsa: None,
                     },
                     m.clone(),
                 ))
@@ -18226,6 +18260,7 @@ impl Pipeline {
                         detached_shared,
                         shared_gated,
                         route_scale: m.routed_scaling,
+                        limit: 0.0,
                     }
                 }
             };
@@ -20482,6 +20517,7 @@ impl Pipeline {
                             detached_shared,
                             shared_gated,
                             route_scale: m.routed_scaling,
+                            limit: 0.0,
                         }
                     }
                     _ => return None,

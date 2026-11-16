@@ -10,36 +10,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - MoE placement for any card size, CUDA hybrid arm: the dense matrices and the attention go to the card first;
   routed experts past it stream through card slots (least recently used giving way) when they are more than an
-  eighth of the experts or past the host's room, the misses built from a page-locked RAM tier of raw experts
-  (DMA, no page faults; the missing ones' pages asked for at once with `MADV_WILLNEED`); a small spill stays in
-  mapped host memory read over the bus; a dense part past a small card goes to mapped host memory too. One stream
-  serves a model's prompt and token plans, and a long prompt goes through the small path a chunk at a time.
-  `CMF_GPU_VRAM_MB` now caps every placement decision, so a smaller card's runs on a bigger one as it would there.
-  Decode after a 512-token prompt on an A40 (46 GB container) capped to 12 / 16 / 24 / 32 / 46 GB:
-  Ornith-1.5-122B q4tp 5.7 / 7.0 / 32.9 / 34.4 / 36.8 tokens/s (was 3.4 / 4.4 / 31.2 / 11.0 / 15.4), Ornith
-  q2tp-v2 38.6 within 32 GB; MiMo-V2.6-Flash (164 GB) 13.6 and MiniMax-M3.1-Flash (157 GB) 1.24 on the whole
-  card (CPU path 1.2 and 0.65), their greedy texts the CPU's (Ornith q4tp's part from the CPU's at a near-tie,
-  as on Vulkan, whose perplexity matches). A call's missing experts are copied into the RAM tier on several host
-  threads before their builds (a build from the tier 0.5 ms instead of 3.8 from the mapping): within 24 / 32 GB
-  the first token of a 512-token prompt in 18.1 / 15.8 s instead of 21.2 / 19.9 on a host whose RAM holds two
-  thirds of the file (the rest is read from disk on first use). Knobs: `CMF_HYB_STREAM=0`,
-  `CMF_HYB_STREAM_SPILL=<n>`, `CMF_HYB_RAM_TIER=0`, `CMF_HYB_HOST_TIER=1`, `CMF_HYB_RAM_FILL_THREADS=<n>`.
+  eighth of the experts or past the host's room; a small spill stays in mapped host memory read over the bus,
+  and a dense part past a small card goes there too. The slots are built from a page-locked RAM tier of raw
+  experts (DMA, no page faults; a call's missing experts copied in on several host threads, their pages asked
+  for at once with `MADV_WILLNEED`), which keeps each expert's card layout after its first build, so the next
+  one is a single copy; the tier holds every expert when they fit three quarters of the host's room, filled and
+  laid out at load, else half of it. A prompt chunk stages a streamed layer whole when the streamed experts are
+  within twice the host's room or once the small path's chunks built most of their picks; each layer then keeps
+  the experts of the chunk's last rows for the tokens after it. In a container whose limit page-locked memory
+  falls outside (a 256 MB probe against its usage), the host's room is its available memory.
+  `CMF_GPU_VRAM_MB` caps every placement decision, so a smaller card's runs on a bigger one as it would there.
+  On an A40 (46 GB container, which counts page-locked memory), decode after a 512-token prompt and that
+  prompt's first token: Ornith-1.5-122B q4tp within 12 / 16 / 24 GB and on the whole card 6.8 / 7.1 / 28.7 /
+  37.3 tokens/s and 10 s (0.8.99: 3.4 / 4.4 / 31.2 / 15.4), perplexity the CPU's (3.049); Apex-35B q4tp within
+  12 GB 88.7 tokens/s and 0.85 s (the tier filled as it goes: 75.4 and 4.65 s), on the whole card 107.8 and
+  0.36 s, perplexity 4.186 against the CPU's 4.188; MiMo-V2.6-Flash (164 GB) and MiniMax-M3.1-Flash (157 GB) on
+  the whole card 11.3 and 1.0 (their prompts on the small path: 46 and 363 s), their greedy texts the CPU's.
+  Knobs: `CMF_HYB_STREAM=0`, `CMF_HYB_STREAM_SPILL=<n>`, `CMF_HYB_STREAM_STAGE=0|1`, `CMF_HYB_RAM_TIER=0`,
+  `CMF_HYB_TIER_PACK=0`, `CMF_HYB_TIER_PREPACK=0`, `CMF_HYB_HOST_TIER=1`, `CMF_HYB_RAM_FILL_THREADS=<n>`,
+  `CMF_HYB_PINNED_PROBE=0`.
 - Vulkan: routed experts past the card live in GPU-visible system memory and the token graph keeps going instead
   of ending at a device prefix; the dense part of every layer and the head are placed first. When more than an
-  eighth of the experts are past the card, as many layers' banks go to system memory as the host's RAM holds and
-  the card's room left after the layers that stay whole becomes LRU slots over those banks, kept by the token
-  graph itself: after the select one workgroup maps the picks to slots and a copy kernel brings the misses in
-  (an indirect dispatch: a token whose picks all hit copies nothing); nothing waits for the host. The prompt runs
-  on the batch graph with the same placement (it refused any model past the card and went a position at a time),
-  each system-memory bank copied whole to a staging bank on the card for a wide chunk instead of its kernels
-  re-reading the experts over the bus, 256 positions a chunk for any expert codec. Ornith-122B q4tp on an A40
-  (46 GB container), decode after a 512-token prompt and that prompt's first token: on the whole card 29.5
-  tokens/s and 6.1 s (0.8.99: 4.3 tokens/s; banks read in place 13.4 and 36 s), within 32 GB 15.4 and 6.2 s (in
-  place 11.5 and 45 s), within 12 / 16 / 24 GB, where the container's RAM holds too few banks for slots, 7.9 /
-  8.3 / 9.6 and 6.2-7.2 s (the prompt took 54-68 s); Ornith q2tp-v2 within 32 GB 25-29 tokens/s and 9.5 s (in
-  place 20.7 and 16 s). Perplexity is the CPU's (q4tp 3.050 against 3.049, q2tp-v2 3.180 against 3.179). Knobs:
-  `CMF_WGPU_EXPERT_CACHE=0`,
-  `CMF_WGPU_EXPERT_SPILL=<n>`, `CMF_WGPU_EXPERT_STAGE=0`, `CMF_SYS_EXPERTS=0`.
+  eighth of the experts are past the card, the banks go to system memory and the card's room left after the
+  layers that stay whole becomes LRU slots over them, kept by the token graph itself: after the select one
+  workgroup maps the picks to slots and a copy kernel brings the misses in (an indirect dispatch: a token whose
+  picks all hit copies nothing); nothing waits for the host. The prompt runs on the batch graph with the same
+  placement (it refused any model past the card and went a position at a time), each system-memory bank copied
+  whole to a staging bank on the card for a chunk of 512 positions. The banks' room is the host's RAM; in a
+  container whose limit the driver's system memory falls outside (a 256 MB probe against its usage), the host's
+  available memory. On an A40 (46 GB container), decode after a 512-token prompt and that prompt's first token:
+  Ornith-122B q4tp on the whole card 31.9 tokens/s and 5.4 s (0.8.99: 4.3 tokens/s), within 12 / 16 / 24 GB
+  10.6 / 12.6 / 30.6 and 5.5 s (the banks within the container's room: 7.4 / 7.8 / 8.7);
+  MiMo-V2.6-Flash on the whole card 13.2 and 12.1 s (its own MoE bank: 1.9 and 189 s), within 24 GB 6.5;
+  MiniMax-M3.1-Flash on the whole card 6.7 and 23.7 s, within 24 GB 4.8 and 24.7 s (CPU 0.65). Perplexity is the
+  CPU's (Ornith q4tp 3.050 against 3.049); MiMo and MiniMax answer as the CPU does. Knobs:
+  `CMF_WGPU_EXPERT_CACHE=0`, `CMF_WGPU_EXPERT_SPILL=<n>`, `CMF_WGPU_EXPERT_STAGE=0`, `CMF_SYS_EXPERTS=0`,
+  `CMF_WGPU_EXPERT_OUT=fit` (the container's room).
+- Vulkan: routed experts past the card AND past the host's memory stream through card slots: pools of slots
+  (a group of layers each, every buffer within one binding) over a RAM tier of raw experts in GPU-visible
+  system memory, the least recently used giving way in both. The token graph ends its submission after a
+  streamed layer's select, the host brings the picks' missing experts into slots (a DMA copy from the tier, or
+  the file into the tier first, on several threads) and the graph goes on; a prompt chunk stages each streamed
+  layer whole and leaves the experts of its last rows in the slots, so decode starts warm. Such a file used to
+  fall to the host for the layers past the room. Its perplexity is the CPU's (Ornith q4tp 3.050).
+  `CMF_WGPU_EXPERT_STREAM=0`, `CMF_WGPU_EXPERT_TIER=0`, `CMF_WGPU_EXPERT_WARM=0`,
+  `CMF_WGPU_EXPERT_FILL_THREADS=<n>`, `CMF_STREAM_STATS=1`.
+- Vulkan: a mixed q2tp-v2 file's q2tp gate/up rides the grouped prompt path (`CMF_MOEG_Q2=0`: the per-row
+  loop): Ornith-122B q2tp-v2 on an A40, the first token of a 512-token prompt in 3.5 s instead of 7.0 on the
+  whole card and 5.2 instead of 8.7 within 32 GB (decode 25-29 tokens/s), perplexity 3.180 on both paths (CPU
+  3.179).
+- Vulkan: the MoE select takes 257-512 experts (two a thread of the workgroup, ties to the lower one), and
+  routed experts with a SwiGLU clamp ride the expert kernels' limit word instead of being refused.
 - CUDA hybrid arm: MLA with a low-rank query (q_a, its norm, q_b), SwiGLU-OAI (MiniMax M3: α 1.702, β 1, clamp 7)
   in dense and routed FFNs, and a V narrower than the head (MiMo: 128 of 192), widened with zeros and cut back
   before the output projection. wgpu's token and batch graphs take the low-rank query too.
@@ -60,10 +81,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime for them. The `glm5_next` stack — four-stream mHC residuals, KDA recurrent mixers and NoPE MLA with
   the DSA indexer — is in: the published q2tp file answers the card's check ("What is 2+2?" → "4"). DSA's
   attention runs absorbed (kv_b through the query and the output instead of over every selected position; the
-  CPU text is the expanded form's to the byte), and on CUDA the routed experts and the shared expert run on
-  the card (`gpu::moe_row`: the host routes, the picks are built into card slots from the mapped file;
-  `CMF_GLM_CUDA_MOE=0` keeps them on the host). On an A40 pod with 46 GB of memory for the 116 GB file:
-  1.2 tokens/s on the CPU, 1.9 on CUDA after a 512-token prompt (96% of the picks already on the card).
+  CPU text is the expanded form's to the byte). On CUDA the whole stack runs on the card's graphs: the KDA and
+  NoPE MLA mixers, DeepSeek-V4's four-stream mHC (its Sinkhorn on the card), the dense and routed FFNs with
+  their SwiGLU clamp, the experts streamed through card slots; the prompt on the batch graph. Past 2048
+  positions, where DSA stops attending to every position, the indexer runs on the card too: its pooled keys,
+  the pool scores, the top-k selection and the attention over the selected latents (`CMF_GLM_GRAPH=0` keeps
+  the host stack). On an A40 pod with 46 GB of memory for the 116 GB file, decode after a 512-token prompt:
+  17.7 tokens/s (the host stack 1.9, the CPU 1.2), the prompt at 14 tokens/s; within 16 / 24 GB 4.1 / 5.7
+  (1.1 / 1.3); after a 3072-token prompt 19.7. The perplexity is the CPU's (2.715 against 2.715). On Vulkan the
+  same stack runs on the wgpu graphs (four-stream mHC kernels, the 288-expert select, DSA past 2048 positions on
+  the token graph, the experts in system-memory banks under card slots): on the A40 pod 15.5 tokens/s and the
+  first token of a 512-token prompt in 15 s, within 24 GB 9.8 tokens/s, perplexity 2.715; with the selection cut
+  to 64 positions, so that DSA selects within a short text, 2.728 as on the CPU (CUDA 2.730).
+- Vulkan: a model whose attention groups more than eight query heads on a K/V head (MiniMax-M3.1-Flash) kept an
+  f16 K/V mirror no attention kernel takes, so both graphs declined it and its experts ran on the host: within
+  24 GB on an A40 0.17 tokens/s and its first token in 1508 s, now 4.8 and 24.7 s. The mirror is f16 only for
+  a geometry the flash-decode kernels serve.
+- `cortiq bench` ran its untimed pair micro-benchmark per op with the routed experts on the card, which a model
+  whose experts live past the card ran out of memory on (MiniMax-M3.1-Flash on a whole A40 under Vulkan); it is
+  skipped for such a placement.
 
 ## [0.8.99] — 2026-11-15
 

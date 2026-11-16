@@ -945,6 +945,14 @@ impl Slot {
             say("prefix — no wgpu device (experts on the host path)");
             return Self::Off;
         }
+        // The whole-token graph places routed experts past the card itself
+        // (system-memory banks under card slots, or the stream through them):
+        // its own bank only on request. MiMo-V2.6 q4tp on an A40 pod, decode
+        // after a 512-token prompt: 14.0 tokens/s against 1.9 on this bank.
+        if forced.is_none() && exact.is_none() && graph_prefix && crate::gpu_wgpu::sys_experts_available() {
+            say("prefix — the token graph places the experts (system-memory banks under card slots)");
+            return Self::Off;
+        }
         if let Some(why) = bank_refusal(layers) {
             say(&format!("prefix — {why}"));
             return Self::Off;

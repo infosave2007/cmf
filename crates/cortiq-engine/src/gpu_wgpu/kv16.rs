@@ -50,11 +50,29 @@ pub(crate) fn forget(kv_id: u64) {
 
 /// A new uniform mirror of this sequence is made f16: it asked, and both
 /// graphs' f16 twins came up on this device.
-pub(crate) fn wanted(c: &Ctx, kv_id: u64) -> bool {
+pub(crate) fn wanted(c: &Ctx, kv_id: u64, nh: usize, nkv: usize, hd: usize) -> bool {
     device_ok(c)
         && notes().lock().unwrap().get(&kv_id).copied().unwrap_or(false)
         && pipes(c).is_some()
         && super::dense_batch::attn_for(c, true).is_some()
+        && geometry_ok(c, nh, nkv, hd)
+}
+
+/// The call's uniform geometry has an f16 kernel on every arm a mirror
+/// meets past the first positions: the token graph's flash-decoding split
+/// (`attend_fd`: at most 8 query heads a KV head, hd 64/128/256) and the
+/// batch graph's token-axis attend (the same group, hd ≤ 256). A wider
+/// group keeps f32 rows: MiniMax-M3.1's f16 mirror made both graphs decline
+/// and its experts ran on the host (0.17 tok/s within 24 GB).
+fn geometry_ok(c: &Ctx, nh: usize, nkv: usize, hd: usize) -> bool {
+    nkv > 0
+        && nh % nkv == 0
+        && nh / nkv <= 8
+        && hd <= 256
+        && hd % 4 == 0
+        && c.attend_dec
+        && c.attend_gpart.is_some()
+        && super::attend_fd::pipe(c, nh / nkv, hd, true).is_some()
 }
 
 /// `src` with the storage arrays `names` in f16: their declarations take
