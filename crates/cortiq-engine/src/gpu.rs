@@ -1292,7 +1292,20 @@ impl Drop for GpuPause {
 }
 
 pub fn enabled() -> bool {
-    !GPU_PAUSED.paused() && backend() != Backend::None
+    !GPU_LOST.load(std::sync::atomic::Ordering::Relaxed) && !GPU_PAUSED.paused() && backend() != Backend::None
+}
+
+/// Set once a frame found the device gone: every later op of the process runs
+/// on the host instead of building buffers on a dead device (Edge0 on an A40:
+/// after the device was lost the host fallback's first upload panicked inside
+/// wgpu, the other threads on its poisoned lock, and the process hung).
+static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The device is lost (`why`: what found it): the GPU path is off for good.
+pub fn mark_lost(why: &str) {
+    if !GPU_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("GPU device lost ({why}): the rest of this run stays on the CPU");
+    }
 }
 
 #[cfg(test)]
