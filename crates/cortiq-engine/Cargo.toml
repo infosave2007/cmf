@@ -21,7 +21,7 @@ exclude = [
 
 [dependencies]
 memmap2 = { workspace = true }
-cortiq-core = { path = "../cortiq-core", version = "0.8.24" }
+cortiq-core = { path = "../cortiq-core", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
