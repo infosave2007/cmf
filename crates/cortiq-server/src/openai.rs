@@ -2461,6 +2461,10 @@ struct ThinkStream {
     /// Whether any reasoning text has shipped yet; the newline the
     /// template opens the block with is not worth a delta.
     reasoning_opened: bool,
+    /// The closer came without answer text after it: the newlines that
+    /// lead the answer are dropped, as the non-streaming split drops them
+    /// (otherwise a lone `"\n\n"` delta precedes the answer or a call).
+    trim_answer_lead: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2495,6 +2499,7 @@ impl ThinkStream {
             pending: String::new(),
             opener_prefilled,
             reasoning_opened: false,
+            trim_answer_lead: false,
         }
     }
 
@@ -2507,11 +2512,20 @@ impl ThinkStream {
             pending: if opener { "<think>".to_string() } else { String::new() },
             opener_prefilled: opener,
             reasoning_opened: false,
+            trim_answer_lead: false,
         }
     }
 
     fn push(&mut self, token: &str) -> ThinkRelease {
         match self.phase {
+            ThinkPhase::Answer if self.trim_answer_lead => {
+                let text = token.trim_start_matches('\n');
+                if text.is_empty() {
+                    return ThinkRelease::default();
+                }
+                self.trim_answer_lead = false;
+                ThinkRelease { reasoning: None, content: Some(text.to_string()) }
+            }
             ThinkPhase::Answer => {
                 ThinkRelease { reasoning: None, content: Some(token.to_string()) }
             }
@@ -2602,6 +2616,7 @@ impl ThinkStream {
             let head = self.ship_reasoning(whole[..pos].to_string());
             let tail = whole[pos + "</think>".len()..].trim_start_matches('\n').to_string();
             self.phase = ThinkPhase::Answer;
+            self.trim_answer_lead = tail.is_empty();
             return ThinkRelease { reasoning: head, content: (!tail.is_empty()).then_some(tail) };
         }
         // Hold back the longest suffix that is still a prefix of the
@@ -2627,6 +2642,7 @@ impl ThinkStream {
             let tail = self.pending[pos + "</think>".len()..].trim_start_matches('\n').to_string();
             self.pending.clear();
             self.phase = ThinkPhase::Answer;
+            self.trim_answer_lead = tail.is_empty();
             return ThinkRelease { reasoning: None, content: (!tail.is_empty()).then_some(tail) };
         }
         let decided = (self.pending.len() > 100 && !self.pending.contains("<think>"))
@@ -2933,6 +2949,22 @@ mod tests {
         let mut stream = ThinkStream::new(false, false);
         let _ = stream.push("<think>private");
         assert_eq!(stream.finish(), ThinkRelease::default());
+    }
+
+    #[test]
+    fn think_stream_drops_newlines_leading_the_answer() {
+        // The closer arrives alone, the newlines in the next token: the
+        // stream starts the answer where the non-streaming split does.
+        let mut stream = ThinkStream::new(true, true);
+        assert_eq!(stream.push("plan").reasoning.as_deref(), Some("plan"));
+        assert_eq!(stream.push("</think>"), ThinkRelease::default());
+        assert_eq!(stream.push("\n\n"), ThinkRelease::default());
+        assert_eq!(stream.push("\nHi").content.as_deref(), Some("Hi"));
+        assert_eq!(stream.push("\n\nmore").content.as_deref(), Some("\n\nmore"));
+        // The same for the disabled-thinking strip of a prefilled empty block.
+        let mut stream = ThinkStream::new(false, false);
+        assert_eq!(stream.push("</think>"), ThinkRelease::default());
+        assert_eq!(stream.push("\n\nOk").content.as_deref(), Some("Ok"));
     }
 
     #[test]
