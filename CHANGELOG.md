@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-16
+
 ### Added
 - MoE placement for any card size, CUDA hybrid arm: the dense matrices and the attention go to the card first;
   routed experts past it stream through card slots (least recently used giving way) when they are more than an
