@@ -1,6 +1,6 @@
 """Training tasks of "reasoning over a card", disjoint from the R set.
 
-    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7]
+    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N]
 
 Output: one `{"messages": [user, assistant], "group": ..., "cat": ...}` per
 line, the `messages` format of `cortiq-embryo sft-prepare` (`group` drives
@@ -22,6 +22,30 @@ that is what the fine-tune is meant to teach.
           with a directory listing; a few flag and sudo patterns)
   two     a pipeline of a listing command and a filter, from two cards
   arith   a number read or computed from a small table
+
+--contrast N appends N tasks, drawn from their own generator (the tasks before
+them stay byte-identical), that take the wording of `two` away as a cue:
+  direct  the listing command of a pipeline alone ("Print the CPU information.")
+  slot    a filter of a pipeline applied to a file, one command ("Show
+          /srv/a.txt encoded as Base64.")
+  two     pipelines over more filters, in the frames of the other requests
+          ("How do I ...?", "I need to ...", "Please ...") and with more verbs
+Without them a model learns that "Print/Show/List/Display <text operation>"
+means two commands: at half of the base it opened 39 of R's 128 one-command
+slot tasks as a pipeline (journal, the 50 % milestone).
+
+--pipes N appends N more tasks from a third generator: pipelines over many
+commands. `two` above pairs 15 listings with 8 filters, a set small enough to
+know by heart, and a model that knows it by heart writes those names for any
+pipeline instead of reading the cards. Here the listing is an example of any
+page whose caption says what it prints ("List all partitions" -> "all
+partitions"), the filter one of PIPE_FILTERS, an example of a card in the form
+that reads `stdin` (the card's command without its file, or the part after the
+pipe), and the request names the result ("Show the lines of all partitions
+that match cache."):
+  two     7 in 10: listing | filter, from two cards
+  slot    2 in 10: the same filter over a file, one command, in the same words
+  slot, direct  1 in 10: the listing alone
 
 The generator is a program over tldr-pages (CC-BY 4.0) text; no model wrote
 any of the data.
@@ -255,7 +279,80 @@ def msg(prompt, answer, group, cat):
             "group": group, "cat": cat}
 
 
-def generate(tldr: Path, n: int, seed: int) -> list[dict]:
+def framed(body: str, rng) -> str:
+    """A request in the frames of request(): bare, "How do I", "I need to", "Please"."""
+    lead = rng.random()
+    low = body[0].lower() + body[1:]
+    if lead < 0.12:
+        return f"How do I {low}?"
+    if lead < 0.24:
+        return f"I need to {low}."
+    if lead < 0.32:
+        return f"Please {low}."
+    return body + "."
+
+
+LISTS = ("List", "Show", "Display", "Print", "Get", "Dump", "Output")
+ARTICLES = ("the", "all", "every", "information", "details", "detailed", "available", "installed", "running", "current", "active")
+FILE_END = re.compile(r" \{\{[^{}]*(?:file|path)[^{}]*\}\}$")
+SUMS = [("sha1sum", "SHA1"), ("sha224sum", "SHA224"), ("sha384sum", "SHA384"), ("sha512sum", "SHA512"), ("b2sum", "BLAKE2"),
+        ("b3sum", "BLAKE3"), ("shasum", "SHA1")]
+PIPE_FILTERS = [  # (page, the card's example, requests over {s}: what is filtered, {v}: the example's first value)
+    ("common/base64", "base64 {{path/to/file}}", ["{s} encoded as Base64", "the Base64 encoding of {s}"]),
+    ("common/base64", "base64 -d {{path/to/file}}", ["{s} decoded from Base64"]),
+    ("common/base32", "base32 {{path/to/file}}", ["{s} encoded as Base32", "the Base32 encoding of {s}"]),
+    ("common/base32", "base32 -d {{path/to/file}}", ["{s} decoded from Base32"]),
+    *[(f"common/{c}", c + " {{path/to/file1 path/to/file2 ...}}", [f"the {n} checksum of {{s}}", f"{{s}} and compute the {n} checksum of that output"])
+      for c, n in SUMS],
+    ("common/cksum", "cksum {{path/to/file}}", ["the CRC checksum and byte count of {s}"]),
+    ("common/sum", "sum {{path/to/file}}", ["the BSD checksum and block count of {s}"]),
+    ("common/rhash", "rhash {{path/to/file}}", ["the CRC32 digest of {s}"]),
+    ("common/expand", "expand {{path/to/file}}", ["{s} with tabs converted to spaces"]),
+    ("common/expand", "expand -t {{number}} {{path/to/file}}", ["{s} with tabs converted to spaces, tab stops {v} characters apart"]),
+    ("common/unexpand", "unexpand {{path/to/file}}", ["{s} with leading blanks converted to tabs"]),
+    ("common/unexpand", "unexpand -a {{path/to/file}}", ["{s} with all blanks converted to tabs"]),
+    ("common/fmt", "fmt {{path/to/file}}", ["{s} reformatted into paragraphs"]),
+    ("common/fmt", "fmt -w {{n}} {{path/to/file}}", ["{s} reformatted to lines of at most {v} characters"]),
+    ("common/fmt", "fmt -u {{path/to/file}}", ["{s} reformatted with uniform spacing"]),
+    ("common/fold", "fold {{path/to/file}}", ["{s} wrapped to the default width"]),
+    ("linux/fold", "fold -w {{width}} {{path/to/file}}", ["{s} wrapped to a width of {v} characters", "{s} folded to lines {v} characters wide"]),
+    ("linux/fold", "fold -s -w {{width}} {{path/to/file}}", ["{s} wrapped at blanks to a width of {v} characters"]),
+    ("linux/rev", "rev {{path/to/file}}", ["{s} with every line reversed"]),
+    ("common/od", "od {{path/to/file}}", ["{s} as an octal dump", "an octal dump of {s}"]),
+    ("common/hexdump", "hexdump {{path/to/file}}", ["{s} as a hexadecimal dump", "a hexadecimal dump of {s}"]),
+    ("common/hexdump", "hexdump -C {{path/to/file}}", ["a hexadecimal dump of {s} with an ASCII column"]),
+    ("common/hexyl", "hexyl {{path/to/file}}", ["the hexadecimal representation of {s}"]),
+    ("common/hexyl", "hexyl -n {{n}} {{path/to/file}}", ["the hexadecimal representation of the first {v} bytes of {s}"]),
+    ("common/strings", "strings {{path/to/file}}", ["the printable strings of {s}", "only the printable strings in {s}"]),
+    ("common/strings", "strings -n {{n}} {{path/to/file}}", ["the printable strings of {s} that are at least {v} characters long"]),
+    ("common/rg", "rg {{pattern}} {{path/to/file_or_directory}}",
+     ["the lines of {s} that match {v}", "only the lines of {s} that contain {v}", "{s}, keeping the lines that match {v}"]),
+    ("common/ugrep", 'ugrep -n "{{search_pattern}}" {{path/to/file_or_directory}}', ["the lines of {s} that match {v}, with their line numbers"]),
+    ("common/gawk", "gawk '{print $5}' {{path/to/file}}", ["the fifth column of {s}", "only the fifth column of {s}"]),
+    ("common/gawk", "gawk '/{{pattern}}/ {print $2}' {{path/to/file}}", ["the second column of the lines of {s} that match {v}"]),
+    ("common/gawk", "gawk -F ',' '{print $NF}' {{path/to/file}}", ["the last comma-separated column of {s}"]),
+    ("common/gawk", "gawk '{s+=$1} END {print s}' {{path/to/file}}", ["the sum of the first column of {s}", "the total of the values in the first column of {s}"]),
+    ("common/gawk", "gawk 'NR%3==1' {{path/to/file}}", ["every third line of {s}, starting from the first"]),
+    ("common/bat", "bat -n {{path/to/file}}", ["{s} with line numbers"]),
+    ("common/bat", "bat -A {{path/to/file}}", ["{s} with the non-printable characters made visible"]),
+    ("common/lolcat", "lolcat {{path/to/file}}", ["{s} in rainbow colors"]),
+    ("common/more", "more {{path/to/file}}", ["{s} one screen at a time"]),
+    ("common/lpr", "lpr {{path/to/file}}", ["Send {s} to the default printer"]),
+    ("common/pr", "pr {{path/to/file1 path/to/file2 ...}}", ["{s} paginated with a header and a footer"]),
+    ("common/hunspell", "hunspell -l {{path/to/file}}", ["the misspelled words in {s}"]),
+    ("common/aspell", "cat {{path/to/file}} | aspell list", ["the misspelled words in {s}"]),
+    ("common/tee", 'echo "example" | tee {{path/to/file}}', ["{s} and also save that output to {v}", "Save {s} to {v} and still show it"]),
+    ("common/tee", 'echo "example" | tee -a {{path/to/file}}', ["{s} and also append that output to {v}"]),
+    ("common/ts", "{{command}} | ts", ["{s} with a timestamp at the beginning of each line", "Put a timestamp before each line of {s}"]),
+    ("linux/column", 'printf "header1 header2\\nbar foo\\n" | column -t', ["{s} aligned as a table", "{s} with the columns aligned"]),
+    ("linux/col", "{{command}} | col -b", ["{s} with the backspaces removed"]),
+    ("linux/wl-copy", "{{ls}} | wl-copy", ["Copy {s} to the clipboard", "Put {s} on the clipboard"]),
+    ("linux/xsel", "echo 123 | xsel -ib", ["Copy {s} to the clipboard"]),
+    ("common/figlet", "{{command}} | figlet", ["{s} as a large ASCII banner"]),
+]
+
+
+def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0) -> list[dict]:
     rng = random.Random(seed)
     used = set()
     for f in F.FAMILIES:
@@ -568,7 +665,168 @@ def generate(tldr: Path, n: int, seed: int) -> list[dict]:
                       ("react", react), ("fix", fix), ("two", two), ("arith", arith)):
         many(cat, make)
     rng.shuffle(out)
-    return out
+    if not contrast and not pipes:
+        return out
+
+    # One command in the wording of `two`, and `two` in more wordings: its own generator, appended.
+    rng = random.Random(seed + 4409)
+    more_filters = filters + [f for f in [
+        ("common/base32", "base32", "encoded as Base32"),
+        ("common/sha512sum", "sha512sum", "and compute the SHA512 checksum of that output"),
+        ("common/sha224sum", "sha224sum", "and compute the SHA224 checksum of that output"),
+        ("common/sha384sum", "sha384sum", "and compute the SHA384 checksum of that output"),
+        ("common/b2sum", "b2sum", "and compute the BLAKE2 checksum of that output"),
+        ("common/unexpand", "unexpand", "with spaces converted to tabs"),
+        ("linux/rev", "rev", "with every line reversed"),
+        ("common/od", "od", "as an octal dump"),
+        ("common/hexdump", "hexdump", "as a hexadecimal dump"),
+    ] if f[0] in pages]
+    on_file = [f for f in [  # (page, the example's template, phrases over {f}, {n}: the values in the template's order)
+        ("common/base64", "base64 {{path/to/file}}", ["{f} encoded as Base64"]),
+        ("common/base32", "base32 {{path/to/file}}", ["{f} encoded as Base32"]),
+        ("common/sha1sum", "sha1sum {{path/to/file1 path/to/file2 ...}}", ["the SHA1 checksum of {f}"]),
+        ("common/sha224sum", "sha224sum {{path/to/file1 path/to/file2 ...}}", ["the SHA224 checksum of {f}"]),
+        ("common/sha384sum", "sha384sum {{path/to/file1 path/to/file2 ...}}", ["the SHA384 checksum of {f}"]),
+        ("common/sha512sum", "sha512sum {{path/to/file1 path/to/file2 ...}}", ["the SHA512 checksum of {f}"]),
+        ("common/b2sum", "b2sum {{path/to/file1 path/to/file2 ...}}", ["the BLAKE2 checksum of {f}"]),
+        ("common/cksum", "cksum {{path/to/file}}", ["the CRC checksum of {f}"]),
+        ("common/expand", "expand {{path/to/file}}", ["{f} with tabs converted to spaces"]),
+        ("common/unexpand", "unexpand {{path/to/file}}", ["{f} with spaces converted to tabs"]),
+        ("common/fmt", "fmt {{path/to/file}}", ["{f} reformatted into paragraphs"]),
+        ("common/fmt", "fmt -w {{n}} {{path/to/file}}", ["{f} reformatted to lines of at most {n} characters"]),
+        ("common/fold", "fold {{path/to/file}}", ["{f} wrapped to the default width"]),
+        ("linux/rev", "rev {{path/to/file}}", ["{f} with every line reversed"]),
+        ("common/od", "od {{path/to/file}}", ["{f} as an octal dump"]),
+        ("common/hexdump", "hexdump {{path/to/file}}", ["{f} as a hexadecimal dump"]),
+        ("common/strings", "strings {{path/to/file}}", ["the printable strings of {f}"]),
+    ] if f[0] in pages and any(c == f[1] for _, c in pages[f[0]][2])]
+    src_verbs = ["Show", "Print", "List", "Display", "Output", "Get"]
+
+    def source_alone():
+        sp, scmd, sphr = rng.choice(sources)
+        name, desc, ex = pages[sp]
+        i = next(k for k, (_, c) in enumerate(ex) if c == scmd)
+        card = card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+        return msg(f"Reference card:\n{card}\n\nTask: {framed(rng.choice(src_verbs) + ' ' + sphr, rng)}\n\n{one}", scmd, sp, "direct")
+
+    def filter_on_file():
+        page, tpl, phrases = rng.choice(on_file)
+        name, desc, ex = pages[page]
+        i = next(k for k, (_, c) in enumerate(ex) if c == tpl)
+        _, cmd, pairs = fill_example(ex[i][0], tpl, rng)
+        v = {"f": " and ".join(pairs[-1][1].split(" ")), "n": pairs[0][1]}
+        phrase = rng.choice(phrases).format(**v)
+        verbs = ["Show", "Print", "Display", "Output"] + (["Compute", "Get"] if "checksum" in phrase else [])
+        card = card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+        return msg(f"Reference card:\n{card}\n\nTask: {framed(rng.choice(verbs) + ' ' + phrase, rng)}\n\n{one}", cmd, page, "slot")
+
+    def two_more():
+        sp, scmd, sphr = rng.choice(sources)
+        fp, fcmd, fphr = rng.choice(more_filters)
+        v = {"n": str(rng.randint(20, 120)), "f": rfile(rng, "txt")}
+        sub = lambda t: t.replace("{n}", v["n"]).replace("{f}", v["f"])
+        cards = []
+        for pg, must in ((sp, scmd), (fp, None)):
+            name, desc, ex = pages[pg]
+            i = next((k for k, (_, c) in enumerate(ex) if c == must), 0)
+            cards.append(card_text(name, desc, trim(ex, i, min(4, len(ex)), rng) if must else ex[:4]))
+        if rng.random() < 0.5:
+            cards.reverse()
+        task = framed(f"{rng.choice(src_verbs)} {sphr} {sub(fphr)}", rng)
+        return msg("Reference cards:\n" + "\n\n".join(cards) + f"\n\nTask: {task}\n\n{one}", f"{scmd} | {sub(fcmd)}", sp, "two")
+
+    extra = []
+    for share, make in ((0.2, source_alone), (0.5, filter_on_file), (0.3, two_more)):
+        extra += [make() for _ in range(int(contrast * share))]
+    rng.shuffle(extra)
+    out = out + extra
+    if not pipes:
+        return out
+
+    # Pipelines over many commands: a listing of any page and a filter that reads it. Its own generator, appended.
+    rng = random.Random(seed + 7717)
+    flt = []  # (page, the example's index, its form that reads `stdin`, requests)
+    for page, tpl, phrases in PIPE_FILTERS:
+        i = next((k for k, (_, c) in enumerate(pages[page][2]) if c == tpl), None) if page in pages else None
+        if i is not None:
+            flt.append((page, i, tpl.rsplit(" | ", 1)[1] if " | " in tpl else FILE_END.sub("", tpl), phrases))
+    on_files = [f for f in flt if " | " not in pages[f[0]][2][f[1]][1]]
+    plain = [k for k in keys if k.split("/")[0] in ("common", "linux")]
+
+    def listing():
+        """(page, the example's index, the command, what it prints as a noun phrase, whether values were filled in)."""
+        if rng.random() < 0.12:
+            sp, scmd, sphr = rng.choice(sources)
+            return sp, next(k for k, (_, c) in enumerate(pages[sp][2]) if c == scmd), scmd, sphr, False
+        for _ in range(60):  # most pages have no such example: draw pages until one has
+            page = rng.choice(plain)
+            ex = pages[page][2]
+            order = list(range(len(ex)))
+            rng.shuffle(order)
+            for i in order:
+                w, c = ex[i]
+                first = w.split(" ")[0]
+                if first not in LISTS or re.search(r"[|<>;&]", c):
+                    continue
+                try:
+                    d, cmd, pairs = fill_example(w, c, rng)
+                except Skip:
+                    continue
+                filled = bool(pairs) or d != w
+                d = clean_desc(d)
+                if pairs:
+                    if len(pairs) != 1 or not NOUN.search(d):
+                        continue
+                    d = NOUN.sub(lambda m: pairs[0][1], d, count=1)
+                noun = d[len(first) + 1:]
+                if len(cmd) <= 70 and len(noun) <= 80 and noun.split(" ")[0] in ARTICLES:
+                    return page, i, cmd, noun, filled
+        raise Skip
+
+    def worded(phrase):
+        return framed(phrase if phrase[0].isupper() else f"{rng.choice(src_verbs)} {phrase}", rng)
+
+    def shown(page, i):
+        name, desc, ex = pages[page]
+        return card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+
+    def pipeline():
+        sp, si, scmd, noun, _ = listing()
+        fp, fi, form, phrases = rng.choice(flt)
+        if pages[fp][0] == pages[sp][0]:
+            raise Skip
+        _, fcmd, pairs = fill_example(pages[fp][2][fi][0], form, rng)
+        task = worded(rng.choice(phrases).format(s=noun, v=pairs[0][1] if pairs else ""))
+        cards = [shown(sp, si), shown(fp, fi)]
+        if rng.random() < 0.5:
+            cards.reverse()
+        return msg("Reference cards:\n" + "\n\n".join(cards) + f"\n\nTask: {task}\n\n{one}", f"{scmd} | {fcmd}", sp, "two")
+
+    def on_a_file():
+        fp, fi, _, phrases = rng.choice(on_files)
+        w, tpl = pages[fp][2][fi]
+        _, cmd, pairs = fill_example(w, tpl, rng)
+        phrases = [p for p in phrases if "that output" not in p] or phrases
+        task = worded(rng.choice(phrases).format(s=" and ".join(pairs[-1][1].split(" ")), v=pairs[0][1]))
+        return msg(f"Reference card:\n{shown(fp, fi)}\n\nTask: {task}\n\n{one}", cmd, fp, "slot")
+
+    def listing_alone():
+        sp, si, scmd, noun, filled = listing()
+        task = framed(f"{rng.choice(src_verbs)} {noun}", rng)
+        return msg(f"Reference card:\n{shown(sp, si)}\n\nTask: {task}\n\n{one}", scmd, sp, "slot" if filled else "direct")
+
+    more = []
+    for share, make in ((0.7, pipeline), (0.2, on_a_file), (0.1, listing_alone)):
+        want, got, tries = int(pipes * share), 0, 0
+        while got < want and tries < want * 60:
+            tries += 1
+            try:
+                more.append(make())
+                got += 1
+            except Skip:
+                pass
+    rng.shuffle(more)
+    return out + more
 
 
 def main() -> None:
@@ -577,8 +835,14 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", type=int, default=90000)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--contrast", type=int, default=0,
+                    help="append N tasks that take the wording of `two` away as a cue: its listing alone, "
+                         "its filters applied to a file, pipelines in more wordings")
+    ap.add_argument("--pipes", type=int, default=0,
+                    help="append N tasks of pipelines over many commands: a listing of any page and a filter that reads "
+                         "it (7 in 10), the same filter over a file (2 in 10), the listing alone (1 in 10)")
     args = ap.parse_args()
-    rows = generate(Path(args.tldr), args.n, args.seed)
+    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes)
     seen, uniq = set(), []
     for r in rows:
         key = (r["messages"][0]["content"], r["messages"][1]["content"])

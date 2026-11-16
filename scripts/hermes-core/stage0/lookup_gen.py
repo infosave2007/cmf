@@ -1,6 +1,7 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
+                            [--ranked] [--need] [--teach P] [--pipes]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -46,6 +47,20 @@ does: the choice is written next to what it is made from. It draws nothing
 from the generator, so a set with it holds the same conversations as the
 set without. The default output is byte-identical to the set the base run's
 shard was made from.
+
+`--pipes`: a pipeline is fetched and built like any other answer. Without it
+the model announces "two commands" before any card and asks the store for
+both BY NAME: it has to know the names already, and on commands it has not
+seen it writes names from the training set and never reads what came back
+(at half of the base: 0 of R's 27 pipelines, the queries were "l, fmt",
+"data, fold"). With it the first query says what is needed, like every other
+lookup; the two cards come back together (sometimes with a neighbour), or one
+comes back and the model asks for the other by what it does; in one
+conversation in four both cards are already in the user turn. The reasoning
+says that one card does not do all of it, which card gives the output and
+which works on it, then each card's example and its values; the second
+example is used without its file, or it is the part after the pipe of the
+card's own example.
 """
 
 from __future__ import annotations
@@ -152,13 +167,40 @@ def find(cards, cmd):
     return best[1:]
 
 
+FILE_END = re.compile(r" \{\{[^{}]*(?:file|path)[^{}]*\}\}$")
+
+
+def find_piped(card, cmd):
+    """(what, template, [(placeholder, value)], how) of the card example the command is the `stdin` form of.
+
+    The form is the example without the file at its end (how = "file") or,
+    for an example that is itself a pipeline, the part after its pipe
+    ("pipe"). Of several matching examples the one with the most literal text.
+    """
+    best = None
+    for what, tpl in card["ex"]:
+        if " | " in tpl:
+            form, how = tpl.rsplit(" | ", 1)[1], "pipe"
+        elif FILE_END.search(tpl):
+            form, how = FILE_END.sub("", tpl), "file"
+        else:
+            continue
+        pairs = match(form, cmd)
+        if pairs is None:
+            continue
+        literal = len(re.sub(r"\{\{.*?\}\}", "", form))
+        if best is None or literal > best[0]:
+            best = (literal, what, tpl, pairs, how)
+    return best[1:] if best else None
+
+
 LEAD = re.compile(r"^(How do I|I need to|Please|On (Linux|macOS|Windows)[:,])\s+", re.I)
 
 
-def vague(task: str, rng, tail=False) -> str:
+def vague(task: str, rng, tail=False, k=None) -> str:
     """A loose query: a few words of the task, without its values."""
     words = [w for w in LEAD.sub("", LEAD.sub("", task)).rstrip(".?").split() if not re.search(r"[/\\=:@]|\d", w)]
-    k = rng.randint(3, 5)
+    k = k or rng.randint(3, 5)
     return " ".join(words[-k:] if tail else words[:k]).lower().strip(" ,;—-")
 
 
@@ -219,7 +261,7 @@ def pattern_think(card, what, tpl, pairs, lead="", cite=False):
     return head + " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "."
 
 
-def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False):
+def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat in ("react", "arith"):
@@ -260,6 +302,48 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked
         end = said(last, "None of them covers the task.") if weigh and last else "None of the cards covers this task."
         turns.append(("assistant", pre + end, "NONE", []))
         return "none", turns
+
+    if cat == "two" and pipes:
+        a, _, b = answer.partition(" | ")
+        got = None
+        for ca, cb in ((cards[0], cards[1]), (cards[1], cards[0])) if len(cards) == 2 else ():
+            ha, hb = find([ca], a), find_piped(cb, b)
+            if ha and hb and not ca["os"] and not cb["os"]:
+                got = (ca, cb, ha, hb)
+                break
+        if not got:
+            raise Skip
+        ca, cb, (_, wa, ta, pa), (wb, tb, pb, how) = got
+        fill = lambda pairs: " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "." if pairs else " No values to fill in."
+        reads = (f"`{tb}`, without the file: it reads the output of {ca['name']}." if how == "file"
+                 else f"`{tb}`: the part after the pipe, on the output of {ca['name']}.")
+        think = (f"One card does not do all of it: {ca['name']} gives the output, {cb['name']} works on it. "
+                 f"Card {ca['name']}: `{ta}`.{fill(pa)} Card {cb['name']}: {reads}{fill(pb)} Join them with a pipe.")
+        final = lambda pre: ("assistant", pre + think, None, [call("terminal", command=answer)])
+        mode = rng.random()
+        if mode < 0.25:  # both cards are already in the user turn
+            return "two", [("user", f"Reference cards:\n{store(cards)}\n\n{user}"), final("")]
+        pre = f"Need: {need_of(task)}. " if need else ""
+        q = vague(task, rng, k=rng.randint(5, 9))  # what is needed, as for any lookup: no command names
+        turns = [("user", user), ("assistant", rng.choice(NEED), None, [call("lookup", query=q)])]
+        both = {ca["name"], cb["name"]}
+        if mode < 0.75:  # the router returns both for the need, sometimes with a neighbour
+            shown = [ca, cb]
+            rng.shuffle(shown)
+            if rng.random() < 0.4:
+                extra = others(1, both, f"{q} {task}")
+                shown = extra + shown if ranked and rng.random() < 0.7 else rng.sample(extra + shown, 3)
+            return "two", turns + [("tool", store(shown)), final(pre)]
+        if rng.random() < 0.6:  # one of the two came back: ask for the other by what it does
+            have, miss, q2 = ca, cb, what_query(wb)
+            why = f"Card {ca['name']} gives the output; no card here works on it. Look that up."
+        else:
+            have, miss, q2 = cb, ca, what_query(wa)
+            why = f"Card {cb['name']} works on an output; the command that gives it is not here. Look that up."
+        first = [have] + (others(rng.choice([1, 2]), both, f"{q} {task}") if rng.random() < 0.5 else [])
+        rng.shuffle(first)
+        return "two", turns + [("tool", store(first)), ("assistant", pre + why, None, [call("lookup", query=q2)]),
+                               ("tool", miss["text"]), final(pre)]
 
     if cat == "two":
         a, _, b = answer.partition(" | ")
@@ -404,6 +488,9 @@ def main() -> None:
                          "several always opens the same way, fewer first queries miss, NONE also with the cards in the user turn")
     ap.add_argument("--need", action="store_true",
                     help="after a tool response the reasoning first says what is needed, in the words of a card's caption")
+    ap.add_argument("--pipes", action="store_true",
+                    help="a pipeline is looked up by what is needed, not by command names, and built from the cards that "
+                         "came back: which gives the output, which works on it, each example and its values")
     ap.add_argument("--teach", type=float, default=0.0,
                     help="share of conversations where the store lacks the command, the user gives it after NONE and the model "
                          "saves a card with the note tool; half of the other conversations then list that tool too, and in "
@@ -430,7 +517,7 @@ def main() -> None:
             gzip.open(args.out + ".val.jsonl.gz", "wt", encoding="utf-8") as fv:
         for r in recs:
             try:
-                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need)
+                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes)
                 direct = mode == "direct"
                 tools = TOOLS
                 if args.teach > 0 and not direct:

@@ -40,6 +40,7 @@ mk b_lookup.u16 1 $P/lookup.jsonl.gz
 mk b_lookup4.u16 1 $P/lookup4.jsonl.gz  # lookup_gen.py --near 0.8 --ranked
 mk b_lookup5.u16 1 $P/lookup5.jsonl.gz  # lookup_gen.py --near 0.8 --ranked --need
 mk b_lookup6.u16 1 $P/lookup6.jsonl.gz  # lookup_gen.py --near 0.8 --ranked --need --teach 0.06
+mk b_lookup7.u16 1 $P/lookup7.jsonl.gz  # the same over train_gen.py --contrast 5200
 mk b_q27_answers.u16 1 $P/q27_answers.jsonl.gz  # q27_data.py: answers of Qwen3.8-27B to coding prompts
 mk b_q27_chat.u16 1 $P/q27_chat.jsonl.gz
 mk b_q27_code.u16 0 $P/q27_code.jsonl.gz
