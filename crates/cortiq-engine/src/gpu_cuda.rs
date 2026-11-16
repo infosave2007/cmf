@@ -265,6 +265,21 @@ fn mem_free() -> Option<u64> {
     cu::mem_get_info().ok().map(|_| card_free() as u64)
 }
 
+/// Some hybrid plan streams its routed experts through card slots (they
+/// live past the card): the per-op path has no such placement.
+pub(crate) fn experts_streamed() -> bool {
+    hyb::STREAMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The card's size for placement: the driver's total, or `CMF_GPU_VRAM_MB`.
+pub(crate) fn card_total() -> usize {
+    let (_, total) = cu::mem_get_info().unwrap_or((0, 0));
+    match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(mb) => total.min(mb << 20),
+        None => total,
+    }
+}
+
 /// The card's free bytes for placement: the driver's figure, and under
 /// `CMF_GPU_VRAM_MB` a card of that size (what is in use counts against it) —
 /// so a 12, 16 or 24 GB card's placement runs on a bigger one exactly as it

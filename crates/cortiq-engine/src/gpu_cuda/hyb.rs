@@ -1046,18 +1046,83 @@ thread_local! {
 /// an allocation of their own.
 fn staged(data: &[u8]) -> Res<Buf> {
     if let Some(b) = arena_take(&STAGE, data.len() + 64) {
-        unsafe { super::htod(b.ptr, data)? };
+        unsafe { put_sync(b.ptr, data)? };
         return Ok(b);
     }
-    Buf::from_slice(data)
+    upload(data)
 }
 
-/// Mapped, pinned host memory (`cuMemHostAlloc`, PORTABLE | DEVICEMAP): a
-/// plan's weights past the card's room, read by the kernels over the bus.
+/// Host bytes in card memory of their own (64 spare bytes, as
+/// `Buf::from_slice`), a VMM block's by its address.
+fn upload(data: &[u8]) -> Res<Buf> {
+    if !in_vmm(data) {
+        return Buf::from_slice(data);
+    }
+    let b = Buf::new(data.len() + 64)?;
+    unsafe { put_sync(b.ptr, data)? };
+    Ok(b)
+}
+
+/// The VMM host blocks alive (address, size): the copies from and into them
+/// go by their address (`cuMemcpy`, unified addressing), which the driver
+/// serves by DMA, instead of `cuMemcpyHtoD`'s host-side read of what it takes
+/// for pageable memory.
+static VMM_BLOCKS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn in_vmm(data: &[u8]) -> bool {
+    let p = data.as_ptr() as usize;
+    VMM_BLOCKS.lock().is_ok_and(|v| v.iter().any(|&(a, n)| p >= a && p + data.len() <= a + n))
+}
+
+/// Host bytes (a VMM block's among them) to card memory, landed on return.
+///
+/// # Safety
+/// `dst` must hold `data.len()` bytes.
+unsafe fn put_sync(dst: u64, data: &[u8]) -> Res<()> {
+    if !in_vmm(data) {
+        return unsafe { super::htod(dst, data) };
+    }
+    let rc = unsafe { cs::cuMemcpy(dst, data.as_ptr() as u64, data.len()) };
+    if rc != cs::cudaError_enum::CUDA_SUCCESS {
+        return Err(format!("copy from VMM host memory: {rc:?}"));
+    }
+    unsafe { cu::stream::synchronize(std::ptr::null_mut()).map_err(derr) }
+}
+
+/// Host bytes to card memory, queued on `stream` (a VMM block by its address).
+///
+/// # Safety
+/// `dst` must hold `data.len()` bytes; `data` must stay until the copy is done.
+unsafe fn put_async(dst: u64, data: &[u8], stream: cs::CUstream) -> Res<()> {
+    if !in_vmm(data) {
+        return unsafe { cu::memcpy_htod_async(dst, data, stream).map_err(derr) };
+    }
+    let rc = unsafe { cs::cuMemcpyAsync(dst, data.as_ptr() as u64, data.len(), stream) };
+    if rc == cs::cudaError_enum::CUDA_SUCCESS { Ok(()) } else { Err(format!("copy from VMM host memory: {rc:?}")) }
+}
+
+/// Card memory to host bytes, queued on `stream` (a VMM block by its address).
+///
+/// # Safety
+/// `src` must hold `data.len()` bytes; `data` must stay until the copy is done.
+unsafe fn get_async(data: &mut [u8], src: u64, stream: cs::CUstream) -> Res<()> {
+    if !in_vmm(data) {
+        return unsafe { cu::memcpy_dtoh_async(data, src, stream).map_err(derr) };
+    }
+    let rc = unsafe { cs::cuMemcpyAsync(data.as_mut_ptr() as u64, src, data.len(), stream) };
+    if rc == cs::cudaError_enum::CUDA_SUCCESS { Ok(()) } else { Err(format!("copy into VMM host memory: {rc:?}")) }
+}
+
+/// Mapped, pinned host memory (`cuMemHostAlloc`, PORTABLE | DEVICEMAP, or
+/// the driver's VMM allocations at a host location): a plan's weights past
+/// the card's room, read by the kernels over the bus, and the RAM tier.
 pub(super) struct HostArena {
     host: *mut std::ffi::c_void,
     dev: u64,
     len: usize,
+    /// A VMM block's handle and mapped size (`new_vmm`): the host and the
+    /// card see it at one address.
+    vmm: Option<(u64, usize)>,
 }
 
 // SAFETY: the block is owned by the state and freed once, on drop.
@@ -1074,7 +1139,70 @@ impl HostArena {
             let _ = unsafe { cu::free_host(host) };
             return Err(format!("mapped host memory: no device address ({rc:?})"));
         }
-        Ok(Self { host, dev, len })
+        Ok(Self { host, dev, len, vmm: None })
+    }
+
+    /// Host memory from the driver's VMM allocations (`cuMemCreate` at a host
+    /// location), mapped for this context's card and for the host at one
+    /// address. A container's limit may not count it where it counts
+    /// `cuMemHostAlloc`'s pages (`host_kind`).
+    fn new_vmm(len: usize) -> Res<Self> {
+        use cs::cudaError_enum::CUDA_SUCCESS as OK;
+        let ck = |rc: cs::CUresult, what: &str| if rc == OK { Ok(()) } else { Err(format!("VMM host memory of {len} bytes: {what} ({rc:?})")) };
+        // SAFETY: plain-data structs of the driver API, zero a valid default
+        let mut prop: cs::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        prop.type_ = cs::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type_ = cs::CUmemLocationType::CU_MEM_LOCATION_TYPE_HOST;
+        prop.location.id = 0;
+        let mut gran = 0usize;
+        ck(unsafe { cs::cuMemGetAllocationGranularity(&mut gran, &prop, cs::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM) }, "granularity")?;
+        let size = len.max(1).next_multiple_of(gran.max(4096));
+        let mut h: cs::CUmemGenericAllocationHandle = 0;
+        ck(unsafe { cs::cuMemCreate(&mut h, size, &prop, 0) }, "create")?;
+        let mut va: cs::CUdeviceptr = 0;
+        if let Err(e) = ck(unsafe { cs::cuMemAddressReserve(&mut va, size, 0, 0, 0) }, "address") {
+            unsafe { cs::cuMemRelease(h) };
+            return Err(e);
+        }
+        let undo = |mapped: bool| unsafe {
+            if mapped {
+                cs::cuMemUnmap(va, size);
+            }
+            cs::cuMemAddressFree(va, size);
+            cs::cuMemRelease(h);
+        };
+        if let Err(e) = ck(unsafe { cs::cuMemMap(va, size, 0, h, 0) }, "map") {
+            undo(false);
+            return Err(e);
+        }
+        let mut card: cs::CUdevice = 0;
+        if let Err(e) = ck(unsafe { cs::cuCtxGetDevice(&mut card) }, "device") {
+            undo(true);
+            return Err(e);
+        }
+        let desc = |type_, id| cs::CUmemAccessDesc { location: cs::CUmemLocation { type_, id }, flags: cs::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE };
+        let acc = [desc(cs::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE, card), desc(cs::CUmemLocationType::CU_MEM_LOCATION_TYPE_HOST, 0)];
+        if let Err(e) = ck(unsafe { cs::cuMemSetAccess(va, size, acc.as_ptr(), acc.len()) }, "access") {
+            undo(true);
+            return Err(e);
+        }
+        if let Ok(mut v) = VMM_BLOCKS.lock() {
+            v.push((va as usize, size));
+        }
+        Ok(Self { host: va as *mut std::ffi::c_void, dev: va, len, vmm: Some((h, size)) })
+    }
+
+    /// A large block (the RAM tier, a plan's weights past the card): VMM host
+    /// memory when the container's limit counts page-locked memory and not
+    /// that, else `cuMemHostAlloc`.
+    fn big(len: usize) -> Res<Self> {
+        if host_kind() == HostKind::Vmm {
+            match Self::new_vmm(len) {
+                Ok(a) => return Ok(a),
+                Err(e) => tracing::warn!("cuda hybrid: {e}; page-locked memory instead"),
+            }
+        }
+        Self::new(len)
     }
 
     fn holds(&self, ptr: u64) -> bool {
@@ -1089,14 +1217,42 @@ impl HostArena {
     }
 }
 
+/// The card memory a plan leaves to the K/V mirrors, the rows, cuBLAS and the
+/// repack's staging: an eighth of the card, at least 1 and at most 3 GiB
+/// (`CMF_HYB_RESERVE_MB`). A fixed 3 GiB left an 8 GB card 4.7 GB for weights
+/// and slots: Apex-35B q4tp decoded at 34.3 tokens/s there, Vulkan 63.9 (its
+/// budget is the card's weights, about nine tenths of it).
+/// The K/V mirrors of a stack's DSA layers at their bound: the mirror stops
+/// at `topk` rows (past them the indexer selects, `admit`), sized to that at
+/// once as a hint sizes a mirror, f16 K and V `nh` heads `rope + nope` wide.
+/// The plan's reserve holds them beside the slots: GLM-5.3's 11 take 1.7 GB,
+/// and on an A40 the slots filled its prompt fell to the host at row 1536 (the
+/// mirrors' growth) or 512 (the prompt path's scratch beside them).
+fn dsa_mirror_bytes(layers: &[GraphLayer]) -> usize {
+    layers
+        .iter()
+        .map(|l| match &l.attn {
+            GraphAttn::Mla { nh, rope, nope, dsa: Some(d), .. } => (d.topk + (d.topk / 8).max(256)) * nh * (rope + nope) * 4,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn card_reserve() -> usize {
+    if let Some(mb) = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return mb << 20;
+    }
+    (super::card_total() / 8).clamp(1 << 30, 3 << 30)
+}
+
 /// Host memory a pinned overflow may take: the container's limit less what it
 /// uses (cgroup v2 or v1), and the host's MemAvailable, the smaller. Pinned
 /// pages count against the limit and cannot be reclaimed, so a spill past it
 /// would end in the OOM killer instead of a declined plan.
 fn host_room() -> usize {
     let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok());
-    if pinned_outside_limit() {
-        // the driver's page-locked blocks are not the container's pages
+    if host_kind() != HostKind::Counted {
+        // the driver's blocks are not the container's pages
         let mut room = u64::MAX;
         if let Ok(mi) = std::fs::read_to_string("/proc/meminfo") {
             if let Some(kb) = mi.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()) {
@@ -1136,49 +1292,97 @@ fn host_room() -> usize {
     room.min(usize::MAX as u64) as usize
 }
 
-/// The container's memory usage (cgroup v2, else v1), when it has a limit.
+/// The container's memory in use less its page cache (the active and inactive
+/// file pages), when it has a limit (cgroup v2, else v1). A probe's charge
+/// shows in it even when the container sits at its limit and the charge
+/// evicts as much cache instead of growing the usage (an A40 pod after a
+/// 68 GB file was read: +1 MB for 256 MB of page-locked memory, which then
+/// took the RAM tier past the limit).
 fn cgroup_usage() -> Option<u64> {
-    let num = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<u64>().ok());
-    if num("/sys/fs/cgroup/memory.max").is_some_and(|l| l < 1 << 60) {
-        return num("/sys/fs/cgroup/memory.current");
-    }
-    if num("/sys/fs/cgroup/memory/memory.limit_in_bytes").is_some_and(|l| l < 1 << 60) {
-        return num("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-    }
-    None
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let num = |p: &str| read(p).and_then(|v| v.trim().parse::<u64>().ok());
+    let field = |s: &Option<String>, k: &str| -> u64 {
+        s.as_deref().and_then(|m| m.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))).unwrap_or(0)
+    };
+    let (used, stat, keys) = if num("/sys/fs/cgroup/memory.max").is_some_and(|l| l < 1 << 60) {
+        (num("/sys/fs/cgroup/memory.current")?, read("/sys/fs/cgroup/memory.stat"), ["active_file ", "inactive_file "])
+    } else if num("/sys/fs/cgroup/memory/memory.limit_in_bytes").is_some_and(|l| l < 1 << 60) {
+        (num("/sys/fs/cgroup/memory/memory.usage_in_bytes")?, read("/sys/fs/cgroup/memory/memory.stat"), ["total_active_file ", "total_inactive_file "])
+    } else {
+        return None;
+    };
+    Some(used.saturating_sub(keys.iter().map(|k| field(&stat, k)).sum::<u64>()))
 }
 
-/// Whether the driver's page-locked host memory (`cuMemHostAlloc`) stays
-/// outside the container's memory limit, as its GPU-visible system memory
-/// does under Vulkan: 256 MB allocated and written, the container's usage
-/// read before and after (it grows by under a quarter of it). Then the
-/// host's room is MemAvailable, not the limit, and the RAM tier can hold
-/// every expert of a file larger than the container. False outside a
-/// container (the room is MemAvailable anyway) and whenever the probe
-/// cannot run; `CMF_HYB_PINNED_PROBE=0` skips it. Measured once.
-fn pinned_outside_limit() -> bool {
-    static OUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OUT.get_or_init(|| {
+/// Which host memory the container's limit leaves out, as it leaves out the
+/// driver's GPU-visible system memory under Vulkan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostKind {
+    /// Both kinds count against it (or no container): `cuMemHostAlloc`
+    /// within the limit's room.
+    Counted,
+    /// `cuMemHostAlloc`'s page-locked pages fall outside it.
+    Pinned,
+    /// Page-locked pages count, VMM host allocations (`cuMemCreate`) do not:
+    /// the large blocks come from those.
+    Vmm,
+}
+
+/// The container's usage growth for 256 MB of each kind, allocated and
+/// written (under a quarter of it: outside the limit). Then the host's room
+/// is MemAvailable, not the limit, and the RAM tier can hold every expert of
+/// a file larger than the container: on an A40 pod's 46 GB container
+/// `cuMemHostAlloc` counted (+256 MB) and VMM host memory did not (+1 MB).
+/// `Counted` outside a container (the room is MemAvailable anyway) and
+/// whenever a probe cannot run; `CMF_HYB_PINNED_PROBE=0` skips them. Measured
+/// once.
+fn host_kind() -> HostKind {
+    static KIND: std::sync::OnceLock<HostKind> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
         if std::env::var("CMF_HYB_PINNED_PROBE").as_deref() == Ok("0") {
-            return false;
+            return HostKind::Counted;
         }
-        let Some(before) = cgroup_usage() else { return false };
+        if cgroup_usage().is_none() {
+            return HostKind::Counted;
+        }
         const PROBE: usize = 256 << 20;
-        let Ok(a) = HostArena::new(PROBE) else { return false };
-        let Some(h) = a.host_mut(0, PROBE) else { return false };
-        for p in h.chunks_mut(4096) {
-            p[0] = 1;
-        }
-        let after = cgroup_usage().unwrap_or(u64::MAX);
-        drop(a);
-        let grew = after.saturating_sub(before);
-        let out = grew < (PROBE as u64) / 4;
+        let grew = |make: fn(usize) -> Res<HostArena>| -> Option<u64> {
+            let before = cgroup_usage()?;
+            let a = make(PROBE).ok()?;
+            let h = a.host_mut(0, PROBE)?;
+            for p in h.chunks_mut(4096) {
+                p[0] = 1;
+            }
+            let after = cgroup_usage()?;
+            drop(a);
+            Some(after.saturating_sub(before))
+        };
+        let out = |g: Option<u64>| g.is_some_and(|g| g < (PROBE as u64) / 4);
+        let mb = |g: Option<u64>| g.map_or("-".to_string(), |g| format!("+{} MB", g >> 20));
+        // the VMM block before the page-locked one: the latter's freed pages
+        // may stay in the usage a while
+        let vmm = grew(HostArena::new_vmm);
+        let pinned = grew(HostArena::new);
+        // VMM first: outside the limit, it is right whatever the page-locked
+        // probe read
+        let kind = if out(vmm) {
+            HostKind::Vmm
+        } else if out(pinned) {
+            HostKind::Pinned
+        } else {
+            HostKind::Counted
+        };
         tracing::info!(
-            "cuda hybrid: page-locked host memory {} the container's limit (+{} MB for a 256 MB probe)",
-            if out { "falls outside" } else { "counts against" },
-            grew >> 20
+            "cuda hybrid: for 256 MB the container's usage less its page cache grew {} (page-locked) and {} (VMM host memory): {}",
+            mb(pinned),
+            mb(vmm),
+            match kind {
+                HostKind::Counted => "the host tier stays within its limit",
+                HostKind::Pinned => "page-locked memory falls outside its limit",
+                HostKind::Vmm => "the RAM tier and the host arenas take VMM host memory, outside its limit",
+            }
         );
-        out
+        kind
     })
 }
 
@@ -1190,7 +1394,19 @@ fn card_held(st: &State, w: u64, held: u64) -> u64 {
 
 impl Drop for HostArena {
     fn drop(&mut self) {
-        let _ = unsafe { cu::free_host(self.host) };
+        match self.vmm {
+            Some((h, size)) => unsafe {
+                if let Ok(mut v) = VMM_BLOCKS.lock() {
+                    v.retain(|&(a, _)| a != self.dev as usize);
+                }
+                cs::cuMemUnmap(self.dev, size);
+                cs::cuMemAddressFree(self.dev, size);
+                cs::cuMemRelease(h);
+            },
+            None => {
+                let _ = unsafe { cu::free_host(self.host) };
+            }
+        }
     }
 }
 
@@ -1333,8 +1549,8 @@ fn repack8_on_card(c: &Ctx, fx: &HFuncs, srcs: &[(&[u8], &[u8], Option<&[u8]>)],
         }
         None => None,
     };
-    let ba = Buf::from_slice(srcs[0].0)?;
-    let bb = if pair { Some(Buf::from_slice(srcs[1].0)?) } else { None };
+    let ba = upload(srcs[0].0)?;
+    let bb = if pair { Some(upload(srcs[1].0)?) } else { None };
     let bb_p = bb.as_ref().map_or(ba.ptr, |b| b.ptr);
     let (pair_i, rows_i, cols_i) = (pair as i32, rows as i32, cols as i32);
     let threads = (rows.div_ceil(16) * (cols / 32) * 32) as u64;
@@ -1412,8 +1628,8 @@ fn repack1x_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows:
     };
     let tg = rows.div_ceil(16) * (cols / 32);
     let sv = all.view(s_at, tg * 32);
-    let a = Buf::from_slice(&srcs[0][..need])?;
-    let b = if srcs.len() == 2 { Some(Buf::from_slice(&srcs[1][..need])?) } else { None };
+    let a = upload(&srcs[0][..need])?;
+    let b = if srcs.len() == 2 { Some(upload(&srcs[1][..need])?) } else { None };
     let b_p = b.as_ref().map_or(a.ptr, |x| x.ptr);
     let (pair_i, rows_i, cols_i) = (b.is_some() as i32, rows as i32, cols as i32);
     let threads = (tg * 32) as u64;
@@ -2263,6 +2479,9 @@ pub(super) struct ExpertStream {
     sm_built: u64,
 }
 
+/// A plan's routed experts stream through card slots (`experts_streamed`).
+pub(super) static STREAMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Job writes the ring holds between two waits.
 const JOB_RING: usize = 16384;
 
@@ -2327,8 +2546,12 @@ fn ram_tier(model: &CmfModel, experts: &[(usize, usize, usize)], cap: usize) -> 
     if n < 64 {
         return None;
     }
-    let arena = HostArena::new(n * slot).ok()?;
-    tracing::info!("cuda hybrid: RAM tier of {n} experts ({:.1} GB) in page-locked host memory", (n * slot) as f64 / 1e9);
+    let arena = HostArena::big(n * slot).ok()?;
+    tracing::info!(
+        "cuda hybrid: RAM tier of {n} experts ({:.1} GB) in {} host memory",
+        (n * slot) as f64 / 1e9,
+        if arena.vmm.is_some() { "VMM" } else { "page-locked" }
+    );
     Some(RamTier { arena, slot, owner: vec![None; n], last: vec![0; n], at: HashMap::new(), hits: 0, fills: 0, packed: HashMap::new() })
 }
 
@@ -2545,7 +2768,7 @@ impl ExpertStream {
         if let (Some(t), Some(r)) = (self.ram.as_ref().and_then(|r| r.at.get(&(li, e)).copied()), self.ram.as_mut()) {
             if used > 0 && used <= r.slot {
                 if let Some(dst) = r.arena.host_mut(t * r.slot, used) {
-                    unsafe { cu::memcpy_dtoh_async(dst, base, c.stream).map_err(derr)? };
+                    unsafe { get_async(dst, base, c.stream)? };
                     r.packed.insert(t, (rel_job(jobs.0, base), rel_job(jobs.1, base), used));
                 }
             }
@@ -2654,7 +2877,7 @@ impl ExpertStream {
                 let r = self.ram.as_ref().ok_or("expert stream: no RAM tier")?;
                 let src = r.arena.host_mut(t * r.slot, used).ok_or("expert stream: a packed tier slot past its block")?;
                 // page-locked: the copy queues behind the work so far, no wait
-                unsafe { cu::memcpy_htod_async(base, &*src, c.stream).map_err(derr)? };
+                unsafe { put_async(base, &*src, c.stream)? };
                 self.packed += 1;
                 (at_job(jg, base), at_job(jd, base))
             }
@@ -2666,7 +2889,7 @@ impl ExpertStream {
                 if let (Some(t), Some(r), true) = (ts, self.ram.as_mut(), pack) {
                     if used > 0 && used <= r.slot {
                         if let Some(dst) = r.arena.host_mut(t * r.slot, used) {
-                            unsafe { cu::memcpy_dtoh_async(dst, base, c.stream).map_err(derr)? };
+                            unsafe { get_async(dst, base, c.stream)? };
                             r.packed.insert(t, (rel_job(jobs.0, base), rel_job(jobs.1, base), used));
                         }
                     }
@@ -2872,7 +3095,7 @@ pub(super) fn moe_row(
         // widest routed expert of the first layer seen
         let (g, _, d) = experts[0];
         let slot = (card_bytes(model, g, 2 * inter, hidden) + card_bytes(model, d, hidden, inter) + (16 << 10)).next_multiple_of(1 << 16);
-        let mut keep = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3072) << 20;
+        let mut keep = card_reserve();
         let free = super::card_free();
         // the trunk the host runs (its matvecs go to the card's dense arm)
         // keeps room beside the slots: everything but the routed experts, up
@@ -3723,8 +3946,7 @@ fn build(
                 && m.attn_w.len() == out * ns * hidden
                 && m.ffn_b.len() == out
                 && m.ffn_w.len() == out * ns * hidden
-                // a routed FFN's mixture goes to the merge on the small path
-                // only (`small_only`), and DeepSeek-V4's form wants the full mix
+                // DeepSeek-V4's form wants the full mix
                 && (m.dsv4.is_none() || out == 2 * ns + ns * ns)
                 && l.attn_out_norm.is_none()
                 && l.ffn_out_norm.is_none();
@@ -4125,11 +4347,11 @@ fn build(
     let live_stream = st.hyb.streams.get(&uid).and_then(|w| w.upgrade()).filter(|c| c.lock().is_ok_and(|g| g.is_some()));
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
         // The card keeps a reserve for the K/V mirrors, the rows, cuBLAS and
-        // the repack's staging (`CMF_HYB_RESERVE_MB`, 3 GiB); weights past
+        // the repack's staging (`card_reserve`: an eighth of the card, 1-3 GiB); weights past
         // that go to mapped host memory, routed experts first, the dense
         // matrices and the attention staying on the card.
         let free = super::card_free();
-        let mut reserve = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3072) << 20;
+        let mut reserve = card_reserve() + dsa_mirror_bytes(layers);
         // a plan without the head (the prompt's) leaves room for it: the
         // token plan, built after, puts it on the card
         if lm.is_none() {
@@ -4206,7 +4428,7 @@ fn build(
             host_quota = host_exp / n_moe;
             if host_dense + host_exp > 0 {
                 let cap = host_dense + host_exp + (64 << 20);
-                let h = HostArena::new(cap)?;
+                let h = HostArena::big(cap)?;
                 ARENA_HOST.with(|x| x.set((h.dev, cap, 0)));
                 st.hyb.host_arenas.push(h);
             }
@@ -4228,7 +4450,7 @@ fn build(
                 st.hyb.arenas.push(a);
             }
             if spill {
-                let h = HostArena::new(host_cap)?;
+                let h = HostArena::big(host_cap)?;
                 ARENA_HOST.with(|x| x.set((h.dev, host_cap, 0)));
                 st.hyb.host_arenas.push(h);
                 ARENA_EXP_DEV.with(|x| x.set(dev_cap.saturating_sub(need - need_exp)));
@@ -4962,6 +5184,7 @@ fn build(
             }
             tracing::info!("cuda hybrid: expert stream of {n} card slots of {} MB ({:.1} GB)", slot >> 20, (n * slot) as f64 / 1e9);
             es.prepack(c, &fx)?;
+            STREAMED.store(true, Ordering::Relaxed);
             *cell.lock().map_err(|_| "expert stream poisoned")? = Some(es);
             st.hyb.streams.insert(uid, Arc::downgrade(&cell));
             Some(cell)
@@ -5260,12 +5483,16 @@ fn admit(
         }
         match (&pl.mix, &l.attn) {
             (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. } | GraphAttn::Mla { cpu_k, cpu_v, cpu_base, .. }) => {
-                // a DSA layer's caches; past its `topk` the mirror stops growing
+                // a DSA layer's caches; past its `topk` the mirror stops
+                // growing, so it is sized to that at once (the plan's reserve
+                // holds it, `dsa_mirror_bytes`)
+                let mut hint = hint;
                 if let Some((d, lora)) = a.mla.as_ref().and_then(|m| m.dsa.as_ref().map(|d| (d, m.lora))) {
                     dsa_ensure(c, st, key, d, lora, pos0, n)?;
                     if pos0 + n > d.topk {
                         continue;
                     }
+                    hint = d.topk;
                 }
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
                 // (the layer's own head geometry)
@@ -6494,9 +6721,8 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
 }
 
 /// A layer the prompt path has no kernels for (a routed FFN's sandwich, mHC
-/// beside a sandwich or a routed FFN, a head-wise gate in a codec other
-/// than f32): such a stack's long prompt runs the small path a chunk at a
-/// time.
+/// beside a sandwich, a head-wise gate in a codec other than f32): such a
+/// stack's long prompt runs the small path a chunk at a time.
 fn small_only(l: &HLayer) -> bool {
     // `blr` (NVG) matrices have no prompt-path GEMM: their stages run the
     // small path NMAX rows at a time
@@ -6515,8 +6741,15 @@ fn small_only(l: &HLayer) -> bool {
         || l.ms_gu.has_blr()
         || l.ms_dn.has_blr()
         || (l.moe.is_some() && l.ffn_out.is_some())
-        || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
+        || (l.mhc.is_some() && (l.attn_out.is_some() || l.ffn_out.is_some()))
         || matches!(&l.mix, Mix::Attn(a) if a.hg.as_ref().is_some_and(|g| g.3.is_none()))
+}
+
+/// A DSA layer of the plan selects within rows `..end` (past its `topk`):
+/// the prompt path writes the indexer's caches but has no selection, so such
+/// a chunk goes the small path.
+fn dsa_past(plan: &HPlan, end: usize) -> bool {
+    plan.layers.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.mla.as_ref().and_then(|m| m.dsa.as_ref()).is_some_and(|d| end > d.topk)))
 }
 
 /// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
@@ -7221,7 +7454,7 @@ pub(super) fn batch(
     // layer scale) runs the small path
     // a routed FFN's long prompt takes the prompt path (its experts grouped)
     // unless the stack has a layer only the small path runs
-    let grouped = moe_big_on() && spec.is_none() && !prompt_far && b > NMAX && !plan.layers.iter().any(small_only);
+    let grouped = moe_big_on() && spec.is_none() && !prompt_far && b > NMAX && !plan.layers.iter().any(small_only) && !dsa_past(&plan, pos0 + b);
     let moe = !grouped && plan.layers.iter().any(|l| l.moe.is_some() || small_only(l));
     if spec.is_some() && plan.layers.iter().any(|l| matches!(l.mix, Mix::Conv(_))) {
         decline("hybrid batch", "a verify window over a short convolution");
@@ -7287,7 +7520,15 @@ pub(super) fn batch(
                 }
             }
             DIRECT.with(|d| d.set(true));
-            let _direct = Direct;
+            let direct = Direct;
+            // a streamed stack's small path churning its slots (the stream's
+            // count: most picks built) hands the rest of the prompt to the
+            // prompt path, its layers staged (`stream_stageable`)
+            let can_stage = moe_big_on()
+                && spec.is_none()
+                && !prompt_far
+                && !dsa_past(&plan, pos0 + b)
+                && plan.layers.iter().any(|l| l.moe.as_ref().is_some_and(|m| m.stream.is_some()));
             let mut at = 0usize;
             while at < b {
                 let n = NMAX.min(b - at);
@@ -7300,11 +7541,21 @@ pub(super) fn batch(
                     dash_upload(&plan, layers, pos0, at, n)?;
                     vres_upload(c, &plan, layers, at, n)?;
                     run_small(c, &mut st, &plan, kv_id, layer_base, pos0 + at, n, false, false, cap, &sealed, &[])?;
-                    if !defer {
+                    if !defer || can_stage {
                         cu::memcpy_dtoh_async(&mut h[at * hidden..(at + n) * hidden], plan.h.ptr, c.stream).map_err(derr)?;
                     }
                 }
                 at += n;
+                if can_stage && at >= 2 * NMAX && b - at > 2 * NMAX && !plan.layers.iter().any(small_only) {
+                    break;
+                }
+            }
+            drop(direct);
+            if at < b {
+                c.sync()?;
+                dash_upload(&plan, layers, pos0, at, b - at)?;
+                let e0 = vres_rows(layers).map(|r| &r[at * hidden..b * hidden]);
+                return unsafe { big(c, &mut st, &plan, kv_id, layer_base, &positions[at..], &mut h[at * hidden..], defer, &sealed, e0) };
             }
             return c.sync();
         }
@@ -7521,9 +7772,10 @@ pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
 /// the normed rows in f32, the router and the shared gate as f32 GEMMs,
 /// every row's picks, the (row, pick) entries sorted by expert and laid out
 /// as input planes, a tensor-core launch over every expert's gate/up and one
-/// over its down, the mixture (and `dsh`, the shared expert's rows) into h.
+/// over its down, the mixture (and `dsh`, the shared expert's rows) added to
+/// `into` (h, or under mHC the zeroed product the merge takes).
 #[allow(clippy::too_many_arguments)]
-unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
+unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, into: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
     let (e, k, inter) = (m.e, m.k, m.inter);
     if e > 1024 || k > 64 || inter % 32 != 0 {
         return Err(format!("a grouped routed FFN of {e} experts, top {k}, width {inter}"));
@@ -7590,7 +7842,7 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, d
         c.launch(f, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(gu_a, jmax_i, xg0, xg1, xg1, hid_i, rmax_i, hid_i))?;
         c.launch(f, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(dn_a, jmax_i, qq0, qq1, qq1, inter_i, rmax_i, inter_i))?;
         let gated_i = (m.gated && sg != 0) as i32;
-        c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, b as u32), 256, 0, kargs!(bh, ys, pos, pwt, dsh, sg, gated_i, n_i, k_i, hid_i))?;
+        c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, b as u32), 256, 0, kargs!(into, ys, pos, pwt, dsh, sg, gated_i, n_i, k_i, hid_i))?;
     }
     Ok(())
 }
@@ -7600,6 +7852,61 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, d
 unsafe fn sandwich_rows(c: &Ctx, plan: &HPlan, w: &Buf, h: u64, y: u64, b: usize) -> Res<()> {
     let (hi, gi) = (plan.hidden as i32, plan.gemma as i32);
     unsafe { c.launch(plan.fx.norm_add, (b as u32, 1), 256, 0, kargs!(h, y, w.ptr, hi, plan.eps, gi)) }
+}
+
+/// The prompt path's DSA rows of a layer (`dsa_past` keeps it under
+/// `topk`): the indexer's caches at the chunk's positions and the pools it
+/// completes, `NMAX` rows at a time through the small path's kernels — the
+/// layer input `bh` normed into the plan's planes, the `[key | gate |
+/// weights]` set over them, `hy_dsa_put` over those and the chunk's latent
+/// rows `kva` (`st_w` wide), as the small path writes them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn dsa_rows(c: &Ctx, plan: &HPlan, pl: &HLayer, ds: &DsaL, ml: &MlaL, st: &mut State, key: (u64, usize), kva: u64, st_w: usize, bh: u64, pos0: usize, b: usize) -> Res<()> {
+    let db = plan.dsa.as_ref().ok_or("a DSA layer without the plan's DSA rows")?;
+    if plan.prism.is_some() {
+        return Err("DSA rows on the prompt path of a Prism file".into());
+    }
+    let s = st.hyb.dsa.get_mut(&key).ok_or("DSA caches missing")?;
+    if s.next_pos != pos0 && pos0 != 0 {
+        return Err(format!("DSA state of layer {} is at row {}, the chunk at {pos0}", key.1, s.next_pos));
+    }
+    s.next_pos = pos0 + b;
+    let (lat, ikc, gtc, pooled) = (s.lat.ptr, s.ikc.ptr, s.gtc.ptr, s.pooled.ptr);
+    let fx = &plan.fx;
+    let hidden = plan.hidden;
+    let planes = Planes { p0: plan.pp[0].ptr, p1: plan.pp[1].ptr, p2: plan.pp[2].ptr, stride: plan.pstride };
+    let (hid_i, eps, gemma_i, ps_i) = (hidden as i32, plan.eps, plan.gemma as i32, plan.pstride as i32);
+    let (st_i, lora_i, xs_i, id_i, kp_i) = (st_w as i32, ml.lora as i32, db.xstride as i32, ds.id as i32, ds.kp as i32);
+    let mut at = 0usize;
+    while at < b {
+        let n = NMAX.min(b - at);
+        let pos = pos0 + at;
+        let pos_i = pos as i32;
+        unsafe {
+            c.launch(
+                fx.rmsnorm2,
+                (hidden.div_ceil(1024) as u32, n as u32),
+                256,
+                0,
+                kargs!(bh + (at * hidden * 4) as u64, pl.in_norm.ptr, plan.xn.ptr, hid_i, eps, gemma_i, planes.p0, planes.p1, planes.p2, ps_i),
+            )?;
+            ds.ms_x.run(c, fx, &planes, hidden, n)?;
+            c.launch(
+                fx.dsa_put,
+                (n as u32, 1),
+                256,
+                0,
+                kargs!(kva + (at * st_w * 4) as u64, st_i, ml.kv_a_norm.ptr, lora_i, eps, db.xk.ptr, xs_i, ds.k_norm.ptr, ds.k_bias.ptr, id_i, lat, ikc, gtc, pos_i),
+            )?;
+            let (p0, p1) = (pos / ds.kp, (pos + n) / ds.kp);
+            if p1 > p0 {
+                let (p0_i, np_i) = (p0 as i32, (p1 - p0) as i32);
+                c.launch(fx.dsa_pool, (((p1 - p0) * ds.id).div_ceil(256) as u32, 1), 256, 0, kargs!(ikc, gtc, ds.ape.ptr, pooled, p0_i, np_i, kp_i, id_i))?;
+            }
+        }
+        at += n;
+    }
+    Ok(())
 }
 
 unsafe fn big(
@@ -7623,6 +7930,9 @@ unsafe fn big(
     });
     if plan.layers.iter().any(small_only) || sealed_window || (plan.layers.iter().any(|l| l.moe.is_some()) && !sealed.iter().all(|&s| !s)) {
         return Err("a layer without prompt-path kernels, or a sealed window or routed FFN, on the prompt path".into());
+    }
+    if dsa_past(plan, pos0 + b) {
+        return Err("a DSA layer selecting within the chunk on the prompt path".into());
     }
     let (gw, _) = prec();
     if gw != Gemm::Half {
@@ -8155,6 +8465,9 @@ unsafe fn big(
                                 kargs!(kva, st_i, kvb, yk, yv, b_i, nkv_i, rope_i, nope_i, vd_i, lora_i),
                             )?;
                         }
+                        if let Some(ds) = &ml.dsa {
+                            unsafe { dsa_rows(c, plan, pl, ds, ml, st, key, kva, st_w, bh, pos0, b)? };
+                        }
                     }
                     None if a.vd < hd => {
                         // a narrow V projected to its own rows, widened to the head with zeros
@@ -8382,7 +8695,19 @@ unsafe fn big(
             }
         }
         if let Some(m) = &pl.moe {
-            unsafe { moe_grouped(c, st, fx, m, bh, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            // under mHC the mixture and the shared expert are the product the
+            // merge takes (GLM-5.3), into a zeroed `yo`
+            let into = match mh {
+                Some((_, _, r)) => {
+                    unsafe { cu::memset_d8_async(r.yo, 0, b * hidden * 4, c.stream).map_err(derr)? };
+                    r.yo
+                }
+                None => bh,
+            };
+            unsafe { moe_grouped(c, st, fx, m, bh, into, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            if let Some((mm, mp, r)) = mh {
+                unsafe { mhc_out(c, fx, hidden, mm, mp, r, true, b)? };
+            }
             bst(c, 6, tm)?;
         }
         if let Some(s) = pl.layer_scale {

@@ -27075,16 +27075,26 @@ fn bank_room_bytes(c: &Ctx) -> u64 {
     room.max(avail)
 }
 
-/// The container's memory in use (cgroup v2, else v1); None outside a limit.
+/// The container's memory in use less its page cache (the active and inactive
+/// file pages), when it has a limit (cgroup v2, else v1). A probe's charge
+/// shows in it even when the container sits at its limit and the charge
+/// evicts as much cache instead of growing the usage (an A40 pod after a
+/// 68 GB file was read: +1 MB for 256 MB of page-locked memory, which then
+/// took the RAM tier past the limit).
 fn cgroup_usage() -> Option<u64> {
-    let num = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<u64>().ok());
-    if num("/sys/fs/cgroup/memory.max").is_some_and(|l| l < 1 << 60) {
-        return num("/sys/fs/cgroup/memory.current");
-    }
-    if num("/sys/fs/cgroup/memory/memory.limit_in_bytes").is_some_and(|l| l < 1 << 60) {
-        return num("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-    }
-    None
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let num = |p: &str| read(p).and_then(|v| v.trim().parse::<u64>().ok());
+    let field = |s: &Option<String>, k: &str| -> u64 {
+        s.as_deref().and_then(|m| m.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))).unwrap_or(0)
+    };
+    let (used, stat, keys) = if num("/sys/fs/cgroup/memory.max").is_some_and(|l| l < 1 << 60) {
+        (num("/sys/fs/cgroup/memory.current")?, read("/sys/fs/cgroup/memory.stat"), ["active_file ", "inactive_file "])
+    } else if num("/sys/fs/cgroup/memory/memory.limit_in_bytes").is_some_and(|l| l < 1 << 60) {
+        (num("/sys/fs/cgroup/memory/memory.usage_in_bytes")?, read("/sys/fs/cgroup/memory/memory.stat"), ["total_active_file ", "total_inactive_file "])
+    } else {
+        return None;
+    };
+    Some(used.saturating_sub(keys.iter().map(|k| field(&stat, k)).sum::<u64>()))
 }
 
 /// Whether the driver's GPU-visible system memory stays outside the
@@ -27111,7 +27121,7 @@ fn sysmem_outside_limit(c: &Ctx) -> bool {
         let grew = after.saturating_sub(before);
         let out = grew < PROBE / 4;
         tracing::info!(
-            "wgpu: GPU-visible system memory {} the container's limit (+{} MB for a 256 MB probe)",
+            "wgpu: GPU-visible system memory {} the container's limit (+{} MB of its usage less its page cache for a 256 MB probe)",
             if out { "falls outside" } else { "counts against" },
             grew >> 20
         );

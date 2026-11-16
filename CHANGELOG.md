@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.2] — 2026-11-16
 
+### Changed
+- CUDA hybrid: the RAM tier and the host arenas take VMM host memory (`cuMemCreate` at a host location, copies
+  by address) when a container's limit counts page-locked memory and not that (a 256 MB probe of each); the tier
+  then holds every expert, as Vulkan's system-memory banks do, laid out at load. On an A40 (46 GB container),
+  decode after a 512-token prompt and that prompt's first token: Ornith-122B q4tp within 12 / 16 / 24 / 32 GB
+  and on the whole card 9.0–10.5 / 10.9 / 40.1 / 43.5 / 44.6 tokens/s and 1.8–3.4 s (0.9.0: 6.8 / 7.1 / 28.7 / –
+  / 37.3 and about 10 s), perplexity the CPU's (3.049); MiMo-V2.6-Flash on the whole card 24.0 and 5.3 s (0.9.0:
+  11.3); MiniMax-M3.1-Flash on the whole card 10.0 and 6.9 s (0.9.0: 1.0 and 363 s); both answer "2+2" as the
+  CPU does. `CMF_HYB_PINNED_PROBE=0` keeps the page-locked tier.
+- CUDA hybrid: the card's reserve beside a plan is an eighth of the card, 1–3 GiB (was 3 GiB;
+  `CMF_HYB_RESERVE_MB` sets it). On an A40, runs interleaved with 3 GiB: Apex-35B q4tp within 8 GB 75–82
+  tokens/s against 35.0 (2840 slots against 1627), 83.7 after a 4096-token prompt; Ornith-122B q4tp within
+  12 GB 9.0 against 8.5.
+- CUDA hybrid: a prompt chunk on the small path hands the rest of its rows to the prompt path, its streamed
+  layers staged, once two of its 16-row pieces ran and the stream's count says most picks were built. On an A40
+  within 24 GB with page-locked memory, the first token after a 512-token prompt: MiniMax-M3.1-Flash 64 s (the
+  small path: 398 s), MiMo-V2.6-Flash 32 s (297 s).
+- GLM-5.3 on CUDA: its prompt takes the prompt path up to the DSA top-k (the grouped experts' mixture into the
+  mHC merge, the indexer's caches written on the way); a chunk where DSA selects still goes the small path. On
+  an A40, decode after a 512-token prompt and its first token: GLM-5.3-Flash q2tp within 24 GB 8.8–9.7
+  tokens/s and 5.4–6.0 s (0.9.0: 6.4 and 100 s), on the whole card 22.7 and 5.6 s (0.9.0: 17.1 and 38 s);
+  perplexity the CPU's (2.715; with the selection cut to 64 positions 2.730), "2+2" answered as the CPU does.
+
 ### Fixed
 - Vulkan on a phone driver: every process that answered once compiled the batch graph's kernels again. They are
   built at first use, after `init` wrote the pipeline cache, and the only later save was at the start of a second
@@ -19,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vulkan: the token graph compiled GLM's DSA kernels for every model, with no pipeline cache — it asked for the
   kernels before asking whether any layer has DSA. The layers are asked first and the DSA pipelines take the
   cache: on the same phone decode over 40 tokens at 10.4 tokens/s from the first run instead of 2.4.
+- GLM-5.3 on CUDA: a prompt past 1536 tokens on a card the expert slots filled fell to the host (its DSA
+  layers' K/V mirrors grew past the reserve; a 3072-token prompt on the whole A40 ran past an hour). A DSA
+  layer's mirror stops at top-k rows: it is now sized to that at once and the plan's reserve holds it beside the
+  slots (1.7 GB for GLM-5.3-Flash). That prompt's first token on the whole card 28.8 s, decode 20.3 tokens/s;
+  within 24 GB 86 s and 9.6.
+- The container-limit probes (CUDA page-locked and VMM host memory, Vulkan GPU-visible system memory) read the
+  container's usage less its page cache: at the limit a charge evicts as much page cache, the usage did not
+  grow, and the CUDA RAM tier took page-locked memory past the limit (Ornith-122B on the whole A40: killed).
+- CUDA: the pair micro-benchmark is skipped while routed experts stream through card slots, as on Vulkan: the
+  per-op path has no route for them.
 
 ## [0.9.1] — 2026-11-16
 
