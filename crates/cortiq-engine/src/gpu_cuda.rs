@@ -259,9 +259,22 @@ impl Drop for SlabScope {
     }
 }
 
-/// Free bytes of the card as the driver reports them (every process counted).
+/// Free bytes of the card as the driver reports them (every process counted),
+/// capped by `CMF_GPU_VRAM_MB` (`card_free`).
 fn mem_free() -> Option<u64> {
-    cu::mem_get_info().ok().map(|(free, _)| free as u64)
+    cu::mem_get_info().ok().map(|_| card_free() as u64)
+}
+
+/// The card's free bytes for placement: the driver's figure, and under
+/// `CMF_GPU_VRAM_MB` a card of that size (what is in use counts against it) —
+/// so a 12, 16 or 24 GB card's placement runs on a bigger one exactly as it
+/// would there.
+pub(crate) fn card_free() -> usize {
+    let (free, total) = cu::mem_get_info().unwrap_or((0, 0));
+    match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(mb) => free.min((mb << 20).saturating_sub(total.saturating_sub(free))),
+        None => free,
+    }
 }
 
 /// A device allocation, freed on drop (the context is current wherever one
@@ -3133,6 +3146,27 @@ fn acap_note(c: &Ctx, layer: usize, kp: u64, vp: u64, n0: usize, n: usize, row: 
 /// Rows a layer's mirror holds (absolute), None without a mirror.
 /// y [n][rows] = W x [n][cols] on the card (a q4tp graph weight of the
 /// hybrid arm): false when the backend cannot take it.
+/// A host-routed MoE row on the card (`hyb::moe_row`). `false` = refused.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_row(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    shared: Option<((usize, usize, usize), usize, f32)>,
+    inter: usize,
+    limit: f32,
+    x: &[f32],
+    picks: &[(usize, f32)],
+    out: &mut [f32],
+) -> bool {
+    match hyb::moe_row(model, experts, shared, inter, limit, x, picks, out) {
+        Ok(()) => true,
+        Err(e) => {
+            decline("moe row", &e);
+            false
+        }
+    }
+}
+
 pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize, x: &[f32], n: usize, y: &mut [f32]) -> bool {
     match hyb::rows_matvec(model, gw, rows, cols, x, n, y) {
         Ok(()) => true,

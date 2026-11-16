@@ -993,11 +993,14 @@ impl Unit {
 
     fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let mut h = x.to_vec();
-        self.s1.apply(&mut h, n);
+        self.s1.apply_pool(&mut h, n, pool);
         let mut h = self.c1.apply(&h, n, pool);
-        self.s2.apply(&mut h, n);
-        let r = self.c2.apply(&h, n, pool);
-        x.iter().zip(&r).map(|(a, b)| a + b).collect()
+        self.s2.apply_pool(&mut h, n, pool);
+        let mut r = self.c2.apply(&h, n, pool);
+        for (a, &b) in r.iter_mut().zip(x) {
+            *a += b;
+        }
+        r
     }
 }
 
@@ -1109,18 +1112,34 @@ impl Codec {
                 x[ch * frames + t] = z[t * ac + ch] + self.fc2.1[ch];
             }
         }
+        let prof = prof_on();
+        let t = std::time::Instant::now();
         let mut h = self.conv1.apply(&x, frames, pool);
         let mut n = frames;
-        for b in &self.blocks {
-            b.snake.apply(&mut h, n);
-            h = b.up.apply(&h, n, pool);
+        let mut last = t.elapsed().as_secs_f64();
+        if prof {
+            eprintln!("[ov codec] codebooks + conv1: {:.3} s", last);
+        }
+        for (bi, b) in self.blocks.iter().enumerate() {
+            b.snake.apply_pool(&mut h, n, pool);
+            h = if std::env::var("CMF_OV_CONVT_REF").is_ok() { b.up.apply(&h, n, pool) } else { b.up.apply_gemm(&h, n, pool) };
             n *= b.up.stride;
+            let up = t.elapsed().as_secs_f64();
             for u in &b.units {
                 h = u.apply(&h, n, pool);
             }
+            let now = t.elapsed().as_secs_f64();
+            if prof {
+                eprintln!("[ov codec] block {bi}: {} ch × {n}: up {:.3} s, units {:.3} s", h.len() / n, up - last, now - up);
+            }
+            last = now;
         }
-        self.snake.apply(&mut h, n);
-        self.conv2.apply(&h, n, pool)
+        self.snake.apply_pool(&mut h, n, pool);
+        let y = self.conv2.apply(&h, n, pool);
+        if prof {
+            eprintln!("[ov codec] conv2: {:.3} s, total {:.3} s", t.elapsed().as_secs_f64() - last, t.elapsed().as_secs_f64());
+        }
+        y
     }
 }
 

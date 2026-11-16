@@ -1,0 +1,36 @@
+#!/bin/bash
+# MiniMax-M3.1 (157 GB, q2tp mix) after the CUDA hybrid's SwiGLU-OAI: decode,
+# a 512-token prompt, the declines, greedy text CUDA / Vulkan against the CPU.
+# (mm1.sh with GLM-5.3 struck: the release has no glm5_next runtime, the
+# file runs as a generic transformer and gives garbage on the CPU too.)
+set -u
+cd /root/h3i || exit 1
+export XDG_RUNTIME_DIR=/tmp
+mkdir -p logs/mm1 out/mm1
+m=cmf/big/minimax-m3.1-flash-q2tp-mix.cmf
+B=bin/cortiq-fast
+P="Explain in two sentences why the sky is blue."
+probe() { # tag file backend
+  local tag=$1 f=$2 be=$3
+  for k in 1 2; do
+    flock gpu.lock env CMF_GPU=$be CMF_CUDA_DEBUG=1 timeout 2400 $B bench $f --tokens 64 --ignore-eos --json > logs/mm1/${tag}_d_${be}_$k.log 2>&1
+    echo "$tag $be decode run$k: exit $? | $(grep -hoE '"(decode_tok_s_steady|prefill_tok_s|ttft_s)": [0-9.e+-]+' logs/mm1/${tag}_d_${be}_$k.log | tr '\n' ' ')"
+  done
+  # past the card and the host's memory a prompt runs about decode speed: 512, not 4096
+  flock gpu.lock env CMF_GPU=$be CMF_CUDA_DEBUG=1 timeout 3600 $B bench $f --tokens 32 --ctx 512 --json > logs/mm1/${tag}_4k_${be}.log 2>&1
+  echo "$tag $be 512: exit $? | $(grep -hoE '"(decode_tok_s_steady|prefill_tok_s|ttft_s)": [0-9.e+-]+' logs/mm1/${tag}_4k_${be}.log | tr '\n' ' ')"
+  sed -E 's/\x1b\[[0-9;]*m//g' logs/mm1/${tag}_d_${be}_1.log logs/mm1/${tag}_4k_${be}.log | grep -iE 'declin|refus|fall.*back|per-op|not supported|out of memory|error' | sed -E 's/^.*(INFO|WARN|ERROR) //' | sort | uniq -c | sort -rn | head -6 | cut -c1-220 | sed 's/^/      /'
+  flock gpu.lock env CMF_GPU=$be timeout 2400 $B run $f --prompt "$P" -n 32 --greedy 2>/dev/null | grep -v '^\[' > out/mm1/${tag}_$be.txt
+}
+if [ -s $m ]; then
+  echo "minimax $(du -h $m | cut -f1)"
+  probe mm $m cuda
+  probe mm $m 1
+  flock gpu.lock env CMF_GPU=0 timeout 3600 $B run $m --prompt "$P" -n 32 --greedy 2>/dev/null | grep -v '^\[' > out/mm1/mm_cpu.txt
+  for be in cuda 1; do
+    if cmp -s out/mm1/mm_$be.txt out/mm1/mm_cpu.txt; then echo "mm: $be text == CPU"; else echo "mm: $be text DIFFERS from CPU"; diff out/mm1/mm_$be.txt out/mm1/mm_cpu.txt | head -6 | cut -c1-200; fi
+  done
+else
+  echo "MINIMAX DOWNLOAD FAILED"; tail -3 logs/mm1/dl.log
+fi
+echo MM2_DONE

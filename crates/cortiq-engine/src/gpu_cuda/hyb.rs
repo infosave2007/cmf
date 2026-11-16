@@ -127,6 +127,14 @@ pub(super) fn report() {
     }
 }
 
+/// MiniMax M3's SwiGLU-OAI clamp (`inference::swiglu_oai`, α 1.702, β 1).
+const OAI_M3_LIMIT: f32 = 7.0;
+
+/// An empty job (no weights, no rows).
+fn job_zero() -> HyJob {
+    HyJob { w: 0, aux0: 0, aux1: 0, y: 0, res: 0, rows: 0, kind: 0, blk0: 0, ystride: 0, xoff: 0, nr: 0, lim: 0.0, pad: [0; 3] }
+}
+
 /// `struct HyJob` of `hyb.cu`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -191,6 +199,7 @@ pub(super) struct HFuncs {
     mla_lat: cs::CUfunction,
     mla_kv: cs::CUfunction,
     mla_cut: cs::CUfunction,
+    vpad: cs::CUfunction,
     repack: cs::CUfunction,
     repack8: cs::CUfunction,
     expand_i8: cs::CUfunction,
@@ -306,6 +315,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         mla_lat: func(module, "hy_mla_lat")?,
         mla_kv: func(module, "hy_mla_kv")?,
         mla_cut: func(module, "hy_mla_cut")?,
+        vpad: func(module, "hy_vpad")?,
         repack: func(module, "hy_repack")?,
         repack8: func(module, "hy_repack8")?,
         expand_i8: func(module, "hy_expand_i8r")?,
@@ -980,7 +990,7 @@ fn repack_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: u
     }
     // the stored planes on the card for the kernel's reads
     let up = |b: &[u8]| -> Res<(Buf, Buf)> {
-        Ok((Buf::from_slice(&b[..params_off])?, Buf::from_slice(&b[codes_off..codes_off + src_rows * stride])?))
+        Ok((staged(&b[..params_off])?, staged(&b[codes_off..codes_off + src_rows * stride])?))
     };
     let (na, ca) = up(srcs[0])?;
     let second = if pair { Some(up(srcs[1])?) } else { None };
@@ -1010,6 +1020,20 @@ thread_local! {
     static ARENA_EXP_DEV: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
     /// A routed expert's matrices are being built.
     static EXPERT_MAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The expert stream's staging block (base, capacity, used): a build's
+    /// raw planes land there instead of an allocation each, freed after.
+    static STAGE: std::cell::Cell<(u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// A repack's raw planes on the card: in the stream's staging block when one
+/// is set and has room (a view; the repack syncs before it returns), else
+/// an allocation of their own.
+fn staged(data: &[u8]) -> Res<Buf> {
+    if let Some(b) = arena_take(&STAGE, data.len() + 64) {
+        unsafe { super::htod(b.ptr, data)? };
+        return Ok(b);
+    }
+    Buf::from_slice(data)
 }
 
 /// Mapped, pinned host memory (`cuMemHostAlloc`, PORTABLE | DEVICEMAP): a
@@ -1039,6 +1063,13 @@ impl HostArena {
 
     fn holds(&self, ptr: u64) -> bool {
         ptr >= self.dev && ptr < self.dev + self.len as u64
+    }
+
+    /// The block's host side, `[off, off + len)` (callers keep ranges apart).
+    #[allow(clippy::mut_from_ref)]
+    fn host_mut(&self, off: usize, len: usize) -> Option<&mut [u8]> {
+        // SAFETY: inside the allocation; the tier hands each range to one writer
+        (off + len <= self.len).then(|| unsafe { std::slice::from_raw_parts_mut((self.host as *mut u8).add(off), len) })
     }
 }
 
@@ -1357,7 +1388,7 @@ fn repack2_on_card(c: &Ctx, fx: &HFuncs, srcs: &[&[u8]], src_rows: usize, rows: 
         lad[r * 2] = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
         lad[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
     }
-    let up = |b: &[u8]| -> Res<(Buf, Buf)> { Ok((Buf::from_slice(&b[..params_off])?, Buf::from_slice(&b[codes_off..codes_off + src_rows * stride])?)) };
+    let up = |b: &[u8]| -> Res<(Buf, Buf)> { Ok((staged(&b[..params_off])?, staged(&b[codes_off..codes_off + src_rows * stride])?)) };
     let (ca, ka) = up(srcs[0])?;
     let second = if pair { Some(up(srcs[1])?) } else { None };
     let (cb_p, kb_p) = second.as_ref().map_or((ca.ptr, ka.ptr), |(x, y)| (x.ptr, y.ptr));
@@ -1537,30 +1568,52 @@ fn hmat_(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usiz
     }
     let t0 = std::time::Instant::now();
     let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
-    let m = if q8 {
-        let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(entry.dtype, bytes, rows, cols)?], rows, cols)?;
-        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
-    } else if q1 {
-        let (w, s) = repack1_on_card(c, &fx, &[bytes], rows, rows, cols)?;
-        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
-    } else if q4g {
-        let (w, s) = repack1x_on_card(c, &fx, &[bytes], rows, rows, cols, 10)?;
-        DevMat { kind: 10, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
-    } else if q2 {
-        let (w, cc, ld) = repack2_on_card(c, &fx, &[bytes], rows, rows, cols)?;
-        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: bytes.len() as u64 }
-    } else if q1t {
-        let base = q1t_base(bytes, rows, cols).ok_or_else(|| format!("{}: a q1t matrix with outlier rows", entry.name))?;
-        let (w, s) = repack1x_on_card(c, &fx, &[base], rows, rows, cols, 2)?;
-        DevMat { kind: 2, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
-    } else {
-        let (w, aux0, aux1) = repack_on_card(c, &fx, &[bytes], rows, rows, cols)?;
-        DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 }
-    };
+    let m = one_dev(c, &fx, model, gw, rows, cols, None)?;
     REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
     let m = Arc::new(m);
     st.hyb.mats.insert(key, m.clone());
+    Ok(m)
+}
+
+/// One quantized matrix as its card layout from the file — no cache, no
+/// budget gate (`hmat_` keeps it; the expert stream builds into a slot).
+fn one_dev(c: &Ctx, fx: &HFuncs, model: &CmfModel, gw: &GraphW, rows: usize, cols: usize, raw: Option<&[u8]>) -> Res<DevMat> {
+    use cortiq_core::TensorDtype;
+    let entry = model.tensors.get(gw.idx).ok_or("tensor index out of range")?;
+    let dtype = Some(entry.dtype);
+    let q8 = matches!(dtype, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
+    let q1 = dtype == Some(TensorDtype::Q1);
+    let q1t = dtype == Some(TensorDtype::Q1T);
+    let q2 = dtype == Some(TensorDtype::Q2TiledP);
+    let q4g = dtype == Some(TensorDtype::Q4Tiled);
+    if dtype != Some(TensorDtype::Q4TiledP) && !q8 && !q1 && !q1t && !q2 && !q4g {
+        return Err(format!("weight codec {dtype:?} has no hybrid kernel ({})", entry.name));
+    }
+    if entry.shape.first() != Some(&rows) || entry.shape.get(1) != Some(&cols) {
+        return Err(format!("tensor {} is {:?}, the graph wants {rows}x{cols}", entry.name, entry.shape));
+    }
+    let bytes = raw.unwrap_or_else(|| model.entry_bytes(entry));
+    let m = if q8 {
+        let (w, rs, cf) = repack8_on_card(c, fx, &[q8_parts(entry.dtype, bytes, rows, cols)?], rows, cols)?;
+        DevMat { kind: 5, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
+    } else if q1 {
+        let (w, s) = repack1_on_card(c, fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if q4g {
+        let (w, s) = repack1x_on_card(c, fx, &[bytes], rows, rows, cols, 10)?;
+        DevMat { kind: 10, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else if q2 {
+        let (w, cc, ld) = repack2_on_card(c, fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: bytes.len() as u64 }
+    } else if q1t {
+        let base = q1t_base(bytes, rows, cols).ok_or_else(|| format!("{}: a q1t matrix with outlier rows", entry.name))?;
+        let (w, s) = repack1x_on_card(c, fx, &[base], rows, rows, cols, 2)?;
+        DevMat { kind: 2, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
+    } else {
+        let (w, aux0, aux1) = repack_on_card(c, fx, &[bytes], rows, rows, cols)?;
+        DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: bytes.len() as u64 }
+    };
     Ok(m)
 }
 
@@ -1599,9 +1652,7 @@ fn blr_mat(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize, rows: usi
 /// silu(gate) * up there.
 fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &GraphW, inter: usize, cols: usize) -> Res<Arc<DevMat>> {
     use cortiq_core::TensorDtype;
-    use cortiq_core::quant::GROUP_SIZE;
     let dt = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype);
-    let q8 = |d: Option<TensorDtype>| matches!(d, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
     let (dg, du) = (dt(gw), dt(uw));
     if dg == Some(TensorDtype::BinaryLowRank) && du == Some(TensorDtype::BinaryLowRank) {
         // both payloads' blocks and one interleaved U' (kind 12)
@@ -1629,6 +1680,36 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
         st.hyb.pairs.insert(key, m.clone());
         return Ok(m);
     }
+    let key = (model.uid(), gw.idx, uw.idx);
+    if let Some(m) = st.hyb.pairs.get(&key) {
+        return Ok(m.clone());
+    }
+    let ge = model.tensors.get(gw.idx).ok_or("tensor index out of range")?;
+    let ue = model.tensors.get(uw.idx).ok_or("tensor index out of range")?;
+    let t0 = std::time::Instant::now();
+    let (gb, ub) = (model.entry_bytes(ge), model.entry_bytes(ue));
+    let held = c.resident.load(Ordering::Relaxed);
+    if !arena_active() && held + (gb.len() + ub.len()) as u64 > super::vram_budget() {
+        return Err("weights do not fit the card".into());
+    }
+    let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
+    let m = pair_dev(c, &fx, model, gw, uw, inter, cols, None)?;
+    REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
+    let m = Arc::new(m);
+    st.hyb.pairs.insert(key, m.clone());
+    Ok(m)
+}
+
+/// A gate/up pair of one codec as its card layout, from the file's two
+/// payloads — no cache, no budget gate: what `hmat_pair` keeps, and what the
+/// expert stream (`ExpertStream`) builds into a slot.
+fn pair_dev(c: &Ctx, fx: &HFuncs, model: &CmfModel, gw: &GraphW, uw: &GraphW, inter: usize, cols: usize, raw: Option<(&[u8], &[u8])>) -> Res<DevMat> {
+    use cortiq_core::TensorDtype;
+    use cortiq_core::quant::GROUP_SIZE;
+    let dt = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype);
+    let q8 = |d: Option<TensorDtype>| matches!(d, Some(TensorDtype::Q8_2f | TensorDtype::Q8Row));
+    let (dg, du) = (dt(gw), dt(uw));
     let both8 = q8(dg) && q8(du);
     let both1 = dg == Some(TensorDtype::Q1) && du == Some(TensorDtype::Q1);
     let both1t = dg == Some(TensorDtype::Q1T) && du == Some(TensorDtype::Q1T);
@@ -1637,10 +1718,6 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
     if !(both8 || both1 || both1t || both2 || both4g || (dg == Some(TensorDtype::Q4TiledP) && du == Some(TensorDtype::Q4TiledP))) || inter % 8 != 0 || cols % GROUP_SIZE != 0 {
         return Err(format!("a gate/up pair of one codec (q4tp, int8 or q1) with rows a multiple of 8, not {dg:?} / {du:?}"));
     }
-    let key = (model.uid(), gw.idx, uw.idx);
-    if let Some(m) = st.hyb.pairs.get(&key) {
-        return Ok(m.clone());
-    }
     let ge = model.tensors.get(gw.idx).ok_or("tensor index out of range")?;
     let ue = model.tensors.get(uw.idx).ok_or("tensor index out of range")?;
     for e in [ge, ue] {
@@ -1648,44 +1725,34 @@ fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &G
             return Err(format!("tensor {} is {:?}, the pair wants {inter}x{cols}", e.name, e.shape));
         }
     }
-    let t0 = std::time::Instant::now();
-    let (gb, ub) = (model.entry_bytes(ge), model.entry_bytes(ue));
-    let held = c.resident.load(Ordering::Relaxed);
-    if !arena_active() && held + (gb.len() + ub.len()) as u64 > super::vram_budget() {
-        return Err("weights do not fit the card".into());
-    }
+    let (gb, ub) = raw.unwrap_or_else(|| (model.entry_bytes(ge), model.entry_bytes(ue)));
     // the pair's rows straight from the two payloads, on the card
     let rows = 2 * inter;
-    let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
     let m = if both8 {
-        let (w, rs, cf) = repack8_on_card(c, &fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
+        let (w, rs, cf) = repack8_on_card(c, fx, &[q8_parts(ge.dtype, gb, inter, cols)?, q8_parts(ue.dtype, ub, inter, cols)?], rows, cols)?;
         // two column fields: the up rows' own (kind 15)
         let kind = if cf.is_some() { 15 } else { 5 };
         DevMat { kind, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) }
     } else if both1 {
-        let (w, s) = repack1_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        let (w, s) = repack1_on_card(c, fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 3, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else if both4g {
-        let (w, s) = repack1x_on_card(c, &fx, &[gb, ub], inter, rows, cols, 10)?;
+        let (w, s) = repack1x_on_card(c, fx, &[gb, ub], inter, rows, cols, 10)?;
         DevMat { kind: 10, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else if both2 {
-        let (w, cc, ld) = repack2_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        let (w, cc, ld) = repack2_on_card(c, fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: if gw.affine { 9 } else { 1 }, rows, cols, w: Arc::new(w), aux0: Some(cc), aux1: Some(ld), held: (gb.len() + ub.len()) as u64 }
     } else if both1t {
         let (g0, u0) = (q1t_base(gb, inter, cols), q1t_base(ub, inter, cols));
         let (Some(g0), Some(u0)) = (g0, u0) else {
             return Err(format!("{} / {}: a q1t pair with outlier rows", ge.name, ue.name));
         };
-        let (w, s) = repack1x_on_card(c, &fx, &[g0, u0], inter, rows, cols, 2)?;
+        let (w, s) = repack1x_on_card(c, fx, &[g0, u0], inter, rows, cols, 2)?;
         DevMat { kind: 2, rows, cols, held: w.bytes as u64, w: Arc::new(w), aux0: Some(s), aux1: None }
     } else {
-        let (w, aux0, aux1) = repack_on_card(c, &fx, &[gb, ub], inter, rows, cols)?;
+        let (w, aux0, aux1) = repack_on_card(c, fx, &[gb, ub], inter, rows, cols)?;
         DevMat { kind: 6, rows, cols, w: Arc::new(w), aux0: Some(aux0), aux1: Some(aux1), held: (gb.len() + ub.len()) as u64 }
     };
-    REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
-    let m = Arc::new(m);
-    st.hyb.pairs.insert(key, m.clone());
     Ok(m)
 }
 
@@ -1763,6 +1830,10 @@ struct AttnL {
     /// Ripple's value residual: the blend, and V alone over the planes of
     /// `lerp(e0, normed, blend)` (`ms_in` then holds Q and K).
     vres: Option<(f32, MmaSet)>,
+    /// V's width when narrower than the head (MiMo: 128 of 192): V projects
+    /// into the plan's narrow rows and is widened with zeros (`hy_vpad`),
+    /// the output cut back to it before O. `hd` otherwise.
+    vd: usize,
 }
 
 /// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
@@ -1855,6 +1926,18 @@ struct MlaL {
     vd: usize,
     lora: usize,
     scale: f32,
+    /// A low-rank query (GLM-5.3, DeepSeek): `ms_in` writes q_a's rows,
+    /// their norm goes to planes, and q_b over them gives the heads.
+    qa: Option<MlaQa>,
+}
+
+/// MLA's low-rank query: q_a `[rank × hidden]`, its norm, and q_b
+/// (`AttnL::q`, `[nh·hd × rank]`) as a set over the normed planes.
+struct MlaQa {
+    m: Arc<DevMat>,
+    norm: Arc<Buf>,
+    ms_qb: MmaSet,
+    rank: usize,
 }
 
 /// A plan's KDA rows (NMAX of them): the low-rank stages, f, the raw β, the
@@ -1876,6 +1959,8 @@ struct MlaBufs {
     kvb: Buf,
     lp: [Buf; 2],
     op: [Buf; 2],
+    /// q_a's rows and their normed planes (the widest rank in the stack).
+    qa: Option<(Buf, [Buf; 2])>,
 }
 
 enum Mix {
@@ -1986,6 +2071,722 @@ struct MoeL {
     /// Whether a shared expert rides beside the routed ones (the layer's pair).
     shared: bool,
     _mats: Vec<Arc<DevMat>>,
+    /// The routed experts stream through card slots (`ExpertStream`): this
+    /// layer's index among the streamed ones and the plan's stream.
+    stream: Option<(usize, StreamCell)>,
+}
+
+/// A plan's expert stream, filled once the plan's other weights are placed.
+type StreamCell = Arc<std::sync::Mutex<Option<ExpertStream>>>;
+
+/// Routed experts that neither the card nor the host's room can hold
+/// (GLM-5.3, MiniMax-M3.1, MiMo-V2.6 on a 46 GB card in a 46 GB container):
+/// the dense matrices and the attention stay on the card, and the experts
+/// the router picks are built into card slots from the file's mapped pages
+/// (the page cache, else the disk), the least recently used slot giving way
+/// — the residency FreeToken measured at 81% hits for 64 slots a layer.
+/// `CMF_HYB_STREAM=0` declines such a plan instead.
+pub(super) struct ExpertStream {
+    model: Arc<CmfModel>,
+    pool: Buf,
+    /// A build's raw planes (`STAGE`), one slot wide.
+    stage: Buf,
+    slot: usize,
+    /// (stream layer, expert) each slot holds, its jobs and its last tick.
+    owner: Vec<Option<(usize, usize)>>,
+    jobs: Vec<(HyJob, HyJob)>,
+    last: Vec<u64>,
+    tick: u64,
+    layers: Vec<StreamLayer>,
+    /// A layer's index by its first expert's gate tensor.
+    index: HashMap<usize, usize>,
+    /// Raw experts in page-locked host memory the builds read from.
+    ram: Option<RamTier>,
+    loads: u64,
+    hits: u64,
+    load_ns: u64,
+}
+
+/// Raw bytes of routed experts in page-locked host memory (`HostArena`), the
+/// least recently used giving way: a slot build reads them at the bus's DMA
+/// speed instead of faulting the mapping's pages in through a pageable copy
+/// (`CMF_HYB_RAM_TIER=0` builds from the mapping).
+struct RamTier {
+    arena: HostArena,
+    slot: usize,
+    owner: Vec<Option<(usize, usize)>>,
+    last: Vec<u64>,
+    at: HashMap<(usize, usize), usize>,
+    hits: u64,
+    fills: u64,
+}
+
+/// The RAM tier for a stream: up to half the host's room (the container's
+/// limit; what is pinned already counted), at most `cap` bytes, a slot the
+/// widest raw expert of `experts` (one layer's). None when off or too small.
+fn ram_tier(model: &CmfModel, experts: &[(usize, usize, usize)], cap: usize) -> Option<RamTier> {
+    if std::env::var("CMF_HYB_RAM_TIER").as_deref() == Ok("0") {
+        return None;
+    }
+    let raw = |i: usize| model.tensors.get(i).map_or(0, |t| (t.nbytes as usize).next_multiple_of(256));
+    let slot = experts.iter().map(|&(g, u, d)| raw(g) + raw(u) + raw(d)).max()? + 4096;
+    let n = (host_room() / 2).min(cap) / slot;
+    if n < 64 {
+        return None;
+    }
+    let arena = HostArena::new(n * slot).ok()?;
+    tracing::info!("cuda hybrid: RAM tier of {n} experts ({:.1} GB) in page-locked host memory", (n * slot) as f64 / 1e9);
+    Some(RamTier { arena, slot, owner: vec![None; n], last: vec![0; n], at: HashMap::new(), hits: 0, fills: 0 })
+}
+
+/// The host threads that copy a layer's missing experts into the RAM tier
+/// together (`CMF_HYB_RAM_FILL_THREADS`, default the cores up to eight).
+fn fill_pool() -> &'static crate::pool::Pool {
+    static P: std::sync::OnceLock<crate::pool::Pool> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let n = std::env::var("CMF_HYB_RAM_FILL_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(8))
+            .max(1);
+        crate::pool::Pool::with_spin(n.saturating_sub(1), 0)
+    })
+}
+
+impl RamTier {
+    /// The experts `want` of stream layer `li` copied into the tier at once,
+    /// on `fill_pool`'s threads: a copy is a page-cache read of a few MB, most
+    /// of a build from the mapping (3.8 ms a build, 83% of a 512-token
+    /// prompt's time for Ornith-122B q4tp within 32 GB), and a call's misses
+    /// come together. At most half the tier a call; the builds then find
+    /// them (`get`).
+    fn fill_many(&mut self, model: &CmfModel, li: usize, want: &[(usize, (usize, usize, usize))], tick: u64) {
+        let cap = self.owner.len() / 2;
+        let mut jobs: Vec<(usize, [&[u8]; 3])> = Vec::with_capacity(want.len().min(cap));
+        for &(e, ids) in want {
+            if jobs.len() >= cap {
+                break;
+            }
+            if let Some(&s) = self.at.get(&(li, e)) {
+                self.last[s] = tick;
+                continue;
+            }
+            let src = |i: usize| model.tensors.get(i).map(|t| &model.entry_bytes(t)[..t.nbytes as usize]);
+            let (Some(a), Some(b), Some(d)) = (src(ids.0), src(ids.1), src(ids.2)) else { continue };
+            let need: usize = [a.len(), b.len(), d.len()].iter().map(|l| l.next_multiple_of(256)).sum();
+            if need > self.slot || a.is_empty() || b.is_empty() || d.is_empty() {
+                continue;
+            }
+            let Some(s) = (0..self.owner.len()).filter(|&s| self.last[s] != tick).min_by_key(|&s| (self.owner[s].is_some(), self.last[s])) else {
+                break;
+            };
+            if let Some(old) = self.owner[s].take() {
+                self.at.remove(&old);
+            }
+            self.owner[s] = Some((li, e));
+            self.at.insert((li, e), s);
+            self.last[s] = tick;
+            self.fills += 1;
+            jobs.push((s * self.slot, [a, b, d]));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let Some(base) = self.arena.host_mut(0, self.owner.len() * self.slot).map(|m| m.as_mut_ptr() as usize) else { return };
+        let copy = |i: usize| {
+            let (mut off, parts) = jobs[i];
+            for p in parts {
+                // SAFETY: each job owns its slot's range of the page-locked block
+                let dst = unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, p.len()) };
+                dst.copy_from_slice(p);
+                off += p.len().next_multiple_of(256);
+            }
+        };
+        if jobs.len() == 1 {
+            copy(0);
+        } else {
+            fill_pool().run_rows(jobs.len(), &|a, b| (a..b).for_each(copy));
+        }
+    }
+
+    /// Expert `e` of stream layer `li`'s three payloads in the tier (copied
+    /// from the mapping when absent): their (offset, length) in the block.
+    fn get(&mut self, model: &CmfModel, li: usize, e: usize, ids: (usize, usize, usize), tick: u64) -> Option<[(usize, usize); 3]> {
+        let lens = [ids.0, ids.1, ids.2].map(|i| model.tensors.get(i).map_or(0, |t| t.nbytes as usize));
+        let need: usize = lens.iter().map(|l| l.next_multiple_of(256)).sum();
+        if need > self.slot || lens.contains(&0) {
+            return None;
+        }
+        let s = match self.at.get(&(li, e)) {
+            Some(&s) => {
+                self.hits += 1;
+                s
+            }
+            None => {
+                let s = (0..self.owner.len()).min_by_key(|&s| (self.owner[s].is_some(), self.last[s]))?;
+                if let Some(old) = self.owner[s].take() {
+                    self.at.remove(&old);
+                }
+                let mut off = s * self.slot;
+                for (k, &i) in [ids.0, ids.1, ids.2].iter().enumerate() {
+                    let src = model.entry_bytes(model.tensors.get(i)?);
+                    self.arena.host_mut(off, lens[k])?.copy_from_slice(&src[..lens[k]]);
+                    off += lens[k].next_multiple_of(256);
+                }
+                self.owner[s] = Some((li, e));
+                self.at.insert((li, e), s);
+                self.fills += 1;
+                s
+            }
+        };
+        self.last[s] = tick;
+        let mut off = s * self.slot;
+        let mut out = [(0, 0); 3];
+        for k in 0..3 {
+            out[k] = (off, lens[k]);
+            off += lens[k].next_multiple_of(256);
+        }
+        Some(out)
+    }
+}
+
+/// One routed layer under the stream.
+struct StreamLayer {
+    experts: Vec<(usize, usize, usize)>,
+    inter: usize,
+    hidden: usize,
+    /// The job tables `hy_moe_select` copies from (`MoeL::gu_t`, `dn_t`),
+    /// one pair a plan that holds the layer.
+    tables: Vec<(u64, u64)>,
+    /// The pair epilogue's bits and clamp (SwiGLU-OAI, `OAI_M3_LIMIT`).
+    act: (i32, f32),
+    /// An absent expert's jobs: its rows, kinds and clamp without weights;
+    /// `pad[0]` = expert + 1 marks it for `stream_fix`.
+    marker: (HyJob, HyJob),
+    slot_of: Vec<Option<usize>>,
+    /// Experts kept in the plan's mapped host memory (read over the bus,
+    /// never built into a slot): their jobs.
+    fixed: Vec<Option<(HyJob, HyJob)>>,
+}
+
+impl ExpertStream {
+    fn slots(&self) -> usize {
+        self.owner.len()
+    }
+
+    /// The slot a weight pointer lies in.
+    fn slot_at(&self, w: u64) -> Option<usize> {
+        let end = self.pool.ptr + (self.slots() * self.slot) as u64;
+        (w >= self.pool.ptr && w < end).then(|| ((w - self.pool.ptr) as usize) / self.slot)
+    }
+
+    /// Expert `e` of stream layer `li` built into slot `s` from the file:
+    /// the plan arena pointed at the slot, so the repack's planes land there.
+    fn build(&self, c: &Ctx, fx: &HFuncs, li: usize, e: usize, s: usize, raw: Option<[(usize, usize); 3]>) -> Res<(HyJob, HyJob)> {
+        let l = &self.layers[li];
+        let (g, u, d) = l.experts[e];
+        let gw6 = |idx: usize| GraphW { idx, kind: 6, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+        let base = self.pool.ptr + (s * self.slot) as u64;
+        let saved = (ARENA.with(|x| x.get()), ARENA_HOST.with(|x| x.get()), ARENA_EXP_DEV.with(|x| x.get()), EXPERT_MAT.with(|x| x.get()));
+        STAGE.with(|x| x.set((self.stage.ptr, self.stage.bytes, 0)));
+        ARENA.with(|x| x.set((base, self.slot, 0)));
+        ARENA_HOST.with(|x| x.set((0, 0, 0)));
+        ARENA_EXP_DEV.with(|x| x.set(usize::MAX));
+        EXPERT_MAT.with(|x| x.set(false));
+        let r = (|| -> Res<(DevMat, DevMat)> {
+            // from the RAM tier's page-locked copy when it holds the expert
+            let tier = |k: usize| -> Option<&[u8]> {
+                let (off, len) = raw?[k];
+                let r = self.ram.as_ref()?;
+                r.arena.host_mut(off, len).map(|m| &*m)
+            };
+            let pr = match (tier(0), tier(1)) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            };
+            let pm = pair_dev(c, fx, &self.model, &gw6(g), &gw6(u), l.inter, l.hidden, pr)?;
+            let dm = one_dev(c, fx, &self.model, &gw6(d), l.hidden, l.inter, tier(2))?;
+            Ok((pm, dm))
+        })();
+        ARENA.with(|x| x.set(saved.0));
+        ARENA_HOST.with(|x| x.set(saved.1));
+        ARENA_EXP_DEV.with(|x| x.set(saved.2));
+        EXPERT_MAT.with(|x| x.set(saved.3));
+        STAGE.with(|x| x.set((0, 0, 0)));
+        let (pm, dm) = r?;
+        let inside = |p: u64| p == 0 || (p >= base && p < base + self.slot as u64);
+        if ![pm.w.ptr, pm.aux0(), pm.aux1(), dm.w.ptr, dm.aux0(), dm.aux1()].into_iter().all(inside) {
+            return Err(format!("expert stream: expert {e} of a layer outgrew its {} MB slot", self.slot >> 20));
+        }
+        let job = |m: &DevMat, rows: usize, kind: i32, lim: f32| HyJob {
+            w: m.w.ptr,
+            aux0: m.aux0(),
+            aux1: m.aux1(),
+            y: 0,
+            res: 0,
+            rows: rows as i32,
+            kind,
+            blk0: 0,
+            ystride: 0,
+            xoff: 0,
+            nr: 0,
+            lim,
+            pad: [0; 3],
+        };
+        Ok((job(&pm, 2 * l.inter, pm.kind as i32 | 0x100 | l.act.0, l.act.1), job(&dm, l.hidden, dm.kind as i32, 0.0)))
+    }
+
+    /// Expert `e` of layer `li` on the card: its slot's jobs, built into a
+    /// free slot or the least recently used one this call does not hold
+    /// (its owner's table entries back to the marker).
+    fn ensure(&mut self, c: &Ctx, fx: &HFuncs, li: usize, e: usize) -> Res<(HyJob, HyJob)> {
+        if let Some(s) = self.layers[li].slot_of[e] {
+            self.last[s] = self.tick;
+            return Ok(self.jobs[s]);
+        }
+        let s = (0..self.slots())
+            .filter(|&s| self.last[s] != self.tick)
+            .min_by_key(|&s| (self.owner[s].is_some(), self.last[s]))
+            .ok_or("expert stream: every slot holds an expert of this call")?;
+        if let Some((l2, e2)) = self.owner[s].take() {
+            let l = &mut self.layers[l2];
+            l.slot_of[e2] = None;
+            let (mut mg, mut md) = l.marker;
+            mg.pad[0] = e2 as i32 + 1;
+            md.pad[0] = e2 as i32 + 1;
+            l.put(e2, mg, md)?;
+        }
+        let t = std::time::Instant::now();
+        let ids = self.layers[li].experts[e];
+        let tick = self.tick;
+        let raw = match self.ram.as_mut() {
+            Some(r) => r.get(&self.model, li, e, ids, tick),
+            None => None,
+        };
+        let jobs = self.build(c, fx, li, e, s, raw)?;
+        self.load_ns += t.elapsed().as_nanos() as u64;
+        self.loads += 1;
+        self.owner[s] = Some((li, e));
+        self.jobs[s] = jobs;
+        self.last[s] = self.tick;
+        let l = &mut self.layers[li];
+        l.slot_of[e] = Some(s);
+        l.put(e, jobs.0, jobs.1)?;
+        Ok(jobs)
+    }
+
+    /// A plan's job tables for layer `li` joined to the stream, written
+    /// whole: the resident experts' jobs, the markers for the rest.
+    fn register(&mut self, li: usize, gu_t: u64, dn_t: u64) -> Res<()> {
+        let l = &self.layers[li];
+        let mark = |j: HyJob, e: usize| HyJob { pad: [e as i32 + 1, 0, 0], ..j };
+        let (tg, td): (Vec<HyJob>, Vec<HyJob>) = (0..l.experts.len())
+            .map(|e| match (l.fixed.get(e).copied().flatten(), l.slot_of[e]) {
+                (Some(j), _) => j,
+                (None, Some(s)) => self.jobs[s],
+                (None, None) => (mark(l.marker.0, e), mark(l.marker.1, e)),
+            })
+            .unzip();
+        unsafe {
+            super::htod(gu_t, &tg)?;
+            super::htod(dn_t, &td)?;
+        }
+        self.layers[li].tables.push((gu_t, dn_t));
+        Ok(())
+    }
+}
+
+impl StreamLayer {
+    /// Expert `e`'s jobs into every plan's tables of this layer.
+    fn put(&self, e: usize, g: HyJob, d: HyJob) -> Res<()> {
+        let at = (e * std::mem::size_of::<HyJob>()) as u64;
+        for &(gt, dt) in &self.tables {
+            unsafe {
+                super::htod(gt + at, &[g])?;
+                super::htod(dt + at, &[d])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MoeL {
+    fn drop(&mut self) {
+        // the stream outlives a plan: this plan's tables leave it
+        if let Some((li, cell)) = &self.stream {
+            if let Ok(mut g) = cell.lock() {
+                if let Some(es) = g.as_mut() {
+                    let key = (self.gu_t.ptr, self.dn_t.ptr);
+                    es.layers[*li].tables.retain(|&t| t != key);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExpertStream {
+    fn drop(&mut self) {
+        if let Some(c) = super::ctx() {
+            c.resident.fetch_sub(self.pool.bytes as u64, Ordering::Relaxed);
+        }
+        if debug() {
+            let tot = self.loads + self.hits;
+            eprintln!(
+                "cuda hybrid expert stream: {} slots of {} MB, {} picks, {} built ({:.1}% hits), {:.1} ms a build",
+                self.slots(),
+                self.slot >> 20,
+                tot,
+                self.loads,
+                if tot > 0 { self.hits as f64 * 100.0 / tot as f64 } else { 0.0 },
+                self.load_ns as f64 / 1e6 / self.loads.max(1) as f64
+            );
+        }
+    }
+}
+
+/// A model's host-routed MoE on the card (`moe_row`): the routed experts
+/// through a stream of card slots, the shared experts resident, by their
+/// gate tensor.
+pub(super) struct RowMoe {
+    stream: ExpertStream,
+    shared: HashMap<usize, (DevMat, DevMat)>,
+}
+
+/// The card bytes of a quantized matrix (`build`'s sizing, one tensor).
+fn card_bytes(model: &CmfModel, idx: usize, rows: usize, cols: usize) -> usize {
+    use cortiq_core::TensorDtype as D;
+    match model.tensors.get(idx).map(|e| e.dtype) {
+        Some(D::Q1) => q1_layout(rows, cols).1,
+        Some(D::Q1T) => q1_layout_of(rows, cols, true).1,
+        Some(D::Q2TiledP) => q2_bytes(rows, cols),
+        Some(D::Q4Tiled) => low_layout(rows, cols, 10).1,
+        Some(D::Q8_2f | D::Q8Row) => i8_layout(rows, cols, 2).2,
+        _ => planes_bytes(rows, cols),
+    }
+}
+
+/// A routed FFN of one row on the card for a stack the host runs and routes
+/// (GLM-5.3: mHC / KDA / DSA on the host): the picks built into the model's
+/// stream slots (`ExpertStream`: least recently used giving way, the missing
+/// ones' pages asked for at once), the shared expert kept on the card,
+/// gate/up (SwiGLU, the layer's clamp in the pair epilogue) and down as job
+/// lists over the row's planes, and the weighted sum (`hy_moe_combine`) back
+/// to the host. `picks` are (expert, weight); `shared` its tensors, width
+/// and weight.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn moe_row(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    shared: Option<((usize, usize, usize), usize, f32)>,
+    inter: usize,
+    limit: f32,
+    x: &[f32],
+    picks: &[(usize, f32)],
+    out: &mut [f32],
+) -> Res<()> {
+    let c = super::ctx().ok_or("no CUDA context")?;
+    let hidden = x.len();
+    if experts.is_empty() || picks.is_empty() || out.len() != hidden || hidden % 32 != 0 || inter % 32 != 0 {
+        return Err("moe_row: rows 32 wide, experts and picks".into());
+    }
+    if picks.iter().any(|&(e, _)| e >= experts.len()) {
+        return Err("moe_row: a pick past the layer's experts".into());
+    }
+    let sinter = shared.map_or(inter, |(_, w, _)| w);
+    let mut st = c.st.lock().unwrap();
+    c.current()?;
+    let st = &mut *st;
+    let fx = match st.hyb.funcs.values().next() {
+        Some(f) => f.clone(),
+        None => {
+            let f = Arc::new(load_funcs(c, 1, 128)?);
+            st.hyb.funcs.insert((1, 128), f.clone());
+            f
+        }
+    };
+    // rows: the routed picks, then the shared expert
+    let ns = picks.len() + shared.is_some() as usize;
+    let pstride = hidden.max(inter).max(sinter).next_multiple_of(64);
+    let hj = std::mem::size_of::<HyJob>();
+    let xin = st.scr(c, "hy_mr_x", hidden * 4)?;
+    let pp = [st.scr(c, "hy_mr_p0", pstride * 2)?, st.scr(c, "hy_mr_p1", pstride * 2)?, st.scr(c, "hy_mr_p2", pstride * 2)?];
+    let qq = [st.scr(c, "hy_mr_q0", ns * pstride * 2 + 64)?, st.scr(c, "hy_mr_q1", ns * pstride * 2 + 64)?];
+    let dns = st.scr(c, "hy_mr_dn", ns * hidden * 4)?;
+    let gu_a = st.scr(c, "hy_mr_gu", ns * hj)?;
+    let dn_a = st.scr(c, "hy_mr_dj", ns * hj)?;
+    let wsel = st.scr(c, "hy_mr_w", ns * 4)?;
+    let outb = st.scr(c, "hy_mr_out", hidden * 4)?;
+    let uid = model.uid();
+    if !st.hyb.row_moe.contains_key(&uid) {
+        // the slots: the card's free memory less the reserve, a slot the
+        // widest routed expert of the first layer seen
+        let (g, _, d) = experts[0];
+        let slot = (card_bytes(model, g, 2 * inter, hidden) + card_bytes(model, d, hidden, inter) + (16 << 10)).next_multiple_of(1 << 16);
+        let mut keep = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3072) << 20;
+        let free = super::card_free();
+        // the trunk the host runs (its matvecs go to the card's dense arm)
+        // keeps room beside the slots: everything but the routed experts, up
+        // to half the card (`CMF_MOE_ROW_TRUNK=0` gives the slots all of it)
+        if std::env::var("CMF_MOE_ROW_TRUNK").as_deref() != Ok("0") {
+            let trunk: usize = model.tensors.iter().filter(|e| !e.name.contains(".experts.")).map(|e| e.nbytes as usize).sum();
+            keep += (trunk + trunk / 10).min(free / 2);
+        }
+        let n = free.saturating_sub(keep + slot) / slot;
+        // a call holds its picks and nothing else: a small card's few slots serve
+        if n < 32 {
+            return Err(format!("moe_row: room for {n} slots of {} MB", slot >> 20));
+        }
+        let stage = Buf::new(slot)?;
+        let pool = Buf::new(n * slot)?;
+        c.resident.fetch_add(pool.bytes as u64, Ordering::Relaxed);
+        tracing::info!("cuda moe rows: {n} card slots of {} MB ({:.1} GB) for the routed experts", slot >> 20, (n * slot) as f64 / 1e9);
+        let stream = ExpertStream {
+            model: model.clone(),
+            pool,
+            stage,
+            slot,
+            owner: vec![None; n],
+            jobs: vec![(job_zero(), job_zero()); n],
+            last: vec![0; n],
+            tick: 0,
+            layers: Vec::new(),
+            index: HashMap::new(),
+            ram: ram_tier(model, experts, usize::MAX),
+            loads: 0,
+            hits: 0,
+            load_ns: 0,
+        };
+        st.hyb.row_moe.insert(uid, RowMoe { stream, shared: HashMap::new() });
+    }
+    let rm = st.hyb.row_moe.get_mut(&uid).ok_or("moe_row: the stream")?;
+    let es = &mut rm.stream;
+    let li = match es.index.get(&experts[0].0) {
+        Some(&i) => i,
+        None => {
+            es.layers.push(StreamLayer {
+                experts: experts.to_vec(),
+                inter,
+                hidden,
+                tables: Vec::new(),
+                act: (0, limit),
+                marker: (job_zero(), job_zero()),
+                slot_of: vec![None; experts.len()],
+                fixed: Vec::new(),
+            });
+            es.index.insert(experts[0].0, es.layers.len() - 1);
+            es.layers.len() - 1
+        }
+    };
+    es.tick += 1;
+    // the picks on the card hold their slots first; the missing ones' pages asked for at once
+    let mut missing = Vec::new();
+    for &(e, _) in picks {
+        match es.layers[li].slot_of[e] {
+            Some(s) => {
+                es.last[s] = es.tick;
+                es.hits += 1;
+            }
+            None => missing.push(e),
+        }
+    }
+    if missing.len() > 1 {
+        stream_will_need(&es.model, &es.layers[li], &missing);
+    }
+    let mut rows: Vec<(HyJob, HyJob, f32, usize)> = Vec::with_capacity(ns);
+    for &(e, w) in picks {
+        let (g, d) = es.ensure(c, &fx, li, e)?;
+        rows.push((g, d, w, inter));
+    }
+    if debug() && es.tick % 1024 == 0 {
+        let tot = es.loads + es.hits;
+        eprintln!(
+            "cuda moe rows: {} slots of {} MB, {tot} picks, {} built ({:.1}% hits), {:.1} ms a build",
+            es.slots(),
+            es.slot >> 20,
+            es.loads,
+            es.hits as f64 * 100.0 / tot.max(1) as f64,
+            es.load_ns as f64 / 1e6 / es.loads.max(1) as f64
+        );
+    }
+    if let Some(((sg, su, sd), sw, weight)) = shared {
+        if !rm.shared.contains_key(&sg) {
+            let gw6 = |idx: usize| GraphW { idx, kind: 6, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
+            let pm = pair_dev(c, &fx, model, &gw6(sg), &gw6(su), sw, hidden, None)?;
+            let dm = one_dev(c, &fx, model, &gw6(sd), hidden, sw, None)?;
+            c.resident.fetch_add(pm.held + dm.held, Ordering::Relaxed);
+            rm.shared.insert(sg, (pm, dm));
+        }
+        let (pm, dm) = &rm.shared[&sg];
+        let job = |m: &DevMat, rows: usize, kind: i32, lim: f32| HyJob {
+            w: m.w.ptr,
+            aux0: m.aux0(),
+            aux1: m.aux1(),
+            y: 0,
+            res: 0,
+            rows: rows as i32,
+            kind,
+            blk0: 0,
+            ystride: 0,
+            xoff: 0,
+            nr: 0,
+            lim,
+            pad: [0; 3],
+        };
+        rows.push((job(pm, 2 * sw, pm.kind as i32 | 0x100, limit), job(dm, hidden, dm.kind as i32, 0.0), weight, sw));
+    }
+    // each row's outputs: its mid planes, its down rows
+    let (bpd, hid_i, ps_i, one_i) = (hidden.div_ceil(16), hidden as i32, pstride as i32, 1i32);
+    let (mut ga, mut da, mut ws) = (Vec::with_capacity(ns), Vec::with_capacity(ns), Vec::with_capacity(ns));
+    for (s, (g, d, w, _)) in rows.iter().enumerate() {
+        ga.push(HyJob { y: qq[0] + (s * pstride * 2) as u64, res: qq[1] + (s * pstride * 2) as u64, ystride: pstride as i32, xoff: 0, ..*g });
+        da.push(HyJob { y: dns + (s * hidden * 4) as u64, res: 0, ystride: hidden as i32, xoff: (s * pstride) as i32, ..*d });
+        ws.push(*w);
+    }
+    let pick = fx.mmp[nt_of(1)][0][1];
+    let planes = Planes { p0: pp[0], p1: pp[1], p2: pp[2], stride: pstride };
+    unsafe {
+        cu::memcpy_htod_async(xin, x, c.stream).map_err(derr)?;
+        split(c, &fx, &planes, xin, hidden, hidden, 1)?;
+        // launches by width (the shared expert's may differ): a launch's
+        // jobs count their blocks from the launch's first
+        let mut s0 = 0;
+        while s0 < ns {
+            let w = rows[s0].3;
+            let s1 = (s0..ns).find(|&s| rows[s].3 != w).unwrap_or(ns);
+            let bpg = (2 * w).div_ceil(16);
+            for s in s0..s1 {
+                ga[s].blk0 = ((s - s0) * bpg) as i32;
+                da[s].blk0 = ((s - s0) * bpd) as i32;
+            }
+            s0 = s1;
+        }
+        super::htod(gu_a, &ga)?;
+        super::htod(dn_a, &da)?;
+        super::htod(wsel, &ws)?;
+        super::htod(outb, &vec![0f32; hidden])?;
+        let mut s0 = 0;
+        while s0 < ns {
+            let w = rows[s0].3;
+            let s1 = (s0..ns).find(|&s| rows[s].3 != w).unwrap_or(ns);
+            let (k, bpg) = (s1 - s0, (2 * w).div_ceil(16));
+            let (k_i, w_i) = (k as i32, w as i32);
+            let (gp, dp) = (gu_a + (s0 * hj) as u64, dn_a + (s0 * hj) as u64);
+            c.launch(pick, ((k * bpg) as u32, 1), 32 * 16, 0, kargs!(gp, k_i, pp[0], pp[1], pp[2], ps_i, one_i, hid_i))?;
+            c.launch(pick, ((k * bpd) as u32, 1), 32 * 16, 0, kargs!(dp, k_i, qq[0], qq[1], qq[1], ps_i, one_i, w_i))?;
+            s0 = s1;
+        }
+        let (nul, zero_i, ns_i) = (0u64, 0i32, ns as i32);
+        c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, 1), 256, 0, kargs!(outb, dns, wsel, nul, nul, zero_i, one_i, hid_i, ns_i))?;
+        cu::memcpy_dtoh_async(out, outb, c.stream).map_err(derr)?;
+    }
+    c.sync()
+}
+
+/// `MADV_WILLNEED` over the three tensors of each expert in `picks`.
+fn stream_will_need(model: &CmfModel, l: &StreamLayer, picks: &[usize]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("CMF_HYB_STREAM_WILLNEED").as_deref() != Ok("0")) {
+            return;
+        }
+        let page = 4096usize;
+        for &e in picks {
+            let (g, u, d) = l.experts[e];
+            for idx in [g, u, d] {
+                let Some(entry) = model.tensors.get(idx) else { continue };
+                let b = model.entry_bytes(entry);
+                if b.is_empty() {
+                    continue;
+                }
+                let p = b.as_ptr() as usize;
+                let s = p & !(page - 1);
+                // SAFETY: a range inside the model's read-only mapping;
+                // MADV_WILLNEED only schedules read-ahead.
+                unsafe {
+                    libc::madvise(s as *mut libc::c_void, p + b.len() - s, libc::MADV_WILLNEED);
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (model, l, picks);
+}
+
+/// After `hy_moe_select`: the call's slots read back, every pick of a
+/// streamed expert not on the card built into a slot, and the patched jobs
+/// written over the call's. A host round trip per routed layer — the price
+/// of experts past the card and the host's room.
+unsafe fn stream_fix(c: &Ctx, fx: &HFuncs, m: &MoeL, mb: &MoeBufs, s_n: usize) -> Res<()> {
+    let Some((li, cell)) = &m.stream else { return Ok(()) };
+    let mut guard = cell.lock().map_err(|_| "expert stream poisoned")?;
+    let es = guard.as_mut().ok_or("expert stream not filled")?;
+    let (mut ga, mut da) = (vec![job_zero(); s_n], vec![job_zero(); s_n]);
+    unsafe {
+        cu::memcpy_dtoh_async(&mut ga, mb.gu_a.ptr, c.stream).map_err(derr)?;
+        cu::memcpy_dtoh_async(&mut da, mb.dn_a.ptr, c.stream).map_err(derr)?;
+    }
+    c.sync()?;
+    es.tick += 1;
+    // the picks already on the card hold their slots for this call first
+    for j in ga.iter().filter(|j| j.rows > 0 && j.w != 0) {
+        if let Some(s) = es.slot_at(j.w) {
+            es.last[s] = es.tick;
+            es.hits += 1;
+        }
+    }
+    // the missing experts' pages asked for at once: the kernel reads them
+    // with large asynchronous requests while the first ones build, instead
+    // of faulting each in page by page (`CMF_HYB_STREAM_WILLNEED=0` off)
+    let missing: Vec<usize> = ga
+        .iter()
+        .filter(|g| g.rows > 0 && g.w == 0)
+        .map(|g| (g.pad[0] - 1) as usize)
+        .filter(|&e| e < es.layers[*li].experts.len() && es.layers[*li].slot_of[e].is_none())
+        .collect();
+    if missing.len() > 1 {
+        stream_will_need(&es.model, &es.layers[*li], &missing);
+        // and copied into the RAM tier together before the builds read them
+        let want: Vec<(usize, (usize, usize, usize))> = missing.iter().map(|&e| (e, es.layers[*li].experts[e])).collect();
+        let (model, tick) = (es.model.clone(), es.tick);
+        if let Some(r) = es.ram.as_mut() {
+            r.fill_many(&model, *li, &want, tick);
+        }
+    }
+    let mut changed = false;
+    for (g, d) in ga.iter_mut().zip(da.iter_mut()) {
+        if g.rows == 0 || g.w != 0 {
+            continue;
+        }
+        let e = (g.pad[0] - 1) as usize;
+        if e >= es.layers[*li].experts.len() {
+            return Err(format!("expert stream: a pick of expert {e} past the layer's"));
+        }
+        let (gj, dj) = es.ensure(c, fx, *li, e)?;
+        (g.w, g.aux0, g.aux1, g.kind) = (gj.w, gj.aux0, gj.aux1, gj.kind);
+        (d.w, d.aux0, d.aux1, d.kind) = (dj.w, dj.aux0, dj.aux1, dj.kind);
+        changed = true;
+    }
+    if changed {
+        unsafe {
+            super::htod(mb.gu_a.ptr, &ga)?;
+            super::htod(mb.dn_a.ptr, &da)?;
+        }
+    }
+    // (a plan lives as long as the process: the running count, not a summary at drop)
+    if debug() && es.tick % 1024 == 0 {
+        let tot = es.loads + es.hits;
+        eprintln!(
+            "cuda hybrid expert stream: {} slots of {} MB, {tot} picks, {} built ({:.1}% hits), {:.1} ms a build, RAM tier {}",
+            es.slots(),
+            es.slot >> 20,
+            es.loads,
+            es.hits as f64 * 100.0 / tot.max(1) as f64,
+            es.load_ns as f64 / 1e6 / es.loads.max(1) as f64,
+            es.ram.as_ref().map_or("off".to_string(), |r| format!("{} slots, {} hits / {} fills", r.owner.len(), r.hits, r.fills))
+        );
+    }
+    Ok(())
 }
 
 /// The routed FFN's per-call rows (`NMAX` rows, `smax` slots), one set a plan.
@@ -2029,6 +2830,8 @@ pub(super) struct HPlan {
     vres: Option<(Buf, [Buf; 3])>,
     kda: Option<KdaBufs>,
     mla: Option<MlaBufs>,
+    /// Narrow-V layers' rows: V before widening (f32) and the cut output planes.
+    narrow: Option<(Buf, [Buf; 2])>,
     /// A Looped Transformer: the layers after which the final norm is applied
     /// to the stream (`loop_norm_at`), and its weights.
     loop_norm: Vec<usize>,
@@ -2075,6 +2878,9 @@ pub(super) struct HPlan {
     moe: Option<MoeBufs>,
     yo: Buf,
     hgv: Buf,
+    /// Routed experts streamed through card slots (graphs off: the host
+    /// patches the jobs after each layer's router).
+    stream: Option<StreamCell>,
 }
 
 /// One GDN layer's recurrent state on the card, with what a verify window
@@ -2134,6 +2940,13 @@ pub(super) struct HState {
     arenas: Vec<Buf>,
     /// Their overflow in mapped host memory.
     host_arenas: Vec<HostArena>,
+    /// A model's expert stream (`ExpertStream`), shared by its plans (the
+    /// prompt's and the tokens'): one pool of card slots, every plan's job
+    /// tables kept in step.
+    streams: HashMap<u64, std::sync::Weak<std::sync::Mutex<Option<ExpertStream>>>>,
+    /// Host-routed MoE rows (`moe_row`, GLM-5.3) by model: their stream of
+    /// card slots and the shared experts kept on the card.
+    row_moe: HashMap<u64, RowMoe>,
     /// The chain's eh_proj job tables by (plan, tensor): their output is
     /// that plan's `h`.
     chain_sets: HashMap<(u64, usize), MmaSet>,
@@ -2432,10 +3245,16 @@ fn build(
                 cdmax = cdmax.max(2 * kd + knh * dv);
                 vdmax = vdmax.max(knh * dv);
             }
-            GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, no_rope, q_a, .. } => {
+            GraphAttn::Mla { nh: mnh, rope, nope, v_dim, lora, no_rope, q_a, q_a_norm, .. } => {
                 let hdm = rope + nope;
-                if *mnh != nh || hdm % 32 != 0 || hdm > 512 || *v_dim > hdm || v_dim % 32 != 0 || lora % 32 != 0 || !*no_rope || q_a.is_some() {
+                if *mnh != nh || hdm % 32 != 0 || hdm > 512 || *v_dim > hdm || v_dim % 32 != 0 || lora % 32 != 0 || !*no_rope {
                     return Err(format!("layer {li}: MLA geometry rope {rope} nope {nope} v {v_dim} lora {lora} (rotary {})", !no_rope));
+                }
+                if q_a.is_some() {
+                    let rank = q_a_norm.map_or(0, |n| n.len());
+                    if rank == 0 || rank % 32 != 0 {
+                        return Err(format!("layer {li}: MLA low-rank query of rank {rank}"));
+                    }
                 }
                 qrow = qrow.max(nh * hdm);
                 kvmax = kvmax.max(nh * hdm);
@@ -2448,7 +3267,8 @@ fn build(
                 let own = |g: &crate::gpu::GraphAttnGeom| g.hd % 32 == 0 && g.hd <= 512 && g.nkv > 0 && nh % g.nkv == 0 && nh / g.nkv <= 16;
                 let same = geom.as_ref().is_none_or(|g| {
                     ((g.nkv == nkv && g.hd == hd) || own(g))
-                        && g.dv == g.hd
+                        // a narrow V (MiMo) widened to the head; not beside Ripple's or DASH's arms
+                        && (g.dv == g.hd || (g.dv < g.hd && g.dv % 32 == 0 && g.vres.is_none() && g.dash.is_none()))
                         && g.rd % 2 == 0
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
                         && g.sink.is_none_or(|s| s.len() == nh)
@@ -2505,7 +3325,9 @@ fn build(
         }
         match &l.ffn {
             GraphFfn::Dense { gate, act, limit, hot, .. } => {
-                if !matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || !(*limit == 0.0 || (*limit > 0.0 && *act == GraphAct::Silu)) || hot.is_some() {
+                // MiniMax M3's SwiGLU-OAI carries its clamp in its code (`OAI_M3_LIMIT`)
+                let oai = *act == GraphAct::SwiGluOaiM3 && *limit == 0.0;
+                if !(matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || oai) || !(*limit == 0.0 || (*limit > 0.0 && *act == GraphAct::Silu)) || hot.is_some() {
                     return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
                 intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
@@ -2516,7 +3338,8 @@ fn build(
                 // two column fields), the fields taken in tile by tile since a
                 // slot's expert is chosen on the card
                 let _ = (gu_q2, q4tp, q82);
-                if *act != GraphAct::Silu {
+                // SiLU, or MiniMax M3's SwiGLU-OAI (α 1.702, β 1, clamp 7) in the pair epilogue
+                if !matches!(act, GraphAct::Silu | GraphAct::SwiGluOaiM3) {
                     return Err(format!("layer {li}: a routed FFN other than q4tp / q2tp SwiGLU"));
                 }
                 if *n_exp == 0 || *n_exp > 1024 || *top_k == 0 || *top_k > 64 || experts.len() != n_exp + *has_shared as usize || router.kind != 4 {
@@ -2544,6 +3367,11 @@ fn build(
     let q = f4(NMAX * qrow)?;
     let k = f4(NMAX * kvmax)?;
     let v = f4(NMAX * kvmax)?;
+    let narrow_bufs = if layers.iter().any(|l| matches!(&l.attn, GraphAttn::Full { geom: Some(g), .. } if g.dv < g.hd)) {
+        Some((f4(NMAX * kvmax)?, [Buf::new(NMAX * nh * hdmax * 2 + 64)?, Buf::new(NMAX * nh * hdmax * 2 + 64)?]))
+    } else {
+        None
+    };
     let qg = f4(NMAX * nh * hdmax)?;
     let gate = f4(NMAX * nh * hdmax)?;
     let ao = f4(NMAX * nh * hdmax)?;
@@ -2578,6 +3406,14 @@ fn build(
         }),
         None => None,
     };
+    let qa_rank = layers
+        .iter()
+        .filter_map(|l| match &l.attn {
+            GraphAttn::Mla { q_a: Some(_), q_a_norm, .. } => q_a_norm.map(|n| n.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
     let mla_bufs = match layers.iter().find_map(|l| match &l.attn {
         GraphAttn::Mla { nh, rope, nope, v_dim, lora, .. } => Some((*nh, *rope, *nope, *v_dim, *lora)),
         _ => None,
@@ -2587,6 +3423,10 @@ fn build(
             kvb: f4(NMAX * mnh * (nope + vd))?,
             lp: [Buf::new(NMAX * lora * 2 + 64)?, Buf::new(NMAX * lora * 2 + 64)?],
             op: [Buf::new(NMAX * mnh * vd * 2 + 64)?, Buf::new(NMAX * mnh * vd * 2 + 64)?],
+            qa: match qa_rank {
+                0 => None,
+                r => Some((f4(NMAX * r)?, [Buf::new(NMAX * r * 2 + 64)?, Buf::new(NMAX * r * 2 + 64)?])),
+            },
         }),
         None => None,
     };
@@ -2627,6 +3467,8 @@ fn build(
     };
     let mut need = 0usize;
     let mut need_exp = 0usize;
+    // the widest routed expert on the card (a stream slot's size)
+    let mut exp_max = 0usize;
     for l in layers {
         let routed = match &l.ffn {
             GraphFfn::Moe { n_exp, .. } => *n_exp,
@@ -2644,7 +3486,13 @@ fn build(
                         let (g, u, d) = experts[*n_exp];
                         v.push((g, u, d, model.tensors.get(g).and_then(|e| e.shape.first().copied()).unwrap_or(0)));
                     }
-                    None => {}
+                    // no shared expert: the first routed one stands in for the
+                    // layer's pair (built, never launched) — dense room too
+                    None => {
+                        if let Some(&(g, u, d)) = experts.first() {
+                            v.push((g, u, d, *inter));
+                        }
+                    }
                 }
                 v
             }
@@ -2669,6 +3517,7 @@ fn build(
             need += b;
             if i < routed {
                 need_exp += b;
+                exp_max = exp_max.max(sized(g, 2 * inter, hidden) + sized(d, hidden, inter));
             }
         }
         let mut one = |w: &GraphW, rows: usize, cols: usize| {
@@ -2713,12 +3562,20 @@ fn build(
             need += q2_bytes(rows_of(model, gw).unwrap_or(rows), hidden);
         }
     }
+    // (slot bytes, the card's reserve, the stream, whether another plan of
+    // the model made it) when the experts stream
+    let mut stream_plan: Option<(usize, usize, StreamCell, bool)> = None;
+    let mut stream_layers: Vec<StreamLayer> = Vec::new();
+    let mut stream_keys: Vec<usize> = Vec::new();
+    // a streamed layer's share of the host tier (bytes)
+    let mut host_quota = 0usize;
+    let live_stream = st.hyb.streams.get(&uid).and_then(|w| w.upgrade()).filter(|c| c.lock().is_ok_and(|g| g.is_some()));
     if need > 0 && std::env::var("CMF_HYB_ARENA").as_deref() != Ok("0") {
         // The card keeps a reserve for the K/V mirrors, the rows, cuBLAS and
         // the repack's staging (`CMF_HYB_RESERVE_MB`, 3 GiB); weights past
         // that go to mapped host memory, routed experts first, the dense
         // matrices and the attention staying on the card.
-        let free = cu::mem_get_info().map(|(f, _)| f).unwrap_or(0);
+        let free = super::card_free();
         let mut reserve = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3072) << 20;
         // a plan without the head (the prompt's) leaves room for it: the
         // token plan, built after, puts it on the card
@@ -2729,32 +3586,105 @@ fn build(
                 .map_or(0, |e| model.entry_bytes(e).len() * 11 / 10);
         }
         let dev_cap = need.min(free.saturating_sub(reserve));
-        if dev_cap > 0 {
-            let a = Buf::new(dev_cap)?;
-            ARENA.with(|x| x.set((a.ptr, dev_cap, 0)));
-            st.hyb.arenas.push(a);
-        }
-        if dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0") {
-            let host_cap = need - dev_cap + (64 << 20);
-            // page cache counts in the container's usage but gives way; keep
-            // a quarter of the room for it and the process
-            let room = host_room();
-            if host_cap > room / 4 * 3 {
+        let spill = dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0");
+        let host_cap = need - dev_cap + (64 << 20);
+        // page cache counts in the container's usage but gives way; keep
+        // a quarter of the room for it and the process
+        let room = if spill { host_room() } else { usize::MAX };
+        // Stream when the spill does not fit the host's room, or when it is
+        // more than an eighth of the routed experts: then card slots fed from
+        // the RAM tier beat reading the spill over the bus every token
+        // (Ornith-122B q4tp on an A40 within 24 GB: 32.9 tok/s streamed; within
+        // 32 GB, its spill pinned and read over the bus, 11.4). A small spill
+        // (Ornith q2tp-v2 within 46 GB: 38.7) stays pinned.
+        // `CMF_HYB_STREAM_SPILL=<n>`: stream past 1/n of the experts (0: only
+        // past the host's room).
+        let spill_n = std::env::var("CMF_HYB_STREAM_SPILL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+        let big_spill = spill_n > 0 && need_exp > 0 && (need - dev_cap) > need_exp / spill_n;
+        if spill && (host_cap > room / 4 * 3 || (big_spill && std::env::var("CMF_HYB_STREAM").as_deref() != Ok("0"))) {
+            // past the card and the host's room both: the dense part on the
+            // card, the routed experts through card slots (`ExpertStream`)
+            let nonexp = need - need_exp;
+            let slot = (exp_max + (16 << 10)).next_multiple_of(1 << 16);
+            let smax = (NMAX * moe_k).min(moe_e).max(1);
+            // another plan of the model holds the slots: only this plan's own
+            // dense weights want room
+            let slots_room = if live_stream.is_some() { 0 } else { 2 * smax * slot };
+            // the card: the reserve, the slots' minimum, the dense part in
+            // what is left; a dense part past it goes to pinned host memory
+            // (a 12 or 16 GB card), read over the bus
+            let avail = free.saturating_sub(reserve);
+            let card_dense = nonexp.min(avail.saturating_sub(slots_room));
+            let host_dense = nonexp - card_dense;
+            let host_ok = host_dense == 0
+                || (std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0") && host_dense + (64 << 20) <= room / 4 * 3);
+            let why = if std::env::var("CMF_HYB_STREAM").as_deref() == Ok("0") {
+                Some("CMF_HYB_STREAM=0")
+            } else if need_exp == 0 || exp_max == 0 {
+                Some("nothing routed to stream")
+            } else if avail < slots_room || !host_ok {
+                Some("the slots and the dense part fill the card and the host's room")
+            } else {
+                None
+            };
+            if let Some(why) = why {
                 return Err(format!(
-                    "{:.1} GB of weights past the card, {:.1} GB of host memory to pin them in",
+                    "{:.1} GB of weights past the card, {:.1} GB of host memory to pin them in ({why})",
                     (need - dev_cap) as f64 / 1e9,
                     room as f64 / 1e9
                 ));
             }
-            let h = HostArena::new(host_cap)?;
-            ARENA_HOST.with(|x| x.set((h.dev, host_cap, 0)));
-            st.hyb.host_arenas.push(h);
-            ARENA_EXP_DEV.with(|x| x.set(dev_cap.saturating_sub(need - need_exp)));
+            if card_dense > 0 {
+                let a = Buf::new(card_dense)?;
+                ARENA.with(|x| x.set((a.ptr, card_dense, 0)));
+                st.hyb.arenas.push(a);
+            }
+            // the host tier (`CMF_HYB_HOST_TIER=1`): up to half the host's room
+            // holds routed experts the kernels read over the bus (no build),
+            // an even share a layer; the rest stream through the slots
+            let n_moe = layers.iter().filter(|l| matches!(l.ffn, GraphFfn::Moe { .. })).count().max(1);
+            // off by default: measured on an A40 (Ornith-122B q4tp), slots fed
+            // from the RAM tier beat reading pinned experts over the bus
+            let host_exp = if live_stream.is_none() && std::env::var("CMF_HYB_HOST_TIER").as_deref() == Ok("1") {
+                (room / 2).saturating_sub(host_dense + (64 << 20)).min(need_exp)
+            } else {
+                0
+            };
+            host_quota = host_exp / n_moe;
+            if host_dense + host_exp > 0 {
+                let cap = host_dense + host_exp + (64 << 20);
+                let h = HostArena::new(cap)?;
+                ARENA_HOST.with(|x| x.set((h.dev, cap, 0)));
+                st.hyb.host_arenas.push(h);
+            }
+            stream_plan = Some(match &live_stream {
+                Some(cell) => (slot, reserve, cell.clone(), true),
+                None => (slot, reserve, Arc::new(std::sync::Mutex::new(None)), false),
+            });
             tracing::info!(
-                "cuda hybrid: {:.1} GB of a plan's weights on the card, {:.1} GB (routed experts first) in mapped host memory",
-                dev_cap as f64 / 1e9,
-                (need - dev_cap) as f64 / 1e9
+                "cuda hybrid: {:.1} GB of a plan's dense weights on the card, {:.1} GB in mapped host memory, {:.1} GB of routed experts streamed through {} MB card slots",
+                card_dense as f64 / 1e9,
+                host_dense as f64 / 1e9,
+                need_exp as f64 / 1e9,
+                slot >> 20
             );
+        } else {
+            if dev_cap > 0 {
+                let a = Buf::new(dev_cap)?;
+                ARENA.with(|x| x.set((a.ptr, dev_cap, 0)));
+                st.hyb.arenas.push(a);
+            }
+            if spill {
+                let h = HostArena::new(host_cap)?;
+                ARENA_HOST.with(|x| x.set((h.dev, host_cap, 0)));
+                st.hyb.host_arenas.push(h);
+                ARENA_EXP_DEV.with(|x| x.set(dev_cap.saturating_sub(need - need_exp)));
+                tracing::info!(
+                    "cuda hybrid: {:.1} GB of a plan's weights on the card, {:.1} GB (routed experts first) in mapped host memory",
+                    dev_cap as f64 / 1e9,
+                    (need - dev_cap) as f64 / 1e9
+                );
+            }
         }
     }
     struct ArenaEnd;
@@ -2779,9 +3709,11 @@ fn build(
             }
             GraphFfn::Moe {
                 router, shared_gate, experts, n_exp, top_k, inter, norm_topk, sigmoid, sigmoid_denom_eps, bias, has_shared,
-                detached_shared, shared_gated, route_scale, ..
+                detached_shared, shared_gated, route_scale, act, ..
             } => {
                 let (e, k, inter) = (*n_exp, *top_k, *inter);
+                // MiniMax M3's activation: its bit in the pair epilogue and its clamp
+                let (oai_bit, oai_lim) = if *act == GraphAct::SwiGluOaiM3 { (0x1000, OAI_M3_LIMIT) } else { (0, 0.0) };
                 let mut mats = Vec::with_capacity(2 * e);
                 let (mut gu_t, mut dn_t) = (Vec::with_capacity(e), Vec::with_capacity(e));
                 let job = |m: &DevMat, rows: usize, kind: i32| HyJob {
@@ -2800,12 +3732,18 @@ fn build(
                     pad: [0; 3],
                 };
                 // routed experts take the card's room after the dense matrices
+                // (streamed: built into slots later, their jobs markers until then)
+                let streamed = stream_plan.is_some();
+                if streamed {
+                    gu_t.resize(e, job_zero());
+                    dn_t.resize(e, job_zero());
+                }
                 EXPERT_MAT.with(|x| x.set(true));
                 let built = (|| -> Res<()> {
-                    for &(g, u, d) in &experts[..e] {
+                    for &(g, u, d) in experts[..e].iter().filter(|_| !streamed) {
                         let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
                         let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
-                        gu_t.push(job(&pm, 2 * inter, pm.kind as i32 | 0x100));
+                        gu_t.push(HyJob { lim: oai_lim, ..job(&pm, 2 * inter, pm.kind as i32 | 0x100 | oai_bit) });
                         dn_t.push(job(&dmx, hidden, dmx.kind as i32));
                         mats.push(pm);
                         mats.push(dmx);
@@ -2814,6 +3752,37 @@ fn build(
                 })();
                 EXPERT_MAT.with(|x| x.set(false));
                 built?;
+                // streamed: the layer's share of the host tier first (mapped
+                // host memory, the card's arena skipped), markers for the rest
+                let mut fixed: Vec<Option<(HyJob, HyJob)>> = vec![None; e];
+                if streamed && host_quota > 0 && matches!(&stream_plan, Some((_, _, _, false))) {
+                    let mut used = 0usize;
+                    let saved_exp = ARENA_EXP_DEV.with(|x| x.replace(0));
+                    EXPERT_MAT.with(|x| x.set(true));
+                    let placed = (|| -> Res<()> {
+                        for (ei, &(g, u, d)) in experts[..e].iter().enumerate() {
+                            let b = card_bytes(model, g, 2 * inter, hidden) + card_bytes(model, d, hidden, inter) + 1024;
+                            let (_, hcap, hused) = ARENA_HOST.with(|x| x.get());
+                            if used + b > host_quota || hused + b > hcap {
+                                break;
+                            }
+                            let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, hidden)?;
+                            let dmx = hmat(c, st, model, &gw6(d), hidden, inter)?;
+                            let on_host = |w: u64| st.hyb.host_arenas.iter().any(|h| h.holds(w));
+                            if !on_host(pm.w.ptr) || !on_host(dmx.w.ptr) {
+                                return Err("streamed expert outside the host tier".into());
+                            }
+                            fixed[ei] = Some((HyJob { lim: oai_lim, ..job(&pm, 2 * inter, pm.kind as i32 | 0x100 | oai_bit) }, job(&dmx, hidden, dmx.kind as i32)));
+                            mats.push(pm);
+                            mats.push(dmx);
+                            used += b;
+                        }
+                        Ok(())
+                    })();
+                    EXPERT_MAT.with(|x| x.set(false));
+                    ARENA_EXP_DEV.with(|x| x.set(saved_exp));
+                    placed?;
+                }
                 // the shared expert: the last entry, one of its own width, or
                 // none (the first routed expert then stands in, never launched)
                 let shared = *has_shared || detached_shared.is_some();
@@ -2843,13 +3812,40 @@ fn build(
                     let d = t.first().and_then(|j| kd_of(j.kind & 0xFF))?;
                     t.iter().all(|j| kd_of(j.kind & 0xFF) == Some(d)).then_some(d)
                 };
-                let kd = (one_kd(&gu_t), one_kd(&dn_t));
+                let kd = if streamed { (None, None) } else { (one_kd(&gu_t), one_kd(&dn_t)) };
+                let gu_tb = Buf::from_slice(&gu_t)?;
+                let dn_tb = Buf::from_slice(&dn_t)?;
+                let stream = match &stream_plan {
+                    // another plan's stream: this plan's tables join its layer
+                    Some((_, _, cell, true)) => {
+                        let mut g = cell.lock().map_err(|_| "expert stream poisoned")?;
+                        let es = g.as_mut().ok_or("expert stream not filled")?;
+                        let sl = *es.index.get(&experts[0].0).ok_or("expert stream: a layer it does not hold")?;
+                        es.register(sl, gu_tb.ptr, dn_tb.ptr)?;
+                        Some((sl, cell.clone()))
+                    }
+                    Some((_, _, cell, false)) => {
+                        stream_layers.push(StreamLayer {
+                            experts: experts[..e].to_vec(),
+                            inter,
+                            hidden,
+                            tables: vec![(gu_tb.ptr, dn_tb.ptr)],
+                            act: (oai_bit, oai_lim),
+                            marker: (job_zero(), job_zero()),
+                            slot_of: vec![None; e],
+                            fixed: fixed.clone(),
+                        });
+                        stream_keys.push(experts[0].0);
+                        Some((stream_layers.len() - 1, cell.clone()))
+                    }
+                    None => None,
+                };
                 let ml = MoeL {
                     router: routerm,
                     sgw,
                     bias: biasb,
-                    gu_t: Buf::from_slice(&gu_t)?,
-                    dn_t: Buf::from_slice(&dn_t)?,
+                    gu_t: gu_tb,
+                    dn_t: dn_tb,
                     e,
                     k,
                     inter,
@@ -2861,6 +3857,7 @@ fn build(
                     kd,
                     shared,
                     _mats: mats,
+                    stream,
                 };
                 (pm, dmx, sh, Some(ml))
             }
@@ -2944,6 +3941,8 @@ fn build(
                     }
                 };
                 let (nkv, hd) = (lnkv, lhd);
+                // V's own width (MiMo's narrow V; the head's otherwise)
+                let vd = geom.as_ref().map_or(hd, |g| g.dv);
                 let qr = nh * hd * (1 + *output_gate as usize);
                 let window = geom.as_ref().and_then(|g| g.window);
                 let sink = match geom.as_ref().and_then(|g| g.sink) {
@@ -2987,8 +3986,17 @@ fn build(
                 };
                 let qm = hmat(c, st, model, wq, qr, hidden)?;
                 let km = hmat(c, st, model, wk, nkv * hd, hidden)?;
-                let vm = hmat(c, st, model, wv, nkv * hd, hidden)?;
-                let om = hmat(c, st, model, wo, hidden, nh * hd)?;
+                let vm = hmat(c, st, model, wv, nkv * vd, hidden)?;
+                let om = hmat(c, st, model, wo, hidden, nh * vd)?;
+                if vd < hd && bias.is_some() {
+                    return Err(format!("layer {li}: projection biases beside a narrow V"));
+                }
+                // a narrow V lands in the plan's narrow rows, widened after the projections
+                let v_dst = match (&narrow_bufs, vd < hd) {
+                    (Some((vt, _)), true) => vt.ptr,
+                    (None, true) => return Err("narrow-V rows missing".into()),
+                    _ => v.ptr,
+                };
                 let nrm = |d: Option<&[f32]>, st: &mut State| -> Res<Option<Arc<Buf>>> {
                     match d {
                         Some(d) if d.len() == hd => Ok(Some(st.f32_buf(d)?)),
@@ -3026,7 +4034,7 @@ fn build(
                         mmaset(&[
                             (&qm, q.ptr, 0, qrow, qr),
                             (&km, k.ptr, 0, nkv * hd, nkv * hd),
-                            (&vm, v.ptr, 0, nkv * hd, nkv * hd),
+                            (&vm, v_dst, 0, nkv * vd, nkv * vd),
                         ])?,
                         None,
                     ),
@@ -3056,7 +4064,7 @@ fn build(
                     }
                     None => None,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres, vd })
             }
             GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
                 let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
@@ -3124,7 +4132,7 @@ fn build(
                     ms_out,
                 })
             }
-            GraphAttn::Mla { q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, .. } => {
+            GraphAttn::Mla { q_a, q_a_norm, q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, .. } => {
                 let (rope, nope, vd, lora) = (*rope, *nope, *v_dim, *lora);
                 let lhd = rope + nope;
                 let lfx = match st.hyb.funcs.get(&(1, lhd)) {
@@ -3136,12 +4144,23 @@ fn build(
                     }
                 };
                 let mb = mla_bufs.as_ref().ok_or("MLA rows missing")?;
-                let qm = hmat(c, st, model, qw, mnh * lhd, hidden)?;
+                let rank = q_a.as_ref().and(*q_a_norm).map_or(0, |n| n.len());
+                let qm = hmat(c, st, model, qw, mnh * lhd, if rank > 0 { rank } else { hidden })?;
                 let kvam = hmat(c, st, model, kv_a, lora + rope, hidden)?;
                 let kvbm = hmat(c, st, model, kv_b, mnh * (nope + vd), lora)?;
                 let om = hmat(c, st, model, ow, hidden, mnh * vd)?;
                 note(kv_a_norm);
-                let ms_in = mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?;
+                let (ms_in, qa) = match (q_a, *q_a_norm) {
+                    (Some(g), Some(qn)) => {
+                        let (qab, _) = mb.qa.as_ref().ok_or("MLA query rows missing")?;
+                        let qam = hmat(c, st, model, g, rank, hidden)?;
+                        note(qn);
+                        let ms_in = mmaset(&[(&qam, qab.ptr, 0, rank, rank), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?;
+                        let ms_qb = mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd)])?;
+                        (ms_in, Some(MlaQa { m: qam, norm: st.f32_buf(qn)?, ms_qb, rank }))
+                    }
+                    _ => (mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?, None),
+                };
                 let ms_kvb = mmaset(&[(&kvbm, mb.kvb.ptr, 0, mnh * (nope + vd), mnh * (nope + vd))])?;
                 let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
                     true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
@@ -3170,7 +4189,8 @@ fn build(
                     ms_out,
                     vres: None,
                     dash: None,
-                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale }),
+                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale, qa }),
+                    vd: lhd,
                 })
             }
             GraphAttn::ShortConv { inp, out: ow, taps, kernel, .. } => {
@@ -3188,16 +4208,20 @@ fn build(
             }
             _ => unreachable!(),
         };
+        // the pair's activation: 1 tanh GELU, 2 erf GELU, 3 SwiGLU-OAI (a
+        // MiniMax M3 shared expert), else SiLU
         let gelu = match &l.ffn {
             GraphFfn::Dense { act: GraphAct::GeluTanh, .. } => 1u8,
             GraphFfn::Dense { act: GraphAct::GeluErf, .. } => 2u8,
+            GraphFfn::Dense { act: GraphAct::SwiGluOaiM3, .. } | GraphFfn::Moe { act: GraphAct::SwiGluOaiM3, .. } => 3u8,
             _ => 0u8,
         };
         let lim = match &l.ffn {
+            GraphFfn::Dense { act: GraphAct::SwiGluOaiM3, .. } | GraphFfn::Moe { act: GraphAct::SwiGluOaiM3, .. } => OAI_M3_LIMIT,
             GraphFfn::Dense { limit, .. } => *limit,
             _ => 0.0,
         };
-        let ms_gu = mmaset_kind_lim(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400][gelu as usize], lim)?;
+        let ms_gu = mmaset_kind_lim(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400, 0x1000][gelu as usize], lim)?;
         // a routed FFN's shared expert goes to its own rows, mixed in after the routed ones
         let ms_dn = match (&moe, &moe_bufs) {
             (Some(_), Some(mb)) => mmaset(&[(&dm, mb.dsh.ptr, 0, hidden, hidden)])?,
@@ -3286,6 +4310,64 @@ fn build(
         None => (None, f4(1)?, None),
     };
     let _ = lm_rows;
+    // the stream's slots: the card's memory left once the plan's other
+    // weights are placed, less the reserve; every routed layer's first
+    // expert built at once, its jobs the markers' rows and kinds
+    let stream = match stream_plan {
+        Some((_, _, cell, true)) => Some(cell),
+        Some((slot, keep, cell, false)) => {
+            let free = super::card_free();
+            let n = free.saturating_sub(keep) / slot;
+            let smax = (NMAX * moe_k).min(moe_e).max(1);
+            if n < 2 * smax {
+                return Err(format!("expert stream: room for {n} slots of {} MB, {} wanted", slot >> 20, 2 * smax));
+            }
+            let stage = Buf::new(slot)?;
+            let pool = Buf::new(n * slot)?;
+            c.resident.fetch_add(pool.bytes as u64, Ordering::Relaxed);
+            let index = stream_keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+            let mut es = ExpertStream {
+                model: model.clone(),
+                pool,
+                stage,
+                slot,
+                owner: vec![None; n],
+                jobs: vec![(job_zero(), job_zero()); n],
+                last: vec![0; n],
+                tick: 0,
+                layers: stream_layers,
+                index,
+                ram: None,
+                loads: 0,
+                hits: 0,
+                load_ns: 0,
+            };
+            // the RAM tier the misses build from (a layer's widest expert a slot)
+            es.ram = es.layers.first().and_then(|l| ram_tier(model, &l.experts, need_exp));
+            // every layer's first expert built at once: its jobs the markers'
+            // rows and kinds; then the tables written whole
+            for li in 0..es.layers.len() {
+                es.tick += 1;
+                // a host-tier expert's jobs give the markers' kinds; else
+                // the first expert built into a slot
+                let (gj, dj) = match es.layers[li].fixed.iter().flatten().next() {
+                    Some(&j) => j,
+                    None => es.ensure(c, &fx, li, 0)?,
+                };
+                let unweighted = |j: HyJob| HyJob { w: 0, aux0: 0, aux1: 0, ..j };
+                es.layers[li].marker = (unweighted(gj), unweighted(dj));
+                let tables = std::mem::take(&mut es.layers[li].tables);
+                for (gt, dt) in tables {
+                    es.register(li, gt, dt)?;
+                }
+            }
+            tracing::info!("cuda hybrid: expert stream of {n} card slots of {} MB ({:.1} GB)", slot >> 20, (n * slot) as f64 / 1e9);
+            *cell.lock().map_err(|_| "expert stream poisoned")? = Some(es);
+            st.hyb.streams.insert(uid, Arc::downgrade(&cell));
+            Some(cell)
+        }
+        None => None,
+    };
     let pp = [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?];
     static PLAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     // every attention layer's call record (MLA's included)
@@ -3313,6 +4395,7 @@ fn build(
         },
         kda: kda_bufs,
         mla: mla_bufs,
+        narrow: narrow_bufs,
         vres: if has_vres {
             Some((f4(NMAX * hidden)?, [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?]))
         } else {
@@ -3367,6 +4450,7 @@ fn build(
         moe: moe_bufs,
         yo,
         hgv,
+        stream,
     })
 }
 
@@ -4283,6 +5367,12 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         let vpl = Planes { p0: vp[0].ptr, p1: vp[1].ptr, p2: vp[2].ptr, stride: plan.pstride };
                         ms_v.run(c, fx, &vpl, hidden, n)?;
                     }
+                    if let (true, Some((vt, _))) = (a.vd < hd, &plan.narrow) {
+                        // a narrow V widened to the head with zeros
+                        let tot = (n * nkv * hd) as u64;
+                        let (nkv_i2, vd_i, hd_i2) = (nkv as i32, a.vd as i32, hd as i32);
+                        c.launch(fx.vpad, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(vt.ptr, plan.v.ptr, n_i, nkv_i2, vd_i, hd_i2))?;
+                    }
                     hst(c, 4, &mut t0)?;
                     if let (Some(ml), Some(mb)) = (&a.mla, &plan.mla) {
                         // MLA: the latent's norm into its planes, kv_b over it, the
@@ -4291,6 +5381,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, mb.lp[0].ptr, mb.lp[1].ptr, lora_i))?;
                         let lpl = Planes { p0: mb.lp[0].ptr, p1: mb.lp[1].ptr, p2: mb.lp[1].ptr, stride: ml.lora };
                         ml.ms_kvb.run(c, fx, &lpl, ml.lora, n)?;
+                        if let (Some(qa), Some((qab, qp))) = (&ml.qa, &mb.qa) {
+                            // the low-rank query: q_a's rows normed into planes, q_b over them
+                            let r_i = qa.rank as i32;
+                            c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(qab.ptr, r_i, qa.norm.ptr, r_i, eps, qp[0].ptr, qp[1].ptr, r_i))?;
+                            let qpl = Planes { p0: qp[0].ptr, p1: qp[1].ptr, p2: qp[1].ptr, stride: qa.rank };
+                            qa.ms_qb.run(c, fx, &qpl, qa.rank, n)?;
+                        }
                         let (rope_i, nope_i, vd_i) = (ml.rope as i32, ml.nope as i32, ml.vd as i32);
                         c.launch(
                             fx.mla_kv,
@@ -4432,6 +5529,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         c.launch(fx.mla_cut, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pp0, pp1, ps_i, mb.op[0].ptr, mb.op[1].ptr, od_i, n_i, nh_i, hd_i2, vd_i))?;
                         let opl = Planes { p0: mb.op[0].ptr, p1: mb.op[1].ptr, p2: mb.op[1].ptr, stride: nh * ml.vd };
                         a.ms_out.run(c, fx, &opl, nh * ml.vd, n)?;
+                    } else if let (true, Some((_, op))) = (a.vd < hd, &plan.narrow) {
+                        // a narrow V: the heads cut back to it for the output product
+                        let tot = n * nh * a.vd;
+                        let (od_i, hd_i2, vd_i) = ((nh * a.vd) as i32, hd as i32, a.vd as i32);
+                        c.launch(fx.mla_cut, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pp0, pp1, ps_i, op[0].ptr, op[1].ptr, od_i, n_i, nh_i, hd_i2, vd_i))?;
+                        let opl = Planes { p0: op[0].ptr, p1: op[1].ptr, p2: op[1].ptr, stride: nh * a.vd };
+                        a.ms_out.run(c, fx, &opl, nh * a.vd, n)?;
                     } else {
                         a.ms_out.run(c, fx, planes, nh * hd, n)?;
                     }
@@ -4608,6 +5712,8 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
                 mb.qq[0].ptr, mb.qq[1].ptr, ps_i, mb.dns.ptr, hi, bg, bd
             ),
         )?;
+        // streamed experts: the picks not on the card built into slots
+        stream_fix(c, fx, m, mb, s_n)?;
         let (pp0, pp1, pp2) = (plan.pp[0].ptr, plan.pp[1].ptr, plan.pp[2].ptr);
         let t = (tb - 1) as usize;
         // experts of one codec: that codec's launch
@@ -4639,7 +5745,9 @@ fn small_only(l: &HLayer) -> bool {
     };
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
-    blr || l.ms_gu.has_blr()
+    // streamed experts are patched after each layer's router: the small path's
+    blr || l.moe.as_ref().is_some_and(|m| m.stream.is_some())
+        || l.ms_gu.has_blr()
         || l.ms_dn.has_blr()
         || (l.moe.is_some() && l.ffn_out.is_some())
         || (l.mhc.is_some() && (l.moe.is_some() || l.attn_out.is_some() || l.ffn_out.is_some()))
@@ -4805,7 +5913,8 @@ unsafe fn run_small(
         }
         // a prompt read through this path a chunk at a time launches directly:
         // capturing a graph per chunk shape cost more than the chunk
-        if !graphs_on() || DIRECT.with(|d| d.get()) {
+        // (a streamed plan's host patches the jobs between the launches)
+        if !graphs_on() || DIRECT.with(|d| d.get()) || plan.stream.is_some() {
             launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
             if head {
                 head_launch(c, plan, n)?;
@@ -5230,7 +6339,8 @@ pub(super) fn mtp_chain(
             Ok(())
         };
         unsafe {
-            if graphs_on() {
+            // (a streamed plan's host patches the jobs between the launches)
+            if graphs_on() && plan.stream.is_none() {
                 let gkey = (plan.id, kv_id, layer_base, k, true, true, 0xC4A1_0000u64);
                 let mut sig: Vec<u64> = books[0].layers.iter().flatten().copied().collect();
                 sig.extend(books[0].scratch);
@@ -5747,7 +6857,12 @@ unsafe fn big(
             match &l.mix {
                 Mix::Gdn(g) => v.extend([(g.qkv.rows, g.qkv.cols), (g.z.rows, g.z.cols), (g.out.rows, g.out.cols)]),
                 Mix::Kda(g) => v.extend([(g.q.rows, g.q.cols), (g.k.rows, g.k.cols), (g.v.rows, g.v.cols), (g.out.rows, g.out.cols)]),
-                Mix::Attn(a) => v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]),
+                Mix::Attn(a) => {
+                    v.extend([(a.q.rows, a.q.cols), (a.k.rows, a.k.cols), (a.v.rows, a.v.cols), (a.o.rows, a.o.cols)]);
+                    if let Some(qa) = a.mla.as_ref().and_then(|m| m.qa.as_ref()) {
+                        v.push((qa.m.rows, qa.m.cols));
+                    }
+                }
                 Mix::Conv(cv) => v.extend([(cv.inp.rows, cv.inp.cols), (cv.out.rows, cv.out.cols)]),
             }
             v
@@ -6050,7 +7165,21 @@ unsafe fn big(
                 let bfm = st.scr(c, "hb_fm", b * nh * 4)?;
                 let bfz = st.scr(c, "hb_fz", b * nh * 4)?;
                 let bfn = st.scr(c, "hb_fn", b * nh * hd * 4)?;
-                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                match a.mla.as_ref().and_then(|m| m.qa.as_ref()) {
+                    Some(qa) => {
+                        // the low-rank query: q_a, its norm as f16 rows, q_b
+                        let yqa = st.scr(c, "hb_qa", b * qa.rank * 4)?;
+                        let qlat = st.scr(c, "hb_qlat", b * qa.rank * 2)?;
+                        mul(&qa.m, bxf, yqa, qa.rank, 1.0, 0.0)?;
+                        let r_i = qa.rank as i32;
+                        unsafe { c.launch(fx.mla_lat_h, (b as u32, 1), 256, 0, kargs!(yqa, r_i, qa.norm.ptr, r_i, eps, qlat))? };
+                        mul(&a.q, qlat, yq, qr, 1.0, 0.0)?;
+                    }
+                    None => mul(&a.q, bxf, yq, qr, 1.0, 0.0)?,
+                }
+                if a.vd < hd {
+                    return Err("a narrow V past the far field's seal".into());
+                }
                 mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
                 mul(&a.v, bxf, yv, nkv * hd, 1.0, 0.0)?;
                 let (kp, vp, kt, qt, mu, mz, th, ns, w, m, win_len, win_head, far_len, fscale, rect_fm) = {
@@ -6187,7 +7316,18 @@ unsafe fn big(
                 let aog = st.scr(c, "hb_aog", b * nh * hd * 4)?;
                 let bao = st.scr(c, "hb_ao", b * nh * hd * 2)?;
                 let bis = st.scr(c, "hb_is", b * nh * 4)?;
-                mul(&a.q, bxf, yq, qr, 1.0, 0.0)?;
+                match a.mla.as_ref().and_then(|m| m.qa.as_ref()) {
+                    Some(qa) => {
+                        // the low-rank query: q_a, its norm as f16 rows, q_b
+                        let yqa = st.scr(c, "hb_qa", b * qa.rank * 4)?;
+                        let qlat = st.scr(c, "hb_qlat", b * qa.rank * 2)?;
+                        mul(&qa.m, bxf, yqa, qa.rank, 1.0, 0.0)?;
+                        let r_i = qa.rank as i32;
+                        unsafe { c.launch(fx.mla_lat_h, (b as u32, 1), 256, 0, kargs!(yqa, r_i, qa.norm.ptr, r_i, eps, qlat))? };
+                        mul(&a.q, qlat, yq, qr, 1.0, 0.0)?;
+                    }
+                    None => mul(&a.q, bxf, yq, qr, 1.0, 0.0)?,
+                }
                 // Ripple's value residual: V reads lerp(e0, normed, blend) of the chunk's rows
                 let bxv = match (&a.vres, e0) {
                     (Some((blend, _)), Some(e0)) => {
@@ -6231,6 +7371,15 @@ unsafe fn big(
                                 kargs!(kva, st_i, kvb, yk, yv, b_i, nkv_i, rope_i, nope_i, vd_i, lora_i),
                             )?;
                         }
+                    }
+                    None if a.vd < hd => {
+                        // a narrow V projected to its own rows, widened to the head with zeros
+                        mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
+                        let yvt = st.scr(c, "hb_vt", b * nkv * a.vd * 4)?;
+                        mul(&a.v, bxv, yvt, nkv * a.vd, 1.0, 0.0)?;
+                        let tot = (b * nkv * hd) as u64;
+                        let (nkv_i2, vd_i, hd_i2) = (nkv as i32, a.vd as i32, hd as i32);
+                        unsafe { c.launch(fx.vpad, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(yvt, yv, b_i, nkv_i2, vd_i, hd_i2))? };
                     }
                     None => {
                         mul(&a.k, bxf, yk, nkv * hd, 1.0, 0.0)?;
@@ -6379,6 +7528,14 @@ unsafe fn big(
                         let cut = st.scr(c, "hb_aocut", b * nh * ml.vd * 2)?;
                         let tot = b * nh * ml.vd;
                         let (nh_i2, hd_i2, vd_i2) = (nh as i32, hd as i32, ml.vd as i32);
+                        unsafe { c.launch(fx.mla_cut_h, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bao, cut, b_i, nh_i2, hd_i2, vd_i2))? };
+                        cut
+                    }
+                    // a narrow V: the same cut to its width
+                    None if a.vd < hd => {
+                        let cut = st.scr(c, "hb_aocut", b * nh * a.vd * 2)?;
+                        let tot = b * nh * a.vd;
+                        let (nh_i2, hd_i2, vd_i2) = (nh as i32, hd as i32, a.vd as i32);
                         unsafe { c.launch(fx.mla_cut_h, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(bao, cut, b_i, nh_i2, hd_i2, vd_i2))? };
                         cut
                     }

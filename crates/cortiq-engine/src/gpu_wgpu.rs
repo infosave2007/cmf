@@ -49,6 +49,8 @@ pub(crate) mod nemotron_verify;
 pub mod host_mem;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
 pub(crate) mod moe_r4;
+/// Card slots over system-memory expert banks (LRU on the device).
+pub(crate) mod moe_cache;
 /// Block-diffusion preview kernels of the batched graph (Clover).
 pub(crate) mod clover;
 /// q8_2f MoE experts on the token graph (decode) and batch graph (prefill).
@@ -5583,6 +5585,34 @@ fn sconv_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         gc_ring[ch * ring + j] = gc_ring[ch * ring + j - 1u];
     }
     if (ring > 0u) { gc_ring[ch * ring] = bx; }
+}
+
+// `sconv_step` for the batch graph: one thread per channel walks a chunk's
+// rows in order (gc_p.xoff = rows), gc_qkv = bcx [rows][3h], gc_cq = y
+// [rows][h]; the ring ends as the token step would leave it after the last.
+@compute @workgroup_size(256)
+fn sconv_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ch = gid.x;
+    let h = gc_p.cdim;
+    if (ch >= h) { return; }
+    let k = gc_p.kk;
+    let ring = k - 1u;
+    let tb = ch * k;
+    for (var t = 0u; t < gc_p.xoff; t = t + 1u) {
+        let base = t * 3u * h;
+        let bx = gc_qkv[base + ch] * gc_qkv[base + 2u * h + ch];
+        var acc = gc_taps[tb + k - 1u] * bx;
+        for (var s = 0u; s < ring; s = s + 1u) {
+            acc = acc + gc_taps[tb + k - 2u - s] * gc_ring[ch * ring + s];
+        }
+        gc_cq[t * h + ch] = gc_qkv[base + h + ch] * acc;
+        var j = ring;
+        while (j > 1u) {
+            j = j - 1u;
+            gc_ring[ch * ring + j] = gc_ring[ch * ring + j - 1u];
+        }
+        if (ring > 0u) { gc_ring[ch * ring] = bx; }
+    }
 }
 
 // ── GDN (gated DeltaNet / linear attention) decode step ──────────────────
@@ -19897,6 +19927,7 @@ fn kimi_problem(
                 lora,
                 no_rope,
                 q_a,
+                q_a_norm,
                 kv_a_norm,
                 ..
             } => {
@@ -19904,7 +19935,7 @@ fn kimi_problem(
                 let lhd = rope + nope;
                 if *mnh != nh
                     || !*no_rope
-                    || q_a.is_some()
+                    || q_a.is_some() && q_a_norm.is_none_or(|n| n.is_empty() || n.len() % 4 != 0)
                     || lhd % 4 != 0
                     || lhd > 256
                     || *v_dim == 0
@@ -19913,7 +19944,7 @@ fn kimi_problem(
                     || *lora == 0
                     || kv_a_norm.len() != *lora
                 {
-                    return Some("MLA geometry outside the kernels (a rotary or q low-rank stage, heads past 256)");
+                    return Some("MLA geometry outside the kernels (a rotary stage, a query rank off 4, heads past 256)");
                 }
                 if let Some(why) = mla_geom(&l.attn).and_then(|g| graph_geom_problem(c, &g, nh, hd)) {
                     return Some(why);
@@ -20451,6 +20482,9 @@ pub struct Ctx {
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     sconv_step: wgpu::ComputePipeline,
+    /// The batch graph's short convolution over a chunk's rows.
+    sconv_batch: wgpu::ComputePipeline,
+    layout_sconv_b: wgpu::BindGroupLayout,
     f32_matvec: wgpu::ComputePipeline,
     f32_matvec_b: wgpu::ComputePipeline,
     layout_f32b: wgpu::BindGroupLayout,
@@ -20564,6 +20598,8 @@ pub struct Ctx {
     qwen4_pipes: std::sync::OnceLock<Option<qwen4::Pipes>>,
     /// The generic MoE block's row-blocked decode pair, compiled on first use.
     moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
+    /// The expert cache's fill and copy kernels, compiled on first use.
+    moe_cache_pipes: std::sync::OnceLock<Option<moe_cache::Pipes>>,
     /// Block-diffusion preview kernels (`clover`), compiled on first use.
     clover_pipes: std::sync::OnceLock<Option<clover::Pipes>>,
     /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
@@ -23017,6 +23053,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_conv = pipe("gdn_conv");
     let sconv_step = pipe("sconv_step");
     let layout_sconv = sconv_step.get_bind_group_layout(0);
+    let sconv_batch = pipe("sconv_batch");
+    let layout_sconv_b = sconv_batch.get_bind_group_layout(0);
     let f32_matvec = pipe("f32_matvec");
     let f32_matvec_b = pipe("f32_matvec_b");
     let layout_f32b = f32_matvec_b.get_bind_group_layout(0);
@@ -23850,6 +23888,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_step,
         gdn_conv,
         sconv_step,
+        sconv_batch,
+        layout_sconv_b,
         f32_matvec,
         f32_matvec_b,
         layout_f32b,
@@ -23916,6 +23956,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         qwen4_pipes: std::sync::OnceLock::new(),
         moe_r4_pipes: std::sync::OnceLock::new(),
+        moe_cache_pipes: std::sync::OnceLock::new(),
         exact_alloc,
         clover_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
@@ -26762,6 +26803,207 @@ fn staged_moe_projection_upload(
 
 /// The upload half of `moe_expert_bufs`: gate/up blobs of `gu_len` bytes,
 /// down blobs of `d_len`, every expert checked before anything is allocated.
+/// System memory routed-expert banks hold (`moe_expert_sysmem`).
+static SYS_EXPERT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The token graph placed this layer's routed experts in system memory
+    /// (its dense part took the card's room): the upload goes there directly.
+    static SYS_EXPERTS_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether routed experts may live in GPU-visible system memory here.
+fn sys_experts_on(c: &Ctx) -> bool {
+    c.discrete && std::env::var("CMF_SYS_EXPERTS").as_deref() != Ok("0") && std::env::var("CMF_SYSMEM").as_deref() != Ok("0")
+}
+
+
+/// A layer's routed-expert bank as `moe_cache::plan` sizes it: its bytes
+/// (every entry, the shared expert's too: it rides in the bank), entries and
+/// picks a token.
+fn layer_bank(model: &CmfModel, l: &crate::gpu::GraphLayer<'_>) -> (u64, usize, usize) {
+    match &l.ffn {
+        crate::gpu::GraphFfn::Moe { experts, top_k, has_shared, .. } => (
+            experts
+                .iter()
+                .flat_map(|&(g, u, d)| [g, u, d])
+                .filter_map(|i| model.tensors.get(i).map(|e| e.nbytes as u64))
+                .sum(),
+            experts.len(),
+            *top_k + usize::from(*has_shared),
+        ),
+        _ => (0, 0, 0),
+    }
+}
+
+/// The placement of a stack's routed experts (`moe_cache::plan`), the same
+/// for the token and the batch graph: every layer's dense part and the head
+/// take the live budget first, the banks what is left. Fixed per model and
+/// stack once made (the banks it placed stay where they went). None: no
+/// system memory here, or the dense part alone does not fit.
+fn expert_plan(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    layers: &[crate::gpu::GraphLayer<'_>],
+    head_idx: Option<usize>,
+    live_budget: u64,
+) -> Option<Arc<moe_cache::Plan>> {
+    type Key = (u64, usize, usize, u64);
+    static MEMO: OnceLock<Mutex<HashMap<Key, Option<Arc<moe_cache::Plan>>>>> = OnceLock::new();
+    if !sys_experts_on(c) {
+        return None;
+    }
+    let first = layers.iter().find_map(|l| match &l.ffn {
+        crate::gpu::GraphFfn::Moe { experts, .. } => experts.first().map(|e| e.0),
+        _ => None,
+    })?;
+    let key = (model.uid(), layers.len(), first, live_budget);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(p) = memo.lock().unwrap().get(&key) {
+        return p.clone();
+    }
+    // the head counts even when this call has none: the decode asks for it
+    // as its own pass (`m3_device_logits`), and a full card sends it to the
+    // host every token
+    let head = head_idx
+        .and_then(|i| model.tensors.get(i))
+        .or_else(|| model.tensor("lm_head.weight"))
+        .or_else(|| model.tensor("model.embed_tokens.weight"))
+        .map_or(0, |e| e.nbytes as u64);
+    let mut dense = head + head / 10;
+    let mut banks = Vec::with_capacity(layers.len());
+    let mut sized = true;
+    for l in layers {
+        let b = layer_bank(model, l);
+        match graph_layer_payload_bytes(model, l) {
+            Some(p) => dense += p - b.0.min(p),
+            None => {
+                sized = false;
+                break;
+            }
+        }
+        banks.push(b);
+    }
+    let plan = (sized && dense <= live_budget).then(|| {
+        let room = host_room_bytes() / 4 * 3 + SYS_EXPERT_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let p = moe_cache::plan(&banks, live_budget - dense, room, moe_cache::on(), moe_cache::stage_on());
+        let n_sys = p.sys.iter().filter(|&&s| s).count();
+        if n_sys > 0 {
+            let cached = p.cap.iter().filter(|&&c| c > 0).count();
+            tracing::info!(
+                "wgpu: routed experts: {} of {} MoE layers in system memory ({} with card slots, {} MB of slots, {} MB staging), {} MB of the card for whole banks",
+                n_sys,
+                banks.iter().filter(|b| b.0 > 0).count(),
+                cached,
+                p.cache_bytes.iter().sum::<u64>() >> 20,
+                p.stage_bytes >> 20,
+                banks.iter().zip(&p.sys).filter(|&(_, s)| !*s).map(|(b, _)| b.0).sum::<u64>() >> 20
+            );
+        }
+        Arc::new(p)
+    });
+    memo.lock().unwrap().insert(key, plan.clone());
+    plan
+}
+
+/// RAM this process may still take: MemAvailable, or the container's limit
+/// less its anonymous memory when lower (cgroup v2, else v1).
+fn host_room_bytes() -> u64 {
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<u64>().ok());
+    let field = |s: &Option<String>, k: &str| -> u64 {
+        s.as_deref()
+            .and_then(|m| m.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().split_whitespace().next()?.parse::<u64>().ok())))
+            .unwrap_or(0)
+    };
+    let mi = read("/proc/meminfo");
+    let mut room = field(&mi, "MemAvailable:") * 1024;
+    if room == 0 {
+        room = u64::MAX;
+    }
+    if let Some(lim) = num(read("/sys/fs/cgroup/memory.max")).filter(|&l| l < 1 << 60) {
+        let st = read("/sys/fs/cgroup/memory.stat");
+        room = room.min(lim.saturating_sub(field(&st, "anon ") + field(&st, "unevictable ")));
+    } else if let Some(lim) = num(read("/sys/fs/cgroup/memory/memory.limit_in_bytes")).filter(|&l| l < 1 << 60) {
+        let st = read("/sys/fs/cgroup/memory/memory.stat");
+        room = room.min(lim.saturating_sub(field(&st, "total_rss ") + field(&st, "total_unevictable ")));
+    }
+    room
+}
+
+/// A layer's routed-expert bank in GPU-visible system memory
+/// (`host_mem::sysmem_storage_buffer`): the gate, up and down stacks copied
+/// from the file's mapping, the kernels reading the picks over the bus — the
+/// card's memory then holds the dense part of every layer instead of the
+/// stack ending at the first layer it has no room for. Bounded by ¾ of the
+/// host's room (the container's limit); `CMF_SYSMEM=0` / `CMF_SYS_EXPERTS=0`
+/// keep the old prefix.
+fn moe_expert_sysmem(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+    gu_len: usize,
+    d_len: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    use std::sync::atomic::Ordering;
+    if !c.discrete || std::env::var("CMF_SYS_EXPERTS").as_deref() == Ok("0") {
+        return None;
+    }
+    let total = (experts.len() * (2 * gu_len + d_len)) as u64;
+    let held = SYS_EXPERT_BYTES.load(Ordering::Relaxed);
+    let room = host_room_bytes();
+    if total > room / 4 * 3 {
+        return None;
+    }
+    let bytes = model.primary_bytes();
+    let mk = |role: &dyn Fn(&(usize, usize, usize)) -> usize, rows: usize, cols: usize, plen: usize| -> Option<wgpu::Buffer> {
+        let mut offs = Vec::with_capacity(experts.len());
+        for t in experts {
+            let e = model.tensors.get(role(t))?;
+            if *e.shape.first()? != rows || *e.shape.get(1)? != cols || e.nbytes as usize != plen {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            bytes.get(abs..abs + plen)?;
+            offs.push(abs);
+        }
+        let sb = host_mem::sysmem_storage_buffer(&c.device, (experts.len() * plen) as u64)?;
+        for (i, &abs) in offs.iter().enumerate() {
+            if !sb.write((i * plen) as u64, &bytes[abs..abs + plen]) {
+                return None;
+            }
+        }
+        Some(sb.buffer.clone())
+    };
+    let g = mk(&|t| t.0, inter, hidden, gu_len)?;
+    let u = mk(&|t| t.1, inter, hidden, gu_len)?;
+    let d = mk(&|t| t.2, hidden, inter, d_len)?;
+    // the copies are in RAM now: the mapping's pages of these experts are
+    // a second copy the page cache would keep
+    let spans: Vec<(usize, usize)> = experts
+        .iter()
+        .flat_map(|&(gi, ui, di)| [gi, ui, di])
+        .filter_map(|i| model.tensors.get(i).and_then(|e| Some((model.entry_abs_offset(e)?, e.nbytes as usize))))
+        .collect();
+    model.evict_ranges(&spans);
+    let now = SYS_EXPERT_BYTES.fetch_add(total, Ordering::Relaxed) + total;
+    {
+        use std::sync::atomic::AtomicBool;
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "wgpu: routed experts past the card's {} MB budget go to GPU-visible system memory ({} MB room)",
+                c.vram_budget >> 20,
+                room >> 20
+            );
+        }
+    }
+    let _ = (held, now);
+    Some((g, u, d))
+}
+
 fn moe_expert_upload(
     c: &Ctx,
     model: &Arc<CmfModel>,
@@ -26775,7 +27017,15 @@ fn moe_expert_upload(
     let bytes = model.primary_bytes();
     let key = (model.uid() as usize, experts.first()?.0);
     let total = (experts.len() * (2 * gu_len + d_len)) as u64;
-    if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
+    let to_sys = SYS_EXPERTS_NEXT.with(|x| x.replace(false));
+    if to_sys || c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
+        // Past the card: the layer's bank in GPU-visible system memory,
+        // read over the bus (only the picked experts' rows travel).
+        if let Some(b) = moe_expert_sysmem(c, model, experts, inter, hidden, gu_len, d_len) {
+            c.moe_expw.lock().unwrap().insert(key, b.clone());
+            moe_cache::note_sys_bank(key);
+            return Some(b);
+        }
         // Over budget — the whole graph falls to CPU. Say so ONCE with the
         // numbers: the default budget is a conservative 8 GB on discrete
         // cards, so a 32 GB card running a big MoE lands here and every
@@ -28518,6 +28768,9 @@ pub fn forward_token_graph(
             dv: usize,
             /// Spark-X2.5 head-wise output gate `[nh, hidden]`.
             hg: Option<GMat>,
+            /// MLA's low-rank query (GLM-5.3): q_a `[rank × hidden]` and the
+            /// rank; `wq` is then q_b `[nh·hd × rank]`.
+            qa: Option<(GMat, usize)>,
         },
         Conv {
             inp: GMat,
@@ -28614,6 +28867,9 @@ pub fn forward_token_graph(
             detached_shared: Option<LDetachedShared>,
             shared_gated: bool,
             route_scale: f32,
+            /// Card slots over a system-memory bank (`moe_cache`): the
+            /// expert kernels read these and the picks' slot numbers.
+            cache: Option<Arc<moe_cache::Cache>>,
         },
         /// MiniMax's dynamic tail: routing through the segmented global bank
         /// (descriptor-indexed gate/up/down), experts admitted between
@@ -28862,20 +29118,50 @@ pub fn forward_token_graph(
         && std::env::var("CMF_MINIMAX_DYNAMIC_TAIL").as_deref() == Ok("1")
         && dsv4_global_moe_supported()
         && dsv4_global_moe_ready(model);
-    for l in layers {
+    let sys_ok = sys_experts_on(c);
+    // Where the routed experts go (`expert_plan`): every layer's dense part
+    // and the head take the live budget first, the banks what is left, the
+    // rest system memory with card slots over it — a greedy front-to-back
+    // fill gave the early layers' experts the card and ended the stack where
+    // a later layer's dense part no longer fit.
+    let plan = expert_plan(c, model, layers, lm_head.map(|(gw, _)| gw.idx), graph_live_budget);
+    for (pli, l) in layers.iter().enumerate() {
         let Some(layer_bytes) = graph_layer_payload_bytes(model, l) else {
             graph_decline("cannot size layer payload");
             return token_graph_outcome(o1_started || state_started, false);
         };
-        if graph_bytes.saturating_add(layer_bytes) > graph_live_budget {
-            if lws.is_empty() {
-                graph_decline("one layer exceeds the weight budget");
-                return token_graph_outcome(o1_started || state_started, false);
-            }
-            prefix = true;
-            break;
+        let exp = layer_bank(model, l).0.min(layer_bytes);
+        let mut sys_layer = exp > 0 && plan.as_ref().is_some_and(|p| p.sys.get(pli) == Some(&true));
+        let mut cache_cap = if sys_layer { plan.as_ref().map_or(0, |p| p.cap[pli]) } else { 0 };
+        let cache_b = if cache_cap > 0 { plan.as_ref().map_or(0, |p| p.cache_bytes[pli]) } else { 0 };
+        let mut live = if sys_layer { layer_bytes - exp + cache_b } else { layer_bytes };
+        if cache_cap > 0 && graph_bytes.saturating_add(live) > graph_live_budget {
+            // the slots go first: the bank still reads in place
+            cache_cap = 0;
+            live = layer_bytes - exp;
         }
-        graph_bytes += layer_bytes;
+        if graph_bytes.saturating_add(live) > graph_live_budget {
+            // a layer whose dense part fits keeps the stack going with its
+            // routed experts in GPU-visible system memory
+            let room = host_room_bytes() / 4 * 3;
+            if !sys_layer
+                && sys_ok
+                && exp > 0
+                && graph_bytes.saturating_add(layer_bytes - exp) <= graph_live_budget
+                && exp <= room
+            {
+                sys_layer = true;
+                live = layer_bytes - exp;
+            } else {
+                if lws.is_empty() {
+                    graph_decline("one layer exceeds the weight budget");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                prefix = true;
+                break;
+            }
+        }
+        graph_bytes += live;
         let attn = match &l.attn {
             crate::gpu::GraphAttn::Full {
                 wq,
@@ -28924,6 +29210,7 @@ pub fn forward_token_graph(
                     hd: lhd,
                     dv: ldv,
                     hg,
+                    qa: None,
                 }
             }
             crate::gpu::GraphAttn::Gdn {
@@ -29020,6 +29307,8 @@ pub fn forward_token_graph(
                 LAttn::Kda { q, k, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g }
             }
             crate::gpu::GraphAttn::Mla {
+                q_a,
+                q_a_norm,
                 q: wq,
                 kv_a,
                 kv_b,
@@ -29034,8 +29323,20 @@ pub fn forward_token_graph(
                 // multi-head attention over heads rope + nope wide: the Full
                 // arm with this layer's geometry; wk / wv hold kv_a / kv_b
                 let lhd = rope + nope;
+                // a low-rank query: q_a here, q_b in wq over its normed rows
+                let rank = q_a.as_ref().and(*q_a_norm).map_or(0, |n| n.len());
+                let qa = match q_a {
+                    Some(g) => match resolve(g, rank, hidden) {
+                        Some(m) if m.prism == crate::gpu::GraphPrismOp::None && !m.affine => Some((m, rank)),
+                        _ => {
+                            graph_decline("MLA low-rank query resolve (dtype/shape outside graph contract)");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    },
+                    None => None,
+                };
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
-                    resolve(wq, mnh * lhd, hidden),
+                    resolve(wq, mnh * lhd, if rank > 0 { rank } else { hidden }),
                     resolve(kv_a, lora + rope, hidden),
                     resolve(kv_b, mnh * (nope + v_dim), *lora),
                     resolve(wo, hidden, mnh * v_dim),
@@ -29056,6 +29357,7 @@ pub fn forward_token_graph(
                     hd: lhd,
                     dv: *v_dim,
                     hg: None,
+                    qa,
                 }
             }
             crate::gpu::GraphAttn::ShortConv {
@@ -29297,6 +29599,7 @@ pub fn forward_token_graph(
                 };
                 if !cached
                     && !lws.is_empty()
+                    && !sys_layer
                     && c.resident.load(std::sync::atomic::Ordering::Relaxed) + need > c.vram_budget
                 {
                     prefix = true;
@@ -29318,15 +29621,48 @@ pub fn forward_token_graph(
                 // q4_tiled experts: the split layout and its row-blocked kernels
                 let q4ts = !*q82 && !*q4tp && !*gu_q2 && moe_q4ts::on(c, hidden, *mi);
                 let packed = if *q82 {
+                    if sys_layer {
+                        // the q8_2f banks have no system-memory arm: the stack ends here
+                        prefix = true;
+                        break;
+                    }
                     moe_expert_bufs_q82(c, model, experts, *mi, hidden)
                 } else if q4ts {
+                    if sys_layer {
+                        prefix = true;
+                        break;
+                    }
                     moe_q4ts::banks(c, model, experts, *mi, hidden)
                 } else {
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
+                    SYS_EXPERTS_NEXT.with(|x| x.set(sys_layer));
+                    let b = moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false);
+                    SYS_EXPERTS_NEXT.with(|x| x.set(false));
+                    b
                 };
                 let Some((gate_all, up_all, down_all)) = packed else {
+                    if sys_layer && !lws.is_empty() {
+                        // no system memory after all: the stack ends before this layer
+                        prefix = true;
+                        break;
+                    }
                     graph_decline("moe_expert_bufs (pack/budget/dtype)");
                     return token_graph_outcome(o1_started || state_started, false);
+                };
+                let cache = if cache_cap > 0 && !*q82 && !q4ts {
+                    let len = |i: usize| model.tensors.get(i).map_or(0, |e| e.nbytes as usize);
+                    experts.first().and_then(|&(g, _, d)| {
+                        moe_cache::get(
+                            c,
+                            (model.uid() as usize, g),
+                            cache_cap,
+                            experts.len(),
+                            *top_k + usize::from(*has_shared),
+                            len(g),
+                            len(d),
+                        )
+                    })
+                } else {
+                    None
                 };
                 LFfn::Moe {
                     router,
@@ -29357,6 +29693,7 @@ pub fn forward_token_graph(
                     shared_gated: *shared_gated,
                     detached_shared,
                     route_scale: *route_scale,
+                    cache,
                 }
                 }
             }
@@ -29655,9 +29992,10 @@ pub fn forward_token_graph(
         .map(|lw| {
             let mut v: Vec<&GMat> = Vec::new();
             match &lw.attn {
-                LAttn::Full { wq, wk, wv, wo, hg, .. } => {
+                LAttn::Full { wq, wk, wv, wo, hg, qa, .. } => {
                     v.extend([wq, wk, wv, wo]);
                     v.extend(hg.iter());
+                    v.extend(qa.iter().map(|(m, _)| m));
                 }
                 LAttn::Gdn { qkv, z, a, b, out, .. } => v.extend([qkv, z, a, b, out]),
                 LAttn::Conv { inp, out, .. } => v.extend([inp, out]),
@@ -31331,6 +31669,7 @@ pub fn forward_token_graph(
                         hd: lhd,
                         dv: ldv,
                         hg,
+                        qa,
                     },
                     la @ (crate::gpu::GraphAttn::Full { .. } | crate::gpu::GraphAttn::Mla { .. }),
                 ) => {
@@ -31403,10 +31742,25 @@ pub fn forward_token_graph(
                         let lat = kimi::scratch(c, "mla-lat", md.lora);
                         let kvbo = kimi::scratch(c, "mla-kvb", md.kvb_rows());
                         let qrows = nh * hd;
-                        mv_c(&mut enc, li, 1, wq, &n1, &qraw, qrows, hidden);
+                        let bkey = |site: u32| Some((kv_id, layer_base + li, site));
+                        match (qa, la) {
+                            (Some((qam, rank)), crate::gpu::GraphAttn::Mla { q_a_norm: Some(qn), .. }) => {
+                                // the low-rank query: q_a, its rows normed, q_b over them
+                                let qd = kimi::MlaDims { nh: 1, rope: 0, nope: 0, vd: 0, lora: *rank };
+                                let qa_b = kimi::scratch(c, "mla-qa", *rank);
+                                let qlat = kimi::scratch(c, "mla-qlat", *rank);
+                                let qn_b = stor(bytemuck::cast_slice::<f32, u8>(qn));
+                                mv_c(&mut enc, li, 6, qam, &n1, &qa_b, *rank, hidden);
+                                if !kimi::encode_mla_lat(c, &mut enc, bkey(7), &qd, eps, 1, &qa_b, &qn_b, &qlat) {
+                                    graph_decline("MLA kernels unavailable");
+                                    return token_graph_outcome(o1_started || state_started, false);
+                                }
+                                mv_c(&mut enc, li, 1, wq, &qlat, &qraw, qrows, *rank);
+                            }
+                            _ => mv_c(&mut enc, li, 1, wq, &n1, &qraw, qrows, hidden),
+                        }
                         mv_c(&mut enc, li, 2, wk, &n1, &kva, md.kva_rows(), hidden);
                         let kvn_b = stor(bytemuck::cast_slice(kvn));
-                        let bkey = |site: u32| Some((kv_id, layer_base + li, site));
                         if !kimi::encode_mla_lat(c, &mut enc, bkey(3), &md, eps, 1, &kva, &kvn_b, &lat) {
                             graph_decline("MLA kernels unavailable");
                             return token_graph_outcome(o1_started || state_started, false);
@@ -33856,6 +34210,7 @@ pub fn forward_token_graph(
                     detached_shared,
                     shared_gated,
                     route_scale,
+                    cache,
                 } => {
                     deferred_shared = detached_shared.as_ref();
                     // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
@@ -33867,6 +34222,15 @@ pub fn forward_token_graph(
                     // NVIDIA Vulkan) is what dominates a 40-layer decode.
                     let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                     let slots = *top_k + usize::from(*has_shared);
+                    // A system-memory bank with card slots: the select still
+                    // writes `msel`, the cache's fill turns it into slot
+                    // numbers, and the expert kernels read the slots.
+                    let (bank_g, bank_u, bank_d) = (gate_all, up_all, down_all);
+                    let cache = cache.as_ref().filter(|x| x.cap >= slots);
+                    let (gate_all, up_all, down_all, msel_x) = match cache {
+                        Some(x) => (&x.g, &x.u, &x.d, &x.out),
+                        None => (gate_all, up_all, down_all, msel),
+                    };
                     // sg_kind = 4 tells the select kernel to compute the shared
                     // gate itself; then the sgate matvec below is not encoded.
                     let sg_fold = sgate.kind == 4;
@@ -34013,6 +34377,7 @@ pub fn forward_token_graph(
                     // to `moe_select`), one dependent dispatch fewer a layer.
                     // `CMF_MOE_FOLD=0` keeps the separate select.
                     let sel_fold = r4.is_some()
+                        && cache.is_none()
                         && !*sigmoid
                         && bias.is_none()
                         && !*has_shared
@@ -34038,7 +34403,7 @@ pub fn forward_token_graph(
                                     (0, gate_all),
                                     (1, up_all),
                                     (2, &n1),
-                                    (3, msel),
+                                    (3, msel_x),
                                     (4, mact),
                                     (5, &gu_u),
                                     (6, gate_all),
@@ -34053,7 +34418,7 @@ pub fn forward_token_graph(
                                     (8, down_all),
                                     (9, down_all),
                                     (10, mact),
-                                    (11, msel),
+                                    (11, msel_x),
                                     (12, mwt),
                                     (13, &ob),
                                     (14, &dn_u),
@@ -34178,7 +34543,7 @@ pub fn forward_token_graph(
                                     (0, gate_all),
                                     (1, up_all),
                                     (2, &n1),
-                                    (3, msel),
+                                    (3, msel_x),
                                     (4, mact),
                                     (5, &gu_u),
                                     (6, gate_all),
@@ -34192,7 +34557,7 @@ pub fn forward_token_graph(
                                     (8, down_all),
                                     (9, down_all),
                                     (10, mact),
-                                    (11, msel),
+                                    (11, msel_x),
                                     (12, mwt),
                                     (13, &ob),
                                     (14, &dn_u),
@@ -34205,8 +34570,8 @@ pub fn forward_token_graph(
                         (
                             p_gu,
                             p_dn,
-                            bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]),
-                            bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]),
+                            bg(l_gu, &[gate_all, up_all, &n1, msel_x, mact, &gu_u]),
+                            bg(l_dn, &[down_all, mact, msel_x, mwt, &ob, &dn_u]),
                             *mi as u32,
                             hidden as u32,
                         )
@@ -34232,6 +34597,7 @@ pub fn forward_token_graph(
                     // slot into the synthetic `id = n_exp` slot.  Keep the
                     // fold for its exact original contract only.
                     let fold = c.foldsel
+                        && cache.is_none()
                         && *gu_q2
                         && sg_fold
                         && *has_shared
@@ -34354,6 +34720,9 @@ pub fn forward_token_graph(
                                 pass.dispatch_workgroups(1, 1, 1);
                             }
                             tsp!(pass, fine, 32); // select
+                            if let (Some(x), false) = (cache, skip_moe) {
+                                x.encode(c, &mut pass, msel, bank_g, bank_u, bank_d);
+                            }
                             if !skip_moe {
                                 pass.set_pipeline(p_gu);
                                 pass.set_bind_group(0, &bg_gu, &[]);
@@ -34392,6 +34761,9 @@ pub fn forward_token_graph(
                             go(&mut enc, &c.moe_select, &bg_sel, 1);
                             {
                                 let mut pass = begin_pass(&mut enc);
+                                if let Some(x) = cache {
+                                    x.encode(c, &mut pass, msel, bank_g, bank_u, bank_d);
+                                }
                                 pass.set_pipeline(p_gu);
                                 pass.set_bind_group(0, &bg_gu, &[]);
                                 pass.dispatch_workgroups(gu_wg, slots as u32, 1);
@@ -35523,6 +35895,19 @@ pub fn forward_batch_graph_at(
         bgraph_refused("cannot size layer payload");
         return batch_outcome(o1_started || state_started, false);
     };
+    // The token graph's placement (`expert_plan`): banks it sends to system
+    // memory are not on the card, their slots are. Counting every bank here
+    // refused the batch for any model past the card and left the prompt to
+    // the per-position graph (Ornith-122B: 512 tokens in 36-68 s).
+    let bplan = expert_plan(c, model, layers, None, graph_live_budget);
+    if let Some(p) = bplan.as_ref() {
+        for (i, l) in layers.iter().enumerate() {
+            if p.sys.get(i) == Some(&true) {
+                live_bytes = live_bytes.saturating_sub(layer_bank(model, l).0) + p.cache_bytes[i];
+            }
+        }
+        live_bytes += p.stage_bytes;
+    }
     if let Some(sp) = spec.as_ref() {
         live_bytes = live_bytes.saturating_add(
             model
@@ -35547,11 +35932,14 @@ pub fn forward_batch_graph_at(
         }
         let mut acc = 0u64;
         run_n = 0;
-        for l in layers {
-            let Some(b) = graph_layer_payload_bytes(model, l) else {
+        for (i, l) in layers.iter().enumerate() {
+            let Some(mut b) = graph_layer_payload_bytes(model, l) else {
                 bgraph_refused("cannot size layer payload");
                 return batch_outcome(o1_started || state_started, false);
             };
+            if let Some(p) = bplan.as_ref().filter(|p| p.sys.get(i) == Some(&true)) {
+                b = b.saturating_sub(layer_bank(model, l).0) + p.cache_bytes[i];
+            }
             if acc.saturating_add(b) > graph_live_budget {
                 break;
             }
@@ -35602,6 +35990,8 @@ pub fn forward_batch_graph_at(
             dv: usize,
             /// Spark-X2.6 head-wise output gate `[nh, hidden]`.
             hg: Option<GMat>,
+            /// MLA's low-rank query: q_a and its rank (`wq` is q_b).
+            qa: Option<(GMat, usize)>,
         },
         Gdn {
             qkv: GMat,
@@ -35631,6 +36021,13 @@ pub fn forward_batch_graph_at(
             d: kimi::KdaDims,
             rank_f: usize,
             rank_g: usize,
+        },
+        /// LFM2/LFM3's gated short convolution: in [3h × h] (B, C, x), the
+        /// ring walked over the chunk's rows (`sconv_batch`), out [h × h].
+        Conv {
+            inp: GMat,
+            out: GMat,
+            kernel: usize,
         },
     }
     /// Батчевый FFN слоя. MoE маршрутизируется ПО ТОКЕНАМ, поэтому его
@@ -35688,6 +36085,9 @@ pub fn forward_batch_graph_at(
             has_shared: bool,
             shared_gated: bool,
             route_scale: f32,
+            /// The bank lives in system memory (`moe_cache`): a wide batch
+            /// copies it to the card's staging bank first.
+            sys: bool,
         },
     }
     struct LW {
@@ -35813,7 +36213,7 @@ pub fn forward_batch_graph_at(
     let t_resolve = std::time::Instant::now();
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
-    for l in layers {
+    for (bli, l) in layers.iter().enumerate() {
         let attn = match &l.attn {
             crate::gpu::GraphAttn::Full {
                 wq,
@@ -35874,6 +36274,7 @@ pub fn forward_batch_graph_at(
                     hd: lhd,
                     dv: ldv,
                     hg,
+                    qa: None,
                 }
             }
             crate::gpu::GraphAttn::Gdn {
@@ -35925,10 +36326,22 @@ pub fn forward_batch_graph_at(
                     cdim,
                 }
             }
-            crate::gpu::GraphAttn::ShortConv { .. } => {
-                // The batch (prefill) graph has no conv-ring kernel that
-                // walks positions in order yet; prefill stays per-op.
-                return batch_outcome(o1_started || state_started, false);
+            crate::gpu::GraphAttn::ShortConv { inp, out, kernel, .. } => {
+                // the ring walks the chunk's rows in order (`sconv_batch`);
+                // a speculative round would want it per row: those stay per-op
+                if spec.is_some() || preview.is_some() {
+                    bgraph_refused("short convolution in a speculative or preview batch");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                let (Some(inp), Some(out)) = (resolve(inp, 3 * hidden, hidden), resolve(out, hidden, hidden)) else {
+                    bgraph_refused("short-conv weight resolve (dtype/shape outside graph contract)");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                if ![&inp, &out].iter().all(|m| gemmable(m)) || *kernel < 1 || *kernel > 16 {
+                    bgraph_refused("short-conv weights not gemmable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                LAttn::Conv { inp, out, kernel: *kernel }
             }
             crate::gpu::GraphAttn::Kda {
                 q: wq,
@@ -35983,6 +36396,8 @@ pub fn forward_batch_graph_at(
                 LAttn::Kda { q, k, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g }
             }
             crate::gpu::GraphAttn::Mla {
+                q_a,
+                q_a_norm,
                 q: wq,
                 kv_a,
                 kv_b,
@@ -35996,8 +36411,20 @@ pub fn forward_batch_graph_at(
             } => {
                 // the Full arm with this layer's geometry; wk / wv hold kv_a / kv_b
                 let lhd = rope + nope;
+                // a low-rank query: q_a here, q_b in wq over its normed rows
+                let rank = q_a.as_ref().and(*q_a_norm).map_or(0, |n| n.len());
+                let qa = match q_a {
+                    Some(g) => match resolve(g, rank, hidden) {
+                        Some(m) if gemmable(&m) && m.prism == crate::gpu::GraphPrismOp::None && !m.affine => Some((m, rank)),
+                        _ => {
+                            bgraph_refused("MLA low-rank query resolve");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                    },
+                    None => None,
+                };
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
-                    resolve(wq, mnh * lhd, hidden),
+                    resolve(wq, mnh * lhd, if rank > 0 { rank } else { hidden }),
                     resolve(kv_a, lora + rope, hidden),
                     resolve(kv_b, mnh * (nope + v_dim), *lora),
                     resolve(wo, hidden, mnh * v_dim),
@@ -36018,6 +36445,7 @@ pub fn forward_batch_graph_at(
                     hd: lhd,
                     dv: *v_dim,
                     hg: None,
+                    qa,
                 }
             }
         };
@@ -36143,7 +36571,13 @@ pub fn forward_batch_graph_at(
                 } else if q4ts {
                     moe_q4ts::banks(c, model, experts, *mi, hidden)
                 } else {
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
+                    // the token graph's placement: a bank it sends to system
+                    // memory is made there when the prompt comes first
+                    let sys = bplan.as_ref().is_some_and(|p| p.sys.get(bli) == Some(&true));
+                    SYS_EXPERTS_NEXT.with(|x| x.set(sys));
+                    let b = moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false);
+                    SYS_EXPERTS_NEXT.with(|x| x.set(false));
+                    b
                 };
                 let Some((gate_all, up_all, down_all)) = packed else {
                     bgraph_refused("site:5990");
@@ -36195,6 +36629,7 @@ pub fn forward_batch_graph_at(
                     has_shared: *has_shared,
                     shared_gated: *shared_gated,
                     route_scale: *route_scale,
+                    sys: experts.first().is_some_and(|e| moe_cache::is_sys_bank((model.uid() as usize, e.0))),
                 }
             }
         };
@@ -36697,6 +37132,8 @@ pub fn forward_batch_graph_at(
     let z_b = rwc(kz * gnv * gdv);
     let gdo_b = rwc(k * gnv * gdv);
     let ob = rwc(kz * hidden);
+    // LFM's short convolutions: the chunk's [B | C | x] rows and their output
+    let sconv_bufs = lws.iter().any(|lw| matches!(lw.attn, LAttn::Conv { .. })).then(|| (rwc(kz * 3 * hidden), rwc(kz * hidden)));
     // One more output for the layers with a hot triple.
     let hot_ob = lws
         .iter()
@@ -36885,12 +37322,35 @@ pub fn forward_batch_graph_at(
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
                 }
-                crate::gpu::GraphAttn::ShortConv { .. } => {
-                    // Unreachable: the batch resolve declined this mixer
-                    // above. Kept explicit so a future prefill kernel has
-                    // to think about the ring, not inherit a None.
+                crate::gpu::GraphAttn::ShortConv { kernel, cpu_state, .. } => {
+                    // The conv ring rides the GDN state map, as the token
+                    // graph keeps it (the pair's second buffer a 4-byte
+                    // placeholder), seeded from the host's ring in its
+                    // layout ([channel][kernel-1], slot 0 newest).
+                    let key = (kv_id, layer_base + li);
+                    let ring_sz = (kernel.saturating_sub(1) * hidden * 4) as u64;
+                    let e = gsm.entry(key).or_insert_with(|| {
+                        let mk = |sz: u64| {
+                            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("sconv-ring"),
+                                size: sz.max(4),
+                                usage: wgpu::BufferUsages::STORAGE
+                                    | wgpu::BufferUsages::COPY_DST
+                                    | wgpu::BufferUsages::COPY_SRC,
+                                mapped_at_creation: false,
+                            });
+                            c.queue.write_buffer(&bf, 0, &vec![0u8; sz.max(4) as usize]);
+                            bf
+                        };
+                        let ring = mk(ring_sz);
+                        if cpu_state.len() * 4 == ring_sz as usize && !cpu_state.is_empty() {
+                            c.queue.write_buffer(&ring, 0, bytemuck::cast_slice(*cpu_state));
+                        }
+                        (ring, mk(4))
+                    });
+                    gcm.entry(key).or_insert(GdnCursor { dims: (hidden, 0, 0, 0, *kernel, hidden), next_pos: pos0 });
+                    gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
-                    gdnbufs.push(None);
                 }
                 crate::gpu::GraphAttn::Mla {
                     cpu_k,
@@ -37619,6 +38079,7 @@ pub fn forward_batch_graph_at(
                     hd: lhd,
                     dv: ldv,
                     hg,
+                    qa,
                 },
                 la @ (crate::gpu::GraphAttn::Full { .. } | crate::gpu::GraphAttn::Mla { .. }),
             ) => {
@@ -37657,7 +38118,24 @@ pub fn forward_batch_graph_at(
                 };
                 // "qkv" = the input norm and the q, k and v projections.
                 bts!(enc, 4);
-                ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden);
+                match (qa, la) {
+                    (Some((qam, rank)), crate::gpu::GraphAttn::Mla { q_a_norm: Some(qn), .. }) => {
+                        // the low-rank query: q_a of every row, the rows'
+                        // norm, q_b over them
+                        let kz = if k >= 128 { k.div_ceil(128) * 128 } else { k };
+                        let qd = kimi::MlaDims { nh: 1, rope: 0, nope: 0, vd: 0, lora: *rank };
+                        let qa_b = kimi::scratch(c, "mla-qa", kz * *rank);
+                        let qlat = kimi::scratch(c, "mla-qlat", kz * *rank);
+                        let qn_b = stor(bytemuck::cast_slice::<f32, u8>(qn));
+                        ematb(&mut enc, qam, &n1_p, &qa_b, *rank, hidden);
+                        if !kimi::encode_mla_lat(c, &mut enc, None, &qd, eps, k, &qa_b, &qn_b, &qlat) {
+                            bgraph_refused("MLA kernels unavailable");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                        ematb(&mut enc, wq, &qlat, &qraw_b, qrows, *rank);
+                    }
+                    _ => ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden),
+                }
                 if let Some((md, kvn)) = mla {
                     // MLA: kv_a (the latent, then the rope key) of every row,
                     // the latents' norm, kv_b over them, the heads' K and V
@@ -39282,6 +39760,37 @@ pub fn forward_batch_graph_at(
                 ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * ldv);
                 bts!(enc, 1);
             }
+            (LAttn::Conv { inp, out, kernel }, crate::gpu::GraphAttn::ShortConv { taps, .. }) => {
+                // LFM's gated short convolution: in over every row, the ring
+                // walked over the rows in order, out over every row
+                state_started = true;
+                let (ring, _) = gdnbufs[li].as_ref().unwrap();
+                let Some((bcx, ys)) = sconv_bufs.as_ref() else {
+                    bgraph_refused("short-conv rows missing");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                let Some(n1_p) = prism_input_b(&mut enc, &[inp], &n1, hidden) else {
+                    bgraph_refused("Prism transform unavailable for the batched short convolution");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                bts!(enc, 4);
+                ematb(&mut enc, inp, &n1_p, bcx, 3 * hidden, hidden);
+                let taps_b = stor(bytemuck::cast_slice(*taps));
+                let su = uniform_u32x4(c, [hidden as u32, *kernel as u32, k as u32, 0]);
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.sconv_batch);
+                    pass.set_bind_group(0, &bg(&c.layout_sconv_b, &[bcx, &taps_b, ring, ys, &su]), &[]);
+                    pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
+                }
+                let Some(y_p) = prism_input_b(&mut enc, &[out], ys, hidden) else {
+                    bgraph_refused("Prism transform unavailable for the batched short-conv output");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                bts!(enc, 5);
+                ematb(&mut enc, out, &y_p, &ob, hidden, hidden);
+                bts!(enc, 1);
+            }
             (
                 LAttn::Kda { q, k: kw, v, out, fa, fb, b, ga, gb, d, rank_f, rank_g },
                 crate::gpu::GraphAttn::Kda {
@@ -40075,8 +40584,27 @@ pub fn forward_batch_graph_at(
                 shared_gated,
                 route_scale,
                 detached: _,
+                sys,
             } => {
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                // A batch whose picks outnumber the bank's experts reads the
+                // system-memory bank once: copied whole to the card's staging
+                // bank, the kernels then run on that.
+                let stage = if *sys && k * (*top_k + usize::from(*has_shared)) >= *n_exp {
+                    moe_cache::staging(c, [gate_all.size(), up_all.size(), down_all.size()])
+                } else {
+                    None
+                };
+                if let Some(st) = stage.as_ref() {
+                    flush_pass(&enc);
+                    enc.copy_buffer_to_buffer(gate_all, 0, &st[0], 0, gate_all.size());
+                    enc.copy_buffer_to_buffer(up_all, 0, &st[1], 0, up_all.size());
+                    enc.copy_buffer_to_buffer(down_all, 0, &st[2], 0, down_all.size());
+                }
+                let (gate_all, up_all, down_all) = match stage.as_ref() {
+                    Some(st) => (&st[0], &st[1], &st[2]),
+                    None => (gate_all, up_all, down_all),
+                };
                 let mut continue_ffn = true;
                 let bias_buf = bias.clone().unwrap_or_else(|| {
                     c.device

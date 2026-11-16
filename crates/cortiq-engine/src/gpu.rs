@@ -5015,6 +5015,62 @@ pub fn music3_ffn(
     }
 }
 
+/// A routed FFN of one row on the card for a stack the host runs and routes
+/// (GLM-5.3): the experts through card slots, the shared one resident (CUDA;
+/// `false` elsewhere or refused, the caller runs the host's).
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn moe_row(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    shared: Option<((usize, usize, usize), usize, f32)>,
+    inter: usize,
+    limit: f32,
+    x: &[f32],
+    picks: &[(usize, f32)],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::moe_row(model, experts, shared, inter, limit, x, picks, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// GLM-5.3's native device state (four mHC streams, KDA rings, DSA caches):
+/// this build runs the `glm5_next` stack on the host, so the device hooks
+/// decline and the caller keeps the exact CPU path.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_sequence_prepare(
+    model_uid: u64,
+    sequence_id: u64,
+    layers: usize,
+    hidden: usize,
+    mhc_streams: usize,
+    nh: usize,
+    dk: usize,
+    dv: usize,
+    kk: usize,
+    dsa_rank: usize,
+    dsa_index: usize,
+    dsa_topk: usize,
+    dsa_kpool: usize,
+) -> bool {
+    let _ = (model_uid, sequence_id, layers, hidden, mhc_streams, nh, dk, dv, kk, dsa_rank, dsa_index, dsa_topk, dsa_kpool);
+    false
+}
+
+/// Grow GLM's device DSA caches (`glm_sequence_prepare`): declines here.
+pub fn glm_sequence_reserve(model_uid: u64, sequence_id: u64, positions: usize) -> bool {
+    let _ = (model_uid, sequence_id, positions);
+    false
+}
+
+/// Drop GLM's device state of a sequence (none in this build).
+pub fn glm_sequence_abort(model_uid: u64, sequence_id: u64) {
+    let _ = (model_uid, sequence_id);
+}
+
 /// A 1D convolution as a GEMM whose column matrix is expanded on the
 /// device instead of being built, transposed and uploaded by the host.
 /// `yt` comes back `[out_n x oc]`. `false` = refused, caller runs host.

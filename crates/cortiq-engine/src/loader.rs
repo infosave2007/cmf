@@ -547,7 +547,8 @@ pub(crate) fn build_ffn_at(
         // FP32 `sum + 1e-20`; the older LFM2/DeepSeek noaux contract keeps
         // its established `+1e-6` floor.
         sigmoid_denom_eps: match arch.arch_name.as_str() {
-            "flint" | "minimax_m3_vl" => 1e-20,
+            // GLM-5.3 routes with the same `sum + 1e-20` floor (`glm5_next`)
+            "flint" | "minimax_m3_vl" | "glm5_next" => 1e-20,
             _ => 1e-6,
         },
         expert_bias,
@@ -1874,7 +1875,8 @@ impl Pipeline {
             || arch.arch_name == "deepseek_v4"
             || arch.arch_name == "deepseek_v41"
             || arch.dory.is_some()
-            || arch.qwen4_exp.is_some();
+            || arch.qwen4_exp.is_some()
+            || arch.glm5_next.is_some();
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
@@ -2370,6 +2372,10 @@ impl Pipeline {
         if arch.qwen4_exp.is_some() {
             let (globals, layers, cfg, state) = crate::qwen4_exp::load(model, &arch)?;
             pipeline.qwen4_exp = Some(Box::new((globals, layers, cfg, state)));
+        }
+        if arch.glm5_next.is_some() {
+            let (globals, layers, cfg, state) = crate::glm5_next::load(model, &arch)?;
+            pipeline.glm5_next = Some(Box::new((globals, layers, cfg, state)));
         }
         // Gemma-4 E-series (E4B): the E block rides in `g3n` — altup/
         // laurel are zeroed for gemma4 — but the layer body is the
