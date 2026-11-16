@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-16
+
 ### Fixed
 - Vulkan, latent-expert `qwen4_exp` files (Edge0-145B) with part of the expert banks in system memory: a prompt
   chunk went out as one submission for every layer, long enough for the driver to give up on the device
