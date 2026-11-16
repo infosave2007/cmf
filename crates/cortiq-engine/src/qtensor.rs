@@ -968,6 +968,15 @@ impl QTensor {
         }
     }
 
+    /// Identity of a mapped matrix for the NPU lane table (its bytes' address).
+    #[cfg(target_os = "android")]
+    pub(crate) fn npu_key(&self) -> Option<usize> {
+        match self {
+            Self::Mapped { .. } => Some(self.quant_bytes().as_ptr() as usize),
+            _ => None,
+        }
+    }
+
     fn quant_bytes(&self) -> &[u8] {
         match self {
             Self::Mapped { model, idx, .. } => model.entry_bytes(&model.tensors[*idx]),
@@ -3802,6 +3811,29 @@ impl QTensor {
             return float_activations_scope(|| {
                 Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
             });
+        }
+        // NPU lane (Android, `CMF_NPU=1`): `up` on the Hexagon NPU while this
+        // thread's pool computes `gate`; see `npu.rs`.
+        #[cfg(target_os = "android")]
+        if !gate.has_prism_contract() && !up.has_prism_contract() {
+            if let Some(lane) = crate::npu::lane(up) {
+                let inter = gate.rows();
+                let mut g = vec![0f32; inter];
+                let mut u = vec![0f32; inter];
+                let t0 = std::time::Instant::now();
+                let pending = crate::npu::start(&lane, x);
+                let t1 = std::time::Instant::now();
+                gate.matvec(x, &mut g, pool);
+                let t2 = std::time::Instant::now();
+                if !pending.is_some_and(|p| p.finish(&mut u)) {
+                    up.matvec(x, &mut u, pool);
+                }
+                crate::npu::note_times(t1 - t0, t2 - t1, t2.elapsed());
+                for r in 0..inter {
+                    out[r] = silu_mul_limited(g[r], u[r], limit);
+                }
+                return true;
+            }
         }
         if gate.has_prism_contract()
             || up.has_prism_contract()
