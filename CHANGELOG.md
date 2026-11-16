@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-11-16
+
 ### Changed
 - CUDA hybrid: the RAM tier and the host arenas take VMM host memory (`cuMemCreate` at a host location, copies
   by address) when a container's limit counts page-locked memory and not that (a 256 MB probe of each); the tier
@@ -31,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   perplexity the CPU's (2.715; with the selection cut to 64 positions 2.730), "2+2" answered as the CPU does.
 
 ### Fixed
+- Vulkan on a phone driver: every process that answered once compiled the batch graph's kernels again. They are
+  built at first use, after `init` wrote the pipeline cache, and the only later save was at the start of a second
+  generation, which `cortiq run -p`, a bench or an app closed after one reply never reaches. A generation's end
+  now saves the cache when the driver's blob differs from the file (a CPU generation does not bring the device
+  up for it). On a Snapdragon 778G (Adreno 642L), lfm2.5-230m q4tp with the whole-token graph forced: the first
+  token of a one-shot run in 6.9 s instead of 41.4 s once the cache holds them.
+- Vulkan: the token graph compiled GLM's DSA kernels for every model, with no pipeline cache — it asked for the
+  kernels before asking whether any layer has DSA. The layers are asked first and the DSA pipelines take the
+  cache: on the same phone decode over 40 tokens at 10.4 tokens/s from the first run instead of 2.4.
 - GLM-5.3 on CUDA: a prompt past 1536 tokens on a card the expert slots filled fell to the host (its DSA
   layers' K/V mirrors grew past the reserve; a 3072-token prompt on the whole A40 ran past an hour). A DSA
   layer's mirror stops at top-k rows: it is now sized to that at once and the plan's reserve holds it beside the
