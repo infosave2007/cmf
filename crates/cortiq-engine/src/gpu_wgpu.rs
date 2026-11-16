@@ -71526,6 +71526,12 @@ fn f32_strict() -> bool {
     BAKE_F32_STRICT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Is the bake in its strict-f32 phase (`bake_precision_strict`)? The CUDA
+/// chains then take plain f32 cuBLAS products instead of TF32.
+pub(crate) fn bake_f32_strict() -> bool {
+    f32_strict()
+}
+
 /// A bake weight on the card — but RESIDENT only once it has proven it
 /// recurs. Phase B hands this function a fresh activation matrix per dw
 /// step; a cache that adopts everything it sees grows by 250 MB a step

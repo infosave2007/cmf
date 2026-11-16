@@ -1934,12 +1934,138 @@ fn blr_mat(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, idx: usize, rows: usi
     Ok(m)
 }
 
+/// [`hmat`] where the kernels want a repacked codec (the tensor-core jobs of
+/// a projection): an f32 working matrix — a soft skill blend's Σ wᵢ·Tᵢ,
+/// materialized on the host — goes to the card once as q8_2f int8 tiles
+/// (kind 5), the closest of this arm's codecs to the host's f32. Every other
+/// weight is `hmat`'s.
+fn hmat_q(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize) -> Res<Arc<DevMat>> {
+    if gw.kind != 4 {
+        return hmat(c, st, model, gw, rows, cols);
+    }
+    f32_q8(c, st, &[gw.data], rows, cols)
+}
+
+/// One f32 matrix, or a gate/up pair of them (`rows` each), as q8_2f tiles
+/// on the card: kind 5, a pair kind 15 laid out as `hmat_pair` lays one.
+/// Cached by the slices' addresses and checked by a fingerprint of their
+/// values (a freed working tensor's address can come back).
+fn f32_q8(c: &Ctx, st: &mut State, mats: &[&[f32]], rows: usize, cols: usize) -> Res<Arc<DevMat>> {
+    use cortiq_core::TensorDtype;
+    if mats.iter().any(|m| m.len() != rows * cols) || cols % 32 != 0 {
+        return Err(format!("an f32 weight of {} values, want {rows}x{cols} (32-column multiple)", mats[0].len()));
+    }
+    let key = (mats[0].as_ptr() as usize, mats.get(1).map_or(0, |m| m.as_ptr() as usize), rows * cols);
+    let fp = mats.iter().fold(0u64, |a, m| a.rotate_left(7) ^ crate::gpu::fp_f32(m));
+    if let Some((f, m)) = st.hyb.f32q.get(&key) {
+        if *f == fp {
+            return Ok(m.clone());
+        }
+    }
+    let held = c.resident.load(Ordering::Relaxed);
+    let need = (mats.len() * rows * (cols + 4) + cols * 4 * mats.len()) as u64;
+    if !arena_active() && held + need > super::vram_budget() {
+        return Err("weights do not fit the card".into());
+    }
+    let t0 = std::time::Instant::now();
+    let fx = st.hyb.funcs.values().next().cloned().ok_or("repack before the hybrid kernels")?;
+    let bytes: Vec<Vec<u8>> = mats
+        .iter()
+        .map(|m| match st.hyb.f32q_bytes.remove(&(m.as_ptr() as usize, m.len())) {
+            Some(b) => b,
+            None => cortiq_core::quant::encode_q8_2f(m, rows, cols),
+        })
+        .collect();
+    let parts = bytes.iter().map(|b| q8_parts(TensorDtype::Q8_2f, b, rows, cols)).collect::<Res<Vec<_>>>()?;
+    let all = rows * mats.len();
+    let (w, rs, cf) = repack8_on_card(c, &fx, &parts, all, cols)?;
+    let kind = if mats.len() == 2 && cf.is_some() { 15 } else { 5 };
+    let m = Arc::new(DevMat { kind, rows: all, cols, held: w.bytes as u64, w: Arc::new(w), aux0: cf, aux1: Some(rs) });
+    REPACK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    c.resident.fetch_add(card_held(st, m.w.ptr, m.held), Ordering::Relaxed);
+    st.hyb.f32q.insert(key, (fp, m.clone()));
+    Ok(m)
+}
+
+/// The f32 working matrices of `layers` (a soft skill blend's projections)
+/// that `f32_q8` will want, encoded to q8_2f on the host's cores at once
+/// instead of one after another inside the build: 0.8B with every FFN and
+/// attention projection blended spent about 3 s here on one core.
+fn f32_q8_prepare(st: &mut State, layers: &[GraphLayer], hidden: usize) {
+    fn add<'a>(want: &mut Vec<(&'a [f32], usize, usize)>, w: &GraphW<'a>, rows: usize, cols: usize) {
+        if w.kind == 4 && rows > 0 && cols % 32 == 0 && w.data.len() == rows * cols && rows * cols >= 1 << 16 {
+            want.push((w.data, rows, cols));
+        }
+    }
+    // a payload lives one build: an address of a freed matrix can come back
+    st.hyb.f32q_bytes.clear();
+    let h = hidden.max(1);
+    let mut want: Vec<(&[f32], usize, usize)> = Vec::new();
+    for l in layers {
+        if let GraphFfn::Dense { gate, up, down, .. } = &l.ffn {
+            if gate.kind == 4 && gate.data.len() % h == 0 {
+                let inter = gate.data.len() / h;
+                add(&mut want, gate, inter, hidden);
+                add(&mut want, up, inter, hidden);
+                add(&mut want, down, hidden, inter);
+            }
+        }
+        match &l.attn {
+            GraphAttn::Full { wq, wk, wv, wo, .. } => {
+                for w in [wq, wk, wv] {
+                    add(&mut want, w, w.data.len() / h, hidden);
+                }
+                add(&mut want, wo, hidden, wo.data.len() / h);
+            }
+            GraphAttn::Gdn { qkv, z, out, .. } => {
+                add(&mut want, qkv, qkv.data.len() / h, hidden);
+                add(&mut want, z, z.data.len() / h, hidden);
+                add(&mut want, out, hidden, out.data.len() / h);
+            }
+            _ => {}
+        }
+    }
+    // already on the card (the prompt's plan and the tokens' share them)
+    want.retain(|(d, rows, cols)| {
+        let a = d.as_ptr() as usize;
+        !st.hyb.f32q.iter().any(|((g, u, n), _)| (*g == a || *u == a) && *n == rows * cols)
+    });
+    if want.is_empty() {
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..want.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..threads.min(want.len()) {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(d, rows, cols)) = want.get(i) else { break };
+                    *out[i].lock().unwrap() = Some(cortiq_core::quant::encode_q8_2f(d, rows, cols));
+                }
+            });
+        }
+    });
+    for ((d, ..), b) in want.iter().zip(out) {
+        if let Some(b) = b.into_inner().unwrap() {
+            st.hyb.f32q_bytes.insert((d.as_ptr() as usize, d.len()), b);
+        }
+    }
+}
+
 /// A dense FFN's gate and up as one repacked matrix of 2 inter rows, its
 /// 16-row tiles 8 gate rows then the same 8 up rows: an mma tile holds a
 /// row's gate and up in one lane, and the kernel's epilogue makes
 /// silu(gate) * up there.
 fn hmat_pair(c: &Ctx, st: &mut State, model: &Arc<CmfModel>, gw: &GraphW, uw: &GraphW, inter: usize, cols: usize) -> Res<Arc<DevMat>> {
     use cortiq_core::TensorDtype;
+    // a soft skill blend's f32 working pair (`f32_q8`)
+    match (gw.kind == 4, uw.kind == 4) {
+        (true, true) => return f32_q8(c, st, &[gw.data, uw.data], inter, cols),
+        (false, false) => {}
+        _ => return Err("a gate/up pair of an f32 working matrix and a file weight".into()),
+    }
     let dt = |w: &GraphW| model.tensors.get(w.idx).map(|e| e.dtype);
     let (dg, du) = (dt(gw), dt(uw));
     if dg == Some(TensorDtype::BinaryLowRank) && du == Some(TensorDtype::BinaryLowRank) {
@@ -3669,6 +3795,13 @@ pub(super) struct HState {
     mats: HashMap<(u64, usize), Arc<DevMat>>,
     /// Gate/up pairs (`hmat_pair`) by (model, gate, up).
     pairs: HashMap<(u64, usize, usize), Arc<DevMat>>,
+    /// f32 working matrices (a soft skill blend's) as int8 tiles (`hmat_q`),
+    /// by (gate or matrix address, up address or 0, values): the
+    /// fingerprint of their values beside them.
+    f32q: HashMap<(usize, usize, usize), (u64, Arc<DevMat>)>,
+    /// q8_2f payloads of f32 working matrices encoded ahead of a plan build
+    /// (`f32_q8_prepare`), by (address, values), taken by `f32_q8`.
+    f32q_bytes: HashMap<(usize, usize), Vec<u8>>,
     /// The far fields of sealed layers (turbo files), by sequence and layer.
     o1: HashMap<(u64, usize), HO1>,
     /// K/V mirrors this arm keeps in f16 (by sequence and layer): a mirror's
@@ -3744,6 +3877,15 @@ pub(super) fn wants(layers: &[GraphLayer], nh: usize, nkv: usize, hd: usize) -> 
         GraphAttn::Full { q_norm, k_norm, output_gate, .. } => *output_gate || q_norm.is_some() || k_norm.is_some(),
         _ => false,
     })
+}
+
+/// A dense FFN gate's rows (the layer's width): the file's shape, or an f32
+/// working matrix's (a soft skill blend's, `f32_q8`) over the model width.
+fn ffn_rows(model: &CmfModel, gw: &GraphW, hidden: usize) -> Option<usize> {
+    if gw.kind == 4 {
+        return (hidden > 0 && !gw.data.is_empty() && gw.data.len() % hidden == 0).then(|| gw.data.len() / hidden);
+    }
+    rows_of(model, gw)
 }
 
 fn rows_of(model: &CmfModel, gw: &GraphW) -> Option<usize> {
@@ -3903,6 +4045,7 @@ fn build(
         return Err("empty stack or head geometry".into());
     }
     let prism = prism_plan(model, layers, lm)?;
+    f32_q8_prepare(st, layers, hidden);
     if hidden % 32 != 0 {
         return Err("hidden width not a multiple of 32".into());
     }
@@ -4086,7 +4229,7 @@ fn build(
                 if !(matches!(act, GraphAct::Silu | GraphAct::GeluTanh | GraphAct::GeluErf) || oai) || !(*limit == 0.0 || (*limit > 0.0 && *act == GraphAct::Silu)) || hot.is_some() {
                     return Err(format!("layer {li}: an FFN other than plain SwiGLU / GeGLU"));
                 }
-                intermax = intermax.max(rows_of(model, gate).ok_or("f32 FFN")?);
+                intermax = intermax.max(ffn_rows(model, gate, hidden).ok_or("an FFN without its width")?);
             }
             GraphFfn::Moe { act, q4tp, gu_q2, q82, n_exp, top_k, inter, experts, has_shared, detached_shared, router, .. } => {
                 // q2tp gate/up beside q4tp down (`gu_q2`) load by their file
@@ -4479,8 +4622,8 @@ fn build(
         let gw6 = |idx: usize| GraphW { idx, kind: 6, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
         let (gum, dm, inter, moe) = match &l.ffn {
             GraphFfn::Dense { gate: gw, up: uw, down: dw, .. } => {
-                let inter = rows_of(model, gw).ok_or("f32 FFN")?;
-                (hmat_pair(c, st, model, gw, uw, inter, hidden)?, hmat(c, st, model, dw, hidden, inter)?, inter, None)
+                let inter = ffn_rows(model, gw, hidden).ok_or("an FFN without its width")?;
+                (hmat_pair(c, st, model, gw, uw, inter, hidden)?, hmat_q(c, st, model, dw, hidden, inter)?, inter, None)
             }
             GraphFfn::Moe {
                 router, shared_gate, experts, n_exp, top_k, inter, norm_topk, sigmoid, sigmoid_denom_eps, bias, has_shared,
@@ -4650,11 +4793,11 @@ fn build(
                 if conv1d.len() != cdim * kk || a_log.len() != nv || dt_bias.len() != nv || norm.len() != dv {
                     return Err(format!("layer {li}: GDN constants of unexpected lengths"));
                 }
-                let qm = hmat(c, st, model, qw, cdim, hidden)?;
-                let zm = hmat(c, st, model, zw, nv * dv, hidden)?;
+                let qm = hmat_q(c, st, model, qw, cdim, hidden)?;
+                let zm = hmat_q(c, st, model, zw, nv * dv, hidden)?;
                 let am = hmat(c, st, model, aw, nv, hidden)?;
                 let bm = hmat(c, st, model, bw, nv, hidden)?;
-                let om = hmat(c, st, model, ow, hidden, nv * dv)?;
+                let om = hmat_q(c, st, model, ow, hidden, nv * dv)?;
                 for d in [*conv1d, *a_log, *dt_bias, *norm] {
                     note(d);
                 }
@@ -4760,10 +4903,10 @@ fn build(
                     }
                     None => None,
                 };
-                let qm = hmat(c, st, model, wq, qr, hidden)?;
-                let km = hmat(c, st, model, wk, nkv * hd, hidden)?;
-                let vm = hmat(c, st, model, wv, nkv * vd, hidden)?;
-                let om = hmat(c, st, model, wo, hidden, nh * vd)?;
+                let qm = hmat_q(c, st, model, wq, qr, hidden)?;
+                let km = hmat_q(c, st, model, wk, nkv * hd, hidden)?;
+                let vm = hmat_q(c, st, model, wv, nkv * vd, hidden)?;
+                let om = hmat_q(c, st, model, wo, hidden, nh * vd)?;
                 if vd < hd && bias.is_some() {
                     return Err(format!("layer {li}: projection biases beside a narrow V"));
                 }

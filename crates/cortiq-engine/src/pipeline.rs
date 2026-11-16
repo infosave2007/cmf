@@ -476,6 +476,10 @@ pub struct Pipeline {
     /// EMA of φ at `dyn_phi_layer` over the decode window (on-policy).
     dyn_phi_ema: Vec<f32>,
     dyn_phi_seen: usize,
+    /// φ rows a device token graph kept at `dyn_phi_layer` (its layer taps):
+    /// the graph runs the router's layer on the card, so the host loop's φ
+    /// hook never sees it; `forward_layers_upto` folds these into the EMA.
+    dyn_phi_tap: std::sync::Mutex<Option<Vec<f32>>>,
     /// Hysteresis router driving per-token skill switches during decode
     /// (None = static/no dynamic routing). Taken out during generation.
     pub dyn_router: Option<crate::swarm::DynRouter>,
@@ -4931,6 +4935,7 @@ impl Pipeline {
             dyn_phi_layer: None,
             dyn_phi_ema: Vec::new(),
             dyn_phi_seen: 0,
+            dyn_phi_tap: std::sync::Mutex::new(None),
             dyn_router: None,
             o1_cfg: None,
             o1_turbo: None,
@@ -6957,10 +6962,14 @@ impl Pipeline {
         // Native Metal: the b-row verify graph (`try_batch_graph_metal`)
         // stands where the wgpu batch graph stands on discrete cards
         // (`metal_graph`, above).
+        // A dynamic router reads φ and may switch skills after every token;
+        // a speculative round commits several tokens per φ, so the router
+        // wins (on the host the drafts are off for it already: no graph).
         let graph_spec = self.speculative
             && (graph_on || metal_graph)
             && self.mtp.is_some()
             && task_mask.is_none()
+            && self.dyn_router.is_none()
             && (!self.o1_active() || self.o1_spec())
             && spec_sampling_ok
             && spec_wanted;
@@ -6974,6 +6983,7 @@ impl Pipeline {
             && !metal_wgpu
             && self.mtp.is_none()
             && task_mask.is_none()
+            && self.dyn_router.is_none()
             && (!self.o1_active() || self.o1_spec())
             && self.sampler_config.temperature < 1e-6
             && !penalized
@@ -7088,6 +7098,7 @@ impl Pipeline {
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
+            && self.dyn_router.is_none()
             && (!self.o1_active() || self.o1_spec())
             && ((!graph_on && pair_pays && self.sampler_config.temperature < 1e-6) || graph_spec);
         // The MTP module is detached during generation so its mutable
@@ -7386,6 +7397,10 @@ impl Pipeline {
         // fused-pair path skips the per-layer φ capture). o1 layers
         // collect their query trace in both the single and pair paths.
         let dyn_prefill = router.is_some();
+        // On CUDA the batch graph keeps the router layer's rows of every
+        // prompt chunk (`dyn_phi_tap`): the prompt reads batched and φ still
+        // takes every position in order.
+        let dyn_batch = dyn_prefill && crate::gpu::cuda_active();
         // Optional bounded calibration prefix for generation.  The normal
         // O(1) path seals after the full prompt; this explicit knob instead
         // runs only the requested prefix through exact attention, seals the
@@ -7919,7 +7934,7 @@ impl Pipeline {
             && task_mask.is_none()
             && (!self.o1_active() || o1_batch_ready)
             && (mtp.is_none() || mtp_batch_prefill || o1_batch_ready)
-            && !dyn_prefill
+            && (!dyn_prefill || dyn_batch)
             && pos + 1 < input_ids.len()
         {
             let hs = self.hidden_size;
@@ -7974,7 +7989,8 @@ impl Pipeline {
                         && o1_arch.is_none()
                         && !o1_batch_ready
                         && !mimo_spec
-                        && !mtp_batch_prefill,
+                        && !mtp_batch_prefill
+                        && !dyn_prefill,
                 );
                 let outcome = self.o1_prompt_chunk(&mut hiddens, &positions, bk);
                 #[cfg(not(target_os = "macos"))]
@@ -7986,6 +8002,9 @@ impl Pipeline {
                     }
                 }
                 let ok_b = outcome == crate::gpu::BatchGraphOutcome::Completed;
+                if ok_b && dyn_prefill {
+                    self.absorb_phi_tap(0..self.num_layers);
+                }
                 // The draft head over a far field reads the prompt's tail only.
                 if ok_b && o1_batch_ready && end > self.mtp_pos_base && mtp.is_some() {
                     let first = pos.max(self.mtp_pos_base);
@@ -9198,7 +9217,17 @@ impl Pipeline {
                         let phi = self.dyn_phi_ema.clone();
                         let decision = r.step(&phi, generated);
                         if let Some(new_active) = decision {
-                            let _ = self.set_active_skill(new_active);
+                            if self.set_active_skill(new_active).is_ok() && next_pos <= all_ids.len() {
+                                // The switch is a sequence boundary: every state
+                                // the old weights made is gone. The context so far
+                                // is read again under the new ones, so the next
+                                // token conditions on all of it, not on an empty
+                                // cache.
+                                match self.reprefill_context(&all_ids[..next_pos], task_mask) {
+                                    Ok(h) => hidden = h,
+                                    Err(e) => tracing::warn!("dynamic routing: re-reading the context after a skill switch failed: {e}"),
+                                }
+                            }
                         }
                         // Backfill this token's coherence + switch flag from
                         // the just-run eval (freshest measured values).
@@ -14745,7 +14774,12 @@ impl Pipeline {
                 // Route on the evolving phi (drives the NEXT token's skill).
                 let phi = self.dyn_phi_ema.clone();
                 if let Some(new_active) = router.step(&phi, pos) {
-                    let _ = self.set_active_skill(new_active);
+                    // a switch clears the state: positions 0..=pos are read
+                    // again under the new weights before pos+1 is scored
+                    if self.set_active_skill(new_active).is_ok() {
+                        self.reprefill_context(&ids[..=pos], None)?;
+                        self.graph_logits = None;
+                    }
                 }
             }
             Ok(((nll / cnt.max(1) as f64).exp(), router.switches.len()))
@@ -18297,8 +18331,7 @@ impl Pipeline {
                             return None;
                         }
                     };
-                    let (m, _, _, _) = wq.graph_weight_or_blr()?;
-                    model = Some(m.clone());
+                    model = Some(self.graph_model_of(&[wq, wk, wv, wo])?);
                     crate::gpu::GraphAttn::Full {
                         wq: gw(wq)?,
                         wk: gw(wk)?,
@@ -18320,8 +18353,7 @@ impl Pipeline {
                 }
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg?;
-                    let (m, _, _, _) = w.in_proj_qkv.graph_weight_or_blr()?;
-                    model = Some(m.clone());
+                    model = Some(self.graph_model_of(&[&w.in_proj_qkv, &w.in_proj_z, &w.out_proj])?);
                     crate::gpu::GraphAttn::Gdn {
                         qkv: gw(&w.in_proj_qkv)?,
                         z: gw(&w.in_proj_z)?,
@@ -18469,7 +18501,21 @@ impl Pipeline {
         // second readback only for that explicit probe instead of dumping
         // the input copy left in `h` by a folded-head graph.
         let dump_hidden = std::env::var_os("CMF_LOGIT_DUMP").is_some();
-        let taps = if steps == 1 { self.dflash_taps_wanted(from, upto_excl) } else { Vec::new() };
+        let mut taps = if steps == 1 { self.dflash_taps_wanted(from, upto_excl) } else { Vec::new() };
+        let n_dflash = taps.len();
+        // Dynamic skill routing reads φ, the residual after the router's
+        // layer, every token: the graph keeps that row the way it keeps a
+        // drafter's, and `forward_layers_upto` folds it into the EMA.
+        let phi_slot = match self.dyn_phi_layer {
+            Some(l) if steps == 1 && (from..upto_excl).contains(&l) => {
+                Some(taps.iter().position(|&t| t == l).unwrap_or_else(|| {
+                    taps.push(l);
+                    taps.len() - 1
+                }))
+            }
+            _ => None,
+        };
+        *self.dyn_phi_tap.lock().unwrap() = None;
         crate::gpu::layer_taps_arm(&taps);
         let outcome = crate::gpu::forward_token_graph(
             &model,
@@ -18501,7 +18547,7 @@ impl Pipeline {
             from,
             dump_hidden,
         );
-        self.dflash_taps_keep(&taps, position, 1, outcome == crate::gpu::TokenGraphOutcome::Completed);
+        self.graph_taps_keep(&taps, n_dflash, phi_slot, position, 1, outcome == crate::gpu::TokenGraphOutcome::Completed);
         match outcome {
             crate::gpu::TokenGraphOutcome::Completed => Some(Ok(h)),
             crate::gpu::TokenGraphOutcome::Failed => Some(Err(())),
@@ -20556,8 +20602,7 @@ impl Pipeline {
                             }
                             return None;
                         }
-                        let (m, _, _, _) = bw(wq)?;
-                        model = Some(m.clone());
+                        model = Some(self.graph_model_of(&[wq, wk, wv, wo])?);
                         crate::gpu::GraphAttn::Full {
                             wq: gw(wq)?,
                             wk: gw(wk)?,
@@ -20584,8 +20629,7 @@ impl Pipeline {
                             }
                             return None;
                         };
-                        let (m, _, _, _) = bw(&w.in_proj_qkv)?;
-                        model = Some(m.clone());
+                        model = Some(self.graph_model_of(&[&w.in_proj_qkv, &w.in_proj_z, &w.out_proj])?);
                         crate::gpu::GraphAttn::Gdn {
                             qkv: gw(&w.in_proj_qkv)?,
                             z: gw(&w.in_proj_z)?,
@@ -20705,7 +20749,17 @@ impl Pipeline {
             Clear
         });
         // a prompt chunk wholly before what the drafter's windows reach keeps none
-        let taps = if positions.last().is_some_and(|&p| p < self.dflash_tap_from) { Vec::new() } else { self.dflash_taps_wanted(0, graph_end) };
+        let mut taps = if positions.last().is_some_and(|&p| p < self.dflash_tap_from) { Vec::new() } else { self.dflash_taps_wanted(0, graph_end) };
+        let n_dflash = taps.len();
+        // a routed prompt's rows at the router's layer, φ in row order
+        let phi_slot = match self.dyn_phi_layer {
+            Some(l) if l < graph_end => Some(taps.iter().position(|&t| t == l).unwrap_or_else(|| {
+                taps.push(l);
+                taps.len() - 1
+            })),
+            _ => None,
+        };
+        *self.dyn_phi_tap.lock().unwrap() = None;
         crate::gpu::layer_taps_arm(&taps);
         let outcome = crate::gpu::forward_batch_graph(
             &model,
@@ -20732,7 +20786,7 @@ impl Pipeline {
             spec,
             layers_run,
         );
-        self.dflash_taps_keep(&taps, positions[0], k, outcome == crate::gpu::BatchGraphOutcome::Completed);
+        self.graph_taps_keep(&taps, n_dflash, phi_slot, positions[0], k, outcome == crate::gpu::BatchGraphOutcome::Completed);
         outcome
     }
 
@@ -20748,6 +20802,13 @@ impl Pipeline {
     /// Collect what the armed graph kept for `rows` rows from `pos0`
     /// (`ok`: it completed) into `dflash_taps`, a row's layers joined.
     fn dflash_taps_keep(&self, taps: &[usize], pos0: usize, rows: usize, ok: bool) {
+        self.graph_taps_keep(taps, taps.len(), None, pos0, rows, ok);
+    }
+
+    /// What the armed graph kept, `[slot][row][hidden]`: the first
+    /// `n_dflash` slots are the drafter's (`dflash_taps`), `phi_slot` the
+    /// router's φ rows (`dyn_phi_tap`).
+    fn graph_taps_keep(&self, taps: &[usize], n_dflash: usize, phi_slot: Option<usize>, pos0: usize, rows: usize, ok: bool) {
         if taps.is_empty() {
             return;
         }
@@ -20756,6 +20817,18 @@ impl Pipeline {
         if !crate::gpu::layer_taps_take(&mut raw) || !ok || raw.len() != nt * rows * hs {
             return;
         }
+        if let Some(s) = phi_slot {
+            *self.dyn_phi_tap.lock().unwrap() = Some(raw[s * rows * hs..(s + 1) * rows * hs].to_vec());
+        }
+        if n_dflash > 0 {
+            raw.truncate(n_dflash * rows * hs);
+            self.dflash_taps_join(&taps[..n_dflash], raw, pos0, rows);
+        }
+    }
+
+    /// The drafter's slots of a graph's taps into `dflash_taps`.
+    fn dflash_taps_join(&self, taps: &[usize], raw: Vec<f32>, pos0: usize, rows: usize) {
+        let (nt, hs) = (taps.len(), self.hidden_size);
         let mut joined = vec![0f32; rows * nt * hs];
         for s in 0..nt {
             for r in 0..rows {
@@ -22645,10 +22718,12 @@ impl Pipeline {
                     // boundary crossing per token.
                     h = hh;
                     tail_start = gl;
+                    self.absorb_phi_tap(0..gl);
                 } else if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
                     if !graph_trusted {
                         crate::gpu::graph_race_record(true, dur);
                     }
+                    self.absorb_phi_tap(0..self.num_layers);
                     if !lg.is_empty() {
                         // Graph produced logits (final-norm + lm_head folded in) —
                         // pad/cap to vocab and hand them to the sampler directly.
@@ -22727,6 +22802,7 @@ impl Pipeline {
                 }
             }
             if let Some(hh) = span_res {
+                self.absorb_phi_tap(from..from + gl);
                 if gl == upto_excl - from {
                     if !lg.is_empty() {
                         lg.resize(self.vocab_size, 0.0);
@@ -23401,6 +23477,104 @@ impl Pipeline {
         }
 
         h
+    }
+
+    /// Read `ids` (positions `0..len`) into a sequence the weights just
+    /// changed under (`set_active_skill` cleared it): all but the last
+    /// position through the prompt ingest (`prefill_rows`: the batch graph
+    /// where it admits them, else the host's chunked prefill), the last as
+    /// a decode step. Returns that step's post-stack hidden; logits the
+    /// graph folded in are its own, never the old weights'. The router's φ
+    /// does not take these rows — they are context it has already seen.
+    fn reprefill_context(&mut self, ids: &[u32], task_mask: Option<&TaskMask>) -> Result<Vec<f32>, String> {
+        let n = ids.len();
+        if n == 0 {
+            return Err("nothing to read".into());
+        }
+        let phi = self.dyn_phi_layer.take();
+        self.graph_logits = None;
+        let r = (|| {
+            let chunk = self.prefill_chunk().max(1);
+            // the device's own prompt path where generation takes it (the
+            // batch graph, chunks of `generation_batch_k`), else the host's
+            let batch_k = self.generation_batch_k();
+            let mut graphed = batch_k > 1 && task_mask.is_none() && !self.o1_active() && self.graph_prefill_preferred();
+            let mut pos = 0usize;
+            while pos + 1 < n {
+                if graphed {
+                    let end = (pos + batch_k).min(n - 1);
+                    let hs = self.hidden_size;
+                    let mut hiddens = vec![0f32; (end - pos) * hs];
+                    for (j, &id) in ids[pos..end].iter().enumerate() {
+                        hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+                    }
+                    let positions: Vec<usize> = (pos..end).collect();
+                    match self.try_batch_graph_wgpu(&mut hiddens, &positions, end - pos, None) {
+                        crate::gpu::BatchGraphOutcome::Completed => {
+                            pos = end;
+                            continue;
+                        }
+                        crate::gpu::BatchGraphOutcome::Failed => {
+                            return Err(format!("the batch graph failed at position {pos}"));
+                        }
+                        crate::gpu::BatchGraphOutcome::Declined => graphed = false,
+                    }
+                }
+                let end = (pos + chunk).min(n - 1);
+                let _ = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
+                // a failed graph stays flagged for the caller's own check
+                if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(format!("the device graph failed at position {pos}"));
+                }
+                pos = end;
+            }
+            Ok(self.forward_layers(&self.embed_single(ids[n - 1]), n - 1, task_mask))
+        })();
+        self.dyn_phi_layer = phi;
+        r
+    }
+
+    /// The file a graph layer's weights come from: the first of `ws` that is
+    /// a mapped graph weight. A soft skill blend holds its working tensors
+    /// in f32 (no file entry); on CUDA, whose hybrid arm keeps such a
+    /// matrix on the card as int8 tiles, the pipeline's own file stands in.
+    fn graph_model_of(&self, ws: &[&QTensor]) -> Option<std::sync::Arc<cortiq_core::CmfModel>> {
+        if let Some(m) = ws.iter().find_map(|t| t.graph_weight_or_blr().map(|r| r.0.clone())) {
+            return Some(m);
+        }
+        if self.dyn_blend_loaded && crate::gpu::cuda_active() {
+            return self.model.clone();
+        }
+        None
+    }
+
+    /// Fold the φ rows a device graph kept (`dyn_phi_tap`) into the EMA,
+    /// in row order. `ran`: the layers the graph ran; a router layer outside
+    /// them runs on the host, whose own hook takes it. A router layer the
+    /// graph ran without keeping its row is a φ the router never sees —
+    /// said once, never silent.
+    fn absorb_phi_tap(&mut self, ran: std::ops::Range<usize>) {
+        let Some(l) = self.dyn_phi_layer else {
+            return;
+        };
+        let rows = self.dyn_phi_tap.get_mut().unwrap().take();
+        match rows {
+            Some(rows) => {
+                let hs = self.hidden_size;
+                for r in rows.chunks_exact(hs) {
+                    self.update_dyn_phi(r);
+                }
+            }
+            None if ran.contains(&l) => {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "dynamic routing: the device graph ran the router's layer {l} without keeping its row — φ is not updated on this backend"
+                    );
+                }
+            }
+            None => {}
+        }
     }
 
     /// EMA of φ at the router layer (rolling, weight 0.2 = ~5-token

@@ -959,6 +959,11 @@ pub use embryo::{
     forward_embryo_graph_chunk,
 };
 
+/// The skill bake's GDN layers (conv, delta rule and its BPTT) and its dX
+/// GEMMs on the card; declared after `kargs!`, which it uses.
+mod bake;
+pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_attn_bwd, bake_phase_a, bake_attn_fwd, bake_ffn_bwd, bake_ffn_fwd, bake_gdn_bwd, bake_gdn_fwd, bake_gdn_layer_fwd, bake_gdn_ok, bake_gemm_dx, bake_gemm_nt, bake_lm_loss, bake_planes_clear};
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
