@@ -1,7 +1,7 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
-                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels]
+                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels] [--or-rules P]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -83,6 +83,17 @@ list of 297, R's five left out. The tasks of `train_gen.py` use 22 labels, few
 enough to know by heart, and a model that knows them writes one of them where
 the rule says another: with the rule copied word for word the answer after it
 was "RENAME" for a copied "answer RETRY.", "CONTINUE" for INSTALL.
+
+`--or-rules P`: that share of the rules of a rule task gets a second quoted
+string ("... contains "A" or "B", answer L."), one of the strings of the other
+tasks that is neither in this task nor in its output; in the rule that
+applies, the string of the output stands first or second. R has such a rule
+and the tasks of `train_gen.py` have none: it was copied as a rule of one
+string with another rule's label. Adding rule tasks instead (`train_gen.py
+--rules`) taught the rule (5 of 5) and brought the false NONE back twice (40
+and 43 of R's 128 one-command tasks): more turns that end in a bare word
+after the reasoning. This option changes rules in place, the number of
+conversations and their endings stay.
 """
 
 from __future__ import annotations
@@ -378,7 +389,7 @@ def arith_think(prompt: str, answer: str) -> str:
 
 
 def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False,
-          reason=(), relabel=None):
+          reason=(), relabel=None, ors=None):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat == "react" and relabel is not None:  # other words for the labels, the same rule set
@@ -386,6 +397,24 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked
         other = dict(zip(names, relabel.sample(LABELS, len(names))))
         prompt = re.sub(r"answer (\S+)\.$", lambda m: f"answer {other[m.group(1)]}.", prompt, flags=re.M)
         answer = other[answer]
+    if cat == "react" and ors is not None:  # some rules get a second string
+        r, share, strings = ors
+        head, tail = prompt.split("\n\nPrevious command: ", 1)
+        used = set(re.findall(r'"([^"]+)"', head))
+        lines = head.split("\n")
+        for i, line in enumerate(lines):
+            m = RULE.match(line)
+            if not m or '" or "' in line or r.random() >= share:
+                continue
+            free = [t for t in strings if t not in used and t not in tail]
+            if not free:
+                continue
+            pair = [m.group(1).strip('"'), r.choice(free)]
+            used.add(pair[1])
+            if r.random() < 0.5:
+                pair.reverse()
+            lines[i] = f'- If the output contains "{pair[0]}" or "{pair[1]}", answer {m.group(2)}.'
+        prompt = "\n".join(lines) + "\n\nPrevious command: " + tail
     if cat in ("react", "arith"):
         think = (react_think if cat == "react" else arith_think)(prompt, answer) if cat in reason else None
         return "direct", [("user", prompt), ("assistant", think, answer, [])]
@@ -614,6 +643,8 @@ def main() -> None:
     ap.add_argument("--pipes", action="store_true",
                     help="a pipeline is looked up by what is needed, not by command names, and built from the cards that "
                          "came back: which gives the output, which works on it, each example and its values")
+    ap.add_argument("--or-rules", type=float, default=0.0,
+                    help="share of the rules of a rule task that get a second quoted string (\"A\" or \"B\")")
     ap.add_argument("--labels", action="store_true",
                     help="the labels of a rule task are replaced by words drawn from a list of 297: a label has to be "
                          "copied from its rule, it cannot be recalled")
@@ -628,7 +659,13 @@ def main() -> None:
     rng = random.Random(args.seed)
     rng2 = random.Random(args.seed + 1009)  # the draws of --teach: the other conversations stay as without it
     rng3 = random.Random(args.seed + 2003) if args.labels else None  # the draws of --labels, likewise
+    ors = None  # (the draws of --or-rules, the share, the quoted strings of all rule tasks)
     recs = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
+    if args.or_rules > 0:
+        strings = sorted({t for r in recs if r["cat"] == "react"
+                          for line in r["messages"][0]["content"].split("\n") if RULE.match(line)
+                          for t in re.findall(r'"([^"]+)"', line)})
+        ors = (random.Random(args.seed + 3001), args.or_rules, strings)
     pool, seen = [], set()
     for r in recs:
         if r["cat"] in ("react", "arith"):
@@ -648,7 +685,7 @@ def main() -> None:
         for r in recs:
             try:
                 mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes,
-                                    set(filter(None, args.reason.split(","))), rng3)
+                                    set(filter(None, args.reason.split(","))), rng3, ors)
                 direct = mode == "direct"
                 tools = TOOLS
                 if args.teach > 0 and not direct:
