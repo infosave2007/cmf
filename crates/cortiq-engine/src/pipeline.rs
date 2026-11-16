@@ -12018,6 +12018,8 @@ impl Pipeline {
         let past = crate::gpu_wgpu::experts_past_card();
         #[cfg(not(feature = "gpu"))]
         let past = false;
+        #[cfg(feature = "cuda")]
+        let past = past || crate::gpu_cuda::experts_streamed();
         if past {
             tracing::info!("pair micro-benchmark skipped: routed experts past the card have no per-op route");
             return (0.0, 0.0);
