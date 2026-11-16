@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Vulkan, latent-expert `qwen4_exp` files (Edge0-145B) with part of the expert banks in system memory: a prompt
+  chunk went out as one submission for every layer, long enough for the driver to give up on the device
+  (within 32 GB on an A40 the device was lost after ~17 s in the chunk past 2048 positions; amdgpu resets its
+  ring after 10 s). Such a chunk now goes out four layers a submission (`CMF_QWEN_CHAIN` still overrides), and
+  the 4.7K-token prompt runs through to decode.
+- After a lost device the host fallback built its buffers on the dead device, panicked inside wgpu and hung the
+  process; a failed frame readback now turns the GPU path off for the rest of the run, which goes on on the CPU.
+
 ## [0.9.0] — 2026-11-16
 
 ### Added

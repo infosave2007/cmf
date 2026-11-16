@@ -4647,6 +4647,10 @@ impl DevProf {
 /// A model with latent layers (Edge0) is loaded: its prompt chunks are sized for the experts' staging.
 pub(crate) static LATENT_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Layers a prompt chunk's submission takes when some latent experts are read
+/// from system memory (`CMF_QWEN_CHAIN` overrides).
+const PROMPT_CHAIN_HOSTED: usize = 4;
+
 /// The whole token on the card. Returns `false` when the device path is
 /// not available (the caller then runs the host path); a refusal after
 /// the first token of a sequence is reported once and turns the path off.
@@ -6034,8 +6038,16 @@ fn forward_tokens_device(
             .unwrap_or(4)
             .max(1);
         let split = want_logits && (ntok <= crate::gpu_wgpu::qwen4::TMAX || frame_mode);
+        // Latent experts read from system memory make a prompt chunk's one
+        // submission long enough for the driver to give up on the device
+        // (Edge0-145B within 32 GB on an A40: lost after ~17 s in the chunk
+        // past 2048 positions; amdgpu resets its ring after 10 s): such a
+        // chunk goes out four layers a submission (the 4.7K prompt then went
+        // through to decode).
+        let hosted = dev.lat.iter().flatten().any(|d| d.host_bytes() > 0);
+        let whole = if hosted { PROMPT_CHAIN_HOSTED } else { layers.len() + 1 };
         chain_env
-            .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { layers.len() + 1 })
+            .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { whole })
             .max(1)
     } else if ntok > 1 {
         1

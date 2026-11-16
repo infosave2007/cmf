@@ -9865,6 +9865,7 @@ impl Pending {
                 }
                 if t0.elapsed() > limit {
                     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                        crate::gpu::mark_lost("qwen4 frame readback");
                         self.stage.unmap();
                         return None;
                     }
@@ -9873,11 +9874,13 @@ impl Pending {
                 std::hint::spin_loop();
             }
         } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            crate::gpu::mark_lost("qwen4 frame readback");
             self.stage.unmap();
             return None;
         }
         let out = {
             let Ok(data) = slice.get_mapped_range() else {
+                crate::gpu::mark_lost("qwen4 frame readback");
                 self.stage.unmap();
                 return None;
             };
