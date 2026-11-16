@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Server: the generic `<think>` dialect (LFM3, Qwen and every other family that opens its own block) now
+  releases thinking as `reasoning_content` — streaming deltas and the non-streaming message field — in the
+  shape DeepSeek made the convention for OpenAI-compatible servers. Previously only DeepSeek V4.1 and
+  MiniMax M3 had protocol-level reasoning; the other families streamed `<think>...</think>` inline as
+  user-visible text whenever thinking was on. DeepSeek V4.1's stream, which also carried its reasoning
+  inline, now matches its non-streaming reply. Replies without thinking are byte-identical to before, and
+  `enable_thinking=false` keeps stripping the prefilled empty block exactly as it did. A client that reads
+  the inline block can keep it: `"reasoning_format": "none"` (llama.cpp's spelling) leaves the thinking in
+  `content`, streamed or not.
+
 ## [0.9.2] — 2026-11-16
 
 ### Changed

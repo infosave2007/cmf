@@ -146,6 +146,10 @@ pub struct StreamDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Thinking released by the generic `<think>` dialect, in the shape
+    /// DeepSeek made the convention for OpenAI-compatible servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Tool calls arrive as one aggregated delta right before the
     /// finish chunk — the shape every OpenAI client accumulates anyway.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +234,7 @@ pub fn tool_calls_chunk(
             delta: StreamDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(calls),
             },
             finish_reason: None,
@@ -252,6 +257,31 @@ pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamCh
             delta: StreamDelta {
                 role: None,
                 content: Some(token.to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+        x_cortiq_route: None,
+        timings: None,
+    }
+}
+
+/// A reasoning-delta chunk for the generic `<think>` dialect, in the same
+/// position of the answer where DeepSeek clients expect it.
+pub fn reasoning_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamChunk {
+    StreamChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![StreamChoice {
+            index: 0,
+            delta: StreamDelta {
+                role: None,
+                content: None,
+                reasoning_content: Some(token.to_string()),
                 tool_calls: None,
             },
             finish_reason: None,
@@ -299,6 +329,7 @@ pub fn finish_chunk(id: &str, model: &str, reason: &str, created: u64) -> Stream
             delta: StreamDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             finish_reason: Some(reason.to_string()),

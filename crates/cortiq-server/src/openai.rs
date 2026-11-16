@@ -490,6 +490,7 @@ async fn lookup_answer_response(
                     delta: streaming::StreamDelta {
                         role: Some("assistant".to_string()),
                         content: None,
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: None,
@@ -927,6 +928,13 @@ struct ChatCompletionsRequest {
     /// top-level field above wins when both are present.
     #[serde(default)]
     chat_template_kwargs: Option<serde_json::Value>,
+    /// llama.cpp's switch for where the generic `<think>` dialect's
+    /// reasoning goes: `"none"` keeps it inline in `content` as
+    /// `<think>…</think>` (the server's behaviour before
+    /// `reasoning_content`); anything else or absent ships it as
+    /// `reasoning_content`.
+    #[serde(default)]
+    reasoning_format: Option<String>,
     /// Cortiq extension: task routing
     #[serde(default)]
     cortiq: Option<CortiqExtension>,
@@ -957,6 +965,12 @@ impl ChatCompletionsRequest {
             Some([]) | None => None,
             Some(ts) => Some(ts),
         }
+    }
+
+    /// `reasoning_format: "none"`: the generic dialect's thinking stays
+    /// inline in `content` instead of `reasoning_content`.
+    fn reasoning_inline(&self) -> bool {
+        self.reasoning_format.as_deref() == Some("none")
     }
 
     /// Effective enable_thinking: top-level field, else chat_template_kwargs.
@@ -1921,6 +1935,7 @@ async fn chat_completions(
                         delta: streaming::StreamDelta {
                             role: Some("assistant".to_string()),
                             content: None,
+                            reasoning_content: None,
                             tool_calls: None,
                         },
                         finish_reason: None,
@@ -1949,13 +1964,18 @@ async fn chat_completions(
                 std::sync::Arc::new(std::sync::Mutex::new(parser))
             });
             let minimax_m3_stream_cb = minimax_m3_stream.clone();
-            // Shared with the post-generation flush: a short reply that
-            // never opens a <think> block (the template prefilled an
-            // empty one) used to be swallowed whole — the filter waited
-            // for a </think> that never comes.
-            let filter_shared = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-            let filter_cb = filter_shared.clone();
-            let mut filter_passthrough = req.thinking() != Some(false);
+            // Generic `<think>` / `</think>` dialect router, in place of
+            // the old pass-through filter: thinking ships as
+            // `reasoning_content` deltas — private, never user content —
+            // while the answer streams as it decodes.
+            // `reasoning_format: "none"` keeps the thinking inline in
+            // `content`, with a template-opened block's opener put back.
+            let think_stream = if req.thinking() != Some(false) && req.reasoning_inline() {
+                ThinkStream::inline(think_opened)
+            } else {
+                ThinkStream::new(req.thinking() != Some(false), think_prefilled)
+            };
+            let think = std::sync::Arc::new(std::sync::Mutex::new(think_stream));
             // Tool-call holdback: once the model opens a call (any grammar
             // the parser knows), nothing more goes out as content — the
             // calls are parsed whole at the end and shipped as a
@@ -1964,68 +1984,43 @@ async fn chat_completions(
             let tools_active = req.effective_tools().is_some();
             let holdback = std::sync::Arc::new(std::sync::Mutex::new(ToolHoldback::new()));
             let holdback_cb = holdback.clone();
-            let mut opener = think_opened.then(|| "<think>".to_string());
 
-            let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
-                if let Some(stream) = &minimax_m3_stream_cb {
-                    let out = stream.lock().expect("MiniMax M3 stream").push(token);
-                    if out.is_empty() {
+            let callback: cortiq_engine::TokenCallback = {
+                let think = think.clone();
+                Box::new(move |token: &str| {
+                    if let Some(stream) = &minimax_m3_stream_cb {
+                        let out = stream.lock().expect("MiniMax M3 stream").push(token);
+                        if out.is_empty() {
+                            return !tx_tokens.is_closed();
+                        }
+                        let chunk = streaming::token_chunk(&id2, &model2, &out, created);
+                        return tx_tokens.blocking_send(chunk).is_ok();
+                    }
+                    let release = think.lock().expect("think router").push(token);
+                    if let Some(reasoning) = release.reasoning {
+                        let chunk = streaming::reasoning_chunk(&id2, &model2, &reasoning, created);
+                        if tx_tokens.blocking_send(chunk).is_err() {
+                            return false;
+                        }
+                    }
+                    let Some(content) = release.content else {
                         return !tx_tokens.is_closed();
-                    }
-                    let chunk = streaming::token_chunk(&id2, &model2, &out, created);
-                    return tx_tokens.blocking_send(chunk).is_ok();
-                }
-                let opened;
-                let token = match opener.take() {
-                    Some(o) => {
-                        opened = o + token;
-                        opened.as_str()
-                    }
-                    None => token,
-                };
-                // Every piece of content goes out through here, so the
-                // think filter's flushes pass the tool holdback too.
-                let emit = |text: &str| -> bool {
+                    };
+                    // Every piece of content goes out through the tool
+                    // holdback, so a call grammar opening in the answer is
+                    // held whole.
                     let out = if tools_active {
-                        holdback_cb.lock().expect("tool holdback").push(text)
+                        holdback_cb.lock().expect("tool holdback").push(&content)
                     } else {
-                        text.to_string()
+                        content
                     };
                     if out.is_empty() {
                         return !tx_tokens.is_closed();
                     }
                     let chunk = streaming::token_chunk(&id2, &model2, &out, created);
                     tx_tokens.blocking_send(chunk).is_ok()
-                };
-                if filter_passthrough {
-                    return emit(token);
-                }
-                let mut filter_buf = filter_cb.lock().expect("think filter buf");
-                filter_buf.push_str(token);
-                if let Some(pos) = filter_buf.find("</think>") {
-                    let tail = filter_buf[pos + "</think>".len()..].to_string();
-                    filter_buf.clear();
-                    filter_passthrough = true;
-                    let tail_trimmed = tail.trim_start_matches('\n');
-                    if !tail_trimmed.is_empty() {
-                        return emit(tail_trimmed);
-                    }
-                    return true;
-                }
-                // A reply that cannot be opening a reasoning block goes out
-                // with its first token: held for 100 characters it reached
-                // the client as one late chunk (28 tokens behind the model).
-                // A prompt that ends inside an opened block keeps the wait:
-                // its reply holds the reasoning without an opener.
-                if (filter_buf.len() > 100 && !filter_buf.contains("<think>"))
-                    || (!think_prefilled && !may_open_think(&filter_buf))
-                {
-                    let b = std::mem::take(&mut *filter_buf);
-                    filter_passthrough = true;
-                    return emit(&b);
-                }
-                true
-            });
+                })
+            };
 
             let outcome = run_generation(
                 state2.clone(),
@@ -2104,21 +2099,17 @@ async fn chat_completions(
                         let _ = tx.send(fin).await;
                         return;
                     }
-                    // End-of-generation flush of the think filter, by the
-                    // filter's own rules: a buffer that never opened a
-                    // <think> block IS the answer; a closed block ships
-                    // its tail; an unterminated block stays private.
-                    let leftover = std::mem::take(&mut *filter_shared.lock().expect("filter buf"));
-                    if !leftover.is_empty() {
-                        let out = if !leftover.contains("<think>") {
-                            leftover
-                        } else if let Some(pos) = leftover.find("</think>") {
-                            leftover[pos + "</think>".len()..]
-                                .trim_start_matches('\n')
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
+                    // End-of-generation flush of the think router, by its
+                    // own rules: a reply that never opened a block IS the
+                    // answer; an unterminated block ships as
+                    // reasoning_content — private thinking, never content.
+                    let leftover = think.lock().expect("think router").finish();
+                    if let Some(reasoning) = leftover.reasoning {
+                        let _ = tx
+                            .send(streaming::reasoning_chunk(&id, &model, &reasoning, created))
+                            .await;
+                    }
+                    if let Some(out) = leftover.content {
                         let out = if tools_active {
                             holdback.lock().expect("tool holdback").push(&out)
                         } else {
@@ -2251,13 +2242,25 @@ async fn chat_completions(
             let content = strip_think_block(&result.text);
             let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
             (plain, calls, None)
-        } else if think_opened {
-            let text = format!("<think>{}", result.text);
+        } else if req.reasoning_inline() {
+            // `reasoning_format: "none"`: the thinking stays inline in
+            // `content`, with a template-opened block's opener put back.
+            let text = if think_opened {
+                format!("<think>{}", result.text)
+            } else {
+                result.text.clone()
+            };
             let (plain, calls) = extract_tool_calls(&text, req.effective_tools());
             (plain, calls, None)
+        } else if think_opened {
+            // A template that opened the block itself: put the opener
+            // back, then route like any other thinking reply.
+            let text = format!("<think>{}", result.text);
+            let (plain, calls, reasoning) = split_think_reply(&text, req.effective_tools());
+            (plain, calls, reasoning)
         } else {
-            let (plain, calls) = extract_tool_calls(&result.text, req.effective_tools());
-            (plain, calls, None)
+            let (plain, calls, reasoning) = split_think_reply(&result.text, req.effective_tools());
+            (plain, calls, reasoning)
         };
         if calls.is_empty() && !minimax_m3 {
             if let Some(names) = req.effective_tools().map(|ts| {
@@ -2432,6 +2435,248 @@ fn strip_think_block(s: &str) -> String {
         return String::new();
     }
     rest.trim_start_matches('\n').to_string()
+}
+
+/// What one step of the generic `<think>` router releases: thinking goes
+/// to `reasoning_content`, the answer to `content`, either or both (one
+/// step may carry the block closer together with the first answer text).
+#[derive(Debug, Default, PartialEq)]
+struct ThinkRelease {
+    reasoning: Option<String>,
+    content: Option<String>,
+}
+
+/// Incremental router for the generic `<think>` / `</think>` dialect, the
+/// same families `strip_think_block` handles whole. It replaces the old
+/// pass-through filter: thinking is released as `reasoning_content` deltas
+/// — never as user content — while the answer streams as it decodes.
+/// A marker split across decoded tokens can never leak into a delta.
+struct ThinkStream {
+    phase: ThinkPhase,
+    /// Text held back while a marker decision or a closer is pending.
+    pending: String,
+    /// A prompt ending inside an opened block (the template prefilled the
+    /// opener): the reply is thinking from its first token.
+    opener_prefilled: bool,
+    /// Whether any reasoning text has shipped yet; the newline the
+    /// template opens the block with is not worth a delta.
+    reasoning_opened: bool,
+    /// The closer came without answer text after it: the newlines that
+    /// lead the answer are dropped, as the non-streaming split drops them
+    /// (otherwise a lone `"\n\n"` delta precedes the answer or a call).
+    trim_answer_lead: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ThinkPhase {
+    /// Thinking requested: hold the first tokens until an opener is
+    /// decided, then route. `pending` carries the undecided text.
+    Deciding,
+    /// Inside the block: release reasoning, watch for the closer.
+    Reasoning,
+    /// Block closed or never opened: plain answer pass-through.
+    Answer,
+    /// Thinking disabled: the old privacy filter — a prefilled empty
+    /// block strips away, thinking never reaches the client.
+    Stripping,
+    /// `reasoning_format: "none"`: everything is content, thinking
+    /// inline; `pending` holds a template-opened block's opener until the
+    /// first token carries it out.
+    Inline,
+}
+
+impl ThinkStream {
+    fn new(thinking_on: bool, opener_prefilled: bool) -> Self {
+        let phase = if !thinking_on {
+            ThinkPhase::Stripping
+        } else if opener_prefilled {
+            ThinkPhase::Reasoning
+        } else {
+            ThinkPhase::Deciding
+        };
+        Self {
+            phase,
+            pending: String::new(),
+            opener_prefilled,
+            reasoning_opened: false,
+            trim_answer_lead: false,
+        }
+    }
+
+    /// The inline router for `reasoning_format: "none"`: thinking stays in
+    /// `content` as `<think>…</think>`; `opener` puts back the opener a
+    /// template wrote into the prompt.
+    fn inline(opener: bool) -> Self {
+        Self {
+            phase: ThinkPhase::Inline,
+            pending: if opener { "<think>".to_string() } else { String::new() },
+            opener_prefilled: opener,
+            reasoning_opened: false,
+            trim_answer_lead: false,
+        }
+    }
+
+    fn push(&mut self, token: &str) -> ThinkRelease {
+        match self.phase {
+            ThinkPhase::Answer if self.trim_answer_lead => {
+                let text = token.trim_start_matches('\n');
+                if text.is_empty() {
+                    return ThinkRelease::default();
+                }
+                self.trim_answer_lead = false;
+                ThinkRelease { reasoning: None, content: Some(text.to_string()) }
+            }
+            ThinkPhase::Answer => {
+                ThinkRelease { reasoning: None, content: Some(token.to_string()) }
+            }
+            ThinkPhase::Inline => {
+                let mut content = std::mem::take(&mut self.pending);
+                content.push_str(token);
+                ThinkRelease { reasoning: None, content: Some(content) }
+            }
+            ThinkPhase::Reasoning => self.reasoning_step(token),
+            ThinkPhase::Deciding => {
+                self.pending.push_str(token);
+                if self.take_opener() {
+                    return self.reasoning_step("");
+                }
+                self.decide_or_hold()
+            }
+            ThinkPhase::Stripping => {
+                self.pending.push_str(token);
+                self.strip_step()
+            }
+        }
+    }
+
+    /// Flush at end of generation, by the filter's own rules: a reply
+    /// that never opened a block IS the answer; a stripping buffer that
+    /// did open one stays private; an unterminated reasoning block ships
+    /// as `reasoning_content` — private thinking, never user content.
+    fn finish(&mut self) -> ThinkRelease {
+        let pending = std::mem::take(&mut self.pending);
+        match self.phase {
+            ThinkPhase::Reasoning if !pending.is_empty() => {
+                ThinkRelease { reasoning: Some(pending), content: None }
+            }
+            ThinkPhase::Stripping if pending.contains("<think>") => ThinkRelease::default(),
+            ThinkPhase::Deciding | ThinkPhase::Stripping if !pending.is_empty() => {
+                ThinkRelease { reasoning: None, content: Some(pending) }
+            }
+            _ => ThinkRelease::default(),
+        }
+    }
+
+    /// Deciding text that opens with the marker enters Reasoning. Earlier
+    /// non-whitespace text is ordinary content, as the old filter judged
+    /// it; a marker elsewhere in the text never counts.
+    fn take_opener(&mut self) -> bool {
+        let lead = self.pending.len() - self.pending.trim_start().len();
+        if !self.pending[lead..].starts_with("<think>") {
+            return false;
+        }
+        self.pending = self.pending[lead + "<think>".len()..].to_string();
+        self.phase = ThinkPhase::Reasoning;
+        true
+    }
+
+    /// A Deciding buffer that cannot open a block any more is the answer,
+    /// in full, at once — a marker elsewhere in the text never counts.
+    fn decide_or_hold(&mut self) -> ThinkRelease {
+        let decided = (self.pending.len() > 100 && !self.pending.contains("<think>"))
+            || (!self.opener_prefilled && !may_open_think(&self.pending))
+            || self.pending.contains("</think>");
+        if !decided {
+            return ThinkRelease::default();
+        }
+        let held = std::mem::take(&mut self.pending);
+        self.phase = ThinkPhase::Answer;
+        ThinkRelease { reasoning: None, content: Some(held) }
+    }
+
+    /// Reasoning ready to ship, with the template's opener newline and
+    /// any empty lead dropped.
+    fn ship_reasoning(&mut self, text: String) -> Option<String> {
+        let text =
+            if self.reasoning_opened { text } else { text.trim_start_matches('\n').to_string() };
+        if text.is_empty() {
+            return None;
+        }
+        self.reasoning_opened = true;
+        Some(text)
+    }
+
+    /// One step in Reasoning: release everything but a suffix that could
+    /// still grow into the closer; on the closer, the tail becomes the
+    /// first answer text.
+    fn reasoning_step(&mut self, token: &str) -> ThinkRelease {
+        self.pending.push_str(token);
+        if let Some(pos) = self.pending.find("</think>") {
+            let whole = std::mem::take(&mut self.pending);
+            let head = self.ship_reasoning(whole[..pos].to_string());
+            let tail = whole[pos + "</think>".len()..].trim_start_matches('\n').to_string();
+            self.phase = ThinkPhase::Answer;
+            self.trim_answer_lead = tail.is_empty();
+            return ThinkRelease { reasoning: head, content: (!tail.is_empty()).then_some(tail) };
+        }
+        // Hold back the longest suffix that is still a prefix of the
+        // closer, so a marker split across tokens stays whole.
+        let mut hold = self.pending.len();
+        for (i, _) in self.pending.char_indices() {
+            if "</think>".starts_with(&self.pending[i..]) {
+                hold = i;
+                break;
+            }
+        }
+        let reasoning = self.pending[..hold].to_string();
+        self.pending = self.pending[hold..].to_string();
+        ThinkRelease { reasoning: self.ship_reasoning(reasoning), content: None }
+    }
+
+    /// The privacy filter for thinking-disabled requests, exactly as the
+    /// old filter behaved: a prefilled empty block strips away, a reply
+    /// that cannot open one goes out at once, an unterminated block stays
+    /// private.
+    fn strip_step(&mut self) -> ThinkRelease {
+        if let Some(pos) = self.pending.find("</think>") {
+            let tail = self.pending[pos + "</think>".len()..].trim_start_matches('\n').to_string();
+            self.pending.clear();
+            self.phase = ThinkPhase::Answer;
+            self.trim_answer_lead = tail.is_empty();
+            return ThinkRelease { reasoning: None, content: (!tail.is_empty()).then_some(tail) };
+        }
+        let decided = (self.pending.len() > 100 && !self.pending.contains("<think>"))
+            || (!self.opener_prefilled && !may_open_think(&self.pending));
+        if !decided {
+            return ThinkRelease::default();
+        }
+        let held = std::mem::take(&mut self.pending);
+        self.phase = ThinkPhase::Answer;
+        ThinkRelease { reasoning: None, content: Some(held) }
+    }
+}
+
+/// Whole-reply routing for the generic `<think>` dialect on the
+/// non-streaming path, mirroring `ThinkStream`: a reply opening with the
+/// block releases the body as `reasoning_content`; a block that never
+/// closes is all reasoning; anything else stays ordinary content.
+fn split_think_reply(
+    text: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> (String, Vec<serde_json::Value>, Option<String>) {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("<think>") {
+        let (plain, calls) = extract_tool_calls(text, tools);
+        return (plain, calls, None);
+    }
+    let body = &trimmed["<think>".len()..];
+    let Some(pos) = body.find("</think>") else {
+        return (String::new(), Vec::new(), Some(body.to_string()));
+    };
+    let reasoning = body[..pos].trim_start_matches('\n').to_string();
+    let plain = body[pos + "</think>".len()..].trim_start_matches('\n').to_string();
+    let (plain, calls) = extract_tool_calls(&plain, tools);
+    (plain, calls, (!reasoning.is_empty()).then_some(reasoning))
 }
 
 // ─── Completions (legacy) ────────────────────────────────
@@ -2649,6 +2894,121 @@ mod tests {
         for free in ["Here", "\n```python", "<tool_call>", "</think>"] {
             assert!(!may_open_think(free), "{free:?}");
         }
+    }
+
+    #[test]
+    fn think_stream_releases_reasoning_then_answer() {
+        let mut stream = ThinkStream::new(true, false);
+        let mut reasoning = String::new();
+        let mut answer = String::new();
+        // Both markers split across decoded tokens.
+        for token in ["<th", "ink>plan t", "he step", "s\n</th", "ink>Hello", "!"] {
+            let release = stream.push(token);
+            reasoning += release.reasoning.as_deref().unwrap_or("");
+            answer += release.content.as_deref().unwrap_or("");
+        }
+        assert_eq!(reasoning, "plan the steps\n");
+        assert_eq!(answer, "Hello!");
+    }
+
+    #[test]
+    fn think_stream_answer_without_a_block_never_waits() {
+        let mut stream = ThinkStream::new(true, false);
+        assert_eq!(stream.push("Sure").content.as_deref(), Some("Sure"));
+        assert_eq!(stream.push(" thing").content.as_deref(), Some(" thing"));
+        assert_eq!(stream.finish(), ThinkRelease::default());
+    }
+
+    #[test]
+    fn think_stream_prefilled_opener_starts_in_reasoning() {
+        let mut stream = ThinkStream::new(true, true);
+        assert_eq!(stream.push("\nprivate").reasoning.as_deref(), Some("private"));
+        let release = stream.push("</think>public");
+        assert_eq!(release.reasoning, None);
+        assert_eq!(release.content.as_deref(), Some("public"));
+        assert_eq!(stream.push(" tail").content.as_deref(), Some(" tail"));
+    }
+
+    #[test]
+    fn think_stream_unclosed_block_ships_reasoning_at_finish() {
+        let mut stream = ThinkStream::new(true, false);
+        assert_eq!(stream.push("<think>thin").reasoning.as_deref(), Some("thin"));
+        // A closer split across tokens stays held, then ships as reasoning.
+        assert_eq!(stream.push("</th").reasoning, None);
+        let release = stream.finish();
+        assert_eq!(release.reasoning.as_deref(), Some("</th"));
+        assert_eq!(release.content, None);
+    }
+
+    #[test]
+    fn think_stream_thinking_disabled_stays_private() {
+        // A prefilled empty block strips to nothing.
+        let mut stream = ThinkStream::new(false, false);
+        assert_eq!(stream.push("</think>Hello").content.as_deref(), Some("Hello"));
+        // An unterminated block never reaches the client.
+        let mut stream = ThinkStream::new(false, false);
+        let _ = stream.push("<think>private");
+        assert_eq!(stream.finish(), ThinkRelease::default());
+    }
+
+    #[test]
+    fn think_stream_drops_newlines_leading_the_answer() {
+        // The closer arrives alone, the newlines in the next token: the
+        // stream starts the answer where the non-streaming split does.
+        let mut stream = ThinkStream::new(true, true);
+        assert_eq!(stream.push("plan").reasoning.as_deref(), Some("plan"));
+        assert_eq!(stream.push("</think>"), ThinkRelease::default());
+        assert_eq!(stream.push("\n\n"), ThinkRelease::default());
+        assert_eq!(stream.push("\nHi").content.as_deref(), Some("Hi"));
+        assert_eq!(stream.push("\n\nmore").content.as_deref(), Some("\n\nmore"));
+        // The same for the disabled-thinking strip of a prefilled empty block.
+        let mut stream = ThinkStream::new(false, false);
+        assert_eq!(stream.push("</think>"), ThinkRelease::default());
+        assert_eq!(stream.push("\n\nOk").content.as_deref(), Some("Ok"));
+    }
+
+    #[test]
+    fn think_stream_inline_keeps_thinking_in_content() {
+        // A template-opened block: the opener comes back with the first token.
+        let mut stream = ThinkStream::inline(true);
+        assert_eq!(stream.push("\nplan").content.as_deref(), Some("<think>\nplan"));
+        let release = stream.push("</think>Hi");
+        assert_eq!(release.reasoning, None);
+        assert_eq!(release.content.as_deref(), Some("</think>Hi"));
+        assert_eq!(stream.finish(), ThinkRelease::default());
+        // A reply that opens its own block passes through untouched.
+        let mut stream = ThinkStream::inline(false);
+        assert_eq!(stream.push("<think>x").content.as_deref(), Some("<think>x"));
+    }
+
+    #[test]
+    fn reasoning_format_none_selects_inline() {
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "reasoning_format": "none"
+        }))
+        .unwrap();
+        assert!(req.reasoning_inline());
+        let req: ChatCompletionsRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        assert!(!req.reasoning_inline());
+    }
+
+    #[test]
+    fn split_think_reply_routes_block_and_answer() {
+        let (plain, calls, reasoning) =
+            split_think_reply("<think>\nreason it\n</think>\nAnswer.", None);
+        assert_eq!(reasoning.as_deref(), Some("reason it\n"));
+        assert_eq!(plain, "Answer.");
+        assert!(calls.is_empty());
+
+        let (_, _, reasoning) = split_think_reply("<think>never closed", None);
+        assert_eq!(reasoning.as_deref(), Some("never closed"));
+
+        let (plain, _, reasoning) = split_think_reply("Just an answer.", None);
+        assert_eq!(plain, "Just an answer.");
+        assert_eq!(reasoning, None);
     }
 
     #[test]
