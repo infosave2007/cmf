@@ -351,6 +351,7 @@ pub(crate) fn bucket_count(n_exp: usize, has_shared: bool) -> Option<usize> {
 pub(crate) fn moeg_wgsl() -> String {
     let mut gu_init = String::new();
     let mut gu_body = String::new();
+    let mut gu_body_q2 = String::new();
     let mut gu_out = String::new();
     let mut dn_init = String::new();
     let mut dn_body = String::new();
@@ -361,6 +362,9 @@ pub(crate) fn moeg_wgsl() -> String {
         ));
         gu_body.push_str(&format!(
             "        {{ let xo = t{j} + gx;\n          let x0 = gg_x[xo]; let x1 = gg_x[xo + 1u]; let x2 = gg_x[xo + 2u]; let x3 = gg_x[xo + 3u];\n          let x4 = gg_x[xo + 4u]; let x5 = gg_x[xo + 5u]; let x6 = gg_x[xo + 6u]; let x7 = gg_x[xo + 7u];\n          ag{j} = ag{j} + sg * m4_d32(wg, x0, x1, x2, x3, x4, x5, x6, x7);\n          au{j} = au{j} + su * m4_d32(wu, x0, x1, x2, x3, x4, x5, x6, x7); }}\n"
+        ));
+        gu_body_q2.push_str(&format!(
+            "        {{ let xo = t{j} + gx;\n          let x0 = gg_x[xo]; let x1 = gg_x[xo + 1u]; let x2 = gg_x[xo + 2u]; let x3 = gg_x[xo + 3u];\n          let x4 = gg_x[xo + 4u]; let x5 = gg_x[xo + 5u]; let x6 = gg_x[xo + 6u]; let x7 = gg_x[xo + 7u];\n          ag{j} = ag{j} + sg * (q2_d16(wg0, x0, x1, x2, x3) + q2_d16(wg1, x4, x5, x6, x7));\n          au{j} = au{j} + su * (q2_d16(wu0, x0, x1, x2, x3) + q2_d16(wu1, x4, x5, x6, x7)); }}\n"
         ));
         gu_out.push_str(&format!(
             "    if ({j}u < nt) {{ gg_act[e{j} * rows + row] = (ag{j} / (1.0 + exp(-ag{j}))) * au{j}; }}\n"
@@ -377,6 +381,7 @@ pub(crate) fn moeg_wgsl() -> String {
     }
     MOEG_WGSL_T
         .replace("{GU_INIT}", &gu_init)
+        .replace("{GU_BODY_Q2}", &gu_body_q2)
         .replace("{GU_BODY}", &gu_body)
         .replace("{GU_OUT}", &gu_out)
         .replace("{DN_INIT}", &dn_init)
@@ -510,6 +515,64 @@ fn moeg_gu(@builtin(workgroup_id) wid: vec3<u32>,
         let wu = gg_uw4[wb + g];
         let gx = g * 8u;
 {GU_BODY}
+    }
+{GU_OUT}
+}
+
+// ── q2tp gate+up+SiLU (the mixed profile's 2-bit gate/up, down q4tp):
+// moeg_gu over the q2tp layout — a group is two u32 words of sixteen 2-bit
+// weights, the weight plane half q4tp's, rung 0 the format's exact zero ──
+fn q2_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> f32 {
+    return (f32(w & 3u) - 1.5) * a.x
+         + (f32((w >> 2u) & 3u) - 1.5) * a.y
+         + (f32((w >> 4u) & 3u) - 1.5) * a.z
+         + (f32((w >> 6u) & 3u) - 1.5) * a.w
+         + (f32((w >> 8u) & 3u) - 1.5) * b.x
+         + (f32((w >> 10u) & 3u) - 1.5) * b.y
+         + (f32((w >> 12u) & 3u) - 1.5) * b.z
+         + (f32((w >> 14u) & 3u) - 1.5) * b.w
+         + (f32((w >> 16u) & 3u) - 1.5) * c.x
+         + (f32((w >> 18u) & 3u) - 1.5) * c.y
+         + (f32((w >> 20u) & 3u) - 1.5) * c.z
+         + (f32((w >> 22u) & 3u) - 1.5) * c.w
+         + (f32((w >> 24u) & 3u) - 1.5) * d.x
+         + (f32((w >> 26u) & 3u) - 1.5) * d.y
+         + (f32((w >> 28u) & 3u) - 1.5) * d.z
+         + (f32((w >> 30u) & 3u) - 1.5) * d.w;
+}
+@compute @workgroup_size(64)
+fn moeg_gu_q2(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let ex = wid.y;
+    let beg = gg_off[ex] + wid.z * {NT}u;
+    let end = min(gg_off[ex + 1u], beg + {NT}u);
+    if (beg >= end) { return; }
+    let nt = end - beg;
+    let gpr = gg_p.gpr;
+    let rows = gg_p.inter;
+    let row = wid.x * 64u + lid;
+    if (row >= rows) { return; }
+    let base16 = ex * gg_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let parw = (base16 >> 1u) + rows * gpr * 2u + row;
+    let gl = unpack2x16float(gg_gw[parw]);
+    let ul = unpack2x16float(gg_uw[parw]);
+    let cod0 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+    let wb = (base16 >> 1u) + row * gpr * 2u;
+{GU_INIT}
+    for (var g = 0u; g < gpr; g = g + 1u) {
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cgv = gg_gc(cb, shf);
+        let cuv = gg_uc(cb, shf);
+        let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+        let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+        let wo = wb + g * 2u;
+        let wg0 = gg_gw[wo]; let wg1 = gg_gw[wo + 1u];
+        let wu0 = gg_uw[wo]; let wu1 = gg_uw[wo + 1u];
+        let gx = g * 8u;
+{GU_BODY_Q2}
     }
 {GU_OUT}
 }
@@ -1330,6 +1393,10 @@ pub(crate) struct Prefill {
     pub(crate) dn_l: wgpu::BindGroupLayout,
     pub(crate) sum: wgpu::ComputePipeline,
     pub(crate) sum_l: wgpu::BindGroupLayout,
+    /// `moeg_gu_q2`: the q2tp gate/up of the mixed profile (its layout has
+    /// no vec4 weight bindings 2 and 3).
+    pub(crate) gu_q2: wgpu::ComputePipeline,
+    pub(crate) gu_q2_l: wgpu::BindGroupLayout,
 }
 
 pub(crate) struct Pipes {
@@ -1492,6 +1559,7 @@ fn build_prefill(c: &Ctx) -> Option<Prefill> {
             })
     };
     let (group, gu, dn, sum) = (pipe("moeg_group"), pipe("moeg_gu"), pipe("moeg_dn"), pipe("moeg_sum"));
+    let gu_q2 = pipe("moeg_gu_q2");
     if let Some(e) = pollster::block_on(scope.pop()) {
         tracing::warn!("cmf-moeg module rejected ({e}): batch MoE keeps the per-token kernels");
         return None;
@@ -1501,10 +1569,12 @@ fn build_prefill(c: &Ctx) -> Option<Prefill> {
         gu_l: gu.get_bind_group_layout(0),
         dn_l: dn.get_bind_group_layout(0),
         sum_l: sum.get_bind_group_layout(0),
+        gu_q2_l: gu_q2.get_bind_group_layout(0),
         group,
         gu,
         dn,
         sum,
+        gu_q2,
     })
 }
 

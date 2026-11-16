@@ -216,6 +216,14 @@ pub(super) struct HFuncs {
     mhc_route: cs::CUfunction,
     mhc_logits: cs::CUfunction,
     mhc_merge: cs::CUfunction,
+    mhc_route4: cs::CUfunction,
+    dsa_put: cs::CUfunction,
+    dsa_pool: cs::CUfunction,
+    dsa_score: cs::CUfunction,
+    dsa_select: cs::CUfunction,
+    dsa_qlat: cs::CUfunction,
+    dsa_attn: cs::CUfunction,
+    dsa_out: cs::CUfunction,
     prism_p: cs::CUfunction,
     prism_h: cs::CUfunction,
     qk: cs::CUfunction,
@@ -330,6 +338,14 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         mhc_route: func(module, "hy_mhc_route")?,
         mhc_logits: func(module, "hy_mhc_logits")?,
         mhc_merge: func(module, "hy_mhc_merge")?,
+        mhc_route4: func(module, "hy_mhc_route_v4")?,
+        dsa_put: func(module, "hy_dsa_put")?,
+        dsa_pool: func(module, "hy_dsa_pool")?,
+        dsa_score: func(module, "hy_dsa_score")?,
+        dsa_select: func(module, "hy_dsa_select")?,
+        dsa_qlat: func(module, "hy_dsa_qlat")?,
+        dsa_attn: func(module, "hy_dsa_attn")?,
+        dsa_out: func(module, "hy_dsa_out")?,
         expand_q4g: func(module, "hy_expand_q4gr")?,
         expand_q2: func(module, "hy_expand_q2r")?,
         prism_p: func(module, "hy_prism_p")?,
@@ -1079,6 +1095,16 @@ impl HostArena {
 /// would end in the OOM killer instead of a declined plan.
 fn host_room() -> usize {
     let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    if pinned_outside_limit() {
+        // the driver's page-locked blocks are not the container's pages
+        let mut room = u64::MAX;
+        if let Ok(mi) = std::fs::read_to_string("/proc/meminfo") {
+            if let Some(kb) = mi.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()) {
+                room = kb << 10;
+            }
+        }
+        return room.min(usize::MAX as u64) as usize;
+    }
     // the file cache in the usage (the model's own mapped pages among it) gives way
     let cache = |p: &str, keys: &[&str]| -> u64 {
         std::fs::read_to_string(p)
@@ -1108,6 +1134,52 @@ fn host_room() -> usize {
         }
     }
     room.min(usize::MAX as u64) as usize
+}
+
+/// The container's memory usage (cgroup v2, else v1), when it has a limit.
+fn cgroup_usage() -> Option<u64> {
+    let num = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    if num("/sys/fs/cgroup/memory.max").is_some_and(|l| l < 1 << 60) {
+        return num("/sys/fs/cgroup/memory.current");
+    }
+    if num("/sys/fs/cgroup/memory/memory.limit_in_bytes").is_some_and(|l| l < 1 << 60) {
+        return num("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    }
+    None
+}
+
+/// Whether the driver's page-locked host memory (`cuMemHostAlloc`) stays
+/// outside the container's memory limit, as its GPU-visible system memory
+/// does under Vulkan: 256 MB allocated and written, the container's usage
+/// read before and after (it grows by under a quarter of it). Then the
+/// host's room is MemAvailable, not the limit, and the RAM tier can hold
+/// every expert of a file larger than the container. False outside a
+/// container (the room is MemAvailable anyway) and whenever the probe
+/// cannot run; `CMF_HYB_PINNED_PROBE=0` skips it. Measured once.
+fn pinned_outside_limit() -> bool {
+    static OUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OUT.get_or_init(|| {
+        if std::env::var("CMF_HYB_PINNED_PROBE").as_deref() == Ok("0") {
+            return false;
+        }
+        let Some(before) = cgroup_usage() else { return false };
+        const PROBE: usize = 256 << 20;
+        let Ok(a) = HostArena::new(PROBE) else { return false };
+        let Some(h) = a.host_mut(0, PROBE) else { return false };
+        for p in h.chunks_mut(4096) {
+            p[0] = 1;
+        }
+        let after = cgroup_usage().unwrap_or(u64::MAX);
+        drop(a);
+        let grew = after.saturating_sub(before);
+        let out = grew < (PROBE as u64) / 4;
+        tracing::info!(
+            "cuda hybrid: page-locked host memory {} the container's limit (+{} MB for a 256 MB probe)",
+            if out { "falls outside" } else { "counts against" },
+            grew >> 20
+        );
+        out
+    })
 }
 
 /// The card memory a matrix takes: none when it lives in a plan's mapped
@@ -1929,6 +2001,67 @@ struct MlaL {
     /// A low-rank query (GLM-5.3, DeepSeek): `ms_in` writes q_a's rows,
     /// their norm goes to planes, and q_b over them gives the heads.
     qa: Option<MlaQa>,
+    /// GLM-5.3's DSA indexer: past `topk` positions the layer attends to
+    /// the positions it selects, in the absorbed form.
+    dsa: Option<DsaL>,
+}
+
+/// A DSA layer's indexer (`GraphDsa`): the index query over q_a's normed
+/// planes (`ms_iq`), the index key, pool gate and head weights over the
+/// layer input (`ms_x`, one row of `[key | gate | weights]` a call row), the
+/// key's LayerNorm, the pools' position embedding and kv_b in f32.
+struct DsaL {
+    ms_iq: MmaSet,
+    ms_x: MmaSet,
+    k_norm: Arc<Buf>,
+    k_bias: Arc<Buf>,
+    ape: Arc<Buf>,
+    wkv: Arc<Buf>,
+    ih: usize,
+    id: usize,
+    topk: usize,
+    kp: usize,
+}
+
+/// The plan's DSA rows: the index queries, the `[key | gate | weights]`
+/// rows, a row's latent query and mixture (every head), its selection and
+/// its count.
+struct DsaBufs {
+    iq: Buf,
+    xk: Buf,
+    xstride: usize,
+    qlat: Buf,
+    olat: Buf,
+    sel: Buf,
+    nsel: Buf,
+}
+
+/// A DSA layer's caches on the card (by sequence and layer): a position's
+/// normed latent, normed index key and pool gate, the pools' keys and a
+/// row's pool scores; `cap` positions, grown by doubling.
+struct DsaState {
+    lat: Buf,
+    ikc: Buf,
+    gtc: Buf,
+    pooled: Buf,
+    sc: Buf,
+    cap: usize,
+    next_pos: usize,
+    bytes: u64,
+}
+
+/// One call's DSA inputs of a layer (`Book::dsa`): whether the call is past
+/// `topk` (the selected positions instead of the mirror), its first row's
+/// position and the caches.
+#[derive(Clone, Copy)]
+struct DsaCall {
+    mode: bool,
+    pos0: usize,
+    lat: u64,
+    ikc: u64,
+    gtc: u64,
+    pooled: u64,
+    sc: u64,
 }
 
 /// MLA's low-rank query: q_a `[rank × hidden]`, its norm, and q_b
@@ -1993,6 +2126,9 @@ struct MhcL {
     out: usize,
     enter: bool,
     leave: bool,
+    /// DeepSeek-V4's form (GLM-5.3, `hy_mhc_route_v4`): the attention's and
+    /// the FFN's group scales and the Sinkhorn epsilon.
+    v4: Option<([f32; 3], [f32; 3], f32)>,
 }
 
 /// The stack's mHC streams: their count, Sinkhorn iterations, branch scale,
@@ -2001,6 +2137,8 @@ struct MhcPlan {
     ns: usize,
     iters: usize,
     pre_scale: f32,
+    /// The router input's RMS epsilon (SenseNova-Loop 1e-6, GLM its norm's).
+    rms_eps: f32,
     r: Buf,
     coef: Buf,
     /// The router's logits [row][24] (`hy_mhc_logits`).
@@ -2105,7 +2243,28 @@ pub(super) struct ExpertStream {
     loads: u64,
     hits: u64,
     load_ns: u64,
+    /// Builds that were one copy of a packed tier slot.
+    packed: u64,
+    /// Page-locked staging for job table writes (`put_jobs`): each write an
+    /// asynchronous copy from its own entry instead of a copy and a wait for
+    /// the whole card; the ring wraps only after the stream drained.
+    ring: Option<HostArena>,
+    ring_at: usize,
+    /// Builds that may still copy their layout back into the tier (a staged
+    /// chunk's: only the ranks the layer keeps; usize::MAX otherwise).
+    pack_left: usize,
+    /// The stream those writes are queued on (`CUstream`), while any may be
+    /// pending: a whole-table write or a table's release waits for it.
+    ring_stream: usize,
+    /// The small path's prompt chunks so far (calls of more slots than one
+    /// row picks): their picks and how many of them were built
+    /// (`stream_stageable` stages the next ones when most were).
+    sm_seen: u64,
+    sm_built: u64,
 }
+
+/// Job writes the ring holds between two waits.
+const JOB_RING: usize = 16384;
 
 /// Raw bytes of routed experts in page-locked host memory (`HostArena`), the
 /// least recently used giving way: a slot build reads them at the bus's DMA
@@ -2119,24 +2278,58 @@ struct RamTier {
     at: HashMap<(usize, usize), usize>,
     hits: u64,
     fills: u64,
+    /// Tier slots holding the card's built layout instead of the raw bytes
+    /// (copied back after an expert's first build): its jobs relative to the
+    /// card slot (`rel_job`) and the bytes to copy. Their next build is one
+    /// DMA copy instead of a repack with its waits.
+    packed: HashMap<usize, (HyJob, HyJob, usize)>,
 }
 
-/// The RAM tier for a stream: up to half the host's room (the container's
-/// limit; what is pinned already counted), at most `cap` bytes, a slot the
+/// Whether a built expert's card layout goes back into its RAM tier slot
+/// (`CMF_HYB_TIER_PACK=0`: every build repacks the raw bytes).
+fn tier_pack_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_TIER_PACK").as_deref() != Ok("0"))
+}
+
+/// A job's weight pointers relative to its card slot at `base` (none: MAX).
+fn rel_job(j: HyJob, base: u64) -> HyJob {
+    let f = |p: u64| if p == 0 { u64::MAX } else { p - base };
+    HyJob { w: f(j.w), aux0: f(j.aux0), aux1: f(j.aux1), ..j }
+}
+
+/// `rel_job` placed at the card slot `base`.
+fn at_job(j: HyJob, base: u64) -> HyJob {
+    let f = |p: u64| if p == u64::MAX { 0 } else { p + base };
+    HyJob { w: f(j.w), aux0: f(j.aux0), aux1: f(j.aux1), ..j }
+}
+
+/// The RAM tier for a stream: every expert when they fit three quarters of the
+/// host's room (the container's limit; what is pinned already counted), else
+/// up to half of it, at most `cap` bytes, a slot the
 /// widest raw expert of `experts` (one layer's). None when off or too small.
 fn ram_tier(model: &CmfModel, experts: &[(usize, usize, usize)], cap: usize) -> Option<RamTier> {
     if std::env::var("CMF_HYB_RAM_TIER").as_deref() == Ok("0") {
         return None;
     }
     let raw = |i: usize| model.tensors.get(i).map_or(0, |t| (t.nbytes as usize).next_multiple_of(256));
-    let slot = experts.iter().map(|&(g, u, d)| raw(g) + raw(u) + raw(d)).max()? + 4096;
-    let n = (host_room() / 2).min(cap) / slot;
+    // room for the card's built layout too (its rung codes a byte each, the
+    // ladders in f32, the planes aligned): `packed`
+    let widest = experts.iter().map(|&(g, u, d)| raw(g) + raw(u) + raw(d)).max()?;
+    let slot = (widest + widest / 16 + 65536).next_multiple_of(4096);
+    // `cap` bytes of raw experts: as many slots as experts that size; all
+    // of them when they fit three quarters of the room (the system-memory
+    // banks' share under Vulkan: the mapping's pages of them are then never
+    // read again), else half the room, the rest left to the page cache
+    let want = if cap == usize::MAX { usize::MAX } else { cap.div_ceil(widest.max(1)) };
+    let room = host_room();
+    let n = if want.saturating_mul(slot) <= room / 4 * 3 { want } else { (room / 2 / slot).min(want) };
     if n < 64 {
         return None;
     }
     let arena = HostArena::new(n * slot).ok()?;
     tracing::info!("cuda hybrid: RAM tier of {n} experts ({:.1} GB) in page-locked host memory", (n * slot) as f64 / 1e9);
-    Some(RamTier { arena, slot, owner: vec![None; n], last: vec![0; n], at: HashMap::new(), hits: 0, fills: 0 })
+    Some(RamTier { arena, slot, owner: vec![None; n], last: vec![0; n], at: HashMap::new(), hits: 0, fills: 0, packed: HashMap::new() })
 }
 
 /// The host threads that copy a layer's missing experts into the RAM tier
@@ -2154,6 +2347,13 @@ fn fill_pool() -> &'static crate::pool::Pool {
 }
 
 impl RamTier {
+    /// Expert `e` of stream layer `li` the first to give way, when held.
+    fn demote(&mut self, li: usize, e: usize) {
+        if let Some(&s) = self.at.get(&(li, e)) {
+            self.last[s] = 1;
+        }
+    }
+
     /// The experts `want` of stream layer `li` copied into the tier at once,
     /// on `fill_pool`'s threads: a copy is a page-cache read of a few MB, most
     /// of a build from the mapping (3.8 ms a build, 83% of a 512-token
@@ -2183,6 +2383,7 @@ impl RamTier {
             if let Some(old) = self.owner[s].take() {
                 self.at.remove(&old);
             }
+            self.packed.remove(&s);
             self.owner[s] = Some((li, e));
             self.at.insert((li, e), s);
             self.last[s] = tick;
@@ -2223,10 +2424,12 @@ impl RamTier {
                 s
             }
             None => {
-                let s = (0..self.owner.len()).min_by_key(|&s| (self.owner[s].is_some(), self.last[s]))?;
+                // never a slot of this call: a queued copy may still read it
+                let s = (0..self.owner.len()).filter(|&s| self.last[s] != tick).min_by_key(|&s| (self.owner[s].is_some(), self.last[s]))?;
                 if let Some(old) = self.owner[s].take() {
                     self.at.remove(&old);
                 }
+                self.packed.remove(&s);
                 let mut off = s * self.slot;
                 for (k, &i) in [ids.0, ids.1, ids.2].iter().enumerate() {
                     let src = model.entry_bytes(model.tensors.get(i)?);
@@ -2274,6 +2477,84 @@ impl ExpertStream {
         self.owner.len()
     }
 
+    /// Every routed expert into the RAM tier at load, in its card layout
+    /// (built once into a slot and copied back), when the tier holds them
+    /// all: what the Vulkan graph does with its system-memory banks. A
+    /// prompt's and a token's misses are then one DMA copy each, never a
+    /// page-cache read and a repack with its waits (Ornith-122B q4tp's
+    /// 512-token prompt within the A40: 10.3 s, Vulkan 5.4 s with its banks
+    /// filled at load). `CMF_HYB_TIER_PREPACK=0`: filled as picks come.
+    fn prepack(&mut self, c: &Ctx, fx: &HFuncs) -> Res<()> {
+        let total: usize = self.layers.iter().map(|l| l.fixed.iter().filter(|f| f.is_none()).count()).sum();
+        let Some(r) = self.ram.as_ref() else { return Ok(()) };
+        if r.owner.len() < total || !tier_pack_on() || std::env::var("CMF_HYB_TIER_PREPACK").as_deref() == Ok("0") {
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        let fills = r.fills;
+        for li in 0..self.layers.len() {
+            self.tick += 1;
+            let want: Vec<(usize, (usize, usize, usize))> =
+                self.layers[li].experts.iter().copied().enumerate().filter(|&(e, _)| self.layers[li].fixed[e].is_none()).collect();
+            let tick = self.tick;
+            if let Some(r) = self.ram.as_mut() {
+                r.fill_many(&self.model, li, &want, tick);
+            }
+            for &(e, _) in &want {
+                // a fresh tick an expert: a layer wider than the slots builds too
+                self.tick += 1;
+                self.pack_left = usize::MAX;
+                let packed = self.ram.as_ref().is_some_and(|r| r.at.get(&(li, e)).is_some_and(|t| r.packed.contains_key(t)));
+                match self.layers[li].slot_of[e] {
+                    Some(_) if packed => {}
+                    // built before the tier held it: built again so it packs
+                    Some(s) => {
+                        self.ensure_rebuild(c, fx, li, e, s)?;
+                    }
+                    None => {
+                        self.ensure(c, fx, li, e)?;
+                    }
+                }
+            }
+        }
+        c.sync()?;
+        let (packed, filled) = self.ram.as_ref().map_or((0, 0), |r| (r.packed.len(), r.fills - fills));
+        if let Some(r) = self.ram.as_mut() {
+            r.hits = 0;
+        }
+        (self.loads, self.load_ns, self.packed) = (0, 0, 0);
+        tracing::info!(
+            "cuda hybrid: RAM tier filled at load: {packed} of {total} experts in their card layout ({filled} read from the file) in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Expert `e` of layer `li`, already in slot `s`, built again from the
+    /// RAM tier and its layout copied back (`prepack`).
+    fn ensure_rebuild(&mut self, c: &Ctx, fx: &HFuncs, li: usize, e: usize, s: usize) -> Res<(HyJob, HyJob)> {
+        let ids = self.layers[li].experts[e];
+        let tick = self.tick;
+        let raw = match self.ram.as_mut() {
+            Some(r) => r.get(&self.model, li, e, ids, tick),
+            None => None,
+        };
+        let Some(raw) = raw else { return Ok(self.jobs[s]) };
+        let base = self.pool.ptr + (s * self.slot) as u64;
+        let (jobs, used) = self.build(c, fx, li, e, s, Some(raw))?;
+        if let (Some(t), Some(r)) = (self.ram.as_ref().and_then(|r| r.at.get(&(li, e)).copied()), self.ram.as_mut()) {
+            if used > 0 && used <= r.slot {
+                if let Some(dst) = r.arena.host_mut(t * r.slot, used) {
+                    unsafe { cu::memcpy_dtoh_async(dst, base, c.stream).map_err(derr)? };
+                    r.packed.insert(t, (rel_job(jobs.0, base), rel_job(jobs.1, base), used));
+                }
+            }
+        }
+        self.jobs[s] = jobs;
+        self.put_jobs(c, li, e, jobs.0, jobs.1)?;
+        Ok(jobs)
+    }
+
     /// The slot a weight pointer lies in.
     fn slot_at(&self, w: u64) -> Option<usize> {
         let end = self.pool.ptr + (self.slots() * self.slot) as u64;
@@ -2282,7 +2563,7 @@ impl ExpertStream {
 
     /// Expert `e` of stream layer `li` built into slot `s` from the file:
     /// the plan arena pointed at the slot, so the repack's planes land there.
-    fn build(&self, c: &Ctx, fx: &HFuncs, li: usize, e: usize, s: usize, raw: Option<[(usize, usize); 3]>) -> Res<(HyJob, HyJob)> {
+    fn build(&self, c: &Ctx, fx: &HFuncs, li: usize, e: usize, s: usize, raw: Option<[(usize, usize); 3]>) -> Res<((HyJob, HyJob), usize)> {
         let l = &self.layers[li];
         let (g, u, d) = l.experts[e];
         let gw6 = |idx: usize| GraphW { idx, kind: 6, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false };
@@ -2308,6 +2589,7 @@ impl ExpertStream {
             let dm = one_dev(c, fx, &self.model, &gw6(d), l.hidden, l.inter, tier(2))?;
             Ok((pm, dm))
         })();
+        let used = ARENA.with(|x| x.get().2);
         ARENA.with(|x| x.set(saved.0));
         ARENA_HOST.with(|x| x.set(saved.1));
         ARENA_EXP_DEV.with(|x| x.set(saved.2));
@@ -2333,7 +2615,7 @@ impl ExpertStream {
             lim,
             pad: [0; 3],
         };
-        Ok((job(&pm, 2 * l.inter, pm.kind as i32 | 0x100 | l.act.0, l.act.1), job(&dm, l.hidden, dm.kind as i32, 0.0)))
+        Ok(((job(&pm, 2 * l.inter, pm.kind as i32 | 0x100 | l.act.0, l.act.1), job(&dm, l.hidden, dm.kind as i32, 0.0)), used))
     }
 
     /// Expert `e` of layer `li` on the card: its slot's jobs, built into a
@@ -2354,7 +2636,7 @@ impl ExpertStream {
             let (mut mg, mut md) = l.marker;
             mg.pad[0] = e2 as i32 + 1;
             md.pad[0] = e2 as i32 + 1;
-            l.put(e2, mg, md)?;
+            self.put_jobs(c, l2, e2, mg, md)?;
         }
         let t = std::time::Instant::now();
         let ids = self.layers[li].experts[e];
@@ -2363,21 +2645,87 @@ impl ExpertStream {
             Some(r) => r.get(&self.model, li, e, ids, tick),
             None => None,
         };
-        let jobs = self.build(c, fx, li, e, s, raw)?;
+        let base = self.pool.ptr + (s * self.slot) as u64;
+        // the tier slot holding it, and its built layout when copied back
+        let ts = self.ram.as_ref().filter(|_| raw.is_some() && tier_pack_on()).and_then(|r| r.at.get(&(li, e)).copied());
+        let packed = ts.and_then(|t| self.ram.as_ref().and_then(|r| r.packed.get(&t).copied()));
+        let jobs = match (ts, packed) {
+            (Some(t), Some((jg, jd, used))) => {
+                let r = self.ram.as_ref().ok_or("expert stream: no RAM tier")?;
+                let src = r.arena.host_mut(t * r.slot, used).ok_or("expert stream: a packed tier slot past its block")?;
+                // page-locked: the copy queues behind the work so far, no wait
+                unsafe { cu::memcpy_htod_async(base, &*src, c.stream).map_err(derr)? };
+                self.packed += 1;
+                (at_job(jg, base), at_job(jd, base))
+            }
+            _ => {
+                let (jobs, used) = self.build(c, fx, li, e, s, raw)?;
+                // the built layout back into the tier slot for the next time
+                let pack = self.pack_left > 0;
+                self.pack_left = self.pack_left.saturating_sub(1);
+                if let (Some(t), Some(r), true) = (ts, self.ram.as_mut(), pack) {
+                    if used > 0 && used <= r.slot {
+                        if let Some(dst) = r.arena.host_mut(t * r.slot, used) {
+                            unsafe { cu::memcpy_dtoh_async(dst, base, c.stream).map_err(derr)? };
+                            r.packed.insert(t, (rel_job(jobs.0, base), rel_job(jobs.1, base), used));
+                        }
+                    }
+                }
+                jobs
+            }
+        };
         self.load_ns += t.elapsed().as_nanos() as u64;
         self.loads += 1;
         self.owner[s] = Some((li, e));
         self.jobs[s] = jobs;
         self.last[s] = self.tick;
-        let l = &mut self.layers[li];
-        l.slot_of[e] = Some(s);
-        l.put(e, jobs.0, jobs.1)?;
+        self.layers[li].slot_of[e] = Some(s);
+        self.put_jobs(c, li, e, jobs.0, jobs.1)?;
         Ok(jobs)
+    }
+
+    /// Expert `e`'s jobs into every plan's tables of layer `li`: queued
+    /// copies from the page-locked ring (the stream drained and the ring
+    /// rewound when full); without a ring, `StreamLayer::put`'s waits.
+    fn put_jobs(&mut self, c: &Ctx, li: usize, e: usize, g: HyJob, d: HyJob) -> Res<()> {
+        let sz = std::mem::size_of::<HyJob>();
+        let need = 2 * self.layers[li].tables.len();
+        if self.ring.is_none() || need > JOB_RING {
+            return self.layers[li].put(e, g, d);
+        }
+        if self.ring_at + need > JOB_RING {
+            c.sync()?;
+            self.ring_at = 0;
+        }
+        let at = (e * sz) as u64;
+        let ring = self.ring.as_ref().ok_or("expert stream: no job ring")?;
+        for &(gt, dt) in &self.layers[li].tables {
+            for (dst, j) in [(gt + at, g), (dt + at, d)] {
+                let slot = ring.host_mut(self.ring_at * sz, sz).ok_or("expert stream: job ring overrun")?;
+                // SAFETY: HyJob is repr(C) plain data
+                slot.copy_from_slice(unsafe { std::slice::from_raw_parts(&j as *const HyJob as *const u8, sz) });
+                unsafe { cu::memcpy_htod_async(dst, &*slot, c.stream).map_err(derr)? };
+                self.ring_at += 1;
+            }
+        }
+        self.ring_stream = c.stream as usize;
+        Ok(())
+    }
+
+    /// Every queued job write done (before a table is written whole or released).
+    fn drain_jobs(&mut self) -> Res<()> {
+        if self.ring_stream != 0 {
+            unsafe { cu::stream::synchronize(self.ring_stream as cs::CUstream) }.map_err(derr)?;
+            self.ring_stream = 0;
+            self.ring_at = 0;
+        }
+        Ok(())
     }
 
     /// A plan's job tables for layer `li` joined to the stream, written
     /// whole: the resident experts' jobs, the markers for the rest.
     fn register(&mut self, li: usize, gu_t: u64, dn_t: u64) -> Res<()> {
+        self.drain_jobs()?;
         let l = &self.layers[li];
         let mark = |j: HyJob, e: usize| HyJob { pad: [e as i32 + 1, 0, 0], ..j };
         let (tg, td): (Vec<HyJob>, Vec<HyJob>) = (0..l.experts.len())
@@ -2416,6 +2764,8 @@ impl Drop for MoeL {
         if let Some((li, cell)) = &self.stream {
             if let Ok(mut g) = cell.lock() {
                 if let Some(es) = g.as_mut() {
+                    // no queued job write may land in the freed tables
+                    let _ = es.drain_jobs();
                     let key = (self.gu_t.ptr, self.dn_t.ptr);
                     es.layers[*li].tables.retain(|&t| t != key);
                 }
@@ -2553,6 +2903,13 @@ pub(super) fn moe_row(
             index: HashMap::new(),
             ram: ram_tier(model, experts, usize::MAX),
             loads: 0,
+            packed: 0,
+            ring: HostArena::new(JOB_RING * std::mem::size_of::<HyJob>()).ok(),
+            ring_at: 0,
+            pack_left: usize::MAX,
+            ring_stream: 0,
+            sm_seen: 0,
+            sm_built: 0,
             hits: 0,
             load_ns: 0,
         };
@@ -2713,10 +3070,174 @@ fn stream_will_need(model: &CmfModel, l: &StreamLayer, picks: &[usize]) {
     let _ = (model, l, picks);
 }
 
+/// `MADV_COLD` over the three tensors of each expert in `picks`: their file
+/// pages the first the kernel reclaims (`CMF_HYB_STREAM_COLD=1`; off by
+/// default — MiMo-V2.6's staged prompt decoded at 5.8 tokens/s with it, 6.7
+/// without).
+fn stream_cold(model: &CmfModel, l: &StreamLayer, picks: &[usize]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("CMF_HYB_STREAM_COLD").as_deref() == Ok("1")) {
+            return;
+        }
+        const MADV_COLD: libc::c_int = 20;
+        let page = 4096usize;
+        for &e in picks {
+            let Some(&(g, u, d)) = l.experts.get(e) else { continue };
+            for idx in [g, u, d] {
+                let Some(entry) = model.tensors.get(idx) else { continue };
+                let b = model.entry_bytes(entry);
+                if b.is_empty() {
+                    continue;
+                }
+                let p = b.as_ptr() as usize;
+                let s = p & !(page - 1);
+                // SAFETY: a range inside the model's read-only mapping;
+                // MADV_COLD only reorders the reclaim lists (ignored where it
+                // does not apply).
+                unsafe {
+                    libc::madvise(s as *mut libc::c_void, p + b.len() - s, MADV_COLD);
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (model, l, picks);
+}
+
 /// After `hy_moe_select`: the call's slots read back, every pick of a
 /// streamed expert not on the card built into a slot, and the patched jobs
 /// written over the call's. A host round trip per routed layer — the price
 /// of experts past the card and the host's room.
+/// Whether the prompt path can take a streamed layer on the grouped path
+/// (its chunk's picks staged after the top-k): the pool holds every expert of
+/// it with room to spare, and either the streamed experts are at most twice
+/// the host's room — past that a staged chunk reads every layer's bank from
+/// the disk in turn and leaves the page cache the last layers' (MiMo-V2.6 on
+/// the 46 GB pod: 6.7 tokens/s after a staged prompt, 10.8 after the small
+/// path) — or the small path's prompt chunks so far built most of their
+/// picks: the router spreads them past the slots and every chunk rebuilds
+/// them (MiniMax-M3.1 on the whole A40: a 512-token prompt's first token in
+/// 363 s on the small path, 35 s staged, and decode 1.0 against 1.27
+/// tokens/s). The same expected spread (51 of 128 picks a 16-row chunk over
+/// 29 slots a layer; MiMo 102 of 256 over 57) gave MiMo 54 s, so the stream
+/// measures it. `CMF_HYB_STREAM_STAGE=0`: the small path a chunk at a time;
+/// `=1`: staged whatever the size.
+fn stream_stageable(m: &MoeL) -> bool {
+    let mode = std::env::var("CMF_HYB_STREAM_STAGE");
+    if mode.as_deref() == Ok("0") {
+        return false;
+    }
+    let Some((li, cell)) = &m.stream else { return false };
+    let Ok(g) = cell.lock() else { return false };
+    let Some(es) = g.as_ref() else { return false };
+    if !es.layers.get(*li).is_some_and(|l| es.slots() >= l.experts.len() + l.experts.len() / 2) {
+        return false;
+    }
+    if mode.as_deref() == Ok("1") {
+        return true;
+    }
+    // the host's room as the stream found it: what is left plus its RAM tier
+    static ROOM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let room = *ROOM.get_or_init(|| host_room() + es.ram.as_ref().map_or(0, |r| r.owner.len() * r.slot));
+    let streamed: usize = es.layers.iter().map(|l| l.experts.len()).sum::<usize>().saturating_mul(es.slot);
+    if streamed <= room.saturating_mul(2) {
+        return true;
+    }
+    // the small path's chunks so far built most of their picks
+    if es.sm_seen >= 4096 && es.sm_built * 2 > es.sm_seen {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "cuda hybrid: prompt chunks staged: the small path built {} of {} picks",
+                es.sm_built,
+                es.sm_seen
+            )
+        });
+        return true;
+    }
+    if es.sm_seen >= 4096 {
+        static KEPT: std::sync::Once = std::sync::Once::new();
+        KEPT.call_once(|| tracing::info!("cuda hybrid: prompt chunks on the small path: it built {} of {} picks", es.sm_built, es.sm_seen));
+    }
+    false
+}
+
+/// A prompt chunk's streamed layer on the grouped path, after its top-k:
+/// the card's queued work done (the picks read back), then the chunk's
+/// picked experts `picked` on the card — the RAM tier filled for the
+/// missing ones at once, their builds — so its job tables hold them.
+unsafe fn stream_stage(c: &Ctx, fx: &HFuncs, m: &MoeL, picked: &[(usize, usize)]) -> Res<()> {
+    let Some((li, cell)) = &m.stream else { return Ok(()) };
+    let mut guard = cell.lock().map_err(|_| "expert stream poisoned")?;
+    let es = guard.as_mut().ok_or("expert stream not filled")?;
+    es.tick += 1;
+    let n = es.layers[*li].experts.len();
+    let mut missing = Vec::new();
+    for e in picked.iter().map(|&(e, _)| e).filter(|&e| e < n) {
+        if es.layers[*li].fixed.get(e).copied().flatten().is_some() {
+            continue;
+        }
+        match es.layers[*li].slot_of[e] {
+            Some(s) => es.last[s] = es.tick,
+            None => missing.push(e),
+        }
+    }
+    if missing.len() > 1 {
+        stream_will_need(&es.model, &es.layers[*li], &missing);
+        let want: Vec<(usize, (usize, usize, usize))> = missing.iter().map(|&e| (e, es.layers[*li].experts[e])).collect();
+        let (model, tick) = (es.model.clone(), es.tick);
+        if let Some(r) = es.ram.as_mut() {
+            r.fill_many(&model, *li, &want, tick);
+        }
+    }
+    // only the ranks the layer keeps copy their layout back into the tier:
+    // the rest give way first, and their copies would cost the prompt the
+    // bus time of a second read (Ornith within 24 GB: TTFT 12.3 s against 10.5)
+    let layers_n = es.layers.len().max(1);
+    let keep_n = (es.slots() / layers_n).max(16) + es.ram.as_ref().map_or(0, |r| (r.owner.len() / layers_n).max(16));
+    let ranks: HashMap<usize, usize> = picked.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
+    for e in missing {
+        es.pack_left = usize::from(ranks.get(&e).is_some_and(|&r| r < keep_n));
+        let r = es.ensure(c, fx, *li, e);
+        es.pack_left = usize::MAX;
+        r?;
+    }
+    // the layer keeps its share of the slots for the tokens to come, the
+    // experts of its last rows; the rest give way first to the layers after it (the
+    // chunk's kernels, queued ahead of any build that takes their slots, still
+    // read them) — staging layer after layer otherwise left the decode the last
+    // layers' experts only
+    let layers = es.layers.len().max(1);
+    let share = (es.slots() / layers).max(16);
+    for &(e, _) in picked.iter().filter(|&&(e, _)| e < n).skip(share) {
+        if let Some(s) = es.layers[*li].slot_of[e] {
+            es.last[s] = 1;
+        }
+    }
+    // and the RAM tier its share past those: every chunk copies the layer's
+    // picks through the tier, which otherwise kept the last layers' experts
+    // only and sent the decode's misses of the others to the disk
+    let mut tier_share = 16;
+    if let Some(r) = es.ram.as_mut() {
+        tier_share = (r.owner.len() / layers).max(16);
+        let keep = share + tier_share;
+        for &(e, _) in picked.iter().filter(|&&(e, _)| e < n).skip(keep) {
+            r.demote(*li, e);
+        }
+    }
+    // and the file's pages: those of the experts the slots and the tier hold
+    // and of the ranks past the next tier-sized share go first, so the page
+    // cache keeps every layer's next experts instead of the last layers'
+    // whole banks (the decode's misses of the others read the disk)
+    let ranked: Vec<usize> = picked.iter().map(|&(e, _)| e).filter(|&e| e < n).collect();
+    let warm = (share + tier_share)..(share + 2 * tier_share);
+    let cold: Vec<usize> = ranked.iter().enumerate().filter(|(i, _)| !warm.contains(i)).map(|(_, &e)| e).collect();
+    stream_cold(&es.model, &es.layers[*li], &cold);
+    Ok(())
+}
+
 unsafe fn stream_fix(c: &Ctx, fx: &HFuncs, m: &MoeL, mb: &MoeBufs, s_n: usize) -> Res<()> {
     let Some((li, cell)) = &m.stream else { return Ok(()) };
     let mut guard = cell.lock().map_err(|_| "expert stream poisoned")?;
@@ -2729,6 +3250,7 @@ unsafe fn stream_fix(c: &Ctx, fx: &HFuncs, m: &MoeL, mb: &MoeBufs, s_n: usize) -
     c.sync()?;
     es.tick += 1;
     // the picks already on the card hold their slots for this call first
+    let (hits0, loads0) = (es.hits, es.loads);
     for j in ga.iter().filter(|j| j.rows > 0 && j.w != 0) {
         if let Some(s) = es.slot_at(j.w) {
             es.last[s] = es.tick;
@@ -2773,15 +3295,22 @@ unsafe fn stream_fix(c: &Ctx, fx: &HFuncs, m: &MoeL, mb: &MoeBufs, s_n: usize) -
             super::htod(mb.dn_a.ptr, &da)?;
         }
     }
+    // a prompt chunk's rows (more slots than one row picks)
+    let used = ga.iter().filter(|j| j.rows > 0).count();
+    if used > m.k {
+        es.sm_seen += (es.hits - hits0) + (es.loads - loads0);
+        es.sm_built += es.loads - loads0;
+    }
     // (a plan lives as long as the process: the running count, not a summary at drop)
     if debug() && es.tick % 1024 == 0 {
         let tot = es.loads + es.hits;
         eprintln!(
-            "cuda hybrid expert stream: {} slots of {} MB, {tot} picks, {} built ({:.1}% hits), {:.1} ms a build, RAM tier {}",
+            "cuda hybrid expert stream: {} slots of {} MB, {tot} picks, {} built ({:.1}% hits, {} copied whole), {:.1} ms a build, RAM tier {}",
             es.slots(),
             es.slot >> 20,
             es.loads,
             es.hits as f64 * 100.0 / tot.max(1) as f64,
+            es.packed,
             es.load_ns as f64 / 1e6 / es.loads.max(1) as f64,
             es.ram.as_ref().map_or("off".to_string(), |r| format!("{} slots, {} hits / {} fills", r.owner.len(), r.hits, r.fills))
         );
@@ -2830,6 +3359,7 @@ pub(super) struct HPlan {
     vres: Option<(Buf, [Buf; 3])>,
     kda: Option<KdaBufs>,
     mla: Option<MlaBufs>,
+    dsa: Option<DsaBufs>,
     /// Narrow-V layers' rows: V before widening (f32) and the cut output planes.
     narrow: Option<(Buf, [Buf; 2])>,
     /// A Looped Transformer: the layers after which the final norm is applied
@@ -2931,6 +3461,8 @@ pub(super) struct HState {
     graphs: HashMap<(u64, u64, usize, usize, bool, bool, u64), GraphRec>,
     plans: HashMap<(u64, usize, usize, bool), Arc<HPlan>>,
     gdn: HashMap<(u64, usize), GdnState>,
+    /// DSA layers' caches (GLM-5.3), by sequence and layer.
+    dsa: HashMap<(u64, usize), DsaState>,
     /// DASH layers' open blocks (three, the router's keys) and block
     /// summaries, by sequence and layer.
     dash: HashMap<(u64, usize), (Buf, Buf)>,
@@ -3180,7 +3712,7 @@ fn build(
     let mut invf_local: Vec<(Vec<f32>, f32)> = Vec::new();
     // SenseNova-Loop's mHC: the streams' count (from the router's shape), its
     // Sinkhorn iterations and the branch scale, one for the stack
-    let mut mhc_geo: Option<(usize, usize, f32)> = None;
+    let mut mhc_geo: Option<(usize, usize, f32, u32)> = None;
     for (li, l) in layers.iter().enumerate() {
         if let Some(m) = &l.mhc {
             let out = m.attn_b.len();
@@ -3191,10 +3723,12 @@ fn build(
                 && m.attn_w.len() == out * ns * hidden
                 && m.ffn_b.len() == out
                 && m.ffn_w.len() == out * ns * hidden
-                && !matches!(l.ffn, GraphFfn::Moe { .. })
+                // a routed FFN's mixture goes to the merge on the small path
+                // only (`small_only`), and DeepSeek-V4's form wants the full mix
+                && (m.dsv4.is_none() || out == 2 * ns + ns * ns)
                 && l.attn_out_norm.is_none()
                 && l.ffn_out_norm.is_none();
-            let geo = (ns, m.iters, m.pre_scale);
+            let geo = (ns, m.iters, m.pre_scale, m.dsv4.map_or(1e-6f32, |d| d.rms_eps).to_bits());
             if !ok || mhc_geo.is_some_and(|g| g != geo) {
                 return Err(format!("layer {li}: mHC streams of a shape the kernels do not take"));
             }
@@ -3428,6 +3962,25 @@ fn build(
                 r => Some((f4(NMAX * r)?, [Buf::new(NMAX * r * 2 + 64)?, Buf::new(NMAX * r * 2 + 64)?])),
             },
         }),
+        None => None,
+    };
+    // DSA layers' rows (the widest geometry of the stack)
+    let dsa_bufs = match layers.iter().filter_map(|l| match &l.attn {
+        GraphAttn::Mla { nh, lora, dsa: Some(d), .. } => Some((*nh, *lora, d.ih, d.id, d.topk, d.kpool)),
+        _ => None,
+    }).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.max(b.2), a.3.max(b.3), a.4.max(b.4), a.5.max(b.5))) {
+        Some((mnh, lora, ih, id, topk, kp)) => {
+            let xstride = 2 * id + ih;
+            Some(DsaBufs {
+                iq: f4(NMAX * ih * id)?,
+                xk: f4(NMAX * xstride)?,
+                xstride,
+                qlat: f4(mnh * lora)?,
+                olat: f4(mnh * lora)?,
+                sel: Buf::new((topk + kp) * 4)?,
+                nsel: Buf::new(16)?,
+            })
+        }
         None => None,
     };
     // a routed FFN's rows: at most NMAX x top_k distinct experts a call
@@ -3709,11 +4262,12 @@ fn build(
             }
             GraphFfn::Moe {
                 router, shared_gate, experts, n_exp, top_k, inter, norm_topk, sigmoid, sigmoid_denom_eps, bias, has_shared,
-                detached_shared, shared_gated, route_scale, act, ..
+                detached_shared, shared_gated, route_scale, act, limit, ..
             } => {
                 let (e, k, inter) = (*n_exp, *top_k, *inter);
-                // MiniMax M3's activation: its bit in the pair epilogue and its clamp
-                let (oai_bit, oai_lim) = if *act == GraphAct::SwiGluOaiM3 { (0x1000, OAI_M3_LIMIT) } else { (0, 0.0) };
+                // MiniMax M3's activation: its bit in the pair epilogue and its
+                // clamp; GLM-5.3's SwiGLU clamp otherwise
+                let (oai_bit, oai_lim) = if *act == GraphAct::SwiGluOaiM3 { (0x1000, OAI_M3_LIMIT) } else { (0, *limit) };
                 let mut mats = Vec::with_capacity(2 * e);
                 let (mut gu_t, mut dn_t) = (Vec::with_capacity(e), Vec::with_capacity(e));
                 let job = |m: &DevMat, rows: usize, kind: i32| HyJob {
@@ -4132,7 +4686,7 @@ fn build(
                     ms_out,
                 })
             }
-            GraphAttn::Mla { q_a, q_a_norm, q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, .. } => {
+            GraphAttn::Mla { q_a, q_a_norm, q: qw, kv_a, kv_a_norm, kv_b, o: ow, nh: mnh, rope, nope, v_dim, lora, scale: mscale, dsa: gdsa, .. } => {
                 let (rope, nope, vd, lora) = (*rope, *nope, *v_dim, *lora);
                 let lhd = rope + nope;
                 let lfx = match st.hyb.funcs.get(&(1, lhd)) {
@@ -4162,6 +4716,41 @@ fn build(
                     _ => (mmaset(&[(&qm, q.ptr, 0, qrow, mnh * lhd), (&kvam, mb.kva.ptr, 0, lora + rope, lora + rope)])?, None),
                 };
                 let ms_kvb = mmaset(&[(&kvbm, mb.kvb.ptr, 0, mnh * (nope + vd), mnh * (nope + vd))])?;
+                let dsa = match gdsa {
+                    Some(d) => {
+                        let db = dsa_bufs.as_ref().ok_or("DSA rows missing")?;
+                        if rope != 0 || rank == 0 || d.kv_b.len() != mnh * (nope + vd) * lora || d.ape.len() != d.kpool * d.id
+                            || d.k_norm.len() != d.id || d.k_bias.len() != d.id || d.kpool == 0 || d.topk % d.kpool != 0
+                        {
+                            return Err(format!("layer {li}: a DSA indexer of a geometry the kernels do not take"));
+                        }
+                        let iqm = hmat(c, st, model, &d.index_q, d.ih * d.id, rank)?;
+                        let ikm = hmat(c, st, model, &d.index_k, d.id, hidden)?;
+                        let pgm = hmat(c, st, model, &d.pool_gate, d.id, hidden)?;
+                        let iwm = hmat(c, st, model, &d.index_weights, d.ih, hidden)?;
+                        for x in [d.k_norm, d.k_bias, d.ape, d.kv_b] {
+                            note(x);
+                        }
+                        let xs = db.xstride;
+                        Some(DsaL {
+                            ms_iq: mmaset(&[(&iqm, db.iq.ptr, 0, d.ih * d.id, d.ih * d.id)])?,
+                            ms_x: mmaset(&[
+                                (&ikm, db.xk.ptr, 0, xs, d.id),
+                                (&pgm, db.xk.ptr + (d.id * 4) as u64, 0, xs, d.id),
+                                (&iwm, db.xk.ptr + (2 * d.id * 4) as u64, 0, xs, d.ih),
+                            ])?,
+                            k_norm: st.f32_buf(d.k_norm)?,
+                            k_bias: st.f32_buf(d.k_bias)?,
+                            ape: st.f32_buf(d.ape)?,
+                            wkv: st.f32_buf(d.kv_b)?,
+                            ih: d.ih,
+                            id: d.id,
+                            topk: d.topk,
+                            kp: d.kpool,
+                        })
+                    }
+                    None => None,
+                };
                 let ms_out = match l.attn_out_norm.is_some() || l.mhc.is_some() {
                     true => mmaset(&[(&om, yo.ptr, 0, hidden, hidden)])?,
                     false => mmaset(&[(&om, h.ptr, h.ptr, hidden, hidden)])?,
@@ -4189,7 +4778,7 @@ fn build(
                     ms_out,
                     vres: None,
                     dash: None,
-                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale, qa }),
+                    mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale, qa, dsa }),
                     vd: lhd,
                 })
             }
@@ -4219,6 +4808,8 @@ fn build(
         let lim = match &l.ffn {
             GraphFfn::Dense { act: GraphAct::SwiGluOaiM3, .. } | GraphFfn::Moe { act: GraphAct::SwiGluOaiM3, .. } => OAI_M3_LIMIT,
             GraphFfn::Dense { limit, .. } => *limit,
+            // the shared expert's pair: the bank's clamp (GLM-5.3)
+            GraphFfn::Moe { limit, .. } => *limit,
             _ => 0.0,
         };
         let ms_gu = mmaset_kind_lim(&[(&gum, qq[0].ptr, qq[1].ptr, pstride, gum.rows)], 6 | 0x100 | [0, 0x200, 0x400, 0x1000][gelu as usize], lim)?;
@@ -4252,6 +4843,7 @@ fn build(
                     out: m.attn_b.len(),
                     enter: m.enter,
                     leave: m.leave,
+                    v4: m.dsv4.map(|d| (d.attn_scale, d.ffn_scale, d.eps)),
                 })
             }
             None => None,
@@ -4339,6 +4931,13 @@ fn build(
                 index,
                 ram: None,
                 loads: 0,
+            packed: 0,
+            ring: HostArena::new(JOB_RING * std::mem::size_of::<HyJob>()).ok(),
+            ring_at: 0,
+            pack_left: usize::MAX,
+            ring_stream: 0,
+            sm_seen: 0,
+            sm_built: 0,
                 hits: 0,
                 load_ns: 0,
             };
@@ -4362,6 +4961,7 @@ fn build(
                 }
             }
             tracing::info!("cuda hybrid: expert stream of {n} card slots of {} MB ({:.1} GB)", slot >> 20, (n * slot) as f64 / 1e9);
+            es.prepack(c, &fx)?;
             *cell.lock().map_err(|_| "expert stream poisoned")? = Some(es);
             st.hyb.streams.insert(uid, Arc::downgrade(&cell));
             Some(cell)
@@ -4390,11 +4990,12 @@ fn build(
         loop_norm: loop_norm.to_vec(),
         loop_w,
         mhc: match mhc_geo {
-            Some((ns, iters, pre_scale)) => Some(MhcPlan { ns, iters, pre_scale, r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
+            Some((ns, iters, pre_scale, rms)) => Some(MhcPlan { ns, iters, pre_scale, rms_eps: f32::from_bits(rms), r: Buf::new(NMAX * ns * hidden * 4)?, coef: Buf::new(NMAX * 20 * 4)?, lg: Buf::new(NMAX * 24 * 4)? }),
             None => None,
         },
         kda: kda_bufs,
         mla: mla_bufs,
+        dsa: dsa_bufs,
         narrow: narrow_bufs,
         vres: if has_vres {
             Some((f4(NMAX * hidden)?, [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?]))
@@ -4596,6 +5197,49 @@ fn sync_half(c: &Ctx, m: &mut KvMirror, cpu_k: &[Vec<f32>], cpu_v: &[Vec<f32>], 
 /// GDN states (fresh at a sequence start, seeded from the host's state after
 /// a host prefill). Err(true): the card holds state this call cannot use.
 #[allow(clippy::too_many_arguments)]
+/// A DSA layer's caches for rows `pos0..pos0 + n`: made, reset at a new
+/// sequence, or grown (doubling, the rows so far copied).
+fn dsa_ensure(c: &Ctx, st: &mut State, key: (u64, usize), d: &DsaL, lora: usize, pos0: usize, n: usize) -> Result<(), (bool, String)> {
+    let soft = |e: String| (false, e);
+    let need = pos0 + n;
+    if let Some(e) = st.hyb.dsa.get_mut(&key) {
+        if pos0 == 0 {
+            e.next_pos = 0;
+        } else if e.next_pos != pos0 {
+            return Err((true, format!("DSA state of layer {} is at row {}, the call at {pos0}", key.1, e.next_pos)));
+        }
+        if need <= e.cap {
+            return Ok(());
+        }
+    } else if pos0 > 0 {
+        return Err(soft("DSA caches missing for a nonzero position".into()));
+    }
+    let old = st.hyb.dsa.remove(&key);
+    let cap = need.max(old.as_ref().map_or(0, |o| 2 * o.cap)).max(4096).next_multiple_of(d.kp * 64);
+    let np = cap / d.kp;
+    let sizes = [cap * lora, cap * d.id, cap * d.id, np * d.id, np];
+    let bufs: Vec<Buf> = sizes.iter().map(|&k| Buf::new(k * 4)).collect::<Res<Vec<_>>>().map_err(soft)?;
+    let bytes = sizes.iter().map(|&k| (k * 4) as u64).sum::<u64>();
+    let at = old.as_ref().map_or(0, |o| o.next_pos);
+    if let Some(o) = &old {
+        let rows = [at * lora, at * d.id, at * d.id, (at / d.kp) * d.id];
+        let src = [o.lat.ptr, o.ikc.ptr, o.gtc.ptr, o.pooled.ptr];
+        for k in 0..4 {
+            if rows[k] > 0 {
+                unsafe { cu::memcpy_dtod_async(bufs[k].ptr, src[k], rows[k] * 4, c.stream).map_err(|e| soft(derr(e)))? };
+            }
+        }
+        c.sync().map_err(soft)?;
+        c.kv_bytes.fetch_sub(o.bytes, Ordering::Relaxed);
+    }
+    c.kv_bytes.fetch_add(bytes, Ordering::Relaxed);
+    let mut it = bufs.into_iter();
+    let mut next = || it.next().ok_or_else(|| soft("DSA buffers".into()));
+    let (lat, ikc, gtc, pooled, sc) = (next()?, next()?, next()?, next()?, next()?);
+    st.hyb.dsa.insert(key, DsaState { lat, ikc, gtc, pooled, sc, cap, next_pos: if pos0 == 0 { 0 } else { at }, bytes });
+    Ok(())
+}
+
 fn admit(
     c: &Ctx,
     st: &mut State,
@@ -4616,6 +5260,13 @@ fn admit(
         }
         match (&pl.mix, &l.attn) {
             (Mix::Attn(a), GraphAttn::Full { cpu_k, cpu_v, cpu_base, .. } | GraphAttn::Mla { cpu_k, cpu_v, cpu_base, .. }) => {
+                // a DSA layer's caches; past its `topk` the mirror stops growing
+                if let Some((d, lora)) = a.mla.as_ref().and_then(|m| m.dsa.as_ref().map(|d| (d, m.lora))) {
+                    dsa_ensure(c, st, key, d, lora, pos0, n)?;
+                    if pos0 + n > d.topk {
+                        continue;
+                    }
+                }
                 // f16 rows: `row` counts f32 slots of a mirror, so half the values
                 // (the layer's own head geometry)
                 let row = a.nkv * a.hd / 2;
@@ -5003,6 +5654,8 @@ struct Book {
     far: Vec<u8>,
     /// Per layer: a far field's landmarks, scale and rectification.
     farp: Vec<(usize, f32, bool)>,
+    /// Per layer: a DSA layer's call (`DsaCall`).
+    dsa: Vec<Option<DsaCall>>,
 }
 
 /// Rows a key block of the decode attention takes for `keys` keys (64 up to
@@ -5031,10 +5684,24 @@ fn book(
     let mut layers = Vec::with_capacity(plan.layers.len());
     let mut far = Vec::with_capacity(plan.layers.len());
     let mut farp = Vec::with_capacity(plan.layers.len());
+    let mut dsa = Vec::with_capacity(plan.layers.len());
     let mut ci = Vec::new();
     let mut keys_max = 0usize;
     for (li, pl) in plan.layers.iter().enumerate() {
         let key = (kv_id, layer_base + li);
+        // a DSA layer: its caches move on; past `topk` the mirror is not read
+        let dcall = match &pl.mix {
+            Mix::Attn(a) => match a.mla.as_ref().and_then(|m| m.dsa.as_ref()) {
+                Some(d) => {
+                    let s = st.hyb.dsa.get_mut(&key).ok_or("DSA caches missing")?;
+                    s.next_pos = pos0 + n;
+                    Some(DsaCall { mode: pos0 + n > d.topk, pos0, lat: s.lat.ptr, ikc: s.ikc.ptr, gtc: s.gtc.ptr, pooled: s.pooled.ptr, sc: s.sc.ptr })
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        dsa.push(dcall);
         if sealed.get(li).copied().unwrap_or(false) && matches!(&pl.mix, Mix::Attn(a) if a.nkv != plan.nkv || a.hd != plan.hd) {
             return Err("a sealed far field over a layer head geometry of its own".into());
         }
@@ -5097,6 +5764,13 @@ fn book(
                 keys_max = keys_max.max(keys);
                 continue;
             }
+            Mix::Attn(_) if dcall.is_some_and(|d| d.mode) => {
+                if tape {
+                    return Err("a verify window over a DSA layer past its selection".into());
+                }
+                layers.push([0; 7]);
+                ci.extend([0i32; 8]);
+            }
             Mix::Attn(a) => {
                 // a DASH layer: its open blocks and block summaries beside the mirror
                 let (dopen, dbar) = match &a.dash {
@@ -5138,7 +5812,7 @@ fn book(
         st.scr(c, "hy_P", NMAX * nbc * nh * hd.max(plan.hdmax) * 4)?,
         st.scr(c, "hy_E", NMAX * nbc * nh * 4)?,
     ];
-    Ok(Book { layers, ci, scratch, far, farp })
+    Ok(Book { layers, ci, scratch, far, farp, dsa })
 }
 
 /// The small path's launches over the rows in `plan.h` (`n <= NMAX`), as
@@ -5396,8 +6070,78 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                             0,
                             kargs!(mb.kva.ptr, st_i, mb.kvb.ptr, plan.k.ptr, plan.v.ptr, n_i, nh_i, rope_i, nope_i, vd_i, lora_i),
                         )?;
+                        // DSA: the indexer's rows, the caches at the rows'
+                        // positions and the pools the call completes
+                        if let (Some(ds), Some(db), Some(dc)) = (&ml.dsa, &plan.dsa, bk.dsa[li]) {
+                            ds.ms_x.run(c, fx, planes, hidden, n)?;
+                            if let (Some(qa), Some((_, qp))) = (&ml.qa, &mb.qa) {
+                                let qpl = Planes { p0: qp[0].ptr, p1: qp[1].ptr, p2: qp[1].ptr, stride: qa.rank };
+                                ds.ms_iq.run(c, fx, &qpl, qa.rank, n)?;
+                            }
+                            let (xs_i, id_i, pos_i) = (db.xstride as i32, ds.id as i32, dc.pos0 as i32);
+                            c.launch(
+                                fx.dsa_put,
+                                (n as u32, 1),
+                                256,
+                                0,
+                                kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, db.xk.ptr, xs_i, ds.k_norm.ptr, ds.k_bias.ptr, id_i, dc.lat, dc.ikc, dc.gtc, pos_i),
+                            )?;
+                            let (p0, p1) = (dc.pos0 / ds.kp, (dc.pos0 + n) / ds.kp);
+                            if p1 > p0 {
+                                let (p0_i, np_i, kp_i) = (p0 as i32, (p1 - p0) as i32, ds.kp as i32);
+                                c.launch(
+                                    fx.dsa_pool,
+                                    (((p1 - p0) * ds.id).div_ceil(256) as u32, 1),
+                                    256,
+                                    0,
+                                    kargs!(dc.ikc, dc.gtc, ds.ape.ptr, dc.pooled, p0_i, np_i, kp_i, id_i),
+                                )?;
+                            }
+                        }
                     }
-                    if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
+                    if let (Some(dc), Some(ml), Some(mb), Some(db)) = (bk.dsa[li].filter(|d| d.mode), &a.mla, &plan.mla, &plan.dsa) {
+                        // DSA past its `topk`: a row at a time, the pools scored,
+                        // the positions selected, the absorbed attention over
+                        // their latents into the output planes
+                        let ds = ml.dsa.as_ref().ok_or("a DSA call without its indexer")?;
+                        let (id, ih, kp) = (ds.id, ds.ih, ds.kp);
+                        let (xs_i, id_i, ih_i, kp_i, keep_i) = (db.xstride as i32, id as i32, ih as i32, kp as i32, (ds.topk / kp) as i32);
+                        let (lora_i, nope_i, vd_i, nh_i2) = (ml.lora as i32, ml.nope as i32, ml.vd as i32, nh as i32);
+                        let (qoff_i, hd_i2, od_i) = (ml.rope as i32, a.hd as i32, (nh * ml.vd) as i32);
+                        let shm = (ds.topk + kp) * 4;
+                        for r in 0..n {
+                            let npos = dc.pos0 + r + 1;
+                            let np = npos / kp;
+                            let (np_i, npos_i, r_i) = (np as i32, npos as i32, r as i32);
+                            let iq_r = db.iq.ptr + (r * ih * id * 4) as u64;
+                            let xk_r = db.xk.ptr + (r * db.xstride * 4) as u64;
+                            if np > 0 {
+                                c.launch(fx.dsa_score, (np.div_ceil(8) as u32, 1), 256, 0, kargs!(iq_r, xk_r, xs_i, id_i, ih_i, dc.pooled, np_i, dc.sc))?;
+                            }
+                            c.launch(fx.dsa_select, (1, 1), 1024, 0, kargs!(dc.sc, np_i, keep_i, kp_i, npos_i, db.sel.ptr, db.nsel.ptr))?;
+                            let q_r = plan.q.ptr + (r * plan.qrow * 4) as u64;
+                            c.launch(
+                                fx.dsa_qlat,
+                                (ml.lora.div_ceil(256) as u32, nh as u32),
+                                256,
+                                0,
+                                kargs!(q_r, qoff_i, hd_i2, ds.wkv.ptr, nope_i, vd_i, lora_i, db.qlat.ptr),
+                            )?;
+                            c.launch(fx.dsa_attn, (nh as u32, 1), 256, shm, kargs!(db.qlat.ptr, dc.lat, db.sel.ptr, db.nsel.ptr, lora_i, ml.scale, db.olat.ptr))?;
+                            c.launch(
+                                fx.dsa_out,
+                                ((nh * ml.vd).div_ceil(8) as u32, 1),
+                                256,
+                                0,
+                                kargs!(db.olat.ptr, ds.wkv.ptr, nh_i2, nope_i, vd_i, lora_i, mb.op[0].ptr, mb.op[1].ptr, od_i, r_i),
+                            )?;
+                        }
+                        hst(c, 5, &mut t0)?;
+                        let opl = Planes { p0: mb.op[0].ptr, p1: mb.op[1].ptr, p2: mb.op[1].ptr, stride: nh * ml.vd };
+                        a.ms_out.run(c, fx, &opl, nh * ml.vd, n)?;
+                        sub_out(c, fx, plan, pl, false, n)?;
+                        hst(c, 6, &mut t0)?;
+                    } else if let (Some(dl), Some(db)) = (&a.dash, &plan.dash) {
                         // DASH: the rows rotated by their own angles and appended,
                         // the router a row, the closing blocks' summaries, the
                         // attend over the read set and the local window
@@ -5575,23 +6319,38 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                 prism_planes(c, plan, mid.p0, mid.p1, mid.stride, pl.inter, n)?;
                 pl.ms_dn.run(c, fx, &mid, pl.inter, n)?;
             }
+            // under mHC a routed FFN's mixture is the product the merge takes:
+            // into a zeroed `yo` first, the stream's own rows untouched
+            let moe_into = if pl.mhc.is_some() { plan.yo.ptr } else { plan.h.ptr };
+            let combine = |c: &Ctx| -> Res<()> {
+                if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
+                    // the mixture and the shared expert into the stream
+                    let s_n = (n * m.k).min(m.e).min(mb.smax);
+                    let (gi, ni, si) = (m.gated as i32, n as i32, s_n as i32);
+                    let dsh = if m.shared { mb.dsh.ptr } else { 0u64 };
+                    if moe_into != plan.h.ptr {
+                        cu::memset_d8_async(moe_into, 0, n * hidden * 4, c.stream).map_err(derr)?;
+                    }
+                    c.launch(
+                        fx.moe_combine,
+                        (hidden.div_ceil(256) as u32, n as u32),
+                        256,
+                        0,
+                        kargs!(moe_into, mb.dns.ptr, mb.wsel.ptr, dsh, mb.sg.ptr, gi, ni, hid_i, si),
+                    )?;
+                }
+                Ok(())
+            };
+            if pl.mhc.is_some() {
+                combine(c)?;
+            }
             sub_out(c, fx, plan, pl, true, n)?;
             if let Some(s) = pl.layer_scale {
                 let tot = (n * hidden) as u64;
                 c.launch(fx.scale, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(plan.h.ptr, s, tot))?;
             }
-            if let (Some(m), Some(mb)) = (&pl.moe, &plan.moe) {
-                // the mixture and the shared expert into the stream
-                let s_n = (n * m.k).min(m.e).min(mb.smax);
-                let (gi, ni, si) = (m.gated as i32, n as i32, s_n as i32);
-                let dsh = if m.shared { mb.dsh.ptr } else { 0u64 };
-                c.launch(
-                    fx.moe_combine,
-                    (hidden.div_ceil(256) as u32, n as u32),
-                    256,
-                    0,
-                    kargs!(plan.h.ptr, mb.dns.ptr, mb.wsel.ptr, dsh, mb.sg.ptr, gi, ni, hid_i, si),
-                )?;
+            if pl.mhc.is_none() {
+                combine(c)?;
             }
             hst(c, 9, &mut t0)?;
             // a Looped Transformer: the final norm on the stream after a loop's last layer
@@ -5672,7 +6431,11 @@ unsafe fn mhc_in(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, ro
         let (w, b) = if ffn { (&m.fw, &m.fb) } else { (&m.aw, &m.ab) };
         let (out_i, it_i, fixed_i) = (m.out as i32, mp.iters as i32, (m.out == 2 * mp.ns) as i32);
         // the logits a block each, then the coefficients and the input rows
-        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i))?;
+        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
+        if let Some((sa, sf, e)) = m.v4 {
+            let s = if ffn { sf } else { sa };
+            return c.launch(fx.mhc_route4, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, it_i, s[0], s[1], s[2], e));
+        }
         c.launch(fx.mhc_route, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, out_i, it_i, fixed_i, mp.pre_scale))
     }
 }
@@ -5745,8 +6508,10 @@ fn small_only(l: &HLayer) -> bool {
     };
     // sandwich norms and a layer scale run on the prompt path too, a routed
     // FFN's sandwich aside
-    // streamed experts are patched after each layer's router: the small path's
-    blr || l.moe.as_ref().is_some_and(|m| m.stream.is_some())
+    // streamed experts are patched after each layer's router: the small path's,
+    // unless the prompt path stages a layer's every expert first
+    // (`stream_stage`, a pool that holds them)
+    blr || l.moe.as_ref().is_some_and(|m| m.stream.is_some() && !stream_stageable(m))
         || l.ms_gu.has_blr()
         || l.ms_dn.has_blr()
         || (l.moe.is_some() && l.ffn_out.is_some())
@@ -5914,7 +6679,7 @@ unsafe fn run_small(
         // a prompt read through this path a chunk at a time launches directly:
         // capturing a graph per chunk shape cost more than the chunk
         // (a streamed plan's host patches the jobs between the launches)
-        if !graphs_on() || DIRECT.with(|d| d.get()) || plan.stream.is_some() {
+        if !graphs_on() || DIRECT.with(|d| d.get()) || plan.stream.is_some() || plan.dsa.is_some() {
             launch(c, plan, &bk, n, tape, plan.ci.ptr, plan.tab.ptr, taps)?;
             if head {
                 head_launch(c, plan, n)?;
@@ -6793,6 +7558,25 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, d
             c.gemm(true, false, 1, b, hidden, 1.0, g.w.ptr, hidden, x32, hidden, 0.0, sg, 1, Gemm::F32)?;
         }
         c.launch(fx.moe_topk, (b.div_ceil(8) as u32, 1), 256, 0, kargs!(logits, bias, n_i, e_i, k_i, m.flags, m.route_scale, pidx, pwt))?;
+        // a streamed layer: the chunk's picked experts in the stream's slots
+        // before the grouping reads their jobs (each built once a chunk)
+        if m.stream.is_some() {
+            let mut picks = vec![0i32; nk];
+            cu::memcpy_dtoh_async(&mut picks, pidx, c.stream).map_err(derr)?;
+            c.sync()?;
+            // the picked experts, the last rows' first: what the tokens after
+            // the chunk route to next (the order the slots are kept in)
+            let mut seen = std::collections::HashSet::new();
+            let mut uniq: Vec<(usize, usize)> = Vec::new();
+            for r in (0..b).rev() {
+                for &e in &picks[r * k..(r + 1) * k] {
+                    if e >= 0 && seen.insert(e as usize) {
+                        uniq.push((e as usize, r));
+                    }
+                }
+            }
+            stream_stage(c, fx, m, &uniq)?;
+        }
         c.launch(
             fx.moe_group,
             (1, 1),
@@ -7807,6 +8591,12 @@ pub(super) fn gdn_state_read(c: &Ctx, st: &State, kv_id: u64, layer: usize) -> O
 /// Drop a sequence's recurrent states.
 pub(super) fn reset(c: &Ctx, st: &mut State, kv_id: u64) {
     st.hyb.rtabs.remove(&kv_id);
+    st.hyb.dsa.retain(|&(id, _), d| {
+        if id == kv_id {
+            c.kv_bytes.fetch_sub(d.bytes, Ordering::Relaxed);
+        }
+        id != kv_id
+    });
     st.hyb.o1.retain(|&(id, _), d| {
         if id == kv_id {
             c.kv_bytes.fetch_sub(d.bytes, Ordering::Relaxed);

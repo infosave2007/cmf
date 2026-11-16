@@ -116,11 +116,32 @@ pub struct State {
     sequence_id: u64,
     gpu_ready: bool,
     pub pos: usize,
+    /// The sequence runs on the card's whole-token graph (`graph_token`):
+    /// None not tried yet, Some(false) declined at its start (the host runs
+    /// it), Some(true) the card holds its states.
+    graph: Option<bool>,
+    /// The sequence's tokens while the card runs it: a later refusal (past
+    /// `index_topk`, where DSA stops being full attention) replays them on
+    /// the host.
+    tokens: Vec<u32>,
+}
+
+impl State {
+    /// The card's graph state key of this sequence (apart from the
+    /// pipelines' own ids).
+    fn kv_id(&self) -> u64 {
+        (1u64 << 62) | self.sequence_id
+    }
 }
 
 impl State {
     fn reset(&mut self, layers: &[Layer], _cfg: &Cfg) {
         crate::gpu::glm_sequence_abort(self.model_uid, self.sequence_id);
+        if self.graph == Some(true) {
+            crate::gpu::graph_kv_reset(self.kv_id());
+        }
+        self.graph = None;
+        self.tokens.clear();
         self.sequence_id = next_glm_sequence();
         self.gpu_ready = false;
         self.hyper.clear();
@@ -197,6 +218,9 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         crate::gpu::glm_sequence_abort(self.model_uid, self.sequence_id);
+        if self.graph == Some(true) {
+            crate::gpu::graph_kv_reset(self.kv_id());
+        }
     }
 }
 
@@ -707,6 +731,14 @@ pub fn load(
         index_topk: gc.index_topk,
         vocab: arch.vocab_size,
     };
+    // `CMF_GLM_DSA_TOPK=<n>` (a multiple of the pool): a smaller selection
+    // for both the host and the card, so a short text exercises DSA's
+    // selection (a check; the file's own value otherwise)
+    let index_topk = std::env::var("CMF_GLM_DSA_TOPK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&k| k > 0 && k % gc.index_kpool == 0)
+        .unwrap_or(gc.index_topk);
     let cfg = Cfg {
         hc,
         kda,
@@ -714,7 +746,7 @@ pub fn load(
         swiglu_limit: gc.swiglu_limit,
         index_n_heads: gc.index_n_heads,
         index_head_dim: gc.index_head_dim,
-        index_topk: gc.index_topk,
+        index_topk,
         index_kpool: gc.index_kpool,
         index_tail: gc.index_kpool_always_select_tail,
     };
@@ -758,6 +790,8 @@ pub fn load(
         sequence_id: next_glm_sequence(),
         gpu_ready: false,
         pos: 0,
+        graph: None,
+        tokens: Vec::new(),
     };
     state.reset(&layers, &cfg);
     Ok((globals, layers, cfg, state))
@@ -1304,6 +1338,388 @@ fn dynamic_moe_gpu(
 /// Decode one token. DSA is mathematically full attention until the 2048
 /// token budget is exceeded; the standard MLA cache is therefore exact for
 /// ordinary prompts and remains the portable CPU/Metal fallback.
+/// GLM's stack on the card's whole-token graph (`CMF_GLM_GRAPH=0`: the
+/// host): KDA and NoPE MLA mixers, the dense and routed FFNs with their
+/// SwiGLU clamp and DeepSeek-V4's four-stream mHC around both halves. Within
+/// `index_topk` positions DSA's selection is every position, so its MLA is
+/// the plain attention there; past it the card's indexer selects the
+/// positions and the attention reads their latents (`GraphDsa`).
+/// The graph calls' context cap: GLM's native million positions (past
+/// `index_topk` DSA reads the selected latents, and the caches grow on the
+/// card as the context does).
+const GRAPH_CAP: usize = 1 << 20;
+
+fn graph_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GLM_GRAPH").as_deref() != Ok("0"))
+}
+
+fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+    if let Some((_, i, kind, rs)) = t.graph_weight_or_blr() {
+        return Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false });
+    }
+    t.as_f32().map(|d| crate::gpu::GraphW { idx: 0, kind: 4, row_scale: &[], data: d, prism: crate::gpu::GraphPrismOp::None, affine: false })
+}
+
+/// The stack as graph layers (None: a weight the graphs cannot address).
+fn graph_layers<'a>(layers: &'a [Layer], cfg: &Cfg) -> Option<Vec<crate::gpu::GraphLayer<'a>>> {
+    use crate::gpu::{GraphAct, GraphAttn, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4};
+    let last = layers.len().checked_sub(1)?;
+    let mut out = Vec::with_capacity(layers.len());
+    for (li, l) in layers.iter().enumerate() {
+        let attn = match &l.mixer {
+            Mixer::Kda(w) => {
+                let (g_a, g_b) = match &w.gate {
+                    KdaOutGate::Full(g) => (gw(g)?, None),
+                    KdaOutGate::LowRank(a, b) => (gw(a)?, Some(gw(b)?)),
+                };
+                GraphAttn::Kda {
+                    q: gw(&w.q_proj)?,
+                    k: gw(&w.k_proj)?,
+                    v: gw(&w.v_proj)?,
+                    conv_q: &w.conv_q,
+                    conv_k: &w.conv_k,
+                    conv_v: &w.conv_v,
+                    f_a: gw(&w.f_a)?,
+                    f_b: gw(&w.f_b)?,
+                    dt_bias: &w.dt_bias,
+                    a_log: &w.a_log,
+                    b: gw(&w.b_proj)?,
+                    g_a,
+                    g_b,
+                    o_norm: &w.o_norm,
+                    out: gw(&w.o_proj)?,
+                    nh: cfg.kda.num_heads,
+                    dk: cfg.kda.head_k_dim,
+                    dv: cfg.kda.head_v_dim,
+                    kk: cfg.kda.conv_kernel,
+                    lower_bound: w.gate_lower_bound,
+                    cpu_state: &[],
+                }
+            }
+            Mixer::Dsa(w) => {
+                let m = &w.mla;
+                let q_a = match &m.q_a {
+                    Some(t) => Some(gw(t)?),
+                    None => None,
+                };
+                GraphAttn::Mla {
+                    q_a,
+                    q_a_norm: m.q_a_norm.as_deref(),
+                    q: gw(&m.q_proj)?,
+                    kv_a: gw(&m.kv_a)?,
+                    kv_a_norm: &m.kv_a_norm,
+                    kv_b: gw(&m.kv_b)?,
+                    o: gw(&m.o_proj)?,
+                    nh: m.nh,
+                    rope: m.qk_rope,
+                    nope: m.qk_nope,
+                    v_dim: m.v_dim,
+                    lora: m.lora,
+                    scale: m.scale,
+                    no_rope: m.nope,
+                    cpu_k: &[],
+                    cpu_v: &[],
+                    cpu_base: 0,
+                    dsa: if cfg.index_tail {
+                        let kvb = w.kvb_f32.get_or_init(|| {
+                            let (rows, lora) = (m.kv_b.rows(), m.lora);
+                            let mut v = vec![0.0f32; rows * lora];
+                            for (r, row) in v.chunks_exact_mut(lora).enumerate() {
+                                m.kv_b.row_f32(r, row);
+                            }
+                            v
+                        });
+                        Some(crate::gpu::GraphDsa {
+                            index_q: gw(&w.index_q)?,
+                            index_k: gw(&w.index_k)?,
+                            pool_gate: gw(&w.pool_gate)?,
+                            index_weights: gw(&w.index_weights)?,
+                            k_norm: &w.index_k_norm,
+                            k_bias: &w.index_k_bias,
+                            ape: &w.pool_ape,
+                            kv_b: kvb,
+                            ih: cfg.index_n_heads,
+                            id: cfg.index_head_dim,
+                            topk: cfg.index_topk,
+                            kpool: cfg.index_kpool,
+                        })
+                    } else {
+                        // the device selection always takes the tail
+                        return None;
+                    },
+                }
+            }
+        };
+        let ffn = match &l.ffn {
+            FfnKind::Dense(d) => GraphFfn::Dense {
+                gate: gw(&d.gate_proj)?,
+                up: gw(&d.up_proj)?,
+                down: gw(&d.down_proj)?,
+                act: GraphAct::Silu,
+                limit: cfg.swiglu_limit,
+                hot: None,
+            },
+            FfnKind::Moe(m) => {
+                let inter = m.experts.first()?.gate_proj.rows();
+                let shared = m.shared.as_ref().map(|(d, _)| d);
+                // the shared expert rides in the bank when it has the routed
+                // experts' width and codec
+                let in_bank = shared.is_some_and(|d| d.gate_proj.rows() == inter && d.up_proj.rows() == inter);
+                let mut experts = l.expert_ids.clone();
+                if in_bank {
+                    experts.push(l.shared_ids?);
+                }
+                let detached_shared = match shared {
+                    Some(d) if !in_bank => Some(crate::gpu::GraphMoeDetachedShared {
+                        gate: gw(&d.gate_proj)?,
+                        up: gw(&d.up_proj)?,
+                        down: gw(&d.down_proj)?,
+                        width: d.gate_proj.rows(),
+                    }),
+                    _ => None,
+                };
+                let e0 = m.experts.first()?;
+                let gu_q2 = e0.gate_proj.mapped_q2tp().is_some();
+                if !(gu_q2 || e0.gate_proj.mapped_q4tp().is_some()) || e0.down_proj.mapped_q4tp().is_none() {
+                    return None;
+                }
+                GraphFfn::Moe {
+                    router: gw(&m.router)?,
+                    shared_gate: gw(&m.router)?,
+                    experts,
+                    n_exp: m.experts.len(),
+                    top_k: m.top_k,
+                    inter,
+                    act: GraphAct::Silu,
+                    norm_topk: m.norm_topk_prob,
+                    q4tp: true,
+                    gu_q2,
+                    q82: false,
+                    sigmoid: m.router_sigmoid,
+                    sigmoid_denom_eps: m.sigmoid_denom_eps,
+                    bias: m.expert_bias.as_deref(),
+                    has_shared: in_bank,
+                    detached_shared,
+                    shared_gated: false,
+                    route_scale: m.routed_scaling,
+                    limit: cfg.swiglu_limit,
+                }
+            }
+            FfnKind::DenseMoe(_) => return None,
+        };
+        out.push(GraphLayer {
+            mhc: Some(GraphMhc {
+                attn_w: &l.attn_hc.function,
+                attn_b: &l.attn_hc.base,
+                ffn_w: &l.ffn_hc.function,
+                ffn_b: &l.ffn_hc.base,
+                enter: li == 0,
+                leave: li == last,
+                iters: cfg.hc.hc_sinkhorn_iters,
+                pre_scale: 1.0,
+                dsv4: Some(GraphMhcDsv4 {
+                    attn_scale: l.attn_hc.scale,
+                    ffn_scale: l.ffn_hc.scale,
+                    eps: cfg.hc.hc_eps,
+                    rms_eps: cfg.hc.norm_eps,
+                }),
+            }),
+            input_norm: &l.input_norm,
+            attn,
+            post_norm: &l.post_norm,
+            ffn,
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
+        });
+    }
+    Some(out)
+}
+
+/// The graph calls' call-wide attention geometry (heads, head width, scale)
+/// and the widest FFN.
+fn graph_geom(layers: &[Layer]) -> (usize, usize, f32, usize) {
+    let mla = layers.iter().find_map(|l| match &l.mixer {
+        Mixer::Dsa(w) => Some(&w.mla),
+        _ => None,
+    });
+    let (nh, hd, scale) = mla.map_or((1, 64, 0.125), |m| (m.nh, m.qk_rope + m.qk_nope, m.scale));
+    let inter = layers
+        .iter()
+        .map(|l| match &l.ffn {
+            FfnKind::Dense(d) => d.gate_proj.rows(),
+            FfnKind::Moe(m) => m.experts.first().map_or(0, |e| e.gate_proj.rows()),
+            FfnKind::DenseMoe(_) => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    (nh, hd, scale, inter)
+}
+
+/// The host takes the sequence over from the card: its tokens replayed
+/// through the host stack (a refusal or failure after the card held it).
+fn host_replay(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, pool: Option<&Pool>) {
+    let toks = std::mem::take(&mut state.tokens);
+    tracing::warn!("glm5_next: the host replays {} tokens the card held", toks.len());
+    state.reset(layers, cfg);
+    state.graph = Some(false);
+    let mut scratch = Vec::new();
+    for (p, &t) in toks.iter().enumerate() {
+        forward_inner(globals, layers, cfg, state, t, p, pool, &mut scratch, false, false);
+    }
+}
+
+/// A prompt's positions `start..` through the card's batch graph (the rows
+/// in chunks), its last one through the token graph with the logits.
+/// Returns the positions taken (0: none, the caller goes a token at a time).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prompt(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    start: usize,
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+) -> usize {
+    use crate::gpu::BatchGraphOutcome;
+    if ids.len() < 2 || !graph_on() || !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) {
+        return 0;
+    }
+    if start == 0 || state.pos != start {
+        state.reset(layers, cfg);
+    }
+    if state.graph == Some(false) || (start > 0 && state.graph != Some(true)) {
+        return 0;
+    }
+    let Some(model) = globals.embed.model_arc() else { return 0 };
+    let Some(gl) = graph_layers(layers, cfg) else { return 0 };
+    let (nh, hd, scale, inter) = graph_geom(layers);
+    let dim = cfg.hc.dim;
+    // wide: a chunk past the card reads every bank once (wgpu stages each
+    // streamed layer's experts whole); CUDA's small path takes 16 rows at a
+    // time inside it either way
+    let chunk = std::env::var("CMF_GLM_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(512).max(1);
+    let body = ids.len() - 1;
+    let o1: Vec<Option<Vec<crate::nystrom::O1DeviceView<'_>>>> = (0..gl.len()).map(|_| None).collect();
+    let mut done = 0usize;
+    while done < body {
+        let end = (done + chunk).min(body);
+        let k = end - done;
+        let mut h = vec![0.0f32; k * dim];
+        for (j, &t) in ids[done..end].iter().enumerate() {
+            if (t as usize) < globals.embed.rows() {
+                globals.embed.row_f32(t as usize, &mut h[j * dim..(j + 1) * dim]);
+            }
+        }
+        let positions: Vec<usize> = (start + done..start + end).collect();
+        let outcome = crate::gpu::forward_batch_graph_at(
+            &model,
+            state.kv_id(),
+            0,
+            &gl,
+            &[],
+            &mut h,
+            nh,
+            nh,
+            hd,
+            0,
+            dim,
+            inter,
+            &positions,
+            GRAPH_CAP,
+            false,
+            cfg.eps as f32,
+            scale,
+            k,
+            &o1,
+            0,
+            None,
+            None,
+        );
+        match outcome {
+            BatchGraphOutcome::Completed => {
+                if state.graph.is_none() {
+                    tracing::info!("glm5_next: the prompt runs on the card's batch graph");
+                }
+                state.graph = Some(true);
+                state.tokens.extend_from_slice(&ids[done..end]);
+                state.pos = start + end;
+                done = end;
+            }
+            // nothing ran: the caller goes on a token at a time from here
+            BatchGraphOutcome::Declined => return done,
+            BatchGraphOutcome::Failed => {
+                host_replay(globals, layers, cfg, state, pool);
+                return done;
+            }
+        }
+    }
+    forward_token(globals, layers, cfg, state, ids[body], start + body, pool, logits, true);
+    ids.len()
+}
+
+/// One token through the card's graph: the embedding in, the logits (or
+/// nothing) out. Declined: no command ran.
+fn graph_token(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &State,
+    token_id: u32,
+    position: usize,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) -> crate::gpu::TokenGraphOutcome {
+    use crate::gpu::TokenGraphOutcome;
+    if !graph_on() || !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) {
+        return TokenGraphOutcome::Declined;
+    }
+    let Some(model) = globals.embed.model_arc() else { return TokenGraphOutcome::Declined };
+    let Some(gl) = graph_layers(layers, cfg) else { return TokenGraphOutcome::Declined };
+    let Some(head) = gw(&globals.lm_head) else { return TokenGraphOutcome::Declined };
+    let (nh, hd, scale, inter) = graph_geom(layers);
+    let mut h = vec![0.0f32; cfg.hc.dim];
+    if (token_id as usize) < globals.embed.rows() {
+        globals.embed.row_f32(token_id as usize, &mut h);
+    }
+    let o1: Vec<Option<Vec<crate::nystrom::O1DeviceView<'_>>>> = (0..gl.len()).map(|_| None).collect();
+    let vocab = globals.lm_head.rows();
+    crate::gpu::forward_token_graph(
+        &model,
+        state.kv_id(),
+        &gl,
+        &o1,
+        0,
+        &[],
+        &mut h,
+        nh,
+        nh,
+        hd,
+        scale,
+        0,
+        cfg.hc.dim,
+        inter,
+        position,
+        GRAPH_CAP,
+        false,
+        cfg.eps as f32,
+        want_logits.then_some((&head, vocab)),
+        &globals.norm,
+        logits,
+        &[],
+        1,
+        None,
+        None,
+        None,
+        0,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn forward_token(
     globals: &Globals,
     layers: &[Layer],
@@ -1314,6 +1730,23 @@ pub fn forward_token(
     pool: Option<&Pool>,
     logits: &mut Vec<f32>,
     want_logits: bool,
+) {
+    forward_inner(globals, layers, cfg, state, token_id, position, pool, logits, want_logits, true);
+}
+
+/// `forward_token`; `allow_graph` false keeps the host (a replay).
+#[allow(clippy::too_many_arguments)]
+fn forward_inner(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    token_id: u32,
+    position: usize,
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+    allow_graph: bool,
 ) {
     let prof = std::env::var_os("CMF_GLM_PROF").is_some();
     #[cfg(feature = "gpu")]
@@ -1336,6 +1769,38 @@ pub fn forward_token(
     let token_t0 = std::time::Instant::now();
     if position == 0 || state.pos != position {
         state.reset(layers, cfg);
+    }
+    if !allow_graph {
+        state.graph = Some(false);
+    }
+    if state.graph != Some(false) {
+        match graph_token(globals, layers, cfg, state, token_id, position, logits, want_logits) {
+            crate::gpu::TokenGraphOutcome::Completed => {
+                if state.graph.is_none() {
+                    tracing::info!("glm5_next: the stack runs on the card's whole-token graph");
+                }
+                state.graph = Some(true);
+                state.tokens.push(token_id);
+                if !want_logits {
+                    logits.clear();
+                }
+                state.pos = position + 1;
+                if prof {
+                    eprintln!("glm-prof pos={position} total={:.3}s (graph)", token_t0.elapsed().as_secs_f64());
+                }
+                return;
+            }
+            outcome => {
+                if state.graph == Some(true) {
+                    // the card held the sequence: the host replays it from
+                    // its tokens (past `index_topk`, or a refusal on the way)
+                    tracing::warn!("glm5_next: the card's graph stopped at position {position} ({outcome:?})");
+                    host_replay(globals, layers, cfg, state, pool);
+                } else {
+                    state.graph = Some(false);
+                }
+            }
+        }
     }
     // Bring up the native persistent state before any layer touches the
     // mixer.  This is a capability/allocation probe only: the exact host
