@@ -112,6 +112,9 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
+思考型模型的推理放在 `reasoning_content` 中，回答放在 `content` 中；`"reasoning_format": "none"` 让推理以
+`<think>…</think>` 的形式留在 `content` 中。
+
 ## Primal VAE:支持 CUDA(0.8.84)
 
 [Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) 现在也可在 CUDA 上编码和解码，整个前向在显卡上一次运行完成;

@@ -123,6 +123,9 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "cmf", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+A thinking model's reasoning comes in `reasoning_content` and the answer in `content`;
+`"reasoning_format": "none"` keeps the reasoning inline in `content` as `<think>…</think>`.
+
 ## Primal VAE on CUDA (0.8.84)
 
 [Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) encodes and decodes on CUDA too, the whole forward as one

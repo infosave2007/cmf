@@ -928,6 +928,13 @@ struct ChatCompletionsRequest {
     /// top-level field above wins when both are present.
     #[serde(default)]
     chat_template_kwargs: Option<serde_json::Value>,
+    /// llama.cpp's switch for where the generic `<think>` dialect's
+    /// reasoning goes: `"none"` keeps it inline in `content` as
+    /// `<think>…</think>` (the server's behaviour before
+    /// `reasoning_content`); anything else or absent ships it as
+    /// `reasoning_content`.
+    #[serde(default)]
+    reasoning_format: Option<String>,
     /// Cortiq extension: task routing
     #[serde(default)]
     cortiq: Option<CortiqExtension>,
@@ -958,6 +965,12 @@ impl ChatCompletionsRequest {
             Some([]) | None => None,
             Some(ts) => Some(ts),
         }
+    }
+
+    /// `reasoning_format: "none"`: the generic dialect's thinking stays
+    /// inline in `content` instead of `reasoning_content`.
+    fn reasoning_inline(&self) -> bool {
+        self.reasoning_format.as_deref() == Some("none")
     }
 
     /// Effective enable_thinking: top-level field, else chat_template_kwargs.
@@ -1955,10 +1968,14 @@ async fn chat_completions(
             // the old pass-through filter: thinking ships as
             // `reasoning_content` deltas — private, never user content —
             // while the answer streams as it decodes.
-            let think = std::sync::Arc::new(std::sync::Mutex::new(ThinkStream::new(
-                req.thinking() != Some(false),
-                think_prefilled,
-            )));
+            // `reasoning_format: "none"` keeps the thinking inline in
+            // `content`, with a template-opened block's opener put back.
+            let think_stream = if req.thinking() != Some(false) && req.reasoning_inline() {
+                ThinkStream::inline(think_opened)
+            } else {
+                ThinkStream::new(req.thinking() != Some(false), think_prefilled)
+            };
+            let think = std::sync::Arc::new(std::sync::Mutex::new(think_stream));
             // Tool-call holdback: once the model opens a call (any grammar
             // the parser knows), nothing more goes out as content — the
             // calls are parsed whole at the end and shipped as a
@@ -1982,7 +1999,7 @@ async fn chat_completions(
                     let release = think.lock().expect("think router").push(token);
                     if let Some(reasoning) = release.reasoning {
                         let chunk = streaming::reasoning_chunk(&id2, &model2, &reasoning, created);
-                        if !tx_tokens.blocking_send(chunk).is_ok() {
+                        if tx_tokens.blocking_send(chunk).is_err() {
                             return false;
                         }
                     }
@@ -2225,6 +2242,16 @@ async fn chat_completions(
             let content = strip_think_block(&result.text);
             let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
             (plain, calls, None)
+        } else if req.reasoning_inline() {
+            // `reasoning_format: "none"`: the thinking stays inline in
+            // `content`, with a template-opened block's opener put back.
+            let text = if think_opened {
+                format!("<think>{}", result.text)
+            } else {
+                result.text.clone()
+            };
+            let (plain, calls) = extract_tool_calls(&text, req.effective_tools());
+            (plain, calls, None)
         } else if think_opened {
             // A template that opened the block itself: put the opener
             // back, then route like any other thinking reply.
@@ -2448,6 +2475,10 @@ enum ThinkPhase {
     /// Thinking disabled: the old privacy filter — a prefilled empty
     /// block strips away, thinking never reaches the client.
     Stripping,
+    /// `reasoning_format: "none"`: everything is content, thinking
+    /// inline; `pending` holds a template-opened block's opener until the
+    /// first token carries it out.
+    Inline,
 }
 
 impl ThinkStream {
@@ -2467,10 +2498,27 @@ impl ThinkStream {
         }
     }
 
+    /// The inline router for `reasoning_format: "none"`: thinking stays in
+    /// `content` as `<think>…</think>`; `opener` puts back the opener a
+    /// template wrote into the prompt.
+    fn inline(opener: bool) -> Self {
+        Self {
+            phase: ThinkPhase::Inline,
+            pending: if opener { "<think>".to_string() } else { String::new() },
+            opener_prefilled: opener,
+            reasoning_opened: false,
+        }
+    }
+
     fn push(&mut self, token: &str) -> ThinkRelease {
         match self.phase {
             ThinkPhase::Answer => {
                 ThinkRelease { reasoning: None, content: Some(token.to_string()) }
+            }
+            ThinkPhase::Inline => {
+                let mut content = std::mem::take(&mut self.pending);
+                content.push_str(token);
+                ThinkRelease { reasoning: None, content: Some(content) }
             }
             ThinkPhase::Reasoning => self.reasoning_step(token),
             ThinkPhase::Deciding => {
@@ -2885,6 +2933,34 @@ mod tests {
         let mut stream = ThinkStream::new(false, false);
         let _ = stream.push("<think>private");
         assert_eq!(stream.finish(), ThinkRelease::default());
+    }
+
+    #[test]
+    fn think_stream_inline_keeps_thinking_in_content() {
+        // A template-opened block: the opener comes back with the first token.
+        let mut stream = ThinkStream::inline(true);
+        assert_eq!(stream.push("\nplan").content.as_deref(), Some("<think>\nplan"));
+        let release = stream.push("</think>Hi");
+        assert_eq!(release.reasoning, None);
+        assert_eq!(release.content.as_deref(), Some("</think>Hi"));
+        assert_eq!(stream.finish(), ThinkRelease::default());
+        // A reply that opens its own block passes through untouched.
+        let mut stream = ThinkStream::inline(false);
+        assert_eq!(stream.push("<think>x").content.as_deref(), Some("<think>x"));
+    }
+
+    #[test]
+    fn reasoning_format_none_selects_inline() {
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "reasoning_format": "none"
+        }))
+        .unwrap();
+        assert!(req.reasoning_inline());
+        let req: ChatCompletionsRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        assert!(!req.reasoning_inline());
     }
 
     #[test]
