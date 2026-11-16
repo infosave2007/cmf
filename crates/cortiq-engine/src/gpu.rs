@@ -1976,7 +1976,36 @@ pub enum GraphAttn<'a> {
         cpu_k: &'a [Vec<f32>],
         cpu_v: &'a [Vec<f32>],
         cpu_base: usize,
+        /// GLM-5.3's DSA: past `topk` positions the layer attends only to
+        /// the positions its indexer selects (None: every position).
+        dsa: Option<GraphDsa<'a>>,
     },
+}
+
+/// A DSA layer's indexer (GLM-5.3, `glm5_next::dsa_forward`): the index
+/// query over the normed low-rank query, the index key, pool gate and head
+/// weights over the layer input, the key's LayerNorm, the pools' position
+/// embedding, kv_b in f32 for the absorbed attention, and the geometry. The
+/// incomplete tail is always selected.
+pub struct GraphDsa<'a> {
+    /// `[ih·id, q_rank]`.
+    pub index_q: GraphW<'a>,
+    /// `[id, hidden]`.
+    pub index_k: GraphW<'a>,
+    /// `[id, hidden]`.
+    pub pool_gate: GraphW<'a>,
+    /// `[ih, hidden]`.
+    pub index_weights: GraphW<'a>,
+    pub k_norm: &'a [f32],
+    pub k_bias: &'a [f32],
+    /// `[kpool, id]`.
+    pub ape: &'a [f32],
+    /// kv_b `[nh·(nope + v), lora]` in f32.
+    pub kv_b: &'a [f32],
+    pub ih: usize,
+    pub id: usize,
+    pub topk: usize,
+    pub kpool: usize,
 }
 
 /// Per-layer attention geometry for the wgpu graphs (see
@@ -2098,6 +2127,23 @@ pub struct GraphMhc<'a> {
     pub leave: bool,
     pub iters: usize,
     pub pre_scale: f32,
+    /// DeepSeek-V4's form (GLM-5.3): Some = the logits scaled per group
+    /// (pre, post, mix) before their base is added, `pre = σ + eps`, the mix
+    /// a row softmax plus eps then eps-floored column / row normalizations,
+    /// and the router's RMS taken with `rms_eps`. None = SenseNova-Loop's
+    /// log-domain Sinkhorn.
+    pub dsv4: Option<GraphMhcDsv4>,
+}
+
+/// DeepSeek-V4 / GLM-5.3 mHC constants of a layer (see `GraphMhc::dsv4`):
+/// the attention and FFN routers' three group scales, the Sinkhorn epsilon
+/// and the router input's RMS epsilon.
+#[derive(Clone, Copy)]
+pub struct GraphMhcDsv4 {
+    pub attn_scale: [f32; 3],
+    pub ffn_scale: [f32; 3],
+    pub eps: f32,
+    pub rms_eps: f32,
 }
 
 pub struct GraphLayer<'a> {
@@ -2213,6 +2259,10 @@ pub enum GraphFfn<'a> {
         /// Multiplier on the routed mixing weights after the optional
         /// renormalization (`routed_scaling_factor`); 1.0 = none.
         route_scale: f32,
+        /// SwiGLU clamp of every routed and shared expert (GLM-5.3: the gate
+        /// from above, up on both sides), 0 = none. The CUDA hybrid's pair
+        /// epilogue takes it; the wgpu graphs decline a clamped bank.
+        limit: f32,
     },
 }
 
