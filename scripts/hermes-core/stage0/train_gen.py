@@ -1,6 +1,6 @@
 """Training tasks of "reasoning over a card", disjoint from the R set.
 
-    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N [--over-files P]]
+    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N [--over-files P]] [--rules N]
 
 Output: one `{"messages": [user, assistant], "group": ..., "cat": ...}` per
 line, the `messages` format of `cortiq-embryo sft-prepare` (`group` drives
@@ -51,6 +51,11 @@ filter over a file ("Show the fifth column of the lines of /srv/a.log that
 match cache." -> rg cache /srv/a.log | gawk '{print $5}'). Without it a file
 in the request always meant one command, and a model taught so answers a
 pipeline over a file with one of its two cards.
+
+--rules N appends N more `react` tasks from a fourth generator, with what the
+rule sets above lack: 3 to 5 rules, a rule with two quoted strings ("... contains
+"A" or "B", answer L."), outputs of several lines, and an output without any of
+the strings in 3 tasks of 10 (a listing, a table: the last rule applies).
 
 The generator is a program over tldr-pages (CC-BY 4.0) text; no model wrote
 any of the data.
@@ -357,7 +362,8 @@ PIPE_FILTERS = [  # (page, the card's example, requests over {s}: what is filter
 ]
 
 
-def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, over_files: float = 0.0) -> list[dict]:
+def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, over_files: float = 0.0,
+             rules: int = 0) -> list[dict]:
     rng = random.Random(seed)
     used = set()
     for f in F.FAMILIES:
@@ -608,6 +614,37 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
         prompt = "Reference cards:\n" + "\n\n".join(cards) + f"\n\nTask: {verb} {sphr} {sub(fphr)}.\n\n{one}"
         return msg(prompt, f"{scmd} | {sub(fcmd)}", sp, "two")
 
+    def more_rules():
+        """Rule tasks with rules of two strings, longer rule sets and outputs of several lines. Its own generator."""
+        r = random.Random(seed + 9973)
+        quiet = lambda: r.choice([
+            "  ".join(f"{r.choice(WORDS)}.{r.choice(EXTS)}" for _ in range(r.randint(2, 5))),
+            f"total {r.randint(4, 900)}\n" + "\n".join(f"-rw-r--r-- 1 {r.choice(USERS)} staff {r.randint(90, 9000):>5} Mar  3 09:12 {r.choice(WORDS)}.log"
+                                                    for _ in range(r.randint(1, 3))),
+            f"Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        {r.randint(20, 200)}G   {r.randint(2, 19)}G   {r.randint(1, 90)}G  {r.randint(3, 97)}% /",
+            f"{r.randint(1, 400)} {r.choice(WORDS)}.txt", f"{r.choice(SERVICES)} is running", f"{r.choice(HOSTS)}", r.choice(benign)])
+        got = []
+        while len(got) < rules:
+            k = r.choice([3, 4, 5])
+            lab = r.sample(labels, k + 1)
+            sets, pool_ = [], r.sample(triggers, k + 2)
+            for i in range(k):  # one rule in three names two strings
+                sets.append([pool_.pop(), pool_.pop()] if pool_ and len(pool_) > k - i and r.random() < 0.33 else [pool_.pop()])
+            lines = ["- If the output contains " + " or ".join(f'"{t}"' for t in ts) + f", answer {l}." for ts, l in zip(sets, lab)]
+            head = "Rules for the next action:\n" + "\n".join(lines) + f"\n- Otherwise answer {lab[-1]}."
+            prog = r.choice(progs)
+            cmdline = f"{prog} {rfile(r)}" if r.random() < 0.7 else f"{prog} {word(r)}"
+            if r.random() < 0.3:
+                j, outp = k, quiet()
+            else:
+                j = r.randrange(k)
+                t = r.choice(sets[j])
+                outp = r.choice([f"{prog}: {rfile(r)}: {t}", f"{prog}: error: {t}", f"fatal: {t}", f"E: {t}", f"bash: {prog}: {t}",
+                                 f"{prog}: cannot open '{rfile(r)}': {t}", f"{r.choice(benign)}\n{prog}: {t}"])
+            prompt = f"{head}\n\nPrevious command: {cmdline}\nIts output:\n{outp}\n\nTask: Decide the next action.\n\n{INSTR['label']}"
+            got.append(msg(prompt, lab[j], "react", "react"))
+        return got
+
     lognames = [f"{w}.log" for w in WORDS[:40]] + [f"{w}.dat" for w in WORDS[40:60]]
 
     def arith():
@@ -670,7 +707,7 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
                       ("react", react), ("fix", fix), ("two", two), ("arith", arith)):
         many(cat, make)
     rng.shuffle(out)
-    if not contrast and not pipes:
+    if not contrast and not pipes and not rules:
         return out
 
     # One command in the wording of `two`, and `two` in more wordings: its own generator, appended.
@@ -745,8 +782,9 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
         extra += [make() for _ in range(int(contrast * share))]
     rng.shuffle(extra)
     out = out + extra
+    tail = more_rules() if rules else []  # after everything else: the tasks before it keep their places
     if not pipes:
-        return out
+        return out + tail
 
     # Pipelines over many commands: a listing of any page and a filter that reads it. Its own generator, appended.
     rng = random.Random(seed + 7717)
@@ -845,7 +883,7 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
             except Skip:
                 pass
     rng.shuffle(more)
-    return out + more
+    return out + more + tail
 
 
 def main() -> None:
@@ -862,8 +900,10 @@ def main() -> None:
                          "it (7 in 10), the same filter over a file (2 in 10), the listing alone (1 in 10)")
     ap.add_argument("--over-files", type=float, default=0.0,
                     help="share of the --pipes pipelines whose first command is itself a filter over a file")
+    ap.add_argument("--rules", type=int, default=0,
+                    help="append N rule tasks with rules of two quoted strings, 3 to 5 rules, outputs of several lines")
     args = ap.parse_args()
-    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes, args.over_files)
+    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes, args.over_files, args.rules)
     seen, uniq = set(), []
     for r in rows:
         key = (r["messages"][0]["content"], r["messages"][1]["content"])
