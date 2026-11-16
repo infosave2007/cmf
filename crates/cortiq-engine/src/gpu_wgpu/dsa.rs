@@ -341,7 +341,7 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                     module: &m,
                     entry_point: Some(e),
                     compilation_options: crate::gpu_wgpu::pco(),
-                    cache: None,
+                    cache: c.pipeline_cache.as_ref(),
                 })
             };
             let p = Pipes {

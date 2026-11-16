@@ -24226,6 +24226,38 @@ pub fn pipeline_cache_flush() {
     pipeline_cache_store(c.pipeline_cache.as_ref(), &c.adapter_info);
 }
 
+/// Size of the blob last written (or loaded), so a generation's end can tell
+/// whether the driver compiled anything since.
+static PIPELINE_CACHE_SAVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Save the pipeline cache when it holds more than the file does.
+///
+/// Kernels built at first use (the batch graph's attention, a model family's
+/// own set) are compiled by the driver during the first generation, after
+/// `init` wrote its blob. The save at the start of a SECOND generation never
+/// came for a process that answers once — `cortiq run -p`, a bench, an app
+/// closed after one reply — so each such process compiled them again: on an
+/// Adreno 642L 41 s before the first token of every run, 6.7 s once kept.
+pub fn pipeline_cache_flush_if_grown() {
+    // Only a context that already exists: a generation that ran on the CPU
+    // must not bring the device up just to find nothing to save.
+    let built: Option<&'static Ctx> = CTXS.get().and_then(|map| {
+        let g = map.lock().unwrap();
+        g.get(&crate::gpu::current_device())
+            .and_then(|slot| slot.as_deref())
+            .map(|c| unsafe { &*(c as *const Ctx) })
+    });
+    let Some(c) = built else { return };
+    let Some(cache) = c.pipeline_cache.as_ref() else { return };
+    let _op = c.op_gate.enter();
+    let Some(data) = cache.get_data() else { return };
+    use std::sync::atomic::Ordering;
+    if data.len() == PIPELINE_CACHE_SAVED.load(Ordering::Relaxed) {
+        return;
+    }
+    pipeline_cache_write(&data, &c.adapter_info);
+}
+
 /// Where this device's compiled pipelines are remembered between runs.
 ///
 /// Measured on a Snapdragon 778G (Adreno 642L, Vulkan): building the
@@ -24445,10 +24477,19 @@ fn pipeline_cache_store(cache: Option<&wgpu::PipelineCache>, info: &wgpu::Adapte
     let Some(data) = cache.get_data() else {
         return;
     };
+    let _ = path;
+    pipeline_cache_write(&data, info);
+}
+
+fn pipeline_cache_write(data: &[u8], info: &wgpu::AdapterInfo) {
+    let Some(path) = pipeline_cache_path(info) else {
+        return;
+    };
     // Write-and-rename: a half-written blob handed to a driver next run
     // is exactly the crash this whole path is careful about.
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+    if std::fs::write(&tmp, data).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        PIPELINE_CACHE_SAVED.store(data.len(), std::sync::atomic::Ordering::Relaxed);
         tracing::debug!("pipeline cache: {} B saved", data.len());
     }
 }
@@ -29306,7 +29347,10 @@ pub fn forward_token_graph(
     // a later layer's dense part no longer fit.
     // GLM's DSA past its selection: the token graph's kernels (`dsa`), or
     // none on a device without them
-    if dsa::pipes(c).is_none() && layers.iter().any(|l| matches!(&l.attn, crate::gpu::GraphAttn::Mla { dsa: Some(d), .. } if position + 1 > d.topk)) {
+    // The model is asked first: `dsa::pipes` compiles the DSA kernels, which on
+    // a phone driver is seconds of shader compiling a model without DSA never
+    // uses (an Adreno 642L spent ~12 s of every process's first answer there).
+    if layers.iter().any(|l| matches!(&l.attn, crate::gpu::GraphAttn::Mla { dsa: Some(d), .. } if position + 1 > d.topk)) && dsa::pipes(c).is_none() {
         graph_decline("DSA past its selection");
         return token_graph_outcome(o1_started || state_started, false);
     }

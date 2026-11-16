@@ -5937,6 +5937,15 @@ const GRAPH_RACE_SAMPLES: u32 = 4;
 
 /// Called at every generation start (fresh KV). Applies a pending
 /// verdict and picks this generation's arm while racing.
+/// A generation has ended: keep whatever the driver compiled during it
+/// (`pipeline_cache_flush_if_grown`). No-op off wgpu and when nothing is new.
+pub fn generation_end() {
+    #[cfg(feature = "gpu")]
+    if matches!(backend(), Backend::Wgpu) {
+        crate::gpu_wgpu::pipeline_cache_flush_if_grown();
+    }
+}
+
 pub fn graph_race_begin_generation() {
     // One generation has now compiled whatever this model needs; keep it
     // for the next process. Once per run: the blob does not grow after
