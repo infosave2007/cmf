@@ -1,6 +1,6 @@
 """Training tasks of "reasoning over a card", disjoint from the R set.
 
-    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N]
+    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N [--over-files P]]
 
 Output: one `{"messages": [user, assistant], "group": ..., "cat": ...}` per
 line, the `messages` format of `cortiq-embryo sft-prepare` (`group` drives
@@ -46,6 +46,11 @@ that match cache."):
   two     7 in 10: listing | filter, from two cards
   slot    2 in 10: the same filter over a file, one command, in the same words
   slot, direct  1 in 10: the listing alone
+--over-files P: in that share of the pipelines the first command is itself a
+filter over a file ("Show the fifth column of the lines of /srv/a.log that
+match cache." -> rg cache /srv/a.log | gawk '{print $5}'). Without it a file
+in the request always meant one command, and a model taught so answers a
+pipeline over a file with one of its two cards.
 
 The generator is a program over tldr-pages (CC-BY 4.0) text; no model wrote
 any of the data.
@@ -352,7 +357,7 @@ PIPE_FILTERS = [  # (page, the card's example, requests over {s}: what is filter
 ]
 
 
-def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0) -> list[dict]:
+def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, over_files: float = 0.0) -> list[dict]:
     rng = random.Random(seed)
     used = set()
     for f in F.FAMILIES:
@@ -791,8 +796,22 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0) -
         return card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
 
     def pipeline():
-        sp, si, scmd, noun, _ = listing()
+        if over_files and rng.random() < over_files:  # the first command is a filter over a file: both cards are filters
+            sp, si, _, inner = rng.choice(on_files)
+            inner = [p for p in inner if not p[0].isupper() and "that output" not in p and ", " not in p]
+            if not inner:
+                raise Skip
+            _, scmd, got = fill_example(*pages[sp][2][si], rng)
+            first = rng.choice(inner)
+            noun = first.format(s=" and ".join(got[-1][1].split(" ")), v=got[0][1])
+        else:
+            first = None
+            sp, si, scmd, noun, _ = listing()
         fp, fi, form, phrases = rng.choice(flt)
+        if first:  # the order must read one way: "the X of the Y of f" or "f, Y-ed, X-ed", never a mix of the two
+            phrases = [p for p in phrases if p[0].isupper() or "that output" in p or p.startswith("{s}") == first.startswith("{s}")]
+            if not phrases:
+                raise Skip
         if pages[fp][0] == pages[sp][0]:
             raise Skip
         _, fcmd, pairs = fill_example(pages[fp][2][fi][0], form, rng)
@@ -841,8 +860,10 @@ def main() -> None:
     ap.add_argument("--pipes", type=int, default=0,
                     help="append N tasks of pipelines over many commands: a listing of any page and a filter that reads "
                          "it (7 in 10), the same filter over a file (2 in 10), the listing alone (1 in 10)")
+    ap.add_argument("--over-files", type=float, default=0.0,
+                    help="share of the --pipes pipelines whose first command is itself a filter over a file")
     args = ap.parse_args()
-    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes)
+    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes, args.over_files)
     seen, uniq = set(), []
     for r in rows:
         key = (r["messages"][0]["content"], r["messages"][1]["content"])
