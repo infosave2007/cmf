@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-11-16
+
 ### Added
 - Skills on the CUDA hybrid arm, every way the host applies them, on the card:
   - a pinned skill (`run/ppl --skill`) was already read by the plans through the skill's tensors; now measured
