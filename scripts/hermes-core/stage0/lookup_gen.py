@@ -1,7 +1,7 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
-                            [--ranked] [--need] [--teach P] [--pipes]
+                            [--ranked] [--need] [--teach P] [--pipes] [--reason]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -61,6 +61,13 @@ says that one card does not do all of it, which card gives the output and
 which works on it, then each card's example and its values; the second
 example is used without its file, or it is the part after the pipe of the
 card's own example.
+
+`--reason`: `react` and `arith` answers come after a line of reasoning that
+puts what the answer is read from next to it: the quoted string the output
+contains and its rule's label; the rows taken from the table and the
+operation on them. Without it they are bare answers, and at half of the base
+the model gave one label of its training set to every R rule task (0 of 25)
+and a number near the table's (6 of 40).
 """
 
 from __future__ import annotations
@@ -261,11 +268,88 @@ def pattern_think(card, what, tpl, pairs, lead="", cite=False):
     return head + " " + "; ".join(f"{ph} → {v}" for ph, v in pairs) + "."
 
 
-def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False):
+RULE = re.compile(r"^- If the output contains (.+), answer (\S+)\.$")
+LS_ROW = re.compile(r"^\S+ +\d+ \S+ \S+ +(\d+) \w+ +\d+ [\d:]+ (\S+)$")
+ASKS = [
+    ("count", re.compile(r"How many of these files are larger than (\d+) bytes\?")),
+    ("sum", re.compile(r"What is the combined size in bytes of (\S+) and (\S+)\?")),
+    ("sum", re.compile(r"How many lines do (\S+) and (\S+) have together\?")),
+    ("max", re.compile(r"Which file has the most lines\?")),
+    ("avail", re.compile(r"How many GB are available on (\S+)\?")),
+    ("used", re.compile(r"How many GB are used on (\S+) and (\S+) together\?")),
+    ("diff", re.compile(r"How many KB larger is (\S+) than (\S+)\?")),
+    ("user", re.compile(r"How many of these processes belong to the user (\S+)\?")),
+]
+
+
+def react_think(prompt: str, answer: str) -> str:
+    """Which quoted string of the rules the output contains, and the label of that rule."""
+    head, rest = prompt.split("\n\nPrevious command: ", 1)
+    out = rest.split("Its output:\n", 1)[1].split("\n\nTask:", 1)[0]
+    for line in head.split("\n"):
+        m = RULE.match(line)
+        for trig in re.findall(r'"([^"]+)"', m.group(1)) if m else ():
+            if trig in out:
+                if m.group(2) != answer:
+                    raise Skip
+                return f'The output contains "{trig}": the rule for it says {answer}.'
+    other = re.search(r"^- Otherwise answer (\S+)\.$", head, re.M)
+    if not other or other.group(1) != answer:
+        raise Skip
+    return f"The output contains none of the quoted strings: the last rule says {answer}."
+
+
+def arith_think(prompt: str, answer: str) -> str:
+    """The rows the question is about, read from the table, and the operation on them."""
+    table, _, question = prompt.partition("\n\nQuestion: ")
+    rows = table.split("\n")[1:]
+    kind, m = next(((k, rx.search(question)) for k, rx in ASKS if rx.search(question)), (None, None))
+    if kind is None:
+        raise Skip
+    if kind in ("count", "sum", "max"):  # name -> number: `ls -l` sizes or `wc -l` counts
+        val = {}
+        for r in rows:
+            ls = LS_ROW.match(r)
+            if ls:
+                val[ls.group(2)] = int(ls.group(1))
+            elif len(r.split()) == 2 and r.split()[0].isdigit() and r.split()[1] != "total":
+                val[r.split()[1]] = int(r.split()[0])
+        if kind == "count":
+            over = [v for v in val.values() if v > int(m.group(1))]
+            think, result = f"Larger than {m.group(1)}: {', '.join(map(str, over))}. That is {len(over)}.", str(len(over))
+        elif kind == "sum":
+            a, b = val[m.group(1)], val[m.group(2)]
+            think, result = f"{m.group(1)}: {a}. {m.group(2)}: {b}. {a} + {b} = {a + b}.", str(a + b)
+        else:
+            top = max(val, key=val.get)
+            think, result = f"The largest count is {val[top]}: {top}.", top
+    elif kind in ("avail", "used"):  # df -h: Filesystem Size Used Avail Use% Mounted on
+        col = {r.split()[5]: r.split() for r in rows[1:] if len(r.split()) == 6}
+        if kind == "avail":
+            a = col[m.group(1)][3]
+            think, result = f"Row {m.group(1)}: Avail {a}.", a.rstrip("G")
+        else:
+            a, b = int(col[m.group(1)][2].rstrip("G")), int(col[m.group(2)][2].rstrip("G"))
+            think, result = f"{m.group(1)}: Used {a}G. {m.group(2)}: Used {b}G. {a} + {b} = {a + b}.", str(a + b)
+    elif kind == "diff":  # du -sk: KB<TAB>directory
+        kb = {r.split("\t")[1]: int(r.split("\t")[0]) for r in rows if "\t" in r}
+        a, b = kb[m.group(1)], kb[m.group(2)]
+        think, result = f"{m.group(1)}: {a}. {m.group(2)}: {b}. {a} - {b} = {a - b}.", str(a - b)
+    else:  # ps -eo user,pid,comm
+        pids = [r.split()[1] for r in rows[1:] if r.split()[0] == m.group(1)]
+        think, result = f"Rows of {m.group(1)}: PID {', '.join(pids)}. That is {len(pids)}.", str(len(pids))
+    if result != answer:
+        raise Skip
+    return think
+
+
+def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False,
+          reason=False):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat in ("react", "arith"):
-        return "direct", [("user", prompt), ("assistant", None, answer, [])]
+        think = (react_think if cat == "react" else arith_think)(prompt, answer) if reason else None
+        return "direct", [("user", prompt), ("assistant", think, answer, [])]
     cards, ctx, task, _ = split_prompt(prompt)
     if not cards:
         raise Skip
@@ -491,6 +575,9 @@ def main() -> None:
     ap.add_argument("--pipes", action="store_true",
                     help="a pipeline is looked up by what is needed, not by command names, and built from the cards that "
                          "came back: which gives the output, which works on it, each example and its values")
+    ap.add_argument("--reason", action="store_true",
+                    help="react and arith answers come after the reasoning they are read from: the matching rule; the rows "
+                         "of the table and the operation")
     ap.add_argument("--teach", type=float, default=0.0,
                     help="share of conversations where the store lacks the command, the user gives it after NONE and the model "
                          "saves a card with the note tool; half of the other conversations then list that tool too, and in "
@@ -517,7 +604,8 @@ def main() -> None:
             gzip.open(args.out + ".val.jsonl.gz", "wt", encoding="utf-8") as fv:
         for r in recs:
             try:
-                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes)
+                mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes,
+                                    args.reason)
                 direct = mode == "direct"
                 tools = TOOLS
                 if args.teach > 0 and not direct:
