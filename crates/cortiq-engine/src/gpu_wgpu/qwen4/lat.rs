@@ -814,6 +814,13 @@ impl LatDev {
             }
         };
         let mut stage = vec![0u8; slot * 32];
+        // Each `write_buffer` holds its bytes in a staging allocation until a
+        // submission carries the copy; without a flush the whole bank of every
+        // layer sat in staging beside its card copy until the first frame
+        // (Edge0-145B on a Radeon 8060S: 90.6 GB of GTT and swap full during
+        // the upload, 59 GB once settled). At most this much stays in flight.
+        const FLUSH_BYTES: usize = 192 << 20;
+        let mut queued = 0usize;
         for (c0, chunk) in moe.experts.chunks(32).enumerate() {
             stage.iter_mut().for_each(|b| *b = 0);
             for (j, e) in chunk.iter().enumerate() {
@@ -835,8 +842,18 @@ impl LatDev {
                         return None;
                     }
                 }
-                None => c.queue.write_buffer(&bank, (c0 * 32 * slot) as u64, &stage[..chunk.len() * slot]),
+                None => {
+                    c.queue.write_buffer(&bank, (c0 * 32 * slot) as u64, &stage[..chunk.len() * slot]);
+                    queued += chunk.len() * slot;
+                    if queued >= FLUSH_BYTES {
+                        super::flush_writes();
+                        queued = 0;
+                    }
+                }
             }
+        }
+        if queued > 0 {
+            super::flush_writes();
         }
         let labels_u: Vec<u32> = lat.labels.iter().map(|&g| g as u32).collect();
         let labels = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
