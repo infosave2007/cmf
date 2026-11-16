@@ -327,12 +327,17 @@ pub fn gemm_nt(
     // The native CUDA backend takes a large f32 GEMM on the tensor cores
     // (TF32) without arbitration against the host — the convolutions of a
     // VAE encoder arrive here as im2col products.
+    // The bake's strict phase takes plain f32 there (`bake_gemm_nt`).
     #[cfg(feature = "cuda")]
     if n * k * m >= (1 << 22)
         && m >= 16
         && crate::gpu::cuda_active()
         && crate::gpu::enabled_here()
-        && crate::gpu_cuda::h3_gemm_nt(x, w, y, n, k, m)
+        && if crate::gpu_wgpu::bake_f32_strict() {
+            crate::gpu_cuda::bake_gemm_nt(x, w, y, n, k, m)
+        } else {
+            crate::gpu_cuda::h3_gemm_nt(x, w, y, n, k, m)
+        }
     {
         return;
     }
@@ -575,6 +580,14 @@ pub fn gemm_dx(
     // The card takes the backward too: phase A of a bake is three of
     // these per layer and nothing else, so this is what makes a bake
     // GPU work rather than a CPU vigil. CMF_BAKE_GPU=0 opts out.
+    #[cfg(feature = "cuda")]
+    if n * k * m >= (1 << 22)
+        && crate::gpu::cuda_active()
+        && crate::gpu::enabled_here()
+        && crate::gpu_cuda::bake_gemm_dx(dy, w, dx, n, k, m)
+    {
+        return;
+    }
     #[cfg(feature = "gpu")]
     if crate::gpu_wgpu::gemm_dx_f32(dy, w, dx, n, k, m) {
         return;

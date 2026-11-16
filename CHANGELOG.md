@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-11-16
+
 ### Added
+- Skills on the CUDA hybrid arm, every way the host applies them, on the card:
+  - a pinned skill (`run/ppl --skill`) was already read by the plans through the skill's tensors; now measured
+    against the float host: Qwen3.5-0.8B q4tp with a 96-tensor skill (BotPsy-0.8B FFN and full attention),
+    64 greedy tokens on four prompts, top-1 64/64 and the same text, logits within 0.011; perplexity the
+    CPU's to three digits with and without the skill (38.689 / 30.868);
+  - a soft blend (`--blend`): its f32 working tensors go to the card once as q8_2f int8 tiles, encoded on the
+    host's cores in parallel (before: every graph declined and the blend ran per op, 9.8 tok/s on that 0.8B;
+    now 346 tok/s, the same text as the CPU's blend);
+  - per-token routing (`--route-dynamic`): the token and batch graphs keep the router layer's row (the layer
+    taps the DFlash drafter uses), so φ moves on the card; before, the graph ran the router's layer and φ never
+    changed (the router never left the backbone, silently), and MTP drafts took the router away altogether.
+    Same E values and switch points as the CPU, the prompt read batched (first token 0.3 s against the CPU's
+    6.9 s on a 90-token prompt).
+  - the skill's speed is the backbone's: A40, medians of three, 128 decode tokens without drafts and a
+    4096-token prompt — Qwen3.5-0.8B 429 / 415 tok/s and 20 895 / 20 150 tok/s without / with the skill,
+    Qwen3.5-4B (a 128-tensor skill from NeoHorse-1-4B) 159 / 157 and 5 950 / 5 950; the 4B's greedy text and
+    logits match the float host with and without it (top-1 64/64, within 0.043).
+- `cortiq skill bake` on CUDA (`CMF_GPU=cuda`): a Phase-A step of a Qwen3.5-class model runs whole on the card
+  — embeddings, every layer (frozen GDN and gated full attention, the masked FFN, both norms), the loss over
+  the scored rows on the full vocabulary and the FFN path's backward down to every layer's mask gradient —
+  with the ids up and the per-row losses and mask gradients down. The GDN recurrence (conv, delta rule,
+  BPTT), the exact attention core, the FFN chain and the LM-head cross-entropy have CUDA kernels of their own,
+  checked against the f64 host operators (relative 1e-7 to 4e-7); the layer-by-layer path keeps them for
+  Phase B and the through-attention backward. Qwen3.5-0.8B q4tp on an A40, 64 records of up to 128 tokens a
+  step: 0.2 s a step against 30–41 s on 0.9.2 (Vulkan chains with the GDN layers in f64 on a 7-core host), a
+  held-out pass of 400 records in seconds instead of 5 minutes, the same masked PPL and token accuracy as the
+  host path (1.614 / 84.09 %). `CMF_BAKE_RESIDENT=0` keeps the layer-by-layer path.
+- `cortiq skill apply --overlay`: a standalone skill file goes beside the base as `skill.<id>.*` instead of
+  replacing its tensors, so one file serves the backbone and, under `--skill <id>`, the specialist. Masks the
+  skill's record does not link stay out (a mask in the catalog is what a file without its default task falls
+  back to: the base itself would serve masked, on the host's sparse FFN arm).
+- `cortiq bench --skill <id>` and `cortiq serve --skill <id>` (every slot runs that skill).
+
+### Fixed
+- Dynamic skill routing: a switch mid-generation cleared the sequence and the next token was decoded against an
+  empty cache (fluent nonsense after the switch, on every backend). The context so far is now read again under
+  the new weights (the batch graph where generation takes it), and `ppl --route-dynamic` does the same.
+- `skill bake` with `CMF_BAKE_SKIP_BASELINE=1` compared the result with the skipped (NaN) baseline and printed
+  "did not beat baseline"; it now says the baseline was skipped.
 - Server: the generic `<think>` dialect (LFM3, Qwen and every other family that opens its own block) now
   releases thinking as `reasoning_content` — streaming deltas and the non-streaming message field — in the
   shape DeepSeek made the convention for OpenAI-compatible servers. Previously only DeepSeek V4.1 and

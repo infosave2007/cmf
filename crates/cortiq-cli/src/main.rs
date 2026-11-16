@@ -436,6 +436,12 @@ enum Commands {
         /// (the table is ignored). Default: CMF_LOOKUP_MODE.
         #[arg(long)]
         lookup_mode: Option<String>,
+        /// Skill to overlay on every slot (spec §9), as `run --skill`: its
+        /// replacement tensors are read in place of the backbone's. Every
+        /// request runs that skill (a router policy's per-request choice is
+        /// off)
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// d1 decision models (Liquid AI's System One on LFM3): named questions
     /// over a state and its pictures, answered from one forward pass as
@@ -2220,6 +2226,10 @@ enum Commands {
         /// Permanent exact sink keys for --o1 (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// Skill to overlay while measuring (spec §9): its replacement
+        /// tensors are read in place of the backbone's, as `run --skill`
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Score skills for a prompt (recon-argmin routing, spec 9)
     Route {
@@ -4119,6 +4129,12 @@ enum SkillCmd {
         /// skill's key (the result is unsupported territory)
         #[arg(long)]
         force: bool,
+        /// Keep the backbone: write the skill's tensors beside the base's as
+        /// `skill.<id>.*` with its record, so `run/serve/bench --skill <id>`
+        /// overlays it at inference and the file without `--skill` is the
+        /// base, byte for byte in every base tensor
+        #[arg(long)]
+        overlay: bool,
     },
     /// Graft a skill from a donor HF checkpoint (same architecture):
     /// replacement tensors + routing subspace + measured quality
@@ -4483,10 +4499,12 @@ async fn main() -> anyhow::Result<()> {
             gpus,
             route_include_quarantine,
             lookup_mode,
+            skill,
         } => {
             // The language-model flags a decision file refuses (spec §4.2).
             let llm_given: Vec<&'static str> = [
                 ("--task", task.is_some()),
+                ("--skill", skill.is_some()),
                 ("--compat-port", compat_port.is_some()),
                 ("--o1", o1.is_some()),
                 ("--o1-m", o1_m.is_some()),
@@ -4535,6 +4553,7 @@ async fn main() -> anyhow::Result<()> {
                 gpus,
                 route_include_quarantine,
                 lookup_mode.as_deref(),
+                skill.as_deref(),
             )
             .await
         }
@@ -6786,6 +6805,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
             bw,
+            skill,
         } => {
             if bw {
                 return cmd_bench_bw(json, &model);
@@ -6812,6 +6832,7 @@ async fn main() -> anyhow::Result<()> {
                 &net_dtype,
                 peer_head,
                 gpus,
+                skill.as_deref(),
             )
             .await
         }
@@ -6868,7 +6889,8 @@ async fn main() -> anyhow::Result<()> {
                 skill,
                 output,
                 force,
-            } => skill::run_skill_apply(&base, &skill, &output, force),
+                overlay,
+            } => skill::run_skill_apply(&base, &skill, &output, force, overlay),
             SkillCmd::Bake {
                 model,
                 files,
@@ -8314,6 +8336,7 @@ async fn cmd_serve(
     replicas: Option<usize>,
     route_include_quarantine: bool,
     lookup_mode: Option<&str>,
+    skill: Option<&str>,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -8451,7 +8474,7 @@ async fn cmd_serve(
         if let Some(d) = devices.get(i) {
             cortiq_engine::gpu::set_current_device(*d);
         }
-        let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+        let mut pipeline = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), skill)?;
         // No endpoint reports per-token confidence, and it is a full-vocab
         // softmax every token (~1 ms at Gemma's 262k vocab).
         // `CMF_SERVE_CONFIDENCE=1` keeps it.
@@ -8519,6 +8542,9 @@ async fn cmd_serve(
     // skill gets its own lane on first use. φ runs on a separate backbone
     // pipeline so no slot's conversation state is reset by routing.
     let routing = if !cortiq_engine::router::is_router_v2(&model) {
+        None
+    } else if let Some(id) = skill {
+        println!("    Router v2: OFF under --skill — every request runs skill '{id}'");
         None
     } else if remote.is_some() {
         println!(
@@ -13236,11 +13262,15 @@ async fn cmd_bench(
     net_dtype: &str,
     peer_head: bool,
     gpus: Option<usize>,
+    skill: Option<&str>,
 ) -> anyhow::Result<()> {
     if !json {
         println!(
-            "Benchmark: {} | task={} | tokens={}",
-            model_path, task, tokens
+            "Benchmark: {} | task={} | tokens={}{}",
+            model_path,
+            task,
+            tokens,
+            skill.map(|s| format!(" | skill={s}")).unwrap_or_default()
         );
     }
     if let Some(n) = ctx {
@@ -13270,7 +13300,7 @@ async fn cmd_bench(
         dtype_n(TensorDtype::Q8_2f),
         dtype_n(TensorDtype::F16),
     );
-    let mut pipeline = Pipeline::from_model(
+    let mut pipeline = Pipeline::from_model_with_skill(
         &model,
         SamplerConfig {
             temperature: 0.0, // greedy: benchmark must be deterministic
@@ -13283,6 +13313,7 @@ async fn cmd_bench(
             },
             ..Default::default()
         },
+        skill,
     )?;
     if ignore_eos {
         // A loop flag, not a suppression: the earlier form put every EOS id
@@ -13771,6 +13802,7 @@ async fn cmd_bench(
             "tensor_q8_2f": tensor_q8_2f,
             "tensor_f16": tensor_f16,
             "task": task,
+            "skill": skill,
             "ctx": ctx,
             "o1": pipeline.o1_active(),
             "o1_prefill_tokens": std::env::var("CMF_O1_PREFILL")

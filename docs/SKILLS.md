@@ -204,6 +204,51 @@ swarm's E floor is 0.662, so an untuned file honestly stays on the
 backbone. Raise the thresholds when your skills' φ statistics sit
 further from live prompts than in this demo.
 
+## Skills on an NVIDIA card (CUDA)
+
+Every way of applying a skill above runs on the CUDA backend (`--features cuda`, `CMF_GPU=cuda`) without
+handing the overlaid layers back to the host:
+
+| | on the card |
+|---|---|
+| `--skill <id>` | the graphs read the skill's tensors in place of the backbone's, in the skill's own codec |
+| `--blend` | the blend's f32 working tensors go to the card once as q8_2f int8 tiles |
+| `--route-dynamic` | the graphs keep the router layer's row, so φ moves every token; a switch reads the context again under the new weights |
+
+```sh
+cortiq skill apply base.cmf code.skill.cmf --overlay -o base+code.cmf   # backbone and skill in one file
+CMF_GPU=cuda cortiq bench base+code.cmf --skill code                     # speed with the skill
+CMF_GPU=cuda cortiq serve base+code.cmf --skill code                     # every request runs the skill
+```
+
+`--overlay` writes the skill's tensors beside the base's as `skill.<id>.*`: without `--skill` the file is the
+base, byte for byte in every base tensor; with it, the specialist. A physically defragmented skill (tensors of
+another shape) cannot ride beside its base and is refused by name; apply it without `--overlay`.
+
+### Baking on the card
+
+`cortiq skill bake` runs on CUDA too (`CMF_GPU=cuda`). A Phase-A step of a Qwen3.5-class model is one resident
+pass on the card: the ids go up, the per-row losses and the mask gradients come down. On an A40 a 0.8B step of
+64 records × 128 tokens takes 0.2 s, a 4B step of 32 records 0.6 s (the Vulkan path with the GDN layers on the
+host took 30–41 s for the 0.8B step).
+
+What the method gave, measured on held-out data that never entered the bake (greedy answers through
+`serve --skill` on the card):
+
+| task | model | without the skill | with it |
+|---|---|---:|---:|
+| emotion of a short text, 6 labels, 2000 test texts | Qwen3.5-0.8B q4tp | 38.3 % | 64.1 % |
+| same | Qwen3.5-4B q4tp | 55.7 % | 71.0 % |
+| Cortiq-Coder answers, 40 test records | Qwen3.5-0.8B q4tp | answer PPL 2.728 | 2.685 |
+| same | Qwen3.5-4B q4tp | answer PPL 1.908 | 1.867 |
+
+The mask can only quiet neurons, so it shapes what a model already does (the label set and its format)
+rather than teaching it new knowledge: on code the gain is small. The FCD correction works on the last two
+layers with one or two steps; Adam's first step moves every weight by the learning rate's full size, so keep
+it small: 3e-6 on the 0.8B (held-out answer-token accuracy 84.2 → 86.2 %; 1e-5 took it down to 73 %), 1e-6 on
+the 4B (one step: 69.8 → 71.0 %; 3e-6 already hurt). The held-out PPL is not the label accuracy: 1500 mask steps
+on the 4B lowered it 1.461 → 1.436 and took the accuracy from 69.8 to 68.5 %, so pick the mask by accuracy.
+
 ## Creating a skill: what actually matters
 
 `cortiq skill add` grafts tensors from a **donor** checkpoint into the

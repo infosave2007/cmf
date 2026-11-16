@@ -952,6 +952,7 @@ pub fn run_skill_apply(
     skill_path: &str,
     output: &str,
     force: bool,
+    overlay: bool,
 ) -> anyhow::Result<()> {
     use cortiq_core::TensorSpecRef;
     let base = CmfModel::open(base_path)?;
@@ -993,6 +994,9 @@ pub fn run_skill_apply(
                 "this skill uses a different linear-core operator/selector than the base; refusing to substitute it. --force overrides explicitly."
             );
         }
+    }
+    if overlay {
+        return apply_as_overlay(&base, &skill, rec, output);
     }
     let over: std::collections::HashMap<&str, &TensorEntry> =
         skill.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -1041,6 +1045,102 @@ pub fn run_skill_apply(
         "✓ applied skill '{}': {replaced} tensor(s) replaced, {} masks carried → {output}",
         rec.id,
         skill.masks.masks.len()
+    );
+    Ok(())
+}
+
+/// `skill apply --overlay`: the base whole, the skill's tensors beside it as
+/// `skill.{id}.{name}` (the runtime's tensor-source indirection reads them
+/// in place of `{name}` under `--skill {id}`), the record carried without its
+/// binding key, the skill's masks added to the base's catalog. A skill whose
+/// tensor shapes differ from the base's (a physically defragmented FFN)
+/// cannot ride beside the base: it is refused, by name.
+fn apply_as_overlay(
+    base: &CmfModel,
+    skill: &CmfModel,
+    rec: &SkillRecord,
+    output: &str,
+) -> anyhow::Result<()> {
+    use cortiq_core::TensorSpecRef;
+    let id = rec.id.as_str();
+    anyhow::ensure!(
+        !base.header.skills.iter().any(|s| s.id == id),
+        "the base already carries a skill '{id}' — give the overlay another id"
+    );
+    let base_by_name: std::collections::HashMap<&str, &TensorEntry> =
+        base.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+    let bbytes = base.primary_bytes();
+    let sbytes = skill.primary_bytes();
+    let mut refs: Vec<TensorSpecRef> = Vec::with_capacity(base.tensors.len() + skill.tensors.len());
+    for e in &base.tensors {
+        let abs = base
+            .entry_abs_offset(e)
+            .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", e.name))?;
+        refs.push(TensorSpecRef {
+            name: e.name.clone(),
+            dtype: e.dtype,
+            shape: e.shape.clone(),
+            data: &bbytes[abs..abs + e.nbytes as usize],
+        });
+    }
+    for e in &skill.tensors {
+        let b = base_by_name.get(e.name.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("skill tensor {} is absent from the base — nothing to overlay it on", e.name)
+        })?;
+        anyhow::ensure!(
+            b.shape == e.shape,
+            "skill tensor {} is {:?}, the base's {:?}: a defragmented skill cannot overlay \
+             the base at inference — apply it without --overlay",
+            e.name,
+            e.shape,
+            b.shape
+        );
+        let abs = skill
+            .entry_abs_offset(e)
+            .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", e.name))?;
+        refs.push(TensorSpecRef {
+            name: format!("skill.{id}.{}", e.name),
+            dtype: e.dtype,
+            shape: e.shape.clone(),
+            data: &sbytes[abs..abs + e.nbytes as usize],
+        });
+    }
+    let mut header = base.header.clone();
+    let mut carried = rec.clone();
+    carried.base_dir_hash = None;
+    header.skills.push(carried);
+    // The skill's masks ride along only when its record links one: a mask in
+    // the catalog of a file whose default task it lacks is what the runtime
+    // falls back to, so a soft-folded skill's unlinked mask would turn the
+    // base itself masked (and onto the host's sparse FFN arm).
+    let mut catalog = base.masks.clone();
+    let linked = rec.input_mask_task.as_deref();
+    let mut dropped = 0usize;
+    for m in &skill.masks.masks {
+        if linked != Some(m.name.as_str()) {
+            dropped += 1;
+            continue;
+        }
+        anyhow::ensure!(
+            !catalog.masks.iter().any(|b| b.name == m.name),
+            "the skill's mask '{}' is already in the base's catalog",
+            m.name
+        );
+        catalog.masks.push(m.clone());
+    }
+    if dropped > 0 {
+        println!("  {dropped} mask(s) of the skill not linked by its record — left out (the base stays unmasked)");
+    }
+    let catalog = (!catalog.masks.is_empty()).then_some(catalog);
+    CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), base.vocab.as_deref())?;
+    println!(
+        "✓ skill '{id}' overlaid: {} tensor(s) beside the base's {} → {output} (run --skill {id}){}",
+        skill.tensors.len(),
+        base.tensors.len(),
+        match &rec.input_mask_task {
+            Some(t) => format!("; the record links task mask '{t}', which --skill activates"),
+            None => String::new(),
+        }
     );
     Ok(())
 }
@@ -1685,7 +1785,9 @@ pub fn run_skill_bake(
             println!("{line}");
         })
         .map_err(|e| anyhow::anyhow!(e))?;
-    let verdict = if report.overlaid <= report.backbone {
+    let verdict = if report.backbone.is_nan() {
+        "baseline skipped (CMF_BAKE_SKIP_BASELINE)"
+    } else if report.overlaid <= report.backbone {
         "SPECIALIST ≤ baseline ✓"
     } else {
         "did not beat baseline"

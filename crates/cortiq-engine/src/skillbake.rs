@@ -695,6 +695,112 @@ fn gather_rows(values: &[f32], rows: &[usize], width: usize) -> Vec<f32> {
 }
 
 impl Pass<'_> {
+    /// Whole verdicts of an answer-span pass: a question is right when every
+    /// token of its value is the argmax (what greedy decoding emits after the
+    /// same prefix). `hits` / `preds` run along `targets`.
+    #[allow(clippy::too_many_arguments)]
+    fn whole_verdicts(&self, ids: &[u32], b: usize, t: usize, targets: &[usize], h: &[bool], preds: &[u32], stats: &mut FocusStats, qdebug: usize) {
+        let Some(sp) = self.span else { return };
+        let Some(text) = &sp.values else { return };
+        let at: std::collections::HashMap<usize, bool> = targets.iter().copied().zip(h.iter().copied()).collect();
+        let pred_at: std::collections::HashMap<usize, u32> = targets.iter().copied().zip(preds.iter().copied()).collect();
+        let mut shown = 0usize;
+        stats.seq = vec![(0, 0); b];
+        for bi in 0..b {
+            let seq = &ids[bi * t..(bi + 1) * t];
+            let Some((first, last)) = answer_targets(seq, sp) else {
+                continue;
+            };
+            if shown < qdebug {
+                let gold: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", text.0.get(seq[q] as usize).map(String::as_str).unwrap_or("?"))).collect();
+                let got: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", pred_at.get(&(bi * t + q)).and_then(|&id| text.0.get(id as usize)).map(String::as_str).unwrap_or("?"))).collect();
+                let groups = answer_values(seq, first.max(1), last, text);
+                eprintln!("[qdebug] gold {} | argmax {} | value groups {:?} (span starts at {})", gold.join(" "), got.join(" "), groups, first.max(1));
+                shown += 1;
+            }
+            for group in answer_values(seq, first.max(1), last, text) {
+                stats.questions += 1;
+                stats.seq[bi].0 += 1;
+                if group.iter().all(|&q| at.get(&(bi * t + q)).copied().unwrap_or(false)) {
+                    stats.questions_correct += 1;
+                    stats.seq[bi].1 += 1;
+                }
+            }
+        }
+    }
+
+    /// The whole pass (forward, loss, Phase-A backward) as one resident step
+    /// on CUDA (`FcdModel::resident_step`): language-model or answer-span
+    /// loss, frozen attention, no trained copies, a single loop. None: the
+    /// layer-by-layer path below runs.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::type_complexity)]
+    fn resident(
+        &self,
+        ids: &[u32],
+        b: usize,
+        grad: &mut Option<(
+            &mut [Vec<f64>],
+            &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+            &mut [Option<AttnGrads>],
+        )>,
+        focus_stats: &mut Option<&mut FocusStats>,
+    ) -> Option<(f64, usize)> {
+        let fm = self.fm;
+        if !crate::gpu::cuda_active() || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
+            return None;
+        }
+        if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
+            return None;
+        }
+        let t = ids.len() / b;
+        let nl = fm.layers.len();
+        let targets: Vec<usize> = (0..b)
+            .flat_map(|bi| scored_targets(ids, bi * t, t, self.focus_tokens, self.focus_follow_tokens, self.span))
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let mats: Vec<std::sync::Arc<crate::fcd::LayerMats>> = (0..nl).map(|li| fm.mats(li).ok()).collect::<Option<_>>()?;
+        let ffn: Vec<(LnFfn, Vec<f32>)> = (0..nl).map(|li| (self.wts(li, &mats[li]), self.gates(li))).collect();
+        let scored = targets.len();
+        let inv_n = 1.0 / scored as f64;
+        let out = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, grad.is_some())?;
+        let mut nll = 0f64;
+        let span_stats = self.span.is_some();
+        let want_hits = focus_stats.is_some() && self.span.is_some_and(|sp| sp.values.is_some());
+        let mut hits = Vec::with_capacity(if want_hits { scored } else { 0 });
+        for (r, &ti) in targets.iter().enumerate() {
+            nll += out.nll[r] as f64;
+            let ok = out.argmax[r] == ids[ti];
+            if span_stats {
+                if let Some(stats) = focus_stats.as_deref_mut() {
+                    stats.total += 1;
+                    if ok {
+                        stats.correct += 1;
+                    }
+                }
+            }
+            if want_hits {
+                hits.push(ok);
+            }
+        }
+        if want_hits {
+            let qdebug: usize = std::env::var("CMF_BAKE_QDEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if let Some(stats) = focus_stats.as_deref_mut() {
+                self.whole_verdicts(ids, b, t, &targets, &hits, &out.argmax, stats, qdebug);
+            }
+        }
+        if let Some((dmask, _, _)) = grad.as_mut() {
+            for (li, dm) in out.dmask.iter().enumerate() {
+                for (d, &x) in dmask[li].iter_mut().zip(dm) {
+                    *d += x as f64;
+                }
+            }
+        }
+        Some((nll, scored))
+    }
+
     fn gates(&self, li: usize) -> Vec<f32> {
         self.logits[li]
             .iter()
@@ -864,6 +970,14 @@ impl Pass<'_> {
         )>,
         mut focus_stats: Option<&mut FocusStats>,
     ) -> (f64, usize) {
+        #[cfg(feature = "cuda")]
+        let mut grad = grad;
+        #[cfg(feature = "cuda")]
+        let mut focus_stats = focus_stats;
+        #[cfg(feature = "cuda")]
+        if let Some(r) = self.resident(ids, b, &mut grad, &mut focus_stats) {
+            return r;
+        }
         let fm = self.fm;
         let hsz = fm.hidden;
         let pool = fm.pool.as_deref();
@@ -982,6 +1096,39 @@ impl Pass<'_> {
             let qdebug: usize = std::env::var("CMF_BAKE_QDEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let mut preds: Vec<u32> = if qdebug > 0 && hits.is_some() { vec![0; scored] } else { Vec::new() };
             let mut p0 = 0usize;
+            // On CUDA the whole head runs on the card (`gpu_cuda::bake_lm_loss`):
+            // the full-vocabulary rows never reach the host.
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() {
+                let src: Vec<usize> = targets.iter().map(|&ti| ti - 1).collect();
+                let hsrc = gather_rows(&hn, &src, hsz);
+                let tg: Vec<u32> = targets.iter().map(|&ti| ids[ti]).collect();
+                if let Some((nl, am, dsrc)) = crate::gpu_cuda::bake_lm_loss(&hsrc, lm, &tg, hsz, inv_n as f32, grad.is_some()) {
+                    for (r, &target_index) in targets.iter().enumerate() {
+                        let target = ids[target_index];
+                        nll += nl[r] as f64;
+                        if let (Some(stats), Some(_)) = (focus_stats.as_deref_mut(), self.span) {
+                            stats.total += 1;
+                            if am[r] == target {
+                                stats.correct += 1;
+                            }
+                        }
+                        if let Some(h) = hits.as_mut() {
+                            h[r] = am[r] == target;
+                        }
+                        if !preds.is_empty() {
+                            preds[r] = am[r];
+                        }
+                        if grad.is_some() {
+                            let s = src[r];
+                            for (d, &x) in dh_n[s * hsz..(s + 1) * hsz].iter_mut().zip(&dsrc[r * hsz..(r + 1) * hsz]) {
+                                *d += x;
+                            }
+                        }
+                    }
+                    p0 = scored;
+                }
+            }
             while p0 < scored {
                 let pc = POS_CHUNK.min(scored - p0);
                 let rows = &targets[p0..p0 + pc];
@@ -1044,36 +1191,8 @@ impl Pass<'_> {
             // Whole verdicts: a question is right when every token of its
             // value is the argmax (what greedy decoding emits after the
             // same prefix).
-            if let (Some(h), Some(stats), Some(sp)) = (&hits, focus_stats.as_deref_mut(), self.span) {
-                if let Some(text) = &sp.values {
-                    let at: std::collections::HashMap<usize, bool> =
-                        targets.iter().copied().zip(h.iter().copied()).collect();
-                    let pred_at: std::collections::HashMap<usize, u32> =
-                        targets.iter().copied().zip(preds.iter().copied()).collect();
-                    let mut shown = 0usize;
-                    stats.seq = vec![(0, 0); b];
-                    for bi in 0..b {
-                        let seq = &ids[bi * t..(bi + 1) * t];
-                        let Some((first, last)) = answer_targets(seq, sp) else {
-                            continue;
-                        };
-                        if shown < qdebug {
-                            let gold: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", text.0.get(seq[q] as usize).map(String::as_str).unwrap_or("?"))).collect();
-                            let got: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", pred_at.get(&(bi * t + q)).and_then(|&id| text.0.get(id as usize)).map(String::as_str).unwrap_or("?"))).collect();
-                            let groups = answer_values(seq, first.max(1), last, text);
-                            eprintln!("[qdebug] gold {} | argmax {} | value groups {:?} (span starts at {})", gold.join(" "), got.join(" "), groups, first.max(1));
-                            shown += 1;
-                        }
-                        for group in answer_values(seq, first.max(1), last, text) {
-                            stats.questions += 1;
-                            stats.seq[bi].0 += 1;
-                            if group.iter().all(|&q| at.get(&(bi * t + q)).copied().unwrap_or(false)) {
-                                stats.questions_correct += 1;
-                                stats.seq[bi].1 += 1;
-                            }
-                        }
-                    }
-                }
+            if let (Some(h), Some(stats)) = (&hits, focus_stats.as_deref_mut()) {
+                self.whole_verdicts(ids, b, t, &targets, h, &preds, stats, qdebug);
             }
         } else {
             // Exact classifier mode. Only the declared label rows can enter
@@ -1181,7 +1300,7 @@ impl Pass<'_> {
                     // with the gate folded in, dn2 = dgu·gu. Only dn2 and
                     // dm[inter] come back.
                     let mut dm_dev = vec![0f32; inter];
-                    if crate::gpu_wgpu::ffn_bwd_chain_f32(
+                    if crate::fcd::bake_ffn_bwd_chain(
                         &dh, wts.down, gu, li, &mut dn2, n, hsz, inter, fm.act, Some(g), Some(&mut dm_dev),
                     ) {
                         for (d, &x) in dmask[vl].iter_mut().zip(&dm_dev) {
@@ -1437,9 +1556,17 @@ impl Pass<'_> {
         let mut done = false;
         #[cfg(feature = "gpu")]
         {
-            done = crate::gpu_wgpu::attn_bwd_chain_f32(
-                qrot, krot, vproj, &dao, b, t, nh, nkv, hd, window, &mut dqrot, &mut dkrot, &mut dvproj,
-            );
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() {
+                done = crate::gpu_cuda::bake_attn_bwd(
+                    qrot, krot, vproj, &dao, b, t, nh, nkv, hd, window, &mut dqrot, &mut dkrot, &mut dvproj,
+                );
+            }
+            if !done {
+                done = crate::gpu_wgpu::attn_bwd_chain_f32(
+                    qrot, krot, vproj, &dao, b, t, nh, nkv, hd, window, &mut dqrot, &mut dkrot, &mut dvproj,
+                );
+            }
         }
         if !done {
             let rep = nh / nkv;
@@ -2490,8 +2617,9 @@ pub fn skill_bake(
             if gc > 0 { g * 1000.0 / gc as f64 } else { 0.0 }
         ));
         log(&format!(
-            "[prof] inside: attn-chain {:.1}s | ffn-pre {:.1}s | ffn-chain {:.1}s | ffn-act(split+act) {:.1}s | ffn-host {:.1}s | ffn-post {:.1}s | chain-w {:.1}s gpu {:.1}s copy {:.1}s",
+            "[prof] inside: attn-chain {:.1}s | gdn {:.1}s | ffn-pre {:.1}s | ffn-chain {:.1}s | ffn-act(split+act) {:.1}s | ffn-host {:.1}s | ffn-post {:.1}s | chain-w {:.1}s gpu {:.1}s copy {:.1}s",
             prof::take(&prof::ATTN_CHAIN),
+            prof::take(&prof::GDN),
             prof::take(&prof::FFN_PRE),
             prof::take(&prof::FFN_CHAIN),
             prof::take(&prof::FFN_ACT),
@@ -2501,6 +2629,7 @@ pub fn skill_bake(
             chain_prof(1),
             chain_prof(2),
         ));
+        log(&format!("[prof] sections: {}", prof::named_report()));
         log(&format!("[prof] gemm shapes:\n{}", prof::shape_report(6)));
     }
     let final_logits = logits.clone();
