@@ -54,8 +54,12 @@ pipeline over a file with one of its two cards.
 
 --rules N appends N more `react` tasks from a fourth generator, with what the
 rule sets above lack: 3 to 5 rules, a rule with two quoted strings ("... contains
-"A" or "B", answer L."), outputs of several lines, and an output without any of
-the strings in 3 tasks of 10 (a listing, a table: the last rule applies).
+"A" or "B", answer L."), a matching line after another line of output, and more
+kinds of output without any of the strings (one line: a file list, a count, a
+service's state). A first form had such outputs of several lines (a listing, a
+table) in 3 tasks of 10, and the model taught on it answered NONE to 43 of R's 128
+one-command tasks: "none of the quoted strings" after a block of lines stands too
+near "None of the cards" after a block of cards.
 
 The generator is a program over tldr-pages (CC-BY 4.0) text; no model wrote
 any of the data.
@@ -619,9 +623,6 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
         r = random.Random(seed + 9973)
         quiet = lambda: r.choice([
             "  ".join(f"{r.choice(WORDS)}.{r.choice(EXTS)}" for _ in range(r.randint(2, 5))),
-            f"total {r.randint(4, 900)}\n" + "\n".join(f"-rw-r--r-- 1 {r.choice(USERS)} staff {r.randint(90, 9000):>5} Mar  3 09:12 {r.choice(WORDS)}.log"
-                                                    for _ in range(r.randint(1, 3))),
-            f"Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        {r.randint(20, 200)}G   {r.randint(2, 19)}G   {r.randint(1, 90)}G  {r.randint(3, 97)}% /",
             f"{r.randint(1, 400)} {r.choice(WORDS)}.txt", f"{r.choice(SERVICES)} is running", f"{r.choice(HOSTS)}", r.choice(benign)])
         got = []
         while len(got) < rules:
@@ -634,10 +635,10 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
             head = "Rules for the next action:\n" + "\n".join(lines) + f"\n- Otherwise answer {lab[-1]}."
             prog = r.choice(progs)
             cmdline = f"{prog} {rfile(r)}" if r.random() < 0.7 else f"{prog} {word(r)}"
-            if r.random() < 0.3:
-                j, outp = k, quiet()
+            j = r.randrange(k + 1)
+            if j == k:
+                outp = quiet()
             else:
-                j = r.randrange(k)
                 t = r.choice(sets[j])
                 outp = r.choice([f"{prog}: {rfile(r)}: {t}", f"{prog}: error: {t}", f"fatal: {t}", f"E: {t}", f"bash: {prog}: {t}",
                                  f"{prog}: cannot open '{rfile(r)}': {t}", f"{r.choice(benign)}\n{prog}: {t}"])
