@@ -6548,7 +6548,9 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
-        self.generate_with_prompt_rows(input_ids, None, max_tokens, task_mask, on_token)
+        let out = self.generate_with_prompt_rows(input_ids, None, max_tokens, task_mask, on_token);
+        crate::gpu::generation_end();
+        out
     }
 
     /// Generate from complete prompt embeddings [token_count, hidden_size].
