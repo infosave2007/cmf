@@ -544,6 +544,11 @@ pub struct Status {
 
 pub fn status() -> Status {
     let requested = wanted();
+    if requested {
+        // A verdict reached by an earlier process is the answer already;
+        // without this the status reads "untested" until the first prompt.
+        load_verdicts();
+    }
     let available = requested && api().is_some();
     let (npu_us, cpu_us) = *TRIALS[0].medians.lock().unwrap();
     let (batch_npu_us, batch_cpu_us) = *TRIALS[1].medians.lock().unwrap();
