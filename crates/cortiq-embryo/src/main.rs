@@ -241,7 +241,7 @@ enum Sub {
         eval_every: usize,
         /// v2: mask logit at step zero (4.0 = the near-identity start of the
         /// DTG-MA notebooks)
-        #[arg(long, default_value_t = cortiq_embryo::skill::SKILL_INIT_LOGIT)]
+        #[arg(long, default_value_t = cortiq_embryo::model::SKILL_INIT_LOGIT)]
         mask_init: f32,
         /// v2, Patent 2 Soft-Fold: every neuron keeps its learned gain σ(m),
         /// folded into down_proj (evaluated and polished as such), instead of
@@ -255,6 +255,11 @@ enum Sub {
         /// v2: phase B evaluates every this many steps (0 = --eval-every)
         #[arg(long, default_value_t = 0)]
         eval_every_b: usize,
+        /// v2: the mask also covers every routed expert of the selected
+        /// layers, each neuron of each expert with its own gain (with
+        /// --soft-fold; folded into the experts' down_proj)
+        #[arg(long)]
+        mask_experts: bool,
         /// v2: phase A draws each batch from the records of one length class
         /// and runs it at that width (--bucket-widths, then the shards' own):
         /// the padding of short records is not computed. Every width is a
@@ -1285,6 +1290,7 @@ fn main() {
             soft_fold,
             fcd_layers,
             eval_every_b,
+            mask_experts,
             length_buckets,
             bucket_widths,
             final_batches,
@@ -1384,6 +1390,7 @@ fn main() {
                         soft_fold,
                         fcd_layers,
                         eval_every_b,
+                        mask_experts,
                         length_buckets,
                         bucket_widths,
                         final_batches,

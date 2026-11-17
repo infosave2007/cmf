@@ -346,6 +346,10 @@ struct CtxInner {
     blas_min: u64,
     /// cuBLAS also for the dynamic-K / dynamic-row GEMMs (`CMF_CUDA_CUBLAS_DYN=0` = off).
     blas_dyn: bool,
+    /// The cuBLAS handle is in the TF32 tensor-core mode (`CMF_CUDA_TF32=0` = never).
+    tf32: bool,
+    /// Live [`ExactF32`] guards: while any lives, cuBLAS runs full f32.
+    exact_depth: Mutex<usize>,
     /// 64 KB of zeros: the slots an operation leaves unbound.
     dummy: u64,
     adapter_name: String,
@@ -521,17 +525,19 @@ fn init() -> Result<Ctx, String> {
     // `CMF_CUDA_CUBLAS=0` turns it off (the bit identity of a GEMM's loop and
     // table forms), `all` sends every plain GEMM.
     let blas_env = std::env::var("CMF_CUDA_CUBLAS").unwrap_or_default();
+    let tf32 = std::env::var("CMF_CUDA_TF32").as_deref() != Ok("0");
     let blas = if blas_env != "0" && unsafe { bl::is_culib_present() } {
         let mut h: bl::cublasHandle_t = std::ptr::null_mut();
         let mut ok = unsafe { bl::cublasCreate_v2(&mut h) } as u32 == 0
             && unsafe { bl::cublasSetStream_v2(h, stream.cast()) } as u32 == 0;
-        if ok && std::env::var("CMF_CUDA_TF32").as_deref() != Ok("0") {
+        if ok && tf32 {
             ok = unsafe { bl::cublasSetMathMode(h, bl::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH) } as u32 == 0;
         }
         ok.then_some(h)
     } else {
         None
     };
+    let tf32 = tf32 && blas.is_some();
     let blas_min: u64 = match blas_env.as_str() {
         "all" | "1" => 0,
         _ => std::env::var("CMF_CUDA_CUBLAS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 26),
@@ -554,6 +560,8 @@ fn init() -> Result<Ctx, String> {
             blas,
             blas_min,
             blas_dyn: std::env::var("CMF_CUDA_CUBLAS_DYN").as_deref() != Ok("0"),
+            tf32,
+            exact_depth: Mutex::new(0),
             dummy,
             adapter_name: name,
             splitk_pool: Mutex::new(Vec::new()),
@@ -630,6 +638,48 @@ impl Ctx {
             gpu_dirty: std::sync::atomic::AtomicBool::new(false),
             ctx: Arc::clone(&self.inner),
         }))
+    }
+}
+
+/// While it lives, the GEMMs committed run in full f32 ([`Ctx::exact_f32`]).
+pub struct ExactF32<'a>(&'a Ctx);
+
+impl Ctx {
+    /// The GEMMs committed while the guard lives run in full f32: cuBLAS
+    /// leaves the TF32 tensor-core mode (operands rounded to 10 mantissa bits
+    /// inside the multiply). For numbers another implementation must
+    /// reproduce: the skill router's φ is checked against the runtime's CPU
+    /// reference within 1e-5, and TF32 moves it by 5e-5 on Embryo-56M (full
+    /// f32: 6e-8). Training steps keep TF32. Guards nest.
+    pub fn exact_f32(&self) -> ExactF32<'_> {
+        self.tf32_depth(1);
+        ExactF32(self)
+    }
+
+    fn tf32_depth(&self, step: isize) {
+        let inner = &self.inner;
+        let Some(h) = inner.blas.filter(|_| inner.tf32) else {
+            return;
+        };
+        // under the commit lock: no GEMM of another stream is executing while the mode flips
+        let _arena = inner.commit.lock().unwrap();
+        let mut d = inner.exact_depth.lock().unwrap();
+        let before = *d;
+        *d = (before as isize + step).max(0) as usize;
+        let mode = match (before, *d) {
+            (0, 1) => bl::cublasMath_t::CUBLAS_DEFAULT_MATH,
+            (1, 0) => bl::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+            _ => return,
+        };
+        inner.current();
+        let st = unsafe { bl::cublasSetMathMode(h, mode) } as u32;
+        assert_eq!(st, 0, "cublasSetMathMode({mode:?}) failed: {st}");
+    }
+}
+
+impl Drop for ExactF32<'_> {
+    fn drop(&mut self) {
+        self.0.tf32_depth(-1);
     }
 }
 

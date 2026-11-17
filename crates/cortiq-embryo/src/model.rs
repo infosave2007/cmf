@@ -1295,6 +1295,12 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
 /// the exporter and the growth records read them on every platform, so they
 /// live outside the Metal-only module that consumes them.
 pub const MOE_K: usize = 16;
+
+/// Initial logit of every skill-mask neuron: σ(3) ≈ 0.953. The all-on hard
+/// mask (neuron kept iff σ(m) > τ) is the exact genome only for 0 < τ < σ(3).
+/// Here, outside the GPU-only `skill` module, because the CLI's argument
+/// defaults are built on every platform.
+pub const SKILL_INIT_LOGIT: f32 = 3.0;
 /// EMA rate of the descriptor means and the balancing-bias step
 pub const MOE_ALPHA: f32 = 0.02;
 pub const MOE_ETA: f32 = 0.05;
@@ -2383,7 +2389,7 @@ mod gpu {
             cmd.swiglu_fwd(gte, up, hh, m * i);
             if let Some(sk) = self.skill.as_ref() {
                 if let Some(mi) = sk.slot(l) {
-                    cmd.mask_fwd(hh, &sk.logits, mi * i, m, i, sk.hard.get(), sk.tau);
+                    cmd.mask_fwd(hh, &sk.logits, sk.off(mi, 0), m, i, sk.hard.get(), sk.tau);
                 }
             }
             // x_out = x_mid + hh·Wdᵀ  ([M,I]·[H,I]ᵀ)
@@ -2611,6 +2617,23 @@ mod gpu {
                 }
             }
             cmd.swiglu_fwd(&mo.gte, &mo.up, &mo.hh, ne * cap * i);
+            if let Some(sk) = self.skill.as_ref() {
+                if let (Some(mi), true) = (sk.slot(l), sk.groups > 1) {
+                    // every routed expert's neurons under their own mask
+                    for e in 0..ne {
+                        cmd.mask_fwd_at(
+                            &mo.hh,
+                            e * cap * i,
+                            &sk.logits,
+                            sk.off(mi, 1 + e),
+                            cap,
+                            i,
+                            sk.hard.get(),
+                            sk.tau,
+                        );
+                    }
+                }
+            }
             for e in 0..ne {
                 let ind_h = GemmDyn {
                     indirect: Some((&d.indir, (ind_off + (ne + e) * 3) * 4)),
@@ -2749,7 +2772,7 @@ mod gpu {
                         &s.dffn,
                         &s.hh_pre,
                         &sk.logits,
-                        mi * i,
+                        sk.off(mi, 0),
                         &sk.g,
                         m,
                         i,
@@ -2859,6 +2882,16 @@ mod gpu {
                 }
                 let ind_off = l * 2 * ne * 3;
                 let d = &self.desc;
+                let expert_mask = self
+                    .skill
+                    .as_ref()
+                    .and_then(|sk| sk.slot(l).filter(|_| sk.groups > 1));
+                if expert_mask.is_some() {
+                    // the GEMMs below fill only an expert's used slots; the
+                    // mask-logit reduction runs over all of them, so the
+                    // rest must not carry another layer's gradients
+                    cmd.axpby(0.0, &s.moe_dffn, 0.0, &s.moe_dffn, ne * cap * i);
+                }
                 for e in 0..ne {
                     let ind_i = GemmDyn {
                         indirect: Some((&d.indir, (ind_off + e * 3) * 4)),
@@ -2913,6 +2946,26 @@ mod gpu {
                         false,
                         &kdyn,
                     );
+                }
+                if let (Some(mi), Some(sk)) = (expert_mask, self.skill.as_ref()) {
+                    // pre-mask activations recomputed; dm from the gradient
+                    // at the masked activations, which then passes the mask
+                    cmd.swiglu_fwd(&mo.gte, &mo.up, &sk.expert_pre, ne * cap * i);
+                    for e in 0..ne {
+                        cmd.mask_bwd_at(
+                            &s.moe_dffn,
+                            &sk.expert_pre,
+                            e * cap * i,
+                            &sk.logits,
+                            sk.off(mi, 1 + e),
+                            &sk.g,
+                            cap,
+                            i,
+                            sk.hard.get(),
+                            sk.tau,
+                            sk.l1.get(),
+                        );
+                    }
                 }
                 cmd.swiglu_bwd(
                     &mo.gte,
@@ -8021,7 +8074,10 @@ unsafe fn host_u32_slice<'a>(buf: &'a GBuf) -> &'a [u32] {
 pub struct SkillState {
     pub layers: Vec<usize>,
     pub inter: usize,
-    /// [layers.len(), I] mask logits
+    /// mask groups per selected layer: 1 = its shared FFN only; 1 + E = the
+    /// shared FFN, then each of its E routed experts
+    pub groups: usize,
+    /// [layers.len(), groups, I] mask logits
     pub logits: GBuf,
     pub g: GBuf,
     pub m: GBuf,
@@ -8034,6 +8090,9 @@ pub struct SkillState {
     /// phase B trains the shared FFN of only this many of the LAST selected
     /// layers (0 = of every selected layer)
     pub polish: std::cell::Cell<usize>,
+    /// [E, cap, I] pre-mask activations of the routed experts (backward
+    /// scratch; one float when the experts carry no mask)
+    pub expert_pre: GBuf,
 }
 
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
@@ -8045,10 +8104,27 @@ impl SkillState {
         init_logit: f32,
         tau: f32,
     ) -> SkillState {
-        let n = layers.len() * inter;
+        Self::with_experts(c, layers, inter, init_logit, tau, 0, 0)
+    }
+    /// Masks over the shared FFN and over each of the `experts` routed
+    /// experts of every selected layer (`cap` = an expert's slots in the
+    /// routed buffers); `experts == 0` masks the shared FFN only.
+    pub fn with_experts(
+        c: &crate::metal::Ctx,
+        layers: Vec<usize>,
+        inter: usize,
+        init_logit: f32,
+        tau: f32,
+        experts: usize,
+        cap: usize,
+    ) -> SkillState {
+        let groups = 1 + experts;
+        let n = layers.len() * groups * inter;
         SkillState {
             layers,
             inter,
+            groups,
+            expert_pre: GBuf::zeros(c, (experts * cap * inter).max(1)),
             logits: GBuf::from_slice(c, &vec![init_logit; n.max(1)]),
             g: GBuf::zeros(c, n),
             m: GBuf::zeros(c, n),
@@ -8062,14 +8138,20 @@ impl SkillState {
     pub fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|&l| l == layer)
     }
-    /// Kept-neuron mask per selected layer from the current logits.
+    /// Where the `I` logits of group `g` (0 = the shared FFN, 1 + e = expert
+    /// e) of the selected layer number `mi` start.
+    pub fn off(&self, mi: usize, g: usize) -> usize {
+        (mi * self.groups + g) * self.inter
+    }
+    /// Kept-neuron mask of the shared FFN per selected layer from the
+    /// current logits.
     pub fn hard_masks(&self) -> Vec<Vec<bool>> {
         let lg = self.logits.to_vec();
         self.layers
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                lg[i * self.inter..(i + 1) * self.inter]
+                lg[self.off(i, 0)..self.off(i, 0) + self.inter]
                     .iter()
                     .map(|&m| 1.0 / (1.0 + (-m).exp()) > self.tau)
                     .collect()
@@ -8227,6 +8309,8 @@ impl EmbryoGpu {
         };
         let cfg = &self.cfg;
         let h = cfg.hidden;
+        // φ and the hidden rows the runtime must reproduce: full f32 (CUDA: no TF32)
+        let _exact = self.ctx().exact_f32();
         let cmd = Cmd::new(self.ctx());
         cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
         let last = layer.min(cfg.layers - 1);

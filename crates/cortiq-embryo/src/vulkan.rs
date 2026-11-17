@@ -2951,13 +2951,30 @@ impl<'a> Cmd<'a> {
         // reads logit `loff + j` (j = z mod i), and the hard mask is the
         // 0/1 indicator 1[σ > τ] — not σ gated by it — so a baked skill's
         // folded tensors equal what phase A/B trained under.
-        assert!(i > 0 && hh.len >= rows * i && logits.len >= loff + i);
+        self.mask_fwd_at(hh, 0, logits, loff, rows, i, hard, tau)
+    }
+    /// [`Self::mask_fwd`] on the `rows × i` block that starts at element
+    /// `hoff` of `hh` (one expert's slots of a routed-experts buffer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_fwd_at(
+        &self,
+        hh: &GBuf,
+        hoff: usize,
+        logits: &GBuf,
+        loff: usize,
+        rows: usize,
+        i: usize,
+        hard: bool,
+        tau: f32,
+    ) {
+        assert!(i > 0 && hh.len >= hoff + rows * i && logits.len >= loff + i);
         let mut p = vec![0; PARAM_WORDS];
         p[1] = (rows * i) as u32;
         p[2] = loff as u32;
         p[3] = hard as u32;
         p[4] = tau.to_bits();
         p[5] = i as u32;
+        p[7] = hoff as u32;
         self.rec(OP_MASK_FWD, &[(hh, 0), (logits, 1)], p, rows * i)
     }
     pub fn mask_bwd(
@@ -2973,7 +2990,28 @@ impl<'a> Cmd<'a> {
         tau: f32,
         l1: f32,
     ) {
+        self.mask_bwd_at(dh, hh, 0, logits, loff, dm, rows, i, hard, tau, l1)
+    }
+    /// [`Self::mask_bwd`] on the `rows × i` block that starts at element
+    /// `off` of both `dh` and `hh`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_bwd_at(
+        &self,
+        dh: &GBuf,
+        hh: &GBuf,
+        off: usize,
+        logits: &GBuf,
+        loff: usize,
+        dm: &GBuf,
+        rows: usize,
+        i: usize,
+        hard: bool,
+        tau: f32,
+        l1: f32,
+    ) {
+        assert!(dh.len >= off + rows * i && hh.len >= off + rows * i);
         let mut p = vec![0; PARAM_WORDS];
+        p[7] = off as u32;
         // The shader owns both the per-row activation derivative and the
         // per-neuron reduction for the mask-logit gradient.  Keep the row
         // count and neuron width separate so a multi-layer SkillState writes
@@ -4942,9 +4980,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  // The balancing frac keeps the full count (it measures the load, not the slots).
  if(op==36u){if(z<U(1u)*U(2u)){let who=z/U(2u);let col=z%U(2u);if(who<U(9u)){return;}let cnt=DU(U(6u)+who);let n_mu=min(cnt,U(12u));let old=AF(U(3u)+who*U(2u)+col);if(n_mu>0u){let sum=CF(U(5u)+who*U(2u)+col)/f32(n_mu);a[U(3u)+who*U(2u)+col]=WF((1.0-F(7u))*old+F(7u)*sum);}if(col==0u && who<U(11u)){var rs=0.0;for(var row=0u;row<U(10u);row=row+1u){rs=rs+EF(row);}let scale=rs/f32(max(U(10u),1u));let frac=f32(cnt)/f32(max(U(10u),1u));b[U(4u)+who]=WF(BF(U(4u)+who)+F(8u)*scale*(1.0/f32(U(1u))-frac));}return;}}
  if(op==37u){if(z<U(1u)*U(2u)){let who=z/U(2u);let col=z%U(2u);let row=BU(who);c[U(3u)+who*U(2u)+col]=WF(AF(row*U(2u)+col));return;}}
- if(op==39u){if(z<U(1u)){let l=BF(U(2u)+z%U(5u));let s=1.0/(1.0+exp(-l));let hardw=select(0.0,1.0,s>F(4u));let w=select(s,hardw,U(3u)==1u);a[z]=WF(AF(z)*w);}return;}
- if(op==40u){let rows=U(1u);let nn=U(2u);let lo=U(6u);if(z<rows*nn){let col=z%nn;let l=CF(lo+col);let s=1.0/(1.0+exp(-l));let hardw=select(0.0,1.0,s>F(4u));let w=select(s,hardw,U(3u)==1u);a[z]=WF(AF(z)*w);}return;}
- if(op==48u){let rows=U(1u);let nn=U(2u);let lo=U(6u);if(z<nn && U(3u)==0u){let l=CF(lo+z);let s=1.0/(1.0+exp(-l));let ds=s*(1.0-s);var acc=0.0;for(var rr=0u;rr<rows;rr=rr+1u){acc=acc+AF(rr*nn+z)*BF(rr*nn+z);}let old=DF(lo+z);d[lo+z]=WF(old+(acc+F(5u))*ds);}return;}
+ if(op==39u){if(z<U(1u)){let ho=U(7u);let l=BF(U(2u)+z%U(5u));let s=1.0/(1.0+exp(-l));let hardw=select(0.0,1.0,s>F(4u));let w=select(s,hardw,U(3u)==1u);a[ho+z]=WF(AF(ho+z)*w);}return;}
+ if(op==40u){let rows=U(1u);let nn=U(2u);let lo=U(6u);let ho=U(7u);if(z<rows*nn){let col=z%nn;let l=CF(lo+col);let s=1.0/(1.0+exp(-l));let hardw=select(0.0,1.0,s>F(4u));let w=select(s,hardw,U(3u)==1u);a[ho+z]=WF(AF(ho+z)*w);}return;}
+ if(op==48u){let rows=U(1u);let nn=U(2u);let lo=U(6u);let ho=U(7u);if(z<nn && U(3u)==0u){let l=CF(lo+z);let s=1.0/(1.0+exp(-l));let ds=s*(1.0-s);var acc=0.0;for(var rr=0u;rr<rows;rr=rr+1u){acc=acc+AF(ho+rr*nn+z)*BF(ho+rr*nn+z);}let old=DF(lo+z);d[lo+z]=WF(old+(acc+F(5u))*ds);}return;}
  if(op==49u){let rows=U(1u);let cols=U(2u);let hh=U(3u);let eo=U(4u);if(z>=rows*cols){return;}let row=z/cols;let col=z%cols;let token=bitcast<u32>(c[row]);if(token==0xffffffffu){e[z]=0u;return;}let cluster=d[token];if(cluster==0xffffffffu){e[z]=0u;return;}var sum=0.0;for(var q=0u;q<1024u;q=q+1u){if(q<hh){sum=sum+AF(token*hh+q)*BF(eo+cluster*cols*hh+col*hh+q);}}e[z]=WF(sum);return;}
  if(op==51u){hybrid_k_fold_fast(z);return;}
  // op 52: bounded-anchor sink gradient fold: dst[off+z] += alpha * sum_j src[((g*group+j)*pad+s)*hd+d], z=(g*S+s)*hd+d
@@ -4987,6 +5025,18 @@ impl Ctx {
 impl Ctx {
     pub fn adapter_name(&self) -> &str {
         &self.inner.adapter_name
+    }
+}
+
+/// The wgpu kernels compute full f32 already: the guard of the CUDA layer's
+/// `Ctx::exact_f32` (cuBLAS off TF32) is empty here.
+#[cfg(not(feature = "cuda"))]
+pub struct ExactF32<'a>(std::marker::PhantomData<&'a Ctx>);
+
+#[cfg(not(feature = "cuda"))]
+impl Ctx {
+    pub fn exact_f32(&self) -> ExactF32<'_> {
+        ExactF32(std::marker::PhantomData)
     }
 }
 

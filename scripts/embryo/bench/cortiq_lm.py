@@ -69,16 +69,50 @@ class CortiqLM(LM):
             if len(res) == len(rows):
                 return res
         req.write_text(body)
-        cmd = [
-            self.cortiq, "loglik", self.model,
-            "--requests-jsonl", str(req),
-            "--out", str(out),
-            "--split", self.split,
-            "--frame", self.frame,
-            "--scorer", self.scorer,
-        ]
-        with open(self.workdir / f"{tag}.loglik.log", "w") as log:
-            subprocess.run(cmd, env=self.env, check=True, stderr=log)
+        # CORTIQ_LM_JOBS=N: N engine processes over contiguous parts cut at context boundaries
+        # (a context and all its continuations stay in one part: the shared scorer forwards a
+        # context once per part either way, so the numbers are those of one process)
+        jobs = max(1, int(os.environ.get("CORTIQ_LM_JOBS", "1")))
+        parts: list[list[dict]] = []
+        if jobs > 1:
+            per = -(-len(rows) // jobs)
+            cur: list[dict] = []
+            for r in rows:
+                if len(cur) >= per and r["context"] != cur[-1]["context"]:
+                    parts.append(cur)
+                    cur = []
+                cur.append(r)
+            if cur:
+                parts.append(cur)
+        else:
+            parts = [rows]
+        procs = []
+        for i, part in enumerate(parts):
+            preq = req if len(parts) == 1 else self.workdir / f"{tag}.requests.part{i}.jsonl"
+            pout = out if len(parts) == 1 else self.workdir / f"{tag}.loglik.part{i}.jsonl"
+            if len(parts) > 1:
+                preq.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in part))
+            cmd = [
+                self.cortiq, "loglik", self.model,
+                "--requests-jsonl", str(preq),
+                "--out", str(pout),
+                "--split", self.split,
+                "--frame", self.frame,
+                "--scorer", self.scorer,
+            ]
+            env = dict(self.env)
+            if len(parts) > 1:
+                env.setdefault("CMF_THREADS", str(max(1, (os.cpu_count() or 1) // len(parts))))
+            log = open(self.workdir / f"{tag}.loglik{'' if len(parts) == 1 else f'.part{i}'}.log", "w")
+            procs.append((subprocess.Popen(cmd, env=env, stderr=log), log, pout))
+        for p, log, _ in procs:
+            if p.wait() != 0:
+                raise RuntimeError(f"cortiq loglik exited with {p.returncode}")
+            log.close()
+        if len(parts) > 1:
+            with open(out, "w") as f:
+                for _, _, pout in procs:
+                    f.write(pout.read_text())
         res = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
         if len(res) != len(rows):
             raise RuntimeError(f"cortiq loglik returned {len(res)} rows for {len(rows)} requests")

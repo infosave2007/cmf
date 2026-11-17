@@ -41,9 +41,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Initial logit of every mask neuron: σ(3) ≈ 0.953. The all-on hard mask
-/// (neuron kept iff σ(m) > τ) is the exact genome only for 0 < τ < σ(3).
-pub const SKILL_INIT_LOGIT: f32 = 3.0;
+pub use crate::model::SKILL_INIT_LOGIT;
 
 /// σ([`SKILL_INIT_LOGIT`]) — the exclusive upper bound of `--tau`.
 pub fn tau_ceiling() -> f32 {
@@ -643,6 +641,10 @@ pub struct BakeV2Args {
     pub fcd_layers: usize,
     /// phase B evaluates every this many steps (0 = `eval_every`)
     pub eval_every_b: usize,
+    /// the mask also covers every routed expert of the selected layers (its
+    /// own `I` gains per expert), folded into the experts' down_proj; needs
+    /// `soft_fold`
+    pub mask_experts: bool,
     /// phase A draws each batch from the records of one length class and
     /// runs it on an instance of that width (`bucket_widths`, then the
     /// shards' own): a record's padding is not computed. Every width is a
@@ -1574,13 +1576,20 @@ pub fn bake_v2_train(
     gpu.set_desc(&ck.extras);
     gpu.desc_updates.set(false); // the genome's routing state is frozen
     gpu.anchor_fixed_window.set(true); // train on the served window
+    anyhow::ensure!(
+        !a.mask_experts || (cfg.experts > 0 && !cfg.router_top2_enabled()),
+        "--mask-experts needs a genome with routed experts and a top-1 router"
+    );
+    let masked_experts = if a.mask_experts { cfg.experts } else { 0 };
     let c = gpu.ctx();
-    gpu.skill = Some(SkillState::new(
+    gpu.skill = Some(SkillState::with_experts(
         c,
         a.layers.clone(),
         i,
         a.mask_init,
         a.tau,
+        masked_experts,
+        gpu.moe_cap,
     ));
     gpu.skill.as_ref().unwrap().polish.set(a.fcd_layers);
     // the whole dev shard (or an even stride over all of it), each record once
@@ -1669,7 +1678,15 @@ pub fn bake_v2_train(
             g.desc_updates.set(false);
             g.anchor_fixed_window.set(true);
             let gc = g.ctx();
-            g.skill = Some(SkillState::new(gc, a.layers.clone(), i, a.mask_init, a.tau));
+            g.skill = Some(SkillState::with_experts(
+                gc,
+                a.layers.clone(),
+                i,
+                a.mask_init,
+                a.tau,
+                masked_experts,
+                g.moe_cap,
+            ));
             // the same records at their own width and at the shards': the cut tail is padding
             let probe: Vec<usize> = rows.iter().copied().take(a.batch).collect();
             g.skill.as_ref().unwrap().hard.set(true);
@@ -1827,13 +1844,53 @@ pub fn bake_v2_train(
         _ => None,
     };
     let tensors = if a.soft_fold {
-        let gains: Vec<Vec<f32>> = best_a
-            .1
-            .chunks(i)
-            .take(a.layers.len())
-            .map(|lg| lg.iter().map(|&m| 1.0 / (1.0 + (-m).exp())).collect())
-            .collect();
-        fold_gains(&cfg, &a.id, &a.layers, &best_b.1, &gains)
+        let groups = 1 + masked_experts;
+        let gain = |li: usize, g: usize| -> Vec<f32> {
+            let o = (li * groups + g) * i;
+            best_a.1[o..o + i].iter().map(|&m| 1.0 / (1.0 + (-m).exp())).collect()
+        };
+        let gains: Vec<Vec<f32>> = (0..a.layers.len()).map(|li| gain(li, 0)).collect();
+        let mut out = fold_gains(&cfg, &a.id, &a.layers, &best_b.1, &gains);
+        if masked_experts > 0 {
+            // every expert's down_proj with its gains folded in (gate / up as in the genome)
+            let p = gpu.params_host();
+            let (h, ew) = (cfg.hidden, 3 * cfg.hidden * i);
+            let mut below = 0usize;
+            for (li, &l) in a.layers.iter().enumerate() {
+                let ffn = match &lay.layers[l] {
+                    LayerOffs::Mixer { ffn, .. }
+                    | LayerOffs::Anchor { ffn, .. }
+                    | LayerOffs::Gdn { ffn, .. } => ffn,
+                };
+                for ex in 0..masked_experts {
+                    let g = gain(li, 1 + ex);
+                    below += g.iter().filter(|&&x| x <= a.tau).count();
+                    let o = ffn.experts + ex * ew + 2 * h * i;
+                    let mut wd = p[o..o + h * i].to_vec();
+                    for j in 0..i {
+                        for r in 0..h {
+                            wd[r * i + j] *= g[j];
+                        }
+                    }
+                    out.push((
+                        format!(
+                            "skill.{}.{}",
+                            a.id,
+                            cortiq_core::knowledge::expert_tensor_name(l, ex, "down_proj.weight")
+                        ),
+                        vec![h, i],
+                        wd,
+                    ));
+                }
+            }
+            eprintln!(
+                "expert masks: {} experts × {i} gains in {} layers; {:.1} % of the gains at or below τ",
+                masked_experts,
+                a.layers.len(),
+                100.0 * below as f64 / (a.layers.len() * masked_experts * i) as f64
+            );
+        }
+        out
     } else {
         fold_mask(&cfg, &a.id, &a.layers, &best_b.1, &masks)
     };
@@ -2094,11 +2151,13 @@ pub const PHI_PARITY_TOL: f32 = 1e-5;
 pub const RUNTIME_CHECK_PER_CLASS: usize = 64;
 
 /// One prompt of [`runtime_route_check`]: its text and what the trainer
-/// computed for it (q ids, raw φ).
+/// computed for it (q ids, raw φ, and [`route_gaps`]: the smallest relative
+/// gap of a routed choice its φ depends on; `INFINITY` = claim no tie).
 pub struct PhiCase<'a> {
     pub text: &'a str,
     pub q_ids: &'a [u32],
     pub phi: &'a [f32],
+    pub route_gap: f64,
 }
 
 fn unit_vec(v: &[f32]) -> Vec<f32> {
@@ -2108,6 +2167,148 @@ fn unit_vec(v: &[f32]) -> Vec<f32> {
     } else {
         v.to_vec()
     }
+}
+
+/// A routed expert closer than this to its runner-up, relative to the winning
+/// score's magnitude, is a numerical tie: two correct implementations (the
+/// Metal, WGSL/CUDA and CPU reductions sum in different orders) may pick
+/// either. Embryo-56M: the median gap of the best two is 0.26 of the score;
+/// the one holdout that flipped between the WGSL trainer and the runtime had
+/// 8.2e-7 (f32 and f64 picked different experts there too).
+pub const ROUTE_TIE_REL: f64 = 1e-5;
+
+/// Holdouts over the φ tolerance a check may excuse as routing ties: at most
+/// this many, or 2 % of the holdouts when that is more. More is systematic.
+pub const ROUTE_TIES_MAX: usize = 2;
+
+/// The runtime's resonance scores (`Resonance::scores`: bias − ‖(x−μ)⊥U‖²) in f64.
+fn resonance_scores_f64(x: &[f32], mu: &[f32], u: &[f32], k: usize, bias: &[f32]) -> Vec<f64> {
+    let h = x.len();
+    (0..bias.len())
+        .map(|e| {
+            let m = &mu[e * h..(e + 1) * h];
+            let d2: f64 = (0..h).map(|j| (x[j] as f64 - m[j] as f64).powi(2)).sum();
+            let pr: f64 = (0..k)
+                .map(|i| {
+                    let ue = &u[(e * k + i) * h..(e * k + i + 1) * h];
+                    (0..h).map(|j| (x[j] as f64 - m[j] as f64) * ue[j] as f64).sum::<f64>().powi(2)
+                })
+                .sum();
+            bias[e] as f64 - (d2 - pr)
+        })
+        .collect()
+}
+
+/// One prompt's routing, read after an evaluation forward of `gpu` up to
+/// `top`: for every layer `0..=top` and position `0..end`, the best expert and
+/// the relative f64 gap to the runner-up, `(layer, pos, best, gap)`.
+fn prompt_routes(
+    gpu: &EmbryoGpu,
+    desc: &crate::growth::GrowthDesc,
+    top: usize,
+    end: usize,
+) -> Vec<(usize, usize, usize, f64)> {
+    let (ne, h) = (desc.e, desc.h);
+    let kk = desc.u.len() / (desc.layers_total * ne * h);
+    let mut out = Vec::new();
+    for l in 0..=top {
+        let x2 = gpu.ffn_input_host(l);
+        let mu = &desc.mu[l * ne * h..(l + 1) * ne * h];
+        let u = &desc.u[l * ne * kk * h..(l + 1) * ne * kk * h];
+        let bias = &desc.bias[l * ne..(l + 1) * ne];
+        for p in 0..end {
+            let s = resonance_scores_f64(&x2[p * h..(p + 1) * h], mu, u, kk, bias);
+            let mut ord: Vec<usize> = (0..ne).collect();
+            ord.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+            let gap = (s[ord[0]] - s[ord[1]]) / s[ord[0]].abs().max(1.0);
+            out.push((l, p, ord[0], gap));
+        }
+    }
+    out
+}
+
+/// A dropless 1 × `t` evaluation instance of the checkpoint (descriptors set,
+/// frozen; served anchor window) and the prompt padded to `t` with its last id.
+fn eval_instance_1xt(ck: &Checkpoint, t: usize) -> anyhow::Result<EmbryoGpu> {
+    let gpu = EmbryoGpu::new_eval_dropless(ck.cfg.clone(), 1, t, &ck.params)
+        .ok_or_else(|| anyhow::anyhow!("no GPU device for the routing probe (Metal / Vulkan / CUDA)"))?;
+    gpu.set_desc(&ck.extras);
+    gpu.desc_updates.set(false);
+    gpu.anchor_fixed_window.set(true);
+    Ok(gpu)
+}
+
+fn padded(ids: &[u32], t: usize) -> Vec<u32> {
+    let mut tokens = vec![ids[ids.len() - 1]; t];
+    tokens[..ids.len()].copy_from_slice(ids);
+    tokens
+}
+
+/// For each prompt: the smallest relative gap between the best two routed
+/// experts over everything its φ depends on (positions `0..span.end` of the
+/// layers `0..=spec.layer`), from the trainer's evaluation forward and the
+/// runtime formula in f64. `INFINITY` (no tie can be claimed) for a genome
+/// without routed experts or with a selection the formula does not describe
+/// (`router_smooth_k4`, `router_top2_margin`).
+pub fn route_gaps(ck: &Checkpoint, spec: &PhiSpec, q_ids: &[&[u32]]) -> anyhow::Result<Vec<f64>> {
+    let cfg = &ck.cfg;
+    if cfg.experts < 2 || cfg.router_smooth_k4 || cfg.router_top2_margin.is_some() || q_ids.is_empty() {
+        return Ok(vec![f64::INFINITY; q_ids.len()]);
+    }
+    let desc = crate::growth::GrowthDesc::from_checkpoint(ck, cfg.experts)?;
+    let framed: Vec<_> = q_ids.iter().map(|q| phi_span_ids(spec, q)).collect();
+    let t = framed.iter().map(|(ids, _)| ids.len()).max().unwrap_or(1).div_ceil(64).max(1) * 64;
+    let gpu = eval_instance_1xt(ck, t)?;
+    let top = spec.layer.min(cfg.layers - 1);
+    Ok(framed
+        .iter()
+        .map(|(ids, span)| {
+            let _ = gpu.hidden_after_layer(&padded(ids, t), top);
+            prompt_routes(&gpu, &desc, top, span.end)
+                .into_iter()
+                .map(|r| r.3)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect())
+}
+
+/// Diagnostic (`CMF_BAKE_PHI_DIAG` + `CMF_BAKE_PHI_DIAG_ROWS`): the trainer's
+/// hidden row after the φ layer at every span position of the chosen holdout
+/// cases and the φ layer's routing there (best expert, f64 gap), each prompt
+/// alone on a dropless 1 × T instance, as JSON lines — to set position by
+/// position against the runtime's rows of the same check.
+fn diag_trainer_rows(
+    ck: &Checkpoint,
+    spec: &PhiSpec,
+    cases: &[PhiCase],
+    idx: &[usize],
+    out: &Path,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let h = ck.cfg.hidden;
+    let desc = (ck.cfg.experts > 1)
+        .then(|| crate::growth::GrowthDesc::from_checkpoint(ck, ck.cfg.experts))
+        .transpose()?;
+    for &k in idx.iter().filter(|&&k| k < cases.len()) {
+        let (ids, span) = phi_span_ids(spec, cases[k].q_ids);
+        let t = ids.len().div_ceil(64).max(1) * 64;
+        let gpu = eval_instance_1xt(ck, t)?;
+        let xs = gpu.hidden_after_layer(&padded(&ids, t), spec.layer);
+        let rows: Vec<&[f32]> = span.clone().map(|p| &xs[p * h..(p + 1) * h]).collect();
+        let route: Vec<_> = desc
+            .as_ref()
+            .map(|d| prompt_routes(&gpu, d, spec.layer, span.end))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.0 == spec.layer && r.1 >= span.start)
+            .map(|(_, p, e, g)| serde_json::json!({"pos": p, "best": e, "gap": g}))
+            .collect();
+        let row = serde_json::json!({"k": k, "span": [span.start, span.end], "trainer_rows": rows, "route": route});
+        writeln!(f, "{row}")?;
+    }
+    f.flush()?;
+    Ok(())
 }
 
 /// Restores `CMF_GPU` when the runtime check ends.
@@ -2159,6 +2360,19 @@ pub fn runtime_route_check(
             include_quarantine: true,
         };
         let (mut worst, mut to_skill) = (0f32, 0usize);
+        // every holdout over the tolerance, not only the first: rounding moves all prompts a
+        // little, one prompt far off is a different path (an expert near a tie)
+        let mut over: Vec<(usize, f32)> = Vec::new();
+        let mut ties: Vec<(usize, f32, f64)> = Vec::new();
+        // `CMF_BAKE_PHI_DIAG=<file>`: both unit φ of every holdout as JSON lines, to compare
+        // devices and hosts; the check itself is unchanged
+        let mut diag = match std::env::var_os("CMF_BAKE_PHI_DIAG") {
+            Some(p) if !p.is_empty() => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+            _ => None,
+        };
+        let diag_rows: Vec<usize> = std::env::var("CMF_BAKE_PHI_DIAG_ROWS")
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_default();
         for (k, c) in cases.iter().enumerate() {
             let q = pipe.tokenizer.encode(c.text);
             anyhow::ensure!(
@@ -2170,20 +2384,41 @@ pub fn runtime_route_check(
                 c.text
             );
             let (ids, span) = phi_span_ids(&policy.phi, &q);
-            let phi_rt = pipe.probe_phi_span(&ids, policy.phi.layer, span);
+            let phi_rt = pipe.probe_phi_span(&ids, policy.phi.layer, span.clone());
             let d = unit_vec(&phi_rt)
                 .iter()
                 .zip(&unit_vec(c.phi))
                 .map(|(x, y)| (x - y).abs())
                 .fold(0f32, f32::max);
-            anyhow::ensure!(
-                d.is_finite() && d <= tol,
-                "runtime check: holdout prompt #{k} — the runtime's unit φ differs from the \
-                 trainer's by {d:.3e} (> {tol:.0e}): the descriptors and the calibration would \
-                 describe another φ than the served one ({:?})",
-                c.text
-            );
-            worst = worst.max(d);
+            if let Some(f) = diag.as_mut() {
+                use std::io::Write;
+                // `CMF_BAKE_PHI_DIAG_ROWS=k,…`: the runtime's hidden row at every span position of
+                // those prompts too (each its own probe over the prefix up to it)
+                let rows: Vec<Vec<f32>> = if diag_rows.contains(&k) {
+                    span.clone()
+                        .map(|p| pipe.probe_phi_span(&ids[..=p], policy.phi.layer, p..p + 1))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let row = serde_json::json!({
+                    "k": k, "delta": d, "span": [span.start, span.end], "ids": ids,
+                    "text": c.text, "trainer": unit_vec(c.phi), "runtime": unit_vec(&phi_rt),
+                    "runtime_raw": phi_rt, "trainer_raw": c.phi, "runtime_rows": rows,
+                });
+                writeln!(f, "{row}")?;
+            }
+            if !(d.is_finite() && d <= tol) {
+                if d.is_finite() && c.route_gap <= ROUTE_TIE_REL {
+                    // an expert the φ depends on is a numerical tie: the trainer's device and
+                    // the runtime may each pick either; the routing decision below must agree
+                    ties.push((k, d, c.route_gap));
+                } else {
+                    over.push((k, d));
+                }
+            } else {
+                worst = worst.max(d);
+            }
             let rt = route_request_ids(&model, &mut pipe, &q, opts);
             let tr = route_policy_with(&model.header, c.phi, opts);
             anyhow::ensure!(
@@ -2198,6 +2433,32 @@ pub fn runtime_route_check(
             );
             to_skill += usize::from(rt.skill().is_some());
         }
+        if let Some(mut f) = diag {
+            use std::io::Write;
+            f.flush()?;
+        }
+        if let Some(&(k, d)) = over.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+            let mut all: Vec<f32> = over.iter().map(|o| o.1).collect();
+            all.sort_by(f32::total_cmp);
+            anyhow::bail!(
+                "runtime check: on {} of {} holdout prompts the runtime's unit φ differs from the \
+                 trainer's by more than {tol:.0e} (largest {d:.3e}, prompt #{k}; median over \
+                 them {:.3e}): the descriptors and the calibration would describe another φ than \
+                 the served one ({:?})",
+                over.len(),
+                cases.len(),
+                all[all.len() / 2],
+                cases[k].text
+            );
+        }
+        let ties_max = ROUTE_TIES_MAX.max(cases.len() / 50);
+        anyhow::ensure!(
+            ties.len() <= ties_max,
+            "runtime check: {} holdout prompts differ from the runtime's φ by more than {tol:.0e} \
+             at a routing tie (gap ≤ {ROUTE_TIE_REL:.0e}), more than the {ties_max} a check \
+             excuses: the trainer's routing is not the runtime's",
+            ties.len()
+        );
         Ok(serde_json::json!({
             "prompts": cases.len(),
             "decisions_equal": cases.len(),
@@ -2205,6 +2466,12 @@ pub fn runtime_route_check(
             "to_backbone": cases.len() - to_skill,
             "max_unit_phi_delta": worst,
             "tol": tol,
+            "near_ties": cases.iter().filter(|c| c.route_gap <= ROUTE_TIE_REL).count(),
+            "route_ties": ties
+                .iter()
+                .map(|&(k, d, g)| serde_json::json!({"prompt": k, "unit_phi_delta": d, "route_gap": g}))
+                .collect::<Vec<_>>(),
+            "route_tie_rel": ROUTE_TIE_REL,
             "reference": "runtime CPU pipeline (CMF_GPU=0), route_request_ids, quarantine scored",
         }))
     })
@@ -2343,6 +2610,10 @@ pub fn bake_v2(
         "--target-fpr must be in (0, 1)"
     );
     anyhow::ensure!(a.mask_init.is_finite(), "--mask-init must be finite");
+    anyhow::ensure!(
+        !a.mask_experts || a.soft_fold,
+        "--mask-experts needs --soft-fold (an expert's mask is folded as gains into its down_proj)"
+    );
     let tau_max = 1.0 / (1.0 + (-a.mask_init).exp());
     anyhow::ensure!(
         a.tau > 0.0 && a.tau < tau_max,
@@ -2622,6 +2893,7 @@ pub fn bake_v2(
         "inputs": roles,
         "recipe": if a.soft_fold { RECIPE_V2_SOFT } else { RECIPE_V2 },
         "mask_init": a.mask_init, "soft_fold": a.soft_fold, "fcd_layers": a.fcd_layers,
+        "mask_experts": a.mask_experts,
         "steps": {"a": a.steps_a, "b": a.steps_b},
         "lr": {"a": a.lr_a, "b": a.lr_b},
         "l1": a.l1, "tau": a.tau,
@@ -2741,8 +3013,24 @@ pub fn bake_v2(
                 text: &cls.texts[k],
                 q_ids: &cls.q_ids[k],
                 phi: &cls.phis[k],
+                route_gap: f64::INFINITY,
             });
         }
+    }
+    // the routing gaps the holdouts' φ depends on: a check may excuse a φ only at a tie
+    let q_of: Vec<&[u32]> = cases.iter().map(|c| c.q_ids).collect();
+    let gaps = route_gaps(&ck, &router.phi, &q_of)?;
+    for (c, g) in cases.iter_mut().zip(gaps) {
+        c.route_gap = g;
+    }
+    if let (Some(path), Ok(list)) = (
+        std::env::var_os("CMF_BAKE_PHI_DIAG"),
+        std::env::var("CMF_BAKE_PHI_DIAG_ROWS"),
+    ) {
+        let idx: Vec<usize> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        let mut out = std::path::PathBuf::from(path).into_os_string();
+        out.push(".trainer.jsonl");
+        diag_trainer_rows(&ck, &router.phi, &cases, &idx, Path::new(&out))?;
     }
     // ---- private copy + true tail append (+ recalibration), G1, runtime ----
     let (tmp, file) = create_bake_tmp(&inp.out)?;
