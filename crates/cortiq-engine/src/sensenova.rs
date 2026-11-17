@@ -311,6 +311,7 @@ pub fn graph_mhc(m: Option<&Mhc>, p: usize) -> Option<crate::gpu::GraphMhc<'_>> 
         leave: m.leaves(p),
         iters: m.s.iterations,
         pre_scale: m.s.pre_scale,
+        dsv4: None,
     })
 }
 

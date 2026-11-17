@@ -295,6 +295,24 @@ pub mod prof {
     /// Inside ATTN_FWD: the device chain call.
     pub static ATTN_CHAIN: AtomicU64 = AtomicU64::new(0);
     pub static BWD: AtomicU64 = AtomicU64::new(0);
+    /// The GDN operator itself (conv + recurrence, forward and BPTT), wherever it runs.
+    pub static GDN: AtomicU64 = AtomicU64::new(0);
+    /// Named sections (`CMF_BAKE_PROF=1`): seconds by label, printed by the bake.
+    pub static NAMED: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+    pub fn tick(name: &'static str, t: std::time::Instant) {
+        let ns = t.elapsed().as_nanos() as u64;
+        let mut g = NAMED.lock().unwrap();
+        match g.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, v)) => *v += ns,
+            None => g.push((name, ns)),
+        }
+    }
+    pub fn named_report() -> String {
+        let mut g = NAMED.lock().unwrap();
+        let out = g.iter().map(|(n, v)| format!("{n} {:.2}s", *v as f64 / 1e9)).collect::<Vec<_>>().join(" | ");
+        g.clear();
+        out
+    }
     pub static GEMM: AtomicU64 = AtomicU64::new(0);
     pub static GEMM_CALLS: AtomicU64 = AtomicU64::new(0);
     #[inline]
@@ -1309,6 +1327,53 @@ pub(crate) fn add_into_pooled(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
 /// `act[r] = f(gpre[r]) ⊙ upre[r]` over `n` rows of `inter`, pooled: the
 /// erf GELU is not free (63 M elements per 4 B training step), and one
 /// thread walking it was the slowest link of a Spark bake.
+/// The bake's frozen FFN chain on the device: CUDA's (`gpu_cuda::bake_ffn_fwd`)
+/// when that is the backend, else wgpu's (`gpu_wgpu::ffn_chain_f32`).
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bake_ffn_chain(
+    n2: &[f32],
+    gu: &[f32],
+    down: &[f32],
+    scale: Option<&[f32]>,
+    both_out: Option<&mut [f32]>,
+    plane: Option<usize>,
+    ffn: &mut [f32],
+    n: usize,
+    hsz: usize,
+    inter: usize,
+    act: FfnAct,
+) -> bool {
+    #[cfg(feature = "cuda")]
+    if crate::gpu::cuda_active() {
+        return crate::gpu_cuda::bake_ffn_fwd(n2, gu, down, scale, both_out, plane, ffn, n, hsz, inter, act);
+    }
+    crate::gpu_wgpu::ffn_chain_f32(n2, gu, down, scale, both_out, plane, ffn, n, hsz, inter, act)
+}
+
+/// The backward twin of [`bake_ffn_chain`] from the plane its forward kept.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bake_ffn_bwd_chain(
+    dh2: &[f32],
+    down: &[f32],
+    gu: &[f32],
+    li: usize,
+    dn2: &mut [f32],
+    n: usize,
+    hsz: usize,
+    inter: usize,
+    act: FfnAct,
+    scale: Option<&[f32]>,
+    dmask: Option<&mut [f32]>,
+) -> bool {
+    #[cfg(feature = "cuda")]
+    if crate::gpu::cuda_active() {
+        return crate::gpu_cuda::bake_ffn_bwd(dh2, down, gu, li, dn2, n, hsz, inter, act, scale, dmask);
+    }
+    crate::gpu_wgpu::ffn_bwd_chain_f32(dh2, down, gu, li, dn2, n, hsz, inter, act, scale, dmask)
+}
+
 pub(crate) fn act_mul_rows(
     f: FfnAct,
     gpre: &[f32],
@@ -1418,6 +1483,99 @@ impl FcdModel {
     }
 
     /// The RoPE geometry of a layer: local layers may own a table.
+    /// A whole Phase-A step of the skill bake on CUDA (`gpu_cuda::bake_phase_a`):
+    /// `ffn` the layers' norms and FFN weights with their mask gains (the
+    /// caller's `LnFfn`, physical order), `mats` the layers' matrices. None
+    /// when the stack has something the resident step does not take (a loop,
+    /// projection biases, a projected head gate) or the card declines — the
+    /// layer-by-layer path then runs as before.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn resident_step(
+        &self,
+        ids: &[u32],
+        b: usize,
+        ffn: &[(LnFfn<'_>, Vec<f32>)],
+        mats: &[std::sync::Arc<LayerMats>],
+        targets: &[usize],
+        scale: f32,
+        grad: bool,
+    ) -> Option<crate::gpu_cuda::BkOut> {
+        use crate::gpu_cuda::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkStep};
+        if !crate::gpu::cuda_active() || self.loops > 1 || ffn.len() != self.layers.len() || mats.len() != self.layers.len() || b == 0 {
+            return None;
+        }
+        if std::env::var("CMF_BAKE_RESIDENT").as_deref() == Ok("0") {
+            return None;
+        }
+        let t = ids.len() / b;
+        // the rope tables a full layer reads, [t][half][2] (cos, sin), by locality
+        let tab = |local: bool| -> Vec<f32> {
+            let (rd, inv_freq) = self.layer_rope(local);
+            let half = rd / 2;
+            let mut v = Vec::with_capacity(t * half * 2);
+            for pos in 0..t {
+                for &fq in &inv_freq[..half] {
+                    let a = pos as f64 * fq;
+                    v.push(a.cos() as f32);
+                    v.push(a.sin() as f32);
+                }
+            }
+            v
+        };
+        let (tab_g, tab_l) = (tab(false), tab(true));
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (li, l) in self.layers.iter().enumerate() {
+            let (w, gain) = (&ffn[li].0, &ffn[li].1);
+            let gu = w.gu?;
+            let attn = match &l.attn {
+                FcdAttn::Gdn { wqkv, wz, wa, wb, conv, a_log, dt_bias, norm, wout } => {
+                    let d = self.gdn?;
+                    BkAttn::Gdn(
+                        BakeGdn { nv: d.nv, nk: d.nk, dk: d.dk, dv: d.dv, kk: d.kk, eps: self.eps as f32, conv, a_log, dt_bias, norm },
+                        BakeGdnW { wqkv, wz, wa, wb, wout, hsz: self.hidden },
+                    )
+                }
+                FcdAttn::Full { q_norm, k_norm, bias, output_gate, head_gate, window, local_rope, .. } => {
+                    if bias.is_some() || head_gate.is_some() {
+                        return None;
+                    }
+                    let (rd, _) = self.layer_rope(*local_rope);
+                    BkAttn::Full(BkFull {
+                        wqkv: &mats[li].wqkv,
+                        wo: &mats[li].wo,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        gated: *output_gate,
+                        nh: self.nh,
+                        nkv: self.nkv,
+                        hd: self.hd,
+                        rope: if *local_rope { &tab_l } else { &tab_g },
+                        half: rd / 2,
+                        window: *window,
+                    })
+                }
+            };
+            layers.push(BkLayer { iln: w.iln, pln: w.pln, attn, gu, down: w.down, inter: l.inter, gain });
+        }
+        let step = BkStep {
+            layers,
+            ids,
+            b,
+            t,
+            hsz: self.hidden,
+            eps: self.eps as f32,
+            gemma: self.gemma,
+            act: self.act,
+            embed: &self.embed,
+            final_norm: &self.final_norm,
+            lm: self.lm_head.as_deref().unwrap_or(&self.embed),
+            targets,
+            scale,
+            grad,
+        };
+        crate::gpu_cuda::bake_phase_a(&step)
+    }
+
     pub(crate) fn layer_rope(&self, local: bool) -> (usize, &[f64]) {
         if local {
             (
@@ -1513,9 +1671,10 @@ impl FcdModel {
             FcdAttn::Full { .. } => {
                 self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom, attn_w, want_attn_acts)
             }
-            FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t),
+            FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t, self.attn_acts || want_attn_acts),
         };
         prof::add(&prof::ATTN_FWD, t_attn);
+        prof::tick(if matches!(l.attn, FcdAttn::Gdn { .. }) { "attn-gdn-layers" } else { "attn-full-layers" }, t_attn);
         let t_ffn = std::time::Instant::now();
 
         let mut h1 = h_in.to_vec();
@@ -1547,7 +1706,7 @@ impl FcdModel {
                 // plane there: nothing of n×2·inter crosses PCIe.
                 let mut both = (want_acts && ffn_planes_to_host).then(|| vec![0f32; n * 2 * inter]);
                 let t_chain = std::time::Instant::now();
-                let chained = crate::gpu_wgpu::ffn_chain_f32(
+                let chained = bake_ffn_chain(
                     &n2,
                     gu,
                     wts.down,
@@ -1826,8 +1985,10 @@ impl FcdModel {
         // One fused submit; the split back into three buffers is a
         // memcpy that costs microseconds and keeps everything below
         // this line byte-identical to the unfused path.
+        let t_q = std::time::Instant::now();
         let mut qkv = vec![0f32; n * fused];
         ops::gemm_nt(n1, wqkv, &mut qkv, n, hsz, fused, pool);
+        prof::tick("full-qkv-gemm", t_q);
         let mut qraw = vec![0f32; n * qrows];
         let mut kpre = vec![0f32; n * kvdim];
         let mut vproj = vec![0f32; n * kvdim];
@@ -1867,16 +2028,26 @@ impl FcdModel {
             (qraw, Vec::new())
         };
 
+        let t_nr = std::time::Instant::now();
         let mut qrot = qpre.clone();
         let mut krot = kpre.clone();
         let mut qinv = vec![0f32; n * nh];
         let mut kinv = vec![0f32; n * nkv];
         self.qk_norm_rope(&mut qrot, q_norm.as_deref(), nh, t, *local_rope, &mut qinv);
         self.qk_norm_rope(&mut krot, k_norm.as_deref(), nkv, t, *local_rope, &mut kinv);
+        prof::tick("full-qk-norm-rope", t_nr);
+        let t_core = std::time::Instant::now();
 
         // ── attention heads: parallel over (sequence, head) ──
         let mut ao = vec![0f32; n * qdim];
-        {
+        // The exact core on the card on CUDA (`gpu_cuda::bake_attn_fwd`).
+        #[cfg(feature = "cuda")]
+        let ao_dev = !nystrom
+            && crate::gpu::cuda_active()
+            && crate::gpu_cuda::bake_attn_fwd(&qrot, &krot, &vproj, b, t, nh, nkv, hd, *window, &mut ao);
+        #[cfg(not(feature = "cuda"))]
+        let ao_dev = false;
+        if !ao_dev {
             let units = b * nh;
             let aop = SendMut(ao.as_mut_ptr());
             let qr = &qrot;
@@ -1970,8 +2141,11 @@ impl FcdModel {
                 }
             }
         }
+        prof::tick("full-core+gate", t_core);
+        let t_wo = std::time::Instant::now();
         let mut attn_out = vec![0f32; n * hsz];
         ops::gemm_nt(&ao_eff, wo, &mut attn_out, n, qdim, hsz, pool);
+        prof::tick("full-wo", t_wo);
         (
             attn_out,
             AttnActs::Full {
@@ -1993,7 +2167,7 @@ impl FcdModel {
     /// projections → f64 conv+SiLU per sequence → pooled per-(seq,
     /// k-head) delta-rule recurrence → out_proj. Matches the runtime
     /// `gdn_forward` (parity-tested in fcd_gradcheck).
-    fn gdn_attn_fwd(&self, attn: &FcdAttn, n1: &[f32], b: usize, t: usize) -> (Vec<f32>, AttnActs) {
+    fn gdn_attn_fwd(&self, attn: &FcdAttn, n1: &[f32], b: usize, t: usize, want_streams: bool) -> (Vec<f32>, AttnActs) {
         let FcdAttn::Gdn {
             wqkv,
             wz,
@@ -2013,14 +2187,45 @@ impl FcdModel {
         let pool = self.pool.as_deref();
         let (c_dim, vd, nv) = (d.c_dim(), d.vd(), d.nv);
 
+        // CUDA: the whole layer on the card, n1 up and attn_out down; the
+        // projection streams come back only for a backward through it.
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            let g = crate::gpu_cuda::BakeGdn {
+                nv: d.nv,
+                nk: d.nk,
+                dk: d.dk,
+                dv: d.dv,
+                kk: d.kk,
+                eps: self.eps as f32,
+                conv,
+                a_log,
+                dt_bias,
+                norm,
+            };
+            let w = crate::gpu_cuda::BakeGdnW { wqkv, wz, wa, wb, wout, hsz };
+            if crate::gpu_cuda::bake_gdn_ok(&g) {
+                let t_gdn = std::time::Instant::now();
+                let done = crate::gpu_cuda::bake_gdn_layer_fwd(n1, &w, &g, b, t, want_streams);
+                prof::tick("gdn-layer-chain", t_gdn);
+                if let Some((attn_out, streams)) = done {
+                    let (qkv, z, a, bstr) = streams.unwrap_or_default();
+                    return (attn_out, AttnActs::Gdn { qkv, z, a, b: bstr });
+                }
+            }
+        }
+        let t_proj = std::time::Instant::now();
         let mut qkv = vec![0f32; n * c_dim];
         ops::gemm_nt(n1, wqkv, &mut qkv, n, hsz, c_dim, pool);
         let mut z = vec![0f32; n * vd];
         ops::gemm_nt(n1, wz, &mut z, n, hsz, vd, pool);
+        prof::tick("gdn-proj-qkvz", t_proj);
+        let t_proj = std::time::Instant::now();
         let mut a = vec![0f32; n * nv];
         ops::gemm_nt(n1, wa, &mut a, n, hsz, nv, pool);
         let mut bstr = vec![0f32; n * nv];
         ops::gemm_nt(n1, wb, &mut bstr, n, hsz, nv, pool);
+        prof::tick("gdn-proj-ab", t_proj);
 
         let cfg = ops::GdnSeqCfg {
             nv: d.nv,
@@ -2034,6 +2239,34 @@ impl FcdModel {
             dt_bias,
             norm,
         };
+        // The card's f32 operator (`gpu_cuda::bake_gdn_fwd`) on CUDA.
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            let g = crate::gpu_cuda::BakeGdn {
+                nv: d.nv,
+                nk: d.nk,
+                dk: d.dk,
+                dv: d.dv,
+                kk: d.kk,
+                eps: self.eps as f32,
+                conv,
+                a_log,
+                dt_bias,
+                norm,
+            };
+            if crate::gpu_cuda::bake_gdn_ok(&g) {
+                let t_gdn = std::time::Instant::now();
+                let done = crate::gpu_cuda::bake_gdn_fwd(&qkv, &z, &a, &bstr, b, t, &g);
+                prof::add(&prof::GDN, t_gdn);
+                if let Some(of) = done {
+                    let t_out = std::time::Instant::now();
+                    let mut attn_out = vec![0f32; n * hsz];
+                    ops::gemm_nt(&of, wout, &mut attn_out, n, vd, hsz, pool);
+                    prof::tick("gdn-out", t_out);
+                    return (attn_out, AttnActs::Gdn { qkv, z, a, b: bstr });
+                }
+            }
+        }
         // f64 streams (runtime-precision recurrence) + per-seq conv.
         let qkv64: Vec<f64> = qkv.iter().map(|&v| v as f64).collect();
         let z64: Vec<f64> = z.iter().map(|&v| v as f64).collect();
@@ -2137,9 +2370,7 @@ impl FcdModel {
         if grads.is_none() {
             if let Some(gu) = wts.gu {
                 if crate::gpu::enabled_here()
-                    && crate::gpu_wgpu::ffn_bwd_chain_f32(
-                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter, self.act, None, None,
-                    )
+                    && bake_ffn_bwd_chain(dh2, wts.down, gu, li, &mut dn2, n, hsz, inter, self.act, None, None)
                 {
                     bwd_fused = true;
                 }
@@ -2289,7 +2520,13 @@ impl FcdModel {
         let mut dqrot = vec![0f32; n * qdim];
         let mut dkrot = vec![0f32; n * kvdim];
         let mut dvproj = vec![0f32; n * kvdim];
-        {
+        #[cfg(feature = "cuda")]
+        let core_dev = !nystrom
+            && crate::gpu::cuda_active()
+            && crate::gpu_cuda::bake_attn_bwd(qrot, krot, vproj, &dao, b, t, nh, nkv, hd, *window, &mut dqrot, &mut dkrot, &mut dvproj);
+        #[cfg(not(feature = "cuda"))]
+        let core_dev = false;
+        if !core_dev {
             // Parallel over (sequence, kv-group): a unit owns the dk/dv
             // slices of its group and the dq slices of its rep Q heads.
             let units = b * nkv;
@@ -2493,6 +2730,34 @@ impl FcdModel {
             dt_bias,
             norm,
         };
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            let g = crate::gpu_cuda::BakeGdn {
+                nv: d.nv,
+                nk: d.nk,
+                dk: d.dk,
+                dv: d.dv,
+                kk: d.kk,
+                eps: self.eps as f32,
+                conv,
+                a_log,
+                dt_bias,
+                norm,
+            };
+            if crate::gpu_cuda::bake_gdn_ok(&g) {
+                let t_gdn = std::time::Instant::now();
+                let done = crate::gpu_cuda::bake_gdn_bwd(qkv, z, a, bstr, &dof, b, t, &g);
+                prof::add(&prof::GDN, t_gdn);
+                if let Some((dqkv, dz, da, db)) = done {
+                    let mut dn1 = vec![0f32; n * hsz];
+                    ops::gemm_dx(&dqkv, wqkv, &mut dn1, n, hsz, c_dim, pool);
+                    ops::gemm_dx(&dz, wz, &mut dn1, n, hsz, vd, pool);
+                    ops::gemm_dx(&da, wa, &mut dn1, n, hsz, nv, pool);
+                    ops::gemm_dx(&db, wb, &mut dn1, n, hsz, nv, pool);
+                    return dn1;
+                }
+            }
+        }
         let qkv64: Vec<f64> = qkv.iter().map(|&v| v as f64).collect();
         let z64: Vec<f64> = z.iter().map(|&v| v as f64).collect();
         let a64: Vec<f64> = a.iter().map(|&v| v as f64).collect();

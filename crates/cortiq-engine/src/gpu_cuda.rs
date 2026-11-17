@@ -259,9 +259,37 @@ impl Drop for SlabScope {
     }
 }
 
-/// Free bytes of the card as the driver reports them (every process counted).
+/// Free bytes of the card as the driver reports them (every process counted),
+/// capped by `CMF_GPU_VRAM_MB` (`card_free`).
 fn mem_free() -> Option<u64> {
-    cu::mem_get_info().ok().map(|(free, _)| free as u64)
+    cu::mem_get_info().ok().map(|_| card_free() as u64)
+}
+
+/// Some hybrid plan streams its routed experts through card slots (they
+/// live past the card): the per-op path has no such placement.
+pub(crate) fn experts_streamed() -> bool {
+    hyb::STREAMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The card's size for placement: the driver's total, or `CMF_GPU_VRAM_MB`.
+pub(crate) fn card_total() -> usize {
+    let (_, total) = cu::mem_get_info().unwrap_or((0, 0));
+    match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(mb) => total.min(mb << 20),
+        None => total,
+    }
+}
+
+/// The card's free bytes for placement: the driver's figure, and under
+/// `CMF_GPU_VRAM_MB` a card of that size (what is in use counts against it) —
+/// so a 12, 16 or 24 GB card's placement runs on a bigger one exactly as it
+/// would there.
+pub(crate) fn card_free() -> usize {
+    let (free, total) = cu::mem_get_info().unwrap_or((0, 0));
+    match std::env::var("CMF_GPU_VRAM_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(mb) => free.min((mb << 20).saturating_sub(total.saturating_sub(free))),
+        None => free,
+    }
 }
 
 /// A device allocation, freed on drop (the context is current wherever one
@@ -931,14 +959,18 @@ pub use embryo::{
     forward_embryo_graph_chunk,
 };
 
+/// The skill bake's GDN layers (conv, delta rule and its BPTT) and its dX
+/// GEMMs on the card; declared after `kargs!`, which it uses.
+mod bake;
+pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_attn_bwd, bake_phase_a, bake_attn_fwd, bake_ffn_bwd, bake_ffn_fwd, bake_gdn_bwd, bake_gdn_fwd, bake_gdn_layer_fwd, bake_gdn_ok, bake_gemm_dx, bake_gemm_nt, bake_lm_loss, bake_planes_clear};
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
 pub use h3::{
-    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_plane_ready, h3_prof_report, h3_release, h3_resident_bytes,
+    h3_attention, h3_chain, h3_conv1d, h3_conv_chain, h3_gemm_nt, h3_matmat, h3_music3_ffn, h3_plane_fits, h3_plane_ready, h3_planes_grow, h3_prof_report, h3_release, h3_resident_bytes,
     flux_vae_chain, h3_te_chain, h3_vae_conv2d, lumina_block, ltx_chain, ltx_vae_chain, moss_chain, primal_vae_run, qi21_prefill, qi21_release,
-    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, sam_encode, vit_encode, zimage_prepare, zimage_release, zimage_step,
-};
+    qi21_release_key, qi21_step, qi21_vae_decode, qwen_image_chain, s2v_prepare, s2v_vae_decode, s2v_vae_encode, s2v_vae_release, sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_mm, sam3_text, sam3_trunk, sam_encode, vit_encode, zimage_prepare, zimage_release, zimage_step, h3_lfm_set_forward};
 
 fn compile(src: &str, defs: Vec<String>, arch: Option<&'static str>) -> Res<cs::CUmodule> {
     // NVRTC takes seconds on a large module (the hybrid arm's: ~11 s on a
@@ -3134,6 +3166,27 @@ fn acap_note(c: &Ctx, layer: usize, kp: u64, vp: u64, n0: usize, n: usize, row: 
 /// Rows a layer's mirror holds (absolute), None without a mirror.
 /// y [n][rows] = W x [n][cols] on the card (a q4tp graph weight of the
 /// hybrid arm): false when the backend cannot take it.
+/// A host-routed MoE row on the card (`hyb::moe_row`). `false` = refused.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_row(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    shared: Option<((usize, usize, usize), usize, f32)>,
+    inter: usize,
+    limit: f32,
+    x: &[f32],
+    picks: &[(usize, f32)],
+    out: &mut [f32],
+) -> bool {
+    match hyb::moe_row(model, experts, shared, inter, limit, x, picks, out) {
+        Ok(()) => true,
+        Err(e) => {
+            decline("moe row", &e);
+            false
+        }
+    }
+}
+
 pub fn rows_matvec(model: &Arc<CmfModel>, gw: &GraphW, rows: usize, cols: usize, x: &[f32], n: usize, y: &mut [f32]) -> bool {
     match hyb::rows_matvec(model, gw, rows, cols, x, n, y) {
         Ok(()) => true,
@@ -3444,6 +3497,13 @@ pub fn resident_bytes() -> u64 {
 /// Bytes of K/V mirrors allocated right now.
 pub fn kv_bytes() -> u64 {
     ctx().map_or(0, |c| c.kv_bytes.load(Ordering::Relaxed))
+}
+
+/// Bytes in use on the card as the driver reports them (every process
+/// counted), None without a context.
+pub fn device_bytes_in_use() -> Option<u64> {
+    let c = ctx()?;
+    mem_free().map(|free| c.total_mem.saturating_sub(free))
 }
 
 /// The card's name, for reports.

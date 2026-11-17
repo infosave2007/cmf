@@ -47,6 +47,7 @@ Answers from a record are verbatim, and so is the refusal. `x_cortiq_route` in t
 | decode, Apple M4 GPU | about 650 tok/s |
 | decode, Apple M4 CPU | about 470 tok/s |
 | decode, NVIDIA RTX 2000 Ada / its EPYC 7443P host | 925 / 612 tok/s |
+| decode, NVIDIA RTX A5000, CUDA (cortiq 0.8.96, `CMF_GPU=cuda CMF_EMBRYO_RESIDENT=1`) | 870–920 tok/s |
 | decode after a 2000-token prompt, M4 GPU / CPU | 535 / 379 tok/s |
 | decode after a 2000-token prompt, RTX 2000 Ada / EPYC | 796 / 405 tok/s |
 | 3000 tokens in one run on the M4, GPU / CPU | 389 / 398 tok/s: the GPU slows down after a few seconds of continuous work |
@@ -100,7 +101,7 @@ cortiq run embryo-56m.cmf -p "Для чего применяют валериа�
 
 ![Измеренные числа: скорость и состояние](https://huggingface.co/infosave/Embryo-56M-cmf/resolve/main/assets/advantages_ru.png)
 
-Скорость: GPU Apple M4 около 650 ток/с, CPU около 470 ток/с. Файл 91 МБ. Состояние 10.1 МБ при любой длине контекста. Простые вопросы о растениях 155 из 180, факты 218 из 223, уточнения простыми словами 900 из 1200, вопросы о фактах вне записей с честным отказом 38 из 44.
+Скорость: GPU Apple M4 около 650 ток/с, CPU около 470 ток/с; NVIDIA RTX A5000 с CUDA (cortiq 0.8.96, `CMF_GPU=cuda CMF_EMBRYO_RESIDENT=1`) — 870–920 ток/с. Файл 91 МБ. Состояние 10.1 МБ при любой длине контекста. Простые вопросы о растениях 155 из 180, факты 218 из 223, уточнения простыми словами 900 из 1200, вопросы о фактах вне записей с честным отказом 38 из 44.
 
 Выбор записи делает резонансный роутер (заявка США № 19/452,440): ошибка реконструкции по токенам названия и остальному сообщению, без классификатора и правил. Свои подпространства есть у уточняющих вопросов и у решения, что в сообщении спрашивают факт, которого у сети нет. Записи дописываются в файл, не меняя ни байта сети (заявка США № 19/731,402). Память постоянна (заявка США № 19/738,763). Не используйте для медицинских решений.
 
@@ -128,7 +129,7 @@ cortiq run embryo-56m.cmf -p "What is valerian used for?"
 
 ![实测数字：速度与状态](https://huggingface.co/infosave/Embryo-56M-cmf/resolve/main/assets/advantages_zh.png)
 
-速度：Apple M4 GPU 约 650 tok/s，CPU 约 470 tok/s。文件 91 MB。任意上下文长度下状态均为 10.1 MB。植物简单问题 180 个中 155 个，事实问题 223 个中 218 个，用平实语言的追问 1200 个中 900 个，记录之外的事实问题如实拒答 44 个中 38 个。
+速度：Apple M4 GPU 约 650 tok/s，CPU 约 470 tok/s；NVIDIA RTX A5000 使用 CUDA（cortiq 0.8.96，`CMF_GPU=cuda CMF_EMBRYO_RESIDENT=1`）870–920 tok/s。文件 91 MB。任意上下文长度下状态均为 10.1 MB。植物简单问题 180 个中 155 个，事实问题 223 个中 218 个，用平实语言的追问 1200 个中 900 个，记录之外的事实问题如实拒答 44 个中 38 个。
 
 记录由共振路由选择（美国专利申请号 19/452,440）：按名称词元和其余消息的重构误差决定，不用分类器和规则。追问以及“消息在询问网络没有的事实”这一判断也有各自的子空间。记录追加写入文件，不改动网络的任何字节（美国专利申请号 19/731,402）。内存恒定（美国专利申请号 19/738,763）。请勿用于医疗决策。
 

@@ -7,6 +7,378 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-11-17
+
+### Added
+- NPU lane for Android phones with a Hexagon DSP (Snapdragon, Hexagon v68 and newer): a prompt chunk's q4tp
+  matrix products are split by rows between the CPU and the DSP. The DSP side is Cortiq's own module
+  (`crates/cortiq-engine/npu/hvx`: a FastRPC interface, an integer-HVX kernel for an unsigned PD and its Android
+  client, ~18 KB and ~12 KB), not a vendor runtime: q4tp codes are moved into a 32-rows-per-vector tiled layout
+  as they are and multiplied with `vrmpy`, a group's scales becoming Q15 ratios of the row's largest (relative
+  error 1e-6 against a double-precision reference). For a chunk the DSP splits a group's codes once and spends
+  them on eight activation vectors on two HVX threads; the CPU kernel computes the other rows meanwhile under a
+  thread-local row limit. The activation is the CPU kernel's own int8 split with float outliers, so the greedy
+  text is the CPU's. Off unless asked for (`npu::set_enabled`, `CMF_NPU=1`); `npu::set_lib_dir` names where the
+  DSP half lives. Each use is measured against the CPU in-process (alternating calls over the first 16
+  matrices, normalised by matrix size) and kept only when it wins by 5%; the verdict is remembered beside the
+  model (`cortiq-npu-probe.tsv`), and `npu::status()` reports it. The weights copied for the DSP take at most a
+  fifth of the memory available when the first lane is built (512 MB cap). On a Snapdragon 778G (Hexagon V68),
+  LFM3-1.7B q4tp: a 256-token prompt at 30.9 tokens/s against 22.7 on the CPU (35.6 within 640 MB), in an app
+  a 296-token text at ~36 against ~23; botpsy-0.8B 60.4 -> 65.0; decode unchanged. The decode split (a gate/up
+  pair's rows in one call) is there but off unless `CMF_NPU_DECODE=1`: a token is bound by DDR, which the CPU
+  and the DSP share, and on that phone it does not pay. Building the module needs the Hexagon SDK
+  (`npu/hvx/README.md`); nothing here is compiled by cargo.
+
+## [0.9.3] — 2026-11-16
+
+### Added
+- Skills on the CUDA hybrid arm, every way the host applies them, on the card:
+  - a pinned skill (`run/ppl --skill`) was already read by the plans through the skill's tensors; now measured
+    against the float host: Qwen3.5-0.8B q4tp with a 96-tensor skill (BotPsy-0.8B FFN and full attention),
+    64 greedy tokens on four prompts, top-1 64/64 and the same text, logits within 0.011; perplexity the
+    CPU's to three digits with and without the skill (38.689 / 30.868);
+  - a soft blend (`--blend`): its f32 working tensors go to the card once as q8_2f int8 tiles, encoded on the
+    host's cores in parallel (before: every graph declined and the blend ran per op, 9.8 tok/s on that 0.8B;
+    now 346 tok/s, the same text as the CPU's blend);
+  - per-token routing (`--route-dynamic`): the token and batch graphs keep the router layer's row (the layer
+    taps the DFlash drafter uses), so φ moves on the card; before, the graph ran the router's layer and φ never
+    changed (the router never left the backbone, silently), and MTP drafts took the router away altogether.
+    Same E values and switch points as the CPU, the prompt read batched (first token 0.3 s against the CPU's
+    6.9 s on a 90-token prompt).
+  - the skill's speed is the backbone's: A40, medians of three, 128 decode tokens without drafts and a
+    4096-token prompt — Qwen3.5-0.8B 429 / 415 tok/s and 20 895 / 20 150 tok/s without / with the skill,
+    Qwen3.5-4B (a 128-tensor skill from NeoHorse-1-4B) 159 / 157 and 5 950 / 5 950; the 4B's greedy text and
+    logits match the float host with and without it (top-1 64/64, within 0.043).
+- `cortiq skill bake` on CUDA (`CMF_GPU=cuda`): a Phase-A step of a Qwen3.5-class model runs whole on the card
+  — embeddings, every layer (frozen GDN and gated full attention, the masked FFN, both norms), the loss over
+  the scored rows on the full vocabulary and the FFN path's backward down to every layer's mask gradient —
+  with the ids up and the per-row losses and mask gradients down. The GDN recurrence (conv, delta rule,
+  BPTT), the exact attention core, the FFN chain and the LM-head cross-entropy have CUDA kernels of their own,
+  checked against the f64 host operators (relative 1e-7 to 4e-7); the layer-by-layer path keeps them for
+  Phase B and the through-attention backward. Qwen3.5-0.8B q4tp on an A40, 64 records of up to 128 tokens a
+  step: 0.2 s a step against 30–41 s on 0.9.2 (Vulkan chains with the GDN layers in f64 on a 7-core host), a
+  held-out pass of 400 records in seconds instead of 5 minutes, the same masked PPL and token accuracy as the
+  host path (1.614 / 84.09 %). `CMF_BAKE_RESIDENT=0` keeps the layer-by-layer path.
+- `cortiq skill apply --overlay`: a standalone skill file goes beside the base as `skill.<id>.*` instead of
+  replacing its tensors, so one file serves the backbone and, under `--skill <id>`, the specialist. Masks the
+  skill's record does not link stay out (a mask in the catalog is what a file without its default task falls
+  back to: the base itself would serve masked, on the host's sparse FFN arm).
+- `cortiq bench --skill <id>` and `cortiq serve --skill <id>` (every slot runs that skill).
+
+### Fixed
+- Dynamic skill routing: a switch mid-generation cleared the sequence and the next token was decoded against an
+  empty cache (fluent nonsense after the switch, on every backend). The context so far is now read again under
+  the new weights (the batch graph where generation takes it), and `ppl --route-dynamic` does the same.
+- `skill bake` with `CMF_BAKE_SKIP_BASELINE=1` compared the result with the skipped (NaN) baseline and printed
+  "did not beat baseline"; it now says the baseline was skipped.
+- Server: the generic `<think>` dialect (LFM3, Qwen and every other family that opens its own block) now
+  releases thinking as `reasoning_content` — streaming deltas and the non-streaming message field — in the
+  shape DeepSeek made the convention for OpenAI-compatible servers. Previously only DeepSeek V4.1 and
+  MiniMax M3 had protocol-level reasoning; the other families streamed `<think>...</think>` inline as
+  user-visible text whenever thinking was on. DeepSeek V4.1's stream, which also carried its reasoning
+  inline, now matches its non-streaming reply. Replies without thinking are byte-identical to before, and
+  `enable_thinking=false` keeps stripping the prefilled empty block exactly as it did. A client that reads
+  the inline block can keep it: `"reasoning_format": "none"` (llama.cpp's spelling) leaves the thinking in
+  `content`, streamed or not.
+
+## [0.9.2] — 2026-11-16
+
+### Changed
+- CUDA hybrid: the RAM tier and the host arenas take VMM host memory (`cuMemCreate` at a host location, copies
+  by address) when a container's limit counts page-locked memory and not that (a 256 MB probe of each); the tier
+  then holds every expert, as Vulkan's system-memory banks do, laid out at load. On an A40 (46 GB container),
+  decode after a 512-token prompt and that prompt's first token: Ornith-122B q4tp within 12 / 16 / 24 / 32 GB
+  and on the whole card 9.0–10.5 / 10.9 / 40.1 / 43.5 / 44.6 tokens/s and 1.8–3.4 s (0.9.0: 6.8 / 7.1 / 28.7 / –
+  / 37.3 and about 10 s), perplexity the CPU's (3.049); MiMo-V2.6-Flash on the whole card 24.0 and 5.3 s (0.9.0:
+  11.3); MiniMax-M3.1-Flash on the whole card 10.0 and 6.9 s (0.9.0: 1.0 and 363 s); both answer "2+2" as the
+  CPU does. `CMF_HYB_PINNED_PROBE=0` keeps the page-locked tier.
+- CUDA hybrid: the card's reserve beside a plan is an eighth of the card, 1–3 GiB (was 3 GiB;
+  `CMF_HYB_RESERVE_MB` sets it). On an A40, runs interleaved with 3 GiB: Apex-35B q4tp within 8 GB 75–82
+  tokens/s against 35.0 (2840 slots against 1627), 83.7 after a 4096-token prompt; Ornith-122B q4tp within
+  12 GB 9.0 against 8.5.
+- CUDA hybrid: a prompt chunk on the small path hands the rest of its rows to the prompt path, its streamed
+  layers staged, once two of its 16-row pieces ran and the stream's count says most picks were built. On an A40
+  within 24 GB with page-locked memory, the first token after a 512-token prompt: MiniMax-M3.1-Flash 64 s (the
+  small path: 398 s), MiMo-V2.6-Flash 32 s (297 s).
+- GLM-5.3 on CUDA: its prompt takes the prompt path up to the DSA top-k (the grouped experts' mixture into the
+  mHC merge, the indexer's caches written on the way); a chunk where DSA selects still goes the small path. On
+  an A40, decode after a 512-token prompt and its first token: GLM-5.3-Flash q2tp within 24 GB 8.8–9.7
+  tokens/s and 5.4–6.0 s (0.9.0: 6.4 and 100 s), on the whole card 22.7 and 5.6 s (0.9.0: 17.1 and 38 s);
+  perplexity the CPU's (2.715; with the selection cut to 64 positions 2.730), "2+2" answered as the CPU does.
+
+### Fixed
+- Vulkan on a phone driver: every process that answered once compiled the batch graph's kernels again. They are
+  built at first use, after `init` wrote the pipeline cache, and the only later save was at the start of a second
+  generation, which `cortiq run -p`, a bench or an app closed after one reply never reaches. A generation's end
+  now saves the cache when the driver's blob differs from the file (a CPU generation does not bring the device
+  up for it). On a Snapdragon 778G (Adreno 642L), lfm2.5-230m q4tp with the whole-token graph forced: the first
+  token of a one-shot run in 6.9 s instead of 41.4 s once the cache holds them.
+- Vulkan: the token graph compiled GLM's DSA kernels for every model, with no pipeline cache — it asked for the
+  kernels before asking whether any layer has DSA. The layers are asked first and the DSA pipelines take the
+  cache: on the same phone decode over 40 tokens at 10.4 tokens/s from the first run instead of 2.4.
+- GLM-5.3 on CUDA: a prompt past 1536 tokens on a card the expert slots filled fell to the host (its DSA
+  layers' K/V mirrors grew past the reserve; a 3072-token prompt on the whole A40 ran past an hour). A DSA
+  layer's mirror stops at top-k rows: it is now sized to that at once and the plan's reserve holds it beside the
+  slots (1.7 GB for GLM-5.3-Flash). That prompt's first token on the whole card 28.8 s, decode 20.3 tokens/s;
+  within 24 GB 86 s and 9.6.
+- The container-limit probes (CUDA page-locked and VMM host memory, Vulkan GPU-visible system memory) read the
+  container's usage less its page cache: at the limit a charge evicts as much page cache, the usage did not
+  grow, and the CUDA RAM tier took page-locked memory past the limit (Ornith-122B on the whole A40: killed).
+- CUDA: the pair micro-benchmark is skipped while routed experts stream through card slots, as on Vulkan: the
+  per-op path has no route for them.
+
+## [0.9.1] — 2026-11-16
+
+### Fixed
+- Vulkan, latent-expert `qwen4_exp` files (Edge0-145B) with part of the expert banks in system memory: a prompt
+  chunk went out as one submission for every layer, long enough for the driver to give up on the device
+  (within 32 GB on an A40 the device was lost after ~17 s in the chunk past 2048 positions; amdgpu resets its
+  ring after 10 s). Such a chunk now goes out four layers a submission (`CMF_QWEN_CHAIN` still overrides), and
+  the 4.7K-token prompt runs through to decode.
+- After a lost device the host fallback built its buffers on the dead device, panicked inside wgpu and hung the
+  process; a failed frame readback now turns the GPU path off for the rest of the run, which goes on on the CPU.
+
+## [0.9.0] — 2026-11-16
+
+### Added
+- MoE placement for any card size, CUDA hybrid arm: the dense matrices and the attention go to the card first;
+  routed experts past it stream through card slots (least recently used giving way) when they are more than an
+  eighth of the experts or past the host's room; a small spill stays in mapped host memory read over the bus,
+  and a dense part past a small card goes there too. The slots are built from a page-locked RAM tier of raw
+  experts (DMA, no page faults; a call's missing experts copied in on several host threads, their pages asked
+  for at once with `MADV_WILLNEED`), which keeps each expert's card layout after its first build, so the next
+  one is a single copy; the tier holds every expert when they fit three quarters of the host's room, filled and
+  laid out at load, else half of it. A prompt chunk stages a streamed layer whole when the streamed experts are
+  within twice the host's room or once the small path's chunks built most of their picks; each layer then keeps
+  the experts of the chunk's last rows for the tokens after it. In a container whose limit page-locked memory
+  falls outside (a 256 MB probe against its usage), the host's room is its available memory.
+  `CMF_GPU_VRAM_MB` caps every placement decision, so a smaller card's runs on a bigger one as it would there.
+  On an A40 (46 GB container, which counts page-locked memory), decode after a 512-token prompt and that
+  prompt's first token: Ornith-1.5-122B q4tp within 12 / 16 / 24 GB and on the whole card 6.8 / 7.1 / 28.7 /
+  37.3 tokens/s and 10 s (0.8.99: 3.4 / 4.4 / 31.2 / 15.4), perplexity the CPU's (3.049); Apex-35B q4tp within
+  12 GB 88.7 tokens/s and 0.85 s (the tier filled as it goes: 75.4 and 4.65 s), on the whole card 107.8 and
+  0.36 s, perplexity 4.186 against the CPU's 4.188; MiMo-V2.6-Flash (164 GB) and MiniMax-M3.1-Flash (157 GB) on
+  the whole card 11.3 and 1.0 (their prompts on the small path: 46 and 363 s), their greedy texts the CPU's.
+  Knobs: `CMF_HYB_STREAM=0`, `CMF_HYB_STREAM_SPILL=<n>`, `CMF_HYB_STREAM_STAGE=0|1`, `CMF_HYB_RAM_TIER=0`,
+  `CMF_HYB_TIER_PACK=0`, `CMF_HYB_TIER_PREPACK=0`, `CMF_HYB_HOST_TIER=1`, `CMF_HYB_RAM_FILL_THREADS=<n>`,
+  `CMF_HYB_PINNED_PROBE=0`.
+- Vulkan: routed experts past the card live in GPU-visible system memory and the token graph keeps going instead
+  of ending at a device prefix; the dense part of every layer and the head are placed first. When more than an
+  eighth of the experts are past the card, the banks go to system memory and the card's room left after the
+  layers that stay whole becomes LRU slots over them, kept by the token graph itself: after the select one
+  workgroup maps the picks to slots and a copy kernel brings the misses in (an indirect dispatch: a token whose
+  picks all hit copies nothing); nothing waits for the host. The prompt runs on the batch graph with the same
+  placement (it refused any model past the card and went a position at a time), each system-memory bank copied
+  whole to a staging bank on the card for a chunk of 512 positions. The banks' room is the host's RAM; in a
+  container whose limit the driver's system memory falls outside (a 256 MB probe against its usage), the host's
+  available memory. On an A40 (46 GB container), decode after a 512-token prompt and that prompt's first token:
+  Ornith-122B q4tp on the whole card 31.9 tokens/s and 5.4 s (0.8.99: 4.3 tokens/s), within 12 / 16 / 24 GB
+  10.6 / 12.6 / 30.6 and 5.5 s (the banks within the container's room: 7.4 / 7.8 / 8.7);
+  MiMo-V2.6-Flash on the whole card 13.2 and 12.1 s (its own MoE bank: 1.9 and 189 s), within 24 GB 6.5;
+  MiniMax-M3.1-Flash on the whole card 6.7 and 23.7 s, within 24 GB 4.8 and 24.7 s (CPU 0.65). Perplexity is the
+  CPU's (Ornith q4tp 3.050 against 3.049); MiMo and MiniMax answer as the CPU does. Knobs:
+  `CMF_WGPU_EXPERT_CACHE=0`, `CMF_WGPU_EXPERT_SPILL=<n>`, `CMF_WGPU_EXPERT_STAGE=0`, `CMF_SYS_EXPERTS=0`,
+  `CMF_WGPU_EXPERT_OUT=fit` (the container's room).
+- Vulkan: routed experts past the card AND past the host's memory stream through card slots: pools of slots
+  (a group of layers each, every buffer within one binding) over a RAM tier of raw experts in GPU-visible
+  system memory, the least recently used giving way in both. The token graph ends its submission after a
+  streamed layer's select, the host brings the picks' missing experts into slots (a DMA copy from the tier, or
+  the file into the tier first, on several threads) and the graph goes on; a prompt chunk stages each streamed
+  layer whole and leaves the experts of its last rows in the slots, so decode starts warm. Such a file used to
+  fall to the host for the layers past the room. Its perplexity is the CPU's (Ornith q4tp 3.050).
+  `CMF_WGPU_EXPERT_STREAM=0`, `CMF_WGPU_EXPERT_TIER=0`, `CMF_WGPU_EXPERT_WARM=0`,
+  `CMF_WGPU_EXPERT_FILL_THREADS=<n>`, `CMF_STREAM_STATS=1`.
+- Vulkan: a mixed q2tp-v2 file's q2tp gate/up rides the grouped prompt path (`CMF_MOEG_Q2=0`: the per-row
+  loop): Ornith-122B q2tp-v2 on an A40, the first token of a 512-token prompt in 3.5 s instead of 7.0 on the
+  whole card and 5.2 instead of 8.7 within 32 GB (decode 25-29 tokens/s), perplexity 3.180 on both paths (CPU
+  3.179).
+- Vulkan: the MoE select takes 257-512 experts (two a thread of the workgroup, ties to the lower one), and
+  routed experts with a SwiGLU clamp ride the expert kernels' limit word instead of being refused.
+- CUDA hybrid arm: MLA with a low-rank query (q_a, its norm, q_b), SwiGLU-OAI (MiniMax M3: α 1.702, β 1, clamp 7)
+  in dense and routed FFNs, and a V narrower than the head (MiMo: 128 of 192), widened with zeros and cut back
+  before the output projection. wgpu's token and batch graphs take the low-rank query too.
+- Vulkan: LFM's short convolutions on the batch graph (a thread a channel walks the chunk's rows over the conv
+  ring), with their sandwich norms: an LFM3 prompt is read in chunks instead of a position at a time. LFM3-1.7B
+  q4tp on an A40 reads a 4096-token prompt at 2013 tokens/s instead of 467 and decodes after it at 154 instead
+  of 103; the greedy text over a long prompt is the CPU's.
+
+### Changed
+- OmniVoice: the codec's transposed convolutions run as one GEMM and an overlap-add (on the card when one is up)
+  and its Snake activations over the thread pool: decoding 4.5 s of speech on an NVIDIA A40 takes 0.82 s instead
+  of 1.85 on CUDA and 1.19 s instead of 2.04 on Vulkan (15.6 s of speech: 3.2 s instead of 6.5). The samples
+  match the previous path within 3·10⁻⁵ on the CPU. The card's commands on CUDA: 4.5 s of speech in 3.4 s instead
+  of 4.4, a 34 s text in 22 s instead of 32; Whisper still reads every sample as its text.
+
+### Fixed
+- Vulkan, Edge0-145B and other latent-expert `qwen4_exp` files: loading the expert banks held every layer's bytes
+  twice, once in the queue's staging and once on the card, until the first frame. On a Radeon 8060S (121 GiB of
+  unified memory) the load pushed the GTT to 90.6 GB and filled swap before settling at 59 GB. The upload now
+  hands its writes to the GPU every 192 MiB, as the expert pool's prefill already did.
+- Vulkan on an integrated GPU under Linux: with no `CMF_GPU_VRAM_MB` the weight budget was unlimited, so a model
+  larger than the machine was all planned onto the "card" and only the allocator's refusals placed the rest
+  (a Ryzen AI Max+ 395 needed the budget set by hand). It is now three quarters of what the GPU can address: its
+  largest device-local heap (an APU's GTT) within the host's memory, or the host's memory when the driver reports
+  only a small carve-out. `CMF_GPU_VRAM_MB` still overrides it; Android and macOS keep their own rules.
+- GLM-5.3-Flash (`glm5_next`) files ran as a plain transformer and answered with noise: the release had no
+  runtime for them. The `glm5_next` stack — four-stream mHC residuals, KDA recurrent mixers and NoPE MLA with
+  the DSA indexer — is in: the published q2tp file answers the card's check ("What is 2+2?" → "4"). DSA's
+  attention runs absorbed (kv_b through the query and the output instead of over every selected position; the
+  CPU text is the expanded form's to the byte). On CUDA the whole stack runs on the card's graphs: the KDA and
+  NoPE MLA mixers, DeepSeek-V4's four-stream mHC (its Sinkhorn on the card), the dense and routed FFNs with
+  their SwiGLU clamp, the experts streamed through card slots; the prompt on the batch graph. Past 2048
+  positions, where DSA stops attending to every position, the indexer runs on the card too: its pooled keys,
+  the pool scores, the top-k selection and the attention over the selected latents (`CMF_GLM_GRAPH=0` keeps
+  the host stack). On an A40 pod with 46 GB of memory for the 116 GB file, decode after a 512-token prompt:
+  17.7 tokens/s (the host stack 1.9, the CPU 1.2), the prompt at 14 tokens/s; within 16 / 24 GB 4.1 / 5.7
+  (1.1 / 1.3); after a 3072-token prompt 19.7. The perplexity is the CPU's (2.715 against 2.715). On Vulkan the
+  same stack runs on the wgpu graphs (four-stream mHC kernels, the 288-expert select, DSA past 2048 positions on
+  the token graph, the experts in system-memory banks under card slots): on the A40 pod 15.5 tokens/s and the
+  first token of a 512-token prompt in 15 s, within 24 GB 9.8 tokens/s, perplexity 2.715; with the selection cut
+  to 64 positions, so that DSA selects within a short text, 2.728 as on the CPU (CUDA 2.730).
+- Vulkan: a model whose attention groups more than eight query heads on a K/V head (MiniMax-M3.1-Flash) kept an
+  f16 K/V mirror no attention kernel takes, so both graphs declined it and its experts ran on the host: within
+  24 GB on an A40 0.17 tokens/s and its first token in 1508 s, now 4.8 and 24.7 s. The mirror is f16 only for
+  a geometry the flash-decode kernels serve.
+- `cortiq bench` ran its untimed pair micro-benchmark per op with the routed experts on the card, which a model
+  whose experts live past the card ran out of memory on (MiniMax-M3.1-Flash on a whole A40 under Vulkan); it is
+  skipped for such a placement.
+
+## [0.8.99] — 2026-11-15
+
+### Added
+- OmniVoice (k2-fsa), zero-shot text-to-speech in 600+ languages, native in the engine: `cortiq convert` packs
+  the checkpoint and its Higgs audio tokenizer v2 into one file (the Qwen3 stack in q8_2f, the audio embeddings
+  and heads in f16), and `cortiq tts FILE TEXT` speaks it — `--lang`, `--instruct` (voice design: "female, low
+  pitch, british accent", "男，四川话"), `--ref-audio` with `--ref-text` (voice cloning), `--steps`, `--duration`,
+  `--speed`; text over 30 s of speech goes in ~15 s pieces joined by short fades. The 32 unmasking passes run
+  both ways over the row through d1's set forward (the conditional and the unconditional rows as two groups of
+  one forward), the head as one device GEMM; the codec's decoder (RVQ, DAC) and encoder (HuBERT, the semantic
+  and acoustic encoders, nearest codes) and the release's duration estimate and post-processing (pydub's silence
+  trimming) are ported term for term. Against the float32 release the prompt and the post-processed length are
+  identical, the first pass's log-probabilities within 0.011 on average, and Whisper transcribes our audio as the
+  release's. On an NVIDIA A40, 4.5 s of speech take 4.4 s on CUDA and 10.6 s on Vulkan; a MacBook Air M4
+  (Metal) 14.3 s.
+- CUDA hybrid arm: Ripple's value residual (V reads `lerp(e0, normed, blend)`) and clamped SwiGLU, on the token
+  and the prompt paths. Ripple-65B q4tp on an A40 decodes at 13.3 tokens/s instead of 0.6–0.9 (Vulkan 13.5) and
+  reads a 4096-token prompt at 428 tokens/s instead of 9.4 (Vulkan 172); the greedy text is Vulkan's.
+- CUDA hybrid arm: weights past the card go to mapped host memory, routed experts first, so a MoE larger than
+  the card runs on it: a plan's arena takes the card's free memory less a reserve (`CMF_HYB_RESERVE_MB`, 3 GiB,
+  plus the head when the plan has none), the rest is pinned and read over the bus (`CMF_HYB_HOST_EXPERTS=0`
+  turns it off; a spill past the container's memory declines instead). On a 46 GB A40: Ornith-1.5-122B q2tp-v2
+  (48 GB) decodes at 38.5–38.9 tokens/s instead of 1.5–2.4 (Vulkan 14.4) and reads a 4096-token prompt at 774
+  tokens/s instead of 4.1; q4tp (64 GB, 23 GB of it pinned) 15.4–15.9 instead of 1.9–4.3 (Vulkan 4.5).
+
+### Fixed
+- Windows: models larger than the card on Vulkan ran entirely on the CPU (#151). The expert banks a card has no
+  room for live in host-visible system memory that the kernels read over the bus, and that allocation was built
+  for Linux only; on Windows the device path refused ("latent experts do not fit the card and system memory cannot
+  hold them for it") and Edge0-145B on a 32 GB Intel Arc Pro B70 stayed on the CPU. The host-memory buffers now
+  build on Windows too; `CMF_SYSMEM=0` turns them off.
+- `cortiq serve` status and dashboard: the execution mode always read "CPU Only" and the GPU memory 0.0 GB off
+  macOS, whatever ran. They now name the backend and the card (`Gpu { backend, device, budget_mb }`) and show the
+  memory in use on it.
+- Qwen3.8-Flash-Next / Edge0 on CUDA in a container with a cgroup v1 memory limit: the free-memory estimate read
+  only cgroup v2, took the host's 426 GB for the container's 46.6 GiB, pinned the n-gram table past the limit and
+  the OOM killer ended the run. It now reads v1 (`memory.limit_in_bytes` less RSS and unevictable pages) too:
+  Edge0-120B on a 46 GB A40 decodes at 52–56 tokens/s (106 after a 4096-token prompt read at 2041 tokens/s),
+  Edge0-145B at 18–20 (36 after the prompt at 1208).
+- CUDA: the Gemma-4 / Ripple prompt path took 128-row chunks, tuned for wgpu, and the CUDA batch graph expands every
+  weight once a chunk; it now takes the CUDA chunk (`CMF_CUDA_BATCH`, 1024). A 4096-token prompt on an A40:
+  humanizer-12B (Gemma-4) 778 → 2095 tokens/s with the same greedy text, Ripple-65B 141 → 428.
+- Vulkan: Edge0 (latent experts) panicked with wgpu's "Out of Memory" when a layer's expert bank did not fit the
+  card after all: the allocation is now a refusal, and that layer and the later ones go to system memory.
+  Edge0-120B on a 46 GB A40 decodes at 32.7 tokens/s on Vulkan.
+
+## [0.8.98] — 2026-11-15
+
+### Added
+- CUDA: binary low-rank (`blr`, NVG) weights in the hybrid arm. Each one is repacked at load into binary tile
+  matrices of the q1 kernels — a V' block per path (group scales ℓ) over `g ⊙ x`, then U' (group scales h) over
+  the latents; a gate/up pair shares one interleaved U' — so both stages run on the tensor cores. Qwen3.8-27B-NVG
+  on an RTX A5000 decodes at 55–58 tokens/s instead of 2.5 (Vulkan: 44) and reads a 4096-token prompt at 282
+  tokens/s instead of timing out (Vulkan: 48); the batch graph builder takes `blr` on CUDA, whose hybrid arm runs
+  such stacks the small path's 16 rows at a time.
+- CUDA: d1's one-pass `set` forward on the card (`h3_lfm_set_forward`, the Metal port's kernels over the weights'
+  f32 planes). A warm d1-2B question through `/v1/system_one` takes 40 ms on an RTX A5000 instead of 850 ms on the
+  CPU (Vulkan: 65 ms); the first call pays the planes' upload (1.7 s).
+- Kimi-Linear on the Vulkan / wgpu token and prompt graphs (it used to fall back to the CPU there). KDA layers
+  run in WGSL (`gpu_wgpu/kimi.rs`): the short conv with SiLU and the q/k L2 norm, the low-rank decay and β
+  and the output gate, the delta-rule scan over 128-wide state columns, the gated RMS norm; their state lives
+  in the GDN maps, laid out as on CUDA. MLA layers take the full-attention arm with their own head geometry
+  (192-wide keys, 128-wide values, no RoPE) behind a latent RMS norm kernel. q4_tiled experts are repacked on
+  the device into a nibble plane and an f16 scale plane (`gpu_wgpu/moe_q4ts.rs`, `CMF_MOE_Q4TS=0` keeps the
+  old layout) and run through the 4-row decode and the grouped prefill kernels; prompts of such models go in
+  256-row chunks. Kimi-Linear-48B-A3B on an RTX A5000: decode 7.7 → 97 tok/s, a 4096-token prompt 4.3 → 507
+  tok/s; the text equals the CUDA arm's byte for byte.
+
+### Fixed
+- MiniMax-Music-3 follows ComfyUI's `ar.py` where the port did not: the RVQ depth decoder runs as the CFG pair
+  (each stream from its own branch's hidden) and samples every level from the guided logits, and the first
+  sample's frame is fed back but not kept in the DiT's condition.
+- MiniMax-Music-3 on CUDA: 10 s of song at 8 steps on an RTX A5000 in 115 s instead of 1126 s (Vulkan: 333 s).
+  The AR runs as the CUDA token graph by default (`CMF_MUSIC3_GRAPH=0` opts out), which now reads the hidden state
+  back alongside the logits — without it the depth decoder read the frame's input and songs ended a few frames
+  in; the feed-forward half of the DiT runs on the card (`h3_music3_ffn`); the plane cache may grow into free VRAM
+  for this pipeline, so the DiT's and the depth decoder's planes stay cached between steps.
+- CUDA per-op products: a decode-narrow batch (under 8 rows) takes the dense plane only when it is cached or fits
+  without evicting another, instead of rebuilding a whole stack's planes every token, and batches under 32 rows
+  multiply in f32 instead of TF32. `CMF_CUDA_MM_VERIFY=1` checks device products against f32 rows of the weight.
+
+## [0.8.97] — 2026-11-14
+
+### Added
+- FastH3 (FastVideo's 4-step MiniMax-H3 students, `FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`):
+  `animate-pack --dit-diffusers <transformer/>` packs a full MiniMax-H3 DiT in the diffusers layout — `to_q |
+  to_k | to_v` stacked into the fused panel, the SwiGLU halves swapped back, `rope_inv_freq` recomputed, every
+  block's full adaLN matrix folded into the curve form through one low-rank basis of the student's own time
+  embedding (ranked by its spectrum) — with the trained VSA gates and the repository's few-step schedule and
+  sparsity in `dit.config_json`; `--dit-from <cmf>` takes the DiT of another container by reference over an
+  `--in` file's encoder and decoders. The runtime follows the student's own sigma schedule when the step
+  count matches it.
+- Video sparse attention (VSA) as FastVideo's VSA-H3 runs it: the packed sequence in tiles of 4×4×4 video
+  tokens and 64-row chunks of the other streams, per head tile scores from the tile means of q and k, each
+  video query tile attending its top-k video tiles (10 % at sparsity 0.9) and every non-video tile, non-video
+  queries attending everything, and the trained gate on the compression branch (softmax over the tile scores
+  times the tile means of v). The CUDA chain runs it on the card (`gpu_cuda/h3_vsa.cu`: tile means, scores, a
+  radix top-k select, the flash kernel over a query tile's key-tile list, the compression branch, the gather
+  back to row order with the gate); the Vulkan / wgpu chain runs the same kernels in WGSL
+  (`gpu_wgpu/h3_vsa.rs`) and the Metal chain in MSL (`gpu_metal/h3_vsa.metal`, `CMF_H3_METAL_VSA=0` turns it off;
+  on an M4 within 0.55 % of the host reference at sparsity 0, 512×288×39 denoised in 129 s against 775 s
+  on the host). `CMF_VSA=0` forces dense attention, `CMF_VSA_SPARSITY` overrides the packed sparsity,
+  `CMF_VSA_GATE=0` drops the compression branch (a diagnostic).
+- Qwen3-TTS 12 Hz (`Qwen3TTSForConditionalGeneration`, the CustomVoice models) runs natively: `convert` takes
+  the HF snapshot (the talker as a Qwen3 stack, its text embedding, text projection, code predictor and the
+  speech tokenizer's decoder as `qtts.*`, a `tokenizer.json` built from `vocab.json` + `merges.txt`), and
+  `cortiq tts <file> "text" --lang ru --speaker serena` speaks: the talker and the code predictor (a second
+  pipeline over the same file) on the engine's backends, the decoder (RVQ, a sliding-window transformer,
+  ConvNeXt upsampling, a SnakeBeta vocoder) on the host with its big products on the device. Greedy codes
+  match `qwen_tts` 0.1.1 frame for frame; the decoder on its codes is within 9.3e-4 of its waveform. An
+  M4 speaks 1.7–1.9× faster than real time, an RTX A5000 1.2× (q4tp).
+- Haru (higurashi-ai/Haru-4B, full-duplex spoken dialogue at 7.5 Hz): `convert` takes the checkpoint (the
+  Qwen3.5 language model, its audio projectors, the MeanFlow head and the VibeVoice codec as `haru.*`), and
+  `cortiq duplex <file> user.wav reply.wav --reference voice.wav` plays a recording to the model frame by frame,
+  as in a live call, and writes its answer: the three streams summed into one position, the text token and
+  the next latent from each final-normed state (DRY, PAD / EOP in float32, one MeanFlow step), the causal
+  codec over the whole recording and the whole reply.
+- `CmfModel::open_view`: a file opened again under other tensor names and another architecture (its own uid),
+  so a stack inside a file can run as a pipeline of its own.
+- CUDA: the hybrid arm's gate/up pair takes the exact erf GELU (Spark-X2.5), and a stack whose call-wide
+  rotary table is narrower than its rotary width takes its first attention layer's own rotation as the
+  call's: Spark-X2.5-4B decodes at 116 tokens/s instead of 94 (q4mix) and 101 instead of 85 (q8_2f) on an
+  RTX A5000.
+
+### Fixed
+- CUDA: a short convolution (LFM2/LFM3) and an f32 head-wise output gate now run on the hybrid arm's prompt
+  path, and the batched prompt graph takes the short-conv layers and the sandwich norms on CUDA, so such a
+  stack reads a long prompt in one batch: LFM3-1.7B on an RTX A5000 reads 4096 tokens at 9 300–10 200
+  tokens/s instead of 247.
+- CUDA: KDA and MLA layers (Kimi Linear) run on the hybrid arm's prompt path — q | k | v, the latent and
+  kv_b as GEMMs, the KDA delta rule over any chunk 16 rows a pass — instead of 16-row chunks through the
+  small path: Kimi-Linear-48B-A3B reads 4096 tokens at 2 210–2 255 tokens/s instead of 378 (first token
+  1.8 s instead of 10.8) on an RTX A5000.
+- CUDA: routed experts in q8_2f run on the hybrid arm (the tile kernel applies the column field itself)
+  instead of the CPU: Unlimited-OCR-2 q8_2f reads a page in 7.4 s instead of 33–58 s.
+
 ## [0.8.96] — 2026-11-14
 
 ### Added

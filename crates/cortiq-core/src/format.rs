@@ -662,6 +662,47 @@ impl CmfModel {
 
     /// Open and strictly validate a CMF v2 file. Any inconsistency is an
     /// error — this function never substitutes defaults.
+    /// The file seen as another model: the tensors `rename` keeps, under the
+    /// names it gives them, with `arch` as the architecture. The file is
+    /// opened again, so the view has a uid of its own and device weight
+    /// caches keyed by model never mix the two. Qwen3-TTS runs its code
+    /// predictor — a Qwen3 stack inside the file, `qtts.code_predictor.*` —
+    /// as a second pipeline this way.
+    pub fn open_view(
+        path: impl AsRef<Path>,
+        rename: &dyn Fn(&str) -> Option<String>,
+        arch: crate::types::ModelArch,
+    ) -> Result<Self, CmfError> {
+        let mut m = Self::open(path)?;
+        let mut tensors = Vec::with_capacity(m.tensors.len());
+        for mut t in std::mem::take(&mut m.tensors) {
+            if let Some(n) = rename(&t.name) {
+                t.name = n;
+                tensors.push(t);
+            }
+        }
+        let mut by_name: HashMap<u64, u32> = HashMap::with_capacity(tensors.len());
+        let mut name_overflow: Vec<u32> = Vec::new();
+        for (i, t) in tensors.iter().enumerate() {
+            let h = hash64(t.name.as_bytes());
+            match by_name.get(&h) {
+                Some(&j) if tensors[j as usize].name == t.name => {
+                    return Err(CmfError::Parse(format!("view: two tensors named '{}'", t.name)));
+                }
+                Some(_) => name_overflow.push(i as u32),
+                None => {
+                    by_name.insert(h, i as u32);
+                }
+            }
+        }
+        m.tensors = tensors;
+        m.by_name = by_name;
+        m.name_overflow = name_overflow;
+        m.sparse_index.clear();
+        m.header.arch = arch;
+        Ok(m)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CmfError> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {

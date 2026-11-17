@@ -3124,13 +3124,31 @@ pub(crate) fn mem_available() -> usize {
         .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
         .unwrap_or(0);
     let mut avail = kb * 1024;
-    // the container's limit minus what it cannot give back (its page cache can be)
-    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|v| v.trim().parse::<usize>().ok());
-    let anon = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
-        .ok()
-        .and_then(|m| m.lines().find(|l| l.starts_with("anon ")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()));
-    if let (Some(max), Some(anon)) = (max, anon) {
-        avail = avail.min(max.saturating_sub(anon));
+    // the container's limit minus what it cannot give back: anonymous memory and
+    // pinned pages (its page cache can be). cgroup v2, else v1 (RunPod: a 503 GB host
+    // under a 46.6 GiB v1 limit, where MemAvailable alone pinned past it into the OOM killer)
+    let stat = |path: &str, keys: &[&str]| -> Option<usize> {
+        let m = std::fs::read_to_string(path).ok()?;
+        let mut sum = None;
+        for k in keys {
+            if let Some(v) = m.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()) {
+                sum = Some(sum.unwrap_or(0) + v);
+            }
+        }
+        sum
+    };
+    let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let limits = [
+        (read("/sys/fs/cgroup/memory.max"), stat("/sys/fs/cgroup/memory.stat", &["anon ", "unevictable "])),
+        (
+            read("/sys/fs/cgroup/memory/memory.limit_in_bytes").filter(|&l| l < (1usize << 60)),
+            stat("/sys/fs/cgroup/memory/memory.stat", &["total_rss ", "total_unevictable "]),
+        ),
+    ];
+    for (max, held) in limits {
+        if let (Some(max), Some(held)) = (max, held) {
+            avail = avail.min(max.saturating_sub(held));
+        }
     }
     avail
 }
@@ -4629,6 +4647,10 @@ impl DevProf {
 /// A model with latent layers (Edge0) is loaded: its prompt chunks are sized for the experts' staging.
 pub(crate) static LATENT_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Layers a prompt chunk's submission takes when some latent experts are read
+/// from system memory (`CMF_QWEN_CHAIN` overrides).
+const PROMPT_CHAIN_HOSTED: usize = 4;
+
 /// The whole token on the card. Returns `false` when the device path is
 /// not available (the caller then runs the host path); a refusal after
 /// the first token of a sequence is reported once and turns the path off.
@@ -5528,16 +5550,26 @@ fn forward_tokens_device(
                 .unwrap_or(if bank == 0 { usize::MAX } else { (room / bank) as usize });
             let mut lats = Vec::with_capacity(layers.len());
             let mut placed = 0usize;
+            // a bank the card refused moves its layer and every later one to system memory
+            let mut card_full = false;
             for l in layers {
                 let Some(lt) = l.latent.as_ref() else {
                     lats.push(None);
                     continue;
                 };
-                let on_host = placed >= on_card;
+                let on_host = card_full || placed >= on_card;
                 placed += 1;
-                match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                let d = match q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, on_host) {
+                    None if !on_host => {
+                        card_full = true;
+                        tracing::warn!("qwen4 device: the card refused layer {}'s latent experts; it and the later layers go to system memory", placed - 1);
+                        q4::lat::LatDev::new(&model, lt, &l.moe, cfg.hidden, true)
+                    }
+                    d => d,
+                };
+                match d {
                     Some(d) => lats.push(Some(d)),
-                    None if on_host => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
+                    None if on_host || card_full => return off(state, "latent experts do not fit the card and system memory cannot hold them for it"),
                     None => return off(state, "latent experts do not load"),
                 }
             }
@@ -6006,8 +6038,16 @@ fn forward_tokens_device(
             .unwrap_or(4)
             .max(1);
         let split = want_logits && (ntok <= crate::gpu_wgpu::qwen4::TMAX || frame_mode);
+        // Latent experts read from system memory make a prompt chunk's one
+        // submission long enough for the driver to give up on the device
+        // (Edge0-145B within 32 GB on an A40: lost after ~17 s in the chunk
+        // past 2048 positions; amdgpu resets its ring after 10 s): such a
+        // chunk goes out four layers a submission (the 4.7K prompt then went
+        // through to decode).
+        let hosted = dev.lat.iter().flatten().any(|d| d.host_bytes() > 0);
+        let whole = if hosted { PROMPT_CHAIN_HOSTED } else { layers.len() + 1 };
         chain_env
-            .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { layers.len() + 1 })
+            .unwrap_or(if split { (layers.len() + 1).div_ceil(chains) } else { whole })
             .max(1)
     } else if ntok > 1 {
         1

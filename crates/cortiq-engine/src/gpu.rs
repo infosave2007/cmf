@@ -1292,7 +1292,20 @@ impl Drop for GpuPause {
 }
 
 pub fn enabled() -> bool {
-    !GPU_PAUSED.paused() && backend() != Backend::None
+    !GPU_LOST.load(std::sync::atomic::Ordering::Relaxed) && !GPU_PAUSED.paused() && backend() != Backend::None
+}
+
+/// Set once a frame found the device gone: every later op of the process runs
+/// on the host instead of building buffers on a dead device (Edge0 on an A40:
+/// after the device was lost the host fallback's first upload panicked inside
+/// wgpu, the other threads on its poisoned lock, and the process hung).
+static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The device is lost (`why`: what found it): the GPU path is off for good.
+pub fn mark_lost(why: &str) {
+    if !GPU_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("GPU device lost ({why}): the rest of this run stays on the CPU");
+    }
 }
 
 #[cfg(test)]
@@ -1406,6 +1419,32 @@ pub fn vram_budget() -> u64 {
     #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
     {
         if backend_available() { u64::MAX } else { 0 }
+    }
+}
+
+/// The card the selected GPU backend runs on, for status reports: "<name> /
+/// CUDA" or "<name> / Vulkan" (DX12, …); None on the CPU and on Apple's Metal
+/// path. Brings the backend up when it is selected and not up yet, as the
+/// first request would.
+pub fn active_device() -> Option<String> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::device_name().map(|n| format!("{n} / CUDA")),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::device_label(),
+        _ => None,
+    }
+}
+
+/// Memory in use on the active card for status reports: the allocator's
+/// blocks on wgpu, the driver's count on CUDA; None on the CPU and Metal.
+pub fn device_bytes_in_use() -> Option<u64> {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::device_bytes_in_use(),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::device_bytes_in_use(),
+        _ => None,
     }
 }
 
@@ -1540,6 +1579,28 @@ pub fn cuda_batch_rows() -> Option<usize> {
 }
 
 /// The CUDA backend is the one in use.
+/// CUDA: whether a narrow product of tensor `idx` may take the dense plane
+/// without evicting another (see `gpu_cuda::h3_plane_fits`).
+#[allow(unused_variables)]
+pub fn cuda_plane_fits(model: &Arc<CmfModel>, idx: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::h3_plane_fits(model, idx)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// CUDA: a pipeline that has the card to itself lets the per-op plane cache
+/// grow into free memory (see `gpu_cuda::h3_planes_grow`). A no-op elsewhere.
+#[allow(unused_variables)]
+pub fn planes_may_grow(on: bool) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::h3_planes_grow(on);
+}
+
 pub fn cuda_active() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -1928,7 +1989,36 @@ pub enum GraphAttn<'a> {
         cpu_k: &'a [Vec<f32>],
         cpu_v: &'a [Vec<f32>],
         cpu_base: usize,
+        /// GLM-5.3's DSA: past `topk` positions the layer attends only to
+        /// the positions its indexer selects (None: every position).
+        dsa: Option<GraphDsa<'a>>,
     },
+}
+
+/// A DSA layer's indexer (GLM-5.3, `glm5_next::dsa_forward`): the index
+/// query over the normed low-rank query, the index key, pool gate and head
+/// weights over the layer input, the key's LayerNorm, the pools' position
+/// embedding, kv_b in f32 for the absorbed attention, and the geometry. The
+/// incomplete tail is always selected.
+pub struct GraphDsa<'a> {
+    /// `[ih·id, q_rank]`.
+    pub index_q: GraphW<'a>,
+    /// `[id, hidden]`.
+    pub index_k: GraphW<'a>,
+    /// `[id, hidden]`.
+    pub pool_gate: GraphW<'a>,
+    /// `[ih, hidden]`.
+    pub index_weights: GraphW<'a>,
+    pub k_norm: &'a [f32],
+    pub k_bias: &'a [f32],
+    /// `[kpool, id]`.
+    pub ape: &'a [f32],
+    /// kv_b `[nh·(nope + v), lora]` in f32.
+    pub kv_b: &'a [f32],
+    pub ih: usize,
+    pub id: usize,
+    pub topk: usize,
+    pub kpool: usize,
 }
 
 /// Per-layer attention geometry for the wgpu graphs (see
@@ -2050,6 +2140,23 @@ pub struct GraphMhc<'a> {
     pub leave: bool,
     pub iters: usize,
     pub pre_scale: f32,
+    /// DeepSeek-V4's form (GLM-5.3): Some = the logits scaled per group
+    /// (pre, post, mix) before their base is added, `pre = σ + eps`, the mix
+    /// a row softmax plus eps then eps-floored column / row normalizations,
+    /// and the router's RMS taken with `rms_eps`. None = SenseNova-Loop's
+    /// log-domain Sinkhorn.
+    pub dsv4: Option<GraphMhcDsv4>,
+}
+
+/// DeepSeek-V4 / GLM-5.3 mHC constants of a layer (see `GraphMhc::dsv4`):
+/// the attention and FFN routers' three group scales, the Sinkhorn epsilon
+/// and the router input's RMS epsilon.
+#[derive(Clone, Copy)]
+pub struct GraphMhcDsv4 {
+    pub attn_scale: [f32; 3],
+    pub ffn_scale: [f32; 3],
+    pub eps: f32,
+    pub rms_eps: f32,
 }
 
 pub struct GraphLayer<'a> {
@@ -2165,6 +2272,10 @@ pub enum GraphFfn<'a> {
         /// Multiplier on the routed mixing weights after the optional
         /// renormalization (`routed_scaling_factor`); 1.0 = none.
         route_scale: f32,
+        /// SwiGLU clamp of every routed and shared expert (GLM-5.3: the gate
+        /// from above, up on both sides), 0 = none. The CUDA hybrid's pair
+        /// epilogue takes it; the wgpu graphs decline a clamped bank.
+        limit: f32,
     },
 }
 
@@ -4326,6 +4437,9 @@ pub struct H3ChainBlock<'a> {
     pub fc2_bias: &'a [f32],
     pub scale1: &'a [f32],
     pub scale2: &'a [f32],
+    /// VSA's compression-branch gate `[heads·hd, hidden]` by directory index
+    /// (`usize::MAX`: none). Read only under [`H3Chain::vsa`].
+    pub gate: usize,
 }
 
 /// A stack of MiniMax-H3 blocks over one packed sequence.
@@ -4350,6 +4464,10 @@ pub struct H3Chain<'a> {
     /// The qkv panel's row layout: `[q | k | v]` planes (false) or
     /// per-head `[q k v]` triples (true).
     pub qkv_interleaved: bool,
+    /// Video sparse attention over the tiles of this plan instead of the
+    /// full attention (a VSA-trained student; one group only). A backend
+    /// without it refuses the chain.
+    pub vsa: Option<&'a crate::mmh3::VsaPlan>,
 }
 
 /// One layer of a language-model prompt encoder for the resident chain: its
@@ -4613,10 +4731,13 @@ pub fn h3_chain(job: &H3Chain<'_>, h: &mut [f32]) -> bool {
     match backend() {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::h3_chain(job, h),
+        // Metal's VSA kernels (an M4 within 0.55 % of the host reference)
+        // are on; `CMF_H3_METAL_VSA=0` sends a sparse student's chain to the
+        // per-op path (the host reference), never through the dense kernels.
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::h3::chain(job, h),
         #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::h3::chain(job, h),
+        Backend::Metal => (job.vsa.is_none() || std::env::var("CMF_H3_METAL_VSA").as_deref() != Ok("0")) && crate::gpu_metal::h3::chain(job, h),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -4950,9 +5071,67 @@ pub fn music3_ffn(
         Backend::Wgpu => {
             crate::gpu_wgpu::music3_ffn(model, idx_in, idx_out, h, bias_in, n, hs, inter, out)
         }
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_music3_ffn(model, idx_in, idx_out, h, bias_in, n, hs, inter, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
+}
+
+/// A routed FFN of one row on the card for a stack the host runs and routes
+/// (GLM-5.3): the experts through card slots, the shared one resident (CUDA;
+/// `false` elsewhere or refused, the caller runs the host's).
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn moe_row(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    shared: Option<((usize, usize, usize), usize, f32)>,
+    inter: usize,
+    limit: f32,
+    x: &[f32],
+    picks: &[(usize, f32)],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::moe_row(model, experts, shared, inter, limit, x, picks, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// GLM-5.3's native device state (four mHC streams, KDA rings, DSA caches):
+/// this build runs the `glm5_next` stack on the host, so the device hooks
+/// decline and the caller keeps the exact CPU path.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_sequence_prepare(
+    model_uid: u64,
+    sequence_id: u64,
+    layers: usize,
+    hidden: usize,
+    mhc_streams: usize,
+    nh: usize,
+    dk: usize,
+    dv: usize,
+    kk: usize,
+    dsa_rank: usize,
+    dsa_index: usize,
+    dsa_topk: usize,
+    dsa_kpool: usize,
+) -> bool {
+    let _ = (model_uid, sequence_id, layers, hidden, mhc_streams, nh, dk, dv, kk, dsa_rank, dsa_index, dsa_topk, dsa_kpool);
+    false
+}
+
+/// Grow GLM's device DSA caches (`glm_sequence_prepare`): declines here.
+pub fn glm_sequence_reserve(model_uid: u64, sequence_id: u64, positions: usize) -> bool {
+    let _ = (model_uid, sequence_id, positions);
+    false
+}
+
+/// Drop GLM's device state of a sequence (none in this build).
+pub fn glm_sequence_abort(model_uid: u64, sequence_id: u64) {
+    let _ = (model_uid, sequence_id);
 }
 
 /// A 1D convolution as a GEMM whose column matrix is expanded on the
@@ -5666,6 +5845,10 @@ pub fn lfm_set_forward(
         Backend::Wgpu => crate::gpu_wgpu::lfm_set::forward(
             model, layers, dims, final_norm, rows, t, state, group, head,
         ),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::h3_lfm_set_forward(
+            model, layers, dims, final_norm, rows, t, state, group, head,
+        ),
         _ => None,
     }
 }
@@ -5767,6 +5950,15 @@ const GRAPH_RACE_SAMPLES: u32 = 4;
 
 /// Called at every generation start (fresh KV). Applies a pending
 /// verdict and picks this generation's arm while racing.
+/// A generation has ended: keep whatever the driver compiled during it
+/// (`pipeline_cache_flush_if_grown`). No-op off wgpu and when nothing is new.
+pub fn generation_end() {
+    #[cfg(feature = "gpu")]
+    if matches!(backend(), Backend::Wgpu) {
+        crate::gpu_wgpu::pipeline_cache_flush_if_grown();
+    }
+}
+
 pub fn graph_race_begin_generation() {
     // One generation has now compiled whatever this model needs; keep it
     // for the next process. Once per run: the blob does not grow after

@@ -58,6 +58,9 @@ pub fn cmd_music(
     out: &str,
 ) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
+    // The three stacks are the only work on the card: on CUDA the DiT's
+    // planes (9.7 GB) and the depth decoder's stay cached between steps.
+    cortiq_engine::gpu::planes_may_grow(true);
     let model = Arc::new(CmfModel::open(model_path).map_err(|e| anyhow!("{model_path}: {e}"))?);
     let vocab = model
         .vocab
@@ -126,6 +129,9 @@ pub fn cmd_music(
     }
     if cortiq_engine::music3::prof::on() {
         eprintln!("  denoise split: {}", cortiq_engine::music3::prof::report());
+    }
+    if let Some(r) = cortiq_engine::gpu::h3_prof_report() {
+        eprintln!("{r}");
     }
     eprintln!(
         "  stages: denoise {:.1}s, vocoder {:.1}s",

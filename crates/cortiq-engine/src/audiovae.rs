@@ -82,7 +82,7 @@ use std::sync::Arc;
 /// this kernel length.
 const FILTER_LEN: usize = 12;
 
-struct Conv1d {
+pub(crate) struct Conv1d {
     w: Vec<f32>, // [out, in, k]
     b: Option<Vec<f32>>,
     out_ch: usize,
@@ -93,7 +93,7 @@ struct Conv1d {
 }
 
 impl Conv1d {
-    fn load(
+    pub(crate) fn load(
         model: &Arc<CmfModel>,
         name: &str,
         pad: usize,
@@ -117,7 +117,7 @@ impl Conv1d {
 
     /// `x` is `[in_ch, n]`; the result is `[out_ch, n]` for the
     /// paddings used here (all `same`).
-    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let out_n = (n + 2 * self.pad).saturating_sub(self.dilation * (self.k - 1));
         let mut out = vec![0f32; self.out_ch * out_n];
         let ptr = SendPtr(out.as_mut_ptr());
@@ -176,13 +176,22 @@ impl Conv1d {
                     out_n,
                     &mut yt,
                 ) {
-                    for o in 0..self.out_ch {
-                        let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
-                        // SAFETY: single-threaded here.
-                        let dst = unsafe { ptr.row(o * out_n, out_n) };
-                        for (t, d) in dst.iter_mut().enumerate() {
-                            *d = yt[t * self.out_ch + o] + bias;
+                    // [out_n × out_ch] back to channel-major with the bias,
+                    // the channels over the pool (a long render's last
+                    // stages are tens of millions of strided reads)
+                    let back = |lo: usize, hi: usize| {
+                        for o in lo..hi {
+                            let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
+                            // SAFETY: workers own disjoint output channels.
+                            let dst = unsafe { ptr.row(o * out_n, out_n) };
+                            for (t, d) in dst.iter_mut().enumerate() {
+                                *d = yt[t * self.out_ch + o] + bias;
+                            }
                         }
+                    };
+                    match pool {
+                        Some(p) => p.run_rows(self.out_ch, &back),
+                        None => back(0, self.out_ch),
                     }
                     return out;
                 }
@@ -324,17 +333,29 @@ impl Conv1d {
     }
 }
 
-struct ConvT1d {
+pub(crate) struct ConvT1d {
     w: Vec<f32>, // [in, out, k]
     b: Vec<f32>,
     in_ch: usize,
     out_ch: usize,
     k: usize,
-    stride: usize,
+    pub(crate) stride: usize,
     pad: usize,
+    /// Extra samples at the end (`output_padding`).
+    out_pad: usize,
+    /// `w` repacked `[out·k × in]` for [`Self::apply_gemm`], built on first use.
+    wt: std::sync::OnceLock<Vec<f32>>,
 }
 
 impl ConvT1d {
+    /// PyTorch's `ConvTranspose1d(.., kernel, stride, padding, output_padding)`.
+    pub(crate) fn load_padded(model: &Arc<CmfModel>, name: &str, stride: usize, pad: usize, out_pad: usize) -> Result<Self, String> {
+        let mut c = Self::load(model, name, stride)?;
+        c.pad = pad;
+        c.out_pad = out_pad;
+        Ok(c)
+    }
+
     fn load(model: &Arc<CmfModel>, name: &str, stride: usize) -> Result<Self, String> {
         let e = model
             .tensor(&format!("{name}.weight"))
@@ -348,12 +369,81 @@ impl ConvT1d {
             k,
             stride,
             pad: (k - stride) / 2,
+            out_pad: 0,
+            wt: std::sync::OnceLock::new(),
         })
     }
 
-    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    /// The same transposed convolution as one GEMM and an overlap-add:
+    /// `y[t, (o, j)] = Σ_i x[i, t] · w[i, o, j]`, then
+    /// `out[o, t·stride + j - pad] += y[t, (o, j)]`. The GEMM goes to the
+    /// device when one is up (the repacked weight stays cached there) and
+    /// to the host's blocked GEMM otherwise — both far ahead of the
+    /// scatter loop in [`Self::apply`], which stays the reference.
+    pub(crate) fn apply_gemm(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let (ic, oc, k, s) = (self.in_ch, self.out_ch, self.k, self.stride);
+        let full = (n - 1) * s + k;
+        let out_n = full + self.out_pad - 2 * self.pad;
+        let m = oc * k;
+        let wt = self.wt.get_or_init(|| {
+            let mut wt = vec![0f32; m * ic];
+            for i in 0..ic {
+                for o in 0..oc {
+                    for j in 0..k {
+                        wt[(o * k + j) * ic + i] = self.w[(i * oc + o) * k + j];
+                    }
+                }
+            }
+            wt
+        });
+        // time-major input [n × in]
+        let mut xt = vec![0f32; n * ic];
+        for i in 0..ic {
+            for (t, &v) in x[i * n..(i + 1) * n].iter().enumerate() {
+                xt[t * ic + i] = v;
+            }
+        }
+        // rows of y a pass: 64M floats at most, so no binding nears 2 GiB
+        let span = ((64usize << 20) / m.max(1)).clamp(1, n);
+        let mut y = vec![0f32; n * m];
+        let mut t0 = 0;
+        while t0 < n {
+            let r = span.min(n - t0);
+            let (xs, ys) = (&xt[t0 * ic..(t0 + r) * ic], &mut y[t0 * m..(t0 + r) * m]);
+            if !crate::gpu::gemm_nt_f32(xs, wt, ys, r, ic, m) {
+                crate::fcd_ops::gemm_nt(xs, wt, ys, r, ic, m, pool);
+            }
+            t0 += r;
+        }
+        let mut out = vec![0f32; oc * out_n];
+        let ptr = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for o in lo..hi {
+                // SAFETY: workers own disjoint output channels.
+                let dst = unsafe { ptr.row(o * out_n, out_n) };
+                dst.fill(self.b[o]);
+                for t in 0..n {
+                    let src = &y[t * m + o * k..t * m + (o + 1) * k];
+                    let base = t * s;
+                    for (j, &v) in src.iter().enumerate() {
+                        let p = base + j;
+                        if p >= self.pad && p - self.pad < out_n {
+                            dst[p - self.pad] += v;
+                        }
+                    }
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.run_rows(oc, &work),
+            None => work(0, oc),
+        }
+        out
+    }
+
+    pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let full = (n - 1) * self.stride + self.k;
-        let out_n = full - 2 * self.pad;
+        let out_n = full + self.out_pad - 2 * self.pad;
         let mut out = vec![0f32; self.out_ch * out_n];
         let ptr = SendPtr(out.as_mut_ptr());
         let work = |lo: usize, hi: usize| {
@@ -396,18 +486,18 @@ impl ConvT1d {
 /// (`(alpha + 1e-9).reciprocal() * sin(alpha * x)**2`). Feeding one
 /// model's parameters to the other's loader silently raises the
 /// activation to an exponent, and the only symptom is worse audio.
-struct Snake {
+pub(crate) struct Snake {
     alpha: Vec<f32>,
 }
 
 impl Snake {
-    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+    pub(crate) fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
         Ok(Self {
             alpha: crate::dit::cmf_f32(model, &format!("{name}.alpha"))?,
         })
     }
 
-    fn apply(&self, x: &mut [f32], n: usize) {
+    pub(crate) fn apply(&self, x: &mut [f32], n: usize) {
         for (c, row) in x.chunks_exact_mut(n).enumerate() {
             let a = self.alpha[c];
             let inv = 1.0 / (a + 1e-9);
@@ -416,6 +506,27 @@ impl Snake {
                 *v += s * s * inv;
             }
         }
+    }
+
+    /// [`Self::apply`] with the channels spread over the pool: the long
+    /// stages of a decoder run 10⁷–10⁸ sines, which one thread takes
+    /// seconds over.
+    pub(crate) fn apply_pool(&self, x: &mut [f32], n: usize, pool: Option<&Pool>) {
+        let Some(p) = pool else { return self.apply(x, n) };
+        let ch = x.len() / n.max(1);
+        let ptr = SendPtr(x.as_mut_ptr());
+        p.run_rows(ch, &|lo, hi| {
+            for c in lo..hi {
+                // SAFETY: workers own disjoint channels.
+                let row = unsafe { ptr.row(c * n, n) };
+                let a = self.alpha[c];
+                let inv = 1.0 / (a + 1e-9);
+                for v in row.iter_mut() {
+                    let s = (a * *v).sin();
+                    *v += s * s * inv;
+                }
+            }
+        });
     }
 }
 
@@ -1022,6 +1133,39 @@ impl SendPtr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GEMM + overlap-add arm of the transposed convolution against the
+    /// scatter loop, over the strides and paddings the decoders use.
+    #[test]
+    fn convt_gemm_matches_the_loop() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) - 0.5
+        };
+        for &(ic, oc, s, n) in &[(16usize, 8usize, 8usize, 7usize), (8, 4, 5, 13), (6, 3, 3, 21), (5, 2, 2, 9)] {
+            let k = 2 * s;
+            let c = ConvT1d {
+                w: (0..ic * oc * k).map(|_| rnd()).collect(),
+                b: (0..oc).map(|_| rnd()).collect(),
+                in_ch: ic,
+                out_ch: oc,
+                k,
+                stride: s,
+                pad: s.div_ceil(2),
+                out_pad: s % 2,
+                wt: std::sync::OnceLock::new(),
+            };
+            let x: Vec<f32> = (0..ic * n).map(|_| rnd()).collect();
+            let a = c.apply(&x, n, None);
+            let b = c.apply_gemm(&x, n, None);
+            assert_eq!(a.len(), b.len());
+            let d = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            assert!(d < 1e-5, "stride {s}: max |Δ| {d}");
+        }
+    }
 
     /// Decode through the packed MiniMax-Music-3 vocoder and check the
     /// two things the reference fixes exactly: 512 samples per latent

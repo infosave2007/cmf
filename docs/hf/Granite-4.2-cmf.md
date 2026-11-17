@@ -40,11 +40,12 @@ This repository contains all three dense reasoning models from IBM's
 3B, 8B and 30B, each converted directly from the original bf16 checkpoint to
 Q4TP and Q8_2F CMF. A CMF is one memory-mapped file containing the weights,
 tokenizer, exact chat template and integrity hashes. The same artifact runs on
-CPU, Vulkan (NVIDIA/AMD/Intel), DX12 and Metal; inference needs no Python,
-PyTorch, CUDA toolkit or model-specific GPU build.
+CPU, CUDA, Vulkan (NVIDIA/AMD/Intel), DX12 and Metal; inference needs no Python,
+PyTorch or model-specific GPU build. On an RTX A5000 with CUDA the 3B decodes at
+176 tok/s and reads a 4096-token prompt in 0.9 s.
 
 ```bash
-cargo install cortiq-cli --version 0.6.4
+cargo install cortiq-cli
 
 hf download infosave/Granite-4.2-cmf granite-4.2-3b-q4tp.cmf --local-dir .
 cortiq verify granite-4.2-3b-q4tp.cmf
@@ -73,6 +74,18 @@ The 30B Q8_2F file is larger than the A40's safe physical graph live set:
 Cortiq automatically kept 55 of 64 layers on Vulkan and ran the nine-layer
 tail on the host. That 100-token run peaked at 43,036 MiB of the A40's
 46,068 MiB and completed without steady-state weight uploads.
+
+On an RTX A5000 (24 GB) with CUDA (`CMF_GPU=cuda`, `cortiq bench`):
+
+| model | file | decode | 4096-token prompt | cortiq |
+|---|---|---:|---:|---|
+| Granite 4.2 3B | `granite-4.2-3b-q4tp.cmf` | **176.2–176.4 tok/s** | 4672 tok/s (first token 0.87 s) | 0.8.96 |
+| Granite 4.2 8B | `granite-4.2-8b-q4tp.cmf` | **99.5–99.7 tok/s** | 3007 tok/s (first token 1.36 s) | 0.8.96 |
+| Granite 4.2 30B | `granite-4.2-30b-q4tp.cmf` | **28.9 tok/s** | — | 0.8.87 |
+
+Vulkan on the same card: 3B 131–135 tok/s, 8B 80–81 tok/s, 30B 28.6–28.9 tok/s.
+The CUDA backend is a build feature: `cargo install cortiq-cli --features cuda`
+(the NVIDIA driver and the CUDA 12.x libraries).
 
 SHA-256 (the Hugging Face LFS object id is the same digest):
 
@@ -228,7 +241,10 @@ thinking/`--no-think`, сохранены GQA, RoPE, SwiGLU и раздельн�
 исполняются в нативном Metal-графе. Для больших файлов Vulkan автоматически
 выбирает постоянный GPU-префикс и CPU-хвост: проверка, имитирующая 16 ГБ,
 дала пики 15 384 MiB для 30B Q4TP и 14 616 MiB для 30B Q8_2F, оба ответа
-остались корректными.
+остались корректными. На RTX A5000 с CUDA (`CMF_GPU=cuda`, сборка
+`cargo install cortiq-cli --features cuda`) Q4TP генерирует: 3B — 176 ток/с и читает промпт
+в 4096 токенов за 0,87 с, 8B — 99,6 ток/с и 1,36 с (cortiq 0.8.96), 30B — 28,9 ток/с
+(cortiq 0.8.87); Vulkan на той же карте — 131–135, 80–81 и 28,6–28,9 ток/с.
 
 Original models and license:
 [ibm-granite/granite-4.2-3b](https://huggingface.co/ibm-granite/granite-4.2-3b),

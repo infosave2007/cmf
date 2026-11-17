@@ -19,8 +19,9 @@ language:
 42 layers, 128k context, thinking mode, tool calling; English and Chinese)
 packaged as single [CMF](https://github.com/infosave2007/cmf) files. They run
 with `cortiq`, a Rust inference engine with no Python and no ML framework:
-NVIDIA, AMD and Intel GPUs through Vulkan/DX12, Apple silicon through Metal,
-and the CPU.
+NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through Vulkan/DX12,
+Apple silicon through Metal, and the CPU. On an RTX A5000 with CUDA `q4tp`
+decodes at 200 tok/s and a 4096-token prompt reaches its first token in 0.6 s.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)
 
@@ -58,10 +59,17 @@ One stream, medians of three runs:
 |---|---|---|---:|---:|---:|
 | RTX 3090 (24 GB) | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 s |
 | RTX 3090 (24 GB) | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 s |
-| Mac mini M4 (24 GB) | Metal | `q4tp` | 49.1 | 42.2 | 6.6 s |
 
 The chat and prompt columns are measured through `cortiq serve` after one
 warm-up request, with the recommended sampling below.
+
+RTX A5000 (24 GB), CUDA, cortiq 0.8.96, `cortiq bench` (`CMF_GPU=cuda` on a build with
+`cargo install cortiq-cli --features cuda`):
+
+| file | decode, tok/s | 4096-token prompt | decode after it |
+|---|---:|---:|---:|
+| `q4tp` | 195.8–202.3 | 6798 tok/s (first token 0.60 s) | 184.6 |
+| `q8_2f` | 144.8–146.1 | 8574 tok/s (first token 0.47 s) | 137.5 |
 
 ## Usage
 
@@ -162,8 +170,8 @@ Weights derive from OpenBMB's release and remain under its Apache-2.0 terms.
 параметров, 42 слоя, контекст 128k, режим рассуждений, вызов инструментов;
 английский и китайский) в виде отдельных файлов
 [CMF](https://github.com/infosave2007/cmf). Запускается движком `cortiq` на
-Rust без Python и ML-фреймворков: GPU NVIDIA, AMD и Intel через Vulkan/DX12,
-Apple silicon через Metal, а также CPU.
+Rust без Python и ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Intel
+через Vulkan/DX12, Apple silicon через Metal, а также CPU.
 
 ### Быстрый старт
 
@@ -198,10 +206,17 @@ Windows — на [странице релизов](https://github.com/infosave20
 |---|---|---|---:|---:|---:|
 | RTX 3090 (24 ГБ) | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 с |
 | RTX 3090 (24 ГБ) | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 с |
-| Mac mini M4 (24 ГБ) | Metal | `q4tp` | 49.1 | 42.2 | 6.6 с |
 
 Столбцы «чат» и «промпт» измерены через `cortiq serve` после одного
 прогревочного запроса, с рекомендуемым сэмплированием (ниже).
+
+RTX A5000 (24 ГБ), CUDA, cortiq 0.8.96, `cortiq bench` (`CMF_GPU=cuda` в сборке
+`cargo install cortiq-cli --features cuda`):
+
+| файл | генерация, ток/с | промпт 4096 токенов | генерация после него |
+|---|---:|---:|---:|
+| `q4tp` | 195,8–202,3 | 6798 ток/с (первый токен 0,60 с) | 184,6 |
+| `q8_2f` | 144,8–146,1 | 8574 ток/с (первый токен 0,47 с) | 137,5 |
 
 ### Использование
 
@@ -295,7 +310,7 @@ cortiq info MiniCPM5-2B-q8_2f.cmf
 [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B)（25 亿参数，42 层，
 128k 上下文，支持思考模式和工具调用，中英双语）打包为独立的
 [CMF](https://github.com/infosave2007/cmf) 文件，由 `cortiq` 运行——一个不依赖
-Python 和机器学习框架的 Rust 推理引擎：NVIDIA、AMD、Intel 显卡走 Vulkan/DX12，
+Python 和机器学习框架的 Rust 推理引擎：NVIDIA 显卡走 CUDA 或 Vulkan，AMD、Intel 显卡走 Vulkan/DX12，
 Apple silicon 走 Metal，也可在 CPU 上运行。
 
 ### 快速开始
@@ -330,10 +345,16 @@ cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "用三句话解释快速排序。" --
 |---|---|---|---:|---:|---:|
 | RTX 3090（24 GB） | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 s |
 | RTX 3090（24 GB） | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 s |
-| Mac mini M4（24 GB） | Metal | `q4tp` | 49.1 | 42.2 | 6.6 s |
 
 「对话」和「提示词」两列通过 `cortiq serve` 测得（先发一次预热请求），使用下文
 推荐的采样参数。
+
+RTX A5000（24 GB），CUDA，cortiq 0.8.96，`cortiq bench`（`cargo install cortiq-cli --features cuda` 构建，设置 `CMF_GPU=cuda`）：
+
+| 文件 | 生成，tok/s | 4096 token 提示词 | 之后的生成 |
+|---|---:|---:|---:|
+| `q4tp` | 195.8–202.3 | 6798 tok/s（首 token 0.60 s） | 184.6 |
+| `q8_2f` | 144.8–146.1 | 8574 tok/s（首 token 0.47 s） | 137.5 |
 
 ### 使用
 

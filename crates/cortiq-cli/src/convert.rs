@@ -344,6 +344,63 @@ fn byte_level_table() -> [char; 256] {
     table
 }
 
+/// The Qwen2 pre-tokenizer's split pattern (as Qwen3's tokenizer.json spells it).
+const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// An HF tokenizer.json for a checkpoint that ships the Qwen2 byte-level
+/// BPE as `vocab.json` + `merges.txt` (Qwen3-TTS): NFC, Qwen2's split
+/// pattern, byte level, and the added tokens of `tokenizer_config.json`.
+fn qwen2_bpe_tokenizer_json(dir: &Path, tok_cfg: &serde_json::Value) -> anyhow::Result<String> {
+    let vocab: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("vocab.json"))?)?;
+    anyhow::ensure!(vocab.as_object().is_some_and(|o| !o.is_empty()), "vocab.json: not a token map");
+    let merges: Vec<serde_json::Value> = fs::read_to_string(dir.join("merges.txt"))?
+        .lines()
+        .filter(|l| !l.starts_with("#version") && !l.trim().is_empty())
+        .filter_map(|l| l.split_once(' ').map(|(a, b)| serde_json::json!([a, b])))
+        .collect();
+    anyhow::ensure!(!merges.is_empty(), "merges.txt: no merges");
+    let mut added: Vec<(u64, serde_json::Value)> = Vec::new();
+    if let Some(m) = tok_cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+        for (id, t) in m {
+            let Ok(id) = id.parse::<u64>() else { continue };
+            let flag = |k: &str| t.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            added.push((
+                id,
+                serde_json::json!({
+                    "id": id,
+                    "content": t.get("content").cloned().unwrap_or_default(),
+                    "single_word": flag("single_word"),
+                    "lstrip": flag("lstrip"),
+                    "rstrip": flag("rstrip"),
+                    "normalized": flag("normalized"),
+                    "special": flag("special"),
+                }),
+            ));
+        }
+    }
+    added.sort_by_key(|(id, _)| *id);
+    let byte_level = serde_json::json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false});
+    let j = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": QWEN2_SPLIT}, "behavior": "Isolated", "invert": false},
+            byte_level.clone()
+        ]},
+        "post_processor": null,
+        "decoder": byte_level,
+        "model": {
+            "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
+            "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": vocab, "merges": merges
+        }
+    });
+    Ok(serde_json::to_string(&j)?)
+}
+
 /// Build an HF tokenizer.json from a tiktoken rank table (Kimi family).
 ///
 /// tiktoken stores `base64(token_bytes) rank` per line and no merge
@@ -733,6 +790,27 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == "lfm3" {
         return lfm3_canon(raw);
     }
+    // Haru (`HaruForConditionalGeneration`): the Qwen3.5 text model under
+    // `lm.`; the audio projectors, the MeanFlow head, the VibeVoice codec and
+    // the latent scale ride along as `haru.*` (`haru`).
+    if arch.arch_name.starts_with("qwen3_5") && is_haru_name(raw) {
+        return match raw.strip_prefix("lm.") {
+            Some(rest) => canon_name(&format!("model.{rest}")),
+            None => Some(format!("haru.{raw}")),
+        };
+    }
+    // Qwen3-TTS: the talker is a plain Qwen3 under `talker.`; its text
+    // embedding, text projection, code predictor and the speech
+    // tokenizer's decoder ride along as `qtts.*` (`qwen3_tts`).
+    if arch.arch_name == "qwen3" && (raw.starts_with("talker.") || raw.starts_with("qtts.")) {
+        return qwen3_tts_canon(raw);
+    }
+    // OmniVoice: a bidirectional Qwen3 under `llm.` over the audio
+    // vocabulary; the text embedding and the Higgs audio tokenizer ride
+    // along as `ov.*` (`omnivoice`).
+    if arch.arch_name == "qwen3" && is_omnivoice_name(raw) {
+        return omnivoice_canon(raw);
+    }
     if arch.dory.is_some() {
         return Some(dory_canon(raw));
     }
@@ -962,6 +1040,180 @@ fn spark25_canon(raw: &str) -> Option<String> {
 /// `codebook_embedding.weight`, read by `lfm3_audio`); LFM3-Audio's own
 /// layout (`lfm.model.*`, `encoder.*`, `mlp.model.N.*`, `depthformer.*`,
 /// `depth_*`) lands on the same names.
+/// Qwen3-TTS (`Qwen3TTSForConditionalGeneration`) names:
+///
+///   talker.model.codec_embedding → model.embed_tokens (the codec vocabulary)
+///   talker.model.{layers.N.*, norm} → model.{layers.N.*, norm}
+///   talker.codec_head → lm_head
+///   talker.model.text_embedding → qtts.text_embedding
+///   talker.text_projection.* → qtts.text_projection.*
+///   talker.code_predictor.* → qtts.code_predictor.*
+///
+/// The speech tokenizer's decoder arrives already as `qtts.codec.decoder.*`
+/// (`open_qtts_codec_shard`); its encoder is not read.
+fn qwen3_tts_canon(name: &str) -> Option<String> {
+    if name.starts_with("qtts.") {
+        return Some(name.to_string());
+    }
+    let rest = name.strip_prefix("talker.")?;
+    Some(match rest {
+        "model.codec_embedding.weight" => "model.embed_tokens.weight".into(),
+        "model.text_embedding.weight" => "qtts.text_embedding.weight".into(),
+        "model.norm.weight" => "model.norm.weight".into(),
+        "codec_head.weight" => "lm_head.weight".into(),
+        _ => {
+            if let Some(r) = rest.strip_prefix("model.layers.") {
+                format!("model.layers.{r}")
+            } else if let Some(r) = rest.strip_prefix("text_projection.") {
+                format!("qtts.text_projection.{r}")
+            } else if let Some(r) = rest.strip_prefix("code_predictor.") {
+                format!("qtts.code_predictor.{r}")
+            } else {
+                return None;
+            }
+        }
+    })
+}
+
+/// A tensor of a Haru checkpoint: the language model under `lm.`, the rest
+/// under names no other family converts.
+fn is_haru_name(raw: &str) -> bool {
+    raw.starts_with("lm.")
+        || raw.starts_with("model_audio_proj.")
+        || raw.starts_with("user_audio_proj.")
+        || raw.starts_with("head.")
+        || raw.starts_with("codec.")
+        || raw == "latent_scale"
+        || raw == "latent_bias"
+}
+
+/// Whether `dir` holds a Qwen3-TTS checkpoint (`model_type` `qwen3_tts`).
+fn is_qwen3_tts(dir: &Path) -> bool {
+    fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
+        .is_some_and(|t| t == "qwen3_tts")
+}
+
+/// The shard name of Qwen3-TTS's speech tokenizer
+/// (`speech_tokenizer/model.safetensors`), whose decoder joins a
+/// conversion as `qtts.codec.decoder.*`.
+const QTTS_CODEC_SHARD: &str = "speech_tokenizer.safetensors";
+
+/// The speech tokenizer shard of a Qwen3-TTS checkpoint: the decoder only,
+/// renamed (the encoder serves voice cloning, which is not ported).
+fn open_qtts_codec_shard(dir: &Path) -> anyhow::Result<Option<SafeTensors>> {
+    let path = dir.join("speech_tokenizer").join("model.safetensors");
+    if !is_qwen3_tts(dir) || !path.exists() {
+        return Ok(None);
+    }
+    let mut st = open_safetensors(&path)?;
+    st.tensors.retain(|t| t.name.starts_with("decoder."));
+    for t in &mut st.tensors {
+        t.name = format!("qtts.codec.{}", t.name);
+    }
+    st.name = QTTS_CODEC_SHARD.to_string();
+    Ok(Some(st))
+}
+
+/// The tensors `open_qtts_codec_shard` keeps.
+fn qtts_codec_count(dir: &Path) -> anyhow::Result<Option<usize>> {
+    let path = dir.join("speech_tokenizer").join("model.safetensors");
+    if !is_qwen3_tts(dir) || !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(open_safetensors(&path)?.tensors.iter().filter(|t| t.name.starts_with("decoder.")).count()))
+}
+
+/// A tensor of an OmniVoice checkpoint (`OmniVoice`, k2-fsa).
+fn is_omnivoice_name(raw: &str) -> bool {
+    raw.starts_with("llm.layers.")
+        || raw == "llm.norm.weight"
+        || raw == "llm.embed_tokens.weight"
+        || raw == "audio_embeddings.weight"
+        || raw == "audio_heads.weight"
+        || raw == "codebook_layer_offsets"
+        || raw.starts_with("ov.")
+}
+
+/// OmniVoice names:
+///
+///   llm.{layers.N.*, norm} → model.{layers.N.*, norm}
+///   audio_embeddings → model.embed_tokens (8 codebooks × 1025 rows)
+///   audio_heads → lm_head (the same 8 × 1025 logits)
+///   llm.embed_tokens → ov.text_embedding (the Qwen3 text vocabulary)
+///
+/// `codebook_layer_offsets` (an arange the engine rebuilds) is dropped; the
+/// audio tokenizer arrives already as `ov.codec.*` (`open_ov_codec_shard`).
+fn omnivoice_canon(name: &str) -> Option<String> {
+    if name.starts_with("ov.") {
+        return Some(name.to_string());
+    }
+    Some(match name {
+        "audio_embeddings.weight" => "model.embed_tokens.weight".into(),
+        "audio_heads.weight" => "lm_head.weight".into(),
+        "llm.embed_tokens.weight" => "ov.text_embedding.weight".into(),
+        "llm.norm.weight" => "model.norm.weight".into(),
+        "codebook_layer_offsets" => return None,
+        _ => format!("model.layers.{}", name.strip_prefix("llm.layers.")?),
+    })
+}
+
+/// Set while an OmniVoice checkpoint converts (`build_arch`): the dtype rules
+/// see names, not the checkpoint, and its embedding and head stay f16.
+static OMNIVOICE_CONVERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `dir` holds an OmniVoice checkpoint (`model_type` `omnivoice`).
+fn is_omnivoice(dir: &Path) -> bool {
+    fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
+        .is_some_and(|t| t == "omnivoice")
+}
+
+/// The shard name of OmniVoice's Higgs audio tokenizer
+/// (`audio_tokenizer/model.safetensors`), whose tensors join a conversion
+/// as `ov.codec.*`.
+const OV_CODEC_SHARD: &str = "omnivoice_codec.safetensors";
+
+/// The parts of the Higgs audio tokenizer the engine runs: the acoustic
+/// decoder and the codebooks for speech, the acoustic encoder, HuBERT and
+/// the semantic encoder for voice cloning. The semantic decoder, `fc1` and
+/// the codebooks' training statistics only serve training.
+fn ov_codec_keeps(name: &str) -> bool {
+    if name.starts_with("quantizer.") {
+        return name.ends_with(".codebook.embed") || name.contains(".project_in.") || name.contains(".project_out.");
+    }
+    ["acoustic_decoder.", "acoustic_encoder.", "encoder_semantic.", "semantic_model.", "fc.", "fc2."]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+fn open_ov_codec_shard(dir: &Path) -> anyhow::Result<Option<SafeTensors>> {
+    let path = dir.join("audio_tokenizer").join("model.safetensors");
+    if !is_omnivoice(dir) || !path.exists() {
+        return Ok(None);
+    }
+    let mut st = open_safetensors(&path)?;
+    st.tensors.retain(|t| ov_codec_keeps(&t.name));
+    for t in &mut st.tensors {
+        t.name = format!("ov.codec.{}", t.name);
+    }
+    st.name = OV_CODEC_SHARD.to_string();
+    Ok(Some(st))
+}
+
+/// The tensors `open_ov_codec_shard` keeps.
+fn ov_codec_count(dir: &Path) -> anyhow::Result<Option<usize>> {
+    let path = dir.join("audio_tokenizer").join("model.safetensors");
+    if !is_omnivoice(dir) || !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(open_safetensors(&path)?.tensors.iter().filter(|t| ov_codec_keeps(&t.name)).count()))
+}
+
 fn lfm3_canon(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         return lfm3_canon(&format!("model.{rest}"));
@@ -1112,6 +1364,24 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
         && name.ends_with(".weight")
         && (name.starts_with("vision.") || name.starts_with("aligner.")))
         || lfm3_vision(arch, name)
+        // Haru's projectors, MeanFlow head and codec: host-side f16 (`haru`)
+        || (arch.arch_name.starts_with("qwen3_5") && name.starts_with("haru."))
+        // Qwen3-TTS's text embedding, text projection, the code
+        // predictor's embeddings and heads, the speech decoder: host-side
+        // f16 (`qwen3_tts`). The predictor's layers follow the profile: they
+        // run as a pipeline of their own on the device graphs.
+        || (arch.arch_name == "qwen3" && name.starts_with("qtts.") && !name.starts_with("qtts.code_predictor.model.layers."))
+        // OmniVoice's text embedding (host rows) and its audio tokenizer
+        // (host convolutions, HuBERT): f16 (`omnivoice`)
+        || (arch.arch_name == "qwen3" && name.starts_with("ov."))
+        // OmniVoice's audio embeddings and heads: f16 in every profile. A row
+        // is the sum of 8 codebooks' embeddings and the heads' log-probabilities
+        // go through guidance (3·cond − 2·uncond); against the float32 release
+        // on the first step's logits, mean |Δ log p| is 0.011 with them f16 and
+        // 0.13 (q8_2f) or 0.08 (row int8) with them quantized, the layers q8_2f.
+        || (OMNIVOICE_CONVERT.load(std::sync::atomic::Ordering::Relaxed)
+            && arch.arch_name == "qwen3"
+            && (name == "model.embed_tokens.weight" || name == "lm_head.weight"))
 }
 
 /// LFM3-VL's vision tower and projector stay f16 in every profile: against
@@ -1141,6 +1411,14 @@ fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
 /// use the established f16 router policy for their own source/runtime paths.
 fn force_arch_f32(arch: &ModelArch, name: &str) -> bool {
     force_f32(name)
+        // Haru's latent scale and bias: two scalars every latent goes through
+        || name == "haru.latent_scale"
+        || name == "haru.latent_bias"
+        // Qwen3-TTS's RVQ codebooks: a usage count divides a sum, both F32
+        // in the source and past f16's range
+        || (name.starts_with("qtts.codec.") && (name.ends_with("._codebook.cluster_usage") || name.ends_with("._codebook.embedding_sum")))
+        // OmniVoice's RVQ codebooks: a voice clone picks the nearest row
+        || (name.starts_with("ov.codec.quantizer.") && name.ends_with(".codebook.embed"))
         || (arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE
             && name.ends_with(".mlp.gate.weight"))
         || (arch.dory.is_some() && dory_scale_vector(name))
@@ -4943,6 +5221,12 @@ fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     if has_lfm3_codec(dir) && codec.exists() {
         shards.push((CODEC_SHARD.to_string(), safetensors_tensor_count(&codec)?));
     }
+    if let Some(n) = qtts_codec_count(dir)? {
+        shards.push((QTTS_CODEC_SHARD.to_string(), n));
+    }
+    if let Some(n) = ov_codec_count(dir)? {
+        shards.push((OV_CODEC_SHARD.to_string(), n));
+    }
     Ok(shards)
 }
 
@@ -5081,6 +5365,12 @@ pub(crate) fn open_model_filtered(
     let mut shards = open_model_filtered_main(dir, completed_shards)?;
     if !completed_shards.contains(CODEC_SHARD) {
         shards.extend(open_codec_shard(dir)?);
+    }
+    if !completed_shards.contains(QTTS_CODEC_SHARD) {
+        shards.extend(open_qtts_codec_shard(dir)?);
+    }
+    if !completed_shards.contains(OV_CODEC_SHARD) {
+        shards.extend(open_ov_codec_shard(dir)?);
     }
     Ok(shards)
 }
@@ -7443,6 +7733,7 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
             router_resonance: false,
         }),
         qwen4_exp: None,
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         deepseek_v41: None,
@@ -7468,6 +7759,38 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
 }
 
 fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    // Haru: the language model is Qwen3.5 text (`lm`); the speech parts
+    // ride in provenance and under `haru.*`.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("haru") {
+        let lm = config.get("lm").cloned().ok_or_else(|| anyhow::anyhow!("haru: no lm config"))?;
+        return build_arch(&lm);
+    }
+    // Qwen3-TTS: the talker is a Qwen3 decoder over the codec vocabulary.
+    // Its multimodal RoPE sections all read one position for text and
+    // speech, which is ordinary RoPE; the rest rides in provenance.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("qwen3_tts") {
+        let mut tc = config.get("talker_config").cloned().ok_or_else(|| anyhow::anyhow!("qwen3_tts: no talker_config"))?;
+        tc["model_type"] = serde_json::json!("qwen3");
+        if let Some(o) = tc.as_object_mut() {
+            o.remove("rope_scaling");
+            o.remove("code_predictor_config");
+        }
+        tc["tie_word_embeddings"] = serde_json::json!(false);
+        return build_arch(&tc);
+    }
+    // OmniVoice: a Qwen3 stack run both ways over the audio vocabulary
+    // (8 codebooks × 1025 ids, embeddings and heads); the text vocabulary
+    // and the audio tokenizer ride in provenance and under `ov.*`.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("omnivoice") {
+        let mut lc = config.get("llm_config").cloned().ok_or_else(|| anyhow::anyhow!("omnivoice: no llm_config"))?;
+        let books = cfg_usize(config, "num_audio_codebook").unwrap_or(8);
+        let vocab = cfg_usize(config, "audio_vocab_size").unwrap_or(1025);
+        lc["model_type"] = serde_json::json!("qwen3");
+        lc["vocab_size"] = serde_json::json!(books * vocab);
+        lc["tie_word_embeddings"] = serde_json::json!(false);
+        OMNIVOICE_CONVERT.store(true, std::sync::atomic::Ordering::Relaxed);
+        return build_arch(&lc);
+    }
     // Dory: a looped normalized GPT. The generic fields describe the plain
     // geometry, the record carries everything the engine's own stack reads.
     if config.get("model_type").and_then(|v| v.as_str()) == Some("dory") {
@@ -8309,6 +8632,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             latent_dim: None,
             latent_groups: None,
         }),
+        // GLM-5.3 converts on its own branch; the runtime reads the record
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         // Keep the complete original HF object, including the text/vision
@@ -11613,6 +11938,16 @@ pub fn run_convert_multi_excluding(
                 None
             }
         }
+    }).or_else(|| {
+        // Qwen3-TTS ships the Qwen2 byte-level BPE as vocab.json +
+        // merges.txt only: synthesize the tokenizer.json they describe.
+        match qwen2_bpe_tokenizer_json(&dir, &tok_cfg) {
+            Ok(j) => {
+                tracing::info!("vocab.json + merges.txt → tokenizer.json ({} bytes)", j.len());
+                Some(j.into_bytes())
+            }
+            Err(_) => None,
+        }
     });
     let gen_cfg: serde_json::Value = fs::read(dir.join("generation_config.json"))
         .ok()
@@ -11817,6 +12152,46 @@ pub fn run_convert_multi_excluding(
             "features": features,
             "codec": codec,
             "generation": generation,
+        });
+        p
+    } else {
+        provenance
+    };
+    // Haru: the checkpoint config (frame, latent, special ids, codec, head).
+    let provenance = if config.get("model_type").and_then(|v| v.as_str()) == Some("haru") {
+        let mut p = provenance;
+        p["haru"] = serde_json::json!({ "config": config.clone() });
+        p
+    } else {
+        provenance
+    };
+    // Qwen3-TTS: the checkpoint config (special ids, speakers, languages,
+    // the code predictor), the sampling the release recommends and the
+    // speech tokenizer's config (`qwen3_tts::Qwen3TtsConfig`).
+    let provenance = if config.get("model_type").and_then(|v| v.as_str()) == Some("qwen3_tts") {
+        let mut p = provenance;
+        let read = |f: &Path| -> serde_json::Value {
+            fs::read(f).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
+        };
+        p["qwen3_tts"] = serde_json::json!({
+            "config": config.clone(),
+            "generation": read(&dir.join("generation_config.json")),
+            "codec": read(&dir.join("speech_tokenizer").join("config.json")),
+        });
+        p
+    } else {
+        provenance
+    };
+    // OmniVoice: the checkpoint config (codebooks, mask id, the codebook
+    // weights) and the audio tokenizer's (`omnivoice::OmniVoiceConfig`).
+    let provenance = if config.get("model_type").and_then(|v| v.as_str()) == Some("omnivoice") {
+        let mut p = provenance;
+        let read = |f: &Path| -> serde_json::Value {
+            fs::read(f).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
+        };
+        p["omnivoice"] = serde_json::json!({
+            "config": config.clone(),
+            "codec": read(&dir.join("audio_tokenizer").join("config.json")),
         });
         p
     } else {

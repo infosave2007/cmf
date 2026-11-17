@@ -603,6 +603,23 @@ pub struct DoryTurbo {
     pub exact_rows: usize,
 }
 
+/// GLM-5.3-Flash (`glm5_next`) text-stack geometry. The model combines
+/// four-stream mHC residuals, KDA recurrent mixers and NoPE sparse MLA.
+/// Keeping it in the CMF header makes one artifact portable across CPU,
+/// Vulkan/DX12 and Metal without checkpoint-specific guesses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Glm5NextConfig {
+    pub hc_mult: usize,
+    pub hc_sinkhorn_iters: usize,
+    pub hc_eps: f32,
+    pub swiglu_limit: f32,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    pub index_kpool: usize,
+    pub index_kpool_always_select_tail: bool,
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -736,6 +753,9 @@ pub struct ModelArch {
     /// Qwen3.8-Flash-Next exact text stack (None for all other families).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qwen4_exp: Option<Qwen4ExpConfig>,
+    /// GLM-5.3-Flash exact text stack (None for all other families).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm5_next: Option<Glm5NextConfig>,
     /// Block-diffusion generation (Clover). Mandatory iff the
     /// `BLOCK_DIFFUSION` feature bit is set: a reader that ignored it would
     /// run the model as a next-token predictor, which it is not.
@@ -1426,6 +1446,9 @@ pub enum ExecutionMode {
     CpuOnly { simd_type: SimdType, threads: usize },
     /// Apple Silicon unified memory (CPU compute today; label for metrics)
     AppleUnified { metal_layers: Vec<usize> },
+    /// A GPU backend is up: `backend` is "cuda" or "wgpu", `device` the
+    /// card and its API, `budget_mb` the weight budget on it.
+    Gpu { backend: String, device: String, budget_mb: f64 },
 }
 
 /// SIMD instruction set available on CPU.

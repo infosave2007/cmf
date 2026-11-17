@@ -67,6 +67,7 @@ fn tiny_arch() -> ModelArch {
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        glm5_next: None,
         block_diffusion: None,
         dory: None,
         deepseek_v41: None,

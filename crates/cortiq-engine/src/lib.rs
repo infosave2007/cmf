@@ -28,6 +28,7 @@ pub mod f32_backend;
 pub mod g3n;
 pub mod g4e;
 pub mod gptq_capture;
+pub mod glm5_next;
 pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod gpu_metal;
@@ -44,6 +45,10 @@ pub mod inference;
 pub mod kv_cache;
 pub mod lfm3_audio;
 pub mod lfm3_speech;
+pub mod omnivoice;
+mod omnivoice_langs;
+pub mod qwen3_tts;
+pub mod haru;
 pub mod lfm3_vl;
 pub mod linear_core;
 pub mod loader;
@@ -74,6 +79,8 @@ pub mod music3;
 pub mod moss_image;
 pub mod moss_imagegen;
 pub mod nystrom;
+#[cfg(target_os = "android")]
+pub mod npu;
 pub mod pin;
 pub mod pipeline;
 /// Gradium Phonon text-to-speech execution for self-contained CMF packages.

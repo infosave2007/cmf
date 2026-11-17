@@ -1405,7 +1405,7 @@ fn core_capacities() -> Vec<u64> {
 }
 
 #[cfg(target_os = "android")]
-fn pin_thread_to_big_cores() {
+pub(crate) fn pin_thread_to_big_cores() {
     use std::mem;
     let caps = core_capacities();
     let max = caps.iter().copied().max().unwrap_or(0);

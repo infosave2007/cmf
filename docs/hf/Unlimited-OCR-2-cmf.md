@@ -85,6 +85,12 @@ the weights are loaded (the first request adds about 4 s), in 4.9 s on the M4. O
 10-core Xeon quota with `CMF_GPU=0` the decoder runs at 67 tok/s and the encoder takes
 16 s for a 1024×1024 view.
 
+**CUDA (RTX A5000 24 GB, cortiq 0.8.96).** With `CMF_GPU=cuda` on a build with the CUDA
+backend (`cargo install cortiq-cli --features cuda`, the NVIDIA driver and the CUDA 12.x
+libraries) `q4tp` decodes at 319–320 tok/s, a tiled page reaches its first token in 1.1 s
+and one page takes 8–9 s end to end with the model load (Vulkan on the same card: 20–25 s).
+On CUDA take `q4tp`: the `q8_2f` file's routed experts do not run on the card yet.
+
 ## Server
 
 ```bash
@@ -102,8 +108,8 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 
 ## Hardware
 
-**NVIDIA / AMD / Intel (Vulkan, DX12).** The encoder and the decoder run on the
-card; 8 GB of VRAM holds `q4tp`, 12 GB `q8_2f`. **Apple silicon (Metal).** Both run on
+**NVIDIA (CUDA, Vulkan) / AMD / Intel (Vulkan, DX12).** The encoder and the decoder run
+on the card; 8 GB of VRAM holds `q4tp`, 12 GB `q8_2f`. **Apple silicon (Metal).** Both run on
 the GPU; a page takes 4.7 GB of memory with `q4tp`, 6.2 GB with `q8_2f`. **CPU only.**
 `CMF_GPU=0`: a page takes tens of seconds in the encoder.
 
@@ -139,7 +145,10 @@ cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --promp
 Скорость на RTX PRO 4500: декодирование 323 ток/с (`q8_2f`) и 319 ток/с (`q4tp`), и на 24 страницах
 не падает; энкодер 0.10 с на тайл и 0.24 с на общий вид. На M4 с 10-ядерным GPU (Metal): 95 и 112 ток/с,
 энкодер 0.35 с и 1.15 с; страница занимает 4.7 ГБ памяти с `q4tp` и 6.2 ГБ с `q8_2f`. Только CPU:
-`CMF_GPU=0`. Лицензия MIT.
+`CMF_GPU=0`. CUDA (RTX A5000, cortiq 0.8.96, сборка `--features cuda`, `CMF_GPU=cuda`): `q4tp`
+декодирует 319–320 ток/с, первый токен страницы — через 1.1 с, страница целиком с загрузкой — 8–9 с
+(Vulkan на той же карте — 20–25 с); на CUDA берите `q4tp`, эксперты `q8_2f` на карте пока не идут.
+Лицензия MIT.
 
 ---
 
@@ -161,4 +170,4 @@ cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --promp
 
 RTX PRO 4500 上的速度：解码 323 tok/s（`q8_2f`）和 319 tok/s（`q4tp`），编码器每块 0.10 秒、
 全局视图 0.24 秒。10 核 GPU 的 M4（Metal）：解码 95 和 112 tok/s，编码器 0.35 秒和 1.15 秒；一页占用
-内存 4.7 GB（`q4tp`）或 6.2 GB（`q8_2f`）。仅 CPU：`CMF_GPU=0`。许可证 MIT。
+内存 4.7 GB（`q4tp`）或 6.2 GB（`q8_2f`）。仅 CPU：`CMF_GPU=0`。CUDA（RTX A5000，cortiq 0.8.96，`--features cuda` 构建，`CMF_GPU=cuda`）：`q4tp` 解码 319–320 tok/s，分块页面 1.1 秒出首个 token，含加载的整页 8–9 秒（同卡 Vulkan 20–25 秒）；CUDA 上请用 `q4tp`，`q8_2f` 的路由专家暂不在显卡上运行。许可证 MIT。

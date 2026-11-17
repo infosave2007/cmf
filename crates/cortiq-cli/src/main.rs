@@ -437,6 +437,12 @@ enum Commands {
         /// (the table is ignored). Default: CMF_LOOKUP_MODE.
         #[arg(long)]
         lookup_mode: Option<String>,
+        /// Skill to overlay on every slot (spec §9), as `run --skill`: its
+        /// replacement tensors are read in place of the backbone's. Every
+        /// request runs that skill (a router policy's per-request choice is
+        /// off)
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// d1 decision models (Liquid AI's System One on LFM3): named questions
     /// over a state and its pictures, answered from one forward pass as
@@ -768,14 +774,58 @@ enum Commands {
     },
     /// Synthesize multilingual Phonon speech from a Phonon CMF checkpoint.
     #[cfg(feature = "phonon")]
-    Tts {
-        /// Path to a Gradium Phonon `.cmf` model.
+    /// Full-duplex spoken dialogue (Haru): play a recording of the user to the
+    /// model frame by frame, as in a live call, and write what it answers
+    /// over the same span.
+    Duplex {
+        /// Path to a Haru `.cmf` model.
         model: String,
-        /// Text to synthesize. Long input is split on sentence boundaries.
+        /// The user's audio (WAV, any rate; mixed down to mono, 24 kHz).
+        input: String,
+        /// The model's audio (24 kHz WAV, as long as the input).
+        output: String,
+        /// The character card, as text (a ChatML system turn).
+        #[arg(long, default_value = "")]
+        system_prompt: String,
+        /// Read the character card from a file.
+        #[arg(long)]
+        system_prompt_file: Option<String>,
+        /// The voice the model speaks with: 3 s to 3 min of one speaker (WAV).
+        #[arg(long)]
+        reference: Option<String>,
+        /// Audio guidance scale (1 to 2; the release's default 1.5).
+        #[arg(long)]
+        guidance_scale: Option<f32>,
+        /// Text sampling temperature (0 is greedy).
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// Text sampling top-k.
+        #[arg(long, default_value_t = 25)]
+        top_k: usize,
+        /// Sampling seed.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// The model opens the conversation.
+        #[arg(long)]
+        speak_first: bool,
+        /// Write the user on the left channel and the model on the right.
+        #[arg(long)]
+        stereo: bool,
+        /// Write the per-frame text as JSON lines.
+        #[arg(long)]
+        transcript: Option<String>,
+    },
+    Tts {
+        /// Path to a Gradium Phonon, Qwen3-TTS or OmniVoice `.cmf` model.
+        model: String,
+        /// Text to synthesize. Long input is split on sentence boundaries (Phonon).
         text: String,
-        /// Language used for text normalization: en, fr, de, es, or pt.
-        #[arg(long, visible_alias = "language", default_value = "en")]
-        lang: String,
+        /// Language: Phonon normalizes en, fr, de, es or pt; Qwen3-TTS speaks
+        /// zh, en, de, it, pt, es, ja, ko, fr, ru (a code or a name) or auto
+        /// (both default to en). OmniVoice: any of its 600+ languages as an
+        /// ISO 639 code or an English name; without it the model guesses.
+        #[arg(long, visible_alias = "language")]
+        lang: Option<String>,
         /// Output mono 24 kHz WAV path.
         #[arg(long, default_value = "speech.wav")]
         out: String,
@@ -783,12 +833,17 @@ enum Commands {
         /// Audio recordings are not supported because the speaker codec is not released.
         #[arg(long)]
         voice_file: Option<String>,
-        /// Name assigned to --voice-file; without it only `default` is embedded.
-        #[arg(long, default_value = "default")]
+        /// Phonon: the name assigned to --voice-file (without it only
+        /// `default` is embedded). Qwen3-TTS: a built-in speaker (serena,
+        /// vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan);
+        /// `default` is serena.
+        #[arg(long, visible_alias = "speaker", default_value = "default")]
         voice: String,
-        /// Flow-noise temperature; 0 is deterministic and 0.3 is the upstream default.
-        #[arg(long, default_value_t = 0.3)]
-        temperature: f32,
+        /// Phonon: flow-noise temperature (0 is deterministic, 0.3 the
+        /// upstream default). Qwen3-TTS: the codes' sampling temperature
+        /// (0 is greedy; the release samples at 0.9).
+        #[arg(long)]
+        temperature: Option<f32>,
         /// Flow-noise seed for reproducible output.
         #[arg(long, default_value_t = 4_242_424_242_424_242u64)]
         seed: u64,
@@ -804,6 +859,25 @@ enum Commands {
         /// Text-token limit for each sentence chunk.
         #[arg(long)]
         max_tokens_per_chunk: Option<usize>,
+        /// OmniVoice voice design: comma-separated speaker attributes, e.g.
+        /// "female, low pitch, british accent" or "男，四川话".
+        #[arg(long)]
+        instruct: Option<String>,
+        /// OmniVoice voice cloning: a 3–10 s WAV of the voice to speak with.
+        #[arg(long)]
+        ref_audio: Option<String>,
+        /// The transcript of --ref-audio.
+        #[arg(long)]
+        ref_text: Option<String>,
+        /// OmniVoice: decoding steps (32; 16 is faster and a little rougher).
+        #[arg(long)]
+        steps: Option<usize>,
+        /// OmniVoice: seconds of speech (instead of the estimate from the text).
+        #[arg(long)]
+        duration: Option<f32>,
+        /// OmniVoice: speaking rate (above 1 faster, below 1 slower).
+        #[arg(long)]
+        speed: Option<f32>,
     },
     /// Rewrite a container tightly, or calibrate/compact an existing MTP
     /// draft from a prompt set:
@@ -2153,6 +2227,10 @@ enum Commands {
         /// Permanent exact sink keys for --o1 (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// Skill to overlay while measuring (spec §9): its replacement
+        /// tensors are read in place of the backbone's, as `run --skill`
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Score skills for a prompt (recon-argmin routing, spec 9)
     Route {
@@ -3538,6 +3616,19 @@ enum Commands {
         /// (minimax_h3_*_pruned_bf16.safetensors)
         #[arg(long)]
         dit: Option<String>,
+        /// A full MiniMax-H3 DiT in the diffusers layout: the `transformer/`
+        /// directory of FastVideo's FastH3 students (index + shards). Its
+        /// VSA gates and the repository's `fastvideo_inference.json`
+        /// (sparsity, tile, few-step schedule) come along
+        #[arg(long)]
+        dit_diffusers: Option<String>,
+        /// Override the student's trained VSA sparsity (0.9 for FastH3)
+        #[arg(long)]
+        vsa_sparsity: Option<f64>,
+        /// Take the DiT (`dit.*`) from another .cmf, by reference: a DiT
+        /// packed on its own over the `--in` file's encoder and decoders
+        #[arg(long)]
+        dit_from: Option<String>,
         /// Turbo 4-step LoRA, merged into the packed weights
         #[arg(long)]
         lora: Option<String>,
@@ -4072,6 +4163,12 @@ enum SkillCmd {
         /// skill's key (the result is unsupported territory)
         #[arg(long)]
         force: bool,
+        /// Keep the backbone: write the skill's tensors beside the base's as
+        /// `skill.<id>.*` with its record, so `run/serve/bench --skill <id>`
+        /// overlays it at inference and the file without `--skill` is the
+        /// base, byte for byte in every base tensor
+        #[arg(long)]
+        overlay: bool,
     },
     /// Graft a skill from a donor HF checkpoint (same architecture):
     /// replacement tensors + routing subspace + measured quality
@@ -4436,10 +4533,12 @@ async fn main() -> anyhow::Result<()> {
             gpus,
             route_include_quarantine,
             lookup_mode,
+            skill,
         } => {
             // The language-model flags a decision file refuses (spec §4.2).
             let llm_given: Vec<&'static str> = [
                 ("--task", task.is_some()),
+                ("--skill", skill.is_some()),
                 ("--compat-port", compat_port.is_some()),
                 ("--o1", o1.is_some()),
                 ("--o1-m", o1_m.is_some()),
@@ -4488,6 +4587,7 @@ async fn main() -> anyhow::Result<()> {
                 gpus,
                 route_include_quarantine,
                 lookup_mode.as_deref(),
+                skill.as_deref(),
             )
             .await
         }
@@ -4826,6 +4926,13 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "phonon")]
         Commands::PhononPack { source, output } => phononpack::cmd_phonon_pack(&source, &output),
         #[cfg(feature = "phonon")]
+        Commands::Duplex { model, input, output, system_prompt, system_prompt_file, reference, guidance_scale, temperature, top_k, seed, speak_first, stereo, transcript } => {
+            let card = match system_prompt_file {
+                Some(f) => std::fs::read_to_string(&f)?.trim().to_string(),
+                None => system_prompt,
+            };
+            haru_duplex(&model, &input, &output, &card, reference.as_deref(), guidance_scale, temperature, top_k, seed, speak_first, stereo, transcript.as_deref())
+        }
         Commands::Tts {
             model,
             text,
@@ -4839,12 +4946,28 @@ async fn main() -> anyhow::Result<()> {
             duration_delta,
             eos_threshold,
             max_tokens_per_chunk,
+            instruct,
+            ref_audio,
+            ref_text,
+            steps,
+            duration,
+            speed,
         } => {
+            if let Ok(m) = CmfModel::open(&model) {
+                if cortiq_engine::omnivoice::is_omnivoice(&m) {
+                    let o = OmniSay { lang: lang.as_deref(), instruct: instruct.as_deref(), ref_audio: ref_audio.as_deref(), ref_text: ref_text.as_deref(), steps, guidance, temperature, seed, duration, speed };
+                    return omnivoice_say(Arc::new(m), &text, &o, &out);
+                }
+                if cortiq_engine::qwen3_tts::is_qwen3_tts(&m) {
+                    return qwen3_tts_say(Arc::new(m), &text, lang.as_deref().unwrap_or("en"), &voice, temperature, seed, &out);
+                }
+            }
+            let lang = lang.unwrap_or_else(|| "en".to_string());
             let options = cortiq_engine::phonon::SynthesisOptions {
                 language: &lang,
                 voice_file: voice_file.as_deref().map(std::path::Path::new),
                 voice_name: &voice,
-                temperature,
+                temperature: temperature.unwrap_or(0.3),
                 seed,
                 guidance,
                 duration_delta,
@@ -6585,6 +6708,9 @@ async fn main() -> anyhow::Result<()> {
             out,
             carry,
             dit,
+            dit_diffusers,
+            vsa_sparsity,
+            dit_from,
             lora,
             time_embedder,
             lora_scale,
@@ -6610,6 +6736,9 @@ async fn main() -> anyhow::Result<()> {
             out: &out,
             carry: carry.as_deref(),
             dit: dit.as_deref(),
+            dit_diffusers: dit_diffusers.as_deref(),
+            vsa_sparsity,
+            dit_from: dit_from.as_deref(),
             lora: lora.as_deref(),
             time_embedder: time_embedder.as_deref(),
             lora_scale,
@@ -6727,6 +6856,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
             bw,
+            skill,
         } => {
             if bw {
                 return cmd_bench_bw(json, &model);
@@ -6753,6 +6883,7 @@ async fn main() -> anyhow::Result<()> {
                 &net_dtype,
                 peer_head,
                 gpus,
+                skill.as_deref(),
             )
             .await
         }
@@ -6809,7 +6940,8 @@ async fn main() -> anyhow::Result<()> {
                 skill,
                 output,
                 force,
-            } => skill::run_skill_apply(&base, &skill, &output, force),
+                overlay,
+            } => skill::run_skill_apply(&base, &skill, &output, force, overlay),
             SkillCmd::Bake {
                 model,
                 files,
@@ -8255,6 +8387,7 @@ async fn cmd_serve(
     replicas: Option<usize>,
     route_include_quarantine: bool,
     lookup_mode: Option<&str>,
+    skill: Option<&str>,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -8392,7 +8525,7 @@ async fn cmd_serve(
         if let Some(d) = devices.get(i) {
             cortiq_engine::gpu::set_current_device(*d);
         }
-        let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+        let mut pipeline = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), skill)?;
         // No endpoint reports per-token confidence, and it is a full-vocab
         // softmax every token (~1 ms at Gemma's 262k vocab).
         // `CMF_SERVE_CONFIDENCE=1` keeps it.
@@ -8460,6 +8593,9 @@ async fn cmd_serve(
     // skill gets its own lane on first use. φ runs on a separate backbone
     // pipeline so no slot's conversation state is reset by routing.
     let routing = if !cortiq_engine::router::is_router_v2(&model) {
+        None
+    } else if let Some(id) = skill {
+        println!("    Router v2: OFF under --skill — every request runs skill '{id}'");
         None
     } else if remote.is_some() {
         println!(
@@ -13177,11 +13313,15 @@ async fn cmd_bench(
     net_dtype: &str,
     peer_head: bool,
     gpus: Option<usize>,
+    skill: Option<&str>,
 ) -> anyhow::Result<()> {
     if !json {
         println!(
-            "Benchmark: {} | task={} | tokens={}",
-            model_path, task, tokens
+            "Benchmark: {} | task={} | tokens={}{}",
+            model_path,
+            task,
+            tokens,
+            skill.map(|s| format!(" | skill={s}")).unwrap_or_default()
         );
     }
     if let Some(n) = ctx {
@@ -13211,7 +13351,7 @@ async fn cmd_bench(
         dtype_n(TensorDtype::Q8_2f),
         dtype_n(TensorDtype::F16),
     );
-    let mut pipeline = Pipeline::from_model(
+    let mut pipeline = Pipeline::from_model_with_skill(
         &model,
         SamplerConfig {
             temperature: 0.0, // greedy: benchmark must be deterministic
@@ -13224,6 +13364,7 @@ async fn cmd_bench(
             },
             ..Default::default()
         },
+        skill,
     )?;
     if ignore_eos {
         // A loop flag, not a suppression: the earlier form put every EOS id
@@ -13712,6 +13853,7 @@ async fn cmd_bench(
             "tensor_q8_2f": tensor_q8_2f,
             "tensor_f16": tensor_f16,
             "task": task,
+            "skill": skill,
             "ctx": ctx,
             "o1": pipeline.o1_active(),
             "o1_prefill_tokens": std::env::var("CMF_O1_PREFILL")
@@ -14765,4 +14907,271 @@ mod tests {
         assert_eq!(loaded.prompts[0].id, teacher_data::derived_prompt_id("first prompt"));
         assert_eq!(loaded.prompts[1].id, teacher_data::derived_prompt_id("second prompt"));
     }
+}
+
+/// `cortiq tts` on a Qwen3-TTS file: the talker on the engine's backends,
+/// the code predictor and the speech decoder on the host.
+/// `CMF_QTTS_CODES_DUMP=file` writes the frames as JSON; `CMF_QTTS_CODES_IN=file`
+/// decodes those frames instead of generating (`[[16 codes] …]`).
+fn qwen3_tts_say(
+    model: Arc<CmfModel>,
+    text: &str,
+    lang: &str,
+    voice: &str,
+    temperature: Option<f32>,
+    seed: u64,
+    out: &str,
+) -> anyhow::Result<()> {
+    use cortiq_engine::qwen3_tts as qt;
+    let cfg = qt::Qwen3TtsConfig::from_model(&model).map_err(anyhow::Error::msg)?;
+    let speaker = if voice == "default" {
+        if cfg.speakers.iter().any(|s| s.0 == "serena") { "serena".to_string() } else { cfg.speakers.first().map(|s| s.0.clone()).unwrap_or_default() }
+    } else {
+        voice.to_lowercase()
+    };
+    let pool = cortiq_engine::pool::Pool::from_env();
+    let t0 = std::time::Instant::now();
+    let frames = match std::env::var("CMF_QTTS_CODES_IN") {
+        Ok(f) => serde_json::from_slice::<Vec<Vec<u32>>>(&std::fs::read(&f)?)?,
+        Err(_) => {
+            let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+            let mut cp = qt::CodePredictor::from_model(&model, &cfg, pool.clone()).map_err(anyhow::Error::msg)?;
+            let req = qt::Request { text, language: lang, speaker: &speaker, seed, max_frames: None, temperature };
+            qt::generate(&mut pipeline, &cfg, &model, &mut cp, &req, pool.as_deref()).map_err(anyhow::Error::msg)?.frames
+        }
+    };
+    let t_gen = t0.elapsed().as_secs_f64();
+    if let Ok(f) = std::env::var("CMF_QTTS_CODES_DUMP") {
+        std::fs::write(&f, serde_json::to_vec(&frames)?)?;
+    }
+    let t1 = std::time::Instant::now();
+    let codec = qt::Codec::from_model(&model, &cfg, pool).map_err(anyhow::Error::msg)?;
+    let wav = codec.decode(&frames);
+    let t_dec = t1.elapsed().as_secs_f64();
+    cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(out), &wav, qt::SAMPLE_RATE)?;
+    let secs = wav.len() as f64 / qt::SAMPLE_RATE as f64;
+    println!("✓ wrote {out} ({secs:.2}s, {} Hz, {} frames, speaker {speaker})", qt::SAMPLE_RATE, frames.len());
+    eprintln!("[generated in {t_gen:.1} s · decoded in {t_dec:.1} s · {:.2}× real time]", secs / (t_gen + t_dec).max(1e-9));
+    if let Some(r) = qt::prof_report() {
+        eprintln!("qwen3-tts stages: {r}");
+    }
+    Ok(())
+}
+
+struct OmniSay<'a> {
+    lang: Option<&'a str>,
+    instruct: Option<&'a str>,
+    ref_audio: Option<&'a str>,
+    ref_text: Option<&'a str>,
+    steps: Option<usize>,
+    guidance: Option<f32>,
+    temperature: Option<f32>,
+    seed: u64,
+    duration: Option<f32>,
+    speed: Option<f32>,
+}
+
+/// `cortiq tts` on an OmniVoice file: the codes from the bidirectional
+/// stack, the Higgs decoder, the release's post-processing.
+fn omnivoice_say(model: Arc<CmfModel>, text: &str, o: &OmniSay, out: &str) -> anyhow::Result<()> {
+    use cortiq_engine::omnivoice as ov;
+    let cfg = ov::OmniVoiceConfig::from_model(&model).map_err(anyhow::Error::msg)?;
+    let pool = cortiq_engine::pool::Pool::from_env();
+    let rate = cfg.sample_rate;
+    let mut generation = ov::GenConfig { seed: o.seed, ..Default::default() };
+    if let Some(s) = o.steps {
+        anyhow::ensure!(s > 0, "--steps must be positive");
+        generation.steps = s;
+    }
+    if let Some(g) = o.guidance {
+        generation.guidance = g;
+    }
+    if let Some(t) = o.temperature {
+        generation.class_temperature = t;
+    }
+    // test knobs: the position temperature (0: deterministic) and no post-processing
+    if let Some(t) = std::env::var("CMF_OV_POS_TEMP").ok().and_then(|v| v.parse().ok()) {
+        generation.position_temperature = t;
+    }
+    if std::env::var("CMF_OV_POSTPROCESS").as_deref() == Ok("0") {
+        generation.postprocess = false;
+    }
+    let t0 = std::time::Instant::now();
+    let codec = ov::Codec::from_model(&model, &cfg, pool.clone()).map_err(anyhow::Error::msg)?;
+    let voice = match (o.ref_audio, std::env::var("CMF_OV_REF_CODES").ok()) {
+        (_, Some(f)) => {
+            let codes: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(&f)?)?;
+            let text = o.ref_text.ok_or_else(|| anyhow::anyhow!("CMF_OV_REF_CODES needs --ref-text"))?;
+            let rms = std::env::var("CMF_OV_REF_RMS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
+            Some(ov::VoicePrompt { codes, text: ov::add_punctuation(text), rms })
+        }
+        (Some(path), None) => {
+            let text = o.ref_text.ok_or_else(|| anyhow::anyhow!("--ref-audio needs --ref-text (its transcript)"))?;
+            let wav = wav_mono(path, rate as u32)?;
+            let enc = ov::Encoder::from_model(&model, &cfg, pool.clone()).map_err(anyhow::Error::msg)?;
+            Some(enc.voice_prompt(&wav, text).map_err(anyhow::Error::msg)?)
+        }
+        (None, None) => None,
+    };
+    let t_ref = t0.elapsed().as_secs_f64();
+    if let (Ok(f), Some(v)) = (std::env::var("CMF_OV_REF_DUMP"), voice.as_ref()) {
+        std::fs::write(&f, serde_json::to_vec(&serde_json::json!({"codes": v.codes, "text": v.text, "rms": v.rms}))?)?;
+    }
+    let chunks: Vec<Vec<Vec<u32>>> = match std::env::var("CMF_OV_TOKENS_IN") {
+        Ok(f) => vec![serde_json::from_slice::<Vec<Vec<u32>>>(&std::fs::read(&f)?)?],
+        Err(_) => {
+            let pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+            let req = ov::Request { text, language: o.lang, instruct: o.instruct, voice: voice.as_ref(), duration: o.duration, speed: o.speed, generation: generation.clone() };
+            ov::generate_chunks(&pipeline, &model, &cfg, &req, pool.as_deref()).map_err(anyhow::Error::msg)?
+        }
+    };
+    let t_gen = t0.elapsed().as_secs_f64() - t_ref;
+    if let Ok(f) = std::env::var("CMF_OV_TOKENS_DUMP") {
+        std::fs::write(&f, serde_json::to_vec(&chunks[0])?)?;
+    }
+    let t1 = std::time::Instant::now();
+    let pieces: Vec<Vec<f32>> = chunks.iter().map(|c| codec.decode(c)).collect();
+    let raw = ov::cross_fade(&pieces, rate);
+    let codes: usize = chunks.iter().map(|c| c.first().map_or(0, |b| b.len())).sum();
+    if let Ok(f) = std::env::var("CMF_OV_RAW_DUMP") {
+        cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(&f), &raw, rate as u32)?;
+    }
+    let wav = ov::post_process(&raw, rate, voice.as_ref().map(|v| v.rms), generation.postprocess);
+    let t_dec = t1.elapsed().as_secs_f64();
+    cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(out), &wav, rate as u32)?;
+    let secs = wav.len() as f64 / rate as f64;
+    println!("✓ wrote {out} ({secs:.2}s, {rate} Hz, {} frames in {} chunk(s), {} steps)", codes, chunks.len(), generation.steps);
+    eprintln!(
+        "[reference {t_ref:.1} s · generated in {t_gen:.1} s · decoded in {t_dec:.1} s · {:.2}× real time]",
+        secs / (t_gen + t_dec).max(1e-9)
+    );
+    Ok(())
+}
+
+/// A WAV file as mono f32 at `rate` (channels averaged, resampled).
+fn wav_mono(path: &str, rate: u32) -> anyhow::Result<Vec<f32>> {
+    use cortiq_engine::mimo_audio as ma;
+    let w = ma::decode_wav(&std::fs::read(path)?).map_err(anyhow::Error::msg)?;
+    let n = w.frames();
+    let ch = w.channels.len().max(1);
+    let mono: Vec<f32> = (0..n).map(|i| w.channels.iter().map(|c| c[i]).sum::<f32>() / ch as f32).collect();
+    Ok(if w.sample_rate == rate { mono } else { ma::resample_sinc(&mono, w.sample_rate, rate) })
+}
+
+/// `cortiq duplex`: the language model on the engine's backends, the codec,
+/// the projectors and the MeanFlow head beside it (`haru`).
+#[allow(clippy::too_many_arguments)]
+fn haru_duplex(
+    model: &str,
+    input: &str,
+    output: &str,
+    card: &str,
+    reference: Option<&str>,
+    guidance: Option<f32>,
+    temperature: f32,
+    top_k: usize,
+    seed: u64,
+    speak_first: bool,
+    stereo: bool,
+    transcript: Option<&str>,
+) -> anyhow::Result<()> {
+    use cortiq_engine::haru;
+    let m = Arc::new(CmfModel::open(model)?);
+    anyhow::ensure!(haru::is_haru(&m), "{model} is not a Haru file (provenance.haru)");
+    let pool = cortiq_engine::pool::Pool::from_env();
+    let t0 = std::time::Instant::now();
+    let h = haru::Haru::from_model(&m, pool).map_err(anyhow::Error::msg)?;
+    let mut pipe = Pipeline::from_model(&m, SamplerConfig::default())?;
+    let rate = h.cfg.sample_rate;
+    let user = wav_mono(input, rate)?;
+    // a voice reference: silence trimmed (-45 dBFS, 20 ms windows, 0.2 s margin), the last 3 minutes
+    let reference = match reference {
+        Some(r) => {
+            let a = wav_mono(r, rate)?;
+            let win = (rate / 50) as usize;
+            let count = a.len() / win;
+            let voiced: Vec<usize> = (0..count)
+                .filter(|&i| {
+                    let ms = a[i * win..(i + 1) * win].iter().map(|v| v * v).sum::<f32>() / win as f32;
+                    20.0 * (ms + 1e-12).sqrt().log10() > -45.0
+                })
+                .collect();
+            let trimmed = match (voiced.first(), voiced.last()) {
+                (Some(&f), Some(&l)) => {
+                    let margin = (0.2 * rate as f32) as usize;
+                    a[(f * win).saturating_sub(margin)..((l + 1) * win + margin).min(a.len())].to_vec()
+                }
+                _ => Vec::new(),
+            };
+            let limit = 180 * rate as usize;
+            Some(trimmed[trimmed.len().saturating_sub(limit)..].to_vec())
+        }
+        None => None,
+    };
+    let t_load = t0.elapsed().as_secs_f64();
+    // CMF_HARU_CODEC_RT=means.f32: the codec alone — the input encoded (its
+    // latent means written there) and decoded back into `output`
+    if let Ok(dump) = std::env::var("CMF_HARU_CODEC_RT") {
+        let fs = h.cfg.frame_samples;
+        let mut u = user.clone();
+        u.resize(u.len().div_ceil(fs) * fs, 0.0);
+        let means = h.codec.encode(&u);
+        std::fs::write(&dump, means.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        let wav = h.codec.decode(&means);
+        cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(output), &wav, rate)?;
+        println!("codec round trip: {} frames -> {output}", means.len() / h.cfg.latent_dim);
+        return Ok(());
+    }
+    let o = haru::Options { guidance, temperature, top_k, speak_first, seed, ..Default::default() };
+    let t1 = std::time::Instant::now();
+    let reply = h.converse(&mut pipe, card, reference.as_deref(), &user, &o).map_err(anyhow::Error::msg)?;
+    let t_run = t1.elapsed().as_secs_f64();
+    if stereo {
+        let n = reply.audio.len();
+        let mut u = user.clone();
+        u.resize(n, 0.0);
+        let inter: Vec<f32> = u.iter().zip(&reply.audio).flat_map(|(&a, &b)| [a, b]).collect();
+        write_wav_channels(output, &inter, rate, 2)?;
+    } else {
+        cortiq_engine::lfm3_speech::write_wav(std::path::Path::new(output), &reply.audio, rate)?;
+    }
+    if let Some(t) = transcript {
+        let mut s = String::new();
+        for (i, txt) in reply.text.iter().enumerate() {
+            s.push_str(&serde_json::json!({"frame": i, "time": (i * h.cfg.frame_samples) as f64 / rate as f64, "text": txt}).to_string());
+            s.push('\n');
+        }
+        std::fs::write(t, s)?;
+    }
+    let mut steps = reply.step_ms[1..].to_vec();
+    steps.sort_by(f64::total_cmp);
+    let median = steps.get(steps.len() / 2).copied().unwrap_or(0.0);
+    let secs = reply.audio.len() as f64 / rate as f64;
+    println!("{} frames ({secs:.1} s), {median:.1} ms per frame -> {output}", reply.frames);
+    println!("{}", reply.text.concat().trim());
+    eprintln!("[load {t_load:.1} s · conversation {t_run:.1} s · prompt and frame 0 {:.0} ms]", reply.step_ms.first().copied().unwrap_or(0.0));
+    Ok(())
+}
+
+/// 16-bit PCM WAV of interleaved `channels`.
+fn write_wav_channels(path: &str, samples: &[f32], rate: u32, channels: u16) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let data = (samples.len() * 2) as u32;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&channels.to_le_bytes())?;
+    f.write_all(&rate.to_le_bytes())?;
+    f.write_all(&(rate * channels as u32 * 2).to_le_bytes())?;
+    f.write_all(&(channels * 2).to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data.to_le_bytes())?;
+    for &v in samples {
+        f.write_all(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())?;
+    }
+    Ok(())
 }

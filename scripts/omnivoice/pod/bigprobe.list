@@ -1,0 +1,12 @@
+# repo file — smallest first; DeepSeek-V4.1 (406+ GB) does not fit the 400 GB disk
+infosave/Ripple-65B-Preview-cmf ripple-65b-q4tp.cmf
+infosave/Ornith-1.5-122B-cmf ornith-1.5-122b-q2tp-v2.cmf
+infosave/Qwen3.8-Flash-Next-Fast-Code-cmf qwen38-flash-next-fast-code.cmf
+infosave/Ornith-1.5-122B-cmf ornith-1.5-122b-q4tp.cmf
+infosave/Qwen3.8-Flash-Next-cmf qwen38-flash-next-q2tp-v2.cmf
+infosave/Qwen3.8-Flash-Next-hot-cmf qwen38-flash-next-q2tp-hot.cmf
+infosave/Edge0-120B-cmf edge0-120b.cmf
+infosave/Edge0-145B-cmf edge0-145b.cmf
+infosave/GLM-5.3-Flash-cmf glm-5.3-flash-q2tp.cmf
+infosave/MiniMax-M3.1-Flash-cmf minimax-m3.1-flash-q2tp-mix.cmf
+infosave/MiMo-V2.6-Flash-RL-cmf MiMo-V2.6-Flash-RL-q4tp.cmf

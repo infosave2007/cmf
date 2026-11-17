@@ -705,6 +705,248 @@ impl Layout {
     }
 }
 
+// ── video sparse attention ──────────────────────────────────────────
+
+/// Rows of a VSA tile, padded or not: the kernels' native granularity.
+pub const VSA_TILE: usize = 64;
+
+/// Video sparse attention (VSA) as FastVideo's VSA-H3 backend runs it for a
+/// student trained with it (FastH3). The packed sequence is cut into tiles:
+/// each non-video stream (text, keyframes, audio) into chunks of 64 rows in
+/// its own order, the video into `4×4×4` blocks of `(t, h, w)` tokens
+/// (smaller at the edges). Per head, every tile is scored against every tile
+/// by the means of its queries and keys; a video query tile attends the
+/// rows of its top-k video key tiles and of every non-video tile, and a
+/// non-video query attends everything. With a trained gate, each row also
+/// adds `gate · (softmax(tile scores) · tile means of v)` of its tile — the
+/// compression branch.
+///
+/// Rows are addressed through `slot`: tile `i` owns slots `64 i .. 64 i +
+/// size[i]`, which is the order the device kernels keep q, k and v in.
+pub struct VsaPlan {
+    pub n: usize,
+    pub tiles: usize,
+    /// Tiles of the non-video streams, first in the tile order.
+    pub prefix_tiles: usize,
+    /// Video key tiles a video query tile keeps.
+    pub topk: usize,
+    /// `[n]` each row's slot.
+    pub slot: Vec<u32>,
+    /// `[tiles]` valid rows of each tile.
+    pub size: Vec<u32>,
+}
+
+impl VsaPlan {
+    /// The plan of a `[text | keyframes | audio | video]` layout, or `None`
+    /// for one VSA was not trained on (references, streaming chunks) or a
+    /// tile shape the kernels do not take.
+    pub fn build(layout: &Layout, tile: [usize; 3], sparsity: f64) -> Option<Self> {
+        if tile.iter().product::<usize>() != VSA_TILE || !(0.0..1.0).contains(&sparsity) {
+            return None;
+        }
+        let video = layout.segments.last().filter(|s| s.kind == Kind::Video && s.stop == layout.seq_len)?;
+        let (vt, vh, vw) = (layout.latent_t, layout.lat_h / 2, layout.lat_w / 2);
+        if vt * vh * vw != video.stop - video.start || vt * vh * vw == 0 {
+            return None;
+        }
+        // the non-video streams, consecutive keyframe blocks as one
+        let mut groups: Vec<(usize, usize, Kind)> = Vec::new();
+        for s in &layout.segments[..layout.segments.len() - 1] {
+            match s.kind {
+                Kind::Text | Kind::Cond | Kind::Audio => {}
+                _ => return None,
+            }
+            if s.stop == s.start {
+                continue;
+            }
+            let joins = matches!(groups.last(), Some(g) if g.2 == s.kind && g.1 == s.start);
+            if joins {
+                groups.last_mut().expect("joins a group").1 = s.stop;
+            } else {
+                groups.push((s.start, s.stop, s.kind));
+            }
+        }
+        let n = layout.seq_len;
+        let mut slot = vec![0u32; n];
+        let mut size: Vec<u32> = Vec::new();
+        for &(a, b, _) in &groups {
+            for (k, r) in (a..b).enumerate() {
+                if k % VSA_TILE == 0 {
+                    size.push(0);
+                }
+                let t = size.len() - 1;
+                slot[r] = (t * VSA_TILE + size[t] as usize) as u32;
+                size[t] += 1;
+            }
+        }
+        let prefix_tiles = size.len();
+        let [ta, ha, wa] = tile;
+        let (nt, nh, nw) = (vt.div_ceil(ta), vh.div_ceil(ha), vw.div_ceil(wa));
+        for it in 0..nt {
+            for ih in 0..nh {
+                for iw in 0..nw {
+                    let (et, eh, ew) = (ta.min(vt - it * ta), ha.min(vh - ih * ha), wa.min(vw - iw * wa));
+                    size.push((et * eh * ew) as u32);
+                }
+            }
+        }
+        for t in 0..vt {
+            for h in 0..vh {
+                for w in 0..vw {
+                    let (it, ih, iw) = (t / ta, h / ha, w / wa);
+                    let (eh, ew) = (ha.min(vh - ih * ha), wa.min(vw - iw * wa));
+                    let off = ((t - it * ta) * eh + (h - ih * ha)) * ew + (w - iw * wa);
+                    let tix = prefix_tiles + (it * nh + ih) * nw + iw;
+                    slot[video.start + (t * vh + h) * vw + w] = (tix * VSA_TILE + off) as u32;
+                }
+            }
+        }
+        let tiles = size.len();
+        let video_tiles = tiles - prefix_tiles;
+        let topk = (((1.0 - sparsity) * video_tiles as f64).ceil() as usize).clamp(1, video_tiles);
+        Some(Self {
+            n,
+            tiles,
+            prefix_tiles,
+            topk,
+            slot,
+            size,
+        })
+    }
+
+    /// The key tiles query tile `i` attends: every non-video tile, then its
+    /// `topk` best-scoring video tiles (`scores` its row of tile scores);
+    /// every tile for a non-video query.
+    pub fn select(&self, i: usize, scores: &[f32]) -> Vec<u32> {
+        if i < self.prefix_tiles || self.topk == self.tiles - self.prefix_tiles {
+            return (0..self.tiles as u32).collect();
+        }
+        let mut vid: Vec<u32> = (self.prefix_tiles as u32..self.tiles as u32).collect();
+        vid.sort_by(|&a, &b| scores[b as usize].total_cmp(&scores[a as usize]).then(a.cmp(&b)));
+        let mut out: Vec<u32> = (0..self.prefix_tiles as u32).collect();
+        out.extend_from_slice(&vid[..self.topk]);
+        out
+    }
+}
+
+/// Softmax of `x` in place, f64 sums.
+fn softmax_f64(x: &mut [f32]) {
+    let m = x.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+    let mut s = 0f64;
+    for v in x.iter_mut() {
+        *v = (*v - m).exp();
+        s += *v as f64;
+    }
+    let inv = (1.0 / s) as f32;
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// VSA over a qkv panel `[n][q | k | v]` whose q and k are normed and
+/// rotated, into `attn` `[n][heads · hd]`; `gate` `[n][heads · hd]` is the
+/// compression branch's gate (none: the branch is off). The host reference
+/// of the device kernels, row for row.
+#[allow(clippy::too_many_arguments)]
+pub fn vsa_attention_host(
+    plan: &VsaPlan,
+    qkv: &[f32],
+    gate: Option<&[f32]>,
+    heads: usize,
+    hd: usize,
+    attn: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let (n, t) = (plan.n, plan.tiles);
+    let inner = heads * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    // rows of each tile, in slot order
+    let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); t];
+    let mut by_slot: Vec<(u32, u32)> = plan.slot.iter().enumerate().map(|(r, &s)| (s, r as u32)).collect();
+    by_slot.sort_unstable();
+    for (s, r) in by_slot {
+        rows_of[s as usize / VSA_TILE].push(r);
+    }
+    let at = |r: usize, plane: usize, h: usize| &qkv[r * 3 * inner + plane * inner + h * hd..][..hd];
+    for h in 0..heads {
+        // tile means of q, k and v, f64 sums
+        let mut means = vec![vec![0f32; t * hd]; 3];
+        for (i, rows) in rows_of.iter().enumerate() {
+            for (plane, m) in means.iter_mut().enumerate() {
+                let mut acc = vec![0f64; hd];
+                for &r in rows {
+                    for (a, &v) in acc.iter_mut().zip(at(r as usize, plane, h)) {
+                        *a += v as f64;
+                    }
+                }
+                for (d, a) in m[i * hd..(i + 1) * hd].iter_mut().zip(acc) {
+                    *d = (a / rows.len() as f64) as f32;
+                }
+            }
+        }
+        let mut scores = vec![0f32; t * t];
+        for i in 0..t {
+            for j in 0..t {
+                let (q, k) = (&means[0][i * hd..(i + 1) * hd], &means[1][j * hd..(j + 1) * hd]);
+                scores[i * t + j] = q.iter().zip(k).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+            }
+        }
+        // the compression branch's output of every tile
+        let comp: Vec<f32> = if gate.is_some() {
+            let mut c = vec![0f32; t * hd];
+            for i in 0..t {
+                let mut p = scores[i * t..(i + 1) * t].to_vec();
+                softmax_f64(&mut p);
+                for (j, &w) in p.iter().enumerate() {
+                    for (d, &v) in c[i * hd..(i + 1) * hd].iter_mut().zip(&means[2][j * hd..(j + 1) * hd]) {
+                        *d += w * v;
+                    }
+                }
+            }
+            c
+        } else {
+            Vec::new()
+        };
+        let lists: Vec<Vec<u32>> = (0..t).map(|i| plan.select(i, &scores[i * t..(i + 1) * t])).collect();
+        let ptr = SendPtr(attn.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            let mut s: Vec<f32> = Vec::new();
+            let mut keys: Vec<u32> = Vec::new();
+            for r in lo..hi {
+                let i = plan.slot[r] as usize / VSA_TILE;
+                keys.clear();
+                for &kt in &lists[i] {
+                    keys.extend_from_slice(&rows_of[kt as usize]);
+                }
+                let q = at(r, 0, h);
+                s.clear();
+                s.extend(keys.iter().map(|&k| {
+                    q.iter().zip(at(k as usize, 1, h)).map(|(&a, &b)| a * b).sum::<f32>() * scale
+                }));
+                softmax_f64(&mut s);
+                // SAFETY: workers own disjoint rows; a row's head slots are its own.
+                let out = unsafe { ptr.row(r * inner + h * hd, hd) };
+                out.fill(0.0);
+                for (&w, &k) in s.iter().zip(&keys) {
+                    for (o, &v) in out.iter_mut().zip(at(k as usize, 2, h)) {
+                        *o += w * v;
+                    }
+                }
+                if let Some(g) = gate {
+                    let gr = &g[r * inner + h * hd..][..hd];
+                    for ((o, &gv), &c) in out.iter_mut().zip(gr).zip(&comp[i * hd..(i + 1) * hd]) {
+                        *o += gv * c;
+                    }
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.run_rows(n, &work),
+            None => work(0, n),
+        }
+    }
+}
+
 // ── weights ─────────────────────────────────────────────────────────
 
 struct Adaln {
@@ -775,6 +1017,8 @@ struct Block {
     fc1: Proj, // [2·ffn, hidden]
     fc2: Proj, // [hidden, ffn]
     adaln: Option<Adaln>,
+    /// VSA's compression-branch gate `[heads·hd, hidden]` (FastH3).
+    gate: Option<Proj>,
     /// Runtime low-rank branches, one per projection an adapter names.
     /// A branch is why the fused device paths below stand down: they
     /// keep qkv, the attention output and the FFN's middle on the card,
@@ -900,6 +1144,13 @@ pub struct MiniMaxH3 {
     pub cond_aug_audio: f64,
     /// Adapter keys that found a projection, for the caller's report.
     lora_bound: std::collections::BTreeSet<String>,
+    /// The trained video sparse attention: (sparsity, tile shape). `None`
+    /// for a dense model; `CMF_VSA=0` forces dense attention on a sparse
+    /// one (an A/B, not what the student was trained for).
+    pub vsa: Option<(f64, [usize; 3])>,
+    /// A few-step student's own schedule, unshifted (`[0.999, 0.749, 0.5,
+    /// 0.25, 0]` for FastH3); empty: the `simple` grid.
+    pub sampler_base_sigmas: Vec<f64>,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -995,6 +1246,16 @@ impl MiniMaxH3 {
                 } else {
                     None
                 },
+                gate: {
+                    let name = format!("dit.{prefix}.attn.gate_compress.weight");
+                    // `CMF_VSA_GATE=0`: the sparse attention without its
+                    // compression branch (a diagnostic, every backend alike)
+                    if model.tensor_index(&name).is_some() && std::env::var("CMF_VSA_GATE").as_deref() != Ok("0") {
+                        Some(Proj::from_model(model, &name)?)
+                    } else {
+                        None
+                    }
+                },
                 lora,
             })
         };
@@ -1063,7 +1324,50 @@ impl MiniMaxH3 {
             cond_aug: VISUAL_COND_TIMESTEP,
             cond_aug_audio: AUDIO_COND_TIMESTEP,
             lora_bound: bound.into_inner(),
+            vsa: match (cfg["vsa_sparsity"].as_f64(), cfg["vsa_tile"].as_array()) {
+                (Some(s), Some(t)) if t.len() == 3 && std::env::var("CMF_VSA").as_deref() != Ok("0") => {
+                    let d = |i: usize| t[i].as_u64().unwrap_or(0) as usize;
+                    // `CMF_VSA_SPARSITY`: another share of video tiles dropped
+                    // (0 keeps them all: the full attention plus the gated
+                    // compression branch — the kernels' parity check)
+                    let s = std::env::var("CMF_VSA_SPARSITY")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|v| (0.0..1.0).contains(v))
+                        .unwrap_or(s);
+                    Some((s, [d(0), d(1), d(2)]))
+                }
+                _ => None,
+            },
+            sampler_base_sigmas: cfg["sampler_base_sigmas"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default(),
         })
+    }
+
+    /// The video sigma grid of a `steps`-step render: the student's own
+    /// schedule shifted onto the video clock when it carries one and
+    /// `steps` matches it, else `None` (the caller's `simple` grid).
+    pub fn student_sigmas(&self, steps: usize) -> Option<Vec<f64>> {
+        let b = &self.sampler_base_sigmas;
+        if b.len() < 2 || b.len() - 1 != steps {
+            return None;
+        }
+        let s = self.shift_video;
+        Some(b.iter().map(|&x| s * x / (1.0 + (s - 1.0) * x)).collect())
+    }
+
+    /// The VSA plan of `layout` (`None`: a dense model, or a layout the
+    /// sparse attention was not trained on — which then runs dense).
+    pub fn vsa_plan(&self, layout: &Layout) -> Option<VsaPlan> {
+        let (s, tile) = self.vsa?;
+        let plan = VsaPlan::build(layout, tile, s);
+        if plan.is_none() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("vsa: this layout is not [text | keyframes | audio | video] — dense attention"));
+        }
+        plan
     }
 
     /// How many of the adapter's branches found a projection.
@@ -1133,7 +1437,7 @@ impl MiniMaxH3 {
                 *v += b;
             }
         }
-        self.run_blocks(&self.refiner, &mut h, n, &[], &[], &[]);
+        self.run_blocks(&self.refiner, &mut h, n, &[], &[], &[], None);
         let mut out = vec![0f32; n * self.hidden];
         for (o, x) in out
             .chunks_exact_mut(self.hidden)
@@ -1378,6 +1682,7 @@ impl MiniMaxH3 {
         mods: Option<&[f32]>,
         pos: &[[f64; 3]],
         rows: &[u32],
+        vsa: Option<&VsaPlan>,
     ) {
         let hs = self.hidden;
         let pool = self.pool.as_deref();
@@ -1408,7 +1713,8 @@ impl MiniMaxH3 {
         // packed kernel hands the attention unnormalized q/k and there is
         // no way back from there — which is why the refusal below used to
         // be an assert.
-        let qk_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() != Ok("cpu")
+        let qk_gpu = vsa.is_none()
+            && std::env::var("CMF_MMH3_QKNORM").as_deref() != Ok("cpu")
             && crate::gpu::enabled_here()
             && crate::gpu::dit_attention_packed_available()
             && n >= 256;
@@ -1542,6 +1848,16 @@ impl MiniMaxH3 {
         Self::prof(2, t);
         let t = std::time::Instant::now();
         let mut attn = vec![0f32; n * inner];
+        if let Some(plan) = vsa {
+            // the sparse student: the host reference (the device runs it in
+            // the chain); the gate reads the same modulated input as qkv
+            let gate = blk.gate.as_ref().map(|g| {
+                let mut v = vec![0f32; n * inner];
+                g.matmat(&xn, n, &mut v, pool);
+                v
+            });
+            vsa_attention_host(plan, &qkv, gate.as_deref(), self.heads, self.head_dim, &mut attn, pool);
+        } else {
         self.attention(
             &qkv,
             n,
@@ -1553,6 +1869,7 @@ impl MiniMaxH3 {
                 self.qk_eps as f32,
             )),
         );
+        }
         Self::prof(3, t);
         let t = std::time::Instant::now();
         let mut proj = vec![0f32; n * hs];
@@ -1919,13 +2236,14 @@ impl MiniMaxH3 {
         // One resident chain where the backend has one (`run_blocks`). The
         // per-block watch reads the stream on the host between blocks, so
         // it keeps the per-op loop.
+        let vsa = self.vsa_plan(layout);
         let watch = std::env::var("CMF_MMH3_WATCHROW")
             .ok()
             .and_then(|w| w.parse::<usize>().ok());
         if let Some(r) = watch {
             for (i, blk) in self.blocks.iter().enumerate() {
                 let mods = blk.adaln.as_ref().unwrap().eval(&ts, pool);
-                self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows);
+                self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows, vsa.as_ref());
                 // Growing magnitude is an overflow, a sudden jump from
                 // finite to NaN is a kernel.
                 let row = &h[r * hs..(r + 1) * hs];
@@ -1942,7 +2260,7 @@ impl MiniMaxH3 {
                 }
             }
         } else {
-            self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows);
+            self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows, vsa.as_ref());
         }
 
         // ── heads ──
@@ -2078,6 +2396,7 @@ impl MiniMaxH3 {
         ts: &[f64],
         pos: &[[f64; 3]],
         rows: &[u32],
+        vsa: Option<&VsaPlan>,
     ) {
         let pool = self.pool.as_deref();
         if std::env::var("CMF_MMH3_CHAIN").as_deref() != Ok("0")
@@ -2123,6 +2442,10 @@ impl MiniMaxH3 {
                         fc2_bias: &[],
                         scale1: &[],
                         scale2: &[],
+                        gate: match (&b.gate, vsa) {
+                            (Some(g), Some(_)) => idx(g)?,
+                            _ => usize::MAX,
+                        },
                     })
                 })
                 .collect();
@@ -2141,6 +2464,7 @@ impl MiniMaxH3 {
                     rows,
                     groups: 1,
                     qkv_interleaved: false,
+                    vsa,
                 };
                 if crate::gpu::h3_chain(&job, h) {
                     return;
@@ -2149,7 +2473,7 @@ impl MiniMaxH3 {
         }
         for (i, blk) in blocks.iter().enumerate() {
             let mods = blk.adaln.as_ref().map(|a| a.eval(ts, pool));
-            self.block_forward(blk, h, n, mods.as_deref(), pos, rows);
+            self.block_forward(blk, h, n, mods.as_deref(), pos, rows, vsa);
             if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
                 eprint!("\r  block {}/{}", i + 1, blocks.len());
             }
@@ -2248,7 +2572,7 @@ impl MiniMaxH3 {
         embed(&v_rows, &mut h[vseg.start * hs..vseg.stop * hs]);
 
         // ── blocks ──
-        self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows);
+        self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows, None);
 
         // ── the output layer ──
         let n = vseg.stop - vseg.start;
@@ -2619,5 +2943,64 @@ mod tests {
         let t0 = l.pos[v.start][0];
         let t1 = l.pos[v.start + l.frame_rows][0];
         assert!((t1 - t0 - FRAME_RESCALE).abs() < 1e-12);
+    }
+
+    /// VSA's tiles cover every row once: the non-video streams in 64-row
+    /// chunks, the video in 4x4x4 blocks with smaller ones at the edges.
+    #[test]
+    fn vsa_tiles_cover_every_row_once() {
+        // 70 text rows (two chunks), 2 x 40 audio rows (two chunks), video
+        // 5 x 6 x 10 after the patch (tiles 2 x 2 x 3)
+        let l = Layout::t2va(70, 5, 12, 20, 40);
+        let p = VsaPlan::build(&l, [4, 4, 4], 0.9).unwrap();
+        assert_eq!(p.prefix_tiles, 2 + 2);
+        assert_eq!(p.tiles, 4 + 2 * 2 * 3);
+        assert_eq!(p.size.iter().map(|&s| s as usize).sum::<usize>(), l.seq_len);
+        assert_eq!((p.size[0], p.size[1], p.size[2], p.size[3]), (64, 6, 64, 16));
+        // a corner tile: t 4..5, h 4..6, w 8..10
+        assert_eq!(*p.size.last().unwrap(), 4); // 1 x 2 x 2
+        let mut seen = std::collections::HashSet::new();
+        for (r, &s) in p.slot.iter().enumerate() {
+            let t = s as usize / VSA_TILE;
+            assert!((s as usize % VSA_TILE) < p.size[t] as usize, "row {r} in a pad slot");
+            assert!(seen.insert(s), "slot {s} twice");
+        }
+        assert_eq!(p.topk, (0.1f64 * 12.0).ceil() as usize);
+    }
+
+    /// With every video tile kept and no gate, VSA is the full attention.
+    #[test]
+    fn vsa_without_sparsity_is_full_attention() {
+        let l = Layout::t2va(9, 3, 8, 12, 5);
+        let p = VsaPlan::build(&l, [4, 4, 4], 0.0).unwrap();
+        assert_eq!(p.topk, p.tiles - p.prefix_tiles);
+        let (heads, hd, n) = (2usize, 8usize, l.seq_len);
+        let inner = heads * hd;
+        let mut seed = 0x2545_F491u64;
+        let qkv: Vec<f32> = (0..n * 3 * inner)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 2001) as f32 / 1000.0 - 1.0
+            })
+            .collect();
+        let mut got = vec![0f32; n * inner];
+        vsa_attention_host(&p, &qkv, None, heads, hd, &mut got, None);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for h in 0..heads {
+            for r in 0..n {
+                let q = &qkv[r * 3 * inner + h * hd..][..hd];
+                let mut s: Vec<f32> = (0..n)
+                    .map(|k| q.iter().zip(&qkv[k * 3 * inner + inner + h * hd..][..hd]).map(|(a, b)| a * b).sum::<f32>() * scale)
+                    .collect();
+                softmax_f64(&mut s);
+                for d in 0..hd {
+                    let want: f32 = (0..n).map(|k| s[k] * qkv[k * 3 * inner + 2 * inner + h * hd + d]).sum();
+                    let g = got[r * inner + h * hd + d];
+                    assert!((g - want).abs() < 1e-5, "head {h} row {r} dim {d}: {g} vs {want}");
+                }
+            }
+        }
     }
 }

@@ -24,8 +24,9 @@ so they read like a person wrote them; it is trained to keep every number,
 unit, date, name and quotation. It is a fine-tune of Google's
 [Gemma 4 12B](https://huggingface.co/google/gemma-4-12B). This repo packages its
 text model as single [CMF](https://github.com/infosave2007/cmf) files for
-`cortiq`, a Rust inference engine with no Python and no ML framework: NVIDIA,
-AMD and Intel GPUs through Vulkan/DX12, Apple silicon through Metal, and the CPU.
+`cortiq`, a Rust inference engine with no Python and no ML framework: NVIDIA
+GPUs through CUDA or Vulkan, AMD and Intel GPUs through Vulkan/DX12, Apple silicon
+through Metal, and the CPU.
 
 From the authors: [model card and evaluation](https://huggingface.co/jialinyyzz/humanizer#evaluation-details) ·
 [desktop app for Mac and Windows](https://github.com/sgaofen/humanizer-local-model/releases/latest) ·
@@ -83,26 +84,30 @@ on Apple silicon and on the CPU both files ran on a 24 GB Mac mini.
 
 | hardware | backend | file | decode, tok/s | decode at 1k tokens | 1k-token prompt, tok/s | time to first token |
 |---|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell (24 GB) | Vulkan | `q4tp-ffn` | 41.6 | 36.3 | 137 | 6.9 s |
-| RTX PRO 4000 Blackwell (24 GB) | Vulkan | `q8_2f` | 31.7 | 28.3 | 90.2 | 10.8 s |
+| RTX PRO 4000 Blackwell (24 GB) | Vulkan | `q4tp-ffn` | 41.6 | 42.8 | 430 | 2.3 s |
+| RTX PRO 4000 Blackwell (24 GB) | Vulkan | `q8_2f` | 31.7 | 32.0 | 393 | 2.6 s |
 | Mac mini M4 (24 GB) | Metal | `q8_2f` | 6.6 | 6.0 | 68 | 14.7 s |
 | Mac mini M4 (24 GB) | Metal | `q4tp-ffn` | 8.5 | 8.3 | 72 | 14.0 s |
 | Mac mini M4 (24 GB) | CPU | `q8_2f` | 4.7 | | | |
 | Mac mini M4 (24 GB) | CPU | `q4tp-ffn` | 4.6 | | | |
 
+On an RTX A5000 (24 GB) with CUDA (cortiq 0.8.96, `cortiq bench`, `CMF_GPU=cuda` on a
+build with `--features cuda`) `q4tp-ffn` decodes 48.1–48.6 tok/s and reads a 4096-token
+prompt at 958 tok/s (first token 4.3 s); Vulkan on the same card gives 43.2 tok/s and
+654 tok/s.
+
 Reading the prompt also uses the CPU; the RTX host had about 10 cores. Whole
 rewrites through `cortiq serve`:
 
-| hardware | file | 957-token draft: first token | its full rewrite | rewrite speed | email, 362 tokens in |
-|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell | `q4tp-ffn` | 7.5 s | 901 tokens in 37.1 s | 30.1 tok/s | 10.6 s |
-| RTX PRO 4000 Blackwell | `q8_2f` | 11.2 s | 932 tokens in 48.9 s | 24.7 tok/s | 14.8 s |
+| hardware | file | 957-token draft: first token | its full rewrite | rewrite speed |
+|---|---|---:|---:|---:|
+| RTX PRO 4000 Blackwell | `q4tp-ffn` | 2.2 s | 901 tokens in 28.9 s | 31.2 tok/s |
+| RTX PRO 4000 Blackwell | `q8_2f` | 2.4 s | 932 tokens in 36.4 s | 25.6 tok/s |
 
 RTX rows use the authors' sampling (medians of three); Mac rows are greedy.
-`cortiq run` loads the weights onto the GPU at every start (about 13 s on the
-RTX PRO 4000), so for more than one draft keep `cortiq serve` running. On
-Apple silicon use `q8_2f`: the 4-bit file is no faster there and reads prompts
-more slowly.
+`cortiq run` loads the weights onto the GPU at every start (first token after
+about 4 s on the RTX PRO 4000), so for more than one draft keep `cortiq serve`
+running. On a 24 GB Mac the 4-bit file decodes faster (8.5 against 6.6 tok/s).
 
 ## Usage
 
@@ -292,8 +297,8 @@ is not affiliated with or endorsed by the humanizer authors or by Google.
 и цитату. Это дообученная модель Google
 [Gemma 4 12B](https://huggingface.co/google/gemma-4-12B). Здесь её текстовая
 модель упакована в отдельные файлы [CMF](https://github.com/infosave2007/cmf)
-для `cortiq` — движка на Rust без Python и ML-фреймворков: GPU NVIDIA, AMD и
-Intel через Vulkan/DX12, Apple silicon через Metal, а также CPU.
+для `cortiq` — движка на Rust без Python и ML-фреймворков: GPU NVIDIA через CUDA
+или Vulkan, AMD и Intel через Vulkan/DX12, Apple silicon через Metal, а также CPU.
 
 У авторов: [карточка модели и оценка](https://huggingface.co/jialinyyzz/humanizer#evaluation-details) ·
 [приложение для Mac и Windows](https://github.com/sgaofen/humanizer-local-model/releases/latest) ·
@@ -349,26 +354,29 @@ silicon и на CPU оба файла работали на Mac mini с 24 ГБ.
 
 | железо | бэкенд | файл | генерация, ток/с | генерация на 1k токенах | промпт 1k токенов, ток/с | время до первого токена |
 |---|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell (24 ГБ) | Vulkan | `q4tp-ffn` | 41.6 | 36.3 | 137 | 6.9 с |
-| RTX PRO 4000 Blackwell (24 ГБ) | Vulkan | `q8_2f` | 31.7 | 28.3 | 90.2 | 10.8 с |
+| RTX PRO 4000 Blackwell (24 ГБ) | Vulkan | `q4tp-ffn` | 41.6 | 42.8 | 430 | 2.3 с |
+| RTX PRO 4000 Blackwell (24 ГБ) | Vulkan | `q8_2f` | 31.7 | 32.0 | 393 | 2.6 с |
 | Mac mini M4 (24 ГБ) | Metal | `q8_2f` | 6.6 | 6.0 | 68 | 14.7 с |
 | Mac mini M4 (24 ГБ) | Metal | `q4tp-ffn` | 8.5 | 8.3 | 72 | 14.0 с |
 | Mac mini M4 (24 ГБ) | CPU | `q8_2f` | 4.7 | | | |
 | Mac mini M4 (24 ГБ) | CPU | `q4tp-ffn` | 4.6 | | | |
 
+На RTX A5000 (24 ГБ) с CUDA (cortiq 0.8.96, `cortiq bench`, `CMF_GPU=cuda` в сборке с
+`--features cuda`) `q4tp-ffn` генерирует 48.1–48.6 ток/с и читает промпт в 4096 токенов со
+скоростью 958 ток/с (первый токен через 4.3 с); Vulkan на той же карте — 43.2 и 654 ток/с.
+
 Чтение промпта нагружает и CPU; у машины с RTX было около 10 ядер. Переписывание
 целиком через `cortiq serve`:
 
-| железо | файл | черновик 957 токенов: первый токен | его полное переписывание | скорость переписывания | письмо, 362 токена на входе |
-|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell | `q4tp-ffn` | 7.5 с | 901 токен за 37.1 с | 30.1 ток/с | 10.6 с |
-| RTX PRO 4000 Blackwell | `q8_2f` | 11.2 с | 932 токена за 48.9 с | 24.7 ток/с | 14.8 с |
+| железо | файл | черновик 957 токенов: первый токен | его полное переписывание | скорость переписывания |
+|---|---|---:|---:|---:|
+| RTX PRO 4000 Blackwell | `q4tp-ffn` | 2.2 с | 901 токен за 28.9 с | 31.2 ток/с |
+| RTX PRO 4000 Blackwell | `q8_2f` | 2.4 с | 932 токена за 36.4 с | 25.6 ток/с |
 
 Строки RTX — с сэмплингом авторов (медианы трёх), строки Mac — жадные.
-`cortiq run` при каждом запуске загружает веса в GPU (около 13 с на RTX PRO
-4000), поэтому для нескольких черновиков держите запущенным `cortiq serve`. На
-Apple silicon берите `q8_2f`: 4-битный файл там не быстрее и медленнее читает
-промпт.
+`cortiq run` при каждом запуске загружает веса в GPU (первый токен примерно
+через 4 с на RTX PRO 4000), поэтому для нескольких черновиков держите запущенным
+`cortiq serve`. На Mac с 24 ГБ 4-битный файл генерирует быстрее (8.5 против 6.6 ток/с).
 
 ### Использование
 
@@ -468,7 +476,7 @@ CMF, без зрительной и звуковой частей. Цифры к
 
 jialinyyzz 的 [humanizer](https://huggingface.co/jialinyyzz/humanizer) 用于改写
 AI 写的草稿（邮件、文章、报告、论坛帖子；英文和中文），让它读起来像人写的；模型经过训练，会保留每个数字、单位、日期、名称和引文。它基于 Google 的
-[Gemma 4 12B](https://huggingface.co/google/gemma-4-12B) 微调。本仓库把其中的文本模型打包为独立的 [CMF](https://github.com/infosave2007/cmf) 文件，由 `cortiq` 运行——一个不依赖 Python 和机器学习框架的 Rust 推理引擎：NVIDIA、AMD、Intel 显卡走 Vulkan/DX12，
+[Gemma 4 12B](https://huggingface.co/google/gemma-4-12B) 微调。本仓库把其中的文本模型打包为独立的 [CMF](https://github.com/infosave2007/cmf) 文件，由 `cortiq` 运行——一个不依赖 Python 和机器学习框架的 Rust 推理引擎：NVIDIA 显卡走 CUDA 或 Vulkan，AMD、Intel 显卡走 Vulkan/DX12，
 Apple silicon 走 Metal，也可在 CPU 上运行。
 
 原作者提供：[模型卡与评测](https://huggingface.co/jialinyyzz/humanizer#evaluation-details) ·
@@ -511,22 +519,24 @@ Mac mini 上运行。
 
 | 硬件 | 后端 | 文件 | 解码 tok/s | 1k token 处解码 | 1k token 提示词 tok/s | 首 token 时间 |
 |---|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell（24 GB） | Vulkan | `q4tp-ffn` | 41.6 | 36.3 | 137 | 6.9 s |
-| RTX PRO 4000 Blackwell（24 GB） | Vulkan | `q8_2f` | 31.7 | 28.3 | 90.2 | 10.8 s |
+| RTX PRO 4000 Blackwell（24 GB） | Vulkan | `q4tp-ffn` | 41.6 | 42.8 | 430 | 2.3 s |
+| RTX PRO 4000 Blackwell（24 GB） | Vulkan | `q8_2f` | 31.7 | 32.0 | 393 | 2.6 s |
 | Mac mini M4（24 GB） | Metal | `q8_2f` | 6.6 | 6.0 | 68 | 14.7 s |
 | Mac mini M4（24 GB） | Metal | `q4tp-ffn` | 8.5 | 8.3 | 72 | 14.0 s |
 | Mac mini M4（24 GB） | CPU | `q8_2f` | 4.7 | | | |
 | Mac mini M4（24 GB） | CPU | `q4tp-ffn` | 4.6 | | | |
 
+RTX A5000（24 GB）上使用 CUDA（cortiq 0.8.96，`cortiq bench`，`--features cuda` 构建并设置 `CMF_GPU=cuda`）：`q4tp-ffn` 解码 48.1–48.6 tok/s，4096 token 的提示读取速度 958 tok/s（首 token 4.3 s）；同一张卡上的 Vulkan 为 43.2 tok/s 和 654 tok/s。
+
 读取提示词也会用到 CPU；RTX 测试机约有 10 个核心。通过 `cortiq serve` 完整改写：
 
-| 硬件 | 文件 | 957 token 草稿：首 token | 完整改写 | 改写速度 | 邮件，输入 362 token |
-|---|---|---:|---:|---:|---:|
-| RTX PRO 4000 Blackwell | `q4tp-ffn` | 7.5 s | 901 token，37.1 s | 30.1 tok/s | 10.6 s |
-| RTX PRO 4000 Blackwell | `q8_2f` | 11.2 s | 932 token，48.9 s | 24.7 tok/s | 14.8 s |
+| 硬件 | 文件 | 957 token 草稿：首 token | 完整改写 | 改写速度 |
+|---|---|---:|---:|---:|
+| RTX PRO 4000 Blackwell | `q4tp-ffn` | 2.2 s | 901 token，28.9 s | 31.2 tok/s |
+| RTX PRO 4000 Blackwell | `q8_2f` | 2.4 s | 932 token，36.4 s | 25.6 tok/s |
 
-RTX 各行使用作者的采样设置（三次中位数），Mac 各行为贪心解码。`cortiq run` 每次启动都要把权重载入 GPU（RTX PRO 4000 上约 13 s），处理多篇草稿时请保持 `cortiq serve` 运行。
-Apple silicon 上请用 `q8_2f`：4 位文件在那里并不更快，读取提示词还更慢。
+RTX 各行使用作者的采样设置（三次中位数），Mac 各行为贪心解码。`cortiq run` 每次启动都要把权重载入 GPU（RTX PRO 4000 上约 4 s 出首 token），处理多篇草稿时请保持 `cortiq serve` 运行。
+在 24 GB 的 Mac 上，4 位文件生成更快（8.5 对 6.6 tok/s）。
 
 ### 使用
 

@@ -589,7 +589,12 @@ fn generate_inner(
         let text = dit.refine_text(&states, ids.len());
         let mut v = gauss(dit.latents_dim * latent_t * lat_h * lat_w, p.seed);
         let mut a = gauss(dit.audio_dim * 2 * audio_t, p.seed ^ 0x9E37_79B9_7F4A_7C15);
-        let sg = sigmas(p.steps, dit.shift_video);
+        // A few-step student carries the schedule it was distilled on
+        // (FastH3: 999, 749, 500, 250 on the 1000-step grid); a step count
+        // of its own keeps the `simple` grid.
+        let sg = dit
+            .student_sigmas(p.steps)
+            .unwrap_or_else(|| sigmas(p.steps, dit.shift_video));
         let mut return_streaming: Option<(Vec<f32>, Vec<f32>)> = None;
         // `CMF_ANIM_PROF=1`: the per-step rms of both streams and of
         // their velocities. A run that is not denoising shows it here
