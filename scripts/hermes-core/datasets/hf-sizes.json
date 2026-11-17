@@ -1,0 +1,258 @@
+{
+ "nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 96968,
+  "bytes": 1586300231,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 396575058
+ },
+ "m-a-p/SuperGPQA": {
+  "license": "odc-by",
+  "gated": false,
+  "error": null,
+  "rows": 26529,
+  "bytes": 19989550,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 4997388
+ },
+ "nvidia/Nemotron-RL-instruction_following": {
+  "license": "odc-by",
+  "gated": false,
+  "error": null,
+  "rows": 0,
+  "bytes": 77885624,
+  "bytes_source": "files",
+  "tokens_est": 19471406
+ },
+ "MadeAgents/xlam-irrelevance-7.5k": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 7500,
+  "bytes": 6869958,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 1717490
+ },
+ "nvidia/When2Call": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 27952,
+  "bytes": 56197576,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 14049394
+ },
+ "nvidia/Nemotron-RL-Agentic-Function-Calling-Pivot-v1": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 9620,
+  "bytes": 277042435,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 69260609
+ },
+ "nvidia/Nemotron-RL-knowledge-mcqa": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 685573,
+  "bytes": 1269332654,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 317333164
+ },
+ "nvidia/Nemotron-RL-Instruction-Following-Calendar-v2": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 9915,
+  "bytes": 125052222,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 31263056
+ },
+ "nvidia/Nemotron-RL-instruction_following-structured_outputs": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 9949,
+  "bytes": 87410957,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 21852739
+ },
+ "inclusionAI/AReaL-tau2-data": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 0,
+  "bytes": 970093313,
+  "bytes_source": "files",
+  "tokens_est": 242523328
+ },
+ "LARK-Lab/EnvFactory-SFT-FILTERED": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 26463,
+  "bytes": 913244544,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 228311136
+ },
+ "Salesforce/xlam-function-calling-60k": {
+  "license": "cc-by-4.0",
+  "gated": "auto",
+  "error": null,
+  "rows": null,
+  "bytes": 97680202,
+  "bytes_source": "files",
+  "tokens_est": 24420050
+ },
+ "glaiveai/glaive-function-calling-v2": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 112960,
+  "bytes": 254485835,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 63621459
+ },
+ "Team-ACE/ToolACE": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 11300,
+  "bytes": 33146350,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 8286588
+ },
+ "nvidia/Nemotron-SFT-Agentic-v2": {
+  "license": [
+   "cc-by-4.0",
+   "apache-2.0",
+   "mit"
+  ],
+  "gated": false,
+  "error": null,
+  "rows": 0,
+  "bytes": 21860711626,
+  "bytes_source": "files",
+  "tokens_est": 5465177906
+ },
+ "BAAI/Infinity-Instruct": {
+  "license": "cc-by-sa-4.0",
+  "gated": "auto",
+  "error": null,
+  "rows": null,
+  "bytes": 21137679120,
+  "bytes_source": "files",
+  "tokens_est": 5284419780
+ },
+ "tuandunghcmut/toolbench-v1": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 189404,
+  "bytes": 1877786283,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 469446571
+ },
+ "Nanbeige/ToolMind": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 368611,
+  "bytes": 3896750954,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 974187738
+ },
+ "Agent-Ark/Toucan-1.5M": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 1646546,
+  "bytes": 63959182907,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 15989795727
+ },
+ "HuggingFaceH4/ultrachat_200k": {
+  "license": "mit",
+  "gated": false,
+  "error": null,
+  "rows": 515311,
+  "bytes": 3007301125,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 751825281
+ },
+ "HuggingFaceTB/smoltalk2": {
+  "license": null,
+  "gated": false,
+  "error": null,
+  "rows": 8610022,
+  "bytes": 208713342568,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 52178335642
+ },
+ "openbmb/UltraData-SFT-2605": {
+  "license": "apache-2.0",
+  "gated": "auto",
+  "error": null,
+  "rows": null,
+  "bytes": 97594056305,
+  "bytes_source": "files",
+  "tokens_est": 24398514076
+ },
+ "allenai/IF_multi_constraints_upto5": {
+  "license": "odc-by",
+  "gated": false,
+  "error": null,
+  "rows": 95373,
+  "bytes": 170439276,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 42609819
+ },
+ "BytedTsinghua-SIA/DAPO-Math-17k": {
+  "license": "apache-2.0",
+  "gated": false,
+  "error": null,
+  "rows": 1791700,
+  "bytes": 1113238400,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 278309600
+ },
+ "Skywork/Skywork-OR1-RL-Data": {
+  "license": null,
+  "gated": false,
+  "error": null,
+  "rows": 119112,
+  "bytes": 2032770150,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 508192538
+ },
+ "nvidia/Nemotron-3-Nano-RL-Training-Blend": {
+  "license": "odc-by",
+  "gated": false,
+  "error": null,
+  "rows": 0,
+  "bytes": 6924519899,
+  "bytes_source": "files",
+  "tokens_est": 1731129975
+ },
+ "nvidia/Nemotron-RL-coding-competitive_coding": {
+  "license": "cc-by-sa-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 16083,
+  "bytes": 5938612813,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 1484653203
+ },
+ "nvidia/Nemotron-RL-agent-workplace_assistant": {
+  "license": "cc-by-4.0",
+  "gated": false,
+  "error": null,
+  "rows": 1800,
+  "bytes": 22653652,
+  "bytes_source": "parquet in memory",
+  "tokens_est": 5663413
+ }
+}

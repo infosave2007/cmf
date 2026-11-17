@@ -54,6 +54,27 @@ enum Sub {
         #[arg(long, default_value_t = 400 << 20)]
         sample_mb_bytes: usize,
     },
+    /// lm-eval `loglikelihood` requests scored on the GPU by the trainer's
+    /// evaluation forward: the numbers of `cortiq loglik --split hflm --frame
+    /// raw` (same tokenizer and pair encoding, backbone only) at GPU speed
+    Loglik {
+        /// trainer checkpoint (the weights)
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// a .cmf with the same vocabulary (its tokenizer)
+        #[arg(long)]
+        vocab: PathBuf,
+        #[arg(long)]
+        requests_jsonl: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// requests per forward
+        #[arg(long, default_value_t = 64)]
+        rows: usize,
+        /// `hflm` | `separate`, as `cortiq loglik --split`
+        #[arg(long, default_value = "hflm")]
+        split: String,
+    },
     /// Encode corpus files (jsonl.gz / txt / parquet with --features data) into a u16 shard.
     Shard {
         #[arg(long)]
@@ -64,6 +85,10 @@ enum Sub {
         out: PathBuf,
         #[arg(long, default_value_t = usize::MAX)]
         max_tokens: usize,
+        /// the documents are rendered chat transcripts: special tokens
+        /// written out in the text become their ids
+        #[arg(long)]
+        specials: bool,
     },
     /// Download corpus files (curl, resumable) into a directory.
     Fetch {
@@ -235,6 +260,41 @@ enum Sub {
         tau: f32,
         #[arg(long, default_value_t = 30)]
         eval_every: usize,
+        /// v2: mask logit at step zero (4.0 = the near-identity start of the
+        /// DTG-MA notebooks)
+        #[arg(long, default_value_t = cortiq_embryo::model::SKILL_INIT_LOGIT)]
+        mask_init: f32,
+        /// v2, Patent 2 Soft-Fold: every neuron keeps its learned gain σ(m),
+        /// folded into down_proj (evaluated and polished as such), instead of
+        /// the hard mask 1[σ(m) > τ]
+        #[arg(long)]
+        soft_fold: bool,
+        /// v2: phase B trains only this many of the LAST selected layers
+        /// (0 = every selected layer)
+        #[arg(long, default_value_t = 0)]
+        fcd_layers: usize,
+        /// v2: phase B evaluates every this many steps (0 = --eval-every)
+        #[arg(long, default_value_t = 0)]
+        eval_every_b: usize,
+        /// v2: the mask also covers every routed expert of the selected
+        /// layers, each neuron of each expert with its own gain (with
+        /// --soft-fold; folded into the experts' down_proj)
+        #[arg(long)]
+        mask_experts: bool,
+        /// v2: phase A draws each batch from the records of one length class
+        /// and runs it at that width (--bucket-widths, then the shards' own):
+        /// the padding of short records is not computed. Every width is a
+        /// whole instance in memory: three of them next to a 16 x 512 batch
+        /// of a 56M genome do not fit a 24 GB Mac
+        #[arg(long)]
+        length_buckets: bool,
+        /// v2: the narrower widths of --length-buckets (multiples of 64;
+        /// default 192,256,384)
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
+        bucket_widths: Vec<usize>,
+        /// v2: final-split evaluation size, as --dev-batches (0 = every record)
+        #[arg(long, default_value_t = 0)]
+        final_batches: usize,
         #[arg(long, default_value_t = 4)]
         batch: usize,
         /// legacy window length (default 512); v2 uses the SFT shards' length
@@ -994,6 +1054,23 @@ enum Sub {
         /// student already fills the card
         #[arg(long, default_value_t = 0)]
         distill_batch: usize,
+        /// logit distillation into the hierarchical head: a teacher checkpoint
+        /// with the same vocabulary and head clusters, any width; the loss
+        /// becomes (1−w)·CE + w·CE(p_teacher) over the clusters and within the
+        /// target's cluster (the logged loss stays the CE)
+        #[arg(long)]
+        kd_from: Option<PathBuf>,
+        /// w of --kd-from
+        #[arg(long, default_value_t = 0.5)]
+        kd_w: f32,
+        /// teacher micro-batch for --kd-from (0 = --batch)
+        #[arg(long, default_value_t = 0)]
+        kd_batch: usize,
+        /// with --kd-from: the first positions of every window train on the
+        /// plain CE (the teacher reads each window alone, without the
+        /// student's carried state)
+        #[arg(long, default_value_t = 64)]
+        kd_skip: usize,
         /// hold the donated tensors still for the first N steps
         #[arg(long, default_value_t = 0)]
         freeze_donor: usize,
@@ -1074,13 +1151,34 @@ fn main() {
         } => {
             cortiq_embryo::corpus::train_tokenizer(&inputs, &out, vocab, sample_mb_bytes);
         }
+        Sub::Loglik {
+            ckpt,
+            vocab,
+            requests_jsonl,
+            out,
+            rows,
+            split,
+        } => {
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
+            cortiq_embryo::loglik::run(&ckpt, &vocab, &requests_jsonl, &out, rows, &split).unwrap_or_else(|e| {
+                eprintln!("loglik: {e:#}");
+                std::process::exit(1)
+            });
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
+            {
+                let _ = (ckpt, vocab, requests_jsonl, out, rows, split);
+                eprintln!("loglik needs a GPU build (macOS, or --features vulkan / cuda)");
+                std::process::exit(1);
+            }
+        }
         Sub::Shard {
             tokenizer,
             inputs,
             out,
             max_tokens,
+            specials,
         } => {
-            cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+            cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens, specials);
         }
         Sub::GrowTrunk {
             ckpt,
@@ -1246,6 +1344,14 @@ fn main() {
             l1,
             tau,
             eval_every,
+            mask_init,
+            soft_fold,
+            fcd_layers,
+            eval_every_b,
+            mask_experts,
+            length_buckets,
+            bucket_widths,
+            final_batches,
             batch,
             seq,
             phi_layer,
@@ -1338,6 +1444,14 @@ fn main() {
                         l1,
                         tau,
                         eval_every,
+                        mask_init,
+                        soft_fold,
+                        fcd_layers,
+                        eval_every_b,
+                        mask_experts,
+                        length_buckets,
+                        bucket_widths,
+                        final_batches,
                         batch,
                         dev_batches,
                         lm_frac,
@@ -2622,6 +2736,10 @@ fn main() {
             distill_from,
             distill_w,
             distill_batch,
+            kd_from,
+            kd_w,
+            kd_batch,
+            kd_skip,
             freeze_donor,
             train_only,
             seed,
@@ -2678,6 +2796,10 @@ fn main() {
                 distill_from,
                 distill_w,
                 distill_batch,
+                kd_from,
+                kd_w,
+                kd_batch,
+                kd_skip,
                 freeze_donor,
                 train_only,
                 seed,
@@ -2735,6 +2857,10 @@ fn main() {
                     distill_from,
                     distill_w,
                     distill_batch,
+                    kd_from,
+                    kd_w,
+                    kd_batch,
+                    kd_skip,
                     freeze_donor,
                     train_only,
                     carry,

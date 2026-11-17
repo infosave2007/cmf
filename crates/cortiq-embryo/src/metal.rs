@@ -130,6 +130,16 @@ unsafe impl Sync for Ctx {}
 
 static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
 
+/// The Metal kernels compute full f32 already: the guard of the CUDA layer's
+/// `Ctx::exact_f32` (cuBLAS off TF32) is empty here.
+pub struct ExactF32<'a>(std::marker::PhantomData<&'a Ctx>);
+
+impl Ctx {
+    pub fn exact_f32(&self) -> ExactF32<'_> {
+        ExactF32(std::marker::PhantomData)
+    }
+}
+
 /// The process-wide context; `None` (with the reason logged once) when
 /// there is no usable Metal device.
 pub fn ctx() -> Option<&'static Ctx> {
@@ -3683,10 +3693,26 @@ impl<'a> Cmd<'a> {
         hard: bool,
         tau: f32,
     ) {
-        assert!(hh.len >= rows * n && m.len >= m_off + n);
+        self.mask_fwd_at(hh, 0, m, m_off, rows, n, hard, tau)
+    }
+    /// [`Self::mask_fwd`] on the `rows × n` block that starts at element
+    /// `hh_off` of `hh` (one expert's slots of a routed-experts buffer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_fwd_at(
+        &self,
+        hh: &GBuf,
+        hh_off: usize,
+        m: &GBuf,
+        m_off: usize,
+        rows: usize,
+        n: usize,
+        hard: bool,
+        tau: f32,
+    ) {
+        assert!(hh.len >= hh_off + rows * n && m.len >= m_off + n);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.mask_fwd);
-        e.set_buffer(0, Some(&hh.buf), 0);
+        e.set_buffer(0, Some(&hh.buf), (hh_off * 4) as u64);
         e.set_buffer(1, Some(&m.buf), (m_off * 4) as u64);
         self.mask_args(2, rows, n, hard, tau, 0.0);
         self.grid1(rows * n, 256);
@@ -3706,22 +3732,41 @@ impl<'a> Cmd<'a> {
         tau: f32,
         l1: f32,
     ) {
+        self.mask_bwd_at(dhhm, hh_pre, 0, m, m_off, dm, rows, n, hard, tau, l1)
+    }
+    /// [`Self::mask_bwd`] on the `rows × n` block that starts at element
+    /// `off` of both `dhhm` and `hh_pre`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_bwd_at(
+        &self,
+        dhhm: &GBuf,
+        hh_pre: &GBuf,
+        off: usize,
+        m: &GBuf,
+        m_off: usize,
+        dm: &GBuf,
+        rows: usize,
+        n: usize,
+        hard: bool,
+        tau: f32,
+        l1: f32,
+    ) {
         assert!(
-            dhhm.len >= rows * n
-                && hh_pre.len >= rows * n
+            dhhm.len >= off + rows * n
+                && hh_pre.len >= off + rows * n
                 && m.len >= m_off + n
                 && dm.len >= m_off + n
         );
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.mask_bwd_dm);
-        e.set_buffer(0, Some(&dhhm.buf), 0);
-        e.set_buffer(1, Some(&hh_pre.buf), 0);
+        e.set_buffer(0, Some(&dhhm.buf), (off * 4) as u64);
+        e.set_buffer(1, Some(&hh_pre.buf), (off * 4) as u64);
         e.set_buffer(2, Some(&m.buf), (m_off * 4) as u64);
         e.set_buffer(3, Some(&dm.buf), (m_off * 4) as u64);
         self.mask_args(4, rows, n, hard, tau, l1);
         self.grid1(n, 128);
         e.set_compute_pipeline_state(&self.c.mask_bwd_dh);
-        e.set_buffer(0, Some(&dhhm.buf), 0);
+        e.set_buffer(0, Some(&dhhm.buf), (off * 4) as u64);
         e.set_buffer(1, Some(&m.buf), (m_off * 4) as u64);
         self.mask_args(2, rows, n, hard, tau, 0.0);
         self.grid1(rows * n, 256);

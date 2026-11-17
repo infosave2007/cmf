@@ -271,9 +271,73 @@ pub fn translate(wgsl: &str) -> String {
     format!("{PRELUDE}\n{s}")
 }
 
+/// `src` (a `translate` output) with one copy of the `emb_main` kernel per
+/// operation code, `emb_main_op<N>`, in which `op` is the constant `N`: the
+/// compiler drops the other eighty branches of the switch, and an
+/// element-wise operation stops paying for them on every element. The
+/// arithmetic of a branch is the same text as in `emb_main`. Returns the
+/// source and the operation codes that have a copy.
+pub fn specialize_main(src: &str) -> (String, Vec<u32>) {
+    const HEAD: &str = "emb_main(EWD) {";
+    const OP: &str = "const auto op=U(0u);";
+    let Some(at) = src.find(HEAD) else { return (src.to_string(), Vec::new()) };
+    let start = src[..at].rfind("extern \"C\"").expect("the entry point's linkage");
+    let open = at + HEAD.len() - 1;
+    let mut depth = 0i32;
+    let mut end = open;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &src[start..end];
+    if !body.contains(OP) {
+        return (src.to_string(), Vec::new());
+    }
+    let mut ops: Vec<u32> = re(r"\bop==(\d+)u")
+        .captures_iter(body)
+        .filter_map(|c| c.ok().and_then(|c| c[1].parse().ok()))
+        .filter(|&o| o != 0)
+        .collect();
+    ops.sort_unstable();
+    ops.dedup();
+    let mut out = src.to_string();
+    for op in &ops {
+        out.push('\n');
+        out.push_str(&body.replacen("emb_main(EWD)", &format!("emb_main_op{op}(EWD)"), 1).replacen(OP, &format!("const u32 op={op}u;"), 1));
+    }
+    (out, ops)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_gets_a_copy_per_operation() {
+        let w = "@group(0) @binding(0) var<storage,read_write> a: array<u32>;\n\
+                 fn U(x:u32)->u32{return par[x];}\n\
+                 @compute @workgroup_size(256)\n\
+                 fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+                  let z=id.x; let op=U(0u); if(op==0u){return;}\n\
+                  if(op==2u){ a[z]=1u; } if(op==7u){ if(z<4u){ a[z]=2u; } }\n\
+                 }\n\
+                 fn tail(x:u32)->u32 { return x; }\n";
+        let (c, ops) = specialize_main(&translate(w));
+        assert_eq!(ops, vec![2, 7]);
+        assert!(c.contains("emb_main_op2(EWD) {") && c.contains("emb_main_op7(EWD) {"), "{c}");
+        assert!(c.contains("const u32 op=7u; if(op==0u){return;}"), "{c}");
+        assert_eq!(c.matches("const auto op=U(0u);").count(), 1, "{c}");
+        assert!(c.trim_end().ends_with('}'), "{c}");
+    }
 
     #[test]
     fn selects_nest_and_keep_commas() {

@@ -373,6 +373,14 @@ fn args(id: &str) -> BakeV2Args {
         l1: 2e-3,
         tau: 0.5,
         eval_every: 3,
+        mask_init: cortiq_embryo::skill::SKILL_INIT_LOGIT,
+        soft_fold: false,
+        fcd_layers: 0,
+        eval_every_b: 0,
+        mask_experts: false,
+        length_buckets: false,
+        bucket_widths: vec![],
+        final_batches: 0,
         batch: 4,
         dev_batches: 0,
         lm_frac: 0.5,
@@ -881,6 +889,7 @@ fn bake_v2_appends_a_bound_routed_record_and_leaves_the_genome_untouched() {
                 text,
                 q_ids: q,
                 phi,
+                route_gap: f64::INFINITY,
             }],
             1e-5,
         )
@@ -892,6 +901,19 @@ fn bake_v2_appends_a_bound_routed_record_and_leaves_the_genome_untouched() {
     off[0] += 1e-2 * off.iter().map(|x| x * x).sum::<f32>().sqrt();
     let e = case(&q, &off).expect_err("a drifted φ must refuse");
     assert!(e.contains("unit φ"), "{e}");
+    // a drift excused only by a routing tie the trainer measured: 1e-4 is over the
+    // tolerance, small enough to keep the decision
+    let mut tie = phis[0].clone();
+    tie[0] += 1e-4 * tie.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let e = case(&q, &tie).expect_err("over the tolerance without a tie must refuse");
+    assert!(e.contains("unit φ"), "{e}");
+    let tied = runtime_route_check(
+        &out,
+        &[PhiCase { text, q_ids: &q, phi: &tie, route_gap: 1e-7 }],
+        1e-5,
+    )
+    .expect("the same drift at a measured routing tie passes");
+    assert_eq!(tied["route_ties"].as_array().map(|a| a.len()), Some(1), "{tied}");
     let e = case(&q[..q.len() - 1], &phis[0]).expect_err("another encoding must refuse");
     assert!(e.contains("encodes"), "{e}");
     drop((m0, m1));

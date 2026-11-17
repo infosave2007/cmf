@@ -33,6 +33,7 @@ mod primalvaepack;
 mod vaecmd;
 mod knowledge;
 mod lookup;
+mod loglik;
 mod ltxcmd;
 mod ltxpack;
 mod mimo_towers;
@@ -2536,6 +2537,39 @@ enum Commands {
         include_quarantine: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// lm-eval `loglikelihood` on the engine: log P(continuation | context)
+    /// and is_greedy for every {"context", "continuation"} JSONL request,
+    /// on the BACKBONE pipeline (no lane, router or lookup; CMF_GROWTH=off
+    /// keeps growth records out). Tokens split as lm-eval HFLM does;
+    /// consecutive equal contexts are forwarded once and their
+    /// continuations walked as a token trie with KV rollback. Output: one
+    /// JSONL line per request {"i","logprob","is_greedy","n_ctx","n_cont"}
+    /// plus the request's other fields.
+    Loglik {
+        /// .cmf file
+        model: String,
+        /// JSONL: {"context": str, "continuation": str, …} per line
+        #[arg(long)]
+        requests_jsonl: String,
+        /// Output JSONL (default: stdout)
+        #[arg(long)]
+        out: Option<String>,
+        /// hflm (lm-eval HFLM._encode_pair) | separate
+        #[arg(long, default_value = "hflm")]
+        split: String,
+        /// raw (plain text, lm-eval without a chat template) | chat
+        /// (context as a cmf-im-v1 user turn, continuation as the answer)
+        #[arg(long, default_value = "raw")]
+        frame: String,
+        /// shared (one context forward per group, the continuations walked
+        /// as a token trie with KV rollback) | full (nll_ids_from per
+        /// request: the slow cross-check, no is_greedy)
+        #[arg(long, default_value = "shared")]
+        scorer: String,
+        /// Prepend the tokenizer's BOS when it declares one
+        #[arg(long)]
+        bos: bool,
     },
     /// Router-v2 gate G3: the per-request decision on every prompt of a
     /// JSONL set against the expected target; accept / recall rate, the
@@ -5762,6 +5796,23 @@ async fn main() -> anyhow::Result<()> {
             route: route.as_deref(),
             include_quarantine,
             json,
+        }),
+        Commands::Loglik {
+            model,
+            requests_jsonl,
+            out,
+            split,
+            frame,
+            scorer,
+            bos,
+        } => loglik::cmd_loglik(loglik::LoglikArgs {
+            model: &model,
+            requests_jsonl: &requests_jsonl,
+            out: out.as_deref(),
+            split: &split,
+            frame: &frame,
+            scorer: &scorer,
+            bos,
         }),
         Commands::RouteEval {
             model,

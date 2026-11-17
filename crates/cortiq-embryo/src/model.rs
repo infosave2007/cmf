@@ -1295,6 +1295,49 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
 /// the exporter and the growth records read them on every platform, so they
 /// live outside the Metal-only module that consumes them.
 pub const MOE_K: usize = 16;
+
+/// The hierarchical head's row grouping of a batch of targets: the target
+/// cluster of every row (`u32::MAX` = no target), the grouped rows (token
+/// row, −1 = padding; clusters ascending, rows ascending within a cluster)
+/// and the groups (cluster, offset, rows with padding). Metal pads every
+/// group to 64 rows for its SIMD GEMM tiles; the Vulkan / CUDA scalar path
+/// keeps only valid rows (the pads multiplied sparse head work by up to 64×).
+pub fn head_grouping(targets: &[u32], ncl: usize, cs: usize) -> (Vec<u32>, Vec<i32>, Vec<(usize, usize, usize)>) {
+    let mut tc = vec![0u32; targets.len()];
+    let mut buckets: Vec<Vec<i32>> = vec![Vec::new(); ncl];
+    for (i, &t) in targets.iter().enumerate() {
+        if t == u32::MAX {
+            tc[i] = u32::MAX; // ignored position (no target)
+            continue;
+        }
+        let c = (t as usize / cs).min(ncl - 1);
+        tc[i] = c as u32;
+        buckets[c].push(i as i32);
+    }
+    let mut idx: Vec<i32> = Vec::new();
+    let mut groups = Vec::new();
+    for (c, bk) in buckets.iter().enumerate() {
+        if bk.is_empty() {
+            continue;
+        }
+        let off = idx.len();
+        idx.extend_from_slice(bk);
+        let pad = if cfg!(all(feature = "vulkan", not(target_os = "macos"))) {
+            bk.len()
+        } else {
+            bk.len().div_ceil(64) * 64
+        };
+        idx.resize(off + pad, -1);
+        groups.push((c, off, pad));
+    }
+    (tc, idx, groups)
+}
+
+/// Initial logit of every skill-mask neuron: σ(3) ≈ 0.953. The all-on hard
+/// mask (neuron kept iff σ(m) > τ) is the exact genome only for 0 < τ < σ(3).
+/// Here, outside the GPU-only `skill` module, because the CLI's argument
+/// defaults are built on every platform.
+pub const SKILL_INIT_LOGIT: f32 = 3.0;
 /// EMA rate of the descriptor means and the balancing-bias step
 pub const MOE_ALPHA: f32 = 0.02;
 pub const MOE_ETA: f32 = 0.05;
@@ -1310,6 +1353,19 @@ mod gpu {
         HkGrads, HkScratch, HkWork, Op, RouteDims,
     };
     use crate::ops::hk_decay_grid;
+
+    /// Logit-distillation buffers of a student instance ([`EmbryoGpu::enable_kd`]):
+    /// the teacher's head gradients in this instance's layout (`c`: [M, C] rows,
+    /// `w`: [Mpad, S] grouped rows), the index maps of one teacher micro-batch,
+    /// α, and whether the next training head adds them.
+    pub struct KdBufs {
+        pub c: GBuf,
+        pub w: GBuf,
+        idx_c: GBuf,
+        idx_w: GBuf,
+        pub alpha: f32,
+        pub armed: std::cell::Cell<bool>,
+    }
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
     pub enum LayerActs {
@@ -1632,6 +1688,8 @@ mod gpu {
         pub lc: GBuf,    // [M, C] cluster logits
         pub loss2: GBuf, // [M]
         pub mpad: usize,
+        /// logit distillation into the hierarchical head ([`EmbryoGpu::enable_kd`])
+        pub kd: Option<KdBufs>,
         /// routed experts: per-layer activations, descriptors, capacity
         pub moe: Vec<MoeActs>,
         pub desc: Desc,
@@ -2234,6 +2292,7 @@ mod gpu {
                 lc: z(m * ncl.max(1)),
                 loss2: z(m),
                 mpad,
+                kd: None,
                 moe,
                 desc,
                 moe_cap,
@@ -2383,7 +2442,7 @@ mod gpu {
             cmd.swiglu_fwd(gte, up, hh, m * i);
             if let Some(sk) = self.skill.as_ref() {
                 if let Some(mi) = sk.slot(l) {
-                    cmd.mask_fwd(hh, &sk.logits, mi * i, m, i, sk.hard.get(), sk.tau);
+                    cmd.mask_fwd(hh, &sk.logits, sk.off(mi, 0), m, i, sk.hard.get(), sk.tau);
                 }
             }
             // x_out = x_mid + hh·Wdᵀ  ([M,I]·[H,I]ᵀ)
@@ -2611,6 +2670,23 @@ mod gpu {
                 }
             }
             cmd.swiglu_fwd(&mo.gte, &mo.up, &mo.hh, ne * cap * i);
+            if let Some(sk) = self.skill.as_ref() {
+                if let (Some(mi), true) = (sk.slot(l), sk.groups > 1) {
+                    // every routed expert's neurons under their own mask
+                    for e in 0..ne {
+                        cmd.mask_fwd_at(
+                            &mo.hh,
+                            e * cap * i,
+                            &sk.logits,
+                            sk.off(mi, 1 + e),
+                            cap,
+                            i,
+                            sk.hard.get(),
+                            sk.tau,
+                        );
+                    }
+                }
+            }
             for e in 0..ne {
                 let ind_h = GemmDyn {
                     indirect: Some((&d.indir, (ind_off + (ne + e) * 3) * 4)),
@@ -2749,7 +2825,7 @@ mod gpu {
                         &s.dffn,
                         &s.hh_pre,
                         &sk.logits,
-                        mi * i,
+                        sk.off(mi, 0),
                         &sk.g,
                         m,
                         i,
@@ -2859,6 +2935,16 @@ mod gpu {
                 }
                 let ind_off = l * 2 * ne * 3;
                 let d = &self.desc;
+                let expert_mask = self
+                    .skill
+                    .as_ref()
+                    .and_then(|sk| sk.slot(l).filter(|_| sk.groups > 1));
+                if expert_mask.is_some() {
+                    // the GEMMs below fill only an expert's used slots; the
+                    // mask-logit reduction runs over all of them, so the
+                    // rest must not carry another layer's gradients
+                    cmd.axpby(0.0, &s.moe_dffn, 0.0, &s.moe_dffn, ne * cap * i);
+                }
                 for e in 0..ne {
                     let ind_i = GemmDyn {
                         indirect: Some((&d.indir, (ind_off + e * 3) * 4)),
@@ -2913,6 +2999,26 @@ mod gpu {
                         false,
                         &kdyn,
                     );
+                }
+                if let (Some(mi), Some(sk)) = (expert_mask, self.skill.as_ref()) {
+                    // pre-mask activations recomputed; dm from the gradient
+                    // at the masked activations, which then passes the mask
+                    cmd.swiglu_fwd(&mo.gte, &mo.up, &sk.expert_pre, ne * cap * i);
+                    for e in 0..ne {
+                        cmd.mask_bwd_at(
+                            &s.moe_dffn,
+                            &sk.expert_pre,
+                            e * cap * i,
+                            &sk.logits,
+                            sk.off(mi, 1 + e),
+                            &sk.g,
+                            cap,
+                            i,
+                            sk.hard.get(),
+                            sk.tau,
+                            sk.l1.get(),
+                        );
+                    }
                 }
                 cmd.swiglu_bwd(
                     &mo.gte,
@@ -6218,38 +6324,8 @@ mod gpu {
                 return;
             }
             let m = self.b * self.t;
-            let cs = self.cfg.vocab / ncl;
-            let mut tc = vec![0u32; m];
-            let mut buckets: Vec<Vec<i32>> = vec![Vec::new(); ncl];
-            for (i, &t) in targets.iter().enumerate() {
-                if t == u32::MAX {
-                    tc[i] = u32::MAX; // ignored position (no target)
-                    continue;
-                }
-                let c = (t as usize / cs).min(ncl - 1);
-                tc[i] = c as u32;
-                buckets[c].push(i as i32);
-            }
-            let mut idx: Vec<i32> = Vec::with_capacity(self.mpad);
-            let mut groups = Vec::new();
-            for (c, bk) in buckets.iter().enumerate() {
-                if bk.is_empty() {
-                    continue;
-                }
-                let off = idx.len();
-                idx.extend_from_slice(bk);
-                // Metal keeps 64-row bucket tiles for its SIMD GEMM path.
-                // The Vulkan scalar path has no tile requirement; retaining
-                // those pads multiplies sparse hierarchical-head work by up
-                // to 64×, so keep only valid rows there.
-                let pad = if cfg!(all(feature = "vulkan", not(target_os = "macos"))) {
-                    bk.len()
-                } else {
-                    bk.len().div_ceil(64) * 64
-                };
-                idx.resize(off + pad, -1);
-                groups.push((c, off, pad));
-            }
+            let (tc, idx, groups) = head_grouping(targets, ncl, self.cfg.vocab / ncl);
+            assert_eq!(tc.len(), m);
             assert!(idx.len() <= self.mpad);
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -6266,6 +6342,107 @@ mod gpu {
             *self.head_groups.borrow_mut() = groups;
             self.head_valid
                 .set(targets.iter().filter(|&&t| t != u32::MAX).count());
+        }
+
+        /// Logit distillation into this instance's hierarchical head from
+        /// `teacher` (same vocabulary and clustering, any width): every
+        /// following `train_step` (until the next call disarms it) trains on
+        /// (1−α)·CE + α·CE(p_teacher) at both head levels — over the clusters
+        /// and within the target's cluster. `teacher_rows` = the teacher's
+        /// batch × T (it may run the batch in micro-batches).
+        pub fn enable_kd(&mut self, alpha: f32, teacher: &EmbryoGpu) {
+            let ncl = self.cfg.head_clusters;
+            assert!(ncl > 0, "logit distillation needs the hierarchical head");
+            assert_eq!(
+                (teacher.cfg.vocab, teacher.cfg.head_clusters, teacher.t),
+                (self.cfg.vocab, ncl, self.t),
+                "the teacher's vocabulary, head clusters and T must be the student's"
+            );
+            assert!(
+                teacher.b <= self.b && self.b % teacher.b == 0,
+                "the teacher's batch must divide the student's"
+            );
+            let c = self.ctx();
+            let (m, cs) = (self.b * self.t, self.cfg.vocab / ncl);
+            self.kd = Some(KdBufs {
+                c: GBuf::zeros(c, m * ncl),
+                w: GBuf::zeros(c, self.mpad.max(1) * cs),
+                idx_c: GBuf::from_u32(c, &vec![u32::MAX; teacher.b * teacher.t]),
+                idx_w: GBuf::from_u32(c, &vec![u32::MAX; teacher.mpad.max(1)]),
+                alpha,
+                armed: std::cell::Cell::new(false),
+            });
+        }
+
+        /// Runs the teacher over `tokens`/`targets` (in micro-batches of its
+        /// own batch) and lays its in-place CE gradients — scale_j·(p − 1ₜ)
+        /// per row, at both head levels — into this instance's distillation
+        /// buffers, rescaled to this batch's 1/valid and moved into this
+        /// batch's rows and grouped rows. Positions before `skip` in each
+        /// window are left out (plain CE there: e.g. a teacher without the
+        /// student's carried state knows nothing at a window's start). Arms
+        /// the next `train_step`; returns the teacher's mean CE on the batch.
+        pub fn kd_gather(&self, teacher: &EmbryoGpu, tokens: &[u32], targets: &[u32], skip: usize) -> f32 {
+            let kd = self.kd.as_ref().expect("enable_kd before kd_gather");
+            let (m, t, ncl) = (self.b * self.t, self.t, self.cfg.head_clusters);
+            let cs = self.cfg.vocab / ncl;
+            assert!(tokens.len() == m && targets.len() == m);
+            // this batch's grouped row of every token (as prepare_head lays them out)
+            let (_, sidx, _) = head_grouping(targets, ncl, cs);
+            let mut pos_s = vec![-1i32; m];
+            for (r, &i) in sidx.iter().enumerate() {
+                if i >= 0 {
+                    pos_s[i as usize] = r as i32;
+                }
+            }
+            let valid = targets.iter().filter(|&&x| x != u32::MAX).count();
+            let c = self.ctx();
+            let cmd = Cmd::new(c);
+            cmd.axpby(0.0, &kd.c, 0.0, &kd.c, kd.c.len);
+            cmd.axpby(0.0, &kd.w, 0.0, &kd.w, kd.w.len);
+            cmd.commit();
+            let mt = teacher.b * teacher.t;
+            let (mut lsum, mut vsum) = (0f64, 0usize);
+            for j in 0..m / mt {
+                let rows = j * mt..(j + 1) * mt;
+                let tl = teacher.eval_loss(&tokens[rows.clone()], &targets[rows.clone()]);
+                let vj = teacher.head_valid.get();
+                if vj == 0 {
+                    continue;
+                }
+                lsum += tl as f64 * vj as f64;
+                vsum += vj;
+                // the teacher's rows and grouped rows (its own prepare_head) → this batch's
+                let (_, tidx, _) = head_grouping(&targets[rows.clone()], ncl, cs);
+                let keep = |local: usize| local % t >= skip;
+                let ic: Vec<i32> = (0..mt)
+                    .map(|r| if keep(r) { (j * mt + r) as i32 } else { -1 })
+                    .collect();
+                let iw: Vec<i32> = tidx
+                    .iter()
+                    .map(|&r| {
+                        if r < 0 || !keep(r as usize) {
+                            -1
+                        } else {
+                            pos_s[j * mt + r as usize]
+                        }
+                    })
+                    .collect();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ic.as_ptr(), kd.idx_c.buf.contents() as *mut i32, ic.len());
+                    std::ptr::copy_nonoverlapping(iw.as_ptr(), kd.idx_w.buf.contents() as *mut i32, iw.len());
+                }
+                // scale_j·(p − 1) → scale·(p − 1): this batch normalises by all its valid rows
+                let s = vj as f32 / valid.max(1) as f32;
+                let cmd = Cmd::new(c);
+                cmd.axpby(0.0, &teacher.lc, s, &teacher.lc, mt * ncl);
+                cmd.scatter_add_rows_unique(&kd.c, &kd.idx_c, &teacher.lc, mt, ncl);
+                cmd.axpby(0.0, &teacher.lw, s, &teacher.lw, iw.len() * cs);
+                cmd.scatter_add_rows_unique(&kd.w, &kd.idx_w, &teacher.lw, iw.len(), cs);
+                cmd.commit();
+            }
+            kd.armed.set(vsum > 0);
+            if vsum == 0 { 0.0 } else { (lsum / vsum as f64) as f32 }
         }
 
         /// Head on the given hidden/targets (the MTP heads reuse the tied head).
@@ -6372,6 +6549,15 @@ mod gpu {
                 ncl,
             );
             cmd.softmax_ce_at(&self.lc, 0, &self.tgt_cluster, 0, &s.loss, 0, m, ncl, scale);
+            // distillation (main head of a training step after kd_gather): the gradient
+            // scale·(q − 1ₜ) becomes scale·(q − (1−α)·1ₜ − α·p_teacher); the loss stays the CE
+            let kd = self
+                .kd
+                .as_ref()
+                .filter(|k| train && k.armed.get() && std::ptr::eq(x, &self.xf));
+            if let Some(k) = kd {
+                cmd.axpby(-k.alpha, &k.c, 1.0, &self.lc, m * ncl);
+            }
             if train {
                 cmd.gemm(
                     Op::N,
@@ -6556,6 +6742,10 @@ mod gpu {
                 cs,
                 scale,
             );
+            if let Some(k) = kd {
+                cmd.axpby(-k.alpha, &k.w, 1.0, &self.lw, rows_total * cs);
+                k.armed.set(false);
+            }
             if train {
                 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
                 let grouped = if let Some((tab, pad_max, ng)) = head_table.as_ref() {
@@ -7919,18 +8109,34 @@ impl EmbryoGpu {
             *cov_ema = vec![0.0; cov_h.len()];
         }
         let mut u_all = vec![0.0f32; l_n * ne * k * h];
-        for le in 0..l_n * ne {
-            let n = counts[le].min(cap as u32) as f32;
-            let blk = &cov_h[le * h * h..(le + 1) * h * h];
-            let ema_blk = &mut cov_ema[le * h * h..(le + 1) * h * h];
-            if n >= 2.0 {
-                for i in 0..h * h {
-                    ema_blk[i] = ema * ema_blk[i] + (1.0 - ema) * blk[i] / n;
-                }
+        // A (layer, expert) block is independent of the others: its EMA and
+        // its power iteration run on one thread exactly as in a plain loop,
+        // so the threads change the time (seconds per refresh on a 16-layer
+        // genome), not the bits.
+        let blocks = l_n * ne;
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, blocks);
+        let per = blocks.div_ceil(threads);
+        std::thread::scope(|sc| {
+            let chunks = cov_ema.chunks_mut(per * h * h).zip(u_all.chunks_mut(per * k * h));
+            for (ti, (ema_chunk, u_chunk)) in chunks.enumerate() {
+                let (cov_h, counts) = (&cov_h, &counts);
+                sc.spawn(move || {
+                    let pairs = ema_chunk.chunks_mut(h * h).zip(u_chunk.chunks_mut(k * h));
+                    for (j, (ema_blk, u_blk)) in pairs.enumerate() {
+                        let le = ti * per + j;
+                        let n = counts[le].min(cap as u32) as f32;
+                        let blk = &cov_h[le * h * h..(le + 1) * h * h];
+                        if n >= 2.0 {
+                            for i in 0..h * h {
+                                ema_blk[i] = ema * ema_blk[i] + (1.0 - ema) * blk[i] / n;
+                            }
+                        }
+                        let u = top_eigenvectors(ema_blk, h, k, 24, le as u64);
+                        u_blk.copy_from_slice(&u);
+                    }
+                });
             }
-            let u = top_eigenvectors(ema_blk, h, k, 24, le as u64);
-            u_all[le * k * h..(le + 1) * k * h].copy_from_slice(&u);
-        }
+        });
         self.desc.u.write_from(&u_all);
     }
 }
@@ -8005,7 +8211,10 @@ unsafe fn host_u32_slice<'a>(buf: &'a GBuf) -> &'a [u32] {
 pub struct SkillState {
     pub layers: Vec<usize>,
     pub inter: usize,
-    /// [layers.len(), I] mask logits
+    /// mask groups per selected layer: 1 = its shared FFN only; 1 + E = the
+    /// shared FFN, then each of its E routed experts
+    pub groups: usize,
+    /// [layers.len(), groups, I] mask logits
     pub logits: GBuf,
     pub g: GBuf,
     pub m: GBuf,
@@ -8015,6 +8224,12 @@ pub struct SkillState {
     pub tau: f32,
     /// L1 pressure on σ(m) (phase A), added to the mask gradient
     pub l1: std::cell::Cell<f32>,
+    /// phase B trains the shared FFN of only this many of the LAST selected
+    /// layers (0 = of every selected layer)
+    pub polish: std::cell::Cell<usize>,
+    /// [E, cap, I] pre-mask activations of the routed experts (backward
+    /// scratch; one float when the experts carry no mask)
+    pub expert_pre: GBuf,
 }
 
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
@@ -8026,10 +8241,27 @@ impl SkillState {
         init_logit: f32,
         tau: f32,
     ) -> SkillState {
-        let n = layers.len() * inter;
+        Self::with_experts(c, layers, inter, init_logit, tau, 0, 0)
+    }
+    /// Masks over the shared FFN and over each of the `experts` routed
+    /// experts of every selected layer (`cap` = an expert's slots in the
+    /// routed buffers); `experts == 0` masks the shared FFN only.
+    pub fn with_experts(
+        c: &crate::metal::Ctx,
+        layers: Vec<usize>,
+        inter: usize,
+        init_logit: f32,
+        tau: f32,
+        experts: usize,
+        cap: usize,
+    ) -> SkillState {
+        let groups = 1 + experts;
+        let n = layers.len() * groups * inter;
         SkillState {
             layers,
             inter,
+            groups,
+            expert_pre: GBuf::zeros(c, (experts * cap * inter).max(1)),
             logits: GBuf::from_slice(c, &vec![init_logit; n.max(1)]),
             g: GBuf::zeros(c, n),
             m: GBuf::zeros(c, n),
@@ -8037,19 +8269,26 @@ impl SkillState {
             hard: std::cell::Cell::new(false),
             tau,
             l1: std::cell::Cell::new(0.0),
+            polish: std::cell::Cell::new(0),
         }
     }
     pub fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|&l| l == layer)
     }
-    /// Kept-neuron mask per selected layer from the current logits.
+    /// Where the `I` logits of group `g` (0 = the shared FFN, 1 + e = expert
+    /// e) of the selected layer number `mi` start.
+    pub fn off(&self, mi: usize, g: usize) -> usize {
+        (mi * self.groups + g) * self.inter
+    }
+    /// Kept-neuron mask of the shared FFN per selected layer from the
+    /// current logits.
     pub fn hard_masks(&self) -> Vec<Vec<bool>> {
         let lg = self.logits.to_vec();
         self.layers
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                lg[i * self.inter..(i + 1) * self.inter]
+                lg[self.off(i, 0)..self.off(i, 0) + self.inter]
                     .iter()
                     .map(|&m| 1.0 / (1.0 + (-m).exp()) > self.tau)
                     .collect()
@@ -8134,7 +8373,11 @@ impl EmbryoGpu {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         if phase_b {
             let (h, i) = (self.cfg.hidden, self.cfg.inter);
-            for &l in &sk.layers {
+            let first = match sk.polish.get() {
+                0 => 0,
+                n => sk.layers.len().saturating_sub(n),
+            };
+            for &l in &sk.layers[first..] {
                 let ffn = match &self.lay.layers[l] {
                     LayerOffs::Mixer { ffn, .. }
                 | LayerOffs::Anchor { ffn, .. }
@@ -8203,6 +8446,8 @@ impl EmbryoGpu {
         };
         let cfg = &self.cfg;
         let h = cfg.hidden;
+        // φ and the hidden rows the runtime must reproduce: full f32 (CUDA: no TF32)
+        let _exact = self.ctx().exact_f32();
         let cmd = Cmd::new(self.ctx());
         cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
         let last = layer.min(cfg.layers - 1);
