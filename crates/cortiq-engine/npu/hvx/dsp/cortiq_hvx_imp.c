@@ -163,20 +163,33 @@ static int q4_matvec(const unsigned char *w, int tiles, int gpr, int shift, cons
 #define MAX_THREADS 4
 #define STACK 8192
 
-int cortiq_hvx_q4_matvec(remote_handle64 h, const unsigned char *w, int wLen, int wfd, int tiles, int gpr, int shift,
-                         const unsigned char *x, int xLen, int *y, int yLen, int threads, int64 *usec) {
+int cortiq_hvx_q4_matvec(remote_handle64 h, const unsigned char *w, int wLen, int wfd, int wfd2, int tiles, int gpr,
+                         int shift, const unsigned char *x, int xLen, int *y, int yLen, int threads, int64 *usec) {
     if (tiles <= 0 || gpr <= 0 || gpr > 1024 || shift < 0 || shift > 12) return AEE_EBADPARM;
     int held = 0;
+    const unsigned char *w2 = NULL;
     if (wfd > 0) {
         void *va = NULL;
         uint64 pa = 0;
         if (HAP_mmap_get(wfd, &va, &pa) != 0 || !va) return AEE_ENOSUCHMAP;
         w = (const unsigned char *)va;
         held = 1;
-    } else if ((int64_t)wLen < (int64_t)tiles * gpr * REC) {
+        if (wfd2 > 0) {
+            if (HAP_mmap_get(wfd2, &va, &pa) != 0 || !va) {
+                HAP_mmap_put(wfd);
+                return AEE_ENOSUCHMAP;
+            }
+            w2 = (const unsigned char *)va;
+            held = 2;
+        }
+    } else if (wfd2 > 0 || (int64_t)wLen < (int64_t)tiles * gpr * REC) {
         return AEE_EBADPARM;
     }
-    int rc = q4_matvec(w, tiles, gpr, shift, x, xLen, y, yLen, threads, usec);
+    int64 u1 = 0, u2 = 0;
+    int rc = q4_matvec(w, tiles, gpr, shift, x, xLen, y, yLen, threads, &u1);
+    if (rc == 0 && w2) rc = q4_matvec(w2, tiles, gpr, shift, x, xLen, y + tiles * 32, yLen - tiles * 32, threads, &u2);
+    *usec = u1 + u2;
+    if (held == 2) HAP_mmap_put(wfd2);
     if (held) HAP_mmap_put(wfd);
     return rc;
 }
@@ -229,4 +242,133 @@ static int q4_matvec(const unsigned char *w, int tiles, int gpr, int shift, cons
     }
     *usec = (int64)(HAP_perf_get_time_us() - t_start);
     return ok ? 0 : AEE_EFAILED;
+}
+
+// ---- the batch product: n activation vectors, eight at a time ------------------------------------------
+
+#define NB 8
+typedef struct {
+    const uint8_t *w;
+    const int32_t *xw;   // [n][gpr*8] words
+    const int32_t *corr; // [n][gpr]
+    int32_t *y;          // [n][tiles*32]
+    int gpr, shift, t0, t1, tiles, n;
+    int ok;
+} bjob_t;
+
+static void run_tiles_batch(bjob_t *j) {
+    if (qurt_hvx_lock(QURT_HVX_MODE_128B) != 0) {
+        j->ok = 0;
+        return;
+    }
+    const HVX_Vector m = Q6_V_vsplat_R(0x0f0f0f0f);
+    const int gpr = j->gpr, shift = j->shift, n = j->n, rows = j->tiles * 32;
+    const HVX_Vector *end = (const HVX_Vector *)(j->w + (size_t)j->tiles * gpr * REC);
+    for (int b0 = 0; b0 < n; b0 += NB) {
+        const int nb = n - b0 < NB ? n - b0 : NB;
+        for (int t = j->t0; t < j->t1; t++) {
+            const HVX_Vector *p = (const HVX_Vector *)(j->w + (size_t)t * gpr * REC);
+            HVX_Vector acc_y[NB];
+            for (int b = 0; b < nb; b++) acc_y[b] = Q6_V_vzero();
+            for (int g = 0; g < gpr; g++, p += 5) {
+                if (p + 5 * (FETCH_AHEAD + 1) <= end) Q6_l2fetch_AR((void *)(p + 5 * FETCH_AHEAD), (128 << 16) | (128 << 8) | 5);
+                HVX_Vector lo[4], hi[4];
+                for (int k = 0; k < 4; k++) {
+                    HVX_Vector v = p[k];
+                    lo[k] = Q6_V_vand_VV(v, m);
+                    hi[k] = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(v, 4), m);
+                }
+                const HVX_Vector wq = p[4];
+                for (int b = 0; b < nb; b++) {
+                    const int32_t *xw = j->xw + ((size_t)(b0 + b) * gpr + g) * 8;
+                    HVX_Vector acc = Q6_V_vsplat_R(-j->corr[(size_t)(b0 + b) * gpr + g]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, lo[0], xw[0]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, hi[0], xw[1]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, lo[1], xw[2]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, hi[1], xw[3]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, lo[2], xw[4]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, hi[2], xw[5]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, lo[3], xw[6]);
+                    acc = Q6_Vw_vrmpyacc_VwVubRb(acc, hi[3], xw[7]);
+                    acc_y[b] = Q6_Vw_vadd_VwVw(acc_y[b], Q6_Vw_vmpyo_VwVh_s1_rnd_sat(Q6_Vw_vasl_VwR(acc, shift), wq));
+                }
+            }
+            for (int b = 0; b < nb; b++) *(HVX_Vector *)(j->y + (size_t)(b0 + b) * rows + (size_t)t * 32) = acc_y[b];
+        }
+    }
+    qurt_hvx_unlock();
+    j->ok = 1;
+}
+
+static void bworker(void *arg) {
+    run_tiles_batch((bjob_t *)arg);
+    qurt_thread_exit(0);
+}
+
+int cortiq_hvx_q4_gemm(remote_handle64 h, const unsigned char *w, int wLen, int wfd, int tiles, int gpr, int shift, int n,
+                       const unsigned char *x, int xLen, int *y, int yLen, int threads, int64 *usec) {
+    if (tiles <= 0 || gpr <= 0 || gpr > 1024 || shift < 0 || shift > 12 || n <= 0) return AEE_EBADPARM;
+    if ((int64_t)xLen < (int64_t)n * gpr * 32 || (int64_t)yLen < (int64_t)n * tiles * 32) return AEE_EBADPARM;
+    if (((uintptr_t)y & 127) || ((uintptr_t)x & 3)) return AEE_EBADPARM;
+    int held = 0;
+    if (wfd > 0) {
+        void *va = NULL;
+        uint64 pa = 0;
+        if (HAP_mmap_get(wfd, &va, &pa) != 0 || !va) return AEE_ENOSUCHMAP;
+        w = (const unsigned char *)va;
+        held = 1;
+    } else if ((int64_t)wLen < (int64_t)tiles * gpr * REC) {
+        return AEE_EBADPARM;
+    }
+    uint64_t t_start = HAP_perf_get_time_us();
+    int rc = AEE_ENOMEMORY;
+    int32_t *corr = (int32_t *)malloc((size_t)n * gpr * sizeof(int32_t));
+    if (corr) {
+        const int8_t *xs = (const int8_t *)x;
+        for (int i = 0; i < n * gpr; i++) {
+            int s = 0;
+            for (int k = 0; k < 32; k++) s += xs[(size_t)i * 32 + k];
+            corr[i] = 8 * s;
+        }
+        if (threads < 1) threads = 1;
+        if (threads > MAX_THREADS) threads = MAX_THREADS;
+        if (threads > tiles) threads = tiles;
+        bjob_t jobs[MAX_THREADS];
+        qurt_thread_t tid[MAX_THREADS];
+        void *stacks[MAX_THREADS] = {0};
+        int started[MAX_THREADS] = {0};
+        for (int i = 0; i < threads; i++) {
+            jobs[i] = (bjob_t){.w = w, .xw = (const int32_t *)x, .corr = corr, .y = (int32_t *)y, .gpr = gpr, .shift = shift,
+                               .tiles = tiles, .n = n, .t0 = (int)((int64_t)tiles * i / threads),
+                               .t1 = (int)((int64_t)tiles * (i + 1) / threads), .ok = 0};
+        }
+        for (int i = 1; i < threads; i++) {
+            stacks[i] = malloc(STACK);
+            if (!stacks[i]) continue;
+            qurt_thread_attr_t attr;
+            qurt_thread_attr_init(&attr);
+            qurt_thread_attr_set_name(&attr, "cq_hvxb");
+            qurt_thread_attr_set_stack_addr(&attr, stacks[i]);
+            qurt_thread_attr_set_stack_size(&attr, STACK);
+            qurt_thread_attr_set_priority(&attr, qurt_thread_get_priority(qurt_thread_get_id()));
+            if (qurt_thread_create(&tid[i], &attr, bworker, &jobs[i]) == 0) started[i] = 1;
+        }
+        run_tiles_batch(&jobs[0]);
+        int ok = jobs[0].ok;
+        for (int i = 1; i < threads; i++) {
+            if (started[i]) {
+                int st;
+                qurt_thread_join(tid[i], &st);
+            } else {
+                run_tiles_batch(&jobs[i]);
+            }
+            ok &= jobs[i].ok;
+            free(stacks[i]);
+        }
+        free(corr);
+        rc = ok ? 0 : AEE_EFAILED;
+    }
+    if (held) HAP_mmap_put(wfd);
+    *usec = (int64)(HAP_perf_get_time_us() - t_start);
+    return rc;
 }

@@ -26,4 +26,5 @@ rpc="$sdk/ipc/fastrpc/remote/ship/android_aarch64"
 "$cc" -O2 -Wall -fPIC -shared "${inc[@]}" -o "$out/libcortiq_npu.so" host/cq_hvx.c "$out/gen/cortiq_hvx_stub.c" \
   -L "$rpc" -lcdsprpc -Wl,-z,max-page-size=16384
 "$cc" -O2 -Wall "${inc[@]}" -o "$out/hvx_test" host/hvx_test.c -L "$out" -lcortiq_npu -lm
+"$cc" -O2 -Wall -o "$out/hvx_multi" host/hvx_multi.c -L "$out" -lcortiq_npu
 ls -la "$out"/*.so "$out/hvx_test" | awk "{print \$5, \$9}"

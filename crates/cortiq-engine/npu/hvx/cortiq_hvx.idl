@@ -21,6 +21,14 @@ interface cortiq_hvx : remote_handle64 {
    // threads: HVX threads to split the tiles over. usec: the DSP's own time.
    // wfd: the fd of a buffer the caller mapped for the session (fastrpc_mmap); then w is empty and the
    //    module takes the mapped address. 0: w carries the matrix (mapped around this call).
-   long q4_matvec(in sequence<octet> w, in long wfd, in long tiles, in long gpr, in long shift,
+   // wfd2: a second mapped matrix of the same shape (a gate/up pair): y then holds both results, the
+   //    first matrix's tiles*32 values and then the second's. 0: one matrix.
+   long q4_matvec(in sequence<octet> w, in long wfd, in long wfd2, in long tiles, in long gpr, in long shift,
                   in sequence<octet> x, rout sequence<long> y, in long threads, rout long long usec);
+
+   // The same product for `n` activation vectors at once (a prompt chunk): x is [n][gpr*32] int8 in the
+   // matvec's input order, y is [n][tiles*32]. The codes of a group are split once and spent on eight
+   // vectors at a time, so past the first vector the work is compute, not DDR, and HVX threads add up.
+   long q4_gemm(in sequence<octet> w, in long wfd, in long tiles, in long gpr, in long shift, in long n,
+                in sequence<octet> x, rout sequence<long> y, in long threads, rout long long usec);
 };

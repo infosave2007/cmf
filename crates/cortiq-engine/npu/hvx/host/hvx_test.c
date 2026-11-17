@@ -8,7 +8,8 @@
 int cq_npu_init(const char *);
 void *cq_npu_alloc(size_t);
 int cq_npu_add(void *, int, int, int);
-int cq_npu_run(int, const int8_t *, int32_t *, int);
+int cq_npu_run(int, int, const int8_t *, int32_t *, int);
+int cq_npu_gemm(int, int, const int8_t *, int32_t *, int);
 const char *cq_npu_error(void);
 long long cq_npu_last_dsp_usec(void);
 int cq_npu_last_map(void);
@@ -44,7 +45,7 @@ int main(int argc, char **argv) {
     int h = cq_npu_add(w, tiles, gpr, shift);
     if (h < 0) { printf("add: %s\n", cq_npu_error()); return 1; }
     printf("persistent map: %s (0x%x)\n", cq_npu_last_map() == 0 ? "yes" : "no", cq_npu_last_map());
-    if (cq_npu_run(h, xo, y, 1)) { printf("run: %s\n", cq_npu_error()); return 1; }
+    if (cq_npu_run(h, -1, xo, y, 1)) { printf("run: %s\n", cq_npu_error()); return 1; }
     double num = 0, den = 0; long maxdiff = 0;
     for (int r = 0; r < tiles * 32; r++) {
         double ref = 0;
@@ -58,8 +59,23 @@ int main(int argc, char **argv) {
     printf("relative L2 error %.2e | largest |diff| %ld counts (of up to %d groups' rounding)\n", sqrt(num / den), maxdiff, gpr);
     for (int th = 1; th <= 4; th++) {
         double best = 1e9; long long dsp = 0;
-        for (int it = 0; it < 3; it++) { double t = now(); for (int i = 0; i < 20; i++) cq_npu_run(h, xo, y, th); double d = (now() - t) / 20; if (d < best) { best = d; dsp = cq_npu_last_dsp_usec(); } }
+        for (int it = 0; it < 3; it++) { double t = now(); for (int i = 0; i < 20; i++) cq_npu_run(h, -1, xo, y, th); double d = (now() - t) / 20; if (d < best) { best = d; dsp = cq_npu_last_dsp_usec(); } }
         printf("threads %d: %.2f ms per matvec end to end (DSP %lld us) | %.1f G weights/s\n", th, best * 1e3, dsp, tiles * 32.0 * cols / best / 1e9);
+    }
+    // the batch product: n vectors; vector b is x rotated by b groups, so its answer is checkable
+    int nrows = tiles * 32;
+    for (int n = 8; n <= 64; n *= 2) {
+        int8_t *bx = malloc((size_t)n * cols); int32_t *by = malloc((size_t)n * nrows * 4);
+        for (int b = 0; b < n; b++) for (int c = 0; c < cols; c++) bx[(size_t)b * cols + c] = xo[(c + 32 * b) % cols];
+        if (cq_npu_gemm(h, n, bx, by, 1)) { printf("gemm: %s\n", cq_npu_error()); return 1; }
+        int bad = 0; for (int r = 0; r < nrows; r++) if (by[r] != y[r]) bad++;   // vector 0 is the matvec's x
+        long sum_last = 0; for (int r = 0; r < nrows; r++) sum_last += by[(size_t)(n - 1) * nrows + r];
+        for (int th = 1; th <= 4; th++) {
+            double best = 1e9; long long dsp = 0;
+            for (int it = 0; it < 3; it++) { double t = now(); cq_npu_gemm(h, n, bx, by, th); double d = now() - t; if (d < best) { best = d; dsp = cq_npu_last_dsp_usec(); } }
+            printf("gemm n=%2d threads %d: %.2f ms (DSP %lld us) = %.3f ms per vector | vector 0 mismatches %d\n", n, th, best * 1e3, dsp, best * 1e3 / n, bad);
+        }
+        (void)sum_last; free(bx); free(by);
     }
     return 0;
 }
