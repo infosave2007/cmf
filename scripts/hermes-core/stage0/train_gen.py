@@ -1,6 +1,6 @@
 """Training tasks of "reasoning over a card", disjoint from the R set.
 
-    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N [--over-files P]] [--rules N]
+    python -I train_gen.py --tldr <dir>/tldr-main --out train.messages.jsonl [--n 90000] [--seed 7] [--contrast N] [--pipes N [--over-files P]] [--rules N] [--mix-order]
 
 Output: one `{"messages": [user, assistant], "group": ..., "cat": ...}` per
 line, the `messages` format of `cortiq-embryo sft-prepare` (`group` drives
@@ -60,6 +60,13 @@ service's state). A first form had such outputs of several lines (a listing, a
 table) in 3 tasks of 10, and the model taught on it answered NONE to 43 of R's 128
 one-command tasks: "none of the quoted strings" after a block of lines stands too
 near "None of the cards" after a block of cards.
+
+--mix-order: the cards of the --contrast and --pipes tasks list their examples in a
+drawn order. The plain form of a command is the first example of its tldr page, and
+these tasks are made of plain forms: the example they need stood first on the card in
+85 % of the --contrast tasks and 54 % of the --pipes ones (27 % by chance). A model
+taught on them takes the first example: at three quarters of the base 31 of 48 answers
+with another example of the right card had its first one (14 of 43 before).
 
 The generator is a program over tldr-pages (CC-BY 4.0) text; no model wrote
 any of the data.
@@ -367,7 +374,7 @@ PIPE_FILTERS = [  # (page, the card's example, requests over {s}: what is filter
 
 
 def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, over_files: float = 0.0,
-             rules: int = 0) -> list[dict]:
+             rules: int = 0, mix_order: bool = False) -> list[dict]:
     rng = random.Random(seed)
     used = set()
     for f in F.FAMILIES:
@@ -745,11 +752,19 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
     ] if f[0] in pages and any(c == f[1] for _, c in pages[f[0]][2])]
     src_verbs = ["Show", "Print", "List", "Display", "Output", "Get"]
 
+    order = random.Random(seed + 5557)  # the draws of --mix-order: everything else stays as without it
+
+    def mixed(exs):
+        exs = list(exs)
+        if mix_order:
+            order.shuffle(exs)
+        return exs
+
     def source_alone():
         sp, scmd, sphr = rng.choice(sources)
         name, desc, ex = pages[sp]
         i = next(k for k, (_, c) in enumerate(ex) if c == scmd)
-        card = card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+        card = card_text(name, desc, mixed(trim(ex, i, min(4, len(ex)), rng)))
         return msg(f"Reference card:\n{card}\n\nTask: {framed(rng.choice(src_verbs) + ' ' + sphr, rng)}\n\n{one}", scmd, sp, "direct")
 
     def filter_on_file():
@@ -760,7 +775,7 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
         v = {"f": " and ".join(pairs[-1][1].split(" ")), "n": pairs[0][1]}
         phrase = rng.choice(phrases).format(**v)
         verbs = ["Show", "Print", "Display", "Output"] + (["Compute", "Get"] if "checksum" in phrase else [])
-        card = card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+        card = card_text(name, desc, mixed(trim(ex, i, min(4, len(ex)), rng)))
         return msg(f"Reference card:\n{card}\n\nTask: {framed(rng.choice(verbs) + ' ' + phrase, rng)}\n\n{one}", cmd, page, "slot")
 
     def two_more():
@@ -772,7 +787,7 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
         for pg, must in ((sp, scmd), (fp, None)):
             name, desc, ex = pages[pg]
             i = next((k for k, (_, c) in enumerate(ex) if c == must), 0)
-            cards.append(card_text(name, desc, trim(ex, i, min(4, len(ex)), rng) if must else ex[:4]))
+            cards.append(card_text(name, desc, mixed(trim(ex, i, min(4, len(ex)), rng) if must else ex[:4])))
         if rng.random() < 0.5:
             cards.reverse()
         task = framed(f"{rng.choice(src_verbs)} {sphr} {sub(fphr)}", rng)
@@ -832,7 +847,7 @@ def generate(tldr: Path, n: int, seed: int, contrast: int = 0, pipes: int = 0, o
 
     def shown(page, i):
         name, desc, ex = pages[page]
-        return card_text(name, desc, trim(ex, i, min(4, len(ex)), rng))
+        return card_text(name, desc, mixed(trim(ex, i, min(4, len(ex)), rng)))
 
     def pipeline():
         if over_files and rng.random() < over_files:  # the first command is a filter over a file: both cards are filters
@@ -903,8 +918,10 @@ def main() -> None:
                     help="share of the --pipes pipelines whose first command is itself a filter over a file")
     ap.add_argument("--rules", type=int, default=0,
                     help="append N rule tasks with rules of two quoted strings, 3 to 5 rules, outputs of several lines")
+    ap.add_argument("--mix-order", action="store_true",
+                    help="the cards of the --contrast and --pipes tasks list their examples in a drawn order")
     args = ap.parse_args()
-    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes, args.over_files, args.rules)
+    rows = generate(Path(args.tldr), args.n, args.seed, args.contrast, args.pipes, args.over_files, args.rules, args.mix_order)
     seen, uniq = set(), []
     for r in rows:
         key = (r["messages"][0]["content"], r["messages"][1]["content"])

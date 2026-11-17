@@ -1,7 +1,7 @@
 """Card tasks as conversations in which the model fetches its reference card itself, inside the reasoning loop.
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
-                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels] [--or-rules P]
+                            [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels] [--or-rules P] [--no-lone-filter]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -94,6 +94,15 @@ string with another rule's label. Adding rule tasks instead (`train_gen.py
 and 43 of R's 128 one-command tasks): more turns that end in a bare word
 after the reasoning. This option changes rules in place, the number of
 conversations and their endings stay.
+
+`--no-lone-filter`: with `--pipes`, when only one card of a pipeline came back
+it is always the one that gives the output, and the model asks for the card
+that works on it. The other case (the filter came back alone, "Card X works on
+an output; the command that gives it is not here. Look that up.") is left
+out, both cards come back in its place: at three quarters of the base the model said that line for a single
+command whose card is a filter (grep, tail, sort over a file), asked again,
+got the same card and wrote a pipeline of the card with itself, in 24 of R's
+128 one-command tasks.
 """
 
 from __future__ import annotations
@@ -389,7 +398,7 @@ def arith_think(prompt: str, answer: str) -> str:
 
 
 def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False,
-          reason=(), relabel=None, ors=None):
+          reason=(), relabel=None, ors=None, lone_filter=True):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat == "react" and relabel is not None:  # other words for the labels, the same rule set
@@ -479,14 +488,15 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked
         q = vague(task, rng, k=rng.randint(5, 9))  # what is needed, as for any lookup: no command names
         turns = [("user", user), ("assistant", rng.choice(NEED), None, [call("lookup", query=q)])]
         both = {ca["name"], cb["name"]}
-        if mode < 0.75:  # the router returns both for the need, sometimes with a neighbour
+        source_back = mode >= 0.75 and rng.random() < 0.6
+        if mode < 0.75 or not (source_back or lone_filter):  # the router returns both for the need, sometimes with a neighbour
             shown = [ca, cb]
             rng.shuffle(shown)
             if rng.random() < 0.4:
                 extra = others(1, both, f"{q} {task}")
                 shown = extra + shown if ranked and rng.random() < 0.7 else rng.sample(extra + shown, 3)
             return "two", turns + [("tool", store(shown)), final(pre)]
-        if rng.random() < 0.6:  # one of the two came back: ask for the other by what it does
+        if source_back:  # one of the two came back: ask for the other by what it does
             have, miss, q2 = ca, cb, what_query(wb)
             why = f"Card {ca['name']} gives the output; no card here works on it. Look that up."
         else:
@@ -643,6 +653,8 @@ def main() -> None:
     ap.add_argument("--pipes", action="store_true",
                     help="a pipeline is looked up by what is needed, not by command names, and built from the cards that "
                          "came back: which gives the output, which works on it, each example and its values")
+    ap.add_argument("--no-lone-filter", action="store_true",
+                    help="with --pipes: when one card of a pipeline came back it is the one that gives the output, never the filter alone")
     ap.add_argument("--or-rules", type=float, default=0.0,
                     help="share of the rules of a rule task that get a second quoted string (\"A\" or \"B\")")
     ap.add_argument("--labels", action="store_true",
@@ -685,7 +697,7 @@ def main() -> None:
         for r in recs:
             try:
                 mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes,
-                                    set(filter(None, args.reason.split(","))), rng3, ors)
+                                    set(filter(None, args.reason.split(","))), rng3, ors, not args.no_lone_filter)
                 direct = mode == "direct"
                 tools = TOOLS
                 if args.teach > 0 and not direct:
