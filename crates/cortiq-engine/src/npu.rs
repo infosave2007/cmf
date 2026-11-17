@@ -644,12 +644,20 @@ fn verdict_path() -> std::path::PathBuf {
 /// prompt chunk calls each matrix once, so a short prompt would otherwise
 /// end before its trial does. `CMF_NPU_PROBE=1` measures again.
 fn load_verdicts() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+    // Retried until a file is read: an app asks for the status before any
+    // model is loaded, when the cache directory (beside the model) is not
+    // known yet, and a once-only attempt there would be spent on nothing.
+    static LOADED: AtomicBool = AtomicBool::new(false);
+    if LOADED.load(Ordering::Relaxed) {
+        return;
+    }
+    (|| {
         if std::env::var("CMF_NPU_PROBE").is_ok() {
+            LOADED.store(true, Ordering::Relaxed);
             return;
         }
         let Ok(text) = std::fs::read_to_string(verdict_path()) else { return };
+        LOADED.store(true, Ordering::Relaxed);
         for line in text.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             if f.len() != 5 || f[0] != env!("CARGO_PKG_VERSION") {
@@ -658,12 +666,12 @@ fn load_verdicts() {
             let (Ok(m), Ok(v), Ok(n), Ok(c)) = (f[1].parse::<usize>(), f[2].parse::<u32>(), f[3].parse::<u64>(), f[4].parse::<u64>()) else {
                 continue;
             };
-            if m < 2 && (v == 1 || v == 2) {
+            if m < 2 && (v == 1 || v == 2) && TRIALS[m].verdict.load(Ordering::Relaxed) == 0 {
                 TRIALS[m].verdict.store(v, Ordering::Relaxed);
                 *TRIALS[m].medians.lock().unwrap() = (n, c);
             }
         }
-    });
+    })();
 }
 
 fn save_verdicts() {
