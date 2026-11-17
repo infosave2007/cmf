@@ -3798,9 +3798,142 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
+        #[cfg(target_os = "android")]
+        if let Some(done) = Self::npu_silu_mul(gate, up, x, out, limit, pool) {
+            return done;
+        }
+        Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
+    }
+
+    /// The q4tp bytes of a matrix the NPU lane can take (not a Prism
+    /// matrix: its rotation lives outside the bytes).
+    #[cfg(target_os = "android")]
+    fn npu_q4tp(&self) -> Option<(&[u8], usize, usize)> {
+        match self {
+            Self::Mapped { dtype: TensorDtype::Q4TiledP, rows, cols, .. } if !self.has_prism_contract() => {
+                Some((self.quant_bytes(), *rows, *cols))
+            }
+            _ => None,
+        }
+    }
+
+    /// The NPU lane of the fused gate+up (`npu.rs`): `up` on the Hexagon DSP
+    /// while this thread's pool computes `gate`. `None`: no lane for this
+    /// pair, the caller takes the CPU kernel. While the lane's trial is open
+    /// the calls alternate between the two paths and both are timed.
+    #[cfg(target_os = "android")]
+    fn npu_silu_mul(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> Option<bool> {
+        // Off unless asked for: a token is bound by DDR, which the CPU and the
+        // DSP share, so on the phones measured so far the split does not pay
+        // (`CMF_NPU_DECODE=1` turns it on; the trial then still decides).
+        if !a8w8_enabled() || !crate::npu::decode_wanted() {
+            return None;
+        }
+        let (gb, rows, cols) = gate.npu_q4tp()?;
+        let (ub, urows, ucols) = up.npu_q4tp()?;
+        if (urows, ucols) != (rows, cols) {
+            return None;
+        }
+        let lg = npu_lane_q4tp(crate::npu::Mode::Decode, gb, rows, cols)?;
+        let lu = npu_lane_q4tp(crate::npu::Mode::Decode, ub, rows, cols)?;
+        let inter = rows;
+        let t0 = std::time::Instant::now();
+        let full_cpu = |out: &mut [f32]| {
+            // The CPU's own best for this pair: the fused kernel, or two
+            // ordinary matvecs where it declines.
+            if !Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool) {
+                let mut g = vec![0f32; inter];
+                let mut u = vec![0f32; inter];
+                gate.matvec(x, &mut g, pool);
+                up.matvec(x, &mut u, pool);
+                for r in 0..inter {
+                    out[r] = silu_mul_limited(g[r], u[r], limit);
+                }
+            }
+        };
+        let timed = match crate::npu::arm(crate::npu::Mode::Decode) {
+            crate::npu::Arm::Cpu => {
+                full_cpu(out);
+                crate::npu::trial_sample(crate::npu::Mode::Decode, false, t0.elapsed().as_micros() as u64);
+                return Some(true);
+            }
+            crate::npu::Arm::Npu { timed } => timed,
+        };
+        // Rows `row0..` of both matrices go to the DSP as one call; the CPU's
+        // fused kernel computes rows `..row0` meanwhile. The activation is the
+        // same int8 split the CPU kernel makes (it makes it again inside), so
+        // the two halves of `out` are the same arithmetic up to the Q15
+        // rounding of the scales; the few outliers are added here in float.
+        let row0 = lg.row0;
+        let act = split_act(x);
+        let mut pending = crate::npu::start(&lg, Some(&lu), &act.xq);
+        if crate::npu::sync_mode() {
+            // no overlap: for measuring the two costs apart
+            if let Some(p) = pending.as_mut() {
+                p.wait();
+            }
+        }
+        let tg = std::time::Instant::now();
+        ROW_LIMIT.with(|c| c.set(row0));
+        let cpu_ok = Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool);
+        ROW_LIMIT.with(|c| c.set(usize::MAX));
+        let gate_us = tg.elapsed().as_micros() as u64;
+        let pre_us = (tg - t0).as_micros() as u64;
+        let tw = std::time::Instant::now();
+        let y = pending.take().and_then(|p| p.finish());
+        let wait_us = tw.elapsed().as_micros() as u64;
+        let ok = match (cpu_ok, y) {
+            (true, Some(y)) => {
+                let k = act.sx * lg.unit();
+                let (yg, yu) = y.split_at(lg.tiles * 32);
+                for r in row0..inter {
+                    let i = r - row0;
+                    let mut gv = yg[i] as f32 * lg.row_max[i] * k;
+                    let mut uv = yu[i] as f32 * lu.row_max[i] * k;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = lg.weight(i, j);
+                        gv += w * s * xv;
+                        let (w, s) = lu.weight(i, j);
+                        uv += w * s * xv;
+                    }
+                    out[r] = silu_mul_limited(gv, uv, limit);
+                }
+                true
+            }
+            (cpu_ok, y) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    eprintln!("[cortiq] npu: fell back to the CPU (fused kernel took the rows: {cpu_ok}, DSP answered: {})", y.is_some())
+                });
+                full_cpu(out);
+                false
+            }
+        };
+        crate::npu::prof(pre_us, gate_us, wait_us, t0.elapsed().as_micros() as u64);
+        if timed && ok {
+            crate::npu::trial_sample(crate::npu::Mode::Decode, true, t0.elapsed().as_micros() as u64);
+        }
+        Some(true)
+    }
+
+    fn matvec_silu_mul_cpu(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> bool {
         if gate.exact_cpu_default() || up.exact_cpu_default() {
             return float_activations_scope(|| {
-                Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
+                Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
             });
         }
         if gate.has_prism_contract()
@@ -5540,7 +5673,14 @@ fn qmatmat(
 
 /// Split rows across pool workers (shared qmatvec pattern). Self-balancing
 /// — see `Pool::run_rows` for why a static 1/n split is wrong here.
+thread_local! {
+    /// Rows a fused kernel dispatched from this thread may compute (`npu_silu_mul`:
+    /// the rest of the rows are on the NPU). `usize::MAX`: all of them.
+    static ROW_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 fn dispatch_rows(pool: Option<&Pool>, rows: usize, run: &(dyn Fn(usize, usize) + Sync)) {
+    let rows = rows.min(ROW_LIMIT.with(|c| c.get()));
     match pool {
         Some(pool) if rows >= 256 => pool.run_rows(rows, run),
         _ => run(0, rows),
@@ -8616,6 +8756,111 @@ fn cuda_mm_verify() -> bool {
 /// Under `row_exact()` every cell is summed in `q4tp_matvec`'s order on
 /// every architecture; the mode is read once, so one call never mixes
 /// the two contracts when a concurrent scope opens or closes mid-call.
+/// Copy rows `row0..` of a q4tp matrix into the NPU module's tiled layout
+/// (`npu.rs`): the codes byte for byte, each group's scale as a Q15 ratio of
+/// the row's largest. `buf` is `ceil((rows - row0)/32) * gpr * npu::REC` bytes.
+#[cfg(target_os = "android")]
+fn npu_fill_q4tp(bytes: &[u8], rows: usize, cols: usize, buf: &mut [u8], row0: usize) -> Option<crate::npu::Tiled> {
+    const REC: usize = crate::npu::REC;
+    let gpr = cols / GROUP_SIZE;
+    let tiles = (rows - row0).div_ceil(32);
+    if buf.len() != tiles * gpr * REC {
+        return None;
+    }
+    buf.fill(0);
+    let v = Q4tpView::new(bytes, rows, cols);
+    let mut scales = vec![0f32; gpr];
+    let mut row_max = vec![0f32; rows - row0];
+    for r in row0..rows {
+        v.scales_into(r, gpr, &mut scales);
+        let mx = scales.iter().fold(0f32, |a, &s| a.max(s.abs()));
+        row_max[r - row0] = mx;
+        let inv = if mx > 0.0 { 32767.0 / mx } else { 0.0 };
+        let (t, lane) = ((r - row0) / 32, (r - row0) % 32);
+        for g in 0..gpr {
+            let rec = &mut buf[(t * gpr + g) * REC..(t * gpr + g + 1) * REC];
+            let src = &v.nib[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+            for j in 0..4 {
+                rec[j * 128 + lane * 4..j * 128 + lane * 4 + 4].copy_from_slice(&src[4 * j..4 * j + 4]);
+            }
+            let q = ((scales[g] * inv).round() as i32).clamp(-32767, 32767);
+            rec[512 + lane * 4..512 + lane * 4 + 4].copy_from_slice(&(q << 16).to_le_bytes());
+        }
+    }
+    // A group's integer sum is below 2^15; `gpr` of them, shifted, must stay inside an i32.
+    let shift = (15u32.saturating_sub(gpr.next_power_of_two().trailing_zeros())).min(8);
+    Some(crate::npu::Tiled { tiles, gpr, shift, row_max })
+}
+
+#[cfg(target_os = "android")]
+fn npu_lane_q4tp(mode: crate::npu::Mode, bytes: &[u8], rows: usize, cols: usize) -> Option<std::sync::Arc<crate::npu::Lane>> {
+    crate::npu::lane_for(mode, bytes.as_ptr() as usize, rows, cols, &|buf, row0| {
+        npu_fill_q4tp(bytes, rows, cols, buf, row0)
+    })
+}
+
+/// The NPU split of a prompt chunk's q4tp `matmat`: rows `row0..` for all
+/// `b` vectors on the DSP while the CPU kernel computes rows `..row0`.
+/// `false`: no lane for this matrix — the caller runs the CPU kernel.
+#[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
+fn npu_q4tp_matmat(bytes: &[u8], xs_all: &[f32], b: usize, rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) -> bool {
+    use crate::npu::Mode::Batch;
+    if b < 4 || !a8w8_enabled() || row_exact() {
+        return false;
+    }
+    let Some(lane) = npu_lane_q4tp(Batch, bytes, rows, cols) else {
+        return false;
+    };
+    let t0 = std::time::Instant::now();
+    // Nanoseconds per vector per million weights: the trial's matrices differ in shape.
+    let per_vec = |t0: std::time::Instant| (t0.elapsed().as_nanos() as u64) * 1_000_000 / (b * rows * cols) as u64;
+    let timed = match crate::npu::arm(Batch) {
+        crate::npu::Arm::Cpu => {
+            q4tp_matmat_with(bytes, xs_all, b, rows, cols, out, pool, false);
+            crate::npu::trial_sample(Batch, false, per_vec(t0));
+            return true;
+        }
+        crate::npu::Arm::Npu { timed } => timed,
+    };
+    // The same per-vector int8 split the CPU kernel makes (it makes it
+    // again inside): integers to the DSP, outliers added here in float.
+    let acts = split_acts_pooled(xs_all, b, cols, pool);
+    let mut xq = vec![0i8; b * cols];
+    for (dst, a) in xq.chunks_exact_mut(cols).zip(&acts) {
+        dst.copy_from_slice(&a.xq);
+    }
+    let pending = crate::npu::start_batch(&lane, b, &xq);
+    let row0 = lane.row0;
+    ROW_LIMIT.with(|c| c.set(row0));
+    q4tp_matmat_with(bytes, xs_all, b, rows, cols, out, pool, false);
+    ROW_LIMIT.with(|c| c.set(usize::MAX));
+    match pending.and_then(|p| p.finish()) {
+        Some(y) => {
+            let n = lane.tiles * 32;
+            for (bi, a) in acts.iter().enumerate() {
+                let k = a.sx * lane.unit();
+                let yb = &y[bi * n..(bi + 1) * n];
+                let ob = &mut out[bi * rows..(bi + 1) * rows];
+                for r in row0..rows {
+                    let i = r - row0;
+                    let mut v = yb[i] as f32 * lane.row_max[i] * k;
+                    for &(j, xv) in &a.outliers {
+                        let (w, s) = lane.weight(i, j);
+                        v += w * s * xv;
+                    }
+                    ob[r] = v;
+                }
+            }
+            if timed {
+                crate::npu::trial_sample(Batch, true, per_vec(t0));
+            }
+        }
+        None => q4tp_matmat_with(bytes, xs_all, b, rows, cols, out, pool, false),
+    }
+    true
+}
+
 fn q4tp_matmat(
     bytes: &[u8],
     xs_all: &[f32],
@@ -8625,6 +8870,10 @@ fn q4tp_matmat(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    #[cfg(target_os = "android")]
+    if npu_q4tp_matmat(bytes, xs_all, b, rows, cols, out, pool) {
+        return;
+    }
     q4tp_matmat_with(bytes, xs_all, b, rows, cols, out, pool, row_exact())
 }
 
