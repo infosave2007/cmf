@@ -45,6 +45,7 @@ mk b_lookup8.u16 1 $P/lookup8.jsonl.gz  # lookup_gen.py --near 0.8 --ranked --ne
 mk b_lookup11.u16 1 $P/lookup11.jsonl.gz  # the same with --reason react
 mk b_lookup13.u16 1 $P/lookup13.jsonl.gz  # the same with --reason react --labels
 mk b_lookup15.u16 1 $P/lookup15.jsonl.gz  # the same with --reason react --labels --or-rules 0.25
+mk b_lookup16.u16 1 $P/lookup16.jsonl.gz  # the same with --no-lone-filter, over train_gen.py --contrast 5200 --pipes 9000 --mix-order
 mk b_q27_answers.u16 1 $P/q27_answers.jsonl.gz  # q27_data.py: answers of Qwen3.8-27B to coding prompts
 mk b_q27_chat.u16 1 $P/q27_chat.jsonl.gz
 mk b_q27_code.u16 0 $P/q27_code.jsonl.gz
