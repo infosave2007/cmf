@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-11-17
+
+### Added
+- NPU lane for Android phones with a Hexagon DSP (Snapdragon, Hexagon v68 and newer): a prompt chunk's q4tp
+  matrix products are split by rows between the CPU and the DSP. The DSP side is Cortiq's own module
+  (`crates/cortiq-engine/npu/hvx`: a FastRPC interface, an integer-HVX kernel for an unsigned PD and its Android
+  client, ~18 KB and ~12 KB), not a vendor runtime: q4tp codes are moved into a 32-rows-per-vector tiled layout
+  as they are and multiplied with `vrmpy`, a group's scales becoming Q15 ratios of the row's largest (relative
+  error 1e-6 against a double-precision reference). For a chunk the DSP splits a group's codes once and spends
+  them on eight activation vectors on two HVX threads; the CPU kernel computes the other rows meanwhile under a
+  thread-local row limit. The activation is the CPU kernel's own int8 split with float outliers, so the greedy
+  text is the CPU's. Off unless asked for (`npu::set_enabled`, `CMF_NPU=1`); `npu::set_lib_dir` names where the
+  DSP half lives. Each use is measured against the CPU in-process (alternating calls over the first 16
+  matrices, normalised by matrix size) and kept only when it wins by 5%; the verdict is remembered beside the
+  model (`cortiq-npu-probe.tsv`), and `npu::status()` reports it. The weights copied for the DSP take at most a
+  fifth of the memory available when the first lane is built (512 MB cap). On a Snapdragon 778G (Hexagon V68),
+  LFM3-1.7B q4tp: a 256-token prompt at 30.9 tokens/s against 22.7 on the CPU (35.6 within 640 MB), in an app
+  a 296-token text at ~36 against ~23; botpsy-0.8B 60.4 -> 65.0; decode unchanged. The decode split (a gate/up
+  pair's rows in one call) is there but off unless `CMF_NPU_DECODE=1`: a token is bound by DDR, which the CPU
+  and the DSP share, and on that phone it does not pay. Building the module needs the Hexagon SDK
+  (`npu/hvx/README.md`); nothing here is compiled by cargo.
+
 ## [0.9.3] — 2026-11-16
 
 ### Added
