@@ -56,9 +56,10 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// Where `libcortiq_npu.so` and `libcortiq_hvx_skel.so` live (an app's native
-/// library directory). Must be called before the first use; without it the
-/// loader's default search path is used.
+/// The directory holding `libcortiq_hvx_skel.so` (the DSP half, which the DSP
+/// reads as a file) and optionally `libcortiq_npu.so` (else loaded by name).
+/// Must be called before the first use; without it the loader's default
+/// search path is used.
 pub fn set_lib_dir(dir: &str) {
     *LIB_DIR.lock().unwrap() = Some(dir.to_string());
 }
@@ -84,9 +85,14 @@ fn api() -> Option<&'static Api> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
         let dir = LIB_DIR.lock().unwrap().clone();
+        // The ARM half is an ordinary app library: by path when the caller's
+        // directory holds it, else by name — an Android app whose libraries
+        // stay uncompressed inside the APK has nothing on disk to point at,
+        // and the linker finds them by name. The DSP half must be a real
+        // file (`dir` is where the caller put it).
         let lib = std::env::var("CMF_NPU_LIB").ok().unwrap_or_else(|| match &dir {
-            Some(d) => format!("{d}/libcortiq_npu.so"),
-            None => "libcortiq_npu.so".into(),
+            Some(d) if std::path::Path::new(d).join("libcortiq_npu.so").exists() => format!("{d}/libcortiq_npu.so"),
+            _ => "libcortiq_npu.so".into(),
         });
         if let Some(d) = &dir {
             // The DSP loads its skeleton from this list; the vendor
