@@ -571,6 +571,32 @@ pub fn fold_mask(
     out
 }
 
+/// Soft-Fold: the record's FFN tensors with every neuron's learned gain
+/// σ(m) folded into its down_proj column (gate_proj / up_proj as polished).
+pub fn fold_gains(
+    cfg: &EmbryoCfg,
+    id: &str,
+    layers: &[usize],
+    snaps: &[Vec<f32>],
+    gains: &[Vec<f32>],
+) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+    let (h, i) = (cfg.hidden, cfg.inter);
+    let mut out = Vec::with_capacity(layers.len() * 3);
+    for (li, &l) in layers.iter().enumerate() {
+        let mut wd = snaps[li * 3 + 2].clone();
+        for j in 0..i {
+            for r in 0..h {
+                wd[r * i + j] *= gains[li][j];
+            }
+        }
+        let name = |proj: &str| format!("skill.{id}.{}", ffn_tensor_name(cfg, l, proj));
+        out.push((name("gate_proj"), vec![i, h], snaps[li * 3].clone()));
+        out.push((name("up_proj"), vec![i, h], snaps[li * 3 + 1].clone()));
+        out.push((name("down_proj"), vec![h, i], wd));
+    }
+    out
+}
+
 fn kept_fractions(masks: &[Vec<bool>]) -> Vec<f32> {
     masks
         .iter()
@@ -584,6 +610,8 @@ fn kept_fractions(masks: &[Vec<bool>]) -> Vec<f32> {
 pub const PROMPT_CONTRACT: &str = "cmf-im-v1";
 /// `origin.recipe` of a v2 record.
 pub const RECIPE_V2: &str = "DTG-MA mask (phase A) + polish under the hard mask (phase B)";
+/// `origin.recipe` of a v2 record baked with `--soft-fold`.
+pub const RECIPE_V2_SOFT: &str = "DTG-MA mask (phase A) + Soft-Fold: every neuron's learned gain σ(m) folded into down_proj + FCD under it (phase B)";
 /// Fewest prompts per φ class (skill / backbone) a descriptor is fitted on.
 pub const PHI_MIN_PROMPTS: usize = 8;
 
@@ -603,6 +631,28 @@ pub struct BakeV2Args {
     /// all-on start is the exact genome and a mask can drop a neuron
     pub tau: f32,
     pub eval_every: usize,
+    /// mask logit at step zero ([`SKILL_INIT_LOGIT`] by default; 4.0 is the
+    /// near-identity start of the DTG-MA notebooks)
+    pub mask_init: f32,
+    /// Patent 2 Soft-Fold: the mask is evaluated, polished under and folded
+    /// as the learned gain σ(m) of every neuron (down_proj columns scaled),
+    /// instead of the hard 1[σ(m) > τ]
+    pub soft_fold: bool,
+    /// phase B trains the shared FFN of only this many of the LAST selected
+    /// layers (0 = of every selected layer)
+    pub fcd_layers: usize,
+    /// phase B evaluates every this many steps (0 = `eval_every`)
+    pub eval_every_b: usize,
+    /// phase A draws each batch from the records of one length class and
+    /// runs it on an instance of that width (`bucket_widths`, then the
+    /// shards' own): a record's padding is not computed. Every width is a
+    /// whole instance in memory next to the full-width one
+    pub length_buckets: bool,
+    /// the narrower widths (multiples of 64 below the shards' width; empty =
+    /// [`BUCKET_WIDTHS`])
+    pub bucket_widths: Vec<usize>,
+    /// final-split evaluation size, as `dev_batches` (0 = every record)
+    pub final_batches: usize,
     /// rows per batch (SFT rows + raw-LM rows)
     pub batch: usize,
     /// dev evaluation size: 0 = every record of `--sft-dev` (default);
@@ -1296,6 +1346,83 @@ impl MixSampler {
             }
         }
     }
+
+    /// A draw in `0..n` from the sampler's stream.
+    pub fn pick(&mut self, n: usize) -> usize {
+        (splitmix(&mut self.state) % n.max(1) as u64) as usize
+    }
+
+    /// A batch of width `t ≤ self.t` from the records `rows` (every one of
+    /// them ends within `t`: the cut tail is padding) and raw-LM windows of
+    /// that width.
+    pub fn batch_rows(
+        &mut self,
+        sft: &SftShard,
+        rows: &[usize],
+        t: usize,
+        lm: Option<&Shard>,
+        tokens: &mut Vec<u32>,
+        targets: &mut Vec<u32>,
+    ) {
+        assert!(t <= self.t && !rows.is_empty());
+        tokens.clear();
+        targets.clear();
+        for _ in 0..self.b - self.lm_rows {
+            let (tok, tgt) = sft.record(rows[self.pick(rows.len())]);
+            tokens.extend(tok[..t].iter().map(|&x| x as u32));
+            targets.extend(
+                tgt[..t]
+                    .iter()
+                    .map(|&x| if x == IGNORE { u32::MAX } else { x as u32 }),
+            );
+        }
+        if self.lm_rows > 0 {
+            let lm = lm.expect("lm rows need an LM shard");
+            let n = lm.tokens.len();
+            for _ in 0..self.lm_rows {
+                let start = self.pick(n - self.t - 1);
+                let w = &lm.tokens[start..start + t + 1];
+                tokens.extend(w[..t].iter().map(|&x| x as u32));
+                targets.extend(w[1..].iter().map(|&x| x as u32));
+            }
+        }
+    }
+}
+
+/// Widths of the narrower instances of `--length-buckets` when
+/// `--bucket-widths` names none.
+pub const BUCKET_WIDTHS: [usize; 3] = [192, 256, 384];
+
+/// Where a record ends: one past its last scored target.
+pub fn record_len(sft: &SftShard, r: usize) -> usize {
+    let (_, tgt) = sft.record(r);
+    tgt.iter().rposition(|&x| x != IGNORE).map_or(1, |p| p + 1)
+}
+
+/// Response-only NLL of `rows` on an instance of width `t ≤ sft.seq`: each
+/// record cut at `t` (the rows must end within it). `(Σ nll, tokens)`.
+pub fn answer_nll_at(gpu: &EmbryoGpu, sft: &SftShard, batch: usize, rows: &[usize], t: usize) -> (f64, usize) {
+    let (mut tk, mut tg) = (Vec::with_capacity(batch * t), Vec::with_capacity(batch * t));
+    let (mut sum, mut cnt) = (0f64, 0usize);
+    for chunk in rows.chunks(batch.max(1)) {
+        tk.clear();
+        tg.clear();
+        for &r in chunk {
+            let (tok, tgt) = sft.record(r);
+            tk.extend(tok[..t].iter().map(|&x| x as u32));
+            tg.extend(tgt[..t].iter().map(|&x| if x == IGNORE { u32::MAX } else { x as u32 }));
+        }
+        for _ in chunk.len()..batch {
+            tk.extend(std::iter::repeat_n(0u32, t));
+            tg.extend(std::iter::repeat_n(u32::MAX, t));
+        }
+        let v = tg.iter().filter(|&&x| x != u32::MAX).count();
+        if v > 0 {
+            sum += gpu.eval_loss(&tk, &tg) as f64 * v as f64;
+            cnt += v;
+        }
+    }
+    (sum, cnt)
 }
 
 /// Raw-LM dev batches per evaluation when `dev_batches == 0`.
@@ -1452,12 +1579,16 @@ pub fn bake_v2_train(
         c,
         a.layers.clone(),
         i,
-        SKILL_INIT_LOGIT,
+        a.mask_init,
         a.tau,
     ));
+    gpu.skill.as_ref().unwrap().polish.set(a.fcd_layers);
     // the whole dev shard (or an even stride over all of it), each record once
     let dev_rows = eval_records(data.sft_dev.records, a.dev_batches.saturating_mul(a.batch));
-    let final_rows = data.sft_final.as_ref().map(|f| eval_records(f.records, 0));
+    let final_rows = data
+        .sft_final
+        .as_ref()
+        .map(|f| eval_records(f.records, a.final_batches.saturating_mul(a.batch)));
     let lm_batches = data.lm_dev.as_ref().map(|lm| {
         let want = if a.dev_batches == 0 {
             LM_DEV_BATCHES
@@ -1505,23 +1636,120 @@ pub fn bake_v2_train(
     );
     let mut sampler = MixSampler::new(a.batch, t, lm_rows, a.seed);
     let (mut tk, mut tg) = (Vec::new(), Vec::new());
+    // --length-buckets: the train records by where they end, and an instance per narrower width
+    let mut classes: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut narrow: Vec<(usize, EmbryoGpu)> = Vec::new();
+    if a.length_buckets {
+        let mut widths: Vec<usize> = if a.bucket_widths.is_empty() {
+            BUCKET_WIDTHS.to_vec()
+        } else {
+            a.bucket_widths.clone()
+        };
+        widths.retain(|&w| w < t);
+        widths.sort_unstable();
+        widths.dedup();
+        anyhow::ensure!(
+            widths.iter().all(|&w| w > 0 && w % 64 == 0),
+            "--bucket-widths must be multiples of 64"
+        );
+        classes = widths.iter().copied().chain(std::iter::once(t)).map(|w| (w, Vec::new())).collect();
+        for r in 0..data.sft_train.records {
+            let len = record_len(&data.sft_train, r);
+            let w = widths.iter().copied().find(|&w| len <= w).unwrap_or(t);
+            classes.iter_mut().find(|(cw, _)| *cw == w).unwrap().1.push(r);
+        }
+        classes.retain(|(_, rows)| !rows.is_empty());
+        for (w, rows) in &classes {
+            if *w == t {
+                continue;
+            }
+            let mut g = bake_gpu(cfg.clone(), a.batch, *w, &ck.params)
+                .ok_or_else(|| anyhow::anyhow!("no GPU device (Metal / Vulkan)"))?;
+            g.set_desc(&ck.extras);
+            g.desc_updates.set(false);
+            g.anchor_fixed_window.set(true);
+            let gc = g.ctx();
+            g.skill = Some(SkillState::new(gc, a.layers.clone(), i, a.mask_init, a.tau));
+            // the same records at their own width and at the shards': the cut tail is padding
+            let probe: Vec<usize> = rows.iter().copied().take(a.batch).collect();
+            g.skill.as_ref().unwrap().hard.set(true);
+            gpu.skill.as_ref().unwrap().hard.set(true);
+            let (s1, n1) = answer_nll_at(&g, &data.sft_train, a.batch, &probe, *w);
+            let (s2, n2) = answer_nll_at(&gpu, &data.sft_train, a.batch, &probe, t);
+            g.skill.as_ref().unwrap().hard.set(false);
+            gpu.skill.as_ref().unwrap().hard.set(false);
+            eprintln!(
+                "  width {w}: {} records; answer NLL of {} of them {:.6} at this width, {:.6} at {t}",
+                rows.len(),
+                probe.len(),
+                s1 / n1.max(1) as f64,
+                s2 / n2.max(1) as f64
+            );
+            narrow.push((*w, g));
+        }
+    }
+    let total: usize = classes.iter().map(|(_, rows)| rows.len()).sum();
+    // which instance holds the latest mask state: usize::MAX = the full-width one
+    let mut holder = usize::MAX;
+    let sync = |from: &SkillState, to: &SkillState| {
+        to.logits.write_from(&from.logits.to_vec());
+        to.m.write_from(&from.m.to_vec());
+        to.v.write_from(&from.v.to_vec());
+    };
     // ---- phase A: masks to the denoising bottom ----
     let mut best_a = (base, gpu.skill.as_ref().unwrap().logits.to_vec());
     for step in 0..a.steps_a {
         anyhow::ensure!(!should_stop(), "preempted");
         let l1 = a.l1 * (step as f32 / a.steps_a.max(1) as f32);
-        gpu.skill.as_ref().unwrap().l1.set(l1);
-        sampler.batch(&data.sft_train, data.lm_train.as_ref(), &mut tk, &mut tg);
-        let (loss, gn) = gpu.train_step_skill(&tk, &tg, a.lr_a, 0.0, 1.0, false);
+        let (loss, gn) = if a.length_buckets {
+            // a length class in proportion to its records, the batch from it at its width
+            let mut k = sampler.pick(total);
+            let ci = classes
+                .iter()
+                .position(|(_, rows)| {
+                    if k < rows.len() {
+                        true
+                    } else {
+                        k -= rows.len();
+                        false
+                    }
+                })
+                .unwrap();
+            let (w, rows) = (classes[ci].0, &classes[ci].1);
+            sampler.batch_rows(&data.sft_train, rows, w, data.lm_train.as_ref(), &mut tk, &mut tg);
+            let want = narrow.iter().position(|(nw, _)| *nw == w).unwrap_or(usize::MAX);
+            if want != holder {
+                let from = if holder == usize::MAX { gpu.skill.as_ref().unwrap() } else { narrow[holder].1.skill.as_ref().unwrap() };
+                let to = if want == usize::MAX { gpu.skill.as_ref().unwrap() } else { narrow[want].1.skill.as_ref().unwrap() };
+                sync(from, to);
+                let at = if holder == usize::MAX { gpu.step } else { narrow[holder].1.step };
+                if want == usize::MAX { gpu.step = at } else { narrow[want].1.step = at }
+                holder = want;
+            }
+            let g = if want == usize::MAX { &mut gpu } else { &mut narrow[want].1 };
+            g.skill.as_ref().unwrap().l1.set(l1);
+            g.train_step_skill(&tk, &tg, a.lr_a, 0.0, 1.0, false)
+        } else {
+            gpu.skill.as_ref().unwrap().l1.set(l1);
+            sampler.batch(&data.sft_train, data.lm_train.as_ref(), &mut tk, &mut tg);
+            gpu.train_step_skill(&tk, &tg, a.lr_a, 0.0, 1.0, false)
+        };
         if (step + 1) % a.eval_every.max(1) == 0 || step + 1 == a.steps_a {
+            if holder != usize::MAX {
+                // the evaluation runs at the shards' width: bring the mask there
+                sync(narrow[holder].1.skill.as_ref().unwrap(), gpu.skill.as_ref().unwrap());
+                gpu.step = narrow[holder].1.step;
+                holder = usize::MAX;
+            }
             let sk = gpu.skill.as_ref().unwrap();
-            sk.hard.set(true);
+            sk.hard.set(!a.soft_fold);
             let p = dev(&gpu, step + 1);
             sk.hard.set(false);
             let kept = kept_fractions(&sk.hard_masks());
             eprintln!(
-                "  A step {:>5} loss {loss:.4} |g| {gn:.3} l1 {l1:.2e} dev(hard) {:.4}{} kept {:?} [{:.0} s]",
+                "  A step {:>5} loss {loss:.4} |g| {gn:.3} l1 {l1:.2e} dev({}) {:.4}{} kept {:?} [{:.0} s]",
                 step + 1,
+                if a.soft_fold { "soft" } else { "hard" },
                 p.answer_nll,
                 fmt_lm(&p),
                 kept.iter().map(|k| format!("{k:.2}")).collect::<Vec<_>>(),
@@ -1535,7 +1763,7 @@ pub fn bake_v2_train(
     {
         let sk = gpu.skill.as_ref().unwrap();
         sk.logits.write_from(&best_a.1);
-        sk.hard.set(true);
+        sk.hard.set(!a.soft_fold);
         sk.l1.set(0.0);
     }
     let masks = gpu.skill.as_ref().unwrap().hard_masks();
@@ -1567,7 +1795,8 @@ pub fn bake_v2_train(
             * 0.5
             * (1.0 + (std::f32::consts::PI * step as f32 / a.steps_b.max(1) as f32).cos());
         let (loss, gn) = gpu.train_step_skill(&tk, &tg, lr, 0.0, 1.0, true);
-        if (step + 1) % a.eval_every.max(1) == 0 || step + 1 == a.steps_b {
+        let every_b = if a.eval_every_b > 0 { a.eval_every_b } else { a.eval_every.max(1) };
+        if (step + 1) % every_b == 0 || step + 1 == a.steps_b {
             let p = dev(&gpu, step + 1);
             eprintln!(
                 "  B step {:>5} loss {loss:.4} |g| {gn:.3} lr {lr:.2e} dev {:.4}{} [{:.0} s]",
@@ -1597,7 +1826,17 @@ pub fn bake_v2_train(
         }
         _ => None,
     };
-    let tensors = fold_mask(&cfg, &a.id, &a.layers, &best_b.1, &masks);
+    let tensors = if a.soft_fold {
+        let gains: Vec<Vec<f32>> = best_a
+            .1
+            .chunks(i)
+            .take(a.layers.len())
+            .map(|lg| lg.iter().map(|&m| 1.0 / (1.0 + (-m).exp())).collect())
+            .collect();
+        fold_gains(&cfg, &a.id, &a.layers, &best_b.1, &gains)
+    } else {
+        fold_mask(&cfg, &a.id, &a.layers, &best_b.1, &masks)
+    };
     Ok(BakeV2Trained {
         tensors,
         kept,
@@ -2103,13 +2342,15 @@ pub fn bake_v2(
         a.target_fpr > 0.0 && a.target_fpr < 1.0,
         "--target-fpr must be in (0, 1)"
     );
-    let tau_max = tau_ceiling();
+    anyhow::ensure!(a.mask_init.is_finite(), "--mask-init must be finite");
+    let tau_max = 1.0 / (1.0 + (-a.mask_init).exp());
     anyhow::ensure!(
         a.tau > 0.0 && a.tau < tau_max,
-        "refusing: --tau {} must lie in (0, σ({SKILL_INIT_LOGIT}) = {tau_max:.4}): the all-on \
+        "refusing: --tau {} must lie in (0, σ({}) = {tau_max:.4}): the all-on \
          hard mask is the exact genome only for τ below σ(init logit) — the base dev NLL and \
          phase A start there — and τ ≤ 0 never drops a neuron",
-        a.tau
+        a.tau,
+        a.mask_init
     );
     anyhow::ensure!(
         a.l1.is_finite() && a.l1 >= 0.0,
@@ -2379,7 +2620,8 @@ pub fn bake_v2(
         "trigger": "user_corpus",
         "dataset_sha256": roles.iter().map(|r| r["sha256"].clone()).collect::<Vec<_>>(),
         "inputs": roles,
-        "recipe": RECIPE_V2,
+        "recipe": if a.soft_fold { RECIPE_V2_SOFT } else { RECIPE_V2 },
+        "mask_init": a.mask_init, "soft_fold": a.soft_fold, "fcd_layers": a.fcd_layers,
         "steps": {"a": a.steps_a, "b": a.steps_b},
         "lr": {"a": a.lr_a, "b": a.lr_b},
         "l1": a.l1, "tau": a.tau,

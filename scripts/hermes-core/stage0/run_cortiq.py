@@ -32,6 +32,10 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--strip-think", action="store_true", help="the answer is what follows a <think> block, if the reply has one")
+    ap.add_argument("--route", default="backbone", help="backbone (default) | auto (the file's router decides) | a skill id")
+    ap.add_argument("--include-quarantine", action="store_true",
+                    help="with --route auto: the router also scores records that have not passed their gate yet")
     args = ap.parse_args()
     tasks = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
     if args.limit:
@@ -42,7 +46,8 @@ def main() -> None:
                                          ensure_ascii=False) + "\n" for t in tasks))
         env = dict(os.environ, CMF_GPU="0", CMF_GROWTH="off")
         p = subprocess.run([args.cortiq, "probe-utility", args.model, "--prompts-jsonl", str(pj),
-                            "--max-tokens", str(args.max_tokens), "--route", "backbone", "--json"],
+                            "--max-tokens", str(args.max_tokens), "--route", args.route, "--json"]
+                           + (["--include-quarantine"] if args.include_quarantine else []),
                            env=env, capture_output=True, text=True, check=True)
     rep = json.loads(p.stdout)
     rep = rep[0] if isinstance(rep, list) else rep
@@ -51,9 +56,12 @@ def main() -> None:
     with open(args.out, "w") as f:
         for t, r in zip(tasks, rows):
             assert r["label"].endswith(t["id"]), (r["label"], t["id"])
-            ans, _ = extract(r["answer"], "plain")
+            reply = r["answer"]
+            if args.strip_think and "</think>" in reply:
+                reply = reply.rsplit("</think>", 1)[1]
+            ans, _ = extract(reply, "plain")
             f.write(json.dumps({"id": t["id"], "answer": ans, "raw": r["answer"], "prompt_tokens": r["prompt_tokens"],
-                                "finish": r.get("finish_reason")}, ensure_ascii=False) + "\n")
+                                "finish": r.get("finish_reason"), "route": r.get("route")}, ensure_ascii=False) + "\n")
     toks = sum(r["generated"] for r in rows)
     print(f"{len(tasks)} tasks, {toks} new tokens, mean {sum(r['tok_s'] for r in rows) / len(rows):.0f} tok/s")
 

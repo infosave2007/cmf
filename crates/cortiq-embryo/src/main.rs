@@ -239,6 +239,36 @@ enum Sub {
         tau: f32,
         #[arg(long, default_value_t = 30)]
         eval_every: usize,
+        /// v2: mask logit at step zero (4.0 = the near-identity start of the
+        /// DTG-MA notebooks)
+        #[arg(long, default_value_t = cortiq_embryo::skill::SKILL_INIT_LOGIT)]
+        mask_init: f32,
+        /// v2, Patent 2 Soft-Fold: every neuron keeps its learned gain σ(m),
+        /// folded into down_proj (evaluated and polished as such), instead of
+        /// the hard mask 1[σ(m) > τ]
+        #[arg(long)]
+        soft_fold: bool,
+        /// v2: phase B trains only this many of the LAST selected layers
+        /// (0 = every selected layer)
+        #[arg(long, default_value_t = 0)]
+        fcd_layers: usize,
+        /// v2: phase B evaluates every this many steps (0 = --eval-every)
+        #[arg(long, default_value_t = 0)]
+        eval_every_b: usize,
+        /// v2: phase A draws each batch from the records of one length class
+        /// and runs it at that width (--bucket-widths, then the shards' own):
+        /// the padding of short records is not computed. Every width is a
+        /// whole instance in memory: three of them next to a 16 x 512 batch
+        /// of a 56M genome do not fit a 24 GB Mac
+        #[arg(long)]
+        length_buckets: bool,
+        /// v2: the narrower widths of --length-buckets (multiples of 64;
+        /// default 192,256,384)
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
+        bucket_widths: Vec<usize>,
+        /// v2: final-split evaluation size, as --dev-batches (0 = every record)
+        #[arg(long, default_value_t = 0)]
+        final_batches: usize,
         #[arg(long, default_value_t = 4)]
         batch: usize,
         /// legacy window length (default 512); v2 uses the SFT shards' length
@@ -1251,6 +1281,13 @@ fn main() {
             l1,
             tau,
             eval_every,
+            mask_init,
+            soft_fold,
+            fcd_layers,
+            eval_every_b,
+            length_buckets,
+            bucket_widths,
+            final_batches,
             batch,
             seq,
             phi_layer,
@@ -1343,6 +1380,13 @@ fn main() {
                         l1,
                         tau,
                         eval_every,
+                        mask_init,
+                        soft_fold,
+                        fcd_layers,
+                        eval_every_b,
+                        length_buckets,
+                        bucket_widths,
+                        final_batches,
                         batch,
                         dev_batches,
                         lm_frac,

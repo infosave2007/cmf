@@ -8031,6 +8031,9 @@ pub struct SkillState {
     pub tau: f32,
     /// L1 pressure on σ(m) (phase A), added to the mask gradient
     pub l1: std::cell::Cell<f32>,
+    /// phase B trains the shared FFN of only this many of the LAST selected
+    /// layers (0 = of every selected layer)
+    pub polish: std::cell::Cell<usize>,
 }
 
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
@@ -8053,6 +8056,7 @@ impl SkillState {
             hard: std::cell::Cell::new(false),
             tau,
             l1: std::cell::Cell::new(0.0),
+            polish: std::cell::Cell::new(0),
         }
     }
     pub fn slot(&self, layer: usize) -> Option<usize> {
@@ -8150,7 +8154,11 @@ impl EmbryoGpu {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         if phase_b {
             let (h, i) = (self.cfg.hidden, self.cfg.inter);
-            for &l in &sk.layers {
+            let first = match sk.polish.get() {
+                0 => 0,
+                n => sk.layers.len().saturating_sub(n),
+            };
+            for &l in &sk.layers[first..] {
                 let ffn = match &self.lay.layers[l] {
                     LayerOffs::Mixer { ffn, .. }
                 | LayerOffs::Anchor { ffn, .. }
