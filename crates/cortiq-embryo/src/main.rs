@@ -1033,6 +1033,23 @@ enum Sub {
         /// student already fills the card
         #[arg(long, default_value_t = 0)]
         distill_batch: usize,
+        /// logit distillation into the hierarchical head: a teacher checkpoint
+        /// with the same vocabulary and head clusters, any width; the loss
+        /// becomes (1−w)·CE + w·CE(p_teacher) over the clusters and within the
+        /// target's cluster (the logged loss stays the CE)
+        #[arg(long)]
+        kd_from: Option<PathBuf>,
+        /// w of --kd-from
+        #[arg(long, default_value_t = 0.5)]
+        kd_w: f32,
+        /// teacher micro-batch for --kd-from (0 = --batch)
+        #[arg(long, default_value_t = 0)]
+        kd_batch: usize,
+        /// with --kd-from: the first positions of every window train on the
+        /// plain CE (the teacher reads each window alone, without the
+        /// student's carried state)
+        #[arg(long, default_value_t = 64)]
+        kd_skip: usize,
         /// hold the donated tensors still for the first N steps
         #[arg(long, default_value_t = 0)]
         freeze_donor: usize,
@@ -2678,6 +2695,10 @@ fn main() {
             distill_from,
             distill_w,
             distill_batch,
+            kd_from,
+            kd_w,
+            kd_batch,
+            kd_skip,
             freeze_donor,
             train_only,
             seed,
@@ -2734,6 +2755,10 @@ fn main() {
                 distill_from,
                 distill_w,
                 distill_batch,
+                kd_from,
+                kd_w,
+                kd_batch,
+                kd_skip,
                 freeze_donor,
                 train_only,
                 seed,
@@ -2791,6 +2816,10 @@ fn main() {
                     distill_from,
                     distill_w,
                     distill_batch,
+                    kd_from,
+                    kd_w,
+                    kd_batch,
+                    kd_skip,
                     freeze_donor,
                     train_only,
                     carry,

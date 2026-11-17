@@ -498,6 +498,14 @@ pub struct BirthArgs {
     /// dropless at B8/T1024 = 17.4 GB of 24) keeps the teacher at 1–2 rows and
     /// runs its forward `batch / distill_batch` times per step.
     pub distill_batch: usize,
+    /// Logit-distillation teacher into the hierarchical head
+    /// (`EmbryoGpu::enable_kd`): same vocabulary and head clusters, any width.
+    pub kd_from: Option<PathBuf>,
+    pub kd_w: f32,
+    /// Teacher micro-batch for `kd_from` (0 = the training batch).
+    pub kd_batch: usize,
+    /// Positions of every window before this one keep the plain CE.
+    pub kd_skip: usize,
     /// Keep descriptor extras byte-identical during a bounded continuation.
     pub freeze_desc: bool,
     /// Hold the donated tensors still for the first N steps (progressive
@@ -811,6 +819,32 @@ pub fn birth(a: BirthArgs) {
         );
         (t, tb)
     });
+    // Logit-distillation teacher: forward-only, the served routing (dropless,
+    // served anchor window, frozen descriptors), each window alone.
+    assert!(
+        a.kd_from.is_none() || a.distill_from.is_none(),
+        "--kd-from and --distill-from are two different teachers: pick one"
+    );
+    let kd_teacher = a.kd_from.as_ref().map(|tp| {
+        let ck = load_checkpoint(tp).expect("load --kd-from teacher");
+        let tb = if a.kd_batch == 0 { a.batch } else { a.kd_batch };
+        assert!(tb <= a.batch && a.batch % tb == 0, "--kd-batch must divide --batch");
+        let t = EmbryoGpu::new_eval_dropless(ck.cfg.clone(), tb, a.seq, &ck.params).expect(NO_DEVICE_TEACHER);
+        t.set_desc(&ck.extras);
+        t.desc_updates.set(false);
+        t.anchor_fixed_window.set(true);
+        println!(
+            "kd-from {} (step {}, hidden {}, {} layers), w = {}, teacher batch {}, plain CE before position {}",
+            tp.display(),
+            ck.step,
+            ck.cfg.hidden,
+            ck.cfg.layers,
+            a.kd_w,
+            tb,
+            a.kd_skip
+        );
+        t
+    });
     println!(
         "genome: {} layers, hidden {}, vocab {}, arena {:.2} M; train {} tok, val {} tok; B={} T={} steps={}",
         cfg.layers,
@@ -833,6 +867,10 @@ pub fn birth(a: BirthArgs) {
     if a.dropless {
         println!("dropless routing: capacity = every row");
     }
+    if let Some(t) = kd_teacher.as_ref() {
+        gpu.enable_kd(a.kd_w, t);
+    }
+    let mut kd_loss = f32::NAN;
     if a.carry {
         println!(
             "carry: state carried across windows (reset every {} windows, eot {:?}); anchor keys carried: {}",
@@ -1021,6 +1059,9 @@ pub fn birth(a: BirthArgs) {
                 gpu.train_step_distill(&tokens, &targets, lr, wd, a.clip, &xft, a.distill_w)
             }
             None => {
+                if let Some(t) = kd_teacher.as_ref() {
+                    kd_loss = gpu.kd_gather(t, &tokens, &targets, a.kd_skip);
+                }
                 let (l, g, ms) = gpu.train_step(&tokens, &targets, lr, wd, a.clip);
                 if !a.train_only.is_empty() {
                     // AdamW momentum and decay must not move the frozen part either
@@ -1055,6 +1096,8 @@ pub fn birth(a: BirthArgs) {
         if step % log_every == 0 || step + 1 == a.steps {
             let dtag = if teacher.is_some() {
                 format!(" dist {dloss:.4}")
+            } else if kd_teacher.is_some() {
+                format!(" kd-teacher {kd_loss:.4}")
             } else {
                 String::new()
             };
