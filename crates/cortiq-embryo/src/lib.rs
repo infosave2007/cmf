@@ -38,6 +38,8 @@ pub mod mtp;
 pub mod ops;
 pub mod sft;
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
+pub mod loglik;
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod skill;
 #[cfg(target_os = "macos")]
 pub mod sleep;

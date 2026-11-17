@@ -79,11 +79,14 @@ def main() -> None:
                 f.write(json.dumps({"context": ex["ctx"], "continuation": ending, "e": ei, "j": j}, ensure_ascii=False) + "\n")
     res_path = work / f"{tag}.loglik.jsonl"
     env = dict(os.environ, CMF_GROWTH="off", CMF_GPU="0")
+    cmd = [args.cortiq, "loglik", args.model, "--requests-jsonl", str(req), "--out", str(res_path), "--split", "separate"]
+    if os.environ.get("EMBRYO_LOGLIK_CKPT"):
+        # the trainer's GPU scorer (same tokenizer and separate encoding; weights from the checkpoint)
+        cmd = [os.environ.get("EMBRYO_LOGLIK_BIN", str(Path(args.cortiq).with_name("cortiq-embryo"))), "loglik",
+               "--ckpt", os.environ["EMBRYO_LOGLIK_CKPT"], "--vocab", args.model,
+               "--requests-jsonl", str(req), "--out", str(res_path), "--split", "separate"]
     with open(work / f"{tag}.loglik.log", "w") as log:
-        subprocess.run(
-            [args.cortiq, "loglik", args.model, "--requests-jsonl", str(req), "--out", str(res_path), "--split", "separate"],
-            env=env, check=True, stderr=log,
-        )
+        subprocess.run(cmd, env=env, check=True, stderr=log)
     rows = [json.loads(l) for l in res_path.read_text().splitlines() if l.strip()]
     raw = defaultdict(dict)
     norm = defaultdict(dict)

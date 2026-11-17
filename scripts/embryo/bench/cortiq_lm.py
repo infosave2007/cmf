@@ -48,6 +48,11 @@ class CortiqLM(LM):
         self.scorer = scorer
         self.env = dict(os.environ)
         self.env.update(env or {})
+        # EMBRYO_LOGLIK_CKPT=<trainer checkpoint>: score on the GPU with `cortiq-embryo loglik`
+        # (EMBRYO_LOGLIK_BIN, default cortiq-embryo next to the engine binary)
+        self.embryo_ckpt = os.environ.get("EMBRYO_LOGLIK_CKPT")
+        self.embryo_bin = os.environ.get(
+            "EMBRYO_LOGLIK_BIN", str(Path(cortiq).with_name("cortiq-embryo")))
 
     def _run(self, rows: list[dict], tag: str) -> list[dict]:
         req = self.workdir / f"{tag}.requests.jsonl"
@@ -63,6 +68,7 @@ class CortiqLM(LM):
             "scorer": self.scorer,
             "CMF_GROWTH": self.env.get("CMF_GROWTH"),
             "CMF_GPU": self.env.get("CMF_GPU"),
+            "embryo_ckpt": self.embryo_ckpt,
         }
         if out.exists() and meta.exists() and json.loads(meta.read_text()) == key:
             res = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
@@ -100,6 +106,12 @@ class CortiqLM(LM):
                 "--frame", self.frame,
                 "--scorer", self.scorer,
             ]
+            if self.embryo_ckpt:
+                # the trainer's GPU scorer: the same pair encoding (hflm, raw frame), weights from the checkpoint,
+                # the tokenizer from --model
+                assert self.split == "hflm" and self.frame == "raw", "the GPU scorer serves --split hflm --frame raw"
+                cmd = [self.embryo_bin, "loglik", "--ckpt", self.embryo_ckpt, "--vocab", self.model,
+                       "--requests-jsonl", str(preq), "--out", str(pout)]
             env = dict(self.env)
             if len(parts) > 1:
                 env.setdefault("CMF_THREADS", str(max(1, (os.cpu_count() or 1) // len(parts))))

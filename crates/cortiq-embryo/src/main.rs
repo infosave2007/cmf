@@ -54,6 +54,27 @@ enum Sub {
         #[arg(long, default_value_t = 400 << 20)]
         sample_mb_bytes: usize,
     },
+    /// lm-eval `loglikelihood` requests scored on the GPU by the trainer's
+    /// evaluation forward: the numbers of `cortiq loglik --split hflm --frame
+    /// raw` (same tokenizer and pair encoding, backbone only) at GPU speed
+    Loglik {
+        /// trainer checkpoint (the weights)
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// a .cmf with the same vocabulary (its tokenizer)
+        #[arg(long)]
+        vocab: PathBuf,
+        #[arg(long)]
+        requests_jsonl: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// requests per forward
+        #[arg(long, default_value_t = 64)]
+        rows: usize,
+        /// `hflm` | `separate`, as `cortiq loglik --split`
+        #[arg(long, default_value = "hflm")]
+        split: String,
+    },
     /// Encode corpus files (jsonl.gz / txt / parquet with --features data) into a u16 shard.
     Shard {
         #[arg(long)]
@@ -1129,6 +1150,26 @@ fn main() {
             sample_mb_bytes,
         } => {
             cortiq_embryo::corpus::train_tokenizer(&inputs, &out, vocab, sample_mb_bytes);
+        }
+        Sub::Loglik {
+            ckpt,
+            vocab,
+            requests_jsonl,
+            out,
+            rows,
+            split,
+        } => {
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
+            cortiq_embryo::loglik::run(&ckpt, &vocab, &requests_jsonl, &out, rows, &split).unwrap_or_else(|e| {
+                eprintln!("loglik: {e:#}");
+                std::process::exit(1)
+            });
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
+            {
+                let _ = (ckpt, vocab, requests_jsonl, out, rows, split);
+                eprintln!("loglik needs a GPU build (macOS, or --features vulkan / cuda)");
+                std::process::exit(1);
+            }
         }
         Sub::Shard {
             tokenizer,
