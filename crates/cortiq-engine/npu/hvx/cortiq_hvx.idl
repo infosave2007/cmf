@@ -1,0 +1,26 @@
+// cortiq_hvx.idl - Cortiq's cDSP module (Hexagon v68 and newer, unsigned PD) as FastRPC sees it.
+// Integer HVX only, so it runs on DSPs without HMX too (Snapdragon 778G/888 are v68).
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface cortiq_hvx : remote_handle64 {
+   // y = x + 1 (the round trip); hvx: 0 when a 128-byte HVX context was had and computes;
+   // power: which clock vote took (3 DCVS v3, 2 DCVS v2, 0 none), +10 when the HVX power request failed.
+   long ping(in long x, rout long y, rout long hvx, rout long power);
+
+   // One 4-bit matvec on a tiled matrix.
+   //
+   // w: `tiles` tiles of 32 rows. A tile is `gpr` records of 640 bytes, one per group of 32 inputs:
+   //    four 128-byte vectors of codes, then one of scales. Code vector j holds, in lane r (4 bytes),
+   //    bytes 4j..4j+3 of row r's 16-byte group: byte b carries inputs 8j+2b (low nibble) and 8j+2b+1 (high),
+   //    a code c meaning the level c - 8. The scale vector holds per row a word whose upper half is the
+   //    group's scale over the row's largest, Q15.
+   // x: per group 32 int8: for j in 0..3 the four even inputs 8j, 8j+2, 8j+4, 8j+6, then the four odd ones.
+   // y[r] = sum over groups of ((d << shift) * q15) >> 15, d the group's exact integer sum of level * x.
+   //    The caller multiplies by the row's largest scale, the activation's scale and 2^-shift.
+   // threads: HVX threads to split the tiles over. usec: the DSP's own time.
+   // wfd: the fd of a buffer the caller mapped for the session (fastrpc_mmap); then w is empty and the
+   //    module takes the mapped address. 0: w carries the matrix (mapped around this call).
+   long q4_matvec(in sequence<octet> w, in long wfd, in long tiles, in long gpr, in long shift,
+                  in sequence<octet> x, rout sequence<long> y, in long threads, rout long long usec);
+};

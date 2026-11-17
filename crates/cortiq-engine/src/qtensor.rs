@@ -3798,9 +3798,171 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
+        #[cfg(target_os = "android")]
+        if let Some(done) = Self::npu_silu_mul(gate, up, x, out, limit, pool) {
+            return done;
+        }
+        Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
+    }
+
+    /// Identity of a mapped matrix for the NPU lane table (its bytes' address).
+    #[cfg(target_os = "android")]
+    pub(crate) fn npu_key(&self) -> Option<usize> {
+        match self {
+            Self::Mapped { dtype: TensorDtype::Q4TiledP, .. } if !self.has_prism_contract() => {
+                Some(self.quant_bytes().as_ptr() as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// Copy a q4tp matrix into the NPU module's tiled layout (`npu.rs`): the
+    /// codes byte for byte, each group's scale as a Q15 ratio of the row's
+    /// largest. `buf` is `ceil(rows/32) * gpr * npu::REC` bytes.
+    #[cfg(target_os = "android")]
+    pub(crate) fn npu_fill_tiles(&self, buf: &mut [u8], row0: usize) -> Option<crate::npu::Tiled> {
+        let Self::Mapped { dtype: TensorDtype::Q4TiledP, rows, cols, .. } = self else {
+            return None;
+        };
+        let (rows, cols) = (*rows, *cols);
+        let gpr = cols / GROUP_SIZE;
+        // Rows `row0..rows` only: the rows before are the CPU's share.
+        let tiles = (rows - row0).div_ceil(32);
+        const REC: usize = crate::npu::REC;
+        debug_assert_eq!(buf.len(), tiles * gpr * REC);
+        buf.fill(0);
+        let v = Q4tpView::new(self.quant_bytes(), rows, cols);
+        let mut scales = vec![0f32; gpr];
+        let mut row_max = vec![0f32; rows - row0];
+        for r in row0..rows {
+            v.scales_into(r, gpr, &mut scales);
+            let mx = scales.iter().fold(0f32, |a, &s| a.max(s.abs()));
+            row_max[r - row0] = mx;
+            let inv = if mx > 0.0 { 32767.0 / mx } else { 0.0 };
+            let (t, lane) = ((r - row0) / 32, (r - row0) % 32);
+            for g in 0..gpr {
+                let rec = &mut buf[(t * gpr + g) * REC..(t * gpr + g + 1) * REC];
+                let src = &v.nib[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+                for j in 0..4 {
+                    rec[j * 128 + lane * 4..j * 128 + lane * 4 + 4].copy_from_slice(&src[4 * j..4 * j + 4]);
+                }
+                let q = ((scales[g] * inv).round() as i32).clamp(-32767, 32767);
+                rec[512 + lane * 4..512 + lane * 4 + 4].copy_from_slice(&(q << 16).to_le_bytes());
+            }
+        }
+        // A group's integer sum is below 2^15; `gpr` of them, shifted, must stay inside an i32.
+        let shift = (15u32.saturating_sub(gpr.next_power_of_two().trailing_zeros())).min(8);
+        Some(crate::npu::Tiled { tiles, gpr, shift, row_max })
+    }
+
+    /// The NPU lane of the fused gate+up (`npu.rs`): `up` on the Hexagon DSP
+    /// while this thread's pool computes `gate`. `None`: no lane for this
+    /// pair, the caller takes the CPU kernel. While the lane's trial is open
+    /// the calls alternate between the two paths and both are timed.
+    #[cfg(target_os = "android")]
+    fn npu_silu_mul(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> Option<bool> {
+        if !a8w8_enabled() {
+            return None;
+        }
+        let lane = crate::npu::lane(gate, up)?;
+        let inter = gate.rows();
+        let t0 = std::time::Instant::now();
+        let full_cpu = |out: &mut [f32]| {
+            // The CPU's own best for this pair: the fused kernel, or two
+            // ordinary matvecs where it declines.
+            if !Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool) {
+                let mut g = vec![0f32; inter];
+                let mut u = vec![0f32; inter];
+                gate.matvec(x, &mut g, pool);
+                up.matvec(x, &mut u, pool);
+                for r in 0..inter {
+                    out[r] = silu_mul_limited(g[r], u[r], limit);
+                }
+            }
+        };
+        let timed = match crate::npu::arm() {
+            crate::npu::Arm::Cpu => {
+                full_cpu(out);
+                crate::npu::trial_sample(false, t0.elapsed().as_micros() as u64);
+                return Some(true);
+            }
+            crate::npu::Arm::Npu { timed } => timed,
+        };
+        // Rows `row0..` of both matrices go to the DSP as one call; the CPU's
+        // fused kernel computes rows `..row0` meanwhile. The activation is the
+        // same int8 split the CPU kernel makes (it makes it again inside), so
+        // the two halves of `out` are the same arithmetic up to the Q15
+        // rounding of the scales; the few outliers are added here in float.
+        let row0 = lane.row0;
+        let act = split_act(x);
+        let mut pending = crate::npu::start(&lane, &act.xq);
+        if crate::npu::sync_mode() {
+            // no overlap: for measuring the two costs apart
+            if let Some(p) = pending.as_mut() {
+                p.wait();
+            }
+        }
+        let tg = std::time::Instant::now();
+        ROW_LIMIT.with(|c| c.set(row0));
+        let cpu_ok = Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool);
+        ROW_LIMIT.with(|c| c.set(usize::MAX));
+        let gate_us = tg.elapsed().as_micros() as u64;
+        let pre_us = (tg - t0).as_micros() as u64;
+        let tw = std::time::Instant::now();
+        let y = pending.take().and_then(|p| p.finish());
+        let wait_us = tw.elapsed().as_micros() as u64;
+        let ok = match (cpu_ok, y) {
+            (true, Some(y)) => {
+                let k = act.sx * (32768.0 / 32767.0) / (1u32 << lane.shift) as f32;
+                let (yg, yu) = y.split_at(lane.tiles * 32);
+                for r in row0..inter {
+                    let i = r - row0;
+                    let mut gv = yg[i] as f32 * lane.gate_max[i] * k;
+                    let mut uv = yu[i] as f32 * lane.up_max[i] * k;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = lane.weight(0, i, j);
+                        gv += w * s * xv;
+                        let (w, s) = lane.weight(1, i, j);
+                        uv += w * s * xv;
+                    }
+                    out[r] = silu_mul_limited(gv, uv, limit);
+                }
+                true
+            }
+            (cpu_ok, y) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    eprintln!("[cortiq] npu: fell back to the CPU (fused kernel took the rows: {cpu_ok}, DSP answered: {})", y.is_some())
+                });
+                full_cpu(out);
+                false
+            }
+        };
+        crate::npu::prof(pre_us, gate_us, wait_us, t0.elapsed().as_micros() as u64);
+        if timed && ok {
+            crate::npu::trial_sample(true, t0.elapsed().as_micros() as u64);
+        }
+        Some(true)
+    }
+
+    fn matvec_silu_mul_cpu(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> bool {
         if gate.exact_cpu_default() || up.exact_cpu_default() {
             return float_activations_scope(|| {
-                Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
+                Self::matvec_silu_mul_cpu(gate, up, x, out, limit, pool)
             });
         }
         if gate.has_prism_contract()
@@ -5540,7 +5702,14 @@ fn qmatmat(
 
 /// Split rows across pool workers (shared qmatvec pattern). Self-balancing
 /// — see `Pool::run_rows` for why a static 1/n split is wrong here.
+thread_local! {
+    /// Rows a fused kernel dispatched from this thread may compute (`npu_silu_mul`:
+    /// the rest of the rows are on the NPU). `usize::MAX`: all of them.
+    static ROW_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 fn dispatch_rows(pool: Option<&Pool>, rows: usize, run: &(dyn Fn(usize, usize) + Sync)) {
+    let rows = rows.min(ROW_LIMIT.with(|c| c.get()));
     match pool {
         Some(pool) if rows >= 256 => pool.run_rows(rows, run),
         _ => run(0, rows),

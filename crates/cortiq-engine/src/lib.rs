@@ -79,6 +79,8 @@ pub mod music3;
 pub mod moss_image;
 pub mod moss_imagegen;
 pub mod nystrom;
+#[cfg(target_os = "android")]
+pub mod npu;
 pub mod pin;
 pub mod pipeline;
 /// Gradium Phonon text-to-speech execution for self-contained CMF packages.
