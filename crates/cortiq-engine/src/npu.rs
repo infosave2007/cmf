@@ -445,8 +445,11 @@ pub fn stats() -> (u64, u64) {
 
 const TRIAL_SKIP: usize = 1;
 const TRIAL_SAMPLES: usize = 4;
-/// Matrices a trial may build lanes for before its verdict.
-const TRIAL_KEYS: usize = 6;
+/// Matrices a trial may build lanes for before its verdict. A prompt reads
+/// each matrix once per chunk and an app's prompt is often one chunk, so the
+/// trial has to be able to decide inside it: alternating arms over 16
+/// matrices gives each arm the 1 + 4 calls it needs.
+const TRIAL_KEYS: usize = 16;
 
 /// What a call should do while its use's verdict is open.
 pub enum Arm {
