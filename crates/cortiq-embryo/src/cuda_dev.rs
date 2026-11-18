@@ -562,8 +562,9 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_fwd_chain(EWD) {
 // dT, dS_{c+1} for the batched dK̂ and op 123 (dγ_end); dS_0 goes to dlive.
 // Slots: a dlive, b dU⁰ → dU (chunk-outer), c dS⁰ (chunk-outer), d K̂, e Kγ,
 // f β, g ρ, h γ, j T, k dsl (chunk-outer), l dE' (chunk-outer), m dŨ
-// (chunk-outer), nbuf dcv. Shared: dS [dk][32], K̂ [64][dk], Kγ [64][dk],
-// T [64][64], dE' and dR [64][32].
+// (chunk-outer), nbuf dcv. Shared (80 KB at dk = 128, within an A40's 99):
+// dS [dk][32], K̂ then Kγ [64][dk] (Kγ is loaded into registers while dR is
+// summed and stored once K̂ is done), T [64][64], dE' and dR [64][32].
 extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
  extern __shared__ float sm[];
  const u32 T=U(2u), nv=U(3u), dk=U(4u), dv=U(5u), cdim=U(6u), nch=U(8u);
@@ -574,7 +575,7 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
  const u32 bb=bh/nv, hh=bh%nv;
  const u32 tid=threadIdx.x, lane=tid&31u, w=tid>>5u;
  const u32 rpw=dk/8u; const u32 k4n=dk/4u;
- float* Sd=sm; float* Ks=Sd+dk*32u; float* Kg=Ks+64u*dk; float* Ts=Kg+64u*dk; float* Ep=Ts+4096u; float* Dr=Ep+2048u;
+ float* Sd=sm; float* Ks=Sd+dk*32u; float* Ts=Ks+64u*dk; float* Ep=Ts+4096u; float* Dr=Ep+2048u; float* Kg=Ks;
  {
   float v[16];
   #pragma unroll
@@ -586,19 +587,18 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
  for(u32 cr=0u;cr<nch;cr++){
   const u32 c=nch-1u-cr; const u32 tb=c*64u;
   {
-   float4 kh[8]; float4 kgv[8]; float4 tv[4];
+   float4 kh[8]; float4 tv[4];
    #pragma unroll
    for(u32 m=0u;m<8u;m++){
-    const u32 q=tid+256u*m; kh[m]=make_float4(0.0f,0.0f,0.0f,0.0f); kgv[m]=kh[m];
-    if(q<16u*dk){const u32 i=q/k4n, k4=q%k4n; const u32 o=(bb*T+tb+i)*nv*dk+hh*dk;
-     kh[m]=*((const float4*)(S_d+o)+k4); kgv[m]=*((const float4*)(S_e+o)+k4);}
+    const u32 q=tid+256u*m; kh[m]=make_float4(0.0f,0.0f,0.0f,0.0f);
+    if(q<16u*dk){const u32 i=q/k4n, k4=q%k4n; kh[m]=*((const float4*)(S_d+(bb*T+tb+i)*nv*dk+hh*dk)+k4);}
    }
    #pragma unroll
    for(u32 m=0u;m<4u;m++){tv[m]=*((const float4*)(S_j+(bh*nch+c)*4096u)+tid+256u*m);}
    #pragma unroll
    for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; if(r<dk){S_k[(c*NB+bh)*ss+r*dv+j]=as_u32(Sd[r*32u+lane]);}}
    #pragma unroll
-   for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Ks)[q]=kh[m]; ((float4*)Kg)[q]=kgv[m];}}
+   for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Ks)[q]=kh[m];}}
    #pragma unroll
    for(u32 m=0u;m<4u;m++){((float4*)Ts)[tid+256u*m]=tv[m];}
   }
@@ -628,6 +628,13 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
   }
   __syncthreads();
   {
+   // Kγ_c into registers now, into the K̂ buffer after dR (K̂ is done)
+   float4 kgv[8];
+   #pragma unroll
+   for(u32 m=0u;m<8u;m++){
+    const u32 q=tid+256u*m; kgv[m]=make_float4(0.0f,0.0f,0.0f,0.0f);
+    if(q<16u*dk){const u32 i=q/k4n, k4=q%k4n; kgv[m]=*((const float4*)(S_e+(bb*T+tb+i)*nv*dk+hh*dk)+k4);}
+   }
    // dR = Tᵀ·dE': rows w*8 .. w*8+7 (A(i, k) = T[k][i]), column j
    float acc[8];
    #pragma unroll
@@ -643,6 +650,8 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
     const u32 i=w*8u+a; const float dr=1.0f*acc[a];
     S_nbuf[(bb*T+tb+i)*cdim+2u*nv*dk+hh*dv+j]=as_u32(dr); Dr[i*32u+lane]=dr;
    }
+   #pragma unroll
+   for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Kg)[q]=kgv[m];}}
   }
   __syncthreads();
   {
@@ -874,6 +883,33 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_gemm_table(EWD) {
   }
  }
 }
+// entry 10 (softmax backward over the rows of P): a block per row as in the
+// WGSL. P is read once into registers and dP only where P ≠ 0: off the band
+// P is exactly 0 and its term adds nothing to the lane sums (which never sit
+// at −0). The lane sums in lane order and the WGSL's tree; dS = P·(dP − Σ)
+// where P ≠ 0 and +0 elsewhere (the WGSL's 0·(dP − Σ) is ±0, which every
+// later sum absorbs the same way).
+#define SMB_PER 14u
+extern "C" __global__ void __launch_bounds__(256) emb_x_softmax_bwd(EWD) {
+ __shared__ float red[256];
+ const u32 lid=threadIdx.x; const u32 zrow=blockIdx.x+blockIdx.y*gridDim.x;
+ if(zrow>=U(1u)*U(2u)){return;}
+ const u32 t=U(1u), ld=U(5u); const u32 block=zrow/t, row=zrow%t;
+ const u32 pb=U(3u)+block*t*ld+row*ld; const u32 db=U(4u)+block*t*ld+row*ld;
+ float pv[SMB_PER]; float dv[SMB_PER];
+ #pragma unroll
+ for(u32 i=0u;i<SMB_PER;i++){const u32 q=lid+256u*i; pv[i]=0.0f; dv[i]=0.0f; if(q<ld){pv[i]=AF(pb+q);}}
+ #pragma unroll
+ for(u32 i=0u;i<SMB_PER;i++){const u32 q=lid+256u*i; if(q<ld&&pv[i]!=0.0f){dv[i]=BF(db+q);}}
+ float dot=0.0f;
+ #pragma unroll
+ for(u32 i=0u;i<SMB_PER;i++){if(pv[i]!=0.0f){dot=dot+pv[i]*dv[i];}}
+ red[lid]=dot; __syncthreads();
+ for(u32 st=128u;st>0u;st=st>>1u){if(lid<st){red[lid]=red[lid]+red[lid+st];} __syncthreads();}
+ const float gdot=red[0];
+ #pragma unroll
+ for(u32 i=0u;i<SMB_PER;i++){const u32 q=lid+256u*i; if(q<ld){S_b[db+q]=as_u32((pv[i]!=0.0f)?(pv[i]*(dv[i]-gdot)):0.0f);}}
+}
 // op 84 (route finalize): a warp per row, the row loaded coalesced, lane 0's
 // norm and expert scan in the WGSL's order.
 extern "C" __global__ void __launch_bounds__(256) emb_x_route_fin(EWD) {
@@ -999,6 +1035,7 @@ struct Native {
     moe_gather: cs::CUfunction,
     moe_scatter: cs::CUfunction,
     gemm_table: cs::CUfunction,
+    softmax_bwd: cs::CUfunction,
     wy_scal: cs::CUfunction,
     wy_ut: cs::CUfunction,
     wy_dlg: cs::CUfunction,
@@ -1023,7 +1060,7 @@ const OP_WY_DU_DOTS: u32 = 122;
 const OP_WY_DGEND_ALL: u32 = 123;
 /// Dynamic shared memory of `emb_x_wy_bwd_chain` for key width `dk`.
 fn wy_bwd_chain_smem(dk: u32) -> u32 {
-    (dk * 32 + 2 * 64 * dk + 4096 + 2048 + 2048) * 4
+    (dk * 32 + 64 * dk + 4096 + 2048 + 2048) * 4
 }
 
 impl Ctx {
@@ -1081,6 +1118,11 @@ struct CtxInner {
     blas_dyn: bool,
     /// The cuBLAS handle is in the TF32 tensor-core mode (`CMF_CUDA_TF32=0` = never).
     tf32: bool,
+    /// cuBLAS GEMMs in the bf16 tensor-core mode (`CMF_CUDA_GEMM_BF16=1`: f32
+    /// in and out, operands rounded to bf16 inside the multiply, f32 sums;
+    /// twice TF32's rate on an A40). Off by default; an [`ExactF32`] guard
+    /// still runs full f32.
+    bf16: bool,
     /// Live [`ExactF32`] guards: while any lives, cuBLAS runs full f32.
     exact_depth: Mutex<usize>,
     /// 64 KB of zeros: the slots an operation leaves unbound.
@@ -1270,6 +1312,7 @@ fn init() -> Result<Ctx, String> {
             moe_gather: get("emb_x_moe_gather")?,
             moe_scatter: get("emb_x_moe_scatter")?,
             gemm_table: get("emb_x_gemm_table")?,
+            softmax_bwd: get("emb_x_softmax_bwd")?,
             wy_scal: get("emb_x_wy_scal")?,
             wy_ut: get("emb_x_wy_ut")?,
             wy_dlg: get("emb_x_wy_dlg")?,
@@ -1326,6 +1369,7 @@ fn init() -> Result<Ctx, String> {
             blas_min,
             blas_dyn: std::env::var("CMF_CUDA_CUBLAS_DYN").as_deref() != Ok("0"),
             tf32,
+            bf16: tf32 && std::env::var("CMF_CUDA_GEMM_BF16").as_deref() == Ok("1"),
             exact_depth: Mutex::new(0),
             dummy,
             adapter_name: name,
@@ -1722,6 +1766,10 @@ impl Cmd<'_> {
                 if let Some(n) = nat {
                     (f, block, groups, shared) = n;
                 }
+            } else if entry == 10 && p[5] <= 256 * 14 {
+                if let Some(x) = inner.native.as_ref().filter(|x| !x.skip.contains(&(p[0] + 10000))) {
+                    f = x.softmax_bwd;
+                }
             } else if entry == 6 && p[2] > 0 {
                 if let Some(x) = inner.native.as_ref().filter(|x| !x.skip.contains(&p[0])) {
                     let ncg = p[2].div_ceil(32);
@@ -1883,6 +1931,12 @@ unsafe fn blas_gemm(inner: &CtxInner, op: &OpRec, dynv: Option<[u32; 2]>) {
     let opr = |t| if t { bl::cublasOperation_t::CUBLAS_OP_T } else { bl::cublasOperation_t::CUBLAS_OP_N };
     let h = inner.blas.expect("recorded only with a handle");
     let base = |slot: usize, off: u32| op.slots[slot].0.ptr + 4 * off as u64;
+    let bf16 = inner.bf16 && *inner.exact_depth.lock().unwrap() == 0;
+    let (f32t, ct, algo) = (
+        bl::cudaDataType::CUDA_R_32F,
+        bl::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+        bl::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+    );
     let (a0, b0, c0) = (base(0, p[10]), base(1, p[11]), base(2, p[12]));
     for cb in 0..nb {
         for ch in 0..nh {
@@ -1890,7 +1944,18 @@ unsafe fn blas_gemm(inner: &CtxInner, op: &OpRec, dynv: Option<[u32; 2]>) {
             let b = b0 + 4 * (cb * p[21] as u64 + ch * p[22] as u64);
             let c = c0 + 4 * (cb * p[24] as u64 + ch * p[25] as u64);
             let s = unsafe {
-                if nc == 1 {
+                if bf16 && nc == 1 {
+                    bl::cublasGemmEx(
+                        h, opr(tb), opr(ta), n, m, k, (&al as *const f32).cast(), b as *const c_void, f32t, ldb,
+                        a as *const c_void, f32t, lda, (&be as *const f32).cast(), c as *mut c_void, f32t, ldc, ct, algo,
+                    )
+                } else if bf16 {
+                    bl::cublasGemmStridedBatchedEx(
+                        h, opr(tb), opr(ta), n, m, k, (&al as *const f32).cast(), b as *const c_void, f32t, ldb,
+                        p[23] as i64, a as *const c_void, f32t, lda, p[20] as i64, (&be as *const f32).cast(),
+                        c as *mut c_void, f32t, ldc, p[26] as i64, nc as i32, ct, algo,
+                    )
+                } else if nc == 1 {
                     bl::cublasSgemm_v2(h, opr(tb), opr(ta), n, m, k, &al, b as *const f32, ldb, a as *const f32, lda, &be, c as *mut f32, ldc)
                 } else {
                     bl::cublasSgemmStridedBatched(
