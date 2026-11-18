@@ -69,7 +69,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "datasets"))
 
 from convert import render  # noqa: E402
-from lookup_gen import SYSTEM, TOOLS, TOOLS_NOTE, Skip, find, match, note_card, parse_card, split_prompt, vague, what_query  # noqa: E402
+from lookup_gen import BUILTIN, SYSTEM, TOOLS, TOOLS_NOTE, Skip, find, match, note_card, parse_card, split_prompt, vague, what_query  # noqa: E402
 
 STOP = set("a an the of to in on for and or with from by is are be it its as at all into this that using use given "
            "how do i need please show print get file files".split())
@@ -173,9 +173,12 @@ def opening(user: str, direct: bool, tools=TOOLS) -> str:
     return text[: text.rindex(ASSISTANT)] + ASSISTANT
 
 
-def complete(port: int, prompt: str, max_tokens: int) -> dict:
+def complete(port: int, prompt: str, max_tokens: int, builtin: bool = False) -> dict:
+    body = {"model": "m", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0}
+    if builtin:
+        body["builtin_tools"] = True  # the server answers calc/table calls itself and generates on
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions",
-                                 data=json.dumps({"model": "m", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0}).encode(),
+                                 data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req, timeout=600).read())
 
@@ -220,21 +223,30 @@ def plain_answer(text: str) -> str:
 
 
 def run_task(t: dict, pool: Store, args, given=None, tools=TOOLS) -> dict:
-    """One task in the loop. `given`: the cards of the store in place of the task's own (teach mode)."""
+    """One task in the loop. `given`: the cards of the store in place of the task's own (teach mode).
+    With --builtin-tools every task lists the engine's tools and an arith task runs in the contract (the
+    system turn and the tools) instead of directly: the server answers its table/calc calls."""
     cards, bare, with_card = task_parts(t)
-    direct = cards is None
+    builtin = bool(getattr(args, "builtin_tools", False))
+    if builtin:
+        tools = tools + BUILTIN
+    direct = cards is None and not (builtin and t["cat"] == "arith")
     if given is not None:
         cards = given
-    own = None if direct else Store(cards)
+    own = None if cards is None else Store(cards)
     store = own if (args.store == "own" or t["ref"] == "NONE") else pool
-    mine = set() if direct else wanted(t, cards) if given is None else {(c["name"], c["os"]) for c in cards}
+    mine = set() if cards is None else wanted(t, cards) if given is None else {(c["name"], c["os"]) for c in cards}
     prompt = opening(with_card if (args.mode == "context" and not direct) else bare, direct, tools)
     row = {"id": t["id"], "answer": "", "raw": [], "lookups": [], "hits": [], "prompt_tokens": 0, "new_tokens": 0, "finish": ""}
     for _ in range(args.max_lookups + 1):
         row["_prompt"] = prompt
-        r = reference_turn(t, cards, prompt, args.mode) if args.mock else complete(args.port, prompt, args.max_tokens)
+        r = reference_turn(t, cards, prompt, args.mode) if args.mock else complete(args.port, prompt, args.max_tokens, builtin)
         text = r["choices"][0]["text"]
-        row["raw"].append(text)
+        done = r.get("x_cortiq_tools")  # built-in rounds the server ran before this turn
+        if done:
+            row.setdefault("builtin", []).extend(done["calls"])
+            prompt += done["transcript"]
+        row["raw"].append((done["transcript"] if done else "") + text)
         row["prompt_tokens"] += r["usage"]["prompt_tokens"]
         row["new_tokens"] += r["usage"]["completion_tokens"]
         calls = tool_calls(text)
@@ -254,6 +266,11 @@ def run_task(t: dict, pool: Store, args, given=None, tools=TOOLS) -> dict:
         prompt += text.strip() + "<|im_end|>\n"
         for _, a in calls:
             q = str(a.get("query", ""))
+            if store is None:  # a task without cards (arith with --builtin-tools)
+                row["lookups"].append(q)
+                row["hits"].append(False)
+                prompt += "<|im_start|>tool\n<tool_response>\nNo cards found.\n</tool_response><|im_end|>\n"
+                continue
             ids = list(range(len(own.cards))) if (args.store == "own" and q.strip()) else store.search(q, args.k)
             if args.ranked and args.store == "own":
                 ids.sort(key=lambda i: is_one_of(store.cards[i], mine))
@@ -354,6 +371,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mock", action="store_true", help="no model: the reference policy answers (a test of the loop)")
+    ap.add_argument("--builtin-tools", action="store_true",
+                    help="list the engine's calc/table in every task and let the server run them (arith in the contract)")
     args = ap.parse_args()
     tasks = [json.loads(l) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
     if args.selftest:

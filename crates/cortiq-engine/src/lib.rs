@@ -53,6 +53,7 @@ pub mod lfm3_vl;
 pub mod linear_core;
 pub mod loader;
 pub mod lookup;
+pub mod tools;
 pub mod mimo_moe;
 pub(crate) mod minicpm_tail;
 pub mod ltxaudio;

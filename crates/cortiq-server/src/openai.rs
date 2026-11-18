@@ -2703,7 +2703,18 @@ struct CompletionsRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
+    /// Run the engine's built-in tools (`calc`, `table`; `cortiq_engine::tools`)
+    /// inside the completion: when the model's turn calls only built-in tools,
+    /// the server answers them in tool turns and generates on, up to
+    /// [`BUILTIN_ROUNDS`] times. `text` is then the last turn; the rounds are
+    /// in `x_cortiq_tools` (`calls`, and `transcript`: what was inserted
+    /// between the prompt and `text`). Off unless asked.
+    #[serde(default)]
+    builtin_tools: Option<bool>,
 }
+
+/// Built-in tool rounds one completion may run.
+const BUILTIN_ROUNDS: usize = 4;
 
 #[derive(Serialize)]
 struct CompletionsResponse {
@@ -2717,6 +2728,8 @@ struct CompletionsResponse {
     timings: Option<streaming::Timings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     x_cortiq_route: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_cortiq_tools: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -2794,6 +2807,7 @@ async fn completions(
                         },
                         timings: None,
                         x_cortiq_route: route_json(Some(&d), Some(&outcome), lookup_mode),
+                        x_cortiq_tools: None,
                     })
                     .into_response();
                 }
@@ -2815,16 +2829,17 @@ async fn completions(
     // Gemma prompt is one token short of what the model was trained on
     // (the humanizer's raw-prompt rewrite drifted from the chat one).
     let prompt_ids = state.tokenizer.with_bos(state.tokenizer.encode(&prompt));
+    let max_new = effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize;
 
-    let (result, elapsed_ms, decision, timings) = match run_generation(
+    let (mut result, mut elapsed_ms, decision, mut timings) = match run_generation(
         state.clone(),
         prompt_ids,
         None,
         None,
         None,
-        effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize,
-        request_mask,
-        sampler_config,
+        max_new,
+        request_mask.clone(),
+        sampler_config.clone(),
         None,
         route_text,
         pre_decision,
@@ -2834,6 +2849,49 @@ async fn completions(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // Built-in tools: a turn that calls only `calc` / `table` is answered here
+    // and the model goes on from the tool turns (the backbone, no routing).
+    let (mut prompt_total, mut generated_total) = (result.prompt_tokens, result.tokens_generated);
+    let mut tool_calls = Vec::new();
+    let mut transcript = String::new();
+    if req.builtin_tools.unwrap_or(false) {
+        let mut so_far = prompt.clone();
+        for _ in 0..BUILTIN_ROUNDS {
+            let Some(round) = cortiq_engine::tools::round(&so_far, &result.text) else {
+                break;
+            };
+            let next = cortiq_engine::tools::continue_prompt(&so_far, &result.text, &round);
+            transcript.push_str(&next[so_far.len()..]);
+            for (name, arguments, out) in &round.calls {
+                tool_calls.push(serde_json::json!({"name": name, "arguments": arguments, "result": out}));
+            }
+            so_far = next;
+            let ids = state.tokenizer.with_bos(state.tokenizer.encode(&so_far));
+            let (r, ms, _, t) = match run_generation(
+                state.clone(),
+                ids,
+                None,
+                None,
+                None,
+                max_new,
+                request_mask.clone(),
+                sampler_config.clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(resp) => return resp,
+            };
+            prompt_total += r.prompt_tokens;
+            generated_total += r.tokens_generated;
+            elapsed_ms += ms;
+            timings = t;
+            result = r;
+        }
+    }
     if let Some(d) = &not_routed {
         tracing::info!("{}", d.describe());
     }
@@ -2841,7 +2899,7 @@ async fn completions(
 
     state
         .runtime
-        .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+        .record_generation(generated_total, elapsed_ms, elapsed_ms)
         .await;
 
     Json(CompletionsResponse {
@@ -2855,12 +2913,14 @@ async fn completions(
             finish_reason: result.finish_reason,
         }],
         usage: Usage {
-            prompt_tokens: result.prompt_tokens as u32,
-            completion_tokens: result.tokens_generated as u32,
-            total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
+            prompt_tokens: prompt_total as u32,
+            completion_tokens: generated_total as u32,
+            total_tokens: (prompt_total + generated_total) as u32,
         },
         timings: Some(timings),
         x_cortiq_route: route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode),
+        x_cortiq_tools: (!tool_calls.is_empty())
+            .then(|| serde_json::json!({"calls": tool_calls, "transcript": transcript})),
     })
     .into_response()
 }

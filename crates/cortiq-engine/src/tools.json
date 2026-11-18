@@ -1,0 +1,11 @@
+[
+  {"name": "calc", "description": "Exact arithmetic on integers and decimals: + - * / % ^ and parentheses, sum(), min(), max(), mean(), abs(), round(). Returns the exact result.",
+   "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}},
+  {"name": "table", "description": "Computes over the last command output read as a table: one row a line, columns split by spaces, a header line names the columns, a row's name is its last column, a total line is left out. op: count, sum, min, max, mean, get (one cell), argmax or argmin (the name of the row), diff (the first of two rows minus the second).",
+   "parameters": {"type": "object", "properties": {"op": {"type": "string", "enum": ["count", "sum", "min", "max", "mean", "get", "argmax", "argmin", "diff"]},
+     "column": {"description": "the column: its header name or its number from 1"},
+     "rows": {"type": "array", "items": {"type": "string"}, "description": "only the rows with these names"},
+     "where": {"type": "object", "properties": {"column": {}, "op": {"type": "string", "enum": ["=", "!=", ">", "<", ">=", "<=", "contains"]}, "value": {}},
+       "description": "only the rows whose cell passes the test"}},
+     "required": ["op"]}}
+]
