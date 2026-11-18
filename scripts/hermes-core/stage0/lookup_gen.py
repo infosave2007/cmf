@@ -2,6 +2,7 @@
 
     python -I lookup_gen.py --tasks cards.messages.jsonl --out lookup [--seed 11] [--near P] [--cite] [--weigh]
                             [--ranked] [--need] [--teach P] [--pipes] [--reason react[,arith]] [--labels] [--or-rules P] [--no-lone-filter]
+                            [--builtin-tools CORTIQ]
 
 Input: the tasks of `train_gen.py` (the card is given in the prompt). Output:
 
@@ -138,6 +139,62 @@ NOTE = {"name": "note", "description": "Save a new card to the local reference s
                                                            "command": {"type": "string"}},
                        "required": ["name", "what", "command"]}}
 TOOLS_NOTE = [TOOLS[0], NOTE, TOOLS[1]]
+# The engine's built-in tools (`calc`, `table`): their descriptions are the engine's own file, the one the
+# server runs them by (`cortiq_engine::tools`, `/v1/completions` with `builtin_tools`).
+BUILTIN = json.loads((Path(__file__).resolve().parents[3] / "crates/cortiq-engine/src/tools.json").read_text())
+
+
+class EngineTools:
+    """`cortiq tool --batch` as a subprocess: the tool turns of the traces are the engine's own answers."""
+
+    def __init__(self, cortiq: str):
+        import subprocess
+        self.p = subprocess.Popen([cortiq, "tool", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  text=True, bufsize=1)
+
+    def __call__(self, name: str, arguments: dict, text: str) -> str:
+        self.p.stdin.write(json.dumps({"name": name, "arguments": arguments, "input": text}) + "\n")
+        self.p.stdin.flush()
+        r = json.loads(self.p.stdout.readline())
+        if "error" in r:
+            raise Skip
+        return r["result"]
+
+
+# arith tasks of train_gen.py / build_r.py: the table query that answers each family, and what the reasoning says
+ARITH_QUERY = {
+    "arith.ls_count": (r"larger than (\d+) bytes", lambda m: {"op": "count", "where": {"column": 5, "op": ">", "value": int(m[1])}},
+                       lambda m: f"Count the files larger than {m[1]} bytes; in ls -l the size is column 5."),
+    "arith.ls_sum": (r"combined size in bytes of (\S+) and (\S+)\?", lambda m: {"op": "sum", "column": 5, "rows": [m[1], m[2]]},
+                     lambda m: f"Add the sizes of {m[1]} and {m[2]}; in ls -l the size is column 5."),
+    "arith.wc_sum": (r"How many lines do (\S+) and (\S+) have together\?", lambda m: {"op": "sum", "column": 1, "rows": [m[1], m[2]]},
+                     lambda m: f"Add the lines of {m[1]} and {m[2]}; wc -l puts them in column 1."),
+    "arith.wc_max": (r"Which file has the most lines\?", lambda m: {"op": "argmax", "column": 1},
+                     lambda m: "The file with the most lines: the largest number in column 1 of wc -l."),
+    "arith.df_avail": (r"available on (\S+)\?", lambda m: {"op": "get", "column": "Avail", "rows": [m[1]]},
+                       lambda m: f"Read the Avail column of {m[1]}."),
+    "arith.df_used_sum": (r"used on (\S+) and (\S+) together\?", lambda m: {"op": "sum", "column": "Used", "rows": [m[1], m[2]]},
+                          lambda m: f"Add the Used column of {m[1]} and {m[2]}."),
+    "arith.du_diff": (r"How many KB larger is (\S+) than (\S+)\?", lambda m: {"op": "diff", "column": 1, "rows": [m[1], m[2]]},
+                      lambda m: f"{m[1]} minus {m[2]}; du -sk puts the size in column 1."),
+    "arith.ps_count": (r"belong to the user (\S+)\?", lambda m: {"op": "count", "where": {"column": "USER", "op": "=", "value": m[1]}},
+                       lambda m: f"Count the rows whose USER is {m[1]}."),
+}
+
+
+def arith_tool_turns(prompt: str, answer: str, group: str, engine) -> list:
+    """An arith task answered through the engine's `table` tool: the call, the engine's result, the answer."""
+    q = ARITH_QUERY.get(group)
+    m = re.search(q[0], prompt) if q else None
+    if m is None:
+        raise Skip
+    args = q[1](m)
+    result = engine("table", args, prompt)
+    if result != answer:
+        raise Skip
+    think = q[2](m) + " The table tool computes it from the output above."
+    return [("user", prompt), ("assistant", think, None, [call("table", **args)]), ("tool", result),
+            ("assistant", None, answer, [])]
 TOLD = ["Use `{c}`.", "`{c}`", "Do it with `{c}`.", "The command is `{c}`.", "No card for it yet. This works: `{c}`."]
 HEAD = re.compile(r"^(?:\[(Linux|macOS|Windows)\] — )?(.+?): (.*)$")
 NEED = ["I need the card for this.", "The exact syntax should come from the reference.", "No card in the conversation yet: look it up.",
@@ -398,7 +455,7 @@ def arith_think(prompt: str, answer: str) -> str:
 
 
 def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked=False, need=False, pipes=False,
-          reason=(), relabel=None, ors=None, lone_filter=True):
+          reason=(), relabel=None, ors=None, lone_filter=True, engine=None):
     prompt, answer = rec["messages"][0]["content"], rec["messages"][1]["content"]
     cat = rec["cat"]
     if cat == "react" and relabel is not None:  # other words for the labels, the same rule set
@@ -424,6 +481,8 @@ def build(rec, pool, rng, near=None, p_near=0.0, cite=False, weigh=False, ranked
                 pair.reverse()
             lines[i] = f'- If the output contains "{pair[0]}" or "{pair[1]}", answer {m.group(2)}.'
         prompt = "\n".join(lines) + "\n\nPrevious command: " + tail
+    if cat == "arith" and engine is not None:
+        return "tool", arith_tool_turns(prompt, answer, rec["group"], engine)
     if cat in ("react", "arith"):
         think = (react_think if cat == "react" else arith_think)(prompt, answer) if cat in reason else None
         return "direct", [("user", prompt), ("assistant", think, answer, [])]
@@ -663,6 +722,9 @@ def main() -> None:
     ap.add_argument("--reason", default="",
                     help="react, arith or both, comma-separated: these answers come after the reasoning they are read from "
                          "(the matching rule copied word for word; the table's column as pairs and the operation)")
+    ap.add_argument("--builtin-tools", default=None, metavar="CORTIQ",
+                    help="the engine's built-in tools (calc, table) in every conversation's tool list, and the arith tasks "
+                         "answered through table, its results from `CORTIQ tool --batch`")
     ap.add_argument("--teach", type=float, default=0.0,
                     help="share of conversations where the store lacks the command, the user gives it after NONE and the model "
                          "saves a card with the note tool; half of the other conversations then list that tool too, and in "
@@ -690,6 +752,8 @@ def main() -> None:
         except Skip:
             pass
     near = Near(pool) if args.near > 0 else None
+    engine = EngineTools(args.builtin_tools) if args.builtin_tools else None
+    extra = BUILTIN if engine else []
     counts: dict[str, int] = {}
     skipped = 0
     with open(args.out + ".messages.jsonl", "w") as fm, gzip.open(args.out + ".jsonl.gz", "wt", encoding="utf-8") as ft, \
@@ -697,9 +761,9 @@ def main() -> None:
         for r in recs:
             try:
                 mode, turns = build(r, pool, rng, near, args.near, args.cite, args.weigh, args.ranked, args.need, args.pipes,
-                                    set(filter(None, args.reason.split(","))), rng3, ors, not args.no_lone_filter)
+                                    set(filter(None, args.reason.split(","))), rng3, ors, not args.no_lone_filter, engine)
                 direct = mode == "direct"
-                tools = TOOLS
+                tools = TOOLS + extra
                 if args.teach > 0 and not direct:
                     if rng2.random() < args.teach:
                         try:
@@ -707,7 +771,7 @@ def main() -> None:
                         except Skip:
                             pass
                     if mode == "teach" or rng2.random() < 0.5:
-                        tools = TOOLS_NOTE
+                        tools = TOOLS_NOTE + extra
                     if mode in ("lookup", "retry") and rng2.random() < 0.08:
                         turns = as_note(turns, r)
                 text = render(None if direct else SYSTEM, None if direct else tools, turns)

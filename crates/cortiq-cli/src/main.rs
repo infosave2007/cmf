@@ -2300,6 +2300,27 @@ enum Commands {
         #[arg(long)]
         temperature: Option<f64>,
     },
+    /// Run one of the engine's built-in tools (`calc`, `table`) as the server
+    /// runs it inside a completion (`builtin_tools`). `--batch`: one call a line
+    /// on stdin, `{"name", "arguments", "input"}`, one `{"result"}` or
+    /// `{"error"}` a line on stdout (the trace generators check their tool
+    /// turns with it)
+    Tool {
+        /// calc | table (not with --batch)
+        name: Option<String>,
+        /// The call's arguments as JSON
+        #[arg(long)]
+        args: Option<String>,
+        /// The text `table` reads: a file, or - for stdin; a cmf-im-v1
+        /// transcript is read as the server reads its prompt
+        #[arg(long)]
+        input: Option<String>,
+        #[arg(long)]
+        batch: bool,
+        /// Print the model-facing tool descriptions (tools.json) and exit
+        #[arg(long)]
+        describe: bool,
+    },
     /// The frozen signal φ of one prompt per line: unit mean hidden state after a
     /// layer, as `f32` rows, for fitting topologies outside the engine
     Phi {
@@ -5730,6 +5751,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
         Commands::DecidePointer { model, input, temperature } => pointer_decision::run(&model, &input, temperature),
         Commands::Phi { model, prompts, layer, out } => cmd_phi(&model, &prompts, layer, &out),
+        Commands::Tool { name, args, input, batch, describe } => cmd_tool(name, args, input, batch, describe),
         Commands::FarTurbo { input, output, exact_weights, exact_rows, o1, seal } => cmd_far_turbo(&input, &output, exact_weights.as_deref(), exact_rows, &o1, seal),
         Commands::DoryTurbo { input, output, topologies, bias, o1, exact_weights, exact_rows } => {
             cmd_dory_turbo(&input, &output, &topologies, bias, &o1, exact_weights.as_deref(), exact_rows)
@@ -9086,6 +9108,68 @@ fn cmd_dory_turbo(input: &str, output: &str, topologies: &str, bias: f32, o1: &s
     CmfModel::write_ref(output, &header, &refs, Some(&model.masks), model.vocab.as_deref())?;
     println!("wrote {output}: {} tensors, exit bias {bias}, far field {o1}, exact rows {}", refs.len(), if exact.is_some() { exact_rows } else { 0 });
     Ok(())
+}
+
+/// `cortiq tool`: a built-in tool run as the server runs it (see `cortiq_engine::tools`).
+fn cmd_tool(
+    name: Option<String>,
+    args: Option<String>,
+    input: Option<String>,
+    batch: bool,
+    describe: bool,
+) -> anyhow::Result<()> {
+    use cortiq_engine::tools;
+    use std::io::{BufRead, Read, Write as _};
+    // a transcript is read as the server reads its prompt: the last tool response, else the last user turn
+    let reading = |text: &str| -> String {
+        if text.contains("<|im_start|>") { tools::last_output(text) } else { text.to_string() }
+    };
+    if describe {
+        println!("{}", tools::TOOLS_JSON.trim());
+        return Ok(());
+    }
+    if batch {
+        let stdin = std::io::stdin();
+        let mut out = std::io::stdout().lock();
+        for line in stdin.lock().lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&line)?;
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let empty = serde_json::Value::Object(Default::default());
+            let r = tools::call(
+                name,
+                v.get("arguments").unwrap_or(&empty),
+                &reading(v.get("input").and_then(|x| x.as_str()).unwrap_or("")),
+            );
+            let row = match r {
+                Ok(x) => serde_json::json!({ "result": x }),
+                Err(e) => serde_json::json!({ "error": e }),
+            };
+            writeln!(out, "{row}")?;
+        }
+        return Ok(());
+    }
+    let name = name.ok_or_else(|| anyhow::anyhow!("cortiq tool NAME --args JSON [--input FILE]"))?;
+    let args: serde_json::Value = serde_json::from_str(args.as_deref().unwrap_or("{}"))?;
+    let text = match input.as_deref() {
+        None => String::new(),
+        Some("-") => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+        Some(p) => std::fs::read_to_string(p)?,
+    };
+    match tools::call(&name, &args, &reading(&text)) {
+        Ok(r) => {
+            println!("{r}");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{name}: {e}"),
+    }
 }
 
 /// `cortiq phi`: one row per prompt, the unit mean hidden state after `layer`.
