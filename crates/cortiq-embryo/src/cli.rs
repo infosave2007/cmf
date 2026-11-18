@@ -1078,9 +1078,13 @@ pub fn birth(a: BirthArgs) {
         if let (Some(st), Some(acc)) = (stream.as_ref(), carry_acc.as_mut()) {
             let per = gpu.per_position_loss();
             gpu.carry_commit();
-            let stats = gpu.carry_state_stats();
+            // The carried-state statistics read every state back and sum it on
+            // the host (25 MB at 340M B8, the card idle meanwhile): only on the
+            // steps that print them; the depth table samples those steps.
+            let logged = step % log_every == 0;
+            let stats = if logged { gpu.carry_state_stats() } else { Vec::new() };
             let line = acc.push(gpu.step, &per, a.seq, &last_reset, &st.depths(), &stats);
-            if step % log_every == 0 {
+            if logged {
                 println!("{line}");
             }
         }
@@ -1569,7 +1573,7 @@ impl CarryAcc {
             "carry summary: last-100-step fresh={f:.4} carried={c:.4} gap={g:+.4} nats ({} steps)\n",
             self.steps
         );
-        out.push_str("carry depth table (windows since reset → mean window loss, per-layer state rms):\n");
+        out.push_str("carry depth table (windows since reset → mean window loss, per-layer state rms of the logged steps):\n");
         for d in 1..=32 {
             let (ls, ln) = self.depth_loss[d];
             if ln == 0 {

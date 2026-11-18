@@ -30,10 +30,18 @@ def main() -> None:
     gem = collections.defaultdict(lambda: [0.0, 0])
     ops = collections.defaultdict(lambda: [0.0, 0])
     steps = 0
+    # only the training-step commits: the largest commits of the log (an
+    # end-of-run held-out pass commits fewer operations and is left out)
+    sizes = [int(x) for x in re.findall(r"cuda commit-ts ops=(\d+)", open(sys.argv[1]).read())]
+    big = max(sizes) if sizes else 0
+    live = False
     for line in open(sys.argv[1]):
         m = re.match(r"cuda commit-ts ops=(\d+) span_ms=([\d.]+)", line)
-        if m and int(m.group(1)) > 1000:
-            steps += 1
+        if m:
+            live = int(m.group(1)) == big
+            steps += live
+        if not live:
+            continue
         m = re.match(r"cuda op-ts op=(\d+) count=(\d+) gpu_ms=([\d.]+)", line)
         if m:
             ops[int(m.group(1))][0] += float(m.group(3))

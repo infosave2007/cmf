@@ -2710,13 +2710,17 @@ kernel void sink_grad_accum_f32(
     uint d = gid % a.hd;
     uint s = (gid / a.hd) % a.sink;
     uint g = gid / (a.hd * a.sink);
-    float acc = 0.0f;
+    // added to the gradient one sequence at a time: a fold over many
+    // sequences leaves the bits of one fold per sequence
+    float cur = dst[gid];
     for (uint b = 0; b < a.nb; ++b) {
+        float acc = 0.0f;
         for (uint j = 0; j < a.group; ++j) {
             acc += src[((ulong)(b * a.qh + g * a.group + j) * a.pad + s) * a.hd + d];
         }
+        cur += a.alpha * acc;
     }
-    dst[gid] += a.alpha * acc;
+    dst[gid] = cur;
 }
 
 // σ(x + bias) forward (y) and backward (dx = dy·y·(1−y)) — the κ gate.

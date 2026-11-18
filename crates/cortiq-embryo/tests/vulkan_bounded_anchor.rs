@@ -279,6 +279,7 @@ fn vulkan_anchor_backward_batched_vs_per_sequence() {
     let _ = ctx().expect("native Vulkan adapter is required");
     use cortiq_embryo::model::ANCHOR_BWD_BATCH;
     use std::sync::atomic::Ordering;
+    let shape0 = ANCHOR_BWD_BATCH.load(Ordering::Relaxed);
     let (b, t) = (8usize, 512usize);
     for (w, s) in [(0usize, 0usize), (128, 4)] {
         let mut cfg = EmbryoCfg::embryo0();
@@ -307,7 +308,7 @@ fn vulkan_anchor_backward_batched_vs_per_sequence() {
             ms.sort_by(|a, b| a.total_cmp(b));
             res.push((ms[1], last.unwrap()));
         }
-        ANCHOR_BWD_BATCH.store(false, Ordering::Relaxed);
+        ANCHOR_BWD_BATCH.store(shape0, Ordering::Relaxed);
         let (tb, gb) = &res[0];
         let (ts, gs) = &res[1];
         let rel = |a: &[f32], c: &[f32]| {

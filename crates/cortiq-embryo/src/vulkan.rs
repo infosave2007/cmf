@@ -1200,6 +1200,32 @@ impl<'a> Cmd<'a> {
             n,
         )
     }
+    /// `swiglu_fwd` over expert-major [ne, cap, i] buffers, on the rows the
+    /// dynamic expert GEMMs use: expert e's first 64·y rows, y = word 1 of its
+    /// record `indir[ioff + 3e]` (`moe_indirect_args`). The rows past them
+    /// keep what they held; every reader of these buffers is a dynamic GEMM
+    /// bounded the same way (dropless: a quarter of the rows of 4 experts).
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_fwd_rows(&self, g: &GBuf, u: &GBuf, h: &GBuf, ne: usize, cap: usize, i: usize, indir: &GBuf, ioff: usize) {
+        let n = ne * cap * i;
+        self.rec(
+            OP_SWIGLU_FWD,
+            &[(g, 0), (u, 1), (h, 2), (indir, 3)],
+            vec![0, n as u32, 1, cap as u32, i as u32, ioff as u32],
+            n,
+        )
+    }
+    /// `swiglu_bwd` on the rows of [`Cmd::swiglu_fwd_rows`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_bwd_rows(&self, g: &GBuf, u: &GBuf, dh: &GBuf, dg: &GBuf, du: &GBuf, ne: usize, cap: usize, i: usize, indir: &GBuf, ioff: usize) {
+        let n = ne * cap * i;
+        self.rec(
+            OP_SWIGLU_BWD,
+            &[(g, 0), (u, 1), (dh, 2), (dg, 3), (du, 4), (indir, 5)],
+            vec![0, n as u32, 1, cap as u32, i as u32, ioff as u32],
+            n,
+        )
+    }
     pub fn embed_gather(&self, e: &GBuf, tok: &GBuf, out: &GBuf, rows: usize, d: usize) {
         self.embed_gather_at(e, 0, tok, out, rows, d)
     }
@@ -3393,6 +3419,85 @@ impl<'a> Cmd<'a> {
         pp[12] = c as u32;
         self.rec(OP_WY_SSCALE, &[(states, 0), (gam, 1)], pp, d.b * d.nv * d.state())
     }
+    /// The whole chunk chain of the WY forward as one CUDA kernel (op 120):
+    /// per chunk `gdn_wy_sscale`, R = V − Kγ·S_c, E' = T·R, `gdn_wy_u` and
+    /// S_{c+1} += K̂ᵀ·Ũ, with their arithmetic and outputs. False (nothing
+    /// recorded) when the CUDA-only kernels are off or the geometry is not
+    /// one it takes; the caller then records the per-chunk operations.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_fwd_chain(
+        &self,
+        d: &GdnScanDims,
+        states: &GBuf,
+        gam: &GBuf,
+        kg: &GBuf,
+        kn: &GBuf,
+        vcm: &GBuf,
+        tmat: &GBuf,
+        bet: &GBuf,
+        rho: &GBuf,
+        epm: &GBuf,
+        um: &GBuf,
+        utm: &GBuf,
+    ) -> bool {
+        if !self.c.wy_fwd_chain_ok(d.dk, d.dv) {
+            return false;
+        }
+        let pp = Self::wy_p(d);
+        let slots = [(states, 0), (gam, 1), (kg, 2), (kn, 3), (vcm, 4), (tmat, 5), (bet, 6), (rho, 7), (epm, 8), (um, 9), (utm, 10)];
+        self.rec(OP_WY_FWD_CHAIN, &slots, pp, d.b * d.nv * (d.dv / 32) * 256);
+        true
+    }
+    /// The whole chunk chain of the WY backward as one CUDA kernel (op 121),
+    /// with op 70's dρ, dβ dots (op 122) and the dγ_end partials and fold
+    /// (op 123) batched over the chunks after it: the bits of the per-chunk
+    /// loop of `gdn_wy::wy_bwd`. Leaves dŨ, dU, dE' and dS_{c+1} of every
+    /// chunk chunk-outer in `dut_all`, `du_all`, `dep_all`, `dsl_all`, dR in
+    /// the v columns of `dcv` and dS_0 in `dlive`. False (nothing recorded)
+    /// when the CUDA-only kernels are off or the geometry is not one it takes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_bwd_chain(
+        &self,
+        d: &GdnScanDims,
+        dlive: &GBuf,
+        du_all: &GBuf,
+        dsq_all: &GBuf,
+        kn: &GBuf,
+        kg: &GBuf,
+        bet: &GBuf,
+        rho: &GBuf,
+        gam: &GBuf,
+        tmat: &GBuf,
+        dsl_all: &GBuf,
+        dep_all: &GBuf,
+        dut_all: &GBuf,
+        dcv: &GBuf,
+        um: &GBuf,
+        epm: &GBuf,
+        drho: &GBuf,
+        dbet: &GBuf,
+        states: &GBuf,
+        dgend_part: &GBuf,
+        dgend: &GBuf,
+    ) -> bool {
+        if !self.c.wy_bwd_chain_ok(d.dk, d.dv) {
+            return false;
+        }
+        let nb = d.b * d.nv;
+        let nch = d.t / 64;
+        assert!(dgend_part.len >= nb * nch * 64 && dut_all.len >= nch * nb * 64 * d.dv);
+        let pp = Self::wy_p(d);
+        let slots = [
+            (dlive, 0), (du_all, 1), (dsq_all, 2), (kn, 3), (kg, 4), (bet, 5), (rho, 6), (gam, 7), (tmat, 9),
+            (dsl_all, 10), (dep_all, 11), (dut_all, 12), (dcv, 13),
+        ];
+        self.rec(OP_WY_BWD_CHAIN, &slots, pp.clone(), nb * (d.dv / 32) * 256);
+        self.rec(OP_WY_DU_DOTS, &[(dut_all, 0), (um, 1), (du_all, 2), (epm, 3), (drho, 4), (dbet, 5)], pp.clone(), nb * nch * 64);
+        self.rec(OP_WY_DGEND_ALL, &[(dsl_all, 0), (states, 1), (dgend_part, 3), (dgend, 4)], pp, nb * nch * 64);
+        true
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_u(&self, d: &GdnScanDims, epm: &GBuf, bet: &GBuf, rho: &GBuf, um: &GBuf, utm: &GBuf, c: usize) {
         let mut pp = Self::wy_p(d);
@@ -4756,6 +4861,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if(U(28u)==1u){kdim=min(((DU(U(29u)+batch_id)+63u)/64u)*64u,k0);}
     // table-batched (p[35]): per-batch offsets and a row count bounding M or K
     if(U(35u)==1u){let tq=U(36u)+batch_id*4u;oa=oa+DU(tq);ob=ob+DU(tq+1u);oc=oc+DU(tq+2u);let rz=DU(tq+3u);if(U(37u)==1u){kdim=min(rz,k0);}else{mrows=min(rz,m0);}}
+    // A tile wholly past its batch's rows writes nothing (a table batch
+    // padded to the largest group: most of the head's cluster tiles), so it
+    // leaves before the K loop; the indirect contract's zero fill (p[30])
+    // still runs. Uniform per workgroup.
+    if((tile/U(32u))*16u>=mrows && U(30u)!=1u){return;}
     var sum=0.0;
     for(var kb=0u;kb<kdim;kb=kb+16u){
       let aq=kb+lid%16u; let bk=kb+lid/16u;
@@ -4792,8 +4902,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  if(op==4u){let groups=U(3u);if(z>=groups){return;}let n=U(1u);let base=U(2u);var s=0.0;for(var t=z*256u;t<n;t=t+groups*256u){let end=min(t+256u,n);for(var q=base+t;q<base+end;q=q+1u){let v=AF(q);s=s+v*v;}}b[U(4u)+z]=WF(s);return;}
  if(op==5u){let row=z;if(row>=U(1u)){return;}let dd=U(2u);let wo=U(3u);var s=0.0;for(var q=0u;q<dd;q=q+1u){let x=AF(row*dd+q);s=s+x*x;}let inv=1.0/sqrt(s/f32(dd)+F(4u));d[row]=WF(inv);for(var r0=0u;r0<dd;r0=r0+1u){c[row*dd+r0]=WF(AF(row*dd+r0)*BF(wo+r0)*inv);}return;}
  if(op==6u){let dd=U(2u);let rows=U(1u);let q=z;if(q>=rows*dd){return;}let row=q/dd;let col=q%dd;let inv=DF(row);let x=AF(row*dd+col);let wv=BF(U(3u)+col);var dot=0.0;for(var j0=0u;j0<dd;j0=j0+1u){dot=dot+CF(row*dd+j0)*BF(U(3u)+j0)*AF(row*dd+j0);}let c0=inv*inv*inv*dot/f32(dd);let val=inv*CF(q)*wv-c0*x;let old=EF(q);e[q]=WF(select(val,old*F(5u)+val,F(5u)!=0.0));if(z<dd){var sw=0.0;for(var r=0u;r<rows;r=r+1u){sw=sw+CF(r*dd+z)*AF(r*dd+z)*DF(r);}f[U(4u)+z]=WF(FF(U(4u)+z)+sw);}return;}
- if(op==7u){if(z<U(1u)){c[z]=WF(silu(AF(z))*BF(z));}return;}
- if(op==8u){if(z<U(1u)){let gg=AF(z);let uu=BF(z);let dh=CF(z);let sig=1.0/(1.0+exp(-gg));let sg=gg*sig;let ds=sig*(1.0+gg*(1.0-sig));d[z]=WF(dh*ds*uu);e[z]=WF(dh*sg);}return;}
+ // ops 7, 8 with p[2] = 1: expert-major [ne, cap=p[3], i=p[4]] rows, only an
+ // expert's first 64·y rows (y = word 1 of its indirect record at p[5])
+ if(op==7u){if(z<U(1u)){if(U(2u)==1u){let per=U(3u)*U(4u);let ex=z/per;let r=(z%per)/U(4u);if(r>=d[U(5u)+ex*3u+1u]*64u){return;}}c[z]=WF(silu(AF(z))*BF(z));}return;}
+ if(op==8u){if(z<U(1u)){if(U(2u)==1u){let per=U(3u)*U(4u);let ex=z/per;let r=(z%per)/U(4u);if(r>=f[U(5u)+ex*3u+1u]*64u){return;}}let gg=AF(z);let uu=BF(z);let dh=CF(z);let sig=1.0/(1.0+exp(-gg));let sg=gg*sig;let ds=sig*(1.0+gg*(1.0-sig));d[z]=WF(dh*ds*uu);e[z]=WF(dh*sg);}return;}
  if(op==9u){if(z>=U(1u)*U(2u)){return;}let row=z/U(2u);let col=z%U(2u);let tok=b[row];c[z]=a[U(3u)+tok*U(2u)+col];return;}
  // op 10: tied-embedding scatter-add. p[4]=1: the legacy single-invocation loop
  // (bit-exact reference). p[4]=0: one owner per (first-occurrence row, column)
@@ -4994,7 +5106,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  if(op==55u){let bh=z/U(5u);let d0=z%U(5u);if(bh>=U(1u)*U(3u)){return;}let b0=bh/U(3u);let hh=bh%U(3u);let p2=2u*U(4u);let nch=U(2u)/64u;let stbase=bh*(nch+1u)*p2*U(5u);let gamoff=U(6u)+hh*65u*p2+p2;var G:array<f32,64>;for(var ff=0u;ff<64u;ff=ff+1u){G[ff]=0.0;if(ff<p2){d[stbase+(nch*p2+ff)*U(5u)+d0]=WF(0.0);}}for(var rev=0u;rev<U(2u);rev=rev+1u){let tt=U(2u)-1u-rev;let rr=(b0*U(2u)+tt)*U(3u)+hh;let dov=BF(rr*U(5u)+d0);for(var ff=0u;ff<64u;ff=ff+1u){if(ff<p2){G[ff]=CF(gamoff+ff)*(G[ff]+AF(rr*p2+ff)*dov);}}if((tt%64u)==0u){for(var ff=0u;ff<64u;ff=ff+1u){if(ff<p2){d[stbase+((tt/64u)*p2+ff)*U(5u)+d0]=WF(G[ff]);}}}}return;}
  if(op==56u){let rows=U(1u)*U(2u);let nh=U(3u);if(z>=rows*nh){return;}let dv=U(5u);let kk=BF(z);let base=z*dv;var s=0.0;for(var q=0u;q<dv;q=q+1u){let gq=CF(base+q);d[base+q]=WF(kk*gq);s=s+gq*AF(base+q);}e[z]=WF(s);return;}
  if(op==57u){let rows=U(1u);let nh=U(3u);let nph=U(4u);if(z>=rows*nh*nph){return;}let r=z%(nh*nph);let hh=r/nph;let ii=r%nph;let row=z/(nh*nph);let p2=2u*nph;let base=row*nh*p2+hh*p2;let t=AF(z);let gv=-sin(t)*BF(base+ii)+cos(t)*BF(base+nph+ii);let beta=F(7u);c[z]=WF(select(beta*CF(z)+gv,gv,beta==0.0));return;}
- if(op==52u){if(z>=U(1u)){return;}let sk=U(2u);let hd=U(3u);let grp=U(4u);let goff=U(5u);let al=F(6u);let pad=U(7u);let nb=U(8u);let qh=U(9u);let d=z%hd;let s=(z/hd)%sk;let g=z/(hd*sk);var acc=0.0;for(var bb=0u;bb<nb;bb=bb+1u){for(var j=0u;j<grp;j=j+1u){acc=acc+AF(((bb*qh+g*grp+j)*pad+s)*hd+d);}}b[goff+z]=WF(BF(goff+z)+al*acc);return;}
+ if(op==52u){if(z>=U(1u)){return;}let sk=U(2u);let hd=U(3u);let grp=U(4u);let goff=U(5u);let al=F(6u);let pad=U(7u);let nb=U(8u);let qh=U(9u);let d=z%hd;let s=(z/hd)%sk;let g=z/(hd*sk);var cur=BF(goff+z);for(var bb=0u;bb<nb;bb=bb+1u){var acc=0.0;for(var j=0u;j<grp;j=j+1u){acc=acc+AF(((bb*qh+g*grp+j)*pad+s)*hd+d);}cur=cur+al*acc;}b[goff+z]=WF(cur);return;}
  if(op==42u){if(z>=U(1u)*U(2u)*U(4u)*U(5u)){return;}let row=z/(U(4u)*U(5u));let dd=z%(U(4u)*U(5u));let batch=row/U(2u);let time=row%U(2u);let qh=U(3u);let kvh=U(4u);let hd=U(5u);let group=qh/kvh;let kvhead=dd/hd;var sum=0.0;for(var q=0u;q<qh;q=q+1u){if(q/group==kvhead){sum=sum+AF(((batch*qh+q)*U(2u)+time)*hd+(dd%hd));}}b[((batch*U(2u)+time)*kvh+kvhead)*hd+(dd%hd)]=WF(sum);return;}
  if(op==43u){phase_delta_replay(z);return;}
  if(op==44u){phase_delta_backward_block(z);return;}

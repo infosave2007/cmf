@@ -48,13 +48,20 @@ pub struct GdnWyKeep {
 }
 
 /// Backward-only scratch of the WY form, shared by all GDN layers (every
-/// buffer is fully rewritten inside one layer's backward).
+/// buffer is fully rewritten inside one layer's backward). The `*_all`
+/// buffers are chunk-outer, [nch, NB, ...]: one chunk's (b, h) blocks are
+/// contiguous.
 pub struct GdnWyScratch {
     pub du: GBuf,    // [NB, C, dv]
     pub dut: GBuf,   // [NB, C, dv] K̂·dS_{c+1}
     pub dep: GBuf,   // [NB, C, dv] dE'
-    pub dt: GBuf,    // [NB, C, C]
-    pub dl1: GBuf,   // [NB, C, C]
+    pub du_all: GBuf,  // [nch, NB, C, dv] Pᵀ dO of every chunk
+    pub dsq_all: GBuf, // [nch, NB, dk, dv] Qγᵀ dO of every chunk
+    pub dsl_all: GBuf, // [nch, NB, dk, dv] dS_{c+1} as chunk c's backward found it
+    pub dep_all: GBuf, // [nch, NB, C, dv] dE' of every chunk
+    pub dut_all: GBuf, // [nch, NB, C, dv] dŨ of every chunk (the CUDA chain)
+    pub dt: GBuf,    // [nch, NB, C, C] dT of every chunk
+    pub dl1: GBuf,   // [nch, NB, C, C] Tᵀ dT of every chunk
     pub dp: GBuf,    // [NC, C, C] dP (then dP⊙Γ)
     pub dl: GBuf,    // [NC, C, C] dL (then dKK)
     pub dsn: GBuf,   // [NB, dk, dv] dS_c being assembled
@@ -66,7 +73,7 @@ pub struct GdnWyScratch {
     pub dbet: GBuf,  // [NB, T]
     pub dlgm: GBuf,  // [NB, T] mask contribution to d lg
     pub dgend: GBuf, // [NB, nch] Σ dS_{c+1}·S_c
-    pub dgend_part: GBuf, // [NB, 64] fixed-chunk partials of one chunk's dgend
+    pub dgend_part: GBuf, // [NB, nch, 64] fixed-chunk partials of dgend (one chunk's: the first NB·64)
     pub dla: GBuf,   // [NB, T] d log α
 }
 
@@ -111,8 +118,13 @@ impl GdnWyScratch {
             du: z(nb * WY_C * d.dv),
             dut: z(nb * WY_C * d.dv),
             dep: z(nb * WY_C * d.dv),
-            dt: z(nb * WY_C * WY_C),
-            dl1: z(nb * WY_C * WY_C),
+            du_all: z(nc * WY_C * d.dv),
+            dsq_all: z(nc * d.dk * d.dv),
+            dsl_all: z(nc * d.dk * d.dv),
+            dep_all: z(nc * WY_C * d.dv),
+            dut_all: z(if cfg!(feature = "cuda") { nc * WY_C * d.dv } else { 1 }),
+            dt: z(nc * WY_C * WY_C),
+            dl1: z(nc * WY_C * WY_C),
             dp: z(nc * WY_C * WY_C),
             dl: z(nc * WY_C * WY_C),
             dsn: z(nb * d.dk * d.dv),
@@ -124,7 +136,7 @@ impl GdnWyScratch {
             dbet: z(nb * d.t),
             dlgm: z(nb * d.t),
             dgend: z(nb * nch),
-            dgend_part: z(nb * 64),
+            dgend_part: z(nc * 64),
             dla: z(nb * d.t),
         }
     }
@@ -188,6 +200,10 @@ impl Geo {
     fn st_batch(&self) -> [usize; 3] {
         [self.nv * self.ss, self.ss, 0]
     }
+    /// batch over (b, h, chunk) of a chunk-outer [nch, NB, x] scratch
+    fn co3(&self, x: usize) -> [usize; 3] {
+        [self.nv * x, x, self.b * self.nv * x]
+    }
     fn bt3(&self, sa: [usize; 3], sb: [usize; 3], sc: [usize; 3]) -> GemmBatch {
         GemmBatch {
             nb: self.b,
@@ -249,7 +265,11 @@ pub fn wy_fwd(
     );
     cmd.gdn_wy_mask(d, &w.kk, &w.qk, &w.lg, &w.bet, &w.lmat);
     cmd.gdn_wy_ut(d, &w.lmat, &w.tmat);
-    for c in 0..nch {
+    #[cfg(feature = "cuda")]
+    let chained = cmd.gdn_wy_fwd_chain(d, states, &w.gam, &w.kg, &w.kn, &w.vcm, &w.tmat, &w.bet, &w.rho, &w.epm, &w.um, &w.utm);
+    #[cfg(not(feature = "cuda"))]
+    let chained = false;
+    for c in (0..nch).filter(|_| !chained) {
         // S_{c+1} := γ_{C−1}·S_c (the GEMM below adds K̂ᵀŨ)
         cmd.gdn_wy_sscale(d, states, &w.gam, c);
         // R_c = V_c − diag(γ)K̂_c S_c   (in place in vcm)
@@ -314,13 +334,33 @@ pub fn wy_bwd(
     if !ds_init {
         cmd.axpby(0.0, dlive, 0.0, dlive, nb * ss);
     }
-    for c in (0..nch).rev() {
-        // dU = Pᵀ dO_c
-        cmd.gemm_ex(
-            Op::T, Op::N, WY_C, dv, WY_C, 1.0, &w.qk, c * WY_C * WY_C, WY_C, doo,
-            c * WY_C * nv * dv, nv * dv, 0.0, &x.du, 0, dv, &g.bt2(g.cc2(), g.tok2(dv), g.sc2(dv)),
-            false,
-        );
+    // Only dS is carried from chunk to chunk: the loop below keeps the GEMMs
+    // on that chain (dŨ, dR, the dR term of dS_c), every other product of a
+    // chunk's backward is one GEMM batched over (b, h, chunk) before or after
+    // it. A GEMM's output sums run over k in the same order at any batch
+    // count (gemm64 and gemm128 share the per-k fma and the epilogue), so the
+    // results are the bits of the per-chunk form.
+    let (cv, cc) = (WY_C * dv, WY_C * WY_C);
+    // dU⁰ = Pᵀ dO and dS_c⁰ = Qγ_cᵀ dO_c of every chunk
+    cmd.gemm_ex(
+        Op::T, Op::N, WY_C, dv, WY_C, 1.0, &w.qk, 0, WY_C, doo, 0, nv * dv, 0.0, &x.du_all, 0, dv,
+        &g.bt3(g.cc3(), g.tok3(dv), g.co3(cv)), false,
+    );
+    cmd.gemm_ex(
+        Op::T, Op::N, dk, dv, WY_C, 1.0, &w.qg, 0, nv * dk, doo, 0, nv * dv, 0.0, &x.dsq_all, 0, dv,
+        &g.bt3(g.tok3(dk), g.tok3(dv), g.co3(ss)), false,
+    );
+    #[cfg(feature = "cuda")]
+    let chained = cmd.gdn_wy_bwd_chain(
+        d, dlive, &x.du_all, &x.dsq_all, &w.kn, &w.kg, &w.bet, &w.rho, &w.gam, &w.tmat, &x.dsl_all, &x.dep_all,
+        &x.dut_all, dcv, &w.um, &w.epm, &x.drho, &x.dbet, states, &x.dgend_part, &x.dgend,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let chained = false;
+    for c in (0..nch).rev().filter(|_| !chained) {
+        // dS_{c+1}, kept for this chunk's dK̂ after the loop
+        cmd.copy(dlive, 0, &x.dsl_all, c * nb * ss, nb * ss);
+        cmd.copy(&x.du_all, c * nb * cv, &x.du, 0, nb * cv);
         // dŨ = K̂_c dS_{c+1}   ([C×dk]·[dk×dv])
         cmd.gemm_ex(
             Op::N, Op::N, WY_C, dv, dk, 1.0, &w.kn, c * WY_C * nv * dk, nv * dk, dlive, 0, dv, 0.0,
@@ -328,59 +368,55 @@ pub fn wy_bwd(
         );
         // dU += ρ·dŨ ; dρ, dβ ; dE' = β dU
         cmd.gdn_wy_du(d, &x.du, &x.dut, &w.um, &w.epm, &w.bet, &w.rho, &x.dep, &x.drho, &x.dbet, c);
-        // dP_c = dO_c U_cᵀ
-        cmd.gemm_ex(
-            Op::N, Op::T, WY_C, WY_C, dv, 1.0, doo, c * WY_C * nv * dv, nv * dv, &w.um,
-            c * WY_C * dv, dv, 0.0, &x.dp, c * WY_C * WY_C, WY_C, &g.bt2(g.tok2(dv), g.cm2(), g.cc2()),
-            false,
-        );
+        cmd.copy(&x.dep, 0, &x.dep_all, c * nb * cv, nb * cv);
         // dS_c = Qγ_cᵀ dO_c
-        cmd.gemm_ex(
-            Op::T, Op::N, dk, dv, WY_C, 1.0, &w.qg, c * WY_C * nv * dk, nv * dk, doo,
-            c * WY_C * nv * dv, nv * dv, 0.0, &x.dsn, 0, dv, &g.bt2(g.tok2(dk), g.tok2(dv), g.st_batch()),
-            false,
-        );
+        cmd.copy(&x.dsq_all, c * nb * ss, &x.dsn, 0, nb * ss);
         // dγ_end partial = Σ dS_{c+1}·S_c ; dS_c += γ_end dS_{c+1}
         cmd.gdn_wy_dgend(d, dlive, states, &x.dgend, &x.dgend_part, c);
         cmd.gdn_wy_dstate(d, &x.dsn, dlive, &w.gam, c);
-        // dK̂_c (from S_{c+1}) = Ũ_c dS_{c+1}ᵀ   (first write of the chunk rows)
-        cmd.gemm_ex(
-            Op::N, Op::T, WY_C, dk, dv, 1.0, &w.utm, c * WY_C * dv, dv, dlive, 0, dv, 0.0, &x.dkn,
-            c * WY_C * nv * dk, nv * dk, &g.bt2(g.cm2(), g.st_batch(), g.tok2(dk)), false,
-        );
         // dR = T_cᵀ dE'  → straight into the v columns of dcv
         cmd.gemm_ex(
             Op::T, Op::N, WY_C, dv, WY_C, 1.0, &w.tmat, c * WY_C * WY_C, WY_C, &x.dep, 0, dv, 0.0,
             dcv, c * WY_C * c_dim + 2 * nv * dk, c_dim, &g.bt2(g.cc2(), g.sc2(dv), [g.t * c_dim, dv, 0]),
             false,
         );
-        // dT = dE' Rᵀ ; dL = −Tᵀ dT Tᵀ
-        cmd.gemm_ex(
-            Op::N, Op::T, WY_C, WY_C, dv, 1.0, &x.dep, 0, dv, &w.vcm, c * WY_C * dv, dv, 0.0, &x.dt,
-            0, WY_C, &g.bt2(g.sc2(dv), g.cm2(), g.sc2(WY_C)), false,
-        );
-        cmd.gemm_ex(
-            Op::T, Op::N, WY_C, WY_C, WY_C, 1.0, &w.tmat, c * WY_C * WY_C, WY_C, &x.dt, 0, WY_C, 0.0,
-            &x.dl1, 0, WY_C, &g.bt2(g.cc2(), g.sc2(WY_C), g.sc2(WY_C)), false,
-        );
-        cmd.gemm_ex(
-            Op::N, Op::T, WY_C, WY_C, WY_C, -1.0, &x.dl1, 0, WY_C, &w.tmat, c * WY_C * WY_C, WY_C,
-            0.0, &x.dl, c * WY_C * WY_C, WY_C, &g.bt2(g.sc2(WY_C), g.cc2(), g.cc2()), false,
-        );
-        // dX0 = −dR: dS_c += −Kγ_cᵀ dR ; dKγ_c = −dR S_cᵀ
+        // dX0 = −dR: dS_c += −Kγ_cᵀ dR
         cmd.gemm_ex(
             Op::T, Op::N, dk, dv, WY_C, -1.0, &w.kg, c * WY_C * nv * dk, nv * dk, dcv,
             c * WY_C * c_dim + 2 * nv * dk, c_dim, 1.0, &x.dsn, 0, dv,
             &g.bt2(g.tok2(dk), [g.t * c_dim, dv, 0], g.st_batch()), false,
         );
-        cmd.gemm_ex(
-            Op::N, Op::T, WY_C, dk, dv, -1.0, dcv, c * WY_C * c_dim + 2 * nv * dk, c_dim, states,
-            c * ss, dv, 0.0, &x.dkg, c * WY_C * nv * dk, nv * dk,
-            &g.bt2([g.t * c_dim, dv, 0], g.st2(), g.tok2(dk)), false,
-        );
         // carry dS_c
         cmd.copy(&x.dsn, 0, dlive, 0, nb * ss);
     }
+    // dP_c = dO_c U_cᵀ
+    cmd.gemm_ex(
+        Op::N, Op::T, WY_C, WY_C, dv, 1.0, doo, 0, nv * dv, &w.um, 0, dv, 0.0, &x.dp, 0, WY_C,
+        &g.bt3(g.tok3(dv), g.cm3(), g.cc3()), false,
+    );
+    // dK̂_c (from S_{c+1}) = Ũ_c dS_{c+1}ᵀ   (first write of the chunk rows)
+    cmd.gemm_ex(
+        Op::N, Op::T, WY_C, dk, dv, 1.0, &w.utm, 0, dv, &x.dsl_all, 0, dv, 0.0, &x.dkn, 0, nv * dk,
+        &g.bt3(g.cm3(), g.co3(ss), g.tok3(dk)), false,
+    );
+    // dT = dE' Rᵀ ; dL = −Tᵀ dT Tᵀ
+    cmd.gemm_ex(
+        Op::N, Op::T, WY_C, WY_C, dv, 1.0, &x.dep_all, 0, dv, &w.vcm, 0, dv, 0.0, &x.dt, 0, WY_C,
+        &g.bt3(g.co3(cv), g.cm3(), g.co3(cc)), false,
+    );
+    cmd.gemm_ex(
+        Op::T, Op::N, WY_C, WY_C, WY_C, 1.0, &w.tmat, 0, WY_C, &x.dt, 0, WY_C, 0.0, &x.dl1, 0, WY_C,
+        &g.bt3(g.cc3(), g.co3(cc), g.co3(cc)), false,
+    );
+    cmd.gemm_ex(
+        Op::N, Op::T, WY_C, WY_C, WY_C, -1.0, &x.dl1, 0, WY_C, &w.tmat, 0, WY_C, 0.0, &x.dl, 0, WY_C,
+        &g.bt3(g.co3(cc), g.cc3(), g.cc3()), false,
+    );
+    // dKγ_c = −dR S_cᵀ
+    cmd.gemm_ex(
+        Op::N, Op::T, WY_C, dk, dv, -1.0, dcv, 2 * nv * dk, c_dim, states, 0, dv, 0.0, &x.dkg, 0, nv * dk,
+        &g.bt3([g.t * c_dim, dv, WY_C * c_dim], g.st3(), g.tok3(dk)), false,
+    );
     // decay/β terms of the masks, then the masks' gradients scaled by Γ (and β_j)
     cmd.gdn_wy_mask_bwd_red(d, &x.dp, &w.qk, &x.dl, &w.lmat, &w.kk, &w.lg, &w.bet, &x.dlgm, &x.dbet);
     cmd.gdn_wy_mask_bwd(d, &x.dp, &x.dl, &w.lg, &w.bet);
