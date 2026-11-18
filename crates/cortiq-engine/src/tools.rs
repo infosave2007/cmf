@@ -698,6 +698,45 @@ pub fn last_output(prompt: &str) -> String {
     body.split(END).next().unwrap_or(body).trim().to_string()
 }
 
+/// The texts `table` may read at the end of `prompt`, newest first: the tool
+/// responses after the last user turn, then that user turn (a prompt without
+/// turns is one text). A second `table` call after a result reads the table
+/// again, not the previous result.
+pub fn outputs(prompt: &str) -> Vec<String> {
+    const USER: &str = "<|im_start|>user\n";
+    const TOOL: &str = "<|im_start|>tool\n";
+    const END: &str = "<|im_end|>";
+    let Some(u) = prompt.rfind(USER) else {
+        return vec![prompt.to_string()];
+    };
+    let after = &prompt[u..];
+    let mut out: Vec<String> = after
+        .split(TOOL)
+        .skip(1)
+        .map(|t| {
+            let body = t.split(END).next().unwrap_or(t).trim();
+            let body = body.strip_prefix("<tool_response>").unwrap_or(body);
+            body.strip_suffix("</tool_response>").unwrap_or(body).trim().to_string()
+        })
+        .collect();
+    out.reverse();
+    let body = &after[USER.len()..];
+    out.push(body.split(END).next().unwrap_or(body).trim().to_string());
+    out
+}
+
+/// `table` over the newest of `texts` that holds a table (the error of the
+/// newest when none does); any other tool over the newest text.
+fn call_on(name: &str, args: &Value, texts: &[String]) -> Result<String, String> {
+    if name == "table" {
+        // a tool's own error line is not an output to read
+        if let Some(t) = texts.iter().find(|t| !t.starts_with("error:") && Table::parse(t).is_ok()) {
+            return call(name, args, t);
+        }
+    }
+    call(name, args, texts.first().map(String::as_str).unwrap_or(""))
+}
+
 /// The `<tool_call>` blocks of an assistant turn: (name, arguments), `None`
 /// for a block that is not a call object.
 pub fn turn_calls(text: &str) -> Vec<Option<(String, Value)>> {
@@ -742,11 +781,11 @@ pub fn round(prompt: &str, generated: &str) -> Option<Round> {
     if calls.is_empty() || calls.iter().any(|c| !matches!(c, Some((n, _)) if is_builtin(n))) {
         return None;
     }
-    let input = last_output(prompt);
+    let texts = outputs(prompt);
     let mut done = Vec::new();
     let mut tool_turns = String::new();
     for (name, args) in calls.into_iter().flatten() {
-        let r = call(&name, &args, &input).unwrap_or_else(|e| format!("error: {e}"));
+        let r = call_on(&name, &args, &texts).unwrap_or_else(|e| format!("error: {e}"));
         tool_turns.push_str("<|im_start|>tool\n<tool_response>\n");
         tool_turns.push_str(&r);
         tool_turns.push_str("\n</tool_response><|im_end|>\n");
@@ -856,6 +895,15 @@ postgres   5471 nginx\nwww-data   6020 node\n\nQuestion: How many of these proce
         assert_eq!(last_output(&next), "2");
         assert!(round(&prompt, "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"query\": \"x\"}}\n</tool_call>").is_none());
         assert!(round(&prompt, "The answer is 2.").is_none());
+        // a second table call after the result reads the table again, not the result
+        let again = round(&next, turn).expect("a built-in turn");
+        assert_eq!(again.calls[0].2, "2");
+        // nor the error of a failed call
+        let miss = "<tool_call>\n{\"name\": \"table\", \"arguments\": {\"op\": \"get\", \"column\": 2, \"rows\": [\"x\"]}}\n</tool_call>";
+        let failed = round(&prompt, miss).unwrap();
+        assert_eq!(failed.calls[0].2, "error: no row named x");
+        let after = continue_prompt(&prompt, miss, &failed);
+        assert_eq!(round(&after, turn).unwrap().calls[0].2, "2");
         let bad = round(&prompt, "<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"expression\": \"1/0\"}}\n</tool_call>").unwrap();
         assert_eq!(bad.calls[0].2, "error: division by zero");
         assert_eq!(descriptions().len(), 2);
