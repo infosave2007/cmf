@@ -1,0 +1,16 @@
+{
+"eval": [
+"Write a Python function that parses a date string in several formats and returns a datetime.",
+"Explain how a hash map handles collisions, with a short example in C.",
+"Write a TypeScript interface for a blog post and a function that sorts posts by date.",
+"What are the pros and cons of microservices compared with a monolith?",
+"Describe the water cycle in four sentences.",
+"Write a short story opening about a lighthouse keeper who finds a message in a bottle.",
+"Give three ways to reduce the memory use of a Python program that loads a large CSV.",
+"Write a SQL query that computes a 7-day moving average of daily sales.",
+"用C++写一个线程安全的单例类。",
+"请解释区块链的基本原理。",
+"Translate into French: The meeting has been moved to Thursday afternoon.",
+"Write a Go HTTP handler that returns the current time as JSON."
+]
+}

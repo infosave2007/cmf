@@ -760,7 +760,7 @@ pub fn multi_head_attention_pair(
 /// style: Qwen3.5/Qwen3-Next are zero-centered `x̂·(1+w)` (gemma-style),
 /// classic Qwen/Llama are `x̂·w` — same authority as the layer norms.
 #[inline]
-fn rmsnorm_head(x: &mut [f32], w: &[f32], eps: f64, style: cortiq_core::NormStyle) {
+pub(crate) fn rmsnorm_head(x: &mut [f32], w: &[f32], eps: f64, style: cortiq_core::NormStyle) {
     let mut ss = 0f64;
     for &v in x.iter() {
         ss += (v as f64) * (v as f64);

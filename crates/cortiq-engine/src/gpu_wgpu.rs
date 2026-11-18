@@ -31962,12 +31962,15 @@ pub fn forward_token_graph(
                     graph_decline("mHC kernels unavailable");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
+                // Token-invariant: the params by content, the bind groups in the
+                // graph's cache (sites 140-146). Built fresh, they took ~290
+                // groups and ~150 uniforms a token on SenseNova-Loop-9B.
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let u = unif(&mhc::params(hidden, m.enter, false, m.iters, m.pre_scale));
+                let u = mhc::uniform8(c, mhc::params(hidden, m.enter, false, m.iters, m.pre_scale));
                 let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
-                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &u]), 1);
+                go(&mut enc, &mp.route, &bgc(140, li, &mp.route_layout, &[&h_buf, &mr, &w, &b, &mk, &u]), 1);
                 let inw = stor(bytemuck::cast_slice(l.input_norm));
-                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
+                go(&mut enc, &c.rmsnorm, &bgc(141, li, &c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
             }
             // ── token mixing (attention or GDN) → ob ──
             let hp_mix = kimi::hostprof_on().then(std::time::Instant::now);
@@ -33703,12 +33706,11 @@ pub fn forward_token_graph(
                 // FFN's branch, norm it.
                 let mp = mhc::pipes(c).expect("checked at the layer start");
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let um = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
-                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, mix_out, &mk, &um]), (hidden as u32).div_ceil(256));
-                let uf = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                let um = mhc::uniform8(c, mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                go(&mut enc, &mp.merge, &bgc(142, li, &mp.merge_layout, &[&h_buf, &mr, mix_out, &mk, &um]), (hidden as u32).div_ceil(256));
                 let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
-                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &uf]), 1);
-                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+                go(&mut enc, &mp.route, &bgc(143, li, &mp.route_layout, &[&h_buf, &mr, &w, &b, &mk, &um]), 1);
+                go(&mut enc, &c.rmsnorm, &bgc(144, li, &c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
             } else if !skip_norm && !sw_mix_done {
                 let nbg = bgc(
                     23,
@@ -35306,11 +35308,11 @@ pub fn forward_token_graph(
                 // the streams' mean on), then the next layer's input norm.
                 let mp = mhc::pipes(c).expect("checked at the layer start");
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let um = unif(&mhc::params(hidden, false, m.leave, m.iters, m.pre_scale));
-                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, &ob, &mk, &um]), (hidden as u32).div_ceil(256));
+                let um = mhc::uniform8(c, mhc::params(hidden, false, m.leave, m.iters, m.pre_scale));
+                go(&mut enc, &mp.merge, &bgc(145, li, &mp.merge_layout, &[&h_buf, &mr, &ob, &mk, &um]), (hidden as u32).div_ceil(256));
                 if li + 1 < layers.len() {
                     let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
-                    go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
+                    go(&mut enc, &c.rmsnorm, &bgc(146, li, &c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
                 }
             } else if sandwich_tail {
                 // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale

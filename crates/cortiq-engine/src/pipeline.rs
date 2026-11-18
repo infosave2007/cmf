@@ -6579,21 +6579,31 @@ impl Pipeline {
         if prompt_rows.iter().any(|x| !x.is_finite()) {
             return Err("embedded prompt contains non-finite values".into());
         }
+        // A turbo file picks its far field by the prompt's length: an image prompt
+        // under the seal reads exact, whatever the previous request held.
+        self.o1_turbo_gate(input_ids.len());
         if !self.can_prefill_batched()
             || self.dyn_router.is_some()
             || self.o1_active()
-            || self.mtp.is_some()
             || self.gpu_plan.is_some()
         {
-            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing, GPU splitting or a generic MTP head".into());
+            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing or GPU splitting".into());
         }
-        self.generate_with_prompt_rows(
+        // The MTP head drafts over token rows: an embedded prompt decodes
+        // without it (the greedy text is the same; MTP state is rebuilt from
+        // the next prompt, and token reuse out of this request is off).
+        // SenseNova-Loop-9B's release ships the head, and its image prompts
+        // were refused before.
+        let mtp = self.mtp.take();
+        let out = self.generate_with_prompt_rows(
             input_ids,
             Some(prompt_rows),
             max_tokens,
             task_mask,
             on_token,
-        )
+        );
+        self.mtp = mtp;
+        out
     }
 
     fn generate_with_prompt_rows(
@@ -7428,7 +7438,10 @@ impl Pipeline {
                 && !dyn_prefill
                 && self.o1_on_graph()
                 && std::env::var("CMF_O1_PREFIX_GPU").as_deref() != Ok("0")
-                && (0..self.num_layers).all(|li| self.phys_layer(li) == li)
+                // One cache per executed layer: a looped stack whose visits keep
+                // their own rows (SenseNova-Loop) indexes caches, mirrors and the
+                // query capture by the visit, as a plain stack does by the layer.
+                && self.kv_cache.layers.len() == self.num_layers
             {
                 let t_px = std::time::Instant::now();
                 // More of the prompt than the first seal covers: its rows stay in host

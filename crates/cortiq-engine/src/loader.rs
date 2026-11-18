@@ -2795,6 +2795,7 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
+        fold_yarn_scale_into_qk_norms(&mut pipeline);
         // A DFlash block drafter beside the file drafts the rounds when asked to.
         if std::env::var("CMF_DFLASH").as_deref() == Ok("1") {
             match crate::dflash::Drafter::for_target(model) {
@@ -3071,6 +3072,67 @@ impl Pipeline {
 /// weights loaded): bytes of bounded-anchor rings, bytes of recurrent
 /// vectors (S + conv rings), and how many layers still hold a growing
 /// per-position KV. A strictly-O(1) file has `growing_layers == 0`.
+/// YaRN's cos/sin scale (`attention_factor`) moved into the q/k norms.
+///
+/// RoPE is linear, so `s·R(q̂·w)` on the rotary channels equals `R(q̂·(s·w))`:
+/// on a model whose q/k norms run before RoPE and whose layers share one
+/// rotary profile, the scale becomes those channels' norm gain (`s·(1+w) − 1`
+/// for the `(1+w)` style) and `rope_scale` drops to 1. Every backend then reads
+/// the same numbers, and the device graphs' uniform attention arms (which
+/// decline a scale of their own) carry the model. SenseNova-Loop-9B: YaRN
+/// factor 2 on 64 rotary channels of 256, scale 1.0693, every length.
+/// `CMF_YARN_FOLD=0` keeps the scale in the rotation.
+pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
+    let s = p.rope_scale;
+    if s == 1.0
+        || p.qk_norm_after_rope
+        || p.rope_scale_local != 1.0
+        || p.sliding_layers.is_some()
+        || p.swa.is_some()
+        || p.inv_freq_local.is_some()
+        || p.global_attn.is_some()
+        || p.inv_freq_global.is_some()
+        || std::env::var("CMF_YARN_FOLD").as_deref() == Ok("0")
+    {
+        return;
+    }
+    let (rd, hd, gemma) = (p.rotary_dim.min(p.head_dim), p.head_dim, p.norm_style == cortiq_core::NormStyle::Gemma);
+    let norms_ok = |a: &AttnKind| match a {
+        AttnKind::Full { q_norm: Some(q), k_norm: Some(k), .. } => q.len() == hd && k.len() == hd,
+        AttnKind::Full { .. } => false,
+        _ => true,
+    };
+    let full_layers = p.weights.layers.iter().filter(|l| matches!(l.attn, AttnKind::Full { .. })).count();
+    if full_layers == 0
+        || !p.weights.layers.iter().all(|l| norms_ok(&l.attn))
+        || p.mtp.as_ref().is_some_and(|m| !norms_ok(&m.layer.attn))
+    {
+        return;
+    }
+    let fold_attn = |a: &mut AttnKind| {
+        if let AttnKind::Full { q_norm: Some(q), k_norm: Some(k), .. } = a {
+            fold_rope_scale_gain(q, rd, s, gemma);
+            fold_rope_scale_gain(k, rd, s, gemma);
+        }
+    };
+    for l in p.weights.layers.iter_mut() {
+        fold_attn(&mut l.attn);
+    }
+    if let Some(m) = p.mtp.as_mut() {
+        fold_attn(&mut m.layer.attn);
+    }
+    p.rope_scale = 1.0;
+    tracing::info!("YaRN scale {s} folded into the q/k norms of {full_layers} layers ({rd} rotary channels of {hd})");
+}
+
+/// One q/k norm's gain with a RoPE cos/sin scale `s` folded into its first `rd`
+/// (rotary) channels: `s·w` for the `x̂·w` style, `s·(1+w) − 1` for `x̂·(1+w)`.
+pub(crate) fn fold_rope_scale_gain(w: &mut [f32], rd: usize, s: f32, gemma: bool) {
+    for v in w.iter_mut().take(rd) {
+        *v = if gemma { s * (1.0 + *v) - 1.0 } else { s * *v };
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerSequenceState {
     pub bounded_bytes: usize,
@@ -3154,6 +3216,33 @@ pub fn per_sequence_state_bytes(model: &CmfModel) -> Result<PerSequenceState, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The YaRN fold: a norm with the scale in its rotary channels, then RoPE
+    /// at scale 1, equals the norm, then RoPE at the scale — for both norm
+    /// styles, on a partial-rotary head (SenseNova-Loop: 64 of 256, s 1.0693).
+    #[test]
+    fn yarn_scale_fold_matches_scaled_rope() {
+        let (hd, rd, s) = (256usize, 64usize, 1.069_314_7_f32);
+        let inv = crate::attention::yarn_inv_freq(rd, 1e7, 2.0, 262_144, 32.0, 1.0);
+        let x: Vec<f32> = (0..hd).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03).collect();
+        let w: Vec<f32> = (0..hd).map(|i| 0.4 + ((i * 13 % 17) as f32) * 0.05).collect();
+        for style in [cortiq_core::NormStyle::Qwen, cortiq_core::NormStyle::Gemma] {
+            let gemma = style == cortiq_core::NormStyle::Gemma;
+            for pos in [0usize, 7, 4099, 300_000] {
+                let mut a = x.clone();
+                crate::attention::rmsnorm_head(&mut a, &w, 1e-6, style);
+                crate::attention::rope_rotate_scaled(&mut a[..rd], pos, &inv, s);
+                let mut wf = w.clone();
+                fold_rope_scale_gain(&mut wf, rd, s, gemma);
+                let mut b = x.clone();
+                crate::attention::rmsnorm_head(&mut b, &wf, 1e-6, style);
+                crate::attention::rope_rotate_scaled(&mut b[..rd], pos, &inv, 1.0);
+                let d = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+                assert!(d < 2e-5, "{style:?} pos {pos}: max |d| {d}");
+                assert_eq!(a[rd..], b[rd..], "{style:?}: the pass-through channels moved");
+            }
+        }
+    }
 
     fn dense_mtp_ffn(width: usize) -> FfnKind {
         const HIDDEN: usize = 4;

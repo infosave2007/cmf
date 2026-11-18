@@ -401,6 +401,9 @@ pub(crate) fn encode_merge4(
 pub(crate) struct Pipes {
     pub route: wgpu::ComputePipeline,
     pub merge: wgpu::ComputePipeline,
+    /// Their bind-group layouts, taken once (the token graph caches its groups).
+    pub route_layout: wgpu::BindGroupLayout,
+    pub merge_layout: wgpu::BindGroupLayout,
 }
 
 static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
@@ -423,7 +426,9 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                     cache: None,
                 })
             };
-            let p = Pipes { route: mk("mhc_route", ROUTE_SRC, "mhc_route"), merge: mk("mhc_merge", MERGE_SRC, "mhc_merge") };
+            let (route, merge) = (mk("mhc_route", ROUTE_SRC, "mhc_route"), mk("mhc_merge", MERGE_SRC, "mhc_merge"));
+            let (route_layout, merge_layout) = (route.get_bind_group_layout(0), merge.get_bind_group_layout(0));
+            let p = Pipes { route, merge, route_layout, merge_layout };
             if let Some(e) = pollster::block_on(sc.pop()) {
                 tracing::warn!("mHC kernels rejected: {e}");
                 return None;
@@ -431,6 +436,25 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             Some(p)
         })
         .as_ref()
+}
+
+static UNIFORMS: std::sync::Mutex<Option<std::collections::HashMap<[u32; 8], wgpu::Buffer>>> = std::sync::Mutex::new(None);
+
+/// A params uniform by content: the same words every token, so one buffer each.
+pub(crate) fn uniform8(c: &Ctx, v: [u32; 8]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let mut g = UNIFORMS.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    if let Some(b) = m.get(&v) {
+        return b.clone();
+    }
+    let b = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mhc-params"),
+        contents: bytemuck::cast_slice(&v),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    m.insert(v, b.clone());
+    b
 }
 
 /// The uniform words: `[d, 2, 8, flags, iters, pre_scale, rows, 0]` with

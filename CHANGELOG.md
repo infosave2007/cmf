@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SenseNova-Loop-9B, the release of 2026-11-17 (`sensenova_loop`): its MTP head, which the release ships in
+  `mtp.safetensors` outside the weight index, joins the conversion (a sharded checkpoint's sidecar is counted,
+  listed and opened with the indexed shards: `mtp_sidecar_shard`), so the looped stack drafts tokens and checks
+  them in one batch; `loop_gate.logits`, a constant the reference never reads, stays out. RTX A5000 through CUDA,
+  q4tp, 256-token answers: code at 88.1 tok/s with drafts against 51.0 without, general questions 57.9 against
+  49.8, the same greedy text.
+- The far field on looped stacks whose visits keep their own rows: the device prompt route of a turbo file
+  required every executed layer to be its own physical layer; it now asks for one cache per executed layer, so
+  SenseNova-Loop's 14 full-attention visits read a long prompt on the batch graph, seal on the card and decode
+  past it on CUDA and Vulkan. CUDA, RTX A5000, turbo against standard: 128 000 tokens in 8.3 GB of the card
+  against 16.5, the first token in 140 s against 142, decode 49.9 tok/s against 30.5; 250 000 tokens in 8.3 GB,
+  265 s, 50.4 tok/s; planted facts in 60 000 / 120 000 / 240 000 characters 4 of 4 each.
+
+### Fixed
+- YaRN on the device graphs: a uniform model with a YaRN cos/sin scale was declined by every fast graph arm
+  ("scaled RoPE without per-layer geometry") and decoded op by op (SenseNova-Loop-9B applies YaRN, factor 2, at
+  every length: 0.7 tok/s on an RTX A5000 through CUDA). Where the q/k norms run before RoPE, the scale now moves
+  into the norms' rotary channels at load (`loader::fold_yarn_scale_into_qk_norms`; RoPE is linear, so the
+  numbers are the same), and the graphs take the model. `CMF_YARN_FOLD=0` keeps the scale in the rotation.
+- GPTQ calibration of looped stacks: a chunk's forward stopped at the executed layer whose index equals the
+  chunk's last physical layer, so the loop's second visits gave no input to the Hessians and the layers after
+  the loop got none (SenseNova-Loop-9B: layers 28–31 rounded). The forward now runs to the last visit of a layer
+  of the chunk. SenseNova-Loop-9B q4tp, ppl on held-out chat text: 1.942, against 2.000 rounded and 1.848 for
+  q8_2f.
+- Image prompts on a file with an MTP head were refused ("embedded prompts require ... a generic MTP head");
+  the head is set aside for such a request (its state is rebuilt from the next prompt), and a turbo file applies
+  its length gate first.
+- wgpu token graph, mHC: the router and merge bind groups and their parameter uniforms are token-invariant and
+  now come from the graph's bind-group cache and a content-keyed uniform cache (SenseNova-Loop-9B: 17 167 to
+  9 834 allocations a token, 248 to 56 fresh uniforms).
+
 ## [0.9.4] — 2026-11-17
 
 ### Added

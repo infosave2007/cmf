@@ -816,8 +816,9 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     }
     // SenseNova-Loop (`sensenova_loop`): the Qwen3.5 text model at the usual
     // names (its mHC routers ride along under their layers), the Qwen3-VL
-    // style vision tower as `vis.*` for `qwen3vis`. The MTP head is dropped:
-    // the looped stack decodes without it.
+    // style vision tower as `vis.*` for `qwen3vis`, the MTP head (the release
+    // ships it in `mtp.safetensors`, outside the index) at the Qwen3.5 head's
+    // names. `loop_gate.logits` is a constant the reference never reads.
     if arch.arch_name == "sensenova_loop" {
         if let Some(rest) = raw.strip_prefix("model.visual.") {
             if let Some(rest) = rest.strip_prefix("patch_embed.proj.") {
@@ -825,7 +826,10 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
             }
             return Some(format!("vis.{rest}"));
         }
-        if raw.starts_with("mtp.") || raw.starts_with("model.mtp.") {
+        if raw.ends_with(".loop_gate.logits") {
+            return None;
+        }
+        if (raw.starts_with("mtp.") || raw.starts_with("model.mtp.")) && arch.mtp.is_none() {
             return None;
         }
         return canon_name(raw);
@@ -5165,6 +5169,15 @@ fn source_shard_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// A sharded checkpoint's MTP head shipped beside the index rather than in
+/// it (SenseNova-Loop-9B: `mtp.safetensors`, absent from the weight map).
+/// None when the file is missing or the index already lists it.
+fn mtp_sidecar_shard(dir: &Path, indexed: &[String]) -> Option<String> {
+    const NAME: &str = "mtp.safetensors";
+    (dir.join(NAME).is_file() && !indexed.iter().any(|f| source_shard_name(f) == NAME))
+        .then(|| NAME.to_string())
+}
+
 /// Move the explicitly requested source basenames to the front while keeping
 /// every other validated shard in its original order.  The source list has
 /// already come from the HF index (or the local source index) when this is
@@ -5278,6 +5291,11 @@ fn source_shard_counts_main(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> 
         for file in map.values().filter_map(|v| v.as_str()) {
             *counts.entry(source_shard_name(file)).or_default() += 1;
         }
+        let indexed: Vec<String> = counts.keys().cloned().collect();
+        if let Some(side) = mtp_sidecar_shard(dir, &indexed) {
+            let n = safetensors_tensor_count(&dir.join(&side))?;
+            counts.insert(side, n);
+        }
         let mut shards: Vec<(String, usize)> = counts.into_iter().collect();
         shards.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(shards);
@@ -5317,9 +5335,20 @@ fn source_tensor_names(dir: &Path) -> Option<Vec<String>> {
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("weight_map").and_then(|m| m.as_object()).cloned())
     {
-        return Some(map.keys().cloned().collect());
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        let files: Vec<String> =
+            map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+        if let Some(side) = mtp_sidecar_shard(dir, &files) {
+            names.extend(safetensors_names(&dir.join(side))?);
+        }
+        return Some(names);
     }
-    let mut file = fs::File::open(dir.join("model.safetensors")).ok()?;
+    safetensors_names(&dir.join("model.safetensors"))
+}
+
+/// Tensor names in one safetensors file's header.
+fn safetensors_names(path: &Path) -> Option<Vec<String>> {
+    let mut file = fs::File::open(path).ok()?;
     let mut len_bytes = [0u8; 8];
     file.read_exact(&mut len_bytes).ok()?;
     let mut header = vec![0u8; u64::from_le_bytes(len_bytes) as usize];
@@ -5398,6 +5427,9 @@ fn open_model_filtered_main(
             .collect();
         files.sort();
         files.dedup();
+        if let Some(side) = mtp_sidecar_shard(dir, &files) {
+            files.push(side);
+        }
         return files
             .iter()
             .filter(|f| !completed_shards.contains(&source_shard_name(f)))
@@ -12481,6 +12513,41 @@ pub(crate) mod tests {
         // DeepSeek-V3 / GLM keep the next-token layer as `layers.N`, N past the trunk.
         assert!(source_may_ship_mtp(&names(&["model.layers.61.enorm.weight"]), 61));
         assert!(!source_may_ship_mtp(&names(&["model.layers.60.enorm.weight"]), 61));
+    }
+
+    /// SenseNova-Loop-9B ships its MTP head in `mtp.safetensors`, outside the
+    /// index: the head's tensors join the inventory, the counts and the list of
+    /// shards to open; a sidecar the index already lists is not added twice.
+    #[test]
+    fn mtp_sidecar_outside_the_index_joins_the_source() {
+        let root = std::env::temp_dir().join(format!("cortiq-mtp-sidecar-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let shard = |name: &str, tensor: &str| {
+            let header = format!(r#"{{"{tensor}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+            let mut b = (header.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(header.as_bytes());
+            b.extend_from_slice(&0f32.to_le_bytes());
+            fs::write(root.join(name), b).unwrap();
+        };
+        shard("model-00001.safetensors", "model.language_model.norm.weight");
+        shard("mtp.safetensors", "mtp.norm.weight");
+        let index = |files: &[(&str, &str)]| {
+            let map: serde_json::Map<String, serde_json::Value> =
+                files.iter().map(|(t, f)| (t.to_string(), serde_json::json!(f))).collect();
+            fs::write(root.join("model.safetensors.index.json"), serde_json::json!({ "weight_map": map }).to_string()).unwrap();
+        };
+        index(&[("model.language_model.norm.weight", "model-00001.safetensors")]);
+        let names = source_tensor_names(&root).unwrap();
+        assert!(names.iter().any(|n| n == "mtp.norm.weight"), "{names:?}");
+        let counts = source_shard_counts_main(&root).unwrap();
+        assert_eq!(counts, vec![("model-00001.safetensors".to_string(), 1), ("mtp.safetensors".to_string(), 1)]);
+        let opened = open_model_filtered_main(&root, &Default::default()).unwrap();
+        assert_eq!(opened.len(), 2);
+        index(&[("model.language_model.norm.weight", "model-00001.safetensors"), ("mtp.norm.weight", "mtp.safetensors")]);
+        assert_eq!(open_model_filtered_main(&root, &Default::default()).unwrap().len(), 2);
+        assert_eq!(mtp_sidecar_shard(&root, &["mtp.safetensors".to_string()]), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
