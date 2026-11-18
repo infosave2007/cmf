@@ -2220,6 +2220,107 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
     }
 }
 
+// Hy4-flash's compact slots (a prompt chunk of the small path): every slot
+// takes only the rows routed to it, `nr` of them in a row block of its own,
+// instead of all `n` rows of the call with zero weights for the others. The
+// slots' row blocks follow each other in slot order (`base`); `srow` names a
+// compact row's call row (-1 past the last), `crow` / `cwt` a call row's
+// compact rows and weights in slot order (the combine's own order), -1 past
+// its picks. One block; the jobs' weights stay (the stream patches them).
+extern "C" __global__ void hy_moe_compact(const float* __restrict__ wsel, int n, int S, int k, HyJob* __restrict__ gu_a,
+                                          HyJob* __restrict__ dn_a, u64 qq0, u64 qq1, int pstride, u64 dnS, int hidden,
+                                          int xs, int* __restrict__ srow, int* __restrict__ crow,
+                                          float* __restrict__ cwt)
+{
+    __shared__ int cnt[1024];
+    __shared__ int base[1025];
+    const int tid = threadIdx.x;
+    for (int s = tid; s < S; s += blockDim.x) {
+        int c = 0;
+        for (int r = 0; r < n; r++) c += wsel[(size_t)r * S + s] != 0.0f;
+        cnt[s] = c;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int b = 0;
+        for (int s = 0; s < S; s++) {
+            base[s] = b;
+            b += cnt[s];
+        }
+        base[S] = b;
+    }
+    __syncthreads();
+    for (int s = tid; s < S; s += blockDim.x) {
+        const int b = base[s];
+        int i = 0;
+        for (int r = 0; r < n; r++)
+            if (wsel[(size_t)r * S + s] != 0.0f) srow[b + i++] = r;
+        HyJob g = gu_a[s], d = dn_a[s];
+        if (cnt[s] == 0) {
+            g.rows = 0;
+            d.rows = 0;
+        }
+        g.y = qq0 + (u64)b * pstride * 2;
+        g.res = qq1 + (u64)b * pstride * 2;
+        g.xoff = b * xs;
+        g.nr = max(cnt[s], 1);
+        d.y = dnS + (u64)b * hidden * 4;
+        d.xoff = b * pstride;
+        d.nr = max(cnt[s], 1);
+        gu_a[s] = g;
+        dn_a[s] = d;
+    }
+    for (int i = base[S] + tid; i < n * k; i += blockDim.x) srow[i] = -1;
+    __syncthreads();
+    if (tid < n) {
+        const int r = tid;
+        int j = 0;
+        for (int s = 0; s < S && j < k; s++) {
+            const float w = wsel[(size_t)r * S + s];
+            if (w == 0.0f) continue;
+            int idx = 0;
+            for (int q = 0; q < r; q++) idx += wsel[(size_t)q * S + s] != 0.0f;
+            crow[r * k + j] = base[s] + idx;
+            cwt[r * k + j] = w;
+            j++;
+        }
+        for (; j < k; j++) {
+            crow[r * k + j] = -1;
+            cwt[r * k + j] = 0.0f;
+        }
+    }
+}
+
+// The compact rows' input: row i of the planes is call row srow[i] (none past -1).
+extern "C" __global__ void hy_rows_gather(const u16* __restrict__ p0, const u16* __restrict__ p1, int xs,
+                                          const int* __restrict__ srow, u16* __restrict__ c0, u16* __restrict__ c1,
+                                          int dim)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
+    if (e >= dim) return;
+    const int r = srow[i];
+    if (r < 0) return;
+    c0[(size_t)i * xs + e] = p0[(size_t)r * xs + e];
+    c1[(size_t)i * xs + e] = p1[(size_t)r * xs + e];
+}
+
+// `hy_moe_combine` over compact rows: h[r] += sum over its picks (slot order)
+// of cwt * dnS[crow] — the same sum in the same order.
+extern "C" __global__ void hy_moe_combine_c(float* __restrict__ h, const float* __restrict__ dnS,
+                                            const int* __restrict__ crow, const float* __restrict__ cwt, int n,
+                                            int hidden, int k)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= hidden || r >= n) return;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        const int q = crow[r * k + j];
+        if (q < 0) break;
+        acc = fmaf(cwt[r * k + j], dnS[(size_t)q * hidden + i], acc);
+    }
+    h[(size_t)r * hidden + i] += acc;
+}
+
 // h[r] += sum over slots of wsel[r][s] * dnS[s][r] (+ the shared expert's
 // output times its weight: sigmoid(sg[r]) under `gated`, else 1).
 extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __restrict__ dnS,
@@ -3194,6 +3295,100 @@ extern "C" __global__ void hy_mhc_merge(float* __restrict__ R, const float* __re
     for (int i = 0; i < ns; i++) Rr[i * dim + e] = t[i];
 }
 
+// Hy4-flash's identity hyper-connections, a block a row after
+// `hy_mhc_logits`: pre = sigmoid(l s0 + base) + eps, the fold of the streams
+// into h; a sub-layer's (head 0) post = mag sigmoid(l s1 + base) + eps and an
+// identity mix for `hy_mhc_merge`; the stack's closing fold (head 1, `hc_head`)
+// only the pre weights over its `ns` logits.
+extern "C" __global__ void hy_mhc_route_ihc(const float* __restrict__ R, const float* __restrict__ L, const float* __restrict__ base,
+                                            float* __restrict__ h, float* __restrict__ coef, int ns, int dim, float s0, float s1,
+                                            float eps, float mag, int head)
+{
+    __shared__ float pre_s[4];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* Rr = R + (size_t)r * ns * dim;
+    if (tid == 0) {
+        const float* l = L + (size_t)r * 24;
+        for (int s = 0; s < ns; s++) pre_s[s] = 1.0f / (1.0f + expf(-(l[s] * s0 + base[s]))) + eps;
+        if (!head) {
+            float* cr = coef + (size_t)r * 20;
+            for (int s = 0; s < ns; s++) cr[s] = mag / (1.0f + expf(-(l[ns + s] * s1 + base[ns + s]))) + eps;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) cr[4 + i * 4 + j] = i == j ? 1.0f : 0.0f;
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < dim; e += blockDim.x) {
+        float v = 0.0f;
+        for (int s = 0; s < ns; s++) v = fmaf(pre_s[s], Rr[s * dim + e], v);
+        h[(size_t)r * dim + e] = v;
+    }
+}
+
+__device__ __forceinline__ float hy_block_sum(float v, float* red)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FULL, v, o);
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float t = 0.0f;
+    for (int w = 0; w < nw; w++) t += red[w];
+    return t;
+}
+
+// Hy4-flash's Engram residual, a block a row (`hy4::Engram::apply`): P the
+// projections of the row's looked-up memory [n][1 + ns][dim] (value, then a
+// key a stream), their biases vb [dim] / kb [ns][dim]; the value RMS-normed
+// (no weight) times gamma; stream s gated by sigmoid of the signed root of
+// <rms(k_s) nk_s, rms(R_s) nq_s> / sqrt(dim); R_s += (gate + hcs_s) value.
+// `on[r]` 0: the row adds nothing (an image or pad position).
+extern "C" __global__ void hy_engram(float* __restrict__ R, const float* __restrict__ P, const float* __restrict__ vb,
+                                     const float* __restrict__ kb, const float* __restrict__ nk, const float* __restrict__ nq,
+                                     const float* __restrict__ gamma, const float* __restrict__ hcs, const float* __restrict__ on,
+                                     int ns, int dim, float eps)
+{
+    extern __shared__ float val[];
+    __shared__ float red[32];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    if (on[r] == 0.0f) return;
+    const float* Pr = P + (size_t)r * (1 + ns) * dim;
+    float* Rr = R + (size_t)r * ns * dim;
+    float ss = 0.0f;
+    for (int e = tid; e < dim; e += blockDim.x) {
+        const float v = Pr[e] + vb[e];
+        val[e] = v;
+        ss = fmaf(v, v, ss);
+    }
+    ss = hy_block_sum(ss, red);
+    const float iv = rsqrtf(ss / (float)dim + eps);
+    for (int e = tid; e < dim; e += blockDim.x) val[e] = val[e] * iv * gamma[e];
+    __syncthreads();
+    const float rs = rsqrtf((float)dim);
+    for (int s = 0; s < ns; s++) {
+        const float* Pk = Pr + (size_t)(1 + s) * dim;
+        const float* Rs = Rr + (size_t)s * dim;
+        float kk = 0.0f, qq = 0.0f, kq = 0.0f;
+        for (int e = tid; e < dim; e += blockDim.x) {
+            const float k = Pk[e] + kb[(size_t)s * dim + e];
+            const float q = Rs[e];
+            kk = fmaf(k, k, kk);
+            qq = fmaf(q, q, qq);
+            kq = fmaf(k * nk[(size_t)s * dim + e], q * nq[(size_t)s * dim + e], kq);
+        }
+        kk = hy_block_sum(kk, red);
+        qq = hy_block_sum(qq, red);
+        kq = hy_block_sum(kq, red);
+        float g = kq * rsqrtf(kk / (float)dim + eps) * rsqrtf(qq / (float)dim + eps) * rs;
+        g = g == 0.0f ? 0.0f : copysignf(sqrtf(fmaxf(fabsf(g), 1e-6f)), g);
+        const float gate = 1.0f / (1.0f + expf(-g));
+        __syncthreads();
+        float* Rw = Rr + (size_t)s * dim;
+        for (int e = tid; e < dim; e += blockDim.x) Rw[e] = fmaf(gate + hcs[(size_t)s * dim + e], val[e], Rw[e]);
+        __syncthreads();
+    }
+}
+
 // ------------------------------------------------------------------ DASH
 //
 // Unlimited-OCR's block-sparse attend (`gpu_wgpu/uocr.rs` has the semantics):
@@ -3925,6 +4120,177 @@ extern "C" __global__ void hy_dsa_out(const float* __restrict__ olat, const floa
     for (int l = lane; l < lora; l += 32) a = fmaf(wv[l], m[l], a);
     for (int k = 16; k > 0; k >>= 1) a += __shfl_xor_sync(FULL, a, k);
     if (lane == 0) put3(p0, p1, p1, (size_t)r * pstride + o, a);
+}
+
+// ------------------------------------------------------------ Hy4-flash
+//
+// Hy4-flash's sparse layers past 2048 positions (`hy4::select_groups` /
+// `pool_group`): the latent cache keeps [normed latent | rotated shared key]
+// a position, the indexer's token key (RMS-normed) beside it; every 4
+// positions make a group whose key is the gate-softmax mixture of the value
+// projections of its token keys, RMS-normed and rotated at its first
+// position. A row scores the complete groups before its own (GLM's
+// `hy_dsa_score`), keeps the best `keep` and its own group, and attends over
+// those positions in the absorbed form with the head's sink, the output
+// gated element-wise.
+
+// A block a row: the latent normed and the shared key rotated (the row's
+// table `tab`, sin / cos pairs) into the latent cache, the token key normed.
+extern "C" __global__ void hy_hy4_put(const float* __restrict__ kva, int kstride, const float* __restrict__ lw, int lora, int rope,
+                                      float eps, const float* __restrict__ xk, int xstride, const float* __restrict__ tkw, int id,
+                                      const float* __restrict__ tab, float* __restrict__ lat, float* __restrict__ ikc, int pos0)
+{
+    __shared__ float red[32];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const size_t pos = (size_t)pos0 + r;
+    const int latw = lora + rope, half = rope >> 1;
+    const float* x = kva + (size_t)r * kstride;
+    float s = 0.0f;
+    for (int i = tid; i < lora; i += blockDim.x) s = fmaf(x[i], x[i], s);
+    s = hy_block_sum(s, red);
+    const float inv = rsqrtf(s / (float)lora + eps);
+    float* lr = lat + pos * latw;
+    for (int i = tid; i < lora; i += blockDim.x) lr[i] = __fmul_rn(__fmul_rn(x[i], inv), lw[i]);
+    const float* t = tab + (size_t)r * half * 2;
+    for (int i = tid; i < half; i += blockDim.x) {
+        const float x0 = x[lora + i], x1 = x[lora + half + i], sn = t[2 * i], c = t[2 * i + 1];
+        lr[lora + i] = x0 * c - x1 * sn;
+        lr[lora + half + i] = x1 * c + x0 * sn;
+    }
+    const float* k = xk + (size_t)r * xstride;
+    float s2 = 0.0f;
+    for (int i = tid; i < id; i += blockDim.x) s2 = fmaf(k[i], k[i], s2);
+    s2 = hy_block_sum(s2, red);
+    const float kinv = rsqrtf(s2 / (float)id + eps);
+    for (int i = tid; i < id; i += blockDim.x) ikc[pos * id + i] = __fmul_rn(__fmul_rn(k[i], kinv), tkw[i]);
+}
+
+// Groups [p0, p0 + np), a block a group (blockDim = id): value and gate
+// projections of the group's token keys (f32 `[id][id]`), the gate plus the
+// group's position embedding softmaxed over the slots, the mixture normed
+// (knw) and its last `rope` channels rotated at the group's first position.
+extern "C" __global__ void hy_hy4_pool(const float* __restrict__ ikc, const float* __restrict__ kv, const float* __restrict__ kg,
+                                       const float* __restrict__ ape, const float* __restrict__ knw, float eps,
+                                       const float* __restrict__ invf, int rope, float* __restrict__ pooled, int p0, int kp, int id)
+{
+    extern __shared__ float key[];
+    __shared__ float red[32];
+    const size_t p = (size_t)p0 + blockIdx.x;
+    const int d = threadIdx.x;
+    float v[8], g[8];
+    float mx = -3.0e38f;
+    for (int t = 0; t < kp && t < 8; t++) {
+        const float* tk = ikc + (p * kp + t) * id;
+        float a = 0.0f, b = 0.0f;
+        for (int c = 0; c < id; c++) {
+            a = fmaf(kv[(size_t)d * id + c], tk[c], a);
+            b = fmaf(kg[(size_t)d * id + c], tk[c], b);
+        }
+        v[t] = a;
+        g[t] = b + ape[(size_t)t * id + d];
+        mx = fmaxf(mx, g[t]);
+    }
+    float z = 0.0f, acc = 0.0f;
+    for (int t = 0; t < kp && t < 8; t++) {
+        const float e = expf(g[t] - mx);
+        z += e;
+        acc = fmaf(e, v[t], acc);
+    }
+    const float m = acc / z;
+    const float ss = hy_block_sum(m * m, red);
+    key[d] = m * rsqrtf(ss / (float)id + eps) * knw[d];
+    __syncthreads();
+    const int half = rope >> 1, base = id - rope;
+    float o = key[d];
+    if (d >= base) {
+        const int i = (d - base) < half ? d - base : d - base - half;
+        float sn, c;
+        sincosf((float)(p * kp) * invf[i], &sn, &c);
+        if (d - base < half) o = key[d] * c - key[d + half] * sn;
+        else o = key[d] * c + key[d - half] * sn;
+    }
+    pooled[p * id + d] = o;
+}
+
+// The rotary slice of every head of n rows, in place: x[r][h·hstride + off
+// + (0..2 half)] by the row's table (sin / cos pairs), half-split.
+extern "C" __global__ void hy_rope_rows(float* __restrict__ x, int rstride, int hstride, int off, int half,
+                                        const float* __restrict__ tab)
+{
+    const int r = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    if (i >= half) return;
+    float* v = x + (size_t)r * rstride + (size_t)h * hstride + off;
+    const float* t = tab + (size_t)r * half * 2;
+    const float x0 = v[i], x1 = v[i + half], sn = t[2 * i], c = t[2 * i + 1];
+    v[i] = x0 * c - x1 * sn;
+    v[i + half] = x1 * c + x0 * sn;
+}
+
+// A block a head: the scores over the selected positions (the absorbed query
+// against the latent, the rotated query against the shared key), the softmax
+// with the head's sink, the mixture of the latents (olat).
+extern "C" __global__ void hy_hy4_attn(const float* __restrict__ qlat, const float* __restrict__ q, int hd, int rope,
+                                       const float* __restrict__ lat, int lora, const int* __restrict__ sel,
+                                       const int* __restrict__ nsel, float scale, const float* __restrict__ sink,
+                                       float* __restrict__ olat)
+{
+    extern __shared__ float sh[];
+    __shared__ float red[32];
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const int ns = *nsel, latw = lora + rope;
+    const float* qh = qlat + (size_t)h * lora;
+    const float* qr = q + (size_t)h * hd;
+    float mx = sink[h];
+    for (int j = warp; j < ns; j += NW) {
+        const float* row = lat + (size_t)sel[j] * latw;
+        float d = 0.0f;
+        for (int e = lane; e < lora; e += 32) d = fmaf(qh[e], row[e], d);
+        for (int e = lane; e < rope; e += 32) d = fmaf(qr[e], row[lora + e], d);
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(FULL, d, o);
+        d = __fmul_rn(d, scale);
+        if (lane == 0) sh[j] = d;
+        mx = fmaxf(mx, d);
+    }
+    if (lane == 0) red[warp] = mx;
+    __syncthreads();
+    mx = sink[h];
+    for (int w = 0; w < NW; w++) mx = fmaxf(mx, red[w]);
+    __syncthreads();
+    float z = 0.0f;
+    for (int j = tid; j < ns; j += blockDim.x) {
+        const float e = expf(__fsub_rn(sh[j], mx));
+        sh[j] = e;
+        z = __fadd_rn(z, e);
+    }
+    for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(FULL, z, o);
+    if (lane == 0) red[warp] = z;
+    __syncthreads();
+    z = expf(sink[h] - mx);
+    for (int w = 0; w < NW; w++) z = __fadd_rn(z, red[w]);
+    const float iz = 1.0f / z;
+    for (int l = tid; l < lora; l += blockDim.x) {
+        float a = 0.0f;
+        for (int j = 0; j < ns; j++) a = fmaf(__fmul_rn(sh[j], iz), lat[(size_t)sel[j] * latw + l], a);
+        olat[(size_t)h * lora + l] = a;
+    }
+}
+
+// `hy_dsa_out` with the element-wise output gate: a warp an output (head h,
+// channel d), kv_b's value part over the head's mixture times
+// sigmoid(gate[r][h vd + d]), into the output planes' row r.
+extern "C" __global__ void hy_hy4_out(const float* __restrict__ olat, const float* __restrict__ wkv, int nh, int nope, int vd, int lora,
+                                      const float* __restrict__ gate, u16* __restrict__ p0, u16* __restrict__ p1, int pstride, int r)
+{
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (o >= nh * vd) return;
+    const int h = o / vd, d = o % vd;
+    const float* wv = wkv + ((size_t)h * (nope + vd) + nope + d) * lora;
+    const float* m = olat + (size_t)h * lora;
+    float a = 0.0f;
+    for (int l = lane; l < lora; l += 32) a = fmaf(wv[l], m[l], a);
+    for (int k = 16; k > 0; k >>= 1) a += __shfl_xor_sync(FULL, a, k);
+    if (lane == 0) put3(p0, p1, p1, (size_t)r * pstride + o, a * sigm(gate[(size_t)r * nh * vd + o]));
 }
 
 // Planes [n][nh][hd] (the attention's heads) into planes [n][nh][vd] (the

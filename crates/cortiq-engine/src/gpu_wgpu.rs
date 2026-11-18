@@ -28904,6 +28904,9 @@ pub fn forward_token_graph(
     // the head's logits from the same submit).
     hidden_too: bool,
 ) -> crate::gpu::TokenGraphOutcome {
+    if crate::gpu::hy_layers(layers) {
+        return crate::gpu::TokenGraphOutcome::Declined;
+    }
     let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
     let span_submit_start = SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
     let mut o1_started = false;
@@ -29738,6 +29741,7 @@ pub fn forward_token_graph(
                 shared_gated,
                 route_scale,
                 limit,
+                ..
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array
                 // (512 through `moe_sel2`); with a shared expert it rides as
@@ -36154,6 +36158,9 @@ pub fn forward_batch_graph_at(
     mut spec: Option<crate::gpu::SpecTail<'_>>,
     layers_run: Option<&mut usize>,
 ) -> crate::gpu::BatchGraphOutcome {
+    if crate::gpu::hy_layers(layers) {
+        return crate::gpu::BatchGraphOutcome::Declined;
+    }
     let t_bfn = std::time::Instant::now();
     // `set_batch_defer` arms this call only.
     let defer_req = BATCH_DEFER.with(|f| f.replace(false));

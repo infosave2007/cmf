@@ -1876,7 +1876,8 @@ impl Pipeline {
             || arch.arch_name == "deepseek_v41"
             || arch.dory.is_some()
             || arch.qwen4_exp.is_some()
-            || arch.glm5_next.is_some();
+            || arch.glm5_next.is_some()
+            || arch.arch_name == crate::hy4::ARCH_NAME;
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
@@ -2241,7 +2242,8 @@ impl Pipeline {
             pipeline
                 .set_attn_geometry(arch.kv_heads_per_layer.clone(), arch.v_head_dim)
                 .map_err(|e| CmfError::Parse(format!("attention geometry: {e}")))?;
-        } else if arch.kv_heads_per_layer.is_some() || arch.v_head_dim.is_some() {
+        } else if (arch.kv_heads_per_layer.is_some() || arch.v_head_dim.is_some()) && arch.arch_name != crate::hy4::ARCH_NAME {
+            // Hy4-flash's stack reads its MLA geometry itself
             return Err(CmfError::Parse(format!(
                 "{}: kv_heads_per_layer / v_head_dim are not supported by its own layer stack",
                 arch.arch_name
@@ -2376,6 +2378,10 @@ impl Pipeline {
         if arch.glm5_next.is_some() {
             let (globals, layers, cfg, state) = crate::glm5_next::load(model, &arch)?;
             pipeline.glm5_next = Some(Box::new((globals, layers, cfg, state)));
+        }
+        if arch.arch_name == crate::hy4::ARCH_NAME {
+            let (globals, layers, cfg, state) = crate::hy4::load(model, &arch)?;
+            pipeline.hy4 = Some(Box::new((globals, layers, cfg, state)));
         }
         // Gemma-4 E-series (E4B): the E block rides in `g3n` — altup/
         // laurel are zeroed for gemma4 — but the layer body is the

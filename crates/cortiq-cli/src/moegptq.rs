@@ -40,7 +40,7 @@
 //!   output in place (their payloads fit the old slots).
 
 use crate::convert::{Quant, fetch, open_safetensors, quantize_2d, to_f32, unpack_fp8_blocks, unpack_mxfp4};
-use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, split_calib_budget};
+use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, q2tp_refine_codes, q4tp_debias_gemm, q4tp_refine_codes, split_calib_budget};
 use cortiq_core::format::{CmfModel, CmfStreamWriter};
 use cortiq_core::quant::{f16_to_f32, f32_to_f16};
 use cortiq_core::types::TensorDtype;
@@ -71,7 +71,7 @@ pub struct MoeOpts<'a> {
 }
 
 /// Input rows per device pass of one expert.
-const CHUNK: usize = 16384;
+pub(crate) const CHUNK: usize = 16384;
 
 /// The expert layout of the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +177,9 @@ pub(crate) struct EncodeCfg {
     pub limit: f32,
     pub lambda: f64,
     pub threads: usize,
+    /// SFq's code refinement after each sweep (`docs/Q2TP_SCALE_REFINE.md`):
+    /// (rounds, ridge, also the q4tp down); None = off.
+    pub refine: Option<(usize, f64, bool)>,
 }
 
 /// Where the per-expert linear algebra runs.
@@ -461,7 +464,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         check_slots(&cmodel, &written, codec, Some((path, target)))?;
     }
 
-    let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1) };
+    let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1), refine: None };
     let main_bufs = match engine {
         Engine::Gpu(c) if !capture_only => Some(wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter.max(inter_s))),
         _ => None,
@@ -2397,6 +2400,10 @@ fn encode_expert_gpu(
             let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             gpu::gptq_fold_free(fid);
+            if let Some((iters, ridge, _)) = ec.refine {
+                q2tp_refine_codes(&mut gb, wg, inter, hidden, &hgu, ridge, iters, threads);
+                q2tp_refine_codes(&mut ub, wu, inter, hidden, &hgu, ridge, iters, threads);
+            }
             // debias: H·w for every gate/up row, one device GEMM [W_g; W_u]·H
             let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
             drop(hgu);
@@ -2415,12 +2422,21 @@ fn encode_expert_gpu(
     };
     tim[2] += ts.elapsed().as_secs_f64();
     let ts = Instant::now();
+    // the down Hessian on the host when its codes are refined
+    let hdh = match ec.refine {
+        Some((_, _, true)) => Some(gpu::gram_read(did).ok_or_else(|| anyhow::anyhow!("gram read"))?),
+        _ => None,
+    };
     let fd = gpu::gptq_fold_dev(did, inter, ec.lambda).ok_or_else(|| anyhow::anyhow!("fold"))?;
     let (dd, _, _) = gpu::gptq_fold_info(fd).unwrap_or_default();
     tim[3] += ts.elapsed().as_secs_f64();
     let ts = Instant::now();
-    let db = gptq_quantize_q4tp_dev(wd, hidden, inter, fd, &dd).ok_or_else(|| anyhow::anyhow!("q4tp sweep"))?;
+    let mut db = gptq_quantize_q4tp_dev(wd, hidden, inter, fd, &dd).ok_or_else(|| anyhow::anyhow!("q4tp sweep"))?;
     gpu::gptq_fold_free(fd);
+    if let (Some((iters, ridge, true)), Some(h)) = (ec.refine, &hdh) {
+        q4tp_refine_codes(&mut db, wd, hidden, inter, h, ridge, iters, threads);
+        q4tp_debias_gemm(&mut db, wd, hidden, inter, h, threads);
+    }
     tim[4] += ts.elapsed().as_secs_f64();
     Ok([gb, ub, db])
 }
@@ -2508,6 +2524,10 @@ pub(crate) fn encode_with_hessians(hidden: usize, inter: usize, w: &ExpertW, hgu
         Some(h) => {
             let mut gb = gptq_quantize_q2tp(&w.g, inter, hidden, &u, &dead, &hdiag, Q2tpRule::Placed, None, threads);
             let mut ub = gptq_quantize_q2tp(&w.u, inter, hidden, &u, &dead, &hdiag, Q2tpRule::Placed, None, threads);
+            if let Some((iters, ridge, _)) = ec.refine {
+                q2tp_refine_codes(&mut gb, &w.g, inter, hidden, h, ridge, iters, threads);
+                q2tp_refine_codes(&mut ub, &w.u, inter, hidden, h, ridge, iters, threads);
+            }
             q2tp_debias_gemm(&mut gb, &w.g, inter, hidden, h, threads);
             q2tp_debias_gemm(&mut ub, &w.u, inter, hidden, h, threads);
             (gb, ub)
@@ -2521,10 +2541,15 @@ pub(crate) fn encode_with_hessians(hidden: usize, inter: usize, w: &ExpertW, hgu
     tim[2] += ts.elapsed().as_secs_f64();
     let ts = Instant::now();
     let hddiag: Vec<f32> = (0..inter).map(|i| hd[i * inter + i] as f32).collect();
+    let keep_d = ec.refine.filter(|r| r.2).map(|_| hd.clone());
     let (ud, deadd) = gptq_fold_operator_par(hd, inter, ec.lambda, threads);
     tim[3] += ts.elapsed().as_secs_f64();
     let ts = Instant::now();
-    let db = gptq_quantize_q4tp(&w.d, hidden, inter, &ud, &deadd, &hddiag, threads);
+    let mut db = gptq_quantize_q4tp(&w.d, hidden, inter, &ud, &deadd, &hddiag, threads);
+    if let (Some((iters, ridge, true)), Some(h)) = (ec.refine, &keep_d) {
+        q4tp_refine_codes(&mut db, &w.d, hidden, inter, h, ridge, iters, threads);
+        q4tp_debias_gemm(&mut db, &w.d, hidden, inter, h, threads);
+    }
     tim[4] += ts.elapsed().as_secs_f64();
     [gb, ub, db]
 }
@@ -2548,7 +2573,7 @@ fn gram_add_host(h: &mut [f64], x: &[f32], m: usize, cols: usize, s: f64, thread
 }
 
 /// The f16 rows `part` of `x` (`hidden` wide) as f32, times `scale`.
-fn gather_rows(x: &[u16], hidden: usize, part: &[u32], scale: f32, threads: usize) -> Vec<f32> {
+pub(crate) fn gather_rows(x: &[u16], hidden: usize, part: &[u32], scale: f32, threads: usize) -> Vec<f32> {
     let mut out = vec![0f32; part.len() * hidden];
     par_rows(&mut out, hidden, threads, |r, row| {
         let t = part[r] as usize;
@@ -3204,7 +3229,7 @@ mod tests {
         let eye = |n: usize| -> Vec<f64> { (0..n * n).map(|i| if i / n == i % n { 1.0 } else { 0.0 }).collect() };
         let (mut groups, mut moved) = (0usize, 0usize);
         for codec in [Codec::Q4tp, Codec::Q2tp] {
-            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 3 };
+            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 3, refine: None };
             let got = encode_with_hessians(hidden, inter, &w, eye(hidden), eye(inter), &ec, &mut [0.0; 5]);
             let want = rtn_expert(codec, &w, inter, hidden);
             for (k, (name, src)) in [("gate", &w.g), ("up", &w.u), ("down", &w.d)].into_iter().enumerate() {
@@ -3264,7 +3289,7 @@ mod tests {
         let rows: Vec<u32> = (0..n_cal as u32).collect();
         let sample: Vec<u32> = (0..n_cal as u32).step_by(4).collect();
         for codec in [Codec::Q4tp, Codec::Q2tp] {
-            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3, refine: None };
             let rtn = err(&rtn_expert(codec, &w, inter, hidden), codec);
             let gptq = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
             let prior = Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
@@ -3327,7 +3352,7 @@ mod tests {
             let o = expert_out(xh, n_ho, hidden, &g, &u, &d, inter, limit, 2);
             o.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>() / o_fp.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()
         };
-        let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+        let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3, refine: None };
         let rows: Vec<u32> = (0..m as u32).collect();
         let prior = Prior { rows: sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
         let rtn = err(&rtn_expert(codec, w, inter, hidden));
@@ -3392,7 +3417,7 @@ mod tests {
         };
         let rows: Vec<u32> = (0..n_cal as u32).collect();
         for codec in [Codec::Q4tp, Codec::Q2tp] {
-            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3, refine: None };
             let rtn = err_w(&rtn_expert(codec, &w, inter, hidden), codec);
             let plain = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
             let weighted = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
@@ -3404,7 +3429,7 @@ mod tests {
             assert!(weighted.1 < 0.95 * plain.1, "{codec:?}: the route-weighted down Hessian does not cut the weighted down error: {plain:?} vs {weighted:?}");
         }
         // the per-row weights must match the rows
-        let ec = EncodeCfg { codec: Codec::Q4tp, limit, lambda: 0.01, threads: 3 };
+        let ec = EncodeCfg { codec: Codec::Q4tp, limit, lambda: 0.01, threads: 3, refine: None };
         assert!(encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw[1..]), &w, &ec, None, &mut [0.0; 5]).is_err());
     }
 
@@ -3527,7 +3552,7 @@ mod tests {
                 o.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>() / o_fp.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()
             };
             for codec in [Codec::Q4tp, Codec::Q2tp] {
-                let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 4 };
+                let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 4, refine: None };
                 let prior = Some(Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 });
                 let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
                 let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
@@ -3671,7 +3696,7 @@ mod tests {
         // the local source directory, read in place
         let source = Source::open(srcdir.to_str().unwrap(), root.join("scratch").to_str().unwrap()).unwrap();
         let run_layers = |codec: Codec, sink: &mut Sink, cm: &CmfModel| {
-            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2 };
+            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2, refine: None };
             for li in 0..nl {
                 let names = dsv41_src_names(&source, li, ne, true);
                 assert_eq!(names.len(), (ne + 1) * 6, "every weight with its scale plane");
@@ -3717,7 +3742,7 @@ mod tests {
         // weighted by w² (what the MoE output sees)
         let held_d: Vec<bool> = (0..n).map(|t| (t / 80) % 4 == 3).collect();
         for (codec, route_w) in [(Codec::Q4tp, RouteW::Off), (Codec::Q2tp, RouteW::Off), (Codec::Q4tp, RouteW::Diag), (Codec::Q2tp, RouteW::Diag)] {
-            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2 };
+            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2, refine: None };
             let names = dsv41_src_names(&source, 0, ne, true);
             let src = source.open_layer(&source.shards_of(&names).unwrap()).unwrap();
             let get = |part: Part, e: usize| dsv41_expert(&src, 0, part, e, hidden, inter, 32);

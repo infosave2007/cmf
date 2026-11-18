@@ -1601,6 +1601,26 @@ pub fn planes_may_grow(on: bool) {
     crate::gpu_cuda::h3_planes_grow(on);
 }
 
+/// Hy4-flash SFq calibration capture on the CUDA hybrid (see
+/// `gpu_cuda::hy4_capture_begin`); false without a CUDA backend.
+pub fn hy4_capture_begin(layers: usize, dim: usize, ne: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::hy4_capture_begin(layers, dim, ne);
+    }
+    let _ = (layers, dim, ne);
+    false
+}
+
+/// The rows the capture took (and the capture disarmed).
+pub fn hy4_capture_take() -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::hy4_capture_take();
+    }
+    None
+}
+
 pub fn cuda_active() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -1992,7 +2012,54 @@ pub enum GraphAttn<'a> {
         /// GLM-5.3's DSA: past `topk` positions the layer attends only to
         /// the positions its indexer selects (None: every position).
         dsa: Option<GraphDsa<'a>>,
+        /// Hy4-flash's gated MLA: the layer's own rotary table, window,
+        /// sinks, element-wise output gate and compressed indexer. None =
+        /// the GLM / Kimi / DeepSeek form; a backend without the arm must
+        /// decline a layer that carries it.
+        hy: Option<GraphMlaHy<'a>>,
     },
+}
+
+/// Hy4-flash's additions to MLA (`hy4::Attn`): heads `[rope | nope]` with
+/// the rotary pairs half-split, rotated by `invf` (`rope / 2` frequencies);
+/// a sliding window (positions a query sees, its own included) or, on the
+/// sparse layers, the compressed indexer past `group_topk · ratio`
+/// positions; one learned sink logit a head; the attention output scaled by
+/// `sigmoid(gate · x)` element-wise before the O projection.
+pub struct GraphMlaHy<'a> {
+    /// `[nh·v, hidden]` over the layer's normed input.
+    pub gate: GraphW<'a>,
+    pub sinks: &'a [f32],
+    pub window: Option<usize>,
+    pub invf: &'a [f32],
+    pub indexer: Option<GraphHyIndexer<'a>>,
+}
+
+/// Hy4-flash's compressed indexer (`hy4::select_groups` / `pool_group`): the
+/// index query over q_a's normed rows, the head weights and the token key
+/// over the layer input, the token key's norm, the pooling's value and gate
+/// projections over the token keys, the pooled key's norm, the groups'
+/// position embedding; rotary on the last `rope` channels of each `id`-wide
+/// head (index query at its position, a group's key at its first).
+pub struct GraphHyIndexer<'a> {
+    /// `[ih·id, q_rank]`.
+    pub q: GraphW<'a>,
+    /// `[ih, hidden]`, `[id, hidden]` f32.
+    pub hw: &'a [f32],
+    pub tk: &'a [f32],
+    pub tk_norm: &'a [f32],
+    /// `[id, id]` f32.
+    pub kv: &'a [f32],
+    pub kg: &'a [f32],
+    pub k_norm: &'a [f32],
+    /// `[ratio, id]`.
+    pub ape: &'a [f32],
+    pub ih: usize,
+    pub id: usize,
+    pub ratio: usize,
+    pub group_topk: usize,
+    /// kv_b `[nh·(nope + v), lora]` in f32, for the absorbed attention.
+    pub kv_b: &'a [f32],
 }
 
 /// A DSA layer's indexer (GLM-5.3, `glm5_next::dsa_forward`): the index
@@ -2146,6 +2213,30 @@ pub struct GraphMhc<'a> {
     /// and the router's RMS taken with `rms_eps`. None = SenseNova-Loop's
     /// log-domain Sinkhorn.
     pub dsv4: Option<GraphMhcDsv4>,
+    /// The range's closing fold (`leave`): Some = Hy4-flash's head,
+    /// `σ(l·scale + base) + eps` over `[ns, ns·hidden]` router weights;
+    /// None = the streams' mean. A backend without the arm must decline it.
+    pub head: Option<GraphMhcHead<'a>>,
+}
+
+/// Whether a stack carries any Hy4-flash arm (identity hyper-connections,
+/// its gated MLA, latent experts, Engram): a backend that has no kernels for
+/// them declines the whole call rather than run the layers without them.
+pub fn hy_layers(layers: &[GraphLayer]) -> bool {
+    layers.iter().any(|l| {
+        l.engram.is_some()
+            || l.mhc.as_ref().is_some_and(|m| m.head.is_some() || m.dsv4.is_some_and(|d| d.ihc.is_some()))
+            || matches!(&l.attn, GraphAttn::Mla { hy: Some(_), .. })
+            || matches!(&l.ffn, GraphFfn::Moe { latent: Some(_), .. } | GraphFfn::Moe { shared_limit: Some(_), .. })
+    })
+}
+
+/// Hy4-flash's closing hyper-connection fold (`hc_head`).
+#[derive(Clone, Copy)]
+pub struct GraphMhcHead<'a> {
+    pub w: &'a [f32],
+    pub base: &'a [f32],
+    pub scale: f32,
 }
 
 /// DeepSeek-V4 / GLM-5.3 mHC constants of a layer (see `GraphMhc::dsv4`):
@@ -2157,6 +2248,11 @@ pub struct GraphMhcDsv4 {
     pub ffn_scale: [f32; 3],
     pub eps: f32,
     pub rms_eps: f32,
+    /// Hy4-flash's identity hyper-connections: Some(magnitude) = the router
+    /// has `2·ns` logits (pre, post) and no mix, the streams are never
+    /// mixed, `post = magnitude·σ + eps`. A backend without the arm must
+    /// decline it.
+    pub ihc: Option<f32>,
 }
 
 pub struct GraphLayer<'a> {
@@ -2174,6 +2270,42 @@ pub struct GraphLayer<'a> {
     /// Gemma-4 `layer_scalar`: the residual stream is multiplied by it at
     /// the end of the layer.
     pub layer_scale: Option<f32>,
+    /// Hy4-flash's Engram: a residual added to the mHC streams before the
+    /// attention's fold. A backend without the arm must decline it.
+    pub engram: Option<GraphEngram<'a>>,
+}
+
+/// One Engram layer of a graph call (`hy4::Engram::apply`): the host's
+/// looked-up memory rows of the call, the value and per-stream key
+/// projections over them (with biases), the norms (`eps`, torch's bf16
+/// default) and the per-stream scales.
+pub struct GraphEngram<'a> {
+    /// `[rows][mem]`: a row a call position; `on[r]` false = the position
+    /// adds nothing (an image or pad token).
+    pub mem: &'a [f32],
+    pub on: &'a [bool],
+    pub mem_dim: usize,
+    /// `[hidden, mem]`, its bias.
+    pub value: GraphW<'a>,
+    pub value_b: &'a [f32],
+    /// One `[hidden, mem]` key projection, bias and two norms a stream.
+    pub keys: Vec<GraphW<'a>>,
+    pub key_b: Vec<&'a [f32]>,
+    pub norm_key: Vec<&'a [f32]>,
+    pub norm_query: Vec<&'a [f32]>,
+    pub gamma: &'a [f32],
+    /// `[ns, hidden]`.
+    pub hc_scales: &'a [f32],
+    pub eps: f32,
+}
+
+/// Hy4-flash's latent MoE: the routed experts read `down · x` and their
+/// mixture goes back through `up`; the router and the shared expert read x.
+pub struct GraphMoeLatent<'a> {
+    /// `[dim, hidden]`, `[hidden, dim]`.
+    pub down: GraphW<'a>,
+    pub up: GraphW<'a>,
+    pub dim: usize,
 }
 
 /// A SwiGLU shared MoE expert whose intermediate width or packed layout does
@@ -2276,6 +2408,12 @@ pub enum GraphFfn<'a> {
         /// from above, up on both sides), 0 = none. The CUDA hybrid's pair
         /// epilogue takes it; the wgpu graphs decline a clamped bank.
         limit: f32,
+        /// The shared expert's own clamp when it differs (Hy4-flash: none
+        /// beside clamped routed experts); None = `limit`.
+        shared_limit: Option<f32>,
+        /// Latent experts (Hy4-flash); None = experts at full width. A
+        /// backend without the arm must decline it.
+        latent: Option<GraphMoeLatent<'a>>,
     },
 }
 

@@ -11,6 +11,7 @@ mod dflash_route;
 mod dialog;
 mod egemma2pack;
 mod nemotron_pack;
+mod hy4pack;
 mod embed;
 mod flint;
 mod hotmix;
@@ -24,6 +25,8 @@ mod gptq;
 mod nvgtrain;
 #[cfg(feature = "gpu")]
 mod moegptq;
+#[cfg(feature = "gpu")]
+mod hy4sfq;
 #[cfg(feature = "gpu")]
 mod nemotron_gptq;
 mod growth;
@@ -1639,6 +1642,57 @@ enum Commands {
         /// are captured in one pass first; q2tp slack is released on Linux)
         #[arg(long, default_value_t = false)]
         in_place: bool,
+    },
+    /// SFq for the routed experts of a Hy4-flash file (hy_v4_flash): the
+    /// calibration capture on the CUDA hybrid (`--capture-only`), then per
+    /// routed FFN the channel scale of the latent input, GPTQ of every
+    /// expert (gate/up q2tp, down q4tp) with the code refinement, written in
+    /// place into `--target` (a q2tp file of the same model).
+    Hy4Sfq {
+        /// Calibration .cmf (the q4tp file; capture phase)
+        #[arg(long, default_value = "")]
+        calib_model: String,
+        /// Capture directory (written by --capture-only, read by the encode)
+        #[arg(long)]
+        capture: String,
+        #[arg(long, default_value_t = false)]
+        capture_only: bool,
+        /// Calibration text, PATH or PATH=SHARE (repeatable; capture phase)
+        #[arg(long)]
+        calib: Vec<String>,
+        #[arg(long, default_value = "65536")]
+        tokens: usize,
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// The FP8 release directory (full-precision experts; encode phase)
+        #[arg(long, default_value = "")]
+        hf: String,
+        /// A bf16 directory overriding the release's tensors (CMF_HY4_BF16)
+        #[arg(long)]
+        bf16: Option<String>,
+        /// The q2tp .cmf to rewrite in place (encode phase)
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Channel-scale exponent α (0 = no channel scale)
+        #[arg(long, default_value = "0.75")]
+        alpha: f64,
+        /// Code-refinement rounds (0 = off)
+        #[arg(long, default_value = "256")]
+        refine: usize,
+        #[arg(long, default_value = "0.3")]
+        ridge: f64,
+        /// Also refine the q4tp down projections
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        refine_q4tp: bool,
+        #[arg(long, default_value = "0.01")]
+        lambda: f64,
+        #[arg(long, default_value = "32")]
+        min_rows: usize,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        /// Layer range LO:HI (encode phase; default all)
+        #[arg(long)]
+        layers: Option<String>,
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
@@ -5281,6 +5335,37 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::Hy4Sfq { calib_model, capture, capture_only, calib, tokens, window, hf, bf16, target, alpha, refine, ridge, refine_q4tp, lambda, min_rows, threads, layers } => {
+            let layers = match layers.as_deref() {
+                None => None,
+                Some(s) => {
+                    let (a, b) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("--layers {s}: LO:HI"))?;
+                    Some((a.parse()?, b.parse()?))
+                }
+            };
+            hy4sfq::run(&hy4sfq::Hy4SfqOpts {
+                calib_model: &calib_model,
+                capture: &capture,
+                capture_only,
+                calib: &calib,
+                tokens,
+                window,
+                hf: &hf,
+                bf16: bf16.as_deref(),
+                target: &target,
+                alpha,
+                refine,
+                ridge,
+                refine_q4tp,
+                lambda,
+                min_rows,
+                threads,
+                layers,
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::Hy4Sfq { .. } => Err(anyhow::anyhow!("hy4-sfq needs a build with the gpu feature")),
         #[cfg(feature = "gpu")]
         Commands::MtpHeal { model, init, data, chain, refresh, stride, tokens, window, epochs, lr, topk, batch, eval_every, patience, hard, trunk_cache, codec, also_output, dump, taps, output } => {
             let also = also_output

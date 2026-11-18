@@ -29,6 +29,7 @@ pub mod g3n;
 pub mod g4e;
 pub mod gptq_capture;
 pub mod glm5_next;
+pub mod hy4;
 pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod gpu_metal;

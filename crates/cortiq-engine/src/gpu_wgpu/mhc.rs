@@ -265,7 +265,21 @@ fn mhc4_route(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wi
     let d = p.d;
     let rb = row * 4u * d;
     let cb = row * 20u;
-    if (t == 0u) {
+    if (t == 0u && (p.flags & 4u) != 0u) {
+        // Hy4-flash's identity form: post = mag sigmoid + eps, no mix (the
+        // closing fold reads the pre weights only)
+        let lb = row * 24u;
+        let mag = bitcast<f32>(p.p0);
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            pre_s[s] = sig(lg[lb + s] * p.s0 + base[s]) + p.eps;
+            if ((p.flags & 8u) == 0u) { coef[cb + s] = mag * sig(lg[lb + 4u + s] * p.s1 + base[4u + s]) + p.eps; }
+        }
+        if ((p.flags & 8u) == 0u) {
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) { coef[cb + 4u + i * 4u + j] = select(0.0, 1.0, i == j); }
+            }
+        }
+    } else if (t == 0u) {
         let lb = row * 24u;
         for (var s = 0u; s < 4u; s = s + 1u) {
             pre_s[s] = sig(lg[lb + s] * p.s0 + base[s]) + p.eps;
@@ -380,9 +394,16 @@ pub(crate) fn pipes4(c: &Ctx) -> Option<&'static Pipes4> {
 /// One four-stream sub-layer step's uniform: `ffn` picks the FFN's group
 /// scales, `leave` sets the merge's mean.
 pub(crate) fn params4(d: usize, rows: usize, leave: bool, iters: usize, scale: [f32; 3], eps: f32, rms_eps: f32) -> [u32; 12] {
+    params4x(d, rows, leave, iters, scale, eps, rms_eps, None, false)
+}
+
+/// `params4` with Hy4-flash's identity form (`ihc` = the post magnitude) and
+/// its closing fold (`fold`: the route writes the pre-weighted fold only).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn params4x(d: usize, rows: usize, leave: bool, iters: usize, scale: [f32; 3], eps: f32, rms_eps: f32, ihc: Option<f32>, fold: bool) -> [u32; 12] {
     [
         d as u32,
-        (leave as u32) << 1,
+        ((leave as u32) << 1) | ((ihc.is_some() as u32) << 2) | ((fold as u32) << 3),
         iters as u32,
         rows as u32,
         scale[0].to_bits(),
@@ -390,7 +411,7 @@ pub(crate) fn params4(d: usize, rows: usize, leave: bool, iters: usize, scale: [
         scale[2].to_bits(),
         eps.to_bits(),
         rms_eps.to_bits(),
-        0,
+        ihc.unwrap_or(0.0).to_bits(),
         0,
         0,
     ]
@@ -437,6 +458,25 @@ pub(crate) fn encode_route4(
     rows: usize,
     enter: bool,
 ) {
+    encode_route4n(c, enc, p, h, w, base, u, d, rows, enter, 24)
+}
+
+/// `encode_route4` over the first `logits` router rows (Hy4-flash's identity
+/// form has 8, its closing fold 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_route4n(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    p: &Pipes4,
+    h: &wgpu::Buffer,
+    w: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    u: &wgpu::Buffer,
+    d: usize,
+    rows: usize,
+    enter: bool,
+    logits: u32,
+) {
     let (r, k, l) = bufs4(c, d, rows);
     let rows = rows.max(1) as u32;
     let b_enter = bind_at(c, &p.enter, &[(0, h), (1, &r), (6, u)]);
@@ -451,7 +491,7 @@ pub(crate) fn encode_route4(
     }
     pass.set_pipeline(&p.logits);
     pass.set_bind_group(0, &b_logits, &[]);
-    pass.dispatch_workgroups(24, rows, 1);
+    pass.dispatch_workgroups(logits, rows, 1);
     pass.set_pipeline(&p.route);
     pass.set_bind_group(0, &b_route, &[]);
     pass.dispatch_workgroups(rows, 1, 1);

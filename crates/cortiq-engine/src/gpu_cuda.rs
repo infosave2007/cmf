@@ -951,6 +951,21 @@ pub(crate) mod qwen4;
 /// contracts; declared after `kargs!`, which it uses.
 mod hyb;
 
+/// Hy4-flash SFq calibration on the hybrid's small path: arm the capture of
+/// `layers` latent routed FFNs (`dim` wide latent, `ne` experts).
+pub fn hy4_capture_begin(layers: usize, dim: usize, ne: usize) -> bool {
+    match ctx() {
+        Some(c) => c.current().is_ok() && hyb::hy4_cap_begin(layers, dim, ne).is_ok(),
+        None => false,
+    }
+}
+
+/// The captured rows, one (latent `[rows·dim]`, logits `[rows·ne]`) pair a
+/// routed FFN in stack order, and the capture disarmed.
+pub fn hy4_capture_take() -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+    hyb::hy4_cap_take()
+}
+
 /// The resident Embryo graph (GDN mixers, bounded anchors, the resonance
 /// router, the hierarchical head); declared after `kargs!`, which it uses.
 mod embryo;
@@ -963,6 +978,11 @@ pub use embryo::{
 /// GEMMs on the card; declared after `kargs!`, which it uses.
 mod bake;
 pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_attn_bwd, bake_phase_a, bake_attn_fwd, bake_ffn_bwd, bake_ffn_fwd, bake_gdn_bwd, bake_gdn_fwd, bake_gdn_layer_fwd, bake_gdn_ok, bake_gemm_dx, bake_gemm_nt, bake_lm_loss, bake_planes_clear};
+
+/// quantize-moe's GPTQ host parts on the card (the row-square GEMM, SFq's
+/// code refinement); declared after `kargs!`, which it uses.
+mod gptq;
+pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
 
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.

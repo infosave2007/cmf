@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Tencent Hy4-flash (`hy_v4_flash`, 220B parameters, 12B active): the converter reads the FP8 release (e4m3
+  with 128×128 block scales, decoded exactly) with optional bf16 shards on top (`CMF_HY4_BF16`), and writes
+  `q4tp` (everything 4-bit, the Engram tables as the release ships them) or `q2tp` (the routed experts' gate/up
+  2-bit, the rest 4-bit). The engine runs the whole stack: four hyper-connection streams (iHC), gated MLA with
+  learned sinks and a sandwich norm, 30 sliding-window and 12 sparse layers (dense to 2048 positions, then the
+  compressed indexer: groups of four, 511 groups and the own), the latent MoE (top 16 of 512 experts on a
+  1536-wide latent, a shared expert on the stream) and Engram (bigram and trigram hash tables on four layers).
+  The CUDA hybrid runs decode and prompts on the card, the indexer included, with the experts streamed from a
+  RAM tier. `q4tp` on an A40: WikiText-2, the first 4096 tokens, perplexity 29.99 against Transformers' 29.75
+  (bf16) and 30.23 (float32).
+- `cortiq hy4-sfq`: SFq (docs/Q2TP_SCALE_REFINE.md) for Hy4-flash's routed experts. `--capture-only` runs the
+  calibration text through the card's prompt graph and keeps every routed FFN's latent rows and router picks;
+  the encode puts a channel scale on the latent (gate/up columns divided, `latent_down` rows multiplied), runs
+  quantize-moe's GPTQ per expert with the code refinement and rewrites the experts and `latent_down` in place.
+- Perplexity of a Hy4-flash file on the card's prompt graph (`hy4::nll`: the rows in long calls, the final norm
+  and the head on the host; `CMF_HY4_NLL_BATCH=0` keeps the token path).
+
+### Changed
+- CUDA hybrid, streamed experts: `MADV_WILLNEED` over the file pages of an expert is no longer asked when the RAM
+  tier holds it (its pages are never read). On a pod whose page cache cannot hold the file the advice started
+  the reads in the call: Hy4-flash's routed FFN on a 16-row prompt chunk spent 23 of its 26 ms there; now 4 ms.
+- CUDA hybrid: a long prompt over streamed latent-expert layers goes a layer at a time (`CMF_HY4_LAYER_MAJOR=0`:
+  the whole stack a chunk at a time); the rows and the iHC streams wait on the card between layers, so a layer's
+  experts cross the bus once a call.
+- CUDA hybrid, latent experts on the small path: each slot takes only the rows routed to it (`hy_moe_compact`,
+  `CMF_HY4_MOE_COMPACT=0` off) instead of all 16 rows of the call; the same arithmetic and sum order, the same
+  numbers. Gate/up and down of a 16-row chunk: 1.6 ms a layer.
+- quantize-moe: the SFq code refinement as an option of the expert encode, and two of its host parts on the
+  card when CUDA is up: the row-square GEMM (debias products, the refinement's seed) on cuBLAS in plain f32 and
+  the greedy moves a block a row (`gpu_cuda::gptq_refine_rows`, the host's codes bit for bit;
+  `CMF_GPTQ_CUDA=0` keeps the host).
+
 ## [0.9.5] — 2026-11-18
 
 ### Added
