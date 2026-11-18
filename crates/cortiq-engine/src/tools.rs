@@ -567,7 +567,7 @@ fn value_text(v: &Value) -> String {
 fn passes(t: &Table, row: &[String], test: &Value) -> Result<bool, String> {
     let c = t.col(test.get("column").ok_or("where needs a column")?)?;
     let op = test.get("op").and_then(Value::as_str).unwrap_or("=");
-    let want = value_text(test.get("value").ok_or("where needs a value")?);
+    let want = value_text(test.get("value").ok_or("where needs a value")?).trim().to_string();
     let cell = Table::cell(row, c).unwrap_or("");
     let nums = (cell_number(cell), cell_number(&want));
     Ok(match op {
@@ -605,7 +605,7 @@ pub fn table(args: &Value, input: &str) -> Result<String, String> {
         Some(Value::Array(names)) if !names.is_empty() => {
             let mut out = Vec::new();
             for n in names {
-                let n = value_text(n);
+                let n = value_text(n).trim().to_string();
                 let r = t
                     .rows
                     .iter()
@@ -616,7 +616,8 @@ pub fn table(args: &Value, input: &str) -> Result<String, String> {
             out
         }
         Some(Value::String(n)) => {
-            vec![t.rows.iter().find(|r| Table::name(r) == n.as_str()).ok_or_else(|| format!("no row named {n}"))?]
+            let n = n.trim();
+            vec![t.rows.iter().find(|r| Table::name(r) == n).ok_or_else(|| format!("no row named {n}"))?]
         }
         _ => return Err("rows: a list of row names".into()),
     };
@@ -837,6 +838,9 @@ postgres   5471 nginx\nwww-data   6020 node\n\nQuestion: How many of these proce
         assert_eq!(t(json!({"op": "sum", "column": "Free", "rows": ["/"]}), DF).starts_with("ERR no column named Free"), true);
         assert_eq!(t(json!({"op": "get", "column": 1}), PS), "ERR 9 rows pass; get reads one");
         assert_eq!(t(json!({"op": "sum", "column": 1}), PS), "ERR root (row nginx) is not a number");
+        // a stray space in what the model writes does not change the answer
+        assert_eq!(t(json!({"op": "count", "where": {"column": "USER", "op": "=", "value": " anna"}}), PS), "1");
+        assert_eq!(t(json!({"op": "get", "column": "Avail", "rows": [" /data "]}), DF), "168");
     }
 
     #[test]
