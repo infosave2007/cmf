@@ -30837,6 +30837,8 @@ pub fn forward_token_graph(
         && steps == 1;
     let ts_fine = !device_span_probe && std::env::var("CMF_GPU_TS").as_deref() == Ok("2");
     let ts_full = !device_span_probe && std::env::var("CMF_GRAPH_TS_ALL").as_deref() == Ok("1");
+    // `CMF_MHC_TS=1` (with CMF_GPU_TS=1): stamps around the mHC merge, route and norm before an FFN.
+    let mhc_ts = std::env::var("CMF_MHC_TS").as_deref() == Ok("1");
     let ts_cap = if device_span_probe { 2 } else if ts_full { 4096 } else { 255 };
     macro_rules! ts_point {
         ($enc:expr, $stage:expr) => {
@@ -31962,12 +31964,15 @@ pub fn forward_token_graph(
                     graph_decline("mHC kernels unavailable");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
+                // Token-invariant: the params by content, the bind groups in the
+                // graph's cache (sites 140-146). Built fresh, they took ~290
+                // groups and ~150 uniforms a token on SenseNova-Loop-9B.
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let u = unif(&mhc::params(hidden, m.enter, false, m.iters, m.pre_scale));
+                let u = mhc::uniform8(c, mhc::params(hidden, m.enter, false, m.iters, m.pre_scale));
                 let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
-                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &u]), 1);
+                go(&mut enc, &mp.route, &bgc(140, li, &mp.route_layout, &[&h_buf, &mr, &w, &b, &mk, &u]), 1);
                 let inw = stor(bytemuck::cast_slice(l.input_norm));
-                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
+                go(&mut enc, &c.rmsnorm, &bgc(141, li, &c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
             }
             // ── token mixing (attention or GDN) → ob ──
             let hp_mix = kimi::hostprof_on().then(std::time::Instant::now);
@@ -33703,12 +33708,23 @@ pub fn forward_token_graph(
                 // FFN's branch, norm it.
                 let mp = mhc::pipes(c).expect("checked at the layer start");
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let um = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
-                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, mix_out, &mk, &um]), (hidden as u32).div_ceil(256));
-                let uf = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                let um = mhc::uniform8(c, mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                if mhc_ts {
+                    ts!(enc, 46, 9);
+                }
+                go(&mut enc, &mp.merge, &bgc(142, li, &mp.merge_layout, &[&h_buf, &mr, mix_out, &mk, &um]), (hidden as u32).div_ceil(256));
+                if mhc_ts {
+                    ts!(enc, 47, 9);
+                }
                 let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
-                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &uf]), 1);
-                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+                go(&mut enc, &mp.route, &bgc(143, li, &mp.route_layout, &[&h_buf, &mr, &w, &b, &mk, &um]), 1);
+                if mhc_ts {
+                    ts!(enc, 48, 9);
+                }
+                go(&mut enc, &c.rmsnorm, &bgc(144, li, &c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+                if mhc_ts {
+                    ts!(enc, 49, 9);
+                }
             } else if !skip_norm && !sw_mix_done {
                 let nbg = bgc(
                     23,
@@ -35306,11 +35322,14 @@ pub fn forward_token_graph(
                 // the streams' mean on), then the next layer's input norm.
                 let mp = mhc::pipes(c).expect("checked at the layer start");
                 let (mr, mk) = mhc::bufs(c, hidden);
-                let um = unif(&mhc::params(hidden, false, m.leave, m.iters, m.pre_scale));
-                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, &ob, &mk, &um]), (hidden as u32).div_ceil(256));
-                if li + 1 < layers.len() {
+                let um = mhc::uniform8(c, mhc::params(hidden, false, m.leave, m.iters, m.pre_scale));
+                go(&mut enc, &mp.merge, &bgc(145, li, &mp.merge_layout, &[&h_buf, &mr, &ob, &mk, &um]), (hidden as u32).div_ceil(256));
+                // A two-stream mHC layer next routes its branch and norms that itself:
+                // this norm would be overwritten unread (46 a token on SenseNova-Loop-9B).
+                let next_routes = layers.get(li + 1).is_some_and(|n| n.mhc.is_some_and(|m| m.dsv4.is_none()));
+                if li + 1 < layers.len() && !next_routes {
                     let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
-                    go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
+                    go(&mut enc, &c.rmsnorm, &bgc(146, li, &c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
                 }
             } else if sandwich_tail {
                 // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
@@ -35848,6 +35867,10 @@ pub fn forward_token_graph(
                     (53, _) => "|gdn:proj",
                     (54, _) => "|gdn:rec",
                     (56, _) => "|ffn:gu",
+                    (46, _) => "|mhc:before",
+                    (47, _) => "|mhc:merge",
+                    (48, _) => "|mhc:route",
+                    (49, _) => "|mhc:norm",
                     _ => "start",
                 };
                     let mut line = String::from("gpu-ts: timeline spans (later-stamp attribution):");
@@ -39080,7 +39103,7 @@ pub fn forward_batch_graph_at(
                                 enc.copy_buffer_to_buffer(&vb_b, 0, &t.spec_v, 0, n);
                             }
                         }
-                        o1_acap_copy(c, &mut enc, layer_base + li, &qall, &kb_b, &vb_b, k * nh * hd, k * nkv * hd);
+                        o1_acap_copy(c, &mut enc, layer_base + li, &qall, &kb_b, &vb_b, &positions[..k], nh * hd, k * nkv * hd);
                         if *output_gate {
                             let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
                             let mut pass = begin_pass(&mut enc);
@@ -39229,9 +39252,9 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
                     }
                     // The O(1) seal's query trace: this layer's rotated rows.
-                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, k * nh * hd) {
+                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, &positions[..k], nh * hd) {
                         flush_pass(&enc);
-                        enc.copy_buffer_to_buffer(&qall, 0, &cb, 0, (k * nh * hd * 4) as u64);
+                        cb.copy(&mut enc, &qall, 0, k);
                     }
                     state_started = true;
                     gemma_batch::encode_kv_attend(
@@ -39433,8 +39456,8 @@ pub fn forward_batch_graph_at(
                     pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
                     state_started = true;
                     // The O(1) seal's query trace: every row's rotated query at once.
-                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, k * nh * hd) {
-                        encode_blit_p(&mut pass, c, &qall, &cb, k * nh * hd, 0, 0, None);
+                    if let Some(cb) = o1_qcap_buffer(c, layer_base + li, &positions[..k], nh * hd) {
+                        cb.blit(&mut pass, c, &qall, 0, k);
                     }
                     pass.set_pipeline(&xb.kv);
                     pass.set_bind_group(0, &bg_kv, &[]);
@@ -39566,7 +39589,7 @@ pub fn forward_batch_graph_at(
                     let split_any = g.window.is_none() && pos_end > ATTEND_SPLIT_MIN;
                     // The O(1) seal's query trace (Spark-X2.6's 256-wide heads take
                     // this arm): each token's rotated query as it is made.
-                    let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
+                    let qcap = o1_qcap_buffer(c, layer_base + li, &positions[..k], nh * hd);
                     let (xacc, xml) = if split_any {
                         (rwc(nh * nc * g.dv), rwc(nh * nc * 2))
                     } else {
@@ -39630,7 +39653,7 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
                         state_started = true;
                         if let Some(cb) = &qcap {
-                            encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
+                            cb.blit_row(&mut pass, c, &qout_s, i);
                         }
                         pass.set_pipeline(&gx.kv_append);
                         pass.set_bind_group(
@@ -39726,7 +39749,7 @@ pub fn forward_batch_graph_at(
                     // positions through the loop.
                     // The O(1) seal's query trace (`o1_qcap_begin`): this
                     // layer's rotated rows, copied out as attention reads them.
-                    let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
+                    let qcap = o1_qcap_buffer(c, layer_base + li, &positions[..k], nh * hd);
                     let half = kvhalf[li];
                     let bt = dense_batch::attn_for(c, half).filter(|_| {
                         c.attend_gpart.is_some()
@@ -39829,7 +39852,7 @@ pub fn forward_batch_graph_at(
                         pass.set_bind_group(0, &bg_r, &[]);
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                         if let Some(cb) = &qcap {
-                            encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
+                            cb.blit_row(&mut pass, c, &qout_s, i);
                         }
                         pass.set_pipeline(&c.kv_append);
                         // The first Full-attention K/V append is the
@@ -40172,15 +40195,8 @@ pub fn forward_batch_graph_at(
                             }
                         }
                         if let Some(cb) = &qcap {
-                            let off = (t_from * nh * hd * 4) as u64;
                             flush_pass(&enc);
-                            enc.copy_buffer_to_buffer(
-                                qall,
-                                off,
-                                cb,
-                                off,
-                                ((k - t_from) * nh * hd * 4) as u64,
-                            );
+                            cb.copy(&mut enc, qall, t_from, k);
                         }
                         if *output_gate {
                             // The loop's gate_mul, over rows t_from..k at once
@@ -55108,6 +55124,54 @@ struct O1QCap {
     layers: Vec<usize>,
     /// (layer, floats, buffer `[rows][nh][hd]`), in batch-call order.
     bufs: Vec<(usize, usize, wgpu::Buffer)>,
+    /// Keep the rows whose position is a multiple of this alone (`o1_qcap_stride`; 1 = all).
+    stride: usize,
+}
+
+/// One batch call's capture for one layer: the buffer and, per row of the call,
+/// the row it lands on there (None: a row the stride skips).
+struct QCapSlot {
+    buf: wgpu::Buffer,
+    dst: Vec<Option<usize>>,
+    row: usize,
+}
+
+impl QCapSlot {
+    /// (row in the call, row in the capture, rows) for the kept rows of `from..to`,
+    /// contiguous on both sides.
+    fn runs(&self, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
+        let mut out: Vec<(usize, usize, usize)> = Vec::new();
+        for i in from..to {
+            let Some(d) = self.dst[i] else { continue };
+            match out.last_mut() {
+                Some((s, dd, n)) if *s + *n == i && *dd + *n == d => *n += 1,
+                _ => out.push((i, d, 1)),
+            }
+        }
+        out
+    }
+
+    /// Copy the kept rows of `from..to` out of `src` (`[rows][nh][hd]`, the call's rows).
+    fn copy(&self, enc: &mut wgpu::CommandEncoder, src: &wgpu::Buffer, from: usize, to: usize) {
+        let b = (self.row * 4) as u64;
+        for (s, d, n) in self.runs(from, to) {
+            enc.copy_buffer_to_buffer(src, s as u64 * b, &self.buf, d as u64 * b, n as u64 * b);
+        }
+    }
+
+    /// The same inside a compute pass.
+    fn blit(&self, pass: &mut wgpu::ComputePass<'_>, c: &Ctx, src: &wgpu::Buffer, from: usize, to: usize) {
+        for (s, d, n) in self.runs(from, to) {
+            encode_blit_p(pass, c, src, &self.buf, n * self.row, s * self.row, d * self.row, None);
+        }
+    }
+
+    /// Row `i`'s query as it is made, alone at the start of `src`.
+    fn blit_row(&self, pass: &mut wgpu::ComputePass<'_>, c: &Ctx, src: &wgpu::Buffer, i: usize) {
+        if let Some(d) = self.dst[i] {
+            encode_blit_p(pass, c, src, &self.buf, self.row, 0, d * self.row, None);
+        }
+    }
 }
 
 thread_local! {
@@ -55121,19 +55185,44 @@ pub fn o1_qcap_begin(layers: &[usize]) {
         *q.borrow_mut() = Some(O1QCap {
             layers: layers.to_vec(),
             bufs: Vec::new(),
+            stride: 1,
         })
     });
+}
+
+/// Keep one row in `stride` by position from here on, the rows a seal's trace keeps:
+/// the drains hand back those rows alone. False when no capture is armed.
+pub fn o1_qcap_stride(stride: usize) -> bool {
+    O1_QCAP.with(|q| match q.borrow_mut().as_mut() {
+        Some(q) => {
+            q.stride = stride.max(1);
+            true
+        }
+        None => false,
+    })
 }
 
 fn o1_qcap_layers() -> Option<Vec<usize>> {
     O1_QCAP.with(|q| q.borrow().as_ref().map(|q| q.layers.clone()))
 }
 
-/// A fresh capture buffer for `layer` when it is being captured.
-fn o1_qcap_buffer(c: &Ctx, layer: usize, floats: usize) -> Option<wgpu::Buffer> {
+/// A fresh capture slot for `layer` when it is being captured: room for the kept
+/// rows of `positions`, `row` floats each.
+fn o1_qcap_buffer(c: &Ctx, layer: usize, positions: &[usize], row: usize) -> Option<QCapSlot> {
     O1_QCAP.with(|q| {
         let mut q = q.borrow_mut();
         let q = q.as_mut().filter(|q| q.layers.contains(&layer))?;
+        let mut kept = 0;
+        let dst: Vec<Option<usize>> = positions
+            .iter()
+            .map(|&p| {
+                (p % q.stride == 0).then(|| {
+                    kept += 1;
+                    kept - 1
+                })
+            })
+            .collect();
+        let floats = kept * row;
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("o1-qcap"),
             size: (floats.max(1) * 4) as u64,
@@ -55143,7 +55232,7 @@ fn o1_qcap_buffer(c: &Ctx, layer: usize, floats: usize) -> Option<wgpu::Buffer> 
             mapped_at_creation: false,
         });
         q.bufs.push((layer, floats, b.clone()));
-        Some(b)
+        Some(QCapSlot { buf: b, dst, row })
     })
 }
 
@@ -55186,25 +55275,42 @@ pub fn o1_spec_commit(kv_id: u64, pos0: usize, rows: usize) -> bool {
 struct O1Acap {
     /// (layer, q, k, v, q floats, k or v floats)
     rows: Vec<(usize, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, usize, usize)>,
+    /// Query rows kept: those whose position is a multiple of this (the archive's trace).
+    stride: usize,
 }
 
 thread_local! {
     static O1_ACAP: std::cell::RefCell<Option<O1Acap>> = const { std::cell::RefCell::new(None) };
 }
 
-pub fn o1_acap_begin() {
-    O1_ACAP.with(|a| *a.borrow_mut() = Some(O1Acap { rows: Vec::new() }));
+pub fn o1_acap_begin(stride: usize) {
+    O1_ACAP.with(|a| *a.borrow_mut() = Some(O1Acap { rows: Vec::new(), stride: stride.max(1) }));
 }
 
 pub fn o1_acap_end() {
     O1_ACAP.with(|a| *a.borrow_mut() = None);
 }
 
-fn o1_acap_copy(c: &Ctx, enc: &mut wgpu::CommandEncoder, layer: usize, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, qf: usize, kf: usize) {
+/// Copy a sealed chunk's rows off the card: every key and value row, the query rows
+/// of `positions` the archive keeps (`qrow` floats each).
+#[allow(clippy::too_many_arguments)]
+fn o1_acap_copy(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    layer: usize,
+    q: &wgpu::Buffer,
+    k: &wgpu::Buffer,
+    v: &wgpu::Buffer,
+    positions: &[usize],
+    qrow: usize,
+    kf: usize,
+) {
     O1_ACAP.with(|a| {
         let mut a = a.borrow_mut();
         let Some(a) = a.as_mut() else { return };
         flush_pass(&*enc);
+        let kept: Vec<usize> = (0..positions.len()).filter(|&i| positions[i] % a.stride == 0).collect();
+        let qf = kept.len() * qrow;
         let stage = |n: usize| {
             c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("o1-acap"),
@@ -55213,8 +55319,18 @@ fn o1_acap_copy(c: &Ctx, enc: &mut wgpu::CommandEncoder, layer: usize, q: &wgpu:
                 mapped_at_creation: false,
             })
         };
-        let (sq, sk, sv) = (stage(qf), stage(kf), stage(kf));
-        enc.copy_buffer_to_buffer(q, 0, &sq, 0, (qf * 4) as u64);
+        let (sq, sk, sv) = (stage(qf.max(1)), stage(kf), stage(kf));
+        // the kept query rows, runs of consecutive rows in one copy
+        let rb = (qrow * 4) as u64;
+        let mut j = 0;
+        while j < kept.len() {
+            let mut n = 1;
+            while j + n < kept.len() && kept[j + n] == kept[j] + n {
+                n += 1;
+            }
+            enc.copy_buffer_to_buffer(q, kept[j] as u64 * rb, &sq, j as u64 * rb, n as u64 * rb);
+            j += n;
+        }
         enc.copy_buffer_to_buffer(k, 0, &sk, 0, (kf * 4) as u64);
         enc.copy_buffer_to_buffer(v, 0, &sv, 0, (kf * 4) as u64);
         a.rows.push((layer, sq, sk, sv, qf, kf));
@@ -55223,18 +55339,56 @@ fn o1_acap_copy(c: &Ctx, enc: &mut wgpu::CommandEncoder, layer: usize, q: &wgpu:
 
 /// The rows captured since the last call: (layer, queries, keys, values).
 pub fn o1_acap_take() -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
-    let rows = O1_ACAP.with(|a| a.borrow_mut().as_mut().map(|a| std::mem::take(&mut a.rows)))?;
+    o1_acap_take_first(usize::MAX)
+}
+
+/// Entries captured and not yet taken (one per sealed layer of each batch call).
+pub fn o1_acap_pending() -> usize {
+    O1_ACAP.with(|a| a.borrow().as_ref().map_or(0, |a| a.rows.len()))
+}
+
+/// The first `n` entries captured, the oldest: a chunk's rows while the chunk after it is
+/// still on the card. Its command must have completed (the next deferred call waited for it).
+pub fn o1_acap_take_first(n: usize) -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    let rows = O1_ACAP.with(|a| {
+        a.borrow_mut().as_mut().map(|a| {
+            let n = n.min(a.rows.len());
+            a.rows.drain(..n).collect::<Vec<_>>()
+        })
+    })?;
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let read = |b: &wgpu::Buffer, n: usize| -> Option<Vec<f32>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        b.map_async(wgpu::MapMode::Read, .., move |r| {
-            let _ = tx.send(r);
-        });
+    // every staging buffer mapped at once, one wait for them all
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut maps = 0;
+    for (_, q, k, v, _, _) in &rows {
+        for b in [q, k, v] {
+            let tx = tx.clone();
+            b.map_async(wgpu::MapMode::Read, .., move |r| {
+                let _ = tx.send(r);
+            });
+            maps += 1;
+        }
+    }
+    // The rows' command is done when a later chunk is still in flight: a poll that does not
+    // wait maps them, and only what it left waits for the card.
+    let _ = c.device.poll(wgpu::PollType::Poll);
+    let mut got = 0;
+    while let Ok(r) = rx.try_recv() {
+        r.ok()?;
+        got += 1;
+    }
+    if got < maps {
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().ok()?.ok()?;
+        for _ in got..maps {
+            rx.recv().ok()?.ok()?;
+        }
+    }
+    let read = |b: &wgpu::Buffer, n: usize| -> Option<Vec<f32>> {
         let mut out = vec![0f32; n];
-        out.copy_from_slice(bytemuck::cast_slice(&b.get_mapped_range(..).ok()?));
+        if n > 0 {
+            out.copy_from_slice(&bytemuck::cast_slice(&b.get_mapped_range(..).ok()?)[..n]);
+        }
         b.unmap();
         Some(out)
     };
@@ -55259,7 +55413,7 @@ pub fn o1_qcap_drain() -> Option<Vec<(usize, Vec<f32>)>> {
     let cap = O1_QCAP.with(|q| {
         let mut q = q.borrow_mut();
         let q = q.as_mut()?;
-        Some(O1QCap { layers: q.layers.clone(), bufs: std::mem::take(&mut q.bufs) })
+        Some(O1QCap { layers: q.layers.clone(), bufs: std::mem::take(&mut q.bufs), stride: q.stride })
     })?;
     o1_qcap_read(cap)
 }
@@ -55281,7 +55435,9 @@ fn o1_qcap_read(cap: O1QCap) -> Option<Vec<(usize, Vec<f32>)>> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("o1-qcap") });
         let mut off = 0u64;
         for (_, n, b) in &cap.bufs {
-            enc.copy_buffer_to_buffer(b, 0, &staging, off, (*n * 4) as u64);
+            if *n > 0 {
+                enc.copy_buffer_to_buffer(b, 0, &staging, off, (*n * 4) as u64);
+            }
             off += (*n * 4) as u64;
         }
         submit(c, finish_enc(enc));

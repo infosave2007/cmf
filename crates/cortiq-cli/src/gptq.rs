@@ -1219,6 +1219,7 @@ impl CalibRun {
             self.pipe = Some(Self::runtime(&self.cal_path)?);
         }
         let pipe = self.pipe.as_mut().unwrap();
+        let upto = calib_upto_visit(pipe, upto);
         cortiq_engine::gptq_capture::begin_filtered(true, move |n| names.contains(n));
         // Positions per batched prefill step: the per-op device GEMMs of a
         // GPU calibration pay one round trip per projection per step.
@@ -1249,6 +1250,23 @@ impl CalibRun {
             cortiq_engine::gptq_capture::end_shared()
         })
     }
+}
+
+/// The executed layers a calibration forward runs for physical layers `0..upto`.
+/// A looped stack (SenseNova-Loop: layers 4–27 twice, 56 visits of 32 layers)
+/// runs a physical layer more than once; the forward goes on to the last visit
+/// of a layer below `upto`, so every visit's inputs reach the Hessians. Stopping
+/// at virtual index `upto` left the second visits out and the layers past the
+/// loop (28–31) with no Hessian at all.
+fn calib_upto_visit(pipe: &cortiq_engine::Pipeline, upto: usize) -> usize {
+    calib_upto_of(pipe.num_layers, upto, |v| pipe.phys_layer(v))
+}
+
+fn calib_upto_of(visits: usize, upto: usize, phys: impl Fn(usize) -> usize) -> usize {
+    if upto >= visits {
+        return upto;
+    }
+    (0..visits).rev().find(|&v| phys(v) < upto).map_or(upto, |v| v + 1)
 }
 
 /// Where one distinct Hessian lives until a worker needs it.
@@ -4119,6 +4137,23 @@ pub fn gptq_quantize_q4tp_act_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The calibration forward for a chunk of physical layers runs to the last
+    /// visit of its top layer: SenseNova-Loop's plan is 0..4, 4..28 twice, 28..32.
+    #[test]
+    fn calibration_forward_reaches_every_visit_of_a_chunk() {
+        let plan: Vec<usize> = (0..4).chain(4..28).chain(4..28).chain(28..32).collect();
+        let phys = |v: usize| plan[v];
+        assert_eq!(calib_upto_of(56, 8, phys), 32); // layers 4..8 again at visits 28..32
+        assert_eq!(calib_upto_of(56, 16, phys), 40);
+        assert_eq!(calib_upto_of(56, 24, phys), 48);
+        assert_eq!(calib_upto_of(56, 32, phys), 56); // 28..32 live past the loop
+        assert_eq!(calib_upto_of(56, 4, phys), 4); // before the loop: as before
+        assert_eq!(calib_upto_of(56, usize::MAX, phys), usize::MAX);
+        // A plain stack is unchanged.
+        assert_eq!(calib_upto_of(32, 8, |v| v), 8);
+        assert_eq!(calib_upto_of(32, 32, |v| v), 32);
+    }
 
     /// The device fold + q4tp sweep against the host's f64 operator and
     /// sweep on the same calibration data: U agrees to f32 rounding, and the

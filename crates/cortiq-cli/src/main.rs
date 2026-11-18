@@ -13724,11 +13724,14 @@ async fn cmd_bench(
     // a bounded-native file, whose sequence the resident graph may own:
     // the CPU pair walk would reset the device sequence and measure a
     // path the file never decodes on.
-    let (singles_ms, pair_ms) = if pipeline.o1_active() || pipeline.bounded_native() {
-        (0.0, 0.0)
-    } else {
-        pipeline.measure_pair_fusion(8)
-    };
+    // `CMF_BENCH_PAIR=0` skips it: it runs on the host, which at a long context
+    // (16 000 tokens on an M4) takes longer than the whole Metal measurement.
+    let (singles_ms, pair_ms) =
+        if pipeline.o1_active() || pipeline.bounded_native() || std::env::var("CMF_BENCH_PAIR").as_deref() == Ok("0") {
+            (0.0, 0.0)
+        } else {
+            pipeline.measure_pair_fusion(8)
+        };
 
     // A prompt the batched graph reads in chunks warms its own kernels too
     // (the matrix-unit GEMMs, the flash attend, the GDN scan): their first

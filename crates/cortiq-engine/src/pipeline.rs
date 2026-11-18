@@ -5738,8 +5738,12 @@ impl Pipeline {
     }
 
     /// A sealed chunk's rows join the archive.
-    fn o1_archive_chunk(&self, a: &mut O1Archive, pos: usize, bk: usize) -> Result<(), String> {
-        let got = crate::gpu::o1_acap_take().ok_or("O(1) archive: readback failed")?;
+    fn o1_archive_chunk(&self, a: &mut O1Archive, pos: usize, bk: usize, entries: Option<usize>) -> Result<(), String> {
+        let got = match entries {
+            Some(n) => crate::gpu::o1_acap_take_first(n),
+            None => crate::gpu::o1_acap_take(),
+        }
+        .ok_or("O(1) archive: readback failed")?;
         let qrow = a.nh * a.hd;
         let stride = a.stride;
         // a backend may hand back the kept query rows alone (CUDA)
@@ -6209,6 +6213,15 @@ impl Pipeline {
         // A backend may hand back the kept rows alone (CUDA gathers them on the card).
         let strided = crate::gpu::o1_qcap_stride(QT_STRIDE);
         let mut qs: Vec<Vec<f32>> = vec![Vec::new(); o1_layers.len()];
+        // the prompt's tail for the draft head over the far field
+        let tail_from = n.saturating_sub(crate::dory::EXACT_TAIL);
+        // A chunk whose rows nobody reads (before the last and the tail) is submitted
+        // while the next one is encoded, and the queries leave the card every
+        // `CMF_O1_QCAP_DRAIN` chunks (8; 1 = every chunk, waiting for each): a drain
+        // waits for the card. SenseNova-Loop-9B over Vulkan, 8192 rows in 128-row
+        // chunks: one wait a chunk spent half the prefix with the card idle.
+        let drain_every = std::env::var("CMF_O1_QCAP_DRAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1);
+        let (mut drain_from, mut undrained) = (0usize, 0usize);
         while pos < n {
             let end = (pos + chunk).min(n);
             let bk = end - pos;
@@ -6218,14 +6231,19 @@ impl Pipeline {
             }
             let positions: Vec<usize> = (pos..end).collect();
             let t_c = std::time::Instant::now();
+            let defer = drain_every > 1 && end < n && end <= tail_from;
+            #[cfg(not(target_os = "macos"))]
+            crate::gpu::set_batch_defer(defer);
             let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+            #[cfg(not(target_os = "macos"))]
+            crate::gpu::set_batch_defer(false);
             t_chunks += t_c.elapsed().as_secs_f64();
             let t_d = std::time::Instant::now();
             match outcome {
                 crate::gpu::BatchGraphOutcome::Completed => {
-                    last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
-                    // the prompt's tail for the draft head over the far field
-                    let tail_from = n.saturating_sub(crate::dory::EXACT_TAIL);
+                    if !defer {
+                        last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
+                    }
                     if end > tail_from {
                         let from = pos.max(tail_from);
                         self.o1_prefix_tail.extend_from_slice(&hiddens[(from - pos) * hs..]);
@@ -6240,13 +6258,20 @@ impl Pipeline {
                     return Err("O(1) prefix batch graph stopped after admission".into());
                 }
             }
+            undrained += 1;
+            pos = end;
+            if defer && undrained < drain_every {
+                continue;
+            }
             let Some(drained) = crate::gpu::o1_qcap_drain() else {
                 let _ = crate::gpu::o1_qcap_take();
                 return Err("O(1) prefix: query readback failed".into());
             };
+            // the rows since the last drain
+            let rows_n = end - drain_from;
             for (i, (_, rows)) in drained.iter().enumerate() {
                 if strided {
-                    let kept = (pos..end).filter(|p| p % QT_STRIDE == 0).count();
+                    let kept = (drain_from..end).filter(|p| p % QT_STRIDE == 0).count();
                     if rows.len() != kept * qrow {
                         let _ = crate::gpu::o1_qcap_take();
                         return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), kept * qrow));
@@ -6254,18 +6279,19 @@ impl Pipeline {
                     qs[i].extend_from_slice(rows);
                     continue;
                 }
-                if rows.len() != bk * qrow {
+                if rows.len() != rows_n * qrow {
                     let _ = crate::gpu::o1_qcap_take();
-                    return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), bk * qrow));
+                    return Err(format!("O(1) prefix: {} query values, expected {}", rows.len(), rows_n * qrow));
                 }
-                for p in pos..end {
+                for p in drain_from..end {
                     if p % QT_STRIDE == 0 {
-                        qs[i].extend_from_slice(&rows[(p - pos) * qrow..(p - pos + 1) * qrow]);
+                        qs[i].extend_from_slice(&rows[(p - drain_from) * qrow..(p - drain_from + 1) * qrow]);
                     }
                 }
             }
+            drain_from = end;
+            undrained = 0;
             t_q += t_d.elapsed().as_secs_f64();
-            pos = end;
         }
         let _ = crate::gpu::o1_qcap_take();
         let t_kv = std::time::Instant::now();
@@ -6579,21 +6605,31 @@ impl Pipeline {
         if prompt_rows.iter().any(|x| !x.is_finite()) {
             return Err("embedded prompt contains non-finite values".into());
         }
+        // A turbo file picks its far field by the prompt's length: an image prompt
+        // under the seal reads exact, whatever the previous request held.
+        self.o1_turbo_gate(input_ids.len());
         if !self.can_prefill_batched()
             || self.dyn_router.is_some()
             || self.o1_active()
-            || self.mtp.is_some()
             || self.gpu_plan.is_some()
         {
-            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing, GPU splitting or a generic MTP head".into());
+            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing or GPU splitting".into());
         }
-        self.generate_with_prompt_rows(
+        // The MTP head drafts over token rows: an embedded prompt decodes
+        // without it (the greedy text is the same; MTP state is rebuilt from
+        // the next prompt, and token reuse out of this request is off).
+        // SenseNova-Loop-9B's release ships the head, and its image prompts
+        // were refused before.
+        let mtp = self.mtp.take();
+        let out = self.generate_with_prompt_rows(
             input_ids,
             Some(prompt_rows),
             max_tokens,
             task_mask,
             on_token,
-        )
+        );
+        self.mtp = mtp;
+        out
     }
 
     fn generate_with_prompt_rows(
@@ -7428,7 +7464,10 @@ impl Pipeline {
                 && !dyn_prefill
                 && self.o1_on_graph()
                 && std::env::var("CMF_O1_PREFIX_GPU").as_deref() != Ok("0")
-                && (0..self.num_layers).all(|li| self.phys_layer(li) == li)
+                // One cache per executed layer: a looped stack whose visits keep
+                // their own rows (SenseNova-Loop) indexes caches, mirrors and the
+                // query capture by the visit, as a plain stack does by the layer.
+                && self.kv_cache.layers.len() == self.num_layers
             {
                 let t_px = std::time::Instant::now();
                 // More of the prompt than the first seal covers: its rows stay in host
@@ -7951,6 +7990,11 @@ impl Pipeline {
             if let Some(a) = o1_arch.as_ref() {
                 crate::gpu::o1_acap_begin(a.stride);
             }
+            let o1_arch_lag = o1_arch.is_some()
+                && o1_batch_ready
+                && crate::gpu::wgpu_active()
+                && std::env::var("CMF_O1_ARCH_LAG").as_deref() != Ok("0");
+            let mut arch_lag: Option<(usize, usize, usize)> = None;
             if o1_batch_ready && mtp.is_some() {
                 self.mtp_pos_base = tail_from.max(pos);
             }
@@ -7960,7 +8004,14 @@ impl Pipeline {
             while pos < input_ids.len() {
                 // The prompt's last rows read the rows chosen just before them.
                 if pos >= tail_from {
-                    if let Some(a) = o1_arch.take() {
+                    if let Some(mut a) = o1_arch.take() {
+                        // the deferred chunk before the tail joins the archive first
+                        if let Some((p0, b0, n0)) = arch_lag.take() {
+                            if let Err(err) = self.o1_archive_chunk(&mut a, p0, b0, Some(n0)) {
+                                self.finish_generation(&mut mtp, &mut router, true);
+                                return Err(err);
+                            }
+                        }
                         crate::gpu::o1_acap_end();
                         if let Err(err) = self.o1_seal_archive(a) {
                             self.finish_generation(&mut mtp, &mut router, true);
@@ -7983,20 +8034,44 @@ impl Pipeline {
                 // A chunk before the last whose rows nothing reads: the
                 // graph submits it and returns, and this loop encodes the
                 // next chunk while the card runs it.
+                // A sealed chunk before the last whose rows nothing reads (wgpu) is
+                // deferred too: its rows for the archive are read once the next chunk
+                // is on the card (`arch_lag`). `CMF_O1_ARCH_LAG=0`: each chunk waits.
+                let sealed_defer = o1_arch_lag
+                    && end < input_ids.len()
+                    && !mimo_spec
+                    && !dyn_prefill
+                    && !(mtp.is_some() && end > self.mtp_pos_base);
                 #[cfg(not(target_os = "macos"))]
                 crate::gpu::set_batch_defer(
-                    end < input_ids.len()
-                        && o1_arch.is_none()
-                        && !o1_batch_ready
-                        && !mimo_spec
-                        && !mtp_batch_prefill
-                        && !dyn_prefill,
+                    sealed_defer
+                        || (end < input_ids.len()
+                            && o1_arch.is_none()
+                            && !o1_batch_ready
+                            && !mimo_spec
+                            && !mtp_batch_prefill
+                            && !dyn_prefill),
                 );
+                let acap_before = crate::gpu::o1_acap_pending();
                 let outcome = self.o1_prompt_chunk(&mut hiddens, &positions, bk);
                 #[cfg(not(target_os = "macos"))]
                 crate::gpu::set_batch_defer(false);
+                // this chunk's entries, counted before the chunk before it leaves the queue
+                let acap_new = crate::gpu::o1_acap_pending().saturating_sub(acap_before);
                 if let (Some(a), crate::gpu::BatchGraphOutcome::Completed) = (o1_arch.as_mut(), outcome) {
-                    if let Err(err) = self.o1_archive_chunk(a, pos, bk) {
+                    // the chunk before this one first: its command is done
+                    let mut res = match arch_lag.take() {
+                        Some((p0, b0, n0)) => self.o1_archive_chunk(a, p0, b0, Some(n0)),
+                        None => Ok(()),
+                    };
+                    if res.is_ok() {
+                        if sealed_defer {
+                            arch_lag = Some((pos, bk, acap_new));
+                        } else {
+                            res = self.o1_archive_chunk(a, pos, bk, None);
+                        }
+                    }
+                    if let Err(err) = res {
                         self.finish_generation(&mut mtp, &mut router, true);
                         return Err(err);
                     }
@@ -8101,11 +8176,15 @@ impl Pipeline {
                                     pos + n_pairs - 1,
                                 );
                             }
+                            let t_warm = std::time::Instant::now();
                             let warm_error = if let Some(m) = mtp.as_mut() {
                                 self.mtp_warm_prefill_pairs(m, &pairs, pos).err()
                             } else {
                                 None
                             };
+                            if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                                eprintln!("mtp-warm: {n_pairs} pairs in {:.1} ms", t_warm.elapsed().as_secs_f64() * 1e3);
+                            }
                             if let Some(err) = warm_error {
                                 // The trunk batch was already admitted.  A
                                 // failed MTP warm-up therefore clears both
@@ -8134,6 +8213,13 @@ impl Pipeline {
                     });
                 } else {
                     break; // unsupported → per-position graph handles the rest
+                }
+            }
+            // a deferred chunk's archive rows the loop left behind (a later chunk declined)
+            if let (Some(a), Some((p0, b0, n0))) = (o1_arch.as_mut(), arch_lag.take()) {
+                if let Err(err) = self.o1_archive_chunk(a, p0, b0, Some(n0)) {
+                    self.finish_generation(&mut mtp, &mut router, true);
+                    return Err(err);
                 }
             }
             if mtp_batch_prefill && mtp.is_some() && pos == input_ids.len() {
@@ -9747,6 +9833,10 @@ impl Pipeline {
                 }
             }
         }
+        if pairs.len() > 1 && std::env::var("CMF_MTP_EH_BATCH").as_deref() != Ok("0") {
+            m.eh_proj.matmat(&cats, pairs.len(), &mut xs, self.pool.as_deref());
+            return xs;
+        }
         for i in 0..pairs.len() {
             m.eh_proj.matvec(&cats[i * 2 * hs..(i + 1) * 2 * hs], &mut xs[i * hs..(i + 1) * hs], self.pool.as_deref());
         }
@@ -10225,8 +10315,11 @@ impl Pipeline {
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         // nothing reads the block's rows back: the warm-up is its K/V rows
-        // (CUDA: no readback, no wait)
-        let defer = crate::gpu::cuda_active();
+        // (no readback, no wait; the next prompt chunk is encoded while the
+        // card runs it — on wgpu too: SenseNova-Loop-9B over Vulkan waited
+        // ~0.35 s a 512-row chunk). `CMF_MTP_WARM_DEFER=0` waits.
+        let defer = (crate::gpu::cuda_active() || crate::gpu::wgpu_active())
+            && std::env::var("CMF_MTP_WARM_DEFER").as_deref() != Ok("0");
         if defer {
             crate::gpu::set_batch_defer(true);
         }
@@ -18606,11 +18699,27 @@ impl Pipeline {
         }
         let mut plan: Vec<MetalRowsItem> = Vec::new();
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
+        // SenseNova-Loop's mHC streams ride the rows graph as they ride the token graph:
+        // two streams, the Sinkhorn mix, kernels that compiled. `CMF_METAL_ROWS_MHC=0`
+        // keeps such a prompt on the token graph, a row at a time.
+        if self.mhc.as_ref().is_some_and(|m| m.s.streams != 2 || m.s.fixed_identity)
+            || (self.mhc.is_some()
+                && (!crate::gpu_metal::mhc::available()
+                    || std::env::var("CMF_MHC_GRAPH").as_deref() == Ok("0")
+                    || std::env::var("CMF_METAL_ROWS_MHC").as_deref() == Ok("0")))
+        {
+            return None;
+        }
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 return None;
             }
+            let mhc = if self.mhc_layer(li) {
+                Some(crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li))?)
+            } else {
+                None
+            };
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if matches!(d.act, Act::Silu | Act::Gelu) && d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) = (
@@ -18645,7 +18754,7 @@ impl Pipeline {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let gl = GdnGpuLayer {
-                        mhc: None,
+                        mhc,
                         attn_norm: &lw.input_norm,
                         post_norm: &lw.post_norm,
                         qkv,
@@ -18704,7 +18813,7 @@ impl Pipeline {
                     }
                     plan.push(MetalRowsItem::Attn {
                         l: AttnGpuLayer {
-                            mhc: None,
+                            mhc,
                             attn_norm: &lw.input_norm,
                             post_norm: &lw.post_norm,
                             wq: pq,
@@ -18838,13 +18947,16 @@ impl Pipeline {
         // that record counted as recurrent state on macOS.
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
         if want > 0 {
-            let phys = self.physical_layers.max(1);
-            for (li, l) in self.kv_cache.layers.iter_mut().enumerate() {
-                let is_gdn = self
-                    .weights
-                    .layers
-                    .get(li % phys)
-                    .is_some_and(|lw| matches!(lw.attn, AttnKind::LinearGdn(_)));
+            // a looped stack's visit runs its physical layer (`phys_layer`), not `li % phys`
+            let gdn: Vec<bool> = (0..self.kv_cache.layers.len())
+                .map(|li| {
+                    self.weights
+                        .layers
+                        .get(self.phys_layer(li))
+                        .is_some_and(|lw| matches!(lw.attn, AttnKind::LinearGdn(_)))
+                })
+                .collect();
+            for (l, is_gdn) in self.kv_cache.layers.iter_mut().zip(gdn) {
                 if is_gdn && l.linear_state.len() != want {
                     l.linear_state = vec![0f32; want];
                 }
@@ -19200,7 +19312,6 @@ impl Pipeline {
     ) -> crate::gpu::BatchGraphOutcome {
         let _t0 = std::time::Instant::now();
         if positions.len() != b
-            || self.mhc.is_some()
             || self.prompt_mrope.is_some()
             || self.value_blend.is_some()
             || positions.windows(2).any(|w| w[1] != w[0] + 1)
