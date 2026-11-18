@@ -8,6 +8,10 @@
 //!   hidden buffer, `post`/`mix` into the coefficient buffer;
 //! - `mhc_merge` (one thread per lane): `r_i ← Σ_j mix_ij·r_j + post_i·y`,
 //!   and after the range's last FFN the hidden becomes the streams' mean.
+//!
+//! Both take rows (the rows graph): `mhc_route` one threadgroup a row, `mhc_merge`
+//! one thread per lane of every row, the streams `[rows][2][d]`, a row's
+//! coefficients 8 floats.
 
 use super::{Ctx, ctx};
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions, MTLSize};
@@ -28,11 +32,15 @@ kernel void mhc_route(device float* h [[buffer(0)]],
                       device const float* bias [[buffer(3)]],
                       device float* coef [[buffer(4)]],
                       constant MP& p [[buffer(5)]],
-                      uint t [[thread_index_in_threadgroup]]) {
+                      uint t [[thread_index_in_threadgroup]],
+                      uint row [[threadgroup_position_in_grid]]) {
     threadgroup float red[9 * 256];
     threadgroup float pre_s[2];
     const uint d = p.d;
     const uint n = 2u * d;
+    h += row * d;
+    r += row * n;
+    coef += row * 8u;
     if ((p.flags & 1u) != 0u) {
         for (uint e = t; e < n; e += 256u) { r[e] = h[e % d]; }
     }
@@ -79,16 +87,20 @@ kernel void mhc_merge(device float* h [[buffer(0)]],
                       device const float* y [[buffer(2)]],
                       device const float* coef [[buffer(3)]],
                       constant MP& p [[buffer(4)]],
-                      uint e [[thread_position_in_grid]]) {
-    if (e >= p.d) { return; }
-    const float yv = y[e];
-    const float r0 = r[e];
-    const float r1 = r[p.d + e];
-    const float n0 = coef[2] * r0 + coef[3] * r1 + coef[0] * yv;
-    const float n1 = coef[4] * r0 + coef[5] * r1 + coef[1] * yv;
-    r[e] = n0;
-    r[p.d + e] = n1;
-    if ((p.flags & 2u) != 0u) { h[e] = 0.5f * (n0 + n1); }
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= p.d * max(p.pad0, 1u)) { return; }
+    const uint row = i / p.d;
+    const uint e = i % p.d;
+    device float* rr = r + row * 2u * p.d;
+    device const float* cf = coef + row * 8u;
+    const float yv = y[i];
+    const float r0 = rr[e];
+    const float r1 = rr[p.d + e];
+    const float n0 = cf[2] * r0 + cf[3] * r1 + cf[0] * yv;
+    const float n1 = cf[4] * r0 + cf[5] * r1 + cf[1] * yv;
+    rr[e] = n0;
+    rr[p.d + e] = n1;
+    if ((p.flags & 2u) != 0u) { h[i] = 0.5f * (n0 + n1); }
 }
 "#;
 
@@ -140,36 +152,74 @@ pub(crate) fn bufs(c: &Ctx, d: usize) -> (Buffer, Buffer) {
     (r, k)
 }
 
-fn params(d: usize, enter: bool, leave: bool, iters: usize, pre_scale: f32) -> [u32; 8] {
-    [d as u32, 2, 8, enter as u32 | (leave as u32) << 1, iters as u32, pre_scale.to_bits(), 0, 0]
+/// The uniform words: `[d, 2, 8, flags, iters, pre_scale, rows, 0]`, flags bit 0 =
+/// enter (the hidden into both streams), bit 1 = leave (the hidden becomes their mean).
+fn params(d: usize, rows: usize, enter: bool, leave: bool, iters: usize, pre_scale: f32) -> [u32; 8] {
+    [d as u32, 2, 8, enter as u32 | (leave as u32) << 1, iters as u32, pre_scale.to_bits(), rows as u32, 0]
 }
 
 /// `mhc_route` into `h` with router `(w, b)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_route(c: &Ctx, enc: &ComputeCommandEncoderRef, h: &Buffer, w: &Buffer, b: &Buffer, d: usize, enter: bool, iters: usize, pre_scale: f32) {
-    let p = pipes(c).expect("mHC kernels (checked by the planner)");
     let (r, k) = bufs(c, d);
-    let pr = params(d, enter, false, iters, pre_scale);
-    enc.set_compute_pipeline_state(&p.route);
-    enc.set_buffer(0, Some(h), 0);
-    enc.set_buffer(1, Some(&r), 0);
-    enc.set_buffer(2, Some(w), 0);
-    enc.set_buffer(3, Some(b), 0);
-    enc.set_buffer(4, Some(&k), 0);
-    enc.set_bytes(5, 32, pr.as_ptr() as *const c_void);
-    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    encode_route_rows(c, enc, h, &r, &k, w, b, d, 1, enter, iters, pre_scale);
 }
 
 /// `mhc_merge` of the sub-layer output `y`.
 pub(crate) fn encode_merge(c: &Ctx, enc: &ComputeCommandEncoderRef, h: &Buffer, y: &Buffer, d: usize, leave: bool) {
-    let p = pipes(c).expect("mHC kernels (checked by the planner)");
     let (r, k) = bufs(c, d);
-    let pr = params(d, false, leave, 0, 1.0);
+    encode_merge_rows(c, enc, h, &r, &k, y, d, 1, leave);
+}
+
+/// The rows twin of `encode_route`: `rows` rows of `h` (`[rows][d]`) out of the streams
+/// `r` (`[rows][2][d]`), their coefficients into `k` (`[rows][8]`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_route_rows(
+    c: &Ctx,
+    enc: &ComputeCommandEncoderRef,
+    h: &Buffer,
+    r: &Buffer,
+    k: &Buffer,
+    w: &Buffer,
+    b: &Buffer,
+    d: usize,
+    rows: usize,
+    enter: bool,
+    iters: usize,
+    pre_scale: f32,
+) {
+    let p = pipes(c).expect("mHC kernels (checked by the planner)");
+    let pr = params(d, rows, enter, false, iters, pre_scale);
+    enc.set_compute_pipeline_state(&p.route);
+    enc.set_buffer(0, Some(h), 0);
+    enc.set_buffer(1, Some(r), 0);
+    enc.set_buffer(2, Some(w), 0);
+    enc.set_buffer(3, Some(b), 0);
+    enc.set_buffer(4, Some(k), 0);
+    enc.set_bytes(5, 32, pr.as_ptr() as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new(rows.max(1) as u64, 1, 1), MTLSize::new(256, 1, 1));
+}
+
+/// The rows twin of `encode_merge`: `y` is `[rows][d]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_merge_rows(
+    c: &Ctx,
+    enc: &ComputeCommandEncoderRef,
+    h: &Buffer,
+    r: &Buffer,
+    k: &Buffer,
+    y: &Buffer,
+    d: usize,
+    rows: usize,
+    leave: bool,
+) {
+    let p = pipes(c).expect("mHC kernels (checked by the planner)");
+    let pr = params(d, rows, false, leave, 0, 1.0);
     enc.set_compute_pipeline_state(&p.merge);
     enc.set_buffer(0, Some(h), 0);
-    enc.set_buffer(1, Some(&r), 0);
+    enc.set_buffer(1, Some(r), 0);
     enc.set_buffer(2, Some(y), 0);
-    enc.set_buffer(3, Some(&k), 0);
+    enc.set_buffer(3, Some(k), 0);
     enc.set_bytes(4, 32, pr.as_ptr() as *const c_void);
-    enc.dispatch_threads(MTLSize::new(d as u64, 1, 1), MTLSize::new(256, 1, 1));
+    enc.dispatch_threads(MTLSize::new((d * rows.max(1)) as u64, 1, 1), MTLSize::new(256, 1, 1));
 }

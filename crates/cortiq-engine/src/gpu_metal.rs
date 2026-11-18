@@ -24735,6 +24735,37 @@ pub struct VerifyGraph {
     state_follow: bool,
     /// Rows of the chunk that come after this graph's, for which a mirror keeps room.
     rows_after: usize,
+    /// SenseNova-Loop: the mHC streams of the layer being encoded (None: a plain residual).
+    mhc_cur: Option<MhcRows>,
+}
+
+/// A layer's mHC routers on the device, for the rows graph.
+#[derive(Clone)]
+struct MhcRows {
+    attn_w: Buffer,
+    attn_b: Buffer,
+    ffn_w: Buffer,
+    ffn_b: Buffer,
+    enter: bool,
+    leave: bool,
+    iters: usize,
+    pre_scale: f32,
+}
+
+impl MhcRows {
+    fn of(c: &Ctx, m: Option<&crate::gpu::GraphMhc<'_>>) -> Option<MhcRows> {
+        let m = m?;
+        Some(MhcRows {
+            attn_w: const_buf(c, m.attn_w),
+            attn_b: const_buf(c, m.attn_b),
+            ffn_w: const_buf(c, m.ffn_w),
+            ffn_b: const_buf(c, m.ffn_b),
+            enter: m.enter,
+            leave: m.leave,
+            iters: m.iters,
+            pre_scale: m.pre_scale,
+        })
+    }
 }
 
 /// The halves of a prompt chunk in step. A layer's state, mirror rows and far field take the
@@ -25106,6 +25137,7 @@ impl VerifyGraph {
             join_pending: false,
             state_follow: false,
             rows_after: 0,
+            mhc_cur: None,
         })
     }
 
@@ -25248,7 +25280,7 @@ impl VerifyGraph {
     /// input. No command of this graph is in flight then, and none has to wait behind the other
     /// half's on the GPU. False leaves it to `rows_norm`.
     fn host_norm(&mut self, w: &[f32], projs: &[(usize, usize, usize)]) -> bool {
-        if self.cmd.is_some() || !self.inflight.is_empty() || (self.pending_delta && !self.join_pending) {
+        if self.cmd.is_some() || !self.inflight.is_empty() || (self.pending_delta && !self.join_pending) || self.mhc_cur.is_some() {
             return false;
         }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -25533,6 +25565,22 @@ impl VerifyGraph {
         );
     }
 
+    /// This graph's mHC streams (`[bc][2][hidden]`) and coefficients (`[bc][8]`).
+    fn mhc_streams(&self) -> (Buffer, Buffer) {
+        let (c, d) = (self.tg.c, self.tg.dims.hidden);
+        (Self::vbuf(c, 60, self.lane, self.bc * 2 * d * 4), Self::vbuf(c, 61, self.lane, (self.bc * 8 * 4).max(64)))
+    }
+
+    /// An mHC layer's start: the residual still pending lands in `h`, then the
+    /// mixer's branch is routed out of the streams into `h` (entering the range
+    /// copies `h` into both streams first).
+    fn mhc_route_attn(&mut self, enc: &metal::ComputeCommandEncoderRef) {
+        let Some(m) = self.mhc_cur.clone() else { return };
+        self.flush_delta(enc);
+        let (r, k) = self.mhc_streams();
+        mhc::encode_route_rows(self.tg.c, enc, &self.h_b, &r, &k, &m.attn_w, &m.attn_b, self.tg.dims.hidden, self.b, m.enter, m.iters, m.pre_scale);
+    }
+
     /// The Neural Engine's output becomes `d_b`, ahead of whatever reads it.
     fn join(&mut self, enc: &metal::ComputeCommandEncoderRef) {
         if std::mem::take(&mut self.join_pending) {
@@ -25776,6 +25824,21 @@ impl VerifyGraph {
         };
         // SiLU or the exact GELU (`ffn_n8_ok` refused the rest).
         self.ffn_act = *act;
+        // mHC: the mixer's output merges into the streams, the FFN's branch is routed
+        // out of them, and the FFN's output merges in (after the range's last layer
+        // the hidden becomes the streams' mean). No residual stays pending.
+        if let Some(m) = self.mhc_cur.clone() {
+            self.join(enc);
+            let (r, k) = self.mhc_streams();
+            let (d, b) = (self.tg.dims.hidden, self.b);
+            mhc::encode_merge_rows(c, enc, &self.h_b, &r, &k, &self.d_b, d, b, false);
+            mhc::encode_route_rows(c, enc, &self.h_b, &r, &k, &m.ffn_w, &m.ffn_b, d, b, false, m.iters, m.pre_scale);
+            self.pending_delta = false;
+            self.rows_norm(enc, post_norm);
+            self.ffn_gpu(enc, *gate, *up, *down);
+            mhc::encode_merge_rows(c, enc, &self.h_b, &r, &k, &self.d_b, d, b, m.leave);
+            return;
+        }
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
         // The Neural Engine takes this FFN: its input now, the rest once this encoder ends.
@@ -25957,6 +26020,7 @@ impl VerifyGraph {
             if !self.begin_layer(false) {
                 return false;
             }
+            self.mhc_cur = MhcRows::of(c, l.mhc.as_ref());
             let slot = self.gdn.len();
             let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {
                 Some(b) => (b, 0usize),
@@ -25999,6 +26063,7 @@ impl VerifyGraph {
             let cmd = self.ensure_cmd();
             let enc = cmd.new_compute_command_encoder().to_owned();
             if !hosted {
+                self.mhc_route_attn(&enc);
                 self.rows_norm(&enc, l.attn_norm);
             }
             // 2. What needs the normed rows alone: the a and b projections, the conv over the
@@ -26199,6 +26264,7 @@ impl VerifyGraph {
         }
         let c = self.tg.c;
         let b = self.b;
+        self.mhc_cur = MhcRows::of(c, l.mhc.as_ref());
         // A sealed layer's rows go through its device state, and no mirror exists.
         let o1dev = match &p.o1 {
             Some(o) => match o1_ensure_metal(c, p.kv_id, p.layer, &o.views, o.epoch, o1c::MAX_NEAR) {
@@ -26264,6 +26330,7 @@ impl VerifyGraph {
         let cmd = self.ensure_cmd();
         let enc = cmd.new_compute_command_encoder().to_owned();
         if !hosted {
+            self.mhc_route_attn(&enc);
             self.rows_norm(&enc, l.attn_norm);
         }
         let nhd = p.nh * p.hd;

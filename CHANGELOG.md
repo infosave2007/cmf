@@ -21,7 +21,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against 16.5, the first token in 140 s against 142, decode 49.9 tok/s against 30.5; 250 000 tokens in 8.3 GB,
   265 s, 50.4 tok/s; planted facts in 60 000 / 120 000 / 240 000 characters 4 of 4 each.
 
+### Changed
+- wgpu, mHC router (`mhc_route`): its nine sums were a private array indexed in the loop, which lived in local
+  memory; they are scalars now, and four lanes' loads go out before their sums (the same sums in the same order,
+  so the same numbers). The next layer's input norm after an mHC FFN is no longer computed when that layer
+  routes and norms its own branch. RTX A5000 over Vulkan, SenseNova-Loop-9B q4tp: the router 103 µs to 30 µs a
+  call (96 calls a token); decode at 1 000 / 16 000 / 128 000 tokens 33.2 / 31.3 / 19.3 to 47.2 / 41.0 / 23.5
+  tok/s, the turbo file's 33 to 46 tok/s, the same text.
+- wgpu, the far field's prompt: the query trace of the exact prefix keeps one row in eight on the card
+  (`o1_qcap_stride`, as on CUDA), so does the archive of the sealed chunks, whose staging buffers are mapped with
+  one wait; prefix chunks whose rows nobody reads are submitted while the next one is encoded and their queries
+  leave the card every eight chunks (`CMF_O1_QCAP_DRAIN`); sealed chunks are deferred too, their archive rows
+  read once the next chunk is on the card (`CMF_O1_ARCH_LAG=0`: each chunk waits). SenseNova-Loop-9B turbo over
+  Vulkan, the first token at 16 000 / 128 000 / 250 000 tokens: 38.7 / 318.7 / 602.4 s to 28.4 / 212.5 / 406.2 s,
+  the same text.
+- wgpu, the draft head's warm-up over a prompt: its chunks are submitted without a wait each, as on CUDA
+  (`CMF_MTP_WARM_DEFER=0`: wait). SenseNova-Loop-9B over Vulkan, a 13 185-token prompt: the first token with drafts
+  40.5 s to 16.4-17.1 s, the same drafts accepted.
+
 ### Fixed
+- Metal, looped mHC stacks (SenseNova-Loop): the rows graph planned the mHC layers as plain residual layers, so
+  a prompt read through it skipped the streams. The rows graph now routes and merges the streams per row
+  (`mhc_route`/`mhc_merge` take rows; `CMF_METAL_ROWS_MHC=0` leaves such prompts to the token graph), which also
+  lets drafts be checked in one batch; the GDN states it seeds follow the loop's physical layer. MacBook Air M4,
+  q4tp, a 1 829-token prompt: the first token in 21.9 s, the same answer as the token graph a row at a time
+  (147.9 s); code at 14.4 tok/s with drafts against 9.5, the same text.
+- `cortiq bench`: `CMF_BENCH_PAIR=0` skips the host pair micro-bench, which at 16 000 tokens on an M4 outlasted
+  the measurement itself.
 - YaRN on the device graphs: a uniform model with a YaRN cos/sin scale was declined by every fast graph arm
   ("scaled RoPE without per-layer geometry") and decoded op by op (SenseNova-Loop-9B applies YaRN, factor 2, at
   every length: 0.7 tok/s on an RTX A5000 through CUDA). Where the q/k norms run before RoPE, the scale now moves

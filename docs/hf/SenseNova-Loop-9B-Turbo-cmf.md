@@ -31,6 +31,7 @@ its own keys and values, so a long prompt costs the standard file twice the memo
   the first token in 140 s (142), then 49.9 tok/s against 30.5.
 - **250 000 tokens on the same card:** 8.3 GB, the first token in 265 s, then 50.4 tok/s; the prompt's rows wait in
   RAM or, with `--o1-spill`, in files.
+- **Vulkan on the same card, 128 000 tokens:** 5.8 GB, the first token in 213 s, then 46.2 tok/s, against 19.4 GB and 23.5 tok/s for the standard file.
 - Facts planted in 60 000, 120 000 and 240 000 characters of Wikipedia (up to 56 000 tokens) come back 4 times of 4
   at each length through CUDA, as from the standard file.
 
@@ -187,18 +188,27 @@ Stand: the same NVIDIA RTX A5000 (24 GB), over Vulkan, a release build of the br
 
 | prompt, tokens | first token, s (standard) | first token, s (**turbo**) | decode, tok/s (standard) | decode, tok/s (**turbo**) | peak card memory, GB (standard) | peak card memory, GB (**turbo**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16 000 | 11.9 | **38.7** | 31.3 | **33.1** | 6.8 | **5.7** |
-| 32 000 | 25.5 | **67.9** | 28.8 | **33.1** | 8.5 | **5.7** |
-| 64 000 | 60.2 | **155.7** | 24.3 | **33.1** | 12.1 | **5.7** |
-| 128 000 | 163.3 | **318.7** | 19.3 | **33.3** | 19.4 | **5.8** |
-| 250 000 | — | **602.4** | — | **33.5** | — | **5.8** |
+| 16 000 | 10.8 | **28.4** | 41.0 | **45.5** | 6.8 | **5.7** |
+| 32 000 | 24.4 | **53.7** | 36.5 | **45.5** | 8.5 | **5.7** |
+| 64 000 | 60.2 | **105.9** | 31.6 | **46.6** | 12.1 | **5.7** |
+| 128 000 | 161.7 | **212.5** | 23.5 | **46.2** | 19.4 | **5.8** |
+| 250 000 | — | **406.2** | — | **45.6** | — | **5.8** |
 
-Over Vulkan the turbo file holds 5.7 GB of the card and 33 tok/s at any length, but it reads a prompt past the seal
-at about 410 tokens a second, against 780–1 340 for the standard file: the first token comes 2–3 times later. On
-an NVIDIA card take CUDA for long prompts.
+Over Vulkan the turbo file holds 5.8 GB of the card and 45.5–46.6 tok/s at any length; at 128 000 tokens
+the standard file takes 19.4 GB and decodes at 23.5 tok/s. The turbo file reads a long prompt at about 600 tokens a
+second against 790–1 480 for the standard file, so its first token comes 1.3–2.6 times later.
 
 Planted facts over Vulkan: the same 12 prompts, 4 of 4 at 60 000, 120 000 and 240 000 characters each (the standard file 4 of 4
 at 60 000 and 120 000).
+
+### Metal · Apple M4
+
+Stand: MacBook Air M4 (24 GB, no fan, the base M4's memory bus), Metal, a release build of the branch above.
+
+A 16 000-token prompt: the first token in 212.4 s, then 9.5 tok/s, with 347 MB of keys, values and
+far-field state, against 220.3 s, 7.6 tok/s and 1 942 MB for the standard file. Planted facts in 60 000
+characters (13 000–15 000 tokens): 4 of 4, the first token in 178–203 s. On the M4 the turbo file is the
+faster one for long prompts as well.
 
 
 ## Options
@@ -214,7 +224,7 @@ at 60 000 and 120 000).
 ## Limits
 
 - The far field runs on CUDA, Vulkan, DX12 and Metal. On the CPU this file runs as the standard one. It was measured
-  on an NVIDIA RTX A5000, through CUDA and Vulkan.
+  on an NVIDIA RTX A5000, through CUDA and Vulkan, and on an Apple M4 through Metal.
 - Past the seal the text is approximate: what lies far back fades, apart from the rows kept exact. The fit behind
   those rows saw planted facts in Wikipedia; other kinds of important text were not tested.
 - While a long prompt is read, its rows take host memory: 24–29 GB at 128 000 tokens. `--o1-spill` puts them in files
@@ -250,6 +260,7 @@ Patent applications filed with the USPTO: No. 19/738,763 (July 13, 2026); titles
   токен через 140 с (142), затем 49,9 ток/с против 30,5.
 - **250 000 токенов на той же карте:** 8,3 ГБ, первый токен через 265 с, затем 50,4 ток/с; строки промпта ждут в
   RAM или, с `--o1-spill`, в файлах.
+- **Vulkan на той же карте, 128 000 токенов:** 5,8 ГБ, первый токен через 213 с, затем 46,2 ток/с против 19,4 ГБ и 23,5 ток/с у обычного файла.
 - Факты, спрятанные в 60 000, 120 000 и 240 000 символах Википедии (до 56 000 токенов), находятся 4 раза из 4 на каждой длине через CUDA, как и у обычного файла.
 
 Это один файл [CMF](https://github.com/infosave2007/cmf) для `cortiq`, движка на Rust без Python и
@@ -367,24 +378,32 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | промпт, токенов | первый токен, с (обычный) | первый токен, с (**турбо**) | декод, ток/с (обычный) | декод, ток/с (**турбо**) | пик памяти карты, ГБ (обычный) | пик памяти карты, ГБ (**турбо**) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16 000 | 11,9 | **38,7** | 31,3 | **33,1** | 6,8 | **5,7** |
-| 32 000 | 25,5 | **67,9** | 28,8 | **33,1** | 8,5 | **5,7** |
-| 64 000 | 60,2 | **155,7** | 24,3 | **33,1** | 12,1 | **5,7** |
-| 128 000 | 163,3 | **318,7** | 19,3 | **33,3** | 19,4 | **5,8** |
-| 250 000 | — | **602,4** | — | **33,5** | — | **5,8** |
+| 16 000 | 10,8 | **28,4** | 41,0 | **45,5** | 6,8 | **5,7** |
+| 32 000 | 24,4 | **53,7** | 36,5 | **45,5** | 8,5 | **5,7** |
+| 64 000 | 60,2 | **105,9** | 31,6 | **46,6** | 12,1 | **5,7** |
+| 128 000 | 161,7 | **212,5** | 23,5 | **46,2** | 19,4 | **5,8** |
+| 250 000 | — | **406,2** | — | **45,6** | — | **5,8** |
 
-Через Vulkan турбо держит 5,7 ГБ карты и 33 ток/с при любой длине, но промпт после печати читает примерно на 410
-токенов в секунду против 780–1 340 у обычного файла: первый токен приходит в 2–3 раза позже. На карте NVIDIA для
-длинных промптов берите CUDA.
+Через Vulkan турбо держит 5,8 ГБ карты и 45,5–46,6 ток/с при любой длине; при 128 000 токенов обычный файл
+занимает 19,4 ГБ и декодирует на 23,5 ток/с. Длинный промпт турбо читает примерно на 600 токенов в секунду против
+790–1 480 у обычного файла, поэтому первый токен приходит в 1,3–2,6 раза позже.
 
 Факты через Vulkan: те же 12 промптов, по 4 из 4 при 60 000, 120 000 и 240 000 символов (обычный файл 4 из 4 при 60 000 и
 120 000).
 
+#### Metal · Apple M4
+
+Стенд: MacBook Air M4 (24 ГБ, без вентилятора, базовая шина памяти M4), Metal, релизная сборка ветки выше.
+
+Промпт в 16 000 токенов: первый токен через 212,4 с, затем 9,5 ток/с, ключи, значения и состояние дальнего поля
+занимают 347 МБ; у обычного файла 220,3 с, 7,6 ток/с и 1 942 МБ. Факты в 60 000 символов (13 000–15 000
+токенов): 4 из 4, первый токен через 178–203 с. На M4 турбо и для длинных
+промптов быстрее обычного файла.
 
 ### Ограничения
 
 - Дальнее поле работает на CUDA, Vulkan, DX12 и Metal; на CPU файл работает как обычный. Измерено на NVIDIA RTX A5000
-  через CUDA и Vulkan.
+  через CUDA и Vulkan и на Apple M4 через Metal.
 - После печати текст приблизительный: далёкое прошлое тускнеет, кроме точных строк. Модель точных строк видела
   факты в Википедии; другие виды важного текста не проверялись.
 - Пока читается длинный промпт, его строки занимают память хоста: 24–29 ГБ при 128 000 токенов. `--o1-spill` кладёт
@@ -412,6 +431,7 @@ SenseNova-Loop 把 24 层运行两遍，每一遍都有自己的键和值，所�
 
 - RTX A5000（24 GB）+ CUDA，128 000 token 的提示词：显存 8.3 GB，普通文件 16.5 GB；首个 token 140 秒（普通文件 142 秒），之后 49.9 tok/s，普通文件 30.5。
 - 同一张卡上 250 000 token：8.3 GB，首个 token 265 秒，之后 50.4 tok/s；提示词的行暂存在内存中，或用 `--o1-spill` 存到文件。
+- 同一张卡 + Vulkan，128 000 token：显存 5.8 GB，首个 token 213 秒，之后 46.2 tok/s；普通文件 19.4 GB、23.5 tok/s。
 - 在 60 000、120 000 和 240 000 字符的维基百科文本（最多 56 000 个 token）中植入的事实，通过 CUDA 每种长度都 4 次找回 4 次，与普通文件相同。
 
 这是一个 [CMF](https://github.com/infosave2007/cmf) 文件，供 `cortiq` 使用（Rust 推理引擎，不依赖 Python 和机器学习框架）。
@@ -521,21 +541,25 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | 提示词，token | 首个 token，秒（普通） | 首个 token，秒（Turbo） | 解码，tok/s（普通） | 解码，tok/s（Turbo） | 显存峰值，GB（普通） | 显存峰值，GB（Turbo） |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16 000 | 11.9 | 38.7 | 31.3 | 33.1 | 6.8 | 5.7 |
-| 32 000 | 25.5 | 67.9 | 28.8 | 33.1 | 8.5 | 5.7 |
-| 64 000 | 60.2 | 155.7 | 24.3 | 33.1 | 12.1 | 5.7 |
-| 128 000 | 163.3 | 318.7 | 19.3 | 33.3 | 19.4 | 5.8 |
-| 250 000 | — | 602.4 | — | 33.5 | — | 5.8 |
+| 16 000 | 10.8 | 28.4 | 41.0 | 45.5 | 6.8 | 5.7 |
+| 32 000 | 24.4 | 53.7 | 36.5 | 45.5 | 8.5 | 5.7 |
+| 64 000 | 60.2 | 105.9 | 31.6 | 46.6 | 12.1 | 5.7 |
+| 128 000 | 161.7 | 212.5 | 23.5 | 46.2 | 19.4 | 5.8 |
+| 250 000 | — | 406.2 | — | 45.6 | — | 5.8 |
 
-在 Vulkan 上 Turbo 在任意长度下都保持 5.7 GB 显存和 33 tok/s，但封存之后读取提示词约每秒 410 个 token，普通文件为 780–1 340：首个 token 要晚 2–3 倍。
-NVIDIA 显卡处理长提示词请用 CUDA。
+在 Vulkan 上 Turbo 在任意长度下都保持 5.8 GB 显存和 45.5–46.6 tok/s；128 000 token 时普通文件占用 19.4 GB，解码 23.5 tok/s。Turbo 读取长提示词约每秒 600 个 token，普通文件为 790–1 480，所以首个 token 晚 1.3–2.6 倍。
 
 Vulkan 上的植入事实：同样的 12 个提示词，60 000、120 000 和 240 000 字符时均为 4 / 4（普通文件在 60 000 和 120 000 字符时 4 / 4）。
 
+#### Metal · Apple M4
+
+测试平台：MacBook Air M4（24 GB，无风扇，M4 基础款内存总线），Metal，上述分支的 release 构建。
+
+16 000 token 的提示词：首个 token 212.4 秒，之后 9.5 tok/s，键、值和远场状态占 347 MB；普通文件为 220.3 秒、7.6 tok/s、1 942 MB。60 000 字符（13 000–15 000 个 token）中植入的事实：4 / 4，首个 token 178–203 秒。在 M4 上长提示词用 Turbo 也更快。
 
 ### 限制
 
-- 远场支持 CUDA、Vulkan、DX12 和 Metal；在 CPU 上该文件按普通文件运行。测量平台：NVIDIA RTX A5000，CUDA 与 Vulkan。
+- 远场支持 CUDA、Vulkan、DX12 和 Metal；在 CPU 上该文件按普通文件运行。测量平台：NVIDIA RTX A5000（CUDA 与 Vulkan）和 Apple M4（Metal）。
 - 封存之后的文本是近似的：远处的内容会淡化，精确行除外。精确行的模型只见过维基百科中植入的事实，其他类型的重要文本未测试。
 - 读取长提示词时，各行占用主机内存：128 000 token 时 24–29 GB。`--o1-spill` 把它们放到文件（250 000 token 时 27 GB），远场建好后删除。
 - 带图片的请求不用草稿；超过封存长度的图片提示词会被拒绝。

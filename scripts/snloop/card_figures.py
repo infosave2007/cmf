@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import card_figures as cf
 from card_figures import Svg, INK, INK2, LINE, BLUE, ORANGE, GREY, TINT, head
 
-STAND = "NVIDIA RTX A5000 (24 GB)"
+STAND = {"cuda": "NVIDIA RTX A5000 (24 GB)", "vulkan": "NVIDIA RTX A5000 (24 GB)", "metal": "Apple M4, MacBook Air (24 GB)"}
 T = {
     "en": {
         "tb_t": "A long prompt, standard and turbo",
@@ -43,7 +43,7 @@ T = {
         "stand": "测试平台", "res": "",
     },
 }
-BACKEND = {"cuda": "CUDA", "vulkan": "Vulkan"}
+BACKEND = {"cuda": "CUDA", "vulkan": "Vulkan", "metal": "Metal"}
 
 
 def num(lang, v, d=1):
@@ -67,7 +67,7 @@ def turbo_fig(lang, bk, d):
     s = Svg(1600, 700)
     head(s, t, t["tb_t"], t["tb_sub"])
     w = pill(s, 50, 158, BACKEND[bk])
-    s.text(50 + w + 16, 156, f"{t['stand']}: {STAND}", 22, INK, "700")
+    s.text(50 + w + 16, 156, f"{t['stand']}: {STAND[bk]}", 22, INK, "700")
     std, tur = d["std"], d["turbo"]
     ctxs = sorted({r["ctx"] for r in std + tur if r["ctx"] >= 4000})
     lg = [math.log2(c) for c in ctxs]
@@ -115,7 +115,7 @@ def survey_fig(lang, bk, d):
     s = Svg(1600, 560)
     head(s, t, t["sv_t"], t["sv_sub"])
     w = pill(s, 50, 158, BACKEND[bk])
-    s.text(50 + w + 16, 156, f"{t['stand']}: {STAND}", 22, INK, "700")
+    s.text(50 + w + 16, 156, f"{t['stand']}: {STAND[bk]}", 22, INK, "700")
     kinds = list(sv)
     top = max(max(v) for v in sv.values()) * 1.2
     y0, y1 = 480, 220

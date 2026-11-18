@@ -2858,6 +2858,10 @@ pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
 /// seal's trace keeps. True: the drains hand back those rows alone; false:
 /// every row, as before.
 pub fn o1_qcap_stride(_stride: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_qcap_stride(_stride);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::o1_qcap_stride(_stride);
@@ -2922,8 +2926,8 @@ pub fn o1_far_sums(nkv: usize, hpk: usize, hd: usize, m: usize, scale: f32, qt: 
 }
 
 /// Copy sealed prompt chunks' rows to host memory until `o1_acap_end`. A
-/// backend may keep one query row in `stride` by position (CUDA), the rows
-/// the archive's trace keeps; the others hand back every row.
+/// backend may keep one query row in `stride` by position (CUDA, wgpu), the
+/// rows the archive's trace keeps; the others hand back every row.
 pub fn o1_acap_begin(_stride: usize) {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
@@ -2931,7 +2935,7 @@ pub fn o1_acap_begin(_stride: usize) {
     }
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
-        crate::gpu_wgpu::o1_acap_begin();
+        crate::gpu_wgpu::o1_acap_begin(_stride);
     }
     #[cfg(target_os = "macos")]
     if backend() == Backend::Metal {
@@ -2952,6 +2956,26 @@ pub fn o1_acap_end() {
     if backend() == Backend::Metal {
         crate::gpu_metal::o1c::cap_end();
     }
+}
+
+/// Entries the archive capture holds, not yet taken; 0 where a backend has no
+/// such queue (`o1_acap_take_first`).
+pub fn o1_acap_pending() -> usize {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_acap_pending();
+    }
+    0
+}
+
+/// The oldest `n` entries of the archive capture, a chunk's rows while the chunk
+/// after it runs (wgpu); elsewhere every row, as `o1_acap_take`.
+pub fn o1_acap_take_first(_n: usize) -> Option<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_acap_take_first(_n);
+    }
+    o1_acap_take()
 }
 
 /// The rows captured since the last call: (layer, queries, keys, values).

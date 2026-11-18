@@ -33,7 +33,8 @@ keep its MTP head, which drafts tokens that the card checks in one batch.
 
 - **RTX A5000 (24 GB), CUDA:** `q4tp` writes code at 88 tok/s with drafts and 51 without, and reads a
   32 000-token prompt in 22.6 s.
-- **The same card, Vulkan:** code at 39.7 tok/s with drafts, 34.2 without.
+- **The same card, Vulkan:** code at 57.5 tok/s with drafts, 49.3 without.
+- **Apple M4 (MacBook Air), Metal:** code at 14.4 tok/s with drafts, 9.5 without.
 - Greedy text of `q8_2f` = Transformers float32 on the reference text prompts, on CUDA and Vulkan.
 - Long documents in fixed card memory: [SenseNova-Loop-9B-Turbo-cmf](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf).
 
@@ -126,11 +127,13 @@ release build of the branch above.
 
 | prompts | with drafts, tok/s | without, tok/s | drafts accepted |
 |---|---:|---:|---:|
-| code | **39.7** (32.9–47.3) | 34.2 | 35–58 % |
-| general questions | **33.5** (30.4–37.1) | 33.0 | 32–40 % |
+| code | **57.5** (47.9–63.7) | 49.3 | 38–61 % |
+| general questions | 42.4 (35.8–45.4) | **47.4** | 23–36 % |
 
-Over Vulkan the drafts pay on code and not on general questions, and four of the eight answers parted from the plain greedy text at a near tie: the batch that checks the drafts rounds differently from the one-token graph. The draft head also reads the prompt: a 13 185-token prompt reached
-the first token in 40.5 s with drafts and in 26.2 s with `CMF_MTP=0`, which turns them off.
+Over Vulkan the drafts pay on code only; on general questions a token is faster without them (`CMF_MTP=0` turns
+them off). Four of the eight answers parted from the plain greedy text at a near tie: the batch that checks the
+drafts rounds differently from the one-token graph. The draft head also reads the prompt: a 13 185-token prompt
+reached the first token in 16.4–17.1 s with drafts and in 12.8–14.6 s without.
 
 ![Draft tokens over Vulkan](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_vulkan_en.png)
 
@@ -138,22 +141,43 @@ the first token in 40.5 s with drafts and in 26.2 s with `CMF_MTP=0`, which turn
 
 | prompt, tokens | first token, s | decode, tok/s | peak card memory, GB |
 |---:|---:|---:|---:|
-| 1 000 | 1.1 | 33.2 | 4.8 |
-| 4 000 | 3.0 | 32.3 | 5.3 |
-| 16 000 | 11.9 | 31.3 | 6.8 |
-| 32 000 | 25.5 | 28.8 | 8.5 |
-| 64 000 | 60.2 | 24.3 | 12.1 |
-| 128 000 | 163.3 | 19.3 | 19.4 |
+| 1 000 | 0.9 | 47.2 | 4.8 |
+| 4 000 | 2.8 | 42.7 | 5.3 |
+| 16 000 | 10.8 | 41.0 | 6.8 |
+| 32 000 | 24.4 | 36.5 | 8.5 |
+| 64 000 | 60.2 | 31.6 | 12.1 |
+| 128 000 | 161.7 | 23.5 | 19.4 |
 
-`q8_2f`: 25.2 / 24.4 / 23.1 tok/s and 8.2 / 8.7 / 10.0 GB at 1 000 / 4 000 / 16 000 tokens; it reads a prompt at
-about 480 tok/s over Vulkan against about 1 340 for `q4tp`. A token over Vulkan is bound by the host's command
-encoding (about 1 100 dispatches a token), where CUDA replays a recorded graph.
+`q8_2f`: 31.1 / 29.0 / 30.0 tok/s and 8.2 / 8.7 / 10.0 GB at 1 000 / 4 000 / 16 000 tokens; it reads a prompt at
+about 480 tok/s over Vulkan against about 1 300 for `q4tp`.
 
 
-## Metal
+## Metal · Apple M4
 
-Metal is the default backend on a Mac and the engine's Metal graphs carry this model's layers; this release was
-measured on NVIDIA cards only.
+Stand: MacBook Air M4 (24 GB), Metal (the default backend on a Mac), a release build of the branch above. The Air has
+no fan and the base M4's memory bus; it slows down under a long load, and the runs went one after another.
+
+**Answers**, `cortiq run --greedy --no-think`, 256 tokens, two prompts of each kind:
+
+| prompts | with drafts, tok/s | without, tok/s | drafts accepted |
+|---|---:|---:|---:|
+| code | **14.4** | 9.5 | 62–70 % |
+| general questions | **11.6** (10.4–12.7) | 9.7 | 37–47 % |
+
+The text is the same with drafts and without.
+
+![Draft tokens on Metal](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_metal_en.png)
+
+**Prompt length**, `cortiq bench --core`, without drafts, 128 tokens after the prompt:
+
+| prompt, tokens | first token, s | decode, tok/s |
+|---:|---:|---:|
+| 1 000 | 10.4 | 11.3 |
+| 4 000 | 49.6 | 9.4 |
+| 16 000 | 220.3 | 7.6 |
+
+The M4's GPU reads a prompt at 75–95 tokens a second, close to its arithmetic: for long documents take the
+[Turbo file](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf) or an NVIDIA card.
 
 ## Server
 
@@ -278,7 +302,8 @@ MTP: она предлагает черновые токены, а карта п
 
 - **RTX A5000 (24 ГБ), CUDA:** `q4tp` пишет код со скоростью 88 ток/с с черновиками и 51 без них; промпт в
   32 000 токенов читается за 23 с.
-- **Та же карта, Vulkan:** 39,7 ток/с на коде с черновиками, 34,2 без них.
+- **Та же карта, Vulkan:** 57,5 ток/с на коде с черновиками, 49,3 без них.
+- **Apple M4 (MacBook Air), Metal:** 14,4 ток/с на коде с черновиками, 9,5 без них.
 - Жадный текст `q8_2f` совпадает с Transformers float32 на текстовых эталонных промптах, на CUDA и Vulkan.
 - Длинные документы при неизменной памяти карты: [SenseNova-Loop-9B-Turbo-cmf](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf).
 
@@ -336,31 +361,52 @@ CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Напиши фун
 
 | запросы | с черновиками, ток/с | без, ток/с | принято черновиков |
 |---|---:|---:|---:|
-| код | **39,7** (32,9–47,3) | 34,2 | 35–58 % |
-| общие вопросы | **33,5** (30,4–37,1) | 33,0 | 32–40 % |
+| код | **57,5** (47,9–63,7) | 49,3 | 38–61 % |
+| общие вопросы | 42,4 (35,8–45,4) | **47,4** | 23–36 % |
 
-Через Vulkan черновики окупаются на коде и не на общих вопросах, а четыре ответа из восьми разошлись с обычным жадным текстом на почти равном выборе: пакет, проверяющий черновики, округляет иначе, чем граф одного токена. Голова черновиков тоже читает промпт: до первого токена промпта в 13 185 токенов 40,5 с с
-черновиками и 26,2 с с `CMF_MTP=0`, который их выключает.
+Через Vulkan черновики окупаются только на коде; на общих вопросах токен без них быстрее (`CMF_MTP=0` их выключает).
+Четыре ответа из восьми разошлись с обычным жадным текстом на почти равном выборе: пакет, проверяющий черновики,
+округляет иначе, чем граф одного токена. Голова черновиков тоже читает промпт: до первого токена промпта в 13 185
+токенов 16,4–17,1 с с черновиками и 12,8–14,6 с без них.
 
 ![Черновые токены на Vulkan](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_vulkan_ru.png)
 
 | промпт, токенов | первый токен, с | декод, ток/с | пик памяти карты, ГБ |
 |---:|---:|---:|---:|
-| 1 000 | 1,1 | 33,2 | 4,8 |
-| 4 000 | 3,0 | 32,3 | 5,3 |
-| 16 000 | 11,9 | 31,3 | 6,8 |
-| 32 000 | 25,5 | 28,8 | 8,5 |
-| 64 000 | 60,2 | 24,3 | 12,1 |
-| 128 000 | 163,3 | 19,3 | 19,4 |
+| 1 000 | 0,9 | 47,2 | 4,8 |
+| 4 000 | 2,8 | 42,7 | 5,3 |
+| 16 000 | 10,8 | 41,0 | 6,8 |
+| 32 000 | 24,4 | 36,5 | 8,5 |
+| 64 000 | 60,2 | 31,6 | 12,1 |
+| 128 000 | 161,7 | 23,5 | 19,4 |
 
-`q8_2f`: 25,2 / 24,4 / 23,1 ток/с и 8,2 / 8,7 / 10,0 ГБ при 1 000 / 4 000 / 16 000 токенов; промпт он читает через
-Vulkan примерно на 480 ток/с против 1 340 у `q4tp`. Токен на Vulkan упирается в кодирование команд на хосте (около
-1 100 диспетчей на токен), а CUDA проигрывает записанный граф.
+`q8_2f`: 31,1 / 29,0 / 30,0 ток/с и 8,2 / 8,7 / 10,0 ГБ при 1 000 / 4 000 / 16 000 токенов; промпт он читает через
+Vulkan примерно на 480 ток/с против 1 300 у `q4tp`.
 
-### Metal
+### Metal · Apple M4
 
-Metal — бэкенд по умолчанию на Mac, и графы Metal в движке берут слои этой модели; этот релиз измерен только на
-картах NVIDIA.
+Стенд: MacBook Air M4 (24 ГБ), Metal (бэкенд по умолчанию на Mac), релизная сборка ветки выше. У Air нет
+вентилятора и базовая шина памяти M4; под долгой нагрузкой он замедляется, прогоны шли один за другим.
+
+**Ответы**, `cortiq run --greedy --no-think`, 256 токенов, по два запроса каждого вида:
+
+| запросы | с черновиками, ток/с | без, ток/с | принято черновиков |
+|---|---:|---:|---:|
+| код | **14,4** | 9,5 | 62–70 % |
+| общие вопросы | **11,6** (10,4–12,7) | 9,7 | 37–47 % |
+
+Текст с черновиками и без одинаковый.
+
+![Черновые токены на Metal](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_metal_ru.png)
+
+| промпт, токенов | первый токен, с | декод, ток/с |
+|---:|---:|---:|
+| 1 000 | 10,4 | 11,3 |
+| 4 000 | 49,6 | 9,4 |
+| 16 000 | 220,3 | 7,6 |
+
+GPU M4 читает промпт со скоростью 75–95 токенов в секунду, близко к пределу своей арифметики: для длинных документов
+берите [Turbo-файл](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf) или карту NVIDIA.
 
 ### Сервер
 
@@ -450,7 +496,8 @@ Apache-2.0, как у оригинала. Веса переведены в CMF �
 可以读图，上下文长度 512K。文件保留了 MTP 头：它生成草稿 token，显卡一次性批量验证。
 
 - RTX A5000（24 GB）+ CUDA：`q4tp` 写代码时用草稿 88 tok/s，不用草稿 51 tok/s；32 000 token 的提示词 23 秒读完。
-- 同一张卡 + Vulkan：代码用草稿 39.7 tok/s，不用 34.2。
+- 同一张卡 + Vulkan：代码用草稿 57.5 tok/s，不用 49.3。
+- Apple M4（MacBook Air）+ Metal：代码用草稿 14.4 tok/s，不用 9.5。
 - `q8_2f` 的贪心输出与 Transformers float32 在文本参考提示词上一致（CUDA 与 Vulkan）。
 - 长文档且显存不增长：[SenseNova-Loop-9B-Turbo-cmf](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf)。
 
@@ -504,28 +551,46 @@ wikitext-2 困惑度（前 2048 个 token）：Transformers float32 11.90，`q8_
 
 | 请求 | 用草稿，tok/s | 不用，tok/s | 草稿接受率 |
 |---|---:|---:|---:|
-| 代码 | 39.7（32.9–47.3） | 34.2 | 35–58 % |
-| 通用问题 | 33.5（30.4–37.1） | 33.0 | 32–40 % |
+| 代码 | 57.5（47.9–63.7） | 49.3 | 38–61 % |
+| 通用问题 | 42.4（35.8–45.4） | 47.4 | 23–36 % |
 
-在 Vulkan 上，草稿只在代码上有收益，通用问题上没有；8 个回答中有 4 个在近似并列处与普通贪心文本分开：验证草稿的批处理与单 token 图的舍入不同。草稿头也要读取提示词：13 185 token 的提示词，用草稿时首个 token 需要 40.5 秒，用 `CMF_MTP=0` 关闭草稿时 26.2 秒。
+在 Vulkan 上，草稿只在代码上有收益；通用问题上不用草稿每个 token 更快（`CMF_MTP=0` 关闭草稿）。8 个回答中有 4 个在近似并列处与普通贪心文本分开：验证草稿的批处理与单 token 图的舍入不同。草稿头也要读取提示词：13 185 token 的提示词，用草稿时首个 token 需要 16.4–17.1 秒，不用时 12.8–14.6 秒。
 
 ![Vulkan 上的草稿 token](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_vulkan_zh.png)
 
 | 提示词，token | 首个 token，秒 | 解码，tok/s | 显存峰值，GB |
 |---:|---:|---:|---:|
-| 1 000 | 1.1 | 33.2 | 4.8 |
-| 4 000 | 3.0 | 32.3 | 5.3 |
-| 16 000 | 11.9 | 31.3 | 6.8 |
-| 32 000 | 25.5 | 28.8 | 8.5 |
-| 64 000 | 60.2 | 24.3 | 12.1 |
-| 128 000 | 163.3 | 19.3 | 19.4 |
+| 1 000 | 0.9 | 47.2 | 4.8 |
+| 4 000 | 2.8 | 42.7 | 5.3 |
+| 16 000 | 10.8 | 41.0 | 6.8 |
+| 32 000 | 24.4 | 36.5 | 8.5 |
+| 64 000 | 60.2 | 31.6 | 12.1 |
+| 128 000 | 161.7 | 23.5 | 19.4 |
 
-`q8_2f`：1 000 / 4 000 / 16 000 token 时 25.2 / 24.4 / 23.1 tok/s，显存 8.2 / 8.7 / 10.0 GB；它在 Vulkan 上读提示词约 480 tok/s，`q4tp` 约 1 340。
-Vulkan 上的每个 token 受主机端命令编码限制（每个 token 约 1 100 次 dispatch），而 CUDA 重放录制好的图。
+`q8_2f`：1 000 / 4 000 / 16 000 token 时 31.1 / 29.0 / 30.0 tok/s，显存 8.2 / 8.7 / 10.0 GB；它在 Vulkan 上读提示词约 480 tok/s，`q4tp` 约 1 300。
 
-### Metal
+### Metal · Apple M4
 
-Metal 是 Mac 上的默认后端，引擎的 Metal 图支持该模型的各层；本版本只在 NVIDIA 显卡上测量过。
+测试平台：MacBook Air M4（24 GB），Metal（Mac 上的默认后端），上述分支的 release 构建。Air 没有风扇，内存总线为 M4 基础款；长时间负载下会降速，各项测试依次进行。
+
+**回答**，`cortiq run --greedy --no-think`，256 个 token，每类两个提示词：
+
+| 请求 | 用草稿，tok/s | 不用，tok/s | 草稿接受率 |
+|---|---:|---:|---:|
+| 代码 | 14.4 | 9.5 | 62–70 % |
+| 通用问题 | 11.6（10.4–12.7） | 9.7 | 37–47 % |
+
+有无草稿文本相同。
+
+![Metal 上的草稿 token](https://huggingface.co/infosave/SenseNova-Loop-9B-cmf/resolve/main/assets/drafts_metal_zh.png)
+
+| 提示词，token | 首个 token，秒 | 解码，tok/s |
+|---:|---:|---:|
+| 1 000 | 10.4 | 11.3 |
+| 4 000 | 49.6 | 9.4 |
+| 16 000 | 220.3 | 7.6 |
+
+M4 的 GPU 读提示词约每秒 75–95 个 token，接近其算力上限：长文档请用 [Turbo 文件](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf) 或 NVIDIA 显卡。
 
 ### 服务器
 

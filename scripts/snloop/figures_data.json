@@ -120,8 +120,8 @@
     "ctx": 1000,
     "prompt_tokens": 1000,
     "prompt_tps": 922.9,
-    "decode": 33.2,
-    "ttft": 1.08,
+    "decode": 47.2,
+    "ttft": 0.88,
     "vram_gb": 4.78,
     "rss_gb": 4.65
    },
@@ -129,8 +129,8 @@
     "ctx": 4000,
     "prompt_tokens": 4000,
     "prompt_tps": 1335.9,
-    "decode": 32.3,
-    "ttft": 2.99,
+    "decode": 42.7,
+    "ttft": 2.77,
     "vram_gb": 5.34,
     "rss_gb": 4.65
    },
@@ -138,8 +138,8 @@
     "ctx": 16000,
     "prompt_tokens": 16000,
     "prompt_tps": 1341.4,
-    "decode": 31.3,
-    "ttft": 11.93,
+    "decode": 41.0,
+    "ttft": 10.83,
     "vram_gb": 6.75,
     "rss_gb": 4.65
    },
@@ -147,8 +147,8 @@
     "ctx": 32000,
     "prompt_tokens": 32000,
     "prompt_tps": 1254.5,
-    "decode": 28.8,
-    "ttft": 25.51,
+    "decode": 36.5,
+    "ttft": 24.38,
     "vram_gb": 8.47,
     "rss_gb": 4.65
    },
@@ -156,7 +156,7 @@
     "ctx": 64000,
     "prompt_tokens": 64000,
     "prompt_tps": 1062.6,
-    "decode": 24.3,
+    "decode": 31.6,
     "ttft": 60.23,
     "vram_gb": 12.1,
     "rss_gb": 4.65
@@ -165,8 +165,8 @@
     "ctx": 128000,
     "prompt_tokens": 128000,
     "prompt_tps": 783.7,
-    "decode": 19.3,
-    "ttft": 163.33,
+    "decode": 23.5,
+    "ttft": 161.69,
     "vram_gb": 19.37,
     "rss_gb": 4.65
    }
@@ -176,8 +176,8 @@
     "ctx": 16000,
     "prompt_tokens": 16000,
     "prompt_tps": 413.6,
-    "decode": 33.1,
-    "ttft": 38.68,
+    "decode": 45.5,
+    "ttft": 28.35,
     "vram_gb": 5.74,
     "rss_gb": 8.92
    },
@@ -185,8 +185,8 @@
     "ctx": 32000,
     "prompt_tokens": 32000,
     "prompt_tps": 471.3,
-    "decode": 33.1,
-    "ttft": 67.89,
+    "decode": 45.5,
+    "ttft": 53.73,
     "vram_gb": 5.74,
     "rss_gb": 11.34
    },
@@ -194,8 +194,8 @@
     "ctx": 64000,
     "prompt_tokens": 64000,
     "prompt_tps": 411.1,
-    "decode": 33.1,
-    "ttft": 155.68,
+    "decode": 46.6,
+    "ttft": 105.92,
     "vram_gb": 5.74,
     "rss_gb": 16.77
    },
@@ -203,29 +203,41 @@
     "ctx": 128000,
     "prompt_tokens": 128000,
     "prompt_tps": 401.7,
-    "decode": 33.3,
-    "ttft": 318.66,
-    "vram_gb": 5.82,
+    "decode": 46.2,
+    "ttft": 212.54,
+    "vram_gb": 5.78,
     "rss_gb": 27.59
    },
    {
     "ctx": 250000,
     "prompt_tokens": 250000,
     "prompt_tps": 415.0,
-    "decode": 33.5,
-    "ttft": 602.36,
-    "vram_gb": 5.82,
+    "decode": 45.6,
+    "ttft": 406.17,
+    "vram_gb": 5.76,
     "rss_gb": 41.95
    }
   ],
   "survey": {
    "code": [
-    39.7,
-    34.2
+    57.5,
+    49.3
    ],
    "general": [
-    33.5,
-    33.0
+    42.4,
+    47.4
+   ]
+  }
+ },
+ "metal": {
+  "survey": {
+   "code": [
+    14.4,
+    9.5
+   ],
+   "general": [
+    11.6,
+    9.7
    ]
   }
  }

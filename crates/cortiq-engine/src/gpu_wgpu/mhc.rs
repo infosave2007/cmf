@@ -45,14 +45,104 @@ fn mhc_route(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid
     }
     storageBarrier();
     workgroupBarrier();
-    var acc: array<f32, 9>;
-    for (var k = 0u; k < 9u; k = k + 1u) { acc[k] = 0.0; }
-    for (var e = t; e < n; e = e + 256u) {
-        let x = r[rb + e];
-        acc[0] = acc[0] + x * x;
-        for (var k = 0u; k < 8u; k = k + 1u) { acc[k + 1u] = acc[k + 1u] + w[k * n + e] * x; }
+    // Nine scalar sums, not an indexed array: the array lived in local memory and the
+    // loop took ~100 us on an RTX A5000 (SenseNova-Loop-9B, 8192 lanes). Same sums,
+    // same order.
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0; var a4 = 0.0;
+    var a5 = 0.0; var a6 = 0.0; var a7 = 0.0; var a8 = 0.0;
+    // Four lanes' loads in flight before their sums, which keep the lane order: one
+    // workgroup reads 288 KB here and waits on each load otherwise.
+    var e = t;
+    loop {
+        if (e + 768u >= n) { break; }
+        let x0 = r[rb + e];
+        let w00 = w[e];
+        let w01 = w[n + e];
+        let w02 = w[2u * n + e];
+        let w03 = w[3u * n + e];
+        let w04 = w[4u * n + e];
+        let w05 = w[5u * n + e];
+        let w06 = w[6u * n + e];
+        let w07 = w[7u * n + e];
+        let x1 = r[rb + e + 256u];
+        let w10 = w[e + 256u];
+        let w11 = w[n + e + 256u];
+        let w12 = w[2u * n + e + 256u];
+        let w13 = w[3u * n + e + 256u];
+        let w14 = w[4u * n + e + 256u];
+        let w15 = w[5u * n + e + 256u];
+        let w16 = w[6u * n + e + 256u];
+        let w17 = w[7u * n + e + 256u];
+        let x2 = r[rb + e + 512u];
+        let w20 = w[e + 512u];
+        let w21 = w[n + e + 512u];
+        let w22 = w[2u * n + e + 512u];
+        let w23 = w[3u * n + e + 512u];
+        let w24 = w[4u * n + e + 512u];
+        let w25 = w[5u * n + e + 512u];
+        let w26 = w[6u * n + e + 512u];
+        let w27 = w[7u * n + e + 512u];
+        let x3 = r[rb + e + 768u];
+        let w30 = w[e + 768u];
+        let w31 = w[n + e + 768u];
+        let w32 = w[2u * n + e + 768u];
+        let w33 = w[3u * n + e + 768u];
+        let w34 = w[4u * n + e + 768u];
+        let w35 = w[5u * n + e + 768u];
+        let w36 = w[6u * n + e + 768u];
+        let w37 = w[7u * n + e + 768u];
+        a0 = a0 + x0 * x0;
+        a1 = a1 + w00 * x0;
+        a2 = a2 + w01 * x0;
+        a3 = a3 + w02 * x0;
+        a4 = a4 + w03 * x0;
+        a5 = a5 + w04 * x0;
+        a6 = a6 + w05 * x0;
+        a7 = a7 + w06 * x0;
+        a8 = a8 + w07 * x0;
+        a0 = a0 + x1 * x1;
+        a1 = a1 + w10 * x1;
+        a2 = a2 + w11 * x1;
+        a3 = a3 + w12 * x1;
+        a4 = a4 + w13 * x1;
+        a5 = a5 + w14 * x1;
+        a6 = a6 + w15 * x1;
+        a7 = a7 + w16 * x1;
+        a8 = a8 + w17 * x1;
+        a0 = a0 + x2 * x2;
+        a1 = a1 + w20 * x2;
+        a2 = a2 + w21 * x2;
+        a3 = a3 + w22 * x2;
+        a4 = a4 + w23 * x2;
+        a5 = a5 + w24 * x2;
+        a6 = a6 + w25 * x2;
+        a7 = a7 + w26 * x2;
+        a8 = a8 + w27 * x2;
+        a0 = a0 + x3 * x3;
+        a1 = a1 + w30 * x3;
+        a2 = a2 + w31 * x3;
+        a3 = a3 + w32 * x3;
+        a4 = a4 + w33 * x3;
+        a5 = a5 + w34 * x3;
+        a6 = a6 + w35 * x3;
+        a7 = a7 + w36 * x3;
+        a8 = a8 + w37 * x3;
+        e = e + 1024u;
     }
-    for (var k = 0u; k < 9u; k = k + 1u) { red[k * 256u + t] = acc[k]; }
+    for (; e < n; e = e + 256u) {
+        let x = r[rb + e];
+        a0 = a0 + x * x;
+        a1 = a1 + w[e] * x;
+        a2 = a2 + w[n + e] * x;
+        a3 = a3 + w[2u * n + e] * x;
+        a4 = a4 + w[3u * n + e] * x;
+        a5 = a5 + w[4u * n + e] * x;
+        a6 = a6 + w[5u * n + e] * x;
+        a7 = a7 + w[6u * n + e] * x;
+        a8 = a8 + w[7u * n + e] * x;
+    }
+    red[t] = a0; red[256u + t] = a1; red[512u + t] = a2; red[768u + t] = a3; red[1024u + t] = a4;
+    red[1280u + t] = a5; red[1536u + t] = a6; red[1792u + t] = a7; red[2048u + t] = a8;
     workgroupBarrier();
     for (var st = 128u; st > 0u; st = st >> 1u) {
         if (t < st) {
@@ -428,12 +518,11 @@ pub(crate) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             };
             let (route, merge) = (mk("mhc_route", ROUTE_SRC, "mhc_route"), mk("mhc_merge", MERGE_SRC, "mhc_merge"));
             let (route_layout, merge_layout) = (route.get_bind_group_layout(0), merge.get_bind_group_layout(0));
-            let p = Pipes { route, merge, route_layout, merge_layout };
             if let Some(e) = pollster::block_on(sc.pop()) {
                 tracing::warn!("mHC kernels rejected: {e}");
                 return None;
             }
-            Some(p)
+            Some(Pipes { route, merge, route_layout, merge_layout })
         })
         .as_ref()
 }
@@ -534,5 +623,15 @@ mod mhc4_tests {
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
             .validate(&module)
             .expect("four-stream mHC WGSL must validate");
+    }
+
+    #[test]
+    fn two_stream_wgsl_validates() {
+        for (name, src) in [("route", super::ROUTE_SRC), ("merge", super::MERGE_SRC)] {
+            let module = wgpu::naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name} WGSL must parse: {e}"));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name} WGSL must validate: {e:?}"));
+        }
     }
 }
