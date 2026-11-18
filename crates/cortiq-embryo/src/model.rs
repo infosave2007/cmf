@@ -2638,7 +2638,11 @@ mod gpu {
                         &ind_i,
                     );
                 }
-                cmd.swiglu_fwd(&mo.gte2, &mo.up2, &mo.hh2, ne * cap * i);
+                if self.skill.is_none() {
+                    cmd.swiglu_fwd_rows(&mo.gte2, &mo.up2, &mo.hh2, ne, cap, i, &mo.indir2, ind2_off);
+                } else {
+                    cmd.swiglu_fwd(&mo.gte2, &mo.up2, &mo.hh2, ne * cap * i);
+                }
                 for e in 0..ne {
                     let ind_h = GemmDyn {
                         indirect: Some((&mo.indir2, (ind2_off + (ne + e) * 3) * 4)),
@@ -2669,7 +2673,12 @@ mod gpu {
                     );
                 }
             }
-            cmd.swiglu_fwd(&mo.gte, &mo.up, &mo.hh, ne * cap * i);
+            if self.skill.is_none() {
+                cmd.swiglu_fwd_rows(&mo.gte, &mo.up, &mo.hh, ne, cap, i, &d.indir, ind_off);
+            } else {
+                // a skill mask reads every slot of hh
+                cmd.swiglu_fwd(&mo.gte, &mo.up, &mo.hh, ne * cap * i);
+            }
             if let Some(sk) = self.skill.as_ref() {
                 if let (Some(mi), true) = (sk.slot(l), sk.groups > 1) {
                     // every routed expert's neurons under their own mask
@@ -3020,14 +3029,11 @@ mod gpu {
                         );
                     }
                 }
-                cmd.swiglu_bwd(
-                    &mo.gte,
-                    &mo.up,
-                    &s.moe_dffn,
-                    &s.moe_dgte,
-                    &s.moe_dup,
-                    ne * cap * i,
-                );
+                if self.skill.is_none() {
+                    cmd.swiglu_bwd_rows(&mo.gte, &mo.up, &s.moe_dffn, &s.moe_dgte, &s.moe_dup, ne, cap, i, &d.indir, ind_off);
+                } else {
+                    cmd.swiglu_bwd(&mo.gte, &mo.up, &s.moe_dffn, &s.moe_dgte, &s.moe_dup, ne * cap * i);
+                }
                 for e in 0..ne {
                     let ind_h = GemmDyn {
                         indirect: Some((&d.indir, (ind_off + (ne + e) * 3) * 4)),
@@ -3197,14 +3203,11 @@ mod gpu {
                             &kdyn,
                         );
                     }
-                    cmd.swiglu_bwd(
-                        &mo.gte2,
-                        &mo.up2,
-                        &s.moe_dffn,
-                        &s.moe_dgte,
-                        &s.moe_dup,
-                        ne * cap * i,
-                    );
+                    if self.skill.is_none() {
+                        cmd.swiglu_bwd_rows(&mo.gte2, &mo.up2, &s.moe_dffn, &s.moe_dgte, &s.moe_dup, ne, cap, i, &mo.indir2, 0);
+                    } else {
+                        cmd.swiglu_bwd(&mo.gte2, &mo.up2, &s.moe_dffn, &s.moe_dgte, &s.moe_dup, ne * cap * i);
+                    }
                     for e in 0..ne {
                         let ind_h = GemmDyn {
                             indirect: Some((&mo.indir2, (ne + e) * 3 * 4)),
@@ -7870,15 +7873,19 @@ fn head_table_enabled() -> bool {
     !env_off && HEAD_TABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Anchor backward dispatch shape: one range per sequence (default — the
-/// measured faster shape on both backends: Metal B8/T512 probe 32.0 vs
-/// 34.0 ms, RTX PRO 4000 303.6 vs 326.5 ms, full step 1069 vs 1103 ms) or
-/// one batched range over all sequences (`CMF_ANCHOR_BWD_BATCH=1` at
-/// startup, or [`ANCHOR_BWD_BATCH`] at runtime for in-process A/B). The
-/// gradients agree to ≤ 3e-7 rel (identical without sinks).
-pub static ANCHOR_BWD_BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Band tile skipping in the bounded anchor's GEMMs (`GemmBand`; Metal
-/// only — the WGSL GEMM computes the full tiles). Exact, on by default;
+/// Anchor backward dispatch shape: one range per sequence (the default on
+/// Metal and wgpu — the measured faster shape there: Metal B8/T512 probe
+/// 32.0 vs 34.0 ms, RTX PRO 4000 303.6 vs 326.5 ms, full step 1069 vs
+/// 1103 ms) or one batched range over all sequences (the default on CUDA:
+/// one sequence's GEMM is 64 tiles, a B200 has 148 SMs; the 340M step at
+/// B8×1024 189 → 159 ms). `CMF_ANCHOR_BWD_BATCH=1`/`0` at startup forces
+/// one; [`ANCHOR_BWD_BATCH`] switches at runtime for in-process A/B. The
+/// same bits either way: the sink fold adds to the gradient one sequence at
+/// a time in both shapes.
+pub static ANCHOR_BWD_BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(cfg!(feature = "cuda"));
+/// Band tile skipping in the bounded anchor's GEMMs (`GemmBand`: the Metal
+/// GEMM and the WGSL 128 entry skip output tiles and K blocks off the band).
+/// Exact, on by default;
 /// `CMF_ANCHOR_BAND=0` at startup or [`ANCHOR_BAND_OFF`] for in-process A/B.
 pub static ANCHOR_BAND_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn anchor_band_on() -> bool {
@@ -7888,10 +7895,13 @@ fn anchor_band_on() -> bool {
 }
 
 fn anchor_bwd_seq() -> bool {
-    static ENV_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let env_on = *ENV_ON
-        .get_or_init(|| std::env::var("CMF_ANCHOR_BWD_BATCH").ok().as_deref() == Some("1"));
-    !(env_on || ANCHOR_BWD_BATCH.load(std::sync::atomic::Ordering::Relaxed))
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("CMF_ANCHOR_BWD_BATCH").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    !env.unwrap_or_else(|| ANCHOR_BWD_BATCH.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn hk_simt() -> bool {

@@ -945,6 +945,17 @@ impl<'a> Cmd<'a> {
         self.grid1(n, 256);
     }
 
+    /// The Vulkan/CUDA row-bounded form; Metal runs every row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_fwd_rows(&self, gate: &GBuf, up: &GBuf, h: &GBuf, ne: usize, cap: usize, i: usize, _indir: &GBuf, _ioff: usize) {
+        self.swiglu_fwd(gate, up, h, ne * cap * i)
+    }
+    /// The Vulkan/CUDA row-bounded form; Metal runs every row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_bwd_rows(&self, gate: &GBuf, up: &GBuf, dh: &GBuf, dgate: &GBuf, dup: &GBuf, ne: usize, cap: usize, i: usize, _indir: &GBuf, _ioff: usize) {
+        self.swiglu_bwd(gate, up, dh, dgate, dup, ne * cap * i)
+    }
+
     /// dgate, dup from dh.
     pub fn swiglu_bwd(
         &self,
