@@ -44,7 +44,7 @@ no ML framework. Prompts under 8192 tokens run exact attention and the draft tok
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-Turbo-cmf sensenova-loop-9b-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=262144 cortiq run sensenova-loop-9b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
@@ -52,11 +52,11 @@ CMF_GPU=cuda CMF_MAX_SEQ=262144 cortiq run sensenova-loop-9b-turbo.cmf --prompt-
 Without CUDA (Vulkan, DX12, Metal), and with the rows of a long prompt in files instead of RAM:
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli
+cargo install cortiq-cli
 CMF_MAX_SEQ=262144 cortiq run sensenova-loop-9b-turbo.cmf --prompt-file report.txt --greedy --no-think --o1-spill /mnt/ssd/cortiq
 ```
 
-The file needs the cortiq release after 0.9.4; until it is out, build from the branch above. `CMF_MAX_SEQ` lifts
+The file needs cortiq 0.9.5 or newer. `CMF_MAX_SEQ` lifts
 the default cap of 32 768 tokens (the model holds 524 288). `--greedy` turns on the draft tokens, `--no-think` asks
 for a direct answer.
 
@@ -154,7 +154,7 @@ The two backends were measured on the same card with the same files, but read ea
 
 ### CUDA · RTX A5000
 
-Stand: NVIDIA RTX A5000 (24 GB), the CUDA backend (`CMF_GPU=cuda`), a release build of the branch above.
+Stand: NVIDIA RTX A5000 (24 GB), the CUDA backend (`CMF_GPU=cuda`), cortiq 0.9.5, a release build.
 `cortiq bench --core` without drafts, 128 tokens after a prompt of that length; the standard file is
 `sensenova-loop-9b-q4tp.cmf`, the same weights.
 
@@ -182,7 +182,7 @@ reply), CUDA:
 
 ### Vulkan · RTX A5000
 
-Stand: the same NVIDIA RTX A5000 (24 GB), over Vulkan, a release build of the branch above. The same bench.
+Stand: the same NVIDIA RTX A5000 (24 GB), over Vulkan, cortiq 0.9.5, a release build. The same bench.
 
 ![Standard and turbo over Vulkan](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf/resolve/main/assets/turbo_vulkan_en.png)
 
@@ -203,7 +203,7 @@ at 60 000 and 120 000).
 
 ### Metal · Apple M4
 
-Stand: MacBook Air M4 (24 GB, no fan, the base M4's memory bus), Metal, a release build of the branch above.
+Stand: MacBook Air M4 (24 GB, no fan, the base M4's memory bus), Metal, cortiq 0.9.5, a release build.
 
 A 16 000-token prompt: the first token in 212.4 s, then 9.5 tok/s, with 347 MB of keys, values and
 far-field state, against 220.3 s, 7.6 tok/s and 1 942 MB for the standard file. Planted facts in 60 000
@@ -239,7 +239,7 @@ faster one for long prompts as well.
 cortiq far-turbo sensenova-loop-9b-q4tp.cmf sensenova-loop-9b-turbo.cmf --exact-weights keep_sn9_long.bin
 ```
 
-`keep_sn9_long.bin` is in this repository and in [scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop):
+`keep_sn9_long.bin` is in this repository and in [scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop):
 112 weights fitted by `scripts/dory/router/q27_feat.py` on 24 prompts of 60 000 characters with a planted fact.
 
 ## License
@@ -270,13 +270,13 @@ ML-фреймворков. Промпты короче 8192 токенов ид�
 ### Быстрый старт
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-Turbo-cmf sensenova-loop-9b-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=262144 cortiq run sensenova-loop-9b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
 Без CUDA (Vulkan, DX12, Metal) — сборка без `--features cuda`, запуск без `CMF_GPU=cuda`; `--o1-spill DIR` держит
-строки длинного промпта в файлах вместо RAM. Нужен релиз cortiq после 0.9.4; до его выхода соберите из ветки выше.
+строки длинного промпта в файлах вместо RAM. Нужен cortiq 0.9.5 или новее.
 `CMF_MAX_SEQ` поднимает предел в 32 768 токенов (модель вмещает 524 288).
 
 ### Сервер
@@ -346,7 +346,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 #### CUDA · RTX A5000
 
-Стенд: NVIDIA RTX A5000 (24 ГБ), бэкенд CUDA (`CMF_GPU=cuda`), релизная сборка ветки выше. `cortiq bench --core`
+Стенд: NVIDIA RTX A5000 (24 ГБ), бэкенд CUDA (`CMF_GPU=cuda`), cortiq 0.9.5, релизная сборка. `cortiq bench --core`
 без черновиков, 128 токенов после промпта; обычный файл — `sensenova-loop-9b-q4tp.cmf`, те же веса.
 
 ![Обычный файл и турбо на CUDA](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf/resolve/main/assets/turbo_cuda_ru.png)
@@ -372,7 +372,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 #### Vulkan · RTX A5000
 
-Стенд: та же NVIDIA RTX A5000 (24 ГБ) через Vulkan, релизная сборка ветки выше, тот же бенчмарк.
+Стенд: та же NVIDIA RTX A5000 (24 ГБ) через Vulkan, cortiq 0.9.5, релизная сборка, тот же бенчмарк.
 
 ![Обычный файл и турбо на Vulkan](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf/resolve/main/assets/turbo_vulkan_ru.png)
 
@@ -393,7 +393,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 #### Metal · Apple M4
 
-Стенд: MacBook Air M4 (24 ГБ, без вентилятора, базовая шина памяти M4), Metal, релизная сборка ветки выше.
+Стенд: MacBook Air M4 (24 ГБ, без вентилятора, базовая шина памяти M4), Metal, cortiq 0.9.5, релизная сборка.
 
 Промпт в 16 000 токенов: первый токен через 212,4 с, затем 9,5 ток/с, ключи, значения и состояние дальнего поля
 занимают 347 МБ; у обычного файла 220,3 с, 7,6 ток/с и 1 942 МБ. Факты в 60 000 символов (13 000–15 000
@@ -416,7 +416,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 cortiq far-turbo sensenova-loop-9b-q4tp.cmf sensenova-loop-9b-turbo.cmf --exact-weights keep_sn9_long.bin
 ```
 
-`keep_sn9_long.bin` лежит в этом репозитории и в [scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop).
+`keep_sn9_long.bin` лежит в этом репозитории и в [scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop).
 
 ### Лицензия
 
@@ -440,13 +440,13 @@ SenseNova-Loop 把 24 层运行两遍，每一遍都有自己的键和值，所�
 ### 快速开始
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-Turbo-cmf sensenova-loop-9b-turbo.cmf --local-dir .
 CMF_GPU=cuda CMF_MAX_SEQ=262144 cortiq run sensenova-loop-9b-turbo.cmf --prompt-file report.txt --greedy --no-think
 ```
 
 不用 CUDA（Vulkan、DX12、Metal）时，编译不加 `--features cuda`，运行不设 `CMF_GPU=cuda`；`--o1-spill DIR` 把长提示词的行放到文件里而不是内存。
-需要 0.9.4 之后的 cortiq 版本；发布之前请从上面的分支编译。`CMF_MAX_SEQ` 提高默认 32 768 token 的上限（模型最多 524 288）。
+需要 cortiq 0.9.5 或更新版本。`CMF_MAX_SEQ` 提高默认 32 768 token 的上限（模型最多 524 288）。
 
 ### 服务器
 
@@ -510,7 +510,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 #### CUDA · RTX A5000
 
-测试平台：NVIDIA RTX A5000（24 GB），CUDA 后端（`CMF_GPU=cuda`），上述分支的 release 构建。`cortiq bench --core`，不用草稿，
+测试平台：NVIDIA RTX A5000（24 GB），CUDA 后端（`CMF_GPU=cuda`），cortiq 0.9.5 release 构建。`cortiq bench --core`，不用草稿，
 提示词之后 128 个 token；普通文件是 `sensenova-loop-9b-q4tp.cmf`，权重相同。
 
 ![CUDA 上的普通文件与 Turbo](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf/resolve/main/assets/turbo_cuda_zh.png)
@@ -535,7 +535,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 #### Vulkan · RTX A5000
 
-测试平台：同一张 NVIDIA RTX A5000（24 GB），走 Vulkan，上述分支的 release 构建，相同的基准测试。
+测试平台：同一张 NVIDIA RTX A5000（24 GB），走 Vulkan，cortiq 0.9.5 release 构建，相同的基准测试。
 
 ![Vulkan 上的普通文件与 Turbo](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf/resolve/main/assets/turbo_vulkan_zh.png)
 
@@ -553,7 +553,7 @@ Vulkan 上的植入事实：同样的 12 个提示词，60 000、120 000 和 240
 
 #### Metal · Apple M4
 
-测试平台：MacBook Air M4（24 GB，无风扇，M4 基础款内存总线），Metal，上述分支的 release 构建。
+测试平台：MacBook Air M4（24 GB，无风扇，M4 基础款内存总线），Metal，cortiq 0.9.5 release 构建。
 
 16 000 token 的提示词：首个 token 212.4 秒，之后 9.5 tok/s，键、值和远场状态占 347 MB；普通文件为 220.3 秒、7.6 tok/s、1 942 MB。60 000 字符（13 000–15 000 个 token）中植入的事实：4 / 4，首个 token 178–203 秒。在 M4 上长提示词用 Turbo 也更快。
 
@@ -570,7 +570,7 @@ Vulkan 上的植入事实：同样的 12 个提示词，60 000、120 000 和 240
 cortiq far-turbo sensenova-loop-9b-q4tp.cmf sensenova-loop-9b-turbo.cmf --exact-weights keep_sn9_long.bin
 ```
 
-`keep_sn9_long.bin` 在本仓库和 [scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop) 中。
+`keep_sn9_long.bin` 在本仓库和 [scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop) 中。
 
 ### 许可证
 

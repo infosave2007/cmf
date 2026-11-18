@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-11-18
+
 ### Added
 - SenseNova-Loop-9B, the release of 2026-11-17 (`sensenova_loop`): its MTP head, which the release ships in
   `mtp.safetensors` outside the weight index, joins the conversion (a sharded checkpoint's sidecar is counted,

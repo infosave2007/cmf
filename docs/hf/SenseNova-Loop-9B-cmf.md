@@ -45,7 +45,7 @@ keep its MTP head, which drafts tokens that the card checks in one batch.
 An NVIDIA card through CUDA, the fastest path:
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-cmf sensenova-loop-9b-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Write a Python function that merges two sorted lists." --greedy --no-think
 ```
@@ -53,12 +53,12 @@ CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Write a Python func
 Vulkan or DX12 (NVIDIA, AMD, Intel), Metal, or the CPU:
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli
+cargo install cortiq-cli
 cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "Describe this image." --no-think
 ```
 
-These files need the cortiq release after 0.9.4. Until it is out, build from the branch above; 0.9.4 reads the
-files and writes the same text, but on a GPU it runs them op by op. `--greedy` turns on the draft tokens, and
+These files need cortiq 0.9.5 or newer; 0.9.4 reads them and writes the same text, but on a GPU it runs them
+op by op. `--greedy` turns on the draft tokens, and
 `--no-think` asks for a direct answer: the model thinks before it answers otherwise, and the thinking counts
 toward `--max-tokens`. `--image` takes a path, a data URL or an HTTP(S) URL and may be repeated.
 
@@ -91,7 +91,7 @@ Perplexity. The chat text is the `q8_2f` file's own greedy answers to 30 held-ou
 
 ## CUDA · RTX A5000
 
-Stand: NVIDIA RTX A5000 (24 GB), the CUDA backend (`CMF_GPU=cuda`), a release build of the branch above.
+Stand: NVIDIA RTX A5000 (24 GB), the CUDA backend (`CMF_GPU=cuda`), cortiq 0.9.5, a release build.
 
 **Answers**, `cortiq run --greedy --no-think`, 256 tokens, four prompts of each kind:
 
@@ -120,8 +120,8 @@ the [Turbo file](https://huggingface.co/infosave/SenseNova-Loop-9B-Turbo-cmf) ho
 
 ## Vulkan · RTX A5000
 
-Stand: the same NVIDIA RTX A5000 (24 GB), over Vulkan (the default backend of a build without `--features cuda`), a
-release build of the branch above.
+Stand: the same NVIDIA RTX A5000 (24 GB), over Vulkan (the default backend of a build without `--features cuda`), cortiq
+0.9.5, a release build.
 
 **Answers**, `cortiq run --greedy --no-think`, 256 tokens, the same prompts:
 
@@ -154,7 +154,7 @@ about 480 tok/s over Vulkan against about 1 300 for `q4tp`.
 
 ## Metal · Apple M4
 
-Stand: MacBook Air M4 (24 GB), Metal (the default backend on a Mac), a release build of the branch above. The Air has
+Stand: MacBook Air M4 (24 GB), Metal (the default backend on a Mac), cortiq 0.9.5, a release build. The Air has
 no fan and the base M4's memory bus; it slows down under a long load, and the runs went one after another.
 
 **Answers**, `cortiq run --greedy --no-think`, 256 tokens, two prompts of each kind:
@@ -283,7 +283,7 @@ cortiq quantize-gptq sn9-f16.cmf --codec q4tp --calib-model sensenova-loop-9b-q8
 ```
 
 `chat_calib.txt` is the `q8_2f` file's own greedy answers to 52 prompts (code, general, instructions, Chinese,
-agent tasks), rendered through the model's chat template. Scripts: [scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop).
+agent tasks), rendered through the model's chat template. Scripts: [scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop).
 
 ## License
 
@@ -310,14 +310,14 @@ MTP: она предлагает черновые токены, а карта п
 ### Быстрый старт
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-cmf sensenova-loop-9b-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Напиши функцию на Python, которая сливает два отсортированных списка." --greedy --no-think
 ```
 
 Без CUDA (Vulkan, DX12, Metal, CPU) — сборка без `--features cuda` и запуск без `CMF_GPU=cuda`.
-Файлам нужен релиз cortiq после 0.9.4; до его выхода соберите из ветки выше. 0.9.4 читает файлы и пишет тот же
-текст, но на GPU выполняет их по одной операции. `--greedy` включает черновые токены, `--no-think` просит ответить
+Файлам нужен cortiq 0.9.5 или новее; 0.9.4 читает файлы и пишет тот же текст, но на GPU выполняет их по одной
+операции. `--greedy` включает черновые токены, `--no-think` просит ответить
 сразу; `--image` принимает путь, data URL или HTTP(S) URL.
 
 | файл | языковая модель | размер | назначение |
@@ -330,7 +330,7 @@ CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Напиши фун
 
 ### CUDA · RTX A5000
 
-Стенд: NVIDIA RTX A5000 (24 ГБ), бэкенд CUDA (`CMF_GPU=cuda`), релизная сборка ветки выше.
+Стенд: NVIDIA RTX A5000 (24 ГБ), бэкенд CUDA (`CMF_GPU=cuda`), cortiq 0.9.5, релизная сборка.
 
 | запросы | с черновиками, ток/с | без, ток/с | принято черновиков |
 |---|---:|---:|---:|
@@ -356,8 +356,8 @@ CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "Напиши фун
 
 ### Vulkan · RTX A5000
 
-Стенд: та же NVIDIA RTX A5000 (24 ГБ) через Vulkan (бэкенд по умолчанию у сборки без `--features cuda`), релизная
-сборка ветки выше.
+Стенд: та же NVIDIA RTX A5000 (24 ГБ) через Vulkan (бэкенд по умолчанию у сборки без `--features cuda`), cortiq
+0.9.5, релизная сборка.
 
 | запросы | с черновиками, ток/с | без, ток/с | принято черновиков |
 |---|---:|---:|---:|
@@ -385,7 +385,7 @@ Vulkan примерно на 480 ток/с против 1 300 у `q4tp`.
 
 ### Metal · Apple M4
 
-Стенд: MacBook Air M4 (24 ГБ), Metal (бэкенд по умолчанию на Mac), релизная сборка ветки выше. У Air нет
+Стенд: MacBook Air M4 (24 ГБ), Metal (бэкенд по умолчанию на Mac), cortiq 0.9.5, релизная сборка. У Air нет
 вентилятора и базовая шина памяти M4; под долгой нагрузкой он замедляется, прогоны шли один за другим.
 
 **Ответы**, `cortiq run --greedy --no-think`, 256 токенов, по два запроса каждого вида:
@@ -479,7 +479,7 @@ cortiq quantize-gptq sn9-f16.cmf --codec q4tp --calib-model sensenova-loop-9b-q8
 ```
 
 `chat_calib.txt` — собственные жадные ответы `q8_2f` на 52 вопроса в шаблоне чата модели. Скрипты:
-[scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop).
+[scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop).
 
 ### Лицензия
 
@@ -504,13 +504,13 @@ Apache-2.0, как у оригинала. Веса переведены в CMF �
 ### 快速开始
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch sensenova-loop9b cortiq-cli --features cuda
+cargo install cortiq-cli --features cuda
 hf download infosave/SenseNova-Loop-9B-cmf sensenova-loop-9b-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run sensenova-loop-9b-q4tp.cmf --prompt "用 Python 写一个合并两个有序列表的函数。" --greedy --no-think
 ```
 
 不用 CUDA（Vulkan、DX12、Metal、CPU）时，编译不加 `--features cuda`，运行不设 `CMF_GPU=cuda`。
-这些文件需要 0.9.4 之后的 cortiq 版本；发布之前请从上面的分支编译。0.9.4 能读取这些文件、输出相同文本，但在 GPU 上逐个算子执行。
+这些文件需要 cortiq 0.9.5 或更新版本；0.9.4 能读取这些文件、输出相同文本，但在 GPU 上逐个算子执行。
 `--greedy` 打开草稿 token，`--no-think` 要求直接回答；`--image` 接受路径、data URL 或 HTTP(S) URL。
 
 | 文件 | 语言模型 | 大小 | 用途 |
@@ -523,7 +523,7 @@ wikitext-2 困惑度（前 2048 个 token）：Transformers float32 11.90，`q8_
 
 ### CUDA · RTX A5000
 
-测试平台：NVIDIA RTX A5000（24 GB），CUDA 后端（`CMF_GPU=cuda`），上述分支的 release 构建。
+测试平台：NVIDIA RTX A5000（24 GB），CUDA 后端（`CMF_GPU=cuda`），cortiq 0.9.5 release 构建。
 
 | 请求 | 用草稿，tok/s | 不用，tok/s | 草稿接受率 |
 |---|---:|---:|---:|
@@ -547,7 +547,7 @@ wikitext-2 困惑度（前 2048 个 token）：Transformers float32 11.90，`q8_
 
 ### Vulkan · RTX A5000
 
-测试平台：同一张 NVIDIA RTX A5000（24 GB），走 Vulkan（不加 `--features cuda` 编译时的默认后端），上述分支的 release 构建。
+测试平台：同一张 NVIDIA RTX A5000（24 GB），走 Vulkan（不加 `--features cuda` 编译时的默认后端），cortiq 0.9.5 release 构建。
 
 | 请求 | 用草稿，tok/s | 不用，tok/s | 草稿接受率 |
 |---|---:|---:|---:|
@@ -571,7 +571,7 @@ wikitext-2 困惑度（前 2048 个 token）：Transformers float32 11.90，`q8_
 
 ### Metal · Apple M4
 
-测试平台：MacBook Air M4（24 GB），Metal（Mac 上的默认后端），上述分支的 release 构建。Air 没有风扇，内存总线为 M4 基础款；长时间负载下会降速，各项测试依次进行。
+测试平台：MacBook Air M4（24 GB），Metal（Mac 上的默认后端），cortiq 0.9.5 release 构建。Air 没有风扇，内存总线为 M4 基础款；长时间负载下会降速，各项测试依次进行。
 
 **回答**，`cortiq run --greedy --no-think`，256 个 token，每类两个提示词：
 
@@ -658,7 +658,7 @@ cortiq quantize-gptq sn9-f16.cmf --codec q4tp --calib-model sensenova-loop-9b-q8
   --calib-chunk-layers 8 --output sensenova-loop-9b-q4tp.cmf
 ```
 
-`chat_calib.txt` 是 `q8_2f` 用模型对话模板对 52 个问题的贪心回答。脚本见 [scripts/snloop](https://github.com/infosave2007/cmf/tree/sensenova-loop9b/scripts/snloop)。
+`chat_calib.txt` 是 `q8_2f` 用模型对话模板对 52 个问题的贪心回答。脚本见 [scripts/snloop](https://github.com/infosave2007/cmf/tree/master/scripts/snloop)。
 
 ### 许可证
 
