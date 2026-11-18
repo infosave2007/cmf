@@ -106,3 +106,8 @@ prompts in its template, 2484 tokens)
   chunks ~460 rows/s; rebuild 3.9 s. Chunk size is not it: CMF_BATCH_K default/512/256 -> 43.8/40.3/38.9 s.
   Follow-up: the wgpu turbo prompt path (query capture on the card, the prefix's chunk graph).
 - Turbo Vulkan (cont.): 64k 155.68 s/33.1/5.74 GB; 128k 318.66/33.3/5.82; 250k (spill) 602.36/33.5/5.82.
+- MTP warm-up over a prompt (`cortiq run --greedy`, drafts on): Vulkan, 13 185 tokens, first token 40.5 s with
+  drafts vs 26.2 s without (release); CUDA 12.6-13.7 s vs ~8. (`run` TTFT includes the first upload/compile, so it
+  is above bench --core.) Batched host eh_proj in `mtp_block_inputs` tried: 37.8 / 23.6 s on the fast build — the
+  same 2.6 s also without drafts, so noise; reverted. The ~14 s are elsewhere (likely the per-row token-graph
+  fallback of the warm-up on wgpu). Follow-up.

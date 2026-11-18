@@ -1,0 +1,232 @@
+{
+ "cuda": {
+  "std": [
+   {
+    "ctx": 1000,
+    "prompt_tokens": 1000,
+    "prompt_tps": 678.2,
+    "decode": 51.9,
+    "ttft": 1.47,
+    "vram_gb": 7.77,
+    "rss_gb": 4.79
+   },
+   {
+    "ctx": 4000,
+    "prompt_tokens": 4000,
+    "prompt_tps": 1714.2,
+    "decode": 50.4,
+    "ttft": 2.33,
+    "vram_gb": 7.99,
+    "rss_gb": 4.8
+   },
+   {
+    "ctx": 16000,
+    "prompt_tokens": 16000,
+    "prompt_tps": 1577.3,
+    "decode": 47.1,
+    "ttft": 10.14,
+    "vram_gb": 8.85,
+    "rss_gb": 4.79
+   },
+   {
+    "ctx": 32000,
+    "prompt_tokens": 32000,
+    "prompt_tps": 1414.8,
+    "decode": 43.5,
+    "ttft": 22.62,
+    "vram_gb": 10.03,
+    "rss_gb": 4.79
+   },
+   {
+    "ctx": 64000,
+    "prompt_tokens": 64000,
+    "prompt_tps": 1207.1,
+    "decode": 38.1,
+    "ttft": 53.02,
+    "vram_gb": 12.19,
+    "rss_gb": 4.79
+   },
+   {
+    "ctx": 128000,
+    "prompt_tokens": 128000,
+    "prompt_tps": 902.3,
+    "decode": 30.5,
+    "ttft": 141.86,
+    "vram_gb": 16.48,
+    "rss_gb": 4.79
+   }
+  ],
+  "turbo": [
+   {
+    "ctx": 16000,
+    "prompt_tokens": 16000,
+    "prompt_tps": 971.6,
+    "decode": 50.8,
+    "ttft": 16.47,
+    "vram_gb": 8.32,
+    "rss_gb": 8.25
+   },
+   {
+    "ctx": 32000,
+    "prompt_tokens": 32000,
+    "prompt_tps": 929.9,
+    "decode": 50.4,
+    "ttft": 34.41,
+    "vram_gb": 8.32,
+    "rss_gb": 9.91
+   },
+   {
+    "ctx": 64000,
+    "prompt_tokens": 64000,
+    "prompt_tps": 910.4,
+    "decode": 50.5,
+    "ttft": 70.3,
+    "vram_gb": 8.32,
+    "rss_gb": 14.51
+   },
+   {
+    "ctx": 128000,
+    "prompt_tokens": 128000,
+    "prompt_tps": 914.9,
+    "decode": 49.9,
+    "ttft": 139.91,
+    "vram_gb": 8.32,
+    "rss_gb": 23.72
+   },
+   {
+    "ctx": 250000,
+    "prompt_tokens": 250000,
+    "prompt_tps": 944.9,
+    "decode": 50.4,
+    "ttft": 264.59,
+    "vram_gb": 8.32,
+    "rss_gb": 34.75
+   }
+  ],
+  "survey": {
+   "code": [
+    88.1,
+    51.0
+   ],
+   "general": [
+    57.9,
+    49.8
+   ]
+  }
+ },
+ "vulkan": {
+  "std": [
+   {
+    "ctx": 1000,
+    "prompt_tokens": 1000,
+    "prompt_tps": 922.9,
+    "decode": 33.2,
+    "ttft": 1.08,
+    "vram_gb": 4.78,
+    "rss_gb": 4.65
+   },
+   {
+    "ctx": 4000,
+    "prompt_tokens": 4000,
+    "prompt_tps": 1335.9,
+    "decode": 32.3,
+    "ttft": 2.99,
+    "vram_gb": 5.34,
+    "rss_gb": 4.65
+   },
+   {
+    "ctx": 16000,
+    "prompt_tokens": 16000,
+    "prompt_tps": 1341.4,
+    "decode": 31.3,
+    "ttft": 11.93,
+    "vram_gb": 6.75,
+    "rss_gb": 4.65
+   },
+   {
+    "ctx": 32000,
+    "prompt_tokens": 32000,
+    "prompt_tps": 1254.5,
+    "decode": 28.8,
+    "ttft": 25.51,
+    "vram_gb": 8.47,
+    "rss_gb": 4.65
+   },
+   {
+    "ctx": 64000,
+    "prompt_tokens": 64000,
+    "prompt_tps": 1062.6,
+    "decode": 24.3,
+    "ttft": 60.23,
+    "vram_gb": 12.1,
+    "rss_gb": 4.65
+   },
+   {
+    "ctx": 128000,
+    "prompt_tokens": 128000,
+    "prompt_tps": 783.7,
+    "decode": 19.3,
+    "ttft": 163.33,
+    "vram_gb": 19.37,
+    "rss_gb": 4.65
+   }
+  ],
+  "turbo": [
+   {
+    "ctx": 16000,
+    "prompt_tokens": 16000,
+    "prompt_tps": 413.6,
+    "decode": 33.1,
+    "ttft": 38.68,
+    "vram_gb": 5.74,
+    "rss_gb": 8.92
+   },
+   {
+    "ctx": 32000,
+    "prompt_tokens": 32000,
+    "prompt_tps": 471.3,
+    "decode": 33.1,
+    "ttft": 67.89,
+    "vram_gb": 5.74,
+    "rss_gb": 11.34
+   },
+   {
+    "ctx": 64000,
+    "prompt_tokens": 64000,
+    "prompt_tps": 411.1,
+    "decode": 33.1,
+    "ttft": 155.68,
+    "vram_gb": 5.74,
+    "rss_gb": 16.77
+   },
+   {
+    "ctx": 128000,
+    "prompt_tokens": 128000,
+    "prompt_tps": 401.7,
+    "decode": 33.3,
+    "ttft": 318.66,
+    "vram_gb": 5.82,
+    "rss_gb": 27.59
+   },
+   {
+    "ctx": 250000,
+    "prompt_tokens": 250000,
+    "prompt_tps": 415.0,
+    "decode": 33.5,
+    "ttft": 602.36,
+    "vram_gb": 5.82,
+    "rss_gb": 41.95
+   }
+  ],
+  "survey": {
+   "code": [
+    39.7,
+    34.2
+   ],
+   "general": [
+    33.5,
+    33.0
+   ]
+  }
+ }
+}
