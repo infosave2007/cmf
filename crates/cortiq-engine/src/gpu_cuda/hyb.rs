@@ -4891,8 +4891,16 @@ fn build(
         // Hy4-flash's long prompt calls (2048 rows a chunk on a card of 32 GB
         // and more, `hy4::prompt_rows`) and the layer-major rows beside them:
         // at the plain reserve an A40's 2048-row call failed an allocation
-        if std::env::var("CMF_HYB_RESERVE_MB").is_err() && layers.iter().any(|l| l.engram.is_some()) && super::vram_budget() >= 32 << 30 {
-            reserve += 3 << 30;
+        if std::env::var("CMF_HYB_RESERVE_MB").is_err() && layers.iter().any(|l| l.engram.is_some()) {
+            if super::vram_budget() >= 32 << 30 {
+                reserve += 3 << 30;
+            } else {
+                // a 12 or 16 GB card: the prompt's chunks, the token plan and
+                // the head took ~2.5 GiB past the slots on an RTX PRO 6000
+                // under every limit (12 / 16 GB: 13.1 / 16.6 GB in use with
+                // the plain eighth of the card)
+                reserve = reserve.max(card_reserve().max(11 << 28) + dsa_mirror_bytes(layers));
+            }
         }
         // a plan without the head (the prompt's) leaves room for it: the
         // token plan, built after, puts it on the card

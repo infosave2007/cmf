@@ -75,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the greedy moves a block a row (`gpu_cuda::gptq_refine_rows`, the host's codes bit for bit;
   `CMF_GPTQ_CUDA=0` keeps the host).
 - CUDA: `CMF_CUDA_PROF` names the call site of every card allocation of 32 MB or more.
+- CUDA hybrid, Hy4-flash on a card under 32 GB: the plan keeps 2.75 GiB beside the expert slots (it kept an eighth of
+  the card, 1.5 GiB on 12 GB): the process stayed ~1 GB past `CMF_GPU_VRAM_MB` (12 / 16 GB: 13.1 / 16.6 GB in use)
+  and would not fit those cards. Now 11.8 / 15.8 GB for `q2tp`, 15.95 GB for `q4tp` on 16 GB; `q4tp`'s expert slots
+  do not fit 12 GB (the prompt falls to the host). `cortiq run` prints the `CMF_CUDA_PROF` report.
 - CUDA expert stream: the slot a miss takes comes from a lazy heap of (held, last use, index) — the same choice as
   the walk over every slot it replaces, in O(log n); a 96 GB card holds tens of thousands of slots
   (`CMF_STREAM_LRU=0` keeps the walk).
