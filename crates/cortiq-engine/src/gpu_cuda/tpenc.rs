@@ -431,10 +431,103 @@ extern "C" __global__ void tp_place(const float* __restrict__ vals, const float*
     p[0] = (u8)(lo_h & 0xFF); p[1] = (u8)(lo_h >> 8);
     p[2] = (u8)(best_st & 0xFF); p[3] = (u8)(best_st >> 8);
 }
+// GPTQ sweep, one 32-column group, a thread a row (gptq_dev.rs's WGSL
+// q2tp_group / q4tp_group): rung choice, rounding with in-group feedback
+// through the fold operator A (n x n, upper), codes into CODES, the words
+// into QN, the scaled residuals into E (rows x 32) for the trail GEMM.
+__device__ float q2l_round(float x) { return clampf(rintf(clampf(x, -1.0f, 4.0f)), 0.0f, 3.0f); }
+
+extern "C" __global__ void gq_group(float* __restrict__ W, int n, int rows, int grp, int two_bit,
+                                    const float* __restrict__ TAB, const float* __restrict__ LOST, const float* __restrict__ HD,
+                                    const float* __restrict__ A, u32* __restrict__ QN, u32* __restrict__ CODES, float* __restrict__ E)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const int c0 = grp * 32;
+    float w[32];
+    float amax = 0.0f;
+    for (int t = 0; t < 32; t++) { w[t] = W[(size_t)row * n + c0 + t]; amax = fmaxf(amax, fabsf(w[t])); }
+    const float* tab = TAB + (size_t)row * 32;
+    int best_c = 0;
+    if (two_bit) {
+        if (amax > 0.0f) {
+            float best_e = 3.4e38f;
+            best_c = 1;
+            for (int cand = 1; cand < 32; cand++) {
+                float s_c = tab[cand];
+                if (!(s_c > 0.0f)) continue;
+                float iv = 1.0f / s_c;
+                float err = 0.0f;
+                for (int t = 0; t < 32; t++) {
+                    float d = w[t] - (q2l_round(w[t] * iv + 1.5f) - 1.5f) * s_c;
+                    err = err + HD[c0 + t] * d * d;
+                }
+                if (err < best_e) { best_e = err; best_c = cand; }
+            }
+        }
+    } else {
+        float lo = LOST[row * 2], st = LOST[row * 2 + 1];
+        int nominal = 0;
+        if (amax > 0.0f && st > 0.0f) {
+            float x = (log2f(amax / 7.0f) - lo) / st;
+            float ra = copysignf(floorf(fabsf(x) + 0.5f), x);
+            nominal = (int)clampf(ra, 0.0f, 31.0f);
+        }
+        best_c = nominal;
+        if (amax > 0.0f) {
+            float best_e = 3.4e38f;
+            int lo_c = nominal >= 2 ? nominal - 2 : 0, hi_c = nominal + 1 < 31 ? nominal + 1 : 31;
+            for (int cand = lo_c; cand <= hi_c; cand++) {
+                float s_c = tab[cand];
+                if (s_c <= 0.0f) continue;
+                float iv = 1.0f / s_c;
+                float err = 0.0f;
+                for (int t = 0; t < 32; t++) {
+                    float q = clampf(rintf(w[t] * iv), -8.0f, 7.0f);
+                    float d = w[t] - q * s_c;
+                    err = err + HD[c0 + t] * d * d;
+                }
+                if (err < best_e) { best_e = err; best_c = cand; }
+            }
+        }
+    }
+    const float s = tab[best_c];
+    CODES[(size_t)row * (n / 32) + grp] = (u32)best_c;
+    u32 words[4] = {0u, 0u, 0u, 0u};
+    for (int j = 0; j < 32; j++) {
+        float q = 0.0f, deq;
+        if (two_bit) {
+            if (s > 0.0f) q = q2l_round(w[j] / s + 1.5f);
+            words[j / 16] |= ((u32)q) << (2 * (j % 16));
+            deq = (q - 1.5f) * s;
+        } else {
+            if (s > 0.0f) q = clampf(rintf(w[j] / s), -8.0f, 7.0f);
+            u32 nb = (u32)((int)q + 8) & 15u;
+            words[j / 8] |= nb << (4 * (j % 8));
+            deq = q * s;
+        }
+        float dj = A[(size_t)(c0 + j) * n + c0 + j];
+        float e = 0.0f;
+        if (dj > 0.0f) e = (w[j] - deq) / dj;
+        E[(size_t)row * 32 + j] = e;
+        if (e != 0.0f) {
+            for (int t = j + 1; t < 32; t++) w[t] = w[t] - e * A[(size_t)(c0 + j) * n + c0 + t];
+        }
+    }
+    if (two_bit) {
+        size_t base = ((size_t)row * (n / 32) + grp) * 2;
+        QN[base] = words[0]; QN[base + 1] = words[1];
+    } else {
+        size_t base = ((size_t)row * (n / 32) + grp) * 4;
+        for (int t = 0; t < 4; t++) QN[base + t] = words[t];
+    }
+}
 "#;
 
 struct TpState {
-    f: Option<Result<(cs::CUfunction, cs::CUfunction, cs::CUfunction), String>>,
+    f: Option<Result<(cs::CUfunction, cs::CUfunction, cs::CUfunction, cs::CUfunction), String>>,
+    /// fold operators uploaded, by the caller's key (the last few)
+    folds: Vec<(u64, usize, Buf)>,
     scr: std::collections::HashMap<&'static str, Buf>,
 }
 
@@ -473,8 +566,8 @@ pub fn tp_encode(vals: &[f32], rows: usize, cols: usize, two_bit: bool, search: 
     }
     let _st = c.st.lock().unwrap();
     let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default() });
-    let (fq2, fq4, _) = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?)))) {
+    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default(), folds: Vec::new() });
+    let (fq2, fq4, _, _) = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?, func(m, "gq_group")?)))) {
         Ok(f) => *f,
         Err(e) => {
             decline("tp encode", e);
@@ -529,8 +622,8 @@ pub fn tp_place_q2(vals: &[f32], hw: &[f32], rows: usize, cols: usize) -> Option
     }
     let _st = c.st.lock().unwrap();
     let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default() });
-    let fp = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?)))) {
+    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default(), folds: Vec::new() });
+    let fp = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?, func(m, "gq_group")?)))) {
         Ok(f) => f.2,
         Err(e) => {
             decline("tp place", e);
@@ -557,6 +650,117 @@ pub fn tp_place_q2(vals: &[f32], hw: &[f32], rows: usize, cols: usize) -> Option
             let _ = c.sync();
             decline("tp place", &e);
             None
+        }
+    }
+}
+
+/// The GPTQ sweep of `w` (`rows × n`, dead columns zeroed) on the card
+/// against the fold operator `u` (`n × n` upper, row-major; uploaded once a
+/// `ukey`): a thread a row a group (`gq_group`, the wgpu sweep's
+/// arithmetic), the trail `W[:, c0+32..] -= E·U[c0..c0+32, c0+32..]` on
+/// cuBLAS (plain f32). `tab` each row's ladder (q2tp: rung 0 = 0), `lost`
+/// its (lo, step) (q4tp), `hd` the group error weights. Writes the code
+/// plane (`rows·n/4` or `rows·n/2` bytes) and a rung code a (row, group).
+#[allow(clippy::too_many_arguments)]
+pub fn gptq_sweep(
+    ukey: u64,
+    u: &dyn Fn() -> Option<Vec<f32>>,
+    n: usize,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    lost: &[f32],
+    hd: &[f32],
+    two_bit: bool,
+    plane: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
+    if !on() || n % 32 != 0 || w.len() != rows * n || tab.len() != rows * 32 || hd.len() != n || codes.len() != rows * (n / 32) {
+        return false;
+    }
+    if plane.len() != rows * n / if two_bit { 4 } else { 2 } || (!two_bit && lost.len() != rows * 2) {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    if c.current().is_err() {
+        return false;
+    }
+    let _st = c.st.lock().unwrap();
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default(), folds: Vec::new() });
+    let fg = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?, func(m, "gq_group")?)))) {
+        Ok(f) => f.3,
+        Err(e) => {
+            decline("gptq sweep", e);
+            return false;
+        }
+    };
+    // the fold operator on the card (the last 8 kept: gate and up share one)
+    let up = match s.folds.iter().position(|(k, nn, _)| *k == ukey && *nn == n) {
+        Some(i) => s.folds[i].2.ptr,
+        None => {
+            let Some(hu) = u() else { return false };
+            if hu.len() != n * n {
+                return false;
+            }
+            let b = match Buf::direct(n * n * 4) {
+                Ok(b) => b,
+                Err(e) => {
+                    decline("gptq sweep", &e);
+                    return false;
+                }
+            };
+            if unsafe { cu::memcpy_htod_async(b.ptr, hu.as_slice(), c.stream) }.is_err() {
+                return false;
+            }
+            if s.folds.len() >= 8 {
+                s.folds.remove(0);
+            }
+            let p = b.ptr;
+            s.folds.push((ukey, n, b));
+            p
+        }
+    };
+    let gpr = n / 32;
+    let mut run = || -> Res<()> {
+        let wp = s.scr("gs_w", rows * n * 4)?;
+        let tp = s.scr("gs_t", rows * 32 * 4)?;
+        let lp = s.scr("gs_l", rows * 2 * 4)?;
+        let hp = s.scr("gs_h", n * 4)?;
+        let qp = s.scr("gs_q", plane.len())?;
+        let cp = s.scr("gs_c", rows * gpr * 4)?;
+        let ep = s.scr("gs_e", rows * 32 * 4)?;
+        let lz = vec![0f32; rows * 2];
+        unsafe {
+            cu::memcpy_htod_async(wp, w, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(tp, tab, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(lp, if two_bit { lz.as_slice() } else { lost }, c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(hp, hd, c.stream).map_err(derr)?;
+            let (n_i, rows_i, tb) = (n as i32, rows as i32, two_bit as i32);
+            let blocks = rows.div_ceil(128) as u32;
+            for k in 0..gpr {
+                let k_i = k as i32;
+                c.launch(fg, (blocks, 1), 128, 0, kargs!(wp, n_i, rows_i, k_i, tb, tp, lp, hp, up, qp, cp, ep))?;
+                let rest = n - (k + 1) * 32;
+                if rest > 0 {
+                    // column-major: W[:, c0+32..]ᵀ (rest × rows, ld n) -= U-block (rest × 32, ld n) · Eᵀ (32 × rows)
+                    let c0 = k * 32;
+                    let a = up + ((c0 * n + c0 + 32) * 4) as u64;
+                    let cc = wp + ((c0 + 32) * 4) as u64;
+                    c.gemm(false, false, rest, rows, 32, -1.0, a, n, ep, 32, 1.0, cc, n, Gemm::F32)?;
+                }
+            }
+            cu::memcpy_dtoh_async(plane, qp, c.stream).map_err(derr)?;
+            cu::memcpy_dtoh_async(codes, cp, c.stream).map_err(derr)?;
+        }
+        c.sync()
+    };
+    match run() {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("gptq sweep", &e);
+            false
         }
     }
 }

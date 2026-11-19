@@ -2737,7 +2737,12 @@ pub(crate) fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold:
             }
         }
     }
-    let mut out = crate::convert::encode_q4tp(&w_init, rows, cols);
+    // the starting ladder: the converter's q4tp, on the card when CUDA is up
+    #[cfg(feature = "cuda")]
+    let start = cortiq_engine::gpu_cuda::tp_encode(&w_init, rows, cols, false, true);
+    #[cfg(not(feature = "cuda"))]
+    let start: Option<Vec<u8>> = None;
+    let mut out = start.unwrap_or_else(|| crate::convert::encode_q4tp(&w_init, rows, cols));
     let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
     if params_off != rows * cols / 2 {
         return None;
@@ -2752,7 +2757,14 @@ pub(crate) fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold:
         lost[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
     }
     let mut codes = vec![0u32; rows * gpr];
-    if !cortiq_engine::gpu::gptq_sweep_q4tp_dev(fold, &w_init, rows, &tab, &lost, &mut out[..params_off], &mut codes) {
+    #[cfg(feature = "cuda")]
+    let on_cuda = {
+        let hd = cortiq_engine::gpu::gptq_fold_info(fold).map(|i| i.1).unwrap_or_default();
+        hd.len() == cols && cortiq_engine::gpu_cuda::gptq_sweep(fold, &|| cortiq_engine::gpu::gptq_fold_read(fold), cols, &w_init, rows, &tab, &lost, &hd, false, &mut out[..params_off], &mut codes)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let on_cuda = false;
+    if !on_cuda && !cortiq_engine::gpu::gptq_sweep_q4tp_dev(fold, &w_init, rows, &tab, &lost, &mut out[..params_off], &mut codes) {
         return None;
     }
     let cs = &mut out[codes_off..codes_off + rows * stride];
@@ -2840,7 +2852,11 @@ pub(crate) fn gptq_quantize_q2tp_dev(
         tab[r * 32..r * 32 + 32].copy_from_slice(&det_q2tp_ladder(&params, r));
     }
     let mut codes = vec![0u32; rows * gpr];
-    if !cortiq_engine::gpu::gptq_sweep_q2tp_dev(fold, &w_init, rows, &tab, &hw, &mut out[..params_off], &mut codes) {
+    #[cfg(feature = "cuda")]
+    let on_cuda = cortiq_engine::gpu_cuda::gptq_sweep(fold, &|| cortiq_engine::gpu::gptq_fold_read(fold), cols, &w_init, rows, &tab, &[], &hw, true, &mut out[..params_off], &mut codes);
+    #[cfg(not(feature = "cuda"))]
+    let on_cuda = false;
+    if !on_cuda && !cortiq_engine::gpu::gptq_sweep_q2tp_dev(fold, &w_init, rows, &tab, &hw, &mut out[..params_off], &mut codes) {
         return None;
     }
     let cs = &mut out[codes_off..codes_off + rows * stride];
@@ -3410,28 +3426,48 @@ fn tiled_refine_codes(
         let n = rows * cols;
         let mut code = vec![0u8; n];
         let mut step = vec![0f32; n];
-        for r in 0..rows {
-            let tab = ladder(&params[r * 4..r * 4 + 4]);
-            let crow = &codes[r * stride..(r + 1) * stride];
-            for g in 0..gpr {
-                let sg = tab[q4tp_code(crow, g)];
-                for (b, &byte) in plane[(r * gpr + g) * cb..(r * gpr + g + 1) * cb].iter().enumerate() {
-                    for j in 0..wpb {
-                        let c = g * GROUP_SIZE + b * wpb + j;
-                        code[r * cols + c] = (byte >> (bits as usize * j)) & mask;
-                        step[r * cols + c] = sg;
-                    }
+        // the levels and steps of every row, a share of the rows a thread
+        {
+            let per = rows.div_ceil(threads.max(1)).max(1);
+            let plane_r = &*plane;
+            std::thread::scope(|s| {
+                for (ci, (cd, sp)) in code.chunks_mut(per * cols).zip(step.chunks_mut(per * cols)).enumerate() {
+                    s.spawn(move || {
+                        for (k, (crow_o, srow)) in cd.chunks_exact_mut(cols).zip(sp.chunks_exact_mut(cols)).enumerate() {
+                            let r = ci * per + k;
+                            let tab = ladder(&params[r * 4..r * 4 + 4]);
+                            let crow = &codes[r * stride..(r + 1) * stride];
+                            for g in 0..gpr {
+                                let sg = tab[q4tp_code(crow, g)];
+                                for (b, &byte) in plane_r[(r * gpr + g) * cb..(r * gpr + g + 1) * cb].iter().enumerate() {
+                                    for j in 0..wpb {
+                                        let c = g * GROUP_SIZE + b * wpb + j;
+                                        crow_o[c] = (byte >> (bits as usize * j)) & mask;
+                                        srow[c] = sg;
+                                    }
+                                }
+                            }
+                        }
+                    });
                 }
-            }
+            });
         }
         if let Some((moves, t)) = cortiq_engine::gpu_cuda::gptq_refine_rows(&mut code, &step, &res, &hf, &live, rows, cols, maxc, iters) {
-            for r in 0..rows {
-                let prow = &mut plane[r * gpr * cb..(r + 1) * gpr * cb];
-                prow.fill(0);
-                for (c, &v) in code[r * cols..(r + 1) * cols].iter().enumerate() {
-                    prow[(c / GROUP_SIZE) * cb + (c % GROUP_SIZE) / wpb] |= v << (bits as usize * (c % wpb));
+            let per = rows.div_ceil(threads.max(1)).max(1);
+            let code = &code;
+            std::thread::scope(|s| {
+                for (ci, pl) in plane.chunks_mut(per * gpr * cb).enumerate() {
+                    s.spawn(move || {
+                        for (k, prow) in pl.chunks_exact_mut(gpr * cb).enumerate() {
+                            let r = ci * per + k;
+                            prow.fill(0);
+                            for (c, &v) in code[r * cols..(r + 1) * cols].iter().enumerate() {
+                                prow[(c / GROUP_SIZE) * cb + (c % GROUP_SIZE) / wpb] |= v << (bits as usize * (c % wpb));
+                            }
+                        }
+                    });
                 }
-            }
+            });
             return RefineStats { moves, obj_before: t[0], obj_after: t[2], plain_before: t[0] - add * t[1], plain_after: t[2] - add * t[3] };
         }
     }

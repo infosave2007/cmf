@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks each layer's first expert against the host before writing: a 512-expert Hy4-flash layer 220–300 s → 23 s
   on an A40 beside 7.65 CPUs (`CMF_TP_CUDA=0`: the host). quantize-moe's q2tp GPTQ places its row ladders there too
   (`gpu_cuda::tp_place_q2`, checked against the host on a matrix's first and last rows).
+- quantize-moe's GPTQ sweep on CUDA (`gpu_cuda::gptq_sweep`): a 32-column group a launch, a thread a row (the wgpu
+  sweep's rung choice and in-group feedback), the trail update on cuBLAS in plain f32; the fold operator crosses
+  once an expert (gate and up share it), and q4tp's starting ladder is the CUDA encoder's. The experts' error on
+  held-out rows is the wgpu sweep's (Hy4-flash layer 1: 0.02263 both); `hy4-sfq` a layer on an A40 145 → 110 s
+  (dry run), 52 s on an RTX PRO 6000. The code refinement's level and step planes are unpacked and packed on the
+  worker's threads.
 
 ### Fixed
 - `--no-think` (and `enable_thinking: false`) gave every template `reasoning_effort = low`, GLM-5's direct-answer
@@ -65,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the greedy moves a block a row (`gpu_cuda::gptq_refine_rows`, the host's codes bit for bit;
   `CMF_GPTQ_CUDA=0` keeps the host).
 - CUDA: `CMF_CUDA_PROF` names the call site of every card allocation of 32 MB or more.
+- CUDA expert stream: the slot a miss takes comes from a lazy heap of (held, last use, index) — the same choice as
+  the walk over every slot it replaces, in O(log n); a 96 GB card holds tens of thousands of slots
+  (`CMF_STREAM_LRU=0` keeps the walk).
 
 ## [0.9.5] — 2026-11-18
 

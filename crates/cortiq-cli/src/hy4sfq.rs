@@ -420,6 +420,9 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
             patches.push((i, dt, bytes));
         }
         CmfModel::recode_entries_in_place(o.target, &patches).map_err(|e| anyhow::anyhow!("{}: {e}", o.target))?;
+        if let Some(s) = crate::moegptq::stage_report() {
+            eprintln!("  layer {li} stages: inputs {:.1} fold {:.1} gate/up {:.1} down fold {:.1} down {:.1}; {s}", out.tim[0], out.tim[1], out.tim[2], out.tim[3], out.tim[4]);
+        }
         eprintln!(
             "  layer {li}: {} GPTQ + {} rounded experts, t in [{tmin:.3}, {tmax:.3}], {:.0} s (total {:.0} s)",
             out.n_gptq,

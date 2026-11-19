@@ -2410,13 +2410,18 @@ fn encode_expert_gpu(
     let ts = Instant::now();
     let (gb, ub) = match hgu {
         Some(hgu) => {
+            let t1 = Instant::now();
             let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             gpu::gptq_fold_free(fid);
+            stage_add(0, t1);
+            let t1 = Instant::now();
             if let Some((iters, ridge, _)) = ec.refine {
                 q2tp_refine_codes(&mut gb, wg, inter, hidden, &hgu, ridge, iters, threads);
                 q2tp_refine_codes(&mut ub, wu, inter, hidden, &hgu, ridge, iters, threads);
             }
+            stage_add(1, t1);
+            let t1 = Instant::now();
             // debias: H·w for every gate/up row, one device GEMM [W_g; W_u]·H
             let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
             drop(hgu);
@@ -2424,6 +2429,7 @@ fn encode_expert_gpu(
             drop(h32);
             q2tp_debias_rows(&mut gb, wg, inter, hidden, &hwg, threads);
             q2tp_debias_rows(&mut ub, wu, inter, hidden, &hwu, threads);
+            stage_add(2, t1);
             (gb, ub)
         }
         None => {
@@ -2444,14 +2450,37 @@ fn encode_expert_gpu(
     let (dd, _, _) = gpu::gptq_fold_info(fd).unwrap_or_default();
     tim[3] += ts.elapsed().as_secs_f64();
     let ts = Instant::now();
+    let t1 = Instant::now();
     let mut db = gptq_quantize_q4tp_dev(wd, hidden, inter, fd, &dd).ok_or_else(|| anyhow::anyhow!("q4tp sweep"))?;
     gpu::gptq_fold_free(fd);
+    stage_add(3, t1);
     if let (Some((iters, ridge, true)), Some(h)) = (ec.refine, &hdh) {
+        let t1 = Instant::now();
         q4tp_refine_codes(&mut db, wd, hidden, inter, h, ridge, iters, threads);
+        stage_add(4, t1);
+        let t1 = Instant::now();
         q4tp_debias_gemm(&mut db, wd, hidden, inter, h, threads);
+        stage_add(5, t1);
     }
     tim[4] += ts.elapsed().as_secs_f64();
     Ok([gb, ub, db])
+}
+
+/// Device-encode stage times (ns, summed over workers): gate/up sweeps,
+/// gate/up refine, gate/up debias, down sweep, down refine, down debias.
+pub(crate) static STAGE_NS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn stage_add(i: usize, t: Instant) {
+    STAGE_NS[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CMF_GPTQ_TIMES=1`: the stage times so far (s), then zeroed.
+pub(crate) fn stage_report() -> Option<String> {
+    if std::env::var("CMF_GPTQ_TIMES").as_deref() != Ok("1") {
+        return None;
+    }
+    let v: Vec<f64> = STAGE_NS.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9).collect();
+    Some(format!("gate/up sweeps {:.1} refine {:.1} debias {:.1}; down sweep {:.1} refine {:.1} debias {:.1} s·worker", v[0], v[1], v[2], v[3], v[4], v[5]))
 }
 
 /// `W_g·H` and `W_u·H` (`inter × hidden` each, `h32` the `hidden²` gate/up

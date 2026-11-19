@@ -2689,6 +2689,10 @@ pub(super) struct ExpertStream {
     owner: Vec<Option<(usize, usize)>>,
     jobs: Vec<(HyJob, HyJob)>,
     last: Vec<u64>,
+    /// The slots by (held, last tick, index), lazily: an entry whose key no
+    /// longer matches the slot is stale. A miss took the first fresh one
+    /// in a walk over every slot — ~10 000 of them on a whole A40.
+    lru: std::collections::BinaryHeap<std::cmp::Reverse<(bool, u64, usize)>>,
     tick: u64,
     layers: Vec<StreamLayer>,
     /// A layer's index by its first expert's gate tensor.
@@ -3017,6 +3021,41 @@ impl ExpertStream {
         self.owner.len()
     }
 
+    /// Slot `s` used at tick `t` (its LRU entry pushed; the old one goes stale).
+    fn touch(&mut self, s: usize, t: u64) {
+        self.last[s] = t;
+        self.lru.push(std::cmp::Reverse((self.owner[s].is_some(), t, s)));
+        if self.lru.len() > 4 * self.owner.len() + 1024 {
+            let n = self.owner.len();
+            self.lru = (0..n).map(|s| std::cmp::Reverse((self.owner[s].is_some(), self.last[s], s))).collect();
+        }
+    }
+
+    /// The slot a miss takes: free ones first, then the least recently used,
+    /// never one of this call (the walk's `min_by_key` order, ties to the
+    /// lowest index).
+    fn victim(&mut self) -> Option<usize> {
+        // `CMF_STREAM_LRU=0`: the walk over every slot (the A/B)
+        static WALK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *WALK.get_or_init(|| std::env::var("CMF_STREAM_LRU").as_deref() == Ok("0")) {
+            return (0..self.slots()).filter(|&s| self.last[s] != self.tick).min_by_key(|&s| (self.owner[s].is_some(), self.last[s]));
+        }
+        let mut held = Vec::new();
+        let found = loop {
+            let Some(std::cmp::Reverse((own, t, s))) = self.lru.pop() else { break None };
+            if own != self.owner[s].is_some() || t != self.last[s] {
+                continue;
+            }
+            if t == self.tick {
+                held.push(std::cmp::Reverse((own, t, s)));
+                continue;
+            }
+            break Some(s);
+        };
+        self.lru.extend(held);
+        found
+    }
+
     /// Every routed expert into the RAM tier at load, in its card layout
     /// (built once into a slot and copied back), when the tier holds them
     /// all: what the Vulkan graph does with its system-memory banks. A
@@ -3163,13 +3202,10 @@ impl ExpertStream {
     /// (its owner's table entries back to the marker).
     fn ensure(&mut self, c: &Ctx, fx: &HFuncs, li: usize, e: usize) -> Res<(HyJob, HyJob)> {
         if let Some(s) = self.layers[li].slot_of[e] {
-            self.last[s] = self.tick;
+            self.touch(s, self.tick);
             return Ok(self.jobs[s]);
         }
-        let s = (0..self.slots())
-            .filter(|&s| self.last[s] != self.tick)
-            .min_by_key(|&s| (self.owner[s].is_some(), self.last[s]))
-            .ok_or("expert stream: every slot holds an expert of this call")?;
+        let s = self.victim().ok_or("expert stream: every slot holds an expert of this call")?;
         if let Some((l2, e2)) = self.owner[s].take() {
             let l = &mut self.layers[l2];
             l.slot_of[e2] = None;
@@ -3223,7 +3259,7 @@ impl ExpertStream {
         self.loads += 1;
         self.owner[s] = Some((li, e));
         self.jobs[s] = jobs;
-        self.last[s] = self.tick;
+        self.touch(s, self.tick);
         self.layers[li].slot_of[e] = Some(s);
         self.put_jobs(c, li, e, jobs.0, jobs.1)?;
         Ok(jobs)
@@ -3443,6 +3479,7 @@ pub(super) fn moe_row(
             owner: vec![None; n],
             jobs: vec![(job_zero(), job_zero()); n],
             last: vec![0; n],
+            lru: (0..n).map(|s| std::cmp::Reverse((false, 0, s))).collect(),
             tick: 0,
             layers: Vec::new(),
             index: HashMap::new(),
@@ -3485,7 +3522,7 @@ pub(super) fn moe_row(
     for &(e, _) in picks {
         match es.layers[li].slot_of[e] {
             Some(s) => {
-                es.last[s] = es.tick;
+                es.touch(s, es.tick);
                 es.hits += 1;
             }
             None => missing.push(e),
@@ -3731,7 +3768,7 @@ unsafe fn stream_stage(c: &Ctx, fx: &HFuncs, m: &MoeL, picked: &[(usize, usize)]
             continue;
         }
         match es.layers[*li].slot_of[e] {
-            Some(s) => es.last[s] = es.tick,
+            Some(s) => es.touch(s, es.tick),
             None => missing.push(e),
         }
     }
@@ -3764,7 +3801,7 @@ unsafe fn stream_stage(c: &Ctx, fx: &HFuncs, m: &MoeL, picked: &[(usize, usize)]
     let share = (es.slots() / layers).max(16);
     for &(e, _) in picked.iter().filter(|&&(e, _)| e < n).skip(share) {
         if let Some(s) = es.layers[*li].slot_of[e] {
-            es.last[s] = 1;
+            es.touch(s, 1);
         }
     }
     // and the RAM tier its share past those: every chunk copies the layer's
@@ -3810,7 +3847,7 @@ unsafe fn stream_fix(c: &Ctx, fx: &HFuncs, m: &MoeL, mb: &MoeBufs, s_n: usize) -
     let (hits0, loads0) = (es.hits, es.loads);
     for j in ga.iter().filter(|j| j.rows > 0 && j.w != 0) {
         if let Some(s) = es.slot_at(j.w) {
-            es.last[s] = es.tick;
+            es.touch(s, es.tick);
             es.hits += 1;
         }
     }
@@ -5778,6 +5815,7 @@ fn build(
                 owner: vec![None; n],
                 jobs: vec![(job_zero(), job_zero()); n],
                 last: vec![0; n],
+                lru: (0..n).map(|s| std::cmp::Reverse((false, 0, s))).collect(),
                 tick: 0,
                 layers: stream_layers,
                 index,
