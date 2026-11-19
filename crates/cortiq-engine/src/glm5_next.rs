@@ -1404,6 +1404,7 @@ fn graph_layers<'a>(layers: &'a [Layer], cfg: &Cfg) -> Option<Vec<crate::gpu::Gr
                     None => None,
                 };
                 GraphAttn::Mla {
+                    hy: None,
                     q_a,
                     q_a_norm: m.q_a_norm.as_deref(),
                     q: gw(&m.q_proj)?,
@@ -1485,6 +1486,8 @@ fn graph_layers<'a>(layers: &'a [Layer], cfg: &Cfg) -> Option<Vec<crate::gpu::Gr
                     return None;
                 }
                 GraphFfn::Moe {
+                    latent: None,
+                    shared_limit: None,
                     router: gw(&m.router)?,
                     shared_gate: gw(&m.router)?,
                     experts,
@@ -1509,7 +1512,9 @@ fn graph_layers<'a>(layers: &'a [Layer], cfg: &Cfg) -> Option<Vec<crate::gpu::Gr
             FfnKind::DenseMoe(_) => return None,
         };
         out.push(GraphLayer {
+            engram: None,
             mhc: Some(GraphMhc {
+                head: None,
                 attn_w: &l.attn_hc.function,
                 attn_b: &l.attn_hc.base,
                 ffn_w: &l.ffn_hc.function,
@@ -1519,6 +1524,7 @@ fn graph_layers<'a>(layers: &'a [Layer], cfg: &Cfg) -> Option<Vec<crate::gpu::Gr
                 iters: cfg.hc.hc_sinkhorn_iters,
                 pre_scale: 1.0,
                 dsv4: Some(GraphMhcDsv4 {
+                    ihc: None,
                     attn_scale: l.attn_hc.scale,
                     ffn_scale: l.ffn_hc.scale,
                     eps: cfg.hc.hc_eps,

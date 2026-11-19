@@ -265,7 +265,21 @@ fn mhc4_route(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wi
     let d = p.d;
     let rb = row * 4u * d;
     let cb = row * 20u;
-    if (t == 0u) {
+    if (t == 0u && (p.flags & 4u) != 0u) {
+        // Hy4-flash's identity form: post = mag sigmoid + eps, no mix (the
+        // closing fold reads the pre weights only)
+        let lb = row * 24u;
+        let mag = bitcast<f32>(p.p0);
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            pre_s[s] = sig(lg[lb + s] * p.s0 + base[s]) + p.eps;
+            if ((p.flags & 8u) == 0u) { coef[cb + s] = mag * sig(lg[lb + 4u + s] * p.s1 + base[4u + s]) + p.eps; }
+        }
+        if ((p.flags & 8u) == 0u) {
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) { coef[cb + 4u + i * 4u + j] = select(0.0, 1.0, i == j); }
+            }
+        }
+    } else if (t == 0u) {
         let lb = row * 24u;
         for (var s = 0u; s < 4u; s = s + 1u) {
             pre_s[s] = sig(lg[lb + s] * p.s0 + base[s]) + p.eps;
@@ -380,9 +394,16 @@ pub(crate) fn pipes4(c: &Ctx) -> Option<&'static Pipes4> {
 /// One four-stream sub-layer step's uniform: `ffn` picks the FFN's group
 /// scales, `leave` sets the merge's mean.
 pub(crate) fn params4(d: usize, rows: usize, leave: bool, iters: usize, scale: [f32; 3], eps: f32, rms_eps: f32) -> [u32; 12] {
+    params4x(d, rows, leave, iters, scale, eps, rms_eps, None, false)
+}
+
+/// `params4` with Hy4-flash's identity form (`ihc` = the post magnitude) and
+/// its closing fold (`fold`: the route writes the pre-weighted fold only).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn params4x(d: usize, rows: usize, leave: bool, iters: usize, scale: [f32; 3], eps: f32, rms_eps: f32, ihc: Option<f32>, fold: bool) -> [u32; 12] {
     [
         d as u32,
-        (leave as u32) << 1,
+        ((leave as u32) << 1) | ((ihc.is_some() as u32) << 2) | ((fold as u32) << 3),
         iters as u32,
         rows as u32,
         scale[0].to_bits(),
@@ -390,7 +411,7 @@ pub(crate) fn params4(d: usize, rows: usize, leave: bool, iters: usize, scale: [
         scale[2].to_bits(),
         eps.to_bits(),
         rms_eps.to_bits(),
-        0,
+        ihc.unwrap_or(0.0).to_bits(),
         0,
         0,
     ]
@@ -437,6 +458,25 @@ pub(crate) fn encode_route4(
     rows: usize,
     enter: bool,
 ) {
+    encode_route4n(c, enc, p, h, w, base, u, d, rows, enter, 24)
+}
+
+/// `encode_route4` over the first `logits` router rows (Hy4-flash's identity
+/// form has 8, its closing fold 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_route4n(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    p: &Pipes4,
+    h: &wgpu::Buffer,
+    w: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    u: &wgpu::Buffer,
+    d: usize,
+    rows: usize,
+    enter: bool,
+    logits: u32,
+) {
     let (r, k, l) = bufs4(c, d, rows);
     let rows = rows.max(1) as u32;
     let b_enter = bind_at(c, &p.enter, &[(0, h), (1, &r), (6, u)]);
@@ -451,7 +491,7 @@ pub(crate) fn encode_route4(
     }
     pass.set_pipeline(&p.logits);
     pass.set_bind_group(0, &b_logits, &[]);
-    pass.dispatch_workgroups(24, rows, 1);
+    pass.dispatch_workgroups(logits, rows, 1);
     pass.set_pipeline(&p.route);
     pass.set_bind_group(0, &b_route, &[]);
     pass.dispatch_workgroups(rows, 1, 1);
@@ -626,6 +666,14 @@ mod mhc4_tests {
     }
 
     #[test]
+    fn engram_wgsl_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::ENGRAM_SRC).expect("Engram WGSL must parse");
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("Engram WGSL must validate");
+    }
+
+    #[test]
     fn two_stream_wgsl_validates() {
         for (name, src) in [("route", super::ROUTE_SRC), ("merge", super::MERGE_SRC)] {
             let module = wgpu::naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name} WGSL must parse: {e}"));
@@ -634,4 +682,128 @@ mod mhc4_tests {
                 .unwrap_or_else(|e| panic!("{name} WGSL must validate: {e:?}"));
         }
     }
+}
+
+// ── Hy4-flash's Engram on the four streams (`hy4::Engram::apply`) ──
+// v: the value projection (no bias yet), k: the four key projections [4][d],
+// c1: [value bias | gamma], c2: [key bias | key norm | query norm | hc scale],
+// each [4][d]. A workgroup a stream: the value normed (no weight) times gamma,
+// the stream's key and query normed, their scaled dot through the signed
+// square root and a sigmoid, then stream += (gate + hc_scale) * value.
+const ENGRAM_SRC: &str = r#"
+struct EP { d: u32, eps: f32, rows: u32, _b: u32 }
+@group(0) @binding(0) var<storage, read_write> r: array<f32>;
+@group(0) @binding(1) var<storage, read> v: array<f32>;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> c1: array<f32>;
+@group(0) @binding(4) var<storage, read> c2: array<f32>;
+@group(0) @binding(5) var<uniform> p: EP;
+var<workgroup> red: array<f32, 256>;
+
+fn wsum(t: u32, x: f32) -> f32 {
+    red[t] = x;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st = st >> 1u) {
+        if (t < st) { red[t] = red[t] + red[t + st]; }
+        workgroupBarrier();
+    }
+    let s = red[0];
+    workgroupBarrier();
+    return s;
+}
+
+// a workgroup a (stream j, row): r [rows][4][d], v [rows][d], k [4][rows][d]
+@compute @workgroup_size(256)
+fn engram4(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let j = wid.x;
+    let row = wid.y;
+    let d = p.d;
+    let fd = f32(d);
+    let rb = (row * 4u + j) * d;
+    let vb = row * d;
+    let kb = (j * p.rows + row) * d;
+    var sv = 0.0;
+    var sk = 0.0;
+    var ss = 0.0;
+    for (var e = t; e < d; e = e + 256u) {
+        let a = v[vb + e] + c1[e];
+        sv = sv + a * a;
+        let b = k[kb + e] + c2[j * d + e];
+        sk = sk + b * b;
+        let s = r[rb + e];
+        ss = ss + s * s;
+    }
+    let rv = 1.0 / sqrt(wsum(t, sv) / fd + p.eps);
+    let rk = 1.0 / sqrt(wsum(t, sk) / fd + p.eps);
+    let rs = 1.0 / sqrt(wsum(t, ss) / fd + p.eps);
+    var dt = 0.0;
+    for (var e = t; e < d; e = e + 256u) {
+        let kn = (k[kb + e] + c2[j * d + e]) * rk * c2[4u * d + j * d + e];
+        let qn = r[rb + e] * rs * c2[8u * d + j * d + e];
+        dt = dt + kn * qn;
+    }
+    let g0 = wsum(t, dt) / sqrt(fd);
+    var g = 0.0;
+    if (g0 != 0.0) { g = sqrt(max(abs(g0), 1e-6)) * sign(g0); }
+    let gate = 1.0 / (1.0 + exp(-g));
+    for (var e = t; e < d; e = e + 256u) {
+        let m = (v[vb + e] + c1[e]) * rv * c1[d + e];
+        r[rb + e] = r[rb + e] + gate * m + c2[12u * d + j * d + e] * m;
+    }
+}
+"#;
+
+static ENGRAM: OnceLock<Option<wgpu::ComputePipeline>> = OnceLock::new();
+
+/// Hy4-flash's Engram step over the four streams of `rows` rows (`bufs4`):
+/// `v` the value projection `[rows][d]`, `k` the four key projections
+/// `[4][rows][d]`, `c1` `[value bias | gamma]`, `c2` `[key bias | key norm |
+/// query norm | hc scale]` (each `[4][d]`). None: the kernel did not build.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_engram4(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    d: usize,
+    rows: usize,
+    eps: f32,
+    v: &wgpu::Buffer,
+    k: &wgpu::Buffer,
+    c1: &wgpu::Buffer,
+    c2: &wgpu::Buffer,
+) -> Option<()> {
+    let pipe = ENGRAM
+        .get_or_init(|| {
+            let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("engram4"), source: wgpu::ShaderSource::Wgsl(ENGRAM_SRC.into()) });
+            let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("engram4"),
+                layout: None,
+                module: &m,
+                entry_point: Some("engram4"),
+                compilation_options: crate::gpu_wgpu::pco(),
+                cache: None,
+            });
+            match pollster::block_on(sc.pop()) {
+                None => Some(p),
+                Some(e) => {
+                    tracing::warn!("wgpu Engram kernel: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()?;
+    use wgpu::util::DeviceExt;
+    let rows = rows.max(1);
+    let (r, _, _) = bufs4(c, d, rows);
+    let u = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("engram4-u"),
+        contents: bytemuck::cast_slice(&[d as u32, eps.to_bits(), rows as u32, 0]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let b = bind_at(c, pipe, &[(0, &r), (1, v), (2, k), (3, c1), (4, c2), (5, &u)]);
+    let mut pass = crate::gpu_wgpu::begin_pass(enc);
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &b, &[]);
+    pass.dispatch_workgroups(4, rows as u32, 1);
+    Some(())
 }

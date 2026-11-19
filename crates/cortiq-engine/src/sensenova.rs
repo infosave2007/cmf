@@ -303,6 +303,7 @@ pub fn graph_mhc(m: Option<&Mhc>, p: usize) -> Option<crate::gpu::GraphMhc<'_>> 
     let m = m?;
     let (a, f) = m.routers.get(p)?.as_ref()?;
     Some(crate::gpu::GraphMhc {
+        head: None,
         attn_w: &a.w,
         attn_b: &a.b,
         ffn_w: &f.w,

@@ -91,10 +91,40 @@ cortiq quantize-gptq MODEL.f16.cmf --codec q2tp \
    层误差不能预测困惑度。
 4. 校准数据之外的文本，以及贪心生成。
 
+## MoE 专家：Hy4-flash
+
+`cortiq hy4-sfq` 把这一方案用于腾讯 Hy4-flash 的路由专家（每层 512 个专家，选 16 个，潜空间宽 1536）。每个专家的输入是
+`latent_down · x`，中间没有归一化，因此通道缩放折叠进 `latent_down` 的行：专家 gate/up 的列除以 `t`，`latent_down`
+的行乘以 `t`。每层一个 `t`，由 512 个专家共享（σ 取所有专家 gate 与 up 行，rms 取该层捕获的潜空间行）。
+
+1. `--capture-only`：校准文本经 CUDA 混合后端的提示图（q4tp 文件），按窗口把每个路由 FFN 的潜空间行与路由选择写入磁盘。
+2. 编码：逐层先求缩放，再用 quantize-moe 的 GPTQ 在各专家自己的行上量化（gate/up 为 q2tp 并做编码细化，down 为 q4tp
+   并做编码细化），原位写入 q2tp 文件；`latent_down` 以缩放后的行重新编码。
+
+在 Hy4-flash 上的结果（98 304 个校准 token：WikiText-2 训练集、Rust、中文文档；q2tp 文件）：
+
+| | 专家输出误差（第 1 层，未见过的文档） | WikiText-2（16 × 512） | 中文文档（8 × 512） | Rust（8 × 512） |
+|---|---:|---:|---:|---:|
+| 转换器的舍入 | 0.0909 | 33.19 | 36.38 | 4.62 |
+| GPTQ | 0.0271 | — | — | — |
+| SFq（缩放 + 编码细化） | 0.0236 | 42.57 | 41.37 | 4.31 |
+
+专家误差在样本外下降为四分之一，代码的困惑度变好，但文本变差：在这里整个模型并不等于各专家误差之和。怀疑原因在校准的
+输入：它取自 q4tp 文件，而 2 位模型的激活逐层偏离（尚未实现逐层顺序捕获）。发布的 q2tp 保留转换器的舍入。CPU 与显卡对编码
+结果的解码一致（24 个 token：CPU 36.6，CUDA token 路径 36.4）。
+
+```bash
+CMF_GPU=cuda cortiq hy4-sfq --capture-only --calib-model hy4-flash-q4tp.cmf --capture cap \
+  --calib wiki_train.txt=0.55 --calib code.txt=0.25 --calib zh.txt=0.20 --tokens 98304 --window 2048
+CMF_GPU=wgpu cortiq hy4-sfq --capture cap --hf Hy4-flash-FP8 --target hy4-flash-q2tp.cmf \
+  --alpha 0.75 --refine 256 --ridge 0.3
+```
+
 ## 限制
 
 - 只在一个模型上测过（MiniCPM5-2B，稠密的 Llama 类结构，GQA 16/2），校准数据为 WikiText。
-- 缩放不作用于 `down_proj` 和 `o_proj` 的输入，也不作用于 MoE 专家和 GDN 层。
+- `quantize-gptq` 的缩放不作用于 `down_proj` 和 `o_proj` 的输入，也不作用于 MoE 专家和 GDN 层；`hy4-sfq` 把它用于
+  Hy4-flash 的潜空间专家（见上）。
 - 新参数涉及的组在 CPU 上做折叠和扫描。其余的组留在显卡上，但这条混合路径没有在显卡上运行过：在 Mac 上全部走 CPU。
 - 已有 `--hessians` 缓存时，所有的组都走 CPU。
 - 精确的最小二乘增益（`--channel-refit`，NVG 编码器的输入通道增益）没有额外收益：−0.23 %。不属于本配方。

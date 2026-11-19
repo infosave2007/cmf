@@ -2737,7 +2737,12 @@ pub(crate) fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold:
             }
         }
     }
-    let mut out = crate::convert::encode_q4tp(&w_init, rows, cols);
+    // the starting ladder: the converter's q4tp, on the card when CUDA is up
+    #[cfg(feature = "cuda")]
+    let start = cortiq_engine::gpu_cuda::tp_encode(&w_init, rows, cols, false, true);
+    #[cfg(not(feature = "cuda"))]
+    let start: Option<Vec<u8>> = None;
+    let mut out = start.unwrap_or_else(|| crate::convert::encode_q4tp(&w_init, rows, cols));
     let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
     if params_off != rows * cols / 2 {
         return None;
@@ -2752,7 +2757,14 @@ pub(crate) fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold:
         lost[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
     }
     let mut codes = vec![0u32; rows * gpr];
-    if !cortiq_engine::gpu::gptq_sweep_q4tp_dev(fold, &w_init, rows, &tab, &lost, &mut out[..params_off], &mut codes) {
+    #[cfg(feature = "cuda")]
+    let on_cuda = {
+        let hd = cortiq_engine::gpu::gptq_fold_info(fold).map(|i| i.1).unwrap_or_default();
+        hd.len() == cols && cortiq_engine::gpu_cuda::gptq_sweep(fold, &|| cortiq_engine::gpu::gptq_fold_read(fold), cols, &w_init, rows, &tab, &lost, &hd, false, &mut out[..params_off], &mut codes)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let on_cuda = false;
+    if !on_cuda && !cortiq_engine::gpu::gptq_sweep_q4tp_dev(fold, &w_init, rows, &tab, &lost, &mut out[..params_off], &mut codes) {
         return None;
     }
     let cs = &mut out[codes_off..codes_off + rows * stride];
@@ -2799,7 +2811,26 @@ pub(crate) fn gptq_quantize_q2tp_dev(
         return None;
     }
     let mut out = vec![0u8; codes_off + rows * stride];
-    {
+    // the ladders on the card when CUDA is up: checked against the host on
+    // the first and the last row, else the host places them all
+    #[cfg(feature = "cuda")]
+    let placed = cortiq_engine::gpu_cuda::tp_place_q2(&w_init, &hw, rows, cols).filter(|p| {
+        let mut rungs = vec![0u8; gpr];
+        [0, rows - 1].iter().all(|&r| {
+            let mut q = [0u8; 4];
+            q2tp_place_row(&w_init[r * cols..(r + 1) * cols], &hw, &mut q, &mut rungs);
+            let ok = q == p[r * 4..r * 4 + 4];
+            if !ok {
+                tracing::warn!("q2tp ladder on the card differs from the host's at row {r}; the host places them");
+            }
+            ok
+        })
+    });
+    #[cfg(not(feature = "cuda"))]
+    let placed: Option<Vec<u8>> = None;
+    if let Some(p) = placed {
+        out[params_off..params_off + rows * 4].copy_from_slice(&p);
+    } else {
         let params = &mut out[params_off..params_off + rows * 4];
         let per = rows.div_ceil(threads.max(1));
         let (w_init, hw) = (&w_init, &hw);
@@ -2821,7 +2852,11 @@ pub(crate) fn gptq_quantize_q2tp_dev(
         tab[r * 32..r * 32 + 32].copy_from_slice(&det_q2tp_ladder(&params, r));
     }
     let mut codes = vec![0u32; rows * gpr];
-    if !cortiq_engine::gpu::gptq_sweep_q2tp_dev(fold, &w_init, rows, &tab, &hw, &mut out[..params_off], &mut codes) {
+    #[cfg(feature = "cuda")]
+    let on_cuda = cortiq_engine::gpu_cuda::gptq_sweep(fold, &|| cortiq_engine::gpu::gptq_fold_read(fold), cols, &w_init, rows, &tab, &[], &hw, true, &mut out[..params_off], &mut codes);
+    #[cfg(not(feature = "cuda"))]
+    let on_cuda = false;
+    if !on_cuda && !cortiq_engine::gpu::gptq_sweep_q2tp_dev(fold, &w_init, rows, &tab, &hw, &mut out[..params_off], &mut codes) {
         return None;
     }
     let cs = &mut out[codes_off..codes_off + rows * stride];
@@ -3254,7 +3289,7 @@ fn chscale_norm_for(
 /// inputs `t⊙x`; `t` is normalized to unit geometric mean over the live
 /// channels (so the folded norm gain keeps its range) and clamped to
 /// `[1e-3, 1e3]`. Dead channels (`H_jj = 0` or an all-zero column) get 1.
-fn chscale_vector(hdiag: &[f64], colsq: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
+pub(crate) fn chscale_vector(hdiag: &[f64], colsq: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
     let n = hdiag.len();
     let mut lt = vec![f64::NAN; n];
     let (mut sum, mut cnt) = (0f64, 0usize);
@@ -3383,6 +3418,58 @@ fn tiled_refine_codes(
                 });
             }
         });
+    }
+    // on the card when CUDA is up: every row's levels and steps, the moves
+    // there, the levels packed back here
+    #[cfg(feature = "cuda")]
+    {
+        let n = rows * cols;
+        let mut code = vec![0u8; n];
+        let mut step = vec![0f32; n];
+        // the levels and steps of every row, a share of the rows a thread
+        {
+            let per = rows.div_ceil(threads.max(1)).max(1);
+            let plane_r = &*plane;
+            std::thread::scope(|s| {
+                for (ci, (cd, sp)) in code.chunks_mut(per * cols).zip(step.chunks_mut(per * cols)).enumerate() {
+                    s.spawn(move || {
+                        for (k, (crow_o, srow)) in cd.chunks_exact_mut(cols).zip(sp.chunks_exact_mut(cols)).enumerate() {
+                            let r = ci * per + k;
+                            let tab = ladder(&params[r * 4..r * 4 + 4]);
+                            let crow = &codes[r * stride..(r + 1) * stride];
+                            for g in 0..gpr {
+                                let sg = tab[q4tp_code(crow, g)];
+                                for (b, &byte) in plane_r[(r * gpr + g) * cb..(r * gpr + g + 1) * cb].iter().enumerate() {
+                                    for j in 0..wpb {
+                                        let c = g * GROUP_SIZE + b * wpb + j;
+                                        crow_o[c] = (byte >> (bits as usize * j)) & mask;
+                                        srow[c] = sg;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        if let Some((moves, t)) = cortiq_engine::gpu_cuda::gptq_refine_rows(&mut code, &step, &res, &hf, &live, rows, cols, maxc, iters) {
+            let per = rows.div_ceil(threads.max(1)).max(1);
+            let code = &code;
+            std::thread::scope(|s| {
+                for (ci, pl) in plane.chunks_mut(per * gpr * cb).enumerate() {
+                    s.spawn(move || {
+                        for (k, prow) in pl.chunks_exact_mut(gpr * cb).enumerate() {
+                            let r = ci * per + k;
+                            prow.fill(0);
+                            for (c, &v) in code[r * cols..(r + 1) * cols].iter().enumerate() {
+                                prow[(c / GROUP_SIZE) * cb + (c % GROUP_SIZE) / wpb] |= v << (bits as usize * (c % wpb));
+                            }
+                        }
+                    });
+                }
+            });
+            return RefineStats { moves, obj_before: t[0], obj_after: t[2], plain_before: t[0] - add * t[1], plain_after: t[2] - add * t[3] };
+        }
     }
     let mut grad = gemm_rows_square(&res, rows, cols, &hf, threads);
     let per = rows.div_ceil(threads.max(1)).max(1);
@@ -3811,6 +3898,11 @@ fn channel_refit_gain(targets: &[&[f32]], quant: &[&[f32]], n: usize, h: &[f64],
 pub(crate) fn gemm_rows_square(a: &[f32], m: usize, k: usize, b: &[f32], threads: usize) -> Vec<f32> {
     assert!(a.len() >= m * k && b.len() >= k * k);
     let mut out = vec![0f32; m * k];
+    // a large product on the card (cuBLAS, plain f32) when CUDA is up
+    #[cfg(feature = "cuda")]
+    if m * k * k >= 1 << 26 && cortiq_engine::gpu_cuda::gptq_gemm_rows_square(a, m, k, b, &mut out) {
+        return out;
+    }
     let per = m.div_ceil(threads.max(1)).max(1);
     std::thread::scope(|s| {
         for (ci, chunk) in out.chunks_mut(per * k).enumerate() {
@@ -4598,6 +4690,37 @@ mod tests {
         let mut d1 = g.clone();
         q2tp_refine_codes(&mut d1, &w, rows, cols, &h, ridge, 40, 1);
         assert_eq!(d, d1);
+    }
+
+    /// SFq's refinement on the card (`gpu_cuda::gptq_refine_rows`) against the
+    /// host's loop on one problem: the same objective, nearly every code the
+    /// same (the seed `R·H_f` is a cuBLAS product there, sums in another
+    /// order). `CMF_GPTQ_CUDA_TEST=1` on a CUDA machine, run alone.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn q2tp_refine_on_the_card_matches_the_host() {
+        if std::env::var("CMF_GPTQ_CUDA_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        for (rows, cols, two) in [(64usize, 256usize, true), (48, 512, false)] {
+            let (w, _, h) = q2_problem_with(rows, cols, 900, 7, 2.0);
+            let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+            let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+            let g = if two { gptq_quantize_q2tp(&w, rows, cols, &u, &dead, &hdiag, Q2tpRule::Placed, None, 2) } else { gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 2) };
+            let refine = |b: &mut [u8]| if two { q2tp_refine_codes(b, &w, rows, cols, &h, 0.3, 64, 2) } else { q4tp_refine_codes(b, &w, rows, cols, &h, 0.3, 64, 2) };
+            unsafe { std::env::set_var("CMF_GPTQ_CUDA", "0") };
+            let mut dh = g.clone();
+            let sh = refine(&mut dh);
+            unsafe { std::env::set_var("CMF_GPTQ_CUDA", "1") };
+            let mut dc = g.clone();
+            let sc = refine(&mut dc);
+            let diff = dh.iter().zip(&dc).filter(|(a, b)| a != b).count();
+            eprintln!("refine {rows}x{cols} two-bit {two}: host {sh:?}, card {sc:?}, {diff} of {} bytes differ", dh.len());
+            assert!(sh.moves > 0 && sc.moves > 0);
+            assert!((sc.obj_after / sh.obj_after - 1.0).abs() < 1e-3, "host {sh:?} card {sc:?}");
+            assert!((sc.obj_before / sh.obj_before - 1.0).abs() < 1e-4, "host {sh:?} card {sc:?}");
+            assert!(diff * 50 <= dh.len(), "{diff} bytes differ");
+        }
     }
 
     /// The same refinement on the 16-level q4tp grid: the objective falls,

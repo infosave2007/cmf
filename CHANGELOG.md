@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-11-19
+
+### Added
+- Tencent Hy4-flash (`hy_v4_flash`, 220B parameters, 12B active): the converter reads the FP8 release (e4m3
+  with 128×128 block scales, decoded exactly) with optional bf16 shards on top (`CMF_HY4_BF16`), and writes
+  `q4tp` (the routed experts 4-bit, the rest 8-bit, the Engram tables as the release ships them) or `q2tp` (the
+  routed experts' gate/up 2-bit, the rest 4-bit). The engine runs the whole stack: four hyper-connection streams (iHC), gated MLA with
+  learned sinks and a sandwich norm, 30 sliding-window and 12 sparse layers (dense to 2048 positions, then the
+  compressed indexer: groups of four, 511 groups and the own), the latent MoE (top 16 of 512 experts on a
+  1536-wide latent, a shared expert on the stream) and Engram (bigram and trigram hash tables on four layers).
+  The CUDA hybrid runs decode and prompts on the card, the indexer included, with the experts streamed from a
+  RAM tier. `q4tp` on an A40: WikiText-2, the first 4096 tokens, perplexity 29.99 against Transformers' 29.75
+  (bf16) and 30.23 (float32).
+- `cortiq hy4-sfq`: SFq (docs/Q2TP_SCALE_REFINE.md) for Hy4-flash's routed experts. `--capture-only` runs the
+  calibration text through the card's prompt graph and keeps every routed FFN's latent rows and router picks;
+  the encode puts a channel scale on the latent (gate/up columns divided, `latent_down` rows multiplied) and runs
+  quantize-moe's GPTQ per expert with the code refinement, in place (`CMF_HY4_SFQ_DRY=1` measures on held-out
+  rows or windows instead, `CMF_HY4_SFQ_RTN=1` writes the converter's rounding back). Measured on the q2tp file
+  (98 304 calibration tokens): the experts' output error on unseen documents falls 4× (layer 1: 0.091 → 0.021),
+  Rust perplexity 4.62 → 4.31, but WikiText-2 rises 33.2 → 42.6 and Chinese 36.4 → 41.4; the published q2tp
+  keeps the converter's rounding.
+- Perplexity of a Hy4-flash file on the card's prompt graph (`hy4::nll`: the rows in long calls, the final norm
+  and the head on the host; `CMF_HY4_NLL_BATCH=0` keeps the token path).
+- Hy4-flash on Vulkan / DX12 / Metal (wgpu): the token graph runs its stack — Engram on the four streams
+  (`mhc::encode_engram4`), the identity hyper-connections (8 router logits) and the head's closing fold, MLA with
+  the layer's own query heads, RoPE table, window and sinks and the element-wise output gate, the latent experts
+  (the expert banks `latent` wide, `latent_down` before and `latent_up` after them), the FFN output norm before the
+  merge; the prompt goes in chunks of 16 rows through the batch graph (`CMF_HY4_WGPU_BATCH=0`: a token at a time).
+  The sparse layers' indexer has no wgpu arm yet: past 2048 positions the call declines to the host. Greedy text on
+  an A40 = the CUDA text up to a near tie.
+- The converter's `q2tp` (v2) and `q4tp` encoders on CUDA (`gpu_cuda::tp_encode`, a thread a row, every f32 / f64
+  operation rounded on its own: the host's bytes). `hy4-sfq`'s rounding rewrite (`CMF_HY4_SFQ_RTN=1`) uses them and
+  checks each layer's first expert against the host before writing: a 512-expert Hy4-flash layer 220–300 s → 23 s
+  on an A40 beside 7.65 CPUs (`CMF_TP_CUDA=0`: the host). quantize-moe's q2tp GPTQ places its row ladders there too
+  (`gpu_cuda::tp_place_q2`, checked against the host on a matrix's first and last rows).
+- quantize-moe's GPTQ sweep on CUDA (`gpu_cuda::gptq_sweep`): a 32-column group a launch, a thread a row (the wgpu
+  sweep's rung choice and in-group feedback), the trail update on cuBLAS in plain f32; the fold operator crosses
+  once an expert (gate and up share it), and q4tp's starting ladder is the CUDA encoder's. The experts' error on
+  held-out rows is the wgpu sweep's (Hy4-flash layer 1: 0.02263 both); `hy4-sfq` a layer on an A40 145 → 110 s
+  (dry run), 52 s on an RTX PRO 6000. The code refinement's level and step planes are unpacked and packed on the
+  worker's threads.
+
+### Fixed
+- `--no-think` (and `enable_thinking: false`) gave every template `reasoning_effort = low`, GLM-5's direct-answer
+  budget; Hy4-flash's template accepts only `no_think` / `high` / `max` and raised, so the prompt fell back to
+  ChatML. A template that names `no_think` now gets it.
+- wgpu, Hy4-flash: a prompt chunk of 32 rows or more (16 top-k picks a row reach the 512 experts) copied the
+  layer's system-memory latent bank to the staging bank and left the decode after it emitting "!!!!"; latent banks
+  are read in place (chunks of 17–256 rows give the 16-row text). `CMF_HY4_WGPU_ROWS` stays 16 by default: on a
+  card filled by the expert caches the larger chunks' buffers do not fit.
+- wgpu expert cache: a cache the card refused was asked for again on every call (~20 ms a layer each time, on
+  Hy4-flash over a whole A40); a refusal is now remembered and the layer reads its bank in place.
+
+### Changed
+- CUDA hybrid, streamed experts: `MADV_WILLNEED` over the file pages of an expert is no longer asked when the RAM
+  tier holds it (its pages are never read). On a pod whose page cache cannot hold the file the advice started
+  the reads in the call: Hy4-flash's routed FFN on a 16-row prompt chunk spent 23 of its 26 ms there; now 4 ms.
+- CUDA hybrid: a long prompt over streamed latent-expert layers goes a layer at a time (`CMF_HY4_LAYER_MAJOR=0`:
+  the whole stack a chunk at a time); the rows and the iHC streams wait on the card between layers, so a layer's
+  experts cross the bus once a call.
+- CUDA hybrid, latent experts on the small path: each slot takes only the rows routed to it (`hy_moe_compact`,
+  `CMF_HY4_MOE_COMPACT=0` off) instead of all 16 rows of the call; the same arithmetic and sum order, the same
+  numbers. Gate/up and down of a 16-row chunk: 1.6 ms a layer.
+- quantize-moe: the SFq code refinement as an option of the expert encode, and two of its host parts on the
+  card when CUDA is up: the row-square GEMM (debias products, the refinement's seed) on cuBLAS in plain f32 and
+  the greedy moves a block a row (`gpu_cuda::gptq_refine_rows`, the host's codes bit for bit;
+  `CMF_GPTQ_CUDA=0` keeps the host).
+- CUDA: `CMF_CUDA_PROF` names the call site of every card allocation of 32 MB or more.
+- CUDA hybrid, Hy4-flash on a card under 32 GB: the plan keeps 2.75 GiB beside the expert slots (it kept an eighth of
+  the card, 1.5 GiB on 12 GB): the process stayed ~1 GB past `CMF_GPU_VRAM_MB` (12 / 16 GB: 13.1 / 16.6 GB in use)
+  and would not fit those cards. Now 11.8 / 15.8 GB for `q2tp`, 15.95 GB for `q4tp` on 16 GB; `q4tp`'s expert slots
+  do not fit 12 GB (the prompt falls to the host). `cortiq run` prints the `CMF_CUDA_PROF` report.
+- CUDA expert stream: the slot a miss takes comes from a lazy heap of (held, last use, index) — the same choice as
+  the walk over every slot it replaces, in O(log n); a 96 GB card holds tens of thousands of slots
+  (`CMF_STREAM_LRU=0` keeps the walk).
+
 ## [0.9.5] — 2026-11-18
 
 ### Added

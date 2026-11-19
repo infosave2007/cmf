@@ -304,6 +304,7 @@ struct Buf {
 }
 
 impl Buf {
+    #[track_caller]
     fn new(bytes: usize) -> Res<Self> {
         let bytes = bytes.max(64);
         if let Some(b) = SLABS.with(|s| s.borrow_mut().as_mut().and_then(|p| p.carve(bytes))) {
@@ -314,10 +315,17 @@ impl Buf {
 
     /// An allocation of the driver's own, whatever the scope: for a buffer
     /// that is replaced by a larger one as a session runs.
+    #[track_caller]
     fn direct(bytes: usize) -> Res<Self> {
         let bytes = bytes.max(64);
         let ptr = unsafe { cu::malloc_sync(bytes) }
             .map_err(|e| format!("device allocation of {bytes} bytes: {e}"))?;
+        // `CMF_CUDA_PROF`: where the card's big allocations come from (what a
+        // plan sized against `CMF_GPU_VRAM_MB` did not count)
+        if prof_on() && bytes >= 32 << 20 {
+            let (free, _) = cu::mem_get_info().unwrap_or((0, 0));
+            eprintln!("cuda alloc {} MB at {} (card free {} MB)", bytes >> 20, std::panic::Location::caller(), free >> 20);
+        }
         Ok(Self { ptr, bytes, owned: true, slab: None })
     }
 
@@ -951,6 +959,21 @@ pub(crate) mod qwen4;
 /// contracts; declared after `kargs!`, which it uses.
 mod hyb;
 
+/// Hy4-flash SFq calibration on the hybrid's small path: arm the capture of
+/// `layers` latent routed FFNs (`dim` wide latent, `ne` experts).
+pub fn hy4_capture_begin(layers: usize, dim: usize, ne: usize) -> bool {
+    match ctx() {
+        Some(c) => c.current().is_ok() && hyb::hy4_cap_begin(layers, dim, ne).is_ok(),
+        None => false,
+    }
+}
+
+/// The captured rows, one (latent `[rows·dim]`, logits `[rows·ne]`) pair a
+/// routed FFN in stack order, and the capture disarmed.
+pub fn hy4_capture_take() -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+    hyb::hy4_cap_take()
+}
+
 /// The resident Embryo graph (GDN mixers, bounded anchors, the resonance
 /// router, the hierarchical head); declared after `kargs!`, which it uses.
 mod embryo;
@@ -963,6 +986,13 @@ pub use embryo::{
 /// GEMMs on the card; declared after `kargs!`, which it uses.
 mod bake;
 pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_attn_bwd, bake_phase_a, bake_attn_fwd, bake_ffn_bwd, bake_ffn_fwd, bake_gdn_bwd, bake_gdn_fwd, bake_gdn_layer_fwd, bake_gdn_ok, bake_gemm_dx, bake_gemm_nt, bake_lm_loss, bake_planes_clear};
+
+/// quantize-moe's GPTQ host parts on the card (the row-square GEMM, SFq's
+/// code refinement); declared after `kargs!`, which it uses.
+mod gptq;
+pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
+mod tpenc;
+pub use tpenc::{gptq_sweep, tp_encode, tp_place_q2};
 
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
@@ -1559,6 +1589,7 @@ impl Ctx {
 
 impl State {
     /// A scratch buffer of at least `bytes` (contents not kept across growth).
+    #[track_caller]
     fn scr(&mut self, c: &Ctx, name: &'static str, bytes: usize) -> Res<u64> {
         if let Some(b) = self.scratch.get(name) {
             if b.bytes >= bytes {
@@ -1566,6 +1597,9 @@ impl State {
             }
             // queued work may still read the old one
             c.sync()?;
+        }
+        if prof_on() && bytes >= 32 << 20 {
+            eprintln!("cuda scratch {name}: {} MB", bytes >> 20);
         }
         let b = Buf::new(bytes.next_multiple_of(1 << 20))?;
         let p = b.ptr;

@@ -4425,7 +4425,7 @@ pub(crate) fn unpack_fp8_blocks(
 /// Fine-grained FP8 with one ordinary f32 inverse scale per source block.
 /// V4.1's `weight_block_size` controls the block geometry; older checkpoints
 /// use 128 while the V4.1 source uses 32.
-fn unpack_fp8_scale_inv(
+pub(crate) fn unpack_fp8_scale_inv(
     packed: &[u8],
     scales: &[f32],
     rows: usize,
@@ -9999,6 +9999,27 @@ pub fn run_convert_multi_excluding(
         );
         for (q, path) in outputs {
             crate::nemotron_pack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
+    // Hy4-flash: identity hyper-connections, latent MoE, Engram tables.
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| crate::hy4pack::detect(&c))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "hy_v4_flash: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
+        );
+        for (q, path) in outputs {
+            crate::hy4pack::convert(dir, q, path)?;
         }
         progress(1.0);
         return Ok(());

@@ -19846,8 +19846,60 @@ static MLA_INVF: [f32; 4] = [0.0; 4];
 /// multi-head attention with heads `rope + nope` wide, V `v_dim` wide, no
 /// rotation (`pipeline::mla_attention`; the host cache keeps K rows that wide
 /// and V rows zero-padded to them, as `GraphAttnGeom` expects).
+/// The rows of a Hy4-flash prompt chunk on the wgpu batch graph
+/// (`CMF_HY4_WGPU_ROWS`, 16).
+pub fn hy4_wgpu_rows() -> usize {
+    std::env::var("CMF_HY4_WGPU_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(16)
+}
+
+/// Why the token graph cannot run a Hy4-flash stack here (`CMF_HY4_WGPU=0`:
+/// never): the sparse layers' compressed indexer has no wgpu arm, so a
+/// position past their dense range (`group_topk · ratio`, 2048) declines,
+/// and the graph's multi-token frames are not taken.
+fn hy4_token_problem(layers: &[crate::gpu::GraphLayer], position: usize, steps: usize) -> Option<&'static str> {
+    if std::env::var("CMF_HY4_WGPU").as_deref() == Ok("0") {
+        return Some("Hy4-flash on wgpu turned off (CMF_HY4_WGPU=0)");
+    }
+    if steps > 1 {
+        return Some("Hy4-flash: one token a frame");
+    }
+    for l in layers {
+        if let crate::gpu::GraphAttn::Mla { hy: Some(h), .. } = &l.attn {
+            if let Some(ix) = &h.indexer {
+                if position + 1 > ix.group_topk * ix.ratio {
+                    return Some("Hy4-flash: a sparse layer past its dense range (no wgpu indexer)");
+                }
+            }
+        }
+        if let Some(e) = &l.engram {
+            if e.mem.len() < e.mem_dim || e.keys.len() != 4 {
+                return Some("Hy4-flash: Engram rows of this call missing");
+            }
+        }
+        if l.mhc.as_ref().is_some_and(|m| m.dsv4.is_none_or(|d| d.ihc.is_none())) {
+            return Some("Hy4-flash: hyper-connections other than the identity form");
+        }
+    }
+    None
+}
+
 fn mla_geom<'a>(attn: &crate::gpu::GraphAttn<'a>) -> Option<crate::gpu::GraphAttnGeom<'a>> {
     match attn {
+        // Hy4-flash: heads [rope | nope] with the rotary half-split over the
+        // first `rope`, the layer's own table, window and sinks
+        crate::gpu::GraphAttn::Mla { nh, rope, nope, v_dim, hy: Some(h), .. } => Some(crate::gpu::GraphAttnGeom {
+            nkv: *nh,
+            hd: rope + nope,
+            dv: *v_dim,
+            rd: *rope,
+            invf: h.invf,
+            rope_scale: 1.0,
+            window: h.window,
+            sink: Some(h.sinks),
+            v_norm: false,
+            dash: None,
+            vres: None,
+        }),
         crate::gpu::GraphAttn::Mla { nh, rope, nope, v_dim, .. } => Some(crate::gpu::GraphAttnGeom {
             nkv: *nh,
             hd: rope + nope,
@@ -19935,12 +19987,15 @@ fn kimi_problem(
                 q_a,
                 q_a_norm,
                 kv_a_norm,
+                hy,
                 ..
             } => {
                 any = true;
                 let lhd = rope + nope;
-                if *mnh != nh
-                    || !*no_rope
+                // Hy4-flash: rotated heads, fewer of them on its sparse layers
+                let hy_ok = hy.is_some() && *mnh <= nh && *rope > 0 && rope % 4 == 0;
+                if (*mnh != nh && !hy_ok)
+                    || (!*no_rope && !hy_ok)
                     || q_a.is_some() && q_a_norm.is_none_or(|n| n.is_empty() || n.len() % 4 != 0)
                     || lhd % 4 != 0
                     || lhd > 256
@@ -19952,7 +20007,9 @@ fn kimi_problem(
                 {
                     return Some("MLA geometry outside the kernels (a rotary stage, a query rank off 4, heads past 256)");
                 }
-                if let Some(why) = mla_geom(&l.attn).and_then(|g| graph_geom_problem(c, &g, nh, hd)) {
+                // Hy4-flash's layer runs its own query heads
+                let qh = if hy_ok { *mnh } else { nh };
+                if let Some(why) = mla_geom(&l.attn).and_then(|g| graph_geom_problem(c, &g, qh, hd)) {
                     return Some(why);
                 }
             }
@@ -28904,6 +28961,12 @@ pub fn forward_token_graph(
     // the head's logits from the same submit).
     hidden_too: bool,
 ) -> crate::gpu::TokenGraphOutcome {
+    if crate::gpu::hy_layers(layers) {
+        if let Some(why) = hy4_token_problem(layers, position, steps) {
+            graph_decline(why);
+            return crate::gpu::TokenGraphOutcome::Declined;
+        }
+    }
     let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
     let span_submit_start = SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
     let mut o1_started = false;
@@ -29332,6 +29395,21 @@ pub fn forward_token_graph(
             _ => None,
         }
     };
+    // Hy4-flash's output gate and latent experts' projections, by layer
+    let mut hy_gate_m: std::collections::HashMap<usize, GMat> = std::collections::HashMap::new();
+    let mut hy_lat_m: std::collections::HashMap<usize, (GMat, GMat, usize)> = std::collections::HashMap::new();
+    let mut hy_eng_m: std::collections::HashMap<usize, (GMat, Vec<GMat>)> = std::collections::HashMap::new();
+    for (li, l) in layers.iter().enumerate() {
+        if let Some(e) = &l.engram {
+            let v = resolve(&e.value, hidden, e.mem_dim);
+            let ks: Option<Vec<GMat>> = e.keys.iter().map(|k| resolve(k, hidden, e.mem_dim)).collect();
+            let (Some(v), Some(ks)) = (v, ks) else {
+                graph_decline("Hy4-flash Engram projections resolve");
+                return token_graph_outcome(o1_started || state_started, false);
+            };
+            hy_eng_m.insert(li, (v, ks));
+        }
+    }
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None; // nv,nk,dk,dv,kk,cdim
                                                                                  // Budget-driven device prefix: the first layer whose live graph buffers
@@ -29619,6 +29697,14 @@ pub fn forward_token_graph(
                     graph_decline("MLA projections with a Prism plane");
                     return token_graph_outcome(o1_started || state_started, false);
                 }
+                // Hy4-flash: the element-wise output gate over the layer input
+                if let crate::gpu::GraphAttn::Mla { hy: Some(h), .. } = &l.attn {
+                    let Some(g) = resolve(&h.gate, mnh * v_dim, hidden) else {
+                        graph_decline("Hy4-flash output gate resolve");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    hy_gate_m.insert(pli, g);
+                }
                 LAttn::Full {
                     wq,
                     wk,
@@ -29738,13 +29824,29 @@ pub fn forward_token_graph(
                 shared_gated,
                 route_scale,
                 limit,
+                latent,
+                ..
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array
                 // (512 through `moe_sel2`); with a shared expert it rides as
                 // the last block.
                 let want = n_exp + usize::from(*has_shared);
                 let wide = *n_exp > 256 && moe_sel2::pipes(c).is_some();
-                if *top_k >= 16 || (*n_exp > 256 && !wide) || *n_exp > 512 || experts.len() != want {
+                // the experts' own width: Hy4-flash's latent, else the hidden
+                let ehid = latent.as_ref().map_or(hidden, |lt| lt.dim);
+                if let Some(lt) = latent {
+                    let (Some(dn), Some(up)) = (resolve(&lt.down, lt.dim, hidden), resolve(&lt.up, hidden, lt.dim)) else {
+                        graph_decline("latent expert projections resolve");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    if lt.dim % 32 != 0 || lt.dim > hidden {
+                        graph_decline("latent experts wider than the hidden");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    hy_lat_m.insert(pli, (dn, up, lt.dim));
+                }
+                // `moe_sel2` takes any k; the narrow select stops at 15
+                if (*top_k >= 16 && !wide) || *top_k + usize::from(*has_shared) > 32 || (*n_exp > 256 && !wide) || *n_exp > 512 || experts.len() != want {
                     graph_decline(&format!(
                         "moe shape: top_k {top_k} n_exp {n_exp} experts {} (want {want})",
                         experts.len()
@@ -29869,7 +29971,7 @@ pub fn forward_token_graph(
                         * (2 * moe_q82::blob_bytes(*mi, hidden) + moe_q82::blob_bytes(hidden, *mi)))
                         as u64
                 } else {
-                    moe_pack_bytes(experts.len(), *mi, hidden, *q4tp, *gu_q2, false)
+                    moe_pack_bytes(experts.len(), *mi, ehid, *q4tp, *gu_q2, false)
                         .unwrap_or(u64::MAX)
                 };
                 if !cached
@@ -29894,7 +29996,7 @@ pub fn forward_token_graph(
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 // q4_tiled experts: the split layout and its row-blocked kernels
-                let q4ts = !*q82 && !*q4tp && !*gu_q2 && moe_q4ts::on(c, hidden, *mi);
+                let q4ts = !*q82 && !*q4tp && !*gu_q2 && latent.is_none() && moe_q4ts::on(c, hidden, *mi);
                 // a streamed layer: the model's pool of slots stands in for the bank
                 let mut stream_l: Option<StreamL> = None;
                 if streamed && !*q82 && !q4ts {
@@ -29934,7 +30036,7 @@ pub fn forward_token_graph(
                     moe_q4ts::banks(c, model, experts, *mi, hidden)
                 } else {
                     SYS_EXPERTS_NEXT.with(|x| x.set(sys_layer));
-                    let b = moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false);
+                    let b = moe_expert_bufs(c, model, experts, *mi, ehid, *q4tp, *gu_q2, false);
                     SYS_EXPERTS_NEXT.with(|x| x.set(false));
                     b
                 };
@@ -31947,15 +32049,50 @@ pub fn forward_token_graph(
             // SenseNova-Loop mHC: route the streams into the hidden and
             // norm that branch (the previous tail's `n1` normed the plain
             // hidden).
+            // Hy4-flash's Engram onto the streams before the attention's route
+            if let (Some(e), Some((ev, eks))) = (l.engram.as_ref().filter(|e| e.on.first().copied().unwrap_or(false)), hy_eng_m.get(&li)) {
+                let md = e.mem_dim;
+                let mem_b = stor(bytemuck::cast_slice(&e.mem[..md]));
+                let vbuf = kimi::scratch(c, "eng-v", hidden);
+                let kbuf = kimi::scratch(c, "eng-k", 4 * hidden);
+                mv_c(&mut enc, li, 201, ev, &mem_b, &vbuf, hidden, md);
+                for (j, km) in eks.iter().enumerate() {
+                    let kj = kimi::scratch(c, ["eng-k0", "eng-k1", "eng-k2", "eng-k3"][j.min(3)], hidden);
+                    mv_c(&mut enc, li, 202 + j as u32, km, &mem_b, &kj, hidden, md);
+                    flush_pass(&enc);
+                    enc.copy_buffer_to_buffer(&kj, 0, &kbuf, (j * hidden * 4) as u64, (hidden * 4) as u64);
+                }
+                let mut c1v: Vec<f32> = Vec::with_capacity(2 * hidden);
+                c1v.extend_from_slice(e.value_b);
+                c1v.extend_from_slice(e.gamma);
+                let mut c2v: Vec<f32> = Vec::with_capacity(16 * hidden);
+                for part in [&e.key_b, &e.norm_key, &e.norm_query] {
+                    for x in part.iter() {
+                        c2v.extend_from_slice(x);
+                    }
+                }
+                c2v.extend_from_slice(e.hc_scales);
+                if c1v.len() != 2 * hidden || c2v.len() != 16 * hidden {
+                    graph_decline("Hy4-flash Engram constants of unexpected lengths");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                let (c1, c2) = (stor(bytemuck::cast_slice(&c1v)), stor(bytemuck::cast_slice(&c2v)));
+                flush_pass(&enc);
+                if mhc::encode_engram4(c, &mut enc, hidden, 1, e.eps, &vbuf, &kbuf, &c1, &c2).is_none() {
+                    graph_decline("Hy4-flash Engram kernel unavailable");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+            }
             if let Some((m, d4)) = l.mhc.and_then(|m| m.dsv4.map(|d| (m, d))) {
-                // DeepSeek-V4's four streams (GLM-5.3)
+                // DeepSeek-V4's four streams (GLM-5.3); Hy4-flash's identity
+                // form routes on 8 logits (pre, post) and writes no mix
                 let Some(mp4) = mhc::pipes4(c) else {
                     graph_decline("four-stream mHC kernels unavailable");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
-                let u = unif(&mhc::params4(hidden, 1, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps));
+                let u = unif(&mhc::params4x(hidden, 1, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps, d4.ihc, false));
                 let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
-                mhc::encode_route4(c, &mut enc, mp4, &h_buf, &w, &b, &u, hidden, 1, m.enter);
+                mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &w, &b, &u, hidden, 1, m.enter, if d4.ihc.is_some() { 8 } else { 24 });
                 let inw = stor(bytemuck::cast_slice(l.input_norm));
                 go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
             } else if let Some(m) = l.mhc {
@@ -32016,6 +32153,12 @@ pub fn forward_token_graph(
                     };
                     // every attend below scales by the layer's own
                     let attn_scale = lscale;
+                    // Hy4-flash: the layer's own query heads (32 on its sparse
+                    // layers against 64); the scratch is sized for the widest
+                    let nh = match la {
+                        crate::gpu::GraphAttn::Mla { nh: mnh, hy: Some(_), .. } => *mnh,
+                        _ => nh,
+                    };
                     let (lnkv, ldv) = (*lnkv, *ldv);
                     // This layer's head width: every size below (projection
                     // rows, rope/qk-norm, mirror rows, attend) is the layer's.
@@ -32917,7 +33060,7 @@ pub fn forward_token_graph(
                         } else {
                             None
                         };
-                        if passfuse && short_ctx && !skip_attn && hg.is_none() {
+                        if passfuse && short_ctx && !skip_attn && hg.is_none() && !hy_gate_m.contains_key(&li) {
                             attn_done = true;
                             let (mut ap, al) = attend_pipes(c, hd);
                             let dec_l;
@@ -33191,6 +33334,16 @@ pub fn forward_token_graph(
                             ts_point!(enc, 23); // attend
                         } // fused-vs-split attend arms
                           // attn_out *= sigmoid(gate) before the O projection.
+                    }
+                    // Hy4-flash: attn *= sigmoid(gate · n1), element-wise
+                    if let Some(g) = hy_gate_m.get(&li) {
+                        if attn_done {
+                            graph_decline("Hy4-flash gate on a fused attention arm");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        mv_c(&mut enc, li, 200, g, &n1, &gout, nh * ldv, hidden);
+                        let gm_u = uniform_u32x4(c, [(nh * ldv) as u32, 0, 0, 0]);
+                        go(&mut enc, &c.gate_mul, &bgc(200, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]), ((nh * ldv) as u32).div_ceil(256));
                     }
                     if *output_gate && !attn_done {
                         let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
@@ -33668,7 +33821,8 @@ pub fn forward_token_graph(
             // and the FFN norm in one dispatch (`gemma_batch::sandwich_pipe`,
             // bit-identical to the two below). `CMF_G4_FUSE=0`: two.
             let mut sw_mix_done = false;
-            if let (Some(w), Some(_), false) = (l.attn_out_norm, ob2.as_ref(), skip_norm) {
+            // (under mHC the normed product goes to the streams' merge, not a residual add)
+            if let (Some(w), Some(_), false, true) = (l.attn_out_norm, ob2.as_ref(), skip_norm, l.mhc.is_none()) {
                 if let Some((sp, sl)) = gemma_batch::sandwich_pipe(c, hidden) {
                     let won = stor(bytemuck::cast_slice(w));
                     let sbg = bgc(64, li, sl, &[&ob, &won, &h_buf, &pnw, &n1, &rms_u]);
@@ -33699,9 +33853,9 @@ pub fn forward_token_graph(
                 let mp4 = mhc::pipes4(c).expect("checked at the layer start");
                 let um = unif(&mhc::params4(hidden, 1, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps));
                 mhc::encode_merge4(c, &mut enc, mp4, &h_buf, mix_out, &um, hidden, 1);
-                let uf = unif(&mhc::params4(hidden, 1, false, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
+                let uf = unif(&mhc::params4x(hidden, 1, false, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps, d4.ihc, false));
                 let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
-                mhc::encode_route4(c, &mut enc, mp4, &h_buf, &w, &b, &uf, hidden, 1, false);
+                mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &w, &b, &uf, hidden, 1, false, if d4.ihc.is_some() { 8 } else { 24 });
                 go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
             } else if let Some(m) = l.mhc {
                 // mHC: fold the mixer output into the streams, route the
@@ -34582,6 +34736,17 @@ pub fn forward_token_graph(
                     limit,
                 } => {
                     deferred_shared = detached_shared.as_ref();
+                    // Hy4-flash's latent experts: their rows are latent_down
+                    // over the normed input, their mixture goes back through
+                    // latent_up below; the router reads the normed input
+                    let hy_lat = hy_lat_m.get(&li);
+                    let ehid = hy_lat.map_or(hidden, |l| l.2);
+                    let lat_in = kimi::scratch(c, "hy-lat-in", ehid);
+                    let lat_out = kimi::scratch(c, "hy-lat-out", ehid);
+                    if let Some((dn, _, ld)) = hy_lat {
+                        mv_c(&mut enc, li, 207, dn, &n1, &lat_in, *ld, hidden);
+                    }
+                    let (ein, eout) = if hy_lat.is_some() { (&lat_in, &lat_out) } else { (&n1, &ob) };
                     // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                     // select, fused gate+up+SiLU over the selected experts, and
                     // the weighted down accumulation into ob — rides in ONE
@@ -34662,19 +34827,19 @@ pub fn forward_token_graph(
                     let gu_mat16 = if *gu_q2 {
                         (cortiq_core::quant::expected_nbytes(
                             cortiq_core::TensorDtype::Q2TiledP,
-                            &[*mi, hidden],
+                            &[*mi, ehid],
                         )
                         .unwrap_or(0)
                             / 2) as u32
                     } else {
-                        mat16(*mi, hidden)
+                        mat16(*mi, ehid)
                     };
                     // The fifth word is the swiglu limit; the final word is
                     // `GraphAct::code` for the MoE gate/up kernels.
                     let gu_u = uniform_u32x8(
                         c,
                         [
-                            (hidden / 32) as u32,
+                            (ehid / 32) as u32,
                             *mi as u32,
                             slots as u32,
                             gu_mat16,
@@ -34688,9 +34853,9 @@ pub fn forward_token_graph(
                         c,
                         [
                             (*mi / 32) as u32,
-                            hidden as u32,
+                            ehid as u32,
                             slots as u32,
-                            mat16(hidden, *mi),
+                            mat16(ehid, *mi),
                         ],
                     );
                     let (p_gu, p_dn, l_gu, l_dn) = if *gu_q2 {
@@ -34748,7 +34913,7 @@ pub fn forward_token_graph(
                     // uniform explicitly carries code 3.
                     let r4 = if *q4tp && !*gu_q2 && *act != 3 {
                         moe_r4::decode(c).filter(|_| {
-                            moe_r4::fits(hidden, *mi, gu_mat16, mat16(hidden, *mi))
+                            moe_r4::fits(ehid, *mi, gu_mat16, mat16(ehid, *mi))
                         })
                     } else {
                         None
@@ -34784,7 +34949,7 @@ pub fn forward_token_graph(
                                 &[
                                     (0, gate_all),
                                     (1, up_all),
-                                    (2, &n1),
+                                    (2, ein),
                                     (3, msel_x),
                                     (4, mact),
                                     (5, &gu_u),
@@ -34802,12 +34967,12 @@ pub fn forward_token_graph(
                                     (10, mact),
                                     (11, msel_x),
                                     (12, mwt),
-                                    (13, &ob),
+                                    (13, eout),
                                     (14, &dn_u),
                                 ],
                             ),
                             (*mi / 4) as u32,
-                            (hidden / 4) as u32,
+                            (ehid / 4) as u32,
                         )
                     } else if let (Some(r4), true) =
                         (r4, sel_fold)
@@ -34815,7 +34980,7 @@ pub fn forward_token_graph(
                         let guf_u = uniform_u32x8(
                             c,
                             [
-                                (hidden / 32) as u32,
+                                (ehid / 32) as u32,
                                 *mi as u32,
                                 slots as u32,
                                 gu_mat16,
@@ -34848,7 +35013,7 @@ pub fn forward_token_graph(
                                     &[
                                         (0, gate_all),
                                         (1, up_all),
-                                        (2, &n1),
+                                        (2, ein),
                                         (4, mact),
                                         (5, &guf_u),
                                         (15, mlogit),
@@ -34861,14 +35026,14 @@ pub fn forward_token_graph(
                                         (8, down_all),
                                         (9, down_all),
                                         (10, mact),
-                                        (13, &ob),
+                                        (13, eout),
                                         (14, &dn_u),
                                         (15, mlogit),
                                         (16, &fd_u),
                                     ],
                                 ),
                                 (*mi / 4) as u32,
-                                (hidden / 4) as u32,
+                                (ehid / 4) as u32,
                             )
                         } else {
                         (
@@ -34880,7 +35045,7 @@ pub fn forward_token_graph(
                                 &[
                                     (0, gate_all),
                                     (1, up_all),
-                                    (2, &n1),
+                                    (2, ein),
                                     (4, mact),
                                     (5, &guf_u),
                                     (6, gate_all),
@@ -34895,14 +35060,14 @@ pub fn forward_token_graph(
                                     (8, down_all),
                                     (9, down_all),
                                     (10, mact),
-                                    (13, &ob),
+                                    (13, eout),
                                     (14, &dn_u),
                                     (15, mlogit),
                                     (16, &fd_u),
                                 ],
                             ),
                             (*mi / 4) as u32,
-                            (hidden / 4) as u32,
+                            (ehid / 4) as u32,
                         )
                         }
                     } else if let Some(r4) = r4.filter(|_| slots <= 32) {
@@ -34924,7 +35089,7 @@ pub fn forward_token_graph(
                                 &[
                                     (0, gate_all),
                                     (1, up_all),
-                                    (2, &n1),
+                                    (2, ein),
                                     (3, msel_x),
                                     (4, mact),
                                     (5, &gu_u),
@@ -34941,21 +35106,21 @@ pub fn forward_token_graph(
                                     (10, mact),
                                     (11, msel_x),
                                     (12, mwt),
-                                    (13, &ob),
+                                    (13, eout),
                                     (14, &dn_u),
                                 ],
                             ),
                             (*mi / 4) as u32,
-                            (hidden / 4) as u32,
+                            (ehid / 4) as u32,
                         )
                     } else {
                         (
                             p_gu,
                             p_dn,
-                            bg(l_gu, &[gate_all, up_all, &n1, msel_x, mact, &gu_u]),
-                            bg(l_dn, &[down_all, mact, msel_x, mwt, &ob, &dn_u]),
+                            bg(l_gu, &[gate_all, up_all, ein, msel_x, mact, &gu_u]),
+                            bg(l_dn, &[down_all, mact, msel_x, mwt, eout, &dn_u]),
                             *mi as u32,
-                            hidden as u32,
+                            ehid as u32,
                         )
                     };
                     let pr = prep(router, &n1, mlogit, *n_exp, hidden);
@@ -35001,7 +35166,7 @@ pub fn forward_token_graph(
                                 entries: &[
                                     bind_buf(0, gate_all),
                                     bind_buf(1, up_all),
-                                    bind_buf(2, &n1),
+                                    bind_buf(2, ein),
                                     bind_buf(3, mlogit),
                                     bind_buf(4, mact),
                                     bind_buf(5, &gu_u),
@@ -35188,6 +35353,11 @@ pub fn forward_token_graph(
                     } // continue_moe_std
                 }
             }
+            if let Some((_, up, ld)) = hy_lat_m.get(&li) {
+                // Hy4-flash: the latent mixture back to the hidden
+                let lat_out = kimi::scratch(c, "hy-lat-out", *ld);
+                mv_c(&mut enc, li, 208, up, &lat_out, &ob, hidden, *ld);
+            }
             if let Some(shared) = deferred_shared {
                 // The shared branch receives the same post-attention RMS
                 // input as the routed bank.  It intentionally runs after
@@ -35311,8 +35481,23 @@ pub fn forward_token_graph(
                 // already emitted at the end of the FFN pass
             } else if let Some((m, d4)) = l.mhc.and_then(|m| m.dsv4.map(|d| (m, d))) {
                 let mp4 = mhc::pipes4(c).expect("checked at the layer start");
-                let um = unif(&mhc::params4(hidden, 1, m.leave, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
-                mhc::encode_merge4(c, &mut enc, mp4, &h_buf, &ob, &um, hidden, 1);
+                // Hy4-flash: the FFN product normed (its sandwich) before the
+                // merge; the range's last layer hands on the head's fold
+                let ffn_y = match (l.ffn_out_norm, ob2.as_ref(), d4.ihc) {
+                    (Some(w), Some(o2), Some(_)) => {
+                        let won = stor(bytemuck::cast_slice(w));
+                        go(&mut enc, &c.rmsnorm, &bgc(209, li, &c.layout_rmsnorm, &[&ob, &won, o2, &rms_u]), 1);
+                        o2
+                    }
+                    _ => &ob,
+                };
+                let um = unif(&mhc::params4(hidden, 1, m.leave && m.head.is_none(), m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
+                mhc::encode_merge4(c, &mut enc, mp4, &h_buf, ffn_y, &um, hidden, 1);
+                if let (true, Some(hh)) = (m.leave, m.head.as_ref()) {
+                    let uh = unif(&mhc::params4x(hidden, 1, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps, Some(d4.ihc.unwrap_or(1.0)), true));
+                    let (hw, hb) = (stor(bytemuck::cast_slice(hh.w)), stor(bytemuck::cast_slice(hh.base)));
+                    mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &hw, &hb, &uh, hidden, 1, false, 4);
+                }
                 if li + 1 < layers.len() {
                     let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
                     go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
@@ -36154,6 +36339,30 @@ pub fn forward_batch_graph_at(
     mut spec: Option<crate::gpu::SpecTail<'_>>,
     layers_run: Option<&mut usize>,
 ) -> crate::gpu::BatchGraphOutcome {
+    if crate::gpu::hy_layers(layers) {
+        // Hy4-flash's prompt arm takes chunks of up to 16 rows (`hy4`'s
+        // wgpu chunk): past that the decode after the chunk read a wrong
+        // state on an A40 (16 rows and fewer: the token path's text).
+        // `CMF_HY4_WGPU_BATCH=0`: the prompt goes a token at a time.
+        if std::env::var("CMF_HY4_WGPU_BATCH").as_deref() == Ok("0") || k > hy4_wgpu_rows() {
+            bgraph_refused("Hy4-flash prompt arm: off, or a chunk past 16 rows");
+            return crate::gpu::BatchGraphOutcome::Declined;
+        }
+        let last = positions.last().copied().unwrap_or(0);
+        let why = hy4_token_problem(layers, last, 1).or_else(|| {
+            layers.iter().filter_map(|l| l.engram.as_ref()).any(|e| e.mem.len() < k * e.mem_dim || e.on.len() < k).then_some("Hy4-flash: Engram rows of this chunk missing")
+        });
+        let why = why.or_else(|| {
+            layers
+                .iter()
+                .any(|l| matches!(&l.ffn, crate::gpu::GraphFfn::Moe { latent: Some(_), gu_q2: true, .. }))
+                .then_some("Hy4-flash: q2tp latent experts (no batched clamped q2tp kernel for 512 experts)")
+        });
+        if let Some(why) = why.or_else(|| spec.is_some().then_some("Hy4-flash: a verify window")) {
+            bgraph_refused(why);
+            return crate::gpu::BatchGraphOutcome::Declined;
+        }
+    }
     let t_bfn = std::time::Instant::now();
     // `set_batch_defer` arms this call only.
     let defer_req = BATCH_DEFER.with(|f| f.replace(false));
@@ -36653,6 +36862,35 @@ pub fn forward_batch_graph_at(
     let gemmable =
         |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9 | 10) || (m.kind == 7 && c.graph_x.is_some());
     let t_resolve = std::time::Instant::now();
+    // Hy4-flash's output gate, latent experts' projections and Engram, by layer
+    let mut hy_gate_bm: std::collections::HashMap<usize, GMat> = std::collections::HashMap::new();
+    let mut hy_lat_bm: std::collections::HashMap<usize, (GMat, GMat, usize)> = std::collections::HashMap::new();
+    let mut hy_eng_bm: std::collections::HashMap<usize, (GMat, Vec<GMat>)> = std::collections::HashMap::new();
+    for (li, l) in layers.iter().enumerate() {
+        if let Some(e) = &l.engram {
+            let v = resolve(&e.value, hidden, e.mem_dim).filter(|m| gemmable(m));
+            let ks: Option<Vec<GMat>> = e.keys.iter().map(|k| resolve(k, hidden, e.mem_dim).filter(|m| gemmable(m))).collect();
+            let (Some(v), Some(ks)) = (v, ks) else {
+                bgraph_refused("Hy4-flash Engram projections not gemmable");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            hy_eng_bm.insert(li, (v, ks));
+        }
+        if let crate::gpu::GraphAttn::Mla { hy: Some(h), nh: mnh, v_dim, .. } = &l.attn {
+            let Some(g) = resolve(&h.gate, mnh * v_dim, hidden).filter(|m| gemmable(m)) else {
+                bgraph_refused("Hy4-flash output gate not gemmable");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            hy_gate_bm.insert(li, g);
+        }
+        if let crate::gpu::GraphFfn::Moe { latent: Some(lt), .. } = &l.ffn {
+            let (Some(dn), Some(up)) = (resolve(&lt.down, lt.dim, hidden).filter(|m| gemmable(m)), resolve(&lt.up, hidden, lt.dim).filter(|m| gemmable(m))) else {
+                bgraph_refused("latent expert projections not gemmable");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            hy_lat_bm.insert(li, (dn, up, lt.dim));
+        }
+    }
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
     for (bli, l) in layers.iter().enumerate() {
@@ -36992,10 +37230,13 @@ pub fn forward_batch_graph_at(
                 route_scale,
                 detached_shared,
                 limit,
+                latent,
                 ..
             } => {
                 let wide = *n_exp > 256 && moe_sel2::pipes(c).is_some();
-                if *top_k >= 16 || (*n_exp > 256 && !wide) || *n_exp > 512 || experts.len() != n_exp + usize::from(*has_shared)
+                // the experts' own width: Hy4-flash's latent, else the hidden
+                let ehid = latent.as_ref().map_or(hidden, |lt| lt.dim);
+                if (*top_k >= 16 && !wide) || *top_k + usize::from(*has_shared) > 32 || (*n_exp > 256 && !wide) || *n_exp > 512 || experts.len() != n_exp + usize::from(*has_shared)
                 {
                     bgraph_refused("site:5979");
                     return batch_outcome(o1_started || state_started, false);
@@ -37032,7 +37273,11 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 }
                 // q4_tiled experts: the split layout and its row-blocked kernels
-                let q4ts = !*q82 && !*q4tp && !*gu_q2 && moe_q4ts::on(c, hidden, *mi);
+                let q4ts = !*q82 && !*q4tp && !*gu_q2 && latent.is_none() && moe_q4ts::on(c, hidden, *mi);
+                if latent.is_some() && *q82 {
+                    bgraph_refused("latent experts in q8_2f");
+                    return batch_outcome(o1_started || state_started, false);
+                }
                 let packed = if *q82 {
                     moe_expert_bufs_q82(c, model, experts, *mi, hidden)
                 } else if q4ts {
@@ -37048,7 +37293,7 @@ pub fn forward_batch_graph_at(
                     // memory is made there when the prompt comes first
                     let sys = bplan.as_ref().is_some_and(|p| p.sys.get(bli) == Some(&true));
                     SYS_EXPERTS_NEXT.with(|x| x.set(sys));
-                    let b = moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false);
+                    let b = moe_expert_bufs(c, model, experts, *mi, ehid, *q4tp, *gu_q2, false);
                     SYS_EXPERTS_NEXT.with(|x| x.set(false));
                     b
                 };
@@ -38532,14 +38777,52 @@ pub fn forward_batch_graph_at(
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         // SenseNova-Loop mHC over the k rows: route every row's streams
         // into its hidden, norm the branches.
+        // Hy4-flash's Engram onto every row's streams before the attention's route
+        if let (Some(e), Some((ev, eks))) = (l.engram.as_ref(), hy_eng_bm.get(&li)) {
+            if e.on[..k].iter().any(|&o| !o) {
+                bgraph_refused("Hy4-flash Engram over an image or pad row");
+                return batch_outcome(o1_started || state_started, false);
+            }
+            let md = e.mem_dim;
+            let mem_b = stor(bytemuck::cast_slice(&e.mem[..k * md]));
+            let vbuf = rwc(k * hidden);
+            let kbuf = rwc(4 * k * hidden);
+            ematb(&mut enc, ev, &mem_b, &vbuf, hidden, md);
+            for (j, km) in eks.iter().enumerate() {
+                let kj = rwc(k * hidden);
+                ematb(&mut enc, km, &mem_b, &kj, hidden, md);
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&kj, 0, &kbuf, (j * k * hidden * 4) as u64, (k * hidden * 4) as u64);
+            }
+            let mut c1v: Vec<f32> = Vec::with_capacity(2 * hidden);
+            c1v.extend_from_slice(e.value_b);
+            c1v.extend_from_slice(e.gamma);
+            let mut c2v: Vec<f32> = Vec::with_capacity(16 * hidden);
+            for part in [&e.key_b, &e.norm_key, &e.norm_query] {
+                for x in part.iter() {
+                    c2v.extend_from_slice(x);
+                }
+            }
+            c2v.extend_from_slice(e.hc_scales);
+            if c1v.len() != 2 * hidden || c2v.len() != 16 * hidden {
+                bgraph_refused("Hy4-flash Engram constants of unexpected lengths");
+                return batch_outcome(o1_started || state_started, false);
+            }
+            let (c1, c2) = (stor(bytemuck::cast_slice(&c1v)), stor(bytemuck::cast_slice(&c2v)));
+            flush_pass(&enc);
+            if mhc::encode_engram4(c, &mut enc, hidden, k, e.eps, &vbuf, &kbuf, &c1, &c2).is_none() {
+                bgraph_refused("Hy4-flash Engram kernel unavailable");
+                return batch_outcome(o1_started || state_started, false);
+            }
+        }
         if let Some((m, d4)) = l.mhc.and_then(|m| m.dsv4.map(|d| (m, d))) {
             let Some(mp4) = mhc::pipes4(c) else {
                 bgraph_refused("four-stream mHC kernels unavailable");
                 return batch_outcome(o1_started || state_started, false);
             };
-            let u = unif(&mhc::params4(hidden, k, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps));
+            let u = unif(&mhc::params4x(hidden, k, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps, d4.ihc, false));
             let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
-            mhc::encode_route4(c, &mut enc, mp4, &h_buf, &w, &b, &u, hidden, k, m.enter);
+            mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &w, &b, &u, hidden, k, m.enter, if d4.ihc.is_some() { 8 } else { 24 });
             let inw = stor(bytemuck::cast_slice(l.input_norm));
             go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw, &n1, &rms_u]), k as u32);
         } else if let Some(m) = l.mhc {
@@ -38595,6 +38878,11 @@ pub fn forward_batch_graph_at(
                 // This layer's head width: every size below is the layer's.
                 // Equal to the call's `hd` except on Gemma-4 global layers.
                 let hd = *lhd;
+                // Hy4-flash: the layer's own query heads (32 on its sparse layers)
+                let nh = match la {
+                    crate::gpu::GraphAttn::Mla { nh: mnh, hy: Some(_), .. } => *mnh,
+                    _ => nh,
+                };
                 let o1_here = o1.get(li).and_then(|v| v.as_ref());
                 let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&vec![0f32; hd])));
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
@@ -40244,6 +40532,13 @@ pub fn forward_batch_graph_at(
                         ((k * nh * ldv) as u32).div_ceil(256),
                     );
                 }
+                // Hy4-flash: attn *= sigmoid(gate · n1) element-wise, every row
+                if let Some(g) = hy_gate_bm.get(&li) {
+                    let gk = rwc(k * nh * ldv);
+                    ematb(&mut enc, g, &n1, &gk, nh * ldv, hidden);
+                    let gm_u = unif(&[(k * nh * ldv) as u32, 0, 0, 0]);
+                    go(&mut enc, &c.gate_mul, &bg(&c.layout_gate_mul, &[&gk, &attn_bb, &gm_u]), ((k * nh * ldv) as u32).div_ceil(256));
+                }
                 let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * ldv) else {
                     bgraph_refused("Prism transform unavailable for batched output projection");
                     return batch_outcome(o1_started || state_started, false);
@@ -40855,9 +41150,9 @@ pub fn forward_batch_graph_at(
             let mp4 = mhc::pipes4(c).expect("checked at the layer start");
             let um = unif(&mhc::params4(hidden, k, false, m.iters, d4.attn_scale, d4.eps, d4.rms_eps));
             mhc::encode_merge4(c, &mut enc, mp4, &h_buf, mix_out, &um, hidden, k);
-            let uf = unif(&mhc::params4(hidden, k, false, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
+            let uf = unif(&mhc::params4x(hidden, k, false, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps, d4.ihc, false));
             let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
-            mhc::encode_route4(c, &mut enc, mp4, &h_buf, &w, &b, &uf, hidden, k, false);
+            mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &w, &b, &uf, hidden, k, false, if d4.ihc.is_some() { 8 } else { 24 });
             go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &pnw, &n1, &rms_u]), k as u32);
         } else if let Some(m) = l.mhc {
             // mHC: fold the mixer outputs into the streams, route the FFN
@@ -41091,6 +41386,16 @@ pub fn forward_batch_graph_at(
                 limit,
             } => {
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                // Hy4-flash's latent experts: their rows are latent_down over
+                // the normed rows, their mixture goes back through latent_up
+                let hy_lat = hy_lat_bm.get(&li);
+                let ehid = hy_lat.map_or(hidden, |l| l.2);
+                let lat_in = rwc(k * ehid);
+                let lat_out = rwc(k * ehid);
+                if let Some((dn, _, ld)) = hy_lat {
+                    ematb(&mut enc, dn, &n1, &lat_in, *ld, hidden);
+                }
+                let (ein, eout) = if hy_lat.is_some() { (&lat_in, &lat_out) } else { (&n1, &ob) };
                 if let Some(ex) = stream {
                     // the experts from the file into the staging bank: after
                     // the work so far (the last layer's kernels read it), the
@@ -41120,7 +41425,10 @@ pub fn forward_batch_graph_at(
                 // A batch whose picks outnumber the bank's experts reads the
                 // system-memory bank once: copied whole to the card's staging
                 // bank, the kernels then run on that.
-                let stage = if *sys && k * (*top_k + usize::from(*has_shared)) >= *n_exp {
+                // (not Hy4-flash's latent banks: a staged batch of 32 rows and
+                // more left the decode after it emitting "!!!!" on an A40 —
+                // 31 rows, read in place, were right)
+                let stage = if *sys && hy_lat.is_none() && k * (*top_k + usize::from(*has_shared)) >= *n_exp {
                     moe_cache::staging(c, [gate_all.size(), up_all.size(), down_all.size()])
                 } else {
                     None
@@ -41184,17 +41492,17 @@ pub fn forward_batch_graph_at(
                 let gu_stride = if *gu_q2 {
                     (cortiq_core::quant::expected_nbytes(
                         cortiq_core::TensorDtype::Q2TiledP,
-                        &[*mi, hidden],
+                        &[*mi, ehid],
                     )
                     .unwrap_or(0)
                         / 2) as u32
                 } else {
-                    mat16(*mi, hidden)
+                    mat16(*mi, ehid)
                 };
                 let gu_u = uniform_u32x8(
                     c,
                     [
-                        (hidden / 32) as u32,
+                        (ehid / 32) as u32,
                         *mi as u32,
                         slots as u32,
                         gu_stride,
@@ -41210,9 +41518,9 @@ pub fn forward_batch_graph_at(
                     c,
                     [
                         (*mi / 32) as u32,
-                        hidden as u32,
+                        ehid as u32,
                         slots as u32,
-                        mat16(hidden, *mi),
+                        mat16(ehid, *mi),
                     ],
                 );
                 let (p_gu, p_dn, l_gu, l_dn) = if *gu_q2 {
@@ -41269,7 +41577,7 @@ pub fn forward_batch_graph_at(
                     && std::env::var("CMF_MOEG_Q2").as_deref() != Ok("0")
                     && moe_r4::prefill(c).is_some()
                     && moe_r4::bucket_count(*n_exp, *has_shared).is_some()
-                    && moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi));
+                    && moe_r4::fits(ehid, *mi, gu_stride, mat16(ehid, *mi));
                 if (*q4tp || *q4ts) && (!*gu_q2 || q2g) && router.kind == 4 && sgate.kind == 4 && (*n_exp <= 256 || sel2.is_some()) {
                     // Uniform q4tp experts + f32 router/gate: k router
                     // matvecs (offset bindings, no staging rows) plus THREE
@@ -41305,9 +41613,9 @@ pub fn forward_batch_graph_at(
                     );
                     let bg_gu = bg(
                         &c.layout_moe_gu_b,
-                        &[gate_all, up_all, &n1, msel, mact, &gu_u],
+                        &[gate_all, up_all, ein, msel, mact, &gu_u],
                     );
-                    let bg_dn = bg(&c.layout_moe_dn_b, &[down_all, mact, msel, mwt, &ob, &dn_u]);
+                    let bg_dn = bg(&c.layout_moe_dn_b, &[down_all, mact, msel, mwt, eout, &dn_u]);
                     // Expert-grouped arm: bucket the selections by expert,
                     // stream each expert once for its tokens, then mix the
                     // slot outputs per token. A gated shared expert is the
@@ -41323,7 +41631,7 @@ pub fn forward_batch_graph_at(
                         moe_r4::prefill(c).and_then(|pg| {
                             moe_r4::bucket_count(*n_exp, *has_shared)
                                 .filter(|_| {
-                                    moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                                    moe_r4::fits(ehid, *mi, gu_stride, mat16(ehid, *mi))
                                 })
                                 .map(|buckets| (pg, buckets))
                         })
@@ -41346,11 +41654,11 @@ pub fn forward_batch_graph_at(
                         // includes MiniCPM's trailing shared bucket 256.
                         let goff = mkb(buckets + 1, "moeg-off");
                         let gent = mkb(n_ent, "moeg-ent");
-                        let ypart = mkb(n_ent * hidden, "moeg-y");
+                        let ypart = mkb(n_ent * ehid, "moeg-y");
                         let gr_u = uniform_u32x4(c, [buckets as u32, n_ent as u32, 0, 0]);
                         let gs_u = uniform_u32x4(
                             c,
-                            [hidden as u32, slots as u32, (k * hidden) as u32, 0],
+                            [ehid as u32, slots as u32, (k * ehid) as u32, 0],
                         );
                         let bg_gr = bind_pairs(
                             c,
@@ -41367,7 +41675,7 @@ pub fn forward_batch_graph_at(
                             bind_pairs(
                                 c,
                                 ggu_l,
-                                &[(0, gate_all), (1, up_all), (4, &n1), (5, &goff), (6, &gent), (7, mact), (8, &gu_u)],
+                                &[(0, gate_all), (1, up_all), (4, ein), (5, &goff), (6, &gent), (7, mact), (8, &gu_u)],
                             )
                         } else {
                             bind_pairs(
@@ -41378,7 +41686,7 @@ pub fn forward_batch_graph_at(
                                     (1, up_all),
                                     (2, gate_all),
                                     (3, up_all),
-                                    (4, &n1),
+                                    (4, ein),
                                     (5, &goff),
                                     (6, &gent),
                                     (7, mact),
@@ -41400,7 +41708,7 @@ pub fn forward_batch_graph_at(
                             ],
                         );
                         let bg_gs =
-                            bind_pairs(c, &pg.sum_l, &[(0, &ypart), (1, mwt), (2, &ob), (3, &gs_u)]);
+                            bind_pairs(c, &pg.sum_l, &[(0, &ypart), (1, mwt), (2, eout), (3, &gs_u)]);
                         let tz = k.div_ceil(moe_r4::MOEG_TOKENS) as u32;
                         pass.set_pipeline(&pg.group);
                         pass.set_bind_group(0, &bg_gr, &[]);
@@ -41410,8 +41718,8 @@ pub fn forward_batch_graph_at(
                         // run only the non-empty tiles (`clover::encode_moe`).
                         if let (Some(cp), Some(_)) = (clover_p, preview) {
                             clover::encode_moe(
-                                c, &mut pass, cp, gate_all, up_all, down_all, &n1, &goff, &gent,
-                                mact, &ypart, &gu_u, &dn_u, buckets, n_ent, *mi, hidden,
+                                c, &mut pass, cp, gate_all, up_all, down_all, ein, &goff, &gent,
+                                mact, &ypart, &gu_u, &dn_u, buckets, n_ent, *mi, ehid,
                             );
                         } else {
                             pass.set_pipeline(ggu_p);
@@ -41419,11 +41727,11 @@ pub fn forward_batch_graph_at(
                             pass.dispatch_workgroups((*mi as u32).div_ceil(64), buckets as u32, tz);
                             pass.set_pipeline(gdn_p);
                             pass.set_bind_group(0, &bg_gdn, &[]);
-                            pass.dispatch_workgroups((hidden as u32).div_ceil(64), buckets as u32, tz);
+                            pass.dispatch_workgroups((ehid as u32).div_ceil(64), buckets as u32, tz);
                         }
                         pass.set_pipeline(&pg.sum);
                         pass.set_bind_group(0, &bg_gs, &[]);
-                        pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
+                        pass.dispatch_workgroups(((k * ehid) as u32).div_ceil(256), 1, 1);
                     } else if *q4ts {
                         drop(pass);
                         bgraph_refused("q4_tiled split experts without the grouped prefill buckets");
@@ -41434,7 +41742,7 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups(*mi as u32, slots as u32, k as u32);
                         pass.set_pipeline(&c.moe_down_q4tp_b);
                         pass.set_bind_group(0, &bg_dn, &[]);
-                        pass.dispatch_workgroups(hidden as u32, k as u32, 1);
+                        pass.dispatch_workgroups(ehid as u32, k as u32, 1);
                     }
                     drop(pass);
                     continue_ffn = false;
@@ -41442,6 +41750,10 @@ pub fn forward_batch_graph_at(
                 if continue_ffn && preview.is_some() {
                     bgraph_refused("block preview: MoE layout without the batched router arm");
                     return batch_outcome(o1_started || state_started, false);
+                }
+                if continue_ffn && hy_lat.is_some() {
+                    bgraph_refused("Hy4-flash latent experts on the per-row MoE arm");
+                    return batch_outcome(true, false);
                 }
                 if continue_ffn {
                     for i in 0..k {
@@ -41469,6 +41781,10 @@ pub fn forward_batch_graph_at(
                         drop(pass);
                         cpo(&mut enc, &row_out, &ob, i * hidden, hidden);
                     }
+                }
+                // Hy4-flash: the latent mixture of every row back to the hidden
+                if let Some((_, up, ld)) = hy_lat {
+                    ematb(&mut enc, up, &lat_out, &ob, hidden, *ld);
                 }
                 // a streamed layer's pools seeded with the experts of the
                 // chunk's last rows from the staging bank (the per-row arm
@@ -41567,8 +41883,16 @@ pub fn forward_batch_graph_at(
             );
         } else if let Some((m, d4)) = l.mhc.and_then(|m| m.dsv4.map(|d| (m, d))) {
             let mp4 = mhc::pipes4(c).expect("checked at the layer start");
-            let um = unif(&mhc::params4(hidden, k, m.leave, m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
-            mhc::encode_merge4(c, &mut enc, mp4, &h_buf, &ob, &um, hidden, k);
+            // Hy4-flash: the FFN product normed (its sandwich) before the
+            // merge; the range's last layer hands on the head's fold
+            let ffn_y = if d4.ihc.is_some() { ffn_out } else { &ob };
+            let um = unif(&mhc::params4(hidden, k, m.leave && m.head.is_none(), m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
+            mhc::encode_merge4(c, &mut enc, mp4, &h_buf, ffn_y, &um, hidden, k);
+            if let (true, Some(hh)) = (m.leave, m.head.as_ref()) {
+                let uh = unif(&mhc::params4x(hidden, k, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps, Some(d4.ihc.unwrap_or(1.0)), true));
+                let (hw, hb) = (stor(bytemuck::cast_slice(hh.w)), stor(bytemuck::cast_slice(hh.base)));
+                mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &hw, &hb, &uh, hidden, k, false, 4);
+            }
             if li + 1 < layers.len() {
                 let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
                 go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw_next, &n1, &rms_u]), k as u32);

@@ -1210,6 +1210,7 @@ impl Music3Ar {
                     return false;
                 };
                 layers.push(crate::gpu::GraphLayer {
+                    engram: None,
                     mhc: None,
                     input_norm: &blk.n1.w,
                     attn: crate::gpu::GraphAttn::Full {

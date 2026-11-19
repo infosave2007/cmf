@@ -251,6 +251,12 @@ fn caches() -> &'static Mutex<HashMap<Key, Arc<Cache>>> {
     M.get_or_init(Default::default)
 }
 
+/// The banks whose cache the card refused (`get` does not ask again).
+fn refused() -> &'static Mutex<std::collections::HashSet<Key>> {
+    static M: OnceLock<Mutex<std::collections::HashSet<Key>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
 /// The keys of the banks `moe_expert_sysmem` placed in system memory: only
 /// those get slots.
 fn sys_banks() -> &'static Mutex<std::collections::HashSet<Key>> {
@@ -286,16 +292,17 @@ pub(crate) fn get(
     if cap < slots || ne == 0 || slots == 0 || slots > 64 || !is_sys_bank(key) || pipes(c).is_none() {
         return None;
     }
-    let cap = cap.min(ne);
+    if refused().lock().unwrap().contains(&key) {
+        return None;
+    }
+    let want = cap.min(ne);
     if gu_len == 0 || d_len == 0 || gu_len % 4 != 0 || d_len % 4 != 0 {
         return None;
     }
-    let total = (cap * (2 * gu_len + d_len)) as u64;
     let max_bind = c.device.limits().max_storage_buffer_binding_size as u64;
-    if (cap * gu_len) as u64 > max_bind || (cap * d_len) as u64 > max_bind {
+    if (want * gu_len) as u64 > max_bind || (want * d_len) as u64 > max_bind {
         return None;
     }
-    let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let mk = |label: &'static str, size: usize| {
         c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -304,9 +311,20 @@ pub(crate) fn get(
             mapped_at_creation: false,
         })
     };
+    // a refusal is kept: a layer whose cache the card refused does not ask
+    // again every call (each ask cost ~20 ms: Hy4-flash on a whole A40)
+    let cap = want;
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let g = mk("moe-cache-g", cap * gu_len);
     let u = mk("moe-cache-u", cap * gu_len);
     let d = mk("moe-cache-d", cap * d_len);
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("wgpu: expert cache of {cap} slots refused ({e}); the layer reads its bank in place");
+        refused().lock().unwrap().insert(key);
+        return None;
+    }
+    let total = (cap * (2 * gu_len + d_len)) as u64;
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let mut st = vec![0u32; 1 + ne + 2 * cap];
     st[1..1 + ne + cap].fill(NONE);
     let st = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -322,6 +340,7 @@ pub(crate) fn get(
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
         tracing::warn!("wgpu: expert cache of {cap} slots refused ({e}); the layer reads its bank in place");
+        refused().lock().unwrap().insert(key);
         return None;
     }
     let (gu_words, dn_words) = ((gu_len / 4) as u32, (d_len / 4) as u32);
