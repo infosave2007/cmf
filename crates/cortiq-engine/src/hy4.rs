@@ -1271,8 +1271,17 @@ fn prompt_rows(
     // long calls: a streamed layer's experts cross the bus once a call (the
     // CUDA hybrid runs a long prompt a layer at a time), and the Engram rows
     // of a call fault in together — 2048 rows on a card of 32 GB and more
+    // (wgpu: chunks of 16 rows, `gpu_wgpu::hy4_wgpu_rows`)
     let big = crate::gpu::vram_budget() >= 32 << 30;
-    let chunk = std::env::var("CMF_HY4_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(if big { 2048 } else { 512 }).max(1);
+    #[cfg(feature = "gpu")]
+    let small = if crate::gpu::wgpu_active() { Some(crate::gpu_wgpu::hy4_wgpu_rows()) } else { None };
+    #[cfg(not(feature = "gpu"))]
+    let small: Option<usize> = None;
+    let chunk = std::env::var("CMF_HY4_PROMPT_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(small.unwrap_or(if big { 2048 } else { 512 }))
+        .max(1);
     let body = ids.len();
     let mut done = 0usize;
     let mut all: Vec<u32> = state.tokens.clone();

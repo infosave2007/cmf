@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-11-19
+
 ### Added
 - Tencent Hy4-flash (`hy_v4_flash`, 220B parameters, 12B active): the converter reads the FP8 release (e4m3
   with 128×128 block scales, decoded exactly) with optional bf16 shards on top (`CMF_HY4_BF16`), and writes
-  `q4tp` (everything 4-bit, the Engram tables as the release ships them) or `q2tp` (the routed experts' gate/up
-  2-bit, the rest 4-bit). The engine runs the whole stack: four hyper-connection streams (iHC), gated MLA with
+  `q4tp` (the routed experts 4-bit, the rest 8-bit, the Engram tables as the release ships them) or `q2tp` (the
+  routed experts' gate/up 2-bit, the rest 4-bit). The engine runs the whole stack: four hyper-connection streams (iHC), gated MLA with
   learned sinks and a sandwich norm, 30 sliding-window and 12 sparse layers (dense to 2048 positions, then the
   compressed indexer: groups of four, 511 groups and the own), the latent MoE (top 16 of 512 experts on a
   1536-wide latent, a shared expert on the stream) and Engram (bigram and trigram hash tables on four layers).
@@ -20,10 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bf16) and 30.23 (float32).
 - `cortiq hy4-sfq`: SFq (docs/Q2TP_SCALE_REFINE.md) for Hy4-flash's routed experts. `--capture-only` runs the
   calibration text through the card's prompt graph and keeps every routed FFN's latent rows and router picks;
-  the encode puts a channel scale on the latent (gate/up columns divided, `latent_down` rows multiplied), runs
-  quantize-moe's GPTQ per expert with the code refinement and rewrites the experts and `latent_down` in place.
+  the encode puts a channel scale on the latent (gate/up columns divided, `latent_down` rows multiplied) and runs
+  quantize-moe's GPTQ per expert with the code refinement, in place (`CMF_HY4_SFQ_DRY=1` measures on held-out
+  rows or windows instead, `CMF_HY4_SFQ_RTN=1` writes the converter's rounding back). Measured on the q2tp file
+  (98 304 calibration tokens): the experts' output error on unseen documents falls 4× (layer 1: 0.091 → 0.021),
+  Rust perplexity 4.62 → 4.31, but WikiText-2 rises 33.2 → 42.6 and Chinese 36.4 → 41.4; the published q2tp
+  keeps the converter's rounding.
 - Perplexity of a Hy4-flash file on the card's prompt graph (`hy4::nll`: the rows in long calls, the final norm
   and the head on the host; `CMF_HY4_NLL_BATCH=0` keeps the token path).
+- Hy4-flash on Vulkan / DX12 / Metal (wgpu): the token graph runs its stack — Engram on the four streams
+  (`mhc::encode_engram4`), the identity hyper-connections (8 router logits) and the head's closing fold, MLA with
+  the layer's own query heads, RoPE table, window and sinks and the element-wise output gate, the latent experts
+  (the expert banks `latent` wide, `latent_down` before and `latent_up` after them), the FFN output norm before the
+  merge; the prompt goes in chunks of 16 rows through the batch graph (`CMF_HY4_WGPU_BATCH=0`: a token at a time).
+  The sparse layers' indexer has no wgpu arm yet: past 2048 positions the call declines to the host. Greedy text on
+  an A40 = the CUDA text up to a near tie.
+
+### Fixed
+- `--no-think` (and `enable_thinking: false`) gave every template `reasoning_effort = low`, GLM-5's direct-answer
+  budget; Hy4-flash's template accepts only `no_think` / `high` / `max` and raised, so the prompt fell back to
+  ChatML. A template that names `no_think` now gets it.
 
 ### Changed
 - CUDA hybrid, streamed experts: `MADV_WILLNEED` over the file pages of an expert is no longer asked when the RAM

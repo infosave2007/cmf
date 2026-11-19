@@ -191,6 +191,8 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
     let (lo, hi) = o.layers.unwrap_or((0, usize::MAX));
     // CMF_HY4_SFQ_DRY=1: encode and time, write nothing (any file of the model as --target)
     let dry = std::env::var("CMF_HY4_SFQ_DRY").as_deref() == Ok("1");
+    let rtn_only = std::env::var("CMF_HY4_SFQ_RTN").as_deref() == Ok("1");
+    anyhow::ensure!(!rtn_only || o.alpha == 0.0, "CMF_HY4_SFQ_RTN=1 takes --alpha 0 (the converter's experts are unscaled)");
     eprintln!(
         "hy4-sfq encode: {} routed FFNs, {ntok} calibration tokens, top-{top_k}, α {} (0 = no channel scale), refine {:?}, clamp {limit}",
         lis.len(),
@@ -280,22 +282,60 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
             anyhow::ensure!(drows == dim && dcols == inter, "expert {e}: down {drows}x{dcols}");
             Ok(ExpertW { g, u, d })
         };
-        let held = vec![false; ntok];
+        // CMF_HY4_SFQ_HOLD=n: every n-th token stays out of the Hessians and
+        // a dry run measures the encodes on those rows (8 in a dry run, else 0)
+        let hold = std::env::var("CMF_HY4_SFQ_HOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(if dry { 8 } else { 0 });
+        // CMF_HY4_SFQ_HOLDWIN=1: whole windows held out (every `hold`-th
+        // window of the capture: unseen documents), not every `hold`-th token
+        let win = meta["window"].as_u64().unwrap_or(2048) as usize;
+        let by_win = std::env::var("CMF_HY4_SFQ_HOLDWIN").as_deref() == Ok("1");
+        let held: Vec<bool> = (0..ntok).map(|t| hold > 1 && if by_win { (t / win.max(1)) % hold == hold - 1 } else { t % hold == hold - 1 }).collect();
         let mean = (ntok * top_k) as f64 / ne as f64;
         let prior_n0 = std::env::var("CMF_MOE_PRIOR").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(if mean < dim as f64 { dim as f64 } else { 0.0 });
         let job = LayerJob { li, hidden: dim, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s: 8192, held: &held, route_w: RouteW::Off };
-        let out = encode_layer(engine, &ec, &job, &lr, true, false, None, None, &get)?;
+        // CMF_HY4_SFQ_RTN=1: the converter's rounding of every expert (and
+        // latent_down unscaled with --alpha 0): an earlier encode undone
+        let out = if rtn_only {
+            let nt = o.threads.max(1);
+            let parts: Vec<anyhow::Result<Vec<(usize, [Vec<u8>; 3])>>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..nt)
+                    .map(|k| {
+                        let get = &get;
+                        sc.spawn(move || -> anyhow::Result<Vec<(usize, [Vec<u8>; 3])>> {
+                            let mut v = Vec::new();
+                            for e in (k..ne).step_by(nt) {
+                                v.push((e, rtn_expert(Codec::Q2tp, &get(Part::Routed, e)?, inter, dim)));
+                            }
+                            Ok(v)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("an RTN worker panicked")))).collect()
+            });
+            let mut routed: Vec<[Vec<u8>; 3]> = (0..ne).map(|_| [Vec::new(), Vec::new(), Vec::new()]).collect();
+            for p in parts {
+                for (e, enc) in p? {
+                    routed[e] = enc;
+                }
+            }
+            crate::moegptq::LayerOut { routed, shared: None, n_gptq: 0, n_rtn: ne, diag: Vec::new(), tim: [0.0; 5], t_shared: 0.0 }
+        } else {
+            encode_layer(engine, &ec, &job, &lr, true, false, None, None, &get)?
+        };
         anyhow::ensure!(out.routed.len() == ne, "layer {li}: {} experts encoded of {ne}", out.routed.len());
         if dry {
-            // the output error of the first experts with rows, on their own rows: RTN against this encode
+            // the output error of the experts, RTN against this encode: on the
+            // held-out rows (every `hold`-th token) when there are any, else on
+            // their own calibration rows; every 16th expert with rows
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
             for (j, &e) in lr.picks.iter().enumerate() {
-                if (e as usize) < ne {
-                    lists[e as usize].push((j / top_k) as u32);
+                let t = j / top_k;
+                if (e as usize) < ne && (hold <= 1 || held[t]) {
+                    lists[e as usize].push(t as u32);
                 }
             }
             let (mut base, mut e_rtn, mut e_enc, mut cnt) = (0f64, 0f64, 0f64, 0usize);
-            for e in (0..ne).filter(|&e| lists[e].len() >= o.min_rows).take(16) {
+            for e in (0..ne).step_by(16).filter(|&e| lists[e].len() >= 4) {
                 let w = get(Part::Routed, e)?;
                 let xs = gather_rows(&lr.x, dim, &lists[e], 1.0, o.threads);
                 let m = lists[e].len();
@@ -311,7 +351,13 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
                 cnt += 1;
             }
             let hash = out.routed.iter().flatten().fold(0u64, |h, b| cortiq_core::hash::hash64(b) ^ h.rotate_left(7));
-            eprintln!("  layer {li}: {cnt} experts' rel. output error: RTN {:.5}, this encode {:.5} ({:+.1} %); payload hash {hash:016x}", e_rtn / base, e_enc / base, (e_enc / e_rtn - 1.0) * 100.0);
+            eprintln!(
+                "  layer {li}: {cnt} experts' rel. output error on {} rows: RTN {:.5}, this encode {:.5} ({:+.1} %); prior {prior_n0}; payload hash {hash:016x}",
+                if hold > 1 { "held-out" } else { "their calibration" },
+                e_rtn / base,
+                e_enc / base,
+                (e_enc / e_rtn - 1.0) * 100.0
+            );
             eprintln!(
                 "  layer {li} (dry run, nothing written): {} GPTQ + {} rounded experts, t in [{tmin:.3}, {tmax:.3}], {:.0} s; stages (summed over workers) inputs {:.1} fold {:.1} sweeps+refine {:.1} down fold {:.1} down sweep+refine {:.1} s",
                 out.n_gptq,
@@ -337,7 +383,9 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
                 patches.push((i, dt, enc[k].clone()));
             }
         }
-        if o.alpha > 0.0 {
+        // latent_down from the source with this run's scale (1 without one:
+        // an earlier scaled run may have left its own in the file)
+        {
             let name = format!("{m}latent_down.weight");
             let i = idx(&name)?;
             let te = &target.tensors[i];

@@ -1381,6 +1381,9 @@ impl Tokenizer {
         let mut env = crate::chat_template::environment();
         self.add_special_globals(&mut env);
         let tpl_src = strip_generation_tags(tpl);
+        // a direct answer's reasoning budget: GLM-5's templates take `low`,
+        // Hy4-flash's only `no_think` / `high` / `max` (it raises on `low`)
+        let off_effort: &'static str = if tpl_src.contains("no_think") { "no_think" } else { "low" };
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
@@ -1407,7 +1410,7 @@ impl Tokenizer {
                 // `reasoning_effort` rather than `enable_thinking`.  A direct
                 // answer therefore needs the low budget when thinking is
                 // disabled; otherwise the template defaults to `max`.
-                reasoning_effort => if !v { Some("low") } else { None::<&str> },
+                reasoning_effort => if !v { Some(off_effort) } else { None::<&str> },
                 tool_call_format => "json",
             })?,
             (Some(ts), None, Some(effort)) => tpl.render(minijinja::context! {
@@ -1427,7 +1430,7 @@ impl Tokenizer {
             (None, Some(v), None) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true, enable_thinking => v,
                 // See the tool-bearing branch above.
-                reasoning_effort => if !v { Some("low") } else { None::<&str> },
+                reasoning_effort => if !v { Some(off_effort) } else { None::<&str> },
                 tool_call_format => "json",
             })?,
             (None, None, Some(effort)) => tpl.render(minijinja::context! {
@@ -1501,6 +1504,9 @@ impl Tokenizer {
         let mut env = crate::chat_template::environment();
         self.add_special_globals(&mut env);
         let tpl_src = strip_generation_tags(tpl);
+        // a direct answer's reasoning budget: GLM-5's templates take `low`,
+        // Hy4-flash's only `no_think` / `high` / `max` (it raises on `low`)
+        let off_effort: &'static str = if tpl_src.contains("no_think") { "no_think" } else { "low" };
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
@@ -1517,7 +1523,7 @@ impl Tokenizer {
                 enable_thinking => v,
                 // GLM-5 uses this variable (not `enable_thinking`) to select
                 // its reasoning budget and defaults to max when omitted.
-                reasoning_effort => if !v { Some("low") } else { None::<&str> },
+                reasoning_effort => if !v { Some(off_effort) } else { None::<&str> },
             })?,
             None => env.get_template("chat")?.render(minijinja::context! {
                 messages => msgs,

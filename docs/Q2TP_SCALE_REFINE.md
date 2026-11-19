@@ -95,10 +95,46 @@ Everything else is the default: the `placed` ladder, debias on. Use at least 32 
    Judge by the model's perplexity, not by the layer error: at 2 bits the layer error does not predict it.
 4. **Text outside the calibration data, and greedy generation.**
 
+## MoE experts: Hy4-flash
+
+`cortiq hy4-sfq` applies the recipe to the routed experts of Tencent Hy4-flash (512 experts a layer, top 16, on a
+1536-wide latent). The latent input of every expert is `latent_down · x`, with no norm in between, so the channel
+scale folds into `latent_down`'s rows: the experts' gate/up columns are divided by `t`, `latent_down`'s rows
+multiplied by it. One `t` a layer is shared by all 512 experts (σ over every expert's gate and up rows, rms over
+the layer's captured latent rows).
+
+1. `--capture-only`: the calibration text through the CUDA hybrid's prompt graph (the q4tp file), every routed FFN's
+   latent rows and the router's picks, appended to disk a window at a time.
+2. The encode: per layer the scale, then quantize-moe's GPTQ of every expert on its own rows (gate/up q2tp with the
+   refinement, down q4tp with the refinement), written in place into the q2tp file; `latent_down` is re-encoded
+   with its rows scaled.
+
+Result on Hy4-flash (98 304 calibration tokens: WikiText-2 train, Rust, Chinese documentation; the q2tp file):
+
+| | the experts' output error, layer 1, unseen documents | WikiText-2 (16 × 512) | Chinese docs (8 × 512) | Rust (8 × 512) |
+|---|---:|---:|---:|---:|
+| the converter's rounding | 0.0909 | 33.19 | 36.38 | 4.62 |
+| GPTQ | 0.0271 | — | — | — |
+| SFq (scale + refinement) | 0.0236 | 42.57 | 41.37 | 4.31 |
+
+The experts' error falls four times out of sample, and code reads better, but text reads worse: the whole model
+is not the sum of its experts' errors here. The suspect is the calibration's input: it is captured from the q4tp
+file, while the 2-bit model's activations drift layer by layer (sequential capture is not implemented). The
+published q2tp keeps the converter's rounding. The CPU and the card decode the encoded payloads alike (24
+tokens: 36.6 on the CPU, 36.4 on CUDA's token path).
+
+```bash
+CMF_GPU=cuda cortiq hy4-sfq --capture-only --calib-model hy4-flash-q4tp.cmf --capture cap \
+  --calib wiki_train.txt=0.55 --calib code.txt=0.25 --calib zh.txt=0.20 --tokens 98304 --window 2048
+CMF_GPU=wgpu cortiq hy4-sfq --capture cap --hf Hy4-flash-FP8 --target hy4-flash-q2tp.cmf \
+  --alpha 0.75 --refine 256 --ridge 0.3
+```
+
 ## Limits
 
 - Measured on one model (MiniCPM5-2B, a dense Llama-like stack, GQA 16/2) with WikiText calibration.
-- The scale is not applied to the inputs of `down_proj` and `o_proj`, to MoE experts or to GDN layers.
+- `quantize-gptq` does not apply the scale to the inputs of `down_proj` and `o_proj`, to MoE experts or to GDN
+  layers; `hy4-sfq` applies it to Hy4-flash's latent experts (above).
 - The groups the new flags touch are folded and swept on the CPU. The other groups stay on the card, but
   this mixed path has not been run on a card: on a Mac everything goes through the CPU.
 - With an existing `--hessians` cache every group goes through the CPU.
