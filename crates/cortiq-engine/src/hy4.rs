@@ -43,6 +43,37 @@ fn err(s: impl Into<String>) -> CmfError {
     CmfError::Parse(format!("hy_v4_flash: {}", s.into()))
 }
 
+/// `CMF_HY4_KEEP=FILE`: the routed experts of a cut without cutting the
+/// file — `{"<layer>": [kept expert ids], ...}`; every other expert of a
+/// listed layer gets a selection bias of -1e30, so no row ever picks it and
+/// the picks' weights renormalize over the kept ones, as in a `moe-defrag`
+/// cut of that set. Layers not listed keep all their experts.
+fn keep_mask(li: usize, mut bias: Vec<f32>) -> Vec<f32> {
+    static KEEP: std::sync::OnceLock<Option<std::collections::HashMap<usize, Vec<usize>>>> = std::sync::OnceLock::new();
+    let keep = KEEP.get_or_init(|| {
+        let path = std::env::var("CMF_HY4_KEEP").ok()?;
+        let text = std::fs::read_to_string(&path).map_err(|e| tracing::warn!("CMF_HY4_KEEP {path}: {e}")).ok()?;
+        let v: std::collections::HashMap<String, Vec<usize>> = serde_json::from_str(&text).map_err(|e| tracing::warn!("CMF_HY4_KEEP {path}: {e}")).ok()?;
+        let m: std::collections::HashMap<usize, Vec<usize>> = v.into_iter().filter_map(|(k, ids)| Some((k.parse().ok()?, ids))).collect();
+        tracing::info!("hy_v4_flash: CMF_HY4_KEEP masks {} layers' routed experts ({path})", m.len());
+        Some(m)
+    });
+    if let Some(ids) = keep.as_ref().and_then(|m| m.get(&li)) {
+        let mut on = vec![false; bias.len()];
+        for &e in ids {
+            if e < on.len() {
+                on[e] = true;
+            }
+        }
+        for (b, &o) in bias.iter_mut().zip(&on) {
+            if !o {
+                *b = -1e30;
+            }
+        }
+    }
+    bias
+}
+
 fn f(model: &CmfModel, name: &str) -> Result<Vec<f32>, CmfError> {
     load_f32(model, name, &Overlay::None).map_err(err)
 }
@@ -447,7 +478,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
             }
             Ffn::Moe(Moe {
                 router: f(model, &format!("{m}gate.weight"))?,
-                bias: f(model, &format!("{m}gate.e_score_correction_bias"))?,
+                bias: keep_mask(li, f(model, &format!("{m}gate.e_score_correction_bias"))?),
                 down: t(model, &format!("{m}latent_down.weight"))?,
                 up: t(model, &format!("{m}latent_up.weight"))?,
                 shared: [

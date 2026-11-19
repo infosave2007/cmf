@@ -542,6 +542,34 @@ pub fn cmd_moe_defrag_with(
     if dropped == 0 {
         bail!("nothing to drop — check the stats file / --cover");
     }
+    // `CMF_DEFRAG_PUNCH=1` (Linux): the dropped experts' bytes are released
+    // from the SOURCE file before the cut is written (holes, the file keeps
+    // its size), so a disk that cannot hold the source and the cut together
+    // holds them. The source loses those experts for good.
+    #[cfg(target_os = "linux")]
+    if std::env::var("CMF_DEFRAG_PUNCH").as_deref() == Ok("1") {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new().write(true).open(model_path).with_context(|| format!("{model_path}: open to release the dropped experts"))?;
+        let mut freed = 0u64;
+        for entry in &model.tensors {
+            let Some((li, e, _)) = expert_parts(&entry.name) else { continue };
+            let Some(map) = remap.get(&li) else { continue };
+            if map.contains_key(&e) {
+                continue;
+            }
+            let Some(off) = model.entry_abs_offset(entry) else { continue };
+            // whole 4 KiB pages inside the tensor only: its neighbours stay intact
+            let (s, end) = ((off as u64).div_ceil(4096) * 4096, (off as u64 + entry.nbytes) / 4096 * 4096);
+            if end > s {
+                let rc = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, s as libc::off_t, (end - s) as libc::off_t) };
+                if rc != 0 {
+                    bail!("{model_path}: releasing {} failed: {}", entry.name, std::io::Error::last_os_error());
+                }
+                freed += end - s;
+            }
+        }
+        eprintln!("moe-defrag: released {:.1} GB of dropped experts from {model_path}", freed as f64 / 1e9);
+    }
     let mut merged_n = 0usize;
     if let Some(m) = merged.as_ref() {
         let have: std::collections::HashSet<&str> = model.tensors.iter().map(|e| e.name.as_str()).collect();
