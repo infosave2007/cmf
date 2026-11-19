@@ -893,6 +893,7 @@ pub fn capture(
     state: &mut State,
     windows: &[Vec<u32>],
     sink: &mut dyn FnMut(&CapLayer) -> Result<(), String>,
+    mut nll: Option<&mut Vec<f32>>,
 ) -> Result<usize, String> {
     let moe: Vec<usize> = layers.iter().enumerate().filter(|(_, l)| matches!(l.ffn, Ffn::Moe(_))).map(|(i, _)| i).collect();
     let ne = layers.iter().find_map(|l| match &l.ffn {
@@ -914,7 +915,21 @@ pub fn capture(
         let mut ids = w.clone();
         ids.push(*w.last().unwrap());
         let mut lg = Vec::new();
-        let taken = forward_prompt(globals, layers, cfg, state, &ids, 0, None, &mut lg);
+        // with `nll`: the window's rows kept, every row's loss on its next token
+        // (the last row of a window has none: NaN), in the order of the picks
+        let taken = match nll.as_mut() {
+            Some(out) => {
+                let mut hrows = Vec::new();
+                let t = prompt_rows(globals, layers, cfg, state, w, 0, None, Some(&mut hrows));
+                if t == w.len() && hrows.len() == w.len() * cfg.dim {
+                    out.extend(row_nll(globals, cfg, &hrows, w));
+                    ids.len()
+                } else {
+                    t
+                }
+            }
+            None => forward_prompt(globals, layers, cfg, state, &ids, 0, None, &mut lg),
+        };
         let rows = crate::gpu::hy4_capture_take().ok_or("the capture lost its rows")?;
         if taken != ids.len() || rows.len() != moe.len() {
             return Err(format!("window {wi}: the card's prompt graph took {taken} of {} rows ({} routed FFNs captured)", ids.len(), rows.len()));
@@ -940,6 +955,35 @@ pub fn capture(
     }
     state.reset(layers.len());
     Ok(done)
+}
+
+/// Every row's loss on the window's next token from the stack's rows
+/// (`hrows`, before the final norm); the last row NaN.
+fn row_nll(globals: &Globals, cfg: &Cfg, hrows: &[f32], w: &[u32]) -> Vec<f32> {
+    let (n, dim) = (w.len(), cfg.dim);
+    let vocab = globals.lm_head.rows();
+    let mut res = vec![f32::NAN; n];
+    const B: usize = 64;
+    let mut out = vec![0f32; B * vocab];
+    let mut xs = vec![0f32; B * dim];
+    let mut r0 = 0;
+    while r0 + 1 < n {
+        let b = B.min(n - 1 - r0);
+        for j in 0..b {
+            let x = rms_w(&hrows[(r0 + j) * dim..(r0 + j + 1) * dim], &globals.norm, cfg.eps);
+            xs[j * dim..(j + 1) * dim].copy_from_slice(&x);
+        }
+        globals.lm_head.matmat(&xs[..b * dim], b, &mut out[..b * vocab], None);
+        for j in 0..b {
+            let row = &out[j * vocab..(j + 1) * vocab];
+            let target = (w[r0 + j + 1] as usize).min(vocab - 1);
+            let best = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+            let den: f64 = row.iter().map(|&v| ((v as f64) - best).exp()).sum();
+            res[r0 + j] = (den.ln() - (row[target] as f64 - best)) as f32;
+        }
+        r0 += b;
+    }
+    res
 }
 
 /// Fold the streams with `pre`.

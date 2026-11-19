@@ -22,12 +22,13 @@ fn expert_parts(name: &str) -> Option<(usize, usize, &str)> {
     Some((li.parse().ok()?, e.parse().ok()?, rest))
 }
 
-/// "model.layers.L.mlp.expert_bias" → L (noaux_tc selection bias —
-/// one scalar per expert, sliced with the experts it scores).
+/// "model.layers.L.mlp.expert_bias" (or Hy4-flash's
+/// "model.layers.L.mlp.gate.e_score_correction_bias") → L (noaux_tc
+/// selection bias — one scalar per expert, sliced with the experts it scores).
 fn expert_bias_layer(name: &str) -> Option<usize> {
     let t = name.strip_prefix("model.layers.")?;
     let (li, t) = t.split_once('.')?;
-    (t == "mlp.expert_bias").then(|| li.parse().ok())?
+    (t == "mlp.expert_bias" || t == "mlp.gate.e_score_correction_bias").then(|| li.parse().ok())?
 }
 
 /// "model.layers.L.mlp.gate.weight" → L.
@@ -628,6 +629,25 @@ pub fn cmd_moe_defrag_with(
         }
         _ => {
             header.provenance = Some(serde_json::json!({ "moe_defrag": prov }));
+        }
+    }
+    // Every MoE layer cut to one count: the architecture says so (stacks
+    // that size their layers from `arch.moe.num_experts`, Hy4-flash's, read
+    // it; the others count the tensors)
+    let counts: std::collections::BTreeSet<usize> = remap.values().map(|m| m.len()).collect();
+    if let (Some(moe), true) = (header.arch.moe.as_mut(), counts.len() == 1) {
+        let n = *counts.iter().next().unwrap_or(&moe.num_experts);
+        if remap.len() == header.arch.num_layers || model.tensors.iter().filter_map(|e| router_layer(&e.name)).all(|li| remap.contains_key(&li)) {
+            moe.num_experts = n;
+            if let Some(tc) = header.provenance.as_mut().and_then(|p| p.get_mut("hy4_flash")).and_then(|h| h.get_mut("text_config")) {
+                if let Some(o) = tc.as_object_mut() {
+                    for k in ["num_experts", "n_routed_experts"] {
+                        if o.contains_key(k) {
+                            o.insert(k.into(), serde_json::json!(n));
+                        }
+                    }
+                }
+            }
         }
     }
 

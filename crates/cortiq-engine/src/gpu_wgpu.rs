@@ -29831,7 +29831,8 @@ pub fn forward_token_graph(
                 // (512 through `moe_sel2`); with a shared expert it rides as
                 // the last block.
                 let want = n_exp + usize::from(*has_shared);
-                let wide = *n_exp > 256 && moe_sel2::pipes(c).is_some();
+                // 257–512 experts, or a top-k of 16 and more (a Hy4-flash cut to 256): the wide select
+                let wide = (*n_exp > 256 || *top_k >= 16) && moe_sel2::pipes(c).is_some();
                 // the experts' own width: Hy4-flash's latent, else the hidden
                 let ehid = latent.as_ref().map_or(hidden, |lt| lt.dim);
                 if let Some(lt) = latent {
@@ -34889,7 +34890,7 @@ pub fn forward_token_graph(
                             })
                     });
                     // past 256 experts the two-a-thread select (`moe_sel2`)
-                    let sel2 = if *n_exp > 256 { moe_sel2::pipes(c) } else { None };
+                    let sel2 = if *n_exp > 256 || *top_k >= 16 { moe_sel2::pipes(c) } else { None };
                     let bg_sel = bg(
                         sel2.map_or(&c.layout_moe_sel, |p| &p.token_l),
                         &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1, &bias_buf],
@@ -37233,7 +37234,8 @@ pub fn forward_batch_graph_at(
                 latent,
                 ..
             } => {
-                let wide = *n_exp > 256 && moe_sel2::pipes(c).is_some();
+                // 257–512 experts, or a top-k of 16 and more (a Hy4-flash cut to 256): the wide select
+                let wide = (*n_exp > 256 || *top_k >= 16) && moe_sel2::pipes(c).is_some();
                 // the experts' own width: Hy4-flash's latent, else the hidden
                 let ehid = latent.as_ref().map_or(hidden, |lt| lt.dim);
                 if (*top_k >= 16 && !wide) || *top_k + usize::from(*has_shared) > 32 || (*n_exp > 256 && !wide) || *n_exp > 512 || experts.len() != n_exp + usize::from(*has_shared)
@@ -41513,7 +41515,7 @@ pub fn forward_batch_graph_at(
                     ],
                 );
                 // past 256 experts the two-a-thread selects (`moe_sel2`)
-                let sel2 = if *n_exp > 256 { moe_sel2::pipes(c) } else { None };
+                let sel2 = if *n_exp > 256 || *top_k >= 16 { moe_sel2::pipes(c) } else { None };
                 let dn_u = uniform_u32x4(
                     c,
                     [
