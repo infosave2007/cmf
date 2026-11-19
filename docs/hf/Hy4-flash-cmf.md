@@ -94,15 +94,14 @@ in the page cache (a second run); `CMF_GPU_VRAM_MB` caps the card.
 | 96 GB (whole) | **65.1** | 15.5 | 55.3 | 19.7 | 60.5 / 86.5 |
 | 48 GB | **53.1** | 18.0 | 38.1 | 21.1 | 45.6 / 45.8 |
 | 24 GB | **37.4** | 19.6 | 25.8 | 25.0 | 23.6 / 23.7 |
-| 16 GB | **31.2** | 19.9 | 19.9 | 24.4 | 16.6 / 17.2 |
-| 15 GB | **29.9** | 20.0 | 19.0 | 23.1 | 15.7 / 15.8 |
-| 12 GB | **26.0** | 19.9 | — | — | 13.1 / — |
+| 16 GB | **29.7** | 17.9 | 19.0 | 23.5 | 15.8 / 16.0 |
+| 12 GB | **24.0** | 18.0 | — | — | 11.8 / — |
 
 ![Decode by card size](https://huggingface.co/infosave/Hy4-flash-cmf/resolve/main/assets/perf_cuda_en.png)
 
 The first token is timed from a cold process: it includes building the plan and filling the RAM tier (about
 15 s, once a process); reading the 1 000-token prompt itself takes 4 s on the whole card.
-`CMF_GPU_VRAM_MB` caps what the engine places; the process peaks up to 1.2 GB above it (the peak column). On a 16 GB card set `CMF_GPU_VRAM_MB=15360`: both files then stay under 16 GB. Under a 12 GB limit `q4tp`'s expert slots do not fit (its prompt falls to the host) and `q2tp` peaks at 13.1 GB, so a 12 GB card is not covered yet.
+`CMF_GPU_VRAM_MB` caps the card: under every limit the process stays within it (the peak column), so the 16 and 12 GB rows are what those cards run. `q4tp` needs 16 GB: under 12 its expert slots do not fit and its prompt falls to the host.
 
 ## Vulkan · RTX PRO 6000
 
@@ -203,15 +202,14 @@ release-сборка. `cortiq run --greedy --no-think`, 256 токенов по�
 | 96 ГБ (вся) | **65,1** | 15,5 | 55,3 | 19,7 | 60,5 / 86,5 |
 | 48 ГБ | **53,1** | 18,0 | 38,1 | 21,1 | 45,6 / 45,8 |
 | 24 ГБ | **37,4** | 19,6 | 25,8 | 25,0 | 23,6 / 23,7 |
-| 16 ГБ | **31,2** | 19,9 | 19,9 | 24,4 | 16,6 / 17,2 |
-| 15 ГБ | **29,9** | 20,0 | 19,0 | 23,1 | 15,7 / 15,8 |
-| 12 ГБ | **26,0** | 19,9 | — | — | 13,1 / — |
+| 16 ГБ | **29,7** | 17,9 | 19,0 | 23,5 | 15,8 / 16,0 |
+| 12 ГБ | **24,0** | 18,0 | — | — | 11,8 / — |
 
 ![Декод по размеру карты](https://huggingface.co/infosave/Hy4-flash-cmf/resolve/main/assets/perf_cuda_ru.png)
 
 Первый токен засекается от холодного процесса: в него входят построение плана и заполнение RAM-яруса (около
 15 с, один раз на процесс); само чтение промпта из 1 000 токенов на всей карте занимает 4 с.
-`CMF_GPU_VRAM_MB` ограничивает то, что размещает движок; пик процесса бывает до 1,2 ГБ выше (столбец пика). На карте 16 ГБ задайте `CMF_GPU_VRAM_MB=15360`: тогда оба файла укладываются в 16 ГБ. Под лимитом 12 ГБ слоты экспертов `q4tp` не помещаются (его промпт уходит на хост), а `q2tp` доходит до 13,1 ГБ, так что карту на 12 ГБ эти файлы пока не покрывают.
+`CMF_GPU_VRAM_MB` ограничивает карту: под каждым лимитом процесс укладывается в него (столбец пика), так что строки 16 и 12 ГБ — это то, что будет на таких картах. `q4tp` нужно 16 ГБ: под 12 ГБ его слоты экспертов не помещаются, и промпт уходит на хост.
 
 ### Vulkan · RTX PRO 6000
 
@@ -306,15 +304,14 @@ CMF_GPU=cuda cortiq run hy4-flash-q4tp.cmf --prompt "用三句话介绍一下长
 | 96 GB（整卡） | **65.1** | 15.5 | 55.3 | 19.7 | 60.5 / 86.5 |
 | 48 GB | **53.1** | 18.0 | 38.1 | 21.1 | 45.6 / 45.8 |
 | 24 GB | **37.4** | 19.6 | 25.8 | 25.0 | 23.6 / 23.7 |
-| 16 GB | **31.2** | 19.9 | 19.9 | 24.4 | 16.6 / 17.2 |
-| 15 GB | **29.9** | 20.0 | 19.0 | 23.1 | 15.7 / 15.8 |
-| 12 GB | **26.0** | 19.9 | — | — | 13.1 / — |
+| 16 GB | **29.7** | 17.9 | 19.0 | 23.5 | 15.8 / 16.0 |
+| 12 GB | **24.0** | 18.0 | — | — | 11.8 / — |
 
 ![按显存大小的解码速度](https://huggingface.co/infosave/Hy4-flash-cmf/resolve/main/assets/perf_cuda_zh.png)
 
 首 token 从冷启动的进程开始计时：包括构建计划和填充 RAM 层（约 15 秒，每个进程一次）；在整卡上读取 1000 token
 的提示本身用时 4 秒。
-`CMF_GPU_VRAM_MB` 限制引擎放置的内容；进程峰值最多比它高 1.2 GB（见峰值列）。16 GB 显卡请设置 `CMF_GPU_VRAM_MB=15360`：两个文件都能控制在 16 GB 以内。在 12 GB 上限下，`q4tp` 的专家槽放不下（提示退回主机），`q2tp` 峰值 13.1 GB，因此暂不支持 12 GB 显卡。
+`CMF_GPU_VRAM_MB` 限制显存：在每个上限下进程都不超出（见峰值列），因此 16 GB 与 12 GB 两行就是这些显卡上的表现。`q4tp` 需要 16 GB：在 12 GB 下其专家槽放不下，提示退回主机。
 
 ### Vulkan · RTX PRO 6000
 
