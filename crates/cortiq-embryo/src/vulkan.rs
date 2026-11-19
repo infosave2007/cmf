@@ -3446,7 +3446,7 @@ impl<'a> Cmd<'a> {
         }
         let pp = Self::wy_p(d);
         let slots = [(states, 0), (gam, 1), (kg, 2), (kn, 3), (vcm, 4), (tmat, 5), (bet, 6), (rho, 7), (epm, 8), (um, 9), (utm, 10)];
-        self.rec(OP_WY_FWD_CHAIN, &slots, pp, d.b * d.nv * (d.dv / 32) * 256);
+        self.rec(OP_WY_FWD_CHAIN, &slots, pp, d.b * d.nv * (d.dv / 16) * 256);
         true
     }
     /// The whole chunk chain of the WY backward as one CUDA kernel (op 121),
@@ -3493,7 +3493,7 @@ impl<'a> Cmd<'a> {
             (dlive, 0), (du_all, 1), (dsq_all, 2), (kn, 3), (kg, 4), (bet, 5), (rho, 6), (gam, 7), (tmat, 9),
             (dsl_all, 10), (dep_all, 11), (dut_all, 12), (dcv, 13),
         ];
-        self.rec(OP_WY_BWD_CHAIN, &slots, pp.clone(), nb * (d.dv / 32) * 256);
+        self.rec(OP_WY_BWD_CHAIN, &slots, pp.clone(), nb * (d.dv / 16) * 256);
         self.rec(OP_WY_DU_DOTS, &[(dut_all, 0), (um, 1), (du_all, 2), (epm, 3), (drho, 4), (dbet, 5)], pp.clone(), nb * nch * 64);
         self.rec(OP_WY_DGEND_ALL, &[(dsl_all, 0), (states, 1), (dgend_part, 3), (dgend, 4)], pp, nb * nch * 64);
         true
