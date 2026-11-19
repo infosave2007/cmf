@@ -10964,6 +10964,11 @@ async fn cmd_run(
                         r.finish_reason
                     ),
                 }
+                // `CMF_CUDA_PROF=1`: where the card's time went, as `cortiq bench` reports it
+                #[cfg(feature = "cuda")]
+                if std::env::var_os("CMF_CUDA_PROF").is_some() {
+                    cortiq_engine::gpu_cuda::perf_report();
+                }
                 if r.mtp_drafted > 0 {
                     println!(
                         "[MTP draft: {} of {} accepted ({:.0}%)]",
