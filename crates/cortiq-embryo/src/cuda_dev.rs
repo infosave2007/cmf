@@ -434,6 +434,11 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_swiglu_bwd_rows(EWD) {
   S_d[z]=as_u32(dh*ds*uu); S_e[z]=as_u32(dh*sg);
  }
 }
+// The WY chain kernels' value-column tile: 16 columns × 16 row groups of a
+// 256-thread block (twice the blocks of a 32-column tile: an A100 or a B200
+// holds two per SM, so a chunk's load latency hides behind the other block).
+#define WY_TW 16u
+#define WY_GR 16u
 // op 120 (CUDA only): the chunk chain of the WY forward (`gdn_wy::wy_fwd`'s
 // loop) in one launch. A block per (b, h, 32 value columns) walks the chunks
 // in order and does what the per-chunk operations did, with their
@@ -446,14 +451,14 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_swiglu_bwd_rows(EWD) {
 extern "C" __global__ void __launch_bounds__(256) emb_x_wy_fwd_chain(EWD) {
  extern __shared__ float sm[];
  const u32 T=U(2u), nv=U(3u), dk=U(4u), dv=U(5u), nch=U(8u);
- const u32 ss=dk*dv; const u32 ntile=dv/32u;
+ const u32 ss=dk*dv; const u32 ntile=dv/WY_TW;
  const u32 blk=blockIdx.x+blockIdx.y*gridDim.x;
- const u32 bh=blk/ntile; const u32 j=(blk%ntile)*32u+(threadIdx.x&31u);
+ const u32 tid=threadIdx.x, cl=tid%WY_TW, g=tid/WY_TW;
+ const u32 bh=blk/ntile; const u32 j=(blk%ntile)*WY_TW+cl;
  if(bh>=U(1u)*nv){return;}
  const u32 bb=bh/nv, hh=bh%nv;
- const u32 tid=threadIdx.x, lane=tid&31u, w=tid>>5u;
- const u32 rpw=dk/8u;   // state rows per warp (dk <= 128)
- float* Ss=sm; float* Ks=Ss+dk*32u; float* Ts=Ks+64u*dk; float* Rs=Ts+4096u; float* Us=Rs+2048u;
+ const u32 rpg=dk/WY_GR;   // state rows per row group (dk <= 128, a multiple of 64)
+ float* Ss=sm; float* Ks=Ss+dk*WY_TW; float* Ts=Ks+64u*dk; float* Rs=Ts+4096u; float* Us=Rs+64u*WY_TW;
  const u32 k4n=dk/4u;   // float4 per key row
  // a [64][dk] block of token rows (Kγ or K̂) as float4, every load of the thread in flight at once
  #define WY_LOAD_K(SRC) { float4 kv[8]; \
@@ -461,11 +466,11 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_fwd_chain(EWD) {
    if(q<16u*dk){const u32 i=q/k4n, k4=q%k4n; kv[m]=*((const float4*)((SRC)+(bb*T+tb+i)*nv*dk+hh*dk)+k4);}} \
   _Pragma("unroll") for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Ks)[q]=kv[m];}} }
  {
-  float sv[16];
+  float sv[8];
   #pragma unroll
-  for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; sv[m]=(r<dk)?AF((bh*(nch+1u))*ss+r*dv+j):0.0f;}
+  for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; sv[m]=(r<dk)?AF((bh*(nch+1u))*ss+r*dv+j):0.0f;}
   #pragma unroll
-  for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; if(r<dk){Ss[r*32u+lane]=sv[m];}}
+  for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; if(r<dk){Ss[r*WY_TW+cl]=sv[m];}}
  }
  for(u32 c=0u;c<nch;c++){
   const u32 tb=c*64u;
@@ -479,71 +484,74 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_fwd_chain(EWD) {
   }
   __syncthreads();
   {
-   float acc[8];
+   // R = V − Kγ·S_c: rows g*4 .. g*4+3, column j
+   float acc[4];
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<4u;a++){acc[a]=0.0f;}
    for(u32 k=0u;k<dk;k+=4u){
-    const float s0=Ss[k*32u+lane], s1=Ss[(k+1u)*32u+lane], s2=Ss[(k+2u)*32u+lane], s3=Ss[(k+3u)*32u+lane];
+    const float s0=Ss[k*WY_TW+cl], s1=Ss[(k+1u)*WY_TW+cl], s2=Ss[(k+2u)*WY_TW+cl], s3=Ss[(k+3u)*WY_TW+cl];
     #pragma unroll
-    for(u32 a=0u;a<8u;a++){
-     const float4 kv=*((const float4*)(Ks+(w*8u+a)*dk+k));
+    for(u32 a=0u;a<4u;a++){
+     const float4 kv=*((const float4*)(Ks+(g*4u+a)*dk+k));
      acc[a]=fmaf(kv.x,s0,acc[a]); acc[a]=fmaf(kv.y,s1,acc[a]); acc[a]=fmaf(kv.z,s2,acc[a]); acc[a]=fmaf(kv.w,s3,acc[a]);
     }
    }
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){
-    const u32 i=w*8u+a; const u32 ix=((bh*nch+c)*64u+i)*dv+j;
+   for(u32 a=0u;a<4u;a++){
+    const u32 i=g*4u+a; const u32 ix=((bh*nch+c)*64u+i)*dv+j;
     float outv=-1.0f*acc[a]; outv=fmaf(1.0f,EF(ix),outv);
-    S_e[ix]=as_u32(outv); Rs[i*32u+lane]=outv;
+    S_e[ix]=as_u32(outv); Rs[i*WY_TW+cl]=outv;
    }
   }
   __syncthreads();
   WY_LOAD_K(S_d)
   {
-   float acc[8];
+   // E' = T·R, U = β·E', Ũ = ρ·U
+   float acc[4];
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<4u;a++){acc[a]=0.0f;}
    for(u32 k=0u;k<64u;k+=4u){
-    const float r0=Rs[k*32u+lane], r1=Rs[(k+1u)*32u+lane], r2=Rs[(k+2u)*32u+lane], r3=Rs[(k+3u)*32u+lane];
+    const float r0=Rs[k*WY_TW+cl], r1=Rs[(k+1u)*WY_TW+cl], r2=Rs[(k+2u)*WY_TW+cl], r3=Rs[(k+3u)*WY_TW+cl];
     #pragma unroll
-    for(u32 a=0u;a<8u;a++){
-     const float4 tv=*((const float4*)(Ts+(w*8u+a)*64u+k));
+    for(u32 a=0u;a<4u;a++){
+     const float4 tv=*((const float4*)(Ts+(g*4u+a)*64u+k));
      acc[a]=fmaf(tv.x,r0,acc[a]); acc[a]=fmaf(tv.y,r1,acc[a]); acc[a]=fmaf(tv.z,r2,acc[a]); acc[a]=fmaf(tv.w,r3,acc[a]);
     }
    }
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){
-    const u32 i=w*8u+a; const u32 ix=((bh*nch+c)*64u+i)*dv+j; const u32 t=tb+i;
+   for(u32 a=0u;a<4u;a++){
+    const u32 i=g*4u+a; const u32 ix=((bh*nch+c)*64u+i)*dv+j; const u32 t=tb+i;
     const float ep=1.0f*acc[a];
     S_i[ix]=as_u32(ep);
     const float u=GF(bh*T+t)*ep; S_j[ix]=as_u32(u);
-    const float ut=HF(bh*T+t)*u; S_k[ix]=as_u32(ut); Us[i*32u+lane]=ut;
+    const float ut=HF(bh*T+t)*u; S_k[ix]=as_u32(ut); Us[i*WY_TW+cl]=ut;
    }
   }
   __syncthreads();
   {
+   // S_{c+1} = γ_end·S_c + K̂ᵀ·Ũ: rows g*rpg ..
    const float gend=BF(bh*T+tb+63u);
-   float acc[16];
+   float acc[8];
    #pragma unroll
-   for(u32 a=0u;a<16u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
    for(u32 kk=0u;kk<64u;kk++){
-    const float uv=Us[kk*32u+lane];
-    float kr[16];
+    const float uv=Us[kk*WY_TW+cl];
+    float kr[8];
     #pragma unroll
-    for(u32 a4=0u;a4<4u;a4++){
-     if(a4*4u<rpw){const float4 kv=*((const float4*)(Ks+kk*dk+w*rpw+a4*4u)); kr[a4*4u]=kv.x; kr[a4*4u+1u]=kv.y; kr[a4*4u+2u]=kv.z; kr[a4*4u+3u]=kv.w;}
+    for(u32 a4=0u;a4<2u;a4++){
+     if(a4*4u<rpg){const float4 kv=*((const float4*)(Ks+kk*dk+g*rpg+a4*4u)); kr[a4*4u]=kv.x; kr[a4*4u+1u]=kv.y; kr[a4*4u+2u]=kv.z; kr[a4*4u+3u]=kv.w;}
     }
     #pragma unroll
-    for(u32 a=0u;a<16u;a++){if(a<rpw){acc[a]=fmaf(kr[a],uv,acc[a]);}}
+    for(u32 a=0u;a<8u;a++){if(a<rpg){acc[a]=fmaf(kr[a],uv,acc[a]);}}
    }
    #pragma unroll
-   for(u32 a=0u;a<16u;a++){
-    if(a<rpw){
-     const u32 r=w*rpw+a;
+   for(u32 a=0u;a<8u;a++){
+    if(a<rpg){
+     const u32 r=g*rpg+a;
      // op 68 stored this product before the GEMM read it: no fusion into the sum
-     const float sp=__fmul_rn(gend,Ss[r*32u+lane]);
+     const float sp=__fmul_rn(gend,Ss[r*WY_TW+cl]);
      float outv=1.0f*acc[a]; outv=fmaf(1.0f,sp,outv);
-     S_a[(bh*(nch+1u)+c+1u)*ss+r*dv+j]=as_u32(outv); Ss[r*32u+lane]=outv;
+     S_a[(bh*(nch+1u)+c+1u)*ss+r*dv+j]=as_u32(outv); Ss[r*WY_TW+cl]=outv;
     }
    }
   }
@@ -568,20 +576,20 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_fwd_chain(EWD) {
 extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
  extern __shared__ float sm[];
  const u32 T=U(2u), nv=U(3u), dk=U(4u), dv=U(5u), cdim=U(6u), nch=U(8u);
- const u32 NB=U(1u)*nv; const u32 ss=dk*dv; const u32 ntile=dv/32u;
+ const u32 NB=U(1u)*nv; const u32 ss=dk*dv; const u32 ntile=dv/WY_TW;
  const u32 blk=blockIdx.x+blockIdx.y*gridDim.x;
- const u32 bh=blk/ntile; const u32 j=(blk%ntile)*32u+(threadIdx.x&31u);
+ const u32 tid=threadIdx.x, cl=tid%WY_TW, g=tid/WY_TW;
+ const u32 bh=blk/ntile; const u32 j=(blk%ntile)*WY_TW+cl;
  if(bh>=NB){return;}
  const u32 bb=bh/nv, hh=bh%nv;
- const u32 tid=threadIdx.x, lane=tid&31u, w=tid>>5u;
- const u32 rpw=dk/8u; const u32 k4n=dk/4u;
- float* Sd=sm; float* Ks=Sd+dk*32u; float* Ts=Ks+64u*dk; float* Ep=Ts+4096u; float* Dr=Ep+2048u; float* Kg=Ks;
+ const u32 rpg=dk/WY_GR; const u32 k4n=dk/4u;
+ float* Sd=sm; float* Ks=Sd+dk*WY_TW; float* Ts=Ks+64u*dk; float* Ep=Ts+4096u; float* Dr=Ep+64u*WY_TW; float* Kg=Ks;
  {
-  float v[16];
+  float v[8];
   #pragma unroll
-  for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; v[m]=(r<dk)?AF(bh*ss+r*dv+j):0.0f;}
+  for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; v[m]=(r<dk)?AF(bh*ss+r*dv+j):0.0f;}
   #pragma unroll
-  for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; if(r<dk){Sd[r*32u+lane]=v[m];}}
+  for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; if(r<dk){Sd[r*WY_TW+cl]=v[m];}}
  }
  __syncthreads();
  for(u32 cr=0u;cr<nch;cr++){
@@ -596,7 +604,7 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
    #pragma unroll
    for(u32 m=0u;m<4u;m++){tv[m]=*((const float4*)(S_j+(bh*nch+c)*4096u)+tid+256u*m);}
    #pragma unroll
-   for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; if(r<dk){S_k[(c*NB+bh)*ss+r*dv+j]=as_u32(Sd[r*32u+lane]);}}
+   for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; if(r<dk){S_k[(c*NB+bh)*ss+r*dv+j]=as_u32(Sd[r*WY_TW+cl]);}}
    #pragma unroll
    for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Ks)[q]=kh[m];}}
    #pragma unroll
@@ -604,26 +612,26 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
   }
   __syncthreads();
   {
-   // dŨ = K̂·dS: rows w*8 .. w*8+7, column j
-   float acc[8];
+   // dŨ = K̂·dS: rows g*4 .. g*4+3, column j
+   float acc[4];
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<4u;a++){acc[a]=0.0f;}
    for(u32 k=0u;k<dk;k+=4u){
-    const float s0=Sd[k*32u+lane], s1=Sd[(k+1u)*32u+lane], s2=Sd[(k+2u)*32u+lane], s3=Sd[(k+3u)*32u+lane];
+    const float s0=Sd[k*WY_TW+cl], s1=Sd[(k+1u)*WY_TW+cl], s2=Sd[(k+2u)*WY_TW+cl], s3=Sd[(k+3u)*WY_TW+cl];
     #pragma unroll
-    for(u32 a=0u;a<8u;a++){
-     const float4 kv=*((const float4*)(Ks+(w*8u+a)*dk+k));
+    for(u32 a=0u;a<4u;a++){
+     const float4 kv=*((const float4*)(Ks+(g*4u+a)*dk+k));
      acc[a]=fmaf(kv.x,s0,acc[a]); acc[a]=fmaf(kv.y,s1,acc[a]); acc[a]=fmaf(kv.z,s2,acc[a]); acc[a]=fmaf(kv.w,s3,acc[a]);
     }
    }
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){
-    const u32 i=w*8u+a; const u32 t=tb+i; const u32 ix=((c*NB+bh)*64u+i)*dv+j;
+   for(u32 a=0u;a<4u;a++){
+    const u32 i=g*4u+a; const u32 t=tb+i; const u32 ix=((c*NB+bh)*64u+i)*dv+j;
     const float rh=GF(bh*T+t); const float be=FF(bh*T+t);
     const float dutv=1.0f*acc[a];
     const float duv=BF(ix)+rh*dutv;
     const float ep=be*duv;
-    S_m[ix]=as_u32(dutv); S_b[ix]=as_u32(duv); S_l[ix]=as_u32(ep); Ep[i*32u+lane]=ep;
+    S_m[ix]=as_u32(dutv); S_b[ix]=as_u32(duv); S_l[ix]=as_u32(ep); Ep[i*WY_TW+cl]=ep;
    }
   }
   __syncthreads();
@@ -635,56 +643,55 @@ extern "C" __global__ void __launch_bounds__(256) emb_x_wy_bwd_chain(EWD) {
     const u32 q=tid+256u*m; kgv[m]=make_float4(0.0f,0.0f,0.0f,0.0f);
     if(q<16u*dk){const u32 i=q/k4n, k4=q%k4n; kgv[m]=*((const float4*)(S_e+(bb*T+tb+i)*nv*dk+hh*dk)+k4);}
    }
-   // dR = Tᵀ·dE': rows w*8 .. w*8+7 (A(i, k) = T[k][i]), column j
-   float acc[8];
+   // dR = Tᵀ·dE': rows g*4 .. g*4+3 (A(i, k) = T[k][i]), column j
+   float acc[4];
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<4u;a++){acc[a]=0.0f;}
    for(u32 k=0u;k<64u;k++){
-    const float4 t0=*((const float4*)(Ts+k*64u+w*8u)); const float4 t1=*((const float4*)(Ts+k*64u+w*8u+4u));
-    const float ev=Ep[k*32u+lane];
+    const float4 t0=*((const float4*)(Ts+k*64u+g*4u));
+    const float ev=Ep[k*WY_TW+cl];
     acc[0]=fmaf(t0.x,ev,acc[0]); acc[1]=fmaf(t0.y,ev,acc[1]); acc[2]=fmaf(t0.z,ev,acc[2]); acc[3]=fmaf(t0.w,ev,acc[3]);
-    acc[4]=fmaf(t1.x,ev,acc[4]); acc[5]=fmaf(t1.y,ev,acc[5]); acc[6]=fmaf(t1.z,ev,acc[6]); acc[7]=fmaf(t1.w,ev,acc[7]);
    }
    #pragma unroll
-   for(u32 a=0u;a<8u;a++){
-    const u32 i=w*8u+a; const float dr=1.0f*acc[a];
-    S_nbuf[(bb*T+tb+i)*cdim+2u*nv*dk+hh*dv+j]=as_u32(dr); Dr[i*32u+lane]=dr;
+   for(u32 a=0u;a<4u;a++){
+    const u32 i=g*4u+a; const float dr=1.0f*acc[a];
+    S_nbuf[(bb*T+tb+i)*cdim+2u*nv*dk+hh*dv+j]=as_u32(dr); Dr[i*WY_TW+cl]=dr;
    }
    #pragma unroll
    for(u32 m=0u;m<8u;m++){const u32 q=tid+256u*m; if(q<16u*dk){((float4*)Kg)[q]=kgv[m];}}
   }
   __syncthreads();
   {
-   // dS_c: rows w*rpw .. (A(r, kk) = Kγ[kk][r]), column j
+   // dS_c: rows g*rpg .. (A(r, kk) = Kγ[kk][r]), column j
    const float gend=HF(bh*T+tb+63u);
-   float acc[16];
+   float acc[8];
    #pragma unroll
-   for(u32 a=0u;a<16u;a++){acc[a]=0.0f;}
+   for(u32 a=0u;a<8u;a++){acc[a]=0.0f;}
    for(u32 kk=0u;kk<64u;kk++){
-    const float dr=Dr[kk*32u+lane];
-    float kr[16];
+    const float dr=Dr[kk*WY_TW+cl];
+    float kr[8];
     #pragma unroll
-    for(u32 a4=0u;a4<4u;a4++){
-     if(a4*4u<rpw){const float4 kv=*((const float4*)(Kg+kk*dk+w*rpw+a4*4u)); kr[a4*4u]=kv.x; kr[a4*4u+1u]=kv.y; kr[a4*4u+2u]=kv.z; kr[a4*4u+3u]=kv.w;}
+    for(u32 a4=0u;a4<2u;a4++){
+     if(a4*4u<rpg){const float4 kv=*((const float4*)(Kg+kk*dk+g*rpg+a4*4u)); kr[a4*4u]=kv.x; kr[a4*4u+1u]=kv.y; kr[a4*4u+2u]=kv.z; kr[a4*4u+3u]=kv.w;}
     }
     #pragma unroll
-    for(u32 a=0u;a<16u;a++){if(a<rpw){acc[a]=fmaf(kr[a],dr,acc[a]);}}
+    for(u32 a=0u;a<8u;a++){if(a<rpg){acc[a]=fmaf(kr[a],dr,acc[a]);}}
    }
    #pragma unroll
-   for(u32 a=0u;a<16u;a++){
-    if(a<rpw){
-     const u32 r=w*rpw+a;
-     const float dq=CF((c*NB+bh)*ss+r*dv+j); const float dl=Sd[r*32u+lane];
+   for(u32 a=0u;a<8u;a++){
+    if(a<rpg){
+     const u32 r=g*rpg+a;
+     const float dq=CF((c*NB+bh)*ss+r*dv+j); const float dl=Sd[r*WY_TW+cl];
      const float dsnv=dq+gend*dl;
      float outv=-1.0f*acc[a]; outv=fmaf(1.0f,dsnv,outv);
-     Sd[r*32u+lane]=outv;
+     Sd[r*WY_TW+cl]=outv;
     }
    }
   }
   __syncthreads();
  }
  #pragma unroll
- for(u32 m=0u;m<16u;m++){const u32 r=w+8u*m; if(r<dk){S_a[bh*ss+r*dv+j]=as_u32(Sd[r*32u+lane]);}}
+ for(u32 m=0u;m<8u;m++){const u32 r=g+WY_GR*m; if(r<dk){S_a[bh*ss+r*dv+j]=as_u32(Sd[r*WY_TW+cl]);}}
 }
 // op 122 (CUDA only): op 70's dρ, dβ dots for every chunk after the chain:
 // a warp per (b, h, chunk, row), lane 0's sums in op 70's order.
@@ -1049,8 +1056,11 @@ const CONV_DW_SMEM: u32 = 2 * (128 + 131) * 32 * 4;
 
 /// Dynamic shared memory of `emb_x_wy_fwd_chain` for key width `dk`.
 fn wy_chain_smem(dk: u32) -> u32 {
-    (dk * 32 + 64 * dk + 4096 + 2048 + 2048) * 4
+    (dk * WY_TW + 64 * dk + 4096 + 2 * 64 * WY_TW) * 4
 }
+
+/// The value-column tile of the WY chain kernels (`WY_TW` in `NATIVE_CUDA`).
+const WY_TW: u32 = 16;
 
 /// The op code of the WY forward chain (CUDA only: no WGSL form).
 const OP_WY_FWD_CHAIN: u32 = 120;
@@ -1060,7 +1070,7 @@ const OP_WY_DU_DOTS: u32 = 122;
 const OP_WY_DGEND_ALL: u32 = 123;
 /// Dynamic shared memory of `emb_x_wy_bwd_chain` for key width `dk`.
 fn wy_bwd_chain_smem(dk: u32) -> u32 {
-    (dk * 32 + 64 * dk + 4096 + 2048 + 2048) * 4
+    (dk * WY_TW + 64 * dk + 4096 + 2 * 64 * WY_TW) * 4
 }
 
 impl Ctx {
@@ -1070,18 +1080,18 @@ impl Ctx {
         self.inner.native.as_ref().is_some_and(|x| !x.wy_fwd_chain.is_null() && !x.skip.contains(&OP_WY_FWD_CHAIN))
             && dk > 0
             && dk <= 128
-            && dk % 32 == 0
+            && dk % 64 == 0
             && dv > 0
-            && dv % 32 == 0
+            && dv % WY_TW as usize == 0
     }
     /// The WY backward chain runs as one CUDA kernel (`Cmd::gdn_wy_bwd_chain`).
     pub fn wy_bwd_chain_ok(&self, dk: usize, dv: usize) -> bool {
         self.inner.native.as_ref().is_some_and(|x| !x.wy_bwd_chain.is_null() && !x.skip.contains(&OP_WY_BWD_CHAIN))
             && dk > 0
             && dk <= 128
-            && dk % 32 == 0
+            && dk % 64 == 0
             && dv > 0
-            && dv % 32 == 0
+            && dv % WY_TW as usize == 0
     }
 }
 
@@ -1123,6 +1133,12 @@ struct CtxInner {
     /// twice TF32's rate on an A40). Off by default; an [`ExactF32`] guard
     /// still runs full f32.
     bf16: bool,
+    /// The anchor's banded and batched GEMMs on cuBLAS (`CMF_CUDA_ANCHOR_TC=1`).
+    anchor_tc: bool,
+    /// With `anchor_tc`, the small batched GEMMs too (`CMF_CUDA_TC_SMALL=1`).
+    tc_small: bool,
+    /// Device pointer arrays of the batched cuBLAS calls (address, words).
+    blas_ptrs: Mutex<(u64, usize)>,
     /// Live [`ExactF32`] guards: while any lives, cuBLAS runs full f32.
     exact_depth: Mutex<usize>,
     /// 64 KB of zeros: the slots an operation leaves unbound.
@@ -1370,6 +1386,9 @@ fn init() -> Result<Ctx, String> {
             blas_dyn: std::env::var("CMF_CUDA_CUBLAS_DYN").as_deref() != Ok("0"),
             tf32,
             bf16: tf32 && std::env::var("CMF_CUDA_GEMM_BF16").as_deref() == Ok("1"),
+            anchor_tc: blas.is_some() && std::env::var("CMF_CUDA_ANCHOR_TC").as_deref() == Ok("1"),
+            tc_small: std::env::var("CMF_CUDA_TC_SMALL").as_deref() == Ok("1"),
+            blas_ptrs: Mutex::new((0, 0)),
             exact_depth: Mutex::new(0),
             dummy,
             adapter_name: name,
@@ -1508,12 +1527,30 @@ impl Cmd<'_> {
         table: &GemmTable<'_>,
         band: Option<&GemmBand>,
     ) -> bool {
-        if self.c.inner.blas.is_none() || causal || table.is_some() || band.is_some_and(|b| b.mode != 0) || p[4] == 0 {
+        if self.c.inner.blas.is_none() || causal || table.is_some() || p[4] == 0 {
             return false;
         }
         let single = p[15] * p[16] * p[17] == 1;
+        let macs = (p[2] as u64) * (p[3] as u64) * (p[4] as u64);
+        // `CMF_CUDA_ANCHOR_TC=1`: the large banded and batched GEMMs (the
+        // bounded anchor's) on cuBLAS too, on its full tiles: off the band a
+        // banded output then holds finite products that no reader takes (the
+        // band softmax and its backward read the band), and a banded
+        // reduction adds the zeros of its operand. A band output over a live
+        // C (beta != 0) keeps the kernels.
+        // `CMF_CUDA_TC_SMALL=1` adds the batched GEMMs of small matrices (the
+        // WY form's, 64×128 over 512 chunks), one pointer-array call each
+        let tc_min = if self.c.inner.tc_small && !single { 1 << 16 } else { 1 << 22 };
+        let tc = self.c.inner.anchor_tc
+            && dynamic.kcount.is_none()
+            && dynamic.indirect.is_none()
+            && macs >= tc_min
+            && band.is_none_or(|b| b.mode != 1 || f32::from_bits(p[14]) == 0.0);
+        if band.is_some_and(|b| b.mode != 0) && !tc {
+            return false;
+        }
         let min = self.c.inner.blas_min;
-        if min > 0 && (!single || (p[2] as u64) * (p[3] as u64) * (p[4] as u64) < min) {
+        if min > 0 && (!single || macs < min) && !tc {
             return false;
         }
         // Dynamic K (expert weight gradients) and dynamic rows (expert
@@ -1749,8 +1786,8 @@ impl Cmd<'_> {
                     OP_WY_UT => Some((x.wy_ut, 64, p[1] * p[3] * p[8], 0)),
                     OP_WY_DLG => Some((x.wy_dlg, 256, (p[1] * p[3] * p[8]).div_ceil(8), 0)),
                     OP_ROUTE_FIN if (1..=1536).contains(&p[2]) => Some((x.route_fin, 256, p[1].div_ceil(8), 32 * p[2])),
-                    OP_WY_FWD_CHAIN => Some((x.wy_fwd_chain, 256, p[1] * p[3] * (p[5] / 32), wy_chain_smem(p[4]))),
-                    OP_WY_BWD_CHAIN => Some((x.wy_bwd_chain, 256, p[1] * p[3] * (p[5] / 32), wy_bwd_chain_smem(p[4]))),
+                    OP_WY_FWD_CHAIN => Some((x.wy_fwd_chain, 256, p[1] * p[3] * (p[5] / WY_TW), wy_chain_smem(p[4]))),
+                    OP_WY_BWD_CHAIN => Some((x.wy_bwd_chain, 256, p[1] * p[3] * (p[5] / WY_TW), wy_bwd_chain_smem(p[4]))),
                     OP_WY_DU_DOTS => Some((x.wy_du_dots, 256, (p[1] * p[3] * p[8] * 64).div_ceil(8), 0)),
                     OP_WY_DGEND_ALL => {
                         then = Some((x.wy_dgend_fold_all, 256, (p[1] * p[3] * p[8]).div_ceil(256), 0));
@@ -1938,6 +1975,47 @@ unsafe fn blas_gemm(inner: &CtxInner, op: &OpRec, dynv: Option<[u32; 2]>) {
         bl::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     );
     let (a0, b0, c0) = (base(0, p[10]), base(1, p[11]), base(2, p[12]));
+    if nb * nh > 1 {
+        // One pointer-array call over every (b, h, c) matrix: the strided form
+        // takes nb·nh calls (the anchor's 8 sequences × 2 KV groups).
+        let total = (nb * nh * nc) as usize;
+        let mut ptrs = vec![0u64; 3 * total];
+        let mut z = 0;
+        for cb in 0..nb {
+            for ch in 0..nh {
+                for cc in 0..nc {
+                    ptrs[z] = b0 + 4 * (cb * p[21] as u64 + ch * p[22] as u64 + cc * p[23] as u64);
+                    ptrs[total + z] = a0 + 4 * (cb * p[18] as u64 + ch * p[19] as u64 + cc * p[20] as u64);
+                    ptrs[2 * total + z] = c0 + 4 * (cb * p[24] as u64 + ch * p[25] as u64 + cc * p[26] as u64);
+                    z += 1;
+                }
+            }
+        }
+        let mut dev = inner.blas_ptrs.lock().unwrap();
+        if dev.1 < ptrs.len() {
+            if dev.0 != 0 {
+                unsafe {
+                    cu::stream::synchronize(inner.stream).expect("CUDA sync before a pointer-array resize");
+                    let _ = cu::free_sync(dev.0);
+                }
+            }
+            let words = ptrs.len().next_power_of_two().max(1024);
+            *dev = (unsafe { cu::malloc_sync(words * 8) }.expect("CUDA pointer arrays"), words);
+        }
+        // stream-ordered: the next call's upload lands after this call has read the arrays
+        unsafe { cu::memcpy_htod_async(dev.0, &ptrs, inner.stream) }.expect("CUDA pointer-array upload");
+        let (pb, pa, pc) = (dev.0, dev.0 + 8 * total as u64, dev.0 + 16 * total as u64);
+        let ct = if bf16 { ct } else { bl::cublasComputeType_t::CUBLAS_COMPUTE_32F };
+        let s = unsafe {
+            bl::cublasGemmBatchedEx(
+                h, opr(tb), opr(ta), n, m, k, (&al as *const f32).cast(), pb as *const *const c_void, f32t, ldb,
+                pa as *const *const c_void, f32t, lda, (&be as *const f32).cast(), pc as *const *mut c_void, f32t, ldc,
+                total as i32, ct, algo,
+            )
+        };
+        assert_eq!(s as u32, 0, "cuBLAS batched GEMM m={m} n={n} k={k} x{total}: {s:?}");
+        return;
+    }
     for cb in 0..nb {
         for ch in 0..nh {
             let a = a0 + 4 * (cb * p[18] as u64 + ch * p[19] as u64);
