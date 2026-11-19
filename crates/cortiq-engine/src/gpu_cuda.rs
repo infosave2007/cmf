@@ -304,6 +304,7 @@ struct Buf {
 }
 
 impl Buf {
+    #[track_caller]
     fn new(bytes: usize) -> Res<Self> {
         let bytes = bytes.max(64);
         if let Some(b) = SLABS.with(|s| s.borrow_mut().as_mut().and_then(|p| p.carve(bytes))) {
@@ -314,10 +315,17 @@ impl Buf {
 
     /// An allocation of the driver's own, whatever the scope: for a buffer
     /// that is replaced by a larger one as a session runs.
+    #[track_caller]
     fn direct(bytes: usize) -> Res<Self> {
         let bytes = bytes.max(64);
         let ptr = unsafe { cu::malloc_sync(bytes) }
             .map_err(|e| format!("device allocation of {bytes} bytes: {e}"))?;
+        // `CMF_CUDA_PROF`: where the card's big allocations come from (what a
+        // plan sized against `CMF_GPU_VRAM_MB` did not count)
+        if prof_on() && bytes >= 32 << 20 {
+            let (free, _) = cu::mem_get_info().unwrap_or((0, 0));
+            eprintln!("cuda alloc {} MB at {} (card free {} MB)", bytes >> 20, std::panic::Location::caller(), free >> 20);
+        }
         Ok(Self { ptr, bytes, owned: true, slab: None })
     }
 
@@ -983,6 +991,8 @@ pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_a
 /// code refinement); declared after `kargs!`, which it uses.
 mod gptq;
 pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
+mod tpenc;
+pub use tpenc::tp_encode;
 
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
@@ -1579,6 +1589,7 @@ impl Ctx {
 
 impl State {
     /// A scratch buffer of at least `bytes` (contents not kept across growth).
+    #[track_caller]
     fn scr(&mut self, c: &Ctx, name: &'static str, bytes: usize) -> Res<u64> {
         if let Some(b) = self.scratch.get(name) {
             if b.bytes >= bytes {
@@ -1586,6 +1597,9 @@ impl State {
             }
             // queued work may still read the old one
             c.sync()?;
+        }
+        if prof_on() && bytes >= 32 << 20 {
+            eprintln!("cuda scratch {name}: {} MB", bytes >> 20);
         }
         let b = Buf::new(bytes.next_multiple_of(1 << 20))?;
         let p = b.ptr;

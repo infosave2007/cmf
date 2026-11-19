@@ -318,6 +318,19 @@ fn encode(o: &Hy4SfqOpts) -> anyhow::Result<()> {
                     routed[e] = enc;
                 }
             }
+            // the card's encoders against the host's on the layer's first
+            // expert: the same bytes, or nothing is written
+            {
+                let w0 = get(Part::Routed, 0)?;
+                let host = [
+                    quantize_2d(Quant::Q2TiledP, &w0.g, inter, dim).1,
+                    quantize_2d(Quant::Q2TiledP, &w0.u, inter, dim).1,
+                    quantize_2d(Quant::Q4TiledP, &w0.d, dim, inter).1,
+                ];
+                for k in 0..3 {
+                    anyhow::ensure!(host[k] == routed[0][k], "layer {li}: expert 0 part {k}: the encode differs from the host's ({} of {} bytes)", host[k].iter().zip(&routed[0][k]).filter(|(a, b)| a != b).count(), host[k].len());
+                }
+            }
             crate::moegptq::LayerOut { routed, shared: None, n_gptq: 0, n_rtn: ne, diag: Vec::new(), tim: [0.0; 5], t_shared: 0.0 }
         } else {
             encode_layer(engine, &ec, &job, &lr, true, false, None, None, &get)?

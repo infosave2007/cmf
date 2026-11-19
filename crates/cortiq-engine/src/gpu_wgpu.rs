@@ -28744,6 +28744,8 @@ fn graph_layer_payload_bytes(
     let mut tensor_seen = std::collections::HashSet::<usize>::new();
     let mut f32_seen = std::collections::HashSet::<usize>::new();
     let mut total = 0u64;
+    // f32 tables the kernels read from their own buffers
+    let mut extra = 0u64;
     let mut add = |w: &crate::gpu::GraphW<'_>| -> Option<()> {
         let bytes = if w.kind == 4 {
             if !f32_seen.insert(w.data.as_ptr() as usize) {
@@ -28809,7 +28811,7 @@ fn graph_layer_payload_bytes(
             }
         }
         crate::gpu::GraphAttn::Mla {
-            q_a, q, kv_a, kv_b, o, ..
+            q_a, q, kv_a, kv_b, o, hy, ..
         } => {
             if let Some(g) = q_a {
                 add(g)?;
@@ -28817,6 +28819,29 @@ fn graph_layer_payload_bytes(
             for w in [q, kv_a, kv_b, o] {
                 add(w)?;
             }
+            // Hy4-flash: the output gate, and the indexer's query with its
+            // f32 tables (kv_b among them, `[nh·(nope + v), lora]`)
+            if let Some(h) = hy {
+                add(&h.gate)?;
+                if let Some(ix) = &h.indexer {
+                    add(&ix.q)?;
+                    for s in [ix.hw, ix.tk, ix.kv, ix.kg, ix.ape, ix.kv_b] {
+                        extra = extra.checked_add((s.len() as u64).checked_mul(4)?)?;
+                    }
+                }
+            }
+        }
+    }
+    // Hy4-flash's Engram projections and its hyper-connection routers
+    if let Some(e) = &layer.engram {
+        add(&e.value)?;
+        for k in &e.keys {
+            add(k)?;
+        }
+    }
+    if let Some(m) = &layer.mhc {
+        for s in [m.attn_w, m.ffn_w] {
+            extra = extra.checked_add((s.len() as u64).checked_mul(4)?)?;
         }
     }
     match &layer.ffn {
@@ -28837,9 +28862,14 @@ fn graph_layer_payload_bytes(
             experts,
             has_shared,
             detached_shared,
+            latent,
             ..
         } => {
             add(router)?;
+            if let Some(l) = latent {
+                add(&l.down)?;
+                add(&l.up)?;
+            }
             if *has_shared {
                 add(shared_gate)?;
             }
@@ -28853,7 +28883,7 @@ fn graph_layer_payload_bytes(
             total = total.checked_add(moe_experts_payload_bytes(model, experts)?)?;
         }
     }
-    Some(total)
+    total.checked_add(extra)
 }
 
 /// Bytes of one MoE layer's expert tensors, each counted once — memoized

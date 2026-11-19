@@ -2252,6 +2252,19 @@ pub(crate) fn encode_layer(
 /// The converter's encoding of an expert (round to nearest; q2tp v2).
 pub(crate) fn rtn_expert(codec: Codec, w: &ExpertW, inter: usize, hidden: usize) -> [Vec<u8>; 3] {
     let q = codec.gate_up().1;
+    // on the card when CUDA is up: the converter's encoders byte for byte
+    #[cfg(feature = "cuda")]
+    {
+        let search = std::env::var("CMF_Q2TP_SEARCH").map(|v| v != "0").unwrap_or(true);
+        let v1 = std::env::var("CMF_Q2TP_ENCODER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("v1"));
+        let two = matches!(q, Quant::Q2TiledP);
+        if (matches!(q, Quant::Q4TiledP) || (two && search && !v1)) && hidden % 32 == 0 && inter % 32 == 0 {
+            let enc = |v: &[f32], rows: usize, cols: usize, two_bit: bool| cortiq_engine::gpu_cuda::tp_encode(v, rows, cols, two_bit, search);
+            if let (Some(g), Some(u), Some(d)) = (enc(&w.g, inter, hidden, two), enc(&w.u, inter, hidden, two), enc(&w.d, hidden, inter, false)) {
+                return [g, u, d];
+            }
+        }
+    }
     [quantize_2d(q, &w.g, inter, hidden).1, quantize_2d(q, &w.u, inter, hidden).1, quantize_2d(Quant::Q4TiledP, &w.d, hidden, inter).1]
 }
 
