@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--no-think` (and `enable_thinking: false`) gave every template `reasoning_effort = low`, GLM-5's direct-answer
   budget; Hy4-flash's template accepts only `no_think` / `high` / `max` and raised, so the prompt fell back to
   ChatML. A template that names `no_think` now gets it.
+- wgpu, Hy4-flash: a prompt chunk of 32 rows or more (16 top-k picks a row reach the 512 experts) copied the
+  layer's system-memory latent bank to the staging bank and left the decode after it emitting "!!!!"; latent banks
+  are read in place (chunks of 17–256 rows give the 16-row text). `CMF_HY4_WGPU_ROWS` stays 16 by default: on a
+  card filled by the expert caches the larger chunks' buffers do not fit.
 - wgpu expert cache: a cache the card refused was asked for again on every call (~20 ms a layer each time, on
   Hy4-flash over a whole A40); a refusal is now remembered and the layer reads its bank in place.
 

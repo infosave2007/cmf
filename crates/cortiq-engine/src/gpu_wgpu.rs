@@ -41425,7 +41425,10 @@ pub fn forward_batch_graph_at(
                 // A batch whose picks outnumber the bank's experts reads the
                 // system-memory bank once: copied whole to the card's staging
                 // bank, the kernels then run on that.
-                let stage = if *sys && k * (*top_k + usize::from(*has_shared)) >= *n_exp {
+                // (not Hy4-flash's latent banks: a staged batch of 32 rows and
+                // more left the decode after it emitting "!!!!" on an A40 —
+                // 31 rows, read in place, were right)
+                let stage = if *sys && hy_lat.is_none() && k * (*top_k + usize::from(*has_shared)) >= *n_exp {
                     moe_cache::staging(c, [gate_all.size(), up_all.size(), down_all.size()])
                 } else {
                     None
