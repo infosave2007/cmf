@@ -992,7 +992,7 @@ pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_a
 mod gptq;
 pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
 mod tpenc;
-pub use tpenc::tp_encode;
+pub use tpenc::{tp_encode, tp_place_q2};
 
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.

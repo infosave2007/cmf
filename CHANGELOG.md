@@ -37,11 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merge; the prompt goes in chunks of 16 rows through the batch graph (`CMF_HY4_WGPU_BATCH=0`: a token at a time).
   The sparse layers' indexer has no wgpu arm yet: past 2048 positions the call declines to the host. Greedy text on
   an A40 = the CUDA text up to a near tie.
+- The converter's `q2tp` (v2) and `q4tp` encoders on CUDA (`gpu_cuda::tp_encode`, a thread a row, every f32 / f64
+  operation rounded on its own: the host's bytes). `hy4-sfq`'s rounding rewrite (`CMF_HY4_SFQ_RTN=1`) uses them and
+  checks each layer's first expert against the host before writing: a 512-expert Hy4-flash layer 220–300 s → 23 s
+  on an A40 beside 7.65 CPUs (`CMF_TP_CUDA=0`: the host). quantize-moe's q2tp GPTQ places its row ladders there too
+  (`gpu_cuda::tp_place_q2`, checked against the host on a matrix's first and last rows).
 
 ### Fixed
 - `--no-think` (and `enable_thinking: false`) gave every template `reasoning_effort = low`, GLM-5's direct-answer
   budget; Hy4-flash's template accepts only `no_think` / `high` / `max` and raised, so the prompt fell back to
   ChatML. A template that names `no_think` now gets it.
+- wgpu expert cache: a cache the card refused was asked for again on every call (~20 ms a layer each time, on
+  Hy4-flash over a whole A40); a refusal is now remembered and the layer reads its bank in place.
 
 ### Changed
 - CUDA hybrid, streamed experts: `MADV_WILLNEED` over the file pages of an expert is no longer asked when the RAM
@@ -57,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   card when CUDA is up: the row-square GEMM (debias products, the refinement's seed) on cuBLAS in plain f32 and
   the greedy moves a block a row (`gpu_cuda::gptq_refine_rows`, the host's codes bit for bit;
   `CMF_GPTQ_CUDA=0` keeps the host).
+- CUDA: `CMF_CUDA_PROF` names the call site of every card allocation of 32 MB or more.
 
 ## [0.9.5] — 2026-11-18
 

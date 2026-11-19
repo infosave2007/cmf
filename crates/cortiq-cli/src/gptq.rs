@@ -2799,7 +2799,26 @@ pub(crate) fn gptq_quantize_q2tp_dev(
         return None;
     }
     let mut out = vec![0u8; codes_off + rows * stride];
-    {
+    // the ladders on the card when CUDA is up: checked against the host on
+    // the first and the last row, else the host places them all
+    #[cfg(feature = "cuda")]
+    let placed = cortiq_engine::gpu_cuda::tp_place_q2(&w_init, &hw, rows, cols).filter(|p| {
+        let mut rungs = vec![0u8; gpr];
+        [0, rows - 1].iter().all(|&r| {
+            let mut q = [0u8; 4];
+            q2tp_place_row(&w_init[r * cols..(r + 1) * cols], &hw, &mut q, &mut rungs);
+            let ok = q == p[r * 4..r * 4 + 4];
+            if !ok {
+                tracing::warn!("q2tp ladder on the card differs from the host's at row {r}; the host places them");
+            }
+            ok
+        })
+    });
+    #[cfg(not(feature = "cuda"))]
+    let placed: Option<Vec<u8>> = None;
+    if let Some(p) = placed {
+        out[params_off..params_off + rows * 4].copy_from_slice(&p);
+    } else {
         let params = &mut out[params_off..params_off + rows * 4];
         let per = rows.div_ceil(threads.max(1));
         let (w_init, hw) = (&w_init, &hw);

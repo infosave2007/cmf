@@ -311,32 +311,17 @@ pub(crate) fn get(
             mapped_at_creation: false,
         })
     };
-    // a card that refuses the planned slots (its other allocations past the
-    // plan's count) takes three quarters of them, down to two tokens' picks;
-    // a refusal is kept, so a layer does not ask again every call (each ask
-    // cost ~20 ms: Hy4-flash on a whole A40, 4 tokens/s against 12)
-    let mut cap = want;
-    let (g, u, d) = loop {
-        let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let g = mk("moe-cache-g", cap * gu_len);
-        let u = mk("moe-cache-u", cap * gu_len);
-        let d = mk("moe-cache-d", cap * d_len);
-        match pollster::block_on(scope.pop()) {
-            None => break (g, u, d),
-            Some(e) => {
-                drop((g, u, d));
-                let next = cap * 3 / 4;
-                if next < 2 * slots {
-                    tracing::warn!("wgpu: expert cache of {want} slots refused ({e}), {cap} too; the layer reads its bank in place");
-                    refused().lock().unwrap().insert(key);
-                    return None;
-                }
-                cap = next;
-            }
-        }
-    };
-    if cap < want {
-        tracing::warn!("wgpu: expert cache of {want} slots refused by the card; {cap} slots instead");
+    // a refusal is kept: a layer whose cache the card refused does not ask
+    // again every call (each ask cost ~20 ms: Hy4-flash on a whole A40)
+    let cap = want;
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let g = mk("moe-cache-g", cap * gu_len);
+    let u = mk("moe-cache-u", cap * gu_len);
+    let d = mk("moe-cache-d", cap * d_len);
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("wgpu: expert cache of {cap} slots refused ({e}); the layer reads its bank in place");
+        refused().lock().unwrap().insert(key);
+        return None;
     }
     let total = (cap * (2 * gu_len + d_len)) as u64;
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);

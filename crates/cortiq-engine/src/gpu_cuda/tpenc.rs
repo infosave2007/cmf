@@ -351,10 +351,90 @@ extern "C" __global__ void tp_q4(const float* __restrict__ vals, int rows, int c
         }
     }
 }
+__device__ float q2_group_err_w(const float* tile, const float* hw, float s) {
+    float inv = __fdiv_rn(1.0f, s);
+    float acc[8];
+    for (int l = 0; l < 8; l++) acc[l] = 0.0f;
+    for (int c = 0; c < 4; c++) {
+        for (int l = 0; l < 8; l++) {
+            float w = tile[c * 8 + l];
+            float lv = q2_level(__fadd_rn(__fmul_rn(w, inv), 1.5f));
+            float d = __fsub_rn(w, __fmul_rn(__fsub_rn(lv, 1.5f), s));
+            acc[l] = __fadd_rn(acc[l], __fmul_rn(__fmul_rn(hw[c * 8 + l], d), d));
+        }
+    }
+    return __fadd_rn(__fadd_rn(__fadd_rn(acc[0], acc[1]), __fadd_rn(acc[2], acc[3])),
+                     __fadd_rn(__fadd_rn(acc[4], acc[5]), __fadd_rn(acc[6], acc[7])));
+}
+
+// q2tp_place_row with per-column weights hw: the row params only.
+extern "C" __global__ void tp_place(const float* __restrict__ vals, const float* __restrict__ hw, int rows, int cols,
+                                    u8* __restrict__ params)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const int gpr = cols / 32;
+    const float* row = vals + (size_t)r * cols;
+    float lg[GMAX];
+    u8 dead[GMAX];
+    float lo = __int_as_float(0x7f800000), hi = __int_as_float(0xff800000);
+    for (int g = 0; g < gpr; g++) {
+        const float* tile = row + g * 32;
+        const float* h = hw + g * 32;
+        float am = 0.0f;
+        for (int j = 0; j < 32; j++) { float a = fabsf(tile[j]); am = am > a ? am : (a != a ? am : a); }
+        dead[g] = am == 0.0f;
+        float base = __fdiv_rn(am, 1.5f);
+        float be = __int_as_float(0x7f800000), bs = base;
+        if (!dead[g]) {
+            for (int k = 0; k < 31; k++) {
+                float mult = __double2float_rn(__ddiv_rn((double)(300 + 25 * k), 1000.0));
+                float s = __fmul_rn(base, mult);
+                if (!(s > 0.0f)) continue;
+                float e = q2_group_err_w(tile, h, s);
+                if (e < be) { be = e; bs = s; }
+            }
+        }
+        lg[g] = det_log2(f16_scale(bs));
+        if (!dead[g]) { lo = fminf(lo, lg[g]); hi = fmaxf(hi, lg[g]); }
+    }
+    if (!isfinite(lo)) { lo = lg[0]; hi = lo; }
+    u16 lo_h = f2h(lo);
+    float lo_r = h2f(lo_h);
+    const float fr[4] = {1.0f, 0.9f, 0.8f, 0.7f};
+    double best_err = 0.0;
+    bool have = false;
+    u16 best_st = 0;
+    for (int fi = 0; fi < 4; fi++) {
+        u16 st_h = q2_step(lo_h, __fadd_rn(lo_r, __fmul_rn(__fsub_rn(hi, lo_r), fr[fi])));
+        float base[32], tab[32];
+        ladder4(lo_h, st_h, base);
+        tab[0] = 0.0f;
+        for (int c = 1; c < 32; c++) tab[c] = base[c - 1];
+        double err = 0.0;
+        for (int g = 0; g < gpr; g++) {
+            if (dead[g]) continue;
+            const float* tile = row + g * 32;
+            const float* h = hw + g * 32;
+            float be = __int_as_float(0x7f800000);
+            for (int c = 1; c < 32; c++) {
+                float s = tab[c];
+                if (!(s > 0.0f)) continue;
+                float e = q2_group_err_w(tile, h, s);
+                if (e < be) be = e;
+            }
+            err = __dadd_rn(err, (double)be);
+        }
+        if (!have || err < best_err) { have = true; best_err = err; best_st = st_h; }
+    }
+    u8* p = params + (size_t)r * 4;
+    p[0] = (u8)(lo_h & 0xFF); p[1] = (u8)(lo_h >> 8);
+    p[2] = (u8)(best_st & 0xFF); p[3] = (u8)(best_st >> 8);
+}
 "#;
 
 struct TpState {
-    f: Option<Result<(cs::CUfunction, cs::CUfunction), String>>,
+    f: Option<Result<(cs::CUfunction, cs::CUfunction, cs::CUfunction), String>>,
     scr: std::collections::HashMap<&'static str, Buf>,
 }
 
@@ -394,7 +474,7 @@ pub fn tp_encode(vals: &[f32], rows: usize, cols: usize, two_bit: bool, search: 
     let _st = c.st.lock().unwrap();
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default() });
-    let (fq2, fq4) = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?)))) {
+    let (fq2, fq4, _) = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?)))) {
         Ok(f) => *f,
         Err(e) => {
             decline("tp encode", e);
@@ -431,6 +511,51 @@ pub fn tp_encode(vals: &[f32], rows: usize, cols: usize, two_bit: bool, search: 
         Err(e) => {
             let _ = c.sync();
             decline("tp encode", &e);
+            None
+        }
+    }
+}
+
+/// `q2tp_place_row`'s row params (lo, step) of every row against the
+/// per-column weights `hw`, on the card: the host's bytes. None: no card or
+/// a refusal.
+pub fn tp_place_q2(vals: &[f32], hw: &[f32], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    if !on() || rows == 0 || cols == 0 || cols % 32 != 0 || cols / 32 > 512 || vals.len() < rows * cols || hw.len() < cols {
+        return None;
+    }
+    let c = ctx()?;
+    if c.current().is_err() {
+        return None;
+    }
+    let _st = c.st.lock().unwrap();
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(|| TpState { f: None, scr: Default::default() });
+    let fp = match s.f.get_or_insert_with(|| compile(SRC, vec![], c.arch).and_then(|m| Ok((func(m, "tp_q2")?, func(m, "tp_q4")?, func(m, "tp_place")?)))) {
+        Ok(f) => f.2,
+        Err(e) => {
+            decline("tp place", e);
+            return None;
+        }
+    };
+    let mut out = vec![0u8; rows * 4];
+    let mut run = || -> Res<()> {
+        let vp = s.scr("tp_v", rows * cols * 4)?;
+        let hp = s.scr("tp_h", cols * 4)?;
+        let op = s.scr("tp_o", rows * 4)?;
+        unsafe {
+            cu::memcpy_htod_async(vp, &vals[..rows * cols], c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(hp, &hw[..cols], c.stream).map_err(derr)?;
+            let (rows_i, cols_i) = (rows as i32, cols as i32);
+            c.launch(fp, (rows.div_ceil(64) as u32, 1), 64, 0, kargs!(vp, hp, rows_i, cols_i, op))?;
+            cu::memcpy_dtoh_async(out.as_mut_slice(), op, c.stream).map_err(derr)?;
+        }
+        c.sync()
+    };
+    match run() {
+        Ok(()) => Some(out),
+        Err(e) => {
+            let _ = c.sync();
+            decline("tp place", &e);
             None
         }
     }
