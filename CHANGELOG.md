@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aion's sliding layers keep only the rows their window reads on the host (as Spark-X2.5's and LFM3's), and its
   Metal K/V mirrors are f16. MacBook Air M4, q4tp at 16 384 tokens: K/V 3.77 → 1.62 GB, decode 33.0 → 42.2 tok/s,
   first token 56 → 44 s; the Turbo file 2.95 → 0.83 GB, 44.7 tok/s. Perplexity unchanged.
+- wgpu decode of Aion: its 7 full-attention layers take the uniform arms (the flash-decoding attend) over the
+  mirrors the prompt's per-layer-geometry arm filled, beside the sliding layers' rings; the prompt keeps the
+  geometry arm (its matrix-unit tile takes 128-wide heads). L4 Vulkan, q4tp, decode after 8k / 16k / 30k tokens
+  66.5 / 53.4 / 40.1 → 73.4 / 64.0 / 53.1 tok/s; q8_2f at 16k 44.3 → 52.1; prompt times, perplexity and a
+  three-turn served chat unchanged. `CMF_MIXED_GEOM=0` turns it off.
 - `quantize-gptq` and `quantize-moe` leave past the NVIDIA driver's exit handlers when the process held both a
   Vulkan device and a CUDA context: a run that had written its file ended in glibc's "corrupted size vs.
   prev_size" (a double free under libnvidia-glcore), rc 134.
