@@ -2473,6 +2473,10 @@ pub fn gptq_fold_operator(h: Vec<f64>, n: usize, lambda: f64) -> (Vec<f32>, Vec<
 /// thread count (every entry is the same `dot64` over the same slices,
 /// computed by one worker). It is O(n³): ~0.15 T multiply-adds for a
 /// 6144-wide `down_proj`, ~3.5 T at 17408 (Qwen3.8-27B).
+/// Folds at least this wide go to the card when one is up (`gptq_fold_chol_inv`).
+#[cfg(feature = "cuda")]
+const CUDA_FOLD_MIN: usize = 1024;
+
 pub fn gptq_fold_operator_par(mut h: Vec<f64>, n: usize, lambda: f64, threads: usize) -> (Vec<f32>, Vec<bool>) {
     assert_eq!(h.len(), n * n);
     let dead: Vec<bool> = (0..n).map(|i| !(h[i * n + i] > 0.0)).collect();
@@ -2488,6 +2492,49 @@ pub fn gptq_fold_operator_par(mut h: Vec<f64>, n: usize, lambda: f64, threads: u
     let mean_diag = (0..n).map(|i| h[i * n + i]).sum::<f64>() / n.max(1) as f64;
     let base = mean_diag.max(1e-12);
     let mut lam = lambda.max(0.0);
+    // On a CUDA card the O(n³) algebra (two Cholesky factors, the inverse)
+    // runs on cuBLAS in f64: an 8192-wide down projection's fold took ~4 min
+    // on 6 Xeon cores, seconds there. Same damping schedule as below; None
+    // (no card, `CMF_GPTQ_CUDA=0`, a cuBLAS error) keeps the host's path.
+    #[cfg(feature = "cuda")]
+    if n >= CUDA_FOLD_MIN {
+        let mut lam_c = lam;
+        loop {
+            let mut a = h.clone();
+            for i in 0..n {
+                a[i * n + i] += lam_c * base;
+            }
+            match cortiq_engine::gpu_cuda::gptq_fold_chol_inv(&a, n) {
+                None => break,
+                Some(Ok(m)) => {
+                    let mut u = vec![0f32; n * n];
+                    for j in 0..n {
+                        for c in 0..=j {
+                            u[c * n + j] = m[j * n + c] as f32;
+                        }
+                    }
+                    return (u, dead);
+                }
+                Some(Err(1)) => {
+                    lam_c = if lam_c == 0.0 { 1e-4 } else { lam_c * 10.0 };
+                    if lam_c > 10.0 {
+                        let mut u = vec![0f32; n * n];
+                        for i in 0..n {
+                            u[i * n + i] = 1.0;
+                        }
+                        return (u, dead);
+                    }
+                }
+                Some(Err(_)) => {
+                    let mut u = vec![0f32; n * n];
+                    for i in 0..n {
+                        u[i * n + i] = 1.0;
+                    }
+                    return (u, dead);
+                }
+            }
+        }
+    }
     let mut a = loop {
         let mut a = h.clone();
         for i in 0..n {
@@ -4720,6 +4767,49 @@ mod tests {
             assert!((sc.obj_after / sh.obj_after - 1.0).abs() < 1e-3, "host {sh:?} card {sc:?}");
             assert!((sc.obj_before / sh.obj_before - 1.0).abs() < 1e-4, "host {sh:?} card {sc:?}");
             assert!(diff * 50 <= dh.len(), "{diff} bytes differ");
+        }
+    }
+
+    /// The fold's algebra on cuBLAS (`gpu_cuda::gptq_fold_chol_inv`) against
+    /// the host's: the same operator to f64 rounding, so the q4tp sweep over
+    /// it writes (nearly) the same codes. Widths past one 256-column block
+    /// and not a multiple of it cover the blocked factorization's edges.
+    /// `CMF_GPTQ_CUDA_TEST=1` on a CUDA machine, run alone.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gptq_fold_on_the_card_matches_the_host() {
+        if std::env::var("CMF_GPTQ_CUDA_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        for (rows, cols) in [(32usize, 1024usize), (24, 1312)] {
+            let (w, _, h) = q2_problem_with(rows, cols, 3 * cols, 7, 2.0);
+            let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+            unsafe { std::env::set_var("CMF_GPTQ_CUDA", "0") };
+            let t0 = std::time::Instant::now();
+            let (uh, dh) = gptq_fold_operator_par(h.clone(), cols, 0.01, 4);
+            let th = t0.elapsed();
+            unsafe { std::env::set_var("CMF_GPTQ_CUDA", "1") };
+            let t0 = std::time::Instant::now();
+            let (uc, dc) = gptq_fold_operator_par(h.clone(), cols, 0.01, 4);
+            let tc = t0.elapsed();
+            assert_eq!(dh, dc);
+            let (mut err, mut mag) = (0f64, 0f64);
+            for (a, b) in uh.iter().zip(&uc) {
+                err = err.max((a - b).abs() as f64);
+                mag = mag.max(a.abs() as f64);
+            }
+            // the lower triangle of U is zero on both paths
+            for i in 0..cols {
+                for j in 0..i {
+                    assert_eq!(uc[i * cols + j], 0.0);
+                }
+            }
+            let qh = gptq_quantize_q4tp(&w, rows, cols, &uh, &dh, &hdiag, 2);
+            let qc = gptq_quantize_q4tp(&w, rows, cols, &uc, &dc, &hdiag, 2);
+            let diff = qh.iter().zip(&qc).filter(|(a, b)| a != b).count();
+            eprintln!("fold {cols}: host {th:?}, card {tc:?}, max |dU| {err:.3e} of {mag:.3e}, {diff} of {} q4tp bytes differ", qh.len());
+            assert!(err <= 1e-5 * mag, "max |dU| {err} of {mag}");
+            assert!(diff * 100 <= qh.len(), "{diff} bytes differ");
         }
     }
 

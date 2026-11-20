@@ -38153,8 +38153,16 @@ pub fn forward_batch_graph_at(
     let q82_prompt = preview.is_none()
         && spec.is_none()
         && k > 16
-        && BATCH_Q82_MM.with(|f| f.get())
+        && (BATCH_Q82_MM.with(|f| f.get()) || std::env::var("CMF_Q82_MM").as_deref() == Ok("1"))
         && std::env::var("CMF_Q82_MM").as_deref() != Ok("0");
+    // Rows from which a prompt chunk's q8_2f matrix takes the matrix units
+    // (`CMF_Q82_COOP_ROWS`, default 4096).
+    let q82_coop_rows = {
+        static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *R.get_or_init(|| {
+            std::env::var("CMF_Q82_COOP_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
+        })
+    };
     let q82mm_p = g4p.or_else(|| (preview.is_some() || q82_prompt).then(|| gemma_batch::pipes(c)).flatten());
     // Prompt chunks only: no preview, no speculative verify.
     let q82_coop_chunk = preview.is_none() && spec.is_none();
@@ -38186,7 +38194,7 @@ pub fn forward_batch_graph_at(
             // reduction cost the four-bit file's prompt 209 -> 196 tok/s.
             7 if k > 16
                 && q82_coop_chunk
-                && rows >= 4096
+                && rows >= q82_coop_rows
                 && cols % 32 == 0
                 && c.q82_mm_coop_s.is_some()
                 && {

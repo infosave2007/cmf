@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- microsoft/Aion-1.0-Instruct-2.3B (`aion_instruct`) converts natively: GQA with per-head q/k RMSNorm, 20 sliding
+  layers (window 2048) on plain RoPE and 8 full layers on YaRN ×16, keyed by layer type as Mellum's
+  `rope_parameters`. Perplexity of the q8_2f file against Transformers bf16 on the same windows: WikiText-2 14.251
+  (14.239), 4 × 4096 tokens 9.469 (9.464), Rust 7.661 (7.657), Python 7.263 (7.264).
+- Chat templates may call `strftime_now(fmt)` (transformers' clock helper: Aion, Llama 3.x); before, such a
+  template failed to render and the prompt fell back to ChatML.
+
+### Changed
+- `quantize-gptq` / `quantize-moe` on a CUDA build: a Hessian fold at least 1024 wide runs its O(n³) algebra (two
+  Cholesky factors and the inverse, f64) on cuBLAS — host 256² diagonal blocks, `dtrsm` panels, `dsyrk` updates.
+  Aion's q4tp with channel scale and code refinement (28 folds 8192 wide): 1919 → 628 s on a Colab L4;
+  `CMF_GPTQ_CUDA=0` keeps the host fold.
+
 ## [0.9.8] — 2026-11-20
 
 ### Added

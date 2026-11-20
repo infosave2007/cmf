@@ -990,7 +990,7 @@ pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_a
 /// quantize-moe's GPTQ host parts on the card (the row-square GEMM, SFq's
 /// code refinement); declared after `kargs!`, which it uses.
 mod gptq;
-pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
+pub use gptq::{gptq_fold_chol_inv, gptq_gemm_rows_square, gptq_refine_rows};
 mod tpenc;
 pub use tpenc::{gptq_sweep, tp_encode, tp_place_q2};
 

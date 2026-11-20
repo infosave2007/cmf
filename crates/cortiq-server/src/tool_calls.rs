@@ -690,7 +690,10 @@ fn minimax_m3_assign_child(parent: &mut Value, tag: String, child: Value) -> boo
 /// validation; the Hermes grammar carries JSON and needs none).
 pub fn extract_tool_calls(text: &str, tools: Option<&[Value]>) -> (String, Vec<Value>) {
     let (start, end) = content_region(text);
-    let (plain_mid, mut calls) = extract_hermes(&text[start..end], tools.unwrap_or(&[]));
+    let (plain_mid, mut calls) = extract_hermes(&text[start..end], tools.unwrap_or(&[]), "<tool_call>", "</tool_call>");
+    // Aion Instruct: the same JSON body between its control tokens.
+    let (plain_mid, aion) = extract_hermes(&plain_mid, tools.unwrap_or(&[]), AION_OPEN, AION_CLOSE);
+    calls.extend(aion);
     let (plain_mid, minicpm) = extract_minicpm5(&plain_mid, tools.unwrap_or(&[]));
     calls.extend(minicpm);
     let (plain_mid, lfm) = extract_lfm(&plain_mid, tools.unwrap_or(&[]));
@@ -728,21 +731,24 @@ fn openai_call(name: &str, args: &Value) -> Value {
 
 // ─── Hermes / Qwen ───────────────────────────────────────────────────
 
-/// `<tool_call>{...}</tool_call>` blocks. A block whose body does not
+/// Aion Instruct's wrapper: `<|tool_call|>{"name": …, "arguments": {…}}<|/tool_call|>`.
+const AION_OPEN: &str = "<|tool_call|>";
+const AION_CLOSE: &str = "<|/tool_call|>";
+
+/// `<tool_call>{...}</tool_call>` blocks (or another `open`/`close` pair
+/// around the same body). A block whose body does not
 /// parse stays in the text verbatim — a client can read prose, but it
 /// cannot execute garbage; an unterminated block (truncated output) too.
-fn extract_hermes(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
+fn extract_hermes(text: &str, tools: &[Value], open: &str, close: &str) -> (String, Vec<Value>) {
     let mut rest = text;
     let mut plain = String::new();
     let mut calls = Vec::new();
-    while let Some(i) = rest.find(OPEN) {
-        let Some(j) = rest[i + OPEN.len()..].find(CLOSE) else {
+    while let Some(i) = rest.find(open) {
+        let Some(j) = rest[i + open.len()..].find(close) else {
             break;
         };
-        let body = rest[i + OPEN.len()..i + OPEN.len() + j].trim();
-        let block_end = i + OPEN.len() + j + CLOSE.len();
+        let body = rest[i + open.len()..i + open.len() + j].trim();
+        let block_end = i + open.len() + j + close.len();
         // Two trained grammars share the wrapper: the JSON object, and
         // Nanbeige's XML `<function=name><parameter=k>v...`.
         let parsed = serde_json::from_str::<Value>(body)
@@ -1338,7 +1344,7 @@ pub struct ToolHoldback {
     in_think: bool,
 }
 
-const MARKERS: &[&str] = &["<tool_call>", "<function ", "<function\n", "<function\t", LFM_OPEN];
+const MARKERS: &[&str] = &["<tool_call>", "<function ", "<function\n", "<function\t", LFM_OPEN, AION_OPEN];
 
 impl ToolHoldback {
     pub fn new() -> Self {
@@ -1418,6 +1424,20 @@ impl ToolHoldback {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn aion_control_token_wrapper_is_a_call() {
+        let text = "<|tool_call|>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}<|/tool_call|>";
+        let (plain, calls) = extract_tool_calls(text, None);
+        assert_eq!(plain, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+        // a body that is not a call stays text
+        let (plain, calls) = extract_tool_calls("<|tool_call|>not json<|/tool_call|>", None);
+        assert!(calls.is_empty());
+        assert!(plain.contains("not json"));
+    }
 
     #[test]
     fn spark_arg_key_calls_follow_the_schema() {
