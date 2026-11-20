@@ -458,6 +458,9 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
     }
 }
 
+// A block of a routed row's bit set (Maxwell's block route, `hy_route_sel`).
+__device__ __forceinline__ bool routed(const u32* bm, int blk) { return (bm[blk >> 5] >> (blk & 31)) & 1u; }
+
 // Decode attention of B rows at once, row b seeing the mirror's rows
 // [r0, r0 + n0 + b + 1) (the rows before the call, the call's rows up to its
 // own). S [B][nh][ncap], Mx [B][nh][nbcap], P [B][nbcap][nh][HD],
@@ -465,9 +468,12 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
 // The call record ci (when given) carries n0, the mirror row of the first
 // row, rb, ncap and nbcap; the grid covers the largest key count a record
 // may give, blocks past this call's keys leave at once.
+// BM (when given): the rows' routed blocks [B][nkv][mw], a block 1 << bshift
+// keys; a key outside them takes no weight.
 extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __restrict__ Km,
                                      float* __restrict__ S, float* __restrict__ Mx, int n0, int r0, int nkv,
-                                     float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci)
+                                     float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci,
+                                     const u32* __restrict__ BM, int bshift, int mw)
 {
     __shared__ float sm[32][HPK];
     // an exact mirror's record carries a sliding window in word 7 (word 5 is
@@ -496,8 +502,9 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
     for (int j = 0; j < HPK; j++) mx[j] = -INF;
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
     float* Sb = S + (size_t)b * nh * ncap;
+    const u32* bm = BM ? BM + ((size_t)b * nkv + g) * mw : 0;
     for (int r = row0 + warp; r < row1; r += NW) {
-        if (r < lo) {
+        if (r < lo || (bm && !routed(bm, r >> bshift))) {
             if (lane == 0)
                 for (int j = 0; j < HPK; j++) Sb[(size_t)(g * HPK + j) * ncap + r] = -INF;
             continue;
@@ -529,7 +536,8 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
 extern "C" __global__ void hy_values(const float* __restrict__ S, const float* __restrict__ Mx,
                                      const u16* __restrict__ Vm, float* __restrict__ P, float* __restrict__ E,
                                      int n0, int r0, int nkv, int rb, int ncap, int nbcap, int B,
-                                     const int* __restrict__ ci, const float* __restrict__ sink)
+                                     const int* __restrict__ ci, const float* __restrict__ sink,
+                                     const u32* __restrict__ BM, int bshift, int mw)
 {
     __shared__ float sp[8][HD];
     // `extra`: a far field's block after the near ones (ci[5])
@@ -567,7 +575,10 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
         for (int t = 0; t < DPL; t++) acc[j][t] = 0.0f;
     }
     const int row0 = blk * rb, row1 = min(row0 + rb, n);
+    const u32* bm = BM ? BM + ((size_t)b * nkv + g) * mw : 0;
     for (int r = row0 + warp; r < row1; r += NW) {
+        // a key outside the row's routed blocks: its score is -inf, no weight
+        if (bm && !routed(bm, r >> bshift)) continue;
         const u16* vr = Vm + ((size_t)(r0 + r) * nkv + g) * HD + lane * DPL;
         float vv[DPL];
         hdpl(vr, vv);
@@ -1664,9 +1675,13 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
 // position pos0 + r / hpk, column c the key at col_base + c), the
 // exponentials written as f16 into P (the value GEMM's operand) and each
 // row's 1 / sum into isum.
+// BM (when given): the routed blocks of the call's rows [row][nkv][mw] (the
+// block's first row is row `brow` of them), a block 1 << bshift keys; a key
+// outside them weighs nothing.
 extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __restrict__ P, float* __restrict__ isum,
                                         int L, int pos0, int col_base, int hpk, int cols, int istride, int win,
-                                        const float* __restrict__ sink)
+                                        const float* __restrict__ sink, const u32* __restrict__ BM, int bshift, int mw,
+                                        int brow, int nkv)
 {
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1677,9 +1692,10 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     const int hi = pq - col_base;
     // a sliding window: the keys left of its `win` (`hy_scores`' rule) weigh nothing
     const int lo = win > 0 ? hi - win + 1 : 0;
+    const u32* bm = BM ? BM + ((size_t)(brow + r / hpk) * nkv + gk) * mw : 0;
     float m = -INF;
     for (int c = tid; c <= hi && c < L; c += T)
-        if (c >= lo) m = fmaxf(m, s[c]);
+        if (c >= lo && (!bm || routed(bm, (col_base + c) >> bshift))) m = fmaxf(m, s[c]);
     for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, k));
     if (lane == 0) red[warp] = m;
     __syncthreads();
@@ -1692,7 +1708,7 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     float sum = 0.0f;
     for (int c = tid; c < L; c += T) {
         float e = 0.0f;
-        if (c <= hi && c >= lo) {
+        if (c <= hi && c >= lo && (!bm || routed(bm, (col_base + c) >> bshift))) {
             e = expf(s[c] - m);
             sum += e;
         }
@@ -1709,6 +1725,153 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
     }
 }
 
+
+// ------------------------------------------------- Maxwell's block route
+//
+// Maxwell-V1-Flash's block-sparse support (`maxwell::route_blocks`): a query
+// attends to the first `prefix` blocks of `block` positions, to its own
+// block and the `local - 1` before it, and to at most `remote` blocks in
+// between, picked for each KV group by the block's largest token score. The
+// index keys ride in a mirror of their own, IK [position][HD] f16; a row's
+// routed blocks are a bit set BM [row][kv group][mw] the attention reads
+// (`hy_scores`, `hy_values`, `hy_softmax_h`). `ci` (a replayed graph): the
+// first row's position in word 0.
+
+// The index rows of the call: block u < nkv the index query of KV group u
+// into IQ [row][group][HD], block u == nkv the row's index key into its slot
+// of IK. Wq [nkv * HD][hidden] and Wk [HD][hidden] f32 over the layer's
+// normed rows, a norm a head, the rows' rotation table (`hy_qk`'s). A thread
+// a channel.
+extern "C" __global__ void hy_route_put(const float* __restrict__ xn, int hidden, const float* __restrict__ Wq,
+                                        const float* __restrict__ Wk, const float* __restrict__ qn,
+                                        const float* __restrict__ kn, const float* __restrict__ tab,
+                                        u16* __restrict__ IK, float* __restrict__ IQ, int pos0, int nkv, int half,
+                                        float eps, const int* __restrict__ ci)
+{
+    if (ci) pos0 = ci[0];
+    __shared__ float xs[HD];
+    __shared__ float red[32];
+    const int u = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int NW = blockDim.x >> 5;
+    const bool isq = u < nkv;
+    const float* W = isq ? Wq + (size_t)u * HD * hidden : Wk;
+    const float* nw = isq ? qn : kn;
+    const float4* x4 = (const float4*)(xn + (size_t)b * hidden);
+    float s = 0.0f;
+    for (int i = tid; i < HD; i += blockDim.x) {
+        const float4* w4 = (const float4*)(W + (size_t)i * hidden);
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int c = 0; c < hidden / 4; c++) {
+            const float4 a = w4[c], v = x4[c];
+            acc.x = fmaf(a.x, v.x, acc.x);
+            acc.y = fmaf(a.y, v.y, acc.y);
+            acc.z = fmaf(a.z, v.z, acc.z);
+            acc.w = fmaf(a.w, v.w, acc.w);
+        }
+        const float x = acc.x + acc.y + acc.z + acc.w;
+        xs[i] = x;
+        s = fmaf(x, x, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, o));
+    if (lane == 0) red[warp] = s;
+    __syncthreads();
+    double tot = 0.0;
+    for (int w = 0; w < NW; w++) tot += (double)red[w];
+    const float inv = 1.0f / (float)sqrt(tot / (double)HD + (double)eps);
+    __syncthreads();
+    for (int i = tid; i < HD; i += blockDim.x) xs[i] = __fmul_rn(__fmul_rn(xs[i], inv), nw[i]);
+    __syncthreads();
+    const float* t = tab + (size_t)b * half * 2;
+    for (int d = tid; d < HD; d += blockDim.x) {
+        float val;
+        if (d < half) {
+            const float sn = t[2 * d], c = t[2 * d + 1];
+            val = __fsub_rn(__fmul_rn(xs[d], c), __fmul_rn(xs[d + half], sn));
+        } else if (d < 2 * half) {
+            const int i = d - half;
+            const float sn = t[2 * i], c = t[2 * i + 1];
+            val = __fadd_rn(__fmul_rn(xs[i], sn), __fmul_rn(xs[d], c));
+        } else {
+            val = xs[d];
+        }
+        if (isq)
+            IQ[((size_t)b * nkv + u) * HD + d] = val;
+        else
+            IK[(size_t)(pos0 + b) * HD + d] = f2h_sat(val);
+    }
+}
+
+// The routed blocks of every (KV group, row) of the call, a block a pair.
+// The candidates are the blocks wholly past the prefix and wholly before the
+// local window; while they do not outnumber `remote` (at most 16) every
+// block up to the row's own is routed. Else a candidate's score is its
+// largest token score q . k (a thread a token of the block) and the best
+// `remote` join the prefix and the local window (ties to the lower block).
+extern "C" __global__ void hy_route_sel(const float* __restrict__ IQ, const u16* __restrict__ IK,
+                                        u32* __restrict__ BM, int pos0, int nkv, int block, int prefix, int local,
+                                        int remote, int mw, const int* __restrict__ ci)
+{
+    if (ci) pos0 = ci[0];
+    __shared__ float qs[HD];
+    __shared__ float red[32];
+    const int g = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int NW = blockDim.x >> 5;
+    const int pos = pos0 + b, cur = pos / block;
+    const int local0 = max(cur + 1 - local, 0);
+    u32* out = BM + ((size_t)b * nkv + g) * mw;
+    if (local0 - prefix <= remote) {
+        for (int w = tid; w < mw; w += blockDim.x) {
+            const int lo = w * 32;
+            out[w] = lo > cur ? 0u : (cur - lo >= 31 ? FULL : (FULL >> (31 - (cur - lo))));
+        }
+        return;
+    }
+    for (int i = tid; i < HD; i += blockDim.x) qs[i] = IQ[((size_t)b * nkv + g) * HD + i];
+    for (int w = tid; w < mw; w += blockDim.x) out[w] = 0u;
+    __syncthreads();
+    // thread 0's: the best candidates so far, descending
+    float vals[16];
+    int ids[16];
+    int cnt = 0;
+    const int R = min(remote, 16);
+    for (int cb = prefix; cb < local0; cb++) {
+        float m = -INF;
+        for (int t = tid; t < block; t += blockDim.x) {
+            const u16* kr = IK + ((size_t)cb * block + t) * HD;
+            float a = 0.0f;
+            for (int d = 0; d < HD; d += 8) {
+                float kv[8];
+                h8(kr + d, kv);
+#pragma unroll
+                for (int e = 0; e < 8; e++) a = fmaf(qs[d + e], kv[e], a);
+            }
+            m = fmaxf(m, a);
+        }
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+        if (lane == 0) red[warp] = m;
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 1; w < NW; w++) m = fmaxf(m, red[w]);
+            if (cnt < R || m > vals[R - 1]) {
+                int j = min(cnt, R - 1);
+                while (j > 0 && vals[j - 1] < m) {
+                    vals[j] = vals[j - 1];
+                    ids[j] = ids[j - 1];
+                    j--;
+                }
+                vals[j] = m;
+                ids[j] = cb;
+                cnt = min(cnt + 1, R);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (int k = 0; k < min(prefix, cur + 1); k++) out[k >> 5] |= 1u << (k & 31);
+        for (int k = max(local0, prefix); k <= cur; k++) out[k >> 5] |= 1u << (k & 31);
+        for (int k = 0; k < cnt; k++) out[ids[k] >> 5] |= 1u << (ids[k] & 31);
+    }
+}
 
 // ------------------------------------------------- the far field of a turbo file
 //
@@ -3218,7 +3381,9 @@ extern "C" __global__ void hy_mhc_logits(const float* __restrict__ R, const floa
             ss += (double)red[0][w];
             dd += (double)red[1][w];
         }
-        L[(size_t)r * 24 + k] = (float)(dd / sqrt(ss / (double)n + (double)eps));
+        // a negative epsilon is added to the RMS itself (Maxwell: 1 / (rms + eps))
+        const double rms = eps < 0.0f ? sqrt(ss / (double)n) - (double)eps : sqrt(ss / (double)n + (double)eps);
+        L[(size_t)r * 24 + k] = (float)(dd / rms);
     }
 }
 

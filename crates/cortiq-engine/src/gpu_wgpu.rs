@@ -35502,7 +35502,7 @@ pub fn forward_token_graph(
                 let um = unif(&mhc::params4(hidden, 1, m.leave && m.head.is_none(), m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
                 mhc::encode_merge4(c, &mut enc, mp4, &h_buf, ffn_y, &um, hidden, 1);
                 if let (true, Some(hh)) = (m.leave, m.head.as_ref()) {
-                    let uh = unif(&mhc::params4x(hidden, 1, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps, Some(d4.ihc.unwrap_or(1.0)), true));
+                    let uh = unif(&mhc::params4x(hidden, 1, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps.abs(), Some(d4.ihc.unwrap_or(1.0)), true));
                     let (hw, hb) = (stor(bytemuck::cast_slice(hh.w)), stor(bytemuck::cast_slice(hh.base)));
                     mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &hw, &hb, &uh, hidden, 1, false, 4);
                 }
@@ -41909,7 +41909,7 @@ pub fn forward_batch_graph_at(
             let um = unif(&mhc::params4(hidden, k, m.leave && m.head.is_none(), m.iters, d4.ffn_scale, d4.eps, d4.rms_eps));
             mhc::encode_merge4(c, &mut enc, mp4, &h_buf, ffn_y, &um, hidden, k);
             if let (true, Some(hh)) = (m.leave, m.head.as_ref()) {
-                let uh = unif(&mhc::params4x(hidden, k, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps, Some(d4.ihc.unwrap_or(1.0)), true));
+                let uh = unif(&mhc::params4x(hidden, k, false, 0, [hh.scale, 0.0, 0.0], d4.eps, d4.rms_eps.abs(), Some(d4.ihc.unwrap_or(1.0)), true));
                 let (hw, hb) = (stor(bytemuck::cast_slice(hh.w)), stor(bytemuck::cast_slice(hh.base)));
                 mhc::encode_route4n(c, &mut enc, mp4, &h_buf, &hw, &hb, &uh, hidden, k, false, 4);
             }
