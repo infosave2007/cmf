@@ -8069,7 +8069,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let is_lfm3 = model_type.eq_ignore_ascii_case("lfm3") || tc_model_type.eq_ignore_ascii_case("lfm3");
     let is_laguna_config = is_laguna_config || is_lfm3;
     let is_mellum_config = model_type.eq_ignore_ascii_case("mellum");
-    let is_dual_rope_config = is_laguna_config || is_mellum_config;
+    // Microsoft Aion Instruct: dense GQA with per-head q/k RMSNorm (Qwen3
+    // order: norm, then RoPE), sliding-window layers on plain RoPE and
+    // full layers on YaRN, keyed by layer type exactly as Mellum.
+    let is_aion = model_type.eq_ignore_ascii_case("aion_instruct");
+    let is_dual_rope_config = is_laguna_config || is_mellum_config || is_aion;
     let rope = if is_dual_rope_config {
         rope_root.and_then(|r| r.get("full_attention"))
     } else {
@@ -8712,6 +8716,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 || mt == "spark2_5"
                 || is_lfm3
                 || is_mellum_config
+                || is_aion
                 || is_gemma2
                 || is_gemma3n
                 // Recursive Flint: 35 sliding-window layers, 14 full.
@@ -14156,6 +14161,64 @@ pub(crate) mod tests {
             canon_name("model.layers.1.mlp.experts.e_score_correction_bias").as_deref(),
             Some("model.layers.1.mlp.expert_bias")
         );
+    }
+
+    #[test]
+    fn aion_config_keeps_dual_rope_and_explicit_sliding_layers() {
+        // microsoft/Aion-1.0-Instruct-2.3B: sliding layers on plain RoPE,
+        // full layers on YaRN ×16 (2048 → 32768) with the derived
+        // 0.1·ln(16)+1 amplitude, both at θ 32000, keyed by layer type.
+        let config = serde_json::json!({
+            "model_type": "aion_instruct",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "max_position_embeddings": 32768,
+            "rms_norm_eps": 0.000001,
+            "hidden_act": "silu",
+            "tie_word_embeddings": true,
+            "sliding_window": 2048,
+            "layer_types": [
+                "sliding_attention", "sliding_attention",
+                "full_attention", "sliding_attention"
+            ],
+            "rope_parameters": {
+                "full_attention": {
+                    "beta_fast": 32.0, "beta_slow": 1.0, "factor": 16.0,
+                    "original_max_position_embeddings": 2048,
+                    "rope_theta": 32000, "rope_type": "yarn"
+                },
+                "sliding_attention": {"rope_type": "default", "rope_theta": 32000}
+            }
+        });
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "aion_instruct");
+        assert_eq!(arch.norm_style, NormStyle::Qwen);
+        assert!(arch.tie_word_embeddings);
+        assert_eq!(arch.max_position_embeddings, 32768);
+        assert_eq!(
+            arch.layer_types,
+            vec![
+                LayerType::SlidingAttention,
+                LayerType::SlidingAttention,
+                LayerType::FullAttention,
+                LayerType::SlidingAttention,
+            ]
+        );
+        assert_eq!(arch.sliding_window, Some(2048));
+        assert_eq!(arch.sliding_window_pattern, None);
+        assert_eq!(arch.rope_theta, 32000.0);
+        assert_eq!(arch.rope_local_base_freq, Some(32000.0));
+        assert!(!arch.qk_norm_after_rope);
+        let yarn = arch.yarn.as_ref().unwrap();
+        assert_eq!(yarn.factor, 16.0);
+        assert_eq!(yarn.original_max_position_embeddings, 2048);
+        assert!((yarn.attention_factor - (0.1 * 16f32.ln() + 1.0)).abs() < 1e-6);
+        assert!(arch.moe.is_none());
     }
 
     #[test]

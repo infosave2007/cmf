@@ -563,6 +563,12 @@ pub struct Pipeline {
     /// layers). Set at load for Spark-X2.5 only (`CMF_SWA_TRIM=0` turns
     /// it off); None keeps every row, as every other model always has.
     pub swa_trim: Option<(usize, usize)>,
+    /// On the wgpu graphs a full-attention layer of the call's own geometry
+    /// takes the uniform arms (f16 mirror rows, the flash-decoding attend)
+    /// beside sliding layers on their rings, instead of every layer going
+    /// the per-layer-geometry kernels because one of them slides. Set at
+    /// load for Aion (`CMF_MIXED_GEOM=0` turns it off).
+    pub uniform_full_layers: bool,
     /// Prompt end of the current turn: the tail trim keeps every row a
     /// rollback to it still reads (`LayerKvCache::trim_window_anchored`),
     /// so the next chat turn can drop this turn's answer.
@@ -4963,6 +4969,7 @@ impl Pipeline {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
             swa_trim: None,
+            uniform_full_layers: false,
             swa_trim_anchor: usize::MAX,
             chunk_min_rows: 32,
             o1_chunk_prefix: false,
@@ -6049,8 +6056,10 @@ impl Pipeline {
     /// either graph the whole way, so the two can be compared row for row.
     #[cfg(not(target_os = "macos"))]
     fn o1_whole_prompt(&self) -> bool {
-        if std::env::var("CMF_O1_WHOLE").as_deref() == Ok("1") {
-            return true;
+        match std::env::var("CMF_O1_WHOLE").as_deref() {
+            Ok("1") => return true,
+            Ok("0") => return false,
+            _ => {}
         }
         crate::gpu::cuda_active() && (self.graph_gdn_layer_count() == 0 || std::env::var("CMF_O1_CHUNKS").as_deref() == Ok("0"))
     }
@@ -6235,7 +6244,7 @@ impl Pipeline {
         let drain_every = std::env::var("CMF_O1_QCAP_DRAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1);
         let (mut drain_from, mut undrained) = (0usize, 0usize);
         while pos < n {
-            let end = (pos + chunk).min(n);
+            let end = o1_chunk_end(pos, chunk, n);
             let bk = end - pos;
             let mut hiddens = vec![0f32; bk * hs];
             for (j, &id) in ids[pos..end].iter().enumerate() {
@@ -8067,6 +8076,7 @@ impl Pipeline {
                 let stop = if o1_arch.is_some() { tail_from } else { input_ids.len() };
                 let end = match snap_at {
                     Some(s) if pos < s => (pos + chunk).min(stop).min(s),
+                    _ if o1_arch.is_some() => o1_chunk_end(pos, chunk, stop),
                     _ => (pos + chunk).min(stop),
                 };
                 let bk = end - pos;
@@ -16910,6 +16920,34 @@ impl Pipeline {
         })
     }
 
+    /// The decode graph's geometry of layer `li`: `graph_attn_geom`, except
+    /// that a full-attention layer of the call's own geometry takes the
+    /// uniform arms (None) on the wgpu token graph of a stack that asked for
+    /// it (`uniform_full_layers`). Its mirror is the one the prompt's
+    /// per-layer-geometry arm filled — one f32 row a position either way —
+    /// and the decode reads it through the flash-decoding attend instead of
+    /// one workgroup a head over every row (Aion-2.3B q4tp on an L4 at 16k /
+    /// 30k tokens: 54 / 41 → see CHANGELOG). The prompt keeps the geometry
+    /// arm: its matrix-unit tile takes 128-wide heads, the uniform one 256.
+    fn graph_attn_geom_decode<'a>(&'a self, li: usize, e0: &'a [f32]) -> Option<crate::gpu::GraphAttnGeom<'a>> {
+        let (nkv, hd, rd) = self.layer_geom(li);
+        if self.uniform_full_layers
+            && crate::gpu::wgpu_active()
+            && self.dash.is_none()
+            && !self.layer_is_local(li)
+            && self.kv_cache.layers[li].sinks.is_none()
+            && (nkv, hd, rd) == (self.num_kv_heads, self.head_dim, self.rotary_dim)
+            && self.layer_v_dim(li) == hd
+            && self.inv_freq_global.is_none()
+            && self.layer_rope_scale(li) == 1.0
+            && !self.attn_v_norm
+            && self.value_blend.is_none()
+        {
+            return None;
+        }
+        self.graph_attn_geom_vres(li, e0)
+    }
+
     /// `graph_attn_geom` with Ripple's value residual: the layer's blend and
     /// `e0`, the embedding rows of the graph call.
     fn graph_attn_geom_vres<'a>(&'a self, li: usize, e0: &'a [f32]) -> Option<crate::gpu::GraphAttnGeom<'a>> {
@@ -18502,7 +18540,7 @@ impl Pipeline {
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
                         cpu_base: self.kv_cache.layers[li].base(),
-                        geom: self.graph_attn_geom_vres(li, vres_e0),
+                        geom: self.graph_attn_geom_decode(li, vres_e0),
                         head_gate,
                     }
                 }
@@ -27703,8 +27741,48 @@ fn ffn_forward_pair(
     })
 }
 
+/// Rows a far-field prompt chunk keeps at least when it is the last before
+/// `stop`: a chunk of a few rows can go a backend's decode-sized path (the
+/// CUDA hybrid arm's 16-row small path), which captures neither the seal's
+/// queries nor the archive's K/V rows. Aion-2.3B, 26 626 rows: the whole-prompt
+/// prefix in 1024-row chunks ended in 2 rows ("0 query values"), the sealed
+/// 512-row chunks before the tail in 2 rows (an archive two rows short, exact
+/// rows read from the wrong place, a garbled answer).
+const O1_MIN_LAST_CHUNK: usize = 32;
+
+/// The end of a far-field prompt chunk from `pos`, at most `chunk` rows and not
+/// past `stop`, that leaves the chunk after it at least [`O1_MIN_LAST_CHUNK`] rows.
+fn o1_chunk_end(pos: usize, chunk: usize, stop: usize) -> usize {
+    let end = (pos + chunk).min(stop);
+    let rest = stop - end;
+    if rest > 0 && rest < O1_MIN_LAST_CHUNK && stop - O1_MIN_LAST_CHUNK > pos + O1_MIN_LAST_CHUNK {
+        stop - O1_MIN_LAST_CHUNK
+    } else {
+        end
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn o1_chunks_never_end_in_a_sliver() {
+        // 26 626 rows in 1024-row chunks: the last but one stops 32 short
+        let mut ends = Vec::new();
+        let mut pos = 0;
+        while pos < 26_626 {
+            let e = super::o1_chunk_end(pos, 1024, 26_626);
+            ends.push(e - pos);
+            pos = e;
+        }
+        assert_eq!(pos, 26_626);
+        assert!(ends.iter().all(|&b| b >= 32 && b <= 1024), "{ends:?}");
+        assert_eq!(*ends.last().unwrap(), 32);
+        // an exact multiple and a short span are left alone
+        assert_eq!(super::o1_chunk_end(0, 512, 1024), 512);
+        assert_eq!(super::o1_chunk_end(1000, 512, 1010), 1010);
+        assert_eq!(super::o1_chunk_end(0, 512, 530), 498);
+    }
     use std::ffi::OsString;
     use std::sync::Mutex;
 

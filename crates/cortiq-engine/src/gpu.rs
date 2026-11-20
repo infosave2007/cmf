@@ -3039,6 +3039,30 @@ pub fn o1_spec_commit(_kv_id: u64, _pos0: usize, _rows: usize) -> bool {
 
 /// A seal's far sums go to the card (`o1_far_sums`): CUDA, unless
 /// `CMF_O1_FAR_GPU=0`.
+/// A finished command leaves here when the process holds both an NVIDIA
+/// Vulkan device and a CUDA context (GPTQ: the calibration forward on the
+/// wgpu graph, the folds and sweeps on CUDA). The driver's own exit handlers
+/// then free something twice: glibc aborted with "corrupted size vs.
+/// prev_size in fastbins" after `quantize-gptq` had written its file, rc 134
+/// for a run that had succeeded (the backtrace: `free` under
+/// libnvidia-glcore, from libGLX_nvidia's teardown). Flushes the standard
+/// streams and exits past the handlers; a process with one of the two, or
+/// neither, returns and exits the usual way. `CMF_EXIT_HANDLERS=1` returns always.
+pub fn exit_past_driver_teardown(code: i32) {
+    #[cfg(all(feature = "cuda", unix))]
+    {
+        if std::env::var("CMF_EXIT_HANDLERS").as_deref() != Ok("1") && crate::gpu_cuda::ctx_built() && crate::gpu_wgpu::any_ctx_built() {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            // SAFETY: `_exit` ends the process at once; every file this
+            // process wrote was closed (or synced) by the command itself.
+            unsafe { libc::_exit(code) }
+        }
+    }
+    let _ = code;
+}
+
 pub fn o1_far_sums_on() -> bool {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {

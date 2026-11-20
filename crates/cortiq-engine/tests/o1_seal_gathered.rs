@@ -87,3 +87,42 @@ fn gathered_seal_over_interleaved_rows_is_the_groups_own() {
         same(&a.device_view(), &b.device_view());
     }
 }
+
+/// Landmarks from the rows past the sinks and the rows kept exact
+/// (`with_landmarks_from`): the gathered seal and the seal over ordered copies
+/// still agree bit for bit, the first key landmark is the mean of the first
+/// segment of those rows alone, and it is not the landmark over every row.
+#[test]
+fn landmarks_skip_the_rows_kept_exact() {
+    let (t, d, m, w, sink) = (300usize, 16usize, 8usize, 24usize, 4usize);
+    let (nh, hpk, h0, stride) = (4usize, 2usize, 2usize, 3usize);
+    let mut seed = 31u64;
+    let ks: Vec<f32> = (0..t * d).map(|_| lcg(&mut seed)).collect();
+    let vs: Vec<f32> = (0..t * d).map(|_| lcg(&mut seed)).collect();
+    let q_trace: Vec<f32> = (0..t.div_ceil(stride) * nh * d).map(|_| lcg(&mut seed)).collect();
+    let keep = [40usize, 41, 150, 151, 152, 200];
+    let mut chosen = vec![false; t];
+    keep.iter().for_each(|&r| chosen[r] = true);
+    let order: Vec<u32> = (0..sink).chain(keep.iter().copied()).chain((sink..t).filter(|&r| !chosen[r])).map(|r| r as u32).collect();
+    let from = sink + keep.len();
+    let pick = |src: &[f32]| -> Vec<f32> { order.iter().flat_map(|&r| src[r as usize * d..(r as usize + 1) * d].iter().copied()).collect() };
+    let qo: Vec<Vec<f32>> = (0..hpk)
+        .map(|h| order.iter().flat_map(|&r| { let at = ((r as usize / stride) * nh + h0 + h) * d; q_trace[at..at + d].iter().copied() }).collect())
+        .collect();
+    let qr: Vec<&[f32]> = qo.iter().map(|q| &q[..]).collect();
+    let mut a = NystromState::new_group(m, w, from, hpk).with_landmarks_from(from);
+    a.prefill_group(&qr, &pick(&ks), &pick(&vs), t, d, d);
+    let mut b = NystromState::new_group(m, w, from, hpk).with_landmarks_from(from);
+    let range = b.seal_gathered(&ks, &vs, &q_trace, stride, nh, h0, &order, t, d, d).expect("a seal past the window");
+    b.replay_far_idx(&ks, &vs, &order[range]);
+    same(&a.device_view(), &b.device_view());
+    let va = a.device_view();
+    let seg = (t - from) / va.m_eff;
+    for c in 0..d {
+        let mean = (0..seg).map(|j| ks[order[from + j] as usize * d + c] as f64).sum::<f64>() / seg as f64;
+        assert!((va.k_tilde[c] as f64 - mean).abs() < 1e-6, "landmark 0, channel {c}");
+    }
+    let mut all = NystromState::new_group(m, w, from, hpk);
+    all.prefill_group(&qr, &pick(&ks), &pick(&vs), t, d, d);
+    assert!(all.device_view().k_tilde[..d] != va.k_tilde[..d], "the kept rows are out of the landmark");
+}

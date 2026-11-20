@@ -2801,7 +2801,9 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
-        fold_yarn_scale_into_qk_norms(&mut pipeline);
+        // Beside sliding layers only where it was measured (Aion); Mellum's
+        // full layers keep their scale in the rotation.
+        fold_yarn_scale_into_qk_norms(&mut pipeline, arch.arch_name == "aion_instruct");
         // A DFlash block drafter beside the file drafts the rounds when asked to.
         if std::env::var("CMF_DFLASH").as_deref() == Ok("1") {
             match crate::dflash::Drafter::for_target(model) {
@@ -2828,7 +2830,9 @@ impl Pipeline {
         // Off with a speculation head (its verify paths read row counts as
         // positions) and under CMF_ATTN_DUMP (the dump header assumes row
         // = position). CMF_SWA_TRIM=0 turns it off for an A/B.
-        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3")
+        // Aion-2.3B (21 of 28 layers, window 2048): at 16 384 tokens the host
+        // held 3.77 GB of rows on a MacBook Air, 2.9 GB of them past any window.
+        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3" | "aion_instruct")
             && pipeline.swa.is_some()
             && pipeline.mtp.is_none()
             && pipeline.mimo_mtp.is_none()
@@ -2836,10 +2840,13 @@ impl Pipeline {
             && std::env::var_os("CMF_ATTN_DUMP").is_none()
             && std::env::var("CMF_SWA_TRIM").as_deref() != Ok("0"))
             .then_some((64, 64));
+        // Aion on the wgpu graphs: its 7 full layers on the uniform arms.
+        pipeline.uniform_full_layers = arch.arch_name == "aion_instruct"
+            && std::env::var("CMF_MIXED_GEOM").as_deref() != Ok("0");
         // Spark-X2.6's KV mirrors in f16 on Metal: at 14 000 tokens a token read 1.03 GB of f32
         // rows on the M4 (`CMF_METAL_KV_F16=0` keeps f32).
         #[cfg(target_os = "macos")]
-        if arch.arch_name == "spark2_5" {
+        if matches!(arch.arch_name.as_str(), "spark2_5" | "aion_instruct") {
             crate::gpu_metal::set_kv_f16_default(true);
         }
         // Spark-X2.6-4B q8_2f on the M4: an 8..31-token prompt prefills in
@@ -3088,20 +3095,30 @@ impl Pipeline {
 /// decline a scale of their own) carry the model. SenseNova-Loop-9B: YaRN
 /// factor 2 on 64 rotary channels of 256, scale 1.0693, every length.
 /// `CMF_YARN_FOLD=0` keeps the scale in the rotation.
-pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
+pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline, beside_sliding: bool) {
     let s = p.rope_scale;
+    // Sliding layers with a scale of their own of 1 (Aion: plain RoPE on the
+    // 21 window layers, YaRN ×16 on the 7 full ones) take no part: the scale
+    // folds into the full layers' norms alone, the local tables stay. Only
+    // for a stack that asked (`beside_sliding`): any other sliding stack
+    // keeps the scale in the rotation, as before.
+    let sliding = p.sliding_layers.is_some() || p.swa.is_some() || p.inv_freq_local.is_some();
     if s == 1.0
         || p.qk_norm_after_rope
         || p.rope_scale_local != 1.0
-        || p.sliding_layers.is_some()
-        || p.swa.is_some()
-        || p.inv_freq_local.is_some()
+        || (sliding && (!beside_sliding || p.mtp.is_some()))
         || p.global_attn.is_some()
         || p.inv_freq_global.is_some()
         || std::env::var("CMF_YARN_FOLD").as_deref() == Ok("0")
     {
         return;
     }
+    let local: Vec<bool> = (0..p.weights.layers.len())
+        .map(|li| match &p.sliding_layers {
+            Some(m) => m.get(li).copied().unwrap_or(false),
+            None => p.swa.is_some_and(|(_, pat)| pat != usize::MAX && (li + 1) % pat.max(1) != 0),
+        })
+        .collect();
     let (rd, hd, gemma) = (p.rotary_dim.min(p.head_dim), p.head_dim, p.norm_style == cortiq_core::NormStyle::Gemma);
     let norms_ok = |a: &AttnKind| match a {
         AttnKind::Full { q_norm: Some(q), k_norm: Some(k), .. } => q.len() == hd && k.len() == hd,
@@ -3121,14 +3138,19 @@ pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
             fold_rope_scale_gain(k, rd, s, gemma);
         }
     };
-    for l in p.weights.layers.iter_mut() {
-        fold_attn(&mut l.attn);
+    let mut folded = 0;
+    for (li, l) in p.weights.layers.iter_mut().enumerate() {
+        if !local[li] {
+            fold_attn(&mut l.attn);
+            folded += 1;
+        }
     }
     if let Some(m) = p.mtp.as_mut() {
         fold_attn(&mut m.layer.attn);
     }
     p.rope_scale = 1.0;
-    tracing::info!("YaRN scale {s} folded into the q/k norms of {full_layers} layers ({rd} rotary channels of {hd})");
+    let _ = full_layers;
+    tracing::info!("YaRN scale {s} folded into the q/k norms of {folded} layers ({rd} rotary channels of {hd})");
 }
 
 /// One q/k norm's gain with a RoPE cos/sin scale `s` folded into its first `rd`

@@ -78,6 +78,17 @@ pub(crate) fn environment<'a>() -> Environment<'a> {
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
+    // `strftime_now(fmt)` is transformers' clock helper (Llama-3.x,
+    // Aion): templates stamp "Current date" with it when the caller sets
+    // no `current_date`. Unregistered, the render fails and the caller
+    // falls back to a ChatML approximation the model was not tuned on.
+    env.add_function("strftime_now", |fmt: String| -> Result<Value, Error> {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        strftime_utc(&fmt, secs).map(Value::from)
+    });
     // `visible_text` is a helper transformers injects into its template
     // env (it flattens multimodal content to its text). Nanbeige's
     // template calls it unconditionally in the tools branch; without it
@@ -102,6 +113,69 @@ pub(crate) fn environment<'a>() -> Environment<'a> {
         String::new()
     });
     env
+}
+
+/// Python `strftime` over a UTC unix time, for the directives chat
+/// templates use (`%Y %m %d %e %H %M %S %y %j %b %B %a %A %%`). Any other
+/// directive is an error rather than a silently wrong date.
+pub(crate) fn strftime_utc(fmt: &str, secs: i64) -> Result<String, Error> {
+    const MON: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    const DAY: [&str; 7] =
+        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy_mar = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy_mar + 2) / 153;
+    let d = doy_mar - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    const CUM: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let yday = CUM[(m - 1) as usize] + d + if leap && m > 2 { 1 } else { 0 };
+    // 1970-01-01 was a Thursday (index 3 with Monday = 0).
+    let wday = (days + 3).rem_euclid(7) as usize;
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut it = fmt.chars();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('y') => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('e') => out.push_str(&format!("{d:>2}")),
+            Some('j') => out.push_str(&format!("{yday:03}")),
+            Some('H') => out.push_str(&format!("{:02}", sod / 3600)),
+            Some('M') => out.push_str(&format!("{:02}", sod / 60 % 60)),
+            Some('S') => out.push_str(&format!("{:02}", sod % 60)),
+            Some('B') => out.push_str(MON[(m - 1) as usize]),
+            Some('b') => out.push_str(&MON[(m - 1) as usize][..3]),
+            Some('A') => out.push_str(DAY[wday]),
+            Some('a') => out.push_str(&DAY[wday][..3]),
+            Some('%') => out.push('%'),
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "strftime_now: unsupported directive %{}",
+                        other.map(String::from).unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `x | tojson(ensure_ascii=False, indent=None, separators=None, sort_keys=False)`.
@@ -651,6 +725,24 @@ mod tests {
         );
         // repr("a\nb'\"\\") == 'a\nb\'"\\'
         assert_eq!(py_str_repr("a\nb'\"\\"), r#"'a\nb\'"\\'"#);
+    }
+
+    #[test]
+    fn strftime_utc_matches_python() {
+        // 2026-11-20 10:53:30 UTC, a Friday.
+        let t = 1_795_172_010;
+        assert_eq!(strftime_utc("%Y-%m-%d", t).unwrap(), "2026-11-20");
+        assert_eq!(strftime_utc("%d %b %Y", t).unwrap(), "20 Nov 2026");
+        assert_eq!(
+            strftime_utc("%A, %B %e %H:%M:%S %j %y %%", t).unwrap(),
+            "Friday, November 20 10:53:30 324 26 %"
+        );
+        // Leap day and the epoch itself.
+        assert_eq!(strftime_utc("%Y-%m-%d %a %j", 951_782_400).unwrap(), "2000-02-29 Tue 060");
+        assert_eq!(strftime_utc("%Y-%m-%d %a", 0).unwrap(), "1970-01-01 Thu");
+        assert!(strftime_utc("%Q", t).is_err());
+        let r = render("{{ strftime_now('%Y') | length }}", serde_json::json!({})).unwrap();
+        assert_eq!(r, "4");
     }
 
     #[test]

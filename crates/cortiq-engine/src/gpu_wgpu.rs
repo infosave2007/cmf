@@ -21782,6 +21782,11 @@ mod graph_bg_cache_key_tests {
 static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<Box<Ctx>>>>> =
     OnceLock::new();
 
+/// A wgpu context was built in this process (no context is built by asking).
+pub fn any_ctx_built() -> bool {
+    CTXS.get().is_some_and(|m| m.lock().map(|m| m.values().any(|c| c.is_some())).unwrap_or(false))
+}
+
 /// Whether the wgpu path is selected (the facade asks before `enabled()`):
 /// `CMF_GPU=wgpu` — always; `CMF_GPU=1` (≠0) — only on non-macOS, where
 /// there is no native Metal (on macOS `=1` goes to Metal). UNSET selects
@@ -38153,8 +38158,19 @@ pub fn forward_batch_graph_at(
     let q82_prompt = preview.is_none()
         && spec.is_none()
         && k > 16
-        && BATCH_Q82_MM.with(|f| f.get())
+        && (BATCH_Q82_MM.with(|f| f.get()) || std::env::var("CMF_Q82_MM").as_deref() == Ok("1"))
         && std::env::var("CMF_Q82_MM").as_deref() != Ok("0");
+    // Rows from which a prompt chunk's q8_2f matrix takes the matrix units
+    // (`CMF_Q82_COOP_ROWS`). A four-bit file keeps 4096: its few 8-bit
+    // matrices (1024-row K/V) sit in L2 for the eight-row matvec. A file
+    // whose dense FFN is 8-bit reads every matrix through the matvec at
+    // 1024: Aion-2.3B q8_2f on an L4, 2k prompt 4.73 → 1.24 s, 8k 20.8 → 6.4 s.
+    let q8_trunk = lws.iter().any(|lw| matches!(&lw.ffn, BFfn::Dense { gate, .. } if gate.kind == 7));
+    let q82_coop_rows = {
+        static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        R.get_or_init(|| std::env::var("CMF_Q82_COOP_ROWS").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(if q8_trunk { 1024 } else { 4096 })
+    };
     let q82mm_p = g4p.or_else(|| (preview.is_some() || q82_prompt).then(|| gemma_batch::pipes(c)).flatten());
     // Prompt chunks only: no preview, no speculative verify.
     let q82_coop_chunk = preview.is_none() && spec.is_none();
@@ -38186,7 +38202,7 @@ pub fn forward_batch_graph_at(
             // reduction cost the four-bit file's prompt 209 -> 196 tok/s.
             7 if k > 16
                 && q82_coop_chunk
-                && rows >= 4096
+                && rows >= q82_coop_rows
                 && cols % 32 == 0
                 && c.q82_mm_coop_s.is_some()
                 && {

@@ -2312,6 +2312,9 @@ struct AttnL {
     nh: usize,
     /// An element-wise output gate projected by `ms_in` into `gate` (Hy4-flash).
     ogate: bool,
+    /// A sliding layer's mirror holds only its window (Hy4-flash's gated
+    /// layers; Aion's window layers): the stacks it was measured on.
+    win_mirror: bool,
 }
 
 /// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
@@ -5420,7 +5423,7 @@ fn build(
                     }
                     None => None,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres, vd, nh, ogate: false })
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres, vd, nh, ogate: false, win_mirror: model.header.arch.arch_name == "aion_instruct" })
             }
             GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
                 let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
@@ -5638,6 +5641,7 @@ fn build(
                     half,
                     nh: *mnh,
                     ogate: hy.is_some(),
+                    win_mirror: hy.is_some(),
                     nkv: *mnh,
                     hd: lhd,
                     fx: lfx,
@@ -6197,10 +6201,12 @@ fn admit(
                 // (the layer's own head geometry)
                 let row = a.nkv * a.hd / 2;
                 let fresh_half = !st.hyb.half.contains(&key);
-                // Hy4-flash's sliding layers keep only their window on the card
-                // (`CMF_HY4_MIRROR_WIN=0`: the whole history kept, the window
-                // applied by the attention alone)
-                let win = if a.ogate && std::env::var("CMF_HY4_MIRROR_WIN").as_deref() != Ok("0") { a.window.unwrap_or(0) } else { 0 };
+                // A sliding layer keeps only its window on the card where that
+                // was measured (`win_mirror`: Hy4-flash's gated layers, and
+                // Aion's 21 window layers, which held a 32k prompt whole: 2.7 GB
+                // of an L4 for rows no query reads). `CMF_HY4_MIRROR_WIN=0`: the
+                // whole history kept, the window applied by the attention alone.
+                let win = if a.win_mirror && std::env::var("CMF_HY4_MIRROR_WIN").as_deref() != Ok("0") { a.window.unwrap_or(0) } else { 0 };
                 let m = st.kv.entry(key).or_insert_with(|| KvMirror::new(row, win));
                 if m.row != row || m.window != win || fresh_half {
                     let _ = c.sync();

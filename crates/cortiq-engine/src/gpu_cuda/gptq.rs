@@ -224,6 +224,173 @@ pub fn gptq_gemm_rows_square(a: &[f32], m: usize, k: usize, b: &[f32], out: &mut
     }
 }
 
+/// Upper Cholesky `A = UᵀU` in place of the column-major `n×n` matrix at
+/// `a` (only its upper triangle is read or written), right-looking in blocks
+/// of `FOLD_NB`: a diagonal block on the host in f64 (the host fold's pivot
+/// rule: a pivot that is not finite and positive fails), its row panel by
+/// `dtrsm`, the trailing matrix by `dsyrk`. Ok(false): not positive definite.
+const FOLD_NB: usize = 256;
+
+fn blas_ok(s: bl::cublasStatus_t, what: &str) -> Res<()> {
+    if s == bl::cublasStatus_t::CUBLAS_STATUS_SUCCESS { Ok(()) } else { Err(format!("cuBLAS {what}: {s:?}")) }
+}
+
+unsafe fn chol_upper_dev(c: &Ctx, a: u64, n: usize, blk: &mut Vec<f64>) -> Res<bool> {
+    use bl::{cublasDiagType_t as Dg, cublasFillMode_t as Fm, cublasOperation_t as Op, cublasSideMode_t as Sd};
+    let at = |r: usize, col: usize| a + ((r + col * n) * 8) as u64;
+    let mut k = 0;
+    while k < n {
+        let kb = FOLD_NB.min(n - k);
+        // the block's trailing updates are done (the stream is in order)
+        c.sync()?;
+        blk.resize(kb * kb, 0.0);
+        unsafe {
+            blas_ok(bl::cublasGetMatrix(kb as i32, kb as i32, 8, at(k, k) as *const c_void, n as i32, blk.as_mut_ptr().cast(), kb as i32), "get block")?;
+        }
+        // U11ᵀU11 = A11, column-major, upper: u(i, j) = blk[i + j kb], i ≤ j
+        for j in 0..kb {
+            let mut d = blk[j + j * kb];
+            for i in 0..j {
+                d -= blk[i + j * kb] * blk[i + j * kb];
+            }
+            if !(d > 0.0) || !d.is_finite() {
+                return Ok(false);
+            }
+            let djj = d.sqrt();
+            blk[j + j * kb] = djj;
+            for col in j + 1..kb {
+                let mut v = blk[j + col * kb];
+                for i in 0..j {
+                    v -= blk[i + j * kb] * blk[i + col * kb];
+                }
+                blk[j + col * kb] = v / djj;
+            }
+        }
+        unsafe {
+            blas_ok(bl::cublasSetMatrix(kb as i32, kb as i32, 8, blk.as_ptr().cast(), kb as i32, at(k, k) as *mut c_void, n as i32), "set block")?;
+        }
+        let rest = n - k - kb;
+        if rest > 0 {
+            let (one, m_one) = (1.0f64, -1.0f64);
+            unsafe {
+                // A12 ← U11⁻ᵀ A12
+                blas_ok(
+                    bl::cublasDtrsm_v2(c.blas, Sd::CUBLAS_SIDE_LEFT, Fm::CUBLAS_FILL_MODE_UPPER, Op::CUBLAS_OP_T, Dg::CUBLAS_DIAG_NON_UNIT,
+                        kb as i32, rest as i32, &one, at(k, k) as *const f64, n as i32, at(k, k + kb) as *mut f64, n as i32),
+                    "dtrsm panel",
+                )?;
+                // A22 ← A22 − A12ᵀ A12
+                blas_ok(
+                    bl::cublasDsyrk_v2(c.blas, Fm::CUBLAS_FILL_MODE_UPPER, Op::CUBLAS_OP_T, rest as i32, kb as i32, &m_one,
+                        at(k, k + kb) as *const f64, n as i32, &one, at(k + kb, k + kb) as *mut f64, n as i32),
+                    "dsyrk trailing",
+                )?;
+            }
+        }
+        k += kb;
+    }
+    c.sync()?;
+    Ok(true)
+}
+
+/// The dense algebra of GPTQ's fold (`cortiq-cli` `gptq_fold_operator_par`)
+/// on cuBLAS in f64: `a` is the damped Hessian `H + λ·mean(diag)·I` (n×n,
+/// symmetric, so its row-major array is also its column-major one). On the
+/// card: `H = UᵀU`, `V = U⁻¹` (`dtrsm` against I), `H⁻¹ = V·Vᵀ` (`dsyrk`),
+/// and `H⁻¹ = WᵀW` again; returned is `W`'s array, which read row-major is
+/// the host's lower `M` with `H⁻¹ = M·Mᵀ` (its upper half undefined).
+/// The host's math in another summation order — the codes it leads to can
+/// differ at rounding boundaries, not in kind.
+/// `Some(Err(1))`: H is not positive definite at this λ (the caller damps
+/// more), `Some(Err(2))`: H⁻¹ is not (the caller's identity fold);
+/// None: no card, or `CMF_GPTQ_CUDA=0` (the host's path).
+pub fn gptq_fold_chol_inv(a: &[f64], n: usize) -> Option<Result<Vec<f64>, u8>> {
+    if !on() || n == 0 || a.len() < n * n {
+        return None;
+    }
+    let c = ctx()?;
+    if c.current().is_err() {
+        return None;
+    }
+    let _st = c.st.lock().unwrap();
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(|| GqState { f: None, scr: Default::default() });
+    let mut run = || -> Res<Result<Vec<f64>, u8>> {
+        use bl::{cublasDiagType_t as Dg, cublasFillMode_t as Fm, cublasOperation_t as Op, cublasSideMode_t as Sd};
+        let bytes = n * n * 8;
+        let ap = s.scr("gq_fold_a", bytes)?;
+        let vp = s.scr("gq_fold_v", bytes)?;
+        let onep = s.scr("gq_fold_one", 8)?;
+        let mut blk = Vec::new();
+        // the host sources outlive the copies (a pageable copy may still be
+        // reading when it returns): both are alive past the sync
+        let one_h = [1.0f64];
+        // `CMF_CUDA_PROF`: the fold's stages, one line a fold
+        let t0 = std::time::Instant::now();
+        let mut marks = [0f64; 4];
+        let mut mark = |i: usize| -> Res<()> {
+            if prof_on() {
+                c.sync()?;
+                marks[i] = t0.elapsed().as_secs_f64() * 1e3;
+            }
+            Ok(())
+        };
+        unsafe {
+            cu::memcpy_htod_async(ap, &a[..n * n], c.stream).map_err(derr)?;
+            cu::memcpy_htod_async(onep, &one_h[..], c.stream).map_err(derr)?;
+            c.sync()?;
+            mark(0)?;
+            if !chol_upper_dev(c, ap, n, &mut blk)? {
+                return Ok(Err(1));
+            }
+            mark(1)?;
+            // V = I, then V ← U⁻¹ V
+            cu::memset_d8_async(vp, 0, bytes, c.stream).map_err(derr)?;
+            blas_ok(bl::cublasDcopy_v2(c.blas, n as i32, onep as *const f64, 0, vp as *mut f64, n as i32 + 1), "dcopy eye")?;
+            let (one, zero) = (1.0f64, 0.0f64);
+            blas_ok(
+                bl::cublasDtrsm_v2(c.blas, Sd::CUBLAS_SIDE_LEFT, Fm::CUBLAS_FILL_MODE_UPPER, Op::CUBLAS_OP_N, Dg::CUBLAS_DIAG_NON_UNIT,
+                    n as i32, n as i32, &one, ap as *const f64, n as i32, vp as *mut f64, n as i32),
+                "dtrsm inverse",
+            )?;
+            // H⁻¹ = V Vᵀ into A's upper triangle
+            blas_ok(
+                bl::cublasDsyrk_v2(c.blas, Fm::CUBLAS_FILL_MODE_UPPER, Op::CUBLAS_OP_N, n as i32, n as i32, &one,
+                    vp as *const f64, n as i32, &zero, ap as *mut f64, n as i32),
+                "dsyrk inverse",
+            )?;
+            mark(2)?;
+            if !chol_upper_dev(c, ap, n, &mut blk)? {
+                return Ok(Err(2));
+            }
+            mark(3)?;
+            let mut out = vec![0f64; n * n];
+            cu::memcpy_dtoh_async(&mut out[..], ap, c.stream).map_err(derr)?;
+            c.sync()?;
+            if prof_on() {
+                eprintln!(
+                    "cuda gptq fold {n}: upload {:.0} ms, cholesky {:.0}, inverse {:.0}, cholesky {:.0}, readback {:.0} ms",
+                    marks[0],
+                    marks[1] - marks[0],
+                    marks[2] - marks[1],
+                    marks[3] - marks[2],
+                    t0.elapsed().as_secs_f64() * 1e3 - marks[3]
+                );
+            }
+            let _ = &one_h;
+            Ok(Ok(out))
+        }
+    };
+    match run() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            let _ = c.sync();
+            decline("gptq fold", &e);
+            None
+        }
+    }
+}
+
 /// SFq's code refinement of `rows` rows on the card: `code` (levels, a byte
 /// a weight, rewritten), `step` (a weight's step, 0 frozen), `res` (Ŵ − W),
 /// `hf` (`H + ridge·mean(diag H)·I`, f32), `live` (H_jj > 0). Returns the

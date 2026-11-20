@@ -990,7 +990,7 @@ pub use bake::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkOut, BkStep, bake_a
 /// quantize-moe's GPTQ host parts on the card (the row-square GEMM, SFq's
 /// code refinement); declared after `kargs!`, which it uses.
 mod gptq;
-pub use gptq::{gptq_gemm_rows_square, gptq_refine_rows};
+pub use gptq::{gptq_fold_chol_inv, gptq_gemm_rows_square, gptq_refine_rows};
 mod tpenc;
 pub use tpenc::{gptq_sweep, tp_encode, tp_place_q2};
 
@@ -1243,6 +1243,7 @@ fn init() -> Res<Ctx> {
 fn ctx_or_reason() -> &'static Result<Ctx, String> {
     static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
     CTX.get_or_init(|| {
+        CTX_BUILT.store(true, Ordering::Relaxed);
         init().inspect_err(|e| {
             tracing::warn!("cuda backend unavailable — CPU fallback: {e}");
             if debug() {
@@ -3498,6 +3499,12 @@ pub fn kv_read_rows(
 /// The backend came up (its context exists).
 pub fn ctx_ready() -> bool {
     ctx().is_some()
+}
+
+/// A CUDA context was built in this process (asking builds none).
+static CTX_BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn ctx_built() -> bool {
+    CTX_BUILT.load(Ordering::Relaxed)
 }
 
 /// A seal's far sums on the card (`gpu::o1_far_sums`).

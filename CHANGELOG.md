@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-11-20
+
+### Added
+- microsoft/Aion-1.0-Instruct-2.3B (`aion_instruct`) converts natively: GQA with per-head q/k RMSNorm, 21 sliding
+  layers (window 2048) on plain RoPE and 7 full layers on YaRN ×16, keyed by layer type as Mellum's
+  `rope_parameters`. Perplexity of the q8_2f file against Transformers bf16 on the same windows: WikiText-2 14.251
+  (14.239), 4 × 4096 tokens 9.469 (9.464), Rust 7.661 (7.657), Python 7.263 (7.264).
+- Chat templates may call `strftime_now(fmt)` (transformers' clock helper: Aion, Llama 3.x); before, such a
+  template failed to render and the prompt fell back to ChatML.
+
+### Changed
+- CUDA hybrid arm: Aion's sliding-window layers keep only their window on the card, as Hy4-flash's gated layers
+  do (other sliding stacks keep the whole history until measured). Aion-2.3B q4tp on a Colab L4: card memory at a 16k / 30k
+  prompt 4.33 / 6.15 → 2.98 / 3.63 GB, decode after it 73.0 / 52.6 → 94.8 / 79.0 tok/s; q8_2f at 16k 56.3 → 68.8;
+  perplexity over 4 × 4096 tokens unchanged (9.469). `CMF_HY4_MIRROR_WIN=0` keeps the whole history.
+- wgpu batch prompt: a file whose dense FFN is 8-bit reads its q8_2f matrices from 1024 rows on the matrix units
+  (4096 before; four-bit files keep 4096, `CMF_Q82_COOP_ROWS` overrides). Aion-2.3B q8_2f on an L4: first token of
+  2k / 8k / 16k 4.73 / 20.8 / 43.3 → 1.25 / 6.39 / 15.5 s, perplexity unchanged (14.251).
+- Aion: YaRN's attention amplitude folds into the q/k norms of its 7 full layers (the 21 window layers have none
+  of their own); every other sliding stack keeps the scale in the rotation, as before. Perplexity unchanged (4 × 4096 tokens 9.469 on CUDA and Vulkan); the Turbo far field
+  reads the facts of 13k-token prompts 4/4 on Vulkan (3/4 before).
+- Far-field landmarks come from the rows past a seal's sinks and the rows it keeps exact (those never enter the far
+  field, yet the segment means held them all in the first segment: 248 kept rows of 816 made its landmark an outlier
+  and the kernel matrix ill-conditioned). Aion Turbo at 27k tokens: one planted-fact prompt answered with garbled
+  text from 216 kept rows on, and with 248 rows in 6 of 8 one-word shifts of the prompt; now every one right, and
+  planted facts on CUDA 4/4 at 13k and 4/4 at 27k (3/4 before, bf16 3/4). Every Turbo file with exact rows seals
+  this way now (Dory's too); `CMF_O1_LM_ALL=1` keeps the old means. `CMF_O1_SEAL_DIAG=1` prints a seal's magnitudes.
+- Aion's sliding layers keep only the rows their window reads on the host (as Spark-X2.5's and LFM3's), and its
+  Metal K/V mirrors are f16. MacBook Air M4, q4tp at 16 384 tokens: K/V 3.77 → 1.62 GB, decode 33.0 → 42.2 tok/s,
+  first token 56 → 44 s; the Turbo file 2.95 → 0.83 GB, 44.7 tok/s. Perplexity unchanged.
+- wgpu decode of Aion: its 7 full-attention layers take the uniform arms (the flash-decoding attend) over the
+  mirrors the prompt's per-layer-geometry arm filled, beside the sliding layers' rings; the prompt keeps the
+  geometry arm (its matrix-unit tile takes 128-wide heads). L4 Vulkan, q4tp, decode after 8k / 16k / 30k tokens
+  66.5 / 53.4 / 40.1 → 73.4 / 64.0 / 53.1 tok/s; q8_2f at 16k 44.3 → 52.1; prompt times, perplexity and a
+  three-turn served chat unchanged. `CMF_MIXED_GEOM=0` turns it off.
+- `quantize-gptq` and `quantize-moe` leave past the NVIDIA driver's exit handlers when the process held both a
+  Vulkan device and a CUDA context: a run that had written its file ended in glibc's "corrupted size vs.
+  prev_size" (a double free under libnvidia-glcore), rc 134.
+- A far-field prompt chunk (the prefix read for a seal, the sealed chunks before the tail) is never left a few rows
+  long: such a chunk took the CUDA hybrid arm's 16-row small path, which captures neither the seal's queries nor
+  the archive's rows. Aion Turbo, a 26 626-row prompt on CUDA: "O(1) prefix: 0 query values" → an answer.
+- `quantize-gptq` / `quantize-moe` on a CUDA build: a Hessian fold at least 1024 wide runs its O(n³) algebra (two
+  Cholesky factors and the inverse, f64) on cuBLAS — host 256² diagonal blocks, `dtrsm` panels, `dsyrk` updates.
+  Aion's q4tp with channel scale and code refinement (28 folds 8192 wide): 1919 → 628 s on a Colab L4;
+  `CMF_GPTQ_CUDA=0` keeps the host fold.
+
 ## [0.9.8] — 2026-11-20
 
 ### Added

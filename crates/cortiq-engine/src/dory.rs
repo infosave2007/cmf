@@ -375,7 +375,8 @@ pub fn far_states_geom(nh: usize, nk: usize, hd: usize, o1: DoryO1, ks: &[f32], 
                         q[r * hd..(r + 1) * hd].copy_from_slice(&qs[at..at + hd]);
                     }
                 }
-                let mut n = crate::nystrom::NystromState::new_group(o1.m, o1.w, o1.sink + kept, rep);
+                let mut n = crate::nystrom::NystromState::new_group(o1.m, o1.w, o1.sink + kept, rep)
+                    .with_landmarks_from(if kept == 0 { 0 } else { o1.sink + kept });
                 let refs: Vec<&[f32]> = qg.iter().map(|q| &q[..]).collect();
                 n.prefill_group(&refs, &kg, &vg, rows, hd, hd);
                 n
