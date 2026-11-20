@@ -39,6 +39,7 @@ enum Mode {
     /// tiny routing/gate tensors and 1-D tensors stay as they are — the
     /// Embryo trainer's f32 export is the source this exists for.
     QuantizeQ4tp,
+    DenseQ4tp,
     /// Explicit, experimental Embryo tied vocabulary profile. The trunk and
     /// hierarchical cluster head remain untouched; quality needs a new gate.
     EmbryoQ8Head,
@@ -100,6 +101,22 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
         {
             Some(TensorDtype::Q4TiledP)
         }
+        // The dense trunk's 8-bit matrices at 4 bits (Hy4-flash: attention,
+        // indexer query, latent projections, shared experts, the dense FFN):
+        // a decode reads half the bytes and the q4tp kernels. The head, the
+        // embeddings, the router, the routed experts and Engram stay.
+        Mode::DenseQ4tp
+            if two_d
+                && shape[0] >= 64
+                && src == TensorDtype::Q8_2f
+                && !name.contains("embed_tokens")
+                && !name.contains("lm_head")
+                && !name.contains(".experts.")
+                && !name.contains("mlp.gate.weight")
+                && !name.contains("engram") =>
+        {
+            Some(TensorDtype::Q4TiledP)
+        }
         // The draft's SwiGLU inputs, and only the draft's: `.mtp.` scopes
         // the match to the speculative stack.
         Mode::DraftQ2tp
@@ -138,6 +155,8 @@ pub fn cmd_requant(
         Mode::EmbryoQ8Head
     } else if quant == "q4tp-quantize" {
         Mode::QuantizeQ4tp
+    } else if quant == "q4tp-dense" {
+        Mode::DenseQ4tp
     } else if quant == "q2tp-draft" {
         Mode::DraftQ2tp
     } else if quant == "q2tp-draft-full" {
@@ -618,6 +637,32 @@ mod tests {
         assert_eq!(std::fs::read(&input).unwrap(), before);
         drop(result);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn q4tp_dense_recodes_only_the_dense_trunk() {
+        let q8 = TensorDtype::Q8_2f;
+        for name in [
+            "model.layers.5.self_attn.o_proj.weight",
+            "model.layers.5.self_attn.q_b_proj.weight",
+            "model.layers.5.mlp.latent_up.weight",
+            "model.layers.5.mlp.shared_experts.down_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+        ] {
+            assert_eq!(target_dtype(&Mode::DenseQ4tp, name, q8, &[3072, 1536]), Some(TensorDtype::Q4TiledP), "{name}");
+        }
+        for name in [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.layers.5.mlp.gate.weight",
+            "model.layers.5.mlp.experts.7.down_proj.weight",
+            "model.layers.2.engram.table",
+        ] {
+            assert!(target_dtype(&Mode::DenseQ4tp, name, q8, &[3072, 1536]).is_none(), "{name}");
+        }
+        // only q8_2f sources, only matrices of 64 rows and more
+        assert!(target_dtype(&Mode::DenseQ4tp, "model.layers.5.self_attn.o_proj.weight", TensorDtype::F32, &[3072, 1536]).is_none());
+        assert!(target_dtype(&Mode::DenseQ4tp, "model.layers.5.attn_hc.fn", q8, &[8, 12288]).is_none());
     }
 
     #[test]

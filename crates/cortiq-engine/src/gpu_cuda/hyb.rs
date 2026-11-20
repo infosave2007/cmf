@@ -7002,13 +7002,13 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         // MLA: the latent's norm into its planes, kv_b over it, the
                         // heads' keys [k_rope | k_nope] and values [v | 0]
                         let (lora_i, st_i) = (ml.lora as i32, (ml.lora + ml.rope) as i32);
-                        c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, mb.lp[0].ptr, mb.lp[1].ptr, lora_i))?;
+                        c.launch(fx.mla_lat, (n as u32, 1), row_threads(n), 0, kargs!(mb.kva.ptr, st_i, ml.kv_a_norm.ptr, lora_i, eps, mb.lp[0].ptr, mb.lp[1].ptr, lora_i))?;
                         let lpl = Planes { p0: mb.lp[0].ptr, p1: mb.lp[1].ptr, p2: mb.lp[1].ptr, stride: ml.lora };
                         ml.ms_kvb.run(c, fx, &lpl, ml.lora, n)?;
                         if let (Some(qa), Some((qab, qp))) = (&ml.qa, &mb.qa) {
                             // the low-rank query: q_a's rows normed into planes, q_b over them
                             let r_i = qa.rank as i32;
-                            c.launch(fx.mla_lat, (n as u32, 1), 256, 0, kargs!(qab.ptr, r_i, qa.norm.ptr, r_i, eps, qp[0].ptr, qp[1].ptr, r_i))?;
+                            c.launch(fx.mla_lat, (n as u32, 1), row_threads(n), 0, kargs!(qab.ptr, r_i, qa.norm.ptr, r_i, eps, qp[0].ptr, qp[1].ptr, r_i))?;
                             let qpl = Planes { p0: qp[0].ptr, p1: qp[1].ptr, p2: qp[1].ptr, stride: qa.rank };
                             qa.ms_qb.run(c, fx, &qpl, qa.rank, n)?;
                         }
@@ -7407,7 +7407,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
             // a Looped Transformer: the final norm on the stream after a loop's last layer
             if let (true, Some(w)) = (plan.loop_norm.contains(&li), plan.loop_w.as_ref()) {
                 let (nullp, zero_h) = (0u64, 0i32);
-                c.launch(fx.rmsnorm, (n as u32, 1), 256, 0, kargs!(plan.h.ptr, w.ptr, plan.h.ptr, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))?;
+                c.launch(fx.rmsnorm, (n as u32, 1), row_threads(n), 0, kargs!(plan.h.ptr, w.ptr, plan.h.ptr, hid_i, eps, gemma_i, zero_h, nullp, nullp, nullp, zero_h))?;
             }
             // a DFlash drafter's taps: the residual stream after this layer
             for &(tl, dst) in taps {
@@ -7460,7 +7460,7 @@ unsafe fn mhc_out(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, r
         // Hy4-flash: the product's sandwich norm before its merge
         if let Some((w, eps)) = norm {
             let (nullp, zero) = (0u64, 0i32);
-            c.launch(fx.rmsnorm, (n as u32, 1), 256, 0, kargs!(rows.yo, w.ptr, rows.yo, hid_i, eps, zero, zero, nullp, nullp, nullp, zero))?;
+            c.launch(fx.rmsnorm, (n as u32, 1), row_threads(n), 0, kargs!(rows.yo, w.ptr, rows.yo, hid_i, eps, zero, zero, nullp, nullp, nullp, zero))?;
         }
         c.launch(fx.mhc_merge, grid, 256, 0, kargs!(rows.r, rows.yo, rows.coef, ns_i, hid_i))?;
         if ffn && m.leave {
@@ -7469,8 +7469,8 @@ unsafe fn mhc_out(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, r
                 Some((w, base, sc)) => {
                     let eps = m.v4.map_or(1e-6, |v| v.2);
                     let (zero_f, one_i, ns_out) = (0f32, 1i32, mp.ns as u32);
-                    c.launch(fx.mhc_logits, (ns_out, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
-                    c.launch(fx.mhc_route_ihc, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, base.ptr, rows.h, rows.coef, ns_i, hid_i, *sc, zero_f, eps, zero_f, one_i))?;
+                    c.launch(fx.mhc_logits, (ns_out, n as u32), row_threads(n), 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
+                    c.launch(fx.mhc_route_ihc, (n as u32, 1), row_threads(n), 0, kargs!(rows.r, rows.lg, base.ptr, rows.h, rows.coef, ns_i, hid_i, *sc, zero_f, eps, zero_f, one_i))?;
                 }
                 None => c.launch(fx.mhc_leave, grid, 256, 0, kargs!(rows.r, rows.h, ns_i, hid_i))?,
             }
@@ -7507,11 +7507,11 @@ unsafe fn mhc_in(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, ro
         let (w, b) = if ffn { (&m.fw, &m.fb) } else { (&m.aw, &m.ab) };
         let (out_i, it_i, fixed_i) = (m.out as i32, mp.iters as i32, (m.out == 2 * mp.ns) as i32);
         // the logits a block each, then the coefficients and the input rows
-        c.launch(fx.mhc_logits, (m.out as u32, n as u32), 256, 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
+        c.launch(fx.mhc_logits, (m.out as u32, n as u32), row_threads(n), 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
         if let (Some((sa, sf, e)), Some(mag)) = (m.v4, m.ihc) {
             let s = if ffn { sf } else { sa };
             let head_i = 0i32;
-            return c.launch(fx.mhc_route_ihc, (n as u32, 1), 256, 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, s[0], s[1], e, mag, head_i));
+            return c.launch(fx.mhc_route_ihc, (n as u32, 1), row_threads(n), 0, kargs!(rows.r, rows.lg, b.ptr, rows.h, rows.coef, ns_i, hid_i, s[0], s[1], e, mag, head_i));
         }
         if let Some((sa, sf, e)) = m.v4 {
             let s = if ffn { sf } else { sa };
@@ -7566,10 +7566,11 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
     let mut tm = std::time::Instant::now();
     unsafe {
         c.launch(fx.moe_router, ((m.e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, m.router.w.ptr, sgw, mb.logits.ptr, mb.sg.ptr, ni, ei, hid_router))?;
+        // a decode row sorts its keys with 512 threads (`hy_moe_select`)
         c.launch(
             fx.moe_select,
             (1, 1),
-            (32 * n.max(1)) as u32,
+            if n == 1 && select512_on() { 512 } else { (32 * n.max(1)) as u32 },
             0,
             kargs!(
                 mb.logits.ptr, bias, ni, ei, ki, fl, m.route_scale, m.gu_t.ptr, m.dn_t.ptr, mb.gu_a.ptr, mb.dn_a.ptr, mb.wsel.ptr, si,
@@ -7655,6 +7656,24 @@ fn small_only(l: &HLayer) -> bool {
 /// a chunk goes the small path.
 fn dsa_past(plan: &HPlan, end: usize) -> bool {
     plan.layers.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.mla.as_ref().and_then(|m| m.dsa.as_ref()).is_some_and(|d| end > d.topk)))
+}
+
+/// Threads of a row-per-block kernel (the mHC logits and routing, the norms,
+/// the MLA latent norm): a decode row (n = 1) takes 1024, so one block keeps
+/// more loads in flight on its SM; `CMF_HYB_ROW1K=0` keeps 256 (Hy4-flash Fast
+/// Code on an RTX PRO 6000: the logits 25.9 → 13.7 us a launch, the routing
+/// 7.5 → 5.8). The norms sum the warps' partials in f64 by one thread: by every
+/// thread it was 4× the work at 1024 (8.9 → 26.8 us).
+fn row_threads(n: usize) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if n == 1 && *ON.get_or_init(|| std::env::var("CMF_HYB_ROW1K").as_deref() != Ok("0")) { 1024 } else { 256 }
+}
+
+/// `CMF_HYB_SELECT512=0`: a decode row's experts by k warp-wide argmax
+/// rounds again instead of one bitonic sort of its keys.
+fn select512_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_SELECT512").as_deref() != Ok("0"))
 }
 
 /// `CMF_HYB_MOE_BIG=0`: a routed FFN's long prompt goes the small path
