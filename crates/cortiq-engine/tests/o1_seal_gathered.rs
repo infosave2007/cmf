@@ -126,3 +126,74 @@ fn landmarks_skip_the_rows_kept_exact() {
     all.prefill_group(&qr, &pick(&ks), &pick(&vs), t, d, d);
     assert!(all.device_view().k_tilde[..d] != va.k_tilde[..d], "the kept rows are out of the landmark");
 }
+
+/// A seal that keeps exact rows takes the stronger ridge (`RIDGE_REL_EXACT`):
+/// its mixing matrices are the ones `with_ridge(RIDGE_REL_EXACT)` builds and
+/// not the 1e-6 ones, with the landmarks, the window and the far sums the same.
+#[test]
+fn a_seal_beside_exact_rows_takes_the_stronger_ridge() {
+    use cortiq_engine::nystrom::{RIDGE_REL, RIDGE_REL_EXACT};
+    if std::env::var_os("CMF_O1_RIDGE").is_some() {
+        return; // the factor is the caller's
+    }
+    let (t, d, m, w, sink) = (300usize, 16usize, 8usize, 24usize, 4usize);
+    let hpk = 2usize;
+    let mut seed = 77u64;
+    let ks: Vec<f32> = (0..t * d).map(|_| lcg(&mut seed)).collect();
+    let vs: Vec<f32> = (0..t * d).map(|_| lcg(&mut seed)).collect();
+    let qs: Vec<Vec<f32>> = (0..hpk).map(|_| (0..t * d).map(|_| lcg(&mut seed)).collect()).collect();
+    let qr: Vec<&[f32]> = qs.iter().map(|q| &q[..]).collect();
+    let from = sink + 6;
+    let seal = |st: NystromState| -> NystromState {
+        let mut st = st;
+        st.prefill_group(&qr, &ks, &vs, t, d, d);
+        st
+    };
+    let exact = seal(NystromState::new_group(m, w, from, hpk).with_landmarks_from(from));
+    let strong = seal(NystromState::new_group(m, w, from, hpk).with_landmarks_from(from).with_ridge(RIDGE_REL_EXACT));
+    let weak = seal(NystromState::new_group(m, w, from, hpk).with_landmarks_from(from).with_ridge(RIDGE_REL));
+    same(&exact.device_view(), &strong.device_view());
+    let (ve, vw) = (exact.device_view(), weak.device_view());
+    assert!(ve.k_tilde.iter().zip(vw.k_tilde).all(|(a, b)| a.to_bits() == b.to_bits()), "the ridge leaves the landmarks alone");
+    for (h, g) in ve.heads.iter().zip(&vw.heads) {
+        assert!(h.q_tilde.iter().zip(g.q_tilde).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(h.z_hat.iter().zip(g.z_hat).all(|(a, b)| a.to_bits() == b.to_bits()), "nor the far sums");
+        assert!(h.mu.iter().zip(g.mu).any(|(a, b)| a.to_bits() != b.to_bits()), "the mixing matrix is the stronger ridge's");
+    }
+    // a seal without exact rows keeps the 1e-6 skeleton
+    let plain = seal(NystromState::new_group(m, w, sink, hpk));
+    let plain_weak = seal(NystromState::new_group(m, w, sink, hpk).with_ridge(RIDGE_REL));
+    same(&plain.device_view(), &plain_weak.device_view());
+}
+
+/// The stronger ridge bounds the mixing matrix where two landmarks nearly
+/// coincide, and on a well-conditioned kernel both ridges invert it.
+#[test]
+fn the_stronger_ridge_bounds_an_ill_conditioned_skeleton() {
+    use cortiq_engine::nystrom::{ridge_pinv_rel, RIDGE_REL, RIDGE_REL_EXACT};
+    let n = 6usize;
+    let amax = |m: &[f64]| m.iter().fold(0f64, |a, x| a.max(x.abs()));
+    // rows 0 and 1 a few parts in a thousand apart: between the two ridges
+    let mut a = vec![0.0f64; n * n];
+    let mut seed = 5u64;
+    for i in 0..n {
+        for j in 0..n {
+            a[i * n + j] = if i == j { 2.0 } else { 0.3 * lcg(&mut seed) as f64 };
+        }
+    }
+    let good = a.clone();
+    for j in 0..n {
+        a[n + j] = a[j] * (1.0 + 3e-3 * (j as f64 - 2.0));
+    }
+    let (weak, strong) = (ridge_pinv_rel(&a, n, RIDGE_REL), ridge_pinv_rel(&a, n, RIDGE_REL_EXACT));
+    assert!(amax(&weak) > 3.0 * amax(&strong), "weak {} strong {}", amax(&weak), amax(&strong));
+    for rel in [RIDGE_REL, RIDGE_REL_EXACT] {
+        let inv = ridge_pinv_rel(&good, n, rel);
+        for i in 0..n {
+            for j in 0..n {
+                let e: f64 = (0..n).map(|k| inv[i * n + k] * good[k * n + j]).sum();
+                assert!((e - if i == j { 1.0 } else { 0.0 }).abs() < 2e-3, "ridge {rel}: ({i},{j}) {e}");
+            }
+        }
+    }
+}

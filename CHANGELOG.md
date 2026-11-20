@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.10] — 2026-11-21
+
+### Fixed
+- Far field beside exact rows (the Turbo files that keep rows exact): the skeleton's pseudo-inverse takes a ridge
+  of 1e-4 there (1e-6 before, and still 1e-6 where no row is kept exact). A query that reads an exact row lies
+  off the landmarks' span, and at 1e-6 its far mass came out with either sign and any size; where it was large
+  it drowned the row. Aion-1.0-Instruct Turbo on CUDA answered one planted-fact prompt of 24 with a loop of two
+  characters, and which prompt it was moved with the rule the landmark means followed. Now 12/12 at about 13 000
+  tokens and 12/12 at about 27 000 (11/12 and 12/12 before; Transformers bf16 12/12 and 11/12), the same at ridges
+  of 1e-5 and 1e-3. `CMF_O1_RIDGE=1e-6` gives the skeleton as it was. Reading in chunks over Vulkan is unchanged
+  (9/12 and 7/12).
+
 ## [0.9.9] — 2026-11-20
 
 ### Added
