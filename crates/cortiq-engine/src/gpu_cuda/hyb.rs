@@ -222,6 +222,7 @@ pub(super) struct HFuncs {
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
     field_planes: cs::CUfunction,
+    route_proj: cs::CUfunction,
     route_put: cs::CUfunction,
     route_sel: cs::CUfunction,
     dash_route: cs::CUfunction,
@@ -360,6 +361,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         field_planes: func(module, "hy_field_planes")?,
+        route_proj: func(module, "hy_route_proj")?,
         route_put: func(module, "hy_route_put")?,
         route_sel: func(module, "hy_route_sel")?,
         dash_route: func(module, "hy_dash_route")?,
@@ -2347,9 +2349,11 @@ impl RouteL {
     }
 }
 
-/// The small path's rows of a block-routed stack: the index queries
-/// `[NMAX][nkv][hd]` and the routed blocks `[NMAX][nkv][ROUTE_WORDS]`.
+/// The small path's rows of a block-routed stack: the index projections
+/// `[NMAX][nkv·hd + hd]`, the index queries `[NMAX][nkv][hd]` and the routed
+/// blocks `[NMAX][nkv][ROUTE_WORDS]`.
 struct RouteBufs {
+    raw: Buf,
     iq: Buf,
     bm: Buf,
 }
@@ -6007,7 +6011,7 @@ fn build(
             None
         },
         route: match route_geo {
-            Some((row, groups)) => Some(RouteBufs { iq: Buf::new(NMAX * row * 4)?, bm: Buf::new(NMAX * groups * ROUTE_WORDS * 4)? }),
+            Some((row, groups)) => Some(RouteBufs { raw: Buf::new(NMAX * (row + row / groups) * 4)?, iq: Buf::new(NMAX * row * 4)?, bm: Buf::new(NMAX * groups * ROUTE_WORDS * 4)? }),
             None => None,
         },
         dash: if has_dash {
@@ -7380,13 +7384,8 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     let (bmp, bsh_i, mw_i) = match (&a.route, &plan.route) {
                         (Some(rt), Some(rb)) => {
                             let (blk_i, pre_i, loc_i, rem_i, mw_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32);
-                            c.launch(
-                                fx.route_put,
-                                ((nkv + 1) as u32, n as u32),
-                                hd as u32,
-                                0,
-                                kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip),
-                            )?;
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rb.raw.ptr, nkv_i))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, n as u32), hd as u32, 0, kargs!(rb.raw.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip))?;
                             c.launch(fx.route_sel, (nkv as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, cip))?;
                             (rb.bm.ptr, rt.bshift(), mw_i)
                         }
@@ -9787,18 +9786,14 @@ unsafe fn big(
                             r.ik.ptr
                         };
                         let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                        let braw = st.scr(c, "hb_rraw", b * (nkv + 1) * hd * 4)?;
                         let biq = st.scr(c, "hb_riq", b * nkv * hd * 4)?;
                         let bbm = st.scr(c, "hb_rbm", b * nkv * ROUTE_WORDS * 4)?;
                         let (blk_i, pre_i, loc_i, rem_i, mw_i, pos_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32, pos0 as i32);
                         unsafe {
                             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
-                            c.launch(
-                                fx.route_put,
-                                ((nkv + 1) as u32, b as u32),
-                                hd as u32,
-                                0,
-                                kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul),
-                            )?;
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, b as u32), 256, 0, kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, braw, nkv_i))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, b as u32), hd as u32, 0, kargs!(braw, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul))?;
                             c.launch(fx.route_sel, (nkv as u32, b as u32), 128, 0, kargs!(biq, ik, bbm, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nul))?;
                         }
                         (bbm, rt.bshift(), mw_i)

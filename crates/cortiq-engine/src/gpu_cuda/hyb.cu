@@ -1737,13 +1737,30 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
 // (`hy_scores`, `hy_values`, `hy_softmax_h`). `ci` (a replayed graph): the
 // first row's position in word 0.
 
-// The index rows of the call: block u < nkv the index query of KV group u
-// into IQ [row][group][HD], block u == nkv the row's index key into its slot
-// of IK. Wq [nkv * HD][hidden] and Wk [HD][hidden] f32 over the layer's
-// normed rows, a norm a head, the rows' rotation table (`hy_qk`'s). A thread
-// a channel.
-extern "C" __global__ void hy_route_put(const float* __restrict__ xn, int hidden, const float* __restrict__ Wq,
-                                        const float* __restrict__ Wk, const float* __restrict__ qn,
+// The index projections of the call's rows: RAW [row][nkv * HD + HD] = the
+// index queries of the KV groups, then the index key, over the layer's
+// normed rows. Wq [nkv * HD][hidden], Wk [HD][hidden] f32. A warp a channel
+// (its lanes share the columns), `blockDim.x / 32` channels a block.
+extern "C" __global__ void hy_route_proj(const float* __restrict__ xn, int hidden, const float* __restrict__ Wq,
+                                         const float* __restrict__ Wk, float* __restrict__ RAW, int nkv)
+{
+    const int b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int NW = blockDim.x >> 5;
+    const int ch = blockIdx.x * NW + warp, nq = nkv * HD;
+    if (ch >= nq + HD) return;
+    const float* W = ch < nq ? Wq + (size_t)ch * hidden : Wk + (size_t)(ch - nq) * hidden;
+    const float* x = xn + (size_t)b * hidden;
+    float a = 0.0f;
+    for (int c = lane; c < hidden; c += 32) a = fmaf(W[c], x[c], a);
+    for (int o = 16; o > 0; o >>= 1) a = __fadd_rn(a, __shfl_xor_sync(FULL, a, o));
+    if (lane == 0) RAW[(size_t)b * (nq + HD) + ch] = a;
+}
+
+// The index rows from their projections: block u < nkv the index query of
+// KV group u into IQ [row][group][HD], block u == nkv the row's index key
+// into its slot of IK; a norm a head, the rows' rotation table (`hy_qk`'s).
+// A thread a channel.
+extern "C" __global__ void hy_route_put(const float* __restrict__ RAW, const float* __restrict__ qn,
                                         const float* __restrict__ kn, const float* __restrict__ tab,
                                         u16* __restrict__ IK, float* __restrict__ IQ, int pos0, int nkv, int half,
                                         float eps, const int* __restrict__ ci)
@@ -1754,21 +1771,11 @@ extern "C" __global__ void hy_route_put(const float* __restrict__ xn, int hidden
     const int u = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int NW = blockDim.x >> 5;
     const bool isq = u < nkv;
-    const float* W = isq ? Wq + (size_t)u * HD * hidden : Wk;
+    const float* src = RAW + (size_t)b * (nkv + 1) * HD + (size_t)u * HD;
     const float* nw = isq ? qn : kn;
-    const float4* x4 = (const float4*)(xn + (size_t)b * hidden);
     float s = 0.0f;
     for (int i = tid; i < HD; i += blockDim.x) {
-        const float4* w4 = (const float4*)(W + (size_t)i * hidden);
-        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (int c = 0; c < hidden / 4; c++) {
-            const float4 a = w4[c], v = x4[c];
-            acc.x = fmaf(a.x, v.x, acc.x);
-            acc.y = fmaf(a.y, v.y, acc.y);
-            acc.z = fmaf(a.z, v.z, acc.z);
-            acc.w = fmaf(a.w, v.w, acc.w);
-        }
-        const float x = acc.x + acc.y + acc.z + acc.w;
+        const float x = src[i];
         xs[i] = x;
         s = fmaf(x, x, s);
     }
@@ -3399,54 +3406,63 @@ extern "C" __global__ void hy_mhc_route_v4(const float* __restrict__ R, const fl
                                            float s1, float s2, float eps)
 {
     __shared__ float pre_s[4];
+    __shared__ float ms[16];
     const int r = blockIdx.x, tid = threadIdx.x;
     const float* Rr = R + (size_t)r * ns * dim;
     float* cr = coef + (size_t)r * 20;
-    if (tid == 0) {
-        const float* l = L + (size_t)r * 24;
-        for (int s = 0; s < ns; s++) {
-            pre_s[s] = 1.0f / (1.0f + expf(-(l[s] * s0 + base[s]))) + eps;
-            cr[s] = 2.0f / (1.0f + expf(-(l[ns + s] * s1 + base[ns + s])));
-        }
-        float m[4][4];
-        for (int i = 0; i < ns; i++)
-            for (int j = 0; j < ns; j++) {
-                const int k = 2 * ns + i * ns + j;
-                m[i][j] = l[k] * s2 + base[k];
-            }
-        for (int i = 0; i < ns; i++) {
-            float mx = -3.0e38f;
-            for (int j = 0; j < ns; j++) mx = fmaxf(mx, m[i][j]);
-            float se = 0.0f;
-            for (int j = 0; j < ns; j++) {
-                m[i][j] = expf(m[i][j] - mx);
-                se += m[i][j];
-            }
-            for (int j = 0; j < ns; j++) m[i][j] = m[i][j] / se + eps;
-        }
-        for (int it = 0; it < iters; it++) {
-            if (it > 0) {
-                for (int i = 0; i < ns; i++) {
-                    float se = 0.0f;
-                    for (int j = 0; j < ns; j++) se += m[i][j];
-                    se += eps;
-                    for (int j = 0; j < ns; j++) m[i][j] /= se;
-                }
-            }
-            for (int j = 0; j < ns; j++) {
-                float se = eps;
-                for (int i = 0; i < ns; i++) se += m[i][j];
-                for (int i = 0; i < ns; i++) m[i][j] /= se;
-            }
-        }
-        for (int i = 0; i < ns; i++)
-            for (int j = 0; j < ns; j++) cr[4 + i * 4 + j] = m[j][i];
+    const float* l = L + (size_t)r * 24;
+    if (tid < ns) {
+        pre_s[tid] = 1.0f / (1.0f + expf(-(l[tid] * s0 + base[tid]))) + eps;
+        cr[tid] = 2.0f / (1.0f + expf(-(l[ns + tid] * s1 + base[ns + tid])));
+    }
+    // the mix a thread a cell (i, j): every round reads the matrix, then
+    // writes its cell — the sums in the order one thread took them (a token
+    // spent 52 us here a sub-layer when thread 0 ran the 20 rounds alone)
+    const bool cell = tid < ns * ns;
+    const int i = tid / ns, j = tid - i * ns;
+    if (cell) {
+        const int k = 2 * ns + tid;
+        ms[i * 4 + j] = l[k] * s2 + base[k];
     }
     __syncthreads();
+    float v = 0.0f;
+    if (cell) {
+        float mx = -3.0e38f;
+        for (int q = 0; q < ns; q++) mx = fmaxf(mx, ms[i * 4 + q]);
+        float se = 0.0f;
+        for (int q = 0; q < ns; q++) se += expf(ms[i * 4 + q] - mx);
+        v = expf(ms[i * 4 + j] - mx) / se + eps;
+    }
+    __syncthreads();
+    if (cell) ms[i * 4 + j] = v;
+    __syncthreads();
+    for (int it = 0; it < iters; it++) {
+        if (it > 0) {
+            if (cell) {
+                float se = 0.0f;
+                for (int q = 0; q < ns; q++) se += ms[i * 4 + q];
+                se += eps;
+                v = ms[i * 4 + j] / se;
+            }
+            __syncthreads();
+            if (cell) ms[i * 4 + j] = v;
+            __syncthreads();
+        }
+        if (cell) {
+            float se = eps;
+            for (int q = 0; q < ns; q++) se += ms[q * 4 + j];
+            v = ms[i * 4 + j] / se;
+        }
+        __syncthreads();
+        if (cell) ms[i * 4 + j] = v;
+        __syncthreads();
+    }
+    // new stream j takes sum_i comb[i][j] R_i: the merge's mix is comb transposed
+    if (cell) cr[4 + j * 4 + i] = ms[i * 4 + j];
     for (int e = tid; e < dim; e += blockDim.x) {
-        float v = 0.0f;
-        for (int s = 0; s < ns; s++) v = fmaf(pre_s[s], Rr[s * dim + e], v);
-        h[(size_t)r * dim + e] = v;
+        float a = 0.0f;
+        for (int q = 0; q < ns; q++) a = fmaf(pre_s[q], Rr[q * dim + e], a);
+        h[(size_t)r * dim + e] = a;
     }
 }
 
