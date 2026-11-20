@@ -32,8 +32,14 @@ language:
 for summaries, rewriting and chat in eight languages with a 32 768-token context, packaged as single
 [CMF](https://github.com/infosave2007/cmf) files. They run with `cortiq`, a Rust inference engine with no Python and
 no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through Vulkan/DX12, Apple silicon through
-Metal, and the CPU. On a 24 GB NVIDIA L4 with CUDA the 4-bit file writes 129 tokens a second and reads a 2048-token
-prompt in 0.33 s.
+Metal, and the CPU. Measured:
+
+- **NVIDIA L4 (24 GB), CUDA:** 129 tok/s for the 4-bit file and 86 for the 8-bit one; a 2 048-token prompt is
+  read in 0.32 s and a 30 000-token one in 9.92 s, in 3.5 GB of the card.
+- **The same card over Vulkan:** 110 and 79 tok/s; a 16 384-token prompt in 10.3 s.
+- **MacBook Air M4 (24 GB):** 59.6 and 38.6 tok/s through Metal, 40.2 and 28.2 on the CPU alone.
+- **Accuracy:** WikiText-2 perplexity 14.25 (8-bit) and 14.61 (4-bit) against 14.24 for Transformers bf16; greedy
+  answers of the 8-bit file match Transformers word for word.
 
 [English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)
 
@@ -68,32 +74,53 @@ For long prompts with the card's memory held in place:
 
 ## Performance
 
-One stream, `cortiq bench --core`: decode speed, then the time to the first token of a prompt of that length and
-the decode speed after it. Card memory is the peak `nvidia-smi` shows during the run.
+One stream, `cortiq bench --core`, cortiq 0.9.9: the time to the first token of a prompt of that length and the
+decode speed after it (64 tokens). Card memory is the peak `nvidia-smi` shows during the run. Read each backend's
+section on its own.
 
-### NVIDIA L4 (24 GB, Google Colab), CUDA
+### CUDA · NVIDIA L4
 
-| file | decode, tok/s | 2k prompt | decode at 2k | 8k prompt | decode at 8k | 16k prompt | decode at 16k | card memory |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 129.1 | 0.33 s | 115.6 | 1.78 s | 105.0 | 4.21 s | 94.5 | 2.0–3.0 GB |
-| `q8_2f` | 86.3 | 0.34 s | 80.0 | 1.83 s | 75.0 | 4.38 s | 68.8 | 3.2–4.2 GB |
+Stand: NVIDIA L4 (24 GB), Google Colab, the CUDA backend (`CMF_GPU=cuda`). Without a prompt the 4-bit file decodes
+at 129.1 tok/s, the 8-bit file at 86.3.
 
-### NVIDIA L4 (24 GB, Google Colab), Vulkan
+![The two files on CUDA](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_cuda_en.png)
 
-| file | decode, tok/s | 2k prompt | decode at 2k | 8k prompt | decode at 8k | 16k prompt | decode at 16k | card memory |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 110.0 | 0.62 s | 83.4 | 3.82 s | 73.4 | 10.3 s | 64.0 | 2.7–4.0 GB |
-| `q8_2f` | 78.6 | 1.21 s | 64.2 | 6.19 s | 58.0 | 15.1 s | 52.1 | 3.2–4.7 GB |
+| prompt, tokens | first token, s (`q4tp`) | first token, s (`q8_2f`) | decode, tok/s (`q4tp`) | decode, tok/s (`q8_2f`) | peak card memory, GB (`q4tp`) | peak card memory, GB (`q8_2f`) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0.32 | 0.34 | 116.9 | 80.4 | 2.2 | 3.3 |
+| 8 192 | 1.72 | 1.79 | 106.3 | 75.2 | 2.5 | 3.6 |
+| 16 384 | 4.15 | 4.31 | 95.7 | 69.8 | 2.9 | 4.0 |
+| 30 000 | 9.92 | 10.1 | 79.7 | 61.0 | 3.5 | 4.7 |
 
-### MacBook Air M4 (24 GB), Metal
+### Vulkan · NVIDIA L4
 
-| file | decode, tok/s | 2k prompt | decode at 2k | 8k prompt | decode at 8k |
-|---|---:|---:|---:|---:|---:|
-| `q4tp` | 59.6 | 3.5 s | 53.4 | 18.4 s | 47.4 |
-| `q8_2f` | 38.6 | 4.2 s | 33.8 | 22.7 s | 33.0 |
+Stand: the same NVIDIA L4 (24 GB), over Vulkan (the default backend). Without a prompt: 110.0 tok/s for the 4-bit
+file, 78.6 for the 8-bit one.
+
+![The two files on Vulkan](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_vulkan_en.png)
+
+| prompt, tokens | first token, s (`q4tp`) | first token, s (`q8_2f`) | decode, tok/s (`q4tp`) | decode, tok/s (`q8_2f`) | peak card memory, GB (`q4tp`) | peak card memory, GB (`q8_2f`) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0.62 | 1.21 | 82.8 | 64.0 | 3.1 | 3.7 |
+| 8 192 | 3.83 | 6.20 | 73.7 | 57.8 | 3.4 | 4.2 |
+| 16 384 | 10.3 | 15.0 | 63.5 | 52.0 | 3.9 | 4.6 |
+| 30 000 | 27.3 | 35.8 | 52.6 | 44.5 | 4.6 | 5.3 |
+
+### Metal · MacBook Air M4
+
+Stand: MacBook Air M4 (24 GB), fanless, Metal. Without a prompt: 59.6 tok/s for the 4-bit file, 38.6 for the 8-bit
+one.
+
+![The two files on Metal](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_metal_en.png)
+
+| prompt, tokens | first token, s (`q4tp`) | first token, s (`q8_2f`) | decode, tok/s (`q4tp`) | decode, tok/s (`q8_2f`) |
+|---:|---:|---:|---:|---:|
+| 2 048 | 3.48 | 4.17 | 53.4 | 33.8 |
+| 8 192 | 18.4 | 22.7 | 47.4 | 33.0 |
+| 16 384 | 44.0 | — | 42.2 | — |
 
 The fanless Air has the base M4's memory bus (about 100 GB/s): the 8-bit file reads its 2.3 GB a token at about
-90 GB/s. A 16 384-token prompt: first token in 44 s, then 42 tok/s for the 4-bit file, 1.6 GB of keys and values.
+90 GB/s. At 16 384 tokens the 4-bit file holds 1.6 GB of keys and values.
 
 ### MacBook Air M4 (24 GB), CPU (10 cores)
 
@@ -140,7 +167,7 @@ server returns as `message.tool_calls`.
 
 The model holds 32 768 tokens. 21 of its 28 layers attend over a 2048-token window and keep only those rows; the 7
 full-attention layers keep every row, about 28 KB a token on the card: a 30 000-token prompt takes the 4-bit file
-to 3.6 GB on an L4 with CUDA, decoding at 79 tok/s after it. `CMF_MAX_SEQ` sets the cap (32 768 by default). Planted
+to 3.5 GB on an L4 with CUDA, decoding at 80 tok/s after it. `CMF_MAX_SEQ` sets the cap (32 768 by default). Planted
 facts read back from a long Wikipedia text, greedy, 12 prompts a length: 12/12 at about 13 000 tokens and 11/12 at
 about 27 000 for the 4-bit file on CUDA and Vulkan, the same as Transformers bf16.
 
@@ -168,66 +195,66 @@ on intended use, limitations and safety apply to these files as well.
 параметров для работы на устройстве: сводки, переписывание текста и чат на восьми языках, контекст 32 768 токенов.
 Здесь она упакована в отдельные файлы [CMF](https://github.com/infosave2007/cmf) для `cortiq` — движка на Rust без
 Python и ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Intel через Vulkan/DX12, Apple silicon через Metal,
-а также CPU. На NVIDIA L4 (24 ГБ) с CUDA 4-битный файл пишет 129 токенов в секунду и читает промпт из 2048 токенов
-за 0,33 с.
+а также CPU. Измерено:
 
-### Быстрый старт
-
-```bash
-cargo install cortiq-cli
-hf download infosave/Aion-1.0-Instruct-2.3B-cmf Aion-1.0-Instruct-2.3B-q8_2f.cmf --local-dir .
-cortiq run Aion-1.0-Instruct-2.3B-q8_2f.cmf --prompt "Сделай краткую сводку в трёх пунктах: ..."
-```
-
-Нужен cortiq 0.9.9 или новее (в нём шаблон чата модели и разбор её вызовов инструментов); готовые сборки — на
-[странице релизов](https://github.com/infosave2007/cmf/releases). Для бэкенда CUDA добавьте `--features cuda` и запускайте с `CMF_GPU=cuda`.
-
-### Файлы
-
-| файл | квантизация | размер | ppl WikiText-2 | ppl Rust | ppl Python |
-|---|---|---:|---:|---:|---:|
-| `Aion-1.0-Instruct-2.3B-q8_2f.cmf` | 8 бит, **по умолчанию** | 2,31 ГБ | 14,25 | 7,66 | 7,26 |
-| `Aion-1.0-Instruct-2.3B-q4tp.cmf` | 4 бита GPTQ, эмбеддинги 8 бит | 1,41 ГБ | 14,61 | 7,83 | 7,43 |
-| эталон: Transformers bf16 | — | 4,58 ГБ | 14,24 | 7,66 | 7,26 |
-
-Перплексия на 12 окнах по 512 токенов (WikiText-2 test, 1,8 МБ кода на Rust, 477 КБ на Python), окна одни и те же
-для всех строк. На 4 окнах по 4096 токенов (дальше скользящего окна в 2048): q8_2f 9,47, bf16 9,46, q4tp 9,70.
-4-битные веса округлены GPTQ на 4096 токенах WikiText-2, кода и собственных ответов модели в её шаблоне, с
-масштабами каналов и уточнением кодов. Жадные ответы 8-битного файла слово в слово совпадают с Transformers на
-CUDA, Vulkan и CPU.
+- **NVIDIA L4 (24 ГБ), CUDA:** 129 ток/с у 4-битного файла и 86 у 8-битного; промпт из 2 048 токенов
+  читается за 0,32 с, из 30 000 — за 9,92 с, в 3,5 ГБ карты.
+- **Та же карта через Vulkan:** 110 и 79 ток/с; промпт из 16 384 токенов — за 10,3 с.
+- **MacBook Air M4 (24 ГБ):** 59,6 и 38,6 ток/с через Metal, 40,2 и 28,2 на одном CPU.
+- **Точность:** перплексия WikiText-2 14,25 (8 бит) и 14,61 (4 бита) против 14,24 у Transformers bf16; жадные
+  ответы 8-битного файла совпадают с Transformers слово в слово.
 
 Для длинных промптов при неизменной памяти карты:
 [Aion-1.0-Instruct-2.3B Turbo](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf).
 
 ### Скорость
 
-Один поток, `cortiq bench --core`: скорость генерации, затем время до первого токена при промпте такой длины и
-генерация после него. Память карты — пик по `nvidia-smi` за прогон.
+Один поток, `cortiq bench --core`, cortiq 0.9.9: время до первого токена при промпте такой длины и генерация
+после него (64 токена). Память карты — пик по `nvidia-smi` за прогон. Каждый раздел читается сам по себе.
 
-**NVIDIA L4 (24 ГБ, Google Colab), CUDA**
+**CUDA · NVIDIA L4**
 
-| файл | генерация, ток/с | промпт 2k | генерация на 2k | промпт 8k | генерация на 8k | промпт 16k | генерация на 16k | память карты |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 129,1 | 0,33 с | 115,6 | 1,78 с | 105,0 | 4,21 с | 94,5 | 2,0–3,0 ГБ |
-| `q8_2f` | 86,3 | 0,34 с | 80,0 | 1,83 с | 75,0 | 4,38 с | 68,8 | 3,2–4,2 ГБ |
+Стенд: NVIDIA L4 (24 ГБ), Google Colab, бэкенд CUDA (`CMF_GPU=cuda`). Без промпта 4-битный файл пишет
+129,1 ток/с, 8-битный — 86,3.
 
-**NVIDIA L4 (24 ГБ, Google Colab), Vulkan**
+![Два файла на CUDA](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_cuda_ru.png)
 
-| файл | генерация, ток/с | промпт 2k | генерация на 2k | промпт 8k | генерация на 8k | промпт 16k | генерация на 16k | память карты |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 110,0 | 0,62 с | 83,4 | 3,82 с | 73,4 | 10,3 с | 64,0 | 2,7–4,0 ГБ |
-| `q8_2f` | 78,6 | 1,21 с | 64,2 | 6,19 с | 58,0 | 15,1 с | 52,1 | 3,2–4,7 ГБ |
+| промпт, токенов | первый токен, с (`q4tp`) | первый токен, с (`q8_2f`) | генерация, ток/с (`q4tp`) | генерация, ток/с (`q8_2f`) | пик памяти карты, ГБ (`q4tp`) | пик памяти карты, ГБ (`q8_2f`) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0,32 | 0,34 | 116,9 | 80,4 | 2,2 | 3,3 |
+| 8 192 | 1,72 | 1,79 | 106,3 | 75,2 | 2,5 | 3,6 |
+| 16 384 | 4,15 | 4,31 | 95,7 | 69,8 | 2,9 | 4,0 |
+| 30 000 | 9,92 | 10,1 | 79,7 | 61,0 | 3,5 | 4,7 |
 
-**MacBook Air M4 (24 ГБ), Metal**
+**Vulkan · NVIDIA L4**
 
-| файл | генерация, ток/с | промпт 2k | генерация на 2k | промпт 8k | генерация на 8k |
-|---|---:|---:|---:|---:|---:|
-| `q4tp` | 59,6 | 3,5 с | 53,4 | 18,4 с | 47,4 |
-| `q8_2f` | 38,6 | 4,2 с | 33,8 | 22,7 с | 33,0 |
+Стенд: та же NVIDIA L4 (24 ГБ), через Vulkan (бэкенд по умолчанию). Без промпта: 110,0 ток/с у 4-битного
+файла, 78,6 у 8-битного.
+
+![Два файла на Vulkan](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_vulkan_ru.png)
+
+| промпт, токенов | первый токен, с (`q4tp`) | первый токен, с (`q8_2f`) | генерация, ток/с (`q4tp`) | генерация, ток/с (`q8_2f`) | пик памяти карты, ГБ (`q4tp`) | пик памяти карты, ГБ (`q8_2f`) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0,62 | 1,21 | 82,8 | 64,0 | 3,1 | 3,7 |
+| 8 192 | 3,83 | 6,20 | 73,7 | 57,8 | 3,4 | 4,2 |
+| 16 384 | 10,3 | 15,0 | 63,5 | 52,0 | 3,9 | 4,6 |
+| 30 000 | 27,3 | 35,8 | 52,6 | 44,5 | 4,6 | 5,3 |
+
+**Metal · MacBook Air M4**
+
+Стенд: MacBook Air M4 (24 ГБ), без вентилятора, Metal. Без промпта: 59,6 ток/с у 4-битного файла, 38,6 у
+8-битного.
+
+![Два файла на Metal](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_metal_ru.png)
+
+| промпт, токенов | первый токен, с (`q4tp`) | первый токен, с (`q8_2f`) | генерация, ток/с (`q4tp`) | генерация, ток/с (`q8_2f`) |
+|---:|---:|---:|---:|---:|
+| 2 048 | 3,48 | 4,17 | 53,4 | 33,8 |
+| 8 192 | 18,4 | 22,7 | 47,4 | 33,0 |
+| 16 384 | 44,0 | — | 42,2 | — |
 
 У безвентиляторного Air шина памяти базового M4 (около 100 ГБ/с): 8-битный файл читает свои 2,3 ГБ на токен
-примерно на 90 ГБ/с. Промпт из 16 384 токенов: первый токен через 44 с, затем 42 ток/с у 4-битного файла, 1,6 ГБ
-ключей и значений.
+примерно на 90 ГБ/с. На 16 384 токенах 4-битный файл держит 1,6 ГБ ключей и значений.
 
 **MacBook Air M4 (24 ГБ), CPU (10 ядер)**
 
@@ -274,7 +301,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 Модель держит 32 768 токенов. 21 из 28 слоёв смотрит в окно из 2048 токенов и хранит только эти строки; 7 слоёв
 полного внимания хранят все строки, около 28 КБ на токен на карте: промпт из 30 000 токенов занимает у 4-битного
-файла 3,6 ГБ на L4 с CUDA, генерация после него — 79 ток/с. `CMF_MAX_SEQ` задаёт предел (по умолчанию 32 768).
+файла 3,5 ГБ на L4 с CUDA, генерация после него — 79 ток/с. `CMF_MAX_SEQ` задаёт предел (по умолчанию 32 768).
 Факты, спрятанные в длинном тексте Википедии (жадно, по 12 промптов на длину): 12/12 примерно на 13 000 токенов и
 11/12 примерно на 27 000 у 4-битного файла на CUDA и Vulkan — как у Transformers bf16.
 
@@ -296,63 +323,64 @@ cortiq verify Aion-1.0-Instruct-2.3B-q8_2f.cmf
 [Aion-1.0-Instruct-2.3B](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B) 是微软面向端侧的 23 亿参数模型，
 用于摘要、改写和八种语言的对话，上下文 32 768 个 token。这里打包为独立的 [CMF](https://github.com/infosave2007/cmf)
 文件，由 `cortiq` 运行——一个不依赖 Python 和机器学习框架的 Rust 推理引擎：NVIDIA 显卡走 CUDA 或 Vulkan，AMD、
-Intel 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在 CPU 上运行。在 24 GB 的 NVIDIA L4 上用 CUDA，4 位文件每秒
-生成 129 个 token，读取 2048 个 token 的提示词只需 0.33 秒。
+Intel 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在 CPU 上运行。实测：
 
-### 快速开始
+- **NVIDIA L4（24 GB），CUDA：** 4 位文件 129 tok/s，8 位文件 86；2 048 token 的提示词读取 0.32 秒，30 000 token
+  读取 9.92 秒，占用 3.5 GB 显存。
+- **同一块显卡，Vulkan：** 110 和 79 tok/s；16 384 token 的提示词 10.3 秒。
+- **MacBook Air M4（24 GB）：** Metal 59.6 和 38.6 tok/s，仅 CPU 为 40.2 和 28.2。
+- **精度：** WikiText-2 困惑度 14.25（8 位）和 14.61（4 位），Transformers bf16 为 14.24；8 位文件的贪心回答与
+  Transformers 逐词一致。
 
-```bash
-cargo install cortiq-cli
-hf download infosave/Aion-1.0-Instruct-2.3B-cmf Aion-1.0-Instruct-2.3B-q8_2f.cmf --local-dir .
-cortiq run Aion-1.0-Instruct-2.3B-q8_2f.cmf --prompt "用三个要点总结：..."
-```
-
-需要 cortiq 0.9.9 或更新版本（它能渲染模型的对话模板并解析其工具调用）；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。CUDA 后端
-需在安装时加 `--features cuda`，并以 `CMF_GPU=cuda` 运行。
-
-### 文件
-
-| 文件 | 量化 | 大小 | WikiText-2 困惑度 | Rust 困惑度 | Python 困惑度 |
-|---|---|---:|---:|---:|---:|
-| `Aion-1.0-Instruct-2.3B-q8_2f.cmf` | 8 位，**默认** | 2.31 GB | 14.25 | 7.66 | 7.26 |
-| `Aion-1.0-Instruct-2.3B-q4tp.cmf` | 4 位 GPTQ，嵌入层 8 位 | 1.41 GB | 14.61 | 7.83 | 7.43 |
-| 参考：Transformers bf16 | — | 4.58 GB | 14.24 | 7.66 | 7.26 |
-
-困惑度基于 12 个 512 token 的窗口（WikiText-2 test、1.8 MB Rust 代码、477 KB Python 代码），各行使用相同窗口。
-4 个 4096 token 的窗口（超过 2048 的滑动窗口）：q8_2f 9.47，bf16 9.46，q4tp 9.70。4 位权重用 GPTQ 在 4096 个
-token 上取整（WikiText-2、代码以及模型自身模板中的回答），并使用通道缩放与码值细化。8 位文件的贪心输出在
-CUDA、Vulkan 和 CPU 上与 Transformers 逐字一致。
 
 长提示词且显存保持不变：[Aion-1.0-Instruct-2.3B Turbo](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf)。
 
 ### 性能
 
-单流，`cortiq bench --core`：生成速度，以及该长度提示词的首 token 时间和之后的生成速度。显存为运行期间
-`nvidia-smi` 的峰值。
+单流，`cortiq bench --core`，cortiq 0.9.9：该长度提示词的首 token 时间和之后的生成速度（64 个 token）。显存为
+运行期间 `nvidia-smi` 的峰值。各节请单独阅读。
 
-**NVIDIA L4（24 GB，Google Colab），CUDA**
+**CUDA · NVIDIA L4**
 
-| 文件 | 生成，tok/s | 2k 提示词 | 2k 处生成 | 8k 提示词 | 8k 处生成 | 16k 提示词 | 16k 处生成 | 显存 |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 129.1 | 0.33 s | 115.6 | 1.78 s | 105.0 | 4.21 s | 94.5 | 2.0–3.0 GB |
-| `q8_2f` | 86.3 | 0.34 s | 80.0 | 1.83 s | 75.0 | 4.38 s | 68.8 | 3.2–4.2 GB |
+测试平台：NVIDIA L4（24 GB），Google Colab，CUDA 后端（`CMF_GPU=cuda`）。无提示词时 4 位文件生成 129.1 tok/s，
+8 位文件 86.3。
 
-**NVIDIA L4（24 GB，Google Colab），Vulkan**
+![CUDA 上的两个文件](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_cuda_zh.png)
 
-| 文件 | 生成，tok/s | 2k 提示词 | 2k 处生成 | 8k 提示词 | 8k 处生成 | 16k 提示词 | 16k 处生成 | 显存 |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `q4tp` | 110.0 | 0.62 s | 83.4 | 3.82 s | 73.4 | 10.3 s | 64.0 | 2.7–4.0 GB |
-| `q8_2f` | 78.6 | 1.21 s | 64.2 | 6.19 s | 58.0 | 15.1 s | 52.1 | 3.2–4.7 GB |
+| 提示词，token 数 | 首 token，秒（`q4tp`） | 首 token，秒（`q8_2f`） | 生成，tok/s（`q4tp`） | 生成，tok/s（`q8_2f`） | 显存峰值，GB（`q4tp`） | 显存峰值，GB（`q8_2f`） |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0.32 | 0.34 | 116.9 | 80.4 | 2.2 | 3.3 |
+| 8 192 | 1.72 | 1.79 | 106.3 | 75.2 | 2.5 | 3.6 |
+| 16 384 | 4.15 | 4.31 | 95.7 | 69.8 | 2.9 | 4.0 |
+| 30 000 | 9.92 | 10.1 | 79.7 | 61.0 | 3.5 | 4.7 |
 
-**MacBook Air M4（24 GB），Metal**
+**Vulkan · NVIDIA L4**
 
-| 文件 | 生成，tok/s | 2k 提示词 | 2k 处生成 | 8k 提示词 | 8k 处生成 |
-|---|---:|---:|---:|---:|---:|
-| `q4tp` | 59.6 | 3.5 s | 53.4 | 18.4 s | 47.4 |
-| `q8_2f` | 38.6 | 4.2 s | 33.8 | 22.7 s | 33.0 |
+测试平台：同一块 NVIDIA L4（24 GB），通过 Vulkan（默认后端）。无提示词时：4 位文件 110.0 tok/s，8 位文件 78.6。
 
-无风扇的 Air 采用基础款 M4 的内存总线（约 100 GB/s）：8 位文件每个 token 以约 90 GB/s 读取 2.3 GB。16 384 token 的
-提示词：首 token 44 s，之后 4 位文件 42 tok/s，键值占 1.6 GB。
+![Vulkan 上的两个文件](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_vulkan_zh.png)
+
+| 提示词，token 数 | 首 token，秒（`q4tp`） | 首 token，秒（`q8_2f`） | 生成，tok/s（`q4tp`） | 生成，tok/s（`q8_2f`） | 显存峰值，GB（`q4tp`） | 显存峰值，GB（`q8_2f`） |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 048 | 0.62 | 1.21 | 82.8 | 64.0 | 3.1 | 3.7 |
+| 8 192 | 3.83 | 6.20 | 73.7 | 57.8 | 3.4 | 4.2 |
+| 16 384 | 10.3 | 15.0 | 63.5 | 52.0 | 3.9 | 4.6 |
+| 30 000 | 27.3 | 35.8 | 52.6 | 44.5 | 4.6 | 5.3 |
+
+**Metal · MacBook Air M4**
+
+测试平台：MacBook Air M4（24 GB），无风扇，Metal。无提示词时：4 位文件 59.6 tok/s，8 位文件 38.6。
+
+![Metal 上的两个文件](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf/resolve/main/assets/files_metal_zh.png)
+
+| 提示词，token 数 | 首 token，秒（`q4tp`） | 首 token，秒（`q8_2f`） | 生成，tok/s（`q4tp`） | 生成，tok/s（`q8_2f`） |
+|---:|---:|---:|---:|---:|
+| 2 048 | 3.48 | 4.17 | 53.4 | 33.8 |
+| 8 192 | 18.4 | 22.7 | 47.4 | 33.0 |
+| 16 384 | 44.0 | — | 42.2 | — |
+
+无风扇的 Air 采用基础款 M4 的内存总线（约 100 GB/s）：8 位文件每个 token 以约 90 GB/s 读取 2.3 GB。16 384 token
+时 4 位文件的键值占 1.6 GB。
 
 **MacBook Air M4（24 GB），CPU（10 核）**
 
@@ -392,7 +420,7 @@ cortiq serve Aion-1.0-Instruct-2.3B-q8_2f.cmf --port 8080
 ### 长上下文
 
 模型支持 32 768 个 token。28 层中有 21 层只关注 2048 token 的窗口并只保留这些行；7 个全注意力层保留所有行，
-每个 token 在显卡上约 28 KB：30 000 token 的提示词让 4 位文件在 L4（CUDA）上占用 3.6 GB，之后生成 79 tok/s。
+每个 token 在显卡上约 28 KB：30 000 token 的提示词让 4 位文件在 L4（CUDA）上占用 3.5 GB，之后生成 79 tok/s。
 `CMF_MAX_SEQ` 设定上限（默认 32 768）。在长篇维基百科文本中埋入的事实（贪心，每个长度 12 个提示词）：4 位文件约
 13 000 token 时 12/12，约 27 000 token 时 11/12（CUDA 与 Vulkan 相同），与 Transformers bf16 一致。
 

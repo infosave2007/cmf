@@ -1,0 +1,265 @@
+{
+ "cuda": {
+  "turbo": [
+   {
+    "ctx": 2048,
+    "ttft": 0.39,
+    "decode": 117.3,
+    "vram_gb": 2.19
+   },
+   {
+    "ctx": 4096,
+    "ttft": 0.8,
+    "decode": 112.6,
+    "vram_gb": 2.3
+   },
+   {
+    "ctx": 8192,
+    "ttft": 2.8,
+    "decode": 90.7,
+    "vram_gb": 2.59
+   },
+   {
+    "ctx": 12288,
+    "ttft": 4.44,
+    "decode": 90.0,
+    "vram_gb": 2.77
+   },
+   {
+    "ctx": 16384,
+    "ttft": 6.3,
+    "decode": 89.9,
+    "vram_gb": 2.97
+   },
+   {
+    "ctx": 24576,
+    "ttft": 10.17,
+    "decode": 89.7,
+    "vram_gb": 3.36
+   },
+   {
+    "ctx": 30000,
+    "ttft": 13.23,
+    "decode": 89.0,
+    "vram_gb": 3.59
+   }
+  ],
+  "q4tp": [
+   {
+    "ctx": 2048,
+    "ttft": 0.32,
+    "decode": 116.9,
+    "vram_gb": 2.19
+   },
+   {
+    "ctx": 4096,
+    "ttft": 0.74,
+    "decode": 112.4,
+    "vram_gb": 2.3
+   },
+   {
+    "ctx": 8192,
+    "ttft": 1.72,
+    "decode": 106.3,
+    "vram_gb": 2.5
+   },
+   {
+    "ctx": 12288,
+    "ttft": 2.86,
+    "decode": 100.1,
+    "vram_gb": 2.7
+   },
+   {
+    "ctx": 16384,
+    "ttft": 4.15,
+    "decode": 95.7,
+    "vram_gb": 2.91
+   },
+   {
+    "ctx": 24576,
+    "ttft": 7.3,
+    "decode": 86.3,
+    "vram_gb": 3.3
+   },
+   {
+    "ctx": 30000,
+    "ttft": 9.92,
+    "decode": 79.7,
+    "vram_gb": 3.54
+   }
+  ],
+  "q8_2f": [
+   {
+    "ctx": 2048,
+    "ttft": 0.34,
+    "decode": 80.4,
+    "vram_gb": 3.33
+   },
+   {
+    "ctx": 8192,
+    "ttft": 1.79,
+    "decode": 75.2,
+    "vram_gb": 3.65
+   },
+   {
+    "ctx": 16384,
+    "ttft": 4.31,
+    "decode": 69.8,
+    "vram_gb": 4.05
+   },
+   {
+    "ctx": 30000,
+    "ttft": 10.14,
+    "decode": 61.0,
+    "vram_gb": 4.69
+   }
+  ]
+ },
+ "vulkan": {
+  "turbo": [
+   {
+    "ctx": 2048,
+    "ttft": 0.84,
+    "decode": 82.4,
+    "vram_gb": 2.96
+   },
+   {
+    "ctx": 4096,
+    "ttft": 1.73,
+    "decode": 79.8,
+    "vram_gb": 3.19
+   },
+   {
+    "ctx": 8192,
+    "ttft": 5.71,
+    "decode": 80.4,
+    "vram_gb": 3.48
+   },
+   {
+    "ctx": 12288,
+    "ttft": 9.75,
+    "decode": 80.5,
+    "vram_gb": 3.5
+   },
+   {
+    "ctx": 16384,
+    "ttft": 12.17,
+    "decode": 80.5,
+    "vram_gb": 3.5
+   },
+   {
+    "ctx": 24576,
+    "ttft": 17.78,
+    "decode": 80.6,
+    "vram_gb": 3.5
+   },
+   {
+    "ctx": 30000,
+    "ttft": 21.01,
+    "decode": 80.3,
+    "vram_gb": 3.5
+   }
+  ],
+  "q4tp": [
+   {
+    "ctx": 2048,
+    "ttft": 0.62,
+    "decode": 82.8,
+    "vram_gb": 3.06
+   },
+   {
+    "ctx": 4096,
+    "ttft": 1.54,
+    "decode": 79.8,
+    "vram_gb": 3.21
+   },
+   {
+    "ctx": 8192,
+    "ttft": 3.83,
+    "decode": 73.7,
+    "vram_gb": 3.43
+   },
+   {
+    "ctx": 12288,
+    "ttft": 6.78,
+    "decode": 68.2,
+    "vram_gb": 3.65
+   },
+   {
+    "ctx": 16384,
+    "ttft": 10.32,
+    "decode": 63.5,
+    "vram_gb": 3.87
+   },
+   {
+    "ctx": 24576,
+    "ttft": 19.66,
+    "decode": 56.9,
+    "vram_gb": 4.31
+   },
+   {
+    "ctx": 30000,
+    "ttft": 27.29,
+    "decode": 52.6,
+    "vram_gb": 4.6
+   }
+  ],
+  "q8_2f": [
+   {
+    "ctx": 2048,
+    "ttft": 1.21,
+    "decode": 64.0,
+    "vram_gb": 3.67
+   },
+   {
+    "ctx": 8192,
+    "ttft": 6.2,
+    "decode": 57.8,
+    "vram_gb": 4.15
+   },
+   {
+    "ctx": 16384,
+    "ttft": 15.04,
+    "decode": 52.0,
+    "vram_gb": 4.59
+   },
+   {
+    "ctx": 30000,
+    "ttft": 35.76,
+    "decode": 44.5,
+    "vram_gb": 5.32
+   }
+  ]
+ },
+ "metal": {
+  "q4tp": [
+   {
+    "ctx": 2048,
+    "ttft": 3.48,
+    "decode": 53.4
+   },
+   {
+    "ctx": 8192,
+    "ttft": 18.4,
+    "decode": 47.4
+   },
+   {
+    "ctx": 16384,
+    "ttft": 44.0,
+    "decode": 42.2
+   }
+  ],
+  "q8_2f": [
+   {
+    "ctx": 2048,
+    "ttft": 4.17,
+    "decode": 33.8
+   },
+   {
+    "ctx": 8192,
+    "ttft": 22.7,
+    "decode": 33.0
+   }
+  ]
+ }
+}
