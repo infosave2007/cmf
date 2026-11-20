@@ -88,6 +88,7 @@ over the 112 ranks, made on planted facts in Wikipedia: left-out prompts rank th
 | 16 384 | Turbo | 6.4 s | 89.5 | 3.0 GB |
 | 16 384 | standard `q4tp` | 4.2 s | 94.5 | 3.0 GB |
 | 30 000 | Turbo | 13.5 s | 88.5 | 3.7 GB |
+| 30 000 | Turbo, `CMF_O1_WHOLE=0` | 11.5 s | 112.4 | 2.8 GB |
 | 30 000 | standard `q4tp` | 10.0 s | 79.3 | 3.6 GB |
 
 ### MacBook Air M4 (24 GB), Metal
@@ -103,7 +104,8 @@ On Vulkan the prompt past 8192 tokens is read through the far field, chunk by ch
 the card as they are read: memory is fixed, and what those rows compute is an approximation. On CUDA the whole
 prompt is read exact and the far field is built once before its last 512 rows: memory grows with the prompt as the
 standard file's does, the answer starts from exact rows. `CMF_O1_WHOLE=1` reads the prompt whole on Vulkan too
-(the 30 000-token row above; planted facts 4/4 instead of 2/4).
+(the 30 000-token row above; planted facts 4/4 instead of 2/4), and `CMF_O1_WHOLE=0` reads it in chunks on CUDA:
+2.7–2.8 GB from 16 000 to 30 000 tokens and 112 tok/s, with planted facts 3/4 and 2/4.
 
 ## Quality
 
@@ -192,6 +194,7 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 | 16 384 | Turbo | 6,4 с | 89,5 | 3,0 ГБ |
 | 16 384 | стандартный `q4tp` | 4,2 с | 94,5 | 3,0 ГБ |
 | 30 000 | Turbo | 13,5 с | 88,5 | 3,7 ГБ |
+| 30 000 | Turbo, `CMF_O1_WHOLE=0` | 11,5 с | 112,4 | 2,8 ГБ |
 | 30 000 | стандартный `q4tp` | 10,0 с | 79,3 | 3,6 ГБ |
 
 **MacBook Air M4 (24 ГБ), Metal**
@@ -205,7 +208,8 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 кусками, и строки уходят с карты по мере чтения: память фиксирована, а вычисленное по этим строкам — приближение.
 На CUDA весь промпт читается точно, и дальнее поле строится один раз перед последними 512 строками: память растёт
 с промптом, как у стандартного файла, зато ответ опирается на точные строки. `CMF_O1_WHOLE=1` читает промпт целиком
-и на Vulkan (строка на 30 000 токенов выше; спрятанные факты 4/4 вместо 2/4).
+и на Vulkan (строка на 30 000 токенов выше; спрятанные факты 4/4 вместо 2/4), а `CMF_O1_WHOLE=0` читает его кусками
+на CUDA: 2,7–2,8 ГБ от 16 000 до 30 000 токенов и 112 ток/с, спрятанные факты — 3/4 и 2/4.
 
 ### Качество
 
@@ -286,6 +290,7 @@ CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 0.9
 | 16 384 | Turbo | 6.4 s | 89.5 | 3.0 GB |
 | 16 384 | 标准 `q4tp` | 4.2 s | 94.5 | 3.0 GB |
 | 30 000 | Turbo | 13.5 s | 88.5 | 3.7 GB |
+| 30 000 | Turbo，`CMF_O1_WHOLE=0` | 11.5 s | 112.4 | 2.8 GB |
 | 30 000 | 标准 `q4tp` | 10.0 s | 79.3 | 3.6 GB |
 
 **MacBook Air M4（24 GB），Metal**
@@ -298,7 +303,8 @@ CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 0.9
 **读取长提示词的两种方式。** 在 Vulkan 上，8192 token 之后的提示词经远场分块读取，读完的行即离开显卡：
 显存固定，而这些行算出的结果是近似值。在 CUDA 上，整个提示词被精确读取，远场在最后 512 行之前一次建成：显存像
 标准文件一样随提示词增长，但回答基于精确的行。`CMF_O1_WHOLE=1` 让 Vulkan 也整体读取（见上表 30 000 token 一行；
-埋入事实 4/4 而非 2/4）。
+埋入事实 4/4 而非 2/4）；`CMF_O1_WHOLE=0` 让 CUDA 分块读取：16 000 到 30 000 token 显存 2.7–2.8 GB、生成 112 tok/s，
+埋入事实为 3/4 和 2/4。
 
 ### 质量
 
