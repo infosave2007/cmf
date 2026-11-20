@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] — 2026-11-20
+
+### Added
+- `cortiq requant --quant q4tp-dense`: a file's dense trunk (its q8_2f matrices: attention, indexer query, latent
+  projections, shared experts, a dense FFN) at q4tp; the head, the embeddings, the router, the routed experts and
+  Engram stay. Hy4-flash Fast Code: half the dense bytes a token, HumanEval 92.7 % (93.3 %), perplexity on
+  fresh code 9.63 (8.97), Rust 4.43 (4.22). Published beside the 8-bit file as `hy4-flash-fast-code-q4.cmf`.
+
+### Changed
+- CUDA hybrid decode (one row): the mHC logits and routing, the norms and the MLA latent norm take 1024 threads a
+  block (the norms sum their warps' partials in f64 once, by one thread); the routed experts of a decode row are
+  chosen by one bitonic sort of the router's keys (512 threads) instead of top-k warp-wide argmax rounds, the same
+  order (`CMF_HYB_ROW1K=0`, `CMF_HYB_SELECT512=0` restore the old launches). Hy4-flash Fast Code on an RTX PRO
+  6000, the 8-bit file on 0.9.7 → the q4tp-dense file on 0.9.8: whole card 49.8 → 67.4 tok/s, within 24 GB 32.0 → 50,
+  16 GB 26.2 → 39.8, 12 GB on the host → 32.6.
+
 ## [0.9.7] — 2026-11-20
 
 ### Added

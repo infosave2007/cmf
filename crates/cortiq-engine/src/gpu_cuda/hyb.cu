@@ -149,9 +149,15 @@ extern "C" __global__ void hy_rmsnorm(const float* __restrict__ x, const float* 
     for (int k = 16; k > 0; k >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, k));
     if (lane == 0) red[warp] = s;
     __syncthreads();
-    double tot = 0.0;
-    for (int k = 0; k < NW; k++) tot += (double)red[k];
-    const float inv = 1.0f / (float)sqrt(tot / (double)n + (double)eps);
+    // the f64 tail once, by one thread (f64 runs at a small fraction of f32)
+    __shared__ float inv_s;
+    if (tid == 0) {
+        double tot = 0.0;
+        for (int k = 0; k < NW; k++) tot += (double)red[k];
+        inv_s = 1.0f / (float)sqrt(tot / (double)n + (double)eps);
+    }
+    __syncthreads();
+    const float inv = inv_s;
     for (int i = tid; i < n; i += T) {
         const float v = __fmul_rn(__fmul_rn(xr[i], inv), gemma ? 1.0f + w[i] : w[i]);
         if (out) stf(out, (size_t)blockIdx.x * n + i, v, half);
@@ -2124,7 +2130,42 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
     const bool sigm = (flags & 2) != 0;
     for (int e = tid; e < E; e += blockDim.x) slot_of[e] = -1;
     for (int i = tid; i < n * S; i += blockDim.x) wsel[i] = 0.0f;
-    if (r < n) {
+    if (n == 1 && (flags & 2) && blockDim.x == 512 && k <= 64) {
+        // a decode row: its keys sorted at once (bitonic, 1024 slots, a pair a
+        // thread) instead of k warp-wide argmax rounds; the same order — the
+        // larger key first, the smaller expert on a tie
+        __shared__ float sk[1024];
+        __shared__ int si[1024];
+        for (int e = tid; e < 1024; e += 512) {
+            float kk = -3.0e38f;
+            if (e < E) {
+                kk = 1.0f / (1.0f + expf(-logits[e]));
+                if ((flags & 4) && bias) kk += bias[e];
+            }
+            sk[e] = kk;
+            si[e] = e < E ? e : 0x7fffffff;
+        }
+        __syncthreads();
+        for (int size = 2; size <= 1024; size <<= 1) {
+            for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                const int i = 2 * tid - (tid & (stride - 1)), j = i + stride;
+                const float ka = sk[i], kb = sk[j];
+                const int ia = si[i], ib = si[j];
+                const bool a_first = ka > kb || (ka == kb && ia < ib);
+                if (((i & size) == 0) != a_first) {
+                    sk[i] = kb;
+                    sk[j] = ka;
+                    si[i] = ib;
+                    si[j] = ia;
+                }
+                __syncthreads();
+            }
+        }
+        if (tid < k) {
+            pick[0][tid] = si[tid];
+            pw[0][tid] = 1.0f / (1.0f + expf(-logits[si[tid]]));
+        }
+    } else if (r < n) {
         const float* L = logits + (size_t)r * E;
         float key[32], lg[32];
 #pragma unroll
@@ -3156,6 +3197,7 @@ extern "C" __global__ void hy_mhc_logits(const float* __restrict__ R, const floa
     const float* Rr = R + (size_t)r * n;
     const float* Wk = W + (size_t)k * n;
     float s2 = 0.0f, d = 0.0f;
+#pragma unroll 4
     for (int i = tid; i < n; i += blockDim.x) {
         const float x = Rr[i];
         s2 = fmaf(x, x, s2);
@@ -3844,9 +3886,14 @@ extern "C" __global__ void hy_mla_lat(const float* __restrict__ kva, int stride,
     for (int k = 16; k > 0; k >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, k));
     if (lane == 0) red[warp] = s;
     __syncthreads();
-    double tot = 0.0;
-    for (int k = 0; k < NW; k++) tot += (double)red[k];
-    const float inv = 1.0f / (float)sqrt(tot / (double)lora + (double)eps);
+    __shared__ float inv_s;
+    if (tid == 0) {
+        double tot = 0.0;
+        for (int k = 0; k < NW; k++) tot += (double)red[k];
+        inv_s = 1.0f / (float)sqrt(tot / (double)lora + (double)eps);
+    }
+    __syncthreads();
+    const float inv = inv_s;
     for (int i = tid; i < lora; i += blockDim.x) put3(p0, p1, p1, (size_t)r * pstride + i, __fmul_rn(__fmul_rn(x[i], inv), w[i]));
 }
 
