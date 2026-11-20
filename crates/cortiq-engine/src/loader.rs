@@ -2828,7 +2828,9 @@ impl Pipeline {
         // Off with a speculation head (its verify paths read row counts as
         // positions) and under CMF_ATTN_DUMP (the dump header assumes row
         // = position). CMF_SWA_TRIM=0 turns it off for an A/B.
-        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3")
+        // Aion-2.3B (21 of 28 layers, window 2048): at 16 384 tokens the host
+        // held 3.77 GB of rows on a MacBook Air, 2.9 GB of them past any window.
+        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3" | "aion_instruct")
             && pipeline.swa.is_some()
             && pipeline.mtp.is_none()
             && pipeline.mimo_mtp.is_none()
@@ -2839,7 +2841,7 @@ impl Pipeline {
         // Spark-X2.6's KV mirrors in f16 on Metal: at 14 000 tokens a token read 1.03 GB of f32
         // rows on the M4 (`CMF_METAL_KV_F16=0` keeps f32).
         #[cfg(target_os = "macos")]
-        if arch.arch_name == "spark2_5" {
+        if matches!(arch.arch_name.as_str(), "spark2_5" | "aion_instruct") {
             crate::gpu_metal::set_kv_f16_default(true);
         }
         // Spark-X2.6-4B q8_2f on the M4: an 8..31-token prompt prefills in

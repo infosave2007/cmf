@@ -21782,6 +21782,11 @@ mod graph_bg_cache_key_tests {
 static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<Box<Ctx>>>>> =
     OnceLock::new();
 
+/// A wgpu context was built in this process (no context is built by asking).
+pub fn any_ctx_built() -> bool {
+    CTXS.get().is_some_and(|m| m.lock().map(|m| m.values().any(|c| c.is_some())).unwrap_or(false))
+}
+
 /// Whether the wgpu path is selected (the facade asks before `enabled()`):
 /// `CMF_GPU=wgpu` — always; `CMF_GPU=1` (≠0) — only on non-macOS, where
 /// there is no native Metal (on macOS `=1` goes to Metal). UNSET selects

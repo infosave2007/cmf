@@ -5373,7 +5373,9 @@ async fn main() -> anyhow::Result<()> {
                 patch_shared: patch_shared.as_deref(),
                 codec: &codec,
                 in_place,
-            })
+            })?;
+            cortiq_engine::gpu::exit_past_driver_teardown(0);
+            Ok(())
         }
         #[cfg(not(feature = "gpu"))]
         Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
@@ -5697,6 +5699,9 @@ async fn main() -> anyhow::Result<()> {
                         refine_q4tp,
                     };
                     gptq::run_quantize_gptq_tiled(&opts)?;
+                    println!("✓ wrote {output}");
+                    cortiq_engine::gpu::exit_past_driver_teardown(0);
+                    return Ok(());
                 }
                 "q1s" => {
                     anyhow::ensure!(

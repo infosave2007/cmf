@@ -368,6 +368,10 @@ struct NystromGroup {
     base_w: usize,
     /// Permanent exact sink keys at positions 0..sink (spec §5b).
     sink: usize,
+    /// Rows of the seal's order before this one stay out of the landmark
+    /// means (`with_landmarks_from`): the rows a seal keeps exact behind the
+    /// sinks. 0 = every row, the historical means.
+    lm_from: usize,
     d: usize,
     dv: usize,
     /// Effective landmark count: clamp(t/8, 4, m) at prefill.  Derived
@@ -579,6 +583,7 @@ impl NystromState {
                 w,
                 base_w: w,
                 sink,
+                lm_from: 0,
                 d: 0,
                 dv: 0,
                 m_eff: 0,
@@ -606,6 +611,20 @@ impl NystromState {
     /// Widen this group's exact window to `w` keys (builder). The
     /// retrieval lever: a copying head reads every key of the last `w`
     /// exactly, while the group's state stays a fixed-size ring.
+    /// Landmarks from the rows past the seal's first `from` (its sinks and the
+    /// rows it keeps exact) alone. Those rows never enter the far field, yet
+    /// with the means over every row the first segment held them all: 248
+    /// kept rows — picked for lying far from the landmarks' span — in a
+    /// segment of 816 made its landmark an outlier, the kernel matrix
+    /// ill-conditioned, and Aion's far field answered a 27k-token prompt with
+    /// garbled text from 216 kept rows on. `CMF_O1_LM_ALL=1` keeps the old means.
+    pub fn with_landmarks_from(mut self, from: usize) -> Self {
+        if std::env::var("CMF_O1_LM_ALL").as_deref() != Ok("1") {
+            self.group.lm_from = from;
+        }
+        self
+    }
+
     pub fn with_window(mut self, w: usize) -> Self {
         assert!(w >= 1, "window must hold at least one key");
         self.group.w = w;
@@ -743,6 +762,23 @@ impl NystromState {
         Some(sink..t - w)
     }
 
+    /// `CMF_O1_SEAL_DIAG=1`: what a sealed group holds, for telling an
+    /// ill-conditioned skeleton from a broken input: the largest |M| entry,
+    /// far mass, far numerator and landmark norms, and whether all are finite.
+    pub fn seal_diag(&self) -> (f32, f32, f32, f32, f32, bool) {
+        let amax = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let (mut mu, mut z, mut t, mut q) = (0f32, 0f32, 0f32, 0f32);
+        let mut finite = self.group.k_tilde.iter().all(|x| x.is_finite());
+        for h in &self.heads {
+            mu = mu.max(amax(&h.mu));
+            z = z.max(amax(&h.z_hat));
+            t = t.max(amax(&h.t_hat));
+            q = q.max(amax(&h.q_tilde));
+            finite &= h.mu.iter().chain(&h.z_hat).chain(&h.t_hat).chain(&h.m_max).chain(&h.q_tilde).all(|x| x.is_finite());
+        }
+        (mu, z, t, q, amax(&self.group.k_tilde), finite)
+    }
+
     /// Landmark count, head width and score scale of a sealed group.
     pub fn far_geometry(&self) -> (usize, usize, f32) {
         (self.group.m_eff, self.group.d, self.group.scale)
@@ -840,7 +876,8 @@ impl NystromState {
         g.win_v = vec![0.0; w * dv];
         let m_eff = (t / 8).clamp(4, g.m);
         g.m_eff = m_eff;
-        let k_tilde64 = seg_means_by(t, d, m_eff, kr);
+        let from = g.landmarks_from(t);
+        let k_tilde64 = seg_means_by(t - from, d, m_eff, |j| kr(j + from));
         g.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
         for r in t - w..t {
             let slot = (r - sink) % w;
@@ -852,10 +889,10 @@ impl NystromState {
         let g = &self.group;
         for (hi, h) in self.heads.iter_mut().enumerate() {
             let qr = |j: usize| -> &[f32] {
-                let at = ((order[j] as usize / stride) * nh + h0 + hi) * d;
+                let at = ((order[j + from] as usize / stride) * nh + h0 + hi) * d;
                 &q_trace[at..at + d]
             };
-            h.seal_tilde(g, seg_means_by(t, d, m_eff, qr), &k_tilde64, None);
+            h.seal_tilde(g, seg_means_by(t - from, d, m_eff, qr), &k_tilde64, None);
         }
         Some(sink..t - w)
     }
@@ -1172,9 +1209,16 @@ impl NystromGroup {
             }
         }
         self.m_eff = m_eff;
-        let k_tilde64 = seg_means(ks, t, d, m_eff);
+        let from = self.landmarks_from(t);
+        let k_tilde64 = seg_means(&ks[from * d..], t - from, d, m_eff);
         self.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
         Some(k_tilde64)
+    }
+
+    /// The first row of the seal's order the landmark means read: `lm_from`
+    /// while enough rows are left for `m_eff` segments, else every row.
+    fn landmarks_from(&self, t: usize) -> usize {
+        if self.lm_from > 0 && t >= self.lm_from + 8 * self.m_eff.max(1) { self.lm_from } else { 0 }
     }
 
     fn memory_bytes(&self) -> usize {
@@ -1227,7 +1271,10 @@ impl NystromHead {
     ) {
         let q_tilde64 = match fixed {
             Some((qt, _)) => qt.iter().map(|&x| x as f64).collect(),
-            None => seg_means(qs, t, g.d, g.m_eff),
+            None => {
+                let from = g.landmarks_from(t);
+                seg_means(&qs[from * g.d..], t - from, g.d, g.m_eff)
+            }
         };
         self.seal_tilde(g, q_tilde64, k_tilde64, fixed.and_then(|f| f.1));
     }

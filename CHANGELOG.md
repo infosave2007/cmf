@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of their own (Aion: 7 full layers on YaRN ×16, 21 window layers on plain RoPE); before, any sliding layer kept the
   scale in the rotation. Perplexity unchanged (4 × 4096 tokens 9.469 on CUDA and Vulkan); the Turbo far field
   reads the facts of 13k-token prompts 4/4 on Vulkan (3/4 before).
+- Far-field landmarks come from the rows past a seal's sinks and the rows it keeps exact (those never enter the far
+  field, yet the segment means held them all in the first segment: 248 kept rows of 816 made its landmark an outlier
+  and the kernel matrix ill-conditioned). Aion Turbo at 27k tokens: one planted-fact prompt answered with garbled
+  text from 216 kept rows on, and with 248 rows in 6 of 8 one-word shifts of the prompt; now every one right, and
+  planted facts on CUDA 4/4 at 13k and 4/4 at 27k (3/4 before, bf16 3/4). Every Turbo file with exact rows seals
+  this way now (Dory's too); `CMF_O1_LM_ALL=1` keeps the old means. `CMF_O1_SEAL_DIAG=1` prints a seal's magnitudes.
+- Aion's sliding layers keep only the rows their window reads on the host (as Spark-X2.5's and LFM3's), and its
+  Metal K/V mirrors are f16. MacBook Air M4, q4tp at 16 384 tokens: K/V 3.77 → 1.62 GB, decode 33.0 → 42.2 tok/s,
+  first token 56 → 44 s; the Turbo file 2.95 → 0.83 GB, 44.7 tok/s. Perplexity unchanged.
+- `quantize-gptq` and `quantize-moe` leave past the NVIDIA driver's exit handlers when the process held both a
+  Vulkan device and a CUDA context: a run that had written its file ended in glibc's "corrupted size vs.
+  prev_size" (a double free under libnvidia-glcore), rc 134.
 - A far-field prompt chunk (the prefix read for a seal, the sealed chunks before the tail) is never left a few rows
   long: such a chunk took the CUDA hybrid arm's 16-row small path, which captures neither the seal's queries nor
   the archive's rows. Aion Turbo, a 26 626-row prompt on CUDA: "O(1) prefix: 0 query values" → an answer.

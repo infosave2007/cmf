@@ -836,6 +836,7 @@ impl LayerKvCache {
             let calib = crate::nystrom::O1Calib::load(wire_layer, g, hd, hpk);
             let wg = crate::nystrom::wide_window(wire_layer, g).unwrap_or(w);
             let mut st = crate::nystrom::NystromState::new_group(m, w, sink + keep.len(), hpk)
+                .with_landmarks_from(if keep.is_empty() { 0 } else { sink + keep.len() })
                 .with_window(wg)
                 .with_rect(rect)
                 .with_calib(calib);
@@ -924,6 +925,21 @@ impl LayerKvCache {
                     }
                 });
             }
+        }
+        if std::env::var_os("CMF_O1_SEAL_DIAG").is_some() {
+            let d: Vec<_> = groups.iter().map(|g| g.seal_diag()).collect();
+            let mx = |f: fn(&(f32, f32, f32, f32, f32, bool)) -> f32| d.iter().map(f).fold(0f32, f32::max);
+            eprintln!(
+                "o1 seal diag: layer {} rows {t} kept {} |M| {:.3e} mass {:.3e} numerator {:.3e} |q~| {:.3e} |k~| {:.3e} finite {}",
+                self.wire_layer,
+                self.o1_keep.len(),
+                mx(|x| x.0),
+                mx(|x| x.1),
+                mx(|x| x.2),
+                mx(|x| x.3),
+                mx(|x| x.4),
+                d.iter().all(|x| x.5)
+            );
         }
         // The states now carry everything decode needs — release the
         // O(context) storage (this is the memory claim, not a cosmetic).
