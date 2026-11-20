@@ -2264,7 +2264,8 @@ pub struct GraphMhc<'a> {
 pub fn hy_layers(layers: &[GraphLayer]) -> bool {
     layers.iter().any(|l| {
         l.engram.is_some()
-            || l.mhc.as_ref().is_some_and(|m| m.head.is_some() || m.dsv4.is_some_and(|d| d.ihc.is_some()))
+            // (a learned closing fold over the DeepSeek-V4 form is Maxwell's, not Hy4-flash's)
+            || l.mhc.as_ref().is_some_and(|m| m.dsv4.is_some_and(|d| d.ihc.is_some()))
             || matches!(&l.attn, GraphAttn::Mla { hy: Some(_), .. })
             || matches!(&l.ffn, GraphFfn::Moe { latent: Some(_), .. } | GraphFfn::Moe { shared_limit: Some(_), .. })
     })

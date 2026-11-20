@@ -16224,6 +16224,170 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tiny_maxwell_converts_loads_and_runs_past_its_dense_range() {
+        // A generated Maxwell-shaped fixture through the packer, the CMF
+        // directory, the runtime's own loader and its host stack: four mHC
+        // streams, a dense layer and a routed one, and a block route small
+        // enough (blocks of 4, 2 prefix + 2 local + 1 remote) that 40
+        // positions reach well past the dense range of 20.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cortiq-maxwell-convtest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (hidden, hc, nh, nkv, hd, inter, moe_inter, shared, n_exp, vocab) = (32usize, 4usize, 4usize, 2usize, 8usize, 64usize, 32usize, 64usize, 4usize, 32usize);
+        let config = serde_json::json!({
+            "model_type": "maxwell_moe",
+            "attention_variant": "block_sparse_gqa",
+            "hidden_size": hidden,
+            "intermediate_size": inter,
+            "num_hidden_layers": 2,
+            "num_attention_heads": nh,
+            "num_key_value_heads": nkv,
+            "attention_head_size": hd,
+            "vocab_size": vocab,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false,
+            "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 3,
+            "moe_intermediate_size": moe_inter,
+            "shared_expert_intermediate_size": shared,
+            "num_experts": n_exp,
+            "num_experts_per_tok": 2,
+            "mlp_only_layers": [0],
+            "qk_layernorm": true,
+            "enable_hyper_connections": true,
+            "num_residual_streams": hc,
+            "mhc_sinkhorn_iterations": 20,
+            "moe_router_enable_expert_bias": true,
+            "router_score_function": "sigmoid",
+            "mtp_num_layers": 1,
+            "block_sparse_gqa_indexer_n_heads": nkv,
+            "block_sparse_gqa_indexer_head_dim": hd,
+            "block_sparse_gqa_block_size": 4,
+            "block_sparse_gqa_prefix_window_size": 8,
+            "block_sparse_gqa_local_window_size": 8,
+            "block_sparse_gqa_num_remote_blocks": 1
+        });
+        fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        fs::write(dir.join("tokenizer.json"), r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}"#).unwrap();
+        let values = |n: usize, salt: usize| (0..n).map(|i| ((i + salt) as f32 * 0.017).sin() * 0.05).collect::<Vec<_>>();
+        let mix = 2 * hc + hc * hc;
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![vocab, hidden], values(vocab * hidden, 1)),
+            ("lm_head.weight".into(), vec![vocab, hidden], values(vocab * hidden, 2)),
+            ("model.norm.weight".into(), vec![hidden], vec![1.0; hidden]),
+            ("model.hc_head.hc_head_fn".into(), vec![hc, hc * hidden], values(hc * hc * hidden, 3)),
+            ("model.hc_head.hc_head_base".into(), vec![hc], values(hc, 4)),
+            ("model.hc_head.hc_head_scale".into(), vec![1], vec![1.0]),
+            // the MTP layer of the checkpoint is left out, whatever it holds
+            ("mtp_layers.0.e_proj.weight".into(), vec![hidden, hidden], values(hidden * hidden, 5)),
+        ];
+        for li in 0..2usize {
+            let p = format!("model.layers.{li}.");
+            for (k, kind) in ["self_attn_hyper_connection", "mlp_hyper_connection"].into_iter().enumerate() {
+                tensors.extend([
+                    (format!("{p}{kind}.mapping_proj.weight"), vec![mix, hc * hidden], values(mix * hc * hidden, 100 + li * 10 + k)),
+                    (format!("{p}{kind}.bias"), vec![mix], values(mix, 110 + li * 10 + k)),
+                    (format!("{p}{kind}.alpha_pre"), vec![1], vec![0.4]),
+                    (format!("{p}{kind}.alpha_post"), vec![1], vec![0.3]),
+                    (format!("{p}{kind}.alpha_res"), vec![1], vec![0.2]),
+                ]);
+            }
+            let a = format!("{p}self_attn.");
+            tensors.extend([
+                (format!("{p}input_layernorm.weight"), vec![hidden], vec![1.0; hidden]),
+                (format!("{p}post_attention_layernorm.weight"), vec![hidden], vec![1.0; hidden]),
+                (format!("{a}q_proj.weight"), vec![nh * hd, hidden], values(nh * hd * hidden, 200 + li)),
+                (format!("{a}k_proj.weight"), vec![nkv * hd, hidden], values(nkv * hd * hidden, 210 + li)),
+                (format!("{a}v_proj.weight"), vec![nkv * hd, hidden], values(nkv * hd * hidden, 220 + li)),
+                (format!("{a}o_proj.weight"), vec![hidden, nh * hd], values(hidden * nh * hd, 230 + li)),
+                (format!("{a}q_layernorm.weight"), vec![hd], vec![1.0; hd]),
+                (format!("{a}k_layernorm.weight"), vec![hd], vec![1.0; hd]),
+                (format!("{a}indexer.linear_q_proj.weight"), vec![nkv * hd, hidden], values(nkv * hd * hidden, 240 + li)),
+                (format!("{a}indexer.linear_k_proj.weight"), vec![hd, hidden], values(hd * hidden, 250 + li)),
+                (format!("{a}indexer.q_layernorm.weight"), vec![hd], vec![1.0; hd]),
+                (format!("{a}indexer.k_layernorm.weight"), vec![hd], vec![1.0; hd]),
+            ]);
+            let m = format!("{p}block_sparse_moe.");
+            if li == 0 {
+                tensors.extend([
+                    (format!("{m}w1.weight"), vec![inter, hidden], values(inter * hidden, 300)),
+                    (format!("{m}w3.weight"), vec![inter, hidden], values(inter * hidden, 301)),
+                    (format!("{m}w2.weight"), vec![hidden, inter], values(hidden * inter, 302)),
+                ]);
+                continue;
+            }
+            tensors.extend([
+                (format!("{m}gate.weight"), vec![n_exp, hidden], values(n_exp * hidden, 310)),
+                (format!("{m}expert_bias"), vec![n_exp], vec![0.0, 0.01, -0.01, 0.02]),
+                (format!("{m}shared_expert.w1.weight"), vec![shared, hidden], values(shared * hidden, 320)),
+                (format!("{m}shared_expert.w3.weight"), vec![shared, hidden], values(shared * hidden, 321)),
+                (format!("{m}shared_expert.w2.weight"), vec![hidden, shared], values(hidden * shared, 322)),
+            ]);
+            for e in 0..n_exp {
+                tensors.extend([
+                    (format!("{m}experts.{e}.w1.weight"), vec![moe_inter, hidden], values(moe_inter * hidden, 330 + 3 * e)),
+                    (format!("{m}experts.{e}.w3.weight"), vec![moe_inter, hidden], values(moe_inter * hidden, 331 + 3 * e)),
+                    (format!("{m}experts.{e}.w2.weight"), vec![hidden, moe_inter], values(hidden * moe_inter, 332 + 3 * e)),
+                ]);
+            }
+        }
+        let refs: Vec<(&str, Vec<usize>, Vec<f32>)> = tensors.iter().map(|(name, shape, vals)| (name.as_str(), shape.clone(), vals.clone())).collect();
+        fs::write(dir.join("model.safetensors"), tiny_safetensors(&refs)).unwrap();
+        let ids: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % vocab as u32).collect();
+        let mut last: Vec<Vec<f32>> = Vec::new();
+        for quant in ["q8_2f", "q4tp", "q2tp"] {
+            let out = dir.join(format!("tiny-maxwell-{quant}.cmf"));
+            run_convert(dir.to_str().unwrap(), quant, out.to_str().unwrap(), None, None, None, false, |_| {}).unwrap();
+            let model = std::sync::Arc::new(CmfModel::open(&out).unwrap());
+            assert!(model.verify().is_empty(), "CMF verify: {:?}", model.verify());
+            assert_eq!(model.arch().arch_name, "maxwell_moe");
+            let dtype = |name: &str| model.tensor(name).unwrap().dtype;
+            assert_eq!(dtype("model.embed_tokens.weight"), TensorDtype::F16);
+            assert_eq!(dtype("lm_head.weight"), TensorDtype::Q8_2f);
+            assert_eq!(dtype("model.layers.1.mlp.gate.weight"), TensorDtype::F32);
+            assert_eq!(dtype("model.layers.1.mlp.gate.e_score_correction_bias"), TensorDtype::F32);
+            assert_eq!(dtype("model.layers.0.attn_hc.fn"), TensorDtype::F32);
+            assert_eq!(dtype("model.layers.0.self_attn.indexer.q_proj.weight"), TensorDtype::F32);
+            assert_eq!(
+                dtype("model.layers.1.mlp.experts.0.gate_proj.weight"),
+                match quant {
+                    "q8_2f" => TensorDtype::Q8_2f,
+                    "q4tp" => TensorDtype::Q4TiledP,
+                    _ => TensorDtype::Q2TiledP,
+                }
+            );
+            assert!(model.tensor("mtp_layers.0.e_proj.weight").is_none(), "the MTP layer is not converted");
+            let mut pipeline = cortiq_engine::Pipeline::from_model(&model, cortiq_engine::sampler::SamplerConfig::default()).unwrap();
+            assert!(pipeline.maxwell.is_some(), "the file loads into the Maxwell stack");
+            let logits = pipeline.forward_ids(&ids, None).unwrap();
+            assert_eq!(logits.len(), vocab);
+            assert!(logits.iter().all(|v| v.is_finite()), "{quant}: {logits:?}");
+            // the same sequence again, from a fresh cache: the same numbers
+            let again = pipeline.forward_ids(&ids, None).unwrap();
+            assert_eq!(logits, again, "{quant}: a second pass differs");
+            // a shorter prompt inside the dense range ends elsewhere
+            let short = pipeline.forward_ids(&ids[..12], None).unwrap();
+            assert_ne!(logits, short);
+            last.push(logits);
+        }
+        // the three profiles are the same model: their logits agree in direction
+        let cos = |a: &[f32], b: &[f32]| {
+            let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                ab += (*x as f64) * (*y as f64);
+                aa += (*x as f64) * (*x as f64);
+                bb += (*y as f64) * (*y as f64);
+            }
+            ab / (aa.sqrt() * bb.sqrt()).max(1e-30)
+        };
+        assert!(cos(&last[0], &last[1]) > 0.98, "q8_2f against q4tp: cos {}", cos(&last[0], &last[1]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tiny_mellum_auto_converts_loads_and_executes_its_dual_rope_schedule() {
         // A generated, fully-shaped Mellum fixture is intentionally used
         // instead of upstream weights.  It crosses the converter, CMF

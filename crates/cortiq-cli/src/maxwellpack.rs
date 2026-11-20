@@ -34,6 +34,7 @@
 //! * `q2tp`: routed experts' gate/up q2tp, down q4tp; every other matrix q4tp
 //!   but the embedding and the head (q8_2f).
 //!
+//! The embedding is f16 in every profile (a row a token, read on the host).
 //! Norms, routers, hyper-connection weights and the indexer's projections
 //! stay f32. `--tensor-quant PATTERN=QUANT` overrides any matrix. The
 //! hyper-parameters the runtime needs ride in the header provenance under
@@ -89,7 +90,13 @@ fn matrix_codec(name: &str, profile: Profile) -> Quant {
             Profile::Q2 => Quant::Q2TiledP,
         };
     }
-    if profile == Profile::Q2 && !(name == "model.embed_tokens.weight" || name == "lm_head.weight") {
+    // the embedding rows of the frequent tokens carry outliers (max / rms of 15):
+    // an 8-bit row loses 3.5 % of them, 2 % of the stream after the first layer.
+    // The table is read a row a token on the host, so f16 costs no card memory.
+    if name == "model.embed_tokens.weight" {
+        return Quant::F16;
+    }
+    if profile == Profile::Q2 && name != "lm_head.weight" {
         return Quant::Q4TiledP;
     }
     Quant::Q8_2f
@@ -171,7 +178,7 @@ impl Out {
     }
 
     fn matrix(&mut self, group: &'static str, name: &str, q: Quant, v: &[f32], rows: usize, cols: usize) -> anyhow::Result<()> {
-        if keep_f32(name) || matches!(q, Quant::F16) {
+        if keep_f32(name) {
             return self.f32(group, name, &[rows, cols], v);
         }
         let (dt, bytes) = quantize_2d(q, v, rows, cols);
@@ -462,6 +469,8 @@ mod tests {
         assert_eq!(matrix_codec("model.layers.3.self_attn.o_proj.weight", Profile::Q2), Quant::Q4TiledP);
         assert_eq!(matrix_codec("model.layers.3.mlp.shared_experts.up_proj.weight", Profile::Q4), Quant::Q8_2f);
         assert_eq!(matrix_codec("lm_head.weight", Profile::Q2), Quant::Q8_2f);
+        assert_eq!(matrix_codec("model.embed_tokens.weight", Profile::Q8), Quant::F16);
+        assert_eq!(matrix_codec("model.embed_tokens.weight", Profile::Q2), Quant::F16);
         assert!(keep_f32("model.layers.3.mlp.gate.weight"));
         assert!(keep_f32("model.layers.3.attn_hc.fn"));
         assert!(keep_f32("model.layers.3.self_attn.indexer.q_proj.weight"));
