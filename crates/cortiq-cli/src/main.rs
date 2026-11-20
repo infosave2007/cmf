@@ -28,6 +28,8 @@ mod moegptq;
 #[cfg(feature = "gpu")]
 mod hy4sfq;
 #[cfg(feature = "gpu")]
+mod hy4alias;
+#[cfg(feature = "gpu")]
 mod nemotron_gptq;
 mod growth;
 mod http_range;
@@ -1693,6 +1695,46 @@ enum Commands {
         /// Layer range LO:HI (encode phase; default all)
         #[arg(long)]
         layers: Option<String>,
+    },
+    /// Resonance substitutes for the experts a Hy4-flash cut drops: per
+    /// dropped expert, the kept expert that reconstructs its output best on
+    /// its own captured inputs (`hy4-sfq --capture-only` rows); writes the
+    /// alias table for CMF_HY4_ALIAS
+    Hy4Alias {
+        /// The full q4tp .cmf
+        model: String,
+        /// Capture directories with latent rows (repeatable)
+        #[arg(long)]
+        capture: Vec<String>,
+        /// The kept experts, {"<layer>": [ids]}
+        #[arg(long)]
+        keep: String,
+        #[arg(long)]
+        output: String,
+        /// Heaviest captured inputs per dropped expert
+        #[arg(long, default_value = "64")]
+        rows: usize,
+        /// Candidates per dropped expert (the most co-picked kept experts)
+        #[arg(long, default_value = "48")]
+        cands: usize,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        /// Measure instead (N held-out tokens): the layer output error of
+        /// dropping the experts vs keeping every expert's best neurons
+        #[arg(long)]
+        probe: Option<usize>,
+        /// Neuron fraction each expert keeps under --probe
+        #[arg(long, default_value = "0.5")]
+        frac: f64,
+        /// Ridge of the least-squares correction (relative to the mean diagonal)
+        #[arg(long, default_value = "0.01")]
+        ridge: f64,
+        /// Measure the linear stand-ins for the dropped experts (N held-out tokens)
+        #[arg(long)]
+        ghost: Option<usize>,
+        /// Write the --keep layers' experts decoded to f16 into DIR instead
+        #[arg(long)]
+        dump: Option<String>,
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
@@ -5366,6 +5408,20 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         Commands::Hy4Sfq { .. } => Err(anyhow::anyhow!("hy4-sfq needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::Hy4Alias { model, capture, keep, output, rows, cands, threads, probe, frac, ridge, ghost, dump } => {
+            let o = hy4alias::Hy4AliasOpts { model: &model, captures: &capture, keep: &keep, output: &output, rows, cands, threads, ridge };
+            if let Some(d) = dump {
+                return hy4alias::dump(&o, &d);
+            }
+            match (probe, ghost) {
+                (_, Some(n)) => hy4alias::ghost(&o, n),
+                (Some(n), None) => hy4alias::probe(&o, n, frac),
+                (None, None) => hy4alias::run(&o),
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::Hy4Alias { .. } => Err(anyhow::anyhow!("hy4-alias needs a build with the gpu feature")),
         #[cfg(feature = "gpu")]
         Commands::MtpHeal { model, init, data, chain, refresh, stride, tokens, window, epochs, lr, topk, batch, eval_every, patience, hard, trunk_cache, codec, also_output, dump, taps, output } => {
             let also = also_output

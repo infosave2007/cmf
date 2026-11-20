@@ -102,6 +102,8 @@ fn capture(o: &Hy4SfqOpts) -> anyhow::Result<()> {
     // appended window by window (the rows of a full capture outgrow a container)
     let mut files: std::collections::BTreeMap<usize, [std::io::BufWriter<std::fs::File>; 3]> = std::collections::BTreeMap::new();
     let mut top_k = 0usize;
+    // `CMF_HY4_CAP_NOX=1`: picks and weights only (a routing profile, no SFq rows)
+    let no_x = std::env::var("CMF_HY4_CAP_NOX").as_deref() == Ok("1");
     let mut sink = |cl: &cortiq_engine::hy4::CapLayer| -> Result<(), String> {
         use std::io::Write;
         let n = cl.x.len() / c.latent.max(1);
@@ -113,12 +115,20 @@ fn capture(o: &Hy4SfqOpts) -> anyhow::Result<()> {
             files.insert(cl.li, [open("x")?, open("picks")?, open("w")?]);
         }
         let f = files.get_mut(&cl.li).unwrap();
-        f[0].write_all(&le_u16(&cl.x)).map_err(|e| e.to_string())?;
+        if !no_x {
+            f[0].write_all(&le_u16(&cl.x)).map_err(|e| e.to_string())?;
+        }
         f[1].write_all(&le_u16(&cl.picks)).map_err(|e| e.to_string())?;
         f[2].write_all(&le_f32(&cl.w)).map_err(|e| e.to_string())?;
         Ok(())
     };
-    let ntok = cortiq_engine::hy4::capture(g, l, c, st, &windows, &mut sink).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+    let mut nlls: Vec<f32> = Vec::new();
+    let want_nll = std::env::var("CMF_HY4_CAP_NLL").as_deref() == Ok("1");
+    let ntok = cortiq_engine::hy4::capture(g, l, c, st, &windows, &mut sink, want_nll.then_some(&mut nlls)).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+    if want_nll {
+        anyhow::ensure!(nlls.len() == ntok, "the capture scored {} of {ntok} rows", nlls.len());
+        write_raw(&dir.join("nll.f32"), &le_f32(&nlls))?;
+    }
     let mut lis = Vec::new();
     for (li, fs) in files {
         for (f, ext) in fs.into_iter().zip(["x", "picks", "w"]) {

@@ -43,6 +43,79 @@ fn err(s: impl Into<String>) -> CmfError {
     CmfError::Parse(format!("hy_v4_flash: {}", s.into()))
 }
 
+/// `CMF_HY4_KEEP=FILE`: the routed experts of a cut without cutting the
+/// file — `{"<layer>": [kept expert ids], ...}`; every other expert of a
+/// listed layer gets a selection bias of -1e30, so no row ever picks it and
+/// the picks' weights renormalize over the kept ones, as in a `moe-defrag`
+/// cut of that set. Layers not listed keep all their experts.
+fn keep_mask(li: usize, mut bias: Vec<f32>) -> Vec<f32> {
+    static KEEP: std::sync::OnceLock<Option<std::collections::HashMap<usize, Vec<usize>>>> = std::sync::OnceLock::new();
+    let keep = KEEP.get_or_init(|| {
+        let path = std::env::var("CMF_HY4_KEEP").ok()?;
+        let text = std::fs::read_to_string(&path).map_err(|e| tracing::warn!("CMF_HY4_KEEP {path}: {e}")).ok()?;
+        let v: std::collections::HashMap<String, Vec<usize>> = serde_json::from_str(&text).map_err(|e| tracing::warn!("CMF_HY4_KEEP {path}: {e}")).ok()?;
+        let m: std::collections::HashMap<usize, Vec<usize>> = v.into_iter().filter_map(|(k, ids)| Some((k.parse().ok()?, ids))).collect();
+        tracing::info!("hy_v4_flash: CMF_HY4_KEEP masks {} layers' routed experts ({path})", m.len());
+        Some(m)
+    });
+    if let Some(ids) = keep.as_ref().and_then(|m| m.get(&li)) {
+        let mut on = vec![false; bias.len()];
+        for &e in ids {
+            if e < on.len() {
+                on[e] = true;
+            }
+        }
+        for (b, &o) in bias.iter_mut().zip(&on) {
+            if !o {
+                *b = -1e30;
+            }
+        }
+    }
+    bias
+}
+
+/// `CMF_HY4_ALIAS=FILE`: resonance substitutes (`cortiq hy4-alias`) —
+/// `{"<layer>": [source id of every expert]}`; expert `e` of a listed layer
+/// is loaded from expert `alias[e]`'s tensors, so the router keeps choosing
+/// among all experts with its own weights and a dropped expert's pick is
+/// computed by its substitute (the cut with an alias table, without cutting).
+fn alias_of(li: usize, e: usize) -> usize {
+    static ALIAS: std::sync::OnceLock<Option<std::collections::HashMap<usize, Vec<usize>>>> = std::sync::OnceLock::new();
+    let a = ALIAS.get_or_init(|| {
+        let path = std::env::var("CMF_HY4_ALIAS").ok()?;
+        let text = std::fs::read_to_string(&path).map_err(|e| tracing::warn!("CMF_HY4_ALIAS {path}: {e}")).ok()?;
+        let v: std::collections::HashMap<String, Vec<usize>> = serde_json::from_str(&text).map_err(|e| tracing::warn!("CMF_HY4_ALIAS {path}: {e}")).ok()?;
+        let m: std::collections::HashMap<usize, Vec<usize>> = v.into_iter().filter_map(|(k, ids)| Some((k.parse().ok()?, ids))).collect();
+        tracing::info!("hy_v4_flash: CMF_HY4_ALIAS maps {} layers' routed experts ({path})", m.len());
+        Some(m)
+    });
+    a.as_ref().and_then(|m| m.get(&li)).and_then(|v| v.get(e)).copied().unwrap_or(e)
+}
+
+/// `CMF_HY4_ABSENT=FILE`: `{"<layer>": [present expert ids]}` — the other
+/// experts of a listed layer are absent: the router still chooses its top-k
+/// among all of them with the full model's weights, and an absent pick adds
+/// nothing (its weight 0, the rest not renormalized). 1/0 per expert.
+fn absent_mask(li: usize, ne: usize) -> Option<Vec<f32>> {
+    static PRESENT: std::sync::OnceLock<Option<std::collections::HashMap<usize, Vec<usize>>>> = std::sync::OnceLock::new();
+    let m = PRESENT.get_or_init(|| {
+        let path = std::env::var("CMF_HY4_ABSENT").ok()?;
+        let text = std::fs::read_to_string(&path).map_err(|e| tracing::warn!("CMF_HY4_ABSENT {path}: {e}")).ok()?;
+        let v: std::collections::HashMap<String, Vec<usize>> = serde_json::from_str(&text).map_err(|e| tracing::warn!("CMF_HY4_ABSENT {path}: {e}")).ok()?;
+        let m: std::collections::HashMap<usize, Vec<usize>> = v.into_iter().filter_map(|(k, ids)| Some((k.parse().ok()?, ids))).collect();
+        tracing::info!("hy_v4_flash: CMF_HY4_ABSENT: {} layers' routed experts outside the list add nothing ({path})", m.len());
+        Some(m)
+    });
+    let ids = m.as_ref()?.get(&li)?;
+    let mut p = vec![0f32; ne];
+    for &e in ids {
+        if e < ne {
+            p[e] = 1.0;
+        }
+    }
+    Some(p)
+}
+
 fn f(model: &CmfModel, name: &str) -> Result<Vec<f32>, CmfError> {
     load_f32(model, name, &Overlay::None).map_err(err)
 }
@@ -191,6 +264,13 @@ pub struct Moe {
     pub out_norm: Vec<f32>,
     /// (gate, up, down) of every routed expert.
     pub experts: Vec<[QTensor; 3]>,
+    /// Per expert 1 present / 0 absent: an absent expert stays in the
+    /// router's choice and its pick's weight becomes 0 (no renormalization
+    /// over the rest). The graph reads the selection bias followed by it.
+    pub present: Option<Vec<f32>>,
+    pub bias_ext: Option<Vec<f32>>,
+    /// Experts the file lacks (absent, standing on another's tensors).
+    pub missing: Vec<bool>,
 }
 
 pub enum Ffn {
@@ -436,18 +516,43 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
                 out_norm: f(model, &format!("{m}post_fc2_norm.weight"))?,
             }
         } else {
+            // a `moe-defrag` cut with absent experts (CMF_DEFRAG_ABSENT) lacks
+            // their tensors: they stay in the router's choice, add nothing, and
+            // stand on the first present expert's tensors (never computed)
+            let has = |e: usize| model.tensor(&format!("{m}experts.{e}.gate_proj.weight")).is_some();
+            let first = (0..n_exp).map(|e| alias_of(li, e)).find(|&e| has(e)).ok_or_else(|| err(format!("layer {li}: no routed expert in the file")))?;
+            let mut missing = vec![false; n_exp];
             let mut experts = Vec::with_capacity(n_exp);
             for e in 0..n_exp {
-                let x = format!("{m}experts.{e}.");
+                let mut src = alias_of(li, e);
+                if !has(src) {
+                    missing[e] = true;
+                    src = first;
+                }
+                let x = format!("{m}experts.{src}.");
                 experts.push([
                     t(model, &format!("{x}gate_proj.weight"))?,
                     t(model, &format!("{x}up_proj.weight"))?,
                     t(model, &format!("{x}down_proj.weight"))?,
                 ]);
             }
+            let bias = keep_mask(li, f(model, &format!("{m}gate.e_score_correction_bias"))?);
+            let mut present = absent_mask(li, bias.len());
+            if missing.iter().any(|&v| v) {
+                let p = present.get_or_insert_with(|| vec![1.0; bias.len()]);
+                for (pv, &mi) in p.iter_mut().zip(&missing) {
+                    if mi {
+                        *pv = 0.0;
+                    }
+                }
+            }
+            let bias_ext = present.as_ref().map(|p| bias.iter().chain(p).copied().collect());
             Ffn::Moe(Moe {
                 router: f(model, &format!("{m}gate.weight"))?,
-                bias: f(model, &format!("{m}gate.e_score_correction_bias"))?,
+                bias,
+                present,
+                bias_ext,
+                missing,
                 down: t(model, &format!("{m}latent_down.weight"))?,
                 up: t(model, &format!("{m}latent_up.weight"))?,
                 shared: [
@@ -814,7 +919,7 @@ impl Moe {
         order.sort_unstable_by(|&a, &b| (scores[b] + self.bias[b]).partial_cmp(&(scores[a] + self.bias[a])).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
         order.truncate(cfg.top_k);
         let sum: f32 = order.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
-        order.into_iter().map(|e| (e, scores[e] / sum * cfg.route_scale)).collect()
+        order.into_iter().map(|e| (e, scores[e] / sum * cfg.route_scale * self.present.as_ref().map_or(1.0, |p| p[e]))).collect()
     }
 
     fn forward(&self, x: &[f32], cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
@@ -823,6 +928,9 @@ impl Moe {
         self.down.matvec(x, &mut lat, pool);
         let mut acc = vec![0f32; cfg.latent];
         for &(e, w) in &picks {
+            if w == 0.0 {
+                continue;
+            }
             let [g, u, d] = &self.experts[e];
             let y = dense(g, u, d, &lat, cfg.limit, pool);
             for (a, v) in acc.iter_mut().zip(&y) {
@@ -877,7 +985,7 @@ impl Moe {
         order.sort_unstable_by(|&a, &b| (scores[b] + self.bias[b]).partial_cmp(&(scores[a] + self.bias[a])).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
         order.truncate(cfg.top_k);
         let sum: f32 = order.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
-        order.into_iter().map(|e| (e, scores[e] / sum * cfg.route_scale)).collect()
+        order.into_iter().map(|e| (e, scores[e] / sum * cfg.route_scale * self.present.as_ref().map_or(1.0, |p| p[e]))).collect()
     }
 }
 
@@ -893,6 +1001,7 @@ pub fn capture(
     state: &mut State,
     windows: &[Vec<u32>],
     sink: &mut dyn FnMut(&CapLayer) -> Result<(), String>,
+    mut nll: Option<&mut Vec<f32>>,
 ) -> Result<usize, String> {
     let moe: Vec<usize> = layers.iter().enumerate().filter(|(_, l)| matches!(l.ffn, Ffn::Moe(_))).map(|(i, _)| i).collect();
     let ne = layers.iter().find_map(|l| match &l.ffn {
@@ -914,7 +1023,21 @@ pub fn capture(
         let mut ids = w.clone();
         ids.push(*w.last().unwrap());
         let mut lg = Vec::new();
-        let taken = forward_prompt(globals, layers, cfg, state, &ids, 0, None, &mut lg);
+        // with `nll`: the window's rows kept, every row's loss on its next token
+        // (the last row of a window has none: NaN), in the order of the picks
+        let taken = match nll.as_mut() {
+            Some(out) => {
+                let mut hrows = Vec::new();
+                let t = prompt_rows(globals, layers, cfg, state, w, 0, None, Some(&mut hrows));
+                if t == w.len() && hrows.len() == w.len() * cfg.dim {
+                    out.extend(row_nll(globals, cfg, &hrows, w));
+                    ids.len()
+                } else {
+                    t
+                }
+            }
+            None => forward_prompt(globals, layers, cfg, state, &ids, 0, None, &mut lg),
+        };
         let rows = crate::gpu::hy4_capture_take().ok_or("the capture lost its rows")?;
         if taken != ids.len() || rows.len() != moe.len() {
             return Err(format!("window {wi}: the card's prompt graph took {taken} of {} rows ({} routed FFNs captured)", ids.len(), rows.len()));
@@ -940,6 +1063,35 @@ pub fn capture(
     }
     state.reset(layers.len());
     Ok(done)
+}
+
+/// Every row's loss on the window's next token from the stack's rows
+/// (`hrows`, before the final norm); the last row NaN.
+fn row_nll(globals: &Globals, cfg: &Cfg, hrows: &[f32], w: &[u32]) -> Vec<f32> {
+    let (n, dim) = (w.len(), cfg.dim);
+    let vocab = globals.lm_head.rows();
+    let mut res = vec![f32::NAN; n];
+    const B: usize = 64;
+    let mut out = vec![0f32; B * vocab];
+    let mut xs = vec![0f32; B * dim];
+    let mut r0 = 0;
+    while r0 + 1 < n {
+        let b = B.min(n - 1 - r0);
+        for j in 0..b {
+            let x = rms_w(&hrows[(r0 + j) * dim..(r0 + j + 1) * dim], &globals.norm, cfg.eps);
+            xs[j * dim..(j + 1) * dim].copy_from_slice(&x);
+        }
+        globals.lm_head.matmat(&xs[..b * dim], b, &mut out[..b * vocab], None);
+        for j in 0..b {
+            let row = &out[j * vocab..(j + 1) * vocab];
+            let target = (w[r0 + j + 1] as usize).min(vocab - 1);
+            let best = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+            let den: f64 = row.iter().map(|&v| ((v as f64) - best).exp()).sum();
+            res[r0 + j] = (den.ln() - (row[target] as f64 - best)) as f32;
+        }
+        r0 += b;
+    }
+    res
 }
 
 /// Fold the streams with `pre`.
@@ -1095,10 +1247,16 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, eng
                 if !(gu_q2 || e0[0].mapped_q4tp().is_some()) || e0[2].mapped_q4tp().is_none() {
                     return None;
                 }
+                // absent experts: no tensors on the card (usize::MAX), which only
+                // the CUDA hybrid knows; elsewhere the layer stays on the host
+                if m.missing.iter().any(|&v| v) && !crate::gpu::cuda_active() {
+                    return None;
+                }
                 let experts = m
                     .experts
                     .iter()
-                    .map(|[g, u, d]| Some((g.model_idx()?, u.model_idx()?, d.model_idx()?)))
+                    .zip(&m.missing)
+                    .map(|([g, u, d], &mi)| if mi { Some((usize::MAX, usize::MAX, usize::MAX)) } else { Some((g.model_idx()?, u.model_idx()?, d.model_idx()?)) })
                     .collect::<Option<Vec<_>>>()?;
                 (
                     GraphFfn::Moe {
@@ -1115,7 +1273,7 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, eng
                         q82: false,
                         sigmoid: true,
                         sigmoid_denom_eps: 1e-20,
-                        bias: Some(&m.bias),
+                        bias: Some(m.bias_ext.as_deref().unwrap_or(&m.bias)),
                         has_shared: false,
                         detached_shared: Some(GraphMoeDetachedShared {
                             gate: gw(&m.shared[0])?,

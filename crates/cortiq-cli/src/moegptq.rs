@@ -2659,6 +2659,12 @@ fn swiglu_rows(x: &[f32], m: usize, hidden: usize, wg: &[f32], wu: &[f32], inter
         .collect()
 }
 
+/// [`swiglu_rows`] for the other passes (`hy4-alias --probe`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn swiglu_rows_pub(x: &[f32], m: usize, hidden: usize, wg: &[f32], wu: &[f32], inter: usize, limit: f32, threads: usize) -> Vec<f32> {
+    swiglu_rows(x, m, hidden, wg, wu, inter, limit, threads)
+}
+
 /// Expert output `swiglu(X·W_gᵀ, X·W_uᵀ)·W_dᵀ` of the rows `x` (`m × hidden`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expert_out(x: &[f32], m: usize, hidden: usize, wg: &[f32], wu: &[f32], wd: &[f32], inter: usize, limit: f32, threads: usize) -> Vec<f32> {

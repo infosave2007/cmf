@@ -2107,7 +2107,8 @@ __device__ __forceinline__ void moe_argmax(float& v, int& i)
 // are k warp-wide argmax shuffles; the union is laid out by one thread.
 // flags: bit0 renormalize the picked weights, bit1 sigmoid scores (else a
 // softmax), bit2 a selection bias on the sigmoid ranking key, bit5 the
-// sigmoid renormalization floor is 1e-20 (else 1e-6).
+// sigmoid renormalization floor is 1e-20 (else 1e-6), bit6 `bias` is 2E wide: the selection bias, then a
+// weight factor per expert applied after the renormalization (an absent expert's 0).
 extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const float* __restrict__ bias, int n, int E,
                                          int k, int flags, float route_scale, const HyJob* __restrict__ gu_t,
                                          const HyJob* __restrict__ dn_t, HyJob* __restrict__ gu_a,
@@ -2186,6 +2187,9 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
                 if (flags & 1) w = w / dn;
                 w *= route_scale;
                 const int e = pick[rr][j];
+                if ((flags & 64) && bias) w *= bias[E + e];
+                // an absent expert: no slot, nothing computed
+                if ((flags & 64) && w == 0.0f) continue;
                 int s = slot_of[e];
                 if (s < 0 && used < S) {
                     s = used++;
@@ -2413,9 +2417,23 @@ extern "C" __global__ void hy_moe_topk(const float* __restrict__ logits, const f
     }
     if (lane == 0) {
         const float dn = sigm ? tot + ((flags & 32) ? 1e-20f : 1e-6f) : tot;
+        // an absent expert's pick: weight 0 on the row's first present pick
+        // (the grouping needs a real expert; it adds nothing)
+        int fb = -1;
+        if ((flags & 64) && bias)
+            for (int j = 0; j < k; j++)
+                if (bias[E + pidx[(size_t)r * k + j]] != 0.0f) {
+                    fb = pidx[(size_t)r * k + j];
+                    break;
+                }
         for (int j = 0; j < k; j++) {
             float w = pwt[(size_t)r * k + j];
             if (flags & 1) w = w / dn;
+            if ((flags & 64) && bias) {
+                const float f = bias[E + pidx[(size_t)r * k + j]];
+                w *= f;
+                if (f == 0.0f && fb >= 0) pidx[(size_t)r * k + j] = fb;
+            }
             pwt[(size_t)r * k + j] = w * route_scale;
         }
     }

@@ -22,12 +22,13 @@ fn expert_parts(name: &str) -> Option<(usize, usize, &str)> {
     Some((li.parse().ok()?, e.parse().ok()?, rest))
 }
 
-/// "model.layers.L.mlp.expert_bias" → L (noaux_tc selection bias —
-/// one scalar per expert, sliced with the experts it scores).
+/// "model.layers.L.mlp.expert_bias" (or Hy4-flash's
+/// "model.layers.L.mlp.gate.e_score_correction_bias") → L (noaux_tc
+/// selection bias — one scalar per expert, sliced with the experts it scores).
 fn expert_bias_layer(name: &str) -> Option<usize> {
     let t = name.strip_prefix("model.layers.")?;
     let (li, t) = t.split_once('.')?;
-    (t == "mlp.expert_bias").then(|| li.parse().ok())?
+    (t == "mlp.expert_bias" || t == "mlp.gate.e_score_correction_bias").then(|| li.parse().ok())?
 }
 
 /// "model.layers.L.mlp.gate.weight" → L.
@@ -454,6 +455,13 @@ pub fn cmd_moe_defrag_with(
         bail!("no usable layer stats in {stats_origin}");
     }
 
+    // `CMF_DEFRAG_ABSENT=1`: the dropped experts are left out and the rest
+    // keep their numbers; the router and the selection bias stay whole, so
+    // the router still chooses among all experts and a stack that knows
+    // absent experts (Hy4-flash) adds nothing for a pick of a missing one
+    // (no renormalization over the rest). The architecture's expert count
+    // stays the router's.
+    let absent = std::env::var("CMF_DEFRAG_ABSENT").as_deref() == Ok("1");
     // Pass 1: gather each masked layer's router rows into owned buffers
     // (small: kept×hidden f32); experts borrow the source mmap directly.
     let mut routers: HashMap<usize, (Vec<u8>, Vec<usize>)> = HashMap::new(); // tensor idx → (data, shape)
@@ -469,6 +477,9 @@ pub fn cmd_moe_defrag_with(
             continue;
         };
         let Some(map) = remap.get(&li) else { continue };
+        if absent {
+            continue;
+        }
         let elem = match entry.dtype {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
@@ -519,6 +530,7 @@ pub fn cmd_moe_defrag_with(
                 match map.get(&e) {
                     Some(&new) => {
                         kept_experts += 1;
+                        let new = if absent { e } else { new };
                         specs.push(TensorSpecRef {
                             name: format!("model.layers.{li}.mlp.experts.{new}.{rest}"),
                             dtype: entry.dtype,
@@ -540,6 +552,34 @@ pub fn cmd_moe_defrag_with(
     }
     if dropped == 0 {
         bail!("nothing to drop — check the stats file / --cover");
+    }
+    // `CMF_DEFRAG_PUNCH=1` (Linux): the dropped experts' bytes are released
+    // from the SOURCE file before the cut is written (holes, the file keeps
+    // its size), so a disk that cannot hold the source and the cut together
+    // holds them. The source loses those experts for good.
+    #[cfg(target_os = "linux")]
+    if std::env::var("CMF_DEFRAG_PUNCH").as_deref() == Ok("1") {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new().write(true).open(model_path).with_context(|| format!("{model_path}: open to release the dropped experts"))?;
+        let mut freed = 0u64;
+        for entry in &model.tensors {
+            let Some((li, e, _)) = expert_parts(&entry.name) else { continue };
+            let Some(map) = remap.get(&li) else { continue };
+            if map.contains_key(&e) {
+                continue;
+            }
+            let Some(off) = model.entry_abs_offset(entry) else { continue };
+            // whole 4 KiB pages inside the tensor only: its neighbours stay intact
+            let (s, end) = ((off as u64).div_ceil(4096) * 4096, (off as u64 + entry.nbytes) / 4096 * 4096);
+            if end > s {
+                let rc = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, s as libc::off_t, (end - s) as libc::off_t) };
+                if rc != 0 {
+                    bail!("{model_path}: releasing {} failed: {}", entry.name, std::io::Error::last_os_error());
+                }
+                freed += end - s;
+            }
+        }
+        eprintln!("moe-defrag: released {:.1} GB of dropped experts from {model_path}", freed as f64 / 1e9);
     }
     let mut merged_n = 0usize;
     if let Some(m) = merged.as_ref() {
@@ -622,12 +662,34 @@ pub fn cmd_moe_defrag_with(
     if !kept_ids.is_empty() {
         prov["kept_ids"] = serde_json::Value::Object(kept_ids);
     }
+    if absent {
+        prov["absent"] = serde_json::json!(true);
+    }
     match header.provenance.as_mut() {
         Some(serde_json::Value::Object(map)) => {
             map.insert("moe_defrag".into(), prov);
         }
         _ => {
             header.provenance = Some(serde_json::json!({ "moe_defrag": prov }));
+        }
+    }
+    // Every MoE layer cut to one count: the architecture says so (stacks
+    // that size their layers from `arch.moe.num_experts`, Hy4-flash's, read
+    // it; the others count the tensors)
+    let counts: std::collections::BTreeSet<usize> = remap.values().map(|m| m.len()).collect();
+    if let (Some(moe), true, false) = (header.arch.moe.as_mut(), counts.len() == 1, absent) {
+        let n = *counts.iter().next().unwrap_or(&moe.num_experts);
+        if remap.len() == header.arch.num_layers || model.tensors.iter().filter_map(|e| router_layer(&e.name)).all(|li| remap.contains_key(&li)) {
+            moe.num_experts = n;
+            if let Some(tc) = header.provenance.as_mut().and_then(|p| p.get_mut("hy4_flash")).and_then(|h| h.get_mut("text_config")) {
+                if let Some(o) = tc.as_object_mut() {
+                    for k in ["num_experts", "n_routed_experts"] {
+                        if o.contains_key(k) {
+                            o.insert(k.into(), serde_json::json!(n));
+                        }
+                    }
+                }
+            }
         }
     }
 

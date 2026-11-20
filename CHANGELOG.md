@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-11-20
+
+### Added
+- Hy4-flash cuts with absent experts: `CMF_DEFRAG_ABSENT=1 cortiq moe-defrag --keep N` leaves the dropped experts
+  out of the file while the router and its selection bias stay whole and the kept experts keep their numbers. The
+  engine treats an expert the file lacks as absent: the router still chooses its 16 of all 512 with the full
+  model's weights, and a pick of an absent expert adds nothing (no renormalization over the rest). On the CUDA
+  hybrid an absent expert is an empty job: `hy_moe_select` gives it no slot and `hy_moe_topk` moves its pick onto a
+  present one with weight 0 (the selection bias buffer carries a weight factor per expert); other backends run
+  such a file on the host. Hy4-flash's experts do not stand in for each other, so this beats a plain cut: 256 of
+  512 experts a layer kept by their energy Σ (weight · ‖output‖)² on code, perplexity on fresh code 8.97 (the full
+  model 8.42, a plain cut of the same experts 9.75), HumanEval 93.3 % (93.9 %); an RTX PRO 6000 within 24 / 16 GB
+  decodes 30.6 / 26.2 tok/s (the full model 11.9 / 8.9 on the same host). Published as
+  `infosave/Hy4-flash-Fast-Code-cmf`.
+- Hy4-flash research switches: `CMF_HY4_KEEP=FILE` masks the routed experts to a kept list (a plain cut's
+  selection on the full file), `CMF_HY4_ABSENT=FILE` makes the others absent, `CMF_HY4_ALIAS=FILE` serves an
+  expert from another's tensors; the routing capture scores every token (`CMF_HY4_CAP_NLL=1`, `nll.f32`) and can
+  skip the latent rows (`CMF_HY4_CAP_NOX=1`).
+- `cortiq hy4-alias`: resonance substitutes for a cut's dropped experts (the kept expert that reconstructs a
+  dropped one's output best on its own inputs), `--probe` (a routed FFN's output error of dropping experts against
+  keeping half of every expert's neurons), `--ghost` (least-squares linear stand-ins for the dropped experts) and
+  `--dump` (a layer's experts decoded to f16 for offline studies).
+- `moe-defrag`: Hy4-flash's selection bias is cut with the router, a cut that keeps one count in every layer writes
+  it into the architecture, and `CMF_DEFRAG_PUNCH=1` (Linux) releases the dropped experts from the source first so
+  a disk that cannot hold both holds them.
+- Embryo CUDA trainer on an A100: 16-column WY chains, opt-in TF32 cuBLAS for the anchor and small batched GEMMs.
+
+### Fixed
+- wgpu: top-16 routing over 256 experts takes the wide select.
+
 ## [0.9.6] — 2026-11-19
 
 ### Added
