@@ -1303,6 +1303,24 @@ fn dsa_mirror_bytes(layers: &[GraphLayer]) -> usize {
         .sum()
 }
 
+/// The mirrors of a stack's block-routed layers (Maxwell) at `rows`
+/// positions, with a mirror's slack: f16 keys and values of every KV group
+/// and the f16 index key, a row a position. Every position stays on the
+/// card (100 KB a token over 45 layers), so the plan's reserve holds the
+/// context's rows beside the slots: at the plain eighth of the card a 24 GB
+/// card filled with the experts sent a prompt of a few thousand tokens to
+/// the host.
+fn route_mirror_bytes(layers: &[GraphLayer], rows: usize) -> usize {
+    let rows = rows + (rows / 8).max(256);
+    layers
+        .iter()
+        .map(|l| match &l.attn {
+            GraphAttn::Full { geom: Some(g), .. } if g.route.is_some() => rows * (2 * g.nkv * g.hd + g.hd) * 2,
+            _ => 0,
+        })
+        .sum()
+}
+
 fn card_reserve() -> usize {
     if let Some(mb) = std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return mb << 20;
@@ -4962,6 +4980,11 @@ fn build(
         // matrices and the attention staying on the card.
         let free = super::card_free();
         let mut reserve = card_reserve() + dsa_mirror_bytes(layers);
+        // a block-routed stack keeps every position: the rows of the context
+        // cap (`CMF_MAX_SEQ`, 32 768) beside the slots
+        if std::env::var("CMF_HYB_RESERVE_MB").is_err() {
+            reserve += route_mirror_bytes(layers, crate::gpu::context_cap(model));
+        }
         // Hy4-flash's long prompt calls (2048 rows a chunk on a card of 32 GB
         // and more, `hy4::prompt_rows`) and the layer-major rows beside them:
         // at the plain reserve an A40's 2048-row call failed an allocation

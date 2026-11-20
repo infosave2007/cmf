@@ -2160,6 +2160,14 @@ impl GraphBlockRoute<'_> {
     }
 }
 
+/// Positions a sequence may reach: `CMF_MAX_SEQ`, else 32 768, within the
+/// model's own limit (the loader's cap, for the code that sizes device
+/// memory by it).
+pub fn context_cap(model: &CmfModel) -> usize {
+    let cap = std::env::var("CMF_MAX_SEQ").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32_768);
+    model.header.arch.max_position_embeddings.min(cap).max(1)
+}
+
 /// Whether the active backend's graphs carry the block router
 /// (`GraphBlockRoute`) past the dense range: the CUDA hybrid does
 /// (`CMF_BLOCK_ROUTE=0`: the host takes such a sequence over).

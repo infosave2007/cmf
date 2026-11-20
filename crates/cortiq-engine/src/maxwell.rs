@@ -766,9 +766,8 @@ pub fn forward_prompt(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mu
 }
 
 /// `ids` from `start` on through the card's prompt graph, a chunk a call
-/// (`CMF_MAXWELL_PROMPT_CHUNK`, 512; never across a block's edge once the
-/// rows are routed: a chunk's rows may only pick blocks closed before it);
-/// with `keep`, every row's hidden state after the stack (the head's fold,
+/// (`CMF_MAXWELL_PROMPT_CHUNK`, 512; halved down to 16 when the card
+/// declines a chunk); with `keep`, every row's hidden state after the stack (the head's fold,
 /// before the final norm) appended to it. Returns the rows the card took.
 #[allow(clippy::too_many_arguments)]
 fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], start: usize, pool: Option<&Pool>, mut keep: Option<&mut Vec<f32>>) -> usize {
@@ -785,7 +784,7 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
     let model = globals.model.clone();
     let inter = graph_inter(layers);
     let dim = cfg.dim;
-    let chunk = std::env::var("CMF_MAXWELL_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(512).max(1);
+    let mut chunk = std::env::var("CMF_MAXWELL_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(512).max(1);
     let body = ids.len();
     let mut done = 0usize;
     let timing = std::env::var_os("CMF_CUDA_PROF").is_some();
@@ -822,6 +821,12 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
                 }
             }
             BatchGraphOutcome::Declined => {
+                // a chunk's rows may not fit beside the weights (a card whose budget the
+                // experts fill): fewer rows a call before the rows go a token at a time
+                if chunk > 16 {
+                    chunk = (chunk / 2).max(16);
+                    continue;
+                }
                 if done > 0 || state.graph == Some(true) {
                     // the card holds the rows before this chunk: the host takes them over
                     host_replay(globals, layers, cfg, state, pool);
