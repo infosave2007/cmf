@@ -2855,7 +2855,8 @@ fn ram_tier(model: &CmfModel, experts: &[(usize, usize, usize)], cap: usize) -> 
     let raw = |i: usize| model.tensors.get(i).map_or(0, |t| (t.nbytes as usize).next_multiple_of(256));
     // room for the card's built layout too (its rung codes a byte each, the
     // ladders in f32, the planes aligned): `packed`
-    let widest = experts.iter().map(|&(g, u, d)| raw(g) + raw(u) + raw(d)).max()?;
+    // absent experts (`usize::MAX`, a Hy4-flash cut) have no bytes
+    let widest = experts.iter().filter(|x| x.0 != usize::MAX).map(|&(g, u, d)| raw(g) + raw(u) + raw(d)).max()?;
     let slot = (widest + widest / 16 + 65536).next_multiple_of(4096);
     // `cap` bytes of raw experts: as many slots as experts that size; all
     // of them when they fit three quarters of the room (the system-memory
@@ -3074,7 +3075,7 @@ impl ExpertStream {
         for li in 0..self.layers.len() {
             self.tick += 1;
             let want: Vec<(usize, (usize, usize, usize))> =
-                self.layers[li].experts.iter().copied().enumerate().filter(|&(e, _)| self.layers[li].fixed[e].is_none()).collect();
+                self.layers[li].experts.iter().copied().enumerate().filter(|&(e, x)| self.layers[li].fixed[e].is_none() && x.0 != usize::MAX).collect();
             let tick = self.tick;
             if let Some(r) = self.ram.as_mut() {
                 r.fill_many(&self.model, li, &want, tick);
@@ -4763,7 +4764,7 @@ fn build(
                 vec![(gw.idx, uw.idx, dw.idx, rows_of(model, gw).unwrap_or(0))]
             }
             GraphFfn::Moe { experts, inter, n_exp, detached_shared, .. } => {
-                let mut v: Vec<_> = experts[..*n_exp].iter().map(|&(g, u, d)| (g, u, d, *inter)).collect();
+                let mut v: Vec<_> = experts[..*n_exp].iter().filter(|x| x.0 != usize::MAX).map(|&(g, u, d)| (g, u, d, *inter)).collect();
                 match detached_shared {
                     Some(d) => v.push((d.gate.idx, d.up.idx, d.down.idx, d.width)),
                     None if experts.len() > *n_exp => {
@@ -5069,6 +5070,12 @@ fn build(
                 EXPERT_MAT.with(|x| x.set(true));
                 let built = (|| -> Res<()> {
                     for &(g, u, d) in experts[..e].iter().filter(|_| !streamed) {
+                        // an absent expert: an empty job, never picked
+                        if g == usize::MAX {
+                            gu_t.push(job_zero());
+                            dn_t.push(job_zero());
+                            continue;
+                        }
                         let pm = hmat_pair(c, st, model, &gw6(g), &gw6(u), inter, ehid)?;
                         let dmx = hmat(c, st, model, &gw6(d), ehid, inter)?;
                         gu_t.push(HyJob { lim: oai_lim, ..job(&pm, 2 * inter, pm.kind as i32 | 0x100 | oai_bit) });
@@ -5089,6 +5096,9 @@ fn build(
                     EXPERT_MAT.with(|x| x.set(true));
                     let placed = (|| -> Res<()> {
                         for (ei, &(g, u, d)) in experts[..e].iter().enumerate() {
+                            if g == usize::MAX {
+                                continue;
+                            }
                             let b = card_bytes(model, g, 2 * inter, ehid) + card_bytes(model, d, ehid, inter) + 1024;
                             let (_, hcap, hused) = ARENA_HOST.with(|x| x.get());
                             if used + b > host_quota || hused + b > hcap {
@@ -5127,28 +5137,33 @@ fn build(
                 let dmx = hmat(c, st, model, &gw6(sd_), hidden, sh)?;
                 let routerm = st.mat(c, model, router, e, hidden)?;
                 let sgw = if gated { Some(st.mat(c, model, shared_gate, 1, hidden)?) } else { None };
+                // `2e` wide: the selection bias, then a weight factor per expert (an absent expert's 0)
                 let biasb = match bias {
-                    Some(b) if b.len() == e => {
+                    Some(b) if b.len() == e || b.len() == 2 * e => {
                         note(b);
                         Some(st.f32_buf(b)?)
                     }
                     Some(_) => return Err(format!("layer {li}: a selection bias of the wrong width")),
                     None => None,
                 };
-                let flags = (*norm_topk as i32) | ((*sigmoid as i32) << 1) | ((biasb.is_some() as i32) << 2) | (((*sigmoid && *sigmoid_denom_eps < 1e-10) as i32) << 5);
+                let wfac = bias.is_some_and(|b| b.len() == 2 * e);
+                let flags = (*norm_topk as i32) | ((*sigmoid as i32) << 1) | ((biasb.is_some() as i32) << 2) | (((*sigmoid && *sigmoid_denom_eps < 1e-10) as i32) << 5) | ((wfac as i32) << 6);
+                // the absent experts' empty jobs (rows 0) do not count
                 let one_kd = |t: &[HyJob]| {
-                    let d = t.first().and_then(|j| kd_of(j.kind & 0xFF))?;
-                    t.iter().all(|j| kd_of(j.kind & 0xFF) == Some(d)).then_some(d)
+                    let d = t.iter().find(|j| j.rows != 0).and_then(|j| kd_of(j.kind & 0xFF))?;
+                    t.iter().filter(|j| j.rows != 0).all(|j| kd_of(j.kind & 0xFF) == Some(d)).then_some(d)
                 };
                 let kd = if streamed { (None, None) } else { (one_kd(&gu_t), one_kd(&dn_t)) };
                 let gu_tb = Buf::from_slice(&gu_t)?;
                 let dn_tb = Buf::from_slice(&dn_t)?;
+                // the layer's key in the stream: its first present expert
+                let key = experts[..e].iter().find(|x| x.0 != usize::MAX).map_or(experts[0].0, |x| x.0);
                 let stream = match &stream_plan {
                     // another plan's stream: this plan's tables join its layer
                     Some((_, _, cell, true)) => {
                         let mut g = cell.lock().map_err(|_| "expert stream poisoned")?;
                         let es = g.as_mut().ok_or("expert stream not filled")?;
-                        let sl = *es.index.get(&experts[0].0).ok_or("expert stream: a layer it does not hold")?;
+                        let sl = *es.index.get(&key).ok_or("expert stream: a layer it does not hold")?;
                         es.register(sl, gu_tb.ptr, dn_tb.ptr)?;
                         Some((sl, cell.clone()))
                     }
@@ -5163,7 +5178,7 @@ fn build(
                             slot_of: vec![None; e],
                             fixed: fixed.clone(),
                         });
-                        stream_keys.push(experts[0].0);
+                        stream_keys.push(key);
                         Some((stream_layers.len() - 1, cell.clone()))
                     }
                     None => None,
@@ -5847,9 +5862,11 @@ fn build(
                 es.tick += 1;
                 // a host-tier expert's jobs give the markers' kinds; else
                 // the first expert built into a slot
+                // (a present expert: a Hy4-flash cut's absent ones have no tensors)
+                let e0 = es.layers[li].experts.iter().position(|x| x.0 != usize::MAX).unwrap_or(0);
                 let (gj, dj) = match es.layers[li].fixed.iter().flatten().next() {
                     Some(&j) => j,
-                    None => es.ensure(c, &fx, li, 0)?,
+                    None => es.ensure(c, &fx, li, e0)?,
                 };
                 let unweighted = |j: HyJob| HyJob { w: 0, aux0: 0, aux1: 0, ..j };
                 es.layers[li].marker = (unweighted(gj), unweighted(dj));

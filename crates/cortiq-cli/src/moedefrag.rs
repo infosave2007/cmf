@@ -455,6 +455,13 @@ pub fn cmd_moe_defrag_with(
         bail!("no usable layer stats in {stats_origin}");
     }
 
+    // `CMF_DEFRAG_ABSENT=1`: the dropped experts are left out and the rest
+    // keep their numbers; the router and the selection bias stay whole, so
+    // the router still chooses among all experts and a stack that knows
+    // absent experts (Hy4-flash) adds nothing for a pick of a missing one
+    // (no renormalization over the rest). The architecture's expert count
+    // stays the router's.
+    let absent = std::env::var("CMF_DEFRAG_ABSENT").as_deref() == Ok("1");
     // Pass 1: gather each masked layer's router rows into owned buffers
     // (small: kept×hidden f32); experts borrow the source mmap directly.
     let mut routers: HashMap<usize, (Vec<u8>, Vec<usize>)> = HashMap::new(); // tensor idx → (data, shape)
@@ -470,6 +477,9 @@ pub fn cmd_moe_defrag_with(
             continue;
         };
         let Some(map) = remap.get(&li) else { continue };
+        if absent {
+            continue;
+        }
         let elem = match entry.dtype {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
@@ -520,6 +530,7 @@ pub fn cmd_moe_defrag_with(
                 match map.get(&e) {
                     Some(&new) => {
                         kept_experts += 1;
+                        let new = if absent { e } else { new };
                         specs.push(TensorSpecRef {
                             name: format!("model.layers.{li}.mlp.experts.{new}.{rest}"),
                             dtype: entry.dtype,
@@ -651,6 +662,9 @@ pub fn cmd_moe_defrag_with(
     if !kept_ids.is_empty() {
         prov["kept_ids"] = serde_json::Value::Object(kept_ids);
     }
+    if absent {
+        prov["absent"] = serde_json::json!(true);
+    }
     match header.provenance.as_mut() {
         Some(serde_json::Value::Object(map)) => {
             map.insert("moe_defrag".into(), prov);
@@ -663,7 +677,7 @@ pub fn cmd_moe_defrag_with(
     // that size their layers from `arch.moe.num_experts`, Hy4-flash's, read
     // it; the others count the tensors)
     let counts: std::collections::BTreeSet<usize> = remap.values().map(|m| m.len()).collect();
-    if let (Some(moe), true) = (header.arch.moe.as_mut(), counts.len() == 1) {
+    if let (Some(moe), true, false) = (header.arch.moe.as_mut(), counts.len() == 1, absent) {
         let n = *counts.iter().next().unwrap_or(&moe.num_experts);
         if remap.len() == header.arch.num_layers || model.tensors.iter().filter_map(|e| router_layer(&e.name)).all(|li| remap.contains_key(&li)) {
             moe.num_experts = n;
