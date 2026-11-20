@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-11-20
+
 ### Added
 - microsoft/Aion-1.0-Instruct-2.3B (`aion_instruct`) converts natively: GQA with per-head q/k RMSNorm, 21 sliding
   layers (window 2048) on plain RoPE and 7 full layers on YaRN ×16, keyed by layer type as Mellum's

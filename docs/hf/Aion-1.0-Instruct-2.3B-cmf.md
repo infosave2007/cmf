@@ -40,14 +40,14 @@ prompt in 0.33 s.
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-cmf Aion-1.0-Instruct-2.3B-q8_2f.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-q8_2f.cmf --prompt "Summarize in three bullet points: ..."
 ```
 
-The files need the cortiq release after 0.9.8 (it renders the model's chat template and parses its tool calls);
-until it is out, build from the branch above. Add `--features cuda` to the install for the CUDA backend
-(`CMF_GPU=cuda`).
+Use cortiq 0.9.9 or later (it renders the model's chat template and parses its tool calls); prebuilt binaries for
+Linux, macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases). Add `--features cuda` to the install for the CUDA
+backend (`CMF_GPU=cuda`).
 
 ## Files
 
@@ -174,13 +174,13 @@ Python и ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, A
 ### Быстрый старт
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-cmf Aion-1.0-Instruct-2.3B-q8_2f.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-q8_2f.cmf --prompt "Сделай краткую сводку в трёх пунктах: ..."
 ```
 
-Файлам нужен релиз cortiq после 0.9.8 (в нём шаблон чата модели и разбор её вызовов инструментов); до выхода —
-сборка из ветки выше. Для бэкенда CUDA добавьте `--features cuda` и запускайте с `CMF_GPU=cuda`.
+Нужен cortiq 0.9.9 или новее (в нём шаблон чата модели и разбор её вызовов инструментов); готовые сборки — на
+[странице релизов](https://github.com/infosave2007/cmf/releases). Для бэкенда CUDA добавьте `--features cuda` и запускайте с `CMF_GPU=cuda`.
 
 ### Файлы
 
@@ -302,12 +302,12 @@ Intel 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在 CPU 上运行�
 ### 快速开始
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-cmf Aion-1.0-Instruct-2.3B-q8_2f.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-q8_2f.cmf --prompt "用三个要点总结：..."
 ```
 
-需要 0.9.8 之后的 cortiq 版本（它能渲染模型的对话模板并解析其工具调用）；发布前请从上面的分支构建。CUDA 后端
+需要 cortiq 0.9.9 或更新版本（它能渲染模型的对话模板并解析其工具调用）；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。CUDA 后端
 需在安装时加 `--features cuda`，并以 `CMF_GPU=cuda` 运行。
 
 ### 文件

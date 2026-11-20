@@ -46,14 +46,13 @@ no ML framework. Prompts under 8192 tokens run exact attention, as in the
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-turbo.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-With CUDA: `cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli --features cuda`, then
-`CMF_GPU=cuda cortiq run …`. The file needs the cortiq release after 0.9.8; until it is out, build from the branch
-above.
+With CUDA: `cargo install cortiq-cli --features cuda`, then `CMF_GPU=cuda cortiq run …`. Use cortiq 0.9.9 or
+later; prebuilt binaries are on the [releases page](https://github.com/infosave2007/cmf/releases).
 
 ## What the file does
 
@@ -153,13 +152,13 @@ Weights: [MIT](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B/blob/main
 ### Быстрый старт
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-turbo.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-С CUDA: установка с `--features cuda`, запуск с `CMF_GPU=cuda`. Нужен релиз cortiq после 0.9.8; до выхода —
-сборка из ветки выше.
+С CUDA: установка с `--features cuda`, запуск с `CMF_GPU=cuda`. Нужен cortiq 0.9.9 или новее; готовые сборки — на
+[странице релизов](https://github.com/infosave2007/cmf/releases).
 
 ### Что делает файл
 
@@ -252,12 +251,12 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ### 快速开始
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch aion cortiq-cli
+cargo install cortiq-cli
 hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-turbo.cmf --local-dir .
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 0.9.8 之后的 cortiq 版本；发布前请从上面的分支构建。
+CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 cortiq 0.9.9 或更新版本；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。
 
 ### 原理
 
