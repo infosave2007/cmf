@@ -6049,8 +6049,10 @@ impl Pipeline {
     /// either graph the whole way, so the two can be compared row for row.
     #[cfg(not(target_os = "macos"))]
     fn o1_whole_prompt(&self) -> bool {
-        if std::env::var("CMF_O1_WHOLE").as_deref() == Ok("1") {
-            return true;
+        match std::env::var("CMF_O1_WHOLE").as_deref() {
+            Ok("1") => return true,
+            Ok("0") => return false,
+            _ => {}
         }
         crate::gpu::cuda_active() && (self.graph_gdn_layer_count() == 0 || std::env::var("CMF_O1_CHUNKS").as_deref() == Ok("0"))
     }

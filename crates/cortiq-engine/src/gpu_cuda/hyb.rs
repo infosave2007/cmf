@@ -6197,10 +6197,12 @@ fn admit(
                 // (the layer's own head geometry)
                 let row = a.nkv * a.hd / 2;
                 let fresh_half = !st.hyb.half.contains(&key);
-                // Hy4-flash's sliding layers keep only their window on the card
-                // (`CMF_HY4_MIRROR_WIN=0`: the whole history kept, the window
-                // applied by the attention alone)
-                let win = if a.ogate && std::env::var("CMF_HY4_MIRROR_WIN").as_deref() != Ok("0") { a.window.unwrap_or(0) } else { 0 };
+                // A sliding layer keeps only its window on the card (Hy4-flash
+                // first; every sliding stack since: Aion's 21 window layers held
+                // a 32k prompt whole, 2.7 GB of an L4 for rows no query reads).
+                // `CMF_HY4_MIRROR_WIN=0`: the whole history kept, the window
+                // applied by the attention alone.
+                let win = if std::env::var("CMF_HY4_MIRROR_WIN").as_deref() != Ok("0") { a.window.unwrap_or(0) } else { 0 };
                 let m = st.kv.entry(key).or_insert_with(|| KvMirror::new(row, win));
                 if m.row != row || m.window != win || fresh_half {
                     let _ = c.sync();

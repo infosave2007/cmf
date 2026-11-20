@@ -8,14 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- microsoft/Aion-1.0-Instruct-2.3B (`aion_instruct`) converts natively: GQA with per-head q/k RMSNorm, 20 sliding
-  layers (window 2048) on plain RoPE and 8 full layers on YaRN ×16, keyed by layer type as Mellum's
+- microsoft/Aion-1.0-Instruct-2.3B (`aion_instruct`) converts natively: GQA with per-head q/k RMSNorm, 21 sliding
+  layers (window 2048) on plain RoPE and 7 full layers on YaRN ×16, keyed by layer type as Mellum's
   `rope_parameters`. Perplexity of the q8_2f file against Transformers bf16 on the same windows: WikiText-2 14.251
   (14.239), 4 × 4096 tokens 9.469 (9.464), Rust 7.661 (7.657), Python 7.263 (7.264).
 - Chat templates may call `strftime_now(fmt)` (transformers' clock helper: Aion, Llama 3.x); before, such a
   template failed to render and the prompt fell back to ChatML.
 
 ### Changed
+- CUDA hybrid arm: every sliding-window layer keeps only its window on the card (Hy4-flash's gated layers did
+  before; others kept the whole history and read it). Aion-2.3B q4tp on a Colab L4: card memory at a 16k / 30k
+  prompt 4.33 / 6.15 → 2.98 / 3.63 GB, decode after it 73.0 / 52.6 → 94.8 / 79.0 tok/s; q8_2f at 16k 56.3 → 68.8;
+  perplexity over 4 × 4096 tokens unchanged (9.469). `CMF_HY4_MIRROR_WIN=0` keeps the whole history.
+- wgpu batch prompt: a file whose dense FFN is 8-bit reads its q8_2f matrices from 1024 rows on the matrix units
+  (4096 before; four-bit files keep 4096, `CMF_Q82_COOP_ROWS` overrides). Aion-2.3B q8_2f on an L4: first token of
+  2k / 8k / 16k 4.73 / 20.8 / 43.3 → 1.25 / 6.39 / 15.5 s, perplexity unchanged (14.251).
 - `quantize-gptq` / `quantize-moe` on a CUDA build: a Hessian fold at least 1024 wide runs its O(n³) algebra (two
   Cholesky factors and the inverse, f64) on cuBLAS — host 256² diagonal blocks, `dtrsm` panels, `dsyrk` updates.
   Aion's q4tp with channel scale and code refinement (28 folds 8192 wide): 1919 → 628 s on a Colab L4;

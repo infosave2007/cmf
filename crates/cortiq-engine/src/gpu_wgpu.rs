@@ -38156,12 +38156,15 @@ pub fn forward_batch_graph_at(
         && (BATCH_Q82_MM.with(|f| f.get()) || std::env::var("CMF_Q82_MM").as_deref() == Ok("1"))
         && std::env::var("CMF_Q82_MM").as_deref() != Ok("0");
     // Rows from which a prompt chunk's q8_2f matrix takes the matrix units
-    // (`CMF_Q82_COOP_ROWS`, default 4096).
+    // (`CMF_Q82_COOP_ROWS`). A four-bit file keeps 4096: its few 8-bit
+    // matrices (1024-row K/V) sit in L2 for the eight-row matvec. A file
+    // whose dense FFN is 8-bit reads every matrix through the matvec at
+    // 1024: Aion-2.3B q8_2f on an L4, 2k prompt 4.73 → 1.24 s, 8k 20.8 → 6.4 s.
+    let q8_trunk = lws.iter().any(|lw| matches!(&lw.ffn, BFfn::Dense { gate, .. } if gate.kind == 7));
     let q82_coop_rows = {
-        static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *R.get_or_init(|| {
-            std::env::var("CMF_Q82_COOP_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
-        })
+        static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        R.get_or_init(|| std::env::var("CMF_Q82_COOP_ROWS").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(if q8_trunk { 1024 } else { 4096 })
     };
     let q82mm_p = g4p.or_else(|| (preview.is_some() || q82_prompt).then(|| gemma_batch::pipes(c)).flatten());
     // Prompt chunks only: no preview, no speculative verify.
