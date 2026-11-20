@@ -18,7 +18,8 @@ baseline is the NVG method.
 | CPU kernels (table matvec, GEMM matmat) | `crates/cortiq-engine/src/blr.rs`, `QTensor::Blr` in `qtensor.rs` |
 | wgpu kernels | `crates/cortiq-engine/src/gpu_wgpu/blr.rs`, `gpu::blr_matmat` |
 | encoders, `convert --quant blr` | `crates/cortiq-cli/src/nvg.rs`, `nvg_linalg.rs` (CPU f64 reference) |
-| NVG encoder on the device | `crates/cortiq-cli/src/nvg_gpu.rs` over `crates/cortiq-engine/src/gpu_wgpu/nvg_dev.rs` |
+| NVG encoder on the device | `crates/cortiq-cli/src/nvg_gpu.rs` over `crates/cortiq-engine/src/nvg_dev.rs` → `gpu_wgpu/nvg_dev.rs`, or `gpu_cuda/nvg_dev.rs` under `CMF_GPU=cuda` (§8) |
+| NVG Ť, the distillation trainer | `crates/cortiq-cli/src/nvgtrain.rs` over `crates/cortiq-engine/src/nvg_train.rs` (wgpu) or `gpu_cuda/nvgt.rs` (CUDA, §8) |
 | per-tensor / per-layer bench | `crates/cortiq-cli/src/nvgbench.rs` (`cortiq nvg-bench`) |
 
 ## 1. Bits and rank
@@ -199,7 +200,7 @@ MoE experts are not covered (they stay `q8_2f`); GDN `in_proj_a/b` stay f16.
 ```
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 \
     --blr-method nvg --calib calib.txt [--blr-paths auto|1|2] [--blr-kv-factor 1] \
-    [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] \
+    [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] [--blr-channel-scale ALPHA] \
     [--blr-threads N] [--blr-keep-src] [--blr-device auto|cpu|gpu] [--blr-plan FILE]
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 --blr-method dual-svid
 cortiq nvg-bench --model m.cmf --tensor NAME | --layer L [--jobs J] --bpw 0.55 \
@@ -276,9 +277,15 @@ cargo test --release -p cortiq-engine --features gpu --lib nvg_dev   # GEMM vari
 cargo test --release -p cortiq-cli --bin cortiq -- nvg_gpu            # device vs host per stage: contexts/errors, latents/ITQ/polar,
                                                                       # one ALS sweep, flip_u, gptq_v, the whole-tensor driver
 cargo test --release -p cortiq-engine --features gpu --lib nvg_dev -- --ignored --nocapture   # GEMM/Cholesky/flip-rate throughput
+cargo test --release -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests gpu_cuda::nvgt::tests --test-threads 1
+                                                                      # the CUDA twins: encoder primitives vs f64, blr layer forward /
+                                                                      # backward vs f64, the sign update bit for bit vs the host mirror,
+                                                                      # GDN and attention cores vs the bake's, the head's top-k and KL
+CMF_NVG_ENC=cuda cargo test --release -p cortiq-cli --features cuda --bin cortiq -- nvg_gpu --test-threads 1
+                                                                      # the encoder driver vs the f64 host encoder, through the CUDA twin
 ```
 
-The wgpu tests skip when no adapter is present.
+The wgpu tests skip when no adapter is present, the CUDA ones without a card.
 
 ## 7. Measured (Qwen3.5-0.8B, 17.10.2026)
 
@@ -361,3 +368,106 @@ multiprocessor), the g solves 23 % (n = 17408 Cholesky per g step for `down_proj
 eigensolver 9 %, the polar factor 7 %. Tensors in flight overlap little: a Vulkan queue
 orders every barrier after all earlier work, so the one-multiprocessor column search of
 one tensor holds back the others.
+
+## 8. On CUDA (`CMF_GPU=cuda`)
+
+A build with the `cuda` feature (`cargo build --release -p cortiq-cli --features cuda`; the NVIDIA driver, NVRTC and
+cuBLAS at run time) runs the whole NVG path on the card without wgpu: the conversion's calibration, the encoder,
+and the trainer. `CMF_GPU=cuda` selects it, as for decoding ([CUDA.md](CUDA.md)):
+
+```bash
+CMF_GPU=cuda cortiq convert --model <hf dir> --quant blr --bpw 0.55 --blr-method nvg --calib calib.txt --output m.cmf
+CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tokens 1048576 --window 512 --batch 8 \
+    --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
+CMF_GPU=cuda cortiq nvg-bench --model m.cmf --layer 3 --bpw 0.55 --device gpu --calib calib.txt
+```
+
+`--blr-device auto` picks the device encoder when the CUDA backend is up, so a machine without a Vulkan adapter
+converts on its card. Files, layouts, snapshots and saved training states are those of the wgpu path: a state
+saved by one backend resumes on the other.
+
+| part | where |
+|---|---|
+| encoder primitives (the API of `gpu_wgpu::nvg_dev`) | `crates/cortiq-engine/src/gpu_cuda/nvg_dev.rs`, kernels `nvg_dev.cu` |
+| backend switch of the encoder driver | `crates/cortiq-engine/src/nvg_dev.rs` |
+| trainer, calibration forward | `crates/cortiq-engine/src/gpu_cuda/nvgt.rs`, kernels `nvgt.cu`, `nvgt_sign.cu`, and the bake's `bake.cu` |
+| trainer backends of `nvg-train` | `crates/cortiq-cli/src/nvgtrain.rs` (`Backend`) |
+
+### 8.1 The encoder
+
+The driver of §4.1 is unchanged: every device call goes through `cortiq_engine::nvg_dev`, which forwards to the
+backend the process runs on. The CUDA twin keeps the arithmetic class (f32) and the stage order; what differs:
+
+* *GEMM*: cuBLAS SGEMM, plain f32, over the same sub-matrix views. A row-major operand read column-major is its
+  transpose, so `C = op(A)·op(B)` is the call `Cᵀ = op(B)ᵀ·op(A)ᵀ` on the arrays as they lie — no copy. The Hadamard
+  epilogue is one more elementwise launch.
+* *SPD solves*: an equilibrated right-looking Cholesky — a diagonal block (64 wide up to n = 8192, 128 past it;
+  `CMF_NVG_CUDA_CHOL_NB`) factored on the host in f64, its panel by STRSM, the trailing matrix by SSYRK — and
+  STRSV / STRSM for the solves and the inverse. A failed pivot grows the ridge ×100, as on the host.
+* *Latents*: the Householder tridiagonalisation as kernels (four launches a reflector), the host's f64 bisection +
+  inverse iteration (`tridiag_top`, shared with wgpu), the compact-WY back-transform as GEMMs.
+* *Knots*: the blocked output-side flips (32 ranks a block, the rest of `qs` by one GEMM) and the input-side column
+  search of a 128-column block in one block of 1024 threads (the lanes of a thread in registers, argmin and dot
+  products by warp shuffles), the trailing feedback a GEMM. Ranks up to 4096.
+* *Buffers*: device matrices come from a pool keyed by size (`CMF_NVG_CUDA_POOL_GB`, default 24 GB of free buffers);
+  all work is queued on the backend's one stream, so a buffer returned to the pool is reused only by launches queued
+  after its last reader. Tensors in flight (`CMF_NVG_JOBS`) interleave on that stream and do not overlap on the card.
+* A matrix kernel takes its row from the grid's y and its column from x: no 64-bit division per element.
+
+`CMF_NVG_ENC=cuda|wgpu` picks the encoder's backend apart from the engine's (an A/B on identical Grams: wgpu
+calibration, CUDA encoder).
+
+### 8.2 The calibration
+
+Under `CMF_GPU=cuda` the conversion does not use the engine's capture hook (its Grams live on the wgpu device or
+the host). The calibration forward is the CUDA trainer's (§8.3): for layer `l` a net of the layers `bound..=l` is
+loaded from the work file — the layers below `l` already binary low-rank, `l` itself as f16 planes of its q8_2f
+weights — each window runs from the cached input of layer `bound` (`nvgt::calib_pass`), and the Grams `H += XᵀX`
+of the layer's four inputs (`in`: q/k/v or qkv/z, `mixout`: o_proj / out_proj, `mlp`: gate/up, `down`) accumulate
+on the card by plain f32 SGEMM. Positions are the engine calibration's (a window's last token is not fed), each
+layer runs once over the conversion. `nvg-bench` and `nvg-train --budget-plan` capture the same way.
+`CMF_NVG_CALIB=engine` keeps the engine's hook.
+
+### 8.3 The trainer
+
+`nvg-train` picks its backend at start (`Backend` in `nvgtrain.rs`): the wgpu trainer of `nvg_train.rs`, or
+`gpu_cuda::nvgt`. The step is the same — teacher top-k, forward with checkpointed layer inputs, KL through the
+frozen head, a reverse sweep that recomputes each layer, Adam on the metric, the sign latents updated right after
+each path's backward — with these differences in how it runs:
+
+* every product is a cuBLAS GEMM on the tensor cores over f16 operands with f32 accumulation: activations staged
+  by one launch (the column factor g, ℓ or h and the gradient scale folded in), the sign bitmaps expanded to ±1 f16
+  planes right before use (no resident plane), frozen weights as f16 planes; the small GDN a/b projections in f32;
+* the GDN recurrence and its BPTT are the skill bake's kernels with ordered reductions (a v-head writes its q̂/k̂
+  through-gradients, a second launch adds the heads of a k-group in order); the state history of the BPTT is
+  `(t+1)·128·128` floats a (window, v-head), `CMF_NVG_GDN_HIST_GB` (default 16) caps it by running the windows in
+  groups; attention is batched GEMMs (TF32; `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM) and a causal softmax;
+* every trainable parameter lives in one concatenated buffer with its gradient and Adam moments: the optimizer and
+  the gradient norm are one launch each;
+* column reductions run in two ordered passes and the sign kernels are built without fused multiply-adds, so a
+  step is bit-reproducible and a sign update is bit for bit `train_sign`'s host mirror (tested).
+
+`--mask-keep` (DTG-MA before the metric) stays on the wgpu trainer. `CMF_NVG_PROF=1` prints the time per phase
+(the stream drained at phase changes), `CMF_NVG_KT=N` the time of every kernel and GEMM of step N.
+
+### 8.4 Agreement with the wgpu path
+
+The math is the same; the arithmetic differs in its accumulation order (cuBLAS against the wgpu tiles), in the
+f16 operands of the trainer's products, and in nothing else. Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
+
+| what | wgpu | CUDA |
+|---|---|---|
+| encoder on identical Grams (wgpu calibration, `CMF_NVG_ENC`), layer 0 held-out error: qkv / down / gate / up / z / out | 0.2143 / 0.4883 / 0.3663 / 0.5276 / 0.3371 / 0.3538 | 0.2143 / 0.4880 / 0.3664 / 0.5273 / 0.3377 / 0.3535 |
+| the same with the CUDA calibration | — | 0.2145 / 0.4881 / 0.3662 / 0.5279 / 0.3367 / 0.3528 |
+| trainer on one file: held-out KL before | 3.47721 | 3.47721 |
+| loss of steps 1–3 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0526, 2.9162 |
+| signs flipped by step 11 | 296 527 | 296 468 |
+| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.45096 |
+| perplexity after it, WikiText-2 test / C4 validation (16 × 512) | 80.57 / 153.07 | 80.40 / 153.93 |
+
+Kernel tests on the card (`cargo test -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests
+gpu_cuda::nvgt::tests`, and the encoder driver's tests with `CMF_NVG_ENC=cuda`): the GEMM views, the elementwise
+kernels, the eigensolver, the SPD solve and the whitening factor against f64; a binary low-rank layer's forward and
+backward against f64 (3·10⁻⁴: f16 operands); the GDN and attention cores against the skill bake's kernels (equal);
+the head's top-k and KL against the host; a sign update against `train_sign::host_step_fact` (no differing latent,
+moment or bitmap word); the device encoder against the f64 host encoder (`nvg_gpu` tests).

@@ -1,8 +1,9 @@
-//! The NVG encoder on the device (wgpu, f32) — `--blr-device gpu`.
+//! The NVG encoder on the device (f32) — `--blr-device gpu`: wgpu, or the
+//! CUDA backend under `CMF_GPU=cuda` (a build with the `cuda` feature).
 //!
 //! Stage for stage the CPU encoder of `nvg.rs` (the f64 reference, kept as
-//! `--blr-device cpu`), with the work moved to `cortiq_engine::gpu_wgpu::
-//! nvg_dev`:
+//! `--blr-device cpu`), with the work moved to `cortiq_engine::nvg_dev`
+//! (`gpu_wgpu::nvg_dev` or its twin `gpu_cuda::nvg_dev`):
 //!
 //! * per input: `H` (damped), the held-out Gram, the act order and the upper
 //!   Cholesky factor `Uc` of the permuted `H⁻¹` (equilibrated f32 Cholesky +
@@ -34,7 +35,7 @@
 use crate::nvg::{BlrModel, BlrPath, Encoded, PathsChoice, Prof, pack};
 use crate::nvg_linalg::{Mat, solve_spd, sym_eig};
 use cortiq_core::blr::{blr_bits, blr_rank};
-use cortiq_engine::gpu_wgpu::nvg_dev::{self as dv, ABS, DMat, INPLACE, LOWER, SIGN, V};
+use cortiq_engine::nvg_dev::{self as dv, ABS, DMat, INPLACE, LOWER, SIGN, V};
 use cortiq_engine::pool::Pool;
 use std::cell::RefCell;
 use std::time::Instant;
@@ -58,6 +59,13 @@ fn vec_dev(v: &[f64]) -> DMat {
     DMat::from_f64(1, v.len(), v)
 }
 
+/// Refinement sweeps of the discrete knots (`CMF_NVG_SWEEPS`, default 2: the
+/// host encoder's).
+pub(crate) fn refine_sweeps() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2));
+    *N
+}
+
 /// f32 flip tolerance, relative (the f64 host path uses 1e-12;
 /// `CMF_NVG_FLIP_TOL` overrides). 1e-7 sits at the f32 resolution: 1e-6
 /// stopped the discrete search early enough to cost ~2 % ppl end to end on
@@ -77,7 +85,7 @@ pub struct HCtxD {
     pub sqd: Vec<f64>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub perm: Vec<usize>,
-    perm_buf: cortiq_engine::wgpu::Buffer,
+    perm_buf: dv::U32Buf,
     pub uc: DMat,
     d: Vec<f64>,
     l: std::sync::Mutex<Option<std::sync::Arc<DMat>>>,
@@ -85,7 +93,7 @@ pub struct HCtxD {
 
 impl HCtxD {
     pub fn new(hfit: &Mat, hsel: &Mat, rho: f64) -> anyhow::Result<Self> {
-        anyhow::ensure!(dv::available(), "no wgpu device for the NVG encoder");
+        anyhow::ensure!(dv::available(), "no GPU device for the NVG encoder");
         let n = hfit.r;
         let tr = (0..n).map(|i| hfit.at(i, i)).sum::<f64>() / n as f64;
         let c_fit = rho * tr;
@@ -766,7 +774,11 @@ fn build_init_d(c: &TCtxD, r: usize, paths: usize) -> anyhow::Result<ModelD> {
 }
 
 /// NVG for one tensor on the device (`nvg::encode_nvg`). `hc` holds the
-/// tensor's input Grams.
+/// tensor's input Grams. `colscale` (the channel scale `t`, see
+/// `nvg::channel_scale`): the encoder works in the scaled input basis — `hc`
+/// was built from `diag(t)·H·diag(t)`, the weight is taken as `W·diag(1/t)`
+/// here — and `t` goes back into every path's g before the scales are stored,
+/// so the stored tensor is a fit of `W` itself.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_nvg_dev(
     pool: Option<&Pool>,
@@ -776,11 +788,17 @@ pub fn encode_nvg_dev(
     mult: f64,
     choice: PathsChoice,
     prof: Option<&Prof>,
+    colscale: Option<&[f64]>,
 ) -> anyhow::Result<Option<Encoded>> {
     let (m, n) = (w.r, w.c);
     anyhow::ensure!(n == hc.n, "{m}x{n} weight vs a {}-wide Gram", hc.n);
+    anyhow::ensure!(colscale.is_none_or(|t| t.len() == n), "channel scale of the wrong width");
     let c = ps(prof, "wh", || {
         let wd = DMat::from_f64(m, n, &w.d);
+        if let Some(t) = colscale {
+            let inv: Vec<f64> = t.iter().map(|v| 1.0 / v).collect();
+            dv::scale_rc(m, n, None, (&wd, 0, n), None, Some(&vec_dev(&inv)), INPLACE, 1.0, 0.0);
+        }
         let wh = dv::mm(&wd, false, &hc.h, false);
         let whsel = dv::mm(&wd, false, &hc.hsel, false);
         let (a_h, a_sel, w2) = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
@@ -793,14 +811,14 @@ pub fn encode_nvg_dev(
         anyhow::ensure!(r2 <= dv::GV_MAX_RANK, "rank {r2} above the device search limit");
         let n3 = build_init_d(&c, r2, 2)?;
         let e3 = ps(prof, "select", || rel_d(&n3, &c, Metric::Sel));
-        let n4 = refine_d(n3, &c, 2);
+        let n4 = refine_d(n3, &c, refine_sweeps());
         notes.push(format!("init {e3:.4}"));
         cands.push((2, n4));
     }
     if choice != PathsChoice::Two {
         let r1 = blr_rank(m, n, b, 1, mult);
         anyhow::ensure!(r1 <= dv::GV_MAX_RANK, "rank {r1} above the device search limit");
-        let p1 = refine_d(build_init_d(&c, r1, 1)?, &c, 2);
+        let p1 = refine_d(build_init_d(&c, r1, 1)?, &c, refine_sweeps());
         cands.push((1, p1));
     }
     let mut best: Option<(f64, usize)> = None;
@@ -814,12 +832,26 @@ pub fn encode_nvg_dev(
     let Some((_, bi)) = best else { return Ok(None) };
     let (p, mut md) = cands.swap_remove(bi);
     drop(cands);
-    let Some((bytes, st)) = ps(prof, "select", || pack(&md.to_host())) else { return Ok(None) };
-    // the stored (rebalanced, f16-rounded) scales, same signs
+    let Some((bytes, st)) = ps(prof, "select", || {
+        let mut hm = md.to_host();
+        if let Some(t) = colscale {
+            for p in hm.paths.iter_mut() {
+                p.g.iter_mut().zip(t).for_each(|(g, t)| *g *= t);
+            }
+        }
+        pack(&hm)
+    }) else {
+        return Ok(None);
+    };
+    // the stored (rebalanced, f16-rounded) scales, same signs (g back in the
+    // encoder's basis for the errors below)
     for (q, s) in md.paths.iter_mut().zip(&st.paths) {
         q.h = vec_dev(&s.h);
         q.l = vec_dev(&s.l);
-        q.g = vec_dev(&s.g);
+        q.g = match colscale {
+            Some(t) => vec_dev(&s.g.iter().zip(t).map(|(g, t)| g / t).collect::<Vec<_>>()),
+            None => vec_dev(&s.g),
+        };
         q.invalidate();
     }
     let (ef, es) = ps(prof, "select", || (rel_d(&md, &c, Metric::Fit), rel_d(&md, &c, Metric::Sel)));
@@ -852,7 +884,7 @@ pub fn encode_tensor(
     if let Some(p) = prof {
         p.add("hctx", t.elapsed().as_secs_f64(), 0);
     }
-    encode_nvg_dev(Some(&pool), w, &hc, b, mult, choice, prof)
+    encode_nvg_dev(Some(&pool), w, &hc, b, mult, choice, prof, None)
 }
 
 /// A host model on the device (same signs and scales).
@@ -1056,7 +1088,7 @@ mod tests {
         let Some(f) = fixture(160, 128) else { return };
         let b = 2.0;
         let cpu = nvg::encode_nvg(Some(&f.pool), &f.w, &f.hc, &f.hfit, &f.hsel, b, 1.0, PathsChoice::Auto, None).unwrap();
-        let gpu = encode_nvg_dev(Some(&f.pool), &f.w, &f.hcd, b, 1.0, PathsChoice::Auto, None).unwrap().unwrap();
+        let gpu = encode_nvg_dev(Some(&f.pool), &f.w, &f.hcd, b, 1.0, PathsChoice::Auto, None, None).unwrap().unwrap();
         assert!(cortiq_core::blr::validate_blr(&[160, 128], &gpu.bytes).is_ok());
         assert_eq!(gpu.bits, blr_bits(160, 128, gpu.rank, gpu.paths));
         let stored = |bytes: &[u8]| {
@@ -1078,6 +1110,8 @@ pub struct Job<'a> {
     /// The bit budget this tensor is encoded at (bits per weight). A plan
     /// may give different tensors different budgets.
     pub bpw: f64,
+    /// The input's channel scale `hc` was built in (see [`encode_nvg_dev`]).
+    pub colscale: Option<&'a [f64]>,
 }
 
 /// What [`encode_many`] reports per job: the encoding, its wall seconds and
@@ -1120,7 +1154,7 @@ pub fn encode_many(
                     let j = &jobs[i];
                     let prof = Prof::default();
                     let t = Instant::now();
-                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, j.bpw, j.mult, choice, profile.then_some(&prof));
+                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, j.bpw, j.mult, choice, profile.then_some(&prof), j.colscale);
                     let done = Done { enc, secs: t.elapsed().as_secs_f64(), prof: profile.then(|| prof.line()) };
                     on_done(i, &done);
                     out.lock().unwrap()[i] = Some(done);

@@ -1,0 +1,808 @@
+// NVG Ť on CUDA (`gpu_cuda/nvgt.rs`): the kernels of the layer-streamed
+// distillation trainer beside the bake's (`bake.cu`, compiled into the same
+// module: conv, GDN forward, causal softmax, RMSNorm). Activations are
+// row-major `[tokens][width]` f32; the operands of the tensor-core GEMMs are
+// staged in f16 (a column factor and a power-of-two scale folded in), as the
+// wgpu trainer stages them. Column reductions run in two ordered passes, so
+// a step is bit-reproducible. A kernel over a matrix takes its row from the
+// grid's y and its column from x: no 64-bit division per element.
+
+typedef unsigned int u32;
+typedef unsigned short u16;
+
+__device__ __forceinline__ u16 nt_f2h(float f) {
+    u16 h;
+    asm("{ cvt.rn.f16.f32 %0, %1; }" : "=h"(h) : "f"(f));
+    return h;
+}
+__device__ __forceinline__ float nt_h2f(u16 h) {
+    float f;
+    asm("{ cvt.f32.f16 %0, %1; }" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ float nt_sigm(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ bool nt_fin(float v) { return (__float_as_uint(v) & 0x7f800000u) != 0x7f800000u; }
+
+// Σ v over the block (blockDim a multiple of 32); every thread gets it.
+__device__ __forceinline__ float nt_block_sum(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    __syncthreads();
+    if (l == 0) red[w] = v;
+    __syncthreads();
+    float s = 0.f;
+    const int nw = blockDim.x >> 5;
+    for (int i = 0; i < nw; i++) s += red[i];
+    return s;
+}
+
+// ───────────────────────────── staging / planes ─────────────────────────────
+
+// dst (f16 [m][k]) = src (f32 [m][k]) · col[k] (when given) · scale. Grid (k / 256, m).
+extern "C" __global__ void nt_stage(const float* __restrict__ src, const float* __restrict__ col, u16* __restrict__ dst,
+                                    u32 k, float scale, u32 has_col)
+{
+    const u32 c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= k) return;
+    const size_t i = (size_t)blockIdx.y * k + c;
+    float v = src[i] * scale;
+    if (has_col) v *= col[c];
+    dst[i] = nt_f2h(v);
+}
+
+// A sign bitmap [rows][wpr] (bit k of row i = rank k) as the f16 plane
+// [rows][r] of ±sv[row]·mul: the row's scale (h of an output row, g of an
+// input row) rides in the plane, so one staged activation serves every path
+// and linear that reads it and a path's product lands in its sum directly.
+// `mul` is a power of two that brings the largest scale under 1 (the GEMM's
+// α takes it back). Grid (r / 256, rows).
+extern "C" __global__ void nt_expand_s(const u32* __restrict__ bits, u16* __restrict__ pl, const float* __restrict__ sv,
+                                       u32 r, u32 wpr, float mul)
+{
+    const u32 row = blockIdx.y, k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= r) return;
+    const u32 w = bits[(size_t)row * wpr + (k >> 5)];
+    const float v = sv[row] * mul;
+    pl[(size_t)row * r + k] = nt_f2h(((w >> (k & 31)) & 1u) ? v : -v);
+}
+
+// G ([rows][r]: a sign matrix's gradient before its row scale, G'[i][k] =
+// ∂L/∂(s_i·S[i][k])): the scale's own gradient acc[row] += Σ_k ±G'[row][k]
+// (the signs as they were in the forward), then G[row][k] = s[row]·G'[row][k],
+// the gradient of the signs. A block a row, the sum in order.
+extern "C" __global__ void nt_g_fold(float* __restrict__ G, const u32* __restrict__ bits, const float* __restrict__ sv,
+                                     float* __restrict__ acc, u32 r, u32 wpr)
+{
+    __shared__ float red[32];
+    const size_t row = blockIdx.x;
+    const u32 t = threadIdx.x;
+    const float s = sv[row];
+    float a = 0.f;
+    for (u32 k = t; k < r; k += blockDim.x) {
+        const float g = G[row * r + k];
+        const u32 w = bits[row * wpr + (k >> 5)];
+        a += ((w >> (k & 31)) & 1u) ? g : -g;
+        G[row * r + k] = g * s;
+    }
+    const float tot = nt_block_sum(a, red);
+    if (t == 0) acc[row] += tot;
+}
+
+// out[i] = f32(src[i]) for n halves.
+extern "C" __global__ void nt_h2f_n(const u16* __restrict__ src, float* __restrict__ out, size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = nt_h2f(src[i]);
+}
+
+// Column reduction, first pass: part[blk·k + j] = Σ over the rows of block blk
+// of a·b (mode 0), a·b·f[row] (mode 1) or a (mode 2). Grid (k / 256, blocks).
+extern "C" __global__ void nt_colsum_part(const float* __restrict__ a, const float* __restrict__ b,
+                                          const float* __restrict__ f, float* __restrict__ part, u32 m, u32 k, u32 rpb,
+                                          u32 mode)
+{
+    const u32 j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) return;
+    const u32 r0 = blockIdx.y * rpb, r1 = min(r0 + rpb, m);
+    float acc = 0.f;
+    if (mode == 0) {
+        for (u32 r = r0; r < r1; r++) acc += a[(size_t)r * k + j] * b[(size_t)r * k + j];
+    } else if (mode == 1) {
+        for (u32 r = r0; r < r1; r++) acc += a[(size_t)r * k + j] * b[(size_t)r * k + j] * f[r];
+    } else {
+        for (u32 r = r0; r < r1; r++) acc += a[(size_t)r * k + j];
+    }
+    part[(size_t)blockIdx.y * k + j] = acc;
+}
+
+// Second pass: out[j] (+)= Σ_blk part[blk·k + j], the blocks in order.
+extern "C" __global__ void nt_colsum_fin(const float* __restrict__ part, float* __restrict__ out, u32 k, u32 nblk, u32 acc)
+{
+    const u32 j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) return;
+    float s = 0.f;
+    for (u32 b = 0; b < nblk; b++) s += part[(size_t)b * k + j];
+    out[j] = acc ? out[j] + s : s;
+}
+
+// ───────────────────────────── elementwise ─────────────────────────────
+
+// h = silu(g)·u
+extern "C" __global__ void nt_swiglu_fwd(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ h,
+                                         size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = g[i];
+    h[i] = a * nt_sigm(a) * u[i];
+}
+
+extern "C" __global__ void nt_swiglu_bwd(const float* __restrict__ g, const float* __restrict__ u,
+                                         const float* __restrict__ dh, float* __restrict__ dg, float* __restrict__ du,
+                                         size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = g[i], s = nt_sigm(a);
+    dg[i] = dh[i] * u[i] * s * (1.f + a * (1.f - s));
+    du[i] = dh[i] * a * s;
+}
+
+// og = o·σ(gate)
+extern "C" __global__ void nt_gate_fwd(const float* __restrict__ o, const float* __restrict__ gate, float* __restrict__ og,
+                                       size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) og[i] = o[i] * nt_sigm(gate[i]);
+}
+
+extern "C" __global__ void nt_gate_bwd(const float* __restrict__ o, const float* __restrict__ gate,
+                                       const float* __restrict__ dog, float* __restrict__ dout, float* __restrict__ dgate,
+                                       size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = nt_sigm(gate[i]);
+    dout[i] = dog[i] * s;
+    dgate[i] = dog[i] * o[i] * s * (1.f - s);
+}
+
+// Per-head [q(hd); gate(hd)] rows of qg ([m][heads][2·hd]) → q, gate
+// ([m][heads·hd] each); merge: the reverse.
+extern "C" __global__ void nt_split_qg(float* qg, float* q, float* gate, u32 heads, u32 hd, u32 merge)
+{
+    const u32 kq = heads * hd, row = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kq) return;
+    const u32 h = c / hd, d = c % hd;
+    const size_t i = (size_t)row * kq + c;
+    const size_t src = (size_t)row * 2 * kq + (size_t)h * 2 * hd + d;
+    if (!merge) {
+        q[i] = qg[src];
+        gate[i] = qg[src + hd];
+    } else {
+        qg[src] = q[i];
+        qg[src + hd] = gate[i];
+    }
+}
+
+// y = a + b (bk_add twin kept here for a size_t count)
+extern "C" __global__ void nt_add(const float* a, const float* b, float* y, size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
+// Depthwise causal conv + SiLU of the GDN's raw projection (`bk_conv_fwd`):
+// pre = Σ_j raw[ti-(kk-1)+j]·tap[c][j], cq = silu(pre). Grid (cdim / 256, rows).
+extern "C" __global__ void nt_conv_fwd(const float* __restrict__ raw, const float* __restrict__ taps,
+                                       float* __restrict__ pre, float* __restrict__ cq, int t, int cdim, int kk)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (c >= cdim) return;
+    const int ti = r % t;
+    float acc = 0.f;
+    for (int j = 0; j < kk; j++) {
+        const int p = ti - (kk - 1) + j;
+        if (p >= 0) acc += raw[(size_t)(r - ti + p) * cdim + c] * taps[c * kk + j];
+    }
+    const size_t idx = (size_t)r * cdim + c;
+    pre[idx] = acc;
+    cq[idx] = bk_silu(acc);
+}
+
+// Its backward (`bk_conv_bwd`): draw[p][c] = Σ_j dcq[p+(kk-1)-j][c]·silu'(pre)·tap[c][j].
+extern "C" __global__ void nt_conv_bwd(const float* __restrict__ pre, const float* __restrict__ dcq,
+                                       const float* __restrict__ taps, float* __restrict__ draw, int t, int cdim, int kk)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (c >= cdim) return;
+    const int p = r % t;
+    float acc = 0.f;
+    for (int j = 0; j < kk; j++) {
+        const int ti = p + (kk - 1) - j;
+        if (ti < t) {
+            const size_t q = (size_t)(r - p + ti) * cdim + c;
+            acc += dcq[q] * bk_silu_bwd(pre[q]) * taps[c * kk + j];
+        }
+    }
+    draw[(size_t)r * cdim + c] = acc;
+}
+
+// dst[(bi·nh + h)][p][c] = src[(bi·t + p)·(sh·hd) + (h / rep)·hd + c]
+// (`bk_attn_perm`). Grid (hd / 256, t, nb·nh): x covers c, y = p, z = bi·nh + h.
+extern "C" __global__ void nt_attn_perm(const float* __restrict__ src, float* __restrict__ dst, u32 t, u32 nh, u32 sh,
+                                        u32 hd, u32 rep)
+{
+    const u32 c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= hd) return;
+    const u32 p = blockIdx.y, u = blockIdx.z, h = u % nh, bi = u / nh;
+    dst[((size_t)u * t + p) * hd + c] = src[((size_t)bi * t + p) * sh * hd + (size_t)(h / rep) * hd + c];
+}
+
+// dst[(bi·t + p)·(dh·hd) + g·hd + c] = Σ over the rep q-heads h of group g of
+// src[(bi·nh + h)][p][c] (`bk_attn_unperm`). Grid (dh·hd / 256, b·t).
+extern "C" __global__ void nt_attn_unperm(const float* __restrict__ src, float* __restrict__ dst, u32 t, u32 nh, u32 dh,
+                                          u32 hd, u32 rep)
+{
+    const u32 x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= dh * hd) return;
+    const u32 row = blockIdx.y, p = row % t, bi = row / t, g = x / hd, c = x % hd;
+    float acc = 0.f;
+    for (u32 k = 0; k < rep; k++) acc += src[(((size_t)bi * nh + g * rep + k) * t + p) * hd + c];
+    dst[(size_t)row * dh * hd + x] = acc;
+}
+
+// ───────────────────────────── q/k norm + RoPE ─────────────────────────────
+
+// Per-head RMSNorm (over hd ≤ 256) then RoPE on the first 2·half dims (pairs
+// (i, i + half)); INV per (row, head). A block of hd threads per (row, head).
+extern "C" __global__ void nt_qkr_fwd(const float* __restrict__ X, const float* __restrict__ W, float* __restrict__ Y,
+                                      float* __restrict__ INV, const float* __restrict__ ROPE, u32 heads, u32 hd, u32 half,
+                                      u32 t, float eps, u32 gemma)
+{
+    __shared__ float red[32];
+    __shared__ float buf[256];
+    const size_t u = blockIdx.x;
+    const u32 tid = threadIdx.x, pos = (u32)((u / heads) % t);
+    const size_t base = u * hd;
+    const float x = tid < hd ? X[base + tid] : 0.f;
+    const float inv = 1.f / sqrtf(nt_block_sum(x * x, red) / (float)hd + eps);
+    if (tid < hd) buf[tid] = x * inv * (gemma ? 1.f + W[tid] : W[tid]);
+    __syncthreads();
+    if (tid < hd) {
+        float y = buf[tid];
+        if (tid < half) {
+            const float c = ROPE[((size_t)pos * half + tid) * 2], s = ROPE[((size_t)pos * half + tid) * 2 + 1];
+            y = buf[tid] * c - buf[tid + half] * s;
+        } else if (tid < 2 * half) {
+            const u32 i = tid - half;
+            const float c = ROPE[((size_t)pos * half + i) * 2], s = ROPE[((size_t)pos * half + i) * 2 + 1];
+            y = buf[i] * s + buf[tid] * c;
+        }
+        Y[base + tid] = y;
+    }
+    if (tid == 0) INV[u] = inv;
+}
+
+// Inverse rotation of dY, then the RMSNorm backward; the gain gradient of
+// each (row, head) goes to DW[u·hd + j] (summed by a column reduction).
+extern "C" __global__ void nt_qkr_bwd(const float* __restrict__ X, const float* __restrict__ W,
+                                      const float* __restrict__ INV, const float* __restrict__ ROPE,
+                                      const float* __restrict__ DY, float* __restrict__ DX, float* __restrict__ DW,
+                                      u32 heads, u32 hd, u32 half, u32 t, u32 gemma)
+{
+    __shared__ float red[32];
+    __shared__ float buf[256];
+    const size_t u = blockIdx.x;
+    const u32 tid = threadIdx.x, pos = (u32)((u / heads) % t);
+    const size_t base = u * hd;
+    if (tid < hd) buf[tid] = DY[base + tid];
+    __syncthreads();
+    float g = 0.f;
+    if (tid < hd) {
+        g = buf[tid];
+        if (tid < half) {
+            const float c = ROPE[((size_t)pos * half + tid) * 2], s = ROPE[((size_t)pos * half + tid) * 2 + 1];
+            g = buf[tid] * c + buf[tid + half] * s;
+        } else if (tid < 2 * half) {
+            const u32 i = tid - half;
+            const float c = ROPE[((size_t)pos * half + i) * 2], s = ROPE[((size_t)pos * half + i) * 2 + 1];
+            g = -buf[i] * s + buf[tid] * c;
+        }
+    }
+    const float iv = INV[u];
+    const float x = tid < hd ? X[base + tid] : 0.f;
+    const float w = tid < hd ? (gemma ? 1.f + W[tid] : W[tid]) : 0.f;
+    const float coef = nt_block_sum(g * w * x, red) / (float)hd * iv * iv * iv;
+    if (tid < hd) {
+        DX[base + tid] = iv * w * g - x * coef;
+        DW[base + tid] = g * x * iv;
+    }
+}
+
+// ───────────────────────────── GDN recurrence ─────────────────────────────
+//
+// The gated delta rule of `bk_gdn_fwd` / `bk_gdn_bwd` (bake.cu) in blocks of
+// DV·GC threads (GC from the build, `GDN_GC` of nvgt.rs: a block's threads
+// share an SM's 64k registers, so 1024 threads leave 64 each — too few for
+// the reverse sweep's two state columns): a thread holds GR = DK / GC rows of
+// one column of the state in registers, so a position is two loops of GR and
+// four barriers. (In the
+// bake's block of DV threads a thread walks all DK rows of its column — the
+// state spills to local memory — and an SM's schedulers wait on four warps'
+// dependency chains: 3.4 µs a position forward and 17 µs backward on an RTX
+// PRO 6000.) Column sums (Sᵀk̂, Sᵀq̂, dSᵀk̂) add the GC chunks' partials in
+// order through shared memory; row sums (S·do, dS·u, S·dkv) reduce a warp's
+// 32 columns by shuffles and add the DV / 32 warps' partials in order: a
+// step stays bit-reproducible. The BPTT's state history is f16
+// ([unit][t][DK][DV], the state after each position, unit = local sequence ·
+// nv + h): half the traffic of an f32 history, written once by the forward
+// that the reverse sweep's layer recompute runs anyway and read once (the
+// reverse sweep keeps the later state in registers).
+
+#ifndef GC
+#define GC 4
+#endif
+#define GR (DK / GC)
+#define GW (DV / 32)
+// A row sum over a warp's 32 columns: GSH shuffle steps leave the sums of
+// 32 >> GSH lanes each with their first lanes, which store them; the row's
+// owner adds the GW·GP partials in order. (All five steps in the warp are
+// 32 additions of which one is kept, twice a state row a position: two
+// thirds of the reverse sweep's instructions.)
+#define GSH 2
+#define GP (32 >> GSH)
+
+// The GW warps' partials in order.
+__device__ __forceinline__ float nt_gsum(const float* r) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < GW; i++) s += r[i];
+    return s;
+}
+
+__device__ __forceinline__ u16 nt_f2h_sat(float f) { return nt_f2h(fminf(fmaxf(f, -65504.f), 65504.f)); }
+
+// Forward: grid (nv, sequences of this launch), block DV·GC.
+// out[row][h·DV + j] = rms(o)·w·silu(z) when `out` is given; with `hist` the
+// state after every position, kv and o per position are kept for `nt_gdn_rev`.
+extern "C" __global__ void nt_gdn_fwd(const float* cq, const float* z, const float* a, const float* bb,
+                                      const float* a_log, const float* dt_bias, const float* normw, float* out,
+                                      u16* hist, float* kvh, float* oh, int t, int nv, int nk, float eps, int seq0)
+{
+    const int h = blockIdx.x, lb = blockIdx.y, bi = seq0 + lb;
+    const int tid = threadIdx.x, j = tid % DV, c = tid / DV, i0 = c * GR;
+    const int rep = nv / nk, ko = h / rep, kd = nk * DK, vd = nv * DV, cdim = 2 * kd + vd;
+    __shared__ float qs[DK], ks[DK], rq[GW], rk[GW], ro[GW], cpa[GC][DV], cpb[GC][DV];
+    const long unit = (long)lb * nv + h;
+    u16* H = hist ? hist + unit * (long)t * DK * DV : 0;
+    float* KV = hist ? kvh + unit * (long)t * DV : 0;
+    float* O = hist ? oh + unit * (long)t * DV : 0;
+    const float ea = __expf(a_log[h]), dtb = dt_bias[h], wn = normw[j];
+    float S[GR];
+#pragma unroll
+    for (int i = 0; i < GR; i++) S[i] = 0.f;
+    // a position's inputs are read one position ahead: the latency of their
+    // loads (rows 6 KB apart, nothing prefetches them) passes under the
+    // arithmetic of the position before
+    float qn = 0.f, kn = 0.f, vn, an, bn, zn = 0.f;
+    {
+        const long row = (long)bi * t;
+        const float* cr = cq + row * cdim;
+        if (tid < DK) {
+            qn = cr[ko * DK + tid];
+            kn = cr[kd + ko * DK + tid];
+        }
+        vn = cr[2 * kd + h * DV + j];
+        an = a[row * nv + h];
+        bn = bb[row * nv + h];
+        if (c == 0 && out) zn = z[row * vd + h * DV + j];
+    }
+    for (int ti = 0; ti < t; ti++) {
+        const long row = (long)bi * t + ti;
+        const float q = qn, k = kn, vj = vn, av = an, bv = bn, zv = zn;
+        if (ti + 1 < t) {
+            const float* cr = cq + (row + 1) * cdim;
+            if (tid < DK) {
+                qn = cr[ko * DK + tid];
+                kn = cr[kd + ko * DK + tid];
+            }
+            vn = cr[2 * kd + h * DV + j];
+            an = a[(row + 1) * nv + h];
+            bn = bb[(row + 1) * nv + h];
+            if (c == 0 && out) zn = z[(row + 1) * vd + h * DV + j];
+        }
+        if (tid < DK) {
+            qs[tid] = q;
+            ks[tid] = k;
+            float pq = q * q, pk = k * k;
+            for (int o = 16; o > 0; o >>= 1) {
+                pq += __shfl_xor_sync(0xffffffffu, pq, o);
+                pk += __shfl_xor_sync(0xffffffffu, pk, o);
+            }
+            if ((tid & 31) == 0) {
+                rq[tid >> 5] = pq;
+                rk[tid >> 5] = pk;
+            }
+        }
+        __syncthreads();
+        const float nq2 = nt_gsum(rq) + 1e-6f, nk2 = nt_gsum(rk) + 1e-6f;
+        const float invq = 1.f / (sqrtf(nq2) * sqrtf((float)DK)), invk = 1.f / sqrtf(nk2);
+        const float g = __expf(-ea * bk_softplus(av + dtb)), beta = bk_sigmoid(bv);
+        float kvp = 0.f;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            S[i] *= g;
+            kvp += S[i] * ks[i0 + i] * invk;
+        }
+        cpa[c][j] = kvp;
+        __syncthreads();
+        float kv = 0.f;
+#pragma unroll
+        for (int q = 0; q < GC; q++) kv += cpa[q][j];
+        const float u = beta * (vj - kv);
+        float op = 0.f;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            S[i] += ks[i0 + i] * invk * u;
+            op += qs[i0 + i] * invq * S[i];
+        }
+        if (H) {
+            u16* Hn = H + (long)ti * DK * DV;
+#pragma unroll
+            for (int i = 0; i < GR; i++) Hn[(long)(i0 + i) * DV + j] = nt_f2h_sat(S[i]);
+        }
+        cpb[c][j] = op;
+        __syncthreads();
+        float o = 0.f;
+        if (c == 0) {
+#pragma unroll
+            for (int q = 0; q < GC; q++) o += cpb[q][j];
+            float so = o * o;
+            for (int x = 16; x > 0; x >>= 1) so += __shfl_xor_sync(0xffffffffu, so, x);
+            if ((tid & 31) == 0) ro[tid >> 5] = so;
+        }
+        __syncthreads();
+        if (c == 0) {
+            if (out) {
+                const float inv = rsqrtf(nt_gsum(ro) / DV + eps);
+                out[row * vd + h * DV + j] = o * inv * wn * bk_silu(zv);
+            }
+            if (H) {
+                KV[(long)ti * DV + j] = kv;
+                O[(long)ti * DV + j] = o;
+            }
+        }
+    }
+}
+
+// Reverse sweep (BPTT) over the history `nt_gdn_fwd` left: grid (nv,
+// sequences of this launch), block DV·GC. Each v-head writes its q̂/k̂
+// through-gradients into DQK ([row][nv][2·DK]); `nt_gdn_qk_sum` adds the heads
+// of a k-group in order. dz, da, db and dcq's v channels are stored.
+extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const float* a, const float* bb,
+                                      const float* a_log, const float* dt_bias, const float* normw, const float* dout,
+                                      float* dcq, float* dz, float* da, float* db, float* dqk, const u16* hist,
+                                      const float* kvh, const float* oh, int t, int nv, int nk, float eps, int seq0)
+{
+    const int h = blockIdx.x, lb = blockIdx.y, bi = seq0 + lb;
+    const int tid = threadIdx.x, j = tid % DV, c = tid / DV, i0 = c * GR;
+    const int lane = tid & 31, w = tid >> 5, wc = w % GW;
+    const int rep = nv / nk, ko = h / rep, kd = nk * DK, vd = nv * DV, cdim = 2 * kd + vd;
+    __shared__ float qs[DK], ks[DK], rq[GW], rk[GW], ro[GW], rs[GW], rb[GW], rqd[GW], rkd[GW], rg[GC * GW], cp[GC][DV],
+        pq_[GW * GP][DK], pk_[GW * GP][DK];
+    const int lead = (lane & ((1 << GSH) - 1)) == 0, slot = wc * GP + (lane >> GSH);
+    const long unit = (long)lb * nv + h;
+    const u16* H = hist + unit * (long)t * DK * DV;
+    const float* KV = kvh + unit * (long)t * DV;
+    const float* O = oh + unit * (long)t * DV;
+    const float ea = __expf(a_log[h]), dtb = dt_bias[h], wn = normw[j];
+    float dS[GR], St[GR];
+    {
+        const u16* Hl = H + (long)(t - 1) * DK * DV;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            dS[i] = 0.f;
+            St[i] = nt_h2f(Hl[(long)(i0 + i) * DV + j]);
+        }
+    }
+    // a position's inputs are read one position ahead (see `nt_gdn_fwd`)
+    float qn = 0.f, kn = 0.f, on, zn, dn, vn, kvn, an, bn;
+    {
+        const long row = (long)bi * t + (t - 1);
+        const float* cr = cq + row * cdim;
+        if (tid < DK) {
+            qn = cr[ko * DK + tid];
+            kn = cr[kd + ko * DK + tid];
+        }
+        on = O[(long)(t - 1) * DV + j];
+        zn = z[row * vd + h * DV + j];
+        dn = dout[row * vd + h * DV + j];
+        vn = cr[2 * kd + h * DV + j];
+        kvn = KV[(long)(t - 1) * DV + j];
+        an = a[row * nv + h];
+        bn = bb[row * nv + h];
+    }
+    for (int ti = t - 1; ti >= 0; ti--) {
+        const long row = (long)bi * t + ti;
+        const float q = qn, k = kn, oj = on, zv = zn, dof = dn, vmk = vn - kvn, av = an, bv = bn;
+        if (ti > 0) {
+            const float* cr = cq + (row - 1) * cdim;
+            if (tid < DK) {
+                qn = cr[ko * DK + tid];
+                kn = cr[kd + ko * DK + tid];
+            }
+            on = O[(long)(ti - 1) * DV + j];
+            zn = z[(row - 1) * vd + h * DV + j];
+            dn = dout[(row - 1) * vd + h * DV + j];
+            vn = cr[2 * kd + h * DV + j];
+            kvn = KV[(long)(ti - 1) * DV + j];
+            an = a[(row - 1) * nv + h];
+            bn = bb[(row - 1) * nv + h];
+        }
+        const float weff = wn * bk_silu(zv);
+        // q̂/k̂ and their norms; the gated RMSNorm's two sums
+        if (tid < DK) {
+            qs[tid] = q;
+            ks[tid] = k;
+            float pq = q * q, pk = k * k, so = oj * oj, sd = dof * weff * oj;
+            for (int o = 16; o > 0; o >>= 1) {
+                pq += __shfl_xor_sync(0xffffffffu, pq, o);
+                pk += __shfl_xor_sync(0xffffffffu, pk, o);
+                so += __shfl_xor_sync(0xffffffffu, so, o);
+                sd += __shfl_xor_sync(0xffffffffu, sd, o);
+            }
+            if (lane == 0) {
+                rq[w] = pq;
+                rk[w] = pk;
+                ro[w] = so;
+                rs[w] = sd;
+            }
+        }
+        __syncthreads();
+        const float nq2 = nt_gsum(rq) + 1e-6f, nk2 = nt_gsum(rk) + 1e-6f;
+        const float invq = 1.f / (sqrtf(nq2) * sqrtf((float)DK)), invk = 1.f / sqrtf(nk2);
+        const float arg = av + dtb;
+        const float g = __expf(-ea * bk_softplus(arg)), beta = bk_sigmoid(bv);
+        const float inv = rsqrtf(nt_gsum(ro) / DV + eps), sdot = nt_gsum(rs);
+        const float doj = inv * weff * dof - oj * (sdot / DV) * inv * inv * inv;
+        if (c == 0) dz[row * vd + h * DV + j] = dof * oj * inv * wn * bk_silu_bwd(zv);
+        // dS += q̂ ⊗ do; dq̂ = S_t·do (across columns); du = dSᵀk̂ (across chunks)
+        float dup = 0.f;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            dS[i] += qs[i0 + i] * invq * doj;
+            dup += dS[i] * ks[i0 + i] * invk;
+            float v = St[i] * doj;
+            for (int o = 1; o < (1 << GSH); o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lead) pq_[slot][i0 + i] = v;
+        }
+        cp[c][j] = dup;
+        // the state before this position, read here: its loads pass under the
+        // barrier and the column sum; it stays as the next position's S_t
+        if (ti > 0) {
+            const u16* Hp = H + (long)(ti - 1) * DK * DV;
+#pragma unroll
+            for (int i = 0; i < GR; i++) St[i] = nt_h2f(Hp[(long)(i0 + i) * DV + j]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < GR; i++) St[i] = 0.f;
+        }
+        __syncthreads();
+        float du = 0.f;
+#pragma unroll
+        for (int q = 0; q < GC; q++) du += cp[q][j];
+        const float dkv = -(beta * du);
+        if (c == 0) {
+            dcq[row * cdim + (long)(2 * kd + h * DV + j)] = beta * du;
+            float pb = du * vmk;
+            for (int o = 16; o > 0; o >>= 1) pb += __shfl_xor_sync(0xffffffffu, pb, o);
+            if (lane == 0) rb[w] = pb;
+        }
+        // dk̂ = dS·u + S_pre·dkv (across columns); dg = ⟨dS_pre, S_{t-1}⟩; dS ← g·dS_pre
+        float dgp = 0.f;
+#pragma unroll
+        for (int i = 0; i < GR; i++) {
+            const float sp = St[i];
+            float v = dS[i] * vmk * beta + sp * g * dkv;
+            for (int o = 1; o < (1 << GSH); o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lead) pk_[slot][i0 + i] = v;
+            const float dspre = dS[i] + ks[i0 + i] * invk * dkv;
+            dgp += dspre * sp;
+            dS[i] = g * dspre;
+        }
+        for (int o = 16; o > 0; o >>= 1) dgp += __shfl_xor_sync(0xffffffffu, dgp, o);
+        if (lane == 0) rg[w] = dgp;
+        __syncthreads();
+        // the warps' partials in order, then the l2-norm through-grads of this head
+        float aq = 0.f, ak = 0.f;
+        if (tid < DK) {
+#pragma unroll
+            for (int x = 0; x < GW * GP; x++) {
+                aq += pq_[x][tid];
+                ak += pk_[x][tid];
+            }
+            float pq = aq * qs[tid], pk = ak * ks[tid];
+            for (int o = 16; o > 0; o >>= 1) {
+                pq += __shfl_xor_sync(0xffffffffu, pq, o);
+                pk += __shfl_xor_sync(0xffffffffu, pk, o);
+            }
+            if (lane == 0) {
+                rqd[w] = pq;
+                rkd[w] = pk;
+            }
+        }
+        if (tid == 0) {
+            float dg = 0.f;
+            for (int x = 0; x < GC * GW; x++) dg += rg[x];
+            da[row * nv + h] = dg * g * (-ea) * bk_sigmoid(arg);
+            db[row * nv + h] = nt_gsum(rb) * beta * (1.f - beta);
+        }
+        __syncthreads();
+        if (tid < DK) {
+            const float qdot = nt_gsum(rqd), kdot = nt_gsum(rkd);
+            float* dst = dqk + ((size_t)row * nv + h) * 2 * DK;
+            dst[tid] = invq * aq - qs[tid] * qdot * invq / nq2;
+            dst[DK + tid] = invk * ak - ks[tid] * kdot * invk / nk2;
+        }
+    }
+}
+
+// dcq[row][ko·DK + i] = Σ over the v-heads h of k-group ko (in order) of
+// DQK[row][h][i]; the k̂ channels likewise at kd + ko·DK + i.
+extern "C" __global__ void nt_gdn_qk_sum(const float* __restrict__ dqk, float* __restrict__ dcq, int nv, int nk)
+{
+    const int kd = nk * DK, rep = nv / nk, cdim = 2 * kd + nv * DV;
+    const size_t row = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= 2 * kd) return;
+    const int part = c / kd, ko = (c % kd) / DK, i = c % DK;
+    float acc = 0.f;
+    for (int r = 0; r < rep; r++) acc += dqk[(row * nv + ko * rep + r) * 2 * DK + part * DK + i];
+    dcq[row * cdim + c] = acc;
+}
+
+// ───────────────────────────── head: KL to the teacher's top-k ─────────────────────────────
+
+// Per token (a block a row): loss over the teacher's support, the logits
+// replaced by coef·ws·p_S − coef·p_T (ws = the row's weight when weighted).
+extern "C" __global__ void nt_kl_rows(float* __restrict__ LG, const u32* __restrict__ TID, const float* __restrict__ TP,
+                                      float* __restrict__ LOSS, u32 v, u32 k, float coef, u32 weighted)
+{
+    __shared__ float red[32];
+    const size_t row = blockIdx.x;
+    const u32 t = threadIdx.x, nt = blockDim.x;
+    float* lg = LG + row * v;
+    const u32* tid = TID + row * k;
+    const float* tp = TP + row * k;
+    float mx = -3.0e38f;
+    for (u32 j = t; j < v; j += nt) mx = fmaxf(mx, lg[j]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((t & 31) == 0) red[t >> 5] = mx;
+    __syncthreads();
+    mx = -3.0e38f;
+    for (u32 i = 0; i < (nt >> 5); i++) mx = fmaxf(mx, red[i]);
+    __syncthreads();
+    float sum = 0.f;
+    for (u32 j = t; j < v; j += nt) sum += __expf(lg[j] - mx);
+    const float lse = mx + __logf(nt_block_sum(sum, red));
+    __syncthreads();
+    float wsum = 0.f;
+    for (u32 q = t; q < k; q += nt) wsum += tp[q];
+    const float wtot = nt_block_sum(wsum, red);
+    const float ws = weighted ? wtot : 1.f;
+    __syncthreads();
+    float lp = 0.f;
+    for (u32 q = t; q < k; q += nt) {
+        const float pt = tp[q];
+        if (pt > 0.f) lp += pt * (__logf(pt / ws) - (lg[tid[q]] - lse));
+    }
+    const float ls = nt_block_sum(lp, red);
+    if (t == 0) LOSS[row] = ls;
+    __syncthreads();
+    for (u32 j = t; j < v; j += nt) lg[j] = __expf(lg[j] - lse) * (coef * ws);
+    __syncthreads();
+    for (u32 q = t; q < k; q += nt) lg[tid[q]] -= tp[q] * coef;
+}
+
+// Teacher top-k per row (a block of 256 a row): each thread keeps its best 8
+// of a strided scan, the 2048 candidates are bitonic-sorted in shared memory,
+// the first k are written with probabilities renormalized over them.
+extern "C" __global__ void nt_topk_rows(const float* __restrict__ LG, u32* __restrict__ TID, float* __restrict__ TP, u32 v,
+                                        u32 k)
+{
+    __shared__ float cv[2048];
+    __shared__ u32 ci[2048];
+    __shared__ float red[32];
+    const size_t row = blockIdx.x;
+    const u32 t = threadIdx.x;
+    const float* lg = LG + row * v;
+    float bv[8];
+    u32 bi[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        bv[q] = -3.0e38f;
+        bi[q] = 0;
+    }
+    for (u32 j = t; j < v; j += 256u) {
+        const float x = lg[j];
+        if (x > bv[7]) {
+            int pos = 7;
+            while (pos > 0 && bv[pos - 1] < x) {
+                bv[pos] = bv[pos - 1];
+                bi[pos] = bi[pos - 1];
+                pos--;
+            }
+            bv[pos] = x;
+            bi[pos] = j;
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        cv[t * 8 + q] = bv[q];
+        ci[t * 8 + q] = bi[q];
+    }
+    __syncthreads();
+    // bitonic sort, descending
+    for (u32 kk = 2; kk <= 2048u; kk <<= 1) {
+        for (u32 jj = kk >> 1; jj > 0; jj >>= 1) {
+            for (u32 e = t; e < 2048u; e += 256u) {
+                const u32 x = e ^ jj;
+                if (x > e) {
+                    const bool desc = (e & kk) == 0;
+                    const float a = cv[e], b = cv[x];
+                    if ((desc && a < b) || (!desc && a > b)) {
+                        cv[e] = b;
+                        cv[x] = a;
+                        const u32 ti = ci[e];
+                        ci[e] = ci[x];
+                        ci[x] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    const float mx = cv[0];
+    float s = 0.f;
+    for (u32 q = t; q < k; q += 256u) s += __expf(cv[q] - mx);
+    const float zsum = nt_block_sum(s, red);
+    for (u32 q = t; q < k; q += 256u) {
+        TID[row * k + q] = ci[q];
+        TP[row * k + q] = __expf(cv[q] - mx) / zsum;
+    }
+}
+
+// ───────────────────────────── optimizer ─────────────────────────────
+
+// Adam (no weight decay) over every parameter entry: mask 0 = frozen; relf > 0:
+// the step is relative to the value's magnitude, floored at relf. The gradient
+// is cleared.
+extern "C" __global__ void nt_adam(float* __restrict__ w, float* __restrict__ g, float* __restrict__ m1,
+                                   float* __restrict__ m2, const float* __restrict__ mask, const float* __restrict__ relf,
+                                   size_t n, float lr, float bc1, float bc2, float b1, float b2, float eps, float gmul)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gr = g[i] * gmul;
+    g[i] = 0.f;
+    if (mask[i] == 0.f) return;
+    const float a1 = b1 * m1[i] + (1.f - b1) * gr;
+    const float a2 = b2 * m2[i] + (1.f - b2) * gr * gr;
+    m1[i] = a1;
+    m2[i] = a2;
+    const float st = lr * (a1 / bc1) / (sqrtf(a2 / bc2) + eps);
+    const float rf = relf[i];
+    if (rf > 0.f) w[i] = w[i] - st * fmaxf(fabsf(w[i]), rf);
+    else w[i] = w[i] - st;
+}
+
+// Partial sums of squares of a[0..n): out[block] (non-finite values propagate).
+extern "C" __global__ void nt_sumsq(const float* __restrict__ a, float* __restrict__ out, size_t n, u32 nblk)
+{
+    __shared__ float red[32];
+    float acc = 0.f;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)blockDim.x * nblk) acc += a[i] * a[i];
+    const float s = nt_block_sum(acc, red);
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}

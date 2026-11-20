@@ -994,6 +994,15 @@ pub use gptq::{gptq_fold_chol_inv, gptq_gemm_rows_square, gptq_refine_rows};
 mod tpenc;
 pub use tpenc::{gptq_sweep, tp_encode, tp_place_q2};
 
+/// The NVG `blr` encoder's device linear algebra (the API of
+/// `gpu_wgpu::nvg_dev`, reached through `crate::nvg_dev`); declared after
+/// `kargs!`, which it uses.
+pub mod nvg_dev;
+
+/// NVG Ť (the distillation trainer of `nvg_train.rs`) and the conversion's
+/// calibration forward on this backend; declared after `kargs!`, which it uses.
+pub mod nvgt;
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
@@ -1101,6 +1110,11 @@ pub(crate) fn kt_start() {
 }
 
 pub(crate) fn kt_stop() {
+    kt_stop_as("qwen4 cuda")
+}
+
+/// [`kt_stop`] under another label (the NVG trainer's `CMF_NVG_KT`).
+pub(crate) fn kt_stop_as(label: &str) {
     KT_ON.store(false, Ordering::SeqCst);
     let events = std::mem::take(&mut *KT_EVENTS.lock().unwrap());
     let names = KT_NAMES.lock().unwrap();
@@ -1121,9 +1135,9 @@ pub(crate) fn kt_stop() {
     }
     let mut rows: Vec<(String, (usize, f64))> = by.into_iter().collect();
     rows.sort_by(|x, y| y.1.1.total_cmp(&x.1.1));
-    eprintln!("qwen4 cuda: kernel times of one round: {n} launches, {total:.2} ms between their events");
+    eprintln!("{label}: kernel times of one round: {n} launches, {total:.2} ms between their events");
     for (name, (c, ms)) in rows.iter().take(40) {
-        eprintln!("qwen4 cuda: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
+        eprintln!("{label}: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
     }
 }
 
