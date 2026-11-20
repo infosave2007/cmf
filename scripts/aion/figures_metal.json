@@ -1,0 +1,4 @@
+{"metal": {
+ "q4tp": [{"ctx": 2048, "ttft": 3.48, "decode": 53.4}, {"ctx": 8192, "ttft": 18.4, "decode": 47.4}, {"ctx": 16384, "ttft": 44.0, "decode": 42.2}],
+ "q8_2f": [{"ctx": 2048, "ttft": 4.17, "decode": 33.8}, {"ctx": 8192, "ttft": 22.7, "decode": 33.0}]
+}}
