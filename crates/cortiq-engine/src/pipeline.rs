@@ -6237,7 +6237,7 @@ impl Pipeline {
         let drain_every = std::env::var("CMF_O1_QCAP_DRAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1);
         let (mut drain_from, mut undrained) = (0usize, 0usize);
         while pos < n {
-            let end = (pos + chunk).min(n);
+            let end = o1_chunk_end(pos, chunk, n);
             let bk = end - pos;
             let mut hiddens = vec![0f32; bk * hs];
             for (j, &id) in ids[pos..end].iter().enumerate() {
@@ -8069,6 +8069,7 @@ impl Pipeline {
                 let stop = if o1_arch.is_some() { tail_from } else { input_ids.len() };
                 let end = match snap_at {
                     Some(s) if pos < s => (pos + chunk).min(stop).min(s),
+                    _ if o1_arch.is_some() => o1_chunk_end(pos, chunk, stop),
                     _ => (pos + chunk).min(stop),
                 };
                 let bk = end - pos;
@@ -27705,8 +27706,48 @@ fn ffn_forward_pair(
     })
 }
 
+/// Rows a far-field prompt chunk keeps at least when it is the last before
+/// `stop`: a chunk of a few rows can go a backend's decode-sized path (the
+/// CUDA hybrid arm's 16-row small path), which captures neither the seal's
+/// queries nor the archive's K/V rows. Aion-2.3B, 26 626 rows: the whole-prompt
+/// prefix in 1024-row chunks ended in 2 rows ("0 query values"), the sealed
+/// 512-row chunks before the tail in 2 rows (an archive two rows short, exact
+/// rows read from the wrong place, a garbled answer).
+const O1_MIN_LAST_CHUNK: usize = 32;
+
+/// The end of a far-field prompt chunk from `pos`, at most `chunk` rows and not
+/// past `stop`, that leaves the chunk after it at least [`O1_MIN_LAST_CHUNK`] rows.
+fn o1_chunk_end(pos: usize, chunk: usize, stop: usize) -> usize {
+    let end = (pos + chunk).min(stop);
+    let rest = stop - end;
+    if rest > 0 && rest < O1_MIN_LAST_CHUNK && stop - O1_MIN_LAST_CHUNK > pos + O1_MIN_LAST_CHUNK {
+        stop - O1_MIN_LAST_CHUNK
+    } else {
+        end
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn o1_chunks_never_end_in_a_sliver() {
+        // 26 626 rows in 1024-row chunks: the last but one stops 32 short
+        let mut ends = Vec::new();
+        let mut pos = 0;
+        while pos < 26_626 {
+            let e = super::o1_chunk_end(pos, 1024, 26_626);
+            ends.push(e - pos);
+            pos = e;
+        }
+        assert_eq!(pos, 26_626);
+        assert!(ends.iter().all(|&b| b >= 32 && b <= 1024), "{ends:?}");
+        assert_eq!(*ends.last().unwrap(), 32);
+        // an exact multiple and a short span are left alone
+        assert_eq!(super::o1_chunk_end(0, 512, 1024), 512);
+        assert_eq!(super::o1_chunk_end(1000, 512, 1010), 1010);
+        assert_eq!(super::o1_chunk_end(0, 512, 530), 498);
+    }
     use std::ffi::OsString;
     use std::sync::Mutex;
 

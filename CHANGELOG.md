@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - wgpu batch prompt: a file whose dense FFN is 8-bit reads its q8_2f matrices from 1024 rows on the matrix units
   (4096 before; four-bit files keep 4096, `CMF_Q82_COOP_ROWS` overrides). Aion-2.3B q8_2f on an L4: first token of
   2k / 8k / 16k 4.73 / 20.8 / 43.3 → 1.25 / 6.39 / 15.5 s, perplexity unchanged (14.251).
+- YaRN's attention amplitude folds into the q/k norms of the full layers alone when the sliding layers have none
+  of their own (Aion: 7 full layers on YaRN ×16, 21 window layers on plain RoPE); before, any sliding layer kept the
+  scale in the rotation. Perplexity unchanged (4 × 4096 tokens 9.469 on CUDA and Vulkan); the Turbo far field
+  reads the facts of 13k-token prompts 4/4 on Vulkan (3/4 before).
+- A far-field prompt chunk (the prefix read for a seal, the sealed chunks before the tail) is never left a few rows
+  long: such a chunk took the CUDA hybrid arm's 16-row small path, which captures neither the seal's queries nor
+  the archive's rows. Aion Turbo, a 26 626-row prompt on CUDA: "O(1) prefix: 0 query values" → an answer.
 - `quantize-gptq` / `quantize-moe` on a CUDA build: a Hessian fold at least 1024 wide runs its O(n³) algebra (two
   Cholesky factors and the inverse, f64) on cuBLAS — host 256² diagonal blocks, `dtrsm` panels, `dsyrk` updates.
   Aion's q4tp with channel scale and code refinement (28 folds 8192 wide): 1919 → 628 s on a Colab L4;

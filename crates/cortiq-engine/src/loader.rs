@@ -3090,18 +3090,26 @@ impl Pipeline {
 /// `CMF_YARN_FOLD=0` keeps the scale in the rotation.
 pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
     let s = p.rope_scale;
+    // Sliding layers with a scale of their own of 1 (Aion: plain RoPE on the
+    // 21 window layers, YaRN ×16 on the 7 full ones) take no part: the scale
+    // folds into the full layers' norms alone, the local tables stay.
+    let sliding = p.sliding_layers.is_some() || p.swa.is_some() || p.inv_freq_local.is_some();
     if s == 1.0
         || p.qk_norm_after_rope
         || p.rope_scale_local != 1.0
-        || p.sliding_layers.is_some()
-        || p.swa.is_some()
-        || p.inv_freq_local.is_some()
+        || (sliding && p.mtp.is_some())
         || p.global_attn.is_some()
         || p.inv_freq_global.is_some()
         || std::env::var("CMF_YARN_FOLD").as_deref() == Ok("0")
     {
         return;
     }
+    let local: Vec<bool> = (0..p.weights.layers.len())
+        .map(|li| match &p.sliding_layers {
+            Some(m) => m.get(li).copied().unwrap_or(false),
+            None => p.swa.is_some_and(|(_, pat)| pat != usize::MAX && (li + 1) % pat.max(1) != 0),
+        })
+        .collect();
     let (rd, hd, gemma) = (p.rotary_dim.min(p.head_dim), p.head_dim, p.norm_style == cortiq_core::NormStyle::Gemma);
     let norms_ok = |a: &AttnKind| match a {
         AttnKind::Full { q_norm: Some(q), k_norm: Some(k), .. } => q.len() == hd && k.len() == hd,
@@ -3121,14 +3129,19 @@ pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
             fold_rope_scale_gain(k, rd, s, gemma);
         }
     };
-    for l in p.weights.layers.iter_mut() {
-        fold_attn(&mut l.attn);
+    let mut folded = 0;
+    for (li, l) in p.weights.layers.iter_mut().enumerate() {
+        if !local[li] {
+            fold_attn(&mut l.attn);
+            folded += 1;
+        }
     }
     if let Some(m) = p.mtp.as_mut() {
         fold_attn(&mut m.layer.attn);
     }
     p.rope_scale = 1.0;
-    tracing::info!("YaRN scale {s} folded into the q/k norms of {full_layers} layers ({rd} rotary channels of {hd})");
+    let _ = full_layers;
+    tracing::info!("YaRN scale {s} folded into the q/k norms of {folded} layers ({rd} rotary channels of {hd})");
 }
 
 /// One q/k norm's gain with a RoPE cos/sin scale `s` folded into its first `rd`
