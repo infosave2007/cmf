@@ -102,7 +102,22 @@ pub enum O1Rect {
 
 /// Ridge factor for the regularized pseudo-inverse of the landmark
 /// kernel: λ = RIDGE_REL · mean(diag(AᵀA)).
-const RIDGE_REL: f64 = 1e-6;
+pub const RIDGE_REL: f64 = 1e-6;
+/// The ridge factor of a seal that keeps exact rows beside its far field
+/// (`with_landmarks_from`). A query that reads one of those rows lies off
+/// the landmarks' span, and at 1e-6 the pseudo-inverse turns that into a
+/// far mass of either sign and any size: where it came out large it drowned
+/// the exact row. Aion-1.0-Instruct Turbo answered one planted-fact prompt
+/// of 24 with a loop of two characters, and which prompt depended on where
+/// the landmark means began. From 1e-5 to 1e-1 both prompts read their fact
+/// back under every landmark rule tried; `CMF_O1_RIDGE` sets another factor.
+pub const RIDGE_REL_EXACT: f64 = 1e-4;
+/// `RIDGE_REL_EXACT`, or the factor `CMF_O1_RIDGE` names (1e-6 is the
+/// skeleton as it was).
+fn exact_ridge() -> f64 {
+    static R: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| std::env::var("CMF_O1_RIDGE").ok().and_then(|s| s.parse::<f64>().ok()).filter(|r| *r > 0.0).unwrap_or(RIDGE_REL_EXACT))
+}
 /// Floor for the joint denominator (mirrors the reference probe).
 const DEN_EPS: f32 = 1e-30;
 /// Prompts of length ≤ w + EXACT_SLACK skip the skeleton entirely:
@@ -372,6 +387,9 @@ struct NystromGroup {
     /// means (`with_landmarks_from`): the rows a seal keeps exact behind the
     /// sinks. 0 = every row, the historical means.
     lm_from: usize,
+    /// Ridge factor of the skeleton's pseudo-inverse (`RIDGE_REL`, or
+    /// `RIDGE_REL_EXACT` beside exact rows).
+    ridge: f64,
     d: usize,
     dv: usize,
     /// Effective landmark count: clamp(t/8, 4, m) at prefill.  Derived
@@ -584,6 +602,7 @@ impl NystromState {
                 base_w: w,
                 sink,
                 lm_from: 0,
+                ridge: RIDGE_REL,
                 d: 0,
                 dv: 0,
                 m_eff: 0,
@@ -618,10 +637,23 @@ impl NystromState {
     /// segment of 816 made its landmark an outlier, the kernel matrix
     /// ill-conditioned, and Aion's far field answered a 27k-token prompt with
     /// garbled text from 216 kept rows on. `CMF_O1_LM_ALL=1` keeps the old means.
+    ///
+    /// A seal with such rows (`from > 0`) also takes the stronger ridge of
+    /// `RIDGE_REL_EXACT`.
     pub fn with_landmarks_from(mut self, from: usize) -> Self {
         if std::env::var("CMF_O1_LM_ALL").as_deref() != Ok("1") {
             self.group.lm_from = from;
         }
+        if from > 0 {
+            self.group.ridge = exact_ridge();
+        }
+        self
+    }
+
+    /// The ridge factor of the skeleton's pseudo-inverse (builder).
+    pub fn with_ridge(mut self, rel: f64) -> Self {
+        assert!(rel > 0.0, "the ridge factor must be positive");
+        self.group.ridge = rel;
         self
     }
 
@@ -1028,7 +1060,7 @@ impl NystromState {
                     au[i * m_eff + j] = (s * g.scale as f64).exp();
                 }
             }
-            let mu64 = ridge_pinv(&au, m_eff);
+            let mu64 = ridge_pinv_rel(&au, m_eff, g.ridge);
             head.mu = mu64.iter().map(|&x| x as f32).collect();
             // Re-warm: the far field is rebuilt from the ring. Mass
             // older than the ring is dropped — under the drifted
@@ -1301,7 +1333,7 @@ impl NystromHead {
                     au[i * m_eff + j] = (s * g.scale as f64).exp();
                 }
             }
-            let mu64 = ridge_pinv(&au, m_eff);
+            let mu64 = ridge_pinv_rel(&au, m_eff, g.ridge);
             self.mu = mu64.iter().map(|&x| x as f32).collect();
         }
 
@@ -1556,6 +1588,11 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// pub(crate): the FCD polish trainer builds its (constant-in-backward)
 /// mixing matrix with the SAME solver the runtime seals with.
 pub(crate) fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
+    ridge_pinv_rel(a, n, RIDGE_REL)
+}
+
+/// `ridge_pinv` with the ridge factor given: λ = rel·mean(diag(AᵀA)).
+pub fn ridge_pinv_rel(a: &[f64], n: usize, rel: f64) -> Vec<f64> {
     let mut ata = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -1567,7 +1604,7 @@ pub(crate) fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
         }
     }
     let mean_diag: f64 = (0..n).map(|i| ata[i * n + i]).sum::<f64>() / n as f64;
-    let mut lambda = RIDGE_REL * mean_diag.max(f64::MIN_POSITIVE);
+    let mut lambda = rel * mean_diag.max(f64::MIN_POSITIVE);
     for _ in 0..12 {
         let mut g = ata.clone();
         for i in 0..n {
