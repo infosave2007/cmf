@@ -475,6 +475,35 @@ release 构建，两列用同一张显卡和同一个构建；Vulkan 是 wgpu �
   最多 3.77 GB。走 Vulkan：66.4 秒、55 tok/s、4.34 GB，回答的开头相同（`scripts/dory_cuda/serve_check.sh`；还有
   接续的一轮对话、工具调用、流式回答和同时两个槽位）。
 
+## 低于 1 比特的文件：NVG 转换器和训练器
+
+NVG 路径——`convert --quant blr --blr-method nvg`、`nvg-bench`、`nvg-train`——在 `CMF_GPU=cuda` 下全部在显卡上
+运行，不需要 Vulkan 适配器：校准前向及其 Gram 矩阵、编码器（白化、潜变量、规范旋转、闭式度量、离散结点）和
+训练器（教师 top-k、前向、穿过 GDN 混合器与门控注意力的反向扫描、度量上的 Adam、符号潜变量）。文件、快照和
+保存的训练状态与 wgpu 路径相同：一个后端保存的状态可以在另一个后端继续。实现方式以及与 wgpu 路径的一致性见
+[BLR_NVG.md §8](BLR_NVG.md#8-on-cuda-cmf_gpucuda)。
+
+```bash
+CMF_GPU=cuda cortiq convert --model <hf 目录> --quant blr --bpw 0.55 --blr-method nvg --calib calib.txt --output m.cmf
+CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tokens 1048576 --window 512 --batch 8 \
+    --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
+```
+
+一块 RTX PRO 6000 Blackwell（96 GB）；wgpu 一列是同一块显卡经 Vulkan 的结果（27B 的数据来自 11 月 3 日在同型号
+显卡上的运行）：
+
+| | wgpu | CUDA |
+|---|---:|---:|
+| Qwen3.5-0.8B，1.0 比特/权重：整个转换 | 492 s | 216 s |
+| 一层的校准 / 一层的编码 | 2.6 s / 17.3 s | 0.45 s / 7.2–8.7 s |
+| 训练一步，8 × 512 词元，度量和符号 | 0.69 s | 0.34 s |
+| 100 万词元的训练，整个运行 | 227 s | 96 s |
+| Qwen3.8-27B，0.55 比特/权重：教师 top-64 前向 | 3.0k tok/s | 4.9k tok/s |
+| 训练一步，8 × 512 词元，度量和符号 | 4.9 s | 3.58 s |
+| 100 万词元：256 步及其教师前向 | 26.7 分钟 | 18.9 分钟 |
+
+0.8B 训练后的留出 KL：CUDA 为 1.4456，wgpu 为 1.4490；在 CUDA 上重复转换得到相同的字节。
+
 ## 选项
 
 | 变量 | 含义 |
@@ -503,6 +532,11 @@ release 构建，两列用同一张显卡和同一个构建；Vulkan 是 wgpu �
 | `CMF_DORY_BIG=0` | Dory 的提示走张量核矩阵向量乘，每次 16 行 |
 | `CMF_DORY_KT=N`、`CMF_DORY_KT_AT=P` | Dory 第 N 个词元、位置 P 处提示块的内核时间 |
 | `CMF_DORY_ATT_ROWS=N` | Dory 提示块每次注意力 GEMM 处理的查询行数，默认 128（512：0.8.71 的做法） |
+| `CMF_NVG_ENC=cuda\|wgpu` | NVG 编码器的后端，可与引擎的后端不同 |
+| `CMF_NVG_CALIB=engine` | NVG 转换的校准走引擎的捕获钩子 |
+| `CMF_NVG_CUDA_POOL_GB=N` | NVG 编码器保留的空闲显存缓冲，默认 24 GB |
+| `CMF_NVG_GDN_HIST_GB=N` | NVG 训练器 GDN 状态历史的上限，默认 16 GB |
+| `CMF_NVG_PROF=1`、`CMF_NVG_KT=N` | NVG 训练器各阶段的时间；其第 N 步的内核时间 |
 
 ## 限制
 
@@ -512,6 +546,8 @@ release 构建，两列用同一张显卡和同一个构建；Vulkan 是 wgpu �
   4.5 GB）。混合分支和 Dory 读提示都不超出封口时的内存。已封口对话的新一轮会把对话重新读一遍，wgpu
   路径也是如此。
 - 草稿在混合分支和 Fast Code 堆栈上运行，不在稠密分支上。
+- NVG 训练器和转换器覆盖 Qwen3.5 系列（GDN 混合器、门控注意力），与 wgpu 相同；`nvg-train --mask-keep` 只在
+  wgpu 训练器上运行。
 - toolkit 的库必须在加载器的路径上；绑定针对 CUDA 12.x。
 - 解码受自身运算限制：在 A40 上约 350 GB/s 的权重，而只加载权重的内核为 500
   （`scripts/cuda/bench/mv_bench.cu`）。

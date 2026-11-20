@@ -2235,6 +2235,62 @@ mod tests {
         ((*seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
     }
 
+    /// The channel scale is a change of the input basis: the H-weighted error
+    /// of any approximation is the same number in the scaled basis, the live
+    /// channels' scales have a unit geometric mean, a dead channel keeps 1.
+    #[test]
+    fn channel_scale_is_a_change_of_basis() {
+        let (w, mut h) = synth();
+        let (m, n) = (w.r, w.c);
+        // a dead input channel
+        for j in 0..n {
+            h.d[5 * n + j] = 0.0;
+            h.d[j * n + 5] = 0.0;
+        }
+        let mut s = 7u64;
+        let mut wq = w.clone();
+        wq.d.iter_mut().for_each(|v| *v += 0.1 * rnd(&mut s));
+        let err = |w: &Mat, wq: &Mat, h: &Mat| -> f64 {
+            let mut e = 0.0;
+            for i in 0..m {
+                let d: Vec<f64> = (0..n).map(|j| w.d[i * n + j] - wq.d[i * n + j]).collect();
+                for a in 0..n {
+                    for b in 0..n {
+                        e += d[a] * h.d[a * n + b] * d[b];
+                    }
+                }
+            }
+            e
+        };
+        let colsq: Vec<f64> = (0..n).map(|j| (0..m).map(|i| w.d[i * n + j] * w.d[i * n + j]).sum()).collect();
+        let hdiag: Vec<f64> = (0..n).map(|j| h.d[j * n + j]).collect();
+        let e0 = err(&w, &wq, &h);
+        for alpha in [0.0, 0.5, 0.75, 1.0] {
+            let t = channel_scale(&colsq, m, &hdiag, alpha);
+            assert_eq!(t[5], 1.0, "a dead channel keeps its unit");
+            assert!(t.iter().all(|v| v.is_finite() && *v > 0.0));
+            let lg: f64 = t.iter().enumerate().filter(|(j, _)| *j != 5).map(|(_, v)| v.ln()).sum();
+            assert!(lg.abs() < 1e-9 * n as f64, "alpha {alpha}: geometric mean {}", (lg / (n - 1) as f64).exp());
+            let (mut ws, mut wqs, mut hs) = (w.clone(), wq.clone(), h.clone());
+            for i in 0..m {
+                for j in 0..n {
+                    ws.d[i * n + j] /= t[j];
+                    wqs.d[i * n + j] /= t[j];
+                }
+            }
+            rebase_gram(&mut hs, &t);
+            let e1 = err(&ws, &wqs, &hs);
+            assert!((e1 - e0).abs() < 1e-9 * e0, "alpha {alpha}: {e1} against {e0}");
+        }
+        // alpha 1 follows the weight columns alone, alpha 0 the inverse input RMS alone
+        let t1 = channel_scale(&colsq, m, &hdiag, 1.0);
+        let t0 = channel_scale(&colsq, m, &hdiag, 0.0);
+        let (sa, sb) = ((colsq[1] / m as f64).sqrt(), (colsq[9] / m as f64).sqrt());
+        assert!((t1[1] / t1[9] - sa / sb).abs() < 1e-9 * (sa / sb));
+        let (ra, rb) = (hdiag[1].sqrt(), hdiag[9].sqrt());
+        assert!((t0[1] / t0[9] - rb / ra).abs() < 1e-9 * (rb / ra));
+    }
+
     /// Synthetic layer: decaying spectrum, three heavy input channels.
     fn synth() -> (Mat, Mat) {
         let (m, n, t) = (96usize, 64usize, 1024usize);

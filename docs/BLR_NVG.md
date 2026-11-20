@@ -433,19 +433,31 @@ layer runs once over the conversion. `nvg-bench` and `nvg-train --budget-plan` c
 `nvg-train` picks its backend at start (`Backend` in `nvgtrain.rs`): the wgpu trainer of `nvg_train.rs`, or
 `gpu_cuda::nvgt`. The step is the same — teacher top-k, forward with checkpointed layer inputs, KL through the
 frozen head, a reverse sweep that recomputes each layer, Adam on the metric, the sign latents updated right after
-each path's backward — with these differences in how it runs:
+each path's backward — and it is laid out for the card's two limits, the tensor cores and the memory bus:
 
-* every product is a cuBLAS GEMM on the tensor cores over f16 operands with f32 accumulation: activations staged
-  by one launch (the column factor g, ℓ or h and the gradient scale folded in), the sign bitmaps expanded to ±1 f16
-  planes right before use (no resident plane), frozen weights as f16 planes; the small GDN a/b projections in f32;
-* the GDN recurrence and its BPTT are the skill bake's kernels with ordered reductions (a v-head writes its q̂/k̂
-  through-gradients, a second launch adds the heads of a k-group in order); the state history of the BPTT is
-  `(t+1)·128·128` floats a (window, v-head), `CMF_NVG_GDN_HIST_GB` (default 16) caps it by running the windows in
-  groups; attention is batched GEMMs (TF32; `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM) and a causal softmax;
-* every trainable parameter lives in one concatenated buffer with its gradient and Adam moments: the optimizer and
-  the gradient norm are one launch each;
-* column reductions run in two ordered passes and the sign kernels are built without fused multiply-adds, so a
-  step is bit-reproducible and a sign update is bit for bit `train_sign`'s host mirror (tested).
+* *Products*: cuBLAS GEMMs on the tensor cores over f16 operands with f32 accumulation (the small GDN a/b
+  projections in f32).
+* *The scales ride the sign planes.* A bitmap is expanded to the f16 plane `±h_i` (U) or `±g_j` (V), times a
+  power of two per path that keeps the largest scale under 1 (`nt_expand_s`). So a layer input is staged in f16
+  once for every linear and path that reads it, a path's product lands in the sum — `y`, or the input gradient —
+  through the GEMM's β, and nothing the size of an activation is scaled, copied or added per path. h and g are
+  f16 in the forward, as they are in the file. The planes of a layer are kept from its forward for its backward.
+* *The scales' gradients come out of the sign gradients.* With `G'_U = dyᵀ·(a ⊙ ℓ)` and `G'_V = xᵀ·(t2 ⊙ ℓ)`
+  (`t2 = (dy ⊙ h)·S_U`): `dh_i = Σ_k S_U[i][k]·G'_U[i][k]`, `dg_j = Σ_k S_V[j][k]·G'_V[j][k]`, and the signs'
+  gradients are `diag(h)·G'_U`, `diag(g)·G'_V` — one row pass over an `m×r` matrix (`nt_g_fold`) instead of a
+  column reduction over `tokens×m` activations. Only `dℓ = Σ a ⊙ t2` reduces over tokens, at the rank's width.
+* *GDN*: the recurrence in blocks of 512 threads (`nt_gdn_fwd`, `nt_gdn_rev`): a thread keeps 32 state rows of one
+  column in registers, column sums go through shared memory, row sums take two shuffle steps and the rest through
+  shared memory; four barriers a position; a position's inputs are read one position ahead, so their latency
+  passes under the arithmetic. The BPTT's state history is f16, written by the forward that the reverse sweep's
+  recompute runs anyway and read once: `t·128·128` halves a (window, v-head) — `CMF_NVG_GDN_HIST_GB` (default 16)
+  caps it by replaying the windows in groups. A v-head writes its q̂/k̂ through-gradients, a second launch adds
+  the heads of a k-group in order. `CMF_NVG_GDN_GC` = 1, 2, 4 picks the block (128, 256, 512 threads).
+* *Attention*: batched GEMMs (TF32; `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM) and a causal softmax.
+* Every trainable parameter lives in one concatenated buffer with its gradient and Adam moments: the optimizer
+  and the gradient norm are one launch each.
+* Reductions run in a fixed order and the sign kernels are built without fused multiply-adds, so a step is
+  bit-reproducible and a sign update is bit for bit `train_sign`'s host mirror (tested).
 
 `--mask-keep` (DTG-MA before the metric) stays on the wgpu trainer. `CMF_NVG_PROF=1` prints the time per phase
 (the stream drained at phase changes), `CMF_NVG_KT=N` the time of every kernel and GEMM of step N.
@@ -453,21 +465,94 @@ each path's backward — with these differences in how it runs:
 ### 8.4 Agreement with the wgpu path
 
 The math is the same; the arithmetic differs in its accumulation order (cuBLAS against the wgpu tiles), in the
-f16 operands of the trainer's products, and in nothing else. Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
+f16 operands of the trainer's products and its f16 h, g and GDN state history, and in nothing else.
+Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
 
 | what | wgpu | CUDA |
 |---|---|---|
 | encoder on identical Grams (wgpu calibration, `CMF_NVG_ENC`), layer 0 held-out error: qkv / down / gate / up / z / out | 0.2143 / 0.4883 / 0.3663 / 0.5276 / 0.3371 / 0.3538 | 0.2143 / 0.4880 / 0.3664 / 0.5273 / 0.3377 / 0.3535 |
 | the same with the CUDA calibration | — | 0.2145 / 0.4881 / 0.3662 / 0.5279 / 0.3367 / 0.3528 |
-| trainer on one file: held-out KL before | 3.47721 | 3.47721 |
-| loss of steps 1–3 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0526, 2.9162 |
-| signs flipped by step 11 | 296 527 | 296 468 |
-| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.45096 |
-| perplexity after it, WikiText-2 test / C4 validation (16 × 512) | 80.57 / 153.07 | 80.40 / 153.93 |
+| trainer on one file: held-out KL before | 3.47721 | 3.47725 |
+| loss of steps 1, 7, 10 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0533, 2.9170 |
+| signs flipped by step 11 | 296 527 | 295 157 |
+| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44555 |
+| signs flipped in the run | 0.901 % | 0.896 % |
+
+A conversion repeated on CUDA gives the same bytes, and the training after it the same curve to the last printed
+digit. A training stopped at a saved state and resumed gives the losses and the held-out KL of an uninterrupted
+run; a state saved by one backend loads on the other.
 
 Kernel tests on the card (`cargo test -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests
 gpu_cuda::nvgt::tests`, and the encoder driver's tests with `CMF_NVG_ENC=cuda`): the GEMM views, the elementwise
-kernels, the eigensolver, the SPD solve and the whitening factor against f64; a binary low-rank layer's forward and
-backward against f64 (3·10⁻⁴: f16 operands); the GDN and attention cores against the skill bake's kernels (equal);
-the head's top-k and KL against the host; a sign update against `train_sign::host_step_fact` (no differing latent,
-moment or bitmap word); the device encoder against the f64 host encoder (`nvg_gpu` tests).
+kernels, the eigensolver, the SPD solve and the whitening factor against f64; a binary low-rank layer's forward
+and backward against f64 (4·10⁻⁴: f16 operands and scales); the GDN core against the skill bake's kernels
+(output 2·10⁻⁷; gradients 1·10⁻⁴ … 3·10⁻⁴: f16 history), kept by the forward and replayed a sequence a launch;
+the attention core against the bake's (equal); the head's top-k and KL against the host; a sign update against
+`train_sign::host_step_fact` (no differing latent, moment or bitmap word); the device encoder against the f64
+host encoder (`nvg_gpu` tests).
+
+### 8.5 Measured on CUDA (20.11.2026)
+
+One RTX PRO 6000 Blackwell (96 GB), 48 host cores; the wgpu column is the same card through Vulkan.
+
+Qwen3.5-0.8B at 1.0 bpw (150 projections, calibration 14 848 FIT + 3 072 SEL tokens; the training is the
+reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `fact-mom`):
+
+| stage | wgpu | CUDA |
+|---|---:|---:|
+| calibration of a layer | 2.6 s | 0.4–0.5 s |
+| input contexts of a layer | 0.1 s | 0.1 s |
+| encode of a layer (6–7 tensors in flight) | 16.6–18.0 s | 7.2–8.7 s |
+| whole conversion, 24 layers | 492 s | 216 s |
+| teacher top-64 pass | 42.7k tok/s | 55.5k tok/s |
+| training step, 4096 tokens | 0.69 s | 0.34 s |
+| the reference training, whole run | 227 s | 96 s |
+
+The conversion is latency-bound at this size (matrices of 1024 to 6144): 78 `n×n` factorisations a tensor for the
+g step (P2 and P1 candidates, two refinement sweeps), 2 ms each at n = 1024 and 7 ms at n = 3584, and the
+column-sequential input-side search. The q1g repack (`requant --quant q1g`) is a lossless host pass over bytes
+and has no device stage.
+
+Qwen3.8-27B at 0.55 bpw (the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and signs):
+
+| stage | wgpu (03.11, the same card model) | CUDA |
+|---|---:|---:|
+| teacher top-64 pass | 3.0k tok/s | 4.9k tok/s |
+| training step, 4096 tokens | 4.9 s | 3.58 s |
+| 1 M tokens: 256 steps and their teacher pass | 26.7 min | 18.9 min |
+| card memory while training | 85–91 GB | 86.5 GB |
+
+A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step at 300 TFLOP/s), the GDN recurrence
+28 %, the sign update's passes over the latents 9 %, the remaining stagings and plane expansions 8 %, SwiGLU 4 %.
+Before the scales rode the planes and the recurrence ran in 512-thread blocks the same step took 4.50 s (the
+elementwise passes over activations alone 40 % of it), and the 0.8B's 0.54 s.
+
+### 8.6 SFq's two ideas at the NVG start
+
+SFq ([Q2TP_SCALE_REFINE.md](Q2TP_SCALE_REFINE.md)) gave q2tp 7–14 % lower perplexity at the same size by a
+channel scale on the inputs and a refinement of the codes on calibration rows under a ridge. NVG has both inside:
+g is a free scale per input channel, solved exactly, and the discrete knots are a code refinement on the
+calibration Gram under the damping ρ. An input rescaling changes the encoder only through that damping and the
+column order of the input-side search. Measured on the 0.8B at 1.0 bpw (all on CUDA; perplexity on 16 × 512 of
+WikiText-2 test / C4 validation; the training is the reference recipe, its held-out KL from 32 to 256 steps):
+
+| variant | no training: ppl | no training: KL | KL at 25 / 100 / 256 steps | after training: ppl |
+|---|---:|---:|---:|---:|
+| NVG as it is (two builds) | 695.3 / 1014.0, 730.1 / 996.1 | 3.565, 3.525 | 2.437 / 1.702 / 1.445, 2.448 / 1.721 / 1.461 | 80.25 / 154.97, 82.01 / 156.87 |
+| `--blr-channel-scale 0.75` | 592.7 / 921.7 | 3.422 | 2.472 / 1.730 / 1.461 | 82.50 / 155.82 |
+| `--blr-channel-scale 0.5` | 615.8 / 961.9 | 3.432 | 2.435 / 1.714 / 1.466 | 81.37 / 157.35 |
+| `--blr-rho 0.1` | 823.5 / 1139.9 | 3.699 | 2.474 / 1.703 / 1.437 | 78.02 / 151.47 |
+| `--blr-rho 0.3` | 1221.4 / 1621.3 | 4.030 | 2.629 / 1.742 / 1.458 | 79.33 / 156.21 |
+| four refinement sweeps (`CMF_NVG_SWEEPS=4`, conversion ×2) | 675.6 / 949.5 | 3.452 | 2.432 / 1.695 / 1.452 | 80.22 / 156.15 |
+
+Two builds of the unchanged method differ by 5 % in the untrained perplexity and by 1 % in the trained KL (their
+arithmetic differs in the last bits; one build repeats itself bit for bit): that is the resolution of this table.
+Reading it:
+
+* The channel scale makes the untrained file better — WikiText-2 about 15 % lower at both exponents, C4 3–9 %, the
+  KL to the teacher 3–4 % — and the training erases the difference within 25 steps; the end is the same.
+* A stronger ridge makes the start worse and leaves the end within the resolution.
+* No variant reaches a given KL in fewer steps.
+
+So SFq's ideas do not shorten NVG's training. `--blr-channel-scale` stays as an option, off by default, for a
+file that will not be trained.
