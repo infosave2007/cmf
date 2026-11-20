@@ -141,8 +141,8 @@ server returns as `message.tool_calls`.
 The model holds 32 768 tokens. 21 of its 28 layers attend over a 2048-token window and keep only those rows; the 7
 full-attention layers keep every row, about 28 KB a token on the card: a 30 000-token prompt takes the 4-bit file
 to 3.6 GB on an L4 with CUDA, decoding at 79 tok/s after it. `CMF_MAX_SEQ` sets the cap (32 768 by default). Planted
-facts read back from a long Wikipedia text, CUDA, greedy: 4/4 at about 13 000 tokens and 3/4 at about 27 000 for the
-4-bit file, the same as Transformers bf16 (the same question missed).
+facts read back from a long Wikipedia text, greedy, 12 prompts a length: 12/12 at about 13 000 tokens and 11/12 at
+about 27 000 for the 4-bit file on CUDA and Vulkan, the same as Transformers bf16.
 
 ## Verify the download
 
@@ -275,8 +275,8 @@ curl http://localhost:8080/v1/chat/completions \
 Модель держит 32 768 токенов. 21 из 28 слоёв смотрит в окно из 2048 токенов и хранит только эти строки; 7 слоёв
 полного внимания хранят все строки, около 28 КБ на токен на карте: промпт из 30 000 токенов занимает у 4-битного
 файла 3,6 ГБ на L4 с CUDA, генерация после него — 79 ток/с. `CMF_MAX_SEQ` задаёт предел (по умолчанию 32 768).
-Факты, спрятанные в длинном тексте Википедии (CUDA, жадно): 4/4 примерно на 13 000 токенов и 3/4 примерно на
-27 000 у 4-битного файла — как у Transformers bf16 (промах на том же вопросе).
+Факты, спрятанные в длинном тексте Википедии (жадно, по 12 промптов на длину): 12/12 примерно на 13 000 токенов и
+11/12 примерно на 27 000 у 4-битного файла на CUDA и Vulkan — как у Transformers bf16.
 
 ### Проверка загрузки
 
@@ -393,8 +393,8 @@ cortiq serve Aion-1.0-Instruct-2.3B-q8_2f.cmf --port 8080
 
 模型支持 32 768 个 token。28 层中有 21 层只关注 2048 token 的窗口并只保留这些行；7 个全注意力层保留所有行，
 每个 token 在显卡上约 28 KB：30 000 token 的提示词让 4 位文件在 L4（CUDA）上占用 3.6 GB，之后生成 79 tok/s。
-`CMF_MAX_SEQ` 设定上限（默认 32 768）。在长篇维基百科文本中埋入的事实（CUDA，贪心）：4 位文件约 13 000 token
-时 4/4，约 27 000 token 时 3/4，与 Transformers bf16 相同（错在同一个问题上）。
+`CMF_MAX_SEQ` 设定上限（默认 32 768）。在长篇维基百科文本中埋入的事实（贪心，每个长度 12 个提示词）：4 位文件约
+13 000 token 时 12/12，约 27 000 token 时 11/12（CUDA 与 Vulkan 相同），与 Transformers bf16 一致。
 
 ### 校验下载
 

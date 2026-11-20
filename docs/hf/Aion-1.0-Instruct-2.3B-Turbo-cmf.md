@@ -34,8 +34,8 @@ header that holds the card's memory and the decode speed in place as the prompt 
 - **NVIDIA L4, CUDA:** decode holds at 88–90 tok/s from 16 000 to 30 000 tokens (94.5 → 79.3 for the standard
   file); the card stays at 3.0–3.7 GB, as the standard file does on CUDA.
 - **MacBook Air M4, Metal:** 16 384 tokens in 0.83 GB of keys and values against 1.62 GB, decode 44.7 tok/s against 42.2.
-- **Planted facts** in long Wikipedia text: 4/4 at about 13 000 tokens on CUDA and Vulkan, and at about 27 000
-  tokens 4/4 on CUDA (Transformers bf16: 3/4), 2/4 on Vulkan's fixed-memory reading.
+- **Planted facts** in long Wikipedia text, 12 prompts a length: on CUDA 11/12 at about 13 000 tokens and 12/12 at
+  about 27 000 (Transformers bf16: 12/12 and 11/12); on Vulkan's fixed-memory reading 9/12 and 7/12.
 
 It is one [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no Python and
 no ML framework. Prompts under 8192 tokens run exact attention, as in the
@@ -103,8 +103,8 @@ On Vulkan the prompt past 8192 tokens is read through the far field, chunk by ch
 the card as they are read: memory is fixed, and what those rows compute is an approximation. On CUDA the whole
 prompt is read exact and the far field is built once before its last 512 rows: memory grows with the prompt as the
 standard file's does, the answer starts from exact rows. `CMF_O1_WHOLE=1` reads the prompt whole on Vulkan too
-(the 30 000-token row above; planted facts 4/4 instead of 2/4), and `CMF_O1_WHOLE=0` reads it in chunks on CUDA:
-2.7–2.8 GB from 16 000 to 30 000 tokens and 112 tok/s, with planted facts 3/4 and 2/4.
+(the 30 000-token row above), and `CMF_O1_WHOLE=0` reads it in chunks on CUDA: 2.7–2.8 GB from 16 000 to 30 000
+tokens and 112 tok/s, with fewer facts kept (3/4 and 2/4 on the first four prompts of each length).
 
 ## Quality
 
@@ -112,13 +112,13 @@ Perplexity is the 4-bit file's below 8192 tokens (WikiText-2 14.61, Rust 7.83, P
 7.26). Past the seal the answer depends on what the far field and the exact rows keep: planted facts in long Wikipedia text (four kinds: a pass key, an access code, a password, a
 room number), greedy:
 
-| prompt | Transformers bf16 | standard `q4tp`, CUDA | Turbo, CUDA | Turbo, Vulkan |
-|---|---:|---:|---:|---:|
-| about 13 000 tokens | 4/4 | 4/4 | 4/4 | 4/4 |
-| about 27 000 tokens | 3/4 | 3/4 | 4/4 | 2/4 (4/4 with `CMF_O1_WHOLE=1`) |
+| prompt | Transformers bf16 | standard `q4tp` | Turbo, CUDA | Turbo, Vulkan | Turbo, Vulkan, `CMF_O1_WHOLE=1` |
+|---|---:|---:|---:|---:|---:|
+| about 13 000 tokens | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| about 27 000 tokens | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
-At 27 000 tokens Vulkan's fixed-memory reading loses a password a quarter of the way into the text and misses the
-question the reference misses too; read whole, the same file answers all four, one more than the reference.
+Twelve prompts a length; the standard file scores the same on CUDA and Vulkan. Read whole, the Turbo file keeps
+the facts as the exact files do; the fixed-memory reading on Vulkan trades some of them for the flat 3.6 GB.
 
 ## Verify the download
 
@@ -142,8 +142,9 @@ Weights: [MIT](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B/blob/main
 - **NVIDIA L4, CUDA:** генерация держится на 88–90 ток/с от 16 000 до 30 000 токенов (у стандартного файла
   94,5 → 79,3); карта остаётся на 3,0–3,7 ГБ, как и у стандартного файла на CUDA.
 - **MacBook Air M4, Metal:** 16 384 токена в 0,83 ГБ ключей и значений против 1,62 ГБ, генерация 44,7 ток/с против 42,2.
-- **Спрятанные факты** в длинном тексте Википедии: 4/4 примерно на 13 000 токенов на CUDA и Vulkan; примерно на
-  27 000 — 4/4 на CUDA (Transformers bf16 — 3/4) и 2/4 на Vulkan при чтении с фиксированной памятью.
+- **Спрятанные факты** в длинном тексте Википедии, по 12 промптов на длину: на CUDA 11/12 примерно на 13 000
+  токенов и 12/12 примерно на 27 000 (Transformers bf16 — 12/12 и 11/12); на Vulkan при чтении с фиксированной
+  памятью — 9/12 и 7/12.
 
 Один файл [CMF](https://github.com/infosave2007/cmf) для `cortiq` — движка на Rust без Python и ML-фреймворков.
 Промпты короче 8192 токенов идут точным вниманием, как в
@@ -207,8 +208,8 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 кусками, и строки уходят с карты по мере чтения: память фиксирована, а вычисленное по этим строкам — приближение.
 На CUDA весь промпт читается точно, и дальнее поле строится один раз перед последними 512 строками: память растёт
 с промптом, как у стандартного файла, зато ответ опирается на точные строки. `CMF_O1_WHOLE=1` читает промпт целиком
-и на Vulkan (строка на 30 000 токенов выше; спрятанные факты 4/4 вместо 2/4), а `CMF_O1_WHOLE=0` читает его кусками
-на CUDA: 2,7–2,8 ГБ от 16 000 до 30 000 токенов и 112 ток/с, спрятанные факты — 3/4 и 2/4.
+и на Vulkan (строка на 30 000 токенов выше), а `CMF_O1_WHOLE=0` читает его кусками на CUDA: 2,7–2,8 ГБ от 16 000 до
+30 000 токенов и 112 ток/с, фактов удерживается меньше (3/4 и 2/4 на первых четырёх промптах каждой длины).
 
 ### Качество
 
@@ -216,14 +217,14 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 7,26). Дальше ответ зависит от того, что сохранят дальнее поле и точные строки. Спрятанные факты (ключ, код
 доступа, пароль, номер комнаты), жадно:
 
-| промпт | Transformers bf16 | стандартный `q4tp`, CUDA | Turbo, CUDA | Turbo, Vulkan |
-|---|---:|---:|---:|---:|
-| около 13 000 токенов | 4/4 | 4/4 | 4/4 | 4/4 |
-| около 27 000 токенов | 3/4 | 3/4 | 4/4 | 2/4 (4/4 с `CMF_O1_WHOLE=1`) |
+| промпт | Transformers bf16 | стандартный `q4tp` | Turbo, CUDA | Turbo, Vulkan | Turbo, Vulkan, `CMF_O1_WHOLE=1` |
+|---|---:|---:|---:|---:|---:|
+| около 13 000 токенов | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| около 27 000 токенов | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
-На 27 000 токенах чтение с фиксированной памятью на Vulkan теряет пароль, стоящий на четверти текста, и ошибается
-на вопросе, на котором ошибается и эталон; при чтении целиком тот же файл отвечает на все четыре — на один больше
-эталона.
+По двенадцать промптов на длину; у стандартного файла результат одинаков на CUDA и Vulkan. При чтении целиком
+Turbo-файл удерживает факты так же, как точные файлы; чтение с фиксированной памятью на Vulkan меняет часть из них
+на неизменные 3,6 ГБ.
 
 Суммы sha256 — в таблице английского раздела. Веса:
 [MIT](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B/blob/main/LICENSE), от
@@ -241,8 +242,8 @@ cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 - **NVIDIA L4，CUDA：** 16 000 到 30 000 token 生成保持 88–90 tok/s（标准文件 94.5 → 79.3）；显存 3.0–3.7 GB，
   与标准文件在 CUDA 上相同。
 - **MacBook Air M4，Metal：** 16 384 token 的键值占 0.83 GB（标准 1.62 GB），生成 44.7 tok/s（标准 42.2）。
-- **埋入事实**（长篇维基百科文本）：约 13 000 token 时 CUDA 和 Vulkan 均为 4/4；约 27 000 token 时 CUDA 4/4
-  （Transformers bf16 为 3/4），Vulkan 固定显存读取为 2/4。
+- **埋入事实**（长篇维基百科文本，每个长度 12 个提示词）：CUDA 约 13 000 token 时 11/12，约 27 000 token 时 12/12
+  （Transformers bf16 为 12/12 和 11/12）；Vulkan 固定显存读取为 9/12 和 7/12。
 
 这是一个供 `cortiq` 使用的 [CMF](https://github.com/infosave2007/cmf) 文件（不依赖 Python 和机器学习框架的 Rust
 推理引擎）。8192 token 以内的提示词使用精确注意力，与[标准文件](https://huggingface.co/infosave/Aion-1.0-Instruct-2.3B-cmf)
@@ -301,22 +302,22 @@ CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 cor
 
 **读取长提示词的两种方式。** 在 Vulkan 上，8192 token 之后的提示词经远场分块读取，读完的行即离开显卡：
 显存固定，而这些行算出的结果是近似值。在 CUDA 上，整个提示词被精确读取，远场在最后 512 行之前一次建成：显存像
-标准文件一样随提示词增长，但回答基于精确的行。`CMF_O1_WHOLE=1` 让 Vulkan 也整体读取（见上表 30 000 token 一行；
-埋入事实 4/4 而非 2/4）；`CMF_O1_WHOLE=0` 让 CUDA 分块读取：16 000 到 30 000 token 显存 2.7–2.8 GB、生成 112 tok/s，
-埋入事实为 3/4 和 2/4。
+标准文件一样随提示词增长，但回答基于精确的行。`CMF_O1_WHOLE=1` 让 Vulkan 也整体读取（见上表 30 000 token 一行）；
+`CMF_O1_WHOLE=0` 让 CUDA 分块读取：16 000 到 30 000 token 显存 2.7–2.8 GB、生成 112 tok/s，保留的事实较少
+（每个长度前四个提示词为 3/4 和 2/4）。
 
 ### 质量
 
 8192 token 以内的困惑度与 4 位文件相同（WikiText-2 14.61，Rust 7.83，Python 7.43；bf16 14.24 / 7.66 / 7.26）。之后
 回答取决于远场和精确行保留了什么。埋入事实（通行码、访问码、密码、房间号），贪心：
 
-| 提示词 | Transformers bf16 | 标准 `q4tp`，CUDA | Turbo，CUDA | Turbo，Vulkan |
-|---|---:|---:|---:|---:|
-| 约 13 000 token | 4/4 | 4/4 | 4/4 | 4/4 |
-| 约 27 000 token | 3/4 | 3/4 | 4/4 | 2/4（`CMF_O1_WHOLE=1` 时 4/4） |
+| 提示词 | Transformers bf16 | 标准 `q4tp` | Turbo，CUDA | Turbo，Vulkan | Turbo，Vulkan，`CMF_O1_WHOLE=1` |
+|---|---:|---:|---:|---:|---:|
+| 约 13 000 token | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| 约 27 000 token | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
-在 27 000 token 时，Vulkan 的固定显存读取会丢失位于文本四分之一处的密码，并答错参考模型也答错的那个问题；整体
-读取时同一文件四个全对，比参考模型多一个。
+每个长度 12 个提示词；标准文件在 CUDA 和 Vulkan 上得分相同。整体读取时 Turbo 文件与精确文件一样保留事实；Vulkan 上
+的固定显存读取以其中一部分换取恒定的 3.6 GB。
 
 sha256 见英文部分的表格。权重：[MIT](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B/blob/main/LICENSE)，
 来自 [microsoft/Aion-1.0-Instruct-2.3B](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B)。
