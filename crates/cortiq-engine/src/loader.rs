@@ -1877,7 +1877,8 @@ impl Pipeline {
             || arch.dory.is_some()
             || arch.qwen4_exp.is_some()
             || arch.glm5_next.is_some()
-            || arch.arch_name == crate::hy4::ARCH_NAME;
+            || arch.arch_name == crate::hy4::ARCH_NAME
+            || arch.arch_name == crate::maxwell::ARCH_NAME;
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
@@ -2382,6 +2383,10 @@ impl Pipeline {
         if arch.arch_name == crate::hy4::ARCH_NAME {
             let (globals, layers, cfg, state) = crate::hy4::load(model, &arch)?;
             pipeline.hy4 = Some(Box::new((globals, layers, cfg, state)));
+        }
+        if arch.arch_name == crate::maxwell::ARCH_NAME {
+            let (globals, layers, cfg, state) = crate::maxwell::load(model, &arch)?;
+            pipeline.maxwell = Some(Box::new((globals, layers, cfg, state)));
         }
         // Gemma-4 E-series (E4B): the E block rides in `g3n` — altup/
         // laurel are zeroed for gemma4 — but the layer body is the

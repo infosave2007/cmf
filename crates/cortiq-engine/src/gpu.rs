@@ -2127,6 +2127,45 @@ pub struct GraphAttnGeom<'a> {
     /// the call (one row for a token, a chunk's rows for a batch). V projects
     /// `lerp(embedding, normed, blend)`; Q and K project the normed row.
     pub vres: Option<(f32, &'a [f32])>,
+    /// Maxwell's block-sparse support. A backend without the arm must
+    /// decline a call that reaches past the dense range (`dense_range`).
+    pub route: Option<GraphBlockRoute<'a>>,
+}
+
+/// One layer's block router (Maxwell-V1-Flash, `maxwell::route_blocks`): a
+/// query attends to the first `prefix` blocks of `block` positions, to its
+/// own block and the `local - 1` before it, and to at most `remote` blocks
+/// in between, chosen for each KV group by the block's largest token score
+/// `q_g · k_t` (ties to the lower block). `q` `[nkv·hd, hidden]` and `k`
+/// `[hd, hidden]` project the layer's normed input; both are normed a head
+/// (`q_norm`, `k_norm`, the layer's epsilon) and rotated as the layer's
+/// queries and keys are. While the blocks in between do not outnumber
+/// `remote` every position is attended and the router does not run.
+#[derive(Clone, Copy)]
+pub struct GraphBlockRoute<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub block: usize,
+    pub prefix: usize,
+    pub local: usize,
+    pub remote: usize,
+}
+
+impl GraphBlockRoute<'_> {
+    /// Positions below which a query attends to its whole past.
+    pub fn dense_range(&self) -> usize {
+        (self.prefix + self.local + self.remote) * self.block
+    }
+}
+
+/// Whether the active backend's graphs carry the block router
+/// (`GraphBlockRoute`) past the dense range: the CUDA hybrid does
+/// (`CMF_BLOCK_ROUTE=0`: the host takes such a sequence over).
+pub fn block_route_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_BLOCK_ROUTE").as_deref() != Ok("0")) && cuda_active()
 }
 
 /// Rows of an Unlimited-OCR prompt chunk on the batch graph: every remote block

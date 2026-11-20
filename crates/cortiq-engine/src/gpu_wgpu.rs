@@ -19899,6 +19899,7 @@ fn mla_geom<'a>(attn: &crate::gpu::GraphAttn<'a>) -> Option<crate::gpu::GraphAtt
             v_norm: false,
             dash: None,
             vres: None,
+            route: None,
         }),
         crate::gpu::GraphAttn::Mla { nh, rope, nope, v_dim, .. } => Some(crate::gpu::GraphAttnGeom {
             nkv: *nh,
@@ -19912,6 +19913,7 @@ fn mla_geom<'a>(attn: &crate::gpu::GraphAttn<'a>) -> Option<crate::gpu::GraphAtt
             v_norm: false,
             dash: None,
             vres: None,
+            route: None,
         }),
         _ => None,
     }

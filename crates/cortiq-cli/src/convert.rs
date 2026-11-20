@@ -10029,6 +10029,27 @@ pub fn run_convert_multi_excluding(
         progress(1.0);
         return Ok(());
     }
+    // Maxwell-V1-Flash: four mHC streams, block-sparse GQA, sigmoid-routed MoE.
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| crate::maxwellpack::detect(&c))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "maxwell_moe: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
+        );
+        for (q, path) in outputs {
+            crate::maxwellpack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
     for (i, (_, path)) in outputs.iter().enumerate() {
         anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
         anyhow::ensure!(
