@@ -18,16 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template failed to render and the prompt fell back to ChatML.
 
 ### Changed
-- CUDA hybrid arm: every sliding-window layer keeps only its window on the card (Hy4-flash's gated layers did
-  before; others kept the whole history and read it). Aion-2.3B q4tp on a Colab L4: card memory at a 16k / 30k
+- CUDA hybrid arm: Aion's sliding-window layers keep only their window on the card, as Hy4-flash's gated layers
+  do (other sliding stacks keep the whole history until measured). Aion-2.3B q4tp on a Colab L4: card memory at a 16k / 30k
   prompt 4.33 / 6.15 → 2.98 / 3.63 GB, decode after it 73.0 / 52.6 → 94.8 / 79.0 tok/s; q8_2f at 16k 56.3 → 68.8;
   perplexity over 4 × 4096 tokens unchanged (9.469). `CMF_HY4_MIRROR_WIN=0` keeps the whole history.
 - wgpu batch prompt: a file whose dense FFN is 8-bit reads its q8_2f matrices from 1024 rows on the matrix units
   (4096 before; four-bit files keep 4096, `CMF_Q82_COOP_ROWS` overrides). Aion-2.3B q8_2f on an L4: first token of
   2k / 8k / 16k 4.73 / 20.8 / 43.3 → 1.25 / 6.39 / 15.5 s, perplexity unchanged (14.251).
-- YaRN's attention amplitude folds into the q/k norms of the full layers alone when the sliding layers have none
-  of their own (Aion: 7 full layers on YaRN ×16, 21 window layers on plain RoPE); before, any sliding layer kept the
-  scale in the rotation. Perplexity unchanged (4 × 4096 tokens 9.469 on CUDA and Vulkan); the Turbo far field
+- Aion: YaRN's attention amplitude folds into the q/k norms of its 7 full layers (the 21 window layers have none
+  of their own); every other sliding stack keeps the scale in the rotation, as before. Perplexity unchanged (4 × 4096 tokens 9.469 on CUDA and Vulkan); the Turbo far field
   reads the facts of 13k-token prompts 4/4 on Vulkan (3/4 before).
 - Far-field landmarks come from the rows past a seal's sinks and the rows it keeps exact (those never enter the far
   field, yet the segment means held them all in the first segment: 248 kept rows of 816 made its landmark an outlier

@@ -2801,7 +2801,9 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
-        fold_yarn_scale_into_qk_norms(&mut pipeline);
+        // Beside sliding layers only where it was measured (Aion); Mellum's
+        // full layers keep their scale in the rotation.
+        fold_yarn_scale_into_qk_norms(&mut pipeline, arch.arch_name == "aion_instruct");
         // A DFlash block drafter beside the file drafts the rounds when asked to.
         if std::env::var("CMF_DFLASH").as_deref() == Ok("1") {
             match crate::dflash::Drafter::for_target(model) {
@@ -3093,16 +3095,18 @@ impl Pipeline {
 /// decline a scale of their own) carry the model. SenseNova-Loop-9B: YaRN
 /// factor 2 on 64 rotary channels of 256, scale 1.0693, every length.
 /// `CMF_YARN_FOLD=0` keeps the scale in the rotation.
-pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline) {
+pub(crate) fn fold_yarn_scale_into_qk_norms(p: &mut crate::pipeline::Pipeline, beside_sliding: bool) {
     let s = p.rope_scale;
     // Sliding layers with a scale of their own of 1 (Aion: plain RoPE on the
     // 21 window layers, YaRN ×16 on the 7 full ones) take no part: the scale
-    // folds into the full layers' norms alone, the local tables stay.
+    // folds into the full layers' norms alone, the local tables stay. Only
+    // for a stack that asked (`beside_sliding`): any other sliding stack
+    // keeps the scale in the rotation, as before.
     let sliding = p.sliding_layers.is_some() || p.swa.is_some() || p.inv_freq_local.is_some();
     if s == 1.0
         || p.qk_norm_after_rope
         || p.rope_scale_local != 1.0
-        || (sliding && p.mtp.is_some())
+        || (sliding && (!beside_sliding || p.mtp.is_some()))
         || p.global_attn.is_some()
         || p.inv_freq_global.is_some()
         || std::env::var("CMF_YARN_FOLD").as_deref() == Ok("0")
