@@ -1690,7 +1690,7 @@ pub fn set_sampling_defaults(spec: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sampling_defaults() -> Option<serde_json::Value> {
+pub(crate) fn sampling_defaults() -> Option<serde_json::Value> {
     SAMPLING_DEFAULTS.lock().unwrap().clone()
 }
 
@@ -16360,6 +16360,9 @@ pub(crate) mod tests {
                 }
             );
             assert!(model.tensor("mtp_layers.0.e_proj.weight").is_none(), "the MTP layer is not converted");
+            // the release's sampling rides in the file
+            let sampler = cortiq_engine::SamplerConfig::from_provenance(model.header.provenance.as_ref());
+            assert_eq!((sampler.temperature, sampler.top_p, sampler.top_k, sampler.repetition_penalty), (0.6, 0.95, 20, 1.0));
             let mut pipeline = cortiq_engine::Pipeline::from_model(&model, cortiq_engine::sampler::SamplerConfig::default()).unwrap();
             assert!(pipeline.maxwell.is_some(), "the file loads into the Maxwell stack");
             let logits = pipeline.forward_ids(&ids, None).unwrap();

@@ -38,7 +38,8 @@
 //! Norms, routers, hyper-connection weights and the indexer's projections
 //! stay f32. `--tensor-quant PATTERN=QUANT` overrides any matrix. The
 //! hyper-parameters the runtime needs ride in the header provenance under
-//! `maxwell_moe`.
+//! `maxwell_moe`; `sampling` there holds the release's settings (temperature
+//! 0.6, top-p 0.95, top-k 20) unless `--sampling` names others.
 
 use crate::convert::{Quant, SafeTensors, TensorMeta, open_safetensors, quantize_2d, tensor_quant_override, to_f32};
 use cortiq_core::format::{CmfHeader, CmfStreamWriter, TokenizerBundle};
@@ -188,6 +189,12 @@ impl Out {
 
 fn read_json(dir: &Path, rel: &str) -> Option<serde_json::Value> {
     std::fs::read(dir.join(rel)).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// The sampling the Maxwell team runs the model with (the model card's usage
+/// section): temperature 0.6, top-p 0.95, top-k 20, no penalties.
+fn release_sampling() -> serde_json::Value {
+    serde_json::json!({ "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repetition_penalty": 1.0 })
 }
 
 /// One hyper-connection: the mapping, its bias and the three gating factors.
@@ -417,6 +424,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         "base_model": "maxwell-model/Maxwell-V1-Flash",
         "quant": profile_name(profile),
         "license": "apache-2.0",
+        // the release's own settings (its model card), unless `--sampling` names others:
+        // `run` and `serve` read them, flags and request fields still override
+        "sampling": crate::convert::sampling_defaults().unwrap_or_else(release_sampling),
         "maxwell_moe": { "config": text },
     });
     let bundle = TokenizerBundle {
