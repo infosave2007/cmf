@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.10] — 2026-11-21
+
 ### Fixed
 - Far field beside exact rows (the Turbo files that keep rows exact): the skeleton's pseudo-inverse takes a ridge
   of 1e-4 there (1e-6 before, and still 1e-6 where no row is kept exact). A query that reads an exact row lies

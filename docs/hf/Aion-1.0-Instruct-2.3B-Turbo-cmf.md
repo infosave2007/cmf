@@ -35,7 +35,7 @@ header that holds the card's memory and the decode speed in place as the prompt 
 - **NVIDIA L4, CUDA:** decode holds at 89.0–90.7 tok/s from 8 192 to 30 000 tokens (106.3 → 79.7 for the standard
   file); with `CMF_O1_WHOLE=0` a 30 000-token prompt takes 2.8 GB of the card and decodes at 112.4 tok/s.
 - **MacBook Air M4, Metal:** 16 384 tokens in 0.83 GB of keys and values against 1.62 GB, decode 44.7 tok/s against 42.2.
-- **Planted facts** in long Wikipedia text, 12 prompts a length: on CUDA 11/12 at about 13 000 tokens and 12/12 at
+- **Planted facts** in long Wikipedia text, 12 prompts a length: on CUDA 12/12 at about 13 000 tokens and 12/12 at
   about 27 000 (Transformers bf16: 12/12 and 11/12); on Vulkan's fixed-memory reading 9/12 and 7/12.
 
 It is one [CMF](https://github.com/infosave2007/cmf) file for `cortiq`, a Rust inference engine with no Python and
@@ -52,7 +52,7 @@ hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-tur
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-With CUDA: `cargo install cortiq-cli --features cuda`, then `CMF_GPU=cuda cortiq run …`. Use cortiq 0.9.9 or
+With CUDA: `cargo install cortiq-cli --features cuda`, then `CMF_GPU=cuda cortiq run …`. Use cortiq 0.9.10 or
 later; prebuilt binaries are on the [releases page](https://github.com/infosave2007/cmf/releases).
 
 ## Server
@@ -159,7 +159,7 @@ room number), greedy:
 
 | prompt | Transformers bf16 | standard `q4tp` | Turbo, CUDA | Turbo, Vulkan | Turbo, Vulkan, `CMF_O1_WHOLE=1` |
 |---|---:|---:|---:|---:|---:|
-| about 13 000 tokens | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| about 13 000 tokens | 12/12 | 12/12 | 12/12 | 9/12 | 12/12 |
 | about 27 000 tokens | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
 Twelve prompts a length; the standard file scores the same on CUDA and Vulkan. Read whole, the Turbo file keeps
@@ -188,7 +188,7 @@ Weights: [MIT](https://huggingface.co/microsoft/Aion-1.0-Instruct-2.3B/blob/main
 - **NVIDIA L4, CUDA:** генерация держится на 89,0–90,7 ток/с от 8 192 до 30 000 токенов (у стандартного файла
   106,3 → 79,7); с `CMF_O1_WHOLE=0` промпт из 30 000 токенов занимает 2,8 ГБ карты, генерация 112,4 ток/с.
 - **MacBook Air M4, Metal:** 16 384 токена в 0,83 ГБ ключей и значений против 1,62 ГБ, генерация 44,7 ток/с против 42,2.
-- **Спрятанные факты** в длинном тексте Википедии, по 12 промптов на длину: на CUDA 11/12 примерно на 13 000
+- **Спрятанные факты** в длинном тексте Википедии, по 12 промптов на длину: на CUDA 12/12 примерно на 13 000
   токенов и 12/12 примерно на 27 000 (Transformers bf16 — 12/12 и 11/12); на Vulkan при чтении с фиксированной
   памятью — 9/12 и 7/12.
 
@@ -204,7 +204,7 @@ hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-tur
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-С CUDA: установка с `--features cuda`, запуск с `CMF_GPU=cuda`. Нужен cortiq 0.9.9 или новее; готовые сборки — на
+С CUDA: установка с `--features cuda`, запуск с `CMF_GPU=cuda`. Нужен cortiq 0.9.10 или новее; готовые сборки — на
 [странице релизов](https://github.com/infosave2007/cmf/releases).
 
 ### Сервер
@@ -310,7 +310,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | промпт | Transformers bf16 | стандартный `q4tp` | Turbo, CUDA | Turbo, Vulkan | Turbo, Vulkan, `CMF_O1_WHOLE=1` |
 |---|---:|---:|---:|---:|---:|
-| около 13 000 токенов | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| около 13 000 токенов | 12/12 | 12/12 | 12/12 | 9/12 | 12/12 |
 | около 27 000 токенов | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
 По двенадцать промптов на длину; у стандартного файла результат одинаков на CUDA и Vulkan. При чтении целиком
@@ -333,7 +333,7 @@ Turbo-файл удерживает факты так же, как точные 
 - **NVIDIA L4，CUDA：** 从 8 192 到 30 000 token 生成保持 89.0–90.7 tok/s（标准文件 106.3 → 79.7）；设
   `CMF_O1_WHOLE=0` 时 30 000 token 的提示词占用 2.8 GB 显存，生成 112.4 tok/s。
 - **MacBook Air M4，Metal：** 16 384 token 的键值占 0.83 GB（标准 1.62 GB），生成 44.7 tok/s（标准 42.2）。
-- **埋入事实**（长篇维基百科文本，每个长度 12 个提示词）：CUDA 约 13 000 token 时 11/12，约 27 000 token 时 12/12
+- **埋入事实**（长篇维基百科文本，每个长度 12 个提示词）：CUDA 约 13 000 token 时 12/12，约 27 000 token 时 12/12
   （Transformers bf16 为 12/12 和 11/12）；Vulkan 固定显存读取为 9/12 和 7/12。
 
 这是一个供 `cortiq` 使用的 [CMF](https://github.com/infosave2007/cmf) 文件（不依赖 Python 和机器学习框架的 Rust
@@ -348,7 +348,7 @@ hf download infosave/Aion-1.0-Instruct-2.3B-Turbo-cmf Aion-1.0-Instruct-2.3B-tur
 cortiq run Aion-1.0-Instruct-2.3B-turbo.cmf --prompt-file report.txt --greedy
 ```
 
-CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 cortiq 0.9.9 或更新版本；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。
+CUDA：安装时加 `--features cuda`，运行时设 `CMF_GPU=cuda`。需要 cortiq 0.9.10 或更新版本；预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。
 
 ### 服务器
 
@@ -446,7 +446,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | 提示词 | Transformers bf16 | 标准 `q4tp` | Turbo，CUDA | Turbo，Vulkan | Turbo，Vulkan，`CMF_O1_WHOLE=1` |
 |---|---:|---:|---:|---:|---:|
-| 约 13 000 token | 12/12 | 12/12 | 11/12 | 9/12 | 11/12 |
+| 约 13 000 token | 12/12 | 12/12 | 12/12 | 9/12 | 12/12 |
 | 约 27 000 token | 11/12 | 11/12 | 12/12 | 7/12 | 12/12 |
 
 每个长度 12 个提示词；标准文件在 CUDA 和 Vulkan 上得分相同。整体读取时 Turbo 文件与精确文件一样保留事实；Vulkan 上
