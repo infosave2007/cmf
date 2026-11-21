@@ -22,21 +22,21 @@ T = {
     "en": {
         "tb_t": "A long prompt: the standard 4-bit file (q4tp) and Turbo",
         "fl_t": "Speed against the prompt's length",
-        "sub": "Inkling-2-Mini, Inkling-2-Mini-q4tp.cmf, cortiq bench --core, 64 tokens after the prompt.",
+        "sub": "Inkling-2-Mini-q4tp.cmf, cortiq 0.9.11, cortiq bench --core, 64 tokens after the prompt.",
         "first": "First token, s", "dec": "Decode, tok/s", "mem": "Peak card memory, GB", "ctx": "prompt, tokens",
         "std": "standard", "tur": "Turbo", "q4tp": "q4tp", "q8_2f": "q8_2f", "stand": "Stand", "res": "",
     },
     "ru": {
         "tb_t": "Длинный промпт: стандартный 4-битный файл (q4tp) и Turbo",
         "fl_t": "Скорость в зависимости от длины промпта",
-        "sub": "Inkling-2-Mini, Inkling-2-Mini-q4tp.cmf, cortiq bench --core, 64 токена после промпта.",
+        "sub": "Inkling-2-Mini-q4tp.cmf, cortiq 0.9.11, cortiq bench --core, 64 токена после промпта.",
         "first": "Первый токен, с", "dec": "Генерация, ток/с", "mem": "Пик памяти карты, ГБ", "ctx": "промпт, токенов",
         "std": "стандартный", "tur": "Turbo", "q4tp": "q4tp", "q8_2f": "q8_2f", "stand": "Стенд", "res": "",
     },
     "zh": {
         "tb_t": "长提示词：标准 4 位文件（q4tp）与 Turbo",
         "fl_t": "速度随提示词长度的变化",
-        "sub": "Inkling-2-Mini，Inkling-2-Mini-q4tp.cmf，cortiq bench --core，提示词之后 64 个 token。",
+        "sub": "Inkling-2-Mini-q4tp.cmf，cortiq 0.9.11，cortiq bench --core，提示词之后 64 个 token。",
         "first": "首个 token，秒", "dec": "生成，tok/s", "mem": "显存峰值，GB", "ctx": "提示词，token 数",
         "std": "标准", "tur": "Turbo", "q4tp": "q4tp", "q8_2f": "q8_2f", "stand": "测试平台", "res": "",
     },
@@ -56,6 +56,8 @@ def pill(s, x, y, text):
 
 
 def ctx_label(c):
+    if c < 1024:
+        return str(c)
     return f"{round(c / 1024)}K" if c % 1024 == 0 else f"{c // 1000}K"
 
 
