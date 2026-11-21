@@ -1019,17 +1019,25 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                 g = __fadd_rn(g, part[k][b][t][ln][0]);
                 u = __fadd_rn(u, part[k][b][t][ln][1]);
             }
-            // Ripple's clamped SwiGLU: the gate from above, up on both sides
-            if (jb.lim > 0.0f) {
-                g = fminf(g, jb.lim);
-                u = fminf(fmaxf(u, -jb.lim), jb.lim);
+            float v;
+            if (jb.kind & 0x2000) {
+                // Inkling's softcapped SwiGLU: the gate's cap in `lim`, the up
+                // branch's in pad0; c·tanh(g / c)·σ(g)·c'·tanh(u / c')
+                const float cu = __int_as_float(jb.pad0);
+                v = __fmul_rn(__fmul_rn(jb.lim * tanhf(g / jb.lim), __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g)))), cu * tanhf(u / cu));
+            } else {
+                // Ripple's clamped SwiGLU: the gate from above, up on both sides
+                if (jb.lim > 0.0f) {
+                    g = fminf(g, jb.lim);
+                    u = fminf(fmaxf(u, -jb.lim), jb.lim);
+                }
+                // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU),
+                // 0x1000: MiniMax M3's SwiGLU-OAI g·σ(1.702 g)·(u + 1), else SwiGLU
+                const bool oai = (jb.kind & 0x1000) != 0;
+                const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g)
+                    : __fdiv_rn(g, __fadd_rn(1.0f, expf(oai ? -1.702f * g : -g)));
+                v = __fmul_rn(act, oai ? __fadd_rn(u, 1.0f) : u);
             }
-            // kind bit 0x200: GeGLU (tanh GELU), 0x400: GeGLU (erf GELU),
-            // 0x1000: MiniMax M3's SwiGLU-OAI g·σ(1.702 g)·(u + 1), else SwiGLU
-            const bool oai = (jb.kind & 0x1000) != 0;
-            const float act = (jb.kind & 0x200) ? gelu_t(g) : (jb.kind & 0x400) ? gelu_e(g)
-                : __fdiv_rn(g, __fadd_rn(1.0f, expf(oai ? -1.702f * g : -g)));
-            const float v = __fmul_rn(act, oai ? __fadd_rn(u, 1.0f) : u);
             put3(q0, q1, q1, (size_t)j * jb.ystride + r, v);
         }
         return;

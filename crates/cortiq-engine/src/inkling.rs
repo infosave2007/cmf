@@ -342,13 +342,34 @@ pub struct State {
     pub pos: usize,
     pub tokens: Vec<u32>,
     slots: Vec<SlotState>,
+    /// The sequence's device key (process-unique: a pipeline reuses one model
+    /// for many prompts).
+    sequence_id: u64,
+    /// The sequence runs on the card: None not tried yet, Some(false) the
+    /// host runs it, Some(true) the card holds its states.
+    card: Option<bool>,
 }
+
+static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl State {
     pub fn reset(&mut self, n_slots: usize) {
+        if self.card == Some(true) {
+            crate::gpu::inkling_reset(self.sequence_id);
+        }
+        self.card = None;
+        self.sequence_id = (3u64 << 60) | NEXT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pos = 0;
         self.tokens.clear();
         self.slots = (0..n_slots).map(|_| SlotState::default()).collect();
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if self.card == Some(true) {
+            crate::gpu::inkling_reset(self.sequence_id);
+        }
     }
 }
 
@@ -468,7 +489,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
             gates,
         });
     }
-    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new() };
+    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None };
     state.reset(cfg.slots());
     Ok((globals, layers, cfg, state))
 }
@@ -879,6 +900,50 @@ fn head_rows(globals: &Globals, cfg: &Cfg, x: &[f32], n: usize, pool: Option<&Po
     lg
 }
 
+/// `ids` from `pos` on the card while it holds the sequence (or takes it at
+/// position 0); `false`: the host runs it. A card that held the sequence and
+/// fails hands its rows to the host (`host_replay`).
+#[allow(clippy::too_many_arguments)]
+fn on_card(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], pos: usize, want: bool, all: bool, logits: &mut Vec<f32>, pool: Option<&Pool>) -> bool {
+    let try_card = match state.card {
+        Some(true) => true,
+        None => pos == 0,
+        Some(false) => false,
+    };
+    if !try_card || !crate::gpu::cuda_active() {
+        if state.card.is_none() && pos == 0 {
+            state.card = Some(false);
+        }
+        return false;
+    }
+    if crate::gpu::inkling_forward(state.sequence_id, globals, layers, cfg, ids, pos, want, all, logits) {
+        if state.card.is_none() {
+            tracing::info!("inkling2_loop: the sequence runs on the card");
+        }
+        state.card = Some(true);
+        state.tokens.extend_from_slice(ids);
+        state.pos = pos + ids.len();
+        return true;
+    }
+    if state.card == Some(true) {
+        tracing::warn!("inkling2_loop: the card dropped the sequence at {pos}; the host replays its {} rows", state.tokens.len());
+        host_replay(globals, layers, cfg, state, pool);
+    }
+    state.card = Some(false);
+    false
+}
+
+/// The host's caches rebuilt from the sequence's tokens (after the card let go).
+fn host_replay(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, pool: Option<&Pool>) {
+    let toks = std::mem::take(&mut state.tokens);
+    state.slots = (0..cfg.slots()).map(|_| SlotState::default()).collect();
+    for (ci, part) in toks.chunks(chunk_rows()).enumerate() {
+        let _ = host_rows(globals, layers, cfg, state, part, ci * chunk_rows(), pool);
+    }
+    state.pos = toks.len();
+    state.tokens = toks;
+}
+
 /// The prompt from `start` through the host stack in chunks; the last row's
 /// logits. Returns the positions taken (all of them, or 0 when the sequence
 /// is not at `start`).
@@ -893,6 +958,10 @@ pub fn forward_prompt(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mu
         return 0;
     }
     let t0 = std::time::Instant::now();
+    if on_card(globals, layers, cfg, state, ids, start, true, false, logits, pool) {
+        tracing::info!("inkling2_loop: {} prompt rows on the card in {:.2} s", ids.len(), t0.elapsed().as_secs_f64());
+        return ids.len();
+    }
     let mut last = Vec::new();
     for (ci, part) in ids.chunks(chunk_rows()).enumerate() {
         let p0 = start + ci * chunk_rows();
@@ -918,11 +987,22 @@ pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
     state.reset(cfg.slots());
     let (mut nll, mut cnt) = (0f64, 0usize);
     let vocab = globals.lm_head.rows();
-    for (ci, part) in ids[..n].chunks(chunk_rows()).enumerate() {
-        let p0 = ci * chunk_rows();
-        let x = host_rows(globals, layers, cfg, state, part, p0, pool);
-        state.pos = p0 + part.len();
-        let lg = head_rows(globals, cfg, &x, part.len(), pool);
+    let card_rows = 16;
+    let mut card = None;
+    let mut p0 = 0usize;
+    while p0 < n {
+        let take = if card != Some(false) { card_rows } else { chunk_rows() }.min(n - p0);
+        let part = &ids[p0..p0 + take];
+        let mut lg = Vec::new();
+        if card != Some(false) {
+            let ok = on_card(globals, layers, cfg, state, part, p0, true, true, &mut lg, pool);
+            card = Some(ok);
+        }
+        if card == Some(false) {
+            let x = host_rows(globals, layers, cfg, state, part, p0, pool);
+            state.pos = p0 + part.len();
+            lg = head_rows(globals, cfg, &x, part.len(), pool);
+        }
         for (j, row) in lg.chunks(vocab).enumerate() {
             let p = p0 + j;
             if p < from {
@@ -934,9 +1014,10 @@ pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
             nll += den.ln() - (row[target] as f64 - best);
             cnt += 1;
         }
+        p0 += take;
     }
     state.reset(cfg.slots());
-    tracing::info!("inkling2_loop nll: {n} rows on the host in {:.1} s", t0.elapsed().as_secs_f64());
+    tracing::info!("inkling2_loop nll: {n} rows on the {} in {:.1} s", if card == Some(true) { "card" } else { "host" }, t0.elapsed().as_secs_f64());
     Some((nll, cnt))
 }
 
@@ -948,6 +1029,9 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
             tracing::warn!("inkling2_loop: position {position} after {}; the sequence restarts", state.pos);
         }
         state.reset(cfg.slots());
+    }
+    if on_card(globals, layers, cfg, state, &[token_id], position, want_logits, false, logits, pool) {
+        return;
     }
     state.tokens.push(token_id);
     let x = host_rows(globals, layers, cfg, state, &[token_id], position, pool);

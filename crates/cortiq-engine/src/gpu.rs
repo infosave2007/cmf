@@ -2577,6 +2577,38 @@ pub fn dory_forward(
     false
 }
 
+/// Inkling-2-Mini's call on the selected device (`ids` from `pos`; the last
+/// row's logits when `want`, every row's when `all`). `false` leaves the host
+/// to run it.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_forward(
+    id: u64,
+    g: &crate::inkling::Globals,
+    layers: &[crate::inkling::Layer],
+    cfg: &crate::inkling::Cfg,
+    ids: &[u32],
+    pos: usize,
+    want: bool,
+    all: bool,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
+    let _ = (id, g, layers, cfg, ids, pos, want, all, logits);
+    false
+}
+
+/// A new Inkling sequence on the device.
+pub fn inkling_reset(id: u64) {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::inkling_reset(id);
+    }
+    let _ = id;
+}
+
 /// A new Dory sequence on the device.
 pub fn dory_reset(id: u64) {
     #[cfg(target_os = "macos")]
