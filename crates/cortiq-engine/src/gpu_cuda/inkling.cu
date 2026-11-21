@@ -920,6 +920,9 @@ extern "C" __global__ void ink_ds_mix(const float* __restrict__ tap, int ntap, i
     const float inv = rsqrtf(ss / (float)H + eps);
     const float* nw = norms + (size_t)j * H;
     if (j == nmix - 1) {
+        // a call of more rows than the ring: only its last fr_cap rows land
+        // (rows fr_cap apart would race for one cell)
+        if (r + fr_cap < (int)gridDim.x) return;
         float* o = fr + (size_t)((cr[0] + r) % fr_cap) * H;
         for (int i = tid; i < H; i += blockDim.x) o[i] = mixv[i] * inv * nw[i];
         return;
