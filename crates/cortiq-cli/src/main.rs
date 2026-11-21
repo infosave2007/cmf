@@ -8680,6 +8680,13 @@ async fn cmd_serve(
         println!("    note: deepseek_v41 serves with 1 slot (one GPU expert bank per model)");
         slots = 1;
     }
+    if slots != 1 && model.arch().arch_name == "maxwell_moe" {
+        // A pipeline of this stack keeps its own tables (routers, hyper-connections,
+        // the block indexer: 0.7 GB), and the 8-bit file's experts already fill the
+        // host's memory beside one of them.
+        println!("    note: maxwell_moe serves with 1 slot");
+        slots = 1;
+    }
     if std::env::var("CMF_THREADS").is_err() {
         // Split the cores between slots instead of oversubscribing
         // N pools × (cores−1) workers. Explicit CMF_THREADS wins.

@@ -143,9 +143,50 @@ pub struct Layer {
     pub ffn: Ffn,
 }
 
+/// The embedding table, a row a token. The converter stores it f16; read as
+/// a matrix it would be dequantized whole (1.6 GB of f32 in every pipeline
+/// of a server), so its rows are taken straight from the file's mapping.
+pub enum Embed {
+    Half { idx: usize, rows: usize, bf16: bool },
+    Matrix(QTensor),
+}
+
+impl Embed {
+    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, CmfError> {
+        let idx = model.tensor_index(name).ok_or_else(|| err(format!("{name} missing")))?;
+        let e = &model.tensors[idx];
+        match e.dtype {
+            cortiq_core::TensorDtype::F16 | cortiq_core::TensorDtype::Bf16 if e.shape.len() == 2 => Ok(Embed::Half { idx, rows: e.shape[0], bf16: e.dtype == cortiq_core::TensorDtype::Bf16 }),
+            _ => Ok(Embed::Matrix(t(model, name)?)),
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Embed::Half { rows, .. } => *rows,
+            Embed::Matrix(m) => m.rows(),
+        }
+    }
+
+    /// Row `r` into `out` (`out.len()` wide).
+    pub fn row_f32(&self, model: &CmfModel, r: usize, out: &mut [f32]) {
+        match self {
+            Embed::Half { idx, bf16, .. } => {
+                let bytes = model.entry_bytes(&model.tensors[*idx]);
+                let dim = out.len();
+                for (o, b) in out.iter_mut().zip(bytes[r * dim * 2..(r + 1) * dim * 2].chunks_exact(2)) {
+                    let h = u16::from_le_bytes([b[0], b[1]]);
+                    *o = if *bf16 { cortiq_core::quant::bf16_to_f32(h) } else { cortiq_core::quant::f16_to_f32(h) };
+                }
+            }
+            Embed::Matrix(m) => m.row_f32(r, out),
+        }
+    }
+}
+
 pub struct Globals {
     pub model: Arc<CmfModel>,
-    pub embed: QTensor,
+    pub embed: Embed,
     pub lm_head: QTensor,
     pub norm: Vec<f32>,
     pub head_fn: Vec<f32>,
@@ -266,7 +307,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let hs = f(model, "model.hc_head.scale")?;
     let globals = Globals {
         model: model.clone(),
-        embed: t(model, "model.embed_tokens.weight")?,
+        embed: Embed::load(model, "model.embed_tokens.weight")?,
         lm_head: t(model, "lm_head.weight")?,
         norm: f(model, "model.norm.weight")?,
         head_fn: f(model, "model.hc_head.fn")?,
@@ -826,7 +867,7 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
         let mut h = vec![0.0f32; k * dim];
         for (j, &tk) in ids[done..end].iter().enumerate() {
             if (tk as usize) < globals.embed.rows() {
-                globals.embed.row_f32(tk as usize, &mut h[j * dim..(j + 1) * dim]);
+                globals.embed.row_f32(&globals.model, tk as usize, &mut h[j * dim..(j + 1) * dim]);
             }
         }
         let positions: Vec<usize> = (start + done..start + end).collect();
@@ -930,7 +971,7 @@ fn graph_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &State, to
     let Some(gl) = graph_layers(globals, layers, cfg, position + 1) else { return TokenGraphOutcome::Declined };
     let mut h = vec![0.0f32; cfg.dim];
     if (token_id as usize) < globals.embed.rows() {
-        globals.embed.row_f32(token_id as usize, &mut h);
+        globals.embed.row_f32(&globals.model, token_id as usize, &mut h);
     }
     let o1: Vec<Option<Vec<crate::nystrom::O1DeviceView<'_>>>> = (0..gl.len()).map(|_| None).collect();
     let vocab = globals.lm_head.rows();
@@ -983,7 +1024,7 @@ fn host_streams(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut Stat
     let (dim, hc) = (cfg.dim, cfg.hc);
     let mut h = vec![0f32; dim];
     if (token_id as usize) < globals.embed.rows() {
-        globals.embed.row_f32(token_id as usize, &mut h);
+        globals.embed.row_f32(&globals.model, token_id as usize, &mut h);
     }
     let mut streams: Vec<f32> = (0..hc).flat_map(|_| h.iter().copied()).collect();
     let mut folded = vec![0f32; dim];
