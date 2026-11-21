@@ -680,6 +680,10 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
         return None;
     }
     let last = layers.len().checked_sub(1)?;
+    // The CUDA hybrid reads the block route from the layer's own geometry. The wgpu graphs
+    // have no arm for it and take the stack on the call-wide geometry, their plain contract
+    // (`CMF_MAXWELL_GEOM=1`: the layer's own there too).
+    let own_geom = crate::gpu::cuda_active() || std::env::var("CMF_MAXWELL_GEOM").as_deref() == Ok("1");
     let mut out = Vec::with_capacity(layers.len());
     for (li, l) in layers.iter().enumerate() {
         let a = &l.attn;
@@ -697,7 +701,7 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
             cpu_k: &[],
             cpu_v: &[],
             cpu_base: 0,
-            geom: Some(GraphAttnGeom {
+            geom: own_geom.then_some(GraphAttnGeom {
                 nkv: cfg.nkv,
                 hd: cfg.hd,
                 dv: cfg.hd,
