@@ -515,17 +515,43 @@ pub fn learn_masks(data: &Data, on: LossOn, model_path: &Path, cfg: &MaskCfg, lo
         let (ids, nx, wt, tot) = batch(&trw, b);
         nt::step_wh(c, &net, &work, &ids, h0(b).as_deref(), &nx, &wt, 1, gs, None, Some(tot))
     };
-    train_masks(c, &net, n_train_b, &step, &|| val(&net), cfg, log, "S2 (device)", &intro)
+    train_masks(&WgMaskNet(c, &net), n_train_b, &step, &|| val(&net), cfg, log, "S2 (device)", &intro)
 }
 
 /// The mask loop of [`learn_masks`] on a net with gates on
 /// ([`nt::Net::enable_masks`]): `step(b, gscale)` runs batch `b` (the loss
 /// is the caller's — the task's LM loss, or a KL to a teacher), `val` the
 /// held-out loss.
+/// The gates of a net on a device, as [`train_masks`] drives them: the wgpu
+/// trainer's net, or the CUDA trainer's.
+pub trait MaskNet {
+    /// MLP widths of the gated layers.
+    fn mask_widths(&self) -> Vec<usize>;
+    /// Set every gate (`s[l]` for the l-th gated layer).
+    fn set_masks(&self, s: &[Vec<f32>]) -> Option<()>;
+    /// The gates' accumulated gradients `dL/ds`, read and cleared.
+    fn mask_grads(&self) -> Option<Vec<Vec<f32>>>;
+}
+
+/// The wgpu trainer's net as a [`MaskNet`].
+pub struct WgMaskNet<'a>(pub cortiq_engine::gpu_wgpu::CtxRef, pub &'a nt::Net);
+
+impl MaskNet for WgMaskNet<'_> {
+    fn mask_widths(&self) -> Vec<usize> {
+        // the gated layers only (`first..end`: a tail net leaves the prefix out)
+        self.1.layers[self.1.first..self.1.end].iter().map(|l| l.gate.m()).collect()
+    }
+    fn set_masks(&self, s: &[Vec<f32>]) -> Option<()> {
+        self.1.set_masks(self.0, s)
+    }
+    fn mask_grads(&self) -> Option<Vec<Vec<f32>>> {
+        self.1.mask_grads(self.0)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn train_masks(
-    c: cortiq_engine::gpu_wgpu::CtxRef,
-    net: &nt::Net,
+    net: &dyn MaskNet,
     n_train_b: usize,
     step: &dyn Fn(usize, f32) -> Option<nt::StepStats>,
     val: &dyn Fn() -> Result<f64>,
@@ -534,8 +560,7 @@ pub fn train_masks(
     what: &str,
     intro: &str,
 ) -> Result<MaskReport> {
-    // the gated layers only (`first..end`: a tail net leaves the prefix out)
-    let widths: Vec<usize> = net.layers[net.first..net.end].iter().map(|l| l.gate.m()).collect();
+    let widths: Vec<usize> = net.mask_widths();
     let n_all: usize = widths.iter().sum();
     let target = (1.0 - cfg.keep_frac).clamp(0.0, 0.95);
     let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
@@ -555,7 +580,7 @@ pub fn train_masks(
             .collect();
         (s, alive)
     };
-    net.set_masks(c, &widths.iter().map(|&w| vec![1.0; w]).collect::<Vec<_>>()).context("masks")?;
+    net.set_masks(&widths.iter().map(|&w| vec![1.0; w]).collect::<Vec<_>>()).context("masks")?;
     let nll_open = val()?;
     let mut logits: Vec<Vec<f32>> = widths.iter().map(|&w| vec![cfg.mask_init; w]).collect();
     let (mut m1, mut m2): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (widths.iter().map(|&w| vec![0.0; w]).collect(), widths.iter().map(|&w| vec![0.0; w]).collect());
@@ -587,9 +612,9 @@ pub fn train_masks(
             }
             let ts = Instant::now();
             let s: Vec<Vec<f32>> = logits.iter().map(|l| l.iter().map(|&x| sig(x)).collect()).collect();
-            net.set_masks(c, &s).context("masks")?;
+            net.set_masks(&s).context("masks")?;
             let st = step(b, gscale).context("DTG-MA step failed")?;
-            let g = net.mask_grads(c).context("mask gradients")?;
+            let g = net.mask_grads().context("mask gradients")?;
             if !st.finite || g.iter().flatten().any(|x| !x.is_finite()) {
                 gscale = (gscale / 2.0).max(1.0);
                 skipped += 1;
@@ -617,9 +642,9 @@ pub fn train_masks(
                 let (hs, alive) = hard(&logits);
                 if cfg.soft {
                     let soft: Vec<Vec<f32>> = logits.iter().map(|l| l.iter().map(|&x| sig(x)).collect()).collect();
-                    net.set_masks(c, &soft).context("masks")?;
+                    net.set_masks(&soft).context("masks")?;
                 } else {
-                    net.set_masks(c, &hs).context("masks")?;
+                    net.set_masks(&hs).context("masks")?;
                 }
                 let e = val()?;
                 let pruned = 1.0 - alive as f64 / n_all as f64;

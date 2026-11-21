@@ -1083,6 +1083,18 @@ pub enum BlrDevice {
 }
 
 impl BlrDevice {
+    /// `CMF_GPU=cuda` in a build with the `cuda` feature, the card up.
+    fn cuda_up() -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            cortiq_engine::gpu_cuda::selected() && cortiq_engine::nvg_dev::on_cuda()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             BlrDevice::Cpu => "cpu",
@@ -1102,10 +1114,12 @@ impl BlrDevice {
             // macOS was excluded here, so every conversion on a Mac ran the
             // f64 CPU encoder — measured 63 s per tensor against ~6 s on the
             // device. The bench path already used the device there.
+            // … or the CUDA backend under `CMF_GPU=cuda` (a machine without
+            // a Vulkan adapter still converts on its card).
             "auto" => Ok(
                 if cfg!(feature = "gpu")
                     && std::env::var("CMF_GPU").as_deref() != Ok("0")
-                    && cortiq_engine::gpu::backend_available()
+                    && (Self::cuda_up() || cortiq_engine::gpu::backend_available())
                 {
                     BlrDevice::Gpu
                 } else {
@@ -1118,6 +1132,9 @@ impl BlrDevice {
 }
 
 pub struct BlrOpts {
+    /// SFq's channel scale for the device encoder (`--blr-channel-scale α`):
+    /// every input is encoded in the basis `x·t`, `t_j = σ_j^α / rms_j^(1−α)`.
+    pub chscale: Option<f64>,
     pub bpw: f64,
     pub plan: Plan,
     pub method: Method,
@@ -1428,6 +1445,111 @@ pub(crate) fn mean_gram(acc: &cortiq_engine::gptq_capture::HessianAcc) -> Mat {
     Mat::from_vec(n, n, acc.h.iter().map(|v| v / t).collect())
 }
 
+/// The calibration role of a lead's input in the CUDA forward (`nvgt::calib_pass`).
+#[cfg(feature = "cuda")]
+fn lead_role(lead: &str) -> &'static str {
+    match lead {
+        "q" | "qkv" => "in",
+        "o" | "out" => "mixout",
+        "gate" => "mlp",
+        _ => "down",
+    }
+}
+
+/// Layer `l`'s FIT and SEL input Grams from the CUDA trainer's forward over
+/// layers `bound..=l` of `wm` (the layers below `l` already binary low-rank):
+/// per lead the mean Grams, and with `advance` every window's input of layer
+/// `l` — where the next layer's pass resumes. With `drop_last` the positions
+/// are the conversion's engine calibration's (a window's last token is not fed).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn calib_cuda(
+    wm: &CmfModel,
+    l: usize,
+    bound: usize,
+    leads: &[&'static str],
+    fit_w: &[Vec<u32>],
+    sel_w: &[Vec<u32>],
+    bound_fit: &[Vec<f32>],
+    bound_sel: &[Vec<f32>],
+    advance: bool,
+    drop_last: bool,
+) -> anyhow::Result<(HashMap<&'static str, (Mat, Mat)>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    use cortiq_engine::gpu_cuda::nvgt as cu;
+    let e = |s: String| anyhow::anyhow!("CUDA calibration: {s}");
+    let net = cu::Net::load_calib(wm, bound..l + 1).map_err(e)?;
+    let mut works: HashMap<usize, cu::Work> = HashMap::new();
+    let mut pass = |windows: &[Vec<u32>], states: &[Vec<f32>]| -> anyhow::Result<(Vec<Mat>, Vec<Vec<f32>>)> {
+        let mut accs: Vec<cu::Gram> = Vec::new();
+        for &lead in leads {
+            accs.push(cu::Gram::new(net.calib_width(l, lead_role(lead)).map_err(e)?).map_err(e)?);
+        }
+        let mut next = Vec::new();
+        for (wi, wv) in windows.iter().enumerate() {
+            let t = wv.len() - drop_last as usize;
+            if !works.contains_key(&t) {
+                works.insert(t, cu::Work::new(&net, 1, t).map_err(e)?);
+            }
+            let w = &works[&t];
+            let h0 = states.get(wi).filter(|_| bound > 0).map(Vec::as_slice);
+            let mut gs: Vec<(&str, &mut cu::Gram)> = leads.iter().map(|&ld| lead_role(ld)).zip(accs.iter_mut()).collect();
+            let h = cu::calib_pass(&net, w, &wv[..t], h0, l, &mut gs, advance).map_err(e)?;
+            if let Some(h) = h {
+                next.push(h);
+            }
+        }
+        let mut out = Vec::new();
+        for a in &accs {
+            let n = a.count.max(1) as f64;
+            out.push(Mat::from_vec(a.k, a.k, a.read().map_err(e)?.into_iter().map(|v| v / n).collect()));
+        }
+        Ok((out, next))
+    };
+    let (gf, nf) = pass(fit_w, bound_fit)?;
+    let (gs, ns) = pass(sel_w, bound_sel)?;
+    let grams = leads.iter().copied().zip(gf.into_iter().zip(gs)).collect();
+    Ok((grams, nf, ns))
+}
+
+/// SFq's channel scale of one input (docs/Q2TP_SCALE_REFINE.md §1):
+/// `t_j = σ_j^α / rms_j^(1−α)` — `colsq[j]` the sum of squares of column j
+/// over the `rows` rows of every tensor reading the input, `hdiag[j]` the
+/// input's mean square on the calibration text — normalized to a unit
+/// geometric mean and kept in [1e-3, 1e3]; a dead channel gets 1.
+pub(crate) fn channel_scale(colsq: &[f64], rows: usize, hdiag: &[f64], alpha: f64) -> Vec<f64> {
+    let n = colsq.len();
+    let mut t = vec![1f64; n];
+    let (mut lsum, mut live) = (0f64, 0usize);
+    for j in 0..n {
+        let sigma = (colsq[j] / rows.max(1) as f64).sqrt();
+        let rms = hdiag[j].max(0.0).sqrt();
+        if sigma > 0.0 && rms > 0.0 && sigma.is_finite() && rms.is_finite() {
+            t[j] = sigma.powf(alpha) / rms.powf(1.0 - alpha);
+            lsum += t[j].ln();
+            live += 1;
+        }
+    }
+    let gm = (lsum / live.max(1) as f64).exp();
+    for j in 0..n {
+        let sigma = (colsq[j] / rows.max(1) as f64).sqrt();
+        if sigma > 0.0 && hdiag[j] > 0.0 {
+            t[j] = (t[j] / gm).clamp(1e-3, 1e3);
+        }
+    }
+    t
+}
+
+/// `diag(t)·H·diag(t)` in place.
+pub(crate) fn rebase_gram(h: &mut Mat, t: &[f64]) {
+    let n = h.r;
+    for i in 0..n {
+        let ti = t[i];
+        for (v, tj) in h.d[i * n..(i + 1) * n].iter_mut().zip(t) {
+            *v *= ti * tj;
+        }
+    }
+}
+
 /// `cortiq convert --quant blr`.
 pub fn run_convert_blr(
     model: &str,
@@ -1442,6 +1564,11 @@ pub fn run_convert_blr(
     );
     let plan = o.plan.clone();
     let gpu = o.method == Method::Nvg && o.device == BlrDevice::Gpu;
+    anyhow::ensure!(o.chscale.is_none() || gpu, "--blr-channel-scale runs in the device encoder (--blr-method nvg --blr-device gpu)");
+    // `CMF_GPU=cuda`: the whole conversion on the card — the calibration is
+    // the CUDA trainer's forward, the encoder `gpu_cuda::nvg_dev`.
+    #[cfg(feature = "cuda")]
+    let cuda_calib = gpu && cortiq_engine::gpu_cuda::selected() && std::env::var("CMF_NVG_CALIB").as_deref() != Ok("engine") && cortiq_engine::gpu_cuda::nvgt::available();
     if o.method == Method::Nvg {
         anyhow::ensure!(o.calib.is_some(), "--blr-method nvg needs --calib FILE");
         if gpu {
@@ -1510,7 +1637,20 @@ pub fn run_convert_blr(
         "blr: {} body linears over {nl} layers, method {} ({}), target {:.4} BPW, kv×{} ({}), paths {}",
         cand.len(),
         o.method.name(),
-        if o.method == Method::Nvg { o.device.name() } else { "cpu" },
+        if o.method != Method::Nvg {
+            "cpu"
+        } else if gpu {
+            #[cfg(feature = "gpu")]
+            {
+                cortiq_engine::nvg_dev::backend_name()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                o.device.name()
+            }
+        } else {
+            o.device.name()
+        },
         o.bpw,
         o.kv_factor,
         if gqa { "GQA" } else { "MHA" },
@@ -1672,6 +1812,37 @@ pub fn run_convert_blr(
                 }
                 .map_err(|e| anyhow::anyhow!("write {work}: {e}"))?;
                 let wm = Arc::new(CmfModel::open(work)?);
+                let mut grams: HashMap<&str, (Mat, Mat)> = HashMap::new();
+                let mut fit_ppl = 0f64;
+                // The calibration forward: the CUDA trainer's own (layers
+                // `bound..=l` on the card, Grams accumulated there) under
+                // `CMF_GPU=cuda`, else the engine's pipeline with the capture hook.
+                #[cfg(feature = "cuda")]
+                let on_cuda = cuda_calib;
+                #[cfg(not(feature = "cuda"))]
+                let on_cuda = false;
+                if on_cuda {
+                    #[cfg(feature = "cuda")]
+                    {
+                        if fit_w.is_empty() {
+                            let vocab = srcm.vocab.as_deref().ok_or_else(|| anyhow::anyhow!("the source has no embedded tokenizer"))?;
+                            let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(vocab).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                            let ids = tok.encode(&text);
+                            let need = o.fit_tokens + o.sel_tokens;
+                            anyhow::ensure!(ids.len() >= need, "calibration text has {} tokens, need {need}", ids.len());
+                            fit_w.extend(ids[..o.fit_tokens].chunks(window).filter(|c| c.len() >= 2).map(<[u32]>::to_vec));
+                            sel_w.extend(ids[o.fit_tokens..need].chunks(window).filter(|c| c.len() >= 2).map(<[u32]>::to_vec));
+                            eprintln!("blr: calibration FIT {} windows, SEL {} windows of ≤{window} tokens (CUDA forward)", fit_w.len(), sel_w.len());
+                        }
+                        let advance = l > bound;
+                        let (g, nf, ns) = calib_cuda(&wm, l, bound, &leads, &fit_w, &sel_w, &bound_fit, &bound_sel, advance, true)?;
+                        grams = g;
+                        if advance {
+                            (bound_fit, bound_sel, bound) = (nf, ns, l);
+                        }
+                        drop(wm);
+                    }
+                } else {
                 let mut pipe = cortiq_engine::Pipeline::from_model(
                     &wm,
                     cortiq_engine::SamplerConfig::default(),
@@ -1703,8 +1874,6 @@ pub fn run_convert_blr(
                     );
                 }
                 let names: HashSet<String> = leads.iter().map(|s| lead_name(l, s)).collect();
-                let mut grams: HashMap<&str, (Mat, Mat)> = HashMap::new();
-                let mut fit_ppl = 0f64;
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 // The device pass feeds the positions the host's scored
@@ -1753,6 +1922,7 @@ pub fn run_convert_blr(
                     };
                     grams.insert(lead, (mean_gram(a), mean_gram(b)));
                 }
+                }
                 let tc = tl.elapsed().as_secs_f64();
                 #[cfg(feature = "gpu")]
                 if gpu && std::env::var("CMF_NVG_ENC_CPU").as_deref() != Ok("1") {
@@ -1760,6 +1930,39 @@ pub fn run_convert_blr(
                     // on the device with up to CMF_NVG_JOBS (default 3) in
                     // flight.
                     let th = Instant::now();
+                    let mut ws: Vec<Mat> = Vec::with_capacity(mine.len());
+                    for &(slot, _, _) in &mine {
+                        ws.push(load_f64(&srcm, slot)?);
+                    }
+                    // SFq's channel scale: one t per input, from the column RMS
+                    // of every tensor reading it and the input's own RMS; the
+                    // Grams go to the scaled basis, the encoder puts t into g.
+                    let mut tscale: HashMap<&str, Vec<f64>> = HashMap::new();
+                    if let Some(alpha) = o.chscale {
+                        for &lead in &leads {
+                            let n = grams[lead].0.r;
+                            let (mut colsq, mut rows) = (vec![0f64; n], 0usize);
+                            for (w, &(_, _, short)) in ws.iter().zip(&mine) {
+                                if input_lead(short) != lead {
+                                    continue;
+                                }
+                                rows += w.r;
+                                for i in 0..w.r {
+                                    for (c, v) in colsq.iter_mut().zip(w.row(i)) {
+                                        *c += v * v;
+                                    }
+                                }
+                            }
+                            let (hfit, hsel) = grams.get_mut(lead).expect("captured above");
+                            let hdiag: Vec<f64> = (0..n).map(|j| hfit.at(j, j)).collect();
+                            let t = channel_scale(&colsq, rows, &hdiag, alpha);
+                            rebase_gram(hfit, &t);
+                            rebase_gram(hsel, &t);
+                            let (lo, hi) = t.iter().fold((f64::MAX, 0f64), |(a, b), &v| (a.min(v), b.max(v)));
+                            eprintln!("  L{l} channel scale {lead}: t in [{lo:.3}, {hi:.3}] (alpha {alpha})");
+                            tscale.insert(lead, t);
+                        }
+                    }
                     let mut hctx: HashMap<&str, crate::nvg_gpu::HCtxD> = HashMap::new();
                     for &lead in &leads {
                         let (hfit, hsel) = &grams[lead];
@@ -1768,12 +1971,13 @@ pub fn run_convert_blr(
                     drop(grams);
                     let thc = th.elapsed().as_secs_f64();
                     let mut jobs = Vec::new();
-                    for &(slot, layer, short) in &mine {
+                    for (w, &(slot, layer, short)) in ws.into_iter().zip(&mine) {
                         jobs.push(crate::nvg_gpu::Job {
-                            w: load_f64(&srcm, slot)?,
+                            w,
                             hc: &hctx[input_lead(short)],
                             mult: mult_of(short),
                             bpw: plan.bpw_for(&srcm.tensors[slot].name, layer, o.bpw),
+                            colscale: tscale.get(input_lead(short)).map(Vec::as_slice),
                         });
                     }
                     let njobs: usize = std::env::var("CMF_NVG_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
@@ -2029,6 +2233,62 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    }
+
+    /// The channel scale is a change of the input basis: the H-weighted error
+    /// of any approximation is the same number in the scaled basis, the live
+    /// channels' scales have a unit geometric mean, a dead channel keeps 1.
+    #[test]
+    fn channel_scale_is_a_change_of_basis() {
+        let (w, mut h) = synth();
+        let (m, n) = (w.r, w.c);
+        // a dead input channel
+        for j in 0..n {
+            h.d[5 * n + j] = 0.0;
+            h.d[j * n + 5] = 0.0;
+        }
+        let mut s = 7u64;
+        let mut wq = w.clone();
+        wq.d.iter_mut().for_each(|v| *v += 0.1 * rnd(&mut s));
+        let err = |w: &Mat, wq: &Mat, h: &Mat| -> f64 {
+            let mut e = 0.0;
+            for i in 0..m {
+                let d: Vec<f64> = (0..n).map(|j| w.d[i * n + j] - wq.d[i * n + j]).collect();
+                for a in 0..n {
+                    for b in 0..n {
+                        e += d[a] * h.d[a * n + b] * d[b];
+                    }
+                }
+            }
+            e
+        };
+        let colsq: Vec<f64> = (0..n).map(|j| (0..m).map(|i| w.d[i * n + j] * w.d[i * n + j]).sum()).collect();
+        let hdiag: Vec<f64> = (0..n).map(|j| h.d[j * n + j]).collect();
+        let e0 = err(&w, &wq, &h);
+        for alpha in [0.0, 0.5, 0.75, 1.0] {
+            let t = channel_scale(&colsq, m, &hdiag, alpha);
+            assert_eq!(t[5], 1.0, "a dead channel keeps its unit");
+            assert!(t.iter().all(|v| v.is_finite() && *v > 0.0));
+            let lg: f64 = t.iter().enumerate().filter(|(j, _)| *j != 5).map(|(_, v)| v.ln()).sum();
+            assert!(lg.abs() < 1e-9 * n as f64, "alpha {alpha}: geometric mean {}", (lg / (n - 1) as f64).exp());
+            let (mut ws, mut wqs, mut hs) = (w.clone(), wq.clone(), h.clone());
+            for i in 0..m {
+                for j in 0..n {
+                    ws.d[i * n + j] /= t[j];
+                    wqs.d[i * n + j] /= t[j];
+                }
+            }
+            rebase_gram(&mut hs, &t);
+            let e1 = err(&ws, &wqs, &hs);
+            assert!((e1 - e0).abs() < 1e-9 * e0, "alpha {alpha}: {e1} against {e0}");
+        }
+        // alpha 1 follows the weight columns alone, alpha 0 the inverse input RMS alone
+        let t1 = channel_scale(&colsq, m, &hdiag, 1.0);
+        let t0 = channel_scale(&colsq, m, &hdiag, 0.0);
+        let (sa, sb) = ((colsq[1] / m as f64).sqrt(), (colsq[9] / m as f64).sqrt());
+        assert!((t1[1] / t1[9] - sa / sb).abs() < 1e-9 * (sa / sb));
+        let (ra, rb) = (hdiag[1].sqrt(), hdiag[9].sqrt());
+        assert!((t0[1] / t0[9] - rb / ra).abs() < 1e-9 * (rb / ra));
     }
 
     /// Synthetic layer: decaying spectrum, three heavy input channels.

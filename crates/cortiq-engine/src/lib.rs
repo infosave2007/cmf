@@ -24,6 +24,8 @@ pub mod fcd;
 pub mod fcd_ops;
 #[cfg(feature = "gpu")]
 pub mod nvg_train;
+#[cfg(feature = "gpu")]
+pub mod nvg_dev;
 pub mod f32_backend;
 pub mod g3n;
 pub mod g4e;

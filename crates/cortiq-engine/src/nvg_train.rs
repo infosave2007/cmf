@@ -254,11 +254,11 @@ pub struct Net {
 
 /// Host threads for a load's element conversions (the cgroup quota, not
 /// the host's cores).
-fn load_threads() -> usize {
+pub(crate) fn load_threads() -> usize {
     crate::pool::Pool::effective_threads().max(1)
 }
 
-fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
+pub(crate) fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
     let e = m.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     let n: usize = e.shape.iter().product();
     let mut v = vec![0f32; n];
@@ -1838,7 +1838,7 @@ pub fn export(c: Ctx, net: &Net, model: &CmfModel) -> Result<Vec<(String, Vec<u8
 }
 
 /// Device U bitmap `[m][wpr]` → file `[m][r/8]` (byte b of row i = ranks 8b..8b+7).
-fn u_bits_to_file(bu: &[u32], m: usize, r: usize, wpr: usize, out: &mut [u8]) {
+pub(crate) fn u_bits_to_file(bu: &[u32], m: usize, r: usize, wpr: usize, out: &mut [u8]) {
     for i in 0..m {
         for b in 0..r / 8 {
             out[i * r / 8 + b] = ((bu[i * wpr + (8 * b) / 32] >> ((8 * b) % 32)) & 0xff) as u8;
@@ -1848,7 +1848,7 @@ fn u_bits_to_file(bu: &[u32], m: usize, r: usize, wpr: usize, out: &mut [u8]) {
 
 /// Device V bitmap `[n][wpr]` (rank bits per input row) → file `[r][n/8]`
 /// (input bits per rank): a bit transpose, parallel over ranks.
-fn v_bits_to_file(bv: &[u32], n: usize, r: usize, wpr: usize, out: &mut [u8]) {
+pub(crate) fn v_bits_to_file(bv: &[u32], n: usize, r: usize, wpr: usize, out: &mut [u8]) {
     let row = n / 8;
     let lanes = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(16);
     let per = r.div_ceil(lanes).max(1);
@@ -1901,7 +1901,7 @@ fn state_bufs(net: &Net) -> Vec<(&wgpu::Buffer, usize)> {
 
 const STATE_MAGIC: &[u8; 8] = b"NVGSTAT1";
 
-fn write_words(path: &std::path::Path, parts: &mut dyn Iterator<Item = Result<Vec<u32>, String>>, sizes: &[usize]) -> Result<u64, String> {
+pub(crate) fn write_words(path: &std::path::Path, parts: &mut dyn Iterator<Item = Result<Vec<u32>, String>>, sizes: &[usize]) -> Result<u64, String> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
     let mut f = std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?);
@@ -1923,7 +1923,7 @@ fn write_words(path: &std::path::Path, parts: &mut dyn Iterator<Item = Result<Ve
     Ok(bytes)
 }
 
-fn read_words(path: &std::path::Path, sizes: &[usize], mut each: impl FnMut(usize, &[u32])) -> Result<(), String> {
+pub(crate) fn read_words(path: &std::path::Path, sizes: &[usize], mut each: impl FnMut(usize, &[u32])) -> Result<(), String> {
     use std::io::Read;
     let mut f = std::io::BufReader::with_capacity(16 << 20, std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?);
     let io = |e: std::io::Error| e.to_string();

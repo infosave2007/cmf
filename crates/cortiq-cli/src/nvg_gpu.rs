@@ -1,8 +1,9 @@
-//! The NVG encoder on the device (wgpu, f32) — `--blr-device gpu`.
+//! The NVG encoder on the device (f32) — `--blr-device gpu`: wgpu, or the
+//! CUDA backend under `CMF_GPU=cuda` (a build with the `cuda` feature).
 //!
 //! Stage for stage the CPU encoder of `nvg.rs` (the f64 reference, kept as
-//! `--blr-device cpu`), with the work moved to `cortiq_engine::gpu_wgpu::
-//! nvg_dev`:
+//! `--blr-device cpu`), with the work moved to `cortiq_engine::nvg_dev`
+//! (`gpu_wgpu::nvg_dev` or its twin `gpu_cuda::nvg_dev`):
 //!
 //! * per input: `H` (damped), the held-out Gram, the act order and the upper
 //!   Cholesky factor `Uc` of the permuted `H⁻¹` (equilibrated f32 Cholesky +
@@ -34,7 +35,7 @@
 use crate::nvg::{BlrModel, BlrPath, Encoded, PathsChoice, Prof, pack};
 use crate::nvg_linalg::{Mat, solve_spd, sym_eig};
 use cortiq_core::blr::{blr_bits, blr_rank};
-use cortiq_engine::gpu_wgpu::nvg_dev::{self as dv, ABS, DMat, INPLACE, LOWER, SIGN, V};
+use cortiq_engine::nvg_dev::{self as dv, ABS, DMat, INPLACE, LOWER, SIGN, V};
 use cortiq_engine::pool::Pool;
 use std::cell::RefCell;
 use std::time::Instant;
@@ -58,6 +59,20 @@ fn vec_dev(v: &[f64]) -> DMat {
     DMat::from_f64(1, v.len(), v)
 }
 
+/// Refinement sweeps of the discrete knots (`CMF_NVG_SWEEPS`, default 2: the
+/// host encoder's).
+/// A tensor's two candidates on two threads (CUDA; `CMF_NVG_CAND_THREADS=0`
+/// builds them one after the other).
+fn cand_threads() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_CAND_THREADS").as_deref() != Ok("0"));
+    *ON
+}
+
+pub(crate) fn refine_sweeps() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2));
+    *N
+}
+
 /// f32 flip tolerance, relative (the f64 host path uses 1e-12;
 /// `CMF_NVG_FLIP_TOL` overrides). 1e-7 sits at the f32 resolution: 1e-6
 /// stopped the discrete search early enough to cost ~2 % ppl end to end on
@@ -77,7 +92,7 @@ pub struct HCtxD {
     pub sqd: Vec<f64>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub perm: Vec<usize>,
-    perm_buf: cortiq_engine::wgpu::Buffer,
+    perm_buf: dv::U32Buf,
     pub uc: DMat,
     d: Vec<f64>,
     l: std::sync::Mutex<Option<std::sync::Arc<DMat>>>,
@@ -85,7 +100,7 @@ pub struct HCtxD {
 
 impl HCtxD {
     pub fn new(hfit: &Mat, hsel: &Mat, rho: f64) -> anyhow::Result<Self> {
-        anyhow::ensure!(dv::available(), "no wgpu device for the NVG encoder");
+        anyhow::ensure!(dv::available(), "no GPU device for the NVG encoder");
         let n = hfit.r;
         let tr = (0..n).map(|i| hfit.at(i, i)).sum::<f64>() / n as f64;
         let c_fit = rho * tr;
@@ -255,11 +270,13 @@ impl ModelD {
     }
 }
 
-/// One tensor's device context.
+/// One tensor's device context (a view: the two candidates of a tensor are
+/// built on two threads from the same matrices, each with its own workers).
+#[derive(Clone, Copy)]
 struct TCtxD<'a> {
-    w: DMat,
-    wh: DMat,
-    whsel: DMat,
+    w: &'a DMat,
+    wh: &'a DMat,
+    whsel: &'a DMat,
     /// tr(W H Wᵀ), tr(W Hsel Wᵀ), ‖W‖²
     a_h: f64,
     a_sel: f64,
@@ -659,6 +676,11 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
 
 /// Input-side knots (see `nvg::gptq_v`), in the latent space.
 fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
+    gptq_v_on(md, c, pi, gv_on_host())
+}
+
+/// [`gptq_v_d`] with the flips on the host or in the device's kernel.
+fn gptq_v_on(md: &mut ModelD, c: &TCtxD, pi: usize, host: bool) -> u64 {
     let (n, r) = (md.n, md.r);
     let np = md.paths.len();
     let mm = md.hsl(pi);
@@ -678,17 +700,303 @@ fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
     dv::permute_rows(&md.paths[pi].sv, &s, &c.hc.perm_buf, false);
     let ks0 = dv::mm(&s, false, &k, false);
     let eg = DMat::zeros(1, 128 * r + n);
-    let cnt = DMat::zeros(1, 4);
-    let mut b0 = 0;
-    while b0 < n {
-        let b1 = (b0 + 128).min(n);
-        dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, *FLIP_TOL_V);
-        b0 = b1;
-    }
+    let flips = if host {
+        // the columns' flips on this thread, the feedback between blocks on the device
+        let kh = k.to_f32();
+        let mut hs = GvHost::new(r, &kh);
+        let mut flips = 0u64;
+        let mut b0 = 0;
+        while b0 < n {
+            let b1 = (b0 + 128).min(n);
+            flips += gv_block_host(&mut hs, &kh, &bv, &s, &ks0, &c.hc.uc, &eg, b0, b1, 4 * r, *FLIP_TOL_V);
+            b0 = b1;
+        }
+        flips
+    } else {
+        let cnt = DMat::zeros(1, 4);
+        let mut b0 = 0;
+        while b0 < n {
+            let b1 = (b0 + 128).min(n);
+            dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, *FLIP_TOL_V);
+            b0 = b1;
+        }
+        cnt.to_f32()[0].to_bits() as u64
+    };
     dv::permute_rows(&s, &md.paths[pi].sv, &c.hc.perm_buf, true);
     dv::scatter_vec(&eg, 128 * r, &md.paths[pi].g, &c.hc.perm_buf, n);
     md.paths[pi].invalidate();
-    cnt.to_f32()[0].to_bits() as u64
+    flips
+}
+
+/// Where the input-side search's flips run: on the calling thread (the
+/// default) or in the device's kernel (`CMF_NVG_GV=device`, and a host
+/// without a hardware fused multiply-add).
+///
+/// The search is sequential twice over — a column's target carries the
+/// errors of the columns before it, and a flip changes every candidate of
+/// the next one — so on the device it is one block of threads on one
+/// multiprocessor: about a microsecond a flip at any rank, 43 s of a 27B
+/// `down_proj`'s 56 on either backend, with the rest of the card idle. A
+/// flip is a pass over r floats; a host core does that in vector registers
+/// several times faster, and every tensor and candidate in flight has a core
+/// of its own. The products between blocks stay on the device.
+fn gv_on_host() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_GV").as_deref() != Ok("device") && host_fma());
+    *ON
+}
+
+/// Relative convergence of a column's scale between flip rounds on the host
+/// (`CMF_NVG_GJ_TOL`, default 1e-8 as in the device kernels).
+fn gv_gj_tol() -> f32 {
+    static T: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_GJ_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-8));
+    *T
+}
+
+/// Scratch of the host search: the column in flight and the candidates' terms.
+struct GvHost {
+    /// diag(K)
+    kd: Vec<f32>,
+    s: Vec<f32>,
+    ks: Vec<f32>,
+    bv: Vec<f32>,
+    /// kd·s
+    kds: Vec<f32>,
+    /// a·s with a = −4·gj²
+    a_s: Vec<f32>,
+    /// 4·gj·s·bv: a candidate's gain is `a_s·(ks − kds) + bp`
+    bp: Vec<f32>,
+    d: Vec<f32>,
+    /// the minimum of each chunk of [`GV_CH`] candidates
+    cm: Vec<f32>,
+    zero: Vec<f32>,
+}
+
+/// Candidates a chunk of the flip pass holds (its minimum is kept beside).
+const GV_CH: usize = 16;
+
+impl GvHost {
+    fn new(r: usize, k: &[f32]) -> GvHost {
+        let z = || vec![0f32; r];
+        GvHost { kd: (0..r).map(|x| k[x * r + x]).collect(), s: z(), ks: z(), bv: z(), kds: z(), a_s: z(), bp: z(), d: z(), cm: vec![0f32; r.div_ceil(GV_CH)], zero: z() }
+    }
+}
+
+/// One pass of the search over a column's r candidates: the last flip's
+/// update `ks −= c·K[row]`, every candidate's gain
+/// `d = (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv` as the device kernel writes it —
+/// the difference `ks − kd·s` first: it is small beside its two terms, and a
+/// gain summed from the large terms loses the digits the stop test reads —
+/// and the minimum of each chunk. The last product and sum are one fused
+/// multiply-add, as the device compiler makes them: near the stop test the
+/// two terms cancel, and a product rounded before the sum leaves noise the
+/// size of the test's tolerance (the fit then ends 0.7 % higher). Elementwise
+/// IEEE operations: the values do not depend on the vector width.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gv_pass_body(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    let r = ks.len();
+    let (krow, kds, a_s, bp, d) = (&krow[..r], &kds[..r], &a_s[..r], &bp[..r], &mut d[..r]);
+    for (ci, m) in cm.iter_mut().enumerate() {
+        let o = ci * GV_CH;
+        let end = (o + GV_CH).min(r);
+        if end - o == GV_CH {
+            let (ks_c, k_c, kds_c, as_c, bp_c, d_c) = (&mut ks[o..end], &krow[o..end], &kds[o..end], &a_s[o..end], &bp[o..end], &mut d[o..end]);
+            for l in 0..GV_CH {
+                let v = ks_c[l] - c * k_c[l];
+                ks_c[l] = v;
+                d_c[l] = as_c[l].mul_add(v - kds_c[l], bp_c[l]);
+            }
+            // the chunk's minimum as a tree of pairwise picks (vector compares)
+            let mut t = [0f32; GV_CH / 2];
+            for l in 0..GV_CH / 2 {
+                t[l] = if d_c[l + GV_CH / 2] < d_c[l] { d_c[l + GV_CH / 2] } else { d_c[l] };
+            }
+            let mut w = GV_CH / 4;
+            while w >= 1 {
+                for l in 0..w {
+                    t[l] = if t[l + w] < t[l] { t[l + w] } else { t[l] };
+                }
+                w /= 2;
+            }
+            *m = t[0];
+        } else {
+            let mut mm = f32::INFINITY;
+            for x in o..end {
+                let v = ks[x] - c * krow[x];
+                ks[x] = v;
+                let dx = a_s[x].mul_add(v - kds[x], bp[x]);
+                d[x] = dx;
+                if dx < mm {
+                    mm = dx;
+                }
+            }
+            *m = mm;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gv_pass_fma(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    gv_pass_body(ks, krow, c, kds, a_s, bp, d, cm)
+}
+
+/// [`gv_pass_body`] with the machine's fused multiply-add in vector
+/// registers (x86-64: AVX2 + FMA, which [`gv_on_host`] has checked).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gv_pass(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the host search runs only where `host_fma()` found both features.
+        unsafe { gv_pass_fma(ks, krow, c, kds, a_s, bp, d, cm) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    gv_pass_body(ks, krow, c, kds, a_s, bp, d, cm)
+}
+
+/// The host has a hardware fused multiply-add in its vector registers (the
+/// host search's pass is built on it; without one it would go through a
+/// software fma).
+fn host_fma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
+}
+
+/// `y −= u·x`.
+#[inline]
+fn gv_axpy(y: &mut [f32], u: f32, x: &[f32]) {
+    for (a, b) in y.iter_mut().zip(x) {
+        *a -= u * *b;
+    }
+}
+
+/// The candidate of the lowest gain, lowest index first among equals (the
+/// chunk minima of the last pass, then the chunk itself).
+#[inline]
+fn gv_argmin(d: &[f32], cm: &[f32]) -> Option<(usize, f32)> {
+    let mut best = f32::INFINITY;
+    let mut bc = usize::MAX;
+    for (ci, &m) in cm.iter().enumerate() {
+        if m < best {
+            best = m;
+            bc = ci;
+        }
+    }
+    if bc == usize::MAX {
+        return None;
+    }
+    let o = bc * GV_CH;
+    let end = (o + GV_CH).min(d.len());
+    (o..end).find(|&x| d[x] == best).map(|x| (x, best))
+}
+
+/// Columns `b0..b1` of the input-side search on the host — the arithmetic
+/// of the device's `gv_block` kernel (`nd_gv_block` / the wgpu twin): a
+/// column's target less the feedback of the block's earlier columns, its
+/// scale, greedy single flips while the best one gains more than `tol`
+/// (at most `max_flips` a round, three rounds, the scale refitted between),
+/// its error row for the columns after. Sums in f64. The block's signs, its
+/// error rows and scales go back to the device, where the trailing feedback
+/// `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is one GEMM. Returns the flips.
+#[allow(clippy::too_many_arguments)]
+fn gv_block_host(h: &mut GvHost, k: &[f32], bv: &DMat, s: &DMat, ks0: &DMat, uc: &DMat, eg: &DMat, b0: usize, b1: usize, max_flips: usize, tol: f32) -> u64 {
+    let (n, r) = (bv.r, bv.c);
+    let nb = b1 - b0;
+    // the block's rows of BV, S and K·S, and its square of Uc, in two downloads
+    let rows = DMat::zeros(3 * nb, r);
+    dv::copy_range(bv, b0 * r, &rows, 0, nb * r);
+    dv::copy_range(s, b0 * r, &rows, nb * r, nb * r);
+    dv::copy_range(ks0, b0 * r, &rows, 2 * nb * r, nb * r);
+    let ub = DMat::zeros(nb, nb);
+    dv::scale_rc(nb, nb, Some((uc, b0 * n + b0, n)), (&ub, 0, nb), None, None, 0, 1.0, 0.0);
+    let (rows, ub) = (rows.to_f32(), ub.to_f32());
+    let (bvb, sb_, ksb) = (&rows[..nb * r], &rows[nb * r..2 * nb * r], &rows[2 * nb * r..]);
+    // out: the block's signs, then its error rows; the scales apart
+    let mut out = vec![0f32; 2 * nb * r];
+    let mut gjs = vec![0f32; nb];
+    let gjtol = gv_gj_tol();
+    let dot = |a: &[f32], b: &[f32]| -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() };
+    let mut flips = 0u64;
+    for j in 0..nb {
+        h.s.copy_from_slice(&sb_[j * r..(j + 1) * r]);
+        h.ks.copy_from_slice(&ksb[j * r..(j + 1) * r]);
+        h.bv.copy_from_slice(&bvb[j * r..(j + 1) * r]);
+        {
+            let (_, errs) = out.split_at(nb * r);
+            for jj in 0..j {
+                gv_axpy(&mut h.bv, ub[jj * nb + j], &errs[jj * r..(jj + 1) * r]);
+            }
+        }
+        let neg = |h: &mut GvHost| {
+            h.s.iter_mut().for_each(|v| *v = -*v);
+            h.ks.iter_mut().for_each(|v| *v = -*v);
+        };
+        let mut gj = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+        if gj < 0.0 {
+            neg(h);
+            gj = -gj;
+        }
+        for _round in 0..3 {
+            // a candidate's gain: (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv; s is ±1, so
+            // a flip negates its three terms exactly
+            let (a, b) = (-4.0 * gj * gj, 4.0 * gj);
+            for x in 0..r {
+                h.kds[x] = h.kd[x] * h.s[x];
+                h.a_s[x] = a * h.s[x];
+                h.bp[x] = (b * h.s[x]) * h.bv[x];
+            }
+            gv_pass(&mut h.ks, &h.zero, 0.0, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+            let mut nf = 0usize;
+            while nf < max_flips {
+                let Some((bi, best)) = gv_argmin(&h.d, &h.cm) else { break };
+                if best >= -tol * (gj * gj * h.kd[bi] + 1.0e-30) {
+                    break;
+                }
+                let sb = h.s[bi];
+                h.s[bi] = -sb;
+                h.kds[bi] = -h.kds[bi];
+                h.a_s[bi] = -h.a_s[bi];
+                h.bp[bi] = -h.bp[bi];
+                gv_pass(&mut h.ks, &k[bi * r..(bi + 1) * r], 2.0 * sb, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+                nf += 1;
+            }
+            flips += nf as u64;
+            let mut g2 = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+            if g2 < 0.0 {
+                neg(h);
+                g2 = -g2;
+            }
+            let done = nf == 0 || (g2 - gj).abs() <= gjtol * gj.abs();
+            gj = g2;
+            if done {
+                break;
+            }
+        }
+        let ujj = ub[j * nb + j];
+        let (signs, errs) = out.split_at_mut(nb * r);
+        signs[j * r..(j + 1) * r].copy_from_slice(&h.s);
+        for (x, o) in errs[j * r..(j + 1) * r].iter_mut().enumerate() {
+            *o = (h.bv[x] - gj * h.ks[x]) / ujj;
+        }
+        gjs[j] = gj;
+    }
+    let up = DMat::from_f32(2 * nb, r, &out);
+    dv::copy_range(&up, 0, s, b0 * r, nb * r);
+    dv::copy_range(&up, nb * r, eg, 0, nb * r);
+    let gd = DMat::from_f32(1, nb, &gjs);
+    dv::copy_range(&gd, 0, eg, 128 * r + b0, nb);
+    if b1 < n {
+        dv::gemm_v(n - b1, r, nb, -1.0, dv::V { m: uc, off: b0 * n + b1, ld: n, t: true }, dv::V { m: eg, off: 0, ld: r, t: false }, 1.0, bv, b1 * r, r, None);
+    }
+    flips
 }
 
 /// Discrete-knot refinement alternating with the exact metric; a step is
@@ -766,7 +1074,11 @@ fn build_init_d(c: &TCtxD, r: usize, paths: usize) -> anyhow::Result<ModelD> {
 }
 
 /// NVG for one tensor on the device (`nvg::encode_nvg`). `hc` holds the
-/// tensor's input Grams.
+/// tensor's input Grams. `colscale` (the channel scale `t`, see
+/// `nvg::channel_scale`): the encoder works in the scaled input basis — `hc`
+/// was built from `diag(t)·H·diag(t)`, the weight is taken as `W·diag(1/t)`
+/// here — and `t` goes back into every path's g before the scales are stored,
+/// so the stored tensor is a fit of `W` itself.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_nvg_dev(
     pool: Option<&Pool>,
@@ -776,32 +1088,72 @@ pub fn encode_nvg_dev(
     mult: f64,
     choice: PathsChoice,
     prof: Option<&Prof>,
+    colscale: Option<&[f64]>,
 ) -> anyhow::Result<Option<Encoded>> {
     let (m, n) = (w.r, w.c);
     anyhow::ensure!(n == hc.n, "{m}x{n} weight vs a {}-wide Gram", hc.n);
-    let c = ps(prof, "wh", || {
+    anyhow::ensure!(colscale.is_none_or(|t| t.len() == n), "channel scale of the wrong width");
+    // on CUDA the tensor's device work queues on a lane of this thread's own
+    // (a no-op when the thread has one, and on wgpu); dropped last
+    let _lane = dv::private_lane();
+    let (wd, wh, whsel, a_h, a_sel, w2) = ps(prof, "wh", || {
         let wd = DMat::from_f64(m, n, &w.d);
+        if let Some(t) = colscale {
+            let inv: Vec<f64> = t.iter().map(|v| 1.0 / v).collect();
+            dv::scale_rc(m, n, None, (&wd, 0, n), None, Some(&vec_dev(&inv)), INPLACE, 1.0, 0.0);
+        }
         let wh = dv::mm(&wd, false, &hc.h, false);
         let whsel = dv::mm(&wd, false, &hc.hsel, false);
         let (a_h, a_sel, w2) = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
-        TCtxD { w: wd, wh, whsel, a_h, a_sel, w2, hc, pool, prof }
+        (wd, wh, whsel, a_h, a_sel, w2)
     });
-    let mut cands: Vec<(usize, ModelD)> = Vec::new();
-    let mut notes = Vec::new();
-    if choice != PathsChoice::One {
+    let c = TCtxD { w: &wd, wh: &wh, whsel: &whsel, a_h, a_sel, w2, hc, pool, prof };
+    // The two candidates: two paths at rank r2 (its initial error noted), one
+    // path at the same bits.
+    let cand2 = |c: &TCtxD| -> anyhow::Result<(String, ModelD)> {
         let r2 = blr_rank(m, n, b, 2, mult);
         anyhow::ensure!(r2 <= dv::GV_MAX_RANK, "rank {r2} above the device search limit");
-        let n3 = build_init_d(&c, r2, 2)?;
-        let e3 = ps(prof, "select", || rel_d(&n3, &c, Metric::Sel));
-        let n4 = refine_d(n3, &c, 2);
-        notes.push(format!("init {e3:.4}"));
-        cands.push((2, n4));
-    }
-    if choice != PathsChoice::Two {
+        let n3 = build_init_d(c, r2, 2)?;
+        let e3 = ps(c.prof, "select", || rel_d(&n3, c, Metric::Sel));
+        Ok((format!("init {e3:.4}"), refine_d(n3, c, refine_sweeps())))
+    };
+    let cand1 = |c: &TCtxD| -> anyhow::Result<ModelD> {
         let r1 = blr_rank(m, n, b, 1, mult);
         anyhow::ensure!(r1 <= dv::GV_MAX_RANK, "rank {r1} above the device search limit");
-        let p1 = refine_d(build_init_d(&c, r1, 1)?, &c, 2);
-        cands.push((1, p1));
+        Ok(refine_d(build_init_d(c, r1, 1)?, c, refine_sweeps()))
+    };
+    let mut cands: Vec<(usize, ModelD)> = Vec::new();
+    let mut notes = Vec::new();
+    if choice == PathsChoice::Auto && dv::on_cuda() && cand_threads() {
+        // Both at once: the one-path candidate on a second thread with a lane
+        // and workers of its own. Each candidate's column search is one block
+        // on one multiprocessor for most of its time, so the two overlap on
+        // the card; they read the same weight and Gram matrices and write
+        // only their own.
+        dv::sync();
+        let hp = Pool::new(pool.map_or(1, Pool::n_workers).max(1));
+        let c1 = TCtxD { pool: Some(&hp), ..c };
+        let (r2, r1) = std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _lane = dv::private_lane();
+                cand1(&c1)
+            });
+            let r2 = cand2(&c);
+            (r2, h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+        });
+        let (note, n4) = r2?;
+        notes.push(note);
+        cands.push((2, n4));
+        cands.push((1, r1?));
+    } else {
+        if choice != PathsChoice::One {
+            let (note, n4) = cand2(&c)?;
+            notes.push(note);
+            cands.push((2, n4));
+        }
+        if choice != PathsChoice::Two {
+            cands.push((1, cand1(&c)?));
+        }
     }
     let mut best: Option<(f64, usize)> = None;
     for (ci, (p, md)) in cands.iter().enumerate() {
@@ -814,12 +1166,26 @@ pub fn encode_nvg_dev(
     let Some((_, bi)) = best else { return Ok(None) };
     let (p, mut md) = cands.swap_remove(bi);
     drop(cands);
-    let Some((bytes, st)) = ps(prof, "select", || pack(&md.to_host())) else { return Ok(None) };
-    // the stored (rebalanced, f16-rounded) scales, same signs
+    let Some((bytes, st)) = ps(prof, "select", || {
+        let mut hm = md.to_host();
+        if let Some(t) = colscale {
+            for p in hm.paths.iter_mut() {
+                p.g.iter_mut().zip(t).for_each(|(g, t)| *g *= t);
+            }
+        }
+        pack(&hm)
+    }) else {
+        return Ok(None);
+    };
+    // the stored (rebalanced, f16-rounded) scales, same signs (g back in the
+    // encoder's basis for the errors below)
     for (q, s) in md.paths.iter_mut().zip(&st.paths) {
         q.h = vec_dev(&s.h);
         q.l = vec_dev(&s.l);
-        q.g = vec_dev(&s.g);
+        q.g = match colscale {
+            Some(t) => vec_dev(&s.g.iter().zip(t).map(|(g, t)| g / t).collect::<Vec<_>>()),
+            None => vec_dev(&s.g),
+        };
         q.invalidate();
     }
     let (ef, es) = ps(prof, "select", || (rel_d(&md, &c, Metric::Fit), rel_d(&md, &c, Metric::Sel)));
@@ -852,7 +1218,7 @@ pub fn encode_tensor(
     if let Some(p) = prof {
         p.add("hctx", t.elapsed().as_secs_f64(), 0);
     }
-    encode_nvg_dev(Some(&pool), w, &hc, b, mult, choice, prof)
+    encode_nvg_dev(Some(&pool), w, &hc, b, mult, choice, prof, None)
 }
 
 /// A host model on the device (same signs and scales).
@@ -931,6 +1297,12 @@ mod tests {
         hc: HCtx,
         hcd: HCtxD,
         pool: Pool,
+        /// The weight on the device and its products with the two Grams
+        /// (what `encode_nvg_dev` makes first), with tr(W H Wᵀ), tr(W Hsel Wᵀ), ‖W‖².
+        wd: DMat,
+        wh: DMat,
+        whsel: DMat,
+        traces: (f64, f64, f64),
     }
 
     fn fixture(m: usize, n: usize) -> Option<Fx> {
@@ -942,16 +1314,16 @@ mod tests {
         let pool = Pool::new(2);
         let hc = HCtx::new(Some(&pool), &hfit, 0.03).unwrap();
         let hcd = HCtxD::new(&hfit, &hsel, 0.03).unwrap();
-        Some(Fx { w, hfit, hsel, hc, hcd, pool })
+        let wd = DMat::from_f64(m, n, &w.d);
+        let wh = dv::mm(&wd, false, &hcd.h, false);
+        let whsel = dv::mm(&wd, false, &hcd.hsel, false);
+        let traces = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
+        Some(Fx { w, hfit, hsel, hc, hcd, pool, wd, wh, whsel, traces })
     }
 
     fn tctx_d<'a>(f: &'a Fx) -> TCtxD<'a> {
-        let (m, n) = (f.w.r, f.w.c);
-        let wd = DMat::from_f64(m, n, &f.w.d);
-        let wh = dv::mm(&wd, false, &f.hcd.h, false);
-        let whsel = dv::mm(&wd, false, &f.hcd.hsel, false);
-        let (a_h, a_sel, w2) = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
-        TCtxD { w: wd, wh, whsel, a_h, a_sel, w2, hc: &f.hcd, pool: Some(&f.pool), prof: None }
+        let (a_h, a_sel, w2) = f.traces;
+        TCtxD { w: &f.wd, wh: &f.wh, whsel: &f.whsel, a_h, a_sel, w2, hc: &f.hcd, pool: Some(&f.pool), prof: None }
     }
 
     fn tctx<'a>(f: &'a Fx) -> TCtx<'a> {
@@ -1035,18 +1407,26 @@ mod tests {
         let su = bd.paths[0].su.to_f64();
         let diff = su.iter().zip(&b.paths[0].su.d).filter(|(x, y)| x != y).count();
         assert!(diff * 200 <= su.len(), "flip_u: {diff} of {} signs differ ({nf} vs {nfd} flips)", su.len());
-        // input-side search from the same model
+        // input-side search from the same model: the flips on the host (the
+        // default) and in the device's kernel, each against the f64 encoder
         let mut g = base.clone();
         nvg::gptq_v(&mut g, &tc, 1);
-        let mut gd = model_to_dev(&base);
-        gptq_v_d(&mut gd, &c, 1);
-        let sv = gd.paths[1].sv.to_f64();
-        let diff = sv.iter().zip(&g.paths[1].sv.d).filter(|(x, y)| x != y).count();
-        assert!(diff * 100 <= sv.len(), "gptq_v: {diff} of {} signs differ", sv.len());
-        let gg = gd.paths[1].g.to_f64();
-        assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v g {}", reld(&gg, &g.paths[1].g));
-        let (e, ed) = (err_cpu(&f, &g, &f.hc.hf), herr_d(&gd, &c, Metric::H));
-        assert!((e - ed).abs() <= 1e-2 * e, "gptq_v err {ed} vs {e}");
+        let e = err_cpu(&f, &g, &f.hc.hf);
+        for host in [true, false] {
+            if host && !host_fma() {
+                continue;
+            }
+            let mut gd = model_to_dev(&base);
+            let nfd = gptq_v_on(&mut gd, &c, 1, host);
+            let sv = gd.paths[1].sv.to_f64();
+            let diff = sv.iter().zip(&g.paths[1].sv.d).filter(|(x, y)| x != y).count();
+            eprintln!("gptq_v, flips on the {}: {nfd} flips, {diff} of {} signs differ from the f64 encoder's", if host { "host" } else { "device" }, sv.len());
+            assert!(diff * 100 <= sv.len(), "gptq_v (host {host}): {diff} of {} signs differ", sv.len());
+            let gg = gd.paths[1].g.to_f64();
+            assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v (host {host}) g {}", reld(&gg, &g.paths[1].g));
+            let ed = herr_d(&gd, &c, Metric::H);
+            assert!((e - ed).abs() <= 1e-2 * e, "gptq_v (host {host}) err {ed} vs {e}");
+        }
     }
 
     /// Whole-tensor driver: a valid payload at the rank rule, the held-out
@@ -1056,7 +1436,7 @@ mod tests {
         let Some(f) = fixture(160, 128) else { return };
         let b = 2.0;
         let cpu = nvg::encode_nvg(Some(&f.pool), &f.w, &f.hc, &f.hfit, &f.hsel, b, 1.0, PathsChoice::Auto, None).unwrap();
-        let gpu = encode_nvg_dev(Some(&f.pool), &f.w, &f.hcd, b, 1.0, PathsChoice::Auto, None).unwrap().unwrap();
+        let gpu = encode_nvg_dev(Some(&f.pool), &f.w, &f.hcd, b, 1.0, PathsChoice::Auto, None, None).unwrap().unwrap();
         assert!(cortiq_core::blr::validate_blr(&[160, 128], &gpu.bytes).is_ok());
         assert_eq!(gpu.bits, blr_bits(160, 128, gpu.rank, gpu.paths));
         let stored = |bytes: &[u8]| {
@@ -1078,6 +1458,8 @@ pub struct Job<'a> {
     /// The bit budget this tensor is encoded at (bits per weight). A plan
     /// may give different tensors different budgets.
     pub bpw: f64,
+    /// The input's channel scale `hc` was built in (see [`encode_nvg_dev`]).
+    pub colscale: Option<&'a [f64]>,
 }
 
 /// What [`encode_many`] reports per job: the encoding, its wall seconds and
@@ -1110,6 +1492,10 @@ pub fn encode_many(
     std::thread::scope(|s| {
         for _ in 0..njobs {
             s.spawn(|| {
+                // with several tensors in flight each job thread queues on
+                // its own lane of the card (first in the thread: dropped
+                // after the thread's matrices)
+                let _lane = (njobs > 1).then(cortiq_engine::nvg_dev::private_lane);
                 let pool = Pool::new(per - 1);
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1120,7 +1506,7 @@ pub fn encode_many(
                     let j = &jobs[i];
                     let prof = Prof::default();
                     let t = Instant::now();
-                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, j.bpw, j.mult, choice, profile.then_some(&prof));
+                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, j.bpw, j.mult, choice, profile.then_some(&prof), j.colscale);
                     let done = Done { enc, secs: t.elapsed().as_secs_f64(), prof: profile.then(|| prof.line()) };
                     on_done(i, &done);
                     out.lock().unwrap()[i] = Some(done);
