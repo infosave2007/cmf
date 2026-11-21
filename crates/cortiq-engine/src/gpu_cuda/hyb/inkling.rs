@@ -1301,8 +1301,10 @@ unsafe fn draft_block(c: &Ctx, d: &Dev, dr: &DraftD, g: &Globals, cfg: &Cfg, anc
         let mut ids = vec![0i32; k];
         cu::memcpy_dtoh_async(&mut ids, dr.ids.ptr, c.stream).map_err(derr)?;
         c.sync()?;
+        let round = DS_ROUND.fetch_add(1, Ordering::Relaxed);
         if let Some(dir) = ds_dump() {
-            if !DS_DUMPED.swap(true, Ordering::Relaxed) {
+            let want = std::env::var("CMF_INKLING_DS_DUMP_ROUND").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            if round == want && !DS_DUMPED.swap(true, Ordering::Relaxed) {
                 let mut hf = vec![0f32; b * hidden];
                 let mut lg = vec![0f32; k * vocab];
                 cu::memcpy_dtoh_async(&mut hf, dr.hf.ptr, c.stream).map_err(derr)?;
@@ -1321,7 +1323,8 @@ unsafe fn draft_block(c: &Ctx, d: &Dev, dr: &DraftD, g: &Globals, cfg: &Cfg, anc
 
 /// `CMF_INKLING_DS_DUMP=dir` (a check, not a run): every call's drafter taps
 /// (`taps.bin`, `[tap][rows][hidden]` f32 a call; `taps.idx` a line `pos0 n`
-/// a call) until the first draft round, then that round's normed block rows
+/// a call) until draft round `CMF_INKLING_DS_DUMP_ROUND` (0: the first), then
+/// that round's normed block rows
 /// (`h.bin`), its drafts' logits before the bias (`logits.bin`) and
 /// `round.json`.
 fn ds_dump() -> Option<&'static str> {
@@ -1330,6 +1333,7 @@ fn ds_dump() -> Option<&'static str> {
 }
 
 static DS_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DS_ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe fn ds_dump_taps(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, pos0: usize) -> Res<()> {
     let Some(dir) = ds_dump() else { return Ok(()) };

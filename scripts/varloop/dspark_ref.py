@@ -115,6 +115,7 @@ w_sp, w_h, w_f = rw[:, :2 * R], rw[:, 2 * R:2 * R + H], rw[:, 2 * R + H:]
 w1 = W("markov_head.markov_w1.weight")
 wo, bo = W("markov_head.hidden_out.weight"), W("markov_head.hidden_out.bias")
 ours_lg = torch.from_numpy(np.fromfile(os.path.join(dump, "logits.bin"), dtype=np.float32)).view(K, -1)
+VOCAB = ours_lg.shape[1]  # the file's head rows (the release pads its head)
 
 
 def drafts(follow):
@@ -125,7 +126,7 @@ def drafts(follow):
         state = gate * state + (1 - gate) * torch.tanh(raw[R:2 * R])
         lat = torch.tanh(raw[2 * R:])
         lg = head @ (h[i + 1] + wo @ lat)  # fold_b = head @ bo is added below
-        full = lg + head @ bo
+        full = (lg + head @ bo)[:VOCAB]
         pick = int(full.argmax())
         out.append(pick)
         rows.append(lg)
@@ -139,6 +140,6 @@ print("cortiq drafts:", rd["ids"])
 print("ref drafts:   ", ref_ids)
 _, rows_on_ours = drafts(rd["ids"])
 for i in range(K):
-    a, b = rows_on_ours[i], ours_lg[i]
+    a, b = rows_on_ours[i][:ours_lg.shape[1]], ours_lg[i]
     print(f"draft {i}: logits cos {torch.nn.functional.cosine_similarity(a, b, 0):.5f}, max |d| {(a - b).abs().max():.3f}, "
-          f"ref top5 {torch.topk(a + head @ bo, 5).indices.tolist()}")
+          f"ref top5 {torch.topk(a + (head @ bo)[:a.shape[0]], 5).indices.tolist()}")
