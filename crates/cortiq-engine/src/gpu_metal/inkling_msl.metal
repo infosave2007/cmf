@@ -379,37 +379,46 @@ kernel void ink_router(device const float* W [[buffer(0)]], device const float* 
 }
 
 // A row's top-k by σ(logit) + bias (ties to the lower expert), weights the
-// chosen scores over their sum (+ 1e-20) times the route scale. Grid n, one thread.
+// chosen scores over their sum (+ 1e-20) times the route scale. A thread an
+// expert (E ≤ 128), k argmax rounds over the threadgroup. Grid n, 128 threads.
 kernel void ink_select(device const float* lg [[buffer(0)]], device const float* bias [[buffer(1)]],
                        device uint* pick [[buffer(2)]], device float* wt [[buffer(3)]],
                        constant IP& p [[buffer(15)]], uint r [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]])
 {
-    if (tid != 0u) return;
+    threadgroup float ks[128];
+    threadgroup uint is[128];
+    threadgroup float chosen_sc[16];
     device const float* l = lg + (ulong)r * p.E;
-    uint chosen[16];
-    float sc[16];
-    float sum = 0.0f;
+    float key = tid < p.E ? sigm(l[tid]) + bias[tid] : -3.0e38f;
     for (uint k = 0u; k < p.topk; ++k) {
-        float best = -3.0e38f;
-        uint bi = 0u;
-        for (uint e = 0u; e < p.E; ++e) {
-            bool taken = false;
-            for (uint j = 0u; j < k; ++j) taken = taken || chosen[j] == e;
-            if (taken) continue;
-            const float key = sigm(l[e]) + bias[e];
-            if (key > best) {
-                best = key;
-                bi = e;
+        ks[tid] = key;
+        is[tid] = tid;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint st = 64u; st > 0u; st >>= 1u) {
+            if (tid < st) {
+                const float ka = ks[tid], kb = ks[tid + st];
+                const uint ia = is[tid], ib = is[tid + st];
+                if (kb > ka || (kb == ka && ib < ia)) {
+                    ks[tid] = kb;
+                    is[tid] = ib;
+                }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        chosen[k] = bi;
-        sc[k] = sigm(l[bi]);
-        sum += sc[k];
+        const uint bi = is[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == bi) key = -3.0e38f;
+        if (tid == 0u) {
+            pick[r * p.topk + k] = bi;
+            chosen_sc[k] = sigm(l[bi]);
+        }
     }
-    for (uint k = 0u; k < p.topk; ++k) {
-        pick[r * p.topk + k] = chosen[k];
-        wt[r * p.topk + k] = sc[k] / (sum + 1e-20f) * p.rscale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float sum = 0.0f;
+        for (uint k = 0u; k < p.topk; ++k) sum += chosen_sc[k];
+        for (uint k = 0u; k < p.topk; ++k) wt[r * p.topk + k] = chosen_sc[k] / (sum + 1e-20f) * p.rscale;
     }
 }
 

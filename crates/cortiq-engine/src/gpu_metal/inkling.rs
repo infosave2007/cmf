@@ -258,6 +258,7 @@ fn admits(layers: &[Layer], cfg: &Cfg) -> bool {
         && cfg.rel_extent <= 1024
         && cfg.top_k <= 16
         && cfg.layers / cfg.block.max(1) <= MAXB
+        && layers.iter().all(|l| l.moe.bias.len() <= 128)
         && layers.iter().all(|l| l.moe.experts.iter().all(|[g, u, d]| g.q4tp_mapped().is_some() && u.q4tp_mapped().is_some() && d.q4tp_mapped().is_some()) && l.attn.k_conv.kernel <= 8)
 }
 
@@ -815,7 +816,7 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     enc.set_buffer(2, Some(&d.pick), 0);
     enc.set_buffer(3, Some(&d.wt), 0);
     setp(enc, &ip);
-    grid(enc, nu, 1, 1, 32);
+    grid(enc, nu, 1, 1, 128);
     let wins: Vec<&Buffer> = (0..4).map(|i| d.fbuf.window(i.min(d.fbuf.bufs.len() - 1))).collect();
     enc.set_compute_pipeline_state(&p.moe_gu);
     for (i, w) in wins.iter().enumerate() {

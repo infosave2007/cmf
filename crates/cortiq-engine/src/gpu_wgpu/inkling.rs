@@ -248,12 +248,33 @@ fn ink_kv(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 var<workgroup> bias_s: array<f32, 1024>;
-var<workgroup> wm: array<f32, 8>;
-var<workgroup> wl: array<f32, 8>;
-var<workgroup> wacc: array<f32, 1024>;
+var<workgroup> sc_s: array<f32, 1024>;
+var<workgroup> q_s: array<f32, 128>;
+var<workgroup> part_s: array<vec4<f32>, 256>;
 
-// ── The attention of row r and head h. a0 yq, a1 yr, a2 sinks, a3 table,
-// a4 kcache (f32), o0 out; the values in o1 (read only here). Grid (NH, n), 256.
+// the max of v over 256 lanes
+fn wmax(lid: u32, v: f32) -> f32 {
+    workgroupBarrier();
+    red[lid] = v;
+    workgroupBarrier();
+    var s = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s) { red[lid] = max(red[lid], red[lid + s]); }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    let t = red[0];
+    workgroupBarrier();
+    return t;
+}
+
+// ── The attention of row r and head h, keys in tiles of 1024: a lane a key
+// for the scores (q·k·scale + the relative bias), the tile's softmax step
+// (online across tiles, the sink logit first), then eight groups of 32 lanes
+// over the tile's keys, a lane four channels, for the weighted values. a0 yq,
+// a1 yr, a2 sinks, a3 table, a4 kcache, o0 out, o1 vcache. Grid (NH, n), 256
+// (HD 128).
 @compute @workgroup_size(256)
 fn ink_attn(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let h = w.x; let r = w.y; let HD = p.hd; let NKV = p.nkv; let NH = p.nh; let DR = p.dr; let E = p.e;
@@ -268,51 +289,66 @@ fn ink_attn(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index
         for (var j = 0u; j < DR; j = j + 1u) { b = b + a1[(r * NH + h) * DR + j] * a3[j * E + d]; }
         bias_s[d] = b;
     }
+    if (lid < 128u) { q_s[lid] = a0[(r * NH + h) * HD + lid]; }
     workgroupBarrier();
-    let sg = lid >> 5u; let lane = lid & 31u;
-    let qb = (r * NH + h) * HD + lane * 4u;
-    let q = vec4<f32>(a0[qb], a0[qb + 1u], a0[qb + 2u], a0[qb + 3u]);
+    let grp = lid >> 5u; let lane = lid & 31u;
+    // the sink: one logit with a zero value
+    var m = a2[r * NH + h];
+    var l = 1.0;
     var acc = vec4<f32>(0.0);
-    var m = -3.0e38; var l = 0.0;
-    var i = sg;
+    var t0 = 0u;
     loop {
-        if (i >= nk) { break; }
-        let tpos = first + i;
-        var row = tpos;
-        if (p.ring > 0u) { row = tpos % p.ring; }
-        let kb = row * C + g * HD + lane * 4u;
-        let kv = vec4<f32>(a4[kb], a4[kb + 1u], a4[kb + 2u], a4[kb + 3u]);
-        red[lid] = dot(q, kv);
-        workgroupBarrier();
-        var s = 0.0;
-        for (var j = 0u; j < 32u; j = j + 1u) { s = s + red[sg * 32u + j]; }
-        workgroupBarrier();
-        s = s * p.scale;
-        let d = pos - tpos;
-        if (d < near) { s = s + bias_s[d]; }
-        let mn = max(m, s);
-        let c = exp(m - mn); let e = exp(s - mn);
-        l = l * c + e;
-        let vv = vec4<f32>(o1[kb], o1[kb + 1u], o1[kb + 2u], o1[kb + 3u]);
-        acc = acc * c + e * vv;
+        if (t0 >= nk) { break; }
+        let tn = min(1024u, nk - t0);
+        var tmax = -3.0e38;
+        for (var i = lid; i < tn; i = i + 256u) {
+            let tpos = first + t0 + i;
+            var row = tpos;
+            if (p.ring > 0u) { row = tpos % p.ring; }
+            let kb = row * C + g * HD;
+            var s = 0.0;
+            for (var c = 0u; c < 128u; c = c + 4u) {
+                s = s + q_s[c] * a4[kb + c] + q_s[c + 1u] * a4[kb + c + 1u] + q_s[c + 2u] * a4[kb + c + 2u] + q_s[c + 3u] * a4[kb + c + 3u];
+            }
+            s = s * p.scale;
+            let dd = pos - tpos;
+            if (dd < near) { s = s + bias_s[dd]; }
+            sc_s[i] = s;
+            tmax = max(tmax, s);
+        }
+        let mt = wmax(lid, tmax);
+        let mn = max(m, mt);
+        let cfac = exp(m - mn);
+        var ts = 0.0;
+        for (var i = lid; i < tn; i = i + 256u) {
+            let e = exp(sc_s[i] - mn);
+            sc_s[i] = e;
+            ts = ts + e;
+        }
+        let tsum = wsum(lid, ts);
+        l = l * cfac + tsum;
+        acc = acc * cfac;
+        for (var i = grp; i < tn; i = i + 8u) {
+            let tpos = first + t0 + i;
+            var row = tpos;
+            if (p.ring > 0u) { row = tpos % p.ring; }
+            let vb = row * C + g * HD + lane * 4u;
+            acc = acc + sc_s[i] * vec4<f32>(o1[vb], o1[vb + 1u], o1[vb + 2u], o1[vb + 3u]);
+        }
         m = mn;
-        i = i + 8u;
+        t0 = t0 + tn;
+        workgroupBarrier();
     }
-    if (lane == 0u) { wm[sg] = m; wl[sg] = l; }
-    wacc[sg * 128u + lane * 4u] = acc.x;
-    wacc[sg * 128u + lane * 4u + 1u] = acc.y;
-    wacc[sg * 128u + lane * 4u + 2u] = acc.z;
-    wacc[sg * 128u + lane * 4u + 3u] = acc.w;
+    part_s[lid] = acc;
     workgroupBarrier();
-    let sk = a2[r * NH + h];
-    var M = sk;
-    for (var k = 0u; k < 8u; k = k + 1u) { M = max(M, wm[k]); }
-    var L = exp(sk - M);
-    for (var k = 0u; k < 8u; k = k + 1u) { L = L + wl[k] * exp(wm[k] - M); }
-    for (var t = lid; t < HD; t = t + 256u) {
-        var av = 0.0;
-        for (var k = 0u; k < 8u; k = k + 1u) { av = av + wacc[k * 128u + t] * exp(wm[k] - M); }
-        o0[(r * NH + h) * HD + t] = av / L;
+    if (lid < 32u) {
+        var t = vec4<f32>(0.0);
+        for (var k = 0u; k < 8u; k = k + 1u) { t = t + part_s[k * 32u + lid]; }
+        let ob = (r * NH + h) * HD + lid * 4u;
+        o0[ob] = t.x / l;
+        o0[ob + 1u] = t.y / l;
+        o0[ob + 2u] = t.z / l;
+        o0[ob + 3u] = t.w / l;
     }
 }
 
@@ -390,31 +426,47 @@ fn ink_router(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_ind
     }
 }
 
+var<workgroup> key_s: array<f32, 128>;
+var<workgroup> idx_s: array<u32, 128>;
+
 // ── A row's top-k by σ(l) + bias (ties to the lower expert): a0 logits, a1 bias
-// → uo picks, o0 weights (renormalized σ times the route scale). Grid n, 1 lane used.
-@compute @workgroup_size(32)
+// → uo picks, o0 weights (renormalized σ times the route scale). A lane an
+// expert (E ≤ 128), k argmax rounds over the workgroup. Grid n, 128.
+@compute @workgroup_size(128)
 fn ink_select(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    if (lid != 0u) { return; }
     let r = w.x; let E = p.e; let K = p.topk;
-    var chosen: array<u32, 16>;
-    var sc: array<f32, 16>;
+    var key = -3.0e38;
+    if (lid < E) { key = sigm(a0[r * E + lid]) + a1[lid]; }
     var sum = 0.0;
     for (var k = 0u; k < K; k = k + 1u) {
-        var best = -3.0e38; var bi = 0u;
-        for (var e = 0u; e < E; e = e + 1u) {
-            var taken = false;
-            for (var j = 0u; j < k; j = j + 1u) { if (chosen[j] == e) { taken = true; } }
-            if (taken) { continue; }
-            let key = sigm(a0[r * E + e]) + a1[e];
-            if (key > best) { best = key; bi = e; }
+        key_s[lid] = key;
+        idx_s[lid] = lid;
+        workgroupBarrier();
+        var st = 64u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) {
+                let ka = key_s[lid]; let kb = key_s[lid + st];
+                let ia = idx_s[lid]; let ib = idx_s[lid + st];
+                if (kb > ka || (kb == ka && ib < ia)) { key_s[lid] = kb; idx_s[lid] = ib; }
+            }
+            workgroupBarrier();
+            st = st >> 1u;
         }
-        chosen[k] = bi;
-        sc[k] = sigm(a0[r * E + bi]);
-        sum = sum + sc[k];
+        let bi = idx_s[0];
+        workgroupBarrier();
+        if (lid == bi) { key = -3.0e38; }
+        if (lid == 0u) {
+            uo[r * K + k] = bi;
+            let sc = sigm(a0[r * E + bi]);
+            o0[r * K + k] = sc;
+        }
     }
-    for (var k = 0u; k < K; k = k + 1u) {
-        uo[r * K + k] = chosen[k];
-        o0[r * K + k] = sc[k] / (sum + 1e-20) * p.rscale;
+    workgroupBarrier();
+    if (lid == 0u) {
+        var tot = 0.0;
+        for (var k = 0u; k < K; k = k + 1u) { tot = tot + o0[r * K + k]; }
+        for (var k = 0u; k < K; k = k + 1u) { o0[r * K + k] = o0[r * K + k] / (tot + 1e-20) * p.rscale; }
     }
 }
 
@@ -775,6 +827,7 @@ fn admits(layers: &[Layer], cfg: &Cfg) -> bool {
         && cfg.rel_extent <= 1024
         && cfg.top_k <= 16
         && cfg.layers / cfg.block.max(1) <= MAXB
+        && layers.iter().all(|l| l.moe.bias.len() <= 128)
         && layers.iter().all(|l| l.moe.experts.iter().all(|[g, u, d]| g.q4tp_mapped().is_some() && u.q4tp_mapped().is_some() && d.q4tp_mapped().is_some()))
 }
 
