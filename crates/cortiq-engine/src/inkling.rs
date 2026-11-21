@@ -1348,10 +1348,13 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     if k == 0 || state.card != Some(true) || state.pos != pos || pos == 0 {
         return None;
     }
+    let timed = std::env::var("CMF_INKLING_SPEC_TIME").is_ok();
+    let t0 = std::time::Instant::now();
     let drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
     if drafts.is_empty() || !crate::gpu::inkling_ring_snap(state.sequence_id) {
         return None;
     }
+    let t1 = std::time::Instant::now();
     let mut ids = Vec::with_capacity(drafts.len() + 1);
     ids.push(anchor);
     ids.extend_from_slice(&drafts);
@@ -1378,6 +1381,18 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     }
     state.tokens.extend_from_slice(&ids[..keep]);
     state.pos = pos + keep;
+    if timed {
+        static T: std::sync::Mutex<(f64, f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0.0, 0));
+        let mut t = T.lock().unwrap();
+        t.0 += (t1 - t0).as_secs_f64() * 1e3;
+        t.1 += t1.elapsed().as_secs_f64() * 1e3;
+        t.2 += (drafts.len() + 1) as f64;
+        t.3 += 1;
+        if t.3 % 64 == 0 {
+            let n = t.3 as f64;
+            eprintln!("dspark: {} rounds, ms a round: drafts {:.2}, verify and rollback {:.2} ({:.1} rows)", t.3, t.0 / n, t.1 / n, t.2 / n);
+        }
+    }
     Some(drafts[..acc].to_vec())
 }
 
