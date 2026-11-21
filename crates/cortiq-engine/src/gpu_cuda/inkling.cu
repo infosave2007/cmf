@@ -221,10 +221,13 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
                                   const float* __restrict__ dk, const float* __restrict__ dv,
                                   const float* __restrict__ tk, const float* __restrict__ tv, float* __restrict__ rk,
                                   float* __restrict__ rv, u16* __restrict__ kc, u16* __restrict__ vc, int ring, int n,
-                                  float qclip, float eps, const int* __restrict__ cr)
+                                  float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
+                                  float* __restrict__ hv)
 {
     __shared__ float sh[32];
     const int g = blockIdx.x, isv = blockIdx.y, tid = threadIdx.x;
+    // the call's input rows kept (a draft verify rolls the ring back to a prefix)
+    float* ho = isv ? hv : hk;
     const int C = NKV * HD, ch = g * HD + tid;
     const float* y = isv ? yv : yk;
     const float* dy = isv ? dv : dk;
@@ -239,6 +242,7 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
     const int pos0 = cr[0];
     for (int j = 0; j < n; j++) {
         const float x = y[(size_t)j * C + ch];
+        if (ho) ho[(size_t)j * C + ch] = x;
         hist[0] = x;
         float acc = 0.0f;
 #pragma unroll
@@ -469,7 +473,7 @@ extern "C" __global__ void ink_ogate(const float* __restrict__ o, const float* _
 // h + c. The ring [KC-1][H] moves on. Grid H/256.
 extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __restrict__ taps,
                                     float* __restrict__ ring, const float* __restrict__ res, float* __restrict__ blk,
-                                    int bslot, int bstride, float* __restrict__ out, int n)
+                                    int bslot, int bstride, float* __restrict__ out, int n, float* __restrict__ ho)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= H) return;
@@ -482,6 +486,7 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
     for (int j = 0; j < n; j++) {
         const size_t at = (size_t)j * H + i;
         const float x = a[at];
+        if (ho) ho[at] = x;
         hist[0] = x;
         float acc = 0.0f;
 #pragma unroll
@@ -844,6 +849,275 @@ extern "C" __global__ void ink_moe_mma(const HyJob* __restrict__ jobs, const u16
                 }
             }
         }
+    }
+}
+
+// ---- a draft verify's rollback: the convolution rings of every application ----
+// A table entry per ring: {the live ring, its snapshot, the call's input rows
+// (the small-path kernels' history), the width}. Snapshot before a verify;
+// after it, the ring as it stands after the first r rows: ring[l-1] = the row
+// r-l when r-l >= 0, else the snapshot's l-1-r. Grid (ceil(maxw/256), rings).
+struct RingRef {
+    u64 live, snap, hist;
+    int width, pad;
+};
+extern "C" __global__ void ink_ring_snap(const RingRef* __restrict__ t)
+{
+    const RingRef e = t[blockIdx.y];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= e.width) return;
+#pragma unroll
+    for (int l = 0; l < KC - 1; l++) ((float*)e.snap)[(size_t)l * e.width + i] = ((const float*)e.live)[(size_t)l * e.width + i];
+}
+extern "C" __global__ void ink_ring_back(const RingRef* __restrict__ t, int r)
+{
+    const RingRef e = t[blockIdx.y];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= e.width) return;
+    const float* hs = (const float*)e.hist;
+    const float* sn = (const float*)e.snap;
+    float* lv = (float*)e.live;
+#pragma unroll
+    for (int l = 1; l < KC; l++)
+        lv[(size_t)(l - 1) * e.width + i] = r - l >= 0 ? hs[(size_t)(r - l) * e.width + i] : sn[(size_t)(l - 1 - r) * e.width + i];
+}
+
+// ---- the DSpark drafter ----
+// NeoX rotation of a head vector held one value a thread (HD threads): the
+// pairs (i, i + HD/2) at angle pos · theta^(−2i/HD).
+__device__ __forceinline__ float rope_neox(float v, float* sh_v, int i, int pos, float theta)
+{
+    __syncthreads();
+    sh_v[i] = v;
+    __syncthreads();
+    const int half = HD / 2, j = i < half ? i : i - half;
+    const float ang = (float)pos * powf(theta, -2.0f * (float)j / (float)HD);
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    return i < half ? v * cs - sh_v[i + half] * sn : v * cs + sh_v[i - half] * sn;
+}
+
+// The mixes of a call's taps: mix j of row r = rms(Σ_k alpha[j][k] tap[k][r]) ·
+// norms[j]; mixes j < nmix − 1 into planes (p0, p1 [j][rows][H]) and f16 rows
+// (h16 [j][rows][H]), the last (the Markov head's context) into the ring row
+// fr[(pos % fr_cap)]. Grid (n, nmix), 256 threads.
+extern "C" __global__ void ink_ds_mix(const float* __restrict__ tap, int ntap, int rows, const float* __restrict__ alpha,
+                                      const float* __restrict__ norms, float eps, int nmix, u16* __restrict__ p0,
+                                      u16* __restrict__ p1, u16* __restrict__ h16, float* __restrict__ fr, int fr_cap,
+                                      const int* __restrict__ cr)
+{
+    __shared__ float sh[32];
+    __shared__ float mixv[H];
+    const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    float ss = 0.0f;
+    for (int i = tid; i < H; i += blockDim.x) {
+        float v = 0.0f;
+        for (int k = 0; k < ntap; k++) v = fmaf(alpha[j * ntap + k], tap[((size_t)k * rows + r) * H + i], v);
+        mixv[i] = v;
+        ss = fmaf(v, v, ss);
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / (float)H + eps);
+    const float* nw = norms + (size_t)j * H;
+    if (j == nmix - 1) {
+        float* o = fr + (size_t)((cr[0] + r) % fr_cap) * H;
+        for (int i = tid; i < H; i += blockDim.x) o[i] = mixv[i] * inv * nw[i];
+        return;
+    }
+    const size_t base = ((size_t)j * rows + r) * H;
+    for (int i = tid; i < H; i += blockDim.x) {
+        const float v = mixv[i] * inv * nw[i];
+        put2(p0, p1, base + i, v);
+        h16[base + i] = f2h(v);
+    }
+}
+
+// A call's context keys and values into a drafter layer's cache: k = rope(rms_head(k_ctx · mix) ·
+// knorm, pos), v = v_ctx · mix, f16 at cell pos (a ring: pos % cap). Grid (n, NKV), HD threads.
+extern "C" __global__ void ink_ds_ctx(const float* __restrict__ yk, const float* __restrict__ yv,
+                                      const float* __restrict__ knorm, float eps, float theta, u16* __restrict__ kc,
+                                      u16* __restrict__ vc, int cap, int ring, const int* __restrict__ cr)
+{
+    __shared__ float sh[32];
+    __shared__ float sv[HD];
+    const int r = blockIdx.x, g = blockIdx.y, i = threadIdx.x;
+    const int C = NKV * HD;
+    const int pos = cr[0] + r;
+    const size_t at = (size_t)r * C + g * HD + i;
+    const float k = yk[at];
+    const float n2 = block_sum(k * k, sh);
+    const float kn = k * rsqrtf(n2 / (float)HD + eps) * knorm[i];
+    const float kr = rope_neox(kn, sv, i, pos, theta);
+    const int cell = ring ? pos % cap : pos;
+    kc[(size_t)cell * C + g * HD + i] = f2h(kr);
+    vc[(size_t)cell * C + g * HD + i] = f2h(yv[at]);
+}
+
+// The block's queries (heads < NH) normed and rotated in place, its keys
+// normed, rotated and with the values written at cells pos0 + r. Grid (B, NH + NKV), HD threads.
+extern "C" __global__ void ink_ds_qk(float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                                     const float* __restrict__ qnorm, const float* __restrict__ knorm, float eps,
+                                     float theta, u16* __restrict__ kc, u16* __restrict__ vc, int cap, int ring,
+                                     const int* __restrict__ dcr)
+{
+    __shared__ float sh[32];
+    __shared__ float sv[HD];
+    const int r = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    const int pos = dcr[0] + r;
+    if (h < NH) {
+        const size_t at = ((size_t)r * NH + h) * HD + i;
+        const float x = q[at];
+        const float n2 = block_sum(x * x, sh);
+        q[at] = rope_neox(x * rsqrtf(n2 / (float)HD + eps) * qnorm[i], sv, i, pos, theta);
+        return;
+    }
+    const int g = h - NH, C = NKV * HD;
+    const size_t at = (size_t)r * C + g * HD + i;
+    const float x = k[at];
+    const float n2 = block_sum(x * x, sh);
+    const float kr = rope_neox(x * rsqrtf(n2 / (float)HD + eps) * knorm[i], sv, i, pos, theta);
+    const int cell = ring ? pos % cap : pos;
+    kc[(size_t)cell * C + g * HD + i] = f2h(kr);
+    vc[(size_t)cell * C + g * HD + i] = f2h(v[at]);
+}
+
+// The block's attention: row r (position pos0 + r) and head h over the cells of
+// positions [lo, pos0 + B) (lo = pos0 − window for a sliding layer, else 0):
+// the context and every block row; q·k / √HD, softmax, the weighted values.
+// Grid (NH, B), 256 threads (8 warps over the keys, online softmax a warp).
+extern "C" __global__ void ink_ds_attn(const float* __restrict__ q, const u16* __restrict__ kc,
+                                       const u16* __restrict__ vc, int cap, int ring, int window, int B,
+                                       float* __restrict__ out, const int* __restrict__ dcr)
+{
+    __shared__ float wm[8], wl[8];
+    __shared__ float wacc[8][HD];
+    const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int C = NKV * HD, g = h / (NH / NKV);
+    const int pos0 = dcr[0];
+    const int lo = window > 0 ? max(0, pos0 - window) : 0, hi = pos0 + B;
+    constexpr int PL = HD / 32;
+    float qv[PL], acc[PL];
+    const float* qr = q + ((size_t)r * NH + h) * HD + lane * PL;
+#pragma unroll
+    for (int t = 0; t < PL; t++) {
+        qv[t] = qr[t];
+        acc[t] = 0.0f;
+    }
+    const float scale = rsqrtf((float)HD);
+    float m = -3.0e38f, l = 0.0f;
+    for (int p = lo + w; p < hi; p += 8) {
+        const int cell = ring ? p % cap : p;
+        const u16* kr = kc + (size_t)cell * C + g * HD + lane * PL;
+        float s = 0.0f;
+#pragma unroll
+        for (int t = 0; t < PL; t++) s = fmaf(qv[t], h2f(kr[t]), s);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+        s *= scale;
+        const float mn = fmaxf(m, s);
+        const float c = expf(m - mn), e = expf(s - mn);
+        l = l * c + e;
+        const u16* vr = vc + (size_t)cell * C + g * HD + lane * PL;
+#pragma unroll
+        for (int t = 0; t < PL; t++) acc[t] = fmaf(e, h2f(vr[t]), acc[t] * c);
+        m = mn;
+    }
+    if (lane == 0) {
+        wm[w] = m;
+        wl[w] = l;
+    }
+#pragma unroll
+    for (int t = 0; t < PL; t++) wacc[w][lane * PL + t] = acc[t];
+    __syncthreads();
+    float M = -3.0e38f;
+    for (int i = 0; i < 8; i++) M = fmaxf(M, wm[i]);
+    float L = 0.0f;
+    for (int i = 0; i < 8; i++) L += wl[i] * expf(wm[i] - M);
+    for (int i = tid; i < HD; i += blockDim.x) {
+        float a = 0.0f;
+        for (int k = 0; k < 8; k++) a += wacc[k][i] * expf(wm[k] - M);
+        out[((size_t)r * NH + h) * HD + i] = a / L;
+    }
+}
+
+// f32 rows into the tensor-core planes. Grid (total / 256).
+extern "C" __global__ void ink_planes(const float* __restrict__ x, u16* __restrict__ p0, u16* __restrict__ p1, int total)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) put2(p0, p1, i, x[i]);
+}
+
+// One step of the Markov head's recurrence (one block, 3R threads): raw = c_h + c_f + b + W [state ; w1[prev]]
+// (W the first 2R columns of the rnn projection, row stride ws); gate = σ(raw[0:R]), state = gate·state +
+// (1 − gate)·tanh(raw[R:2R]), latent = tanh(raw[2R:3R]) as planes.
+extern "C" __global__ void ink_ds_markov(const float* __restrict__ ch, const float* __restrict__ cf,
+                                         const float* __restrict__ b, const float* __restrict__ W, int ws, int R,
+                                         float* __restrict__ state, const int* __restrict__ prev,
+                                         const u16* __restrict__ w1, u16* __restrict__ lp0, u16* __restrict__ lp1)
+{
+    extern __shared__ float smem[];
+    float* in = smem;          // [2R]: state, w1[prev]
+    float* raw = smem + 2 * R; // [3R]
+    const int o = threadIdx.x;
+    const int pv = prev[0];
+    for (int j = o; j < R; j += blockDim.x) {
+        in[j] = state[j];
+        in[R + j] = h2f(w1[(size_t)pv * R + j]);
+    }
+    __syncthreads();
+    if (o < 3 * R) {
+        const float* wr = W + (size_t)o * ws;
+        float a = ch[o] + cf[o] + b[o];
+        for (int j = 0; j < 2 * R; j++) a = fmaf(wr[j], in[j], a);
+        raw[o] = a;
+    }
+    __syncthreads();
+    if (o < R) {
+        const float g = 1.0f / (1.0f + expf(-raw[o]));
+        state[o] = g * in[o] + (1.0f - g) * tanhf(raw[R + o]);
+        put2(lp0, lp1, o, tanhf(raw[2 * R + o]));
+    }
+}
+
+// A draft's pick: the first argmax of logits + fold_b (the softcap keeps the
+// order) into ids[i] and *prev. One block, 1024 threads.
+extern "C" __global__ void ink_ds_pick(const float* __restrict__ lg, const float* __restrict__ fb, int V, int i,
+                                       int* __restrict__ ids, int* __restrict__ prev)
+{
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    float best = -3.0e38f;
+    int idx = 0x7fffffff;
+    for (int v = tid; v < V; v += blockDim.x) {
+        const float x = lg[v] + fb[v];
+        if (x > best) {
+            best = x;
+            idx = v;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ob = __shfl_xor_sync(FULL, best, o);
+        const int oi = __shfl_xor_sync(FULL, idx, o);
+        if (ob > best || (ob == best && oi < idx)) {
+            best = ob;
+            idx = oi;
+        }
+    }
+    if (lane == 0) {
+        bv[w] = best;
+        bi[w] = idx;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float b = bv[0];
+        int x = bi[0];
+        for (int k = 1; k < (int)(blockDim.x >> 5); k++)
+            if (bv[k] > b || (bv[k] == b && bi[k] < x)) {
+                b = bv[k];
+                x = bi[k];
+            }
+        ids[i] = x;
+        prev[0] = x;
     }
 }
 

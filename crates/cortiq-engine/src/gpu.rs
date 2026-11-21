@@ -2638,6 +2638,37 @@ pub fn inkling_reset(id: u64) {
     let _ = id;
 }
 
+/// Inkling's DSpark drafter on the card: up to `k` drafts from `anchor`, the
+/// token sampled for `pos` (CUDA; `None` elsewhere: plain decoding).
+pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling::Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_draft(id, g, cfg, anchor, pos, k);
+    }
+    let _ = (id, g, cfg, anchor, pos, k);
+    None
+}
+
+/// The sequence's convolution rings saved before a draft verify.
+pub fn inkling_ring_snap(id: u64) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_ring_snap(id);
+    }
+    let _ = id;
+    false
+}
+
+/// The rings put back as they stand after the verify's first `r` rows.
+pub fn inkling_ring_back(id: u64, r: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_ring_back(id, r);
+    }
+    let _ = (id, r);
+    false
+}
+
 /// A new Dory sequence on the device.
 pub fn dory_reset(id: u64) {
     #[cfg(target_os = "macos")]

@@ -273,6 +273,126 @@ pub struct Globals {
     pub final_query: Vec<f32>,
     /// `[loop, 4, hidden]`: q, k, v, MLP message queries of each loop layer.
     pub message_query: Vec<f32>,
+    /// The DSpark drafter, when the file carries it (`mtp.*`).
+    pub draft: Option<Draft>,
+}
+
+/// One dense layer of the DSpark drafter.
+pub struct DraftLayer {
+    pub q: QTensor,
+    pub k: QTensor,
+    pub v: QTensor,
+    pub o: QTensor,
+    pub k_ctx: QTensor,
+    pub v_ctx: QTensor,
+    pub gate: QTensor,
+    pub up: QTensor,
+    pub down: QTensor,
+    pub dflare_norm: Vec<f32>,
+    pub in_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub k_ctx_norm: Vec<f32>,
+    /// A sliding-window layer (`mtp_config.local_layer_ids`).
+    pub local: bool,
+}
+
+/// The DSpark drafter (the release's `mtp.safetensors`): dense layers over a
+/// block of the anchor and mask rows, their context keys and values made from
+/// the target's taps (`targets`: application indices, the last the final
+/// normed state), and a recurrent Markov head over the target's head.
+pub struct Draft {
+    pub layers: Vec<DraftLayer>,
+    /// softmax(fuse_weight) rows: `[mixes][targets]`, a mix per draft layer and
+    /// the Markov head's last.
+    pub alpha: Vec<f32>,
+    pub mask: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub markov_norm: Vec<f32>,
+    /// The recurrence: `[3 rank][2 rank + 2 hidden]` (state, previous token,
+    /// hidden, context columns) and its bias.
+    pub rnn_w: Vec<f32>,
+    pub rnn_b: Vec<f32>,
+    /// The previous token's row `[vocab][rank]` (f16).
+    pub w1: QTensor,
+    /// head · hidden_out `[vocab][rank]` and head · hidden_out's bias.
+    pub fold: QTensor,
+    pub fold_b: Vec<f32>,
+    pub targets: Vec<usize>,
+    pub window: usize,
+    pub block: usize,
+    pub rank: usize,
+    pub rope_theta: f64,
+    pub eps: f32,
+}
+
+impl Draft {
+    fn load(model: &Arc<CmfModel>, mc: &serde_json::Value, dim: usize) -> Result<Self, CmfError> {
+        let u = |k: &str| -> Result<usize, CmfError> { mc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| err(format!("mtp_config.{k}"))) };
+        let n = u("num_hidden_layers")?;
+        let local: Vec<usize> = mc.get("local_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
+        let targets: Vec<usize> = mc.get("target_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
+        let mut layers = Vec::with_capacity(n);
+        for l in 0..n {
+            let p = format!("mtp.layers.{l}.");
+            layers.push(DraftLayer {
+                q: t(model, &format!("{p}self_attn.q_proj.weight"))?,
+                k: t(model, &format!("{p}self_attn.k_proj.weight"))?,
+                v: t(model, &format!("{p}self_attn.v_proj.weight"))?,
+                o: t(model, &format!("{p}self_attn.o_proj.weight"))?,
+                k_ctx: t(model, &format!("{p}self_attn.k_proj_ctx.weight"))?,
+                v_ctx: t(model, &format!("{p}self_attn.v_proj_ctx.weight"))?,
+                gate: t(model, &format!("{p}mlp.gate_proj.weight"))?,
+                up: t(model, &format!("{p}mlp.up_proj.weight"))?,
+                down: t(model, &format!("{p}mlp.down_proj.weight"))?,
+                dflare_norm: f(model, &format!("{p}dflare_norm.weight"))?,
+                in_norm: f(model, &format!("{p}input_layernorm.weight"))?,
+                post_norm: f(model, &format!("{p}post_attention_layernorm.weight"))?,
+                q_norm: f(model, &format!("{p}self_attn.q_norm.weight"))?,
+                k_norm: f(model, &format!("{p}self_attn.k_norm.weight"))?,
+                k_ctx_norm: f(model, &format!("{p}self_attn.k_norm_ctx.weight"))?,
+                local: local.contains(&l),
+            });
+        }
+        // the mixes' weights, each row softmaxed over the targets
+        let fuse = f(model, "mtp.fuse_weight")?;
+        let nt = targets.len();
+        if nt == 0 || fuse.len() != (n + 1) * nt {
+            return Err(err(format!("mtp fuse_weight: {} values for {} mixes of {nt} targets", fuse.len(), n + 1)));
+        }
+        let mut alpha = fuse.clone();
+        for row in alpha.chunks_mut(nt) {
+            let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let s: f32 = row.iter().map(|&x| (x - m).exp()).sum();
+            for x in row.iter_mut() {
+                *x = (*x - m).exp() / s;
+            }
+        }
+        let rank = u("markov_rank")?;
+        let d = Self {
+            layers,
+            alpha,
+            mask: f(model, "mtp.mask_embed")?,
+            norm: f(model, "mtp.norm.weight")?,
+            markov_norm: f(model, "mtp.markov_head.dflare_norm.weight")?,
+            rnn_w: f(model, "mtp.markov_head.rnn_proj.weight")?,
+            rnn_b: f(model, "mtp.markov_head.rnn_proj.bias")?,
+            w1: t(model, "mtp.markov_head.markov_w1.weight")?,
+            fold: t(model, "mtp.markov_head.fold")?,
+            fold_b: f(model, "mtp.markov_head.fold_b")?,
+            targets,
+            window: u("sliding_window_size")?,
+            block: u("block_size")?,
+            rank,
+            rope_theta: mc.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1e6),
+            eps: mc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32,
+        };
+        if d.rnn_w.len() != 3 * rank * (2 * rank + 2 * dim) || d.mask.len() != dim {
+            return Err(err("mtp: the Markov head's or the mask's shape"));
+        }
+        Ok(d)
+    }
 }
 
 pub struct Cfg {
@@ -432,6 +552,17 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         norm: f(model, "model.norm.weight")?,
         final_query: f(model, "model.final_input.query")?,
         message_query: f(model, "model.message_input.query")?,
+        // the drafter: kept off with CMF_INKLING_DRAFT=0
+        draft: match prov.get("mtp_config") {
+            Some(mc) if !mc.is_null() && std::env::var("CMF_INKLING_DRAFT").as_deref() != Ok("0") => match Draft::load(model, mc, cfg.dim) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!("inkling2_loop: the DSpark drafter does not load ({e}); plain decoding");
+                    None
+                }
+            },
+            _ => None,
+        },
     };
     if globals.message_query.len() != cfg.loop_len() * 4 * cfg.dim || globals.final_query.len() != cfg.dim {
         return Err(err("residual queries"));
@@ -1061,6 +1192,54 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
     if want_logits {
         *logits = head_rows(globals, cfg, &x, 1, pool);
     }
+}
+
+/// Drafts a DSpark round offers (`CMF_INKLING_SPEC`: 0 plain decoding; the
+/// block's 7 at most); 4 by default.
+pub fn spec_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CMF_INKLING_SPEC").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4))
+}
+
+/// One DSpark round at the decode tip, on the card: `anchor` (the token the
+/// sampler took for `pos`) and up to `k` drafts through the target in one
+/// call; the drafts it agrees with (its greedy picks) are kept, the rest rolled
+/// back. Returns the accepted drafts and leaves `logits` the last kept row's;
+/// `None` when no round ran (no drafter, not on the card, a refusal): nothing
+/// changed and the caller forwards the anchor itself.
+pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, anchor: u32, pos: usize, k: usize, logits: &mut Vec<f32>) -> Option<Vec<u32>> {
+    globals.draft.as_ref()?;
+    if k == 0 || state.card != Some(true) || state.pos != pos || pos == 0 {
+        return None;
+    }
+    let drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    if drafts.is_empty() || !crate::gpu::inkling_ring_snap(state.sequence_id) {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(drafts.len() + 1);
+    ids.push(anchor);
+    ids.extend_from_slice(&drafts);
+    let mut lg = Vec::new();
+    if !crate::gpu::inkling_forward(state.sequence_id, globals, layers, cfg, &ids, pos, true, true, &mut lg) {
+        // the card let go mid-round: the host replays what it ran
+        state.card = Some(false);
+        return None;
+    }
+    let vocab = globals.lm_head.rows();
+    let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0 as u32;
+    let mut acc = 0usize;
+    while acc < drafts.len() && argmax(&lg[acc * vocab..(acc + 1) * vocab]) == drafts[acc] {
+        acc += 1;
+    }
+    let keep = acc + 1;
+    if keep < ids.len() && !crate::gpu::inkling_ring_back(state.sequence_id, keep) {
+        state.card = Some(false);
+        return None;
+    }
+    state.tokens.extend_from_slice(&ids[..keep]);
+    state.pos = pos + keep;
+    *logits = lg[acc * vocab..(acc + 1) * vocab].to_vec();
+    Some(drafts[..acc].to_vec())
 }
 
 #[cfg(test)]

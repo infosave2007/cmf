@@ -3404,6 +3404,24 @@ pub fn inkling_reset(id: u64) {
     hyb::inkling::reset(id);
 }
 
+/// Inkling's DSpark drafter: up to `k` drafts from `anchor` at `pos`.
+pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling::Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+    if !selected() {
+        return None;
+    }
+    hyb::inkling::draft_round(id, g, cfg, anchor, pos, k)
+}
+
+/// The convolution rings saved before a draft verify, and put back to its
+/// first `r` rows after it.
+pub fn inkling_ring_snap(id: u64) -> bool {
+    selected() && hyb::inkling::ring_snap(id)
+}
+
+pub fn inkling_ring_back(id: u64, r: usize) -> bool {
+    selected() && hyb::inkling::ring_back(id, r)
+}
+
 /// Has this Dory sequence gone over to the far field on the card?
 pub fn dory_sealed(id: u64) -> bool {
     hyb::dory::sealed(id)
