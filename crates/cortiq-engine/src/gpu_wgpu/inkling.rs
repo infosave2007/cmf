@@ -53,6 +53,9 @@ struct CR { pos0: u32, n: u32, pad0: u32, pad1: u32 };
 @group(0) @binding(11) var<storage, read> bank: array<u32>;
 @group(0) @binding(12) var<storage, read> ui: array<u32>;
 @group(0) @binding(13) var<storage, read_write> uo: array<u32>;
+// the bank as 16-byte words (one q4tp nibble group) and a row source as vec4s
+@group(0) @binding(14) var<storage, read> bank4: array<vec4<u32>>;
+@group(0) @binding(15) var<storage, read> xv4: array<vec4<f32>>;
 
 var<workgroup> red: array<f32, 256>;
 var<workgroup> sh8: array<f32, 16>;
@@ -582,6 +585,107 @@ fn ink_moe_down(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_i
     if (lane == 0u && row < H) { o0[r * H + row] = tot; }
 }
 
+// ── The decode's experts four rows a workgroup (the Mellum/Flash-Next `moe_r4`
+// shape on this bank): a lane's 32-column group of the row source read once
+// for every row it meets, each row's nibble group one vec4<u32>, the partial
+// sums through one 64-lane tree.
+var<workgroup> m4a: array<vec4<f32>, 64>;
+var<workgroup> m4b: array<vec4<f32>, 64>;
+
+fn m4_n4(w: u32, sh: u32) -> vec4<f32> {
+    return vec4<f32>(f32((w >> sh) & 0xFu), f32((w >> (sh + 4u)) & 0xFu),
+                     f32((w >> (sh + 8u)) & 0xFu), f32((w >> (sh + 12u)) & 0xFu)) - vec4<f32>(8.0);
+}
+fn m4_d8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 { return dot(m4_n4(w, 0u), a) + dot(m4_n4(w, 16u), b); }
+fn m4_d32(w: vec4<u32>, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>,
+          x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return (m4_d8(w.x, x0, x1) + m4_d8(w.y, x2, x3)) + (m4_d8(w.z, x4, x5) + m4_d8(w.w, x6, x7));
+}
+// a group's 5-bit scale code: `ob` the row's code bytes, `bit` the group's bit
+fn m4_code(ob: u32, bit: u32) -> u32 {
+    let o = ob + (bit >> 3u); let sh = bit & 7u;
+    var c = bank_byte(o);
+    if (sh > 3u) { c = c | (bank_byte(o + 1u) << 8u); }
+    return (c >> sh) & 31u;
+}
+// the scales of rows row0..row0+3 of the matrix at word `wb` (rows × gpr) at group g
+fn m4_scales(wb: u32, rows: u32, gpr: u32, row0: u32, g: u32) -> vec4<f32> {
+    let par = wb + rows * gpr * 4u + row0;
+    let a = unpack2x16float(bank[par]); let b = unpack2x16float(bank[par + 1u]);
+    let c = unpack2x16float(bank[par + 2u]); let d = unpack2x16float(bank[par + 3u]);
+    let cst = (gpr * 5u + 7u) / 8u;
+    let ob = (wb + rows * gpr * 4u + rows) * 4u + row0 * cst;
+    let bit = g * 5u;
+    let cv = vec4<u32>(m4_code(ob, bit), m4_code(ob + cst, bit), m4_code(ob + 2u * cst, bit), m4_code(ob + 3u * cst, bit));
+    return exp2(vec4<f32>(a.x, b.x, c.x, d.x) + vec4<f32>(cv) * vec4<f32>(a.y, b.y, c.y, d.y));
+}
+fn m4_reduce(lid: u32) {
+    workgroupBarrier();
+    var st = 32u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { m4a[lid] = m4a[lid] + m4a[lid + st]; m4b[lid] = m4b[lid] + m4b[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+}
+
+// Every pick's gate and up, rows 4·w.x .. +3: the softcapped SwiGLU into o0
+// act[r][k][inter]. xv4 x (rows H apart), ui the table and picks.
+// Grid (inter/4, K, n), 64.
+@compute @workgroup_size(64)
+fn ink_moe_gu4(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let k = w.y; let r = w.z; let inter = p.inter; let gpr = p.h / 32u;
+    let e = ui[p.e * 3u + r * p.topk + k];
+    let gw = ui[e * 3u]; let uw = ui[e * 3u + 1u];
+    let row0 = w.x * 4u;
+    let xb = r * (p.h / 4u);
+    var ag = vec4<f32>(0.0); var au = vec4<f32>(0.0);
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = xb + g * 8u;
+        let x0 = xv4[xo]; let x1 = xv4[xo + 1u]; let x2 = xv4[xo + 2u]; let x3 = xv4[xo + 3u];
+        let x4 = xv4[xo + 4u]; let x5 = xv4[xo + 5u]; let x6 = xv4[xo + 6u]; let x7 = xv4[xo + 7u];
+        let wg = gw / 4u + row0 * gpr + g;
+        let wu = uw / 4u + row0 * gpr + g;
+        let dg = vec4<f32>(m4_d32(bank4[wg], x0, x1, x2, x3, x4, x5, x6, x7), m4_d32(bank4[wg + gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(bank4[wg + 2u * gpr], x0, x1, x2, x3, x4, x5, x6, x7), m4_d32(bank4[wg + 3u * gpr], x0, x1, x2, x3, x4, x5, x6, x7));
+        let du = vec4<f32>(m4_d32(bank4[wu], x0, x1, x2, x3, x4, x5, x6, x7), m4_d32(bank4[wu + gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(bank4[wu + 2u * gpr], x0, x1, x2, x3, x4, x5, x6, x7), m4_d32(bank4[wu + 3u * gpr], x0, x1, x2, x3, x4, x5, x6, x7));
+        ag = ag + m4_scales(gw, inter, gpr, row0, g) * dg;
+        au = au + m4_scales(uw, inter, gpr, row0, g) * du;
+    }
+    m4a[lid] = ag; m4b[lid] = au;
+    m4_reduce(lid);
+    if (lid < 4u && row0 + lid < inter) {
+        let gs = m4a[0][lid]; let us = m4b[0][lid];
+        o0[(r * p.topk + k) * inter + row0 + lid] = (p.cap * tanh(gs / p.cap)) * sigm(gs) * (p.ucap * tanh(us / p.ucap));
+    }
+}
+
+// Every row's mixture of its picks' downs, rows 4·w.x .. +3: xv4 act
+// [r][k][inter], a4 the picks' weights → o0 y[r]. Grid (H/4, n), 64.
+@compute @workgroup_size(64)
+fn ink_moe_dn4(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let r = w.y; let H = p.h; let inter = p.inter; let gpr = inter / 32u; let K = p.topk;
+    let row0 = w.x * 4u;
+    var acc = vec4<f32>(0.0);
+    for (var i = lid; i < K * gpr; i = i + 64u) {
+        let k = i / gpr; let g = i - k * gpr;
+        let e = ui[p.e * 3u + r * K + k];
+        let dw = ui[e * 3u + 2u];
+        let xo = (r * K + k) * (inter / 4u) + g * 8u;
+        let a0 = xv4[xo]; let a1 = xv4[xo + 1u]; let a2v = xv4[xo + 2u]; let a3v = xv4[xo + 3u];
+        let a4v = xv4[xo + 4u]; let a5 = xv4[xo + 5u]; let a6 = xv4[xo + 6u]; let a7 = xv4[xo + 7u];
+        let wv = dw / 4u + row0 * gpr + g;
+        let d = vec4<f32>(m4_d32(bank4[wv], a0, a1, a2v, a3v, a4v, a5, a6, a7), m4_d32(bank4[wv + gpr], a0, a1, a2v, a3v, a4v, a5, a6, a7),
+                          m4_d32(bank4[wv + 2u * gpr], a0, a1, a2v, a3v, a4v, a5, a6, a7), m4_d32(bank4[wv + 3u * gpr], a0, a1, a2v, a3v, a4v, a5, a6, a7));
+        acc = acc + a4[r * K + k] * (m4_scales(dw, H, gpr, row0, g) * d);
+    }
+    m4a[lid] = acc; m4b[lid] = vec4<f32>(0.0);
+    m4_reduce(lid);
+    if (lid < 4u && row0 + lid < H) { o0[r * H + row0 + lid] = m4a[0][lid]; }
+}
+
 // ── A prompt call's routed experts grouped by expert: an expert's rows read its
 // weights once a call (from the cache after the first entry), not once a pick.
 
@@ -838,9 +942,10 @@ struct Pipes {
 
 static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
 
-const KERNELS: [&str; 23] = [
+const KERNELS: [&str; 25] = [
     "ink_mix", "ink_rms", "ink_gate_down", "ink_gate_out", "ink_fmv", "ink_qr", "ink_kv", "ink_attn", "ink_ogate", "ink_post", "ink_softcap", "ink_copy", "ink_router",
-    "ink_select", "ink_moe_gu", "ink_moe_down", "ink_group", "ink_moe_gu_g", "ink_moe_down_g", "ink_moe_mix", "ink_moe_mm", "ink_moe_act", "ink_moe_mixq",
+    "ink_select", "ink_moe_gu", "ink_moe_down", "ink_group", "ink_moe_gu_g", "ink_moe_down_g", "ink_moe_mix", "ink_moe_mm", "ink_moe_act", "ink_moe_mixq", "ink_moe_gu4",
+    "ink_moe_dn4",
 ];
 
 /// The writable bindings of the shader (the others read-only storage,
@@ -851,9 +956,9 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
     PIPES
         .get_or_init(|| {
             let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            // one layout for every entry point: a dispatch binds all fourteen
+            // one layout for every entry point: a dispatch binds all sixteen
             // (a dummy where a kernel reads nothing)
-            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14u32)
+            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16u32)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -1376,6 +1481,13 @@ fn moe_mode() -> u8 {
     })
 }
 
+/// `CMF_INKLING_MOE4=0`: the decode's experts a row a subgroup (`ink_moe_gu` /
+/// `ink_moe_down`) instead of four rows a workgroup (`ink_moe_gu4` / `ink_moe_dn4`).
+fn moe4_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE4").as_deref() != Ok("0"))
+}
+
 fn prof() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_INKLING_PROF").as_deref() == Ok("1"))
@@ -1492,7 +1604,7 @@ impl Rec<'_> {
         let u = self.c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-ip"), size: std::mem::size_of::<IP>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         self.c.queue.write_buffer(&u, 0, bytemuck::bytes_of(ip));
         let mut entries: Vec<wgpu::BindGroupEntry> = vec![wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: self.cr.as_entire_binding() }];
-        for b in 2..14u32 {
+        for b in 2..16u32 {
             let (buf, off) = match binds.iter().find(|x| x.0 == b) {
                 Some(&(_, buf, off)) => (buf, off),
                 // a read binding and a writable one never share a buffer in a dispatch
@@ -1678,6 +1790,9 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
             rec.go("ink_moe_gu_g", &ipg, &[(4, &d.xm, 0), (7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], ((l.inter as u32).div_ceil(8), l.e as u32, 1));
             rec.go("ink_moe_down_g", &ipg, &[(5, &d.act, 0), (7, &d.yp, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], ((hidden as u32).div_ceil(8), l.e as u32, 1));
             rec.go("ink_moe_mix", &ipg, &[(2, &d.yp, 0), (3, &d.wt, 0), (7, &d.y, 0)], ((hidden as u32).div_ceil(256), nu, 1));
+        } else if moe4_on() && l.inter % 32 == 0 && hidden % 32 == 0 {
+            rec.go("ink_moe_gu4", &ip, &[(7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0), (14, &l.bank, 0), (15, &d.xm, 0)], ((l.inter as u32) / 4, cfg.top_k as u32, nu));
+            rec.go("ink_moe_dn4", &ip, &[(6, &d.wt, 0), (7, &d.y, 0), (11, &l.bank, 0), (12, &l.table, 0), (14, &l.bank, 0), (15, &d.act, 0)], ((hidden as u32) / 4, nu, 1));
         } else {
             rec.go("ink_moe_gu", &ip, &[(4, &d.xm, 0), (7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((l.inter as u32).div_ceil(8), cfg.top_k as u32, nu));
             rec.go("ink_moe_down", &ip, &[(5, &d.act, 0), (6, &d.wt, 0), (7, &d.y, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((hidden as u32).div_ceil(8), nu, 1));
@@ -1708,4 +1823,21 @@ fn gate(rec: &mut Rec, base: &IP, g: &(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer,
     let ip = IP { r: g.3 as u32, ..*base };
     rec.go("ink_gate_down", &ip, &[(2, x.0, x.1), (3, m.0, m.1), (4, &g.0, 0), (7, dbuf, 0)], (g.3 as u32, n as u32, 1));
     rec.go("ink_gate_out", &ip, &[(2, x.0, x.1), (3, m.0, m.1), (4, dbuf, 0), (5, &g.1, 0), (6, &g.2, 0), (7, out.0, out.1)], ((hidden as u32).div_ceil(8), n as u32, 1));
+}
+
+#[cfg(test)]
+mod tests {
+    /// The arm's shader (every entry point, the decode's four-row expert
+    /// kernels with the bank's vec4 view among them) parses and validates
+    /// without a device.
+    #[test]
+    fn inkling_wgsl_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::SRC).unwrap_or_else(|e| panic!("inkling WGSL must parse: {}", e.emit_to_string(super::SRC)));
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("inkling WGSL must validate: {}", e.emit_to_string(super::SRC)));
+        for k in super::KERNELS {
+            assert!(module.entry_points.iter().any(|e| e.name == k), "{k}");
+        }
+    }
 }
