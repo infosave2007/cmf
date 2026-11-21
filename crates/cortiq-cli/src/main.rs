@@ -12,6 +12,7 @@ mod dialog;
 mod egemma2pack;
 mod nemotron_pack;
 mod hy4pack;
+mod inklingpack;
 mod embed;
 mod flint;
 mod hotmix;
