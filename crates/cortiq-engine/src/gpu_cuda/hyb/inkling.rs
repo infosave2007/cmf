@@ -27,6 +27,17 @@ const MAXB: usize = 4;
 /// Keys a tile of the decode attention takes (`AT` in `inkling.cu`).
 const ATILE: usize = 256;
 
+/// Bytes of a prompt chunk's attention scores (`attn_gemm`): the rows of a
+/// chunk are as many as fit.
+const ATT_SCORES: usize = 128 << 20;
+
+/// `CMF_INKLING_ATTN_GEMM=0`: a prompt call's attention a block a head and row
+/// (`ink_attn`) instead of the cuBLAS products.
+fn attn_gemm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_SPLIT=0`: a decode call's attention a block a head and row
 /// (`ink_attn`) instead of a block a tile of keys.
 fn split_on() -> bool {
@@ -56,6 +67,8 @@ struct Fx {
     attn_split: cs::CUfunction,
     attn_merge: cs::CUfunction,
     h16: cs::CUfunction,
+    f16: cs::CUfunction,
+    attn_soft: cs::CUfunction,
     gate_norm: cs::CUfunction,
     gate_mix: cs::CUfunction,
     kv_rows: cs::CUfunction,
@@ -142,6 +155,11 @@ struct Big {
     gxn: Buf,
     gtf: Buf,
     gtg: Buf,
+    /// The attention through cuBLAS (`attn_gemm`): the queries as f16, the
+    /// scores of a chunk of rows `[NH][rows][keys]` f32 and their softmax f16.
+    q16: Buf,
+    sc: Buf,
+    pr: Buf,
 }
 
 struct Dev {
@@ -151,6 +169,8 @@ struct Dev {
     /// prompt path).
     rows: usize,
     big: Option<Big>,
+    /// A prompt call's first position (the host's copy of `cr[0]`).
+    big_pos0: std::cell::Cell<usize>,
     layers: Vec<LayerD>,
     slots: Vec<SlotD>,
     head: MmaSet,
@@ -317,6 +337,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         attn_split: func(module, "ink_attn_split")?,
         attn_merge: func(module, "ink_attn_merge")?,
         h16: func(module, "ink_h16")?,
+        f16: func(module, "ink_f16")?,
+        attn_soft: func(module, "ink_attn_soft")?,
         gate_norm: func(module, "ink_gate_norm")?,
         gate_mix: func(module, "ink_gate_mix")?,
         kv_rows: func(module, "ink_kv_rows")?,
@@ -478,6 +500,9 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             gxn: f4(rows * 2 * hidden)?,
             gtf: f4(rows * hidden)?,
             gtg: f4(rows * hidden)?,
+            q16: h2(rows * qs)?,
+            sc: Buf::new(ATT_SCORES)?,
+            pr: Buf::new(ATT_SCORES / 2)?,
         })
     } else {
         None
@@ -487,6 +512,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         hfx,
         rows,
         big,
+        big_pos0: std::cell::Cell::new(0),
         layers: dl,
         slots,
         head,
@@ -669,6 +695,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             cu::memcpy_htod_async(d.cr.ptr, &[(pos0 + at) as i32, n as i32], c.stream).map_err(derr)?;
         }
         let key = (n, lrows);
+        d.big_pos0.set(pos0 + at);
         if big && all {
             unsafe { call(c, d, cfg, n, 0, vocab)? };
             let mut r0 = 0usize;
@@ -1024,7 +1051,11 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (hd as f32).sqrt());
         let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
-        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
+        if attn_gemm_on() {
+            attn_gemm(c, d, b, cfg, l, s, n, ext, win, scale)?;
+        } else {
+            c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
+        }
         st(c, 5, &mut tp)?;
         let qs_i = qs as i32;
         c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
@@ -1059,6 +1090,51 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         c.launch(f.post_rows, (hb, nu), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout))?;
         ring(d.y.ptr, &s.rings[3], hidden)?;
         st(c, 7, &mut tp)?;
+    }
+    Ok(())
+}
+
+/// A prompt call's attention through cuBLAS: the queries as f16 rows, per KV
+/// group S = Q·Kᵀ over the slots the call reads (a local layer's whole ring,
+/// a full layer's positions to the call's last), `ink_attn_soft` (scale,
+/// relative bias, window, ring positions, sink, softmax), O = P·V into `att`;
+/// rows in chunks whose scores fit `ATT_SCORES`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_gemm(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, n: usize, ext: i32, win: i32, scale: f32) -> Res<()> {
+    let f = &d.fx;
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let hpk = nh / nkv;
+    let (qs, kvs) = (nh * hd, nkv * hd);
+    let nk = if s.ring > 0 { s.ring } else { d.big_pos0.get() + n };
+    let chunk = (ATT_SCORES / (nh * nk * 4)).clamp(1, n);
+    let (tot_i, nk_i, ring_i, n_i) = ((n * qs) as i32, nk as i32, s.ring as i32, n as i32);
+    unsafe {
+        c.launch(f.f16, ((n * qs).div_ceil(256) as u32, 1), 256, 0, kargs!(d.yq.ptr, b.q16.ptr, tot_i))?;
+        let mut r0 = 0usize;
+        while r0 < n {
+            let rows = chunk.min(n - r0);
+            for g in 0..nkv {
+                let kp = s.k.ptr + (g * hd * 2) as u64;
+                let qp = b.q16.ptr + ((r0 * qs + g * hpk * hd) * 2) as u64;
+                let sp = b.sc.ptr + ((g * hpk * rows * nk) * 4) as u64;
+                gemm_batched_h(c, true, nk, rows, hd, 1.0, kp, kvs, 0, qp, qs, hd, sp, nk, rows * nk, hpk)?;
+            }
+            let (rows_i, r0_i) = (rows as i32, r0 as i32);
+            c.launch(
+                f.attn_soft,
+                (rows as u32, nh as u32),
+                256,
+                0,
+                kargs!(b.sc.ptr, b.pr.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, nk_i, ring_i, win, scale, rows_i, r0_i, n_i, d.cr.ptr),
+            )?;
+            for g in 0..nkv {
+                let vp = s.v.ptr + (g * hd * 2) as u64;
+                let pp = b.pr.ptr + ((g * hpk * rows * nk) * 2) as u64;
+                let op = d.att.ptr + ((r0 * qs + g * hpk * hd) * 4) as u64;
+                gemm_batched_h(c, false, hd, rows, nk, 1.0, vp, kvs, 0, pp, nk, rows * nk, op, qs, hd, hpk)?;
+            }
+            r0 += rows;
+        }
     }
     Ok(())
 }

@@ -626,6 +626,80 @@ extern "C" __global__ void ink_gate_mix(const float* __restrict__ x, const float
     if (i < total) out[i] = (1.0f - tanhf(f[i])) * x[i] + tanhf(g[i]) * m[i];
 }
 
+// A prompt call's attention through cuBLAS (`attn_gemm`): the queries as f16
+// rows, S = Q·Kᵀ and O = P·V as batched GEMMs a KV group, and between them
+// `ink_attn_soft`: per (row, head) the scaled scores, the relative bias for
+// distances under E, the window and the ring's positions, the sink, the
+// softmax into P (f16). `ink_attn`'s arithmetic with the products on the
+// tensor cores.
+extern "C" __global__ void ink_f16(const float* __restrict__ x, u16* __restrict__ out, int total)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = f2h(x[i]);
+}
+
+// S [NH][rows][nk] f32 (rows r0 .. r0 + rows of the call), in place; P the
+// same layout f16. Key slot s holds position p = s (ring 0) or the latest
+// p ≤ the call's last position with p ≡ s (mod ring). Grid (rows, NH), 256.
+extern "C" __global__ void ink_attn_soft(float* __restrict__ S, u16* __restrict__ P, const float* __restrict__ yr,
+                                         const float* __restrict__ sinks, const float* __restrict__ table, int E,
+                                         int nk, int ring, int win, float scale, int rows, int r0, int nall,
+                                         const int* __restrict__ cr)
+{
+    __shared__ float sh[32];
+    const int r = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int row = r0 + r;
+    const int pos = cr[0] + row, plast = cr[0] + nall - 1;
+    const int first = win > 0 ? max(0, pos + 1 - win) : 0;
+    float rr[DR];
+    const float* rp = yr + ((size_t)row * NH + h) * DR;
+#pragma unroll
+    for (int j = 0; j < DR; j++) rr[j] = rp[j];
+    float* srow = S + ((size_t)h * rows + r) * nk;
+    u16* prow = P + ((size_t)h * rows + r) * nk;
+    float mx = -3.0e38f;
+    for (int s = tid; s < nk; s += blockDim.x) {
+        int p = s;
+        if (ring > 0) {
+            int q = (plast - s) % ring;
+            if (q < 0) q += ring;
+            p = plast - q;
+        }
+        float v = -3.0e38f;
+        if (p >= first && p <= pos) {
+            v = srow[s] * scale;
+            const int d = pos - p;
+            if (d < E) {
+                float b = 0.0f;
+#pragma unroll
+                for (int j = 0; j < DR; j++) b = fmaf(rr[j], table[(size_t)j * E + d], b);
+                v += b;
+            }
+        }
+        srow[s] = v;
+        mx = fmaxf(mx, v);
+    }
+    // the block's max (a max, so the order of the reduction does not matter)
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o));
+    __syncthreads();
+    if ((tid & 31) == 0) sh[tid >> 5] = mx;
+    __syncthreads();
+    const float sk = sinks[(size_t)row * NH + h];
+    float M = sk;
+    for (int i = 0; i < (int)(blockDim.x >> 5); i++) M = fmaxf(M, sh[i]);
+    __syncthreads();
+    float sum = 0.0f;
+    for (int s = tid; s < nk; s += blockDim.x) {
+        const float v = srow[s];
+        const float e = v > -1.0e38f ? expf(v - M) : 0.0f;
+        srow[s] = e;
+        sum += e;
+    }
+    const float L = block_sum(sum, sh) + expf(sk - M);
+    const float il = 1.0f / L;
+    for (int s = tid; s < nk; s += blockDim.x) prow[s] = f2h(srow[s] * il);
+}
+
 // The head's logits capped: cap · tanh(x / cap). Grid (V/256, n).
 extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
 {
