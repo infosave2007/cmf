@@ -18,23 +18,25 @@ STAND = {
     "cpu": {"en": "MacBook Air M4 (24 GB), fanless", "ru": "MacBook Air M4 (24 ГБ), без вентилятора", "zh": "MacBook Air M4（24 GB），无风扇"},
 }
 BACKEND = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}
-VERSION = os.environ.get("CORTIQ_VERSION", "0.9.11")
+# the build the numbers come from: a release ("0.9.11"), or the pull request before one
+BUILD = os.environ.get("CORTIQ_BUILD", "PR #182")
+VERSION = {"en": f"cortiq ({BUILD})", "ru": f"cortiq ({BUILD})", "zh": f"cortiq（{BUILD}）"} if BUILD.startswith("PR") else {k: f"cortiq {BUILD}" for k in ("en", "ru", "zh")}
 T = {
     "en": {
         "fl_t": "Speed and card memory against the prompt's length",
-        "sub": f"Maxwell-V1-Flash, cortiq {VERSION}, cortiq bench --core, 64 tokens after the prompt.",
+        "sub": f"Maxwell-V1-Flash, {VERSION['en']}, cortiq bench --core, 64 tokens after the prompt.",
         "first": "First token, s", "dec": "Decode, tok/s", "mem": "Peak card memory, GB", "ctx": "prompt, tokens",
         "q4tp": "q4tp", "q8_2f": "q8_2f", "q2tp": "q2tp", "stand": "Stand",
     },
     "ru": {
         "fl_t": "Скорость и память карты в зависимости от длины промпта",
-        "sub": f"Maxwell-V1-Flash, cortiq {VERSION}, cortiq bench --core, 64 токена после промпта.",
+        "sub": f"Maxwell-V1-Flash, {VERSION['ru']}, cortiq bench --core, 64 токена после промпта.",
         "first": "Первый токен, с", "dec": "Генерация, ток/с", "mem": "Пик памяти карты, ГБ", "ctx": "промпт, токенов",
         "q4tp": "q4tp", "q8_2f": "q8_2f", "q2tp": "q2tp", "stand": "Стенд",
     },
     "zh": {
         "fl_t": "速度与显存随提示词长度的变化",
-        "sub": f"Maxwell-V1-Flash，cortiq {VERSION}，cortiq bench --core，提示词之后 64 个 token。",
+        "sub": f"Maxwell-V1-Flash，{VERSION['zh']}，cortiq bench --core，提示词之后 64 个 token。",
         "first": "首个 token，秒", "dec": "生成，tok/s", "mem": "显存峰值，GB", "ctx": "提示词，token 数",
         "q4tp": "q4tp", "q8_2f": "q8_2f", "q2tp": "q2tp", "stand": "测试平台",
     },
@@ -54,6 +56,8 @@ def pill(s, x, y, text):
 
 
 def ctx_label(c):
+    if c < 1000:
+        return str(c)
     return f"{round(c / 1024)}K" if c % 1024 == 0 else f"{c // 1000}K"
 
 

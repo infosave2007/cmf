@@ -348,9 +348,13 @@ pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], 
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
     let mode = Mode::DenseQ4tp;
+    // `CMF_REQUANT_HEAD_OUT=<path>`: a second file with the head GPTQ-rounded too, from
+    // the same calibration pass (the two against each other, one forward)
+    let head_out = std::env::var("CMF_REQUANT_HEAD_OUT").ok().filter(|p| !p.is_empty() && !head);
+    let want_head = head || head_out.is_some();
     let is_target = |e: &cortiq_core::format::TensorEntry| {
         target_dtype(&mode, &e.name, e.dtype, &e.shape).is_some()
-            || (head && e.name == "lm_head.weight" && e.dtype == TensorDtype::Q8_2f && e.shape.len() == 2 && e.shape[1] % GROUP_SIZE == 0)
+            || (want_head && e.name == "lm_head.weight" && e.dtype == TensorDtype::Q8_2f && e.shape.len() == 2 && e.shape[1] % GROUP_SIZE == 0)
     };
     let names: HashSet<String> = model.tensors.iter().filter(|e| is_target(e)).map(|e| e.name.clone()).collect();
     anyhow::ensure!(!names.is_empty(), "no q8_2f matrix of a dense trunk in {model_path}");
@@ -431,31 +435,40 @@ pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], 
         }
     }
 
-    let mut specs: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len());
-    let (mut gptq, mut rounded, mut copied) = (0usize, 0usize, 0usize);
-    for (i, entry) in model.tensors.iter().enumerate() {
-        let (dtype, data) = if let Some(b) = done.remove(&i) {
-            gptq += 1;
-            (TensorDtype::Q4TiledP, b)
-        } else if names.contains(&entry.name) && entry.name != "lm_head.weight" {
-            // a matrix whose input the pass did not see (an invalid capture): rounded
-            rounded += 1;
-            let (rows, cols) = (entry.shape[0], entry.shape[1]);
-            let mut buf = vec![0.0f32; rows * cols];
-            dequant_tensor(entry, model.entry_bytes(entry), &mut buf).map_err(anyhow::Error::msg)?;
-            (TensorDtype::Q4TiledP, encode_q4tp(&buf, rows, cols))
-        } else {
-            copied += 1;
-            (entry.dtype, model.entry_bytes(entry).to_vec())
-        };
-        specs.push(TensorSpec { name: entry.name.clone(), dtype, shape: entry.shape.clone(), data });
+    let write = |path: &str, with_head: bool| -> anyhow::Result<()> {
+        let mut specs: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len());
+        let (mut gptq, mut rounded, mut copied) = (0usize, 0usize, 0usize);
+        for (i, entry) in model.tensors.iter().enumerate() {
+            let is_head = entry.name == "lm_head.weight";
+            let (dtype, data) = if let Some(b) = done.get(&i).filter(|_| with_head || !is_head) {
+                gptq += 1;
+                (TensorDtype::Q4TiledP, b.clone())
+            } else if names.contains(&entry.name) && !is_head {
+                // a matrix whose input the pass did not see (an invalid capture): rounded
+                rounded += 1;
+                let (rows, cols) = (entry.shape[0], entry.shape[1]);
+                let mut buf = vec![0.0f32; rows * cols];
+                dequant_tensor(entry, model.entry_bytes(entry), &mut buf).map_err(anyhow::Error::msg)?;
+                (TensorDtype::Q4TiledP, encode_q4tp(&buf, rows, cols))
+            } else {
+                copied += 1;
+                (entry.dtype, model.entry_bytes(entry).to_vec())
+            };
+            specs.push(TensorSpec { name: entry.name.clone(), dtype, shape: entry.shape.clone(), data });
+        }
+        CmfModel::write(path, &model.header, &specs, Some(&model.masks), model.vocab.as_deref())?;
+        println!(
+            "requant → q4tp-dense (GPTQ, {total} calibration tokens{}): {gptq} matrices GPTQ-rounded, {rounded} rounded without a Hessian, {copied} copied verbatim",
+            if with_head { ", the head too" } else { "" }
+        );
+        let (in_sz, out_sz) = (std::fs::metadata(model_path)?.len() as f64 / 1e9, std::fs::metadata(path)?.len() as f64 / 1e9);
+        println!("{path}: {in_sz:.2} GB → {out_sz:.2} GB ({:+.1}%)", (out_sz / in_sz - 1.0) * 100.0);
+        Ok(())
+    };
+    write(output, head)?;
+    if let Some(p) = &head_out {
+        write(p, true)?;
     }
-    CmfModel::write(output, &model.header, &specs, Some(&model.masks), model.vocab.as_deref())?;
-    println!(
-        "requant → q4tp-dense (GPTQ, {total} calibration tokens): {gptq} matrices GPTQ-rounded, {rounded} rounded without a Hessian, {copied} copied verbatim"
-    );
-    let (in_sz, out_sz) = (std::fs::metadata(model_path)?.len() as f64 / 1e9, std::fs::metadata(output)?.len() as f64 / 1e9);
-    println!("file {in_sz:.2} GB → {out_sz:.2} GB ({:+.1}%)", (out_sz / in_sz - 1.0) * 100.0);
     Ok(())
 }
 

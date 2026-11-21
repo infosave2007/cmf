@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench2.sh FILE TAG BACKEND CTX... : decode (3 runs) + prompt at each CTX, with the card's peak memory and the
 # process' peak resident memory
-# NODEC=1: the prompt lengths only. BENCH_ENV: extra environment of the runs.
+# NODEC=1: the prompt lengths only; DECN=n: n decode runs (3). BENCH_ENV: extra environment of the runs.
 source /root/mx/scripts/env.sh
 F=$1; TAG=$2; be=$3; shift 3
 mkdir -p bench
@@ -24,5 +24,5 @@ one() { # label args...
   echo "$TAG $be $label: $(grep -aE 'Prompt:|Decode:' bench/$TAG.$be.$label.log | sed 's/  */ /g' | tr '\n' ' ') vram_peak ${peak} MiB rss_peak $(( rss / 1024 )) MiB"
 }
 n=128; [ $be = cpu ] && n=32
-[ -n "${NODEC:-}" ] || for i in 1 2 3; do one d$i --tokens $n; done
+[ -n "${NODEC:-}" ] || for i in $(seq 1 ${DECN:-3}); do one d$i --tokens $n; done
 for c in "$@"; do m=64; [ $be = cpu ] && m=16; one c$c --ctx $c --tokens $m; done
