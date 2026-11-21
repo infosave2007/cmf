@@ -117,6 +117,28 @@ thread_local! {
     /// still be read by work queued on that thread's stream, so only that
     /// thread takes it again (its own stream keeps the order).
     static MY_POOL: std::cell::RefCell<std::collections::HashMap<usize, Vec<u64>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Bytes in `MY_POOL`.
+    static MY_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Free bytes a lane keeps to itself before it hands them to the shared pool
+/// (an eighth of the pool's cap: several lanes' own pools together stay
+/// under it, and what one lane freed is there for the others).
+fn lane_cap() -> usize {
+    pool_cap() / 8
+}
+
+/// The calling lane's free buffers into the shared pool (its stream drained
+/// first: work queued on it may still read them).
+fn lane_flush(stream: cs::CUstream) {
+    let _ = unsafe { cu::stream::synchronize(stream) };
+    let mine = MY_POOL.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    MY_HELD.with(|h| h.set(0));
+    let mut p = POOL.lock().unwrap();
+    for (bytes, v) in mine {
+        p.held += bytes * v.len();
+        p.free.entry(bytes).or_default().extend(v);
+    }
 }
 
 /// What an encoder call runs on: the backend's context with the stream and
@@ -198,14 +220,7 @@ impl Drop for LaneGuard {
             let _ = c.current();
         }
         // the lane's work is done before its buffers go to the shared pool
-        let _ = unsafe { cu::stream::synchronize(lane.stream) };
-        let mine = MY_POOL.with(|m| std::mem::take(&mut *m.borrow_mut()));
-        let mut p = POOL.lock().unwrap();
-        for (bytes, v) in mine {
-            p.held += bytes * v.len();
-            p.free.entry(bytes).or_default().extend(v);
-        }
-        drop(p);
+        lane_flush(lane.stream);
         LANES.lock().unwrap().push(lane);
     }
 }
@@ -267,6 +282,10 @@ fn with<R>(f: impl FnOnce(&E, &NdState) -> Res<R>) -> R {
         Some(l) => E { c, stream: l.stream, blas: l.blas, arch: c.arch },
         None => E { c, stream: c.stream, blas: c.blas, arch: c.arch },
     };
+    // a lane that has freed a lot gives it to the shared pool between calls
+    if lane.is_some() && MY_HELD.with(|h| h.get()) > lane_cap() {
+        lane_flush(e.stream);
+    }
     match f(&e, st) {
         Ok(v) => v,
         Err(err) => {
@@ -320,6 +339,7 @@ fn round_bytes(bytes: usize) -> usize {
 fn pool_trim(c: &E) {
     let _ = c.sync();
     let mine = MY_POOL.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    MY_HELD.with(|h| h.set(0));
     for ptr in mine.into_values().flatten() {
         unsafe {
             let _ = cu::free_sync(ptr);
@@ -342,6 +362,7 @@ fn raw_alloc(c: &E, bytes: usize) -> Res<u64> {
     if MY_LANE.with(|l| l.get().is_some())
         && let Some(ptr) = MY_POOL.with(|m| m.borrow_mut().get_mut(&bytes).and_then(Vec::pop))
     {
+        MY_HELD.with(|h| h.set(h.get().saturating_sub(bytes)));
         return Ok(ptr);
     }
     {
@@ -368,6 +389,7 @@ fn raw_release(ptr: u64, bytes: usize) {
     // a private lane keeps what it frees (see `MY_POOL`); a thread past its
     // thread-locals' end falls through to the shared pool
     if MY_LANE.try_with(|l| l.get().is_some()).unwrap_or(false) && MY_POOL.try_with(|m| m.borrow_mut().entry(bytes).or_default().push(ptr)).is_ok() {
+        let _ = MY_HELD.try_with(|h| h.set(h.get() + bytes));
         return;
     }
     let mut p = POOL.lock().unwrap();
