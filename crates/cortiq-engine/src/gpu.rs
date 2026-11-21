@@ -1621,6 +1621,18 @@ pub fn hy4_capture_take() -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     None
 }
 
+/// The Metal backend is the selected one.
+pub fn metal_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        backend() == Backend::Metal
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn cuda_active() -> bool {
     #[cfg(feature = "cuda")]
     {

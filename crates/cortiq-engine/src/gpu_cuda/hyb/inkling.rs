@@ -341,7 +341,9 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     let mut slots = Vec::with_capacity(cfg.slots());
     for (li, pass) in cfg.plan() {
         let _ = pass;
-        let ring = if layers[li].sliding { cfg.window } else { 0 };
+        // a local slot's ring: its window and a call's rows (the call writes
+        // every row's key before any row reads)
+        let ring = if layers[li].sliding { cfg.window + NMAX } else { 0 };
         let rows_kv = if ring > 0 { ring } else { cap };
         let s = SlotD {
             k: h2(rows_kv * kvs)?,
@@ -698,7 +700,8 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         st(c, 4, &mut tp)?;
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (cfg.hd as f32).sqrt());
-        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, scale, d.att.ptr, d.cr.ptr))?;
+        let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
+        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.att.ptr, d.cr.ptr))?;
         st(c, 5, &mut tp)?;
         let qs = nh * cfg.hd;
         let qs_i = qs as i32;

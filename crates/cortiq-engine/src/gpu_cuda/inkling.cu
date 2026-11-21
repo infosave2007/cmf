@@ -252,14 +252,14 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
 }
 
 // The attention of row r (position cr[0] + r) and head h: every cached key
-// of its window (ring > 0: the last `ring` positions) or its whole past,
+// of its window (win > 0: the last `win` positions) or its whole past,
 // q·k·scale + the relative bias r·table[d] for distances d < E, the sink
 // logit, the weighted values. Grid (NH, n), 256 threads (8 warps over the
 // keys, online softmax a warp, merged at the end).
 extern "C" __global__ void ink_attn(const float* __restrict__ yq, const float* __restrict__ yr,
                                     const float* __restrict__ sinks, const float* __restrict__ table, int E,
-                                    const u16* __restrict__ kc, const u16* __restrict__ vc, int ring, float scale,
-                                    float* __restrict__ out, const int* __restrict__ cr)
+                                    const u16* __restrict__ kc, const u16* __restrict__ vc, int ring, int win,
+                                    float scale, float* __restrict__ out, const int* __restrict__ cr)
 {
     __shared__ float bias[1024];
     __shared__ float qs[HD];
@@ -268,7 +268,10 @@ extern "C" __global__ void ink_attn(const float* __restrict__ yq, const float* _
     const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int C = NKV * HD, g = h / (NH / NKV);
     const int pos = cr[0] + r;
-    const int first = ring > 0 ? max(0, pos + 1 - ring) : 0;
+    // the window (`win` positions, the row's own included); the ring holds
+    // `win` + the call's rows, so the call's later rows never overwrite a key
+    // an earlier row still reads
+    const int first = win > 0 ? max(0, pos + 1 - win) : 0;
     const int nk = pos + 1 - first;
     const int near = min(E, nk);
     const float* rr = yr + ((size_t)r * NH + h) * DR;
