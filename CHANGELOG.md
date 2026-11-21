@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- NVG on CUDA: `convert --quant blr --blr-method nvg`, `nvg-bench` and `nvg-train` (with `--mask-keep`) run whole
+  on the card under `CMF_GPU=cuda` (a build with the `cuda` feature), with no Vulkan adapter — the calibration
+  forward and its Grams, the encoder (cuBLAS products, a blocked Cholesky, the eigensolver, the output-side knots
+  as kernels) and the trainer. Files, snapshots and training states are those of the wgpu path; a state saved by
+  one backend resumes on the other. On one RTX PRO 6000 Blackwell against wgpu on the same card: Qwen3.5-0.8B at
+  1.0 bpw converts in 64 s (492 s), a layer's calibration 0.45 s (2.6 s), its encode 1.5–1.7 s (17 s); a training
+  step of 8 × 512 tokens with signs 0.31 s (0.69 s), 1 M tokens in 102 s (227 s), held-out KL 1.4462 (1.4490).
+  Qwen3.8-27B at 0.55 bpw: 3.4 s a step (5.48 s), the teacher pass 4.9k tok/s (2.7k). The trainer keeps h and g
+  in the f16 sign planes, so a layer input is staged once and the scales' gradients are row sums of the sign
+  gradients; the GDN recurrence runs in 512-thread blocks over an f16 history of every second state; the rank
+  activations of a step's forward serve its recompute (`CMF_NVG_ACACHE_GB`). The encoder's job threads queue on
+  streams of their own, and a tensor's two candidates are built on two threads. A conversion repeated on CUDA
+  gives the same bytes. `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
+- `convert --blr-channel-scale ALPHA` (device encoder): SFq's input channel scale for NVG, off by default. On the
+  0.8B at 1.0 bpw it makes the untrained file better at every seed — the KL to the teacher 3–4 % lower, WikiText-2
+  perplexity about 15 % (730 → 608 at 1.0) — and the reference training erases the difference. What does survive
+  the training is a gentler fit: `--blr-rho 0.1` on four times the calibration rows ends 2 % lower in held-out KL
+  at three training seeds (−1.6 … −2.5 %), reaching the unchanged file's final KL at about step 195 of 256.
+  Defaults unchanged; not repeated on the 27B. `docs/BLR_NVG.md` §8.6.
 - maxwell-model/Maxwell-V1-Flash (`maxwell_moe`, 35B mixture of experts, 3B active a token) converts natively
   (`cortiq convert`, profiles `q8_2f` and `q4tp`) and runs on its own stack: four residual streams with
   manifold-constrained hyper-connections (the DeepSeek-V4 form, a Sinkhorn mix of 20 rounds, a learned closing
@@ -58,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   here: about 2 200), where an allocation used to fail (a panic in wgpu at a 3072-token prompt).
 
 ### Changed
+- NVG device encoder, both backends: the flips of the input-side column search run on the host thread that encodes
+  the tensor, the feedback between column blocks stays a device GEMM. The search is sequential twice over, so a
+  device runs it as one block on one multiprocessor — about a microsecond a flip at any rank, 43 s of the 56 a
+  Qwen3.8-27B `down_proj` took — while a host core passes over the r candidates in vector registers. Qwen3.5-0.8B
+  on CUDA: `down_proj`'s search 1.57 → 0.48 s; on wgpu a layer's encode 17.8 → 14.2 s. The same search with its
+  sums in another order: files differ in the fourth digit of a tensor's error, and after the reference training
+  four conversions end at KL 1.4622 and 1.4546 (device kernel), 1.4669 and 1.4595 (host flips).
+  `CMF_NVG_GV=device` keeps the kernel (x86-64 hosts without AVX2 + FMA use it too). `docs/BLR_NVG.md` §4.1.
+- `nvg-train --sign-lr`: the help says what a trained file takes (about a quarter of `auto`; at the full rate the
+  guard halves it twice on its own).
 - CUDA hybrid arm: a stack that keeps every position on the card (Maxwell's block route: 101 KB a token over 45
   layers) holds its context's rows in the plan's reserve beside the expert slots: the rows of `CMF_MAX_SEQ`, or
   with none named the rows that fit beside weights that stay on the card whole (4096 at least, 32 768 at most;
@@ -79,6 +108,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CUDA and wgpu; a learned closing fold is admitted over the DeepSeek-V4 form as over the identity one.
 
 ### Fixed
+- CUDA GPTQ (`gpu_cuda/gptq.rs`): the Cholesky's upload by `cublasSetMatrix` is followed by a wait on the legacy
+  stream before work queued on the backend's stream reads the block (from pageable memory the call returns before
+  its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
+- `nvg-bench --layer L --gram-cache PREFIX` notes the layer beside the cached Grams and refuses a prefix captured
+  for another layer; before, the second layer was encoded on the first one's inputs without a word.
 - wgpu token graph: a stack with its own runtime (Hy4-flash, GLM-5.3, Maxwell) takes no device prefix, and the
   graph ran one anyway when the layers passed the weight budget: the caller read the boundary hidden as the
   whole stack's and stale logits as the token's (a 6 GB budget under Maxwell's 4-bit file on an M4 wrote empty

@@ -645,6 +645,12 @@ enum Commands {
         /// NVG relative Gram damping ρ.
         #[arg(long = "blr-rho", default_value = "0.03")]
         blr_rho: f64,
+        /// SFq's channel scale for the NVG device encoder: every input is
+        /// encoded in the basis x·t, t_j = σ_j^α / rms_j^(1−α) (σ the column
+        /// RMS of the tensors reading it, rms the input's on the calibration
+        /// text); t goes into the stored column gain g. Off by default.
+        #[arg(long = "blr-channel-scale", value_name = "ALPHA")]
+        blr_channel_scale: Option<f64>,
         /// Encoder threads (default: all cores).
         #[arg(long = "blr-threads")]
         blr_threads: Option<usize>,
@@ -652,9 +658,11 @@ enum Commands {
         /// an existing one is reused instead of reconverting.
         #[arg(long = "blr-keep-src")]
         blr_keep_src: bool,
-        /// NVG encoder device: `gpu` (f32 on the wgpu device, calibration on
-        /// per-op device GEMMs), `cpu` (the f64 reference), `auto` = gpu when
-        /// a wgpu adapter is up (not on macOS).
+        /// NVG encoder device: `gpu` (f32 on the device: wgpu with the
+        /// calibration on per-op device GEMMs, or — `CMF_GPU=cuda`, a build
+        /// with the cuda feature — CUDA with the calibration as the CUDA
+        /// trainer's forward), `cpu` (the f64 reference), `auto` = gpu when
+        /// a wgpu adapter or the CUDA backend is up.
         #[arg(long = "blr-device", default_value = "auto", value_name = "auto|cpu|gpu")]
         blr_device: String,
     },
@@ -1759,7 +1767,8 @@ enum Commands {
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
     /// gain; with --train-signs also the signs; every other weight frozen)
-    /// against its full-precision teacher, on the GPU. Qwen3.5-family models.
+    /// against its full-precision teacher, on the GPU (wgpu, or CUDA under
+    /// `CMF_GPU=cuda` in a build with the cuda feature). Qwen3.5-family models.
     NvgTrain {
         /// Student .cmf (binary low-rank tensors to train)
         student: String,
@@ -1812,7 +1821,10 @@ enum Commands {
         #[arg(long, default_value = "0.25")]
         sign_tau: f64,
         /// Peak sign learning rate, or auto = min(0.15·τ/√steps, 4e-3·τ)
-        /// (the second term caps the per-step move at the stable rate)
+        /// (the second term caps the per-step move at the stable rate).
+        /// A file that is already trained takes about a quarter of auto: at
+        /// the full rate its held-out KL rises and the guard halves the rate
+        /// twice on its own, at the cost of the steps in between
         #[arg(long, default_value = "auto")]
         sign_lr: String,
         /// Sign steps at η = 0 while the second-moment statistics settle
@@ -4762,6 +4774,7 @@ async fn main() -> anyhow::Result<()> {
             blr_fit_tokens,
             blr_sel_tokens,
             blr_rho,
+            blr_channel_scale,
             blr_threads,
             blr_keep_src,
             blr_device,
@@ -4828,7 +4841,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                     None => nvg::Plan::default(),
                 };
+                anyhow::ensure!(
+                    blr_channel_scale.is_none_or(|a| a.is_finite() && (0.0..=1.0).contains(&a)),
+                    "--blr-channel-scale: an exponent in [0, 1]"
+                );
                 let opts = nvg::BlrOpts {
+                    chscale: blr_channel_scale,
                     bpw: blr_bpw,
                     plan,
                     method,

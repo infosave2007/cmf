@@ -18,7 +18,8 @@ baseline is the NVG method.
 | CPU kernels (table matvec, GEMM matmat) | `crates/cortiq-engine/src/blr.rs`, `QTensor::Blr` in `qtensor.rs` |
 | wgpu kernels | `crates/cortiq-engine/src/gpu_wgpu/blr.rs`, `gpu::blr_matmat` |
 | encoders, `convert --quant blr` | `crates/cortiq-cli/src/nvg.rs`, `nvg_linalg.rs` (CPU f64 reference) |
-| NVG encoder on the device | `crates/cortiq-cli/src/nvg_gpu.rs` over `crates/cortiq-engine/src/gpu_wgpu/nvg_dev.rs` |
+| NVG encoder on the device | `crates/cortiq-cli/src/nvg_gpu.rs` over `crates/cortiq-engine/src/nvg_dev.rs` → `gpu_wgpu/nvg_dev.rs`, or `gpu_cuda/nvg_dev.rs` under `CMF_GPU=cuda` (§8) |
+| NVG Ť, the distillation trainer | `crates/cortiq-cli/src/nvgtrain.rs` over `crates/cortiq-engine/src/nvg_train.rs` (wgpu) or `gpu_cuda/nvgt.rs` (CUDA, §8) |
 | per-tensor / per-layer bench | `crates/cortiq-cli/src/nvgbench.rs` (`cortiq nvg-bench`) |
 
 ## 1. Bits and rank
@@ -177,10 +178,27 @@ Stage for stage the CPU encoder; what changes is where and how each stage runs.
   `qs −= F·Q[block, :]`. The decisions are the host's sequential pass.
 * *Input-side knots*: the column-sequential search carried in the latent space: `Mᵀw_j`
   for every column is one GEMM up front, and a column's error reaches the others as
-  `Mᵀe_j = (Mᵀw_j − g_j K s_j)/Uc[j,j]` (no m-length vector in the sequential part); a
-  128-column block runs in one 512-thread workgroup (lanes unrolled in registers, argmin
-  and dot products by subgroup operations, two barriers per flip), the trailing feedback
-  `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a GEMM.
+  `Mᵀe_j = (Mᵀw_j − g_j K s_j)/Uc[j,j]` (no m-length vector in the sequential part). The
+  flips of a 128-column block run on the host thread that encodes the tensor
+  (`gv_block_host`); the trailing feedback `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a device GEMM.
+  The search is sequential twice over — a column's target carries the errors of the columns
+  before it, and a flip changes every candidate of the next one — so a device runs it as one
+  block of threads on one multiprocessor, about a microsecond a flip whatever the rank, with
+  the rest of the card idle. A flip is one pass over r floats (the update `ks −= 2s·K[row]`,
+  every candidate's gain `(−4g²s)·(ks − kd·s) + (4gs)·bv`, the minimum of each 16
+  candidates) in vector registers, about 0.3 µs at r = 776, and every tensor and candidate in
+  flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
+  come down in two reads, its signs and error rows go back in two writes. The gain is written
+  as the device kernel writes it — the difference first, the last product and sum fused: the
+  two terms cancel near the stop test, and a gain summed from them loses the digits the test
+  reads. Elementwise IEEE operations and f64 sums: the result does not depend on the vector
+  width (x86-64 needs AVX2 and FMA; without them the device's kernel runs).
+  `CMF_NVG_GV=device` runs the flips in the device's kernel (one workgroup or block, lanes
+  unrolled in registers, argmin and dot products by subgroup operations): the same search
+  with its sums in another order, so two files differ in the fourth digit of a tensor's
+  error. After the 0.8B's reference training the held-out KL of four conversions is 1.4622
+  and 1.4546 with the device's kernel (blocks of 1024 and 256 threads), 1.4669 and 1.4595
+  with the host's flips (the gain summed plainly, and fused): one spread.
 * *Errors* `tr(E X Eᵀ)` (X = H, the raw fit Gram, the held-out Gram) from the factor-sized
   expansion `tr(WXWᵀ) − 2Σ⟨hsl_p, WX·gs_p⟩ + Σ⟨hsl_pᵀhsl_q, gs_pᵀX gs_q⟩`, read back at once.
 * Flip tolerances are 1e-7 relative in f32 and the column scale converges to 1e-8
@@ -199,7 +217,7 @@ MoE experts are not covered (they stay `q8_2f`); GDN `in_proj_a/b` stay f16.
 ```
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 \
     --blr-method nvg --calib calib.txt [--blr-paths auto|1|2] [--blr-kv-factor 1] \
-    [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] \
+    [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] [--blr-channel-scale ALPHA] \
     [--blr-threads N] [--blr-keep-src] [--blr-device auto|cpu|gpu] [--blr-plan FILE]
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 --blr-method dual-svid
 cortiq nvg-bench --model m.cmf --tensor NAME | --layer L [--jobs J] --bpw 0.55 \
@@ -276,9 +294,15 @@ cargo test --release -p cortiq-engine --features gpu --lib nvg_dev   # GEMM vari
 cargo test --release -p cortiq-cli --bin cortiq -- nvg_gpu            # device vs host per stage: contexts/errors, latents/ITQ/polar,
                                                                       # one ALS sweep, flip_u, gptq_v, the whole-tensor driver
 cargo test --release -p cortiq-engine --features gpu --lib nvg_dev -- --ignored --nocapture   # GEMM/Cholesky/flip-rate throughput
+cargo test --release -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests gpu_cuda::nvgt::tests --test-threads 1
+                                                                      # the CUDA twins: encoder primitives vs f64, blr layer forward /
+                                                                      # backward vs f64, the sign update bit for bit vs the host mirror,
+                                                                      # GDN and attention cores vs the bake's, the head's top-k and KL
+CMF_NVG_ENC=cuda cargo test --release -p cortiq-cli --features cuda --bin cortiq -- nvg_gpu --test-threads 1
+                                                                      # the encoder driver vs the f64 host encoder, through the CUDA twin
 ```
 
-The wgpu tests skip when no adapter is present.
+The wgpu tests skip when no adapter is present, the CUDA ones without a card.
 
 ## 7. Measured (Qwen3.5-0.8B, 17.10.2026)
 
@@ -361,3 +385,300 @@ multiprocessor), the g solves 23 % (n = 17408 Cholesky per g step for `down_proj
 eigensolver 9 %, the polar factor 7 %. Tensors in flight overlap little: a Vulkan queue
 orders every barrier after all earlier work, so the one-multiprocessor column search of
 one tensor holds back the others.
+
+## 8. On CUDA (`CMF_GPU=cuda`)
+
+A build with the `cuda` feature (`cargo build --release -p cortiq-cli --features cuda`; the NVIDIA driver, NVRTC and
+cuBLAS at run time) runs the whole NVG path on the card without wgpu: the conversion's calibration, the encoder,
+and the trainer. `CMF_GPU=cuda` selects it, as for decoding ([CUDA.md](CUDA.md)):
+
+```bash
+CMF_GPU=cuda cortiq convert --model <hf dir> --quant blr --bpw 0.55 --blr-method nvg --calib calib.txt --output m.cmf
+CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tokens 1048576 --window 512 --batch 8 \
+    --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
+CMF_GPU=cuda cortiq nvg-bench --model m.cmf --layer 3 --bpw 0.55 --device gpu --calib calib.txt
+```
+
+`--blr-device auto` picks the device encoder when the CUDA backend is up, so a machine without a Vulkan adapter
+converts on its card. Files, layouts, snapshots and saved training states are those of the wgpu path: a state
+saved by one backend resumes on the other.
+
+| part | where |
+|---|---|
+| encoder primitives (the API of `gpu_wgpu::nvg_dev`) | `crates/cortiq-engine/src/gpu_cuda/nvg_dev.rs`, kernels `nvg_dev.cu` |
+| backend switch of the encoder driver | `crates/cortiq-engine/src/nvg_dev.rs` |
+| trainer, calibration forward | `crates/cortiq-engine/src/gpu_cuda/nvgt.rs`, kernels `nvgt.cu`, `nvgt_sign.cu`, and the bake's `bake.cu` |
+| trainer backends of `nvg-train` | `crates/cortiq-cli/src/nvgtrain.rs` (`Backend`) |
+
+### 8.1 The encoder
+
+The driver of §4.1 is unchanged: every device call goes through `cortiq_engine::nvg_dev`, which forwards to the
+backend the process runs on. The CUDA twin keeps the arithmetic class (f32) and the stage order; what differs:
+
+* *GEMM*: cuBLAS SGEMM, plain f32, over the same sub-matrix views. A row-major operand read column-major is its
+  transpose, so `C = op(A)·op(B)` is the call `Cᵀ = op(B)ᵀ·op(A)ᵀ` on the arrays as they lie — no copy. The Hadamard
+  epilogue is one more elementwise launch.
+* *SPD solves*: an equilibrated right-looking Cholesky — a diagonal block (64 wide up to n = 8192, 128 past it;
+  `CMF_NVG_CUDA_CHOL_NB`) factored on the host in f64, its panel by STRSM, the trailing matrix by SSYRK — and
+  STRSV / STRSM for the solves and the inverse. A failed pivot grows the ridge ×100, as on the host.
+* *Latents*: the Householder tridiagonalisation as kernels (four launches a reflector), the host's f64 bisection +
+  inverse iteration (`tridiag_top`, shared with wgpu), the compact-WY back-transform as GEMMs.
+* *Knots*: the blocked output-side flips (32 ranks a block, the rest of `qs` by one GEMM); the input-side column
+  search's flips on the host (§4.1), its feedback a GEMM. The device kernel of the search (`CMF_NVG_GV=device`)
+  takes a 128-column block in one block of 256 threads (`CMF_NVG_GV_WS`; the lanes of a thread in registers,
+  argmin and dot products by warp shuffles; ranks up to 4096): a flip is one barrier — the warps' best candidates
+  go to shared memory and every thread merges them itself — and a candidate carries its diagonal of K, so the
+  winner's acceptance test reads nothing from the matrix.
+* *Lanes.* On the backend's one stream every encoder call of every thread waits its turn under the context's
+  lock, so tensors in flight overlap only on the host. A job thread queues on a lane of its own instead — a stream
+  and a cuBLAS handle (`nvg_dev::private_lane`, pooled and handed on) — and takes no lock: the tensors in flight
+  (`CMF_NVG_JOBS`) overlap on the card. The two candidates of a tensor (two paths at rank r, one path at the same bits) are built
+  on two threads with a lane each as well (`CMF_NVG_CAND_THREADS=0`: one after the other). The results do not
+  depend on any of it: every tensor and candidate is computed from its own matrices and the shared read-only
+  weight and Grams. `CMF_NVG_CUDA_LANES=0` puts everything back on the backend's one stream.
+* *Buffers*: device matrices come from a pool keyed by size (`CMF_NVG_CUDA_POOL_GB`, default 24 GB of free
+  buffers). A buffer a thread frees may still be read by work queued on that thread's stream, so a lane keeps
+  what it frees and only it takes it again; when the lane is given up its stream is drained and its buffers go to
+  the shared pool.
+* A matrix kernel takes its row from the grid's y and its column from x: no 64-bit division per element.
+
+`CMF_NVG_ENC=cuda|wgpu` picks the encoder's backend apart from the engine's (an A/B on identical Grams: wgpu
+calibration, CUDA encoder).
+
+### 8.2 The calibration
+
+Under `CMF_GPU=cuda` the conversion does not use the engine's capture hook (its Grams live on the wgpu device or
+the host). The calibration forward is the CUDA trainer's (§8.3): for layer `l` a net of the layers `bound..=l` is
+loaded from the work file — the layers below `l` already binary low-rank, `l` itself as f16 planes of its q8_2f
+weights — each window runs from the cached input of layer `bound` (`nvgt::calib_pass`), and the Grams `H += XᵀX`
+of the layer's four inputs (`in`: q/k/v or qkv/z, `mixout`: o_proj / out_proj, `mlp`: gate/up, `down`) accumulate
+on the card by plain f32 SGEMM. Positions are the engine calibration's (a window's last token is not fed), each
+layer runs once over the conversion. `nvg-bench` and `nvg-train --budget-plan` capture the same way.
+`CMF_NVG_CALIB=engine` keeps the engine's hook.
+
+### 8.3 The trainer
+
+`nvg-train` picks its backend at start (`Backend` in `nvgtrain.rs`): the wgpu trainer of `nvg_train.rs`, or
+`gpu_cuda::nvgt`. The step is the same — teacher top-k, forward with checkpointed layer inputs, KL through the
+frozen head, a reverse sweep that recomputes each layer, Adam on the metric, the sign latents updated right after
+each path's backward — and it is laid out for the card's two limits, the tensor cores and the memory bus:
+
+* *Products*: cuBLAS GEMMs on the tensor cores over f16 operands with f32 accumulation (the small GDN a/b
+  projections in f32).
+* *The scales ride the sign planes.* A bitmap is expanded to the f16 plane `±h_i` (U) or `±g_j` (V), times a
+  power of two per path that keeps the largest scale under 1 (`nt_expand_s`). So a layer input is staged in f16
+  once for every linear and path that reads it, a path's product lands in the sum — `y`, or the input gradient —
+  through the GEMM's β, and nothing the size of an activation is scaled, copied or added per path. h and g are
+  f16 in the forward, as they are in the file. The planes of a layer are kept from its forward for its backward.
+* *The scales' gradients come out of the sign gradients.* With `G'_U = dyᵀ·(a ⊙ ℓ)` and `G'_V = xᵀ·(t2 ⊙ ℓ)`
+  (`t2 = (dy ⊙ h)·S_U`): `dh_i = Σ_k S_U[i][k]·G'_U[i][k]`, `dg_j = Σ_k S_V[j][k]·G'_V[j][k]`, and the signs'
+  gradients are `diag(h)·G'_U`, `diag(g)·G'_V` — one row pass over an `m×r` matrix (`nt_g_fold`) instead of a
+  column reduction over `tokens×m` activations. Only `dℓ = Σ a ⊙ t2` reduces over tokens, at the rank's width.
+* *GDN forward*: the recurrence in blocks of 512 threads (`nt_gdn_fwd`): a thread keeps 32 state rows of one
+  column in registers, column sums go through shared memory. A position's q, k and their norms are published a
+  position early and its inputs are read ahead, so a position is two barriers and the loads' latency passes under
+  the arithmetic. `CMF_NVG_GDN_GC` = 1, 2, 4 picks the block (128, 256, 512 threads).
+* *GDN reverse sweep in chunks.* The delta rule over a chunk of C positions is linear algebra in the chunk's start
+  state S0 and its rows: with K̂, Q̂ (`[C][128]`), u_t = β_t·(v_t − kv_t) from the forward's `kv`, the decays
+  c_τ = Π g inside the chunk and r(τ,σ) = c_τ/c_σ,
+  `kv_τ = c_τ(K̂S0)_τ + Σ_{σ<τ} r(τ,σ)(k̂_τ·k̂_σ)u_σ`, `o_τ = c_τ(Q̂S0)_τ + Σ_{σ≤τ} r(τ,σ)(q̂_τ·k̂_σ)u_σ`,
+  `S_end = c_end·S0 + K̂ᵀ·diag(c_end/c_σ)·U`. So the adjoints of a chunk are fourteen batched f32 products of
+  `[C][128]`, `[C][C]` and `[128][128]` matrices over the (sequence, v-head) units (`cublasSgemmStridedBatched`),
+  one back substitution (`X_τ = Ū_τ − Σ_{τ'>τ} β_τ'·r(τ',τ)(k̂_τ'·k̂_τ)·X_τ'`: what the per-position sweep calls du)
+  and elementwise kernels (`nt_gdc_*`): `gdn_rev_chunked` in `nvgt.rs`, the derivation at the kernels in
+  `nvgt.cu`. Chunks are cut from the window's end (`CMF_NVG_GDN_CHUNK`, default 64: the pairwise products grow
+  with the chunk, the launches with their number); the forward keeps only the states at the chunk starts (f16),
+  and `kv` and `o` of every position. On an RTX PRO 6000 at 8×512 and 48 v-heads a layer's reverse sweep takes
+  7.0 ms where the per-position kernel takes 12.7, the forward that keeps the states 2.6 ms where it took 3.8,
+  and the history is 0.1 GB a layer where every second state was 3.2; it is more exact too (a window in one
+  chunk needs no stored state: the gradients agree with the skill bake's to 2·10⁻⁷, 1·10⁻⁴ through f16 states).
+  `CMF_NVG_GDN_REV=kernel` runs the per-position kernel `nt_gdn_rev` instead: three barriers a position, the
+  history every second state (the reverse sweep rebuilds the one between by a rank-one step from `kv`).
+  `CMF_NVG_GDN_HIST_GB` (default 16) caps the history by replaying the windows in groups. A v-head writes its
+  q̂/k̂ through-gradients, a second launch adds the heads of a k-group in order.
+* *The recompute reuses the forward's rank activations.* `a = x·S_V` of every path is kept from the step's first
+  forward, per layer and role, and the layer's recompute in the reverse sweep skips that product: the same input
+  and the same weights give the same values, so the losses of a run are equal with and without it. The widest
+  inputs are kept first (`down_proj` saves the most a byte) within `CMF_NVG_ACACHE_GB` (default 7) and what the
+  card has free past a 3 GiB reserve; 0 turns it off.
+* *SwiGLU writes its stagings.* In a training net the MLP's activation is read only as `down_proj`'s f16 input,
+  and the two gradients of SwiGLU only as the f16 output gradients of `gate_proj` and `up_proj`: the kernels write
+  those stagings directly (the values a separate staging pass makes), without the f32 copies.
+* *Attention*: batched GEMMs (TF32; `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM) and a causal softmax.
+* Every trainable parameter lives in one concatenated buffer with its gradient and Adam moments: the optimizer
+  and the gradient norm are one launch each.
+* Reductions run in a fixed order and the sign kernels are built without fused multiply-adds, so a step is
+  bit-reproducible and a sign update is bit for bit `train_sign`'s host mirror (tested).
+
+`--mask-keep` (DTG-MA before the metric) runs on CUDA too: a gate per MLP neuron scales the activation that
+`down_proj` reads (`nt_scale_cols`), its gradient is the column sum of the gated activation's gradient times the
+activation, and the gate training, the cut and the refit of ℓ are the wgpu trainer's code over a small trait
+(`MaskNet`). `CMF_NVG_PROF=1` prints the time per phase (the stream drained at phase changes), `CMF_NVG_KT=N` the
+time of every kernel and GEMM of step N.
+
+### 8.4 Agreement with the wgpu path
+
+The math is the same; the arithmetic differs in its accumulation order (cuBLAS against the wgpu tiles), in the
+f16 operands of the trainer's products and its f16 h, g and GDN state history, and in nothing else.
+Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
+
+| what | wgpu | CUDA |
+|---|---|---|
+| encoder on identical Grams (wgpu calibration, `CMF_NVG_ENC`), layer 0 held-out error: qkv / down / gate / up / z / out | 0.2143 / 0.4883 / 0.3663 / 0.5276 / 0.3371 / 0.3538 | 0.2143 / 0.4880 / 0.3664 / 0.5273 / 0.3377 / 0.3535 |
+| the same with the CUDA calibration | — | 0.2145 / 0.4881 / 0.3662 / 0.5279 / 0.3367 / 0.3528 |
+| trainer on one file: held-out KL before | 3.47721 | 3.47725 |
+| loss of steps 1, 7, 10 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0533, 2.9170 |
+| signs flipped by step 11 | 296 527 | 295 157 |
+| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44555 |
+| signs flipped in the run | 0.901 % | 0.896 % |
+| Qwen3.8-27B at 0.55 bpw, the trainer on one file: held-out KL before | 1.53820 | 1.53821 |
+| loss of steps 1, 6, 11, 12 | 1.4572, 1.3403, 1.5225, 1.6106 | 1.4572, 1.3403, 1.5225, 1.6106 |
+| signs flipped by step 11 | 4 259 313 | 4 259 718 |
+| the 27B's encoder, held-out error of layer 3: down / gate / up / q / o / k / v | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0830 / 0.3558 / 0.5083 | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0829 / 0.3560 / 0.5083 |
+
+A conversion repeated on CUDA gives the same bytes, and the training after it the same curve to the last printed
+digit. A training stopped at a saved state and resumed gives the losses and the held-out KL of an uninterrupted
+run; a state saved by one backend loads on the other.
+
+Kernel tests on the card (`cargo test -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests
+gpu_cuda::nvgt::tests`, and the encoder driver's tests with `CMF_NVG_ENC=cuda`): the GEMM views, the elementwise
+kernels, the eigensolver, the SPD solve and the whitening factor against f64; a binary low-rank layer's forward
+and backward against f64 (4·10⁻⁴: f16 operands and scales); the GDN core against the skill bake's kernels at
+odd, even and the shortest lengths, the reverse sweep as the per-position kernel and in chunks (the window as
+one chunk, chunks of 2 and 4 with a short first one), the states kept by the forward and replayed a sequence a
+launch (output 2·10⁻⁷; gradients 2·10⁻⁷ … 7·10⁻⁴); the attention core against the bake's (equal); the
+head's top-k and KL against the host; a sign update against `train_sign::host_step_fact` (no differing latent,
+moment or bitmap word); the DTG-MA gates on a real file (`cuda_mask_gradient_check`: open gates leave the loss as
+it is, a gate's gradient against a central difference within 0.3 % in the last layer and 4–6 % in the first);
+the device encoder against the f64 host encoder (`nvg_gpu` tests; the input-side search with its flips on the
+host and in the device's kernel: no sign differs from the f64 encoder's either way).
+
+The trainer's exact changes are checked on a run: 40 steps of the 0.8B give the same losses with and without the
+rank-activation cache, and with SwiGLU writing its stagings. A change of the GDN reverse sweep changes its
+rounding: the losses stay equal to four digits until the signs move (step 12) and the runs part after it, as two
+builds always do (the chunked sweep against the per-position kernel, 40 steps of 4×512: 2.7754 / 2.7754 at step
+11, 2.7217 / 2.7216 at 12, held-out KL at 40 2.30670 / 2.30814).
+
+### 8.5 Measured on CUDA (20–21.11.2026)
+
+One RTX PRO 6000 Blackwell (96 GB), 48 host cores; the wgpu column is the same card through Vulkan, the same
+binary without `CMF_GPU=cuda`.
+
+Qwen3.5-0.8B at 1.0 bpw (150 projections, calibration 14 848 FIT + 3 072 SEL tokens; the training is the
+reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `fact-mom`):
+
+| stage | wgpu | CUDA |
+|---|---:|---:|
+| calibration of a layer | 2.6 s | 0.4–0.5 s |
+| input contexts of a layer | 0.1 s | 0.1 s |
+| encode of a layer (three tensors in flight) | 16.6–18.0 s | 1.5–1.7 s |
+| whole conversion, 24 layers | 492 s | 64 s |
+| teacher top-64 pass | 42.7k tok/s | 55.5k tok/s |
+| training step, 4096 tokens | 0.69 s | 0.31 s |
+| the reference training, whole run | 227 s | 102 s |
+
+Inside the encoder, layer 0 with one tensor in flight (seconds; `CMF_NVG_PROF=1`):
+
+| tensor | stage | wgpu | CUDA |
+|---|---|---:|---:|
+| `in_proj_qkv` 6144×1024 | gauge rotation (polar) / g solves / ℓ solves / input-side search / eigenpairs | 0.75 / 0.66 / 0.40 / 0.34 / 0.13 | 0.13 / 0.13 / 0.07 / 0.09 / 0.10 |
+| `down_proj` 1024×3584 | g solves / input-side search | 1.59 / 2.11 | 0.42 / 0.48 |
+
+(The wgpu column is the device's search kernel, measured before the flips moved to the host; with them the wgpu
+encoder takes layer 0 in 14.2 s with one tensor in flight, 17.8 s with its kernel.)
+
+The linear algebra is 3–6 times faster on CUDA. The column-sequential input-side search was what remained — one
+block on one multiprocessor on either backend, 0.9 µs a flip here (1.57 s of `down_proj`) — until its flips
+moved to the host thread (§4.1): 0.27 µs a flip, transfers included. Layer 0 on CUDA, warm kernels, a quiet card,
+one tensor in flight and four:
+
+| | one | four |
+|---|---:|---:|
+| the backend's one stream, the search in the device's kernel | 6.0 s | 5.9 s |
+| a lane a thread, the two candidates on two threads (§8.1) | 5.2 s | 4.3 s |
+| and the flips on the host | 2.7 s | 1.5 s |
+
+The whole conversion: 202 s, 141 s, 64 s. The lanes and the candidate threads do not change the file (one sha256
+with and without them); the host's flips give another file of the same quality (§4.1). The q1g repack
+(`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
+
+Qwen3.8-27B at 0.55 bpw. The trainer: the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and
+signs. The encoder: one layer from the q8_2f weights, one tensor in flight, 32 768 + 4 096 calibration tokens.
+
+| stage | wgpu | CUDA |
+|---|---:|---:|
+| teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
+| training step, 4096 tokens | 5.48 s | 3.57 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
+| card memory while training | 90.8 GB | 86.5 GB |
+| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.9 s / 8.1 s |
+| input contexts of a layer | 2.5–3.4 s | 1.0–1.2 s |
+| encode of layer 0 (GDN, 6 tensors) | 149.3 s | 104.9 s |
+| encode of layer 3 (attention, 7 tensors) | 148.9 s | 102.4 s |
+| of it `down_proj` 5120×17408: whole / input-side search / g solves | 70.9 / 45.3 / 15.6 s | 58.1 / 44.4 / 8.9 s |
+| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 19.4, 14.6, 5.2 s | 11.6, 7.7, 2.3 s |
+
+A training run of 10.5 M tokens of the 27B (2559 steps with their teacher pass, states saved to a RAM disk)
+took 3 h 55 min on CUDA, at 3.56 s a step.
+
+A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step; the six products of a path run at
+280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput`), the GDN recurrence 28 % (its f16 state
+history is 6.4 GB a layer, written and read once), the sign update's passes over the latents 9 %, the remaining
+stagings and plane expansions 8 %, SwiGLU 4 %. Before the scales rode the planes and the recurrence ran in
+512-thread blocks the same step took 4.50 s (the elementwise passes over activations alone 40 % of it), and the
+0.8B's 0.54 s. In the 27B's encoder the input-side search of `down_proj` (33–36 M flips at 1.25 µs) is 42 % of a
+layer on CUDA and the next thing to parallelise.
+
+### 8.6 SFq's two ideas at the NVG start
+
+SFq ([Q2TP_SCALE_REFINE.md](Q2TP_SCALE_REFINE.md)) gave q2tp 7–14 % lower perplexity at the same size by a
+channel scale on the inputs and a refinement of the codes on calibration rows under a ridge. NVG has both inside:
+g is a free scale per input channel, solved exactly, and the discrete knots are a code refinement on the
+calibration Gram under the damping ρ. An input rescaling changes the encoder only through that damping and the
+column order of the input-side search. Measured on the 0.8B at 1.0 bpw, all on CUDA: perplexity on 16 × 512 of
+WikiText-2 test / C4 validation, the reference training (256 steps), its held-out KL. A build's own unchanged run
+is the row to compare with: the two builds differ in the last bits of their arithmetic (a build repeats itself bit
+for bit).
+
+| variant | no training: ppl | no training: KL | KL at 25 / 100 / 256 steps | after training: ppl |
+|---|---:|---:|---:|---:|
+| *first build:* NVG as it is | 695.3 / 1014.0 | 3.565 | 2.437 / 1.702 / 1.445 | 80.25 / 154.97 |
+| `--blr-channel-scale 0.75` | 592.7 / 921.7 | 3.422 | 2.472 / 1.730 / 1.461 | 82.50 / 155.82 |
+| `--blr-rho 0.1` | 823.5 / 1139.9 | 3.699 | 2.474 / 1.703 / 1.437 | 78.02 / 151.47 |
+| `--blr-rho 0.3` | 1221.4 / 1621.3 | 4.030 | 2.629 / 1.742 / 1.458 | 79.33 / 156.21 |
+| four refinement sweeps (`CMF_NVG_SWEEPS=4`, conversion ×2) | 675.6 / 949.5 | 3.452 | 2.432 / 1.695 / 1.452 | 80.22 / 156.15 |
+| *final build:* NVG as it is | 730.1 / 996.1 | 3.525 | 2.448 / 1.721 / 1.461 | 82.01 / 156.87 |
+| `--blr-channel-scale 0.5` | 615.8 / 961.9 | 3.432 | 2.435 / 1.714 / 1.466 | 81.37 / 157.35 |
+| `--blr-channel-scale 1.0` | 608.5 / 895.6 | 3.396 | 2.391 / 1.697 / 1.435 | 78.91 / 151.92 |
+| `--blr-rho 0.01` | 709.6 / 973.8 | 3.491 | 2.481 / 1.736 / 1.483 | 83.61 / 156.25 |
+| four times the calibration rows (`--blr-fit-tokens 59392 --blr-sel-tokens 12288`) | 580.8 / 1013.4 | 3.412 | 2.380 / 1.691 / 1.436 | 79.11 / 153.70 |
+| the rows and `--blr-rho 0.1` | 746.6 / 1142.9 | 3.644 | 2.404 / 1.680 / 1.424 | 79.52 / 151.72 |
+| the rows, `--blr-rho 0.1` and `--blr-channel-scale 1.0` | 674.3 / 1090.2 | 3.571 | 2.397 / 1.666 / 1.420 | 78.87 / 153.29 |
+
+The two unchanged runs differ by 5 % in the untrained perplexity and by 1 % in the trained KL, and one training
+seed is one draw: the files of the final build were trained again with two other seeds (a seed changes the order
+of the training windows and the held-out windows, so a KL compares within a seed only).
+
+| held-out KL after training | seed 42 | seed 7 | seed 11 | against the unchanged file |
+|---|---:|---:|---:|---:|
+| NVG as it is | 1.4608 | 1.5142 | 1.5509 | |
+| channel scale 0.5 | 1.4657 | 1.5393 | 1.5627 | +0.3 %, +1.7 %, +0.8 % |
+| channel scale 1.0 | 1.4350 | 1.5128 | 1.5418 | −1.8 %, −0.1 %, −0.6 % |
+| four times the rows | 1.4363 | 1.5254 | 1.5342 | −1.7 %, +0.7 %, −1.1 % |
+| the rows and ρ 0.1 | 1.4245 | 1.4904 | 1.5195 | −2.5 %, −1.6 %, −2.0 % |
+| the rows, ρ 0.1 and scale 1.0 | 1.4199 | 1.4878 | 1.5160 | −2.8 %, −1.7 %, −2.3 % |
+
+Reading it:
+
+* *The channel scale* makes the untrained file better at every seed — the KL to the teacher 3–4 % lower,
+  WikiText-2 perplexity about 15 %, C4 3–10 % — and the training erases it: after 256 steps the scaled files end
+  where the unscaled one does.
+* *A gentler fit* — a ridge of 0.1 on four times the calibration rows — starts no better (the stronger ridge
+  alone makes the untrained file worse) and ends 2 % lower in KL at all three seeds; the scale on top adds
+  nothing measurable. The file reaches the unchanged run's final KL at about step 195 of 256.
+* More refinement sweeps, a weaker or a much stronger ridge, more rows alone: inside the resolution.
+
+So SFq's channel scale helps a file that will not be trained (`--blr-channel-scale 1.0`), and its ridge with more
+calibration rows (`--blr-rho 0.1 --blr-fit-tokens 59392 --blr-sel-tokens 12288`; on CUDA the rows cost nothing:
+the conversion takes the same 3–4 minutes) trims the training by about a fifth for the same KL, or leaves the
+trained file 2 % better. The defaults are unchanged, and none of this was repeated on the 27B.

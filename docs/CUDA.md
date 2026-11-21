@@ -546,6 +546,37 @@ prompt of that length; the peak is the card's over the whole run, in GB of 1024 
   and an answer that begins the same (`scripts/dory_cuda/serve_check.sh`; a follow-up turn, a tool call, a
   streamed answer and two slots at once too).
 
+## Sub-1-bit files: the NVG converter and trainer
+
+The NVG path — `convert --quant blr --blr-method nvg`, `nvg-bench`, `nvg-train` — runs whole on the card under
+`CMF_GPU=cuda`, with no Vulkan adapter: the calibration forward and its Grams, the encoder (whitening, latents,
+the gauge rotation, the closed-form metric, the discrete knots) and the trainer (teacher top-k, forward, the
+reverse sweep through GDN mixers and gated attention, Adam on the metric, the sign latents). Files, snapshots and
+saved training states are those of the wgpu path: a state saved by one backend resumes on the other. How it is
+built and how it agrees with the wgpu path: [BLR_NVG.md §8](BLR_NVG.md#8-on-cuda-cmf_gpucuda).
+
+```bash
+CMF_GPU=cuda cortiq convert --model <hf dir> --quant blr --bpw 0.55 --blr-method nvg --calib calib.txt --output m.cmf
+CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tokens 1048576 --window 512 --batch 8 \
+    --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
+```
+
+One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vulkan:
+
+| | wgpu | CUDA |
+|---|---:|---:|
+| Qwen3.5-0.8B at 1.0 bpw: whole conversion | 492 s | 216 s |
+| calibration of a layer / encode of a layer | 2.6 s / 17.3 s | 0.45 s / 7.2–8.7 s |
+| training step, 8 × 512 tokens, metric and signs | 0.69 s | 0.34 s |
+| 1 M tokens of training, whole run | 227 s | 96 s |
+| Qwen3.8-27B at 0.55 bpw: teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
+| training step, 8 × 512 tokens, metric and signs | 5.48 s | 3.57 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
+| encode of a layer (one tensor in flight) | 149 s | 102–105 s |
+
+The held-out KL after the 0.8B's training is 1.4456 on CUDA and 1.4490 on wgpu; a conversion repeated on CUDA
+gives the same bytes.
+
 ## Options
 
 | variable | meaning |
@@ -574,6 +605,19 @@ prompt of that length; the peak is the card's over the whole run, in GB of 1024 
 | `CMF_DORY_BIG=0` | a Dory prompt by the tensor-core matvec, 16 rows at a time |
 | `CMF_DORY_KT=N`, `CMF_DORY_KT_AT=P` | kernel times of Dory's N-th token, of its prompt chunk at position P |
 | `CMF_DORY_ATT_ROWS=N` | query rows of a Dory prompt chunk per attention GEMM pass, 128 by default (512: the 0.8.71 way) |
+| `CMF_NVG_ENC=cuda\|wgpu` | the NVG encoder's backend apart from the engine's |
+| `CMF_NVG_CALIB=engine` | the NVG conversion's calibration through the engine's capture hook |
+| `CMF_NVG_CUDA_POOL_GB=N` | free device buffers the NVG encoder keeps, 24 GB by default |
+| `CMF_NVG_GDN_HIST_GB=N` | the cap of the NVG trainer's GDN state history, 16 GB by default |
+| `CMF_NVG_ACACHE_GB=N` | rank activations the NVG trainer keeps from a step's forward for its recompute, 7 GB by default, 0 for none |
+| `CMF_NVG_GDN_REV=kernel` | the NVG trainer's GDN reverse sweep a position at a time instead of in chunks |
+| `CMF_NVG_GDN_CHUNK=N` | positions a chunk of that sweep takes, 64 by default, at most 256 |
+| `CMF_NVG_JOBS=N` | tensors of a layer in flight in the NVG conversion, 3 by default |
+| `CMF_NVG_CUDA_LANES=0` | the NVG encoder's threads on the backend's one stream (no overlap on the card) |
+| `CMF_NVG_CAND_THREADS=0` | a tensor's two candidates one after the other |
+| `CMF_NVG_GV=device` | the NVG column search's flips in the device kernel instead of on the host |
+| `CMF_NVG_GV_WS=N` | threads of the device kernel's block, 256 by default |
+| `CMF_NVG_PROF=1`, `CMF_NVG_KT=N` | the NVG trainer's time per phase; the kernel times of its step N |
 
 ## Limits
 
@@ -584,6 +628,7 @@ prompt of that length; the peak is the card's over the whole run, in GB of 1024 
   tokens, 4.5 GB on the wgpu path). The hybrid arm's and Dory's prompts stay within the seal's memory. A new
   turn of a sealed conversation reads the conversation again, as on the wgpu path.
 - Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm.
+- The NVG trainer and converter cover the Qwen3.5 family (GDN mixers, gated attention), as on wgpu.
 - The toolkit libraries must be on the loader's path; the bindings are for CUDA 12.x.
 - Decode is bound by its own arithmetic, about 350 GB/s of weights on an A40 against 500 for a kernel
   that only loads them (`scripts/cuda/bench/mv_bench.cu`).

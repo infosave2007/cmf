@@ -17,6 +17,8 @@
 use crate::gptq::{CalibSource, calib_source_tokens, split_calib_budget};
 use cortiq_core::format::{CmfModel, TensorSpec};
 use cortiq_engine::gpu_wgpu::train_sign as ts;
+#[cfg(feature = "cuda")]
+use cortiq_engine::gpu_cuda::nvgt as cu;
 use cortiq_engine::nvg_train as nt;
 use std::io::{Read, Write};
 use std::time::Instant;
@@ -349,7 +351,7 @@ fn mask_and_cut(
     t_ids: &[Vec<u32>],
     t_p: &[Vec<f32>],
 ) -> anyhow::Result<CmfModel> {
-    use crate::compress::{cmfio, dtgma, heal_gpu};
+    use crate::compress::heal_gpu;
     anyhow::ensure!(keep > 0.0 && keep < 1.0, "--mask-keep {keep}: a fraction in (0, 1)");
     let k = o.topk;
     let mut mnet = nt::Net::load(c, &smodel, true, true, None).map_err(|e| anyhow::anyhow!(e))?;
@@ -364,8 +366,17 @@ fn mask_and_cut(
         }
         Ok(s / n_eval_b.max(1) as f64)
     };
+    let cfg = mask_cfg(o, keep);
+    let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
+    let rep = heal_gpu::train_masks(&heal_gpu::WgMaskNet(c, &mnet), n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
+    drop((mw, mnet));
+    cut_by_masks(&smodel, keep, o, &rep)
+}
+
+/// The DTG-MA knobs of `--mask-keep` (`CMF_DTGMA_*`).
+fn mask_cfg(o: &NvgTrainOpts, keep: f64) -> crate::compress::heal_gpu::MaskCfg {
     let knob = |n: &str, d: f64| std::env::var(format!("CMF_DTGMA_{n}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let cfg = heal_gpu::MaskCfg {
+    crate::compress::heal_gpu::MaskCfg {
         window: o.window,
         batch: o.batch,
         keep_frac: keep,
@@ -381,10 +392,13 @@ fn mask_and_cut(
         train_from: 0,
         soft: false,
         max_batches: 0,
-    };
-    let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
-    let rep = heal_gpu::train_masks(c, &mnet, n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
-    drop((mw, mnet));
+    }
+}
+
+/// Keep the `keep` fraction of the MLP neurons the trained gates rank
+/// highest and write the cut model next to the output (`<output>.masked.cmf`).
+fn cut_by_masks(smodel: &CmfModel, keep: f64, o: &NvgTrainOpts, rep: &crate::compress::heal_gpu::MaskReport) -> anyhow::Result<CmfModel> {
+    use crate::compress::{cmfio, dtgma};
     let widths: Vec<usize> = rep.logits.iter().map(Vec::len).collect();
     let total = (widths.iter().sum::<usize>() as f64 * keep).round() as usize;
     let floor: Vec<usize> = widths.iter().map(|&w| ((w as f64 * 0.25) as usize).div_ceil(128) * 128).collect();
@@ -403,7 +417,7 @@ fn mask_and_cut(
         "keep": keep, "widths": keeps, "hard_loss": rep.nll_hard, "open_loss": rep.nll_open,
         "pruned_at_selection": rep.pruned, "step": rep.step, "steps": rep.steps, "sec_per_step": rep.sec_per_step,
     });
-    let bytes = cmfio::subset_ffn(&smodel, &cut, &keep_idx, &|h| cmfio::provenance_set(h, "dtgma", prov.clone()))?;
+    let bytes = cmfio::subset_ffn(smodel, &cut, &keep_idx, &|h| cmfio::provenance_set(h, "dtgma", prov.clone()))?;
     eprintln!(
         "nvg-train: {} of {} MLP neurons kept ({:.1} %) → {} ({:.3} GB); widths {}",
         keeps.iter().sum::<usize>(),
@@ -416,7 +430,241 @@ fn mask_and_cut(
     Ok(CmfModel::open_sharded(&cut)?)
 }
 
+/// The device a run trains on: the wgpu trainer (`nvg_train`), or its CUDA
+/// twin (`gpu_cuda::nvgt`) under `CMF_GPU=cuda` in a build with the `cuda`
+/// feature. Both keep the same layout, snapshot and state-file order.
+trait Backend {
+    type Net;
+    type Work;
+    fn name(&self) -> &'static str;
+    /// `bwd`: the net is stepped (the student); false: the teacher.
+    fn load(&self, m: &CmfModel, bwd: bool, sign: Option<&ts::SignInit>) -> anyhow::Result<Self::Net>;
+    fn work(&self, net: &Self::Net, nb: usize, t: usize) -> anyhow::Result<Self::Work>;
+    fn teacher_topk(&self, net: &Self::Net, w: &Self::Work, ids: &[u32], k: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>)>;
+    #[allow(clippy::too_many_arguments)]
+    fn step(&self, net: &Self::Net, w: &Self::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&ts::SignStepCfg>) -> anyhow::Result<nt::StepStats>;
+    fn loss_only(&self, net: &Self::Net, w: &Self::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize) -> anyhow::Result<f64>;
+    /// NaN when the norm cannot be read.
+    fn grad_norm(&self, net: &Self::Net) -> f64;
+    fn zero_grads(&self, net: &Self::Net);
+    #[allow(clippy::too_many_arguments)]
+    fn adam(&self, net: &Self::Net, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> anyhow::Result<()>;
+    fn snapshot(&self, net: &Self::Net, bits: bool) -> anyhow::Result<nt::Snap>;
+    fn restore(&self, net: &Self::Net, snap: &nt::Snap) -> anyhow::Result<()>;
+    fn export(&self, net: &Self::Net, model: &CmfModel) -> anyhow::Result<Vec<(String, Vec<u8>)>>;
+    fn save_state(&self, net: &Self::Net, path: &std::path::Path) -> anyhow::Result<u64>;
+    fn load_state(&self, net: &Self::Net, path: &std::path::Path) -> anyhow::Result<()>;
+    fn sign_stats(&self, net: &Self::Net) -> anyhow::Result<Vec<(String, u64, u64)>>;
+    fn sign_live(&self, net: &Self::Net) -> u64;
+    fn n_sign_mats(&self, net: &Self::Net) -> u32;
+    fn sign_scratch_bytes(&self, w: &Self::Work) -> u64;
+    /// Forget the profile of what ran before the training loop.
+    fn prof_reset(&self) {}
+    fn prof_step_end(&self);
+    fn prof_report(&self);
+    /// DTG-MA before the metric (`--mask-keep`): the cut student.
+    #[allow(clippy::too_many_arguments)]
+    fn mask_and_cut(&self, smodel: CmfModel, keep: f64, o: &NvgTrainOpts, n_train_b: usize, n_eval_b: usize, batch_ids: &dyn Fn(usize) -> Vec<u32>, t_ids: &[Vec<u32>], t_p: &[Vec<f32>]) -> anyhow::Result<CmfModel>;
+}
+
+struct Wg(cortiq_engine::gpu_wgpu::CtxRef);
+
+impl Backend for Wg {
+    type Net = nt::Net;
+    type Work = nt::Work;
+    fn name(&self) -> &'static str {
+        "wgpu"
+    }
+    fn load(&self, m: &CmfModel, bwd: bool, sign: Option<&ts::SignInit>) -> anyhow::Result<nt::Net> {
+        nt::Net::load(self.0, m, true, bwd, sign).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn work(&self, net: &nt::Net, nb: usize, t: usize) -> anyhow::Result<nt::Work> {
+        Ok(nt::Work::new(self.0, net, nb, t))
+    }
+    fn teacher_topk(&self, net: &nt::Net, w: &nt::Work, ids: &[u32], k: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        nt::teacher_topk(self.0, net, w, ids, k).ok_or_else(|| anyhow::anyhow!("teacher pass failed"))
+    }
+    fn step(&self, net: &nt::Net, w: &nt::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&ts::SignStepCfg>) -> anyhow::Result<nt::StepStats> {
+        nt::step(self.0, net, w, ids, tid, tp, k, gscale, sign).ok_or_else(|| anyhow::anyhow!("step failed"))
+    }
+    fn loss_only(&self, net: &nt::Net, w: &nt::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize) -> anyhow::Result<f64> {
+        nt::loss_only(self.0, net, w, ids, tid, tp, k).ok_or_else(|| anyhow::anyhow!("eval failed"))
+    }
+    fn grad_norm(&self, net: &nt::Net) -> f64 {
+        nt::grad_norm(self.0, net).unwrap_or(f64::NAN)
+    }
+    fn zero_grads(&self, net: &nt::Net) {
+        nt::zero_grads(self.0, net)
+    }
+    fn adam(&self, net: &nt::Net, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> anyhow::Result<()> {
+        nt::adam(self.0, net, lr, step, b1, b2, eps, gmul).ok_or_else(|| anyhow::anyhow!("adam failed"))
+    }
+    fn snapshot(&self, net: &nt::Net, bits: bool) -> anyhow::Result<nt::Snap> {
+        nt::snapshot(self.0, net, bits).ok_or_else(|| anyhow::anyhow!("snapshot"))
+    }
+    fn restore(&self, net: &nt::Net, snap: &nt::Snap) -> anyhow::Result<()> {
+        nt::restore(self.0, net, snap);
+        Ok(())
+    }
+    fn export(&self, net: &nt::Net, model: &CmfModel) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        nt::export(self.0, net, model).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn save_state(&self, net: &nt::Net, path: &std::path::Path) -> anyhow::Result<u64> {
+        nt::save_state(self.0, net, path).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn load_state(&self, net: &nt::Net, path: &std::path::Path) -> anyhow::Result<()> {
+        nt::load_state(self.0, net, path).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn sign_stats(&self, net: &nt::Net) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        nt::sign_stats(self.0, net).ok_or_else(|| anyhow::anyhow!("sign stats"))
+    }
+    fn sign_live(&self, net: &nt::Net) -> u64 {
+        net.sign_live()
+    }
+    fn n_sign_mats(&self, net: &nt::Net) -> u32 {
+        net.n_sign_mats
+    }
+    fn sign_scratch_bytes(&self, w: &nt::Work) -> u64 {
+        w.sg.as_ref().map(|x| x.bytes()).unwrap_or(0)
+    }
+    fn prof_step_end(&self) {
+        nt::prof::step_end()
+    }
+    fn prof_report(&self) {
+        nt::prof::report()
+    }
+    fn mask_and_cut(&self, smodel: CmfModel, keep: f64, o: &NvgTrainOpts, n_train_b: usize, n_eval_b: usize, batch_ids: &dyn Fn(usize) -> Vec<u32>, t_ids: &[Vec<u32>], t_p: &[Vec<f32>]) -> anyhow::Result<CmfModel> {
+        mask_and_cut(self.0, smodel, keep, o, n_train_b, n_eval_b, batch_ids, t_ids, t_p)
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct Cu;
+
+#[cfg(feature = "cuda")]
+impl Backend for Cu {
+    type Net = cu::Net;
+    type Work = cu::Work;
+    fn name(&self) -> &'static str {
+        "cuda"
+    }
+    fn load(&self, m: &CmfModel, bwd: bool, sign: Option<&ts::SignInit>) -> anyhow::Result<cu::Net> {
+        cu::Net::load(m, bwd, sign).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn work(&self, net: &cu::Net, nb: usize, t: usize) -> anyhow::Result<cu::Work> {
+        cu::Work::new(net, nb, t).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn teacher_topk(&self, net: &cu::Net, w: &cu::Work, ids: &[u32], k: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        cu::teacher_topk(net, w, ids, k).map_err(|e| anyhow::anyhow!("teacher pass: {e}"))
+    }
+    fn step(&self, net: &cu::Net, w: &cu::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&ts::SignStepCfg>) -> anyhow::Result<nt::StepStats> {
+        cu::step(net, w, ids, tid, tp, k, gscale, sign).map_err(|e| anyhow::anyhow!("step: {e}"))
+    }
+    fn loss_only(&self, net: &cu::Net, w: &cu::Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize) -> anyhow::Result<f64> {
+        cu::loss_only(net, w, ids, tid, tp, k).map_err(|e| anyhow::anyhow!("eval: {e}"))
+    }
+    fn grad_norm(&self, net: &cu::Net) -> f64 {
+        cu::grad_norm(net).unwrap_or(f64::NAN)
+    }
+    fn zero_grads(&self, net: &cu::Net) {
+        let _ = cu::zero_grads(net);
+    }
+    fn adam(&self, net: &cu::Net, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> anyhow::Result<()> {
+        cu::adam(net, lr, step, b1, b2, eps, gmul).map_err(|e| anyhow::anyhow!("adam: {e}"))
+    }
+    fn snapshot(&self, net: &cu::Net, bits: bool) -> anyhow::Result<nt::Snap> {
+        cu::snapshot(net, bits).map_err(|e| anyhow::anyhow!("snapshot: {e}"))
+    }
+    fn restore(&self, net: &cu::Net, snap: &nt::Snap) -> anyhow::Result<()> {
+        cu::restore(net, snap).map_err(|e| anyhow::anyhow!("restore: {e}"))
+    }
+    fn export(&self, net: &cu::Net, model: &CmfModel) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        cu::export(net, model).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn save_state(&self, net: &cu::Net, path: &std::path::Path) -> anyhow::Result<u64> {
+        cu::save_state(net, path).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn load_state(&self, net: &cu::Net, path: &std::path::Path) -> anyhow::Result<()> {
+        cu::load_state(net, path).map_err(|e| anyhow::anyhow!(e))
+    }
+    fn sign_stats(&self, net: &cu::Net) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        cu::sign_stats(net).map_err(|e| anyhow::anyhow!("sign stats: {e}"))
+    }
+    fn sign_live(&self, net: &cu::Net) -> u64 {
+        net.sign_live()
+    }
+    fn n_sign_mats(&self, net: &cu::Net) -> u32 {
+        net.n_sign_mats
+    }
+    fn sign_scratch_bytes(&self, w: &cu::Work) -> u64 {
+        w.sign_scratch
+    }
+    fn prof_reset(&self) {
+        cu::prof::reset()
+    }
+    fn prof_step_end(&self) {
+        cu::prof::step_end()
+    }
+    fn prof_report(&self) {
+        cu::prof::report()
+    }
+    fn mask_and_cut(&self, smodel: CmfModel, keep: f64, o: &NvgTrainOpts, n_train_b: usize, n_eval_b: usize, batch_ids: &dyn Fn(usize) -> Vec<u32>, t_ids: &[Vec<u32>], t_p: &[Vec<f32>]) -> anyhow::Result<CmfModel> {
+        use crate::compress::heal_gpu;
+        anyhow::ensure!(keep > 0.0 && keep < 1.0, "--mask-keep {keep}: a fraction in (0, 1)");
+        let k = o.topk;
+        let mut mnet = cu::Net::load(&smodel, true, None).map_err(|e| anyhow::anyhow!(e))?;
+        mnet.enable_masks().map_err(|e| anyhow::anyhow!(e))?;
+        let mw = cu::Work::new(&mnet, o.batch, o.window).map_err(|e| anyhow::anyhow!(e))?;
+        // the gates alone are trained: the metric's gradients of a step are dropped
+        let step = |b: usize, gs: f32| {
+            let st = cu::step(&mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k, gs, None).ok()?;
+            cu::zero_grads(&mnet).ok()?;
+            Some(st)
+        };
+        let val = || -> anyhow::Result<f64> {
+            let mut s = 0.0;
+            for e in 0..n_eval_b {
+                let b = n_train_b + e;
+                s += cu::loss_only(&mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k).map_err(|e| anyhow::anyhow!("eval: {e}"))?;
+            }
+            Ok(s / n_eval_b.max(1) as f64)
+        };
+        let cfg = mask_cfg(o, keep);
+        let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
+        let rep = heal_gpu::train_masks(&CuMaskNet(&mnet), n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
+        drop((mw, mnet));
+        cut_by_masks(&smodel, keep, o, &rep)
+    }
+}
+
+/// The CUDA trainer's net as the mask loop's [`crate::compress::heal_gpu::MaskNet`].
+#[cfg(feature = "cuda")]
+struct CuMaskNet<'a>(&'a cu::Net);
+
+#[cfg(feature = "cuda")]
+impl crate::compress::heal_gpu::MaskNet for CuMaskNet<'_> {
+    fn mask_widths(&self) -> Vec<usize> {
+        self.0.mask_widths()
+    }
+    fn set_masks(&self, s: &[Vec<f32>]) -> Option<()> {
+        self.0.set_masks(s).ok()
+    }
+    fn mask_grads(&self) -> Option<Vec<Vec<f32>>> {
+        self.0.mask_grads().ok()
+    }
+}
+
 pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
+    #[cfg(feature = "cuda")]
+    if cortiq_engine::gpu_cuda::selected() {
+        anyhow::ensure!(cu::available(), "CMF_GPU=cuda: the CUDA trainer did not come up (driver, NVRTC and cuBLAS are needed)");
+        return run_on(&Cu, o);
+    }
+    let c = cortiq_engine::gpu_wgpu::train_ops::dev().ok_or_else(|| anyhow::anyhow!("nvg-train needs a wgpu GPU (or CMF_GPU=cuda in a build with the cuda feature)"))?;
+    run_on(&Wg(c), o)
+}
+
+fn run_on<B: Backend>(be: &B, o: &NvgTrainOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     // The plan is parsed first: a malformed rule is a cheap error, and it
     // must not be hidden behind a missing GPU or a missing model.
@@ -428,7 +676,6 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         }
         None => None,
     };
-    let c = cortiq_engine::gpu_wgpu::train_ops::dev().ok_or_else(|| anyhow::anyhow!("nvg-train needs a wgpu GPU"))?;
     let tmodel = CmfModel::open_sharded(o.teacher)?;
     // The allocation step: the plan moves the bits to the layers that need
     // them, and the training then optimises the metric (and the signs) of the
@@ -468,7 +715,8 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let eval_n = eval.len() / o.batch * o.batch;
     let train = windows;
     eprintln!(
-        "nvg-train: {} training windows + {} held out of {} tokens, batch {}, top-{} teacher",
+        "nvg-train ({}): {} training windows + {} held out of {} tokens, batch {}, top-{} teacher",
+        be.name(),
         train.len(),
         eval_n,
         o.window,
@@ -492,14 +740,14 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     } else {
         let mut t_ids: Vec<Vec<u32>> = Vec::new();
         let mut t_p: Vec<Vec<f32>> = Vec::new();
-        let tnet = nt::Net::load(c, &tmodel, true, false, None).map_err(|e| anyhow::anyhow!(e))?;
-        let tw = nt::Work::new(c, &tnet, o.batch, o.window);
+        let tnet = be.load(&tmodel, false, None)?;
+        let tw = be.work(&tnet, o.batch, o.window)?;
         let all: Vec<&Vec<u32>> = train[..whole].iter().chain(eval.iter().take(eval_n)).collect();
         let tt = Instant::now();
         for (bi, chunk) in all.chunks(o.batch).enumerate() {
             anyhow::ensure!(chunk.len() == o.batch, "teacher batch {bi}: {} windows", chunk.len());
             let ids: Vec<u32> = chunk.iter().flat_map(|w| w.iter().copied()).collect();
-            let (ti, tp) = nt::teacher_topk(c, &tnet, &tw, &ids, k).ok_or_else(|| anyhow::anyhow!("teacher pass failed"))?;
+            let (ti, tp) = be.teacher_topk(&tnet, &tw, &ids, k)?;
             t_ids.push(ti);
             t_p.push(tp);
             eprint!("\r  teacher {}/{}  {:.0} tok/s   ", bi + 1, all.len() / o.batch, ((bi + 1) * o.batch * o.window) as f64 / tt.elapsed().as_secs_f64());
@@ -522,17 +770,17 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     // ── DTG-MA before the metric (NVG → DTG-MA): a gate on every MLP neuron
     // trained with the same KL, the closed neurons cut out of the tensors ──
     let smodel = match o.mask_keep {
-        Some(keep) => mask_and_cut(c, smodel, keep, o, n_train_b, eval_n / o.batch, &batch_ids, &t_ids, &t_p)?,
+        Some(keep) => be.mask_and_cut(smodel, keep, o, n_train_b, eval_n / o.batch, &batch_ids, &t_ids, &t_p)?,
         None => smodel,
     };
 
     // ── student ──
     let total_steps = n_train_b * o.epochs;
     let sign_init = o.signs.as_ref().map(|s| ts::SignInit { opt: s.opt, tau: s.tau as f32, seed: s.seed as u32, keep_bits0: true, defer: false });
-    let snet = nt::Net::load(c, &smodel, true, true, sign_init.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
-    let sw = nt::Work::new(c, &snet, o.batch, o.window);
+    let snet = be.load(&smodel, true, sign_init.as_ref())?;
+    let sw = be.work(&snet, o.batch, o.window)?;
     let train_signs = o.signs.is_some();
-    let live = snet.sign_live();
+    let live = be.sign_live(&snet);
     // auto: the random-walk spread of the reference QAT run (0.15·τ/√steps),
     // capped at its per-step move (lr/τ = 4e-3): on the 0.8B the uncapped
     // 2.3e-3 for 256 steps flipped 0.2 % of the signs in one step and diverged
@@ -541,11 +789,11 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         eprintln!(
             "sign training: {} signs in {} matrices, optimizer {} ({} B/sign state ≈ {:.2} GB, scratch {:.2} GB), τ {}, η0 {:.3e}{}, warm {} sign steps",
             live,
-            snet.n_sign_mats,
+            be.n_sign_mats(&snet),
             s.opt.name(),
             s.opt.bytes_per_sign(),
             (live as f64 * s.opt.bytes_per_sign() as f64 + live as f64 / 8.0) / 1e9,
-            sw.sg.as_ref().map(|x| x.bytes() as f64 / 1e9).unwrap_or(0.0),
+            be.sign_scratch_bytes(&sw) as f64 / 1e9,
             s.tau,
             eta0,
             if s.lr.is_none() { " (auto min(0.15·τ/√steps, 4e-3·τ))" } else { "" },
@@ -553,11 +801,11 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         );
     }
     let n_eval_b = eval_n / o.batch;
-    let eval_loss = |net: &nt::Net| -> anyhow::Result<f64> {
+    let eval_loss = |net: &B::Net| -> anyhow::Result<f64> {
         let mut s = 0.0;
         for e in 0..n_eval_b {
             let b = n_train_b + e;
-            s += nt::loss_only(c, net, &sw, &batch_ids(b), &t_ids[b], &t_p[b], k).ok_or_else(|| anyhow::anyhow!("eval failed"))?;
+            s += be.loss_only(net, &sw, &batch_ids(b), &t_ids[b], &t_p[b], k)?;
         }
         Ok(s / n_eval_b.max(1) as f64)
     };
@@ -566,7 +814,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let meta: Option<serde_json::Value> = match o.resume {
         Some(dir) => {
             let m: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json"))?)?;
-            nt::load_state(c, &snet, std::path::Path::new(&format!("{dir}/{}", m["state"].as_str().unwrap_or("")))).map_err(|e| anyhow::anyhow!(e))?;
+            be.load_state(&snet, std::path::Path::new(&format!("{dir}/{}", m["state"].as_str().unwrap_or(""))))?;
             eprintln!("resumed {dir} at step {} (epoch {}, batch {} of the epoch)", m["done"], m["epoch"], m["consumed"]);
             Some(m)
         }
@@ -588,7 +836,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
             0.5 * (1.0 + (std::f64::consts::PI * pr.min(1.0)).cos())
         }
     };
-    let mut best = (e0, nt::snapshot(c, &snet, train_signs).ok_or_else(|| anyhow::anyhow!("snapshot"))?, 0usize);
+    let mut best = (e0, be.snapshot(&snet, train_signs)?, 0usize);
     if let (Some(m), Some(dir)) = (&meta, o.resume) {
         let snap = nt::load_snap(&best.1, std::path::Path::new(&format!("{dir}/{}", m["best"].as_str().unwrap_or("")))).map_err(|e| anyhow::anyhow!(e))?;
         best = (m["best_kl"].as_f64().unwrap_or(e0), snap, m["best_step"].as_u64().unwrap_or(0) as usize);
@@ -607,6 +855,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let (resume_ep, resume_pos) = (mu("epoch") as usize, mu("consumed") as usize);
     // probe runs: stop after this many steps (the schedule still spans the full run)
     let stop_after: usize = std::env::var("CMF_NVG_STOP_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    be.prof_reset();
     let ts0 = Instant::now();
     let mut order: Vec<usize> = (0..n_train_b).collect();
     for ep in 0..o.epochs {
@@ -639,16 +888,16 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                     defer: false,
                 }
             });
-            let st = nt::step(c, &snet, &sw, &batch_ids(b), &t_ids[b], &t_p[b], k, gscale, cfg.as_ref()).ok_or_else(|| anyhow::anyhow!("step failed"))?;
+            let st = be.step(&snet, &sw, &batch_ids(b), &t_ids[b], &t_p[b], k, gscale, cfg.as_ref())?;
             if st.backward && train_signs {
                 sign_steps += 1;
                 step_flips_total += st.flips;
                 sat_total += st.saturated;
                 clamp_total += st.clamped;
             }
-            let gn = if st.backward { nt::grad_norm(c, &snet).unwrap_or(f64::NAN) } else { f64::NAN };
+            let gn = if st.backward { be.grad_norm(&snet) } else { f64::NAN };
             if !st.finite || !gn.is_finite() || st.g_nonfinite > 0 {
-                nt::zero_grads(c, &snet);
+                be.zero_grads(&snet);
                 gscale = (gscale / 2.0).max(1.0);
                 skipped += 1;
                 eprintln!("\n  non-finite step (loss {:.4}, |g| {gn:.3e}, {} non-finite sign gradients): gscale -> {gscale}", st.loss, st.g_nonfinite);
@@ -657,10 +906,10 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
             done += 1;
             let lr = o.lr * shape(done);
             let gmul = if gn > o.clip { (o.clip / gn) as f32 } else { 1.0 };
-            nt::adam(c, &snet, lr as f32, done as u32, 0.9, 0.999, 1e-8, gmul).ok_or_else(|| anyhow::anyhow!("adam failed"))?;
+            be.adam(&snet, lr as f32, done as u32, 0.9, 0.999, 1e-8, gmul)?;
             step_secs += tstep.elapsed().as_secs_f64();
             // CMF_NVG_PROF: resolve this step's timestamps (outside the timer)
-            nt::prof::step_end();
+            be.prof_step_end();
             let mut sign_note = String::new();
             if let (Some(s), Some(cf)) = (&o.signs, &cfg) {
                 let rate = st.flips as f64 / live.max(1) as f64;
@@ -689,7 +938,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                 eprintln!("\n  step {done}: held-out KL {e:.5} (best {:.5} at {})", best.0.min(e), if e < best.0 { done } else { best.2 });
                 let mut rec = serde_json::json!({ "step": done, "heldout_kl": e });
                 if let Some(s) = &o.signs {
-                    let stats = nt::sign_stats(c, &snet).ok_or_else(|| anyhow::anyhow!("sign stats"))?;
+                    let stats = be.sign_stats(&snet)?;
                     let distinct: u64 = stats.iter().map(|x| x.1).sum();
                     last_distinct = distinct;
                     let frac = distinct as f64 / live.max(1) as f64;
@@ -721,7 +970,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                 }
                 eval_log.push(rec);
                 if e < best.0 {
-                    best = (e, nt::snapshot(c, &snet, train_signs).ok_or_else(|| anyhow::anyhow!("snapshot"))?, done);
+                    best = (e, be.snapshot(&snet, train_signs)?, done);
                 }
             }
             if let Some(dir) = o.state_dir
@@ -738,7 +987,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                         let _ = std::fs::remove_file(format!("{dir}/{f}"));
                     }
                 }
-                let nb = nt::save_state(c, &snet, std::path::Path::new(&format!("{dir}/{sf}"))).map_err(|e| anyhow::anyhow!(e))?;
+                let nb = be.save_state(&snet, std::path::Path::new(&format!("{dir}/{sf}")))?;
                 nt::save_snap(&best.1, std::path::Path::new(&format!("{dir}/{bf}"))).map_err(|e| anyhow::anyhow!(e))?;
                 let m = serde_json::json!({
                     "state": sf, "best": bf, "done": done, "epoch": ep, "consumed": pos + 1, "skipped": skipped,
@@ -771,11 +1020,11 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         step_secs / (done - done0).max(1) as f64,
         train_secs
     );
-    nt::prof::report();
-    nt::restore(c, &snet, &best.1);
+    be.prof_report();
+    be.restore(&snet, &best.1)?;
     let mut sign_prov = serde_json::Value::Null;
     if let Some(s) = &o.signs {
-        let stats = nt::sign_stats(c, &snet).ok_or_else(|| anyhow::anyhow!("sign stats"))?;
+        let stats = be.sign_stats(&snet)?;
         let distinct: u64 = stats.iter().map(|x| x.1).sum();
         let per_role: serde_json::Map<String, serde_json::Value> = stats.iter().map(|(n, f, l)| (n.clone(), serde_json::json!(*f as f64 / (*l).max(1) as f64))).collect();
         eprintln!("exported bits: {:.3}% of {live} signs flipped (last eval {last_distinct})", 100.0 * distinct as f64 / live.max(1) as f64);
@@ -790,7 +1039,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
             "per_role": per_role,
         });
     }
-    let patched = nt::export(c, &snet, &smodel).map_err(|e| anyhow::anyhow!(e))?;
+    let patched = be.export(&snet, &smodel)?;
     let map: std::collections::HashMap<String, Vec<u8>> = patched.into_iter().collect();
     let specs: Vec<TensorSpec> = smodel
         .tensors

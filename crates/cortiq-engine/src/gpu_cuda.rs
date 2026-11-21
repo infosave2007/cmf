@@ -994,6 +994,15 @@ pub use gptq::{gptq_fold_chol_inv, gptq_gemm_rows_square, gptq_refine_rows};
 mod tpenc;
 pub use tpenc::{gptq_sweep, tp_encode, tp_place_q2};
 
+/// The NVG `blr` encoder's device linear algebra (the API of
+/// `gpu_wgpu::nvg_dev`, reached through `crate::nvg_dev`); declared after
+/// `kargs!`, which it uses.
+pub mod nvg_dev;
+
+/// NVG Ť (the distillation trainer of `nvg_train.rs`) and the conversion's
+/// calibration forward on this backend; declared after `kargs!`, which it uses.
+pub mod nvgt;
+
 /// MiniMax-H3 stacks (the DiT, the VAE's ViT decoder) as resident chains
 /// under a memory ceiling; declared after `kargs!`, which it uses.
 mod h3;
@@ -1101,6 +1110,11 @@ pub(crate) fn kt_start() {
 }
 
 pub(crate) fn kt_stop() {
+    kt_stop_as("qwen4 cuda")
+}
+
+/// [`kt_stop`] under another label (the NVG trainer's `CMF_NVG_KT`).
+pub(crate) fn kt_stop_as(label: &str) {
     KT_ON.store(false, Ordering::SeqCst);
     let events = std::mem::take(&mut *KT_EVENTS.lock().unwrap());
     let names = KT_NAMES.lock().unwrap();
@@ -1121,9 +1135,9 @@ pub(crate) fn kt_stop() {
     }
     let mut rows: Vec<(String, (usize, f64))> = by.into_iter().collect();
     rows.sort_by(|x, y| y.1.1.total_cmp(&x.1.1));
-    eprintln!("qwen4 cuda: kernel times of one round: {n} launches, {total:.2} ms between their events");
+    eprintln!("{label}: kernel times of one round: {n} launches, {total:.2} ms between their events");
     for (name, (c, ms)) in rows.iter().take(40) {
-        eprintln!("qwen4 cuda: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
+        eprintln!("{label}: kernel {name:<22} x{c:<5} {ms:8.3} ms  {:7.1} us each", ms * 1e3 / *c as f64);
     }
 }
 
@@ -1335,10 +1349,24 @@ impl Ctx {
         shared: usize,
         params: &mut [*mut c_void],
     ) -> Res<()> {
+        unsafe { self.launch_on(self.stream, f, grid, block, shared, params) }
+    }
+
+    /// [`Self::launch`] on `stream` (a stream of this context: the NVG
+    /// encoder's threads each queue on their own).
+    unsafe fn launch_on(
+        &self,
+        stream: cs::CUstream,
+        f: cs::CUfunction,
+        grid: (u32, u32),
+        block: u32,
+        shared: usize,
+        params: &mut [*mut c_void],
+    ) -> Res<()> {
         let timed = if KT_ON.load(Ordering::Relaxed) {
             let a = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT).ok();
             if let Some(a) = a {
-                let _ = unsafe { cu::event::record(a, self.stream) };
+                let _ = unsafe { cu::event::record(a, stream) };
             }
             a
         } else {
@@ -1358,7 +1386,7 @@ impl Ctx {
                 blockDimY: 1,
                 blockDimZ: 1,
                 sharedMemBytes: shared as u32,
-                hStream: self.stream,
+                hStream: stream,
                 attrs: &mut attr,
                 numAttrs: 1,
             };
@@ -1370,7 +1398,7 @@ impl Ctx {
                     (grid.0.max(1), grid.1.max(1), 1),
                     (block, 1, 1),
                     shared as u32,
-                    self.stream,
+                    stream,
                     params,
                 )
             }
@@ -1382,11 +1410,11 @@ impl Ctx {
         if nop != 0 && nop != f as usize && r.is_ok() {
             let (mut p, mut n) = (0u64, 0u64);
             let mut args = [std::ptr::from_mut(&mut p) as *mut c_void, std::ptr::from_mut(&mut n) as *mut c_void];
-            let _ = unsafe { cu::launch_kernel(nop as cs::CUfunction, (1, 1, 1), (32, 1, 1), 0, self.stream, &mut args) };
+            let _ = unsafe { cu::launch_kernel(nop as cs::CUfunction, (1, 1, 1), (32, 1, 1), 0, stream, &mut args) };
         }
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
-                let _ = unsafe { cu::event::record(b, self.stream) };
+                let _ = unsafe { cu::event::record(b, stream) };
                 KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
             }
         }
@@ -1506,6 +1534,59 @@ impl Ctx {
 }
 
 impl Ctx {
+    /// `count` plain f32 GEMMs of one shape, `C = α·op(A)·op(B) + β·C`
+    /// (column-major, as cuBLAS reads the arrays): operand i sits `stride`
+    /// elements after operand i - 1.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sgemm_batched(
+        &self,
+        ta: bool,
+        tb: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: u64,
+        lda: usize,
+        stride_a: usize,
+        b: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f32,
+        cptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        count: usize,
+    ) -> Res<()> {
+        let op = |t| if t { bl::cublasOperation_t::CUBLAS_OP_T } else { bl::cublasOperation_t::CUBLAS_OP_N };
+        let s = unsafe {
+            bl::cublasSgemmStridedBatched(
+                self.blas,
+                op(ta),
+                op(tb),
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha,
+                a as *const f32,
+                lda as i32,
+                stride_a as i64,
+                b as *const f32,
+                ldb as i32,
+                stride_b as i64,
+                &beta,
+                cptr as *mut f32,
+                ldc as i32,
+                stride_c as i64,
+                count as i32,
+            )
+        };
+        if s as u32 != 0 {
+            return Err(format!("cuBLAS batched gemm {count}×{m}x{n}x{k}: {s:?}"));
+        }
+        Ok(())
+    }
+
     /// `count` GEMMs of one shape in a call: operand i sits `stride`
     /// elements after operand i - 1 (f32 operands; TF32 inside unless exact).
     #[allow(clippy::too_many_arguments)]
