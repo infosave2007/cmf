@@ -397,9 +397,9 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     // — but not below the weights themselves: the stack takes no device prefix, so a card
     // that could hold them and is told to keep less runs every token on the host (a 24 GB
     // card under the 4-bit file: 19.3 GB resident, prompts of 3 000 tokens beside them).
-    // The embedding stays on the host.
+    // The embedding stays on the host, and the MTP layer drafts on CUDA only.
     let emb = model.tensor("model.embed_tokens.weight").map_or(0, |e| e.nbytes as u64);
-    let on_card: u64 = model.tensors.iter().map(|e| e.nbytes as u64).sum::<u64>().saturating_sub(emb);
+    let on_card: u64 = model.tensors.iter().filter(|e| !e.name.starts_with("mtp.")).map(|e| e.nbytes as u64).sum::<u64>().saturating_sub(emb);
     crate::gpu::wgpu_keep_at_least(on_card + on_card / 40 + (64 << 20));
     let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None, spec: Spec::default() };
     state.reset(layers.len());
