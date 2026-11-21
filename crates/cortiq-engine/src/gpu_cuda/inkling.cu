@@ -700,6 +700,153 @@ extern "C" __global__ void ink_attn_soft(float* __restrict__ S, u16* __restrict_
     for (int s = tid; s < nk; s += blockDim.x) prow[s] = f2h(srow[s] * il);
 }
 
+// ---- a prompt call's routed experts as tensor-core GEMMs over their rows ----
+// The hybrid arm's job of a grouped expert (`struct HyJob` of hyb.cu, the
+// same layout): the expert's repacked q4tp matrix and the places of its rows.
+struct HyJob {
+    u64 w;
+    u64 aux0;
+    u64 aux1;
+    u64 y;
+    u64 res;
+    int rows;
+    int kind;
+    int blk0;
+    int ystride;
+    int xoff;
+    int nr;
+    float lim;
+    int pad0, pad1, pad2;
+};
+
+// The f16 rows the expert GEMMs read, in their places: out[q] = x[src[q]].
+// Grid (total / 256), total = places · H.
+extern "C" __global__ void ink_gather16(const float* __restrict__ x, const int* __restrict__ src, int total,
+                                        u16* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int q = i / H, c = i - q * H;
+    out[i] = f2h(x[(size_t)src[q] * H + c]);
+}
+
+// A register a_m of a repacked q4tp word as f16x2 (nibble − 8): 1024 + n is
+// 0x6400 | n; one fma takes 1032 off both halves.
+__device__ __forceinline__ u32 a_h16(u32 X, int m) {
+    u32 h;
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(h) : "r"(X >> (4 * m)), "r"(0x000F000Fu), "r"(0x64006400u));
+    u32 r;
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(h), "r"(0x3C003C00u), "r"(0xE408E408u));
+    return r;
+}
+
+__device__ __forceinline__ void mma16816h(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// One expert job (`hy_moe_group`'s, up to 64 rows at places xoff / cols + j)
+// against 128 output rows of its q4tp matrix: 4 warps × MT 16-row tiles, the
+// job's rows NTL n tiles of 8. A group of 32 columns is two mma steps into a
+// fresh sum, scaled by the row's ladder rung and added (the codec's
+// arithmetic; the inputs f16, the sums f32). pair: the gate/up pair (a tile's
+// rows 8 of gate, then the same 8 of up), the softcapped SwiGLU into act
+// [place][cols_out] f16; else the down product into ys [place][rows] f32.
+// Grid (ceil(tiles / (4 MT)), jobs), 128 threads.
+#define MT 2
+#define NTL 8
+extern "C" __global__ void ink_moe_mma(const HyJob* __restrict__ jobs, const u16* __restrict__ x, int cols, int pair,
+                                       u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride)
+{
+    const HyJob jb = jobs[blockIdx.y];
+    if (jb.rows <= 0 || jb.nr <= 0) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
+    const int ntile = (jb.rows + 15) >> 4;
+    const int tbase = ((int)blockIdx.x * 4 + warp) * MT;
+    if (tbase >= ntile) return;
+    const int gpr = cols >> 5;
+    const int place0 = jb.xoff / cols, nr = jb.nr;
+    const uint2* T = (const uint2*)jb.w;
+    const unsigned char* Cc = (const unsigned char*)jb.aux0;
+    const float2* par = (const float2*)jb.aux1;
+    float2 pa[MT], pb[MT];
+#pragma unroll
+    for (int b = 0; b < MT; b++) {
+        const int tile = min(tbase + b, ntile - 1);
+        pa[b] = par[tile * 16 + gid];
+        pb[b] = par[tile * 16 + gid + 8];
+    }
+    float acc[MT][NTL][4];
+#pragma unroll
+    for (int b = 0; b < MT; b++)
+#pragma unroll
+        for (int t = 0; t < NTL; t++) acc[b][t][0] = acc[b][t][1] = acc[b][t][2] = acc[b][t][3] = 0.0f;
+    for (int g = 0; g < gpr; g++) {
+        u32 bx[NTL][4];
+        const int k0 = g * 32 + 2 * tig;
+#pragma unroll
+        for (int t = 0; t < NTL; t++) {
+            const int j = t * 8 + gid;
+            if (j < nr) {
+                const u16* xp = x + (size_t)(place0 + j) * cols + k0;
+#pragma unroll
+                for (int q = 0; q < 4; q++) bx[t][q] = *(const u32*)(xp + 8 * q);
+            } else {
+#pragma unroll
+                for (int q = 0; q < 4; q++) bx[t][q] = 0u;
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < MT; b++) {
+            const int tile = tbase + b;
+            if (tile >= ntile) break;
+            const size_t tg = (size_t)tile * gpr + g;
+            const uint2 X = T[tg * 32 + lane];
+            const float sa = exp2f(fmaf((float)Cc[tg * 16 + gid], pa[b].y, pa[b].x));
+            const float sb = exp2f(fmaf((float)Cc[tg * 16 + gid + 8], pb[b].y, pb[b].x));
+            const u32 a00 = a_h16(X.x, 0), a01 = a_h16(X.x, 1), a02 = a_h16(X.x, 2), a03 = a_h16(X.x, 3);
+            const u32 a10 = a_h16(X.y, 0), a11 = a_h16(X.y, 1), a12 = a_h16(X.y, 2), a13 = a_h16(X.y, 3);
+#pragma unroll
+            for (int t = 0; t < NTL; t++) {
+                if (t * 8 >= nr) break;
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma16816h(c, a00, a01, a02, a03, bx[t][0], bx[t][1]);
+                mma16816h(c, a10, a11, a12, a13, bx[t][2], bx[t][3]);
+                acc[b][t][0] = fmaf(sa, c[0], acc[b][t][0]);
+                acc[b][t][1] = fmaf(sa, c[1], acc[b][t][1]);
+                acc[b][t][2] = fmaf(sb, c[2], acc[b][t][2]);
+                acc[b][t][3] = fmaf(sb, c[3], acc[b][t][3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < MT; b++) {
+        const int tile = tbase + b;
+        if (tile >= ntile) break;
+#pragma unroll
+        for (int t = 0; t < NTL; t++) {
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const int j = t * 8 + 2 * tig + e;
+                if (j >= nr) continue;
+                const size_t pl = (size_t)(place0 + j);
+                if (pair) {
+                    // Inkling's softcapped SwiGLU (the cap in `lim`, the up branch's in pad0)
+                    const float gv = acc[b][t][e], uv = acc[b][t][2 + e];
+                    const float cu = __int_as_float(jb.pad0);
+                    const float v = (jb.lim * tanhf(gv / jb.lim)) * (1.0f / (1.0f + expf(-gv))) * (cu * tanhf(uv / cu));
+                    act[pl * act_stride + tile * 8 + gid] = f2h(v);
+                } else {
+                    ys[pl * ys_stride + tile * 16 + gid] = acc[b][t][e];
+                    ys[pl * ys_stride + tile * 16 + gid + 8] = acc[b][t][2 + e];
+                }
+            }
+        }
+    }
+}
+
 // The head's logits capped: cap · tanh(x / cap). Grid (V/256, n).
 extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
 {

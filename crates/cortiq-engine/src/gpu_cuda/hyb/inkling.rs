@@ -31,6 +31,17 @@ const ATILE: usize = 256;
 /// chunk are as many as fit.
 const ATT_SCORES: usize = 128 << 20;
 
+/// `CMF_INKLING_MOE_MMA=0`: a prompt call's experts through the hybrid arm's
+/// grouped tensor-core launches (32 rows a job, two bf16 planes) instead of
+/// `ink_moe_mma` (64 rows a job, f16 rows, 128 output rows a block).
+fn moe_mma_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA").as_deref() != Ok("0"))
+}
+
+/// Output tiles of 16 rows an `ink_moe_mma` block takes (4 warps × `MT`).
+const MMA_TILES: usize = 8;
+
 /// `CMF_INKLING_ATTN_GEMM=0`: a prompt call's attention a block a head and row
 /// (`ink_attn`) instead of the cuBLAS products.
 fn attn_gemm_on() -> bool {
@@ -69,6 +80,8 @@ struct Fx {
     h16: cs::CUfunction,
     f16: cs::CUfunction,
     attn_soft: cs::CUfunction,
+    gather16: cs::CUfunction,
+    moe_mma: cs::CUfunction,
     gate_norm: cs::CUfunction,
     gate_mix: cs::CUfunction,
     kv_rows: cs::CUfunction,
@@ -338,6 +351,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         attn_merge: func(module, "ink_attn_merge")?,
         h16: func(module, "ink_h16")?,
         f16: func(module, "ink_f16")?,
+        gather16: func(module, "ink_gather16")?,
+        moe_mma: func(module, "ink_moe_mma")?,
         attn_soft: func(module, "ink_attn_soft")?,
         gate_norm: func(module, "ink_gate_norm")?,
         gate_mix: func(module, "ink_gate_mix")?,
@@ -1184,7 +1199,8 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
     let fx = &d.hfx;
     let (hidden, e, k, inter) = (cfg.dim, l.e, cfg.top_k, l.inter);
     let nk = n * k;
-    let rmax = moe_rmax();
+    let mma = moe_mma_on();
+    let rmax = if mma { 64 } else { moe_rmax() };
     let jmax = e + nk.div_ceil(rmax);
     let (gi, tb) = if rmax == 64 { (1usize, 1u32) } else { (0, 2) };
     let (bpg, bpd) = (l.bpj_gu.div_ceil(tb), l.bpj_dn.div_ceil(tb));
@@ -1203,6 +1219,22 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
             kargs!(b.pidx.ptr, nk_i, k_i, e_i, rmax_i, jmax_i, l.gu_t.ptr, l.dn_t.ptr, b.gu_a.ptr, b.dn_a.ptr, b.pos.ptr, b.src.ptr, b.qq[0].ptr, b.qq[1].ptr, hid_i, inter_i, b.ys.ptr, bg_i, bd_i),
         )?;
         let tot = (nk * hidden) as u64;
+        if mma {
+            // the rows in their places as f16; gate/up (the activation in the
+            // epilogue) into f16 rows, then down into ys
+            let (tot_i, f) = (tot as i32, &d.fx);
+            c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
+            st(c, 11, tp)?;
+            let (one, zero_i, nul) = (1i32, 0i32, 0u64);
+            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            c.launch(f.moe_mma, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
+            st(c, 12, tp)?;
+            let dx = (hidden.div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            c.launch(f.moe_mma, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
+            cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
+            c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
+            return Ok(());
+        }
         c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, nk_i, hid_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr))?;
         st(c, 11, tp)?;
         let fg = fx.mmp_g[gi];
