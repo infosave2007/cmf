@@ -874,5 +874,5 @@ fn gate(p: &Pipes, enc: &ComputeCommandEncoderRef, base: &IP, g: &(Buffer, Buffe
     enc.set_buffer(4, Some(&g.2), 0);
     enc.set_buffer(5, Some(out.0), out.1);
     set_bytes_t(enc, 15, &ip);
-    grid(enc, (hidden as u64).div_ceil(256), n as u64, 1, 256);
+    grid(enc, (hidden as u64).div_ceil(8), n as u64, 1, 256);
 }

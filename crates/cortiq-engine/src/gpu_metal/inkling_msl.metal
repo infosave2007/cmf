@@ -31,9 +31,12 @@ inline float sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
 kernel void ink_mix(device const float* blk [[buffer(0)]], device const float* x [[buffer(1)]],
                     device const float* q [[buffer(2)]], device float* out [[buffer(3)]],
                     constant IP& p [[buffer(15)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                    uint nt [[threads_per_threadgroup]])
+                    uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     threadgroup float sh[32];
     threadgroup float lg[8], rn[8];
     const uint qi = tg.x, r = tg.y, H = p.H, nb = p.nb, ns = nb + 1u;
@@ -77,9 +80,12 @@ kernel void ink_mix(device const float* blk [[buffer(0)]], device const float* x
 // Weighted RMS norm of each row: grid n, 256 threads.
 kernel void ink_rms(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                     device float* xo [[buffer(2)]], constant IP& p [[buffer(15)]],
-                    uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                    uint nt [[threads_per_threadgroup]])
+                    uint3 r_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint r = r_v.x;
+    const uint nt = nt_v.x;
+
     threadgroup float sh[32];
     const uint H = p.H;
     device const float* xr = x + (ulong)r * H;
@@ -94,9 +100,12 @@ kernel void ink_rms(device const float* x [[buffer(0)]], device const float* w [
 kernel void ink_gate_down(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
                           device const float* down [[buffer(2)]], device float* d [[buffer(3)]],
                           constant IP& p [[buffer(15)]],
-                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                          uint nt [[threads_per_threadgroup]])
+                          uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     threadgroup float sh[32];
     const uint k = tg.x, r = tg.y, H = p.H;
     device const float* xr = x + (ulong)r * H;
@@ -117,33 +126,41 @@ kernel void ink_gate_down(device const float* x [[buffer(0)]], device const floa
     if (tid == 0u) d[(ulong)r * p.R + k] = ax * rsqrt(sx / (float)H + p.eps) + am * rsqrt(sm / (float)H + p.eps);
 }
 
-// Second half: grid (H/256, n).
+// Second half: a simdgroup an output channel. Grid (H/8, n), 256 threads.
 kernel void ink_gate_out(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
                          device const float* d [[buffer(2)]], device const float* F [[buffer(3)]],
                          device const float* G [[buffer(4)]], device float* out [[buffer(5)]],
                          constant IP& p [[buffer(15)]],
-                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                         uint nt [[threads_per_threadgroup]])
+                         uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]])
 {
-    const uint i = tg.x * nt + tid, r = tg.y, H = p.H, R = p.R;
+    const uint2 tg = tg_v.xy;
+
+    const uint i = tg.x * 8u + sg, r = tg.y, H = p.H, R = p.R;
     if (i >= H) return;
     device const float* dr = d + (ulong)r * R;
     float f = 0.0f, g = 0.0f;
-    for (uint k = 0u; k < R; ++k) {
+    for (uint k = lane; k < R; k += 32u) {
         f = fma(F[(ulong)i * R + k], dr[k], f);
         g = fma(G[(ulong)i * R + k], dr[k], g);
     }
-    const ulong at = (ulong)r * H + i;
-    out[at] = (1.0f - tanh(f)) * x[at] + tanh(g) * m[at];
+    f = simd_sum(f);
+    g = simd_sum(g);
+    if (lane == 0u) {
+        const ulong at = (ulong)r * H + i;
+        out[at] = (1.0f - tanh(f)) * x[at] + tanh(g) * m[at];
+    }
 }
 
 // y[r][o] = W[o]·x[r] for an f32 matrix [rows][H]: a simdgroup an output row.
 // Grid (rows/8, n), 256 threads.
 kernel void ink_fmv(device const float* W [[buffer(0)]], device const float* x [[buffer(1)]],
                     device float* y [[buffer(2)]], constant IP& p [[buffer(15)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                    uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]])
 {
+    const uint2 tg = tg_v.xy;
+
     const uint o = tg.x * 8u + sg, r = tg.y, H = p.H;
     if (o >= p.rows) return;
     device const float* w = W + (ulong)o * H;
@@ -162,9 +179,12 @@ inline float tau_of(uint pos, float alpha, float floor_) {
 kernel void ink_qr(device float* yq [[buffer(0)]], device float* yr [[buffer(1)]],
                    device const float* qs [[buffer(2)]], device const float* rs [[buffer(3)]],
                    constant IP& p [[buffer(15)]],
-                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                   uint nt [[threads_per_threadgroup]])
+                   uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                   uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     threadgroup float sh[32];
     const uint h = tg.x, r = tg.y, HD = p.HD, DR = p.DR, NH = p.NH;
     const float tu = p.full ? tau_of(p.pos0 + r, p.alpha, p.floor_) : 1.0f;
@@ -190,9 +210,12 @@ kernel void ink_kv(device const float* yk [[buffer(0)]], device const float* yv 
                    device float* rk [[buffer(6)]], device float* rv [[buffer(7)]],
                    device half* kc [[buffer(8)]], device half* vc [[buffer(9)]],
                    constant IP& p [[buffer(15)]],
-                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                   uint nt [[threads_per_threadgroup]])
+                   uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                   uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     threadgroup float sh[32];
     const uint g = tg.x, isv = tg.y, HD = p.HD, NKV = p.NKV, KC = p.KC;
     const uint C = NKV * HD, ch = g * HD + tid;
@@ -233,9 +256,11 @@ kernel void ink_attn(device const float* yq [[buffer(0)]], device const float* y
                      device const float* sinks [[buffer(2)]], device const float* table [[buffer(3)]],
                      device const half* kc [[buffer(4)]], device const half* vc [[buffer(5)]],
                      device float* out [[buffer(6)]], constant IP& p [[buffer(15)]],
-                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
 {
+    const uint2 tg = tg_v.xy;
+
     threadgroup float bias[1024];
     threadgroup float qsh[128];
     threadgroup float wm[8], wl[8];
@@ -296,9 +321,12 @@ kernel void ink_attn(device const float* yq [[buffer(0)]], device const float* y
 // o · σ(gate) in place: grid (NH*HD/256, n).
 kernel void ink_ogate(device float* o [[buffer(0)]], device const float* gt [[buffer(1)]],
                       constant IP& p [[buffer(15)]],
-                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                      uint nt [[threads_per_threadgroup]])
+                      uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     const uint W = p.NH * p.HD;
     const uint i = tg.x * nt + tid, r = tg.y;
     if (i >= W) return;
@@ -312,9 +340,12 @@ kernel void ink_post(device const float* a [[buffer(0)]], device const float* ta
                      device float* ring [[buffer(2)]], device const float* res [[buffer(3)]],
                      device float* blk [[buffer(4)]], device float* out [[buffer(5)]],
                      constant IP& p [[buffer(15)]],
-                     uint tgx [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                     uint nt [[threads_per_threadgroup]])
+                     uint3 tgx_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint tgx = tgx_v.x;
+    const uint nt = nt_v.x;
+
     const uint i = tgx * nt + tid, H = p.H, KC = p.KC;
     if (i >= H) return;
     float hist[8];
@@ -344,16 +375,21 @@ kernel void ink_post(device const float* a [[buffer(0)]], device const float* ta
 
 // dst[i] = src[i] for i < p.rows (in order with the dispatches around it).
 kernel void ink_copy(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
-                     constant IP& p [[buffer(15)]], uint i [[thread_position_in_grid]])
+                     constant IP& p [[buffer(15)]], uint3 i_v [[thread_position_in_grid]])
 {
+    const uint i = i_v.x;
+
     if (i < p.rows) dst[i] = src[i];
 }
 
 // cap · tanh(x / cap): grid (V/256, n).
 kernel void ink_softcap(device float* lg [[buffer(0)]], constant IP& p [[buffer(15)]],
-                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                        uint nt [[threads_per_threadgroup]])
+                        uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint3 nt_v [[threads_per_threadgroup]])
 {
+    const uint2 tg = tg_v.xy;
+    const uint nt = nt_v.x;
+
     const uint i = tg.x * nt + tid, r = tg.y;
     if (i >= p.V) return;
     const ulong at = (ulong)r * p.V + i;
@@ -365,9 +401,11 @@ kernel void ink_softcap(device float* lg [[buffer(0)]], constant IP& p [[buffer(
 // Router logits: a simdgroup an expert. Grid (E/8, n), 256 threads.
 kernel void ink_router(device const float* W [[buffer(0)]], device const float* x [[buffer(1)]],
                        device float* lg [[buffer(2)]], constant IP& p [[buffer(15)]],
-                       uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]])
 {
+    const uint2 tg = tg_v.xy;
+
     const uint e = tg.x * 8u + sg, r = tg.y, H = p.H;
     if (e >= p.E) return;
     device const float* w = W + (ulong)e * H;
@@ -383,9 +421,11 @@ kernel void ink_router(device const float* W [[buffer(0)]], device const float* 
 // expert (E ≤ 128), k argmax rounds over the threadgroup. Grid n, 128 threads.
 kernel void ink_select(device const float* lg [[buffer(0)]], device const float* bias [[buffer(1)]],
                        device uint* pick [[buffer(2)]], device float* wt [[buffer(3)]],
-                       constant IP& p [[buffer(15)]], uint r [[threadgroup_position_in_grid]],
+                       constant IP& p [[buffer(15)]], uint3 r_v [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]])
 {
+    const uint r = r_v.x;
+
     threadgroup float ks[128];
     threadgroup uint is[128];
     threadgroup float chosen_sc[16];
@@ -486,9 +526,11 @@ kernel void ink_moe_gu(device const uchar* q0 [[buffer(0)]], device const uchar*
                        device const ulong* bases [[buffer(4)]], device const uint* pick [[buffer(5)]],
                        device const float* x [[buffer(6)]], device float* act [[buffer(7)]],
                        constant ulong& wstride [[buffer(8)]], constant IP& p [[buffer(15)]],
-                       uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]])
 {
+    const uint3 tg = tg_v;
+
     threadgroup float lad[4][2][4 * 32];
     const uint k = tg.y, r = tg.z, inter = p.inter, gpr = p.H / 32u;
     const uint e = pick[r * p.topk + k];
@@ -522,9 +564,11 @@ kernel void ink_moe_down(device const uchar* q0 [[buffer(0)]], device const ucha
                          device const float* wt [[buffer(6)]], device const float* act [[buffer(7)]],
                          device float* y [[buffer(8)]], constant ulong& wstride [[buffer(9)]],
                          constant IP& p [[buffer(15)]],
-                         uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]])
 {
+    const uint2 tg = tg_v.xy;
+
     threadgroup float lad[4][4 * 32];
     const uint r = tg.y, H = p.H, inter = p.inter, gpr = inter / 32u;
     const uint r0 = (tg.x * 4u + sg) * 4u;

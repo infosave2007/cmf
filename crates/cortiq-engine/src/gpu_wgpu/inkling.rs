@@ -153,19 +153,33 @@ fn ink_gate_down(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_
     }
 }
 
-// ── Second half: a0 x, a1 m, a2 d, a3 F, a4 G → o0. Grid (H/256, n), 256.
+// ── Second half: a0 x, a1 m, a2 d, a3 F, a4 G → o0; 32 lanes an output
+// channel. Grid (H/8, n), 256.
 @compute @workgroup_size(256)
 fn ink_gate_out(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let i = w.x * 256u + lid; let r = w.y; let H = p.h; let R = p.r;
-    if (i >= H) { return; }
+    let sg = lid >> 5u; let lane = lid & 31u;
+    let i = w.x * 8u + sg; let r = w.y; let H = p.h; let R = p.r;
     var f = 0.0; var g = 0.0;
-    for (var k = 0u; k < R; k = k + 1u) {
-        let dk = a2[r * R + k];
-        f = f + a3[i * R + k] * dk;
-        g = g + a4[i * R + k] * dk;
+    if (i < H) {
+        for (var k = lane; k < R; k = k + 32u) {
+            let dk = a2[r * R + k];
+            f = f + a3[i * R + k] * dk;
+            g = g + a4[i * R + k] * dk;
+        }
     }
-    let at = r * H + i;
-    o0[at] = (1.0 - tanh(f)) * a0[at] + tanh(g) * a1[at];
+    red[lid] = f;
+    workgroupBarrier();
+    var fs = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) { fs = fs + red[sg * 32u + j]; }
+    workgroupBarrier();
+    red[lid] = g;
+    workgroupBarrier();
+    var gs = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) { gs = gs + red[sg * 32u + j]; }
+    if (lane == 0u && i < H) {
+        let at = r * H + i;
+        o0[at] = (1.0 - tanh(fs)) * a0[at] + tanh(gs) * a1[at];
+    }
 }
 
 // ── y[r][o] = W[o]·x[r], f32: a0 W, a1 x → o0. Grid (rows/8, n), 256 (32 lanes a row).
@@ -1331,5 +1345,5 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
 fn gate(rec: &mut Rec, base: &IP, g: &(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, usize), x: (&wgpu::Buffer, u64), m: (&wgpu::Buffer, u64), dbuf: &wgpu::Buffer, out: (&wgpu::Buffer, u64), n: usize, hidden: usize) {
     let ip = IP { r: g.3 as u32, ..*base };
     rec.go("ink_gate_down", &ip, &[(2, x.0, x.1), (3, m.0, m.1), (4, &g.0, 0), (7, dbuf, 0)], (g.3 as u32, n as u32, 1));
-    rec.go("ink_gate_out", &ip, &[(2, x.0, x.1), (3, m.0, m.1), (4, dbuf, 0), (5, &g.1, 0), (6, &g.2, 0), (7, out.0, out.1)], ((hidden as u32).div_ceil(256), n as u32, 1));
+    rec.go("ink_gate_out", &ip, &[(2, x.0, x.1), (3, m.0, m.1), (4, dbuf, 0), (5, &g.1, 0), (6, &g.2, 0), (7, out.0, out.1)], ((hidden as u32).div_ceil(8), n as u32, 1));
 }

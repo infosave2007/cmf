@@ -51,6 +51,8 @@ struct LayerD {
     post_norm: Buf,
     /// q, gate, rel from the query input's planes; k; v; o.
     qset: MmaSet,
+    /// q, gate, rel, k and v together, for a local layer's first pass (one input row).
+    qkv: Option<MmaSet>,
     kset: MmaSet,
     vset: MmaSet,
     oset: MmaSet,
@@ -253,6 +255,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let a = &l.attn;
         let (q, gt, rl, km, vm, om) = (mat(c, st, &a.q)?, mat(c, st, &a.gate)?, mat(c, st, &a.rel)?, mat(c, st, &a.k)?, mat(c, st, &a.v)?, mat(c, st, &a.o)?);
         let qset = mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs)])?;
+        let qkv = if l.sliding { Some(mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs), (&km, yk.ptr, 0, kvs, kvs), (&vm, yv.ptr, 0, kvs, kvs)])?) } else { None };
         let kset = mmaset(&[(&km, yk.ptr, 0, kvs, kvs)])?;
         let vset = mmaset(&[(&vm, yv.ptr, 0, kvs, kvs)])?;
         let oset = mmaset(&[(&om, ya.ptr, 0, hidden, hidden)])?;
@@ -300,6 +303,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             norms: [f32b(&l.in_norm[0])?, f32b(&l.in_norm[1])?, f32b(&l.in_norm[2])?],
             post_norm: f32b(&l.post_norm)?,
             qset,
+            qkv,
             kset,
             vset,
             oset,
@@ -677,9 +681,14 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let pl = |j: usize| Planes { p0: d.xp[j][0].ptr, p1: d.xp[j][1].ptr, p2: d.xp[j][1].ptr, stride: hidden };
         st(c, 2, &mut tp)?;
         // 4. the projections
-        l.qset.run(c, &d.hfx, &pl(0), hidden, n)?;
-        l.kset.run(c, &d.hfx, &pl(xk), hidden, n)?;
-        l.vset.run(c, &d.hfx, &pl(xv), hidden, n)?;
+        match (&l.qkv, one) {
+            (Some(all), true) => all.run(c, &d.hfx, &pl(0), hidden, n)?,
+            _ => {
+                l.qset.run(c, &d.hfx, &pl(0), hidden, n)?;
+                l.kset.run(c, &d.hfx, &pl(xk), hidden, n)?;
+                l.vset.run(c, &d.hfx, &pl(xv), hidden, n)?;
+            }
+        }
         let nh = cfg.nh;
         let (nh_i, kp_i) = (nh as i32, (cfg.nkv * 4) as i32);
         c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
@@ -752,7 +761,7 @@ unsafe fn gate(c: &Ctx, f: &Fx, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, 
     let r_i = r as i32;
     unsafe {
         c.launch(f.gate_down, (r as u32, n as u32), 256, 0, kargs!(x, m, g.down.ptr, r_i, eps, dbuf))?;
-        c.launch(f.gate_out, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(x, m, dbuf, g.forget.ptr, g.gain.ptr, r_i, out))
+        c.launch(f.gate_out, (hidden.div_ceil(8) as u32, n as u32), 256, 0, kargs!(x, m, dbuf, g.forget.ptr, g.gain.ptr, r_i, out))
     }
 }
 

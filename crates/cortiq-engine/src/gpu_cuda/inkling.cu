@@ -139,21 +139,30 @@ extern "C" __global__ void ink_gate_down(const float* __restrict__ x, const floa
     if (tid == 0) d[(size_t)r * R + k] = ax * rsqrtf(sx / (float)H + eps) + am * rsqrtf(sm / (float)H + eps);
 }
 
-// Second half: out = (1 − tanh(F·d))·x + tanh(G·d)·m. Grid (H/256, n).
+// Second half: out = (1 − tanh(F·d))·x + tanh(G·d)·m, a warp an output
+// channel (the lanes split the rank, a coalesced read of F's and G's rows).
+// Grid (H/8, n), 256 threads.
 extern "C" __global__ void ink_gate_out(const float* __restrict__ x, const float* __restrict__ m,
                                         const float* __restrict__ d, const float* __restrict__ F,
                                         const float* __restrict__ G, int R, float* __restrict__ out)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), r = blockIdx.y;
     if (i >= H) return;
     const float* dr = d + (size_t)r * R;
     float f = 0.0f, g = 0.0f;
-    for (int k = 0; k < R; k++) {
+    for (int k = lane; k < R; k += 32) {
         f = fmaf(F[(size_t)i * R + k], dr[k], f);
         g = fmaf(G[(size_t)i * R + k], dr[k], g);
     }
-    const size_t at = (size_t)r * H + i;
-    out[at] = (1.0f - tanhf(f)) * x[at] + tanhf(g) * m[at];
+    for (int o = 16; o > 0; o >>= 1) {
+        f += __shfl_xor_sync(FULL, f, o);
+        g += __shfl_xor_sync(FULL, g, o);
+    }
+    if (lane == 0) {
+        const size_t at = (size_t)r * H + i;
+        out[at] = (1.0f - tanhf(f)) * x[at] + tanhf(g) * m[at];
+    }
 }
 
 // y[r][o] = W[o] · x[r] for an f32 matrix [rows][H]: a warp an output row.
