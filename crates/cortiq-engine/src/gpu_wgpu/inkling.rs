@@ -1005,7 +1005,7 @@ const COOP_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
 
-struct CP { e: u32, k: u32, cols: u32, rows: u32, which: u32, p1: u32, p2: u32, p3: u32 };
+struct CP { e: u32, k: u32, cols: u32, rows: u32, which: u32, asc: f32, p2: u32, p3: u32 };
 @group(0) @binding(0) var<uniform> cp: CP;
 @group(0) @binding(1) var<storage, read> cbank: array<u32>;
 @group(0) @binding(2) var<storage, read> cui: array<u32>;
@@ -1072,7 +1072,8 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 v = vec4<f32>(cx[base], cx[base + 1u], cx[base + 2u], cx[base + 3u]);
             }
             let dst = m * KS + k4;
-            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y); cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+            let sv = v * cp.asc;
+            cm_a[dst] = f16(sv.x); cm_a[dst + 1u] = f16(sv.y); cm_a[dst + 2u] = f16(sv.z); cm_a[dst + 3u] = f16(sv.w);
         }
         for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let n = t / 8u;
@@ -1133,7 +1134,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
         let m = t / 64u;
         let n = t % 64u;
         if (m0 + m < nb && n0 + n < rows) {
-            cy[(span.x + m0 + m) * rows + n0 + n] = cm_c[m * 64u + n];
+            cy[(span.x + m0 + m) * rows + n0 + n] = cm_c[m * 64u + n] / cp.asc;
         }
     }
 }
@@ -2034,7 +2035,9 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
             // one grouped-expert product on the matrix units: (which, x, y, cols, rows)
             let coop_go = |rec: &mut Rec, pipe: &wgpu::ComputePipeline, which: u32, x: &wgpu::Buffer, y: &wgpu::Buffer, cols: usize, rows: usize| {
                 let u = rec.c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-cp"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let words: [u32; 8] = [l.e as u32, cfg.top_k as u32, cols as u32, rows as u32, which, 0, 0, 0];
+                // the activations scaled into f16's range on the way in, back on the way out
+                let asc: f32 = std::env::var("CMF_INKLING_COOP_ASC").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                let words: [u32; 8] = [l.e as u32, cfg.top_k as u32, cols as u32, rows as u32, which, asc.to_bits(), 0, 0];
                 rec.c.queue.write_buffer(&u, 0, bytemuck::cast_slice(&words));
                 let layout = pipe.get_bind_group_layout(0);
                 let bg = rec.c.device.create_bind_group(&wgpu::BindGroupDescriptor {
