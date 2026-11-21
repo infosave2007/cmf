@@ -178,10 +178,27 @@ Stage for stage the CPU encoder; what changes is where and how each stage runs.
   `qs −= F·Q[block, :]`. The decisions are the host's sequential pass.
 * *Input-side knots*: the column-sequential search carried in the latent space: `Mᵀw_j`
   for every column is one GEMM up front, and a column's error reaches the others as
-  `Mᵀe_j = (Mᵀw_j − g_j K s_j)/Uc[j,j]` (no m-length vector in the sequential part); a
-  128-column block runs in one 512-thread workgroup (lanes unrolled in registers, argmin
-  and dot products by subgroup operations, two barriers per flip), the trailing feedback
-  `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a GEMM.
+  `Mᵀe_j = (Mᵀw_j − g_j K s_j)/Uc[j,j]` (no m-length vector in the sequential part). The
+  flips of a 128-column block run on the host thread that encodes the tensor
+  (`gv_block_host`); the trailing feedback `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a device GEMM.
+  The search is sequential twice over — a column's target carries the errors of the columns
+  before it, and a flip changes every candidate of the next one — so a device runs it as one
+  block of threads on one multiprocessor, about a microsecond a flip whatever the rank, with
+  the rest of the card idle. A flip is one pass over r floats (the update `ks −= 2s·K[row]`,
+  every candidate's gain `(−4g²s)·(ks − kd·s) + (4gs)·bv`, the minimum of each 16
+  candidates) in vector registers, about 0.3 µs at r = 776, and every tensor and candidate in
+  flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
+  come down in two reads, its signs and error rows go back in two writes. The gain is written
+  as the device kernel writes it — the difference first, the last product and sum fused: the
+  two terms cancel near the stop test, and a gain summed from them loses the digits the test
+  reads. Elementwise IEEE operations and f64 sums: the result does not depend on the vector
+  width (x86-64 needs AVX2 and FMA; without them the device's kernel runs).
+  `CMF_NVG_GV=device` runs the flips in the device's kernel (one workgroup or block, lanes
+  unrolled in registers, argmin and dot products by subgroup operations): the same search
+  with its sums in another order, so two files differ in the fourth digit of a tensor's
+  error. After the 0.8B's reference training the held-out KL of four conversions is 1.4622
+  and 1.4546 with the device's kernel (blocks of 1024 and 256 threads), 1.4669 and 1.4595
+  with the host's flips (the gain summed plainly, and fused): one spread.
 * *Errors* `tr(E X Eᵀ)` (X = H, the raw fit Gram, the held-out Gram) from the factor-sized
   expansion `tr(WXWᵀ) − 2Σ⟨hsl_p, WX·gs_p⟩ + Σ⟨hsl_pᵀhsl_q, gs_pᵀX gs_q⟩`, read back at once.
 * Flip tolerances are 1e-7 relative in f32 and the column scale converges to 1e-8
@@ -406,15 +423,16 @@ backend the process runs on. The CUDA twin keeps the arithmetic class (f32) and 
   STRSV / STRSM for the solves and the inverse. A failed pivot grows the ridge ×100, as on the host.
 * *Latents*: the Householder tridiagonalisation as kernels (four launches a reflector), the host's f64 bisection +
   inverse iteration (`tridiag_top`, shared with wgpu), the compact-WY back-transform as GEMMs.
-* *Knots*: the blocked output-side flips (32 ranks a block, the rest of `qs` by one GEMM) and the input-side column
-  search of a 128-column block in one block of 256 threads (`CMF_NVG_GV_WS`; the lanes of a thread in registers,
-  argmin and dot products by warp shuffles), the trailing feedback a GEMM. Ranks up to 4096. A flip of the search
-  is one barrier: the warps' best candidates go to shared memory and every thread merges them itself; a candidate
-  carries its diagonal of K, so the winner's acceptance test reads nothing from the matrix.
-* *Lanes.* A column search is one block on one multiprocessor for tens of milliseconds a launch, and on one stream
-  it holds every other launch back. So a job thread queues on a lane of its own — a stream and a cuBLAS handle
-  (`nvg_dev::private_lane`, pooled and handed on) — and takes no lock: the tensors in flight (`CMF_NVG_JOBS`)
-  overlap on the card. The two candidates of a tensor (two paths at rank r, one path at the same bits) are built
+* *Knots*: the blocked output-side flips (32 ranks a block, the rest of `qs` by one GEMM); the input-side column
+  search's flips on the host (§4.1), its feedback a GEMM. The device kernel of the search (`CMF_NVG_GV=device`)
+  takes a 128-column block in one block of 256 threads (`CMF_NVG_GV_WS`; the lanes of a thread in registers,
+  argmin and dot products by warp shuffles; ranks up to 4096): a flip is one barrier — the warps' best candidates
+  go to shared memory and every thread merges them itself — and a candidate carries its diagonal of K, so the
+  winner's acceptance test reads nothing from the matrix.
+* *Lanes.* On the backend's one stream every encoder call of every thread waits its turn under the context's
+  lock, so tensors in flight overlap only on the host. A job thread queues on a lane of its own instead — a stream
+  and a cuBLAS handle (`nvg_dev::private_lane`, pooled and handed on) — and takes no lock: the tensors in flight
+  (`CMF_NVG_JOBS`) overlap on the card. The two candidates of a tensor (two paths at rank r, one path at the same bits) are built
   on two threads with a lane each as well (`CMF_NVG_CAND_THREADS=0`: one after the other). The results do not
   depend on any of it: every tensor and candidate is computed from its own matrices and the shared read-only
   weight and Grams. `CMF_NVG_CUDA_LANES=0` puts everything back on the backend's one stream.
@@ -532,22 +550,36 @@ reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `
 |---|---:|---:|
 | calibration of a layer | 2.6 s | 0.4–0.5 s |
 | input contexts of a layer | 0.1 s | 0.1 s |
-| encode of a layer (6–7 tensors in flight) | 16.6–18.0 s | 7.2–8.7 s |
-| whole conversion, 24 layers | 492 s | 216 s |
+| encode of a layer (three tensors in flight) | 16.6–18.0 s | 1.5–1.7 s |
+| whole conversion, 24 layers | 492 s | 64 s |
 | teacher top-64 pass | 42.7k tok/s | 55.5k tok/s |
-| training step, 4096 tokens | 0.69 s | 0.34 s |
-| the reference training, whole run | 227 s | 96 s |
+| training step, 4096 tokens | 0.69 s | 0.31 s |
+| the reference training, whole run | 227 s | 102 s |
 
 Inside the encoder, layer 0 with one tensor in flight (seconds; `CMF_NVG_PROF=1`):
 
 | tensor | stage | wgpu | CUDA |
 |---|---|---:|---:|
-| `in_proj_qkv` 6144×1024 | gauge rotation (polar) / g solves / ℓ solves / input-side search / eigenpairs | 0.75 / 0.66 / 0.40 / 0.34 / 0.13 | 0.13 / 0.13 / 0.07 / 0.30 / 0.10 |
-| `down_proj` 1024×3584 | g solves / input-side search | 1.59 / 2.11 | 0.42 / 2.07 |
+| `in_proj_qkv` 6144×1024 | gauge rotation (polar) / g solves / ℓ solves / input-side search / eigenpairs | 0.75 / 0.66 / 0.40 / 0.34 / 0.13 | 0.13 / 0.13 / 0.07 / 0.09 / 0.10 |
+| `down_proj` 1024×3584 | g solves / input-side search | 1.59 / 2.11 | 0.42 / 0.48 |
 
-The linear algebra is 3–6 times faster; the column-sequential input-side search runs on one multiprocessor on
-either backend and is what remains (a factorisation of the g step: 2 ms at n = 1024, 7 ms at n = 3584, 78 of them
-a tensor). The q1g repack (`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
+(The wgpu column is the device's search kernel, measured before the flips moved to the host; with them the wgpu
+encoder takes layer 0 in 14.2 s with one tensor in flight, 17.8 s with its kernel.)
+
+The linear algebra is 3–6 times faster on CUDA. The column-sequential input-side search was what remained — one
+block on one multiprocessor on either backend, 0.9 µs a flip here (1.57 s of `down_proj`) — until its flips
+moved to the host thread (§4.1): 0.27 µs a flip, transfers included. Layer 0 on CUDA, warm kernels, a quiet card,
+one tensor in flight and four:
+
+| | one | four |
+|---|---:|---:|
+| the backend's one stream, the search in the device's kernel | 6.0 s | 5.9 s |
+| a lane a thread, the two candidates on two threads (§8.1) | 5.2 s | 4.3 s |
+| and the flips on the host | 2.7 s | 1.5 s |
+
+The whole conversion: 202 s, 141 s, 64 s. The lanes and the candidate threads do not change the file (one sha256
+with and without them); the host's flips give another file of the same quality (§4.1). The q1g repack
+(`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
 
 Qwen3.8-27B at 0.55 bpw. The trainer: the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and
 signs. The encoder: one layer from the q8_2f weights, one tensor in flight, 32 768 + 4 096 calibration tokens.

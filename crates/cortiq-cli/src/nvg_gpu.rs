@@ -676,6 +676,11 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
 
 /// Input-side knots (see `nvg::gptq_v`), in the latent space.
 fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
+    gptq_v_on(md, c, pi, gv_on_host())
+}
+
+/// [`gptq_v_d`] with the flips on the host or in the device's kernel.
+fn gptq_v_on(md: &mut ModelD, c: &TCtxD, pi: usize, host: bool) -> u64 {
     let (n, r) = (md.n, md.r);
     let np = md.paths.len();
     let mm = md.hsl(pi);
@@ -695,17 +700,303 @@ fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
     dv::permute_rows(&md.paths[pi].sv, &s, &c.hc.perm_buf, false);
     let ks0 = dv::mm(&s, false, &k, false);
     let eg = DMat::zeros(1, 128 * r + n);
-    let cnt = DMat::zeros(1, 4);
-    let mut b0 = 0;
-    while b0 < n {
-        let b1 = (b0 + 128).min(n);
-        dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, *FLIP_TOL_V);
-        b0 = b1;
-    }
+    let flips = if host {
+        // the columns' flips on this thread, the feedback between blocks on the device
+        let kh = k.to_f32();
+        let mut hs = GvHost::new(r, &kh);
+        let mut flips = 0u64;
+        let mut b0 = 0;
+        while b0 < n {
+            let b1 = (b0 + 128).min(n);
+            flips += gv_block_host(&mut hs, &kh, &bv, &s, &ks0, &c.hc.uc, &eg, b0, b1, 4 * r, *FLIP_TOL_V);
+            b0 = b1;
+        }
+        flips
+    } else {
+        let cnt = DMat::zeros(1, 4);
+        let mut b0 = 0;
+        while b0 < n {
+            let b1 = (b0 + 128).min(n);
+            dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, *FLIP_TOL_V);
+            b0 = b1;
+        }
+        cnt.to_f32()[0].to_bits() as u64
+    };
     dv::permute_rows(&s, &md.paths[pi].sv, &c.hc.perm_buf, true);
     dv::scatter_vec(&eg, 128 * r, &md.paths[pi].g, &c.hc.perm_buf, n);
     md.paths[pi].invalidate();
-    cnt.to_f32()[0].to_bits() as u64
+    flips
+}
+
+/// Where the input-side search's flips run: on the calling thread (the
+/// default) or in the device's kernel (`CMF_NVG_GV=device`, and a host
+/// without a hardware fused multiply-add).
+///
+/// The search is sequential twice over — a column's target carries the
+/// errors of the columns before it, and a flip changes every candidate of
+/// the next one — so on the device it is one block of threads on one
+/// multiprocessor: about a microsecond a flip at any rank, 43 s of a 27B
+/// `down_proj`'s 56 on either backend, with the rest of the card idle. A
+/// flip is a pass over r floats; a host core does that in vector registers
+/// several times faster, and every tensor and candidate in flight has a core
+/// of its own. The products between blocks stay on the device.
+fn gv_on_host() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_GV").as_deref() != Ok("device") && host_fma());
+    *ON
+}
+
+/// Relative convergence of a column's scale between flip rounds on the host
+/// (`CMF_NVG_GJ_TOL`, default 1e-8 as in the device kernels).
+fn gv_gj_tol() -> f32 {
+    static T: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_GJ_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-8));
+    *T
+}
+
+/// Scratch of the host search: the column in flight and the candidates' terms.
+struct GvHost {
+    /// diag(K)
+    kd: Vec<f32>,
+    s: Vec<f32>,
+    ks: Vec<f32>,
+    bv: Vec<f32>,
+    /// kd·s
+    kds: Vec<f32>,
+    /// a·s with a = −4·gj²
+    a_s: Vec<f32>,
+    /// 4·gj·s·bv: a candidate's gain is `a_s·(ks − kds) + bp`
+    bp: Vec<f32>,
+    d: Vec<f32>,
+    /// the minimum of each chunk of [`GV_CH`] candidates
+    cm: Vec<f32>,
+    zero: Vec<f32>,
+}
+
+/// Candidates a chunk of the flip pass holds (its minimum is kept beside).
+const GV_CH: usize = 16;
+
+impl GvHost {
+    fn new(r: usize, k: &[f32]) -> GvHost {
+        let z = || vec![0f32; r];
+        GvHost { kd: (0..r).map(|x| k[x * r + x]).collect(), s: z(), ks: z(), bv: z(), kds: z(), a_s: z(), bp: z(), d: z(), cm: vec![0f32; r.div_ceil(GV_CH)], zero: z() }
+    }
+}
+
+/// One pass of the search over a column's r candidates: the last flip's
+/// update `ks −= c·K[row]`, every candidate's gain
+/// `d = (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv` as the device kernel writes it —
+/// the difference `ks − kd·s` first: it is small beside its two terms, and a
+/// gain summed from the large terms loses the digits the stop test reads —
+/// and the minimum of each chunk. The last product and sum are one fused
+/// multiply-add, as the device compiler makes them: near the stop test the
+/// two terms cancel, and a product rounded before the sum leaves noise the
+/// size of the test's tolerance (the fit then ends 0.7 % higher). Elementwise
+/// IEEE operations: the values do not depend on the vector width.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gv_pass_body(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    let r = ks.len();
+    let (krow, kds, a_s, bp, d) = (&krow[..r], &kds[..r], &a_s[..r], &bp[..r], &mut d[..r]);
+    for (ci, m) in cm.iter_mut().enumerate() {
+        let o = ci * GV_CH;
+        let end = (o + GV_CH).min(r);
+        if end - o == GV_CH {
+            let (ks_c, k_c, kds_c, as_c, bp_c, d_c) = (&mut ks[o..end], &krow[o..end], &kds[o..end], &a_s[o..end], &bp[o..end], &mut d[o..end]);
+            for l in 0..GV_CH {
+                let v = ks_c[l] - c * k_c[l];
+                ks_c[l] = v;
+                d_c[l] = as_c[l].mul_add(v - kds_c[l], bp_c[l]);
+            }
+            // the chunk's minimum as a tree of pairwise picks (vector compares)
+            let mut t = [0f32; GV_CH / 2];
+            for l in 0..GV_CH / 2 {
+                t[l] = if d_c[l + GV_CH / 2] < d_c[l] { d_c[l + GV_CH / 2] } else { d_c[l] };
+            }
+            let mut w = GV_CH / 4;
+            while w >= 1 {
+                for l in 0..w {
+                    t[l] = if t[l + w] < t[l] { t[l + w] } else { t[l] };
+                }
+                w /= 2;
+            }
+            *m = t[0];
+        } else {
+            let mut mm = f32::INFINITY;
+            for x in o..end {
+                let v = ks[x] - c * krow[x];
+                ks[x] = v;
+                let dx = a_s[x].mul_add(v - kds[x], bp[x]);
+                d[x] = dx;
+                if dx < mm {
+                    mm = dx;
+                }
+            }
+            *m = mm;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gv_pass_fma(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    gv_pass_body(ks, krow, c, kds, a_s, bp, d, cm)
+}
+
+/// [`gv_pass_body`] with the machine's fused multiply-add in vector
+/// registers (x86-64: AVX2 + FMA, which [`gv_on_host`] has checked).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gv_pass(ks: &mut [f32], krow: &[f32], c: f32, kds: &[f32], a_s: &[f32], bp: &[f32], d: &mut [f32], cm: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the host search runs only where `host_fma()` found both features.
+        unsafe { gv_pass_fma(ks, krow, c, kds, a_s, bp, d, cm) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    gv_pass_body(ks, krow, c, kds, a_s, bp, d, cm)
+}
+
+/// The host has a hardware fused multiply-add in its vector registers (the
+/// host search's pass is built on it; without one it would go through a
+/// software fma).
+fn host_fma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
+}
+
+/// `y −= u·x`.
+#[inline]
+fn gv_axpy(y: &mut [f32], u: f32, x: &[f32]) {
+    for (a, b) in y.iter_mut().zip(x) {
+        *a -= u * *b;
+    }
+}
+
+/// The candidate of the lowest gain, lowest index first among equals (the
+/// chunk minima of the last pass, then the chunk itself).
+#[inline]
+fn gv_argmin(d: &[f32], cm: &[f32]) -> Option<(usize, f32)> {
+    let mut best = f32::INFINITY;
+    let mut bc = usize::MAX;
+    for (ci, &m) in cm.iter().enumerate() {
+        if m < best {
+            best = m;
+            bc = ci;
+        }
+    }
+    if bc == usize::MAX {
+        return None;
+    }
+    let o = bc * GV_CH;
+    let end = (o + GV_CH).min(d.len());
+    (o..end).find(|&x| d[x] == best).map(|x| (x, best))
+}
+
+/// Columns `b0..b1` of the input-side search on the host — the arithmetic
+/// of the device's `gv_block` kernel (`nd_gv_block` / the wgpu twin): a
+/// column's target less the feedback of the block's earlier columns, its
+/// scale, greedy single flips while the best one gains more than `tol`
+/// (at most `max_flips` a round, three rounds, the scale refitted between),
+/// its error row for the columns after. Sums in f64. The block's signs, its
+/// error rows and scales go back to the device, where the trailing feedback
+/// `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is one GEMM. Returns the flips.
+#[allow(clippy::too_many_arguments)]
+fn gv_block_host(h: &mut GvHost, k: &[f32], bv: &DMat, s: &DMat, ks0: &DMat, uc: &DMat, eg: &DMat, b0: usize, b1: usize, max_flips: usize, tol: f32) -> u64 {
+    let (n, r) = (bv.r, bv.c);
+    let nb = b1 - b0;
+    // the block's rows of BV, S and K·S, and its square of Uc, in two downloads
+    let rows = DMat::zeros(3 * nb, r);
+    dv::copy_range(bv, b0 * r, &rows, 0, nb * r);
+    dv::copy_range(s, b0 * r, &rows, nb * r, nb * r);
+    dv::copy_range(ks0, b0 * r, &rows, 2 * nb * r, nb * r);
+    let ub = DMat::zeros(nb, nb);
+    dv::scale_rc(nb, nb, Some((uc, b0 * n + b0, n)), (&ub, 0, nb), None, None, 0, 1.0, 0.0);
+    let (rows, ub) = (rows.to_f32(), ub.to_f32());
+    let (bvb, sb_, ksb) = (&rows[..nb * r], &rows[nb * r..2 * nb * r], &rows[2 * nb * r..]);
+    // out: the block's signs, then its error rows; the scales apart
+    let mut out = vec![0f32; 2 * nb * r];
+    let mut gjs = vec![0f32; nb];
+    let gjtol = gv_gj_tol();
+    let dot = |a: &[f32], b: &[f32]| -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() };
+    let mut flips = 0u64;
+    for j in 0..nb {
+        h.s.copy_from_slice(&sb_[j * r..(j + 1) * r]);
+        h.ks.copy_from_slice(&ksb[j * r..(j + 1) * r]);
+        h.bv.copy_from_slice(&bvb[j * r..(j + 1) * r]);
+        {
+            let (_, errs) = out.split_at(nb * r);
+            for jj in 0..j {
+                gv_axpy(&mut h.bv, ub[jj * nb + j], &errs[jj * r..(jj + 1) * r]);
+            }
+        }
+        let neg = |h: &mut GvHost| {
+            h.s.iter_mut().for_each(|v| *v = -*v);
+            h.ks.iter_mut().for_each(|v| *v = -*v);
+        };
+        let mut gj = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+        if gj < 0.0 {
+            neg(h);
+            gj = -gj;
+        }
+        for _round in 0..3 {
+            // a candidate's gain: (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv; s is ±1, so
+            // a flip negates its three terms exactly
+            let (a, b) = (-4.0 * gj * gj, 4.0 * gj);
+            for x in 0..r {
+                h.kds[x] = h.kd[x] * h.s[x];
+                h.a_s[x] = a * h.s[x];
+                h.bp[x] = (b * h.s[x]) * h.bv[x];
+            }
+            gv_pass(&mut h.ks, &h.zero, 0.0, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+            let mut nf = 0usize;
+            while nf < max_flips {
+                let Some((bi, best)) = gv_argmin(&h.d, &h.cm) else { break };
+                if best >= -tol * (gj * gj * h.kd[bi] + 1.0e-30) {
+                    break;
+                }
+                let sb = h.s[bi];
+                h.s[bi] = -sb;
+                h.kds[bi] = -h.kds[bi];
+                h.a_s[bi] = -h.a_s[bi];
+                h.bp[bi] = -h.bp[bi];
+                gv_pass(&mut h.ks, &k[bi * r..(bi + 1) * r], 2.0 * sb, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+                nf += 1;
+            }
+            flips += nf as u64;
+            let mut g2 = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+            if g2 < 0.0 {
+                neg(h);
+                g2 = -g2;
+            }
+            let done = nf == 0 || (g2 - gj).abs() <= gjtol * gj.abs();
+            gj = g2;
+            if done {
+                break;
+            }
+        }
+        let ujj = ub[j * nb + j];
+        let (signs, errs) = out.split_at_mut(nb * r);
+        signs[j * r..(j + 1) * r].copy_from_slice(&h.s);
+        for (x, o) in errs[j * r..(j + 1) * r].iter_mut().enumerate() {
+            *o = (h.bv[x] - gj * h.ks[x]) / ujj;
+        }
+        gjs[j] = gj;
+    }
+    let up = DMat::from_f32(2 * nb, r, &out);
+    dv::copy_range(&up, 0, s, b0 * r, nb * r);
+    dv::copy_range(&up, nb * r, eg, 0, nb * r);
+    let gd = DMat::from_f32(1, nb, &gjs);
+    dv::copy_range(&gd, 0, eg, 128 * r + b0, nb);
+    if b1 < n {
+        dv::gemm_v(n - b1, r, nb, -1.0, dv::V { m: uc, off: b0 * n + b1, ld: n, t: true }, dv::V { m: eg, off: 0, ld: r, t: false }, 1.0, bv, b1 * r, r, None);
+    }
+    flips
 }
 
 /// Discrete-knot refinement alternating with the exact metric; a step is
@@ -1116,18 +1407,26 @@ mod tests {
         let su = bd.paths[0].su.to_f64();
         let diff = su.iter().zip(&b.paths[0].su.d).filter(|(x, y)| x != y).count();
         assert!(diff * 200 <= su.len(), "flip_u: {diff} of {} signs differ ({nf} vs {nfd} flips)", su.len());
-        // input-side search from the same model
+        // input-side search from the same model: the flips on the host (the
+        // default) and in the device's kernel, each against the f64 encoder
         let mut g = base.clone();
         nvg::gptq_v(&mut g, &tc, 1);
-        let mut gd = model_to_dev(&base);
-        gptq_v_d(&mut gd, &c, 1);
-        let sv = gd.paths[1].sv.to_f64();
-        let diff = sv.iter().zip(&g.paths[1].sv.d).filter(|(x, y)| x != y).count();
-        assert!(diff * 100 <= sv.len(), "gptq_v: {diff} of {} signs differ", sv.len());
-        let gg = gd.paths[1].g.to_f64();
-        assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v g {}", reld(&gg, &g.paths[1].g));
-        let (e, ed) = (err_cpu(&f, &g, &f.hc.hf), herr_d(&gd, &c, Metric::H));
-        assert!((e - ed).abs() <= 1e-2 * e, "gptq_v err {ed} vs {e}");
+        let e = err_cpu(&f, &g, &f.hc.hf);
+        for host in [true, false] {
+            if host && !host_fma() {
+                continue;
+            }
+            let mut gd = model_to_dev(&base);
+            let nfd = gptq_v_on(&mut gd, &c, 1, host);
+            let sv = gd.paths[1].sv.to_f64();
+            let diff = sv.iter().zip(&g.paths[1].sv.d).filter(|(x, y)| x != y).count();
+            eprintln!("gptq_v, flips on the {}: {nfd} flips, {diff} of {} signs differ from the f64 encoder's", if host { "host" } else { "device" }, sv.len());
+            assert!(diff * 100 <= sv.len(), "gptq_v (host {host}): {diff} of {} signs differ", sv.len());
+            let gg = gd.paths[1].g.to_f64();
+            assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v (host {host}) g {}", reld(&gg, &g.paths[1].g));
+            let ed = herr_d(&gd, &c, Metric::H);
+            assert!((e - ed).abs() <= 1e-2 * e, "gptq_v (host {host}) err {ed} vs {e}");
+        }
     }
 
     /// Whole-tensor driver: a valid payload at the rank rule, the held-out

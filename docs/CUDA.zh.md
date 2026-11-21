@@ -540,7 +540,8 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
 | `CMF_NVG_JOBS=N` | NVG 转换中一层同时编码的张量数，默认 3 |
 | `CMF_NVG_CUDA_LANES=0` | NVG 编码器的线程都走后端的同一条流（在显卡上不重叠） |
 | `CMF_NVG_CAND_THREADS=0` | 一个张量的两个候选依次构建 |
-| `CMF_NVG_GV_WS=N` | NVG 按列搜索的块的线程数，默认 256 |
+| `CMF_NVG_GV=device` | NVG 按列搜索的翻转在显卡内核里做，而不是在主机上 |
+| `CMF_NVG_GV_WS=N` | 该内核的块的线程数，默认 256 |
 | `CMF_NVG_PROF=1`、`CMF_NVG_KT=N` | NVG 训练器各阶段的时间；其第 N 步的内核时间 |
 
 ## 限制

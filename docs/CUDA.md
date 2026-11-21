@@ -613,7 +613,8 @@ gives the same bytes.
 | `CMF_NVG_JOBS=N` | tensors of a layer in flight in the NVG conversion, 3 by default |
 | `CMF_NVG_CUDA_LANES=0` | the NVG encoder's threads on the backend's one stream (no overlap on the card) |
 | `CMF_NVG_CAND_THREADS=0` | a tensor's two candidates one after the other |
-| `CMF_NVG_GV_WS=N` | threads of the NVG column search's block, 256 by default |
+| `CMF_NVG_GV=device` | the NVG column search's flips in the device kernel instead of on the host |
+| `CMF_NVG_GV_WS=N` | threads of the device kernel's block, 256 by default |
 | `CMF_NVG_PROF=1`, `CMF_NVG_KT=N` | the NVG trainer's time per phase; the kernel times of its step N |
 
 ## Limits
