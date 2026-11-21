@@ -607,6 +607,14 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
     use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
     let routed = end > cfg.dense_range();
     if routed && !crate::gpu::block_route_on() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "maxwell_moe: past {} positions the attention picks its blocks, which this backend's graphs do not do; \
+                 the sequence continues on the host (the CUDA backend, CMF_GPU=cuda, keeps it on the card)",
+                cfg.dense_range()
+            );
+        }
         return None;
     }
     let last = layers.len().checked_sub(1)?;
