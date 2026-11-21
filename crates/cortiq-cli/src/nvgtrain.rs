@@ -351,7 +351,7 @@ fn mask_and_cut(
     t_ids: &[Vec<u32>],
     t_p: &[Vec<f32>],
 ) -> anyhow::Result<CmfModel> {
-    use crate::compress::{cmfio, dtgma, heal_gpu};
+    use crate::compress::heal_gpu;
     anyhow::ensure!(keep > 0.0 && keep < 1.0, "--mask-keep {keep}: a fraction in (0, 1)");
     let k = o.topk;
     let mut mnet = nt::Net::load(c, &smodel, true, true, None).map_err(|e| anyhow::anyhow!(e))?;
@@ -366,8 +366,17 @@ fn mask_and_cut(
         }
         Ok(s / n_eval_b.max(1) as f64)
     };
+    let cfg = mask_cfg(o, keep);
+    let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
+    let rep = heal_gpu::train_masks(&heal_gpu::WgMaskNet(c, &mnet), n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
+    drop((mw, mnet));
+    cut_by_masks(&smodel, keep, o, &rep)
+}
+
+/// The DTG-MA knobs of `--mask-keep` (`CMF_DTGMA_*`).
+fn mask_cfg(o: &NvgTrainOpts, keep: f64) -> crate::compress::heal_gpu::MaskCfg {
     let knob = |n: &str, d: f64| std::env::var(format!("CMF_DTGMA_{n}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let cfg = heal_gpu::MaskCfg {
+    crate::compress::heal_gpu::MaskCfg {
         window: o.window,
         batch: o.batch,
         keep_frac: keep,
@@ -383,10 +392,13 @@ fn mask_and_cut(
         train_from: 0,
         soft: false,
         max_batches: 0,
-    };
-    let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
-    let rep = heal_gpu::train_masks(c, &mnet, n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
-    drop((mw, mnet));
+    }
+}
+
+/// Keep the `keep` fraction of the MLP neurons the trained gates rank
+/// highest and write the cut model next to the output (`<output>.masked.cmf`).
+fn cut_by_masks(smodel: &CmfModel, keep: f64, o: &NvgTrainOpts, rep: &crate::compress::heal_gpu::MaskReport) -> anyhow::Result<CmfModel> {
+    use crate::compress::{cmfio, dtgma};
     let widths: Vec<usize> = rep.logits.iter().map(Vec::len).collect();
     let total = (widths.iter().sum::<usize>() as f64 * keep).round() as usize;
     let floor: Vec<usize> = widths.iter().map(|&w| ((w as f64 * 0.25) as usize).div_ceil(128) * 128).collect();
@@ -405,7 +417,7 @@ fn mask_and_cut(
         "keep": keep, "widths": keeps, "hard_loss": rep.nll_hard, "open_loss": rep.nll_open,
         "pruned_at_selection": rep.pruned, "step": rep.step, "steps": rep.steps, "sec_per_step": rep.sec_per_step,
     });
-    let bytes = cmfio::subset_ffn(&smodel, &cut, &keep_idx, &|h| cmfio::provenance_set(h, "dtgma", prov.clone()))?;
+    let bytes = cmfio::subset_ffn(smodel, &cut, &keep_idx, &|h| cmfio::provenance_set(h, "dtgma", prov.clone()))?;
     eprintln!(
         "nvg-train: {} of {} MLP neurons kept ({:.1} %) → {} ({:.3} GB); widths {}",
         keeps.iter().sum::<usize>(),
@@ -596,8 +608,49 @@ impl Backend for Cu {
     fn prof_report(&self) {
         cu::prof::report()
     }
-    fn mask_and_cut(&self, _: CmfModel, _: f64, _: &NvgTrainOpts, _: usize, _: usize, _: &dyn Fn(usize) -> Vec<u32>, _: &[Vec<u32>], _: &[Vec<f32>]) -> anyhow::Result<CmfModel> {
-        anyhow::bail!("--mask-keep (DTG-MA) runs on the wgpu trainer: drop CMF_GPU=cuda for this step")
+    fn mask_and_cut(&self, smodel: CmfModel, keep: f64, o: &NvgTrainOpts, n_train_b: usize, n_eval_b: usize, batch_ids: &dyn Fn(usize) -> Vec<u32>, t_ids: &[Vec<u32>], t_p: &[Vec<f32>]) -> anyhow::Result<CmfModel> {
+        use crate::compress::heal_gpu;
+        anyhow::ensure!(keep > 0.0 && keep < 1.0, "--mask-keep {keep}: a fraction in (0, 1)");
+        let k = o.topk;
+        let mut mnet = cu::Net::load(&smodel, true, None).map_err(|e| anyhow::anyhow!(e))?;
+        mnet.enable_masks().map_err(|e| anyhow::anyhow!(e))?;
+        let mw = cu::Work::new(&mnet, o.batch, o.window).map_err(|e| anyhow::anyhow!(e))?;
+        // the gates alone are trained: the metric's gradients of a step are dropped
+        let step = |b: usize, gs: f32| {
+            let st = cu::step(&mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k, gs, None).ok()?;
+            cu::zero_grads(&mnet).ok()?;
+            Some(st)
+        };
+        let val = || -> anyhow::Result<f64> {
+            let mut s = 0.0;
+            for e in 0..n_eval_b {
+                let b = n_train_b + e;
+                s += cu::loss_only(&mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k).map_err(|e| anyhow::anyhow!("eval: {e}"))?;
+            }
+            Ok(s / n_eval_b.max(1) as f64)
+        };
+        let cfg = mask_cfg(o, keep);
+        let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
+        let rep = heal_gpu::train_masks(&CuMaskNet(&mnet), n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
+        drop((mw, mnet));
+        cut_by_masks(&smodel, keep, o, &rep)
+    }
+}
+
+/// The CUDA trainer's net as the mask loop's [`crate::compress::heal_gpu::MaskNet`].
+#[cfg(feature = "cuda")]
+struct CuMaskNet<'a>(&'a cu::Net);
+
+#[cfg(feature = "cuda")]
+impl crate::compress::heal_gpu::MaskNet for CuMaskNet<'_> {
+    fn mask_widths(&self) -> Vec<usize> {
+        self.0.mask_widths()
+    }
+    fn set_masks(&self, s: &[Vec<f32>]) -> Option<()> {
+        self.0.set_masks(s).ok()
+    }
+    fn mask_grads(&self) -> Option<Vec<Vec<f32>>> {
+        self.0.mask_grads().ok()
     }
 }
 

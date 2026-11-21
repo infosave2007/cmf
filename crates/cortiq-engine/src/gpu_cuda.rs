@@ -1349,10 +1349,24 @@ impl Ctx {
         shared: usize,
         params: &mut [*mut c_void],
     ) -> Res<()> {
+        unsafe { self.launch_on(self.stream, f, grid, block, shared, params) }
+    }
+
+    /// [`Self::launch`] on `stream` (a stream of this context: the NVG
+    /// encoder's threads each queue on their own).
+    unsafe fn launch_on(
+        &self,
+        stream: cs::CUstream,
+        f: cs::CUfunction,
+        grid: (u32, u32),
+        block: u32,
+        shared: usize,
+        params: &mut [*mut c_void],
+    ) -> Res<()> {
         let timed = if KT_ON.load(Ordering::Relaxed) {
             let a = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT).ok();
             if let Some(a) = a {
-                let _ = unsafe { cu::event::record(a, self.stream) };
+                let _ = unsafe { cu::event::record(a, stream) };
             }
             a
         } else {
@@ -1372,7 +1386,7 @@ impl Ctx {
                 blockDimY: 1,
                 blockDimZ: 1,
                 sharedMemBytes: shared as u32,
-                hStream: self.stream,
+                hStream: stream,
                 attrs: &mut attr,
                 numAttrs: 1,
             };
@@ -1384,7 +1398,7 @@ impl Ctx {
                     (grid.0.max(1), grid.1.max(1), 1),
                     (block, 1, 1),
                     shared as u32,
-                    self.stream,
+                    stream,
                     params,
                 )
             }
@@ -1396,11 +1410,11 @@ impl Ctx {
         if nop != 0 && nop != f as usize && r.is_ok() {
             let (mut p, mut n) = (0u64, 0u64);
             let mut args = [std::ptr::from_mut(&mut p) as *mut c_void, std::ptr::from_mut(&mut n) as *mut c_void];
-            let _ = unsafe { cu::launch_kernel(nop as cs::CUfunction, (1, 1, 1), (32, 1, 1), 0, self.stream, &mut args) };
+            let _ = unsafe { cu::launch_kernel(nop as cs::CUfunction, (1, 1, 1), (32, 1, 1), 0, stream, &mut args) };
         }
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
-                let _ = unsafe { cu::event::record(b, self.stream) };
+                let _ = unsafe { cu::event::record(b, stream) };
                 KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
             }
         }

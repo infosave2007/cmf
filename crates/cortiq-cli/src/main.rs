@@ -1801,7 +1801,10 @@ enum Commands {
         #[arg(long, default_value = "0.25")]
         sign_tau: f64,
         /// Peak sign learning rate, or auto = min(0.15·τ/√steps, 4e-3·τ)
-        /// (the second term caps the per-step move at the stable rate)
+        /// (the second term caps the per-step move at the stable rate).
+        /// A file that is already trained takes about a quarter of auto: at
+        /// the full rate its held-out KL rises and the guard halves the rate
+        /// twice on its own, at the cost of the steps in between
         #[arg(long, default_value = "auto")]
         sign_lr: String,
         /// Sign steps at η = 0 while the second-moment statistics settle

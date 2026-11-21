@@ -85,13 +85,130 @@ struct NdFuncs {
 struct NdState {
     f: NdFuncs,
     /// `nd_gv_block` by lanes per thread (the module is compiled per NQ).
-    gv: std::collections::HashMap<usize, cs::CUfunction>,
+    gv: Mutex<std::collections::HashMap<usize, cs::CUfunction>>,
 }
 
-// SAFETY: the function handles are used under the context's lock.
+// SAFETY: function handles of the backend's context — launched with that
+// context current, on the context's stream under its lock or on a thread's
+// private lane.
 unsafe impl Send for NdState {}
+unsafe impl Sync for NdState {}
 
-static STATE: Mutex<Option<Result<NdState, String>>> = Mutex::new(None);
+static STATE: OnceLock<Result<NdState, String>> = OnceLock::new();
+
+/// The stream and the cuBLAS handle a thread's encoder calls queue on.
+#[derive(Clone, Copy)]
+struct Lane {
+    stream: cs::CUstream,
+    blas: bl::cublasHandle_t,
+}
+
+// SAFETY: handles of the backend's context; a lane is one thread's at a time.
+unsafe impl Send for Lane {}
+
+/// Lanes not held by a thread (a cuBLAS handle takes a while to create: they
+/// are made once and handed on).
+static LANES: Mutex<Vec<Lane>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// The calling thread's private lane, while it holds a [`LaneGuard`].
+    static MY_LANE: std::cell::Cell<Option<Lane>> = const { std::cell::Cell::new(None) };
+    /// Free buffers of the thread's lane, by size: a buffer a thread freed may
+    /// still be read by work queued on that thread's stream, so only that
+    /// thread takes it again (its own stream keeps the order).
+    static MY_POOL: std::cell::RefCell<std::collections::HashMap<usize, Vec<u64>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// What an encoder call runs on: the backend's context with the stream and
+/// the cuBLAS handle of the calling thread — the context's own (every thread
+/// in one order, under the context's lock), or the thread's private lane.
+struct E {
+    c: &'static Ctx,
+    stream: cs::CUstream,
+    blas: bl::cublasHandle_t,
+    arch: Option<&'static str>,
+}
+
+impl E {
+    unsafe fn launch(&self, f: cs::CUfunction, grid: (u32, u32), block: u32, shared: usize, params: &mut [*mut c_void]) -> Res<()> {
+        unsafe { self.c.launch_on(self.stream, f, grid, block, shared, params) }
+    }
+
+    fn sync(&self) -> Res<()> {
+        unsafe { cu::stream::synchronize(self.stream) }.map_err(derr)
+    }
+
+    /// `C = α·op(A)·op(B) + β·C`, f32, column-major as cuBLAS reads it.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sgemm(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, b: u64, ldb: usize, beta: f32, cp: u64, ldc: usize) -> Res<()> {
+        let op = |t| if t { bl::cublasOperation_t::CUBLAS_OP_T } else { bl::cublasOperation_t::CUBLAS_OP_N };
+        let s = unsafe {
+            bl::cublasSgemm_v2(self.blas, op(ta), op(tb), m as i32, n as i32, k as i32, &alpha, a as *const f32, lda as i32, b as *const f32, ldb as i32, &beta, cp as *mut f32, ldc as i32)
+        };
+        if s as u32 != 0 {
+            return Err(format!("cuBLAS gemm {m}x{n}x{k}: {s:?}"));
+        }
+        Ok(())
+    }
+}
+
+/// A private lane for the calling thread until the guard drops: its encoder
+/// calls queue on a stream and a cuBLAS handle of their own and take no
+/// lock, so the tensors of several threads overlap on the card (on the
+/// context's one stream a tensor's column search — one block, one
+/// multiprocessor, tens of milliseconds a launch — holds every other tensor
+/// back). Matrices made before are visible (the context's stream is drained
+/// first); the thread that made them must not use the encoder until the
+/// lanes are gone (the driver's thread waits for its job threads). `None`:
+/// no card, a lane already held, or `CMF_NVG_CUDA_LANES=0`.
+pub fn private_lane() -> Option<LaneGuard> {
+    if std::env::var("CMF_NVG_CUDA_LANES").as_deref() == Ok("0") || MY_LANE.with(|l| l.get().is_some()) {
+        return None;
+    }
+    let c = ctx()?;
+    let _st = c.st.lock().unwrap();
+    c.current().ok()?;
+    // everything queued on the context's stream is done: the shared pool's
+    // buffers are free to be written from another stream
+    c.sync().ok()?;
+    let lane = match LANES.lock().unwrap().pop() {
+        Some(l) => l,
+        None => {
+            let stream = cu::stream::create(cu::stream::StreamKind::NonBlocking).ok()?;
+            let mut blas: bl::cublasHandle_t = std::ptr::null_mut();
+            if unsafe { bl::cublasCreate_v2(&mut blas) } as u32 != 0 || unsafe { bl::cublasSetStream_v2(blas, stream.cast()) } as u32 != 0 {
+                return None;
+            }
+            Lane { stream, blas }
+        }
+    };
+    MY_LANE.with(|l| l.set(Some(lane)));
+    Some(LaneGuard { _thread: std::marker::PhantomData })
+}
+
+/// See [`private_lane`]. Dropped on the thread that took it.
+pub struct LaneGuard {
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for LaneGuard {
+    fn drop(&mut self) {
+        let Some(lane) = MY_LANE.with(|l| l.take()) else { return };
+        if let Some(c) = ctx() {
+            let _ = c.current();
+        }
+        // the lane's work is done before its buffers go to the shared pool
+        let _ = unsafe { cu::stream::synchronize(lane.stream) };
+        let mine = MY_POOL.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        let mut p = POOL.lock().unwrap();
+        for (bytes, v) in mine {
+            p.held += bytes * v.len();
+            p.free.entry(bytes).or_default().extend(v);
+        }
+        drop(p);
+        LANES.lock().unwrap().push(lane);
+    }
+}
 
 fn build(c: &Ctx) -> Res<NdState> {
     let m = compile(ND_SRC, vec!["-DNQ=1".into()], c.arch)?;
@@ -128,28 +245,34 @@ fn build(c: &Ctx) -> Res<NdState> {
             vblock: f("nd_vblock")?,
             wy_t: f("nd_wy_t")?,
         },
-        gv: std::collections::HashMap::new(),
+        gv: Mutex::new(std::collections::HashMap::new()),
     })
 }
 
-/// Run `f` with the context current, its lock held and the kernels built.
+/// Run `f` with the context current and the kernels built, on the calling
+/// thread's lane: the context's own stream under its lock, or the thread's
+/// private lane with no lock ([`private_lane`]).
 /// A device error is a panic with its message (the wgpu twin `expect`s too):
 /// the encoder has no partial result to fall back on.
-fn with<R>(f: impl FnOnce(&Ctx, &mut NdState) -> Res<R>) -> R {
+fn with<R>(f: impl FnOnce(&E, &NdState) -> Res<R>) -> R {
     let c = ctx().expect("nvg_dev: no CUDA device");
-    let _st = c.st.lock().unwrap();
+    let lane = MY_LANE.with(|l| l.get());
+    let _st = if lane.is_none() { Some(c.st.lock().unwrap()) } else { None };
     c.current().expect("nvg_dev: CUDA context");
-    let mut g = STATE.lock().unwrap();
-    let st = g.get_or_insert_with(|| build(c));
-    match st {
-        Ok(s) => match f(c, s) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = c.sync();
-                panic!("nvg_dev (CUDA): {e}");
-            }
-        },
+    let st = match STATE.get_or_init(|| build(c)) {
+        Ok(s) => s,
         Err(e) => panic!("nvg_dev (CUDA) kernels: {e}"),
+    };
+    let e = match lane {
+        Some(l) => E { c, stream: l.stream, blas: l.blas, arch: c.arch },
+        None => E { c, stream: c.stream, blas: c.blas, arch: c.arch },
+    };
+    match f(&e, st) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = e.sync();
+            panic!("nvg_dev (CUDA): {err}");
+        }
     }
 }
 
@@ -160,8 +283,7 @@ pub fn available() -> bool {
     if c.current().is_err() {
         return false;
     }
-    let mut g = STATE.lock().unwrap();
-    match g.get_or_insert_with(|| build(c)) {
+    match STATE.get_or_init(|| build(c)) {
         Ok(_) => true,
         Err(e) => {
             decline("nvg encoder kernels", e);
@@ -192,9 +314,17 @@ fn round_bytes(bytes: usize) -> usize {
     bytes.max(64).next_multiple_of(256)
 }
 
-/// Free every pooled buffer (the stream drained first: queued work may read them).
-fn pool_trim(c: &Ctx) {
+/// Free every pooled buffer — the shared pool's and the calling lane's own
+/// (the lane's stream drained first: queued work may read them; the shared
+/// pool's buffers have no work queued while private lanes are out).
+fn pool_trim(c: &E) {
     let _ = c.sync();
+    let mine = MY_POOL.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    for ptr in mine.into_values().flatten() {
+        unsafe {
+            let _ = cu::free_sync(ptr);
+        }
+    }
     let mut p = POOL.lock().unwrap();
     for (_, v) in p.free.drain() {
         for ptr in v {
@@ -206,9 +336,14 @@ fn pool_trim(c: &Ctx) {
     p.held = 0;
 }
 
-/// `bytes` of device memory, contents undefined. Context current, lock held.
-fn raw_alloc(c: &Ctx, bytes: usize) -> Res<u64> {
+/// `bytes` of device memory, contents undefined. Context current.
+fn raw_alloc(c: &E, bytes: usize) -> Res<u64> {
     let bytes = round_bytes(bytes);
+    if MY_LANE.with(|l| l.get().is_some())
+        && let Some(ptr) = MY_POOL.with(|m| m.borrow_mut().get_mut(&bytes).and_then(Vec::pop))
+    {
+        return Ok(ptr);
+    }
     {
         let mut p = POOL.lock().unwrap();
         if let Some(ptr) = p.free.get_mut(&bytes).and_then(Vec::pop) {
@@ -230,6 +365,11 @@ fn raw_alloc(c: &Ctx, bytes: usize) -> Res<u64> {
 
 fn raw_release(ptr: u64, bytes: usize) {
     let bytes = round_bytes(bytes);
+    // a private lane keeps what it frees (see `MY_POOL`); a thread past its
+    // thread-locals' end falls through to the shared pool
+    if MY_LANE.try_with(|l| l.get().is_some()).unwrap_or(false) && MY_POOL.try_with(|m| m.borrow_mut().entry(bytes).or_default().push(ptr)).is_ok() {
+        return;
+    }
     let mut p = POOL.lock().unwrap();
     p.free.entry(bytes).or_default().push(ptr);
     p.held += bytes;
@@ -242,11 +382,11 @@ struct Tmp {
 }
 
 impl Tmp {
-    fn new(c: &Ctx, floats: usize) -> Res<Tmp> {
+    fn new(c: &E, floats: usize) -> Res<Tmp> {
         let bytes = floats.max(4) * 4;
         Ok(Tmp { ptr: raw_alloc(c, bytes)?, bytes })
     }
-    fn zeroed(c: &Ctx, floats: usize) -> Res<Tmp> {
+    fn zeroed(c: &E, floats: usize) -> Res<Tmp> {
         let t = Tmp::new(c, floats)?;
         unsafe { cu::memset_d8_async(t.ptr, 0, t.bytes, c.stream).map_err(derr)? };
         Ok(t)
@@ -292,12 +432,12 @@ impl Drop for U32Buf {
     }
 }
 
-fn mat_raw(c: &Ctx, r: usize, cc: usize) -> Res<DMat> {
+fn mat_raw(c: &E, r: usize, cc: usize) -> Res<DMat> {
     let bytes = (r * cc).max(4) * 4;
     Ok(DMat { ptr: raw_alloc(c, bytes)?, bytes, r, c: cc })
 }
 
-fn mat_zero(c: &Ctx, r: usize, cc: usize) -> Res<DMat> {
+fn mat_zero(c: &E, r: usize, cc: usize) -> Res<DMat> {
     let m = mat_raw(c, r, cc)?;
     unsafe { cu::memset_d8_async(m.ptr, 0, m.bytes, c.stream).map_err(derr)? };
     Ok(m)
@@ -305,7 +445,7 @@ fn mat_zero(c: &Ctx, r: usize, cc: usize) -> Res<DMat> {
 
 /// Host memory into a (possibly reused) device buffer: the stream drained
 /// first — work queued earlier may still read the buffer's previous contents.
-fn upload<T: Copy>(c: &Ctx, ptr: u64, data: &[T]) -> Res<()> {
+fn upload<T: Copy>(c: &E, ptr: u64, data: &[T]) -> Res<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -313,7 +453,7 @@ fn upload<T: Copy>(c: &Ctx, ptr: u64, data: &[T]) -> Res<()> {
     unsafe { htod(ptr, data) }
 }
 
-fn download_f32(c: &Ctx, ptr: u64, n: usize) -> Res<Vec<f32>> {
+fn download_f32(c: &E, ptr: u64, n: usize) -> Res<Vec<f32>> {
     let mut v = vec![0f32; n];
     if n > 0 {
         unsafe { cu::memcpy_dtoh_async(v.as_mut_slice(), ptr, c.stream).map_err(derr)? };
@@ -322,7 +462,7 @@ fn download_f32(c: &Ctx, ptr: u64, n: usize) -> Res<Vec<f32>> {
     Ok(v)
 }
 
-fn download_u32(c: &Ctx, ptr: u64, n: usize) -> Res<Vec<u32>> {
+fn download_u32(c: &E, ptr: u64, n: usize) -> Res<Vec<u32>> {
     let mut v = vec![0u32; n];
     if n > 0 {
         unsafe { cu::memcpy_dtoh_async(v.as_mut_slice(), ptr, c.stream).map_err(derr)? };
@@ -385,7 +525,7 @@ impl DMat {
     }
 }
 
-fn copy_raw(c: &Ctx, src: u64, dst: u64, floats: usize) -> Res<()> {
+fn copy_raw(c: &E, src: u64, dst: u64, floats: usize) -> Res<()> {
     if floats == 0 {
         return Ok(());
     }
@@ -463,14 +603,14 @@ impl<'a> V<'a> {
 /// Read column-major, a row-major operand is its transpose: the product is
 /// `Cᵀ = op(B)ᵀ·op(A)ᵀ` with each stored array taken as it lies.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gemm_raw(c: &Ctx, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, ta: bool, b: u64, ldb: usize, tb: bool, beta: f32, cp: u64, ldc: usize) -> Res<()> {
+unsafe fn gemm_raw(c: &E, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, ta: bool, b: u64, ldb: usize, tb: bool, beta: f32, cp: u64, ldc: usize) -> Res<()> {
     if m == 0 || n == 0 {
         return Ok(());
     }
     if k == 0 {
         return Err("gemm with an empty inner dimension".into());
     }
-    unsafe { c.gemm(tb, ta, n, m, k, alpha, b, ldb, a, lda, beta, cp, ldc, Gemm::F32) }
+    unsafe { c.sgemm(tb, ta, n, m, k, alpha, b, ldb, a, lda, beta, cp, ldc) }
 }
 
 /// `C[oc + i·ldc + j] = α·Σ_k op(A)(i,k)·op(B)(k,j) [⊙ E] + β·C` for an
@@ -520,7 +660,7 @@ pub fn mm(a: &DMat, ta: bool, b: &DMat, tb: bool) -> DMat {
 // ───────────────────────────── elementwise / reductions ─────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn scale_rc_raw(cx: &Ctx, f: &NdFuncs, rows: usize, cols: usize, a: u64, lda: usize, oa: usize, c: u64, ldc: usize, oc: usize, r: Option<u64>, s: Option<u64>, flags: u32, alpha: f32, beta: f32) -> Res<()> {
+unsafe fn scale_rc_raw(cx: &E, f: &NdFuncs, rows: usize, cols: usize, a: u64, lda: usize, oa: usize, c: u64, ldc: usize, oc: usize, r: Option<u64>, s: Option<u64>, flags: u32, alpha: f32, beta: f32) -> Res<()> {
     if rows == 0 || cols == 0 {
         return Ok(());
     }
@@ -582,7 +722,7 @@ pub fn rownorm(rows: usize, cols: usize, c: &DMat, oc: usize, ldc: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn colsum_part_raw(cx: &Ctx, f: &NdFuncs, rows: usize, cols: usize, a: u64, oa: usize, lda: usize, b: u64, ob: usize, ldb: usize) -> Res<(Tmp, usize)> {
+unsafe fn colsum_part_raw(cx: &E, f: &NdFuncs, rows: usize, cols: usize, a: u64, oa: usize, lda: usize, b: u64, ob: usize, ldb: usize) -> Res<(Tmp, usize)> {
     let per = 64usize.max(rows.div_ceil(256));
     let nch = rows.div_ceil(per).max(1);
     let part = Tmp::new(cx, nch * cols)?;
@@ -622,7 +762,7 @@ fn frob_nwg(len: usize) -> usize {
     512usize.min(len.div_ceil(256)).max(1)
 }
 
-unsafe fn frob_part_raw(cx: &Ctx, f: &NdFuncs, a: u64, b: u64, len: usize, out: u64) -> Res<usize> {
+unsafe fn frob_part_raw(cx: &E, f: &NdFuncs, a: u64, b: u64, len: usize, out: u64) -> Res<usize> {
     let nwg = frob_nwg(len);
     let (leni, nwgi) = (len as u64, nwg as u32);
     unsafe { cx.launch(f.frob_part, (nwg as u32, 1), 256, 0, kargs!(a, b, out, leni, nwgi))? };
@@ -768,7 +908,7 @@ fn blas_ok(s: bl::cublasStatus_t, what: &str) -> Res<()> {
 /// [`chol_nb`] — a diagonal block on the host in f64 (a pivot that is not
 /// finite and positive fails), its row panel by STRSM, the trailing matrix
 /// by SSYRK. The strict upper triangle (row-major) is left as it was.
-unsafe fn chol_dev(c: &Ctx, a: u64, n: usize) -> Res<bool> {
+unsafe fn chol_dev(c: &E, a: u64, n: usize) -> Res<bool> {
     use bl::{cublasDiagType_t as Dg, cublasFillMode_t as Fm, cublasOperation_t as Op, cublasSideMode_t as Sd};
     let at = |r: usize, col: usize| a + ((r + col * n) * 4) as u64;
     let nb = chol_nb(n);
@@ -864,7 +1004,7 @@ pub fn tri_inv(l: &DMat, x: &DMat) -> Option<()> {
 }
 
 /// Solve `L Lᵀ x = b` in place over device addresses (`l` the lower factor).
-unsafe fn chol_solve_raw(c: &Ctx, l: u64, n: usize, y: u64) -> Res<()> {
+unsafe fn chol_solve_raw(c: &E, l: u64, n: usize, y: u64) -> Res<()> {
     use bl::{cublasDiagType_t as Dg, cublasFillMode_t as Fm, cublasOperation_t as Op};
     unsafe {
         // UᵀU x = b with U = Lᵀ (column-major upper)
@@ -963,9 +1103,11 @@ fn gj_tol() -> f32 {
     std::env::var("CMF_NVG_GJ_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-8)
 }
 
-/// Threads of the column search's block (`CMF_NVG_GV_WS`, default 1024).
+/// Threads of the column search's block (`CMF_NVG_GV_WS`: 64 … 1024, default
+/// 256). A flip is one barrier, after which every thread merges the warps'
+/// partial winners itself: eight warps keep that merge short.
 fn gv_ws() -> usize {
-    std::env::var("CMF_NVG_GV_WS").ok().and_then(|v| v.parse().ok()).filter(|w| [256usize, 512, 1024].contains(w)).unwrap_or(1024)
+    std::env::var("CMF_NVG_GV_WS").ok().and_then(|v| v.parse().ok()).filter(|w| [64usize, 128, 256, 512, 1024].contains(w)).unwrap_or(256)
 }
 
 /// One 128-column block of the input-side search (see `nd_gv_block`), then
@@ -977,13 +1119,16 @@ pub fn gv_block(bv: &DMat, s: &DMat, ks0: &DMat, k: &DMat, uc: &DMat, eg: &DMat,
     let ws = gv_ws();
     let nq = r.div_ceil(ws).max(1);
     with(|c, st| unsafe {
-        let f = match st.gv.get(&nq) {
-            Some(f) => *f,
-            None => {
-                let m = compile(ND_SRC, vec![format!("-DNQ={nq}")], c.arch)?;
-                let f = func(m, "nd_gv_block")?;
-                st.gv.insert(nq, f);
-                f
+        let f = {
+            let mut gv = st.gv.lock().unwrap();
+            match gv.get(&nq) {
+                Some(f) => *f,
+                None => {
+                    let m = compile(ND_SRC, vec![format!("-DNQ={nq}")], c.arch)?;
+                    let f = func(m, "nd_gv_block")?;
+                    gv.insert(nq, f);
+                    f
+                }
             }
         };
         let (ni, ri, b0i, b1i, mf, gjt) = (n as u32, r as u32, b0 as u32, b1 as u32, max_flips as u32, gj_tol());

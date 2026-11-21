@@ -585,6 +585,22 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
         }
     }
     let path = |lead: &str, kind: &str| o.gram_cache.map(|p| format!("{p}.{lead}.{kind}.gram"));
+    // The cache prefix names the layer by convention only (`grams/L3`): a
+    // note beside the files says which layer they were captured for, and a
+    // prefix reused for another layer is refused instead of silently encoding
+    // this layer on that layer's inputs.
+    let note = o.gram_cache.map(|p| format!("{p}.layer"));
+    if let Some(n) = &note
+        && let Ok(t) = std::fs::read_to_string(n)
+    {
+        let have = t.trim().parse::<usize>().ok();
+        anyhow::ensure!(
+            have == Some(l),
+            "--gram-cache {}: these Grams were captured for layer {}, not layer {l} — give each layer its own prefix",
+            o.gram_cache.unwrap_or(""),
+            t.trim()
+        );
+    }
     let mut grams: std::collections::HashMap<&str, (Mat, Mat)> = std::collections::HashMap::new();
     let missing: Vec<&str> = leads
         .iter()
@@ -608,6 +624,9 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
                 save_gram(&ps, &b, cb)?;
             }
             grams.insert(lead, (a, b));
+        }
+        if let Some(n) = &note {
+            std::fs::write(n, format!("{l}\n"))?;
         }
     }
     let gqa = model.arch().num_kv_heads < model.arch().num_attention_heads;

@@ -403,12 +403,13 @@ __device__ __forceinline__ void nd_sum2(float& x, float& y, float* pa, float* pb
     y = fin[1];
 }
 
-__device__ __forceinline__ void nd_best_merge(float& v, u32& i, float& s, float ov, u32 oi, float os)
+__device__ __forceinline__ void nd_best_merge(float& v, u32& i, float& s, float& kd, float ov, u32 oi, float os, float okd)
 {
     if (ov < v || (ov == v && oi < i)) {
         v = ov;
         i = oi;
         s = os;
+        kd = okd;
     }
 }
 
@@ -417,9 +418,20 @@ extern "C" __global__ void nd_gv_block(const float* __restrict__ KS0, const floa
                                        float* EG, u32* CNT, u32 n, u32 r, u32 b0, u32 b1, u32 maxf, float tol, float gjtol)
 {
     __shared__ float pa[32], pb[32], fin[2];
-    __shared__ float pv[32], ps[32], fv, fs;
-    __shared__ u32 pi[32], fi;
+    // the warps' best flips of a round, in two buffers used in turn: a round
+    // is one barrier (the partials are written, then every thread merges them
+    // itself), and the next round writes the other buffer while slow threads
+    // still read this one. Three barriers a flip — partials, the block's
+    // winner by warp 0, the winner read by all — made the search 1.25 µs a
+    // flip, the whole of a wide down_proj's encode. A candidate carries its
+    // diagonal of K (every thread holds its own lanes' in registers): the
+    // winner's acceptance test needs it, and read from K after the merge it
+    // was a second global load in series with the winner's row — the search
+    // is bound by that chain, not by the arithmetic.
+    __shared__ float pv[2][32], ps[2][32], pk[2][32];
+    __shared__ u32 pi[2][32];
     const u32 t = threadIdx.x, nt = blockDim.x, lane = t & 31, w = t >> 5, nw = nt >> 5;
+    u32 fp = 0;
     const size_t goff = (size_t)128 * r;
     float kd[NQ], s[NQ], ks[NQ], bv[NQ];
 #pragma unroll
@@ -469,7 +481,7 @@ extern "C" __global__ void nd_gv_block(const float* __restrict__ KS0, const floa
         for (u32 rd = 0; rd < 3u; rd++) {
             u32 nf = 0;
             while (nf < maxf) {
-                float bvl = 3.4e38f, bsl = 0.f;
+                float bvl = 3.4e38f, bsl = 0.f, bkl = 0.f;
                 u32 bil = 0xffffffffu;
 #pragma unroll
                 for (u32 q = 0; q < NQ; q++) {
@@ -480,6 +492,7 @@ extern "C" __global__ void nd_gv_block(const float* __restrict__ KS0, const floa
                             bvl = d;
                             bil = x;
                             bsl = s[q];
+                            bkl = kd[q];
                         }
                     }
                 }
@@ -487,35 +500,26 @@ extern "C" __global__ void nd_gv_block(const float* __restrict__ KS0, const floa
                     const float ov = __shfl_xor_sync(0xffffffffu, bvl, o);
                     const u32 oi = __shfl_xor_sync(0xffffffffu, bil, o);
                     const float os = __shfl_xor_sync(0xffffffffu, bsl, o);
-                    nd_best_merge(bvl, bil, bsl, ov, oi, os);
+                    const float ok = __shfl_xor_sync(0xffffffffu, bkl, o);
+                    nd_best_merge(bvl, bil, bsl, bkl, ov, oi, os, ok);
                 }
+                const u32 pb_ = fp & 1u;
+                fp++;
                 if (lane == 0) {
-                    pv[w] = bvl;
-                    pi[w] = bil;
-                    ps[w] = bsl;
+                    pv[pb_][w] = bvl;
+                    pi[pb_][w] = bil;
+                    ps[pb_][w] = bsl;
+                    pk[pb_][w] = bkl;
                 }
                 __syncthreads();
-                if (w == 0) {
-                    float gv = lane < nw ? pv[lane] : 3.4e38f, gs = lane < nw ? ps[lane] : 0.f;
-                    u32 gi = lane < nw ? pi[lane] : 0xffffffffu;
-                    for (int o = 16; o > 0; o >>= 1) {
-                        const float ov = __shfl_xor_sync(0xffffffffu, gv, o);
-                        const u32 oi = __shfl_xor_sync(0xffffffffu, gi, o);
-                        const float os = __shfl_xor_sync(0xffffffffu, gs, o);
-                        nd_best_merge(gv, gi, gs, ov, oi, os);
-                    }
-                    if (lane == 0) {
-                        fv = gv;
-                        fi = gi;
-                        fs = gs;
-                    }
-                }
-                __syncthreads();
-                const float bvm = fv, sb = fs;
-                const u32 bi = fi;
+                // the block's winner: every thread merges the warps' partials
+                // in the same order (ties go to the lower index, so the order
+                // of the merge does not matter)
+                float bvm = pv[pb_][0], sb = ps[pb_][0], kdb = pk[pb_][0];
+                u32 bi = pi[pb_][0];
+                for (u32 x = 1; x < nw; x++) nd_best_merge(bvm, bi, sb, kdb, pv[pb_][x], pi[pb_][x], ps[pb_][x], pk[pb_][x]);
                 if (bi >= r) break;
                 const size_t kr = (size_t)bi * r;
-                const float kdb = K[kr + bi];
                 if (bvm >= -tol * (gj * gj * kdb + 1.0e-30f)) break;
 #pragma unroll
                 for (u32 q = 0; q < NQ; q++) {
@@ -524,8 +528,6 @@ extern "C" __global__ void nd_gv_block(const float* __restrict__ KS0, const floa
                     if (x < r) ks[q] -= 2.f * sb * K[kr + x];
                 }
                 nf++;
-                // the shared winner is rewritten in the next round: every thread has read it
-                __syncthreads();
             }
             flips += nf;
             float c1 = 0.f, c2 = 0.f;

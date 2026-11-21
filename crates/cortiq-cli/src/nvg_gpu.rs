@@ -61,6 +61,13 @@ fn vec_dev(v: &[f64]) -> DMat {
 
 /// Refinement sweeps of the discrete knots (`CMF_NVG_SWEEPS`, default 2: the
 /// host encoder's).
+/// A tensor's two candidates on two threads (CUDA; `CMF_NVG_CAND_THREADS=0`
+/// builds them one after the other).
+fn cand_threads() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_CAND_THREADS").as_deref() != Ok("0"));
+    *ON
+}
+
 pub(crate) fn refine_sweeps() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2));
     *N
@@ -263,11 +270,13 @@ impl ModelD {
     }
 }
 
-/// One tensor's device context.
+/// One tensor's device context (a view: the two candidates of a tensor are
+/// built on two threads from the same matrices, each with its own workers).
+#[derive(Clone, Copy)]
 struct TCtxD<'a> {
-    w: DMat,
-    wh: DMat,
-    whsel: DMat,
+    w: &'a DMat,
+    wh: &'a DMat,
+    whsel: &'a DMat,
     /// tr(W H Wᵀ), tr(W Hsel Wᵀ), ‖W‖²
     a_h: f64,
     a_sel: f64,
@@ -793,7 +802,10 @@ pub fn encode_nvg_dev(
     let (m, n) = (w.r, w.c);
     anyhow::ensure!(n == hc.n, "{m}x{n} weight vs a {}-wide Gram", hc.n);
     anyhow::ensure!(colscale.is_none_or(|t| t.len() == n), "channel scale of the wrong width");
-    let c = ps(prof, "wh", || {
+    // on CUDA the tensor's device work queues on a lane of this thread's own
+    // (a no-op when the thread has one, and on wgpu); dropped last
+    let _lane = dv::private_lane();
+    let (wd, wh, whsel, a_h, a_sel, w2) = ps(prof, "wh", || {
         let wd = DMat::from_f64(m, n, &w.d);
         if let Some(t) = colscale {
             let inv: Vec<f64> = t.iter().map(|v| 1.0 / v).collect();
@@ -802,24 +814,55 @@ pub fn encode_nvg_dev(
         let wh = dv::mm(&wd, false, &hc.h, false);
         let whsel = dv::mm(&wd, false, &hc.hsel, false);
         let (a_h, a_sel, w2) = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
-        TCtxD { w: wd, wh, whsel, a_h, a_sel, w2, hc, pool, prof }
+        (wd, wh, whsel, a_h, a_sel, w2)
     });
-    let mut cands: Vec<(usize, ModelD)> = Vec::new();
-    let mut notes = Vec::new();
-    if choice != PathsChoice::One {
+    let c = TCtxD { w: &wd, wh: &wh, whsel: &whsel, a_h, a_sel, w2, hc, pool, prof };
+    // The two candidates: two paths at rank r2 (its initial error noted), one
+    // path at the same bits.
+    let cand2 = |c: &TCtxD| -> anyhow::Result<(String, ModelD)> {
         let r2 = blr_rank(m, n, b, 2, mult);
         anyhow::ensure!(r2 <= dv::GV_MAX_RANK, "rank {r2} above the device search limit");
-        let n3 = build_init_d(&c, r2, 2)?;
-        let e3 = ps(prof, "select", || rel_d(&n3, &c, Metric::Sel));
-        let n4 = refine_d(n3, &c, refine_sweeps());
-        notes.push(format!("init {e3:.4}"));
-        cands.push((2, n4));
-    }
-    if choice != PathsChoice::Two {
+        let n3 = build_init_d(c, r2, 2)?;
+        let e3 = ps(c.prof, "select", || rel_d(&n3, c, Metric::Sel));
+        Ok((format!("init {e3:.4}"), refine_d(n3, c, refine_sweeps())))
+    };
+    let cand1 = |c: &TCtxD| -> anyhow::Result<ModelD> {
         let r1 = blr_rank(m, n, b, 1, mult);
         anyhow::ensure!(r1 <= dv::GV_MAX_RANK, "rank {r1} above the device search limit");
-        let p1 = refine_d(build_init_d(&c, r1, 1)?, &c, refine_sweeps());
-        cands.push((1, p1));
+        Ok(refine_d(build_init_d(c, r1, 1)?, c, refine_sweeps()))
+    };
+    let mut cands: Vec<(usize, ModelD)> = Vec::new();
+    let mut notes = Vec::new();
+    if choice == PathsChoice::Auto && dv::on_cuda() && cand_threads() {
+        // Both at once: the one-path candidate on a second thread with a lane
+        // and workers of its own. Each candidate's column search is one block
+        // on one multiprocessor for most of its time, so the two overlap on
+        // the card; they read the same weight and Gram matrices and write
+        // only their own.
+        dv::sync();
+        let hp = Pool::new(pool.map_or(1, Pool::n_workers).max(1));
+        let c1 = TCtxD { pool: Some(&hp), ..c };
+        let (r2, r1) = std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _lane = dv::private_lane();
+                cand1(&c1)
+            });
+            let r2 = cand2(&c);
+            (r2, h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+        });
+        let (note, n4) = r2?;
+        notes.push(note);
+        cands.push((2, n4));
+        cands.push((1, r1?));
+    } else {
+        if choice != PathsChoice::One {
+            let (note, n4) = cand2(&c)?;
+            notes.push(note);
+            cands.push((2, n4));
+        }
+        if choice != PathsChoice::Two {
+            cands.push((1, cand1(&c)?));
+        }
     }
     let mut best: Option<(f64, usize)> = None;
     for (ci, (p, md)) in cands.iter().enumerate() {
@@ -963,6 +1006,12 @@ mod tests {
         hc: HCtx,
         hcd: HCtxD,
         pool: Pool,
+        /// The weight on the device and its products with the two Grams
+        /// (what `encode_nvg_dev` makes first), with tr(W H Wᵀ), tr(W Hsel Wᵀ), ‖W‖².
+        wd: DMat,
+        wh: DMat,
+        whsel: DMat,
+        traces: (f64, f64, f64),
     }
 
     fn fixture(m: usize, n: usize) -> Option<Fx> {
@@ -974,16 +1023,16 @@ mod tests {
         let pool = Pool::new(2);
         let hc = HCtx::new(Some(&pool), &hfit, 0.03).unwrap();
         let hcd = HCtxD::new(&hfit, &hsel, 0.03).unwrap();
-        Some(Fx { w, hfit, hsel, hc, hcd, pool })
+        let wd = DMat::from_f64(m, n, &w.d);
+        let wh = dv::mm(&wd, false, &hcd.h, false);
+        let whsel = dv::mm(&wd, false, &hcd.hsel, false);
+        let traces = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
+        Some(Fx { w, hfit, hsel, hc, hcd, pool, wd, wh, whsel, traces })
     }
 
     fn tctx_d<'a>(f: &'a Fx) -> TCtxD<'a> {
-        let (m, n) = (f.w.r, f.w.c);
-        let wd = DMat::from_f64(m, n, &f.w.d);
-        let wh = dv::mm(&wd, false, &f.hcd.h, false);
-        let whsel = dv::mm(&wd, false, &f.hcd.hsel, false);
-        let (a_h, a_sel, w2) = (dv::frob(&wd, &wh, m * n), dv::frob(&wd, &whsel, m * n), dv::frob(&wd, &wd, m * n));
-        TCtxD { w: wd, wh, whsel, a_h, a_sel, w2, hc: &f.hcd, pool: Some(&f.pool), prof: None }
+        let (a_h, a_sel, w2) = f.traces;
+        TCtxD { w: &f.wd, wh: &f.wh, whsel: &f.whsel, a_h, a_sel, w2, hc: &f.hcd, pool: Some(&f.pool), prof: None }
     }
 
     fn tctx<'a>(f: &'a Fx) -> TCtx<'a> {
@@ -1144,6 +1193,10 @@ pub fn encode_many(
     std::thread::scope(|s| {
         for _ in 0..njobs {
             s.spawn(|| {
+                // with several tensors in flight each job thread queues on
+                // its own lane of the card (first in the thread: dropped
+                // after the thread's matrices)
+                let _lane = (njobs > 1).then(cortiq_engine::nvg_dev::private_lane);
                 let pool = Pool::new(per - 1);
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

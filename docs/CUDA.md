@@ -609,6 +609,11 @@ gives the same bytes.
 | `CMF_NVG_CALIB=engine` | the NVG conversion's calibration through the engine's capture hook |
 | `CMF_NVG_CUDA_POOL_GB=N` | free device buffers the NVG encoder keeps, 24 GB by default |
 | `CMF_NVG_GDN_HIST_GB=N` | the cap of the NVG trainer's GDN state history, 16 GB by default |
+| `CMF_NVG_ACACHE_GB=N` | rank activations the NVG trainer keeps from a step's forward for its recompute, 7 GB by default, 0 for none |
+| `CMF_NVG_JOBS=N` | tensors of a layer in flight in the NVG conversion, 3 by default |
+| `CMF_NVG_CUDA_LANES=0` | the NVG encoder's threads on the backend's one stream (no overlap on the card) |
+| `CMF_NVG_CAND_THREADS=0` | a tensor's two candidates one after the other |
+| `CMF_NVG_GV_WS=N` | threads of the NVG column search's block, 256 by default |
 | `CMF_NVG_PROF=1`, `CMF_NVG_KT=N` | the NVG trainer's time per phase; the kernel times of its step N |
 
 ## Limits
@@ -620,8 +625,7 @@ gives the same bytes.
   tokens, 4.5 GB on the wgpu path). The hybrid arm's and Dory's prompts stay within the seal's memory. A new
   turn of a sealed conversation reads the conversation again, as on the wgpu path.
 - Drafts run on the hybrid arm and on the Fast Code stack, not on the dense arm.
-- The NVG trainer and converter cover the Qwen3.5 family (GDN mixers, gated attention), as on wgpu; `nvg-train
-  --mask-keep` runs on the wgpu trainer only.
+- The NVG trainer and converter cover the Qwen3.5 family (GDN mixers, gated attention), as on wgpu.
 - The toolkit libraries must be on the loader's path; the bindings are for CUDA 12.x.
 - Decode is bound by its own arithmetic, about 350 GB/s of weights on an A40 against 500 for a kernel
   that only loads them (`scripts/cuda/bench/mv_bench.cu`).

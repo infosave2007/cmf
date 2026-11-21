@@ -95,6 +95,16 @@ extern "C" __global__ void nt_h2f_n(const u16* __restrict__ src, float* __restri
     if (i < n) out[i] = nt_h2f(src[i]);
 }
 
+// out = a ⊙ col per row (in place when out = a): the DTG-MA gate on the MLP's
+// activation and on its gradient. Grid (k / 256, rows).
+extern "C" __global__ void nt_scale_cols(const float* a, const float* __restrict__ col, float* out, u32 k)
+{
+    const u32 c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= k) return;
+    const size_t i = (size_t)blockIdx.y * k + c;
+    out[i] = a[i] * col[c];
+}
+
 // Column reduction, first pass: part[blk·k + j] = Σ over the rows of block blk
 // of a·b (mode 0), a·b·f[row] (mode 1) or a (mode 2). Grid (k / 256, blocks).
 extern "C" __global__ void nt_colsum_part(const float* __restrict__ a, const float* __restrict__ b,
@@ -146,6 +156,33 @@ extern "C" __global__ void nt_swiglu_bwd(const float* __restrict__ g, const floa
     const float a = g[i], s = nt_sigm(a);
     dg[i] = dh[i] * u[i] * s * (1.f + a * (1.f - s));
     du[i] = dh[i] * a * s;
+}
+
+// h = silu(g)·u staged in f16 for the linear that reads it (what `nt_stage`
+// makes of `nt_swiglu_fwd`'s h, in one pass and without the f32 copy).
+extern "C" __global__ void nt_swiglu_fwd16(const float* __restrict__ g, const float* __restrict__ u, u16* __restrict__ h,
+                                           size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = g[i];
+    const float v = a * nt_sigm(a) * u[i];
+    h[i] = nt_f2h(v);
+}
+
+// `nt_swiglu_bwd`'s two gradients staged in f16 times `scale` (the gradient
+// scale) for their linears' backward — the values `nt_stage` makes of them.
+extern "C" __global__ void nt_swiglu_bwd16(const float* __restrict__ g, const float* __restrict__ u,
+                                           const float* __restrict__ dh, u16* __restrict__ dg, u16* __restrict__ du,
+                                           size_t n, float scale)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = g[i], s = nt_sigm(a);
+    const float vg = dh[i] * u[i] * s * (1.f + a * (1.f - s));
+    const float vu = dh[i] * a * s;
+    dg[i] = nt_f2h(vg * scale);
+    du[i] = nt_f2h(vu * scale);
 }
 
 // og = o·σ(gate)
@@ -327,18 +364,22 @@ extern "C" __global__ void nt_qkr_bwd(const float* __restrict__ X, const float* 
 // share an SM's 64k registers, so 1024 threads leave 64 each — too few for
 // the reverse sweep's two state columns): a thread holds GR = DK / GC rows of
 // one column of the state in registers, so a position is two loops of GR and
-// four barriers. (In the
+// two barriers forward, three backward (a position's q, k and scalar sums are
+// published a position early; the forward's output norm rides the next
+// position's barrier). (In the
 // bake's block of DV threads a thread walks all DK rows of its column — the
 // state spills to local memory — and an SM's schedulers wait on four warps'
 // dependency chains: 3.4 µs a position forward and 17 µs backward on an RTX
 // PRO 6000.) Column sums (Sᵀk̂, Sᵀq̂, dSᵀk̂) add the GC chunks' partials in
 // order through shared memory; row sums (S·do, dS·u, S·dkv) reduce a warp's
 // 32 columns by shuffles and add the DV / 32 warps' partials in order: a
-// step stays bit-reproducible. The BPTT's state history is f16
-// ([unit][t][DK][DV], the state after each position, unit = local sequence ·
-// nv + h): half the traffic of an f32 history, written once by the forward
-// that the reverse sweep's layer recompute runs anyway and read once (the
-// reverse sweep keeps the later state in registers).
+// step stays bit-reproducible. The BPTT's state history is f16 and holds
+// every second state ([unit][⌈t/2⌉][DK][DV], unit = local sequence · nv + h;
+// the states after positions t-1, t-3, …): the reverse sweep rebuilds the
+// state between two stored ones by one rank-one step from the forward's kv
+// (no sums). A quarter of the traffic of an f32 history of every state,
+// written once by the forward that the reverse sweep's layer recompute runs
+// anyway and read once.
 
 #ifndef GC
 #define GC 4
@@ -363,9 +404,30 @@ __device__ __forceinline__ float nt_gsum(const float* r) {
 
 __device__ __forceinline__ u16 nt_f2h_sat(float f) { return nt_f2h(fminf(fmaxf(f, -65504.f), 65504.f)); }
 
+// A position's q, k and the sums of their squares go to shared memory a
+// position early (slot = the position's parity): the block needs no barrier
+// of its own for them.
+#define GDN_PUB_QK(SL, QV, KV_)                                    \
+    if (tid < DK) {                                                \
+        qs[SL][tid] = QV;                                          \
+        ks[SL][tid] = KV_;                                         \
+        float pq = QV * QV, pk = KV_ * KV_;                        \
+        for (int o = 16; o > 0; o >>= 1) {                         \
+            pq += __shfl_xor_sync(0xffffffffu, pq, o);             \
+            pk += __shfl_xor_sync(0xffffffffu, pk, o);             \
+        }                                                          \
+        if ((tid & 31) == 0) {                                     \
+            rq[SL][tid >> 5] = pq;                                 \
+            rk[SL][tid >> 5] = pk;                                 \
+        }                                                          \
+    }
+
 // Forward: grid (nv, sequences of this launch), block DV·GC.
 // out[row][h·DV + j] = rms(o)·w·silu(z) when `out` is given; with `hist` the
-// state after every position, kv and o per position are kept for `nt_gdn_rev`.
+// state after every second position (the last one among them), and kv and o
+// of every position, are kept for `nt_gdn_rev`. Two barriers a position: q
+// and k are published a position early, the output's norm is taken under the
+// next position's first barrier.
 extern "C" __global__ void nt_gdn_fwd(const float* cq, const float* z, const float* a, const float* bb,
                                       const float* a_log, const float* dt_bias, const float* normw, float* out,
                                       u16* hist, float* kvh, float* oh, int t, int nv, int nk, float eps, int seq0)
@@ -373,70 +435,71 @@ extern "C" __global__ void nt_gdn_fwd(const float* cq, const float* z, const flo
     const int h = blockIdx.x, lb = blockIdx.y, bi = seq0 + lb;
     const int tid = threadIdx.x, j = tid % DV, c = tid / DV, i0 = c * GR;
     const int rep = nv / nk, ko = h / rep, kd = nk * DK, vd = nv * DV, cdim = 2 * kd + vd;
-    __shared__ float qs[DK], ks[DK], rq[GW], rk[GW], ro[GW], cpa[GC][DV], cpb[GC][DV];
+    __shared__ float qs[2][DK], ks[2][DK], rq[2][GW], rk[2][GW], ro[GW], cpa[GC][DV], cpb[GC][DV];
     const long unit = (long)lb * nv + h;
-    u16* H = hist ? hist + unit * (long)t * DK * DV : 0;
+    const int par = (t - 1) & 1;
+    u16* H = hist ? hist + unit * (long)((t + 1) / 2) * DK * DV : 0;
     float* KV = hist ? kvh + unit * (long)t * DV : 0;
     float* O = hist ? oh + unit * (long)t * DV : 0;
     const float ea = __expf(a_log[h]), dtb = dt_bias[h], wn = normw[j];
+    const long row0 = (long)bi * t;
     float S[GR];
 #pragma unroll
     for (int i = 0; i < GR; i++) S[i] = 0.f;
-    // a position's inputs are read one position ahead: the latency of their
-    // loads (rows 6 KB apart, nothing prefetches them) passes under the
-    // arithmetic of the position before
-    float qn = 0.f, kn = 0.f, vn, an, bn, zn = 0.f;
+    // inputs are read ahead — q and k two positions (they are published one
+    // position early), the rest one: the latency of their loads (rows 6 KB
+    // apart, nothing prefetches them) passes under the arithmetic before
+    float qa = 0.f, ka = 0.f, vn, an, bn, zn = 0.f;
     {
-        const long row = (long)bi * t;
-        const float* cr = cq + row * cdim;
+        const float* cr = cq + row0 * cdim;
         if (tid < DK) {
-            qn = cr[ko * DK + tid];
-            kn = cr[kd + ko * DK + tid];
+            qa = cr[ko * DK + tid];
+            ka = cr[kd + ko * DK + tid];
         }
+        GDN_PUB_QK(0, qa, ka)
         vn = cr[2 * kd + h * DV + j];
-        an = a[row * nv + h];
-        bn = bb[row * nv + h];
-        if (c == 0 && out) zn = z[row * vd + h * DV + j];
+        an = a[row0 * nv + h];
+        bn = bb[row0 * nv + h];
+        if (c == 0 && out) zn = z[row0 * vd + h * DV + j];
+        if (t > 1 && tid < DK) {
+            qa = cr[cdim + ko * DK + tid];
+            ka = cr[cdim + kd + ko * DK + tid];
+        }
     }
+    __syncthreads();
+    float o_prev = 0.f, z_prev = 0.f;
     for (int ti = 0; ti < t; ti++) {
-        const long row = (long)bi * t + ti;
-        const float q = qn, k = kn, vj = vn, av = an, bv = bn, zv = zn;
+        const int p = ti & 1;
+        const long row = row0 + ti;
+        const float vj = vn, av = an, bv = bn, zv = zn;
         if (ti + 1 < t) {
+            GDN_PUB_QK(1 - p, qa, ka)
             const float* cr = cq + (row + 1) * cdim;
-            if (tid < DK) {
-                qn = cr[ko * DK + tid];
-                kn = cr[kd + ko * DK + tid];
-            }
             vn = cr[2 * kd + h * DV + j];
             an = a[(row + 1) * nv + h];
             bn = bb[(row + 1) * nv + h];
             if (c == 0 && out) zn = z[(row + 1) * vd + h * DV + j];
-        }
-        if (tid < DK) {
-            qs[tid] = q;
-            ks[tid] = k;
-            float pq = q * q, pk = k * k;
-            for (int o = 16; o > 0; o >>= 1) {
-                pq += __shfl_xor_sync(0xffffffffu, pq, o);
-                pk += __shfl_xor_sync(0xffffffffu, pk, o);
-            }
-            if ((tid & 31) == 0) {
-                rq[tid >> 5] = pq;
-                rk[tid >> 5] = pk;
+            if (ti + 2 < t && tid < DK) {
+                qa = cr[cdim + ko * DK + tid];
+                ka = cr[cdim + kd + ko * DK + tid];
             }
         }
-        __syncthreads();
-        const float nq2 = nt_gsum(rq) + 1e-6f, nk2 = nt_gsum(rk) + 1e-6f;
+        const float nq2 = nt_gsum(rq[p]) + 1e-6f, nk2 = nt_gsum(rk[p]) + 1e-6f;
         const float invq = 1.f / (sqrtf(nq2) * sqrtf((float)DK)), invk = 1.f / sqrtf(nk2);
         const float g = __expf(-ea * bk_softplus(av + dtb)), beta = bk_sigmoid(bv);
         float kvp = 0.f;
 #pragma unroll
         for (int i = 0; i < GR; i++) {
             S[i] *= g;
-            kvp += S[i] * ks[i0 + i] * invk;
+            kvp += S[i] * ks[p][i0 + i] * invk;
         }
         cpa[c][j] = kvp;
         __syncthreads();
+        // the position before: its output under its norm (the sums landed before this barrier)
+        if (c == 0 && out && ti > 0) {
+            const float inv = rsqrtf(nt_gsum(ro) / DV + eps);
+            out[(row - 1) * vd + h * DV + j] = o_prev * inv * wn * bk_silu(z_prev);
+        }
         float kv = 0.f;
 #pragma unroll
         for (int q = 0; q < GC; q++) kv += cpa[q][j];
@@ -444,42 +507,71 @@ extern "C" __global__ void nt_gdn_fwd(const float* cq, const float* z, const flo
         float op = 0.f;
 #pragma unroll
         for (int i = 0; i < GR; i++) {
-            S[i] += ks[i0 + i] * invk * u;
-            op += qs[i0 + i] * invq * S[i];
+            S[i] += ks[p][i0 + i] * invk * u;
+            op += qs[p][i0 + i] * invq * S[i];
         }
-        if (H) {
-            u16* Hn = H + (long)ti * DK * DV;
+        if (H && p == par) {
+            u16* Hn = H + (long)(ti >> 1) * DK * DV;
 #pragma unroll
             for (int i = 0; i < GR; i++) Hn[(long)(i0 + i) * DV + j] = nt_f2h_sat(S[i]);
         }
         cpb[c][j] = op;
         __syncthreads();
-        float o = 0.f;
         if (c == 0) {
+            float o = 0.f;
 #pragma unroll
             for (int q = 0; q < GC; q++) o += cpb[q][j];
             float so = o * o;
             for (int x = 16; x > 0; x >>= 1) so += __shfl_xor_sync(0xffffffffu, so, x);
             if ((tid & 31) == 0) ro[tid >> 5] = so;
-        }
-        __syncthreads();
-        if (c == 0) {
-            if (out) {
-                const float inv = rsqrtf(nt_gsum(ro) / DV + eps);
-                out[row * vd + h * DV + j] = o * inv * wn * bk_silu(zv);
-            }
             if (H) {
                 KV[(long)ti * DV + j] = kv;
                 O[(long)ti * DV + j] = o;
             }
+            o_prev = o;
+            z_prev = zv;
         }
     }
+    __syncthreads();
+    if (c == 0 && out) {
+        const float inv = rsqrtf(nt_gsum(ro) / DV + eps);
+        out[(row0 + t - 1) * vd + h * DV + j] = o_prev * inv * wn * bk_silu(z_prev);
+    }
 }
+
+// The reverse sweep's sums of a position — q, k, their squares, and the gated
+// RMSNorm's two sums — published a position early like the forward's.
+#define GDN_PUB_REV(SL, QV, KV_, OV, ZV, DOV)                      \
+    if (tid < DK) {                                                \
+        qs[SL][tid] = QV;                                          \
+        ks[SL][tid] = KV_;                                         \
+        float pq = QV * QV, pk = KV_ * KV_, so = OV * OV, sd = DOV * (wn * bk_silu(ZV)) * OV; \
+        for (int o = 16; o > 0; o >>= 1) {                         \
+            pq += __shfl_xor_sync(0xffffffffu, pq, o);             \
+            pk += __shfl_xor_sync(0xffffffffu, pk, o);             \
+            so += __shfl_xor_sync(0xffffffffu, so, o);             \
+            sd += __shfl_xor_sync(0xffffffffu, sd, o);             \
+        }                                                          \
+        if (lane == 0) {                                           \
+            rq[SL][w] = pq;                                        \
+            rk[SL][w] = pk;                                        \
+            ro[SL][w] = so;                                        \
+            rs[SL][w] = sd;                                        \
+        }                                                          \
+    }
 
 // Reverse sweep (BPTT) over the history `nt_gdn_fwd` left: grid (nv,
 // sequences of this launch), block DV·GC. Each v-head writes its q̂/k̂
 // through-gradients into DQK ([row][nv][2·DK]); `nt_gdn_qk_sum` adds the heads
 // of a k-group in order. dz, da, db and dcq's v channels are stored.
+//
+// The history holds the state after every second position (the last one
+// among them). At a stored position the state before it is the stored state
+// two back advanced by the position between (g·S + k̂ ⊗ u, u = β·(v − kv) from
+// the forward's kv: no sums); at the position between, the state after it is
+// the stored state before it advanced by the position itself. One state
+// array in registers either way, half the history's traffic. Three barriers
+// a position: the sums of a position are published a position early.
 extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const float* a, const float* bb,
                                       const float* a_log, const float* dt_bias, const float* normw, const float* dout,
                                       float* dcq, float* dz, float* da, float* db, float* dqk, const u16* hist,
@@ -489,104 +581,125 @@ extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const flo
     const int tid = threadIdx.x, j = tid % DV, c = tid / DV, i0 = c * GR;
     const int lane = tid & 31, w = tid >> 5, wc = w % GW;
     const int rep = nv / nk, ko = h / rep, kd = nk * DK, vd = nv * DV, cdim = 2 * kd + vd;
-    __shared__ float qs[DK], ks[DK], rq[GW], rk[GW], ro[GW], rs[GW], rb[GW], rqd[GW], rkd[GW], rg[GC * GW], cp[GC][DV],
-        pq_[GW * GP][DK], pk_[GW * GP][DK];
+    __shared__ float qs[2][DK], ks[2][DK], rq[2][GW], rk[2][GW], ro[2][GW], rs[2][GW], rb[GW], rqd[GW], rkd[GW],
+        rg[GC * GW], cp[GC][DV], pq_[GW * GP][DK], pk_[GW * GP][DK];
     const int lead = (lane & ((1 << GSH) - 1)) == 0, slot = wc * GP + (lane >> GSH);
     const long unit = (long)lb * nv + h;
-    const u16* H = hist + unit * (long)t * DK * DV;
+    const int par = (t - 1) & 1;
+    const u16* H = hist + unit * (long)((t + 1) / 2) * DK * DV;
     const float* KV = kvh + unit * (long)t * DV;
     const float* O = oh + unit * (long)t * DV;
     const float ea = __expf(a_log[h]), dtb = dt_bias[h], wn = normw[j];
+    const long row0 = (long)bi * t;
     float dS[GR], St[GR];
     {
-        const u16* Hl = H + (long)(t - 1) * DK * DV;
+        const u16* Hl = H + (long)((t - 1) >> 1) * DK * DV;
 #pragma unroll
         for (int i = 0; i < GR; i++) {
             dS[i] = 0.f;
             St[i] = nt_h2f(Hl[(long)(i0 + i) * DV + j]);
         }
     }
-    // a position's inputs are read one position ahead (see `nt_gdn_fwd`)
-    float qn = 0.f, kn = 0.f, on, zn, dn, vn, kvn, an, bn;
+    // the current position's inputs, and the next one's (read two positions
+    // ahead: its sums are published a position early; see `nt_gdn_fwd`)
+    float oc, zc, dc, vc, ac, bc;
+    float qn = 0.f, kn = 0.f, on = 0.f, zn = 0.f, dn = 0.f, vn = 0.f, an = 0.f, bn = 0.f;
     {
-        const long row = (long)bi * t + (t - 1);
+        const long row = row0 + (t - 1);
         const float* cr = cq + row * cdim;
+        float q0 = 0.f, k0 = 0.f;
         if (tid < DK) {
-            qn = cr[ko * DK + tid];
-            kn = cr[kd + ko * DK + tid];
+            q0 = cr[ko * DK + tid];
+            k0 = cr[kd + ko * DK + tid];
         }
-        on = O[(long)(t - 1) * DV + j];
-        zn = z[row * vd + h * DV + j];
-        dn = dout[row * vd + h * DV + j];
-        vn = cr[2 * kd + h * DV + j];
-        kvn = KV[(long)(t - 1) * DV + j];
-        an = a[row * nv + h];
-        bn = bb[row * nv + h];
-    }
-    for (int ti = t - 1; ti >= 0; ti--) {
-        const long row = (long)bi * t + ti;
-        const float q = qn, k = kn, oj = on, zv = zn, dof = dn, vmk = vn - kvn, av = an, bv = bn;
-        if (ti > 0) {
-            const float* cr = cq + (row - 1) * cdim;
+        oc = O[(long)(t - 1) * DV + j];
+        zc = z[row * vd + h * DV + j];
+        dc = dout[row * vd + h * DV + j];
+        vc = cr[2 * kd + h * DV + j] - KV[(long)(t - 1) * DV + j];
+        ac = a[row * nv + h];
+        bc = bb[row * nv + h];
+        GDN_PUB_REV((t - 1) & 1, q0, k0, oc, zc, dc)
+        // the other slot's keys are read (times zero) before a position fills them
+        if (tid < DK) ks[1 - ((t - 1) & 1)][tid] = 0.f;
+        if (t > 1) {
+            const float* c1 = cr - cdim;
             if (tid < DK) {
-                qn = cr[ko * DK + tid];
-                kn = cr[kd + ko * DK + tid];
+                qn = c1[ko * DK + tid];
+                kn = c1[kd + ko * DK + tid];
             }
-            on = O[(long)(ti - 1) * DV + j];
+            on = O[(long)(t - 2) * DV + j];
             zn = z[(row - 1) * vd + h * DV + j];
             dn = dout[(row - 1) * vd + h * DV + j];
-            vn = cr[2 * kd + h * DV + j];
-            kvn = KV[(long)(ti - 1) * DV + j];
+            vn = c1[2 * kd + h * DV + j] - KV[(long)(t - 2) * DV + j];
             an = a[(row - 1) * nv + h];
             bn = bb[(row - 1) * nv + h];
         }
-        const float weff = wn * bk_silu(zv);
-        // q̂/k̂ and their norms; the gated RMSNorm's two sums
-        if (tid < DK) {
-            qs[tid] = q;
-            ks[tid] = k;
-            float pq = q * q, pk = k * k, so = oj * oj, sd = dof * weff * oj;
-            for (int o = 16; o > 0; o >>= 1) {
-                pq += __shfl_xor_sync(0xffffffffu, pq, o);
-                pk += __shfl_xor_sync(0xffffffffu, pk, o);
-                so += __shfl_xor_sync(0xffffffffu, so, o);
-                sd += __shfl_xor_sync(0xffffffffu, sd, o);
-            }
-            if (lane == 0) {
-                rq[w] = pq;
-                rk[w] = pk;
-                ro[w] = so;
-                rs[w] = sd;
+    }
+    __syncthreads();
+    for (int ti = t - 1; ti >= 0; ti--) {
+        const int p = ti & 1;
+        const bool stored = p == par;
+        const long row = row0 + ti;
+        const float oj = oc, zv = zc, dof = dc, vmk = vc, av = ac, bv = bc;
+        // the position before, for the state between two stored ones
+        const float vmkn = vn, avn = an, bvn = bn;
+        if (ti > 0) {
+            GDN_PUB_REV(1 - p, qn, kn, on, zn, dn)
+            oc = on;
+            zc = zn;
+            dc = dn;
+            vc = vn;
+            ac = an;
+            bc = bn;
+            if (ti > 1) {
+                const float* c2 = cq + (row - 2) * cdim;
+                if (tid < DK) {
+                    qn = c2[ko * DK + tid];
+                    kn = c2[kd + ko * DK + tid];
+                }
+                on = O[(long)(ti - 2) * DV + j];
+                zn = z[(row - 2) * vd + h * DV + j];
+                dn = dout[(row - 2) * vd + h * DV + j];
+                vn = c2[2 * kd + h * DV + j] - KV[(long)(ti - 2) * DV + j];
+                an = a[(row - 2) * nv + h];
+                bn = bb[(row - 2) * nv + h];
             }
         }
-        __syncthreads();
-        const float nq2 = nt_gsum(rq) + 1e-6f, nk2 = nt_gsum(rk) + 1e-6f;
+        const float weff = wn * bk_silu(zv);
+        const float nq2 = nt_gsum(rq[p]) + 1e-6f, nk2 = nt_gsum(rk[p]) + 1e-6f;
         const float invq = 1.f / (sqrtf(nq2) * sqrtf((float)DK)), invk = 1.f / sqrtf(nk2);
         const float arg = av + dtb;
         const float g = __expf(-ea * bk_softplus(arg)), beta = bk_sigmoid(bv);
-        const float inv = rsqrtf(nt_gsum(ro) / DV + eps), sdot = nt_gsum(rs);
+        const float inv = rsqrtf(nt_gsum(ro[p]) / DV + eps), sdot = nt_gsum(rs[p]);
         const float doj = inv * weff * dof - oj * (sdot / DV) * inv * inv * inv;
         if (c == 0) dz[row * vd + h * DV + j] = dof * oj * inv * wn * bk_silu_bwd(zv);
+        // the state after this position: St itself at a stored position, St
+        // (the stored state before) advanced by this position otherwise
+        const float cs = stored ? 1.f : g, ck = stored ? 0.f : invk * (beta * vmk);
         // dS += q̂ ⊗ do; dq̂ = S_t·do (across columns); du = dSᵀk̂ (across chunks)
         float dup = 0.f;
 #pragma unroll
         for (int i = 0; i < GR; i++) {
-            dS[i] += qs[i0 + i] * invq * doj;
-            dup += dS[i] * ks[i0 + i] * invk;
-            float v = St[i] * doj;
+            const float kx = ks[p][i0 + i];
+            dS[i] += qs[p][i0 + i] * invq * doj;
+            dup += dS[i] * kx * invk;
+            float v = (St[i] * cs + kx * ck) * doj;
             for (int o = 1; o < (1 << GSH); o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             if (lead) pq_[slot][i0 + i] = v;
         }
         cp[c][j] = dup;
-        // the state before this position, read here: its loads pass under the
-        // barrier and the column sum; it stays as the next position's S_t
-        if (ti > 0) {
-            const u16* Hp = H + (long)(ti - 1) * DK * DV;
+        // at a stored position: the stored state two back, read here — its
+        // loads pass under the barrier and the column sum; it serves this
+        // position (advanced) and the next two
+        if (stored) {
+            if (ti > 1) {
+                const u16* Hp = H + (long)((ti - 2) >> 1) * DK * DV;
 #pragma unroll
-            for (int i = 0; i < GR; i++) St[i] = nt_h2f(Hp[(long)(i0 + i) * DV + j]);
-        } else {
+                for (int i = 0; i < GR; i++) St[i] = nt_h2f(Hp[(long)(i0 + i) * DV + j]);
+            } else {
 #pragma unroll
-            for (int i = 0; i < GR; i++) St[i] = 0.f;
+                for (int i = 0; i < GR; i++) St[i] = 0.f;
+            }
         }
         __syncthreads();
         float du = 0.f;
@@ -599,15 +712,28 @@ extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const flo
             for (int o = 16; o > 0; o >>= 1) pb += __shfl_xor_sync(0xffffffffu, pb, o);
             if (lane == 0) rb[w] = pb;
         }
+        // the state before this position: St itself between stored positions,
+        // St advanced by the position before at a stored one (nothing before
+        // position 0)
+        float cs2 = 1.f, ck2 = 0.f;
+        if (stored) {
+            if (ti > 0) {
+                const float invkn = 1.f / sqrtf(nt_gsum(rk[1 - p]) + 1e-6f);
+                cs2 = __expf(-ea * bk_softplus(avn + dtb));
+                ck2 = invkn * (bk_sigmoid(bvn) * vmkn);
+            } else {
+                cs2 = 0.f;
+            }
+        }
         // dk̂ = dS·u + S_pre·dkv (across columns); dg = ⟨dS_pre, S_{t-1}⟩; dS ← g·dS_pre
         float dgp = 0.f;
 #pragma unroll
         for (int i = 0; i < GR; i++) {
-            const float sp = St[i];
+            const float sp = St[i] * cs2 + ks[1 - p][i0 + i] * ck2;
             float v = dS[i] * vmk * beta + sp * g * dkv;
             for (int o = 1; o < (1 << GSH); o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             if (lead) pk_[slot][i0 + i] = v;
-            const float dspre = dS[i] + ks[i0 + i] * invk * dkv;
+            const float dspre = dS[i] + ks[p][i0 + i] * invk * dkv;
             dgp += dspre * sp;
             dS[i] = g * dspre;
         }
@@ -622,7 +748,7 @@ extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const flo
                 aq += pq_[x][tid];
                 ak += pk_[x][tid];
             }
-            float pq = aq * qs[tid], pk = ak * ks[tid];
+            float pq = aq * qs[p][tid], pk = ak * ks[p][tid];
             for (int o = 16; o > 0; o >>= 1) {
                 pq += __shfl_xor_sync(0xffffffffu, pq, o);
                 pk += __shfl_xor_sync(0xffffffffu, pk, o);
@@ -642,8 +768,8 @@ extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const flo
         if (tid < DK) {
             const float qdot = nt_gsum(rqd), kdot = nt_gsum(rkd);
             float* dst = dqk + ((size_t)row * nv + h) * 2 * DK;
-            dst[tid] = invq * aq - qs[tid] * qdot * invq / nq2;
-            dst[DK + tid] = invk * ak - ks[tid] * kdot * invk / nk2;
+            dst[tid] = invq * aq - qs[p][tid] * qdot * invq / nq2;
+            dst[DK + tid] = invk * ak - ks[p][tid] * kdot * invk / nk2;
         }
     }
 }

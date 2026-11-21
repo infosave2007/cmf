@@ -268,6 +268,13 @@ unsafe fn chol_upper_dev(c: &Ctx, a: u64, n: usize, blk: &mut Vec<f64>) -> Res<b
         }
         unsafe {
             blas_ok(bl::cublasSetMatrix(kb as i32, kb as i32, 8, blk.as_ptr().cast(), kb as i32, at(k, k) as *mut c_void, n as i32), "set block")?;
+            // a copy from pageable memory returns once it is staged: its DMA
+            // runs on the legacy stream, which this backend's non-blocking
+            // stream does not wait for — the panel solve queued next could
+            // read the block as it was before the factorisation (the NVG
+            // encoder's twin of this loop failed that way, rarely, with "not
+            // positive definite" at a well-conditioned Gram)
+            cu::stream::synchronize(std::ptr::null_mut()).map_err(derr)?;
         }
         let rest = n - k - kb;
         if rest > 0 {

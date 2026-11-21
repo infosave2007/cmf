@@ -407,11 +407,21 @@ backend the process runs on. The CUDA twin keeps the arithmetic class (f32) and 
 * *Latents*: the Householder tridiagonalisation as kernels (four launches a reflector), the host's f64 bisection +
   inverse iteration (`tridiag_top`, shared with wgpu), the compact-WY back-transform as GEMMs.
 * *Knots*: the blocked output-side flips (32 ranks a block, the rest of `qs` by one GEMM) and the input-side column
-  search of a 128-column block in one block of 1024 threads (the lanes of a thread in registers, argmin and dot
-  products by warp shuffles), the trailing feedback a GEMM. Ranks up to 4096.
-* *Buffers*: device matrices come from a pool keyed by size (`CMF_NVG_CUDA_POOL_GB`, default 24 GB of free buffers);
-  all work is queued on the backend's one stream, so a buffer returned to the pool is reused only by launches queued
-  after its last reader. Tensors in flight (`CMF_NVG_JOBS`) interleave on that stream and do not overlap on the card.
+  search of a 128-column block in one block of 256 threads (`CMF_NVG_GV_WS`; the lanes of a thread in registers,
+  argmin and dot products by warp shuffles), the trailing feedback a GEMM. Ranks up to 4096. A flip of the search
+  is one barrier: the warps' best candidates go to shared memory and every thread merges them itself; a candidate
+  carries its diagonal of K, so the winner's acceptance test reads nothing from the matrix.
+* *Lanes.* A column search is one block on one multiprocessor for tens of milliseconds a launch, and on one stream
+  it holds every other launch back. So a job thread queues on a lane of its own — a stream and a cuBLAS handle
+  (`nvg_dev::private_lane`, pooled and handed on) — and takes no lock: the tensors in flight (`CMF_NVG_JOBS`)
+  overlap on the card. The two candidates of a tensor (two paths at rank r, one path at the same bits) are built
+  on two threads with a lane each as well (`CMF_NVG_CAND_THREADS=0`: one after the other). The results do not
+  depend on any of it: every tensor and candidate is computed from its own matrices and the shared read-only
+  weight and Grams. `CMF_NVG_CUDA_LANES=0` puts everything back on the backend's one stream.
+* *Buffers*: device matrices come from a pool keyed by size (`CMF_NVG_CUDA_POOL_GB`, default 24 GB of free
+  buffers). A buffer a thread frees may still be read by work queued on that thread's stream, so a lane keeps
+  what it frees and only it takes it again; when the lane is given up its stream is drained and its buffers go to
+  the shared pool.
 * A matrix kernel takes its row from the grid's y and its column from x: no 64-bit division per element.
 
 `CMF_NVG_ENC=cuda|wgpu` picks the encoder's backend apart from the engine's (an A/B on identical Grams: wgpu
@@ -448,19 +458,34 @@ each path's backward — and it is laid out for the card's two limits, the tenso
   column reduction over `tokens×m` activations. Only `dℓ = Σ a ⊙ t2` reduces over tokens, at the rank's width.
 * *GDN*: the recurrence in blocks of 512 threads (`nt_gdn_fwd`, `nt_gdn_rev`): a thread keeps 32 state rows of one
   column in registers, column sums go through shared memory, row sums take two shuffle steps and the rest through
-  shared memory; four barriers a position; a position's inputs are read one position ahead, so their latency
-  passes under the arithmetic. The BPTT's state history is f16, written by the forward that the reverse sweep's
-  recompute runs anyway and read once: `t·128·128` halves a (window, v-head) — `CMF_NVG_GDN_HIST_GB` (default 16)
-  caps it by replaying the windows in groups. A v-head writes its q̂/k̂ through-gradients, a second launch adds
-  the heads of a k-group in order. `CMF_NVG_GDN_GC` = 1, 2, 4 picks the block (128, 256, 512 threads).
+  shared memory. A position's q, k and scalar sums are published a position early and its inputs are read ahead,
+  so a position is two barriers forward and three backward and the loads' latency passes under the arithmetic.
+  The BPTT's state history is f16 and holds every second state (the ones after positions t-1, t-3, …), written by
+  the forward that the reverse sweep's recompute runs anyway and read once: `⌈t/2⌉·128·128` halves a (window,
+  v-head). The reverse sweep rebuilds the state between two stored ones by one rank-one step from the forward's
+  `kv` (`g·S + k̂ ⊗ β·(v − kv)`: no sums), with one state array in registers as before.
+  `CMF_NVG_GDN_HIST_GB` (default 16) caps the history by replaying the windows in groups. A v-head writes its
+  q̂/k̂ through-gradients, a second launch adds the heads of a k-group in order. `CMF_NVG_GDN_GC` = 1, 2, 4 picks
+  the block (128, 256, 512 threads).
+* *The recompute reuses the forward's rank activations.* `a = x·S_V` of every path is kept from the step's first
+  forward, per layer and role, and the layer's recompute in the reverse sweep skips that product: the same input
+  and the same weights give the same values, so the losses of a run are equal with and without it. The widest
+  inputs are kept first (`down_proj` saves the most a byte) within `CMF_NVG_ACACHE_GB` (default 7) and what the
+  card has free past a 3 GiB reserve; 0 turns it off.
+* *SwiGLU writes its stagings.* In a training net the MLP's activation is read only as `down_proj`'s f16 input,
+  and the two gradients of SwiGLU only as the f16 output gradients of `gate_proj` and `up_proj`: the kernels write
+  those stagings directly (the values a separate staging pass makes), without the f32 copies.
 * *Attention*: batched GEMMs (TF32; `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM) and a causal softmax.
 * Every trainable parameter lives in one concatenated buffer with its gradient and Adam moments: the optimizer
   and the gradient norm are one launch each.
 * Reductions run in a fixed order and the sign kernels are built without fused multiply-adds, so a step is
   bit-reproducible and a sign update is bit for bit `train_sign`'s host mirror (tested).
 
-`--mask-keep` (DTG-MA before the metric) stays on the wgpu trainer. `CMF_NVG_PROF=1` prints the time per phase
-(the stream drained at phase changes), `CMF_NVG_KT=N` the time of every kernel and GEMM of step N.
+`--mask-keep` (DTG-MA before the metric) runs on CUDA too: a gate per MLP neuron scales the activation that
+`down_proj` reads (`nt_scale_cols`), its gradient is the column sum of the gated activation's gradient times the
+activation, and the gate training, the cut and the refit of ℓ are the wgpu trainer's code over a small trait
+(`MaskNet`). `CMF_NVG_PROF=1` prints the time per phase (the stream drained at phase changes), `CMF_NVG_KT=N` the
+time of every kernel and GEMM of step N.
 
 ### 8.4 Agreement with the wgpu path
 

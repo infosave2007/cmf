@@ -53,12 +53,15 @@ struct F {
     rmsnorm_bwd: cs::CUfunction,
     stage: cs::CUfunction,
     expand_s: cs::CUfunction,
+    scale_cols: cs::CUfunction,
     g_fold: cs::CUfunction,
     h2f_n: cs::CUfunction,
     colsum_part: cs::CUfunction,
     colsum_fin: cs::CUfunction,
     swiglu_fwd: cs::CUfunction,
     swiglu_bwd: cs::CUfunction,
+    swiglu_fwd16: cs::CUfunction,
+    swiglu_bwd16: cs::CUfunction,
     gate_fwd: cs::CUfunction,
     gate_bwd: cs::CUfunction,
     split_qg: cs::CUfunction,
@@ -108,12 +111,15 @@ fn build(c: &Ctx) -> Res<F> {
         rmsnorm_bwd: f("bk_rmsnorm_bwd")?,
         stage: f("nt_stage")?,
         expand_s: f("nt_expand_s")?,
+        scale_cols: f("nt_scale_cols")?,
         g_fold: f("nt_g_fold")?,
         h2f_n: f("nt_h2f_n")?,
         colsum_part: f("nt_colsum_part")?,
         colsum_fin: f("nt_colsum_fin")?,
         swiglu_fwd: f("nt_swiglu_fwd")?,
         swiglu_bwd: f("nt_swiglu_bwd")?,
+        swiglu_fwd16: f("nt_swiglu_fwd16")?,
+        swiglu_bwd16: f("nt_swiglu_bwd16")?,
         gate_fwd: f("nt_gate_fwd")?,
         gate_bwd: f("nt_gate_bwd")?,
         split_qg: f("nt_split_qg")?,
@@ -576,6 +582,17 @@ struct Layer {
     gate: Lin,
     up: Lin,
     down: Lin,
+    mask: Option<MaskGate>,
+}
+
+/// A gate per MLP neuron between the SwiGLU and `down_proj` (DTG-MA): `h·s`
+/// with `s` set by the caller (σ of the mask logits while training, 0/1 for
+/// the hard mask), and `Σ_tokens dL/d(h·s)·h` — the gradient with respect to
+/// `s` — accumulated on the card. The wgpu trainer's `MaskGate`.
+struct MaskGate {
+    s: DBuf,
+    g: DBuf,
+    w: usize,
 }
 
 /// The model on the card.
@@ -823,6 +840,48 @@ impl Net {
         Self::load_range(model, bwd, sign, 0..nl)
     }
 
+    /// DTG-MA: a gate (all open) on every on-device layer's MLP intermediate.
+    /// Call before the workspace is made (it gets the gated activation's
+    /// buffer); the net must be loaded for the backward.
+    pub fn enable_masks(&mut self) -> Result<(), String> {
+        let d = enter()?;
+        for ly in &mut self.layers[self.first..self.end] {
+            let w = ly.gate.m();
+            ly.mask = Some(MaskGate { s: DBuf::from(&vec![1f32; w])?, g: DBuf::floats(d.c, w)?, w });
+        }
+        d.c.sync()
+    }
+
+    /// The gated layers' MLP widths (`first..end`).
+    pub fn mask_widths(&self) -> Vec<usize> {
+        self.layers[self.first..self.end].iter().map(|l| l.gate.m()).collect()
+    }
+
+    /// Set every gate (`s[l]` for layer `first + l`, its MLP width long).
+    pub fn set_masks(&self, s: &[Vec<f32>]) -> Result<(), String> {
+        let d = enter()?;
+        for (ly, v) in self.layers[self.first..self.end].iter().zip(s) {
+            let mg = ly.mask.as_ref().ok_or("the net has no gates")?;
+            if v.len() != mg.w {
+                return Err(format!("a gate of {} for an MLP of {}", v.len(), mg.w));
+            }
+            put(d.c, mg.s.ptr, v)?;
+        }
+        Ok(())
+    }
+
+    /// The gates' accumulated gradients `dL/ds`, read and cleared.
+    pub fn mask_grads(&self) -> Result<Vec<Vec<f32>>, String> {
+        let d = enter()?;
+        let mut out = Vec::new();
+        for ly in &self.layers[self.first..self.end] {
+            let mg = ly.mask.as_ref().ok_or("the net has no gates")?;
+            out.push(get_f32(d.c, mg.g.ptr, mg.w)?);
+            zero_f(d.c, mg.g.ptr, mg.w)?;
+        }
+        Ok(out)
+    }
+
     /// Layers `range` only, forward, without the head: the calibration
     /// forward over the layers a conversion is working on.
     pub fn load_calib(model: &CmfModel, range: std::ops::Range<usize>) -> Result<Self, String> {
@@ -891,7 +950,7 @@ impl Net {
             let gate = lin("mlp.gate_proj.weight", "mlp.gate", false, &mut pb)?;
             let up = lin("mlp.up_proj.weight", "mlp.up", false, &mut pb)?;
             let down = lin("mlp.down_proj.weight", "mlp.down", false, &mut pb)?;
-            layers.push(Layer { ln1, ln2, mix, gate, up, down });
+            layers.push(Layer { ln1, ln2, mix, gate, up, down, mask: None });
         }
         // per-layer MLP widths (a pruned model): the workspace takes the widest
         geom.inter = layers.iter().map(|l| l.gate.m()).max().unwrap_or(geom.inter);
@@ -1067,6 +1126,22 @@ pub struct Work {
     xs_mx: Xs,
     xs_n2: Xs,
     xs_hh: Xs,
+    /// Per layer (from `ac_first`) and role: the rank activations `a` of a
+    /// binary low-rank linear's paths as the step's first forward left them.
+    /// The layer's recompute in the reverse sweep reads them instead of
+    /// repeating x·S_V (same input, same weights: the same values). Absent
+    /// where the budget (`CMF_NVG_ACACHE_GB`, widest inputs first) ran out.
+    acache: Vec<HashMap<&'static str, Vec<DBuf>>>,
+    ac_first: usize,
+    /// The layer the linear calls belong to, and the cache's part in them:
+    /// 0 none (the role's scratch), 1 the forward fills it, 2 the recompute
+    /// and the backward read it.
+    ac_layer: std::cell::Cell<usize>,
+    ac_mode: std::cell::Cell<u8>,
+    /// The caches hold the forward of the step in flight.
+    ac_valid: std::cell::Cell<bool>,
+    /// Device bytes of the caches.
+    pub acache_bytes: u64,
     rope: DBuf,
     /// u32[64] sign counters (the CNT_* slots of `train_sign`).
     cnt: DBuf,
@@ -1100,6 +1175,10 @@ impl Work {
         }
         for n in ["gg", "uu", "hh"] {
             z(n, ntok * g.inter)?;
+        }
+        // the gated MLP activation (DTG-MA), beside the ungated one its gradient needs
+        if net.layers[net.first..net.end].iter().any(|l| l.mask.is_some()) {
+            z("hg", ntok * g.inter)?;
         }
         if bwd {
             for n in ["dx", "dn1", "dx2", "dn2", "dmix"] {
@@ -1144,11 +1223,11 @@ impl Work {
                 for (n, w) in [("dgout", v), ("dcq", cd), ("draw", cd), ("dz", v), ("da", g.nv), ("db", g.nv), ("dqk", g.nv * 2 * DKV)] {
                     z(n, ntok * w)?;
                 }
-                // the BPTT's state history: t·dk·dv halves a (sequence, v-head)
+                // the BPTT's state history: every second state, ⌈t/2⌉·dk·dv halves a (sequence, v-head)
                 let cap = std::env::var("CMF_NVG_GDN_HIST_GB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 30;
-                let per_seq = t * DKV * DKV * 2 * g.nv;
+                let per_seq = t.div_ceil(2) * DKV * DKV * 2 * g.nv;
                 gdn_per = (cap / per_seq.max(1)).clamp(1, nb);
-                z("hist", (gdn_per * g.nv * t * DKV * DKV).div_ceil(2))?;
+                z("hist", (gdn_per * g.nv * t.div_ceil(2) * DKV * DKV).div_ceil(2))?;
                 z("kvh", gdn_per * g.nv * t * DKV)?;
                 z("oh", gdn_per * g.nv * t * DKV)?;
             }
@@ -1251,6 +1330,52 @@ impl Work {
                 tab.push(a.sin() as f32);
             }
         }
+        let ckpt = (0..=g.nl).map(|l| if l >= net.first && l <= net.end { DBuf::floats(c, ntok * g.hs) } else { DBuf::floats(c, 1) }).collect::<Res<Vec<_>>>()?;
+        // the rank activations kept from a step's forward for the recompute,
+        // last of the workspace: the widest inputs first (the product saved is
+        // ntok·n·r a path), within `CMF_NVG_ACACHE_GB` (default 7) and what
+        // the card has free past a 3 GiB reserve
+        let mut acache: Vec<HashMap<&'static str, Vec<DBuf>>> = (net.first..net.end).map(|_| HashMap::new()).collect();
+        let mut acache_bytes = 0u64;
+        if bwd {
+            let want = (std::env::var("CMF_NVG_ACACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(7.0).max(0.0) * (1u64 << 30) as f64) as u64;
+            c.sync()?;
+            let free = cu::mem_get_info().map(|(f, _)| f as u64).unwrap_or(0);
+            let budget = want.min(free.saturating_sub(3 << 30));
+            let mut cand: Vec<(usize, usize, &'static str, usize, usize)> = Vec::new();
+            for (li, l) in net.layers[net.first..net.end].iter().enumerate() {
+                let mut lins: Vec<&Lin> = vec![&l.gate, &l.up, &l.down];
+                match &l.mix {
+                    Mix::Gdn { qkv, z, a, b, out, .. } => lins.extend([qkv, z, a, b, out]),
+                    Mix::Attn { q, k, v, o, .. } => lins.extend([q, k, v, o]),
+                }
+                for lin in lins {
+                    if let Lin::Blr { n, r, role, paths, .. } = lin {
+                        cand.push((*n, li, *role, *r, paths.len()));
+                    }
+                }
+            }
+            cand.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+            'fill: for (_, li, role, r, np) in cand {
+                let bytes = (np * ntok * r * 4) as u64;
+                if acache_bytes + bytes > budget {
+                    continue;
+                }
+                let mut v = Vec::with_capacity(np);
+                for _ in 0..np {
+                    match DBuf::floats(c, ntok * r) {
+                        Ok(buf) => v.push(buf),
+                        // the card is full after all: what is cached stays, the rest recomputes
+                        Err(_) => break 'fill,
+                    }
+                }
+                acache[li].insert(role, v);
+                acache_bytes += bytes;
+            }
+            if acache_bytes > 0 {
+                tracing::info!("nvg-train (cuda): {:.2} GB of rank activations kept from the forward for the recompute", acache_bytes as f64 / 1e9);
+            }
+        }
         let xs = |n: &str| Xs::new(b[n].ptr);
         let (xs_n1, xs_mx, xs_n2, xs_hh) = (xs("xs_n1"), xs("xs_mx"), xs("xs_n2"), xs("xs_hh"));
         let w = Work {
@@ -1261,9 +1386,15 @@ impl Work {
             xs_mx,
             xs_n2,
             xs_hh,
-            ckpt: (0..=g.nl).map(|l| if l >= net.first && l <= net.end { DBuf::floats(c, ntok * g.hs) } else { DBuf::floats(c, 1) }).collect::<Res<Vec<_>>>()?,
+            ckpt,
             b,
             blr,
+            acache,
+            ac_first: net.first,
+            ac_layer: std::cell::Cell::new(0),
+            ac_mode: std::cell::Cell::new(0),
+            ac_valid: std::cell::Cell::new(false),
+            acache_bytes,
             rope: DBuf::from(&tab)?,
             cnt: DBuf::floats(c, ts::CNT_LEN)?,
             head_chunk,
@@ -1276,6 +1407,15 @@ impl Work {
 
     fn p(&self, n: &str) -> u64 {
         self.b[n].ptr
+    }
+
+    /// The cached rank activations of `role` in the layer in flight, when
+    /// the cache takes part (see `ac_mode`).
+    fn acache_of(&self, role: &str) -> Option<&Vec<DBuf>> {
+        if self.ac_mode.get() == 0 {
+            return None;
+        }
+        self.acache.get(self.ac_layer.get().wrapping_sub(self.ac_first))?.get(role)
     }
 }
 
@@ -1301,11 +1441,18 @@ unsafe fn lin_fwd(d: &Dev, net: &Net, w: &Work, lin: &Lin, x: u64, xs: &Xs, y: u
                 let (m, n, r) = (*m, *n, *r);
                 let sc = &w.blr[role];
                 let xh = staged(n)?;
+                // the rank activations: the role's scratch, or the layer's
+                // cache — written by the step's forward, read by the recompute
+                let ac = w.acache_of(role);
+                let kept = ac.is_some() && w.ac_mode.get() == 2;
                 for (pi, p) in paths.iter().enumerate() {
-                    let (a, pu, pv) = (sc[pi].a.ptr, sc[pi].pu.ptr, sc[pi].pv.ptr);
+                    let (pu, pv) = (sc[pi].pu.ptr, sc[pi].pv.ptr);
+                    let a = ac.map_or(sc[pi].a.ptr, |v| v[pi].ptr);
                     // a = x·(diag(g) S_V);  y (+)= (a ⊙ ℓ)·(diag(h) S_U)ᵀ
                     d.expand_s(p.bits_v.ptr, pv, n, r, net.w(p.g), p.mg)?;
-                    d.mm(ntok, r, n, 1.0 / p.mg, xh, n, false, pv, r, false, 0.0, a, r, Gemm::Half)?;
+                    if !kept {
+                        d.mm(ntok, r, n, 1.0 / p.mg, xh, n, false, pv, r, false, 0.0, a, r, Gemm::Half)?;
+                    }
                     d.stage(a, Some(net.w(p.l)), w.p("s2"), ntok, r, 1.0)?;
                     d.expand_s(p.bits_u.ptr, pu, m, r, net.w(p.h), p.mh)?;
                     d.mm(ntok, m, r, 1.0 / p.mh, w.p("s2"), r, false, pu, r, true, if pi > 0 { 1.0 } else { 0.0 }, y, m, Gemm::Half)?;
@@ -1363,8 +1510,18 @@ unsafe fn sign_update(d: &Dev, w: &Work, cfg: &SignStepCfg, mat: &SignMat, g: u6
 /// diag(h)·G'_U and diag(g)·G'_V — the scales' gradients are row sums of the
 /// matrices the sign training needs anyway, not passes over the activations.
 #[allow(clippy::too_many_arguments)]
-unsafe fn lin_bwd(d: &Dev, net: &Net, w: &Work, lin: &Lin, xs: &Xs, dy: u64, dx: u64, acc: bool, gs: f32, sign: Option<&SignStepCfg>) -> Res<()> {
+unsafe fn lin_bwd(d: &Dev, net: &Net, w: &Work, lin: &Lin, xs: &Xs, dy: Dy, dx: u64, acc: bool, gs: f32, sign: Option<&SignStepCfg>) -> Res<()> {
     let ntok = w.ntok;
+    // the output gradient's f16 staging (times the gradient scale): given, or made in s1
+    let staged = |m: usize| -> Res<u64> {
+        match dy {
+            Dy::Staged(p) => Ok(p),
+            Dy::F32(p) => {
+                unsafe { d.stage(p, None, w.p("s1"), ntok, m, gs)? };
+                Ok(w.p("s1"))
+            }
+        }
+    };
     unsafe {
         match lin {
             Lin::Blr { m, n, r, role, paths, .. } => {
@@ -1375,10 +1532,12 @@ unsafe fn lin_bwd(d: &Dev, net: &Net, w: &Work, lin: &Lin, xs: &Xs, dy: u64, dx:
                 let sc = &w.blr[role];
                 let part = w.p("part");
                 let rid = ts::role_id(role);
-                let (s1, s2, s3, t2, g) = (w.p("s1"), w.p("s2"), w.p("s3"), w.p("t2"), w.p("sg"));
-                d.stage(dy, None, s1, ntok, m, gs)?;
+                let (s2, s3, t2, g) = (w.p("s2"), w.p("s3"), w.p("t2"), w.p("sg"));
+                let s1 = staged(m)?;
+                let ac = w.acache_of(role);
                 for (pi, p) in paths.iter().enumerate() {
-                    let (a, pu, pv) = (sc[pi].a.ptr, sc[pi].pu.ptr, sc[pi].pv.ptr);
+                    let (pu, pv) = (sc[pi].pu.ptr, sc[pi].pv.ptr);
+                    let a = ac.map_or(sc[pi].a.ptr, |v| v[pi].ptr);
                     let (ph, pl, pg) = (net.w(p.h), net.w(p.l), net.w(p.g));
                     // t2 = dy·(diag(h) S_U);  dℓ += Σ a ⊙ t2
                     d.mm(ntok, r, m, 1.0 / (gs * p.mh), s1, m, false, pu, r, false, 0.0, t2, r, Gemm::Half)?;
@@ -1405,17 +1564,28 @@ unsafe fn lin_bwd(d: &Dev, net: &Net, w: &Work, lin: &Lin, xs: &Xs, dy: u64, dx:
             }
             Lin::Plane { w: pl, m, k } => {
                 let target = if acc { w.p("tmp_h") } else { dx };
-                d.stage(dy, None, w.p("s1"), ntok, *m, gs)?;
-                d.mm(ntok, *k, *m, 1.0 / gs, w.p("s1"), *m, false, pl.ptr, *k, false, 0.0, target, *k, Gemm::Half)?;
+                let s1 = staged(*m)?;
+                d.mm(ntok, *k, *m, 1.0 / gs, s1, *m, false, pl.ptr, *k, false, 0.0, target, *k, Gemm::Half)?;
                 if acc {
                     d.add(dx, target, dx, ntok * k)?;
                 }
                 Ok(())
             }
-            Lin::Dense { w: dw, m, k } => d.mm(ntok, *k, *m, 1.0, dy, *m, false, dw.ptr, *k, false, if acc { 1.0 } else { 0.0 }, dx, *k, Gemm::F32),
+            Lin::Dense { w: dw, m, k } => {
+                let Dy::F32(dy) = dy else { return Err("a staged gradient into a dense linear".into()) };
+                d.mm(ntok, *k, *m, 1.0, dy, *m, false, dw.ptr, *k, false, if acc { 1.0 } else { 0.0 }, dx, *k, Gemm::F32)
+            }
             Lin::Absent { .. } => Err("a linear outside the net's range".into()),
         }
     }
+}
+
+/// A linear's output gradient: f32 `[ntok][m]`, or its f16 staging already
+/// made (times the gradient scale).
+#[derive(Clone, Copy)]
+enum Dy {
+    F32(u64),
+    Staged(u64),
 }
 
 // ───────────────────────────── attention core ─────────────────────────────
@@ -1647,6 +1817,16 @@ unsafe fn layer_fwd(d: &Dev, net: &Net, w: &Work, l: usize, x: u64, y: u64, bptt
     for xs in [&w.xs_n1, &w.xs_mx, &w.xs_n2, &w.xs_hh] {
         xs.done.set(false);
     }
+    // a plain forward fills the layer's rank-activation cache; the recompute
+    // of the step in flight (and the backward after it) reads it
+    w.ac_layer.set(l);
+    w.ac_mode.set(if !bptt {
+        1
+    } else if w.ac_valid.get() {
+        2
+    } else {
+        0
+    });
     unsafe {
         d.rms_fwd(x, net.w(ly.ln1), w.p("n1"), w.p("inv1"), n, g.hs, g.eps, g.gemma)?;
         match &ly.mix {
@@ -1686,8 +1866,26 @@ unsafe fn layer_fwd(d: &Dev, net: &Net, w: &Work, l: usize, x: u64, y: u64, bptt
         lin_fwd(d, net, w, &ly.up, w.p("n2"), &w.xs_n2, w.p("uu"), false)?;
         let inter = ly.gate.m();
         let ni = (n * inter) as u64;
-        d.el(d.f.swiglu_fwd, n * inter, kargs!(w.p("gg"), w.p("uu"), w.p("hh"), ni))?;
-        lin_fwd(d, net, w, &ly.down, w.p("hh"), &w.xs_hh, w.p("mix"), false)?;
+        // A training net without gates reads the activation only as down_proj's
+        // staged input: it is written there directly (the values the staging
+        // would make of it), with no f32 copy. A forward-only net keeps the
+        // f32 activation — the calibration folds it into down_proj's Gram.
+        if net.bwd && ly.mask.is_none() && matches!(ly.down, Lin::Blr { .. } | Lin::Plane { .. }) {
+            d.el(d.f.swiglu_fwd16, n * inter, kargs!(w.p("gg"), w.p("uu"), w.xs_hh.buf, ni))?;
+            w.xs_hh.done.set(true);
+        } else {
+            d.el(d.f.swiglu_fwd, n * inter, kargs!(w.p("gg"), w.p("uu"), w.p("hh"), ni))?;
+        }
+        // DTG-MA: down_proj reads the gated activation
+        let act = match &ly.mask {
+            Some(mg) => {
+                let ki = inter as u32;
+                d.el2(d.f.scale_cols, n, inter, kargs!(w.p("hh"), mg.s.ptr, w.p("hg"), ki))?;
+                w.p("hg")
+            }
+            None => w.p("hh"),
+        };
+        lin_fwd(d, net, w, &ly.down, act, &w.xs_hh, w.p("mix"), false)?;
         d.add(w.p("x2"), w.p("mix"), y, n * g.hs)
     }
 }
@@ -1702,32 +1900,49 @@ unsafe fn layer_bwd(d: &Dev, net: &Net, w: &Work, l: usize, x: u64, dy: u64, dx:
     let part = w.p("part");
     unsafe {
         // MLP: y = x2 + down(swiglu(gate(n2), up(n2)))
-        lin_bwd(d, net, w, &ly.down, &w.xs_hh, dy, w.p("dhh"), false, gs, sg)?;
+        lin_bwd(d, net, w, &ly.down, &w.xs_hh, Dy::F32(dy), w.p("dhh"), false, gs, sg)?;
         let inter = ly.gate.m();
         let ni = (n * inter) as u64;
-        d.el(d.f.swiglu_bwd, n * inter, kargs!(w.p("gg"), w.p("uu"), w.p("dhh"), w.p("dgg"), w.p("duu"), ni))?;
-        lin_bwd(d, net, w, &ly.gate, &w.xs_n2, w.p("dgg"), w.p("dn2"), false, gs, sg)?;
-        lin_bwd(d, net, w, &ly.up, &w.xs_n2, w.p("duu"), w.p("dn2"), true, gs, sg)?;
+        if let Some(mg) = &ly.mask {
+            // the gate's gradient Σ_tokens dL/d(h·s)·h, then dL/dh = dL/d(h·s)·s
+            d.colsum(w.p("dhh"), w.p("hh"), w.p("hh"), mg.g.ptr, n, inter, 0, true, part)?;
+            let ki = inter as u32;
+            d.el2(d.f.scale_cols, n, inter, kargs!(w.p("dhh"), mg.s.ptr, w.p("dhh"), ki))?;
+        }
+        let staged_dy = |l: &Lin| matches!(l, Lin::Blr { .. } | Lin::Plane { .. });
+        if staged_dy(&ly.gate) && staged_dy(&ly.up) {
+            // the two gradients go straight to their f16 stagings (gate's in
+            // s1, up's in the buffer that held down_proj's staged input: its
+            // backward is done), no f32 copies and no staging passes
+            let (g16, u16_) = (w.p("s1"), w.xs_hh.buf);
+            d.el(d.f.swiglu_bwd16, n * inter, kargs!(w.p("gg"), w.p("uu"), w.p("dhh"), g16, u16_, ni, gs))?;
+            lin_bwd(d, net, w, &ly.gate, &w.xs_n2, Dy::Staged(g16), w.p("dn2"), false, gs, sg)?;
+            lin_bwd(d, net, w, &ly.up, &w.xs_n2, Dy::Staged(u16_), w.p("dn2"), true, gs, sg)?;
+        } else {
+            d.el(d.f.swiglu_bwd, n * inter, kargs!(w.p("gg"), w.p("uu"), w.p("dhh"), w.p("dgg"), w.p("duu"), ni))?;
+            lin_bwd(d, net, w, &ly.gate, &w.xs_n2, Dy::F32(w.p("dgg")), w.p("dn2"), false, gs, sg)?;
+            lin_bwd(d, net, w, &ly.up, &w.xs_n2, Dy::F32(w.p("duu")), w.p("dn2"), true, gs, sg)?;
+        }
         d.rms_bwd(w.p("x2"), net.w(ly.ln2), w.p("inv2"), w.p("dn2"), w.p("dx2"), net.g(ly.ln2), n, g.hs, g.gemma, part)?;
         d.add(w.p("dx2"), dy, w.p("dx2"), n * g.hs)?;
         // mixer: x2 = x + mix(n1)
         match &ly.mix {
             Mix::Gdn { qkv, z, a, b, out, prm } => {
                 let prm = prm.as_ref().ok_or("GDN layer outside the net's range")?;
-                lin_bwd(d, net, w, out, &w.xs_mx, w.p("dx2"), w.p("dgout"), false, gs, sg)?;
+                lin_bwd(d, net, w, out, &w.xs_mx, Dy::F32(w.p("dx2")), w.p("dgout"), false, gs, sg)?;
                 {
                     let _ph = d.phase("gdn.bptt");
                     let gg = GdnG { nb: w.nb, t: w.t, nv: g.nv, nk: g.nk, kk: g.kk, eps: g.eps };
                     gdn_core_bwd(d, gg, prm.ptrs(), w.p("zz"), w.p("aa"), w.p("bb"), w.p("pre"), w.p("cq"), w.p("dgout"), w.p("draw"), w.p("dz"), w.p("da"), w.p("db"), &GdnS::of(w), true)?;
                 }
-                lin_bwd(d, net, w, qkv, &w.xs_n1, w.p("draw"), w.p("dn1"), false, gs, sg)?;
-                lin_bwd(d, net, w, z, &w.xs_n1, w.p("dz"), w.p("dn1"), true, gs, sg)?;
-                lin_bwd(d, net, w, a, &w.xs_n1, w.p("da"), w.p("dn1"), true, gs, sg)?;
-                lin_bwd(d, net, w, b, &w.xs_n1, w.p("db"), w.p("dn1"), true, gs, sg)?;
+                lin_bwd(d, net, w, qkv, &w.xs_n1, Dy::F32(w.p("draw")), w.p("dn1"), false, gs, sg)?;
+                lin_bwd(d, net, w, z, &w.xs_n1, Dy::F32(w.p("dz")), w.p("dn1"), true, gs, sg)?;
+                lin_bwd(d, net, w, a, &w.xs_n1, Dy::F32(w.p("da")), w.p("dn1"), true, gs, sg)?;
+                lin_bwd(d, net, w, b, &w.xs_n1, Dy::F32(w.p("db")), w.p("dn1"), true, gs, sg)?;
             }
             Mix::Attn { q, k, v, o, qn, kn } => {
                 let (qd, kd) = (g.nh * g.hd, g.nkv * g.hd);
-                lin_bwd(d, net, w, o, &w.xs_mx, w.p("dx2"), w.p("dog"), false, gs, sg)?;
+                lin_bwd(d, net, w, o, &w.xs_mx, Dy::F32(w.p("dx2")), w.p("dog"), false, gs, sg)?;
                 let nq = (n * qd) as u64;
                 d.el(d.f.gate_bwd, n * qd, kargs!(w.p("o"), w.p("gate"), w.p("dog"), w.p("do"), w.p("dgate"), nq))?;
                 let ag = AttnG { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
@@ -1742,9 +1957,9 @@ unsafe fn layer_bwd(d: &Dev, net: &Net, w: &Work, l: usize, x: u64, dy: u64, dx:
                 d.colsum(w.p("dwk"), w.p("dwk"), w.p("dwk"), net.g(*kn), n * g.nkv, g.hd, 2, true, part)?;
                 let one_u = 1u32;
                 d.el2(d.f.split_qg, n, qd, kargs!(w.p("dqg"), w.p("dq"), w.p("dgate"), nhi, hdi, one_u))?;
-                lin_bwd(d, net, w, q, &w.xs_n1, w.p("dqg"), w.p("dn1"), false, gs, sg)?;
-                lin_bwd(d, net, w, k, &w.xs_n1, w.p("dk"), w.p("dn1"), true, gs, sg)?;
-                lin_bwd(d, net, w, v, &w.xs_n1, w.p("dv"), w.p("dn1"), true, gs, sg)?;
+                lin_bwd(d, net, w, q, &w.xs_n1, Dy::F32(w.p("dqg")), w.p("dn1"), false, gs, sg)?;
+                lin_bwd(d, net, w, k, &w.xs_n1, Dy::F32(w.p("dk")), w.p("dn1"), true, gs, sg)?;
+                lin_bwd(d, net, w, v, &w.xs_n1, Dy::F32(w.p("dv")), w.p("dn1"), true, gs, sg)?;
             }
         }
         d.rms_bwd(x, net.w(ly.ln1), w.p("inv1"), w.p("dn1"), dx, net.g(ly.ln1), n, g.hs, g.gemma, part)?;
@@ -1799,6 +2014,7 @@ fn forward_to(d: &Dev, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, upt
         None => return Err("a net starting past layer 0 needs its input".into()),
     }
     let upto = upto.min(net.end);
+    w.ac_valid.set(false);
     for l in net.first..upto {
         let _p = d.phase(if g.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
         unsafe { layer_fwd(d, net, w, l, w.ckpt[l].ptr, w.ckpt[l + 1].ptr, false)? };
@@ -1917,6 +2133,8 @@ pub fn step(net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize,
         unsafe { cu::memset_d8_async(w.cnt.ptr, 0, ts::CNT_LEN * 4, d.c.stream).map_err(derr)? };
     }
     forward_to(&d, net, w, ids, None, g.nl, true)?;
+    // the caches of the rank activations hold this forward until the sweep ends
+    w.ac_valid.set(true);
     {
         let _p = d.phase("head");
         unsafe {
@@ -1942,6 +2160,8 @@ pub fn step(net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize,
         unsafe { layer_bwd(&d, net, w, l, w.ckpt[l].ptr, cur, nxt, gscale, sign)? };
         std::mem::swap(&mut cur, &mut nxt);
     }
+    w.ac_valid.set(false);
+    w.ac_mode.set(0);
     let mut st = StepStats { backward: true, ..Default::default() };
     if sign.is_some() {
         let cnt = get_u32(d.c, w.cnt.ptr, ts::CNT_LEN)?;
@@ -2292,6 +2512,7 @@ mod tests {
                 gate,
                 up: Lin::Absent { m: inter },
                 down: Lin::Absent { m: hs },
+                mask: None,
             }],
             final_norm,
             head: head.map(|(w, _)| DBuf::from(&to_f16(w)).unwrap()),
@@ -2377,7 +2598,7 @@ mod tests {
         let lin = &net.layers[0].gate;
         unsafe {
             lin_fwd(&d, &net, &w, lin, bx.ptr, &w.xs_n2, by.ptr, false).unwrap();
-            lin_bwd(&d, &net, &w, lin, &w.xs_n2, bdy.ptr, bdx.ptr, false, 1024.0, None).unwrap();
+            lin_bwd(&d, &net, &w, lin, &w.xs_n2, Dy::F32(bdy.ptr), bdx.ptr, false, 1024.0, None).unwrap();
         }
         let mut y = vec![0f64; ntok * m];
         let mut dx = vec![0f64; ntok * n];
@@ -2483,16 +2704,24 @@ mod tests {
         assert!(stats.iter().any(|(name, f, live)| name == "mlp.gate.U" && *f > 0 && *live == (m * r) as u64), "{stats:?}");
     }
 
-    /// The GDN core (conv, recurrence, the reverse sweep over an f16 state
-    /// history — kept by the forward, and replayed one sequence a launch — the
-    /// group sum of the q̂/k̂ through-gradients) against the bake's entries.
+    /// The GDN core (conv, recurrence, the reverse sweep over an f16 history
+    /// of every second state — kept by the forward, and replayed one sequence
+    /// a launch — the group sum of the q̂/k̂ through-gradients) against the
+    /// bake's entries, for odd and even lengths (the stored states are the
+    /// ones after positions t-1, t-3, …) and the shortest ones.
     #[test]
     fn cuda_gdn_core_matches_bake() {
         if enter().is_err() {
             eprintln!("no CUDA device — skipped");
             return;
         }
-        let (nb, t, nv, nk, kk) = (2usize, 9usize, 2usize, 1usize, 4usize);
+        for t in [9usize, 8, 1, 2, 3] {
+            gdn_core_against_bake(t);
+        }
+    }
+
+    fn gdn_core_against_bake(t: usize) {
+        let (nb, nv, nk, kk) = (2usize, 2usize, 1usize, 4usize);
         let g = GdnG { nb, t, nv, nk, kk, eps: 1e-6 };
         let (n, cd, v) = (nb * t, g.cd(), g.vd());
         let (qkv, z, a, b, dout) = (rnd(n * cd, 1, 0.5), rnd(n * v, 2, 1.0), rnd(n * nv, 3, 1.0), rnd(n * nv, 4, 1.0), rnd(n * v, 5, 1.0));
@@ -2508,7 +2737,7 @@ mod tests {
         let (bconv, balog, bdtb, bnorm) = (up(&conv), up(&a_log), up(&dt_bias), up(&norm));
         let p = GdnP { a_log: balog.ptr, dt_bias: bdtb.ptr, norm: bnorm.ptr, conv: bconv.ptr };
         let (pre, cq, out, draw, dz, da, db) = (fl(n * cd), fl(n * cd), fl(n * v), fl(n * cd), fl(n * v), fl(n * nv), fl(n * nv));
-        let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl(nb * nv * t * DKV * DKV / 2), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
+        let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl((nb * nv * t.div_ceil(2) * DKV * DKV).div_ceil(2)), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
         let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
         // per = nb: the forward keeps the states; per = 1: a replay a sequence
         for per in [nb, 1] {
@@ -2524,6 +2753,73 @@ mod tests {
             rel("gdn da", &get_f32(d.c, da.ptr, n * nv).unwrap(), &f64s(&da_ref), 1e-3);
             rel("gdn db", &get_f32(d.c, db.ptr, n * nv).unwrap(), &f64s(&db_ref), 1e-4);
         }
+    }
+
+    /// DTG-MA gates on a real model (`CMF_TRAIN_TEST_MODEL`, a Qwen3.5-family
+    /// file with binary low-rank tensors; `--ignored`): every gate open leaves
+    /// the loss as it is; the analytic gradient of a gate against a central
+    /// difference of the loss, for the largest-gradient gates of the first and
+    /// the last layer, the gates set to a spread of values. The wgpu
+    /// trainer's `mask_gradient_check`.
+    #[test]
+    #[ignore]
+    fn cuda_mask_gradient_check() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        if enter().is_err() {
+            eprintln!("no CUDA device — skipped");
+            return;
+        }
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let teacher = Net::load(&model, false, None).expect("teacher");
+        let (nb, t, k) = (2usize, 64usize, 32usize);
+        let tw = Work::new(&teacher, nb, t).expect("work");
+        let vocab = teacher.geom.vocab as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, tp) = teacher_topk(&teacher, &tw, &ids, k).expect("topk");
+        let plain = loss_only(&teacher, &tw, &ids, &tid, &tp, k).unwrap();
+        drop((tw, teacher));
+        let mut student = Net::load(&model, true, None).expect("student");
+        student.enable_masks().unwrap();
+        let w = Work::new(&student, nb, t).expect("work");
+        let open = loss_only(&student, &w, &ids, &tid, &tp, k).unwrap();
+        eprintln!("loss: plain {plain:.8}, every gate open {open:.8}");
+        assert_eq!(plain, open, "open gates must leave the net unchanged");
+        let nl = student.geom.nl;
+        let mut s: Vec<Vec<f32>> = student.mask_widths().iter().enumerate().map(|(l, &m)| (0..m).map(|j| 0.4 + 0.6 * (((j * 37 + l * 11) % 101) as f32 / 100.0)).collect()).collect();
+        student.set_masks(&s).unwrap();
+        zero_grads(&student).unwrap();
+        let st = step(&student, &w, &ids, &tid, &tp, k, 1024.0, None).expect("step");
+        let g = student.mask_grads().unwrap();
+        eprintln!("loss with gates {:.6}", st.loss);
+        let mut worst = 0f64;
+        for l in [0, nl - 1] {
+            let mut order: Vec<usize> = (0..g[l].len()).collect();
+            order.sort_by(|&a, &b| g[l][b].abs().partial_cmp(&g[l][a].abs()).unwrap());
+            for &j in order.iter().take(4) {
+                let base = s[l][j];
+                let mut fds = Vec::new();
+                for eps in [0.02f32, 0.08] {
+                    s[l][j] = base + eps;
+                    student.set_masks(&s).unwrap();
+                    let lp = loss_only(&student, &w, &ids, &tid, &tp, k).unwrap();
+                    s[l][j] = base - eps;
+                    student.set_masks(&s).unwrap();
+                    let lm = loss_only(&student, &w, &ids, &tid, &tp, k).unwrap();
+                    fds.push((lp - lm) / (2.0 * eps as f64));
+                }
+                s[l][j] = base;
+                let r = fds.iter().map(|fd| (fd / g[l][j] as f64 - 1.0).abs()).fold(f64::MAX, f64::min);
+                // the last layer's difference is clean; through all the layers
+                // above the first one it scatters around the gradient by the
+                // f16 forward's rounding: the two step sizes must bracket it
+                let (lo, hi) = (fds[0].min(fds[1]), fds[0].max(fds[1]));
+                let a = g[l][j] as f64;
+                let ok = if l + 1 == nl { r < 0.02 } else { r < 0.15 || (a >= lo - 0.15 * a.abs() && a <= hi + 0.15 * a.abs()) };
+                worst = worst.max(if ok { 0.0 } else { r });
+                eprintln!("L{l} gate {j}: analytic {:.5e}  fd(0.02) {:.5e}  fd(0.08) {:.5e}  (rel {r:.3}){}", g[l][j], fds[0], fds[1], if ok { "" } else { "  ✗" });
+            }
+        }
+        assert!(worst == 0.0, "gate gradient off by {worst:.3}");
     }
 
     /// Times of the recurrence's kernels at the 0.8B trainer's size (8 windows
@@ -2550,7 +2846,7 @@ mod tests {
         let (bconv, balog, bdtb, bnorm) = (up(&conv), up(&a_log), up(&dt_bias), up(&norm));
         let p = GdnP { a_log: balog.ptr, dt_bias: bdtb.ptr, norm: bnorm.ptr, conv: bconv.ptr };
         let (pre, cq, out, draw, dz, da, db) = (fl(n * cd), fl(n * cd), fl(n * v), fl(n * cd), fl(n * v), fl(n * nv), fl(n * nv));
-        let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl(nb * nv * t * DKV * DKV / 2), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
+        let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl((nb * nv * t.div_ceil(2) * DKV * DKV).div_ceil(2)), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
         let sc = GdnS { dcq: dcq.ptr, dqk: dqk.ptr, hist: hist.ptr, kvh: kvh.ptr, oh: oh.ptr, per: nb };
         let time = |f: &dyn Fn()| -> f64 {
             let mut best = f64::MAX;

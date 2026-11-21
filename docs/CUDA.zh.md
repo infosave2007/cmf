@@ -536,6 +536,11 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
 | `CMF_NVG_CALIB=engine` | NVG 转换的校准走引擎的捕获钩子 |
 | `CMF_NVG_CUDA_POOL_GB=N` | NVG 编码器保留的空闲显存缓冲，默认 24 GB |
 | `CMF_NVG_GDN_HIST_GB=N` | NVG 训练器 GDN 状态历史的上限，默认 16 GB |
+| `CMF_NVG_ACACHE_GB=N` | NVG 训练器从一步的前向保留给重算用的秩激活，默认 7 GB，0 为不保留 |
+| `CMF_NVG_JOBS=N` | NVG 转换中一层同时编码的张量数，默认 3 |
+| `CMF_NVG_CUDA_LANES=0` | NVG 编码器的线程都走后端的同一条流（在显卡上不重叠） |
+| `CMF_NVG_CAND_THREADS=0` | 一个张量的两个候选依次构建 |
+| `CMF_NVG_GV_WS=N` | NVG 按列搜索的块的线程数，默认 256 |
 | `CMF_NVG_PROF=1`、`CMF_NVG_KT=N` | NVG 训练器各阶段的时间；其第 N 步的内核时间 |
 
 ## 限制
@@ -546,8 +551,7 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
   4.5 GB）。混合分支和 Dory 读提示都不超出封口时的内存。已封口对话的新一轮会把对话重新读一遍，wgpu
   路径也是如此。
 - 草稿在混合分支和 Fast Code 堆栈上运行，不在稠密分支上。
-- NVG 训练器和转换器覆盖 Qwen3.5 系列（GDN 混合器、门控注意力），与 wgpu 相同；`nvg-train --mask-keep` 只在
-  wgpu 训练器上运行。
+- NVG 训练器和转换器覆盖 Qwen3.5 系列（GDN 混合器、门控注意力），与 wgpu 相同。
 - toolkit 的库必须在加载器的路径上；绑定针对 CUDA 12.x。
 - 解码受自身运算限制：在 A40 上约 350 GB/s 的权重，而只加载权重的内核为 500
   （`scripts/cuda/bench/mv_bench.cu`）。

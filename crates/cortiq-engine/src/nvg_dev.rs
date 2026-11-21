@@ -151,6 +151,26 @@ pub fn sync() {
     be!(w::sync(), cu::sync())
 }
 
+/// A job thread's own lane on the device until the guard drops, so several
+/// threads' tensors overlap on the card (`gpu_cuda::nvg_dev::private_lane`:
+/// a stream and a cuBLAS handle of the thread's own). Nothing on wgpu, whose
+/// queue takes every thread's passes as they come. Take it first in the
+/// thread and drop it there, after the thread's matrices.
+pub fn private_lane() -> LaneGuard {
+    LaneGuard {
+        #[cfg(feature = "cuda")]
+        _c: if on_cuda() { cu::private_lane() } else { None },
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// See [`private_lane`].
+pub struct LaneGuard {
+    #[cfg(feature = "cuda")]
+    _c: Option<cu::LaneGuard>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
 /// `dst ← src` (same element count).
 pub fn copy(src: &DMat, dst: &DMat) {
     be!(w::copy(src.w(), dst.w()), cu::copy(src.cu(), dst.cu()))
