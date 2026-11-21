@@ -39,6 +39,14 @@ fn moe_mma_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_MOE_MMA2=0`: `ink_moe_mma` (every warp loads the job's rows
+/// itself) instead of `ink_moe_mma2` (the rows staged once a block through a
+/// cp.async pipeline).
+fn mma2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA2").as_deref() != Ok("0"))
+}
+
 /// Output tiles of 16 rows an `ink_moe_mma` block takes (4 warps × `MT`).
 const MMA_TILES: usize = 8;
 
@@ -82,6 +90,7 @@ struct Fx {
     attn_soft: cs::CUfunction,
     gather16: cs::CUfunction,
     moe_mma: cs::CUfunction,
+    moe_mma2: cs::CUfunction,
     ring_snap: cs::CUfunction,
     ring_back: cs::CUfunction,
     ds_mix: cs::CUfunction,
@@ -465,6 +474,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         f16: func(module, "ink_f16")?,
         gather16: func(module, "ink_gather16")?,
         moe_mma: func(module, "ink_moe_mma")?,
+        moe_mma2: func(module, "ink_moe_mma2")?,
         ring_snap: func(module, "ink_ring_snap")?,
         ring_back: func(module, "ink_ring_back")?,
         ds_mix: func(module, "ink_ds_mix")?,
@@ -1786,10 +1796,11 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
             st(c, 11, tp)?;
             let (one, zero_i, nul) = (1i32, 0i32, 0u64);
             let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
-            c.launch(f.moe_mma, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
+            let mm = if mma2_on() { f.moe_mma2 } else { f.moe_mma };
+            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
             st(c, 12, tp)?;
             let dx = (hidden.div_ceil(16)).div_ceil(MMA_TILES) as u32;
-            c.launch(f.moe_mma, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
+            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
             cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
             c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
             return Ok(());

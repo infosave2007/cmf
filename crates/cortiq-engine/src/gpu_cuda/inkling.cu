@@ -852,6 +852,166 @@ extern "C" __global__ void ink_moe_mma(const HyJob* __restrict__ jobs, const u16
     }
 }
 
+// `ink_moe_mma` with the job's rows staged once a block: the 32-column slice of
+// its (up to 64) f16 rows goes into shared memory through a three-stage
+// cp.async pipeline (one copy for the four warps, not one a warp, and the
+// next slices in flight while this one multiplies), each warp's B fragments
+// read from there (rows padded to 40 halves: conflict-free), its weights one
+// group ahead in registers. Same jobs, grid, arithmetic and outputs.
+#define MS 3
+#define XROW 40
+__device__ __forceinline__ void cp16(void* dst, const void* src, bool full)
+{
+#if __CUDA_ARCH__ >= 800
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    const int n = full ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(src), "r"(n));
+#else
+    *(uint4*)dst = full ? *(const uint4*)src : make_uint4(0u, 0u, 0u, 0u);
+#endif
+}
+__device__ __forceinline__ void cp_commit()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_wait()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+#endif
+}
+extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __restrict__ jobs, const u16* __restrict__ x, int cols, int pair,
+                                                             u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride)
+{
+    __shared__ __align__(16) u16 xs[MS][NTL * 8][XROW];
+    const HyJob jb = jobs[blockIdx.y];
+    if (jb.rows <= 0 || jb.nr <= 0) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
+    const int ntile = (jb.rows + 15) >> 4;
+    const int tbase = ((int)blockIdx.x * 4 + warp) * MT;
+    // the block's first tile past the matrix: nothing to do (every warp's tiles beyond)
+    if ((int)blockIdx.x * 4 * MT >= ntile) return;
+    const int gpr = cols >> 5;
+    const int place0 = jb.xoff / cols, nr = jb.nr;
+    const uint2* T = (const uint2*)jb.w;
+    const unsigned char* Cc = (const unsigned char*)jb.aux0;
+    const float2* par = (const float2*)jb.aux1;
+    // the slice copy: 64 rows × 4 chunks of 16 bytes, two a thread
+    auto stage = [&](int g, int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int c = threadIdx.x + i * 128, row = c >> 2, ch = c & 3;
+            const bool in = row < nr;
+            const u16* src = x + (size_t)(place0 + (in ? row : 0)) * cols + g * 32 + ch * 8;
+            cp16(&xs[buf][row][ch * 8], src, in);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < MS - 1; s++) {
+        if (s < gpr) stage(s, s);
+        cp_commit();
+    }
+    const bool live = tbase < ntile;
+    float2 pa[MT], pb[MT];
+#pragma unroll
+    for (int b = 0; b < MT; b++) {
+        const int tile = min(tbase + b, ntile - 1);
+        pa[b] = par[tile * 16 + gid];
+        pb[b] = par[tile * 16 + gid + 8];
+    }
+    float acc[MT][NTL][4];
+#pragma unroll
+    for (int b = 0; b < MT; b++)
+#pragma unroll
+        for (int t = 0; t < NTL; t++) acc[b][t][0] = acc[b][t][1] = acc[b][t][2] = acc[b][t][3] = 0.0f;
+    // this warp's weights and codes one group ahead
+    uint2 Xn[MT];
+    unsigned char ca[MT], cb[MT];
+#pragma unroll
+    for (int b = 0; b < MT; b++) {
+        const int tile = min(tbase + b, ntile - 1);
+        const size_t tg = (size_t)tile * gpr;
+        Xn[b] = T[tg * 32 + lane];
+        ca[b] = Cc[tg * 16 + gid];
+        cb[b] = Cc[tg * 16 + gid + 8];
+    }
+    const int ntl = min(NTL, (nr + 7) >> 3);
+    for (int g = 0; g < gpr; g++) {
+        if (g + MS - 1 < gpr) stage(g + MS - 1, (g + MS - 1) % MS);
+        cp_commit();
+        cp_wait<MS - 1>();
+        __syncthreads();
+        uint2 X[MT];
+        float sa[MT], sb[MT];
+#pragma unroll
+        for (int b = 0; b < MT; b++) {
+            X[b] = Xn[b];
+            sa[b] = exp2f(fmaf((float)ca[b], pa[b].y, pa[b].x));
+            sb[b] = exp2f(fmaf((float)cb[b], pb[b].y, pb[b].x));
+        }
+        if (g + 1 < gpr) {
+#pragma unroll
+            for (int b = 0; b < MT; b++) {
+                const int tile = min(tbase + b, ntile - 1);
+                const size_t tg = (size_t)tile * gpr + g + 1;
+                Xn[b] = T[tg * 32 + lane];
+                ca[b] = Cc[tg * 16 + gid];
+                cb[b] = Cc[tg * 16 + gid + 8];
+            }
+        }
+        if (live) {
+            const int buf = g % MS;
+#pragma unroll
+            for (int t = 0; t < NTL; t++) {
+                if (t >= ntl) break;
+                const u16* xr = &xs[buf][t * 8 + gid][2 * tig];
+                const u32 b0 = *(const u32*)(xr), b1 = *(const u32*)(xr + 8), b2 = *(const u32*)(xr + 16), b3 = *(const u32*)(xr + 24);
+#pragma unroll
+                for (int b = 0; b < MT; b++) {
+                    if (tbase + b >= ntile) break;
+                    const u32 a00 = a_h16(X[b].x, 0), a01 = a_h16(X[b].x, 1), a02 = a_h16(X[b].x, 2), a03 = a_h16(X[b].x, 3);
+                    const u32 a10 = a_h16(X[b].y, 0), a11 = a_h16(X[b].y, 1), a12 = a_h16(X[b].y, 2), a13 = a_h16(X[b].y, 3);
+                    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816h(c, a00, a01, a02, a03, b0, b1);
+                    mma16816h(c, a10, a11, a12, a13, b2, b3);
+                    acc[b][t][0] = fmaf(sa[b], c[0], acc[b][t][0]);
+                    acc[b][t][1] = fmaf(sa[b], c[1], acc[b][t][1]);
+                    acc[b][t][2] = fmaf(sb[b], c[2], acc[b][t][2]);
+                    acc[b][t][3] = fmaf(sb[b], c[3], acc[b][t][3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    cp_wait<0>();
+    if (!live) return;
+#pragma unroll
+    for (int b = 0; b < MT; b++) {
+        const int tile = tbase + b;
+        if (tile >= ntile) break;
+#pragma unroll
+        for (int t = 0; t < NTL; t++) {
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const int j = t * 8 + 2 * tig + e;
+                if (j >= nr) continue;
+                const size_t pl = (size_t)(place0 + j);
+                if (pair) {
+                    const float gv = acc[b][t][e], uv = acc[b][t][2 + e];
+                    const float cu = __int_as_float(jb.pad0);
+                    const float v = (jb.lim * tanhf(gv / jb.lim)) * (1.0f / (1.0f + expf(-gv))) * (cu * tanhf(uv / cu));
+                    act[pl * act_stride + tile * 8 + gid] = f2h(v);
+                } else {
+                    ys[pl * ys_stride + tile * 16 + gid] = acc[b][t][e];
+                    ys[pl * ys_stride + tile * 16 + gid + 8] = acc[b][t][2 + e];
+                }
+            }
+        }
+    }
+}
+
 // ---- a draft verify's rollback: the convolution rings of every application ----
 // A table entry per ring: {the live ring, its snapshot, the call's input rows
 // (the small-path kernels' history), the width}. Snapshot before a verify;
