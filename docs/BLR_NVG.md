@@ -477,6 +477,10 @@ Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
 | signs flipped by step 11 | 296 527 | 295 157 |
 | held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44555 |
 | signs flipped in the run | 0.901 % | 0.896 % |
+| Qwen3.8-27B at 0.55 bpw, the trainer on one file: held-out KL before | 1.53820 | 1.53821 |
+| loss of steps 1, 6, 11, 12 | 1.4572, 1.3403, 1.5225, 1.6106 | 1.4572, 1.3403, 1.5225, 1.6106 |
+| signs flipped by step 11 | 4 259 313 | 4 259 718 |
+| the 27B's encoder, held-out error of layer 3: down / gate / up / q / o / k / v | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0830 / 0.3558 / 0.5083 | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0829 / 0.3560 / 0.5083 |
 
 A conversion repeated on CUDA gives the same bytes, and the training after it the same curve to the last printed
 digit. A training stopped at a saved state and resumed gives the losses and the held-out KL of an uninterrupted
@@ -491,9 +495,10 @@ the attention core against the bake's (equal); the head's top-k and KL against t
 `train_sign::host_step_fact` (no differing latent, moment or bitmap word); the device encoder against the f64
 host encoder (`nvg_gpu` tests).
 
-### 8.5 Measured on CUDA (20.11.2026)
+### 8.5 Measured on CUDA (20–21.11.2026)
 
-One RTX PRO 6000 Blackwell (96 GB), 48 host cores; the wgpu column is the same card through Vulkan.
+One RTX PRO 6000 Blackwell (96 GB), 48 host cores; the wgpu column is the same card through Vulkan, the same
+binary without `CMF_GPU=cuda`.
 
 Qwen3.5-0.8B at 1.0 bpw (150 projections, calibration 14 848 FIT + 3 072 SEL tokens; the training is the
 reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `fact-mom`):
@@ -508,24 +513,43 @@ reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `
 | training step, 4096 tokens | 0.69 s | 0.34 s |
 | the reference training, whole run | 227 s | 96 s |
 
-The conversion is latency-bound at this size (matrices of 1024 to 6144): 78 `n×n` factorisations a tensor for the
-g step (P2 and P1 candidates, two refinement sweeps), 2 ms each at n = 1024 and 7 ms at n = 3584, and the
-column-sequential input-side search. The q1g repack (`requant --quant q1g`) is a lossless host pass over bytes
-and has no device stage.
+Inside the encoder, layer 0 with one tensor in flight (seconds; `CMF_NVG_PROF=1`):
 
-Qwen3.8-27B at 0.55 bpw (the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and signs):
+| tensor | stage | wgpu | CUDA |
+|---|---|---:|---:|
+| `in_proj_qkv` 6144×1024 | gauge rotation (polar) / g solves / ℓ solves / input-side search / eigenpairs | 0.75 / 0.66 / 0.40 / 0.34 / 0.13 | 0.13 / 0.13 / 0.07 / 0.30 / 0.10 |
+| `down_proj` 1024×3584 | g solves / input-side search | 1.59 / 2.11 | 0.42 / 2.07 |
 
-| stage | wgpu (03.11, the same card model) | CUDA |
+The linear algebra is 3–6 times faster; the column-sequential input-side search runs on one multiprocessor on
+either backend and is what remains (a factorisation of the g step: 2 ms at n = 1024, 7 ms at n = 3584, 78 of them
+a tensor). The q1g repack (`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
+
+Qwen3.8-27B at 0.55 bpw. The trainer: the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and
+signs. The encoder: one layer from the q8_2f weights, one tensor in flight, 32 768 + 4 096 calibration tokens.
+
+| stage | wgpu | CUDA |
 |---|---:|---:|
-| teacher top-64 pass | 3.0k tok/s | 4.9k tok/s |
-| training step, 4096 tokens | 4.9 s | 3.58 s |
-| 1 M tokens: 256 steps and their teacher pass | 26.7 min | 18.9 min |
-| card memory while training | 85–91 GB | 86.5 GB |
+| teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
+| training step, 4096 tokens | 5.48 s | 3.57 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
+| card memory while training | 90.8 GB | 86.5 GB |
+| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.9 s / 8.1 s |
+| input contexts of a layer | 2.5–3.4 s | 1.0–1.2 s |
+| encode of layer 0 (GDN, 6 tensors) | 149.3 s | 104.9 s |
+| encode of layer 3 (attention, 7 tensors) | 148.9 s | 102.4 s |
+| of it `down_proj` 5120×17408: whole / input-side search / g solves | 70.9 / 45.3 / 15.6 s | 58.1 / 44.4 / 8.9 s |
+| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 19.4, 14.6, 5.2 s | 11.6, 7.7, 2.3 s |
 
-A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step at 300 TFLOP/s), the GDN recurrence
-28 %, the sign update's passes over the latents 9 %, the remaining stagings and plane expansions 8 %, SwiGLU 4 %.
-Before the scales rode the planes and the recurrence ran in 512-thread blocks the same step took 4.50 s (the
-elementwise passes over activations alone 40 % of it), and the 0.8B's 0.54 s.
+A training run of 10.5 M tokens of the 27B (2559 steps with their teacher pass, states saved to a RAM disk)
+took 3 h 55 min on CUDA, at 3.56 s a step.
+
+A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step; the six products of a path run at
+280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput`), the GDN recurrence 28 % (its f16 state
+history is 6.4 GB a layer, written and read once), the sign update's passes over the latents 9 %, the remaining
+stagings and plane expansions 8 %, SwiGLU 4 %. Before the scales rode the planes and the recurrence ran in
+512-thread blocks the same step took 4.50 s (the elementwise passes over activations alone 40 % of it), and the
+0.8B's 0.54 s. In the 27B's encoder the input-side search of `down_proj` (33–36 M flips at 1.25 µs) is 42 % of a
+layer on CUDA and the next thing to parallelise.
 
 ### 8.6 SFq's two ideas at the NVG start
 
@@ -533,26 +557,50 @@ SFq ([Q2TP_SCALE_REFINE.md](Q2TP_SCALE_REFINE.md)) gave q2tp 7–14 % lower perp
 channel scale on the inputs and a refinement of the codes on calibration rows under a ridge. NVG has both inside:
 g is a free scale per input channel, solved exactly, and the discrete knots are a code refinement on the
 calibration Gram under the damping ρ. An input rescaling changes the encoder only through that damping and the
-column order of the input-side search. Measured on the 0.8B at 1.0 bpw (all on CUDA; perplexity on 16 × 512 of
-WikiText-2 test / C4 validation; the training is the reference recipe, its held-out KL from 32 to 256 steps):
+column order of the input-side search. Measured on the 0.8B at 1.0 bpw, all on CUDA: perplexity on 16 × 512 of
+WikiText-2 test / C4 validation, the reference training (256 steps), its held-out KL. A build's own unchanged run
+is the row to compare with: the two builds differ in the last bits of their arithmetic (a build repeats itself bit
+for bit).
 
 | variant | no training: ppl | no training: KL | KL at 25 / 100 / 256 steps | after training: ppl |
 |---|---:|---:|---:|---:|
-| NVG as it is (two builds) | 695.3 / 1014.0, 730.1 / 996.1 | 3.565, 3.525 | 2.437 / 1.702 / 1.445, 2.448 / 1.721 / 1.461 | 80.25 / 154.97, 82.01 / 156.87 |
+| *first build:* NVG as it is | 695.3 / 1014.0 | 3.565 | 2.437 / 1.702 / 1.445 | 80.25 / 154.97 |
 | `--blr-channel-scale 0.75` | 592.7 / 921.7 | 3.422 | 2.472 / 1.730 / 1.461 | 82.50 / 155.82 |
-| `--blr-channel-scale 0.5` | 615.8 / 961.9 | 3.432 | 2.435 / 1.714 / 1.466 | 81.37 / 157.35 |
 | `--blr-rho 0.1` | 823.5 / 1139.9 | 3.699 | 2.474 / 1.703 / 1.437 | 78.02 / 151.47 |
 | `--blr-rho 0.3` | 1221.4 / 1621.3 | 4.030 | 2.629 / 1.742 / 1.458 | 79.33 / 156.21 |
 | four refinement sweeps (`CMF_NVG_SWEEPS=4`, conversion ×2) | 675.6 / 949.5 | 3.452 | 2.432 / 1.695 / 1.452 | 80.22 / 156.15 |
+| *final build:* NVG as it is | 730.1 / 996.1 | 3.525 | 2.448 / 1.721 / 1.461 | 82.01 / 156.87 |
+| `--blr-channel-scale 0.5` | 615.8 / 961.9 | 3.432 | 2.435 / 1.714 / 1.466 | 81.37 / 157.35 |
+| `--blr-channel-scale 1.0` | 608.5 / 895.6 | 3.396 | 2.391 / 1.697 / 1.435 | 78.91 / 151.92 |
+| `--blr-rho 0.01` | 709.6 / 973.8 | 3.491 | 2.481 / 1.736 / 1.483 | 83.61 / 156.25 |
+| four times the calibration rows (`--blr-fit-tokens 59392 --blr-sel-tokens 12288`) | 580.8 / 1013.4 | 3.412 | 2.380 / 1.691 / 1.436 | 79.11 / 153.70 |
+| the rows and `--blr-rho 0.1` | 746.6 / 1142.9 | 3.644 | 2.404 / 1.680 / 1.424 | 79.52 / 151.72 |
+| the rows, `--blr-rho 0.1` and `--blr-channel-scale 1.0` | 674.3 / 1090.2 | 3.571 | 2.397 / 1.666 / 1.420 | 78.87 / 153.29 |
 
-Two builds of the unchanged method differ by 5 % in the untrained perplexity and by 1 % in the trained KL (their
-arithmetic differs in the last bits; one build repeats itself bit for bit): that is the resolution of this table.
+The two unchanged runs differ by 5 % in the untrained perplexity and by 1 % in the trained KL, and one training
+seed is one draw: the files of the final build were trained again with two other seeds (a seed changes the order
+of the training windows and the held-out windows, so a KL compares within a seed only).
+
+| held-out KL after training | seed 42 | seed 7 | seed 11 | against the unchanged file |
+|---|---:|---:|---:|---:|
+| NVG as it is | 1.4608 | 1.5142 | 1.5509 | |
+| channel scale 0.5 | 1.4657 | 1.5393 | 1.5627 | +0.3 %, +1.7 %, +0.8 % |
+| channel scale 1.0 | 1.4350 | 1.5128 | 1.5418 | −1.8 %, −0.1 %, −0.6 % |
+| four times the rows | 1.4363 | 1.5254 | 1.5342 | −1.7 %, +0.7 %, −1.1 % |
+| the rows and ρ 0.1 | 1.4245 | 1.4904 | 1.5195 | −2.5 %, −1.6 %, −2.0 % |
+| the rows, ρ 0.1 and scale 1.0 | 1.4199 | 1.4878 | 1.5160 | −2.8 %, −1.7 %, −2.3 % |
+
 Reading it:
 
-* The channel scale makes the untrained file better — WikiText-2 about 15 % lower at both exponents, C4 3–9 %, the
-  KL to the teacher 3–4 % — and the training erases the difference within 25 steps; the end is the same.
-* A stronger ridge makes the start worse and leaves the end within the resolution.
-* No variant reaches a given KL in fewer steps.
+* *The channel scale* makes the untrained file better at every seed — the KL to the teacher 3–4 % lower,
+  WikiText-2 perplexity about 15 %, C4 3–10 % — and the training erases it: after 256 steps the scaled files end
+  where the unscaled one does.
+* *A gentler fit* — a ridge of 0.1 on four times the calibration rows — starts no better (the stronger ridge
+  alone makes the untrained file worse) and ends 2 % lower in KL at all three seeds; the scale on top adds
+  nothing measurable. The file reaches the unchanged run's final KL at about step 195 of 256.
+* More refinement sweeps, a weaker or a much stronger ridge, more rows alone: inside the resolution.
 
-So SFq's ideas do not shorten NVG's training. `--blr-channel-scale` stays as an option, off by default, for a
-file that will not be trained.
+So SFq's channel scale helps a file that will not be trained (`--blr-channel-scale 1.0`), and its ridge with more
+calibration rows (`--blr-rho 0.1 --blr-fit-tokens 59392 --blr-sel-tokens 12288`; on CUDA the rows cost nothing:
+the conversion takes the same 3–4 minutes) trims the training by about a fifth for the same KL, or leaves the
+trained file 2 % better. The defaults are unchanged, and none of this was repeated on the 27B.

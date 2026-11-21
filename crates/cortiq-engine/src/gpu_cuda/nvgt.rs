@@ -2571,6 +2571,46 @@ mod tests {
         }
     }
 
+    /// Rates of the six products of a binary low-rank path at the 27B's MLP
+    /// shapes (4096 tokens, 5120 ↔ 17408, padded rank 1152): `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn cuda_blr_gemm_shapes_throughput() {
+        let Ok(d) = enter() else {
+            eprintln!("no CUDA device — skipped");
+            return;
+        };
+        let (ntok, r) = (4096usize, 1152usize);
+        for (name, m, n) in [("gate/up", 17408usize, 5120usize), ("down", 5120, 17408)] {
+            let hb = |len: usize, seed: u64| DBuf::from(&to_f16(&rnd(len, seed, 1.0))).unwrap();
+            let (xs, s1, s2, pu, pv) = (hb(ntok * n, 1), hb(ntok * m, 2), hb(ntok * r, 3), hb(m * r, 4), hb(n * r, 5));
+            let fl = |len: usize| DBuf::floats(d.c, len).unwrap();
+            let (a, y, dx, g) = (fl(ntok * r), fl(ntok * m), fl(ntok * n), fl(m.max(n) * r));
+            let time = |what: &str, flop: f64, f: &dyn Fn()| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    d.c.sync().unwrap();
+                    let t0 = std::time::Instant::now();
+                    f();
+                    d.c.sync().unwrap();
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                eprintln!("{name}: {what:<34} {:7.3} ms  {:6.1} TFLOP/s", best * 1e3, flop / best / 1e12);
+            };
+            let fl2 = |x: usize, y: usize, z: usize| 2.0 * x as f64 * y as f64 * z as f64;
+            unsafe {
+                time("a = x·P_V            [tok][r]", fl2(ntok, r, n), &|| d.mm(ntok, r, n, 1.0, xs.ptr, n, false, pv.ptr, r, false, 0.0, a.ptr, r, Gemm::Half).unwrap());
+                time("y = (a⊙ℓ)·P_Uᵀ       [tok][m]", fl2(ntok, m, r), &|| d.mm(ntok, m, r, 1.0, s2.ptr, r, false, pu.ptr, r, true, 0.0, y.ptr, m, Gemm::Half).unwrap());
+                time("y += …  (β = 1)      [tok][m]", fl2(ntok, m, r), &|| d.mm(ntok, m, r, 1.0, s2.ptr, r, false, pu.ptr, r, true, 1.0, y.ptr, m, Gemm::Half).unwrap());
+                time("t2 = dy·P_U          [tok][r]", fl2(ntok, r, m), &|| d.mm(ntok, r, m, 1.0, s1.ptr, m, false, pu.ptr, r, false, 0.0, a.ptr, r, Gemm::Half).unwrap());
+                time("dx = (t2⊙ℓ)·P_Vᵀ     [tok][n]", fl2(ntok, n, r), &|| d.mm(ntok, n, r, 1.0, s2.ptr, r, false, pv.ptr, r, true, 0.0, dx.ptr, n, Gemm::Half).unwrap());
+                time("G'_U = dyᵀ·(a⊙ℓ)     [m][r]", fl2(m, r, ntok), &|| d.mm(m, r, ntok, 1.0, s1.ptr, m, true, s2.ptr, r, false, 0.0, g.ptr, r, Gemm::Half).unwrap());
+                time("G'_V = xᵀ·(t2⊙ℓ)     [n][r]", fl2(n, r, ntok), &|| d.mm(n, r, ntok, 1.0, xs.ptr, n, true, s2.ptr, r, false, 0.0, g.ptr, r, Gemm::Half).unwrap());
+            }
+        }
+    }
+
     /// The attention core (GQA 4/2, two windows) against the bake's entries.
     #[test]
     fn cuda_attn_core_matches_bake() {

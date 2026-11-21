@@ -15,14 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the other. On one RTX PRO 6000 Blackwell against wgpu on the same card: Qwen3.5-0.8B at 1.0 bpw converts in
   216 s (492 s), a layer's calibration 0.45 s (2.6 s), its encode 7.2–8.7 s (17.3 s); a training step of 8 × 512
   tokens with signs 0.34 s (0.69 s), 1 M tokens in 96 s (227 s), held-out KL 1.4456 (1.4490). Qwen3.8-27B at
-  0.55 bpw: 3.58 s a step (4.9 s), the teacher pass 4.9k tok/s (3.0k), 1 M tokens in 18.9 min (26.7 min). The
+  0.55 bpw: 3.57 s a step (5.48 s), the teacher pass 4.9k tok/s (2.7k), 1 M tokens in 18.8 min (29.5 min), a
+  layer's encode 102–105 s (149 s). The
   trainer keeps h and g in the f16 sign planes, so a layer input is staged once and the scales' gradients are row
   sums of the sign gradients; the GDN recurrence runs in 512-thread blocks over an f16 state history. A conversion
   repeated on CUDA gives the same bytes. `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
 - `convert --blr-channel-scale ALPHA` (device encoder): SFq's input channel scale for NVG, off by default. On the
-  0.8B at 1.0 bpw the untrained file's WikiText-2 perplexity is about 15 % lower (695 → 593 at 0.75), C4 3–9 %;
-  after the reference training the difference is gone (held-out KL 1.461 against 1.445–1.461), and no variant —
-  the scale, a stronger ridge, more refinement sweeps (`CMF_NVG_SWEEPS`) — reaches a given KL in fewer steps.
+  0.8B at 1.0 bpw it makes the untrained file better at every seed — the KL to the teacher 3–4 % lower, WikiText-2
+  perplexity about 15 % (730 → 608 at 1.0) — and the reference training erases the difference. What does survive
+  the training is a gentler fit: `--blr-rho 0.1` on four times the calibration rows ends 2 % lower in held-out KL
+  at three training seeds (−1.6 … −2.5 %), reaching the unchanged file's final KL at about step 195 of 256.
+  Defaults unchanged; not repeated on the 27B. `docs/BLR_NVG.md` §8.6.
 
 ## [0.9.10] — 2026-11-21
 

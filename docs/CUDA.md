@@ -561,8 +561,7 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
     --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
 ```
 
-One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vulkan (the 27B's from a run of
-03.11 on the same card model):
+One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vulkan:
 
 | | wgpu | CUDA |
 |---|---:|---:|
@@ -570,9 +569,10 @@ One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vul
 | calibration of a layer / encode of a layer | 2.6 s / 17.3 s | 0.45 s / 7.2–8.7 s |
 | training step, 8 × 512 tokens, metric and signs | 0.69 s | 0.34 s |
 | 1 M tokens of training, whole run | 227 s | 96 s |
-| Qwen3.8-27B at 0.55 bpw: teacher top-64 pass | 3.0k tok/s | 4.9k tok/s |
-| training step, 8 × 512 tokens, metric and signs | 4.9 s | 3.58 s |
-| 1 M tokens: 256 steps and their teacher pass | 26.7 min | 18.9 min |
+| Qwen3.8-27B at 0.55 bpw: teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
+| training step, 8 × 512 tokens, metric and signs | 5.48 s | 3.57 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
+| encode of a layer (one tensor in flight) | 149 s | 102–105 s |
 
 The held-out KL after the 0.8B's training is 1.4456 on CUDA and 1.4490 on wgpu; a conversion repeated on CUDA
 gives the same bytes.

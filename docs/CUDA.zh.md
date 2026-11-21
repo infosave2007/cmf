@@ -489,8 +489,7 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
     --lr 1e-3 --topk 64 --train-signs --sign-opt fact-mom --output m-trained.cmf
 ```
 
-一块 RTX PRO 6000 Blackwell（96 GB）；wgpu 一列是同一块显卡经 Vulkan 的结果（27B 的数据来自 11 月 3 日在同型号
-显卡上的运行）：
+一块 RTX PRO 6000 Blackwell（96 GB）；wgpu 一列是同一块显卡经 Vulkan 的结果：
 
 | | wgpu | CUDA |
 |---|---:|---:|
@@ -498,9 +497,10 @@ CMF_GPU=cuda cortiq nvg-train m.cmf --teacher teacher.cmf --calib text.txt --tok
 | 一层的校准 / 一层的编码 | 2.6 s / 17.3 s | 0.45 s / 7.2–8.7 s |
 | 训练一步，8 × 512 词元，度量和符号 | 0.69 s | 0.34 s |
 | 100 万词元的训练，整个运行 | 227 s | 96 s |
-| Qwen3.8-27B，0.55 比特/权重：教师 top-64 前向 | 3.0k tok/s | 4.9k tok/s |
-| 训练一步，8 × 512 词元，度量和符号 | 4.9 s | 3.58 s |
-| 100 万词元：256 步及其教师前向 | 26.7 分钟 | 18.9 分钟 |
+| Qwen3.8-27B，0.55 比特/权重：教师 top-64 前向 | 2.7k tok/s | 4.9k tok/s |
+| 训练一步，8 × 512 词元，度量和符号 | 5.48 s | 3.57 s |
+| 100 万词元：256 步及其教师前向 | 29.5 分钟 | 18.8 分钟 |
+| 一层的编码（同时只处理一个张量） | 149 s | 102–105 s |
 
 0.8B 训练后的留出 KL：CUDA 为 1.4456，wgpu 为 1.4490；在 CUDA 上重复转换得到相同的字节。
 
