@@ -468,6 +468,9 @@ pub struct State {
     /// The sequence runs on the card: None not tried yet, Some(false) the
     /// host runs it, Some(true) the card holds its states.
     card: Option<bool>,
+    /// The DSpark depth (kept across sequences: a device's prices and a
+    /// drafter's holds outlive a request).
+    pub spec: SpecPolicy,
 }
 
 static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -482,6 +485,7 @@ impl State {
         self.pos = 0;
         self.tokens.clear();
         self.slots = (0..n_slots).map(|_| SlotState::default()).collect();
+        self.spec.forget_step();
     }
 }
 
@@ -634,7 +638,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
             gates,
         });
     }
-    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None };
+    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None, spec: SpecPolicy::default() };
     state.reset(cfg.slots());
     Ok((globals, layers, cfg, state))
 }
@@ -1194,11 +1198,143 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
     }
 }
 
-/// Drafts a DSpark round offers (`CMF_INKLING_SPEC`: 0 plain decoding; the
-/// block's 7 at most); 4 by default.
+/// `CMF_INKLING_SPEC`: unset or `auto` lets [`SpecPolicy`] pick each round's
+/// drafts (`usize::MAX` here), 0 is plain decoding, a number pins the drafts a
+/// round offers (the block's 7 at most).
 pub fn spec_k() -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *K.get_or_init(|| std::env::var("CMF_INKLING_SPEC").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4))
+    *K.get_or_init(|| std::env::var("CMF_INKLING_SPEC").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX))
+}
+
+/// A verify of `k` drafts against a plain token, NVIDIA L4 (calls of 1..8
+/// rows: 18.4, 23.1, 25.8, 28.4, 30.7, 32.8, 34.9, 36.9 ms): the price of a
+/// depth no round has timed yet, scaled from the nearest timed one.
+const SPEC_REL: [f32; 8] = [1.0, 1.26, 1.40, 1.54, 1.67, 1.78, 1.90, 2.0];
+
+/// How often draft `j` holds once the one before it held, before a round has
+/// shown it (DSpark's own figures for Inkling 2: a half to two thirds of
+/// drafts kept on prose and chat).
+const SPEC_HOLD_PRIOR: [f32; 7] = [0.70, 0.65, 0.62, 0.60, 0.58, 0.56, 0.55];
+
+/// The DSpark depth that lands the most tokens per millisecond: every round
+/// and plain token is timed from one decode step to the next (the
+/// pipeline's own work included), a depth's price is its running average
+/// (one never timed is scaled from the nearest timed one by [`SPEC_REL`]),
+/// and how often each draft holds is a running average too. 0 drafts, plain
+/// decoding, is a depth like the others; while it wins, a round of 2 every
+/// 32 tokens keeps the holds current.
+#[derive(Clone, Debug)]
+pub struct SpecPolicy {
+    hold: [f32; 7],
+    wall: [f32; 8],
+    seen: [u8; 8],
+    k: usize,
+    dwell: u8,
+    plain_run: u16,
+    picked: Option<std::time::Instant>,
+    last: Option<(std::time::Instant, usize, usize)>,
+}
+
+impl Default for SpecPolicy {
+    fn default() -> Self {
+        Self { hold: SPEC_HOLD_PRIOR, wall: [0.0; 8], seen: [0; 8], k: 3, dwell: 0, plain_run: 0, picked: None, last: None }
+    }
+}
+
+impl SpecPolicy {
+    /// The drafts for the step at `pos` (`room`: tokens the request still
+    /// allows past the anchor). Times the previous step when it ended here.
+    pub fn pick(&mut self, pos: usize, room: usize) -> usize {
+        let now = std::time::Instant::now();
+        self.picked = Some(now);
+        if let Some((t, k, at)) = self.last.take() {
+            if at == pos {
+                let w = now.duration_since(t).as_secs_f32() * 1e3;
+                // a depth's first step builds its call's graph and is not counted
+                match self.seen[k] {
+                    0 => self.seen[k] = 1,
+                    1 => (self.wall[k], self.seen[k]) = (w, 2),
+                    _ if w < self.wall[k] * 4.0 => self.wall[k] += 0.2 * (w - self.wall[k]),
+                    _ => {}
+                }
+            }
+        }
+        let pinned = spec_k();
+        let k = if pinned != usize::MAX {
+            pinned.min(7)
+        } else {
+            self.plan()
+        };
+        let k = if k == 0 && self.plain_run >= 32 { 2 } else { k };
+        k.min(room)
+    }
+
+    /// Record the step just taken at `pos`: `k` drafts offered, `accepted`
+    /// kept (0 and 0 for a plain token).
+    pub fn done(&mut self, pos: usize, k: usize, accepted: usize) {
+        let k = k.min(7);
+        self.last = self.picked.take().map(|t| (t, k, pos + 1 + accepted));
+        if k == 0 {
+            self.plain_run = self.plain_run.saturating_add(1);
+            return;
+        }
+        self.plain_run = 0;
+        for j in 1..=k {
+            if accepted + 1 >= j {
+                let hit = if accepted >= j { 1.0 } else { 0.0 };
+                self.hold[j - 1] += 0.1 * (hit - self.hold[j - 1]);
+            }
+        }
+        // text this predictable is worth a deeper round now and then
+        if k < 7 && self.hold[k - 1] >= 0.9 {
+            for j in k + 1..=7 {
+                self.hold[j - 1] += 0.02 * (self.hold[k - 1] - self.hold[j - 1]);
+            }
+        }
+    }
+
+    /// The step after a reset or a new request is not timed against the last one.
+    pub fn forget_step(&mut self) {
+        self.last = None;
+        self.picked = None;
+    }
+
+    fn price(&self, k: usize) -> Option<f32> {
+        if self.seen[k] >= 2 {
+            return Some(self.wall[k]);
+        }
+        let near = (0..8usize).filter(|&j| self.seen[j] >= 2).min_by_key(|&j| j.abs_diff(k))?;
+        Some(self.wall[near] * SPEC_REL[k] / SPEC_REL[near])
+    }
+
+    fn plan(&mut self) -> usize {
+        let mut rate = [0f32; 8];
+        let (mut tokens, mut reach) = (1.0f32, 1.0f32);
+        for k in 0..8usize {
+            if k > 0 {
+                reach *= self.hold[k - 1];
+                tokens += reach;
+            }
+            match self.price(k) {
+                Some(p) if p > 0.0 => rate[k] = tokens / p,
+                // nothing timed yet: stay
+                _ => return self.k,
+            }
+        }
+        if self.dwell > 0 {
+            self.dwell -= 1;
+            return self.k;
+        }
+        let best = (0..8usize).max_by(|&a, &b| rate[a].total_cmp(&rate[b])).unwrap_or(self.k);
+        if best != self.k && rate[best] > rate[self.k] * 1.04 {
+            if std::env::var("CMF_INKLING_SPEC_TIME").is_ok() {
+                eprintln!("dspark: {} → {best} drafts (a step costs {:.1?} ms, a draft holds {:.2?})", self.k, self.wall, self.hold);
+            }
+            self.k = best;
+            self.dwell = 6;
+        }
+        self.k
+    }
 }
 
 /// One DSpark round at the decode tip, on the card: `anchor` (the token the
@@ -1290,6 +1426,33 @@ mod tests {
         slots.sort();
         slots.dedup();
         assert_eq!(slots.len(), 48);
+    }
+
+    #[test]
+    fn the_dspark_depth_follows_the_holds_and_the_prices() {
+        // L4 prices: a plain token 18.4 ms, a verify of k drafts by SPEC_REL
+        let timed = |hold: [f32; 7]| {
+            let mut p = SpecPolicy { hold, ..SpecPolicy::default() };
+            for k in 0..8 {
+                p.wall[k] = 18.4 * SPEC_REL[k] + if k > 0 { 2.0 } else { 0.0 };
+                p.seen[k] = 2;
+            }
+            p.plan()
+        };
+        // text that holds: a deep round
+        assert!(timed([0.95; 7]) >= 6);
+        // drafts that rarely hold: plain decoding
+        assert_eq!(timed([0.15; 7]), 0);
+        // chat-like holds: a short round
+        let k = timed([0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5]);
+        assert!((1..=4).contains(&k), "{k}");
+        // nothing timed yet: the starting depth
+        assert_eq!(SpecPolicy::default().plan(), 3);
+        // one timed depth prices the rest from SPEC_REL
+        let mut p = SpecPolicy::default();
+        p.wall[3] = 28.4;
+        p.seen[3] = 2;
+        assert!((p.price(0).unwrap() - 28.4 / 1.54).abs() < 1e-3);
     }
 
     #[test]

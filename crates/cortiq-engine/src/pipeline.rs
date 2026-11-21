@@ -9302,11 +9302,19 @@ impl Pipeline {
                         && self.sampler_config.repetition_penalty == 1.0
                         && generated + 2 < max_tokens
                     {
-                        let k = crate::inkling::spec_k().min(max_tokens.saturating_sub(generated + 1));
+                        let room = max_tokens.saturating_sub(generated + 1);
                         let mut lg = Vec::new();
-                        let round = match &mut self.inkling {
-                            Some(b) => crate::inkling::spec_round(&b.0, &b.1, &b.2, &mut b.3, t_next, next_pos, k, &mut lg),
-                            None => None,
+                        let (round, k) = match &mut self.inkling {
+                            Some(b) => {
+                                let k = b.3.spec.pick(next_pos, room);
+                                let r = if k > 0 { crate::inkling::spec_round(&b.0, &b.1, &b.2, &mut b.3, t_next, next_pos, k, &mut lg) } else { None };
+                                match &r {
+                                    Some(extra) => b.3.spec.done(next_pos, k, extra.len()),
+                                    None => b.3.spec.done(next_pos, 0, 0),
+                                }
+                                (r, k)
+                            }
+                            None => (None, 0),
                         };
                         if let Some(extra) = round {
                             drafted += k;
