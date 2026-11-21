@@ -185,6 +185,8 @@ impl Embed {
 }
 
 pub struct Globals {
+    /// The checkpoint's multi-token-prediction layer, when the file carries it.
+    pub mtp: Option<Mtp>,
     pub model: Arc<CmfModel>,
     pub embed: Embed,
     pub lm_head: QTensor,
@@ -244,6 +246,34 @@ pub struct State {
     /// The sequence runs on the card's graphs: None not tried yet, Some(false)
     /// the host runs it, Some(true) the card holds its states.
     graph: Option<bool>,
+    /// Drafting with the MTP layer (`spec_token`).
+    spec: Spec,
+}
+
+/// The speculation's state: the card may hold one row past the confirmed
+/// ones — the draft's, kept until the next token is known.
+#[derive(Default)]
+struct Spec {
+    /// The stack's closing streams of the last confirmed position (`hc·dim`;
+    /// empty: not known, nothing to draft from).
+    streams: Vec<f32>,
+    /// The row after it, already on the card: its token (the draft), its
+    /// folded hidden row (the head runs when the row is taken) and its
+    /// streams.
+    kept: Option<(u32, Vec<f32>, Vec<f32>)>,
+    /// The MTP layer's rows on the card: one contiguous run of positions
+    /// from `mtp_base` (its attention counts positions from there).
+    mtp_base: usize,
+    mtp_rows: usize,
+    /// MTP rows not on the card yet: a position's streams and the token
+    /// after it, in order (a taken draft's position waits for the next pass).
+    pending: Vec<(Vec<f32>, u32)>,
+    /// Verify passes and the drafts they kept.
+    passes: u64,
+    hits: u64,
+    /// Seconds in the MTP layer's host projections, its card call, the
+    /// verify call and the heads.
+    t: [f64; 4],
 }
 
 static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -253,6 +283,11 @@ impl State {
         if self.graph == Some(true) {
             crate::gpu::graph_kv_reset(self.kv_id());
         }
+        if self.spec.mtp_rows > 0 {
+            crate::gpu::graph_kv_reset(self.mtp_kv_id());
+        }
+        self.spec.report();
+        self.spec = Spec::default();
         self.graph = None;
         self.sequence_id = NEXT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pos = 0;
@@ -263,12 +298,40 @@ impl State {
     fn kv_id(&self) -> u64 {
         (1u64 << 60) | self.sequence_id
     }
+
+    /// The MTP layer's own rows.
+    fn mtp_kv_id(&self) -> u64 {
+        (1u64 << 59) | self.sequence_id
+    }
+}
+
+impl Spec {
+    /// The share of drafts a sequence took, once (`RUST_LOG=info`).
+    fn report(&self) {
+        if self.passes >= 16 {
+            let p = self.passes as f64;
+            tracing::info!(
+                "maxwell_moe: {} of {} drafts taken ({:.0} %); a pass: MTP projections {:.2} ms, MTP layer {:.2} ms, verify {:.2} ms, heads {:.2} ms",
+                self.hits,
+                self.passes,
+                100.0 * self.hits as f64 / p,
+                self.t[0] * 1e3 / p,
+                self.t[1] * 1e3 / p,
+                self.t[2] * 1e3 / p,
+                self.t[3] * 1e3 / p
+            );
+        }
+    }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.spec.report();
         if self.graph == Some(true) {
             crate::gpu::graph_kv_reset(self.kv_id());
+        }
+        if self.spec.mtp_rows > 0 {
+            crate::gpu::graph_kv_reset(self.mtp_kv_id());
         }
     }
 }
@@ -305,7 +368,8 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         return Err(err("block-sparse geometry"));
     }
     let hs = f(model, "model.hc_head.scale")?;
-    let globals = Globals {
+    let mut globals = Globals {
+        mtp: None,
         model: model.clone(),
         embed: Embed::load(model, "model.embed_tokens.weight")?,
         lm_head: t(model, "lm_head.weight")?,
@@ -314,68 +378,14 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         head_base: f(model, "model.hc_head.base")?,
         head_scale: *hs.first().ok_or_else(|| err("hc_head.scale"))?,
     };
-    let mix = 2 * cfg.hc + cfg.hc * cfg.hc;
     let mut layers = Vec::with_capacity(arch.num_layers);
     for li in 0..arch.num_layers {
-        let p = format!("model.layers.{li}.");
-        let hc_of = |kind: &str| -> Result<Hc, CmfError> {
-            let s = f(model, &format!("{p}{kind}.scale"))?;
-            let h = Hc { function: f(model, &format!("{p}{kind}.fn"))?, base: f(model, &format!("{p}{kind}.base"))?, scale: [s.first().copied().unwrap_or(0.0), s.get(1).copied().unwrap_or(0.0), s.get(2).copied().unwrap_or(0.0)] };
-            if s.len() != 3 || h.base.len() != mix || h.function.len() != mix * cfg.hc * cfg.dim {
-                return Err(err(format!("{p}{kind}: shape")));
-            }
-            Ok(h)
-        };
-        let a = format!("{p}self_attn.");
-        let attn = Attn {
-            q: t(model, &format!("{a}q_proj.weight"))?,
-            k: t(model, &format!("{a}k_proj.weight"))?,
-            v: t(model, &format!("{a}v_proj.weight"))?,
-            o: t(model, &format!("{a}o_proj.weight"))?,
-            q_norm: f(model, &format!("{a}q_norm.weight"))?,
-            k_norm: f(model, &format!("{a}k_norm.weight"))?,
-            indexer: Indexer {
-                q: f(model, &format!("{a}indexer.q_proj.weight"))?,
-                k: f(model, &format!("{a}indexer.k_proj.weight"))?,
-                q_norm: f(model, &format!("{a}indexer.q_norm.weight"))?,
-                k_norm: f(model, &format!("{a}indexer.k_norm.weight"))?,
-            },
-        };
-        if attn.q.rows() != nh * hd || attn.k.rows() != nkv * hd || attn.v.rows() != nkv * hd || attn.indexer.q.len() != nkv * hd * cfg.dim || attn.indexer.k.len() != hd * cfg.dim {
-            return Err(err(format!("layer {li}: attention shapes")));
-        }
-        let m = format!("{p}mlp.");
-        let ffn = if model.tensor(&format!("{m}gate.weight")).is_none() {
-            Ffn::Dense { gate: t(model, &format!("{m}gate_proj.weight"))?, up: t(model, &format!("{m}up_proj.weight"))?, down: t(model, &format!("{m}down_proj.weight"))? }
-        } else {
-            let mut experts = Vec::with_capacity(moe.num_experts);
-            for e in 0..moe.num_experts {
-                let x = format!("{m}experts.{e}.");
-                experts.push([t(model, &format!("{x}gate_proj.weight"))?, t(model, &format!("{x}up_proj.weight"))?, t(model, &format!("{x}down_proj.weight"))?]);
-            }
-            let mo = Moe {
-                router: f(model, &format!("{m}gate.weight"))?,
-                bias: f(model, &format!("{m}gate.e_score_correction_bias"))?,
-                experts,
-                shared: [
-                    t(model, &format!("{m}shared_experts.gate_proj.weight"))?,
-                    t(model, &format!("{m}shared_experts.up_proj.weight"))?,
-                    t(model, &format!("{m}shared_experts.down_proj.weight"))?,
-                ],
-            };
-            if mo.bias.len() != moe.num_experts || mo.router.len() != moe.num_experts * cfg.dim {
-                return Err(err(format!("layer {li}: router shapes")));
-            }
-            Ffn::Moe(mo)
-        };
-        layers.push(Layer {
-            attn_hc: hc_of("attn_hc")?,
-            ffn_hc: hc_of("ffn_hc")?,
-            input_norm: f(model, &format!("{p}input_layernorm.weight"))?,
-            post_norm: f(model, &format!("{p}post_attention_layernorm.weight"))?,
-            attn,
-            ffn,
-        });
+        layers.push(load_layer(model, &format!("model.layers.{li}."), &cfg, moe.num_experts, true)?);
+    }
+    globals.mtp = load_mtp(model, &cfg, moe.num_experts)?;
+    if let Some(m) = &globals.mtp {
+        // the MTP layer's weights go on the card after the stack's: the stack's plan leaves them room
+        crate::gpu::plan_extra_reserve(model.uid(), m.bytes + m.bytes / 8 + (64 << 20));
     }
     // wgpu: the rows every position keeps while the attention is dense (f32 keys and values of
     // the KV groups, a row a layer) and the prompt chunk's rows, beside the weights. At the
@@ -391,9 +401,113 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let emb = model.tensor("model.embed_tokens.weight").map_or(0, |e| e.nbytes as u64);
     let on_card: u64 = model.tensors.iter().map(|e| e.nbytes as u64).sum::<u64>().saturating_sub(emb);
     crate::gpu::wgpu_keep_at_least(on_card + on_card / 40 + (64 << 20));
-    let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None };
+    let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None, spec: Spec::default() };
     state.reset(layers.len());
     Ok((globals, layers, cfg, state))
+}
+
+/// One decoder layer by its name prefix; `indexed`: with the attention's block
+/// indexer (the MTP layer's attention is plain GQA and has none).
+fn load_layer(model: &Arc<CmfModel>, p: &str, cfg: &Cfg, n_exp: usize, indexed: bool) -> Result<Layer, CmfError> {
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let mix = 2 * cfg.hc + cfg.hc * cfg.hc;
+    let hc_of = |kind: &str| -> Result<Hc, CmfError> {
+        let s = f(model, &format!("{p}{kind}.scale"))?;
+        let h = Hc { function: f(model, &format!("{p}{kind}.fn"))?, base: f(model, &format!("{p}{kind}.base"))?, scale: [s.first().copied().unwrap_or(0.0), s.get(1).copied().unwrap_or(0.0), s.get(2).copied().unwrap_or(0.0)] };
+        if s.len() != 3 || h.base.len() != mix || h.function.len() != mix * cfg.hc * cfg.dim {
+            return Err(err(format!("{p}{kind}: shape")));
+        }
+        Ok(h)
+    };
+    let a = format!("{p}self_attn.");
+    let ix = |n: &str| -> Result<Vec<f32>, CmfError> { if indexed { f(model, &format!("{a}indexer.{n}")) } else { Ok(Vec::new()) } };
+    let attn = Attn {
+        q: t(model, &format!("{a}q_proj.weight"))?,
+        k: t(model, &format!("{a}k_proj.weight"))?,
+        v: t(model, &format!("{a}v_proj.weight"))?,
+        o: t(model, &format!("{a}o_proj.weight"))?,
+        q_norm: f(model, &format!("{a}q_norm.weight"))?,
+        k_norm: f(model, &format!("{a}k_norm.weight"))?,
+        indexer: Indexer { q: ix("q_proj.weight")?, k: ix("k_proj.weight")?, q_norm: ix("q_norm.weight")?, k_norm: ix("k_norm.weight")? },
+    };
+    if attn.q.rows() != nh * hd || attn.k.rows() != nkv * hd || attn.v.rows() != nkv * hd || (indexed && (attn.indexer.q.len() != nkv * hd * cfg.dim || attn.indexer.k.len() != hd * cfg.dim)) {
+        return Err(err(format!("{p}: attention shapes")));
+    }
+    let m = format!("{p}mlp.");
+    let ffn = if model.tensor(&format!("{m}gate.weight")).is_none() {
+        Ffn::Dense { gate: t(model, &format!("{m}gate_proj.weight"))?, up: t(model, &format!("{m}up_proj.weight"))?, down: t(model, &format!("{m}down_proj.weight"))? }
+    } else {
+        let mut experts = Vec::with_capacity(n_exp);
+        for e in 0..n_exp {
+            let x = format!("{m}experts.{e}.");
+            experts.push([t(model, &format!("{x}gate_proj.weight"))?, t(model, &format!("{x}up_proj.weight"))?, t(model, &format!("{x}down_proj.weight"))?]);
+        }
+        let mo = Moe {
+            router: f(model, &format!("{m}gate.weight"))?,
+            bias: f(model, &format!("{m}gate.e_score_correction_bias"))?,
+            experts,
+            shared: [
+                t(model, &format!("{m}shared_experts.gate_proj.weight"))?,
+                t(model, &format!("{m}shared_experts.up_proj.weight"))?,
+                t(model, &format!("{m}shared_experts.down_proj.weight"))?,
+            ],
+        };
+        if mo.bias.len() != n_exp || mo.router.len() != n_exp * cfg.dim {
+            return Err(err(format!("{p}: router shapes")));
+        }
+        Ffn::Moe(mo)
+    };
+    Ok(Layer {
+        attn_hc: hc_of("attn_hc")?,
+        ffn_hc: hc_of("ffn_hc")?,
+        input_norm: f(model, &format!("{p}input_layernorm.weight"))?,
+        post_norm: f(model, &format!("{p}post_attention_layernorm.weight"))?,
+        attn,
+        ffn,
+    })
+}
+
+/// The checkpoint's multi-token-prediction layer (`mtp.0.*`): at position `i`
+/// it takes the stack's streams and the embedding of token `i + 1` —
+/// `stream_s = e_proj(enorm(emb)) + h_proj(hnorm(stream_s))` — through one
+/// decoder layer (plain GQA over its own rows, a routed FFN), its own closing
+/// fold and final norm, and the model's head: token `i + 2`. The card drafts
+/// with it (`spec_token`).
+pub struct Mtp {
+    pub enorm: Vec<f32>,
+    pub hnorm: Vec<f32>,
+    pub e_proj: QTensor,
+    pub h_proj: QTensor,
+    pub layer: Layer,
+    pub head_fn: Vec<f32>,
+    pub head_base: Vec<f32>,
+    pub head_scale: f32,
+    pub final_norm: Vec<f32>,
+    /// Bytes of its tensors (the room the card keeps for them).
+    pub bytes: u64,
+}
+
+fn load_mtp(model: &Arc<CmfModel>, cfg: &Cfg, n_exp: usize) -> Result<Option<Mtp>, CmfError> {
+    if model.tensor("mtp.0.e_proj.weight").is_none() {
+        return Ok(None);
+    }
+    let hs = f(model, "mtp.0.hc_head.scale")?;
+    let m = Mtp {
+        enorm: f(model, "mtp.0.enorm.weight")?,
+        hnorm: f(model, "mtp.0.hnorm.weight")?,
+        e_proj: t(model, "mtp.0.e_proj.weight")?,
+        h_proj: t(model, "mtp.0.h_proj.weight")?,
+        layer: load_layer(model, "mtp.0.layer.", cfg, n_exp, false)?,
+        head_fn: f(model, "mtp.0.hc_head.fn")?,
+        head_base: f(model, "mtp.0.hc_head.base")?,
+        head_scale: *hs.first().ok_or_else(|| err("mtp.0.hc_head.scale"))?,
+        final_norm: f(model, "mtp.0.final_norm.weight")?,
+        bytes: model.tensors.iter().filter(|e| e.name.starts_with("mtp.")).map(|e| e.nbytes).sum(),
+    };
+    if m.enorm.len() != cfg.dim || m.hnorm.len() != cfg.dim || m.final_norm.len() != cfg.dim || m.e_proj.rows() != cfg.dim || m.h_proj.rows() != cfg.dim || m.head_fn.len() != cfg.hc * cfg.hc * cfg.dim || matches!(m.layer.ffn, Ffn::Dense { .. }) {
+        return Err(err("mtp.0: shapes"));
+    }
+    Ok(Some(m))
 }
 
 /// Per-head RMS norm with one weight vector shared by the heads.
@@ -754,7 +868,6 @@ fn wgpu_rows(cfg: &Cfg, layers: usize) -> usize {
 }
 
 fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end: usize) -> Option<Vec<crate::gpu::GraphLayer<'a>>> {
-    use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
     // the rows the card keeps room for: the cap, or on CUDA with no cap named the rows that fit
     // beside weights that stay on the card whole
     let kept = match crate::gpu::route_rows() {
@@ -803,115 +916,125 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
     let own_geom = crate::gpu::cuda_active() || std::env::var("CMF_MAXWELL_GEOM").as_deref() == Ok("1");
     let mut out = Vec::with_capacity(layers.len());
     for (li, l) in layers.iter().enumerate() {
-        let a = &l.attn;
-        let ix = &a.indexer;
-        let attn = GraphAttn::Full {
-            wq: gw(&a.q)?,
-            wk: gw(&a.k)?,
-            wv: gw(&a.v)?,
-            wo: gw(&a.o)?,
-            q_norm: Some(&a.q_norm),
-            k_norm: Some(&a.k_norm),
-            late_qk_norm: false,
-            bias: None,
-            output_gate: false,
-            cpu_k: &[],
-            cpu_v: &[],
-            cpu_base: 0,
-            geom: own_geom.then_some(GraphAttnGeom {
-                nkv: cfg.nkv,
-                hd: cfg.hd,
-                dv: cfg.hd,
-                rd: cfg.hd,
-                invf: &cfg.invf,
-                rope_scale: 1.0,
-                window: None,
-                sink: None,
-                v_norm: false,
-                dash: None,
-                vres: None,
-                route: Some(GraphBlockRoute {
-                    q: &ix.q,
-                    k: &ix.k,
-                    q_norm: &ix.q_norm,
-                    k_norm: &ix.k_norm,
-                    block: cfg.block,
-                    prefix: cfg.prefix_blocks,
-                    local: cfg.local_blocks,
-                    remote: cfg.remote_blocks,
-                }),
-            }),
-            head_gate: None,
-        };
-        let ffn = match &l.ffn {
-            Ffn::Dense { gate, up, down } => GraphFfn::Dense { gate: gw(gate)?, up: gw(up)?, down: gw(down)?, act: GraphAct::Silu, limit: 0.0, hot: None },
-            Ffn::Moe(m) => {
-                let e0 = m.experts.first()?;
-                let q82 = e0[0].mapped_q8_2f().is_some();
-                let gu_q2 = e0[0].mapped_q2tp().is_some();
-                let uniform = m.experts.iter().all(|[g, u, d]| {
-                    if q82 {
-                        g.mapped_q8_2f().is_some() && u.mapped_q8_2f().is_some() && d.mapped_q8_2f().is_some()
-                    } else if gu_q2 {
-                        g.mapped_q2tp().is_some() && u.mapped_q2tp().is_some() && d.mapped_q4tp().is_some()
-                    } else {
-                        g.mapped_q4tp().is_some() && u.mapped_q4tp().is_some() && d.mapped_q4tp().is_some()
-                    }
-                });
-                if !uniform {
-                    return None;
-                }
-                let experts = m.experts.iter().map(|[g, u, d]| Some((g.model_idx()?, u.model_idx()?, d.model_idx()?))).collect::<Option<Vec<_>>>()?;
-                GraphFfn::Moe {
-                    router: gf(&m.router),
-                    shared_gate: gf(&m.router),
-                    experts,
-                    n_exp: m.experts.len(),
-                    top_k: cfg.top_k,
-                    inter: e0[0].rows(),
-                    act: GraphAct::Silu,
-                    norm_topk: true,
-                    q4tp: !q82,
-                    gu_q2,
-                    q82,
-                    sigmoid: true,
-                    sigmoid_denom_eps: 1e-20,
-                    bias: Some(&m.bias),
-                    has_shared: false,
-                    detached_shared: Some(GraphMoeDetachedShared { gate: gw(&m.shared[0])?, up: gw(&m.shared[1])?, down: gw(&m.shared[2])?, width: m.shared[0].rows() }),
-                    shared_gated: false,
-                    route_scale: 1.0,
-                    limit: 0.0,
-                    shared_limit: None,
-                    latent: None,
-                }
-            }
-        };
-        out.push(GraphLayer {
-            mhc: Some(GraphMhc {
-                attn_w: &l.attn_hc.function,
-                attn_b: &l.attn_hc.base,
-                ffn_w: &l.ffn_hc.function,
-                ffn_b: &l.ffn_hc.base,
-                enter: li == 0,
-                leave: li == last,
-                iters: cfg.sinkhorn_iters,
-                pre_scale: 1.0,
-                // a negative RMS epsilon: added to the RMS itself (`Hc::mixes`)
-                dsv4: Some(GraphMhcDsv4 { attn_scale: l.attn_hc.scale, ffn_scale: l.ffn_hc.scale, eps: cfg.hc_eps, rms_eps: -cfg.hc_eps, ihc: None }),
-                head: (li == last).then_some(GraphMhcHead { w: &globals.head_fn, base: &globals.head_base, scale: globals.head_scale }),
-            }),
-            input_norm: &l.input_norm,
-            attn,
-            post_norm: &l.post_norm,
-            ffn,
-            attn_out_norm: None,
-            ffn_out_norm: None,
-            layer_scale: None,
-            engram: None,
-        });
+        let head = (li == last).then_some((&globals.head_fn[..], &globals.head_base[..], globals.head_scale));
+        out.push(graph_layer(l, cfg, own_geom, li == 0, li == last, head)?);
     }
     Some(out)
+}
+
+/// One layer for the card's graphs. `route`: its attention carries the block
+/// route on the layer's own geometry (the main stack on CUDA); `enter` /
+/// `leave`: it opens / closes the hyper-connection range, `head` the closing
+/// fold's weights.
+fn graph_layer<'a>(l: &'a Layer, cfg: &'a Cfg, route: bool, enter: bool, leave: bool, head: Option<(&'a [f32], &'a [f32], f32)>) -> Option<crate::gpu::GraphLayer<'a>> {
+    use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
+    let a = &l.attn;
+    let ix = &a.indexer;
+    let attn = GraphAttn::Full {
+        wq: gw(&a.q)?,
+        wk: gw(&a.k)?,
+        wv: gw(&a.v)?,
+        wo: gw(&a.o)?,
+        q_norm: Some(&a.q_norm),
+        k_norm: Some(&a.k_norm),
+        late_qk_norm: false,
+        bias: None,
+        output_gate: false,
+        cpu_k: &[],
+        cpu_v: &[],
+        cpu_base: 0,
+        geom: route.then_some(GraphAttnGeom {
+            nkv: cfg.nkv,
+            hd: cfg.hd,
+            dv: cfg.hd,
+            rd: cfg.hd,
+            invf: &cfg.invf,
+            rope_scale: 1.0,
+            window: None,
+            sink: None,
+            v_norm: false,
+            dash: None,
+            vres: None,
+            route: Some(GraphBlockRoute {
+                q: &ix.q,
+                k: &ix.k,
+                q_norm: &ix.q_norm,
+                k_norm: &ix.k_norm,
+                block: cfg.block,
+                prefix: cfg.prefix_blocks,
+                local: cfg.local_blocks,
+                remote: cfg.remote_blocks,
+            }),
+        }),
+        head_gate: None,
+    };
+    let ffn = match &l.ffn {
+        Ffn::Dense { gate, up, down } => GraphFfn::Dense { gate: gw(gate)?, up: gw(up)?, down: gw(down)?, act: GraphAct::Silu, limit: 0.0, hot: None },
+        Ffn::Moe(m) => {
+            let e0 = m.experts.first()?;
+            let q82 = e0[0].mapped_q8_2f().is_some();
+            let gu_q2 = e0[0].mapped_q2tp().is_some();
+            let uniform = m.experts.iter().all(|[g, u, d]| {
+                if q82 {
+                    g.mapped_q8_2f().is_some() && u.mapped_q8_2f().is_some() && d.mapped_q8_2f().is_some()
+                } else if gu_q2 {
+                    g.mapped_q2tp().is_some() && u.mapped_q2tp().is_some() && d.mapped_q4tp().is_some()
+                } else {
+                    g.mapped_q4tp().is_some() && u.mapped_q4tp().is_some() && d.mapped_q4tp().is_some()
+                }
+            });
+            if !uniform {
+                return None;
+            }
+            let experts = m.experts.iter().map(|[g, u, d]| Some((g.model_idx()?, u.model_idx()?, d.model_idx()?))).collect::<Option<Vec<_>>>()?;
+            GraphFfn::Moe {
+                router: gf(&m.router),
+                shared_gate: gf(&m.router),
+                experts,
+                n_exp: m.experts.len(),
+                top_k: cfg.top_k,
+                inter: e0[0].rows(),
+                act: GraphAct::Silu,
+                norm_topk: true,
+                q4tp: !q82,
+                gu_q2,
+                q82,
+                sigmoid: true,
+                sigmoid_denom_eps: 1e-20,
+                bias: Some(&m.bias),
+                has_shared: false,
+                detached_shared: Some(GraphMoeDetachedShared { gate: gw(&m.shared[0])?, up: gw(&m.shared[1])?, down: gw(&m.shared[2])?, width: m.shared[0].rows() }),
+                shared_gated: false,
+                route_scale: 1.0,
+                limit: 0.0,
+                shared_limit: None,
+                latent: None,
+            }
+        }
+    };
+    Some(GraphLayer {
+        mhc: Some(GraphMhc {
+            attn_w: &l.attn_hc.function,
+            attn_b: &l.attn_hc.base,
+            ffn_w: &l.ffn_hc.function,
+            ffn_b: &l.ffn_hc.base,
+            enter,
+            leave,
+            iters: cfg.sinkhorn_iters,
+            pre_scale: 1.0,
+            // a negative RMS epsilon: added to the RMS itself (`Hc::mixes`)
+            dsv4: Some(GraphMhcDsv4 { attn_scale: l.attn_hc.scale, ffn_scale: l.ffn_hc.scale, eps: cfg.hc_eps, rms_eps: -cfg.hc_eps, ihc: None }),
+            head: head.map(|(w, base, scale)| GraphMhcHead { w, base, scale }),
+        }),
+        input_norm: &l.input_norm,
+        attn,
+        post_norm: &l.post_norm,
+        ffn,
+        attn_out_norm: None,
+        ffn_out_norm: None,
+        layer_scale: None,
+        engram: None,
+    })
 }
 
 /// The widest FFN of the stack (the graphs' scratch width).
@@ -972,6 +1095,8 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
     if state.graph == Some(false) || (start > 0 && state.graph != Some(true)) {
         return 0;
     }
+    // a draft's row kept past the confirmed ones leaves the card before the prompt's rows
+    spec_drop(state, layers.len(), start);
     let model = globals.model.clone();
     let inter = graph_inter(layers);
     let dim = cfg.dim;
@@ -997,6 +1122,15 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
         );
         if timing {
             tracing::info!("maxwell_moe prompt chunk of {k} rows: the card {:.2} s", t0.elapsed().as_secs_f64());
+        }
+        // `CMF_MAXWELL_MEMLOG=1`: the device allocator's bytes after every prompt chunk
+        if std::env::var("CMF_MAXWELL_MEMLOG").as_deref() == Ok("1") {
+            tracing::info!(
+                "maxwell_moe memlog: {} positions, {:.0} MiB in use on the device ({:.0} MiB resident weights)",
+                start + end,
+                crate::gpu::device_bytes_in_use().unwrap_or(0) as f64 / 1048576.0,
+                crate::gpu::resident_bytes() as f64 / 1048576.0
+            );
         }
         match outcome {
             BatchGraphOutcome::Completed => {
@@ -1119,7 +1253,19 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
         Some(false) => false,
     };
     if try_graph {
-        match graph_token(globals, layers, cfg, state, token_id, position, logits, want_logits) {
+        let spec = spec_on(globals);
+        if spec && want_logits && state.graph == Some(true) && spec_token(globals, layers, cfg, state, token_id, position, pool, logits) {
+            return;
+        }
+        // a plain call: a kept row leaves the card first, and the streams it
+        // would have continued from are not this row's
+        spec_drop(state, layers.len(), position);
+        if spec {
+            crate::gpu::graph_streams_want();
+        }
+        let outcome = graph_token(globals, layers, cfg, state, token_id, position, logits, want_logits);
+        let streams = if spec { crate::gpu::graph_streams_take() } else { Vec::new() };
+        match outcome {
             TokenGraphOutcome::Completed => {
                 if state.graph.is_none() {
                     tracing::info!("maxwell_moe: decode runs on the card's token graph");
@@ -1127,6 +1273,7 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
                 state.graph = Some(true);
                 state.tokens.push(token_id);
                 state.pos = position + 1;
+                state.spec.streams = if streams.len() == cfg.hc * cfg.dim { streams } else { Vec::new() };
                 return;
             }
             TokenGraphOutcome::Declined if state.graph == Some(true) => {
@@ -1138,6 +1285,256 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
         }
     }
     host_token(globals, layers, cfg, state, token_id, position, pool, logits, want_logits);
+}
+
+// ---------------------------------------------------------------- calibration of the routed experts
+
+/// What `cortiq quantize-moe` calibrates the routed experts on: per captured
+/// layer the routed FFN's normed input rows (`dim` f16 values a token), each
+/// token's `top_k` expert ids in route order (`u16::MAX`: none) and their
+/// route weights.
+#[derive(Default)]
+pub struct MoeCapture {
+    pub x: Vec<Vec<u16>>,
+    pub picks: Vec<Vec<u16>>,
+    pub w: Vec<Vec<f32>>,
+}
+
+/// The capture of layers `lo..hi` over `ids`, a sequence of its own: the
+/// prompt path on the CUDA card with the routed FFNs tapped
+/// (`gpu::moe_tap_begin`) — the host stack runs a few tokens a second, and
+/// an expert sees one token in twenty.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_window(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], lo: usize, hi: usize, pool: Option<&Pool>) -> Result<MoeCapture, String> {
+    if !crate::gpu::cuda_active() {
+        return Err("the routed experts' calibration runs on the CUDA backend (CMF_GPU=cuda)".into());
+    }
+    if lo >= hi || hi > layers.len() || (lo..hi).any(|li| matches!(layers[li].ffn, Ffn::Dense { .. })) {
+        return Err(format!("layers {lo}..{hi}: not a range of routed layers"));
+    }
+    state.reset(layers.len());
+    crate::gpu::moe_tap_begin(lo, hi);
+    let done = prompt_rows(globals, layers, cfg, state, ids, 0, pool, None);
+    let taps = crate::gpu::moe_tap_end();
+    state.reset(layers.len());
+    if done != ids.len() {
+        return Err(format!("the card took {done} of {} rows", ids.len()));
+    }
+    let mut cap = MoeCapture { x: vec![Vec::new(); hi - lo], picks: vec![Vec::new(); hi - lo], w: vec![Vec::new(); hi - lo] };
+    for (li, x, pk, pw) in taps {
+        let k = li - lo;
+        cap.x[k].extend(x.iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
+        cap.picks[k].extend(pk.iter().map(|&e| if (0..u16::MAX as i32).contains(&e) { e as u16 } else { u16::MAX }));
+        cap.w[k].extend(pw);
+    }
+    for k in 0..hi - lo {
+        if cap.x[k].len() != ids.len() * cfg.dim || cap.picks[k].len() != ids.len() * cfg.top_k {
+            return Err(format!("layer {}: {} rows and {} routes captured for {} tokens (the prompt left the grouped path?)", lo + k, cap.x[k].len() / cfg.dim, cap.picks[k].len() / cfg.top_k.max(1), ids.len()));
+        }
+    }
+    Ok(cap)
+}
+
+// ---------------------------------------------------------------- drafting with the MTP layer
+//
+// The checkpoint's MTP layer predicts token i + 2 from the stack's streams at position i and
+// the embedding of token i + 1. On CUDA every main call past the first is two rows: the token
+// just chosen and the MTP layer's draft of the one after it. When the next token is the draft,
+// its row is already on the card and its logits are returned without a call; when it is not,
+// the row leaves the mirrors (`graph_kv_set_stored`). A two-row call costs 1.29x a one-row call
+// on an L4 (17.3 against 13.4 ms), so a token costs less from 30 % of drafts taken on.
+// `CMF_MAXWELL_SPEC=0` turns it off. The MTP layer's own context starts at the first position
+// it sees (its rows count positions from there: RoPE is relative).
+
+/// The MTP layer could not go on the card (no room, a weight the graphs do not address): the
+/// drafting stays off instead of asking again every token.
+static SPEC_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spec_on(globals: &Globals) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    globals.mtp.is_some()
+        && crate::gpu::cuda_active()
+        && *ON.get_or_init(|| std::env::var("CMF_MAXWELL_SPEC").as_deref() != Ok("0"))
+        && !SPEC_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A kept row (the draft's) off the card: the mirrors back to `position` rows. The MTP
+/// layer's run ends here too (the plain call that follows leaves it a gap).
+fn spec_drop(state: &mut State, n_layers: usize, position: usize) {
+    if state.spec.kept.take().is_some() {
+        for li in 0..n_layers {
+            crate::gpu::graph_kv_set_stored(state.kv_id(), li, position);
+        }
+    }
+    state.spec.streams.clear();
+    state.spec.pending.clear();
+}
+
+/// The vocabulary's logits of one folded hidden row: the final norm and the head on the card,
+/// a call without layers.
+fn head_logits(globals: &Globals, cfg: &Cfg, state: &State, norm: &[f32], hidden: &[f32], logits: &mut Vec<f32>) -> bool {
+    let Some(head) = gw(&globals.lm_head) else { return false };
+    let vocab = globals.lm_head.rows();
+    let mut h = hidden.to_vec();
+    let mut run = 0usize;
+    let outcome = crate::gpu::forward_token_graph(
+        &globals.model, state.kv_id(), &[], &[], 0, &cfg.invf, &mut h, cfg.nh, cfg.nkv, cfg.hd, cfg.scale, cfg.hd, cfg.dim, cfg.dim, 0, GRAPH_CAP, false, cfg.eps as f32,
+        Some((&head, vocab)), norm, logits, &[], 1, None, None, Some(&mut run), 0, false,
+    );
+    outcome == crate::gpu::TokenGraphOutcome::Completed && logits.len() == vocab
+}
+
+/// The MTP layer over its pending rows, one call: their rows onto the card, and the last
+/// row's prediction — the draft of the token two positions after it.
+fn mtp_rows(globals: &Globals, cfg: &Cfg, state: &mut State, last_pos: usize, pool: Option<&Pool>) -> Option<u32> {
+    use crate::gpu::BatchGraphOutcome;
+    let mtp = globals.mtp.as_ref()?;
+    let (dim, hc) = (cfg.dim, cfg.hc);
+    let k = state.spec.pending.len();
+    if k == 0 || k > 8 || last_pos + 1 < k {
+        return None;
+    }
+    let first = last_pos + 1 - k;
+    // its rows are one contiguous run: a gap starts a new one
+    if state.spec.mtp_rows > 0 && state.spec.mtp_base + state.spec.mtp_rows != first {
+        crate::gpu::graph_kv_reset(state.mtp_kv_id());
+        state.spec.mtp_rows = 0;
+    }
+    if state.spec.mtp_rows == 0 {
+        state.spec.mtp_base = first;
+    }
+    let t0 = std::time::Instant::now();
+    // stream_s = e_proj(enorm(emb(next))) + h_proj(hnorm(stream_s)), a GEMM over the rows each
+    let (mut en, mut hn) = (Vec::with_capacity(k * dim), Vec::with_capacity(k * hc * dim));
+    let mut e = vec![0f32; dim];
+    for (streams, next) in &state.spec.pending {
+        if streams.len() != hc * dim || *next as usize >= globals.embed.rows() {
+            return None;
+        }
+        globals.embed.row_f32(&globals.model, *next as usize, &mut e);
+        en.extend(rms_w(&e, &mtp.enorm, cfg.eps));
+        for s in streams.chunks(dim) {
+            hn.extend(rms_w(s, &mtp.hnorm, cfg.eps));
+        }
+    }
+    let (mut eo, mut ho) = (vec![0f32; k * dim], vec![0f32; k * hc * dim]);
+    mtp.e_proj.matmat(&en, k, &mut eo, pool);
+    mtp.h_proj.matmat(&hn, k * hc, &mut ho, pool);
+    for (r, row) in ho.chunks_mut(hc * dim).enumerate() {
+        for s in row.chunks_mut(dim) {
+            for (a, b) in s.iter_mut().zip(&eo[r * dim..(r + 1) * dim]) {
+                *a += b;
+            }
+        }
+    }
+    state.spec.t[0] += t0.elapsed().as_secs_f64();
+    let t1 = std::time::Instant::now();
+    let gl = [graph_layer(&mtp.layer, cfg, false, false, true, Some((&mtp.head_fn, &mtp.head_base, mtp.head_scale)))?];
+    let inter = match &mtp.layer.ffn {
+        Ffn::Moe(m) => m.experts.first().map_or(0, |x| x[0].rows()).max(m.shared[0].rows()),
+        Ffn::Dense { gate, .. } => gate.rows(),
+    };
+    let o1: [Option<Vec<crate::nystrom::O1DeviceView<'_>>>; 1] = [None];
+    let rel = first - state.spec.mtp_base;
+    let positions: Vec<usize> = (rel..rel + k).collect();
+    let mut h = vec![0f32; k * dim];
+    crate::gpu::graph_streams_in(ho);
+    let outcome = crate::gpu::forward_batch_graph_at(
+        &globals.model, state.mtp_kv_id(), 0, &gl, &cfg.invf, &mut h, cfg.nh, cfg.nkv, cfg.hd, cfg.hd, dim, inter, &positions, GRAPH_CAP, false, cfg.eps as f32, cfg.scale, k, &o1, 0, None, None,
+    );
+    state.spec.t[1] += t1.elapsed().as_secs_f64();
+    let mut lg = Vec::new();
+    let t2 = std::time::Instant::now();
+    let ok = outcome == BatchGraphOutcome::Completed && head_logits(globals, cfg, state, &mtp.final_norm, &h[(k - 1) * dim..], &mut lg);
+    state.spec.t[3] += t2.elapsed().as_secs_f64();
+    if !ok {
+        if !SPEC_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("maxwell_moe: the MTP layer did not run on the card ({outcome:?}); decoding goes on without drafts");
+        }
+        return None;
+    }
+    state.spec.mtp_rows += k;
+    state.spec.pending.clear();
+    Some(lg.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32)
+}
+
+/// One token with a draft beside it: true when the token's logits are in `logits` and the
+/// state stepped; false leaves the token to the plain call (no row of it is on the card).
+#[allow(clippy::too_many_arguments)]
+fn spec_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, token: u32, position: usize, pool: Option<&Pool>, logits: &mut Vec<f32>) -> bool {
+    use crate::gpu::BatchGraphOutcome;
+    let (dim, hc) = (cfg.dim, cfg.hc);
+    if position == 0 {
+        return false;
+    }
+    // the row kept from the last call: this token's, when it was the draft
+    if let Some((tok, hidden, st)) = state.spec.kept.take() {
+        if tok == token {
+            let t0 = std::time::Instant::now();
+            let ok = head_logits(globals, cfg, state, &globals.norm, &hidden, logits);
+            state.spec.t[3] += t0.elapsed().as_secs_f64();
+            if ok {
+                // the MTP layer's row of the position before waits for the next pass
+                let before = std::mem::replace(&mut state.spec.streams, st);
+                state.spec.pending.push((before, token));
+                state.spec.hits += 1;
+                state.tokens.push(token);
+                state.pos = position + 1;
+                return true;
+            }
+        }
+        for li in 0..layers.len() {
+            crate::gpu::graph_kv_set_stored(state.kv_id(), li, position);
+        }
+    }
+    if state.spec.streams.len() != hc * dim {
+        return false;
+    }
+    // the draft of the token after this one: the MTP layer up to the position before
+    state.spec.pending.push((state.spec.streams.clone(), token));
+    let Some(draft) = mtp_rows(globals, cfg, state, position - 1, pool) else {
+        state.spec.pending.clear();
+        state.spec.mtp_rows = 0;
+        return false;
+    };
+    // this token and the draft, one call
+    let Some(gl) = graph_layers(globals, layers, cfg, position + 2) else { return false };
+    let mut h = vec![0f32; 2 * dim];
+    for (r, &t) in [token, draft].iter().enumerate() {
+        if (t as usize) < globals.embed.rows() {
+            globals.embed.row_f32(&globals.model, t as usize, &mut h[r * dim..(r + 1) * dim]);
+        }
+    }
+    let positions = [position, position + 1];
+    let o1: Vec<Option<Vec<crate::nystrom::O1DeviceView<'_>>>> = (0..gl.len()).map(|_| None).collect();
+    let t0 = std::time::Instant::now();
+    crate::gpu::graph_streams_want();
+    let outcome = crate::gpu::forward_batch_graph_at(
+        &globals.model, state.kv_id(), 0, &gl, &cfg.invf, &mut h, cfg.nh, cfg.nkv, cfg.hd, cfg.hd, dim, graph_inter(layers), &positions, GRAPH_CAP, false, cfg.eps as f32, cfg.scale, 2, &o1, 0, None, None,
+    );
+    let streams = crate::gpu::graph_streams_take();
+    state.spec.t[2] += t0.elapsed().as_secs_f64();
+    if outcome == BatchGraphOutcome::Completed && streams.len() == 2 * hc * dim {
+        let t1 = std::time::Instant::now();
+        let ok = head_logits(globals, cfg, state, &globals.norm, &h[..dim], logits);
+        state.spec.t[3] += t1.elapsed().as_secs_f64();
+        if ok {
+            state.spec.streams = streams[..hc * dim].to_vec();
+            state.spec.kept = Some((draft, h[dim..].to_vec(), streams[hc * dim..].to_vec()));
+            state.spec.passes += 1;
+            state.tokens.push(token);
+            state.pos = position + 1;
+            return true;
+        }
+    }
+    // the call left rows the plain path cannot continue from: back to this position
+    if outcome != BatchGraphOutcome::Declined {
+        for li in 0..layers.len() {
+            crate::gpu::graph_kv_set_stored(state.kv_id(), li, position);
+        }
+    }
+    state.spec.streams.clear();
+    false
 }
 
 /// The streams of one position after the whole stack (host).

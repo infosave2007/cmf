@@ -2203,6 +2203,80 @@ pub fn wgpu_card_total() -> u64 {
     WGPU_CARD_TOTAL.load(Ordering::Relaxed)
 }
 
+static PLAN_EXTRA: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Card room a model keeps beside its stack for weights that go on the card
+/// later (Maxwell's MTP layer, a plan of its own built at the first draft):
+/// the CUDA plan of the model's block-routed stack counts it in its reserve,
+/// so the rows it fits beside the weights leave that room, and the model's
+/// later plans take their weights from it. `model`: `CmfModel::uid`.
+pub fn plan_extra_reserve(model: u64, bytes: u64) {
+    let mut g = PLAN_EXTRA.lock().unwrap();
+    match g.iter_mut().find(|e| e.0 == model) {
+        Some(e) => e.1 = e.1.max(bytes),
+        None => g.push((model, bytes)),
+    }
+}
+
+pub(crate) fn plan_extra(model: u64) -> u64 {
+    PLAN_EXTRA.lock().unwrap().iter().find(|e| e.0 == model).map_or(0, |e| e.1)
+}
+
+/// CUDA hybrid arm: the hyper-connection streams the next small-path call of
+/// this thread starts from, `[row][stream][hidden]` — a stack whose first
+/// layer does not open its range (Maxwell's MTP layer takes the main stack's
+/// streams). Dropped by the call that reads them, or by the next one.
+pub fn graph_streams_in(streams: Vec<f32>) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::streams_in(streams);
+    #[cfg(not(feature = "cuda"))]
+    let _ = streams;
+}
+
+/// CUDA hybrid arm: ask the next small-path call of this thread for its rows'
+/// closing streams (before the fold), then take them, `[row][stream][hidden]`;
+/// empty when the call kept none.
+pub fn graph_streams_want() {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::streams_want();
+}
+
+/// See [`graph_streams_want`].
+pub fn graph_streams_take() -> Vec<f32> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::streams_take()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
+/// CUDA hybrid arm, a GPTQ calibration of routed experts: from now on the
+/// prompt path keeps, for the routed FFNs of layers `[lo, hi)`, each chunk's
+/// normed input rows with the rows' expert ids and route weights
+/// ([`moe_tap_end`] takes them: `(layer, rows [b][hidden], ids [b][k],
+/// weights [b][k])` in call order). This thread's calls only.
+pub fn moe_tap_begin(lo: usize, hi: usize) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::moe_tap_begin(lo, hi);
+    #[cfg(not(feature = "cuda"))]
+    let _ = (lo, hi);
+}
+
+/// See [`moe_tap_begin`].
+pub fn moe_tap_end() -> Vec<(usize, Vec<f32>, Vec<i32>, Vec<f32>)> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::moe_tap_end()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
 static ROUTE_ROWS: AtomicU64 = AtomicU64::new(0);
 
 /// The positions the CUDA plan of a block-routed stack keeps room for (the

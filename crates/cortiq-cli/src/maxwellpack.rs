@@ -25,7 +25,11 @@
 //!   `mlp.shared_experts.{gate,up,down}_proj.weight`.
 //!
 //! Globals: `model.embed_tokens.weight`, `lm_head.weight`, `model.norm.weight`,
-//! `model.hc_head.{fn,base,scale}`. The MTP layer (`mtp_layers.*`) is left out.
+//! `model.hc_head.{fn,base,scale}`. The MTP layer (`mtp_layers.0.*`) becomes
+//! `mtp.0.{enorm,hnorm,final_norm}.weight`, `mtp.0.{e,h}_proj.weight`,
+//! `mtp.0.hc_head.{fn,base,scale}` and `mtp.0.layer.*` (a layer's names, no
+//! index). `CMF_MAXWELL_BASE=<file.cmf>` writes an existing file of the model
+//! with the MTP layer added, nothing else re-encoded.
 //!
 //! ## Profiles (`--quant`)
 //!
@@ -215,6 +219,147 @@ fn pack_hc(src: &mut Sources, out: &mut Out, from: &str, to: &str, hc: usize, hi
     out.f32("skeleton", &format!("{to}.scale"), &[3], &scale)
 }
 
+struct MoeDims {
+    n_exp: usize,
+    hidden: usize,
+    moe_inter: usize,
+    shared_inter: usize,
+    bias_on: bool,
+}
+
+/// The source's SwiGLU is `w2(act(w1 x) · w3 x)`.
+const TRIO: [(&str, &str); 3] = [("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")];
+
+/// A routed FFN: the router and its selection bias, the shared expert, the
+/// routed experts (`s` its source prefix, `m` the output's).
+fn pack_moe(src: &mut Sources, out: &mut Out, s: &str, m: &str, d: &MoeDims, profile: Profile) -> anyhow::Result<()> {
+    let (n_exp, hidden, moe_inter, shared_inter) = (d.n_exp, d.hidden, d.moe_inter, d.shared_inter);
+    let (v, r, c) = src.matrix(&format!("{s}gate.weight"))?;
+    anyhow::ensure!(r == n_exp && c == hidden, "{s}gate: {r}x{c}");
+    out.f32("skeleton", &format!("{m}gate.weight"), &[r, c], &v)?;
+    let bias = if d.bias_on {
+        let (f, t) = src.need(&format!("{s}expert_bias"))?;
+        // the spread between experts is below a bf16 step: a half-precision bias collapses the routing
+        anyhow::ensure!(t.dtype == "F32", "{s}expert_bias is {} in the checkpoint; the router needs it in f32", t.dtype);
+        to_f32(&t.dtype, f.bytes(t))?
+    } else {
+        vec![0f32; n_exp]
+    };
+    anyhow::ensure!(bias.len() == n_exp, "{s}expert_bias has {} values", bias.len());
+    out.f32("skeleton", &format!("{m}gate.e_score_correction_bias"), &[n_exp], &bias)?;
+    for (from, to) in TRIO {
+        let (v, r, c) = src.matrix(&format!("{s}shared_expert.{from}.weight"))?;
+        anyhow::ensure!(if to == "down_proj" { r == hidden && c == shared_inter } else { r == shared_inter && c == hidden }, "{s}shared_expert.{from}: {r}x{c}");
+        let n = format!("{m}shared_experts.{to}.weight");
+        out.matrix("skeleton", &n, matrix_codec(&n, profile), &v, r, c)?;
+    }
+    // the routed experts: read and encode a batch at a time on all cores
+    let threads = crate::convert::encode_threads().max(1);
+    let mut jobs: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
+    let flush = |jobs: &mut Vec<(String, Vec<f32>, usize, usize)>, out: &mut Out| -> anyhow::Result<()> {
+        let enc: Vec<(TensorDtype, Vec<u8>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = jobs
+                .iter()
+                .map(|(n, v, r, c)| {
+                    let q = matrix_codec(n, profile);
+                    sc.spawn(move || quantize_2d(q, v, *r, *c))
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("encoder thread")).collect()
+        });
+        for ((n, _, r, c), (dt, bytes)) in jobs.iter().zip(&enc) {
+            out.push("experts", n, *dt, &[*r, *c], bytes)?;
+        }
+        jobs.clear();
+        Ok(())
+    };
+    for e in 0..n_exp {
+        for (from, to) in TRIO {
+            let (v, r, c) = src.matrix(&format!("{s}experts.{e}.{from}.weight"))?;
+            anyhow::ensure!(if to == "down_proj" { r == hidden && c == moe_inter } else { r == moe_inter && c == hidden }, "{s}experts.{e}.{from}: {r}x{c}");
+            jobs.push((format!("{m}experts.{e}.{to}.weight"), v, r, c));
+        }
+        if jobs.len() >= threads * 3 {
+            flush(&mut jobs, out)?;
+        }
+    }
+    flush(&mut jobs, out)
+}
+
+struct AttnDims {
+    hidden: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    hc: usize,
+}
+
+/// The multi-token-prediction layer (`mtp.0.*`): the next token's embedding
+/// and the streams through a norm and a projection each, one decoder layer
+/// with hyper-connections (plain GQA: no block index, a routed FFN), its own
+/// closing fold and final norm. The head is the model's.
+fn pack_mtp(src: &mut Sources, out: &mut Out, a: &AttnDims, d: &MoeDims, profile: Profile) -> anyhow::Result<()> {
+    let (s, t) = ("mtp_layers.0.", "mtp.0.");
+    let hidden = a.hidden;
+    for (from, to) in [("enorm.weight", "enorm.weight"), ("hnorm.weight", "hnorm.weight"), ("final_layernorm.weight", "final_norm.weight")] {
+        let (v, sh) = src.f32(&format!("{s}{from}"))?;
+        anyhow::ensure!(v.len() == hidden, "{s}{from}: {} values", v.len());
+        out.f32("skeleton", &format!("{t}{to}"), &sh, &v)?;
+    }
+    for k in ["e_proj", "h_proj"] {
+        let (v, r, c) = src.matrix(&format!("{s}{k}.weight"))?;
+        anyhow::ensure!(r == hidden && c == hidden, "{s}{k}: {r}x{c}");
+        let n = format!("{t}{k}.weight");
+        out.matrix("skeleton", &n, matrix_codec(&n, profile), &v, r, c)?;
+    }
+    for (from, to) in [("hc_head_fn", "fn"), ("hc_head_base", "base"), ("hc_head_scale", "scale")] {
+        let (v, sh) = src.f32(&format!("{s}hc_head.{from}"))?;
+        out.f32("skeleton", &format!("{t}hc_head.{to}"), &sh, &v)?;
+    }
+    let (sp, tp) = (format!("{s}decoder_layer."), format!("{t}layer."));
+    pack_hc(src, out, &format!("{sp}self_attn_hyper_connection"), &format!("{tp}attn_hc"), a.hc, hidden)?;
+    pack_hc(src, out, &format!("{sp}mlp_hyper_connection"), &format!("{tp}ffn_hc"), a.hc, hidden)?;
+    for n in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+        let (v, sh) = src.f32(&format!("{sp}{n}"))?;
+        out.f32("skeleton", &format!("{tp}{n}"), &sh, &v)?;
+    }
+    for (k, rows, cols) in [("q_proj", a.nh * a.hd, hidden), ("k_proj", a.nkv * a.hd, hidden), ("v_proj", a.nkv * a.hd, hidden), ("o_proj", hidden, a.nh * a.hd)] {
+        let (v, r, c) = src.matrix(&format!("{sp}self_attn.{k}.weight"))?;
+        anyhow::ensure!(r == rows && c == cols, "{sp}self_attn.{k}: {r}x{c}, expected {rows}x{cols}");
+        let n = format!("{tp}self_attn.{k}.weight");
+        out.matrix("skeleton", &n, matrix_codec(&n, profile), &v, r, c)?;
+    }
+    for (from, to) in [("q_layernorm", "q_norm"), ("k_layernorm", "k_norm")] {
+        let (v, sh) = src.f32(&format!("{sp}self_attn.{from}.weight"))?;
+        anyhow::ensure!(v.len() == a.hd, "{sp}self_attn.{from}: {} values, expected {}", v.len(), a.hd);
+        out.f32("skeleton", &format!("{tp}self_attn.{to}.weight"), &sh, &v)?;
+    }
+    pack_moe(src, out, &format!("{sp}block_sparse_moe."), &format!("{tp}mlp."), d, profile)
+}
+
+/// `CMF_MAXWELL_BASE=<file.cmf>`: every tensor of an existing file of this
+/// model as it is, and the MTP layer from the checkpoint beside them — a
+/// calibrated file gets the layer without being quantized again.
+fn rebase(base: &str, src: &mut Sources, output: &str, a: &AttnDims, d: &MoeDims, profile: Profile) -> anyhow::Result<()> {
+    let t0 = std::time::Instant::now();
+    let bm = cortiq_core::format::CmfModel::open_sharded(base).map_err(|e| anyhow::anyhow!("{base}: {e}"))?;
+    anyhow::ensure!(bm.header.arch.arch_name == ARCH_NAME, "{base}: not a {ARCH_NAME} file");
+    let gap = CmfStreamWriter::head_reserve_for(bm.tensors.len() + 3 * d.n_exp + 64, 64);
+    let tmp = format!("{output}.part");
+    let w = CmfStreamWriter::new(&tmp, gap).map_err(|e| anyhow::anyhow!("create {tmp}: {e}"))?;
+    let mut out = Out { w, census: Default::default(), n: 0 };
+    for e in bm.tensors.iter().filter(|e| !e.name.starts_with("mtp.")) {
+        out.push("base", &e.name, e.dtype, &e.shape, bm.entry_bytes(e))?;
+    }
+    pack_mtp(src, &mut out, a, d, profile)?;
+    let count = out.w.tensor_count();
+    out.w.finish(&bm.header, None, bm.vocab.as_deref()).map_err(|e| anyhow::anyhow!("finish {tmp}: {e}"))?;
+    std::fs::rename(&tmp, output)?;
+    let size = std::fs::metadata(output)?.len();
+    eprintln!("{output}: {count} tensors, {:.2} GB ({base} + the MTP layer) in {:.0}s", size as f64 / 1e9, t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// Convert the checkpoint in `dir` into `output` under the `quant` profile.
 pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     let profile = parse_profile(quant)?;
@@ -248,6 +393,14 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     let bias_on = config.get("moe_router_enable_expert_bias").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let mut src = Sources::open(dir)?;
+    let n_mtp = config.get("mtp_num_layers").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    anyhow::ensure!(n_mtp <= 1, "maxwell_moe: {n_mtp} MTP layers (one is supported)");
+    let adims = AttnDims { hidden, nh, nkv, hd, hc };
+    let mdims = MoeDims { n_exp, hidden, moe_inter, shared_inter, bias_on };
+    if let Some(base) = std::env::var("CMF_MAXWELL_BASE").ok().filter(|b| !b.is_empty()) {
+        anyhow::ensure!(n_mtp == 1, "CMF_MAXWELL_BASE: the checkpoint has no MTP layer to add");
+        return rebase(&base, &mut src, output, &adims, &mdims, profile);
+    }
     let tokenizer_config = read_json(dir, "tokenizer_config.json").unwrap_or(serde_json::Value::Null);
     let generation = read_json(dir, "generation_config.json").unwrap_or(serde_json::Value::Null);
     let vocab = std::fs::read(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("{}: tokenizer.json: {e}", dir.display()))?;
@@ -256,7 +409,7 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| tokenizer_config.get("chat_template").and_then(|v| v.as_str()).map(String::from));
 
-    let n_out_estimate = n_layers * (3 * n_exp + 32) + 64;
+    let n_out_estimate = (n_layers + n_mtp) * (3 * n_exp + 32) + 64;
     let gap = CmfStreamWriter::head_reserve_for(n_out_estimate, 64);
     let tmp = format!("{output}.part");
     let w = CmfStreamWriter::new(&tmp, gap).map_err(|e| anyhow::anyhow!("create {tmp}: {e}"))?;
@@ -308,7 +461,6 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         // ---- FFN: the source's SwiGLU is w2(act(w1 x) · w3 x)
         let s = format!("{p}block_sparse_moe.");
         let m = format!("{p}mlp.");
-        const TRIO: [(&str, &str); 3] = [("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")];
         if dense.contains(&li) {
             for (from, to) in TRIO {
                 let (v, r, c) = src.matrix(&format!("{s}{from}.weight"))?;
@@ -319,61 +471,16 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
             eprintln!("  layer {li} (dense) done, {:.0}s", t0.elapsed().as_secs_f64());
             continue;
         }
-        let (v, r, c) = src.matrix(&format!("{s}gate.weight"))?;
-        anyhow::ensure!(r == n_exp && c == hidden, "{s}gate: {r}x{c}");
-        out.f32("skeleton", &format!("{m}gate.weight"), &[r, c], &v)?;
-        let bias = if bias_on {
-            let (f, t) = src.need(&format!("{s}expert_bias"))?;
-            // the spread between experts is below a bf16 step: a half-precision bias collapses the routing
-            anyhow::ensure!(t.dtype == "F32", "{s}expert_bias is {} in the checkpoint; the router needs it in f32", t.dtype);
-            to_f32(&t.dtype, f.bytes(t))?
-        } else {
-            vec![0f32; n_exp]
-        };
-        anyhow::ensure!(bias.len() == n_exp, "{s}expert_bias has {} values", bias.len());
-        out.f32("skeleton", &format!("{m}gate.e_score_correction_bias"), &[n_exp], &bias)?;
-        for (from, to) in TRIO {
-            let (v, r, c) = src.matrix(&format!("{s}shared_expert.{from}.weight"))?;
-            anyhow::ensure!(if to == "down_proj" { r == hidden && c == shared_inter } else { r == shared_inter && c == hidden }, "{s}shared_expert.{from}: {r}x{c}");
-            let n = format!("{m}shared_experts.{to}.weight");
-            out.matrix("skeleton", &n, matrix_codec(&n, profile), &v, r, c)?;
-        }
-        // the routed experts: read and encode a batch at a time on all cores
-        let threads = crate::convert::encode_threads().max(1);
-        let mut jobs: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
-        let flush = |jobs: &mut Vec<(String, Vec<f32>, usize, usize)>, out: &mut Out| -> anyhow::Result<()> {
-            let enc: Vec<(TensorDtype, Vec<u8>)> = std::thread::scope(|sc| {
-                let hs: Vec<_> = jobs
-                    .iter()
-                    .map(|(n, v, r, c)| {
-                        let q = matrix_codec(n, profile);
-                        sc.spawn(move || quantize_2d(q, v, *r, *c))
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("encoder thread")).collect()
-            });
-            for ((n, _, r, c), (dt, bytes)) in jobs.iter().zip(&enc) {
-                out.push("experts", n, *dt, &[*r, *c], bytes)?;
-            }
-            jobs.clear();
-            Ok(())
-        };
-        for e in 0..n_exp {
-            for (from, to) in TRIO {
-                let (v, r, c) = src.matrix(&format!("{s}experts.{e}.{from}.weight"))?;
-                anyhow::ensure!(if to == "down_proj" { r == hidden && c == moe_inter } else { r == moe_inter && c == hidden }, "{s}experts.{e}.{from}: {r}x{c}");
-                jobs.push((format!("{m}experts.{e}.{to}.weight"), v, r, c));
-            }
-            if jobs.len() >= threads * 3 {
-                flush(&mut jobs, &mut out)?;
-            }
-        }
-        flush(&mut jobs, &mut out)?;
+        pack_moe(&mut src, &mut out, &s, &m, &MoeDims { n_exp, hidden, moe_inter, shared_inter, bias_on }, profile)?;
         eprintln!("  layer {li} done, {:.0}s", t0.elapsed().as_secs_f64());
     }
 
-    // every source tensor is either packed or deliberately left out (the MTP layer)
-    let mut left: Vec<&String> = src.by_name.keys().filter(|k| !src.used.contains(*k) && !k.starts_with("mtp_layers.")).collect();
+    if n_mtp == 1 {
+        pack_mtp(&mut src, &mut out, &adims, &mdims, profile)?;
+        eprintln!("  the MTP layer done, {:.0}s", t0.elapsed().as_secs_f64());
+    }
+    // every source tensor is packed
+    let mut left: Vec<&String> = src.by_name.keys().filter(|k| !src.used.contains(*k)).collect();
     left.sort();
     anyhow::ensure!(left.is_empty(), "maxwell_moe: source tensors left unpacked: {left:?}");
     for (grp, (n, wts, b)) in &out.census {

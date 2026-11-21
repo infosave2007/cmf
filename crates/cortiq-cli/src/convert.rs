@@ -16492,11 +16492,20 @@ pub(crate) mod tests {
             ("model.hc_head.hc_head_fn".into(), vec![hc, hc * hidden], values(hc * hc * hidden, 3)),
             ("model.hc_head.hc_head_base".into(), vec![hc], values(hc, 4)),
             ("model.hc_head.hc_head_scale".into(), vec![1], vec![1.0]),
-            // the MTP layer of the checkpoint is left out, whatever it holds
+            // the MTP layer: two norms and projections, its closing fold and norm, one layer (below)
             ("mtp_layers.0.e_proj.weight".into(), vec![hidden, hidden], values(hidden * hidden, 5)),
+            ("mtp_layers.0.h_proj.weight".into(), vec![hidden, hidden], values(hidden * hidden, 6)),
+            ("mtp_layers.0.enorm.weight".into(), vec![hidden], vec![1.0; hidden]),
+            ("mtp_layers.0.hnorm.weight".into(), vec![hidden], vec![1.0; hidden]),
+            ("mtp_layers.0.final_layernorm.weight".into(), vec![hidden], vec![1.0; hidden]),
+            ("mtp_layers.0.hc_head.hc_head_fn".into(), vec![hc, hc * hidden], values(hc * hc * hidden, 7)),
+            ("mtp_layers.0.hc_head.hc_head_base".into(), vec![hc], values(hc, 8)),
+            ("mtp_layers.0.hc_head.hc_head_scale".into(), vec![1], vec![1.0]),
         ];
-        for li in 0..2usize {
-            let p = format!("model.layers.{li}.");
+        // two decoder layers (a dense one, a routed one) and the MTP layer's (routed, no block index)
+        for li in 0..3usize {
+            let mtp = li == 2;
+            let p = if mtp { "mtp_layers.0.decoder_layer.".to_string() } else { format!("model.layers.{li}.") };
             for (k, kind) in ["self_attn_hyper_connection", "mlp_hyper_connection"].into_iter().enumerate() {
                 tensors.extend([
                     (format!("{p}{kind}.mapping_proj.weight"), vec![mix, hc * hidden], values(mix * hc * hidden, 100 + li * 10 + k)),
@@ -16516,11 +16525,15 @@ pub(crate) mod tests {
                 (format!("{a}o_proj.weight"), vec![hidden, nh * hd], values(hidden * nh * hd, 230 + li)),
                 (format!("{a}q_layernorm.weight"), vec![hd], vec![1.0; hd]),
                 (format!("{a}k_layernorm.weight"), vec![hd], vec![1.0; hd]),
-                (format!("{a}indexer.linear_q_proj.weight"), vec![nkv * hd, hidden], values(nkv * hd * hidden, 240 + li)),
-                (format!("{a}indexer.linear_k_proj.weight"), vec![hd, hidden], values(hd * hidden, 250 + li)),
-                (format!("{a}indexer.q_layernorm.weight"), vec![hd], vec![1.0; hd]),
-                (format!("{a}indexer.k_layernorm.weight"), vec![hd], vec![1.0; hd]),
             ]);
+            if !mtp {
+                tensors.extend([
+                    (format!("{a}indexer.linear_q_proj.weight"), vec![nkv * hd, hidden], values(nkv * hd * hidden, 240 + li)),
+                    (format!("{a}indexer.linear_k_proj.weight"), vec![hd, hidden], values(hd * hidden, 250 + li)),
+                    (format!("{a}indexer.q_layernorm.weight"), vec![hd], vec![1.0; hd]),
+                    (format!("{a}indexer.k_layernorm.weight"), vec![hd], vec![1.0; hd]),
+                ]);
+            }
             let m = format!("{p}block_sparse_moe.");
             if li == 0 {
                 tensors.extend([
@@ -16531,7 +16544,7 @@ pub(crate) mod tests {
                 continue;
             }
             tensors.extend([
-                (format!("{m}gate.weight"), vec![n_exp, hidden], values(n_exp * hidden, 310)),
+                (format!("{m}gate.weight"), vec![n_exp, hidden], values(n_exp * hidden, 310 + li)),
                 (format!("{m}expert_bias"), vec![n_exp], vec![0.0, 0.01, -0.01, 0.02]),
                 (format!("{m}shared_expert.w1.weight"), vec![shared, hidden], values(shared * hidden, 320)),
                 (format!("{m}shared_expert.w3.weight"), vec![shared, hidden], values(shared * hidden, 321)),
@@ -16570,12 +16583,18 @@ pub(crate) mod tests {
                     _ => TensorDtype::Q2TiledP,
                 }
             );
-            assert!(model.tensor("mtp_layers.0.e_proj.weight").is_none(), "the MTP layer is not converted");
+            // the MTP layer rides along: its projections 8-bit, its experts in the profile's codec
+            assert!(model.tensor("mtp_layers.0.e_proj.weight").is_none());
+            assert_eq!(dtype("mtp.0.e_proj.weight"), if quant == "q2tp" { TensorDtype::Q4TiledP } else { TensorDtype::Q8_2f });
+            assert_eq!(dtype("mtp.0.hc_head.fn"), TensorDtype::F32);
+            assert_eq!(dtype("mtp.0.layer.mlp.experts.0.gate_proj.weight"), dtype("model.layers.1.mlp.experts.0.gate_proj.weight"));
+            assert!(model.tensor("mtp.0.layer.self_attn.indexer.q_proj.weight").is_none(), "the MTP layer's attention has no block index");
             // the release's sampling rides in the file
             let sampler = cortiq_engine::SamplerConfig::from_provenance(model.header.provenance.as_ref());
             assert_eq!((sampler.temperature, sampler.top_p, sampler.top_k, sampler.repetition_penalty), (0.6, 0.95, 20, 1.0));
             let mut pipeline = cortiq_engine::Pipeline::from_model(&model, cortiq_engine::sampler::SamplerConfig::default()).unwrap();
             assert!(pipeline.maxwell.is_some(), "the file loads into the Maxwell stack");
+            assert!(pipeline.maxwell.as_ref().is_some_and(|m| m.0.mtp.is_some()), "with its MTP layer");
             let logits = pipeline.forward_ids(&ids, None).unwrap();
             assert_eq!(logits.len(), vocab);
             assert!(logits.iter().all(|v| v.is_finite()), "{quant}: {logits:?}");

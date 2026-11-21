@@ -3402,9 +3402,33 @@ pub fn kv_stored(kv_id: u64, layer: usize) -> Option<usize> {
 }
 
 /// Move a mirror's cursor back to `stored` rows.
+pub(crate) fn moe_tap_begin(lo: usize, hi: usize) {
+    hyb::MOE_TAP.with(|t| *t.borrow_mut() = Some((lo, hi, Vec::new())));
+}
+
+pub(crate) fn moe_tap_end() -> Vec<hyb::MoeTapRows> {
+    hyb::MOE_TAP.with(|t| t.borrow_mut().take()).map(|t| t.2).unwrap_or_default()
+}
+
+pub(crate) fn streams_in(streams: Vec<f32>) {
+    hyb::STREAMS_IN.with(|s| *s.borrow_mut() = Some(streams));
+}
+
+pub(crate) fn streams_want() {
+    hyb::STREAMS_WANT.with(|w| w.set(true));
+}
+
+pub(crate) fn streams_take() -> Vec<f32> {
+    hyb::STREAMS_WANT.with(|w| w.set(false));
+    hyb::STREAMS_OUT.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
 pub fn kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     let Some(c) = ctx() else { return false };
-    match c.st.lock().unwrap().kv.get_mut(&(kv_id, layer)) {
+    let mut st = c.st.lock().unwrap();
+    // a block-routed layer's index keys step back with its mirror
+    hyb::route_set_stored(&mut st, kv_id, layer, stored);
+    match st.kv.get_mut(&(kv_id, layer)) {
         Some(m) if stored <= m.stored && stored >= m.base => {
             m.stored = stored;
             true

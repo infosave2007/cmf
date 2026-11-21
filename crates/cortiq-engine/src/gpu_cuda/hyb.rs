@@ -5011,32 +5011,49 @@ fn build(
         // a block-routed stack keeps every position: the rows of the context
         // cap (`CMF_MAX_SEQ`, 32 768) beside the slots. With no cap named and
         // weights that fit the card, the weights come first: the rows that fit
-        // beside them (8192 at least) instead of the cap's — a 24 GB card
-        // under Maxwell's 4-bit file streamed its experts for a context nobody
-        // asked for (44.6 tok/s against 52.7 with every expert resident).
+        // beside them (4096 at least, the dense range) instead of the cap's — a
+        // 24 GB card under Maxwell's 4-bit file streamed its experts for a
+        // context nobody asked for (44.6 tok/s against 52.7 with every expert
+        // resident).
         if std::env::var("CMF_HYB_RESERVE_MB").is_err() {
             let cap = crate::gpu::context_cap(model);
             let full = route_mirror_bytes(layers, cap);
-            let mut rows = cap;
-            if full > 0 && std::env::var("CMF_MAX_SEQ").is_err() && free < reserve + full + need {
+            if full > 0 {
+                // The stack's mirrors are counted by themselves, so of the plain
+                // reserve (an eighth of the card, sized for stacks whose K/V
+                // live in it) stays what its calls take: a GiB and a prompt
+                // chunk's scores, 512 rows x heads x 4 B a position. At the
+                // plain eighth the MTP layer's 0.5 GB beside the 4-bit file
+                // left 4 300 positions on a 24 GB card and the experts streamed.
+                let cr = card_reserve();
+                let other = reserve.saturating_sub(cr);
+                let sb = 512 * nh * 4;
+                let base = |rows: usize| cr.min((1usize << 30) + rows * sb);
+                // weights of the model that go on the card after this plan (`gpu::plan_extra_reserve`)
+                let extra = crate::gpu::plan_extra(uid) as usize;
                 // bytes a row, the mirrors' slack of an eighth on top
                 let per = route_mirror_bytes(layers, 1 << 20) / ((1 << 20) + (1 << 17));
-                let fit = free.saturating_sub(reserve + need) / per.max(1) * 8 / 9;
-                if fit >= 8192 {
-                    rows = fit.min(cap);
-                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(
-                            "cuda hybrid: every weight on the card and room for {rows} positions beside them; \
-                             CMF_MAX_SEQ names a longer context (the routed experts stream then)"
-                        );
+                let mut rows = cap;
+                if std::env::var("CMF_MAX_SEQ").is_err() && free < other + base(cap) + extra + full + need {
+                    let fit = free.saturating_sub(other + extra + need + (1 << 30)) / (sb + per * 9 / 8).max(1);
+                    if fit >= 4096 {
+                        rows = fit.min(cap);
+                        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(
+                                "cuda hybrid: every weight on the card and room for {rows} positions beside them; \
+                                 CMF_MAX_SEQ names a longer context (the routed experts stream then)"
+                            );
+                        }
                     }
                 }
-            }
-            if full > 0 {
                 crate::gpu::note_route_rows(rows);
+                reserve = other + base(rows) + extra + route_mirror_bytes(layers, rows);
+            } else {
+                // a later plan of a model whose routed stack kept it room (Maxwell's
+                // MTP layer): its weights come out of that room, not past the reserve
+                reserve = reserve.saturating_sub(crate::gpu::plan_extra(uid) as usize);
             }
-            reserve += route_mirror_bytes(layers, rows);
         }
         let dev_cap = need.min(free.saturating_sub(reserve));
         let spill = dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0");
@@ -8139,6 +8156,68 @@ unsafe fn run_small(
     sealed: &[bool],
     taps: &[(usize, u64)],
 ) -> Res<usize> {
+    // the streams a call starts from (`gpu::graph_streams_in`): a stack whose
+    // first layer does not open its hyper-connection range
+    let given = STREAMS_IN.with(|s| s.borrow_mut().take());
+    if let (Some(s), Some(mp)) = (&given, &plan.mhc) {
+        if s.len() == n * mp.ns * plan.hidden {
+            unsafe { cu::memcpy_htod_async(mp.r.ptr, s, c.stream).map_err(derr)? };
+        } else {
+            return Err(format!("{} stream values for {n} rows of {} streams", s.len(), mp.ns));
+        }
+    }
+    let out = unsafe { run_small_inner(c, st, plan, kv_id, layer_base, pos0, n, tape, head, kcap, sealed, taps)? };
+    // the rows' closing streams for the caller that asked (`gpu::graph_streams_want`)
+    if STREAMS_WANT.with(|w| w.replace(false)) {
+        let mut v = Vec::new();
+        if let Some(mp) = &plan.mhc {
+            v = vec![0f32; n * mp.ns * plan.hidden];
+            c.sync()?;
+            unsafe { cu::memcpy_dtoh_sync(&mut v, mp.r.ptr).map_err(derr)? };
+        }
+        STREAMS_OUT.with(|s| *s.borrow_mut() = v);
+    }
+    Ok(out)
+}
+
+/// One chunk of a calibration capture: the layer, its routed FFN's normed
+/// input rows, the rows' expert ids and their route weights.
+pub(crate) type MoeTapRows = (usize, Vec<f32>, Vec<i32>, Vec<f32>);
+
+thread_local! {
+    /// A calibration capture of the routed FFNs of layers `[lo, hi)` on the
+    /// prompt path (`moe_grouped`), chunk after chunk.
+    pub(super) static MOE_TAP: std::cell::RefCell<Option<(usize, usize, Vec<MoeTapRows>)>> = const { std::cell::RefCell::new(None) };
+    pub(super) static STREAMS_IN: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static STREAMS_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static STREAMS_OUT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A block-routed layer's index keys back to `stored` rows with its mirror
+/// (`kv_set_stored`: a speculative row that was not taken).
+pub(super) fn route_set_stored(st: &mut State, kv_id: u64, layer: usize, stored: usize) {
+    if let Some(r) = st.hyb.route.get_mut(&(kv_id, layer)) {
+        if stored < r.next_pos {
+            r.next_pos = stored;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_small_inner(
+    c: &Ctx,
+    st: &mut State,
+    plan: &HPlan,
+    kv_id: u64,
+    layer_base: usize,
+    pos0: usize,
+    n: usize,
+    tape: bool,
+    head: bool,
+    kcap: usize,
+    sealed: &[bool],
+    taps: &[(usize, u64)],
+) -> Res<usize> {
     let bk = book(c, st, plan, kv_id, layer_base, pos0, n, tape, kcap, sealed)?;
     let rows = plan.lm.as_ref().map_or(0, |l| l.rows());
     unsafe {
@@ -9067,7 +9146,7 @@ pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
 /// over its down, the mixture (and `dsh`, the shared expert's rows) added to
 /// `into` (h, or under mHC the zeroed product the merge takes).
 #[allow(clippy::too_many_arguments)]
-unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, into: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
+unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, into: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64, layer: usize) -> Res<()> {
     let (e, k, inter) = (m.e, m.k, m.inter);
     if e > 1024 || k > 64 || inter % 32 != 0 {
         return Err(format!("a grouped routed FFN of {e} experts, top {k}, width {inter}"));
@@ -9102,6 +9181,20 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, i
             c.gemm(true, false, 1, b, hidden, 1.0, g.w.ptr, hidden, x32, hidden, 0.0, sg, 1, Gemm::F32)?;
         }
         c.launch(fx.moe_topk, (b.div_ceil(8) as u32, 1), 256, 0, kargs!(logits, bias, n_i, e_i, k_i, m.flags, m.route_scale, pidx, pwt))?;
+        // a calibration capture of this layer (`gpu::moe_tap_begin`): the chunk's
+        // normed rows, each row's experts and their weights
+        if MOE_TAP.with(|t| t.borrow().as_ref().is_some_and(|t| (t.0..t.1).contains(&layer))) {
+            let (mut x, mut pk, mut pw) = (vec![0f32; b * hidden], vec![0i32; nk], vec![0f32; nk]);
+            c.sync()?;
+            cu::memcpy_dtoh_sync(&mut x, x32).map_err(derr)?;
+            cu::memcpy_dtoh_sync(&mut pk, pidx).map_err(derr)?;
+            cu::memcpy_dtoh_sync(&mut pw, pwt).map_err(derr)?;
+            MOE_TAP.with(|t| {
+                if let Some(t) = t.borrow_mut().as_mut() {
+                    t.2.push((layer, x, pk, pw));
+                }
+            });
+        }
         // a streamed layer: the chunk's picked experts in the stream's slots
         // before the grouping reads their jobs (each built once a chunk)
         if m.stream.is_some() {
@@ -10030,7 +10123,7 @@ unsafe fn big(
                 }
                 None => bh,
             };
-            unsafe { moe_grouped(c, st, fx, m, bh, into, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            unsafe { moe_grouped(c, st, fx, m, bh, into, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr, layer_base + li)? };
             if let Some((mm, mp, r)) = mh {
                 unsafe { mhc_out(c, fx, hidden, mm, mp, r, true, b, None)? };
             }

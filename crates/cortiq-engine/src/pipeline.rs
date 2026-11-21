@@ -12936,6 +12936,24 @@ impl Pipeline {
         res
     }
 
+    /// GPTQ calibration of Maxwell's routed experts (`cortiq quantize-moe`):
+    /// the routed FFNs' input rows and expert ids of layers `lo..hi` for
+    /// `ids` (a fresh sequence), see [`crate::maxwell::MoeCapture`].
+    pub fn maxwell_moe_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<crate::maxwell::MoeCapture, String> {
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+        self.maxwell.as_ref().ok_or_else(|| "not a Maxwell model".to_string())?;
+        self.clear_sequence_state();
+        let res = {
+            let pool = self.pool.clone();
+            let b = self.maxwell.as_mut().expect("maxwell checked above");
+            crate::maxwell::capture_window(&b.0, &b.1, &b.2, &mut b.3, ids, lo, hi, pool.as_deref())
+        };
+        self.clear_sequence_state();
+        res
+    }
+
     /// Teacher-forced perplexity over a token sequence (phase-C gate:
     /// honest quant comparisons instead of prompt vibes).
     ///
