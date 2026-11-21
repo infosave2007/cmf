@@ -206,9 +206,12 @@ static DEVICES: Mutex<Option<HashMap<u64, Dev>>> = Mutex::new(None);
 
 /// Stages of `CMF_INKLING_PROF=1` (each closed by a stream sync; the calls
 /// then run without graphs).
-const STAGES: [&str; 11] = ["mix", "msg+gates", "norms", "proj", "qr+kv", "attn", "o", "post", "moe in", "moe", "head"];
-static STAGE_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+const STAGES: [&str; 14] = ["mix", "msg+gates", "norms", "proj", "qr+kv", "attn", "o", "post", "moe in", "moe", "head", "moe route", "moe gu", "moe down"];
+static STAGE_NS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 static PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A prompt call's stages, apart from the decode calls' (`CMF_INKLING_PROF=1`).
+static BIG_NS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+static IN_BIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn prof() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -219,7 +222,8 @@ fn prof() -> bool {
 fn st(c: &Ctx, i: usize, t: &mut std::time::Instant) -> Res<()> {
     if prof() {
         c.sync()?;
-        STAGE_NS[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let to = if IN_BIG.load(Ordering::Relaxed) { &BIG_NS } else { &STAGE_NS };
+        to[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         *t = std::time::Instant::now();
     }
     Ok(())
@@ -230,6 +234,13 @@ fn prof_report() {
     let calls = PROF_CALLS.load(Ordering::Relaxed).max(1);
     let row: Vec<String> = STAGES.iter().zip(&STAGE_NS).map(|(n, v)| format!("{n} {:.2}", v.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64)).collect();
     tracing::info!("inkling2_loop CUDA ms a call ({calls} calls): {}", row.join(", "));
+}
+
+/// One prompt call's stage table (`CMF_INKLING_PROF=1`), then cleared.
+fn prof_report_big(n: usize) {
+    let tot: u64 = BIG_NS.iter().map(|v| v.load(Ordering::Relaxed)).sum();
+    let row: Vec<String> = STAGES.iter().zip(&BIG_NS).filter(|(_, v)| v.load(Ordering::Relaxed) > 0).map(|(name, v)| format!("{name} {:.1}", v.swap(0, Ordering::Relaxed) as f64 / 1e6)).collect();
+    tracing::info!("inkling2_loop CUDA prompt call of {n} rows, {:.1} ms ({:.0} rows/s): {}", tot as f64 / 1e6, n as f64 / (tot as f64 / 1e9), row.join(", "));
 }
 static DECLINED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
@@ -691,6 +702,9 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
 /// The launches of one call of `n` rows (positions from `cr[0]`): the 48
 /// applications, the final mixture and, for the last `lrows` rows, the head.
 unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize) -> Res<()> {
+    if prof() {
+        IN_BIG.store(n > NMAX, Ordering::Relaxed);
+    }
     let hidden = cfg.dim;
     let hb = n * hidden * 4;
     let ost = (d.rows * hidden) as i32;
@@ -738,6 +752,10 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
         }
     }
     st(c, 10, &mut tp)?;
+    if prof() && n > NMAX {
+        IN_BIG.store(false, Ordering::Relaxed);
+        prof_report_big(n);
+    }
     if prof() && n == 1 {
         let k = PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if k % 64 == 0 {
@@ -1022,8 +1040,8 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, nul, nul, hs))?;
         st(c, 8, &mut tp)?;
         // 9. the routed experts into y
-        moe_big(c, d, b, cfg, l, n)?;
-        st(c, 9, &mut tp)?;
+        moe_big(c, d, b, cfg, l, n, &mut tp)?;
+        st(c, 13, &mut tp)?;
         // 10. the output convolution onto the running sum
         let m1 = -1i32;
         c.launch(f.post_rows, (hb, nu), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout))?;
@@ -1074,7 +1092,7 @@ unsafe fn wmul(c: &Ctx, fx: &HFuncs, b: &Big, m: &DevMat, x: u64, y: u64, ldy: u
 /// entries sorted by expert and laid out as planes, one tensor-core launch over
 /// every expert's gate/up pair (Inkling's activation in the epilogue) and one
 /// over its down, the weighted mixture into `y`.
-unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
+unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
     let fx = &d.hfx;
     let (hidden, e, k, inter) = (cfg.dim, l.e, cfg.top_k, l.inter);
     let nk = n * k;
@@ -1098,8 +1116,10 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize) ->
         )?;
         let tot = (nk * hidden) as u64;
         c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, nk_i, hid_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr))?;
+        st(c, 11, tp)?;
         let fg = fx.mmp_g[gi];
         c.launch(fg, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(b.gu_a.ptr, jmax_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr, hid_i, rmax_i, hid_i))?;
+        st(c, 12, tp)?;
         c.launch(fg, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(b.dn_a.ptr, jmax_i, b.qq[0].ptr, b.qq[1].ptr, b.qq[1].ptr, inter_i, rmax_i, inter_i))?;
         cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
         c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
