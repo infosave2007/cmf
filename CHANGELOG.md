@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the training is a gentler fit: `--blr-rho 0.1` on four times the calibration rows ends 2 % lower in held-out KL
   at three training seeds (−1.6 … −2.5 %), reaching the unchanged file's final KL at about step 195 of 256.
   Defaults unchanged; not repeated on the 27B. `docs/BLR_NVG.md` §8.6.
+- SFq inside NVG at 0.55 bpw (device encoder, both backends, all off by default): `CMF_NVG_CD=passes` — SFq's code
+  refinement for NVG's input-side signs, exact coordinate descent over the columns of `diag(g)·S_V` (each column
+  solved by the input-side search's own column solver against the exact residual of every other column and path,
+  its change sent to all of them by one device GEMM per 128 columns; the error never rises), `CMF_NVG_CD_RIDGE`
+  for SFq's ridge in its Gram; `CMF_NVG_CS_DAMP=orig|only` for `--blr-channel-scale` — the scaled encoder with the
+  original basis's damping, or no change of basis and only the scaled basis's damping, a ridge of its own per
+  input. In NVG an input scale is absorbed exactly by g, so SFq's scale has no group step to even out: the tensors'
+  errors stay the same and the scale's gain lives in that damping. Qwen3.5-0.8B at 0.55 bpw, untrained: held-out
+  KL to the teacher 4.324 → 4.166 with `--blr-channel-scale 0.75` (WikiText-2 / C4 perplexity 1770 / 2150 →
+  1528 / 1695), 4.187 with the per-input ridge alone at α 1.0, 4.377 / 4.348 with the refinement without / with the
+  ridge; after 1 M tokens of training all within 2.5 % of each other. Qwen3.8-27B at 0.55 bpw, converted whole on
+  CUDA from the bf16 checkpoint: untrained KL 3.463 → 3.427 with `--blr-channel-scale 0.75` (WikiText-2 / C4
+  152.1 / 418.1 → 146.8 / 404.2), 3.451 with the per-input ridge. `docs/BLR_NVG.md` §8.6,
+  `docs/Q2TP_SCALE_REFINE.md`.
 
 ### Changed
 - NVG device encoder, both backends: the flips of the input-side column search run on the host thread that encodes

@@ -705,3 +705,70 @@ So SFq's channel scale helps a file that will not be trained (`--blr-channel-sca
 calibration rows (`--blr-rho 0.1 --blr-fit-tokens 59392 --blr-sel-tokens 12288`; on CUDA the rows cost nothing:
 the conversion takes the same 3–4 minutes) trims the training by about a fifth for the same KL, or leaves the
 trained file 2 % better. The defaults are unchanged, and none of this was repeated on the 27B.
+
+#### At 0.55 bits, and what SFq is inside NVG
+
+SFq was built for q2tp, and its two steps answer q2tp's two losses: a 2-bit code has one step per group of 32
+input channels, so a group's small channels vanish (the channel scale, folded into the norm in front, evens the
+group out); and GPTQ settles each code once, left to right (the refinement moves single codes afterwards, best
+first, by their exact change of `r·H_f·rᵀ` under `H_f = H + 0.3·mean(diag H)·I`). Neither loss has the same form
+in NVG:
+
+* *The scale.* An input scale `t` is absorbed exactly by g (an output scale by h): the family of NVG tensors is the
+  same in either basis, and the H-weighted error is basis-invariant. There is no group step to even out, and the
+  per-tensor errors do not move (a tensor's mean held-out error 0.24519 unscaled, 0.24525 at α 0.75). What the
+  scale does change is the encoder's path — the ITQ weights of the init, the input-side search's column order, and
+  the damping: `ρ·mean(diag H')·I` in the scaled basis is, in the original one, a ridge of its own per input,
+  `ρ·mean_k(t_k²·H_kk) / t_j²`. At α 1.0 (`t_j ∝ σ_j`, the column norm) that ridge weighs each input column's error
+  relative to the column's own size.
+* *The refinement.* NVG's output-side flips (`flip_u`) are exact per row already — the counterpart of SFq's
+  refinement, whose rows are independent too. The input-side signs were settled by a GPTQ-style column search,
+  each column against the feedback of the columns before it. `CMF_NVG_CD=passes` adds the missing step: exact
+  coordinate descent over the columns of `diag(g)·S_V` (`cd_v_d`), each column solved by the search's own column
+  solver against the exact residual of every other column and path, its change sent to all of them — the error
+  never rises. `CMF_NVG_CD_RIDGE` gives it SFq's ridge.
+
+Qwen3.5-0.8B at 0.55 bpw, all on CUDA, untrained: WikiText-2 / C4 perplexity (16 × 512) and the held-out KL to
+the teacher before any step; then the reference training (1 M tokens, seed 42):
+
+| variant | ppl wiki / C4 | KL, untrained | KL after training |
+|---|---:|---:|---:|
+| NVG as it is | 1770 / 2150 | 4.324 | 2.028 |
+| SFq's scale, α 0.5 / 0.75 / 1.0 | 1579 / 1888, 1528 / 1695, 1619 / 1756 | 4.278, **4.166**, 4.253 | 2.042, 1.986, 1.976 |
+| α 0.75, the damping of the original basis (`CMF_NVG_CS_DAMP=orig`) | 1861 / 2301 | 4.449 | 2.030 |
+| no change of basis, only the per-input ridge (`CMF_NVG_CS_DAMP=only`), α 0.75 / 1.0 | 1475 / 1874, 1449 / 1697 | 4.242, **4.187** | 1.995, 1.985 |
+| the per-input ridge at α 1.0, ρ 0.015 / 0.06 / 0.12 | 1631 / 2037, 1849 / 2120, 1971 / 2156 | 4.289, 4.398, 4.435 | 2.035, 1.987, 1.984 |
+| the exact refinement (`CMF_NVG_CD=1`) | 1730 / 2204 | 4.377 | 2.014 |
+| the exact refinement with SFq's ridge 0.3 | 1667 / 2198 | 4.348 | 1.991 |
+| α 0.75 scale + the exact refinement | 1433 / 1757 | 4.167 | 1.977 |
+| four times the calibration rows; with ρ 0.1; with ρ 0.1 and α 1.0 | 1783 / 2553, 2233 / 3347, 1873 / 2450 | 4.477, 4.733, 4.477 | 1.997, 2.027, 1.996 |
+
+* The scale lowers the untrained KL by 3.7 % at α 0.75 (perplexity −14 % / −21 %), and its gain lives in its
+  damping: with the original basis's damping the scaled encoder is worse than the unscaled one, and the per-input
+  ridge alone, with no change of basis, gives −3.2 % at α 1.0 (perplexity −18 % / −21 %). Its strength is the
+  encoder's own ρ: at half of it the gain is −0.8 %, at twice or four times the file is worse than the unchanged one.
+* The exact refinement lowers a tensor's damped error by 0.4 % and raises its held-out error by about as much: the
+  untrained model moves by no more than the spread of the neutral variants (±1 %), with SFq's ridge too. After
+  training it is 0.5–2 % lower.
+* The gentler fit that helps after training at 1.0 bpw (four times the rows, a ridge of 0.1) makes the untrained
+  0.55-bit file worse.
+* After the training every variant ends within 2.5 % of the others: the untrained gain is not a head start the
+  training keeps.
+
+Qwen3.8-27B at 0.55 bpw, each file converted whole on CUDA from the bf16 checkpoint with the published file's
+recipe (32 768 fit + 4 096 selection tokens; 72–88 minutes beside other jobs on the card), untrained: the held-out
+KL to the q8_2f teacher before the trainer's first step (16 windows of 512) and the perplexity of the dense
+expansion on WikiText-2 test (12 × 512) and C4 validation (16 × 512):
+
+| variant | KL, untrained | ppl wiki / C4 |
+|---|---:|---:|
+| NVG as it is | 3.463 | 152.1 / 418.1 |
+| SFq's scale, α 0.75 | 3.427 (−1.1 %) | 146.8 / 404.2 (−3.5 % / −3.3 %) |
+| the per-input ridge alone, α 1.0 | 3.451 (−0.4 %) | 150.1 / 412.5 (−1.3 % / −1.3 %) |
+
+On the 27B the scale helps the untrained file by a third of what it does on the 0.8B, and the ridge alone by less.
+(These files encode all 400 projections — 0.5617 bpw over the layers' 24.35 G weights, 4.698 GB; the encoder of
+18.10 kept a few at q8_2f, 0.6259 bpw, 4.893 GB.)
+
+The defaults are unchanged. For a file that will not be trained, `--blr-channel-scale 0.75` is the better start at
+0.55 bpw too; for one that will be, the choice is inside the training's own spread.

@@ -130,6 +130,25 @@ CMF_GPU=wgpu cortiq hy4-sfq --capture cap --hf Hy4-flash-FP8 --target hy4-flash-
   --alpha 0.75 --refine 256 --ridge 0.3
 ```
 
+## NVG (below 1 bit)
+
+The NVG codec (`--quant blr --blr-method nvg`, `docs/BLR_NVG.md` §8.6) has neither of q2tp's two losses in the
+same form. An input scale is absorbed exactly by its per-input gain g, so the scale has no group step to even out
+and the tensors' errors do not move; inside NVG it acts as a ridge of its own per input in the encoder's damping
+(`ρ·mean_k(t_k²·H_kk) / t_j²`). Its output-side signs are refined exactly already; for the input side,
+`CMF_NVG_CD=1` adds the refinement as exact coordinate descent over the columns (`CMF_NVG_CD_RIDGE` gives it this
+recipe's ridge). Without training, at 0.55 bits:
+
+| | Qwen3.5-0.8B: KL to the teacher, WikiText-2 / C4 perplexity | Qwen3.8-27B: KL to the teacher, WikiText-2 / C4 perplexity |
+|---|---|---|
+| NVG as it is | 4.324, 1770 / 2150 | 3.463, 152.1 / 418.1 |
+| `--blr-channel-scale 0.75` | 4.166 (−3.7 %), 1528 / 1695 | 3.427 (−1.1 %), 146.8 / 404.2 |
+| the per-input ridge alone, α 1.0 (`--blr-channel-scale 1.0`, `CMF_NVG_CS_DAMP=only`) | 4.187 (−3.2 %), 1449 / 1697 | 3.451 (−0.4 %), 150.1 / 412.5 |
+| the refinement (`CMF_NVG_CD=1`), without / with the ridge 0.3 | 4.377, 4.348 | — |
+
+After the training (1 M tokens) every variant ends within 2.5 % of the others. The refinement does not help the
+untrained file beyond the run-to-run spread (±1 %).
+
 ## Limits
 
 - Measured on one model (MiniCPM5-2B, a dense Llama-like stack, GQA 16/2) with WikiText calibration.
