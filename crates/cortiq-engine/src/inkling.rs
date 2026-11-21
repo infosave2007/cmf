@@ -987,7 +987,9 @@ pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
     state.reset(cfg.slots());
     let (mut nll, mut cnt) = (0f64, 0usize);
     let vocab = globals.lm_head.rows();
-    let card_rows = 16;
+    // rows a card call scores (`CMF_INKLING_NLL_ROWS`): 16 keeps every call on
+    // the arms' decode path, more takes CUDA's prompt path
+    let card_rows = std::env::var("CMF_INKLING_NLL_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&r| r >= 1).unwrap_or(16);
     let mut card = None;
     let mut p0 = 0usize;
     while p0 < n {

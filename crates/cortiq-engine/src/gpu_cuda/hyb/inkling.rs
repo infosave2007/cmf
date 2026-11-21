@@ -615,9 +615,9 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
     }
     let mut at = 0usize;
     while at < ids.len() {
-        // a prompt's chunk of more than NMAX rows on the prompt path (not for
-        // the logits of every row: those stay 16 rows a call)
-        let big = d.big.is_some() && !all && ids.len() - at > NMAX;
+        // a prompt's chunk of more than NMAX rows on the prompt path (every
+        // row's logits then come from the head 16 rows at a time)
+        let big = d.big.is_some() && ids.len() - at > NMAX;
         let n = (ids.len() - at).min(if big { d.rows } else { NMAX });
         let part = &ids[at..at + n];
         let last = at + n == ids.len();
@@ -641,6 +641,21 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             cu::memcpy_htod_async(d.cr.ptr, &[(pos0 + at) as i32, n as i32], c.stream).map_err(derr)?;
         }
         let key = (n, lrows);
+        if big && all {
+            unsafe { call(c, d, cfg, n, 0, vocab)? };
+            let mut r0 = 0usize;
+            while r0 < n {
+                let m = (n - r0).min(NMAX);
+                unsafe { head_rows(c, d, cfg, r0, m, vocab)? };
+                let mut v = vec![0f32; m * vocab];
+                unsafe { cu::memcpy_dtoh_async(&mut v, d.logits.ptr, c.stream).map_err(derr)? };
+                c.sync()?;
+                logits.extend_from_slice(&v);
+                r0 += m;
+            }
+            at += n;
+            continue;
+        }
         if big {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
         } else if graphs_on() && !prof() {
@@ -714,16 +729,7 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
         let nb_i = nb as i32;
         c.launch(f.mix, (1, n as u32), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, d.final_q.ptr, d.fin.ptr, ost))?;
         if lrows > 0 {
-            let r0 = n - lrows;
-            let fin = d.fin.ptr + (r0 * hidden * 4) as u64;
-            let (nul, hs) = (0u64, hidden as i32);
-            c.launch(f.rms, (lrows as u32, 1), 256, 0, kargs!(fin, d.final_norm.ptr, cfg.eps as f32, nul, d.pf[0].ptr, d.pf[1].ptr, hs))?;
-            let pl = Planes { p0: d.pf[0].ptr, p1: d.pf[1].ptr, p2: d.pf[1].ptr, stride: hidden };
-            d.head.run(c, &d.hfx, &pl, hidden, lrows)?;
-            let (v_i, cap) = (vocab as i32, cfg.logit_cap);
-            if cap > 0.0 {
-                c.launch(f.softcap, (vocab.div_ceil(256) as u32, lrows as u32), 256, 0, kargs!(d.logits.ptr, v_i, cap))?;
-            }
+            head_rows(c, d, cfg, n - lrows, lrows, vocab)?;
         }
     }
     st(c, 10, &mut tp)?;
@@ -731,6 +737,25 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
         let k = PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if k % 64 == 0 {
             prof_report();
+        }
+    }
+    Ok(())
+}
+
+/// The head over rows `r0 .. r0 + m` of the final mixture (`m` ≤ `NMAX`):
+/// the norm, the logits into `logits`, the softcap.
+unsafe fn head_rows(c: &Ctx, d: &Dev, cfg: &Cfg, r0: usize, m: usize, vocab: usize) -> Res<()> {
+    let f = &d.fx;
+    let hidden = cfg.dim;
+    let fin = d.fin.ptr + (r0 * hidden * 4) as u64;
+    let (nul, hs) = (0u64, hidden as i32);
+    unsafe {
+        c.launch(f.rms, (m as u32, 1), 256, 0, kargs!(fin, d.final_norm.ptr, cfg.eps as f32, nul, d.pf[0].ptr, d.pf[1].ptr, hs))?;
+        let pl = Planes { p0: d.pf[0].ptr, p1: d.pf[1].ptr, p2: d.pf[1].ptr, stride: hidden };
+        d.head.run(c, &d.hfx, &pl, hidden, m)?;
+        let (v_i, cap) = (vocab as i32, cfg.logit_cap);
+        if cap > 0.0 {
+            c.launch(f.softcap, (vocab.div_ceil(256) as u32, m as u32), 256, 0, kargs!(d.logits.ptr, v_i, cap))?;
         }
     }
     Ok(())
