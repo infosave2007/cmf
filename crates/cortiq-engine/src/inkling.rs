@@ -89,12 +89,6 @@ fn mv(pool: Option<&Pool>, w: &[f32], x: &[f32], rows: usize) -> Vec<f32> {
     out
 }
 
-fn qmv(t: &QTensor, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
-    let mut out = vec![0f32; t.rows()];
-    t.matvec(x, &mut out, pool);
-    out
-}
-
 /// A softmax mixture of the RMS-normed `states` by each of `queries`
 /// (`[nq, dim]`), scaled by `1/√dim`: the reference's block attention
 /// residual (keys and values are the normed states).
@@ -147,16 +141,13 @@ impl Conv {
     }
 
     /// One position: `ring` holds the previous `kernel − 1` inputs (newest
-    /// first); `dyn_in` the input the per-token taps project.
-    fn step(&self, x: &[f32], ring: &mut Vec<f32>, dyn_in: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+    /// first); `dynw` the per-token taps `[groups · kernel]` of the full
+    /// layers' convolutions.
+    fn step_with(&self, x: &[f32], ring: &mut Vec<f32>, dynw: Option<&[f32]>) -> Vec<f32> {
         let (c, k) = (self.channels, self.kernel);
         if ring.len() != (k - 1) * c {
             *ring = vec![0f32; (k - 1) * c];
         }
-        let dynw = match (&self.proj, dyn_in) {
-            (Some(p), Some(xi)) => Some(mv(pool, p, xi, self.groups * k)),
-            _ => None,
-        };
         let per = c / self.groups.max(1);
         let scale = 1.0 / (((if dynw.is_some() { 2 } else { 1 }) * k + 1) as f32).sqrt();
         let mut out = vec![0f32; c];
@@ -166,7 +157,7 @@ impl Conv {
             for lag in 0..k {
                 let xv = if lag == 0 { x[ch] } else { ring[(lag - 1) * c + ch] };
                 let mut w = tp[lag];
-                if let Some(d) = &dynw {
+                if let Some(d) = dynw {
                     w += d[(ch / per) * k + lag];
                 }
                 acc += w * xv;
@@ -210,17 +201,6 @@ impl Gate {
         Ok(Self { down: f(model, &format!("{stem}.down"))?, forget: f(model, &format!("{stem}.forget"))?, gain: f(model, &format!("{stem}.gain"))? })
     }
 
-    /// `(1 − tanh f)·x + tanh g·m`.
-    fn apply(&self, x: &[f32], m: &[f32], eps: f64, pool: Option<&Pool>) -> Vec<f32> {
-        let dim = x.len();
-        let rank = self.down.len() / (2 * dim);
-        let mut cat = unit_rms(x, eps);
-        cat.extend(unit_rms(m, eps));
-        let d = mv(pool, &self.down, &cat, rank);
-        let fg = mv(pool, &self.forget, &d, dim);
-        let gn = mv(pool, &self.gain, &d, dim);
-        (0..dim).map(|i| (1.0 - fg[i].tanh()) * x[i] + gn[i].tanh() * m[i]).collect()
-    }
 }
 
 pub struct Moe {
@@ -493,109 +473,188 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     Ok((globals, layers, cfg, state))
 }
 
-impl Attn {
-    /// One position: q from `xq`, k from `xk`, v from `xv` (normed inputs);
-    /// its key and value into the slot's cache; the attention with the
-    /// relative bias and the sink; the gated O projection.
-    #[allow(clippy::too_many_arguments)]
-    fn forward(&self, xq: &[f32], xk: &[f32], xv: &[f32], ss: &mut SlotState, pos: usize, sliding: bool, cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
-        let (nh, nkv, hd, dr) = (cfg.nh, cfg.nkv, cfg.hd, cfg.d_rel);
-        let per = nh / nkv;
-        let mut q = qmv(&self.q, xq, pool);
-        for (v, s) in q.iter_mut().zip(&self.q_scale) {
-            *v *= s;
+/// `rows` rows of `width` floats each, for the pool.
+fn par_rows(pool: Option<&Pool>, rows: usize, width: usize, out: &mut [f32], f: &(dyn Fn(usize, &mut [f32]) + Sync)) {
+    debug_assert_eq!(out.len(), rows * width);
+    match pool {
+        Some(p) if rows > 1 => {
+            let addr = crate::pool::SendMut::new(out.as_mut_ptr());
+            p.run_rows(rows, &|a, b| {
+                for r in a..b {
+                    f(r, unsafe { std::slice::from_raw_parts_mut(addr.at(r * width), width) });
+                }
+            });
         }
-        l2_clip(&mut q, hd, cfg.qk_clip);
-        let mut r = qmv(&self.rel, xq, pool);
-        for (v, s) in r.iter_mut().zip(&self.rel_scale) {
-            *v *= s;
-        }
-        l2_clip(&mut r, dr, cfg.rel_clip);
-        if !sliding {
-            let tu = tau(pos, cfg.log_alpha, cfg.log_floor);
-            for v in q.iter_mut().chain(r.iter_mut()) {
-                *v *= tu;
+        _ => {
+            for (r, o) in out.chunks_mut(width).enumerate() {
+                f(r, o);
             }
         }
-        let sinks = mv(pool, &self.sink, xq, nh);
-        let gate = qmv(&self.gate, xq, pool);
+    }
+}
 
-        let kl = qmv(&self.k, xk, pool);
-        let mut k = self.k_conv.step(&kl, &mut ss.rings[0], Some(xk), pool);
-        l2_clip(&mut k, hd, cfg.qk_clip);
-        let vl = qmv(&self.v, xv, pool);
-        let mut v = self.v_conv.step(&vl, &mut ss.rings[1], Some(xv), pool);
-        for h in v.chunks_mut(hd) {
-            let n = unit_rms(h, cfg.eps);
-            h.copy_from_slice(&n);
+/// `t · x` for `n` rows of `x` (`[n, cols]` → `[n, rows]`).
+fn qmm(t: &QTensor, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    let mut out = vec![0f32; n * t.rows()];
+    if n == 1 {
+        t.matvec(x, &mut out, pool);
+    } else {
+        t.matmat(x, n, &mut out, pool);
+    }
+    out
+}
+
+/// An f32 matrix `[rows, cols]` times `n` rows.
+fn fmm(pool: Option<&Pool>, w: &[f32], x: &[f32], n: usize, rows: usize) -> Vec<f32> {
+    let cols = x.len() / n.max(1);
+    let mut out = vec![0f32; n * rows];
+    if n == 1 {
+        crate::pool::matvec_rows(pool, w, x, &mut out);
+        return out;
+    }
+    // a row of the matrix against every input row: the matrix is read once
+    let mut t = vec![0f32; rows * n];
+    par_rows(pool, rows, n, &mut t, &|o, dst| {
+        let wr = &w[o * cols..(o + 1) * cols];
+        for (r, d) in dst.iter_mut().enumerate() {
+            *d = wr.iter().zip(&x[r * cols..(r + 1) * cols]).map(|(a, b)| a * b).sum();
         }
+    });
+    for o in 0..rows {
+        for r in 0..n {
+            out[r * rows + o] = t[o * n + r];
+        }
+    }
+    out
+}
+
+impl Conv {
+    /// `n` consecutive positions (`x` `[n, channels]`); `dyn_in` `[n, hidden]`.
+    fn rows(&self, x: &[f32], n: usize, ring: &mut Vec<f32>, dyn_in: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+        let c = self.channels;
+        let dynw = match (&self.proj, dyn_in) {
+            (Some(p), Some(xi)) => Some(fmm(pool, p, xi, n, self.groups * self.kernel)),
+            _ => None,
+        };
+        let gk = self.groups * self.kernel;
+        let mut out = vec![0f32; n * c];
+        for r in 0..n {
+            let d = dynw.as_ref().map(|d| &d[r * gk..(r + 1) * gk]);
+            let y = self.step_with(&x[r * c..(r + 1) * c], ring, d);
+            out[r * c..(r + 1) * c].copy_from_slice(&y);
+        }
+        out
+    }
+}
+
+/// Unit-RMS each `hd`-wide head of every row.
+fn norm_heads(x: &mut [f32], hd: usize, eps: f64) {
+    for h in x.chunks_mut(hd) {
+        let n = unit_rms(h, eps);
+        h.copy_from_slice(&n);
+    }
+}
+
+impl Attn {
+    /// `n` positions from `p0`: q from `xq`, k from `xk`, v from `xv` (normed
+    /// inputs, `[n, hidden]`); their keys and values into the slot's cache;
+    /// each row's attention over its past with the relative bias and the
+    /// sink; the gated O projection.
+    #[allow(clippy::too_many_arguments)]
+    fn rows(&self, xq: &[f32], xk: &[f32], xv: &[f32], n: usize, ss: &mut SlotState, p0: usize, sliding: bool, cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
+        let (nh, nkv, hd, dr, dim) = (cfg.nh, cfg.nkv, cfg.hd, cfg.d_rel, cfg.dim);
+        let per = nh / nkv;
+        let mut q = qmm(&self.q, xq, n, pool);
+        let mut r = qmm(&self.rel, xq, n, pool);
+        for (row, (qr, rr)) in q.chunks_mut(nh * hd).zip(r.chunks_mut(nh * dr)).enumerate() {
+            for (v, s) in qr.iter_mut().zip(&self.q_scale) {
+                *v *= s;
+            }
+            l2_clip(qr, hd, cfg.qk_clip);
+            for (v, s) in rr.iter_mut().zip(&self.rel_scale) {
+                *v *= s;
+            }
+            l2_clip(rr, dr, cfg.rel_clip);
+            if !sliding {
+                let tu = tau(p0 + row, cfg.log_alpha, cfg.log_floor);
+                for v in qr.iter_mut().chain(rr.iter_mut()) {
+                    *v *= tu;
+                }
+            }
+        }
+        let sinks = fmm(pool, &self.sink, xq, n, nh);
+        let gate = qmm(&self.gate, xq, n, pool);
+        let kl = qmm(&self.k, xk, n, pool);
+        let mut k = self.k_conv.rows(&kl, n, &mut ss.rings[0], Some(xk), pool);
+        l2_clip(&mut k, hd, cfg.qk_clip);
+        let vl = qmm(&self.v, xv, n, pool);
+        let mut v = self.v_conv.rows(&vl, n, &mut ss.rings[1], Some(xv), pool);
+        norm_heads(&mut v, hd, cfg.eps);
         let row = nkv * hd;
         ss.k.extend_from_slice(&k);
         ss.v.extend_from_slice(&v);
+        let base = ss.base;
+        debug_assert_eq!(base + ss.k.len() / row, p0 + n);
+
+        let extent = self.rel_table.len() / dr;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let (kc, vc) = (&ss.k, &ss.v);
+        let mut out = vec![0f32; n * nh * hd];
+        let (q, r) = (&q, &r);
+        par_rows(pool, n * nh, hd, &mut out, &|i, o| {
+            let (rw, h) = (i / nh, i % nh);
+            let pos = p0 + rw;
+            let g = h / per;
+            let qh = &q[(rw * nh + h) * hd..(rw * nh + h + 1) * hd];
+            let rh = &r[(rw * nh + h) * dr..(rw * nh + h + 1) * dr];
+            let first = if sliding { base.max((pos + 1).saturating_sub(cfg.window)) } else { base };
+            // the relative bias of this row and head over the distances it sees
+            let near = extent.min(pos + 1 - first);
+            let bias: Vec<f32> = (0..near).map(|d| (0..dr).map(|j| rh[j] * self.rel_table[j * extent + d]).sum::<f32>()).collect();
+            let sk = sinks[rw * nh + h];
+            let cnt = pos + 1 - first;
+            let mut s = vec![0f32; cnt];
+            let mut mx = sk;
+            for (ii, sv) in s.iter_mut().enumerate() {
+                let tpos = first + ii;
+                let ci = tpos - base;
+                let kr = &kc[(ci * nkv + g) * hd..(ci * nkv + g + 1) * hd];
+                let mut x = kr.iter().zip(qh).map(|(a, b)| a * b).sum::<f32>() * scale;
+                let d = pos - tpos;
+                if d < near {
+                    x += bias[d];
+                }
+                *sv = x;
+                mx = mx.max(x);
+            }
+            let mut den = ((sk - mx) as f64).exp();
+            for sv in s.iter_mut() {
+                *sv = (*sv - mx).exp();
+                den += *sv as f64;
+            }
+            let inv = (1.0 / den) as f32;
+            for (ii, &w) in s.iter().enumerate() {
+                let ci = first + ii - base;
+                let vr = &vc[(ci * nkv + g) * hd..(ci * nkv + g + 1) * hd];
+                let w = w * inv;
+                for (a, b) in o.iter_mut().zip(vr) {
+                    *a += w * b;
+                }
+            }
+        });
+        // a sliding slot keeps its last `window` rows
         if sliding && ss.k.len() > cfg.window * row {
             let drop = ss.k.len() / row - cfg.window;
             ss.k.drain(..drop * row);
             ss.v.drain(..drop * row);
             ss.base += drop;
         }
-        let first = ss.base;
-        debug_assert_eq!(first + ss.k.len() / row, pos + 1);
-
-        let extent = self.rel_table.len() / dr;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let (kc, vc) = (&ss.k, &ss.v);
-        let mut out = vec![0f32; nh * hd];
-        let head = |h: usize, o: &mut [f32]| {
-            let g = h / per;
-            let qh = &q[h * hd..(h + 1) * hd];
-            let rh = &r[h * dr..(h + 1) * dr];
-            let n = pos + 1 - first;
-            let mut s = vec![0f32; n];
-            let mut mx = sinks[h];
-            for (i, sv) in s.iter_mut().enumerate() {
-                let tpos = first + i;
-                let kr = &kc[(i * nkv + g) * hd..(i * nkv + g + 1) * hd];
-                let mut x = kr.iter().zip(qh).map(|(a, b)| a * b).sum::<f32>() * scale;
-                let d = pos - tpos;
-                if d < extent {
-                    x += (0..dr).map(|j| rh[j] * self.rel_table[j * extent + d]).sum::<f32>();
-                }
-                *sv = x;
-                mx = mx.max(x);
-            }
-            let mut den = ((sinks[h] - mx) as f64).exp();
-            for sv in s.iter_mut() {
-                *sv = (*sv - mx).exp();
-                den += *sv as f64;
-            }
-            let inv = (1.0 / den) as f32;
-            for (i, &w) in s.iter().enumerate() {
-                let vr = &vc[(i * nkv + g) * hd..(i * nkv + g + 1) * hd];
-                let w = w * inv;
-                for (a, b) in o.iter_mut().zip(vr) {
-                    *a += w * b;
-                }
-            }
-        };
-        match pool {
-            Some(p) => {
-                let addr = crate::pool::SendMut::new(out.as_mut_ptr());
-                p.run_rows(nh, &|a, b| {
-                    for h in a..b {
-                        head(h, unsafe { std::slice::from_raw_parts_mut(addr.at(h * hd), hd) });
-                    }
-                });
-            }
-            None => {
-                for (h, o) in out.chunks_mut(hd).enumerate() {
-                    head(h, o);
-                }
-            }
-        }
         for (o, g) in out.iter_mut().zip(&gate) {
             *o *= sigmoid(*g);
         }
-        qmv(&self.o, &out, pool)
+        let y = qmm(&self.o, &out, n, pool);
+        debug_assert_eq!(y.len(), n * dim);
+        y
     }
 }
 
@@ -608,17 +667,36 @@ impl Moe {
         route_logits(&logits, &self.bias, top_k)
     }
 
-    fn forward(&self, x: &[f32], cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
-        let mut y = vec![0f32; x.len()];
-        for (e, w) in self.route(x, cfg.top_k, pool) {
+    /// `n` rows: each row's experts, the rows of an expert in one product.
+    fn rows(&self, x: &[f32], n: usize, cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
+        let dim = cfg.dim;
+        let ne = self.bias.len();
+        let logits = fmm(pool, &self.router, x, n, ne);
+        let mut by: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ne];
+        for r in 0..n {
+            for (e, w) in route_logits(&logits[r * ne..(r + 1) * ne], &self.bias, cfg.top_k) {
+                by[e].push((r, w * cfg.route_scale));
+            }
+        }
+        let mut y = vec![0f32; n * dim];
+        for (e, rows) in by.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let m = rows.len();
+            let mut xs = vec![0f32; m * dim];
+            for (j, &(r, _)) in rows.iter().enumerate() {
+                xs[j * dim..(j + 1) * dim].copy_from_slice(&x[r * dim..(r + 1) * dim]);
+            }
             let [gt, up, dn] = &self.experts[e];
-            let g = qmv(gt, x, pool);
-            let u = qmv(up, x, pool);
+            let g = qmm(gt, &xs, m, pool);
+            let u = qmm(up, &xs, m, pool);
             let a: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| softcap(g, cfg.gate_cap) * sigmoid(g) * softcap(u, cfg.up_cap)).collect();
-            let ye = qmv(dn, &a, pool);
-            let w = w * cfg.route_scale;
-            for (o, v) in y.iter_mut().zip(&ye) {
-                *o += w * v;
+            let ye = qmm(dn, &a, m, pool);
+            for (j, &(r, w)) in rows.iter().enumerate() {
+                for (o, v) in y[r * dim..(r + 1) * dim].iter_mut().zip(&ye[j * dim..(j + 1) * dim]) {
+                    *o += w * v;
+                }
             }
         }
         y
@@ -643,7 +721,7 @@ pub fn route_logits(logits: &[f32], bias: &[f32], top_k: usize) -> Vec<(usize, f
 
 /// `CMF_INKLING_DUMP=<dir>,<pos>,<pos>…`: the host stack writes every
 /// application's output at those positions (`<dir>/<kind>_s<slot>_p<pos>.f32`).
-fn dump(slot: usize, pos: usize, kind: &str, v: &[f32]) {
+fn dump_rows(slot: usize, p0: usize, kind: &str, v: &[f32], dim: usize) {
     static CFG: std::sync::OnceLock<Option<(String, Vec<usize>)>> = std::sync::OnceLock::new();
     let cfg = CFG.get_or_init(|| {
         let s = std::env::var("CMF_INKLING_DUMP").ok()?;
@@ -651,74 +729,109 @@ fn dump(slot: usize, pos: usize, kind: &str, v: &[f32]) {
         let dir = it.next()?.to_string();
         Some((dir, it.filter_map(|p| p.parse().ok()).collect()))
     });
-    if let Some((dir, ps)) = cfg
-        && ps.contains(&pos)
-    {
-        let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let _ = std::fs::write(format!("{dir}/{kind}_s{slot}_p{pos}.f32"), b);
+    if let Some((dir, ps)) = cfg {
+        for (r, row) in v.chunks(dim).enumerate() {
+            if ps.contains(&(p0 + r)) {
+                let b: Vec<u8> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{dir}/{kind}_s{slot}_p{}.f32", p0 + r), b);
+            }
+        }
     }
 }
 
-/// One layer application at one position: `h` the running sum, `blocks` the
-/// closed block states (a boundary layer closes `h` into them), `msgs` the
-/// four messages of a loop pass after the first.
+/// `x` and the closed blocks per row; the mixture of every row by `queries`.
+fn mix_rows(blocks: &[Vec<f32>], x: &[f32], queries: &[f32], n: usize, dim: usize) -> Vec<Vec<f32>> {
+    let nq = queries.len() / dim;
+    let mut out = vec![vec![0f32; n * dim]; nq];
+    for r in 0..n {
+        let mut st: Vec<&[f32]> = blocks.iter().map(|b| &b[r * dim..(r + 1) * dim]).collect();
+        st.push(&x[r * dim..(r + 1) * dim]);
+        for (qi, m) in mix(&st, queries, dim).into_iter().enumerate() {
+            out[qi][r * dim..(r + 1) * dim].copy_from_slice(&m);
+        }
+    }
+    out
+}
+
+impl Gate {
+    fn rows(&self, x: &[f32], m: &[f32], n: usize, eps: f64, pool: Option<&Pool>) -> Vec<f32> {
+        let dim = x.len() / n;
+        let rank = self.down.len() / (2 * dim);
+        let mut cat = vec![0f32; n * 2 * dim];
+        for r in 0..n {
+            cat[r * 2 * dim..r * 2 * dim + dim].copy_from_slice(&unit_rms(&x[r * dim..(r + 1) * dim], eps));
+            cat[r * 2 * dim + dim..(r + 1) * 2 * dim].copy_from_slice(&unit_rms(&m[r * dim..(r + 1) * dim], eps));
+        }
+        let d = fmm(pool, &self.down, &cat, n, rank);
+        let fg = fmm(pool, &self.forget, &d, n, dim);
+        let gn = fmm(pool, &self.gain, &d, n, dim);
+        (0..n * dim).map(|i| (1.0 - fg[i].tanh()) * x[i] + gn[i].tanh() * m[i]).collect()
+    }
+}
+
+fn rms_rows(x: &[f32], w: &[f32], eps: f64) -> Vec<f32> {
+    x.chunks(w.len()).flat_map(|r| rms_w(r, w, eps)).collect()
+}
+
+/// One layer application for `n` positions from `p0`: `h` the running sums
+/// `[n, hidden]`, `blocks` the closed block states (a boundary layer closes
+/// `h` into them), `msgs` the four messages of a loop pass after the first.
 #[allow(clippy::too_many_arguments)]
-fn layer_step(l: &Layer, li: usize, ss: &mut SlotState, h: &[f32], blocks: &mut Vec<Vec<f32>>, msgs: Option<&[Vec<f32>]>, pos: usize, cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
+fn layer_rows(l: &Layer, li: usize, ss: &mut SlotState, h: &[f32], n: usize, blocks: &mut Vec<Vec<f32>>, msgs: Option<&[Vec<f32>]>, p0: usize, cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
     let dim = cfg.dim;
     let boundary = li % cfg.block == 0;
     let mut inputs: [Vec<f32>; 3] = match &l.attn_query {
         Some(q) => {
-            let mut st: Vec<&[f32]> = blocks.iter().map(|b| b.as_slice()).collect();
-            st.push(h);
-            let m = mix(&st, q, dim);
+            let m = mix_rows(blocks, h, q, n, dim);
             if l.sliding { [m[0].clone(), m[0].clone(), m[0].clone()] } else { [m[0].clone(), m[1].clone(), m[2].clone()] }
         }
         None => [h.to_vec(), h.to_vec(), h.to_vec()],
     };
     if let (Some(ms), Some(g)) = (msgs, &l.gates) {
         for j in 0..3 {
-            inputs[j] = g[j].apply(&inputs[j], &ms[j], cfg.eps, pool);
+            inputs[j] = g[j].rows(&inputs[j], &ms[j], n, cfg.eps, pool);
         }
     }
-    let xq = rms_w(&inputs[0], &l.in_norm[0], cfg.eps);
+    let xq = rms_rows(&inputs[0], &l.in_norm[0], cfg.eps);
     let (xk, xv) = if l.sliding && msgs.is_none() {
         (xq.clone(), xq.clone())
     } else {
-        (rms_w(&inputs[1], &l.in_norm[1], cfg.eps), rms_w(&inputs[2], &l.in_norm[2], cfg.eps))
+        (rms_rows(&inputs[1], &l.in_norm[1], cfg.eps), rms_rows(&inputs[2], &l.in_norm[2], cfg.eps))
     };
-    let a = l.attn.forward(&xq, &xk, &xv, ss, pos, l.sliding, cfg, pool);
-    let a = l.post_attn_conv.step(&a, &mut ss.rings[2], None, pool);
+    let a = l.attn.rows(&xq, &xk, &xv, n, ss, p0, l.sliding, cfg, pool);
+    let a = l.post_attn_conv.rows(&a, n, &mut ss.rings[2], None, pool);
     let r: Vec<f32> = if boundary {
         blocks.push(h.to_vec());
         a
     } else {
         h.iter().zip(&a).map(|(x, y)| x + y).collect()
     };
-    let mut st: Vec<&[f32]> = blocks.iter().map(|b| b.as_slice()).collect();
-    st.push(&r);
-    let mut m = mix(&st, &l.mlp_query, dim).swap_remove(0);
+    let mut m = mix_rows(blocks, &r, &l.mlp_query, n, dim).swap_remove(0);
     if let (Some(ms), Some(g)) = (msgs, &l.gates) {
-        m = g[3].apply(&m, &ms[3], cfg.eps, pool);
+        m = g[3].rows(&m, &ms[3], n, cfg.eps, pool);
     }
-    let x = rms_w(&m, &l.post_norm, cfg.eps);
-    let y = l.moe.forward(&x, cfg, pool);
-    let y = l.post_mlp_conv.step(&y, &mut ss.rings[3], None, pool);
+    let x = rms_rows(&m, &l.post_norm, cfg.eps);
+    let y = l.moe.rows(&x, n, cfg, pool);
+    let y = l.post_mlp_conv.rows(&y, n, &mut ss.rings[3], None, pool);
     r.iter().zip(&y).map(|(a, b)| a + b).collect()
 }
 
-/// The final mixture of one position after the whole stack (host): its
-/// normed hidden, ready for the head.
-fn host_hidden(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, token_id: u32, pos: usize, pool: Option<&Pool>) -> Vec<f32> {
-    let dim = cfg.dim;
-    let mut e = vec![0f32; dim];
-    if (token_id as usize) < globals.embed.rows() {
-        globals.embed.row_f32(&globals.model, token_id as usize, &mut e);
+/// `n` positions from `p0` through the whole stack (host): the normed final
+/// mixture of every row, ready for the head.
+fn host_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], p0: usize, pool: Option<&Pool>) -> Vec<f32> {
+    let (dim, n) = (cfg.dim, ids.len());
+    let mut h = vec![0f32; n * dim];
+    for (r, &id) in ids.iter().enumerate() {
+        let mut e = vec![0f32; dim];
+        if (id as usize) < globals.embed.rows() {
+            globals.embed.row_f32(&globals.model, id as usize, &mut e);
+        }
+        h[r * dim..(r + 1) * dim].copy_from_slice(&rms_w(&e, &globals.embed_norm, cfg.eps));
     }
-    let mut h = rms_w(&e, &globals.embed_norm, cfg.eps);
     let mut blocks: Vec<Vec<f32>> = Vec::new();
     for li in 0..cfg.core_start {
-        h = layer_step(&layers[li], li, &mut state.slots[li], &h, &mut blocks, None, pos, cfg, pool);
-        dump(li, pos, "h", &h);
+        h = layer_rows(&layers[li], li, &mut state.slots[li], &h, n, &mut blocks, None, p0, cfg, pool);
+        dump_rows(li, p0, "h", &h, dim);
     }
     let (pre_h, pre_blocks) = (h.clone(), blocks.clone());
     for pass in 0..cfg.passes {
@@ -732,45 +845,99 @@ fn host_hidden(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
             let slot = cfg.slot(li, pass);
             let msgs = (pass > 0).then(|| {
                 let i = li - cfg.core_start;
-                let st: Vec<&[f32]> = bank.iter().map(|b| b.as_slice()).collect();
-                mix(&st, &globals.message_query[i * 4 * dim..(i + 1) * 4 * dim], dim)
+                let last = bank.len() - 1;
+                mix_rows(&bank[..last], &bank[last], &globals.message_query[i * 4 * dim..(i + 1) * 4 * dim], n, dim)
             });
-            h = layer_step(&layers[li], li, &mut state.slots[slot], &h, &mut blocks, msgs.as_deref(), pos, cfg, pool);
-            dump(slot, pos, "h", &h);
+            h = layer_rows(&layers[li], li, &mut state.slots[slot], &h, n, &mut blocks, msgs.as_deref(), p0, cfg, pool);
+            dump_rows(slot, p0, "h", &h, dim);
         }
     }
     for li in cfg.core_end..cfg.layers {
-        h = layer_step(&layers[li], li, &mut state.slots[li], &h, &mut blocks, None, pos, cfg, pool);
-        dump(li, pos, "h", &h);
+        h = layer_rows(&layers[li], li, &mut state.slots[li], &h, n, &mut blocks, None, p0, cfg, pool);
+        dump_rows(li, p0, "h", &h, dim);
     }
-    let mut st: Vec<&[f32]> = blocks.iter().map(|b| b.as_slice()).collect();
-    st.push(&h);
-    let fin = mix(&st, &globals.final_query, dim).swap_remove(0);
-    rms_w(&fin, &globals.norm, cfg.eps)
+    let fin = mix_rows(&blocks, &h, &globals.final_query, n, dim).swap_remove(0);
+    let x = rms_rows(&fin, &globals.norm, cfg.eps);
+    dump_rows(cfg.slots(), p0, "final", &x, dim);
+    x
 }
 
-/// The softcapped logits of a normed hidden.
-fn head(globals: &Globals, cfg: &Cfg, x: &[f32], logits: &mut Vec<f32>, pool: Option<&Pool>) {
-    logits.resize(globals.lm_head.rows(), 0.0);
-    globals.lm_head.matvec(x, logits, pool);
+/// Rows of a prompt chunk on the host (`CMF_INKLING_CHUNK`, 128).
+fn chunk_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_INKLING_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(128))
+}
+
+/// The softcapped logits of `n` normed rows.
+fn head_rows(globals: &Globals, cfg: &Cfg, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    let mut lg = qmm(&globals.lm_head, x, n, pool);
     if cfg.logit_cap > 0.0 {
-        for v in logits.iter_mut() {
+        for v in lg.iter_mut() {
             *v = softcap(*v, cfg.logit_cap);
         }
     }
+    lg
 }
 
-/// The prompt through a batched path; 0 = not taken (the caller runs it a
-/// token at a time).
+/// The prompt from `start` through the host stack in chunks; the last row's
+/// logits. Returns the positions taken (all of them, or 0 when the sequence
+/// is not at `start`).
 #[allow(clippy::too_many_arguments)]
-pub fn forward_prompt(_globals: &Globals, _layers: &[Layer], _cfg: &Cfg, _state: &mut State, _ids: &[u32], _start: usize, _pool: Option<&Pool>, _logits: &mut Vec<f32>) -> usize {
-    0
+pub fn forward_prompt(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], start: usize, pool: Option<&Pool>, logits: &mut Vec<f32>) -> usize {
+    if ids.is_empty() || std::env::var("CMF_INKLING_BATCH").as_deref() == Ok("0") {
+        return 0;
+    }
+    if start == 0 {
+        state.reset(cfg.slots());
+    } else if state.pos != start {
+        return 0;
+    }
+    let t0 = std::time::Instant::now();
+    let mut last = Vec::new();
+    for (ci, part) in ids.chunks(chunk_rows()).enumerate() {
+        let p0 = start + ci * chunk_rows();
+        last = host_rows(globals, layers, cfg, state, part, p0, pool);
+        state.tokens.extend_from_slice(part);
+        state.pos = p0 + part.len();
+        let n = part.len();
+        last = last[(n - 1) * cfg.dim..].to_vec();
+    }
+    *logits = head_rows(globals, cfg, &last, 1, pool);
+    tracing::info!("inkling2_loop: {} prompt rows on the host in {:.1} s", ids.len(), t0.elapsed().as_secs_f64());
+    ids.len()
 }
 
-/// A window's negative log-likelihood through a batched path; None = the
-/// caller scores it a token at a time.
-pub fn nll(_globals: &Globals, _layers: &[Layer], _cfg: &Cfg, _state: &mut State, _ids: &[u32], _from: usize, _pool: Option<&Pool>) -> Option<(f64, usize)> {
-    None
+/// A window's negative log-likelihood through the host stack in chunks (the
+/// predictions from `from` on).
+pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], from: usize, pool: Option<&Pool>) -> Option<(f64, usize)> {
+    if ids.len() < 2 || std::env::var("CMF_INKLING_BATCH").as_deref() == Ok("0") {
+        return None;
+    }
+    let n = ids.len() - 1;
+    let t0 = std::time::Instant::now();
+    state.reset(cfg.slots());
+    let (mut nll, mut cnt) = (0f64, 0usize);
+    let vocab = globals.lm_head.rows();
+    for (ci, part) in ids[..n].chunks(chunk_rows()).enumerate() {
+        let p0 = ci * chunk_rows();
+        let x = host_rows(globals, layers, cfg, state, part, p0, pool);
+        state.pos = p0 + part.len();
+        let lg = head_rows(globals, cfg, &x, part.len(), pool);
+        for (j, row) in lg.chunks(vocab).enumerate() {
+            let p = p0 + j;
+            if p < from {
+                continue;
+            }
+            let target = (ids[p + 1] as usize).min(vocab - 1);
+            let best = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+            let den: f64 = row.iter().map(|&v| ((v as f64) - best).exp()).sum();
+            nll += den.ln() - (row[target] as f64 - best);
+            cnt += 1;
+        }
+    }
+    state.reset(cfg.slots());
+    tracing::info!("inkling2_loop nll: {n} rows on the host in {:.1} s", t0.elapsed().as_secs_f64());
+    Some((nll, cnt))
 }
 
 /// One token; the logits when asked.
@@ -783,11 +950,10 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
         state.reset(cfg.slots());
     }
     state.tokens.push(token_id);
-    let x = host_hidden(globals, layers, cfg, state, token_id, position, pool);
+    let x = host_rows(globals, layers, cfg, state, &[token_id], position, pool);
     state.pos = position + 1;
     if want_logits {
-        dump(cfg.slots(), position, "final", &x);
-        head(globals, cfg, &x, logits, pool);
+        *logits = head_rows(globals, cfg, &x, 1, pool);
     }
 }
 
@@ -864,11 +1030,11 @@ mod tests {
         let c = Conv { taps: vec![1.0, 0.5, 0.25, 0.0], channels: 1, kernel: 4, proj: None, groups: 1 };
         let mut ring = Vec::new();
         let s5 = 5f32.sqrt();
-        let y0 = c.step(&[2.0], &mut ring, None, None);
+        let y0 = c.step_with(&[2.0], &mut ring, None);
         assert!((y0[0] - (2.0 + 2.0) / s5).abs() < 1e-6);
-        let y1 = c.step(&[4.0], &mut ring, None, None);
+        let y1 = c.step_with(&[4.0], &mut ring, None);
         assert!((y1[0] - (4.0 + 4.0 + 1.0) / s5).abs() < 1e-6);
-        let y2 = c.step(&[8.0], &mut ring, None, None);
+        let y2 = c.step_with(&[8.0], &mut ring, None);
         assert!((y2[0] - (8.0 + 8.0 + 2.0 + 0.5) / s5).abs() < 1e-6);
         assert_eq!(ring, vec![8.0, 4.0, 2.0]);
     }
