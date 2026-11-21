@@ -1418,7 +1418,10 @@ fn profile(c: &Ctx, plan: &[Step], n: usize) {
             let slice = mb.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
-            let raw: Vec<u64> = slice.get_mapped_range().chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect();
+            let raw: Vec<u64> = match slice.get_mapped_range() {
+                Ok(v) => v.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect(),
+                Err(_) => return,
+            };
             mb.unmap();
             let mut g = PROF.lock().unwrap();
             let m = g.get_or_insert_with(HashMap::new);

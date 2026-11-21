@@ -931,6 +931,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
         } else {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
         }
+        unsafe { ds_dump_taps(c, d, cfg, n, pos0 + at)? };
         if lrows > 0 && all && !big {
             if let Some(p) = pick.as_deref_mut() {
                 let mut v = vec![0i32; lrows];
@@ -1300,8 +1301,58 @@ unsafe fn draft_block(c: &Ctx, d: &Dev, dr: &DraftD, g: &Globals, cfg: &Cfg, anc
         let mut ids = vec![0i32; k];
         cu::memcpy_dtoh_async(&mut ids, dr.ids.ptr, c.stream).map_err(derr)?;
         c.sync()?;
+        if let Some(dir) = ds_dump() {
+            if !DS_DUMPED.swap(true, Ordering::Relaxed) {
+                let mut hf = vec![0f32; b * hidden];
+                let mut lg = vec![0f32; k * vocab];
+                cu::memcpy_dtoh_async(&mut hf, dr.hf.ptr, c.stream).map_err(derr)?;
+                cu::memcpy_dtoh_async(&mut lg, dr.dlog.ptr, c.stream).map_err(derr)?;
+                c.sync()?;
+                let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+                let _ = std::fs::write(format!("{dir}/h.bin"), bytes(&hf));
+                let _ = std::fs::write(format!("{dir}/logits.bin"), bytes(&lg));
+                let _ = std::fs::write(format!("{dir}/round.json"), format!("{{\"anchor\": {anchor}, \"pos\": {pos}, \"k\": {k}, \"ids\": {ids:?}}}"));
+                tracing::info!("inkling2_loop: the drafter's first round dumped into {dir}");
+            }
+        }
         Ok(ids.into_iter().map(|v| v as u32).collect())
     }
+}
+
+/// `CMF_INKLING_DS_DUMP=dir` (a check, not a run): every call's drafter taps
+/// (`taps.bin`, `[tap][rows][hidden]` f32 a call; `taps.idx` a line `pos0 n`
+/// a call) until the first draft round, then that round's normed block rows
+/// (`h.bin`), its drafts' logits before the bias (`logits.bin`) and
+/// `round.json`.
+fn ds_dump() -> Option<&'static str> {
+    static D: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    D.get_or_init(|| std::env::var("CMF_INKLING_DS_DUMP").ok().filter(|v| !v.is_empty())).as_deref()
+}
+
+static DS_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn ds_dump_taps(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, pos0: usize) -> Res<()> {
+    let Some(dir) = ds_dump() else { return Ok(()) };
+    let Some(dr) = &d.draft else { return Ok(()) };
+    if DS_DUMPED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    use std::io::Write;
+    let hidden = cfg.dim;
+    let nt = dr.taps.len() + 1;
+    let mut v = vec![0f32; nt * n * hidden];
+    unsafe {
+        for k in 0..nt {
+            cu::memcpy_dtoh_async(&mut v[k * n * hidden..(k + 1) * n * hidden], dr.tap.ptr + ((k * d.rows * hidden) * 4) as u64, c.stream).map_err(derr)?;
+        }
+    }
+    c.sync()?;
+    let _ = std::fs::create_dir_all(dir);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/taps.bin")).map_err(|e| e.to_string())?;
+    f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(|e| e.to_string())?;
+    let mut ix = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/taps.idx")).map_err(|e| e.to_string())?;
+    writeln!(ix, "{pos0} {n}").map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The rings of every application saved before a draft verify.
