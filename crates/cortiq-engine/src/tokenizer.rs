@@ -1182,36 +1182,43 @@ impl Tokenizer {
 
     /// Streaming decode of ONE token: no sequence-level Strip — a
     /// per-token strip would eat the ▁-spaces of every SP word.
+    /// An Inkling turn marker one token at a time (`decode_token` and the
+    /// stream): `Some` of its spelling (the thinking part's `<think>` …
+    /// `</think>`, a tool call's `<tool_call>` … `</tool_call>`, nothing for the
+    /// others and for a turn header's name), `None` for a token of a part.
+    fn ink_token(&self, id: u32) -> Option<String> {
+        let m = self.ink_marks()?;
+        use std::sync::atomic::Ordering::Relaxed;
+        let st = &self.ink_state;
+        if id == m.model {
+            st.store(4, Relaxed);
+            return Some(String::new());
+        }
+        if id == m.think {
+            st.store(1, Relaxed);
+            return Some("<think>".into());
+        }
+        if id == m.text {
+            st.store(2, Relaxed);
+            return Some(String::new());
+        }
+        if id == m.tool {
+            st.store(3, Relaxed);
+            return Some("<tool_call>".into());
+        }
+        if id == m.end {
+            return Some(match st.swap(0, Relaxed) {
+                1 => "</think>\n\n".into(),
+                3 => "</tool_call>".into(),
+                _ => String::new(),
+            });
+        }
+        (st.load(Relaxed) == 4).then(String::new)
+    }
+
     pub fn decode_token(&self, id: u32) -> String {
-        if let Some(m) = self.ink_marks() {
-            use std::sync::atomic::Ordering::Relaxed;
-            let st = &self.ink_state;
-            if id == m.model {
-                st.store(4, Relaxed);
-                return String::new();
-            }
-            if id == m.think {
-                st.store(1, Relaxed);
-                return "<think>".into();
-            }
-            if id == m.text {
-                st.store(2, Relaxed);
-                return String::new();
-            }
-            if id == m.tool {
-                st.store(3, Relaxed);
-                return "<tool_call>".into();
-            }
-            if id == m.end {
-                return match st.swap(0, Relaxed) {
-                    1 => "</think>\n\n".into(),
-                    3 => "</tool_call>".into(),
-                    _ => String::new(),
-                };
-            }
-            if st.load(Relaxed) == 4 {
-                return String::new();
-            }
+        if let Some(t) = self.ink_token(id) {
+            return t;
         }
         if self.special_ids.contains(&id) {
             return String::new();
@@ -1255,6 +1262,9 @@ impl Tokenizer {
     /// The incomplete tail waits in `pending` (one per stream) and comes out
     /// with the token that completes it; invalid bytes still decode lossily.
     pub fn decode_token_stream(&self, id: u32, pending: &mut Vec<u8>) -> String {
+        if let Some(t) = self.ink_token(id) {
+            return t;
+        }
         if self.special_ids.contains(&id) {
             return String::new();
         }
@@ -2614,6 +2624,10 @@ mod ink_tests {
         assert_eq!(t.decode(&[2, 3, 0, 5, 2, 4, 1, 5, 7]), "<think>a</think>\n\nb");
         assert_eq!(t.decode(&[2, 4, 1, 1, 5]), "bb");
         let streamed: String = [2u32, 3, 0, 5, 2, 4, 1, 5, 7].iter().map(|&i| t.decode_token(i)).collect();
+        assert_eq!(streamed, "<think>a</think>\n\nb");
+        // the UTF-8-safe stream `run` prints with marks the parts the same way
+        let mut pending = Vec::new();
+        let streamed: String = [2u32, 3, 0, 5, 2, 4, 1, 5, 7].iter().map(|&i| t.decode_token_stream(i, &mut pending)).collect();
         assert_eq!(streamed, "<think>a</think>\n\nb");
     }
 }

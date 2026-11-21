@@ -269,6 +269,10 @@ fn job(m: &DevMat, rows: usize, kind: i32) -> HyJob {
 
 fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Res<Dev> {
     let t0 = std::time::Instant::now();
+    // the 6144 expert matrices (1.3 and 2.7 MB) as pieces of shared slabs: the
+    // driver rounds each allocation above a megabyte up to a multiple of two,
+    // which took 6 GB of an L4 beside 13.6 GB of weights
+    let slabs = super::super::SlabScope::enter();
     let (hidden, nh, nkv, hd, dr) = (cfg.dim, cfg.nh, cfg.nkv, cfg.hd, cfg.d_rel);
     let hpk = nh / nkv;
     let hfx = match st.hyb.funcs.get(&(hpk, hd)) {
@@ -511,13 +515,14 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         cap,
     };
     tracing::info!(
-        "inkling2_loop on CUDA: {} layers resident, {:.1} GB of weights, {:.2} GB of caches for {} positions, prompt calls of {} rows, built in {:.1} s",
+        "inkling2_loop on CUDA: {} layers resident, {:.1} GB of weights, {:.2} GB of caches for {} positions, prompt calls of {} rows, built in {:.1} s; {}",
         layers.len(),
         resident as f64 / 1e9,
         d.slots.iter().map(|s| (s.k.bytes + s.v.bytes) as f64).sum::<f64>() / 1e9,
         cap,
         if d.big.is_some() { d.rows } else { NMAX },
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        slabs.report()
     );
     Ok(d)
 }
