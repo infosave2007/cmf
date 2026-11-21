@@ -172,6 +172,9 @@ pub struct Cfg {
     pub local_blocks: usize,
     pub remote_blocks: usize,
     pub top_k: usize,
+    /// The context cap (`CMF_MAX_SEQ`, 32 768): the positions the card's
+    /// reserve is sized for.
+    pub max_seq: usize,
 }
 
 impl Cfg {
@@ -255,6 +258,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         local_blocks: u("block_sparse_gqa_local_window_size")? / block.max(1),
         remote_blocks: u("block_sparse_gqa_num_remote_blocks")?,
         top_k: moe.top_k,
+        max_seq: crate::gpu::context_cap(model),
     };
     if block == 0 || cfg.prefix_blocks == 0 || cfg.local_blocks == 0 || !(1..=4).contains(&cfg.hc) {
         return Err(err("block-sparse geometry"));
@@ -612,6 +616,16 @@ fn gf(d: &[f32]) -> crate::gpu::GraphW<'_> {
 /// backend whose attention has no block router).
 fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end: usize) -> Option<Vec<crate::gpu::GraphLayer<'a>>> {
     use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
+    if end > cfg.max_seq {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "maxwell_moe: {end} positions, past the context cap of {}: the card keeps room for the cap's rows only, \
+                 so later rows may leave it for the host. Raise CMF_MAX_SEQ.",
+                cfg.max_seq
+            );
+        }
+    }
     let routed = end > cfg.dense_range();
     if routed && !crate::gpu::block_route_on() {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1038,7 +1052,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> Cfg {
-        Cfg { dim: 8, hc: 4, eps: 1e-6, hc_eps: 1e-6, sinkhorn_iters: 20, nh: 4, nkv: 2, hd: 4, scale: 0.5, invf: vec![1.0, 0.1], block: 128, prefix_blocks: 8, local_blocks: 8, remote_blocks: 16, top_k: 2 }
+        Cfg { dim: 8, hc: 4, eps: 1e-6, hc_eps: 1e-6, sinkhorn_iters: 20, nh: 4, nkv: 2, hd: 4, scale: 0.5, invf: vec![1.0, 0.1], block: 128, prefix_blocks: 8, local_blocks: 8, remote_blocks: 16, top_k: 2, max_seq: 32768 }
     }
 
     #[test]
