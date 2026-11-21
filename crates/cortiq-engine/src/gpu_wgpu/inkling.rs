@@ -1005,7 +1005,7 @@ const COOP_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
 
-struct CP { e: u32, k: u32, cols: u32, rows: u32, which: u32, asc: f32, wsc: f32, p3: u32 };
+struct CP { e: u32, k: u32, cols: u32, rows: u32, which: u32, p1: u32, p2: u32, p3: u32 };
 @group(0) @binding(0) var<uniform> cp: CP;
 @group(0) @binding(1) var<storage, read> cbank: array<u32>;
 @group(0) @binding(2) var<storage, read> cui: array<u32>;
@@ -1075,8 +1075,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 v = vec4<f32>(cx[base], cx[base + 1u], cx[base + 2u], cx[base + 3u]);
             }
             let dst = m * KS + k4;
-            let sv = v * cp.asc;
-            cm_a[dst] = f16(sv.x); cm_a[dst + 1u] = f16(sv.y); cm_a[dst + 2u] = f16(sv.z); cm_a[dst + 3u] = f16(sv.w);
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y); cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
         }
         for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let n = t / 8u;
@@ -1096,7 +1095,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 let bo = (wb + (wrow * gpr + g) * 4u) * 4u + (col0 - g * 32u) / 2u;
                 let b0 = cbyte(bo);
                 let b1 = cbyte(bo + 1u);
-                wv = vec4<f32>(f32(b0 & 0xFu) - 8.0, f32(b0 >> 4u) - 8.0, f32(b1 & 0xFu) - 8.0, f32(b1 >> 4u) - 8.0) * (scale * cp.wsc);
+                wv = vec4<f32>(f32(b0 & 0xFu) - 8.0, f32(b0 >> 4u) - 8.0, f32(b1 & 0xFu) - 8.0, f32(b1 >> 4u) - 8.0) * scale;
             }
             let bd = n * KS + k4;
             cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y); cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
@@ -1137,7 +1136,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
         let m = t / 64u;
         let n = t % 64u;
         if (m0 + m < nb && n0 + n < rows) {
-            cy[(span.x + m0 + m) * rows + n0 + n] = cm_c[m * 64u + n] / (cp.asc * cp.wsc);
+            cy[(span.x + m0 + m) * rows + n0 + n] = cm_c[m * 64u + n];
         }
     }
 }
@@ -1702,18 +1701,16 @@ fn moe_mode() -> u8 {
     })
 }
 
-/// `CMF_INKLING_COOP`: a prompt chunk's 4-bit dense matrices on the
-/// cooperative-matrix GEMM (`dense`, the default), the grouped experts too
-/// (`1`), the experts only (`moe`), neither (`0`). The grouped-expert kernel
-/// is not right yet: on an L4 its perplexity is 16.1 against 8.95 (both of its
-/// products wrong, the dense GEMM right), so it is off unless asked for.
+/// `CMF_INKLING_COOP`: a prompt chunk's 4-bit dense matrices and grouped
+/// experts on the cooperative-matrix GEMMs (`1`, the default), the dense ones
+/// only (`dense`), the experts only (`moe`), neither (`0`).
 fn coop_mode() -> (bool, bool) {
     static M: OnceLock<(bool, bool)> = OnceLock::new();
     *M.get_or_init(|| match std::env::var("CMF_INKLING_COOP").as_deref() {
         Ok("0") => (false, false),
-        Ok("1") => (true, true),
+        Ok("dense") => (true, false),
         Ok("moe") => (false, true),
-        _ => (true, false),
+        _ => (true, true),
     })
 }
 fn coop_on() -> bool {
@@ -2038,11 +2035,7 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
             // one grouped-expert product on the matrix units: (which, x, y, cols, rows)
             let coop_go = |rec: &mut Rec, pipe: &wgpu::ComputePipeline, which: u32, x: &wgpu::Buffer, y: &wgpu::Buffer, cols: usize, rows: usize| {
                 let u = rec.c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-cp"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                // the activations scaled into f16's range on the way in, back on the way out
-                let asc: f32 = std::env::var("CMF_INKLING_COOP_ASC").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                // the weights scaled up out of f16's subnormals (a check)
-                let wsc: f32 = std::env::var("CMF_INKLING_COOP_WSC").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                let words: [u32; 8] = [l.e as u32, cfg.top_k as u32, cols as u32, rows as u32, which, asc.to_bits(), wsc.to_bits(), 0];
+                let words: [u32; 8] = [l.e as u32, cfg.top_k as u32, cols as u32, rows as u32, which, 0, 0, 0];
                 rec.c.queue.write_buffer(&u, 0, bytemuck::cast_slice(&words));
                 let layout = pipe.get_bind_group_layout(0);
                 let bg = rec.c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2059,11 +2052,8 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
                 });
                 rec.out.push(Step { name: "ink_moe_coop", pipe: pipe.clone(), bg, x: (rows as u32).div_ceil(64), y: nk.div_ceil(64), z: l.e as u32 });
             };
-            let part = std::env::var("CMF_INKLING_COOP_PART").unwrap_or_default();
-            let coop_gu = coop.filter(|_| part != "down");
-            let coop_dn = coop.filter(|_| part != "gu");
             for (which, x, y, out) in [(0u32, &d.xm, &d.gq, l.inter), (1, &d.xm, &d.uq, l.inter)] {
-                match coop_gu {
+                match coop {
                     Some(pipe) => coop_go(&mut rec, pipe, which, x, y, hidden, out),
                     None => {
                         let ipm = IP { v: which, ..ipg };
@@ -2072,7 +2062,7 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
                 }
             }
             rec.go("ink_moe_act", &ipg, &[(2, &d.gq, 0), (3, &d.uq, 0), (7, &d.act, 0)], ((l.inter as u32).div_ceil(256), nk, 1));
-            match coop_dn {
+            match coop {
                 Some(pipe) => coop_go(&mut rec, pipe, 2, &d.act, &d.yp, l.inter, hidden),
                 None => {
                     let ipm = IP { v: 2, ..ipg };
