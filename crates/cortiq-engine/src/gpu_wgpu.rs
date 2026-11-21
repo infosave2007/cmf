@@ -22703,7 +22703,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     // 16 GiB through 3 GiB at 24 GiB to the existing 4 GiB
                     // ceiling on large cards.
                     let reserve = (total / 8).clamp(5 * gib / 2, 4 * gib).min(total / 2);
-                    total - reserve
+                    // a model that keeps more on the card than the default foresees
+                    // (Maxwell: every position's rows and a long prompt chunk) asked for it
+                    (total - reserve).saturating_sub(crate::gpu::wgpu_extra_reserve()).max(total / 4)
                 }
                 None => 8 * 1024 * 1024 * 1024,
             }

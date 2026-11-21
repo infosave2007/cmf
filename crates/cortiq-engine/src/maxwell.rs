@@ -332,6 +332,13 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
             ffn,
         });
     }
+    // wgpu: the rows every position keeps while the attention is dense (f32 keys and values of
+    // the KV groups, a row a layer) and the prompt chunk's rows, beside the weights. At the
+    // backend's plain reserve a 24 GB card holding the 4-bit file ran out of memory on a
+    // 2048-token prompt.
+    let rows = cfg.dense_range() + cfg.dense_range() / 8;
+    let mirrors = (rows * layers.len() * 2 * cfg.nkv * cfg.hd * 4) as u64;
+    crate::gpu::wgpu_reserve_at_least(mirrors + (2u64 << 30));
     let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None };
     state.reset(layers.len());
     Ok((globals, layers, cfg, state))

@@ -2160,6 +2160,20 @@ impl GraphBlockRoute<'_> {
     }
 }
 
+static WGPU_EXTRA_RESERVE: AtomicU64 = AtomicU64::new(0);
+
+/// A model's own room on a discrete card besides the wgpu backend's default
+/// reserve (the largest ask wins): bytes its sequences keep on the card that
+/// the default does not foresee. Read when the device is first set up, so a
+/// loader asks before the first GPU call; `CMF_GPU_VRAM_MB` overrides it.
+pub fn wgpu_reserve_at_least(bytes: u64) {
+    WGPU_EXTRA_RESERVE.fetch_max(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn wgpu_extra_reserve() -> u64 {
+    WGPU_EXTRA_RESERVE.load(Ordering::Relaxed)
+}
+
 /// Positions a sequence may reach: `CMF_MAX_SEQ`, else 32 768, within the
 /// model's own limit (the loader's cap, for the code that sizes device
 /// memory by it).
