@@ -58,23 +58,37 @@
   "q4tp": [
    {
     "ctx": 512,
-    "ttft": 0.84,
-    "decode": 37.9,
-    "vram_gb": 20.54,
-    "rss_gb": 4.5
-   },
-   {
-    "ctx": 1024,
-    "ttft": 1.66,
-    "decode": 37.3,
-    "vram_gb": 20.77,
-    "rss_gb": 4.5
+    "ttft": 0.91,
+    "decode": 38.5,
+    "vram_gb": 19.62,
+    "rss_gb": 4.4
    },
    {
     "ctx": 2048,
-    "ttft": 3.41,
-    "decode": 36.8,
-    "vram_gb": 21.03,
+    "ttft": 4.93,
+    "decode": 35.4,
+    "vram_gb": 19.81,
+    "rss_gb": 4.4
+   },
+   {
+    "ctx": 4096,
+    "ttft": 13.54,
+    "decode": 28.9,
+    "vram_gb": 20.24,
+    "rss_gb": 4.4
+   },
+   {
+    "ctx": 8192,
+    "ttft": 39.78,
+    "decode": 27.6,
+    "vram_gb": 21.0,
+    "rss_gb": 4.5
+   },
+   {
+    "ctx": 16384,
+    "ttft": 109.69,
+    "decode": 24.6,
+    "vram_gb": 21.38,
     "rss_gb": 4.4
    }
   ]

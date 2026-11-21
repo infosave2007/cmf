@@ -28,7 +28,7 @@
    "q4tp_cap32k": 55.05
   },
   "vulkan": {
-   "q4tp": 39.9,
+   "q4tp": 38.8,
    "q8_2f": null
   },
   "cpu_vm": {
@@ -61,8 +61,8 @@
  },
  "fit_rows": 18000,
  "calib_tokens": 3072,
- "vk_weights_gb": 17.9,
- "vk_rows": 2600,
+ "vk_weights_gb": 17.5,
+ "vk_rows": 17000,
  "calib_note": {
   "en": "In the 4-bit file every matrix but the\nhead is GPTQ-calibrated on prose, Rust and Python that the evaluation texts do not hold: the routed experts on\n65 536 tokens, the attention, the shared experts and the dense FFNs on 3 072; its head is 8-bit.",
   "ru": "В 4-битном файле все матрицы, кроме\nголовы, откалиброваны методом GPTQ на прозе, Rust и Python, которых нет в оценочных текстах: маршрутизируемые\nэксперты — на 65 536 токенах, внимание, общие эксперты и плотные FFN — на 3 072; голова 8-битная.",
@@ -72,5 +72,6 @@
   "en": "Both files carry the\ncheckpoint's multi-token-prediction layer: with `CMF_MAXWELL_SPEC=1` the CUDA decode drafts the next token with\nit (the same text; on the L4 three quarters of the drafts are taken and decode goes from 65.5 to 67.2 tok/s, so\nit is off by default).",
   "ru": "В обоих файлах есть слой предсказания\nнескольких токенов (MTP) из чекпойнта: с `CMF_MAXWELL_SPEC=1` генерация на CUDA строит по нему черновик следующего\nтокена (текст тот же; на L4 принимается три четверти черновиков, скорость растёт с 65,5 до 67,2 ток/с, поэтому\nпо умолчанию он выключен).",
   "zh": "两个文件都带有检查点的多 token 预测层（MTP）：\n设置 `CMF_MAXWELL_SPEC=1` 后，CUDA 解码用它为下一个 token 打草稿（文本不变；在 L4 上约四分之三的草稿被采纳，\n速度从 65.5 提高到 67.2 tok/s，因此默认关闭）。"
- }
+ },
+ "vk_ppl6k": 20.662
 }

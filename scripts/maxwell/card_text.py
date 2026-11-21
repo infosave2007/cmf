@@ -15,7 +15,8 @@ no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through 
   writes {dlast} tok/s in {mlast} GB of the card.
 - **The 8-bit file is {s8} GB and runs on the same 24 GB card** at {d8_2k} tok/s after a 2 048-token prompt
   ({d_c8} from a cold start): its experts stay in host memory and pass through the card as the router picks them.
-- **Vulkan on the same card:** {d_v4} tok/s for the 4-bit file, with prompts of up to 2 048 tokens on the card.
+- **Vulkan on the same card:** {d_v4} tok/s for the 4-bit file, the block-sparse attention on the card as well: a
+  {vklast}-token prompt is read in {vktlast} s, after which it writes {vkdlast} tok/s.
 - **Accuracy:** WikiText-2 perplexity {p8w} (8-bit) and {p4w} (4-bit) against {pbw} for Transformers bf16; over
   windows of 6 144 tokens, where the model's block-sparse attention picks its own blocks, {p8l} and {p4l} against
   {pbl}. {greedy}
@@ -80,10 +81,10 @@ Stand: the same NVIDIA L4 (24 GB), over Vulkan (the default backend), the 4-bit 
 
 {vk_table}
 
-Over Vulkan the weights stay on the card whole ({vkw} GB of the 4-bit file) and the rest of the card holds the
-context: about {vkrows} positions on a 24 GB card. Past that, and past 4 096 positions on any card (where the
-model's attention starts to pick its blocks), the sequence continues on the CPU, with a warning. Long contexts on an
-NVIDIA card belong to the CUDA backend, which streams the experts. The 8-bit file needs a larger card over Vulkan.
+Over Vulkan the block-sparse attention runs on the card too (the indexer, the choice of blocks and the attention over
+them): WikiText-2 over windows of 6 144 tokens gives {vk6k}, against {p4l} on CUDA. The weights stay on the card whole
+({vkw} GB of the 4-bit file) and the rest of the card holds the context: about {vkrows} positions on a 24 GB card;
+past that the sequence continues on the CPU, with a warning. The 8-bit file needs a larger card over Vulkan.
 
 ### CPU
 
@@ -124,8 +125,8 @@ as `message.tool_calls`. `--host 127.0.0.1` keeps the server local; no API key i
 
 The model's attention is block-sparse: a query attends to the first 1 024 positions, to its own block of 128 and the
 seven before it, and to 16 more blocks that each layer's indexer picks for each of its four key groups by the best
-token score of the block. Below 4 096 positions that is every position. On CUDA the indexer and the block choice
-run on the card, as in the reference (the 6 144-token perplexity above). Every position keeps its keys, values and
+token score of the block. Below 4 096 positions that is every position. On CUDA and over Vulkan the indexer and the
+block choice run on the card, as in the reference (the 6 144-token perplexity above). Every position keeps its keys, values and
 index keys on the card, {kv} KB a token: a {last}-token prompt takes the 4-bit file to {mlast} GB. `CMF_MAX_SEQ`
 sets the context cap (262 144 at most; without it, the positions that fit beside the weights, 32 768 at most);
 the card holds that many positions' room, and experts that no longer fit beside it stream from host memory.
@@ -162,7 +163,8 @@ ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Inte
   генерация идёт на {dlast} ток/с в {mlast} ГБ карты.
 - **8-битный файл занимает {s8} ГБ и работает на той же карте 24 ГБ** на {d8_2k} ток/с после промпта из 2 048
   токенов ({d_c8} с холодного старта): эксперты лежат в памяти хоста и проходят через карту по выбору роутера.
-- **Vulkan на той же карте:** {d_v4} ток/с у 4-битного файла, промпты до 2 048 токенов целиком на карте.
+- **Vulkan на той же карте:** {d_v4} ток/с у 4-битного файла, блочно-разреженное внимание тоже на карте: промпт
+  из {vklast} токенов читается за {vktlast} с, после чего генерация идёт на {vkdlast} ток/с.
 - **Точность:** перплексия WikiText-2 {p8w} (8 бит) и {p4w} (4 бита) против {pbw} у Transformers bf16; на окнах
   по 6 144 токена, где блочно-разреженное внимание модели само выбирает блоки, — {p8l} и {p4l} против {pbl}.
   {greedy}
@@ -224,10 +226,10 @@ CMF_GPU=cuda cortiq run {q4} --prompt "Почему небо голубое? О�
 
 {vk_table}
 
-Через Vulkan веса лежат на карте целиком ({vkw} ГБ у 4-битного файла), а остаток карты занимает контекст: около
-{vkrows} позиций на карте 24 ГБ. Дальше, а на любой карте — после 4 096 позиций (где внимание модели начинает
-выбирать блоки), последовательность продолжается на CPU с предупреждением. Длинные контексты на картах NVIDIA —
-задача бэкенда CUDA, который подаёт экспертов потоком. 8-битному файлу через Vulkan нужна карта большего объёма.
+Через Vulkan блочно-разреженное внимание тоже работает на карте (индексатор, выбор блоков и внимание по ним):
+перплексия WikiText-2 на окнах по 6 144 токена — {vk6k} против {p4l} на CUDA. Веса лежат на карте целиком ({vkw} ГБ
+у 4-битного файла), а остаток карты занимает контекст: около {vkrows} позиций на карте 24 ГБ; дальше
+последовательность продолжается на CPU с предупреждением. 8-битному файлу через Vulkan нужна карта большего объёма.
 
 **CPU**
 
@@ -268,8 +270,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \\
 
 Внимание модели блочно-разреженное: запрос видит первые 1 024 позиции, свой блок из 128 позиций и семь блоков
 перед ним, а также ещё 16 блоков, которые индексатор каждого слоя выбирает для каждой из четырёх групп ключей по
-лучшей оценке токена в блоке. До 4 096 позиций это все позиции. На CUDA индексатор и выбор блоков работают на
-карте, как в эталоне (перплексия на окнах по 6 144 токена выше). Каждая позиция хранит на карте ключи, значения и
+лучшей оценке токена в блоке. До 4 096 позиций это все позиции. На CUDA и через Vulkan индексатор и выбор блоков
+работают на карте, как в эталоне (перплексия на окнах по 6 144 токена выше). Каждая позиция хранит на карте ключи, значения и
 ключи индексатора, {kv} КБ на токен: промпт из {last} токенов доводит 4-битный файл до {mlast} ГБ. Предел
 контекста задаёт `CMF_MAX_SEQ` (максимум 262 144; без него — столько позиций, сколько помещается рядом с весами,
 но не больше 32 768): карта держит место под столько позиций, а эксперты, которым рядом не хватило места,
@@ -308,7 +310,8 @@ Intel 显卡走 Vulkan/DX12，也可在 CPU 上运行。实测：
   {mlast} GB 显存。
 - **8 位文件 {s8} GB，在同一块 24 GB 显卡上运行，** 2 048 token 提示词之后 {d8_2k} tok/s（冷启动时
   {d_c8}）：专家权重留在主机内存中，由路由器选中后经过显卡。
-- **同一块显卡，Vulkan：** 4 位文件 {d_v4} tok/s，2 048 token 以内的提示词完全在显卡上处理。
+- **同一块显卡，Vulkan：** 4 位文件 {d_v4} tok/s，块稀疏注意力同样在显卡上运行：{vklast} token 的提示词
+  读取 {vktlast} 秒，之后以 {vkdlast} tok/s 生成。
 - **精度：** WikiText-2 困惑度 {p8w}（8 位）和 {p4w}（4 位），Transformers bf16 为 {pbw}；在 6 144 token
   的窗口上（此时模型的块稀疏注意力自行选择块）为 {p8l} 和 {p4l}，参考值 {pbl}。{greedy}
 
@@ -367,10 +370,9 @@ WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。{cali
 
 {vk_table}
 
-通过 Vulkan 时权重完整地放在显卡上（4 位文件为 {vkw} GB），显卡其余空间用于上下文：24 GB 显卡约 {vkrows}
-个位置。超过这一数量，以及在任何显卡上超过 4 096 个位置（模型注意力开始自行选择块）之后，序列转到 CPU
-上继续，并给出一次警告。NVIDIA 显卡上的长上下文应使用 CUDA 后端，它以流式方式调入专家。8 位文件通过 Vulkan
-需要更大显存的显卡。
+通过 Vulkan 时块稀疏注意力同样在显卡上运行（索引器、块的选择以及在所选块上的注意力）：WikiText-2 在 6 144 token
+窗口上的困惑度为 {vk6k}，CUDA 为 {p4l}。权重完整地放在显卡上（4 位文件为 {vkw} GB），显卡其余空间用于上下文：
+24 GB 显卡约 {vkrows} 个位置；超过之后序列转到 CPU 上继续，并给出一次警告。8 位文件通过 Vulkan 需要更大显存的显卡。
 
 **CPU**
 
@@ -410,7 +412,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \\
 
 模型的注意力是块稀疏的：每个查询关注最前面的 1 024 个位置、自己所在的 128 位置块及其之前的七个块，另外还有
 16 个块，由每一层的索引器按块内最高的 token 得分为四个键组分别选出。在 4 096 个位置以内，这就是全部位置。
-在 CUDA 上，索引器和块的选择都在显卡上执行，与参考实现一致（见上面 6 144 token 窗口的困惑度）。每个位置
+在 CUDA 和 Vulkan 上，索引器和块的选择都在显卡上执行，与参考实现一致（见上面 6 144 token 窗口的困惑度）。每个位置
 在显卡上保留键、值和索引键，每个 token {kv} KB：{last} token 的提示词使 4 位文件占用 {mlast} GB。上下文上限由
 `CMF_MAX_SEQ` 设置（最大 262 144；未设置时为权重旁边能容纳的位置数，最多 32 768）：显卡为这么多位置预留空间，
 放不下的专家权重从主机内存流式送入。
