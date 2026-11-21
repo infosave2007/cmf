@@ -329,7 +329,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     let lc = tc.get("loop_config").cloned().unwrap_or(serde_json::Value::Null);
     let lg = |k: &str| -> anyhow::Result<usize> { lc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| anyhow::anyhow!("inkling2_loop: loop_config has no {k}")) };
     let (core_start, core_end, passes, gate_rank) = (lg("core_start")?, lg("core_end")?, lg("num_passes")?, lg("gate_rank")?);
-    anyhow::ensure!(lc.get("is_varloop").and_then(|v| v.as_bool()) != Some(true), "inkling2_loop: a variable loop is not supported");
+    // TML-d24-varloop-research: the same stack trained at 1 to 5 passes; the file keeps the default
+    // count and `--loops N` picks another at run time
+    let varloop = lc.get("is_varloop").and_then(|v| v.as_bool()) == Some(true);
     anyhow::ensure!(core_start > 0 && core_start < core_end && core_end <= n_layers && core_start % block == 0 && core_end % block == 0 && passes >= 1, "inkling2_loop: loop core [{core_start}, {core_end}) x {passes} with blocks of {block}");
     let n_loop = core_end - core_start;
     let is_sliding = |li: usize| local.contains(&li);
@@ -538,7 +540,7 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     }
     let provenance = serde_json::json!({
         "source": dir.display().to_string(),
-        "base_model": "thinkingmachines/Inkling-2-Mini",
+        "base_model": if varloop { "thinkingmachines/TML-d24-varloop-research" } else { "thinkingmachines/Inkling-2-Mini" },
         "quant": profile_name(profile),
         "license": "apache-2.0",
         // generation_config.json: temperature 1.0, sampled; `--sampling` names others

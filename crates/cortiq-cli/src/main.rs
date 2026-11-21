@@ -308,9 +308,10 @@ impl PplWindows {
 #[command(about = "Sparse task-routed model inference engine")]
 #[command(version)]
 struct Cli {
-    /// Looped models (Dory): passes of the recurrent block per token, or `auto`:
-    /// one pass when its top token is confident, a second when it is not, on the
-    /// last-loop cache. More passes reason better and cost more; no retraining.
+    /// Looped models: passes of the recurrent block per token. Dory: N, or `auto`
+    /// (one pass when its top token is confident, a second when it is not, on the
+    /// last-loop cache). Inkling 2 (TML-d24-varloop-research, trained at 1 to 5):
+    /// N passes of its middle layers. More passes reason better and cost more.
     #[arg(long, global = true, value_name = "N|auto")]
     loops: Option<String>,
     /// Looped models (Dory): `per_loop` keeps a KV cache per pass, `last_loop`
@@ -4608,7 +4609,10 @@ async fn main() -> anyhow::Result<()> {
                     std::env::set_var("CMF_DORY_GATE", "auto");
                 }
             }
-            Some(n) => std::env::set_var("CMF_DORY_LOOPS", n),
+            Some(n) => {
+                std::env::set_var("CMF_DORY_LOOPS", n);
+                std::env::set_var("CMF_INKLING_PASSES", n);
+            }
         }
         if let Some(m) = &cli.kv_cache {
             std::env::set_var("CMF_DORY_KV", m);

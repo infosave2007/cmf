@@ -382,7 +382,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let lu = |k: &str| -> Result<usize, CmfError> { lc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| err(format!("loop_config.{k}"))) };
     let moe = arch.moe.as_ref().ok_or_else(|| err("missing MoE geometry"))?;
     let local: Vec<usize> = c.get("local_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
-    let cfg = Cfg {
+    let mut cfg = Cfg {
         dim: arch.hidden_size,
         layers: arch.num_layers,
         nh: arch.num_attention_heads,
@@ -409,6 +409,20 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     };
     if cfg.nkv == 0 || cfg.nh % cfg.nkv != 0 || cfg.block == 0 || cfg.core_start == 0 || cfg.core_end <= cfg.core_start || cfg.core_end > cfg.layers || cfg.passes == 0 {
         return Err(err("geometry"));
+    }
+    // `--loops N` (CMF_INKLING_PASSES): the loop core run N times. A varloop file
+    // (TML-d24-varloop-research) was trained at 1 to 5 passes; Inkling-2-Mini at its
+    // file's count only
+    if let Some(n) = passes_override() {
+        let varloop = lc.get("is_varloop").and_then(|v| v.as_bool()) == Some(true);
+        if n != cfg.passes {
+            if varloop {
+                tracing::info!("inkling2_loop: the loop runs {n} passes (the file's default {})", cfg.passes);
+            } else {
+                tracing::warn!("inkling2_loop: the loop runs {n} passes; this file was trained at {} (a varloop file is trained for other counts)", cfg.passes);
+            }
+        }
+        cfg.passes = n;
     }
     let globals = Globals {
         model: model.clone(),
@@ -883,6 +897,12 @@ fn host_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, 
     x
 }
 
+/// The loop's pass count asked for at run time (`--loops N` sets
+/// `CMF_INKLING_PASSES`), at least 1.
+pub fn passes_override() -> Option<usize> {
+    std::env::var("CMF_INKLING_PASSES").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1)
+}
+
 /// Rows of a prompt chunk on the host (`CMF_INKLING_CHUNK`, 128).
 fn chunk_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1091,6 +1111,22 @@ mod tests {
         slots.sort();
         slots.dedup();
         assert_eq!(slots.len(), 48);
+    }
+
+    #[test]
+    fn a_varloop_plan_runs_the_core_any_number_of_times() {
+        for passes in [1usize, 2, 5] {
+            let c = Cfg { passes, ..cfg() };
+            let plan = c.plan();
+            assert_eq!(plan.len(), 12 + 12 * passes);
+            assert_eq!(c.slots(), 24 + 12 * (passes - 1));
+            assert_eq!(plan.last(), Some(&(23, 0)));
+            let mut slots: Vec<usize> = plan.iter().map(|&(l, p)| c.slot(l, p)).collect();
+            slots.sort();
+            slots.dedup();
+            assert_eq!(slots.len(), c.slots());
+            assert_eq!(slots.last(), Some(&(c.slots() - 1)));
+        }
     }
 
     #[test]
