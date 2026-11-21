@@ -50,7 +50,7 @@ no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through 
 NVIDIA (CUDA):
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Why is the sky blue? Answer in three sentences."
 ```
@@ -58,14 +58,13 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Why is the sky blue?
 Vulkan (AMD, Intel, NVIDIA), Apple Silicon and the CPU:
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+cargo install --locked cortiq-cli
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Why is the sky blue? Answer in three sentences."
 ```
 
-The model's support is in [PR #182](https://github.com/infosave2007/cmf/pull/182), after cortiq 0.9.10: until the
-next release, `cortiq` is built from its branch. A build needs Rust 1.88 or newer; the CUDA build loads the NVIDIA
-driver, NVRTC and cuBLAS of CUDA 12 at run time.
+The model needs cortiq 0.9.12 or later. A build needs Rust 1.88 or newer; the CUDA build loads the NVIDIA driver,
+NVRTC and cuBLAS of CUDA 12 at run time.
 
 ## Files
 
@@ -93,7 +92,7 @@ What each file needs:
 
 ## Performance
 
-One stream, `cortiq bench --core`, cortiq built from PR #182: the time to the first token of a prompt
+One stream, `cortiq bench --core`, cortiq 0.9.12: the time to the first token of a prompt
 of that length and the decode speed after it (64 tokens). Card memory is the peak `nvidia-smi` shows during the
 run. Read each backend's section on its own.
 
@@ -224,7 +223,7 @@ ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Inte
 NVIDIA (CUDA):
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему небо голубое? Ответь тремя предложениями."
 ```
@@ -232,14 +231,13 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему неб�
 Vulkan (AMD, Intel, NVIDIA), Apple Silicon и CPU:
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+cargo install --locked cortiq-cli
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему небо голубое? Ответь тремя предложениями."
 ```
 
-Поддержка модели находится в [PR #182](https://github.com/infosave2007/cmf/pull/182), после cortiq 0.9.10: до
-следующего релиза `cortiq` собирается из его ветки. Для сборки нужен Rust 1.88 или новее; сборка с CUDA во время
-работы загружает драйвер NVIDIA, NVRTC и cuBLAS из CUDA 12.
+Модели нужен cortiq 0.9.12 или новее. Для сборки нужен Rust 1.88 или новее; сборка с CUDA во время работы загружает
+драйвер NVIDIA, NVRTC и cuBLAS из CUDA 12.
 
 ### Файлы
 
@@ -267,7 +265,7 @@ cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему небо голуб�
 
 ### Скорость
 
-Один поток, `cortiq bench --core`, cortiq, собранный из PR #182: время до первого токена при промпте такой
+Один поток, `cortiq bench --core`, cortiq 0.9.12: время до первого токена при промпте такой
 длины и генерация после него (64 токена). Память карты — пик по `nvidia-smi` за прогон. Каждый раздел читается сам
 по себе.
 
@@ -398,7 +396,7 @@ Intel 显卡走 Vulkan/DX12，也可在 CPU 上运行。实测：
 NVIDIA（CUDA）：
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是蓝色的？用三句话回答。"
 ```
@@ -406,13 +404,13 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是�
 Vulkan（AMD、Intel、NVIDIA）、Apple Silicon 与 CPU：
 
 ```bash
-cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+cargo install --locked cortiq-cli
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是蓝色的？用三句话回答。"
 ```
 
-对该模型的支持位于 [PR #182](https://github.com/infosave2007/cmf/pull/182)，在 cortiq 0.9.10 之后：下一个版本发布之前，
-`cortiq` 从该分支构建。构建需要 Rust 1.88 或更新版本；CUDA 版本在运行时加载 NVIDIA 驱动以及 CUDA 12 的 NVRTC 和 cuBLAS。
+该模型需要 cortiq 0.9.12 或更新版本。构建需要 Rust 1.88 或更新版本；CUDA 版本在运行时加载 NVIDIA 驱动以及 CUDA 12 的
+NVRTC 和 cuBLAS。
 
 ### 文件
 
@@ -439,7 +437,7 @@ WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位
 
 ### 性能
 
-单路推理，`cortiq bench --core`，由 PR #182 构建的 cortiq：给定长度提示词的首个 token 时间，以及之后的生成
+单路推理，`cortiq bench --core`，cortiq 0.9.12：给定长度提示词的首个 token 时间，以及之后的生成
 速度（64 个 token）。显存为运行期间 `nvidia-smi` 的峰值。各后端的小节请单独阅读。
 
 **CUDA · NVIDIA L4**
