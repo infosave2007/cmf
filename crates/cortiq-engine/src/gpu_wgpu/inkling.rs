@@ -2049,8 +2049,11 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
                 });
                 rec.out.push(Step { name: "ink_moe_coop", pipe: pipe.clone(), bg, x: (rows as u32).div_ceil(64), y: nk.div_ceil(64), z: l.e as u32 });
             };
+            let part = std::env::var("CMF_INKLING_COOP_PART").unwrap_or_default();
+            let coop_gu = coop.filter(|_| part != "down");
+            let coop_dn = coop.filter(|_| part != "gu");
             for (which, x, y, out) in [(0u32, &d.xm, &d.gq, l.inter), (1, &d.xm, &d.uq, l.inter)] {
-                match coop {
+                match coop_gu {
                     Some(pipe) => coop_go(&mut rec, pipe, which, x, y, hidden, out),
                     None => {
                         let ipm = IP { v: which, ..ipg };
@@ -2059,7 +2062,7 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
                 }
             }
             rec.go("ink_moe_act", &ipg, &[(2, &d.gq, 0), (3, &d.uq, 0), (7, &d.act, 0)], ((l.inter as u32).div_ceil(256), nk, 1));
-            match coop {
+            match coop_dn {
                 Some(pipe) => coop_go(&mut rec, pipe, 2, &d.act, &d.yp, l.inter, hidden),
                 None => {
                     let ipm = IP { v: 2, ..ipg };
