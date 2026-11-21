@@ -24,12 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CUDA, Inkling prompt path: message gates as f32 cuBLAS GEMMs, attention as batched cuBLAS GEMMs around a masked
   softmax, routed experts through tensor-core kernels (`ink_moe_mma2`: 64 rows a job, rows staged through a cp.async
   pipeline). A 512-row call on an L4 1000 → 319 ms; a 2 048 / 8 192 / 32 768-token prompt 4.02 / 18.75 / 113 s →
-  1.38 / 5.79 / 32.3 s.
+  1.38 / 5.97 / 32.0 s.
 - wgpu, Inkling decode: the routed experts four rows a workgroup (`ink_moe_gu4` / `ink_moe_dn4`), the block mixes and
   message gates through one reduction tree, the router and small f32 matvecs on vec4 loads. Vulkan on an L4:
-  19.0 → 35.7 tok/s, the experts 28.8 → 8.1 ms a token. `CMF_INKLING_PROF=1` times each kernel by GPU timestamps.
-- Metal, Inkling prompt: message gates as three f32 GEMMs on the simdgroup matrices. M4, a 512-token prompt
-  140.5 → 162.9 tok/s.
+  19.0 → 35.9 tok/s (after a 2 048-token prompt 16.6 → 27.9), the experts 28.8 → 8.1 ms a token. A prompt's 4-bit
+  dense matrices on the cooperative-matrix GEMM where the device has one (`CMF_INKLING_COOP`; the grouped-expert coop
+  kernel is opt-in, not right yet). `CMF_INKLING_PROF=1` times each kernel by GPU timestamps.
+- Metal, Inkling prompt: message gates as three f32 GEMMs on the simdgroup matrices. M4, a 2 048 / 8 192-token prompt
+  18.3 / 83.9 → 15.3 / 74.2 s.
 
 ## [0.9.12] — 2026-11-21
 
