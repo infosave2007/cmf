@@ -37,7 +37,7 @@
 //!   `mlp.experts.{e}.{gate,up,down}_proj.weight`;
 //! * loop layers: `{q,k,v,mlp}_message_gate.{down,forget,gain}` (f32).
 //!
-//! The vision tower and the MTP drafter (`mtp.safetensors`) are left out.
+//! The vision tower is left out; the DSpark drafter (`mtp.safetensors`, `mtp_config`) goes in as `mtp.*`.
 //!
 //! ## Profiles (`--quant`)
 //!
@@ -190,6 +190,82 @@ impl Out {
         let (dt, bytes) = quantize_2d(q, v, rows, cols);
         self.push(group, name, dt, &[rows, cols], &bytes)
     }
+}
+
+/// The DSpark drafter into `mtp.*`: the projections q8_2f, the Markov head's
+/// token table f16, the norms and the recurrence f32, and the head folds made
+/// here once from the release's bf16 head: fold = head · hidden_out [vocab][256]
+/// (q8_2f) and fold_b = head · hidden_out's bias, so a draft's logits are
+/// head(h) + fold · latent + fold_b.
+fn pack_drafter(path: &Path, src: &mut Sources, out: &mut Out, vocab: usize, vocab_padded: usize, hidden: usize) -> anyhow::Result<()> {
+    let st = open_safetensors(path)?;
+    let get = |name: &str| -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+        let m = st.tensors.iter().find(|m| m.name == name).ok_or_else(|| anyhow::anyhow!("mtp.safetensors: {name} missing"))?;
+        Ok((to_f32(&m.dtype, st.bytes(m))?, m.shape.clone()))
+    };
+    let mut layers = 0usize;
+    while st.tensors.iter().any(|m| m.name.starts_with(&format!("layers.{layers}."))) {
+        layers += 1;
+    }
+    anyhow::ensure!(layers > 0, "mtp.safetensors: no layers");
+    for l in 0..layers {
+        let p = format!("layers.{l}.");
+        for n in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "self_attn.k_proj_ctx", "self_attn.v_proj_ctx", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+            let (v, sh) = get(&format!("{p}{n}.weight"))?;
+            anyhow::ensure!(sh.len() == 2, "mtp {p}{n}: shape {sh:?}");
+            out.matrix("drafter", &format!("mtp.{p}{n}.weight"), Quant::Q8_2f, &v, sh[0], sh[1])?;
+        }
+        for n in ["dflare_norm", "input_layernorm", "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm", "self_attn.k_norm_ctx"] {
+            let (v, sh) = get(&format!("{p}{n}.weight"))?;
+            out.f32("drafter", &format!("mtp.{p}{n}.weight"), &sh, &v)?;
+        }
+    }
+    for n in ["fuse_weight", "mask_embed", "norm.weight", "markov_head.dflare_norm.weight", "markov_head.rnn_proj.weight", "markov_head.rnn_proj.bias", "markov_head.hidden_out.weight", "markov_head.hidden_out.bias"] {
+        let (v, sh) = get(n)?;
+        out.f32("drafter", &format!("mtp.{n}"), &sh, &v)?;
+    }
+    let (w1, sh) = get("markov_head.markov_w1.weight")?;
+    anyhow::ensure!(sh.len() == 2 && sh[0] >= vocab, "mtp markov_w1: shape {sh:?}");
+    let rank = sh[1];
+    out.matrix("drafter", "mtp.markov_head.markov_w1.weight", Quant::F16, &w1[..vocab * rank], vocab, rank)?;
+    // the folds from the release's head
+    let (ho, hsh) = get("markov_head.hidden_out.weight")?;
+    let (hb, _) = get("markov_head.hidden_out.bias")?;
+    anyhow::ensure!(hsh == vec![hidden, rank], "mtp hidden_out: shape {hsh:?}");
+    let (head, rows, cols) = src.matrix("model.llm.unembed.weight")?;
+    anyhow::ensure!(rows == vocab_padded && cols == hidden, "unembed: {rows}x{cols}");
+    let t0 = std::time::Instant::now();
+    // hidden_out transposed [rank][hidden], so a fold row is rank dots of rows
+    let mut hot = vec![0f32; rank * hidden];
+    for i in 0..hidden {
+        for r in 0..rank {
+            hot[r * hidden + i] = ho[i * rank + r];
+        }
+    }
+    let mut fold = vec![0f32; vocab * rank];
+    let mut fold_b = vec![0f32; vocab];
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let per = vocab.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (ci, (fc, bc)) in fold.chunks_mut(per * rank).zip(fold_b.chunks_mut(per)).enumerate() {
+            let (head, hot, hb) = (&head, &hot, &hb);
+            sc.spawn(move || {
+                for (j, b) in bc.iter_mut().enumerate() {
+                    let v = ci * per + j;
+                    let hr = &head[v * hidden..(v + 1) * hidden];
+                    for r in 0..rank {
+                        let h = &hot[r * hidden..(r + 1) * hidden];
+                        fc[j * rank + r] = hr.iter().zip(h).map(|(a, b)| a * b).sum();
+                    }
+                    *b = hr.iter().zip(hb.iter()).map(|(a, b)| a * b).sum();
+                }
+            });
+        }
+    });
+    out.matrix("drafter", "mtp.markov_head.fold", Quant::Q8_2f, &fold, vocab, rank)?;
+    out.f32("drafter", "mtp.markov_head.fold_b", &[vocab], &fold_b)?;
+    eprintln!("  drafter: {layers} layers, the head folds in {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn read_json(dir: &Path, rel: &str) -> Option<serde_json::Value> {
@@ -489,6 +565,19 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         eprintln!("  layer {li} ({}) done, {:.0}s", if sliding { "sliding" } else { "full" }, t0.elapsed().as_secs_f64());
     }
 
+    // ---- the DSpark drafter (mtp.safetensors, `mtp_config`): three dense layers
+    // over a block of the anchor and seven mask rows, reading context keys and
+    // values made from the target's taps, and a recurrent Markov head over the
+    // target's head; `--quant` keeps it out with CMF_INKLING_MTP=0
+    let mtp_cfg = config.get("mtp_config").cloned().filter(|_| std::env::var("CMF_INKLING_MTP").as_deref() != Ok("0"));
+    let mtp_cfg = match mtp_cfg {
+        Some(mc) if dir.join("mtp.safetensors").exists() => {
+            pack_drafter(&dir.join("mtp.safetensors"), &mut src, &mut out, vocab, vocab_padded, hidden)?;
+            Some(mc)
+        }
+        _ => None,
+    };
+
     // every source tensor is either packed or deliberately left out (the vision tower)
     let mut left: Vec<&String> = src.by_name.keys().filter(|k| !src.used.contains(*k) && !k.starts_with("model.visual.")).collect();
     left.sort();
@@ -545,7 +634,7 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         "license": "apache-2.0",
         // generation_config.json: temperature 1.0, sampled; `--sampling` names others
         "sampling": crate::convert::sampling_defaults().unwrap_or_else(|| serde_json::json!({ "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0, "repetition_penalty": 1.0 })),
-        "inkling2_loop": { "config": text, "image_token_id": config.get("image_token_id").cloned().unwrap_or(serde_json::json!(200054)) },
+        "inkling2_loop": { "config": text, "mtp_config": mtp_cfg, "image_token_id": config.get("image_token_id").cloned().unwrap_or(serde_json::json!(200054)) },
     });
     let bundle = TokenizerBundle {
         chat_template,
