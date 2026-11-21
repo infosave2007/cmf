@@ -24,6 +24,16 @@ const SRC: &str = include_str!("../inkling.cu");
 /// Block states a row holds (the embedding and the closed blocks).
 const MAXB: usize = 4;
 
+/// Keys a tile of the decode attention takes (`AT` in `inkling.cu`).
+const ATILE: usize = 256;
+
+/// `CMF_INKLING_SPLIT=0`: a decode call's attention a block a head and row
+/// (`ink_attn`) instead of a block a tile of keys.
+fn split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_SPLIT").as_deref() != Ok("0"))
+}
+
 /// Rows of a prompt call (`CMF_INKLING_ROWS`, 512; 16 reads a prompt on the
 /// decode path, 16 rows a call).
 fn bmax() -> usize {
@@ -43,6 +53,8 @@ struct Fx {
     ogate: cs::CUfunction,
     post: cs::CUfunction,
     softcap: cs::CUfunction,
+    attn_split: cs::CUfunction,
+    attn_merge: cs::CUfunction,
     h16: cs::CUfunction,
     kv_rows: cs::CUfunction,
     ring_rows: cs::CUfunction,
@@ -157,6 +169,9 @@ struct Dev {
     yk: Buf,
     yv: Buf,
     sk: Buf,
+    /// The key tiles' softmax partials of a decode call's attention
+    /// (`ink_attn_split`): `[NMAX][NH][tiles of the cap][HD + 2]`.
+    part: Buf,
     dkb: Buf,
     dvb: Buf,
     att: Buf,
@@ -277,6 +292,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         ogate: func(module, "ink_ogate")?,
         post: func(module, "ink_post")?,
         softcap: func(module, "ink_softcap")?,
+        attn_split: func(module, "ink_attn_split")?,
+        attn_merge: func(module, "ink_attn_merge")?,
         h16: func(module, "ink_h16")?,
         kv_rows: func(module, "ink_kv_rows")?,
         ring_rows: func(module, "ink_ring_rows")?,
@@ -466,6 +483,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         yk,
         yv,
         sk: f4(rows * nh)?,
+        part: f4(NMAX * nh * cap.div_ceil(ATILE) * (hd + 2))?,
         dkb: f4(rows * nkv * 4)?,
         dvb: f4(rows * nkv * 4)?,
         att: f4(rows * qs)?,
@@ -800,7 +818,22 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (cfg.hd as f32).sqrt());
         let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
-        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.att.ptr, d.cr.ptr))?;
+        if split_on() {
+            // the tiles of the longest span the slot holds: a recorded call
+            // replays at any position
+            let tiles = if s.ring > 0 { cfg.window } else { d.cap }.div_ceil(ATILE);
+            let t_i = tiles as i32;
+            c.launch_3d(
+                f.attn_split,
+                (nh as u32, nu, tiles as u32),
+                256,
+                0,
+                kargs!(d.yq.ptr, d.yr.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.part.ptr, t_i, d.cr.ptr),
+            )?;
+            c.launch(f.attn_merge, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr))?;
+        } else {
+            c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.att.ptr, d.cr.ptr))?;
+        }
         st(c, 5, &mut tp)?;
         let qs = nh * cfg.hd;
         let qs_i = qs as i32;

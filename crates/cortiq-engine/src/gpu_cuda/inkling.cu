@@ -340,6 +340,116 @@ extern "C" __global__ void ink_attn(const float* __restrict__ yq, const float* _
     }
 }
 
+// `ink_attn` split over the keys, for a decode or verify call (few rows): a
+// block a tile of AT keys of row r and head h, its online-softmax partial
+// (max, sum, weighted values) into part[r][h][sp][HD + 2]; `ink_attn_merge`
+// adds the sink and merges the tiles. Grid (NH, n, splits) with splits the
+// tiles of the longest span (the window, or the context cap): a tile past the
+// row's keys only marks itself empty, so a recorded call holds at any position.
+#define AT 256
+extern "C" __global__ void ink_attn_split(const float* __restrict__ yq, const float* __restrict__ yr,
+                                          const float* __restrict__ table, int E, const u16* __restrict__ kc,
+                                          const u16* __restrict__ vc, int ring, int win, float scale,
+                                          float* __restrict__ part, int splits, const int* __restrict__ cr)
+{
+    __shared__ float bias[AT];
+    __shared__ float wm[8], wl[8];
+    __shared__ float wacc[8][HD];
+    const int h = blockIdx.x, r = blockIdx.y, sp = blockIdx.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int C = NKV * HD, g = h / (NH / NKV);
+    const int pos = cr[0] + r;
+    const int first = win > 0 ? max(0, pos + 1 - win) : 0;
+    const int nk = pos + 1 - first;
+    const int k0 = sp * AT, k1 = min(nk, k0 + AT);
+    float* pp = part + (((size_t)r * NH + h) * splits + sp) * (HD + 2);
+    if (k0 >= nk) {
+        if (tid == 0) {
+            pp[0] = -3.0e38f;
+            pp[1] = 0.0f;
+        }
+        return;
+    }
+    const float* rr = yr + ((size_t)r * NH + h) * DR;
+    for (int i = k0 + tid; i < k1; i += blockDim.x) {
+        const int d = pos - first - i;
+        float b = 0.0f;
+        if (d < E) {
+#pragma unroll
+            for (int j = 0; j < DR; j++) b = fmaf(rr[j], table[(size_t)j * E + d], b);
+        }
+        bias[i - k0] = b;
+    }
+    constexpr int PL = HD / 32;
+    float qv[PL], acc[PL];
+    const float* qr = yq + ((size_t)r * NH + h) * HD + lane * PL;
+#pragma unroll
+    for (int t = 0; t < PL; t++) {
+        qv[t] = qr[t];
+        acc[t] = 0.0f;
+    }
+    __syncthreads();
+    float m = -3.0e38f, l = 0.0f;
+    for (int i = k0 + w; i < k1; i += 8) {
+        const int tpos = first + i;
+        const int row = ring > 0 ? tpos % ring : tpos;
+        const u16* kr = kc + (size_t)row * C + g * HD + lane * PL;
+        float s = 0.0f;
+#pragma unroll
+        for (int t = 0; t < PL; t++) s = fmaf(qv[t], h2f(kr[t]), s);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+        s = s * scale + bias[i - k0];
+        const float mn = fmaxf(m, s);
+        const float c = expf(m - mn), e = expf(s - mn);
+        l = l * c + e;
+        const u16* vr = vc + (size_t)row * C + g * HD + lane * PL;
+#pragma unroll
+        for (int t = 0; t < PL; t++) acc[t] = fmaf(e, h2f(vr[t]), acc[t] * c);
+        m = mn;
+    }
+    if (lane == 0) {
+        wm[w] = m;
+        wl[w] = l;
+    }
+#pragma unroll
+    for (int t = 0; t < PL; t++) wacc[w][lane * PL + t] = acc[t];
+    __syncthreads();
+    float M = -3.0e38f;
+    for (int i = 0; i < 8; i++) M = fmaxf(M, wm[i]);
+    if (tid == 0) {
+        float L = 0.0f;
+        for (int i = 0; i < 8; i++) L += wl[i] * expf(wm[i] - M);
+        pp[0] = M;
+        pp[1] = L;
+    }
+    for (int i = tid; i < HD; i += blockDim.x) {
+        float a = 0.0f;
+        for (int k = 0; k < 8; k++) a += wacc[k][i] * expf(wm[k] - M);
+        pp[2 + i] = a;
+    }
+}
+
+// The tiles of `ink_attn_split` and the sink (a logit with a zero value)
+// merged into the attention output. Grid (NH, n), HD threads.
+extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
+                                          int win, float* __restrict__ out, const int* __restrict__ cr)
+{
+    const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
+    const int pos = cr[0] + r;
+    const int first = win > 0 ? max(0, pos + 1 - win) : 0;
+    const int ns = min(splits, (pos + 1 - first + AT - 1) / AT);
+    const float* pp = part + ((size_t)r * NH + h) * splits * (HD + 2);
+    const float sk = sinks[(size_t)r * NH + h];
+    float M = sk;
+    for (int s = 0; s < ns; s++) M = fmaxf(M, pp[(size_t)s * (HD + 2)]);
+    float L = expf(sk - M);
+    for (int s = 0; s < ns; s++) L += pp[(size_t)s * (HD + 2) + 1] * expf(pp[(size_t)s * (HD + 2)] - M);
+    for (int i = tid; i < HD; i += blockDim.x) {
+        float a = 0.0f;
+        for (int s = 0; s < ns; s++) a += pp[(size_t)s * (HD + 2) + 2 + i] * expf(pp[(size_t)s * (HD + 2)] - M);
+        out[((size_t)r * NH + h) * HD + i] = a / L;
+    }
+}
+
 // The attention output gated by σ(gate) into the planes of the O projection.
 // Grid (NH*HD/256, n).
 extern "C" __global__ void ink_ogate(const float* __restrict__ o, const float* __restrict__ gt, u16* __restrict__ p0,
