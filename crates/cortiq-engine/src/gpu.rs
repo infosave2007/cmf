@@ -2608,6 +2608,10 @@ pub fn inkling_forward(
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_forward(id, g, layers, cfg, ids, pos, want, all, logits);
     }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::inkling::forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
     let _ = (id, g, layers, cfg, ids, pos, want, all, logits);
     false
 }
@@ -2617,6 +2621,10 @@ pub fn inkling_reset(id: u64) {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         crate::gpu_cuda::inkling_reset(id);
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::inkling::reset(id);
     }
     let _ = id;
 }

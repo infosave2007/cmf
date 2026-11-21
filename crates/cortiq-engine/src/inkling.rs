@@ -910,7 +910,7 @@ fn on_card(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
         None => pos == 0,
         Some(false) => false,
     };
-    if !try_card || !(crate::gpu::cuda_active() || crate::gpu::metal_active()) {
+    if !try_card || !(crate::gpu::cuda_active() || crate::gpu::metal_active() || crate::gpu::wgpu_active()) {
         if state.card.is_none() && pos == 0 {
             state.card = Some(false);
         }
