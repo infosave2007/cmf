@@ -849,7 +849,6 @@ fn build(c: &'static Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<De
     pipes(c).ok_or("shaders")?;
     let t0 = std::time::Instant::now();
     let (hidden, nh, nkv, hd, dr) = (cfg.dim, cfg.nh, cfg.nkv, cfg.hd, cfg.d_rel);
-    let model = &g.model;
     let mut pending = 0u64;
     let mut dl = Vec::with_capacity(layers.len());
     let max_bind = c.device.limits().max_storage_buffer_binding_size as usize;

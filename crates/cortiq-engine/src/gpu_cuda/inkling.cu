@@ -1,7 +1,8 @@
 // Inkling-2-Mini on CUDA (`gpu_cuda/hyb/inkling.rs`): the stages of the looped
 // stack between the hybrid arm's tensor-core matvecs and routed experts. The
 // semantics are `inkling.rs`'s host stack; every kernel takes the call's rows
-// (at most 16) and reads the first position from the call record `cr[0]`.
+// (a decode or verify call at most 16, a prompt call up to the arm's row cap)
+// and reads the first position from the call record `cr[0]`.
 //
 // Compiled by NVRTC with H (hidden), HD (head width 128), NKV (KV heads), NH
 // (query heads), DR (relative-state width), KC (convolution taps).
@@ -388,6 +389,97 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
     }
 #pragma unroll
     for (int l = 1; l < KC; l++) ring[(size_t)(l - 1) * H + i] = hist[l];
+}
+
+// ---- the prompt path (a call of more than 16 rows) ----
+// The rows go in parallel: a convolution's history is its input rows, so a
+// row needs no earlier row's output; the rings move on after the call.
+
+// f16 of the two bf16 planes (the cuBLAS input of a weight GEMM). total
+// elements, grid total/256.
+extern "C" __global__ void ink_h16(const u16* __restrict__ p0, const u16* __restrict__ p1, u16* __restrict__ out,
+                                   int total)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = f2h(__fadd_rn(bf2f(p0[i]), bf2f(p1[i])));
+}
+
+// `ink_kv` a row a block: grid (2·NKV, n) (keys, then values), HD threads.
+// Row j's history is rows j-1 … j-KC+1 of the call, then the ring (newest
+// first).
+extern "C" __global__ void ink_kv_rows(const float* __restrict__ yk, const float* __restrict__ yv,
+                                       const float* __restrict__ dk, const float* __restrict__ dv,
+                                       const float* __restrict__ tk, const float* __restrict__ tv,
+                                       const float* __restrict__ rk, const float* __restrict__ rv,
+                                       u16* __restrict__ kc, u16* __restrict__ vc, int ring, float qclip, float eps,
+                                       const int* __restrict__ cr)
+{
+    __shared__ float sh[32];
+    const int g = blockIdx.x % NKV, isv = blockIdx.x / NKV, j = blockIdx.y, tid = threadIdx.x;
+    const int C = NKV * HD, ch = g * HD + tid;
+    const float* y = isv ? yv : yk;
+    const float* dy = isv ? dv : dk;
+    const float* tp = (isv ? tv : tk) + (size_t)ch * KC;
+    const float* rg = isv ? rv : rk;
+    u16* cache = isv ? vc : kc;
+    const float scale = rsqrtf((float)((dy ? 2 : 1) * KC + 1));
+    const float x = y[(size_t)j * C + ch];
+    float acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < KC; l++) {
+        const float hv = l == 0 ? x : (j - l >= 0 ? y[(size_t)(j - l) * C + ch] : rg[(size_t)(l - 1 - j) * C + ch]);
+        float w = tp[l];
+        if (dy) w += dy[((size_t)j * NKV + g) * KC + l];
+        acc = fmaf(w, hv, acc);
+    }
+    float v = (x + acc) * scale;
+    const float n2 = block_sum(v * v, sh);
+    if (isv) v *= rsqrtf(n2 / (float)HD + eps);
+    else v *= fminf(qclip / (sqrtf(n2) + 1e-6f), 1.0f);
+    const int pos = cr[0] + j;
+    const int row = ring > 0 ? pos % ring : pos;
+    cache[(size_t)row * C + ch] = f2h(v);
+}
+
+// A convolution ring [KC-1][C] (newest first) after a call of n input rows
+// y [n][C]. Grid C/256.
+extern "C" __global__ void ink_ring_rows(const float* __restrict__ y, float* __restrict__ ring, int C, int n)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= C) return;
+    float nv[KC];
+#pragma unroll
+    for (int l = 1; l < KC; l++) nv[l] = n - l >= 0 ? y[(size_t)(n - l) * C + ch] : ring[(size_t)(l - 1 - n) * C + ch];
+#pragma unroll
+    for (int l = 1; l < KC; l++) ring[(size_t)(l - 1) * C + ch] = nv[l];
+}
+
+// `ink_post` a row a block row: grid (H/256, n). The ring moves on after it
+// (`ink_ring_rows` over `a`).
+extern "C" __global__ void ink_post_rows(const float* __restrict__ a, const float* __restrict__ taps,
+                                         const float* __restrict__ ring, const float* __restrict__ res,
+                                         float* __restrict__ blk, int bslot, int bstride, float* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+    if (i >= H) return;
+    const float* tp = taps + (size_t)i * KC;
+    const float scale = rsqrtf((float)(KC + 1));
+    const size_t at = (size_t)j * H + i;
+    const float x = a[at];
+    float acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < KC; l++) {
+        const float hv = l == 0 ? x : (j - l >= 0 ? a[(size_t)(j - l) * H + i] : ring[(size_t)(l - 1 - j) * H + i]);
+        acc = fmaf(tp[l], hv, acc);
+    }
+    const float c = (x + acc) * scale;
+    const float hv = res[at];
+    if (bslot >= 0) {
+        blk[(size_t)j * bstride + (size_t)bslot * H + i] = hv;
+        out[at] = c;
+    } else {
+        out[at] = hv + c;
+    }
 }
 
 // The head's logits capped: cap · tanh(x / cap). Grid (V/256, n).

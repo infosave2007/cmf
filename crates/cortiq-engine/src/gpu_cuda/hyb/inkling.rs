@@ -5,11 +5,15 @@
 //! or q8_2f); the routed experts are the arm's slot launches (`hy_moe_router`,
 //! `hy_moe_select`, a gate/up pair whose epilogue is Inkling's softcapped
 //! SwiGLU, the down launch, `hy_moe_combine`); the stages between them are
-//! `inkling.cu`. A call takes at most 16 rows (`NMAX`); a prompt goes 16 rows
-//! at a time. Every one of the 48 layer applications keeps its own keys and
-//! values (f16; a local layer's in a ring of its window, a full layer's for
-//! the context cap) and its four convolution rings. A call's launches are
-//! recorded once per row count and replayed (CUDA graphs).
+//! `inkling.cu`. A decode or verify call takes at most 16 rows (`NMAX`); its
+//! launches are recorded once per row count and replayed (CUDA graphs). A
+//! prompt goes up to `CMF_INKLING_ROWS` (512) rows a call on the prompt path:
+//! every weight expanded to f16 and multiplied by cuBLAS, the routed experts
+//! grouped by expert (the hybrid prompt path's `hy_moe_group`), so a chunk reads
+//! each expert once instead of once every 16 rows. Every one of the 48 layer
+//! applications keeps its own keys and values (f16; a local layer's in a ring of
+//! its window and a call's rows, a full layer's for the context cap) and its four
+//! convolution rings.
 
 use super::*;
 use crate::inkling::{Cfg, Globals, Layer};
@@ -19,6 +23,13 @@ use std::sync::Mutex;
 const SRC: &str = include_str!("../inkling.cu");
 /// Block states a row holds (the embedding and the closed blocks).
 const MAXB: usize = 4;
+
+/// Rows of a prompt call (`CMF_INKLING_ROWS`, 512; 16 reads a prompt on the
+/// decode path, 16 rows a call).
+fn bmax() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(512, |n| n.clamp(NMAX, 4096)))
+}
 
 struct Fx {
     mix: cs::CUfunction,
@@ -32,6 +43,10 @@ struct Fx {
     ogate: cs::CUfunction,
     post: cs::CUfunction,
     softcap: cs::CUfunction,
+    h16: cs::CUfunction,
+    kv_rows: cs::CUfunction,
+    ring_rows: cs::CUfunction,
+    post_rows: cs::CUfunction,
 }
 
 /// A loop layer's message gate: down `[R][2H]`, forget and gain `[H][R]`.
@@ -77,6 +92,8 @@ struct LayerD {
     bpj_gu: u32,
     bpj_dn: u32,
     gates: Option<[GateD; 4]>,
+    /// q, gate, rel, k, v, o for the prompt path's GEMMs.
+    dense: [Arc<DevMat>; 6],
     _mats: Vec<Arc<DevMat>>,
 }
 
@@ -89,9 +106,32 @@ struct SlotD {
     rings: [Buf; 4],
 }
 
+/// The prompt path's scratch: the f16 inputs of the weight GEMMs, the band a
+/// weight expands into, the grouped experts' entries, planes and jobs.
+struct Big {
+    x16: [Buf; 3],
+    o16: Buf,
+    wd: Buf,
+    wd_elems: usize,
+    lg: Buf,
+    pidx: Buf,
+    pwt: Buf,
+    pos: Buf,
+    src: Buf,
+    xg: [Buf; 2],
+    qq: [Buf; 2],
+    ys: Buf,
+    gu_a: Buf,
+    dn_a: Buf,
+}
+
 struct Dev {
     fx: Fx,
     hfx: Arc<HFuncs>,
+    /// Rows the row buffers hold: a prompt call's cap (`NMAX` without the
+    /// prompt path).
+    rows: usize,
+    big: Option<Big>,
     layers: Vec<LayerD>,
     slots: Vec<SlotD>,
     head: MmaSet,
@@ -237,19 +277,25 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         ogate: func(module, "ink_ogate")?,
         post: func(module, "ink_post")?,
         softcap: func(module, "ink_softcap")?,
+        h16: func(module, "ink_h16")?,
+        kv_rows: func(module, "ink_kv_rows")?,
+        ring_rows: func(module, "ink_ring_rows")?,
+        post_rows: func(module, "ink_post_rows")?,
     };
     let f4 = |n: usize| Buf::new(n * 4);
     let h2 = |n: usize| Buf::new(n * 2 + 64);
     let (qs, kvs, rs) = (nh * hd, nkv * hd, nh * dr);
-    let rows = NMAX;
+    // the prompt path's rows (f16 weight GEMMs, as the hybrid's)
+    let big_on = bmax() > NMAX && prec().0 == Gemm::Half;
+    let rows = if big_on { bmax() } else { NMAX };
     let (yq, yg, yr, yk, yv) = (f4(rows * qs)?, f4(rows * qs)?, f4(rows * rs)?, f4(rows * kvs)?, f4(rows * kvs)?);
     let ya = f4(rows * hidden)?;
     let vocab = g.lm_head.rows();
-    let logits = f4(rows * vocab)?;
+    let logits = f4(NMAX * vocab)?;
     let e = layers.first().map_or(0, |l| l.moe.bias.len());
     let k = cfg.top_k;
     let inter = layers.first().and_then(|l| l.moe.experts.first()).map_or(0, |x| x[0].rows());
-    let smax = (rows * k).min(e);
+    let smax = (NMAX * k).min(e);
     let mut dl = Vec::with_capacity(layers.len());
     for (li, l) in layers.iter().enumerate() {
         let a = &l.attn;
@@ -259,6 +305,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let kset = mmaset(&[(&km, yk.ptr, 0, kvs, kvs)])?;
         let vset = mmaset(&[(&vm, yv.ptr, 0, kvs, kvs)])?;
         let oset = mmaset(&[(&om, ya.ptr, 0, hidden, hidden)])?;
+        let dense = [q.clone(), gt.clone(), rl.clone(), km.clone(), vm.clone(), om.clone()];
         let mut mats = vec![q, gt, rl, km, vm, om];
         // the routed experts: Inkling's softcapped SwiGLU in the pair's epilogue
         // (kind bit 0x2000: the gate's cap in `lim`, the up branch's in pad[0])
@@ -334,6 +381,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             bpj_gu: (2 * inter).div_ceil(16) as u32,
             bpj_dn: hidden.div_ceil(16) as u32,
             gates,
+            dense,
             _mats: mats,
         });
     }
@@ -347,7 +395,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let _ = pass;
         // a local slot's ring: its window and a call's rows (the call writes
         // every row's key before any row reads)
-        let ring = if layers[li].sliding { cfg.window + NMAX } else { 0 };
+        let ring = if layers[li].sliding { cfg.window + rows } else { 0 };
         let rows_kv = if ring > 0 { ring } else { cap };
         let s = SlotD {
             k: h2(rows_kv * kvs)?,
@@ -365,9 +413,36 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     }
     let slots: Vec<SlotD> = by_slot.into_iter().map(|s| s.ok_or_else(|| "a slot without its application".to_string())).collect::<Res<_>>()?;
     let job_b = std::mem::size_of::<HyJob>();
+    // the prompt path: every dense weight in a codec it expands (q4tp, int8)
+    let big = if big_on && dl.iter().all(|l| l.dense.iter().all(|m| matches!(m.kind, 5 | 6 | 15))) && inter % 32 == 0 && e <= 1024 {
+        let wmax = dl.iter().flat_map(|l| l.dense.iter().map(|m| m.rows * m.cols)).max().unwrap_or(0);
+        let wd_bytes = (wmax * 2).min(wd_cap().max(1 << 20));
+        let nk = rows * k;
+        let jmax = e + nk.div_ceil(32);
+        Some(Big {
+            x16: [h2(rows * hidden)?, h2(rows * hidden)?, h2(rows * hidden)?],
+            o16: h2(rows * qs)?,
+            wd: Buf::new(wd_bytes + 64)?,
+            wd_elems: wd_bytes / 2,
+            lg: f4(rows * e)?,
+            pidx: f4(nk)?,
+            pwt: f4(nk)?,
+            pos: f4(nk)?,
+            src: f4(nk)?,
+            xg: [h2(nk * hidden)?, h2(nk * hidden)?],
+            qq: [h2(nk * inter)?, h2(nk * inter)?],
+            ys: f4(nk * hidden)?,
+            gu_a: Buf::new(jmax * job_b)?,
+            dn_a: Buf::new(jmax * job_b)?,
+        })
+    } else {
+        None
+    };
     let d = Dev {
         fx,
         hfx,
+        rows,
+        big,
         layers: dl,
         slots,
         head,
@@ -403,11 +478,11 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         pm: [h2(rows * hidden)?, h2(rows * hidden)?],
         logits_e: f4(rows * e)?,
         sg: f4(rows)?,
-        wsel: f4(rows * smax)?,
+        wsel: f4(NMAX * smax)?,
         gu_a: Buf::new(smax * job_b)?,
         dn_a: Buf::new(smax * job_b)?,
-        qq: [Buf::new(smax * rows * hidden * 2)?, Buf::new(smax * rows * hidden * 2)?],
-        dns: f4(smax * rows * hidden)?,
+        qq: [Buf::new(smax * NMAX * hidden * 2)?, Buf::new(smax * NMAX * hidden * 2)?],
+        dns: f4(smax * NMAX * hidden)?,
         y: f4(rows * hidden)?,
         fin: f4(rows * hidden)?,
         pf: [h2(rows * hidden)?, h2(rows * hidden)?],
@@ -418,11 +493,12 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         cap,
     };
     tracing::info!(
-        "inkling2_loop on CUDA: {} layers resident, {:.1} GB of weights, {:.2} GB of caches for {} positions, built in {:.1} s",
+        "inkling2_loop on CUDA: {} layers resident, {:.1} GB of weights, {:.2} GB of caches for {} positions, prompt calls of {} rows, built in {:.1} s",
         layers.len(),
         resident as f64 / 1e9,
         d.slots.iter().map(|s| (s.k.bytes + s.v.bytes) as f64).sum::<f64>() / 1e9,
         cap,
+        if d.big.is_some() { d.rows } else { NMAX },
         t0.elapsed().as_secs_f64()
     );
     Ok(d)
@@ -521,7 +597,10 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
     }
     let mut at = 0usize;
     while at < ids.len() {
-        let n = (ids.len() - at).min(NMAX);
+        // a prompt's chunk of more than NMAX rows on the prompt path (not for
+        // the logits of every row: those stay 16 rows a call)
+        let big = d.big.is_some() && !all && ids.len() - at > NMAX;
+        let n = (ids.len() - at).min(if big { d.rows } else { NMAX });
         let part = &ids[at..at + n];
         let last = at + n == ids.len();
         let lrows = if all { n } else if want && last { 1 } else { 0 };
@@ -544,7 +623,9 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             cu::memcpy_htod_async(d.cr.ptr, &[(pos0 + at) as i32, n as i32], c.stream).map_err(derr)?;
         }
         let key = (n, lrows);
-        if graphs_on() && !prof() {
+        if big {
+            unsafe { call(c, d, cfg, n, lrows, vocab)? };
+        } else if graphs_on() && !prof() {
             if !d.graphs.contains_key(&key) {
                 let dd: &Dev = d;
                 let exec = unsafe { capture(c, || call(c, dd, cfg, n, lrows, vocab))? };
@@ -574,7 +655,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
 unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize) -> Res<()> {
     let hidden = cfg.dim;
     let hb = n * hidden * 4;
-    let ost = (NMAX * hidden) as i32;
+    let ost = (d.rows * hidden) as i32;
     let bst = (MAXB * hidden) as i32;
     let mut cur = 0usize;
     let mut hin = d.h[0].ptr;
@@ -601,7 +682,10 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
             nb = npre;
         }
         let hout = d.h[1 - cur].ptr;
-        unsafe { app(c, d, cfg, l, s, li, pass, n, hin, hout, &mut nb, npre, bank_nb)? };
+        match &d.big {
+            Some(b) if n > NMAX => unsafe { app_big(c, d, b, cfg, l, s, li, pass, n, hin, hout, &mut nb, npre, bank_nb)? },
+            _ => unsafe { app(c, d, cfg, l, s, li, pass, n, hin, hout, &mut nb, npre, bank_nb)? },
+        }
         cur = 1 - cur;
         hin = hout;
     }
@@ -640,7 +724,7 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
 unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pass: usize, n: usize, hin: u64, hout: u64, nb: &mut usize, npre: usize, bank_nb: usize) -> Res<()> {
     let f = &d.fx;
     let hidden = cfg.dim;
-    let rows = NMAX;
+    let rows = d.rows;
     let ost = (rows * hidden) as i32;
     let bst = (MAXB * hidden) as i32;
     let (ni, nu) = (n as i32, n as u32);
@@ -749,6 +833,213 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let (nul, m1) = (0u64, -1i32);
         c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni))?;
         st(c, 7, &mut tp)?;
+    }
+    Ok(())
+}
+
+/// One layer application of a prompt call (more than `NMAX` rows): `app`'s
+/// stages with the weights as cuBLAS GEMMs (`wmul`), the convolutions a row a
+/// block (their rings moved on after the call) and the routed experts grouped
+/// by expert (`moe_big`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pass: usize, n: usize, hin: u64, hout: u64, nb: &mut usize, npre: usize, bank_nb: usize) -> Res<()> {
+    let f = &d.fx;
+    let fx = &d.hfx;
+    let hidden = cfg.dim;
+    let rows = d.rows;
+    let ost = (rows * hidden) as i32;
+    let bst = (MAXB * hidden) as i32;
+    let (ni, nu) = (n as i32, n as u32);
+    let eps = cfg.eps as f32;
+    let hs = hidden as i32;
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let (qs, kvs, rs) = (nh * hd, nkv * hd, nh * cfg.d_rel);
+    let fl = |bb: &Buf, i: usize| bb.ptr + (i * rows * hidden * 4) as u64;
+    let h16 = |p0: u64, p1: u64, out: u64, width: usize| -> Res<()> {
+        let tot = n * width;
+        let tot_i = tot as i32;
+        unsafe { c.launch(f.h16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(p0, p1, out, tot_i)) }
+    };
+    let ring = |y: u64, r: &Buf, width: usize| -> Res<()> {
+        let w_i = width as i32;
+        unsafe { c.launch(f.ring_rows, (width.div_ceil(256) as u32, 1), 256, 0, kargs!(y, r.ptr, w_i, ni)) }
+    };
+    let mut tp = std::time::Instant::now();
+    unsafe {
+        // 1. the attention inputs
+        let mut inp = [hin, hin, hin];
+        if let Some((aq, nq)) = &l.aq {
+            let nb_i = *nb as i32;
+            c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
+        }
+        st(c, 0, &mut tp)?;
+        // 2. the messages of a later pass, gated into q, k, v
+        let gates = if pass > 0 { l.gates.as_ref() } else { None };
+        if let Some(gs) = gates {
+            let i = li - cfg.core_start;
+            let q = d.msg_q.ptr + (i * 4 * hidden * 4) as u64;
+            let bnb = bank_nb as i32;
+            let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
+            c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            for j in 0..3 {
+                gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
+                inp[j] = fl(&d.gin, j);
+            }
+        }
+        st(c, 1, &mut tp)?;
+        // 3. the input norms and their f16 rows
+        let one = l.sliding && gates.is_none();
+        for j in 0..(if one { 1 } else { 3 }) {
+            c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+            h16(d.xp[j][0].ptr, d.xp[j][1].ptr, b.x16[j].ptr, hidden)?;
+        }
+        let (xk, xv) = if one { (0, 0) } else { (1, 2) };
+        st(c, 2, &mut tp)?;
+        // 4. the projections
+        let [wq, wg, wr, wk, wv, wo] = &l.dense;
+        wmul(c, fx, b, wq, b.x16[0].ptr, d.yq.ptr, qs, n)?;
+        wmul(c, fx, b, wg, b.x16[0].ptr, d.yg.ptr, qs, n)?;
+        wmul(c, fx, b, wr, b.x16[0].ptr, d.yr.ptr, rs, n)?;
+        wmul(c, fx, b, wk, b.x16[xk].ptr, d.yk.ptr, kvs, n)?;
+        wmul(c, fx, b, wv, b.x16[xv].ptr, d.yv.ptr, kvs, n)?;
+        let (nh_i, kp_i) = (nh as i32, (nkv * 4) as i32);
+        c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
+        let (mut dk, mut dv) = (0u64, 0u64);
+        if let (Some(wdk), Some(wdv)) = (&l.dk, &l.dv) {
+            c.launch(f.fmv, ((nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wdk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
+            c.launch(f.fmv, ((nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wdv.ptr, kp_i, d.x[xv].ptr, d.dvb.ptr))?;
+            dk = d.dkb.ptr;
+            dv = d.dvb.ptr;
+        }
+        st(c, 3, &mut tp)?;
+        // 5. queries and relative states; keys and values into the cache, a row a block
+        let full = !l.sliding as i32;
+        let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
+        c.launch(f.qr, (nh as u32, nu), hd as u32, 0, kargs!(d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.qk_clip, cfg.rel_clip, full, alpha, floor, d.cr.ptr))?;
+        let ring_i = s.ring as i32;
+        c.launch(
+            f.kv_rows,
+            ((2 * nkv) as u32, nu),
+            hd as u32,
+            0,
+            kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring_i, cfg.qk_clip, eps, d.cr.ptr),
+        )?;
+        ring(d.yk.ptr, &s.rings[0], kvs)?;
+        ring(d.yv.ptr, &s.rings[1], kvs)?;
+        st(c, 4, &mut tp)?;
+        // 6. the attention, its gate, the O projection
+        let (ext, scale) = (l.extent as i32, 1.0f32 / (hd as f32).sqrt());
+        let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
+        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
+        st(c, 5, &mut tp)?;
+        let qs_i = qs as i32;
+        c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+        h16(d.po[0].ptr, d.po[1].ptr, b.o16.ptr, qs)?;
+        wmul(c, fx, b, wo, b.o16.ptr, d.ya.ptr, hidden, n)?;
+        st(c, 6, &mut tp)?;
+        // 7. the output convolution; a boundary closes the running sum into a block
+        let bslot = if l.boundary { *nb as i32 } else { -1 };
+        let hb = hidden.div_ceil(256) as u32;
+        c.launch(f.post_rows, (hb, nu), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr))?;
+        ring(d.ya.ptr, &s.rings[2], hidden)?;
+        if l.boundary {
+            *nb += 1;
+        }
+        st(c, 7, &mut tp)?;
+        // 8. the MoE input
+        let nb_i = *nb as i32;
+        c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+        let mut mi = d.m.ptr;
+        if let Some(gs) = gates {
+            gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+            mi = d.mg.ptr;
+        }
+        let nul = 0u64;
+        c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, nul, nul, hs))?;
+        st(c, 8, &mut tp)?;
+        // 9. the routed experts into y
+        moe_big(c, d, b, cfg, l, n)?;
+        st(c, 9, &mut tp)?;
+        // 10. the output convolution onto the running sum
+        let m1 = -1i32;
+        c.launch(f.post_rows, (hb, nu), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout))?;
+        ring(d.y.ptr, &s.rings[3], hidden)?;
+        st(c, 7, &mut tp)?;
+    }
+    Ok(())
+}
+
+/// `y [n][ldy] = W x` for a prompt call's rows (`x` f16 `[n][cols]`): the
+/// weight expanded to f16 (whole when it fits the band, else a band of rows at
+/// a time) and cuBLAS on the tensor cores, as the hybrid prompt path's `mul`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn wmul(c: &Ctx, fx: &HFuncs, b: &Big, m: &DevMat, x: u64, y: u64, ldy: usize, n: usize) -> Res<()> {
+    let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
+    let wd = b.wd.ptr;
+    unsafe {
+        if m.kind == 6 && m.rows * m.cols <= b.wd_elems {
+            let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
+            c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
+            return c.gemm(true, false, m.rows, n, m.cols, 1.0, wd, m.cols, x, m.cols, 0.0, y, ldy, Gemm::Half);
+        }
+        let tiles = m.rows.div_ceil(16);
+        let band = (b.wd_elems / m.cols / 16).max(1);
+        let mut t0 = 0usize;
+        while t0 < tiles {
+            let nt = band.min(tiles - t0);
+            let r0 = t0 * 16;
+            let nr = (nt * 16).min(m.rows - r0);
+            let threads = (nt * (m.cols / 32) * 32) as u64;
+            let (t0_i, nt_i) = (t0 as i32, nt as i32);
+            if m.kind == 5 || m.kind == 15 {
+                let dual_i = (m.kind == 15) as i32;
+                c.launch(fx.expand_i8, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux1(), m.aux0(), wd, rows_i, cols_i, t0_i, nt_i, dual_i))?;
+            } else {
+                c.launch(fx.expand_pr, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i, t0_i, nt_i))?;
+            }
+            c.gemm(true, false, nr, n, m.cols, 1.0, wd, m.cols, x, m.cols, 0.0, y + (r0 * 4) as u64, ldy, Gemm::Half)?;
+            t0 += nt;
+        }
+    }
+    Ok(())
+}
+
+/// A prompt call's routed experts, grouped (the hybrid prompt path's
+/// `moe_grouped`): the router as an f32 GEMM, every row's picks
+/// (`hy_moe_topk`, the arithmetic of the decode select), the (row, pick)
+/// entries sorted by expert and laid out as planes, one tensor-core launch over
+/// every expert's gate/up pair (Inkling's activation in the epilogue) and one
+/// over its down, the weighted mixture into `y`.
+unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
+    let fx = &d.hfx;
+    let (hidden, e, k, inter) = (cfg.dim, l.e, cfg.top_k, l.inter);
+    let nk = n * k;
+    let rmax = moe_rmax();
+    let jmax = e + nk.div_ceil(rmax);
+    let (gi, tb) = if rmax == 64 { (1usize, 1u32) } else { (0, 2) };
+    let (bpg, bpd) = (l.bpj_gu.div_ceil(tb), l.bpj_dn.div_ceil(tb));
+    let flags = 1 | 2 | 4 | 32;
+    let (n_i, e_i, k_i, nk_i, rmax_i, jmax_i, inter_i, hid_i) = (n as i32, e as i32, k as i32, nk as i32, rmax as i32, jmax as i32, inter as i32, hidden as i32);
+    let (bg_i, bd_i) = (bpg as i32, bpd as i32);
+    let (nul, zero) = (0u64, 0i32);
+    unsafe {
+        c.gemm(true, false, e, n, hidden, 1.0, l.router.ptr, hidden, d.xm.ptr, hidden, 0.0, b.lg.ptr, e, Gemm::F32)?;
+        c.launch(fx.moe_topk, (n.div_ceil(8) as u32, 1), 256, 0, kargs!(b.lg.ptr, l.bias.ptr, n_i, e_i, k_i, flags, cfg.route_scale, b.pidx.ptr, b.pwt.ptr))?;
+        c.launch(
+            fx.moe_group,
+            (1, 1),
+            1024,
+            0,
+            kargs!(b.pidx.ptr, nk_i, k_i, e_i, rmax_i, jmax_i, l.gu_t.ptr, l.dn_t.ptr, b.gu_a.ptr, b.dn_a.ptr, b.pos.ptr, b.src.ptr, b.qq[0].ptr, b.qq[1].ptr, hid_i, inter_i, b.ys.ptr, bg_i, bd_i),
+        )?;
+        let tot = (nk * hidden) as u64;
+        c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, nk_i, hid_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr))?;
+        let fg = fx.mmp_g[gi];
+        c.launch(fg, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(b.gu_a.ptr, jmax_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr, hid_i, rmax_i, hid_i))?;
+        c.launch(fg, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(b.dn_a.ptr, jmax_i, b.qq[0].ptr, b.qq[1].ptr, b.qq[1].ptr, inter_i, rmax_i, inter_i))?;
+        cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
+        c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
     }
     Ok(())
 }
