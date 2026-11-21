@@ -344,6 +344,24 @@ pub fn capture_layer_grams(
     sel_tokens: usize,
 ) -> anyhow::Result<std::collections::HashMap<&'static str, (Mat, Mat, usize, usize)>> {
     let text = std::fs::read_to_string(calib)?;
+    // `CMF_GPU=cuda`: the CUDA trainer's forward over layers 0..=layer, the
+    // Grams accumulated on the card (the engine's capture hook is the wgpu /
+    // CPU path)
+    #[cfg(feature = "cuda")]
+    if cortiq_engine::gpu_cuda::selected() && cortiq_engine::gpu_cuda::nvgt::available() {
+        let vocab = model.vocab.as_deref().ok_or_else(|| anyhow::anyhow!("the model has no embedded tokenizer"))?;
+        let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(vocab).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let ids = tok.encode(&text);
+        let need = fit_tokens + sel_tokens;
+        anyhow::ensure!(ids.len() >= need, "calibration text has {} tokens, need {need}", ids.len());
+        let win = |s: &[u32]| -> Vec<Vec<u32>> { s.chunks(512).filter(|c| c.len() >= 2).map(<[u32]>::to_vec).collect() };
+        let (fit_w, sel_w) = (win(&ids[..fit_tokens]), win(&ids[fit_tokens..need]));
+        let t = Instant::now();
+        let (g, _, _) = nvg::calib_cuda(model, layer, 0, leads, &fit_w, &sel_w, &[], &[], false, false)?;
+        eprintln!("nvg-bench: layer {layer} capture of {} inputs over {need} tokens in {:.1}s (CUDA forward)", leads.len(), t.elapsed().as_secs_f64());
+        let (nf, ns) = (fit_w.iter().map(Vec::len).sum(), sel_w.iter().map(Vec::len).sum());
+        return Ok(g.into_iter().map(|(lead, (a, b))| (lead, (a, b, nf, ns))).collect());
+    }
     let mut pipe = cortiq_engine::Pipeline::from_model(model, cortiq_engine::SamplerConfig::default())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     pipe.set_confidence(false);
@@ -422,7 +440,7 @@ pub fn recode_layer(
             .ok_or_else(|| anyhow::anyhow!("layer {layer}: no Gram for the {lead} input"))?;
         hctx.insert(lead, crate::nvg_gpu::HCtxD::new(a, b, rho)?);
     }
-    cortiq_engine::gpu_wgpu::nvg_dev::sync();
+    cortiq_engine::nvg_dev::sync();
     let tpool = Pool::new(threads.saturating_sub(1).max(1));
     let mut js = Vec::new();
     let mut gauges: Vec<Option<Vec<f64>>> = Vec::new();
@@ -467,7 +485,7 @@ pub fn recode_layer(
                 gauge = Some(d);
             }
         }
-        js.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult, bpw });
+        js.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult, bpw, colscale: None });
         gauges.push(gauge);
         wanted.push(bpw);
     }
@@ -567,6 +585,22 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
         }
     }
     let path = |lead: &str, kind: &str| o.gram_cache.map(|p| format!("{p}.{lead}.{kind}.gram"));
+    // The cache prefix names the layer by convention only (`grams/L3`): a
+    // note beside the files says which layer they were captured for, and a
+    // prefix reused for another layer is refused instead of silently encoding
+    // this layer on that layer's inputs.
+    let note = o.gram_cache.map(|p| format!("{p}.layer"));
+    if let Some(n) = &note
+        && let Ok(t) = std::fs::read_to_string(n)
+    {
+        let have = t.trim().parse::<usize>().ok();
+        anyhow::ensure!(
+            have == Some(l),
+            "--gram-cache {}: these Grams were captured for layer {}, not layer {l} — give each layer its own prefix",
+            o.gram_cache.unwrap_or(""),
+            t.trim()
+        );
+    }
     let mut grams: std::collections::HashMap<&str, (Mat, Mat)> = std::collections::HashMap::new();
     let missing: Vec<&str> = leads
         .iter()
@@ -590,6 +624,9 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
                 save_gram(&ps, &b, cb)?;
             }
             grams.insert(lead, (a, b));
+        }
+        if let Some(n) = &note {
+            std::fs::write(n, format!("{l}\n"))?;
         }
     }
     let gqa = model.arch().num_kv_heads < model.arch().num_attention_heads;
@@ -630,7 +667,7 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
             let (a, b) = &grams[lead];
             hctx.insert(lead, crate::nvg_gpu::HCtxD::new(a, b, o.rho)?);
         }
-        cortiq_engine::gpu_wgpu::nvg_dev::sync();
+        cortiq_engine::nvg_dev::sync();
         let thc = th.elapsed().as_secs_f64();
         // Per tensor: the target matrix (teacher or student) and the optional
         // row gauge that is undone on the packed bytes after the encode.
@@ -656,7 +693,7 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
                 let Some(blocks) = row_head_blocks(model.arch(), short, w.r) else {
                     eprintln!("nvg-bench: {tname} ({short}) has no per-head rows: no row gauge");
                     gauges.push(None);
-                    jobs.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short), bpw: o.bpw });
+                    jobs.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short), bpw: o.bpw, colscale: None });
                     dumps.push(dump_dir.as_ref().map(|dir| {
                         let stem = tname.strip_prefix("model.layers.").unwrap_or(tname).replace('.', "_");
                         dir.join(format!("{stem}.blr"))
@@ -692,7 +729,7 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
                 );
                 gauge = Some(d);
             }
-            jobs.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short), bpw: o.bpw });
+            jobs.push(crate::nvg_gpu::Job { w, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short), bpw: o.bpw, colscale: None });
             gauges.push(gauge);
             dumps.push(dump_dir.as_ref().map(|dir| {
                 let stem = tname.strip_prefix("model.layers.").unwrap_or(tname).replace('.', "_");
