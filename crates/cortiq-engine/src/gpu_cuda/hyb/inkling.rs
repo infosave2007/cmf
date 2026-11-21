@@ -150,7 +150,8 @@ static DECLINED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn gw_of(t: &crate::qtensor::QTensor) -> Option<(Arc<CmfModel>, GraphW<'static>)> {
     let (model, idx, kind, _) = t.graph_weight()?;
-    if !matches!(kind, 5 | 6) {
+    // q4tp (6) and q8_2f (7): the codecs the arm's matvecs read from the file
+    if !matches!(kind, 6 | 7) {
         return None;
     }
     Some((model.clone(), GraphW { idx, kind, row_scale: &[], data: &[], prism: crate::gpu::GraphPrismOp::None, affine: false }))
@@ -411,7 +412,12 @@ impl Dev {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
     let Some(c) = super::super::ctx() else { return false };
-    if std::env::var("CMF_INKLING_CUDA").as_deref() == Ok("0") || !admits(g, layers, cfg) {
+    if std::env::var("CMF_INKLING_CUDA").as_deref() == Ok("0") {
+        return false;
+    }
+    if !admits(g, layers, cfg) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!("inkling2_loop on CUDA: the file's codecs or geometry are not the arm's (q4tp / q8_2f matrices, 128-wide heads); the host runs it"));
         return false;
     }
     if DECLINED.lock().unwrap().contains(&id) {
