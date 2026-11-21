@@ -21865,6 +21865,7 @@ pub fn selected() -> bool {
     }
 }
 
+
 /// AMD RDNA1/RDNA2 (Navi 1x/2x: PCI ids 0x7310–0x73FF, and Navi 24 at
 /// 0x743F) have no matrix units; RDNA3 (0x744x, 0x747x, 0x748x) and newer do.
 fn amd_without_matrix_units(vendor: u32, device: u32) -> bool {
@@ -22337,9 +22338,9 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
 /// the driver reports only a small carve-out. It used to be unlimited, so a
 /// model larger than the machine was all planned onto the "card" and only
 /// the allocator's refusals placed the rest: a Ryzen AI Max+ 395 (121 GiB,
-/// 103 GB of GTT) needed the budget pinned by hand. None elsewhere
-/// (unlimited, as before): Android's and macOS's shared memory keep their
-/// own rules.
+/// 103 GB of GTT) needed the budget pinned by hand. macOS has its own
+/// (below); None elsewhere (unlimited, as before): Android's shared memory
+/// keeps its own rules.
 #[cfg(target_os = "linux")]
 fn uma_budget(adapter: &wgpu::Adapter) -> Option<u64> {
     let mi = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -22347,7 +22348,24 @@ fn uma_budget(adapter: &wgpu::Adapter) -> Option<u64> {
     Some(uma_share(kb << 10, vulkan_vram_total(adapter)))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Apple silicon: three quarters of the GPU's recommended working set
+/// (Metal's `recommendedMaxWorkingSetSize`, itself about ¾ of the memory),
+/// the rest for K/V rows, scratch and the file pages the host reads. The
+/// working set is noted as the card's total (`gpu::wgpu_card_total`). It
+/// used to be unlimited: a 20.5 GB Maxwell file was planned whole onto a
+/// 24 GB M4's shared memory; within the budget its routed experts stream
+/// through slots instead (`expert_plan`).
+#[cfg(target_os = "macos")]
+fn uma_budget(_adapter: &wgpu::Adapter) -> Option<u64> {
+    let ws = metal::Device::system_default()?.recommended_max_working_set_size();
+    if ws == 0 {
+        return None;
+    }
+    crate::gpu::wgpu_note_card_total(ws);
+    Some(ws / 4 * 3)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn uma_budget(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
@@ -27058,6 +27076,14 @@ fn sys_experts_on(c: &Ctx) -> bool {
     c.discrete && std::env::var("CMF_SYS_EXPERTS").as_deref() != Ok("0") && std::env::var("CMF_SYSMEM").as_deref() != Ok("0")
 }
 
+/// Apple silicon's shared memory: no system-memory banks (the GPU's memory
+/// is the host's), but a stack past the budget streams its routed experts
+/// through slots fed from the file's mapping (`CMF_WGPU_EXPERT_STREAM=0`
+/// keeps the old prefix).
+fn uma_stream_on(c: &Ctx) -> bool {
+    !c.discrete && cfg!(target_os = "macos") && moe_stream::on()
+}
+
 
 /// A streamed MoE layer of the token graph: its key in the pool (its first
 /// expert's gate tensor), its experts' tensors and the model's pool.
@@ -27101,7 +27127,8 @@ fn expert_plan(
 ) -> Option<Arc<moe_cache::Plan>> {
     type Key = (u64, usize, usize, u64);
     static MEMO: OnceLock<Mutex<HashMap<Key, Option<Arc<moe_cache::Plan>>>>> = OnceLock::new();
-    if !sys_experts_on(c) {
+    let uma = uma_stream_on(c);
+    if !sys_experts_on(c) && !uma {
         return None;
     }
     let first = layers.iter().find_map(|l| match &l.ffn {
@@ -27137,12 +27164,19 @@ fn expert_plan(
     }
     let plan = (sized && dense <= live_budget).then(|| {
         let held = SYS_EXPERT_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-        let banks_room = bank_room_bytes(c);
-        let room = banks_room / 4 * 3 + held;
+        // shared memory: no room for banks, the stream past the budget alone
+        let banks_room = if uma { 0 } else { bank_room_bytes(c) };
+        let room = if uma { 0 } else { banks_room / 4 * 3 + held };
         // CMF_WGPU_EXPERT_STREAM=1: stream past the card alone (a test)
-        let hard = if moe_stream::forced() { 0 } else { banks_room + held };
-        let p = moe_cache::plan_with(&banks, live_budget - dense, room, hard, moe_cache::on(), moe_cache::stage_on(), moe_stream::on());
+        let hard = if uma || moe_stream::forced() { 0 } else { banks_room + held };
+        let p = moe_cache::plan_with(&banks, live_budget - dense, room, hard, moe_cache::on() && !uma, moe_cache::stage_on(), moe_stream::on());
         let n_sys = p.sys.iter().filter(|&&s| s).count();
+        if uma && n_sys > 0 {
+            // shared memory has no banks: a pool under a fifth of the experts
+            // leaves the stack to the old prefix
+            tracing::info!("wgpu: routed experts: the budget's slots hold under a fifth of the experts; no stream");
+            return None;
+        }
         if n_sys > 0 || p.stream {
             EXPERTS_PAST_CARD.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -27165,8 +27199,8 @@ fn expert_plan(
                 banks.iter().zip(&p.sys).filter(|&(_, s)| !*s).map(|(b, _)| b.0).sum::<u64>() >> 20
             );
         }
-        Arc::new(p)
-    });
+        Some(Arc::new(p))
+    }).flatten();
     memo.lock().unwrap().insert(key, plan.clone());
     plan
 }
@@ -30981,6 +31015,9 @@ pub fn forward_token_graph(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     let t_enc0 = std::time::Instant::now();
+    // CMF_STREAM_STATS: when the last streamed layer's picks arrived (the
+    // host's gap to the next streamed submission)
+    let mut stream_resumed: Option<std::time::Instant> = None;
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -35394,18 +35431,40 @@ pub fn forward_token_graph(
                                         &mut enc,
                                         c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("token-graph") }),
                                     );
+                                    let t_wait = std::time::Instant::now();
+                                    let gap = stream_resumed.take().map_or(0, |t| t_wait.duration_since(t).as_nanos() as u64);
                                     submit(c, finish_enc(done));
+                                    let submitted = t_wait.elapsed().as_nanos() as u64;
                                     let Some(picks) = moe_stream::read_picks(c, &rb, slots) else {
                                         graph_decline("expert stream: picks unreadable");
                                         return token_graph_outcome(true, false);
                                     };
+                                    let waited = t_wait.elapsed().as_nanos() as u64;
+                                    // CMF_STREAM_STATS=2: an empty submission's round trip beside it
+                                    let empty = (std::env::var("CMF_STREAM_STATS").as_deref() == Ok("2")).then(|| {
+                                        let t = std::time::Instant::now();
+                                        let mut e = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rt-probe") });
+                                        // a real command buffer: the picks copied once more
+                                        e.copy_buffer_to_buffer(msel, 0, &rb, 0, (slots * 4) as u64);
+                                        submit(c, finish_enc(e));
+                                        let _ = moe_stream::read_picks(c, &rb, slots);
+                                        t.elapsed().as_nanos() as u64
+                                    });
                                     let mut p = sl.stream.lock().unwrap();
+                                    p.wait_ns += waited;
+                                    p.waits += 1;
+                                    p.gap_ns += gap;
+                                    p.sub_ns += submitted;
+                                    if let Some(e) = empty {
+                                        p.rt_ns += e;
+                                    }
                                     let Some(at) = p.ensure(c, &mut enc, model, sl.seg, sl.key, &sl.experts, &picks) else {
                                         graph_decline("expert stream: a pick outside the layer");
                                         return token_graph_outcome(true, false);
                                     };
                                     c.queue.write_buffer(&p.sel, 0, bytemuck::cast_slice(&at));
                                     drop(p);
+                                    stream_resumed = Some(std::time::Instant::now());
                                     begin_pass(&mut enc)
                                 }
                                 _ => pass,

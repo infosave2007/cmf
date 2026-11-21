@@ -1416,6 +1416,12 @@ pub fn vram_budget() -> u64 {
     {
         return crate::gpu_wgpu::device_vram_budget();
     }
+    // Apple silicon: wgpu's own budget while it runs (its share of the
+    // shared memory, `uma_budget`); the native Metal path keeps none
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::device_vram_budget();
+    }
     #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
     {
         if backend_available() { u64::MAX } else { 0 }

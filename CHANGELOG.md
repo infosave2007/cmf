@@ -137,6 +137,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CUDA and wgpu; a learned closing fold is admitted over the DeepSeek-V4 form as over the identity one.
 
 ### Fixed
+- wgpu on Apple silicon (`CMF_GPU=wgpu`): the weight budget is three quarters of Metal's recommended working set
+  instead of unlimited (a 20.5 GB Maxwell file was planned whole onto a 24 GB M4's shared memory), and a stack past
+  it streams its routed experts through slots fed from the file's mapping (no system-memory banks or RAM tier on
+  shared memory; a miss's pages are faulted in on the fill threads, 4.0 → 1.7 ms an expert). `gpu::vram_budget`
+  reports wgpu's budget while it runs on macOS. Maxwell's 4-bit file on a MacBook Air M4 over wgpu: WikiText-2
+  perplexity 28.057 against 28.066 on the CPU (two 512-token windows), 9 tok/s decode against 14–16 on the CPU,
+  which stays the default there. `CMF_STREAM_STATS=1` prints the stream's waits, gaps and submits.
 - CUDA GPTQ (`gpu_cuda/gptq.rs`): the Cholesky's upload by `cublasSetMatrix` is followed by a wait on the legacy
   stream before work queued on the backend's stream reads the block (from pageable memory the call returns before
   its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
