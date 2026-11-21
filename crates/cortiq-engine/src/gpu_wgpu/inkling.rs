@@ -56,6 +56,7 @@ struct CR { pos0: u32, n: u32, pad0: u32, pad1: u32 };
 // the bank as 16-byte words (one q4tp nibble group) and a row source as vec4s
 @group(0) @binding(14) var<storage, read> bank4: array<vec4<u32>>;
 @group(0) @binding(15) var<storage, read> xv4: array<vec4<f32>>;
+@group(0) @binding(16) var<storage, read> av4: array<vec4<f32>>;
 
 var<workgroup> red: array<f32, 256>;
 var<workgroup> sh8: array<f32, 16>;
@@ -73,6 +74,25 @@ fn wsum(lid: u32, v: f32) -> f32 {
         s = s >> 1u;
     }
     let t = red[0];
+    workgroupBarrier();
+    return t;
+}
+
+var<workgroup> red4: array<vec4<f32>, 256>;
+
+// the workgroup's four sums of v (256 lanes) through one tree; every lane gets them
+fn wsum4(lid: u32, v: vec4<f32>) -> vec4<f32> {
+    workgroupBarrier();
+    red4[lid] = v;
+    workgroupBarrier();
+    var s = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s) { red4[lid] = red4[lid] + red4[lid + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    let t = red4[0];
     workgroupBarrier();
     return t;
 }
@@ -103,19 +123,28 @@ fn ink_mix(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index)
     let qi = w.x; let r = w.y; let H = p.h; let nb = p.nb; let ns = nb + 1u;
     var lg: array<f32, 8>;
     var rn: array<f32, 8>;
-    for (var s = 0u; s < ns; s = s + 1u) {
-        var ss = 0.0; var dt = 0.0;
+    // the states' squares and dot products, two states a tree
+    for (var s0 = 0u; s0 < ns; s0 = s0 + 2u) {
+        var acc = vec4<f32>(0.0);
         for (var i = lid; i < H; i = i + 256u) {
+            let q = a2[qi * H + i];
             var v: f32;
-            if (s < nb) { v = a0[r * p.bstride + s * H + i]; } else { v = a1[r * H + i]; }
-            ss = ss + v * v;
-            dt = dt + v * a2[qi * H + i];
+            if (s0 < nb) { v = a0[r * p.bstride + s0 * H + i]; } else { v = a1[r * H + i]; }
+            var u = 0.0;
+            if (s0 + 1u < ns) {
+                if (s0 + 1u < nb) { u = a0[r * p.bstride + (s0 + 1u) * H + i]; } else { u = a1[r * H + i]; }
+            }
+            acc = acc + vec4<f32>(v * v, v * q, u * u, u * q);
         }
-        let s2 = wsum(lid, ss);
-        let d2 = wsum(lid, dt);
-        let inv = inverseSqrt(s2 / f32(H) + 1e-6);
-        rn[s] = inv;
-        lg[s] = d2 * inv * inverseSqrt(f32(H));
+        let t = wsum4(lid, acc);
+        let inv0 = inverseSqrt(t.x / f32(H) + 1e-6);
+        rn[s0] = inv0;
+        lg[s0] = t.y * inv0 * inverseSqrt(f32(H));
+        if (s0 + 1u < ns) {
+            let inv1 = inverseSqrt(t.z / f32(H) + 1e-6);
+            rn[s0 + 1u] = inv1;
+            lg[s0 + 1u] = t.w * inv1 * inverseSqrt(f32(H));
+        }
     }
     var mx = -3.0e38;
     for (var s = 0u; s < ns; s = s + 1u) { mx = max(mx, lg[s]); }
@@ -155,10 +184,9 @@ fn ink_gate_down(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_
         ax = ax + a2[k * 2u * H + i] * a;
         am = am + a2[k * 2u * H + H + i] * b;
     }
-    let sx2 = wsum(lid, sx); let sm2 = wsum(lid, sm);
-    let ax2 = wsum(lid, ax); let am2 = wsum(lid, am);
+    let t = wsum4(lid, vec4<f32>(sx, sm, ax, am));
     if (lid == 0u) {
-        o0[r * p.r + k] = ax2 * inverseSqrt(sx2 / f32(H) + p.eps) + am2 * inverseSqrt(sm2 / f32(H) + p.eps);
+        o0[r * p.r + k] = t.z * inverseSqrt(t.x / f32(H) + p.eps) + t.w * inverseSqrt(t.y / f32(H) + p.eps);
     }
 }
 
@@ -201,6 +229,31 @@ fn ink_fmv(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index)
         for (var i = lane; i < H; i = i + 32u) { acc = acc + a0[o * H + i] * a1[r * H + i]; }
     }
     red[lid] = acc;
+    workgroupBarrier();
+    if (lane == 0u && o < p.rows) {
+        var t = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { t = t + red[sg * 32u + j]; }
+        o0[r * p.rows + o] = t;
+    }
+}
+
+// ── ink_fmv / ink_router with vec4 loads: xv4 W [rows][H], av4 x [n][H] → o0
+// [n][rows] (p.rows rows; the router's p.e). Grid (rows/8, n), 256 (32 lanes a row).
+@compute @workgroup_size(256)
+fn ink_fmv4(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let sg = lid >> 5u; let lane = lid & 31u;
+    let o = w.x * 8u + sg; let r = w.y; let H4 = p.h / 4u;
+    var a = vec4<f32>(0.0); var b = vec4<f32>(0.0);
+    if (o < p.rows) {
+        var i = lane;
+        loop {
+            if (i >= H4) { break; }
+            a = a + xv4[o * H4 + i] * av4[r * H4 + i];
+            if (i + 32u < H4) { b = b + xv4[o * H4 + i + 32u] * av4[r * H4 + i + 32u]; }
+            i = i + 64u;
+        }
+    }
+    red[lid] = dot(a + b, vec4<f32>(1.0));
     workgroupBarrier();
     if (lane == 0u && o < p.rows) {
         var t = 0.0;
@@ -1106,10 +1159,10 @@ fn coop_pipe(c: &Ctx) -> Option<&'static wgpu::ComputePipeline> {
     .as_ref()
 }
 
-const KERNELS: [&str; 25] = [
+const KERNELS: [&str; 26] = [
     "ink_mix", "ink_rms", "ink_gate_down", "ink_gate_out", "ink_fmv", "ink_qr", "ink_kv", "ink_attn", "ink_ogate", "ink_post", "ink_softcap", "ink_copy", "ink_router",
     "ink_select", "ink_moe_gu", "ink_moe_down", "ink_group", "ink_moe_gu_g", "ink_moe_down_g", "ink_moe_mix", "ink_moe_mm", "ink_moe_act", "ink_moe_mixq", "ink_moe_gu4",
-    "ink_moe_dn4",
+    "ink_moe_dn4", "ink_fmv4",
 ];
 
 /// The writable bindings of the shader (the others read-only storage,
@@ -1120,9 +1173,9 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
     PIPES
         .get_or_init(|| {
             let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            // one layout for every entry point: a dispatch binds all sixteen
+            // one layout for every entry point: a dispatch binds all seventeen
             // (a dummy where a kernel reads nothing)
-            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16u32)
+            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..17u32)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -1775,7 +1828,7 @@ impl Rec<'_> {
         let u = self.c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-ip"), size: std::mem::size_of::<IP>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         self.c.queue.write_buffer(&u, 0, bytemuck::bytes_of(ip));
         let mut entries: Vec<wgpu::BindGroupEntry> = vec![wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: self.cr.as_entire_binding() }];
-        for b in 2..16u32 {
+        for b in 2..17u32 {
             let (buf, off) = match binds.iter().find(|x| x.0 == b) {
                 Some(&(_, buf, off)) => (buf, off),
                 // a read binding and a writable one never share a buffer in a dispatch
@@ -1907,7 +1960,11 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
         }
         let fmv = |rec: &mut Rec, w: &wgpu::Buffer, rows: usize, x: &wgpu::Buffer, y: &wgpu::Buffer| {
             let ip = IP { rows: rows as u32, ..base };
-            rec.go("ink_fmv", &ip, &[(2, w, 0), (3, x, 0), (7, y, 0)], ((rows as u32).div_ceil(8), nu, 1));
+            if hidden % 4 == 0 && moe4_on() {
+                rec.go("ink_fmv4", &ip, &[(7, y, 0), (15, w, 0), (16, x, 0)], ((rows as u32).div_ceil(8), nu, 1));
+            } else {
+                rec.go("ink_fmv", &ip, &[(2, w, 0), (3, x, 0), (7, y, 0)], ((rows as u32).div_ceil(8), nu, 1));
+            }
         };
         fmv(&mut rec, &l.sink, cfg.nh, &d.x[0], &d.sk);
         let full = l.dk.is_some();
@@ -1948,7 +2005,12 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
         rec.go("ink_rms", &base, &[(2, mi.0, mi.1), (3, &l.post_norm, 0), (7, &d.xm, 0)], (nu, 1, 1));
         // 9. the routed experts into y
         let ip = IP { e: l.e as u32, inter: l.inter as u32, ..base };
-        rec.go("ink_router", &ip, &[(2, &l.router, 0), (3, &d.xm, 0), (7, &d.lg, 0)], ((l.e as u32).div_ceil(8), nu, 1));
+        if hidden % 4 == 0 && moe4_on() {
+            let ipr = IP { rows: l.e as u32, ..ip };
+            rec.go("ink_fmv4", &ipr, &[(7, &d.lg, 0), (15, &l.router, 0), (16, &d.xm, 0)], ((l.e as u32).div_ceil(8), nu, 1));
+        } else {
+            rec.go("ink_router", &ip, &[(2, &l.router, 0), (3, &d.xm, 0), (7, &d.lg, 0)], ((l.e as u32).div_ceil(8), nu, 1));
+        }
         // the picks land behind the expert offsets in the layer's table
         rec.go("ink_select", &ip, &[(2, &d.lg, 0), (3, &l.bias, 0), (7, &d.wt, 0), (13, &l.table, (l.e * 3 * 4) as u64)], (nu, 1, 1));
         if n > 1 && moe_mode() == 2 {
