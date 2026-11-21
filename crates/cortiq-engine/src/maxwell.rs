@@ -449,6 +449,7 @@ impl Attn {
         let mut q = vec![0f32; nh * hd];
         let mut k = vec![0f32; nkv * hd];
         let mut v = vec![0f32; nkv * hd];
+        cap(0, x, |li| ["q", "k", "v"].iter().map(|m| format!("model.layers.{li}.self_attn.{m}_proj.weight")).collect());
         self.q.matvec(x, &mut q, pool);
         self.k.matvec(x, &mut k, pool);
         self.v.matvec(x, &mut v, pool);
@@ -564,10 +565,78 @@ impl Attn {
                 }
             }
         }
+        cap(1, &out, |li| vec![format!("model.layers.{li}.self_attn.o_proj.weight")]);
         let mut y = vec![0f32; dim];
         self.o.matvec(&out, &mut y, pool);
         y
     }
+}
+
+// ---------------------------------------------------------------- calibration capture
+//
+// A GPTQ pass over the dense trunk (`cortiq requant --quant q4tp-dense --calib`): while
+// `gptq_capture` is on, the host stack folds the inputs of the attention projections, the
+// dense FFNs and the shared experts into their Hessians. The stack runs a row a token, and a
+// rank-1 update a token streams a whole Hessian (16.8 M entries for the O projection's 4096
+// inputs), so the rows wait in a panel and fold `CAP_ROWS` at a time, one blocked XᵀX.
+
+const CAP_ROWS: usize = 64;
+
+struct CapPanel {
+    /// The matrices that read this panel; the first owns the Hessian, the others alias it.
+    names: Vec<String>,
+    cols: usize,
+    rows: Vec<f32>,
+}
+
+thread_local! {
+    static CAP_LAYER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+static CAP: std::sync::Mutex<Vec<((usize, u8), CapPanel)>> = std::sync::Mutex::new(Vec::new());
+
+fn cap_fold(p: &mut CapPanel) {
+    let b = p.rows.len() / p.cols.max(1);
+    if b > 0 {
+        for n in &p.names {
+            crate::gptq_capture::accumulate(n, &p.rows, b, p.cols);
+        }
+    }
+    p.rows.clear();
+}
+
+/// A row of the current layer's panel `kind` (0 the attention's input, 1 the O projection's,
+/// 2 the FFN's, 3 its down projection's); `names` the matrices that read it.
+fn cap(kind: u8, x: &[f32], names: impl FnOnce(usize) -> Vec<String>) {
+    if !crate::gptq_capture::capturing() {
+        return;
+    }
+    let li = CAP_LAYER.with(|c| c.get());
+    let mut g = CAP.lock().unwrap();
+    let at = match g.iter().position(|(k, _)| *k == (li, kind)) {
+        Some(i) => i,
+        None => {
+            g.push(((li, kind), CapPanel { names: names(li), cols: x.len(), rows: Vec::new() }));
+            g.len() - 1
+        }
+    };
+    let p = &mut g[at].1;
+    if p.cols != x.len() {
+        return;
+    }
+    p.rows.extend_from_slice(x);
+    if p.rows.len() >= CAP_ROWS * p.cols {
+        cap_fold(p);
+    }
+}
+
+/// The rows still waiting in the panels into their Hessians: the end of a calibration pass,
+/// before `gptq_capture::end`.
+pub fn capture_flush() {
+    let mut g = CAP.lock().unwrap();
+    for (_, p) in g.iter_mut() {
+        cap_fold(p);
+    }
+    g.clear();
 }
 
 fn swiglu(g: &mut [f32], u: &[f32]) {
@@ -576,12 +645,20 @@ fn swiglu(g: &mut [f32], u: &[f32]) {
     }
 }
 
-fn dense(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+/// `tag`: the block's name under its layer for a calibration capture (`mlp.` a dense FFN,
+/// `mlp.shared_experts.` a shared expert); None for a routed expert, which no pass captures.
+fn dense(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], pool: Option<&Pool>, tag: Option<&str>) -> Vec<f32> {
     let mut g = vec![0f32; gate.rows()];
     let mut u = vec![0f32; up.rows()];
+    if let Some(t) = tag {
+        cap(2, x, |li| vec![format!("model.layers.{li}.{t}gate_proj.weight"), format!("model.layers.{li}.{t}up_proj.weight")]);
+    }
     gate.matvec(x, &mut g, pool);
     up.matvec(x, &mut u, pool);
     swiglu(&mut g, &u);
+    if let Some(t) = tag {
+        cap(3, &g, |li| vec![format!("model.layers.{li}.{t}down_proj.weight")]);
+    }
     let mut out = vec![0f32; down.rows()];
     down.matvec(&g, &mut out, pool);
     out
@@ -598,10 +675,10 @@ impl Moe {
     }
 
     fn forward(&self, x: &[f32], cfg: &Cfg, pool: Option<&Pool>) -> Vec<f32> {
-        let mut y = dense(&self.shared[0], &self.shared[1], &self.shared[2], x, pool);
+        let mut y = dense(&self.shared[0], &self.shared[1], &self.shared[2], x, pool, Some("mlp.shared_experts."));
         for (e, w) in self.route(x, cfg, pool) {
             let [g, u, d] = &self.experts[e];
-            let ye = dense(g, u, d, x, pool);
+            let ye = dense(g, u, d, x, pool, None);
             for (a, v) in y.iter_mut().zip(&ye) {
                 *a += w * v;
             }
@@ -678,13 +755,18 @@ fn wgpu_rows(cfg: &Cfg, layers: usize) -> usize {
 
 fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end: usize) -> Option<Vec<crate::gpu::GraphLayer<'a>>> {
     use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
-    if end > cfg.max_seq {
+    // the rows the card keeps room for: the cap, or on CUDA with no cap named the rows that fit
+    // beside weights that stay on the card whole
+    let kept = match crate::gpu::route_rows() {
+        0 => cfg.max_seq,
+        r => r.min(cfg.max_seq),
+    };
+    if end > kept {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(
-                "maxwell_moe: {end} positions, past the context cap of {}: the card keeps room for the cap's rows only, \
-                 so later rows may leave it for the host. Raise CMF_MAX_SEQ.",
-                cfg.max_seq
+                "maxwell_moe: {end} positions, past the {kept} the card keeps room for: later rows may leave it for the \
+                 host. Set CMF_MAX_SEQ to the context you need (the routed experts stream to make room)."
             );
         }
     }
@@ -1069,6 +1151,7 @@ fn host_streams(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut Stat
     let mut folded = vec![0f32; dim];
     let mut next = vec![0f32; hc * dim];
     for (li, l) in layers.iter().enumerate() {
+        CAP_LAYER.with(|c| c.set(li));
         let (pre, post, comb) = l.attn_hc.split(&streams, cfg, pool);
         hc_fold(&streams, &pre, hc, dim, &mut folded);
         let x = rms_w(&folded, &l.input_norm, cfg.eps);
@@ -1080,7 +1163,7 @@ fn host_streams(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut Stat
         hc_fold(&streams, &pre, hc, dim, &mut folded);
         let x = rms_w(&folded, &l.post_norm, cfg.eps);
         let y = match &l.ffn {
-            Ffn::Dense { gate, up, down } => dense(gate, up, down, &x, pool),
+            Ffn::Dense { gate, up, down } => dense(gate, up, down, &x, pool, Some("mlp.")),
             Ffn::Moe(m) => m.forward(&x, cfg, pool),
         };
         dump(li, position, "ffn", &y);
@@ -1124,6 +1207,10 @@ fn host_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State,
     let x = rms_w(&head_fold(globals, cfg, &streams), &globals.norm, cfg.eps);
     dump(layers.len(), position, "final", &x);
     logits.resize(globals.lm_head.rows(), 0.0);
+    if crate::gptq_capture::capturing() {
+        CAP_LAYER.with(|c| c.set(usize::MAX));
+        cap(4, &x, |_| vec!["lm_head.weight".to_string()]);
+    }
     globals.lm_head.matvec(&x, logits, pool);
 }
 

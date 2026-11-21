@@ -2395,6 +2395,8 @@ fn route_admits(r: &crate::gpu::GraphBlockRoute<'_>, hidden: usize, nkv: usize, 
         && r.prefix > 0
         && r.local > 0
         && (1..=16).contains(&r.remote)
+        // `hy_route_score` keeps a query a KV group in a block's shared memory
+        && nkv <= 8
         && hidden % 4 == 0
         && r.q.len() == nkv * hd * hidden
         && r.k.len() == hd * hidden
@@ -4984,11 +4986,6 @@ fn build(
         // matrices and the attention staying on the card.
         let free = super::card_free();
         let mut reserve = card_reserve() + dsa_mirror_bytes(layers);
-        // a block-routed stack keeps every position: the rows of the context
-        // cap (`CMF_MAX_SEQ`, 32 768) beside the slots
-        if std::env::var("CMF_HYB_RESERVE_MB").is_err() {
-            reserve += route_mirror_bytes(layers, crate::gpu::context_cap(model));
-        }
         // Hy4-flash's long prompt calls (2048 rows a chunk on a card of 32 GB
         // and more, `hy4::prompt_rows`) and the layer-major rows beside them:
         // at the plain reserve an A40's 2048-row call failed an allocation
@@ -5011,6 +5008,36 @@ fn build(
                 .find_map(|n| model.tensor(n))
                 .map_or(0, |e| model.entry_bytes(e).len() * 11 / 10);
         }
+        // a block-routed stack keeps every position: the rows of the context
+        // cap (`CMF_MAX_SEQ`, 32 768) beside the slots. With no cap named and
+        // weights that fit the card, the weights come first: the rows that fit
+        // beside them (8192 at least) instead of the cap's — a 24 GB card
+        // under Maxwell's 4-bit file streamed its experts for a context nobody
+        // asked for (44.6 tok/s against 52.7 with every expert resident).
+        if std::env::var("CMF_HYB_RESERVE_MB").is_err() {
+            let cap = crate::gpu::context_cap(model);
+            let full = route_mirror_bytes(layers, cap);
+            let mut rows = cap;
+            if full > 0 && std::env::var("CMF_MAX_SEQ").is_err() && free < reserve + full + need {
+                // bytes a row, the mirrors' slack of an eighth on top
+                let per = route_mirror_bytes(layers, 1 << 20) / ((1 << 20) + (1 << 17));
+                let fit = free.saturating_sub(reserve + need) / per.max(1) * 8 / 9;
+                if fit >= 8192 {
+                    rows = fit.min(cap);
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(
+                            "cuda hybrid: every weight on the card and room for {rows} positions beside them; \
+                             CMF_MAX_SEQ names a longer context (the routed experts stream then)"
+                        );
+                    }
+                }
+            }
+            if full > 0 {
+                crate::gpu::note_route_rows(rows);
+            }
+            reserve += route_mirror_bytes(layers, rows);
+        }
         let dev_cap = need.min(free.saturating_sub(reserve));
         let spill = dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0");
         let host_cap = need - dev_cap + (64 << 20);
@@ -5025,7 +5052,12 @@ fn build(
         // (Ornith q2tp-v2 within 46 GB: 38.7) stays pinned.
         // `CMF_HYB_STREAM_SPILL=<n>`: stream past 1/n of the experts (0: only
         // past the host's room).
-        let spill_n = std::env::var("CMF_HYB_STREAM_SPILL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+        // A block-routed stack (Maxwell) streams past 1/32: its reserve grows with
+        // the context, so a long cap leaves a spill of a few percent, and an L4
+        // read that over the bus at 23.2 tok/s after 24 576 positions against
+        // 31.0 streamed (at 1.6 %, after 12 288, the two were equal).
+        let routed_stack = route_mirror_bytes(layers, 1) > 0;
+        let spill_n = std::env::var("CMF_HYB_STREAM_SPILL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(if routed_stack { 32 } else { 8 });
         let big_spill = spill_n > 0 && need_exp > 0 && (need - dev_cap) > need_exp / spill_n;
         if spill && (host_cap > room / 4 * 3 || (big_spill && std::env::var("CMF_HYB_STREAM").as_deref() != Ok("0"))) {
             // past the card and the host's room both: the dense part on the
@@ -6903,7 +6935,11 @@ fn book(
                     Some(rt) => {
                         let r = st.hyb.route.get_mut(&key).ok_or("index keys missing")?;
                         r.next_pos = pos0 + n;
-                        (r.ik.ptr, (r.cap / rt.block).min(ROUTE_WORDS * 32) as u64)
+                        // 0 blocks while no row of the call picks any (the dense range): the
+                        // call then records neither the candidates' scores nor the choice,
+                        // and its attention reads no bit set (two launches a layer less)
+                        let picks = ((pos0 + n - 1) / rt.block + 1).saturating_sub(rt.local) > rt.prefix + rt.remote;
+                        (r.ik.ptr, if picks { (r.cap / rt.block).min(ROUTE_WORDS * 32) as u64 } else { 0 })
                     }
                     None => (0, 0),
                 };
@@ -7416,17 +7452,22 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                     let (bmp, bsh_i, mw_i) = match (&a.route, &plan.route) {
                         (Some(rt), Some(rb)) => {
                             let (blk_i, pre_i, loc_i, rem_i, mw_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32);
-                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rb.raw.ptr, nkv_i))?;
-                            c.launch(fx.route_put, ((nkv + 1) as u32, n as u32), hd as u32, 0, kargs!(rb.raw.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip))?;
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rb.raw.ptr, nkv_i, n0_i, blk_i, pre_i, loc_i, rem_i, cip))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, n as u32), hd as u32, 0, kargs!(rb.raw.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip, blk_i, pre_i, loc_i, rem_i))?;
                             // the candidates a mirror of this size may hold: a fixed grid (a recorded
                             // graph's), the blocks past a row's candidates leave at once
                             let nblk = lb[5] as usize;
                             let (nblk_i, cb0_i) = (nblk as i32, rt.prefix as i32);
-                            if nblk > rt.prefix {
-                                c.launch_3d(fx.route_score, ((nblk - rt.prefix) as u32, nkv as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.sc.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, cb0_i, cip))?;
+                            if nblk == 0 {
+                                // every row attends to its whole past (`book`): no bit set
+                                (0u64, 0i32, 0i32)
+                            } else {
+                                if nblk > rt.prefix {
+                                    c.launch(fx.route_score, ((nblk - rt.prefix) as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.sc.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, cb0_i, cip))?;
+                                }
+                                c.launch(fx.route_sel, (nkv as u32, n as u32), 32, 0, kargs!(rb.sc.ptr, rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, cip))?;
+                                (rb.bm.ptr, rt.bshift(), mw_i)
                             }
-                            c.launch(fx.route_sel, (nkv as u32, n as u32), 32, 0, kargs!(rb.sc.ptr, rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, cip))?;
-                            (rb.bm.ptr, rt.bshift(), mw_i)
                         }
                         _ => (0u64, 0i32, 0i32),
                     };
@@ -7805,6 +7846,8 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
         let xs_i = xs as i32;
         let t = (tb - 1) as usize;
         // experts of one codec: that codec's launch
+        // (an L4 under Maxwell's 4-bit experts: 8 warps a tile for either launch, or two
+        // tiles a block for a decode row, moved nothing: 53.9–54.6 tok/s against 54.1)
         let pick = |kd: Option<usize>| match kd {
             Some(d) => fx.mmpk[nt_of(n)][t][1][d],
             None => fx.mmp[nt_of(n)][t][1],
@@ -9831,8 +9874,8 @@ unsafe fn big(
                         let (blk_i, pre_i, loc_i, rem_i, mw_i, pos_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32, pos0 as i32);
                         unsafe {
                             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
-                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, b as u32), 256, 0, kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, braw, nkv_i))?;
-                            c.launch(fx.route_put, ((nkv + 1) as u32, b as u32), hd as u32, 0, kargs!(braw, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul))?;
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, b as u32), 256, 0, kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, braw, nkv_i, pos_i, blk_i, pre_i, loc_i, rem_i, nul))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, b as u32), hd as u32, 0, kargs!(braw, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul, blk_i, pre_i, loc_i, rem_i))?;
                             // the candidates of the chunk's last row bound the grid; none while
                             // every block is routed
                             let local0 = ((pos0 + b - 1) / rt.block + 1).saturating_sub(rt.local);
@@ -9840,7 +9883,7 @@ unsafe fn big(
                             let nblk_i = nblk as i32;
                             let bsc = st.scr(c, "hb_rsc", b * nkv * nblk * 4)?;
                             if local0 > rt.prefix + rt.remote {
-                                c.launch_3d(fx.route_score, ((local0 - rt.prefix) as u32, nkv as u32, b as u32), 128, 0, kargs!(biq, ik, bsc, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, pre_i, nul))?;
+                                c.launch(fx.route_score, ((local0 - rt.prefix) as u32, b as u32), 128, 0, kargs!(biq, ik, bsc, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, pre_i, nul))?;
                             }
                             c.launch(fx.route_sel, (nkv as u32, b as u32), 32, 0, kargs!(bsc, bbm, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, nul))?;
                         }

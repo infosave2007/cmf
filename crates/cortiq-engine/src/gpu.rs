@@ -2203,6 +2203,20 @@ pub fn wgpu_card_total() -> u64 {
     WGPU_CARD_TOTAL.load(Ordering::Relaxed)
 }
 
+static ROUTE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// The positions the CUDA plan of a block-routed stack keeps room for (the
+/// context cap, or with no `CMF_MAX_SEQ` the rows that fit beside weights
+/// that stay on the card whole).
+pub(crate) fn note_route_rows(rows: usize) {
+    ROUTE_ROWS.store(rows as u64, Ordering::Relaxed);
+}
+
+/// See [`note_route_rows`]; 0 before a plan is built.
+pub fn route_rows() -> usize {
+    ROUTE_ROWS.load(Ordering::Relaxed) as usize
+}
+
 /// Positions a sequence may reach: `CMF_MAX_SEQ`, else 32 768, within the
 /// model's own limit (the loader's cap, for the code that sizes device
 /// memory by it).
