@@ -1938,6 +1938,15 @@ pub fn run_convert_blr(
                     // of every tensor reading it and the input's own RMS; the
                     // Grams go to the scaled basis, the encoder puts t into g.
                     let mut tscale: HashMap<&str, Vec<f64>> = HashMap::new();
+                    // CMF_NVG_CS_DAMP=orig: the damping stays the original basis's
+                    // ρ·mean(diag H)·I, which the scaled basis sees as c·t_j².
+                    // CMF_NVG_CS_DAMP=only: no change of basis; only the scaled
+                    // basis's damping, seen from the original one — a ridge of
+                    // its own per input, ρ·mean_k(t_k²·H_kk) / t_j².
+                    let mut tdamp: HashMap<&str, Vec<f64>> = HashMap::new();
+                    let cs_damp = std::env::var("CMF_NVG_CS_DAMP").unwrap_or_default();
+                    let damp_orig = cs_damp == "orig";
+                    let damp_only = cs_damp == "only";
                     if let Some(alpha) = o.chscale {
                         for &lead in &leads {
                             let n = grams[lead].0.r;
@@ -1956,9 +1965,19 @@ pub fn run_convert_blr(
                             let (hfit, hsel) = grams.get_mut(lead).expect("captured above");
                             let hdiag: Vec<f64> = (0..n).map(|j| hfit.at(j, j)).collect();
                             let t = channel_scale(&colsq, rows, &hdiag, alpha);
+                            let (lo, hi) = t.iter().fold((f64::MAX, 0f64), |(a, b), &v| (a.min(v), b.max(v)));
+                            if damp_only {
+                                let c = o.rho * t.iter().zip(&hdiag).map(|(t, h)| t * t * h).sum::<f64>() / n as f64;
+                                tdamp.insert(lead, t.iter().map(|v| c / (v * v)).collect());
+                                eprintln!("  L{l} channel ridge {lead}: t in [{lo:.3}, {hi:.3}] (alpha {alpha}), ridge rho*mean(t^2 H)/t^2");
+                                continue;
+                            }
+                            if damp_orig {
+                                let c = o.rho * hdiag.iter().sum::<f64>() / n as f64;
+                                tdamp.insert(lead, t.iter().map(|v| c * v * v).collect());
+                            }
                             rebase_gram(hfit, &t);
                             rebase_gram(hsel, &t);
-                            let (lo, hi) = t.iter().fold((f64::MAX, 0f64), |(a, b), &v| (a.min(v), b.max(v)));
                             eprintln!("  L{l} channel scale {lead}: t in [{lo:.3}, {hi:.3}] (alpha {alpha})");
                             tscale.insert(lead, t);
                         }
@@ -1966,7 +1985,7 @@ pub fn run_convert_blr(
                     let mut hctx: HashMap<&str, crate::nvg_gpu::HCtxD> = HashMap::new();
                     for &lead in &leads {
                         let (hfit, hsel) = &grams[lead];
-                        hctx.insert(lead, crate::nvg_gpu::HCtxD::new(hfit, hsel, o.rho)?);
+                        hctx.insert(lead, crate::nvg_gpu::HCtxD::new_damped(hfit, hsel, o.rho, tdamp.get(lead).map(Vec::as_slice))?);
                     }
                     drop(grams);
                     let thc = th.elapsed().as_secs_f64();
