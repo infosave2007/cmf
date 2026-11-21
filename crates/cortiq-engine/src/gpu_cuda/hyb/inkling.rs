@@ -146,6 +146,34 @@ struct Dev {
 unsafe impl Send for Dev {}
 
 static DEVICES: Mutex<Option<HashMap<u64, Dev>>> = Mutex::new(None);
+
+/// Stages of `CMF_INKLING_PROF=1` (each closed by a stream sync; the calls
+/// then run without graphs).
+const STAGES: [&str; 11] = ["mix", "msg+gates", "norms", "proj", "qr+kv", "attn", "o", "post", "moe in", "moe", "head"];
+static STAGE_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_PROF").as_deref() == Ok("1"))
+}
+
+/// Closes stage `i` when profiling: syncs and adds its time.
+fn st(c: &Ctx, i: usize, t: &mut std::time::Instant) -> Res<()> {
+    if prof() {
+        c.sync()?;
+        STAGE_NS[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        *t = std::time::Instant::now();
+    }
+    Ok(())
+}
+
+/// The stage table of the decode calls so far (`CMF_INKLING_PROF=1`).
+fn prof_report() {
+    let calls = PROF_CALLS.load(Ordering::Relaxed).max(1);
+    let row: Vec<String> = STAGES.iter().zip(&STAGE_NS).map(|(n, v)| format!("{n} {:.2}", v.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64)).collect();
+    tracing::info!("inkling2_loop CUDA ms a call ({calls} calls): {}", row.join(", "));
+}
 static DECLINED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn gw_of(t: &crate::qtensor::QTensor) -> Option<(Arc<CmfModel>, GraphW<'static>)> {
@@ -504,7 +532,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             cu::memcpy_htod_async(d.cr.ptr, &[(pos0 + at) as i32, n as i32], c.stream).map_err(derr)?;
         }
         let key = (n, lrows);
-        if graphs_on() {
+        if graphs_on() && !prof() {
             if !d.graphs.contains_key(&key) {
                 let dd: &Dev = d;
                 let exec = unsafe { capture(c, || call(c, dd, cfg, n, lrows, vocab))? };
@@ -567,6 +595,7 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
     }
     // the final mixture, its norm and the head
     let f = &d.fx;
+    let mut tp = std::time::Instant::now();
     unsafe {
         let nb_i = nb as i32;
         c.launch(f.mix, (1, n as u32), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, d.final_q.ptr, d.fin.ptr, ost))?;
@@ -581,6 +610,13 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
             if cap > 0.0 {
                 c.launch(f.softcap, (vocab.div_ceil(256) as u32, lrows as u32), 256, 0, kargs!(d.logits.ptr, v_i, cap))?;
             }
+        }
+    }
+    st(c, 10, &mut tp)?;
+    if prof() && n == 1 {
+        let k = PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if k % 64 == 0 {
+            prof_report();
         }
     }
     Ok(())
@@ -599,6 +635,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
     let eps = cfg.eps as f32;
     let hs = hidden as i32;
     let fl = |b: &Buf, i: usize| b.ptr + (i * rows * hidden * 4) as u64;
+    let mut tp = std::time::Instant::now();
     unsafe {
         // 1. the attention inputs
         let mut inp = [hin, hin, hin];
@@ -607,6 +644,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
             inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
         }
+        st(c, 0, &mut tp)?;
         // 2. the messages of a later pass, gated into q, k, v
         let gates = if pass > 0 { l.gates.as_ref() } else { None };
         if let Some(gs) = gates {
@@ -620,6 +658,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                 inp[j] = fl(&d.gin, j);
             }
         }
+        st(c, 1, &mut tp)?;
         // 3. the input norms (a local layer's three are one weight; without
         // messages its inputs are one row)
         let one = l.sliding && gates.is_none();
@@ -628,6 +667,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
         let pl = |j: usize| Planes { p0: d.xp[j][0].ptr, p1: d.xp[j][1].ptr, p2: d.xp[j][1].ptr, stride: hidden };
+        st(c, 2, &mut tp)?;
         // 4. the projections
         l.qset.run(c, &d.hfx, &pl(0), hidden, n)?;
         l.kset.run(c, &d.hfx, &pl(xk), hidden, n)?;
@@ -642,6 +682,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             dk = d.dkb.ptr;
             dv = d.dvb.ptr;
         }
+        st(c, 3, &mut tp)?;
         // 5. queries and relative states; keys and values into the cache
         let full = !l.sliding as i32;
         let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
@@ -654,14 +695,17 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             0,
             kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr),
         )?;
+        st(c, 4, &mut tp)?;
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (cfg.hd as f32).sqrt());
         c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, scale, d.att.ptr, d.cr.ptr))?;
+        st(c, 5, &mut tp)?;
         let qs = nh * cfg.hd;
         let qs_i = qs as i32;
         c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
         let po = Planes { p0: d.po[0].ptr, p1: d.po[1].ptr, p2: d.po[1].ptr, stride: qs };
         l.oset.run(c, &d.hfx, &po, qs, n)?;
+        st(c, 6, &mut tp)?;
         // 7. the output convolution; a boundary closes the running sum into a block
         let bslot = if l.boundary { *nb as i32 } else { -1 };
         let hb = hidden.div_ceil(256) as u32;
@@ -669,6 +713,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         if l.boundary {
             *nb += 1;
         }
+        st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
         c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
@@ -678,11 +723,14 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             mi = d.mg.ptr;
         }
         c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+        st(c, 8, &mut tp)?;
         // 9. the routed experts into y
         moe(c, d, cfg, l, n)?;
+        st(c, 9, &mut tp)?;
         // 10. the output convolution onto the running sum
         let (nul, m1) = (0u64, -1i32);
         c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni))?;
+        st(c, 7, &mut tp)?;
     }
     Ok(())
 }

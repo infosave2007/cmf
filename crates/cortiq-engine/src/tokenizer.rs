@@ -84,6 +84,8 @@ pub struct Tokenizer {
     /// pieces. The CLIP family isolates words that way — keeping the
     /// gaps would hand BPE a stray `Ġ` piece per space.
     split_drop_gap: Vec<bool>,
+    /// `model.ignore_merges`: a whole pre-token in the vocabulary is one token.
+    ignore_merges: bool,
     /// `model.end_of_word_suffix` (CLIP: `</w>`), appended to a piece's
     /// LAST symbol before the merges run — the merges themselves carry
     /// the suffix (`["th", "e</w>"]`), so plain words resolve to their
@@ -186,6 +188,10 @@ struct HfModel {
     /// CLIP's `</w>`: the BPE model appends it to a word's last symbol.
     #[serde(default)]
     end_of_word_suffix: Option<String>,
+    /// o200k-style BPE (Inkling 2): a pre-token that is a vocabulary entry
+    /// as a whole is that token, the merges never run on it.
+    #[serde(default)]
+    ignore_merges: bool,
 }
 
 /// Merge rules come in two HF flavours: legacy `"a b"` strings and
@@ -637,6 +643,7 @@ impl Tokenizer {
             special_ids,
             split_res,
             split_drop_gap,
+            ignore_merges: hf.model.ignore_merges,
             eow_suffix: hf.model.end_of_word_suffix,
             lowercase,
             collapse_ws,
@@ -679,6 +686,7 @@ impl Tokenizer {
             special_ids: HashSet::new(),
             split_res: Vec::new(),
             split_drop_gap: Vec::new(),
+            ignore_merges: false,
             eow_suffix: None,
             lowercase: false,
             collapse_ws: false,
@@ -958,6 +966,13 @@ impl Tokenizer {
             .bytes()
             .map(|b| self.byte_to_char[b as usize].to_string())
             .collect();
+        if self.ignore_merges {
+            let whole: String = mapped.concat();
+            if let Some(&id) = self.vocab.get(&whole) {
+                out.push(id);
+                return;
+            }
+        }
         let mut sym = mapped;
         // CLIP's `end_of_word_suffix`: the last symbol of the word wears
         // it before any merge runs, so the suffixed merges ("th",
@@ -2557,5 +2572,64 @@ mod generation_tag_tests {
         // The word appearing in TEXT is not a statement.
         let prose = "{{ 'the generation of tokens' }}";
         assert_eq!(strip_generation_tags(prose), prose);
+    }
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::Tokenizer;
+
+    /// A byte-level BPE whose merges would split "abc" as "a" + "bc"; with
+    /// `ignore_merges` the whole word is its own entry.
+    fn tok(ignore: bool) -> Tokenizer {
+        let json = format!(
+            r#"{{"model": {{"type": "BPE", "ignore_merges": {ignore}, "vocab": {{"a": 0, "b": 1, "c": 2, "bc": 3, "abc": 4}}, "merges": [["b", "c"]]}},
+               "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false, "use_regex": false}},
+               "added_tokens": []}}"#
+        );
+        Tokenizer::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn ignore_merges_takes_a_whole_word_from_the_vocabulary() {
+        assert_eq!(tok(false).encode("abc"), vec![0, 3]);
+        assert_eq!(tok(true).encode("abc"), vec![4]);
+        // a word that is not an entry still merges
+        assert_eq!(tok(true).encode("bc"), vec![3]);
+        assert_eq!(tok(true).encode("cbc"), vec![2, 3]);
+    }
+
+    #[test]
+    fn an_inkling_turn_decodes_as_think_and_text() {
+        let json = r#"{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+               "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+               "added_tokens": [
+                 {"id": 2, "content": "<|message_model|>", "special": true},
+                 {"id": 3, "content": "<|content_thinking|>", "special": true},
+                 {"id": 4, "content": "<|content_text|>", "special": true},
+                 {"id": 5, "content": "<|end_message|>", "special": true},
+                 {"id": 6, "content": "<|content_invoke_tool_json|>", "special": true},
+                 {"id": 7, "content": "<|content_model_end_sampling|>", "special": true}]}"#;
+        let t = Tokenizer::from_json(json).unwrap();
+        assert_eq!(t.decode(&[2, 3, 0, 5, 2, 4, 1, 5, 7]), "<think>a</think>\n\nb");
+        assert_eq!(t.decode(&[2, 4, 1, 1, 5]), "bb");
+        let streamed: String = [2u32, 3, 0, 5, 2, 4, 1, 5, 7].iter().map(|&i| t.decode_token(i)).collect();
+        assert_eq!(streamed, "<think>a</think>\n\nb");
+    }
+}
+
+#[cfg(test)]
+mod ink_parity {
+    /// `CMF_TOK_PARITY=<tokenizer.json>,<text file>,<out ids file>`: the ids of the
+    /// text, one a line, for a comparison against the reference tokenizer.
+    #[test]
+    #[ignore]
+    fn dump_ids() {
+        let Ok(spec) = std::env::var("CMF_TOK_PARITY") else { return };
+        let mut it = spec.split(',');
+        let (tj, txt, out) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        let t = super::Tokenizer::from_file(tj).unwrap();
+        let ids = t.encode(&std::fs::read_to_string(txt).unwrap());
+        std::fs::write(out, ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
     }
 }
