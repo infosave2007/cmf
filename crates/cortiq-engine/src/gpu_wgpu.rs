@@ -30156,6 +30156,15 @@ pub fn forward_token_graph(
             graph_refused("device prefix cannot serve the multi-step tail");
             return token_graph_outcome(o1_started || state_started, false);
         }
+        // A caller that takes no layer count (a stack with its own runtime:
+        // Hy4, GLM-5.3, Maxwell) cannot finish from the boundary hidden: it
+        // read the prefix's hidden as the whole stack's and its stale logits
+        // as the token's (a 6 GB budget under Maxwell's 4-bit file wrote
+        // empty tokens at "31 tok/s").
+        if layers_run.is_none() {
+            graph_refused("the layers exceed the weight budget and the caller takes no device prefix");
+            return token_graph_outcome(o1_started || state_started, false);
+        }
         use std::sync::atomic::{AtomicBool, Ordering};
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
