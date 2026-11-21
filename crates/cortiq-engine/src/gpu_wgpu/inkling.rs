@@ -1698,16 +1698,18 @@ fn moe_mode() -> u8 {
     })
 }
 
-/// `CMF_INKLING_COOP`: a prompt chunk's 4-bit dense matrices and routed
-/// experts on the cooperative-matrix GEMMs (`1`, the default), the dense ones
-/// only (`dense`), the experts only (`moe`), neither (`0`).
+/// `CMF_INKLING_COOP`: a prompt chunk's 4-bit dense matrices on the
+/// cooperative-matrix GEMM (`dense`, the default), the grouped experts too
+/// (`1`), the experts only (`moe`), neither (`0`). The grouped-expert kernel
+/// is not right yet: on an L4 its perplexity is 16.1 against 8.95 (both of its
+/// products wrong, the dense GEMM right), so it is off unless asked for.
 fn coop_mode() -> (bool, bool) {
     static M: OnceLock<(bool, bool)> = OnceLock::new();
     *M.get_or_init(|| match std::env::var("CMF_INKLING_COOP").as_deref() {
         Ok("0") => (false, false),
-        Ok("dense") => (true, false),
+        Ok("1") => (true, true),
         Ok("moe") => (false, true),
-        _ => (true, true),
+        _ => (true, false),
     })
 }
 fn coop_on() -> bool {
