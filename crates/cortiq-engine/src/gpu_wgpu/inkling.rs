@@ -942,6 +942,170 @@ struct Pipes {
 
 static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
 
+/// A prompt chunk's routed experts on the matrix units: an expert's grouped
+/// entries (up to 64 a workgroup) against 64 rows of its matrix, k 32 a step —
+/// `q4tp_mm_coop`'s staging and products (f16 operands, f32 sums, the codec
+/// dequantized in the kernel) with the activation rows taken through the
+/// grouping. Its own module: the `enable` directive does not parse on a
+/// device without the feature.
+const COOP_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct CP { e: u32, k: u32, cols: u32, rows: u32, which: u32, p1: u32, p2: u32, p3: u32 };
+@group(0) @binding(0) var<uniform> cp: CP;
+@group(0) @binding(1) var<storage, read> cbank: array<u32>;
+@group(0) @binding(2) var<storage, read> cui: array<u32>;
+@group(0) @binding(3) var<storage, read> cuo: array<u32>;
+@group(0) @binding(4) var<storage, read> cx: array<f32>;
+@group(0) @binding(5) var<storage, read_write> cy: array<f32>;
+
+const KS: u32 = 32u;
+var<workgroup> cm_a: array<f16, 64 * 32>;
+var<workgroup> cm_b: array<f16, 64 * 32>;
+var<workgroup> cm_c: array<f32, 64 * 64>;
+var<workgroup> cspan: vec2<u32>;
+var<workgroup> cxrow: array<u32, 64>;
+
+fn cbyte(off: u32) -> u32 { return (cbank[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+
+// Grid (rows/64, entry tiles, E), 128 (four subgroups). which: 0 gate, 1 up
+// (x the chunk's rows, an entry's row = its pick / K), 2 down (x the entries'
+// activations in grouped order). cy [entry][rows].
+@compute @workgroup_size(128)
+fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
+    let e = wid.z; let E = cp.e; let K = cp.k;
+    if (tid == 0u) {
+        var i1 = cuo[E];
+        if (e + 1u < E) { i1 = cuo[e + 1u]; }
+        cspan = vec2<u32>(cuo[e], i1);
+    }
+    let span = workgroupUniformLoad(&cspan);
+    let nb = span.y - span.x;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let cols = cp.cols; let rows = cp.rows;
+    if (m0 >= nb) { return; }
+    let gpr = cols >> 5u;
+    let wb = cui[e * 3u + cp.which];
+    let params_w = wb + rows * gpr * 4u;
+    let codes_b = (params_w + rows) * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    if (tid < 64u) {
+        var xr = 0xFFFFFFFFu;
+        if (m0 + tid < nb) {
+            let q = span.x + m0 + tid;
+            if (cp.which == 2u) { xr = q; } else { xr = cuo[E + 1u + q] / K; }
+        }
+        cxrow[tid] = xr;
+    }
+    workgroupBarrier();
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let xr = cxrow[m];
+            var v = vec4<f32>(0.0);
+            if (xr != 0xFFFFFFFFu) {
+                let base = xr * cols + k0 + k4;
+                v = vec4<f32>(cx[base], cx[base + 1u], cx[base + 2u], cx[base + 3u]);
+            }
+            let dst = m * KS + k4;
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y); cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < rows) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = cbyte(cb);
+                if (sh > 3u) { cv = cv | (cbyte(cb + 1u) << 8u); }
+                let pr = unpack2x16float(cbank[params_w + wrow]);
+                let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+                let bo = (wb + (wrow * gpr + g) * 4u) * 4u + (col0 - g * 32u) / 2u;
+                let b0 = cbyte(bo);
+                let b1 = cbyte(bo + 1u);
+                wv = vec4<f32>(f32(b0 & 0xFu) - 8.0, f32(b0 >> 4u) - 8.0, f32(b1 & 0xFu) - 8.0, f32(b1 >> 4u) - 8.0) * scale;
+            }
+            let bd = n * KS + k4;
+            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y); cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < nb && n0 + n < rows) {
+            cy[(span.x + m0 + m) * rows + n0 + n] = cm_c[m * 64u + n];
+        }
+    }
+}
+"#;
+
+/// The grouped-expert coop pipeline, where the device's cooperative-matrix
+/// GEMM came up (`CMF_INKLING_COOP=0` off).
+fn coop_pipe(c: &Ctx) -> Option<&'static wgpu::ComputePipeline> {
+    static P: OnceLock<Option<wgpu::ComputePipeline>> = OnceLock::new();
+    P.get_or_init(|| {
+        if !coop_on() || c.q4tp_mm_coop.is_none() {
+            return None;
+        }
+        let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("inkling-coop"), source: wgpu::ShaderSource::Wgsl(COOP_SRC.into()) });
+        let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("ink_moe_coop"), layout: None, module: &m, entry_point: Some("ink_moe_coop"), compilation_options: Default::default(), cache: None });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("inkling2_loop wgpu: the grouped-expert coop pipeline was rejected ({e}); the scalar GEMM runs the experts");
+            return None;
+        }
+        Some(p)
+    })
+    .as_ref()
+}
+
 const KERNELS: [&str; 25] = [
     "ink_mix", "ink_rms", "ink_gate_down", "ink_gate_out", "ink_fmv", "ink_qr", "ink_kv", "ink_attn", "ink_ogate", "ink_post", "ink_softcap", "ink_copy", "ink_router",
     "ink_select", "ink_moe_gu", "ink_moe_down", "ink_group", "ink_moe_gu_g", "ink_moe_down_g", "ink_moe_mix", "ink_moe_mm", "ink_moe_act", "ink_moe_mixq", "ink_moe_gu4",
@@ -1792,14 +1956,45 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
             let ipg = IP { rows: nu, ..ip };
             rec.go("ink_group", &ipg, &[(12, &l.table, (l.e * 3 * 4) as u64), (13, &d.grp, 0)], (1, 1, 1));
             let tiles = nu.div_ceil(32);
-            for (which, x, y, out) in [(0u32, &d.xm, &d.gq, l.inter), (1, &d.xm, &d.uq, l.inter)] {
-                let ipm = IP { v: which, ..ipg };
-                rec.go("ink_moe_mm", &ipm, &[(4, x, 0), (7, y, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (out as u32).div_ceil(64), l.e as u32));
-            }
             let nk = nu * cfg.top_k as u32;
+            let coop = coop_pipe(c).filter(|_| hidden % 32 == 0 && l.inter % 32 == 0);
+            // one grouped-expert product on the matrix units: (which, x, y, cols, rows)
+            let coop_go = |rec: &mut Rec, pipe: &wgpu::ComputePipeline, which: u32, x: &wgpu::Buffer, y: &wgpu::Buffer, cols: usize, rows: usize| {
+                let u = rec.c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-cp"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                let words: [u32; 8] = [l.e as u32, cfg.top_k as u32, cols as u32, rows as u32, which, 0, 0, 0];
+                rec.c.queue.write_buffer(&u, 0, bytemuck::cast_slice(&words));
+                let layout = pipe.get_bind_group_layout(0);
+                let bg = rec.c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ink_moe_coop"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: l.bank.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: l.table.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: d.grp.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: x.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: y.as_entire_binding() },
+                    ],
+                });
+                rec.out.push(Step { name: "ink_moe_coop", pipe: pipe.clone(), bg, x: (rows as u32).div_ceil(64), y: nk.div_ceil(64), z: l.e as u32 });
+            };
+            for (which, x, y, out) in [(0u32, &d.xm, &d.gq, l.inter), (1, &d.xm, &d.uq, l.inter)] {
+                match coop {
+                    Some(pipe) => coop_go(&mut rec, pipe, which, x, y, hidden, out),
+                    None => {
+                        let ipm = IP { v: which, ..ipg };
+                        rec.go("ink_moe_mm", &ipm, &[(4, x, 0), (7, y, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (out as u32).div_ceil(64), l.e as u32));
+                    }
+                }
+            }
             rec.go("ink_moe_act", &ipg, &[(2, &d.gq, 0), (3, &d.uq, 0), (7, &d.act, 0)], ((l.inter as u32).div_ceil(256), nk, 1));
-            let ipm = IP { v: 2, ..ipg };
-            rec.go("ink_moe_mm", &ipm, &[(4, &d.act, 0), (7, &d.yp, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (hidden as u32).div_ceil(64), l.e as u32));
+            match coop {
+                Some(pipe) => coop_go(&mut rec, pipe, 2, &d.act, &d.yp, l.inter, hidden),
+                None => {
+                    let ipm = IP { v: 2, ..ipg };
+                    rec.go("ink_moe_mm", &ipm, &[(4, &d.act, 0), (7, &d.yp, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (hidden as u32).div_ceil(64), l.e as u32));
+                }
+            }
             rec.go("ink_moe_mixq", &ipg, &[(2, &d.yp, 0), (3, &d.wt, 0), (7, &d.y, 0), (12, &d.grp, 0)], ((hidden as u32).div_ceil(256), nu, 1));
         } else if n > 1 && moe_mode() == 1 {
             // the entries by expert, an expert's rows against its weights once
@@ -1857,5 +2052,9 @@ mod tests {
         for k in super::KERNELS {
             assert!(module.entry_points.iter().any(|e| e.name == k), "{k}");
         }
+        let coop = wgpu::naga::front::wgsl::parse_str(super::COOP_SRC).unwrap_or_else(|e| panic!("inkling coop WGSL must parse: {}", e.emit_to_string(super::COOP_SRC)));
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+            .validate(&coop)
+            .unwrap_or_else(|e| panic!("inkling coop WGSL must validate: {}", e.emit_to_string(super::COOP_SRC)));
     }
 }
