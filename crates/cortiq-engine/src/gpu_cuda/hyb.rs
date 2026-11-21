@@ -5051,8 +5051,14 @@ fn build(
                 reserve = other + base(rows) + extra + route_mirror_bytes(layers, rows);
             } else {
                 // a later plan of a model whose routed stack kept it room (Maxwell's
-                // MTP layer): its weights come out of that room, not past the reserve
-                reserve = reserve.saturating_sub(crate::gpu::plan_extra(uid) as usize);
+                // MTP layer, as a token plan or a prompt plan): its weights take that
+                // room and no more — what else is free is the stack's rows and
+                // prompt scratch, and the head such a plan would leave room for is on
+                // the card already
+                let extra = crate::gpu::plan_extra(uid) as usize;
+                if extra > 0 {
+                    reserve = free.saturating_sub(extra);
+                }
             }
         }
         let dev_cap = need.min(free.saturating_sub(reserve));
@@ -5132,6 +5138,7 @@ fn build(
                 ARENA_HOST.with(|x| x.set((h.dev, cap, 0)));
                 st.hyb.host_arenas.push(h);
             }
+            crate::gpu::note_plan_streamed(uid);
             stream_plan = Some(match &live_stream {
                 Some(cell) => (slot, reserve, cell.clone(), true),
                 None => (slot, reserve, Arc::new(std::sync::Mutex::new(None)), false),

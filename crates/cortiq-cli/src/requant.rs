@@ -352,8 +352,10 @@ pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], 
     // the same calibration pass (the two against each other, one forward)
     let head_out = std::env::var("CMF_REQUANT_HEAD_OUT").ok().filter(|p| !p.is_empty() && !head);
     let want_head = head || head_out.is_some();
+    // the MTP layer's matrices (`mtp.*`: Maxwell) stay as they are: the calibration forward
+    // never runs it, and it only drafts
     let is_target = |e: &cortiq_core::format::TensorEntry| {
-        target_dtype(&mode, &e.name, e.dtype, &e.shape).is_some()
+        (!e.name.starts_with("mtp.") && target_dtype(&mode, &e.name, e.dtype, &e.shape).is_some())
             || (want_head && e.name == "lm_head.weight" && e.dtype == TensorDtype::Q8_2f && e.shape.len() == 2 && e.shape[1] % GROUP_SIZE == 0)
     };
     let names: HashSet<String> = model.tensors.iter().filter(|e| is_target(e)).map(|e| e.name.clone()).collect();

@@ -2222,6 +2222,22 @@ pub(crate) fn plan_extra(model: u64) -> u64 {
     PLAN_EXTRA.lock().unwrap().iter().find(|e| e.0 == model).map_or(0, |e| e.1)
 }
 
+static PLAN_STREAMED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_plan_streamed(model: u64) {
+    let mut g = PLAN_STREAMED.lock().unwrap();
+    if !g.contains(&model) {
+        g.push(model);
+    }
+}
+
+/// Whether a CUDA plan of this model streams its routed experts through card
+/// slots (they did not fit beside the context's rows): every call then waits
+/// for the host between its layers.
+pub fn plan_streamed(model: u64) -> bool {
+    PLAN_STREAMED.lock().unwrap().contains(&model)
+}
+
 /// CUDA hybrid arm: the hyper-connection streams the next small-path call of
 /// this thread starts from, `[row][stream][hidden]` — a stack whose first
 /// layer does not open its range (Maxwell's MTP layer takes the main stack's

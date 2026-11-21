@@ -383,7 +383,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         layers.push(load_layer(model, &format!("model.layers.{li}."), &cfg, moe.num_experts, true)?);
     }
     globals.mtp = load_mtp(model, &cfg, moe.num_experts)?;
-    if let Some(m) = &globals.mtp {
+    if let (Some(m), true) = (&globals.mtp, spec_mode() != 0) {
         // the MTP layer's weights go on the card after the stack's: the stack's plan leaves them room
         crate::gpu::plan_extra_reserve(model.uid(), m.bytes + m.bytes / 8 + (64 << 20));
     }
@@ -1342,20 +1342,34 @@ pub fn capture_window(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mu
 // just chosen and the MTP layer's draft of the one after it. When the next token is the draft,
 // its row is already on the card and its logits are returned without a call; when it is not,
 // the row leaves the mirrors (`graph_kv_set_stored`). A two-row call costs 1.29x a one-row call
-// on an L4 (17.3 against 13.4 ms), so a token costs less from 30 % of drafts taken on.
-// `CMF_MAXWELL_SPEC=0` turns it off. The MTP layer's own context starts at the first position
+// on an L4 (17.3 against 13.4 ms), and the heads' calls take back what that saves there.
+// `CMF_MAXWELL_SPEC=1` turns it on (`spec_mode`: off by default). The MTP layer's own context starts at the first position
 // it sees (its rows count positions from there: RoPE is relative).
 
 /// The MTP layer could not go on the card (no room, a weight the graphs do not address): the
 /// drafting stays off instead of asking again every token.
 static SPEC_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `CMF_MAXWELL_SPEC`: 1 drafts while every weight is on the card, 2 also when the experts
+/// stream (a streamed plan's calls wait for the host between their layers, twice for two
+/// rows). Off without it: on an L4 three quarters of the drafts are taken and a token still
+/// costs what it did (67.2 against 65.5 tok/s) — a pass reads the head 2.75 times.
+fn spec_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("CMF_MAXWELL_SPEC").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
 fn spec_on(globals: &Globals) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mode = spec_mode();
     globals.mtp.is_some()
+        && mode != 0
         && crate::gpu::cuda_active()
-        && *ON.get_or_init(|| std::env::var("CMF_MAXWELL_SPEC").as_deref() != Ok("0"))
         && !SPEC_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+        && (mode == 2 || !crate::gpu::plan_streamed(globals.model.uid()))
 }
 
 /// A kept row (the draft's) off the card: the mirrors back to `position` rows. The MTP

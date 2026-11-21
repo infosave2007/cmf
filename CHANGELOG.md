@@ -19,15 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the attention kernels read); the wgpu graphs take the stack while its attention is dense, and past 4096
   positions the sequence continues on the host. The embedding is stored f16 and read a row a token from the
   file's mapping (the frequent tokens' rows have a maximum of 15 RMS, which an 8-bit row loses 3.5 % of), the
-  file carries the release's sampling (temperature 0.6, top-p 0.95, top-k 20), `cortiq serve` gives the model
-  one slot, and the checkpoint's multi-token
-  prediction layer is left out. Perplexity of the q8_2f file against Transformers bf16 on the same windows:
+  file carries the release's sampling (temperature 0.6, top-p 0.95, top-k 20) and `cortiq serve` gives the model
+  one slot. The checkpoint's multi-token-prediction layer is converted too (`mtp.0.*`; `CMF_MAXWELL_BASE=<file>`
+  adds it to an existing file of the model, nothing else re-encoded): with `CMF_MAXWELL_SPEC=1` the CUDA decode
+  drafts with it — every stack call is the chosen token and the layer's draft of the next, a taken draft's row is
+  on the card already and only its head runs. The text is the same with and without it; on an L4 72–75 % of the
+  drafts are taken and decode goes from 65.5 to 67.2 tok/s (a pass reads the head 2.75 times), so it is off
+  by default. Perplexity of the q8_2f file against Transformers bf16 on the same windows:
   WikiText-2 33.071 (32.804), Rust 7.048 (7.049), Python 7.160 (7.026), and over 2 × 6144 tokens of WikiText-2,
   past the dense range, 20.675 (20.755); the q4tp profile (experts rounded without calibration, the rest
   q8_2f): 32.380, 7.192, 7.554, 20.947. On an NVIDIA L4 (24 GB, CUDA) the published 4-bit file decodes at 65 tok/s with every
   weight on the card (a 2048-token prompt in 2.0 s, a 30 000-token one in 69 s and 33 tok/s after it), the 8-bit
   file at 37 tok/s after a 2048-token prompt with its experts streamed; over Vulkan the 4-bit file at 40 tok/s.
   The same card runs Qwen3.6-35B-A3B q4tp (40 layers, 8 experts a token, no hyper-connections) at 92 tok/s.
+- `cortiq quantize-moe` takes Maxwell: the routed FFNs' input rows and each token's experts are tapped on the
+  CUDA prompt path (`gpu::moe_tap_begin`; 65 536 tokens in 258 s on an L4, a capture-only run with
+  `CMF_GPU=cuda CMF_MOE_HOST=1`), the experts' full-precision weights come from the checkpoint
+  (`block_sparse_moe.experts.E.{w1,w3,w2}`), the encode runs on the device as for the other families; the
+  dense layers have no experts and are left alone. With a prior of 2048 pseudo-rows (`CMF_MOE_PRIOR=2048`; an
+  expert sees one token in twenty, some a few hundred rows) the 4-bit file's perplexity goes from 32.400 /
+  7.421 / 7.489 / 21.352 (WikiText-2 / Rust / Python / WikiText-2 over 6144-token windows, experts rounded) to
+  31.782 / 7.215 / 7.513 / 20.610; without the prior to 32.316 / 7.205 / 7.620 / 21.567.
 - `cortiq requant --quant q4tp-dense --calib TEXT…` (`--tokens`, `--calib-window`, `--calib-head`, `--lambda`):
   the dense trunk's q8_2f matrices GPTQ-rounded into q4tp over a calibration text instead of rounded to the
   nearest level, for a model whose host stack folds its inputs into the Hessian hook (Maxwell: the attention
@@ -47,8 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - CUDA hybrid arm: a stack that keeps every position on the card (Maxwell's block route: 101 KB a token over 45
   layers) holds its context's rows in the plan's reserve beside the expert slots: the rows of `CMF_MAX_SEQ`, or
-  with none named the rows that fit beside weights that stay on the card whole (8192 at least, 32 768 at most;
-  else the cap's rows with the experts streamed). At the plain eighth of the card a 24 GB card filled with
+  with none named the rows that fit beside weights that stay on the card whole (4096 at least, 32 768 at most;
+  else the cap's rows with the experts streamed). Its mirrors counted by themselves, the rest of its reserve is
+  a GiB and a prompt chunk's scores (512 rows × heads × 4 B a position) instead of the plain eighth of the card;
+  a model may keep room for weights that go on the card after its stack (`gpu::plan_extra_reserve`: Maxwell's
+  MTP layer when drafting is on). At the plain eighth of the card a 24 GB card filled with
   Maxwell's 4-bit experts sent a 6144-token window to the host; with the cap's 32 768 rows always reserved it
   streamed the experts of a file that fits (44.6 tok/s against 55.5 resident). A block-routed stack streams a
   spill past 1/32 of its experts instead of 1/8 (read over the bus after 24 576 positions: 23.2 tok/s, streamed
