@@ -14,6 +14,17 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
+/// Projections whose input is byte-identical to the previous one's share its
+/// Hessian (`State::alias`). Off for a stack where two projections read one
+/// input in some calls and different inputs in others (Inkling's loop: q, k
+/// and v of a local layer read one row in the first pass, three after it), so
+/// each keeps its own instead of going invalid.
+static ALIAS: AtomicBool = AtomicBool::new(true);
+
+/// Whether projections with a shared input share a Hessian (default on).
+pub fn set_alias(on: bool) {
+    ALIAS.store(on, Ordering::SeqCst);
+}
 /// Accumulate the full `H = X·Xᵀ` (needed only for the GPTQ fold). Off ⇒
 /// diagonal-only (`Σx²`), which is all the ternary + per-row correction
 /// path needs — and the only thing that fits for a 12B (full H would be
@@ -242,6 +253,7 @@ fn accumulate_inner(name: &str, xs: &[f32], b: usize, cols: usize) {
             return;
         }
         if !st.map.contains_key(name)
+            && ALIAS.load(Ordering::Relaxed)
             && let Some((owner, l, h)) = &st.last
             && owner != name
             && *l == xs.len()

@@ -12,6 +12,7 @@ mod dialog;
 mod egemma2pack;
 mod nemotron_pack;
 mod hy4pack;
+mod inklingpack;
 mod embed;
 mod flint;
 mod hotmix;
@@ -1009,6 +1010,25 @@ enum Commands {
         /// with a group beyond it stay q1, byte for byte.
         #[arg(long, default_value_t = 0.00390625)]
         tol: f64,
+        /// q4tp-dense only: calibration text(s). With it the dense trunk is
+        /// GPTQ-rounded (each matrix's output over the calibration rows
+        /// kept) instead of rounded to the nearest level; repeat to mix
+        /// texts, each giving an equal share of --tokens. Needs a model
+        /// whose host stack folds its inputs (Inkling 2)
+        #[arg(long)]
+        calib: Vec<String>,
+        /// q4tp-dense --calib: calibration tokens in all
+        #[arg(long, default_value_t = 3072)]
+        tokens: usize,
+        /// q4tp-dense --calib: tokens a calibration window (each a fresh context)
+        #[arg(long, default_value_t = 512)]
+        calib_window: usize,
+        /// q4tp-dense --calib: the head (`lm_head.weight`) into q4tp too
+        #[arg(long, default_value_t = false)]
+        calib_head: bool,
+        /// q4tp-dense --calib: relative Hessian damping
+        #[arg(long, default_value_t = 0.01)]
+        lambda: f64,
     },
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
@@ -5225,8 +5245,17 @@ async fn main() -> anyhow::Result<()> {
             in_place,
             allow_tol,
             tol,
+            calib,
+            tokens,
+            calib_window,
+            calib_head,
+            lambda,
         } => {
-            if quant == "tiled-q8_2f" {
+            if !calib.is_empty() {
+                anyhow::ensure!(quant == "q4tp-dense", "--calib goes with --quant q4tp-dense");
+                let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant q4tp-dense --calib needs --output"))?;
+                requant::cmd_requant_dense_gptq(&model, out, &calib, tokens, calib_window, calib_head, lambda)
+            } else if quant == "tiled-q8_2f" {
                 let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant tiled-q8_2f needs --output"))?;
                 requant::cmd_requant_tiled_q8(&model, out)
             } else if quant == "blr-q8_2f" {
@@ -8695,6 +8724,11 @@ async fn cmd_serve(
         // physical slots would let one slot compute with an expert the
         // other has just overwritten. One slot until the pool is shared.
         println!("    note: deepseek_v41 serves with 1 slot (one GPU expert bank per model)");
+        slots = 1;
+    }
+    if slots != 1 && model.arch().arch_name == "inkling2_loop" {
+        // the card holds one sequence's 48 caches at a time
+        println!("    note: inkling2_loop serves with 1 slot");
         slots = 1;
     }
     if std::env::var("CMF_THREADS").is_err() {
