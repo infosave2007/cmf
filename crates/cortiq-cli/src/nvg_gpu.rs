@@ -35,7 +35,7 @@
 use crate::nvg::{BlrModel, BlrPath, Encoded, PathsChoice, Prof, pack};
 use crate::nvg_linalg::{Mat, solve_spd, sym_eig};
 use cortiq_core::blr::{blr_bits, blr_rank};
-use cortiq_engine::nvg_dev::{self as dv, ABS, DMat, INPLACE, LOWER, SIGN, V};
+use cortiq_engine::nvg_dev::{self as dv, ABS, ACC, DMat, INPLACE, LOWER, SIGN, V};
 use cortiq_engine::pool::Pool;
 use std::cell::RefCell;
 use std::time::Instant;
@@ -100,18 +100,32 @@ pub struct HCtxD {
 
 impl HCtxD {
     pub fn new(hfit: &Mat, hsel: &Mat, rho: f64) -> anyhow::Result<Self> {
+        Self::new_damped(hfit, hsel, rho, None)
+    }
+
+    /// [`HCtxD::new`] with a damping of its own for each input: `damp[j]` is
+    /// added to `H_jj` in place of `ρ·mean(diag H)`. The uniform damping of the
+    /// original basis, seen from a channel-scaled one, is `c·t_j²`
+    /// (`CMF_NVG_CS_DAMP=orig`). The raw-Gram metric then subtracts the mean
+    /// damping (the "stored fit" figure is approximate).
+    pub fn new_damped(hfit: &Mat, hsel: &Mat, rho: f64, damp: Option<&[f64]>) -> anyhow::Result<Self> {
         anyhow::ensure!(dv::available(), "no GPU device for the NVG encoder");
         let n = hfit.r;
+        anyhow::ensure!(damp.is_none_or(|d| d.len() == n), "damping of the wrong width");
         let tr = (0..n).map(|i| hfit.at(i, i)).sum::<f64>() / n as f64;
-        let c_fit = rho * tr;
+        let c_fit = match damp {
+            Some(d) => d.iter().sum::<f64>() / n as f64,
+            None => rho * tr,
+        };
+        let dj = |i: usize| damp.map_or(c_fit, |d| d[i]);
         let mut hf: Vec<f32> = hfit.d.iter().map(|&v| v as f32).collect();
         for i in 0..n {
-            hf[i * n + i] = (hfit.at(i, i) + c_fit) as f32;
+            hf[i * n + i] = (hfit.at(i, i) + dj(i)) as f32;
         }
         let h = DMat::from_f32(n, n, &hf);
         drop(hf);
         let hsel_d = DMat::from_f64(n, n, &hsel.d);
-        let dg: Vec<f64> = (0..n).map(|i| hfit.at(i, i) + c_fit).collect();
+        let dg: Vec<f64> = (0..n).map(|i| hfit.at(i, i) + dj(i)).collect();
         let sqd: Vec<f64> = dg.iter().map(|v| v.sqrt()).collect();
         let mut perm: Vec<usize> = (0..n).collect();
         perm.sort_by(|&a, &b| dg[b].partial_cmp(&dg[a]).unwrap_or(std::cmp::Ordering::Equal));
@@ -898,6 +912,70 @@ fn gv_argmin(d: &[f32], cm: &[f32]) -> Option<(usize, f32)> {
     (o..end).find(|&x| d[x] == best).map(|x| (x, best))
 }
 
+/// f64 sum of an f32 dot product.
+#[inline]
+fn gv_dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+}
+
+/// A column's problem of the input-side search: `min gj²·sᵀKs − 2gj·sᵀbv` over
+/// the scale and the signs, from the signs in `h.s`, their `K·s` in `h.ks` and
+/// the target in `h.bv` — the scale by least squares, greedy single flips while
+/// the best one gains more than `tol` (at most `max_flips` a round, three
+/// rounds, the scale refitted between). Leaves the signs and `K·s` in `h`;
+/// returns the scale and the flips.
+#[inline]
+fn gv_solve_col(h: &mut GvHost, k: &[f32], max_flips: usize, tol: f32, gjtol: f32) -> (f32, u64) {
+    let r = h.s.len();
+    let neg = |h: &mut GvHost| {
+        h.s.iter_mut().for_each(|v| *v = -*v);
+        h.ks.iter_mut().for_each(|v| *v = -*v);
+    };
+    let mut flips = 0u64;
+    let mut gj = (gv_dot(&h.bv, &h.s) / gv_dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+    if gj < 0.0 {
+        neg(h);
+        gj = -gj;
+    }
+    for _round in 0..3 {
+        // a candidate's gain: (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv; s is ±1, so
+        // a flip negates its three terms exactly
+        let (a, b) = (-4.0 * gj * gj, 4.0 * gj);
+        for x in 0..r {
+            h.kds[x] = h.kd[x] * h.s[x];
+            h.a_s[x] = a * h.s[x];
+            h.bp[x] = (b * h.s[x]) * h.bv[x];
+        }
+        gv_pass(&mut h.ks, &h.zero, 0.0, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+        let mut nf = 0usize;
+        while nf < max_flips {
+            let Some((bi, best)) = gv_argmin(&h.d, &h.cm) else { break };
+            if best >= -tol * (gj * gj * h.kd[bi] + 1.0e-30) {
+                break;
+            }
+            let sb = h.s[bi];
+            h.s[bi] = -sb;
+            h.kds[bi] = -h.kds[bi];
+            h.a_s[bi] = -h.a_s[bi];
+            h.bp[bi] = -h.bp[bi];
+            gv_pass(&mut h.ks, &k[bi * r..(bi + 1) * r], 2.0 * sb, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
+            nf += 1;
+        }
+        flips += nf as u64;
+        let mut g2 = (gv_dot(&h.bv, &h.s) / gv_dot(&h.s, &h.ks).max(1.0e-30)) as f32;
+        if g2 < 0.0 {
+            neg(h);
+            g2 = -g2;
+        }
+        let done = nf == 0 || (g2 - gj).abs() <= gjtol * gj.abs();
+        gj = g2;
+        if done {
+            break;
+        }
+    }
+    (gj, flips)
+}
+
 /// Columns `b0..b1` of the input-side search on the host — the arithmetic
 /// of the device's `gv_block` kernel (`nd_gv_block` / the wgpu twin): a
 /// column's target less the feedback of the block's earlier columns, its
@@ -923,7 +1001,6 @@ fn gv_block_host(h: &mut GvHost, k: &[f32], bv: &DMat, s: &DMat, ks0: &DMat, uc:
     let mut out = vec![0f32; 2 * nb * r];
     let mut gjs = vec![0f32; nb];
     let gjtol = gv_gj_tol();
-    let dot = |a: &[f32], b: &[f32]| -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() };
     let mut flips = 0u64;
     for j in 0..nb {
         h.s.copy_from_slice(&sb_[j * r..(j + 1) * r]);
@@ -935,51 +1012,8 @@ fn gv_block_host(h: &mut GvHost, k: &[f32], bv: &DMat, s: &DMat, ks0: &DMat, uc:
                 gv_axpy(&mut h.bv, ub[jj * nb + j], &errs[jj * r..(jj + 1) * r]);
             }
         }
-        let neg = |h: &mut GvHost| {
-            h.s.iter_mut().for_each(|v| *v = -*v);
-            h.ks.iter_mut().for_each(|v| *v = -*v);
-        };
-        let mut gj = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
-        if gj < 0.0 {
-            neg(h);
-            gj = -gj;
-        }
-        for _round in 0..3 {
-            // a candidate's gain: (−4gj²·s)·(ks − kd·s) + (4gj·s)·bv; s is ±1, so
-            // a flip negates its three terms exactly
-            let (a, b) = (-4.0 * gj * gj, 4.0 * gj);
-            for x in 0..r {
-                h.kds[x] = h.kd[x] * h.s[x];
-                h.a_s[x] = a * h.s[x];
-                h.bp[x] = (b * h.s[x]) * h.bv[x];
-            }
-            gv_pass(&mut h.ks, &h.zero, 0.0, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
-            let mut nf = 0usize;
-            while nf < max_flips {
-                let Some((bi, best)) = gv_argmin(&h.d, &h.cm) else { break };
-                if best >= -tol * (gj * gj * h.kd[bi] + 1.0e-30) {
-                    break;
-                }
-                let sb = h.s[bi];
-                h.s[bi] = -sb;
-                h.kds[bi] = -h.kds[bi];
-                h.a_s[bi] = -h.a_s[bi];
-                h.bp[bi] = -h.bp[bi];
-                gv_pass(&mut h.ks, &k[bi * r..(bi + 1) * r], 2.0 * sb, &h.kds, &h.a_s, &h.bp, &mut h.d, &mut h.cm);
-                nf += 1;
-            }
-            flips += nf as u64;
-            let mut g2 = (dot(&h.bv, &h.s) / dot(&h.s, &h.ks).max(1.0e-30)) as f32;
-            if g2 < 0.0 {
-                neg(h);
-                g2 = -g2;
-            }
-            let done = nf == 0 || (g2 - gj).abs() <= gjtol * gj.abs();
-            gj = g2;
-            if done {
-                break;
-            }
-        }
+        let (gj, nf) = gv_solve_col(h, k, max_flips, tol, gjtol);
+        flips += nf;
         let ujj = ub[j * nb + j];
         let (signs, errs) = out.split_at_mut(nb * r);
         signs[j * r..(j + 1) * r].copy_from_slice(&h.s);
@@ -996,6 +1030,129 @@ fn gv_block_host(h: &mut GvHost, k: &[f32], bv: &DMat, s: &DMat, ks0: &DMat, uc:
     if b1 < n {
         dv::gemm_v(n - b1, r, nb, -1.0, dv::V { m: uc, off: b0 * n + b1, ld: n, t: true }, dv::V { m: eg, off: 0, ld: r, t: false }, 1.0, bv, b1 * r, r, None);
     }
+    flips
+}
+
+/// Passes of the exact input-side refinement after the knots (`CMF_NVG_CD`,
+/// default 0: off).
+fn cd_passes() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_CD").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    *N
+}
+
+/// SFq's ridge of the refinement (`CMF_NVG_CD_RIDGE`, relative to the mean of
+/// the raw Gram's diagonal, default 0): the refinement's metric is
+/// `H + ridge·mean(diag H)·I` on top of the encoder's damping. With a ridge
+/// the refined signs are kept as SFq keeps its codes (its objective is the
+/// ridged one); without, only when the damped error falls.
+fn cd_ridge() -> f64 {
+    static R: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("CMF_NVG_CD_RIDGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0));
+    *R
+}
+
+/// SFq's code refinement for NVG (`gptq::q2tp_refine_codes`, MACaQ's flip
+/// refinement) on the input-side signs of path `pi`: exact coordinate descent
+/// over the columns of `diag(g)·S_V`. The input-side search settles a column
+/// against the GPTQ feedback of the columns before it; here each column is
+/// solved against the exact residual of every other column — before and after
+/// it, every path — under the damped Gram, and its change reaches all of them:
+/// Gauss–Seidel on `tr(R·H·Rᵀ)`, which no column step raises. With `v = g_j·s_j`,
+/// `Û = diag(h) S_U diag(ℓ)`, `K = ÛᵀÛ` and `A = (R·H)ᵀ·Û`, the error's part
+/// in column j is `H_jj·(vᵀKv − 2vᵀb)` with `b = A_j / H_jj + K·v_old`: the
+/// search's own column problem ([`gv_solve_col`]) with that target. Blocks of
+/// 128 columns on the host; a block's change `u_j = K·(v_new − v_old)` updates
+/// every row of `A` (`A −= H[:, block]·U`) in one GEMM on the device.
+fn cd_v_d(md: &mut ModelD, c: &TCtxD, pi: usize, ridge: f64) -> u64 {
+    let (n, r) = (md.n, md.r);
+    let np = md.paths.len();
+    let hsl = md.hsl(pi);
+    let k = dv::mm(&hsl, true, &hsl, false);
+    // the refinement's Gram: the damped one, plus SFq's ridge when asked
+    let cx = ridge * (c.hc.sqd.iter().map(|v| v * v).sum::<f64>() / n as f64 - c.hc.c_fit).max(0.0);
+    let hx_own = (cx > 0.0).then(|| {
+        let hx = c.hc.h.dup();
+        // the diagonal as an n × 1 view of stride n + 1
+        let ridge = DMat::from_f64(n, 1, &vec![cx; n]);
+        dv::scale_rc(n, 1, Some((&ridge, 0, 1)), (&hx, 0, n + 1), None, None, ACC, 1.0, 1.0);
+        hx
+    });
+    let hx = hx_own.as_ref().unwrap_or(&c.hc.h);
+    // A = (W·Hx)ᵀ·Û − Σ_q (Hx·gs_q)·(Û_qᵀ·Û), Hx·gs_q = H·gs_q + cx·gs_q
+    let a = if cx > 0.0 {
+        let wx = c.wh.dup();
+        dv::scale_rc(md.m, n, Some((c.w, 0, n)), (&wx, 0, n), None, None, ACC, cx as f32, 1.0);
+        dv::mm(&wx, true, &hsl, false)
+    } else {
+        dv::mm(c.wh, true, &hsl, false)
+    };
+    for q in 0..np {
+        let kq = dv::mm(&md.hsl(q), true, &hsl, false);
+        if cx > 0.0 {
+            let hgx = md.hg(q, c).dup();
+            dv::scale_rc(n, r, Some((&md.gs(q), 0, r)), (&hgx, 0, r), None, None, ACC, cx as f32, 1.0);
+            dv::gemm(-1.0, &hgx, false, &kq, false, 1.0, &a);
+        } else {
+            dv::gemm(-1.0, &md.hg(q, c), false, &kq, false, 1.0, &a);
+        }
+    }
+    let ks = dv::mm(&md.paths[pi].sv, false, &k, false);
+    let kh = k.to_f32();
+    let mut g = md.paths[pi].g.to_f32();
+    let mut hs = GvHost::new(r, &kh);
+    let (tol, gjtol) = (*FLIP_TOL_V, gv_gj_tol());
+    let mut flips = 0u64;
+    let mut b0 = 0;
+    while b0 < n {
+        let b1 = (b0 + 128).min(n);
+        let nb = b1 - b0;
+        let rows = DMat::zeros(3 * nb, r);
+        dv::copy_range(&a, b0 * r, &rows, 0, nb * r);
+        dv::copy_range(&md.paths[pi].sv, b0 * r, &rows, nb * r, nb * r);
+        dv::copy_range(&ks, b0 * r, &rows, 2 * nb * r, nb * r);
+        let hb = DMat::zeros(nb, nb);
+        dv::scale_rc(nb, nb, Some((hx, b0 * n + b0, n)), (&hb, 0, nb), None, None, 0, 1.0, 0.0);
+        let (rows, hb) = (rows.to_f32(), hb.to_f32());
+        let (ab, sb, ksb) = (&rows[..nb * r], &rows[nb * r..2 * nb * r], &rows[2 * nb * r..]);
+        // out: the block's signs, their K·s, the changes u_j
+        let mut out = vec![0f32; 3 * nb * r];
+        for j in 0..nb {
+            let (so, kso) = (&sb[j * r..(j + 1) * r], &ksb[j * r..(j + 1) * r]);
+            let hjj = hb[j * nb + j];
+            if !(hjj > 0.0) {
+                out[j * r..(j + 1) * r].copy_from_slice(so);
+                out[(nb + j) * r..(nb + j + 1) * r].copy_from_slice(kso);
+                continue;
+            }
+            hs.bv.copy_from_slice(&ab[j * r..(j + 1) * r]);
+            {
+                let us = &out[2 * nb * r..];
+                for jj in 0..j {
+                    gv_axpy(&mut hs.bv, hb[jj * nb + j], &us[jj * r..(jj + 1) * r]);
+                }
+            }
+            let g_old = g[b0 + j];
+            for (b, ko) in hs.bv.iter_mut().zip(kso) {
+                *b = *b / hjj + g_old * *ko;
+            }
+            hs.s.copy_from_slice(so);
+            hs.ks.copy_from_slice(kso);
+            let (gj, nf) = gv_solve_col(&mut hs, &kh, 4 * r, tol, gjtol);
+            flips += nf;
+            out[j * r..(j + 1) * r].copy_from_slice(&hs.s);
+            out[(nb + j) * r..(nb + j + 1) * r].copy_from_slice(&hs.ks);
+            for (x, u) in out[(2 * nb + j) * r..(2 * nb + j + 1) * r].iter_mut().enumerate() {
+                *u = gj * hs.ks[x] - g_old * kso[x];
+            }
+            g[b0 + j] = gj;
+        }
+        let up = DMat::from_f32(3 * nb, r, &out);
+        dv::copy_range(&up, 0, &md.paths[pi].sv, b0 * r, nb * r);
+        dv::copy_range(&up, nb * r, &ks, b0 * r, nb * r);
+        dv::gemm_v(n, r, nb, -1.0, dv::V { m: hx, off: b0, ld: n, t: false }, dv::V { m: &up, off: 2 * nb * r, ld: r, t: false }, 1.0, &a, 0, r, None);
+        b0 = b1;
+    }
+    md.paths[pi].g = DMat::from_f32(1, n, &g);
+    md.paths[pi].invalidate();
     flips
 }
 
@@ -1030,6 +1187,35 @@ fn refine_d(mut md: ModelD, c: &TCtxD, sweeps: usize) -> ModelD {
                     md = trial;
                     cur = e;
                 }
+            }
+        }
+    }
+    for _ in 0..cd_passes() {
+        for pi in 0..md.paths.len() {
+            let mut trial = md.dup();
+            let t = Instant::now();
+            let f = cd_v_d(&mut trial, c, pi, cd_ridge());
+            if let Some(p) = prof {
+                dv::sync();
+                p.add("cd_v", t.elapsed().as_secs_f64(), 1);
+                p.add("cd_v.flips", 0.0, f);
+            }
+            als_d(&mut trial, c, 3);
+            let e = ps(prof, "err", || herr_d(&trial, c, Metric::H));
+            if std::env::var("CMF_NVG_CD_LOG").as_deref() == Ok("1") {
+                let (s0, s1) = (rel_d(&md, c, Metric::Sel), rel_d(&trial, c, Metric::Sel));
+                eprintln!(
+                    "  nvg cd: {}x{} r{} path {pi}: {f} flips, H error {cur:.6e} -> {e:.6e} ({:+.3} %), held-out {s0:.5} -> {s1:.5} ({:+.3} %)",
+                    md.m,
+                    md.n,
+                    md.r,
+                    100.0 * (e / cur - 1.0),
+                    100.0 * (s1 / s0 - 1.0)
+                );
+            }
+            if e < cur || cd_ridge() > 0.0 {
+                md = trial;
+                cur = e;
             }
         }
     }
@@ -1426,6 +1612,149 @@ mod tests {
             assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v (host {host}) g {}", reld(&gg, &g.paths[1].g));
             let ed = herr_d(&gd, &c, Metric::H);
             assert!((e - ed).abs() <= 1e-2 * e, "gptq_v (host {host}) err {ed} vs {e}");
+        }
+    }
+
+    /// One Gauss–Seidel pass over path `pi`'s input-side columns in f64, the
+    /// residual recomputed for every column (the reference of [`cd_v_d`]).
+    fn cd_host(f: &Fx, md: &BlrModel, pi: usize) -> BlrModel {
+        let mut md = md.clone();
+        let (m, n, r) = (md.m, md.n, md.r);
+        let h = &f.hc.hf;
+        let uh = {
+            let p = &md.paths[pi];
+            Mat::from_vec(m, r, (0..m * r).map(|x| p.h[x / r] * p.su.d[x] * p.l[x % r]).collect())
+        };
+        let kk = gemm(None, &uh, true, &uh, false);
+        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        for j in 0..n {
+            let hjj = h.at(j, j);
+            if hjj <= 0.0 {
+                continue;
+            }
+            let res = f.w.sub(&md.recon(None, None));
+            let rh: Vec<f64> = (0..m).map(|i| (0..n).map(|l| res.at(i, l) * h.at(l, j)).sum()).collect();
+            let (mut s, g0) = (md.paths[pi].sv.row(j).to_vec(), md.paths[pi].g[j]);
+            let mut ks: Vec<f64> = (0..r).map(|a| (0..r).map(|b| kk.at(a, b) * s[b]).sum()).collect();
+            let bv: Vec<f64> = (0..r).map(|k| (0..m).map(|i| uh.at(i, k) * rh[i]).sum::<f64>() / hjj + g0 * ks[k]).collect();
+            let mut gj = dot(&bv, &s) / dot(&s, &ks).max(1e-30);
+            if gj < 0.0 {
+                s.iter_mut().chain(ks.iter_mut()).for_each(|v| *v = -*v);
+                gj = -gj;
+            }
+            for _ in 0..3 {
+                let mut nf = 0;
+                loop {
+                    let (mut best, mut bi) = (f64::INFINITY, 0);
+                    for x in 0..r {
+                        let d = -4.0 * gj * gj * s[x] * (ks[x] - kk.at(x, x) * s[x]) + 4.0 * gj * s[x] * bv[x];
+                        if d < best {
+                            (best, bi) = (d, x);
+                        }
+                    }
+                    if best >= -1e-7 * gj * gj * kk.at(bi, bi) {
+                        break;
+                    }
+                    let sb = s[bi];
+                    s[bi] = -sb;
+                    for (a, v) in ks.iter_mut().enumerate() {
+                        *v -= 2.0 * sb * kk.at(a, bi);
+                    }
+                    nf += 1;
+                }
+                let mut g2 = dot(&bv, &s) / dot(&s, &ks).max(1e-30);
+                if g2 < 0.0 {
+                    s.iter_mut().chain(ks.iter_mut()).for_each(|v| *v = -*v);
+                    g2 = -g2;
+                }
+                let done = nf == 0 || (g2 - gj).abs() <= 1e-8 * gj.abs();
+                gj = g2;
+                if done {
+                    break;
+                }
+            }
+            md.paths[pi].sv.d[j * r..(j + 1) * r].copy_from_slice(&s);
+            md.paths[pi].g[j] = gj;
+        }
+        md
+    }
+
+    /// The exact input-side refinement: from a state of the GPTQ-style search
+    /// it lowers the damped error, keeps its device residual exact, and agrees
+    /// with the f64 pass.
+    #[test]
+    fn cd_matches_host_and_lowers_the_error() {
+        let Some(f) = fixture(160, 128) else { return };
+        if !host_fma() {
+            return;
+        }
+        let c = tctx_d(&f);
+        let tc = tctx(&f);
+        let mut base = nvg::build_nvg_init(&tc, 24, 2);
+        nvg::gptq_v(&mut base, &tc, 1);
+        let e0 = err_cpu(&f, &base, &f.hc.hf);
+        let want = cd_host(&f, &base, 1);
+        let ew = err_cpu(&f, &want, &f.hc.hf);
+        let mut d = model_to_dev(&base);
+        let nf = cd_v_d(&mut d, &c, 1, 0.0);
+        let ed = herr_d(&d, &c, Metric::H);
+        let got = d.to_host();
+        let eh = err_cpu(&f, &got, &f.hc.hf);
+        let diff = got.paths[1].sv.d.iter().zip(&want.paths[1].sv.d).filter(|(x, y)| x != y).count();
+        eprintln!("cd: {nf} flips; H error {e0:.6e} -> device {ed:.6e} (host recompute {eh:.6e}), f64 pass {ew:.6e}; {diff} signs differ");
+        assert!(nf > 0, "no flip found after the GPTQ-style search");
+        assert!(eh < e0 && ed < e0, "the pass raised the error: {e0} -> {eh}");
+        assert!((ed - eh).abs() <= 1e-3 * eh, "device error {ed} vs recomputed {eh}");
+        assert!((eh - ew).abs() <= 1e-2 * ew, "device pass {eh} vs f64 pass {ew}");
+        assert!(diff * 100 <= got.paths[1].sv.d.len(), "{diff} signs differ from the f64 pass");
+    }
+
+    /// The ridged refinement against the f64 pass on `H + cx·I`.
+    #[test]
+    fn cd_with_ridge_matches_host() {
+        let Some(mut f) = fixture(160, 128) else { return };
+        if !host_fma() {
+            return;
+        }
+        let tc = tctx(&f);
+        let mut base = nvg::build_nvg_init(&tc, 24, 2);
+        nvg::gptq_v(&mut base, &tc, 1);
+        let n = 128;
+        let craw = (0..n).map(|j| f.hfit.at(j, j)).sum::<f64>() / n as f64;
+        let cx = 0.3 * craw;
+        let mut d = model_to_dev(&base);
+        let c = tctx_d(&f);
+        let nf = cd_v_d(&mut d, &c, 1, 0.3);
+        // the f64 pass with the ridge in its Gram
+        for j in 0..n {
+            let v = f.hc.hf.at(j, j) + cx;
+            f.hc.hf.d[j * n + j] = v;
+        }
+        let want = cd_host(&f, &base, 1);
+        let got = d.to_host();
+        let (eg, ew) = (err_cpu(&f, &got, &f.hc.hf), err_cpu(&f, &want, &f.hc.hf));
+        let diff = got.paths[1].sv.d.iter().zip(&want.paths[1].sv.d).filter(|(x, y)| x != y).count();
+        eprintln!("cd ridge 0.3: {nf} flips; ridged error device {eg:.6e}, f64 {ew:.6e}; {diff} signs differ");
+        assert!((eg - ew).abs() <= 1e-2 * ew, "ridged pass {eg} vs f64 {ew}");
+        assert!(diff * 100 <= got.paths[1].sv.d.len(), "{diff} signs differ from the f64 pass");
+    }
+
+    /// The ridged Gram of the refinement (`H + cx·I` built on the device)
+    /// against the host's.
+    #[test]
+    fn cd_ridge_gram_on_the_device() {
+        let Some(f) = fixture(96, 64) else { return };
+        let n = 64;
+        let cx = 0.37;
+        let hx = f.hcd.h.dup();
+        let ridge = DMat::from_f64(n, 1, &vec![cx; n]);
+        dv::scale_rc(n, 1, Some((&ridge, 0, 1)), (&hx, 0, n + 1), None, None, ACC, 1.0, 1.0);
+        let (got, base) = (hx.to_f64(), f.hcd.h.to_f64());
+        for i in 0..n {
+            for j in 0..n {
+                let want = base[i * n + j] + if i == j { cx } else { 0.0 };
+                assert!((got[i * n + j] - want).abs() <= 1e-5 * want.abs().max(1.0), "({i},{j}) {} vs {want}", got[i * n + j]);
+            }
         }
     }
 
