@@ -43,11 +43,8 @@ next release, build from that branch as above (once the PR is merged, drop `--br
 | reference: Transformers bf16 | — | {sb} GB | {pbw} | {pbc} | {pbp} | {pbl} |
 
 Perplexity over 12 windows of 512 tokens on WikiText-2 test, 1.8 MB of Rust and 477 KB of Python, and over 2
-windows of 6 144 tokens of WikiText-2, the same windows for every row. In the 4-bit file the routed experts are
-rounded without calibration; the attention, the shared experts and the dense FFNs are GPTQ-calibrated on
-{caltok} tokens of prose, Rust and Python that the evaluation texts do not hold. In both files the embedding is
-f16, the routers, the hyper-connections and the attention's block indexer are f32. The checkpoint's
-multi-token-prediction layer is not included.
+windows of 6 144 tokens of WikiText-2, the same windows for every row. {calib} In both files the embedding is
+f16, the routers, the hyper-connections and the attention's block indexer are f32. {mtp}
 
 What each file needs:
 
@@ -191,10 +188,8 @@ CMF_GPU=cuda cortiq run {q4} --prompt "Почему небо голубое? О�
 | эталон: Transformers bf16 | — | {sb} ГБ | {pbw} | {pbc} | {pbp} | {pbl} |
 
 Перплексия на 12 окнах по 512 токенов: тест WikiText-2, 1,8 МБ кода на Rust и 477 КБ на Python, а также на 2 окнах
-по 6 144 токена WikiText-2; окна одни и те же для всех строк. В 4-битном файле маршрутизируемые эксперты округлены
-без калибровки; внимание, общие эксперты и плотные FFN откалиброваны методом GPTQ на {caltok} токенах прозы, Rust
-и Python, которых нет в оценочных текстах. В обоих файлах эмбеддинг хранится в f16, роутеры, гиперсвязи и блочный
-индексатор внимания — в f32. Слой предсказания нескольких токенов (MTP) из чекпойнта не включён.
+по 6 144 токена WikiText-2; окна одни и те же для всех строк. {calib} В обоих файлах эмбеддинг хранится в f16,
+роутеры, гиперсвязи и блочный индексатор внимания — в f32. {mtp}
 
 Что нужно каждому файлу:
 
@@ -338,9 +333,8 @@ CMF_GPU=cuda cortiq run {q4} --prompt "天空为什么是蓝色的？用三句�
 | 参考：Transformers bf16 | — | {sb} GB | {pbw} | {pbc} | {pbp} | {pbl} |
 
 困惑度在 12 个 512 token 的窗口上计算：WikiText-2 测试集、1.8 MB Rust 代码和 477 KB Python 代码；另有
-WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位文件中，路由专家未经校准直接舍入；注意力、
-共享专家和稠密 FFN 用 GPTQ 在 {caltok} 个 token 的散文、Rust 和 Python 文本上校准，这些文本不在评测文本之内。
-两个文件中词嵌入为 f16，路由器、超连接和注意力的块索引器为 f32。检查点中的多 token 预测层（MTP）未包含在内。
+WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。{calib}两个文件中词嵌入为 f16，路由器、超连接和
+注意力的块索引器为 f32。{mtp}
 
 每个文件的要求：
 

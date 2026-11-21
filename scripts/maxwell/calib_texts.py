@@ -4,10 +4,17 @@ and Python that the evaluation texts (WikiText-2 test, the cortiq CLI's sources,
 
 calib_texts.py OUT_DIR   ->  OUT_DIR/wiki.txt, rust.txt, py.txt (120 KB each)
 
-    cortiq requant Maxwell-V1-Flash-q4tp-experts.cmf --output Maxwell-V1-Flash-q4tp.cmf --quant q4tp-dense \\
-        --calib OUT_DIR/wiki.txt --calib OUT_DIR/rust.txt --calib OUT_DIR/py.txt --tokens 3072
+The published 4-bit file, step by step (SRC the checkpoint, T = OUT_DIR):
 
-(the input is `cortiq convert --quant q4tp`: routed experts q4tp, the rest q8_2f).
+    cortiq convert --model SRC --output a.cmf --quant q4tp          # routed experts q4tp, the rest q8_2f, the MTP layer
+    cortiq requant a.cmf --output b.cmf --quant q4tp-dense \\
+        --calib T/wiki.txt --calib T/rust.txt --calib T/py.txt --tokens 3072      # the dense trunk, GPTQ
+    # the routed experts, GPTQ: a capture on CUDA, then the encode on the device, in place
+    C="--calib T/wiki.txt --calib T/rust.txt --calib T/py.txt --tokens 65536 --window 2048 --layers-per-pass 42 --codec q4tp"
+    CMF_GPU=cuda CMF_MOE_HOST=1 CMF_MOE_CAPTURE_ONLY=1 CMF_MOE_CAPTURE_DIR=cap cortiq quantize-moe b.cmf --hf SRC $C --output unused.cmf
+    CMF_MOE_CAPTURE_DIR=cap CMF_MOE_CAPTURE_FORCE=1 CMF_MOE_PRIOR=2048 cortiq quantize-moe b.cmf --hf SRC $C --in-place
+
+(`CMF_MAXWELL_BASE=<file>` on `convert` adds the MTP layer to a file made before it was converted.)
 Needs pandas + huggingface_hub (WikiText-2 train), a cargo registry with serde_json and regex, a CPython stdlib."""
 import glob, os, sys
 

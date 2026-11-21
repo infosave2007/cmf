@@ -1,63 +1,12 @@
 {
  "cuda": {
-  "q4tp": [
-   {
-    "ctx": 2048,
-    "ttft": 2.02,
-    "decode": 60.7,
-    "vram_gb": 19.73,
-    "rss_gb": 21.1
-   },
-   {
-    "ctx": 4096,
-    "ttft": 4.38,
-    "decode": 49.7,
-    "vram_gb": 20.03,
-    "rss_gb": 21.1
-   },
-   {
-    "ctx": 8192,
-    "ttft": 10.96,
-    "decode": 46.6,
-    "vram_gb": 20.56,
-    "rss_gb": 21.1
-   },
-   {
-    "ctx": 12288,
-    "ttft": 19.01,
-    "decode": 42.9,
-    "vram_gb": 21.03,
-    "rss_gb": 21.1
-   },
-   {
-    "ctx": 16384,
-    "ttft": 28.98,
-    "decode": 38.8,
-    "vram_gb": 21.15,
-    "rss_gb": 21.6
-   },
-   {
-    "ctx": 24576,
-    "ttft": 51.22,
-    "decode": 33.3,
-    "vram_gb": 20.31,
-    "rss_gb": 38.8
-   },
-   {
-    "ctx": 30000,
-    "ttft": 69.39,
-    "decode": 33.1,
-    "vram_gb": 20.28,
-    "rss_gb": 37.9
-   }
-  ],
   "q8_2f": [
    {
     "ctx": 2048,
-    "ttft": 4.32,
-    "decode": 37.5,
-    "vram_gb": 20.0,
-    "rss_gb": 46.2
+    "ttft": 4.1,
+    "decode": 38.0,
+    "vram_gb": 21.62,
+    "rss_gb": 43.6
    },
    {
     "ctx": 8192,
@@ -72,6 +21,36 @@
     "decode": 26.1,
     "vram_gb": 20.35,
     "rss_gb": 46.1
+   }
+  ],
+  "q4tp": [
+   {
+    "ctx": 2048,
+    "ttft": 2.01,
+    "decode": 61.4,
+    "vram_gb": 19.73,
+    "rss_gb": 21.2
+   },
+   {
+    "ctx": 8192,
+    "ttft": 10.86,
+    "decode": 47.7,
+    "vram_gb": 20.56,
+    "rss_gb": 21.2
+   },
+   {
+    "ctx": 16384,
+    "ttft": 27.89,
+    "decode": 42.0,
+    "vram_gb": 21.57,
+    "rss_gb": 21.2
+   },
+   {
+    "ctx": 30000,
+    "ttft": 68.19,
+    "decode": 33.6,
+    "vram_gb": 20.28,
+    "rss_gb": 38.1
    }
   ]
  },

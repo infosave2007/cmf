@@ -15,17 +15,17 @@
    "wiki6k": 20.675
   },
   "q4tp": {
-   "wiki": 32.4,
-   "code": 7.421,
-   "py": 7.489,
-   "wiki6k": 21.352
+   "wiki": 31.782,
+   "code": 7.215,
+   "py": 7.513,
+   "wiki6k": 20.61
   }
  },
  "decode": {
   "cuda": {
-   "q4tp": 65.1,
-   "q8_2f": 25.15,
-   "q4tp_cap32k": 48.8
+   "q4tp": 66.3,
+   "q8_2f": 21.8,
+   "q4tp_cap32k": 55.05
   },
   "vulkan": {
    "q4tp": 39.9,
@@ -36,8 +36,8 @@
   }
  },
  "size_gb": {
-  "q8_2f": 36.97,
-  "q4tp": 20.03,
+  "q8_2f": 37.82,
+  "q4tp": 20.5,
   "bf16": 73.64
  },
  "greedy": {
@@ -50,8 +50,8 @@
   "q4tp": 24
  },
  "sha256": {
-  "q8_2f": "22804734b61eae4e66bef7e0eabd2d9251aeadb11d5a34049dbd84df9c4e9cb3",
-  "q4tp": "c2da5a24c058f3345a6aeb0d9b2ee4ccc42fef406c3c6b4117a3214818041491"
+  "q4tp": "350017b5bc2942f03fabb5611f3d9f7729ff9631607716e8961a4c0ae3a5a974",
+  "q8_2f": "8b96d4e0b65ae258eed226032c5af646adabd25d62fc5a912a7ad4f291972221"
  },
  "kv_kb_per_token": 101.25,
  "mac": {
@@ -59,8 +59,18 @@
   "ru": "| MacBook Air M4 (10 ядер, 24 ГБ) | `q4tp` | 7,9 |\n\nНа Apple Silicon модель работает на CPU (графа Metal для её стека пока нет). Файл отображается в память: этот\nзапуск занял до 12 ГБ резидентной памяти.\n",
   "zh": "| MacBook Air M4（10 核，24 GB） | `q4tp` | 7.9 |\n\n在 Apple Silicon 上模型运行于 CPU（其结构暂无 Metal 图）。文件通过内存映射读取：该次运行的常驻内存峰值为\n12 GB。\n"
  },
- "fit_rows": 8800,
+ "fit_rows": 18000,
  "calib_tokens": 3072,
  "vk_weights_gb": 17.9,
- "vk_rows": 2600
+ "vk_rows": 2600,
+ "calib_note": {
+  "en": "In the 4-bit file every matrix but the\nhead is GPTQ-calibrated on prose, Rust and Python that the evaluation texts do not hold: the routed experts on\n65 536 tokens, the attention, the shared experts and the dense FFNs on 3 072; its head is 8-bit.",
+  "ru": "В 4-битном файле все матрицы, кроме\nголовы, откалиброваны методом GPTQ на прозе, Rust и Python, которых нет в оценочных текстах: маршрутизируемые\nэксперты — на 65 536 токенах, внимание, общие эксперты и плотные FFN — на 3 072; голова 8-битная.",
+  "zh": "4 位文件中，除输出头外的所有矩阵都用 GPTQ 校准，\n校准文本为散文、Rust 和 Python，且不在评测文本之内：路由专家用 65 536 个 token，注意力、共享专家和稠密 FFN 用\n3 072 个；输出头为 8 位。"
+ },
+ "mtp_note": {
+  "en": "Both files carry the\ncheckpoint's multi-token-prediction layer: with `CMF_MAXWELL_SPEC=1` the CUDA decode drafts the next token with\nit (the same text; on the L4 three quarters of the drafts are taken and decode goes from 65.5 to 67.2 tok/s, so\nit is off by default).",
+  "ru": "В обоих файлах есть слой предсказания\nнескольких токенов (MTP) из чекпойнта: с `CMF_MAXWELL_SPEC=1` генерация на CUDA строит по нему черновик следующего\nтокена (текст тот же; на L4 принимается три четверти черновиков, скорость растёт с 65,5 до 67,2 ток/с, поэтому\nпо умолчанию он выключен).",
+  "zh": "两个文件都带有检查点的多 token 预测层（MTP）：\n设置 `CMF_MAXWELL_SPEC=1` 后，CUDA 解码用它为下一个 token 打草稿（文本不变；在 L4 上约四分之三的草稿被采纳，\n速度从 65.5 提高到 67.2 tok/s，因此默认关闭）。"
+ }
 }

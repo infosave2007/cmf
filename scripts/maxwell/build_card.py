@@ -71,7 +71,7 @@ def card(lang):
     g = lambda v, d=1: n(lang, v, d)
     fill = dict(
         src=SRC, repo=REPO, q8=Q8, q4=Q4, img=IMG, pr=N["pr"], ver=N["version"],
-        d_c4=g(D["cuda"]["q4tp"]), d_c32k=g(D["cuda"]["q4tp_cap32k"]), d_c8=g(D["cuda"]["q8_2f"]), fitrows=toks(N["fit_rows"]), d8_2k=g(c8[2048]["decode"]), caltok=toks(N["calib_tokens"]), d_v4=g(D["vulkan"]["q4tp"]),
+        d_c4=g(D["cuda"]["q4tp"]), d_c32k=g(D["cuda"]["q4tp_cap32k"]), d_c8=g(D["cuda"]["q8_2f"]), fitrows=toks(N["fit_rows"]), calib=N["calib_note"][lang], mtp=N["mtp_note"][lang], d8_2k=g(c8[2048]["decode"]),  d_v4=g(D["vulkan"]["q4tp"]),
         t2k=tt(lang, c4[2048]["ttft"]), tlast=tt(lang, c4[last]["ttft"]), last=toks(last), dlast=g(c4[last]["decode"]), mlast=g(c4[last]["vram_gb"]),
         m2k=g(c4[2048]["vram_gb"]), s8=g(S["q8_2f"], 2), s4=g(S["q4tp"], 2), sb=g(S["bf16"], 2),
         p8w=r8[0], p8c=r8[1], p8p=r8[2], p8l=r8[3], p4w=r4[0], p4c=r4[1], p4p=r4[2], p4l=r4[3], pbw=rb[0], pbc=rb[1], pbp=rb[2], pbl=rb[3],

@@ -31,14 +31,14 @@ parameters active a token, a 256K-token context, Apache-2.0), packaged as single
 [CMF](https://github.com/infosave2007/cmf) files. They run with `cortiq`, a Rust inference engine with no Python and
 no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through Vulkan/DX12, and the CPU. Measured:
 
-- **The whole 35B model on one 24 GB card.** NVIDIA L4, CUDA, the 4-bit file: 65.1 tok/s with every weight on
-  the card; a 2 048-token prompt is read in 2.02 s and a 30 000-token one in 69.4 s, after which it still
-  writes 33.1 tok/s in 20.3 GB of the card.
-- **The 8-bit file is 36.97 GB and runs on the same 24 GB card** at 37.5 tok/s after a 2 048-token prompt
-  (25.1 from a cold start): its experts stay in host memory and pass through the card as the router picks them.
+- **The whole 35B model on one 24 GB card.** NVIDIA L4, CUDA, the 4-bit file: 66.3 tok/s with every weight on
+  the card; a 2 048-token prompt is read in 2.01 s and a 30 000-token one in 68.2 s, after which it still
+  writes 33.6 tok/s in 20.3 GB of the card.
+- **The 8-bit file is 37.82 GB and runs on the same 24 GB card** at 38.0 tok/s after a 2 048-token prompt
+  (21.8 from a cold start): its experts stay in host memory and pass through the card as the router picks them.
 - **Vulkan on the same card:** 39.9 tok/s for the 4-bit file, with prompts of up to 2 048 tokens on the card.
-- **Accuracy:** WikiText-2 perplexity 33.07 (8-bit) and 32.40 (4-bit) against 32.80 for Transformers bf16; over
-  windows of 6 144 tokens, where the model's block-sparse attention picks its own blocks, 20.68 and 21.35 against
+- **Accuracy:** WikiText-2 perplexity 33.07 (8-bit) and 31.78 (4-bit) against 32.80 for Transformers bf16; over
+  windows of 6 144 tokens, where the model's block-sparse attention picks its own blocks, 20.68 and 20.61 against
   20.75. Greedy answers of the 8-bit file were checked against Transformers bf16 token by token on four prompts of
   40 tokens: three are identical, the fourth differs in one token.
 
@@ -60,22 +60,24 @@ next release, build from that branch as above (once the PR is merged, drop `--br
 
 | file | quantization | size | WikiText-2 ppl | Rust ppl | Python ppl | WikiText-2, 6 144-token windows |
 |---|---|---:|---:|---:|---:|---:|
-| `Maxwell-V1-Flash-q4tp.cmf` | 4-bit: routed experts, attention, shared experts, dense FFNs; head 8-bit | 20.03 GB | 32.40 | 7.42 | 7.49 | 21.35 |
-| `Maxwell-V1-Flash-q8_2f.cmf` | 8-bit | 36.97 GB | 33.07 | 7.05 | 7.16 | 20.68 |
+| `Maxwell-V1-Flash-q4tp.cmf` | 4-bit: routed experts, attention, shared experts, dense FFNs; head 8-bit | 20.50 GB | 31.78 | 7.21 | 7.51 | 20.61 |
+| `Maxwell-V1-Flash-q8_2f.cmf` | 8-bit | 37.82 GB | 33.07 | 7.05 | 7.16 | 20.68 |
 | reference: Transformers bf16 | — | 73.64 GB | 32.80 | 7.05 | 7.03 | 20.75 |
 
 Perplexity over 12 windows of 512 tokens on WikiText-2 test, 1.8 MB of Rust and 477 KB of Python, and over 2
-windows of 6 144 tokens of WikiText-2, the same windows for every row. In the 4-bit file the routed experts are
-rounded without calibration; the attention, the shared experts and the dense FFNs are GPTQ-calibrated on
-3 072 tokens of prose, Rust and Python that the evaluation texts do not hold. In both files the embedding is
-f16, the routers, the hyper-connections and the attention's block indexer are f32. The checkpoint's
-multi-token-prediction layer is not included.
+windows of 6 144 tokens of WikiText-2, the same windows for every row. In the 4-bit file every matrix but the
+head is GPTQ-calibrated on prose, Rust and Python that the evaluation texts do not hold: the routed experts on
+65 536 tokens, the attention, the shared experts and the dense FFNs on 3 072; its head is 8-bit. In both files the embedding is
+f16, the routers, the hyper-connections and the attention's block indexer are f32. Both files carry the
+checkpoint's multi-token-prediction layer: with `CMF_MAXWELL_SPEC=1` the CUDA decode drafts the next token with
+it (the same text; on the L4 three quarters of the drafts are taken and decode goes from 65.5 to 67.2 tok/s, so
+it is off by default).
 
 What each file needs:
 
 | file | card | host memory | where the experts are |
 |---|---|---:|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | 24 GB | 24 GB | on the card, with about 8 800 positions beside them; a longer context cap (`CMF_MAX_SEQ`) streams them from page-locked host memory |
+| `Maxwell-V1-Flash-q4tp.cmf` | 24 GB | 24 GB | on the card, with about 18 000 positions beside them; a longer context cap (`CMF_MAX_SEQ`) streams them from page-locked host memory |
 | `Maxwell-V1-Flash-q8_2f.cmf` | 24 GB | 42 GB | in page-locked host memory, 18 GB of them at a time on the card |
 
 ## Performance
@@ -87,22 +89,19 @@ run. Read each backend's section on its own.
 ### CUDA · NVIDIA L4
 
 Stand: NVIDIA L4 (24 GB), Google Colab (12 vCPU, 52 GB), the CUDA backend (`CMF_GPU=cuda`). Without a prompt the
-4-bit file decodes at 65.1 tok/s, the 8-bit file at 25.1. By default the card keeps every weight that fits and
-the positions that fit beside them (about 8 800 for the 4-bit file); `CMF_MAX_SEQ` names a longer context, and the
-routed experts then stream from host memory (48.8 tok/s with `CMF_MAX_SEQ=32768`). Each row below ran with the
+4-bit file decodes at 66.3 tok/s, the 8-bit file at 21.8. By default the card keeps every weight that fits and
+the positions that fit beside them (about 18 000 for the 4-bit file); `CMF_MAX_SEQ` names a longer context, and the
+routed experts then stream from host memory (55.0 tok/s with `CMF_MAX_SEQ=32768`). Each row below ran with the
 cap at its prompt's length.
 
 ![The two files on CUDA](https://huggingface.co/infosave/Maxwell-V1-Flash-cmf/resolve/main/assets/files_cuda_en.png)
 
 | prompt, tokens | first token, s (`q4tp`) | first token, s (`q8_2f`) | decode, tok/s (`q4tp`) | decode, tok/s (`q8_2f`) | peak card memory, GB (`q4tp`) | peak card memory, GB (`q8_2f`) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 048 | 2.02 | 4.32 | 60.7 | 37.5 | 19.7 | 20.0 |
-| 4 096 | 4.38 | — | 49.7 | — | 20.0 | — |
-| 8 192 | 11.0 | 17.7 | 46.6 | 31.4 | 20.6 | 20.2 |
-| 12 288 | 19.0 | — | 42.9 | — | 21.0 | — |
-| 16 384 | 29.0 | — | 38.8 | — | 21.1 | — |
-| 24 576 | 51.2 | — | 33.3 | — | 20.3 | — |
-| 30 000 | 69.4 | 94.9 | 33.1 | 26.1 | 20.3 | 20.4 |
+| 2 048 | 2.01 | 4.10 | 61.4 | 38.0 | 19.7 | 21.6 |
+| 8 192 | 10.9 | 17.7 | 47.7 | 31.4 | 20.6 | 20.2 |
+| 16 384 | 27.9 | — | 42.0 | — | 21.6 | — |
+| 30 000 | 68.2 | 94.9 | 33.6 | 26.1 | 20.3 | 20.4 |
 
 ### Vulkan · NVIDIA L4
 
@@ -180,8 +179,8 @@ cortiq info Maxwell-V1-Flash-q4tp.cmf
 
 | file | sha256 |
 |---|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | `c2da5a24c058f3345a6aeb0d9b2ee4ccc42fef406c3c6b4117a3214818041491` |
-| `Maxwell-V1-Flash-q8_2f.cmf` | `22804734b61eae4e66bef7e0eabd2d9251aeadb11d5a34049dbd84df9c4e9cb3` |
+| `Maxwell-V1-Flash-q4tp.cmf` | `350017b5bc2942f03fabb5611f3d9f7729ff9631607716e8961a4c0ae3a5a974` |
+| `Maxwell-V1-Flash-q8_2f.cmf` | `8b96d4e0b65ae258eed226032c5af646adabd25d62fc5a912a7ad4f291972221` |
 
 Weights: [Apache-2.0](https://huggingface.co/maxwell-model/Maxwell-V1-Flash/blob/main/LICENSE), from [maxwell-model/Maxwell-V1-Flash](https://huggingface.co/maxwell-model/Maxwell-V1-Flash). The model card's
 notes on intended use and limitations apply to these files as well.
@@ -195,14 +194,14 @@ notes on intended use and limitations apply to these files as well.
 отдельные файлы [CMF](https://github.com/infosave2007/cmf) для `cortiq` — движка на Rust без Python и
 ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Intel через Vulkan/DX12, а также CPU. Измерено:
 
-- **Вся модель на 35 млрд параметров на одной карте 24 ГБ.** NVIDIA L4, CUDA, 4-битный файл: 65,1 ток/с, все
-  веса лежат на карте; промпт из 2 048 токенов читается за 2,02 с, из 30 000 — за 69,4 с, после чего
-  генерация идёт на 33,1 ток/с в 20,3 ГБ карты.
-- **8-битный файл занимает 36,97 ГБ и работает на той же карте 24 ГБ** на 37,5 ток/с после промпта из 2 048
-  токенов (25,1 с холодного старта): эксперты лежат в памяти хоста и проходят через карту по выбору роутера.
+- **Вся модель на 35 млрд параметров на одной карте 24 ГБ.** NVIDIA L4, CUDA, 4-битный файл: 66,3 ток/с, все
+  веса лежат на карте; промпт из 2 048 токенов читается за 2,01 с, из 30 000 — за 68,2 с, после чего
+  генерация идёт на 33,6 ток/с в 20,3 ГБ карты.
+- **8-битный файл занимает 37,82 ГБ и работает на той же карте 24 ГБ** на 38,0 ток/с после промпта из 2 048
+  токенов (21,8 с холодного старта): эксперты лежат в памяти хоста и проходят через карту по выбору роутера.
 - **Vulkan на той же карте:** 39,9 ток/с у 4-битного файла, промпты до 2 048 токенов целиком на карте.
-- **Точность:** перплексия WikiText-2 33,07 (8 бит) и 32,40 (4 бита) против 32,80 у Transformers bf16; на окнах
-  по 6 144 токена, где блочно-разреженное внимание модели само выбирает блоки, — 20,68 и 21,35 против 20,75.
+- **Точность:** перплексия WikiText-2 33,07 (8 бит) и 31,78 (4 бита) против 32,80 у Transformers bf16; на окнах
+  по 6 144 токена, где блочно-разреженное внимание модели само выбирает блоки, — 20,68 и 20,61 против 20,75.
   Жадные ответы 8-битного файла сверены с Transformers bf16 токен за токеном на четырёх
   промптах по 40 токенов: три совпали полностью, четвёртый отличается одним токеном.
 
@@ -222,21 +221,24 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему неб�
 
 | файл | квантование | размер | перплексия WikiText-2 | Rust | Python | WikiText-2, окна по 6 144 токена |
 |---|---|---:|---:|---:|---:|---:|
-| `Maxwell-V1-Flash-q4tp.cmf` | 4 бита: маршрутизируемые эксперты, внимание, общие эксперты, плотные FFN; голова 8 бит | 20,03 ГБ | 32,40 | 7,42 | 7,49 | 21,35 |
-| `Maxwell-V1-Flash-q8_2f.cmf` | 8 бит | 36,97 ГБ | 33,07 | 7,05 | 7,16 | 20,68 |
+| `Maxwell-V1-Flash-q4tp.cmf` | 4 бита: маршрутизируемые эксперты, внимание, общие эксперты, плотные FFN; голова 8 бит | 20,50 ГБ | 31,78 | 7,21 | 7,51 | 20,61 |
+| `Maxwell-V1-Flash-q8_2f.cmf` | 8 бит | 37,82 ГБ | 33,07 | 7,05 | 7,16 | 20,68 |
 | эталон: Transformers bf16 | — | 73,64 ГБ | 32,80 | 7,05 | 7,03 | 20,75 |
 
 Перплексия на 12 окнах по 512 токенов: тест WikiText-2, 1,8 МБ кода на Rust и 477 КБ на Python, а также на 2 окнах
-по 6 144 токена WikiText-2; окна одни и те же для всех строк. В 4-битном файле маршрутизируемые эксперты округлены
-без калибровки; внимание, общие эксперты и плотные FFN откалиброваны методом GPTQ на 3 072 токенах прозы, Rust
-и Python, которых нет в оценочных текстах. В обоих файлах эмбеддинг хранится в f16, роутеры, гиперсвязи и блочный
-индексатор внимания — в f32. Слой предсказания нескольких токенов (MTP) из чекпойнта не включён.
+по 6 144 токена WikiText-2; окна одни и те же для всех строк. В 4-битном файле все матрицы, кроме
+головы, откалиброваны методом GPTQ на прозе, Rust и Python, которых нет в оценочных текстах: маршрутизируемые
+эксперты — на 65 536 токенах, внимание, общие эксперты и плотные FFN — на 3 072; голова 8-битная. В обоих файлах эмбеддинг хранится в f16,
+роутеры, гиперсвязи и блочный индексатор внимания — в f32. В обоих файлах есть слой предсказания
+нескольких токенов (MTP) из чекпойнта: с `CMF_MAXWELL_SPEC=1` генерация на CUDA строит по нему черновик следующего
+токена (текст тот же; на L4 принимается три четверти черновиков, скорость растёт с 65,5 до 67,2 ток/с, поэтому
+по умолчанию он выключен).
 
 Что нужно каждому файлу:
 
 | файл | карта | память хоста | где лежат эксперты |
 |---|---|---:|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | 24 ГБ | 24 ГБ | на карте, рядом помещается около 8 800 позиций; при большем пределе контекста (`CMF_MAX_SEQ`) подаются из закреплённой памяти хоста |
+| `Maxwell-V1-Flash-q4tp.cmf` | 24 ГБ | 24 ГБ | на карте, рядом помещается около 18 000 позиций; при большем пределе контекста (`CMF_MAX_SEQ`) подаются из закреплённой памяти хоста |
 | `Maxwell-V1-Flash-q8_2f.cmf` | 24 ГБ | 42 ГБ | в закреплённой памяти хоста, на карте одновременно 18 ГБ из них |
 
 ### Скорость
@@ -248,22 +250,19 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему неб�
 **CUDA · NVIDIA L4**
 
 Стенд: NVIDIA L4 (24 ГБ), Google Colab (12 vCPU, 52 ГБ), бэкенд CUDA (`CMF_GPU=cuda`). Без промпта 4-битный файл
-пишет 65,1 ток/с, 8-битный — 25,1. По умолчанию карта держит все веса, которые на неё помещаются, и столько
-позиций, сколько помещается рядом (около 8 800 у 4-битного файла); `CMF_MAX_SEQ` задаёт более длинный контекст, и
-тогда маршрутизируемые эксперты подаются из памяти хоста (48,8 ток/с при `CMF_MAX_SEQ=32768`). Каждая строка
+пишет 66,3 ток/с, 8-битный — 21,8. По умолчанию карта держит все веса, которые на неё помещаются, и столько
+позиций, сколько помещается рядом (около 18 000 у 4-битного файла); `CMF_MAX_SEQ` задаёт более длинный контекст, и
+тогда маршрутизируемые эксперты подаются из памяти хоста (55,0 ток/с при `CMF_MAX_SEQ=32768`). Каждая строка
 ниже измерена с пределом, равным длине её промпта.
 
 ![Два файла на CUDA](https://huggingface.co/infosave/Maxwell-V1-Flash-cmf/resolve/main/assets/files_cuda_ru.png)
 
 | промпт, токенов | первый токен, с (`q4tp`) | первый токен, с (`q8_2f`) | генерация, ток/с (`q4tp`) | генерация, ток/с (`q8_2f`) | пик памяти карты, ГБ (`q4tp`) | пик памяти карты, ГБ (`q8_2f`) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 048 | 2,02 | 4,32 | 60,7 | 37,5 | 19,7 | 20,0 |
-| 4 096 | 4,38 | — | 49,7 | — | 20,0 | — |
-| 8 192 | 11,0 | 17,7 | 46,6 | 31,4 | 20,6 | 20,2 |
-| 12 288 | 19,0 | — | 42,9 | — | 21,0 | — |
-| 16 384 | 29,0 | — | 38,8 | — | 21,1 | — |
-| 24 576 | 51,2 | — | 33,3 | — | 20,3 | — |
-| 30 000 | 69,4 | 94,9 | 33,1 | 26,1 | 20,3 | 20,4 |
+| 2 048 | 2,01 | 4,10 | 61,4 | 38,0 | 19,7 | 21,6 |
+| 8 192 | 10,9 | 17,7 | 47,7 | 31,4 | 20,6 | 20,2 |
+| 16 384 | 27,9 | — | 42,0 | — | 21,6 | — |
+| 30 000 | 68,2 | 94,9 | 33,6 | 26,1 | 20,3 | 20,4 |
 
 **Vulkan · NVIDIA L4**
 
@@ -341,8 +340,8 @@ cortiq info Maxwell-V1-Flash-q4tp.cmf
 
 | файл | sha256 |
 |---|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | `c2da5a24c058f3345a6aeb0d9b2ee4ccc42fef406c3c6b4117a3214818041491` |
-| `Maxwell-V1-Flash-q8_2f.cmf` | `22804734b61eae4e66bef7e0eabd2d9251aeadb11d5a34049dbd84df9c4e9cb3` |
+| `Maxwell-V1-Flash-q4tp.cmf` | `350017b5bc2942f03fabb5611f3d9f7729ff9631607716e8961a4c0ae3a5a974` |
+| `Maxwell-V1-Flash-q8_2f.cmf` | `8b96d4e0b65ae258eed226032c5af646adabd25d62fc5a912a7ad4f291972221` |
 
 Веса: [Apache-2.0](https://huggingface.co/maxwell-model/Maxwell-V1-Flash/blob/main/LICENSE), источник —
 [maxwell-model/Maxwell-V1-Flash](https://huggingface.co/maxwell-model/Maxwell-V1-Flash). Замечания карточки модели о назначении и ограничениях относятся и к этим
@@ -357,14 +356,14 @@ cortiq info Maxwell-V1-Flash-q4tp.cmf
 文件，由 `cortiq` 运行——一个不依赖 Python 和机器学习框架的 Rust 推理引擎：NVIDIA 显卡走 CUDA 或 Vulkan，AMD、
 Intel 显卡走 Vulkan/DX12，也可在 CPU 上运行。实测：
 
-- **整个 350 亿参数模型放进一块 24 GB 显卡。** NVIDIA L4，CUDA，4 位文件：65.1 tok/s，全部权重都在显卡上；
-  2 048 token 的提示词读取 2.02 秒，30 000 token 读取 69.4 秒，之后仍以 33.1 tok/s 生成，占用
+- **整个 350 亿参数模型放进一块 24 GB 显卡。** NVIDIA L4，CUDA，4 位文件：66.3 tok/s，全部权重都在显卡上；
+  2 048 token 的提示词读取 2.01 秒，30 000 token 读取 68.2 秒，之后仍以 33.6 tok/s 生成，占用
   20.3 GB 显存。
-- **8 位文件 36.97 GB，在同一块 24 GB 显卡上运行，** 2 048 token 提示词之后 37.5 tok/s（冷启动时
-  25.1）：专家权重留在主机内存中，由路由器选中后经过显卡。
+- **8 位文件 37.82 GB，在同一块 24 GB 显卡上运行，** 2 048 token 提示词之后 38.0 tok/s（冷启动时
+  21.8）：专家权重留在主机内存中，由路由器选中后经过显卡。
 - **同一块显卡，Vulkan：** 4 位文件 39.9 tok/s，2 048 token 以内的提示词完全在显卡上处理。
-- **精度：** WikiText-2 困惑度 33.07（8 位）和 32.40（4 位），Transformers bf16 为 32.80；在 6 144 token
-  的窗口上（此时模型的块稀疏注意力自行选择块）为 20.68 和 21.35，参考值 20.75。8 位文件的贪心回答在四个提示词上（各 40 个 token）与 Transformers bf16
+- **精度：** WikiText-2 困惑度 33.07（8 位）和 31.78（4 位），Transformers bf16 为 32.80；在 6 144 token
+  的窗口上（此时模型的块稀疏注意力自行选择块）为 20.68 和 20.61，参考值 20.75。8 位文件的贪心回答在四个提示词上（各 40 个 token）与 Transformers bf16
   逐 token 比对：三个完全一致，第四个有一个 token 不同。
 
 ### 快速开始
@@ -383,20 +382,23 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是�
 
 | 文件 | 量化 | 大小 | WikiText-2 困惑度 | Rust | Python | WikiText-2，6 144 token 窗口 |
 |---|---|---:|---:|---:|---:|---:|
-| `Maxwell-V1-Flash-q4tp.cmf` | 4 位：路由专家、注意力、共享专家、稠密 FFN；输出头 8 位 | 20.03 GB | 32.40 | 7.42 | 7.49 | 21.35 |
-| `Maxwell-V1-Flash-q8_2f.cmf` | 8 位 | 36.97 GB | 33.07 | 7.05 | 7.16 | 20.68 |
+| `Maxwell-V1-Flash-q4tp.cmf` | 4 位：路由专家、注意力、共享专家、稠密 FFN；输出头 8 位 | 20.50 GB | 31.78 | 7.21 | 7.51 | 20.61 |
+| `Maxwell-V1-Flash-q8_2f.cmf` | 8 位 | 37.82 GB | 33.07 | 7.05 | 7.16 | 20.68 |
 | 参考：Transformers bf16 | — | 73.64 GB | 32.80 | 7.05 | 7.03 | 20.75 |
 
 困惑度在 12 个 512 token 的窗口上计算：WikiText-2 测试集、1.8 MB Rust 代码和 477 KB Python 代码；另有
-WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位文件中，路由专家未经校准直接舍入；注意力、
-共享专家和稠密 FFN 用 GPTQ 在 3 072 个 token 的散文、Rust 和 Python 文本上校准，这些文本不在评测文本之内。
-两个文件中词嵌入为 f16，路由器、超连接和注意力的块索引器为 f32。检查点中的多 token 预测层（MTP）未包含在内。
+WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位文件中，除输出头外的所有矩阵都用 GPTQ 校准，
+校准文本为散文、Rust 和 Python，且不在评测文本之内：路由专家用 65 536 个 token，注意力、共享专家和稠密 FFN 用
+3 072 个；输出头为 8 位。两个文件中词嵌入为 f16，路由器、超连接和
+注意力的块索引器为 f32。两个文件都带有检查点的多 token 预测层（MTP）：
+设置 `CMF_MAXWELL_SPEC=1` 后，CUDA 解码用它为下一个 token 打草稿（文本不变；在 L4 上约四分之三的草稿被采纳，
+速度从 65.5 提高到 67.2 tok/s，因此默认关闭）。
 
 每个文件的要求：
 
 | 文件 | 显卡 | 主机内存 | 专家权重的位置 |
 |---|---|---:|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | 24 GB | 24 GB | 在显卡上，旁边可容纳约 8 800 个位置；更大的上下文上限（`CMF_MAX_SEQ`）时从锁页的主机内存流式调入 |
+| `Maxwell-V1-Flash-q4tp.cmf` | 24 GB | 24 GB | 在显卡上，旁边可容纳约 18 000 个位置；更大的上下文上限（`CMF_MAX_SEQ`）时从锁页的主机内存流式调入 |
 | `Maxwell-V1-Flash-q8_2f.cmf` | 24 GB | 42 GB | 在锁页的主机内存中，显卡上同时保留其中 18 GB |
 
 ### 性能
@@ -407,21 +409,18 @@ WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位
 **CUDA · NVIDIA L4**
 
 测试平台：NVIDIA L4（24 GB），Google Colab（12 vCPU，52 GB），CUDA 后端（`CMF_GPU=cuda`）。无提示词时 4 位文件
-65.1 tok/s，8 位文件 25.1。默认情况下，显卡保留能放下的全部权重，以及旁边能容纳的位置数（4 位文件约
-8 800 个）；`CMF_MAX_SEQ` 指定更长的上下文，此时路由专家从主机内存流式调入（`CMF_MAX_SEQ=32768` 时
-48.8 tok/s）。下表每一行的上限等于该行提示词的长度。
+66.3 tok/s，8 位文件 21.8。默认情况下，显卡保留能放下的全部权重，以及旁边能容纳的位置数（4 位文件约
+18 000 个）；`CMF_MAX_SEQ` 指定更长的上下文，此时路由专家从主机内存流式调入（`CMF_MAX_SEQ=32768` 时
+55.0 tok/s）。下表每一行的上限等于该行提示词的长度。
 
 ![CUDA 上的两个文件](https://huggingface.co/infosave/Maxwell-V1-Flash-cmf/resolve/main/assets/files_cuda_zh.png)
 
 | 提示词，token 数 | 首个 token，秒（`q4tp`） | 首个 token，秒（`q8_2f`） | 生成，tok/s（`q4tp`） | 生成，tok/s（`q8_2f`） | 显存峰值，GB（`q4tp`） | 显存峰值，GB（`q8_2f`） |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 048 | 2.02 | 4.32 | 60.7 | 37.5 | 19.7 | 20.0 |
-| 4 096 | 4.38 | — | 49.7 | — | 20.0 | — |
-| 8 192 | 11.0 | 17.7 | 46.6 | 31.4 | 20.6 | 20.2 |
-| 12 288 | 19.0 | — | 42.9 | — | 21.0 | — |
-| 16 384 | 29.0 | — | 38.8 | — | 21.1 | — |
-| 24 576 | 51.2 | — | 33.3 | — | 20.3 | — |
-| 30 000 | 69.4 | 94.9 | 33.1 | 26.1 | 20.3 | 20.4 |
+| 2 048 | 2.01 | 4.10 | 61.4 | 38.0 | 19.7 | 21.6 |
+| 8 192 | 10.9 | 17.7 | 47.7 | 31.4 | 20.6 | 20.2 |
+| 16 384 | 27.9 | — | 42.0 | — | 21.6 | — |
+| 30 000 | 68.2 | 94.9 | 33.6 | 26.1 | 20.3 | 20.4 |
 
 **Vulkan · NVIDIA L4**
 
@@ -496,8 +495,8 @@ cortiq info Maxwell-V1-Flash-q4tp.cmf
 
 | 文件 | sha256 |
 |---|---|
-| `Maxwell-V1-Flash-q4tp.cmf` | `c2da5a24c058f3345a6aeb0d9b2ee4ccc42fef406c3c6b4117a3214818041491` |
-| `Maxwell-V1-Flash-q8_2f.cmf` | `22804734b61eae4e66bef7e0eabd2d9251aeadb11d5a34049dbd84df9c4e9cb3` |
+| `Maxwell-V1-Flash-q4tp.cmf` | `350017b5bc2942f03fabb5611f3d9f7729ff9631607716e8961a4c0ae3a5a974` |
+| `Maxwell-V1-Flash-q8_2f.cmf` | `8b96d4e0b65ae258eed226032c5af646adabd25d62fc5a912a7ad4f291972221` |
 
 权重：[Apache-2.0](https://huggingface.co/maxwell-model/Maxwell-V1-Flash/blob/main/LICENSE)，来源
 [maxwell-model/Maxwell-V1-Flash](https://huggingface.co/maxwell-model/Maxwell-V1-Flash)。原模型卡中关于用途和局限的说明同样适用于这些文件。
