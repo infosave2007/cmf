@@ -401,6 +401,9 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let emb = model.tensor("model.embed_tokens.weight").map_or(0, |e| e.nbytes as u64);
     let on_card: u64 = model.tensors.iter().filter(|e| !e.name.starts_with("mtp.")).map(|e| e.nbytes as u64).sum::<u64>().saturating_sub(emb);
     crate::gpu::wgpu_keep_at_least(on_card + on_card / 40 + (64 << 20));
+    // its mirrors (f32 keys and values of the KV groups and the index key, 207 KB a position)
+    // grow a block of 1024 positions at a time, not to the next power of two
+    crate::gpu::wgpu_kv_step(1024);
     let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None, spec: Spec::default() };
     state.reset(layers.len());
     Ok((globals, layers, cfg, state))
@@ -853,17 +856,41 @@ fn gf(d: &[f32]) -> crate::gpu::GraphW<'_> {
 /// The stack as graph layers for a call ending at `end` positions (None: a
 /// weight the graphs cannot address, or a call past the dense range on a
 /// backend whose attention has no block router).
-/// Positions a discrete card holds over wgpu beside the weights: its graphs keep a key and a
-/// value a HEAD of every position (f32, a layer; 1.4 MB a position here), and an allocation
-/// past the card is a panic in wgpu. Measured on an L4 with 3.6 GiB beside the 4-bit file's
-/// weights: prompts of 2 048 tokens ran, 3 072 did not.
+/// Positions a discrete card holds over wgpu beside the weights: the block route keeps f16 keys
+/// and values of the KV groups and the index key of every position, a layer (104 KB a
+/// position over 45 layers, as the CUDA arm), beside a prompt
+/// chunk's scratch and the driver's share (`SCRATCH`). An allocation past the card is a panic
+/// in wgpu.
+/// Rows of a prompt chunk over wgpu: the batch graph keeps every layer's scratch of a call for
+/// the prompt (2 MB a row over 45 layers on an L4), beside the weights and the route's mirrors
+/// of `positions`. A chunk costs about a second whatever its rows (the experts' weights), so
+/// the rows are as many as fit, 512 at most.
+fn wgpu_chunk_rows(cfg: &Cfg, layers: usize, positions: usize) -> usize {
+    let total = crate::gpu::wgpu_card_total();
+    if total == 0 {
+        return 512;
+    }
+    // the driver's share of the card, the call's other buffers, the staging (measured: 45 KB a
+    // row a layer)
+    const KEEP: u64 = 2560 << 20;
+    let mirrors = (positions + 2048) as u64 * crate::gpu::wgpu_route_position_bytes(layers, cfg.nkv, cfg.hd);
+    let room = total.saturating_sub(crate::gpu::resident_bytes()).saturating_sub(mirrors).saturating_sub(KEEP);
+    let per_row = (layers as u64) * 50 * 1024;
+    ((room / per_row.max(1)) as usize / 32 * 32).clamp(32, 512)
+}
+
 fn wgpu_rows(cfg: &Cfg, layers: usize) -> usize {
+    // `CMF_MAXWELL_WGPU_ROWS=<n>`: the positions to allow (measuring what a position costs)
+    if let Some(n) = std::env::var("CMF_MAXWELL_WGPU_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n;
+    }
     let total = crate::gpu::wgpu_card_total();
     if total == 0 {
         return usize::MAX;
     }
-    let per = (layers * 2 * cfg.nh * cfg.hd * 4).max(1) as u64;
-    let room = total.saturating_sub(crate::gpu::vram_budget()).saturating_sub(512 << 20);
+    const SCRATCH: u64 = 2560 << 20;
+    let per = crate::gpu::wgpu_route_position_bytes(layers, cfg.nkv, cfg.hd).max(1);
+    let room = total.saturating_sub(crate::gpu::vram_budget()).saturating_sub(SCRATCH);
     (room / per) as usize
 }
 
@@ -897,23 +924,26 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
     }
     if crate::gpu::wgpu_active() {
         let rows = wgpu_rows(cfg, layers.len());
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("maxwell_moe: beside the weights this card holds {rows} positions over wgpu");
+        }
         if end > rows {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
-                    "maxwell_moe: beside the weights this card holds {rows} positions over wgpu (a key and a value a head of every \
-                     position, a layer); the sequence continues on the host (the CUDA backend, CMF_GPU=cuda, streams the experts \
-                     and keeps the context on the card)"
+                    "maxwell_moe: beside the weights this card holds {rows} positions over wgpu; the sequence continues on the \
+                     host (the CUDA backend, CMF_GPU=cuda, streams the experts and keeps a longer context on the card)"
                 );
             }
             return None;
         }
     }
     let last = layers.len().checked_sub(1)?;
-    // The CUDA hybrid reads the block route from the layer's own geometry. The wgpu graphs
-    // have no arm for it and take the stack on the call-wide geometry, their plain contract
-    // (`CMF_MAXWELL_GEOM=1`: the layer's own there too).
-    let own_geom = crate::gpu::cuda_active() || std::env::var("CMF_MAXWELL_GEOM").as_deref() == Ok("1");
+    // The block route rides the layer's own geometry, on the CUDA hybrid and on the wgpu
+    // graphs (their per-layer-geometry arm, `gpu_wgpu::broute`). `CMF_MAXWELL_GEOM=0` puts the
+    // wgpu graphs back on the call-wide geometry (the dense range only).
+    let own_geom = crate::gpu::cuda_active() || std::env::var("CMF_MAXWELL_GEOM").as_deref() != Ok("0");
     let mut out = Vec::with_capacity(layers.len());
     for (li, l) in layers.iter().enumerate() {
         let head = (li == last).then_some((&globals.head_fn[..], &globals.head_base[..], globals.head_scale));
@@ -1085,7 +1115,6 @@ pub fn forward_prompt(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mu
 /// before the final norm) appended to it. Returns the rows the card took.
 #[allow(clippy::too_many_arguments)]
 fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], start: usize, pool: Option<&Pool>, mut keep: Option<&mut Vec<f32>>) -> usize {
-    use crate::gpu::BatchGraphOutcome;
     if ids.is_empty() || !graph_on() || !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) {
         return 0;
     }
@@ -1097,14 +1126,36 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
     }
     // a draft's row kept past the confirmed ones leaves the card before the prompt's rows
     spec_drop(state, layers.len(), start);
+    // wgpu: every mirror sized for the whole prompt at its first chunk (no growth midway, when
+    // the old and the new buffers would sit on the card together)
+    let hinted = crate::gpu::wgpu_active();
+    if hinted {
+        crate::gpu::set_batch_kv_hint(start + ids.len() + 1);
+    }
+    let done = prompt_rows_inner(globals, layers, cfg, state, ids, start, pool, keep.as_deref_mut());
+    if hinted {
+        crate::gpu::set_batch_kv_hint(0);
+    }
+    done
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prompt_rows_inner(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, ids: &[u32], start: usize, pool: Option<&Pool>, mut keep: Option<&mut Vec<f32>>) -> usize {
+    use crate::gpu::BatchGraphOutcome;
     let model = globals.model.clone();
     let inter = graph_inter(layers);
     let dim = cfg.dim;
-    let mut chunk = std::env::var("CMF_MAXWELL_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(512).max(1);
+    let named = std::env::var("CMF_MAXWELL_PROMPT_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let mut chunk = named.unwrap_or(512).max(1);
     let body = ids.len();
     let mut done = 0usize;
     let timing = std::env::var_os("CMF_CUDA_PROF").is_some();
     while done < body {
+        // over wgpu a chunk's rows take what the card has left beside the weights and the
+        // mirrors (sized for the whole prompt at its first chunk)
+        if named.is_none() && crate::gpu::wgpu_active() {
+            chunk = chunk.min(wgpu_chunk_rows(cfg, layers.len(), start + body + 1));
+        }
         let end = (done + chunk).min(body);
         let k = end - done;
         let t0 = std::time::Instant::now();
@@ -1123,7 +1174,8 @@ fn prompt_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State
         if timing {
             tracing::info!("maxwell_moe prompt chunk of {k} rows: the card {:.2} s", t0.elapsed().as_secs_f64());
         }
-        // `CMF_MAXWELL_MEMLOG=1`: the device allocator's bytes after every prompt chunk
+        // `CMF_MAXWELL_MEMLOG=1`: the device allocator's bytes after every prompt chunk (and the
+        // card's free memory as the driver reports it, when it does)
         if std::env::var("CMF_MAXWELL_MEMLOG").as_deref() == Ok("1") {
             tracing::info!(
                 "maxwell_moe memlog: {} positions, {:.0} MiB in use on the device ({:.0} MiB resident weights)",
@@ -1190,10 +1242,29 @@ pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
     let t_rows = t0.elapsed().as_secs_f64();
     let vocab = globals.lm_head.rows();
     let (mut nll, mut cnt) = (0f64, 0usize);
+    let score = |row: &[f32], target: usize| -> f64 {
+        let best = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+        let den: f64 = row.iter().map(|&v| ((v as f64) - best).exp()).sum();
+        den.ln() - (row[target.min(vocab - 1)] as f64 - best)
+    };
+    let mut r0 = from.min(n);
+    // over wgpu a row at a time through the graph's own head (a call without layers): a matmat
+    // of the head would upload a second copy of it beside the graph's and run a 24 GB card out
+    // of memory at the next window, and on the host it takes a minute a window
+    if crate::gpu::wgpu_active() {
+        let mut lg = Vec::with_capacity(vocab);
+        while r0 < n {
+            if !head_logits(globals, cfg, state, &globals.norm, &rows[r0 * dim..(r0 + 1) * dim], &mut lg) {
+                break;
+            }
+            nll += score(&lg, ids[r0 + 1] as usize);
+            cnt += 1;
+            r0 += 1;
+        }
+    }
     const B: usize = 64;
     let mut out = vec![0f32; B * vocab];
     let mut xs = vec![0f32; B * dim];
-    let mut r0 = from.min(n);
     while r0 < n {
         let b = B.min(n - r0);
         for j in 0..b {
@@ -1202,16 +1273,12 @@ pub fn nll(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
         }
         globals.lm_head.matmat(&xs[..b * dim], b, &mut out[..b * vocab], pool);
         for j in 0..b {
-            let row = &out[j * vocab..(j + 1) * vocab];
-            let target = ids[r0 + j + 1] as usize;
-            let best = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
-            let den: f64 = row.iter().map(|&v| ((v as f64) - best).exp()).sum();
-            nll += den.ln() - (row[target.min(vocab - 1)] as f64 - best);
+            nll += score(&out[j * vocab..(j + 1) * vocab], ids[r0 + j + 1] as usize);
             cnt += 1;
         }
         r0 += b;
     }
-    tracing::info!("maxwell_moe nll: {n} rows through the card in {t_rows:.1} s ({:.1} rows/s), the head on the host {:.1} s", n as f64 / t_rows.max(1e-9), t0.elapsed().as_secs_f64() - t_rows);
+    tracing::info!("maxwell_moe nll: {n} rows through the card in {t_rows:.1} s ({:.1} rows/s), the head {:.1} s", n as f64 / t_rows.max(1e-9), t0.elapsed().as_secs_f64() - t_rows);
     Some((nll, cnt))
 }
 

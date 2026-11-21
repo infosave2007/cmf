@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   55.5 → 66 tok/s; perplexity (WikiText-2 / Rust / Python / WikiText-2 over 6144-token windows) 32.400 / 7.421 /
   7.489 / 21.352 against 32.380 / 7.192 / 7.554 / 20.947 before, and 34.892 / 7.856 / 8.242 / 20.837 when the
   same matrices are only rounded (3072 calibration tokens of prose, Rust and Python, 512-token windows).
+- wgpu: Maxwell's block-sparse attention on the card (`gpu_wgpu::broute`, the CUDA arm's `hy_route_*` and the
+  host's `maxwell::route_blocks` its specification): the indexer's projections, norms and rotation, an index-key
+  mirror a layer, the candidate blocks' scores, every (row, KV group)'s block list, and the attention over the
+  listed blocks in parts (64 positions for a token, 256 for a prompt chunk, a KV group's heads together), merged a
+  head a row. A routed layer keeps its own f16 rows (keys and values of the KV groups and the index key, 104 KB a
+  position over 45 layers, as on CUDA) and runs its whole attention in these kernels, the dense range included.
+  On an NVIDIA L4 over Vulkan the 4-bit file's WikiText-2 perplexity is 31.754 over 512-token windows and 20.662 over
+  6144-token windows (CUDA 31.782 / 20.610), a 24 GB card holds 17 088 positions beside the weights (past them the
+  sequence continues on the host, with a warning), and a 16 384-token prompt runs on the card. Its K/V mirrors grow
+  in steps of 1024 positions (`gpu::wgpu_kv_step`) and are sized for the whole prompt at its first chunk; a
+  prompt's chunk rows follow the card memory left (`maxwell::wgpu_chunk_rows`).
 - A model may ask the wgpu backend for card room beyond its default reserve before the device is set up
   (`gpu::wgpu_reserve_at_least`) and name the weights its graphs need on the card whole
   (`gpu::wgpu_keep_at_least`): the reserve does not take the weight budget below them while the default budget
@@ -113,6 +124,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
 - `nvg-bench --layer L --gram-cache PREFIX` notes the layer beside the cached Grams and refuses a prefix captured
   for another layer; before, the second layer was encoded on the first one's inputs without a word.
+- wgpu batch graph: the expert-grouped MoE prompt kernels made their bucket, entry and slot-row buffers anew for
+  every layer of a call and kept them to its submit (Maxwell: 106 KB a row a layer, 2.2 GB for a 512-row chunk); one
+  set now serves every layer and call (`moeg_bufs`). Same perplexity.
+- Maxwell over wgpu: `cortiq ppl` scored a window's rows with a matmat of the head, which uploaded a second copy of
+  it beside the graph's and ran a 24 GB card out of memory at the second window; the rows go through the graph's own
+  head now.
 - wgpu token graph: a stack with its own runtime (Hy4-flash, GLM-5.3, Maxwell) takes no device prefix, and the
   graph ran one anyway when the layers passed the weight budget: the caller read the boundary hidden as the
   whole stack's and stale logits as the token's (a 6 GB budget under Maxwell's 4-bit file on an M4 wrote empty

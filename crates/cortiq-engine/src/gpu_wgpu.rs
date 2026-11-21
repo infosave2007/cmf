@@ -89,6 +89,7 @@ pub mod dflash_dev;
 pub(crate) mod vit;
 pub(crate) mod dory;
 pub(crate) mod uocr;
+pub(crate) mod broute;
 // Kimi-Linear's KDA and MLA mixers on the token and batch graphs.
 pub(crate) mod kimi;
 // q4_tiled MoE experts in a split layout with row-blocked kernels.
@@ -20059,6 +20060,12 @@ fn graph_geom_problem(
     if g.sink.is_some_and(|s| s.len() != nh) {
         return Some("per-layer attention geometry: one sink logit per Q head required");
     }
+    // Maxwell's block route (`broute`): its own kernels, f32 mirrors of a full context
+    if let Some(r) = g.route.as_ref() {
+        if !broute::admits(r, nh, g.nkv, g.hd) || g.window.is_some() || g.sink.is_some() || g.dash.is_some() || g.dv != g.hd || g.rd != g.hd {
+            return Some("per-layer attention geometry: a block route outside its kernels");
+        }
+    }
     None
 }
 
@@ -21195,7 +21202,52 @@ struct GdnCursor {
 /// and the rest of the prompt fell back to the scalar attend (Qwen3.5-4B on
 /// an RTX A5000: 118 against 42 ms a 512-row chunk). The extra rows are
 /// never written.
+/// The expert-grouped MoE prompt kernels' buffers (bucket offsets, entries,
+/// the slots' rows), one set the layers and calls take in turn: dispatches
+/// in a pass are ordered with memory visibility, so a layer's writes follow
+/// the last reads of the one before. Grown, never shrunk.
+fn moeg_bufs(c: &Ctx, n_off: usize, n_ent: usize, n_y: usize) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    static BUFS: Mutex<Option<[(usize, wgpu::Buffer); 3]>> = Mutex::new(None);
+    let mk = |n: usize, label: &str| {
+        let n = n.max(4).next_power_of_two();
+        (
+            n,
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+        )
+    };
+    let mut g = BUFS.lock().unwrap();
+    let b = g.get_or_insert_with(|| [mk(n_off, "moeg-off"), mk(n_ent, "moeg-ent"), mk(n_y, "moeg-y")]);
+    for (slot, (n, label)) in [(n_off, "moeg-off"), (n_ent, "moeg-ent"), (n_y, "moeg-y")].into_iter().enumerate() {
+        if b[slot].0 < n {
+            b[slot] = mk(n, label);
+        }
+    }
+    (b[0].1.clone(), b[1].1.clone(), b[2].1.clone())
+}
+
+/// Rows a mirror grows by past `KV_STEP` (0: to the next power of two). A
+/// model whose every position costs much card memory asks for it
+/// (`gpu::wgpu_kv_step`): Maxwell's f32 mirrors and index keys, 207 KB a
+/// position, would take a 8 256-position sequence to 16 384 positions' room.
+static KV_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn set_kv_step(rows: usize) {
+    KV_STEP.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn kv_capacity(limit: usize, need: usize) -> usize {
+    let step = KV_STEP.load(std::sync::atomic::Ordering::Relaxed);
+    if step > 0 {
+        let limit = limit.max(1);
+        let need = need.max(BATCH_KV_HINT.with(|f| f.get())).max(1);
+        // a step's slack on top, so a decode does not grow its mirrors every step
+        return (need.div_ceil(step) * step + step).max(step).min(limit.max(need));
+    }
     let floor = std::env::var("CMF_GPU_KV_MIN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -30587,6 +30639,11 @@ pub fn forward_token_graph(
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
+                crate::gpu::GraphAttn::Full { geom: Some(g), .. } if g.route.is_some() => {
+                    // Maxwell's block route keeps its own rows (`broute`)
+                    kvbufs.push(None);
+                    gdnbufs.push(None);
+                }
                 crate::gpu::GraphAttn::Full {
                     cpu_k,
                     cpu_v,
@@ -32703,6 +32760,37 @@ pub fn forward_token_graph(
                             enc.copy_buffer_to_buffer(&vb, 0, &dbgq, 32, 16);
                             o1_dbg.push((li + 10_000, dbgq));
                         }
+                    } else if let Some((g, r)) = geom.as_ref().and_then(|g| g.route.as_ref().map(|r| (g, r))) {
+                        // Maxwell's block route (`broute`): norms, rotation and the append into
+                        // its own f16 mirrors, the index key, the block choice past the dense
+                        // range and the attention into `attn`
+                        let e = broute::Enc {
+                            r,
+                            key: (kv_id, layer_base + li),
+                            layer: layer_base + li,
+                            n1: &n1,
+                            qraw: &qraw,
+                            kraw: &kb,
+                            vraw: &vb,
+                            qn: q_norm.unwrap_or(&[]),
+                            kn: k_norm.unwrap_or(&[]),
+                            q: &qout,
+                            invf: g.invf,
+                            attn: &attn,
+                            pos0: position,
+                            rows: 1,
+                            nh,
+                            nkv: g.nkv,
+                            hd,
+                            hidden,
+                            scale: attn_scale,
+                            eps,
+                        };
+                        if broute::encode(c, &mut enc, &e).is_none() {
+                            graph_refused("block-route kernels or the layer's rows unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        state_started = true;
                     } else if let Some(g) = geom {
                         // Per-layer geometry (MiMo-V2): this layer's KV
                         // heads, RoPE table and rotary width, a dv-wide V
@@ -37936,6 +38024,11 @@ pub fn forward_batch_graph_at(
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
+                crate::gpu::GraphAttn::Full { geom: Some(g), .. } if g.route.is_some() => {
+                    // Maxwell's block route keeps its own rows (`broute`)
+                    kvbufs.push(None);
+                    gdnbufs.push(None);
+                }
                 crate::gpu::GraphAttn::Full {
                     cpu_k,
                     cpu_v,
@@ -39029,7 +39122,42 @@ pub fn forward_batch_graph_at(
                         && hd % 4 == 0
                         && pos_end <= cap
                 });
-                if let Some(d) = geom.as_ref().and_then(|g| g.dash.as_ref()) {
+                // Maxwell's block route: every chunk through its own kernels and its own f16
+                // rows (the dense range included: one set of rows for the whole sequence)
+                let route_l = geom.as_ref().and_then(|g| g.route.as_ref().map(|r| (g, r)));
+                if let Some((g, r)) = route_l {
+                    // Maxwell's prompt chunk: norms, rotation and the append of every row into
+                    // the route's own f16 mirrors, the index keys, the block route and the
+                    // attention (`broute`)
+                    let qall = rwc(k * nh * hd);
+                    let e = broute::Enc {
+                        r,
+                        key: (kv_id, layer_base + li),
+                        layer: layer_base + li,
+                        n1: &n1,
+                        qraw: &qraw_b,
+                        kraw: &kb_b,
+                        vraw: &vb_b,
+                        qn: q_norm.unwrap_or(&[]),
+                        kn: k_norm.unwrap_or(&[]),
+                        q: &qall,
+                        invf: g.invf,
+                        attn: &attn_bb,
+                        pos0: positions[0],
+                        rows: k,
+                        nh,
+                        nkv: g.nkv,
+                        hd,
+                        hidden,
+                        scale: attn_scale,
+                        eps,
+                    };
+                    if broute::encode(c, &mut enc, &e).is_none() {
+                        bgraph_refused("block-route kernels or the layer's rows unavailable");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                    state_started = true;
+                } else if let Some(d) = geom.as_ref().and_then(|g| g.dash.as_ref()) {
                     // Unlimited-OCR's prompt chunk.
                     let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                     let qall = rwc(k * nh * hd);
@@ -41677,19 +41805,12 @@ pub fn forward_batch_graph_at(
                     pass.dispatch_workgroups(k as u32, 1, 1);
                     if let Some((pg, buckets)) = moeg {
                         let n_ent = k * slots;
-                        let mkb = |n: usize, label: &str| {
-                            c.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some(label),
-                                size: (n * 4).max(16) as u64,
-                                usage: wgpu::BufferUsages::STORAGE,
-                                mapped_at_creation: false,
-                            })
-                        };
                         // `goff` needs the terminal offset too: [0..buckets]
                         // includes MiniCPM's trailing shared bucket 256.
-                        let goff = mkb(buckets + 1, "moeg-off");
-                        let gent = mkb(n_ent, "moeg-ent");
-                        let ypart = mkb(n_ent * ehid, "moeg-y");
+                        // One set for every layer of every call (`moeg_bufs`): a
+                        // set a layer held 45 x 106 KB a row until the submit on
+                        // Maxwell (13 slots of 2048), 2.2 GB for a 512-row chunk.
+                        let (goff, gent, ypart) = moeg_bufs(c, buckets + 1, n_ent, n_ent * ehid);
                         let gr_u = uniform_u32x4(c, [buckets as u32, n_ent as u32, 0, 0]);
                         let gs_u = uniform_u32x4(
                             c,
@@ -43996,6 +44117,7 @@ pub fn kv_mirror_reset(kv_id: u64) {
         let _op = c.op_gate.enter();
         kimi::binds_forget(kv_id);
         dsa::reset(kv_id);
+        broute::reset(kv_id);
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
         kv16::forget(kv_id);
         c.gdn_state

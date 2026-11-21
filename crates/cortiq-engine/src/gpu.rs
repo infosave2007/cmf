@@ -2203,6 +2203,27 @@ pub fn wgpu_card_total() -> u64 {
     WGPU_CARD_TOTAL.load(Ordering::Relaxed)
 }
 
+/// wgpu: card bytes a position takes on the block route (`gpu_wgpu::broute`) over `layers` layers.
+pub fn wgpu_route_position_bytes(layers: usize, nkv: usize, hd: usize) -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::broute::position_bytes(layers, nkv, hd)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        (layers * (2 * nkv + 1) * hd * 2) as u64
+    }
+}
+
+/// wgpu: grow every K/V mirror in steps of `rows` instead of to the next power of two (a model
+/// whose positions cost much card memory; 0 restores the power of two).
+pub fn wgpu_kv_step(rows: usize) {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::set_kv_step(rows);
+    #[cfg(not(feature = "gpu"))]
+    let _ = rows;
+}
+
 static PLAN_EXTRA: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Card room a model keeps beside its stack for weights that go on the card
@@ -2320,7 +2341,8 @@ pub fn context_cap(model: &CmfModel) -> usize {
 /// (`CMF_BLOCK_ROUTE=0`: the host takes such a sequence over).
 pub fn block_route_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_BLOCK_ROUTE").as_deref() != Ok("0")) && cuda_active()
+    // the CUDA hybrid's `hy_route_*` kernels, the wgpu graphs' `broute`
+    *ON.get_or_init(|| std::env::var("CMF_BLOCK_ROUTE").as_deref() != Ok("0")) && (cuda_active() || wgpu_active())
 }
 
 /// Rows of an Unlimited-OCR prompt chunk on the batch graph: every remote block
