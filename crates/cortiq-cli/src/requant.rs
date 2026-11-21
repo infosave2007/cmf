@@ -322,6 +322,158 @@ pub fn cmd_requant(
     Ok(())
 }
 
+/// `q4tp-dense` with a calibration text: the dense trunk's q8_2f matrices
+/// GPTQ-rounded into q4tp instead of rounded to the nearest level — the
+/// same layout and kernels, the nibbles chosen so each matrix's OUTPUT over
+/// the calibration rows survives (`gptq::gptq_quantize_q4tp`). The
+/// calibration forward is the model's own host stack with the Hessian hook
+/// on (`gptq_capture`); `--calib-head` takes the head too. A model whose
+/// stack folds no inputs (no captured Hessian) is refused: its matrices
+/// would only be rounded, which the plain `q4tp-dense` already does.
+///
+/// Inkling 2's loop (`inkling2_loop`) reads a local layer's q, k and v from
+/// one row in the first pass and from three after it: its projections keep a
+/// Hessian each (`gptq_capture::set_alias(false)`), every pass folded in.
+pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], tokens: usize, window: usize, head: bool, lambda: f64) -> anyhow::Result<()> {
+    use cortiq_engine::{Pipeline, SamplerConfig};
+    use std::collections::{HashMap, HashSet};
+    anyhow::ensure!(!calib.is_empty(), "--calib names no text");
+    anyhow::ensure!(tokens >= GROUP_SIZE && window >= 2, "--tokens {tokens} / --calib-window {window}: too few");
+    // the calibration forward is the host stack (its inputs are what the hook folds): the
+    // card stays out until the folds
+    // SAFETY: set before any pipeline thread starts
+    unsafe {
+        std::env::set_var("CMF_GPU", "0");
+    }
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+    let mode = Mode::DenseQ4tp;
+    // `CMF_REQUANT_HEAD_OUT=<path>`: a second file with the head GPTQ-rounded too, from
+    // the same calibration pass (the two against each other, one forward)
+    let head_out = std::env::var("CMF_REQUANT_HEAD_OUT").ok().filter(|p| !p.is_empty() && !head);
+    let want_head = head || head_out.is_some();
+    // the MTP layer's matrices (`mtp.*`: Maxwell) stay as they are: the calibration forward
+    // never runs it, and it only drafts
+    let is_target = |e: &cortiq_core::format::TensorEntry| {
+        (!e.name.starts_with("mtp.") && target_dtype(&mode, &e.name, e.dtype, &e.shape).is_some())
+            || (want_head && e.name == "lm_head.weight" && e.dtype == TensorDtype::Q8_2f && e.shape.len() == 2 && e.shape[1] % GROUP_SIZE == 0)
+    };
+    let names: HashSet<String> = model.tensors.iter().filter(|e| is_target(e)).map(|e| e.name.clone()).collect();
+    anyhow::ensure!(!names.is_empty(), "no q8_2f matrix of a dense trunk in {model_path}");
+
+    let mut pipe = Pipeline::from_model(&model, SamplerConfig::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    pipe.set_confidence(false);
+    let share = tokens / calib.len();
+    let mut windows: Vec<Vec<u32>> = Vec::new();
+    for path in calib {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+        // a share of the tokens from the head of each text (eight bytes a token is ample)
+        let mut cut = text.len().min(share.saturating_mul(8).max(4096));
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut ids = pipe.tokenizer.encode(&text[..cut]);
+        ids.truncate(share);
+        windows.extend(ids.chunks(window).filter(|w| w.len() >= 2).map(|w| w.to_vec()));
+    }
+    let total: usize = windows.iter().map(Vec::len).sum();
+    anyhow::ensure!(total >= GROUP_SIZE, "the calibration texts gave {total} tokens");
+    eprintln!("calibrating {} matrices on {total} tokens ({} windows) …", names.len(), windows.len());
+    let t0 = std::time::Instant::now();
+    let keep = names.clone();
+    cortiq_engine::gptq_capture::set_alias(model.header.arch.arch_name != "inkling2_loop");
+    cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
+    for (i, w) in windows.iter().enumerate() {
+        if let Err(e) = pipe.ppl_ids(w) {
+            let _ = cortiq_engine::gptq_capture::end_shared();
+            bail!("calibration window {i}: {e}");
+        }
+    }
+    let cap = cortiq_engine::gptq_capture::end_shared();
+    drop(pipe);
+    eprintln!("captured {} Hessians ({} aliases, {} invalid) in {:.0} s", cap.hess.len(), cap.alias.len(), cap.broken.len(), t0.elapsed().as_secs_f64());
+    anyhow::ensure!(
+        !cap.hess.is_empty(),
+        "the calibration forward folded no inputs: this model's stack has no capture (plain `--quant q4tp-dense` rounds without one)"
+    );
+
+    // the folds' O(n³) algebra on the card when the build has one
+    #[cfg(feature = "cuda")]
+    // SAFETY: the pipeline is gone; the workers left idle read no environment
+    unsafe {
+        std::env::set_var("CMF_GPU", "cuda");
+    }
+    let owner_of: HashMap<&str, &str> = cap.alias.iter().map(|(a, o)| (a.as_str(), o.as_str())).collect();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, e) in model.tensors.iter().enumerate() {
+        if !names.contains(&e.name) || cap.broken.contains(&e.name) {
+            continue;
+        }
+        let owner = owner_of.get(e.name.as_str()).copied().unwrap_or(e.name.as_str());
+        if cap.hess.get(owner).is_some_and(|h| h.cols == e.shape[1] && h.h.len() == h.cols * h.cols) {
+            groups.entry(owner.to_string()).or_default().push(i);
+        }
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut hess = cap.hess;
+    let mut done: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut order: Vec<String> = groups.keys().cloned().collect();
+    order.sort();
+    let t1 = std::time::Instant::now();
+    for (gi, owner) in order.iter().enumerate() {
+        let acc = hess.remove(owner).unwrap();
+        let n = acc.cols;
+        let hdiag: Vec<f32> = (0..n).map(|i| acc.h[i * n + i] as f32).collect();
+        let (u, dead) = crate::gptq::gptq_fold_operator_par(acc.h, n, lambda, threads);
+        for &i in &groups[owner] {
+            let e = &model.tensors[i];
+            let (rows, cols) = (e.shape[0], e.shape[1]);
+            let mut w = vec![0f32; rows * cols];
+            dequant_tensor(e, model.entry_bytes(e), &mut w).map_err(anyhow::Error::msg).with_context(|| format!("dequantizing '{}'", e.name))?;
+            done.insert(i, crate::gptq::gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, threads));
+        }
+        if (gi + 1) % 20 == 0 || gi + 1 == order.len() {
+            eprintln!("  {} / {} input groups folded and swept, {:.0} s", gi + 1, order.len(), t1.elapsed().as_secs_f64());
+        }
+    }
+
+    let write = |path: &str, with_head: bool| -> anyhow::Result<()> {
+        let mut specs: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len());
+        let (mut gptq, mut rounded, mut copied) = (0usize, 0usize, 0usize);
+        for (i, entry) in model.tensors.iter().enumerate() {
+            let is_head = entry.name == "lm_head.weight";
+            let (dtype, data) = if let Some(b) = done.get(&i).filter(|_| with_head || !is_head) {
+                gptq += 1;
+                (TensorDtype::Q4TiledP, b.clone())
+            } else if names.contains(&entry.name) && !is_head {
+                // a matrix whose input the pass did not see (an invalid capture): rounded
+                rounded += 1;
+                let (rows, cols) = (entry.shape[0], entry.shape[1]);
+                let mut buf = vec![0.0f32; rows * cols];
+                dequant_tensor(entry, model.entry_bytes(entry), &mut buf).map_err(anyhow::Error::msg)?;
+                (TensorDtype::Q4TiledP, encode_q4tp(&buf, rows, cols))
+            } else {
+                copied += 1;
+                (entry.dtype, model.entry_bytes(entry).to_vec())
+            };
+            specs.push(TensorSpec { name: entry.name.clone(), dtype, shape: entry.shape.clone(), data });
+        }
+        CmfModel::write(path, &model.header, &specs, Some(&model.masks), model.vocab.as_deref())?;
+        println!(
+            "requant → q4tp-dense (GPTQ, {total} calibration tokens{}): {gptq} matrices GPTQ-rounded, {rounded} rounded without a Hessian, {copied} copied verbatim",
+            if with_head { ", the head too" } else { "" }
+        );
+        let (in_sz, out_sz) = (std::fs::metadata(model_path)?.len() as f64 / 1e9, std::fs::metadata(path)?.len() as f64 / 1e9);
+        println!("{path}: {in_sz:.2} GB → {out_sz:.2} GB ({:+.1}%)", (out_sz / in_sz - 1.0) * 100.0);
+        Ok(())
+    };
+    write(output, head)?;
+    if let Some(p) = &head_out {
+        write(p, true)?;
+    }
+    Ok(())
+}
+
 /// `q1 → q1g`: repack the 1-bit tensors of a model whose native scale group
 /// is 128 (Bonsai class). Such a `q1` file stores every group scale four
 /// times, once per 32-tile; `q1g` keeps the sign bits byte for byte and

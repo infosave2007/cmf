@@ -2604,6 +2604,10 @@ pub fn inkling_forward(
     all: bool,
     logits: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_forward(id, g, layers, cfg, ids, pos, want, all, logits);
@@ -2618,6 +2622,11 @@ pub fn inkling_forward(
 
 /// A new Inkling sequence on the device.
 pub fn inkling_reset(id: u64) {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::inkling::reset(id);
+        return;
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         crate::gpu_cuda::inkling_reset(id);

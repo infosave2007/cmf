@@ -41,6 +41,7 @@ pub mod vit;
 pub mod uocr;
 // Dory's looped stack.
 pub mod dory;
+pub(crate) mod inkling;
 pub mod ane;
 pub mod o1c;
 pub mod primal_vae;

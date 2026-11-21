@@ -584,7 +584,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 })
                 .collect();
             let layout = c.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("inkling"), entries: &entries });
-            let pl = c.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inkling"), bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+            let pl = c.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inkling"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
             let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("inkling"), source: wgpu::ShaderSource::Wgsl(SRC.into()) });
             let mut by_name = HashMap::new();
             for k in KERNELS {

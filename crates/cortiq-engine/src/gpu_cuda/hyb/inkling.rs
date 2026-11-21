@@ -458,22 +458,30 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
     }
     let mut guard = DEVICES.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
-    let fresh = !map.contains_key(&id);
-    if fresh {
-        // one sequence's device at a time: a new one takes the old one's place
-        map.clear();
-        let built = {
-            let mut st = c.st.lock().unwrap();
-            build(c, &mut st, g, layers, cfg)
-        };
-        match built {
-            Ok(d) => {
+    if !map.contains_key(&id) {
+        // one sequence's state on the card at a time: a new sequence takes the
+        // device over (its weights, caches and recorded calls stay)
+        let old = map.keys().next().copied();
+        match old {
+            Some(k) => {
+                let d = map.remove(&k).expect("device");
                 map.insert(id, d);
             }
-            Err(e) => {
-                tracing::warn!("inkling2_loop on CUDA declined: {e}; the host runs this sequence");
-                DECLINED.lock().unwrap().push(id);
-                return false;
+            None => {
+                let built = {
+                    let mut st = c.st.lock().unwrap();
+                    build(c, &mut st, g, layers, cfg)
+                };
+                match built {
+                    Ok(d) => {
+                        map.insert(id, d);
+                    }
+                    Err(e) => {
+                        tracing::warn!("inkling2_loop on CUDA declined: {e}; the host runs this sequence");
+                        DECLINED.lock().unwrap().push(id);
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -494,11 +502,9 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
     }
 }
 
-/// A new sequence: its device state goes.
+/// A sequence ends: the device stays for the next one (its rings are cleared
+/// when that one starts at position 0).
 pub(crate) fn reset(id: u64) {
-    if let Some(m) = DEVICES.lock().unwrap().as_mut() {
-        m.remove(&id);
-    }
     DECLINED.lock().unwrap().retain(|&x| x != id);
 }
 
