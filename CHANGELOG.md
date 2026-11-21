@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] — 2026-11-21
+
 ### Added
 - thinkingmachines/Inkling-2-Mini (`inkling2_loop`) converts natively: the release's NVFP4 (layers 0–19) and MXFP8
   (20–23) experts are decoded and stored as q4tp, q8_2f or byte for byte (`--quant nvfp4`). Its own stack on the
@@ -35,13 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `q4tp_mul_mm`. Apple M4: a 512-token prompt in 3.70 s (15.5 s before, on the file with an 8-bit trunk), decode
   21.5 tok/s; Vulkan on an L4: a 2 048-token prompt in 17.9 s (64 s), decode 18.7. `CMF_INKLING_MOE=pick|loop|gemm`
   picks the expert kernels.
-
-### Fixed
-- Tokenizer: BPE `ignore_merges` (o200k-style vocabularies) — a word that is a vocabulary entry is that entry; before,
-  Inkling's tokenizer split 29 extra tokens out of WikiText-2 test.
-- `bench` timed an Inkling prompt a token at a time (`forward_ids`); it now takes the route generation takes.
-
-### Added
 - NVG on CUDA: `convert --quant blr --blr-method nvg`, `nvg-bench` and `nvg-train` (with `--mask-keep`) run whole
   on the card under `CMF_GPU=cuda` (a build with the `cuda` feature), with no Vulkan adapter — the calibration
   forward and its Grams, the encoder (cuBLAS products, a blocked Cholesky, the eigensolver, the output-side knots
@@ -93,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard halves it twice on its own).
 
 ### Fixed
+- Tokenizer: BPE `ignore_merges` (o200k-style vocabularies) — a word that is a vocabulary entry is that entry; before,
+  Inkling's tokenizer split 29 extra tokens out of WikiText-2 test.
+- `bench` timed an Inkling prompt a token at a time (`forward_ids`); it now takes the route generation takes.
 - CUDA GPTQ (`gpu_cuda/gptq.rs`): the Cholesky's upload by `cublasSetMatrix` is followed by a wait on the legacy
   stream before work queued on the backend's stream reads the block (from pageable memory the call returns before
   its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
