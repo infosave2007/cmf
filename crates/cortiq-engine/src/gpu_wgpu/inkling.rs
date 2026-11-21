@@ -731,6 +731,8 @@ struct SlotW {
 
 #[derive(Clone)]
 struct Step {
+    /// The kernel (`CMF_INKLING_PROF=1` times each by name).
+    name: &'static str,
     pipe: wgpu::ComputePipeline,
     bg: wgpu::BindGroup,
     x: u32,
@@ -1104,8 +1106,11 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
                 p
             }
         };
+        if prof() {
+            profile(c, &plan, n);
+        }
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inkling-call") });
-        {
+        if !prof() {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("inkling"), timestamp_writes: None });
             for st in plan.iter() {
                 pass.set_pipeline(&st.pipe);
@@ -1129,6 +1134,52 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         at += n;
     }
     true
+}
+
+fn prof() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_PROF").as_deref() == Ok("1"))
+}
+
+/// Milliseconds by kernel and calls, by the call's row count (one row: decode).
+static PROF: Mutex<Option<HashMap<(bool, &'static str), (f64, u64)>>> = Mutex::new(None);
+static PROF_CALLS: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+
+/// `CMF_INKLING_PROF=1`: a call's steps one submission each, the host waiting
+/// for every one (so the times are the device's, plus a submission's cost);
+/// every 32 calls of a kind the table by kernel in ms a call.
+fn profile(c: &Ctx, plan: &[Step], n: usize) {
+    let multi = n > 1;
+    for st in plan {
+        let t = std::time::Instant::now();
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inkling-prof") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("inkling"), timestamp_writes: None });
+            pass.set_pipeline(&st.pipe);
+            pass.set_bind_group(0, &st.bg, &[]);
+            pass.dispatch_workgroups(st.x, st.y, st.z);
+        }
+        c.queue.submit(Some(enc.finish()));
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let mut g = PROF.lock().unwrap();
+        let e = g.get_or_insert_with(HashMap::new).entry((multi, st.name)).or_insert((0.0, 0));
+        e.0 += ms;
+        e.1 += 1;
+    }
+    let calls = {
+        let mut k = PROF_CALLS.lock().unwrap();
+        k[multi as usize] += 1;
+        k[multi as usize]
+    };
+    if calls % 32 == 0 {
+        let g = PROF.lock().unwrap();
+        let mut rows: Vec<(&str, f64, u64)> = g.as_ref().map_or(Vec::new(), |m| m.iter().filter(|((mm, _), _)| *mm == multi).map(|((_, k), (ms, cnt))| (*k, *ms / calls as f64, *cnt / calls)).collect());
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let tot: f64 = rows.iter().map(|r| r.1).sum();
+        let line: Vec<String> = rows.iter().map(|(k, ms, cnt)| format!("{k} {ms:.2} ({cnt})")).collect();
+        tracing::info!("inkling2_loop wgpu ms a {} call ({calls} calls, {tot:.1} ms): {}", if multi { "prompt" } else { "decode" }, line.join(", "));
+    }
 }
 
 /// A new sequence: its plans stay (the buffers are the next one's).
@@ -1161,7 +1212,7 @@ impl Rec<'_> {
             entries.push(wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: buf, offset: off, size: None }) });
         }
         let bg = self.c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(kernel), layout: &self.p.layout, entries: &entries });
-        self.out.push(Step { pipe: pipe.clone(), bg, x: grid.0.max(1), y: grid.1.max(1), z: grid.2.max(1) });
+        self.out.push(Step { name: kernel, pipe: pipe.clone(), bg, x: grid.0.max(1), y: grid.1.max(1), z: grid.2.max(1) });
     }
 }
 
@@ -1173,14 +1224,14 @@ fn mv(c: &'static Ctx, rec: &mut Rec, m: &Mat, xs: &wgpu::Buffer, y: &wgpu::Buff
             Codec::Q4 => dense_batch::q4tp_mm_r_prep(c, &m.buf, xs, y, m.rows, m.cols, n)?,
             Codec::Q8 => gemma_batch::q82_mm_prep(c, &m.buf, xs, y, m.rows, m.cols, n)?,
         };
-        rec.out.push(Step { pipe, bg, x: a, y: b, z: 1 });
+        rec.out.push(Step { name: "mm (rows)", pipe, bg, x: a, y: b, z: 1 });
         return Some(());
     }
     let (pipe, bg, x) = match m.codec {
         Codec::Q4 => dense_mv::sg_prep(c, xs, m.cols, &[(&m.buf, y, m.rows)]).map(|(p, b, g)| (p.clone(), b, g))?,
         Codec::Q8 => moe_r4::q82sg_prep(c, xs, m.cols, &[(&m.buf, y, m.rows)])?,
     };
-    rec.out.push(Step { pipe, bg, x, y: 1, z: 1 });
+    rec.out.push(Step { name: "mv", pipe, bg, x, y: 1, z: 1 });
     Some(())
 }
 
