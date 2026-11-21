@@ -84,6 +84,9 @@ required-features = ["gpu"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
 [target.'cfg(target_os = "macos")'.dependencies]
+# wgpu's Metal handles: a MoE bank as a no-copy buffer over the file's mapping (`gpu_wgpu::nocopy`)
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLBuffer", "MTLDevice", "MTLResource", "MTLAllocation"] }
 metal = "0.29"
 objc = "0.2"
 # pthread_set_qos_class_self_np: the pool's workers ask for the P-cores.

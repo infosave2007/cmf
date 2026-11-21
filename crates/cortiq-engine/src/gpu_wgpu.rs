@@ -90,6 +90,8 @@ pub(crate) mod vit;
 pub(crate) mod dory;
 pub(crate) mod uocr;
 pub(crate) mod broute;
+#[cfg(target_os = "macos")]
+pub(crate) mod nocopy;
 // Kimi-Linear's KDA and MLA mixers on the token and batch graphs.
 pub(crate) mod kimi;
 // q4_tiled MoE experts in a split layout with row-blocked kernels.
@@ -19796,6 +19798,19 @@ struct Coop2 {
 
 /// Bind group from explicit (binding, buffer) pairs — the ATTEND_X entry
 /// points each read a different subset of their module's bindings.
+/// `bind_pairs` with an offset into each buffer (a MoE bank read in place:
+/// its three planes in one buffer, `nocopy`).
+fn bind_planes(c: &Ctx, layout: &wgpu::BindGroupLayout, pairs: &[(u32, &wgpu::Buffer, u64)]) -> wgpu::BindGroup {
+    let e: Vec<_> = pairs
+        .iter()
+        .map(|(i, b, o)| wgpu::BindGroupEntry {
+            binding: *i,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: b, offset: *o, size: None }),
+        })
+        .collect();
+    c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("moe-planes"), layout, entries: &e })
+}
+
 fn bind_pairs(
     c: &Ctx,
     layout: &wgpu::BindGroupLayout,
@@ -27084,6 +27099,46 @@ fn uma_stream_on(c: &Ctx) -> bool {
     !c.discrete && cfg!(target_os = "macos") && moe_stream::on()
 }
 
+/// A layer's routed experts read in place from the file on Apple silicon
+/// (`nocopy`): the bank's buffer, the three planes' offsets in it and the
+/// stride from one expert to the next. None elsewhere, or for a layout the
+/// file does not have.
+fn nocopy_bank(c: &Ctx, model: &CmfModel, experts: &[(usize, usize, usize)]) -> Option<(wgpu::Buffer, [u64; 3], u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        if !nocopy::on(c) {
+            return None;
+        }
+        return nocopy::bank(c, model, experts).map(|b| (b.buf.clone(), b.lay.off, b.lay.stride));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (c, model, experts);
+        None
+    }
+}
+
+/// Whether `nocopy_bank` would serve these experts (no buffer made).
+fn nocopy_fits(c: &Ctx, model: &CmfModel, experts: &[(usize, usize, usize)]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        nocopy::on(c) && nocopy::layout(model, experts, c.device.limits().min_storage_buffer_offset_alignment as u64).is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (c, model, experts);
+        false
+    }
+}
+
+/// The routed experts of a graph layer read in place (`nocopy_fits`).
+fn layer_nocopy(c: &Ctx, l: &crate::gpu::GraphLayer<'_>, model: &CmfModel) -> bool {
+    match &l.ffn {
+        crate::gpu::GraphFfn::Moe { experts, q4tp: true, gu_q2: false, q82: false, latent: None, .. } => nocopy_fits(c, model, experts),
+        _ => false,
+    }
+}
+
 
 /// A streamed MoE layer of the token graph: its key in the pool (its first
 /// expert's gate tensor), its experts' tensors and the model's pool.
@@ -27127,6 +27182,11 @@ fn expert_plan(
 ) -> Option<Arc<moe_cache::Plan>> {
     type Key = (u64, usize, usize, u64);
     static MEMO: OnceLock<Mutex<HashMap<Key, Option<Arc<moe_cache::Plan>>>>> = OnceLock::new();
+    // Apple silicon: banks read in place from the file need no placement
+    let routed: Vec<&crate::gpu::GraphLayer<'_>> = layers.iter().filter(|l| layer_bank(model, l).0 > 0).collect();
+    if !c.discrete && !routed.is_empty() && routed.iter().all(|l| layer_nocopy(c, l, model)) {
+        return None;
+    }
     let uma = uma_stream_on(c);
     if !sys_experts_on(c) && !uma {
         return None;
@@ -29263,6 +29323,10 @@ pub fn forward_token_graph(
             stream: Option<StreamL>,
             /// The experts' SwiGLU clamp (GLM-5.3), 0 = none.
             limit: f32,
+            /// The bank read in place from the file (`nocopy`): the gate, up
+            /// and down planes' offsets in `gate_all` (all three the same
+            /// buffer) and an expert's stride in u16 units.
+            plane: Option<([u64; 3], u32)>,
         },
         /// MiniMax's dynamic tail: routing through the segmented global bank
         /// (descriptor-indexed gate/up/down), experts admitted between
@@ -29562,7 +29626,9 @@ pub fn forward_token_graph(
         let mut sys_layer = streamed || (exp > 0 && plan.as_ref().is_some_and(|p| p.sys.get(pli) == Some(&true)));
         let mut cache_cap = if sys_layer && !streamed { plan.as_ref().map_or(0, |p| p.cap[pli]) } else { 0 };
         let cache_b = if cache_cap > 0 { plan.as_ref().map_or(0, |p| p.cache_bytes[pli]) } else { 0 };
-        let mut live = if sys_layer { layer_bytes - exp + cache_b } else { layer_bytes };
+        // a bank read in place from the file takes none of the budget
+        let in_place = exp > 0 && !streamed && !sys_layer && layer_nocopy(c, l, model);
+        let mut live = if sys_layer { layer_bytes - exp + cache_b } else if in_place { layer_bytes - exp } else { layer_bytes };
         if cache_cap > 0 && graph_bytes.saturating_add(live) > graph_live_budget {
             // the slots go first: the bank still reads in place
             cache_cap = 0;
@@ -30099,6 +30165,7 @@ pub fn forward_token_graph(
                 let q4ts = !*q82 && !*q4tp && !*gu_q2 && latent.is_none() && moe_q4ts::on(c, hidden, *mi);
                 // a streamed layer: the model's pool of slots stands in for the bank
                 let mut stream_l: Option<StreamL> = None;
+                let mut plane: Option<([u64; 3], u32)> = None;
                 if streamed && !*q82 && !q4ts {
                     let len = |i: usize| model.tensors.get(i).map_or(0, |e| e.nbytes as usize);
                     let st = experts.first().and_then(|&(g, _, d)| {
@@ -30134,7 +30201,18 @@ pub fn forward_token_graph(
                         break;
                     }
                     moe_q4ts::banks(c, model, experts, *mi, hidden)
+                } else if let Some((nb, off, stride)) = in_place.then(|| nocopy_bank(c, model, experts)).flatten() {
+                    plane = Some((off, (stride / 2) as u32));
+                    Some((nb.clone(), nb.clone(), nb))
                 } else {
+                    if in_place {
+                        // no in-place buffer after all: the bank counts against the budget
+                        if graph_bytes.saturating_add(exp) > graph_live_budget {
+                            graph_decline("an in-place MoE bank was refused and the copy passes the budget");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        graph_bytes += exp;
+                    }
                     SYS_EXPERTS_NEXT.with(|x| x.set(sys_layer));
                     let b = moe_expert_bufs(c, model, experts, *mi, ehid, *q4tp, *gu_q2, false);
                     SYS_EXPERTS_NEXT.with(|x| x.set(false));
@@ -30197,6 +30275,7 @@ pub fn forward_token_graph(
                     cache,
                     stream: stream_l,
                     limit: *limit,
+                    plane,
                 }
                 }
             }
@@ -34882,6 +34961,7 @@ pub fn forward_token_graph(
                     cache,
                     stream,
                     limit,
+                    plane,
                 } => {
                     deferred_shared = detached_shared.as_ref();
                     // Hy4-flash's latent experts: their rows are latent_down
@@ -34982,6 +35062,10 @@ pub fn forward_token_graph(
                     } else {
                         mat16(*mi, ehid)
                     };
+                    // a bank read in place: an expert is the file's stride on
+                    let gu_mat16 = plane.map_or(gu_mat16, |p| p.1);
+                    let dn_mat16 = plane.map_or(mat16(ehid, *mi), |p| p.1);
+                    let po = plane.map_or([0u64; 3], |p| p.0);
                     // The fifth word is the swiglu limit; the final word is
                     // `GraphAct::code` for the MoE gate/up kernels.
                     let gu_u = uniform_u32x8(
@@ -35003,7 +35087,7 @@ pub fn forward_token_graph(
                             (*mi / 32) as u32,
                             ehid as u32,
                             slots as u32,
-                            mat16(ehid, *mi),
+                            dn_mat16,
                         ],
                     );
                     let (p_gu, p_dn, l_gu, l_dn) = if *gu_q2 {
@@ -35061,7 +35145,7 @@ pub fn forward_token_graph(
                     // uniform explicitly carries code 3.
                     let r4 = if *q4tp && !*gu_q2 && *act != 3 {
                         moe_r4::decode(c).filter(|_| {
-                            moe_r4::fits(ehid, *mi, gu_mat16, mat16(ehid, *mi))
+                            moe_r4::fits(ehid, *mi, gu_mat16, dn_mat16)
                         })
                     } else {
                         None
@@ -35079,6 +35163,10 @@ pub fn forward_token_graph(
                         && *n_exp <= 64
                         && slots <= 32
                         && std::env::var("CMF_MOE_FOLD").as_deref() != Ok("0");
+                    if plane.is_some() && (sel_fold || *q4ts || *gu_q2 || cache.is_some() || stream.is_some()) {
+                        graph_decline("an in-place MoE bank on an expert arm without plane offsets");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
                     let q4ts_p = if *q4ts { moe_q4ts::pipes(c) } else { None };
                     if *q4ts && (q4ts_p.is_none() || slots > 32) {
                         graph_decline("q4_tiled split experts without their kernels");
@@ -35231,31 +35319,31 @@ pub fn forward_token_graph(
                         (
                             r4_gu,
                             r4_dn,
-                            bind_pairs(
+                            bind_planes(
                                 c,
                                 r4_gu_l,
                                 &[
-                                    (0, gate_all),
-                                    (1, up_all),
-                                    (2, ein),
-                                    (3, msel_x),
-                                    (4, mact),
-                                    (5, &gu_u),
-                                    (6, gate_all),
-                                    (7, up_all),
+                                    (0, gate_all, po[0]),
+                                    (1, up_all, po[1]),
+                                    (2, ein, 0),
+                                    (3, msel_x, 0),
+                                    (4, mact, 0),
+                                    (5, &gu_u, 0),
+                                    (6, gate_all, po[0]),
+                                    (7, up_all, po[1]),
                                 ],
                             ),
-                            bind_pairs(
+                            bind_planes(
                                 c,
                                 r4_dn_l,
                                 &[
-                                    (8, down_all),
-                                    (9, down_all),
-                                    (10, mact),
-                                    (11, msel_x),
-                                    (12, mwt),
-                                    (13, eout),
-                                    (14, &dn_u),
+                                    (8, down_all, po[2]),
+                                    (9, down_all, po[2]),
+                                    (10, mact, 0),
+                                    (11, msel_x, 0),
+                                    (12, mwt, 0),
+                                    (13, eout, 0),
+                                    (14, &dn_u, 0),
                                 ],
                             ),
                             (*mi / 4) as u32,
@@ -35265,8 +35353,8 @@ pub fn forward_token_graph(
                         (
                             p_gu,
                             p_dn,
-                            bg(l_gu, &[gate_all, up_all, ein, msel_x, mact, &gu_u]),
-                            bg(l_dn, &[down_all, mact, msel_x, mwt, eout, &dn_u]),
+                            bind_planes(c, l_gu, &[(0, gate_all, po[0]), (1, up_all, po[1]), (2, ein, 0), (3, msel_x, 0), (4, mact, 0), (5, &gu_u, 0)]),
+                            bind_planes(c, l_dn, &[(0, down_all, po[2]), (1, mact, 0), (2, msel_x, 0), (3, mwt, 0), (4, eout, 0), (5, &dn_u, 0)]),
                             *mi as u32,
                             ehid as u32,
                         )

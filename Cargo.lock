@@ -672,6 +672,8 @@ dependencies = [
  "minijinja-contrib",
  "naga",
  "objc",
+ "objc2",
+ "objc2-metal",
  "pollster",
  "ptts",
  "rustfft",
