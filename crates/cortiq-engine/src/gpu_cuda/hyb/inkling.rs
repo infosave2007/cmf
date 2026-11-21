@@ -56,6 +56,8 @@ struct Fx {
     attn_split: cs::CUfunction,
     attn_merge: cs::CUfunction,
     h16: cs::CUfunction,
+    gate_norm: cs::CUfunction,
+    gate_mix: cs::CUfunction,
     kv_rows: cs::CUfunction,
     ring_rows: cs::CUfunction,
     post_rows: cs::CUfunction,
@@ -135,6 +137,11 @@ struct Big {
     ys: Buf,
     gu_a: Buf,
     dn_a: Buf,
+    /// A message gate's normed halves `[rows][2H]` and its F and G products
+    /// `[rows][H]` (`gate_big`).
+    gxn: Buf,
+    gtf: Buf,
+    gtg: Buf,
 }
 
 struct Dev {
@@ -310,6 +317,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         attn_split: func(module, "ink_attn_split")?,
         attn_merge: func(module, "ink_attn_merge")?,
         h16: func(module, "ink_h16")?,
+        gate_norm: func(module, "ink_gate_norm")?,
+        gate_mix: func(module, "ink_gate_mix")?,
         kv_rows: func(module, "ink_kv_rows")?,
         ring_rows: func(module, "ink_ring_rows")?,
         post_rows: func(module, "ink_post_rows")?,
@@ -466,6 +475,9 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             ys: f4(nk * hidden)?,
             gu_a: Buf::new(jmax * job_b)?,
             dn_a: Buf::new(jmax * job_b)?,
+            gxn: f4(rows * 2 * hidden)?,
+            gtf: f4(rows * hidden)?,
+            gtg: f4(rows * hidden)?,
         })
     } else {
         None
@@ -964,7 +976,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
             c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
             for j in 0..3 {
-                gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
+                gate_big(c, f, b, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
                 inp[j] = fl(&d.gin, j);
             }
         }
@@ -1033,7 +1045,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
         let mut mi = d.m.ptr;
         if let Some(gs) = gates {
-            gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+            gate_big(c, f, b, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
             mi = d.mg.ptr;
         }
         let nul = 0u64;
@@ -1125,6 +1137,22 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
         c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
     }
     Ok(())
+}
+
+/// A prompt call's message gate (`gate`'s arithmetic): the normed halves of
+/// every row, `d = xn · downᵀ`, `F·d` and `G·d` as f32 GEMMs, then the mix.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gate_big(c: &Ctx, f: &Fx, b: &Big, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, n: usize, hidden: usize, eps: f32) -> Res<()> {
+    let r = g.down.bytes / (2 * hidden * 4);
+    let tot = n * hidden;
+    let tot_i = tot as i32;
+    unsafe {
+        c.launch(f.gate_norm, (n as u32, 1), 256, 0, kargs!(x, m, eps, b.gxn.ptr))?;
+        c.gemm(true, false, r, n, 2 * hidden, 1.0, g.down.ptr, 2 * hidden, b.gxn.ptr, 2 * hidden, 0.0, dbuf, r, Gemm::F32)?;
+        c.gemm(true, false, hidden, n, r, 1.0, g.forget.ptr, r, dbuf, r, 0.0, b.gtf.ptr, hidden, Gemm::F32)?;
+        c.gemm(true, false, hidden, n, r, 1.0, g.gain.ptr, r, dbuf, r, 0.0, b.gtg.ptr, hidden, Gemm::F32)?;
+        c.launch(f.gate_mix, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x, m, b.gtf.ptr, b.gtg.ptr, out, tot_i))
+    }
 }
 
 /// A message gate: `out = (1 − tanh F·d)·x + tanh G·d·m`, `d` the rank-R

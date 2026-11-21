@@ -592,6 +592,40 @@ extern "C" __global__ void ink_post_rows(const float* __restrict__ a, const floa
     }
 }
 
+// A prompt call's message gate in GEMMs (`gate_big`): the rows' normed
+// halves [x / rms x, m / rms m] into xn [n][2H] (grid n, 256 threads), the
+// rank-R products through cuBLAS, then the mix below.
+extern "C" __global__ void ink_gate_norm(const float* __restrict__ x, const float* __restrict__ m, float eps,
+                                         float* __restrict__ xn)
+{
+    __shared__ float sh[32];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* xr = x + (size_t)r * H;
+    const float* mr = m + (size_t)r * H;
+    float sx = 0.0f, sm = 0.0f;
+    for (int i = tid; i < H; i += blockDim.x) {
+        sx = fmaf(xr[i], xr[i], sx);
+        sm = fmaf(mr[i], mr[i], sm);
+    }
+    sx = block_sum(sx, sh);
+    sm = block_sum(sm, sh);
+    const float ix = rsqrtf(sx / (float)H + eps), im = rsqrtf(sm / (float)H + eps);
+    float* o = xn + (size_t)r * 2 * H;
+    for (int i = tid; i < H; i += blockDim.x) {
+        o[i] = xr[i] * ix;
+        o[H + i] = mr[i] * im;
+    }
+}
+
+// out = (1 − tanh f)·x + tanh g·m over n·H values (f, g the F and G products).
+extern "C" __global__ void ink_gate_mix(const float* __restrict__ x, const float* __restrict__ m,
+                                        const float* __restrict__ f, const float* __restrict__ g,
+                                        float* __restrict__ out, int total)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = (1.0f - tanhf(f[i])) * x[i] + tanhf(g[i]) * m[i];
+}
+
 // The head's logits capped: cap · tanh(x / cap). Grid (V/256, n).
 extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
 {
