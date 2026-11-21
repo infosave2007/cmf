@@ -1350,7 +1350,12 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     }
     let timed = std::env::var("CMF_INKLING_SPEC_TIME").is_ok();
     let t0 = std::time::Instant::now();
-    let drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    let mut drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    // `CMF_INKLING_SPEC_JUNK=1` (a check): drafts the model never keeps, so every
+    // round rolls all of them back — the text must stay plain decoding's
+    if std::env::var("CMF_INKLING_SPEC_JUNK").as_deref() == Ok("1") {
+        drafts.iter_mut().for_each(|d| *d = 1);
+    }
     if drafts.is_empty() || !crate::gpu::inkling_ring_snap(state.sequence_id) {
         return None;
     }
