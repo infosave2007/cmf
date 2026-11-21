@@ -922,16 +922,17 @@ fn calib_windows(ids: &[u32], window: usize, bos: Option<u32>) -> Vec<Vec<u32>> 
 }
 
 /// The layer prior of the production encode (`n0` pseudo-rows, 0 = none)
-/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1, when the
-/// mean expert is routed fewer calibration rows than its input width
-/// (`n_cal·top_k/ne < hidden`: most experts' own Hessians are rank
-/// deficient), one hidden width, the value measured best on Flash-Next.
+/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1 and
+/// Maxwell, when the mean expert is routed fewer calibration rows than its
+/// input width (`n_cal·top_k/ne < hidden`: most experts' own Hessians are
+/// rank deficient), one hidden width, the value measured best on Flash-Next.
 fn production_prior(family: Family, env: Option<f64>, n_cal: usize, top_k: usize, ne: usize, hidden: usize) -> (f64, String) {
     let mean = (n_cal * top_k) as f64 / ne.max(1) as f64;
+    let who = if family == Family::Maxwell { "Maxwell" } else { "V4.1" };
     match env {
         Some(v) => (v.max(0.0), format!("CMF_MOE_PRIOR={v}")),
         None if matches!(family, Family::Dsv41 | Family::Maxwell) && mean < hidden as f64 => {
-            (hidden as f64, format!("default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
+            (hidden as f64, format!("{who} default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
         }
         None => (0.0, format!("{mean:.0} routed rows per expert on average (CMF_MOE_PRIOR sets one)")),
     }
