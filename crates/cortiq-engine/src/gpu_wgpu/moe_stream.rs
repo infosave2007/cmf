@@ -27,6 +27,13 @@ pub(crate) fn forced() -> bool {
     std::env::var("CMF_WGPU_EXPERT_STREAM").as_deref() == Ok("1")
 }
 
+/// Without a RAM tier the misses' pages are faulted in on the fill threads
+/// before their copies (`CMF_WGPU_EXPERT_FAULT_IN=0`: the copies alone).
+fn fault_in_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_WGPU_EXPERT_FAULT_IN").as_deref() != Ok("0"))
+}
+
 /// `CMF_STREAM_STATS=1`: the stream's counters every 1024 layer calls.
 fn stats_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -53,13 +60,13 @@ fn fill_pool() -> &'static crate::pool::Pool {
 /// `MADV_WILLNEED` over experts' three tensors: the kernel's read-ahead
 /// scheduled, no wait (`CMF_WGPU_EXPERT_WILLNEED=0` off).
 pub(crate) fn will_need(model: &CmfModel, experts: impl IntoIterator<Item = (usize, usize, usize)>) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("CMF_WGPU_EXPERT_WILLNEED").as_deref() != Ok("0")) {
             return;
         }
-        let page = 4096usize;
+        let page = if cfg!(target_os = "macos") { 16384usize } else { 4096 };
         for (g, u, d) in experts {
             for idx in [g, u, d] {
                 let Some(entry) = model.tensors.get(idx) else { continue };
@@ -77,8 +84,49 @@ pub(crate) fn will_need(model: &CmfModel, experts: impl IntoIterator<Item = (usi
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let _ = (model, experts.into_iter().count());
+}
+
+/// Fault experts' pages in on `fill_pool`'s threads, a read a page: with no
+/// RAM tier the misses' copies come straight from the mapping, and one
+/// thread's page faults read a 1.6 MB Maxwell expert from the disk in 4 ms
+/// (an M4's shared memory, the file past what the page cache keeps).
+fn fault_in(model: &CmfModel, experts: &[(usize, usize, usize)]) {
+    const PAGE: usize = 16384;
+    let mut spans: Vec<&[u8]> = Vec::with_capacity(experts.len() * 3);
+    for &(g, u, d) in experts {
+        for idx in [g, u, d] {
+            if let Some(te) = model.tensors.get(idx) {
+                let b = model.entry_bytes(te);
+                if !b.is_empty() {
+                    spans.push(b);
+                }
+            }
+        }
+    }
+    if spans.is_empty() {
+        return;
+    }
+    // pages of every span in one list, split across the threads
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    for (i, b) in spans.iter().enumerate() {
+        let mut o = 0usize;
+        while o < b.len() {
+            pages.push((i, o));
+            o += PAGE;
+        }
+    }
+    let touch = |a: usize, z: usize| {
+        let mut acc = 0u8;
+        for &(i, o) in &pages[a..z] {
+            // SAFETY: an offset inside the span (o < len), a read of the
+            // model's read-only mapping
+            acc ^= unsafe { std::ptr::read_volatile(spans[i].as_ptr().add(o)) };
+        }
+        std::hint::black_box(acc);
+    };
+    fill_pool().run_rows(pages.len(), &touch);
 }
 
 /// One pool of card slots: gate, up and down planes of `n` experts.
@@ -122,9 +170,38 @@ pub(crate) struct Stream {
     pub loads: u64,
     pub fills: u64,
     pub load_ns: u64,
+    /// The token graph's waits for the picks (the submission's GPU work and
+    /// the round trip), `CMF_STREAM_STATS=1`.
+    pub wait_ns: u64,
+    pub waits: u64,
+    /// `CMF_STREAM_STATS=2`: empty submissions' round trips.
+    pub rt_ns: u64,
+    /// Host time from the picks' arrival to the next streamed submission
+    /// (the GPU idles through it), and when the picks last arrived.
+    pub gap_ns: u64,
+    pub resumed: Option<std::time::Instant>,
+    /// The finish and submit of a streamed submission (host time).
+    pub sub_ns: u64,
 }
 
 impl Stream {
+    fn print_stats(&self) {
+        eprintln!(
+            "wgpu expert stream: {} picks, {} loaded ({:.1}% hits), {} RAM tier fills ({} slots), {:.2} ms a load, {:.3} ms a wait for the picks ({} waits), {:.3} ms an empty round trip, {:.3} ms a gap to the next submission, {:.3} ms its finish and submit",
+            self.picks,
+            self.loads,
+            100.0 * (1.0 - self.loads as f64 / self.picks.max(1) as f64),
+            self.fills,
+            self.tier_slots(),
+            self.load_ns as f64 / 1e6 / self.loads.max(1) as f64,
+            self.wait_ns as f64 / 1e6 / self.waits.max(1) as f64,
+            self.waits,
+            self.rt_ns as f64 / 1e6 / self.waits.max(1) as f64,
+            self.gap_ns as f64 / 1e6 / self.waits.max(1) as f64,
+            self.sub_ns as f64 / 1e6 / self.waits.max(1) as f64
+        );
+    }
+
     /// Expert `e` of layer `lk` in the RAM tier: its slot there (copied from
     /// the mapping when absent). None: no tier, or every slot is held this tick.
     fn tier_get(&mut self, model: &CmfModel, lk: usize, e: usize, ids: (usize, usize, usize)) -> Option<usize> {
@@ -279,17 +356,24 @@ impl Stream {
             }
         }
         self.picks += picks.len() as u64;
+        if stats_on() && self.tick % 1024 == 0 {
+            self.print_stats();
+        }
         if miss.is_empty() {
             return Some(out);
         }
         let t0 = std::time::Instant::now();
         crate::gpu_wgpu::flush_pass(&*enc);
         // the misses into the RAM tier together first (the copies below then
-        // find them there)
-        if miss.len() > 1 {
+        // find them there); without one, their pages faulted in together
+        if miss.len() > 1 && self.tier.is_some() {
             let want: Vec<(usize, (usize, usize, usize))> =
                 miss.iter().filter_map(|&i| experts.get(picks[i] as usize).map(|&ids| (picks[i] as usize, ids))).collect();
             self.tier_fill(model, lk, &want);
+        } else if self.tier.is_none() && fault_in_on() {
+            let want: Vec<(usize, usize, usize)> = miss.iter().filter_map(|&i| experts.get(picks[i] as usize).copied()).collect();
+            will_need(model, want.iter().copied());
+            fault_in(model, &want);
         }
         for i in miss {
             let e = picks[i] as usize;
@@ -315,17 +399,6 @@ impl Stream {
             out[i] = s as u32;
         }
         self.load_ns += t0.elapsed().as_nanos() as u64;
-        if stats_on() && self.tick % 1024 == 0 {
-            eprintln!(
-                "wgpu expert stream: {} picks, {} loaded ({:.1}% hits), {} RAM tier fills ({} slots), {:.2} ms a load",
-                self.picks,
-                self.loads,
-                100.0 * (1.0 - self.loads as f64 / self.picks.max(1) as f64),
-                self.fills,
-                self.tier_slots(),
-                self.load_ns as f64 / 1e6 / self.loads.max(1) as f64
-            );
-        }
         Some(out)
     }
 
@@ -494,8 +567,9 @@ pub(crate) fn stream(c: &Ctx, uid: u64, gu_len: usize, d_len: usize, bytes: u64)
         return None;
     }
     c.resident.fetch_add(total as u64 * per, std::sync::atomic::Ordering::Relaxed);
-    // the RAM tier: half the host's room, in buffers within the size limit
-    let tier = (std::env::var("CMF_WGPU_EXPERT_TIER").as_deref() != Ok("0")).then(|| {
+    // the RAM tier: half the host's room, in buffers within the size limit;
+    // none on shared memory (the GPU's memory is the host's: a second copy)
+    let tier = (c.discrete && std::env::var("CMF_WGPU_EXPERT_TIER").as_deref() != Ok("0")).then(|| {
         let slot = (per as usize).next_multiple_of(256);
         let per_buf = (c.device.limits().max_buffer_size / slot as u64) as usize;
         let want = (host_room_bytes() / 2) as usize / slot;
@@ -538,6 +612,12 @@ pub(crate) fn stream(c: &Ctx, uid: u64, gu_len: usize, d_len: usize, bytes: u64)
         loads: 0,
         fills: 0,
         load_ns: 0,
+        wait_ns: 0,
+        waits: 0,
+        rt_ns: 0,
+        gap_ns: 0,
+        resumed: None,
+        sub_ns: 0,
     }));
     streams().lock().unwrap().insert(uid, s.clone());
     Some(s)

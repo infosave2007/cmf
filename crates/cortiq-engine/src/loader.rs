@@ -1878,6 +1878,7 @@ impl Pipeline {
             || arch.qwen4_exp.is_some()
             || arch.glm5_next.is_some()
             || arch.arch_name == crate::hy4::ARCH_NAME
+            || arch.arch_name == crate::maxwell::ARCH_NAME
             || arch.arch_name == crate::inkling::ARCH_NAME;
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
@@ -2383,6 +2384,10 @@ impl Pipeline {
         if arch.arch_name == crate::hy4::ARCH_NAME {
             let (globals, layers, cfg, state) = crate::hy4::load(model, &arch)?;
             pipeline.hy4 = Some(Box::new((globals, layers, cfg, state)));
+        }
+        if arch.arch_name == crate::maxwell::ARCH_NAME {
+            let (globals, layers, cfg, state) = crate::maxwell::load(model, &arch)?;
+            pipeline.maxwell = Some(Box::new((globals, layers, cfg, state)));
         }
         if arch.arch_name == crate::inkling::ARCH_NAME {
             let (globals, layers, cfg, state) = crate::inkling::load(model, &arch)?;

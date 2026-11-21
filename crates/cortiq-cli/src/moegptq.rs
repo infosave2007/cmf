@@ -198,6 +198,11 @@ enum Family {
     /// trunk's own FFN slots, captured on the batched device graph; the
     /// source layout is Flash-Next's (`mlp.experts.gate_up_proj` / `down_proj`).
     Qwen35,
+    /// Maxwell-V1-Flash (`maxwell_moe`): its routed layers (the first three
+    /// are dense and have no experts), captured on the CUDA prompt path
+    /// (`Pipeline::maxwell_moe_capture`); the source keeps an expert as
+    /// `block_sparse_moe.experts.E.{w1,w3,w2}` (gate, up, down).
+    Maxwell,
 }
 
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
@@ -277,6 +282,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let p = pipe.as_ref().expect("pipeline");
     let family = if p.dsv41.is_some() {
         Family::Dsv41
+    } else if p.maxwell.is_some() {
+        Family::Maxwell
     } else if p.qwen4_expert_dirs(0).is_some() {
         Family::Qwen4
     } else if (0..nl).all(|li| p.moe_expert_dirs(li).is_some()) {
@@ -308,6 +315,21 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             let top_k = arch.moe.as_ref().map(|m| m.top_k).ok_or_else(|| anyhow::anyhow!("no MoE config in the header"))?;
             (top_k, 0.0f32, 0usize)
         }
+        Family::Maxwell => {
+            let moe = arch.moe.as_ref().ok_or_else(|| anyhow::anyhow!("no MoE config in the header"))?;
+            for li in 0..nl {
+                // a dense layer: no experts
+                if cmodel.tensor_index(&format!("model.layers.{li}.mlp.gate.weight")).is_none() {
+                    layer_dirs.push(Vec::new());
+                    shared_dirs.push(None);
+                    continue;
+                }
+                let (d, s) = dsv41_dirs(&cmodel, li, moe.num_experts)?;
+                layer_dirs.push(d);
+                shared_dirs.push(Some(s));
+            }
+            (moe.top_k, 0.0f32, 0usize)
+        }
         Family::Dsv41 => {
             let cfg = &p.dsv41.as_ref().expect("dsv41").2;
             anyhow::ensure!(cfg.dim == hidden, "deepseek_v41: runtime dim {} vs header hidden {hidden}", cfg.dim);
@@ -319,9 +341,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             dsv41_settings(cfg, arch.deepseek_v41.as_ref())
         }
     };
-    let ne = layer_dirs[0].len();
+    // the first layer with experts (Maxwell's first layers are dense)
+    let first_moe = layer_dirs.iter().position(|d| !d.is_empty()).unwrap_or(0);
+    let ne = layer_dirs[first_moe].len();
     anyhow::ensure!(ne > 0 && ne <= u16::MAX as usize && top_k > 0 && top_k <= ne, "{ne} experts, top-{top_k}: unsupported");
-    let inter = cmodel.tensors[layer_dirs[0][0].0].shape[0];
+    anyhow::ensure!(layer_dirs[first_moe..].iter().all(|d| d.len() == ne), "layers past {first_moe} without their {ne} experts");
+    let inter = cmodel.tensors[layer_dirs[first_moe][0].0].shape[0];
     let inter_s = shared_dirs.iter().flatten().map(|&(g, _, _)| cmodel.tensors[g].shape[0]).max().unwrap_or(0);
     anyhow::ensure!(
         hidden % 32 == 0 && inter % 32 == 0 && inter_s % 32 == 0,
@@ -347,7 +372,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     // starts with BOS as every request does (not mid-text at position 0)
     let bos = match family {
         Family::Dsv41 => Some(p.tokenizer.bos_token_id.unwrap_or(0)),
-        Family::Qwen4 | Family::Qwen35 => None,
+        Family::Qwen4 | Family::Qwen35 | Family::Maxwell => None,
     };
     let mut windows: Vec<Vec<u32>> = Vec::new();
     for (src, &n) in srcs.iter().zip(&budgets) {
@@ -376,8 +401,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let (range_lo, range_hi) = std::env::var("CMF_MOE_RANGE")
         .ok()
         .and_then(|v| v.split_once("..").and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))))
-        .unwrap_or((0, nl));
-    let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
+        .unwrap_or((first_moe, nl));
+    let (range_lo, range_hi) = (range_lo.max(first_moe).min(nl), range_hi.min(nl));
     anyhow::ensure!(range_lo < range_hi, "CMF_MOE_RANGE {range_lo}..{range_hi} is empty");
     if capture_only {
         anyhow::ensure!(std::env::var_os("CMF_MOE_CAPTURE_DIR").is_some(), "CMF_MOE_CAPTURE_ONLY=1 needs CMF_MOE_CAPTURE_DIR");
@@ -385,7 +410,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         eprintln!("CMF_MOE_CAPTURE_ONLY=1: layers {range_lo}..{range_hi} are captured in one forward and saved; nothing is encoded or written");
     }
     anyhow::ensure!(
-        capture_only || diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
+        capture_only || diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (first_moe, nl),
         "CMF_MOE_RANGE {range_lo}..{range_hi} with --output would leave the other layers' experts out of the file \
          (use it with --in-place, --patch-shared or CMF_MOE_DIAG)"
     );
@@ -429,6 +454,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 }
             }
             Family::Dsv41 => names = dsv41_src_names(&source, li, ne, patch.is_none()),
+            Family::Maxwell => names = maxwell_src_names(li, ne, patch.is_none()),
         }
         source.shards_of(&names)
     };
@@ -594,6 +620,13 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                                 qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
                             }
                         }
+                        Family::Maxwell => {
+                            let cap = p.maxwell_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, (x, pk)) in cap.x.into_iter().zip(cap.picks).enumerate() {
+                                rows[k].x.extend(x);
+                                rows[k].picks.extend(pk);
+                            }
+                        }
                         Family::Dsv41 => {
                             let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
                             for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
@@ -676,6 +709,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 match family {
                     Family::Qwen4 | Family::Qwen35 => qwen4_expert(&source, &src, li, part, e, hidden, inter, inter_s),
                     Family::Dsv41 => dsv41_expert(&src, li, part, e, hidden, if matches!(part, Part::Shared) { inter_s } else { inter }, fp8_block),
+                    Family::Maxwell => maxwell_expert(&src, li, part, e, hidden, if matches!(part, Part::Shared) { inter_s } else { inter }),
                 }
             };
             let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s, held: &held, route_w };
@@ -888,16 +922,17 @@ fn calib_windows(ids: &[u32], window: usize, bos: Option<u32>) -> Vec<Vec<u32>> 
 }
 
 /// The layer prior of the production encode (`n0` pseudo-rows, 0 = none)
-/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1, when the
-/// mean expert is routed fewer calibration rows than its input width
-/// (`n_cal·top_k/ne < hidden`: most experts' own Hessians are rank
-/// deficient), one hidden width, the value measured best on Flash-Next.
+/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1 and
+/// Maxwell, when the mean expert is routed fewer calibration rows than its
+/// input width (`n_cal·top_k/ne < hidden`: most experts' own Hessians are
+/// rank deficient), one hidden width, the value measured best on Flash-Next.
 fn production_prior(family: Family, env: Option<f64>, n_cal: usize, top_k: usize, ne: usize, hidden: usize) -> (f64, String) {
     let mean = (n_cal * top_k) as f64 / ne.max(1) as f64;
+    let who = if family == Family::Maxwell { "Maxwell" } else { "V4.1" };
     match env {
         Some(v) => (v.max(0.0), format!("CMF_MOE_PRIOR={v}")),
-        None if family == Family::Dsv41 && mean < hidden as f64 => {
-            (hidden as f64, format!("V4.1 default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
+        None if matches!(family, Family::Dsv41 | Family::Maxwell) && mean < hidden as f64 => {
+            (hidden as f64, format!("{who} default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
         }
         None => (0.0, format!("{mean:.0} routed rows per expert on average (CMF_MOE_PRIOR sets one)")),
     }
@@ -1352,6 +1387,34 @@ fn dsv41_src_names(source: &Source, li: usize, ne: usize, routed: bool) -> Vec<S
         }
     }
     names
+}
+
+/// The source tensors of a Maxwell layer's experts (`routed`: the routed
+/// ones too, not only the shared expert).
+fn maxwell_src_names(li: usize, ne: usize, routed: bool) -> Vec<String> {
+    let s = format!("model.layers.{li}.block_sparse_moe");
+    let mut names = Vec::with_capacity(ne * 3 + 3);
+    if routed {
+        for e in 0..ne {
+            names.extend(["w1", "w2", "w3"].map(|w| format!("{s}.experts.{e}.{w}.weight")));
+        }
+    }
+    names.extend(["w1", "w2", "w3"].map(|w| format!("{s}.shared_expert.{w}.weight")));
+    names
+}
+
+/// Maxwell expert `e` (or the shared expert) of layer `li` from its source
+/// shard: `w1` gate, `w3` up, `w2` down (bf16).
+fn maxwell_expert(src: &LayerSrc, li: usize, part: Part, e: usize, hidden: usize, inter: usize) -> anyhow::Result<ExpertW> {
+    let stem = match part {
+        Part::Routed => format!("model.layers.{li}.block_sparse_moe.experts.{e}"),
+        Part::Shared => format!("model.layers.{li}.block_sparse_moe.shared_expert"),
+    };
+    Ok(ExpertW {
+        g: src.dsv41_matrix(&format!("{stem}.w1"), inter, hidden, 1)?,
+        u: src.dsv41_matrix(&format!("{stem}.w3"), inter, hidden, 1)?,
+        d: src.dsv41_matrix(&format!("{stem}.w2"), hidden, inter, 1)?,
+    })
 }
 
 /// Which expert of a layer.
