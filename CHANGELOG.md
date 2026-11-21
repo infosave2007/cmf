@@ -27,9 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.38 / 5.97 / 32.0 s.
 - wgpu, Inkling decode: the routed experts four rows a workgroup (`ink_moe_gu4` / `ink_moe_dn4`), the block mixes and
   message gates through one reduction tree, the router and small f32 matvecs on vec4 loads. Vulkan on an L4:
-  19.0 → 35.9 tok/s (after a 2 048-token prompt 16.6 → 27.9), the experts 28.8 → 8.1 ms a token. A prompt's 4-bit
-  dense matrices on the cooperative-matrix GEMM where the device has one (`CMF_INKLING_COOP`; the grouped-expert coop
-  kernel is opt-in, not right yet). `CMF_INKLING_PROF=1` times each kernel by GPU timestamps.
+  19.0 → 35.7 tok/s (after a 2 048-token prompt 16.6 → 27.9), the experts 28.8 → 8.1 ms a token. A prompt's 4-bit
+  dense matrices and its routed experts (grouped by expert, `ink_moe_coop`) on the cooperative-matrix units where the
+  device has them (`CMF_INKLING_COOP=0|dense|moe`): a 2 048 / 8 192 / 16 384-token prompt 18.1 / 82.5 / 189 s →
+  12.9 / 60.7 / 149 s, perplexity 9.237 / 7.576 (CUDA 9.239 / 7.580). `CMF_INKLING_PROF=1` times each kernel by GPU
+  timestamps.
 - Metal, Inkling prompt: message gates as three f32 GEMMs on the simdgroup matrices. M4, a 2 048 / 8 192-token prompt
   18.3 / 83.9 → 15.3 / 74.2 s.
 
