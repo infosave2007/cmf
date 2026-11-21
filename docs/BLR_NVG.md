@@ -186,8 +186,8 @@ Stage for stage the CPU encoder; what changes is where and how each stage runs.
   block of threads on one multiprocessor, about a microsecond a flip whatever the rank, with
   the rest of the card idle. A flip is one pass over r floats (the update `ks −= 2s·K[row]`,
   every candidate's gain `(−4g²s)·(ks − kd·s) + (4gs)·bv`, the minimum of each 16
-  candidates) in vector registers, about 0.3 µs at r = 776, and every tensor and candidate in
-  flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
+  candidates) in vector registers, 0.27 µs at r = 776 and 0.54 µs at r = 2152 with the
+  transfers, and every tensor and candidate in flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
   come down in two reads, its signs and error rows go back in two writes. The gain is written
   as the device kernel writes it — the difference first, the last product and sum fused: the
   two terms cancel near the stop test, and a gain summed from them loses the digits the test
@@ -529,12 +529,18 @@ Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
 | trainer on one file: held-out KL before | 3.47721 | 3.47725 |
 | loss of steps 1, 7, 10 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0533, 2.9170 |
 | signs flipped by step 11 | 296 527 | 295 157 |
-| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44555 |
+| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44404 |
 | signs flipped in the run | 0.901 % | 0.896 % |
 | Qwen3.8-27B at 0.55 bpw, the trainer on one file: held-out KL before | 1.53820 | 1.53821 |
 | loss of steps 1, 6, 11, 12 | 1.4572, 1.3403, 1.5225, 1.6106 | 1.4572, 1.3403, 1.5225, 1.6106 |
 | signs flipped by step 11 | 4 259 313 | 4 259 718 |
-| the 27B's encoder, held-out error of layer 3: down / gate / up / q / o / k / v | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0830 / 0.3558 / 0.5083 | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0829 / 0.3560 / 0.5083 |
+| the 27B's encoder on one capture of layer 3's Grams, held-out error: down / gate / up / q / o / k / v | 0.6899 / 0.5240 / 0.5979 / 0.0825 / 0.0832 / 0.3558 / 0.5079 | 0.6893 / 0.5241 / 0.5978 / 0.0825 / 0.0830 / 0.3560 / 0.5083 |
+
+The 0.8B encoder rows and the step-11 flips were taken with the search in the device's kernel on both backends and
+with the per-position GDN reverse sweep; the 27B encoder row is with the flips on the host (§4.1), which the two
+backends share. With the device's kernels on CUDA the same capture gives 0.6891 / 0.5239 / 0.5979 / 0.0825 / 0.0829
+/ 0.3561 / 0.5083. (An earlier version of this table gave layer 3's MLP tensors the errors of an encode on layer
+0's Grams: `nvg-bench` read a cache prefix shared by the two layers. It now refuses such a prefix.)
 
 A conversion repeated on CUDA gives the same bytes, and the training after it the same curve to the last printed
 digit. A training stopped at a saved state and resumed gives the losses and the held-out KL of an uninterrupted
@@ -574,8 +580,8 @@ reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `
 | encode of a layer (three tensors in flight) | 16.6–18.0 s | 1.5–1.7 s |
 | whole conversion, 24 layers | 492 s | 64 s |
 | teacher top-64 pass | 42.7k tok/s | 55.5k tok/s |
-| training step, 4096 tokens | 0.69 s | 0.31 s |
-| the reference training, whole run | 227 s | 102 s |
+| training step, 4096 tokens | 0.69 s | 0.28 s |
+| the reference training, whole run | 227 s | 97 s |
 
 Inside the encoder, layer 0 with one tensor in flight (seconds; `CMF_NVG_PROF=1`):
 
@@ -603,31 +609,48 @@ with and without them); the host's flips give another file of the same quality (
 (`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
 
 Qwen3.8-27B at 0.55 bpw. The trainer: the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and
-signs. The encoder: one layer from the q8_2f weights, one tensor in flight, 32 768 + 4 096 calibration tokens.
+signs. The encoder: one layer from the q8_2f weights, 32 768 + 4 096 calibration tokens, each layer's Grams
+captured once (on CUDA) and read by both backends.
 
 | stage | wgpu | CUDA |
 |---|---:|---:|
-| teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
-| training step, 4096 tokens | 5.48 s | 3.57 s |
-| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
-| card memory while training | 90.8 GB | 86.5 GB |
-| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.9 s / 8.1 s |
-| input contexts of a layer | 2.5–3.4 s | 1.0–1.2 s |
-| encode of layer 0 (GDN, 6 tensors) | 149.3 s | 104.9 s |
-| encode of layer 3 (attention, 7 tensors) | 148.9 s | 102.4 s |
-| of it `down_proj` 5120×17408: whole / input-side search / g solves | 70.9 / 45.3 / 15.6 s | 58.1 / 44.4 / 8.9 s |
-| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 19.4, 14.6, 5.2 s | 11.6, 7.7, 2.3 s |
+| teacher top-64 pass | 2.7k tok/s | 5.0k tok/s |
+| training step, 4096 tokens | 5.48 s | 2.97 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 16.2 min |
+| card memory while training | 90.8 GB | 87.9 GB |
+| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.6 s / 8.1 s |
+| input contexts of a layer | 2.9–5.2 s | 1.3 s |
+| encode of layer 0 (GDN, 6 tensors): one tensor in flight / three | 106.6 s | 40.4 s / 29.8 s |
+| encode of layer 3 (attention, 7 tensors): one tensor in flight / three | 103.0 s | 38.2 s / 28.2 s |
+| of it `down_proj` 5120×17408: whole / input-side search / g solves | 42.2 / 16.6 / 15.2 s | 17.3 / 16.7 / 10.1 s |
+| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 14.7, 12.7, 4.1 s | 5.6, 4.5, 0.8 s |
 
-A training run of 10.5 M tokens of the 27B (2559 steps with their teacher pass, states saved to a RAM disk)
-took 3 h 55 min on CUDA, at 3.56 s a step.
+(CUDA's search and solve times of `down_proj` are summed over its two candidates' threads, which overlap; the
+tensor takes 17.3 s.)
 
-A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step; the six products of a path run at
-280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput`), the GDN recurrence 28 % (its f16 state
-history is 6.4 GB a layer, written and read once), the sign update's passes over the latents 9 %, the remaining
-stagings and plane expansions 8 %, SwiGLU 4 %. Before the scales rode the planes and the recurrence ran in
-512-thread blocks the same step took 4.50 s (the elementwise passes over activations alone 40 % of it), and the
-0.8B's 0.54 s. In the 27B's encoder the input-side search of `down_proj` (33–36 M flips at 1.25 µs) is 42 % of a
-layer on CUDA and the next thing to parallelise.
+What this pass changed, the same stand and the same Grams:
+
+| | before | now |
+|---|---:|---:|
+| encode of layer 3 on CUDA, one tensor in flight | 90.1 s (one stream, the search in the device's kernel) | 38.2 s |
+| three / four tensors in flight | no faster than one | 28.2 s / 29.5 s |
+| encode of layer 0 on CUDA, one / three in flight | 96.5 s | 40.4 s / 29.8 s |
+| `down_proj`'s input-side search, 31 M flips | 37.8 s (1.22 µs a flip) | 16.7 s over two threads (0.54 µs) |
+| encode of a layer on wgpu | 148.9–149.3 s | 103.0–106.6 s |
+| training step on CUDA | 3.57 s | 2.97 s (3.29 s with the per-position GDN reverse sweep) |
+
+A training run of 10.5 M tokens of the 27B (2559 steps, their teacher pass, a held-out evaluation every 32 steps
+and the saved states) took 3 h 55 min at 3.56 s a step; the next one ran at 3.3–3.4 s a step on an intermediate
+build, beside other jobs on the card.
+
+A CUDA step of the 27B (2.97 s; `CMF_NVG_KT`): the f16 GEMMs 1.42 s, 48 % (about 4.3·10¹⁴ flop a step; the six
+products of a path run at 280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput` — cuBLAS's rate on
+this card), the GDN recurrence 0.50 s, 17 % (the forward kernel 0.21 s, the reverse sweep's batched products 0.13 s
+and its kernels 0.16 s), the sign update's passes over the latents 0.22 s, 7 %, the remaining stagings and plane
+expansions 0.23 s, 8 %, SwiGLU 0.11 s, 4 %. The step before this pass, 3.57 s: GEMMs 1.53 s (the recompute's x·S_V
+among them), the recurrence 0.94 s (reverse 0.57, forward 0.37), stagings 0.19 s, SwiGLU 0.14 s. And before the
+scales rode the planes and the recurrence ran in 512-thread blocks, 4.50 s (the elementwise passes over activations
+alone 40 % of it), the 0.8B's 0.54 s. What is left is cuBLAS at its rate and passes that run at the memory bus.
 
 ### 8.6 SFq's two ideas at the NVG start
 
@@ -682,3 +705,70 @@ So SFq's channel scale helps a file that will not be trained (`--blr-channel-sca
 calibration rows (`--blr-rho 0.1 --blr-fit-tokens 59392 --blr-sel-tokens 12288`; on CUDA the rows cost nothing:
 the conversion takes the same 3–4 minutes) trims the training by about a fifth for the same KL, or leaves the
 trained file 2 % better. The defaults are unchanged, and none of this was repeated on the 27B.
+
+#### At 0.55 bits, and what SFq is inside NVG
+
+SFq was built for q2tp, and its two steps answer q2tp's two losses: a 2-bit code has one step per group of 32
+input channels, so a group's small channels vanish (the channel scale, folded into the norm in front, evens the
+group out); and GPTQ settles each code once, left to right (the refinement moves single codes afterwards, best
+first, by their exact change of `r·H_f·rᵀ` under `H_f = H + 0.3·mean(diag H)·I`). Neither loss has the same form
+in NVG:
+
+* *The scale.* An input scale `t` is absorbed exactly by g (an output scale by h): the family of NVG tensors is the
+  same in either basis, and the H-weighted error is basis-invariant. There is no group step to even out, and the
+  per-tensor errors do not move (a tensor's mean held-out error 0.24519 unscaled, 0.24525 at α 0.75). What the
+  scale does change is the encoder's path — the ITQ weights of the init, the input-side search's column order, and
+  the damping: `ρ·mean(diag H')·I` in the scaled basis is, in the original one, a ridge of its own per input,
+  `ρ·mean_k(t_k²·H_kk) / t_j²`. At α 1.0 (`t_j ∝ σ_j`, the column norm) that ridge weighs each input column's error
+  relative to the column's own size.
+* *The refinement.* NVG's output-side flips (`flip_u`) are exact per row already — the counterpart of SFq's
+  refinement, whose rows are independent too. The input-side signs were settled by a GPTQ-style column search,
+  each column against the feedback of the columns before it. `CMF_NVG_CD=passes` adds the missing step: exact
+  coordinate descent over the columns of `diag(g)·S_V` (`cd_v_d`), each column solved by the search's own column
+  solver against the exact residual of every other column and path, its change sent to all of them — the error
+  never rises. `CMF_NVG_CD_RIDGE` gives it SFq's ridge.
+
+Qwen3.5-0.8B at 0.55 bpw, all on CUDA, untrained: WikiText-2 / C4 perplexity (16 × 512) and the held-out KL to
+the teacher before any step; then the reference training (1 M tokens, seed 42):
+
+| variant | ppl wiki / C4 | KL, untrained | KL after training |
+|---|---:|---:|---:|
+| NVG as it is | 1770 / 2150 | 4.324 | 2.028 |
+| SFq's scale, α 0.5 / 0.75 / 1.0 | 1579 / 1888, 1528 / 1695, 1619 / 1756 | 4.278, **4.166**, 4.253 | 2.042, 1.986, 1.976 |
+| α 0.75, the damping of the original basis (`CMF_NVG_CS_DAMP=orig`) | 1861 / 2301 | 4.449 | 2.030 |
+| no change of basis, only the per-input ridge (`CMF_NVG_CS_DAMP=only`), α 0.75 / 1.0 | 1475 / 1874, 1449 / 1697 | 4.242, **4.187** | 1.995, 1.985 |
+| the per-input ridge at α 1.0, ρ 0.015 / 0.06 / 0.12 | 1631 / 2037, 1849 / 2120, 1971 / 2156 | 4.289, 4.398, 4.435 | 2.035, 1.987, 1.984 |
+| the exact refinement (`CMF_NVG_CD=1`) | 1730 / 2204 | 4.377 | 2.014 |
+| the exact refinement with SFq's ridge 0.3 | 1667 / 2198 | 4.348 | 1.991 |
+| α 0.75 scale + the exact refinement | 1433 / 1757 | 4.167 | 1.977 |
+| four times the calibration rows; with ρ 0.1; with ρ 0.1 and α 1.0 | 1783 / 2553, 2233 / 3347, 1873 / 2450 | 4.477, 4.733, 4.477 | 1.997, 2.027, 1.996 |
+
+* The scale lowers the untrained KL by 3.7 % at α 0.75 (perplexity −14 % / −21 %), and its gain lives in its
+  damping: with the original basis's damping the scaled encoder is worse than the unscaled one, and the per-input
+  ridge alone, with no change of basis, gives −3.2 % at α 1.0 (perplexity −18 % / −21 %). Its strength is the
+  encoder's own ρ: at half of it the gain is −0.8 %, at twice or four times the file is worse than the unchanged one.
+* The exact refinement lowers a tensor's damped error by 0.4 % and raises its held-out error by about as much: the
+  untrained model moves by no more than the spread of the neutral variants (±1 %), with SFq's ridge too. After
+  training it is 0.5–2 % lower.
+* The gentler fit that helps after training at 1.0 bpw (four times the rows, a ridge of 0.1) makes the untrained
+  0.55-bit file worse.
+* After the training every variant ends within 2.5 % of the others: the untrained gain is not a head start the
+  training keeps.
+
+Qwen3.8-27B at 0.55 bpw, each file converted whole on CUDA from the bf16 checkpoint with the published file's
+recipe (32 768 fit + 4 096 selection tokens; 72–88 minutes beside other jobs on the card), untrained: the held-out
+KL to the q8_2f teacher before the trainer's first step (16 windows of 512) and the perplexity of the dense
+expansion on WikiText-2 test (12 × 512) and C4 validation (16 × 512):
+
+| variant | KL, untrained | ppl wiki / C4 |
+|---|---:|---:|
+| NVG as it is | 3.463 | 152.1 / 418.1 |
+| SFq's scale, α 0.75 | 3.427 (−1.1 %) | 146.8 / 404.2 (−3.5 % / −3.3 %) |
+| the per-input ridge alone, α 1.0 | 3.451 (−0.4 %) | 150.1 / 412.5 (−1.3 % / −1.3 %) |
+
+On the 27B the scale helps the untrained file by a third of what it does on the 0.8B, and the ridge alone by less.
+(These files encode all 400 projections — 0.5617 bpw over the layers' 24.35 G weights, 4.698 GB; the encoder of
+18.10 kept a few at q8_2f, 0.6259 bpw, 4.893 GB.)
+
+The defaults are unchanged. For a file that will not be trained, `--blr-channel-scale 0.75` is the better start at
+0.55 bpw too; for one that will be, the choice is inside the training's own spread.
