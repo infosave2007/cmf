@@ -1385,27 +1385,68 @@ fn prof() -> bool {
 static PROF: Mutex<Option<HashMap<(bool, &'static str), (f64, u64)>>> = Mutex::new(None);
 static PROF_CALLS: Mutex<[u64; 2]> = Mutex::new([0; 2]);
 
-/// `CMF_INKLING_PROF=1`: a call's steps one submission each, the host waiting
-/// for every one (so the times are the device's, plus a submission's cost);
-/// every 32 calls of a kind the table by kernel in ms a call.
+/// `CMF_INKLING_PROF=1`: a call's steps each in a compute pass of its own
+/// with GPU timestamps at its ends, all in one submission (the times are the
+/// device's own, without a submission per step). Every 32 calls of a kind:
+/// the table by kernel in ms a call and their sum — against a plain run's ms
+/// a token, the difference is what the dispatches and the barriers between
+/// them cost. Without timestamp queries a submission a step, the host timing
+/// it.
 fn profile(c: &Ctx, plan: &[Step], n: usize) {
     let multi = n > 1;
-    for st in plan {
-        let t = std::time::Instant::now();
-        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inkling-prof") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("inkling"), timestamp_writes: None });
-            pass.set_pipeline(&st.pipe);
-            pass.set_bind_group(0, &st.bg, &[]);
-            pass.dispatch_workgroups(st.x, st.y, st.z);
+    let ts = c.device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    if ts {
+        const CHUNK: usize = 2000;
+        let period = c.queue.get_timestamp_period() as f64;
+        for part in plan.chunks(CHUNK) {
+            let cnt = (part.len() * 2) as u32;
+            let qs = c.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("inkling-prof"), ty: wgpu::QueryType::Timestamp, count: cnt });
+            let size = cnt as u64 * 8;
+            let rb = c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-prof"), size, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            let mb = c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-prof-map"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inkling-prof") });
+            for (i, st) in part.iter().enumerate() {
+                let tw = wgpu::ComputePassTimestampWrites { query_set: &qs, beginning_of_pass_write_index: Some(2 * i as u32), end_of_pass_write_index: Some(2 * i as u32 + 1) };
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("inkling"), timestamp_writes: Some(tw) });
+                pass.set_pipeline(&st.pipe);
+                pass.set_bind_group(0, &st.bg, &[]);
+                pass.dispatch_workgroups(st.x, st.y, st.z);
+            }
+            enc.resolve_query_set(&qs, 0..cnt, &rb, 0);
+            enc.copy_buffer_to_buffer(&rb, 0, &mb, 0, size);
+            c.queue.submit(Some(enc.finish()));
+            let slice = mb.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let raw: Vec<u64> = slice.get_mapped_range().chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect();
+            mb.unmap();
+            let mut g = PROF.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            for (i, st) in part.iter().enumerate() {
+                let ms = raw[2 * i + 1].saturating_sub(raw[2 * i]) as f64 * period / 1e6;
+                let e = m.entry((multi, st.name)).or_insert((0.0, 0));
+                e.0 += ms;
+                e.1 += 1;
+            }
         }
-        c.queue.submit(Some(enc.finish()));
-        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        let mut g = PROF.lock().unwrap();
-        let e = g.get_or_insert_with(HashMap::new).entry((multi, st.name)).or_insert((0.0, 0));
-        e.0 += ms;
-        e.1 += 1;
+    } else {
+        for st in plan {
+            let t = std::time::Instant::now();
+            let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inkling-prof") });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("inkling"), timestamp_writes: None });
+                pass.set_pipeline(&st.pipe);
+                pass.set_bind_group(0, &st.bg, &[]);
+                pass.dispatch_workgroups(st.x, st.y, st.z);
+            }
+            c.queue.submit(Some(enc.finish()));
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let mut g = PROF.lock().unwrap();
+            let e = g.get_or_insert_with(HashMap::new).entry((multi, st.name)).or_insert((0.0, 0));
+            e.0 += ms;
+            e.1 += 1;
+        }
     }
     let calls = {
         let mut k = PROF_CALLS.lock().unwrap();
@@ -1417,8 +1458,13 @@ fn profile(c: &Ctx, plan: &[Step], n: usize) {
         let mut rows: Vec<(&str, f64, u64)> = g.as_ref().map_or(Vec::new(), |m| m.iter().filter(|((mm, _), _)| *mm == multi).map(|((_, k), (ms, cnt))| (*k, *ms / calls as f64, *cnt / calls)).collect());
         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         let tot: f64 = rows.iter().map(|r| r.1).sum();
+        let steps: u64 = rows.iter().map(|r| r.2).sum();
         let line: Vec<String> = rows.iter().map(|(k, ms, cnt)| format!("{k} {ms:.2} ({cnt})")).collect();
-        tracing::info!("inkling2_loop wgpu ms a {} call ({calls} calls, {tot:.1} ms): {}", if multi { "prompt" } else { "decode" }, line.join(", "));
+        tracing::info!(
+            "inkling2_loop wgpu ms a {} call ({calls} calls, {steps} dispatches, kernels {tot:.1} ms): {}",
+            if multi { "prompt" } else { "decode" },
+            line.join(", ")
+        );
     }
 }
 
