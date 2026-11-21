@@ -1144,7 +1144,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
 fn coop_pipe(c: &Ctx) -> Option<&'static wgpu::ComputePipeline> {
     static P: OnceLock<Option<wgpu::ComputePipeline>> = OnceLock::new();
     P.get_or_init(|| {
-        if !coop_on() || c.q4tp_mm_coop.is_none() {
+        if !coop_mode().1 || c.q4tp_mm_coop.is_none() {
             return None;
         }
         let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -1698,11 +1698,20 @@ fn moe_mode() -> u8 {
     })
 }
 
-/// `CMF_INKLING_COOP=0`: a prompt chunk's 4-bit dense matrices on the scalar
-/// tile GEMM instead of the cooperative-matrix one.
+/// `CMF_INKLING_COOP`: a prompt chunk's 4-bit dense matrices and routed
+/// experts on the cooperative-matrix GEMMs (`1`, the default), the dense ones
+/// only (`dense`), the experts only (`moe`), neither (`0`).
+fn coop_mode() -> (bool, bool) {
+    static M: OnceLock<(bool, bool)> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CMF_INKLING_COOP").as_deref() {
+        Ok("0") => (false, false),
+        Ok("dense") => (true, false),
+        Ok("moe") => (false, true),
+        _ => (true, true),
+    })
+}
 fn coop_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_INKLING_COOP").as_deref() != Ok("0"))
+    coop_mode().0
 }
 
 /// `CMF_INKLING_MOE4=0`: the decode's experts a row a subgroup (`ink_moe_gu` /

@@ -39,12 +39,12 @@ fn moe_mma_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA").as_deref() != Ok("0"))
 }
 
-/// `CMF_INKLING_MOE_MMA2=1`: `ink_moe_mma2` (the job's rows staged once a
-/// block through a cp.async pipeline) instead of `ink_moe_mma` (every warp
-/// loads them itself). Off until measured.
+/// `CMF_INKLING_MOE_MMA2=0`: `ink_moe_mma` (every warp loads the job's rows
+/// itself) instead of `ink_moe_mma2` (the rows staged once a block through a
+/// cp.async pipeline; L4, a 512-row call's experts 174 → 135 ms, the same sums).
 fn mma2_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA2").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA2").as_deref() != Ok("0"))
 }
 
 /// Output tiles of 16 rows an `ink_moe_mma` block takes (4 warps × `MT`).
