@@ -28,9 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by default. Perplexity of the q8_2f file against Transformers bf16 on the same windows:
   WikiText-2 33.071 (32.804), Rust 7.048 (7.049), Python 7.160 (7.026), and over 2 × 6144 tokens of WikiText-2,
   past the dense range, 20.675 (20.755); the q4tp profile (experts rounded without calibration, the rest
-  q8_2f): 32.380, 7.192, 7.554, 20.947. On an NVIDIA L4 (24 GB, CUDA) the published 4-bit file decodes at 65 tok/s with every
-  weight on the card (a 2048-token prompt in 2.0 s, a 30 000-token one in 69 s and 33 tok/s after it), the 8-bit
-  file at 37 tok/s after a 2048-token prompt with its experts streamed; over Vulkan the 4-bit file at 40 tok/s.
+  q8_2f): 32.380, 7.192, 7.554, 20.947. The published 4-bit file (every matrix but the head GPTQ-calibrated, see
+  below): 31.782, 7.215, 7.513, 20.610. On an NVIDIA L4 (24 GB, CUDA) it decodes at 66 tok/s with every weight on
+  the card (a 2048-token prompt in 2.0 s, a 30 000-token one in 68 s and 34 tok/s after it), the 8-bit file at
+  38 tok/s after a 2048-token prompt with its experts streamed; over Vulkan the 4-bit file at 40 tok/s.
   The same card runs Qwen3.6-35B-A3B q4tp (40 layers, 8 experts a token, no hyper-connections) at 92 tok/s.
 - `cortiq quantize-moe` takes Maxwell: the routed FFNs' input rows and each token's experts are tapped on the
   CUDA prompt path (`gpu::moe_tap_begin`; 65 536 tokens in 258 s on an L4, a capture-only run with
