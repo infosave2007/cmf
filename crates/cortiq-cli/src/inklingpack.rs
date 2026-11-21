@@ -503,7 +503,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     if eos.is_empty() {
         eos.push(config.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(200006) as u32);
     }
-    let layer_types: Vec<&str> = (0..n_layers).map(|li| if is_sliding(li) { "SlidingAttention" } else { "FullAttention" }).collect();
+    // the generic loader's sliding-window machinery is not this stack's: every layer is
+    // `FullAttention` to it, the runtime reads the local layers from the record
+    let layer_types: Vec<&str> = vec!["FullAttention"; n_layers];
     let arch: ModelArch = serde_json::from_value(serde_json::json!({
         "arch_name": ARCH_NAME,
         "hidden_size": hidden,
