@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- thinkingmachines/Inkling-2-Mini (`inkling2_loop`) converts natively: the release's NVFP4 (layers 0–19) and MXFP8
+  (20–23) experts are decoded and stored as q4tp, q8_2f or byte for byte (`--quant nvfp4`). Its own stack on the
+  host, CUDA, Metal and wgpu: 24 layers, layers 6–17 three passes (48 applications, each with its own keys, values
+  and convolution rings), a learned relative bias over 1 024 distances instead of RoPE (log-scaled queries on the 4
+  full layers past 8 192 positions), per-token sinks, sigmoid output gates, short convolutions on keys, values and
+  both residual branches, block attention residuals, message gates between passes, 128 σ-routed experts with a
+  softcapped SwiGLU, a logit softcap. Perplexity of the published 4-bit file (q4tp experts, GPTQ dense trunk, 8-bit
+  head) against the release's layers in f32 (transformers PR #51050) on the same windows: WikiText-2 9.057 (8.944),
+  2 × 4096 tokens 7.383 (7.310), Rust 3.148 (3.124), Python 2.861 (2.851); Vulkan 9.057 / 7.377, Metal 9.055 / 7.380.
+  Text only: the vision tower and the MTP drafter are not converted.
+- Inkling's chat format: the thinking-effort line (`--reasoning-effort`, the server's `reasoning_effort`;
+  `--no-think` and `enable_thinking: false` give effort `none`), its thinking and JSON tool-call parts decoded as
+  `<think>` / `<tool_call>` for the CLI stream and the server (`reasoning_content`, `tool_calls`). `serve` runs it
+  with one slot.
+- `cortiq requant --quant q4tp-dense --calib FILE…`: GPTQ of a file's dense trunk through the host stack (a looped
+  model's projections take one Hessian over all their passes). Inkling-2-Mini's trunk: 15.00 → 14.69 GB, CUDA decode
+  41.6 → 47.1 tok/s, perplexity +0.3 %.
+- CUDA, Inkling: a prompt path (calls of up to 512 rows, `CMF_INKLING_ROWS`: the weights expanded to f16 through
+  cuBLAS, the routed experts grouped by expert as the hybrid prompt path's), decode attention split over 256-key tiles,
+  the arm's buffers carved from shared slabs. NVIDIA L4: decode 51.7 tok/s; a 2 048 / 8 192 / 32 768-token prompt in
+  3.82 / 18.2 / 111 s (12.9 / 54 / — s at 16 rows a call), decode after it 48.5 / 45.9 / 39.1 (38.0 / 32.3 / —);
+  peak card memory 21.4 → 15.4 GB (the driver rounded each of the 6144 expert matrices up to an even megabyte).
+- Metal and wgpu, Inkling: prompt calls of 256 / 128 rows with the routed experts grouped by expert as GEMMs (Metal:
+  the backend's `q4tp_mul_mm` over gathered rows; wgpu: a tiled WGSL GEMM), Metal's dense matrices through
+  `q4tp_mul_mm`. Apple M4: a 512-token prompt in 3.70 s (15.5 s before, on the file with an 8-bit trunk), decode
+  21.5 tok/s; Vulkan on an L4: a 2 048-token prompt in 17.9 s (64 s), decode 18.7. `CMF_INKLING_MOE=pick|loop|gemm`
+  picks the expert kernels.
+
+### Fixed
+- Tokenizer: BPE `ignore_merges` (o200k-style vocabularies) — a word that is a vocabulary entry is that entry; before,
+  Inkling's tokenizer split 29 extra tokens out of WikiText-2 test.
+- `bench` timed an Inkling prompt a token at a time (`forward_ids`); it now takes the route generation takes.
+
+### Added
 - NVG on CUDA: `convert --quant blr --blr-method nvg`, `nvg-bench` and `nvg-train` (with `--mask-keep`) run whole
   on the card under `CMF_GPU=cuda` (a build with the `cuda` feature), with no Vulkan adapter — the calibration
   forward and its Grams, the encoder (cuBLAS products, a blocked Cholesky, the eigensolver, the output-side knots
