@@ -474,17 +474,28 @@ each path's backward — and it is laid out for the card's two limits, the tenso
   (`t2 = (dy ⊙ h)·S_U`): `dh_i = Σ_k S_U[i][k]·G'_U[i][k]`, `dg_j = Σ_k S_V[j][k]·G'_V[j][k]`, and the signs'
   gradients are `diag(h)·G'_U`, `diag(g)·G'_V` — one row pass over an `m×r` matrix (`nt_g_fold`) instead of a
   column reduction over `tokens×m` activations. Only `dℓ = Σ a ⊙ t2` reduces over tokens, at the rank's width.
-* *GDN*: the recurrence in blocks of 512 threads (`nt_gdn_fwd`, `nt_gdn_rev`): a thread keeps 32 state rows of one
-  column in registers, column sums go through shared memory, row sums take two shuffle steps and the rest through
-  shared memory. A position's q, k and scalar sums are published a position early and its inputs are read ahead,
-  so a position is two barriers forward and three backward and the loads' latency passes under the arithmetic.
-  The BPTT's state history is f16 and holds every second state (the ones after positions t-1, t-3, …), written by
-  the forward that the reverse sweep's recompute runs anyway and read once: `⌈t/2⌉·128·128` halves a (window,
-  v-head). The reverse sweep rebuilds the state between two stored ones by one rank-one step from the forward's
-  `kv` (`g·S + k̂ ⊗ β·(v − kv)`: no sums), with one state array in registers as before.
+* *GDN forward*: the recurrence in blocks of 512 threads (`nt_gdn_fwd`): a thread keeps 32 state rows of one
+  column in registers, column sums go through shared memory. A position's q, k and their norms are published a
+  position early and its inputs are read ahead, so a position is two barriers and the loads' latency passes under
+  the arithmetic. `CMF_NVG_GDN_GC` = 1, 2, 4 picks the block (128, 256, 512 threads).
+* *GDN reverse sweep in chunks.* The delta rule over a chunk of C positions is linear algebra in the chunk's start
+  state S0 and its rows: with K̂, Q̂ (`[C][128]`), u_t = β_t·(v_t − kv_t) from the forward's `kv`, the decays
+  c_τ = Π g inside the chunk and r(τ,σ) = c_τ/c_σ,
+  `kv_τ = c_τ(K̂S0)_τ + Σ_{σ<τ} r(τ,σ)(k̂_τ·k̂_σ)u_σ`, `o_τ = c_τ(Q̂S0)_τ + Σ_{σ≤τ} r(τ,σ)(q̂_τ·k̂_σ)u_σ`,
+  `S_end = c_end·S0 + K̂ᵀ·diag(c_end/c_σ)·U`. So the adjoints of a chunk are fourteen batched f32 products of
+  `[C][128]`, `[C][C]` and `[128][128]` matrices over the (sequence, v-head) units (`cublasSgemmStridedBatched`),
+  one back substitution (`X_τ = Ū_τ − Σ_{τ'>τ} β_τ'·r(τ',τ)(k̂_τ'·k̂_τ)·X_τ'`: what the per-position sweep calls du)
+  and elementwise kernels (`nt_gdc_*`): `gdn_rev_chunked` in `nvgt.rs`, the derivation at the kernels in
+  `nvgt.cu`. Chunks are cut from the window's end (`CMF_NVG_GDN_CHUNK`, default 64: the pairwise products grow
+  with the chunk, the launches with their number); the forward keeps only the states at the chunk starts (f16),
+  and `kv` and `o` of every position. On an RTX PRO 6000 at 8×512 and 48 v-heads a layer's reverse sweep takes
+  7.0 ms where the per-position kernel takes 12.7, the forward that keeps the states 2.6 ms where it took 3.8,
+  and the history is 0.1 GB a layer where every second state was 3.2; it is more exact too (a window in one
+  chunk needs no stored state: the gradients agree with the skill bake's to 2·10⁻⁷, 1·10⁻⁴ through f16 states).
+  `CMF_NVG_GDN_REV=kernel` runs the per-position kernel `nt_gdn_rev` instead: three barriers a position, the
+  history every second state (the reverse sweep rebuilds the one between by a rank-one step from `kv`).
   `CMF_NVG_GDN_HIST_GB` (default 16) caps the history by replaying the windows in groups. A v-head writes its
-  q̂/k̂ through-gradients, a second launch adds the heads of a k-group in order. `CMF_NVG_GDN_GC` = 1, 2, 4 picks
-  the block (128, 256, 512 threads).
+  q̂/k̂ through-gradients, a second launch adds the heads of a k-group in order.
 * *The recompute reuses the forward's rank activations.* `a = x·S_V` of every path is kept from the step's first
   forward, per layer and role, and the layer's recompute in the reverse sweep skips that product: the same input
   and the same weights give the same values, so the losses of a run are equal with and without it. The widest
@@ -532,11 +543,21 @@ run; a state saved by one backend loads on the other.
 Kernel tests on the card (`cargo test -p cortiq-engine --features cuda --lib -- gpu_cuda::nvg_dev::tests
 gpu_cuda::nvgt::tests`, and the encoder driver's tests with `CMF_NVG_ENC=cuda`): the GEMM views, the elementwise
 kernels, the eigensolver, the SPD solve and the whitening factor against f64; a binary low-rank layer's forward
-and backward against f64 (4·10⁻⁴: f16 operands and scales); the GDN core against the skill bake's kernels
-(output 2·10⁻⁷; gradients 1·10⁻⁴ … 3·10⁻⁴: f16 history), kept by the forward and replayed a sequence a launch;
-the attention core against the bake's (equal); the head's top-k and KL against the host; a sign update against
-`train_sign::host_step_fact` (no differing latent, moment or bitmap word); the device encoder against the f64
-host encoder (`nvg_gpu` tests).
+and backward against f64 (4·10⁻⁴: f16 operands and scales); the GDN core against the skill bake's kernels at
+odd, even and the shortest lengths, the reverse sweep as the per-position kernel and in chunks (the window as
+one chunk, chunks of 2 and 4 with a short first one), the states kept by the forward and replayed a sequence a
+launch (output 2·10⁻⁷; gradients 2·10⁻⁷ … 7·10⁻⁴); the attention core against the bake's (equal); the
+head's top-k and KL against the host; a sign update against `train_sign::host_step_fact` (no differing latent,
+moment or bitmap word); the DTG-MA gates on a real file (`cuda_mask_gradient_check`: open gates leave the loss as
+it is, a gate's gradient against a central difference within 0.3 % in the last layer and 4–6 % in the first);
+the device encoder against the f64 host encoder (`nvg_gpu` tests; the input-side search with its flips on the
+host and in the device's kernel: no sign differs from the f64 encoder's either way).
+
+The trainer's exact changes are checked on a run: 40 steps of the 0.8B give the same losses with and without the
+rank-activation cache, and with SwiGLU writing its stagings. A change of the GDN reverse sweep changes its
+rounding: the losses stay equal to four digits until the signs move (step 12) and the runs part after it, as two
+builds always do (the chunked sweep against the per-position kernel, 40 steps of 4×512: 2.7754 / 2.7754 at step
+11, 2.7217 / 2.7216 at 12, held-out KL at 40 2.30670 / 2.30814).
 
 ### 8.5 Measured on CUDA (20–21.11.2026)
 

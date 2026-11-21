@@ -70,6 +70,16 @@ struct F {
     qkr_bwd: cs::CUfunction,
     gdn_rev: cs::CUfunction,
     gdn_qk_sum: cs::CUfunction,
+    gdc_prep: cs::CUfunction,
+    gdc_cum: cs::CUfunction,
+    gdc_mask: cs::CUfunction,
+    gdc_solve: cs::CUfunction,
+    gdc_zy: cs::CUfunction,
+    gdc_rows: cs::CUfunction,
+    gdc_fin: cs::CUfunction,
+    gdc_post: cs::CUfunction,
+    gdc_s0: cs::CUfunction,
+    gdc_snext: cs::CUfunction,
     kl_rows: cs::CUfunction,
     topk_rows: cs::CUfunction,
     adam: cs::CUfunction,
@@ -128,6 +138,16 @@ fn build(c: &Ctx) -> Res<F> {
         qkr_bwd: f("nt_qkr_bwd")?,
         gdn_rev: f("nt_gdn_rev")?,
         gdn_qk_sum: f("nt_gdn_qk_sum")?,
+        gdc_prep: f("nt_gdc_prep")?,
+        gdc_cum: f("nt_gdc_cum")?,
+        gdc_mask: f("nt_gdc_mask")?,
+        gdc_solve: f("nt_gdc_solve")?,
+        gdc_zy: f("nt_gdc_zy")?,
+        gdc_rows: f("nt_gdc_rows")?,
+        gdc_fin: f("nt_gdc_fin")?,
+        gdc_post: f("nt_gdc_post")?,
+        gdc_s0: f("nt_gdc_s0")?,
+        gdc_snext: f("nt_gdc_snext")?,
         kl_rows: f("nt_kl_rows")?,
         topk_rows: f("nt_topk_rows")?,
         adam: f("nt_adam")?,
@@ -394,6 +414,16 @@ impl Dev {
         let ev = self.kt_begin();
         let r = unsafe { self.c.gemm_batched(ta, m, n, k, alpha, a, lda, sa, b, ldb, sb, cp, ldc, sc, count, attn_mode()) };
         self.kt_end(ev, (3, "cublas gemm batched"));
+        r
+    }
+
+    /// `count` plain f32 GEMMs of one shape with either operand transposed
+    /// and a β (`Ctx::sgemm_batched`), timed under `CMF_NVG_KT`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn mmb2(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, a: u64, lda: usize, sa: usize, b: u64, ldb: usize, sb: usize, beta: f32, cp: u64, ldc: usize, sc: usize, count: usize) -> Res<()> {
+        let ev = self.kt_begin();
+        let r = unsafe { self.c.sgemm_batched(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count) };
+        self.kt_end(ev, (4, "cublas gemm batched (gdn chunks)"));
         r
     }
 
@@ -1148,6 +1178,8 @@ pub struct Work {
     head_chunk: usize,
     /// Sequences a GDN backward launch holds the state history of.
     gdn_per: usize,
+    /// The chunked reverse sweep's scratch (a net with GDN layers and a backward).
+    gdnc: Option<GdnC>,
     /// Device bytes of the sign scratch.
     pub sign_scratch: u64,
 }
@@ -1223,11 +1255,14 @@ impl Work {
                 for (n, w) in [("dgout", v), ("dcq", cd), ("draw", cd), ("dz", v), ("da", g.nv), ("db", g.nv), ("dqk", g.nv * 2 * DKV)] {
                     z(n, ntok * w)?;
                 }
-                // the BPTT's state history: every second state, ⌈t/2⌉·dk·dv halves a (sequence, v-head)
+                // the BPTT's state history: the states a stride apart (a chunk of the
+                // chunked reverse sweep, or every second one for its per-position
+                // kernel), ⌈t/stride⌉·dk·dv halves a (sequence, v-head)
+                let stride = gdn_chunk(t).unwrap_or(2).max(1);
                 let cap = std::env::var("CMF_NVG_GDN_HIST_GB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 30;
-                let per_seq = t.div_ceil(2) * DKV * DKV * 2 * g.nv;
+                let per_seq = t.div_ceil(stride) * DKV * DKV * 2 * g.nv;
                 gdn_per = (cap / per_seq.max(1)).clamp(1, nb);
-                z("hist", (gdn_per * g.nv * t.div_ceil(2) * DKV * DKV).div_ceil(2))?;
+                z("hist", (gdn_per * g.nv * t.div_ceil(stride) * DKV * DKV).div_ceil(2))?;
                 z("kvh", gdn_per * g.nv * t * DKV)?;
                 z("oh", gdn_per * g.nv * t * DKV)?;
             }
@@ -1331,6 +1366,10 @@ impl Work {
             }
         }
         let ckpt = (0..=g.nl).map(|l| if l >= net.first && l <= net.end { DBuf::floats(c, ntok * g.hs) } else { DBuf::floats(c, 1) }).collect::<Res<Vec<_>>>()?;
+        let gdnc = match gdn_chunk(t) {
+            Some(cap) if any_gdn && bwd => Some(GdnC::new(c, gdn_per * g.nv, cap)?),
+            _ => None,
+        };
         // the rank activations kept from a step's forward for the recompute,
         // last of the workspace: the widest inputs first (the product saved is
         // ntok·n·r a path), within `CMF_NVG_ACACHE_GB` (default 7) and what
@@ -1399,6 +1438,7 @@ impl Work {
             cnt: DBuf::floats(c, ts::CNT_LEN)?,
             head_chunk,
             gdn_per,
+            gdnc,
             sign_scratch,
         };
         c.sync()?;
@@ -1741,28 +1781,174 @@ unsafe fn gdn_core_fwd(d: &Dev, g: GdnG, p: GdnP, raw: u64, z: u64, a: u64, b: u
         Some(s) if s.per >= g.nb => (s.hist, s.kvh, s.oh),
         _ => (0u64, 0u64, 0u64),
     };
+    let stride = keep.map_or(2, GdnS::stride);
     unsafe {
         d.el2(d.f.conv_fwd, n, cd, kargs!(raw, p.conv, pre, cq, ti, cdi, kki))?;
-        d.c.launch(d.f.gdn_fwd, (g.nv as u32, g.nb as u32), gdn_block(), 0, kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, out, hist, kvh, oh, ti, nvi, nki, eps, seq0))
+        d.c.launch(d.f.gdn_fwd, (g.nv as u32, g.nb as u32), gdn_block(), 0, kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, out, hist, kvh, oh, ti, nvi, nki, eps, seq0, stride))
     }
 }
 
 /// The BPTT's scratch: per-head q̂/k̂ through-gradients, and the state
-/// history (f16), kv and o of the `per` sequences one launch holds.
-struct GdnS {
+/// history (f16), kv and o of the `per` sequences one launch holds; with
+/// `chunk`, the reverse sweep runs as batched products over chunks.
+struct GdnS<'a> {
     dcq: u64,
     dqk: u64,
     hist: u64,
     kvh: u64,
     oh: u64,
     per: usize,
+    chunk: Option<&'a GdnC>,
 }
 
-impl GdnS {
-    /// The workspace's (a net loaded for the backward).
-    fn of(w: &Work) -> GdnS {
-        GdnS { dcq: w.p("dcq"), dqk: w.p("dqk"), hist: w.p("hist"), kvh: w.p("kvh"), oh: w.p("oh"), per: w.gdn_per }
+impl GdnS<'_> {
+    /// How far apart the states the forward keeps are: every second one for
+    /// the per-position reverse kernel, a chunk's start for the chunked form.
+    fn stride(&self) -> i32 {
+        self.chunk.map_or(2, |gc| gc.c.max(1)) as i32
     }
+
+    /// The workspace's (a net loaded for the backward).
+    fn of(w: &Work) -> GdnS<'_> {
+        GdnS { dcq: w.p("dcq"), dqk: w.p("dqk"), hist: w.p("hist"), kvh: w.p("kvh"), oh: w.p("oh"), per: w.gdn_per, chunk: w.gdnc.as_ref() }
+    }
+}
+
+/// Positions a chunk of the reverse sweep's chunked form takes for windows of
+/// `t` (`CMF_NVG_GDN_CHUNK`, default 64, at most 256; a window that fits is
+/// one chunk), or `None` for the per-position kernel (`CMF_NVG_GDN_REV=kernel`).
+/// 64 is the fastest on an RTX PRO 6000 at 16 and at 48 v-heads: the pairwise
+/// products grow with the chunk, the launches with their number.
+fn gdn_chunk(t: usize) -> Option<usize> {
+    if std::env::var("CMF_NVG_GDN_REV").as_deref() == Ok("kernel") {
+        return None;
+    }
+    let c = std::env::var("CMF_NVG_GDN_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64).clamp(2, GDC_MAX);
+    // a window that fits is one chunk; otherwise chunks are cut from the
+    // window's end, and an even chunk keeps their start states among the
+    // stored ones (every second state, the last among them)
+    Some(if t <= c { t.max(1) } else { c & !1 })
+}
+
+/// The largest chunk (`GDC_MAX` of nvgt.cu).
+const GDC_MAX: usize = 256;
+
+/// Scratch of the chunked reverse sweep (`nt_gdc_*`): per unit — one
+/// sequence's v-head — the chunk's `[C][D]` rows, `[C][C]` factors, `[D][D]`
+/// states and per-position scalars, for `units` units and chunks of `c`.
+struct GdnC {
+    c: usize,
+    units: usize,
+    b: HashMap<&'static str, DBuf>,
+}
+
+impl GdnC {
+    fn new(c: &Ctx, units: usize, cap: usize) -> Res<GdnC> {
+        let dd = DKV;
+        let mut b = HashMap::new();
+        for n in ["kh", "qh", "uu", "ob", "t1", "t2", "x", "ab", "co", "wu", "kb", "qb"] {
+            b.insert(n, DBuf::floats(c, units * cap * dd)?);
+        }
+        for n in ["kk", "qk", "m", "lt", "xu", "ou", "w1", "y", "e1"] {
+            b.insert(n, DBuf::floats(c, units * cap * cap)?);
+        }
+        for n in ["s0", "se", "sn"] {
+            b.insert(n, DBuf::floats(c, units * dd * dd)?);
+        }
+        b.insert("sc", DBuf::floats(c, units * cap * 8)?);
+        b.insert("r", DBuf::floats(c, units * cap * 2)?);
+        b.insert("sd", DBuf::floats(c, units)?);
+        Ok(GdnC { c: cap, units, b })
+    }
+    fn p(&self, n: &str) -> u64 {
+        self.b[n].ptr
+    }
+}
+
+/// The reverse sweep of `nbs` sequences from `seq0` as batched products over
+/// chunks (see nvgt.cu, "GDN reverse sweep in chunks"): what `nt_gdn_rev`
+/// computes — dz, da, db, the v channels of dcq, the per-head q̂/k̂
+/// through-gradients — from the forward's kv, o and the stored states at the
+/// chunk starts. Chunks are cut from the window's end; the first one in time
+/// may be short.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gdn_rev_chunked(d: &Dev, g: GdnG, p: GdnP, z: u64, a: u64, b: u64, cq: u64, dout: u64, dz: u64, da: u64, db: u64, s: &GdnS, gc: &GdnC, seq0: usize, nbs: usize) -> Res<()> {
+    let (t, dd, cap) = (g.t, DKV, gc.c);
+    let units = nbs * g.nv;
+    if units > gc.units {
+        return Err(format!("{units} GDN units for a chunk scratch of {}", gc.units));
+    }
+    let (scd, scc, sdd) = (cap * dd, cap * cap, dd * dd);
+    let (ti, nvi, nki, seq0i, capi, eps) = (t as i32, g.nv as i32, g.nk as i32, seq0 as i32, cap as i32, g.eps);
+    // the forward kept the states after t-1, t-1-cap, … (slot k from the end)
+    let slots = t.div_ceil(cap) as i32;
+    let cb = (cap.div_ceil(32) * 32) as u32;
+    let (ddu, un) = (dd as u32, units as u32);
+    let nsd = (units * sdd) as u64;
+    // row-major products over the units: Z = X·Y, X·Yᵀ, Xᵀ·Y (dims in the
+    // order rows of Z, the inner dimension, columns of Z)
+    let xy = |x: u64, sx: usize, y: u64, sy: usize, pr: usize, q: usize, r: usize, beta: f32, zc: u64, sz: usize| unsafe { d.mmb2(false, false, r, pr, q, y, r, sy, x, q, sx, beta, zc, r, sz, units) };
+    let xyt = |x: u64, sx: usize, y: u64, sy: usize, pr: usize, q: usize, r: usize, beta: f32, zc: u64, sz: usize| unsafe { d.mmb2(true, false, r, pr, q, y, q, sy, x, q, sx, beta, zc, r, sz, units) };
+    let xty = |x: u64, sx: usize, y: u64, sy: usize, pr: usize, q: usize, r: usize, beta: f32, zc: u64, sz: usize| unsafe { d.mmb2(false, true, r, pr, q, y, r, sy, x, pr, sx, beta, zc, r, sz, units) };
+    let zero = |n: &str, floats: usize| unsafe { cu::memset_d8_async(gc.p(n), 0, floats * 4, d.c.stream).map_err(derr) };
+    let (kh, qh, uu, ob) = (gc.p("kh"), gc.p("qh"), gc.p("uu"), gc.p("ob"));
+    let (t1, t2, x, ab, co, wu, kb, qb) = (gc.p("t1"), gc.p("t2"), gc.p("x"), gc.p("ab"), gc.p("co"), gc.p("wu"), gc.p("kb"), gc.p("qb"));
+    let (kk, qk, mm, lt, xu, ou, w1, y, e1) = (gc.p("kk"), gc.p("qk"), gc.p("m"), gc.p("lt"), gc.p("xu"), gc.p("ou"), gc.p("w1"), gc.p("y"), gc.p("e1"));
+    let (s0, sc, r, sd) = (gc.p("s0"), gc.p("sc"), gc.p("r"), gc.p("sd"));
+    // the adjoint of the state after the chunk in flight, and of the one before it
+    let (mut se, mut sn) = (gc.p("se"), gc.p("sn"));
+    unsafe {
+        cu::memset_d8_async(se, 0, units * sdd * 4, d.c.stream).map_err(derr)?;
+        let mut p1 = t;
+        while p1 > 0 {
+            let p0 = p1.saturating_sub(cap);
+            let l = p1 - p0;
+            let (li, p0i) = (l as i32, p0 as i32);
+            if l < cap {
+                // the rows past a short chunk are zero in every product
+                for n in ["kh", "qh", "uu", "ob", "x", "ab", "co", "wu"] {
+                    zero(n, units * scd)?;
+                }
+            }
+            // the chunk's start state (nothing before the window) and ⟨S̄_end, S0⟩
+            let slot = if p0 > 0 { ((t - p0) / cap) as i32 } else { -1 };
+            d.c.launch(d.f.gdc_s0, (un, 1), 256, 0, kargs!(s.hist, se, s0, sd, slots, slot))?;
+            d.c.launch(d.f.gdc_prep, (l as u32, un), ddu, 0, kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, dout, s.kvh, s.oh, dz, kh, qh, uu, ob, sc, ti, nvi, nki, eps, seq0i, p0i, capi))?;
+            d.c.launch(d.f.gdc_cum, (un, 1), 32, 0, kargs!(sc, capi, li))?;
+            // KK = K̂K̂ᵀ, QK = Q̂K̂ᵀ
+            xyt(kh, scd, kh, scd, cap, dd, cap, 0.0, kk, scc)?;
+            xyt(qh, scd, kh, scd, cap, dd, cap, 0.0, qk, scc)?;
+            d.c.launch(d.f.gdc_mask, (cap as u32, un), cb, 0, kargs!(kk, qk, sc, mm, lt, capi, li))?;
+            // Ū = MᵀŌ + diag(w)·K̂·S̄_end, then the back substitution
+            xty(mm, scc, ob, scd, cap, cap, dd, 0.0, t1, scd)?;
+            xy(kh, scd, se, sdd, cap, dd, dd, 0.0, t2, scd)?;
+            d.c.launch(d.f.gdc_solve, (un, 1), ddu, 0, kargs!(t1, t2, lt, sc, ob, uu, x, ab, co, wu, s.dcq, ti, nvi, nki, seq0i, p0i, capi, li))?;
+            // the adjoints of the two Grams
+            xyt(x, scd, uu, scd, cap, dd, cap, 0.0, xu, scc)?;
+            xyt(ob, scd, uu, scd, cap, dd, cap, 0.0, ou, scc)?;
+            d.c.launch(d.f.gdc_zy, (cap as u32, un), cb, 0, kargs!(xu, ou, kk, qk, sc, w1, y, e1, capi, li))?;
+            // K̂̄ and Q̂̄ start from Ā·S0ᵀ and diag(c)Ō·S0ᵀ: the decay's row
+            // terms are dots with them (db and those terms: `nt_gdc_rows`)
+            xyt(ab, scd, s0, sdd, cap, dd, dd, 0.0, kb, scd)?;
+            xyt(co, scd, s0, sdd, cap, dd, dd, 0.0, qb, scd)?;
+            d.c.launch(d.f.gdc_rows, (l as u32, un), ddu, 0, kargs!(x, uu, kh, kb, qh, qb, t2, wu, sc, r, db, ti, nvi, seq0i, p0i, capi))?;
+            // K̂̄ += (Z + Zᵀ)·K̂ + Yᵀ·Q̂ + diag(w)U·S̄_endᵀ;  Q̂̄ += Y·K̂
+            xy(w1, scc, kh, scd, cap, cap, dd, 1.0, kb, scd)?;
+            xty(y, scc, qh, scd, cap, cap, dd, 1.0, kb, scd)?;
+            xyt(wu, scd, se, sdd, cap, dd, dd, 1.0, kb, scd)?;
+            xy(y, scc, kh, scd, cap, cap, dd, 1.0, qb, scd)?;
+            // S̄0 = K̂ᵀ·Ā + Q̂ᵀ·diag(c)Ō (+ c_end·S̄_end below)
+            xty(kh, scd, ab, scd, dd, cap, dd, 0.0, sn, sdd)?;
+            xty(qh, scd, co, scd, dd, cap, dd, 1.0, sn, sdd)?;
+            // da of the chunk, the q/k through-gradients
+            d.c.launch(d.f.gdc_fin, (un, 1), cb, 0, kargs!(e1, r, sd, sc, da, ti, nvi, seq0i, p0i, capi, li))?;
+            d.c.launch(d.f.gdc_post, (l as u32, un), ddu, 0, kargs!(cq, kb, qb, sc, s.dqk, ti, nvi, nki, seq0i, p0i, capi))?;
+            d.el(d.f.gdc_snext, units * sdd, kargs!(sn, se, sc, capi, li, nsd))?;
+            std::mem::swap(&mut se, &mut sn);
+            p1 = p0;
+        }
+    }
+    Ok(())
 }
 
 /// GDN backward from `dout` `[n][vd]` (the forward's `pre` / `cq` and its
@@ -1783,15 +1969,19 @@ unsafe fn gdn_core_bwd(d: &Dev, g: GdnG, p: GdnP, z: u64, a: u64, b: u64, pre: u
             let grid = (g.nv as u32, nbs as u32);
             if !kept {
                 let no_out = 0u64;
-                d.c.launch(d.f.gdn_fwd, grid, gdn_block(), 0, kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, no_out, s.hist, s.kvh, s.oh, ti, nvi, nki, eps, seq0))?;
+                let stride = s.stride();
+                d.c.launch(d.f.gdn_fwd, grid, gdn_block(), 0, kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, no_out, s.hist, s.kvh, s.oh, ti, nvi, nki, eps, seq0, stride))?;
             }
-            d.c.launch(
-                d.f.gdn_rev,
-                grid,
-                gdn_block(),
-                0,
-                kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, dout, s.dcq, dz, da, db, s.dqk, s.hist, s.kvh, s.oh, ti, nvi, nki, eps, seq0),
-            )?;
+            match s.chunk {
+                Some(gc) => gdn_rev_chunked(d, g, p, z, a, b, cq, dout, dz, da, db, s, gc, s0, nbs)?,
+                None => d.c.launch(
+                    d.f.gdn_rev,
+                    grid,
+                    gdn_block(),
+                    0,
+                    kargs!(cq, z, a, b, p.a_log, p.dt_bias, p.norm, dout, s.dcq, dz, da, db, s.dqk, s.hist, s.kvh, s.oh, ti, nvi, nki, eps, seq0),
+                )?,
+            }
             s0 += nbs;
         }
         d.el2(d.f.gdn_qk_sum, n, 2 * g.nk * DKV, kargs!(s.dqk, s.dcq, nvi, nki))?;
@@ -2739,19 +2929,28 @@ mod tests {
         let (pre, cq, out, draw, dz, da, db) = (fl(n * cd), fl(n * cd), fl(n * v), fl(n * cd), fl(n * v), fl(n * nv), fl(n * nv));
         let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl((nb * nv * t.div_ceil(2) * DKV * DKV).div_ceil(2)), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
         let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
-        // per = nb: the forward keeps the states; per = 1: a replay a sequence
-        for per in [nb, 1] {
-            let sc = GdnS { dcq: dcq.ptr, dqk: dqk.ptr, hist: hist.ptr, kvh: kvh.ptr, oh: oh.ptr, per };
-            unsafe {
-                gdn_core_fwd(&d, g, p, braw.ptr, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, out.ptr, Some(&sc)).unwrap();
-                gdn_core_bwd(&d, g, p, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, bdout.ptr, draw.ptr, dz.ptr, da.ptr, db.ptr, &sc, true).unwrap();
+        // the reverse sweep: the per-position kernel (0), then the chunked form
+        // with the window as one chunk and with chunks of 2 and 4 (the first
+        // chunk in time short when the length is not a multiple)
+        let mut caps = vec![0usize, t];
+        caps.extend([2usize, 4].into_iter().filter(|c| *c < t));
+        for cap in caps {
+            let gc = (cap > 0).then(|| GdnC::new(d.c, nb * nv, cap).unwrap());
+            // per = nb: the forward keeps the states; per = 1: a replay a sequence
+            for per in [nb, 1] {
+                eprintln!("gdn t {t}, chunk {cap}, {per} sequences a launch");
+                let sc = GdnS { dcq: dcq.ptr, dqk: dqk.ptr, hist: hist.ptr, kvh: kvh.ptr, oh: oh.ptr, per, chunk: gc.as_ref() };
+                unsafe {
+                    gdn_core_fwd(&d, g, p, braw.ptr, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, out.ptr, Some(&sc)).unwrap();
+                    gdn_core_bwd(&d, g, p, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, bdout.ptr, draw.ptr, dz.ptr, da.ptr, db.ptr, &sc, true).unwrap();
+                }
+                rel("gdn out", &get_f32(d.c, out.ptr, n * v).unwrap(), &f64s(&out_ref), 1e-5);
+                // the reverse sweep reads the states as f16
+                rel("gdn draw", &get_f32(d.c, draw.ptr, n * cd).unwrap(), &f64s(&draw_ref), 1e-3);
+                rel("gdn dz", &get_f32(d.c, dz.ptr, n * v).unwrap(), &f64s(&dz_ref), 1e-4);
+                rel("gdn da", &get_f32(d.c, da.ptr, n * nv).unwrap(), &f64s(&da_ref), 1e-3);
+                rel("gdn db", &get_f32(d.c, db.ptr, n * nv).unwrap(), &f64s(&db_ref), 1e-4);
             }
-            rel("gdn out", &get_f32(d.c, out.ptr, n * v).unwrap(), &f64s(&out_ref), 1e-5);
-            // the reverse sweep reads the states as f16
-            rel("gdn draw", &get_f32(d.c, draw.ptr, n * cd).unwrap(), &f64s(&draw_ref), 1e-3);
-            rel("gdn dz", &get_f32(d.c, dz.ptr, n * v).unwrap(), &f64s(&dz_ref), 1e-4);
-            rel("gdn da", &get_f32(d.c, da.ptr, n * nv).unwrap(), &f64s(&da_ref), 1e-3);
-            rel("gdn db", &get_f32(d.c, db.ptr, n * nv).unwrap(), &f64s(&db_ref), 1e-4);
         }
     }
 
@@ -2847,7 +3046,11 @@ mod tests {
         let p = GdnP { a_log: balog.ptr, dt_bias: bdtb.ptr, norm: bnorm.ptr, conv: bconv.ptr };
         let (pre, cq, out, draw, dz, da, db) = (fl(n * cd), fl(n * cd), fl(n * v), fl(n * cd), fl(n * v), fl(n * nv), fl(n * nv));
         let (dcq, dqk, hist, kvh, oh) = (fl(n * cd), fl(n * nv * 2 * DKV), fl((nb * nv * t.div_ceil(2) * DKV * DKV).div_ceil(2)), fl(nb * nv * t * DKV), fl(nb * nv * t * DKV));
-        let sc = GdnS { dcq: dcq.ptr, dqk: dqk.ptr, hist: hist.ptr, kvh: kvh.ptr, oh: oh.ptr, per: nb };
+        let gc = match gdn_chunk(t) {
+            Some(cap) => Some(GdnC::new(d.c, nb * nv, cap).unwrap()),
+            None => None,
+        };
+        let sc = GdnS { dcq: dcq.ptr, dqk: dqk.ptr, hist: hist.ptr, kvh: kvh.ptr, oh: oh.ptr, per: nb, chunk: gc.as_ref() };
         let time = |f: &dyn Fn()| -> f64 {
             let mut best = f64::MAX;
             for _ in 0..4 {
@@ -2864,6 +3067,14 @@ mod tests {
             let keep = time(&|| gdn_core_fwd(&d, g, p, braw.ptr, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, out.ptr, Some(&sc)).unwrap());
             let rev = time(&|| gdn_core_bwd(&d, g, p, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, bdout.ptr, draw.ptr, dz.ptr, da.ptr, db.ptr, &sc, true).unwrap());
             eprintln!("gdn core, {nb}×{t}, {nv} v-heads, block {}: forward {fwd:.2} ms, forward keeping the states {keep:.2} ms, reverse {rev:.2} ms (conv and the group sum included)", gdn_block());
+            // `GDN_BENCH_KT=1`: the reverse sweep's launches one by one
+            if std::env::var("GDN_BENCH_KT").as_deref() == Ok("1") {
+                d.c.sync().unwrap();
+                kt_start();
+                gdn_core_bwd(&d, g, p, bz.ptr, ba.ptr, bb.ptr, pre.ptr, cq.ptr, bdout.ptr, draw.ptr, dz.ptr, da.ptr, db.ptr, &sc, true).unwrap();
+                d.c.sync().unwrap();
+                kt_stop_as("gdn reverse");
+            }
         }
     }
 
@@ -2903,6 +3114,48 @@ mod tests {
                 time("dx = (t2⊙ℓ)·P_Vᵀ     [tok][n]", fl2(ntok, n, r), &|| d.mm(ntok, n, r, 1.0, s2.ptr, r, false, pv.ptr, r, true, 0.0, dx.ptr, n, Gemm::Half).unwrap());
                 time("G'_U = dyᵀ·(a⊙ℓ)     [m][r]", fl2(m, r, ntok), &|| d.mm(m, r, ntok, 1.0, s1.ptr, m, true, s2.ptr, r, false, 0.0, g.ptr, r, Gemm::Half).unwrap());
                 time("G'_V = xᵀ·(t2⊙ℓ)     [n][r]", fl2(n, r, ntok), &|| d.mm(n, r, ntok, 1.0, xs.ptr, n, true, s2.ptr, r, false, 0.0, g.ptr, r, Gemm::Half).unwrap());
+            }
+        }
+    }
+
+    /// What batched small products cost at the GDN recurrence's sizes (384
+    /// units of a 128×128 state against C rows): the price list of a chunked
+    /// form of the recurrence. `--ignored --nocapture`;
+    /// `CMF_NVG_CUDA_ATTN=f32` for plain SGEMM instead of TF32.
+    #[test]
+    #[ignore]
+    fn cuda_batched_small_gemm_throughput() {
+        let Ok(d) = enter() else {
+            eprintln!("no CUDA device — skipped");
+            return;
+        };
+        let (units, dd) = (384usize, 128usize);
+        for c in [32usize, 64, 128] {
+            let fl = |len: usize, seed: u64| DBuf::from(&rnd(len, seed, 1.0)).unwrap();
+            // every operand in a slot of D×D floats a unit (leading dimension D): only the sizes matter here
+            let slot = dd * dd;
+            let (s0, kk, o1, o2) = (fl(units * slot, 1), fl(units * slot, 2), fl(units * slot, 3), fl(units * slot, 4));
+            let time = |what: &str, flop: f64, f: &dyn Fn()| {
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    d.c.sync().unwrap();
+                    let t0 = std::time::Instant::now();
+                    f();
+                    d.c.sync().unwrap();
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                eprintln!("batched ×{units}, C = {c}: {what:<26} {:8.1} µs  {:6.1} TFLOP/s", best * 1e6, flop / best / 1e12);
+            };
+            let fl2 = |x: usize, y: usize, z: usize| 2.0 * (units * x * y * z) as f64;
+            unsafe {
+                // the state against C rows: a C×D×D product a unit
+                time("state × rows   C·D·D", fl2(c, dd, dd), &|| d.mmb(false, dd, c, dd, 1.0, s0.ptr, dd, slot, kk.ptr, dd, slot, o1.ptr, dd, slot, units).unwrap());
+                // rows against rows: C×C×D
+                time("rows × rowsᵀ   C·C·D", fl2(c, c, dd), &|| d.mmb(true, c, c, dd, 1.0, kk.ptr, dd, slot, kk.ptr, dd, slot, o2.ptr, dd, slot, units).unwrap());
+                // a C×C factor against C rows: C×C×D
+                time("factor × rows  C·C·D", fl2(c, c, dd), &|| d.mmb(false, dd, c, c, 1.0, kk.ptr, dd, slot, o2.ptr, dd, slot, o1.ptr, dd, slot, units).unwrap());
+                // the rank-C update of the state: D×D×C
+                time("rowsᵀ × rows   D·D·C", fl2(dd, dd, c), &|| d.mmb(false, dd, dd, c, 1.0, kk.ptr, dd, slot, o1.ptr, dd, slot, s0.ptr, dd, slot, units).unwrap());
             }
         }
     }

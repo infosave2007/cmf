@@ -610,6 +610,8 @@ gives the same bytes.
 | `CMF_NVG_CUDA_POOL_GB=N` | free device buffers the NVG encoder keeps, 24 GB by default |
 | `CMF_NVG_GDN_HIST_GB=N` | the cap of the NVG trainer's GDN state history, 16 GB by default |
 | `CMF_NVG_ACACHE_GB=N` | rank activations the NVG trainer keeps from a step's forward for its recompute, 7 GB by default, 0 for none |
+| `CMF_NVG_GDN_REV=kernel` | the NVG trainer's GDN reverse sweep a position at a time instead of in chunks |
+| `CMF_NVG_GDN_CHUNK=N` | positions a chunk of that sweep takes, 64 by default, at most 256 |
 | `CMF_NVG_JOBS=N` | tensors of a layer in flight in the NVG conversion, 3 by default |
 | `CMF_NVG_CUDA_LANES=0` | the NVG encoder's threads on the backend's one stream (no overlap on the card) |
 | `CMF_NVG_CAND_THREADS=0` | a tensor's two candidates one after the other |
