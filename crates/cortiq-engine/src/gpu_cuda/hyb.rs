@@ -34,6 +34,8 @@ const HYB_SRC: &str = include_str!("hyb.cu");
 /// The DFlash 2 block on the card, on this arm's kernels.
 pub(super) mod dflash;
 pub(super) mod dory;
+/// Inkling-2-Mini on this arm's kernels.
+pub(super) mod inkling;
 /// Rows of the small path.
 pub(super) const NMAX: usize = 16;
 /// Rows of a prompt chunk read past a seal (`big` over sealed layers): the far

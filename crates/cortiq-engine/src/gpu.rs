@@ -1627,6 +1627,18 @@ pub fn hy4_capture_take() -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     None
 }
 
+/// The Metal backend is the selected one.
+pub fn metal_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        backend() == Backend::Metal
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn cuda_active() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -2798,6 +2810,55 @@ pub fn dory_forward(
     }
     let _ = (id, model, m, ids, pos, loops, want, logits);
     false
+}
+
+/// Inkling-2-Mini's call on the selected device (`ids` from `pos`; the last
+/// row's logits when `want`, every row's when `all`). `false` leaves the host
+/// to run it.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_forward(
+    id: u64,
+    g: &crate::inkling::Globals,
+    layers: &[crate::inkling::Layer],
+    cfg: &crate::inkling::Cfg,
+    ids: &[u32],
+    pos: usize,
+    want: bool,
+    all: bool,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::inkling::forward(id, g, layers, cfg, ids, pos, want, all, logits);
+    }
+    let _ = (id, g, layers, cfg, ids, pos, want, all, logits);
+    false
+}
+
+/// A new Inkling sequence on the device.
+pub fn inkling_reset(id: u64) {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::inkling::reset(id);
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        crate::gpu_cuda::inkling_reset(id);
+    }
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::inkling::reset(id);
+    }
+    let _ = id;
 }
 
 /// A new Dory sequence on the device.

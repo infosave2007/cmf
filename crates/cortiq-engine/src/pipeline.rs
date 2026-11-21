@@ -297,6 +297,16 @@ pub struct Pipeline {
             crate::maxwell::State,
         )>,
     >,
+    /// Inkling-2-Mini owns its looped stack: block attention residuals,
+    /// short convolutions, per-pass caches.
+    pub inkling: Option<
+        Box<(
+            crate::inkling::Globals,
+            Vec<crate::inkling::Layer>,
+            crate::inkling::Cfg,
+            crate::inkling::State,
+        )>,
+    >,
     /// GLM-5.3-Flash owns four mHC streams plus KDA/DSA state.
     pub glm5_next: Option<
         Box<(
@@ -2414,6 +2424,7 @@ impl Pipeline {
             && self.glm5_next.is_none()
             && self.hy4.is_none()
             && self.maxwell.is_none()
+            && self.inkling.is_none()
             && self.weights.layers.iter().all(|lw| {
                 // LFM2/LFM3's short-conv mixer is two projection GEMMs and
                 // an elementwise conv: the host-driven chunk walk starves
@@ -4888,6 +4899,7 @@ impl Pipeline {
             glm5_next: None,
             hy4: None,
             maxwell: None,
+            inkling: None,
             clover: None,
             clover_stats: clover::CloverStats::default(),
             clover_pen: Default::default(),
@@ -5276,6 +5288,7 @@ impl Pipeline {
             && self.glm5_next.is_none()
             && self.hy4.is_none()
             && self.maxwell.is_none()
+            && self.inkling.is_none()
             && std::env::var("CMF_KV_REUSE").as_deref() != Ok("0")
     }
 
@@ -7413,6 +7426,39 @@ impl Pipeline {
             let mut lg = Vec::new();
             if let Some(b) = &mut self.maxwell {
                 crate::maxwell::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, pos, self.pool.as_deref(), &mut lg, want_logits);
+            }
+            if want_logits {
+                self.graph_logits = Some(lg);
+            }
+            pos += 1;
+            hidden.fill(0.0);
+        }
+        // Inkling-2-Mini: its own looped stack; the prompt on the
+        // card's batch graph when it takes it, else a token at a time.
+        if mtp.is_none() && pos + 1 < input_ids.len() {
+            let mut lg = Vec::new();
+            let taken = match &mut self.inkling {
+                Some(b) => crate::inkling::forward_prompt(&b.0, &b.1, &b.2, &mut b.3, &input_ids[pos..], pos, self.pool.as_deref(), &mut lg),
+                None => 0,
+            };
+            if taken > 0 {
+                pos += taken;
+                if pos == input_ids.len() {
+                    self.graph_logits = Some(lg);
+                }
+                hidden.fill(0.0);
+            }
+        }
+        while self.inkling.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let token_id = input_ids[pos];
+            let want_logits = pos + 1 == input_ids.len();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.inkling {
+                crate::inkling::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, pos, self.pool.as_deref(), &mut lg, want_logits);
             }
             if want_logits {
                 self.graph_logits = Some(lg);
@@ -12747,6 +12793,17 @@ impl Pipeline {
             }
             return Ok(logits);
         }
+        // Inkling-2-Mini: the prompt as generation reads it (the card's
+        // prompt calls, else host chunks), so bench times that route
+        if let Some(b) = &mut self.inkling {
+            let mut logits = Vec::new();
+            let taken = crate::inkling::forward_prompt(&b.0, &b.1, &b.2, &mut b.3, ids, 0, self.pool.as_deref(), &mut logits);
+            for (i, &t) in ids.iter().enumerate().skip(taken) {
+                crate::inkling::forward_token(&b.0, &b.1, &b.2, &mut b.3, t, i, self.pool.as_deref(), &mut logits, i + 1 == ids.len());
+            }
+            self.graph_logits = Some(logits.clone());
+            return Ok(logits);
+        }
         // Same routing predicate generation uses. Two reasons it must be
         // the same one: (1) a GDN hybrid's recurrent state is GPU-
         // resident, and a batched CPU prefill would build it on the host
@@ -14344,6 +14401,13 @@ impl Pipeline {
         if task_mask.is_none()
             && let Some(b) = &mut self.maxwell
             && let Some(r) = crate::maxwell::nll(&b.0, &b.1, &b.2, &mut b.3, ids, start, self.pool.as_deref())
+        {
+            return Ok(r);
+        }
+        // Inkling-2-Mini: the same, through its own stack
+        if task_mask.is_none()
+            && let Some(b) = &mut self.inkling
+            && let Some(r) = crate::inkling::nll(&b.0, &b.1, &b.2, &mut b.3, ids, start, self.pool.as_deref())
         {
             return Ok(r);
         }
@@ -16027,7 +16091,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() || self.glm5_next.is_some() || self.hy4.is_some() || self.maxwell.is_some() {
+        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() || self.glm5_next.is_some() || self.hy4.is_some() || self.maxwell.is_some() || self.inkling.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -17466,6 +17530,9 @@ impl Pipeline {
         }
         if self.maxwell.is_some() {
             return Err("network split: the Maxwell mHC stack is not splittable yet".into());
+        }
+        if self.inkling.is_some() {
+            return Err("network split: the Inkling looped stack is not splittable yet".into());
         }
         if self.per_token_stack() {
             return Err(
@@ -20291,6 +20358,7 @@ impl Pipeline {
             || self.glm5_next.is_some()
             || self.hy4.is_some()
             || self.maxwell.is_some()
+            || self.inkling.is_some()
             || self.per_token_stack()
         {
             return Err(false);
@@ -21831,6 +21899,7 @@ impl Pipeline {
             || self.glm5_next.is_some()
             || self.hy4.is_some()
             || self.maxwell.is_some()
+            || self.inkling.is_some()
             // Dynamic routing swaps FFN weights mid-sequence under the
             // packed graph; a blend has no single overlay. A STATIC skill
             // (`from_model_with_skill`) is fine: the pack reads the live
@@ -22708,6 +22777,7 @@ impl Pipeline {
                     && self.glm5_next.is_none()
                     && self.hy4.is_none()
                     && self.maxwell.is_none()
+                    && self.inkling.is_none()
                     && !self.per_token_stack())
         );
         // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
@@ -22741,6 +22811,14 @@ impl Pipeline {
             let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
             let mut logits = Vec::new();
             crate::maxwell::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, position, self.pool.as_deref(), &mut logits, true);
+            self.graph_logits = Some(logits);
+            return vec![0.0; self.hidden_size];
+        }
+        if let Some(b) = &mut self.inkling {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let mut logits = Vec::new();
+            crate::inkling::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, position, self.pool.as_deref(), &mut logits, true);
             self.graph_logits = Some(logits);
             return vec![0.0; self.hidden_size];
         }

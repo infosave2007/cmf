@@ -334,6 +334,10 @@ pub fn cmd_requant(
 /// Measured on Maxwell-V1-Flash (attention, shared experts and dense FFNs of
 /// its 4-bit file, 45 layers): rounding takes WikiText-2 perplexity from
 /// 32.38 to 36.5 (head included) for 55 → 69 tok/s on an L4.
+///
+/// Inkling 2's loop (`inkling2_loop`) reads a local layer's q, k and v from
+/// one row in the first pass and from three after it: its projections keep a
+/// Hessian each (`gptq_capture::set_alias(false)`), every pass folded in.
 pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], tokens: usize, window: usize, head: bool, lambda: f64) -> anyhow::Result<()> {
     use cortiq_engine::{Pipeline, SamplerConfig};
     use std::collections::{HashMap, HashSet};
@@ -381,6 +385,7 @@ pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], 
     eprintln!("calibrating {} matrices on {total} tokens ({} windows) …", names.len(), windows.len());
     let t0 = std::time::Instant::now();
     let keep = names.clone();
+    cortiq_engine::gptq_capture::set_alias(model.header.arch.arch_name != "inkling2_loop");
     cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
     for (i, w) in windows.iter().enumerate() {
         if let Err(e) = pipe.ppl_ids(w) {

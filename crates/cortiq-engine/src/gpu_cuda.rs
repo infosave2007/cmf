@@ -3393,6 +3393,17 @@ pub fn dory_reset(id: u64) {
     hyb::dory::reset(id);
 }
 
+/// Inkling-2-Mini's call on the card (`hyb::inkling`); `false` leaves the host to run it.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_forward(id: u64, g: &crate::inkling::Globals, layers: &[crate::inkling::Layer], cfg: &crate::inkling::Cfg, ids: &[u32], pos: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
+    selected() && hyb::inkling::forward(id, g, layers, cfg, ids, pos, want, all, logits)
+}
+
+/// A new Inkling sequence on the card.
+pub fn inkling_reset(id: u64) {
+    hyb::inkling::reset(id);
+}
+
 /// Has this Dory sequence gone over to the far field on the card?
 pub fn dory_sealed(id: u64) -> bool {
     hyb::dory::sealed(id)

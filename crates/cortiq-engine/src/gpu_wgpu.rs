@@ -88,6 +88,8 @@ pub(crate) mod vres;
 pub mod dflash_dev;
 pub(crate) mod vit;
 pub(crate) mod dory;
+/// Inkling-2-Mini's resident stack.
+pub(crate) mod inkling;
 pub(crate) mod uocr;
 pub(crate) mod broute;
 #[cfg(target_os = "macos")]

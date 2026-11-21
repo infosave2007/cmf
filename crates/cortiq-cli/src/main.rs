@@ -13,6 +13,7 @@ mod egemma2pack;
 mod nemotron_pack;
 mod hy4pack;
 mod maxwellpack;
+mod inklingpack;
 mod embed;
 mod flint;
 mod hotmix;
@@ -1014,7 +1015,7 @@ enum Commands {
         /// GPTQ-rounded (each matrix's output over the calibration rows
         /// kept) instead of rounded to the nearest level; repeat to mix
         /// texts, each giving an equal share of --tokens. Needs a model
-        /// whose host stack folds its inputs (Maxwell)
+        /// whose host stack folds its inputs (Maxwell, Inkling 2)
         #[arg(long)]
         calib: Vec<String>,
         /// q4tp-dense --calib: calibration tokens in all
@@ -8731,6 +8732,11 @@ async fn cmd_serve(
         // the block indexer: 0.7 GB), and the 8-bit file's experts already fill the
         // host's memory beside one of them.
         println!("    note: maxwell_moe serves with 1 slot");
+        slots = 1;
+    }
+    if slots != 1 && model.arch().arch_name == "inkling2_loop" {
+        // the card holds one sequence's 48 caches at a time
+        println!("    note: inkling2_loop serves with 1 slot");
         slots = 1;
     }
     if std::env::var("CMF_THREADS").is_err() {

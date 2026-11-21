@@ -39,8 +39,25 @@ pub const TOOL_MARKUP_TOKENS: &[&str] = &[
     "</param>",
 ];
 
+/// Inkling 2's turn markers: a model turn is `<|message_model|>` (a tool
+/// call's name after it), then `<|content_thinking|>`, `<|content_text|>` or
+/// `<|content_invoke_tool_json|>`, the part, `<|end_message|>`.
+#[derive(Clone, Copy, Debug)]
+struct InkMarks {
+    model: u32,
+    think: u32,
+    text: u32,
+    end: u32,
+    tool: u32,
+}
+
 /// A loaded BPE tokenizer.
 pub struct Tokenizer {
+    /// Inkling 2's turn markers, when the vocabulary has them (`ink_marks`).
+    ink: OnceLock<Option<InkMarks>>,
+    /// `decode_token`'s place in an Inkling turn (0 none, 1 thinking, 2 text,
+    /// 3 a tool call, 4 a turn's header).
+    ink_state: std::sync::atomic::AtomicU8,
     /// Token string → ID
     vocab: HashMap<String, u32>,
     /// ID → Token string
@@ -67,6 +84,8 @@ pub struct Tokenizer {
     /// pieces. The CLIP family isolates words that way — keeping the
     /// gaps would hand BPE a stray `Ġ` piece per space.
     split_drop_gap: Vec<bool>,
+    /// `model.ignore_merges`: a whole pre-token in the vocabulary is one token.
+    ignore_merges: bool,
     /// `model.end_of_word_suffix` (CLIP: `</w>`), appended to a piece's
     /// LAST symbol before the merges run — the merges themselves carry
     /// the suffix (`["th", "e</w>"]`), so plain words resolve to their
@@ -169,6 +188,10 @@ struct HfModel {
     /// CLIP's `</w>`: the BPE model appends it to a word's last symbol.
     #[serde(default)]
     end_of_word_suffix: Option<String>,
+    /// o200k-style BPE (Inkling 2): a pre-token that is a vocabulary entry
+    /// as a whole is that token, the merges never run on it.
+    #[serde(default)]
+    ignore_merges: bool,
 }
 
 /// Merge rules come in two HF flavours: legacy `"a b"` strings and
@@ -366,6 +389,17 @@ fn close_direct_think(rendered: String, enable_thinking: Option<bool>) -> String
         return out;
     }
     rendered
+}
+
+/// An Inkling tool call `{"name": …, "args": {…}}` as the Hermes spelling the
+/// server's parser reads; a body that is not that JSON goes through as it is.
+fn ink_tool_call(body: &str) -> String {
+    let fixed = serde_json::from_str::<serde_json::Value>(body.trim()).ok().and_then(|v| {
+        let name = v.get("name")?.clone();
+        let args = v.get("args").or_else(|| v.get("arguments")).cloned().unwrap_or_else(|| serde_json::json!({}));
+        Some(serde_json::json!({ "name": name, "arguments": args }).to_string())
+    });
+    format!("<tool_call>{}</tool_call>", fixed.unwrap_or_else(|| body.to_string()))
 }
 
 impl Tokenizer {
@@ -598,6 +632,8 @@ impl Tokenizer {
         );
 
         Ok(Self {
+            ink: OnceLock::new(),
+            ink_state: std::sync::atomic::AtomicU8::new(0),
             vocab,
             id_to_token,
             ranks,
@@ -607,6 +643,7 @@ impl Tokenizer {
             special_ids,
             split_res,
             split_drop_gap,
+            ignore_merges: hf.model.ignore_merges,
             eow_suffix: hf.model.end_of_word_suffix,
             lowercase,
             collapse_ws,
@@ -638,6 +675,8 @@ impl Tokenizer {
         }
         let (byte_to_char, char_to_byte) = bytes_to_unicode();
         Self {
+            ink: OnceLock::new(),
+            ink_state: std::sync::atomic::AtomicU8::new(0),
             vocab,
             id_to_token,
             ranks: HashMap::new(),
@@ -647,6 +686,7 @@ impl Tokenizer {
             special_ids: HashSet::new(),
             split_res: Vec::new(),
             split_drop_gap: Vec::new(),
+            ignore_merges: false,
             eow_suffix: None,
             lowercase: false,
             collapse_ws: false,
@@ -926,6 +966,13 @@ impl Tokenizer {
             .bytes()
             .map(|b| self.byte_to_char[b as usize].to_string())
             .collect();
+        if self.ignore_merges {
+            let whole: String = mapped.concat();
+            if let Some(&id) = self.vocab.get(&whole) {
+                out.push(id);
+                return;
+            }
+        }
         let mut sym = mapped;
         // CLIP's `end_of_word_suffix`: the last symbol of the word wears
         // it before any merge runs, so the suffixed merges ("th",
@@ -988,7 +1035,90 @@ impl Tokenizer {
 
     /// Decode token IDs back to text. Special tokens are skipped; added
     /// tokens are raw text; everything else reverses the byte-level map.
+    /// Inkling 2's markers, when this vocabulary has them.
+    fn ink_marks(&self) -> Option<InkMarks> {
+        *self.ink.get_or_init(|| {
+            let id = |t: &str| self.vocab.get(t).copied().or_else(|| self.added.iter().find(|(s, _)| s == t).map(|&(_, i)| i));
+            id("<|content_model_end_sampling|>")?;
+            Some(InkMarks {
+                model: id("<|message_model|>")?,
+                think: id("<|content_thinking|>")?,
+                text: id("<|content_text|>")?,
+                end: id("<|end_message|>")?,
+                tool: id("<|content_invoke_tool_json|>")?,
+            })
+        })
+    }
+
+    /// An Inkling turn in the `<think>` / `<tool_call>` spelling the rest of
+    /// the engine reads: a thinking part becomes `<think>…</think>`, a tool
+    /// call `<tool_call>{"name", "arguments"}</tool_call>`, a text part its
+    /// text; the headers and other markers go.
+    fn ink_decode(&self, m: InkMarks, ids: &[u32]) -> String {
+        let mut out = String::new();
+        let mut run: Vec<u32> = Vec::new();
+        // 0 none, 1 thinking, 2 text, 3 tool call, 4 header
+        let mut state = 0u8;
+        let flush = |run: &mut Vec<u32>, out: &mut String| {
+            if !run.is_empty() {
+                out.push_str(&self.decode_plain(run));
+                run.clear();
+            }
+        };
+        let mut tool = String::new();
+        for &id in ids {
+            if id == m.model {
+                flush(&mut run, &mut out);
+                state = 4;
+            } else if id == m.think {
+                run.clear();
+                out.push_str("<think>");
+                state = 1;
+            } else if id == m.text {
+                run.clear();
+                state = 2;
+            } else if id == m.tool {
+                run.clear();
+                state = 3;
+            } else if id == m.end {
+                if state == 3 {
+                    tool.push_str(&self.decode_plain(&run));
+                    run.clear();
+                    out.push_str(&ink_tool_call(&tool));
+                    tool.clear();
+                } else {
+                    flush(&mut run, &mut out);
+                    if state == 1 {
+                        out.push_str("</think>\n\n");
+                    }
+                }
+                state = 0;
+            } else if state == 4 || self.special_ids.contains(&id) {
+                // a header's name, or another marker
+            } else {
+                run.push(id);
+            }
+        }
+        if state == 3 {
+            tool.push_str(&self.decode_plain(&run));
+            out.push_str("<tool_call>");
+            out.push_str(&tool);
+        } else {
+            flush(&mut run, &mut out);
+        }
+        out
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
+        if let Some(m) = self.ink_marks()
+            && ids.iter().any(|&i| i == m.model || i == m.think || i == m.text || i == m.end || i == m.tool)
+        {
+            return self.ink_decode(m, ids);
+        }
+        self.decode_plain(ids)
+    }
+
+    fn decode_plain(&self, ids: &[u32]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             if self.special_ids.contains(&id) {
@@ -1052,7 +1182,44 @@ impl Tokenizer {
 
     /// Streaming decode of ONE token: no sequence-level Strip — a
     /// per-token strip would eat the ▁-spaces of every SP word.
+    /// An Inkling turn marker one token at a time (`decode_token` and the
+    /// stream): `Some` of its spelling (the thinking part's `<think>` …
+    /// `</think>`, a tool call's `<tool_call>` … `</tool_call>`, nothing for the
+    /// others and for a turn header's name), `None` for a token of a part.
+    fn ink_token(&self, id: u32) -> Option<String> {
+        let m = self.ink_marks()?;
+        use std::sync::atomic::Ordering::Relaxed;
+        let st = &self.ink_state;
+        if id == m.model {
+            st.store(4, Relaxed);
+            return Some(String::new());
+        }
+        if id == m.think {
+            st.store(1, Relaxed);
+            return Some("<think>".into());
+        }
+        if id == m.text {
+            st.store(2, Relaxed);
+            return Some(String::new());
+        }
+        if id == m.tool {
+            st.store(3, Relaxed);
+            return Some("<tool_call>".into());
+        }
+        if id == m.end {
+            return Some(match st.swap(0, Relaxed) {
+                1 => "</think>\n\n".into(),
+                3 => "</tool_call>".into(),
+                _ => String::new(),
+            });
+        }
+        (st.load(Relaxed) == 4).then(String::new)
+    }
+
     pub fn decode_token(&self, id: u32) -> String {
+        if let Some(t) = self.ink_token(id) {
+            return t;
+        }
         if self.special_ids.contains(&id) {
             return String::new();
         }
@@ -1095,6 +1262,9 @@ impl Tokenizer {
     /// The incomplete tail waits in `pending` (one per stream) and comes out
     /// with the token that completes it; invalid bytes still decode lossily.
     pub fn decode_token_stream(&self, id: u32, pending: &mut Vec<u8>) -> String {
+        if let Some(t) = self.ink_token(id) {
+            return t;
+        }
         if self.special_ids.contains(&id) {
             return String::new();
         }
@@ -1180,6 +1350,9 @@ impl Tokenizer {
     /// Decode generated protocol text while retaining special markers. The
     /// V4.1 harmony parser needs `<think>`, EOS, and spaced DSML tags.
     pub fn decode_for_protocol(&self, ids: &[u32]) -> String {
+        if self.ink_marks().is_some() {
+            return self.decode(ids);
+        }
         let mut out = String::new();
         for &id in ids {
             let idx = id as usize;
@@ -1383,7 +1556,16 @@ impl Tokenizer {
         let tpl_src = strip_generation_tags(tpl);
         // a direct answer's reasoning budget: GLM-5's templates take `low`,
         // Hy4-flash's only `no_think` / `high` / `max` (it raises on `low`)
-        let off_effort: &'static str = if tpl_src.contains("no_think") { "no_think" } else { "low" };
+        // Inkling 2's dial is a number (`none` = 0, a direct answer) and its turn
+        // has no think block to close
+        let inkling = tpl_src.contains("<|content_model_end_sampling|>") && tpl_src.contains("Thinking effort level");
+        let off_effort: &'static str = if tpl_src.contains("no_think") {
+            "no_think"
+        } else if inkling {
+            "none"
+        } else {
+            "low"
+        };
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
@@ -1443,6 +1625,9 @@ impl Tokenizer {
                 tool_call_format => "json",
             })?,
         };
+        if inkling {
+            return Ok(rendered);
+        }
         Ok(close_direct_think(rendered, enable_thinking))
     }
 
@@ -1505,8 +1690,16 @@ impl Tokenizer {
         self.add_special_globals(&mut env);
         let tpl_src = strip_generation_tags(tpl);
         // a direct answer's reasoning budget: GLM-5's templates take `low`,
-        // Hy4-flash's only `no_think` / `high` / `max` (it raises on `low`)
-        let off_effort: &'static str = if tpl_src.contains("no_think") { "no_think" } else { "low" };
+        // Hy4-flash's only `no_think` / `high` / `max` (it raises on `low`),
+        // Inkling 2 a number (`none` = 0)
+        let inkling = tpl_src.contains("<|content_model_end_sampling|>") && tpl_src.contains("Thinking effort level");
+        let off_effort: &'static str = if tpl_src.contains("no_think") {
+            "no_think"
+        } else if inkling {
+            "none"
+        } else {
+            "low"
+        };
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
@@ -1530,6 +1723,9 @@ impl Tokenizer {
                 add_generation_prompt => true,
             })?,
         };
+        if inkling {
+            return Ok(rendered);
+        }
         Ok(close_direct_think(rendered, enable_thinking))
     }
 
@@ -2386,5 +2582,68 @@ mod generation_tag_tests {
         // The word appearing in TEXT is not a statement.
         let prose = "{{ 'the generation of tokens' }}";
         assert_eq!(strip_generation_tags(prose), prose);
+    }
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::Tokenizer;
+
+    /// A byte-level BPE whose merges would split "abc" as "a" + "bc"; with
+    /// `ignore_merges` the whole word is its own entry.
+    fn tok(ignore: bool) -> Tokenizer {
+        let json = format!(
+            r#"{{"model": {{"type": "BPE", "ignore_merges": {ignore}, "vocab": {{"a": 0, "b": 1, "c": 2, "bc": 3, "abc": 4}}, "merges": [["b", "c"]]}},
+               "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false, "use_regex": false}},
+               "added_tokens": []}}"#
+        );
+        Tokenizer::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn ignore_merges_takes_a_whole_word_from_the_vocabulary() {
+        assert_eq!(tok(false).encode("abc"), vec![0, 3]);
+        assert_eq!(tok(true).encode("abc"), vec![4]);
+        // a word that is not an entry still merges
+        assert_eq!(tok(true).encode("bc"), vec![3]);
+        assert_eq!(tok(true).encode("cbc"), vec![2, 3]);
+    }
+
+    #[test]
+    fn an_inkling_turn_decodes_as_think_and_text() {
+        let json = r#"{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+               "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+               "added_tokens": [
+                 {"id": 2, "content": "<|message_model|>", "special": true},
+                 {"id": 3, "content": "<|content_thinking|>", "special": true},
+                 {"id": 4, "content": "<|content_text|>", "special": true},
+                 {"id": 5, "content": "<|end_message|>", "special": true},
+                 {"id": 6, "content": "<|content_invoke_tool_json|>", "special": true},
+                 {"id": 7, "content": "<|content_model_end_sampling|>", "special": true}]}"#;
+        let t = Tokenizer::from_json(json).unwrap();
+        assert_eq!(t.decode(&[2, 3, 0, 5, 2, 4, 1, 5, 7]), "<think>a</think>\n\nb");
+        assert_eq!(t.decode(&[2, 4, 1, 1, 5]), "bb");
+        let streamed: String = [2u32, 3, 0, 5, 2, 4, 1, 5, 7].iter().map(|&i| t.decode_token(i)).collect();
+        assert_eq!(streamed, "<think>a</think>\n\nb");
+        // the UTF-8-safe stream `run` prints with marks the parts the same way
+        let mut pending = Vec::new();
+        let streamed: String = [2u32, 3, 0, 5, 2, 4, 1, 5, 7].iter().map(|&i| t.decode_token_stream(i, &mut pending)).collect();
+        assert_eq!(streamed, "<think>a</think>\n\nb");
+    }
+}
+
+#[cfg(test)]
+mod ink_parity {
+    /// `CMF_TOK_PARITY=<tokenizer.json>,<text file>,<out ids file>`: the ids of the
+    /// text, one a line, for a comparison against the reference tokenizer.
+    #[test]
+    #[ignore]
+    fn dump_ids() {
+        let Ok(spec) = std::env::var("CMF_TOK_PARITY") else { return };
+        let mut it = spec.split(',');
+        let (tj, txt, out) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        let t = super::Tokenizer::from_file(tj).unwrap();
+        let ids = t.encode(&std::fs::read_to_string(txt).unwrap());
+        std::fs::write(out, ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
     }
 }

@@ -10008,6 +10008,28 @@ pub fn run_convert_multi_excluding(
         progress(1.0);
         return Ok(());
     }
+    // Inkling-2-Mini: a looped stack with block attention residuals, short
+    // convolutions and NVFP4 / MXFP8 experts in the source.
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| crate::inklingpack::detect(&c))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "inkling2_loop: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
+        );
+        for (q, path) in outputs {
+            crate::inklingpack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
     // Hy4-flash: identity hyper-connections, latent MoE, Engram tables.
     if let Some(dir) = Some(Path::new(model)).filter(|d| {
         fs::read(d.join("config.json"))

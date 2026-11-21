@@ -7,28 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.12] — 2026-11-21
+
 ### Added
-- NVG on CUDA: `convert --quant blr --blr-method nvg`, `nvg-bench` and `nvg-train` (with `--mask-keep`) run whole
-  on the card under `CMF_GPU=cuda` (a build with the `cuda` feature), with no Vulkan adapter — the calibration
-  forward and its Grams, the encoder (cuBLAS products, a blocked Cholesky, the eigensolver, the output-side knots
-  as kernels) and the trainer. Files, snapshots and training states are those of the wgpu path; a state saved by
-  one backend resumes on the other. On one RTX PRO 6000 Blackwell against wgpu on the same card: Qwen3.5-0.8B at
-  1.0 bpw converts in 64 s (492 s), a layer's calibration 0.45 s (2.6 s), its encode 1.5–1.7 s (17 s); a training
-  step of 8 × 512 tokens with signs 0.28 s (0.69 s), 1 M tokens in 97 s (227 s), held-out KL 1.4440 (1.4490).
-  Qwen3.8-27B at 0.55 bpw: 2.97 s a step (5.48 s), 1 M tokens with their teacher pass in 16.2 min (29.5), the
-  teacher pass 5.0k tok/s (2.7k), a layer's encode 28–30 s (103–107 s). The trainer keeps h and g
-  in the f16 sign planes, so a layer input is staged once and the scales' gradients are row sums of the sign
-  gradients; the GDN recurrence runs forward in 512-thread blocks and backward as batched products over chunks of
-  64 positions (a layer's reverse sweep 7.0 ms where a per-position kernel takes 12.7); the rank activations of a
-  step's forward serve its recompute (`CMF_NVG_ACACHE_GB`). The encoder's job threads queue on streams of their
-  own, and a tensor's two candidates are built on two threads. A conversion repeated on CUDA gives the same bytes.
-  `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
-- `convert --blr-channel-scale ALPHA` (device encoder): SFq's input channel scale for NVG, off by default. On the
-  0.8B at 1.0 bpw it makes the untrained file better at every seed — the KL to the teacher 3–4 % lower, WikiText-2
-  perplexity about 15 % (730 → 608 at 1.0) — and the reference training erases the difference. What does survive
-  the training is a gentler fit: `--blr-rho 0.1` on four times the calibration rows ends 2 % lower in held-out KL
-  at three training seeds (−1.6 … −2.5 %), reaching the unchanged file's final KL at about step 195 of 256.
-  Defaults unchanged; not repeated on the 27B. `docs/BLR_NVG.md` §8.6.
 - maxwell-model/Maxwell-V1-Flash (`maxwell_moe`, 35B mixture of experts, 3B active a token) converts natively
   (`cortiq convert`, profiles `q8_2f` and `q4tp`) and runs on its own stack: four residual streams with
   manifold-constrained hyper-connections (the DeepSeek-V4 form, a Sinkhorn mix of 20 rounds, a learned closing
@@ -62,14 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expert sees one token in twenty, some a few hundred rows) the 4-bit file's perplexity goes from 32.400 /
   7.421 / 7.489 / 21.352 (WikiText-2 / Rust / Python / WikiText-2 over 6144-token windows, experts rounded) to
   31.782 / 7.215 / 7.513 / 20.610; without the prior to 32.316 / 7.205 / 7.620 / 21.567.
-- `cortiq requant --quant q4tp-dense --calib TEXT…` (`--tokens`, `--calib-window`, `--calib-head`, `--lambda`):
-  the dense trunk's q8_2f matrices GPTQ-rounded into q4tp over a calibration text instead of rounded to the
-  nearest level, for a model whose host stack folds its inputs into the Hessian hook (Maxwell: the attention
-  projections, the shared experts and the dense FFNs, 64 rows a panel; the folds' algebra on cuBLAS when the
-  build has it). Maxwell's q4tp file on an L4:
-  55.5 → 66 tok/s; perplexity (WikiText-2 / Rust / Python / WikiText-2 over 6144-token windows) 32.400 / 7.421 /
-  7.489 / 21.352 against 32.380 / 7.192 / 7.554 / 20.947 before, and 34.892 / 7.856 / 8.242 / 20.837 when the
-  same matrices are only rounded (3072 calibration tokens of prose, Rust and Python, 512-token windows).
 - wgpu: Maxwell's block-sparse attention on the card (`gpu_wgpu::broute`, the CUDA arm's `hy_route_*` and the
   host's `maxwell::route_blocks` its specification): the indexer's projections, norms and rotation, an index-key
   mirror a layer, the candidate blocks' scores, every (row, KV group)'s block list, and the attention over the
@@ -88,34 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   weights stay on the card (19.3 GB) and a sequence leaves it for the host, with one warning, past the positions
   the rest of the card holds (the wgpu graphs keep a key and a value a head of every position, 1.4 MB a position
   here: about 2 200), where an allocation used to fail (a panic in wgpu at a 3072-token prompt).
-- SFq inside NVG at 0.55 bpw (device encoder, both backends, all off by default): `CMF_NVG_CD=passes` — SFq's code
-  refinement for NVG's input-side signs, exact coordinate descent over the columns of `diag(g)·S_V` (each column
-  solved by the input-side search's own column solver against the exact residual of every other column and path,
-  its change sent to all of them by one device GEMM per 128 columns; the error never rises), `CMF_NVG_CD_RIDGE`
-  for SFq's ridge in its Gram; `CMF_NVG_CS_DAMP=orig|only` for `--blr-channel-scale` — the scaled encoder with the
-  original basis's damping, or no change of basis and only the scaled basis's damping, a ridge of its own per
-  input. In NVG an input scale is absorbed exactly by g, so SFq's scale has no group step to even out: the tensors'
-  errors stay the same and the scale's gain lives in that damping. Qwen3.5-0.8B at 0.55 bpw, untrained: held-out
-  KL to the teacher 4.324 → 4.166 with `--blr-channel-scale 0.75` (WikiText-2 / C4 perplexity 1770 / 2150 →
-  1528 / 1695), 4.187 with the per-input ridge alone at α 1.0, 4.377 / 4.348 with the refinement without / with the
-  ridge; after 1 M tokens of training all within 2.5 % of each other. Qwen3.8-27B at 0.55 bpw, converted whole on
-  CUDA from the bf16 checkpoint: untrained KL 3.463 → 3.427 with `--blr-channel-scale 0.75` (WikiText-2 / C4
-  152.1 / 418.1 → 146.8 / 404.2), 3.451 with the per-input ridge. `docs/BLR_NVG.md` §8.6,
-  `docs/Q2TP_SCALE_REFINE.md`.
 
 ### Changed
-- NVG device encoder, both backends: the flips of the input-side column search run on the host thread that encodes
-  the tensor, the feedback between column blocks stays a device GEMM. The search is sequential twice over, so a
-  device runs it as one block on one multiprocessor — about a microsecond a flip at any rank, 38 s of the 51 a
-  Qwen3.8-27B `down_proj` took on CUDA — while a host core passes over the r candidates in vector registers.
-  Qwen3.8-27B, a layer's encode: on CUDA 90–96 → 38–40 s with one tensor in flight and 28–30 s with three (with
-  the encoder's own streams and candidate threads), on wgpu 149 → 103–107 s. Qwen3.5-0.8B on CUDA: `down_proj`'s
-  search 1.57 → 0.48 s; on wgpu a layer's encode 17.8 → 14.2 s. The same search with its
-  sums in another order: files differ in the fourth digit of a tensor's error, and after the reference training
-  four conversions end at KL 1.4622 and 1.4546 (device kernel), 1.4669 and 1.4595 (host flips).
-  `CMF_NVG_GV=device` keeps the kernel (x86-64 hosts without AVX2 + FMA use it too). `docs/BLR_NVG.md` §4.1.
-- `nvg-train --sign-lr`: the help says what a trained file takes (about a quarter of `auto`; at the full rate the
-  guard halves it twice on its own).
 - CUDA hybrid arm: a stack that keeps every position on the card (Maxwell's block route: 101 KB a token over 45
   layers) holds its context's rows in the plan's reserve beside the expert slots: the rows of `CMF_MAX_SEQ`, or
   with none named the rows that fit beside weights that stay on the card whole (4096 at least, 32 768 at most;
@@ -144,11 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports wgpu's budget while it runs on macOS. Maxwell's 4-bit file on a MacBook Air M4 over wgpu: WikiText-2
   perplexity 28.057 against 28.066 on the CPU (two 512-token windows), 9 tok/s decode against 14–16 on the CPU,
   which stays the default there. `CMF_STREAM_STATS=1` prints the stream's waits, gaps and submits.
-- CUDA GPTQ (`gpu_cuda/gptq.rs`): the Cholesky's upload by `cublasSetMatrix` is followed by a wait on the legacy
-  stream before work queued on the backend's stream reads the block (from pageable memory the call returns before
-  its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
-- `nvg-bench --layer L --gram-cache PREFIX` notes the layer beside the cached Grams and refuses a prefix captured
-  for another layer; before, the second layer was encoded on the first one's inputs without a word.
+- wgpu on Apple silicon: `CMF_WGPU_NOCOPY=1` reads a MoE layer's routed experts in place from the file's mapping
+  (`gpu_wgpu::nocopy`: one no-copy Metal buffer a layer, the gate/up/down planes bound at their offsets, an expert the
+  file's stride on) — no stream and no wait for the picks. Off by default: Metal keeps a command buffer's buffers
+  resident whole, and on a 24 GB M4 the 17.7 GB of Maxwell's banks did not stay in memory beside the system (each
+  token re-read them from the disk).
 - wgpu batch graph: the expert-grouped MoE prompt kernels made their bucket, entry and slot-row buffers anew for
   every layer of a call and kept them to its submit (Maxwell: 106 KB a row a layer, 2.2 GB for a 512-row chunk); one
   set now serves every layer and call (`moeg_bufs`). Same perplexity.
@@ -161,6 +108,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens at "31 tok/s"). The graph declines now and the host runs the token.
 - CUDA: Dory's prompt arm launched `hy_softmax_h` with 9 of the kernel's 11 arguments (its window and sink
   pointer read past the argument array); it passes all of them now.
+
+## [0.9.11] — 2026-11-21
+
+### Added
+- thinkingmachines/Inkling-2-Mini (`inkling2_loop`) converts natively: the release's NVFP4 (layers 0–19) and MXFP8
+  (20–23) experts are decoded and stored as q4tp, q8_2f or byte for byte (`--quant nvfp4`). Its own stack on the
+  host, CUDA, Metal and wgpu: 24 layers, layers 6–17 three passes (48 applications, each with its own keys, values
+  and convolution rings), a learned relative bias over 1 024 distances instead of RoPE (log-scaled queries on the 4
+  full layers past 8 192 positions), per-token sinks, sigmoid output gates, short convolutions on keys, values and
+  both residual branches, block attention residuals, message gates between passes, 128 σ-routed experts with a
+  softcapped SwiGLU, a logit softcap. Perplexity of the published 4-bit file (q4tp experts, GPTQ dense trunk, 8-bit
+  head) against the release's layers in f32 (transformers PR #51050) on the same windows: WikiText-2 9.057 (8.944),
+  2 × 4096 tokens 7.383 (7.310), Rust 3.148 (3.124), Python 2.861 (2.851); Vulkan 9.057 / 7.377, Metal 9.055 / 7.380.
+  Text only: the vision tower and the MTP drafter are not converted.
+- Inkling's chat format: the thinking-effort line (`--reasoning-effort`, the server's `reasoning_effort`;
+  `--no-think` and `enable_thinking: false` give effort `none`), its thinking and JSON tool-call parts decoded as
+  `<think>` / `<tool_call>` for the CLI stream and the server (`reasoning_content`, `tool_calls`). `serve` runs it
+  with one slot.
+- `cortiq requant --quant q4tp-dense --calib FILE…`: GPTQ of a file's dense trunk through the host stack (a looped
+  model's projections take one Hessian over all their passes). Inkling-2-Mini's trunk: 15.00 → 14.69 GB, CUDA decode
+  41.6 → 47.1 tok/s, perplexity +0.3 %.
+- CUDA, Inkling: a prompt path (calls of up to 512 rows, `CMF_INKLING_ROWS`: the weights expanded to f16 through
+  cuBLAS, the routed experts grouped by expert as the hybrid prompt path's), decode attention split over 256-key tiles,
+  the arm's buffers carved from shared slabs. NVIDIA L4: decode 51.7 tok/s; a 2 048 / 8 192 / 32 768-token prompt in
+  3.82 / 18.2 / 111 s (12.9 / 54 / — s at 16 rows a call), decode after it 48.5 / 45.9 / 39.1 (38.0 / 32.3 / —);
+  peak card memory 21.0 → 15.1 GB (the driver rounded each of the 6144 expert matrices up to an even megabyte).
+- Metal and wgpu, Inkling: prompt calls of 256 / 128 rows with the routed experts grouped by expert as GEMMs (Metal:
+  the backend's `q4tp_mul_mm` over gathered rows; wgpu: a tiled WGSL GEMM), Metal's dense matrices through
+  `q4tp_mul_mm`. Apple M4: a 512-token prompt in 3.70 s (15.5 s before, on the file with an 8-bit trunk), decode
+  21.5 tok/s; Vulkan on an L4: a 2 048-token prompt in 17.9 s (64 s), decode 18.7. `CMF_INKLING_MOE=pick|loop|gemm`
+  picks the expert kernels.
+- NVG on CUDA: `convert --quant blr --blr-method nvg`, `nvg-bench` and `nvg-train` (with `--mask-keep`) run whole
+  on the card under `CMF_GPU=cuda` (a build with the `cuda` feature), with no Vulkan adapter — the calibration
+  forward and its Grams, the encoder (cuBLAS products, a blocked Cholesky, the eigensolver, the output-side knots
+  as kernels) and the trainer. Files, snapshots and training states are those of the wgpu path; a state saved by
+  one backend resumes on the other. On one RTX PRO 6000 Blackwell against wgpu on the same card: Qwen3.5-0.8B at
+  1.0 bpw converts in 64 s (492 s), a layer's calibration 0.45 s (2.6 s), its encode 1.5–1.7 s (17 s); a training
+  step of 8 × 512 tokens with signs 0.28 s (0.69 s), 1 M tokens in 97 s (227 s), held-out KL 1.4440 (1.4490).
+  Qwen3.8-27B at 0.55 bpw: 2.97 s a step (5.48 s), 1 M tokens with their teacher pass in 16.2 min (29.5), the
+  teacher pass 5.0k tok/s (2.7k), a layer's encode 28–30 s (103–107 s). The trainer keeps h and g
+  in the f16 sign planes, so a layer input is staged once and the scales' gradients are row sums of the sign
+  gradients; the GDN recurrence runs forward in 512-thread blocks and backward as batched products over chunks of
+  64 positions (a layer's reverse sweep 7.0 ms where a per-position kernel takes 12.7); the rank activations of a
+  step's forward serve its recompute (`CMF_NVG_ACACHE_GB`). The encoder's job threads queue on streams of their
+  own, and a tensor's two candidates are built on two threads. A conversion repeated on CUDA gives the same bytes.
+  `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
+- `convert --blr-channel-scale ALPHA` (device encoder): SFq's input channel scale for NVG, off by default. On the
+  0.8B at 1.0 bpw it makes the untrained file better at every seed — the KL to the teacher 3–4 % lower, WikiText-2
+  perplexity about 15 % (730 → 608 at 1.0) — and the reference training erases the difference. What does survive
+  the training is a gentler fit: `--blr-rho 0.1` on four times the calibration rows ends 2 % lower in held-out KL
+  at three training seeds (−1.6 … −2.5 %), reaching the unchanged file's final KL at about step 195 of 256.
+  Defaults unchanged; not repeated on the 27B. `docs/BLR_NVG.md` §8.6.
+- SFq inside NVG at 0.55 bpw (device encoder, both backends, all off by default): `CMF_NVG_CD=passes` — SFq's code
+  refinement for NVG's input-side signs, exact coordinate descent over the columns of `diag(g)·S_V` (each column
+  solved by the input-side search's own column solver against the exact residual of every other column and path,
+  its change sent to all of them by one device GEMM per 128 columns; the error never rises), `CMF_NVG_CD_RIDGE`
+  for SFq's ridge in its Gram; `CMF_NVG_CS_DAMP=orig|only` for `--blr-channel-scale` — the scaled encoder with the
+  original basis's damping, or no change of basis and only the scaled basis's damping, a ridge of its own per
+  input. In NVG an input scale is absorbed exactly by g, so SFq's scale has no group step to even out: the tensors'
+  errors stay the same and the scale's gain lives in that damping. Qwen3.5-0.8B at 0.55 bpw, untrained: held-out
+  KL to the teacher 4.324 → 4.166 with `--blr-channel-scale 0.75` (WikiText-2 / C4 perplexity 1770 / 2150 →
+  1528 / 1695), 4.187 with the per-input ridge alone at α 1.0, 4.377 / 4.348 with the refinement without / with the
+  ridge; after 1 M tokens of training all within 2.5 % of each other. Qwen3.8-27B at 0.55 bpw, converted whole on
+  CUDA from the bf16 checkpoint: untrained KL 3.463 → 3.427 with `--blr-channel-scale 0.75` (WikiText-2 / C4
+  152.1 / 418.1 → 146.8 / 404.2), 3.451 with the per-input ridge. `docs/BLR_NVG.md` §8.6,
+  `docs/Q2TP_SCALE_REFINE.md`.
+
+### Changed
+- NVG device encoder, both backends: the flips of the input-side column search run on the host thread that encodes
+  the tensor, the feedback between column blocks stays a device GEMM. The search is sequential twice over, so a
+  device runs it as one block on one multiprocessor — about a microsecond a flip at any rank, 38 s of the 51 a
+  Qwen3.8-27B `down_proj` took on CUDA — while a host core passes over the r candidates in vector registers.
+  Qwen3.8-27B, a layer's encode: on CUDA 90–96 → 38–40 s with one tensor in flight and 28–30 s with three (with
+  the encoder's own streams and candidate threads), on wgpu 149 → 103–107 s. Qwen3.5-0.8B on CUDA: `down_proj`'s
+  search 1.57 → 0.48 s; on wgpu a layer's encode 17.8 → 14.2 s. The same search with its
+  sums in another order: files differ in the fourth digit of a tensor's error, and after the reference training
+  four conversions end at KL 1.4622 and 1.4546 (device kernel), 1.4669 and 1.4595 (host flips).
+  `CMF_NVG_GV=device` keeps the kernel (x86-64 hosts without AVX2 + FMA use it too). `docs/BLR_NVG.md` §4.1.
+- `nvg-train --sign-lr`: the help says what a trained file takes (about a quarter of `auto`; at the full rate the
+  guard halves it twice on its own).
+
+### Fixed
+- Tokenizer: BPE `ignore_merges` (o200k-style vocabularies) — a word that is a vocabulary entry is that entry; before,
+  Inkling's tokenizer split 29 extra tokens out of WikiText-2 test.
+- `bench` timed an Inkling prompt a token at a time (`forward_ids`); it now takes the route generation takes.
+- CUDA GPTQ (`gpu_cuda/gptq.rs`): the Cholesky's upload by `cublasSetMatrix` is followed by a wait on the legacy
+  stream before work queued on the backend's stream reads the block (from pageable memory the call returns before
+  its copy lands; the same order gave the NVG encoder an occasional "Gram not SPD").
+- `nvg-bench --layer L --gram-cache PREFIX` notes the layer beside the cached Grams and refuses a prefix captured
+  for another layer; before, the second layer was encoded on the first one's inputs without a word.
 
 ## [0.9.10] — 2026-11-21
 
