@@ -1531,7 +1531,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
         st(c, 8, &mut tp)?;
         // 9. the routed experts into y
-        moe(c, d, cfg, l, n)?;
+        moe(c, d, cfg, l, n, &mut tp)?;
         st(c, 9, &mut tp)?;
         // 10. the output convolution onto the running sum
         let (nul, m1) = (0u64, -1i32);
@@ -1849,7 +1849,7 @@ unsafe fn gate(c: &Ctx, f: &Fx, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, 
 /// this arm's buffers): the router, the picks laid out as slots, every slot's
 /// gate/up pair (Inkling's activation in its epilogue) and down, the mixture
 /// into `y`.
-unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
+unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
     let fx = &d.hfx;
     let hidden = cfg.dim;
     let e = l.e;
@@ -1876,6 +1876,7 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
                 d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
             ),
         )?;
+        st(c, 11, tp)?;
         let t = (tb - 1) as usize;
         let pick = |kd: Option<usize>| match kd {
             Some(dd) => fx.mmpk[nt_of(n)][t][1][dd],
@@ -1883,7 +1884,9 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
         };
         let xs_i = hidden as i32;
         c.launch(pick(l.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?;
+        st(c, 12, tp)?;
         c.launch(pick(l.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?;
+        st(c, 13, tp)?;
         cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
         let zero = 0i32;
         c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;
