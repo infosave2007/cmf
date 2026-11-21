@@ -384,6 +384,13 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let rows = cfg.dense_range() + cfg.dense_range() / 8;
     let mirrors = (rows * layers.len() * 2 * cfg.nkv * cfg.hd * 4) as u64;
     crate::gpu::wgpu_reserve_at_least(mirrors + (2u64 << 30));
+    // — but not below the weights themselves: the stack takes no device prefix, so a card
+    // that could hold them and is told to keep less runs every token on the host (a 24 GB
+    // card under the 4-bit file: 19.3 GB resident, prompts of 3 000 tokens beside them).
+    // The embedding stays on the host.
+    let emb = model.tensor("model.embed_tokens.weight").map_or(0, |e| e.nbytes as u64);
+    let on_card: u64 = model.tensors.iter().map(|e| e.nbytes as u64).sum::<u64>().saturating_sub(emb);
+    crate::gpu::wgpu_keep_at_least(on_card + on_card / 40 + (64 << 20));
     let mut state = State { pos: 0, tokens: Vec::new(), layers: Vec::new(), sequence_id: 0, graph: None };
     state.reset(layers.len());
     Ok((globals, layers, cfg, state))
@@ -655,6 +662,20 @@ fn gf(d: &[f32]) -> crate::gpu::GraphW<'_> {
 /// The stack as graph layers for a call ending at `end` positions (None: a
 /// weight the graphs cannot address, or a call past the dense range on a
 /// backend whose attention has no block router).
+/// Positions a discrete card holds over wgpu beside the weights: its graphs keep a key and a
+/// value a HEAD of every position (f32, a layer; 1.4 MB a position here), and an allocation
+/// past the card is a panic in wgpu. Measured on an L4 with 3.6 GiB beside the 4-bit file's
+/// weights: prompts of 2 048 tokens ran, 3 072 did not.
+fn wgpu_rows(cfg: &Cfg, layers: usize) -> usize {
+    let total = crate::gpu::wgpu_card_total();
+    if total == 0 {
+        return usize::MAX;
+    }
+    let per = (layers * 2 * cfg.nh * cfg.hd * 4).max(1) as u64;
+    let room = total.saturating_sub(crate::gpu::vram_budget()).saturating_sub(512 << 20);
+    (room / per) as usize
+}
+
 fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end: usize) -> Option<Vec<crate::gpu::GraphLayer<'a>>> {
     use crate::gpu::{GraphAct, GraphAttn, GraphAttnGeom, GraphBlockRoute, GraphFfn, GraphLayer, GraphMhc, GraphMhcDsv4, GraphMhcHead, GraphMoeDetachedShared};
     if end > cfg.max_seq {
@@ -678,6 +699,20 @@ fn graph_layers<'a>(globals: &'a Globals, layers: &'a [Layer], cfg: &'a Cfg, end
             );
         }
         return None;
+    }
+    if crate::gpu::wgpu_active() {
+        let rows = wgpu_rows(cfg, layers.len());
+        if end > rows {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "maxwell_moe: beside the weights this card holds {rows} positions over wgpu (a key and a value a head of every \
+                     position, a layer); the sequence continues on the host (the CUDA backend, CMF_GPU=cuda, streams the experts \
+                     and keeps the context on the card)"
+                );
+            }
+            return None;
+        }
     }
     let last = layers.len().checked_sub(1)?;
     // The CUDA hybrid reads the block route from the layer's own geometry. The wgpu graphs

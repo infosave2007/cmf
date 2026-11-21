@@ -22695,6 +22695,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             // overrides either way.
             match vulkan_vram_total(&adapter) {
                 Some(total) => {
+                    crate::gpu::wgpu_note_card_total(total);
                     let gib = 1024 * 1024 * 1024u64;
                     // The former 1/32 margin let a 29 GB q8_2f dense graph fill
                     // an A40 to within 1.4 GiB, then OOM while constructing KV
@@ -22705,7 +22706,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     let reserve = (total / 8).clamp(5 * gib / 2, 4 * gib).min(total / 2);
                     // a model that keeps more on the card than the default foresees
                     // (Maxwell: every position's rows and a long prompt chunk) asked for it
-                    (total - reserve).saturating_sub(crate::gpu::wgpu_extra_reserve()).max(total / 4)
+                    // — down to the weights its graphs need whole, while the default
+                    // budget holds them (`wgpu_keep_at_least`)
+                    let base = total - reserve;
+                    base.saturating_sub(crate::gpu::wgpu_extra_reserve()).max(crate::gpu::wgpu_weights_floor().min(base)).max(total / 4)
                 }
                 None => 8 * 1024 * 1024 * 1024,
             }

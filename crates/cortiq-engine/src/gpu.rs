@@ -2174,6 +2174,35 @@ pub(crate) fn wgpu_extra_reserve() -> u64 {
     WGPU_EXTRA_RESERVE.load(Ordering::Relaxed)
 }
 
+static WGPU_WEIGHTS_FLOOR: AtomicU64 = AtomicU64::new(0);
+
+/// The weights a model's graphs need on the card whole (a stack with its own
+/// runtime takes no device prefix: short of them every token runs on the
+/// host). The extra reserve of [`wgpu_reserve_at_least`] does not take the
+/// weight budget below them while the default budget holds them: on a 24 GB
+/// card Maxwell's reserve left 17.3 GB for 19.3 GB of weights and the card
+/// sat idle. The largest ask wins; `CMF_GPU_VRAM_MB` overrides it.
+pub fn wgpu_keep_at_least(bytes: u64) {
+    WGPU_WEIGHTS_FLOOR.fetch_max(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn wgpu_weights_floor() -> u64 {
+    WGPU_WEIGHTS_FLOOR.load(Ordering::Relaxed)
+}
+
+static WGPU_CARD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn wgpu_note_card_total(bytes: u64) {
+    WGPU_CARD_TOTAL.store(bytes, Ordering::Relaxed);
+}
+
+/// A discrete card's device-local memory as the wgpu backend read it at
+/// setup; 0 on unified memory, on a backend that does not say, and before
+/// the device is up.
+pub fn wgpu_card_total() -> u64 {
+    WGPU_CARD_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Positions a sequence may reach: `CMF_MAX_SEQ`, else 32 768, within the
 /// model's own limit (the loader's cap, for the code that sizes device
 /// memory by it).
