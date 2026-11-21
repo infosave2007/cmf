@@ -47,15 +47,25 @@ no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through 
 
 ## Quick start
 
+NVIDIA (CUDA):
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Why is the sky blue? Answer in three sentences."
 ```
 
-The model's support is in cortiq after 0.9.10 ([PR #182](https://github.com/infosave2007/cmf/pull/182)): until the
-next release, build from that branch as above (once the PR is merged, drop `--branch maxwell`). Leave out
-`--features cuda` and `CMF_GPU=cuda` for Vulkan or the CPU.
+Vulkan (AMD, Intel, NVIDIA), Apple Silicon and the CPU:
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
+cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Why is the sky blue? Answer in three sentences."
+```
+
+The model's support is in [PR #182](https://github.com/infosave2007/cmf/pull/182), after cortiq 0.9.10: until the
+next release, `cortiq` is built from its branch. A build needs Rust 1.88 or newer; the CUDA build loads the NVIDIA
+driver, NVRTC and cuBLAS of CUDA 12 at run time.
 
 ## Files
 
@@ -121,7 +131,7 @@ Stand: the same NVIDIA L4 (24 GB), over Vulkan (the default backend), the 4-bit 
 
 Over Vulkan the block-sparse attention runs on the card too (the indexer, the choice of blocks and the attention over
 them): WikiText-2 over windows of 6 144 tokens gives 20.66, against 20.61 on CUDA. The weights stay on the card whole
-(17.5 GB of the 4-bit file) and the rest of the card holds the context: about 17 000 positions on a 24 GB card;
+(17.4 GB of the 4-bit file) and the rest of the card holds the context: about 17 000 positions on a 24 GB card;
 past that the sequence continues on the CPU, with a warning. The 8-bit file needs a larger card over Vulkan.
 
 ### CPU
@@ -129,10 +139,10 @@ past that the sequence continues on the CPU, with a warning. The 8-bit file need
 | stand | file | decode, tok/s |
 |---|---|---:|
 | Colab L4 host (Xeon 2.2 GHz, 6 cores / 12 threads, 52 GB) | `q4tp` | 4.1 |
-| MacBook Air M4 (10 cores, 24 GB) | `q4tp` | 7.9 |
+| MacBook Air M4 (10 cores, 24 GB) | `q4tp` | 13.6 |
 
 On Apple Silicon the model runs on the CPU (its stack has no Metal graph yet). The file is memory-mapped: that
-run peaked at 12 GB of resident memory.
+run peaked at 13 GB of resident memory.
 
 ## Usage
 
@@ -211,15 +221,25 @@ ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Inte
 
 ### Быстрый старт
 
+NVIDIA (CUDA):
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему небо голубое? Ответь тремя предложениями."
 ```
 
-Поддержка модели входит в cortiq после 0.9.10 ([PR #182](https://github.com/infosave2007/cmf/pull/182)): до
-следующего релиза соберите движок из этой ветки, как выше (после слияния PR уберите `--branch maxwell`). Для Vulkan
-или CPU уберите `--features cuda` и `CMF_GPU=cuda`.
+Vulkan (AMD, Intel, NVIDIA), Apple Silicon и CPU:
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
+cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему небо голубое? Ответь тремя предложениями."
+```
+
+Поддержка модели находится в [PR #182](https://github.com/infosave2007/cmf/pull/182), после cortiq 0.9.10: до
+следующего релиза `cortiq` собирается из его ветки. Для сборки нужен Rust 1.88 или новее; сборка с CUDA во время
+работы загружает драйвер NVIDIA, NVRTC и cuBLAS из CUDA 12.
 
 ### Файлы
 
@@ -283,7 +303,7 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему неб�
 | 16 384 | 109,7 | 24,6 | 21,4 |
 
 Через Vulkan блочно-разреженное внимание тоже работает на карте (индексатор, выбор блоков и внимание по ним):
-перплексия WikiText-2 на окнах по 6 144 токена — 20,66 против 20,61 на CUDA. Веса лежат на карте целиком (17,5 ГБ
+перплексия WikiText-2 на окнах по 6 144 токена — 20,66 против 20,61 на CUDA. Веса лежат на карте целиком (17,4 ГБ
 у 4-битного файла), а остаток карты занимает контекст: около 17 000 позиций на карте 24 ГБ; дальше
 последовательность продолжается на CPU с предупреждением. 8-битному файлу через Vulkan нужна карта большего объёма.
 
@@ -292,10 +312,10 @@ CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "Почему неб�
 | стенд | файл | генерация, ток/с |
 |---|---|---:|
 | хост Colab L4 (Xeon 2,2 ГГц, 6 ядер / 12 потоков, 52 ГБ) | `q4tp` | 4,1 |
-| MacBook Air M4 (10 ядер, 24 ГБ) | `q4tp` | 7,9 |
+| MacBook Air M4 (10 ядер, 24 ГБ) | `q4tp` | 13,6 |
 
 На Apple Silicon модель работает на CPU (графа Metal для её стека пока нет). Файл отображается в память: этот
-запуск занял до 12 ГБ резидентной памяти.
+запуск занял до 13 ГБ резидентной памяти.
 
 ### Использование
 
@@ -375,15 +395,24 @@ Intel 显卡走 Vulkan/DX12，也可在 CPU 上运行。实测：
 
 ### 快速开始
 
+NVIDIA（CUDA）：
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
 CMF_GPU=cuda cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是蓝色的？用三句话回答。"
 ```
 
-对该模型的支持在 cortiq 0.9.10 之后（[PR #182](https://github.com/infosave2007/cmf/pull/182)）：下一个版本发布
-之前，请按上面的命令从该分支构建（PR 合并后去掉 `--branch maxwell`）。使用 Vulkan 或 CPU 时去掉
-`--features cuda` 和 `CMF_GPU=cuda`。
+Vulkan（AMD、Intel、NVIDIA）、Apple Silicon 与 CPU：
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download infosave/Maxwell-V1-Flash-cmf Maxwell-V1-Flash-q4tp.cmf --local-dir .
+cortiq run Maxwell-V1-Flash-q4tp.cmf --prompt "天空为什么是蓝色的？用三句话回答。"
+```
+
+对该模型的支持位于 [PR #182](https://github.com/infosave2007/cmf/pull/182)，在 cortiq 0.9.10 之后：下一个版本发布之前，
+`cortiq` 从该分支构建。构建需要 Rust 1.88 或更新版本；CUDA 版本在运行时加载 NVIDIA 驱动以及 CUDA 12 的 NVRTC 和 cuBLAS。
 
 ### 文件
 
@@ -444,7 +473,7 @@ WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位
 | 16 384 | 109.7 | 24.6 | 21.4 |
 
 通过 Vulkan 时块稀疏注意力同样在显卡上运行（索引器、块的选择以及在所选块上的注意力）：WikiText-2 在 6 144 token
-窗口上的困惑度为 20.66，CUDA 为 20.61。权重完整地放在显卡上（4 位文件为 17.5 GB），显卡其余空间用于上下文：
+窗口上的困惑度为 20.66，CUDA 为 20.61。权重完整地放在显卡上（4 位文件为 17.4 GB），显卡其余空间用于上下文：
 24 GB 显卡约 17 000 个位置；超过之后序列转到 CPU 上继续，并给出一次警告。8 位文件通过 Vulkan 需要更大显存的显卡。
 
 **CPU**
@@ -452,10 +481,10 @@ WikiText-2 的 2 个 6 144 token 窗口；每一行使用相同的窗口。4 位
 | 测试平台 | 文件 | 生成，tok/s |
 |---|---|---:|
 | Colab L4 主机（Xeon 2.2 GHz，6 核 / 12 线程，52 GB） | `q4tp` | 4.1 |
-| MacBook Air M4（10 核，24 GB） | `q4tp` | 7.9 |
+| MacBook Air M4（10 核，24 GB） | `q4tp` | 13.6 |
 
 在 Apple Silicon 上模型运行于 CPU（其结构暂无 Metal 图）。文件通过内存映射读取：该次运行的常驻内存峰值为
-12 GB。
+13 GB。
 
 ### 用法
 

@@ -55,13 +55,13 @@
  },
  "kv_kb_per_token": 101.25,
  "mac": {
-  "en": "| MacBook Air M4 (10 cores, 24 GB) | `q4tp` | 7.9 |\n\nOn Apple Silicon the model runs on the CPU (its stack has no Metal graph yet). The file is memory-mapped: that\nrun peaked at 12 GB of resident memory.\n",
-  "ru": "| MacBook Air M4 (10 ядер, 24 ГБ) | `q4tp` | 7,9 |\n\nНа Apple Silicon модель работает на CPU (графа Metal для её стека пока нет). Файл отображается в память: этот\nзапуск занял до 12 ГБ резидентной памяти.\n",
-  "zh": "| MacBook Air M4（10 核，24 GB） | `q4tp` | 7.9 |\n\n在 Apple Silicon 上模型运行于 CPU（其结构暂无 Metal 图）。文件通过内存映射读取：该次运行的常驻内存峰值为\n12 GB。\n"
+  "en": "| MacBook Air M4 (10 cores, 24 GB) | `q4tp` | 13.6 |\n\nOn Apple Silicon the model runs on the CPU (its stack has no Metal graph yet). The file is memory-mapped: that\nrun peaked at 13 GB of resident memory.\n",
+  "ru": "| MacBook Air M4 (10 ядер, 24 ГБ) | `q4tp` | 13,6 |\n\nНа Apple Silicon модель работает на CPU (графа Metal для её стека пока нет). Файл отображается в память: этот\nзапуск занял до 13 ГБ резидентной памяти.\n",
+  "zh": "| MacBook Air M4（10 核，24 GB） | `q4tp` | 13.6 |\n\n在 Apple Silicon 上模型运行于 CPU（其结构暂无 Metal 图）。文件通过内存映射读取：该次运行的常驻内存峰值为\n13 GB。\n"
  },
  "fit_rows": 18000,
  "calib_tokens": 3072,
- "vk_weights_gb": 17.5,
+ "vk_weights_gb": 17.4,
  "vk_rows": 17000,
  "calib_note": {
   "en": "In the 4-bit file every matrix but the\nhead is GPTQ-calibrated on prose, Rust and Python that the evaluation texts do not hold: the routed experts on\n65 536 tokens, the attention, the shared experts and the dense FFNs on 3 072; its head is 8-bit.",

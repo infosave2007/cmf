@@ -25,15 +25,25 @@ no ML framework: NVIDIA GPUs through CUDA or Vulkan, AMD and Intel GPUs through 
 
 ## Quick start
 
+NVIDIA (CUDA):
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download {repo} {q4} --local-dir .
 CMF_GPU=cuda cortiq run {q4} --prompt "Why is the sky blue? Answer in three sentences."
 ```
 
-The model's support is in cortiq after {ver} ([PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr})): until the
-next release, build from that branch as above (once the PR is merged, drop `--branch maxwell`). Leave out
-`--features cuda` and `CMF_GPU=cuda` for Vulkan or the CPU.
+Vulkan (AMD, Intel, NVIDIA), Apple Silicon and the CPU:
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download {repo} {q4} --local-dir .
+cortiq run {q4} --prompt "Why is the sky blue? Answer in three sentences."
+```
+
+The model's support is in [PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr}), after cortiq {ver}: until the
+next release, `cortiq` is built from its branch. A build needs Rust 1.88 or newer; the CUDA build loads the NVIDIA
+driver, NVRTC and cuBLAS of CUDA 12 at run time.
 
 ## Files
 
@@ -171,15 +181,25 @@ ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Inte
 
 ### Быстрый старт
 
+NVIDIA (CUDA):
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download {repo} {q4} --local-dir .
 CMF_GPU=cuda cortiq run {q4} --prompt "Почему небо голубое? Ответь тремя предложениями."
 ```
 
-Поддержка модели входит в cortiq после {ver} ([PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr})): до
-следующего релиза соберите движок из этой ветки, как выше (после слияния PR уберите `--branch maxwell`). Для Vulkan
-или CPU уберите `--features cuda` и `CMF_GPU=cuda`.
+Vulkan (AMD, Intel, NVIDIA), Apple Silicon и CPU:
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download {repo} {q4} --local-dir .
+cortiq run {q4} --prompt "Почему небо голубое? Ответь тремя предложениями."
+```
+
+Поддержка модели находится в [PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr}), после cortiq {ver}: до
+следующего релиза `cortiq` собирается из его ветки. Для сборки нужен Rust 1.88 или новее; сборка с CUDA во время
+работы загружает драйвер NVIDIA, NVRTC и cuBLAS из CUDA 12.
 
 ### Файлы
 
@@ -317,15 +337,24 @@ Intel 显卡走 Vulkan/DX12，也可在 CPU 上运行。实测：
 
 ### 快速开始
 
+NVIDIA（CUDA）：
+
 ```bash
-cargo install --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli --features cuda
 hf download {repo} {q4} --local-dir .
 CMF_GPU=cuda cortiq run {q4} --prompt "天空为什么是蓝色的？用三句话回答。"
 ```
 
-对该模型的支持在 cortiq {ver} 之后（[PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr})）：下一个版本发布
-之前，请按上面的命令从该分支构建（PR 合并后去掉 `--branch maxwell`）。使用 Vulkan 或 CPU 时去掉
-`--features cuda` 和 `CMF_GPU=cuda`。
+Vulkan（AMD、Intel、NVIDIA）、Apple Silicon 与 CPU：
+
+```bash
+cargo install --locked --git https://github.com/infosave2007/cmf --branch maxwell cortiq-cli
+hf download {repo} {q4} --local-dir .
+cortiq run {q4} --prompt "天空为什么是蓝色的？用三句话回答。"
+```
+
+对该模型的支持位于 [PR #{pr}](https://github.com/infosave2007/cmf/pull/{pr})，在 cortiq {ver} 之后：下一个版本发布之前，
+`cortiq` 从该分支构建。构建需要 Rust 1.88 或更新版本；CUDA 版本在运行时加载 NVIDIA 驱动以及 CUDA 12 的 NVRTC 和 cuBLAS。
 
 ### 文件
 
