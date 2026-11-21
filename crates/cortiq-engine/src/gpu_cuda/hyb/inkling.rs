@@ -660,6 +660,26 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         tracing::warn!("inkling2_loop on CUDA: {} positions past the cap of {}", pos0 + ids.len(), d.cap);
         return false;
     }
+    // `CMF_INKLING_WINDOW_PROBE=1` (a measurement, not a run): after a prompt,
+    // the time of a call of 1..16 rows with every row's logits, as a draft
+    // verify would take it; the sequence's state is spoiled
+    if pos0 > 0 && std::env::var("CMF_INKLING_WINDOW_PROBE").as_deref() == Ok("1") {
+        let vocab = g.lm_head.rows();
+        let mut line = Vec::new();
+        for n in [1usize, 2, 3, 4, 5, 6, 8, 12, 16] {
+            let mut lg = Vec::new();
+            let ids_n = vec![ids.first().copied().unwrap_or(0); n];
+            let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg);
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg);
+            }
+            line.push(format!("{n}: {:.2} ms", t.elapsed().as_secs_f64() * 100.0));
+            let _ = vocab;
+        }
+        tracing::info!("inkling2_loop CUDA window probe (a call with every row's logits): {}", line.join(", "));
+        std::process::exit(0);
+    }
     match forward_(c, d, g, cfg, ids, pos0, want, all, logits) {
         Ok(()) => true,
         Err(e) => {
