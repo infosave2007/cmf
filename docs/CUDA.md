@@ -565,16 +565,16 @@ One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vul
 
 | | wgpu | CUDA |
 |---|---:|---:|
-| Qwen3.5-0.8B at 1.0 bpw: whole conversion | 492 s | 216 s |
-| calibration of a layer / encode of a layer | 2.6 s / 17.3 s | 0.45 s / 7.2–8.7 s |
-| training step, 8 × 512 tokens, metric and signs | 0.69 s | 0.34 s |
-| 1 M tokens of training, whole run | 227 s | 96 s |
-| Qwen3.8-27B at 0.55 bpw: teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
-| training step, 8 × 512 tokens, metric and signs | 5.48 s | 3.57 s |
-| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
-| encode of a layer (one tensor in flight) | 149 s | 102–105 s |
+| Qwen3.5-0.8B at 1.0 bpw: whole conversion | 492 s | 64 s |
+| calibration of a layer / encode of a layer | 2.6 s / 17.3 s | 0.45 s / 1.5–1.7 s |
+| training step, 8 × 512 tokens, metric and signs | 0.69 s | 0.28 s |
+| 1 M tokens of training, whole run | 227 s | 97 s |
+| Qwen3.8-27B at 0.55 bpw: teacher top-64 pass | 2.7k tok/s | 5.0k tok/s |
+| training step, 8 × 512 tokens, metric and signs | 5.48 s | 2.97 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 16.2 min |
+| encode of a layer (three tensors in flight) | 103–107 s | 28–30 s |
 
-The held-out KL after the 0.8B's training is 1.4456 on CUDA and 1.4490 on wgpu; a conversion repeated on CUDA
+The held-out KL after the 0.8B's training is 1.4440 on CUDA and 1.4490 on wgpu; a conversion repeated on CUDA
 gives the same bytes.
 
 ## Options
