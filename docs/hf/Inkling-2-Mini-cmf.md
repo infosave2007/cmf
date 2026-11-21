@@ -32,8 +32,8 @@ Metal, and the CPU. The file holds the language model; the release's vision towe
 it. Measured:
 
 - **14.69 GB, every weight on one 24 GB card.** NVIDIA L4, CUDA: 51.7 tok/s; a 2 048-token prompt is read in
-  3.82 s and a 32 768-token one in 111 s, after which it writes 39.1 tok/s in 15.4 GB of the card.
-- **The same card over Vulkan:** 18.7 tok/s in 14.0 GB; **MacBook Air M4 (24 GB):** 21.5 tok/s through Metal, 10.3 on
+  3.82 s and a 32 768-token one in 111 s, after which it writes 39.1 tok/s in 15.1 GB of the card.
+- **The same card over Vulkan:** 18.7 tok/s in 13.7 GB; **MacBook Air M4 (24 GB):** 21.5 tok/s through Metal, 10.3 on
   the CPU alone.
 - **Accuracy:** WikiText-2 perplexity 9.057 against 8.944 for the release's own weights in f32 (Transformers), 7.383
   against 7.310 over windows of 4 096 tokens. CUDA, Vulkan and Metal agree within 0.1 %, and five chat questions get
@@ -91,11 +91,11 @@ call.
 
 | prompt, tokens | first token, s | decode, tok/s | peak card memory, GB |
 |---:|---:|---:|---:|
-| 512 | 0.93 | 49.6 | 14.3 |
-| 2 048 | 3.82 | 48.5 | 14.4 |
-| 8 192 | 18.2 | 45.9 | 14.6 |
-| 16 384 | 42.7 | 43.5 | 14.9 |
-| 32 768 | 111.0 | 39.1 | 15.4 |
+| 512 | 0.93 | 49.6 | 14.0 |
+| 2 048 | 3.82 | 48.5 | 14.1 |
+| 8 192 | 18.2 | 45.9 | 14.3 |
+| 16 384 | 42.7 | 43.5 | 14.5 |
+| 32 768 | 111.0 | 39.1 | 15.1 |
 
 ### Vulkan · NVIDIA L4
 
@@ -105,9 +105,10 @@ Stand: the same NVIDIA L4 (24 GB), over Vulkan (the default backend). Without a 
 
 | prompt, tokens | first token, s | decode, tok/s | peak card memory, GB |
 |---:|---:|---:|---:|
-| 512 | 3.99 | 17.5 | 14.0 |
-| 2 048 | 17.9 | 16.5 | 14.0 |
-| 8 192 | 79.7 | 14.5 | 14.9 |
+| 512 | 3.99 | 17.5 | 13.7 |
+| 2 048 | 17.9 | 16.5 | 13.7 |
+| 8 192 | 79.7 | 14.5 | 14.6 |
+| 16 384 | 188.0 | 13.0 | 15.5 |
 
 ### Metal · MacBook Air M4
 
@@ -122,11 +123,12 @@ is read 256 rows a call, the routed experts as simdgroup GEMMs.
 | 2 048 | 18.2 | 19.3 |
 | 8 192 | 86.4 | 17.0 |
 
-### CPU · MacBook Air M4
+### CPU
 
 | stand | decode, tok/s | 512-token prompt | decode after it |
 |---|---:|---:|---:|
 | MacBook Air M4 (10 cores, 24 GB), `CMF_GPU=0` | 10.3 | 22.6 s | 9.7 |
+| Colab L4 host (Xeon 2.2 GHz, 6 cores / 12 threads), `CMF_GPU=0` | 2.9 | 70.1 s | 2.8 |
 
 ## Usage
 
@@ -211,8 +213,8 @@ Metal, а также CPU. В файле языковая модель; визу�
 Измерено:
 
 - **14,69 ГБ, все веса на одной карте 24 ГБ.** NVIDIA L4, CUDA: 51,7 ток/с; промпт из 2 048 токенов читается за
-  3,82 с, из 32 768 — за 111 с, после чего модель пишет 39,1 ток/с в 15,4 ГБ карты.
-- **Та же карта через Vulkan:** 18,7 ток/с в 14,0 ГБ; **MacBook Air M4 (24 ГБ):** 21,5 ток/с через Metal, 10,3 на
+  3,82 с, из 32 768 — за 111 с, после чего модель пишет 39,1 ток/с в 15,1 ГБ карты.
+- **Та же карта через Vulkan:** 18,7 ток/с в 13,7 ГБ; **MacBook Air M4 (24 ГБ):** 21,5 ток/с через Metal, 10,3 на
   одном CPU.
 - **Точность:** перплексия WikiText-2 9,057 против 8,944 у собственных весов релиза в f32 (Transformers), 7,383
   против 7,310 на окнах по 4 096 токенов. CUDA, Vulkan и Metal расходятся не больше чем на 0,1 %, а на пять вопросов в
@@ -267,11 +269,11 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "Почему небо 
 
 | промпт, токенов | первый токен, с | генерация, ток/с | пик памяти карты, ГБ |
 |---:|---:|---:|---:|
-| 512 | 0,93 | 49,6 | 14,3 |
-| 2 048 | 3,82 | 48,5 | 14,4 |
-| 8 192 | 18,2 | 45,9 | 14,6 |
-| 16 384 | 42,7 | 43,5 | 14,9 |
-| 32 768 | 111,0 | 39,1 | 15,4 |
+| 512 | 0,93 | 49,6 | 14,0 |
+| 2 048 | 3,82 | 48,5 | 14,1 |
+| 8 192 | 18,2 | 45,9 | 14,3 |
+| 16 384 | 42,7 | 43,5 | 14,5 |
+| 32 768 | 111,0 | 39,1 | 15,1 |
 
 #### Vulkan · NVIDIA L4
 
@@ -281,9 +283,10 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "Почему небо 
 
 | промпт, токенов | первый токен, с | генерация, ток/с | пик памяти карты, ГБ |
 |---:|---:|---:|---:|
-| 512 | 3,99 | 17,5 | 14,0 |
-| 2 048 | 17,9 | 16,5 | 14,0 |
-| 8 192 | 79,7 | 14,5 | 14,9 |
+| 512 | 3,99 | 17,5 | 13,7 |
+| 2 048 | 17,9 | 16,5 | 13,7 |
+| 8 192 | 79,7 | 14,5 | 14,6 |
+| 16 384 | 188,0 | 13,0 | 15,5 |
 
 #### Metal · MacBook Air M4
 
@@ -298,11 +301,12 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "Почему небо 
 | 2 048 | 18,2 | 19,3 |
 | 8 192 | 86,4 | 17,0 |
 
-#### CPU · MacBook Air M4
+#### CPU
 
 | стенд | генерация, ток/с | промпт 512 токенов | генерация после него |
 |---|---:|---:|---:|
 | MacBook Air M4 (10 ядер, 24 ГБ), `CMF_GPU=0` | 10,3 | 22,6 с | 9,7 |
+| хост Colab L4 (Xeon 2,2 ГГц, 6 ядер / 12 потоков), `CMF_GPU=0` | 2,9 | 70,1 с | 2,8 |
 
 ### Использование
 
@@ -384,8 +388,8 @@ Apache-2.0, как у исходного релиза ([LICENSE](LICENSE)); ис
 显卡走 Vulkan/DX12，Apple silicon 走 Metal，也可在 CPU 上运行。文件包含语言模型；发布版的视觉编码器和多 token 草稿头不在其中。实测：
 
 - **14.69 GB，全部权重放在一块 24 GB 显卡上。** NVIDIA L4，CUDA：51.7 tok/s；2 048 token 的提示词读取 3.82 秒，
-  32 768 token 读取 111 秒，之后以 39.1 tok/s 生成，占用 15.4 GB 显存。
-- **同一块显卡，Vulkan：** 18.7 tok/s，占用 14.0 GB；**MacBook Air M4（24 GB）：** Metal 21.5 tok/s，仅 CPU 10.3。
+  32 768 token 读取 111 秒，之后以 39.1 tok/s 生成，占用 15.1 GB 显存。
+- **同一块显卡，Vulkan：** 18.7 tok/s，占用 13.7 GB；**MacBook Air M4（24 GB）：** Metal 21.5 tok/s，仅 CPU 10.3。
 - **精度：** WikiText-2 困惑度 9.057，发布版自身权重在 f32（Transformers）下为 8.944；4 096 token 窗口上 7.383，参考为
   7.310。CUDA、Vulkan 和 Metal 之间相差不超过 0.1%，五个对话问题在三者上的回答逐词一致。
 
@@ -435,11 +439,11 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "天空为什么是蓝�
 
 | 提示词，token | 首 token，秒 | 生成，tok/s | 显存峰值，GB |
 |---:|---:|---:|---:|
-| 512 | 0.93 | 49.6 | 14.3 |
-| 2 048 | 3.82 | 48.5 | 14.4 |
-| 8 192 | 18.2 | 45.9 | 14.6 |
-| 16 384 | 42.7 | 43.5 | 14.9 |
-| 32 768 | 111.0 | 39.1 | 15.4 |
+| 512 | 0.93 | 49.6 | 14.0 |
+| 2 048 | 3.82 | 48.5 | 14.1 |
+| 8 192 | 18.2 | 45.9 | 14.3 |
+| 16 384 | 42.7 | 43.5 | 14.5 |
+| 32 768 | 111.0 | 39.1 | 15.1 |
 
 #### Vulkan · NVIDIA L4
 
@@ -449,9 +453,10 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "天空为什么是蓝�
 
 | 提示词，token | 首 token，秒 | 生成，tok/s | 显存峰值，GB |
 |---:|---:|---:|---:|
-| 512 | 3.99 | 17.5 | 14.0 |
-| 2 048 | 17.9 | 16.5 | 14.0 |
-| 8 192 | 79.7 | 14.5 | 14.9 |
+| 512 | 3.99 | 17.5 | 13.7 |
+| 2 048 | 17.9 | 16.5 | 13.7 |
+| 8 192 | 79.7 | 14.5 | 14.6 |
+| 16 384 | 188.0 | 13.0 | 15.5 |
 
 #### Metal · MacBook Air M4
 
@@ -466,11 +471,12 @@ CMF_GPU=cuda cortiq run Inkling-2-Mini-q4tp.cmf --prompt "天空为什么是蓝�
 | 2 048 | 18.2 | 19.3 |
 | 8 192 | 86.4 | 17.0 |
 
-#### CPU · MacBook Air M4
+#### CPU
 
 | 测试平台 | 生成，tok/s | 512 token 提示词 | 其后生成 |
 |---|---:|---:|---:|
 | MacBook Air M4（10 核，24 GB），`CMF_GPU=0` | 10.3 | 22.6 秒 | 9.7 |
+| Colab L4 主机（Xeon 2.2 GHz，6 核 / 12 线程），`CMF_GPU=0` | 2.9 | 70.1 秒 | 2.8 |
 
 ### 使用
 

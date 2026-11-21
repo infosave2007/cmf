@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cuBLAS, the routed experts grouped by expert as the hybrid prompt path's), decode attention split over 256-key tiles,
   the arm's buffers carved from shared slabs. NVIDIA L4: decode 51.7 tok/s; a 2 048 / 8 192 / 32 768-token prompt in
   3.82 / 18.2 / 111 s (12.9 / 54 / — s at 16 rows a call), decode after it 48.5 / 45.9 / 39.1 (38.0 / 32.3 / —);
-  peak card memory 21.4 → 15.4 GB (the driver rounded each of the 6144 expert matrices up to an even megabyte).
+  peak card memory 21.0 → 15.1 GB (the driver rounded each of the 6144 expert matrices up to an even megabyte).
 - Metal and wgpu, Inkling: prompt calls of 256 / 128 rows with the routed experts grouped by expert as GEMMs (Metal:
   the backend's `q4tp_mul_mm` over gathered rows; wgpu: a tiled WGSL GEMM), Metal's dense matrices through
   `q4tp_mul_mm`. Apple M4: a 512-token prompt in 3.70 s (15.5 s before, on the file with an 8-bit trunk), decode
