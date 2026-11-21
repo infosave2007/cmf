@@ -1129,3 +1129,46 @@ extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
     const size_t at = (size_t)r * V + i;
     lg[at] = tanhf(lg[at] / cap) * cap;
 }
+
+// The greedy pick of each row of `lg` ([rows][V], a block a row): the first
+// index of the largest value, as the host's argmax takes it.
+extern "C" __global__ void ink_argmax_rows(const float* __restrict__ lg, int V, int* __restrict__ ids)
+{
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const float* r = lg + (size_t)blockIdx.x * V;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    float best = -3.0e38f;
+    int idx = 0x7fffffff;
+    for (int v = tid; v < V; v += blockDim.x) {
+        const float x = r[v];
+        if (x > best) {
+            best = x;
+            idx = v;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ob = __shfl_xor_sync(FULL, best, o);
+        const int oi = __shfl_xor_sync(FULL, idx, o);
+        if (ob > best || (ob == best && oi < idx)) {
+            best = ob;
+            idx = oi;
+        }
+    }
+    if (lane == 0) {
+        bv[w] = best;
+        bi[w] = idx;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float b = bv[0];
+        int x = bi[0];
+        for (int j = 1; j < (int)(blockDim.x >> 5); j++) {
+            if (bv[j] > b || (bv[j] == b && bi[j] < x)) {
+                b = bv[j];
+                x = bi[j];
+            }
+        }
+        ids[blockIdx.x] = x == 0x7fffffff ? 0 : x;
+    }
+}

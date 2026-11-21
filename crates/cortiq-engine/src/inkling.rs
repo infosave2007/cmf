@@ -1355,16 +1355,16 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     let mut ids = Vec::with_capacity(drafts.len() + 1);
     ids.push(anchor);
     ids.extend_from_slice(&drafts);
-    let mut lg = Vec::new();
-    if !crate::gpu::inkling_forward(state.sequence_id, globals, layers, cfg, &ids, pos, true, true, &mut lg) {
+    // each row's greedy pick on the card; only the kept row's logits come over
+    let mut picks = Vec::with_capacity(ids.len());
+    if !crate::gpu::inkling_verify(state.sequence_id, globals, layers, cfg, &ids, pos, &mut picks) || picks.len() != ids.len() {
         // the card let go mid-round: the host replays what it ran
         state.card = Some(false);
         return None;
     }
     let vocab = globals.lm_head.rows();
-    let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0 as u32;
     let mut acc = 0usize;
-    while acc < drafts.len() && argmax(&lg[acc * vocab..(acc + 1) * vocab]) == drafts[acc] {
+    while acc < drafts.len() && picks[acc] == drafts[acc] {
         acc += 1;
     }
     let keep = acc + 1;
@@ -1372,9 +1372,12 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
         state.card = Some(false);
         return None;
     }
+    if !crate::gpu::inkling_row_logits(state.sequence_id, acc, vocab, logits) {
+        state.card = Some(false);
+        return None;
+    }
     state.tokens.extend_from_slice(&ids[..keep]);
     state.pos = pos + keep;
-    *logits = lg[acc * vocab..(acc + 1) * vocab].to_vec();
     Some(drafts[..acc].to_vec())
 }
 

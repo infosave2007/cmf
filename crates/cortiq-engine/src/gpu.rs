@@ -2669,6 +2669,28 @@ pub fn inkling_ring_back(id: u64, r: usize) -> bool {
     false
 }
 
+/// A draft verify on the card: each row's greedy pick (the logits stay there
+/// for `inkling_row_logits`).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_verify(id: u64, g: &crate::inkling::Globals, layers: &[crate::inkling::Layer], cfg: &crate::inkling::Cfg, ids: &[u32], pos: usize, picks: &mut Vec<u32>) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_verify(id, g, layers, cfg, ids, pos, picks);
+    }
+    let _ = (id, g, layers, cfg, ids, pos, picks);
+    false
+}
+
+/// Row `r`'s logits of the last `inkling_verify`.
+pub fn inkling_row_logits(id: u64, r: usize, vocab: usize, out: &mut Vec<f32>) -> bool {
+    #[cfg(feature = "cuda")]
+    if backend() == Backend::Cuda {
+        return crate::gpu_cuda::inkling_row_logits(id, r, vocab, out);
+    }
+    let _ = (id, r, vocab, out);
+    false
+}
+
 /// A new Dory sequence on the device.
 pub fn dory_reset(id: u64) {
     #[cfg(target_os = "macos")]

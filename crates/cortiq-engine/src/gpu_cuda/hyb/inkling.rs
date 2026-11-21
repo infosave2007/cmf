@@ -91,6 +91,7 @@ struct Fx {
     planes: cs::CUfunction,
     ds_markov: cs::CUfunction,
     ds_pick: cs::CUfunction,
+    argmax_rows: cs::CUfunction,
     gate_norm: cs::CUfunction,
     gate_mix: cs::CUfunction,
     kv_rows: cs::CUfunction,
@@ -343,6 +344,8 @@ struct Dev {
     pf: [Buf; 2],
     logits: Buf,
     cr: Buf,
+    /// A verify call's greedy pick of each row (`NMAX` ids).
+    pick: Buf,
     smax: usize,
     /// Recorded calls by (rows, logits rows) and the pointers they hold.
     graphs: HashMap<(usize, usize), GraphRec>,
@@ -471,6 +474,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         planes: func(module, "ink_planes")?,
         ds_markov: func(module, "ink_ds_markov")?,
         ds_pick: func(module, "ink_ds_pick")?,
+        argmax_rows: func(module, "ink_argmax_rows")?,
         attn_soft: func(module, "ink_attn_soft")?,
         gate_norm: func(module, "ink_gate_norm")?,
         gate_mix: func(module, "ink_gate_mix")?,
@@ -715,6 +719,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         pf: [h2(rows * hidden)?, h2(rows * hidden)?],
         logits,
         cr: Buf::new(64)?,
+        pick: Buf::new(NMAX * 4)?,
         smax,
         graphs: HashMap::new(),
         cap,
@@ -749,6 +754,33 @@ impl Dev {
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
+    forward_with(id, g, layers, cfg, ids, pos0, want, all, logits, None)
+}
+
+/// A draft verify: every row of `ids` through the target, each row's greedy
+/// pick into `picks` on the card; the logits stay there for `row_logits`.
+pub(crate) fn verify(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, picks: &mut Vec<u32>) -> bool {
+    if ids.len() > NMAX {
+        return false;
+    }
+    let mut none = Vec::new();
+    forward_with(id, g, layers, cfg, ids, pos0, true, true, &mut none, Some(picks))
+}
+
+/// Row `r`'s logits of the last verify.
+pub(crate) fn row_logits(id: u64, r: usize, vocab: usize, out: &mut Vec<f32>) -> bool {
+    let Some(c) = super::super::ctx() else { return false };
+    let guard = DEVICES.lock().unwrap();
+    let Some(d) = guard.as_ref().and_then(|m| m.get(&id)) else { return false };
+    if r >= NMAX {
+        return false;
+    }
+    out.resize(vocab, 0.0);
+    unsafe { cu::memcpy_dtoh_async(out, d.logits.ptr + (r * vocab * 4) as u64, c.stream).is_ok() && c.sync().is_ok() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_with(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>, pick: Option<&mut Vec<u32>>) -> bool {
     let Some(c) = super::super::ctx() else { return false };
     if std::env::var("CMF_INKLING_CUDA").as_deref() == Ok("0") {
         return false;
@@ -810,10 +842,10 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         for n in [1usize, 2, 3, 4, 5, 6, 8, 12, 16] {
             let mut lg = Vec::new();
             let ids_n = vec![ids.first().copied().unwrap_or(0); n];
-            let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg);
+            let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg, None);
             let t = std::time::Instant::now();
             for _ in 0..10 {
-                let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg);
+                let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg, None);
             }
             line.push(format!("{n}: {:.2} ms", t.elapsed().as_secs_f64() * 100.0));
             let _ = vocab;
@@ -821,7 +853,7 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         tracing::info!("inkling2_loop CUDA window probe (a call with every row's logits): {}", line.join(", "));
         std::process::exit(0);
     }
-    match forward_(c, d, g, cfg, ids, pos0, want, all, logits) {
+    match forward_(c, d, g, cfg, ids, pos0, want, all, logits, pick) {
         Ok(()) => true,
         Err(e) => {
             tracing::error!("inkling2_loop on CUDA: {e}");
@@ -837,7 +869,7 @@ pub(crate) fn reset(id: u64) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> Res<()> {
+fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>, mut pick: Option<&mut Vec<u32>>) -> Res<()> {
     let hidden = cfg.dim;
     let vocab = g.lm_head.rows();
     if all {
@@ -898,6 +930,20 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             unsafe { curesult(cs::cuGraphLaunch(d.graphs[&key].exec, c.stream), "graph launch")? };
         } else {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
+        }
+        if lrows > 0 && all && !big {
+            if let Some(p) = pick.as_deref_mut() {
+                let mut v = vec![0i32; lrows];
+                let v_i = vocab as i32;
+                unsafe {
+                    c.launch(d.fx.argmax_rows, (lrows as u32, 1), 1024, 0, kargs!(d.logits.ptr, v_i, d.pick.ptr))?;
+                    cu::memcpy_dtoh_async(&mut v, d.pick.ptr, c.stream).map_err(derr)?;
+                }
+                c.sync()?;
+                p.extend(v.iter().map(|&x| x as u32));
+                at += n;
+                continue;
+            }
         }
         if lrows > 0 {
             let mut v = vec![0f32; lrows * vocab];

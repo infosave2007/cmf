@@ -3418,6 +3418,16 @@ pub fn inkling_ring_snap(id: u64) -> bool {
     selected() && hyb::inkling::ring_snap(id)
 }
 
+/// A draft verify: each row's greedy pick, the logits kept on the card.
+pub fn inkling_verify(id: u64, g: &crate::inkling::Globals, layers: &[crate::inkling::Layer], cfg: &crate::inkling::Cfg, ids: &[u32], pos: usize, picks: &mut Vec<u32>) -> bool {
+    selected() && hyb::inkling::verify(id, g, layers, cfg, ids, pos, picks)
+}
+
+/// Row `r`'s logits of the last verify.
+pub fn inkling_row_logits(id: u64, r: usize, vocab: usize, out: &mut Vec<f32>) -> bool {
+    selected() && hyb::inkling::row_logits(id, r, vocab, out)
+}
+
 pub fn inkling_ring_back(id: u64, r: usize) -> bool {
     selected() && hyb::inkling::ring_back(id, r)
 }
