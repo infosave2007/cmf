@@ -1808,21 +1808,57 @@ extern "C" __global__ void hy_route_put(const float* __restrict__ RAW, const flo
     }
 }
 
-// The routed blocks of every (KV group, row) of the call, a block a pair.
-// The candidates are the blocks wholly past the prefix and wholly before the
-// local window; while they do not outnumber `remote` (at most 16) every
-// block up to the row's own is routed. Else a candidate's score is its
-// largest token score q . k (a thread a token of the block) and the best
-// `remote` join the prefix and the local window (ties to the lower block).
-extern "C" __global__ void hy_route_sel(const float* __restrict__ IQ, const u16* __restrict__ IK,
-                                        u32* __restrict__ BM, int pos0, int nkv, int block, int prefix, int local,
-                                        int remote, int mw, const int* __restrict__ ci)
+// The candidates' scores of every (KV group, row) of the call: grid block x
+// is candidate block `cb0 + x` of KV group y of row z; a candidate's score is
+// its largest token score q . k (a thread a token), into SC [row][group][nblk].
+// The candidates of a row are the blocks wholly past the prefix and wholly
+// before its local window; a row whose candidates do not outnumber `remote`
+// scores nothing (`hy_route_sel` routes every block for it).
+extern "C" __global__ void hy_route_score(const float* __restrict__ IQ, const u16* __restrict__ IK,
+                                          float* __restrict__ SC, int pos0, int nkv, int block, int prefix, int local,
+                                          int remote, int nblk, int cb0, const int* __restrict__ ci)
 {
     if (ci) pos0 = ci[0];
+    const int cb = cb0 + (int)blockIdx.x, g = blockIdx.y, b = blockIdx.z;
+    const int pos = pos0 + b, cur = pos / block;
+    const int local0 = max(cur + 1 - local, 0);
+    if (cb < prefix || cb >= local0 || cb >= nblk || local0 - prefix <= remote) return;
     __shared__ float qs[HD];
     __shared__ float red[32];
-    const int g = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int NW = blockDim.x >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    for (int i = tid; i < HD; i += blockDim.x) qs[i] = IQ[((size_t)b * nkv + g) * HD + i];
+    __syncthreads();
+    float m = -INF;
+    for (int t = tid; t < block; t += blockDim.x) {
+        const u16* kr = IK + ((size_t)cb * block + t) * HD;
+        float a = 0.0f;
+        for (int d = 0; d < HD; d += 8) {
+            float kv[8];
+            h8(kr + d, kv);
+#pragma unroll
+            for (int e = 0; e < 8; e++) a = fmaf(qs[d + e], kv[e], a);
+        }
+        m = fmaxf(m, a);
+    }
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (tid == 0) {
+        for (int w = 1; w < NW; w++) m = fmaxf(m, red[w]);
+        SC[((size_t)b * nkv + g) * nblk + cb] = m;
+    }
+}
+
+// The routed blocks of every (KV group, row) of the call, a block a pair:
+// the prefix, the local window and the best `remote` (at most 16) candidates
+// by `hy_route_score` (ties to the lower block); while the candidates do
+// not outnumber `remote`, every block up to the row's own.
+extern "C" __global__ void hy_route_sel(const float* __restrict__ SC, u32* __restrict__ BM, int pos0, int nkv,
+                                        int block, int prefix, int local, int remote, int mw, int nblk,
+                                        const int* __restrict__ ci)
+{
+    if (ci) pos0 = ci[0];
+    const int g = blockIdx.x, b = blockIdx.y, tid = threadIdx.x;
     const int pos = pos0 + b, cur = pos / block;
     const int local0 = max(cur + 1 - local, 0);
     u32* out = BM + ((size_t)b * nkv + g) * mw;
@@ -1833,51 +1869,32 @@ extern "C" __global__ void hy_route_sel(const float* __restrict__ IQ, const u16*
         }
         return;
     }
-    for (int i = tid; i < HD; i += blockDim.x) qs[i] = IQ[((size_t)b * nkv + g) * HD + i];
     for (int w = tid; w < mw; w += blockDim.x) out[w] = 0u;
     __syncthreads();
-    // thread 0's: the best candidates so far, descending
+    if (tid != 0) return;
+    const float* sc = SC + ((size_t)b * nkv + g) * nblk;
+    // the best candidates so far, descending
     float vals[16];
     int ids[16];
     int cnt = 0;
     const int R = min(remote, 16);
     for (int cb = prefix; cb < local0; cb++) {
-        float m = -INF;
-        for (int t = tid; t < block; t += blockDim.x) {
-            const u16* kr = IK + ((size_t)cb * block + t) * HD;
-            float a = 0.0f;
-            for (int d = 0; d < HD; d += 8) {
-                float kv[8];
-                h8(kr + d, kv);
-#pragma unroll
-                for (int e = 0; e < 8; e++) a = fmaf(qs[d + e], kv[e], a);
+        const float m = sc[cb];
+        if (cnt < R || m > vals[R - 1]) {
+            int j = min(cnt, R - 1);
+            while (j > 0 && vals[j - 1] < m) {
+                vals[j] = vals[j - 1];
+                ids[j] = ids[j - 1];
+                j--;
             }
-            m = fmaxf(m, a);
+            vals[j] = m;
+            ids[j] = cb;
+            cnt = min(cnt + 1, R);
         }
-        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
-        if (lane == 0) red[warp] = m;
-        __syncthreads();
-        if (tid == 0) {
-            for (int w = 1; w < NW; w++) m = fmaxf(m, red[w]);
-            if (cnt < R || m > vals[R - 1]) {
-                int j = min(cnt, R - 1);
-                while (j > 0 && vals[j - 1] < m) {
-                    vals[j] = vals[j - 1];
-                    ids[j] = ids[j - 1];
-                    j--;
-                }
-                vals[j] = m;
-                ids[j] = cb;
-                cnt = min(cnt + 1, R);
-            }
-        }
-        __syncthreads();
     }
-    if (tid == 0) {
-        for (int k = 0; k < min(prefix, cur + 1); k++) out[k >> 5] |= 1u << (k & 31);
-        for (int k = max(local0, prefix); k <= cur; k++) out[k >> 5] |= 1u << (k & 31);
-        for (int k = 0; k < cnt; k++) out[ids[k] >> 5] |= 1u << (ids[k] & 31);
-    }
+    for (int k = 0; k < min(prefix, cur + 1); k++) out[k >> 5] |= 1u << (k & 31);
+    for (int k = max(local0, prefix); k <= cur; k++) out[k >> 5] |= 1u << (k & 31);
+    for (int k = 0; k < cnt; k++) out[ids[k] >> 5] |= 1u << (ids[k] & 31);
 }
 
 // ------------------------------------------------- the far field of a turbo file

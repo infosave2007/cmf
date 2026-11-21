@@ -224,6 +224,7 @@ pub(super) struct HFuncs {
     field_planes: cs::CUfunction,
     route_proj: cs::CUfunction,
     route_put: cs::CUfunction,
+    route_score: cs::CUfunction,
     route_sel: cs::CUfunction,
     dash_route: cs::CUfunction,
     dash_close: cs::CUfunction,
@@ -363,6 +364,7 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         field_planes: func(module, "hy_field_planes")?,
         route_proj: func(module, "hy_route_proj")?,
         route_put: func(module, "hy_route_put")?,
+        route_score: func(module, "hy_route_score")?,
         route_sel: func(module, "hy_route_sel")?,
         dash_route: func(module, "hy_dash_route")?,
         dash_close: func(module, "hy_dash_close")?,
@@ -2368,11 +2370,13 @@ impl RouteL {
 }
 
 /// The small path's rows of a block-routed stack: the index projections
-/// `[NMAX][nkv·hd + hd]`, the index queries `[NMAX][nkv][hd]` and the routed
-/// blocks `[NMAX][nkv][ROUTE_WORDS]`.
+/// `[NMAX][nkv·hd + hd]`, the index queries `[NMAX][nkv][hd]`, the
+/// candidates' scores `[NMAX][nkv][ROUTE_WORDS · 32]` and the routed blocks
+/// `[NMAX][nkv][ROUTE_WORDS]`.
 struct RouteBufs {
     raw: Buf,
     iq: Buf,
+    sc: Buf,
     bm: Buf,
 }
 
@@ -6034,7 +6038,12 @@ fn build(
             None
         },
         route: match route_geo {
-            Some((row, groups)) => Some(RouteBufs { raw: Buf::new(NMAX * (row + row / groups) * 4)?, iq: Buf::new(NMAX * row * 4)?, bm: Buf::new(NMAX * groups * ROUTE_WORDS * 4)? }),
+            Some((row, groups)) => Some(RouteBufs {
+                raw: Buf::new(NMAX * (row + row / groups) * 4)?,
+                iq: Buf::new(NMAX * row * 4)?,
+                sc: Buf::new(NMAX * groups * ROUTE_WORDS * 32 * 4)?,
+                bm: Buf::new(NMAX * groups * ROUTE_WORDS * 4)?,
+            }),
             None => None,
         },
         dash: if has_dash {
@@ -6890,20 +6899,20 @@ fn book(
                     None => (0, 0),
                 };
                 // a block-routed layer: its index keys beside the mirror
-                let rik = match &a.route {
-                    Some(_) => {
+                let (rik, rblocks) = match &a.route {
+                    Some(rt) => {
                         let r = st.hyb.route.get_mut(&key).ok_or("index keys missing")?;
                         r.next_pos = pos0 + n;
-                        r.ik.ptr
+                        (r.ik.ptr, (r.cap / rt.block).min(ROUTE_WORDS * 32) as u64)
                     }
-                    None => 0,
+                    None => (0, 0),
                 };
                 let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
                 let n0 = m.stored - m.base;
                 if rik != 0 && (m.base != 0 || n0 != pos0) {
                     return Err("a block route over a mirror that does not hold the whole history".into());
                 }
-                layers.push([m.kptr(), m.vptr(), dopen, dbar, rik, 0, 0]);
+                layers.push([m.kptr(), m.vptr(), dopen, dbar, rik, rblocks, 0]);
                 m.stored += n;
                 let keys = n0 + n;
                 let rb = attn_rb(keys);
@@ -7409,7 +7418,14 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                             let (blk_i, pre_i, loc_i, rem_i, mw_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32);
                             c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rb.raw.ptr, nkv_i))?;
                             c.launch(fx.route_put, ((nkv + 1) as u32, n as u32), hd as u32, 0, kargs!(rb.raw.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip))?;
-                            c.launch(fx.route_sel, (nkv as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, cip))?;
+                            // the candidates a mirror of this size may hold: a fixed grid (a recorded
+                            // graph's), the blocks past a row's candidates leave at once
+                            let nblk = lb[5] as usize;
+                            let (nblk_i, cb0_i) = (nblk as i32, rt.prefix as i32);
+                            if nblk > rt.prefix {
+                                c.launch_3d(fx.route_score, ((nblk - rt.prefix) as u32, nkv as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.sc.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, cb0_i, cip))?;
+                            }
+                            c.launch(fx.route_sel, (nkv as u32, n as u32), 32, 0, kargs!(rb.sc.ptr, rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, cip))?;
                             (rb.bm.ptr, rt.bshift(), mw_i)
                         }
                         _ => (0u64, 0i32, 0i32),
@@ -9817,7 +9833,16 @@ unsafe fn big(
                             c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
                             c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, b as u32), 256, 0, kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, braw, nkv_i))?;
                             c.launch(fx.route_put, ((nkv + 1) as u32, b as u32), hd as u32, 0, kargs!(braw, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul))?;
-                            c.launch(fx.route_sel, (nkv as u32, b as u32), 128, 0, kargs!(biq, ik, bbm, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nul))?;
+                            // the candidates of the chunk's last row bound the grid; none while
+                            // every block is routed
+                            let local0 = ((pos0 + b - 1) / rt.block + 1).saturating_sub(rt.local);
+                            let nblk = local0.max(rt.prefix + 1);
+                            let nblk_i = nblk as i32;
+                            let bsc = st.scr(c, "hb_rsc", b * nkv * nblk * 4)?;
+                            if local0 > rt.prefix + rt.remote {
+                                c.launch_3d(fx.route_score, ((local0 - rt.prefix) as u32, nkv as u32, b as u32), 128, 0, kargs!(biq, ik, bsc, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, pre_i, nul))?;
+                            }
+                            c.launch(fx.route_sel, (nkv as u32, b as u32), 32, 0, kargs!(bsc, bbm, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, nul))?;
                         }
                         (bbm, rt.bshift(), mw_i)
                     }
