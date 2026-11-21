@@ -1481,6 +1481,13 @@ fn moe_mode() -> u8 {
     })
 }
 
+/// `CMF_INKLING_COOP=0`: a prompt chunk's 4-bit dense matrices on the scalar
+/// tile GEMM instead of the cooperative-matrix one.
+fn coop_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_COOP").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_MOE4=0`: the decode's experts a row a subgroup (`ink_moe_gu` /
 /// `ink_moe_down`) instead of four rows a workgroup (`ink_moe_gu4` / `ink_moe_dn4`).
 fn moe4_on() -> bool {
@@ -1621,6 +1628,17 @@ impl Rec<'_> {
 fn mv(c: &'static Ctx, rec: &mut Rec, m: &Mat, xs: &wgpu::Buffer, y: &wgpu::Buffer, n: usize) -> Option<()> {
     // the backend's batch kernels for a prompt chunk, its matvec a row
     if n > 1 {
+        // a 4-bit matrix on the cooperative-matrix GEMM (f16 operands, in-kernel
+        // dequant) where the device has matrix units
+        if let (Codec::Q4, Some(pipe), true) = (&m.codec, c.q4tp_mm_coop.as_ref(), coop_on()) {
+            if m.cols % 32 == 0 {
+                let u = uniform_u32x4(c, [(m.cols / 4) as u32, m.rows as u32, n as u32, 0]);
+                let layout = pipe.get_bind_group_layout(0);
+                let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("inkling-coop"), layout: &layout, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &u)] });
+                rec.out.push(Step { name: "mm (coop)", pipe: pipe.clone(), bg, x: (m.rows as u32).div_ceil(64).min(MAX_WG), y: (n as u32).div_ceil(64), z: 1 });
+                return Some(());
+            }
+        }
         let (pipe, bg, a, b) = match m.codec {
             Codec::Q4 => dense_batch::q4tp_mm_r_prep(c, &m.buf, xs, y, m.rows, m.cols, n)?,
             Codec::Q8 => gemma_batch::q82_mm_prep(c, &m.buf, xs, y, m.rows, m.cols, n)?,
