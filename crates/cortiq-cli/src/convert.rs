@@ -16223,6 +16223,217 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The reference `modeling_maxwell_moe.py` transcribed in f64 for the tiny
+    /// fixture of `tiny_maxwell_…` (a whole sequence at once, no cache): the
+    /// logits after the last position. Independent of the engine's stack.
+    fn maxwell_reference(t: &std::collections::HashMap<String, Vec<f32>>, ids: &[u32]) -> Vec<f64> {
+        let (c, n, nh, nkv, hd, blk, npre, nloc, remote, top_k) = (32usize, 4usize, 4usize, 2usize, 8usize, 4usize, 2usize, 2usize, 1usize, 2usize);
+        let eps = 1e-6f64;
+        let w = |name: &str| -> Vec<f64> { t.get(name).unwrap_or_else(|| panic!("{name}")).iter().map(|&v| v as f64).collect() };
+        let mv = |m: &[f64], rows: usize, x: &[f64]| -> Vec<f64> {
+            let cols = x.len();
+            (0..rows).map(|r| m[r * cols..(r + 1) * cols].iter().zip(x).map(|(a, b)| a * b).sum()).collect()
+        };
+        let rms = |x: &[f64], g: &[f64]| -> Vec<f64> {
+            let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+            let r = 1.0 / (ms + eps).sqrt();
+            x.iter().zip(g).map(|(v, g)| v * r * g).collect()
+        };
+        let sig = |x: f64| 1.0 / (1.0 + (-x).exp());
+        let len = ids.len();
+        let emb = w("model.embed_tokens.weight");
+        let mut s: Vec<Vec<f64>> = ids
+            .iter()
+            .map(|&id| {
+                let row = &emb[id as usize * c..(id as usize + 1) * c];
+                (0..n).flat_map(|_| row.iter().copied()).collect()
+            })
+            .collect();
+        let invf: Vec<f64> = (0..hd / 2).map(|i| 1.0 / 10000f64.powf(2.0 * i as f64 / hd as f64)).collect();
+        // q * cos + rotate_half(q) * sin, a head at a time
+        let rope = |x: &mut [f64], pos: usize| {
+            for h in x.chunks_mut(hd) {
+                for i in 0..hd / 2 {
+                    let (sn, cs) = (pos as f64 * invf[i]).sin_cos();
+                    let (x0, x1) = (h[i], h[i + hd / 2]);
+                    h[i] = x0 * cs - x1 * sn;
+                    h[i + hd / 2] = x1 * cs + x0 * sn;
+                }
+            }
+        };
+        let norm_heads = |x: &mut [f64], g: &[f64]| {
+            for h in x.chunks_mut(hd) {
+                let v = rms(h, g);
+                h.copy_from_slice(&v);
+            }
+        };
+        // HyperConnectionModule._compute_mappings at one position
+        let hc = |p: &str, flat: &[f64]| -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+            let nc = flat.len();
+            let r = 1.0 / (flat.iter().map(|v| v * v).sum::<f64>().sqrt() / (nc as f64).sqrt() + eps);
+            let proj = mv(&w(&format!("{p}.mapping_proj.weight")), 2 * n + n * n, flat);
+            let bias = w(&format!("{p}.bias"));
+            let (ap, ao, ar) = (w(&format!("{p}.alpha_pre"))[0], w(&format!("{p}.alpha_post"))[0], w(&format!("{p}.alpha_res"))[0]);
+            let h: Vec<f64> = (0..2 * n + n * n).map(|i| r * proj[i] * (if i < n { ap } else if i < 2 * n { ao } else { ar }) + bias[i]).collect();
+            let pre: Vec<f64> = (0..n).map(|j| sig(h[j]) + eps).collect();
+            let post: Vec<f64> = (0..n).map(|j| 2.0 * sig(h[n + j])).collect();
+            let mut m: Vec<f64> = h[2 * n..].to_vec();
+            for i in 0..n {
+                let row = &mut m[i * n..(i + 1) * n];
+                let mx = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let se: f64 = row.iter().map(|v| (v - mx).exp()).sum();
+                for v in row.iter_mut() {
+                    *v = (*v - mx).exp() / se + eps;
+                }
+            }
+            let cols = |m: &mut [f64]| {
+                for j in 0..n {
+                    let se: f64 = (0..n).map(|i| m[i * n + j]).sum::<f64>() + eps;
+                    for i in 0..n {
+                        m[i * n + j] /= se;
+                    }
+                }
+            };
+            let rows = |m: &mut [f64]| {
+                for i in 0..n {
+                    let se: f64 = m[i * n..(i + 1) * n].iter().sum::<f64>() + eps;
+                    for v in m[i * n..(i + 1) * n].iter_mut() {
+                        *v /= se;
+                    }
+                }
+            };
+            cols(&mut m);
+            for _ in 0..19 {
+                rows(&mut m);
+                cols(&mut m);
+            }
+            (pre, post, m)
+        };
+        let fold = |st: &[f64], pre: &[f64]| -> Vec<f64> { (0..c).map(|d| (0..n).map(|j| pre[j] * st[j * c + d]).sum()).collect() };
+        // expand_and_mix: post[j] * y + sum_i res[i][j] * stream_i
+        let expand = |st: &mut Vec<f64>, y: &[f64], post: &[f64], res: &[f64]| {
+            let old = st.clone();
+            for j in 0..n {
+                for d in 0..c {
+                    st[j * c + d] = post[j] * y[d] + (0..n).map(|i| res[i * n + j] * old[i * c + d]).sum::<f64>();
+                }
+            }
+        };
+        let mlp = |pre: &str, x: &[f64], inter: usize| -> Vec<f64> {
+            let g = mv(&w(&format!("{pre}w1.weight")), inter, x);
+            let u = mv(&w(&format!("{pre}w3.weight")), inter, x);
+            let a: Vec<f64> = g.iter().zip(&u).map(|(g, u)| g * sig(*g) * u).collect();
+            mv(&w(&format!("{pre}w2.weight")), c, &a)
+        };
+        for li in 0..2usize {
+            let p = format!("model.layers.{li}.");
+            let a = format!("{p}self_attn.");
+            let (wq, wk, wv, wo) = (w(&format!("{a}q_proj.weight")), w(&format!("{a}k_proj.weight")), w(&format!("{a}v_proj.weight")), w(&format!("{a}o_proj.weight")));
+            let (qn, kn) = (w(&format!("{a}q_layernorm.weight")), w(&format!("{a}k_layernorm.weight")));
+            let (wiq, wik) = (w(&format!("{a}indexer.linear_q_proj.weight")), w(&format!("{a}indexer.linear_k_proj.weight")));
+            let (iqn, ikn) = (w(&format!("{a}indexer.q_layernorm.weight")), w(&format!("{a}indexer.k_layernorm.weight")));
+            let in_norm = w(&format!("{p}input_layernorm.weight"));
+            let (mut qs, mut ks, mut vs, mut iqs, mut iks, mut maps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for pos in 0..len {
+                let (pre, post, res) = hc(&format!("{p}self_attn_hyper_connection"), &s[pos]);
+                let x = rms(&fold(&s[pos], &pre), &in_norm);
+                let mut q = mv(&wq, nh * hd, &x);
+                norm_heads(&mut q, &qn);
+                rope(&mut q, pos);
+                let mut k = mv(&wk, nkv * hd, &x);
+                norm_heads(&mut k, &kn);
+                rope(&mut k, pos);
+                let mut iq = mv(&wiq, nkv * hd, &x);
+                norm_heads(&mut iq, &iqn);
+                rope(&mut iq, pos);
+                let mut ik = mv(&wik, hd, &x);
+                norm_heads(&mut ik, &ikn);
+                rope(&mut ik, pos);
+                qs.push(q);
+                ks.push(k);
+                vs.push(mv(&wv, nkv * hd, &x));
+                iqs.push(iq);
+                iks.push(ik);
+                maps.push((post, res));
+            }
+            let per = nh / nkv;
+            let num_blocks = len.div_ceil(blk);
+            for pos in 0..len {
+                let cur = pos / blk;
+                let local0 = (cur + 1).saturating_sub(nloc);
+                let mut out = vec![0f64; nh * hd];
+                for g in 0..nkv {
+                    // _select_blocks: the blocks wholly past the prefix and wholly before the
+                    // local window, by their largest token score
+                    let mut scored: Vec<(usize, f64)> = (0..num_blocks)
+                        .filter(|&b| b >= npre && b + 1 <= local0)
+                        .map(|b| {
+                            let mx = (b * blk..(b + 1) * blk)
+                                .map(|tk| iqs[pos][g * hd..(g + 1) * hd].iter().zip(&iks[tk]).map(|(a, b)| a * b).sum::<f64>())
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            (b, mx)
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    // _build_block_aligned_route: prefix, remote, local
+                    let mut blocks: Vec<usize> = (0..npre).filter(|&b| b <= cur).collect();
+                    blocks.extend(scored.iter().take(remote).map(|s| s.0));
+                    blocks.extend((local0..=cur).filter(|&b| b >= npre));
+                    let toks: Vec<usize> = blocks.iter().flat_map(|&b| b * blk..(b + 1) * blk).filter(|&tk| tk <= pos).collect();
+                    for j in 0..per {
+                        let h = g * per + j;
+                        let qh = &qs[pos][h * hd..(h + 1) * hd];
+                        let sc: Vec<f64> = toks.iter().map(|&tk| qh.iter().zip(&ks[tk][g * hd..(g + 1) * hd]).map(|(a, b)| a * b).sum::<f64>() / (hd as f64).sqrt()).collect();
+                        let mx = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let den: f64 = sc.iter().map(|v| (v - mx).exp()).sum();
+                        for (&tk, &sv) in toks.iter().zip(&sc) {
+                            let pw = (sv - mx).exp() / den;
+                            for d in 0..hd {
+                                out[h * hd + d] += pw * vs[tk][g * hd + d];
+                            }
+                        }
+                    }
+                }
+                let y = mv(&wo, c, &out);
+                let (post, res) = &maps[pos];
+                expand(&mut s[pos], &y, post, res);
+            }
+            let post_norm = w(&format!("{p}post_attention_layernorm.weight"));
+            let m = format!("{p}block_sparse_moe.");
+            for pos in 0..len {
+                let (pre, post, res) = hc(&format!("{p}mlp_hyper_connection"), &s[pos]);
+                let x = rms(&fold(&s[pos], &pre), &post_norm);
+                let y = if li == 0 {
+                    mlp(&m, &x, 64)
+                } else {
+                    let sc: Vec<f64> = mv(&w(&format!("{m}gate.weight")), 4, &x).into_iter().map(sig).collect();
+                    let bias = w(&format!("{m}expert_bias"));
+                    let mut order: Vec<usize> = (0..4).collect();
+                    order.sort_by(|&a, &b| (sc[b] + bias[b]).partial_cmp(&(sc[a] + bias[a])).unwrap());
+                    order.truncate(top_k);
+                    let sum: f64 = order.iter().map(|&e| sc[e]).sum::<f64>() + 1e-20;
+                    let mut y = mlp(&format!("{m}shared_expert."), &x, 64);
+                    for &e in &order {
+                        let ye = mlp(&format!("{m}experts.{e}."), &x, 32);
+                        for d in 0..c {
+                            y[d] += sc[e] / sum * ye[d];
+                        }
+                    }
+                    y
+                };
+                expand(&mut s[pos], &y, &post, &res);
+            }
+        }
+        // HCHead, the final norm, the head
+        let flat = &s[len - 1];
+        let rs = 1.0 / (flat.iter().map(|v| v * v).sum::<f64>() / flat.len() as f64 + eps).sqrt();
+        let mixes = mv(&w("model.hc_head.hc_head_fn"), n, flat);
+        let (base, scale) = (w("model.hc_head.hc_head_base"), w("model.hc_head.hc_head_scale")[0]);
+        let wts: Vec<f64> = (0..n).map(|j| sig(mixes[j] * rs * scale + base[j]) + eps).collect();
+        let x = rms(&fold(flat, &wts), &w("model.norm.weight"));
+        mv(&w("lm_head.weight"), 32, &x)
+    }
+
     #[test]
     fn tiny_maxwell_converts_loads_and_runs_past_its_dense_range() {
         // A generated Maxwell-shaped fixture through the packer, the CMF
@@ -16387,6 +16598,27 @@ pub(crate) mod tests {
             ab / (aa.sqrt() * bb.sqrt()).max(1e-30)
         };
         assert!(cos(&last[0], &last[1]) > 0.98, "q8_2f against q4tp: cos {}", cos(&last[0], &last[1]));
+
+        // The stack against a transcription of the reference: every matrix kept f16, the
+        // engine's logits beside the reference's in f64, at a length inside the dense range
+        // and at one where the indexer picks the remote block (20 candidates' worth of rows).
+        set_tensor_quant_overrides(&["*=f16".to_string()]).unwrap();
+        let out = dir.join("tiny-maxwell-f16.cmf");
+        let converted = run_convert(dir.to_str().unwrap(), "q8_2f", out.to_str().unwrap(), None, None, None, false, |_| {});
+        set_tensor_quant_overrides(&[]).unwrap();
+        converted.unwrap();
+        let model = std::sync::Arc::new(CmfModel::open(&out).unwrap());
+        let mut pipeline = cortiq_engine::Pipeline::from_model(&model, cortiq_engine::sampler::SamplerConfig::default()).unwrap();
+        let weights: std::collections::HashMap<String, Vec<f32>> = tensors.iter().map(|(name, _, vals)| (name.clone(), vals.clone())).collect();
+        for upto in [12usize, 40] {
+            let got = pipeline.forward_ids(&ids[..upto], None).unwrap();
+            let want = maxwell_reference(&weights, &ids[..upto]);
+            let top = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+            let worst = got.iter().zip(&want).map(|(a, b)| (*a as f64 - b).abs()).fold(0f64, f64::max);
+            assert!(worst <= 5e-3 * top, "{upto} tokens: the logits differ from the reference by {worst} of {top}");
+            let arg = |v: &mut dyn Iterator<Item = f64>| v.enumerate().fold((0usize, f64::NEG_INFINITY), |b, (i, x)| if x > b.1 { (i, x) } else { b }).0;
+            assert_eq!(arg(&mut got.iter().map(|v| *v as f64)), arg(&mut want.iter().copied()), "{upto} tokens: argmax");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
