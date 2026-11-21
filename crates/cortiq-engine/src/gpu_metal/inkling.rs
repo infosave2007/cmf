@@ -6,8 +6,10 @@
 //! SwiGLU, the weighted downs) — nothing returns to the host inside a token.
 //! Every one of the 48 layer applications keeps its own keys and values (f16;
 //! a local layer's in a ring of its window, a full layer's growing) and its
-//! four convolution rings. A call (a token, or a prompt chunk of up to 16
-//! rows) is one command buffer.
+//! four convolution rings. A call (a token, or a prompt chunk of up to
+//! `CMF_INKLING_ROWS`, 256, rows) is one command buffer. A prompt chunk's
+//! dense matrices go through the backend's simdgroup GEMM (`q4tp_mul_mm`), its
+//! routed experts grouped by expert, so a chunk reads each expert once.
 
 use super::{Ctx, WeightArena, ctx, file_buffer, set_bytes_t};
 use crate::inkling::{Cfg, Globals, Layer};
@@ -16,8 +18,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const MSL: &str = include_str!("inkling_msl.metal");
-/// Rows of a call.
-const NMAX: usize = 16;
+/// Rows of a call (`CMF_INKLING_ROWS`, 256: M4, a 512-token prompt 117 tok/s
+/// at 128, 140 at 256, 145 at 512).
+fn rows_cap() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(256, |n| n.clamp(1, 1024)))
+}
 /// Block states a row holds.
 const MAXB: usize = 4;
 
@@ -80,6 +86,13 @@ struct Pipes {
     select: ComputePipelineState,
     moe_gu: ComputePipelineState,
     moe_down: ComputePipelineState,
+    group: ComputePipelineState,
+    moe_gu_g: ComputePipelineState,
+    moe_down_g: ComputePipelineState,
+    moe_mix: ComputePipelineState,
+    moe_mm: ComputePipelineState,
+    moe_act: ComputePipelineState,
+    moe_mixq: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -110,6 +123,13 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             select: pso("ink_select")?,
             moe_gu: pso("ink_moe_gu")?,
             moe_down: pso("ink_moe_down")?,
+            group: pso("ink_group")?,
+            moe_gu_g: pso("ink_moe_gu_g")?,
+            moe_down_g: pso("ink_moe_down_g")?,
+            moe_mix: pso("ink_moe_mix")?,
+            moe_mm: pso("ink_moe_mm")?,
+            moe_act: pso("ink_moe_act")?,
+            moe_mixq: pso("ink_moe_mixq")?,
         })
     });
     match r {
@@ -202,6 +222,8 @@ struct SlotM {
 }
 
 struct Dev {
+    /// Rows a call holds.
+    rows: usize,
     fbuf: Arc<WeightArena>,
     wstride: u64,
     layers: Vec<LayerM>,
@@ -238,6 +260,13 @@ struct Dev {
     pick: Buffer,
     wt: Buffer,
     act: Buffer,
+    /// A multi-row call's (row, pick) entries grouped by expert, and the
+    /// picks' down outputs `[row·topk + k][H]`.
+    grp: Buffer,
+    yp: Buffer,
+    /// The places' gate and up rows of the grouped GEMMs `[place][inter]`.
+    gq: Buffer,
+    uq: Buffer,
     y: Buffer,
     fin: Buffer,
     xf: Buffer,
@@ -329,7 +358,7 @@ fn build(c: &Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<Dev, Strin
     for (li, pass) in cfg.plan() {
         // a local slot's ring: its window and a call's rows (the call writes
         // every row's key before any row reads)
-        let ring = if layers[li].sliding { cfg.window + NMAX } else { 0 };
+        let ring = if layers[li].sliding { cfg.window + rows_cap() } else { 0 };
         let cap = if ring > 0 { ring } else { 4096 };
         slots[cfg.slot(li, pass)] = Some(SlotM {
             k: shared(c, cap * kvs * 2),
@@ -341,12 +370,13 @@ fn build(c: &Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<Dev, Strin
     }
     let slots: Vec<SlotM> = slots.into_iter().map(|s| s.ok_or("a slot without its application")).collect::<Result<_, _>>()?;
     let f4 = |n: usize| shared(c, n * 4);
-    let rows = NMAX;
+    let rows = rows_cap();
     let (qs, rs) = (nh * hd, nh * dr);
     let e = dl.first().map_or(0, |l| l.e);
     let inter = dl.first().map_or(0, |l| l.inter);
     let vocab = head.rows();
     Ok(Dev {
+        rows,
         fbuf,
         wstride,
         layers: dl,
@@ -383,10 +413,14 @@ fn build(c: &Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<Dev, Strin
         pick: shared(c, rows * cfg.top_k * 4),
         wt: f4(rows * cfg.top_k),
         act: f4(rows * cfg.top_k * inter),
+        grp: shared(c, (e + 1 + 2 * rows * cfg.top_k) * 4),
+        yp: f4(rows * cfg.top_k * hidden),
+        gq: f4(rows * cfg.top_k * inter),
+        uq: f4(rows * cfg.top_k * inter),
         y: f4(rows * hidden),
         fin: f4(rows * hidden),
         xf: f4(rows * hidden),
-        logits: f4(rows * vocab),
+        logits: f4(rows.min(16) * vocab),
         dummy: shared(c, 64),
     })
 }
@@ -466,7 +500,8 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
     let p = pipes(c).expect("pipelines");
     let mut at = 0usize;
     while at < ids.len() {
-        let n = (ids.len() - at).min(NMAX);
+        // every row's logits come 16 rows a call (the logits buffer's rows)
+        let n = (ids.len() - at).min(if all { d.rows.min(16) } else { d.rows });
         let last = at + n == ids.len();
         let lrows = if all { n } else if want && last { 1 } else { 0 };
         let mut e = vec![0f32; hidden];
@@ -513,6 +548,14 @@ fn grid(enc: &ComputeCommandEncoderRef, x: u64, y: u64, z: u64, threads: u64) {
 /// `m · x` for `n` rows: x rows `cols` apart from `xoff` bytes, y rows `rows` apart.
 #[allow(clippy::too_many_arguments)]
 fn mv(c: &Ctx, enc: &ComputeCommandEncoderRef, fbuf: &WeightArena, m: &Mat, xs: &Buffer, xoff: usize, y: &Buffer, yoff: usize, n: usize) {
+    // a prompt chunk's q4tp matrix: the backend's simdgroup GEMM reads it once
+    // for every row (its activations staged as half)
+    if let Mat::Q4 { abs, rows, cols } = m {
+        if n > 1 && gemm_on() && xoff % (cols * 4) == 0 && yoff % (rows * 4) == 0 {
+            super::enc_q4tp_mm_rows(c, enc, fbuf, *abs, xs, xoff / (cols * 4), y, yoff / (rows * 4), n, *rows, *cols);
+            return;
+        }
+    }
     for j in 0..n {
         match m {
             Mat::Q4 { abs, rows, cols } => {
@@ -542,7 +585,26 @@ fn mv(c: &Ctx, enc: &ComputeCommandEncoderRef, fbuf: &WeightArena, m: &Mat, xs: 
     }
 }
 
-fn base_ip(cfg: &Cfg, n: usize, pos0: usize) -> IP {
+/// `CMF_INKLING_GEMM=0`: a chunk's dense matrices a matvec a row.
+fn gemm_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_GEMM").as_deref() != Ok("0"))
+}
+
+/// A chunk's routed experts (`CMF_INKLING_MOE`): `gemm` (the default) groups
+/// the (row, pick) entries by expert and runs each expert as a simdgroup GEMM
+/// over its rows; `loop` an expert's rows a matvec at a time; `pick` the decode
+/// kernels, a (row, pick) at a time.
+fn moe_mode() -> u8 {
+    static M: OnceLock<u8> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CMF_INKLING_MOE").as_deref() {
+        Ok("pick") => 0,
+        Ok("loop") => 1,
+        _ => 2,
+    })
+}
+
+fn base_ip(cfg: &Cfg, n: usize, pos0: usize, rows: usize) -> IP {
     IP {
         h: cfg.dim as u32,
         nh: cfg.nh as u32,
@@ -553,7 +615,7 @@ fn base_ip(cfg: &Cfg, n: usize, pos0: usize) -> IP {
         n: n as u32,
         pos0: pos0 as u32,
         bstride: (MAXB * cfg.dim) as u32,
-        ostride: (NMAX * cfg.dim) as u32,
+        ostride: (rows * cfg.dim) as u32,
         topk: cfg.top_k as u32,
         eps: cfg.eps as f32,
         qclip: cfg.qk_clip,
@@ -578,7 +640,7 @@ fn setp(enc: &ComputeCommandEncoderRef, ip: &IP) {
 #[allow(clippy::too_many_arguments)]
 fn encode_call(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, n: usize, pos0: usize, lrows: usize) {
     let hidden = cfg.dim;
-    let base = base_ip(cfg, n, pos0);
+    let base = base_ip(cfg, n, pos0, d.rows);
     let hb = (n * hidden * 4) as u64;
     let mut cur = 0usize;
     let mut hin: (&Buffer, u64) = (&d.h[0], 0);
@@ -650,7 +712,7 @@ fn copy(p: &Pipes, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, b
 fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l: &LayerM, s: &SlotM, li: usize, pass: usize, n: usize, base: &IP, hin: &Buffer, hout: &Buffer, nb: &mut usize, npre: usize) {
     let hidden = cfg.dim;
     let nu = n as u64;
-    let plane = (NMAX * hidden * 4) as u64;
+    let plane = (d.rows * hidden * 4) as u64;
     // 1. the attention inputs
     let mut inp: [(&Buffer, u64); 3] = [(hin, 0), (hin, 0), (hin, 0)];
     if let Some((aq, nq)) = &l.aq {
@@ -818,6 +880,78 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     setp(enc, &ip);
     grid(enc, nu, 1, 1, 128);
     let wins: Vec<&Buffer> = (0..4).map(|i| d.fbuf.window(i.min(d.fbuf.bufs.len() - 1))).collect();
+    if n > 1 && moe_mode() > 0 {
+        // the entries by expert, an expert's rows against its weights once
+        enc.set_compute_pipeline_state(&p.group);
+        enc.set_buffer(0, Some(&d.pick), 0);
+        enc.set_buffer(1, Some(&d.grp), 0);
+        setp(enc, &ip);
+        grid(enc, 1, 1, 1, 256);
+    }
+    if n > 1 && moe_mode() == 2 {
+        let nk = (n * cfg.top_k) as u64;
+        let tiles = nu.div_ceil(32);
+        let mm = |which: u32, x: &Buffer, y: &Buffer, out_rows: usize| {
+            let mut ipm = ip;
+            ipm.v = which;
+            enc.set_compute_pipeline_state(&p.moe_mm);
+            for (i, w) in wins.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(w), 0);
+            }
+            enc.set_buffer(4, Some(&l.bases), 0);
+            enc.set_buffer(5, Some(&d.grp), 0);
+            enc.set_buffer(6, Some(x), 0);
+            enc.set_buffer(7, Some(y), 0);
+            set_bytes_t(enc, 8, &d.wstride);
+            setp(enc, &ipm);
+            grid(enc, tiles, (out_rows as u64).div_ceil(64), l.e as u64, 128);
+        };
+        mm(0, &d.xm, &d.gq, l.inter);
+        mm(1, &d.xm, &d.uq, l.inter);
+        enc.set_compute_pipeline_state(&p.moe_act);
+        enc.set_buffer(0, Some(&d.gq), 0);
+        enc.set_buffer(1, Some(&d.uq), 0);
+        enc.set_buffer(2, Some(&d.act), 0);
+        setp(enc, &ip);
+        grid(enc, (l.inter as u64).div_ceil(256), nk, 1, 256);
+        mm(2, &d.act, &d.yp, hidden);
+        enc.set_compute_pipeline_state(&p.moe_mixq);
+        enc.set_buffer(0, Some(&d.yp), 0);
+        enc.set_buffer(1, Some(&d.wt), 0);
+        enc.set_buffer(2, Some(&d.y), 0);
+        enc.set_buffer(3, Some(&d.grp), 0);
+        setp(enc, &ip);
+        grid(enc, (hidden as u64).div_ceil(256), nu, 1, 256);
+    } else if n > 1 && moe_mode() == 1 {
+        enc.set_compute_pipeline_state(&p.moe_gu_g);
+        for (i, w) in wins.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(w), 0);
+        }
+        enc.set_buffer(4, Some(&l.bases), 0);
+        enc.set_buffer(5, Some(&d.grp), 0);
+        enc.set_buffer(6, Some(&d.xm), 0);
+        enc.set_buffer(7, Some(&d.act), 0);
+        set_bytes_t(enc, 8, &d.wstride);
+        setp(enc, &ip);
+        grid(enc, (l.inter as u64).div_ceil(16), l.e as u64, 1, 128);
+        enc.set_compute_pipeline_state(&p.moe_down_g);
+        for (i, w) in wins.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(w), 0);
+        }
+        enc.set_buffer(4, Some(&l.bases), 0);
+        enc.set_buffer(5, Some(&d.grp), 0);
+        enc.set_buffer(6, Some(&d.act), 0);
+        enc.set_buffer(7, Some(&d.yp), 0);
+        set_bytes_t(enc, 8, &d.wstride);
+        setp(enc, &ip);
+        grid(enc, (hidden as u64).div_ceil(16), l.e as u64, 1, 128);
+        enc.set_compute_pipeline_state(&p.moe_mix);
+        enc.set_buffer(0, Some(&d.yp), 0);
+        enc.set_buffer(1, Some(&d.wt), 0);
+        enc.set_buffer(2, Some(&d.y), 0);
+        setp(enc, &ip);
+        grid(enc, (hidden as u64).div_ceil(256), nu, 1, 256);
+    } else {
     enc.set_compute_pipeline_state(&p.moe_gu);
     for (i, w) in wins.iter().enumerate() {
         enc.set_buffer(i as u64, Some(w), 0);
@@ -841,6 +975,7 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     set_bytes_t(enc, 9, &d.wstride);
     setp(enc, &ip);
     grid(enc, (hidden as u64).div_ceil(16), nu, 1, 128);
+    }
     // 10. the output convolution onto the running sum
     let ip = *base;
     enc.set_compute_pipeline_state(&p.post);

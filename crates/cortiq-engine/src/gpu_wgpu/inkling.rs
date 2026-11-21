@@ -14,8 +14,14 @@ use crate::inkling::{Cfg, Globals, Layer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Rows of a call.
-const NMAX: usize = 16;
+/// Rows of a call (`CMF_INKLING_ROWS`, 128): a prompt chunk's; a decode call
+/// is one.
+fn rows_cap() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(128, |n| n.clamp(1, 1024)))
+}
+/// Rows of logits a call returns (every row's, 16 at a time).
+const LROWS: usize = 16;
 /// Block states a row holds.
 const MAXB: usize = 4;
 
@@ -575,6 +581,216 @@ fn ink_moe_down(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_i
     }
     if (lane == 0u && row < H) { o0[r * H + row] = tot; }
 }
+
+// ── A prompt call's routed experts grouped by expert: an expert's rows read its
+// weights once a call (from the cache after the first entry), not once a pick.
+
+var<workgroup> gcnt: array<u32, 1024>;
+var<workgroup> g_i0: u32;
+var<workgroup> g_i1: u32;
+
+// The (row, pick) entries by expert: ui the picks (the table from E·3), uo
+// [0..E) the first entry of each expert, uo[E] the count, uo[E + 1 + q] the
+// q-th entry (r·K + k), uo[E + 1 + nk + entry] its place q. p.rows: the
+// call's rows. Grid 1, 256.
+@compute @workgroup_size(256)
+fn ink_group(@builtin(local_invocation_index) lid: u32) {
+    let E = p.e; let nk = p.rows * p.topk;
+    for (var e = lid; e < E; e = e + 256u) {
+        var c = 0u;
+        for (var i = 0u; i < nk; i = i + 1u) { if (ui[i] == e) { c = c + 1u; } }
+        gcnt[e] = c;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var o = 0u;
+        for (var e = 0u; e < E; e = e + 1u) { let c = gcnt[e]; gcnt[e] = o; o = o + c; }
+        uo[E] = o;
+    }
+    workgroupBarrier();
+    for (var e = lid; e < E; e = e + 256u) {
+        var q = gcnt[e];
+        uo[e] = q;
+        for (var i = 0u; i < nk; i = i + 1u) { if (ui[i] == e) { uo[E + 1u + nk + i] = q; uo[E + 1u + q] = i; q = q + 1u; } }
+    }
+}
+
+// An expert's entries, uniform over the workgroup: [i0, i1) of uo's list.
+fn entries(lid: u32, e: u32) -> vec2<u32> {
+    if (lid == 0u) {
+        g_i0 = uo[e];
+        if (e + 1u < p.e) { g_i1 = uo[e + 1u]; } else { g_i1 = uo[p.e]; }
+    }
+    return vec2<u32>(workgroupUniformLoad(&g_i0), workgroupUniformLoad(&g_i1));
+}
+
+// An expert's gate and up rows over its entries, the softcapped SwiGLU into
+// o0 act[entry][inter]. a2 x, ui the table, uo the grouped entries.
+// Grid (inter/8, E), 256 (32 lanes a row).
+@compute @workgroup_size(256)
+fn ink_moe_gu_g(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let sg = lid >> 5u; let lane = lid & 31u;
+    let e = w.y; let inter = p.inter; let gpr = p.h / 32u;
+    let row = w.x * 8u + sg;
+    let span = entries(lid, e);
+    for (var i = span.x; i < span.y; i = i + 1u) {
+        let ent = uo[p.e + 1u + i];
+        let r = ent / p.topk;
+        var g = 0.0; var u = 0.0;
+        if (row < inter) {
+            g = q4row(ui[e * 3u], inter, gpr, row, lane, r * p.h, 0u);
+            u = q4row(ui[e * 3u + 1u], inter, gpr, row, lane, r * p.h, 0u);
+        }
+        red[lid] = g;
+        workgroupBarrier();
+        var gs = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { gs = gs + red[sg * 32u + j]; }
+        workgroupBarrier();
+        red[lid] = u;
+        workgroupBarrier();
+        var us = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { us = us + red[sg * 32u + j]; }
+        workgroupBarrier();
+        if (lane == 0u && row < inter) {
+            o0[ent * inter + row] = (p.cap * tanh(gs / p.cap)) * sigm(gs) * (p.ucap * tanh(us / p.ucap));
+        }
+    }
+}
+
+// An expert's down rows over its entries into o0 yp[entry][H] (unweighted).
+// a3 act. Grid (H/8, E), 256.
+@compute @workgroup_size(256)
+fn ink_moe_down_g(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let sg = lid >> 5u; let lane = lid & 31u;
+    let e = w.y; let H = p.h; let inter = p.inter; let gpr = inter / 32u;
+    let row = w.x * 8u + sg;
+    let span = entries(lid, e);
+    for (var i = span.x; i < span.y; i = i + 1u) {
+        let ent = uo[p.e + 1u + i];
+        var acc = 0.0;
+        if (row < H) { acc = q4row(ui[e * 3u + 2u], H, gpr, row, lane, ent * inter, 1u); }
+        red[lid] = acc;
+        workgroupBarrier();
+        var s = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { s = s + red[sg * 32u + j]; }
+        workgroupBarrier();
+        if (lane == 0u && row < H) { o0[ent * H + row] = s; }
+    }
+}
+
+// ── The grouped experts as tiled GEMMs: o0 Y[q][rows] = W_e · X[q] over the
+// places q of expert e. p.v 0 / 1: the gate / up of e over the gathered rows
+// a2 x[entry / K] (cols H); 2: the down of e over a2 A[q] (cols inter). ui the
+// table, uo the grouped entries. A workgroup a tile of 64 output rows × 32
+// places, K in steps of 32 through workgroup memory (the weights decoded once
+// a tile), 8 sums a lane. Grid (rows of a call / 32, out rows / 64, E), 256.
+var<workgroup> wt_s: array<f32, 2112>;
+var<workgroup> xt_s: array<f32, 1056>;
+@compute @workgroup_size(256)
+fn ink_moe_mm(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let which = p.v; let e = w.z; let E = p.e; let K = p.topk;
+    let span = entries(lid, e);
+    let nb = span.y - span.x;
+    let r1 = w.x * 32u;
+    if (r1 >= nb) { return; }
+    var cols = p.h; var rows = p.inter;
+    if (which == 2u) { cols = p.inter; rows = p.h; }
+    let r0 = w.y * 64u;
+    if (r0 >= rows) { return; }
+    let wb = ui[e * 3u + which];
+    let gpr = cols / 32u;
+    let params_w = wb + rows * gpr * 4u;
+    let codes_b = (wb + rows * gpr * 4u + rows) * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    // the loads: a weight row's quarter group (one word, 8 nibbles), an input row's 4 floats
+    let lrow = lid >> 2u; let quarter = lid & 3u;
+    let wrow = min(r0 + lrow, rows - 1u);
+    let pr = unpack2x16float(bank[params_w + wrow]);
+    let xent = lid >> 3u; let x4 = (lid & 7u) * 4u;
+    let qp = span.x + r1 + min(xent, nb - r1 - 1u);
+    var xrow = qp;
+    if (which != 2u) { xrow = uo[E + 1u + qp] / K; }
+    let xbase = xrow * cols;
+    // the sums: rows rb..rb+3, places eb, eb+1
+    let rb = (lid & 15u) * 4u; let eb = (lid >> 4u) * 2u;
+    var c00 = 0.0; var c01 = 0.0; var c10 = 0.0; var c11 = 0.0;
+    var c20 = 0.0; var c21 = 0.0; var c30 = 0.0; var c31 = 0.0;
+    for (var g = 0u; g < gpr; g = g + 1u) {
+        workgroupBarrier();
+        let bit = g * 5u; let cbo = bit >> 3u; let sh = bit & 7u;
+        var cv = bank_byte(codes_b + wrow * cstride + cbo);
+        if (sh > 3u) { cv = cv | (bank_byte(codes_b + wrow * cstride + cbo + 1u) << 8u); }
+        let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+        let wq = bank[wb + (wrow * gpr + g) * 4u + quarter];
+        let wo = lrow * 33u + quarter * 8u;
+        for (var i = 0u; i < 8u; i = i + 1u) { wt_s[wo + i] = (f32((wq >> (4u * i)) & 0xFu) - 8.0) * scale; }
+        let xo = xbase + g * 32u + x4;
+        let xs = xent * 33u + x4;
+        xt_s[xs] = a2[xo]; xt_s[xs + 1u] = a2[xo + 1u]; xt_s[xs + 2u] = a2[xo + 2u]; xt_s[xs + 3u] = a2[xo + 3u];
+        workgroupBarrier();
+        for (var k = 0u; k < 32u; k = k + 1u) {
+            let a0 = wt_s[rb * 33u + k]; let a1 = wt_s[(rb + 1u) * 33u + k];
+            let a2v = wt_s[(rb + 2u) * 33u + k]; let a3 = wt_s[(rb + 3u) * 33u + k];
+            let b0 = xt_s[eb * 33u + k]; let b1 = xt_s[(eb + 1u) * 33u + k];
+            c00 = c00 + a0 * b0; c01 = c01 + a0 * b1;
+            c10 = c10 + a1 * b0; c11 = c11 + a1 * b1;
+            c20 = c20 + a2v * b0; c21 = c21 + a2v * b1;
+            c30 = c30 + a3 * b0; c31 = c31 + a3 * b1;
+        }
+    }
+    // the places eb, eb+1 of the tile that hold an entry, the rows that exist
+    let base = span.x + r1;
+    if (eb < nb - r1) {
+        let o = (base + eb) * rows + r0 + rb;
+        if (r0 + rb < rows) { o0[o] = c00; }
+        if (r0 + rb + 1u < rows) { o0[o + 1u] = c10; }
+        if (r0 + rb + 2u < rows) { o0[o + 2u] = c20; }
+        if (r0 + rb + 3u < rows) { o0[o + 3u] = c30; }
+    }
+    if (eb + 1u < nb - r1) {
+        let o = (base + eb + 1u) * rows + r0 + rb;
+        if (r0 + rb < rows) { o0[o] = c01; }
+        if (r0 + rb + 1u < rows) { o0[o + 1u] = c11; }
+        if (r0 + rb + 2u < rows) { o0[o + 2u] = c21; }
+        if (r0 + rb + 3u < rows) { o0[o + 3u] = c31; }
+    }
+}
+
+// The softcapped SwiGLU of the places' gate and up rows: o0 A = f(a0 G, a1 U).
+// Grid (inter/256, nk), 256.
+@compute @workgroup_size(256)
+fn ink_moe_act(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let i = w.x * 256u + lid; let q = w.y; let inter = p.inter;
+    if (i >= inter || q >= p.rows * p.topk) { return; }
+    let at = q * inter + i;
+    let g = a0[at]; let u = a1[at];
+    o0[at] = (p.cap * tanh(g / p.cap)) * sigm(g) * (p.ucap * tanh(u / p.ucap));
+}
+
+// Every row's mixture of its picks' downs from the places: o0 y[r] = Σ_k
+// a1 wt[r][k]·a0 Yp[place(r·K + k)], ui the grouped entries. Grid (H/256, n), 256.
+@compute @workgroup_size(256)
+fn ink_moe_mixq(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let i = w.x * 256u + lid; let r = w.y; let H = p.h; let nk = p.rows * p.topk;
+    if (i >= H) { return; }
+    var acc = 0.0;
+    for (var k = 0u; k < p.topk; k = k + 1u) {
+        let q = ui[p.e + 1u + nk + r * p.topk + k];
+        acc = acc + a1[r * p.topk + k] * a0[q * H + i];
+    }
+    o0[r * H + i] = acc;
+}
+
+// Every row's mixture of its picks' downs: o0 y[r] = Σ_k a1 wt[r][k]·a0 yp[r·K + k].
+// Grid (H/256, n), 256.
+@compute @workgroup_size(256)
+fn ink_moe_mix(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let i = w.x * 256u + lid; let r = w.y; let H = p.h;
+    if (i >= H) { return; }
+    var acc = 0.0;
+    for (var k = 0u; k < p.topk; k = k + 1u) { acc = acc + a1[r * p.topk + k] * a0[(r * p.topk + k) * H + i]; }
+    o0[r * H + i] = acc;
+}
 "#;
 
 /// `IP` of the shader.
@@ -622,9 +838,9 @@ struct Pipes {
 
 static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
 
-const KERNELS: [&str; 16] = [
+const KERNELS: [&str; 23] = [
     "ink_mix", "ink_rms", "ink_gate_down", "ink_gate_out", "ink_fmv", "ink_qr", "ink_kv", "ink_attn", "ink_ogate", "ink_post", "ink_softcap", "ink_copy", "ink_router",
-    "ink_select", "ink_moe_gu", "ink_moe_down",
+    "ink_select", "ink_moe_gu", "ink_moe_down", "ink_group", "ink_moe_gu_g", "ink_moe_down_g", "ink_moe_mix", "ink_moe_mm", "ink_moe_act", "ink_moe_mixq",
 ];
 
 /// The writable bindings of the shader (the others read-only storage,
@@ -775,6 +991,13 @@ struct Dev {
     lg: wgpu::Buffer,
     wt: wgpu::Buffer,
     act: wgpu::Buffer,
+    /// A multi-row call's (row, pick) entries grouped by expert, and the
+    /// picks' down outputs `[row·topk + k][H]`.
+    grp: wgpu::Buffer,
+    yp: wgpu::Buffer,
+    /// The places' gate and up rows of the grouped GEMMs `[place][inter]`.
+    gq: wgpu::Buffer,
+    uq: wgpu::Buffer,
     y: wgpu::Buffer,
     fin: wgpu::Buffer,
     xf: wgpu::Buffer,
@@ -890,7 +1113,7 @@ fn build(c: &'static Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<De
         }
         let e = l.moe.bias.len();
         let mut table = offs;
-        table.resize(e * 3 + NMAX * cfg.top_k, 0);
+        table.resize(e * 3 + rows_cap() * cfg.top_k, 0);
         let gates = match &l.gates {
             Some(gs) => {
                 let mk = |x: &crate::inkling::Gate| (store(c, "gd", &x.down), store(c, "gf", &x.forget), store(c, "gg", &x.gain), x.down.len() / (2 * hidden));
@@ -938,7 +1161,7 @@ fn build(c: &'static Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<De
     let kvs = nkv * hd;
     let mut slots: Vec<Option<SlotW>> = (0..cfg.slots()).map(|_| None).collect();
     for (li, pass) in cfg.plan() {
-        let ring = if layers[li].sliding { cfg.window + NMAX } else { 0 };
+        let ring = if layers[li].sliding { cfg.window + rows_cap() } else { 0 };
         let cap = if ring > 0 { ring } else { 4096 };
         slots[cfg.slot(li, pass)] = Some(SlotW {
             k: buf(c, "kc", cap * kvs * 4),
@@ -949,7 +1172,7 @@ fn build(c: &'static Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<De
         });
     }
     let slots: Vec<SlotW> = slots.into_iter().map(|s| s.ok_or_else(|| "a slot without its application".to_string())).collect::<Result<_, _>>()?;
-    let rows = NMAX;
+    let rows = rows_cap();
     let f4 = |label: &str, n: usize| buf(c, label, n * 4);
     let (qs, rs) = (nh * hd, nh * dr);
     let e = dl.first().map_or(0, |l| l.e);
@@ -989,11 +1212,15 @@ fn build(c: &'static Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<De
         lg: f4("lg", rows * e),
         wt: f4("wt", rows * cfg.top_k),
         act: f4("act", rows * cfg.top_k * inter),
+        grp: buf(c, "grp", (e + 1 + 2 * rows * cfg.top_k) * 4),
+        yp: f4("yp", rows * cfg.top_k * hidden),
+        gq: f4("gq", rows * cfg.top_k * inter),
+        uq: f4("uq", rows * cfg.top_k * inter),
         y: f4("y", rows * hidden),
         fin: f4("fin", rows * hidden),
         xf: f4("xf", rows * hidden),
-        logits: f4("logits", rows * vocab),
-        staging: c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-staging"), size: (rows * vocab * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+        logits: f4("logits", LROWS * vocab),
+        staging: c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inkling-staging"), size: (LROWS * vocab * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
         dummy: buf(c, "dummy", 256),
         dummy_w: buf(c, "dummy-w", 256),
         head,
@@ -1080,7 +1307,7 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
     let vocab = d.head.rows;
     let mut at = 0usize;
     while at < ids.len() {
-        let n = (ids.len() - at).min(NMAX);
+        let n = (ids.len() - at).min(if all { LROWS } else { rows_cap() });
         let last = at + n == ids.len();
         let lrows = if all { n } else if want && last { 1 } else { 0 };
         let mut rows = vec![0f32; n * hidden];
@@ -1134,6 +1361,19 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         at += n;
     }
     true
+}
+
+/// A chunk's routed experts (`CMF_INKLING_MOE`): `gemm` (the default) groups
+/// the (row, pick) entries by expert and runs each expert as a tiled GEMM over
+/// its rows; `loop` an expert's rows a matvec at a time; `pick` the decode
+/// kernels, a (row, pick) at a time.
+fn moe_mode() -> u8 {
+    static M: OnceLock<u8> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CMF_INKLING_MOE").as_deref() {
+        Ok("pick") => 0,
+        Ok("loop") => 1,
+        _ => 2,
+    })
 }
 
 fn prof() -> bool {
@@ -1244,7 +1484,7 @@ fn base_ip(cfg: &Cfg) -> IP {
         dr: cfg.d_rel as u32,
         kc: 4,
         bstride: (MAXB * cfg.dim) as u32,
-        ostride: (NMAX * cfg.dim) as u32,
+        ostride: (rows_cap() * cfg.dim) as u32,
         topk: cfg.top_k as u32,
         eps: cfg.eps as f32,
         qclip: cfg.qk_clip,
@@ -1268,7 +1508,7 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
     let hidden = cfg.dim;
     let base = base_ip(cfg);
     let nu = n as u32;
-    let plane = (NMAX * hidden * 4) as u64;
+    let plane = (rows_cap() * hidden * 4) as u64;
     let copy = |rec: &mut Rec, src: &wgpu::Buffer, dst: &wgpu::Buffer, floats: usize| {
         let ip = IP { rows: floats as u32, ..base };
         rec.go("ink_copy", &ip, &[(2, src, 0), (7, dst, 0)], ((floats as u32).div_ceil(256), 1, 1));
@@ -1368,8 +1608,31 @@ fn record(c: &'static Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize) -> Vec<St
         rec.go("ink_router", &ip, &[(2, &l.router, 0), (3, &d.xm, 0), (7, &d.lg, 0)], ((l.e as u32).div_ceil(8), nu, 1));
         // the picks land behind the expert offsets in the layer's table
         rec.go("ink_select", &ip, &[(2, &d.lg, 0), (3, &l.bias, 0), (7, &d.wt, 0), (13, &l.table, (l.e * 3 * 4) as u64)], (nu, 1, 1));
-        rec.go("ink_moe_gu", &ip, &[(4, &d.xm, 0), (7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((l.inter as u32).div_ceil(8), cfg.top_k as u32, nu));
-        rec.go("ink_moe_down", &ip, &[(5, &d.act, 0), (6, &d.wt, 0), (7, &d.y, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((hidden as u32).div_ceil(8), nu, 1));
+        if n > 1 && moe_mode() == 2 {
+            // the entries by expert, each expert's rows a tiled GEMM against its weights
+            let ipg = IP { rows: nu, ..ip };
+            rec.go("ink_group", &ipg, &[(12, &l.table, (l.e * 3 * 4) as u64), (13, &d.grp, 0)], (1, 1, 1));
+            let tiles = nu.div_ceil(32);
+            for (which, x, y, out) in [(0u32, &d.xm, &d.gq, l.inter), (1, &d.xm, &d.uq, l.inter)] {
+                let ipm = IP { v: which, ..ipg };
+                rec.go("ink_moe_mm", &ipm, &[(4, x, 0), (7, y, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (out as u32).div_ceil(64), l.e as u32));
+            }
+            let nk = nu * cfg.top_k as u32;
+            rec.go("ink_moe_act", &ipg, &[(2, &d.gq, 0), (3, &d.uq, 0), (7, &d.act, 0)], ((l.inter as u32).div_ceil(256), nk, 1));
+            let ipm = IP { v: 2, ..ipg };
+            rec.go("ink_moe_mm", &ipm, &[(4, &d.act, 0), (7, &d.yp, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], (tiles, (hidden as u32).div_ceil(64), l.e as u32));
+            rec.go("ink_moe_mixq", &ipg, &[(2, &d.yp, 0), (3, &d.wt, 0), (7, &d.y, 0), (12, &d.grp, 0)], ((hidden as u32).div_ceil(256), nu, 1));
+        } else if n > 1 && moe_mode() == 1 {
+            // the entries by expert, an expert's rows against its weights once
+            let ipg = IP { rows: nu, ..ip };
+            rec.go("ink_group", &ipg, &[(12, &l.table, (l.e * 3 * 4) as u64), (13, &d.grp, 0)], (1, 1, 1));
+            rec.go("ink_moe_gu_g", &ipg, &[(4, &d.xm, 0), (7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], ((l.inter as u32).div_ceil(8), l.e as u32, 1));
+            rec.go("ink_moe_down_g", &ipg, &[(5, &d.act, 0), (7, &d.yp, 0), (11, &l.bank, 0), (12, &l.table, 0), (13, &d.grp, 0)], ((hidden as u32).div_ceil(8), l.e as u32, 1));
+            rec.go("ink_moe_mix", &ipg, &[(2, &d.yp, 0), (3, &d.wt, 0), (7, &d.y, 0)], ((hidden as u32).div_ceil(256), nu, 1));
+        } else {
+            rec.go("ink_moe_gu", &ip, &[(4, &d.xm, 0), (7, &d.act, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((l.inter as u32).div_ceil(8), cfg.top_k as u32, nu));
+            rec.go("ink_moe_down", &ip, &[(5, &d.act, 0), (6, &d.wt, 0), (7, &d.y, 0), (11, &l.bank, 0), (12, &l.table, 0)], ((hidden as u32).div_ceil(8), nu, 1));
+        }
         // 10. the output convolution onto the running sum
         rec.go("ink_post", &base, &[(2, &d.y, 0), (3, &l.tpm, 0), (4, &d.r, 0), (7, &s.rings[3], 0), (8, &d.dummy_w, 0), (9, hout, 0)], ((hidden as u32).div_ceil(256), 1, 1));
         cur = 1 - cur;

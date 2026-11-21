@@ -12747,6 +12747,17 @@ impl Pipeline {
             }
             return Ok(logits);
         }
+        // Inkling-2-Mini: the prompt as generation reads it (the card's
+        // prompt calls, else host chunks), so bench times that route
+        if let Some(b) = &mut self.inkling {
+            let mut logits = Vec::new();
+            let taken = crate::inkling::forward_prompt(&b.0, &b.1, &b.2, &mut b.3, ids, 0, self.pool.as_deref(), &mut logits);
+            for (i, &t) in ids.iter().enumerate().skip(taken) {
+                crate::inkling::forward_token(&b.0, &b.1, &b.2, &mut b.3, t, i, self.pool.as_deref(), &mut logits, i + 1 == ids.len());
+            }
+            self.graph_logits = Some(logits.clone());
+            return Ok(logits);
+        }
         // Same routing predicate generation uses. Two reasons it must be
         // the same one: (1) a GDN hybrid's recurrent state is GPU-
         // resident, and a batched CPU prefill would build it on the host

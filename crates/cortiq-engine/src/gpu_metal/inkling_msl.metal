@@ -592,3 +592,302 @@ kernel void ink_moe_down(device const uchar* q0 [[buffer(0)]], device const ucha
         for (uint ri = 0u; ri < nr; ++ri) y[(ulong)r * H + r0 + ri] = tot[ri];
     }
 }
+
+// ---- a prompt call's routed experts, grouped by expert ----
+// The decode kernels above read a pick's expert once a (row, pick); a prompt
+// call groups its (row, pick) entries by expert, and an expert's rows read
+// its weights once a call (the ladders once, the planes from the cache).
+
+// The entries grouped: grp[0..E] the first entry of each expert in expert
+// order, grp[E] the count, grp[E + 1 + q] the q-th entry (r·topk + k), and
+// grp[E + 1 + nk + entry] its place q. One threadgroup, 256 threads, an
+// expert a thread (E ≤ 1024 in turns).
+kernel void ink_group(device const uint* pick [[buffer(0)]], device uint* grp [[buffer(1)]],
+                      constant IP& p [[buffer(15)]], uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint cnt[1024];
+    const uint E = p.E, nk = p.n * p.topk;
+    for (uint e = tid; e < E; e += 256u) {
+        uint c = 0u;
+        for (uint i = 0u; i < nk; ++i) c += (pick[i] == e) ? 1u : 0u;
+        cnt[e] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint o = 0u;
+        for (uint e = 0u; e < E; ++e) {
+            const uint c = cnt[e];
+            cnt[e] = o;
+            o += c;
+        }
+        grp[E] = o;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < E; e += 256u) {
+        uint q = cnt[e];
+        grp[e] = q;
+        for (uint i = 0u; i < nk; ++i)
+            if (pick[i] == e) {
+                grp[E + 1u + nk + i] = q;
+                grp[E + 1u + q++] = i;
+            }
+    }
+}
+
+// An expert's gate and up rows over its entries, the softcapped SwiGLU into
+// act[entry][inter]. Grid (inter/16, E), 128 threads (4 simdgroups × 4 rows).
+kernel void ink_moe_gu_g(device const uchar* q0 [[buffer(0)]], device const uchar* q1 [[buffer(1)]],
+                         device const uchar* q2 [[buffer(2)]], device const uchar* q3 [[buffer(3)]],
+                         device const ulong* bases [[buffer(4)]], device const uint* grp [[buffer(5)]],
+                         device const float* x [[buffer(6)]], device float* act [[buffer(7)]],
+                         constant ulong& wstride [[buffer(8)]], constant IP& p [[buffer(15)]],
+                         uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]])
+{
+    const uint3 tg = tg_v;
+    threadgroup float lad[4][2][4 * 32];
+    const uint e = tg.y, inter = p.inter, gpr = p.H / 32u, E = p.E;
+    const uint i0 = grp[e], i1 = (e + 1u < E) ? grp[e + 1u] : grp[E];
+    if (i1 <= i0) return;
+    device const uchar* wg = at_abs(bases[e * 3u], q0, q1, q2, q3, wstride);
+    device const uchar* wu = at_abs(bases[e * 3u + 1u], q0, q1, q2, q3, wstride);
+    const uint r0 = (tg.x * 4u + sg) * 4u;
+    const bool active = r0 < inter;
+    const uint nr = active ? min(inter - r0, 4u) : 0u;
+    ladder(wg, inter, gpr, r0, nr, lad[sg][0], lane);
+    ladder(wu, inter, gpr, r0, nr, lad[sg][1], lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    for (uint i = i0; i < i1; ++i) {
+        const uint ent = grp[E + 1u + i];
+        device const float* xr = x + (ulong)(ent / p.topk) * p.H;
+        float ag[4], au[4];
+        q4tp_rows(wg, inter, gpr, r0, nr, xr, lad[sg][0], lane, ag);
+        q4tp_rows(wu, inter, gpr, r0, nr, xr, lad[sg][1], lane, au);
+        if (lane == 0u) {
+            device float* a = act + (ulong)ent * inter;
+            for (uint ri = 0u; ri < nr; ++ri) {
+                const float g = ag[ri], u = au[ri];
+                a[r0 + ri] = (p.cap * tanh(g / p.cap)) * sigm(g) * (p.ucap * tanh(u / p.ucap));
+            }
+        }
+    }
+}
+
+// An expert's down rows over its entries into yp[entry][H] (unweighted).
+// Grid (H/16, E), 128 threads.
+kernel void ink_moe_down_g(device const uchar* q0 [[buffer(0)]], device const uchar* q1 [[buffer(1)]],
+                           device const uchar* q2 [[buffer(2)]], device const uchar* q3 [[buffer(3)]],
+                           device const ulong* bases [[buffer(4)]], device const uint* grp [[buffer(5)]],
+                           device const float* act [[buffer(6)]], device float* yp [[buffer(7)]],
+                           constant ulong& wstride [[buffer(8)]], constant IP& p [[buffer(15)]],
+                           uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]])
+{
+    const uint3 tg = tg_v;
+    threadgroup float lad[4][4 * 32];
+    const uint e = tg.y, H = p.H, inter = p.inter, gpr = inter / 32u, E = p.E;
+    const uint i0 = grp[e], i1 = (e + 1u < E) ? grp[e + 1u] : grp[E];
+    if (i1 <= i0) return;
+    device const uchar* wd = at_abs(bases[e * 3u + 2u], q0, q1, q2, q3, wstride);
+    const uint r0 = (tg.x * 4u + sg) * 4u;
+    const bool active = r0 < H;
+    const uint nr = active ? min(H - r0, 4u) : 0u;
+    ladder(wd, H, gpr, r0, nr, lad[sg], lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    for (uint i = i0; i < i1; ++i) {
+        const uint ent = grp[E + 1u + i];
+        float acc[4];
+        q4tp_rows(wd, H, gpr, r0, nr, act + (ulong)ent * inter, lad[sg], lane, acc);
+        if (lane == 0u) {
+            device float* o = yp + (ulong)ent * H;
+            for (uint ri = 0u; ri < nr; ++ri) o[r0 + ri] = acc[ri];
+        }
+    }
+}
+
+// Every row's mixture of its picks' downs: y[r] = Σ_k wt[r][k]·yp[r·topk + k].
+// Grid (H/256, n), 256 threads.
+kernel void ink_moe_mix(device const float* yp [[buffer(0)]], device const float* wt [[buffer(1)]],
+                        device float* y [[buffer(2)]], constant IP& p [[buffer(15)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const uint i = tg.x * 256u + tid, r = tg.y, H = p.H;
+    if (i >= H) return;
+    float acc = 0.0f;
+    for (uint k = 0u; k < p.topk; ++k) acc += wt[r * p.topk + k] * yp[((ulong)r * p.topk + k) * H + i];
+    y[(ulong)r * H + i] = acc;
+}
+
+// ---- the grouped experts as simdgroup GEMMs (`q4tp_mul_mm` of the backend,
+// its inputs gathered by expert): Y[q][rows] = W_e · X[q] for the places q of
+// expert e. which 0 / 1: the gate / up of e over the gathered rows
+// x[entry / topk] (cols H); 2: the down of e over A[q] (cols inter). Grid
+// (rows of a call / 32, out rows / 64, E), 128 threads; a tile past the
+// expert's entries returns at once.
+kernel void ink_moe_mm(device const uchar* q0 [[buffer(0)]], device const uchar* q1 [[buffer(1)]],
+                       device const uchar* q2 [[buffer(2)]], device const uchar* q3 [[buffer(3)]],
+                       device const ulong* bases [[buffer(4)]], device const uint* grp [[buffer(5)]],
+                       device const float* xs [[buffer(6)]], device float* y [[buffer(7)]],
+                       constant ulong& wstride [[buffer(8)]], constant IP& p [[buffer(15)]],
+                       uint tiitg [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]],
+                       uint3 tg [[threadgroup_position_in_grid]])
+{
+    const uint which = p.V, e = tg.z, E = p.E, nk = p.n * p.topk;
+    const uint i0 = grp[e], i1 = (e + 1u < E) ? grp[e + 1u] : grp[E];
+    const uint nb = i1 - i0;
+    const uint r1 = tg.x * 32u;
+    if (r1 >= nb) return;
+    const uint cols = which == 2u ? p.inter : p.H;
+    const uint rows = which == 2u ? p.H : p.inter;
+    device const uchar* q = at_abs(bases[e * 3u + which], q0, q1, q2, q3, wstride);
+    uint gpr = cols >> 5u;
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    if (r0 >= rows) return;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+    // this thread's input row: a gathered row of x, or the place's row of A
+    const uint qp = i0 + r1 + lr1;
+    const ulong xrow = which == 2u ? (ulong)qp : (ulong)(grp[E + 1u + qp] / p.topk);
+    device const float* yrow = xs + xrow * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+    device const half* prow = (device const half*)(q + params_off + (ulong)(r0 + lr0) * 4ul);
+    float row_lo = (float)prow[0];
+    float row_st = (float)prow[1];
+    device const uchar* codes_row = q + codes_off + (ulong)(r0 + lr0) * (ulong)cstride;
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint g = k0 >> 5u;
+            uint bit = g * 5u;
+            uint shf = bit & 7u;
+            device const uchar* cp = codes_row + (bit >> 3u);
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = exp2(row_lo + (float)code * row_st);
+            device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 16ul + 8u * il0;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            uint2 nb2 = *(device const uint2*)nib;
+            for (uint i = 0; i < 8u; ++i) {
+                uint bb = ((i < 4u ? nb2.x : nb2.y) >> (8u * (i & 3u))) & 0xFFu;
+                wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
+                wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* y4 = (device const float4*)yrow;
+            float4 v0 = y4[0];
+            float4 v1 = y4[1];
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)v0.x; dst[1] = (half)v0.y;
+            dst[2] = (half)v0.z; dst[3] = (half)v0.w;
+            dst[4] = (half)v1.x; dst[5] = (half)v1.y;
+            dst[6] = (half)v1.z; dst[7] = (half)v1.w;
+        }
+        yrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    // the tile's outputs at the expert's places i0 + r1 + j
+    device float* yb = y + (ulong)(i0 + r1) * rows;
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = yb + (r0 + 32u * (sgitg & 1u)) + (ulong)(16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4), rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem) + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4), 64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = yb + r0 + (ulong)j * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) D[i] = Cr[i];
+            }
+        }
+    }
+}
+
+// The softcapped SwiGLU of the places' gate and up rows: A = f(G, U).
+// Grid (inter/256, nk), 256 threads.
+kernel void ink_moe_act(device const float* G [[buffer(0)]], device const float* U [[buffer(1)]],
+                        device float* A [[buffer(2)]], constant IP& p [[buffer(15)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const uint i = tg.x * 256u + tid, qp = tg.y, inter = p.inter;
+    if (i >= inter || qp >= p.n * p.topk) return;
+    const ulong at = (ulong)qp * inter + i;
+    const float g = G[at], u = U[at];
+    A[at] = (p.cap * tanh(g / p.cap)) * sigm(g) * (p.ucap * tanh(u / p.ucap));
+}
+
+// Every row's mixture of its picks' downs from the places: y[r] = Σ_k
+// wt[r][k]·Yp[place(r·topk + k)]. Grid (H/256, n), 256 threads.
+kernel void ink_moe_mixq(device const float* yp [[buffer(0)]], device const float* wt [[buffer(1)]],
+                         device float* y [[buffer(2)]], device const uint* grp [[buffer(3)]],
+                         constant IP& p [[buffer(15)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const uint i = tg.x * 256u + tid, r = tg.y, H = p.H, nk = p.n * p.topk;
+    if (i >= H) return;
+    float acc = 0.0f;
+    for (uint k = 0u; k < p.topk; ++k) {
+        const uint qp = grp[p.E + 1u + nk + r * p.topk + k];
+        acc += wt[r * p.topk + k] * yp[(ulong)qp * H + i];
+    }
+    y[(ulong)r * H + i] = acc;
+}
