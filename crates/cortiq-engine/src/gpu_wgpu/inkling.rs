@@ -1017,8 +1017,10 @@ const KS: u32 = 32u;
 var<workgroup> cm_a: array<f16, 64 * 32>;
 var<workgroup> cm_b: array<f16, 64 * 32>;
 var<workgroup> cm_c: array<f32, 64 * 64>;
-var<workgroup> cspan: vec2<u32>;
-var<workgroup> cxrow: array<u32, 64>;
+// the expert's span [0, 1] and its entries' source rows [64 ..): one array of
+// 512 bytes, so every workgroup array keeps a 256-byte-aligned size (the
+// matrix loads read from these arrays' bases)
+var<workgroup> cmeta: array<u32, 128>;
 
 fn cbyte(off: u32) -> u32 { return (cbank[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
 
@@ -1033,9 +1035,10 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
     if (tid == 0u) {
         var i1 = cuo[E];
         if (e + 1u < E) { i1 = cuo[e + 1u]; }
-        cspan = vec2<u32>(cuo[e], i1);
+        cmeta[0] = cuo[e];
+        cmeta[1] = i1;
     }
-    let span = workgroupUniformLoad(&cspan);
+    let span = vec2<u32>(workgroupUniformLoad(&cmeta[0]), workgroupUniformLoad(&cmeta[1]));
     let nb = span.y - span.x;
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
@@ -1052,7 +1055,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
             let q = span.x + m0 + tid;
             if (cp.which == 2u) { xr = q; } else { xr = cuo[E + 1u + q] / K; }
         }
-        cxrow[tid] = xr;
+        cmeta[64u + tid] = xr;
     }
     workgroupBarrier();
     var c0: coop_mat16x16<f32, C>;
@@ -1065,7 +1068,7 @@ fn ink_moe_coop(@builtin(workgroup_id) wid: vec3<u32>,
         for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let m = t / 8u;
             let k4 = (t % 8u) * 4u;
-            let xr = cxrow[m];
+            let xr = cmeta[64u + m];
             var v = vec4<f32>(0.0);
             if (xr != 0xFFFFFFFFu) {
                 let base = xr * cols + k0 + k4;
