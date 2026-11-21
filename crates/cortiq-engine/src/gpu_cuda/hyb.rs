@@ -224,6 +224,10 @@ pub(super) struct HFuncs {
     argmax: cs::CUfunction,
     silu_pair: cs::CUfunction,
     field_planes: cs::CUfunction,
+    route_proj: cs::CUfunction,
+    route_put: cs::CUfunction,
+    route_score: cs::CUfunction,
+    route_sel: cs::CUfunction,
     dash_route: cs::CUfunction,
     dash_close: cs::CUfunction,
     dash_attend: cs::CUfunction,
@@ -360,6 +364,10 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
         argmax: func(module, "hy_argmax")?,
         silu_pair: func(module, "hy_silu_pair_half")?,
         field_planes: func(module, "hy_field_planes")?,
+        route_proj: func(module, "hy_route_proj")?,
+        route_put: func(module, "hy_route_put")?,
+        route_score: func(module, "hy_route_score")?,
+        route_sel: func(module, "hy_route_sel")?,
         dash_route: func(module, "hy_dash_route")?,
         dash_close: func(module, "hy_dash_close")?,
         dash_attend: func(module, "hy_dash_attend")?,
@@ -1294,6 +1302,24 @@ fn dsa_mirror_bytes(layers: &[GraphLayer]) -> usize {
                 let topk = ix.group_topk * ix.ratio;
                 (topk + (topk / 8).max(256)) * nh * (rope + nope) * 4
             }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The mirrors of a stack's block-routed layers (Maxwell) at `rows`
+/// positions, with a mirror's slack: f16 keys and values of every KV group
+/// and the f16 index key, a row a position. Every position stays on the
+/// card (100 KB a token over 45 layers), so the plan's reserve holds the
+/// context's rows beside the slots: at the plain eighth of the card a 24 GB
+/// card filled with the experts sent a prompt of a few thousand tokens to
+/// the host.
+fn route_mirror_bytes(layers: &[GraphLayer], rows: usize) -> usize {
+    let rows = rows + (rows / 8).max(256);
+    layers
+        .iter()
+        .map(|l| match &l.attn {
+            GraphAttn::Full { geom: Some(g), .. } if g.route.is_some() => rows * (2 * g.nkv * g.hd + g.hd) * 2,
             _ => 0,
         })
         .sum()
@@ -2300,6 +2326,8 @@ struct AttnL {
     ms_out: MmaSet,
     /// Unlimited-OCR's DASH router (the attend over its read set).
     dash: Option<DashL>,
+    /// Maxwell's block router (the attention over its routed blocks).
+    route: Option<RouteL>,
     /// MLA's latent projections (`k` holds kv_a, `v` kv_b).
     mla: Option<MlaL>,
     /// Ripple's value residual: the blend, and V alone over the planes of
@@ -2317,6 +2345,65 @@ struct AttnL {
     /// A sliding layer's mirror holds only its window (Hy4-flash's gated
     /// layers; Aion's window layers): the stacks it was measured on.
     win_mirror: bool,
+}
+
+/// Words of a routed row's block set (`hy_route_sel`): 8192 blocks, a
+/// million positions of 128.
+const ROUTE_WORDS: usize = 256;
+
+/// A layer's block router (`GraphBlockRoute`, `hy_route_*`): the index
+/// query and key projections over the normed rows (f32), their norms and
+/// the blocks' geometry.
+struct RouteL {
+    wq: Arc<Buf>,
+    wk: Arc<Buf>,
+    qn: Arc<Buf>,
+    kn: Arc<Buf>,
+    block: usize,
+    prefix: usize,
+    local: usize,
+    remote: usize,
+}
+
+impl RouteL {
+    fn bshift(&self) -> i32 {
+        self.block.trailing_zeros() as i32
+    }
+}
+
+/// The small path's rows of a block-routed stack: the index projections
+/// `[NMAX][nkv·hd + hd]`, the index queries `[NMAX][nkv][hd]`, the
+/// candidates' scores `[NMAX][nkv][ROUTE_WORDS · 32]` and the routed blocks
+/// `[NMAX][nkv][ROUTE_WORDS]`.
+struct RouteBufs {
+    raw: Buf,
+    iq: Buf,
+    sc: Buf,
+    bm: Buf,
+}
+
+/// A block-routed layer's index keys of a sequence: `[cap][hd]` f16, grown
+/// by doubling.
+struct RouteState {
+    ik: Buf,
+    cap: usize,
+    next_pos: usize,
+    bytes: u64,
+}
+
+fn route_admits(r: &crate::gpu::GraphBlockRoute<'_>, hidden: usize, nkv: usize, hd: usize) -> bool {
+    r.block.is_power_of_two()
+        && r.block >= 32
+        && r.prefix > 0
+        && r.local > 0
+        && (1..=16).contains(&r.remote)
+        // `hy_route_score` keeps a query a KV group in a block's shared memory
+        && nkv <= 8
+        && hidden % 4 == 0
+        && r.q.len() == nkv * hd * hidden
+        && r.k.len() == hd * hidden
+        && r.q_norm.len() == hd
+        && r.k_norm.len() == hd
 }
 
 /// A DASH layer's router (`hy_dash_*`): the q / k index rows, their norms,
@@ -3974,6 +4061,8 @@ pub(super) struct HPlan {
     /// SenseNova-Loop's mHC streams (the stack's geometry and rows).
     mhc: Option<MhcPlan>,
     dash: Option<DashBufs>,
+    /// Maxwell's block route: the small path's index queries and block sets.
+    route: Option<RouteBufs>,
     /// Ripple's value residual: the call's embedding rows `[NMAX][hidden]`
     /// and V's input planes.
     vres: Option<(Buf, [Buf; 3])>,
@@ -4105,6 +4194,8 @@ pub(super) struct HState {
     /// DASH layers' open blocks (three, the router's keys) and block
     /// summaries, by sequence and layer.
     dash: HashMap<(u64, usize), (Buf, Buf)>,
+    /// Block-routed layers' index keys (Maxwell), by sequence and layer.
+    route: HashMap<(u64, usize), RouteState>,
     /// The MTP draft chain's table and norms (`mtp_chain`).
     chain: Option<ChainRes>,
     /// Plan builds' weight arenas (the matrices in them are views).
@@ -4380,7 +4471,8 @@ fn build(
                 // DeepSeek-V4's form wants the full mix, the identity one none
                 && (m.dsv4.is_none() || out == if ihc { 2 * ns } else { 2 * ns + ns * ns })
                 && (ihc || (l.attn_out_norm.is_none() && l.ffn_out_norm.is_none()))
-                && m.head.is_none_or(|hd| ihc && hd.w.len() == ns * ns * hidden && hd.base.len() == ns);
+                // the closing fold: Hy4-flash's identity form, or the DeepSeek-V4 form (Maxwell)
+                && m.head.is_none_or(|hd| m.dsv4.is_some() && hd.w.len() == ns * ns * hidden && hd.base.len() == ns);
             let geo = (ns, m.iters, m.pre_scale, m.dsv4.map_or(1e-6f32, |d| d.rms_eps).to_bits());
             if !ok || mhc_geo.is_some_and(|g| g != geo) {
                 return Err(format!("layer {li}: mHC streams of a shape the kernels do not take"));
@@ -4510,6 +4602,8 @@ fn build(
                         && g.window.is_none_or(|w| w > 0 && w < i32::MAX as usize)
                         && g.sink.is_none_or(|s| s.len() == nh)
                         && g.dash.as_ref().is_none_or(|d| dash_admits(d, hidden, g.hd, g.rd) && g.window.is_none() && g.sink.is_none())
+                        // Maxwell's block route: over an exact mirror of the whole history
+                        && g.route.as_ref().is_none_or(|r| route_admits(r, hidden, g.nkv, g.hd) && g.window.is_none() && g.sink.is_none() && g.dash.is_none() && g.vres.is_none() && g.dv == g.hd && g.rd == g.hd)
                         // Ripple's value residual: the call's embedding rows, a row a position
                         && g.vres.is_none_or(|(_, e0)| !e0.is_empty() && e0.len() % hidden == 0 && g.dash.is_none())
                         && g.invf.len() >= g.rd / 2
@@ -4916,6 +5010,59 @@ fn build(
                 .find_map(|n| model.tensor(n))
                 .map_or(0, |e| model.entry_bytes(e).len() * 11 / 10);
         }
+        // a block-routed stack keeps every position: the rows of the context
+        // cap (`CMF_MAX_SEQ`, 32 768) beside the slots. With no cap named and
+        // weights that fit the card, the weights come first: the rows that fit
+        // beside them (4096 at least, the dense range) instead of the cap's — a
+        // 24 GB card under Maxwell's 4-bit file streamed its experts for a
+        // context nobody asked for (44.6 tok/s against 52.7 with every expert
+        // resident).
+        if std::env::var("CMF_HYB_RESERVE_MB").is_err() {
+            let cap = crate::gpu::context_cap(model);
+            let full = route_mirror_bytes(layers, cap);
+            if full > 0 {
+                // The stack's mirrors are counted by themselves, so of the plain
+                // reserve (an eighth of the card, sized for stacks whose K/V
+                // live in it) stays what its calls take: a GiB and a prompt
+                // chunk's scores, 512 rows x heads x 4 B a position. At the
+                // plain eighth the MTP layer's 0.5 GB beside the 4-bit file
+                // left 4 300 positions on a 24 GB card and the experts streamed.
+                let cr = card_reserve();
+                let other = reserve.saturating_sub(cr);
+                let sb = 512 * nh * 4;
+                let base = |rows: usize| cr.min((1usize << 30) + rows * sb);
+                // weights of the model that go on the card after this plan (`gpu::plan_extra_reserve`)
+                let extra = crate::gpu::plan_extra(uid) as usize;
+                // bytes a row, the mirrors' slack of an eighth on top
+                let per = route_mirror_bytes(layers, 1 << 20) / ((1 << 20) + (1 << 17));
+                let mut rows = cap;
+                if std::env::var("CMF_MAX_SEQ").is_err() && free < other + base(cap) + extra + full + need {
+                    let fit = free.saturating_sub(other + extra + need + (1 << 30)) / (sb + per * 9 / 8).max(1);
+                    if fit >= 4096 {
+                        rows = fit.min(cap);
+                        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(
+                                "cuda hybrid: every weight on the card and room for {rows} positions beside them; \
+                                 CMF_MAX_SEQ names a longer context (the routed experts stream then)"
+                            );
+                        }
+                    }
+                }
+                crate::gpu::note_route_rows(rows);
+                reserve = other + base(rows) + extra + route_mirror_bytes(layers, rows);
+            } else {
+                // a later plan of a model whose routed stack kept it room (Maxwell's
+                // MTP layer, as a token plan or a prompt plan): its weights take that
+                // room and no more — what else is free is the stack's rows and
+                // prompt scratch, and the head such a plan would leave room for is on
+                // the card already
+                let extra = crate::gpu::plan_extra(uid) as usize;
+                if extra > 0 {
+                    reserve = free.saturating_sub(extra);
+                }
+            }
+        }
         let dev_cap = need.min(free.saturating_sub(reserve));
         let spill = dev_cap < need && std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() != Ok("0");
         let host_cap = need - dev_cap + (64 << 20);
@@ -4930,7 +5077,12 @@ fn build(
         // (Ornith q2tp-v2 within 46 GB: 38.7) stays pinned.
         // `CMF_HYB_STREAM_SPILL=<n>`: stream past 1/n of the experts (0: only
         // past the host's room).
-        let spill_n = std::env::var("CMF_HYB_STREAM_SPILL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+        // A block-routed stack (Maxwell) streams past 1/32: its reserve grows with
+        // the context, so a long cap leaves a spill of a few percent, and an L4
+        // read that over the bus at 23.2 tok/s after 24 576 positions against
+        // 31.0 streamed (at 1.6 %, after 12 288, the two were equal).
+        let routed_stack = route_mirror_bytes(layers, 1) > 0;
+        let spill_n = std::env::var("CMF_HYB_STREAM_SPILL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(if routed_stack { 32 } else { 8 });
         let big_spill = spill_n > 0 && need_exp > 0 && (need - dev_cap) > need_exp / spill_n;
         if spill && (host_cap > room / 4 * 3 || (big_spill && std::env::var("CMF_HYB_STREAM").as_deref() != Ok("0"))) {
             // past the card and the host's room both: the dense part on the
@@ -4988,6 +5140,7 @@ fn build(
                 ARENA_HOST.with(|x| x.set((h.dev, cap, 0)));
                 st.hyb.host_arenas.push(h);
             }
+            crate::gpu::note_plan_streamed(uid);
             stream_plan = Some(match &live_stream {
                 Some(cell) => (slot, reserve, cell.clone(), true),
                 None => (slot, reserve, Arc::new(std::sync::Mutex::new(None)), false),
@@ -5425,7 +5578,16 @@ fn build(
                     }
                     None => None,
                 };
-                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, mla: None, vres, vd, nh, ogate: false, win_mirror: model.header.arch.arch_name == "aion_instruct" })
+                let route = match geom.as_ref().and_then(|g| g.route.as_ref()) {
+                    Some(r) => {
+                        for w in [r.q, r.k, r.q_norm, r.k_norm] {
+                            note(w);
+                        }
+                        Some(RouteL { wq: st.f32_buf(r.q)?, wk: st.f32_buf(r.k)?, qn: st.f32_buf(r.q_norm)?, kn: st.f32_buf(r.k_norm)?, block: r.block, prefix: r.prefix, local: r.local, remote: r.remote })
+                    }
+                    None => None,
+                };
+                Mix::Attn(AttnL { q: qm, k: km, v: vm, o: om, qn, kn, gated: *output_gate, late: *late_qk_norm, v_norm: geom.as_ref().is_some_and(|g| g.v_norm), bias, hg, window, sink, local, half: lhalf, nkv, hd, fx: lfx, ms_in, ms_out, dash, route, mla: None, vres, vd, nh, ogate: false, win_mirror: model.header.arch.arch_name == "aion_instruct" })
             }
             GraphAttn::Kda { q: qw, k: kw, v: vw, conv_q, conv_k, conv_v, f_a, f_b, dt_bias, a_log, b: bw, g_a, g_b, o_norm, out: ow, nh: knh, dk, dv, kk, lower_bound, .. } => {
                 let (knh, dk, dv, kk) = (*knh, *dk, *dv, *kk);
@@ -5651,6 +5813,7 @@ fn build(
                     ms_out,
                     vres: None,
                     dash: None,
+                    route: None,
                     mla: Some(MlaL { kv_b: kvbm, kv_a_norm: st.f32_buf(kv_a_norm)?, ms_kvb, rope, nope, vd, lora, scale: *mscale, qa, dsa }),
                     vd: lhd,
                 })
@@ -5895,6 +6058,14 @@ fn build(
     // every attention layer's call record (MLA's included)
     let n_attn = layers.iter().filter(|l| matches!(l.attn, GraphAttn::Full { .. } | GraphAttn::Mla { .. })).count();
     let has_dash = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.dash.is_some()));
+    // a block-routed stack: its widest index rows and most KV groups
+    let route_geo = out
+        .iter()
+        .filter_map(|l| match &l.mix {
+            Mix::Attn(a) if a.route.is_some() => Some((a.nkv * a.hd, a.nkv)),
+            _ => None,
+        })
+        .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
     let has_vres = out.iter().any(|l| matches!(&l.mix, Mix::Attn(a) if a.vres.is_some()));
     Ok(HPlan {
         id: PLAN_ID.fetch_add(1, Ordering::Relaxed),
@@ -5923,6 +6094,15 @@ fn build(
             Some((f4(NMAX * hidden)?, [Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?, Buf::new(NMAX * pstride * 2)?]))
         } else {
             None
+        },
+        route: match route_geo {
+            Some((row, groups)) => Some(RouteBufs {
+                raw: Buf::new(NMAX * (row + row / groups) * 4)?,
+                iq: Buf::new(NMAX * row * 4)?,
+                sc: Buf::new(NMAX * groups * ROUTE_WORDS * 32 * 4)?,
+                bm: Buf::new(NMAX * groups * ROUTE_WORDS * 4)?,
+            }),
+            None => None,
         },
         dash: if has_dash {
             let cand = DASH_ROWS * DASH_BLOCKS;
@@ -6117,6 +6297,47 @@ fn sync_half(c: &Ctx, m: &mut KvMirror, cpu_k: &[Vec<f32>], cpu_v: &[Vec<f32>], 
 
 /// Bring every layer's state to `pos0` rows before anything is launched:
 /// the K/V mirrors (from the host's rows where the card lacks them) and the
+/// A block-routed layer's index keys for rows `pos0..pos0 + n`: made, reset
+/// at a new sequence, or grown (the rows so far copied). `hint`: the rows
+/// the prompt is about to bring.
+#[allow(clippy::too_many_arguments)]
+fn route_ensure(c: &Ctx, st: &mut State, key: (u64, usize), hd: usize, block: usize, pos0: usize, n: usize, hint: usize) -> Result<(), (bool, String)> {
+    let soft = |e: String| (false, e);
+    let need = pos0 + n;
+    if need > ROUTE_WORDS * 32 * block {
+        return Err(soft(format!("a block route past {} positions", ROUTE_WORDS * 32 * block)));
+    }
+    if let Some(e) = st.hyb.route.get_mut(&key) {
+        if pos0 == 0 {
+            e.next_pos = 0;
+        } else if e.next_pos != pos0 {
+            return Err((true, format!("index keys of layer {} are at row {}, the call at {pos0}", key.1, e.next_pos)));
+        }
+        if need <= e.cap {
+            return Ok(());
+        }
+    } else if pos0 > 0 {
+        return Err(soft("index keys missing for a nonzero position".into()));
+    }
+    let old = st.hyb.route.remove(&key);
+    let grown = old.as_ref().map_or(0, |o| o.cap + (o.cap / 2).max(1024));
+    let cap = need.max(grown).max(if hint >= need { hint + (hint / 8).max(256) } else { 0 }).max(4096).next_multiple_of(block);
+    let ik = Buf::new(cap * hd * 2).map_err(soft)?;
+    let bytes = (cap * hd * 2) as u64;
+    let at = if pos0 == 0 { 0 } else { old.as_ref().map_or(0, |o| o.next_pos) };
+    if let Some(o) = &old {
+        if at > 0 {
+            unsafe { cu::memcpy_dtod_async(ik.ptr, o.ik.ptr, at * hd * 2, c.stream).map_err(|e| soft(derr(e)))? };
+        }
+        // the old rows may still be read by queued work
+        c.sync().map_err(soft)?;
+        c.kv_bytes.fetch_sub(o.bytes, Ordering::Relaxed);
+    }
+    c.kv_bytes.fetch_add(bytes, Ordering::Relaxed);
+    st.hyb.route.insert(key, RouteState { ik, cap, next_pos: at, bytes });
+    Ok(())
+}
+
 /// GDN states (fresh at a sequence start, seeded from the host's state after
 /// a host prefill). Err(true): the card holds state this call cannot use.
 #[allow(clippy::too_many_arguments)]
@@ -6192,6 +6413,9 @@ fn admit(
                 // growing, so it is sized to that at once (the plan's reserve
                 // holds it, `dsa_mirror_bytes`)
                 let mut hint = hint;
+                if let Some(r) = &a.route {
+                    route_ensure(c, st, key, a.hd, r.block, pos0, n, hint)?;
+                }
                 if let Some((d, lora)) = a.mla.as_ref().and_then(|m| m.dsa.as_ref().map(|d| (d, m.lora))) {
                     dsa_ensure(c, st, key, d, lora, pos0, n)?;
                     if pos0 + n > d.topk {
@@ -6732,9 +6956,25 @@ fn book(
                     }
                     None => (0, 0),
                 };
+                // a block-routed layer: its index keys beside the mirror
+                let (rik, rblocks) = match &a.route {
+                    Some(rt) => {
+                        let r = st.hyb.route.get_mut(&key).ok_or("index keys missing")?;
+                        r.next_pos = pos0 + n;
+                        // 0 blocks while no row of the call picks any (the dense range): the
+                        // call then records neither the candidates' scores nor the choice,
+                        // and its attention reads no bit set (two launches a layer less)
+                        let picks = ((pos0 + n - 1) / rt.block + 1).saturating_sub(rt.local) > rt.prefix + rt.remote;
+                        (r.ik.ptr, if picks { (r.cap / rt.block).min(ROUTE_WORDS * 32) as u64 } else { 0 })
+                    }
+                    None => (0, 0),
+                };
                 let m = st.kv.get_mut(&key).ok_or("K/V mirror missing")?;
                 let n0 = m.stored - m.base;
-                layers.push([m.kptr(), m.vptr(), dopen, dbar, 0, 0, 0]);
+                if rik != 0 && (m.base != 0 || n0 != pos0) {
+                    return Err("a block route over a mirror that does not hold the whole history".into());
+                }
+                layers.push([m.kptr(), m.vptr(), dopen, dbar, rik, rblocks, 0]);
                 m.stored += n;
                 let keys = n0 + n;
                 let rb = attn_rb(keys);
@@ -7233,6 +7473,30 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                             tabl, nh_i, nkv_i, half_i, eps, qk_g, gated_i, slot0, n_i, cip, nul16, bqp, bkp, bvp
                         ),
                     )?;
+                    // Maxwell's block route: the rows' index query and key, then
+                    // the blocks each KV group of a row attends to
+                    let (bmp, bsh_i, mw_i) = match (&a.route, &plan.route) {
+                        (Some(rt), Some(rb)) => {
+                            let (blk_i, pre_i, loc_i, rem_i, mw_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32);
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, n as u32), 256, 0, kargs!(plan.xn.ptr, hid_i, rt.wq.ptr, rt.wk.ptr, rb.raw.ptr, nkv_i, n0_i, blk_i, pre_i, loc_i, rem_i, cip))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, n as u32), hd as u32, 0, kargs!(rb.raw.ptr, rt.qn.ptr, rt.kn.ptr, tabl, lb[4], rb.iq.ptr, n0_i, nkv_i, half_i, eps, cip, blk_i, pre_i, loc_i, rem_i))?;
+                            // the candidates a mirror of this size may hold: a fixed grid (a recorded
+                            // graph's), the blocks past a row's candidates leave at once
+                            let nblk = lb[5] as usize;
+                            let (nblk_i, cb0_i) = (nblk as i32, rt.prefix as i32);
+                            if nblk == 0 {
+                                // every row attends to its whole past (`book`): no bit set
+                                (0u64, 0i32, 0i32)
+                            } else {
+                                if nblk > rt.prefix {
+                                    c.launch(fx.route_score, ((nblk - rt.prefix) as u32, n as u32), 128, 0, kargs!(rb.iq.ptr, lb[4], rb.sc.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, cb0_i, cip))?;
+                                }
+                                c.launch(fx.route_sel, (nkv as u32, n as u32), 32, 0, kargs!(rb.sc.ptr, rb.bm.ptr, n0_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, cip))?;
+                                (rb.bm.ptr, rt.bshift(), mw_i)
+                            }
+                        }
+                        _ => (0u64, 0i32, 0i32),
+                    };
                     // a grid for any record: blocks past the call's keys leave
                     let nblk = ATTN_NBLK as u32;
                     // MLA's own softmax scale (1/√(rope + nope), YaRN-corrected)
@@ -7242,7 +7506,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, scale_l, rb_i, ncap_i, nbcap_i, n_i, cip),
+                        kargs!(plan.qg.ptr, kp, s_p, mx_p, n0_i, r0, nkv_i, scale_l, rb_i, ncap_i, nbcap_i, n_i, cip, bmp, bsh_i, mw_i),
                     )?;
                     if far != 0 {
                         // the far part: one more block of P and E, and its maximum
@@ -7272,7 +7536,7 @@ unsafe fn launch(c: &Ctx, plan: &HPlan, bk: &Book, n: usize, tape: bool, cib: u6
                         (nblk, nkv as u32, n as u32),
                         256,
                         0,
-                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip, sinkp),
+                        kargs!(s_p, mx_p, vp, p_p, e_p, n0_i, r0, nkv_i, rb_i, ncap_i, nbcap_i, n_i, cip, sinkp, bmp, bsh_i, mw_i),
                     )?;
                     c.launch(
                         fx.finish,
@@ -7477,7 +7741,8 @@ unsafe fn mhc_out(c: &Ctx, fx: &HFuncs, hidden: usize, m: &MhcL, mp: &MhcPlan, r
                 Some((w, base, sc)) => {
                     let eps = m.v4.map_or(1e-6, |v| v.2);
                     let (zero_f, one_i, ns_out) = (0f32, 1i32, mp.ns as u32);
-                    c.launch(fx.mhc_logits, (ns_out, n as u32), row_threads(n), 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, mp.rms_eps))?;
+                    let head_eps = mp.rms_eps.abs();
+                    c.launch(fx.mhc_logits, (ns_out, n as u32), row_threads(n), 0, kargs!(rows.r, w.ptr, rows.lg, ns_i, hid_i, head_eps))?;
                     c.launch(fx.mhc_route_ihc, (n as u32, 1), row_threads(n), 0, kargs!(rows.r, rows.lg, base.ptr, rows.h, rows.coef, ns_i, hid_i, *sc, zero_f, eps, zero_f, one_i))?;
                 }
                 None => c.launch(fx.mhc_leave, grid, 256, 0, kargs!(rows.r, rows.h, ns_i, hid_i))?,
@@ -7607,6 +7872,8 @@ unsafe fn moe_routed(c: &Ctx, fx: &HFuncs, plan: &HPlan, m: &MoeL, mb: &MoeBufs,
         let xs_i = xs as i32;
         let t = (tb - 1) as usize;
         // experts of one codec: that codec's launch
+        // (an L4 under Maxwell's 4-bit experts: 8 warps a tile for either launch, or two
+        // tiles a block for a decode row, moved nothing: 53.9–54.6 tok/s against 54.1)
         let pick = |kd: Option<usize>| match kd {
             Some(d) => fx.mmpk[nt_of(n)][t][1][d],
             None => fx.mmp[nt_of(n)][t][1],
@@ -7885,6 +8152,68 @@ fn dash_upload(plan: &HPlan, layers: &[GraphLayer], pos: usize, r0: usize, n: us
 /// `plan.tab` must be on the stream already.
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_small(
+    c: &Ctx,
+    st: &mut State,
+    plan: &HPlan,
+    kv_id: u64,
+    layer_base: usize,
+    pos0: usize,
+    n: usize,
+    tape: bool,
+    head: bool,
+    kcap: usize,
+    sealed: &[bool],
+    taps: &[(usize, u64)],
+) -> Res<usize> {
+    // the streams a call starts from (`gpu::graph_streams_in`): a stack whose
+    // first layer does not open its hyper-connection range
+    let given = STREAMS_IN.with(|s| s.borrow_mut().take());
+    if let (Some(s), Some(mp)) = (&given, &plan.mhc) {
+        if s.len() == n * mp.ns * plan.hidden {
+            unsafe { cu::memcpy_htod_async(mp.r.ptr, s, c.stream).map_err(derr)? };
+        } else {
+            return Err(format!("{} stream values for {n} rows of {} streams", s.len(), mp.ns));
+        }
+    }
+    let out = unsafe { run_small_inner(c, st, plan, kv_id, layer_base, pos0, n, tape, head, kcap, sealed, taps)? };
+    // the rows' closing streams for the caller that asked (`gpu::graph_streams_want`)
+    if STREAMS_WANT.with(|w| w.replace(false)) {
+        let mut v = Vec::new();
+        if let Some(mp) = &plan.mhc {
+            v = vec![0f32; n * mp.ns * plan.hidden];
+            c.sync()?;
+            unsafe { cu::memcpy_dtoh_sync(&mut v, mp.r.ptr).map_err(derr)? };
+        }
+        STREAMS_OUT.with(|s| *s.borrow_mut() = v);
+    }
+    Ok(out)
+}
+
+/// One chunk of a calibration capture: the layer, its routed FFN's normed
+/// input rows, the rows' expert ids and their route weights.
+pub(crate) type MoeTapRows = (usize, Vec<f32>, Vec<i32>, Vec<f32>);
+
+thread_local! {
+    /// A calibration capture of the routed FFNs of layers `[lo, hi)` on the
+    /// prompt path (`moe_grouped`), chunk after chunk.
+    pub(super) static MOE_TAP: std::cell::RefCell<Option<(usize, usize, Vec<MoeTapRows>)>> = const { std::cell::RefCell::new(None) };
+    pub(super) static STREAMS_IN: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static STREAMS_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static STREAMS_OUT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A block-routed layer's index keys back to `stored` rows with its mirror
+/// (`kv_set_stored`: a speculative row that was not taken).
+pub(super) fn route_set_stored(st: &mut State, kv_id: u64, layer: usize, stored: usize) {
+    if let Some(r) = st.hyb.route.get_mut(&(kv_id, layer)) {
+        if stored < r.next_pos {
+            r.next_pos = stored;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_small_inner(
     c: &Ctx,
     st: &mut State,
     plan: &HPlan,
@@ -8826,7 +9155,7 @@ pub(super) fn mem_report(c: &Ctx, st: &State, what: &str) {
 /// over its down, the mixture (and `dsh`, the shared expert's rows) added to
 /// `into` (h, or under mHC the zeroed product the merge takes).
 #[allow(clippy::too_many_arguments)]
-unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, into: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64) -> Res<()> {
+unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, into: u64, dsh: u64, b: usize, hidden: usize, eps: f32, gemma_i: i32, norm: u64, layer: usize) -> Res<()> {
     let (e, k, inter) = (m.e, m.k, m.inter);
     if e > 1024 || k > 64 || inter % 32 != 0 {
         return Err(format!("a grouped routed FFN of {e} experts, top {k}, width {inter}"));
@@ -8861,6 +9190,20 @@ unsafe fn moe_grouped(c: &Ctx, st: &mut State, fx: &HFuncs, m: &MoeL, bh: u64, i
             c.gemm(true, false, 1, b, hidden, 1.0, g.w.ptr, hidden, x32, hidden, 0.0, sg, 1, Gemm::F32)?;
         }
         c.launch(fx.moe_topk, (b.div_ceil(8) as u32, 1), 256, 0, kargs!(logits, bias, n_i, e_i, k_i, m.flags, m.route_scale, pidx, pwt))?;
+        // a calibration capture of this layer (`gpu::moe_tap_begin`): the chunk's
+        // normed rows, each row's experts and their weights
+        if MOE_TAP.with(|t| t.borrow().as_ref().is_some_and(|t| (t.0..t.1).contains(&layer))) {
+            let (mut x, mut pk, mut pw) = (vec![0f32; b * hidden], vec![0i32; nk], vec![0f32; nk]);
+            c.sync()?;
+            cu::memcpy_dtoh_sync(&mut x, x32).map_err(derr)?;
+            cu::memcpy_dtoh_sync(&mut pk, pidx).map_err(derr)?;
+            cu::memcpy_dtoh_sync(&mut pw, pwt).map_err(derr)?;
+            MOE_TAP.with(|t| {
+                if let Some(t) = t.borrow_mut().as_mut() {
+                    t.2.push((layer, x, pk, pw));
+                }
+            });
+        }
         // a streamed layer: the chunk's picked experts in the stream's slots
         // before the grouping reads their jobs (each built once a chunk)
         if m.stream.is_some() {
@@ -9617,6 +9960,39 @@ unsafe fn big(
                         )?;
                     }
                 } else {
+                // Maxwell's block route: the index rows over the rows normed in
+                // f32, the routed blocks of every row of the chunk
+                let (bmp, bsh_i, mw_i) = match &a.route {
+                    Some(rt) => {
+                        let ik = {
+                            let r = st.hyb.route.get_mut(&key).ok_or("index keys missing")?;
+                            r.next_pos = pos0 + b;
+                            r.ik.ptr
+                        };
+                        let bx32 = st.scr(c, "hb_x32", b * hidden * 4)?;
+                        let braw = st.scr(c, "hb_rraw", b * (nkv + 1) * hd * 4)?;
+                        let biq = st.scr(c, "hb_riq", b * nkv * hd * 4)?;
+                        let bbm = st.scr(c, "hb_rbm", b * nkv * ROUTE_WORDS * 4)?;
+                        let (blk_i, pre_i, loc_i, rem_i, mw_i, pos_i) = (rt.block as i32, rt.prefix as i32, rt.local as i32, rt.remote as i32, ROUTE_WORDS as i32, pos0 as i32);
+                        unsafe {
+                            c.launch(fx.rmsnorm, (b as u32, 1), 256, 0, kargs!(bh, pl.in_norm.ptr, bx32, hid_i, eps, gemma_i, zero_i, nul, nul, nul, zero_i))?;
+                            c.launch(fx.route_proj, (((nkv + 1) * hd).div_ceil(8) as u32, b as u32), 256, 0, kargs!(bx32, hid_i, rt.wq.ptr, rt.wk.ptr, braw, nkv_i, pos_i, blk_i, pre_i, loc_i, rem_i, nul))?;
+                            c.launch(fx.route_put, ((nkv + 1) as u32, b as u32), hd as u32, 0, kargs!(braw, rt.qn.ptr, rt.kn.ptr, tabl, ik, biq, pos_i, nkv_i, half_i, eps, nul, blk_i, pre_i, loc_i, rem_i))?;
+                            // the candidates of the chunk's last row bound the grid; none while
+                            // every block is routed
+                            let local0 = ((pos0 + b - 1) / rt.block + 1).saturating_sub(rt.local);
+                            let nblk = local0.max(rt.prefix + 1);
+                            let nblk_i = nblk as i32;
+                            let bsc = st.scr(c, "hb_rsc", b * nkv * nblk * 4)?;
+                            if local0 > rt.prefix + rt.remote {
+                                c.launch(fx.route_score, ((local0 - rt.prefix) as u32, b as u32), 128, 0, kargs!(biq, ik, bsc, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, nblk_i, pre_i, nul))?;
+                            }
+                            c.launch(fx.route_sel, (nkv as u32, b as u32), 32, 0, kargs!(bsc, bbm, pos_i, nkv_i, blk_i, pre_i, loc_i, rem_i, mw_i, nblk_i, nul))?;
+                        }
+                        (bbm, rt.bshift(), mw_i)
+                    }
+                    None => (0u64, 0i32, 0i32),
+                };
                 let lda = nkv * hd;
                 let grow = hpk * hd;
                 let mut b0 = 0usize;
@@ -9646,7 +10022,8 @@ unsafe fn big(
                     unsafe {
                         gemm_batched_h(c, true, l_rows, cols, hd, scale_l, kpw, lda, hd, qgh + (b0 * grow * 2) as u64, hd, b * grow, bs, l_rows, l_rows * cols, nkv)?;
                         let sinkp = a.sink.as_ref().map_or(0u64, |b| b.ptr);
-                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i, sinkp))?;
+                        let brow_i = b0 as i32;
+                        c.launch(fx.softmax_h, ((nkv * cols) as u32, 1), 256, 0, kargs!(bs, bp, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, win_i, sinkp, bmp, bsh_i, mw_i, brow_i, nkv_i))?;
                         gemm_batched_h(c, false, hd, cols, l_rows, 1.0, vpw, lda, hd, bp, l_rows, l_rows * cols, aog + (b0 * grow * 4) as u64, hd, b * grow, nkv)?;
                     }
                     b0 += bn;
@@ -9755,7 +10132,7 @@ unsafe fn big(
                 }
                 None => bh,
             };
-            unsafe { moe_grouped(c, st, fx, m, bh, into, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr)? };
+            unsafe { moe_grouped(c, st, fx, m, bh, into, dsh, b, hidden, eps, gemma_i, pl.post_norm.ptr, layer_base + li)? };
             if let Some((mm, mp, r)) = mh {
                 unsafe { mhc_out(c, fx, hidden, mm, mp, r, true, b, None)? };
             }
@@ -9967,6 +10344,12 @@ pub(super) fn gdn_state_read(c: &Ctx, st: &State, kv_id: u64, layer: usize) -> O
 /// Drop a sequence's recurrent states.
 pub(super) fn reset(c: &Ctx, st: &mut State, kv_id: u64) {
     st.hyb.rtabs.remove(&kv_id);
+    st.hyb.route.retain(|&(id, _), r| {
+        if id == kv_id {
+            c.kv_bytes.fetch_sub(r.bytes, Ordering::Relaxed);
+        }
+        id != kv_id
+    });
     st.hyb.dsa.retain(|&(id, _), d| {
         if id == kv_id {
             c.kv_bytes.fetch_sub(d.bytes, Ordering::Relaxed);

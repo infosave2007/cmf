@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.12] — 2026-11-21
+
+### Added
+- maxwell-model/Maxwell-V1-Flash (`maxwell_moe`, 35B mixture of experts, 3B active a token) converts natively
+  (`cortiq convert`, profiles `q8_2f` and `q4tp`) and runs on its own stack: four residual streams with
+  manifold-constrained hyper-connections (the DeepSeek-V4 form, a Sinkhorn mix of 20 rounds, a learned closing
+  fold), GQA with a per-head q/k RMSNorm, a dense FFN in three layers and 42 routed ones (sigmoid router, a
+  selection bias, 12 of 256 experts and an ungated shared expert), and the model's block-sparse attention: a query
+  attends to the first 1024 positions, to its block of 128 and the seven before it, and to 16 blocks each layer's
+  indexer picks for each KV group by the block's best token score; below 4096 positions that is every position.
+  On the CUDA hybrid the indexer and the block choice run on the card (`hy_route_*`, the routed blocks a bit set
+  the attention kernels read); the wgpu graphs take the stack while its attention is dense, and past 4096
+  positions the sequence continues on the host. The embedding is stored f16 and read a row a token from the
+  file's mapping (the frequent tokens' rows have a maximum of 15 RMS, which an 8-bit row loses 3.5 % of), the
+  file carries the release's sampling (temperature 0.6, top-p 0.95, top-k 20) and `cortiq serve` gives the model
+  one slot. The checkpoint's multi-token-prediction layer is converted too (`mtp.0.*`; `CMF_MAXWELL_BASE=<file>`
+  adds it to an existing file of the model, nothing else re-encoded): with `CMF_MAXWELL_SPEC=1` the CUDA decode
+  drafts with it — every stack call is the chosen token and the layer's draft of the next, a taken draft's row is
+  on the card already and only its head runs. The text is the same with and without it; on an L4 72–75 % of the
+  drafts are taken and decode goes from 65.5 to 67.2 tok/s (a pass reads the head 2.75 times), so it is off
+  by default. Perplexity of the q8_2f file against Transformers bf16 on the same windows:
+  WikiText-2 33.071 (32.804), Rust 7.048 (7.049), Python 7.160 (7.026), and over 2 × 6144 tokens of WikiText-2,
+  past the dense range, 20.675 (20.755); the q4tp profile (experts rounded without calibration, the rest
+  q8_2f): 32.380, 7.192, 7.554, 20.947. The published 4-bit file (every matrix but the head GPTQ-calibrated, see
+  below): 31.782, 7.215, 7.513, 20.610. On an NVIDIA L4 (24 GB, CUDA) it decodes at 66 tok/s with every weight on
+  the card (a 2048-token prompt in 2.0 s, a 30 000-token one in 68 s and 34 tok/s after it), the 8-bit file at
+  38 tok/s after a 2048-token prompt with its experts streamed; over Vulkan the 4-bit file at 40 tok/s.
+  The same card runs Qwen3.6-35B-A3B q4tp (40 layers, 8 experts a token, no hyper-connections) at 92 tok/s.
+- `cortiq quantize-moe` takes Maxwell: the routed FFNs' input rows and each token's experts are tapped on the
+  CUDA prompt path (`gpu::moe_tap_begin`; 65 536 tokens in 258 s on an L4, a capture-only run with
+  `CMF_GPU=cuda CMF_MOE_HOST=1`), the experts' full-precision weights come from the checkpoint
+  (`block_sparse_moe.experts.E.{w1,w3,w2}`), the encode runs on the device as for the other families; the
+  dense layers have no experts and are left alone. With a prior of 2048 pseudo-rows (`CMF_MOE_PRIOR=2048`; an
+  expert sees one token in twenty, some a few hundred rows) the 4-bit file's perplexity goes from 32.400 /
+  7.421 / 7.489 / 21.352 (WikiText-2 / Rust / Python / WikiText-2 over 6144-token windows, experts rounded) to
+  31.782 / 7.215 / 7.513 / 20.610; without the prior to 32.316 / 7.205 / 7.620 / 21.567.
+- wgpu: Maxwell's block-sparse attention on the card (`gpu_wgpu::broute`, the CUDA arm's `hy_route_*` and the
+  host's `maxwell::route_blocks` its specification): the indexer's projections, norms and rotation, an index-key
+  mirror a layer, the candidate blocks' scores, every (row, KV group)'s block list, and the attention over the
+  listed blocks in parts (64 positions for a token, 256 for a prompt chunk, a KV group's heads together), merged a
+  head a row. A routed layer keeps its own f16 rows (keys and values of the KV groups and the index key, 104 KB a
+  position over 45 layers, as on CUDA) and runs its whole attention in these kernels, the dense range included.
+  On an NVIDIA L4 over Vulkan the 4-bit file's WikiText-2 perplexity is 31.754 over 512-token windows and 20.662 over
+  6144-token windows (CUDA 31.782 / 20.610), a 24 GB card holds 17 088 positions beside the weights (past them the
+  sequence continues on the host, with a warning), and a 16 384-token prompt runs on the card. Its K/V mirrors grow
+  in steps of 1024 positions (`gpu::wgpu_kv_step`) and are sized for the whole prompt at its first chunk; a
+  prompt's chunk rows follow the card memory left (`maxwell::wgpu_chunk_rows`).
+- A model may ask the wgpu backend for card room beyond its default reserve before the device is set up
+  (`gpu::wgpu_reserve_at_least`) and name the weights its graphs need on the card whole
+  (`gpu::wgpu_keep_at_least`): the reserve does not take the weight budget below them while the default budget
+  holds them. Maxwell asks for the rows of its dense range and for its weights. On a 24 GB card the 4-bit file's
+  weights stay on the card (19.3 GB) and a sequence leaves it for the host, with one warning, past the positions
+  the rest of the card holds (the wgpu graphs keep a key and a value a head of every position, 1.4 MB a position
+  here: about 2 200), where an allocation used to fail (a panic in wgpu at a 3072-token prompt).
+
+### Changed
+- CUDA hybrid arm: a stack that keeps every position on the card (Maxwell's block route: 101 KB a token over 45
+  layers) holds its context's rows in the plan's reserve beside the expert slots: the rows of `CMF_MAX_SEQ`, or
+  with none named the rows that fit beside weights that stay on the card whole (4096 at least, 32 768 at most;
+  else the cap's rows with the experts streamed). Its mirrors counted by themselves, the rest of its reserve is
+  a GiB and a prompt chunk's scores (512 rows × heads × 4 B a position) instead of the plain eighth of the card;
+  a model may keep room for weights that go on the card after its stack (`gpu::plan_extra_reserve`: Maxwell's
+  MTP layer when drafting is on). At the plain eighth of the card a 24 GB card filled with
+  Maxwell's 4-bit experts sent a 6144-token window to the host; with the cap's 32 768 rows always reserved it
+  streamed the experts of a file that fits (44.6 tok/s against 55.5 resident). A block-routed stack streams a
+  spill past 1/32 of its experts instead of 1/8 (read over the bus after 24 576 positions: 23.2 tok/s, streamed
+  31.0).
+- CUDA hybrid arm, the block route: a row that attends to its whole past makes no index query, and a call of
+  such rows records neither the candidates' scores nor the choice (the attention reads no bit set); the
+  candidates' scores read a key once for every KV group instead of once a group. Perplexity and text unchanged
+  bit for bit.
+- CUDA hybrid arm: the DeepSeek-V4 form of the hyper-connections (GLM-5.3, Maxwell) computes its Sinkhorn mix a
+  thread a cell instead of on one thread: 52 → 15 µs a sub-layer on an L4, the operations in the same order.
+- `GraphMhcDsv4::rms_eps` below zero adds the epsilon to the RMS itself (`1 / (rms + eps)`, Maxwell's router) on
+  CUDA and wgpu; a learned closing fold is admitted over the DeepSeek-V4 form as over the identity one.
+
+### Fixed
+- wgpu on Apple silicon (`CMF_GPU=wgpu`): the weight budget is three quarters of Metal's recommended working set
+  instead of unlimited (a 20.5 GB Maxwell file was planned whole onto a 24 GB M4's shared memory), and a stack past
+  it streams its routed experts through slots fed from the file's mapping (no system-memory banks or RAM tier on
+  shared memory; a miss's pages are faulted in on the fill threads, 4.0 → 1.7 ms an expert). `gpu::vram_budget`
+  reports wgpu's budget while it runs on macOS. Maxwell's 4-bit file on a MacBook Air M4 over wgpu: WikiText-2
+  perplexity 28.057 against 28.066 on the CPU (two 512-token windows), 9 tok/s decode against 14–16 on the CPU,
+  which stays the default there. `CMF_STREAM_STATS=1` prints the stream's waits, gaps and submits.
+- wgpu on Apple silicon: `CMF_WGPU_NOCOPY=1` reads a MoE layer's routed experts in place from the file's mapping
+  (`gpu_wgpu::nocopy`: one no-copy Metal buffer a layer, the gate/up/down planes bound at their offsets, an expert the
+  file's stride on) — no stream and no wait for the picks. Off by default: Metal keeps a command buffer's buffers
+  resident whole, and on a 24 GB M4 the 17.7 GB of Maxwell's banks did not stay in memory beside the system (each
+  token re-read them from the disk).
+- wgpu batch graph: the expert-grouped MoE prompt kernels made their bucket, entry and slot-row buffers anew for
+  every layer of a call and kept them to its submit (Maxwell: 106 KB a row a layer, 2.2 GB for a 512-row chunk); one
+  set now serves every layer and call (`moeg_bufs`). Same perplexity.
+- Maxwell over wgpu: `cortiq ppl` scored a window's rows with a matmat of the head, which uploaded a second copy of
+  it beside the graph's and ran a 24 GB card out of memory at the second window; the rows go through the graph's own
+  head now.
+- wgpu token graph: a stack with its own runtime (Hy4-flash, GLM-5.3, Maxwell) takes no device prefix, and the
+  graph ran one anyway when the layers passed the weight budget: the caller read the boundary hidden as the
+  whole stack's and stale logits as the token's (a 6 GB budget under Maxwell's 4-bit file on an M4 wrote empty
+  tokens at "31 tok/s"). The graph declines now and the host runs the token.
+- CUDA: Dory's prompt arm launched `hy_softmax_h` with 9 of the kernel's 11 arguments (its window and sink
+  pointer read past the argument array); it passes all of them now.
+
 ## [0.9.11] — 2026-11-21
 
 ### Added

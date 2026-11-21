@@ -12,6 +12,7 @@ mod dialog;
 mod egemma2pack;
 mod nemotron_pack;
 mod hy4pack;
+mod maxwellpack;
 mod inklingpack;
 mod embed;
 mod flint;
@@ -1014,7 +1015,7 @@ enum Commands {
         /// GPTQ-rounded (each matrix's output over the calibration rows
         /// kept) instead of rounded to the nearest level; repeat to mix
         /// texts, each giving an equal share of --tokens. Needs a model
-        /// whose host stack folds its inputs (Inkling 2)
+        /// whose host stack folds its inputs (Maxwell, Inkling 2)
         #[arg(long)]
         calib: Vec<String>,
         /// q4tp-dense --calib: calibration tokens in all
@@ -8724,6 +8725,13 @@ async fn cmd_serve(
         // physical slots would let one slot compute with an expert the
         // other has just overwritten. One slot until the pool is shared.
         println!("    note: deepseek_v41 serves with 1 slot (one GPU expert bank per model)");
+        slots = 1;
+    }
+    if slots != 1 && model.arch().arch_name == "maxwell_moe" {
+        // A pipeline of this stack keeps its own tables (routers, hyper-connections,
+        // the block indexer: 0.7 GB), and the 8-bit file's experts already fill the
+        // host's memory beside one of them.
+        println!("    note: maxwell_moe serves with 1 slot");
         slots = 1;
     }
     if slots != 1 && model.arch().arch_name == "inkling2_loop" {

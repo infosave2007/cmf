@@ -1416,6 +1416,12 @@ pub fn vram_budget() -> u64 {
     {
         return crate::gpu_wgpu::device_vram_budget();
     }
+    // Apple silicon: wgpu's own budget while it runs (its share of the
+    // shared memory, `uma_budget`); the native Metal path keeps none
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::device_vram_budget();
+    }
     #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
     {
         if backend_available() { u64::MAX } else { 0 }
@@ -2139,6 +2145,222 @@ pub struct GraphAttnGeom<'a> {
     /// the call (one row for a token, a chunk's rows for a batch). V projects
     /// `lerp(embedding, normed, blend)`; Q and K project the normed row.
     pub vres: Option<(f32, &'a [f32])>,
+    /// Maxwell's block-sparse support. A backend without the arm must
+    /// decline a call that reaches past the dense range (`dense_range`).
+    pub route: Option<GraphBlockRoute<'a>>,
+}
+
+/// One layer's block router (Maxwell-V1-Flash, `maxwell::route_blocks`): a
+/// query attends to the first `prefix` blocks of `block` positions, to its
+/// own block and the `local - 1` before it, and to at most `remote` blocks
+/// in between, chosen for each KV group by the block's largest token score
+/// `q_g · k_t` (ties to the lower block). `q` `[nkv·hd, hidden]` and `k`
+/// `[hd, hidden]` project the layer's normed input; both are normed a head
+/// (`q_norm`, `k_norm`, the layer's epsilon) and rotated as the layer's
+/// queries and keys are. While the blocks in between do not outnumber
+/// `remote` every position is attended and the router does not run.
+#[derive(Clone, Copy)]
+pub struct GraphBlockRoute<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub block: usize,
+    pub prefix: usize,
+    pub local: usize,
+    pub remote: usize,
+}
+
+impl GraphBlockRoute<'_> {
+    /// Positions below which a query attends to its whole past.
+    pub fn dense_range(&self) -> usize {
+        (self.prefix + self.local + self.remote) * self.block
+    }
+}
+
+static WGPU_EXTRA_RESERVE: AtomicU64 = AtomicU64::new(0);
+
+/// A model's own room on a discrete card besides the wgpu backend's default
+/// reserve (the largest ask wins): bytes its sequences keep on the card that
+/// the default does not foresee. Read when the device is first set up, so a
+/// loader asks before the first GPU call; `CMF_GPU_VRAM_MB` overrides it.
+pub fn wgpu_reserve_at_least(bytes: u64) {
+    WGPU_EXTRA_RESERVE.fetch_max(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn wgpu_extra_reserve() -> u64 {
+    WGPU_EXTRA_RESERVE.load(Ordering::Relaxed)
+}
+
+static WGPU_WEIGHTS_FLOOR: AtomicU64 = AtomicU64::new(0);
+
+/// The weights a model's graphs need on the card whole (a stack with its own
+/// runtime takes no device prefix: short of them every token runs on the
+/// host). The extra reserve of [`wgpu_reserve_at_least`] does not take the
+/// weight budget below them while the default budget holds them: on a 24 GB
+/// card Maxwell's reserve left 17.3 GB for 19.3 GB of weights and the card
+/// sat idle. The largest ask wins; `CMF_GPU_VRAM_MB` overrides it.
+pub fn wgpu_keep_at_least(bytes: u64) {
+    WGPU_WEIGHTS_FLOOR.fetch_max(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn wgpu_weights_floor() -> u64 {
+    WGPU_WEIGHTS_FLOOR.load(Ordering::Relaxed)
+}
+
+static WGPU_CARD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn wgpu_note_card_total(bytes: u64) {
+    WGPU_CARD_TOTAL.store(bytes, Ordering::Relaxed);
+}
+
+/// A discrete card's device-local memory as the wgpu backend read it at
+/// setup; 0 on unified memory, on a backend that does not say, and before
+/// the device is up.
+pub fn wgpu_card_total() -> u64 {
+    WGPU_CARD_TOTAL.load(Ordering::Relaxed)
+}
+
+/// wgpu: card bytes a position takes on the block route (`gpu_wgpu::broute`) over `layers` layers.
+pub fn wgpu_route_position_bytes(layers: usize, nkv: usize, hd: usize) -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::broute::position_bytes(layers, nkv, hd)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        (layers * (2 * nkv + 1) * hd * 2) as u64
+    }
+}
+
+/// wgpu: grow every K/V mirror in steps of `rows` instead of to the next power of two (a model
+/// whose positions cost much card memory; 0 restores the power of two).
+pub fn wgpu_kv_step(rows: usize) {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::set_kv_step(rows);
+    #[cfg(not(feature = "gpu"))]
+    let _ = rows;
+}
+
+static PLAN_EXTRA: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Card room a model keeps beside its stack for weights that go on the card
+/// later (Maxwell's MTP layer, a plan of its own built at the first draft):
+/// the CUDA plan of the model's block-routed stack counts it in its reserve,
+/// so the rows it fits beside the weights leave that room, and the model's
+/// later plans take their weights from it. `model`: `CmfModel::uid`.
+pub fn plan_extra_reserve(model: u64, bytes: u64) {
+    let mut g = PLAN_EXTRA.lock().unwrap();
+    match g.iter_mut().find(|e| e.0 == model) {
+        Some(e) => e.1 = e.1.max(bytes),
+        None => g.push((model, bytes)),
+    }
+}
+
+pub(crate) fn plan_extra(model: u64) -> u64 {
+    PLAN_EXTRA.lock().unwrap().iter().find(|e| e.0 == model).map_or(0, |e| e.1)
+}
+
+static PLAN_STREAMED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_plan_streamed(model: u64) {
+    let mut g = PLAN_STREAMED.lock().unwrap();
+    if !g.contains(&model) {
+        g.push(model);
+    }
+}
+
+/// Whether a CUDA plan of this model streams its routed experts through card
+/// slots (they did not fit beside the context's rows): every call then waits
+/// for the host between its layers.
+pub fn plan_streamed(model: u64) -> bool {
+    PLAN_STREAMED.lock().unwrap().contains(&model)
+}
+
+/// CUDA hybrid arm: the hyper-connection streams the next small-path call of
+/// this thread starts from, `[row][stream][hidden]` — a stack whose first
+/// layer does not open its range (Maxwell's MTP layer takes the main stack's
+/// streams). Dropped by the call that reads them, or by the next one.
+pub fn graph_streams_in(streams: Vec<f32>) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::streams_in(streams);
+    #[cfg(not(feature = "cuda"))]
+    let _ = streams;
+}
+
+/// CUDA hybrid arm: ask the next small-path call of this thread for its rows'
+/// closing streams (before the fold), then take them, `[row][stream][hidden]`;
+/// empty when the call kept none.
+pub fn graph_streams_want() {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::streams_want();
+}
+
+/// See [`graph_streams_want`].
+pub fn graph_streams_take() -> Vec<f32> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::streams_take()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
+/// CUDA hybrid arm, a GPTQ calibration of routed experts: from now on the
+/// prompt path keeps, for the routed FFNs of layers `[lo, hi)`, each chunk's
+/// normed input rows with the rows' expert ids and route weights
+/// ([`moe_tap_end`] takes them: `(layer, rows [b][hidden], ids [b][k],
+/// weights [b][k])` in call order). This thread's calls only.
+pub fn moe_tap_begin(lo: usize, hi: usize) {
+    #[cfg(feature = "cuda")]
+    crate::gpu_cuda::moe_tap_begin(lo, hi);
+    #[cfg(not(feature = "cuda"))]
+    let _ = (lo, hi);
+}
+
+/// See [`moe_tap_begin`].
+pub fn moe_tap_end() -> Vec<(usize, Vec<f32>, Vec<i32>, Vec<f32>)> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu_cuda::moe_tap_end()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
+static ROUTE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// The positions the CUDA plan of a block-routed stack keeps room for (the
+/// context cap, or with no `CMF_MAX_SEQ` the rows that fit beside weights
+/// that stay on the card whole).
+pub(crate) fn note_route_rows(rows: usize) {
+    ROUTE_ROWS.store(rows as u64, Ordering::Relaxed);
+}
+
+/// See [`note_route_rows`]; 0 before a plan is built.
+pub fn route_rows() -> usize {
+    ROUTE_ROWS.load(Ordering::Relaxed) as usize
+}
+
+/// Positions a sequence may reach: `CMF_MAX_SEQ`, else 32 768, within the
+/// model's own limit (the loader's cap, for the code that sizes device
+/// memory by it).
+pub fn context_cap(model: &CmfModel) -> usize {
+    let cap = std::env::var("CMF_MAX_SEQ").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32_768);
+    model.header.arch.max_position_embeddings.min(cap).max(1)
+}
+
+/// Whether the active backend's graphs carry the block router
+/// (`GraphBlockRoute`) past the dense range: the CUDA hybrid does
+/// (`CMF_BLOCK_ROUTE=0`: the host takes such a sequence over).
+pub fn block_route_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // the CUDA hybrid's `hy_route_*` kernels, the wgpu graphs' `broute`
+    *ON.get_or_init(|| std::env::var("CMF_BLOCK_ROUTE").as_deref() != Ok("0")) && (cuda_active() || wgpu_active())
 }
 
 /// Rows of an Unlimited-OCR prompt chunk on the batch graph: every remote block
@@ -2237,7 +2459,8 @@ pub struct GraphMhc<'a> {
 pub fn hy_layers(layers: &[GraphLayer]) -> bool {
     layers.iter().any(|l| {
         l.engram.is_some()
-            || l.mhc.as_ref().is_some_and(|m| m.head.is_some() || m.dsv4.is_some_and(|d| d.ihc.is_some()))
+            // (a learned closing fold over the DeepSeek-V4 form is Maxwell's, not Hy4-flash's)
+            || l.mhc.as_ref().is_some_and(|m| m.dsv4.is_some_and(|d| d.ihc.is_some()))
             || matches!(&l.attn, GraphAttn::Mla { hy: Some(_), .. })
             || matches!(&l.ffn, GraphFfn::Moe { latent: Some(_), .. } | GraphFfn::Moe { shared_limit: Some(_), .. })
     })

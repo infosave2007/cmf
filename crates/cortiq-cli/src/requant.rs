@@ -331,6 +331,10 @@ pub fn cmd_requant(
 /// stack folds no inputs (no captured Hessian) is refused: its matrices
 /// would only be rounded, which the plain `q4tp-dense` already does.
 ///
+/// Measured on Maxwell-V1-Flash (attention, shared experts and dense FFNs of
+/// its 4-bit file, 45 layers): rounding takes WikiText-2 perplexity from
+/// 32.38 to 36.5 (head included) for 55 → 69 tok/s on an L4.
+///
 /// Inkling 2's loop (`inkling2_loop`) reads a local layer's q, k and v from
 /// one row in the first pass and from three after it: its projections keep a
 /// Hessian each (`gptq_capture::set_alias(false)`), every pass folded in.
@@ -389,6 +393,7 @@ pub fn cmd_requant_dense_gptq(model_path: &str, output: &str, calib: &[String], 
             bail!("calibration window {i}: {e}");
         }
     }
+    cortiq_engine::maxwell::capture_flush();
     let cap = cortiq_engine::gptq_capture::end_shared();
     drop(pipe);
     eprintln!("captured {} Hessians ({} aliases, {} invalid) in {:.0} s", cap.hess.len(), cap.alias.len(), cap.broken.len(), t0.elapsed().as_secs_f64());

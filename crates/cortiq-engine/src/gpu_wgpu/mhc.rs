@@ -254,7 +254,11 @@ fn mhc4_logits(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) w
         }
         workgroupBarrier();
     }
-    if (t == 0u) { lg[row * 24u + k] = red2[256u] / sqrt(red2[0] / f32(n) + p.rms_eps); }
+    // a negative epsilon is added to the RMS itself (Maxwell: 1 / (rms + eps))
+    if (t == 0u) {
+        let ms = red2[0] / f32(n);
+        lg[row * 24u + k] = red2[256u] / select(sqrt(ms + p.rms_eps), sqrt(ms) - p.rms_eps, p.rms_eps < 0.0);
+    }
 }
 
 // a workgroup a row: pre / post / the Sinkhorn mix (thread 0), the branch

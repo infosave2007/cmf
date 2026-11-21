@@ -287,6 +287,16 @@ pub struct Pipeline {
             crate::hy4::State,
         )>,
     >,
+    /// Maxwell-V1-Flash owns four mHC streams, its block router and a
+    /// sigmoid-routed MoE.
+    pub maxwell: Option<
+        Box<(
+            crate::maxwell::Globals,
+            Vec<crate::maxwell::Layer>,
+            crate::maxwell::Cfg,
+            crate::maxwell::State,
+        )>,
+    >,
     /// Inkling-2-Mini owns its looped stack: block attention residuals,
     /// short convolutions, per-pass caches.
     pub inkling: Option<
@@ -2413,6 +2423,7 @@ impl Pipeline {
             && self.qwen4_exp.is_none()
             && self.glm5_next.is_none()
             && self.hy4.is_none()
+            && self.maxwell.is_none()
             && self.inkling.is_none()
             && self.weights.layers.iter().all(|lw| {
                 // LFM2/LFM3's short-conv mixer is two projection GEMMs and
@@ -4887,6 +4898,7 @@ impl Pipeline {
             qwen4_exp: None,
             glm5_next: None,
             hy4: None,
+            maxwell: None,
             inkling: None,
             clover: None,
             clover_stats: clover::CloverStats::default(),
@@ -5275,6 +5287,7 @@ impl Pipeline {
             && self.qwen4_exp.is_none()
             && self.glm5_next.is_none()
             && self.hy4.is_none()
+            && self.maxwell.is_none()
             && self.inkling.is_none()
             && std::env::var("CMF_KV_REUSE").as_deref() != Ok("0")
     }
@@ -7380,6 +7393,39 @@ impl Pipeline {
             let mut lg = Vec::new();
             if let Some(b) = &mut self.hy4 {
                 crate::hy4::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, pos, self.pool.as_deref(), &mut lg, want_logits);
+            }
+            if want_logits {
+                self.graph_logits = Some(lg);
+            }
+            pos += 1;
+            hidden.fill(0.0);
+        }
+        // Maxwell-V1-Flash: its own mHC stack; the prompt on the card's
+        // batch graph when it takes it, else a token at a time.
+        if mtp.is_none() && pos + 1 < input_ids.len() {
+            let mut lg = Vec::new();
+            let taken = match &mut self.maxwell {
+                Some(b) => crate::maxwell::forward_prompt(&b.0, &b.1, &b.2, &mut b.3, &input_ids[pos..], pos, self.pool.as_deref(), &mut lg),
+                None => 0,
+            };
+            if taken > 0 {
+                pos += taken;
+                if pos == input_ids.len() {
+                    self.graph_logits = Some(lg);
+                }
+                hidden.fill(0.0);
+            }
+        }
+        while self.maxwell.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let token_id = input_ids[pos];
+            let want_logits = pos + 1 == input_ids.len();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.maxwell {
+                crate::maxwell::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, pos, self.pool.as_deref(), &mut lg, want_logits);
             }
             if want_logits {
                 self.graph_logits = Some(lg);
@@ -12947,6 +12993,24 @@ impl Pipeline {
         res
     }
 
+    /// GPTQ calibration of Maxwell's routed experts (`cortiq quantize-moe`):
+    /// the routed FFNs' input rows and expert ids of layers `lo..hi` for
+    /// `ids` (a fresh sequence), see [`crate::maxwell::MoeCapture`].
+    pub fn maxwell_moe_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<crate::maxwell::MoeCapture, String> {
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+        self.maxwell.as_ref().ok_or_else(|| "not a Maxwell model".to_string())?;
+        self.clear_sequence_state();
+        let res = {
+            let pool = self.pool.clone();
+            let b = self.maxwell.as_mut().expect("maxwell checked above");
+            crate::maxwell::capture_window(&b.0, &b.1, &b.2, &mut b.3, ids, lo, hi, pool.as_deref())
+        };
+        self.clear_sequence_state();
+        res
+    }
+
     /// Teacher-forced perplexity over a token sequence (phase-C gate:
     /// honest quant comparisons instead of prompt vibes).
     ///
@@ -14330,6 +14394,13 @@ impl Pipeline {
         if task_mask.is_none()
             && let Some(b) = &mut self.hy4
             && let Some(r) = crate::hy4::nll(&b.0, &b.1, &b.2, &mut b.3, ids, start, self.pool.as_deref())
+        {
+            return Ok(r);
+        }
+        // Maxwell-V1-Flash: the same, through its own stack
+        if task_mask.is_none()
+            && let Some(b) = &mut self.maxwell
+            && let Some(r) = crate::maxwell::nll(&b.0, &b.1, &b.2, &mut b.3, ids, start, self.pool.as_deref())
         {
             return Ok(r);
         }
@@ -16020,7 +16091,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() || self.glm5_next.is_some() || self.hy4.is_some() || self.inkling.is_some() {
+        if self.dsv4.is_some() || self.dsv41.is_some() || self.dory.is_some() || self.qwen4_exp.is_some() || self.glm5_next.is_some() || self.hy4.is_some() || self.maxwell.is_some() || self.inkling.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -16981,6 +17052,7 @@ impl Pipeline {
             v_norm: self.attn_v_norm,
             dash,
             vres: None,
+            route: None,
         })
     }
 
@@ -17455,6 +17527,9 @@ impl Pipeline {
         }
         if self.hy4.is_some() {
             return Err("network split: the Hy4-flash iHC/Engram stack is not splittable yet".into());
+        }
+        if self.maxwell.is_some() {
+            return Err("network split: the Maxwell mHC stack is not splittable yet".into());
         }
         if self.inkling.is_some() {
             return Err("network split: the Inkling looped stack is not splittable yet".into());
@@ -20282,6 +20357,7 @@ impl Pipeline {
             || self.qwen4_exp.is_some()
             || self.glm5_next.is_some()
             || self.hy4.is_some()
+            || self.maxwell.is_some()
             || self.inkling.is_some()
             || self.per_token_stack()
         {
@@ -21822,6 +21898,7 @@ impl Pipeline {
             || self.qwen4_exp.is_some()
             || self.glm5_next.is_some()
             || self.hy4.is_some()
+            || self.maxwell.is_some()
             || self.inkling.is_some()
             // Dynamic routing swaps FFN weights mid-sequence under the
             // packed graph; a blend has no single overlay. A STATIC skill
@@ -22699,8 +22776,8 @@ impl Pipeline {
                     && self.qwen4_exp.is_none()
                     && self.glm5_next.is_none()
                     && self.hy4.is_none()
+                    && self.maxwell.is_none()
                     && self.inkling.is_none()
-            && self.inkling.is_none()
                     && !self.per_token_stack())
         );
         // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
@@ -22726,6 +22803,14 @@ impl Pipeline {
             let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
             let mut logits = Vec::new();
             crate::hy4::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, position, self.pool.as_deref(), &mut logits, true);
+            self.graph_logits = Some(logits);
+            return vec![0.0; self.hidden_size];
+        }
+        if let Some(b) = &mut self.maxwell {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let mut logits = Vec::new();
+            crate::maxwell::forward_token(&b.0, &b.1, &b.2, &mut b.3, token_id, position, self.pool.as_deref(), &mut logits, true);
             self.graph_logits = Some(logits);
             return vec![0.0; self.hidden_size];
         }

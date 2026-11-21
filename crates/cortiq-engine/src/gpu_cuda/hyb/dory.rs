@@ -1079,7 +1079,9 @@ fn run_big(c: &Ctx, d: &mut Dev, m: &Dory, ids: &[u32], pos: usize, loops: usize
                         let isum = bg.isum.ptr + (b0 * hpk * 4) as u64;
                         unsafe {
                             gemm_batched_h(c, true, l_rows, cols, hd, cf.attn_scale, slot.k.ptr, lda, hd, bg.qgh.ptr + (b0 * grow * 2) as u64, hd, b * grow, bg.bs.ptr, l_rows, l_rows * cols, nk)?;
-                            c.launch(hfx.softmax_h, ((nk * cols) as u32, 1), 256, 0, kargs!(bg.bs.ptr, bg.bp.ptr, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride))?;
+                            // no window, no sinks, no block route: the kernel's every argument, the unused ones zero
+                            let (no_i, no_p, nk_i) = (0i32, 0u64, nk as i32);
+                            c.launch(hfx.softmax_h, ((nk * cols) as u32, 1), 256, 0, kargs!(bg.bs.ptr, bg.bp.ptr, isum, l_i, p0_i, cb_i, hpk_i, cols_i, istride, no_i, no_p, no_p, no_i, no_i, no_i, nk_i))?;
                             gemm_batched_h(c, false, hd, cols, l_rows, 1.0, slot.v.ptr, lda, hd, bg.bp.ptr, l_rows, l_rows * cols, bg.aog.ptr + (b0 * grow * 4) as u64, hd, b * grow, nk)?;
                         }
                         b0 += bn;
