@@ -14,13 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as kernels) and the trainer. Files, snapshots and training states are those of the wgpu path; a state saved by
   one backend resumes on the other. On one RTX PRO 6000 Blackwell against wgpu on the same card: Qwen3.5-0.8B at
   1.0 bpw converts in 64 s (492 s), a layer's calibration 0.45 s (2.6 s), its encode 1.5–1.7 s (17 s); a training
-  step of 8 × 512 tokens with signs 0.31 s (0.69 s), 1 M tokens in 102 s (227 s), held-out KL 1.4462 (1.4490).
-  Qwen3.8-27B at 0.55 bpw: 3.4 s a step (5.48 s), the teacher pass 4.9k tok/s (2.7k). The trainer keeps h and g
+  step of 8 × 512 tokens with signs 0.28 s (0.69 s), 1 M tokens in 97 s (227 s), held-out KL 1.4440 (1.4490).
+  Qwen3.8-27B at 0.55 bpw: 2.97 s a step (5.48 s), 1 M tokens with their teacher pass in 16.2 min (29.5), the
+  teacher pass 5.0k tok/s (2.7k), a layer's encode 28–30 s (103–107 s). The trainer keeps h and g
   in the f16 sign planes, so a layer input is staged once and the scales' gradients are row sums of the sign
-  gradients; the GDN recurrence runs in 512-thread blocks over an f16 history of every second state; the rank
-  activations of a step's forward serve its recompute (`CMF_NVG_ACACHE_GB`). The encoder's job threads queue on
-  streams of their own, and a tensor's two candidates are built on two threads. A conversion repeated on CUDA
-  gives the same bytes. `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
+  gradients; the GDN recurrence runs forward in 512-thread blocks and backward as batched products over chunks of
+  64 positions (a layer's reverse sweep 7.0 ms where a per-position kernel takes 12.7); the rank activations of a
+  step's forward serve its recompute (`CMF_NVG_ACACHE_GB`). The encoder's job threads queue on streams of their
+  own, and a tensor's two candidates are built on two threads. A conversion repeated on CUDA gives the same bytes.
+  `docs/BLR_NVG.md` §8, `docs/CUDA.md`.
 - `convert --blr-channel-scale ALPHA` (device encoder): SFq's input channel scale for NVG, off by default. On the
   0.8B at 1.0 bpw it makes the untrained file better at every seed — the KL to the teacher 3–4 % lower, WikiText-2
   perplexity about 15 % (730 → 608 at 1.0) — and the reference training erases the difference. What does survive
@@ -31,9 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - NVG device encoder, both backends: the flips of the input-side column search run on the host thread that encodes
   the tensor, the feedback between column blocks stays a device GEMM. The search is sequential twice over, so a
-  device runs it as one block on one multiprocessor — about a microsecond a flip at any rank, 43 s of the 56 a
-  Qwen3.8-27B `down_proj` took — while a host core passes over the r candidates in vector registers. Qwen3.5-0.8B
-  on CUDA: `down_proj`'s search 1.57 → 0.48 s; on wgpu a layer's encode 17.8 → 14.2 s. The same search with its
+  device runs it as one block on one multiprocessor — about a microsecond a flip at any rank, 38 s of the 51 a
+  Qwen3.8-27B `down_proj` took on CUDA — while a host core passes over the r candidates in vector registers.
+  Qwen3.8-27B, a layer's encode: on CUDA 90–96 → 38–40 s with one tensor in flight and 28–30 s with three (with
+  the encoder's own streams and candidate threads), on wgpu 149 → 103–107 s. Qwen3.5-0.8B on CUDA: `down_proj`'s
+  search 1.57 → 0.48 s; on wgpu a layer's encode 17.8 → 14.2 s. The same search with its
   sums in another order: files differ in the fourth digit of a tensor's error, and after the reference training
   four conversions end at KL 1.4622 and 1.4546 (device kernel), 1.4669 and 1.4595 (host flips).
   `CMF_NVG_GV=device` keeps the kernel (x86-64 hosts without AVX2 + FMA use it too). `docs/BLR_NVG.md` §4.1.

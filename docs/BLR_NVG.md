@@ -186,8 +186,8 @@ Stage for stage the CPU encoder; what changes is where and how each stage runs.
   block of threads on one multiprocessor, about a microsecond a flip whatever the rank, with
   the rest of the card idle. A flip is one pass over r floats (the update `ks −= 2s·K[row]`,
   every candidate's gain `(−4g²s)·(ks − kd·s) + (4gs)·bv`, the minimum of each 16
-  candidates) in vector registers, about 0.3 µs at r = 776, and every tensor and candidate in
-  flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
+  candidates) in vector registers, 0.27 µs at r = 776 and 0.54 µs at r = 2152 with the
+  transfers, and every tensor and candidate in flight has a core of its own. The block's rows of `BV`, `S`, `K·S` and its square of `Uc`
   come down in two reads, its signs and error rows go back in two writes. The gain is written
   as the device kernel writes it — the difference first, the last product and sum fused: the
   two terms cancel near the stop test, and a gain summed from them loses the digits the test
@@ -529,12 +529,18 @@ Qwen3.5-0.8B at 1.0 bpw on an RTX PRO 6000 Blackwell:
 | trainer on one file: held-out KL before | 3.47721 | 3.47725 |
 | loss of steps 1, 7, 10 | 3.5255, 3.0526, 2.9163 | 3.5255, 3.0533, 2.9170 |
 | signs flipped by step 11 | 296 527 | 295 157 |
-| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44555 |
+| held-out KL after 256 steps of 8×512 (signs, `fact-mom`) | 1.44903 | 1.44404 |
 | signs flipped in the run | 0.901 % | 0.896 % |
 | Qwen3.8-27B at 0.55 bpw, the trainer on one file: held-out KL before | 1.53820 | 1.53821 |
 | loss of steps 1, 6, 11, 12 | 1.4572, 1.3403, 1.5225, 1.6106 | 1.4572, 1.3403, 1.5225, 1.6106 |
 | signs flipped by step 11 | 4 259 313 | 4 259 718 |
-| the 27B's encoder, held-out error of layer 3: down / gate / up / q / o / k / v | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0830 / 0.3558 / 0.5083 | 0.5702 / 0.4449 / 0.4715 / 0.0825 / 0.0829 / 0.3560 / 0.5083 |
+| the 27B's encoder on one capture of layer 3's Grams, held-out error: down / gate / up / q / o / k / v | 0.6899 / 0.5240 / 0.5979 / 0.0825 / 0.0832 / 0.3558 / 0.5079 | 0.6893 / 0.5241 / 0.5978 / 0.0825 / 0.0830 / 0.3560 / 0.5083 |
+
+The 0.8B encoder rows and the step-11 flips were taken with the search in the device's kernel on both backends and
+with the per-position GDN reverse sweep; the 27B encoder row is with the flips on the host (§4.1), which the two
+backends share. With the device's kernels on CUDA the same capture gives 0.6891 / 0.5239 / 0.5979 / 0.0825 / 0.0829
+/ 0.3561 / 0.5083. (An earlier version of this table gave layer 3's MLP tensors the errors of an encode on layer
+0's Grams: `nvg-bench` read a cache prefix shared by the two layers. It now refuses such a prefix.)
 
 A conversion repeated on CUDA gives the same bytes, and the training after it the same curve to the last printed
 digit. A training stopped at a saved state and resumed gives the losses and the held-out KL of an uninterrupted
@@ -574,8 +580,8 @@ reference recipe: 1 M tokens, 8 windows of 512, teacher f16, metric and signs, `
 | encode of a layer (three tensors in flight) | 16.6–18.0 s | 1.5–1.7 s |
 | whole conversion, 24 layers | 492 s | 64 s |
 | teacher top-64 pass | 42.7k tok/s | 55.5k tok/s |
-| training step, 4096 tokens | 0.69 s | 0.31 s |
-| the reference training, whole run | 227 s | 102 s |
+| training step, 4096 tokens | 0.69 s | 0.28 s |
+| the reference training, whole run | 227 s | 97 s |
 
 Inside the encoder, layer 0 with one tensor in flight (seconds; `CMF_NVG_PROF=1`):
 
@@ -603,31 +609,48 @@ with and without them); the host's flips give another file of the same quality (
 (`requant --quant q1g`) is a lossless host pass over bytes and has no device stage.
 
 Qwen3.8-27B at 0.55 bpw. The trainer: the 4.89 GB student against its q8_2f teacher, 8 windows of 512, metric and
-signs. The encoder: one layer from the q8_2f weights, one tensor in flight, 32 768 + 4 096 calibration tokens.
+signs. The encoder: one layer from the q8_2f weights, 32 768 + 4 096 calibration tokens, each layer's Grams
+captured once (on CUDA) and read by both backends.
 
 | stage | wgpu | CUDA |
 |---|---:|---:|
-| teacher top-64 pass | 2.7k tok/s | 4.9k tok/s |
-| training step, 4096 tokens | 5.48 s | 3.57 s |
-| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 18.8 min |
-| card memory while training | 90.8 GB | 86.5 GB |
-| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.9 s / 8.1 s |
-| input contexts of a layer | 2.5–3.4 s | 1.0–1.2 s |
-| encode of layer 0 (GDN, 6 tensors) | 149.3 s | 104.9 s |
-| encode of layer 3 (attention, 7 tensors) | 148.9 s | 102.4 s |
-| of it `down_proj` 5120×17408: whole / input-side search / g solves | 70.9 / 45.3 / 15.6 s | 58.1 / 44.4 / 8.9 s |
-| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 19.4, 14.6, 5.2 s | 11.6, 7.7, 2.3 s |
+| teacher top-64 pass | 2.7k tok/s | 5.0k tok/s |
+| training step, 4096 tokens | 5.48 s | 2.97 s |
+| 1 M tokens: 256 steps and their teacher pass | 29.5 min | 16.2 min |
+| card memory while training | 90.8 GB | 87.9 GB |
+| calibration of layer 0 / layer 3 (a forward from the embeddings) | 17.1 s / 36.8 s | 5.6 s / 8.1 s |
+| input contexts of a layer | 2.9–5.2 s | 1.3 s |
+| encode of layer 0 (GDN, 6 tensors): one tensor in flight / three | 106.6 s | 40.4 s / 29.8 s |
+| encode of layer 3 (attention, 7 tensors): one tensor in flight / three | 103.0 s | 38.2 s / 28.2 s |
+| of it `down_proj` 5120×17408: whole / input-side search / g solves | 42.2 / 16.6 / 15.2 s | 17.3 / 16.7 / 10.1 s |
+| `gate_proj` 17408×5120, `q_proj` 12288×5120, `k_proj` 1024×5120 | 14.7, 12.7, 4.1 s | 5.6, 4.5, 0.8 s |
 
-A training run of 10.5 M tokens of the 27B (2559 steps with their teacher pass, states saved to a RAM disk)
-took 3 h 55 min on CUDA, at 3.56 s a step.
+(CUDA's search and solve times of `down_proj` are summed over its two candidates' threads, which overlap; the
+tensor takes 17.3 s.)
 
-A CUDA step of the 27B: the f16 GEMMs 41 % (about 4.6·10¹⁴ flop a step; the six products of a path run at
-280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput`), the GDN recurrence 28 % (its f16 state
-history is 6.4 GB a layer, written and read once), the sign update's passes over the latents 9 %, the remaining
-stagings and plane expansions 8 %, SwiGLU 4 %. Before the scales rode the planes and the recurrence ran in
-512-thread blocks the same step took 4.50 s (the elementwise passes over activations alone 40 % of it), and the
-0.8B's 0.54 s. In the 27B's encoder the input-side search of `down_proj` (33–36 M flips at 1.25 µs) is 42 % of a
-layer on CUDA and the next thing to parallelise.
+What this pass changed, the same stand and the same Grams:
+
+| | before | now |
+|---|---:|---:|
+| encode of layer 3 on CUDA, one tensor in flight | 90.1 s (one stream, the search in the device's kernel) | 38.2 s |
+| three / four tensors in flight | no faster than one | 28.2 s / 29.5 s |
+| encode of layer 0 on CUDA, one / three in flight | 96.5 s | 40.4 s / 29.8 s |
+| `down_proj`'s input-side search, 31 M flips | 37.8 s (1.22 µs a flip) | 16.7 s over two threads (0.54 µs) |
+| encode of a layer on wgpu | 148.9–149.3 s | 103.0–106.6 s |
+| training step on CUDA | 3.57 s | 2.97 s (3.29 s with the per-position GDN reverse sweep) |
+
+A training run of 10.5 M tokens of the 27B (2559 steps, their teacher pass, a held-out evaluation every 32 steps
+and the saved states) took 3 h 55 min at 3.56 s a step; the next one ran at 3.3–3.4 s a step on an intermediate
+build, beside other jobs on the card.
+
+A CUDA step of the 27B (2.97 s; `CMF_NVG_KT`): the f16 GEMMs 1.42 s, 48 % (about 4.3·10¹⁴ flop a step; the six
+products of a path run at 280–345 TFLOP/s at the MLP's shapes, `cuda_blr_gemm_shapes_throughput` — cuBLAS's rate on
+this card), the GDN recurrence 0.50 s, 17 % (the forward kernel 0.21 s, the reverse sweep's batched products 0.13 s
+and its kernels 0.16 s), the sign update's passes over the latents 0.22 s, 7 %, the remaining stagings and plane
+expansions 0.23 s, 8 %, SwiGLU 0.11 s, 4 %. The step before this pass, 3.57 s: GEMMs 1.53 s (the recompute's x·S_V
+among them), the recurrence 0.94 s (reverse 0.57, forward 0.37), stagings 0.19 s, SwiGLU 0.14 s. And before the
+scales rode the planes and the recurrence ran in 512-thread blocks, 4.50 s (the elementwise passes over activations
+alone 40 % of it), the 0.8B's 0.54 s. What is left is cuBLAS at its rate and passes that run at the memory bus.
 
 ### 8.6 SFq's two ideas at the NVG start
 
