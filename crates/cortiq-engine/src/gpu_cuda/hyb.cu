@@ -901,10 +901,14 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const int gpr = cols >> 5;
     const int per = (gpr + KS - 1) / KS;
     const int g0 = min(gpr, warp * per), g1 = min(gpr, g0 + per);
-    if (PF) {
-        // a launch whose jobs and weights are fixed: the warp's weight words
-        // into L2 while the predecessor runs (programmatic dependent launch),
-        // then the wait for the input rows it writes
+#ifndef MMP_PF2
+#define MMP_PF2 1
+#endif
+    if (PF || (MMP_PF2 && KD && NT == 1)) {
+        // the warp's weight words into L2 at once (requests in flight without
+        // registers); a launch whose jobs and weights are fixed (PF) does it
+        // while the predecessor runs (programmatic dependent launch), then
+        // waits for the input rows it writes
         const int gb = KD == 5 ? 512 : (KD == 1 || KD == 2) ? 128 : KD == 3 ? 64 : 256;
 #pragma unroll
         for (int b = 0; b < TB; b++) {
@@ -915,8 +919,10 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
             for (int q = lane; q < lines; q += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(base + ((size_t)q << 7)));
         }
 #if __CUDA_ARCH__ >= 900
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-        asm volatile("griddepcontrol.launch_dependents;");
+        if (PF) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;");
+        }
 #endif
     }
     float acc[TB][NT][2];
