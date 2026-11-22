@@ -201,6 +201,9 @@ pub(super) struct HFuncs {
     /// One codec's windows, `hy_mmpk_{NT}_{TB}_{KS}_{KD}` by [NT as in
     /// `mmp`][TB - 1][KS == 16][`KDS` index of KD].
     mmpk: [[[[cs::CUfunction; 6]; 2]; 2]; 3],
+    /// `hy_mmpkp_1_1_{8,16}_{6,5}`: a decode row's fixed-job launch with its
+    /// weights prefetched before the dependent-launch wait (q4tp, int8)
+    mmpkp: [[cs::CUfunction; 2]; 2],
     /// The grouped experts' launches: `hy_mmp_8_2_8` (32 rows a job), `hy_mmp_16_1_8` (64).
     mmp_g: [cs::CUfunction; 2],
 
@@ -297,6 +300,8 @@ pub(super) struct HFuncs {
     moe_combine_c: cs::CUfunction,
     moe_topk: cs::CUfunction,
     moe_group: cs::CUfunction,
+    /// `hy_moe_group` in parallel (E <= 256)
+    moe_group2: cs::CUfunction,
     moe_gather: cs::CUfunction,
     moe_gcombine: cs::CUfunction,
     norm_add: cs::CUfunction,
@@ -339,13 +344,21 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
             }
         }
     }
+    let mut mmpkp = [[std::ptr::null_mut(); 2]; 2];
+    for (ki, ks) in [8usize, 16].into_iter().enumerate() {
+        for (di, kd) in [6i32, 5].into_iter().enumerate() {
+            mmpkp[ki][di] = func(module, &format!("hy_mmpkp_1_1_{ks}_{kd}"))?;
+        }
+    }
     Ok(HFuncs {
         mmp,
         mmpk,
+        mmpkp,
         mmp_g: [func(module, "hy_mmp_8_2_8")?, func(module, "hy_mmp_16_1_8")?],
 
         moe_topk: func(module, "hy_moe_topk")?,
         moe_group: func(module, "hy_moe_group")?,
+        moe_group2: func(module, "hy_moe_group2")?,
         moe_gather: func(module, "hy_moe_gather")?,
         moe_gcombine: func(module, "hy_moe_gcombine")?,
         split: func(module, "hy_split")?,
@@ -850,6 +863,8 @@ impl MmaSet {
         let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
         let ks = if self.ks16 { 16 } else { 8 };
         let f = match self.kd {
+            // q4tp / int8 (KDS 0 / 1): the weights ahead of the wait
+            Some(d) if n == 1 && tb == 1 && d < 2 && pf_on() => fx.mmpkp[self.ks16 as usize][d],
             Some(d) => fx.mmpk[nt_of(n)][tb - 1][self.ks16 as usize][d],
             None => fx.mmp[nt_of(n)][tb - 1][self.ks16 as usize],
         };
@@ -874,6 +889,13 @@ impl MmaSet {
         let (nj, xs_i, n_i, cols_i) = (self.n, xs as i32, n as i32, cols as i32);
         unsafe { c.launch(f, (self.blocks[tb - 1], 1), (32 * ks) as u32, 0, kargs!(self.bufs[tb - 1].ptr, nj, x0, x1, x1, xs_i, n_i, cols_i)) }
     }
+}
+
+/// `CMF_HYB_PF=0`: a decode row's matrix-set matvec without its weights
+/// prefetched ahead of the dependent-launch wait.
+fn pf_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_PF").as_deref() != Ok("0"))
 }
 
 /// The tile launch of a window of `n` rows (at most 16): n tiles of 4 rows.

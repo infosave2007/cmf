@@ -788,6 +788,13 @@ fn fuse_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_FUSE").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_GROUP2=0`: a prompt call's experts grouped by the one-warp-an-
+/// expert scan (`hy_moe_group`) instead of the parallel count (`hy_moe_group2`).
+fn group2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_GROUP2").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_KT=N` (a measurement): is this the N-th decode call?
 fn kt_call() -> bool {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1960,7 +1967,7 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
         c.gemm(true, false, e, n, hidden, 1.0, l.router.ptr, hidden, d.xm.ptr, hidden, 0.0, b.lg.ptr, e, Gemm::F32)?;
         c.launch(fx.moe_topk, (n.div_ceil(8) as u32, 1), 256, 0, kargs!(b.lg.ptr, l.bias.ptr, n_i, e_i, k_i, flags, cfg.route_scale, b.pidx.ptr, b.pwt.ptr))?;
         c.launch(
-            fx.moe_group,
+            if e <= 256 && group2_on() { fx.moe_group2 } else { fx.moe_group },
             (1, 1),
             1024,
             0,
