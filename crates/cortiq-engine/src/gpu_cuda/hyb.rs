@@ -328,15 +328,17 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     if hd % 32 != 0 || hd > 512 || hpk == 0 || hpk > 16 {
         return Err(format!("attention geometry {hpk} heads per KV head x {hd} outside the kernels"));
     }
-    // `CMF_HYB_UG=N` (a measurement): a one-codec decode matvec's groups read
-    // ahead per warp (2; the arithmetic does not depend on it)
-    let ug = std::env::var("CMF_HYB_UG").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| (1..=8).contains(u)).unwrap_or(2);
+    // `CMF_HYB_UG=N`: a one-codec decode matvec's groups read ahead per warp
+    // (2; 1 on sm_120 — RTX PRO 6000, Inkling decode 199.8 → 202.4 tok/s; the
+    // arithmetic does not depend on it)
+    let ug_def = if super::cc_major() == 12 { 1 } else { 2 };
+    let ug = std::env::var("CMF_HYB_UG").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| (1..=8).contains(u)).unwrap_or(ug_def);
     // `CMF_HYB_PF2=1` (a measurement): a one-codec decode matvec prefetches its
     // warps' weights into L2 at the start (G4: 174.2 against 182.4 tok/s off)
     let pf2 = (std::env::var("CMF_HYB_PF2").as_deref() == Ok("1")) as i32;
-    // `CMF_HYB_PIPE=0` (a measurement): a decode row's q4tp matvec without its
-    // software pipeline (the next group's loads in flight)
-    let pipe = (std::env::var("CMF_HYB_PIPE").as_deref() != Ok("0")) as i32;
+    // `CMF_HYB_PIPE=1` (a measurement): a decode row's q4tp matvec software-
+    // pipelined (the next group's loads in flight; G4: 196.2 against 199.8 off)
+    let pipe = (std::env::var("CMF_HYB_PIPE").as_deref() == Ok("1")) as i32;
     let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}"), format!("-DMMP_UG={ug}"), format!("-DMMP_PF2={pf2}"), format!("-DMMP_PIPE={pipe}")], c.arch)?;
     let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 3];
     for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {

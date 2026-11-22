@@ -939,7 +939,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
 #define MMP_UG 2
 #endif
 #ifndef MMP_PIPE
-#define MMP_PIPE 1
+#define MMP_PIPE 0
 #endif
     constexpr int UG = (KD && NT == 1) ? MMP_UG : 1;
     constexpr bool PIPE = MMP_PIPE && KD == 6 && NT == 1 && TB == 1;
