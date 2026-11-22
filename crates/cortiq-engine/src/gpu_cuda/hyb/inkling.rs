@@ -71,6 +71,21 @@ fn rowmap_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ROWMAP").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_QRKV2=1`: the decode sinks and per-token taps inside the qr+kv
+/// launch (`ink_qrkv2`) instead of `ink_fmv3` before it (G4: slower, the dots
+/// serialize in the query and key blocks).
+fn qrkv2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_QRKV2").as_deref() == Ok("1"))
+}
+
+/// `CMF_INKLING_POSTMIX=1`: a decode row's attention post and MoE mix in one
+/// block (`ink_post_mix`) instead of `ink_post` (nine blocks) and `ink_mix2`.
+fn postmix_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_POSTMIX").as_deref() == Ok("1"))
+}
+
 /// `CMF_INKLING_FLASH=0`: a prompt call's attention through the cuBLAS score
 /// products (`attn_gemm`) instead of `ink_attn_flash`.
 fn flash_on() -> bool {
@@ -102,6 +117,8 @@ struct Fx {
     merge_g: cs::CUfunction,
     post_mx: cs::CUfunction,
     qrkv2: cs::CUfunction,
+    qrkv: cs::CUfunction,
+    fmv3: cs::CUfunction,
     post_mix: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
@@ -509,6 +526,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         merge_g: func(module, "ink_attn_merge_g")?,
         post_mx: func(module, "ink_post_mx")?,
         qrkv2: func(module, "ink_qrkv2")?,
+        qrkv: func(module, "ink_qrkv")?,
+        fmv3: func(module, "ink_fmv3")?,
         post_mix: func(module, "ink_post_mix")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
@@ -1632,8 +1651,20 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let nh = cfg.nh;
         let (nh_i, kp_i) = (nh as i32, (cfg.nkv * 4) as i32);
         let (mut dk, mut dv) = (0u64, 0u64);
-        // fused: the sinks and the per-token taps come inside `ink_qrkv2`
-        if !fuse {
+        let q2 = fuse && qrkv2_on();
+        if fuse && !q2 {
+            // the sinks and the dynamic convolution weights in one launch
+            let (wk, wv, kr) = match (&l.dk, &l.dv) {
+                (Some(wk), Some(wv)) => {
+                    dk = d.dkb.ptr;
+                    dv = d.dvb.ptr;
+                    (wk.ptr, wv.ptr, kp_i)
+                }
+                _ => (0u64, 0u64, 0i32),
+            };
+            let tot = nh + 2 * kr as usize;
+            c.launch(f.fmv3, (tot as u32, nu), 192, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
+        } else if !fuse {
             c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
             if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
                 c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
@@ -1647,7 +1678,18 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let full = !l.sliding as i32;
         let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
         let ring = s.ring as i32;
-        if fuse {
+        if fuse && !q2 {
+            c.launch(
+                f.qrkv,
+                ((nh * n + 2 * cfg.nkv) as u32, 1),
+                cfg.hd as u32,
+                0,
+                kargs!(
+                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr,
+                    s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr
+                ),
+            )?;
+        } else if fuse {
             // queries, keys, values, the sinks and the per-token taps in one launch
             let (wdk, wdv) = match (&l.dk, &l.dv) {
                 (Some(wk), Some(wv)) => (wk.ptr, wv.ptr),
@@ -1712,7 +1754,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let bslot = if l.boundary { *nb as i32 } else { -1 };
         let hb = hidden.div_ceil(256) as u32;
         // a decode row: the post and the MoE input's mix (and norm) in one block
-        let pm = fuse && n == 1;
+        let pm = fuse && n == 1 && postmix_on();
         if !pm {
             c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
         }
