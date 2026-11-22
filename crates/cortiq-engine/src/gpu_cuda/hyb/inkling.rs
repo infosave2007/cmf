@@ -1523,7 +1523,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                 let r_i = r as i32;
                 let (m0, m1, m2) = (fl(&d.msg, 0), fl(&d.msg, 1), fl(&d.msg, 2));
                 let (o0, o1, o2) = (fl(&d.gin, 0), fl(&d.gin, 1), fl(&d.gin, 2));
-                c.launch_3d(f.gd3, (r.div_ceil(8) as u32, nu, 3), 256, 0, kargs!(inp[0], inp[1], inp[2], m0, m1, m2, gs[0].down.ptr, gs[1].down.ptr, gs[2].down.ptr, r_i, eps, d.gd.ptr))?;
+                c.launch_3d(f.gd3, (r as u32, nu, 3), 256, 0, kargs!(inp[0], inp[1], inp[2], m0, m1, m2, gs[0].down.ptr, gs[1].down.ptr, gs[2].down.ptr, r_i, eps, d.gd.ptr))?;
                 c.launch_3d(
                     f.go3,
                     (hidden.div_ceil(8) as u32, nu, 3),
@@ -1683,7 +1683,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                     let r = gs[3].down.bytes / (2 * hidden * 4);
                     let r_i = r as i32;
                     let (m3, g3) = (fl(&d.msg, 3), &gs[3]);
-                    c.launch_3d(f.gd3, (r.div_ceil(8) as u32, nu, 1), 256, 0, kargs!(mi, mi, mi, m3, m3, m3, g3.down.ptr, g3.down.ptr, g3.down.ptr, r_i, eps, d.gd.ptr))?;
+                    c.launch_3d(f.gd3, (r as u32, nu, 1), 256, 0, kargs!(mi, mi, mi, m3, m3, m3, g3.down.ptr, g3.down.ptr, g3.down.ptr, r_i, eps, d.gd.ptr))?;
                     c.launch_3d(
                         f.go3,
                         (hidden.div_ceil(8) as u32, nu, 1),
@@ -2048,8 +2048,8 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
             // a decode row: the router and the selection in one launch
             c.launch(
                 fx.moe_route1,
-                (e.div_ceil(8) as u32, 1),
-                256,
+                (e as u32, 1),
+                128,
                 0,
                 kargs!(
                     d.xm.ptr, l.router.ptr, d.logits_e.ptr, ei, hi, l.bias.ptr, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si, d.qq[0].ptr,

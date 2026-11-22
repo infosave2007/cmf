@@ -349,8 +349,9 @@ extern "C" __global__ void ink_gate_out(const float* __restrict__ x, const float
 }
 
 // Up to three message gates' first halves in one launch (blockIdx.z the
-// gate): the block's RMS of x and m once, then a warp a rank row (float4).
-// Grid (R/8, n, count), 256 threads; d of gate j at d + j·n·R.
+// gate): a block a rank row, its four sums (the RMS of x and m, the row's two
+// halves against them) in one pass of float4 loads and one exchange.
+// Grid (R, n, count), 256 threads; d of gate j at d + j·n·R.
 extern "C" __global__ void ink_gate_down3(const float* __restrict__ x0, const float* __restrict__ x1,
                                           const float* __restrict__ x2, const float* __restrict__ m0,
                                           const float* __restrict__ m1, const float* __restrict__ m2,
@@ -358,49 +359,41 @@ extern "C" __global__ void ink_gate_down3(const float* __restrict__ x0, const fl
                                           const float* __restrict__ dw2, int R, float eps, float* __restrict__ d)
 {
     PDL_PRO();
-    __shared__ float part[32][2];
-    __shared__ float tot[2];
-    const int j = blockIdx.z, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, nwp = blockDim.x >> 5;
+    __shared__ float part[32][4];
+    const int k = blockIdx.x, j = blockIdx.z, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
     const float4* xr = (const float4*)((j == 0 ? x0 : j == 1 ? x1 : x2) + (size_t)r * H);
     const float4* mr = (const float4*)((j == 0 ? m0 : j == 1 ? m1 : m2) + (size_t)r * H);
     const float* down = j == 0 ? dw0 : j == 1 ? dw1 : dw2;
-    float sx = 0.0f, sm = 0.0f;
-    for (int i = tid; i < H / 4; i += blockDim.x) {
-        const float4 a = xr[i], b = mr[i];
-        sx += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
-        sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        sx += __shfl_xor_sync(FULL, sx, o);
-        sm += __shfl_xor_sync(FULL, sm, o);
-    }
-    if (lane == 0) {
-        part[wp][0] = sx;
-        part[wp][1] = sm;
-    }
-    __syncthreads();
-    if (tid < 2) {
-        float t = 0.0f;
-        for (int w = 0; w < nwp; w++) t += part[w][tid];
-        tot[tid] = t;
-    }
-    __syncthreads();
-    const int k = blockIdx.x * nwp + wp;
-    if (k >= R) return;
     const float4* dx = (const float4*)(down + (size_t)k * 2 * H);
     const float4* dm = (const float4*)(down + (size_t)k * 2 * H + H);
-    float ax = 0.0f, am = 0.0f;
-    for (int i = lane; i < H / 4; i += 32) {
+    float sx = 0.0f, sm = 0.0f, ax = 0.0f, am = 0.0f;
+    for (int i = tid; i < H / 4; i += blockDim.x) {
         const float4 a = xr[i], b = mr[i], u = dx[i], v = dm[i];
+        sx += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+        sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
         ax += u.x * a.x + u.y * a.y + u.z * a.z + u.w * a.w;
         am += v.x * b.x + v.y * b.y + v.z * b.z + v.w * b.w;
     }
     for (int o = 16; o > 0; o >>= 1) {
+        sx += __shfl_xor_sync(FULL, sx, o);
+        sm += __shfl_xor_sync(FULL, sm, o);
         ax += __shfl_xor_sync(FULL, ax, o);
         am += __shfl_xor_sync(FULL, am, o);
     }
-    if (lane == 0)
-        d[((size_t)j * gridDim.y + r) * R + k] = ax * rsqrtf(tot[0] / (float)H + eps) + am * rsqrtf(tot[1] / (float)H + eps);
+    if (lane == 0) {
+        part[wp][0] = sx;
+        part[wp][1] = sm;
+        part[wp][2] = ax;
+        part[wp][3] = am;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) t[q] += part[w][q];
+        d[((size_t)j * gridDim.y + r) * R + k] = t[2] * rsqrtf(t[0] / (float)H + eps) + t[3] * rsqrtf(t[1] / (float)H + eps);
+    }
 }
 
 // `ink_gate_out` of up to three gates in one launch (blockIdx.z the gate).

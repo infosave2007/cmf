@@ -2549,10 +2549,10 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
 
 // A decode row's router and selection in one launch (`hy_moe_router` with no
 // shared gate, then `hy_moe_select`'s sigmoid path: flags bits 0, 2, 5; E <=
-// 256 experts, k <= 32 picks, S == k slots): a warp a router row; the last
+// 256 experts, k <= 32 picks, S == k slots): a block a router row; the last
 // block to finish picks the top k by warp-wide argmax (the larger key first,
 // the smaller expert on a tie: the select's order), writes the weights, lays
-// out the slots' jobs and re-arms the counter. Grid any, 256 threads.
+// out the slots' jobs and re-arms the counter. Grid E, 128-256 threads.
 extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __restrict__ xn, const float* __restrict__ Wr,
         float* __restrict__ logits, int E, int hidden, const float* __restrict__ bias, int k, int flags, float route_scale,
         const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t, HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a,
@@ -2563,23 +2563,27 @@ extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __r
     __shared__ int pick[32];
     __shared__ float pw[32];
     __shared__ int last;
+    __shared__ float rpart[32];
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
     const int h4 = hidden >> 2;
     const float4* x4 = (const float4*)xn;
-    for (int e = blockIdx.x * nwp + wp; e < E; e += gridDim.x * nwp) {
+    // a block a router row: every thread a float4 or two of it
+    for (int e = blockIdx.x; e < E; e += gridDim.x) {
         const float4* w4 = (const float4*)(Wr + (size_t)e * hidden);
-        float a = 0.0f, b = 0.0f;
-        for (int i = lane; i < h4; i += 64) {
+        float a = 0.0f;
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
             const float4 u = w4[i], v = x4[i];
             a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
-            if (i + 32 < h4) {
-                const float4 u2 = w4[i + 32], v2 = x4[i + 32];
-                b += u2.x * v2.x + u2.y * v2.y + u2.z * v2.z + u2.w * v2.w;
-            }
         }
-        float acc = a + b;
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(FULL, acc, o);
-        if (lane == 0) logits[e] = acc;
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
+        if (lane == 0) rpart[wp] = a;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.0f;
+            for (int w = 0; w < nwp; w++) t += rpart[w];
+            logits[e] = t;
+        }
+        __syncthreads();
     }
     __threadfence();
     __syncthreads();
