@@ -11,7 +11,9 @@ struct IP {
     uint V, bslot, topk, gpr, ostride2, win;
     float eps, qclip, rclip, alpha;
     float floor_, scale, cap, ucap;
-    float rscale, pad1, pad2, pad3;
+    float rscale;
+    uint HIST;
+    float pad2, pad3;
 };
 
 inline float tg_sum(float v, threadgroup float* sh, uint tid, uint nt) {
@@ -298,7 +300,7 @@ kernel void ink_qr(device float* yq [[buffer(0)]], device float* yr [[buffer(1)]
 inline void kv_body(uint g, uint isv, uint tid, uint nt, threadgroup float* sh,
                     device const float* yk, device const float* yv, device const float* dk, device const float* dv,
                     device const float* tk, device const float* tv, device float* rk, device float* rv,
-                    device half* kc, device half* vc, constant IP& p)
+                    device half* kc, device half* vc, device float* hk, device float* hv, constant IP& p)
 {
     const uint HD = p.HD, NKV = p.NKV, KC = p.KC;
     const uint C = NKV * HD, ch = g * HD + tid;
@@ -307,6 +309,8 @@ inline void kv_body(uint g, uint isv, uint tid, uint nt, threadgroup float* sh,
     device const float* tp = (isv ? tv : tk) + (ulong)ch * KC;
     device float* rg = isv ? rv : rk;
     device half* cache = isv ? vc : kc;
+    // `p.HIST` (a draft verify): every row's input, for the rings' rollback
+    device float* hr = isv ? hv : hk;
     float hist[8];
     hist[0] = 0.0f;
     for (uint l = 1u; l < KC; ++l) hist[l] = rg[(ulong)(l - 1u) * C + ch];
@@ -314,6 +318,7 @@ inline void kv_body(uint g, uint isv, uint tid, uint nt, threadgroup float* sh,
     const float scale = rsqrt((float)((dyn ? 2u : 1u) * KC + 1u));
     for (uint j = 0u; j < p.n; ++j) {
         const float x = y[(ulong)j * C + ch];
+        if (p.HIST != 0u) hr[(ulong)j * C + ch] = x;
         hist[0] = x;
         float acc = 0.0f;
         for (uint l = 0u; l < KC; ++l) {
@@ -339,11 +344,12 @@ kernel void ink_kv(device const float* yk [[buffer(0)]], device const float* yv 
                    device float* rk [[buffer(6)]], device float* rv [[buffer(7)]],
                    device half* kc [[buffer(8)]], device half* vc [[buffer(9)]],
                    constant IP& p [[buffer(15)]],
+                   device float* hk [[buffer(16)]], device float* hv [[buffer(17)]],
                    uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                    uint3 nt_v [[threads_per_threadgroup]])
 {
     threadgroup float sh[32];
-    kv_body(tg_v.x, tg_v.y, tid, nt_v.x, sh, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, p);
+    kv_body(tg_v.x, tg_v.y, tid, nt_v.x, sh, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, hk, hv, p);
 }
 
 // `ink_qr` and `ink_kv` in one dispatch (a decode call): threadgroups [0, NH·n)
@@ -357,13 +363,14 @@ kernel void ink_qrkv(device float* yq [[buffer(0)]], device float* yr [[buffer(1
                      device float* rk [[buffer(10)]], device float* rv [[buffer(11)]],
                      device half* kc [[buffer(12)]], device half* vc [[buffer(13)]],
                      constant IP& p [[buffer(15)]],
+                     device float* hk [[buffer(16)]], device float* hv [[buffer(17)]],
                      uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint3 nt_v [[threads_per_threadgroup]])
 {
     threadgroup float sh[32];
     const uint b = tg_v.x, nq = p.NH * p.n;
     if (b < nq) qr_body(b % p.NH, b / p.NH, tid, nt_v.x, sh, yq, yr, qs, rs, p);
-    else kv_body((b - nq) % p.NKV, (b - nq) / p.NKV, tid, nt_v.x, sh, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, p);
+    else kv_body((b - nq) % p.NKV, (b - nq) / p.NKV, tid, nt_v.x, sh, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, hk, hv, p);
 }
 
 // The attention of row r and head h (see `ink_attn` in inkling.cu): grid
@@ -458,6 +465,7 @@ kernel void ink_ogate(device float* o [[buffer(0)]], device const float* gt [[bu
 kernel void ink_post(device const float* a [[buffer(0)]], device const float* taps [[buffer(1)]],
                      device float* ring [[buffer(2)]], device const float* res [[buffer(3)]],
                      device float* blk [[buffer(4)]], device float* out [[buffer(5)]],
+                     device float* hst [[buffer(6)]],
                      constant IP& p [[buffer(15)]],
                      uint3 tgx_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint3 nt_v [[threads_per_threadgroup]])
@@ -476,6 +484,7 @@ kernel void ink_post(device const float* a [[buffer(0)]], device const float* ta
     for (uint j = 0u; j < p.n; ++j) {
         const ulong at = (ulong)j * H + i;
         const float x = a[at];
+        if (p.HIST != 0u) hst[at] = x;
         hist[0] = x;
         float acc = 0.0f;
         for (uint l = 0u; l < KC; ++l) acc = fma(tp[l], hist[l], acc);
@@ -1412,5 +1421,478 @@ kernel void ink_attn_fl(device const float* yq [[buffer(0)]], device const float
                 out[((ulong)row * NH + h) * HD + cb * 8u + c] = ss[sg][lr * 8u + c];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---- a draft verify's rows (up to 8) ----
+
+// x·col of a q8_2f product prepared once a call. Grid (cols4/256, n), 256.
+kernel void ink_xcol(device const float4* x [[buffer(0)]], device const float4* col [[buffer(1)]],
+                     device float4* xc [[buffer(2)]], constant uint& cols4 [[buffer(3)]],
+                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const uint i = tg.x * 256u + tid, r = tg.y;
+    if (i >= cols4) return;
+    xc[(ulong)r * cols4 + i] = x[(ulong)r * cols4 + i] * col[i];
+}
+
+// A q8_2f matrix over up to 8 rows (`p.n`; x·col from `ink_xcol`): four rows
+// a simdgroup, a weight converted once for every row; `p.V` adds into y.
+// Grid rows/32, 256.
+kernel void ink_q8p(device const char4* q [[buffer(0)]], device const float4* xc [[buffer(1)]],
+                    device const float* rs [[buffer(2)]], device float* y [[buffer(3)]],
+                    constant uint& cols4 [[buffer(4)]], constant uint& rows [[buffer(5)]],
+                    constant IP& p [[buffer(15)]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                    uint tgpos [[threadgroup_position_in_grid]], uint sgs [[simdgroups_per_threadgroup]])
+{
+    const uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    const uint nr = min(rows - r0, 4u), n = p.n;
+    float acc[8][4];
+    for (uint j = 0u; j < 8u; ++j)
+        for (uint ri = 0u; ri < 4u; ++ri) acc[j][ri] = 0.0f;
+    // a row's x·col loaded once for the four matrix rows
+    const uint last = nr - 1u;
+    device const char4* q0 = q + (ulong)r0 * cols4;
+    device const char4* q1 = q + (ulong)(r0 + min(1u, last)) * cols4;
+    device const char4* q2 = q + (ulong)(r0 + min(2u, last)) * cols4;
+    device const char4* q3 = q + (ulong)(r0 + min(3u, last)) * cols4;
+    for (uint i = lane; i < cols4; i += 32u) {
+        const float4 w0 = float4(q0[i]), w1 = float4(q1[i]), w2 = float4(q2[i]), w3 = float4(q3[i]);
+        for (uint j = 0u; j < 8u; ++j) {
+            if (j < n) {
+                const float4 xv = xc[(ulong)j * cols4 + i];
+                acc[j][0] += dot(w0, xv);
+                acc[j][1] += dot(w1, xv);
+                acc[j][2] += dot(w2, xv);
+                acc[j][3] += dot(w3, xv);
+            }
+        }
+    }
+    for (uint j = 0u; j < 8u; ++j)
+        for (uint ri = 0u; ri < 4u; ++ri) acc[j][ri] = simd_sum(acc[j][ri]);
+    if (lane == 0u) {
+        for (uint j = 0u; j < 8u; ++j) {
+            if (j < n) {
+                for (uint ri = 0u; ri < nr; ++ri) {
+                    // p.V: the residual form, y += W·x
+                    const ulong at = (ulong)j * rows + r0 + ri;
+                    const float v = acc[j][ri] * rs[r0 + ri];
+                    y[at] = p.V != 0u ? y[at] + v : v;
+                }
+            }
+        }
+    }
+}
+
+// ---- the DSpark drafter (`ink_ds_*` of inkling.cu) ----
+
+struct DsP {
+    float eps, theta;
+    uint cap, ring, pos0, B, win, R;
+};
+
+// NeoX rotation of a head vector held a value a thread (HD threads): the pairs
+// (i, i + HD/2) at angle pos · theta^(−2i/HD).
+inline float ds_rope(float v, threadgroup float* sv, uint i, uint pos, float theta, uint HD) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sv[i] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint hf = HD / 2u, j = i < hf ? i : i - hf;
+    const float ang = (float)pos * precise::pow(theta, -2.0f * (float)j / (float)HD);
+    const float sn = precise::sin(ang), cs = precise::cos(ang);
+    return i < hf ? v * cs - sv[i + hf] * sn : v * cs + sv[i - hf] * sn;
+}
+
+// The mixes of a call's taps: mix j of row r = rms(Σ_k α[j][k]·tap[k][r])·norms[j];
+// j < nmix − 1 into mix[j][rows][H], the last (the Markov head's context) into
+// the ring row fr[(pos0 + r) % frc]. dm = (taps, rows, nmix, frc). Grid (n, nmix), 256.
+kernel void ink_ds_mix(device const float* tap [[buffer(0)]], device const float* alpha [[buffer(1)]],
+                       device const float* norms [[buffer(2)]], device float* mix [[buffer(3)]],
+                       device float* fr [[buffer(4)]], constant uint4& dm [[buffer(5)]],
+                       constant DsP& d [[buffer(14)]], constant IP& p [[buffer(15)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float sh[32];
+    threadgroup float mixv[4096];
+    const uint r = tg.x, j = tg.y, H = p.H, nt = nt_v.x, ntap = dm.x, rows = dm.y, nmix = dm.z, frc = dm.w;
+    float ss = 0.0f;
+    for (uint i = tid; i < H; i += nt) {
+        float v = 0.0f;
+        for (uint k = 0u; k < ntap; ++k) v = fma(alpha[j * ntap + k], tap[((ulong)k * rows + r) * H + i], v);
+        mixv[i] = v;
+        ss = fma(v, v, ss);
+    }
+    ss = tg_sum(ss, sh, tid, nt);
+    const float inv = rsqrt(ss / (float)H + d.eps);
+    device const float* nw = norms + (ulong)j * H;
+    if (j == nmix - 1u) {
+        // a call of more rows than the ring: only its last frc rows land
+        if (r + frc < p.n) return;
+        device float* o = fr + (ulong)((d.pos0 + r) % frc) * H;
+        for (uint i = tid; i < H; i += nt) o[i] = mixv[i] * inv * nw[i];
+        return;
+    }
+    const ulong base = ((ulong)j * rows + r) * H;
+    for (uint i = tid; i < H; i += nt) mix[base + i] = mixv[i] * inv * nw[i];
+}
+
+// A call's context keys and values into a drafter layer's cache: k =
+// rope(rms_head(k_ctx·mix)·knorm, pos), v = v_ctx·mix, f16 at cell pos (a ring:
+// pos % cap). Grid (n, NKV), HD threads.
+kernel void ink_ds_ctx(device const float* yk [[buffer(0)]], device const float* yv [[buffer(1)]],
+                       device const float* knorm [[buffer(2)]], device half* kc [[buffer(3)]],
+                       device half* vc [[buffer(4)]], constant DsP& d [[buffer(14)]], constant IP& p [[buffer(15)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup float sh[32];
+    threadgroup float sv[256];
+    const uint r = tg.x, g = tg.y, HD = p.HD, C = p.NKV * HD, pos = d.pos0 + r;
+    const ulong at = (ulong)r * C + g * HD + tid;
+    const float k = yk[at];
+    const float n2 = tg_sum(k * k, sh, tid, HD);
+    const float kr = ds_rope(k * rsqrt(n2 / (float)HD + d.eps) * knorm[tid], sv, tid, pos, d.theta, HD);
+    const uint cell = d.ring != 0u ? pos % d.cap : pos;
+    kc[(ulong)cell * C + g * HD + tid] = (half)kr;
+    vc[(ulong)cell * C + g * HD + tid] = (half)yv[at];
+}
+
+// The block's queries (heads < NH) normed and rotated in place, its keys normed,
+// rotated and with the values written at cells pos0 + r. Grid (B, NH + NKV), HD.
+kernel void ink_ds_qk(device float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                      device const float* v [[buffer(2)]], device const float* qnorm [[buffer(3)]],
+                      device const float* knorm [[buffer(4)]], device half* kc [[buffer(5)]],
+                      device half* vc [[buffer(6)]], constant DsP& d [[buffer(14)]], constant IP& p [[buffer(15)]],
+                      uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup float sh[32];
+    threadgroup float sv[256];
+    const uint r = tg.x, h = tg.y, HD = p.HD, NH = p.NH, pos = d.pos0 + r;
+    if (h < NH) {
+        const ulong at = ((ulong)r * NH + h) * HD + tid;
+        const float x = q[at];
+        const float n2 = tg_sum(x * x, sh, tid, HD);
+        q[at] = ds_rope(x * rsqrt(n2 / (float)HD + d.eps) * qnorm[tid], sv, tid, pos, d.theta, HD);
+        return;
+    }
+    const uint g = h - NH, C = p.NKV * HD;
+    const ulong at = (ulong)r * C + g * HD + tid;
+    const float x = k[at];
+    const float n2 = tg_sum(x * x, sh, tid, HD);
+    const float kr = ds_rope(x * rsqrt(n2 / (float)HD + d.eps) * knorm[tid], sv, tid, pos, d.theta, HD);
+    const uint cell = d.ring != 0u ? pos % d.cap : pos;
+    kc[(ulong)cell * C + g * HD + tid] = (half)kr;
+    vc[(ulong)cell * C + g * HD + tid] = (half)v[at];
+}
+
+// The block's attention: row r and head h over the cells of positions [lo,
+// pos0 + B) (lo = pos0 − window for a sliding layer, else 0): the context and
+// every block row. Grid (NH, B), 256 threads (8 simdgroups over the keys).
+kernel void ink_ds_attn(device const float* q [[buffer(0)]], device const half* kc [[buffer(1)]],
+                        device const half* vc [[buffer(2)]], device float* out [[buffer(3)]],
+                        constant DsP& d [[buffer(14)]], constant IP& p [[buffer(15)]],
+                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float wm[8], wl[8];
+    threadgroup float wacc[8][128];
+    const uint h = tg.x, r = tg.y, HD = p.HD, NH = p.NH, C = p.NKV * HD, g = h / (NH / p.NKV);
+    const uint pos0 = d.pos0;
+    const uint lo = d.win > 0u ? (pos0 > d.win ? pos0 - d.win : 0u) : 0u, hi = pos0 + d.B;
+    device const float4* qr = (device const float4*)(q + ((ulong)r * NH + h) * HD) + lane;
+    const float4 qv = *qr;
+    const float scale = rsqrt((float)HD);
+    float4 acc = float4(0.0f);
+    float m = -3.0e38f, l = 0.0f;
+    for (uint ps = lo + sg; ps < hi; ps += 8u) {
+        const uint cell = d.ring != 0u ? ps % d.cap : ps;
+        device const half4* kr = (device const half4*)(kc + (ulong)cell * C + g * HD) + lane;
+        const float s = simd_sum(dot(qv, float4(*kr))) * scale;
+        const float mn = max(m, s);
+        const float c = exp(m - mn), e = exp(s - mn);
+        l = l * c + e;
+        device const half4* vr = (device const half4*)(vc + (ulong)cell * C + g * HD) + lane;
+        acc = acc * c + e * float4(*vr);
+        m = mn;
+    }
+    if (lane == 0u) {
+        wm[sg] = m;
+        wl[sg] = l;
+    }
+    wacc[sg][lane * 4u] = acc.x;
+    wacc[sg][lane * 4u + 1u] = acc.y;
+    wacc[sg][lane * 4u + 2u] = acc.z;
+    wacc[sg][lane * 4u + 3u] = acc.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = -3.0e38f;
+    for (uint i = 0u; i < 8u; ++i) M = max(M, wm[i]);
+    float L = 0.0f;
+    for (uint i = 0u; i < 8u; ++i) L += wl[i] * exp(wm[i] - M);
+    for (uint i = tid; i < HD; i += 256u) {
+        float a = 0.0f;
+        for (uint k = 0u; k < 8u; ++k) a += wacc[k][i] * exp(wm[k] - M);
+        out[((ulong)r * NH + h) * HD + i] = a / L;
+    }
+}
+
+// SwiGLU of the drafter's MLP: a[r][i] = silu(g)·u. Grid (inter/256, B), 256.
+kernel void ink_ds_act(device const float* gb [[buffer(0)]], device const float* ub [[buffer(1)]],
+                       device float* ab [[buffer(2)]], constant uint& inter [[buffer(3)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const uint i = tg.x * 256u + tid, r = tg.y;
+    if (i >= inter) return;
+    const ulong at = (ulong)r * inter + i;
+    const float g = gb[at];
+    ab[at] = g / (1.0f + exp(-g)) * ub[at];
+}
+
+// y[r][o] = W[o·ws + off .. + H]·x[r]: a column range of an f32 matrix, a
+// simdgroup an output. fm = (rows, ws, off, H). Grid (rows/8, n), 256.
+kernel void ink_ds_fmv(device const float* W [[buffer(0)]], device const float* x [[buffer(1)]],
+                       device float* y [[buffer(2)]], constant uint4& fm [[buffer(3)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]])
+{
+    const uint o = tg.x * 8u + sg, r = tg.y;
+    if (o >= fm.x) return;
+    const float acc = simd_sum(row_dot(W + (ulong)o * fm.y + fm.z, x + (ulong)r * fm.w, fm.w, lane));
+    if (lane == 0u) y[(ulong)r * fm.x + o] = acc;
+}
+
+// One step of the Markov head's recurrence (one threadgroup, 3R threads): raw =
+// c_h + c_f + b + W [state ; w1[prev]] (W the first 2R columns of the rnn
+// projection, row stride ws); gate = σ(raw[0:R]), state = gate·state + (1 −
+// gate)·tanh(raw[R:2R]), latent = tanh(raw[2R:3R]).
+kernel void ink_ds_markov(device const float* ch [[buffer(0)]], device const float* cf [[buffer(1)]],
+                          device const float* b [[buffer(2)]], device const float* W [[buffer(3)]],
+                          device float* state [[buffer(4)]], device const uint* prev [[buffer(5)]],
+                          device const half* w1 [[buffer(6)]], device float* lat [[buffer(7)]],
+                          constant uint2& wr [[buffer(8)]],
+                          uint tid [[thread_index_in_threadgroup]], uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float in_[512];
+    threadgroup float raw[768];
+    const uint ws = wr.x, R = wr.y, nt = nt_v.x;
+    const uint pv = prev[0];
+    for (uint j = tid; j < R; j += nt) {
+        in_[j] = state[j];
+        in_[R + j] = (float)w1[(ulong)pv * R + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 3u * R) {
+        device const float* wrow = W + (ulong)tid * ws;
+        float a = ch[tid] + cf[tid] + b[tid];
+        for (uint j = 0u; j < 2u * R; ++j) a = fma(wrow[j], in_[j], a);
+        raw[tid] = a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < R) {
+        const float g = 1.0f / (1.0f + exp(-raw[tid]));
+        state[tid] = g * in_[tid] + (1.0f - g) * tanh(raw[R + tid]);
+        lat[tid] = tanh(raw[2u * R + tid]);
+    }
+}
+
+// A draft's pick and its probability: the first argmax of logits + fold_b
+// into ids[i] and prev (a table's index through map), and the softmax of the
+// soft-capped scores at it into prob[i]. One threadgroup, 1024 threads.
+struct DsPick {
+    uint V, i, map, pad;
+    float cap;
+};
+kernel void ink_ds_pick(device const float* lg [[buffer(0)]], device const float* fb [[buffer(1)]],
+                        device uint* ids [[buffer(2)]], device uint* prev [[buffer(3)]],
+                        constant DsPick& dp [[buffer(4)]], device const uint* map [[buffer(5)]],
+                        device float* prob [[buffer(6)]],
+                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]], uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float bv[32], bm[32], bs[32];
+    threadgroup uint bi[32];
+    const uint V = dp.V, nt = nt_v.x;
+    float best = -3.0e38f, mx = -3.0e38f, sm = 0.0f;
+    uint idx = 0xFFFFFFFFu;
+    for (uint v = tid; v < V; v += nt) {
+        const float x = lg[v] + fb[v];
+        if (x > best) {
+            best = x;
+            idx = v;
+        }
+        // the running log-sum-exp of the capped scores
+        const float y = dp.cap > 0.0f ? dp.cap * tanh(x / dp.cap) : x;
+        if (y > mx) {
+            sm = sm * exp(mx - y) + 1.0f;
+            mx = y;
+        } else {
+            sm += exp(y - mx);
+        }
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) {
+        const float ob = simd_shuffle_xor(best, o);
+        const uint oi = simd_shuffle_xor(idx, o);
+        if (ob > best || (ob == best && oi < idx)) {
+            best = ob;
+            idx = oi;
+        }
+        const float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sm, o);
+        const float nm = max(mx, om);
+        sm = sm * exp(mx - nm) + os * exp(om - nm);
+        mx = nm;
+    }
+    if (lane == 0u) {
+        bv[sg] = best;
+        bi[sg] = idx;
+        bm[sg] = mx;
+        bs[sg] = sm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float b = bv[0], M = bm[0], S = bs[0];
+        uint x = bi[0];
+        for (uint k = 1u; k < (nt >> 5u); ++k) {
+            if (bv[k] > b || (bv[k] == b && bi[k] < x)) {
+                b = bv[k];
+                x = bi[k];
+            }
+            const float nm = max(M, bm[k]);
+            S = S * exp(M - nm) + bs[k] * exp(bm[k] - nm);
+            M = nm;
+        }
+        const float yb = dp.cap > 0.0f ? dp.cap * tanh(b / dp.cap) : b;
+        prob[dp.i] = exp(yb - M) / S;
+        const uint tok = dp.map != 0u ? map[x] : x;
+        ids[dp.i] = tok;
+        prev[0] = tok;
+    }
+}
+
+// A verify's greedy picks on the GPU: row r's first argmax into out[r].
+// Grid (n), 1024 threads.
+kernel void ink_argmax(device const float* lg [[buffer(0)]], device uint* out [[buffer(1)]],
+                       constant uint& V [[buffer(2)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                       uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    const uint nt = nt_v.x, r = tg.x;
+    device const float* row = lg + (ulong)r * V;
+    float best = -INFINITY;
+    uint idx = 0xFFFFFFFFu;
+    for (uint v = tid; v < V; v += nt) {
+        const float x = row[v];
+        if (x > best) {
+            best = x;
+            idx = v;
+        }
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) {
+        const float ob = simd_shuffle_xor(best, o);
+        const uint oi = simd_shuffle_xor(idx, o);
+        if (ob > best || (ob == best && oi < idx)) {
+            best = ob;
+            idx = oi;
+        }
+    }
+    if (lane == 0u) {
+        bv[sg] = best;
+        bi[sg] = idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float b = bv[0];
+        uint x = bi[0];
+        for (uint k = 1u; k < (nt >> 5u); ++k) {
+            if (bv[k] > b || (bv[k] == b && bi[k] < x)) {
+                b = bv[k];
+                x = bi[k];
+            }
+        }
+        out[r] = x;
+    }
+}
+
+// A q8_2f matrix over up to 8 rows (`p.n`) on the matrix unit — the drafter's
+// block: x·col (`ink_xcol`) staged as half, a weight converted once, the
+// 8×8×8 products on the simdgroup matrices, 64 matrix rows a threadgroup
+// (`q4tp_mul_mm_n8`'s tiling); `p.V` adds into y. Grid rows/64, 128 threads;
+// cols % 64 == 0.
+kernel void ink_q8mm8(device const char* q [[buffer(0)]], device const float* xc [[buffer(1)]],
+                      device const float* rs [[buffer(2)]], device float* y [[buffer(3)]],
+                      constant uint& cols [[buffer(4)]], constant uint& rows [[buffer(5)]],
+                      constant IP& p [[buffer(15)]],
+                      uint tiitg [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]],
+                      uint tg [[threadgroup_position_in_grid]])
+{
+    // sa: [kb 8][row 64][k 8] halves; sb: [kb 8][b 8][k 8]
+    threadgroup half sa[8u * 512u];
+    threadgroup half sb[8u * 64u];
+    threadgroup float* sc = (threadgroup float*)sa;
+    const uint nb = p.n;
+    const uint r0 = tg * 64u;
+    const uint lr = tiitg >> 1u, il = tiitg & 1u;
+    const uint r = min(r0 + lr, rows - 1u);
+    device const uint4* wrow = (device const uint4*)(q + (ulong)r * cols) + il * 2u;
+    const uint xb = tiitg >> 3u, xkb = tiitg & 7u;
+    const bool xrole = tiitg < 64u && xb < nb;
+    device const float4* xrow = (device const float4*)(xc + (ulong)xb * cols + xkb * 8u);
+    threadgroup half* my_sa = sa + (4u * il) * 512u + lr * 8u;
+    threadgroup half* my_sb = sb + xkb * 64u + xb * 8u;
+    if (tiitg < 64u && !xrole) {
+        *(threadgroup uint4*)(my_sb) = uint4(0u);
+    }
+    simdgroup_half8x8 ma0, ma1, mb;
+    simdgroup_float8x8 mc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 mc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint niter = cols >> 6u;
+    for (uint it = 0u; it < niter; ++it) {
+        // this thread's 32 weights of the chunk (two 16 B loads) and its x slice
+        const uint4 w0 = wrow[it * 4u], w1 = wrow[it * 4u + 1u];
+        float4 xv0 = float4(0.0f), xv1 = float4(0.0f);
+        if (xrole) {
+            xv0 = xrow[it * 16u];
+            xv1 = xrow[it * 16u + 1u];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            const char4 a = as_type<char4>(ws[2u * j]), b = as_type<char4>(ws[2u * j + 1u]);
+            *(threadgroup half4*)(my_sa + j * 512u) = half4(a);
+            *(threadgroup half4*)(my_sa + j * 512u + 4u) = half4(b);
+        }
+        if (xrole) {
+            *(threadgroup half4*)(my_sb) = half4(xv0);
+            *(threadgroup half4*)(my_sb + 4u) = half4(xv1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* la = sa + sgitg * 128u;
+        #pragma clang loop unroll(full)
+        for (short kb = 0; kb < 8; ++kb) {
+            simdgroup_load(mb, sb + kb * 64, 8, ulong2(0, 0), true);
+            simdgroup_load(ma0, la + kb * 512, 8, ulong2(0, 0), false);
+            simdgroup_load(ma1, la + kb * 512 + 64, 8, ulong2(0, 0), false);
+            simdgroup_multiply_accumulate(mc0, ma0, mb, mc0);
+            simdgroup_multiply_accumulate(mc1, ma1, mb, mc1);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* my_sc = sc + sgitg * 128u;
+    simdgroup_store(mc0, my_sc, 8, ulong2(0, 0), false);
+    simdgroup_store(mc1, my_sc + 64, 8, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint orow = r0 + lr;
+    if (orow < rows) {
+        threadgroup const float* src = sc + (lr >> 4u) * 128u + (lr & 15u) * 8u;
+        const float s = rs[orow];
+        for (uint b = il * 4u; b < min(il * 4u + 4u, nb); ++b) {
+            const ulong at = (ulong)b * rows + orow;
+            const float v = src[b] * s;
+            y[at] = p.V != 0u ? y[at] + v : v;
+        }
     }
 }
