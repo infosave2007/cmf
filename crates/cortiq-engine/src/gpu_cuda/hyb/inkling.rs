@@ -57,6 +57,13 @@ fn attn_gemm_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_PERSIST=0`: a decode row's expert matvecs a block a place
+/// (a partial last wave) instead of a resident grid taking the places in turn.
+fn persist_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_PERSIST").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_FLASH=0`: a prompt call's attention through the cuBLAS score
 /// products (`attn_gemm`) instead of `ink_attn_flash`.
 fn flash_on() -> bool {
@@ -2139,9 +2146,27 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
             None => fx.mmp[nt_of(n)][t][1],
         };
         let xs_i = hidden as i32;
-        c.launch(pick(l.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?;
+        // a decode row's experts as a resident grid (q4tp / int8): no partial last wave
+        let res = |kd: Option<usize>| match kd {
+            Some(dd) if n == 1 && t == 0 && dd < 2 && persist_on() && fx.mmpkg_res[dd] > 0 => Some((fx.mmpkg[dd], fx.mmpkg_res[dd])),
+            _ => None,
+        };
+        let (nbg, nbd) = (s_n as u32 * bpg, s_n as u32 * bpd);
+        match res(l.kd.0) {
+            Some((fg, rb)) => {
+                let nb_i = nbg as i32;
+                c.launch(fg, (nbg.min(rb), 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi, nb_i))?
+            }
+            None => c.launch(pick(l.kd.0), (nbg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?,
+        }
         st(c, 12, tp)?;
-        c.launch(pick(l.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?;
+        match res(l.kd.1) {
+            Some((fd, rb)) => {
+                let nb_i = nbd as i32;
+                c.launch(fd, (nbd.min(rb), 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i, nb_i))?
+            }
+            None => c.launch(pick(l.kd.1), (nbd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?,
+        }
         st(c, 13, tp)?;
         if !fuse {
             cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;

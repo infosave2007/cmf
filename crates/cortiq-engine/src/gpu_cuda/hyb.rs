@@ -204,6 +204,11 @@ pub(super) struct HFuncs {
     /// `hy_mmpkp_1_1_{8,16}_{6,5}`: a decode row's fixed-job launch with its
     /// weights prefetched before the dependent-launch wait (q4tp, int8)
     mmpkp: [[cs::CUfunction; 2]; 2],
+    /// `hy_mmpkg_1_1_16_{6,5}`: a decode row's launch as a resident grid
+    /// (its blocks take the launch's places in turn), and the blocks the
+    /// device holds of each
+    mmpkg: [cs::CUfunction; 2],
+    mmpkg_res: [u32; 2],
     /// The grouped experts' launches: `hy_mmp_8_2_8` (32 rows a job), `hy_mmp_16_1_8` (64).
     mmp_g: [cs::CUfunction; 2],
 
@@ -351,10 +356,14 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
             mmpkp[ki][di] = func(module, &format!("hy_mmpkp_1_1_{ks}_{kd}"))?;
         }
     }
+    let mmpkg = [func(module, "hy_mmpkg_1_1_16_6")?, func(module, "hy_mmpkg_1_1_16_5")?];
+    let mmpkg_res = [super::resident_blocks(mmpkg[0], 512), super::resident_blocks(mmpkg[1], 512)];
     Ok(HFuncs {
         mmp,
         mmpk,
         mmpkp,
+        mmpkg,
+        mmpkg_res,
         mmp_g: [func(module, "hy_mmp_8_2_8")?, func(module, "hy_mmp_16_1_8")?],
 
         moe_topk: func(module, "hy_moe_topk")?,

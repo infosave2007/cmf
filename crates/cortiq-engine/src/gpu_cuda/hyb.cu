@@ -835,8 +835,10 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 template <int NT, int TB, int KS, int KD, bool PF = false>
 __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njobs, const u16* __restrict__ x0,
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
-                                         int nrows_in, int cols)
+                                         int nrows_in, int cols, int vb = -1)
 {
+    // the block's place in the launch (a resident grid's turn: `vb`)
+    const int bid = vb >= 0 ? vb : (int)blockIdx.x;
     __shared__ float part[KS][TB][NT][32][2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     // the block's job: the last whose first block is at most this one — up
@@ -846,13 +848,13 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     int jx = 0;
     if (njobs <= 32) {
         const int b0 = lane < njobs ? jobs[lane].blk0 : 0x7fffffff;
-        const unsigned m = __ballot_sync(FULL, b0 <= (int)blockIdx.x);
+        const unsigned m = __ballot_sync(FULL, b0 <= bid);
         jx = m ? 31 - __clz(m) : 0;
     } else {
         int jhi = njobs - 1;
         while (jx < jhi) {
             const int mid = (jx + jhi + 1) >> 1;
-            if ((int)blockIdx.x >= jobs[mid].blk0) jx = mid;
+            if (bid >= jobs[mid].blk0) jx = mid;
             else jhi = mid - 1;
         }
     }
@@ -860,7 +862,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     // an empty job (a dead MoE slot, a grouped launch's spare) has no blocks' work
     if (jb.rows <= 0) return;
     const int nrows = jb.nr > 0 ? min(nrows_in, jb.nr) : nrows_in;
-    const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
+    const int tile0 = (bid - jb.blk0) * TB;
     const int rows = jb.rows;
     const int ntile = (rows + 15) >> 4;
     // kind 5: int8 tiles, a row's scale its one number (aux1), the column
@@ -1154,6 +1156,20 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         mmp_body<1, 1, KS, KD, true>(j, nj, x0, x1, x2, xstride, n, cols);                                      \
     }
 MMPKP(8, 6) MMPKP(16, 6) MMPKP(8, 5) MMPKP(16, 5)
+// a decode row's launch as a resident grid: the blocks take the launch's
+// `nblk` places in turn (no partial last wave)
+#define MMPKG(KS, KD)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(32 * KS) hy_mmpkg_1_1_##KS##_##KD(                             \
+        const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
+        const u16* __restrict__ x2, int xstride, int n, int cols, int nblk)                                     \
+    {                                                                                                           \
+        PDL_PRO();                                                                                              \
+        for (int vb = blockIdx.x; vb < nblk; vb += gridDim.x) {                                                 \
+            mmp_body<1, 1, KS, KD>(j, nj, x0, x1, x2, xstride, n, cols, vb);                                    \
+            __syncthreads();                                                                                    \
+        }                                                                                                       \
+    }
+MMPKG(16, 6) MMPKG(16, 5)
 MMPK4(6)
 MMPK4(5)
 MMPK4(3)

@@ -1097,6 +1097,23 @@ pub(crate) fn cc_major() -> u32 {
     CC_MAJOR.load(Ordering::SeqCst)
 }
 
+/// The device's multiprocessors; 0 before the context.
+static SM_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn sm_count() -> u32 {
+    SM_COUNT.load(Ordering::SeqCst)
+}
+
+/// Blocks of `f` (`threads` each, no dynamic shared memory) the whole device
+/// holds at once; 0 when the driver cannot say.
+pub(crate) fn resident_blocks(f: cs::CUfunction, threads: u32) -> u32 {
+    let mut nb: std::os::raw::c_int = 0;
+    let r = unsafe { cs::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut nb, f, threads as std::os::raw::c_int, 0) };
+    if r != cs::CUresult::CUDA_SUCCESS || nb <= 0 {
+        return 0;
+    }
+    nb as u32 * sm_count()
+}
+
 pub(crate) fn pdl_set(on: bool) {
     PDL_ON.store(on, Ordering::SeqCst);
 }
@@ -1181,6 +1198,7 @@ fn init() -> Res<Ctx> {
     let major = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
     let minor = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
     CC_MAJOR.store(major as u32, Ordering::SeqCst);
+    SM_COUNT.store(attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) as u32, Ordering::SeqCst);
     let arch = match (major, minor) {
         (7, 5) => Some("compute_75"),
         (8, 0) => Some("compute_80"),
