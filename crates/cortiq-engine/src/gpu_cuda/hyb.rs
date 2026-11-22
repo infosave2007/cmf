@@ -204,6 +204,11 @@ pub(super) struct HFuncs {
     /// `hy_mmpkp_1_1_{8,16}_{6,5}`: a decode row's fixed-job launch with its
     /// weights prefetched before the dependent-launch wait (q4tp, int8)
     mmpkp: [[cs::CUfunction; 2]; 2],
+    /// A narrow q4tp matrix (fewer tiles than multiprocessors) 32 warps a tile,
+    /// one tile a block, at every window size (the sum's order is KS's):
+    /// `hy_mmpkp_1_1_32_6` (a decode row, weights before the wait), then
+    /// `hy_mmpk_{1,2,4}_1_32_6`
+    mmpk32: [cs::CUfunction; 4],
     /// `hy_mmpkg_1_1_16_{6,5}`: a decode row's launch as a resident grid
     /// (its blocks take the launch's places in turn), and the blocks the
     /// device holds of each
@@ -366,10 +371,12 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     }
     let mmpkg = [func(module, "hy_mmpkg_1_1_16_6")?, func(module, "hy_mmpkg_1_1_16_5")?];
     let mmpkg_res = [super::resident_blocks(mmpkg[0], 512), super::resident_blocks(mmpkg[1], 512)];
+    let mmpk32 = [func(module, "hy_mmpkp_1_1_32_6")?, func(module, "hy_mmpk_1_1_32_6")?, func(module, "hy_mmpk_2_1_32_6")?, func(module, "hy_mmpk_4_1_32_6")?];
     Ok(HFuncs {
         mmp,
         mmpk,
         mmpkp,
+        mmpk32,
         mmpkg,
         mmpkg_res,
         mmp_g: [func(module, "hy_mmp_8_2_8")?, func(module, "hy_mmp_16_1_8")?],
@@ -879,13 +886,17 @@ impl MmaSet {
     unsafe fn run_tiles(&self, c: &Ctx, fx: &HFuncs, p: &Planes, cols: usize, n: usize) -> Res<()> {
         // one codec's decode row takes one tile a block at any height (A5000,
         // q4tp 5120 x 17408: 76.7 against 80.5 us; 10240 x 5120 49.3 / 56.3)
-        let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
+        // a narrow q4tp matrix: 32 warps a tile at any window size, so a verify
+        // row sums as a decode row (`CMF_HYB_KS32=0` off)
+        let narrow = n <= NMAX && self.kd == Some(0) && decode_ks().is_none() && ks32_on() && super::sm_count() > 0 && self.blocks[0] < super::sm_count();
+        let tb = if narrow || self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
         let k16 = match decode_ks() {
             Some(k) if self.kd.is_some() && n <= NMAX => k == 16,
             _ => self.ks16,
         };
-        let ks = if k16 { 16 } else { 8 };
+        let ks = if narrow { 32 } else if k16 { 16 } else { 8 };
         let f = match self.kd {
+            Some(_) if narrow => fx.mmpk32[if n == 1 && pf_on() { 0 } else { 1 + nt_of(n) }],
             // q4tp / int8 (KDS 0 / 1): the weights ahead of the wait
             Some(d) if n == 1 && tb == 1 && d < 2 && pf_on() => fx.mmpkp[k16 as usize][d],
             Some(d) => fx.mmpk[nt_of(n)][tb - 1][k16 as usize][d],
@@ -919,6 +930,12 @@ impl MmaSet {
 pub(super) fn decode_ks() -> Option<usize> {
     static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("CMF_HYB_KS").ok().and_then(|v| v.parse().ok()).filter(|&k| k == 8 || k == 16))
+}
+
+/// `CMF_HYB_KS32=0`: a narrow matrix's decode row 16 warps a tile, not 32.
+fn ks32_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_HYB_KS32").as_deref() != Ok("0"))
 }
 
 /// `CMF_HYB_PF=0`: a decode row's matrix-set matvec without its weights

@@ -1209,6 +1209,9 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         mmp_body<1, 1, KS, KD, true>(j, nj, x0, x1, x2, xstride, n, cols);                                      \
     }
 MMPKP(8, 6) MMPKP(16, 6) MMPKP(8, 5) MMPKP(16, 5)
+// a narrow matrix's decode row (fewer tiles than multiprocessors): 32 warps a
+// tile, fewer groups a warp
+MMPKP(32, 6) MMPK(1, 1, 32, 6) MMPK(2, 1, 32, 6) MMPK(4, 1, 32, 6)
 // a decode row's launch as a resident grid: the blocks take the launch's
 // `nblk` places in turn (no partial last wave)
 #define MMPKG(KS, KD)                                                                                           \
