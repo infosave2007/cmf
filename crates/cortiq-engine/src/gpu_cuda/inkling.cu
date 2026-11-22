@@ -52,9 +52,21 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
 // q·s / √H, and the weighted sum of the normed states. Grid (nq, n), 256
 // threads. out[qi * ostride + r * H + i].
 #define MAXS 8
+// Programmatic dependent launch (CMF_INKLING_PDL=1, sm_90+): a kernel launched with the attribute may start while
+// its predecessor drains; it first waits for the predecessor to finish and flush, then lets its own successor launch.
+// Without the attribute both are no-ops.
+#ifndef PDL_PRO
+#if __CUDA_ARCH__ >= 900
+#define PDL_PRO() do { asm volatile("griddepcontrol.wait;" ::: "memory"); asm volatile("griddepcontrol.launch_dependents;"); } while (0)
+#else
+#define PDL_PRO() do { } while (0)
+#endif
+#endif
+
 extern "C" __global__ void ink_mix(const float* __restrict__ blk, int nb, int bstride, const float* __restrict__ x,
                                    const float* __restrict__ q, float* __restrict__ out, int ostride)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     __shared__ float lg[MAXS], rn[MAXS];
     const int qi = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
@@ -101,6 +113,7 @@ extern "C" __global__ void ink_mix(const float* __restrict__ blk, int nb, int bs
 extern "C" __global__ void ink_rms(const float* __restrict__ x, const float* __restrict__ w, float eps,
                                    float* __restrict__ xo, u16* __restrict__ p0, u16* __restrict__ p1, int pstride)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int r = blockIdx.x, tid = threadIdx.x;
     const float* xr = x + (size_t)r * H;
@@ -120,6 +133,7 @@ extern "C" __global__ void ink_rms(const float* __restrict__ x, const float* __r
 extern "C" __global__ void ink_gate_down(const float* __restrict__ x, const float* __restrict__ m,
                                          const float* __restrict__ down, int R, float eps, float* __restrict__ d)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int k = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
     const float* xr = x + (size_t)r * H;
@@ -147,6 +161,7 @@ extern "C" __global__ void ink_gate_out(const float* __restrict__ x, const float
                                         const float* __restrict__ d, const float* __restrict__ F,
                                         const float* __restrict__ G, int R, float* __restrict__ out)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), r = blockIdx.y;
     if (i >= H) return;
@@ -171,6 +186,7 @@ extern "C" __global__ void ink_gate_out(const float* __restrict__ x, const float
 extern "C" __global__ void ink_fmv(const float* __restrict__ W, int rows, const float* __restrict__ x,
                                    float* __restrict__ y)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), r = blockIdx.y;
     if (o >= rows) return;
@@ -193,6 +209,7 @@ extern "C" __global__ void ink_qr(float* __restrict__ yq, float* __restrict__ yr
                                   const float* __restrict__ rs, float qclip, float rclip, int full, float alpha,
                                   float floor_, const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
     const float tu = full ? tau_of(cr[0] + r, alpha, floor_) : 1.0f;
@@ -224,6 +241,7 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
                                   float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
                                   float* __restrict__ hv)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int g = blockIdx.x, isv = blockIdx.y, tid = threadIdx.x;
     // the call's input rows kept (a draft verify rolls the ring back to a prefix)
@@ -275,6 +293,7 @@ extern "C" __global__ void ink_attn(const float* __restrict__ yq, const float* _
                                     const u16* __restrict__ kc, const u16* __restrict__ vc, int ring, int win,
                                     float scale, float* __restrict__ out, const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float bias[1024];
     __shared__ float qs[HD];
     __shared__ float wm[8], wl[8];
@@ -356,6 +375,7 @@ extern "C" __global__ void ink_attn_split(const float* __restrict__ yq, const fl
                                           const u16* __restrict__ vc, int ring, int win, float scale,
                                           float* __restrict__ part, int splits, const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float bias[AT];
     __shared__ float wm[8], wl[8];
     __shared__ float wacc[8][HD];
@@ -437,6 +457,7 @@ extern "C" __global__ void ink_attn_split(const float* __restrict__ yq, const fl
 extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
                                           int win, float* __restrict__ out, const int* __restrict__ cr)
 {
+    PDL_PRO();
     const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
     const int pos = cr[0] + r;
     const int first = win > 0 ? max(0, pos + 1 - win) : 0;
@@ -459,6 +480,7 @@ extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int sp
 extern "C" __global__ void ink_ogate(const float* __restrict__ o, const float* __restrict__ gt, u16* __restrict__ p0,
                                      u16* __restrict__ p1, int pstride)
 {
+    PDL_PRO();
     const int W = NH * HD;
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= W) return;
@@ -475,6 +497,7 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
                                     float* __restrict__ ring, const float* __restrict__ res, float* __restrict__ blk,
                                     int bslot, int bstride, float* __restrict__ out, int n, float* __restrict__ ho)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= H) return;
     float hist[KC];
@@ -515,6 +538,7 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
 extern "C" __global__ void ink_h16(const u16* __restrict__ p0, const u16* __restrict__ p1, u16* __restrict__ out,
                                    int total)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = f2h(__fadd_rn(bf2f(p0[i]), bf2f(p1[i])));
 }
@@ -529,6 +553,7 @@ extern "C" __global__ void ink_kv_rows(const float* __restrict__ yk, const float
                                        u16* __restrict__ kc, u16* __restrict__ vc, int ring, float qclip, float eps,
                                        const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int g = blockIdx.x % NKV, isv = blockIdx.x / NKV, j = blockIdx.y, tid = threadIdx.x;
     const int C = NKV * HD, ch = g * HD + tid;
@@ -560,6 +585,7 @@ extern "C" __global__ void ink_kv_rows(const float* __restrict__ yk, const float
 // y [n][C]. Grid C/256.
 extern "C" __global__ void ink_ring_rows(const float* __restrict__ y, float* __restrict__ ring, int C, int n)
 {
+    PDL_PRO();
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= C) return;
     float nv[KC];
@@ -575,6 +601,7 @@ extern "C" __global__ void ink_post_rows(const float* __restrict__ a, const floa
                                          const float* __restrict__ ring, const float* __restrict__ res,
                                          float* __restrict__ blk, int bslot, int bstride, float* __restrict__ out)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
     if (i >= H) return;
     const float* tp = taps + (size_t)i * KC;
@@ -603,6 +630,7 @@ extern "C" __global__ void ink_post_rows(const float* __restrict__ a, const floa
 extern "C" __global__ void ink_gate_norm(const float* __restrict__ x, const float* __restrict__ m, float eps,
                                          float* __restrict__ xn)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int r = blockIdx.x, tid = threadIdx.x;
     const float* xr = x + (size_t)r * H;
@@ -627,6 +655,7 @@ extern "C" __global__ void ink_gate_mix(const float* __restrict__ x, const float
                                         const float* __restrict__ f, const float* __restrict__ g,
                                         float* __restrict__ out, int total)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = (1.0f - tanhf(f[i])) * x[i] + tanhf(g[i]) * m[i];
 }
@@ -639,6 +668,7 @@ extern "C" __global__ void ink_gate_mix(const float* __restrict__ x, const float
 // tensor cores.
 extern "C" __global__ void ink_f16(const float* __restrict__ x, u16* __restrict__ out, int total)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = f2h(x[i]);
 }
@@ -651,6 +681,7 @@ extern "C" __global__ void ink_attn_soft(float* __restrict__ S, u16* __restrict_
                                          int nk, int ring, int win, float scale, int rows, int r0, int nall,
                                          const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     const int r = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
     const int row = r0 + r;
@@ -729,6 +760,7 @@ struct HyJob {
 extern "C" __global__ void ink_gather16(const float* __restrict__ x, const int* __restrict__ src, int total,
                                         u16* __restrict__ out)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const int q = i / H, c = i - q * H;
@@ -765,6 +797,7 @@ __device__ __forceinline__ void mma16816h(float* c, u32 a0, u32 a1, u32 a2, u32 
 extern "C" __global__ void ink_moe_mma(const HyJob* __restrict__ jobs, const u16* __restrict__ x, int cols, int pair,
                                        u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride)
 {
+    PDL_PRO();
     const HyJob jb = jobs[blockIdx.y];
     if (jb.rows <= 0 || jb.nr <= 0) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
@@ -885,6 +918,7 @@ template <int N> __device__ __forceinline__ void cp_wait()
 extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __restrict__ jobs, const u16* __restrict__ x, int cols, int pair,
                                                              u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride)
 {
+    PDL_PRO();
     __shared__ __align__(16) u16 xs[MS][NTL * 8][XROW];
     const HyJob jb = jobs[blockIdx.y];
     if (jb.rows <= 0 || jb.nr <= 0) return;
@@ -1023,6 +1057,7 @@ struct RingRef {
 };
 extern "C" __global__ void ink_ring_snap(const RingRef* __restrict__ t)
 {
+    PDL_PRO();
     const RingRef e = t[blockIdx.y];
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= e.width) return;
@@ -1031,6 +1066,7 @@ extern "C" __global__ void ink_ring_snap(const RingRef* __restrict__ t)
 }
 extern "C" __global__ void ink_ring_back(const RingRef* __restrict__ t, int r)
 {
+    PDL_PRO();
     const RingRef e = t[blockIdx.y];
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= e.width) return;
@@ -1066,6 +1102,7 @@ extern "C" __global__ void ink_ds_mix(const float* __restrict__ tap, int ntap, i
                                       u16* __restrict__ p1, u16* __restrict__ h16, float* __restrict__ fr, int fr_cap,
                                       const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     __shared__ float mixv[H];
     const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
@@ -1101,6 +1138,7 @@ extern "C" __global__ void ink_ds_ctx(const float* __restrict__ yk, const float*
                                       const float* __restrict__ knorm, float eps, float theta, u16* __restrict__ kc,
                                       u16* __restrict__ vc, int cap, int ring, const int* __restrict__ cr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     __shared__ float sv[HD];
     const int r = blockIdx.x, g = blockIdx.y, i = threadIdx.x;
@@ -1123,6 +1161,7 @@ extern "C" __global__ void ink_ds_qk(float* __restrict__ q, const float* __restr
                                      float theta, u16* __restrict__ kc, u16* __restrict__ vc, int cap, int ring,
                                      const int* __restrict__ dcr)
 {
+    PDL_PRO();
     __shared__ float sh[32];
     __shared__ float sv[HD];
     const int r = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
@@ -1152,6 +1191,7 @@ extern "C" __global__ void ink_ds_attn(const float* __restrict__ q, const u16* _
                                        const u16* __restrict__ vc, int cap, int ring, int window, int B,
                                        float* __restrict__ out, const int* __restrict__ dcr)
 {
+    PDL_PRO();
     __shared__ float wm[8], wl[8];
     __shared__ float wacc[8][HD];
     const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -1205,6 +1245,7 @@ extern "C" __global__ void ink_ds_attn(const float* __restrict__ q, const u16* _
 // f32 rows into the tensor-core planes. Grid (total / 256).
 extern "C" __global__ void ink_planes(const float* __restrict__ x, u16* __restrict__ p0, u16* __restrict__ p1, int total)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) put2(p0, p1, i, x[i]);
 }
@@ -1217,6 +1258,7 @@ extern "C" __global__ void ink_ds_markov(const float* __restrict__ ch, const flo
                                          float* __restrict__ state, const int* __restrict__ prev,
                                          const u16* __restrict__ w1, u16* __restrict__ lp0, u16* __restrict__ lp1)
 {
+    PDL_PRO();
     extern __shared__ float smem[];
     float* in = smem;          // [2R]: state, w1[prev]
     float* raw = smem + 2 * R; // [3R]
@@ -1246,6 +1288,7 @@ extern "C" __global__ void ink_ds_markov(const float* __restrict__ ch, const flo
 extern "C" __global__ void ink_ds_pick(const float* __restrict__ lg, const float* __restrict__ fb, int V, int i,
                                        int* __restrict__ ids, int* __restrict__ prev)
 {
+    PDL_PRO();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -1287,6 +1330,7 @@ extern "C" __global__ void ink_ds_pick(const float* __restrict__ lg, const float
 // The head's logits capped: cap · tanh(x / cap). Grid (V/256, n).
 extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= V) return;
     const size_t at = (size_t)r * V + i;
@@ -1297,6 +1341,7 @@ extern "C" __global__ void ink_softcap(float* __restrict__ lg, int V, float cap)
 // index of the largest value, as the host's argmax takes it.
 extern "C" __global__ void ink_argmax_rows(const float* __restrict__ lg, int V, int* __restrict__ ids)
 {
+    PDL_PRO();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const float* r = lg + (size_t)blockIdx.x * V;

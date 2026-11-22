@@ -37,24 +37,44 @@ kernel void ink_mix(device const float* blk [[buffer(0)]], device const float* x
     const uint2 tg = tg_v.xy;
     const uint nt = nt_v.x;
 
-    threadgroup float sh[32];
+    threadgroup float sh2[32][16];
     threadgroup float lg[8], rn[8];
     const uint qi = tg.x, r = tg.y, H = p.H, nb = p.nb, ns = nb + 1u;
     device const float* qv = q + (ulong)qi * H;
+    // every state's squares and dot product in one pass, their sums through
+    // one exchange (tg_sum's order: a simdgroup's sum, then the simdgroups')
+    float ss[8], dt[8];
+    for (uint s = 0u; s < ns; ++s) {
+        ss[s] = 0.0f;
+        dt[s] = 0.0f;
+    }
     for (uint s = 0u; s < ns; ++s) {
         device const float* sv = s < nb ? blk + (ulong)r * p.bstride + (ulong)s * H : x + (ulong)r * H;
-        float ss = 0.0f, dt = 0.0f;
         for (uint i = tid; i < H; i += nt) {
             float v = sv[i];
-            ss = fma(v, v, ss);
-            dt = fma(v, qv[i], dt);
+            ss[s] = fma(v, v, ss[s]);
+            dt[s] = fma(v, qv[i], dt[s]);
         }
-        ss = tg_sum(ss, sh, tid, nt);
-        dt = tg_sum(dt, sh, tid, nt);
-        if (tid == 0u) {
-            float inv = rsqrt(ss / (float)H + 1e-6f);
+    }
+    const uint lane = tid & 31u, wi = tid >> 5u, nw = (nt + 31u) >> 5u;
+    for (uint s = 0u; s < ns; ++s) {
+        const float a = simd_sum(ss[s]), b = simd_sum(dt[s]);
+        if (lane == 0u) {
+            sh2[wi][2u * s] = a;
+            sh2[wi][2u * s + 1u] = b;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        for (uint s = 0u; s < ns; ++s) {
+            float a = 0.0f, b = 0.0f;
+            for (uint j = 0u; j < nw; ++j) {
+                a += sh2[j][2u * s];
+                b += sh2[j][2u * s + 1u];
+            }
+            float inv = rsqrt(a / (float)H + 1e-6f);
             rn[s] = inv;
-            lg[s] = dt * inv * rsqrt((float)H);
+            lg[s] = b * inv * rsqrt((float)H);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -155,11 +175,17 @@ kernel void ink_gate_down(device const float* x [[buffer(0)]], device const floa
         ax = fma(dw[i], a, ax);
         am = fma(dw[H + i], b, am);
     }
-    sx = tg_sum(sx, sh, tid, nt);
-    sm = tg_sum(sm, sh, tid, nt);
-    ax = tg_sum(ax, sh, tid, nt);
-    am = tg_sum(am, sh, tid, nt);
-    if (tid == 0u) d[(ulong)r * p.R + k] = ax * rsqrt(sx / (float)H + p.eps) + am * rsqrt(sm / (float)H + p.eps);
+    // the four sums through one exchange (tg_sum's order)
+    threadgroup float4 sh4[32];
+    const float4 v4 = float4(simd_sum(sx), simd_sum(sm), simd_sum(ax), simd_sum(am));
+    const uint lane = tid & 31u, w = tid >> 5u, nw = (nt + 31u) >> 5u;
+    if (lane == 0u) sh4[w] = v4;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float4 t = float4(0.0f);
+        for (uint j = 0u; j < nw; ++j) t += sh4[j];
+        d[(ulong)r * p.R + k] = t.z * rsqrt(t.x / (float)H + p.eps) + t.w * rsqrt(t.y / (float)H + p.eps);
+    }
 }
 
 // Second half: a simdgroup an output channel. Grid (H/8, n), 256 threads.
@@ -190,6 +216,26 @@ kernel void ink_gate_out(device const float* x [[buffer(0)]], device const float
 
 // y[r][o] = W[o]·x[r] for an f32 matrix [rows][H]: a simdgroup an output row.
 // Grid (rows/8, n), 256 threads.
+// A lane's share of an f32 row's dot product: float4 loads, two sums in
+// flight (rows 16-byte aligned when H % 4 == 0, else scalar).
+inline float row_dot(device const float* w, device const float* x, uint H, uint lane) {
+    if ((H & 3u) != 0u) {
+        float acc = 0.0f;
+        for (uint i = lane; i < H; i += 32u) acc = fma(w[i], x[i], acc);
+        return acc;
+    }
+    device const float4* w4 = (device const float4*)w;
+    device const float4* x4 = (device const float4*)x;
+    const uint H4 = H >> 2u;
+    float4 a = float4(0.0f), b = float4(0.0f);
+    for (uint i = lane; i < H4; i += 64u) {
+        a = fma(w4[i], x4[i], a);
+        if (i + 32u < H4) b = fma(w4[i + 32u], x4[i + 32u], b);
+    }
+    const float4 t = a + b;
+    return (t.x + t.y) + (t.z + t.w);
+}
+
 kernel void ink_fmv(device const float* W [[buffer(0)]], device const float* x [[buffer(1)]],
                     device float* y [[buffer(2)]], constant IP& p [[buffer(15)]],
                     uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -199,11 +245,7 @@ kernel void ink_fmv(device const float* W [[buffer(0)]], device const float* x [
 
     const uint o = tg.x * 8u + sg, r = tg.y, H = p.H;
     if (o >= p.rows) return;
-    device const float* w = W + (ulong)o * H;
-    device const float* xr = x + (ulong)r * H;
-    float acc = 0.0f;
-    for (uint i = lane; i < H; i += 32u) acc = fma(w[i], xr[i], acc);
-    acc = simd_sum(acc);
+    const float acc = simd_sum(row_dot(W + (ulong)o * H, x + (ulong)r * H, H, lane));
     if (lane == 0u) y[(ulong)r * p.rows + o] = acc;
 }
 
@@ -444,11 +486,7 @@ kernel void ink_router(device const float* W [[buffer(0)]], device const float* 
 
     const uint e = tg.x * 8u + sg, r = tg.y, H = p.H;
     if (e >= p.E) return;
-    device const float* w = W + (ulong)e * H;
-    device const float* xr = x + (ulong)r * H;
-    float acc = 0.0f;
-    for (uint i = lane; i < H; i += 32u) acc = fma(w[i], xr[i], acc);
-    acc = simd_sum(acc);
+    const float acc = simd_sum(row_dot(W + (ulong)e * H, x + (ulong)r * H, H, lane));
     if (lane == 0u) lg[(ulong)r * p.E + e] = acc;
 }
 
@@ -626,6 +664,128 @@ kernel void ink_moe_down(device const uchar* q0 [[buffer(0)]], device const ucha
     }
     if (active && lane == 0u) {
         for (uint ri = 0u; ri < nr; ++ri) y[(ulong)r * H + r0 + ri] = tot[ri];
+    }
+}
+
+// ---- the decode's experts with every lane busy ----
+// `ink_moe_gu` / `ink_moe_down` give a simdgroup's 32 lanes a row block's
+// groups: 72 groups (gate/up) leave a third pass to 8 lanes and 36 (down)
+// a second to 4. Here gate/up splits the lanes into two halves of 16 over
+// four rows each and down into four quarters of 8, a pick each: ~90 % of the
+// lanes in every pass. A group's scale is exp2(lo + code·step) directly.
+
+// One q4tp group of row `row` (`gpr` groups, `codes_off`/`stride` the codes)
+// against x's 32 values pre-scaled by (1, 1/16, 1/256, 1/4096) (`m8` = −8·Σx).
+inline float q4tp_group(device const uchar* w, ulong row, uint gpr, uint g, ulong params_off, ulong codes_off, uint stride,
+                        float4 x0, float4 x1, float4 x2, float4 x3, float4 x4, float4 x5, float4 x6, float4 x7, float m8)
+{
+    const uint4 b = *(device const uint4*)(w + (row * gpr + (ulong)g) * 16ul);
+    const uint bit = g * 5u, cb = bit >> 3u, shf = bit & 7u;
+    device const uchar* cp = w + codes_off + row * (ulong)stride + cb;
+    const uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+    device const half* ph = (device const half*)(w + params_off + row * 4ul);
+    const float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+    const float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                     + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                     + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                     + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+    return scale * (gsum + m8);
+}
+
+#define LOAD_X32(xp)                                                                    \
+    device const float4* xv = (device const float4*)(xp);                               \
+    float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];                              \
+    float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];                              \
+    const float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;                            \
+    const float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);                               \
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);         \
+    x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+
+// Every pick's gate and up rows, eight rows a simdgroup (a half of 16 lanes
+// on four), Inkling's softcapped SwiGLU into act[r][k][inter].
+// Grid (inter/32, topk, n), 128 threads.
+kernel void ink_moe_gu8(device const uchar* q0 [[buffer(0)]], device const uchar* q1 [[buffer(1)]],
+                        device const uchar* q2 [[buffer(2)]], device const uchar* q3 [[buffer(3)]],
+                        device const ulong* bases [[buffer(4)]], device const uint* pick [[buffer(5)]],
+                        device const float* x [[buffer(6)]], device float* act [[buffer(7)]],
+                        constant ulong& wstride [[buffer(8)]], constant IP& p [[buffer(15)]],
+                        uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]])
+{
+    const uint k = tg_v.y, r = tg_v.z, inter = p.inter, gpr = p.H / 32u;
+    const uint e = pick[r * p.topk + k];
+    device const uchar* wg = at_abs(bases[e * 3u], q0, q1, q2, q3, wstride);
+    device const uchar* wu = at_abs(bases[e * 3u + 1u], q0, q1, q2, q3, wstride);
+    const uint hf = lane >> 4u, l16 = lane & 15u;
+    const uint r0 = (tg_v.x * 4u + sg) * 8u + hf * 4u;
+    const uint nr = r0 < inter ? min(inter - r0, 4u) : 0u;
+    const ulong params_off = (ulong)inter * (ulong)gpr * 16ul;
+    const ulong codes_off = params_off + (ulong)inter * 4ul;
+    const uint stride = (gpr * 5u + 7u) / 8u;
+    float ag[4] = {0.0f, 0.0f, 0.0f, 0.0f}, au[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float* xr = x + (ulong)r * p.H;
+    if (nr > 0u) {
+        for (uint g = l16; g < gpr; g += 16u) {
+            LOAD_X32(xr + g * 32u)
+            for (uint ri = 0u; ri < nr; ++ri) {
+                const ulong row = (ulong)(r0 + ri);
+                ag[ri] += q4tp_group(wg, row, gpr, g, params_off, codes_off, stride, x0, x1, x2, x3, x4, x5, x6, x7, m8);
+                au[ri] += q4tp_group(wu, row, gpr, g, params_off, codes_off, stride, x0, x1, x2, x3, x4, x5, x6, x7, m8);
+            }
+        }
+    }
+    for (uint ri = 0u; ri < 4u; ++ri) {
+        for (uint o = 8u; o > 0u; o >>= 1u) {
+            ag[ri] += simd_shuffle_xor(ag[ri], o);
+            au[ri] += simd_shuffle_xor(au[ri], o);
+        }
+    }
+    if (l16 == 0u && nr > 0u) {
+        device float* a = act + ((ulong)r * p.topk + k) * inter;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            const float g = ag[ri], u = au[ri];
+            a[r0 + ri] = (p.cap * tanh(g / p.cap)) * sigm(g) * (p.ucap * tanh(u / p.ucap));
+        }
+    }
+}
+
+// Every row's mixture of its picks' downs, four rows a simdgroup and a pick a
+// quarter of 8 lanes: y[r] = Σ_k w[r][k]·down_e(act[r][k]). Grid (H/16, n), 128.
+kernel void ink_moe_dn8(device const uchar* q0 [[buffer(0)]], device const uchar* q1 [[buffer(1)]],
+                        device const uchar* q2 [[buffer(2)]], device const uchar* q3 [[buffer(3)]],
+                        device const ulong* bases [[buffer(4)]], device const uint* pick [[buffer(5)]],
+                        device const float* wt [[buffer(6)]], device const float* act [[buffer(7)]],
+                        device float* y [[buffer(8)]], constant ulong& wstride [[buffer(9)]],
+                        constant IP& p [[buffer(15)]],
+                        uint3 tg_v [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]])
+{
+    const uint r = tg_v.y, H = p.H, inter = p.inter, gpr = inter / 32u, K = p.topk;
+    const uint qt = lane >> 3u, l8 = lane & 7u;
+    const uint r0 = (tg_v.x * 4u + sg) * 4u;
+    const uint nr = r0 < H ? min(H - r0, 4u) : 0u;
+    const ulong params_off = (ulong)H * (ulong)gpr * 16ul;
+    const ulong codes_off = params_off + (ulong)H * 4ul;
+    const uint stride = (gpr * 5u + 7u) / 8u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (nr > 0u) {
+        for (uint k = qt; k < K; k += 4u) {
+            const uint e = pick[r * K + k];
+            device const uchar* wd = at_abs(bases[e * 3u + 2u], q0, q1, q2, q3, wstride);
+            device const float* xr = act + ((ulong)r * K + k) * inter;
+            float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint g = l8; g < gpr; g += 8u) {
+                LOAD_X32(xr + g * 32u)
+                for (uint ri = 0u; ri < nr; ++ri)
+                    t[ri] += q4tp_group(wd, (ulong)(r0 + ri), gpr, g, params_off, codes_off, stride, x0, x1, x2, x3, x4, x5, x6, x7, m8);
+            }
+            const float w = wt[r * K + k];
+            for (uint ri = 0u; ri < 4u; ++ri) acc[ri] += w * t[ri];
+        }
+    }
+    for (uint ri = 0u; ri < 4u; ++ri) acc[ri] = simd_sum(acc[ri]);
+    if (lane == 0u && nr > 0u) {
+        for (uint ri = 0u; ri < nr; ++ri) y[(ulong)r * H + r0 + ri] = acc[ri];
     }
 }
 

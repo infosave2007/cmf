@@ -109,10 +109,22 @@ struct HyJob {
 
 // Ripple's value residual: lerp(e0, xn, blend) of every row into V's input
 // planes, in the form the host's `vres_lerp` and wgpu's kernel take.
+// Programmatic dependent launch (CMF_INKLING_PDL=1, sm_90+): a kernel launched with the attribute may start while
+// its predecessor drains; it first waits for the predecessor to finish and flush, then lets its own successor launch.
+// Without the attribute both are no-ops.
+#ifndef PDL_PRO
+#if __CUDA_ARCH__ >= 900
+#define PDL_PRO() do { asm volatile("griddepcontrol.wait;" ::: "memory"); asm volatile("griddepcontrol.launch_dependents;"); } while (0)
+#else
+#define PDL_PRO() do { } while (0)
+#endif
+#endif
+
 extern "C" __global__ void hy_vres(const float* __restrict__ xn, const float* __restrict__ e0, float blend, int n,
                                    int hidden, u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2,
                                    int pstride)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * hidden) return;
     const int j = (int)(i / hidden), c = (int)(i % hidden);
@@ -126,6 +138,7 @@ extern "C" __global__ void hy_vres(const float* __restrict__ xn, const float* __
 extern "C" __global__ void hy_vres_half(const float* __restrict__ x, const float* __restrict__ e0, float blend, u64 total,
                                         u16* __restrict__ out)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const float e = e0[i], v = x[i];
@@ -138,6 +151,7 @@ extern "C" __global__ void hy_rmsnorm(const float* __restrict__ x, const float* 
                                       void* __restrict__ out, int n, float eps, int gemma, int half,
                                       u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2, int pstride)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
     const float* xr = x + (size_t)blockIdx.x * n;
@@ -168,6 +182,7 @@ extern "C" __global__ void hy_rmsnorm(const float* __restrict__ x, const float* 
 // f32 -> f16 over n values (saturating).
 extern "C" __global__ void hy_to_half(const float* __restrict__ x, u16* __restrict__ xh, u64 n)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) xh[i] = f2h_sat(x[i]);
 }
@@ -183,6 +198,7 @@ extern "C" __global__ void hy_to_half(const float* __restrict__ x, u16* __restri
 extern "C" __global__ void hy_gdn_ring(float* __restrict__ ring, const float* __restrict__ qkv, int qstride, int n,
                                        int c_dim, int kk)
 {
+    PDL_PRO();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= c_dim || n <= 0) return;
     for (int j = 0; j < kk - 1; j++) {
@@ -204,6 +220,7 @@ extern "C" __global__ void hy_gdn_scan(const float* __restrict__ cq, const float
                                        float* __restrict__ o, int n, int c_dim, int nv, int nk, int dk, int dv,
                                        float* __restrict__ ring, const float* __restrict__ qkv, int qstride, int kk)
 {
+    PDL_PRO();
     // blocks past the state's columns move the conv ring (the front kernel
     // that read it has finished): its last kk-1 rows of [ring, qkv rows]
     const int sblocks = (nv * dv + (blockDim.x >> 5) - 1) / (blockDim.x >> 5);
@@ -332,6 +349,7 @@ extern "C" __global__ void __launch_bounds__(128) hy_gdn_scan4(const float* __re
                                                               const float* __restrict__ qkv, int qstride, int kk,
                                                               float* __restrict__ ssave)
 {
+    PDL_PRO();
     const int sblocks = nv * (dv >> 5);
     if ((int)blockIdx.x >= sblocks) {
         const int c = ((int)blockIdx.x - sblocks) * blockDim.x + threadIdx.x;
@@ -363,6 +381,7 @@ extern "C" __global__ void hy_qk(const float* __restrict__ qraw, int qstride, co
                                  const int* __restrict__ ci, u16* __restrict__ qgh, const float* __restrict__ bq,
                                  const float* __restrict__ bk, const float* __restrict__ bv)
 {
+    PDL_PRO();
     // gemma bit 1: the head's RMS norm after the rotation (HunYuan), its
     // weight then applied to the rotated dims
     const bool late = (gemma & 2) != 0;
@@ -475,6 +494,7 @@ extern "C" __global__ void hy_scores(const float* __restrict__ qg, const u16* __
                                      float scale, int rb, int ncap, int nbcap, int B, const int* __restrict__ ci,
                                      const u32* __restrict__ BM, int bshift, int mw)
 {
+    PDL_PRO();
     __shared__ float sm[32][HPK];
     // an exact mirror's record carries a sliding window in word 7 (word 5 is
     // the far-field flag of the other records)
@@ -539,6 +559,7 @@ extern "C" __global__ void hy_values(const float* __restrict__ S, const float* _
                                      const int* __restrict__ ci, const float* __restrict__ sink,
                                      const u32* __restrict__ BM, int bshift, int mw)
 {
+    PDL_PRO();
     __shared__ float sp[8][HD];
     // `extra`: a far field's block after the near ones (ci[5])
     int extra = 0;
@@ -627,6 +648,7 @@ extern "C" __global__ void hy_finish(const float* __restrict__ P, const float* _
                                      u16* __restrict__ p2, int pstride, int n0, int rb, int nh, int nbcap,
                                      const int* __restrict__ ci)
 {
+    PDL_PRO();
     int extra = 0;
     if (ci) {
         n0 = ci[0];
@@ -656,6 +678,7 @@ extern "C" __global__ void hy_finish(const float* __restrict__ P, const float* _
 extern "C" __global__ void hy_attn_out(const float* __restrict__ aog, const float* __restrict__ isum,
                                        const float* __restrict__ gate, void* __restrict__ ao, int nh, int B, int half)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)B * nh * HD) return;
     const int d = (int)(i % HD);
@@ -1074,6 +1097,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
         const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
     {                                                                                                           \
+        PDL_PRO();                                                                                              \
         mmp_body<NT, TB, KS, 0>(j, nj, x0, x1, x2, xstride, n, cols);                                           \
     }
 // one codec's window (KD as above)
@@ -1082,6 +1106,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
         const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
     {                                                                                                           \
+        PDL_PRO();                                                                                              \
         mmp_body<NT, TB, KS, KD>(j, nj, x0, x1, x2, xstride, n, cols);                                          \
     }
 #define MMPK3(TB, KS, KD) MMPK(1, TB, KS, KD) MMPK(2, TB, KS, KD) MMPK(4, TB, KS, KD)
@@ -1118,6 +1143,7 @@ extern "C" __global__ void hy_field_planes(const u16* __restrict__ p0, const u16
                                            const float* __restrict__ cf, int fields, int cols, int n, u16* __restrict__ o0,
                                            u16* __restrict__ o1, int ostride, int ooff)
 {
+    PDL_PRO();
     const int nf = fields > 0 ? fields : 1;
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * nf * cols) return;
@@ -1142,6 +1168,7 @@ extern "C" __global__ void hy_field_planes(const u16* __restrict__ p0, const u16
 extern "C" __global__ void hy_split(const float* __restrict__ x, int xstride, int cols, u16* __restrict__ p0,
                                     u16* __restrict__ p1, u16* __restrict__ p2, int ostride, int n)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)n * cols) return;
     const int j = (int)(i / cols), c = (int)(i - (size_t)j * cols);
@@ -1153,6 +1180,7 @@ extern "C" __global__ void hy_split(const float* __restrict__ x, int xstride, in
 extern "C" __global__ void hy_expand_p(const uint2* __restrict__ T, const u8* __restrict__ Cc,
                                        const float* __restrict__ lad, u16* __restrict__ W, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -1189,6 +1217,7 @@ extern "C" __global__ void hy_expand_pr(const uint2* __restrict__ T, const u8* _
                                         const float* __restrict__ lad, u16* __restrict__ W, int rows, int cols,
                                         int tile0, int nt)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -1234,6 +1263,7 @@ extern "C" __global__ void hy_gdn_front(const float* __restrict__ qkv, int qstri
                                         const float* __restrict__ a_log, const float* __restrict__ dt_bias,
                                         float* __restrict__ gb, int nv)
 {
+    PDL_PRO();
     // a block a (unit, row): blockIdx.y is the row; the ring is read here and
     // moved by `hy_gdn_ring` after this launch
     __shared__ float red[2][32];
@@ -1322,6 +1352,7 @@ extern "C" __global__ void hy_gdn_out32(const float* __restrict__ o, const float
                                         float eps, int sigmoid, int half, u16* __restrict__ p0, u16* __restrict__ p1,
                                         u16* __restrict__ p2, int pstride)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const size_t b = blockIdx.x;
     const size_t t = b / nv;
@@ -1354,6 +1385,7 @@ extern "C" __global__ void hy_rmsnorm2(const float* __restrict__ x, const float*
                                        float* __restrict__ out, int n, float eps, int gemma, u16* __restrict__ p0,
                                        u16* __restrict__ p1, u16* __restrict__ p2, int pstride)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int j = blockIdx.y, chunk = blockIdx.x;
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
@@ -1388,6 +1420,7 @@ extern "C" __global__ void hy_gdn_conv32(const float* __restrict__ qkv, int qstr
                                          const float* __restrict__ taps, float* __restrict__ cq, int n, int c_dim,
                                          int kk)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * c_dim) return;
     const int t = (int)(i / c_dim);
@@ -1405,6 +1438,7 @@ extern "C" __global__ void hy_gdn_conv32(const float* __restrict__ qkv, int qstr
 // L2 norm of the q and k heads in place, a block of dk threads a (row, head).
 extern "C" __global__ void hy_gdn_prep32(float* __restrict__ cq, int c_dim, int nk, int dk)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const u64 t = blockIdx.x / (2 * nk);
     const int g = (int)(blockIdx.x - t * (2 * nk));
@@ -1425,6 +1459,7 @@ extern "C" __global__ void hy_gdn_prep32(float* __restrict__ cq, int c_dim, int 
 extern "C" __global__ void hy_gdn_gb32(const float* __restrict__ ab, const float* __restrict__ a_log,
                                        const float* __restrict__ dt_bias, float* __restrict__ gb, int n, int nv)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)n * nv) return;
     const u64 t = i / nv;
@@ -1446,6 +1481,7 @@ extern "C" __global__ void hy_gdn_gb32(const float* __restrict__ ab, const float
 extern "C" __global__ void hy_gdn_restore_scan(const u64* __restrict__ tab, int keep, int c_dim, int nv, int nk,
                                                int dk, int dv)
 {
+    PDL_PRO();
     const u64* tb = tab + (size_t)blockIdx.y * 7;
     const float* Sin = (const float*)tb[0];
     float* Sout = (float*)tb[1];
@@ -1484,6 +1520,7 @@ extern "C" __global__ void hy_gdn_restore_scan(const u64* __restrict__ tab, int 
 extern "C" __global__ void __launch_bounds__(128) hy_gdn_restore_scan4(const u64* __restrict__ tab, int keep, int c_dim,
                                                                       int nv, int nk, int dv)
 {
+    PDL_PRO();
     const u64* tb = tab + (size_t)blockIdx.y * 7;
     gdn_scan4_body((const float*)tb[2], (const float*)tb[3], (const float*)tb[0], (float*)tb[1], nullptr, keep, c_dim,
                    nv, nk, dv, nullptr);
@@ -1491,6 +1528,7 @@ extern "C" __global__ void __launch_bounds__(128) hy_gdn_restore_scan4(const u64
 
 extern "C" __global__ void hy_gdn_restore_ring(const u64* __restrict__ tab, int keep, int qstride, int c_dim, int kk)
 {
+    PDL_PRO();
     const u64* tb = tab + (size_t)blockIdx.y * 7;
     const float* rs = (const float*)tb[4];
     float* ring = (float*)tb[5];
@@ -1515,6 +1553,7 @@ extern "C" __global__ void hy_embed_gather(const uint2* __restrict__ T, const u8
                                            const float2* __restrict__ par, int rows, int cols,
                                            const int* __restrict__ tok, int j, float* __restrict__ e)
 {
+    PDL_PRO();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= cols) return;
     const int r = tok[j];
@@ -1541,6 +1580,7 @@ extern "C" __global__ void hy_embed_gather(const uint2* __restrict__ T, const u8
 // the plain decode's choice.
 extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int stride, int* __restrict__ out, int j)
 {
+    PDL_PRO();
     __shared__ float sv[32];
     __shared__ int si[32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
@@ -1583,6 +1623,7 @@ extern "C" __global__ void hy_argmax(const float* __restrict__ x, int n, int str
 extern "C" __global__ void hy_silu_pair_half(const float* __restrict__ y, u16* __restrict__ xh, int inter, int B, int act,
                                              float lim)
 {
+    PDL_PRO();
     const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (u64)B * inter) return;
     const u64 b = i / inter;
@@ -1624,6 +1665,7 @@ extern "C" __global__ void hy_repack(const u32* __restrict__ nibA, const u8* __r
                                      const u32* __restrict__ nibB, const u8* __restrict__ codesB, int stride,
                                      int pair, uint2* __restrict__ T, u8* __restrict__ Cc, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -1691,6 +1733,7 @@ extern "C" __global__ void hy_softmax_h(const float* __restrict__ S, u16* __rest
                                         const float* __restrict__ sink, const u32* __restrict__ BM, int bshift, int mw,
                                         int brow, int nkv)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
     const float* s = S + (size_t)blockIdx.x * L;
@@ -1761,6 +1804,7 @@ extern "C" __global__ void hy_route_proj(const float* __restrict__ xn, int hidde
                                          const float* __restrict__ Wk, float* __restrict__ RAW, int nkv, int pos0,
                                          int block, int prefix, int local, int remote, const int* __restrict__ ci)
 {
+    PDL_PRO();
     if (ci) pos0 = ci[0];
     const int b = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int NW = blockDim.x >> 5;
@@ -1785,6 +1829,7 @@ extern "C" __global__ void hy_route_put(const float* __restrict__ RAW, const flo
                                         float eps, const int* __restrict__ ci, int block, int prefix, int local,
                                         int remote)
 {
+    PDL_PRO();
     if (ci) pos0 = ci[0];
     __shared__ float xs[HD];
     __shared__ float red[32];
@@ -1844,6 +1889,7 @@ extern "C" __global__ void hy_route_score(const float* __restrict__ IQ, const u1
                                           float* __restrict__ SC, int pos0, int nkv, int block, int prefix, int local,
                                           int remote, int nblk, int cb0, const int* __restrict__ ci)
 {
+    PDL_PRO();
     if (ci) pos0 = ci[0];
     const int cb = cb0 + (int)blockIdx.x, b = blockIdx.y;
     const int pos = pos0 + b, cur = pos / block;
@@ -1893,6 +1939,7 @@ extern "C" __global__ void hy_route_sel(const float* __restrict__ SC, u32* __res
                                         int block, int prefix, int local, int remote, int mw, int nblk,
                                         const int* __restrict__ ci)
 {
+    PDL_PRO();
     if (ci) pos0 = ci[0];
     const int g = blockIdx.x, b = blockIdx.y, tid = threadIdx.x;
     const int pos = pos0 + b, cur = pos / block;
@@ -1950,6 +1997,7 @@ extern "C" __global__ void hy_far_insert(const u16* __restrict__ NK, const u16* 
                                          const float* __restrict__ QT, float* __restrict__ MZ, float* __restrict__ TH,
                                          const int* __restrict__ ci, int m, int nkv, float scale)
 {
+    PDL_PRO();
     // a warp per (KV head g, its head j, landmark i): the key's dot product
     // across the lanes, then the head's far numerator row by the lanes
     const int wg = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5), lane = threadIdx.x & 31;
@@ -2071,6 +2119,7 @@ extern "C" __global__ void hy_far_prep_b(const float* __restrict__ q, const floa
                                          float* __restrict__ P, float* __restrict__ E,
                                          const int* __restrict__ ci, int m, int nh, float scale, int rect_fm, int B)
 {
+    PDL_PRO();
     far_prep_body(q, KT, MU, MZ, TH, Mx, P, E, ci, m, nh, scale, rect_fm, B, blockIdx.y);
 }
 
@@ -2080,6 +2129,7 @@ extern "C" __global__ void hy_far_prep(const float* __restrict__ q, const float*
                                        float* __restrict__ P, float* __restrict__ E,
                                        const int* __restrict__ ci, int m, int nh, float scale, int rect_fm)
 {
+    PDL_PRO();
     far_prep_body(q, KT, MU, MZ, TH, Mx, P, E, ci, m, nh, scale, rect_fm, 1, 0);
 }
 
@@ -2100,6 +2150,7 @@ extern "C" __global__ void hy_far_rows(const float* __restrict__ q, const float*
                                        float* __restrict__ FZ, float* __restrict__ FN,
                                        int m, int nh, float scale, int rect_fm, int B)
 {
+    PDL_PRO();
     __shared__ float sf[64];
     __shared__ float su[64];
     __shared__ float sc[2];
@@ -2165,6 +2216,7 @@ extern "C" __global__ void hy_softmax_hf(const float* __restrict__ S, u16* __res
                                          int hpk, int cols, int istride, const float* __restrict__ FM,
                                          const float* __restrict__ FZ, int nh)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int T = blockDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = T >> 5;
     const float* s = S + (size_t)blockIdx.x * L;
@@ -2217,6 +2269,7 @@ extern "C" __global__ void hy_attn_out_f(const float* __restrict__ aog, const fl
                                          const float* __restrict__ FN, const float* __restrict__ gate,
                                          void* __restrict__ ao, int nh, int B, int half)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)B * nh * HD) return;
     const int d = (int)(i % HD);
@@ -2239,6 +2292,7 @@ extern "C" __global__ void hy_far_insert_n(const u16* __restrict__ NK, const u16
                                            const float* __restrict__ QT, float* __restrict__ MZ, float* __restrict__ TH,
                                            int m, int nkv, float scale, int ns, int w, int head0, int E)
 {
+    PDL_PRO();
     const int wg = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5), lane = threadIdx.x & 31;
     if (wg >= nkv * HPK * m) return;
     const int g = wg / (HPK * m), r = wg - g * (HPK * m), j = r / m, i = r - j * m;
@@ -2301,6 +2355,7 @@ extern "C" __global__ void hy_moe_router(const float* __restrict__ xn, const flo
                                          const float* __restrict__ sgw, float* __restrict__ logits,
                                          float* __restrict__ sg, int n, int E, int hidden)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (e > E || (e == E && !sgw)) return;
@@ -2344,6 +2399,7 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
                                          HyJob* __restrict__ dn_a, float* __restrict__ wsel, int S, u64 qq0, u64 qq1,
                                          int pstride, u64 dnS, int hidden, int bpj_gu, int bpj_dn)
 {
+    PDL_PRO();
     __shared__ int slot_of[1024];
     __shared__ int U[1024];
     __shared__ int pick[16][64];
@@ -2500,6 +2556,7 @@ extern "C" __global__ void hy_moe_compact(const float* __restrict__ wsel, int n,
                                           int xs, int* __restrict__ srow, int* __restrict__ crow,
                                           float* __restrict__ cwt)
 {
+    PDL_PRO();
     __shared__ int cnt[1024];
     __shared__ int base[1025];
     const int tid = threadIdx.x;
@@ -2564,6 +2621,7 @@ extern "C" __global__ void hy_rows_gather(const u16* __restrict__ p0, const u16*
                                           const int* __restrict__ srow, u16* __restrict__ c0, u16* __restrict__ c1,
                                           int dim)
 {
+    PDL_PRO();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
     if (e >= dim) return;
     const int r = srow[i];
@@ -2578,6 +2636,7 @@ extern "C" __global__ void hy_moe_combine_c(float* __restrict__ h, const float* 
                                             const int* __restrict__ crow, const float* __restrict__ cwt, int n,
                                             int hidden, int k)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= hidden || r >= n) return;
     float acc = 0.0f;
@@ -2595,6 +2654,7 @@ extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __
                                           const float* __restrict__ wsel, const float* __restrict__ dsh,
                                           const float* __restrict__ sg, int gated, int n, int hidden, int S)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= hidden || r >= n) return;
     float acc = 0.0f;
@@ -2624,6 +2684,7 @@ extern "C" __global__ void hy_moe_combine(float* __restrict__ h, const float* __
 extern "C" __global__ void hy_moe_topk(const float* __restrict__ logits, const float* __restrict__ bias, int n, int E,
                                        int k, int flags, float route_scale, int* __restrict__ pidx, float* __restrict__ pwt)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= n) return;
@@ -2716,6 +2777,7 @@ extern "C" __global__ void hy_moe_group(const int* __restrict__ pidx, int nk, in
                                         int* __restrict__ src, u64 qq0, u64 qq1, int hidden, int inter_s, u64 ys,
                                         int bpj_gu, int bpj_dn)
 {
+    PDL_PRO();
     __shared__ int cnt[1024], off[1024], jb0[1024];
     __shared__ int njobs;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
@@ -2796,6 +2858,7 @@ extern "C" __global__ void hy_moe_group(const int* __restrict__ pidx, int nk, in
 extern "C" __global__ void hy_moe_gather(const float* __restrict__ xn, const int* __restrict__ src, int total, int hidden,
                                          u16* __restrict__ p0, u16* __restrict__ p1, u16* __restrict__ p2)
 {
+    PDL_PRO();
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)total * hidden) return;
     const int q = (int)(idx / hidden), i = (int)(idx - (size_t)q * hidden);
@@ -2808,6 +2871,7 @@ extern "C" __global__ void hy_moe_gcombine(float* __restrict__ h, const float* _
                                            const float* __restrict__ pwt, const float* __restrict__ dsh,
                                            const float* __restrict__ sg, int gated, int n, int k, int hidden)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= hidden || r >= n) return;
     float acc = 0.0f;
@@ -2825,6 +2889,7 @@ extern "C" __global__ void hy_moe_gcombine(float* __restrict__ h, const float* _
 extern "C" __global__ void hy_norm_add(float* __restrict__ h, const float* __restrict__ y, const float* __restrict__ w,
                                        int hidden, float eps, int gemma)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const float* yr = y + (size_t)r * hidden;
@@ -2844,6 +2909,7 @@ extern "C" __global__ void hy_norm_add(float* __restrict__ h, const float* __res
 // h *= s over `total` values (Gemma-4's layer scalar).
 extern "C" __global__ void hy_scale(float* __restrict__ h, float s, unsigned long long total)
 {
+    PDL_PRO();
     const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) h[i] *= s;
 }
@@ -2858,6 +2924,7 @@ extern "C" __global__ void hy_sconv(const float* __restrict__ y, int ystride, co
                                     float* __restrict__ ring, int hidden, int k, int n, u16* __restrict__ p0,
                                     u16* __restrict__ p1, u16* __restrict__ p2, int pstride)
 {
+    PDL_PRO();
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= hidden) return;
     const int rl = k - 1;
@@ -2890,6 +2957,7 @@ extern "C" __global__ void hy_sconv_h(const float* __restrict__ y, int ystride, 
                                       float* __restrict__ ring, int hidden, int k, int n, u16* __restrict__ out,
                                       int ostride)
 {
+    PDL_PRO();
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= hidden) return;
     const int rl = k - 1;
@@ -2919,6 +2987,7 @@ extern "C" __global__ void hy_sconv_h(const float* __restrict__ y, int ystride, 
 // head h of row r times sigmoid(g[r][h]).
 extern "C" __global__ void hy_head_gate_h(u16* __restrict__ ao, const float* __restrict__ g, int nh, int hd, int n)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= nh * hd || r >= n) return;
     const size_t at = (size_t)r * nh * hd + i;
@@ -2931,6 +3000,7 @@ extern "C" __global__ void hy_head_gate_h(u16* __restrict__ ao, const float* __r
 extern "C" __global__ void hy_head_gate(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ g,
                                         int nh, int hd, int n)
 {
+    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (i >= nh * hd || r >= n) return;
     const size_t at = (size_t)r * pstride + i;
@@ -2950,6 +3020,7 @@ extern "C" __global__ void hy_head_gate(u16* __restrict__ p0, u16* __restrict__ 
 extern "C" __global__ void hy_repack8(const signed char* __restrict__ bA, const signed char* __restrict__ bB, int pair,
                                       uint4* __restrict__ T, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -2981,6 +3052,7 @@ extern "C" __global__ void hy_repack8(const signed char* __restrict__ bA, const 
 extern "C" __global__ void hy_expand_i8r(const uint4* __restrict__ T, const float* __restrict__ rs, const float* __restrict__ cf,
                                          u16* __restrict__ W, int rows, int cols, int tile0, int nt, int dual)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -3019,6 +3091,7 @@ extern "C" __global__ void hy_expand_i8r(const uint4* __restrict__ T, const floa
 extern "C" __global__ void hy_repack1(const u8* __restrict__ A, const u8* __restrict__ Bm, int pair, u16* __restrict__ T,
                                       u16* __restrict__ S, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -3063,6 +3136,7 @@ extern "C" __global__ void hy_repack1(const u8* __restrict__ A, const u8* __rest
 extern "C" __global__ void hy_expand_q1r(const u16* __restrict__ T, const u16* __restrict__ S, u16* __restrict__ W, int rows,
                                          int cols, int tile0, int nt)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -3101,6 +3175,7 @@ __device__ __forceinline__ u32 q1t_val1(const u8* c7, int k) {
 extern "C" __global__ void hy_repack1t(const u8* __restrict__ A, const u8* __restrict__ Bm, int pair, u32* __restrict__ T,
                                        u16* __restrict__ S, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -3148,6 +3223,7 @@ extern "C" __global__ void hy_repack1t(const u8* __restrict__ A, const u8* __res
 extern "C" __global__ void hy_expand_q1tr(const u32* __restrict__ T, const u16* __restrict__ S, u16* __restrict__ W, int rows,
                                           int cols, int tile0, int nt)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -3182,6 +3258,7 @@ extern "C" __global__ void hy_repack2(const u8* __restrict__ chA, const u8* __re
                                       const u8* __restrict__ codesB, int stride, int pair, u32* __restrict__ T,
                                       u8* __restrict__ Cc, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -3226,6 +3303,7 @@ extern "C" __global__ void hy_repack2(const u8* __restrict__ chA, const u8* __re
 extern "C" __global__ void hy_expand_q2r(const u32* __restrict__ T, const u8* __restrict__ Cc, const float* __restrict__ lad,
                                          u16* __restrict__ W, int rows, int cols, int tile0, int nt, int aff)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -3274,6 +3352,7 @@ __device__ __forceinline__ void prism_fwht(float* sv, int blk) {
 extern "C" __global__ void hy_prism_p(u16* __restrict__ p0, u16* __restrict__ p1, int pstride, const float* __restrict__ signs,
                                       int blk, int f16)
 {
+    PDL_PRO();
     extern __shared__ float sv[];
     const int r = blockIdx.y, b0 = blockIdx.x * blk;
     const size_t at = (size_t)r * pstride + b0;
@@ -3291,6 +3370,7 @@ extern "C" __global__ void hy_prism_p(u16* __restrict__ p0, u16* __restrict__ p1
 extern "C" __global__ void hy_prism_h(const u16* src, u16* dst, int stride, const float* __restrict__ signs,
                                       int blk, int f16)
 {
+    PDL_PRO();
     extern __shared__ float sv[];
     const int r = blockIdx.y, b0 = blockIdx.x * blk;
     const size_t at = (size_t)r * stride + b0;
@@ -3312,6 +3392,7 @@ extern "C" __global__ void hy_prism_h(const u16* src, u16* dst, int stride, cons
 extern "C" __global__ void hy_repack4t(const u8* __restrict__ A, const u8* __restrict__ Bm, int pair, uint2* __restrict__ T,
                                        u16* __restrict__ S, int rows, int cols)
 {
+    PDL_PRO();
     const int gpr = cols >> 5, ntile = (rows + 15) >> 4;
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)ntile * gpr * 32) return;
@@ -3355,6 +3436,7 @@ extern "C" __global__ void hy_repack4t(const u8* __restrict__ A, const u8* __res
 extern "C" __global__ void hy_expand_q4gr(const uint2* __restrict__ T, const u16* __restrict__ S, u16* __restrict__ W, int rows,
                                           int cols, int tile0, int nt)
 {
+    PDL_PRO();
     const int gpr = cols >> 5;
     const size_t idx0 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx0 >= (size_t)nt * gpr * 32) return;
@@ -3394,6 +3476,7 @@ extern "C" __global__ void hy_expand_q4gr(const uint2* __restrict__ T, const u16
 
 extern "C" __global__ void hy_mhc_enter(const float* __restrict__ h, float* __restrict__ R, int ns, int dim)
 {
+    PDL_PRO();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (e >= dim) return;
     const float v = h[(size_t)r * dim + e];
@@ -3402,6 +3485,7 @@ extern "C" __global__ void hy_mhc_enter(const float* __restrict__ h, float* __re
 
 extern "C" __global__ void hy_mhc_leave(const float* __restrict__ R, float* __restrict__ h, int ns, int dim)
 {
+    PDL_PRO();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (e >= dim) return;
     float v = 0.0f;
@@ -3414,6 +3498,7 @@ extern "C" __global__ void hy_mhc_leave(const float* __restrict__ R, float* __re
 extern "C" __global__ void hy_mhc_logits(const float* __restrict__ R, const float* __restrict__ W, float* __restrict__ L, int ns,
                                          int dim, float eps)
 {
+    PDL_PRO();
     __shared__ float red[2][32];
     const int k = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const int n = ns * dim;
@@ -3458,6 +3543,7 @@ extern "C" __global__ void hy_mhc_route_v4(const float* __restrict__ R, const fl
                                            float* __restrict__ h, float* __restrict__ coef, int ns, int dim, int iters, float s0,
                                            float s1, float s2, float eps)
 {
+    PDL_PRO();
     __shared__ float pre_s[4];
     __shared__ float ms[16];
     const int r = blockIdx.x, tid = threadIdx.x;
@@ -3532,6 +3618,7 @@ extern "C" __global__ void hy_mhc_route(const float* __restrict__ R, const float
                                         float* __restrict__ h, float* __restrict__ coef, int ns, int dim, int out, int iters,
                                         int fixed, float pre_scale)
 {
+    PDL_PRO();
     __shared__ float pre_s[4];
     const int r = blockIdx.x, tid = threadIdx.x;
     const float* Rr = R + (size_t)r * ns * dim;
@@ -3582,6 +3669,7 @@ extern "C" __global__ void hy_mhc_route(const float* __restrict__ R, const float
 extern "C" __global__ void hy_mhc_merge(float* __restrict__ R, const float* __restrict__ y, const float* __restrict__ coef, int ns,
                                         int dim)
 {
+    PDL_PRO();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (e >= dim) return;
     const float* cr = coef + (size_t)r * 20;
@@ -3605,6 +3693,7 @@ extern "C" __global__ void hy_mhc_route_ihc(const float* __restrict__ R, const f
                                             float* __restrict__ h, float* __restrict__ coef, int ns, int dim, float s0, float s1,
                                             float eps, float mag, int head)
 {
+    PDL_PRO();
     __shared__ float pre_s[4];
     const int r = blockIdx.x, tid = threadIdx.x;
     const float* Rr = R + (size_t)r * ns * dim;
@@ -3649,6 +3738,7 @@ extern "C" __global__ void hy_engram(float* __restrict__ R, const float* __restr
                                      const float* __restrict__ gamma, const float* __restrict__ hcs, const float* __restrict__ on,
                                      int ns, int dim, float eps)
 {
+    PDL_PRO();
     extern __shared__ float val[];
     __shared__ float red[32];
     const int r = blockIdx.x, tid = threadIdx.x;
@@ -3714,6 +3804,7 @@ extern "C" __global__ void __launch_bounds__(256) hy_dash_route(
     unsigned* __restrict__ sel, float* __restrict__ sbias, const int* __restrict__ rec, int n, int block, int kk,
     float eps, float idx_scale, float floor_, float sigma)
 {
+    PDL_PRO();
     const int row = blockIdx.x, lid = threadIdx.x, lane = lid & 31, warp = lid >> 5;
     if (row >= n) return;
     const int d = 128, half = 64;
@@ -3844,6 +3935,7 @@ extern "C" __global__ void __launch_bounds__(128) hy_dash_close(const float* __r
                                                                 float* __restrict__ kbar, const int* __restrict__ rec, int n,
                                                                 int block)
 {
+    PDL_PRO();
     __shared__ float aw[64];
     const int tid = threadIdx.x, d = 128;
     const int pos0 = rec[0], end = pos0 + n;
@@ -3895,6 +3987,7 @@ extern "C" __global__ void __launch_bounds__(256) hy_dash_attend(
     u16* __restrict__ oh, const int* __restrict__ rec, const int* __restrict__ ci, int slot0_, int nh, int nkv, int n, int block,
     int window, float scale)
 {
+    PDL_PRO();
     const int h = blockIdx.x, row = blockIdx.y, lid = threadIdx.x;
     if (h >= nh || row >= n) return;
     const int hpk = nh / nkv, g = h / hpk, jh = h - g * hpk;
@@ -4013,6 +4106,7 @@ extern "C" __global__ void hy_kda_gates(const float* __restrict__ f, int fstride
                                         float* __restrict__ gd, float* __restrict__ beta, int n, int nh, int dk, int lb_on,
                                         float lb)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int kd = nh * dk;
     if (i >= (size_t)n * kd) return;
@@ -4036,6 +4130,7 @@ extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __re
                                                               int n, int c_dim, int nh, int dv, float* __restrict__ ring,
                                                               const float* __restrict__ qkv, int qstride, int kk)
 {
+    PDL_PRO();
     const int sblocks = nh * (dv >> 5);
     if ((int)blockIdx.x >= sblocks) {
         // blocks past the state's move the conv ring, as `hy_gdn_scan4`'s do
@@ -4119,6 +4214,7 @@ extern "C" __global__ void __launch_bounds__(128) hy_kda_scan4(const float* __re
 extern "C" __global__ void hy_mla_lat(const float* __restrict__ kva, int stride, const float* __restrict__ w, int lora,
                                       float eps, u16* __restrict__ p0, u16* __restrict__ p1, int pstride)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const float* x = kva + (size_t)r * stride;
@@ -4144,6 +4240,7 @@ extern "C" __global__ void hy_mla_lat(const float* __restrict__ kva, int stride,
 extern "C" __global__ void hy_mla_kv(const float* __restrict__ kva, int kstride, const float* __restrict__ kvb, float* __restrict__ k,
                                      float* __restrict__ v, int n, int nh, int rope, int nope, int vd, int lora)
 {
+    PDL_PRO();
     const int hd = rope + nope;
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)n * nh * hd) return;
@@ -4176,6 +4273,7 @@ extern "C" __global__ void hy_dsa_put(const float* __restrict__ kva, int kstride
                                       const float* __restrict__ kn_b, int id, float* __restrict__ lat, float* __restrict__ ikc,
                                       float* __restrict__ gtc, int pos0)
 {
+    PDL_PRO();
     __shared__ float red[32];
     __shared__ double dred[2][32];
     const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
@@ -4224,6 +4322,7 @@ extern "C" __global__ void hy_dsa_put(const float* __restrict__ kva, int kstride
 extern "C" __global__ void hy_dsa_pool(const float* __restrict__ ikc, const float* __restrict__ gtc, const float* __restrict__ ape,
                                        float* __restrict__ pooled, int p0, int np, int kp, int id)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)np * id) return;
     const int d = (int)(i % id);
@@ -4243,6 +4342,7 @@ extern "C" __global__ void hy_dsa_pool(const float* __restrict__ ikc, const floa
 extern "C" __global__ void hy_dsa_score(const float* __restrict__ iq, const float* __restrict__ xk, int xstride, int id, int ih,
                                         const float* __restrict__ pooled, int np, float* __restrict__ sc)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int p = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (p >= np) return;
@@ -4273,6 +4373,7 @@ __device__ __forceinline__ u32 dsa_key(float f)
 extern "C" __global__ void hy_dsa_select(const float* __restrict__ sc, int np, int keep, int kp, int npos, int* __restrict__ sel,
                                          int* __restrict__ nsel)
 {
+    PDL_PRO();
     __shared__ u32 cnt[2];
     __shared__ int pre[1024];
     const int tid = threadIdx.x, NT = blockDim.x;
@@ -4358,6 +4459,7 @@ extern "C" __global__ void hy_dsa_select(const float* __restrict__ sc, int np, i
 extern "C" __global__ void hy_dsa_qlat(const float* __restrict__ q, int qoff, int hd, const float* __restrict__ wkv, int nope, int vd,
                                        int lora, float* __restrict__ qlat)
 {
+    PDL_PRO();
     const int h = blockIdx.y, l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= lora) return;
     const float* qh = q + (size_t)h * hd + qoff;
@@ -4372,6 +4474,7 @@ extern "C" __global__ void hy_dsa_qlat(const float* __restrict__ q, int qoff, in
 extern "C" __global__ void hy_dsa_attn(const float* __restrict__ qlat, const float* __restrict__ lat, const int* __restrict__ sel,
                                        const int* __restrict__ nsel, int lora, float scale, float* __restrict__ olat)
 {
+    PDL_PRO();
     extern __shared__ float sh[];
     __shared__ float red[32];
     const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
@@ -4416,6 +4519,7 @@ extern "C" __global__ void hy_dsa_attn(const float* __restrict__ qlat, const flo
 extern "C" __global__ void hy_dsa_out(const float* __restrict__ olat, const float* __restrict__ wkv, int nh, int nope, int vd, int lora,
                                       u16* __restrict__ p0, u16* __restrict__ p1, int pstride, int r)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (o >= nh * vd) return;
@@ -4446,6 +4550,7 @@ extern "C" __global__ void hy_hy4_put(const float* __restrict__ kva, int kstride
                                       float eps, const float* __restrict__ xk, int xstride, const float* __restrict__ tkw, int id,
                                       const float* __restrict__ tab, float* __restrict__ lat, float* __restrict__ ikc, int pos0)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int r = blockIdx.x, tid = threadIdx.x;
     const size_t pos = (size_t)pos0 + r;
@@ -4479,6 +4584,7 @@ extern "C" __global__ void hy_hy4_pool(const float* __restrict__ ikc, const floa
                                        const float* __restrict__ ape, const float* __restrict__ knw, float eps,
                                        const float* __restrict__ invf, int rope, float* __restrict__ pooled, int p0, int kp, int id)
 {
+    PDL_PRO();
     extern __shared__ float key[];
     __shared__ float red[32];
     const size_t p = (size_t)p0 + blockIdx.x;
@@ -4523,6 +4629,7 @@ extern "C" __global__ void hy_hy4_pool(const float* __restrict__ ikc, const floa
 extern "C" __global__ void hy_rope_rows(float* __restrict__ x, int rstride, int hstride, int off, int half,
                                         const float* __restrict__ tab)
 {
+    PDL_PRO();
     const int r = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
     if (i >= half) return;
     float* v = x + (size_t)r * rstride + (size_t)h * hstride + off;
@@ -4540,6 +4647,7 @@ extern "C" __global__ void hy_hy4_attn(const float* __restrict__ qlat, const flo
                                        const int* __restrict__ nsel, float scale, const float* __restrict__ sink,
                                        float* __restrict__ olat)
 {
+    PDL_PRO();
     extern __shared__ float sh[];
     __shared__ float red[32];
     const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
@@ -4587,6 +4695,7 @@ extern "C" __global__ void hy_hy4_attn(const float* __restrict__ qlat, const flo
 extern "C" __global__ void hy_hy4_out(const float* __restrict__ olat, const float* __restrict__ wkv, int nh, int nope, int vd, int lora,
                                       const float* __restrict__ gate, u16* __restrict__ p0, u16* __restrict__ p1, int pstride, int r)
 {
+    PDL_PRO();
     const int lane = threadIdx.x & 31;
     const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (o >= nh * vd) return;
@@ -4604,6 +4713,7 @@ extern "C" __global__ void hy_hy4_out(const float* __restrict__ olat, const floa
 extern "C" __global__ void hy_mla_cut(const u16* __restrict__ s0, const u16* __restrict__ s1, int sstride, u16* __restrict__ d0,
                                       u16* __restrict__ d1, int dstride, int n, int nh, int hd, int vd)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)n * nh * vd) return;
     const int e = (int)(i % vd);
@@ -4619,6 +4729,7 @@ extern "C" __global__ void hy_mla_cut(const u16* __restrict__ s0, const u16* __r
 extern "C" __global__ void hy_mla_lat_h(const float* __restrict__ kva, int stride, const float* __restrict__ w, int lora,
                                         float eps, u16* __restrict__ out)
 {
+    PDL_PRO();
     __shared__ float red[32];
     const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
     const float* x = kva + (size_t)r * stride;
@@ -4639,6 +4750,7 @@ extern "C" __global__ void hy_mla_lat_h(const float* __restrict__ kva, int strid
 // cut back to vd (`hy_mla_cut`) for the output product.
 extern "C" __global__ void hy_vpad(const float* __restrict__ src, float* __restrict__ dst, int n, int nkv, int vd, int hd)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)n * nkv * hd) return;
     const int d = (int)(i % hd);
@@ -4650,6 +4762,7 @@ extern "C" __global__ void hy_vpad(const float* __restrict__ src, float* __restr
 // [n][nh][vd] for the output GEMM.
 extern "C" __global__ void hy_mla_cut_h(const u16* __restrict__ src, u16* __restrict__ dst, int n, int nh, int hd, int vd)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)n * nh * vd) return;
     const int e = (int)(i % vd);
@@ -4667,6 +4780,7 @@ extern "C" __global__ void hy_blr_z(const u16* __restrict__ x0, const u16* __res
                                     int xstride, const float* __restrict__ g, int din, int slots, u16* __restrict__ z0,
                                     u16* __restrict__ z1)
 {
+    PDL_PRO();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y;
     if (i >= (size_t)slots * din) return;

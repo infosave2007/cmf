@@ -1074,7 +1074,8 @@ fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
     let f = unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
         .map_err(|e| format!("kernel {name}: {e}"))?;
     KT_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(f as usize, name.to_string());
-    if name.starts_with("q4_") {
+    // every kernel of these modules opens with `griddepcontrol.wait` (PDL_PRO)
+    if name.starts_with("q4_") || name.starts_with("ink_") || name.starts_with("hy_") {
         PDL_FUNCS.lock().unwrap().get_or_insert_with(std::collections::HashSet::new).insert(f as usize);
     }
     Ok(f)
@@ -1089,6 +1090,12 @@ pub(crate) fn nop_set(f: cs::CUfunction) {
     NOP_F.store(f as usize, Ordering::SeqCst);
 }
 static PDL_FUNCS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// The device's compute capability (major); 0 before the context.
+static CC_MAJOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn cc_major() -> u32 {
+    CC_MAJOR.load(Ordering::SeqCst)
+}
 
 pub(crate) fn pdl_set(on: bool) {
     PDL_ON.store(on, Ordering::SeqCst);
@@ -1164,6 +1171,7 @@ fn init() -> Res<Ctx> {
     let attr = |a| unsafe { cu::device::get_attribute(dev, a) }.unwrap_or(0);
     let major = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
     let minor = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+    CC_MAJOR.store(major as u32, Ordering::SeqCst);
     let arch = match (major, minor) {
         (7, 5) => Some("compute_75"),
         (8, 0) => Some("compute_80"),

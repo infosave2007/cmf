@@ -763,7 +763,26 @@ impl Dev {
 /// `true` when this call ran on the card. `ids` from position `pos0`; the
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
+/// Programmatic dependent launch for the arm's kernels on sm_90+ (Hopper,
+/// Blackwell): a kernel schedules while its predecessor drains (RTX PRO 6000:
+/// decode 122.7 → 127.6 tok/s, the same text). `CMF_INKLING_PDL=0|1` forces it.
+fn pdl_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("CMF_INKLING_PDL").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => super::super::cc_major() >= 9,
+        };
+        if on {
+            super::super::pdl_set(true);
+        }
+        on
+    })
+}
+
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
+    let _ = pdl_on();
     forward_with(id, g, layers, cfg, ids, pos0, want, all, logits, None)
 }
 
