@@ -463,6 +463,24 @@ __device__ __forceinline__ float tau_of(int pos, float alpha, float floor_) {
 // Queries and relative states of the call's rows, in place: per head the
 // learned scale, the L2 clip, and on the full layers the log scale of the
 // position. Grid (NH, n), HD threads (HD >= 32).
+// A warp's dot product of an f32 row of H with x (float4, the lanes' sums
+// reduced; every lane gets it).
+__device__ __forceinline__ float warp_dot(const float* __restrict__ w, const float* __restrict__ x) {
+    const float4* w4 = (const float4*)w;
+    const float4* x4 = (const float4*)x;
+    const int lane = threadIdx.x & 31;
+    float a = 0.0f;
+    for (int i = lane; i < H / 4; i += 32) {
+        const float4 u = w4[i], v = x4[i];
+        a = fmaf(u.x, v.x, a);
+        a = fmaf(u.y, v.y, a);
+        a = fmaf(u.z, v.z, a);
+        a = fmaf(u.w, v.w, a);
+    }
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
+    return a;
+}
+
 __device__ __forceinline__ void qr_body(int h, int r, float* __restrict__ yq, float* __restrict__ yr,
                                         const float* __restrict__ qs, const float* __restrict__ rs, float qclip,
                                         float rclip, int full, float alpha, float floor_, const int* __restrict__ cr)
@@ -566,24 +584,6 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
 {
     PDL_PRO();
     kv_body(blockIdx.x, blockIdx.y, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, ring, n, qclip, eps, cr, hk, hv);
-}
-
-// A warp's dot product of an f32 row of H with x (float4, the lanes' sums
-// reduced; every lane gets it).
-__device__ __forceinline__ float warp_dot(const float* __restrict__ w, const float* __restrict__ x) {
-    const float4* w4 = (const float4*)w;
-    const float4* x4 = (const float4*)x;
-    const int lane = threadIdx.x & 31;
-    float a = 0.0f;
-    for (int i = lane; i < H / 4; i += 32) {
-        const float4 u = w4[i], v = x4[i];
-        a = fmaf(u.x, v.x, a);
-        a = fmaf(u.y, v.y, a);
-        a = fmaf(u.z, v.z, a);
-        a = fmaf(u.w, v.w, a);
-    }
-    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
-    return a;
 }
 
 // `ink_qr` and `ink_kv` in one launch: blocks [0, NH n) the queries (head,
