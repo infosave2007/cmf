@@ -1097,6 +1097,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
         const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
     {                                                                                                           \
+        PDL_PRO();                                                                                              \
         mmp_body<NT, TB, KS, 0>(j, nj, x0, x1, x2, xstride, n, cols);                                           \
     }
 // one codec's window (KD as above)
@@ -1105,6 +1106,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
         const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
         const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
     {                                                                                                           \
+        PDL_PRO();                                                                                              \
         mmp_body<NT, TB, KS, KD>(j, nj, x0, x1, x2, xstride, n, cols);                                          \
     }
 #define MMPK3(TB, KS, KD) MMPK(1, TB, KS, KD) MMPK(2, TB, KS, KD) MMPK(4, TB, KS, KD)
