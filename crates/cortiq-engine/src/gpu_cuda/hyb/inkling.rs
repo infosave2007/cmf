@@ -2210,9 +2210,12 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
         }
         st(c, 11, tp)?;
         let t = (tb - 1) as usize;
+        // the experts' K split: 16 warps a tile (`CMF_HYB_KS=8`: 8)
+        let k16 = super::decode_ks().is_none_or(|k| k == 16);
+        let ksw = if k16 { 16u32 } else { 8 };
         let pick = |kd: Option<usize>| match kd {
-            Some(dd) => fx.mmpk[nt_of(n)][t][1][dd],
-            None => fx.mmp[nt_of(n)][t][1],
+            Some(dd) => fx.mmpk[nt_of(n)][t][k16 as usize][dd],
+            None => fx.mmp[nt_of(n)][t][k16 as usize],
         };
         let xs_i = hidden as i32;
         // a decode row's experts as a resident grid (q4tp / int8): no partial last wave
@@ -2226,7 +2229,7 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
                 let nb_i = nbg as i32;
                 c.launch(fg, (nbg.min(rb), 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi, nb_i))?
             }
-            None => c.launch(pick(l.kd.0), (nbg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?,
+            None => c.launch(pick(l.kd.0), (nbg, 1), 32 * ksw, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?,
         }
         st(c, 12, tp)?;
         match res(l.kd.1) {
@@ -2234,7 +2237,7 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
                 let nb_i = nbd as i32;
                 c.launch(fd, (nbd.min(rb), 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i, nb_i))?
             }
-            None => c.launch(pick(l.kd.1), (nbd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?,
+            None => c.launch(pick(l.kd.1), (nbd, 1), 32 * ksw, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?,
         }
         st(c, 13, tp)?;
         if !fuse {

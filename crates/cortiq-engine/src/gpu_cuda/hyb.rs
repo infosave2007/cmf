@@ -875,12 +875,16 @@ impl MmaSet {
         // one codec's decode row takes one tile a block at any height (A5000,
         // q4tp 5120 x 17408: 76.7 against 80.5 us; 10240 x 5120 49.3 / 56.3)
         let tb = if self.tb1 || (n == 1 && (self.tb1_n1 || self.kd.is_some())) { 1 } else { 2 };
-        let ks = if self.ks16 { 16 } else { 8 };
+        let k16 = match decode_ks() {
+            Some(k) if self.kd.is_some() && n <= NMAX => k == 16,
+            _ => self.ks16,
+        };
+        let ks = if k16 { 16 } else { 8 };
         let f = match self.kd {
             // q4tp / int8 (KDS 0 / 1): the weights ahead of the wait
-            Some(d) if n == 1 && tb == 1 && d < 2 && pf_on() => fx.mmpkp[self.ks16 as usize][d],
-            Some(d) => fx.mmpk[nt_of(n)][tb - 1][self.ks16 as usize][d],
-            None => fx.mmp[nt_of(n)][tb - 1][self.ks16 as usize],
+            Some(d) if n == 1 && tb == 1 && d < 2 && pf_on() => fx.mmpkp[k16 as usize][d],
+            Some(d) => fx.mmpk[nt_of(n)][tb - 1][k16 as usize][d],
+            None => fx.mmp[nt_of(n)][tb - 1][k16 as usize],
         };
         // the rows under the fields first, every job's region
         let (x0, x1, xs) = match &self.pre {
@@ -903,6 +907,13 @@ impl MmaSet {
         let (nj, xs_i, n_i, cols_i) = (self.n, xs as i32, n as i32, cols as i32);
         unsafe { c.launch(f, (self.blocks[tb - 1], 1), (32 * ks) as u32, 0, kargs!(self.bufs[tb - 1].ptr, nj, x0, x1, x1, xs_i, n_i, cols_i)) }
     }
+}
+
+/// `CMF_HYB_KS=8|16` (a measurement): the warps a tile of a one-codec decode
+/// matvec splits its columns over (the sum's order follows it).
+pub(super) fn decode_ks() -> Option<usize> {
+    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CMF_HYB_KS").ok().and_then(|v| v.parse().ok()).filter(|&k| k == 8 || k == 16))
 }
 
 /// `CMF_HYB_PF=0`: a decode row's matrix-set matvec without its weights
