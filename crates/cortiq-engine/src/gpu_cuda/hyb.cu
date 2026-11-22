@@ -2672,12 +2672,14 @@ extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __r
         const float t = rdot_block(Wr + (size_t)e * hidden, xn, hidden, rpart);
         if (threadIdx.x == 0) logits[e] = t;
     }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == gridDim.x - 1;
+    // only thread 0 wrote: its fence, its count
+    if (threadIdx.x == 0) {
+        __threadfence();
+        last = atomicAdd(counter, 1u) == gridDim.x - 1;
+        if (last) __threadfence();
+    }
     __syncthreads();
     if (!last) return;
-    __threadfence();
     if (wp == 0) {
         float key[8];
 #pragma unroll
