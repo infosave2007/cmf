@@ -557,6 +557,184 @@ fn job(m: &DevMat, rows: usize, kind: i32) -> HyJob {
     HyJob { w: m.w.ptr, aux0: m.aux0(), aux1: m.aux1(), y: 0, res: 0, rows: rows as i32, kind, blk0: 0, ystride: 0, xoff: 0, nr: 0, lim: 0.0, pad: [0; 3] }
 }
 
+/// Card bytes of one Inkling matrix in its codec's card layout (q4tp planes,
+/// q8_2f int8 tiles with both column fields): what `mat` / `hmat_pair` carve
+/// out of a build's arena. Other matrices take no arena room.
+fn dev_bytes(t: &crate::qtensor::QTensor, rows: usize, cols: usize) -> usize {
+    match gw_of(t) {
+        Some((_, gw)) if gw.kind == 7 => i8_layout(rows, cols, 2).2,
+        Some(_) => planes_bytes(rows, cols),
+        None => 0,
+    }
+}
+
+/// Layers as ranges for a log line: `0-5, 18-23`.
+fn ranges(ls: &[usize]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < ls.len() {
+        let mut j = i;
+        while j + 1 < ls.len() && ls[j + 1] == ls[j] + 1 {
+            j += 1;
+        }
+        out.push(if j > i { format!("{}-{}", ls[i], ls[j]) } else { ls[i].to_string() });
+        i = j + 1;
+    }
+    out.join(", ")
+}
+
+/// Card bytes `build` takes after the weights beside the K/V: the row planes
+/// of a call (`Dev`), the slots' rings, and the prompt path's planes and
+/// attention scores (`Big`, when `big_on`), sized as `build` sizes them.
+fn rows_bytes(cfg: &Cfg, rows: usize, e: usize, k: usize, inter: usize, big_on: bool) -> usize {
+    let (h, nh, nkv, hd) = (cfg.dim, cfg.nh, cfg.nkv, cfg.hd);
+    let (qs, kvs, r) = (nh * hd, nkv * hd, rows);
+    let f4 = |n: usize| n * 4;
+    let h2 = |n: usize| n * 2 + 64;
+    let smax = (NMAX * k).min(e);
+    // f32 planes of `rows x hidden`: h 2, blk and bank MAXB each, pre_h,
+    // bank_out, msg 4, in3 3, gin 4, x 3, r, m, mg, xm, y, fin
+    let planes = f4(r * h) * (2 + 2 * MAXB + 2 + 4 + 3 + 4 + 3 + 6);
+    // f16 planes: xpb 2 x 3, pm 2, pf 2; the attention's and the router's
+    let half = h2(3 * r * h) * 2 + h2(r * h) * 4 + f4(r * qs) + h2(r * qs) * 2 + f4(r * nh) + f4(r * nkv * 4) * 2 + f4(r * e) + f4(r * 256);
+    let part = f4(NMAX * nh * cfg.max_seq.div_ceil(ATILE) * (hd + 2));
+    let experts = h2(smax * NMAX * h) * 2 + f4(smax * NMAX * h) + f4(NMAX * smax);
+    let rings = cfg.slots() * (2 * f4(6 * kvs + 6 * h) + f4(2 * NMAX * (kvs + h)));
+    let big = if big_on {
+        let nk = r * k;
+        h2(r * h) * 3 + h2(r * qs) * 2 + wd_cap() + f4(r * e) + f4(nk) * 4 + h2(nk * h) * 2 + h2(nk * inter) * 2 + f4(nk * h) + f4(r * h) * 5 + ATT_SCORES + ATT_SCORES / 2
+    } else {
+        0
+    };
+    planes + half + part + experts + rings + big
+}
+
+/// The stack's place when the card has no room for all of it (the 15 GB
+/// Inkling-2-Mini file on a 12 or 16 GB card): the dense part, the head and
+/// the drafter on the card, and of the routed experts the ones the stack reads
+/// most — a loop layer is applied `passes` times a token, so a byte of its
+/// experts is read that many times as often as one of a layer outside the
+/// loop. What is left lives in mapped host memory, where the same kernels read
+/// it over the bus; the hybrid arm's placement spills in build order instead,
+/// which on this stack would push loop layers out before the layers before it.
+///
+/// Opens the build's arenas (the card's and the host's) and returns each
+/// layer's budget for experts on the card in bytes (`ARENA_EXP_DEV` while that
+/// layer builds), or `None` when every weight fits the card or the overflow is
+/// off (`CMF_HYB_HOST_EXPERTS=0`): the build then runs as it did before.
+///
+/// The card keeps, past the weights, the K/V of every application, the row
+/// planes the build takes after them (`rows_bytes`) and a GiB for cuBLAS, the
+/// call graphs and what the first calls allocate: on an RTX 3060 (12 GB) the
+/// plain eighth of the card (1.5 GiB) beside the K/V of 16 384 positions left
+/// 0.45 GB, and a 4096-token prompt's graph failed to instantiate. The knobs
+/// are the hybrid arm's, so any card places the same way: `CMF_GPU_VRAM_MB`
+/// (a smaller card, for a check on a big one), `CMF_HYB_RESERVE_MB` (the room
+/// past the K/V instead of the planes and the GiB), `CMF_MAX_SEQ` (the K/V).
+#[allow(clippy::too_many_arguments)]
+fn place_experts(st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg, rows: usize, e: usize, k: usize, inter: usize, big_on: bool) -> Res<Option<Vec<usize>>> {
+    if std::env::var("CMF_HYB_HOST_EXPERTS").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let uid = g.model.uid();
+    let hidden = cfg.dim;
+    // a matrix the state holds already (another build of this model) takes no room
+    let one = |st: &State, t: &crate::qtensor::QTensor| match gw_of(t) {
+        Some((_, w)) if st.hyb.mats.contains_key(&(uid, w.idx)) => 0,
+        _ => dev_bytes(t, t.rows(), t.cols()),
+    };
+    // the dense part: the attention's six matrices a layer, the head, the drafter
+    let mut dense = one(st, &g.lm_head);
+    for l in layers {
+        let a = &l.attn;
+        dense += [&a.q, &a.gate, &a.rel, &a.k, &a.v, &a.o].into_iter().map(|t| one(st, t)).sum::<usize>();
+    }
+    if let Some(dr) = &g.draft {
+        for d in &dr.layers {
+            dense += [&d.q, &d.k, &d.v, &d.o, &d.k_ctx, &d.v_ctx, &d.gate, &d.up, &d.down].into_iter().map(|t| one(st, t)).sum::<usize>();
+        }
+        dense += one(st, &dr.fold);
+    }
+    // a layer's routed experts: each one's gate/up pair and its down matrix
+    let exp: Vec<usize> = layers
+        .iter()
+        .map(|l| {
+            l.moe
+                .experts
+                .iter()
+                .map(|[eg, eu, ed]| {
+                    let held = matches!((gw_of(eg), gw_of(eu)), (Some((_, a)), Some((_, b))) if st.hyb.pairs.contains_key(&(uid, a.idx, b.idx)));
+                    (if held { 0 } else { dev_bytes(eg, 2 * inter, hidden) }) + one(st, ed)
+                })
+                .sum()
+        })
+        .collect();
+    let need_exp: usize = exp.iter().sum();
+    // the card past the weights: the K/V of every application (a sliding slot
+    // its window and a call's rows, a full slot the context cap), the row
+    // planes and a GiB for cuBLAS and the graphs (or `CMF_HYB_RESERVE_MB`)
+    let kvs = cfg.nkv * cfg.hd;
+    let kv: usize = cfg.plan().iter().map(|&(li, _)| 2 * ((if layers[li].sliding { cfg.window + rows } else { cfg.max_seq }) * kvs * 2 + 64)).sum();
+    let past = match std::env::var("CMF_HYB_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(mb) => mb << 20,
+        None => rows_bytes(cfg, rows, e, k, inter, big_on) + (1 << 30),
+    };
+    let room = super::super::card_free().saturating_sub(kv + past);
+    if dense + need_exp <= room {
+        return Ok(None);
+    }
+    if dense > room {
+        return Err(format!(
+            "{:.1} GB of dense weights past the card's room of {:.1} GB beside {:.2} GB of caches (CMF_HYB_RESERVE_MB, CMF_MAX_SEQ)",
+            dense as f64 / 1e9,
+            room as f64 / 1e9,
+            kv as f64 / 1e9
+        ));
+    }
+    // the card's room for experts goes to the layers read most a token (the
+    // loop first), then by depth; the last layer it reaches keeps a part
+    let reads = |li: usize| if (cfg.core_start..cfg.core_end).contains(&li) { cfg.passes } else { 1 };
+    let mut order: Vec<usize> = (0..layers.len()).collect();
+    order.sort_by_key(|&li| (std::cmp::Reverse(reads(li)), li));
+    let mut left = room - dense;
+    let mut card = vec![0usize; layers.len()];
+    for &li in &order {
+        card[li] = exp[li].min(left);
+        left -= card[li];
+    }
+    let on_card: usize = card.iter().sum();
+    let host = need_exp - on_card;
+    // pinned pages are not reclaimed: past the host's room the plan is declined
+    // (the host runs the sequence) instead of ending in the OOM killer
+    let host_cap = host + host / 64 + (64 << 20);
+    let hroom = host_room();
+    if host_cap > hroom / 4 * 3 {
+        return Err(format!("{:.1} GB of routed experts past the card, {:.1} GB of host memory to pin them in", host as f64 / 1e9, hroom as f64 / 1e9));
+    }
+    // every matrix rounds to 256 bytes in an arena
+    let nmat = layers.iter().map(|l| 6 + 2 * l.moe.experts.len()).sum::<usize>() + 64;
+    let dev_cap = dense + on_card + nmat * 256;
+    let a = Buf::new(dev_cap)?;
+    ARENA.with(|x| x.set((a.ptr, dev_cap, 0)));
+    st.hyb.arenas.push(a);
+    let h = HostArena::big(host_cap)?;
+    ARENA_HOST.with(|x| x.set((h.dev, host_cap, 0)));
+    st.hyb.host_arenas.push(h);
+    let spilled: Vec<usize> = (0..layers.len()).filter(|&li| card[li] < exp[li]).collect();
+    let all_reads: usize = (0..layers.len()).map(|li| reads(li) * exp[li]).sum();
+    let card_reads: usize = (0..layers.len()).map(|li| reads(li) * card[li]).sum();
+    tracing::info!(
+        "inkling2_loop on CUDA: {:.1} GB of weights on the card beside {:.2} GB of K/V and {:.2} GB kept for the calls, {:.1} GB of routed experts (layers {}) in mapped host memory, read over the bus; {:.0} % of a token's expert reads stay on the card (CMF_HYB_HOST_EXPERTS=0: no overflow)",
+        (dense + on_card) as f64 / 1e9,
+        kv as f64 / 1e9,
+        past as f64 / 1e9,
+        host as f64 / 1e9,
+        ranges(&spilled),
+        100.0 * card_reads as f64 / all_reads.max(1) as f64
+    );
+    Ok(Some(card))
+}
+
 fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Res<Dev> {
     let t0 = std::time::Instant::now();
     // the 6144 expert matrices (1.3 and 2.7 MB) as pieces of shared slabs: the
@@ -643,6 +821,18 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     let k = cfg.top_k;
     let inter = layers.first().and_then(|l| l.moe.experts.first()).map_or(0, |x| x[0].rows());
     let smax = (NMAX * k).min(e);
+    // a card short of the stack: the experts it reads least in mapped host
+    // memory (`place_experts`); the arenas close with the drafter's build
+    struct ArenaEnd;
+    impl Drop for ArenaEnd {
+        fn drop(&mut self) {
+            ARENA.with(|x| x.set((0, 0, 0)));
+            ARENA_HOST.with(|x| x.set((0, 0, 0)));
+            ARENA_EXP_DEV.with(|x| x.set(usize::MAX));
+        }
+    }
+    let arena_end = ArenaEnd;
+    let budgets = place_experts(st, g, layers, cfg, rows, e, k, inter, big_on)?;
     let mut dl = Vec::with_capacity(layers.len());
     for (li, l) in layers.iter().enumerate() {
         let a = &l.attn;
@@ -660,6 +850,9 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         // (kind bit 0x2000: the gate's cap in `lim`, the up branch's in pad[0])
         let mut gu_t = Vec::with_capacity(e);
         let mut dn_t = Vec::with_capacity(e);
+        if let Some(b) = &budgets {
+            ARENA_EXP_DEV.with(|x| x.set(b[li]));
+        }
         EXPERT_MAT.with(|x| x.set(true));
         let built = (|| -> Res<()> {
             for [eg, eu, ed] in &l.moe.experts {
@@ -787,6 +980,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         },
         None => None,
     };
+    drop(arena_end);
     // the prompt path: every dense weight in a codec it expands (q4tp, int8)
     let big = if big_on && dl.iter().all(|l| l.dense.iter().all(|m| matches!(m.kind, 5 | 6 | 15))) && inter % 32 == 0 && e <= 1024 {
         let wmax = dl.iter().flat_map(|l| l.dense.iter().map(|m| m.rows * m.cols)).max().unwrap_or(0);
