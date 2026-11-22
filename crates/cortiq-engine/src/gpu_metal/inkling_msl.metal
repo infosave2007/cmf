@@ -1815,3 +1815,84 @@ kernel void ink_argmax(device const float* lg [[buffer(0)]], device uint* out [[
         out[r] = x;
     }
 }
+
+// A q8_2f matrix over up to 8 rows (`p.n`) on the matrix unit — the drafter's
+// block: x·col (`ink_xcol`) staged as half, a weight converted once, the
+// 8×8×8 products on the simdgroup matrices, 64 matrix rows a threadgroup
+// (`q4tp_mul_mm_n8`'s tiling); `p.V` adds into y. Grid rows/64, 128 threads;
+// cols % 64 == 0.
+kernel void ink_q8mm8(device const char* q [[buffer(0)]], device const float* xc [[buffer(1)]],
+                      device const float* rs [[buffer(2)]], device float* y [[buffer(3)]],
+                      constant uint& cols [[buffer(4)]], constant uint& rows [[buffer(5)]],
+                      constant IP& p [[buffer(15)]],
+                      uint tiitg [[thread_index_in_threadgroup]], uint sgitg [[simdgroup_index_in_threadgroup]],
+                      uint tg [[threadgroup_position_in_grid]])
+{
+    // sa: [kb 8][row 64][k 8] halves; sb: [kb 8][b 8][k 8]
+    threadgroup half sa[8u * 512u];
+    threadgroup half sb[8u * 64u];
+    threadgroup float* sc = (threadgroup float*)sa;
+    const uint nb = p.n;
+    const uint r0 = tg * 64u;
+    const uint lr = tiitg >> 1u, il = tiitg & 1u;
+    const uint r = min(r0 + lr, rows - 1u);
+    device const uint4* wrow = (device const uint4*)(q + (ulong)r * cols) + il * 2u;
+    const uint xb = tiitg >> 3u, xkb = tiitg & 7u;
+    const bool xrole = tiitg < 64u && xb < nb;
+    device const float4* xrow = (device const float4*)(xc + (ulong)xb * cols + xkb * 8u);
+    threadgroup half* my_sa = sa + (4u * il) * 512u + lr * 8u;
+    threadgroup half* my_sb = sb + xkb * 64u + xb * 8u;
+    if (tiitg < 64u && !xrole) {
+        *(threadgroup uint4*)(my_sb) = uint4(0u);
+    }
+    simdgroup_half8x8 ma0, ma1, mb;
+    simdgroup_float8x8 mc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 mc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint niter = cols >> 6u;
+    for (uint it = 0u; it < niter; ++it) {
+        // this thread's 32 weights of the chunk (two 16 B loads) and its x slice
+        const uint4 w0 = wrow[it * 4u], w1 = wrow[it * 4u + 1u];
+        float4 xv0 = float4(0.0f), xv1 = float4(0.0f);
+        if (xrole) {
+            xv0 = xrow[it * 16u];
+            xv1 = xrow[it * 16u + 1u];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            const char4 a = as_type<char4>(ws[2u * j]), b = as_type<char4>(ws[2u * j + 1u]);
+            *(threadgroup half4*)(my_sa + j * 512u) = half4(a);
+            *(threadgroup half4*)(my_sa + j * 512u + 4u) = half4(b);
+        }
+        if (xrole) {
+            *(threadgroup half4*)(my_sb) = half4(xv0);
+            *(threadgroup half4*)(my_sb + 4u) = half4(xv1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* la = sa + sgitg * 128u;
+        #pragma clang loop unroll(full)
+        for (short kb = 0; kb < 8; ++kb) {
+            simdgroup_load(mb, sb + kb * 64, 8, ulong2(0, 0), true);
+            simdgroup_load(ma0, la + kb * 512, 8, ulong2(0, 0), false);
+            simdgroup_load(ma1, la + kb * 512 + 64, 8, ulong2(0, 0), false);
+            simdgroup_multiply_accumulate(mc0, ma0, mb, mc0);
+            simdgroup_multiply_accumulate(mc1, ma1, mb, mc1);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* my_sc = sc + sgitg * 128u;
+    simdgroup_store(mc0, my_sc, 8, ulong2(0, 0), false);
+    simdgroup_store(mc1, my_sc + 64, 8, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint orow = r0 + lr;
+    if (orow < rows) {
+        threadgroup const float* src = sc + (lr >> 4u) * 128u + (lr & 15u) * 8u;
+        const float s = rs[orow];
+        for (uint b = il * 4u; b < min(il * 4u + 4u, nb); ++b) {
+            const ulong at = (ulong)b * rows + orow;
+            const float v = src[b] * s;
+            y[at] = p.V != 0u ? y[at] + v : v;
+        }
+    }
+}

@@ -1285,6 +1285,17 @@ pub struct SpecPolicy {
     verified: Option<usize>,
     wasted: bool,
     t_draft: f32,
+    /// How often a reached draft holds by the probability the drafter claimed
+    /// for it (`CAL_EDGES` buckets): its claims run high (0.8 claimed, 0.7
+    /// held on code; 0.63, 0.48 on prose).
+    cal: [f32; 5],
+}
+
+/// The claimed-probability buckets' upper edges of [`SpecPolicy::cal`].
+const CAL_EDGES: [f32; 4] = [0.4, 0.6, 0.8, 0.95];
+
+fn cal_bucket(p: f32) -> usize {
+    CAL_EDGES.iter().take_while(|&&e| p >= e).count()
 }
 
 impl Default for SpecPolicy {
@@ -1305,6 +1316,7 @@ impl Default for SpecPolicy {
             verified: None,
             wasted: false,
             t_draft: 0.0,
+            cal: [0.15, 0.4, 0.5, 0.65, 0.85],
         }
     }
 }
@@ -1398,6 +1410,16 @@ impl SpecPolicy {
         Some(self.wall[near] * rel[k] / rel[near])
     }
 
+    /// A gated round's outcome: every draft it reached held or not at the
+    /// probability claimed for it.
+    pub fn calibrate(&mut self, p: &[f32], verified: usize, accepted: usize) {
+        for (j, &pj) in p.iter().enumerate().take(verified.min(accepted + 1)) {
+            let b = cal_bucket(pj);
+            let hit = if j < accepted { 1.0 } else { 0.0 };
+            self.cal[b] += 0.05 * (hit - self.cal[b]);
+        }
+    }
+
     /// A round's realized gain (its tokens against plain steps of the same
     /// time): a run of losing rounds sends the policy to plain steps, 8 at
     /// first and up to 16 while they keep losing.
@@ -1427,7 +1449,7 @@ impl SpecPolicy {
         let (mut best, mut gain) = (0usize, 0f32);
         let (mut reach, mut extra) = (1f32, 0f32);
         for m in 1..=p.len().min(7) {
-            reach *= p[m - 1].clamp(0.0, 1.0);
+            reach *= self.cal[cal_bucket(p[m - 1])];
             extra += reach;
             let Some(pm) = self.price(m) else { break };
             let net = extra * w0 - (pm - self.t_draft - w0);
@@ -1527,6 +1549,28 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     let mut acc = 0usize;
     while acc < drafts.len() && picks[acc] == drafts[acc] {
         acc += 1;
+    }
+    if !probs.is_empty() {
+        state.spec.calibrate(&probs, drafts.len(), acc);
+    }
+    if timed && !probs.is_empty() {
+        // the drafter's calibration: the probability a reached draft claimed
+        // against how often it held, by position
+        static C: std::sync::Mutex<([f64; 8], [f64; 8], [u32; 8], u32)> = std::sync::Mutex::new(([0.0; 8], [0.0; 8], [0; 8], 0));
+        let mut c = C.lock().unwrap();
+        for j in 0..drafts.len().min(8) {
+            if j > acc {
+                break;
+            }
+            c.0[j] += probs[j] as f64;
+            c.1[j] += (j < acc) as u32 as f64;
+            c.2[j] += 1;
+        }
+        c.3 += 1;
+        if c.3 % 64 == 0 {
+            let row: Vec<String> = (0..4).filter(|&j| c.2[j] > 0).map(|j| format!("d{}: p {:.2} held {:.2} (n {})", j + 1, c.0[j] / c.2[j] as f64, c.1[j] / c.2[j] as f64, c.2[j])).collect();
+            eprintln!("dspark calibration: {}", row.join(", "));
+        }
     }
     let keep = acc + 1;
     if keep < ids.len() && !crate::gpu::inkling_ring_back(state.sequence_id, keep) {

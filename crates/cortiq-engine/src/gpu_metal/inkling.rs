@@ -119,6 +119,7 @@ struct Pipes {
     ds_markov: ComputePipelineState,
     ds_pick: ComputePipelineState,
     argmax: ComputePipelineState,
+    q8mm8: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -177,6 +178,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             ds_markov: pso("ink_ds_markov")?,
             ds_pick: pso("ink_ds_pick")?,
             argmax: pso("ink_argmax")?,
+            q8mm8: pso("ink_q8mm8")?,
         })
     });
     match r {
@@ -1497,7 +1499,9 @@ fn q8_rows(p: &Pipes, enc: &ComputeCommandEncoderRef, d: &Dev, m: &Mat, x: (&Buf
     set_bytes_t(enc, 3, &c4);
     grid(enc, ((cols / 4) as u64).div_ceil(256), n as u64, 1, 256);
     let ip = IP { n: n as u32, v: add as u32, ..IP::default() };
-    enc.set_compute_pipeline_state(&p.q8p);
+    // four rows and more (the drafter's block): the matrix unit, x·col as half
+    let mm = n >= q8_mm_min() && cols % 64 == 0 && q8_mm_on();
+    enc.set_compute_pipeline_state(if mm { &p.q8mm8 } else { &p.q8p });
     match wbuf {
         Ok(b) => enc.set_buffer(0, Some(b), 0),
         Err(abs) => d.fbuf.bind(enc, 0, abs),
@@ -1505,10 +1509,30 @@ fn q8_rows(p: &Pipes, enc: &ComputeCommandEncoderRef, d: &Dev, m: &Mat, x: (&Buf
     enc.set_buffer(1, Some(xc), 0);
     enc.set_buffer(2, Some(rs), 0);
     enc.set_buffer(3, Some(y.0), y.1);
-    set_bytes_t(enc, 4, &c4);
-    set_bytes_t(enc, 5, &r);
-    setp(enc, &ip);
-    grid(enc, (*rows as u64).div_ceil(32), 1, 1, 256);
+    if mm {
+        set_bytes_t(enc, 4, &(*cols as u32));
+        set_bytes_t(enc, 5, &r);
+        setp(enc, &ip);
+        grid(enc, (*rows as u64).div_ceil(64), 1, 1, 128);
+    } else {
+        set_bytes_t(enc, 4, &c4);
+        set_bytes_t(enc, 5, &r);
+        setp(enc, &ip);
+        grid(enc, (*rows as u64).div_ceil(32), 1, 1, 256);
+    }
+}
+
+/// Rows from which a q8_2f product takes the matrix unit (`CMF_INKLING_Q8MM_MIN`).
+fn q8_mm_min() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_INKLING_Q8MM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
+}
+
+/// `CMF_INKLING_Q8MM=0`: q8_2f products of four rows and more on `ink_q8p`
+/// (f32 lanes) instead of the matrix unit.
+fn q8_mm_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_Q8MM").as_deref() != Ok("0"))
 }
 
 /// `bytes` of `src` from its offset into `dst` at its offset.
