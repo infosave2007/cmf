@@ -2862,8 +2862,12 @@ pub fn inkling_reset(id: u64) {
 }
 
 /// Inkling's DSpark drafter on the card: up to `k` drafts from `anchor`, the
-/// token sampled for `pos` (CUDA; `None` elsewhere: plain decoding).
+/// token sampled for `pos` (CUDA and Metal; `None` elsewhere: plain decoding).
 pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling::Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::draft(id, g, cfg, anchor, pos, k);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_draft(id, g, cfg, anchor, pos, k);
@@ -2874,6 +2878,10 @@ pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling:
 
 /// The sequence's convolution rings saved before a draft verify.
 pub fn inkling_ring_snap(id: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::ring_snap(id);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_ring_snap(id);
@@ -2884,6 +2892,10 @@ pub fn inkling_ring_snap(id: u64) -> bool {
 
 /// The rings put back as they stand after the verify's first `r` rows.
 pub fn inkling_ring_back(id: u64, r: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::ring_back(id, r);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_ring_back(id, r);
@@ -2896,6 +2908,10 @@ pub fn inkling_ring_back(id: u64, r: usize) -> bool {
 /// for `inkling_row_logits`).
 #[allow(clippy::too_many_arguments)]
 pub fn inkling_verify(id: u64, g: &crate::inkling::Globals, layers: &[crate::inkling::Layer], cfg: &crate::inkling::Cfg, ids: &[u32], pos: usize, picks: &mut Vec<u32>) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::verify(id, g, layers, cfg, ids, pos, picks);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_verify(id, g, layers, cfg, ids, pos, picks);
@@ -2906,6 +2922,10 @@ pub fn inkling_verify(id: u64, g: &crate::inkling::Globals, layers: &[crate::ink
 
 /// Row `r`'s logits of the last `inkling_verify`.
 pub fn inkling_row_logits(id: u64, r: usize, vocab: usize, out: &mut Vec<f32>) -> bool {
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        return crate::gpu_metal::inkling::row_logits(id, r, vocab, out);
+    }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::inkling_row_logits(id, r, vocab, out);
