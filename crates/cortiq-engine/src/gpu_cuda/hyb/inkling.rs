@@ -763,12 +763,17 @@ impl Dev {
 /// `true` when this call ran on the card. `ids` from position `pos0`; the
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
-/// `CMF_INKLING_PDL=1`: the arm's launches with programmatic dependent launch
-/// (sm_90+): a kernel schedules while its predecessor drains.
+/// Programmatic dependent launch for the arm's kernels on sm_90+ (Hopper,
+/// Blackwell): a kernel schedules while its predecessor drains (RTX PRO 6000:
+/// decode 122.7 → 127.6 tok/s, the same text). `CMF_INKLING_PDL=0|1` forces it.
 fn pdl_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("CMF_INKLING_PDL").as_deref() == Ok("1");
+        let on = match std::env::var("CMF_INKLING_PDL").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => super::super::cc_major() >= 9,
+        };
         if on {
             super::super::pdl_set(true);
         }

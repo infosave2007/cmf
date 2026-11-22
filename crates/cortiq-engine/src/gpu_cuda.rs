@@ -1091,6 +1091,12 @@ pub(crate) fn nop_set(f: cs::CUfunction) {
 }
 static PDL_FUNCS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
+/// The device's compute capability (major); 0 before the context.
+static CC_MAJOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn cc_major() -> u32 {
+    CC_MAJOR.load(Ordering::SeqCst)
+}
+
 pub(crate) fn pdl_set(on: bool) {
     PDL_ON.store(on, Ordering::SeqCst);
 }
@@ -1165,6 +1171,7 @@ fn init() -> Res<Ctx> {
     let attr = |a| unsafe { cu::device::get_attribute(dev, a) }.unwrap_or(0);
     let major = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
     let minor = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+    CC_MAJOR.store(major as u32, Ordering::SeqCst);
     let arch = match (major, minor) {
         (7, 5) => Some("compute_75"),
         (8, 0) => Some("compute_80"),
