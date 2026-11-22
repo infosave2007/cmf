@@ -2619,13 +2619,29 @@ __device__ __forceinline__ float rdot_block(const float* __restrict__ w, const f
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
     const float4* w4 = (const float4*)w;
     const float4* x4 = (const float4*)x;
+    const int h4 = hidden >> 2;
     float a = 0.0f;
-    for (int i = threadIdx.x; i < (hidden >> 2); i += blockDim.x) {
-        const float4 u = w4[i], v = x4[i];
-        a = fmaf(u.x, v.x, a);
-        a = fmaf(u.y, v.y, a);
-        a = fmaf(u.z, v.z, a);
-        a = fmaf(u.w, v.w, a);
+    // up to 8 float4s a thread, every load issued before the first sum (a warp
+    // issues in order); the sum's order is the loop's
+    int i0 = threadIdx.x;
+    for (; i0 < h4; i0 += 8 * blockDim.x) {
+        float4 u[8], v[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = i0 + k * blockDim.x;
+            if (i < h4) {
+                u[k] = w4[i];
+                v[k] = x4[i];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            if (i0 + k * blockDim.x >= h4) break;
+            a = fmaf(u[k].x, v[k].x, a);
+            a = fmaf(u[k].y, v[k].y, a);
+            a = fmaf(u[k].z, v[k].z, a);
+            a = fmaf(u[k].w, v[k].w, a);
+        }
     }
     for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
     if (lane == 0) rpart[wp] = a;

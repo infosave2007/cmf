@@ -112,6 +112,10 @@ extern "C" __global__ void ink_mix(const float* __restrict__ blk, int nb, int bs
 // exchange (float4 loads), and — when `nw` is given — the RMS norm of query
 // 0's output in the epilogue (`ink_rms`'s weights, f32 rows and f16 planes).
 // Grid (nq, n), 512 threads.
+// A thread's float4s of a row, all loaded before any is used (a warp issues
+// in order: a loop's next loads would wait for this one's sums).
+#define MIX_TPB 512
+#define MIX_PER ((H / 4 + MIX_TPB - 1) / MIX_TPB)
 __device__ __forceinline__ void mix2_body(int qi, int r, const float* __restrict__ blk, int nb, int bstride,
         const float* __restrict__ x, const float* __restrict__ q, float* __restrict__ out, int ostride,
         const float* __restrict__ nw, float eps, float* __restrict__ xo, u16* __restrict__ p0, u16* __restrict__ p1,
@@ -123,18 +127,31 @@ __device__ __forceinline__ void mix2_body(int qi, int r, const float* __restrict
     const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, nwp = blockDim.x >> 5;
     const int ns = nb + 1, H4 = H / 4;
     const float4* qv = (const float4*)(q + (size_t)qi * H);
+    const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 qq[MIX_PER], v[MIX_PER][MAXS];
+#pragma unroll
+    for (int k = 0; k < MIX_PER; k++) {
+        const int i = tid + k * MIX_TPB;
+        const bool ok = i < H4;
+        qq[k] = ok ? qv[i] : z4;
+#pragma unroll
+        for (int s = 0; s < MAXS; s++) {
+            const float4* sv = (const float4*)(s < nb ? blk + (size_t)r * bstride + (size_t)s * H : x + (size_t)r * H);
+            v[k][s] = (ok && s < ns) ? sv[i] : z4;
+        }
+    }
     float ss[MAXS], dt[MAXS];
 #pragma unroll
     for (int s = 0; s < MAXS; s++) ss[s] = dt[s] = 0.0f;
-    for (int i = tid; i < H4; i += blockDim.x) {
-        const float4 qq = qv[i];
+#pragma unroll
+    for (int k = 0; k < MIX_PER; k++) {
+        if (tid + k * MIX_TPB >= H4) break;
 #pragma unroll
         for (int s = 0; s < MAXS; s++) {
             if (s >= ns) break;
-            const float4* sv = (const float4*)(s < nb ? blk + (size_t)r * bstride + (size_t)s * H : x + (size_t)r * H);
-            const float4 v = sv[i];
-            ss[s] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-            dt[s] += v.x * qq.x + v.y * qq.y + v.z * qq.z + v.w * qq.w;
+            const float4 w = v[k][s], g = qq[k];
+            ss[s] += w.x * w.x + w.y * w.y + w.z * w.z + w.w * w.w;
+            dt[s] += w.x * g.x + w.y * g.y + w.z * g.z + w.w * g.w;
         }
     }
 #pragma unroll
@@ -181,32 +198,38 @@ __device__ __forceinline__ void mix2_body(int qi, int r, const float* __restrict
     float4* o = (float4*)(out + (size_t)qi * ostride + (size_t)r * H);
     const bool norm = nw != nullptr && qi == 0;
     float sq = 0.0f;
-    // a thread reads back only its own float4s in the epilogue
-    for (int i = tid; i < H4; i += blockDim.x) {
-        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 acc[MIX_PER];
+#pragma unroll
+    for (int k = 0; k < MIX_PER; k++) {
+        const int i = tid + k * MIX_TPB;
+        acc[k] = z4;
+        if (i >= H4) break;
 #pragma unroll
         for (int s = 0; s < MAXS; s++) {
             if (s >= ns) break;
-            const float4 v = ((const float4*)(s < nb ? blk + (size_t)r * bstride + (size_t)s * H : x + (size_t)r * H))[i];
-            acc.x = fmaf(wts[s], v.x, acc.x);
-            acc.y = fmaf(wts[s], v.y, acc.y);
-            acc.z = fmaf(wts[s], v.z, acc.z);
-            acc.w = fmaf(wts[s], v.w, acc.w);
+            const float4 w = v[k][s];
+            acc[k].x = fmaf(wts[s], w.x, acc[k].x);
+            acc[k].y = fmaf(wts[s], w.y, acc[k].y);
+            acc[k].z = fmaf(wts[s], w.z, acc[k].z);
+            acc[k].w = fmaf(wts[s], w.w, acc[k].w);
         }
-        o[i] = acc;
-        sq += acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w;
+        o[i] = acc[k];
+        sq += acc[k].x * acc[k].x + acc[k].y * acc[k].y + acc[k].z * acc[k].z + acc[k].w * acc[k].w;
     }
     if (!norm) return;
     sq = block_sum(sq, sh);
     const float inv = rsqrtf(sq / (float)H + eps);
     const float4* w4 = (const float4*)nw;
-    for (int i = tid; i < H4; i += blockDim.x) {
-        const float4 a = o[i], g = w4[i];
-        const float v[4] = {g.x * (a.x * inv), g.y * (a.y * inv), g.z * (a.z * inv), g.w * (a.w * inv)};
-        if (xo) ((float4*)(xo + (size_t)r * H))[i] = make_float4(v[0], v[1], v[2], v[3]);
+#pragma unroll
+    for (int k = 0; k < MIX_PER; k++) {
+        const int i = tid + k * MIX_TPB;
+        if (i >= H4) break;
+        const float4 a = acc[k], g = w4[i];
+        const float vv[4] = {g.x * (a.x * inv), g.y * (a.y * inv), g.z * (a.z * inv), g.w * (a.w * inv)};
+        if (xo) ((float4*)(xo + (size_t)r * H))[i] = make_float4(vv[0], vv[1], vv[2], vv[3]);
         if (p0) {
 #pragma unroll
-            for (int k = 0; k < 4; k++) put2(p0, p1, (size_t)r * pstride + 4 * i + k, v[k]);
+            for (int kk = 0; kk < 4; kk++) put2(p0, p1, (size_t)r * pstride + 4 * i + kk, vv[kk]);
         }
     }
 }
@@ -237,9 +260,21 @@ extern "C" __global__ void ink_fmv3(const float* __restrict__ W0, int r0, const 
     const float4* w = (const float4*)(W + (size_t)o * H);
     const float4* xr = (const float4*)(x + (size_t)r * H);
     float a = 0.0f;
-    for (int i = threadIdx.x; i < H / 4; i += blockDim.x) {
-        const float4 u = w[i], v = xr[i];
-        a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
+    // the thread's float4s loaded before their sums (H/4 over 192 threads: 3)
+    constexpr int FP = (H / 4 + 191) / 192;
+    float4 U[FP], V[FP];
+#pragma unroll
+    for (int k = 0; k < FP; k++) {
+        const int i = threadIdx.x + k * 192;
+        if (i < H / 4) {
+            U[k] = w[i];
+            V[k] = xr[i];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < FP; k++) {
+        if (threadIdx.x + k * 192 >= H / 4) break;
+        a += U[k].x * V[k].x + U[k].y * V[k].y + U[k].z * V[k].z + U[k].w * V[k].w;
     }
     a = block_sum(a, sh);
     if (threadIdx.x == 0) y[(size_t)r * rows + o] = a;
@@ -374,8 +409,23 @@ extern "C" __global__ void ink_gate_down3(const float* __restrict__ x0, const fl
     const float4* dx = (const float4*)(down + (size_t)k * 2 * H);
     const float4* dm = (const float4*)(down + (size_t)k * 2 * H + H);
     float sx = 0.0f, sm = 0.0f, ax = 0.0f, am = 0.0f;
-    for (int i = tid; i < H / 4; i += blockDim.x) {
-        const float4 a = xr[i], b = mr[i], u = dx[i], v = dm[i];
+    // a thread's float4s loaded before their sums (H/4 over 256 threads: 3)
+    constexpr int GP = (H / 4 + 255) / 256;
+    float4 A[GP], Bm[GP], U[GP], V[GP];
+#pragma unroll
+    for (int k = 0; k < GP; k++) {
+        const int i = tid + k * 256;
+        if (i < H / 4) {
+            A[k] = xr[i];
+            Bm[k] = mr[i];
+            U[k] = dx[i];
+            V[k] = dm[i];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < GP; k++) {
+        if (tid + k * 256 >= H / 4) break;
+        const float4 a = A[k], b = Bm[k], u = U[k], v = V[k];
         sx += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
         sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
         ax += u.x * a.x + u.y * a.y + u.z * a.z + u.w * a.w;
@@ -935,11 +985,20 @@ __device__ __forceinline__ void post_body(int i, const float* __restrict__ a, co
         const size_t at = (size_t)j * H + i;
         float x;
         if (MX) {
-            // `hy_moe_combine` into a zeroed row: the same sum in the same order
+            // `hy_moe_combine` into a zeroed row: the same sum in the same
+            // order, eight slots' loads issued before their sums
             float acc = 0.0f;
-            for (int s = 0; s < S; s++) {
-                const float w = wsel[(size_t)j * S + s];
-                if (w != 0.0f) acc = fmaf(w, dnS[((size_t)s * n + j) * H + i], acc);
+            for (int s0 = 0; s0 < S; s0 += 8) {
+                float wv[8], dv[8];
+#pragma unroll
+                for (int u = 0; u < 8; u++) {
+                    const int s = s0 + u;
+                    wv[u] = s < S ? wsel[(size_t)j * S + s] : 0.0f;
+                    dv[u] = s < S ? dnS[((size_t)s * n + j) * H + i] : 0.0f;
+                }
+#pragma unroll
+                for (int u = 0; u < 8; u++)
+                    if (s0 + u < S && wv[u] != 0.0f) acc = fmaf(wv[u], dv[u], acc);
             }
             x = 0.0f + acc;
         } else {
