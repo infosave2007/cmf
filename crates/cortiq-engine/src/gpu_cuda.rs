@@ -1074,7 +1074,8 @@ fn func(module: cs::CUmodule, name: &str) -> Res<cs::CUfunction> {
     let f = unsafe { cu::module::get_function(module, CString::new(name).unwrap()) }
         .map_err(|e| format!("kernel {name}: {e}"))?;
     KT_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(f as usize, name.to_string());
-    if name.starts_with("q4_") {
+    // every kernel of these modules opens with `griddepcontrol.wait` (PDL_PRO)
+    if name.starts_with("q4_") || name.starts_with("ink_") || name.starts_with("hy_") {
         PDL_FUNCS.lock().unwrap().get_or_insert_with(std::collections::HashSet::new).insert(f as usize);
     }
     Ok(f)
