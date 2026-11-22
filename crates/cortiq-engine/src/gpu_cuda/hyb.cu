@@ -902,7 +902,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const int per = (gpr + KS - 1) / KS;
     const int g0 = min(gpr, warp * per), g1 = min(gpr, g0 + per);
 #ifndef MMP_PF2
-#define MMP_PF2 1
+#define MMP_PF2 0
 #endif
     if (PF || (MMP_PF2 && KD && NT == 1)) {
         // the warp's weight words into L2 at once (requests in flight without

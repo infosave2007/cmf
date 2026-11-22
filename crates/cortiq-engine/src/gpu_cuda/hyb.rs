@@ -331,9 +331,9 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     // `CMF_HYB_UG=N` (a measurement): a one-codec decode matvec's groups read
     // ahead per warp (2; the arithmetic does not depend on it)
     let ug = std::env::var("CMF_HYB_UG").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| (1..=8).contains(u)).unwrap_or(2);
-    // `CMF_HYB_PF2=0` (a measurement): a one-codec decode matvec without its
-    // warps' weights prefetched into L2 at the start
-    let pf2 = (std::env::var("CMF_HYB_PF2").as_deref() != Ok("0")) as i32;
+    // `CMF_HYB_PF2=1` (a measurement): a one-codec decode matvec prefetches its
+    // warps' weights into L2 at the start (G4: 174.2 against 182.4 tok/s off)
+    let pf2 = (std::env::var("CMF_HYB_PF2").as_deref() == Ok("1")) as i32;
     let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}"), format!("-DMMP_UG={ug}"), format!("-DMMP_PF2={pf2}")], c.arch)?;
     let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 3];
     for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
