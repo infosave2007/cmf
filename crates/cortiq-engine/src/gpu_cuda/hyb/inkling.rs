@@ -832,9 +832,14 @@ fn group2_on() -> bool {
 }
 
 /// `CMF_INKLING_KT=N` (a measurement): is this the N-th decode call?
-fn kt_call() -> bool {
+/// `CMF_INKLING_KT_ROWS=R` counts the calls of R rows instead (a verify call).
+fn kt_call(rows: usize) -> bool {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if rows != *R.get_or_init(|| std::env::var("CMF_INKLING_KT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) {
+        return false;
+    }
     match N.get_or_init(|| std::env::var("CMF_INKLING_KT").ok().and_then(|v| v.parse().ok())) {
         Some(n) => SEEN.fetch_add(1, Ordering::Relaxed) + 1 == *n,
         None => false,
@@ -1029,7 +1034,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             at += n;
             continue;
         }
-        if n == 1 && kt_call() {
+        if n <= NMAX && kt_call(n) {
             // `CMF_INKLING_KT=N`: the N-th decode call without its graph, every
             // launch between two events, the time a kernel printed
             super::super::kt_start();
