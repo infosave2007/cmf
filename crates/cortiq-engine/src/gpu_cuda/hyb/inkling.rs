@@ -142,6 +142,8 @@ struct Fx {
     fmv3: cs::CUfunction,
     post_mix: cs::CUfunction,
     gate_rr: cs::CUfunction,
+    rms_h: cs::CUfunction,
+    ogate_h: cs::CUfunction,
     gate_d: cs::CUfunction,
     gate_mix2: cs::CUfunction,
     rms: cs::CUfunction,
@@ -588,6 +590,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         fmv3: func(module, "ink_fmv3")?,
         post_mix: func(module, "ink_post_mix")?,
         gate_rr: func(module, "ink_gate_rr")?,
+        rms_h: func(module, "ink_rms_h")?,
+        ogate_h: func(module, "ink_ogate_h")?,
         gate_d: func(module, "ink_gate_d")?,
         gate_mix2: func(module, "ink_gate_mix2")?,
         rms: func(module, "ink_rms")?,
@@ -1957,9 +1961,15 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         st(c, 1, &mut tp)?;
         // 3. the input norms and their f16 rows
         let one = l.sliding && gates.is_none();
+        let th = ((hidden / 4).div_ceil(32) * 32) as u32;
         for j in 0..(if one { 1 } else { 3 }) {
-            c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
-            h16(d.xp[j][0].ptr, d.xp[j][1].ptr, b.x16[j].ptr, hidden)?;
+            if hidden % 4 == 0 && th <= 1024 {
+                // the f16 rows straight from the norm
+                c.launch(f.rms_h, (nu, 1), th, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, b.x16[j].ptr))?;
+            } else {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+                h16(d.xp[j][0].ptr, d.xp[j][1].ptr, b.x16[j].ptr, hidden)?;
+            }
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
         st(c, 2, &mut tp)?;
@@ -2009,9 +2019,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
         }
         st(c, 5, &mut tp)?;
-        let qs_i = qs as i32;
-        c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
-        h16(d.po[0].ptr, d.po[1].ptr, b.o16.ptr, qs)?;
+        c.launch(f.ogate_h, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, b.o16.ptr))?;
         wmul(c, fx, b, wo, b.o16.ptr, d.ya.ptr, hidden, n)?;
         st(c, 6, &mut tp)?;
         // 7. the output convolution; a boundary closes the running sum into a block

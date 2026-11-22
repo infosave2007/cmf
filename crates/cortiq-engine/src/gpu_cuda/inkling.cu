@@ -1179,6 +1179,46 @@ extern "C" __global__ void ink_gate_norm(const float* __restrict__ x, const floa
     }
 }
 
+// A prompt row's weighted RMS norm into f32 (xo, when set) and straight to
+// f16 (the cuBLAS input; no bf16 planes in between). Grid n, H/4 threads.
+extern "C" __global__ void ink_rms_h(const float* __restrict__ x, const float* __restrict__ w, float eps,
+                                     float* __restrict__ xo, u16* __restrict__ h)
+{
+    PDL_PRO();
+    __shared__ float sh[32];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float4* xr = (const float4*)(x + (size_t)r * H);
+    float ss = 0.0f;
+    float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const bool in = tid < H / 4;
+    if (in) {
+        a = xr[tid];
+        ss = a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / (float)H + eps);
+    if (!in) return;
+    const float4 g = ((const float4*)w)[tid];
+    const float4 v = make_float4(g.x * (a.x * inv), g.y * (a.y * inv), g.z * (a.z * inv), g.w * (a.w * inv));
+    if (xo) ((float4*)(xo + (size_t)r * H))[tid] = v;
+    uint2 o;
+    o.x = pk_h(v.x, v.y);
+    o.y = pk_h(v.z, v.w);
+    ((uint2*)(h + (size_t)r * H))[tid] = o;
+}
+
+// `ink_ogate` of a prompt call straight to f16 rows (the O GEMM's input).
+// Grid (NH*HD/256, n).
+extern "C" __global__ void ink_ogate_h(const float* __restrict__ o, const float* __restrict__ gt, u16* __restrict__ h)
+{
+    PDL_PRO();
+    const int W = NH * HD;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= W) return;
+    const size_t at = (size_t)r * W + i;
+    h[at] = f2h(o[at] * sigm(gt[at]));
+}
+
 // `gate_big` without the normed copy: a row's two inverse RMS (x's, m's)
 // into rr [n][2]. Grid n, H/4 threads (rounded to a warp).
 extern "C" __global__ void ink_gate_rr(const float* __restrict__ x, const float* __restrict__ m, float eps,
