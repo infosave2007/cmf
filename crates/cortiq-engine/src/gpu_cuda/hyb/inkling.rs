@@ -101,12 +101,20 @@ fn split_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_SPLIT").as_deref() != Ok("0"))
 }
 
-/// Rows of a prompt call (`CMF_INKLING_ROWS`, 1024: RTX PRO 6000, a 2 048-
-/// token prompt 7 843 → 8 549 tok/s against 512, 2 048 rows 7 747; 16 reads a
-/// prompt on the decode path, 16 rows a call).
+/// Rows of a prompt call (`CMF_INKLING_ROWS`; by the card's size 4096 at 40
+/// GB and more, 2048 at 24 GB, else 1024 — RTX PRO 6000 with flash attention,
+/// prompt tok/s 1024 / 2048 / 4096 rows: 2k 11.4K / 12.4K / 12.4K, 16k 10.2K /
+/// 11.5K / 12.1K; 16 reads a prompt on the decode path, 16 rows a call).
 fn bmax() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(1024, |n| n.clamp(NMAX, 4096)))
+    *N.get_or_init(|| {
+        let by_card = match super::super::card_total() >> 30 {
+            g if g >= 40 => 4096,
+            g if g >= 24 => 2048,
+            _ => 1024,
+        };
+        std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(by_card, |n| n.clamp(NMAX, 4096))
+    })
 }
 
 struct Fx {

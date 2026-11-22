@@ -2729,7 +2729,6 @@ extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __r
     __shared__ float pw[32];
     __shared__ int last;
     __shared__ float rpart[32];
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     // a block a router row (`hy_moe_router4`'s arithmetic)
     for (int e = blockIdx.x; e < E; e += gridDim.x) {
         const float t = rdot_block(Wr + (size_t)e * hidden, xn, hidden, rpart);
@@ -2743,37 +2742,27 @@ extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __r
     }
     __syncthreads();
     if (!last) return;
-    if (wp == 0) {
-        float key[8];
-#pragma unroll
-        for (int q = 0; q < 8; q++) {
-            const int e = lane + 32 * q;
-            float kk = -3.0e38f;
-            if (e < E) {
-                kk = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
-                if ((flags & 4) && bias) kk += bias[e];
-            }
-            key[q] = kk;
+    // the picks by rank, every expert a thread (E <= blockDim): its key's
+    // place among all keys (a larger key first, the smaller expert on a
+    // tie: the argmax order), in parallel instead of k argmax rounds
+    __shared__ float keys[256];
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        float kk = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
+        if ((flags & 4) && bias) kk += bias[e];
+        keys[e] = kk;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        const float ke = keys[e];
+        int rank = 0;
+#pragma unroll 8
+        for (int q = 0; q < E; q++) {
+            const float kq = keys[q];
+            rank += (kq > ke || (kq == ke && q < e)) ? 1 : 0;
         }
-        for (int j = 0; j < k; j++) {
-            float best = -3.0e38f;
-            int bi = 0x7fffffff;
-#pragma unroll
-            for (int q = 0; q < 8; q++) {
-                const int e = lane + 32 * q;
-                if (key[q] > best || (key[q] == best && e < bi)) {
-                    best = key[q];
-                    bi = e;
-                }
-            }
-            moe_argmax(best, bi);
-#pragma unroll
-            for (int q = 0; q < 8; q++)
-                if (lane + 32 * q == bi) key[q] = -3.0e38f;
-            if (lane == 0) {
-                pick[j] = bi;
-                pw[j] = 1.0f / (1.0f + expf(-__ldcg(logits + bi)));
-            }
+        if (rank < k) {
+            pick[rank] = e;
+            pw[rank] = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
         }
     }
     __syncthreads();
