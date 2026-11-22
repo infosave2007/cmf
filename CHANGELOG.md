@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Inkling: a DSpark round whose verify, rollback or row logits failed on the card handed the sequence to the host
+  without its caches, and the next token read past a one-row cache and panicked (`inkling.rs:791`). Every path off
+  the card now replays the sequence's tokens on the host (`card_dropped`), and the host replays them itself when its
+  caches miss positions the tokens have (`host_catch_up`).
+
 ## [0.9.15] — 2026-11-22
 
 ### Changed

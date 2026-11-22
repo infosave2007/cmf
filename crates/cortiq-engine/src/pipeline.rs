@@ -9353,7 +9353,7 @@ impl Pipeline {
                         let (round, k) = match &mut self.inkling {
                             Some(b) => {
                                 let k = b.3.spec.pick(next_pos, room);
-                                let r = if k > 0 { crate::inkling::spec_round(&b.0, &b.1, &b.2, &mut b.3, t_next, next_pos, k, &mut lg) } else { None };
+                                let r = if k > 0 { crate::inkling::spec_round(&b.0, &b.1, &b.2, &mut b.3, t_next, next_pos, k, &mut lg, self.pool.as_deref()) } else { None };
                                 match &r {
                                     Some(extra) => b.3.spec.done(next_pos, k, extra.len()),
                                     None => b.3.spec.done(next_pos, 0, 0),
