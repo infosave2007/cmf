@@ -967,13 +967,12 @@ fn vproj_rows() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_VPROJ").as_deref() == Ok("rows"))
 }
 
-/// DSpark on Metal only when `CMF_INKLING_SPEC` names it (`auto` or a depth):
-/// on the M4 a verify's second row costs ~40 % of a step (the experts'
-/// unpacking), so drafts gain ~7 % on code and JSON at the best depth and lose
-/// on prose; without it the drafter is not built and nothing is committed.
+/// DSpark on Metal unless `CMF_INKLING_SPEC=0`: the drafter is built and the
+/// target's taps committed every call (~1 % of a decode step); rounds run only
+/// when decoding greedily, sized by the drafts' calibrated probabilities.
 fn spec_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_INKLING_SPEC").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_SPEC").as_deref() != Ok("0"))
 }
 
 /// `CMF_INKLING_PROBE_VM=1`: the window probe times a draft verify's call
