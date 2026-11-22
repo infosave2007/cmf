@@ -27,6 +27,36 @@ const MAXB: usize = 4;
 /// Keys a tile of the decode attention takes (`AT` in `inkling.cu`).
 const ATILE: usize = 256;
 
+/// Bytes of a prompt chunk's attention scores (`attn_gemm`): the rows of a
+/// chunk are as many as fit.
+const ATT_SCORES: usize = 128 << 20;
+
+/// `CMF_INKLING_MOE_MMA=0`: a prompt call's experts through the hybrid arm's
+/// grouped tensor-core launches (32 rows a job, two bf16 planes) instead of
+/// `ink_moe_mma` (64 rows a job, f16 rows, 128 output rows a block).
+fn moe_mma_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA").as_deref() != Ok("0"))
+}
+
+/// `CMF_INKLING_MOE_MMA2=0`: `ink_moe_mma` (every warp loads the job's rows
+/// itself) instead of `ink_moe_mma2` (the rows staged once a block through a
+/// cp.async pipeline; L4, a 512-row call's experts 174 → 135 ms, the same sums).
+fn mma2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_MOE_MMA2").as_deref() != Ok("0"))
+}
+
+/// Output tiles of 16 rows an `ink_moe_mma` block takes (4 warps × `MT`).
+const MMA_TILES: usize = 8;
+
+/// `CMF_INKLING_ATTN_GEMM=0`: a prompt call's attention a block a head and row
+/// (`ink_attn`) instead of the cuBLAS products.
+fn attn_gemm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_SPLIT=0`: a decode call's attention a block a head and row
 /// (`ink_attn`) instead of a block a tile of keys.
 fn split_on() -> bool {
@@ -56,6 +86,23 @@ struct Fx {
     attn_split: cs::CUfunction,
     attn_merge: cs::CUfunction,
     h16: cs::CUfunction,
+    f16: cs::CUfunction,
+    attn_soft: cs::CUfunction,
+    gather16: cs::CUfunction,
+    moe_mma: cs::CUfunction,
+    moe_mma2: cs::CUfunction,
+    ring_snap: cs::CUfunction,
+    ring_back: cs::CUfunction,
+    ds_mix: cs::CUfunction,
+    ds_ctx: cs::CUfunction,
+    ds_qk: cs::CUfunction,
+    ds_attn: cs::CUfunction,
+    planes: cs::CUfunction,
+    ds_markov: cs::CUfunction,
+    ds_pick: cs::CUfunction,
+    argmax_rows: cs::CUfunction,
+    gate_norm: cs::CUfunction,
+    gate_mix: cs::CUfunction,
     kv_rows: cs::CUfunction,
     ring_rows: cs::CUfunction,
     post_rows: cs::CUfunction,
@@ -116,7 +163,103 @@ struct SlotD {
     v: Buf,
     ring: usize,
     rings: [Buf; 4],
+    /// A decode call's input rows of each ring (`NMAX` rows) and the rings'
+    /// snapshot: a draft verify rolls them back to its accepted prefix.
+    hist: [Buf; 4],
+    snap: [Buf; 4],
 }
+
+/// `struct RingRef` of inkling.cu.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RingRef {
+    live: u64,
+    snap: u64,
+    hist: u64,
+    width: i32,
+    pad: i32,
+}
+
+/// One dense layer of the DSpark drafter on the card.
+struct DLayerD {
+    qkv: MmaSet,
+    kctx: MmaSet,
+    vctx: MmaSet,
+    kctx_m: Arc<DevMat>,
+    vctx_m: Arc<DevMat>,
+    o: MmaSet,
+    gu: MmaSet,
+    down: MmaSet,
+    in_norm: Buf,
+    post_norm: Buf,
+    q_norm: Buf,
+    k_norm: Buf,
+    kc_norm: Buf,
+    /// The layer's keys and values (f16 `[cell][NKV·HD]`; a sliding layer's a
+    /// ring of its window and more).
+    ck: Buf,
+    cv: Buf,
+    cap: usize,
+    ring: bool,
+    _mats: Vec<Arc<DevMat>>,
+}
+
+/// The DSpark drafter on the card: its layers and caches, the taps the target
+/// leaves in every call, the block's rows and the Markov head.
+struct DraftD {
+    layers: Vec<DLayerD>,
+    /// Application indices whose input rows are tapped (the last target, the
+    /// final normed state, is every call's).
+    taps: Vec<usize>,
+    /// `[targets][rows][H]` f32.
+    tap: Buf,
+    alpha: Buf,
+    /// The mixes' norms `[mixes][H]`.
+    norms: Buf,
+    /// The block's final norm.
+    fnorm: Buf,
+    mixp: [Buf; 2],
+    mixh: Buf,
+    ckb: Buf,
+    cvb: Buf,
+    /// The Markov head's context of recent positions `[FR][H]`.
+    fr: Buf,
+    masks: Buf,
+    x: Buf,
+    xp: [Buf; 2],
+    dq: Buf,
+    dk: Buf,
+    dv: Buf,
+    att: Buf,
+    ap: [Buf; 2],
+    gp: [Buf; 2],
+    hf: Buf,
+    hp: [Buf; 2],
+    dcr: Buf,
+    head: MmaSet,
+    dlog: Buf,
+    rnn_w: Buf,
+    rnn_b: Buf,
+    ch: Buf,
+    cf: Buf,
+    state: Buf,
+    prev: Buf,
+    ids: Buf,
+    w1: Buf,
+    folds: Vec<MmaSet>,
+    fold_b: Buf,
+    latp: [Buf; 2],
+    block: usize,
+    rank: usize,
+    window: usize,
+    theta: f32,
+    eps: f32,
+    inter: usize,
+    _mats: Vec<Arc<DevMat>>,
+}
+
+/// Positions whose Markov context the ring keeps.
+const FR: usize = 16;
 
 /// The prompt path's scratch: the f16 inputs of the weight GEMMs, the band a
 /// weight expands into, the grouped experts' entries, planes and jobs.
@@ -135,6 +278,16 @@ struct Big {
     ys: Buf,
     gu_a: Buf,
     dn_a: Buf,
+    /// A message gate's normed halves `[rows][2H]` and its F and G products
+    /// `[rows][H]` (`gate_big`).
+    gxn: Buf,
+    gtf: Buf,
+    gtg: Buf,
+    /// The attention through cuBLAS (`attn_gemm`): the queries as f16, the
+    /// scores of a chunk of rows `[NH][rows][keys]` f32 and their softmax f16.
+    q16: Buf,
+    sc: Buf,
+    pr: Buf,
 }
 
 struct Dev {
@@ -144,6 +297,12 @@ struct Dev {
     /// prompt path).
     rows: usize,
     big: Option<Big>,
+    /// A prompt call's first position (the host's copy of `cr[0]`).
+    big_pos0: std::cell::Cell<usize>,
+    /// Every application's four rings as `RingRef`s (`ink_ring_snap` / `back`).
+    rings_tab: Buf,
+    nrings: usize,
+    draft: Option<DraftD>,
     layers: Vec<LayerD>,
     slots: Vec<SlotD>,
     head: MmaSet,
@@ -194,6 +353,8 @@ struct Dev {
     pf: [Buf; 2],
     logits: Buf,
     cr: Buf,
+    /// A verify call's greedy pick of each row (`NMAX` ids).
+    pick: Buf,
     smax: usize,
     /// Recorded calls by (rows, logits rows) and the pointers they hold.
     graphs: HashMap<(usize, usize), GraphRec>,
@@ -206,9 +367,12 @@ static DEVICES: Mutex<Option<HashMap<u64, Dev>>> = Mutex::new(None);
 
 /// Stages of `CMF_INKLING_PROF=1` (each closed by a stream sync; the calls
 /// then run without graphs).
-const STAGES: [&str; 11] = ["mix", "msg+gates", "norms", "proj", "qr+kv", "attn", "o", "post", "moe in", "moe", "head"];
-static STAGE_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+const STAGES: [&str; 14] = ["mix", "msg+gates", "norms", "proj", "qr+kv", "attn", "o", "post", "moe in", "moe", "head", "moe route", "moe gu", "moe down"];
+static STAGE_NS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 static PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A prompt call's stages, apart from the decode calls' (`CMF_INKLING_PROF=1`).
+static BIG_NS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+static IN_BIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn prof() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -219,7 +383,8 @@ fn prof() -> bool {
 fn st(c: &Ctx, i: usize, t: &mut std::time::Instant) -> Res<()> {
     if prof() {
         c.sync()?;
-        STAGE_NS[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let to = if IN_BIG.load(Ordering::Relaxed) { &BIG_NS } else { &STAGE_NS };
+        to[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         *t = std::time::Instant::now();
     }
     Ok(())
@@ -230,6 +395,13 @@ fn prof_report() {
     let calls = PROF_CALLS.load(Ordering::Relaxed).max(1);
     let row: Vec<String> = STAGES.iter().zip(&STAGE_NS).map(|(n, v)| format!("{n} {:.2}", v.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64)).collect();
     tracing::info!("inkling2_loop CUDA ms a call ({calls} calls): {}", row.join(", "));
+}
+
+/// One prompt call's stage table (`CMF_INKLING_PROF=1`), then cleared.
+fn prof_report_big(n: usize) {
+    let tot: u64 = BIG_NS.iter().map(|v| v.load(Ordering::Relaxed)).sum();
+    let row: Vec<String> = STAGES.iter().zip(&BIG_NS).filter(|(_, v)| v.load(Ordering::Relaxed) > 0).map(|(name, v)| format!("{name} {:.1}", v.swap(0, Ordering::Relaxed) as f64 / 1e6)).collect();
+    tracing::info!("inkling2_loop CUDA prompt call of {n} rows, {:.1} ms ({:.0} rows/s): {}", tot as f64 / 1e6, n as f64 / (tot as f64 / 1e9), row.join(", "));
 }
 static DECLINED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
@@ -299,6 +471,23 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         attn_split: func(module, "ink_attn_split")?,
         attn_merge: func(module, "ink_attn_merge")?,
         h16: func(module, "ink_h16")?,
+        f16: func(module, "ink_f16")?,
+        gather16: func(module, "ink_gather16")?,
+        moe_mma: func(module, "ink_moe_mma")?,
+        moe_mma2: func(module, "ink_moe_mma2")?,
+        ring_snap: func(module, "ink_ring_snap")?,
+        ring_back: func(module, "ink_ring_back")?,
+        ds_mix: func(module, "ink_ds_mix")?,
+        ds_ctx: func(module, "ink_ds_ctx")?,
+        ds_qk: func(module, "ink_ds_qk")?,
+        ds_attn: func(module, "ink_ds_attn")?,
+        planes: func(module, "ink_planes")?,
+        ds_markov: func(module, "ink_ds_markov")?,
+        ds_pick: func(module, "ink_ds_pick")?,
+        argmax_rows: func(module, "ink_argmax_rows")?,
+        attn_soft: func(module, "ink_attn_soft")?,
+        gate_norm: func(module, "ink_gate_norm")?,
+        gate_mix: func(module, "ink_gate_mix")?,
         kv_rows: func(module, "ink_kv_rows")?,
         ring_rows: func(module, "ink_ring_rows")?,
         post_rows: func(module, "ink_post_rows")?,
@@ -423,6 +612,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             v: h2(rows_kv * kvs)?,
             ring,
             rings: [f4(3 * kvs)?, f4(3 * kvs)?, f4(3 * hidden)?, f4(3 * hidden)?],
+            hist: [f4(NMAX * kvs)?, f4(NMAX * kvs)?, f4(NMAX * hidden)?, f4(NMAX * hidden)?],
+            snap: [f4(3 * kvs)?, f4(3 * kvs)?, f4(3 * hidden)?, f4(3 * hidden)?],
         };
         c.kv_bytes.fetch_add((s.k.bytes + s.v.bytes) as u64, Ordering::Relaxed);
         slots.push(s);
@@ -434,6 +625,24 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     }
     let slots: Vec<SlotD> = by_slot.into_iter().map(|s| s.ok_or_else(|| "a slot without its application".to_string())).collect::<Res<_>>()?;
     let job_b = std::mem::size_of::<HyJob>();
+    let mut tab = Vec::with_capacity(slots.len() * 4);
+    for sl in &slots {
+        for j in 0..4 {
+            tab.push(RingRef { live: sl.rings[j].ptr, snap: sl.snap[j].ptr, hist: sl.hist[j].ptr, width: if j < 2 { kvs } else { hidden } as i32, pad: 0 });
+        }
+    }
+    let rings_tab = Buf::from_slice(&tab)?;
+    let nrings = tab.len();
+    let draft = match &g.draft {
+        Some(dr) => match build_draft(c, st, g, dr, cfg, rows, &hm, cap) {
+            Ok(x) => Some(x),
+            Err(e) => {
+                tracing::warn!("inkling2_loop on CUDA: the DSpark drafter does not build ({e}); plain decoding");
+                None
+            }
+        },
+        None => None,
+    };
     // the prompt path: every dense weight in a codec it expands (q4tp, int8)
     let big = if big_on && dl.iter().all(|l| l.dense.iter().all(|m| matches!(m.kind, 5 | 6 | 15))) && inter % 32 == 0 && e <= 1024 {
         let wmax = dl.iter().flat_map(|l| l.dense.iter().map(|m| m.rows * m.cols)).max().unwrap_or(0);
@@ -455,6 +664,12 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             ys: f4(nk * hidden)?,
             gu_a: Buf::new(jmax * job_b)?,
             dn_a: Buf::new(jmax * job_b)?,
+            gxn: f4(rows * 2 * hidden)?,
+            gtf: f4(rows * hidden)?,
+            gtg: f4(rows * hidden)?,
+            q16: h2(rows * qs)?,
+            sc: Buf::new(ATT_SCORES)?,
+            pr: Buf::new(ATT_SCORES / 2)?,
         })
     } else {
         None
@@ -464,6 +679,10 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         hfx,
         rows,
         big,
+        big_pos0: std::cell::Cell::new(0),
+        rings_tab,
+        nrings,
+        draft,
         layers: dl,
         slots,
         head,
@@ -510,6 +729,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         pf: [h2(rows * hidden)?, h2(rows * hidden)?],
         logits,
         cr: Buf::new(64)?,
+        pick: Buf::new(NMAX * 4)?,
         smax,
         graphs: HashMap::new(),
         cap,
@@ -544,6 +764,33 @@ impl Dev {
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
+    forward_with(id, g, layers, cfg, ids, pos0, want, all, logits, None)
+}
+
+/// A draft verify: every row of `ids` through the target, each row's greedy
+/// pick into `picks` on the card; the logits stay there for `row_logits`.
+pub(crate) fn verify(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, picks: &mut Vec<u32>) -> bool {
+    if ids.len() > NMAX {
+        return false;
+    }
+    let mut none = Vec::new();
+    forward_with(id, g, layers, cfg, ids, pos0, true, true, &mut none, Some(picks))
+}
+
+/// Row `r`'s logits of the last verify.
+pub(crate) fn row_logits(id: u64, r: usize, vocab: usize, out: &mut Vec<f32>) -> bool {
+    let Some(c) = super::super::ctx() else { return false };
+    let guard = DEVICES.lock().unwrap();
+    let Some(d) = guard.as_ref().and_then(|m| m.get(&id)) else { return false };
+    if r >= NMAX {
+        return false;
+    }
+    out.resize(vocab, 0.0);
+    unsafe { cu::memcpy_dtoh_async(out, d.logits.ptr + (r * vocab * 4) as u64, c.stream).is_ok() && c.sync().is_ok() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_with(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>, pick: Option<&mut Vec<u32>>) -> bool {
     let Some(c) = super::super::ctx() else { return false };
     if std::env::var("CMF_INKLING_CUDA").as_deref() == Ok("0") {
         return false;
@@ -596,7 +843,27 @@ pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[
         tracing::warn!("inkling2_loop on CUDA: {} positions past the cap of {}", pos0 + ids.len(), d.cap);
         return false;
     }
-    match forward_(c, d, g, cfg, ids, pos0, want, all, logits) {
+    // `CMF_INKLING_WINDOW_PROBE=1` (a measurement, not a run): after a prompt,
+    // the time of a call of 1..16 rows with every row's logits, as a draft
+    // verify would take it; the sequence's state is spoiled
+    if pos0 > 0 && std::env::var("CMF_INKLING_WINDOW_PROBE").as_deref() == Ok("1") {
+        let vocab = g.lm_head.rows();
+        let mut line = Vec::new();
+        for n in [1usize, 2, 3, 4, 5, 6, 8, 12, 16] {
+            let mut lg = Vec::new();
+            let ids_n = vec![ids.first().copied().unwrap_or(0); n];
+            let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg, None);
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                let _ = forward_(c, d, g, cfg, &ids_n, pos0, true, true, &mut lg, None);
+            }
+            line.push(format!("{n}: {:.2} ms", t.elapsed().as_secs_f64() * 100.0));
+            let _ = vocab;
+        }
+        tracing::info!("inkling2_loop CUDA window probe (a call with every row's logits): {}", line.join(", "));
+        std::process::exit(0);
+    }
+    match forward_(c, d, g, cfg, ids, pos0, want, all, logits, pick) {
         Ok(()) => true,
         Err(e) => {
             tracing::error!("inkling2_loop on CUDA: {e}");
@@ -612,7 +879,7 @@ pub(crate) fn reset(id: u64) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> Res<()> {
+fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>, mut pick: Option<&mut Vec<u32>>) -> Res<()> {
     let hidden = cfg.dim;
     let vocab = g.lm_head.rows();
     if all {
@@ -646,6 +913,7 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             cu::memcpy_htod_async(d.cr.ptr, &[(pos0 + at) as i32, n as i32], c.stream).map_err(derr)?;
         }
         let key = (n, lrows);
+        d.big_pos0.set(pos0 + at);
         if big && all {
             unsafe { call(c, d, cfg, n, 0, vocab)? };
             let mut r0 = 0usize;
@@ -673,6 +941,21 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
         } else {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
         }
+        unsafe { ds_dump_taps(c, d, cfg, n, pos0 + at)? };
+        if lrows > 0 && all && !big {
+            if let Some(p) = pick.as_deref_mut() {
+                let mut v = vec![0i32; lrows];
+                let v_i = vocab as i32;
+                unsafe {
+                    c.launch(d.fx.argmax_rows, (lrows as u32, 1), 1024, 0, kargs!(d.logits.ptr, v_i, d.pick.ptr))?;
+                    cu::memcpy_dtoh_async(&mut v, d.pick.ptr, c.stream).map_err(derr)?;
+                }
+                c.sync()?;
+                p.extend(v.iter().map(|&x| x as u32));
+                at += n;
+                continue;
+            }
+        }
         if lrows > 0 {
             let mut v = vec![0f32; lrows * vocab];
             unsafe { cu::memcpy_dtoh_async(&mut v, d.logits.ptr, c.stream).map_err(derr)? };
@@ -691,6 +974,9 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
 /// The launches of one call of `n` rows (positions from `cr[0]`): the 48
 /// applications, the final mixture and, for the last `lrows` rows, the head.
 unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize) -> Res<()> {
+    if prof() {
+        IN_BIG.store(n > NMAX, Ordering::Relaxed);
+    }
     let hidden = cfg.dim;
     let hb = n * hidden * 4;
     let ost = (d.rows * hidden) as i32;
@@ -699,9 +985,15 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
     let mut hin = d.h[0].ptr;
     let mut nb = 0usize;
     let mut npre = 0usize;
-    for (li, pass) in cfg.plan() {
+    for (ai, (li, pass)) in cfg.plan().into_iter().enumerate() {
         let l = &d.layers[li];
         let s = &d.slots[cfg.slot(li, pass)];
+        // the drafter's taps: this application's input rows
+        if let Some(dr) = &d.draft {
+            if let Some(k) = dr.taps.iter().position(|&t| t == ai) {
+                unsafe { cu::memcpy_dtod_async(dr.tap.ptr + ((k * d.rows * hidden) * 4) as u64, hin, hb, c.stream).map_err(derr)? };
+            }
+        }
         if li == cfg.core_start {
             unsafe {
                 if pass == 0 {
@@ -733,11 +1025,18 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
     unsafe {
         let nb_i = nb as i32;
         c.launch(f.mix, (1, n as u32), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, d.final_q.ptr, d.fin.ptr, ost))?;
+        if let Some(dr) = &d.draft {
+            draft_commit(c, d, dr, cfg, n)?;
+        }
         if lrows > 0 {
             head_rows(c, d, cfg, n - lrows, lrows, vocab)?;
         }
     }
     st(c, 10, &mut tp)?;
+    if prof() && n > NMAX {
+        IN_BIG.store(false, Ordering::Relaxed);
+        prof_report_big(n);
+    }
     if prof() && n == 1 {
         let k = PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if k % 64 == 0 {
@@ -745,6 +1044,348 @@ unsafe fn call(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, lrows: usize, vocab: usize
         }
     }
     Ok(())
+}
+
+/// The drafter's context of a call's rows: the final normed state as the last
+/// tap, the mixes, every layer's context keys and values at the rows'
+/// positions, the Markov head's context into its ring.
+unsafe fn draft_commit(c: &Ctx, d: &Dev, dr: &DraftD, cfg: &Cfg, n: usize) -> Res<()> {
+    let f = &d.fx;
+    let hidden = cfg.dim;
+    let rows = d.rows;
+    let kvs = cfg.nkv * cfg.hd;
+    let nt = dr.taps.len() + 1;
+    let (nul, hs, eps) = (0u64, hidden as i32, cfg.eps as f32);
+    let last = dr.tap.ptr + (((nt - 1) * rows * hidden) * 4) as u64;
+    let (nt_i, rows_i, nmix_i, fr_i) = (nt as i32, rows as i32, (dr.layers.len() + 1) as i32, FR as i32);
+    unsafe {
+        c.launch(f.rms, (n as u32, 1), 256, 0, kargs!(d.fin.ptr, d.final_norm.ptr, eps, last, nul, nul, hs))?;
+        c.launch(
+            f.ds_mix,
+            (n as u32, (dr.layers.len() + 1) as u32),
+            256,
+            0,
+            kargs!(dr.tap.ptr, nt_i, rows_i, dr.alpha.ptr, dr.norms.ptr, dr.eps, nmix_i, dr.mixp[0].ptr, dr.mixp[1].ptr, dr.mixh.ptr, dr.fr.ptr, fr_i, d.cr.ptr),
+        )?;
+        for (l, dl) in dr.layers.iter().enumerate() {
+            let off = ((l * rows * hidden) * 2) as u64;
+            if n <= NMAX {
+                let pl = Planes { p0: dr.mixp[0].ptr + off, p1: dr.mixp[1].ptr + off, p2: dr.mixp[1].ptr + off, stride: hidden };
+                dl.kctx.run(c, &d.hfx, &pl, hidden, n)?;
+                dl.vctx.run(c, &d.hfx, &pl, hidden, n)?;
+            } else {
+                let b = d.big.as_ref().ok_or("a prompt call without the prompt path")?;
+                wmul(c, &d.hfx, b, &dl.kctx_m, dr.mixh.ptr + off, dr.ckb.ptr, kvs, n)?;
+                wmul(c, &d.hfx, b, &dl.vctx_m, dr.mixh.ptr + off, dr.cvb.ptr, kvs, n)?;
+            }
+            let (cap_i, ring_i) = (dl.cap as i32, dl.ring as i32);
+            c.launch(f.ds_ctx, (n as u32, cfg.nkv as u32), cfg.hd as u32, 0, kargs!(dr.ckb.ptr, dr.cvb.ptr, dl.kc_norm.ptr, dr.eps, dr.theta, dl.ck.ptr, dl.cv.ptr, cap_i, ring_i, d.cr.ptr))?;
+        }
+    }
+    Ok(())
+}
+
+/// The drafter on the card (`g.draft`): its matrices in the arm's codecs, its
+/// caches for `cap` positions, the target's head for its block.
+#[allow(clippy::too_many_arguments)]
+fn build_draft(c: &Ctx, st: &mut State, g: &Globals, dr: &crate::inkling::Draft, cfg: &Cfg, rows: usize, hm: &Arc<DevMat>, cap: usize) -> Res<DraftD> {
+    let hidden = cfg.dim;
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let (qs, kvs) = (nh * hd, nkv * hd);
+    let b = dr.block;
+    if dr.layers.is_empty() || dr.targets.len() < 2 || b < 2 || b > NMAX + 1 || dr.rank * 3 > 1024 {
+        return Err("the drafter's geometry".into());
+    }
+    let f4 = |n: usize| Buf::new(n * 4);
+    let h2 = |n: usize| Buf::new(n * 2 + 64);
+    let f32b = |v: &[f32]| Buf::from_slice(v);
+    let inter = dr.layers[0].gate.rows();
+    let x = f4(b * hidden)?;
+    let xp = [h2(b * hidden)?, h2(b * hidden)?];
+    let (dq, dk, dv) = (f4(b * qs)?, f4(b * kvs)?, f4(b * kvs)?);
+    let att = f4(b * qs)?;
+    let ap = [h2(b * qs)?, h2(b * qs)?];
+    let gp = [h2(b * inter)?, h2(b * inter)?];
+    let (ckb, cvb) = (f4(rows * kvs)?, f4(rows * kvs)?);
+    let mut layers = Vec::new();
+    let mut all = Vec::new();
+    for dl in &dr.layers {
+        let (q, k, v, o) = (mat(c, st, &dl.q)?, mat(c, st, &dl.k)?, mat(c, st, &dl.v)?, mat(c, st, &dl.o)?);
+        let (kc, vc, dn) = (mat(c, st, &dl.k_ctx)?, mat(c, st, &dl.v_ctx)?, mat(c, st, &dl.down)?);
+        let (mg, gwg) = gw_of(&dl.gate).ok_or("drafter gate codec")?;
+        let (_, gwu) = gw_of(&dl.up).ok_or("drafter up codec")?;
+        let pm = hmat_pair(c, st, &mg, &gwg, &gwu, inter, hidden)?;
+        let qkv = mmaset(&[(&q, dq.ptr, 0, qs, qs), (&k, dk.ptr, 0, kvs, kvs), (&v, dv.ptr, 0, kvs, kvs)])?;
+        let kctx = mmaset(&[(&kc, ckb.ptr, 0, kvs, kvs)])?;
+        let vctx = mmaset(&[(&vc, cvb.ptr, 0, kvs, kvs)])?;
+        let oset = mmaset(&[(&o, x.ptr, x.ptr, hidden, hidden)])?;
+        let gu = mmaset_pair(&pm, gp[0].ptr, gp[1].ptr, inter)?;
+        let down = mmaset(&[(&dn, x.ptr, x.ptr, hidden, hidden)])?;
+        let lcap = if dl.local { dr.window + 64 } else { cap + b };
+        let ck = Buf::new(lcap * kvs * 2 + 64)?;
+        let cv = Buf::new(lcap * kvs * 2 + 64)?;
+        c.kv_bytes.fetch_add((ck.bytes + cv.bytes) as u64, Ordering::Relaxed);
+        layers.push(DLayerD {
+            qkv,
+            kctx,
+            vctx,
+            kctx_m: kc.clone(),
+            vctx_m: vc.clone(),
+            o: oset,
+            gu,
+            down,
+            in_norm: f32b(&dl.in_norm)?,
+            post_norm: f32b(&dl.post_norm)?,
+            q_norm: f32b(&dl.q_norm)?,
+            k_norm: f32b(&dl.k_norm)?,
+            kc_norm: f32b(&dl.k_ctx_norm)?,
+            ck,
+            cv,
+            cap: lcap,
+            ring: dl.local,
+            _mats: vec![q, k, v, o, kc, vc, dn, pm],
+        });
+    }
+    let nt = dr.targets.len();
+    let mut norms = Vec::with_capacity((dr.layers.len() + 1) * hidden);
+    for dl in &dr.layers {
+        norms.extend_from_slice(&dl.dflare_norm);
+    }
+    norms.extend_from_slice(&dr.markov_norm);
+    let mut masks = Vec::with_capacity((b - 1) * hidden);
+    for _ in 1..b {
+        masks.extend_from_slice(&dr.mask);
+    }
+    let vocab = g.lm_head.rows();
+    let dlog = f4((b - 1) * vocab)?;
+    let head = mmaset(&[(hm, dlog.ptr, 0, vocab, vocab)])?;
+    let fold = mat(c, st, &dr.fold)?;
+    let latp = [h2(dr.rank)?, h2(dr.rank)?];
+    let mut folds = Vec::with_capacity(b - 1);
+    for i in 0..b - 1 {
+        let y = dlog.ptr + ((i * vocab) * 4) as u64;
+        folds.push(mmaset(&[(&fold, y, y, vocab, vocab)])?);
+    }
+    all.push(fold);
+    // the previous token's rows, f16
+    let rank = dr.rank;
+    let mut w1 = vec![0u16; dr.w1.rows() * rank];
+    let mut row = vec![0f32; rank];
+    for r in 0..dr.w1.rows() {
+        dr.w1.row_f32(r, &mut row);
+        for (o, &v) in w1[r * rank..(r + 1) * rank].iter_mut().zip(&row) {
+            *o = cortiq_core::quant::f32_to_f16(v);
+        }
+    }
+    Ok(DraftD {
+        layers,
+        taps: dr.targets[..nt - 1].to_vec(),
+        tap: f4(nt * rows * hidden)?,
+        alpha: f32b(&dr.alpha)?,
+        norms: f32b(&norms)?,
+        fnorm: f32b(&dr.norm)?,
+        mixp: [h2(dr.layers.len() * rows * hidden)?, h2(dr.layers.len() * rows * hidden)?],
+        mixh: h2(dr.layers.len() * rows * hidden)?,
+        ckb,
+        cvb,
+        fr: f4(FR * hidden)?,
+        masks: f32b(&masks)?,
+        x,
+        xp,
+        dq,
+        dk,
+        dv,
+        att,
+        ap,
+        gp,
+        hf: f4(b * hidden)?,
+        hp: [h2(b * hidden)?, h2(b * hidden)?],
+        dcr: Buf::new(64)?,
+        head,
+        dlog,
+        rnn_w: f32b(&dr.rnn_w)?,
+        rnn_b: f32b(&dr.rnn_b)?,
+        ch: f4((b - 1) * 3 * rank)?,
+        cf: f4(3 * rank)?,
+        state: f4(rank)?,
+        prev: Buf::new(64)?,
+        ids: Buf::new(64)?,
+        w1: Buf::from_slice(&w1)?,
+        folds,
+        fold_b: f32b(&dr.fold_b)?,
+        latp,
+        block: b,
+        rank,
+        window: dr.window,
+        theta: dr.rope_theta as f32,
+        eps: dr.eps,
+        inter,
+        _mats: all,
+    })
+}
+
+/// One block of the drafter from the anchor at `pos` (the target has run every
+/// position before it): up to `k` drafts, on the card.
+pub(crate) fn draft_round(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+    let c = super::super::ctx()?;
+    let guard = DEVICES.lock().unwrap();
+    let d = guard.as_ref()?.get(&id)?;
+    let dr = d.draft.as_ref()?;
+    if pos == 0 || k == 0 || pos + dr.block > d.cap {
+        return None;
+    }
+    let k = k.min(dr.block - 1);
+    match unsafe { draft_block(c, d, dr, g, cfg, anchor, pos, k) } {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("inkling2_loop on CUDA: a draft failed: {e}");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draft_block(c: &Ctx, d: &Dev, dr: &DraftD, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k: usize) -> Res<Vec<u32>> {
+    let f = &d.fx;
+    let hidden = cfg.dim;
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let qs = nh * hd;
+    let b = dr.block;
+    let vocab = g.lm_head.rows();
+    let (bu, eps, hs) = (b as u32, dr.eps, hidden as i32);
+    // the anchor's normed embedding, as the target's input row
+    let mut e = vec![0f32; hidden];
+    if (anchor as usize) < g.embed.rows() {
+        g.embed.row_f32(&g.model, anchor as usize, &mut e);
+    }
+    let ms = e.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / hidden as f64;
+    let r = (1.0 / (ms + cfg.eps).sqrt()) as f32;
+    let row0: Vec<f32> = e.iter().zip(&g.embed_norm).map(|(&v, &w)| w * (v * r)).collect();
+    unsafe {
+        cu::memcpy_htod_async(dr.x.ptr, &row0, c.stream).map_err(derr)?;
+        cu::memcpy_dtod_async(dr.x.ptr + (hidden * 4) as u64, dr.masks.ptr, (b - 1) * hidden * 4, c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(dr.dcr.ptr, &[pos as i32, b as i32], c.stream).map_err(derr)?;
+        cu::memcpy_htod_async(dr.prev.ptr, &[anchor as i32], c.stream).map_err(derr)?;
+        cu::memset_d8_async(dr.state.ptr, 0, dr.rank * 4, c.stream).map_err(derr)?;
+        let xpl = Planes { p0: dr.xp[0].ptr, p1: dr.xp[1].ptr, p2: dr.xp[1].ptr, stride: hidden };
+        let nul = 0u64;
+        for dl in &dr.layers {
+            c.launch(f.rms, (bu, 1), 256, 0, kargs!(dr.x.ptr, dl.in_norm.ptr, eps, nul, dr.xp[0].ptr, dr.xp[1].ptr, hs))?;
+            dl.qkv.run(c, &d.hfx, &xpl, hidden, b)?;
+            let (cap_i, ring_i) = (dl.cap as i32, dl.ring as i32);
+            c.launch(f.ds_qk, (bu, (nh + nkv) as u32), hd as u32, 0, kargs!(dr.dq.ptr, dr.dk.ptr, dr.dv.ptr, dl.q_norm.ptr, dl.k_norm.ptr, eps, dr.theta, dl.ck.ptr, dl.cv.ptr, cap_i, ring_i, dr.dcr.ptr))?;
+            let (win_i, b_i) = (if dl.ring { dr.window as i32 } else { 0 }, b as i32);
+            c.launch(f.ds_attn, (nh as u32, bu), 256, 0, kargs!(dr.dq.ptr, dl.ck.ptr, dl.cv.ptr, cap_i, ring_i, win_i, b_i, dr.att.ptr, dr.dcr.ptr))?;
+            let tot = (b * qs) as i32;
+            c.launch(f.planes, ((b * qs).div_ceil(256) as u32, 1), 256, 0, kargs!(dr.att.ptr, dr.ap[0].ptr, dr.ap[1].ptr, tot))?;
+            let apl = Planes { p0: dr.ap[0].ptr, p1: dr.ap[1].ptr, p2: dr.ap[1].ptr, stride: qs };
+            dl.o.run(c, &d.hfx, &apl, qs, b)?;
+            c.launch(f.rms, (bu, 1), 256, 0, kargs!(dr.x.ptr, dl.post_norm.ptr, eps, nul, dr.xp[0].ptr, dr.xp[1].ptr, hs))?;
+            dl.gu.run(c, &d.hfx, &xpl, hidden, b)?;
+            let gpl = Planes { p0: dr.gp[0].ptr, p1: dr.gp[1].ptr, p2: dr.gp[1].ptr, stride: dr.inter };
+            dl.down.run(c, &d.hfx, &gpl, dr.inter, b)?;
+        }
+        // h; the rows after the anchor's through the target's head (the drafts' base logits)
+        c.launch(f.rms, (bu, 1), 256, 0, kargs!(dr.x.ptr, dr.fnorm.ptr, eps, dr.hf.ptr, dr.hp[0].ptr, dr.hp[1].ptr, hs))?;
+        let hpl = Planes { p0: dr.hp[0].ptr + (hidden * 2) as u64, p1: dr.hp[1].ptr + (hidden * 2) as u64, p2: dr.hp[1].ptr + (hidden * 2) as u64, stride: hidden };
+        dr.head.run(c, &d.hfx, &hpl, hidden, k)?;
+        // the recurrence's input terms: W_h · h_{i+1} for every draft, W_f · f
+        // (the Markov context of position pos − 1)
+        let rk = dr.rank;
+        let ws = 2 * rk + 2 * hidden;
+        let w_h = dr.rnn_w.ptr + ((2 * rk) * 4) as u64;
+        let w_f = dr.rnn_w.ptr + ((2 * rk + hidden) * 4) as u64;
+        c.gemm(true, false, 3 * rk, k, hidden, 1.0, w_h, ws, dr.hf.ptr + (hidden * 4) as u64, hidden, 0.0, dr.ch.ptr, 3 * rk, Gemm::F32)?;
+        let fp = dr.fr.ptr + ((((pos - 1) % FR) * hidden) * 4) as u64;
+        c.gemm(true, false, 3 * rk, 1, hidden, 1.0, w_f, ws, fp, hidden, 0.0, dr.cf.ptr, 3 * rk, Gemm::F32)?;
+        let (ws_i, rk_i, v_i) = (ws as i32, rk as i32, vocab as i32);
+        let lpl = Planes { p0: dr.latp[0].ptr, p1: dr.latp[1].ptr, p2: dr.latp[1].ptr, stride: rk };
+        for i in 0..k {
+            let chi = dr.ch.ptr + ((i * 3 * rk) * 4) as u64;
+            c.launch(f.ds_markov, (1, 1), (3 * rk) as u32, 5 * rk * 4, kargs!(chi, dr.cf.ptr, dr.rnn_b.ptr, dr.rnn_w.ptr, ws_i, rk_i, dr.state.ptr, dr.prev.ptr, dr.w1.ptr, dr.latp[0].ptr, dr.latp[1].ptr))?;
+            dr.folds[i].run(c, &d.hfx, &lpl, rk, 1)?;
+            let lg = dr.dlog.ptr + ((i * vocab) * 4) as u64;
+            let i_i = i as i32;
+            c.launch(f.ds_pick, (1, 1), 1024, 0, kargs!(lg, dr.fold_b.ptr, v_i, i_i, dr.ids.ptr, dr.prev.ptr))?;
+        }
+        let mut ids = vec![0i32; k];
+        cu::memcpy_dtoh_async(&mut ids, dr.ids.ptr, c.stream).map_err(derr)?;
+        c.sync()?;
+        let round = DS_ROUND.fetch_add(1, Ordering::Relaxed);
+        if let Some(dir) = ds_dump() {
+            let want = std::env::var("CMF_INKLING_DS_DUMP_ROUND").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            if round == want && !DS_DUMPED.swap(true, Ordering::Relaxed) {
+                let mut hf = vec![0f32; b * hidden];
+                let mut lg = vec![0f32; k * vocab];
+                cu::memcpy_dtoh_async(&mut hf, dr.hf.ptr, c.stream).map_err(derr)?;
+                cu::memcpy_dtoh_async(&mut lg, dr.dlog.ptr, c.stream).map_err(derr)?;
+                c.sync()?;
+                let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+                let _ = std::fs::write(format!("{dir}/h.bin"), bytes(&hf));
+                let _ = std::fs::write(format!("{dir}/logits.bin"), bytes(&lg));
+                let _ = std::fs::write(format!("{dir}/round.json"), format!("{{\"anchor\": {anchor}, \"pos\": {pos}, \"k\": {k}, \"ids\": {ids:?}}}"));
+                tracing::info!("inkling2_loop: the drafter's first round dumped into {dir}");
+            }
+        }
+        Ok(ids.into_iter().map(|v| v as u32).collect())
+    }
+}
+
+/// `CMF_INKLING_DS_DUMP=dir` (a check, not a run): every call's drafter taps
+/// (`taps.bin`, `[tap][rows][hidden]` f32 a call; `taps.idx` a line `pos0 n`
+/// a call) until draft round `CMF_INKLING_DS_DUMP_ROUND` (0: the first), then
+/// that round's normed block rows
+/// (`h.bin`), its drafts' logits before the bias (`logits.bin`) and
+/// `round.json`.
+fn ds_dump() -> Option<&'static str> {
+    static D: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    D.get_or_init(|| std::env::var("CMF_INKLING_DS_DUMP").ok().filter(|v| !v.is_empty())).as_deref()
+}
+
+static DS_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DS_ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn ds_dump_taps(c: &Ctx, d: &Dev, cfg: &Cfg, n: usize, pos0: usize) -> Res<()> {
+    let Some(dir) = ds_dump() else { return Ok(()) };
+    let Some(dr) = &d.draft else { return Ok(()) };
+    if DS_DUMPED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    use std::io::Write;
+    let hidden = cfg.dim;
+    let nt = dr.taps.len() + 1;
+    let mut v = vec![0f32; nt * n * hidden];
+    unsafe {
+        for k in 0..nt {
+            cu::memcpy_dtoh_async(&mut v[k * n * hidden..(k + 1) * n * hidden], dr.tap.ptr + ((k * d.rows * hidden) * 4) as u64, c.stream).map_err(derr)?;
+        }
+    }
+    c.sync()?;
+    let _ = std::fs::create_dir_all(dir);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/taps.bin")).map_err(|e| e.to_string())?;
+    f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(|e| e.to_string())?;
+    let mut ix = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/taps.idx")).map_err(|e| e.to_string())?;
+    writeln!(ix, "{pos0} {n}").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The rings of every application saved before a draft verify.
+pub(crate) fn ring_snap(id: u64) -> bool {
+    let Some(c) = super::super::ctx() else { return false };
+    let guard = DEVICES.lock().unwrap();
+    let Some(d) = guard.as_ref().and_then(|m| m.get(&id)) else { return false };
+    let maxw = (d.slots.first().map_or(0, |s| s.hist[2].bytes / 4 / NMAX)) as u32;
+    unsafe { c.launch(d.fx.ring_snap, (maxw.div_ceil(256), d.nrings as u32), 256, 0, kargs!(d.rings_tab.ptr)).is_ok() && c.sync().is_ok() }
+}
+
+/// The rings put back as they stand after the verify call's first `r` rows.
+pub(crate) fn ring_back(id: u64, r: usize) -> bool {
+    let Some(c) = super::super::ctx() else { return false };
+    let guard = DEVICES.lock().unwrap();
+    let Some(d) = guard.as_ref().and_then(|m| m.get(&id)) else { return false };
+    let maxw = (d.slots.first().map_or(0, |s| s.hist[2].bytes / 4 / NMAX)) as u32;
+    let r_i = r as i32;
+    unsafe { c.launch(d.fx.ring_back, (maxw.div_ceil(256), d.nrings as u32), 256, 0, kargs!(d.rings_tab.ptr, r_i)).is_ok() && c.sync().is_ok() }
 }
 
 /// The head over rows `r0 .. r0 + m` of the final mixture (`m` ≤ `NMAX`):
@@ -842,7 +1483,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             (cfg.nkv as u32, 2),
             cfg.hd as u32,
             0,
-            kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr),
+            kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr),
         )?;
         st(c, 4, &mut tp)?;
         // 6. the attention, its gate, the O projection
@@ -874,7 +1515,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 7. the output convolution; a boundary closes the running sum into a block
         let bslot = if l.boundary { *nb as i32 } else { -1 };
         let hb = hidden.div_ceil(256) as u32;
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni))?;
+        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
         if l.boundary {
             *nb += 1;
         }
@@ -890,11 +1531,11 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
         st(c, 8, &mut tp)?;
         // 9. the routed experts into y
-        moe(c, d, cfg, l, n)?;
+        moe(c, d, cfg, l, n, &mut tp)?;
         st(c, 9, &mut tp)?;
         // 10. the output convolution onto the running sum
         let (nul, m1) = (0u64, -1i32);
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni))?;
+        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni, s.hist[3].ptr))?;
         st(c, 7, &mut tp)?;
     }
     Ok(())
@@ -946,7 +1587,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
             c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
             for j in 0..3 {
-                gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
+                gate_big(c, f, b, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
                 inp[j] = fl(&d.gin, j);
             }
         }
@@ -994,7 +1635,11 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (hd as f32).sqrt());
         let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
-        c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
+        if attn_gemm_on() {
+            attn_gemm(c, d, b, cfg, l, s, n, ext, win, scale)?;
+        } else {
+            c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
+        }
         st(c, 5, &mut tp)?;
         let qs_i = qs as i32;
         c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
@@ -1015,20 +1660,65 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
         let mut mi = d.m.ptr;
         if let Some(gs) = gates {
-            gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+            gate_big(c, f, b, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
             mi = d.mg.ptr;
         }
         let nul = 0u64;
         c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, nul, nul, hs))?;
         st(c, 8, &mut tp)?;
         // 9. the routed experts into y
-        moe_big(c, d, b, cfg, l, n)?;
-        st(c, 9, &mut tp)?;
+        moe_big(c, d, b, cfg, l, n, &mut tp)?;
+        st(c, 13, &mut tp)?;
         // 10. the output convolution onto the running sum
         let m1 = -1i32;
         c.launch(f.post_rows, (hb, nu), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout))?;
         ring(d.y.ptr, &s.rings[3], hidden)?;
         st(c, 7, &mut tp)?;
+    }
+    Ok(())
+}
+
+/// A prompt call's attention through cuBLAS: the queries as f16 rows, per KV
+/// group S = Q·Kᵀ over the slots the call reads (a local layer's whole ring,
+/// a full layer's positions to the call's last), `ink_attn_soft` (scale,
+/// relative bias, window, ring positions, sink, softmax), O = P·V into `att`;
+/// rows in chunks whose scores fit `ATT_SCORES`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_gemm(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, n: usize, ext: i32, win: i32, scale: f32) -> Res<()> {
+    let f = &d.fx;
+    let (nh, nkv, hd) = (cfg.nh, cfg.nkv, cfg.hd);
+    let hpk = nh / nkv;
+    let (qs, kvs) = (nh * hd, nkv * hd);
+    let nk = if s.ring > 0 { s.ring } else { d.big_pos0.get() + n };
+    let chunk = (ATT_SCORES / (nh * nk * 4)).clamp(1, n);
+    let (tot_i, nk_i, ring_i, n_i) = ((n * qs) as i32, nk as i32, s.ring as i32, n as i32);
+    unsafe {
+        c.launch(f.f16, ((n * qs).div_ceil(256) as u32, 1), 256, 0, kargs!(d.yq.ptr, b.q16.ptr, tot_i))?;
+        let mut r0 = 0usize;
+        while r0 < n {
+            let rows = chunk.min(n - r0);
+            for g in 0..nkv {
+                let kp = s.k.ptr + (g * hd * 2) as u64;
+                let qp = b.q16.ptr + ((r0 * qs + g * hpk * hd) * 2) as u64;
+                let sp = b.sc.ptr + ((g * hpk * rows * nk) * 4) as u64;
+                gemm_batched_h(c, true, nk, rows, hd, 1.0, kp, kvs, 0, qp, qs, hd, sp, nk, rows * nk, hpk)?;
+            }
+            let (rows_i, r0_i) = (rows as i32, r0 as i32);
+            c.launch(
+                f.attn_soft,
+                (rows as u32, nh as u32),
+                256,
+                0,
+                kargs!(b.sc.ptr, b.pr.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, nk_i, ring_i, win, scale, rows_i, r0_i, n_i, d.cr.ptr),
+            )?;
+            for g in 0..nkv {
+                let vp = s.v.ptr + (g * hd * 2) as u64;
+                let pp = b.pr.ptr + ((g * hpk * rows * nk) * 2) as u64;
+                let op = d.att.ptr + ((r0 * qs + g * hpk * hd) * 4) as u64;
+                gemm_batched_h(c, false, hd, rows, nk, 1.0, vp, kvs, 0, pp, nk, rows * nk, op, qs, hd, hpk)?;
+            }
+            r0 += rows;
+        }
     }
     Ok(())
 }
@@ -1074,11 +1764,12 @@ unsafe fn wmul(c: &Ctx, fx: &HFuncs, b: &Big, m: &DevMat, x: u64, y: u64, ldy: u
 /// entries sorted by expert and laid out as planes, one tensor-core launch over
 /// every expert's gate/up pair (Inkling's activation in the epilogue) and one
 /// over its down, the weighted mixture into `y`.
-unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
+unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
     let fx = &d.hfx;
     let (hidden, e, k, inter) = (cfg.dim, l.e, cfg.top_k, l.inter);
     let nk = n * k;
-    let rmax = moe_rmax();
+    let mma = moe_mma_on();
+    let rmax = if mma { 64 } else { moe_rmax() };
     let jmax = e + nk.div_ceil(rmax);
     let (gi, tb) = if rmax == 64 { (1usize, 1u32) } else { (0, 2) };
     let (bpg, bpd) = (l.bpj_gu.div_ceil(tb), l.bpj_dn.div_ceil(tb));
@@ -1097,14 +1788,49 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize) ->
             kargs!(b.pidx.ptr, nk_i, k_i, e_i, rmax_i, jmax_i, l.gu_t.ptr, l.dn_t.ptr, b.gu_a.ptr, b.dn_a.ptr, b.pos.ptr, b.src.ptr, b.qq[0].ptr, b.qq[1].ptr, hid_i, inter_i, b.ys.ptr, bg_i, bd_i),
         )?;
         let tot = (nk * hidden) as u64;
+        if mma {
+            // the rows in their places as f16; gate/up (the activation in the
+            // epilogue) into f16 rows, then down into ys
+            let (tot_i, f) = (tot as i32, &d.fx);
+            c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
+            st(c, 11, tp)?;
+            let (one, zero_i, nul) = (1i32, 0i32, 0u64);
+            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            let mm = if mma2_on() { f.moe_mma2 } else { f.moe_mma };
+            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
+            st(c, 12, tp)?;
+            let dx = (hidden.div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
+            cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
+            c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
+            return Ok(());
+        }
         c.launch(fx.moe_gather, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, nk_i, hid_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr))?;
+        st(c, 11, tp)?;
         let fg = fx.mmp_g[gi];
         c.launch(fg, (jmax as u32 * bpg, 1), 32 * 8, 0, kargs!(b.gu_a.ptr, jmax_i, b.xg[0].ptr, b.xg[1].ptr, b.xg[1].ptr, hid_i, rmax_i, hid_i))?;
+        st(c, 12, tp)?;
         c.launch(fg, (jmax as u32 * bpd, 1), 32 * 8, 0, kargs!(b.dn_a.ptr, jmax_i, b.qq[0].ptr, b.qq[1].ptr, b.qq[1].ptr, inter_i, rmax_i, inter_i))?;
         cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
         c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
     }
     Ok(())
+}
+
+/// A prompt call's message gate (`gate`'s arithmetic): the normed halves of
+/// every row, `d = xn · downᵀ`, `F·d` and `G·d` as f32 GEMMs, then the mix.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gate_big(c: &Ctx, f: &Fx, b: &Big, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, n: usize, hidden: usize, eps: f32) -> Res<()> {
+    let r = g.down.bytes / (2 * hidden * 4);
+    let tot = n * hidden;
+    let tot_i = tot as i32;
+    unsafe {
+        c.launch(f.gate_norm, (n as u32, 1), 256, 0, kargs!(x, m, eps, b.gxn.ptr))?;
+        c.gemm(true, false, r, n, 2 * hidden, 1.0, g.down.ptr, 2 * hidden, b.gxn.ptr, 2 * hidden, 0.0, dbuf, r, Gemm::F32)?;
+        c.gemm(true, false, hidden, n, r, 1.0, g.forget.ptr, r, dbuf, r, 0.0, b.gtf.ptr, hidden, Gemm::F32)?;
+        c.gemm(true, false, hidden, n, r, 1.0, g.gain.ptr, r, dbuf, r, 0.0, b.gtg.ptr, hidden, Gemm::F32)?;
+        c.launch(f.gate_mix, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x, m, b.gtf.ptr, b.gtg.ptr, out, tot_i))
+    }
 }
 
 /// A message gate: `out = (1 − tanh F·d)·x + tanh G·d·m`, `d` the rank-R
@@ -1123,7 +1849,7 @@ unsafe fn gate(c: &Ctx, f: &Fx, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, 
 /// this arm's buffers): the router, the picks laid out as slots, every slot's
 /// gate/up pair (Inkling's activation in its epilogue) and down, the mixture
 /// into `y`.
-unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
+unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
     let fx = &d.hfx;
     let hidden = cfg.dim;
     let e = l.e;
@@ -1150,6 +1876,7 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
                 d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
             ),
         )?;
+        st(c, 11, tp)?;
         let t = (tb - 1) as usize;
         let pick = |kd: Option<usize>| match kd {
             Some(dd) => fx.mmpk[nt_of(n)][t][1][dd],
@@ -1157,7 +1884,9 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize) -> Res<()> {
         };
         let xs_i = hidden as i32;
         c.launch(pick(l.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?;
+        st(c, 12, tp)?;
         c.launch(pick(l.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?;
+        st(c, 13, tp)?;
         cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
         let zero = 0i32;
         c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;

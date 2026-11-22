@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] — 2026-11-22
+
+### Added
+- thinkingmachines/TML-d24-varloop-research (`inkling2_loop` with `loop_config.is_varloop`) converts natively, and
+  `--loops N` (`CMF_INKLING_PASSES=N`) runs the looped layers 1 to 5 times (the file's 3 by default; a warning on a
+  file not trained for it). Published 4-bit file, WikiText-2 perplexity at 1 / 3 / 5 passes: 9.930 / 9.239 / 9.218
+  (the release's layers in f32: 9.784 / 9.134 / 9.118); NVIDIA L4 decode 98.5 / 50.6 / 34.7 tok/s.
+- DSpark speculative decoding for `inkling2_loop` on CUDA: the converter packs the release's drafter
+  (`mtp.safetensors`: three dense layers and the Markov head, its head folds made at conversion) as `mtp.*`; the
+  engine taps applications 5, 23, 41 and the final normed state in every target call, runs the block and the head on
+  the card, verifies the anchor and the drafts in one call (each row's pick on the card) and rolls the convolution
+  rings back to the kept prefix. Each round's drafts follow measured tokens per millisecond (plain decoding is one of
+  the depths); `CMF_INKLING_SPEC=0` turns it off, `=N` pins N. Checked against an f32 PyTorch drafter
+  (`scripts/varloop/dspark_ref.py`): same drafts. L4, greedy: code 50.6 → 78.2 tok/s, JSON 50.5 → 68.7, prose ±3 %.
+
+### Changed
+- CUDA, Inkling prompt path: message gates as f32 cuBLAS GEMMs, attention as batched cuBLAS GEMMs around a masked
+  softmax, routed experts through tensor-core kernels (`ink_moe_mma2`: 64 rows a job, rows staged through a cp.async
+  pipeline). A 512-row call on an L4 1000 → 319 ms; a 2 048 / 8 192 / 32 768-token prompt 4.02 / 18.75 / 113 s →
+  1.38 / 5.97 / 32.0 s.
+- wgpu, Inkling decode: the routed experts four rows a workgroup (`ink_moe_gu4` / `ink_moe_dn4`), the block mixes and
+  message gates through one reduction tree, the router and small f32 matvecs on vec4 loads. Vulkan on an L4:
+  19.0 → 35.7 tok/s (after a 2 048-token prompt 16.6 → 27.9), the experts 28.8 → 8.1 ms a token. A prompt's 4-bit
+  dense matrices and its routed experts (grouped by expert, `ink_moe_coop`) on the cooperative-matrix units where the
+  device has them (`CMF_INKLING_COOP=0|dense|moe`): a 2 048 / 8 192 / 16 384-token prompt 18.1 / 82.5 / 189 s →
+  12.9 / 60.7 / 149 s, perplexity 9.237 / 7.576 (CUDA 9.239 / 7.580). `CMF_INKLING_PROF=1` times each kernel by GPU
+  timestamps.
+- Metal, Inkling prompt: message gates as three f32 GEMMs on the simdgroup matrices. M4, a 2 048 / 8 192-token prompt
+  18.3 / 83.9 → 15.3 / 74.2 s.
+
 ## [0.9.12] — 2026-11-21
 
 ### Added

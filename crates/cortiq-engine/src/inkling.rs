@@ -273,6 +273,126 @@ pub struct Globals {
     pub final_query: Vec<f32>,
     /// `[loop, 4, hidden]`: q, k, v, MLP message queries of each loop layer.
     pub message_query: Vec<f32>,
+    /// The DSpark drafter, when the file carries it (`mtp.*`).
+    pub draft: Option<Draft>,
+}
+
+/// One dense layer of the DSpark drafter.
+pub struct DraftLayer {
+    pub q: QTensor,
+    pub k: QTensor,
+    pub v: QTensor,
+    pub o: QTensor,
+    pub k_ctx: QTensor,
+    pub v_ctx: QTensor,
+    pub gate: QTensor,
+    pub up: QTensor,
+    pub down: QTensor,
+    pub dflare_norm: Vec<f32>,
+    pub in_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub k_ctx_norm: Vec<f32>,
+    /// A sliding-window layer (`mtp_config.local_layer_ids`).
+    pub local: bool,
+}
+
+/// The DSpark drafter (the release's `mtp.safetensors`): dense layers over a
+/// block of the anchor and mask rows, their context keys and values made from
+/// the target's taps (`targets`: application indices, the last the final
+/// normed state), and a recurrent Markov head over the target's head.
+pub struct Draft {
+    pub layers: Vec<DraftLayer>,
+    /// softmax(fuse_weight) rows: `[mixes][targets]`, a mix per draft layer and
+    /// the Markov head's last.
+    pub alpha: Vec<f32>,
+    pub mask: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub markov_norm: Vec<f32>,
+    /// The recurrence: `[3 rank][2 rank + 2 hidden]` (state, previous token,
+    /// hidden, context columns) and its bias.
+    pub rnn_w: Vec<f32>,
+    pub rnn_b: Vec<f32>,
+    /// The previous token's row `[vocab][rank]` (f16).
+    pub w1: QTensor,
+    /// head · hidden_out `[vocab][rank]` and head · hidden_out's bias.
+    pub fold: QTensor,
+    pub fold_b: Vec<f32>,
+    pub targets: Vec<usize>,
+    pub window: usize,
+    pub block: usize,
+    pub rank: usize,
+    pub rope_theta: f64,
+    pub eps: f32,
+}
+
+impl Draft {
+    fn load(model: &Arc<CmfModel>, mc: &serde_json::Value, dim: usize) -> Result<Self, CmfError> {
+        let u = |k: &str| -> Result<usize, CmfError> { mc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| err(format!("mtp_config.{k}"))) };
+        let n = u("num_hidden_layers")?;
+        let local: Vec<usize> = mc.get("local_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
+        let targets: Vec<usize> = mc.get("target_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
+        let mut layers = Vec::with_capacity(n);
+        for l in 0..n {
+            let p = format!("mtp.layers.{l}.");
+            layers.push(DraftLayer {
+                q: t(model, &format!("{p}self_attn.q_proj.weight"))?,
+                k: t(model, &format!("{p}self_attn.k_proj.weight"))?,
+                v: t(model, &format!("{p}self_attn.v_proj.weight"))?,
+                o: t(model, &format!("{p}self_attn.o_proj.weight"))?,
+                k_ctx: t(model, &format!("{p}self_attn.k_proj_ctx.weight"))?,
+                v_ctx: t(model, &format!("{p}self_attn.v_proj_ctx.weight"))?,
+                gate: t(model, &format!("{p}mlp.gate_proj.weight"))?,
+                up: t(model, &format!("{p}mlp.up_proj.weight"))?,
+                down: t(model, &format!("{p}mlp.down_proj.weight"))?,
+                dflare_norm: f(model, &format!("{p}dflare_norm.weight"))?,
+                in_norm: f(model, &format!("{p}input_layernorm.weight"))?,
+                post_norm: f(model, &format!("{p}post_attention_layernorm.weight"))?,
+                q_norm: f(model, &format!("{p}self_attn.q_norm.weight"))?,
+                k_norm: f(model, &format!("{p}self_attn.k_norm.weight"))?,
+                k_ctx_norm: f(model, &format!("{p}self_attn.k_norm_ctx.weight"))?,
+                local: local.contains(&l),
+            });
+        }
+        // the mixes' weights, each row softmaxed over the targets
+        let fuse = f(model, "mtp.fuse_weight")?;
+        let nt = targets.len();
+        if nt == 0 || fuse.len() != (n + 1) * nt {
+            return Err(err(format!("mtp fuse_weight: {} values for {} mixes of {nt} targets", fuse.len(), n + 1)));
+        }
+        let mut alpha = fuse.clone();
+        for row in alpha.chunks_mut(nt) {
+            let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let s: f32 = row.iter().map(|&x| (x - m).exp()).sum();
+            for x in row.iter_mut() {
+                *x = (*x - m).exp() / s;
+            }
+        }
+        let rank = u("markov_rank")?;
+        let d = Self {
+            layers,
+            alpha,
+            mask: f(model, "mtp.mask_embed")?,
+            norm: f(model, "mtp.norm.weight")?,
+            markov_norm: f(model, "mtp.markov_head.dflare_norm.weight")?,
+            rnn_w: f(model, "mtp.markov_head.rnn_proj.weight")?,
+            rnn_b: f(model, "mtp.markov_head.rnn_proj.bias")?,
+            w1: t(model, "mtp.markov_head.markov_w1.weight")?,
+            fold: t(model, "mtp.markov_head.fold")?,
+            fold_b: f(model, "mtp.markov_head.fold_b")?,
+            targets,
+            window: u("sliding_window_size")?,
+            block: u("block_size")?,
+            rank,
+            rope_theta: mc.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1e6),
+            eps: mc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32,
+        };
+        if d.rnn_w.len() != 3 * rank * (2 * rank + 2 * dim) || d.mask.len() != dim {
+            return Err(err("mtp: the Markov head's or the mask's shape"));
+        }
+        Ok(d)
+    }
 }
 
 pub struct Cfg {
@@ -348,6 +468,9 @@ pub struct State {
     /// The sequence runs on the card: None not tried yet, Some(false) the
     /// host runs it, Some(true) the card holds its states.
     card: Option<bool>,
+    /// The DSpark depth (kept across sequences: a device's prices and a
+    /// drafter's holds outlive a request).
+    pub spec: SpecPolicy,
 }
 
 static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -362,6 +485,7 @@ impl State {
         self.pos = 0;
         self.tokens.clear();
         self.slots = (0..n_slots).map(|_| SlotState::default()).collect();
+        self.spec.forget_step();
     }
 }
 
@@ -382,7 +506,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     let lu = |k: &str| -> Result<usize, CmfError> { lc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| err(format!("loop_config.{k}"))) };
     let moe = arch.moe.as_ref().ok_or_else(|| err("missing MoE geometry"))?;
     let local: Vec<usize> = c.get("local_layer_ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
-    let cfg = Cfg {
+    let mut cfg = Cfg {
         dim: arch.hidden_size,
         layers: arch.num_layers,
         nh: arch.num_attention_heads,
@@ -410,6 +534,20 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
     if cfg.nkv == 0 || cfg.nh % cfg.nkv != 0 || cfg.block == 0 || cfg.core_start == 0 || cfg.core_end <= cfg.core_start || cfg.core_end > cfg.layers || cfg.passes == 0 {
         return Err(err("geometry"));
     }
+    // `--loops N` (CMF_INKLING_PASSES): the loop core run N times. A varloop file
+    // (TML-d24-varloop-research) was trained at 1 to 5 passes; Inkling-2-Mini at its
+    // file's count only
+    if let Some(n) = passes_override() {
+        let varloop = lc.get("is_varloop").and_then(|v| v.as_bool()) == Some(true);
+        if n != cfg.passes {
+            if varloop {
+                tracing::info!("inkling2_loop: the loop runs {n} passes (the file's default {})", cfg.passes);
+            } else {
+                tracing::warn!("inkling2_loop: the loop runs {n} passes; this file was trained at {} (a varloop file is trained for other counts)", cfg.passes);
+            }
+        }
+        cfg.passes = n;
+    }
     let globals = Globals {
         model: model.clone(),
         embed: Embed::load(model, "model.embed_tokens.weight")?,
@@ -418,6 +556,17 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
         norm: f(model, "model.norm.weight")?,
         final_query: f(model, "model.final_input.query")?,
         message_query: f(model, "model.message_input.query")?,
+        // the drafter: kept off with CMF_INKLING_DRAFT=0
+        draft: match prov.get("mtp_config") {
+            Some(mc) if !mc.is_null() && std::env::var("CMF_INKLING_DRAFT").as_deref() != Ok("0") => match Draft::load(model, mc, cfg.dim) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!("inkling2_loop: the DSpark drafter does not load ({e}); plain decoding");
+                    None
+                }
+            },
+            _ => None,
+        },
     };
     if globals.message_query.len() != cfg.loop_len() * 4 * cfg.dim || globals.final_query.len() != cfg.dim {
         return Err(err("residual queries"));
@@ -489,7 +638,7 @@ pub fn load(model: &Arc<CmfModel>, arch: &ModelArch) -> Result<(Globals, Vec<Lay
             gates,
         });
     }
-    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None };
+    let mut state = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None, spec: SpecPolicy::default() };
     state.reset(cfg.slots());
     Ok((globals, layers, cfg, state))
 }
@@ -883,6 +1032,12 @@ fn host_rows(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, 
     x
 }
 
+/// The loop's pass count asked for at run time (`--loops N` sets
+/// `CMF_INKLING_PASSES`), at least 1.
+pub fn passes_override() -> Option<usize> {
+    std::env::var("CMF_INKLING_PASSES").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1)
+}
+
 /// Rows of a prompt chunk on the host (`CMF_INKLING_CHUNK`, 128).
 fn chunk_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1043,6 +1198,209 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
     }
 }
 
+/// `CMF_INKLING_SPEC`: unset or `auto` lets [`SpecPolicy`] pick each round's
+/// drafts (`usize::MAX` here), 0 is plain decoding, a number pins the drafts a
+/// round offers (the block's 7 at most).
+pub fn spec_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CMF_INKLING_SPEC").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX))
+}
+
+/// A verify of `k` drafts against a plain token, NVIDIA L4 (calls of 1..8
+/// rows: 18.4, 23.1, 25.8, 28.4, 30.7, 32.8, 34.9, 36.9 ms): the price of a
+/// depth no round has timed yet, scaled from the nearest timed one.
+const SPEC_REL: [f32; 8] = [1.0, 1.26, 1.40, 1.54, 1.67, 1.78, 1.90, 2.0];
+
+/// How often draft `j` holds once the one before it held, before a round has
+/// shown it (DSpark's own figures for Inkling 2: a half to two thirds of
+/// drafts kept on prose and chat).
+const SPEC_HOLD_PRIOR: [f32; 7] = [0.70, 0.65, 0.62, 0.60, 0.58, 0.56, 0.55];
+
+/// The DSpark depth that lands the most tokens per millisecond: every round
+/// and plain token is timed from one decode step to the next (the
+/// pipeline's own work included), a depth's price is its running average
+/// (one never timed is scaled from the nearest timed one by [`SPEC_REL`]),
+/// and how often each draft holds is a running average too. 0 drafts, plain
+/// decoding, is a depth like the others; while it wins, a round of 2 every
+/// 32 tokens keeps the holds current.
+#[derive(Clone, Debug)]
+pub struct SpecPolicy {
+    hold: [f32; 7],
+    wall: [f32; 8],
+    seen: [u8; 8],
+    k: usize,
+    dwell: u8,
+    plain_run: u16,
+    picked: Option<std::time::Instant>,
+    last: Option<(std::time::Instant, usize, usize)>,
+}
+
+impl Default for SpecPolicy {
+    fn default() -> Self {
+        Self { hold: SPEC_HOLD_PRIOR, wall: [0.0; 8], seen: [0; 8], k: 3, dwell: 0, plain_run: 0, picked: None, last: None }
+    }
+}
+
+impl SpecPolicy {
+    /// The drafts for the step at `pos` (`room`: tokens the request still
+    /// allows past the anchor). Times the previous step when it ended here.
+    pub fn pick(&mut self, pos: usize, room: usize) -> usize {
+        let now = std::time::Instant::now();
+        self.picked = Some(now);
+        if let Some((t, k, at)) = self.last.take() {
+            if at == pos {
+                let w = now.duration_since(t).as_secs_f32() * 1e3;
+                // a depth's first step builds its call's graph and is not counted
+                match self.seen[k] {
+                    0 => self.seen[k] = 1,
+                    1 => (self.wall[k], self.seen[k]) = (w, 2),
+                    _ if w < self.wall[k] * 4.0 => self.wall[k] += 0.2 * (w - self.wall[k]),
+                    _ => {}
+                }
+            }
+        }
+        let pinned = spec_k();
+        let k = if pinned != usize::MAX {
+            pinned.min(7)
+        } else {
+            self.plan()
+        };
+        let k = if k == 0 && self.plain_run >= 32 { 2 } else { k };
+        k.min(room)
+    }
+
+    /// Record the step just taken at `pos`: `k` drafts offered, `accepted`
+    /// kept (0 and 0 for a plain token).
+    pub fn done(&mut self, pos: usize, k: usize, accepted: usize) {
+        let k = k.min(7);
+        self.last = self.picked.take().map(|t| (t, k, pos + 1 + accepted));
+        if k == 0 {
+            self.plain_run = self.plain_run.saturating_add(1);
+            return;
+        }
+        self.plain_run = 0;
+        for j in 1..=k {
+            if accepted + 1 >= j {
+                let hit = if accepted >= j { 1.0 } else { 0.0 };
+                self.hold[j - 1] += 0.1 * (hit - self.hold[j - 1]);
+            }
+        }
+        // text this predictable is worth a deeper round now and then
+        if k < 7 && self.hold[k - 1] >= 0.9 {
+            for j in k + 1..=7 {
+                self.hold[j - 1] += 0.02 * (self.hold[k - 1] - self.hold[j - 1]);
+            }
+        }
+    }
+
+    /// The step after a reset or a new request is not timed against the last one.
+    pub fn forget_step(&mut self) {
+        self.last = None;
+        self.picked = None;
+    }
+
+    fn price(&self, k: usize) -> Option<f32> {
+        if self.seen[k] >= 2 {
+            return Some(self.wall[k]);
+        }
+        let near = (0..8usize).filter(|&j| self.seen[j] >= 2).min_by_key(|&j| j.abs_diff(k))?;
+        Some(self.wall[near] * SPEC_REL[k] / SPEC_REL[near])
+    }
+
+    fn plan(&mut self) -> usize {
+        let mut rate = [0f32; 8];
+        let (mut tokens, mut reach) = (1.0f32, 1.0f32);
+        for k in 0..8usize {
+            if k > 0 {
+                reach *= self.hold[k - 1];
+                tokens += reach;
+            }
+            match self.price(k) {
+                Some(p) if p > 0.0 => rate[k] = tokens / p,
+                // nothing timed yet: stay
+                _ => return self.k,
+            }
+        }
+        if self.dwell > 0 {
+            self.dwell -= 1;
+            return self.k;
+        }
+        let best = (0..8usize).max_by(|&a, &b| rate[a].total_cmp(&rate[b])).unwrap_or(self.k);
+        if best != self.k && rate[best] > rate[self.k] * 1.04 {
+            if std::env::var("CMF_INKLING_SPEC_TIME").is_ok() {
+                eprintln!("dspark: {} → {best} drafts (a step costs {:.1?} ms, a draft holds {:.2?})", self.k, self.wall, self.hold);
+            }
+            self.k = best;
+            self.dwell = 6;
+        }
+        self.k
+    }
+}
+
+/// One DSpark round at the decode tip, on the card: `anchor` (the token the
+/// sampler took for `pos`) and up to `k` drafts through the target in one
+/// call; the drafts it agrees with (its greedy picks) are kept, the rest rolled
+/// back. Returns the accepted drafts and leaves `logits` the last kept row's;
+/// `None` when no round ran (no drafter, not on the card, a refusal): nothing
+/// changed and the caller forwards the anchor itself.
+pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, anchor: u32, pos: usize, k: usize, logits: &mut Vec<f32>) -> Option<Vec<u32>> {
+    globals.draft.as_ref()?;
+    if k == 0 || state.card != Some(true) || state.pos != pos || pos == 0 {
+        return None;
+    }
+    let timed = std::env::var("CMF_INKLING_SPEC_TIME").is_ok();
+    let t0 = std::time::Instant::now();
+    let mut drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    // `CMF_INKLING_SPEC_JUNK=1` (a check): drafts the model never keeps, so every
+    // round rolls all of them back — the text must stay plain decoding's
+    if std::env::var("CMF_INKLING_SPEC_JUNK").as_deref() == Ok("1") {
+        drafts.iter_mut().for_each(|d| *d = 1);
+    }
+    if drafts.is_empty() || !crate::gpu::inkling_ring_snap(state.sequence_id) {
+        return None;
+    }
+    let t1 = std::time::Instant::now();
+    let mut ids = Vec::with_capacity(drafts.len() + 1);
+    ids.push(anchor);
+    ids.extend_from_slice(&drafts);
+    // each row's greedy pick on the card; only the kept row's logits come over
+    let mut picks = Vec::with_capacity(ids.len());
+    if !crate::gpu::inkling_verify(state.sequence_id, globals, layers, cfg, &ids, pos, &mut picks) || picks.len() != ids.len() {
+        // the card let go mid-round: the host replays what it ran
+        state.card = Some(false);
+        return None;
+    }
+    let vocab = globals.lm_head.rows();
+    let mut acc = 0usize;
+    while acc < drafts.len() && picks[acc] == drafts[acc] {
+        acc += 1;
+    }
+    let keep = acc + 1;
+    if keep < ids.len() && !crate::gpu::inkling_ring_back(state.sequence_id, keep) {
+        state.card = Some(false);
+        return None;
+    }
+    if !crate::gpu::inkling_row_logits(state.sequence_id, acc, vocab, logits) {
+        state.card = Some(false);
+        return None;
+    }
+    state.tokens.extend_from_slice(&ids[..keep]);
+    state.pos = pos + keep;
+    if timed {
+        static T: std::sync::Mutex<(f64, f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0.0, 0));
+        let mut t = T.lock().unwrap();
+        t.0 += (t1 - t0).as_secs_f64() * 1e3;
+        t.1 += t1.elapsed().as_secs_f64() * 1e3;
+        t.2 += (drafts.len() + 1) as f64;
+        t.3 += 1;
+        if t.3 % 64 == 0 {
+            let n = t.3 as f64;
+            eprintln!("dspark: {} rounds, ms a round: drafts {:.2}, verify and rollback {:.2} ({:.1} rows)", t.3, t.0 / n, t.1 / n, t.2 / n);
+        }
+    }
+    Some(drafts[..acc].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1449,49 @@ mod tests {
         slots.sort();
         slots.dedup();
         assert_eq!(slots.len(), 48);
+    }
+
+    #[test]
+    fn the_dspark_depth_follows_the_holds_and_the_prices() {
+        // L4 prices: a plain token 18.4 ms, a verify of k drafts by SPEC_REL
+        let timed = |hold: [f32; 7]| {
+            let mut p = SpecPolicy { hold, ..SpecPolicy::default() };
+            for k in 0..8 {
+                p.wall[k] = 18.4 * SPEC_REL[k] + if k > 0 { 2.0 } else { 0.0 };
+                p.seen[k] = 2;
+            }
+            p.plan()
+        };
+        // text that holds: a deep round
+        assert!(timed([0.95; 7]) >= 6);
+        // drafts that rarely hold: plain decoding
+        assert_eq!(timed([0.15; 7]), 0);
+        // chat-like holds: a short round
+        let k = timed([0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5]);
+        assert!((1..=4).contains(&k), "{k}");
+        // nothing timed yet: the starting depth
+        assert_eq!(SpecPolicy::default().plan(), 3);
+        // one timed depth prices the rest from SPEC_REL
+        let mut p = SpecPolicy::default();
+        p.wall[3] = 28.4;
+        p.seen[3] = 2;
+        assert!((p.price(0).unwrap() - 28.4 / 1.54).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_varloop_plan_runs_the_core_any_number_of_times() {
+        for passes in [1usize, 2, 5] {
+            let c = Cfg { passes, ..cfg() };
+            let plan = c.plan();
+            assert_eq!(plan.len(), 12 + 12 * passes);
+            assert_eq!(c.slots(), 24 + 12 * (passes - 1));
+            assert_eq!(plan.last(), Some(&(23, 0)));
+            let mut slots: Vec<usize> = plan.iter().map(|&(l, p)| c.slot(l, p)).collect();
+            slots.sort();
+            slots.dedup();
+            assert_eq!(slots.len(), c.slots());
+            assert_eq!(slots.last(), Some(&(c.slots() - 1)));
+        }
     }
 
     #[test]

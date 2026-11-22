@@ -9335,6 +9335,54 @@ impl Pipeline {
                             continue 'decode;
                         }
                     }
+                    // ── Inkling 2 DSpark (the file's drafter, greedy): the
+                    // anchor and its drafts through the target in one call,
+                    // the agreed prefix kept, the rest rolled back; the output
+                    // is plain decoding's. ──
+                    if self.inkling.as_ref().is_some_and(|b| b.0.draft.is_some())
+                        && crate::inkling::spec_k() > 0
+                        && task_mask.is_none()
+                        && router.is_none()
+                        && !trace_on
+                        && self.sampler_config.temperature < 1e-6
+                        && self.sampler_config.repetition_penalty == 1.0
+                        && generated + 2 < max_tokens
+                    {
+                        let room = max_tokens.saturating_sub(generated + 1);
+                        let mut lg = Vec::new();
+                        let (round, k) = match &mut self.inkling {
+                            Some(b) => {
+                                let k = b.3.spec.pick(next_pos, room);
+                                let r = if k > 0 { crate::inkling::spec_round(&b.0, &b.1, &b.2, &mut b.3, t_next, next_pos, k, &mut lg) } else { None };
+                                match &r {
+                                    Some(extra) => b.3.spec.done(next_pos, k, extra.len()),
+                                    None => b.3.spec.done(next_pos, 0, 0),
+                                }
+                                (r, k)
+                            }
+                            None => (None, 0),
+                        };
+                        if let Some(extra) = round {
+                            drafted += k;
+                            accepted += extra.len();
+                            self.graph_logits = Some(lg);
+                            next_pos += 1 + extra.len();
+                            let mut stopped = false;
+                            for &id in &extra {
+                                if self.confidence_on {
+                                    confidence.push(0.0);
+                                }
+                                if !commit!(id) {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            if stopped {
+                                break 'decode;
+                            }
+                            continue 'decode;
+                        }
+                    }
                     self.graph_want_logits = fuse_lm;
                     // Greedy burst (CMF_MULTISTEP, off unless explicitly set): while
                     // nothing observes per-token state — pure argmax sampling,

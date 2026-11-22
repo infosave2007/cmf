@@ -96,6 +96,42 @@ kernel void ink_rms(device const float* x [[buffer(0)]], device const float* w [
     for (uint i = tid; i < H; i += nt) xo[(ulong)r * H + i] = w[i] * (xr[i] * inv);
 }
 
+// A prompt call's message gate as GEMMs: the input rows normed and side by
+// side, xn[r] = [x[r] / rms x[r], m[r] / rms m[r]] (2H). Grid n, 256 threads.
+kernel void ink_gate_norm(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
+                          device float* xn [[buffer(2)]], constant IP& p [[buffer(15)]],
+                          uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float sh[32];
+    const uint r = tg_v.x, H = p.H, nt = nt_v.x;
+    device const float* xr = x + (ulong)r * H;
+    device const float* mr = m + (ulong)r * H;
+    float sx = 0.0f, sm = 0.0f;
+    for (uint i = tid; i < H; i += nt) {
+        sx = fma(xr[i], xr[i], sx);
+        sm = fma(mr[i], mr[i], sm);
+    }
+    sx = tg_sum(sx, sh, tid, nt);
+    sm = tg_sum(sm, sh, tid, nt);
+    const float ix = rsqrt(sx / (float)H + p.eps), im = rsqrt(sm / (float)H + p.eps);
+    device float* o = xn + (ulong)r * 2u * H;
+    for (uint i = tid; i < H; i += nt) {
+        o[i] = xr[i] * ix;
+        o[H + i] = mr[i] * im;
+    }
+}
+
+// out = (1 − tanh f)·x + tanh g·m over the call's n·H values. Grid (n·H/256), 256.
+kernel void ink_gate_mix(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
+                         device const float* f [[buffer(2)]], device const float* g [[buffer(3)]],
+                         device float* out [[buffer(4)]], constant IP& p [[buffer(15)]],
+                         uint3 tg_v [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    const ulong i = (ulong)tg_v.x * 256u + tid;
+    if (i < (ulong)p.n * p.H) out[i] = (1.0f - tanh(f[i])) * x[i] + tanh(g[i]) * m[i];
+}
+
 // Message gate, first half: grid (R, n), 256 threads.
 kernel void ink_gate_down(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
                           device const float* down [[buffer(2)]], device float* d [[buffer(3)]],
