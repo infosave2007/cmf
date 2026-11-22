@@ -114,7 +114,9 @@ extern "C" __global__ void ink_mix(const float* __restrict__ blk, int nb, int bs
 // Grid (nq, n), 512 threads.
 // A thread's float4s of a row, all loaded before any is used (a warp issues
 // in order: a loop's next loads would wait for this one's sums).
-#define MIX_TPB 512
+// two float4s a thread (H 2304: 288 threads, 9 warps — fewer warps' reductions
+// than 512 threads' 16); `ink_mix2`'s launches use MIX_TPB threads
+#define MIX_TPB ((((H / 4 + 1) / 2) + 31) / 32 * 32)
 #define MIX_PER ((H / 4 + MIX_TPB - 1) / MIX_TPB)
 __device__ __forceinline__ void mix2_body(int qi, int r, const float* __restrict__ blk, int nb, int bstride,
         const float* __restrict__ x, const float* __restrict__ q, float* __restrict__ out, int ostride,

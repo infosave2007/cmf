@@ -72,6 +72,11 @@ fn rowmap_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ROWMAP").as_deref() != Ok("0"))
 }
 
+/// `ink_mix2`'s block: two float4s of the row a thread (its `MIX_TPB`).
+fn mix_tpb(hidden: usize) -> u32 {
+    ((hidden / 4).div_ceil(2).div_ceil(32) * 32) as u32
+}
+
 /// `CMF_INKLING_QRKV2=1`: the decode sinks and per-token taps inside the qr+kv
 /// launch (`ink_qrkv2`) instead of `ink_fmv3` before it (G4: slower, the dots
 /// serialize in the query and key blocks).
@@ -1618,7 +1623,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             let nb_i = *nb as i32;
             if fuse {
                 let (nw, xo, p0, p1) = if one { (l.norms[0].ptr, d.x[0].ptr, d.xp[0][0].ptr, d.xp[0][1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
-                c.launch(f.mix2, (*nq as u32, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nw, eps, xo, p0, p1, hs))?;
+                c.launch(f.mix2, (*nq as u32, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nw, eps, xo, p0, p1, hs))?;
                 normed = one;
             } else {
                 c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
@@ -1634,7 +1639,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
             if fuse {
                 let nul = 0u64;
-                c.launch(f.mix2, (4, nu), 512, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+                c.launch(f.mix2, (4, nu), mix_tpb(hidden), 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
             } else {
                 c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
             }
@@ -1813,18 +1818,18 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let nb_i = *nb as i32;
         if pm {
             let (nw, xo, p0, p1) = if gates.is_none() { (l.post_norm.ptr, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
-            c.launch(f.post_mix, (1, 1), 512, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, s.hist[2].ptr, nb_i, l.mq.ptr, d.m.ptr, ost, nw, eps, xo, p0, p1, hs))?;
+            c.launch(f.post_mix, (1, 1), mix_tpb(hidden), 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, s.hist[2].ptr, nb_i, l.mq.ptr, d.m.ptr, ost, nw, eps, xo, p0, p1, hs))?;
         }
         if fuse && gates.is_none() {
             // the MoE input's mix and its norm in one launch
             if !pm {
-                c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+                c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
             }
         } else {
             if pm {
             } else if fuse {
                 let nul = 0u64;
-                c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+                c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
             } else {
                 c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
             }
@@ -1906,7 +1911,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let nb_i = *nb as i32;
             if fuse_on() {
                 let nul = 0u64;
-                c.launch(f.mix2, (*nq as u32, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+                c.launch(f.mix2, (*nq as u32, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nul, eps, nul, nul, nul, hs))?;
             } else {
                 c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
             }
@@ -1922,7 +1927,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
             if fuse_on() {
                 let nul = 0u64;
-                c.launch(f.mix2, (4, nu), 512, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+                c.launch(f.mix2, (4, nu), mix_tpb(hidden), 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
             } else {
                 c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
             }
@@ -2004,7 +2009,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         let nb_i = *nb as i32;
         if fuse_on() {
             let nul = 0u64;
-            c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
         } else {
             c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
         }
