@@ -763,6 +763,16 @@ impl Dev {
 /// `true` when this call ran on the card. `ids` from position `pos0`; the
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
+/// `CMF_INKLING_KT=N` (a measurement): is this the N-th decode call?
+fn kt_call() -> bool {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match N.get_or_init(|| std::env::var("CMF_INKLING_KT").ok().and_then(|v| v.parse().ok())) {
+        Some(n) => SEEN.fetch_add(1, Ordering::Relaxed) + 1 == *n,
+        None => false,
+    }
+}
+
 /// Programmatic dependent launch for the arm's kernels on sm_90+ (Hopper,
 /// Blackwell): a kernel schedules while its predecessor drains (RTX PRO 6000:
 /// decode 122.7 → 127.6 tok/s, the same text). `CMF_INKLING_PDL=0|1` forces it.
@@ -948,7 +958,14 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             at += n;
             continue;
         }
-        if big {
+        if n == 1 && kt_call() {
+            // `CMF_INKLING_KT=N`: the N-th decode call without its graph, every
+            // launch between two events, the time a kernel printed
+            super::super::kt_start();
+            unsafe { call(c, d, cfg, n, lrows, vocab)? };
+            c.sync()?;
+            super::super::kt_stop_as("inkling2_loop decode");
+        } else if big {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
         } else if graphs_on() && !prof() {
             if !d.graphs.contains_key(&key) {
