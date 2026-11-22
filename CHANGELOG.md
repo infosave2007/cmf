@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] — 2026-11-22
+
 ### Added
 - thinkingmachines/TML-d24-varloop-research (`inkling2_loop` with `loop_config.is_varloop`) converts natively, and
   `--loops N` (`CMF_INKLING_PASSES=N`) runs the looped layers 1 to 5 times (the file's 3 by default; a warning on a
