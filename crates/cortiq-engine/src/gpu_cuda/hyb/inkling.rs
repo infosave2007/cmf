@@ -346,6 +346,12 @@ struct Big {
     q16: Buf,
     sc: Buf,
     pr: Buf,
+    /// q4tp dense weights kept expanded to f16 between prompt calls (by the
+    /// matrix's body address), while `wf16_left` bytes of the budget remain
+    /// (`CMF_INKLING_WF16_MB`, default the card's free memory past 4 GB, at
+    /// most 4 GB)
+    wf16: std::cell::RefCell<HashMap<u64, Buf>>,
+    wf16_left: std::cell::Cell<usize>,
 }
 
 struct Dev {
@@ -730,6 +736,11 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             o16: h2(rows * qs)?,
             wd: Buf::new(wd_bytes + 64)?,
             wd_elems: wd_bytes / 2,
+            wf16: std::cell::RefCell::new(HashMap::new()),
+            wf16_left: std::cell::Cell::new(match std::env::var("CMF_INKLING_WF16_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(mb) => mb << 20,
+                None => super::super::card_free().saturating_sub(4 << 30).min(4 << 30),
+            }),
             lg: f4(rows * e)?,
             pidx: f4(nk)?,
             pwt: f4(nk)?,
@@ -2035,6 +2046,23 @@ unsafe fn wmul(c: &Ctx, fx: &HFuncs, b: &Big, m: &DevMat, x: u64, y: u64, ldy: u
     let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
     let wd = b.wd.ptr;
     unsafe {
+        if m.kind == 6 {
+            // the f16 copy kept from an earlier call, or made now while the budget lasts
+            if let Some(w16) = b.wf16.borrow().get(&m.w.ptr) {
+                return c.gemm(true, false, m.rows, n, m.cols, 1.0, w16.ptr, m.cols, x, m.cols, 0.0, y, ldy, Gemm::Half);
+            }
+            let bytes = m.rows * m.cols * 2;
+            if bytes <= b.wf16_left.get() {
+                if let Ok(w16) = Buf::direct(bytes + 64) {
+                    let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
+                    c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), w16.ptr, rows_i, cols_i))?;
+                    let p = w16.ptr;
+                    b.wf16_left.set(b.wf16_left.get() - bytes);
+                    b.wf16.borrow_mut().insert(m.w.ptr, w16);
+                    return c.gemm(true, false, m.rows, n, m.cols, 1.0, p, m.cols, x, m.cols, 0.0, y, ldy, Gemm::Half);
+                }
+            }
+        }
         if m.kind == 6 && m.rows * m.cols <= b.wd_elems {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
             c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
