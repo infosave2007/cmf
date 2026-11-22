@@ -16,12 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CMF_INKLING_ROWS` and `CMF_HYB_HOST_EXPERTS=0` steer it; a card that holds the whole stack builds as before.
   RTX 3060 (12 GB): Inkling-2-Mini decodes at 63.3 tok/s and reads a 4 096-token prompt at 1175 tok/s with 4.9 GB of
   experts in host memory, where the build used to decline the card (7.2 tok/s on the host's CPU).
+- MiniMax-H3: H3-Tiny's few-step student (MeanFlow) packs and runs. `animate-pack --dit` takes the ComfyUI file's
+  low-rank adaLN (`linear_2(linear_1(silu(temb)))`, rank 8), its dense final adaLN and both time embedders; the
+  runtime evaluates `temb(t, r) = emb_t(t) + emb_r(r − t)` for every modulation row, a row now being a `(t, r)` clock —
+  the target rows' endpoint is the next point of `linspace(1, 0, steps + 1)` on the video shift, condition rows keep
+  `r = t` — on the host, so CUDA, Vulkan and Metal run it unchanged. `animate --steps` defaults to the file's own count
+  (6 for the student, 4 for the Turbo files). `animate --ref <ppm>` (repeatable) is ref2va: each picture enters the
+  prompt as `<Picture i>: ` and a vision block and the DiT as a reference latent at its own aspect. RTX 3060 (12 GB),
+  CUDA: `h3tiny-17b-fewstep-clipproj4b-q4tp.cmf` (13.0 GB) renders 512×288 × 39 frames with sound in 24 s at 4 steps,
+  where the Turbo small file takes 408 s (its DiT does not fit the card).
 
 ### Fixed
 - Inkling: a DSpark round whose verify, rollback or row logits failed on the card handed the sequence to the host
   without its caches, and the next token read past a one-row cache and panicked (`inkling.rs:791`). Every path off
   the card now replays the sequence's tokens on the host (`card_dropped`), and the host replays them itself when its
   caches miss positions the tokens have (`host_catch_up`).
+- MiniMax-H3 `animate`: `max_tokens` cut the prompt INCLUDING the picture blocks ahead of it, so two references on a
+  768×448 canvas (672 vision rows) left a span past the sequence and the encoder panicked (`qwen3te.rs:661`); the cap
+  now applies to the prompt's text after the pictures.
 
 ## [0.9.15] — 2026-11-22
 

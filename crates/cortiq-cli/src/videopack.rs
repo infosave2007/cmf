@@ -781,17 +781,34 @@ fn pack_dit(
         dit.shape("final_layer.audio_out.weight").unwrap()[0]
     };
 
+    // H3-Tiny's few-step student (ComfyUI single file, `"adaln": "lowrank"`)
+    // carries no curve: every block's adaLN is `linear_2(linear_1(silu(
+    // temb)))` at rank 8, the final layer keeps its dense projection, and
+    // `temb(t, r) = emb_t(t) + emb_r(r − t)` reads the step's endpoint too,
+    // which no 1-D table of t can hold. Those go in as they are, with both
+    // clock embedders, and the runtime evaluates them (`mmh3::TimeEmb`).
+    let lowrank = dit.has("blocks.0.adaln_proj.linear_1.weight");
+    let meanflow = lowrank && dit.has("r_time_embedder.proj_in.weight");
+    if lowrank && lora.is_some() {
+        return Err(anyhow!("--lora on a low-rank (H3-Tiny few-step) DiT: an adapter written for the 33B base does not fit its pruned blocks"));
+    }
+
     // The curve. A pruned base is required: the whole point of this
     // packer is that adaLN never becomes 13 B parameters again.
-    let base_table = dit
-        .get("adaln_t_table")
-        .map_err(|_| anyhow!("{}: not a pruned/curve checkpoint (no adaln_t_table) — pass minimax_h3_*_pruned_bf16.safetensors", path.display()))?;
-    let base_cols = dit.shape("adaln_t_table").unwrap()[1];
-    let grid = dit.shape("adaln_t_table").unwrap()[0];
-    if grid != CURVE_GRID {
-        return Err(anyhow!("adaln_t_table grid {grid} != {CURVE_GRID}"));
-    }
+    let (base_table, base_cols) = if lowrank {
+        (Vec::new(), 0)
+    } else {
+        let t = dit
+            .get("adaln_t_table")
+            .map_err(|_| anyhow!("{}: not a pruned/curve checkpoint (no adaln_t_table) — pass minimax_h3_*_pruned_bf16.safetensors", path.display()))?;
+        let grid = dit.shape("adaln_t_table").unwrap()[0];
+        if grid != CURVE_GRID {
+            return Err(anyhow!("adaln_t_table grid {grid} != {CURVE_GRID}"));
+        }
+        (t, dit.shape("adaln_t_table").unwrap()[1])
+    };
     let (curve, t_dim) = match temb_path {
+        Some(_) if lowrank => return Err(anyhow!("--time-embedder: a low-rank DiT carries its own time embedders")),
         Some(p) => time_curve(&StFile::open(p)?, lora.as_ref(), scale)?,
         None if lora.is_some() => {
             return Err(anyhow!(
@@ -827,7 +844,19 @@ fn pack_dit(
                 Level::F32,
             )?;
         }
-        if prefix.starts_with("blocks.") {
+        if prefix.starts_with("blocks.") && lowrank {
+            // `linear_1` stays f32 (the runtime reads it a step, 8 × 2688);
+            // `linear_2` is the curve basis in the curve's own codec.
+            let a = format!("{prefix}.adaln_proj");
+            for (k, o, l) in [
+                ("linear_1.weight", "adaln.lin1.weight", Level::F32),
+                ("linear_1.bias", "adaln.lin1.bias", Level::F32),
+                ("linear_2.weight", "adaln.weight", Level::F16),
+                ("linear_2.bias", "adaln.bias", Level::F32),
+            ] {
+                push_exact(specs, &dit, &format!("{a}.{k}"), &format!("dit.{prefix}.{o}"), l)?;
+            }
+        } else if prefix.starts_with("blocks.") {
             let ad = merge_adaln(
                 &dit,
                 lora.as_ref(),
@@ -868,29 +897,42 @@ fn pack_dit(
     eprintln!();
 
     // final layer + heads: the checkpoint's fp32 island, kept fp32.
-    let ad = merge_adaln(
-        &dit,
-        lora.as_ref(),
-        "final_layer.adaln_proj.linear",
-        &base_table,
-        base_cols,
-        &curve,
-        t_dim,
-        scale,
-    )?;
-    let rows = ad.weight.len() / ad.cols;
-    specs.push(spec(
-        "dit.final_layer.adaln.weight".into(),
-        &ad.weight,
-        vec![rows, ad.cols],
-        Level::F32,
-    ));
-    specs.push(spec(
-        "dit.final_layer.adaln.table".into(),
-        &ad.table,
-        vec![CURVE_GRID, ad.cols],
-        Level::F32,
-    ));
+    if lowrank {
+        // The few-step student keeps the final layer's dense projection,
+        // read straight off `silu(temb)` (no table), and the runtime needs
+        // the clock embedders that make `temb`.
+        push_exact(specs, &dit, "final_layer.adaln_proj.linear.weight", "dit.final_layer.adaln.weight", Level::F32)?;
+        let embedders: &[&str] = if meanflow { &["time_embedder", "r_time_embedder"] } else { &["time_embedder"] };
+        for e in embedders {
+            for t in ["proj_in.weight", "proj_in.bias", "proj_out.weight", "proj_out.bias"] {
+                push_exact(specs, &dit, &format!("{e}.{t}"), &format!("dit.{e}.{t}"), Level::F32)?;
+            }
+        }
+    } else {
+        let ad = merge_adaln(
+            &dit,
+            lora.as_ref(),
+            "final_layer.adaln_proj.linear",
+            &base_table,
+            base_cols,
+            &curve,
+            t_dim,
+            scale,
+        )?;
+        let rows = ad.weight.len() / ad.cols;
+        specs.push(spec(
+            "dit.final_layer.adaln.weight".into(),
+            &ad.weight,
+            vec![rows, ad.cols],
+            Level::F32,
+        ));
+        specs.push(spec(
+            "dit.final_layer.adaln.table".into(),
+            &ad.table,
+            vec![CURVE_GRID, ad.cols],
+            Level::F32,
+        ));
+    }
     for (k, o, l) in [
         (
             "final_layer.adaln_proj.linear.bias",
@@ -966,7 +1008,7 @@ fn pack_dit(
         )?;
     }
 
-    Ok(serde_json::json!({
+    let mut cfg = serde_json::json!({
         "hidden_size": hidden,
         "num_layers": n_blocks,
         "token_refiner_num_layers": n_refiner,
@@ -986,7 +1028,20 @@ fn pack_dit(
         "image": image,
         "pdd_steps": pdd_steps,
         "pdd_sigmas": pdd_sigmas,
-    }))
+    });
+    if lowrank {
+        cfg["adaln_mode"] = serde_json::json!("lowrank");
+        // A MeanFlow student samples `linspace(1, 0, steps + 1)` on the video
+        // shift; 6 steps is the release's default (4 or more work).
+        cfg["endpoint_mode"] = serde_json::json!(if meanflow { "meanflow" } else { "none" });
+        if meanflow {
+            cfg["default_steps"] = serde_json::json!(6);
+        }
+        if let Some(src) = dit.meta.get("h3tiny").and_then(|v| v.as_str()) {
+            cfg["source"] = serde_json::from_str(src).unwrap_or(serde_json::Value::Null);
+        }
+    }
+    Ok(cfg)
 }
 
 /// The PDD head bank of a checkpoint: how many stacked heads its output
