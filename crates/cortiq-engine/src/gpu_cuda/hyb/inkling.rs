@@ -73,6 +73,8 @@ fn bmax() -> usize {
 
 struct Fx {
     mix: cs::CUfunction,
+    mix2: cs::CUfunction,
+    fmv3: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
     gate_out: cs::CUfunction,
@@ -458,6 +460,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     let module = compile(SRC, vec![format!("-DH={hidden}"), format!("-DHD={hd}"), format!("-DNKV={nkv}"), format!("-DNH={nh}"), format!("-DDR={dr}"), "-DKC=4".into()], c.arch)?;
     let fx = Fx {
         mix: func(module, "ink_mix")?,
+        mix2: func(module, "ink_mix2")?,
+        fmv3: func(module, "ink_fmv3")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
         gate_out: func(module, "ink_gate_out")?,
@@ -763,6 +767,14 @@ impl Dev {
 /// `true` when this call ran on the card. `ids` from position `pos0`; the
 /// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
 #[allow(clippy::too_many_arguments)]
+/// `CMF_INKLING_FUSE=0`: a decode call's mixes, norms and small matvecs as
+/// separate launches (`ink_mix`, `ink_rms`, three `ink_fmv`) instead of
+/// `ink_mix2` (one exchange, the norm in its epilogue) and `ink_fmv3`.
+fn fuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FUSE").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_KT=N` (a measurement): is this the N-th decode call?
 fn kt_call() -> bool {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1458,22 +1470,37 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
     let fl = |b: &Buf, i: usize| b.ptr + (i * rows * hidden * 4) as u64;
     let mut tp = std::time::Instant::now();
     unsafe {
-        // 1. the attention inputs
+        // 1. the attention inputs (a decode call: the mix and, when no gate
+        // follows, query 0's norm in one launch)
+        let gates = if pass > 0 { l.gates.as_ref() } else { None };
+        let one = l.sliding && gates.is_none();
+        let fuse = fuse_on();
+        let mut normed = false;
         let mut inp = [hin, hin, hin];
         if let Some((aq, nq)) = &l.aq {
             let nb_i = *nb as i32;
-            c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            if fuse {
+                let (nw, xo, p0, p1) = if one { (l.norms[0].ptr, d.x[0].ptr, d.xp[0][0].ptr, d.xp[0][1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
+                c.launch(f.mix2, (*nq as u32, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nw, eps, xo, p0, p1, hs))?;
+                normed = one;
+            } else {
+                c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            }
             inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
         }
         st(c, 0, &mut tp)?;
         // 2. the messages of a later pass, gated into q, k, v
-        let gates = if pass > 0 { l.gates.as_ref() } else { None };
         if let Some(gs) = gates {
             let i = li - cfg.core_start;
             let q = d.msg_q.ptr + (i * 4 * hidden * 4) as u64;
             let bnb = bank_nb as i32;
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
-            c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            if fuse {
+                let nul = 0u64;
+                c.launch(f.mix2, (4, nu), 512, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            }
             for j in 0..3 {
                 gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
                 inp[j] = fl(&d.gin, j);
@@ -1482,8 +1509,10 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         st(c, 1, &mut tp)?;
         // 3. the input norms (a local layer's three are one weight; without
         // messages its inputs are one row)
-        let one = l.sliding && gates.is_none();
         for j in 0..(if one { 1 } else { 3 }) {
+            if normed && j == 0 {
+                continue;
+            }
             c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
@@ -1500,13 +1529,27 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         }
         let nh = cfg.nh;
         let (nh_i, kp_i) = (nh as i32, (cfg.nkv * 4) as i32);
-        c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
         let (mut dk, mut dv) = (0u64, 0u64);
-        if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
-            c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
-            c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wv.ptr, kp_i, d.x[xv].ptr, d.dvb.ptr))?;
-            dk = d.dkb.ptr;
-            dv = d.dvb.ptr;
+        if fuse {
+            // the sinks and the dynamic convolution weights in one launch
+            let (wk, wv, kr) = match (&l.dk, &l.dv) {
+                (Some(wk), Some(wv)) => {
+                    dk = d.dkb.ptr;
+                    dv = d.dvb.ptr;
+                    (wk.ptr, wv.ptr, kp_i)
+                }
+                _ => (0u64, 0u64, 0i32),
+            };
+            let tot = nh + 2 * kr as usize;
+            c.launch(f.fmv3, (tot.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
+        } else {
+            c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
+            if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
+                c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
+                c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wv.ptr, kp_i, d.x[xv].ptr, d.dvb.ptr))?;
+                dk = d.dkb.ptr;
+                dv = d.dvb.ptr;
+            }
         }
         st(c, 3, &mut tp)?;
         // 5. queries and relative states; keys and values into the cache
@@ -1558,13 +1601,23 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
-        c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
-        let mut mi = d.m.ptr;
-        if let Some(gs) = gates {
-            gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
-            mi = d.mg.ptr;
+        if fuse && gates.is_none() {
+            // the MoE input's mix and its norm in one launch
+            c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+        } else {
+            if fuse {
+                let nul = 0u64;
+                c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+            }
+            let mut mi = d.m.ptr;
+            if let Some(gs) = gates {
+                gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+                mi = d.mg.ptr;
+            }
+            c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
         }
-        c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
         st(c, 8, &mut tp)?;
         // 9. the routed experts into y
         moe(c, d, cfg, l, n, &mut tp)?;

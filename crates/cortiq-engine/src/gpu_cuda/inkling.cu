@@ -108,6 +108,142 @@ extern "C" __global__ void ink_mix(const float* __restrict__ blk, int nb, int bs
     }
 }
 
+// `ink_mix` for a decode call, with every state's two sums in one pass and one
+// exchange (float4 loads), and — when `nw` is given — the RMS norm of query
+// 0's output in the epilogue (`ink_rms`'s weights, f32 rows and f16 planes).
+// Grid (nq, n), 512 threads.
+extern "C" __global__ void __launch_bounds__(512) ink_mix2(const float* __restrict__ blk, int nb, int bstride,
+        const float* __restrict__ x, const float* __restrict__ q, float* __restrict__ out, int ostride,
+        const float* __restrict__ nw, float eps, float* __restrict__ xo, u16* __restrict__ p0, u16* __restrict__ p1,
+        int pstride)
+{
+    PDL_PRO();
+    __shared__ float part[16][2 * MAXS];
+    __shared__ float tot[2 * MAXS];
+    __shared__ float sh[32];
+    const int qi = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, nwp = blockDim.x >> 5;
+    const int ns = nb + 1, H4 = H / 4;
+    const float4* qv = (const float4*)(q + (size_t)qi * H);
+    float ss[MAXS], dt[MAXS];
+#pragma unroll
+    for (int s = 0; s < MAXS; s++) ss[s] = dt[s] = 0.0f;
+    for (int i = tid; i < H4; i += blockDim.x) {
+        const float4 qq = qv[i];
+#pragma unroll
+        for (int s = 0; s < MAXS; s++) {
+            if (s >= ns) break;
+            const float4* sv = (const float4*)(s < nb ? blk + (size_t)r * bstride + (size_t)s * H : x + (size_t)r * H);
+            const float4 v = sv[i];
+            ss[s] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            dt[s] += v.x * qq.x + v.y * qq.y + v.z * qq.z + v.w * qq.w;
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < MAXS; s++) {
+        if (s >= ns) break;
+        float a = ss[s], b = dt[s];
+        for (int o = 16; o > 0; o >>= 1) {
+            a += __shfl_xor_sync(FULL, a, o);
+            b += __shfl_xor_sync(FULL, b, o);
+        }
+        if (lane == 0) {
+            part[wp][2 * s] = a;
+            part[wp][2 * s + 1] = b;
+        }
+    }
+    __syncthreads();
+    if (tid < 2 * ns) {
+        float t = 0.0f;
+        for (int w = 0; w < nwp; w++) t += part[w][tid];
+        tot[tid] = t;
+    }
+    __syncthreads();
+    float wts[MAXS], mx = -3.0e38f, den = 0.0f;
+#pragma unroll
+    for (int s = 0; s < MAXS; s++) {
+        if (s >= ns) break;
+        const float inv = rsqrtf(tot[2 * s] / (float)H + 1e-6f);
+        wts[s] = tot[2 * s + 1] * inv * rsqrtf((float)H);
+        mx = fmaxf(mx, wts[s]);
+    }
+    float rn[MAXS];
+#pragma unroll
+    for (int s = 0; s < MAXS; s++) {
+        if (s >= ns) break;
+        rn[s] = rsqrtf(tot[2 * s] / (float)H + 1e-6f);
+        wts[s] = expf(wts[s] - mx);
+        den += wts[s];
+    }
+#pragma unroll
+    for (int s = 0; s < MAXS; s++) {
+        if (s >= ns) break;
+        wts[s] = wts[s] / den * rn[s];
+    }
+    float4* o = (float4*)(out + (size_t)qi * ostride + (size_t)r * H);
+    const bool norm = nw != nullptr && qi == 0;
+    float sq = 0.0f;
+    // a thread reads back only its own float4s in the epilogue
+    for (int i = tid; i < H4; i += blockDim.x) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int s = 0; s < MAXS; s++) {
+            if (s >= ns) break;
+            const float4 v = ((const float4*)(s < nb ? blk + (size_t)r * bstride + (size_t)s * H : x + (size_t)r * H))[i];
+            acc.x = fmaf(wts[s], v.x, acc.x);
+            acc.y = fmaf(wts[s], v.y, acc.y);
+            acc.z = fmaf(wts[s], v.z, acc.z);
+            acc.w = fmaf(wts[s], v.w, acc.w);
+        }
+        o[i] = acc;
+        sq += acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w;
+    }
+    if (!norm) return;
+    sq = block_sum(sq, sh);
+    const float inv = rsqrtf(sq / (float)H + eps);
+    const float4* w4 = (const float4*)nw;
+    for (int i = tid; i < H4; i += blockDim.x) {
+        const float4 a = o[i], g = w4[i];
+        const float v[4] = {g.x * (a.x * inv), g.y * (a.y * inv), g.z * (a.z * inv), g.w * (a.w * inv)};
+        if (xo) ((float4*)(xo + (size_t)r * H))[i] = make_float4(v[0], v[1], v[2], v[3]);
+        if (p0) {
+#pragma unroll
+            for (int k = 0; k < 4; k++) put2(p0, p1, (size_t)r * pstride + 4 * i + k, v[k]);
+        }
+    }
+}
+
+// Three small f32 matvecs of a decode call in one launch: rows [0, r0) of W0·x0,
+// [r0, r0 + r1) of W1·x1, the rest of W2·x2 (float4 loads, a warp a row).
+// Grid (ceil((r0 + r1 + r2) / 8), n), 256 threads.
+extern "C" __global__ void ink_fmv3(const float* __restrict__ W0, int r0, const float* __restrict__ x0, float* __restrict__ y0,
+                                    const float* __restrict__ W1, int r1, const float* __restrict__ x1, float* __restrict__ y1,
+                                    const float* __restrict__ W2, int r2, const float* __restrict__ x2, float* __restrict__ y2)
+{
+    PDL_PRO();
+    const int lane = threadIdx.x & 31;
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int r = blockIdx.y;
+    const float* W; const float* x; float* y; int rows;
+    if (o < r0) { W = W0; x = x0; y = y0; rows = r0; }
+    else if (o < r0 + r1) { o -= r0; W = W1; x = x1; y = y1; rows = r1; }
+    else if (o < r0 + r1 + r2) { o -= r0 + r1; W = W2; x = x2; y = y2; rows = r2; }
+    else return;
+    const float4* w = (const float4*)(W + (size_t)o * H);
+    const float4* xr = (const float4*)(x + (size_t)r * H);
+    float a = 0.0f, b = 0.0f;
+    for (int i = lane; i < H / 4; i += 64) {
+        const float4 u = w[i], v = xr[i];
+        a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
+        if (i + 32 < H / 4) {
+            const float4 u2 = w[i + 32], v2 = xr[i + 32];
+            b += u2.x * v2.x + u2.y * v2.y + u2.z * v2.z + u2.w * v2.w;
+        }
+    }
+    float acc = a + b;
+    for (int sft = 16; sft > 0; sft >>= 1) acc += __shfl_xor_sync(FULL, acc, sft);
+    if (lane == 0) y[(size_t)r * rows + o] = acc;
+}
+
 // Weighted RMS norm of row r of x into xo (f32) and, when p0 is set, the
 // tensor-core planes of the row. Grid n, 256 threads.
 extern "C" __global__ void ink_rms(const float* __restrict__ x, const float* __restrict__ w, float eps,
