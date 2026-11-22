@@ -1081,11 +1081,42 @@ fn on_card(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, id
         return true;
     }
     if state.card == Some(true) {
-        tracing::warn!("inkling2_loop: the card dropped the sequence at {pos}; the host replays its {} rows", state.tokens.len());
-        host_replay(globals, layers, cfg, state, pool);
+        card_dropped(globals, layers, cfg, state, pos, pool);
     }
     state.card = Some(false);
     false
+}
+
+/// The card let go of a sequence it held (a call failed: an allocation, a
+/// graph): the host rebuilds its caches from the sequence's tokens and runs
+/// the sequence from here on. Every path off the card goes through here — a
+/// host that took a position without its caches read rows it never wrote.
+fn card_dropped(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, pos: usize, pool: Option<&Pool>) {
+    tracing::warn!("inkling2_loop: the card dropped the sequence at {pos}; the host replays its {} rows", state.tokens.len());
+    host_replay(globals, layers, cfg, state, pool);
+    state.card = Some(false);
+}
+
+/// Positions the host's caches hold: those of the first application's slot
+/// (layer 0 runs once a position; a sliding slot's dropped rows are in its base).
+fn host_holds(state: &State, cfg: &Cfg) -> usize {
+    state.slots.get(cfg.slot(0, 0)).map_or(0, |s| s.base + s.k.len() / (cfg.nkv * cfg.hd).max(1))
+}
+
+/// Before the host runs from `pos`: its caches must hold the sequence up to
+/// there. A card that let go without `card_dropped` leaves them empty; the
+/// host then replays the sequence's tokens instead of reading past its cache.
+fn host_catch_up(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, pos: usize, pool: Option<&Pool>) {
+    if host_behind(state, cfg, pos) {
+        tracing::warn!("inkling2_loop: the host's caches hold {} of {pos} positions; it replays the sequence", host_holds(state, cfg));
+        host_replay(globals, layers, cfg, state, pool);
+    }
+}
+
+/// The host's caches miss positions before `pos` that the sequence's tokens
+/// have (so a replay of the tokens brings them to `pos`).
+fn host_behind(state: &State, cfg: &Cfg, pos: usize) -> bool {
+    host_holds(state, cfg) != pos && state.tokens.len() == pos
 }
 
 /// The host's caches rebuilt from the sequence's tokens (after the card let go).
@@ -1117,6 +1148,7 @@ pub fn forward_prompt(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mu
         tracing::info!("inkling2_loop: {} prompt rows on the card in {:.2} s", ids.len(), t0.elapsed().as_secs_f64());
         return ids.len();
     }
+    host_catch_up(globals, layers, cfg, state, start, pool);
     let mut last = Vec::new();
     for (ci, part) in ids.chunks(chunk_rows()).enumerate() {
         let p0 = start + ci * chunk_rows();
@@ -1190,6 +1222,7 @@ pub fn forward_token(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut
     if on_card(globals, layers, cfg, state, &[token_id], position, want_logits, false, logits, pool) {
         return;
     }
+    host_catch_up(globals, layers, cfg, state, position, pool);
     state.tokens.push(token_id);
     let x = host_rows(globals, layers, cfg, state, &[token_id], position, pool);
     state.pos = position + 1;
@@ -1347,8 +1380,11 @@ impl SpecPolicy {
 /// call; the drafts it agrees with (its greedy picks) are kept, the rest rolled
 /// back. Returns the accepted drafts and leaves `logits` the last kept row's;
 /// `None` when no round ran (no drafter, not on the card, a refusal): nothing
-/// changed and the caller forwards the anchor itself.
-pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, anchor: u32, pos: usize, k: usize, logits: &mut Vec<f32>) -> Option<Vec<u32>> {
+/// changed and the caller forwards the anchor itself. A card that lets go in
+/// the round hands the sequence to the host first (`card_dropped`), so that
+/// forward runs on caches that hold the sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut State, anchor: u32, pos: usize, k: usize, logits: &mut Vec<f32>, pool: Option<&Pool>) -> Option<Vec<u32>> {
     globals.draft.as_ref()?;
     if k == 0 || state.card != Some(true) || state.pos != pos || pos == 0 {
         return None;
@@ -1371,8 +1407,8 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     // each row's greedy pick on the card; only the kept row's logits come over
     let mut picks = Vec::with_capacity(ids.len());
     if !crate::gpu::inkling_verify(state.sequence_id, globals, layers, cfg, &ids, pos, &mut picks) || picks.len() != ids.len() {
-        // the card let go mid-round: the host replays what it ran
-        state.card = Some(false);
+        // the card let go mid-round: the host replays the sequence before the round
+        card_dropped(globals, layers, cfg, state, pos, pool);
         return None;
     }
     let vocab = globals.lm_head.rows();
@@ -1382,11 +1418,11 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     }
     let keep = acc + 1;
     if keep < ids.len() && !crate::gpu::inkling_ring_back(state.sequence_id, keep) {
-        state.card = Some(false);
+        card_dropped(globals, layers, cfg, state, pos, pool);
         return None;
     }
     if !crate::gpu::inkling_row_logits(state.sequence_id, acc, vocab, logits) {
-        state.card = Some(false);
+        card_dropped(globals, layers, cfg, state, pos, pool);
         return None;
     }
     state.tokens.extend_from_slice(&ids[..keep]);
@@ -1500,6 +1536,32 @@ mod tests {
             assert_eq!(slots.len(), c.slots());
             assert_eq!(slots.last(), Some(&(c.slots() - 1)));
         }
+    }
+
+    #[test]
+    fn the_host_knows_when_its_caches_miss_the_sequence() {
+        // a card ran 3 073 positions, then let go without a replay: the host's
+        // slots are a reset's, its tokens the sequence's (0.9.15 then read
+        // row 3 073 of a one-row cache at inkling.rs:791 and panicked)
+        let c = cfg();
+        let row = c.nkv * c.hd;
+        let mut st = State { pos: 3073, tokens: vec![7; 3073], slots: (0..c.slots()).map(|_| SlotState::default()).collect(), sequence_id: 0, card: Some(false), spec: SpecPolicy::default() };
+        assert_eq!(host_holds(&st, &c), 0);
+        assert!(host_behind(&st, &c, 3073));
+        // a host that ran the sequence: a sliding slot keeps its last window,
+        // the rows it dropped counted in its base
+        let s = &mut st.slots[c.slot(0, 0)];
+        s.base = 3073 - c.window;
+        s.k = vec![0.0; c.window * row];
+        assert_eq!(host_holds(&st, &c), 3073);
+        assert!(!host_behind(&st, &c, 3073));
+        // tokens that do not reach the position: no replay could bring the host there
+        st.tokens.truncate(100);
+        st.slots = (0..c.slots()).map(|_| SlotState::default()).collect();
+        assert!(!host_behind(&st, &c, 3073));
+        // a sequence's start: nothing to hold
+        let fresh = State { pos: 0, tokens: Vec::new(), slots: Vec::new(), sequence_id: 0, card: None, spec: SpecPolicy::default() };
+        assert!(!host_behind(&fresh, &c, 0));
     }
 
     #[test]
