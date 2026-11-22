@@ -88,6 +88,8 @@ struct Pipes {
     select: ComputePipelineState,
     moe_gu: ComputePipelineState,
     moe_down: ComputePipelineState,
+    moe_gu8: ComputePipelineState,
+    moe_dn8: ComputePipelineState,
     group: ComputePipelineState,
     moe_gu_g: ComputePipelineState,
     moe_down_g: ComputePipelineState,
@@ -127,6 +129,8 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             select: pso("ink_select")?,
             moe_gu: pso("ink_moe_gu")?,
             moe_down: pso("ink_moe_down")?,
+            moe_gu8: pso("ink_moe_gu8")?,
+            moe_dn8: pso("ink_moe_dn8")?,
             group: pso("ink_group")?,
             moe_gu_g: pso("ink_moe_gu_g")?,
             moe_down_g: pso("ink_moe_down_g")?,
@@ -604,6 +608,15 @@ fn skip(stage: &str) -> bool {
     S.get_or_init(|| std::env::var("CMF_INKLING_SKIP").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default()).iter().any(|x| x == stage)
 }
 
+/// `CMF_INKLING_DEC8=0`: the decode's experts on `ink_moe_gu` / `ink_moe_down`
+/// (a simdgroup's 32 lanes over a row block's groups) instead of
+/// `ink_moe_gu8` / `ink_moe_dn8` (halves and quarters of a simdgroup, every
+/// lane busy in every pass).
+fn dec8_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_DEC8").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_GATE_GEMM=0`: a prompt call's message gates a channel a
 /// simdgroup instead of three f32 GEMMs on the simdgroup matrices.
 fn gate_gemm_on() -> bool {
@@ -988,6 +1001,30 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
         enc.set_buffer(2, Some(&d.y), 0);
         setp(enc, &ip);
         grid(enc, (hidden as u64).div_ceil(256), nu, 1, 256);
+    } else if dec8_on() && l.inter % 32 == 0 && hidden % 16 == 0 {
+        enc.set_compute_pipeline_state(&p.moe_gu8);
+        for (i, w) in wins.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(w), 0);
+        }
+        enc.set_buffer(4, Some(&l.bases), 0);
+        enc.set_buffer(5, Some(&d.pick), 0);
+        enc.set_buffer(6, Some(&d.xm), 0);
+        enc.set_buffer(7, Some(&d.act), 0);
+        set_bytes_t(enc, 8, &d.wstride);
+        setp(enc, &ip);
+        grid(enc, (l.inter as u64) / 32, cfg.top_k as u64, nu, 128);
+        enc.set_compute_pipeline_state(&p.moe_dn8);
+        for (i, w) in wins.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(w), 0);
+        }
+        enc.set_buffer(4, Some(&l.bases), 0);
+        enc.set_buffer(5, Some(&d.pick), 0);
+        enc.set_buffer(6, Some(&d.wt), 0);
+        enc.set_buffer(7, Some(&d.act), 0);
+        enc.set_buffer(8, Some(&d.y), 0);
+        set_bytes_t(enc, 9, &d.wstride);
+        setp(enc, &ip);
+        grid(enc, (hidden as u64).div_ceil(16), nu, 1, 128);
     } else {
     enc.set_compute_pipeline_state(&p.moe_gu);
     for (i, w) in wins.iter().enumerate() {
