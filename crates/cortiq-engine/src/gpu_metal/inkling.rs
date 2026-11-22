@@ -102,6 +102,7 @@ struct Pipes {
     mvq: ComputePipelineState,
     gate_down3: ComputePipelineState,
     gate_out3: ComputePipelineState,
+    attn_fl: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -148,6 +149,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             mvq: pso("ink_mvq")?,
             gate_down3: pso("ink_gate_down3")?,
             gate_out3: pso("ink_gate_out3")?,
+            attn_fl: pso("ink_attn_fl")?,
         })
     });
     match r {
@@ -653,6 +655,13 @@ fn skip(stage: &str) -> bool {
     S.get_or_init(|| std::env::var("CMF_INKLING_SKIP").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default()).iter().any(|x| x == stage)
 }
 
+/// `CMF_INKLING_FLASH=0`: a prompt call's attention a threadgroup a (head, row)
+/// (`ink_attn`) instead of the flash kernel on the simdgroup matrices.
+fn flash_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FLASH").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_FUSE=0`: a call's stages one launch each (the mixes and norms,
 /// the five projections, the small matvecs, qr and kv, the attention and its
 /// gate) instead of the fused launches.
@@ -1029,16 +1038,24 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     enc.set_buffer(4, Some(&s.k), 0);
     enc.set_buffer(5, Some(&s.v), 0);
     enc.set_buffer(6, Some(&d.att), 0);
-    enc.set_buffer(7, Some(if fuse { &d.yg } else { &d.dummy }), 0);
-    if fuse {
+    // a prompt call: the flash kernel on the simdgroup matrices (the gate after it)
+    let flash = n > 1 && flash_on() && cfg.hd == 128 && cfg.d_rel <= 32;
+    let gated = fuse && !flash;
+    enc.set_buffer(7, Some(if gated { &d.yg } else { &d.dummy }), 0);
+    if gated {
         ip.v = 1;
     }
     setp(enc, &ip);
     if !skip("attn") {
-        grid(enc, cfg.nh as u64, nu, 1, 256);
+        if flash {
+            enc.set_compute_pipeline_state(&p.attn_fl);
+            grid(enc, nu.div_ceil(32), cfg.nh as u64, 1, 128);
+        } else {
+            grid(enc, cfg.nh as u64, nu, 1, 256);
+        }
     }
     let qs = cfg.nh * cfg.hd;
-    if !fuse {
+    if !gated {
         enc.set_compute_pipeline_state(&p.ogate);
         enc.set_buffer(0, Some(&d.att), 0);
         enc.set_buffer(1, Some(&d.yg), 0);
