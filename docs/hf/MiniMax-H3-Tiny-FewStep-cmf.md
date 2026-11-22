@@ -93,7 +93,8 @@ The same card with our [MiniMax-H3 Turbo](https://huggingface.co/infosave/MiniMa
 **RTX 3060, Vulkan**: 512×288, 39 frames — 4 steps, text only: **34.7 s**; 6 steps with two references: **63.2 s**;
 peak 9.4 GiB.
 
-**Apple silicon, Metal:** not measured with this file yet.
+**Apple M4 (24 GB), Metal**: 512×288, 39 frames — 4 steps, text only: **148 s** (denoising 91.2 s, video decoder
+45.9 s); 6 steps with two references: **265 s**. The process keeps 5.7 GB resident; the rest of the file stays mapped.
 
 ## How it was made
 
@@ -130,7 +131,8 @@ DiT в 4 битах, кодировщик Qwen3-VL-4B с vision-башней и 
 
 - **DiT целиком помещается в карту на 12 ГБ.** RTX 3060, CUDA: 512×288 на 39 кадров со звуком за **24 с** (4 шага)
   или 30 с (6 шагов), 768×448 на 73 кадра — за 145 с. Наш файл MiniMax-H3 Turbo на той же карте — 408 и 2 201 с.
-  Vulkan на той же карте: 34,7 с (4 шага) и 63,2 с (6 шагов с двумя опорными картинками).
+  Vulkan на той же карте: 34,7 с (4 шага) и 63,2 с (6 шагов с двумя опорными картинками). Apple M4 (24 ГБ), Metal:
+  148 с (4 шага) и 265 с (6 шагов с двумя картинками).
 - **Текст → видео или опорные картинки → видео (Ref2VA):** картинки передаются через `--ref` и упоминаются в промпте
   как `<Picture 1>`, `<Picture 2>`.
 
