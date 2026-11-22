@@ -64,6 +64,13 @@ fn persist_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_PERSIST").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_ROWMAP=0`: a prompt call's expert input as a gathered f16
+/// copy of every pick (`ink_gather16`) instead of the rows read in place.
+fn rowmap_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_ROWMAP").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_FLASH=0`: a prompt call's attention through the cuBLAS score
 /// products (`attn_gemm`) instead of `ink_attn_flash`.
 fn flash_on() -> bool {
@@ -2046,15 +2053,24 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
             // the rows in their places as f16; gate/up (the activation in the
             // epilogue) into f16 rows, then down into ys
             let (tot_i, f) = (tot as i32, &d.fx);
-            c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
-            st(c, 11, tp)?;
             let (one, zero_i, nul) = (1i32, 0i32, 0u64);
-            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
             let mm = if mma2_on() { f.moe_mma2 } else { f.moe_mma };
-            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
+            // ink_moe_mma2 reads a job's rows through the places' rows (src):
+            // the call's rows as f16 once instead of every pick's copy
+            let map = mma2_on() && rowmap_on();
+            let rm = if map { b.src.ptr } else { nul };
+            if map {
+                let tn = (n * hidden) as i32;
+                c.launch(f.f16, ((n * hidden).div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.xg[0].ptr, tn))?;
+            } else {
+                c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
+            }
+            st(c, 11, tp)?;
+            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i, rm))?;
             st(c, 12, tp)?;
             let dx = (hidden.div_ceil(16)).div_ceil(MMA_TILES) as u32;
-            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
+            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i, nul))?;
             cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
             c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
             return Ok(());

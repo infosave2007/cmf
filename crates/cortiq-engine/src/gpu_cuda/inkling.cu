@@ -1384,7 +1384,8 @@ template <int N> __device__ __forceinline__ void cp_wait()
 #endif
 }
 extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __restrict__ jobs, const u16* __restrict__ x, int cols, int pair,
-                                                             u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride)
+                                                             u16* __restrict__ act, int act_stride, float* __restrict__ ys, int ys_stride,
+                                                             const int* __restrict__ rowmap)
 {
     PDL_PRO();
     __shared__ __align__(16) u16 xs[MS][NTL * 8][XROW];
@@ -1400,14 +1401,20 @@ extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __re
     const uint2* T = (const uint2*)jb.w;
     const unsigned char* Cc = (const unsigned char*)jb.aux0;
     const float2* par = (const float2*)jb.aux1;
-    // the slice copy: 64 rows × 4 chunks of 16 bytes, two a thread
+    // the slice copy: 64 rows × 4 chunks of 16 bytes, two a thread; with
+    // `rowmap` a job row's place names its row of x (no gathered copy)
+    const u16* srow[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int c = threadIdx.x + i * 128, row = c >> 2, ch = c & 3;
+        const int q = place0 + (row < nr ? row : 0);
+        srow[i] = x + (size_t)(rowmap ? rowmap[q] : q) * cols + ch * 8;
+    }
     auto stage = [&](int g, int buf) {
 #pragma unroll
         for (int i = 0; i < 2; i++) {
             const int c = threadIdx.x + i * 128, row = c >> 2, ch = c & 3;
-            const bool in = row < nr;
-            const u16* src = x + (size_t)(place0 + (in ? row : 0)) * cols + g * 32 + ch * 8;
-            cp16(&xs[buf][row][ch * 8], src, in);
+            cp16(&xs[buf][row][ch * 8], srow[i] + g * 32, row < nr);
         }
     };
 #pragma unroll
