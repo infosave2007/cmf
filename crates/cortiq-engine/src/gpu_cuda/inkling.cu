@@ -1179,6 +1179,54 @@ extern "C" __global__ void ink_gate_norm(const float* __restrict__ x, const floa
     }
 }
 
+// `gate_big` without the normed copy: a row's two inverse RMS (x's, m's)
+// into rr [n][2]. Grid n, H/4 threads (rounded to a warp).
+extern "C" __global__ void ink_gate_rr(const float* __restrict__ x, const float* __restrict__ m, float eps,
+                                       float* __restrict__ rr)
+{
+    PDL_PRO();
+    __shared__ float sh[32];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float4* xr = (const float4*)(x + (size_t)r * H);
+    const float4* mr = (const float4*)(m + (size_t)r * H);
+    float sx = 0.0f, sm = 0.0f;
+    for (int i = tid; i < H / 4; i += blockDim.x) {
+        const float4 a = xr[i], b = mr[i];
+        sx += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+        sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+    }
+    sx = block_sum(sx, sh);
+    sm = block_sum(sm, sh);
+    if (tid == 0) {
+        rr[2 * r] = rsqrtf(sx / (float)H + eps);
+        rr[2 * r + 1] = rsqrtf(sm / (float)H + eps);
+    }
+}
+
+// d [n][R] = P·rr_x + Q·rr_m (P = x's products with the down rows' first
+// halves, Q = m's with the second). total = n·R.
+extern "C" __global__ void ink_gate_d(const float* __restrict__ P, const float* __restrict__ Q,
+                                      const float* __restrict__ rr, int R, int total, float* __restrict__ d)
+{
+    PDL_PRO();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int r = i / R;
+    d[i] = P[i] * rr[2 * r] + Q[i] * rr[2 * r + 1];
+}
+
+// `ink_gate_mix` over one product [n][2H] (F·d, then G·d, a row).
+extern "C" __global__ void ink_gate_mix2(const float* __restrict__ x, const float* __restrict__ m,
+                                         const float* __restrict__ fg, float* __restrict__ out, int total)
+{
+    PDL_PRO();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int r = i / H, c = i - r * H;
+    const float* row = fg + (size_t)r * 2 * H;
+    out[i] = (1.0f - tanhf(row[c])) * x[i] + tanhf(row[H + c]) * m[i];
+}
+
 // out = (1 − tanh f)·x + tanh g·m over n·H values (f, g the F and G products).
 extern "C" __global__ void ink_gate_mix(const float* __restrict__ x, const float* __restrict__ m,
                                         const float* __restrict__ f, const float* __restrict__ g,

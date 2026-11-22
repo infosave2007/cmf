@@ -72,6 +72,13 @@ fn rowmap_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ROWMAP").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_GATE2=0`: a prompt call's message gates through the normed copy
+/// of their inputs (`ink_gate_norm`) and two product GEMMs.
+fn gate2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_GATE2").as_deref() != Ok("0"))
+}
+
 /// `ink_mix2`'s block: two float4s of the row a thread (its `MIX_TPB`).
 fn mix_tpb(hidden: usize) -> u32 {
     ((hidden / 4).div_ceil(2).div_ceil(32) * 32) as u32
@@ -134,6 +141,9 @@ struct Fx {
     qrkv: cs::CUfunction,
     fmv3: cs::CUfunction,
     post_mix: cs::CUfunction,
+    gate_rr: cs::CUfunction,
+    gate_d: cs::CUfunction,
+    gate_mix2: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
     gate_out: cs::CUfunction,
@@ -175,6 +185,8 @@ struct GateD {
     down: Buf,
     forget: Buf,
     gain: Buf,
+    /// F's rows then G's ([2H][R]): a prompt call's two products in one GEMM
+    fg: Buf,
 }
 
 /// A device address inside a buffer another field owns.
@@ -575,6 +587,9 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         qrkv: func(module, "ink_qrkv")?,
         fmv3: func(module, "ink_fmv3")?,
         post_mix: func(module, "ink_post_mix")?,
+        gate_rr: func(module, "ink_gate_rr")?,
+        gate_d: func(module, "ink_gate_d")?,
+        gate_mix2: func(module, "ink_gate_mix2")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
         gate_out: func(module, "ink_gate_out")?,
@@ -664,7 +679,10 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let kd = (one_kd(&gu_t), one_kd(&dn_t));
         let gates = match &l.gates {
             Some(gs) => {
-                let mk = |x: &crate::inkling::Gate| -> Res<GateD> { Ok(GateD { down: f32b(&x.down)?, forget: f32b(&x.forget)?, gain: f32b(&x.gain)? }) };
+                let mk = |x: &crate::inkling::Gate| -> Res<GateD> {
+                    let fg: Vec<f32> = x.forget.iter().chain(x.gain.iter()).copied().collect();
+                    Ok(GateD { down: f32b(&x.down)?, forget: f32b(&x.forget)?, gain: f32b(&x.gain)?, fg: f32b(&fg)? })
+                };
                 Some([mk(&gs[0])?, mk(&gs[1])?, mk(&gs[2])?, mk(&gs[3])?])
             }
             None => None,
@@ -792,7 +810,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             gu_a: Buf::new(jmax * job_b)?,
             dn_a: Buf::new(jmax * job_b)?,
             gxn: f4(rows * 2 * hidden)?,
-            gtf: f4(rows * hidden)?,
+            gtf: f4(2 * rows * hidden)?,
             gtg: f4(rows * hidden)?,
             q16: h2(rows * qs)?,
             sc: Buf::new(ATT_SCORES)?,
@@ -2205,6 +2223,21 @@ unsafe fn gate_big(c: &Ctx, f: &Fx, b: &Big, g: &GateD, x: u64, m: u64, dbuf: u6
     let r = g.down.bytes / (2 * hidden * 4);
     let tot = n * hidden;
     let tot_i = tot as i32;
+    if gate2_on() {
+        // no normed copy: the rows' inverse RMS, x's and m's products with the
+        // down rows' halves, d = P·rr_x + Q·rr_m; F and G in one GEMM
+        let (p, q, rr) = (b.gxn.ptr, b.gxn.ptr + (n * r * 4) as u64, b.gxn.ptr + (2 * n * r * 4) as u64);
+        let (r_i, nr_i) = (r as i32, (n * r) as i32);
+        let th = ((hidden / 4).div_ceil(32) * 32).min(1024) as u32;
+        unsafe {
+            c.launch(f.gate_rr, (n as u32, 1), th, 0, kargs!(x, m, eps, rr))?;
+            c.gemm(true, false, r, n, hidden, 1.0, g.down.ptr, 2 * hidden, x, hidden, 0.0, p, r, Gemm::F32)?;
+            c.gemm(true, false, r, n, hidden, 1.0, g.down.ptr + (hidden * 4) as u64, 2 * hidden, m, hidden, 0.0, q, r, Gemm::F32)?;
+            c.launch(f.gate_d, ((n * r).div_ceil(256) as u32, 1), 256, 0, kargs!(p, q, rr, r_i, nr_i, dbuf))?;
+            c.gemm(true, false, 2 * hidden, n, r, 1.0, g.fg.ptr, r, dbuf, r, 0.0, b.gtf.ptr, 2 * hidden, Gemm::F32)?;
+            return c.launch(f.gate_mix2, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x, m, b.gtf.ptr, out, tot_i));
+        }
+    }
     unsafe {
         c.launch(f.gate_norm, (n as u32, 1), 256, 0, kargs!(x, m, eps, b.gxn.ptr))?;
         c.gemm(true, false, r, n, 2 * hidden, 1.0, g.down.ptr, 2 * hidden, b.gxn.ptr, 2 * hidden, 0.0, dbuf, r, Gemm::F32)?;
