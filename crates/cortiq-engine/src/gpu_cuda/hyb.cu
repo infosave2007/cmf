@@ -938,8 +938,55 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
 #ifndef MMP_UG
 #define MMP_UG 2
 #endif
+#ifndef MMP_PIPE
+#define MMP_PIPE 1
+#endif
     constexpr int UG = (KD && NT == 1) ? MMP_UG : 1;
-    for (int gb = g0; gb < g1; gb += UG) {
+    constexpr bool PIPE = MMP_PIPE && KD == 6 && NT == 1 && TB == 1;
+    if (PIPE) {
+        // a decode row's q4tp loop, software-pipelined: group g + 1's weight
+        // words, rung codes and input pairs are in flight while group g is
+        // summed (a warp issues in order); the one-group loop's arithmetic
+        if (tile0 < ntile && g0 < g1) {
+            const size_t tb0 = (size_t)tile0 * gpr;
+            const float2 pa = lad[0][0], pb = lad[0][1];
+            const int j = gid >> 1;
+            const bool jin = j < nrows;
+            const u16* xp = (gid & 1) ? x1 : x0;
+            const size_t xo0 = (size_t)jb.xoff + (size_t)j * xstride + 2 * tig;
+            uint2 Xn = T[(tb0 + g0) * 32 + lane];
+            int can = Cc[(tb0 + g0) * 16 + gid], cbn = Cc[(tb0 + g0) * 16 + gid + 8];
+            u32 bn[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) bn[q] = jin ? *(const u32*)(xp + xo0 + g0 * 32 + 8 * q) : 0u;
+            for (int g = g0; g < g1; g++) {
+                const uint2 X = Xn;
+                const int ca = can, cb = cbn;
+                u32 bx0[4];
+#pragma unroll
+                for (int q = 0; q < 4; q++) bx0[q] = bn[q];
+                if (g + 1 < g1) {
+                    Xn = T[(tb0 + g + 1) * 32 + lane];
+                    can = Cc[(tb0 + g + 1) * 16 + gid];
+                    cbn = Cc[(tb0 + g + 1) * 16 + gid + 8];
+#pragma unroll
+                    for (int q = 0; q < 4; q++) bn[q] = jin ? *(const u32*)(xp + xo0 + (g + 1) * 32 + 8 * q) : 0u;
+                }
+                const float sa = exp2f(fmaf((float)ca, pa.y, pa.x));
+                const float sb = exp2f(fmaf((float)cb, pb.y, pb.x));
+                const u32 a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
+                const u32 a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
+                if (nrows > 0) {
+                    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816(c, a00, a01, a02, a03, bx0[0], bx0[1]);
+                    mma16816(c, a10, a11, a12, a13, bx0[2], bx0[3]);
+                    acc[0][0][0] = fmaf(sa, __fadd_rn(c[0], c[1]), acc[0][0][0]);
+                    acc[0][0][1] = fmaf(sb, __fadd_rn(c[2], c[3]), acc[0][0][1]);
+                }
+            }
+        }
+    }
+    for (int gb = PIPE ? g1 : g0; gb < g1; gb += UG) {
         u32 wx[UG][TB][4];
         float wsa[UG][TB], wsb[UG][TB];
 #pragma unroll
