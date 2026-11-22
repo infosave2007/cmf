@@ -124,6 +124,12 @@ struct GateD {
     gain: Buf,
 }
 
+/// A device address inside a buffer another field owns.
+#[derive(Clone, Copy)]
+struct DPtr {
+    ptr: u64,
+}
+
 struct LayerD {
     sliding: bool,
     boundary: bool,
@@ -136,6 +142,9 @@ struct LayerD {
     qset: MmaSet,
     /// q, gate, rel, k and v together, for a local layer's first pass (one input row).
     qkv: Option<MmaSet>,
+    /// q, gate, rel, k, v in one launch from three input planes (k's and v's
+    /// rows at planes 1 and 2: `Dev::xpb`), for the calls whose inputs differ
+    qkv3: MmaSet,
     kset: MmaSet,
     vset: MmaSet,
     oset: MmaSet,
@@ -330,7 +339,9 @@ struct Dev {
     gin: Buf,
     gd: Buf,
     x: [Buf; 3],
-    xp: [[Buf; 2]; 3],
+    /// the three input rows' planes, views of `xpb` (plane j at j·rows·hidden)
+    xp: [[DPtr; 2]; 3],
+    xpb: [Buf; 2],
     yq: Buf,
     yg: Buf,
     yr: Buf,
@@ -531,6 +542,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let (q, gt, rl, km, vm, om) = (mat(c, st, &a.q)?, mat(c, st, &a.gate)?, mat(c, st, &a.rel)?, mat(c, st, &a.k)?, mat(c, st, &a.v)?, mat(c, st, &a.o)?);
         let qset = mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs)])?;
         let qkv = if l.sliding { Some(mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs), (&km, yk.ptr, 0, kvs, kvs), (&vm, yv.ptr, 0, kvs, kvs)])?) } else { None };
+        let plane = (rows * hidden) as i32;
+        let qkv3 = mmaset_core(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs), (&km, yk.ptr, 0, kvs, kvs), (&vm, yv.ptr, 0, kvs, kvs)], 6, Some(&[0, 0, 0, plane, 2 * plane]), 0.0)?;
         let kset = mmaset(&[(&km, yk.ptr, 0, kvs, kvs)])?;
         let vset = mmaset(&[(&vm, yv.ptr, 0, kvs, kvs)])?;
         let oset = mmaset(&[(&om, ya.ptr, 0, hidden, hidden)])?;
@@ -580,6 +593,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             post_norm: f32b(&l.post_norm)?,
             qset,
             qkv,
+            qkv3,
             kset,
             vset,
             oset,
@@ -693,6 +707,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     } else {
         None
     };
+    let xpb = [h2(3 * rows * hidden)?, h2(3 * rows * hidden)?];
     let d = Dev {
         fx,
         hfx,
@@ -718,7 +733,11 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         gin: f4(4 * rows * hidden)?,
         gd: f4(rows * 256)?,
         x: [f4(rows * hidden)?, f4(rows * hidden)?, f4(rows * hidden)?],
-        xp: [[h2(rows * hidden)?, h2(rows * hidden)?], [h2(rows * hidden)?, h2(rows * hidden)?], [h2(rows * hidden)?, h2(rows * hidden)?]],
+        xp: {
+            let at = |b: &Buf, j: usize| DPtr { ptr: b.ptr + (j * rows * hidden * 2) as u64 };
+            [[at(&xpb[0], 0), at(&xpb[1], 0)], [at(&xpb[0], 1), at(&xpb[1], 1)], [at(&xpb[0], 2), at(&xpb[1], 2)]]
+        },
+        xpb,
         yq,
         yg,
         yr,
@@ -1574,6 +1593,8 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 4. the projections
         match (&l.qkv, one) {
             (Some(all), true) => all.run(c, &d.hfx, &pl(0), hidden, n)?,
+            // k's and v's input planes follow q's (`xpb`)
+            _ if fuse => l.qkv3.run(c, &d.hfx, &pl(0), hidden, n)?,
             _ => {
                 l.qset.run(c, &d.hfx, &pl(0), hidden, n)?;
                 l.kset.run(c, &d.hfx, &pl(xk), hidden, n)?;
@@ -2065,7 +2086,12 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
                 ),
             )?;
         } else {
-            c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
+            if fuse && e <= 256 && hidden % 4 == 0 {
+                // a verify call's rows: the decode route's logits
+                c.launch(fx.moe_router4, (e as u32, n as u32), 128, 0, kargs!(d.xm.ptr, l.router.ptr, d.logits_e.ptr, ei, hi))?;
+            } else {
+                c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
+            }
             c.launch(
                 fx.moe_select,
                 (1, 1),

@@ -2587,6 +2587,46 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
     }
 }
 
+// A router row against an input row, a block (thread 0 gets the sum): float4
+// loads, a lane's sum, the warps' in order. `hy_moe_route1` and
+// `hy_moe_router4` share it, so a decode row and a verify call's rows get
+// the same logits.
+__device__ __forceinline__ float rdot_block(const float* __restrict__ w, const float* __restrict__ x, int hidden,
+                                            float* rpart)
+{
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
+    const float4* w4 = (const float4*)w;
+    const float4* x4 = (const float4*)x;
+    float a = 0.0f;
+    for (int i = threadIdx.x; i < (hidden >> 2); i += blockDim.x) {
+        const float4 u = w4[i], v = x4[i];
+        a = fmaf(u.x, v.x, a);
+        a = fmaf(u.y, v.y, a);
+        a = fmaf(u.z, v.z, a);
+        a = fmaf(u.w, v.w, a);
+    }
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
+    if (lane == 0) rpart[wp] = a;
+    __syncthreads();
+    float t = 0.0f;
+    if (threadIdx.x == 0)
+        for (int q = 0; q < nwp; q++) t += rpart[q];
+    __syncthreads();
+    return t;
+}
+
+// logits[r][e] = Wr[e] · xn[r] a block a (router row, input row): the
+// decode route's arithmetic (`rdot_block`). Grid (E, n), 128 threads.
+extern "C" __global__ void hy_moe_router4(const float* __restrict__ xn, const float* __restrict__ Wr,
+                                          float* __restrict__ logits, int E, int hidden)
+{
+    PDL_PRO();
+    __shared__ float rpart[32];
+    const int e = blockIdx.x, r = blockIdx.y;
+    const float t = rdot_block(Wr + (size_t)e * hidden, xn + (size_t)r * hidden, hidden, rpart);
+    if (threadIdx.x == 0) logits[(size_t)r * E + e] = t;
+}
+
 // A decode row's router and selection in one launch (`hy_moe_router` with no
 // shared gate, then `hy_moe_select`'s sigmoid path: flags bits 0, 2, 5; E <=
 // 256 experts, k <= 32 picks, S == k slots): a block a router row; the last
@@ -2604,26 +2644,11 @@ extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __r
     __shared__ float pw[32];
     __shared__ int last;
     __shared__ float rpart[32];
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
-    const int h4 = hidden >> 2;
-    const float4* x4 = (const float4*)xn;
-    // a block a router row: every thread a float4 or two of it
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    // a block a router row (`hy_moe_router4`'s arithmetic)
     for (int e = blockIdx.x; e < E; e += gridDim.x) {
-        const float4* w4 = (const float4*)(Wr + (size_t)e * hidden);
-        float a = 0.0f;
-        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
-            const float4 u = w4[i], v = x4[i];
-            a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
-        }
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
-        if (lane == 0) rpart[wp] = a;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float t = 0.0f;
-            for (int w = 0; w < nwp; w++) t += rpart[w];
-            logits[e] = t;
-        }
-        __syncthreads();
+        const float t = rdot_block(Wr + (size_t)e * hidden, xn, hidden, rpart);
+        if (threadIdx.x == 0) logits[e] = t;
     }
     __threadfence();
     __syncthreads();
