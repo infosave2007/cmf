@@ -2862,15 +2862,16 @@ pub fn inkling_reset(id: u64) {
 }
 
 /// Inkling's DSpark drafter on the card: up to `k` drafts from `anchor`, the
-/// token sampled for `pos` (CUDA and Metal; `None` elsewhere: plain decoding).
-pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling::Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+/// token sampled for `pos`, and (Metal) each draft's probability under the
+/// drafter (CUDA: none) — `None` elsewhere: plain decoding.
+pub fn inkling_draft(id: u64, g: &crate::inkling::Globals, cfg: &crate::inkling::Cfg, anchor: u32, pos: usize, k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
     #[cfg(target_os = "macos")]
     if backend() == Backend::Metal {
         return crate::gpu_metal::inkling::draft(id, g, cfg, anchor, pos, k);
     }
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
-        return crate::gpu_cuda::inkling_draft(id, g, cfg, anchor, pos, k);
+        return crate::gpu_cuda::inkling_draft(id, g, cfg, anchor, pos, k).map(|v| (v, Vec::new()));
     }
     let _ = (id, g, cfg, anchor, pos, k);
     None

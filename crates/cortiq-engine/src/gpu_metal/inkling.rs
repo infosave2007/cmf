@@ -118,6 +118,7 @@ struct Pipes {
     ds_fmv: ComputePipelineState,
     ds_markov: ComputePipelineState,
     ds_pick: ComputePipelineState,
+    argmax: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -175,6 +176,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             ds_fmv: pso("ink_ds_fmv")?,
             ds_markov: pso("ink_ds_markov")?,
             ds_pick: pso("ink_ds_pick")?,
+            argmax: pso("ink_argmax")?,
         })
     });
     match r {
@@ -191,12 +193,14 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
 enum Mat {
     Q4 { abs: usize, rows: usize, cols: usize },
     Q8 { abs: usize, rows: usize, cols: usize, rs: Buffer, col: Buffer },
+    /// q8_2f rows gathered into a buffer of their own (the drafter's table).
+    Q8B { buf: Buffer, rows: usize, cols: usize, rs: Buffer, col: Buffer },
 }
 
 impl Mat {
     fn rows(&self) -> usize {
         match self {
-            Mat::Q4 { rows, .. } | Mat::Q8 { rows, .. } => *rows,
+            Mat::Q4 { rows, .. } | Mat::Q8 { rows, .. } | Mat::Q8B { rows, .. } => *rows,
         }
     }
 }
@@ -279,9 +283,15 @@ struct DraftM {
     state: Buffer,
     prev: Buffer,
     ids: Buffer,
+    /// Each draft's probability under the drafter (`ink_ds_pick`).
+    probs: Buffer,
     w1: Buffer,
     fold: Mat,
     fold_b: Buffer,
+    /// `CMF_INKLING_DRAFT_TABLE=N`: drafts scored on N tokens only (the head's
+    /// and the fold's rows of the N largest fold_b, the Markov head's unigram
+    /// prior), `map` their ids; the verify keeps the whole head.
+    table: Option<(Mat, Mat, Buffer, Buffer, usize)>,
     lat: Buffer,
     block: usize,
     rank: usize,
@@ -445,6 +455,8 @@ struct Dev {
     /// activation pre-scales (ones: the verify's rows are normed).
     pxc: Buffer,
     ones8: Buffer,
+    /// A verify's greedy picks (`ink_argmax`).
+    vpick: Buffer,
     /// The rings' widths: k and v `nkv·hd`, the two output convolutions `hidden`.
     rw: [usize; 4],
     /// The DSpark drafter, when the file has one and its matrices are q8_2f.
@@ -628,12 +640,66 @@ fn build(c: &Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<Dev, Strin
         snap: Vec::new(),
         pxc: f4(VROWS * hidden),
         ones8: up(c, &[1.0f32; 8]),
+        vpick: shared(c, VROWS * 4),
         rw: [kvs, kvs, hidden, hidden],
         draft: match g.draft.as_ref() {
             Some(dr) if spec_on() => build_draft(c, g, dr, cfg, rows),
             _ => None,
         },
     })
+}
+
+/// `CMF_INKLING_DRAFT_TABLE=[RANKING:]N`: the drafter's vocabulary, N tokens:
+/// the first of RANKING (token ids most frequent first, one a line), then by
+/// fold_b (the Markov head's unigram prior). Unset: the whole head.
+fn draft_table() -> Option<(Option<String>, usize)> {
+    static V: OnceLock<Option<(Option<String>, usize)>> = OnceLock::new();
+    V.get_or_init(|| {
+        let v = std::env::var("CMF_INKLING_DRAFT_TABLE").ok()?;
+        let (path, n) = match v.rsplit_once(':') {
+            Some((p, n)) => (Some(p.to_string()), n),
+            None => (None, v.as_str()),
+        };
+        n.parse::<usize>().ok().filter(|&n| n > 0).map(|n| (path, n))
+    })
+    .clone()
+}
+
+/// The drafter's table of `n` tokens (in id order): the head's and the fold's
+/// q8_2f rows, their fold_b, and their ids.
+fn gather_table(c: &Ctx, g: &Globals, dr: &crate::inkling::Draft, (path, n): (Option<String>, usize)) -> Option<(Mat, Mat, Buffer, Buffer, usize)> {
+    let vocab = g.lm_head.rows().min(dr.fold_b.len());
+    if n >= vocab {
+        return None;
+    }
+    let mut keep = vec![false; vocab];
+    let mut ids: Vec<u32> = Vec::with_capacity(n);
+    if let Some(p) = path {
+        let text = std::fs::read_to_string(&p).map_err(|e| tracing::warn!("draft table {p}: {e}")).ok()?;
+        for id in text.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+            if ids.len() < n && (id as usize) < vocab && !keep[id as usize] {
+                keep[id as usize] = true;
+                ids.push(id);
+            }
+        }
+    }
+    let mut prior: Vec<u32> = (0..vocab as u32).filter(|&i| !keep[i as usize]).collect();
+    prior.sort_by(|&a, &b| dr.fold_b[b as usize].total_cmp(&dr.fold_b[a as usize]));
+    ids.extend(prior.into_iter().take(n - ids.len()));
+    ids.sort_unstable();
+    let gather = |t: &crate::qtensor::QTensor| -> Option<Mat> {
+        let (codes, rs, col) = t.q8_2f_codes()?;
+        let cols = t.cols();
+        let mut q = Vec::with_capacity(n * cols);
+        let mut r = Vec::with_capacity(n);
+        for &id in &ids {
+            q.extend_from_slice(&codes[id as usize * cols..(id as usize + 1) * cols]);
+            r.push(rs[id as usize]);
+        }
+        Some(Mat::Q8B { buf: up(c, &q), rows: n, cols, rs: up(c, &r), col: up(c, col) })
+    };
+    let fb: Vec<f32> = ids.iter().map(|&id| dr.fold_b[id as usize]).collect();
+    Some((gather(&g.lm_head)?, gather(&dr.fold)?, up(c, &fb), up(c, &ids), n))
 }
 
 /// The drafter on the GPU, or `None` (and plain decoding) when its matrices
@@ -722,9 +788,11 @@ fn build_draft(c: &Ctx, g: &Globals, dr: &crate::inkling::Draft, cfg: &Cfg, rows
         state: f4(rank),
         prev: shared(c, 64),
         ids: shared(c, 64),
+        probs: shared(c, 64),
         w1: up(c, &w1),
         fold: q8(&dr.fold)?,
         fold_b: up(c, &dr.fold_b),
+        table: draft_table().and_then(|n| gather_table(c, g, dr, n)),
         lat: f4(rank),
         block: b,
         rank,
@@ -944,23 +1012,19 @@ pub(crate) fn verify(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     encode_call(c, p, d, cfg, enc, n, pos0, n, true);
+    // every row's greedy pick on the GPU (the first of equal maxima)
+    enc.set_compute_pipeline_state(&p.argmax);
+    enc.set_buffer(0, Some(&d.logits), 0);
+    enc.set_buffer(1, Some(&d.vpick), 0);
+    set_bytes_t(enc, 2, &(vocab as u32));
+    grid(enc, n as u64, 1, 1, 1024);
     enc.end_encoding();
     let t1 = std::time::Instant::now();
     cmd.commit();
     cmd.wait_until_completed();
     let t2 = std::time::Instant::now();
-    let lg = unsafe { std::slice::from_raw_parts(d.logits.contents() as *const f32, n * vocab) };
     picks.clear();
-    for row in lg.chunks_exact(vocab) {
-        // the first of equal maxima, as the sampler's argmax
-        let mut best = 0usize;
-        for (i, &v) in row.iter().enumerate() {
-            if v > row[best] {
-                best = i;
-            }
-        }
-        picks.push(best as u32);
-    }
+    picks.extend_from_slice(unsafe { std::slice::from_raw_parts(d.vpick.contents() as *const u32, n) });
     if std::env::var("CMF_INKLING_SPEC_TIME").is_ok() {
         static T: Mutex<(f64, f64, f64, u32)> = Mutex::new((0.0, 0.0, 0.0, 0));
         let mut t = T.lock().unwrap();
@@ -1043,7 +1107,7 @@ pub(crate) fn ring_back(id: u64, r: usize) -> bool {
 /// One block of the drafter from the anchor at `pos` (the target has run every
 /// position before it): up to `k` drafts (`inkling.cu`'s `draft_block`), one
 /// command buffer.
-pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k: usize) -> Option<Vec<u32>> {
+pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
     let c = ctx()?;
     let mut guard = DEVICES.lock().unwrap();
     let d = guard.as_mut()?.get_mut(&id)?;
@@ -1089,7 +1153,8 @@ pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k:
         setp(enc, &ip);
         grid(enc, b as u64, 1, 1, 256);
     };
-    for l in &dr.layers {
+    let dskip = |what: &str| std::env::var("CMF_INKLING_DSKIP").is_ok_and(|v| v.split(',').any(|x| x == what));
+    for l in dr.layers.iter().filter(|_| !dskip("layers")) {
         let dpl = DsP { cap: l.cap as u32, ring: l.ring as u32, win: if l.ring { dr.window as u32 } else { 0 }, ..dp };
         rms(&dr.x, &l.in_norm, &dr.xn);
         q8_rows(p, enc, d, &l.q, (&dr.xn, 0), (&dr.dq, 0), b, false);
@@ -1128,7 +1193,13 @@ pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k:
     }
     // h; the rows after the anchor's through the target's head (the drafts' base logits)
     rms(&dr.x, &dr.fnorm, &dr.hf);
-    q8_rows(p, enc, d, &d.head, (&dr.hf, (hidden * 4) as u64), (&dr.dlog, 0), k, false);
+    let (thead, tfold, tfb, tmap, tv) = match &dr.table {
+        Some((h, f, b, m, n)) => (h, f, b, Some(m), *n),
+        None => (&d.head, &dr.fold, &dr.fold_b, None, vocab),
+    };
+    if !dskip("head") {
+        q8_rows(p, enc, d, thead, (&dr.hf, (hidden * 4) as u64), (&dr.dlog, 0), k, false);
+    }
     // the recurrence's input terms: W_h · h_{i+1} for every draft, W_f · f
     // (the Markov context of position pos − 1)
     let rk = dr.rank;
@@ -1157,13 +1228,25 @@ pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k:
         enc.set_buffer(7, Some(&dr.lat), 0);
         set_bytes_t(enc, 8, &wr);
         grid(enc, 1, 1, 1, (3 * rk) as u64);
-        q8_rows(p, enc, d, &dr.fold, (&dr.lat, 0), (&dr.dlog, (i * vocab * 4) as u64), 1, true);
-        let vi: [u32; 2] = [vocab as u32, i as u32];
+        if !dskip("fold") {
+            q8_rows(p, enc, d, tfold, (&dr.lat, 0), (&dr.dlog, (i * tv * 4) as u64), 1, true);
+        }
+        #[repr(C)]
+        struct DsPick {
+            v: u32,
+            i: u32,
+            map: u32,
+            pad: u32,
+            cap: f32,
+        }
+        let vi = DsPick { v: tv as u32, i: i as u32, map: tmap.is_some() as u32, pad: 0, cap: cfg.logit_cap };
         enc.set_compute_pipeline_state(&p.ds_pick);
-        enc.set_buffer(0, Some(&dr.dlog), (i * vocab * 4) as u64);
-        enc.set_buffer(1, Some(&dr.fold_b), 0);
+        enc.set_buffer(0, Some(&dr.dlog), (i * tv * 4) as u64);
+        enc.set_buffer(1, Some(tfb), 0);
         enc.set_buffer(2, Some(&dr.ids), 0);
         enc.set_buffer(3, Some(&dr.prev), 0);
+        enc.set_buffer(5, Some(tmap.unwrap_or(&dr.ids)), 0);
+        enc.set_buffer(6, Some(&dr.probs), 0);
         set_bytes_t(enc, 4, &vi);
         grid(enc, 1, 1, 1, 1024);
     }
@@ -1181,7 +1264,8 @@ pub(crate) fn draft(id: u64, g: &Globals, cfg: &Cfg, anchor: u32, pos: usize, k:
         }
     }
     let ids = unsafe { std::slice::from_raw_parts(dr.ids.contents() as *const u32, k) };
-    Some(ids.to_vec())
+    let probs = unsafe { std::slice::from_raw_parts(dr.probs.contents() as *const f32, k) };
+    Some((ids.to_vec(), probs.to_vec()))
 }
 
 fn grid(enc: &ComputeCommandEncoderRef, x: u64, y: u64, z: u64, threads: u64) {
@@ -1213,6 +1297,7 @@ fn mv(c: &Ctx, enc: &ComputeCommandEncoderRef, fbuf: &WeightArena, m: &Mat, xs: 
                 set_bytes_t(enc, 5, &addy);
                 enc.dispatch_thread_groups(MTLSize::new((*rows as u64).div_ceil(16), 1, 1), MTLSize::new(128, 1, 1));
             }
+            Mat::Q8B { .. } => unreachable!("a gathered table goes through q8_rows"),
             Mat::Q8 { abs, rows, cols, rs, col } => {
                 enc.set_compute_pipeline_state(&c.q8f_r4);
                 fbuf.bind(enc, 0, *abs);
@@ -1398,7 +1483,11 @@ fn encode_call(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncod
 /// then `ink_q8p`, the matrix read once for all the rows.
 #[allow(clippy::too_many_arguments)]
 fn q8_rows(p: &Pipes, enc: &ComputeCommandEncoderRef, d: &Dev, m: &Mat, x: (&Buffer, u64), y: (&Buffer, u64), n: usize, add: bool) {
-    let Mat::Q8 { abs, rows, cols, rs, col } = m else { return };
+    let (wbuf, rows, cols, rs, col) = match m {
+        Mat::Q8 { abs, rows, cols, rs, col } => (Err(*abs), rows, cols, rs, col),
+        Mat::Q8B { buf, rows, cols, rs, col } => (Ok(buf), rows, cols, rs, col),
+        Mat::Q4 { .. } => return,
+    };
     let xc = d.draft.as_ref().map_or(&d.pxc, |dr| &dr.xc);
     let (c4, r) = ((cols / 4) as u32, *rows as u32);
     enc.set_compute_pipeline_state(&p.xcol);
@@ -1409,7 +1498,10 @@ fn q8_rows(p: &Pipes, enc: &ComputeCommandEncoderRef, d: &Dev, m: &Mat, x: (&Buf
     grid(enc, ((cols / 4) as u64).div_ceil(256), n as u64, 1, 256);
     let ip = IP { n: n as u32, v: add as u32, ..IP::default() };
     enc.set_compute_pipeline_state(&p.q8p);
-    d.fbuf.bind(enc, 0, *abs);
+    match wbuf {
+        Ok(b) => enc.set_buffer(0, Some(b), 0),
+        Err(abs) => d.fbuf.bind(enc, 0, abs),
+    }
     enc.set_buffer(1, Some(xc), 0);
     enc.set_buffer(2, Some(rs), 0);
     enc.set_buffer(3, Some(y.0), y.1);

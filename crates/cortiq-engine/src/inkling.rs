@@ -1249,6 +1249,13 @@ const SPEC_REL: [f32; 8] = [1.0, 1.26, 1.40, 1.54, 1.67, 1.78, 1.90, 2.0];
 /// drafts kept on prose and chat).
 const SPEC_HOLD_PRIOR: [f32; 7] = [0.70, 0.65, 0.62, 0.60, 0.58, 0.56, 0.55];
 
+/// A round of `k` drafts against a plain token on the Apple M4 (the draft
+/// included): a verify's rows cost far more there (the experts' unpacking).
+const SPEC_REL_GATE: [f32; 8] = [1.0, 1.6, 1.95, 2.3, 2.6, 2.9, 3.2, 3.5];
+
+/// Drafts a gated round asks for (it verifies the ones that pay).
+const GATE_DRAFTS: usize = 3;
+
 /// The DSpark depth that lands the most tokens per millisecond: every round
 /// and plain token is timed from one decode step to the next (the
 /// pipeline's own work included), a depth's price is its running average
@@ -1265,12 +1272,40 @@ pub struct SpecPolicy {
     dwell: u8,
     plain_run: u16,
     picked: Option<std::time::Instant>,
-    last: Option<(std::time::Instant, usize, usize)>,
+    last: Option<(std::time::Instant, usize, usize, usize)>,
+    /// Drafts that carry their probabilities (Metal): a round verifies as many
+    /// as pay by them, and rounds that lose to plain decoding send the policy
+    /// to plain steps for a while (`cool` steps; Strata's realized-gain gate).
+    gate: bool,
+    cool: u16,
+    cool_len: u16,
+    gain: f32,
+    /// The drafts the round just taken verified, and whether its draft went
+    /// unused (that step is not timed).
+    verified: Option<usize>,
+    wasted: bool,
+    t_draft: f32,
 }
 
 impl Default for SpecPolicy {
     fn default() -> Self {
-        Self { hold: SPEC_HOLD_PRIOR, wall: [0.0; 8], seen: [0; 8], k: 3, dwell: 0, plain_run: 0, picked: None, last: None }
+        Self {
+            hold: SPEC_HOLD_PRIOR,
+            wall: [0.0; 8],
+            seen: [0; 8],
+            k: 3,
+            dwell: 0,
+            plain_run: 0,
+            picked: None,
+            last: None,
+            gate: false,
+            cool: 0,
+            cool_len: 8,
+            gain: 1.0,
+            verified: None,
+            wasted: false,
+            t_draft: 0.0,
+        }
     }
 }
 
@@ -1280,7 +1315,7 @@ impl SpecPolicy {
     pub fn pick(&mut self, pos: usize, room: usize) -> usize {
         let now = std::time::Instant::now();
         self.picked = Some(now);
-        if let Some((t, k, at)) = self.last.take() {
+        if let Some((t, k, at, accepted)) = self.last.take() {
             if at == pos {
                 let w = now.duration_since(t).as_secs_f32() * 1e3;
                 // a depth's first step builds its call's graph and is not counted
@@ -1290,9 +1325,23 @@ impl SpecPolicy {
                     _ if w < self.wall[k] * 4.0 => self.wall[k] += 0.2 * (w - self.wall[k]),
                     _ => {}
                 }
+                if self.gate && k > 0 && self.seen[0] >= 2 {
+                    self.realized((1 + accepted) as f32 * self.wall[0] / w);
+                }
             }
         }
         let pinned = spec_k();
+        if self.gate && pinned == usize::MAX {
+            if self.cool > 0 {
+                self.cool -= 1;
+                return 0;
+            }
+            // plain decoding timed for itself before rounds are weighed against it
+            if self.seen[0] < 2 {
+                return 0;
+            }
+            return GATE_DRAFTS.min(room);
+        }
         let k = if pinned != usize::MAX {
             pinned.min(7)
         } else {
@@ -1305,8 +1354,16 @@ impl SpecPolicy {
     /// Record the step just taken at `pos`: `k` drafts offered, `accepted`
     /// kept (0 and 0 for a plain token).
     pub fn done(&mut self, pos: usize, k: usize, accepted: usize) {
-        let k = k.min(7);
-        self.last = self.picked.take().map(|t| (t, k, pos + 1 + accepted));
+        if std::mem::take(&mut self.wasted) {
+            // a draft no row was verified for: its step is not a plain one's price
+            self.picked = None;
+            self.last = None;
+            return;
+        }
+        // a round that did not run (k 0) leaves no verified drafts behind
+        let verified = self.verified.take();
+        let k = if self.gate && k > 0 { verified.unwrap_or(k) } else { k }.min(7);
+        self.last = self.picked.take().map(|t| (t, k, pos + 1 + accepted, accepted));
         if k == 0 {
             self.plain_run = self.plain_run.saturating_add(1);
             return;
@@ -1336,8 +1393,55 @@ impl SpecPolicy {
         if self.seen[k] >= 2 {
             return Some(self.wall[k]);
         }
+        let rel = if self.gate { &SPEC_REL_GATE } else { &SPEC_REL };
         let near = (0..8usize).filter(|&j| self.seen[j] >= 2).min_by_key(|&j| j.abs_diff(k))?;
-        Some(self.wall[near] * SPEC_REL[k] / SPEC_REL[near])
+        Some(self.wall[near] * rel[k] / rel[near])
+    }
+
+    /// A round's realized gain (its tokens against plain steps of the same
+    /// time): a run of losing rounds sends the policy to plain steps, 8 at
+    /// first and up to 16 while they keep losing.
+    fn realized(&mut self, r: f32) {
+        self.gain = 0.72 * self.gain + 0.28 * r;
+        if r >= 1.05 {
+            self.gain = self.gain.max(1.14);
+            self.cool_len = 8;
+        } else if self.gain < 0.90 {
+            self.cool = self.cool_len;
+            self.cool_len = (self.cool_len + 4).min(16);
+            self.gain = 0.96;
+        }
+    }
+
+    /// The drafts of a gated round worth verifying by their probabilities
+    /// (`p[j]` the drafter's for draft j): the count whose expected tokens
+    /// beyond the anchor, at a plain step's price, most exceed what verifying
+    /// them adds; 0 when none does. `t_draft` the draft's time (ms).
+    fn keep(&mut self, p: &[f32], t_draft: f32) -> usize {
+        self.gate = true;
+        self.t_draft += if self.t_draft == 0.0 { t_draft } else { 0.2 * (t_draft - self.t_draft) };
+        if spec_k() != usize::MAX {
+            return p.len();
+        }
+        let Some(w0) = self.price(0).filter(|_| self.seen[0] >= 2) else { return p.len() };
+        let (mut best, mut gain) = (0usize, 0f32);
+        let (mut reach, mut extra) = (1f32, 0f32);
+        for m in 1..=p.len().min(7) {
+            reach *= p[m - 1].clamp(0.0, 1.0);
+            extra += reach;
+            let Some(pm) = self.price(m) else { break };
+            let net = extra * w0 - (pm - self.t_draft - w0);
+            if net > gain {
+                (best, gain) = (m, net);
+            }
+        }
+        if best == 0 {
+            self.wasted = true;
+            self.realized(w0 / (w0 + self.t_draft));
+        } else {
+            self.verified = Some(best);
+        }
+        best
     }
 
     fn plan(&mut self) -> usize {
@@ -1391,7 +1495,15 @@ pub fn spec_round(globals: &Globals, layers: &[Layer], cfg: &Cfg, state: &mut St
     }
     let timed = std::env::var("CMF_INKLING_SPEC_TIME").is_ok();
     let t0 = std::time::Instant::now();
-    let mut drafts = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    let (mut drafts, probs) = crate::gpu::inkling_draft(state.sequence_id, globals, cfg, anchor, pos, k)?;
+    if !probs.is_empty() {
+        // drafts with their probabilities (Metal): verify the ones that pay
+        let m = state.spec.keep(&probs, t0.elapsed().as_secs_f32() * 1e3);
+        if m == 0 {
+            return None;
+        }
+        drafts.truncate(m);
+    }
     // `CMF_INKLING_SPEC_JUNK=1` (a check): drafts the model never keeps, so every
     // round rolls all of them back — the text must stay plain decoding's
     if std::env::var("CMF_INKLING_SPEC_JUNK").as_deref() == Ok("1") {

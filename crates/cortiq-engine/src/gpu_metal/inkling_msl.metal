@@ -1696,21 +1696,95 @@ kernel void ink_ds_markov(device const float* ch [[buffer(0)]], device const flo
     }
 }
 
-// A draft's pick: the first argmax of logits + fold_b into ids[i] and prev.
-// vi = (V, i). One threadgroup, 1024 threads.
+// A draft's pick and its probability: the first argmax of logits + fold_b
+// into ids[i] and prev (a table's index through map), and the softmax of the
+// soft-capped scores at it into prob[i]. One threadgroup, 1024 threads.
+struct DsPick {
+    uint V, i, map, pad;
+    float cap;
+};
 kernel void ink_ds_pick(device const float* lg [[buffer(0)]], device const float* fb [[buffer(1)]],
                         device uint* ids [[buffer(2)]], device uint* prev [[buffer(3)]],
-                        constant uint2& vi [[buffer(4)]],
+                        constant DsPick& dp [[buffer(4)]], device const uint* map [[buffer(5)]],
+                        device float* prob [[buffer(6)]],
                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]], uint3 nt_v [[threads_per_threadgroup]])
 {
-    threadgroup float bv[32];
+    threadgroup float bv[32], bm[32], bs[32];
     threadgroup uint bi[32];
-    const uint V = vi.x, nt = nt_v.x;
-    float best = -3.0e38f;
+    const uint V = dp.V, nt = nt_v.x;
+    float best = -3.0e38f, mx = -3.0e38f, sm = 0.0f;
     uint idx = 0xFFFFFFFFu;
     for (uint v = tid; v < V; v += nt) {
         const float x = lg[v] + fb[v];
+        if (x > best) {
+            best = x;
+            idx = v;
+        }
+        // the running log-sum-exp of the capped scores
+        const float y = dp.cap > 0.0f ? dp.cap * tanh(x / dp.cap) : x;
+        if (y > mx) {
+            sm = sm * exp(mx - y) + 1.0f;
+            mx = y;
+        } else {
+            sm += exp(y - mx);
+        }
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) {
+        const float ob = simd_shuffle_xor(best, o);
+        const uint oi = simd_shuffle_xor(idx, o);
+        if (ob > best || (ob == best && oi < idx)) {
+            best = ob;
+            idx = oi;
+        }
+        const float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sm, o);
+        const float nm = max(mx, om);
+        sm = sm * exp(mx - nm) + os * exp(om - nm);
+        mx = nm;
+    }
+    if (lane == 0u) {
+        bv[sg] = best;
+        bi[sg] = idx;
+        bm[sg] = mx;
+        bs[sg] = sm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float b = bv[0], M = bm[0], S = bs[0];
+        uint x = bi[0];
+        for (uint k = 1u; k < (nt >> 5u); ++k) {
+            if (bv[k] > b || (bv[k] == b && bi[k] < x)) {
+                b = bv[k];
+                x = bi[k];
+            }
+            const float nm = max(M, bm[k]);
+            S = S * exp(M - nm) + bs[k] * exp(bm[k] - nm);
+            M = nm;
+        }
+        const float yb = dp.cap > 0.0f ? dp.cap * tanh(b / dp.cap) : b;
+        prob[dp.i] = exp(yb - M) / S;
+        const uint tok = dp.map != 0u ? map[x] : x;
+        ids[dp.i] = tok;
+        prev[0] = tok;
+    }
+}
+
+// A verify's greedy picks on the GPU: row r's first argmax into out[r].
+// Grid (n), 1024 threads.
+kernel void ink_argmax(device const float* lg [[buffer(0)]], device uint* out [[buffer(1)]],
+                       constant uint& V [[buffer(2)]],
+                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                       uint3 nt_v [[threads_per_threadgroup]])
+{
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    const uint nt = nt_v.x, r = tg.x;
+    device const float* row = lg + (ulong)r * V;
+    float best = -INFINITY;
+    uint idx = 0xFFFFFFFFu;
+    for (uint v = tid; v < V; v += nt) {
+        const float x = row[v];
         if (x > best) {
             best = x;
             idx = v;
@@ -1730,15 +1804,14 @@ kernel void ink_ds_pick(device const float* lg [[buffer(0)]], device const float
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        float bb = bv[0];
+        float b = bv[0];
         uint x = bi[0];
         for (uint k = 1u; k < (nt >> 5u); ++k) {
-            if (bv[k] > bb || (bv[k] == bb && bi[k] < x)) {
-                bb = bv[k];
+            if (bv[k] > b || (bv[k] == b && bi[k] < x)) {
+                b = bv[k];
                 x = bi[k];
             }
         }
-        ids[vi.y] = x;
-        prev[0] = x;
+        out[r] = x;
     }
 }
