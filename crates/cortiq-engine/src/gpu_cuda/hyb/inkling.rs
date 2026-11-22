@@ -57,11 +57,12 @@ fn attn_gemm_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
 }
 
-/// `CMF_INKLING_PERSIST=0`: a decode row's expert matvecs a block a place
-/// (a partial last wave) instead of a resident grid taking the places in turn.
+/// `CMF_INKLING_PERSIST=1`: a decode row's expert matvecs as a resident grid
+/// taking the places in turn instead of a block a place (G4: 179.6 against
+/// 190.8 tok/s — the many blocks' loads in flight win over the partial wave).
 fn persist_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_INKLING_PERSIST").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_PERSIST").as_deref() == Ok("1"))
 }
 
 /// `CMF_INKLING_ROWMAP=0`: a prompt call's expert input as a gathered f16
