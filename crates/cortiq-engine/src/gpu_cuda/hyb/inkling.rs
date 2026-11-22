@@ -89,13 +89,13 @@ fn bmax() -> usize {
 struct Fx {
     mix: cs::CUfunction,
     mix2: cs::CUfunction,
-    fmv3: cs::CUfunction,
     rms3: cs::CUfunction,
     gd3: cs::CUfunction,
     go3: cs::CUfunction,
-    qrkv: cs::CUfunction,
     merge_g: cs::CUfunction,
     post_mx: cs::CUfunction,
+    qrkv2: cs::CUfunction,
+    post_mix: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
     gate_out: cs::CUfunction,
@@ -496,13 +496,13 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     let fx = Fx {
         mix: func(module, "ink_mix")?,
         mix2: func(module, "ink_mix2")?,
-        fmv3: func(module, "ink_fmv3")?,
         rms3: func(module, "ink_rms3")?,
         gd3: func(module, "ink_gate_down3")?,
         go3: func(module, "ink_gate_out3")?,
-        qrkv: func(module, "ink_qrkv")?,
         merge_g: func(module, "ink_attn_merge_g")?,
         post_mx: func(module, "ink_post_mx")?,
+        qrkv2: func(module, "ink_qrkv2")?,
+        post_mix: func(module, "ink_post_mix")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
         gate_out: func(module, "ink_gate_out")?,
@@ -1620,19 +1620,8 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let nh = cfg.nh;
         let (nh_i, kp_i) = (nh as i32, (cfg.nkv * 4) as i32);
         let (mut dk, mut dv) = (0u64, 0u64);
-        if fuse {
-            // the sinks and the dynamic convolution weights in one launch
-            let (wk, wv, kr) = match (&l.dk, &l.dv) {
-                (Some(wk), Some(wv)) => {
-                    dk = d.dkb.ptr;
-                    dv = d.dvb.ptr;
-                    (wk.ptr, wv.ptr, kp_i)
-                }
-                _ => (0u64, 0u64, 0i32),
-            };
-            let tot = nh + 2 * kr as usize;
-            c.launch(f.fmv3, (tot as u32, nu), 192, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
-        } else {
+        // fused: the sinks and the per-token taps come inside `ink_qrkv2`
+        if !fuse {
             c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
             if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
                 c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
@@ -1647,14 +1636,19 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
         let ring = s.ring as i32;
         if fuse {
+            // queries, keys, values, the sinks and the per-token taps in one launch
+            let (wdk, wdv) = match (&l.dk, &l.dv) {
+                (Some(wk), Some(wv)) => (wk.ptr, wv.ptr),
+                _ => (0u64, 0u64),
+            };
             c.launch(
-                f.qrkv,
+                f.qrkv2,
                 ((nh * n + 2 * cfg.nkv) as u32, 1),
                 cfg.hd as u32,
                 0,
                 kargs!(
-                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr,
-                    s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr
+                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr,
+                    ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr, l.sink.ptr, d.x[0].ptr, d.sk.ptr, wdk, d.x[xk].ptr, wdv, d.x[xv].ptr
                 ),
             )?;
         } else {
@@ -1705,18 +1699,29 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 7. the output convolution; a boundary closes the running sum into a block
         let bslot = if l.boundary { *nb as i32 } else { -1 };
         let hb = hidden.div_ceil(256) as u32;
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
+        // a decode row: the post and the MoE input's mix (and norm) in one block
+        let pm = fuse && n == 1;
+        if !pm {
+            c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
+        }
         if l.boundary {
             *nb += 1;
         }
         st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
+        if pm {
+            let (nw, xo, p0, p1) = if gates.is_none() { (l.post_norm.ptr, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
+            c.launch(f.post_mix, (1, 1), 512, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, s.hist[2].ptr, nb_i, l.mq.ptr, d.m.ptr, ost, nw, eps, xo, p0, p1, hs))?;
+        }
         if fuse && gates.is_none() {
             // the MoE input's mix and its norm in one launch
-            c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            if !pm {
+                c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            }
         } else {
-            if fuse {
+            if pm {
+            } else if fuse {
                 let nul = 0u64;
                 c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
             } else {
