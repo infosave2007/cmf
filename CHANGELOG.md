@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RTX 3060 (12 GB): Inkling-2-Mini decodes at 63.3 tok/s and reads a 4 096-token prompt at 1175 tok/s with 4.9 GB of
   experts in host memory, where the build used to decline the card (7.2 tok/s on the host's CPU).
 
+### Fixed
+- Inkling: a DSpark round whose verify, rollback or row logits failed on the card handed the sequence to the host
+  without its caches, and the next token read past a one-row cache and panicked (`inkling.rs:791`). Every path off
+  the card now replays the sequence's tokens on the host (`card_dropped`), and the host replays them itself when its
+  caches miss positions the tokens have (`host_catch_up`).
+
 ## [0.9.15] — 2026-11-22
 
 ### Changed
