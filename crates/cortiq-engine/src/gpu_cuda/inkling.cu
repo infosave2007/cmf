@@ -1752,3 +1752,213 @@ extern "C" __global__ void ink_argmax_rows(const float* __restrict__ lg, int V, 
         ids[blockIdx.x] = x == 0x7fffffff ? 0 : x;
     }
 }
+
+__device__ __forceinline__ void mma16816b(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ u32 pk_h(float lo, float hi) { return (u32)f2h(lo) | ((u32)f2h(hi) << 16); }
+
+// A prompt call's attention, flash style (`ink_attn_soft`'s arithmetic, the
+// scores never stored): a block 64 query rows of one head, 4 warps of 16;
+// tiles of 64 key positions from the block's earliest window start to its
+// last row; S = Q·Kᵀ and O += P·V on the f16 tensor cores; the relative bias
+// of a warp's 16 × 64 tile from one 16 × 80 band product (yr · table over
+// the tile's 79 distances, bf16 split three ways ≈ f32); a running softmax a
+// row; the sink at the end. q16 [n][NH·HD] f16, yr [n][NH][DR], out
+// [n][NH·HD]. Grid (ceil(n / 64), NH), 128 threads.
+#define FT 64
+extern "C" __global__ void __launch_bounds__(128) ink_attn_flash(const u16* __restrict__ q16, const float* __restrict__ yr,
+                                                                const float* __restrict__ sinks, const float* __restrict__ table,
+                                                                int E, const u16* __restrict__ kc, const u16* __restrict__ vc,
+                                                                int ring, int win, float scale, int n,
+                                                                const int* __restrict__ cr, float* __restrict__ out)
+{
+    PDL_PRO();
+#if HD == 128 && DR == 16
+    // Ks [64][HD + 8] while the scores run, then the warps' bias bands [4][16][80] f32
+    __shared__ __align__(16) unsigned char kb[4 * 16 * 80 * 4];
+    __shared__ __align__(16) u16 Vt[HD][FT + 8];
+    __shared__ __align__(16) u16 Tb[2][FT + 64][DR];
+    u16(*Ks)[HD + 8] = (u16(*)[HD + 8])kb;
+    float(*Bw)[16][80] = (float(*)[16][80])kb;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int h = blockIdx.y, g = h / (NH / NKV), C = NKV * HD;
+    const int pos0 = cr[0];
+    const int rb0 = blockIdx.x * FT, rlast = min(n - 1, rb0 + FT - 1);
+    const int ra = rb0 + 16 * w + gid, rb = ra + 8;
+    const int pa = pos0 + ra, pb = pos0 + rb;
+    const int fa = win > 0 ? max(0, pa + 1 - win) : 0, fb = win > 0 ? max(0, pb + 1 - win) : 0;
+    const bool va = ra < n, vb = rb < n;
+    u32 qa[8][4];
+    {
+        const u16* qra = q16 + ((size_t)ra * NH + h) * HD + 2 * tig;
+        const u16* qrb = q16 + ((size_t)rb * NH + h) * HD + 2 * tig;
+#pragma unroll
+        for (int ks = 0; ks < 8; ks++) {
+            qa[ks][0] = va ? *(const u32*)(qra + ks * 16) : 0u;
+            qa[ks][1] = vb ? *(const u32*)(qrb + ks * 16) : 0u;
+            qa[ks][2] = va ? *(const u32*)(qra + ks * 16 + 8) : 0u;
+            qa[ks][3] = vb ? *(const u32*)(qrb + ks * 16 + 8) : 0u;
+        }
+    }
+    // the rows' relative states as bf16 hi / lo A fragments (16 rows × DR)
+    u32 yh[4], yl[4];
+    {
+        const float* ya = yr + ((size_t)ra * NH + h) * DR;
+        const float* yb = yr + ((size_t)rb * NH + h) * DR;
+        const int j0[4] = {2 * tig, 2 * tig, 2 * tig + 8, 2 * tig + 8};
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const bool ok = (q & 1) ? vb : va;
+            const float* y = (q & 1) ? yb : ya;
+            const float x0 = ok ? y[j0[q]] : 0.0f, x1 = ok ? y[j0[q] + 1] : 0.0f;
+            const u16 h0 = f2bf(x0), h1 = f2bf(x1);
+            const u16 l0 = f2bf(x0 - bf2f(h0)), l1 = f2bf(x1 - bf2f(h1));
+            yh[q] = (u32)h0 | ((u32)h1 << 16);
+            yl[q] = (u32)l0 | ((u32)l1 << 16);
+        }
+    }
+    float o[16][4];
+#pragma unroll
+    for (int dt = 0; dt < 16; dt++) o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
+    float ma = -3.0e38f, mb = -3.0e38f, la = 0.0f, lb = 0.0f;
+    const int pfirst = win > 0 ? max(0, pos0 + rb0 + 1 - win) : 0, pend = pos0 + rlast;
+    for (int p0 = pfirst; p0 <= pend; p0 += FT) {
+        for (int t = tid; t < FT * (HD / 8); t += blockDim.x) {
+            const int key = t / (HD / 8), c8 = t % (HD / 8), p = p0 + key;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = kv;
+            if (p <= pend) {
+                const int slot = ring > 0 ? p % ring : p;
+                kv = *(const uint4*)(kc + (size_t)slot * C + g * HD + c8 * 8);
+                vv = *(const uint4*)(vc + (size_t)slot * C + g * HD + c8 * 8);
+            }
+            *(uint4*)&Ks[key][c8 * 8] = kv;
+            const u16* vh = (const u16*)&vv;
+#pragma unroll
+            for (int i = 0; i < 8; i++) Vt[c8 * 8 + i][key] = vh[i];
+        }
+        // the band: column c is the distance pos0 + rb0 - p0 - 63 + c
+        const int db = pos0 + rb0 - p0 - (FT - 1);
+        for (int t = tid; t < (FT + 64) * DR; t += blockDim.x) {
+            const int c = t / DR, j = t % DR, dd = db + c;
+            const float x = (dd >= 0 && dd < E) ? table[(size_t)j * E + dd] : 0.0f;
+            const u16 hi = f2bf(x);
+            Tb[0][c][j] = hi;
+            Tb[1][c][j] = f2bf(x - bf2f(hi));
+        }
+        __syncthreads();
+        float sc[8][4];
+#pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < 8; ks++) {
+                const u32 b0 = *(const u32*)&Ks[nt * 8 + gid][ks * 16 + 2 * tig];
+                const u32 b1 = *(const u32*)&Ks[nt * 8 + gid][ks * 16 + 2 * tig + 8];
+                mma16816h(sc[nt], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], b0, b1);
+            }
+        }
+        float bb[10][4];
+#pragma unroll
+        for (int bt = 0; bt < 10; bt++) {
+            bb[bt][0] = bb[bt][1] = bb[bt][2] = bb[bt][3] = 0.0f;
+            const int cc = 16 * w + bt * 8 + gid;
+            const u32 th0 = *(const u32*)&Tb[0][cc][2 * tig], th1 = *(const u32*)&Tb[0][cc][2 * tig + 8];
+            const u32 tl0 = *(const u32*)&Tb[1][cc][2 * tig], tl1 = *(const u32*)&Tb[1][cc][2 * tig + 8];
+            mma16816b(bb[bt], yh[0], yh[1], yh[2], yh[3], th0, th1);
+            mma16816b(bb[bt], yh[0], yh[1], yh[2], yh[3], tl0, tl1);
+            mma16816b(bb[bt], yl[0], yl[1], yl[2], yl[3], th0, th1);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int bt = 0; bt < 10; bt++) {
+            Bw[w][gid][bt * 8 + 2 * tig] = bb[bt][0];
+            Bw[w][gid][bt * 8 + 2 * tig + 1] = bb[bt][1];
+            Bw[w][gid + 8][bt * 8 + 2 * tig] = bb[bt][2];
+            Bw[w][gid + 8][bt * 8 + 2 * tig + 1] = bb[bt][3];
+        }
+        __syncwarp();
+        float ta = -3.0e38f, tb2 = -3.0e38f;
+#pragma unroll
+        for (int nt = 0; nt < 8; nt++)
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const int kcol = nt * 8 + 2 * tig + e, p = p0 + kcol;
+                float s0 = sc[nt][e] * scale + Bw[w][gid][FT - 1 + gid - kcol];
+                float s1 = sc[nt][2 + e] * scale + Bw[w][gid + 8][FT - 1 + gid + 8 - kcol];
+                if (!(va && p >= fa && p <= pa)) s0 = -3.0e38f;
+                if (!(vb && p >= fb && p <= pb)) s1 = -3.0e38f;
+                sc[nt][e] = s0;
+                sc[nt][2 + e] = s1;
+                ta = fmaxf(ta, s0);
+                tb2 = fmaxf(tb2, s1);
+            }
+#pragma unroll
+        for (int x = 1; x <= 2; x <<= 1) {
+            ta = fmaxf(ta, __shfl_xor_sync(FULL, ta, x));
+            tb2 = fmaxf(tb2, __shfl_xor_sync(FULL, tb2, x));
+        }
+        const float na = fmaxf(ma, ta), nb = fmaxf(mb, tb2);
+        const float ca = na > -1.0e38f ? expf(ma - na) : 1.0f, cb = nb > -1.0e38f ? expf(mb - nb) : 1.0f;
+        la *= ca;
+        lb *= cb;
+#pragma unroll
+        for (int dt = 0; dt < 16; dt++) {
+            o[dt][0] *= ca;
+            o[dt][1] *= ca;
+            o[dt][2] *= cb;
+            o[dt][3] *= cb;
+        }
+        ma = na;
+        mb = nb;
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            float pv[2][4];
+#pragma unroll
+            for (int u = 0; u < 2; u++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const float s = sc[2 * kk + u][q];
+                    const float m = q < 2 ? ma : mb;
+                    pv[u][q] = s > -1.0e38f ? expf(s - m) : 0.0f;
+                }
+            la += pv[0][0] + pv[0][1] + pv[1][0] + pv[1][1];
+            lb += pv[0][2] + pv[0][3] + pv[1][2] + pv[1][3];
+            const u32 a0 = pk_h(pv[0][0], pv[0][1]), a1 = pk_h(pv[0][2], pv[0][3]);
+            const u32 a2 = pk_h(pv[1][0], pv[1][1]), a3 = pk_h(pv[1][2], pv[1][3]);
+#pragma unroll
+            for (int dt = 0; dt < 16; dt++) {
+                const u32 b0 = *(const u32*)&Vt[dt * 8 + gid][kk * 16 + 2 * tig];
+                const u32 b1 = *(const u32*)&Vt[dt * 8 + gid][kk * 16 + 2 * tig + 8];
+                mma16816h(o[dt], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int x = 1; x <= 2; x <<= 1) {
+        la += __shfl_xor_sync(FULL, la, x);
+        lb += __shfl_xor_sync(FULL, lb, x);
+    }
+#pragma unroll
+    for (int hb = 0; hb < 2; hb++) {
+        const int r = hb ? rb : ra;
+        if (!(hb ? vb : va)) continue;
+        const float m = hb ? mb : ma, l = hb ? lb : la;
+        const float sk = sinks[(size_t)r * NH + h];
+        const float M = fmaxf(m, sk);
+        const float f = m > -1.0e38f ? expf(m - M) : 0.0f;
+        const float inv = f / (l * f + expf(sk - M));
+        float* orow = out + ((size_t)r * NH + h) * HD + 2 * tig;
+#pragma unroll
+        for (int dt = 0; dt < 16; dt++) {
+            orow[dt * 8] = o[dt][2 * hb] * inv;
+            orow[dt * 8 + 1] = o[dt][2 * hb + 1] * inv;
+        }
+    }
+#endif
+}

@@ -57,6 +57,13 @@ fn attn_gemm_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_FLASH=0`: a prompt call's attention through the cuBLAS score
+/// products (`attn_gemm`) instead of `ink_attn_flash`.
+fn flash_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FLASH").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_SPLIT=0`: a decode call's attention a block a head and row
 /// (`ink_attn`) instead of a block a tile of keys.
 fn split_on() -> bool {
@@ -97,6 +104,7 @@ struct Fx {
     h16: cs::CUfunction,
     f16: cs::CUfunction,
     attn_soft: cs::CUfunction,
+    attn_flash: cs::CUfunction,
     gather16: cs::CUfunction,
     moe_mma: cs::CUfunction,
     moe_mma2: cs::CUfunction,
@@ -516,6 +524,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         ds_pick: func(module, "ink_ds_pick")?,
         argmax_rows: func(module, "ink_argmax_rows")?,
         attn_soft: func(module, "ink_attn_soft")?,
+        attn_flash: func(module, "ink_attn_flash")?,
         gate_norm: func(module, "ink_gate_norm")?,
         gate_mix: func(module, "ink_gate_mix")?,
         kv_rows: func(module, "ink_kv_rows")?,
@@ -1782,7 +1791,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         let mut inp = [hin, hin, hin];
         if let Some((aq, nq)) = &l.aq {
             let nb_i = *nb as i32;
-            c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            if fuse_on() {
+                let nul = 0u64;
+                c.launch(f.mix2, (*nq as u32, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            }
             inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
         }
         st(c, 0, &mut tp)?;
@@ -1793,7 +1807,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let q = d.msg_q.ptr + (i * 4 * hidden * 4) as u64;
             let bnb = bank_nb as i32;
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
-            c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            if fuse_on() {
+                let nul = 0u64;
+                c.launch(f.mix2, (4, nu), 512, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            }
             for j in 0..3 {
                 gate_big(c, f, b, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
                 inp[j] = fl(&d.gin, j);
@@ -1843,7 +1862,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (hd as f32).sqrt());
         let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
-        if attn_gemm_on() {
+        if attn_gemm_on() && flash_on() && hd == 128 && cfg.d_rel == 16 && nh % cfg.nkv == 0 {
+            // the queries as f16 rows, then the flash kernel (no scores stored)
+            let (tot_i, n_i, ring_i) = ((n * nh * hd) as i32, n as i32, s.ring as i32);
+            c.launch(f.f16, ((n * nh * hd).div_ceil(256) as u32, 1), 256, 0, kargs!(d.yq.ptr, b.q16.ptr, tot_i))?;
+            c.launch(f.attn_flash, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(b.q16.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, n_i, d.cr.ptr, d.att.ptr))?;
+        } else if attn_gemm_on() {
             attn_gemm(c, d, b, cfg, l, s, n, ext, win, scale)?;
         } else {
             c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
@@ -1865,7 +1889,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
-        c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+        if fuse_on() {
+            let nul = 0u64;
+            c.launch(f.mix2, (1, nu), 512, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+        } else {
+            c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+        }
         let mut mi = d.m.ptr;
         if let Some(gs) = gates {
             gate_big(c, f, b, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
