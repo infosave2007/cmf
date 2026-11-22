@@ -75,6 +75,12 @@ struct Fx {
     mix: cs::CUfunction,
     mix2: cs::CUfunction,
     fmv3: cs::CUfunction,
+    rms3: cs::CUfunction,
+    gd3: cs::CUfunction,
+    go3: cs::CUfunction,
+    qrkv: cs::CUfunction,
+    merge_g: cs::CUfunction,
+    post_mx: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
     gate_out: cs::CUfunction,
@@ -357,6 +363,8 @@ struct Dev {
     cr: Buf,
     /// A verify call's greedy pick of each row (`NMAX` ids).
     pick: Buf,
+    /// `hy_moe_route1`'s finished-block counter (the last block re-arms it)
+    rcnt: Buf,
     smax: usize,
     /// Recorded calls by (rows, logits rows) and the pointers they hold.
     graphs: HashMap<(usize, usize), GraphRec>,
@@ -462,6 +470,12 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         mix: func(module, "ink_mix")?,
         mix2: func(module, "ink_mix2")?,
         fmv3: func(module, "ink_fmv3")?,
+        rms3: func(module, "ink_rms3")?,
+        gd3: func(module, "ink_gate_down3")?,
+        go3: func(module, "ink_gate_out3")?,
+        qrkv: func(module, "ink_qrkv")?,
+        merge_g: func(module, "ink_attn_merge_g")?,
+        post_mx: func(module, "ink_post_mx")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
         gate_out: func(module, "ink_gate_out")?,
@@ -734,6 +748,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         logits,
         cr: Buf::new(64)?,
         pick: Buf::new(NMAX * 4)?,
+        rcnt: Buf::new(64)?,
         smax,
         graphs: HashMap::new(),
         cap,
@@ -754,6 +769,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
 impl Dev {
     fn zero_state(&self, c: &Ctx) -> Res<()> {
         unsafe {
+            cu::memset_d8_async(self.rcnt.ptr, 0, self.rcnt.bytes, c.stream).map_err(derr)?;
             for s in &self.slots {
                 for r in &s.rings {
                     cu::memset_d8_async(r.ptr, 0, r.bytes, c.stream).map_err(derr)?;
@@ -764,12 +780,9 @@ impl Dev {
     }
 }
 
-/// `true` when this call ran on the card. `ids` from position `pos0`; the
-/// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
-#[allow(clippy::too_many_arguments)]
-/// `CMF_INKLING_FUSE=0`: a decode call's mixes, norms and small matvecs as
-/// separate launches (`ink_mix`, `ink_rms`, three `ink_fmv`) instead of
-/// `ink_mix2` (one exchange, the norm in its epilogue) and `ink_fmv3`.
+/// `CMF_INKLING_FUSE=0`: a decode call's kernels one stage a launch (`ink_mix`,
+/// `ink_rms`, `ink_fmv`, the gates' halves, `ink_qr` + `ink_kv`, the merge and
+/// `ink_ogate`, router + select, combine + post) instead of the fused ones.
 fn fuse_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_INKLING_FUSE").as_deref() != Ok("0"))
@@ -803,6 +816,9 @@ fn pdl_on() -> bool {
     })
 }
 
+/// `true` when this call ran on the card. `ids` from position `pos0`; the
+/// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
     let _ = pdl_on();
     forward_with(id, g, layers, cfg, ids, pos0, want, all, logits, None)
@@ -1501,19 +1517,48 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             } else {
                 c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
             }
-            for j in 0..3 {
-                gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
-                inp[j] = fl(&d.gin, j);
+            let r = gs[0].down.bytes / (2 * hidden * 4);
+            if fuse && gs[..3].iter().all(|g| g.down.bytes / (2 * hidden * 4) == r) {
+                // the three gates' halves a launch each
+                let r_i = r as i32;
+                let (m0, m1, m2) = (fl(&d.msg, 0), fl(&d.msg, 1), fl(&d.msg, 2));
+                let (o0, o1, o2) = (fl(&d.gin, 0), fl(&d.gin, 1), fl(&d.gin, 2));
+                c.launch_3d(f.gd3, (r.div_ceil(8) as u32, nu, 3), 256, 0, kargs!(inp[0], inp[1], inp[2], m0, m1, m2, gs[0].down.ptr, gs[1].down.ptr, gs[2].down.ptr, r_i, eps, d.gd.ptr))?;
+                c.launch_3d(
+                    f.go3,
+                    (hidden.div_ceil(8) as u32, nu, 3),
+                    256,
+                    0,
+                    kargs!(inp[0], inp[1], inp[2], m0, m1, m2, d.gd.ptr, gs[0].forget.ptr, gs[1].forget.ptr, gs[2].forget.ptr, gs[0].gain.ptr, gs[1].gain.ptr, gs[2].gain.ptr, r_i, o0, o1, o2),
+                )?;
+                inp = [o0, o1, o2];
+            } else {
+                for j in 0..3 {
+                    gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
+                    inp[j] = fl(&d.gin, j);
+                }
             }
         }
         st(c, 1, &mut tp)?;
         // 3. the input norms (a local layer's three are one weight; without
         // messages its inputs are one row)
-        for j in 0..(if one { 1 } else { 3 }) {
-            if normed && j == 0 {
-                continue;
+        let cnt = if one { 1 } else { 3 };
+        if fuse {
+            if !normed {
+                let th = (hidden / 4).div_ceil(32) * 32;
+                let (x, w, p) = (&d.x, &l.norms, &d.xp);
+                c.launch(
+                    f.rms3,
+                    (nu, cnt as u32),
+                    th as u32,
+                    0,
+                    kargs!(inp[0], w[0].ptr, x[0].ptr, p[0][0].ptr, p[0][1].ptr, inp[1], w[1].ptr, x[1].ptr, p[1][0].ptr, p[1][1].ptr, inp[2], w[2].ptr, x[2].ptr, p[2][0].ptr, p[2][1].ptr, eps, hs),
+                )?;
             }
-            c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+        } else {
+            for j in 0..cnt {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+            }
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
         let pl = |j: usize| Planes { p0: d.xp[j][0].ptr, p1: d.xp[j][1].ptr, p2: d.xp[j][1].ptr, stride: hidden };
@@ -1541,7 +1586,7 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                 _ => (0u64, 0u64, 0i32),
             };
             let tot = nh + 2 * kr as usize;
-            c.launch(f.fmv3, (tot.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
+            c.launch(f.fmv3, (tot as u32, nu), 192, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
         } else {
             c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
             if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
@@ -1555,15 +1600,28 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 5. queries and relative states; keys and values into the cache
         let full = !l.sliding as i32;
         let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
-        c.launch(f.qr, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.qk_clip, cfg.rel_clip, full, alpha, floor, d.cr.ptr))?;
         let ring = s.ring as i32;
-        c.launch(
-            f.kv,
-            (cfg.nkv as u32, 2),
-            cfg.hd as u32,
-            0,
-            kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr),
-        )?;
+        if fuse {
+            c.launch(
+                f.qrkv,
+                ((nh * n + 2 * cfg.nkv) as u32, 1),
+                cfg.hd as u32,
+                0,
+                kargs!(
+                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr,
+                    s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr
+                ),
+            )?;
+        } else {
+            c.launch(f.qr, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.qk_clip, cfg.rel_clip, full, alpha, floor, d.cr.ptr))?;
+            c.launch(
+                f.kv,
+                (cfg.nkv as u32, 2),
+                cfg.hd as u32,
+                0,
+                kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr),
+            )?;
+        }
         st(c, 4, &mut tp)?;
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (cfg.hd as f32).sqrt());
@@ -1580,14 +1638,22 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                 0,
                 kargs!(d.yq.ptr, d.yr.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.part.ptr, t_i, d.cr.ptr),
             )?;
-            c.launch(f.attn_merge, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr))?;
+            if fuse {
+                // the output gate in the merge's epilogue
+                let qs_i = (nh * cfg.hd) as i32;
+                c.launch(f.merge_g, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+            } else {
+                c.launch(f.attn_merge, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr))?;
+            }
         } else {
             c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.att.ptr, d.cr.ptr))?;
         }
         st(c, 5, &mut tp)?;
         let qs = nh * cfg.hd;
         let qs_i = qs as i32;
-        c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+        if !(fuse && split_on()) {
+            c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+        }
         let po = Planes { p0: d.po[0].ptr, p1: d.po[1].ptr, p2: d.po[1].ptr, stride: qs };
         l.oset.run(c, &d.hfx, &po, qs, n)?;
         st(c, 6, &mut tp)?;
@@ -1613,18 +1679,42 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
             }
             let mut mi = d.m.ptr;
             if let Some(gs) = gates {
-                gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+                if fuse {
+                    let r = gs[3].down.bytes / (2 * hidden * 4);
+                    let r_i = r as i32;
+                    let (m3, g3) = (fl(&d.msg, 3), &gs[3]);
+                    c.launch_3d(f.gd3, (r.div_ceil(8) as u32, nu, 1), 256, 0, kargs!(mi, mi, mi, m3, m3, m3, g3.down.ptr, g3.down.ptr, g3.down.ptr, r_i, eps, d.gd.ptr))?;
+                    c.launch_3d(
+                        f.go3,
+                        (hidden.div_ceil(8) as u32, nu, 1),
+                        256,
+                        0,
+                        kargs!(mi, mi, mi, m3, m3, m3, d.gd.ptr, g3.forget.ptr, g3.forget.ptr, g3.forget.ptr, g3.gain.ptr, g3.gain.ptr, g3.gain.ptr, r_i, d.mg.ptr, d.mg.ptr, d.mg.ptr),
+                    )?;
+                } else {
+                    gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+                }
                 mi = d.mg.ptr;
             }
-            c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            if fuse {
+                let th = (hidden / 4).div_ceil(32) * 32;
+                let (x, p, w) = (d.xm.ptr, &d.pm, l.post_norm.ptr);
+                c.launch(f.rms3, (nu, 1), th as u32, 0, kargs!(mi, w, x, p[0].ptr, p[1].ptr, mi, w, x, p[0].ptr, p[1].ptr, mi, w, x, p[0].ptr, p[1].ptr, eps, hs))?;
+            } else {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            }
         }
         st(c, 8, &mut tp)?;
-        // 9. the routed experts into y
-        moe(c, d, cfg, l, n, &mut tp)?;
+        // 9. the routed experts (fused: their weighted sum left to the post)
+        let si = moe(c, d, cfg, l, n, &mut tp, fuse)?;
         st(c, 9, &mut tp)?;
         // 10. the output convolution onto the running sum
         let (nul, m1) = (0u64, -1i32);
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni, s.hist[3].ptr))?;
+        if fuse {
+            c.launch(f.post_mx, (hb, 1), 256, 0, kargs!(d.dns.ptr, d.wsel.ptr, si, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, hout, ni, s.hist[3].ptr))?;
+        } else {
+            c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni, s.hist[3].ptr))?;
+        }
         st(c, 7, &mut tp)?;
     }
     Ok(())
@@ -1938,7 +2028,7 @@ unsafe fn gate(c: &Ctx, f: &Fx, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, 
 /// this arm's buffers): the router, the picks laid out as slots, every slot's
 /// gate/up pair (Inkling's activation in its epilogue) and down, the mixture
 /// into `y`.
-unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
+unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant, fuse: bool) -> Res<i32> {
     let fx = &d.hfx;
     let hidden = cfg.dim;
     let e = l.e;
@@ -1954,17 +2044,31 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
     let (bg, bd) = (bpg as i32, bpd as i32);
     let nul = 0u64;
     unsafe {
-        c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
-        c.launch(
-            fx.moe_select,
-            (1, 1),
-            if n == 1 && select512_on() { 512 } else { (32 * n.max(1)) as u32 },
-            0,
-            kargs!(
-                d.logits_e.ptr, l.bias.ptr, ni, ei, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si,
-                d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
-            ),
-        )?;
+        if fuse && n == 1 && e <= 256 && k <= 32 && s_n == k && hidden % 4 == 0 {
+            // a decode row: the router and the selection in one launch
+            c.launch(
+                fx.moe_route1,
+                (e.div_ceil(8) as u32, 1),
+                256,
+                0,
+                kargs!(
+                    d.xm.ptr, l.router.ptr, d.logits_e.ptr, ei, hi, l.bias.ptr, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si, d.qq[0].ptr,
+                    d.qq[1].ptr, ps_i, d.dns.ptr, bg, bd, d.rcnt.ptr
+                ),
+            )?;
+        } else {
+            c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
+            c.launch(
+                fx.moe_select,
+                (1, 1),
+                if n == 1 && select512_on() { 512 } else { (32 * n.max(1)) as u32 },
+                0,
+                kargs!(
+                    d.logits_e.ptr, l.bias.ptr, ni, ei, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si,
+                    d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
+                ),
+            )?;
+        }
         st(c, 11, tp)?;
         let t = (tb - 1) as usize;
         let pick = |kd: Option<usize>| match kd {
@@ -1976,9 +2080,11 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
         st(c, 12, tp)?;
         c.launch(pick(l.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?;
         st(c, 13, tp)?;
-        cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
-        let zero = 0i32;
-        c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;
+        if !fuse {
+            cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
+            let zero = 0i32;
+            c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;
+        }
     }
-    Ok(())
+    Ok(si)
 }

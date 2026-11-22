@@ -213,35 +213,66 @@ extern "C" __global__ void __launch_bounds__(512) ink_mix2(const float* __restri
 }
 
 // Three small f32 matvecs of a decode call in one launch: rows [0, r0) of W0·x0,
-// [r0, r0 + r1) of W1·x1, the rest of W2·x2 (float4 loads, a warp a row).
-// Grid (ceil((r0 + r1 + r2) / 8), n), 256 threads.
+// [r0, r0 + r1) of W1·x1, the rest of W2·x2 — a block an output row (float4
+// loads, every thread a few in flight). Grid (r0 + r1 + r2, n), 192 threads.
 extern "C" __global__ void ink_fmv3(const float* __restrict__ W0, int r0, const float* __restrict__ x0, float* __restrict__ y0,
                                     const float* __restrict__ W1, int r1, const float* __restrict__ x1, float* __restrict__ y1,
                                     const float* __restrict__ W2, int r2, const float* __restrict__ x2, float* __restrict__ y2)
 {
     PDL_PRO();
-    const int lane = threadIdx.x & 31;
-    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    __shared__ float sh[32];
+    int o = blockIdx.x;
     const int r = blockIdx.y;
     const float* W; const float* x; float* y; int rows;
     if (o < r0) { W = W0; x = x0; y = y0; rows = r0; }
     else if (o < r0 + r1) { o -= r0; W = W1; x = x1; y = y1; rows = r1; }
-    else if (o < r0 + r1 + r2) { o -= r0 + r1; W = W2; x = x2; y = y2; rows = r2; }
-    else return;
+    else { o -= r0 + r1; W = W2; x = x2; y = y2; rows = r2; }
     const float4* w = (const float4*)(W + (size_t)o * H);
     const float4* xr = (const float4*)(x + (size_t)r * H);
-    float a = 0.0f, b = 0.0f;
-    for (int i = lane; i < H / 4; i += 64) {
+    float a = 0.0f;
+    for (int i = threadIdx.x; i < H / 4; i += blockDim.x) {
         const float4 u = w[i], v = xr[i];
         a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
-        if (i + 32 < H / 4) {
-            const float4 u2 = w[i + 32], v2 = xr[i + 32];
-            b += u2.x * v2.x + u2.y * v2.y + u2.z * v2.z + u2.w * v2.w;
+    }
+    a = block_sum(a, sh);
+    if (threadIdx.x == 0) y[(size_t)r * rows + o] = a;
+}
+
+// Up to three `ink_rms` of a decode call in one launch (blockIdx.y the norm),
+// float4 loads. Grid (n, count), H/4 threads (rounded up to a warp).
+extern "C" __global__ void ink_rms3(const float* __restrict__ x0, const float* __restrict__ w0, float* __restrict__ o0,
+                                    u16* __restrict__ p00, u16* __restrict__ p01,
+                                    const float* __restrict__ x1, const float* __restrict__ w1, float* __restrict__ o1,
+                                    u16* __restrict__ p10, u16* __restrict__ p11,
+                                    const float* __restrict__ x2, const float* __restrict__ w2, float* __restrict__ o2,
+                                    u16* __restrict__ p20, u16* __restrict__ p21, float eps, int pstride)
+{
+    PDL_PRO();
+    __shared__ float sh[32];
+    const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    const float* x = j == 0 ? x0 : j == 1 ? x1 : x2;
+    const float* w = j == 0 ? w0 : j == 1 ? w1 : w2;
+    float* xo = j == 0 ? o0 : j == 1 ? o1 : o2;
+    u16* p0 = j == 0 ? p00 : j == 1 ? p10 : p20;
+    u16* p1 = j == 0 ? p01 : j == 1 ? p11 : p21;
+    const float4* xr = (const float4*)(x + (size_t)r * H);
+    float ss = 0.0f;
+    for (int i = tid; i < H / 4; i += blockDim.x) {
+        const float4 a = xr[i];
+        ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / (float)H + eps);
+    const float4* w4 = (const float4*)w;
+    for (int i = tid; i < H / 4; i += blockDim.x) {
+        const float4 a = xr[i], g = w4[i];
+        const float v[4] = {g.x * (a.x * inv), g.y * (a.y * inv), g.z * (a.z * inv), g.w * (a.w * inv)};
+        if (xo) ((float4*)(xo + (size_t)r * H))[i] = make_float4(v[0], v[1], v[2], v[3]);
+        if (p0) {
+#pragma unroll
+            for (int k = 0; k < 4; k++) put2(p0, p1, (size_t)r * pstride + 4 * i + k, v[k]);
         }
     }
-    float acc = a + b;
-    for (int sft = 16; sft > 0; sft >>= 1) acc += __shfl_xor_sync(FULL, acc, sft);
-    if (lane == 0) y[(size_t)r * rows + o] = acc;
 }
 
 // Weighted RMS norm of row r of x into xo (f32) and, when p0 is set, the
@@ -317,6 +348,97 @@ extern "C" __global__ void ink_gate_out(const float* __restrict__ x, const float
     }
 }
 
+// Up to three message gates' first halves in one launch (blockIdx.z the
+// gate): the block's RMS of x and m once, then a warp a rank row (float4).
+// Grid (R/8, n, count), 256 threads; d of gate j at d + j·n·R.
+extern "C" __global__ void ink_gate_down3(const float* __restrict__ x0, const float* __restrict__ x1,
+                                          const float* __restrict__ x2, const float* __restrict__ m0,
+                                          const float* __restrict__ m1, const float* __restrict__ m2,
+                                          const float* __restrict__ dw0, const float* __restrict__ dw1,
+                                          const float* __restrict__ dw2, int R, float eps, float* __restrict__ d)
+{
+    PDL_PRO();
+    __shared__ float part[32][2];
+    __shared__ float tot[2];
+    const int j = blockIdx.z, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, nwp = blockDim.x >> 5;
+    const float4* xr = (const float4*)((j == 0 ? x0 : j == 1 ? x1 : x2) + (size_t)r * H);
+    const float4* mr = (const float4*)((j == 0 ? m0 : j == 1 ? m1 : m2) + (size_t)r * H);
+    const float* down = j == 0 ? dw0 : j == 1 ? dw1 : dw2;
+    float sx = 0.0f, sm = 0.0f;
+    for (int i = tid; i < H / 4; i += blockDim.x) {
+        const float4 a = xr[i], b = mr[i];
+        sx += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+        sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        sx += __shfl_xor_sync(FULL, sx, o);
+        sm += __shfl_xor_sync(FULL, sm, o);
+    }
+    if (lane == 0) {
+        part[wp][0] = sx;
+        part[wp][1] = sm;
+    }
+    __syncthreads();
+    if (tid < 2) {
+        float t = 0.0f;
+        for (int w = 0; w < nwp; w++) t += part[w][tid];
+        tot[tid] = t;
+    }
+    __syncthreads();
+    const int k = blockIdx.x * nwp + wp;
+    if (k >= R) return;
+    const float4* dx = (const float4*)(down + (size_t)k * 2 * H);
+    const float4* dm = (const float4*)(down + (size_t)k * 2 * H + H);
+    float ax = 0.0f, am = 0.0f;
+    for (int i = lane; i < H / 4; i += 32) {
+        const float4 a = xr[i], b = mr[i], u = dx[i], v = dm[i];
+        ax += u.x * a.x + u.y * a.y + u.z * a.z + u.w * a.w;
+        am += v.x * b.x + v.y * b.y + v.z * b.z + v.w * b.w;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        ax += __shfl_xor_sync(FULL, ax, o);
+        am += __shfl_xor_sync(FULL, am, o);
+    }
+    if (lane == 0)
+        d[((size_t)j * gridDim.y + r) * R + k] = ax * rsqrtf(tot[0] / (float)H + eps) + am * rsqrtf(tot[1] / (float)H + eps);
+}
+
+// `ink_gate_out` of up to three gates in one launch (blockIdx.z the gate).
+// Grid (H/8, n, count), 256 threads.
+extern "C" __global__ void ink_gate_out3(const float* __restrict__ x0, const float* __restrict__ x1,
+                                         const float* __restrict__ x2, const float* __restrict__ m0,
+                                         const float* __restrict__ m1, const float* __restrict__ m2,
+                                         const float* __restrict__ d, const float* __restrict__ F0,
+                                         const float* __restrict__ F1, const float* __restrict__ F2,
+                                         const float* __restrict__ G0, const float* __restrict__ G1,
+                                         const float* __restrict__ G2, int R, float* __restrict__ o0,
+                                         float* __restrict__ o1, float* __restrict__ o2)
+{
+    PDL_PRO();
+    const int lane = threadIdx.x & 31, j = blockIdx.z;
+    const int i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), r = blockIdx.y;
+    if (i >= H) return;
+    const float* x = j == 0 ? x0 : j == 1 ? x1 : x2;
+    const float* m = j == 0 ? m0 : j == 1 ? m1 : m2;
+    const float* F = j == 0 ? F0 : j == 1 ? F1 : F2;
+    const float* G = j == 0 ? G0 : j == 1 ? G1 : G2;
+    float* out = j == 0 ? o0 : j == 1 ? o1 : o2;
+    const float* dr = d + ((size_t)j * gridDim.y + r) * R;
+    float f = 0.0f, g = 0.0f;
+    for (int k = lane; k < R; k += 32) {
+        f = fmaf(F[(size_t)i * R + k], dr[k], f);
+        g = fmaf(G[(size_t)i * R + k], dr[k], g);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        f += __shfl_xor_sync(FULL, f, o);
+        g += __shfl_xor_sync(FULL, g, o);
+    }
+    if (lane == 0) {
+        const size_t at = (size_t)r * H + i;
+        out[at] = (1.0f - tanhf(f)) * x[at] + tanhf(g) * m[at];
+    }
+}
+
 // y[r][o] = W[o] · x[r] for an f32 matrix [rows][H]: a warp an output row.
 // Grid (rows/8, n), 256 threads.
 extern "C" __global__ void ink_fmv(const float* __restrict__ W, int rows, const float* __restrict__ x,
@@ -341,13 +463,12 @@ __device__ __forceinline__ float tau_of(int pos, float alpha, float floor_) {
 // Queries and relative states of the call's rows, in place: per head the
 // learned scale, the L2 clip, and on the full layers the log scale of the
 // position. Grid (NH, n), HD threads (HD >= 32).
-extern "C" __global__ void ink_qr(float* __restrict__ yq, float* __restrict__ yr, const float* __restrict__ qs,
-                                  const float* __restrict__ rs, float qclip, float rclip, int full, float alpha,
-                                  float floor_, const int* __restrict__ cr)
+__device__ __forceinline__ void qr_body(int h, int r, float* __restrict__ yq, float* __restrict__ yr,
+                                        const float* __restrict__ qs, const float* __restrict__ rs, float qclip,
+                                        float rclip, int full, float alpha, float floor_, const int* __restrict__ cr)
 {
-    PDL_PRO();
     __shared__ float sh[32];
-    const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
+    const int tid = threadIdx.x;
     const float tu = full ? tau_of(cr[0] + r, alpha, floor_) : 1.0f;
     float* q = yq + ((size_t)r * NH + h) * HD;
     const float v = q[tid] * qs[h * HD + tid];
@@ -363,6 +484,13 @@ extern "C" __global__ void ink_qr(float* __restrict__ yq, float* __restrict__ yr
         if (tid < DR) rr[tid] = a * sr * tu;
     }
 }
+extern "C" __global__ void ink_qr(float* __restrict__ yq, float* __restrict__ yr, const float* __restrict__ qs,
+                                  const float* __restrict__ rs, float qclip, float rclip, int full, float alpha,
+                                  float floor_, const int* __restrict__ cr)
+{
+    PDL_PRO();
+    qr_body(blockIdx.x, blockIdx.y, yq, yr, qs, rs, qclip, rclip, full, alpha, floor_, cr);
+}
 
 // The keys (blockIdx.y 0) or values (1) of the call's rows, a KV head a block
 // (HD threads, a channel each): the short convolution over the ring (taps
@@ -370,16 +498,15 @@ extern "C" __global__ void ink_qr(float* __restrict__ yq, float* __restrict__ yr
 // taps on the full layers), `(x + conv) * scale`, then per head the keys'
 // L2 clip or the values' unit RMS, into the f16 cache at the row's slot
 // (`ring` > 0: position mod ring). The ring [KC-1][C] (newest first) moves on.
-extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __restrict__ yv,
-                                  const float* __restrict__ dk, const float* __restrict__ dv,
-                                  const float* __restrict__ tk, const float* __restrict__ tv, float* __restrict__ rk,
-                                  float* __restrict__ rv, u16* __restrict__ kc, u16* __restrict__ vc, int ring, int n,
-                                  float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
-                                  float* __restrict__ hv)
+__device__ __forceinline__ void kv_body(int g, int isv, const float* __restrict__ yk, const float* __restrict__ yv,
+                                        const float* __restrict__ dk, const float* __restrict__ dv,
+                                        const float* __restrict__ tk, const float* __restrict__ tv, float* __restrict__ rk,
+                                        float* __restrict__ rv, u16* __restrict__ kc, u16* __restrict__ vc, int ring, int n,
+                                        float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
+                                        float* __restrict__ hv)
 {
-    PDL_PRO();
     __shared__ float sh[32];
-    const int g = blockIdx.x, isv = blockIdx.y, tid = threadIdx.x;
+    const int tid = threadIdx.x;
     // the call's input rows kept (a draft verify rolls the ring back to a prefix)
     float* ho = isv ? hv : hk;
     const int C = NKV * HD, ch = g * HD + tid;
@@ -417,6 +544,33 @@ extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __r
     }
 #pragma unroll
     for (int l = 1; l < KC; l++) rg[(size_t)(l - 1) * C + ch] = hist[l];
+}
+extern "C" __global__ void ink_kv(const float* __restrict__ yk, const float* __restrict__ yv,
+                                  const float* __restrict__ dk, const float* __restrict__ dv,
+                                  const float* __restrict__ tk, const float* __restrict__ tv, float* __restrict__ rk,
+                                  float* __restrict__ rv, u16* __restrict__ kc, u16* __restrict__ vc, int ring, int n,
+                                  float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
+                                  float* __restrict__ hv)
+{
+    PDL_PRO();
+    kv_body(blockIdx.x, blockIdx.y, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, ring, n, qclip, eps, cr, hk, hv);
+}
+
+// `ink_qr` and `ink_kv` in one launch: blocks [0, NH n) the queries (head,
+// row), the next 2 NKV the keys and values. HD threads.
+extern "C" __global__ void ink_qrkv(float* __restrict__ yq, float* __restrict__ yr, const float* __restrict__ qs,
+                                    const float* __restrict__ rs, float rclip, int full, float alpha, float floor_,
+                                    const float* __restrict__ yk, const float* __restrict__ yv,
+                                    const float* __restrict__ dk, const float* __restrict__ dv,
+                                    const float* __restrict__ tk, const float* __restrict__ tv, float* __restrict__ rk,
+                                    float* __restrict__ rv, u16* __restrict__ kc, u16* __restrict__ vc, int ring, int n,
+                                    float qclip, float eps, const int* __restrict__ cr, float* __restrict__ hk,
+                                    float* __restrict__ hv)
+{
+    PDL_PRO();
+    const int b = blockIdx.x, nq = NH * n;
+    if (b < nq) qr_body(b % NH, b / NH, yq, yr, qs, rs, qclip, rclip, full, alpha, floor_, cr);
+    else kv_body((b - nq) % NKV, (b - nq) / NKV, yk, yv, dk, dv, tk, tv, rk, rv, kc, vc, ring, n, qclip, eps, cr, hk, hv);
 }
 
 // The attention of row r (position cr[0] + r) and head h: every cached key
@@ -549,7 +703,48 @@ extern "C" __global__ void ink_attn_split(const float* __restrict__ yq, const fl
     }
     __syncthreads();
     float m = -3.0e38f, l = 0.0f;
-    for (int i = k0 + w; i < k1; i += 8) {
+    int i0 = k0 + w;
+#if HD == 128
+    // four of the warp's keys loaded at once (8 bytes a lane); the running
+    // softmax still takes them one by one, in the same order
+    for (; i0 + 24 < k1; i0 += 32) {
+        uint2 kw[4], vw[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int tpos = first + i0 + 8 * u;
+            const int row = ring > 0 ? tpos % ring : tpos;
+            kw[u] = *(const uint2*)(kc + (size_t)row * C + g * HD + lane * 4);
+            vw[u] = *(const uint2*)(vc + (size_t)row * C + g * HD + lane * 4);
+        }
+        float sc[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            float s = 0.0f;
+            s = fmaf(qv[0], h2f((u16)(kw[u].x & 0xffff)), s);
+            s = fmaf(qv[1], h2f((u16)(kw[u].x >> 16)), s);
+            s = fmaf(qv[2], h2f((u16)(kw[u].y & 0xffff)), s);
+            s = fmaf(qv[3], h2f((u16)(kw[u].y >> 16)), s);
+            sc[u] = s;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+            for (int u = 0; u < 4; u++) sc[u] += __shfl_xor_sync(FULL, sc[u], o);
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const float s = sc[u] * scale + bias[i0 + 8 * u - k0];
+            const float mn = fmaxf(m, s);
+            const float c = expf(m - mn), e = expf(s - mn);
+            l = l * c + e;
+            acc[0] = fmaf(e, h2f((u16)(vw[u].x & 0xffff)), acc[0] * c);
+            acc[1] = fmaf(e, h2f((u16)(vw[u].x >> 16)), acc[1] * c);
+            acc[2] = fmaf(e, h2f((u16)(vw[u].y & 0xffff)), acc[2] * c);
+            acc[3] = fmaf(e, h2f((u16)(vw[u].y >> 16)), acc[3] * c);
+            m = mn;
+        }
+    }
+#endif
+    for (int i = i0; i < k1; i += 8) {
         const int tpos = first + i;
         const int row = ring > 0 ? tpos % ring : tpos;
         const u16* kr = kc + (size_t)row * C + g * HD + lane * PL;
@@ -590,10 +785,11 @@ extern "C" __global__ void ink_attn_split(const float* __restrict__ yq, const fl
 
 // The tiles of `ink_attn_split` and the sink (a logit with a zero value)
 // merged into the attention output. Grid (NH, n), HD threads.
-extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
-                                          int win, float* __restrict__ out, const int* __restrict__ cr)
+__device__ __forceinline__ void merge_body(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
+                                           int win, float* __restrict__ out, const int* __restrict__ cr,
+                                           const float* __restrict__ gt, u16* __restrict__ p0, u16* __restrict__ p1,
+                                           int pstride)
 {
-    PDL_PRO();
     const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;
     const int pos = cr[0] + r;
     const int first = win > 0 ? max(0, pos + 1 - win) : 0;
@@ -607,8 +803,26 @@ extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int sp
     for (int i = tid; i < HD; i += blockDim.x) {
         float a = 0.0f;
         for (int s = 0; s < ns; s++) a += pp[(size_t)s * (HD + 2) + 2 + i] * expf(pp[(size_t)s * (HD + 2)] - M);
-        out[((size_t)r * NH + h) * HD + i] = a / L;
+        const size_t at = ((size_t)r * NH + h) * HD + i;
+        out[at] = a / L;
+        if (p0) put2(p0, p1, (size_t)r * pstride + h * HD + i, (a / L) * sigm(gt[at]));
     }
+}
+extern "C" __global__ void ink_attn_merge(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
+                                          int win, float* __restrict__ out, const int* __restrict__ cr)
+{
+    PDL_PRO();
+    merge_body(part, splits, sinks, win, out, cr, nullptr, nullptr, nullptr, 0);
+}
+// `ink_attn_merge` with `ink_ogate` in its epilogue: σ(gate)·out into the O
+// projection's planes. Grid (NH, n), HD threads.
+extern "C" __global__ void ink_attn_merge_g(const float* __restrict__ part, int splits, const float* __restrict__ sinks,
+                                            int win, float* __restrict__ out, const int* __restrict__ cr,
+                                            const float* __restrict__ gt, u16* __restrict__ p0, u16* __restrict__ p1,
+                                            int pstride)
+{
+    PDL_PRO();
+    merge_body(part, splits, sinks, win, out, cr, gt, p0, p1, pstride);
 }
 
 // The attention output gated by σ(gate) into the planes of the O projection.
@@ -629,11 +843,12 @@ extern "C" __global__ void ink_ogate(const float* __restrict__ o, const float* _
 // attention (`res` the running sum h): a block boundary closes h into
 // blk[r][bslot] and the new running sum is c, else h + c. After the MoE:
 // h + c. The ring [KC-1][H] moves on. Grid H/256.
-extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __restrict__ taps,
-                                    float* __restrict__ ring, const float* __restrict__ res, float* __restrict__ blk,
-                                    int bslot, int bstride, float* __restrict__ out, int n, float* __restrict__ ho)
+template <bool MX>
+__device__ __forceinline__ void post_body(const float* __restrict__ a, const float* __restrict__ taps,
+                                          float* __restrict__ ring, const float* __restrict__ res, float* __restrict__ blk,
+                                          int bslot, int bstride, float* __restrict__ out, int n, float* __restrict__ ho,
+                                          const float* __restrict__ dnS, const float* __restrict__ wsel, int S)
 {
-    PDL_PRO();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= H) return;
     float hist[KC];
@@ -644,7 +859,18 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
     const float scale = rsqrtf((float)(KC + 1));
     for (int j = 0; j < n; j++) {
         const size_t at = (size_t)j * H + i;
-        const float x = a[at];
+        float x;
+        if (MX) {
+            // `hy_moe_combine` into a zeroed row: the same sum in the same order
+            float acc = 0.0f;
+            for (int s = 0; s < S; s++) {
+                const float w = wsel[(size_t)j * S + s];
+                if (w != 0.0f) acc = fmaf(w, dnS[((size_t)s * n + j) * H + i], acc);
+            }
+            x = 0.0f + acc;
+        } else {
+            x = a[at];
+        }
         if (ho) ho[at] = x;
         hist[0] = x;
         float acc = 0.0f;
@@ -663,6 +889,23 @@ extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __
     }
 #pragma unroll
     for (int l = 1; l < KC; l++) ring[(size_t)(l - 1) * H + i] = hist[l];
+}
+extern "C" __global__ void ink_post(const float* __restrict__ a, const float* __restrict__ taps,
+                                    float* __restrict__ ring, const float* __restrict__ res, float* __restrict__ blk,
+                                    int bslot, int bstride, float* __restrict__ out, int n, float* __restrict__ ho)
+{
+    PDL_PRO();
+    post_body<false>(a, taps, ring, res, blk, bslot, bstride, out, n, ho, nullptr, nullptr, 0);
+}
+// `ink_post` after the MoE with the experts' weighted sum (`hy_moe_combine`)
+// as its input: the slots' outputs dnS [S][n][H] and weights wsel [n][S].
+extern "C" __global__ void ink_post_mx(const float* __restrict__ dnS, const float* __restrict__ wsel, int S,
+                                       const float* __restrict__ taps, float* __restrict__ ring,
+                                       const float* __restrict__ res, float* __restrict__ out, int n,
+                                       float* __restrict__ ho)
+{
+    PDL_PRO();
+    post_body<true>(nullptr, taps, ring, res, nullptr, -1, 0, out, n, ho, dnS, wsel, S);
 }
 
 // ---- the prompt path (a call of more than 16 rows) ----

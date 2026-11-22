@@ -2544,6 +2544,109 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
     }
 }
 
+// A decode row's router and selection in one launch (`hy_moe_router` with no
+// shared gate, then `hy_moe_select`'s sigmoid path: flags bits 0, 2, 5; E <=
+// 256 experts, k <= 32 picks, S == k slots): a warp a router row; the last
+// block to finish picks the top k by warp-wide argmax (the larger key first,
+// the smaller expert on a tie: the select's order), writes the weights, lays
+// out the slots' jobs and re-arms the counter. Grid any, 256 threads.
+extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __restrict__ xn, const float* __restrict__ Wr,
+        float* __restrict__ logits, int E, int hidden, const float* __restrict__ bias, int k, int flags, float route_scale,
+        const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t, HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a,
+        float* __restrict__ wsel, int S, u64 qq0, u64 qq1, int pstride, u64 dnS, int bpj_gu, int bpj_dn,
+        unsigned* __restrict__ counter)
+{
+    PDL_PRO();
+    __shared__ int pick[32];
+    __shared__ float pw[32];
+    __shared__ int last;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
+    const int h4 = hidden >> 2;
+    const float4* x4 = (const float4*)xn;
+    for (int e = blockIdx.x * nwp + wp; e < E; e += gridDim.x * nwp) {
+        const float4* w4 = (const float4*)(Wr + (size_t)e * hidden);
+        float a = 0.0f, b = 0.0f;
+        for (int i = lane; i < h4; i += 64) {
+            const float4 u = w4[i], v = x4[i];
+            a += u.x * v.x + u.y * v.y + u.z * v.z + u.w * v.w;
+            if (i + 32 < h4) {
+                const float4 u2 = w4[i + 32], v2 = x4[i + 32];
+                b += u2.x * v2.x + u2.y * v2.y + u2.z * v2.z + u2.w * v2.w;
+            }
+        }
+        float acc = a + b;
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(FULL, acc, o);
+        if (lane == 0) logits[e] = acc;
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (wp == 0) {
+        float key[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const int e = lane + 32 * q;
+            float kk = -3.0e38f;
+            if (e < E) {
+                kk = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
+                if ((flags & 4) && bias) kk += bias[e];
+            }
+            key[q] = kk;
+        }
+        for (int j = 0; j < k; j++) {
+            float best = -3.0e38f;
+            int bi = 0x7fffffff;
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int e = lane + 32 * q;
+                if (key[q] > best || (key[q] == best && e < bi)) {
+                    best = key[q];
+                    bi = e;
+                }
+            }
+            moe_argmax(best, bi);
+#pragma unroll
+            for (int q = 0; q < 8; q++)
+                if (lane + 32 * q == bi) key[q] = -3.0e38f;
+            if (lane == 0) {
+                pick[j] = bi;
+                pw[j] = 1.0f / (1.0f + expf(-__ldcg(logits + bi)));
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int j = 0; j < k; j++) tot += pw[j];
+        const float dn = tot + ((flags & 32) ? 1e-20f : 1e-6f);
+        for (int j = 0; j < k; j++) {
+            float w = pw[j];
+            if (flags & 1) w = w / dn;
+            wsel[j] = w * route_scale;
+        }
+        *counter = 0u;
+    }
+    for (int s = threadIdx.x; s < S; s += blockDim.x) {
+        HyJob g = gu_t[pick[s]];
+        HyJob d = dn_t[pick[s]];
+        g.y = qq0 + (u64)s * pstride * 2;
+        g.res = qq1 + (u64)s * pstride * 2;
+        g.ystride = pstride;
+        g.blk0 = s * bpj_gu;
+        g.xoff = 0;
+        d.y = dnS + (u64)s * hidden * 4;
+        d.res = 0;
+        d.ystride = hidden;
+        d.blk0 = s * bpj_dn;
+        d.xoff = s * pstride;
+        gu_a[s] = g;
+        dn_a[s] = d;
+    }
+}
+
 // Hy4-flash's compact slots (a prompt chunk of the small path): every slot
 // takes only the rows routed to it, `nr` of them in a row block of its own,
 // instead of all `n` rows of the call with zero weights for the others. The
