@@ -897,7 +897,10 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     // UG groups' weight words and scales are read before any of them is
     // used (one codec's decode-row loop: q1 86 -> 80 us; the all-codec loop
     // ran slower with it); the arithmetic is the one-group loop's.
-    constexpr int UG = (KD && NT == 1) ? 2 : 1;
+#ifndef MMP_UG
+#define MMP_UG 2
+#endif
+    constexpr int UG = (KD && NT == 1) ? MMP_UG : 1;
     for (int gb = g0; gb < g1; gb += UG) {
         u32 wx[UG][TB][4];
         float wsa[UG][TB], wsb[UG][TB];

@@ -317,7 +317,10 @@ fn load_funcs(c: &Ctx, hpk: usize, hd: usize) -> Res<HFuncs> {
     if hd % 32 != 0 || hd > 512 || hpk == 0 || hpk > 16 {
         return Err(format!("attention geometry {hpk} heads per KV head x {hd} outside the kernels"));
     }
-    let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}")], c.arch)?;
+    // `CMF_HYB_UG=N` (a measurement): a one-codec decode matvec's groups read
+    // ahead per warp (2; the arithmetic does not depend on it)
+    let ug = std::env::var("CMF_HYB_UG").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| (1..=8).contains(u)).unwrap_or(2);
+    let module = compile(HYB_SRC, vec![format!("-DHPK={hpk}"), format!("-DHD={hd}"), format!("-DMMP_UG={ug}")], c.arch)?;
     let mut mmp = [[[std::ptr::null_mut(); 2]; 2]; 3];
     for (ni, nt) in [1usize, 2, 4].into_iter().enumerate() {
         for tb in 1..=2usize {
