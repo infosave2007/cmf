@@ -1304,6 +1304,16 @@ __device__ __forceinline__ u32 a_h16(u32 X, int m) {
     return r;
 }
 
+#ifndef MOE_FOLD
+#define MOE_FOLD 1
+#endif
+__device__ __forceinline__ u32 pk_h(float lo, float hi) { return (u32)f2h(lo) | ((u32)f2h(hi) << 16); }
+__device__ __forceinline__ u32 hmul2(u32 a, u32 b) {
+    u32 r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
 __device__ __forceinline__ void mma16816h(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1531,6 +1541,33 @@ extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __re
         }
         if (live) {
             const int buf = g % MS;
+#if MOE_FOLD
+            // the group's scale folded into the f16 weights once (rows gid:
+            // a0, a2; rows gid + 8: a1, a3), every n tile's mma accumulating
+            // in f32 itself (no per-tile unpacking, no scale FMAs)
+            u32 A[MT][8];
+#pragma unroll
+            for (int b = 0; b < MT; b++) {
+                const u32 s2a = pk_h(sa[b], sa[b]), s2b = pk_h(sb[b], sb[b]);
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    A[b][m] = hmul2(a_h16(X[b].x, m), (m & 1) ? s2b : s2a);
+                    A[b][4 + m] = hmul2(a_h16(X[b].y, m), (m & 1) ? s2b : s2a);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < NTL; t++) {
+                if (t >= ntl) break;
+                const u16* xr = &xs[buf][t * 8 + gid][2 * tig];
+                const u32 b0 = *(const u32*)(xr), b1 = *(const u32*)(xr + 8), b2 = *(const u32*)(xr + 16), b3 = *(const u32*)(xr + 24);
+#pragma unroll
+                for (int b = 0; b < MT; b++) {
+                    if (tbase + b >= ntile) break;
+                    mma16816h(acc[b][t], A[b][0], A[b][1], A[b][2], A[b][3], b0, b1);
+                    mma16816h(acc[b][t], A[b][4], A[b][5], A[b][6], A[b][7], b2, b3);
+                }
+            }
+#else
 #pragma unroll
             for (int t = 0; t < NTL; t++) {
                 if (t >= ntl) break;
@@ -1550,6 +1587,7 @@ extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __re
                     acc[b][t][3] = fmaf(sb[b], c[3], acc[b][t][3]);
                 }
             }
+#endif
         }
         __syncthreads();
     }
@@ -1922,7 +1960,6 @@ __device__ __forceinline__ void mma16816b(float* c, u32 a0, u32 a1, u32 a2, u32 
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ u32 pk_h(float lo, float hi) { return (u32)f2h(lo) | ((u32)f2h(hi) << 16); }
 
 // A prompt call's attention, flash style (`ink_attn_soft`'s arithmetic, the
 // scores never stored): a block 64 query rows of one head, 4 warps of 16;

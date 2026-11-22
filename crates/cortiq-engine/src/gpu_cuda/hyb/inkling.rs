@@ -523,7 +523,10 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             f
         }
     };
-    let module = compile(SRC, vec![format!("-DH={hidden}"), format!("-DHD={hd}"), format!("-DNKV={nkv}"), format!("-DNH={nh}"), format!("-DDR={dr}"), "-DKC=4".into()], c.arch)?;
+    // `CMF_INKLING_MOE_FOLD=0`: a prompt call's expert GEMM scales its sums
+    // after every mma instead of folding the group scale into the f16 weights
+    let fold = (std::env::var("CMF_INKLING_MOE_FOLD").as_deref() != Ok("0")) as i32;
+    let module = compile(SRC, vec![format!("-DH={hidden}"), format!("-DHD={hd}"), format!("-DNKV={nkv}"), format!("-DNH={nh}"), format!("-DDR={dr}"), "-DKC=4".into(), format!("-DMOE_FOLD={fold}")], c.arch)?;
     let fx = Fx {
         mix: func(module, "ink_mix")?,
         mix2: func(module, "ink_mix2")?,
