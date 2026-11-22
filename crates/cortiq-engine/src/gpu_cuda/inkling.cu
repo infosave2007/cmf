@@ -1648,8 +1648,14 @@ extern "C" __global__ void __launch_bounds__(128) ink_moe_mma2(const HyJob* __re
 #pragma unroll
             for (int t = 0; t < NTL; t++) {
                 if (t >= ntl) break;
-                const u16* xr = &xs[buf][t * 8 + gid][2 * tig];
-                const u32 b0 = *(const u32*)(xr), b1 = *(const u32*)(xr + 8), b2 = *(const u32*)(xr + 16), b3 = *(const u32*)(xr + 24);
+                // the n tile's four B registers in one ldmatrix: lane i names
+                // row i % 8 of the 8×8 block at k (i / 8)·8
+                u32 b0, b1, b2, b3;
+                {
+                    const unsigned ad = (unsigned)__cvta_generic_to_shared(&xs[buf][t * 8 + (lane & 7)][(lane >> 3) * 8]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(ad));
+                }
 #pragma unroll
                 for (int b = 0; b < MT; b++) {
                     if (tbase + b >= ntile) break;
