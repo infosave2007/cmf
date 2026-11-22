@@ -12,7 +12,7 @@ import json, math, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "dory"))
 import card_figures as cf  # scripts/dory: the SVG writer every card figure shares
-from card_figures import Svg, INK, INK2, LINE, BLUE, GREY, head
+from card_figures import Svg, INK, INK2, LINE, BLUE, GREY, ORANGE, head
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location("ink_fig", os.path.join(HERE, "..", "inkling", "card_figures.py"))
@@ -20,7 +20,11 @@ ink = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ink)
 
 FILE = "TML-d24-varloop-research-q4tp.cmf"
-VER = os.environ.get("CORTIQ_VER", "0.9.13")
+VER = os.environ.get("CORTIQ_VER", "0.9.14")
+# the second CUDA stand
+ink.STAND["cuda_g4"] = {"en": "NVIDIA RTX PRO 6000 Blackwell (96 GB), Google Colab", "ru": "NVIDIA RTX PRO 6000 Blackwell (96 ГБ), Google Colab",
+                        "zh": "NVIDIA RTX PRO 6000 Blackwell（96 GB），Google Colab"}
+ink.BACKEND["cuda_g4"] = "CUDA"
 SUB = {
     "en": f"{FILE}, cortiq {VER}, cortiq bench --core, 3 passes, 64 tokens after the prompt.",
     "ru": f"{FILE}, cortiq {VER}, cortiq bench --core, 3 прохода, 64 токена после промпта.",
@@ -29,21 +33,21 @@ SUB = {
 P = {
     "en": {
         "title": "More passes: better perplexity, slower decoding",
-        "sub": f"{FILE}, cortiq {VER}; NVIDIA L4 (24 GB), CUDA. The model was trained at 1 to 5 passes, mostly 3.",
+        "sub": f"{FILE}, cortiq {VER}, CUDA. Trained at 1 to 5 passes, mostly 3.",
         "ppl": "WikiText-2 perplexity", "dec": "Decode, tok/s", "first": "First token after 2 048 tokens, s",
-        "x": "passes", "ours": "q4tp", "ref": "f32 reference",
+        "x": "passes", "ours": "q4tp", "ref": "f32 reference", "l4": "L4", "g4": "RTX PRO 6000",
     },
     "ru": {
         "title": "Больше проходов: ниже перплексия, медленнее генерация",
-        "sub": f"{FILE}, cortiq {VER}; NVIDIA L4 (24 ГБ), CUDA. Модель обучена на 1–5 проходах, в основном на 3.",
+        "sub": f"{FILE}, cortiq {VER}, CUDA. Обучена на 1–5 проходах, в основном на 3.",
         "ppl": "Перплексия WikiText-2", "dec": "Генерация, ток/с", "first": "Первый токен после 2 048 токенов, с",
-        "x": "проходов", "ours": "q4tp", "ref": "эталон f32",
+        "x": "проходов", "ours": "q4tp", "ref": "эталон f32", "l4": "L4", "g4": "RTX PRO 6000",
     },
     "zh": {
         "title": "遍数越多：困惑度越低，生成越慢",
-        "sub": f"{FILE}，cortiq {VER}；NVIDIA L4（24 GB），CUDA。模型在 1 到 5 遍上训练，以 3 遍为主。",
+        "sub": f"{FILE}，cortiq {VER}，CUDA。在 1 到 5 遍上训练，以 3 遍为主。",
         "ppl": "WikiText-2 困惑度", "dec": "生成，tok/s", "first": "2 048 token 后的首 token，秒",
-        "x": "遍数", "ours": "q4tp", "ref": "f32 参考",
+        "x": "遍数", "ours": "q4tp", "ref": "f32 参考", "l4": "L4", "g4": "RTX PRO 6000",
     },
 }
 
@@ -52,7 +56,7 @@ def passes_fig(lang, rows):
     t = P[lang]
     s = Svg(1600, 640)
     head(s, {"res": ""}, t["title"], t["sub"])
-    panels = [("ppl", [("ppl", BLUE, 5, t["ours"]), ("ref", GREY, 3, t["ref"])]), ("dec", [("decode", BLUE, 5, t["ours"])]), ("first", [("ttft", BLUE, 5, t["ours"])])]
+    panels = [("ppl", [("ppl", BLUE, 5, t["ours"]), ("ref", GREY, 3, t["ref"])]), ("dec", [("decode", BLUE, 5, t["l4"]), ("g4_decode", ORANGE, 3, t["g4"])]), ("first", [("ttft", BLUE, 5, t["l4"])])]
     gap = 40
     pw = (1500 - gap * (len(panels) - 1)) / len(panels)
     xs = [r["passes"] for r in rows]
@@ -102,7 +106,7 @@ def passes_fig(lang, rows):
                 yy[i - 1], yy[i] = mid - 12, mid + 12
         for y, (_, (last, col, label, key)) in zip(yy, ys):
             d = 3 if key in ("ppl", "ref") else (2 if last[2] < 10 else 1)
-            s.text(last[0] + 14, y, f"{label} {ink.num(lang, last[2], d)}", 19, INK if col == BLUE else INK2, "700", "start")
+            s.text(last[0] + 14, y, f"{label} {ink.num(lang, last[2], d)}", 19, INK if col != GREY else INK2, "700", "start")
     s.done(f"passes_{lang}")
 
 

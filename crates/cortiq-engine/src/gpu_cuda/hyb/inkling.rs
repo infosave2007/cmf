@@ -57,6 +57,55 @@ fn attn_gemm_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_ATTN_GEMM").as_deref() != Ok("0"))
 }
 
+/// `CMF_INKLING_PERSIST=1`: a decode row's expert matvecs as a resident grid
+/// taking the places in turn instead of a block a place (G4: 179.6 against
+/// 190.8 tok/s — the many blocks' loads in flight win over the partial wave).
+fn persist_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_PERSIST").as_deref() == Ok("1"))
+}
+
+/// `CMF_INKLING_ROWMAP=0`: a prompt call's expert input as a gathered f16
+/// copy of every pick (`ink_gather16`) instead of the rows read in place.
+fn rowmap_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_ROWMAP").as_deref() != Ok("0"))
+}
+
+/// `CMF_INKLING_GATE2=0`: a prompt call's message gates through the normed copy
+/// of their inputs (`ink_gate_norm`) and two product GEMMs.
+fn gate2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_GATE2").as_deref() != Ok("0"))
+}
+
+/// `ink_mix2`'s block: two float4s of the row a thread (its `MIX_TPB`).
+fn mix_tpb(hidden: usize) -> u32 {
+    ((hidden / 4).div_ceil(2).div_ceil(32) * 32) as u32
+}
+
+/// `CMF_INKLING_QRKV2=1`: the decode sinks and per-token taps inside the qr+kv
+/// launch (`ink_qrkv2`) instead of `ink_fmv3` before it (G4: slower, the dots
+/// serialize in the query and key blocks).
+fn qrkv2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_QRKV2").as_deref() == Ok("1"))
+}
+
+/// `CMF_INKLING_POSTMIX=1`: a decode row's attention post and MoE mix in one
+/// block (`ink_post_mix`) instead of `ink_post` (nine blocks) and `ink_mix2`.
+fn postmix_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_POSTMIX").as_deref() == Ok("1"))
+}
+
+/// `CMF_INKLING_FLASH=0`: a prompt call's attention through the cuBLAS score
+/// products (`attn_gemm`) instead of `ink_attn_flash`.
+fn flash_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FLASH").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_SPLIT=0`: a decode call's attention a block a head and row
 /// (`ink_attn`) instead of a block a tile of keys.
 fn split_on() -> bool {
@@ -64,15 +113,39 @@ fn split_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_SPLIT").as_deref() != Ok("0"))
 }
 
-/// Rows of a prompt call (`CMF_INKLING_ROWS`, 512; 16 reads a prompt on the
-/// decode path, 16 rows a call).
+/// Rows of a prompt call (`CMF_INKLING_ROWS`; by the card's size 4096 at 40
+/// GB and more, 2048 at 24 GB, else 1024 — RTX PRO 6000 with flash attention,
+/// prompt tok/s 1024 / 2048 / 4096 rows: 2k 11.4K / 12.4K / 12.4K, 16k 10.2K /
+/// 11.5K / 12.1K; 16 reads a prompt on the decode path, 16 rows a call).
 fn bmax() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(512, |n| n.clamp(NMAX, 4096)))
+    *N.get_or_init(|| {
+        let by_card = match super::super::card_total() >> 30 {
+            g if g >= 40 => 4096,
+            g if g >= 24 => 2048,
+            _ => 1024,
+        };
+        std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(by_card, |n| n.clamp(NMAX, 4096))
+    })
 }
 
 struct Fx {
     mix: cs::CUfunction,
+    mix2: cs::CUfunction,
+    rms3: cs::CUfunction,
+    gd3: cs::CUfunction,
+    go3: cs::CUfunction,
+    merge_g: cs::CUfunction,
+    post_mx: cs::CUfunction,
+    qrkv2: cs::CUfunction,
+    qrkv: cs::CUfunction,
+    fmv3: cs::CUfunction,
+    post_mix: cs::CUfunction,
+    gate_rr: cs::CUfunction,
+    rms_h: cs::CUfunction,
+    ogate_h: cs::CUfunction,
+    gate_d: cs::CUfunction,
+    gate_mix2: cs::CUfunction,
     rms: cs::CUfunction,
     gate_down: cs::CUfunction,
     gate_out: cs::CUfunction,
@@ -88,6 +161,7 @@ struct Fx {
     h16: cs::CUfunction,
     f16: cs::CUfunction,
     attn_soft: cs::CUfunction,
+    attn_flash: cs::CUfunction,
     gather16: cs::CUfunction,
     moe_mma: cs::CUfunction,
     moe_mma2: cs::CUfunction,
@@ -113,6 +187,14 @@ struct GateD {
     down: Buf,
     forget: Buf,
     gain: Buf,
+    /// F's rows then G's ([2H][R]): a prompt call's two products in one GEMM
+    fg: Buf,
+}
+
+/// A device address inside a buffer another field owns.
+#[derive(Clone, Copy)]
+struct DPtr {
+    ptr: u64,
 }
 
 struct LayerD {
@@ -127,6 +209,9 @@ struct LayerD {
     qset: MmaSet,
     /// q, gate, rel, k and v together, for a local layer's first pass (one input row).
     qkv: Option<MmaSet>,
+    /// q, gate, rel, k, v in one launch from three input planes (k's and v's
+    /// rows at planes 1 and 2: `Dev::xpb`), for the calls whose inputs differ
+    qkv3: MmaSet,
     kset: MmaSet,
     vset: MmaSet,
     oset: MmaSet,
@@ -134,6 +219,8 @@ struct LayerD {
     q_scale: Buf,
     rel_scale: Buf,
     rel_table: Buf,
+    /// The table as `ink_attn_flash` reads its bands: [E][hi, lo][DR] bf16
+    rel_tb: Buf,
     extent: usize,
     tk: Buf,
     tv: Buf,
@@ -288,6 +375,12 @@ struct Big {
     q16: Buf,
     sc: Buf,
     pr: Buf,
+    /// q4tp dense weights kept expanded to f16 between prompt calls (by the
+    /// matrix's body address), while `wf16_left` bytes of the budget remain
+    /// (`CMF_INKLING_WF16_MB`, default the card's free memory past 4 GB, at
+    /// most 4 GB)
+    wf16: std::cell::RefCell<HashMap<u64, Buf>>,
+    wf16_left: std::cell::Cell<usize>,
 }
 
 struct Dev {
@@ -321,7 +414,9 @@ struct Dev {
     gin: Buf,
     gd: Buf,
     x: [Buf; 3],
-    xp: [[Buf; 2]; 3],
+    /// the three input rows' planes, views of `xpb` (plane j at j·rows·hidden)
+    xp: [[DPtr; 2]; 3],
+    xpb: [Buf; 2],
     yq: Buf,
     yg: Buf,
     yr: Buf,
@@ -355,6 +450,8 @@ struct Dev {
     cr: Buf,
     /// A verify call's greedy pick of each row (`NMAX` ids).
     pick: Buf,
+    /// `hy_moe_route1`'s finished-block counter (the last block re-arms it)
+    rcnt: Buf,
     smax: usize,
     /// Recorded calls by (rows, logits rows) and the pointers they hold.
     graphs: HashMap<(usize, usize), GraphRec>,
@@ -431,6 +528,27 @@ pub(crate) fn admits(g: &Globals, layers: &[Layer], cfg: &Cfg) -> bool {
         })
 }
 
+/// The relative table [DR][E] f32 as [E][2][DR] bf16: each distance's row
+/// split into a high and a low part (round to nearest even, as `f2bf`).
+fn rel_band(t: &[f32], dr: usize) -> Vec<u16> {
+    let bf = |x: f32| -> u16 {
+        let b = x.to_bits();
+        ((b.wrapping_add(0x7FFF + ((b >> 16) & 1))) >> 16) as u16
+    };
+    let e = t.len() / dr.max(1);
+    let mut out = vec![0u16; e * 2 * dr];
+    for d in 0..e {
+        for j in 0..dr {
+            let x = t[j * e + d];
+            let hi = bf(x);
+            let lo = bf(x - f32::from_bits((hi as u32) << 16));
+            out[(d * 2) * dr + j] = hi;
+            out[(d * 2 + 1) * dr + j] = lo;
+        }
+    }
+    out
+}
+
 fn f32b(v: &[f32]) -> Res<Buf> {
     Buf::from_slice(v)
 }
@@ -455,9 +573,27 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             f
         }
     };
-    let module = compile(SRC, vec![format!("-DH={hidden}"), format!("-DHD={hd}"), format!("-DNKV={nkv}"), format!("-DNH={nh}"), format!("-DDR={dr}"), "-DKC=4".into()], c.arch)?;
+    // `CMF_INKLING_MOE_FOLD=0`: a prompt call's expert GEMM scales its sums
+    // after every mma instead of folding the group scale into the f16 weights
+    let fold = (std::env::var("CMF_INKLING_MOE_FOLD").as_deref() != Ok("0")) as i32;
+    let module = compile(SRC, vec![format!("-DH={hidden}"), format!("-DHD={hd}"), format!("-DNKV={nkv}"), format!("-DNH={nh}"), format!("-DDR={dr}"), "-DKC=4".into(), format!("-DMOE_FOLD={fold}")], c.arch)?;
     let fx = Fx {
         mix: func(module, "ink_mix")?,
+        mix2: func(module, "ink_mix2")?,
+        rms3: func(module, "ink_rms3")?,
+        gd3: func(module, "ink_gate_down3")?,
+        go3: func(module, "ink_gate_out3")?,
+        merge_g: func(module, "ink_attn_merge_g")?,
+        post_mx: func(module, "ink_post_mx")?,
+        qrkv2: func(module, "ink_qrkv2")?,
+        qrkv: func(module, "ink_qrkv")?,
+        fmv3: func(module, "ink_fmv3")?,
+        post_mix: func(module, "ink_post_mix")?,
+        gate_rr: func(module, "ink_gate_rr")?,
+        rms_h: func(module, "ink_rms_h")?,
+        ogate_h: func(module, "ink_ogate_h")?,
+        gate_d: func(module, "ink_gate_d")?,
+        gate_mix2: func(module, "ink_gate_mix2")?,
         rms: func(module, "ink_rms")?,
         gate_down: func(module, "ink_gate_down")?,
         gate_out: func(module, "ink_gate_out")?,
@@ -486,6 +622,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         ds_pick: func(module, "ink_ds_pick")?,
         argmax_rows: func(module, "ink_argmax_rows")?,
         attn_soft: func(module, "ink_attn_soft")?,
+        attn_flash: func(module, "ink_attn_flash")?,
         gate_norm: func(module, "ink_gate_norm")?,
         gate_mix: func(module, "ink_gate_mix")?,
         kv_rows: func(module, "ink_kv_rows")?,
@@ -512,6 +649,8 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let (q, gt, rl, km, vm, om) = (mat(c, st, &a.q)?, mat(c, st, &a.gate)?, mat(c, st, &a.rel)?, mat(c, st, &a.k)?, mat(c, st, &a.v)?, mat(c, st, &a.o)?);
         let qset = mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs)])?;
         let qkv = if l.sliding { Some(mmaset(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs), (&km, yk.ptr, 0, kvs, kvs), (&vm, yv.ptr, 0, kvs, kvs)])?) } else { None };
+        let plane = (rows * hidden) as i32;
+        let qkv3 = mmaset_core(&[(&q, yq.ptr, 0, qs, qs), (&gt, yg.ptr, 0, qs, qs), (&rl, yr.ptr, 0, rs, rs), (&km, yk.ptr, 0, kvs, kvs), (&vm, yv.ptr, 0, kvs, kvs)], 6, Some(&[0, 0, 0, plane, 2 * plane]), 0.0)?;
         let kset = mmaset(&[(&km, yk.ptr, 0, kvs, kvs)])?;
         let vset = mmaset(&[(&vm, yv.ptr, 0, kvs, kvs)])?;
         let oset = mmaset(&[(&om, ya.ptr, 0, hidden, hidden)])?;
@@ -544,7 +683,10 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         let kd = (one_kd(&gu_t), one_kd(&dn_t));
         let gates = match &l.gates {
             Some(gs) => {
-                let mk = |x: &crate::inkling::Gate| -> Res<GateD> { Ok(GateD { down: f32b(&x.down)?, forget: f32b(&x.forget)?, gain: f32b(&x.gain)? }) };
+                let mk = |x: &crate::inkling::Gate| -> Res<GateD> {
+                    let fg: Vec<f32> = x.forget.iter().chain(x.gain.iter()).copied().collect();
+                    Ok(GateD { down: f32b(&x.down)?, forget: f32b(&x.forget)?, gain: f32b(&x.gain)?, fg: f32b(&fg)? })
+                };
                 Some([mk(&gs[0])?, mk(&gs[1])?, mk(&gs[2])?, mk(&gs[3])?])
             }
             None => None,
@@ -561,6 +703,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             post_norm: f32b(&l.post_norm)?,
             qset,
             qkv,
+            qkv3,
             kset,
             vset,
             oset,
@@ -568,6 +711,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             q_scale: f32b(&a.q_scale)?,
             rel_scale: f32b(&a.rel_scale)?,
             rel_table: f32b(&a.rel_table)?,
+            rel_tb: Buf::from_slice(&rel_band(&a.rel_table, dr))?,
             extent: a.rel_table.len() / dr,
             tk: f32b(&a.k_conv.taps)?,
             tv: f32b(&a.v_conv.taps)?,
@@ -654,6 +798,11 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             o16: h2(rows * qs)?,
             wd: Buf::new(wd_bytes + 64)?,
             wd_elems: wd_bytes / 2,
+            wf16: std::cell::RefCell::new(HashMap::new()),
+            wf16_left: std::cell::Cell::new(match std::env::var("CMF_INKLING_WF16_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(mb) => mb << 20,
+                None => super::super::card_free().saturating_sub(4 << 30).min(4 << 30),
+            }),
             lg: f4(rows * e)?,
             pidx: f4(nk)?,
             pwt: f4(nk)?,
@@ -665,7 +814,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             gu_a: Buf::new(jmax * job_b)?,
             dn_a: Buf::new(jmax * job_b)?,
             gxn: f4(rows * 2 * hidden)?,
-            gtf: f4(rows * hidden)?,
+            gtf: f4(2 * rows * hidden)?,
             gtg: f4(rows * hidden)?,
             q16: h2(rows * qs)?,
             sc: Buf::new(ATT_SCORES)?,
@@ -674,6 +823,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
     } else {
         None
     };
+    let xpb = [h2(3 * rows * hidden)?, h2(3 * rows * hidden)?];
     let d = Dev {
         fx,
         hfx,
@@ -699,7 +849,11 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         gin: f4(4 * rows * hidden)?,
         gd: f4(rows * 256)?,
         x: [f4(rows * hidden)?, f4(rows * hidden)?, f4(rows * hidden)?],
-        xp: [[h2(rows * hidden)?, h2(rows * hidden)?], [h2(rows * hidden)?, h2(rows * hidden)?], [h2(rows * hidden)?, h2(rows * hidden)?]],
+        xp: {
+            let at = |b: &Buf, j: usize| DPtr { ptr: b.ptr + (j * rows * hidden * 2) as u64 };
+            [[at(&xpb[0], 0), at(&xpb[1], 0)], [at(&xpb[0], 1), at(&xpb[1], 1)], [at(&xpb[0], 2), at(&xpb[1], 2)]]
+        },
+        xpb,
         yq,
         yg,
         yr,
@@ -730,6 +884,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
         logits,
         cr: Buf::new(64)?,
         pick: Buf::new(NMAX * 4)?,
+        rcnt: Buf::new(64)?,
         smax,
         graphs: HashMap::new(),
         cap,
@@ -750,6 +905,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
 impl Dev {
     fn zero_state(&self, c: &Ctx) -> Res<()> {
         unsafe {
+            cu::memset_d8_async(self.rcnt.ptr, 0, self.rcnt.bytes, c.stream).map_err(derr)?;
             for s in &self.slots {
                 for r in &s.rings {
                     cu::memset_d8_async(r.ptr, 0, r.bytes, c.stream).map_err(derr)?;
@@ -760,9 +916,36 @@ impl Dev {
     }
 }
 
-/// `true` when this call ran on the card. `ids` from position `pos0`; the
-/// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
-#[allow(clippy::too_many_arguments)]
+/// `CMF_INKLING_FUSE=0`: a decode call's kernels one stage a launch (`ink_mix`,
+/// `ink_rms`, `ink_fmv`, the gates' halves, `ink_qr` + `ink_kv`, the merge and
+/// `ink_ogate`, router + select, combine + post) instead of the fused ones.
+fn fuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FUSE").as_deref() != Ok("0"))
+}
+
+/// `CMF_INKLING_GROUP2=0`: a prompt call's experts grouped by the one-warp-an-
+/// expert scan (`hy_moe_group`) instead of the parallel count (`hy_moe_group2`).
+fn group2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_GROUP2").as_deref() != Ok("0"))
+}
+
+/// `CMF_INKLING_KT=N` (a measurement): is this the N-th decode call?
+/// `CMF_INKLING_KT_ROWS=R` counts the calls of R rows instead (a verify call).
+fn kt_call(rows: usize) -> bool {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if rows != *R.get_or_init(|| std::env::var("CMF_INKLING_KT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) {
+        return false;
+    }
+    match N.get_or_init(|| std::env::var("CMF_INKLING_KT").ok().and_then(|v| v.parse().ok())) {
+        Some(n) => SEEN.fetch_add(1, Ordering::Relaxed) + 1 == *n,
+        None => false,
+    }
+}
+
 /// Programmatic dependent launch for the arm's kernels on sm_90+ (Hopper,
 /// Blackwell): a kernel schedules while its predecessor drains (RTX PRO 6000:
 /// decode 122.7 → 127.6 tok/s, the same text). `CMF_INKLING_PDL=0|1` forces it.
@@ -781,6 +964,9 @@ fn pdl_on() -> bool {
     })
 }
 
+/// `true` when this call ran on the card. `ids` from position `pos0`; the
+/// logits of the last row (`all`: of every row, `[n][vocab]`) when `want`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(id: u64, g: &Globals, layers: &[Layer], cfg: &Cfg, ids: &[u32], pos0: usize, want: bool, all: bool, logits: &mut Vec<f32>) -> bool {
     let _ = pdl_on();
     forward_with(id, g, layers, cfg, ids, pos0, want, all, logits, None)
@@ -948,7 +1134,14 @@ fn forward_(c: &Ctx, d: &mut Dev, g: &Globals, cfg: &Cfg, ids: &[u32], pos0: usi
             at += n;
             continue;
         }
-        if big {
+        if n <= NMAX && kt_call(n) {
+            // `CMF_INKLING_KT=N`: the N-th decode call without its graph, every
+            // launch between two events, the time a kernel printed
+            super::super::kt_start();
+            unsafe { call(c, d, cfg, n, lrows, vocab)? };
+            c.sync()?;
+            super::super::kt_stop_as("inkling2_loop decode");
+        } else if big {
             unsafe { call(c, d, cfg, n, lrows, vocab)? };
         } else if graphs_on() && !prof() {
             if !d.graphs.contains_key(&key) {
@@ -1441,33 +1634,79 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
     let fl = |b: &Buf, i: usize| b.ptr + (i * rows * hidden * 4) as u64;
     let mut tp = std::time::Instant::now();
     unsafe {
-        // 1. the attention inputs
+        // 1. the attention inputs (a decode call: the mix and, when no gate
+        // follows, query 0's norm in one launch)
+        let gates = if pass > 0 { l.gates.as_ref() } else { None };
+        let one = l.sliding && gates.is_none();
+        let fuse = fuse_on();
+        let mut normed = false;
         let mut inp = [hin, hin, hin];
         if let Some((aq, nq)) = &l.aq {
             let nb_i = *nb as i32;
-            c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            if fuse {
+                let (nw, xo, p0, p1) = if one { (l.norms[0].ptr, d.x[0].ptr, d.xp[0][0].ptr, d.xp[0][1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
+                c.launch(f.mix2, (*nq as u32, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nw, eps, xo, p0, p1, hs))?;
+                normed = one;
+            } else {
+                c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            }
             inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
         }
         st(c, 0, &mut tp)?;
         // 2. the messages of a later pass, gated into q, k, v
-        let gates = if pass > 0 { l.gates.as_ref() } else { None };
         if let Some(gs) = gates {
             let i = li - cfg.core_start;
             let q = d.msg_q.ptr + (i * 4 * hidden * 4) as u64;
             let bnb = bank_nb as i32;
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
-            c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
-            for j in 0..3 {
-                gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
-                inp[j] = fl(&d.gin, j);
+            if fuse {
+                let nul = 0u64;
+                c.launch(f.mix2, (4, nu), mix_tpb(hidden), 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            }
+            let r = gs[0].down.bytes / (2 * hidden * 4);
+            if fuse && gs[..3].iter().all(|g| g.down.bytes / (2 * hidden * 4) == r) {
+                // the three gates' halves a launch each
+                let r_i = r as i32;
+                let (m0, m1, m2) = (fl(&d.msg, 0), fl(&d.msg, 1), fl(&d.msg, 2));
+                let (o0, o1, o2) = (fl(&d.gin, 0), fl(&d.gin, 1), fl(&d.gin, 2));
+                c.launch_3d(f.gd3, (r as u32, nu, 3), 256, 0, kargs!(inp[0], inp[1], inp[2], m0, m1, m2, gs[0].down.ptr, gs[1].down.ptr, gs[2].down.ptr, r_i, eps, d.gd.ptr))?;
+                c.launch_3d(
+                    f.go3,
+                    (hidden.div_ceil(8) as u32, nu, 3),
+                    256,
+                    0,
+                    kargs!(inp[0], inp[1], inp[2], m0, m1, m2, d.gd.ptr, gs[0].forget.ptr, gs[1].forget.ptr, gs[2].forget.ptr, gs[0].gain.ptr, gs[1].gain.ptr, gs[2].gain.ptr, r_i, o0, o1, o2),
+                )?;
+                inp = [o0, o1, o2];
+            } else {
+                for j in 0..3 {
+                    gate(c, f, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
+                    inp[j] = fl(&d.gin, j);
+                }
             }
         }
         st(c, 1, &mut tp)?;
         // 3. the input norms (a local layer's three are one weight; without
         // messages its inputs are one row)
-        let one = l.sliding && gates.is_none();
-        for j in 0..(if one { 1 } else { 3 }) {
-            c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+        let cnt = if one { 1 } else { 3 };
+        if fuse {
+            if !normed {
+                let th = (hidden / 4).div_ceil(32) * 32;
+                let (x, w, p) = (&d.x, &l.norms, &d.xp);
+                c.launch(
+                    f.rms3,
+                    (nu, cnt as u32),
+                    th as u32,
+                    0,
+                    kargs!(inp[0], w[0].ptr, x[0].ptr, p[0][0].ptr, p[0][1].ptr, inp[1], w[1].ptr, x[1].ptr, p[1][0].ptr, p[1][1].ptr, inp[2], w[2].ptr, x[2].ptr, p[2][0].ptr, p[2][1].ptr, eps, hs),
+                )?;
+            }
+        } else {
+            for j in 0..cnt {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+            }
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
         let pl = |j: usize| Planes { p0: d.xp[j][0].ptr, p1: d.xp[j][1].ptr, p2: d.xp[j][1].ptr, stride: hidden };
@@ -1475,6 +1714,8 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         // 4. the projections
         match (&l.qkv, one) {
             (Some(all), true) => all.run(c, &d.hfx, &pl(0), hidden, n)?,
+            // k's and v's input planes follow q's (`xpb`)
+            _ if fuse => l.qkv3.run(c, &d.hfx, &pl(0), hidden, n)?,
             _ => {
                 l.qset.run(c, &d.hfx, &pl(0), hidden, n)?;
                 l.kset.run(c, &d.hfx, &pl(xk), hidden, n)?;
@@ -1483,27 +1724,71 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
         }
         let nh = cfg.nh;
         let (nh_i, kp_i) = (nh as i32, (cfg.nkv * 4) as i32);
-        c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
         let (mut dk, mut dv) = (0u64, 0u64);
-        if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
-            c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
-            c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wv.ptr, kp_i, d.x[xv].ptr, d.dvb.ptr))?;
-            dk = d.dkb.ptr;
-            dv = d.dvb.ptr;
+        let q2 = fuse && qrkv2_on();
+        if fuse && !q2 {
+            // the sinks and the dynamic convolution weights in one launch
+            let (wk, wv, kr) = match (&l.dk, &l.dv) {
+                (Some(wk), Some(wv)) => {
+                    dk = d.dkb.ptr;
+                    dv = d.dvb.ptr;
+                    (wk.ptr, wv.ptr, kp_i)
+                }
+                _ => (0u64, 0u64, 0i32),
+            };
+            let tot = nh + 2 * kr as usize;
+            c.launch(f.fmv3, (tot as u32, nu), 192, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr, wk, kr, d.x[xk].ptr, d.dkb.ptr, wv, kr, d.x[xv].ptr, d.dvb.ptr))?;
+        } else if !fuse {
+            c.launch(f.fmv, (nh.div_ceil(8) as u32, nu), 256, 0, kargs!(l.sink.ptr, nh_i, d.x[0].ptr, d.sk.ptr))?;
+            if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
+                c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wk.ptr, kp_i, d.x[xk].ptr, d.dkb.ptr))?;
+                c.launch(f.fmv, ((cfg.nkv * 4).div_ceil(8) as u32, nu), 256, 0, kargs!(wv.ptr, kp_i, d.x[xv].ptr, d.dvb.ptr))?;
+                dk = d.dkb.ptr;
+                dv = d.dvb.ptr;
+            }
         }
         st(c, 3, &mut tp)?;
         // 5. queries and relative states; keys and values into the cache
         let full = !l.sliding as i32;
         let (alpha, floor) = (cfg.log_alpha as f32, cfg.log_floor as f32);
-        c.launch(f.qr, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.qk_clip, cfg.rel_clip, full, alpha, floor, d.cr.ptr))?;
         let ring = s.ring as i32;
-        c.launch(
-            f.kv,
-            (cfg.nkv as u32, 2),
-            cfg.hd as u32,
-            0,
-            kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr),
-        )?;
+        if fuse && !q2 {
+            c.launch(
+                f.qrkv,
+                ((nh * n + 2 * cfg.nkv) as u32, 1),
+                cfg.hd as u32,
+                0,
+                kargs!(
+                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr,
+                    s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr
+                ),
+            )?;
+        } else if fuse {
+            // queries, keys, values, the sinks and the per-token taps in one launch
+            let (wdk, wdv) = match (&l.dk, &l.dv) {
+                (Some(wk), Some(wv)) => (wk.ptr, wv.ptr),
+                _ => (0u64, 0u64),
+            };
+            c.launch(
+                f.qrkv2,
+                ((nh * n + 2 * cfg.nkv) as u32, 1),
+                cfg.hd as u32,
+                0,
+                kargs!(
+                    d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.rel_clip, full, alpha, floor, d.yk.ptr, d.yv.ptr, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr,
+                    ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr, l.sink.ptr, d.x[0].ptr, d.sk.ptr, wdk, d.x[xk].ptr, wdv, d.x[xv].ptr
+                ),
+            )?;
+        } else {
+            c.launch(f.qr, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.yq.ptr, d.yr.ptr, l.q_scale.ptr, l.rel_scale.ptr, cfg.qk_clip, cfg.rel_clip, full, alpha, floor, d.cr.ptr))?;
+            c.launch(
+                f.kv,
+                (cfg.nkv as u32, 2),
+                cfg.hd as u32,
+                0,
+                kargs!(d.yk.ptr, d.yv.ptr, dk, dv, l.tk.ptr, l.tv.ptr, s.rings[0].ptr, s.rings[1].ptr, s.k.ptr, s.v.ptr, ring, ni, cfg.qk_clip, eps, d.cr.ptr, s.hist[0].ptr, s.hist[1].ptr),
+            )?;
+        }
         st(c, 4, &mut tp)?;
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (cfg.hd as f32).sqrt());
@@ -1520,41 +1805,94 @@ unsafe fn app(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, s: &SlotD, li: usize, pas
                 0,
                 kargs!(d.yq.ptr, d.yr.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.part.ptr, t_i, d.cr.ptr),
             )?;
-            c.launch(f.attn_merge, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr))?;
+            if fuse {
+                // the output gate in the merge's epilogue
+                let qs_i = (nh * cfg.hd) as i32;
+                c.launch(f.merge_g, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+            } else {
+                c.launch(f.attn_merge, (nh as u32, nu), cfg.hd as u32, 0, kargs!(d.part.ptr, t_i, d.sk.ptr, win, d.att.ptr, d.cr.ptr))?;
+            }
         } else {
             c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring, win, scale, d.att.ptr, d.cr.ptr))?;
         }
         st(c, 5, &mut tp)?;
         let qs = nh * cfg.hd;
         let qs_i = qs as i32;
-        c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+        if !(fuse && split_on()) {
+            c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
+        }
         let po = Planes { p0: d.po[0].ptr, p1: d.po[1].ptr, p2: d.po[1].ptr, stride: qs };
         l.oset.run(c, &d.hfx, &po, qs, n)?;
         st(c, 6, &mut tp)?;
         // 7. the output convolution; a boundary closes the running sum into a block
         let bslot = if l.boundary { *nb as i32 } else { -1 };
         let hb = hidden.div_ceil(256) as u32;
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
+        // a decode row: the post and the MoE input's mix (and norm) in one block
+        let pm = fuse && n == 1 && postmix_on();
+        if !pm {
+            c.launch(f.post, (hb, 1), 256, 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, ni, s.hist[2].ptr))?;
+        }
         if l.boundary {
             *nb += 1;
         }
         st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
-        c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
-        let mut mi = d.m.ptr;
-        if let Some(gs) = gates {
-            gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
-            mi = d.mg.ptr;
+        if pm {
+            let (nw, xo, p0, p1) = if gates.is_none() { (l.post_norm.ptr, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr) } else { (0u64, 0u64, 0u64, 0u64) };
+            c.launch(f.post_mix, (1, 1), mix_tpb(hidden), 0, kargs!(d.ya.ptr, l.tpa.ptr, s.rings[2].ptr, hin, d.blk.ptr, bslot, bst, d.r.ptr, s.hist[2].ptr, nb_i, l.mq.ptr, d.m.ptr, ost, nw, eps, xo, p0, p1, hs))?;
         }
-        c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+        if fuse && gates.is_none() {
+            // the MoE input's mix and its norm in one launch
+            if !pm {
+                c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            }
+        } else {
+            if pm {
+            } else if fuse {
+                let nul = 0u64;
+                c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+            }
+            let mut mi = d.m.ptr;
+            if let Some(gs) = gates {
+                if fuse {
+                    let r = gs[3].down.bytes / (2 * hidden * 4);
+                    let r_i = r as i32;
+                    let (m3, g3) = (fl(&d.msg, 3), &gs[3]);
+                    c.launch_3d(f.gd3, (r as u32, nu, 1), 256, 0, kargs!(mi, mi, mi, m3, m3, m3, g3.down.ptr, g3.down.ptr, g3.down.ptr, r_i, eps, d.gd.ptr))?;
+                    c.launch_3d(
+                        f.go3,
+                        (hidden.div_ceil(8) as u32, nu, 1),
+                        256,
+                        0,
+                        kargs!(mi, mi, mi, m3, m3, m3, d.gd.ptr, g3.forget.ptr, g3.forget.ptr, g3.forget.ptr, g3.gain.ptr, g3.gain.ptr, g3.gain.ptr, r_i, d.mg.ptr, d.mg.ptr, d.mg.ptr),
+                    )?;
+                } else {
+                    gate(c, f, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
+                }
+                mi = d.mg.ptr;
+            }
+            if fuse {
+                let th = (hidden / 4).div_ceil(32) * 32;
+                let (x, p, w) = (d.xm.ptr, &d.pm, l.post_norm.ptr);
+                c.launch(f.rms3, (nu, 1), th as u32, 0, kargs!(mi, w, x, p[0].ptr, p[1].ptr, mi, w, x, p[0].ptr, p[1].ptr, mi, w, x, p[0].ptr, p[1].ptr, eps, hs))?;
+            } else {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(mi, l.post_norm.ptr, eps, d.xm.ptr, d.pm[0].ptr, d.pm[1].ptr, hs))?;
+            }
+        }
         st(c, 8, &mut tp)?;
-        // 9. the routed experts into y
-        moe(c, d, cfg, l, n, &mut tp)?;
+        // 9. the routed experts (fused: their weighted sum left to the post)
+        let si = moe(c, d, cfg, l, n, &mut tp, fuse)?;
         st(c, 9, &mut tp)?;
         // 10. the output convolution onto the running sum
         let (nul, m1) = (0u64, -1i32);
-        c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni, s.hist[3].ptr))?;
+        if fuse {
+            c.launch(f.post_mx, (hb, 1), 256, 0, kargs!(d.dns.ptr, d.wsel.ptr, si, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, hout, ni, s.hist[3].ptr))?;
+        } else {
+            c.launch(f.post, (hb, 1), 256, 0, kargs!(d.y.ptr, l.tpm.ptr, s.rings[3].ptr, d.r.ptr, nul, m1, bst, hout, ni, s.hist[3].ptr))?;
+        }
         st(c, 7, &mut tp)?;
     }
     Ok(())
@@ -1593,7 +1931,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         let mut inp = [hin, hin, hin];
         if let Some((aq, nq)) = &l.aq {
             let nb_i = *nb as i32;
-            c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            if fuse_on() {
+                let nul = 0u64;
+                c.launch(f.mix2, (*nq as u32, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (*nq as u32, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, hin, aq.ptr, d.in3.ptr, ost))?;
+            }
             inp = if *nq == 3 { [fl(&d.in3, 0), fl(&d.in3, 1), fl(&d.in3, 2)] } else { [fl(&d.in3, 0); 3] };
         }
         st(c, 0, &mut tp)?;
@@ -1604,7 +1947,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             let q = d.msg_q.ptr + (i * 4 * hidden * 4) as u64;
             let bnb = bank_nb as i32;
             let bank = d.bank.ptr + ((npre + 1) * hidden * 4) as u64;
-            c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            if fuse_on() {
+                let nul = 0u64;
+                c.launch(f.mix2, (4, nu), mix_tpb(hidden), 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+            } else {
+                c.launch(f.mix, (4, nu), 256, 0, kargs!(bank, bnb, bst, d.bank_out.ptr, q, d.msg.ptr, ost))?;
+            }
             for j in 0..3 {
                 gate_big(c, f, b, &gs[j], inp[j], fl(&d.msg, j), d.gd.ptr, fl(&d.gin, j), n, hidden, eps)?;
                 inp[j] = fl(&d.gin, j);
@@ -1613,9 +1961,15 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         st(c, 1, &mut tp)?;
         // 3. the input norms and their f16 rows
         let one = l.sliding && gates.is_none();
+        let th = ((hidden / 4).div_ceil(32) * 32) as u32;
         for j in 0..(if one { 1 } else { 3 }) {
-            c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
-            h16(d.xp[j][0].ptr, d.xp[j][1].ptr, b.x16[j].ptr, hidden)?;
+            if hidden % 4 == 0 && th <= 1024 {
+                // the f16 rows straight from the norm
+                c.launch(f.rms_h, (nu, 1), th, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, b.x16[j].ptr))?;
+            } else {
+                c.launch(f.rms, (nu, 1), 256, 0, kargs!(inp[j], l.norms[j].ptr, eps, d.x[j].ptr, d.xp[j][0].ptr, d.xp[j][1].ptr, hs))?;
+                h16(d.xp[j][0].ptr, d.xp[j][1].ptr, b.x16[j].ptr, hidden)?;
+            }
         }
         let (xk, xv) = if one { (0, 0) } else { (1, 2) };
         st(c, 2, &mut tp)?;
@@ -1654,15 +2008,18 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         // 6. the attention, its gate, the O projection
         let (ext, scale) = (l.extent as i32, 1.0f32 / (hd as f32).sqrt());
         let win = if s.ring > 0 { cfg.window as i32 } else { 0 };
-        if attn_gemm_on() {
+        if attn_gemm_on() && flash_on() && hd == 128 && cfg.d_rel == 16 && nh % cfg.nkv == 0 {
+            // the queries as f16 rows, then the flash kernel (no scores stored)
+            let (tot_i, n_i, ring_i) = ((n * nh * hd) as i32, n as i32, s.ring as i32);
+            c.launch(f.f16, ((n * nh * hd).div_ceil(256) as u32, 1), 256, 0, kargs!(d.yq.ptr, b.q16.ptr, tot_i))?;
+            c.launch(f.attn_flash, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(b.q16.ptr, d.yr.ptr, d.sk.ptr, l.rel_tb.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, n_i, d.cr.ptr, d.att.ptr))?;
+        } else if attn_gemm_on() {
             attn_gemm(c, d, b, cfg, l, s, n, ext, win, scale)?;
         } else {
             c.launch(f.attn, (nh as u32, nu), 256, 0, kargs!(d.yq.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, d.att.ptr, d.cr.ptr))?;
         }
         st(c, 5, &mut tp)?;
-        let qs_i = qs as i32;
-        c.launch(f.ogate, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, d.po[0].ptr, d.po[1].ptr, qs_i))?;
-        h16(d.po[0].ptr, d.po[1].ptr, b.o16.ptr, qs)?;
+        c.launch(f.ogate_h, (qs.div_ceil(256) as u32, nu), 256, 0, kargs!(d.att.ptr, d.yg.ptr, b.o16.ptr))?;
         wmul(c, fx, b, wo, b.o16.ptr, d.ya.ptr, hidden, n)?;
         st(c, 6, &mut tp)?;
         // 7. the output convolution; a boundary closes the running sum into a block
@@ -1676,7 +2033,12 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
         st(c, 7, &mut tp)?;
         // 8. the MoE input
         let nb_i = *nb as i32;
-        c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+        if fuse_on() {
+            let nul = 0u64;
+            c.launch(f.mix2, (1, nu), mix_tpb(hidden), 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost, nul, eps, nul, nul, nul, hs))?;
+        } else {
+            c.launch(f.mix, (1, nu), 256, 0, kargs!(d.blk.ptr, nb_i, bst, d.r.ptr, l.mq.ptr, d.m.ptr, ost))?;
+        }
         let mut mi = d.m.ptr;
         if let Some(gs) = gates {
             gate_big(c, f, b, &gs[3], mi, fl(&d.msg, 3), d.gd.ptr, d.mg.ptr, n, hidden, eps)?;
@@ -1750,6 +2112,23 @@ unsafe fn wmul(c: &Ctx, fx: &HFuncs, b: &Big, m: &DevMat, x: u64, y: u64, ldy: u
     let (rows_i, cols_i) = (m.rows as i32, m.cols as i32);
     let wd = b.wd.ptr;
     unsafe {
+        if m.kind == 6 {
+            // the f16 copy kept from an earlier call, or made now while the budget lasts
+            if let Some(w16) = b.wf16.borrow().get(&m.w.ptr) {
+                return c.gemm(true, false, m.rows, n, m.cols, 1.0, w16.ptr, m.cols, x, m.cols, 0.0, y, ldy, Gemm::Half);
+            }
+            let bytes = m.rows * m.cols * 2;
+            if bytes <= b.wf16_left.get() {
+                if let Ok(w16) = Buf::direct(bytes + 64) {
+                    let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
+                    c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), w16.ptr, rows_i, cols_i))?;
+                    let p = w16.ptr;
+                    b.wf16_left.set(b.wf16_left.get() - bytes);
+                    b.wf16.borrow_mut().insert(m.w.ptr, w16);
+                    return c.gemm(true, false, m.rows, n, m.cols, 1.0, p, m.cols, x, m.cols, 0.0, y, ldy, Gemm::Half);
+                }
+            }
+        }
         if m.kind == 6 && m.rows * m.cols <= b.wd_elems {
             let threads = (m.rows.div_ceil(16) * (m.cols / 32) * 32) as u64;
             c.launch(fx.expand_p, (threads.div_ceil(256) as u32, 1), 256, 0, kargs!(m.w.ptr, m.aux0(), m.aux1(), wd, rows_i, cols_i))?;
@@ -1800,7 +2179,7 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
         c.gemm(true, false, e, n, hidden, 1.0, l.router.ptr, hidden, d.xm.ptr, hidden, 0.0, b.lg.ptr, e, Gemm::F32)?;
         c.launch(fx.moe_topk, (n.div_ceil(8) as u32, 1), 256, 0, kargs!(b.lg.ptr, l.bias.ptr, n_i, e_i, k_i, flags, cfg.route_scale, b.pidx.ptr, b.pwt.ptr))?;
         c.launch(
-            fx.moe_group,
+            if e <= 256 && group2_on() { fx.moe_group2 } else { fx.moe_group },
             (1, 1),
             1024,
             0,
@@ -1811,15 +2190,24 @@ unsafe fn moe_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, n: usize, tp
             // the rows in their places as f16; gate/up (the activation in the
             // epilogue) into f16 rows, then down into ys
             let (tot_i, f) = (tot as i32, &d.fx);
-            c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
-            st(c, 11, tp)?;
             let (one, zero_i, nul) = (1i32, 0i32, 0u64);
-            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
             let mm = if mma2_on() { f.moe_mma2 } else { f.moe_mma };
-            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i))?;
+            // ink_moe_mma2 reads a job's rows through the places' rows (src):
+            // the call's rows as f16 once instead of every pick's copy
+            let map = mma2_on() && rowmap_on();
+            let rm = if map { b.src.ptr } else { nul };
+            if map {
+                let tn = (n * hidden) as i32;
+                c.launch(f.f16, ((n * hidden).div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.xg[0].ptr, tn))?;
+            } else {
+                c.launch(f.gather16, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(d.xm.ptr, b.src.ptr, tot_i, b.xg[0].ptr))?;
+            }
+            st(c, 11, tp)?;
+            let gx = ((2 * inter).div_ceil(16)).div_ceil(MMA_TILES) as u32;
+            c.launch(mm, (gx, jmax as u32), 128, 0, kargs!(b.gu_a.ptr, b.xg[0].ptr, hid_i, one, b.qq[0].ptr, inter_i, nul, zero_i, rm))?;
             st(c, 12, tp)?;
             let dx = (hidden.div_ceil(16)).div_ceil(MMA_TILES) as u32;
-            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i))?;
+            c.launch(mm, (dx, jmax as u32), 128, 0, kargs!(b.dn_a.ptr, b.qq[0].ptr, inter_i, zero_i, nul, zero_i, b.ys.ptr, hid_i, nul))?;
             cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
             c.launch(fx.moe_gcombine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, b.ys.ptr, b.pos.ptr, b.pwt.ptr, nul, nul, zero, n_i, k_i, hid_i))?;
             return Ok(());
@@ -1843,6 +2231,21 @@ unsafe fn gate_big(c: &Ctx, f: &Fx, b: &Big, g: &GateD, x: u64, m: u64, dbuf: u6
     let r = g.down.bytes / (2 * hidden * 4);
     let tot = n * hidden;
     let tot_i = tot as i32;
+    if gate2_on() {
+        // no normed copy: the rows' inverse RMS, x's and m's products with the
+        // down rows' halves, d = P·rr_x + Q·rr_m; F and G in one GEMM
+        let (p, q, rr) = (b.gxn.ptr, b.gxn.ptr + (n * r * 4) as u64, b.gxn.ptr + (2 * n * r * 4) as u64);
+        let (r_i, nr_i) = (r as i32, (n * r) as i32);
+        let th = ((hidden / 4).div_ceil(32) * 32).min(1024) as u32;
+        unsafe {
+            c.launch(f.gate_rr, (n as u32, 1), th, 0, kargs!(x, m, eps, rr))?;
+            c.gemm(true, false, r, n, hidden, 1.0, g.down.ptr, 2 * hidden, x, hidden, 0.0, p, r, Gemm::F32)?;
+            c.gemm(true, false, r, n, hidden, 1.0, g.down.ptr + (hidden * 4) as u64, 2 * hidden, m, hidden, 0.0, q, r, Gemm::F32)?;
+            c.launch(f.gate_d, ((n * r).div_ceil(256) as u32, 1), 256, 0, kargs!(p, q, rr, r_i, nr_i, dbuf))?;
+            c.gemm(true, false, 2 * hidden, n, r, 1.0, g.fg.ptr, r, dbuf, r, 0.0, b.gtf.ptr, 2 * hidden, Gemm::F32)?;
+            return c.launch(f.gate_mix2, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(x, m, b.gtf.ptr, out, tot_i));
+        }
+    }
     unsafe {
         c.launch(f.gate_norm, (n as u32, 1), 256, 0, kargs!(x, m, eps, b.gxn.ptr))?;
         c.gemm(true, false, r, n, 2 * hidden, 1.0, g.down.ptr, 2 * hidden, b.gxn.ptr, 2 * hidden, 0.0, dbuf, r, Gemm::F32)?;
@@ -1868,7 +2271,7 @@ unsafe fn gate(c: &Ctx, f: &Fx, g: &GateD, x: u64, m: u64, dbuf: u64, out: u64, 
 /// this arm's buffers): the router, the picks laid out as slots, every slot's
 /// gate/up pair (Inkling's activation in its epilogue) and down, the mixture
 /// into `y`.
-unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant) -> Res<()> {
+unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::time::Instant, fuse: bool) -> Res<i32> {
     let fx = &d.hfx;
     let hidden = cfg.dim;
     let e = l.e;
@@ -1879,36 +2282,79 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
     let flags = 1 | 2 | 4 | 32;
     let ps_i = hidden as i32;
     let inter_i = l.inter as i32;
-    let tb = if n > 1 && std::env::var("CMF_HYB_MOE_TB").as_deref() != Ok("1") { 2u32 } else { 1u32 };
+    // `CMF_INKLING_EXP_TB=2` (a measurement): a decode row's experts two tiles a block
+    let tb = if (n > 1 && std::env::var("CMF_HYB_MOE_TB").as_deref() != Ok("1")) || std::env::var("CMF_INKLING_EXP_TB").as_deref() == Ok("2") { 2u32 } else { 1u32 };
     let (bpg, bpd) = (l.bpj_gu.div_ceil(tb), l.bpj_dn.div_ceil(tb));
     let (bg, bd) = (bpg as i32, bpd as i32);
     let nul = 0u64;
     unsafe {
-        c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
-        c.launch(
-            fx.moe_select,
-            (1, 1),
-            if n == 1 && select512_on() { 512 } else { (32 * n.max(1)) as u32 },
-            0,
-            kargs!(
-                d.logits_e.ptr, l.bias.ptr, ni, ei, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si,
-                d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
-            ),
-        )?;
+        if fuse && n == 1 && e <= 256 && k <= 32 && s_n == k && hidden % 4 == 0 {
+            // a decode row: the router and the selection in one launch
+            c.launch(
+                fx.moe_route1,
+                (e as u32, 1),
+                128,
+                0,
+                kargs!(
+                    d.xm.ptr, l.router.ptr, d.logits_e.ptr, ei, hi, l.bias.ptr, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si, d.qq[0].ptr,
+                    d.qq[1].ptr, ps_i, d.dns.ptr, bg, bd, d.rcnt.ptr
+                ),
+            )?;
+        } else {
+            if fuse && e <= 256 && hidden % 4 == 0 {
+                // a verify call's rows: the decode route's logits
+                c.launch(fx.moe_router4, (e as u32, n as u32), 128, 0, kargs!(d.xm.ptr, l.router.ptr, d.logits_e.ptr, ei, hi))?;
+            } else {
+                c.launch(fx.moe_router, ((e + 1).div_ceil(8) as u32, n as u32), 256, 0, kargs!(d.xm.ptr, l.router.ptr, nul, d.logits_e.ptr, d.sg.ptr, ni, ei, hi))?;
+            }
+            c.launch(
+                fx.moe_select,
+                (1, 1),
+                if n == 1 && select512_on() { 512 } else { (32 * n.max(1)) as u32 },
+                0,
+                kargs!(
+                    d.logits_e.ptr, l.bias.ptr, ni, ei, ki, flags, cfg.route_scale, l.gu_t.ptr, l.dn_t.ptr, d.gu_a.ptr, d.dn_a.ptr, d.wsel.ptr, si,
+                    d.qq[0].ptr, d.qq[1].ptr, ps_i, d.dns.ptr, hi, bg, bd
+                ),
+            )?;
+        }
         st(c, 11, tp)?;
         let t = (tb - 1) as usize;
+        // the experts' K split: 16 warps a tile (`CMF_HYB_KS=8`: 8)
+        let k16 = super::decode_ks().is_none_or(|k| k == 16);
+        let ksw = if k16 { 16u32 } else { 8 };
         let pick = |kd: Option<usize>| match kd {
-            Some(dd) => fx.mmpk[nt_of(n)][t][1][dd],
-            None => fx.mmp[nt_of(n)][t][1],
+            Some(dd) => fx.mmpk[nt_of(n)][t][k16 as usize][dd],
+            None => fx.mmp[nt_of(n)][t][k16 as usize],
         };
         let xs_i = hidden as i32;
-        c.launch(pick(l.kd.0), (s_n as u32 * bpg, 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?;
+        // a decode row's experts as a resident grid (q4tp / int8): no partial last wave
+        let res = |kd: Option<usize>| match kd {
+            Some(dd) if n == 1 && t == 0 && dd < 2 && persist_on() && fx.mmpkg_res[dd] > 0 => Some((fx.mmpkg[dd], fx.mmpkg_res[dd])),
+            _ => None,
+        };
+        let (nbg, nbd) = (s_n as u32 * bpg, s_n as u32 * bpd);
+        match res(l.kd.0) {
+            Some((fg, rb)) => {
+                let nb_i = nbg as i32;
+                c.launch(fg, (nbg.min(rb), 1), 32 * 16, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi, nb_i))?
+            }
+            None => c.launch(pick(l.kd.0), (nbg, 1), 32 * ksw, 0, kargs!(d.gu_a.ptr, si, d.pm[0].ptr, d.pm[1].ptr, d.pm[1].ptr, xs_i, ni, hi))?,
+        }
         st(c, 12, tp)?;
-        c.launch(pick(l.kd.1), (s_n as u32 * bpd, 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?;
+        match res(l.kd.1) {
+            Some((fd, rb)) => {
+                let nb_i = nbd as i32;
+                c.launch(fd, (nbd.min(rb), 1), 32 * 16, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i, nb_i))?
+            }
+            None => c.launch(pick(l.kd.1), (nbd, 1), 32 * ksw, 0, kargs!(d.dn_a.ptr, si, d.qq[0].ptr, d.qq[1].ptr, d.qq[1].ptr, ps_i, ni, inter_i))?,
+        }
         st(c, 13, tp)?;
-        cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
-        let zero = 0i32;
-        c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;
+        if !fuse {
+            cu::memset_d8_async(d.y.ptr, 0, n * hidden * 4, c.stream).map_err(derr)?;
+            let zero = 0i32;
+            c.launch(fx.moe_combine, (hidden.div_ceil(256) as u32, n as u32), 256, 0, kargs!(d.y.ptr, d.dns.ptr, d.wsel.ptr, nul, d.sg.ptr, zero, ni, hi, si))?;
+        }
     }
-    Ok(())
+    Ok(si)
 }

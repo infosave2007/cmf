@@ -1097,6 +1097,23 @@ pub(crate) fn cc_major() -> u32 {
     CC_MAJOR.load(Ordering::SeqCst)
 }
 
+/// The device's multiprocessors; 0 before the context.
+static SM_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn sm_count() -> u32 {
+    SM_COUNT.load(Ordering::SeqCst)
+}
+
+/// Blocks of `f` (`threads` each, no dynamic shared memory) the whole device
+/// holds at once; 0 when the driver cannot say.
+pub(crate) fn resident_blocks(f: cs::CUfunction, threads: u32) -> u32 {
+    let mut nb: std::os::raw::c_int = 0;
+    let r = unsafe { cs::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut nb, f, threads as std::os::raw::c_int, 0) };
+    if r != cs::CUresult::CUDA_SUCCESS || nb <= 0 {
+        return 0;
+    }
+    nb as u32 * sm_count()
+}
+
 pub(crate) fn pdl_set(on: bool) {
     PDL_ON.store(on, Ordering::SeqCst);
 }
@@ -1110,6 +1127,13 @@ static KT_NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 struct KtEvent(usize, cs::CUevent, cs::CUevent);
 unsafe impl Send for KtEvent {}
 static KT_EVENTS: Mutex<Vec<KtEvent>> = Mutex::new(Vec::new());
+
+/// A timed launch's key: the kernel, and under `CMF_KT_GRID=1` its grid's
+/// width as well (one row a shape in the table).
+fn kt_key(f: cs::CUfunction, gx: u32) -> usize {
+    static BY_GRID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_GRID.get_or_init(|| std::env::var("CMF_KT_GRID").as_deref() == Ok("1")) { (f as usize) | ((gx as usize) << 48) } else { f as usize }
+}
 
 pub(crate) fn kt_start() {
     KT_EVENTS.lock().unwrap().clear();
@@ -1129,7 +1153,9 @@ pub(crate) fn kt_stop_as(label: &str) {
     let (mut total, mut n) = (0f64, 0usize);
     for KtEvent(f, a, b) in events {
         let ms = unsafe { cu::event::elapsed(a, b) }.unwrap_or(0.0) as f64;
-        let name = names.as_ref().and_then(|m| m.get(&f)).cloned().unwrap_or_else(|| format!("{f:x}"));
+        let (fp, gx) = (f & ((1usize << 48) - 1), f >> 48);
+        let name = names.as_ref().and_then(|m| m.get(&fp)).cloned().unwrap_or_else(|| format!("{fp:x}"));
+        let name = if gx > 0 { format!("{name}@{gx}") } else { name };
         let e = by.entry(name).or_insert((0, 0.0));
         e.0 += 1;
         e.1 += ms;
@@ -1172,6 +1198,7 @@ fn init() -> Res<Ctx> {
     let major = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
     let minor = attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
     CC_MAJOR.store(major as u32, Ordering::SeqCst);
+    SM_COUNT.store(attr(cs::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) as u32, Ordering::SeqCst);
     let arch = match (major, minor) {
         (7, 5) => Some("compute_75"),
         (8, 0) => Some("compute_80"),
@@ -1423,7 +1450,7 @@ impl Ctx {
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, stream) };
-                KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
+                KT_EVENTS.lock().unwrap().push(KtEvent(kt_key(f, grid.0), a, b));
             }
         }
         r
@@ -1446,21 +1473,43 @@ impl Ctx {
         } else {
             None
         };
-        let r = unsafe {
-            cu::launch_kernel(
-                f,
-                (grid.0.max(1), grid.1.max(1), grid.2.max(1)),
-                (block, 1, 1),
-                shared as u32,
-                self.stream,
-                params,
-            )
-        }
-        .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)));
+        // a registered kernel under programmatic dependent launch, as `launch`
+        let pdl = PDL_ON.load(Ordering::Relaxed)
+            && PDL_FUNCS.lock().unwrap().as_ref().is_some_and(|set| set.contains(&(f as usize)));
+        let r = if pdl {
+            let mut attr: cs::CUlaunchAttribute = unsafe { std::mem::zeroed() };
+            attr.id = cs::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+            attr.value.programmaticStreamSerializationAllowed = 1;
+            let cfg = cs::CUlaunchConfig {
+                gridDimX: grid.0.max(1),
+                gridDimY: grid.1.max(1),
+                gridDimZ: grid.2.max(1),
+                blockDimX: block,
+                blockDimY: 1,
+                blockDimZ: 1,
+                sharedMemBytes: shared as u32,
+                hStream: self.stream,
+                attrs: &mut attr,
+                numAttrs: 1,
+            };
+            unsafe { cs::cuLaunchKernelEx(&cfg, f, params.as_mut_ptr(), std::ptr::null_mut()) }.result().map_err(derr)
+        } else {
+            unsafe {
+                cu::launch_kernel(
+                    f,
+                    (grid.0.max(1), grid.1.max(1), grid.2.max(1)),
+                    (block, 1, 1),
+                    shared as u32,
+                    self.stream,
+                    params,
+                )
+            }
+            .map_err(|e| format!("{} (a launch of grid {grid:?}, block {block}, shared {shared})", derr(e)))
+        };
         if let Some(a) = timed {
             if let Ok(b) = cu::event::create(cs::CUevent_flags::CU_EVENT_DEFAULT) {
                 let _ = unsafe { cu::event::record(b, self.stream) };
-                KT_EVENTS.lock().unwrap().push(KtEvent(f as usize, a, b));
+                KT_EVENTS.lock().unwrap().push(KtEvent(kt_key(f, grid.0), a, b));
             }
         }
         r

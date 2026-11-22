@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.15] — 2026-11-22
+
+### Changed
+- CUDA, Inkling (`inkling2_loop`) decode: the small kernels fused and every load issued before its sums —
+  `ink_mix2` (a block mix in one exchange, its states in registers, the norm in its epilogue), three message gates a
+  launch (`ink_gate_down3` / `ink_gate_out3`), the norms a launch (`ink_rms3`), the attention merge with its output
+  gate, the experts' mixture inside the post (`ink_post_mx`), q, k and v in one matvec over three input planes, the
+  router and the expert pick in one launch (`hy_moe_route1`: the last block picks by a parallel rank; a verify's
+  rows sum their router as a decode row, `hy_moe_router4`, so rolled-back drafts still give plain decoding's text
+  byte for byte), the attention tile four keys in flight; the matvecs find their job by one ballot, read their
+  ladders into registers, prefetch a fixed set's weights before the dependent-launch wait, take 32 warps a tile on a
+  matrix narrower than the card, and read one group ahead on sm_120. 3-D launches carry programmatic dependent
+  launch too. RTX PRO 6000 Blackwell: decode 127.3 → 220.1 tok/s; WikiText-2 perplexity unchanged (9.060 at
+  12 × 512). `CMF_INKLING_FUSE=0` restores the stage-a-launch kernels.
+- CUDA, Inkling prompt: attention as a flash kernel on the tensor cores (`ink_attn_flash`: no stored scores, the
+  relative bias of a 16 × 64 tile from one band product with the bf16-split table, a running softmax, the sink at
+  the end); prompt calls of 4096 rows on 40 GB cards and more (2048 at 24 GB, else 1024); the routed experts
+  grouped in parallel (`hy_moe_group2`), read in place through the places' row map, the group's scale folded into
+  the f16 weights once (no per-tile unpacking) and their B tiles by `ldmatrix`; the dense weights kept as f16
+  between calls while free memory allows (`CMF_INKLING_WF16_MB`); the message gates without the normed copy of
+  their inputs, F and G in one GEMM; the norms and the output gate straight to f16. RTX PRO 6000: a 2 048-token
+  prompt 7 843 → 13 997 tok/s, 16 384 6 434 → 13 537, 32 768 4 002 → 12 171; perplexity unchanged (4 × 2048 6.159,
+  1 × 16384 5.368). `CMF_INKLING_FLASH=0` brings back the cuBLAS attention.
+- DSpark's depth policy times plain decoding itself instead of scaling its price from a verify's with the L4's
+  ratios (on the RTX PRO 6000 a story drafted at 197 against plain decoding's 215 tok/s).
+- Metal, Inkling: a decode call's stages fused — the five attention projections in one q4tp launch (`ink_mvq`, the
+  backend matvec's arithmetic), the sinks and per-token taps in one (`ink_fmv3`), qr with kv, the output gate in the
+  attention, the block mixes with their norms, the three message gates in two launches; a prompt call's attention as
+  a flash kernel on the simdgroup matrices (`ink_attn_fl`), whose perplexity is the CPU's (2 × 1024: 7.340 against
+  the CPU's 7.340; the old kernel 7.364). MacBook Air M4: decode 24.0 → 25.3 tok/s with the same greedy text, a
+  2 048-token prompt 136.6 → 152.1 tok/s. `CMF_INKLING_FUSE=0` / `CMF_INKLING_FLASH=0` restore the old launches.
+
 ## [0.9.14] — 2026-11-22
 
 ### Changed

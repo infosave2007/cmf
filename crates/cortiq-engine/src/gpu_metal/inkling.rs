@@ -97,6 +97,12 @@ struct Pipes {
     moe_mm: ComputePipelineState,
     moe_act: ComputePipelineState,
     moe_mixq: ComputePipelineState,
+    qrkv: ComputePipelineState,
+    fmv3: ComputePipelineState,
+    mvq: ComputePipelineState,
+    gate_down3: ComputePipelineState,
+    gate_out3: ComputePipelineState,
+    attn_fl: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -138,6 +144,12 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             moe_mm: pso("ink_moe_mm")?,
             moe_act: pso("ink_moe_act")?,
             moe_mixq: pso("ink_moe_mixq")?,
+            qrkv: pso("ink_qrkv")?,
+            fmv3: pso("ink_fmv3")?,
+            mvq: pso("ink_mvq")?,
+            gate_down3: pso("ink_gate_down3")?,
+            gate_out3: pso("ink_gate_out3")?,
+            attn_fl: pso("ink_attn_fl")?,
         })
     });
     match r {
@@ -188,7 +200,21 @@ fn mat(c: &Ctx, model: &Arc<cortiq_core::CmfModel>, t: &crate::qtensor::QTensor)
     Some(Mat::Q8 { abs, rows, cols, rs: up(c, rs), col: up(c, col) })
 }
 
+/// One matrix of `ink_mvq`'s decode-row launch (the shader's `MvJob`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MvJob {
+    abs: u64,
+    rows: u32,
+    xs: u32,
+    ys: u32,
+    tg0: u32,
+}
+
 struct LayerM {
+    /// q, gate, rel, k, v as one decode-row launch (`ink_mvq`): its jobs, their
+    /// count and threadgroups — [0] all from input 0, [1] k from 1 and v from 2
+    mvj: Option<[(Buffer, u32, u64); 2]>,
     sliding: bool,
     boundary: bool,
     aq: Option<(Buffer, usize)>,
@@ -332,19 +358,40 @@ fn build(c: &Ctx, g: &Globals, layers: &[Layer], cfg: &Cfg) -> Result<Dev, Strin
             }
             None => None,
         };
+        let (q, k, v, gt, rl) = (mm(&a.q)?, mm(&a.k)?, mm(&a.v)?, mm(&a.gate)?, mm(&a.rel)?);
+        let mvj = {
+            let all = [(&q, 0u32), (&gt, 1), (&rl, 2), (&k, 3), (&v, 4)];
+            if all.iter().all(|(m, _)| matches!(m, Mat::Q4 { cols, .. } if *cols == hidden)) {
+                let mk = |two: bool| {
+                    let mut jobs = Vec::with_capacity(5);
+                    let mut tg0 = 0u32;
+                    for (m, ys) in all {
+                        let Mat::Q4 { abs, rows, .. } = m else { unreachable!() };
+                        let xs = if two && ys >= 3 { ys - 2 } else { 0 };
+                        jobs.push(MvJob { abs: *abs as u64, rows: *rows as u32, xs, ys, tg0 });
+                        tg0 += rows.div_ceil(16) as u32;
+                    }
+                    (up(c, &jobs), jobs.len() as u32, tg0 as u64)
+                };
+                Some([mk(false), mk(true)])
+            } else {
+                None
+            }
+        };
         dl.push(LayerM {
+            mvj,
             sliding: l.sliding,
             boundary: li % cfg.block == 0,
             aq: l.attn_query.as_ref().map(|q| (up(c, q), q.len() / hidden)),
             mq: up(c, &l.mlp_query),
             norms: [up(c, &l.in_norm[0]), up(c, &l.in_norm[1]), up(c, &l.in_norm[2])],
             post_norm: up(c, &l.post_norm),
-            q: mm(&a.q)?,
-            k: mm(&a.k)?,
-            v: mm(&a.v)?,
+            q,
+            k,
+            v,
             o: mm(&a.o)?,
-            gate: mm(&a.gate)?,
-            rel: mm(&a.rel)?,
+            gate: gt,
+            rel: rl,
             sink: up(c, &a.sink),
             q_scale: up(c, &a.q_scale),
             rel_scale: up(c, &a.rel_scale),
@@ -608,6 +655,21 @@ fn skip(stage: &str) -> bool {
     S.get_or_init(|| std::env::var("CMF_INKLING_SKIP").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default()).iter().any(|x| x == stage)
 }
 
+/// `CMF_INKLING_FLASH=0`: a prompt call's attention a threadgroup a (head, row)
+/// (`ink_attn`) instead of the flash kernel on the simdgroup matrices.
+fn flash_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FLASH").as_deref() != Ok("0"))
+}
+
+/// `CMF_INKLING_FUSE=0`: a call's stages one launch each (the mixes and norms,
+/// the five projections, the small matvecs, qr and kv, the attention and its
+/// gate) instead of the fused launches.
+fn fuse_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_INKLING_FUSE").as_deref() != Ok("0"))
+}
+
 /// `CMF_INKLING_DEC8=0`: the decode's experts on `ink_moe_gu` / `ink_moe_down`
 /// (a simdgroup's 32 lanes over a row block's groups) instead of
 /// `ink_moe_gu8` / `ink_moe_dn8` (halves and quarters of a simdgroup, every
@@ -752,8 +814,12 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     let hidden = cfg.dim;
     let nu = n as u64;
     let plane = (d.rows * hidden * 4) as u64;
-    // 1. the attention inputs
+    let fuse = fuse_on();
+    let gates = if pass > 0 { l.gates.as_ref() } else { None };
+    let one = l.sliding && gates.is_none();
+    // 1. the attention inputs (fused: a local layer's one norm in the mix)
     let mut inp: [(&Buffer, u64); 3] = [(hin, 0), (hin, 0), (hin, 0)];
+    let mut normed = false;
     if let Some((aq, nq)) = &l.aq {
         let mut ip = *base;
         ip.nb = *nb as u32;
@@ -762,12 +828,17 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
         enc.set_buffer(1, Some(hin), 0);
         enc.set_buffer(2, Some(aq), 0);
         enc.set_buffer(3, Some(&d.in3), 0);
+        if fuse && one {
+            ip.v = 1;
+            enc.set_buffer(4, Some(&l.norms[0]), 0);
+            enc.set_buffer(5, Some(&d.x[0]), 0);
+            normed = true;
+        }
         setp(enc, &ip);
         grid(enc, *nq as u64, nu, 1, 256);
         inp = if *nq == 3 { [(&d.in3, 0), (&d.in3, plane), (&d.in3, 2 * plane)] } else { [(&d.in3, 0); 3] };
     }
     // 2. the messages of a later pass, gated into q, k, v
-    let gates = if pass > 0 { l.gates.as_ref() } else { None };
     if let Some(gs) = gates {
         let i = li - cfg.core_start;
         let mut ip = *base;
@@ -779,16 +850,60 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
         enc.set_buffer(3, Some(&d.msg), 0);
         setp(enc, &ip);
         grid(enc, 4, nu, 1, 256);
-        for j in 0..3 {
-            if !skip("gates") {
-                gate(c, p, d, enc, base, &gs[j], inp[j], (&d.msg, j as u64 * plane), (&d.gin, j as u64 * plane), n, hidden);
+        let r3 = gs[0].3;
+        if fuse && n == 1 && !skip("gates") && gs[..3].iter().all(|g| g.3 == r3) && inp.iter().all(|x| std::ptr::eq(x.0, inp[0].0)) {
+            // the three gates' halves a launch each
+            #[repr(C)]
+            struct G3Off {
+                xo: [u32; 3],
+                mo: [u32; 3],
+                oo: [u32; 3],
             }
-            inp[j] = (&d.gin, j as u64 * plane);
+            let pf = (plane / 4) as u32;
+            let go = G3Off { xo: [(inp[0].1 / 4) as u32, (inp[1].1 / 4) as u32, (inp[2].1 / 4) as u32], mo: [0, pf, 2 * pf], oo: [0, pf, 2 * pf] };
+            let mut ip = *base;
+            ip.r = r3 as u32;
+            enc.set_compute_pipeline_state(&p.gate_down3);
+            enc.set_buffer(0, Some(inp[0].0), 0);
+            enc.set_buffer(1, Some(&d.msg), 0);
+            enc.set_buffer(2, Some(&gs[0].0), 0);
+            enc.set_buffer(3, Some(&gs[1].0), 0);
+            enc.set_buffer(4, Some(&gs[2].0), 0);
+            enc.set_buffer(5, Some(&d.gd), 0);
+            set_bytes_t(enc, 6, &go);
+            setp(enc, &ip);
+            grid(enc, r3 as u64, nu, 3, 256);
+            enc.set_compute_pipeline_state(&p.gate_out3);
+            enc.set_buffer(0, Some(inp[0].0), 0);
+            enc.set_buffer(1, Some(&d.msg), 0);
+            enc.set_buffer(2, Some(&d.gd), 0);
+            enc.set_buffer(3, Some(&gs[0].1), 0);
+            enc.set_buffer(4, Some(&gs[1].1), 0);
+            enc.set_buffer(5, Some(&gs[2].1), 0);
+            enc.set_buffer(6, Some(&gs[0].2), 0);
+            enc.set_buffer(7, Some(&gs[1].2), 0);
+            enc.set_buffer(8, Some(&gs[2].2), 0);
+            enc.set_buffer(9, Some(&d.gin), 0);
+            set_bytes_t(enc, 10, &go);
+            setp(enc, &ip);
+            grid(enc, (hidden as u64).div_ceil(8), nu, 3, 256);
+            for (j, x) in inp.iter_mut().enumerate() {
+                *x = (&d.gin, j as u64 * plane);
+            }
+        } else {
+            for j in 0..3 {
+                if !skip("gates") {
+                    gate(c, p, d, enc, base, &gs[j], inp[j], (&d.msg, j as u64 * plane), (&d.gin, j as u64 * plane), n, hidden);
+                }
+                inp[j] = (&d.gin, j as u64 * plane);
+            }
         }
     }
     // 3. the input norms
-    let one = l.sliding && gates.is_none();
     for j in 0..(if one { 1 } else { 3 }) {
+        if normed && j == 0 {
+            continue;
+        }
         enc.set_compute_pipeline_state(&p.rms);
         enc.set_buffer(0, Some(inp[j].0), inp[j].1);
         enc.set_buffer(1, Some(&l.norms[j]), 0);
@@ -798,7 +913,27 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     }
     let (xk, xv) = if one { (0, 0) } else { (1, 2) };
     // 4. the projections
-    if !skip("proj") {
+    if !skip("proj") && fuse && n == 1 && l.mvj.is_some() {
+        // the five matrices in one launch
+        let (jobs, nj, tgs) = &l.mvj.as_ref().unwrap()[if one { 0 } else { 1 }];
+        enc.set_compute_pipeline_state(&p.mvq);
+        for i in 0..4u64 {
+            enc.set_buffer(i, Some(d.fbuf.window((i as usize).min(d.fbuf.bufs.len() - 1))), 0);
+        }
+        enc.set_buffer(4, Some(jobs), 0);
+        set_bytes_t(enc, 5, nj);
+        set_bytes_t(enc, 6, &d.wstride);
+        enc.set_buffer(7, Some(&d.x[0]), 0);
+        enc.set_buffer(8, Some(&d.x[1]), 0);
+        enc.set_buffer(9, Some(&d.x[2]), 0);
+        enc.set_buffer(10, Some(&d.yq), 0);
+        enc.set_buffer(11, Some(&d.yg), 0);
+        enc.set_buffer(12, Some(&d.yr), 0);
+        enc.set_buffer(13, Some(&d.yk), 0);
+        enc.set_buffer(14, Some(&d.yv), 0);
+        setp(enc, base);
+        enc.dispatch_thread_groups(MTLSize::new(*tgs, 1, 1), MTLSize::new(128, 1, 1));
+    } else if !skip("proj") {
         mv(c, enc, &d.fbuf, &l.q, &d.x[0], 0, &d.yq, 0, n);
         mv(c, enc, &d.fbuf, &l.gate, &d.x[0], 0, &d.yg, 0, n);
         mv(c, enc, &d.fbuf, &l.rel, &d.x[0], 0, &d.yr, 0, n);
@@ -815,13 +950,55 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
         setp(enc, &ip);
         grid(enc, (rows as u64).div_ceil(8), nu, 1, 256);
     };
-    fmv(&l.sink, cfg.nh, &d.x[0], &d.sk);
     let full = l.dk.is_some();
-    if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
-        fmv(wk, cfg.nkv * 4, &d.x[xk], &d.dkb);
-        fmv(wv, cfg.nkv * 4, &d.x[xv], &d.dvb);
+    if fuse {
+        // the sinks and the per-token taps in one launch
+        let kr = if full { (cfg.nkv * 4) as u32 } else { 0 };
+        let rr: [u32; 4] = [cfg.nh as u32, kr, kr, 0];
+        enc.set_compute_pipeline_state(&p.fmv3);
+        enc.set_buffer(0, Some(&l.sink), 0);
+        enc.set_buffer(1, Some(&d.x[0]), 0);
+        enc.set_buffer(2, Some(&d.sk), 0);
+        enc.set_buffer(3, Some(l.dk.as_ref().unwrap_or(&d.dummy)), 0);
+        enc.set_buffer(4, Some(&d.x[xk]), 0);
+        enc.set_buffer(5, Some(&d.dkb), 0);
+        enc.set_buffer(6, Some(l.dv.as_ref().unwrap_or(&d.dummy)), 0);
+        enc.set_buffer(7, Some(&d.x[xv]), 0);
+        enc.set_buffer(8, Some(&d.dvb), 0);
+        set_bytes_t(enc, 9, &rr);
+        setp(enc, base);
+        grid(enc, ((cfg.nh as u32 + 2 * kr) as u64).div_ceil(8), nu, 1, 256);
+    } else {
+        fmv(&l.sink, cfg.nh, &d.x[0], &d.sk);
+        if let (Some(wk), Some(wv)) = (&l.dk, &l.dv) {
+            fmv(wk, cfg.nkv * 4, &d.x[xk], &d.dkb);
+            fmv(wv, cfg.nkv * 4, &d.x[xv], &d.dvb);
+        }
     }
     // 5. queries and relative states; keys and values into the cache
+    // (fused: one launch, a full layer's log scale and per-token taps alike)
+    if fuse && l.sliding == l.dk.is_none() {
+        let mut ip = *base;
+        ip.full = full as u32;
+        ip.ring = s.ring as u32;
+        enc.set_compute_pipeline_state(&p.qrkv);
+        enc.set_buffer(0, Some(&d.yq), 0);
+        enc.set_buffer(1, Some(&d.yr), 0);
+        enc.set_buffer(2, Some(&l.q_scale), 0);
+        enc.set_buffer(3, Some(&l.rel_scale), 0);
+        enc.set_buffer(4, Some(&d.yk), 0);
+        enc.set_buffer(5, Some(&d.yv), 0);
+        enc.set_buffer(6, Some(if full { &d.dkb } else { &d.dummy }), 0);
+        enc.set_buffer(7, Some(if full { &d.dvb } else { &d.dummy }), 0);
+        enc.set_buffer(8, Some(&l.tk), 0);
+        enc.set_buffer(9, Some(&l.tv), 0);
+        enc.set_buffer(10, Some(&s.rings[0]), 0);
+        enc.set_buffer(11, Some(&s.rings[1]), 0);
+        enc.set_buffer(12, Some(&s.k), 0);
+        enc.set_buffer(13, Some(&s.v), 0);
+        setp(enc, &ip);
+        enc.dispatch_thread_groups(MTLSize::new((cfg.nh * n + 2 * cfg.nkv) as u64, 1, 1), MTLSize::new(cfg.hd as u64, 1, 1));
+    } else {
     let mut ip = *base;
     ip.full = (!l.sliding) as u32;
     enc.set_compute_pipeline_state(&p.qr);
@@ -847,7 +1024,8 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     enc.set_buffer(9, Some(&s.v), 0);
     setp(enc, &ip);
     enc.dispatch_thread_groups(MTLSize::new(cfg.nkv as u64, 2, 1), MTLSize::new(cfg.hd as u64, 1, 1));
-    // 6. the attention, its gate, the O projection
+    }
+    // 6. the attention, its gate, the O projection (fused: the gate in the attention's epilogue)
     let mut ip = *base;
     ip.ring = s.ring as u32;
     ip.win = if s.ring > 0 { cfg.window as u32 } else { 0 };
@@ -860,16 +1038,30 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     enc.set_buffer(4, Some(&s.k), 0);
     enc.set_buffer(5, Some(&s.v), 0);
     enc.set_buffer(6, Some(&d.att), 0);
+    // a prompt call: the flash kernel on the simdgroup matrices (the gate after it)
+    let flash = n > 1 && flash_on() && cfg.hd == 128 && cfg.d_rel <= 32;
+    let gated = fuse && !flash;
+    enc.set_buffer(7, Some(if gated { &d.yg } else { &d.dummy }), 0);
+    if gated {
+        ip.v = 1;
+    }
     setp(enc, &ip);
     if !skip("attn") {
-        grid(enc, cfg.nh as u64, nu, 1, 256);
+        if flash {
+            enc.set_compute_pipeline_state(&p.attn_fl);
+            grid(enc, nu.div_ceil(32), cfg.nh as u64, 1, 128);
+        } else {
+            grid(enc, cfg.nh as u64, nu, 1, 256);
+        }
     }
     let qs = cfg.nh * cfg.hd;
-    enc.set_compute_pipeline_state(&p.ogate);
-    enc.set_buffer(0, Some(&d.att), 0);
-    enc.set_buffer(1, Some(&d.yg), 0);
-    setp(enc, base);
-    grid(enc, (qs as u64).div_ceil(256), nu, 1, 256);
+    if !gated {
+        enc.set_compute_pipeline_state(&p.ogate);
+        enc.set_buffer(0, Some(&d.att), 0);
+        enc.set_buffer(1, Some(&d.yg), 0);
+        setp(enc, base);
+        grid(enc, (qs as u64).div_ceil(256), nu, 1, 256);
+    }
     if !skip("o") {
         mv(c, enc, &d.fbuf, &l.o, &d.att, 0, &d.ya, 0, n);
     }
@@ -896,6 +1088,13 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
     enc.set_buffer(1, Some(&d.r), 0);
     enc.set_buffer(2, Some(&l.mq), 0);
     enc.set_buffer(3, Some(&d.m), 0);
+    // fused, no gate: the MoE input's norm in the mix
+    let mnorm = fuse && gates.is_none();
+    if mnorm {
+        ip.v = 1;
+        enc.set_buffer(4, Some(&l.post_norm), 0);
+        enc.set_buffer(5, Some(&d.xm), 0);
+    }
     setp(enc, &ip);
     grid(enc, 1, nu, 1, 256);
     let mut mi: (&Buffer, u64) = (&d.m, 0);
@@ -905,12 +1104,14 @@ fn app(c: &Ctx, p: &Pipes, d: &Dev, cfg: &Cfg, enc: &ComputeCommandEncoderRef, l
         }
         mi = (&d.mg, 0);
     }
-    enc.set_compute_pipeline_state(&p.rms);
-    enc.set_buffer(0, Some(mi.0), mi.1);
-    enc.set_buffer(1, Some(&l.post_norm), 0);
-    enc.set_buffer(2, Some(&d.xm), 0);
-    setp(enc, base);
-    grid(enc, nu, 1, 1, 256);
+    if !mnorm {
+        enc.set_compute_pipeline_state(&p.rms);
+        enc.set_buffer(0, Some(mi.0), mi.1);
+        enc.set_buffer(1, Some(&l.post_norm), 0);
+        enc.set_buffer(2, Some(&d.xm), 0);
+        setp(enc, base);
+        grid(enc, nu, 1, 1, 256);
+    }
     // 9. the routed experts into y
     let mut ip = *base;
     ip.e = l.e as u32;

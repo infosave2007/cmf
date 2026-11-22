@@ -832,27 +832,37 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 #if NPL != 2
 #error "the tensor-core tiles take two bf16 planes"
 #endif
-template <int NT, int TB, int KS, int KD>
+template <int NT, int TB, int KS, int KD, bool PF = false>
 __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njobs, const u16* __restrict__ x0,
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
-                                         int nrows_in, int cols)
+                                         int nrows_in, int cols, int vb = -1)
 {
-    __shared__ float2 par_s[16 * TB];
+    // the block's place in the launch (a resident grid's turn: `vb`)
+    const int bid = vb >= 0 ? vb : (int)blockIdx.x;
     __shared__ float part[KS][TB][NT][32][2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    // the block's job: a binary search of the first blocks (a MoE launch has
-    // a hundred slots and more, where a scan was a hundred dependent loads)
-    int jx = 0, jhi = njobs - 1;
-    while (jx < jhi) {
-        const int mid = (jx + jhi + 1) >> 1;
-        if ((int)blockIdx.x >= jobs[mid].blk0) jx = mid;
-        else jhi = mid - 1;
+    // the block's job: the last whose first block is at most this one — up
+    // to 32 jobs one load a lane and a ballot, else a binary search (a MoE
+    // launch has a hundred slots and more, where a scan was a hundred
+    // dependent loads)
+    int jx = 0;
+    if (njobs <= 32) {
+        const int b0 = lane < njobs ? jobs[lane].blk0 : 0x7fffffff;
+        const unsigned m = __ballot_sync(FULL, b0 <= bid);
+        jx = m ? 31 - __clz(m) : 0;
+    } else {
+        int jhi = njobs - 1;
+        while (jx < jhi) {
+            const int mid = (jx + jhi + 1) >> 1;
+            if (bid >= jobs[mid].blk0) jx = mid;
+            else jhi = mid - 1;
+        }
     }
     const HyJob jb = jobs[jx];
     // an empty job (a dead MoE slot, a grouped launch's spare) has no blocks' work
     if (jb.rows <= 0) return;
     const int nrows = jb.nr > 0 ? min(nrows_in, jb.nr) : nrows_in;
-    const int tile0 = ((int)blockIdx.x - jb.blk0) * TB;
+    const int tile0 = (bid - jb.blk0) * TB;
     const int rows = jb.rows;
     const int ntile = (rows + 15) >> 4;
     // kind 5: int8 tiles, a row's scale its one number (aux1), the column
@@ -875,18 +885,46 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const bool q2a = q2 && kk == 9;
     // kind 10: q4_tiled tiles (a lane's 16 nibbles), a (row, group)'s f16 scale in aux0
     const bool q4g = KD ? KD == 10 : kk == 10;
-    // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
-    for (int i = tid; i < 16 * TB; i += blockDim.x) {
-        const int rr = tile0 * 16 + i;
-        par_s[i] = (rr >= rows || q1 || q1t || q4g) ? make_float2(0.0f, 0.0f)
-                   : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
-                                      : ((const float2*)jb.aux1)[rr];
-    }
-    __syncthreads();
     const int gid = lane >> 2, tig = lane & 3;
+    // a row's ladder is exp2(lo + code * step): its two numbers, not its 32
+    // rungs — a lane's two rows of each tile, read once into registers
+    float2 lad[TB][2];
+#pragma unroll
+    for (int b = 0; b < TB; b++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int rr = (tile0 + b) * 16 + gid + 8 * h;
+            lad[b][h] = (rr >= rows || q1 || q1t || q4g) ? make_float2(0.0f, 0.0f)
+                        : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
+                                           : ((const float2*)jb.aux1)[rr];
+        }
     const int gpr = cols >> 5;
     const int per = (gpr + KS - 1) / KS;
     const int g0 = min(gpr, warp * per), g1 = min(gpr, g0 + per);
+#ifndef MMP_PF2
+#define MMP_PF2 0
+#endif
+    if (PF || (MMP_PF2 && KD && NT == 1)) {
+        // the warp's weight words into L2 at once (requests in flight without
+        // registers); a launch whose jobs and weights are fixed (PF) does it
+        // while the predecessor runs (programmatic dependent launch), then
+        // waits for the input rows it writes
+        const int gb = KD == 5 ? 512 : (KD == 1 || KD == 2) ? 128 : KD == 3 ? 64 : 256;
+#pragma unroll
+        for (int b = 0; b < TB; b++) {
+            const int tile = tile0 + b;
+            if (tile >= ntile || g1 <= g0) continue;
+            const char* base = (const char*)jb.w + ((size_t)tile * gpr + g0) * gb;
+            const int lines = ((g1 - g0) * gb + 127) >> 7;
+            for (int q = lane; q < lines; q += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(base + ((size_t)q << 7)));
+        }
+#if __CUDA_ARCH__ >= 900
+        if (PF) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;");
+        }
+#endif
+    }
     float acc[TB][NT][2];
 #pragma unroll
     for (int b = 0; b < TB; b++)
@@ -897,8 +935,58 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     // UG groups' weight words and scales are read before any of them is
     // used (one codec's decode-row loop: q1 86 -> 80 us; the all-codec loop
     // ran slower with it); the arithmetic is the one-group loop's.
-    constexpr int UG = (KD && NT == 1) ? 2 : 1;
-    for (int gb = g0; gb < g1; gb += UG) {
+#ifndef MMP_UG
+#define MMP_UG 2
+#endif
+#ifndef MMP_PIPE
+#define MMP_PIPE 0
+#endif
+    constexpr int UG = (KD && NT == 1) ? MMP_UG : 1;
+    constexpr bool PIPE = MMP_PIPE && KD == 6 && NT == 1 && TB == 1;
+    if (PIPE) {
+        // a decode row's q4tp loop, software-pipelined: group g + 1's weight
+        // words, rung codes and input pairs are in flight while group g is
+        // summed (a warp issues in order); the one-group loop's arithmetic
+        if (tile0 < ntile && g0 < g1) {
+            const size_t tb0 = (size_t)tile0 * gpr;
+            const float2 pa = lad[0][0], pb = lad[0][1];
+            const int j = gid >> 1;
+            const bool jin = j < nrows;
+            const u16* xp = (gid & 1) ? x1 : x0;
+            const size_t xo0 = (size_t)jb.xoff + (size_t)j * xstride + 2 * tig;
+            uint2 Xn = T[(tb0 + g0) * 32 + lane];
+            int can = Cc[(tb0 + g0) * 16 + gid], cbn = Cc[(tb0 + g0) * 16 + gid + 8];
+            u32 bn[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) bn[q] = jin ? *(const u32*)(xp + xo0 + g0 * 32 + 8 * q) : 0u;
+            for (int g = g0; g < g1; g++) {
+                const uint2 X = Xn;
+                const int ca = can, cb = cbn;
+                u32 bx0[4];
+#pragma unroll
+                for (int q = 0; q < 4; q++) bx0[q] = bn[q];
+                if (g + 1 < g1) {
+                    Xn = T[(tb0 + g + 1) * 32 + lane];
+                    can = Cc[(tb0 + g + 1) * 16 + gid];
+                    cbn = Cc[(tb0 + g + 1) * 16 + gid + 8];
+#pragma unroll
+                    for (int q = 0; q < 4; q++) bn[q] = jin ? *(const u32*)(xp + xo0 + (g + 1) * 32 + 8 * q) : 0u;
+                }
+                const float sa = exp2f(fmaf((float)ca, pa.y, pa.x));
+                const float sb = exp2f(fmaf((float)cb, pb.y, pb.x));
+                const u32 a00 = a_reg(X.x, 0), a01 = a_reg(X.x, 1), a02 = a_reg(X.x, 2), a03 = a_reg(X.x, 3);
+                const u32 a10 = a_reg(X.y, 0), a11 = a_reg(X.y, 1), a12 = a_reg(X.y, 2), a13 = a_reg(X.y, 3);
+                if (nrows > 0) {
+                    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816(c, a00, a01, a02, a03, bx0[0], bx0[1]);
+                    mma16816(c, a10, a11, a12, a13, bx0[2], bx0[3]);
+                    acc[0][0][0] = fmaf(sa, __fadd_rn(c[0], c[1]), acc[0][0][0]);
+                    acc[0][0][1] = fmaf(sb, __fadd_rn(c[2], c[3]), acc[0][0][1]);
+                }
+            }
+        }
+    }
+    for (int gb = PIPE ? g1 : g0; gb < g1; gb += UG) {
         u32 wx[UG][TB][4];
         float wsa[UG][TB], wsb[UG][TB];
 #pragma unroll
@@ -919,7 +1007,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                     wsb[u][b] = h2f(S1[gid + 8]);
                 } else if (q2) {
                     wx[u][b][0] = ((const u32*)jb.w)[tg * 32 + lane];
-                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    const float2 pa = lad[b][0], pb = lad[b][1];
                     const int ca = Cc[tg * 16 + gid], cb = Cc[tg * 16 + gid + 8];
                     const float half = q2a ? 1.0f : 0.5f;
                     wsa[u][b] = ca ? half * exp2f(fmaf((float)(ca - 1), pa.y, pa.x)) : 0.0f;
@@ -935,11 +1023,11 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                     wx[u][b][1] = X8.y;
                     wx[u][b][2] = X8.z;
                     wx[u][b][3] = X8.w;
-                    wsa[u][b] = par_s[b * 16 + gid].x;
-                    wsb[u][b] = par_s[b * 16 + gid + 8].x;
+                    wsa[u][b] = lad[b][0].x;
+                    wsb[u][b] = lad[b][1].x;
                 } else {
                     const uint2 X = T[tg * 32 + lane];
-                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    const float2 pa = lad[b][0], pb = lad[b][1];
                     wx[u][b][0] = X.x;
                     wx[u][b][1] = X.y;
                     wsa[u][b] = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
@@ -1111,6 +1199,33 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     }
 #define MMPK3(TB, KS, KD) MMPK(1, TB, KS, KD) MMPK(2, TB, KS, KD) MMPK(4, TB, KS, KD)
 #define MMPK4(KD) MMPK3(1, 8, KD) MMPK3(2, 8, KD) MMPK3(1, 16, KD) MMPK3(2, 16, KD)
+// a decode row's launch of fixed jobs (a matrix set): its weights prefetched
+// before the programmatic-dependent-launch wait (`mmp_body`'s PF)
+#define MMPKP(KS, KD)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(32 * KS) hy_mmpkp_1_1_##KS##_##KD(                             \
+        const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
+        const u16* __restrict__ x2, int xstride, int n, int cols)                                               \
+    {                                                                                                           \
+        mmp_body<1, 1, KS, KD, true>(j, nj, x0, x1, x2, xstride, n, cols);                                      \
+    }
+MMPKP(8, 6) MMPKP(16, 6) MMPKP(8, 5) MMPKP(16, 5)
+// a narrow matrix's decode row (fewer tiles than multiprocessors): 32 warps a
+// tile, fewer groups a warp
+MMPKP(32, 6) MMPK(1, 1, 32, 6) MMPK(2, 1, 32, 6) MMPK(4, 1, 32, 6)
+// a decode row's launch as a resident grid: the blocks take the launch's
+// `nblk` places in turn (no partial last wave)
+#define MMPKG(KS, KD)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(32 * KS) hy_mmpkg_1_1_##KS##_##KD(                             \
+        const HyJob* __restrict__ j, int nj, const u16* __restrict__ x0, const u16* __restrict__ x1,              \
+        const u16* __restrict__ x2, int xstride, int n, int cols, int nblk)                                     \
+    {                                                                                                           \
+        PDL_PRO();                                                                                              \
+        for (int vb = blockIdx.x; vb < nblk; vb += gridDim.x) {                                                 \
+            mmp_body<1, 1, KS, KD>(j, nj, x0, x1, x2, xstride, n, cols, vb);                                    \
+            __syncthreads();                                                                                    \
+        }                                                                                                       \
+    }
+MMPKG(16, 6) MMPKG(16, 5)
 MMPK4(6)
 MMPK4(5)
 MMPK4(3)
@@ -2544,6 +2659,145 @@ extern "C" __global__ void hy_moe_select(const float* __restrict__ logits, const
     }
 }
 
+// A router row against an input row, a block (thread 0 gets the sum): float4
+// loads, a lane's sum, the warps' in order. `hy_moe_route1` and
+// `hy_moe_router4` share it, so a decode row and a verify call's rows get
+// the same logits.
+__device__ __forceinline__ float rdot_block(const float* __restrict__ w, const float* __restrict__ x, int hidden,
+                                            float* rpart)
+{
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nwp = blockDim.x >> 5;
+    const float4* w4 = (const float4*)w;
+    const float4* x4 = (const float4*)x;
+    const int h4 = hidden >> 2;
+    float a = 0.0f;
+    // up to 8 float4s a thread, every load issued before the first sum (a warp
+    // issues in order); the sum's order is the loop's
+    int i0 = threadIdx.x;
+    for (; i0 < h4; i0 += 8 * blockDim.x) {
+        float4 u[8], v[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = i0 + k * blockDim.x;
+            if (i < h4) {
+                u[k] = w4[i];
+                v[k] = x4[i];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            if (i0 + k * blockDim.x >= h4) break;
+            a = fmaf(u[k].x, v[k].x, a);
+            a = fmaf(u[k].y, v[k].y, a);
+            a = fmaf(u[k].z, v[k].z, a);
+            a = fmaf(u[k].w, v[k].w, a);
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
+    if (lane == 0) rpart[wp] = a;
+    __syncthreads();
+    float t = 0.0f;
+    if (threadIdx.x == 0)
+        for (int q = 0; q < nwp; q++) t += rpart[q];
+    __syncthreads();
+    return t;
+}
+
+// logits[r][e] = Wr[e] · xn[r] a block a (router row, input row): the
+// decode route's arithmetic (`rdot_block`). Grid (E, n), 128 threads.
+extern "C" __global__ void hy_moe_router4(const float* __restrict__ xn, const float* __restrict__ Wr,
+                                          float* __restrict__ logits, int E, int hidden)
+{
+    PDL_PRO();
+    __shared__ float rpart[32];
+    const int e = blockIdx.x, r = blockIdx.y;
+    const float t = rdot_block(Wr + (size_t)e * hidden, xn + (size_t)r * hidden, hidden, rpart);
+    if (threadIdx.x == 0) logits[(size_t)r * E + e] = t;
+}
+
+// A decode row's router and selection in one launch (`hy_moe_router` with no
+// shared gate, then `hy_moe_select`'s sigmoid path: flags bits 0, 2, 5; E <=
+// 256 experts, k <= 32 picks, S == k slots): a block a router row; the last
+// block to finish picks the top k by warp-wide argmax (the larger key first,
+// the smaller expert on a tie: the select's order), writes the weights, lays
+// out the slots' jobs and re-arms the counter. Grid E, 128-256 threads.
+extern "C" __global__ void __launch_bounds__(256) hy_moe_route1(const float* __restrict__ xn, const float* __restrict__ Wr,
+        float* __restrict__ logits, int E, int hidden, const float* __restrict__ bias, int k, int flags, float route_scale,
+        const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t, HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a,
+        float* __restrict__ wsel, int S, u64 qq0, u64 qq1, int pstride, u64 dnS, int bpj_gu, int bpj_dn,
+        unsigned* __restrict__ counter)
+{
+    PDL_PRO();
+    __shared__ int pick[32];
+    __shared__ float pw[32];
+    __shared__ int last;
+    __shared__ float rpart[32];
+    // a block a router row (`hy_moe_router4`'s arithmetic)
+    for (int e = blockIdx.x; e < E; e += gridDim.x) {
+        const float t = rdot_block(Wr + (size_t)e * hidden, xn, hidden, rpart);
+        if (threadIdx.x == 0) logits[e] = t;
+    }
+    // only thread 0 wrote: its fence, its count
+    if (threadIdx.x == 0) {
+        __threadfence();
+        last = atomicAdd(counter, 1u) == gridDim.x - 1;
+        if (last) __threadfence();
+    }
+    __syncthreads();
+    if (!last) return;
+    // the picks by rank, every expert a thread (E <= blockDim): its key's
+    // place among all keys (a larger key first, the smaller expert on a
+    // tie: the argmax order), in parallel instead of k argmax rounds
+    __shared__ float keys[256];
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        float kk = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
+        if ((flags & 4) && bias) kk += bias[e];
+        keys[e] = kk;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        const float ke = keys[e];
+        int rank = 0;
+#pragma unroll 8
+        for (int q = 0; q < E; q++) {
+            const float kq = keys[q];
+            rank += (kq > ke || (kq == ke && q < e)) ? 1 : 0;
+        }
+        if (rank < k) {
+            pick[rank] = e;
+            pw[rank] = 1.0f / (1.0f + expf(-__ldcg(logits + e)));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int j = 0; j < k; j++) tot += pw[j];
+        const float dn = tot + ((flags & 32) ? 1e-20f : 1e-6f);
+        for (int j = 0; j < k; j++) {
+            float w = pw[j];
+            if (flags & 1) w = w / dn;
+            wsel[j] = w * route_scale;
+        }
+        *counter = 0u;
+    }
+    for (int s = threadIdx.x; s < S; s += blockDim.x) {
+        HyJob g = gu_t[pick[s]];
+        HyJob d = dn_t[pick[s]];
+        g.y = qq0 + (u64)s * pstride * 2;
+        g.res = qq1 + (u64)s * pstride * 2;
+        g.ystride = pstride;
+        g.blk0 = s * bpj_gu;
+        g.xoff = 0;
+        d.y = dnS + (u64)s * hidden * 4;
+        d.res = 0;
+        d.ystride = hidden;
+        d.blk0 = s * bpj_dn;
+        d.xoff = s * pstride;
+        gu_a[s] = g;
+        dn_a[s] = d;
+    }
+}
+
 // Hy4-flash's compact slots (a prompt chunk of the small path): every slot
 // takes only the rows routed to it, `nr` of them in a row block of its own,
 // instead of all `n` rows of the call with zero weights for the others. The
@@ -2815,6 +3069,107 @@ extern "C" __global__ void hy_moe_group(const int* __restrict__ pidx, int nk, in
             }
             p += __popc(b);
         }
+    }
+    for (int e = tid; e < E; e += blockDim.x) {
+        const int c = cnt[e];
+        for (int ps = 0; ps * rmax < c; ps++) {
+            const int j = jb0[e] + ps;
+            if (j >= jmax) break;
+            const int r0 = off[e] + ps * rmax, nr = min(rmax, c - ps * rmax);
+            HyJob g = gu_t[e];
+            g.y = qq0 + (u64)r0 * inter_s * 2;
+            g.res = qq1 + (u64)r0 * inter_s * 2;
+            g.ystride = inter_s;
+            g.blk0 = j * bpj_gu;
+            g.xoff = r0 * hidden;
+            g.nr = nr;
+            HyJob d = dn_t[e];
+            d.y = ys + (u64)r0 * hidden * 4;
+            d.res = 0;
+            d.ystride = hidden;
+            d.blk0 = j * bpj_dn;
+            d.xoff = r0 * inter_s;
+            d.nr = nr;
+            gu_a[j] = g;
+            dn_a[j] = d;
+        }
+    }
+    for (int j = njobs + tid; j < jmax; j += blockDim.x) {
+        HyJob g = gu_t[0], d = dn_t[0];
+        g.rows = 0;
+        d.rows = 0;
+        g.blk0 = j * bpj_gu;
+        d.blk0 = j * bpj_dn;
+        g.nr = 0;
+        d.nr = 0;
+        gu_a[j] = g;
+        dn_a[j] = d;
+    }
+}
+
+// `hy_moe_group` for E <= 256 experts, in parallel: every warp counts a
+// contiguous share of the entries, the counts' prefix over the warps gives
+// each warp its places within an expert, and a warp places its share 32
+// entries at a time (a match of equal experts ranks them) — the same order
+// (an expert's entries in entry order), the same places and jobs.
+extern "C" __global__ void __launch_bounds__(1024) hy_moe_group2(const int* __restrict__ pidx, int nk, int k, int E, int rmax, int jmax,
+                                        const HyJob* __restrict__ gu_t, const HyJob* __restrict__ dn_t,
+                                        HyJob* __restrict__ gu_a, HyJob* __restrict__ dn_a, int* __restrict__ pos,
+                                        int* __restrict__ src, u64 qq0, u64 qq1, int hidden, int inter_s, u64 ys,
+                                        int bpj_gu, int bpj_dn)
+{
+    PDL_PRO();
+    __shared__ int hist[32][256];
+    __shared__ int cnt[256], off[256], jb0[256];
+    __shared__ int njobs;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, NW = blockDim.x >> 5;
+    const int chunk = (nk + NW - 1) / NW;
+    const int a = min(nk, warp * chunk), z = min(nk, a + chunk);
+    for (int e = lane; e < E; e += 32) hist[warp][e] = 0;
+    __syncwarp();
+    for (int i = a + lane; i < z; i += 32) {
+        const int e = pidx[i];
+        if ((unsigned)e < (unsigned)E) atomicAdd(&hist[warp][e], 1);
+    }
+    __syncthreads();
+    if (tid < E) {
+        int c = 0;
+        for (int w = 0; w < NW; w++) {
+            const int h = hist[w][tid];
+            hist[w][tid] = c;
+            c += h;
+        }
+        cnt[tid] = c;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int o = 0, j = 0;
+        for (int e = 0; e < E; e++) {
+            off[e] = o;
+            jb0[e] = j;
+            o += cnt[e];
+            j += (cnt[e] + rmax - 1) / rmax;
+        }
+        njobs = min(j, jmax);
+    }
+    __syncthreads();
+    if (tid < E)
+        for (int w = 0; w < NW; w++) hist[w][tid] += off[tid];
+    __syncthreads();
+    for (int b = a; b < z; b += 32) {
+        const int i = b + lane;
+        const int pe = i < z ? pidx[i] : -1;
+        const bool v = (unsigned)pe < (unsigned)E;
+        const int e = v ? pe : -1 - lane;
+        const unsigned m = __match_any_sync(FULL, e);
+        if (v) {
+            const int q = hist[warp][e] + __popc(m & ((1u << lane) - 1u));
+            pos[i] = q;
+            src[q] = i / k;
+        }
+        __syncwarp();
+        if (v && lane == __ffs(m) - 1) hist[warp][e] += __popc(m);
+        __syncwarp();
     }
     for (int e = tid; e < E; e += blockDim.x) {
         const int c = cnt[e];

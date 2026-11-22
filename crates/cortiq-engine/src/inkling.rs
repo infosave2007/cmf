@@ -1308,6 +1308,11 @@ impl SpecPolicy {
     }
 
     fn plan(&mut self) -> usize {
+        // plain decoding timed for itself once the depth in use is: its price
+        // is not scaled from a verify's (the card's one-row path is its own)
+        if self.seen[0] < 2 && self.seen[self.k] >= 2 {
+            return 0;
+        }
         let mut rate = [0f32; 8];
         let (mut tokens, mut reach) = (1.0f32, 1.0f32);
         for k in 0..8usize {
@@ -1476,6 +1481,9 @@ mod tests {
         p.wall[3] = 28.4;
         p.seen[3] = 2;
         assert!((p.price(0).unwrap() - 28.4 / 1.54).abs() < 1e-3);
+        // with the depth in use timed, plain decoding is timed for itself next
+        assert_eq!(p.plan(), 0);
+        assert_eq!(p.k, 3);
     }
 
     #[test]
