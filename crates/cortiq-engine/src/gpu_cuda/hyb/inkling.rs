@@ -200,6 +200,8 @@ struct LayerD {
     q_scale: Buf,
     rel_scale: Buf,
     rel_table: Buf,
+    /// The table as `ink_attn_flash` reads its bands: [E][hi, lo][DR] bf16
+    rel_tb: Buf,
     extent: usize,
     tk: Buf,
     tv: Buf,
@@ -507,6 +509,27 @@ pub(crate) fn admits(g: &Globals, layers: &[Layer], cfg: &Cfg) -> bool {
         })
 }
 
+/// The relative table [DR][E] f32 as [E][2][DR] bf16: each distance's row
+/// split into a high and a low part (round to nearest even, as `f2bf`).
+fn rel_band(t: &[f32], dr: usize) -> Vec<u16> {
+    let bf = |x: f32| -> u16 {
+        let b = x.to_bits();
+        ((b.wrapping_add(0x7FFF + ((b >> 16) & 1))) >> 16) as u16
+    };
+    let e = t.len() / dr.max(1);
+    let mut out = vec![0u16; e * 2 * dr];
+    for d in 0..e {
+        for j in 0..dr {
+            let x = t[j * e + d];
+            let hi = bf(x);
+            let lo = bf(x - f32::from_bits((hi as u32) << 16));
+            out[(d * 2) * dr + j] = hi;
+            out[(d * 2 + 1) * dr + j] = lo;
+        }
+    }
+    out
+}
+
 fn f32b(v: &[f32]) -> Res<Buf> {
     Buf::from_slice(v)
 }
@@ -661,6 +684,7 @@ fn build(c: &Ctx, st: &mut State, g: &Globals, layers: &[Layer], cfg: &Cfg) -> R
             q_scale: f32b(&a.q_scale)?,
             rel_scale: f32b(&a.rel_scale)?,
             rel_table: f32b(&a.rel_table)?,
+            rel_tb: Buf::from_slice(&rel_band(&a.rel_table, dr))?,
             extent: a.rel_table.len() / dr,
             tk: f32b(&a.k_conv.taps)?,
             tv: f32b(&a.v_conv.taps)?,
@@ -1955,7 +1979,7 @@ unsafe fn app_big(c: &Ctx, d: &Dev, b: &Big, cfg: &Cfg, l: &LayerD, s: &SlotD, l
             // the queries as f16 rows, then the flash kernel (no scores stored)
             let (tot_i, n_i, ring_i) = ((n * nh * hd) as i32, n as i32, s.ring as i32);
             c.launch(f.f16, ((n * nh * hd).div_ceil(256) as u32, 1), 256, 0, kargs!(d.yq.ptr, b.q16.ptr, tot_i))?;
-            c.launch(f.attn_flash, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(b.q16.ptr, d.yr.ptr, d.sk.ptr, l.rel_table.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, n_i, d.cr.ptr, d.att.ptr))?;
+            c.launch(f.attn_flash, (n.div_ceil(64) as u32, nh as u32), 128, 0, kargs!(b.q16.ptr, d.yr.ptr, d.sk.ptr, l.rel_tb.ptr, ext, s.k.ptr, s.v.ptr, ring_i, win, scale, n_i, d.cr.ptr, d.att.ptr))?;
         } else if attn_gemm_on() {
             attn_gemm(c, d, b, cfg, l, s, n, ext, win, scale)?;
         } else {

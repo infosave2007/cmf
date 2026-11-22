@@ -1971,7 +1971,7 @@ __device__ __forceinline__ void mma16816b(float* c, u32 a0, u32 a1, u32 a2, u32 
 // [n][NH·HD]. Grid (ceil(n / 64), NH), 128 threads.
 #define FT 64
 extern "C" __global__ void __launch_bounds__(128) ink_attn_flash(const u16* __restrict__ q16, const float* __restrict__ yr,
-                                                                const float* __restrict__ sinks, const float* __restrict__ table,
+                                                                const float* __restrict__ sinks, const u16* __restrict__ tband,
                                                                 int E, const u16* __restrict__ kc, const u16* __restrict__ vc,
                                                                 int ring, int win, float scale, int n,
                                                                 const int* __restrict__ cr, float* __restrict__ out)
@@ -2027,28 +2027,45 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_flash(const u16* __re
     float ma = -3.0e38f, mb = -3.0e38f, la = 0.0f, lb = 0.0f;
     const int pfirst = win > 0 ? max(0, pos0 + rb0 + 1 - win) : 0, pend = pos0 + rlast;
     for (int p0 = pfirst; p0 <= pend; p0 += FT) {
+        // the keys by cp.async (zero past the block's last row), the values
+        // through registers (transposed), the band's rows of the bf16 table
         for (int t = tid; t < FT * (HD / 8); t += blockDim.x) {
             const int key = t / (HD / 8), c8 = t % (HD / 8), p = p0 + key;
-            uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = kv;
+            const int slot = p <= pend ? (ring > 0 ? p % ring : p) : 0;
+            cp16(&Ks[key][c8 * 8], kc + (size_t)slot * C + g * HD + c8 * 8, p <= pend);
+        }
+        cp_commit();
+        // the band: column c is the distance pos0 + rb0 - p0 - 63 + c
+        const int db = pos0 + rb0 - p0 - (FT - 1);
+        uint4 tv[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int t = tid + u * 128, c = t >> 2, pl = (t >> 1) & 1, hf = t & 1, dd = db + c;
+            tv[u] = (dd >= 0 && dd < E) ? *(const uint4*)(tband + ((size_t)dd * 2 + pl) * DR + hf * 8) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        uint4 vq[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int t = tid + u * 128, key = t / (HD / 8), c8 = t % (HD / 8), p = p0 + key;
+            vq[u] = make_uint4(0u, 0u, 0u, 0u);
             if (p <= pend) {
                 const int slot = ring > 0 ? p % ring : p;
-                kv = *(const uint4*)(kc + (size_t)slot * C + g * HD + c8 * 8);
-                vv = *(const uint4*)(vc + (size_t)slot * C + g * HD + c8 * 8);
+                vq[u] = *(const uint4*)(vc + (size_t)slot * C + g * HD + c8 * 8);
             }
-            *(uint4*)&Ks[key][c8 * 8] = kv;
-            const u16* vh = (const u16*)&vv;
+        }
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int t = tid + u * 128, c = t >> 2, pl = (t >> 1) & 1, hf = t & 1;
+            *(uint4*)&Tb[pl][c][hf * 8] = tv[u];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int t = tid + u * 128, key = t / (HD / 8), c8 = t % (HD / 8);
+            const u16* vh = (const u16*)&vq[u];
 #pragma unroll
             for (int i = 0; i < 8; i++) Vt[c8 * 8 + i][key] = vh[i];
         }
-        // the band: column c is the distance pos0 + rb0 - p0 - 63 + c
-        const int db = pos0 + rb0 - p0 - (FT - 1);
-        for (int t = tid; t < (FT + 64) * DR; t += blockDim.x) {
-            const int c = t / DR, j = t % DR, dd = db + c;
-            const float x = (dd >= 0 && dd < E) ? table[(size_t)j * E + dd] : 0.0f;
-            const u16 hi = f2bf(x);
-            Tb[0][c][j] = hi;
-            Tb[1][c][j] = f2bf(x - bf2f(hi));
-        }
+        cp_wait<0>();
         __syncthreads();
         float sc[8][4];
 #pragma unroll
