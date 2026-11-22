@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.14] — 2026-11-22
+
+### Changed
+- Metal, Inkling decode: the routed experts with every lane busy (`ink_moe_gu8`: halves of 16 lanes on four rows,
+  `ink_moe_dn8`: a pick a quarter of 8 lanes; the old kernels left a third of the lanes idle on gate/up and almost
+  half on down), the block mixes and message gates through one exchange (bit for bit the same), the router and the
+  small f32 matvecs on float4 loads. MacBook Air M4: 21.9 → 23.9 tok/s, the same greedy text. `CMF_INKLING_DEC8=0`
+  restores the old kernels; `CMF_INKLING_SKIP=attn,gates,proj,o,moe` leaves stages out to measure them.
+- CUDA, Inkling: programmatic dependent launch on sm_90+ (Hopper, Blackwell): every `ink_` and `hy_` kernel opens
+  with `griddepcontrol.wait` / `launch_dependents` (no-ops without the launch attribute), the arm's launches carry the
+  attribute. RTX PRO 6000 Blackwell: decode 122.7 → 127.6 tok/s, a 2 048-token prompt 7 354 → 7 751 tok/s, the same
+  greedy text. `CMF_INKLING_PDL=0|1` forces it.
+
 ## [0.9.13] — 2026-11-22
 
 ### Added
