@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.15] — 2026-11-22
+
 ### Changed
 - CUDA, Inkling (`inkling2_loop`) decode: the small kernels fused and every load issued before its sums —
   `ink_mix2` (a block mix in one exchange, its states in registers, the norm in its epilogue), three message gates a
