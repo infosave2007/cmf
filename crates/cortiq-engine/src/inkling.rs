@@ -1308,6 +1308,11 @@ impl SpecPolicy {
     }
 
     fn plan(&mut self) -> usize {
+        // plain decoding timed for itself once the depth in use is: its price
+        // is not scaled from a verify's (the card's one-row path is its own)
+        if self.seen[0] < 2 && self.seen[self.k] >= 2 {
+            return 0;
+        }
         let mut rate = [0f32; 8];
         let (mut tokens, mut reach) = (1.0f32, 1.0f32);
         for k in 0..8usize {
