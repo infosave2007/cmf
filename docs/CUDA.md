@@ -577,6 +577,39 @@ One RTX PRO 6000 Blackwell (96 GB); the wgpu column is the same card through Vul
 The held-out KL after the 0.8B's training is 1.4440 on CUDA and 1.4490 on wgpu; a conversion repeated on CUDA
 gives the same bytes.
 
+## Inkling on a card smaller than the file
+
+The 15.1 GB Inkling-2-Mini file takes about 14 GB of a card on CUDA. On a smaller one the build keeps the dense
+part, the head and the drafter on the card and places the routed experts by how often a token reads them: the 12
+loop layers (6–17) run three times a token, so their experts stay on the card first, and the layers before and
+after the loop go to mapped host memory, which the same kernels read over the bus. The last layer the card reaches
+keeps part of its experts. The hybrid arm spills in build order; here that would push loop layers out before the
+first layers. Past the weights the card keeps the K/V of every application, the row planes the build takes after
+them and a GiB for cuBLAS and the call graphs. The log says where everything went:
+
+```
+inkling2_loop on CUDA: 9.3 GB of weights on the card beside 0.87 GB of K/V and 2.06 GB kept for the calls,
+4.9 GB of routed experts (layers 3-5, 18-23) in mapped host memory, read over the bus; 81 % of a token's
+expert reads stay on the card
+```
+
+RTX 3060 (12 GB, PCIe 4.0 x16, limited to 120 W), Core i9-11900K, 64 GB, driver 580.178, CUDA 12.4 libraries,
+`CMF_MAX_SEQ=16384`, `cortiq bench --core --ignore-eos --ctx 4096 --tokens 8000`:
+
+| | |
+|---|---:|
+| prompt, 4 096 tokens | 1175 tok/s (3.5 s) |
+| decode, 8 000 tokens | 63.3 tok/s |
+| peak card memory | 11.2 GiB of 12 |
+| pinned host memory | 4.9 GB |
+| the same file on the host's CPU (`CMF_GPU=0`) | 7.2 tok/s |
+
+The same placement serves any card: `CMF_GPU_VRAM_MB` places as a smaller card would, `CMF_MAX_SEQ` sizes the
+K/V, `CMF_HYB_RESERVE_MB` names the room kept past the K/V instead of the planes and the GiB, `CMF_INKLING_ROWS`
+reads a prompt in fewer rows a call (more room for experts). A spill past three quarters of the host's room
+(`MemAvailable`, or a container's limit) is declined and the host runs the sequence, as is any spill under
+`CMF_HYB_HOST_EXPERTS=0`.
+
 ## Options
 
 | variable | meaning |
@@ -586,6 +619,9 @@ gives the same bytes.
 | `CMF_CUDA_PREC=fast\|tf32\|exact` | the prompt's precision, see above |
 | `CMF_CUDA_BATCH=N` | prompt rows per chunk, 1024 by default |
 | `CMF_GPU_VRAM_MB=N` | the weight budget instead of the card's memory less 2 GB |
+| `CMF_HYB_HOST_EXPERTS=0` | no routed experts in mapped host memory: a stack past the card runs on the host |
+| `CMF_HYB_RESERVE_MB=N` | the card's room kept past the weights (Inkling: past the K/V) |
+| `CMF_INKLING_ROWS=N` | an Inkling prompt's rows a call: 1024 below 24 GB, 2048 at 24 GB, 4096 at 40 GB |
 | `CMF_O1=off` | a turbo file with exact attention at any length |
 | `CMF_CUDA_PROF=1` | stage timers of the prompt and of a token, with a wait after each stage |
 | `CMF_CUDA_CACHE=DIR` | where compiled PTX is kept, `~/.cache/cortiq/cuda` by default |

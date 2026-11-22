@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CUDA, Inkling (`inkling2_loop`) on a card smaller than the file: the dense part, the head and the drafter stay on
+  the card and the routed experts are placed by how often a token reads them — the loop layers (applied `passes`
+  times a token) first — with the rest in mapped host memory, read by the same kernels over the bus
+  (`place_experts`). Past the weights the card keeps the K/V of every application, the row planes the build takes
+  after them and a GiB for cuBLAS and the call graphs. `CMF_GPU_VRAM_MB`, `CMF_HYB_RESERVE_MB`, `CMF_MAX_SEQ`,
+  `CMF_INKLING_ROWS` and `CMF_HYB_HOST_EXPERTS=0` steer it; a card that holds the whole stack builds as before.
+  RTX 3060 (12 GB): Inkling-2-Mini decodes at 63.3 tok/s and reads a 4 096-token prompt at 1175 tok/s with 4.9 GB of
+  experts in host memory, where the build used to decline the card (7.2 tok/s on the host's CPU).
+
 ### Fixed
 - Inkling: a DSpark round whose verify, rollback or row logits failed on the card handed the sequence to the host
   without its caches, and the next token read past a one-row cache and panicked (`inkling.rs:791`). Every path off
