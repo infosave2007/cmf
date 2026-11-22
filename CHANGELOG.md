@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1 × 16384 5.368). `CMF_INKLING_FLASH=0` brings back the cuBLAS attention.
 - DSpark's depth policy times plain decoding itself instead of scaling its price from a verify's with the L4's
   ratios (on the RTX PRO 6000 a story drafted at 197 against plain decoding's 215 tok/s).
+- Metal, Inkling: a decode call's stages fused — the five attention projections in one q4tp launch (`ink_mvq`, the
+  backend matvec's arithmetic), the sinks and per-token taps in one (`ink_fmv3`), qr with kv, the output gate in the
+  attention, the block mixes with their norms, the three message gates in two launches; a prompt call's attention as
+  a flash kernel on the simdgroup matrices (`ink_attn_fl`), whose perplexity is the CPU's (2 × 1024: 7.340 against
+  the CPU's 7.340; the old kernel 7.364). MacBook Air M4: decode 24.0 → 25.3 tok/s with the same greedy text, a
+  2 048-token prompt 136.6 → 152.1 tok/s. `CMF_INKLING_FUSE=0` / `CMF_INKLING_FLASH=0` restore the old launches.
 
 ## [0.9.14] — 2026-11-22
 
