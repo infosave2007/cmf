@@ -837,16 +837,24 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                                          const u16* __restrict__ x1, const u16* __restrict__ x2, int xstride,
                                          int nrows_in, int cols)
 {
-    __shared__ float2 par_s[16 * TB];
     __shared__ float part[KS][TB][NT][32][2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    // the block's job: a binary search of the first blocks (a MoE launch has
-    // a hundred slots and more, where a scan was a hundred dependent loads)
-    int jx = 0, jhi = njobs - 1;
-    while (jx < jhi) {
-        const int mid = (jx + jhi + 1) >> 1;
-        if ((int)blockIdx.x >= jobs[mid].blk0) jx = mid;
-        else jhi = mid - 1;
+    // the block's job: the last whose first block is at most this one — up
+    // to 32 jobs one load a lane and a ballot, else a binary search (a MoE
+    // launch has a hundred slots and more, where a scan was a hundred
+    // dependent loads)
+    int jx = 0;
+    if (njobs <= 32) {
+        const int b0 = lane < njobs ? jobs[lane].blk0 : 0x7fffffff;
+        const unsigned m = __ballot_sync(FULL, b0 <= (int)blockIdx.x);
+        jx = m ? 31 - __clz(m) : 0;
+    } else {
+        int jhi = njobs - 1;
+        while (jx < jhi) {
+            const int mid = (jx + jhi + 1) >> 1;
+            if ((int)blockIdx.x >= jobs[mid].blk0) jx = mid;
+            else jhi = mid - 1;
+        }
     }
     const HyJob jb = jobs[jx];
     // an empty job (a dead MoE slot, a grouped launch's spare) has no blocks' work
@@ -875,15 +883,19 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
     const bool q2a = q2 && kk == 9;
     // kind 10: q4_tiled tiles (a lane's 16 nibbles), a (row, group)'s f16 scale in aux0
     const bool q4g = KD ? KD == 10 : kk == 10;
-    // a row's ladder is exp2(lo + code * step): its two numbers, not its 32 rungs
-    for (int i = tid; i < 16 * TB; i += blockDim.x) {
-        const int rr = tile0 * 16 + i;
-        par_s[i] = (rr >= rows || q1 || q1t || q4g) ? make_float2(0.0f, 0.0f)
-                   : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
-                                      : ((const float2*)jb.aux1)[rr];
-    }
-    __syncthreads();
     const int gid = lane >> 2, tig = lane & 3;
+    // a row's ladder is exp2(lo + code * step): its two numbers, not its 32
+    // rungs — a lane's two rows of each tile, read once into registers
+    float2 lad[TB][2];
+#pragma unroll
+    for (int b = 0; b < TB; b++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int rr = (tile0 + b) * 16 + gid + 8 * h;
+            lad[b][h] = (rr >= rows || q1 || q1t || q4g) ? make_float2(0.0f, 0.0f)
+                        : i8               ? make_float2(((const float*)jb.aux1)[rr], 0.0f)
+                                           : ((const float2*)jb.aux1)[rr];
+        }
     const int gpr = cols >> 5;
     const int per = (gpr + KS - 1) / KS;
     const int g0 = min(gpr, warp * per), g1 = min(gpr, g0 + per);
@@ -922,7 +934,7 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                     wsb[u][b] = h2f(S1[gid + 8]);
                 } else if (q2) {
                     wx[u][b][0] = ((const u32*)jb.w)[tg * 32 + lane];
-                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    const float2 pa = lad[b][0], pb = lad[b][1];
                     const int ca = Cc[tg * 16 + gid], cb = Cc[tg * 16 + gid + 8];
                     const float half = q2a ? 1.0f : 0.5f;
                     wsa[u][b] = ca ? half * exp2f(fmaf((float)(ca - 1), pa.y, pa.x)) : 0.0f;
@@ -938,11 +950,11 @@ __device__ __forceinline__ void mmp_body(const HyJob* __restrict__ jobs, int njo
                     wx[u][b][1] = X8.y;
                     wx[u][b][2] = X8.z;
                     wx[u][b][3] = X8.w;
-                    wsa[u][b] = par_s[b * 16 + gid].x;
-                    wsb[u][b] = par_s[b * 16 + gid + 8].x;
+                    wsa[u][b] = lad[b][0].x;
+                    wsb[u][b] = lad[b][1].x;
                 } else {
                     const uint2 X = T[tg * 32 + lane];
-                    const float2 pa = par_s[b * 16 + gid], pb = par_s[b * 16 + gid + 8];
+                    const float2 pa = lad[b][0], pb = lad[b][1];
                     wx[u][b][0] = X.x;
                     wx[u][b][1] = X.y;
                     wsa[u][b] = exp2f(fmaf((float)Cc[tg * 16 + gid], pa.y, pa.x));
