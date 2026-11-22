@@ -27,6 +27,8 @@ __device__ __forceinline__ u16 f2bf(float f) {
     return h;
 }
 __device__ __forceinline__ float bf2f(u16 h) { return __uint_as_float((u32)h << 16); }
+// two floats as an f16x2 register (lo in the low half)
+__device__ __forceinline__ u32 pk_h(float lo, float hi) { return (u32)f2h(lo) | ((u32)f2h(hi) << 16); }
 // the hybrid arm's two bf16 planes of an f32 (`put3` with NPL 2)
 __device__ __forceinline__ void put2(u16* __restrict__ p0, u16* __restrict__ p1, size_t i, float v) {
     const u16 a = f2bf(v);
@@ -1397,7 +1399,6 @@ __device__ __forceinline__ u32 a_h16(u32 X, int m) {
 #ifndef MOE_FOLD
 #define MOE_FOLD 1
 #endif
-__device__ __forceinline__ u32 pk_h(float lo, float hi) { return (u32)f2h(lo) | ((u32)f2h(hi) << 16); }
 __device__ __forceinline__ u32 hmul2(u32 a, u32 b) {
     u32 r;
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
