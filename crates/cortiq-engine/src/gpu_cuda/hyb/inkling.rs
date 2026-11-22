@@ -2236,7 +2236,8 @@ unsafe fn moe(c: &Ctx, d: &Dev, cfg: &Cfg, l: &LayerD, n: usize, tp: &mut std::t
     let flags = 1 | 2 | 4 | 32;
     let ps_i = hidden as i32;
     let inter_i = l.inter as i32;
-    let tb = if n > 1 && std::env::var("CMF_HYB_MOE_TB").as_deref() != Ok("1") { 2u32 } else { 1u32 };
+    // `CMF_INKLING_EXP_TB=2` (a measurement): a decode row's experts two tiles a block
+    let tb = if (n > 1 && std::env::var("CMF_HYB_MOE_TB").as_deref() != Ok("1")) || std::env::var("CMF_INKLING_EXP_TB").as_deref() == Ok("2") { 2u32 } else { 1u32 };
     let (bpg, bpd) = (l.bpj_gu.div_ceil(tb), l.bpj_dn.div_ceil(tb));
     let (bg, bd) = (bpg as i32, bpd as i32);
     let nul = 0u64;
