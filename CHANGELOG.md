@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.16] — 2026-11-22
+
 ### Added
 - CUDA, Inkling (`inkling2_loop`) on a card smaller than the file: the dense part, the head and the drafter stay on
   the card and the routed experts are placed by how often a token reads them — the loop layers (applied `passes`
