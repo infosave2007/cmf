@@ -64,11 +64,12 @@ fn split_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_INKLING_SPLIT").as_deref() != Ok("0"))
 }
 
-/// Rows of a prompt call (`CMF_INKLING_ROWS`, 512; 16 reads a prompt on the
-/// decode path, 16 rows a call).
+/// Rows of a prompt call (`CMF_INKLING_ROWS`, 1024: RTX PRO 6000, a 2 048-
+/// token prompt 7 843 → 8 549 tok/s against 512, 2 048 rows 7 747; 16 reads a
+/// prompt on the decode path, 16 rows a call).
 fn bmax() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(512, |n| n.clamp(NMAX, 4096)))
+    *N.get_or_init(|| std::env::var("CMF_INKLING_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(1024, |n| n.clamp(NMAX, 4096)))
 }
 
 struct Fx {
