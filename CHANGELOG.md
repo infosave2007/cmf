@@ -8,14 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- CUDA, Inkling (`inkling2_loop`) on a card smaller than the file: the dense part, the head and the drafter stay on
-  the card and the routed experts are placed by how often a token reads them — the loop layers (applied `passes`
-  times a token) first — with the rest in mapped host memory, read by the same kernels over the bus
-  (`place_experts`). Past the weights the card keeps the K/V of every application, the row planes the build takes
-  after them and a GiB for cuBLAS and the call graphs. `CMF_GPU_VRAM_MB`, `CMF_HYB_RESERVE_MB`, `CMF_MAX_SEQ`,
-  `CMF_INKLING_ROWS` and `CMF_HYB_HOST_EXPERTS=0` steer it; a card that holds the whole stack builds as before.
-  RTX 3060 (12 GB): Inkling-2-Mini decodes at 63.3 tok/s and reads a 4 096-token prompt at 1175 tok/s with 4.9 GB of
-  experts in host memory, where the build used to decline the card (7.2 tok/s on the host's CPU).
 - MiniMax-H3: H3-Tiny's few-step student (MeanFlow) packs and runs. `animate-pack --dit` takes the ComfyUI file's
   low-rank adaLN (`linear_2(linear_1(silu(temb)))`, rank 8), its dense final adaLN and both time embedders; the
   runtime evaluates `temb(t, r) = emb_t(t) + emb_r(r − t)` for every modulation row, a row now being a `(t, r)` clock —
@@ -27,13 +19,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the Turbo small file takes 408 s (its DiT does not fit the card).
 
 ### Fixed
+- MiniMax-H3 `animate`: `max_tokens` cut the prompt INCLUDING the picture blocks ahead of it, so two references on a
+  768×448 canvas (672 vision rows) left a span past the sequence and the encoder panicked (`qwen3te.rs:661`); the cap
+  now applies to the prompt's text after the pictures.
+
+## [0.9.16] — 2026-11-22
+
+### Added
+- CUDA, Inkling (`inkling2_loop`) on a card smaller than the file: the dense part, the head and the drafter stay on
+  the card and the routed experts are placed by how often a token reads them — the loop layers (applied `passes`
+  times a token) first — with the rest in mapped host memory, read by the same kernels over the bus
+  (`place_experts`). Past the weights the card keeps the K/V of every application, the row planes the build takes
+  after them and a GiB for cuBLAS and the call graphs. `CMF_GPU_VRAM_MB`, `CMF_HYB_RESERVE_MB`, `CMF_MAX_SEQ`,
+  `CMF_INKLING_ROWS` and `CMF_HYB_HOST_EXPERTS=0` steer it; a card that holds the whole stack builds as before.
+  RTX 3060 (12 GB): Inkling-2-Mini decodes at 63.3 tok/s and reads a 4 096-token prompt at 1175 tok/s with 4.9 GB of
+  experts in host memory, where the build used to decline the card (7.2 tok/s on the host's CPU).
+- Metal, Inkling (`inkling2_loop`): DSpark speculative decoding, on by default when decoding greedily
+  (`CMF_INKLING_SPEC=0` turns it off). The drafter runs on the GPU (`ink_ds_*`, its 8-row block on the simdgroup
+  matrices, `ink_q8mm8`); a verify of up to 8 rows goes through the decode kernels a row (the experts a (row, pick):
+  on the M4 their unpacking is the limit, and reading a shared expert once for its rows measured slower), the
+  projections and O through the narrow GEMM (`q4tp_mul_mm_n8`), the head read once, the picks on the GPU; the
+  convolutions keep their input rows and roll back to the accepted prefix. A round verifies the drafts that pay by
+  their probabilities, calibrated online by how often they held, at the step prices it measures, and rounds that
+  lose to plain decoding send it to plain steps for 8–16 tokens. MacBook Air M4, 384 tokens: code 24.6 → 28.8
+  tok/s, JSON 24.8 → 33.2, a short story 24.8 → 23.7.
+- `CMF_INKLING_DRAFT_TABLE=RANKING:N`: the drafter scores N tokens only (a ranking file's first, the Markov head's
+  unigram prior after them); `cargo run --example ink_tokfreq` writes a ranking from a corpus under the file's own
+  tokenizer. M4, 32 768 tokens: a draft 13 → 8 ms; code 29.3, JSON 34.8, story 24.7 tok/s.
+
+### Fixed
 - Inkling: a DSpark round whose verify, rollback or row logits failed on the card handed the sequence to the host
   without its caches, and the next token read past a one-row cache and panicked (`inkling.rs:791`). Every path off
   the card now replays the sequence's tokens on the host (`card_dropped`), and the host replays them itself when its
   caches miss positions the tokens have (`host_catch_up`).
-- MiniMax-H3 `animate`: `max_tokens` cut the prompt INCLUDING the picture blocks ahead of it, so two references on a
-  768×448 canvas (672 vision rows) left a span past the sequence and the encoder panicked (`qwen3te.rs:661`); the cap
-  now applies to the prompt's text after the pictures.
 
 ## [0.9.15] — 2026-11-22
 
