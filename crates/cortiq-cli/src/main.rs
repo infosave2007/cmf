@@ -3970,8 +3970,10 @@ enum Commands {
         /// Frames at 24 fps, snapped up to the model's 17k+5 grid
         #[arg(long, default_value_t = 39)]
         frames: usize,
-        /// The Turbo LoRA is trained for 4; more still helps a little
-        #[arg(long, default_value_t = 4)]
+        /// Denoise steps. 0 (the default): the file's own — 6 for an H3-Tiny
+        /// FewStep student (4 or more work, 8 adds detail), 4 for the Turbo
+        /// LoRA's files, where more still helps a little
+        #[arg(long, default_value_t = 0)]
         steps: usize,
         #[arg(long, default_value_t = 42)]
         seed: u64,
@@ -3991,6 +3993,13 @@ enum Commands {
         /// the first one is stretched, as the reference does
         #[arg(long)]
         last_frame: Option<String>,
+        /// A reference picture (binary P6 PPM), repeatable: ref2va — each one
+        /// enters the prompt as `<Picture i>: ` and a vision block and
+        /// conditions the DiT as a reference latent ahead of the clip; name
+        /// them in the prompt as `<Picture 1>` … (H3-Tiny FewStep is a
+        /// Ref2VA student)
+        #[arg(long = "ref")]
+        refs: Vec<String>,
         /// A directory of reference frames (`frame_0000.ppm` …): every
         /// `--video-stride`-th one becomes a condition pinned to its own
         /// moment in the clip. This is the release's `v2v` as this
@@ -6997,6 +7006,7 @@ async fn main() -> anyhow::Result<()> {
             quality,
             first_frame,
             last_frame,
+            refs,
             video,
             video_stride,
             stream_chunk,
@@ -7020,6 +7030,7 @@ async fn main() -> anyhow::Result<()> {
                 stock_sampler,
                 first_frame: first_frame.as_deref().map(read_ppm).transpose()?,
                 last_frame: last_frame.as_deref().map(read_ppm).transpose()?,
+                refs: refs.iter().map(|r| read_ppm(r)).collect::<Result<Vec<_>, _>>()?,
                 mid_frames: match video.as_deref() {
                     None => Vec::new(),
                     Some(dir) => read_frame_dir(dir, video_stride.max(1), frames)?,

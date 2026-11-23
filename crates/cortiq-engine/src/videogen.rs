@@ -50,6 +50,10 @@ pub struct AnimParams {
     /// frame is a condition row pinned to its own time coordinate, the
     /// same machinery `--first-frame`/`--last-frame` use for two.
     pub mid_frames: Vec<((Vec<f32>, usize, usize), usize)>,
+    /// Reference pictures (ref2va), RGB in [0, 1] as `[3, h, w]` with their
+    /// size: presented in the prompt as `<Picture i>: ` and a vision block,
+    /// and laid ahead of the clip as reference latents on the canvas.
+    pub refs: Vec<(Vec<f32>, usize, usize)>,
     /// A LoRA adapter (.safetensors) applied at runtime, and how hard.
     pub lora: Option<String>,
     pub lora_strength: f32,
@@ -77,6 +81,15 @@ const VISION_END: u32 = 151_653;
 /// Resize `[3, h, w]` RGB to the canvas. The first frame is a geometry
 /// anchor and is stretched; the last one follows and is cover-cropped,
 /// which is what the reference node does with each.
+/// A reference picture's canvas: its own aspect at `area` pixels, each
+/// side on the 32-pixel grid (at least 32) — a portrait reference beside a
+/// landscape clip is neither stretched nor cropped.
+pub fn ref_canvas(h: usize, w: usize, area: usize) -> (usize, usize) {
+    let scale = (area as f64 / (h.max(1) * w.max(1)) as f64).sqrt();
+    let snap = |x: usize| (((x as f64 * scale) / 32.0).round() as usize).max(1) * 32;
+    (snap(h), snap(w))
+}
+
 pub fn fit_to_canvas(
     rgb: &[f32],
     h: usize,
@@ -130,6 +143,7 @@ impl Default for AnimParams {
             first_frame: None,
             last_frame: None,
             mid_frames: Vec::new(),
+            refs: Vec::new(),
             lora: None,
             lora_strength: 1.0,
             upscale: None,
@@ -385,14 +399,23 @@ fn generate_inner(
     // same pixel index would be two rows claiming one moment.
     keyframes.sort_by_key(|(_, i)| *i);
     keyframes.dedup_by_key(|(_, i)| *i);
+    // ref2va's pictures and fl2va's keyframes are two layouts: one or the other.
+    if !p.refs.is_empty() && !keyframes.is_empty() {
+        return Err("--ref (ref2va) and --first-frame/--last-frame/--video (fl2va) are two layouts: pass one".into());
+    }
+    // Every picture the prompt presents, in order: the keyframes, or the
+    // references (each one fitted to the canvas like a first frame).
+    let pictures: Vec<&(Vec<f32>, usize, usize)> = keyframes.iter().map(|(f, _)| *f).chain(p.refs.iter()).collect();
     let mut ids: Vec<u32> = Vec::new();
     let mut spans: Vec<ImageSpan> = Vec::new();
     let mut embeds: Vec<Vec<f32>> = Vec::new();
     let mut deepstack: Vec<Vec<f32>> = Vec::new();
     let mut cond: Vec<Vec<f32>> = Vec::new();
     let mut tags: Vec<u8> = Vec::new();
+    // Each reference's latent size, in order (ref2va).
+    let mut ref_sizes: Vec<(usize, usize)> = Vec::new();
 
-    if !keyframes.is_empty() {
+    if !pictures.is_empty() {
         let tower = VisionTower::from_cmf(&model)?;
         // An activation harvest (CMF_TE_ONLY) never denoises, and the
         // VAE latent is the DiT's food alone — the frame's 3-D conv
@@ -403,17 +426,19 @@ fn generate_inner(
         } else {
             Some(VideoVaeEncoder::from_cmf(&model)?)
         };
-        for (i, (frame, _)) in keyframes.iter().enumerate() {
+        for (i, frame) in pictures.iter().enumerate() {
             let (src, sh, sw) = *frame;
-            // The picture the DiT sees is on the generation canvas; the
-            // one Qwen sees keeps its own resolution policy.
-            let fitted = fit_to_canvas(src, *sh, *sw, p.height, p.width, i > 0);
+            // A keyframe is drawn on the generation canvas (a last frame
+            // cover-cropped where the first is stretched); a reference
+            // keeps its own aspect at the canvas's area (`ref_canvas`).
+            let is_ref = i >= keyframes.len();
+            let (ph, pw) = if is_ref { ref_canvas(*sh, *sw, p.height * p.width) } else { (p.height, p.width) };
+            let fitted = fit_to_canvas(src, *sh, *sw, ph, pw, i > 0 && !is_ref);
+            if is_ref {
+                ref_sizes.push((ph / 16, pw / 16));
+            }
             if let Some(venc) = &venc {
-                let (z, _, _) = venc.encode_frame(
-                    &fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(),
-                    p.height,
-                    p.width,
-                );
+                let (z, _, _) = venc.encode_frame(&fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(), ph, pw);
                 cond.push(z);
             }
 
@@ -423,8 +448,8 @@ fn generate_inner(
             }
             let (patches, gh, gw) = qwen3vis::preprocess(
                 &fitted,
-                p.height,
-                p.width,
+                ph,
+                pw,
                 tower.patch_size,
                 tower.temporal_patch,
                 tower.merge,
@@ -458,6 +483,10 @@ fn generate_inner(
             }
         }
     }
+    // The picture blocks come first and are never cut: `max_tokens` caps the
+    // prompt's text. Cutting into a block left its span past the sequence —
+    // two references on a 768×448 canvas are 672 vision rows before the text.
+    let picture_rows = ids.len();
     for t in tok.encode(prompt) {
         ids.push(t);
         tags.push(1);
@@ -466,7 +495,7 @@ fn generate_inner(
         ids.push(151643); // the pad id, as the reference does for ""
         tags.push(1);
     }
-    ids.truncate(p.max_tokens);
+    ids.truncate(picture_rows + p.max_tokens);
     tags.truncate(ids.len());
     lap(&mut marks, "prepare");
     // The prompt encoder is a one-shot pass over 12 GB of weights; on a
@@ -581,7 +610,11 @@ fn generate_inner(
             .iter()
             .map(|&(_, idx)| (idx, frames_total))
             .collect();
-        let layout = if kf.is_empty() {
+        let layout = if !p.refs.is_empty() {
+            // Each reference latent is one frame at its own size.
+            let refs: Vec<crate::mmh3::Ref> = ref_sizes.iter().map(|&(lat_h, lat_w)| crate::mmh3::Ref::Image { lat_h, lat_w }).collect();
+            Layout::ref2va(ids.len(), latent_t, lat_h, lat_w, audio_t, &refs, &tags)
+        } else if kf.is_empty() {
             Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t)
         } else {
             Layout::fl2va(ids.len(), latent_t, lat_h, lat_w, audio_t, &kf, &tags)
@@ -592,9 +625,12 @@ fn generate_inner(
         // A few-step student carries the schedule it was distilled on
         // (FastH3: 999, 749, 500, 250 on the 1000-step grid); a step count
         // of its own keeps the `simple` grid.
+        // `steps = 0`: the file's own count (H3-Tiny FewStep: 6), else the
+        // Turbo LoRA's 4.
+        let steps = if p.steps == 0 { dit.default_steps.unwrap_or(4) } else { p.steps };
         let sg = dit
-            .student_sigmas(p.steps)
-            .unwrap_or_else(|| sigmas(p.steps, dit.shift_video));
+            .student_sigmas(steps)
+            .unwrap_or_else(|| sigmas(steps, dit.shift_video));
         let mut return_streaming: Option<(Vec<f32>, Vec<f32>)> = None;
         // `CMF_ANIM_PROF=1`: the per-step rms of both streams and of
         // their velocities. A run that is not denoising shows it here
@@ -728,7 +764,7 @@ fn generate_inner(
                 let ctx_ax = gather_a(&a_out, &ctx_a);
                 let mut xv = gather_v(&v, &cur_v);
                 let mut xa = gather_a(&a, &cur_a);
-                for i in 0..p.steps {
+                for i in 0..steps {
                     let (sv, sv_n) = (sg[i], sg[i + 1]);
                     // [context frames | current frames], the order the
                     // layout lays its rows out in.
@@ -752,7 +788,7 @@ fn generate_inner(
                                 .copy_from_slice(&xa[(c * 2 + ch) * mk..(c * 2 + ch + 1) * mk]);
                         }
                     }
-                    let (dv, da) = dit.forward(&clay, &text, &vin, &ain, sv, &[]);
+                    let (dv, da) = dit.forward_to(&clay, &text, &vin, &ain, sv, Some(sv_n), &[]);
                     let step_v = (sv_n - sv) as f32;
                     for (x, &d) in xv.iter_mut().zip(&dv) {
                         *x += step_v * d;
@@ -790,12 +826,12 @@ fn generate_inner(
             return_streaming = Some((v_out, a_out));
         }
 
-        for i in 0..p.steps {
+        for i in 0..steps {
             if return_streaming.is_some() {
                 break;
             }
             let (sv, sv_n) = (sg[i], sg[i + 1]);
-            let (dv, da) = dit.forward(&layout, &text, &v, &a, sv, &cond);
+            let (dv, da) = dit.forward_to(&layout, &text, &v, &a, sv, Some(sv_n), &cond);
             // `CMF_ANIM_DUMP=<prefix>`: this step's two velocities as raw
             // f32 (`<prefix>.v<i>.f32`, `<prefix>.a<i>.f32`), so one forward
             // can be compared between two paths before the sampler
@@ -828,7 +864,7 @@ fn generate_inner(
                     rms(&a)
                 );
             }
-            progress("denoise", i + 1, p.steps);
+            progress("denoise", i + 1, steps);
         }
         if let Some(rep) = dit.lora_report() {
             eprint!("{rep}");
@@ -952,6 +988,18 @@ fn trim_frames(rgb: &[f32], have: usize, keep: usize, h: usize, w: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_keeps_its_aspect_at_the_canvas_area() {
+        // a portrait picture beside a 512 x 288 clip: about the clip's area,
+        // its own shape, both sides on the 32-pixel grid
+        let (h, w) = ref_canvas(640, 475, 288 * 512);
+        assert_eq!((h % 32, w % 32), (0, 0));
+        assert!(((h as f64 / w as f64) - 640.0 / 475.0).abs() < 0.12, "{h}x{w}");
+        assert!(((h * w) as f64 / (288.0 * 512.0) - 1.0).abs() < 0.15, "{h}x{w}");
+        // a picture already the clip's shape keeps the clip's size
+        assert_eq!(ref_canvas(360, 640, 288 * 512), (288, 512));
+    }
 
     #[test]
     fn the_four_step_schedule_is_the_references() {

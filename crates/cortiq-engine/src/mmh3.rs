@@ -116,6 +116,14 @@ const AUDIO_COND_TIMESTEP: f64 = 1.0;
 // ── the flow-schedule remap ─────────────────────────────────────────
 
 /// σ on `to`'s schedule at the same point of the shared base grid.
+/// A MeanFlow student's video grid: `steps + 1` sigmas, `linspace(1, 0,
+/// steps + 1)` through `shift·s / (1 + (shift − 1)·s)` — H3-Tiny's
+/// `shifted_sigmas`, the grid its few-step students were trained on at
+/// every step count (the audio stream reads the same points on its shift).
+pub fn meanflow_sigmas(steps: usize, shift: f64) -> Vec<f64> {
+    (0..=steps).map(|i| 1.0 - i as f64 / steps.max(1) as f64).map(|x| shift * x / (1.0 + (shift - 1.0) * x)).collect()
+}
+
 pub fn time_shift_sigma(sigma: f64, from_shift: f64, to_shift: f64) -> f64 {
     let base = sigma / (from_shift + sigma * (1.0 - from_shift));
     to_shift * base / (1.0 + (to_shift - 1.0) * base)
@@ -174,6 +182,9 @@ pub struct Layout {
     /// Per-token modality tag for the text span. A vision block inside
     /// the prompt carries the VIDEO tag, not the text one.
     pub text_tags: Vec<u8>,
+    /// Each reference picture's latent size `(lat_h, lat_w)`, in the order
+    /// of the `RefImg` segments (a reference keeps its own aspect).
+    pub ref_sizes: Vec<(usize, usize)>,
 }
 
 /// One reference block, in the order it was given.
@@ -475,6 +486,7 @@ impl Layout {
             } else {
                 text_tags.to_vec()
             },
+            ref_sizes: refs.iter().filter_map(|r| match r { Ref::Image { lat_h, lat_w } => Some((*lat_h, *lat_w)), _ => None }).collect(),
         }
     }
 
@@ -594,6 +606,7 @@ impl Layout {
             } else {
                 text_tags.to_vec()
             },
+            ref_sizes: Vec::new(),
         }
     }
 
@@ -701,6 +714,7 @@ impl Layout {
             } else {
                 text_tags.to_vec()
             },
+            ref_sizes: refs.to_vec(),
         }
     }
 }
@@ -949,12 +963,29 @@ pub fn vsa_attention_host(
 
 // ── weights ─────────────────────────────────────────────────────────
 
+/// One modulation row's clock: the timestep `t` and the endpoint `r` a
+/// mean-flow student integrates to over the step. Every other model, and
+/// every condition row, has `r = t`.
+pub type Clock = (f64, f64);
+
+/// Where an adaLN's rank coordinates come from.
+enum AdalnIn {
+    /// `[grid, rank]`: the curve of a pruned checkpoint, read at `t` on the
+    /// 1025-point grid (no time embedder in the file).
+    Table(Vec<f32>),
+    /// A low-rank adaLN's `linear_1` (`[rank, t_dim]` and its bias): the
+    /// coordinates are `W1 · silu(temb) + b1` (H3-Tiny's few-step student).
+    Lin1 { w: Vec<f32>, b: Vec<f32> },
+    /// A dense adaLN: the coordinates ARE `silu(temb)` (the few-step
+    /// student's final layer, `rank = t_dim`).
+    Direct,
+}
+
 struct Adaln {
     /// [out, rank] — the curve basis, already carrying the LoRA.
     w: Proj,
     b: Vec<f32>,
-    /// [grid, rank]
-    table: Vec<f32>,
+    input: AdalnIn,
     rank: usize,
     out: usize,
 }
@@ -962,46 +993,157 @@ struct Adaln {
 impl Adaln {
     fn load(model: &Arc<CmfModel>, prefix: &str) -> Result<Self, String> {
         let w = Proj::from_model(model, &format!("{prefix}.weight"))?;
-        let table = crate::dit::cmf_f32(model, &format!("{prefix}.table"))?;
         let b = crate::dit::cmf_f32(model, &format!("{prefix}.bias"))?;
         let out = w.rows();
-        let rank = table.len() / CURVE_GRID;
-        Ok(Self {
-            w,
-            b,
-            table,
-            rank,
-            out,
-        })
+        let (input, rank) = if model.tensor_index(&format!("{prefix}.table")).is_some() {
+            let table = crate::dit::cmf_f32(model, &format!("{prefix}.table"))?;
+            let rank = table.len() / CURVE_GRID;
+            (AdalnIn::Table(table), rank)
+        } else if model.tensor_index(&format!("{prefix}.lin1.weight")).is_some() {
+            let w1 = crate::dit::cmf_f32(model, &format!("{prefix}.lin1.weight"))?;
+            let b1 = crate::dit::cmf_f32(model, &format!("{prefix}.lin1.bias"))?;
+            let rank = b1.len();
+            if rank != w.cols() || w1.len() % rank.max(1) != 0 {
+                return Err(format!("{prefix}: lin1 [{rank}, {}] does not feed weight [{out}, {}]", w1.len() / rank.max(1), w.cols()));
+            }
+            (AdalnIn::Lin1 { w: w1, b: b1 }, rank)
+        } else {
+            (AdalnIn::Direct, w.cols())
+        };
+        Ok(Self { w, b, input, rank, out })
     }
 
-    /// The modulation vectors at `ts`: `[ts.len() · MODALITIES, expand ·
-    /// hidden]` laid out so row `t·MODALITIES + tag`, chunk `e`, starts
-    /// at `(t·MODALITIES + tag)·expand·hidden + e·hidden`.
-    fn eval(&self, ts: &[f64], pool: Option<&Pool>) -> Vec<f32> {
-        let g = CURVE_GRID;
-        let mut coords = vec![0f32; ts.len() * self.rank];
-        for (i, &t) in ts.iter().enumerate() {
-            // t → fractional grid index; out-of-range clamps to the ends,
-            // and the last interval is kept whole so t = 1 does not read
-            // past the table.
-            let p = (t.clamp(0.0, 1.0) * (g - 1) as f64) as f32;
-            let i0 = (p.floor() as usize).min(g - 2);
-            let f = p - i0 as f32;
-            for k in 0..self.rank {
-                let (a, b) = (
-                    self.table[i0 * self.rank + k],
-                    self.table[(i0 + 1) * self.rank + k],
-                );
-                coords[i * self.rank + k] = a + (b - a) * f;
+    /// Whether the coordinates need the time embedder's `silu(temb)` rows.
+    fn wants_temb(&self) -> bool {
+        !matches!(self.input, AdalnIn::Table(_))
+    }
+
+    /// The modulation vectors at `clocks`: `[clocks.len() · MODALITIES,
+    /// expand · hidden]` laid out so row `c·MODALITIES + tag`, chunk `e`,
+    /// starts at `(c·MODALITIES + tag)·expand·hidden + e·hidden`. `temb` is
+    /// `silu(temb(t, r))` a clock (`[clocks.len(), t_dim]`), needed by the
+    /// adaLNs that are not a curve.
+    fn eval(&self, clocks: &[Clock], temb: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+        let mut coords = vec![0f32; clocks.len() * self.rank];
+        match &self.input {
+            AdalnIn::Table(table) => {
+                let g = CURVE_GRID;
+                for (i, &(t, _)) in clocks.iter().enumerate() {
+                    // t → fractional grid index; out-of-range clamps to the
+                    // ends, and the last interval is kept whole so t = 1 does
+                    // not read past the table.
+                    let p = (t.clamp(0.0, 1.0) * (g - 1) as f64) as f32;
+                    let i0 = (p.floor() as usize).min(g - 2);
+                    let f = p - i0 as f32;
+                    for k in 0..self.rank {
+                        let (a, b) = (table[i0 * self.rank + k], table[(i0 + 1) * self.rank + k]);
+                        coords[i * self.rank + k] = a + (b - a) * f;
+                    }
+                }
+            }
+            AdalnIn::Lin1 { w, b } => {
+                let temb = temb.expect("a low-rank adaLN without the time embedder's rows");
+                let t_dim = w.len() / self.rank;
+                for (i, e) in temb.chunks_exact(t_dim).take(clocks.len()).enumerate() {
+                    for k in 0..self.rank {
+                        let row = &w[k * t_dim..(k + 1) * t_dim];
+                        coords[i * self.rank + k] = b[k] + row.iter().zip(e).map(|(&a, &x)| a * x).sum::<f32>();
+                    }
+                }
+            }
+            AdalnIn::Direct => {
+                let temb = temb.expect("a dense adaLN without the time embedder's rows");
+                coords.copy_from_slice(&temb[..clocks.len() * self.rank]);
             }
         }
-        let mut out = vec![0f32; ts.len() * self.out];
-        self.w.matmat(&coords, ts.len(), &mut out, pool);
+        let mut out = vec![0f32; clocks.len() * self.out];
+        self.w.matmat(&coords, clocks.len(), &mut out, pool);
         for row in out.chunks_exact_mut(self.out) {
             for (v, &bv) in row.iter_mut().zip(&self.b) {
                 *v += bv;
             }
+        }
+        out
+    }
+}
+
+/// A time embedder: `proj_out(silu(proj_in(sinusoid(t))))`, the sinusoid
+/// cos-first over its frequencies (`flip_sin_to_cos`, max period 10 000,
+/// no frequency shift) on the `t = 1 − σ` axis, fp32 throughout — the
+/// reference's `Timesteps` + `TimestepEmbedding`, as the packer tabulates
+/// the curve of a pruned checkpoint.
+struct TimeMlp {
+    w_in: Vec<f32>,
+    b_in: Vec<f32>,
+    w_out: Vec<f32>,
+    b_out: Vec<f32>,
+}
+
+impl TimeMlp {
+    fn load(model: &Arc<CmfModel>, prefix: &str) -> Result<Self, String> {
+        let g = |n: &str| crate::dit::cmf_f32(model, &format!("{prefix}.{n}"));
+        let m = Self { w_in: g("proj_in.weight")?, b_in: g("proj_in.bias")?, w_out: g("proj_out.weight")?, b_out: g("proj_out.bias")? };
+        let (hidden, t_dim) = (m.b_in.len(), m.b_out.len());
+        if hidden == 0 || !m.w_in.len().is_multiple_of(hidden) || m.w_out.len() != t_dim * hidden || !(m.w_in.len() / hidden).is_multiple_of(2) {
+            return Err(format!("{prefix}: proj_in {} / proj_out {} do not chain", m.w_in.len(), m.w_out.len()));
+        }
+        Ok(m)
+    }
+
+    fn embed(&self, t: f64) -> Vec<f32> {
+        let (hidden, t_dim) = (self.b_in.len(), self.b_out.len());
+        let freq = self.w_in.len() / hidden;
+        let half = freq / 2;
+        let t = t as f32;
+        let mut s = vec![0f32; freq];
+        for j in 0..half {
+            let f = (-(10000f32.ln()) * j as f32 / half as f32).exp();
+            let (sn, c) = (t * f).sin_cos();
+            s[j] = c;
+            s[half + j] = sn;
+        }
+        let h: Vec<f32> = (0..hidden).map(|o| silu(self.b_in[o] + self.w_in[o * freq..(o + 1) * freq].iter().zip(&s).map(|(&a, &b)| a * b).sum::<f32>())).collect();
+        (0..t_dim).map(|o| self.b_out[o] + self.w_out[o * hidden..(o + 1) * hidden].iter().zip(&h).map(|(&a, &b)| a * b).sum::<f32>()).collect()
+    }
+}
+
+/// A few-step student's clock embedding (H3-Tiny FewStep, MeanFlow):
+/// `temb(t, r) = emb_t(t) + emb_r(r − t)`, and its adaLNs read `silu` of
+/// it. Without an interval branch it is the plain `emb_t(t)`.
+struct TimeEmb {
+    t: TimeMlp,
+    r: Option<TimeMlp>,
+}
+
+impl TimeEmb {
+    fn load(model: &Arc<CmfModel>) -> Result<Option<Self>, String> {
+        if model.tensor_index("dit.time_embedder.proj_in.weight").is_none() {
+            return Ok(None);
+        }
+        let t = TimeMlp::load(model, "dit.time_embedder")?;
+        let r = if model.tensor_index("dit.r_time_embedder.proj_in.weight").is_some() {
+            let r = TimeMlp::load(model, "dit.r_time_embedder")?;
+            if r.b_out.len() != t.b_out.len() {
+                return Err(format!("r_time_embedder gives {} values, time_embedder {}", r.b_out.len(), t.b_out.len()));
+            }
+            Some(r)
+        } else {
+            None
+        };
+        Ok(Some(Self { t, r }))
+    }
+
+    /// `silu(temb(t, r))` for every clock: `[clocks.len(), t_dim]`.
+    fn silu_rows(&self, clocks: &[Clock]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(clocks.len() * self.t.b_out.len());
+        for &(t, r) in clocks {
+            let mut e = self.t.embed(t);
+            if let Some(rm) = &self.r {
+                for (v, d) in e.iter_mut().zip(rm.embed(r - t)) {
+                    *v += d;
+                }
+            }
+            out.extend(e.into_iter().map(silu));
         }
         out
     }
@@ -1151,6 +1293,16 @@ pub struct MiniMaxH3 {
     /// A few-step student's own schedule, unshifted (`[0.999, 0.749, 0.5,
     /// 0.25, 0]` for FastH3); empty: the `simple` grid.
     pub sampler_base_sigmas: Vec<f64>,
+    /// The clock embedding of a file whose adaLNs read it (H3-Tiny
+    /// FewStep's low-rank adaLN); `None` for a curve checkpoint.
+    temb: Option<TimeEmb>,
+    /// A MeanFlow student (`endpoint_mode = "meanflow"`): a target row's
+    /// adaLN also reads its endpoint `r`, the next point of the step grid,
+    /// and the grid is `linspace(1, 0, steps + 1)` on the video shift.
+    pub meanflow: bool,
+    /// The steps the file was distilled for, when it names them
+    /// (`default_steps`); the caller's `--steps` overrides.
+    pub default_steps: Option<usize>,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -1265,6 +1417,18 @@ impl MiniMaxH3 {
         let refiner = (0..n_refiner)
             .map(|i| load_block(&format!("token_refiner.blocks.{i}"), false))
             .collect::<Result<Vec<_>, _>>()?;
+        let final_adaln = Adaln::load(model, "dit.final_layer.adaln")?;
+        // A low-rank or dense adaLN reads the clock embedding the file has to carry.
+        let temb = TimeEmb::load(model)?;
+        let wants = blocks.iter().filter_map(|b| b.adaln.as_ref()).any(Adaln::wants_temb) || final_adaln.wants_temb();
+        if wants && temb.is_none() {
+            return Err("dit: an adaLN reads the time embedding, and the file has no dit.time_embedder".into());
+        }
+        let meanflow = cfg["endpoint_mode"].as_str() == Some("meanflow");
+        if meanflow && !temb.as_ref().is_some_and(|e| e.r.is_some()) {
+            return Err("dit.config_json: endpoint_mode meanflow without dit.r_time_embedder".into());
+        }
+        let default_steps = cfg["default_steps"].as_u64().map(|v| v as usize).filter(|&v| v > 0);
 
         Ok(Self {
             video_patch: Proj::from_model(model, "dit.video_patch_proj.weight")?,
@@ -1285,7 +1449,7 @@ impl MiniMaxH3 {
             refiner_norm: f32v("dit.token_refiner.final_norm.weight")?,
             blocks,
             final_norm: f32v("dit.final_layer.norm.weight")?,
-            final_adaln: Adaln::load(model, "dit.final_layer.adaln")?,
+            final_adaln,
             video_out: Proj::from_model(model, "dit.final_layer.video_out.weight")?,
             video_out_b: f32v("dit.final_layer.video_out.bias")?,
             audio_out: if image {
@@ -1343,13 +1507,21 @@ impl MiniMaxH3 {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
                 .unwrap_or_default(),
+            temb,
+            meanflow,
+            default_steps,
         })
     }
 
     /// The video sigma grid of a `steps`-step render: the student's own
     /// schedule shifted onto the video clock when it carries one and
-    /// `steps` matches it, else `None` (the caller's `simple` grid).
+    /// `steps` matches it, else `None` (the caller's `simple` grid). A
+    /// MeanFlow student was trained on `linspace(1, 0, steps + 1)` at any
+    /// step count, the reference's `shifted_sigmas`.
     pub fn student_sigmas(&self, steps: usize) -> Option<Vec<f64>> {
+        if self.meanflow && steps > 0 {
+            return Some(meanflow_sigmas(steps, self.shift_video));
+        }
         let b = &self.sampler_base_sigmas;
         if b.len() < 2 || b.len() - 1 != steps {
             return None;
@@ -1437,7 +1609,7 @@ impl MiniMaxH3 {
                 *v += b;
             }
         }
-        self.run_blocks(&self.refiner, &mut h, n, &[], &[], &[], None);
+        self.run_blocks(&self.refiner, &mut h, n, &[], None, &[], &[], None);
         let mut out = vec![0f32; n * self.hidden];
         for (o, x) in out
             .chunks_exact_mut(self.hidden)
@@ -2050,11 +2222,35 @@ impl MiniMaxH3 {
         sigma_v: f64,
         cond: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<f32>) {
+        self.forward_to(layout, text, video, audio, sigma_v, None, cond)
+    }
+
+    /// [`Self::forward`] for a step that ends at `sigma_next` on the video
+    /// clock. A MeanFlow student reads that endpoint (`r = 1 − σ_next`, the
+    /// audio rows' on the audio clock) and returns the AVERAGE velocity over
+    /// the step; every other model ignores it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_to(
+        &self,
+        layout: &Layout,
+        text: &[f32],
+        video: &[f32],
+        audio: &[f32],
+        sigma_v: f64,
+        sigma_next: Option<f64>,
+        cond: &[Vec<f32>],
+    ) -> (Vec<f32>, Vec<f32>) {
         let hs = self.hidden;
         let pool = self.pool.as_deref();
         let sigma_v = sigma_v.max(1e-6);
         let t_v = 1.0 - sigma_v;
         let t_a = 1.0 - time_shift_sigma(sigma_v, self.shift_video, self.shift_audio);
+        // The endpoints: the next grid point of each stream for a MeanFlow
+        // student (the reference's `row_time_pairs`), `r = t` otherwise.
+        let (r_v, r_a) = match (self.meanflow, sigma_next) {
+            (true, Some(sn)) => (1.0 - sn, 1.0 - time_shift_sigma(sn, self.shift_video, self.shift_audio)),
+            _ => (t_v, t_a),
+        };
 
         // Distinct timesteps, sorted — the adaLN row index is a position
         // in this list, so the order is part of the contract. A keyframe
@@ -2081,23 +2277,27 @@ impl MiniMaxH3 {
             .segments
             .iter()
             .any(|s| matches!(s.kind, Kind::CtxVideo | Kind::CtxAudio));
-        let mut ts = vec![t_v, t_a];
+        // Distinct clocks, sorted: a row is `(t, r)`, so the video and audio
+        // streams that share `t = 0` at σ = 1 still get rows of their own when
+        // their endpoints differ. Condition rows stay pinned (`r = t`).
+        let mut ts: Vec<Clock> = vec![(t_v, r_v), (t_a, r_a)];
         if has_ctx {
-            ts.push(0.0);
+            ts.push((0.0, 0.0));
         }
         if has_cond {
-            ts.push(t_cond);
+            ts.push((t_cond, t_cond));
         }
         if has_ref_audio {
-            ts.push(t_cond_a);
+            ts.push((t_cond_a, t_cond_a));
         }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ts.dedup();
-        let row_of = |t: f64| ts.iter().position(|&x| x == t).unwrap();
-        let (row_v, row_a) = (row_of(t_v), row_of(t_a));
-        let row_c = if has_cond { row_of(t_cond) } else { 0 };
-        let row_ctx = if has_ctx { row_of(0.0) } else { 0 };
-        let row_ca = if has_ref_audio { row_of(t_cond_a) } else { 0 };
+        let row_of = |c: Clock| ts.iter().position(|&x| x == c).unwrap();
+        let (row_v, row_a) = (row_of((t_v, r_v)), row_of((t_a, r_a)));
+        let row_c = if has_cond { row_of((t_cond, t_cond)) } else { 0 };
+        let row_ctx = if has_ctx { row_of((0.0, 0.0)) } else { 0 };
+        let row_ca = if has_ref_audio { row_of((t_cond_a, t_cond_a)) } else { 0 };
+        let temb = self.temb.as_ref().map(|e| e.silu_rows(&ts));
 
         // Per-token modulation row: t_row · MODALITIES + tag. The text
         // span is not uniform once a vision block is in it — those
@@ -2164,7 +2364,10 @@ impl MiniMaxH3 {
             .iter()
             .enumerate()
             .map(|(i, z)| {
-                let mut r = patchify_video(z, self.latents_dim, 1, layout.lat_h, layout.lat_w);
+                // A keyframe is on the canvas; a reference picture at its own
+                // size (`ref_sizes`, the order of the RefImg segments).
+                let (ch, cw) = layout.ref_sizes.get(i).copied().unwrap_or((layout.lat_h, layout.lat_w));
+                let mut r = patchify_video(z, self.latents_dim, 1, ch, cw);
                 if self.cond_aug < 1.0 {
                     // The reference draws this from a torch generator
                     // reseeded per condition; ours is its own stream, so
@@ -2182,7 +2385,9 @@ impl MiniMaxH3 {
 
         let mut h = vec![0f32; layout.seq_len * hs];
         let mut ci = 0usize;
-        for s in layout.segments.iter().filter(|s| s.kind == Kind::Cond) {
+        // Keyframes (fl2va) and reference pictures (ref2va) alike: a latent
+        // a segment, in the layout's order, through the target's patch embed.
+        for s in layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::RefImg)) {
             let n = s.stop - s.start;
             let r = cond_rows.get(ci).unwrap_or_else(|| {
                 panic!(
@@ -2242,7 +2447,7 @@ impl MiniMaxH3 {
             .and_then(|w| w.parse::<usize>().ok());
         if let Some(r) = watch {
             for (i, blk) in self.blocks.iter().enumerate() {
-                let mods = blk.adaln.as_ref().unwrap().eval(&ts, pool);
+                let mods = blk.adaln.as_ref().unwrap().eval(&ts, temb.as_deref(), pool);
                 self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows, vsa.as_ref());
                 // Growing magnitude is an overflow, a sudden jump from
                 // finite to NaN is a kernel.
@@ -2260,7 +2465,7 @@ impl MiniMaxH3 {
                 }
             }
         } else {
-            self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows, vsa.as_ref());
+            self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, temb.as_deref(), &layout.pos, &rows, vsa.as_ref());
         }
 
         // ── heads ──
@@ -2281,7 +2486,7 @@ impl MiniMaxH3 {
                 );
             }
         }
-        let fm = self.final_adaln.eval(&ts, pool);
+        let fm = self.final_adaln.eval(&ts, temb.as_deref(), pool);
         let mut video_out = vec![0f32; (vseg.stop - vseg.start) * vd];
         let mut audio_out = vec![0f32; (aseg.stop - aseg.start) * self.audio_dim];
         for (seg, row, w, b, dst, dim) in [
@@ -2384,16 +2589,19 @@ impl MiniMaxH3 {
     /// `blocks` over `h` `[n, hidden]`, in place. On a backend with a
     /// resident chain the whole stack runs on the card — the stream goes
     /// up once and comes back once; otherwise block by block through the
-    /// per-op paths. `ts` are the distinct timesteps (empty for the
-    /// unmodulated token refiner), `pos` the rows' positions (empty: no
+    /// per-op paths. `ts` are the distinct clocks (empty for the
+    /// unmodulated token refiner) and `temb` their `silu(temb)` rows when
+    /// the file's adaLNs read them, `pos` the rows' positions (empty: no
     /// rotation), `rows` each row's modulation row.
     /// `CMF_MMH3_CHAIN=0` keeps the per-op path.
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks(
         &self,
         blocks: &[Block],
         h: &mut [f32],
         n: usize,
-        ts: &[f64],
+        ts: &[Clock],
+        temb: Option<&[f32]>,
         pos: &[[f64; 3]],
         rows: &[u32],
         vsa: Option<&VsaPlan>,
@@ -2405,7 +2613,7 @@ impl MiniMaxH3 {
         {
             let mods: Vec<Vec<f32>> = blocks
                 .iter()
-                .map(|b| b.adaln.as_ref().map(|a| a.eval(ts, pool)).unwrap_or_default())
+                .map(|b| b.adaln.as_ref().map(|a| a.eval(ts, temb, pool)).unwrap_or_default())
                 .collect();
             let angles = if pos.is_empty() {
                 Vec::new()
@@ -2472,7 +2680,7 @@ impl MiniMaxH3 {
             }
         }
         for (i, blk) in blocks.iter().enumerate() {
-            let mods = blk.adaln.as_ref().map(|a| a.eval(ts, pool));
+            let mods = blk.adaln.as_ref().map(|a| a.eval(ts, temb, pool));
             self.block_forward(blk, h, n, mods.as_deref(), pos, rows, vsa);
             if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
                 eprint!("\r  block {}/{}", i + 1, blocks.len());
@@ -2505,13 +2713,14 @@ impl MiniMaxH3 {
         // pin near 1.
         let has_ref = layout.segments.iter().any(|s| s.kind == Kind::RefImg);
         let t_ref = t.max(self.cond_aug);
-        let mut ts = vec![t];
+        let mut ts: Vec<Clock> = vec![(t, t)];
         if has_ref && t_ref != t {
-            ts.push(t_ref);
+            ts.push((t_ref, t_ref));
         }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let row_of = |x: f64| ts.iter().position(|&v| v == x).unwrap();
+        let row_of = |x: f64| ts.iter().position(|&v| v == (x, x)).unwrap();
         let (row_t, row_r) = (row_of(t), if has_ref { row_of(t_ref) } else { 0 });
+        let temb = self.temb.as_ref().map(|e| e.silu_rows(&ts));
 
         let mut rows = vec![0u32; layout.seq_len];
         for s in &layout.segments {
@@ -2572,11 +2781,11 @@ impl MiniMaxH3 {
         embed(&v_rows, &mut h[vseg.start * hs..vseg.stop * hs]);
 
         // ── blocks ──
-        self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, &layout.pos, &rows, None);
+        self.run_blocks(&self.blocks, &mut h, layout.seq_len, &ts, temb.as_deref(), &layout.pos, &rows, None);
 
         // ── the output layer ──
         let n = vseg.stop - vseg.start;
-        let fm = self.final_adaln.eval(&ts, pool);
+        let fm = self.final_adaln.eval(&ts, temb.as_deref(), pool);
         let shift = &fm[row_t * 2 * hs..row_t * 2 * hs + hs];
         let scale = &fm[row_t * 2 * hs + hs..(row_t + 1) * 2 * hs];
         let mut hn = vec![0f32; n * hs];
@@ -2860,6 +3069,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_meanflow_grid_is_the_shifted_linspace() {
+        // H3-Tiny's `shifted_sigmas(6, 12)`
+        let want = [1.0, 10.0 / (1.0 + 55.0 / 6.0), 0.96, 6.0 / 6.5, 4.0 / (1.0 + 11.0 / 3.0), 2.0 / (1.0 + 11.0 / 6.0), 0.0];
+        let got = meanflow_sigmas(6, 12.0);
+        assert_eq!(got.len(), 7);
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-12, "{got:?}");
+        }
+        // the audio stream's points are the same grid on its own shift
+        for (i, &sv) in got.iter().enumerate() {
+            let x = 1.0 - i as f64 / 6.0;
+            let sa = 3.0 * x / (1.0 + 2.0 * x);
+            assert!((time_shift_sigma(sv, 12.0, 3.0) - sa).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn schedule_remap_is_an_involution() {
