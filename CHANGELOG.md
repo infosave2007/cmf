@@ -32,8 +32,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (lr 2e-4–5e-4). Adam's first step moves every trained weight by about `--lr-b`; clipped SGD moves all of
   them together by at most `--lr-b` in L2, so the notebooks' rate means a far smaller step than the same
   number under Adam.
+- `skill bake` on a discrete Vulkan card: the whole Phase-A step resident on the card (`gpu_wgpu::bake_res`),
+  the twin of the CUDA step — the ids go up; every layer (full attention or GDN, the masked FFN, both norms),
+  the final norm and the scored rows' cross-entropy run there, and with a gradient the backward down to each
+  layer's mask (through each frozen branch under `--through-attn`); the losses, their argmax and the mask
+  gradients come down. RTX 3060, a step of 4 × 64 tokens, the layer path → the resident step:
+
+  | | old gradient | `--through-attn` |
+  |---|---:|---:|
+  | Qwen3-0.6B (f16) | 0.90 → 0.21 s | 1.23 → 0.31 s |
+  | Qwen3.5-0.8B (q8_2f) | 1.32 → 0.22 s | 1.66 → 0.32 s |
+
+  The held-out PPL after 34 steps is the layer path's (1.555 / 1.554, 1.344, 1.431, 1.273); the whole 510-step
+  bake with `--through-attn` takes 160 s and 167 s (CUDA 67 s and 183 s) and reaches CUDA's best held-out PPL
+  (1.224, 1.201). The f32 tile GEMMs
+  split a long K when their output is too small to fill the card (a 256 × 1024 product is 64 tiles; the head's
+  backward summed 248k vocabulary columns in one thread) — also the closer sum: against f64 at K = 65 536 a
+  relative error of 4.8e-7 against 4.5e-6. The cross-entropy takes the target's own terms from the other
+  columns' sum, so a near-certain target keeps its digits. The backward reads the attention planes and GDN
+  inputs the forward kept per layer, within `CMF_BAKE_RES_SAVE_MB` (default 1024), and recomputes them past it.
+  `CMF_BAKE_RESIDENT=0` runs the layer path, `CMF_BAKE_SPLITK=0` keeps K whole; `CMF_BAKE_RES_CHECK=1` checks
+  every resident step (CUDA or Vulkan) against the layer path on the same batch — the loss and each layer's
+  mask gradient — and `CMF_BAKE_RES_PROF=1` prints the Vulkan step's sections. Unified memory keeps the layer
+  path.
+- `skill bake` on Vulkan: the GDN layers of a Qwen3.5-class model run the NVG trainer's f32 operator on the card
+  (the backward replays it) instead of the host's f64 recurrence — the layer path's step with `--through-attn`
+  5.3 → 1.7 s on Qwen3.5-0.8B, the same held-out PPL as CPU and CUDA.
 
 ### Fixed
+- `skill bake --through-attn` on Vulkan: the wgpu `gemm_dx` wrote its product over dX where the contract (and the
+  CPU and CUDA twins) is dX += dY·W, so a GDN layer's four projections kept only the last one's gradient
+  (Qwen3.5-0.8B: held-out PPL 2.764 after 4 steps against 2.441 on CPU and CUDA).
 - `skill bake` on Vulkan: the strict-f32 Phase A (the default) declined every wgpu chain — their GEMMs are the
   f16-staged coop kernels — and ran its products on the host, 7.7 s a step of Qwen3-0.6B on an RTX 3060 against
   0.7 s with `CMF_BAKE_A_STRICT=0`. A discrete card now takes plain-f32 tile kernels with the coop kernels'
