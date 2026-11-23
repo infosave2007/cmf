@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `skill bake --through-attn`: Phase A's mask gradient also runs through every frozen attention (and GDN)
+  branch — o_proj, the output gate, the attention core, RoPE, the q/k norms and the projections, input
+  gradient only — as the DTG-MA notebooks' autograd does. Without it a frozen branch was skipped and the
+  mask saw no path from a prompt position to a later target, so a skill learned the answer's format but
+  not what to copy into it. Qwen3-0.6B (f16), the patent-2 ODE task (300 templated equations, 510 steps of
+  4×64 tokens, mask lr 0.1, init 2.0, L1 0.56, soft mask), greedy 32 tokens over a raw prompt, 100 test
+  equations with the training coefficients and 100 with coefficients never trained on: 49 % / 5 % →
+  84 % / 80 % (80 of 80 on the four equation kinds whose coefficients vary in training; the base model,
+  given the chat template and 300 tokens, 61 % / 46 %). On an M4 a step takes 1.1 s against 0.9 s; the
+  CUDA resident step does not take it yet (with the flag the layer-by-layer path runs).
+- `skill bake --fcd-optim sgd`: Phase B with plain SGD under the same global-norm clip, the notebooks' FCD
+  (lr 2e-4–5e-4). Adam's first step moves every trained weight by about `--lr-b`; clipped SGD moves all of
+  them together by at most `--lr-b` in L2, so the notebooks' rate means a far smaller step than the same
+  number under Adam.
+
 ## [0.9.17] — 2026-11-23
 
 ### Added

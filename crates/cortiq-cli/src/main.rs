@@ -4432,7 +4432,7 @@ enum SkillCmd {
         /// Phase A Adam learning rate
         #[arg(long, default_value = "0.1")]
         lr_a: f64,
-        /// Phase B FCD Adam learning rate
+        /// Phase B FCD learning rate (Adam; with --fcd-optim sgd the SGD step)
         #[arg(long, default_value = "0.00001")]
         lr_b: f64,
         /// Evaluate and checkpoint every N steps
@@ -4513,6 +4513,14 @@ enum SkillCmd {
         /// the projected head gate and both norm gains of the FCD layers
         #[arg(long)]
         fcd_attn: bool,
+        /// Phase B's optimizer: adam, or sgd (plain SGD under the same global-norm clip, the
+        /// DTG-MA notebooks' FCD; give it the notebooks' --lr-b, e.g. 0.0005)
+        #[arg(long, default_value = "adam", value_parser = ["adam", "sgd"])]
+        fcd_optim: String,
+        /// Phase A's mask gradient also runs through every frozen attention (and GDN)
+        /// branch, as the DTG-MA notebooks' autograd does (slower per step)
+        #[arg(long)]
+        through_attn: bool,
         /// Write each Phase-A evaluation's mask logits into this directory
         /// (phase-a-step-N.json, usable with --mask-from) as the run goes
         #[arg(long)]
@@ -7200,6 +7208,8 @@ async fn main() -> anyhow::Result<()> {
                 no_defrag,
                 mask_name,
                 fcd_attn,
+                fcd_optim,
+                through_attn,
                 checkpoint_dir,
                 held_tags,
                 target_sparsity,
@@ -7245,6 +7255,8 @@ async fn main() -> anyhow::Result<()> {
                 no_defrag,
                 &mask_name,
                 fcd_attn,
+                fcd_optim == "sgd",
+                through_attn,
                 checkpoint_dir.as_deref(),
                 held_tags.as_deref(),
                 target_sparsity,

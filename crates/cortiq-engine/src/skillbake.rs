@@ -238,6 +238,17 @@ pub struct BakeHyper {
     /// (q/k/v/o, the projected head gate) and both norm gains of the FCD
     /// layers — the notebook's "unfreeze the last N layers entirely".
     pub fcd_attn: bool,
+    /// Phase B with plain SGD under the same global-norm clip, the DTG-MA
+    /// notebooks' FCD (lr 2e-4–5e-4), instead of Adam. Adam's first step
+    /// moves every trained weight by about `lr_b`; clipped SGD moves all of
+    /// them together by at most `lr_b` in L2.
+    pub fcd_sgd: bool,
+    /// Phase A's mask backward also runs through every frozen attention
+    /// (and GDN) branch, as autograd does in the DTG-MA notebooks: the mask
+    /// can then shape what a later position reads from an earlier one (a
+    /// coefficient copied from the prompt into the answer). Off = the older,
+    /// cheaper gradient along the residual and FFN path only.
+    pub through_attn: bool,
     /// Write every Phase-A evaluation's mask logits to
     /// `<dir>/phase-a-step-<n>.json` as it happens (a `--mask-from` input),
     /// so a long run survives being stopped.
@@ -279,6 +290,8 @@ impl Default for BakeHyper {
             mask_logits: None,
             soft_fold: false,
             fcd_attn: false,
+            fcd_sgd: false,
+            through_attn: false,
             checkpoint_dir: None,
             held_tags: None,
         }
@@ -429,6 +442,35 @@ impl Adam {
     }
 }
 
+/// Phase B's optimizer: Adam, or the notebooks' plain SGD under the same
+/// global-norm clip (`BakeHyper::fcd_sgd`).
+enum FcdOpt {
+    Adam(Adam),
+    Sgd { lr: f64 },
+}
+
+impl FcdOpt {
+    fn step(&mut self, params: &mut [&mut [f32]], grads: &[Vec<f64>], lr_scale: f64) {
+        match self {
+            FcdOpt::Adam(adam) => adam.step(params, grads, lr_scale),
+            FcdOpt::Sgd { lr } => {
+                let gn: f64 = grads
+                    .iter()
+                    .flat_map(|g| g.iter().map(|x| x * x))
+                    .sum::<f64>()
+                    .sqrt();
+                let clip = if gn > CLIP { CLIP / gn } else { 1.0 };
+                let s = *lr * lr_scale * clip;
+                for (p, g) in params.iter_mut().zip(grads) {
+                    for (w, d) in p.iter_mut().zip(g) {
+                        *w -= (s * d) as f32;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Mask logit at step zero, solved for the loop depth.
 ///
 /// The gate multiplies the FFN once per VISIT, so a Looped Transformer
@@ -532,6 +574,9 @@ struct Pass<'a> {
     soft_fold: bool,
     /// Full-layer FCD masters per layer (attention + norms); None = frozen.
     attn_tr: &'a [Option<AttnMasters>],
+    /// The mask backward also runs through each frozen attention (or GDN)
+    /// branch (`BakeHyper::through_attn`).
+    through_attn: bool,
 }
 
 /// Raw-pointer carriers for pooled row writes (disjoint ranges per worker).
@@ -750,7 +795,7 @@ impl Pass<'_> {
         if !crate::gpu::cuda_active() || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
             return None;
         }
-        if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
+        if self.through_attn || self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
             return None;
         }
         let t = ids.len() / b;
@@ -1035,7 +1080,7 @@ impl Pass<'_> {
                 Some(&g),
                 planes_host,
                 attn_w,
-                want && attn_w.is_some(),
+                want && (attn_w.is_some() || self.through_attn),
             );
             h_ins.push(if want { h } else { Vec::new() });
             acts.push(a);
@@ -1435,11 +1480,17 @@ impl Pass<'_> {
                     }
                 }
             }
-            // Post-norm backward into h1; a frozen attention branch carries
-            // no gradient, so dh1 flows straight to dh_in.
+            // Post-norm backward into h1. Without `through_attn` a frozen
+            // attention branch is skipped and dh1 flows straight to dh_in:
+            // the mask then sees no path from a prompt position to a later
+            // target, though the branch's weights being frozen only removes
+            // their own gradient, not the one through it.
             let mut dh1 = dh.clone(); // residual h2 = h1 + ffn
             rmsnorm_bwd_pooled(&a.h1, wts.pln, &a.inv2, &dn2, fm.gemma, &mut dh1, pool);
-            if let (Some(m), Some(dg)) = (&self.attn_tr[li], dattn[li].as_mut()) {
+            if self.through_attn && self.attn_tr[li].is_none() {
+                let dn1 = fm.attn_through_bwd(li, a, &dh1, b, t);
+                rmsnorm_bwd_pooled(&h_ins[vl], wts.iln, &a.inv1, &dn1, fm.gemma, &mut dh1, pool);
+            } else if let (Some(m), Some(dg)) = (&self.attn_tr[li], dattn[li].as_mut()) {
                 // Full-layer FCD: through the trained attention — post-norm
                 // gain, o_proj, the head gate, the attention core (device),
                 // RoPE, q/k/v projections, the input norm — into dh_in.
@@ -2111,6 +2162,7 @@ pub fn replica_score_file_mask(
             span: None,
             soft_fold: false,
             attn_tr: &no_attn,
+            through_attn: false,
         };
         held_ppl(&pass, chunks)
     };
@@ -2189,6 +2241,7 @@ pub fn skill_bake(
             span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
         };
         let score = held_score(&pass, &held);
         let keep: Vec<Vec<bool>> = fm
@@ -2296,6 +2349,7 @@ pub fn skill_bake(
         span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
     };
     // CMF_BAKE_SKIP_BASELINE=1 with a supplied mask: a checkpoint
     // measurement that already knows the backbone's score skips its pass.
@@ -2335,6 +2389,7 @@ pub fn skill_bake(
             span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
         };
         let s0 = held_score_tagged(&start_pass, &held, held_tags.as_ref());
         log(&format!("supplied mask: {:.3}{}", s0.ppl, score_suffix(&s0)));
@@ -2394,6 +2449,7 @@ pub fn skill_bake(
             span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
         };
         let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
@@ -2435,6 +2491,7 @@ pub fn skill_bake(
                 span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
             };
             crate::gpu::bake_precision_strict(false);
             let hs = held_score_tagged(&pass, &held, held_tags.as_ref());
@@ -2647,6 +2704,7 @@ pub fn skill_bake(
         span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
     };
     // With no mask-training steps the hard mask is still exactly all-open,
     // so rescoring the same validation batch is pure duplicate work.  This
@@ -2705,7 +2763,11 @@ pub fn skill_bake(
         })
         .filter(|&n| n > 0)
         .collect();
-    let mut adam_b = Adam::new(&sizes, hy.lr_b);
+    let mut opt_b = if hy.fcd_sgd {
+        FcdOpt::Sgd { lr: hy.lr_b }
+    } else {
+        FcdOpt::Adam(Adam::new(&sizes, hy.lr_b))
+    };
     // The mask-only model is a real checkpoint too. If every FCD eval is
     // worse, restore `None` overlays rather than accidentally writing the
     // final (rejected) training step while reporting the mask-only PPL.
@@ -2729,6 +2791,7 @@ pub fn skill_bake(
             span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
         };
         log(&format!(
             "[B-cache] extracting native CMF boundaries: {} train + {} held records",
@@ -2803,7 +2866,7 @@ pub fn skill_bake(
             let (g, u, d) = ffn[last].as_mut().expect("cached FCD master");
             let mut params = vec![g.as_mut_slice(), u.as_mut_slice(), d.as_mut_slice()];
             let grads = vec![dg, du, dd];
-            adam_b.step(&mut params, &grads, lr_scale);
+            opt_b.step(&mut params, &grads, lr_scale);
             if (step + 1) % hy.eval_every == 0 {
                 let cur = {
                     let (g, u, d) = ffn[last].as_ref().expect("cached FCD master");
@@ -2867,6 +2930,7 @@ pub fn skill_bake(
                 span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
             };
             let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
             // Cosine LR.
@@ -2911,7 +2975,7 @@ pub fn skill_bake(
             // visit of a physical layer, and an FFN update perturbs BOTH
             // passes of the loop, so per-step damage is `loops` times what
             // lr_b was tuned for on ordinary stacks.
-            adam_b.step(&mut params, &grads, lr_scale * mask_step_scale(loops));
+            opt_b.step(&mut params, &grads, lr_scale * mask_step_scale(loops));
             if (step + 1) % hy.eval_every == 0 {
                 let pass = Pass {
                     fm: &fm,
@@ -2924,6 +2988,7 @@ pub fn skill_bake(
                     span: hy.answer_span.as_ref(),
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
+            through_attn: hy.through_attn,
                 };
                 let cur = held_score_tagged(&pass, &held, held_tags.as_ref());
                 let better = if hy.checkpoint_accuracy && hy.answer_span.is_some() {
