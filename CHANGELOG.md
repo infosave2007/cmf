@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.17] — 2026-11-23
+
 ### Added
 - MiniMax-H3: H3-Tiny's few-step student (MeanFlow) packs and runs. `animate-pack --dit` takes the ComfyUI file's
   low-rank adaLN (`linear_2(linear_1(silu(temb)))`, rank 8), its dense final adaLN and both time embedders; the
