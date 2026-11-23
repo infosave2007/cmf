@@ -1578,6 +1578,91 @@ impl FcdModel {
         crate::gpu_cuda::bake_phase_a(&step)
     }
 
+    /// `resident_step` on a wgpu card (`gpu_wgpu::bake_res::phase_a`): the
+    /// same stack and the same declines, discrete cards only.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resident_step_wgpu(
+        &self,
+        ids: &[u32],
+        b: usize,
+        ffn: &[(LnFfn<'_>, Vec<f32>)],
+        mats: &[std::sync::Arc<LayerMats>],
+        targets: &[usize],
+        scale: f32,
+        grad: bool,
+        through_attn: bool,
+    ) -> Option<crate::gpu_wgpu::bake_res::WgOut> {
+        use crate::gpu_wgpu::bake_res::{WgAttn, WgFull, WgGdn, WgLayer, WgStep};
+        if !crate::gpu::wgpu_active() || self.loops > 1 || ffn.len() != self.layers.len() || mats.len() != self.layers.len() || b == 0 {
+            return None;
+        }
+        if std::env::var("CMF_BAKE_RESIDENT").as_deref() == Ok("0") {
+            return None;
+        }
+        let t = ids.len() / b;
+        let tab = |local: bool| -> Vec<f32> {
+            let (rd, inv_freq) = self.layer_rope(local);
+            let half = rd / 2;
+            let mut v = Vec::with_capacity(t * half * 2);
+            for pos in 0..t {
+                for &fq in &inv_freq[..half] {
+                    let a = pos as f64 * fq;
+                    v.push(a.cos() as f32);
+                    v.push(a.sin() as f32);
+                }
+            }
+            v
+        };
+        let (tab_g, tab_l) = (tab(false), tab(true));
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (li, l) in self.layers.iter().enumerate() {
+            let (w, gain) = (&ffn[li].0, &ffn[li].1);
+            let gu = w.gu?;
+            let attn = match &l.attn {
+                FcdAttn::Gdn { wqkv, wz, wa, wb, wout, .. } => WgAttn::Gdn(WgGdn { cfg: self.wgpu_gdn_cfg(&l.attn)?, wqkv, wz, wa, wb, wout }),
+                FcdAttn::Full { q_norm, k_norm, bias, output_gate, head_gate, window, local_rope, .. } => {
+                    if bias.is_some() || head_gate.is_some() {
+                        return None;
+                    }
+                    let (rd, _) = self.layer_rope(*local_rope);
+                    WgAttn::Full(WgFull {
+                        wqkv: &mats[li].wqkv,
+                        wo: &mats[li].wo,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        gated: *output_gate,
+                        nh: self.nh,
+                        nkv: self.nkv,
+                        hd: self.hd,
+                        rope: if *local_rope { &tab_l } else { &tab_g },
+                        half: rd / 2,
+                        window: *window,
+                    })
+                }
+            };
+            layers.push(WgLayer { iln: w.iln, pln: w.pln, attn, gu, down: w.down, inter: l.inter, gain });
+        }
+        let step = WgStep {
+            layers,
+            ids,
+            b,
+            t,
+            hsz: self.hidden,
+            eps: self.eps as f32,
+            gemma: self.gemma,
+            act: self.act,
+            embed: &self.embed,
+            final_norm: &self.final_norm,
+            lm: self.lm_head.as_deref().unwrap_or(&self.embed),
+            targets,
+            scale,
+            grad,
+            through_attn,
+        };
+        crate::gpu_wgpu::bake_res::phase_a(&step)
+    }
+
     pub(crate) fn layer_rope(&self, local: bool) -> (usize, &[f64]) {
         if local {
             (

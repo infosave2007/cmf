@@ -106,6 +106,7 @@ pub(crate) mod blr;
 pub use blr::blr_matmat;
 /// GatedDeltaNet forward and BPTT backward on the device (training).
 pub mod gdn_train;
+pub(crate) mod bake_res;
 
 /// The decode matvec, the prompt flash attention and the prompt GEMM as
 /// `shader_stats` builds them (driver registers and shared memory).
@@ -54681,7 +54682,7 @@ fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// 64×64 tile a workgroup of 64 threads (8 × 8 outputs each), K in steps of
 /// 16 staged k-major in workgroup memory.
 const F32T_NT_SRC: &str = r#"
-struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+struct MmP { cols4: u32, rows: u32, nb: u32, kspan: u32 };
 @group(0) @binding(0) var<storage, read> wmm: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
@@ -54692,9 +54693,12 @@ const KS: u32 = 16u;
 var<workgroup> ta: array<vec4<f32>, 256>;
 var<workgroup> tb: array<vec4<f32>, 256>;
 
-fn store4(m: u32, n: u32, v: vec4<f32>) {
+// `kspan` > 0 splits K: workgroup z reduces columns [z·kspan, z·kspan + kspan)
+// into its own partial plane y[z][nb][rows] (summed by the caller); 0 is the
+// whole K into y.
+fn store4(zoff: u32, m: u32, n: u32, v: vec4<f32>) {
     if (m >= pmm.nb) { return; }
-    let base = m * pmm.rows;
+    let base = zoff + m * pmm.rows;
     if (n < pmm.rows) { ymm[base + n] = v.x; }
     if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
     if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
@@ -54705,6 +54709,9 @@ fn store4(m: u32, n: u32, v: vec4<f32>) {
 fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_index) tid: u32) {
     let cols = pmm.cols4 * 4u;
+    let kbeg = wid.z * pmm.kspan;
+    let kend = select(cols, min(kbeg + pmm.kspan, cols), pmm.kspan != 0u);
+    let zoff = wid.z * pmm.nb * pmm.rows;
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     // Thread (tm, tn) owns rows tm·8 … +7 and columns tn·8 … +7: sixteen
@@ -54720,9 +54727,9 @@ fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
     var c5a = vec4<f32>(); var c5b = vec4<f32>();
     var c6a = vec4<f32>(); var c6b = vec4<f32>();
     var c7a = vec4<f32>(); var c7b = vec4<f32>();
-    var k0 = 0u;
+    var k0 = kbeg;
     loop {
-        if (k0 >= cols) { break; }
+        if (k0 >= kend) { break; }
         // One 4×4 block of x and of w per thread: four vec4 rows along k,
         // transposed into k-major vec4s of four consecutive rows.
         let bm = tid / 4u;
@@ -54730,7 +54737,7 @@ fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
         let kc = k0 + bk;
         var x0 = vec4<f32>(); var x1 = vec4<f32>(); var x2 = vec4<f32>(); var x3 = vec4<f32>();
         var w0 = vec4<f32>(); var w1 = vec4<f32>(); var w2 = vec4<f32>(); var w3 = vec4<f32>();
-        if (kc < cols) {
+        if (kc < kend) {
             let r = m0 + bm * 4u;
             if (r < pmm.nb) { x0 = xmm[(r * cols + kc) >> 2u]; }
             if (r + 1u < pmm.nb) { x1 = xmm[((r + 1u) * cols + kc) >> 2u]; }
@@ -54770,21 +54777,21 @@ fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let mb = m0 + tm * 8u;
     let nb0 = n0 + tn * 8u;
-    store4(mb + 0u, nb0, c0a); store4(mb + 0u, nb0 + 4u, c0b);
-    store4(mb + 1u, nb0, c1a); store4(mb + 1u, nb0 + 4u, c1b);
-    store4(mb + 2u, nb0, c2a); store4(mb + 2u, nb0 + 4u, c2b);
-    store4(mb + 3u, nb0, c3a); store4(mb + 3u, nb0 + 4u, c3b);
-    store4(mb + 4u, nb0, c4a); store4(mb + 4u, nb0 + 4u, c4b);
-    store4(mb + 5u, nb0, c5a); store4(mb + 5u, nb0 + 4u, c5b);
-    store4(mb + 6u, nb0, c6a); store4(mb + 6u, nb0 + 4u, c6b);
-    store4(mb + 7u, nb0, c7a); store4(mb + 7u, nb0 + 4u, c7b);
+    store4(zoff, mb + 0u, nb0, c0a); store4(zoff, mb + 0u, nb0 + 4u, c0b);
+    store4(zoff, mb + 1u, nb0, c1a); store4(zoff, mb + 1u, nb0 + 4u, c1b);
+    store4(zoff, mb + 2u, nb0, c2a); store4(zoff, mb + 2u, nb0 + 4u, c2b);
+    store4(zoff, mb + 3u, nb0, c3a); store4(zoff, mb + 3u, nb0 + 4u, c3b);
+    store4(zoff, mb + 4u, nb0, c4a); store4(zoff, mb + 4u, nb0 + 4u, c4b);
+    store4(zoff, mb + 5u, nb0, c5a); store4(zoff, mb + 5u, nb0 + 4u, c5b);
+    store4(zoff, mb + 6u, nb0, c6a); store4(zoff, mb + 6u, nb0 + 4u, c6b);
+    store4(zoff, mb + 7u, nb0, c7a); store4(zoff, mb + 7u, nb0 + 4u, c7b);
 }
 "#;
 
 /// `gemm_nn_coop` in plain f32: y[nb][rows] = x[nb][cols]·w[cols][rows], the
 /// same tile and thread layout as `F32T_NT_SRC`.
 const F32T_NN_SRC: &str = r#"
-struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+struct MmP { cols4: u32, rows: u32, nb: u32, kspan: u32 };
 @group(0) @binding(0) var<storage, read> wmm: array<f32>;
 @group(0) @binding(1) var<storage, read> xmm: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
@@ -54795,9 +54802,12 @@ const KS: u32 = 16u;
 var<workgroup> ta: array<vec4<f32>, 256>;
 var<workgroup> tb: array<vec4<f32>, 256>;
 
-fn store4(m: u32, n: u32, v: vec4<f32>) {
+// `kspan` > 0 splits K: workgroup z reduces columns [z·kspan, z·kspan + kspan)
+// into its own partial plane y[z][nb][rows] (summed by the caller); 0 is the
+// whole K into y.
+fn store4(zoff: u32, m: u32, n: u32, v: vec4<f32>) {
     if (m >= pmm.nb) { return; }
-    let base = m * pmm.rows;
+    let base = zoff + m * pmm.rows;
     if (n < pmm.rows) { ymm[base + n] = v.x; }
     if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
     if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
@@ -54808,6 +54818,9 @@ fn store4(m: u32, n: u32, v: vec4<f32>) {
 fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_index) tid: u32) {
     let cols = pmm.cols4 * 4u;
+    let kbeg = wid.z * pmm.kspan;
+    let kend = select(cols, min(kbeg + pmm.kspan, cols), pmm.kspan != 0u);
+    let zoff = wid.z * pmm.nb * pmm.rows;
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     // Thread (tm, tn) owns rows tm·8 … +7 and columns tn·8 … +7: sixteen
@@ -54823,9 +54836,9 @@ fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
     var c5a = vec4<f32>(); var c5b = vec4<f32>();
     var c6a = vec4<f32>(); var c6b = vec4<f32>();
     var c7a = vec4<f32>(); var c7b = vec4<f32>();
-    var k0 = 0u;
+    var k0 = kbeg;
     loop {
-        if (k0 >= cols) { break; }
+        if (k0 >= kend) { break; }
         // x: a 4×4 block per thread (rows bm·4 …, k bk …), transposed into
         // k-major vec4s; w [cols][rows]: four vec4s along the output row.
         let bm = tid / 4u;
@@ -54834,7 +54847,7 @@ fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
         for (var j = 0u; j < 4u; j = j + 1u) {
             let k = k0 + bk + j;
             var v = vec4<f32>();
-            if (k < cols) {
+            if (k < kend) {
                 if (r < pmm.nb) { v.x = xmm[r * cols + k]; }
                 if (r + 1u < pmm.nb) { v.y = xmm[(r + 1u) * cols + k]; }
                 if (r + 2u < pmm.nb) { v.z = xmm[(r + 2u) * cols + k]; }
@@ -54846,7 +54859,7 @@ fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
             let k = k0 + e / 16u;
             let q = n0 + (e % 16u) * 4u;
             var u = vec4<f32>();
-            if (k < cols) {
+            if (k < kend) {
                 let base = k * pmm.rows + q;
                 if (q < pmm.rows) { u.x = wmm[base]; }
                 if (q + 1u < pmm.rows) { u.y = wmm[base + 1u]; }
@@ -54875,14 +54888,14 @@ fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let mb = m0 + tm * 8u;
     let nb0 = n0 + tn * 8u;
-    store4(mb + 0u, nb0, c0a); store4(mb + 0u, nb0 + 4u, c0b);
-    store4(mb + 1u, nb0, c1a); store4(mb + 1u, nb0 + 4u, c1b);
-    store4(mb + 2u, nb0, c2a); store4(mb + 2u, nb0 + 4u, c2b);
-    store4(mb + 3u, nb0, c3a); store4(mb + 3u, nb0 + 4u, c3b);
-    store4(mb + 4u, nb0, c4a); store4(mb + 4u, nb0 + 4u, c4b);
-    store4(mb + 5u, nb0, c5a); store4(mb + 5u, nb0 + 4u, c5b);
-    store4(mb + 6u, nb0, c6a); store4(mb + 6u, nb0 + 4u, c6b);
-    store4(mb + 7u, nb0, c7a); store4(mb + 7u, nb0 + 4u, c7b);
+    store4(zoff, mb + 0u, nb0, c0a); store4(zoff, mb + 0u, nb0 + 4u, c0b);
+    store4(zoff, mb + 1u, nb0, c1a); store4(zoff, mb + 1u, nb0 + 4u, c1b);
+    store4(zoff, mb + 2u, nb0, c2a); store4(zoff, mb + 2u, nb0 + 4u, c2b);
+    store4(zoff, mb + 3u, nb0, c3a); store4(zoff, mb + 3u, nb0 + 4u, c3b);
+    store4(zoff, mb + 4u, nb0, c4a); store4(zoff, mb + 4u, nb0 + 4u, c4b);
+    store4(zoff, mb + 5u, nb0, c5a); store4(zoff, mb + 5u, nb0 + 4u, c5b);
+    store4(zoff, mb + 6u, nb0, c6a); store4(zoff, mb + 6u, nb0 + 4u, c6b);
+    store4(zoff, mb + 7u, nb0, c7a); store4(zoff, mb + 7u, nb0 + 4u, c7b);
 }
 "#;
 
