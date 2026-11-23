@@ -20493,6 +20493,12 @@ pub struct Ctx {
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
     /// Its backward twin (reduction over w's leading axis) for `gemm_dx_f32`.
     gemm_nn_coop: Option<wgpu::ComputePipeline>,
+    /// The same two GEMMs in plain f32 on the shader cores (`F32T_NT_SRC`,
+    /// `F32T_NN_SRC`: the coop kernels' bindings, parameters and 64×64
+    /// grid). The bake's strict-f32 phase and coop-less devices take them
+    /// where the f16-staged coop kernels may not run.
+    gemm_nt_f32t: wgpu::ComputePipeline,
+    gemm_nn_f32t: wgpu::ComputePipeline,
     /// silu(g)·u·scale between the chain's two GEMMs (plain f32 module).
     bake_silu: wgpu::ComputePipeline,
     /// Its backward: dact + the resident plane → concatenated dgu.
@@ -23184,6 +23190,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
             cache: pcache.as_ref(),
         })
     };
+    let gemm_nt_f32t = plain(F32T_NT_SRC, "bake-nt-f32t", "gemm_nt_f32t");
+    let gemm_nn_f32t = plain(F32T_NN_SRC, "bake-nn-f32t", "gemm_nn_f32t");
     let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
     let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
     let bake_gelu = plain(BAKE_GELU_SRC, "bake-gelu", "bake_gelu_mul");
@@ -24064,6 +24072,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop_f16_m128,
         gemm_nt_coop,
         gemm_nn_coop,
+        gemm_nt_f32t,
+        gemm_nn_f32t,
         bake_silu,
         bake_silu_bwd,
         bake_gelu,
@@ -54667,6 +54677,215 @@ fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// the B staging reads a column of w per output: four stride-`rows` loads
 /// where the forward kernel read four consecutive. Everything else —
 /// tiles, loads, the store — is the forward kernel unchanged.
+/// `gemm_nt_coop` in plain f32: y[nb][rows] = x[nb][cols]·w[rows][cols]ᵀ, a
+/// 64×64 tile a workgroup of 64 threads (8 × 8 outputs each), K in steps of
+/// 16 staged k-major in workgroup memory.
+const F32T_NT_SRC: &str = r#"
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 16u;
+// k-major tiles: ta[k·16 + i] holds rows 4i … 4i+3 at k, tb the columns.
+var<workgroup> ta: array<vec4<f32>, 256>;
+var<workgroup> tb: array<vec4<f32>, 256>;
+
+fn store4(m: u32, n: u32, v: vec4<f32>) {
+    if (m >= pmm.nb) { return; }
+    let base = m * pmm.rows;
+    if (n < pmm.rows) { ymm[base + n] = v.x; }
+    if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
+    if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
+    if (n + 3u < pmm.rows) { ymm[base + n + 3u] = v.w; }
+}
+
+@compute @workgroup_size(64)
+fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32) {
+    let cols = pmm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    // Thread (tm, tn) owns rows tm·8 … +7 and columns tn·8 … +7: sixteen
+    // named vec4 accumulators (a private array indexed at run time spills
+    // to memory under WGSL).
+    let tm = tid / 8u;
+    let tn = tid % 8u;
+    var c0a = vec4<f32>(); var c0b = vec4<f32>();
+    var c1a = vec4<f32>(); var c1b = vec4<f32>();
+    var c2a = vec4<f32>(); var c2b = vec4<f32>();
+    var c3a = vec4<f32>(); var c3b = vec4<f32>();
+    var c4a = vec4<f32>(); var c4b = vec4<f32>();
+    var c5a = vec4<f32>(); var c5b = vec4<f32>();
+    var c6a = vec4<f32>(); var c6b = vec4<f32>();
+    var c7a = vec4<f32>(); var c7b = vec4<f32>();
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // One 4×4 block of x and of w per thread: four vec4 rows along k,
+        // transposed into k-major vec4s of four consecutive rows.
+        let bm = tid / 4u;
+        let bk = (tid % 4u) * 4u;
+        let kc = k0 + bk;
+        var x0 = vec4<f32>(); var x1 = vec4<f32>(); var x2 = vec4<f32>(); var x3 = vec4<f32>();
+        var w0 = vec4<f32>(); var w1 = vec4<f32>(); var w2 = vec4<f32>(); var w3 = vec4<f32>();
+        if (kc < cols) {
+            let r = m0 + bm * 4u;
+            if (r < pmm.nb) { x0 = xmm[(r * cols + kc) >> 2u]; }
+            if (r + 1u < pmm.nb) { x1 = xmm[((r + 1u) * cols + kc) >> 2u]; }
+            if (r + 2u < pmm.nb) { x2 = xmm[((r + 2u) * cols + kc) >> 2u]; }
+            if (r + 3u < pmm.nb) { x3 = xmm[((r + 3u) * cols + kc) >> 2u]; }
+            let q = n0 + bm * 4u;
+            if (q < pmm.rows) { w0 = wmm[(q * cols + kc) >> 2u]; }
+            if (q + 1u < pmm.rows) { w1 = wmm[((q + 1u) * cols + kc) >> 2u]; }
+            if (q + 2u < pmm.rows) { w2 = wmm[((q + 2u) * cols + kc) >> 2u]; }
+            if (q + 3u < pmm.rows) { w3 = wmm[((q + 3u) * cols + kc) >> 2u]; }
+        }
+        ta[bk * 16u + bm] = vec4<f32>(x0.x, x1.x, x2.x, x3.x);
+        ta[(bk + 1u) * 16u + bm] = vec4<f32>(x0.y, x1.y, x2.y, x3.y);
+        ta[(bk + 2u) * 16u + bm] = vec4<f32>(x0.z, x1.z, x2.z, x3.z);
+        ta[(bk + 3u) * 16u + bm] = vec4<f32>(x0.w, x1.w, x2.w, x3.w);
+        tb[bk * 16u + bm] = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
+        tb[(bk + 1u) * 16u + bm] = vec4<f32>(w0.y, w1.y, w2.y, w3.y);
+        tb[(bk + 2u) * 16u + bm] = vec4<f32>(w0.z, w1.z, w2.z, w3.z);
+        tb[(bk + 3u) * 16u + bm] = vec4<f32>(w0.w, w1.w, w2.w, w3.w);
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 1u) {
+            let a0 = ta[kk * 16u + tm * 2u];
+            let a1 = ta[kk * 16u + tm * 2u + 1u];
+            let b0 = tb[kk * 16u + tn * 2u];
+            let b1 = tb[kk * 16u + tn * 2u + 1u];
+            c0a = fma(vec4<f32>(a0.x), b0, c0a); c0b = fma(vec4<f32>(a0.x), b1, c0b);
+            c1a = fma(vec4<f32>(a0.y), b0, c1a); c1b = fma(vec4<f32>(a0.y), b1, c1b);
+            c2a = fma(vec4<f32>(a0.z), b0, c2a); c2b = fma(vec4<f32>(a0.z), b1, c2b);
+            c3a = fma(vec4<f32>(a0.w), b0, c3a); c3b = fma(vec4<f32>(a0.w), b1, c3b);
+            c4a = fma(vec4<f32>(a1.x), b0, c4a); c4b = fma(vec4<f32>(a1.x), b1, c4b);
+            c5a = fma(vec4<f32>(a1.y), b0, c5a); c5b = fma(vec4<f32>(a1.y), b1, c5b);
+            c6a = fma(vec4<f32>(a1.z), b0, c6a); c6b = fma(vec4<f32>(a1.z), b1, c6b);
+            c7a = fma(vec4<f32>(a1.w), b0, c7a); c7b = fma(vec4<f32>(a1.w), b1, c7b);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    let mb = m0 + tm * 8u;
+    let nb0 = n0 + tn * 8u;
+    store4(mb + 0u, nb0, c0a); store4(mb + 0u, nb0 + 4u, c0b);
+    store4(mb + 1u, nb0, c1a); store4(mb + 1u, nb0 + 4u, c1b);
+    store4(mb + 2u, nb0, c2a); store4(mb + 2u, nb0 + 4u, c2b);
+    store4(mb + 3u, nb0, c3a); store4(mb + 3u, nb0 + 4u, c3b);
+    store4(mb + 4u, nb0, c4a); store4(mb + 4u, nb0 + 4u, c4b);
+    store4(mb + 5u, nb0, c5a); store4(mb + 5u, nb0 + 4u, c5b);
+    store4(mb + 6u, nb0, c6a); store4(mb + 6u, nb0 + 4u, c6b);
+    store4(mb + 7u, nb0, c7a); store4(mb + 7u, nb0 + 4u, c7b);
+}
+"#;
+
+/// `gemm_nn_coop` in plain f32: y[nb][rows] = x[nb][cols]·w[cols][rows], the
+/// same tile and thread layout as `F32T_NT_SRC`.
+const F32T_NN_SRC: &str = r#"
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<f32>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 16u;
+// k-major tiles: ta[k·16 + i] holds rows 4i … 4i+3 at k, tb the columns.
+var<workgroup> ta: array<vec4<f32>, 256>;
+var<workgroup> tb: array<vec4<f32>, 256>;
+
+fn store4(m: u32, n: u32, v: vec4<f32>) {
+    if (m >= pmm.nb) { return; }
+    let base = m * pmm.rows;
+    if (n < pmm.rows) { ymm[base + n] = v.x; }
+    if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
+    if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
+    if (n + 3u < pmm.rows) { ymm[base + n + 3u] = v.w; }
+}
+
+@compute @workgroup_size(64)
+fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32) {
+    let cols = pmm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    // Thread (tm, tn) owns rows tm·8 … +7 and columns tn·8 … +7: sixteen
+    // named vec4 accumulators (a private array indexed at run time spills
+    // to memory under WGSL).
+    let tm = tid / 8u;
+    let tn = tid % 8u;
+    var c0a = vec4<f32>(); var c0b = vec4<f32>();
+    var c1a = vec4<f32>(); var c1b = vec4<f32>();
+    var c2a = vec4<f32>(); var c2b = vec4<f32>();
+    var c3a = vec4<f32>(); var c3b = vec4<f32>();
+    var c4a = vec4<f32>(); var c4b = vec4<f32>();
+    var c5a = vec4<f32>(); var c5b = vec4<f32>();
+    var c6a = vec4<f32>(); var c6b = vec4<f32>();
+    var c7a = vec4<f32>(); var c7b = vec4<f32>();
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // x: a 4×4 block per thread (rows bm·4 …, k bk …), transposed into
+        // k-major vec4s; w [cols][rows]: four vec4s along the output row.
+        let bm = tid / 4u;
+        let bk = (tid % 4u) * 4u;
+        let r = m0 + bm * 4u;
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let k = k0 + bk + j;
+            var v = vec4<f32>();
+            if (k < cols) {
+                if (r < pmm.nb) { v.x = xmm[r * cols + k]; }
+                if (r + 1u < pmm.nb) { v.y = xmm[(r + 1u) * cols + k]; }
+                if (r + 2u < pmm.nb) { v.z = xmm[(r + 2u) * cols + k]; }
+                if (r + 3u < pmm.nb) { v.w = xmm[(r + 3u) * cols + k]; }
+            }
+            ta[(bk + j) * 16u + bm] = v;
+        }
+        for (var e = tid; e < 256u; e = e + 64u) {
+            let k = k0 + e / 16u;
+            let q = n0 + (e % 16u) * 4u;
+            var u = vec4<f32>();
+            if (k < cols) {
+                let base = k * pmm.rows + q;
+                if (q < pmm.rows) { u.x = wmm[base]; }
+                if (q + 1u < pmm.rows) { u.y = wmm[base + 1u]; }
+                if (q + 2u < pmm.rows) { u.z = wmm[base + 2u]; }
+                if (q + 3u < pmm.rows) { u.w = wmm[base + 3u]; }
+            }
+            tb[e] = u;
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 1u) {
+            let a0 = ta[kk * 16u + tm * 2u];
+            let a1 = ta[kk * 16u + tm * 2u + 1u];
+            let b0 = tb[kk * 16u + tn * 2u];
+            let b1 = tb[kk * 16u + tn * 2u + 1u];
+            c0a = fma(vec4<f32>(a0.x), b0, c0a); c0b = fma(vec4<f32>(a0.x), b1, c0b);
+            c1a = fma(vec4<f32>(a0.y), b0, c1a); c1b = fma(vec4<f32>(a0.y), b1, c1b);
+            c2a = fma(vec4<f32>(a0.z), b0, c2a); c2b = fma(vec4<f32>(a0.z), b1, c2b);
+            c3a = fma(vec4<f32>(a0.w), b0, c3a); c3b = fma(vec4<f32>(a0.w), b1, c3b);
+            c4a = fma(vec4<f32>(a1.x), b0, c4a); c4b = fma(vec4<f32>(a1.x), b1, c4b);
+            c5a = fma(vec4<f32>(a1.y), b0, c5a); c5b = fma(vec4<f32>(a1.y), b1, c5b);
+            c6a = fma(vec4<f32>(a1.z), b0, c6a); c6b = fma(vec4<f32>(a1.z), b1, c6b);
+            c7a = fma(vec4<f32>(a1.w), b0, c7a); c7b = fma(vec4<f32>(a1.w), b1, c7b);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    let mb = m0 + tm * 8u;
+    let nb0 = n0 + tn * 8u;
+    store4(mb + 0u, nb0, c0a); store4(mb + 0u, nb0 + 4u, c0b);
+    store4(mb + 1u, nb0, c1a); store4(mb + 1u, nb0 + 4u, c1b);
+    store4(mb + 2u, nb0, c2a); store4(mb + 2u, nb0 + 4u, c2b);
+    store4(mb + 3u, nb0, c3a); store4(mb + 3u, nb0 + 4u, c3b);
+    store4(mb + 4u, nb0, c4a); store4(mb + 4u, nb0 + 4u, c4b);
+    store4(mb + 5u, nb0, c5a); store4(mb + 5u, nb0 + 4u, c5b);
+    store4(mb + 6u, nb0, c6a); store4(mb + 6u, nb0 + 4u, c6b);
+    store4(mb + 7u, nb0, c7a); store4(mb + 7u, nb0 + 4u, c7b);
+}
+"#;
+
 const COOP_NN_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -72318,6 +72537,27 @@ pub(crate) fn bake_f32_strict() -> bool {
     f32_strict()
 }
 
+/// The bake's forward GEMM pipeline: the f16-staged coop kernel, or — in
+/// the strict-f32 phase or without matrix units, on a discrete card — its
+/// plain-f32 twin (`F32T_NT_SRC`). None: the host (unified memory keeps its
+/// BLAS arm, faster than the shader cores there).
+fn bake_nt(c: &Ctx) -> Option<&wgpu::ComputePipeline> {
+    match c.gemm_nt_coop.as_ref() {
+        Some(p) if !f32_strict() => Some(p),
+        _ if c.discrete => Some(&c.gemm_nt_f32t),
+        _ => None,
+    }
+}
+
+/// `bake_nt` for the backward's NN product (`F32T_NN_SRC`).
+fn bake_nn(c: &Ctx) -> Option<&wgpu::ComputePipeline> {
+    match c.gemm_nn_coop.as_ref() {
+        Some(p) if !f32_strict() => Some(p),
+        _ if c.discrete => Some(&c.gemm_nn_f32t),
+        _ => None,
+    }
+}
+
 /// A bake weight on the card — but RESIDENT only once it has proven it
 /// recurs. Phase B hands this function a fresh activation matrix per dw
 /// step; a cache that adopts everything it sees grows by 250 MB a step
@@ -72775,10 +73015,15 @@ thread_local! {
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // The strict phase takes the plain-f32 tile kernel on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     // Small jobs lose to the round trip.
     if n * k * m < (1 << 22) {
@@ -72790,13 +73035,16 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     // becomes an ordinary call. Held to discrete cards for the big-m case:
     // on unified memory the head weight's device copy would be 2 GB of the
     // laptop's RAM that the CPU path does not spend.
-    let coop = c
-        .gemm_nt_coop
-        .as_ref()
-        .filter(|_| !MIMO_F32_GEMM.get())
-        .filter(|_| !COOP_BYPASS.with(|b| b.get()))
-        .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
-        .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
+    let coop = if f32_strict() {
+        Some(&c.gemm_nt_f32t)
+    } else {
+        c.gemm_nt_coop
+            .as_ref()
+            .filter(|_| !MIMO_F32_GEMM.get())
+            .filter(|_| !COOP_BYPASS.with(|b| b.get()))
+    }
+    .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
+    .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
     // illegal, and a huge PRODUCT is a hang: a phase-B dw shape
     // (3072×21504 = 66M workgroups, four billion threads) ran minutes
@@ -72918,10 +73166,15 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
 /// calls it three times a layer and nothing else touches the card
 /// there, so this is what decides whether a bake is GPU work or not.
 pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // The strict phase takes the plain-f32 tile kernel on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     if n * k * m < (1 << 22) || k > 65_000 || n > 65_000 {
         return false;
@@ -72989,9 +73242,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bake-dx"),
         });
-    let coop = c
-        .gemm_nn_coop
-        .as_ref()
+    let coop = if f32_strict() { Some(&c.gemm_nn_f32t) } else { c.gemm_nn_coop.as_ref() }
         .filter(|_| m % 4 == 0 && k.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535);
     // The scalar dx arm has NO probe arbitrating it — the call site takes
     // whatever this function accepts, shadowing the Accelerate arm on
@@ -73097,10 +73348,10 @@ pub fn ffn_chain_f32(
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu,
     };
-    let Some(nt) = c.gemm_nt_coop.as_ref() else {
+    let Some(nt) = bake_nt(c) else {
         return false;
     };
-    if f32_strict() || hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
+    if hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
         return false;
     }
     if (2 * inter).div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 {
@@ -73384,12 +73635,12 @@ pub fn attn_chain_f32(
     attn_out: &mut [f32],
     want_acts: bool,
 ) -> Option<AttnChainActs> {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return None;
     }
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let nt = c.gemm_nt_coop.as_ref()?;
+    let nt = bake_nt(c)?;
     let (b, t, nh, nkv, hd, hsz) = (cfg.b, cfg.t, cfg.nh, cfg.nkv, cfg.hd, cfg.hsz);
     let n = b * t;
     let qdim = nh * hd;
@@ -73804,10 +74055,15 @@ pub fn attn_bwd_chain_f32(
     dk: &mut [f32],
     dv: &mut [f32],
 ) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // Plain-f32 kernels: the strict phase runs them on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     let n = b * t;
     let qdim = nh * hd;
@@ -73978,11 +74234,10 @@ pub fn ffn_bwd_chain_f32(
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu_bwd,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu_bwd,
     };
-    let Some(nn) = c.gemm_nn_coop.as_ref() else {
+    let Some(nn) = bake_nn(c) else {
         return false;
     };
-    if f32_strict()
-        || !c.discrete
+    if !c.discrete
         || hsz % 4 != 0
         || inter % 2 != 0
         || n * hsz * 2 * inter < (1 << 22)

@@ -225,6 +225,15 @@ FCD 校正在最后两层、一两步内有效；Adam 的第一步会把每个�
 | 技能，软掩码，`--through-attn` | 84 % | 80 % |
 
 在新系数上，技能解出了训练中系数有变化的四类方程的全部 80 道，而 `y'' + k²y = 0` 一道也没有解出：训练中只出现过 k = 1。
+Qwen3.5-0.8B（q8_2f，技能在 RTX 3060 上通过叠加运行）连这一类也解出了：
+
+| Qwen3.5-0.8B | 训练系数 | 新系数 |
+|---|---:|---:|
+| 基础模型，聊天模板，300 个 token | 66 % | 44 % |
+| 技能，软掩码，`--through-attn` | 84 % | 96 % |
+
+在 CUDA 上 `--through-attn` 走常驻步：510 步的烘焙在 Qwen3-0.6B 上用时 67 秒，在 Qwen3.5-0.8B 上用时 183 秒（RTX 3060），
+技能的解码速度与基础模型相同。
 
 ```sh
 cortiq skill bake model.cmf --files train.txt --held-files held.txt --held 16 --calib-chunks 127 --chunk 64 \

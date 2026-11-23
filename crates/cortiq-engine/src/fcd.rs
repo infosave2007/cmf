@@ -1499,6 +1499,7 @@ impl FcdModel {
         targets: &[usize],
         scale: f32,
         grad: bool,
+        through_attn: bool,
     ) -> Option<crate::gpu_cuda::BkOut> {
         use crate::gpu_cuda::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkStep};
         if !crate::gpu::cuda_active() || self.loops > 1 || ffn.len() != self.layers.len() || mats.len() != self.layers.len() || b == 0 {
@@ -1572,6 +1573,7 @@ impl FcdModel {
             targets,
             scale,
             grad,
+            through_attn,
         };
         crate::gpu_cuda::bake_phase_a(&step)
     }

@@ -29,7 +29,9 @@ struct BkFuncs {
     rmsnorm_bwd: cs::CUfunction,
     add: cs::CUfunction,
     attn_prep: cs::CUfunction,
+    attn_prep_bwd: cs::CUfunction,
     gate_mul: cs::CUfunction,
+    gate_bwd: cs::CUfunction,
     gather: cs::CUfunction,
     scatter_add: cs::CUfunction,
 }
@@ -51,6 +53,9 @@ struct BkState {
     /// The resident step's per-layer saves (h1, inv2, the FFN plane), grown to
     /// the largest step.
     saves: Vec<(Buf, Buf, Buf)>,
+    /// With `BkStep::through_attn`: each layer's input h, for the backward
+    /// through its attention branch (recomputed from it).
+    saves_in: Vec<Buf>,
 }
 
 impl BkState {
@@ -165,7 +170,9 @@ fn funcs(c: &Ctx, s: &mut BkState, dk: usize, dv: usize) -> Res<BkFuncs> {
                 rmsnorm_bwd: func(m, "bk_rmsnorm_bwd")?,
                 add: func(m, "bk_add")?,
                 attn_prep: func(m, "bk_attn_prep")?,
+                attn_prep_bwd: func(m, "bk_attn_prep_bwd")?,
                 gate_mul: func(m, "bk_gate_mul")?,
+                gate_bwd: func(m, "bk_gate_bwd")?,
                 gather: func(m, "bk_gather")?,
                 scatter_add: func(m, "bk_scatter_add")?,
             })
@@ -878,6 +885,10 @@ pub struct BkStep<'a> {
     pub targets: &'a [usize],
     pub scale: f32,
     pub grad: bool,
+    /// The backward also runs through every frozen attention (and GDN)
+    /// branch (`BakeHyper::through_attn`); each layer's input is kept and its
+    /// attention recomputed from it.
+    pub through_attn: bool,
 }
 
 /// What a step returns: nll and argmax per scored target, the mask gradient
@@ -932,11 +943,135 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
     Ok(())
 }
 
+/// The full-attention branch's input gradient on the card: `dy` (at the
+/// branch's output, [n × hsz]) → `dx` (at its normed input `x`), frozen
+/// weights. The forward is recomputed from `x`: projections, q/k norm and
+/// RoPE, P; then o_proj, the output gate, the core, RoPE and the q/k norm
+/// backward, the projections' transpose.
+#[allow(clippy::too_many_arguments)]
+unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize, eps: f32, gemma: bool) -> Res<()> {
+    let (n, nh, nkv, hd) = (b * t, a.nh, a.nkv, a.hd);
+    let (qdim, kvdim, rep) = (nh * hd, nkv * hd, nh / nkv);
+    let qrows = if a.gated { 2 * qdim } else { qdim };
+    let fused = qrows + 2 * kvdim;
+    if a.wqkv.len() != fused * hsz || a.wo.len() != hsz * qdim || hd > 512 || a.rope.len() < t * a.half * 2 {
+        return Err("full attention geometry".into());
+    }
+    let mode = gemm_mode();
+    let (wq, wo) = (s.weight(a.wqkv)?, s.weight(a.wo)?);
+    let rope = s.up(c, "rope", a.rope)?;
+    let (qn, kn) = (match a.q_norm { Some(w) => s.up(c, "qn", w)?, None => s.scr("qn", 4)? }, match a.k_norm { Some(w) => s.up(c, "kn", w)?, None => s.scr("kn", 4)? });
+    let qkv = s.scr("qkv", n * fused * 4)?;
+    let (qr, kr, vp, gt) = (s.scr("qrot", n * qdim * 4)?, s.scr("krot", n * kvdim * 4)?, s.scr("vproj", n * kvdim * 4)?, s.scr("gate", n * qdim * 4)?);
+    let cnt = b * nh;
+    let per = cnt * t * hd;
+    let (qp, kp, vpp, op) = (s.scr("qp", per * 4)?, s.scr("kp", per * 4)?, s.scr("vp", per * 4)?, s.scr("op", per * 4)?);
+    let (pm, ptm) = (s.scr("P", cnt * t * t * 4)?, s.scr("PT", cnt * t * t * 4)?);
+    let sm = s.scr("S", cnt * t * t * 4)?;
+    let ao = s.scr("ao", n * qdim * 4)?;
+    let dao = s.scr("bdao", n * qdim * 4)?;
+    let dgt = s.scr("bdgate", n * qdim * 4)?;
+    let dop = s.scr("bdop", per * 4)?;
+    let (dp, ds, dst) = (s.scr("bdP", cnt * t * t * 4)?, s.scr("bdS", cnt * t * t * 4)?, s.scr("bdST", cnt * t * t * 4)?);
+    let (dqp, dkp, dvp) = (s.scr("bdqp", per * 4)?, s.scr("bdkp", per * 4)?, s.scr("bdvp", per * 4)?);
+    let (dq, dk, dv) = (s.scr("bdq", n * qdim * 4)?, s.scr("bdk", n * kvdim * 4)?, s.scr("bdv", n * kvdim * 4)?);
+    let dqkv = s.scr("bdqkv", n * fused * 4)?;
+    let (t_i, nh_i, nkv_i, hd_i, half_i, gated_i, gm_i, hq, hk) =
+        (t as i32, nh as i32, nkv as i32, hd as i32, a.half as i32, a.gated as i32, gemma as i32, a.q_norm.is_some() as i32, a.k_norm.is_some() as i32);
+    let (b_i, one, rep_i, w_i) = (b as i32, 1i32, rep as i32, a.window.map_or(0, |w| w as i32));
+    let scale = 1.0 / (hd as f32).sqrt();
+    let grid = ((per as u64).div_ceil(256) as u32, 1);
+    let qg = (((n * qdim) as u64).div_ceil(256) as u32, 1);
+    let kvg = (((n * kvdim) as u64).div_ceil(256) as u32, 1);
+    unsafe {
+        // the forward again, to P and the pre-gate head outputs
+        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, fused, mode)?;
+        c.launch(f.attn_prep, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, qr, kr, vp, gt, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
+        c.launch(f.attn_perm, grid, 256, 0, kargs!(qr, qp, b_i, t_i, nh_i, nh_i, hd_i, one))?;
+        c.launch(f.attn_perm, grid, 256, 0, kargs!(kr, kp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
+        c.launch(f.attn_perm, grid, 256, 0, kargs!(vp, vpp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
+        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, mode)?;
+        c.launch(f.softmax_fwd, ((cnt * t) as u32, 1), 128, 0, kargs!(sm, pm, ptm, t_i, w_i))?;
+        if a.gated {
+            c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, mode)?;
+            c.launch(f.attn_unperm, qg, 256, 0, kargs!(op, ao, b_i, t_i, nh_i, nh_i, hd_i, one))?;
+        }
+        // dao_eff = dy·Wo; through the output gate
+        c.gemm(false, false, qdim, n, hsz, 1.0, wo, qdim, dy, hsz, 0.0, dao, qdim, mode)?;
+        if a.gated {
+            let tot = (n * qdim) as i64;
+            c.launch(f.gate_bwd, qg, 256, 0, kargs!(dao, ao, gt, dgt, tot))?;
+        }
+        // the core: dP = dO·Vᵀ, dS, dQ = dS·K/√hd, dK = dSᵀ·Q/√hd, dV = Pᵀ·dO
+        c.launch(f.attn_perm, grid, 256, 0, kargs!(dao, dop, b_i, t_i, nh_i, nh_i, hd_i, one))?;
+        c.gemm_batched(true, t, t, hd, 1.0, vpp, hd, t * hd, dop, hd, t * hd, dp, t, t * t, cnt, mode)?;
+        c.launch(f.softmax_bwd, ((cnt * t) as u32, 1), 128, 0, kargs!(pm, dp, ds, dst, t_i))?;
+        c.gemm_batched(false, hd, t, t, scale, kp, hd, t * hd, ds, t, t * t, dqp, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, scale, qp, hd, t * hd, dst, t, t * t, dkp, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, 1.0, dop, hd, t * hd, ptm, t, t * t, dvp, hd, t * hd, cnt, mode)?;
+        c.launch(f.attn_unperm, qg, 256, 0, kargs!(dqp, dq, b_i, t_i, nh_i, nh_i, hd_i, one))?;
+        c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dkp, dk, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
+        c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dvp, dv, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
+        // RoPE and the q/k norm back to the projections, then their transpose
+        c.launch(f.attn_prep_bwd, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, dq, dk, dv, dgt, dqkv, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
+        c.gemm(false, false, hsz, n, fused, 1.0, wq, hsz, dqkv, fused, 0.0, dx, hsz, mode)?;
+    }
+    Ok(())
+}
+
+/// The GDN branch's input gradient on the card: `dy` → `dx` at its normed
+/// input `x`, frozen weights. The four projections and the conv are
+/// recomputed from `x`; then out_proj's transpose, the recurrence's BPTT,
+/// the conv's backward and the projections' transpose.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gdn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize) -> Res<()> {
+    let (n, cdim, vd, nv) = (b * t, g.c_dim(), g.nv * g.dv, g.nv);
+    let mode = gemm_mode();
+    let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
+    let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
+    let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
+    let (pre, cq) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?);
+    let dof = s.scr("bdof", n * vd * 4)?;
+    let (dcq, draw) = (s.scr("bdcq", n * cdim * 4)?, s.scr("bdraw", n * cdim * 4)?);
+    let (dz, da, db) = (s.scr("bdz", n * vd * 4)?, s.scr("bda", n * nv * 4)?, s.scr("bdb", n * nv * 4)?);
+    let per = seqs_per_launch(g, t, b);
+    let hist = s.scr("bhist", per * g.nv * (t + 1) * g.dk * g.dv * 4)?;
+    let kvh = s.scr("bkvh", per * g.nv * t * g.dv * 4)?;
+    let oh = s.scr("boh", per * g.nv * t * g.dv * 4)?;
+    let (n_i, t_i, cd_i, kk_i, nv_i, nk_i) = (n as i32, t as i32, cdim as i32, g.kk as i32, nv as i32, g.nk as i32);
+    let eps = g.eps;
+    let tot = (n * cdim) as u64;
+    unsafe {
+        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, cdim, mode)?;
+        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, x, hsz, 0.0, z, vd, mode)?;
+        c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, x, hsz, 0.0, a, nv, Gemm::F32)?;
+        c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, x, hsz, 0.0, bb, nv, Gemm::F32)?;
+        c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
+        // dof = dy·Wout
+        c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dy, hsz, 0.0, dof, vd, mode)?;
+        cu::memset_d8_async(dcq, 0, n * cdim * 4, c.stream).map_err(derr)?;
+        let mut s0 = 0usize;
+        while s0 < b {
+            let nb = per.min(b - s0);
+            let seq0 = s0 as i32;
+            c.launch(f.gdn_bwd, (nv as u32, nb as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, dof, dcq, dz, da, db, hist, kvh, oh, t_i, nv_i, nk_i, eps, seq0))?;
+            s0 += nb;
+        }
+        c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
+        // dx = draw·Wqkv + dz·Wz + da·Wa + db·Wb
+        c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, draw, cdim, 0.0, dx, hsz, mode)?;
+        c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dz, vd, 1.0, dx, hsz, mode)?;
+        c.gemm(false, false, hsz, n, nv, 1.0, wa, hsz, da, nv, 1.0, dx, hsz, Gemm::F32)?;
+        c.gemm(false, false, hsz, n, nv, 1.0, wb, hsz, db, nv, 1.0, dx, hsz, Gemm::F32)?;
+    }
+    Ok(())
+}
+
 /// A whole Phase-A step of the skill bake on the card: embeddings, every
 /// layer (frozen attention — GDN or full —, the masked FFN), the final norm,
 /// the cross-entropy over the scored rows and, with `grad`, the backward of
-/// the FFN path (the attention branch carries no gradient in Phase A: dh1
-/// flows to dh_in) down to each layer's mask gradient. Only the ids go up
+/// the FFN path down to each layer's mask gradient — through each frozen
+/// attention (or GDN) branch too with `through_attn`, else dh1 flows to dh_in. Only the ids go up
 /// and the per-target numbers and the mask gradients come down. None: the
 /// layer-by-layer host-orchestrated path.
 pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
@@ -993,11 +1128,25 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
         unsafe {
             c.launch(f.embed, gh, 256, 0, kargs!(emb, idb.ptr, h, n_i, hsz_i))?;
         }
+        let keep_in = st.grad && st.through_attn;
+        if keep_in {
+            while s.saves_in.len() < nl {
+                s.saves_in.push(Buf::new(4)?);
+            }
+            for li in 0..nl {
+                if s.saves_in[li].bytes < n * hsz * 4 {
+                    s.saves_in[li] = Buf::new(n * hsz * 4)?;
+                }
+            }
+        }
         for (li, l) in st.layers.iter().enumerate() {
             let iln = s.up(c, "riln", l.iln)?;
             let pln = s.up(c, "rpln", l.pln)?;
             let (h1, inv2) = (s.saves[li].0.ptr, s.saves[li].1.ptr);
             unsafe {
+                if keep_in {
+                    cu::memcpy_dtod_async(s.saves_in[li].ptr, h, n * hsz * 4, c.stream).map_err(derr)?;
+                }
                 c.launch(f.rmsnorm, (n as u32, 1), 256, 0, kargs!(h, iln, nrm, inv1, hsz_i, eps, gm))?;
             }
             match &l.attn {
@@ -1103,9 +1252,24 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                     c.gemm(false, false, inter, n, hsz, 1.0, wdn, inter, dh, hsz, 0.0, dact, inter, mode)?;
                     c.launch(f.ffn_act_bwd, (inter.div_ceil(256) as u32, n.div_ceil(64) as u32), 256, 0, kargs!(both, dact, gain, dgu, dml, n_i, in_i, gelu, one, rows))?;
                     c.gemm(false, false, hsz, n, 2 * inter, 1.0, wgu, hsz, dgu, 2 * inter, 0.0, dn2, hsz, mode)?;
-                    // dh1 = dh + post-norm backward (dh accumulates in place); the
-                    // frozen attention passes dh1 straight to dh_in
+                    // dh1 = dh + post-norm backward (dh accumulates in place);
+                    // without through_attn the frozen attention passes dh1
+                    // straight to dh_in
                     c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(h1, pln, inv2, dn2, dh, hsz_i, gm, acc))?;
+                }
+                if st.through_attn {
+                    // dh_in = dh1 + input-norm backward of the branch's dX
+                    let hin = s.saves_in[li].ptr;
+                    let iln = s.up(c, "riln", l.iln)?;
+                    let dn1 = s.scr("rdn1", n * hsz * 4)?;
+                    unsafe {
+                        c.launch(f.rmsnorm, (n as u32, 1), 256, 0, kargs!(hin, iln, nrm, inv1, hsz_i, eps, gm))?;
+                        match &l.attn {
+                            BkAttn::Full(fa) => full_attn_bwd_dev(c, s, &f, fa, nrm, dh, dn1, b, t, hsz, eps, st.gemma)?,
+                            BkAttn::Gdn(g, w) => gdn_bwd_dev(c, s, &f, g, w, nrm, dh, dn1, b, t, hsz)?,
+                        }
+                        c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(hin, iln, inv1, dn1, dh, hsz_i, gm, acc))?;
+                    }
                 }
             }
             let all = dtoh(c, dm, nl * max_inter)?;

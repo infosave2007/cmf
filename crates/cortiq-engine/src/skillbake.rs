@@ -795,7 +795,7 @@ impl Pass<'_> {
         if !crate::gpu::cuda_active() || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
             return None;
         }
-        if self.through_attn || self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
+        if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
             return None;
         }
         let t = ids.len() / b;
@@ -810,7 +810,7 @@ impl Pass<'_> {
         let ffn: Vec<(LnFfn, Vec<f32>)> = (0..nl).map(|li| (self.wts(li, &mats[li]), self.gates(li))).collect();
         let scored = targets.len();
         let inv_n = 1.0 / scored as f64;
-        let out = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, grad.is_some())?;
+        let out = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, grad.is_some(), self.through_attn)?;
         let mut nll = 0f64;
         let span_stats = self.span.is_some();
         let want_hits = focus_stats.is_some() && self.span.is_some_and(|sp| sp.values.is_some());

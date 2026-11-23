@@ -8,7 +8,11 @@ scripts measure it with a held-out coefficient set, three base settings, and the
 - `ode_repro.py`: PyTorch (MPS/CUDA/CPU) — the base three ways (raw 32 tokens, chat template with 300 tokens,
   one-shot), then the notebook's mask on every Linear (`--variant all`) or on the FFN neurons only (`--variant ffn`).
 - `make_corpus.py`: the same 300 training equations and 40 held ones as `train.txt` / `held.txt`.
-- `bake.sh`, `serve_eval.sh` + `engine_eval.py`: the engine bake and its accuracy over `/v1/completions`.
+- `bake.sh`, `serve_eval.sh` + `engine_eval.py`: the engine bake and its accuracy over `/v1/completions`
+  (`engine_eval.py PORT TAG chat`: the fair base, chat template with thinking off and 300 tokens).
+- On CUDA (`CMF_GPU=cuda`) bake on a q8_2f base (`BASE=…q8_2f.cmf`): the skill then keeps the base's codec and
+  serves through the card's graph (`skill export`, `skill apply --overlay`, `serve --skill ode`); an f16 base
+  bakes as well but serves on the host.
 
 ```sh
 python3 ode_repro.py --variant ffn --out B_ffn.json
