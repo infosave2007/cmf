@@ -2169,6 +2169,28 @@ impl FcdModel {
     /// projections → f64 conv+SiLU per sequence → pooled per-(seq,
     /// k-head) delta-rule recurrence → out_proj. Matches the runtime
     /// `gdn_forward` (parity-tested in fcd_gradcheck).
+    /// The wgpu GDN operator's configuration for this layer, when the device
+    /// path is up and the layer's geometry is the one it takes (dk = dv = 128).
+    /// `CMF_BAKE_WGPU_GDN=0` keeps the host operator.
+    #[cfg(feature = "gpu")]
+    fn wgpu_gdn_cfg<'a>(&self, attn: &'a FcdAttn) -> Option<crate::gpu_wgpu::gdn_train::GdnTrainCfg<'a>> {
+        let FcdAttn::Gdn { conv, a_log, dt_bias, norm, .. } = attn else {
+            return None;
+        };
+        let d = self.gdn?;
+        if d.dk != 128 || d.dv != 128 || d.nv % d.nk != 0 || std::env::var("CMF_BAKE_WGPU_GDN").as_deref() == Ok("0") {
+            return None;
+        }
+        if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || crate::gpu_wgpu::trainer_ctx().is_none() {
+            return None;
+        }
+        #[cfg(feature = "cuda")]
+        if crate::gpu::cuda_active() {
+            return None;
+        }
+        Some(crate::gpu_wgpu::gdn_train::GdnTrainCfg { nv: d.nv, nk: d.nk, kk: d.kk, rms_eps: self.eps, a_log, dt_bias, norm, conv })
+    }
+
     fn gdn_attn_fwd(&self, attn: &FcdAttn, n1: &[f32], b: usize, t: usize, want_streams: bool) -> (Vec<f32>, AttnActs) {
         let FcdAttn::Gdn {
             wqkv,
@@ -2267,6 +2289,21 @@ impl FcdModel {
                     prof::tick("gdn-out", t_out);
                     return (attn_out, AttnActs::Gdn { qkv, z, a, b: bstr });
                 }
+            }
+        }
+        // The NVG trainer's f32 GDN operator on wgpu (`gdn_train`, the same
+        // operator as `fcd_ops::gdn_seq_*`, dk = dv = 128).
+        #[cfg(feature = "gpu")]
+        if let Some(gc) = self.wgpu_gdn_cfg(attn) {
+            let t_gdn = std::time::Instant::now();
+            let done = crate::gpu_wgpu::gdn_train::gdn_forward(&gc, b, t, &qkv, &z, &a, &bstr);
+            prof::add(&prof::GDN, t_gdn);
+            if let Some((of, _tape)) = done {
+                let t_out = std::time::Instant::now();
+                let mut attn_out = vec![0f32; n * hsz];
+                ops::gemm_nt(&of, wout, &mut attn_out, n, vd, hsz, pool);
+                prof::tick("gdn-out", t_out);
+                return (attn_out, AttnActs::Gdn { qkv, z, a, b: bstr });
             }
         }
         // f64 streams (runtime-precision recurrence) + per-seq conv.
@@ -2773,6 +2810,23 @@ impl FcdModel {
                     ops::gemm_dx(&db, wb, &mut dn1, n, hsz, nv, pool);
                     return dn1;
                 }
+            }
+        }
+        // wgpu: the trainer's operator again from the kept streams (its
+        // forward records the tape the backward replays).
+        #[cfg(feature = "gpu")]
+        if let Some(gc) = self.wgpu_gdn_cfg(attn) {
+            let t_gdn = std::time::Instant::now();
+            let done = crate::gpu_wgpu::gdn_train::gdn_forward(&gc, b, t, qkv, z, a, bstr)
+                .and_then(|(_, tape)| crate::gpu_wgpu::gdn_train::gdn_backward(&gc, &tape, &dof));
+            prof::add(&prof::GDN, t_gdn);
+            if let Some((dqkv, dz, da, db)) = done {
+                let mut dn1 = vec![0f32; n * hsz];
+                ops::gemm_dx(&dqkv, wqkv, &mut dn1, n, hsz, c_dim, pool);
+                ops::gemm_dx(&dz, wz, &mut dn1, n, hsz, vd, pool);
+                ops::gemm_dx(&da, wa, &mut dn1, n, hsz, nv, pool);
+                ops::gemm_dx(&db, wb, &mut dn1, n, hsz, nv, pool);
+                return dn1;
             }
         }
         let qkv64: Vec<f64> = qkv.iter().map(|&v| v as f64).collect();

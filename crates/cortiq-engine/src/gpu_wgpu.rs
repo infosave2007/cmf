@@ -73300,7 +73300,17 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         pass.dispatch_workgroups(k as u32, n as u32, 1);
     }
     let bytes = (n * k * 4) as u64;
-    readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
+    // dX += dY·W, as `fcd_ops::gemm_dx` (and its CUDA twin) promise: a GDN
+    // layer's four projections and an FFN's gate and up accumulate into one
+    // dn. Reading the product straight into dx overwrote all but the last.
+    let mut prod = vec![0f32; n * k];
+    if !readback(c, enc, &dxb, &stage, bytes, &mut prod) {
+        return false;
+    }
+    for (d, p) in dx[..n * k].iter_mut().zip(&prod) {
+        *d += *p;
+    }
+    true
 }
 
 /// The bake's frozen FFN as ONE device chain: both = n2·guᵀ, act =
