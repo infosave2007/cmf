@@ -275,7 +275,7 @@ RTX 3060 through its overlay) gets that one too:
 
 On CUDA the resident step takes `--through-attn`: the 510-step bake runs in 67 s on Qwen3-0.6B and 183 s on
 Qwen3.5-0.8B (RTX 3060), and the skill decodes at the base's speed. On a discrete Vulkan card (`CMF_GPU=1`) the
-step is resident too: the same bake runs in 160 s and 167 s and reaches the same best held-out PPL.
+step is resident too: the same bake runs in 97 s and 127 s and reaches the same best held-out PPL.
 
 ```sh
 cortiq skill bake model.cmf --files train.txt --held-files held.txt --held 16 --calib-chunks 127 --chunk 64 \

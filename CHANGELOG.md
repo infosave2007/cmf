@@ -55,6 +55,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every resident step (CUDA or Vulkan) against the layer path on the same batch — the loss and each layer's
   mask gradient — and `CMF_BAKE_RES_PROF=1` prints the Vulkan step's sections. Unified memory keeps the layer
   path.
+- `skill bake` on Vulkan: faster kernels under both the resident step and the layer path. The attention core
+  (forward, both backward kernels) and the q/k norm + RoPE run on 32-wide subgroups where the device has them —
+  a subgroup takes one key or query at a time with its lanes on vec4s of the head, so a dot product reads a row
+  whole and closes with `subgroupAdd`, where a lane of the scalar kernels walked a strided row alone (same
+  bindings and results, closer to f64; the scalar kernels stay for other devices and `CMF_BAKE_ATTN_SG=0`).
+  The f32 tile GEMMs give each thread neighbouring vec4s of the tiles (owning 8 consecutive columns put two
+  lanes of a quarter-warp on one bank), the backward's NN product reads x and w as vec4s, and both build
+  without naga's bounds checks, as the trainer's kernels do (`CMF_BAKE_CHECKED=1` restores them). RTX 3060,
+  4 × 64 tokens, 16:8 heads of 128 unless noted:
+
+  | kernel | before | after |
+  |---|---:|---:|
+  | attention forward | 0.54 ms | 0.17 ms |
+  | attention backward, q / kv | 1.67 / 0.89 ms | 0.31 / 0.17 ms |
+  | the same at 2 × 512 tokens | 62 / 28 ms | 7.4 / 3.8 ms |
+  | q/k norm + RoPE, forward / backward | 0.28 / 0.37 ms | 0.05 / 0.06 ms |
+  | NT GEMM, the LM head (252 × 1024 × 151 936) | 4.5 TFLOPS | 5.6 TFLOPS |
+  | NN GEMM, 1024 × 1024 × 4096 | 4.1 TFLOPS | 6.0 TFLOPS |
+
+  A Phase-A step of the resident path: Qwen3-0.6B 0.21 → 0.15 s (0.31 → 0.19 s with `--through-attn`),
+  Qwen3.5-0.8B 0.22 → 0.17 s (0.32 → 0.25 s), the same held-out PPL; the whole 510-step bake with
+  `--through-attn` 160 → 97 s and 167 → 127 s (CUDA 67 s and 183 s), the same best held-out PPL (1.224, 1.201).
+  `scripts/kbench` times a bake kernel on a
+  card and checks it against f64 or another kernel without rebuilding the engine (it reads the shaders from
+  `gpu_wgpu.rs` by name).
 - `skill bake` on Vulkan: the GDN layers of a Qwen3.5-class model run the NVG trainer's f32 operator on the card
   (the backward replays it) instead of the host's f64 recurrence — the layer path's step with `--through-attn`
   5.3 → 1.7 s on Qwen3.5-0.8B, the same held-out PPL as CPU and CUDA.

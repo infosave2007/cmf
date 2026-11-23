@@ -261,7 +261,7 @@ CMF_GPU=cuda cortiq serve base+code.cmf --skill code                     # ка�
 
 На CUDA `--through-attn` идёт резидентным шагом: запекание в 510 шагов занимает 67 с на Qwen3-0.6B и 183 с на
 Qwen3.5-0.8B (RTX 3060), а скилл генерирует со скоростью базы. На дискретной карте через Vulkan (`CMF_GPU=1`)
-шаг тоже резидентный: то же запекание занимает 160 с и 167 с и даёт ту же лучшую PPL на отложенных данных.
+шаг тоже резидентный: то же запекание занимает 97 с и 127 с и даёт ту же лучшую PPL на отложенных данных.
 
 ```sh
 cortiq skill bake model.cmf --files train.txt --held-files held.txt --held 16 --calib-chunks 127 --chunk 64 \
