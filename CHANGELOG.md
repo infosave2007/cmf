@@ -12,16 +12,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch — o_proj, the output gate, the attention core, RoPE, the q/k norms and the projections, input
   gradient only — as the DTG-MA notebooks' autograd does. Without it a frozen branch was skipped and the
   mask saw no path from a prompt position to a later target, so a skill learned the answer's format but
-  not what to copy into it. Qwen3-0.6B (f16), the patent-2 ODE task (300 templated equations, 510 steps of
-  4×64 tokens, mask lr 0.1, init 2.0, L1 0.56, soft mask), greedy 32 tokens over a raw prompt, 100 test
-  equations with the training coefficients and 100 with coefficients never trained on: 49 % / 5 % →
-  84 % / 80 % (80 of 80 on the four equation kinds whose coefficients vary in training; the base model,
-  given the chat template and 300 tokens, 61 % / 46 %). On an M4 a step takes 1.1 s against 0.9 s; the
-  CUDA resident step does not take it yet (with the flag the layer-by-layer path runs).
+  not what to copy into it. The patent-2 ODE task (300 templated equations, 510 steps of 4×64 tokens, mask
+  lr 0.1, init 2.0, L1 0.56, soft mask), greedy 32 tokens over a raw prompt, 100 test equations with the
+  training coefficients and 100 with coefficients never trained on, served on the card through the skill's
+  overlay (q8_2f):
+
+  | model | base, chat template, 300 tokens | skill, old gradient | skill, `--through-attn` |
+  |---|---:|---:|---:|
+  | Qwen3-0.6B | 65 % / 53 % | 49 % / 5 % (f16, M4) | 84 % / 75 % |
+  | Qwen3.5-0.8B | 66 % / 44 % | — | 84 % / 96 % |
+
+  The 0.8B's skill solves `y'' + k²y = 0` for k = 2 and 3 (20 of 20), which training showed with k = 1
+  only. The CUDA resident step takes it: the forward keeps each layer's input, the backward recomputes the
+  branch from it (P, the GDN streams) and runs it back on the card (`bk_attn_prep_bwd`, `bk_gate_bwd`; the
+  GDN BPTT kernels). RTX 3060: a step of 4×64 tokens 0.1 s on Qwen3-0.6B (the layer path 0.6 s, an M4
+  1.1 s), 0.3 s on Qwen3.5-0.8B (0.7 s), the same held-out PPL as the layer path (1.344, 1.273) and the
+  whole 510-step bake in 67 s / 183 s; the skill decodes at the base's speed (261 / 247 tok/s).
 - `skill bake --fcd-optim sgd`: Phase B with plain SGD under the same global-norm clip, the notebooks' FCD
   (lr 2e-4–5e-4). Adam's first step moves every trained weight by about `--lr-b`; clipped SGD moves all of
   them together by at most `--lr-b` in L2, so the notebooks' rate means a far smaller step than the same
   number under Adam.
+
+### Fixed
+- `skill bake` on Vulkan: the strict-f32 Phase A (the default) declined every wgpu chain — their GEMMs are the
+  f16-staged coop kernels — and ran its products on the host, 7.7 s a step of Qwen3-0.6B on an RTX 3060 against
+  0.7 s with `CMF_BAKE_A_STRICT=0`. A discrete card now takes plain-f32 tile kernels with the coop kernels'
+  interface (`F32T_NT_SRC`, `F32T_NN_SRC`) there and on coop-less devices: 0.9 s a step with the strict
+  phase's numbers (held-out PPL 1.555, as on the host), 1.2 s with `--through-attn` (11.0 s). Unified memory
+  keeps its BLAS arm.
 
 ## [0.9.17] — 2026-11-23
 
