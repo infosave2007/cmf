@@ -1479,6 +1479,8 @@ pub fn run_skill_bake(
     no_defrag: bool,
     mask_name: &str,
     fcd_attn: bool,
+    fcd_sgd: bool,
+    through_attn: bool,
     checkpoint_dir: Option<&str>,
     held_tags: Option<&str>,
     target_sparsity: f64,
@@ -1719,6 +1721,8 @@ pub fn run_skill_bake(
         answer_span: answer_span.clone(),
         soft_fold,
         fcd_attn,
+        fcd_sgd,
+        through_attn,
         held_tags: match held_tags {
             Some(path) => {
                 anyhow::ensure!(!held_files.is_empty(), "--held-tags names records of --held-files");

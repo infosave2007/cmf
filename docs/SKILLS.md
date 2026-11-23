@@ -242,12 +242,36 @@ What the method gave, measured on held-out data that never entered the bake (gre
 | Cortiq-Coder answers, 40 test records | Qwen3.5-0.8B q4tp | answer PPL 2.728 | 2.685 |
 | same | Qwen3.5-4B q4tp | answer PPL 1.908 | 1.867 |
 
-The mask can only quiet neurons, so it shapes what a model already does (the label set and its format)
-rather than teaching it new knowledge: on code the gain is small. The FCD correction works on the last two
-layers with one or two steps; Adam's first step moves every weight by the learning rate's full size, so keep
-it small: 3e-6 on the 0.8B (held-out answer-token accuracy 84.2 → 86.2 %; 1e-5 took it down to 73 %), 1e-6 on
+These skills were baked with the older gradient (see below); on code the gain was small. The FCD correction
+works on the last two layers with one or two steps; Adam's first step moves every weight by the learning
+rate's full size, so keep it small (or use `--fcd-optim sgd` with the notebooks' 2e-4–5e-4): 3e-6 on the 0.8B (held-out answer-token accuracy 84.2 → 86.2 %; 1e-5 took it down to 73 %), 1e-6 on
 the 4B (one step: 69.8 → 71.0 %; 3e-6 already hurt). The held-out PPL is not the label accuracy: 1500 mask steps
 on the 4B lowered it 1.461 → 1.436 and took the accuracy from 69.8 to 68.5 %, so pick the mask by accuracy.
+
+### The gradient through attention
+
+`--through-attn` runs the mask gradient through every frozen attention branch, as autograd does in the
+DTG-MA notebooks. Without it a later position (the answer) sends nothing back through what it read from an
+earlier one (the prompt): the skill learns an answer's format, not what to copy into it. With a strong L1 most
+gates end below 0.5 and still carry the function, so keep such a mask soft (`--tau 0.001`); the hard cut at
+0.5 erased it. The patent-2 ODE task on Qwen3-0.6B (f16, 300 templated equations, greedy 32 tokens over a raw
+prompt; 100 test equations with the training coefficients, 100 with coefficients never trained on):
+
+| | training coefficients | new coefficients |
+|---|---:|---:|
+| the base model, chat template, 300 tokens | 61 % | 46 % |
+| skill, hard mask at τ 0.5 | 3 % | 0 % |
+| skill, soft mask | 49 % | 5 % |
+| skill, soft mask, `--through-attn` | 84 % | 80 % |
+
+On new coefficients the skill solves 80 of 80 equations of the four kinds whose coefficients vary in training,
+and none of `y'' + k²y = 0`, which training showed with k = 1 only.
+
+```sh
+cortiq skill bake model.cmf --files train.txt --held-files held.txt --held 16 --calib-chunks 127 --chunk 64 \
+  --steps-a 510 --eval-every 34 --steps-b 0 --batch 4 --mask-init 2.0 --lr-a 0.1 --l1-init 0.56 --l1-step 0 \
+  --tau 0.001 --through-attn --soft-fold --no-defrag --skip-runtime-gate --mask-name ode --output ode.cmf
+```
 
 ## Creating a skill: what actually matters
 

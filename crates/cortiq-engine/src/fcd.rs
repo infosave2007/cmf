@@ -2438,6 +2438,21 @@ impl FcdModel {
         dh_in
     }
 
+    /// A frozen attention (or GDN) branch's through-gradient for the skill
+    /// bake's mask backward: `dattn` at the branch's output → the gradient
+    /// at its normed input n1. No weight gradients; `acts` must come from a
+    /// forward that kept the attention activations.
+    pub(crate) fn attn_through_bwd(&self, li: usize, acts: &LayerActs, dattn: &[f32], b: usize, t: usize) -> Vec<f32> {
+        let l = &self.layers[li];
+        match &l.attn {
+            FcdAttn::Full { .. } => {
+                let mats = self.mats(li).expect("layer mats");
+                self.full_attn_bwd(&l.attn, &mats, &acts.attn, dattn, b, t, false)
+            }
+            FcdAttn::Gdn { .. } => self.gdn_attn_bwd(&l.attn, &acts.attn, dattn, b, t),
+        }
+    }
+
     /// Full-attention through-backward: o_proj → output gate →
     /// per-head attention (exact / Nyström-frozen-M) → RoPE → qk-norm →
     /// projections. Frozen weights: dX only.
