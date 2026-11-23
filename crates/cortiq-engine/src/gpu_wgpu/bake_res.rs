@@ -436,6 +436,129 @@ fn res_qkr_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// `QKR_BWD_SRC` on 32-wide subgroups, `bake_qkr`'s subgroup geometry: one
+/// subgroup per (row, unit), lanes on vec4s, the norm's two sums by
+/// subgroupAdd (RTX 3060, Qwen3-0.6B layer: 0.37 → 0.06 ms).
+const QKR_BWD_SG_SRC: &str = r#"
+struct P {
+    n: u32, t: u32, nh: u32, nkv: u32,
+    hd: u32, qrows: u32, half: u32, flags: u32,
+    eps: f32, _a: u32, _b: u32, _c: u32,
+};
+@group(0) @binding(0) var<storage, read> plane: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> qn: array<f32>;
+@group(0) @binding(2) var<storage, read> kn: array<f32>;
+@group(0) @binding(3) var<storage, read> rope: array<f32>;
+@group(0) @binding(4) var<storage, read> dq: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> dk: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> dv: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> dgate: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> dplane: array<vec4<f32>>;
+@group(0) @binding(9) var<uniform> p: P;
+const FL_GATED: u32 = 1u;
+const FL_QNORM: u32 = 2u;
+const FL_KNORM: u32 = 4u;
+const FL_GEMMA: u32 = 8u;
+
+fn nw(is_q: bool, c: u32) -> vec4<f32> {
+    var w: vec4<f32>;
+    if (is_q) { w = vec4<f32>(qn[c], qn[c + 1u], qn[c + 2u], qn[c + 3u]); }
+    else { w = vec4<f32>(kn[c], kn[c + 1u], kn[c + 2u], kn[c + 3u]); }
+    if ((p.flags & FL_GEMMA) != 0u) { w = w + vec4<f32>(1.0); }
+    return w;
+}
+
+fn grad4(is_q: bool, g0: u32, c: u32) -> vec4<f32> {
+    if (is_q) { return dq[(g0 + c) >> 2u]; }
+    return dk[(g0 + c) >> 2u];
+}
+
+// the rotated gradient at c … c+3 (from `g0`, the head's start in dq/dk)
+// back through RoPE at `pos`
+fn unrope4(is_q: bool, g0: u32, c: u32, pos: u32) -> vec4<f32> {
+    let half = p.half;
+    let d = grad4(is_q, g0, c);
+    if (c >= 2u * half) { return d; }
+    let i = c % half;
+    let rb = (pos * half + i) * 2u;
+    let cs = vec4<f32>(rope[rb], rope[rb + 2u], rope[rb + 4u], rope[rb + 6u]);
+    let sn = vec4<f32>(rope[rb + 1u], rope[rb + 3u], rope[rb + 5u], rope[rb + 7u]);
+    if (c < half) { return d * cs + grad4(is_q, g0, c + half) * sn; }
+    return d * cs - grad4(is_q, g0, c - half) * sn;
+}
+
+// `bake_qkr`'s backward with its geometry: one subgroup per (row, unit),
+// lanes on vec4s; RoPE transposed (partners read again), then the per-head
+// RMSNorm's backward from the raw projection, its two sums by subgroupAdd.
+@compute @workgroup_size(64)
+fn res_qkr_bwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let units = p.nh + 2u * p.nkv;
+    let pair = (wid.y * 32768u + wid.x) * 2u + lid / 32u;
+    if (pair >= p.n * units) { return; }
+    let lane = lid % 32u;
+    let r = pair / units;
+    let u = pair % units;
+    let pos = r % p.t;
+    let hd = p.hd;
+    let qdim = p.nh * hd;
+    let kvdim = p.nkv * hd;
+    let base = r * (p.qrows + 2u * kvdim);
+    let ca = lane * 4u;
+    let cb = 128u + lane * 4u;
+    let oka = ca < hd;
+    let okb = cb < hd;
+    if (u < p.nh + p.nkv) {
+        let is_q = u < p.nh;
+        var src: u32;
+        var g0: u32;
+        var norm: bool;
+        if (is_q) {
+            if ((p.flags & FL_GATED) != 0u) { src = base + 2u * u * hd; } else { src = base + u * hd; }
+            g0 = r * qdim + u * hd;
+            norm = (p.flags & FL_QNORM) != 0u;
+        } else {
+            let g = u - p.nh;
+            src = base + p.qrows + g * hd;
+            g0 = r * kvdim + g * hd;
+            norm = (p.flags & FL_KNORM) != 0u;
+        }
+        var da = vec4<f32>();
+        var db = vec4<f32>();
+        if (oka) { da = unrope4(is_q, g0, ca, pos); }
+        if (okb) { db = unrope4(is_q, g0, cb, pos); }
+        var xa = vec4<f32>();
+        var xb = vec4<f32>();
+        var wa = vec4<f32>();
+        var wb = vec4<f32>();
+        var ss = 0.0;
+        var sd = 0.0;
+        if (norm) {
+            if (oka) { xa = plane[(src + ca) >> 2u]; wa = nw(is_q, ca); ss = dot(xa, xa); sd = dot(da * wa, xa); }
+            if (okb) { xb = plane[(src + cb) >> 2u]; wb = nw(is_q, cb); ss = ss + dot(xb, xb); sd = sd + dot(db * wb, xb); }
+        }
+        ss = subgroupAdd(ss);
+        sd = subgroupAdd(sd);
+        if (norm) {
+            let iv = 1.0 / sqrt(ss / f32(hd) + p.eps);
+            let k = sd * iv * iv * iv / f32(hd);
+            da = iv * wa * da - xa * k;
+            db = iv * wb * db - xb * k;
+        }
+        if (oka) { dplane[(src + ca) >> 2u] = da; }
+        if (okb) { dplane[(src + cb) >> 2u] = db; }
+        if (is_q && (p.flags & FL_GATED) != 0u) {
+            if (oka) { dplane[(src + hd + ca) >> 2u] = dgate[(g0 + ca) >> 2u]; }
+            if (okb) { dplane[(src + hd + cb) >> 2u] = dgate[(g0 + cb) >> 2u]; }
+        }
+    } else {
+        let g = u - p.nh - p.nkv;
+        let dst = base + p.qrows + kvdim + g * hd;
+        if (oka) { dplane[(dst + ca) >> 2u] = dv[(r * kvdim + g * hd + ca) >> 2u]; }
+        if (okb) { dplane[(dst + cb) >> 2u] = dv[(r * kvdim + g * hd + cb) >> 2u]; }
+    }
+}
+"#;
+
 const GATE_BWD_SRC: &str = r#"
 struct P { total: u32, stride: u32, _a: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read_write> d: array<f32>;
@@ -464,6 +587,8 @@ struct Pipes {
     gather: wgpu::ComputePipeline,
     ce: wgpu::ComputePipeline,
     qkr_bwd: wgpu::ComputePipeline,
+    /// `QKR_BWD_SG_SRC` where the device has the subgroup kernels.
+    qkr_bwd_sg: Option<wgpu::ComputePipeline>,
     gate_bwd: wgpu::ComputePipeline,
 }
 
@@ -492,6 +617,7 @@ fn build_pipes(c: &Ctx) -> Pipes {
         gather: mk(GATHER_SRC, "res_gather"),
         ce: mk(CE_SRC, "res_ce"),
         qkr_bwd: mk(QKR_BWD_SRC, "res_qkr_bwd"),
+        qkr_bwd_sg: c.bake_sg.as_ref().map(|_| mk(QKR_BWD_SG_SRC, "res_qkr_bwd")),
         gate_bwd: mk(GATE_BWD_SRC, "res_gate_bwd"),
     }
 }
@@ -803,9 +929,10 @@ fn full_fwd(e: &mut Enc, s: &mut State, st: &WgStep, li: usize, a: &WgFull, nt_p
     let zero = s.buf(c, "zero", fused);
     e.gemm(nt_p, &wq, x, &p.plane, n, hsz, fused);
     let u = e.uni(&[n as u32, t as u32, nh as u32, nkv as u32, hd as u32, qrows as u32, a.half as u32, full_flags(a, st.gemma), st.eps.to_bits(), 0, 0, 0]);
-    e.run(&c.bake_qkr, &[&p.plane, &p.qn, &p.kn, &zero, &p.rope, &p.qrot, &p.krot, &p.vproj, &p.gate, &qi, &ki, &u], (((n * (nh + 2 * nkv)) as u32).div_ceil(64), 1, 1));
+    let ka = c.bake_attn(hd, a.half);
+    e.run(ka.qkr, &[&p.plane, &p.qn, &p.kn, &zero, &p.rope, &p.qrot, &p.krot, &p.vproj, &p.gate, &qi, &ki, &u], ka.qkr_grid(n * (nh + 2 * nkv)));
     let u2 = e.uni(&[t as u32, nh as u32, nkv as u32, hd as u32, b as u32, a.window.unwrap_or(0) as u32, 0, 0]);
-    e.run(&c.bake_attn_head, &[&p.qrot, &p.krot, &p.vproj, &p.aoh, &u2], (t as u32, (b * nh) as u32, 1));
+    e.run(ka.head, &[&p.qrot, &p.krot, &p.vproj, &p.aoh, &u2], (t as u32, (b * nh) as u32, 1));
     let (Some(y), Some(wo)) = (y, wo) else { return p };
     if a.gated {
         let aoe = s.buf(c, "aoe", n * qdim);
@@ -1221,11 +1348,13 @@ fn run(st: &WgStep, c: &Ctx, s: &mut State, nt_p: &wgpu::ComputePipeline, nn_p: 
                         e.run(&pp.gate_bwd, &[&dao, &p.aoh, &p.gate, &dgt, &u3], grid);
                     }
                     let up = e.uni(&[t as u32, nh as u32, nkv as u32, hd as u32, b as u32, a.window.unwrap_or(0) as u32, 0, 0]);
-                    e.run(&c.bake_attn_bwd_q, &[&p.qrot, &p.krot, &p.vproj, &dao, &dq, &stat, &up], (t as u32, (b * nh) as u32, 1));
-                    e.run(&c.bake_attn_bwd_kv, &[&p.qrot, &p.krot, &p.vproj, &dao, &stat, &dk, &dv, &up], (t as u32, (b * nkv) as u32, 1));
+                    let ka = c.bake_attn(hd, a.half);
+                    e.run(ka.bwd_q, &[&p.qrot, &p.krot, &p.vproj, &dao, &dq, &stat, &up], (t as u32, (b * nh) as u32, 1));
+                    e.run(ka.bwd_kv, &[&p.qrot, &p.krot, &p.vproj, &dao, &stat, &dk, &dv, &up], (t as u32, (b * nkv) as u32, 1));
                     prof.mark(&mut e, "bwd.attn.core");
                     let uq = e.uni(&[n as u32, t as u32, nh as u32, nkv as u32, hd as u32, qrows as u32, a.half as u32, full_flags(a, st.gemma), st.eps.to_bits(), 0, 0, 0]);
-                    e.run(&pp.qkr_bwd, &[&p.plane, &p.qn, &p.kn, &p.rope, &dq, &dk, &dv, &dgt, &dplane, &uq], (((n * (nh + 2 * nkv)) as u32).div_ceil(64), 1, 1));
+                    let qb = if ka.qkr_sg { pp.qkr_bwd_sg.as_ref() } else { None };
+                    e.run(qb.unwrap_or(&pp.qkr_bwd), &[&p.plane, &p.qn, &p.kn, &p.rope, &dq, &dk, &dv, &dgt, &dplane, &uq], if qb.is_some() { ka.qkr_grid(n * (nh + 2 * nkv)) } else { (((n * (nh + 2 * nkv)) as u32).div_ceil(64), 1, 1) });
                     e.gemm(nn_p, &wq, &dplane, &dn, n, fused, hsz);
                     prof.mark(&mut e, "bwd.attn.proj");
                 }
