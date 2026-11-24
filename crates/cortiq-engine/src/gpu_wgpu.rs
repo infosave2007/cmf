@@ -30841,6 +30841,17 @@ pub fn forward_token_graph(
         }
     }
     if prefix {
+        // A prefix never stops inside an mHC range: the host would continue
+        // from stale streams while the live ones sit on the card (a 4-5 GB
+        // budget under SenseNova-Loop-9B cut at 38 or 46 of 56 layers and
+        // wrote garbage). The range then runs on the host from its first layer.
+        while !lws.is_empty() && layers.get(lws.len()).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter)) {
+            lws.pop();
+        }
+        if lws.is_empty() {
+            graph_decline("the device prefix would end inside an mHC range");
+            return token_graph_outcome(o1_started || state_started, false);
+        }
         // The multi-step tail (on-device argmax + re-embed) needs the head,
         // which a prefix does not reach — those callers fall back whole.
         if steps > 1 || ids_out.is_some() {
@@ -37371,6 +37382,14 @@ pub fn forward_batch_graph_at(
         }
         if run_n == 0 {
             bgraph_refused("one layer exceeds the weight budget");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        // Nor inside an mHC range (as the token graph's prefix above).
+        while run_n > 0 && layers.get(run_n).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter)) {
+            run_n -= 1;
+        }
+        if run_n == 0 {
+            bgraph_refused("the device prefix would end inside an mHC range");
             return batch_outcome(o1_started || state_started, false);
         }
         {
